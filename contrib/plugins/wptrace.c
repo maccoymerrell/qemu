@@ -3,8 +3,22 @@
  *
  * This plugin simulates speculative wrong-path execution at branch points
  * during correct-path execution. At each branch, it determines the "wrong"
- * direction and walks through previously-observed basic blocks to generate
- * a wrong-path instruction trace, up to a configurable depth limit.
+ * direction and executes the wrong-path by reading instruction bytes from
+ * guest memory and capturing CPU register state, producing traces with
+ * realistic instruction data and address-computation context.
+ *
+ * Unlike a simple cached-block replay approach, this plugin:
+ *   - Reads actual instruction bytes from guest memory at wrong-path
+ *     addresses, enabling discovery of code never executed on the correct
+ *     path.
+ *   - Captures a full CPU register snapshot at each branch point, providing
+ *     the dynamic state needed to compute data addresses that wrong-path
+ *     load/store instructions would access.
+ *   - Tracks per-instruction memory access addresses on the correct path,
+ *     associating last-known data addresses with instruction PCs for
+ *     wrong-path context.
+ *   - After simulation, the CPU state is implicitly "rolled back" since
+ *     the real CPU state is never modified (simulation is software-based).
  *
  * Branch predictions on the wrong path are made using an "infinite" Smith
  * predictor: a hash map from PC to a 2-bit saturating counter that tracks
@@ -45,6 +59,9 @@ static char *trace_path;
 static FILE *trace_file;
 static const char *target_name;
 
+/* Maximum bytes to read for unknown (uncached) wrong-path blocks */
+#define WP_UNKNOWN_BLOCK_READ_SIZE 64
+
 /* ========================= Data Structures ========================= */
 
 /*
@@ -56,6 +73,7 @@ typedef struct {
     uint32_t n_insns;           /* Number of instructions */
     uint64_t *insn_pcs;         /* Array of instruction PCs */
     uint32_t *insn_sizes;       /* Array of instruction sizes */
+    uint8_t **insn_data;        /* Raw instruction bytes per insn */
     uint64_t fall_through_pc;   /* PC after last instruction (sequential) */
 } BlockRecord;
 
@@ -81,16 +99,41 @@ typedef struct {
     uint64_t prev_fall_through; /* Expected sequential next from prev block */
 } VCPUScoreBoard;
 
+/*
+ * Snapshot of CPU register state at a branch point.
+ * Captures the dynamic state needed to compute addresses that
+ * wrong-path instructions would access.
+ */
+typedef struct {
+    GByteArray **values;        /* Array of register value buffers */
+    int n_regs;                 /* Number of registers captured */
+} RegSnapshot;
+
+/*
+ * Record of the most recent memory access at an instruction PC.
+ * Updated on the correct path via per-instruction memory callbacks,
+ * used as address context during wrong-path simulation.
+ */
+typedef struct {
+    uint64_t vaddr;             /* Last observed memory access vaddr */
+    bool is_store;              /* Whether the access was a store */
+} MemAddrEntry;
+
 /* ========================= Global State ========================= */
 
 static GMutex data_lock;
 static GHashTable *block_map;       /* start_pc (uint64_t*) → BlockRecord* */
 static GHashTable *branch_map;      /* branch_pc (uint64_t*) → BranchRecord* */
+static GHashTable *mem_addr_map;    /* insn_pc (uint64_t*) → MemAddrEntry* */
 
 static struct qemu_plugin_scoreboard *vcpu_sb;
 static qemu_plugin_u64 sb_current_pc;
 static qemu_plugin_u64 sb_prev_last_pc;
 static qemu_plugin_u64 sb_prev_fall_through;
+
+/* Register descriptor cache (populated in vcpu_init) */
+static GArray *cached_reg_list;
+static bool regs_available;
 
 /* Statistics */
 static uint64_t stat_blocks_translated;
@@ -102,6 +145,9 @@ static uint64_t stat_wp_skipped;       /* wrong target unknown */
 static uint64_t stat_wp_total_insns;
 static uint64_t stat_wp_total_blocks;
 static uint64_t stat_wp_early_exits;   /* sim ended at unknown block */
+static uint64_t stat_wp_mem_fetches;   /* insn bytes read from memory */
+static uint64_t stat_wp_mem_fetch_fails; /* failed memory reads */
+static uint64_t stat_wp_unknown_blocks;  /* uncached blocks encountered */
 
 /* ========================= Smith Predictor ========================= */
 
@@ -137,9 +183,129 @@ static inline uint8_t smith_update(uint8_t counter, bool taken)
 static void block_record_free(gpointer data)
 {
     BlockRecord *block = data;
+    if (block->insn_data) {
+        for (uint32_t i = 0; i < block->n_insns; i++) {
+            g_free(block->insn_data[i]);
+        }
+        g_free(block->insn_data);
+    }
     g_free(block->insn_pcs);
     g_free(block->insn_sizes);
     g_free(block);
+}
+
+/* ========================= Register Snapshot ========================= */
+
+/*
+ * Capture a snapshot of all CPU registers.
+ * Must be called from a vCPU callback registered with QEMU_PLUGIN_CB_R_REGS.
+ * Returns NULL if register tracking is not available.
+ */
+static RegSnapshot *take_reg_snapshot(void)
+{
+    if (!regs_available || !cached_reg_list || cached_reg_list->len == 0) {
+        return NULL;
+    }
+
+    int n = cached_reg_list->len;
+    RegSnapshot *snap = g_new0(RegSnapshot, 1);
+    snap->n_regs = n;
+    snap->values = g_new0(GByteArray *, n);
+
+    for (int i = 0; i < n; i++) {
+        qemu_plugin_reg_descriptor *rd = &g_array_index(
+            cached_reg_list, qemu_plugin_reg_descriptor, i);
+        snap->values[i] = g_byte_array_new();
+        qemu_plugin_read_register(rd->handle, snap->values[i]);
+    }
+
+    return snap;
+}
+
+static void free_reg_snapshot(RegSnapshot *snap)
+{
+    if (!snap) {
+        return;
+    }
+    for (int i = 0; i < snap->n_regs; i++) {
+        if (snap->values[i]) {
+            g_byte_array_unref(snap->values[i]);
+        }
+    }
+    g_free(snap->values);
+    g_free(snap);
+}
+
+/*
+ * Write register snapshot to the trace file.
+ * Outputs register names and values in hex for address computation context.
+ */
+static void write_reg_snapshot(FILE *f, RegSnapshot *snap)
+{
+    if (!snap || !f || !cached_reg_list) {
+        return;
+    }
+    fprintf(f, "  REGS:");
+    for (int i = 0; i < snap->n_regs; i++) {
+        qemu_plugin_reg_descriptor *rd = &g_array_index(
+            cached_reg_list, qemu_plugin_reg_descriptor, i);
+        if (snap->values[i] && snap->values[i]->len > 0) {
+            fprintf(f, " %s=0x", rd->name);
+            for (int j = snap->values[i]->len - 1; j >= 0; j--) {
+                fprintf(f, "%02x", snap->values[i]->data[j]);
+            }
+        }
+    }
+    fprintf(f, "\n");
+}
+
+/* ========================= Memory Access Tracking ========================= */
+
+/*
+ * Per-instruction memory access callback.
+ * Records the most recent memory address accessed by each instruction PC
+ * on the correct path. This data is used during wrong-path simulation to
+ * provide address context for instructions that were previously executed.
+ *
+ * The instruction PC is passed via udata as a cast integer.
+ */
+static void vcpu_mem_cb(unsigned int cpu_index,
+                        qemu_plugin_meminfo_t info,
+                        uint64_t vaddr,
+                        void *udata)
+{
+    uint64_t insn_pc = (uint64_t)(uintptr_t)udata;
+
+    g_mutex_lock(&data_lock);
+
+    MemAddrEntry *entry = g_hash_table_lookup(mem_addr_map, &insn_pc);
+    if (!entry) {
+        entry = g_new0(MemAddrEntry, 1);
+        uint64_t *key = g_new(uint64_t, 1);
+        *key = insn_pc;
+        g_hash_table_insert(mem_addr_map, key, entry);
+    }
+    entry->vaddr = vaddr;
+    entry->is_store = qemu_plugin_mem_is_store(info);
+
+    g_mutex_unlock(&data_lock);
+}
+
+/* ========================= vCPU Init Callback ========================= */
+
+/*
+ * Called when a vCPU is initialized.
+ * Enumerates available registers for state capture during wrong-path
+ * simulation.
+ */
+static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
+{
+    if (!cached_reg_list) {
+        cached_reg_list = qemu_plugin_get_registers();
+        if (cached_reg_list && cached_reg_list->len > 0) {
+            regs_available = true;
+        }
+    }
 }
 
 /* ========================= Wrong-Path Simulation ========================= */
@@ -147,73 +313,191 @@ static void block_record_free(gpointer data)
 /*
  * Simulate wrong-path execution starting from @wrong_target.
  *
- * Walks through previously-observed basic blocks, using the Smith
- * predictor for branch decisions encountered on the wrong path.
- * Stops when:
- *   - max_wrong_path_depth basic blocks have been traversed
- *   - an unknown (never-translated) block is encountered
+ * Instead of simply replaying cached basic blocks, this function reads
+ * actual instruction bytes from guest memory at wrong-path addresses and
+ * uses the register snapshot captured at the branch point to provide
+ * address-computation context. This produces traces with realistic
+ * instruction data and memory address information.
+ *
+ * For blocks in the block_map, the cached structure provides instruction
+ * boundaries while live memory reads provide current instruction bytes.
+ * For unknown blocks (never translated on the correct path), raw bytes
+ * are read directly from guest memory, enabling discovery of code that
+ * exists only on wrong-path execution.
+ *
+ * The register snapshot (@reg_snap) represents the CPU state at the
+ * branch point, enabling downstream tools to compute the actual data
+ * addresses that wrong-path load/store instructions would access.
  *
  * Must be called with data_lock held.
  */
 static void simulate_wrong_path(uint64_t branch_pc,
                                 uint64_t correct_target,
                                 uint64_t wrong_target,
-                                unsigned int cpu_index)
+                                unsigned int cpu_index,
+                                RegSnapshot *reg_snap)
 {
     uint64_t current_pc = wrong_target;
     uint64_t sim_insns = 0;
     uint64_t sim_blocks = 0;
     bool early_exit = false;
+    GByteArray *mem_buf = g_byte_array_new();
+
+    /* Write simulation header with register state at branch point */
+    if (trace_file) {
+        fprintf(trace_file,
+                "WP_BEGIN: cpu=%u branch_pc=0x%" PRIx64
+                " correct=0x%" PRIx64 " wrong=0x%" PRIx64 "\n",
+                cpu_index, branch_pc, correct_target, wrong_target);
+        write_reg_snapshot(trace_file, reg_snap);
+    }
 
     for (int depth = 0; depth < max_wrong_path_depth; depth++) {
-        /* Look up block in our translation cache */
         BlockRecord *block = g_hash_table_lookup(block_map, &current_pc);
-        if (!block) {
+
+        if (block) {
+            /*
+             * Known block: use cached structure for instruction boundaries.
+             * Read live instruction bytes from guest memory to capture the
+             * actual code at these addresses (may differ from translation
+             * time for self-modifying code).
+             */
+            sim_blocks++;
+
+            for (uint32_t i = 0; i < block->n_insns; i++) {
+                sim_insns++;
+
+                /* Read instruction bytes from guest memory */
+                g_byte_array_set_size(mem_buf, 0);
+                bool mem_ok = qemu_plugin_read_memory_vaddr(
+                    block->insn_pcs[i], mem_buf, block->insn_sizes[i]);
+
+                if (mem_ok) {
+                    stat_wp_mem_fetches++;
+                } else {
+                    stat_wp_mem_fetch_fails++;
+                }
+
+                /* Look up last-known memory address for this insn PC */
+                MemAddrEntry *maddr = NULL;
+                if (mem_addr_map) {
+                    maddr = g_hash_table_lookup(mem_addr_map,
+                                                &block->insn_pcs[i]);
+                }
+
+                if (trace_file) {
+                    fprintf(trace_file,
+                            "WP: cpu=%u branch_pc=0x%" PRIx64
+                            " correct=0x%" PRIx64
+                            " depth=%d pc=0x%" PRIx64
+                            " size=%u",
+                            cpu_index, branch_pc, correct_target,
+                            depth, block->insn_pcs[i],
+                            block->insn_sizes[i]);
+
+                    /* Include live instruction bytes from memory */
+                    if (mem_ok && mem_buf->len > 0) {
+                        fprintf(trace_file, " bytes=");
+                        for (uint32_t b = 0; b < mem_buf->len; b++) {
+                            fprintf(trace_file, "%02x", mem_buf->data[b]);
+                        }
+                    }
+
+                    /* Include memory address context if available */
+                    if (maddr) {
+                        fprintf(trace_file, " mem_addr=0x%" PRIx64
+                                " mem_%s",
+                                maddr->vaddr,
+                                maddr->is_store ? "store" : "load");
+                    }
+
+                    fprintf(trace_file, "\n");
+                }
+            }
+
+            /* Determine next block using Smith predictor */
+            uint64_t end_pc = block->insn_pcs[block->n_insns - 1];
+            BranchRecord *br = g_hash_table_lookup(branch_map, &end_pc);
+
+            if (!br) {
+                current_pc = block->fall_through_pc;
+                continue;
+            }
+
+            if (smith_predict_taken(br->smith_counter)) {
+                if (br->has_taken_target) {
+                    current_pc = br->taken_target;
+                } else {
+                    early_exit = true;
+                    break;
+                }
+            } else {
+                current_pc = br->fall_through;
+            }
+        } else {
+            /*
+             * Unknown block: not in translation cache.
+             * Read raw instruction bytes directly from guest memory.
+             * This is a fundamental improvement over the cached-only
+             * approach: we can discover and trace code on the wrong path
+             * that was never executed on the correct path.
+             */
+            stat_wp_unknown_blocks++;
+            sim_blocks++;
+
+            g_byte_array_set_size(mem_buf, 0);
+            bool raw_ok = qemu_plugin_read_memory_vaddr(
+                current_pc, mem_buf, WP_UNKNOWN_BLOCK_READ_SIZE);
+
+            if (!raw_ok) {
+                /* Memory at wrong-path address is unmapped */
+                stat_wp_mem_fetch_fails++;
+                early_exit = true;
+                if (trace_file) {
+                    fprintf(trace_file,
+                            "WP_UNMAPPED: cpu=%u branch_pc=0x%" PRIx64
+                            " depth=%d pc=0x%" PRIx64 "\n",
+                            cpu_index, branch_pc, depth, current_pc);
+                }
+                break;
+            }
+
+            stat_wp_mem_fetches++;
+            sim_insns++;
+
+            if (trace_file) {
+                fprintf(trace_file,
+                        "WP_RAW: cpu=%u branch_pc=0x%" PRIx64
+                        " depth=%d pc=0x%" PRIx64 " raw_size=%u bytes=",
+                        cpu_index, branch_pc, depth,
+                        current_pc, mem_buf->len);
+                for (uint32_t b = 0; b < mem_buf->len; b++) {
+                    fprintf(trace_file, "%02x", mem_buf->data[b]);
+                }
+                fprintf(trace_file, "\n");
+            }
+
+            /*
+             * Without ISA-specific instruction decoding, we cannot
+             * determine instruction boundaries or branch targets in
+             * unknown blocks. Exit simulation at this point.
+             * A future enhancement could add per-ISA decoders to
+             * continue walking through unknown code.
+             */
             early_exit = true;
             break;
         }
-
-        sim_blocks++;
-
-        /* Trace all instructions in this wrong-path block */
-        for (uint32_t i = 0; i < block->n_insns; i++) {
-            sim_insns++;
-            if (trace_file) {
-                fprintf(trace_file,
-                        "WP: cpu=%u branch_pc=0x%" PRIx64
-                        " correct=0x%" PRIx64
-                        " depth=%d pc=0x%" PRIx64 "\n",
-                        cpu_index, branch_pc, correct_target,
-                        depth, block->insn_pcs[i]);
-            }
-        }
-
-        /* Determine next block on the wrong path */
-        uint64_t end_pc = block->insn_pcs[block->n_insns - 1];
-        BranchRecord *br = g_hash_table_lookup(branch_map, &end_pc);
-
-        if (!br) {
-            /*
-             * No branch record for this block's last instruction.
-             * Default to fall-through.
-             */
-            current_pc = block->fall_through_pc;
-            continue;
-        }
-
-        /* Use Smith predictor for wrong-path branch direction */
-        if (smith_predict_taken(br->smith_counter)) {
-            if (br->has_taken_target) {
-                current_pc = br->taken_target;
-            } else {
-                /* Predicted taken but target unknown; stop simulation */
-                early_exit = true;
-                break;
-            }
-        } else {
-            current_pc = br->fall_through;
-        }
     }
+
+    if (trace_file) {
+        fprintf(trace_file,
+                "WP_END: cpu=%u branch_pc=0x%" PRIx64
+                " blocks=%" PRIu64 " insns=%" PRIu64
+                " early_exit=%d\n",
+                cpu_index, branch_pc, sim_blocks, sim_insns, early_exit);
+    }
+
+    g_byte_array_unref(mem_buf);
 
     /* Update statistics */
     stat_wp_simulations++;
@@ -251,6 +535,13 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     }
 
     branch_taken = (current_pc != prev_ft);
+
+    /*
+     * Capture register state at the branch point BEFORE acquiring the
+     * data lock. This snapshot represents the CPU state that determines
+     * what addresses wrong-path instructions would access.
+     */
+    RegSnapshot *reg_snap = take_reg_snapshot();
 
     g_mutex_lock(&data_lock);
 
@@ -297,12 +588,15 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     /* Run wrong-path simulation if we know where the wrong path starts */
     if (wrong_target != 0) {
-        simulate_wrong_path(prev_last, current_pc, wrong_target, cpu_index);
+        simulate_wrong_path(prev_last, current_pc, wrong_target,
+                            cpu_index, reg_snap);
     } else {
         stat_wp_skipped++;
     }
 
     g_mutex_unlock(&data_lock);
+
+    free_reg_snapshot(reg_snap);
 }
 
 /* ========================= Translation Callback ========================= */
@@ -329,18 +623,38 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     size_t last_insn_size = qemu_plugin_insn_size(last_insn);
     uint64_t fall_through = last_insn_pc + last_insn_size;
 
-    /* Build block record */
+    /* Build block record with instruction data */
     BlockRecord *block = g_new0(BlockRecord, 1);
     block->start_pc = pc;
     block->n_insns = (uint32_t)n_insns;
     block->insn_pcs = g_new0(uint64_t, n_insns);
     block->insn_sizes = g_new0(uint32_t, n_insns);
+    block->insn_data = g_new0(uint8_t *, n_insns);
     block->fall_through_pc = fall_through;
 
     for (size_t i = 0; i < n_insns; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
-        block->insn_pcs[i] = qemu_plugin_insn_vaddr(insn);
-        block->insn_sizes[i] = (uint32_t)qemu_plugin_insn_size(insn);
+        uint64_t insn_pc = qemu_plugin_insn_vaddr(insn);
+        uint32_t insn_size = (uint32_t)qemu_plugin_insn_size(insn);
+
+        block->insn_pcs[i] = insn_pc;
+        block->insn_sizes[i] = insn_size;
+
+        /* Cache raw instruction bytes for wrong-path reference */
+        block->insn_data[i] = g_new(uint8_t, insn_size);
+        qemu_plugin_insn_data(insn, block->insn_data[i], insn_size);
+
+        /*
+         * Register per-instruction memory callback to track data addresses.
+         * The instruction PC is passed as userdata for the address mapping.
+         * Only enabled when tracefile is specified to avoid overhead in
+         * summary-only mode.
+         */
+        if (trace_file) {
+            qemu_plugin_register_vcpu_mem_cb(
+                insn, vcpu_mem_cb, QEMU_PLUGIN_CB_NO_REGS,
+                QEMU_PLUGIN_MEM_RW, (void *)(uintptr_t)insn_pc);
+        }
     }
 
     /*
@@ -364,11 +678,11 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
     /*
      * Step 2: Register execution callback (TB-level).
-     * Reads sb_current_pc (just set above) and sb_prev_* (set by
-     * previous block's first-instruction inline ops).
+     * Uses QEMU_PLUGIN_CB_R_REGS so registers are available for
+     * state capture at branch points during wrong-path simulation.
      */
     qemu_plugin_register_vcpu_tb_exec_cb(
-        tb, vcpu_tb_exec, QEMU_PLUGIN_CB_NO_REGS, NULL);
+        tb, vcpu_tb_exec, QEMU_PLUGIN_CB_R_REGS, NULL);
 
     /*
      * Step 3: Update prev_* values for the NEXT block's callback.
@@ -427,6 +741,15 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     g_string_append_printf(report,
         "  Early exits (unknown block on path): %" PRIu64 "\n",
         stat_wp_early_exits);
+    g_string_append_printf(report,
+        "  Instruction bytes fetched from memory: %" PRIu64 "\n",
+        stat_wp_mem_fetches);
+    g_string_append_printf(report,
+        "  Memory fetch failures: %" PRIu64 "\n",
+        stat_wp_mem_fetch_fails);
+    g_string_append_printf(report,
+        "  Unknown (uncached) blocks encountered: %" PRIu64 "\n",
+        stat_wp_unknown_blocks);
 
     if (stat_wp_simulations > 0) {
         g_string_append_printf(report,
@@ -493,6 +816,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                                       NULL, block_record_free);
     branch_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
                                        NULL, g_free);
+    mem_addr_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                         g_free, g_free);
 
     /* Initialize per-vCPU scoreboard */
     vcpu_sb = qemu_plugin_scoreboard_new(sizeof(VCPUScoreBoard));
@@ -504,6 +829,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         vcpu_sb, VCPUScoreBoard, prev_fall_through);
 
     /* Register callbacks */
+    qemu_plugin_register_vcpu_init_cb(id, vcpu_init_cb);
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
     qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
 

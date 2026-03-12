@@ -223,8 +223,6 @@ static bool simpoints_exhausted = false;
 
 /* Correct-path memory accesses for current BB */
 static GArray *cp_mem_accesses = NULL;
-static uint64_t cp_current_insn_pc = 0;
-static bool cp_collecting = false;
 
 /* Statistics */
 static uint64_t stat_blocks_translated;
@@ -393,9 +391,11 @@ static void vcpu_mem_cb(unsigned int cpu_index,
                         uint64_t vaddr,
                         void *udata)
 {
+    uint64_t insn_pc = (uint64_t)(uintptr_t)udata;
+
     if (wp_in_progress && wp_mem_accesses) {
         WPMemAccess acc = {
-            .insn_pc = wp_current_insn_pc,
+            .insn_pc = wp_current_insn_pc ? wp_current_insn_pc : insn_pc,
             .mem_vaddr = vaddr,
             .is_store = qemu_plugin_mem_is_store(info),
         };
@@ -403,9 +403,9 @@ static void vcpu_mem_cb(unsigned int cpu_index,
         return;
     }
 
-    if (cp_collecting && cp_mem_accesses) {
+    if (trace_active && cp_mem_accesses) {
         WPMemAccess acc = {
-            .insn_pc = cp_current_insn_pc,
+            .insn_pc = insn_pc,
             .mem_vaddr = vaddr,
             .is_store = qemu_plugin_mem_is_store(info),
         };
@@ -944,7 +944,11 @@ static void bbv_increment(BBV *bbv, uint64_t bb_pc, uint64_t n_insns)
         *idx = next_bb_index++;
         g_hash_table_insert(bbv_bb_map, key, idx);
     }
-    bb_idx = *(uint32_t *)g_hash_table_lookup(bbv_bb_map, key);
+    uint32_t *idx_ptr = g_hash_table_lookup(bbv_bb_map, key);
+    if (!idx_ptr) {
+        return;
+    }
+    bb_idx = *idx_ptr;
 
     /* Increment count for this BB */
     gpointer bb_key = GUINT_TO_POINTER(bb_idx);
@@ -1199,25 +1203,44 @@ static void start_trace_segment(const char *label,
     current_segment = trace_segment_new(label, start, stop);
     body_seq_num = 0;
 
-    /* Open output files */
-    if (output_base_path) {
-        g_autofree char *bin_path = g_strdup_printf("%s_%s.bin",
-                                                     output_base_path, label);
+    /* Determine output file paths based on mode */
+    g_autofree char *bin_path = NULL;
+    g_autofree char *txt_path = NULL;
+
+    if (simpoint_mode == SP_TRACE) {
+        /*
+         * SimPoints mode: files named as program_instrnum.{bin,txt}
+         * per the spec's naming convention.
+         */
+        bin_path = g_strdup_printf("%s.bin", label);
+        if (enable_debug_text) {
+            txt_path = g_strdup_printf("%s.txt", label);
+        }
+    } else {
+        /*
+         * Simple start/stop mode: files named as outfile.{bin,txt}
+         */
+        if (output_base_path) {
+            bin_path = g_strdup_printf("%s.bin", output_base_path);
+            if (enable_debug_text) {
+                txt_path = g_strdup_printf("%s.txt", output_base_path);
+            }
+        }
+    }
+
+    if (bin_path) {
         current_segment->bin_file = fopen(bin_path, "wb");
         if (!current_segment->bin_file) {
             fprintf(stderr, "wptrace: cannot open binary output: %s\n",
                     bin_path);
         }
+    }
 
-        if (enable_debug_text) {
-            g_autofree char *txt_path = g_strdup_printf("%s_%s.txt",
-                                                         output_base_path,
-                                                         label);
-            current_segment->text_file = fopen(txt_path, "w");
-            if (!current_segment->text_file) {
-                fprintf(stderr, "wptrace: cannot open text output: %s\n",
-                        txt_path);
-            }
+    if (txt_path) {
+        current_segment->text_file = fopen(txt_path, "w");
+        if (!current_segment->text_file) {
+            fprintf(stderr, "wptrace: cannot open text output: %s\n",
+                    txt_path);
         }
     }
 
@@ -1421,17 +1444,9 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
         g_array_append_val(current_segment->body_entries, entry);
     } else {
-        /* Still run wrong-path for statistics even if not tracing */
-        if (enable_wrong_path && wrong_target != 0) {
-            GArray *wp = simulate_wrong_path_ext(
-                prev_last, current_pc, wrong_target, cpu_index);
-            /* Free wp chain */
-            for (guint i = 0; i < wp->len; i++) {
-                wp_bb_entry_clear(&g_array_index(wp, WPBBEntry, i));
-            }
-            g_array_unref(wp);
-        } else if (wrong_target == 0) {
-            stat_wp_skipped++;
+        /* Clear any accumulated memory accesses when not tracing */
+        if (cp_mem_accesses) {
+            g_array_set_size(cp_mem_accesses, 0);
         }
     }
 }
@@ -1467,10 +1482,10 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         insn_bytes_arr[i] = g_new0(uint8_t, insn_sizes[i]);
         qemu_plugin_insn_data(insn, insn_bytes_arr[i], insn_sizes[i]);
 
-        /* Register per-instruction memory callback */
+        /* Register per-instruction memory callback with PC as udata */
         qemu_plugin_register_vcpu_mem_cb(
             insn, vcpu_mem_cb, QEMU_PLUGIN_CB_NO_REGS,
-            QEMU_PLUGIN_MEM_RW, NULL);
+            QEMU_PLUGIN_MEM_RW, (void *)(uintptr_t)insn_pcs[i]);
     }
 
     /* Create or update BB template */
@@ -1547,11 +1562,14 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
             }
             write_simpoints_file(sp_path, specs);
 
-            qemu_plugin_outs(
-                g_strdup_printf("SimPoints discovery complete: "
-                                "%" G_GUINT32_FORMAT " intervals, "
-                                "%u simpoints written to %s\n",
-                                bbv_collection->len, specs->len, sp_path));
+            {
+                g_autofree char *msg = g_strdup_printf(
+                    "SimPoints discovery complete: "
+                    "%" G_GUINT32_FORMAT " intervals, "
+                    "%u simpoints written to %s\n",
+                    bbv_collection->len, specs->len, sp_path);
+                qemu_plugin_outs(msg);
+            }
 
             g_array_unref(specs);
         }
@@ -1629,6 +1647,18 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     if (cp_mem_accesses) {
         g_array_unref(cp_mem_accesses);
     }
+    if (bbv_bb_map) {
+        g_hash_table_unref(bbv_bb_map);
+    }
+    if (simpoint_specs) {
+        g_array_unref(simpoint_specs);
+    }
+    g_hash_table_unref(template_map);
+    g_hash_table_unref(branch_map);
+    qemu_plugin_scoreboard_free(vcpu_sb);
+    g_free(output_base_path);
+    g_free(program_name);
+    g_free(simpoint_file_path);
 }
 
 /* ========================= Plugin Installation ========================= */

@@ -587,7 +587,7 @@ bool qemu_plugin_exec_inline_insn(void)
     return cpu_plugin_exec_inline(current_cpu);
 }
 
-void qemu_plugin_spec_mode_begin(void)
+void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
 {
     g_assert(current_cpu);
     g_assert(!current_cpu->plugin_spec_mode);
@@ -596,15 +596,24 @@ void qemu_plugin_spec_mode_begin(void)
                                                            g_direct_equal);
     current_cpu->plugin_spec_page_cache = g_hash_table_new(g_direct_hash,
                                                             g_direct_equal);
+    current_cpu->plugin_spec_saved_state = saved_state;
     current_cpu->plugin_spec_mode = true;
 }
 
 void qemu_plugin_spec_mode_end(void)
 {
     g_assert(current_cpu);
-    g_assert(current_cpu->plugin_spec_mode);
+    /*
+     * In the normal path, plugin_spec_mode is true here.
+     * In the longjmp cleanup path, it may already be false if this
+     * is called as part of recovery after an exception.
+     */
+    if (!current_cpu->plugin_spec_mode) {
+        return;
+    }
 
     current_cpu->plugin_spec_mode = false;
+    current_cpu->plugin_spec_saved_state = NULL;
     if (current_cpu->plugin_spec_store_buf) {
         g_hash_table_destroy(current_cpu->plugin_spec_store_buf);
         current_cpu->plugin_spec_store_buf = NULL;

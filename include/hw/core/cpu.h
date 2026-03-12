@@ -556,6 +556,14 @@ struct CPUState {
     bool plugin_spec_mode;
     GHashTable *plugin_spec_store_buf;
     GHashTable *plugin_spec_page_cache;
+
+    /*
+     * Saved CPU state snapshot for wrong-path recovery.
+     * Set by the plugin before entering speculative mode, read by
+     * cpu_exec_longjmp_cleanup if an exception escapes wrong-path
+     * execution so we can restore the correct architectural state.
+     */
+    struct qemu_plugin_cpu_state *plugin_spec_saved_state;
 #endif
 
     /* TODO Move common fields from CPUArchState here. */

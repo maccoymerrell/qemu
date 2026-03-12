@@ -534,8 +534,8 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     wp_mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
     wp_in_progress = true;
 
-    /* Enter speculative mode */
-    qemu_plugin_spec_mode_begin();
+    /* Enter speculative mode, providing saved state for exception recovery */
+    qemu_plugin_spec_mode_begin(saved_state);
 
     /* Set PC to wrong-path target */
     qemu_plugin_set_pc(wrong_target);

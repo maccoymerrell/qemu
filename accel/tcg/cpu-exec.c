@@ -34,10 +34,12 @@
 #include "exec/log.h"
 #include "qemu/main-loop.h"
 #include "exec/cpu-all.h"
+#include "exec/exec-all.h"
 #include "system/cpu-timers.h"
 #include "exec/replay-core.h"
 #include "system/tcg.h"
 #include "exec/helper-proto-common.h"
+#include "qemu/qemu-plugin.h"
 #include "tb-jmp-cache.h"
 #include "tb-hash.h"
 #include "tb-context.h"
@@ -527,6 +529,27 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
     /* Non-buggy compilers preserve this; assert the correct value. */
     g_assert(cpu == current_cpu);
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * If an exception occurred during speculative (wrong-path) execution,
+     * clean up the speculative state.  Without this, the store buffer and
+     * page cache would leak and the CPU state would remain corrupted.
+     */
+    if (cpu->plugin_spec_mode) {
+        qemu_plugin_spec_mode_end();
+        /*
+         * Restore CPU state from the snapshot saved before wrong-path
+         * execution began.  The plugin stashes this in
+         * plugin_spec_saved_state.
+         */
+        if (cpu->plugin_spec_saved_state) {
+            qemu_plugin_cpu_state_restore(cpu->plugin_spec_saved_state);
+            qemu_plugin_cpu_state_free(cpu->plugin_spec_saved_state);
+            cpu->plugin_spec_saved_state = NULL;
+        }
+    }
+#endif
+
 #ifdef CONFIG_USER_ONLY
     clear_helper_retaddr();
     if (have_mmap_lock()) {
@@ -650,6 +673,19 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
      */
     cflags |= CF_MEMI_ONLY;
 
+    /*
+     * Before attempting translation, verify the PC page is mapped.
+     * During wrong-path execution the PC may point to unmapped memory;
+     * probing non-faultingly avoids an exception in tb_gen_code.
+     */
+    void *host;
+    int pflags = probe_access_flags(env, pc, 1, MMU_INST_FETCH,
+                                    cpu_mmu_index(cpu, true),
+                                    true, &host, 0);
+    if (pflags & TLB_INVALID_MASK) {
+        return false;
+    }
+
     tb = tb_lookup(cpu, pc, cs_base, flags, cflags);
     if (tb == NULL) {
         mmap_lock();
@@ -667,20 +703,6 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
      * to cpu->running. Save and restore to avoid assertion failures.
      */
     saved_running = cpu->running;
-
-    /*
-     * Safety net: catch exceptions that occur during wrong-path execution.
-     * During speculative execution, instructions may access invalid memory
-     * or trigger faults. The page validity checks in the TLB helpers
-     * handle most cases, but this sigsetjmp catches any remaining
-     * exceptions (e.g. from tb_gen_code or unexpected faults).
-     */
-    if (sigsetjmp(cpu->jmp_env, 0) != 0) {
-        cpu_exec_longjmp_cleanup(cpu);
-        cpu->running = saved_running;
-        return false;
-    }
-
     cpu_tb_exec(cpu, tb, &tb_exit);
     cpu->running = saved_running;
 

@@ -26,6 +26,16 @@
 void cpu_exec_init_all(void);
 void cpu_exec_step_atomic(CPUState *cpu);
 
+/**
+ * cpu_plugin_exec_inline() - Execute one instruction at the current PC.
+ *
+ * Designed to be called from within a plugin callback context where
+ * the CPU is already running. Does not manage exclusive context.
+ *
+ * Returns true on success, false on failure.
+ */
+bool cpu_plugin_exec_inline(CPUState *cpu);
+
 #define REAL_HOST_PAGE_ALIGN(addr) ROUND_UP((addr), qemu_real_host_page_size())
 
 /* The CPU list lock nests outside page_(un)lock or mmap_(un)lock */

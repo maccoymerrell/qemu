@@ -1,10 +1,31 @@
 /*
  * Wrong-Path Tracing Plugin for QEMU
  *
- * This plugin simulates speculative wrong-path execution at branch points
- * during correct-path execution. At each branch, it determines the "wrong"
- * direction and walks through previously-observed basic blocks to generate
- * a wrong-path instruction trace, up to a configurable depth limit.
+ * This plugin performs fully-faithful speculative wrong-path execution at
+ * branch points. At each branch, it determines the "wrong" direction,
+ * saves the complete CPU state, sets the PC to the wrong-path target, and
+ * actually executes instructions one at a time using QEMU's CPU execution
+ * engine. After reaching the configured depth, it restores the CPU state
+ * to roll back to the correct path.
+ *
+ * This approach produces fully-realistic wrong-path traces including:
+ *   - Real instruction fetch addresses (IF) from actual code execution
+ *   - Real data fetch addresses (DF) from actual load/store execution
+ *   - Correct address computations based on actual register state
+ *   - Discovery of code paths never seen on the correct path
+ *
+ * Unlike a cached-block replay or memory-read-only approach, this plugin:
+ *   - Actually executes instructions on the wrong path using QEMU's CPU
+ *   - Generates real memory access addresses from actual execution
+ *   - Handles all instruction types including indirect branches
+ *   - Provides the same fidelity as an execution-driven simulator
+ *   - Rolls back CPU state after wrong-path traversal
+ *
+ * Memory isolation: Wrong-path stores are captured in a per-CPU speculative
+ * store buffer rather than modifying real guest memory. Wrong-path loads
+ * check the buffer first (store-to-load forwarding) so dependent wrong-path
+ * instructions see correct speculative values. When wrong-path execution
+ * ends, the buffer is discarded — real memory is never modified.
  *
  * Branch predictions on the wrong path are made using an "infinite" Smith
  * predictor: a hash map from PC to a 2-bit saturating counter that tracks
@@ -13,13 +34,13 @@
  *
  * The implementation is ISA-agnostic: it learns block boundaries and branch
  * targets from QEMU's translation and execution events, requiring no
- * instruction decoding. This means it works with any target architecture
- * (x86, ARM, RISC-V, etc.) without modification.
+ * instruction decoding. The CPU state save/restore uses the GDB register
+ * interface which works with any target architecture.
  *
  * Usage:
  *   -plugin wptrace[,depth=N][,tracefile=PATH]
  *
- *   depth:     Maximum wrong-path depth in basic blocks (default: 64)
+ *   depth:     Maximum wrong-path depth in instructions (default: 64)
  *   tracefile: File path for detailed per-instruction wrong-path traces.
  *              If not specified, only summary statistics are printed at exit.
  *
@@ -45,11 +66,14 @@ static char *trace_path;
 static FILE *trace_file;
 static const char *target_name;
 
+/* Maximum bytes to prefetch for instruction data in trace output */
+#define MAX_INSN_BYTES 16
+
 /* ========================= Data Structures ========================= */
 
 /*
  * Record of a translated basic block. Populated during translation
- * and used during wrong-path simulation to walk speculative paths.
+ * and used during wrong-path simulation to track block boundaries.
  */
 typedef struct {
     uint64_t start_pc;          /* Block start address */
@@ -81,6 +105,17 @@ typedef struct {
     uint64_t prev_fall_through; /* Expected sequential next from prev block */
 } VCPUScoreBoard;
 
+/*
+ * Record of a memory access captured during wrong-path execution.
+ * Collected as we execute instructions on the wrong path to track
+ * both instruction fetches and data fetches.
+ */
+typedef struct {
+    uint64_t insn_pc;           /* PC of the instruction making the access */
+    uint64_t mem_vaddr;         /* Virtual address of the memory access */
+    bool is_store;              /* Whether this was a store operation */
+} WPMemAccess;
+
 /* ========================= Global State ========================= */
 
 static GMutex data_lock;
@@ -92,6 +127,15 @@ static qemu_plugin_u64 sb_current_pc;
 static qemu_plugin_u64 sb_prev_last_pc;
 static qemu_plugin_u64 sb_prev_fall_through;
 
+/*
+ * Wrong-path memory access collection.
+ * During wrong-path execution, memory callbacks append to this list.
+ * Protected by wp_in_progress flag (single-threaded per vCPU).
+ */
+static bool wp_in_progress;
+static GArray *wp_mem_accesses;  /* GArray of WPMemAccess */
+static uint64_t wp_current_insn_pc;  /* PC of currently executing WP insn */
+
 /* Statistics */
 static uint64_t stat_blocks_translated;
 static uint64_t stat_branches_observed;
@@ -100,8 +144,8 @@ static uint64_t stat_branches_not_taken;
 static uint64_t stat_wp_simulations;
 static uint64_t stat_wp_skipped;       /* wrong target unknown */
 static uint64_t stat_wp_total_insns;
-static uint64_t stat_wp_total_blocks;
-static uint64_t stat_wp_early_exits;   /* sim ended at unknown block */
+static uint64_t stat_wp_early_exits;   /* sim ended due to exec failure */
+static uint64_t stat_wp_total_mem_accesses; /* DF observed on wrong-path */
 
 /* ========================= Smith Predictor ========================= */
 
@@ -114,13 +158,10 @@ static uint64_t stat_wp_early_exits;   /* sim ended at unknown block */
  *   2 = Weakly Taken
  *   3 = Strongly Taken
  *
- * Prediction: taken if counter >= 2, not-taken otherwise.
+ * The predictor tracks correct-path branch outcomes. In fully-faithful
+ * mode, wrong-path execution uses QEMU's CPU engine directly, so the
+ * predictor is only used for branch outcome statistics.
  */
-
-static inline bool smith_predict_taken(uint8_t counter)
-{
-    return counter >= 2;
-}
 
 static inline uint8_t smith_update(uint8_t counter, bool taken)
 {
@@ -142,83 +183,188 @@ static void block_record_free(gpointer data)
     g_free(block);
 }
 
+/* ========================= Memory Access Tracking ========================= */
+
+/*
+ * Per-instruction memory access callback.
+ * During wrong-path execution (wp_in_progress), this records the real
+ * data addresses generated by actual instruction execution.
+ * During correct-path execution, this is a no-op.
+ */
+static void vcpu_mem_cb(unsigned int cpu_index,
+                        qemu_plugin_meminfo_t info,
+                        uint64_t vaddr,
+                        void *udata)
+{
+    if (!wp_in_progress || !wp_mem_accesses) {
+        return;
+    }
+
+    WPMemAccess acc = {
+        .insn_pc = wp_current_insn_pc,
+        .mem_vaddr = vaddr,
+        .is_store = qemu_plugin_mem_is_store(info),
+    };
+    g_array_append_val(wp_mem_accesses, acc);
+}
+
 /* ========================= Wrong-Path Simulation ========================= */
 
 /*
- * Simulate wrong-path execution starting from @wrong_target.
+ * Execute wrong-path instructions starting from @wrong_target.
  *
- * Walks through previously-observed basic blocks, using the Smith
- * predictor for branch decisions encountered on the wrong path.
- * Stops when:
- *   - max_wrong_path_depth basic blocks have been traversed
- *   - an unknown (never-translated) block is encountered
+ * This performs FULLY-FAITHFUL wrong-path execution by:
+ *   1. Saving the complete CPU state (all registers via GDB interface)
+ *   2. Setting the PC to the wrong-path target address
+ *   3. Executing instructions one at a time using QEMU's CPU engine
+ *   4. Collecting real memory access addresses from actual execution
+ *   5. Restoring the CPU state to roll back to the correct path
  *
- * Must be called with data_lock held.
+ * Each instruction on the wrong path is actually executed by QEMU,
+ * producing real instruction fetch addresses (IF) and real data fetch
+ * addresses (DF) with correct address computations based on actual
+ * register state.
+ *
+ * The Smith predictor is not needed for block-level navigation since
+ * actual execution follows real branch outcomes. However, we still
+ * track block boundaries for depth counting and trace structure.
+ *
+ * Must be called with data_lock NOT held (execution may trigger
+ * callbacks that need it).
  */
 static void simulate_wrong_path(uint64_t branch_pc,
                                 uint64_t correct_target,
                                 uint64_t wrong_target,
                                 unsigned int cpu_index)
 {
-    uint64_t current_pc = wrong_target;
     uint64_t sim_insns = 0;
-    uint64_t sim_blocks = 0;
     bool early_exit = false;
+    GByteArray *insn_buf = g_byte_array_new();
 
+    /* Save complete CPU state for rollback after wrong-path execution */
+    struct qemu_plugin_cpu_state *saved_state = qemu_plugin_cpu_state_save();
+    if (!saved_state) {
+        stat_wp_early_exits++;
+        stat_wp_simulations++;
+        g_byte_array_unref(insn_buf);
+        return;
+    }
+
+    /* Initialize wrong-path memory access collection */
+    wp_mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
+    wp_in_progress = true;
+
+    /*
+     * Enter speculative mode: all memory writes from wrong-path
+     * instructions will be captured in a per-CPU store buffer
+     * instead of modifying real guest memory.  Wrong-path loads
+     * see the buffered values (store-to-load forwarding) so
+     * dependent instructions produce correct speculative results.
+     */
+    qemu_plugin_spec_mode_begin();
+
+    /* Write simulation header */
+    if (trace_file) {
+        fprintf(trace_file,
+                "WP_BEGIN: cpu=%u branch_pc=0x%" PRIx64
+                " correct=0x%" PRIx64 " wrong=0x%" PRIx64 "\n",
+                cpu_index, branch_pc, correct_target, wrong_target);
+    }
+
+    /* Set PC to the wrong-path target */
+    qemu_plugin_set_pc(wrong_target);
+
+    /* Execute instructions on the wrong path */
     for (int depth = 0; depth < max_wrong_path_depth; depth++) {
-        /* Look up block in our translation cache */
-        BlockRecord *block = g_hash_table_lookup(block_map, &current_pc);
-        if (!block) {
+        /* Read the current PC (updated by previous execution or set_pc) */
+        uint64_t pre_pc = qemu_plugin_get_pc();
+
+        /*
+         * Read instruction bytes at current PC for the trace.
+         * We read before execution to capture the instruction fetch (IF).
+         */
+        g_byte_array_set_size(insn_buf, 0);
+        qemu_plugin_read_memory_vaddr(pre_pc, insn_buf, MAX_INSN_BYTES);
+
+        /* Track current instruction PC for memory callback */
+        wp_current_insn_pc = pre_pc;
+
+        /* Execute exactly one instruction */
+        if (!qemu_plugin_exec_inline_insn()) {
             early_exit = true;
+            if (trace_file) {
+                fprintf(trace_file,
+                        "WP_FAULT: cpu=%u branch_pc=0x%" PRIx64
+                        " depth=%d pc=0x%" PRIx64 "\n",
+                        cpu_index, branch_pc, depth, pre_pc);
+            }
             break;
         }
 
-        sim_blocks++;
+        sim_insns++;
 
-        /* Trace all instructions in this wrong-path block */
-        for (uint32_t i = 0; i < block->n_insns; i++) {
-            sim_insns++;
-            if (trace_file) {
-                fprintf(trace_file,
-                        "WP: cpu=%u branch_pc=0x%" PRIx64
-                        " correct=0x%" PRIx64
-                        " depth=%d pc=0x%" PRIx64 "\n",
-                        cpu_index, branch_pc, correct_target,
-                        depth, block->insn_pcs[i]);
+        /* Write trace entry with instruction fetch and data accesses */
+        if (trace_file) {
+            fprintf(trace_file,
+                    "WP: cpu=%u branch_pc=0x%" PRIx64
+                    " correct=0x%" PRIx64
+                    " depth=%d pc=0x%" PRIx64,
+                    cpu_index, branch_pc, correct_target,
+                    depth, pre_pc);
+
+            /* Include instruction bytes */
+            if (insn_buf->len > 0) {
+                fprintf(trace_file, " bytes=");
+                for (uint32_t b = 0; b < insn_buf->len && b < MAX_INSN_BYTES; b++) {
+                    fprintf(trace_file, "%02x", insn_buf->data[b]);
+                }
             }
-        }
 
-        /* Determine next block on the wrong path */
-        uint64_t end_pc = block->insn_pcs[block->n_insns - 1];
-        BranchRecord *br = g_hash_table_lookup(branch_map, &end_pc);
-
-        if (!br) {
-            /*
-             * No branch record for this block's last instruction.
-             * Default to fall-through.
-             */
-            current_pc = block->fall_through_pc;
-            continue;
-        }
-
-        /* Use Smith predictor for wrong-path branch direction */
-        if (smith_predict_taken(br->smith_counter)) {
-            if (br->has_taken_target) {
-                current_pc = br->taken_target;
-            } else {
-                /* Predicted taken but target unknown; stop simulation */
-                early_exit = true;
-                break;
+            /* Include data memory accesses from this instruction */
+            for (guint m = 0; m < wp_mem_accesses->len; m++) {
+                WPMemAccess *acc = &g_array_index(wp_mem_accesses,
+                                                  WPMemAccess, m);
+                if (acc->insn_pc == pre_pc) {
+                    fprintf(trace_file, " %s=0x%" PRIx64,
+                            acc->is_store ? "store" : "load",
+                            acc->mem_vaddr);
+                    stat_wp_total_mem_accesses++;
+                }
             }
-        } else {
-            current_pc = br->fall_through;
+            fprintf(trace_file, "\n");
         }
     }
+
+    /* Stop wrong-path collection */
+    wp_in_progress = false;
+
+    if (trace_file) {
+        fprintf(trace_file,
+                "WP_END: cpu=%u branch_pc=0x%" PRIx64
+                " insns=%" PRIu64
+                " mem_accesses=%u early_exit=%d\n",
+                cpu_index, branch_pc, sim_insns,
+                wp_mem_accesses->len, early_exit);
+    }
+
+    /*
+     * Exit speculative mode: discard all buffered wrong-path
+     * writes.  Real guest memory is unmodified.
+     */
+    qemu_plugin_spec_mode_end();
+
+    /* Restore CPU state to roll back to correct path */
+    qemu_plugin_cpu_state_restore(saved_state);
+    qemu_plugin_cpu_state_free(saved_state);
+
+    /* Clean up */
+    g_array_unref(wp_mem_accesses);
+    wp_mem_accesses = NULL;
+    g_byte_array_unref(insn_buf);
 
     /* Update statistics */
     stat_wp_simulations++;
     stat_wp_total_insns += sim_insns;
-    stat_wp_total_blocks += sim_blocks;
     if (early_exit) {
         stat_wp_early_exits++;
     }
@@ -235,7 +381,8 @@ static void simulate_wrong_path(uint64_t branch_pc,
  *
  * We compare the current block's PC with the previous block's expected
  * fall-through to determine whether the previous block's branch was
- * taken or not-taken, then trigger wrong-path simulation.
+ * taken or not-taken, then trigger wrong-path execution with full
+ * CPU state save/restore.
  */
 static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 {
@@ -247,6 +394,11 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     /* Skip initial block (no previous context) */
     if (prev_ft == 0) {
+        return;
+    }
+
+    /* Don't trigger wrong-path inside wrong-path execution */
+    if (wp_in_progress) {
         return;
     }
 
@@ -268,10 +420,6 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         br->pc = prev_last;
         br->fall_through = prev_ft;
         br->smith_counter = 1; /* Start weakly not-taken */
-        /*
-         * Key points into the value struct; safe because we only insert
-         * new entries (never duplicates) and use g_hash_table_replace.
-         */
         g_hash_table_replace(branch_map, &br->pc, br);
     }
 
@@ -295,14 +443,18 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         wrong_target = br->taken_target;
     }
 
-    /* Run wrong-path simulation if we know where the wrong path starts */
+    g_mutex_unlock(&data_lock);
+
+    /*
+     * Run wrong-path execution if we know where the wrong path starts.
+     * This is called WITHOUT the data_lock held because execution
+     * triggers callbacks that may need to acquire it.
+     */
     if (wrong_target != 0) {
         simulate_wrong_path(prev_last, current_pc, wrong_target, cpu_index);
     } else {
         stat_wp_skipped++;
     }
-
-    g_mutex_unlock(&data_lock);
 }
 
 /* ========================= Translation Callback ========================= */
@@ -341,12 +493,21 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
         block->insn_pcs[i] = qemu_plugin_insn_vaddr(insn);
         block->insn_sizes[i] = (uint32_t)qemu_plugin_insn_size(insn);
+
+        /*
+         * Register per-instruction memory callback.
+         * During wrong-path execution, these fire and record real
+         * data addresses generated by actual instruction execution.
+         */
+        if (trace_file) {
+            qemu_plugin_register_vcpu_mem_cb(
+                insn, vcpu_mem_cb, QEMU_PLUGIN_CB_NO_REGS,
+                QEMU_PLUGIN_MEM_RW, NULL);
+        }
     }
 
     /*
      * Insert into block map (replaces on retranslation).
-     * Key points into the value struct; g_hash_table_replace stores the
-     * new key before freeing the old value, so this is safe.
      */
     g_mutex_lock(&data_lock);
     g_hash_table_replace(block_map, &block->start_pc, block);
@@ -364,11 +525,11 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
     /*
      * Step 2: Register execution callback (TB-level).
-     * Reads sb_current_pc (just set above) and sb_prev_* (set by
-     * previous block's first-instruction inline ops).
+     * Uses QEMU_PLUGIN_CB_RW_REGS so we can save/restore CPU state
+     * for wrong-path execution and rollback.
      */
     qemu_plugin_register_vcpu_tb_exec_cb(
-        tb, vcpu_tb_exec, QEMU_PLUGIN_CB_NO_REGS, NULL);
+        tb, vcpu_tb_exec, QEMU_PLUGIN_CB_RW_REGS, NULL);
 
     /*
      * Step 3: Update prev_* values for the NEXT block's callback.
@@ -412,26 +573,23 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
         "  Unique branch PCs (Smith predictor entries): %u\n",
         g_hash_table_size(branch_map));
     g_string_append_printf(report,
-        "\nWrong-path simulation:\n");
+        "\nWrong-path execution:\n");
     g_string_append_printf(report,
         "  Simulations performed: %" PRIu64 "\n", stat_wp_simulations);
     g_string_append_printf(report,
         "  Simulations skipped (unknown target): %" PRIu64 "\n",
         stat_wp_skipped);
     g_string_append_printf(report,
-        "  Total wrong-path instructions traced: %" PRIu64 "\n",
+        "  Total wrong-path instructions executed: %" PRIu64 "\n",
         stat_wp_total_insns);
     g_string_append_printf(report,
-        "  Total wrong-path blocks traversed: %" PRIu64 "\n",
-        stat_wp_total_blocks);
+        "  Total wrong-path data accesses: %" PRIu64 "\n",
+        stat_wp_total_mem_accesses);
     g_string_append_printf(report,
-        "  Early exits (unknown block on path): %" PRIu64 "\n",
+        "  Early exits (execution fault): %" PRIu64 "\n",
         stat_wp_early_exits);
 
     if (stat_wp_simulations > 0) {
-        g_string_append_printf(report,
-            "  Average wrong-path depth: %.1f blocks\n",
-            (double)stat_wp_total_blocks / stat_wp_simulations);
         g_string_append_printf(report,
             "  Average wrong-path length: %.1f instructions\n",
             (double)stat_wp_total_insns / stat_wp_simulations);

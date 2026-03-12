@@ -111,6 +111,8 @@ typedef struct {
     uint32_t template_id;       /* BB template ID (or UINT32_MAX if new) */
     uint64_t start_pc;          /* Start PC (for identification) */
     GArray *dyn_params;         /* GArray of DynParam */
+    uint32_t n_insns_executed;  /* Number of insns executed in this WP BB */
+    bool exception;             /* True if WP BB ended due to exception */
 } WPBBEntry;
 
 /*
@@ -431,6 +433,8 @@ static WPBBEntry create_wp_bb_entry(uint64_t bb_start_pc,
 
     entry.start_pc = bb_start_pc;
     entry.dyn_params = g_array_new(false, false, sizeof(DynParam));
+    entry.n_insns_executed = n_insns;
+    entry.exception = false;
 
     /* Try to find existing template */
     g_mutex_lock(&data_lock);
@@ -530,8 +534,8 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     wp_mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
     wp_in_progress = true;
 
-    /* Enter speculative mode */
-    qemu_plugin_spec_mode_begin();
+    /* Enter speculative mode, providing saved state for exception recovery */
+    qemu_plugin_spec_mode_begin(saved_state);
 
     /* Set PC to wrong-path target */
     qemu_plugin_set_pc(wrong_target);
@@ -629,7 +633,15 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         WPBBEntry wp_bb = create_wp_bb_entry(
             bb_start_pc, bb_insn_pcs, bb_insn_sizes,
             bb_insn_bytes, wp_mem_accesses, bb_mem_start_idx);
+        if (early_exit) {
+            wp_bb.exception = true;
+        }
         g_array_append_val(wp_chain, wp_bb);
+    } else if (early_exit && wp_chain->len > 0) {
+        /* Exception on first insn of new BB - mark previous BB */
+        WPBBEntry *last = &g_array_index(wp_chain, WPBBEntry,
+                                          wp_chain->len - 1);
+        last->exception = true;
     }
 
     /* Stop wrong-path collection */
@@ -758,6 +770,10 @@ static void write_text_body(FILE *f, GArray *body_entries)
                         break;
                     }
                 }
+                if (wp->exception) {
+                    fprintf(f, " EXCEPTION");
+                }
+                fprintf(f, " n_insns=%" PRIu32, wp->n_insns_executed);
                 fprintf(f, "]");
             }
         }
@@ -901,6 +917,8 @@ static void write_bin_body(FILE *f, GArray *body_entries)
             write_u32(f, wp->template_id);
             write_u64(f, wp->start_pc);
             write_u16(f, (uint16_t)wp->dyn_params->len);
+            write_u32(f, wp->n_insns_executed);
+            write_u8(f, wp->exception ? 1 : 0);
 
             for (guint d = 0; d < wp->dyn_params->len; d++) {
                 DynParam *dp = &g_array_index(wp->dyn_params, DynParam, d);

@@ -1130,10 +1130,17 @@ bool qemu_plugin_exec_inline_insn(void);
  * before executing wrong-path instructions, then call
  * qemu_plugin_spec_mode_end() to discard all speculative writes.
  *
+ * @saved_state: optional CPU state snapshot taken before wrong-path
+ *               execution.  If non-NULL and an exception longjmps
+ *               out of wrong-path execution, the cleanup handler
+ *               restores this snapshot before resuming normal
+ *               execution.  Ownership remains with the caller on
+ *               the normal (non-exception) path.
+ *
  * Must be paired with qemu_plugin_spec_mode_end().
  */
 QEMU_PLUGIN_API
-void qemu_plugin_spec_mode_begin(void);
+void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state);
 
 /**
  * qemu_plugin_spec_mode_end() - exit speculative execution mode

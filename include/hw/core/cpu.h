@@ -539,6 +539,17 @@ struct CPUState {
 
 #ifdef CONFIG_PLUGIN
     CPUPluginState *plugin_state;
+
+    /*
+     * Wrong-path speculative store buffer.
+     * When plugin_spec_mode is true, all guest memory stores are
+     * redirected to a per-CPU hash table (spec_store_buf) instead
+     * of modifying real guest memory. Loads check the buffer first
+     * for store-to-load forwarding. The buffer is discarded when
+     * speculative mode ends.
+     */
+    bool plugin_spec_mode;
+    GHashTable *plugin_spec_store_buf;
 #endif
 
     /* TODO Move common fields from CPUArchState here. */

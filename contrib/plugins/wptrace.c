@@ -21,6 +21,12 @@
  *   - Provides the same fidelity as an execution-driven simulator
  *   - Rolls back CPU state after wrong-path traversal
  *
+ * Memory isolation: Wrong-path stores are captured in a per-CPU speculative
+ * store buffer rather than modifying real guest memory. Wrong-path loads
+ * check the buffer first (store-to-load forwarding) so dependent wrong-path
+ * instructions see correct speculative values. When wrong-path execution
+ * ends, the buffer is discarded — real memory is never modified.
+ *
  * Branch predictions on the wrong path are made using an "infinite" Smith
  * predictor: a hash map from PC to a 2-bit saturating counter that tracks
  * which way correct-path branches go. The counter saturates at 0 and 3,
@@ -248,6 +254,15 @@ static void simulate_wrong_path(uint64_t branch_pc,
     wp_mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
     wp_in_progress = true;
 
+    /*
+     * Enter speculative mode: all memory writes from wrong-path
+     * instructions will be captured in a per-CPU store buffer
+     * instead of modifying real guest memory.  Wrong-path loads
+     * see the buffered values (store-to-load forwarding) so
+     * dependent instructions produce correct speculative results.
+     */
+    qemu_plugin_spec_mode_begin();
+
     /* Write simulation header */
     if (trace_file) {
         fprintf(trace_file,
@@ -331,6 +346,12 @@ static void simulate_wrong_path(uint64_t branch_pc,
                 cpu_index, branch_pc, sim_insns,
                 wp_mem_accesses->len, early_exit);
     }
+
+    /*
+     * Exit speculative mode: discard all buffered wrong-path
+     * writes.  Real guest memory is unmodified.
+     */
+    qemu_plugin_spec_mode_end();
 
     /* Restore CPU state to roll back to correct path */
     qemu_plugin_cpu_state_restore(saved_state);

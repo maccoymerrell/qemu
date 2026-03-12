@@ -46,7 +46,6 @@
 #include "exec/translation-block.h"
 #include "exec/translator.h"
 #include "exec/tb-flush.h"
-#include "exec/cputlb.h"
 #include "exec/cpu-common.h"
 #include "disas/disas.h"
 #include "plugin.h"
@@ -456,6 +455,24 @@ bool qemu_plugin_read_memory_vaddr(uint64_t addr, GByteArray *data, size_t len)
         return false;
     }
 
+    /*
+     * If in speculative mode, overlay any bytes from the speculative
+     * store buffer on top of the data just read from real memory.
+     * This provides store-to-load forwarding for plugin API reads.
+     */
+    if (current_cpu->plugin_spec_mode &&
+        current_cpu->plugin_spec_store_buf) {
+        for (size_t i = 0; i < len; i++) {
+            gpointer v;
+            if (g_hash_table_lookup_extended(
+                    current_cpu->plugin_spec_store_buf,
+                    GUINT_TO_POINTER((guintptr)(addr + i)),
+                    NULL, &v)) {
+                data->data[i] = (uint8_t)GPOINTER_TO_UINT(v);
+            }
+        }
+    }
+
     return true;
 }
 
@@ -527,11 +544,10 @@ bool qemu_plugin_cpu_state_restore(struct qemu_plugin_cpu_state *state)
     }
 
     /*
-     * After restoring registers, flush the TB and TLB caches to ensure
+     * After restoring registers, flush the TB cache to ensure
      * the CPU picks up the restored PC and any changed state.
      */
     tb_flush(current_cpu);
-    tlb_flush(current_cpu);
 
     return true;
 }
@@ -569,6 +585,28 @@ bool qemu_plugin_exec_inline_insn(void)
 {
     g_assert(current_cpu);
     return cpu_plugin_exec_inline(current_cpu);
+}
+
+void qemu_plugin_spec_mode_begin(void)
+{
+    g_assert(current_cpu);
+    g_assert(!current_cpu->plugin_spec_mode);
+
+    current_cpu->plugin_spec_store_buf = g_hash_table_new(g_direct_hash,
+                                                           g_direct_equal);
+    current_cpu->plugin_spec_mode = true;
+}
+
+void qemu_plugin_spec_mode_end(void)
+{
+    g_assert(current_cpu);
+    g_assert(current_cpu->plugin_spec_mode);
+
+    current_cpu->plugin_spec_mode = false;
+    if (current_cpu->plugin_spec_store_buf) {
+        g_hash_table_destroy(current_cpu->plugin_spec_store_buf);
+        current_cpu->plugin_spec_store_buf = NULL;
+    }
 }
 
 struct qemu_plugin_scoreboard *qemu_plugin_scoreboard_new(size_t element_size)

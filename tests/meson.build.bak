@@ -79,7 +79,7 @@ endif
 subdir('decode')
 
 if 'CONFIG_TCG' in config_all_accel
-  # subdir('fp') # Disabled due to missing subproject
+  subdir('fp')
   subdir('tcg/plugins')
 endif
 

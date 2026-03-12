@@ -48,6 +48,71 @@
 #endif
 #include "tcg/tcg-ldst.h"
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Speculative store buffer helpers for wrong-path execution.
+ *
+ * When a plugin enters speculative mode (cpu->plugin_spec_mode == true),
+ * all guest memory writes are redirected to a per-byte hash table
+ * (cpu->plugin_spec_store_buf) instead of modifying real guest memory.
+ * Loads check the buffer first for store-to-load forwarding, falling
+ * back to real memory for bytes not in the buffer.
+ *
+ * The buffer maps guest vaddr (per byte) → byte value.
+ */
+
+static inline bool cpu_plugin_spec_active(CPUState *cpu)
+{
+    return unlikely(cpu->plugin_spec_mode && cpu->plugin_spec_store_buf);
+}
+
+static inline void spec_store_byte(CPUState *cpu, vaddr addr, uint8_t val)
+{
+    g_hash_table_insert(cpu->plugin_spec_store_buf,
+                        GUINT_TO_POINTER((guintptr)addr),
+                        GUINT_TO_POINTER((guint)val));
+}
+
+static inline bool spec_load_byte(CPUState *cpu, vaddr addr, uint8_t *val)
+{
+    gpointer v;
+    if (g_hash_table_lookup_extended(cpu->plugin_spec_store_buf,
+                                     GUINT_TO_POINTER((guintptr)addr),
+                                     NULL, &v)) {
+        *val = (uint8_t)GPOINTER_TO_UINT(v);
+        return true;
+    }
+    return false;
+}
+
+/* Store N bytes to the speculative buffer (little-endian layout in memory) */
+static void spec_store_bytes(CPUState *cpu, vaddr addr,
+                             const void *buf, int size)
+{
+    const uint8_t *p = buf;
+    for (int i = 0; i < size; i++) {
+        spec_store_byte(cpu, addr + i, p[i]);
+    }
+}
+
+/*
+ * Load N bytes with store-to-load forwarding.
+ * Checks speculative buffer first for each byte, falls back to
+ * the supplied host address for bytes not in the buffer.
+ */
+static void spec_load_bytes(CPUState *cpu, vaddr guest_addr,
+                            void *host_addr, void *out, int size)
+{
+    uint8_t *hp = host_addr;
+    uint8_t *op = out;
+    for (int i = 0; i < size; i++) {
+        if (!spec_load_byte(cpu, guest_addr + i, &op[i])) {
+            op[i] = hp[i];
+        }
+    }
+}
+#endif /* CONFIG_PLUGIN */
+
 /* DEBUG defines, enable DEBUG_TLB_LOG to log to the CPU_LOG_MMU target */
 /* #define DEBUG_TLB */
 /* #define DEBUG_TLB_LOG */
@@ -2248,6 +2313,14 @@ static Int128 do_ld16_beN(CPUState *cpu, MMULookupPageData *p,
 static uint8_t do_ld_1(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
                        MMUAccessType type, uintptr_t ra)
 {
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        uint8_t val;
+        if (spec_load_byte(cpu, p->addr, &val)) {
+            return val;
+        }
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         return do_ld_mmio_beN(cpu, p->full, 0, p->addr, 1, mmu_idx, type, ra);
     } else {
@@ -2260,6 +2333,27 @@ static uint16_t do_ld_2(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
 {
     uint16_t ret;
 
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        /* Read from real memory, then overlay any speculative bytes */
+        if (unlikely(p->flags & TLB_MMIO)) {
+            ret = do_ld_mmio_beN(cpu, p->full, 0, p->addr, 2,
+                                 mmu_idx, type, ra);
+            if ((memop & MO_BSWAP) == MO_LE) {
+                ret = bswap16(ret);
+            }
+        } else {
+            ret = load_atom_2(cpu, ra, p->haddr, memop);
+            if (memop & MO_BSWAP) {
+                ret = bswap16(ret);
+            }
+        }
+        /* Overlay speculative bytes (host endian at this point) */
+        uint16_t host_val = ret;
+        spec_load_bytes(cpu, p->addr, &host_val, &host_val, 2);
+        return host_val;
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         ret = do_ld_mmio_beN(cpu, p->full, 0, p->addr, 2, mmu_idx, type, ra);
         if ((memop & MO_BSWAP) == MO_LE) {
@@ -2280,6 +2374,25 @@ static uint32_t do_ld_4(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
 {
     uint32_t ret;
 
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        if (unlikely(p->flags & TLB_MMIO)) {
+            ret = do_ld_mmio_beN(cpu, p->full, 0, p->addr, 4,
+                                 mmu_idx, type, ra);
+            if ((memop & MO_BSWAP) == MO_LE) {
+                ret = bswap32(ret);
+            }
+        } else {
+            ret = load_atom_4(cpu, ra, p->haddr, memop);
+            if (memop & MO_BSWAP) {
+                ret = bswap32(ret);
+            }
+        }
+        uint32_t host_val = ret;
+        spec_load_bytes(cpu, p->addr, &host_val, &host_val, 4);
+        return host_val;
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         ret = do_ld_mmio_beN(cpu, p->full, 0, p->addr, 4, mmu_idx, type, ra);
         if ((memop & MO_BSWAP) == MO_LE) {
@@ -2300,6 +2413,25 @@ static uint64_t do_ld_8(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
 {
     uint64_t ret;
 
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        if (unlikely(p->flags & TLB_MMIO)) {
+            ret = do_ld_mmio_beN(cpu, p->full, 0, p->addr, 8,
+                                 mmu_idx, type, ra);
+            if ((memop & MO_BSWAP) == MO_LE) {
+                ret = bswap64(ret);
+            }
+        } else {
+            ret = load_atom_8(cpu, ra, p->haddr, memop);
+            if (memop & MO_BSWAP) {
+                ret = bswap64(ret);
+            }
+        }
+        uint64_t host_val = ret;
+        spec_load_bytes(cpu, p->addr, &host_val, &host_val, 8);
+        return host_val;
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         ret = do_ld_mmio_beN(cpu, p->full, 0, p->addr, 8, mmu_idx, type, ra);
         if ((memop & MO_BSWAP) == MO_LE) {
@@ -2660,6 +2792,12 @@ static uint64_t do_st16_leN(CPUState *cpu, MMULookupPageData *p,
 static void do_st_1(CPUState *cpu, MMULookupPageData *p, uint8_t val,
                     int mmu_idx, uintptr_t ra)
 {
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        spec_store_byte(cpu, p->addr, val);
+        return;
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         do_st_mmio_leN(cpu, p->full, val, p->addr, 1, mmu_idx, ra);
     } else if (unlikely(p->flags & TLB_DISCARD_WRITE)) {
@@ -2672,6 +2810,17 @@ static void do_st_1(CPUState *cpu, MMULookupPageData *p, uint8_t val,
 static void do_st_2(CPUState *cpu, MMULookupPageData *p, uint16_t val,
                     int mmu_idx, MemOp memop, uintptr_t ra)
 {
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        /* Swap to host endian before storing byte-by-byte */
+        if (memop & MO_BSWAP) {
+            val = bswap16(val);
+        }
+        uint16_t host_val = val;
+        spec_store_bytes(cpu, p->addr, &host_val, 2);
+        return;
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         if ((memop & MO_BSWAP) != MO_LE) {
             val = bswap16(val);
@@ -2691,6 +2840,16 @@ static void do_st_2(CPUState *cpu, MMULookupPageData *p, uint16_t val,
 static void do_st_4(CPUState *cpu, MMULookupPageData *p, uint32_t val,
                     int mmu_idx, MemOp memop, uintptr_t ra)
 {
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        if (memop & MO_BSWAP) {
+            val = bswap32(val);
+        }
+        uint32_t host_val = val;
+        spec_store_bytes(cpu, p->addr, &host_val, 4);
+        return;
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         if ((memop & MO_BSWAP) != MO_LE) {
             val = bswap32(val);
@@ -2710,6 +2869,16 @@ static void do_st_4(CPUState *cpu, MMULookupPageData *p, uint32_t val,
 static void do_st_8(CPUState *cpu, MMULookupPageData *p, uint64_t val,
                     int mmu_idx, MemOp memop, uintptr_t ra)
 {
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        if (memop & MO_BSWAP) {
+            val = bswap64(val);
+        }
+        uint64_t host_val = val;
+        spec_store_bytes(cpu, p->addr, &host_val, 8);
+        return;
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         if ((memop & MO_BSWAP) != MO_LE) {
             val = bswap64(val);
@@ -2814,6 +2983,16 @@ static void do_st16_mmu(CPUState *cpu, vaddr addr, Int128 val,
 
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        if (l.memop & MO_BSWAP) {
+            val = bswap128(val);
+        }
+        Int128 host_val = val;
+        spec_store_bytes(cpu, addr, &host_val, 16);
+        return;
+    }
+#endif
     if (likely(!crosspage)) {
         if (unlikely(l.page[0].flags & TLB_MMIO)) {
             if ((l.memop & MO_BSWAP) != MO_LE) {

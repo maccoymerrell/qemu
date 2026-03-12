@@ -1116,4 +1116,33 @@ uint64_t qemu_plugin_get_pc(void);
 QEMU_PLUGIN_API
 bool qemu_plugin_exec_inline_insn(void);
 
+/* ================ Speculative Store Buffer API ================ */
+
+/**
+ * qemu_plugin_spec_mode_begin() - enter speculative execution mode
+ *
+ * Initializes the per-CPU speculative store buffer. While active,
+ * all guest memory writes from instruction execution are redirected
+ * to a local cache instead of modifying real guest memory. Guest
+ * memory reads check the buffer first for store-to-load forwarding.
+ *
+ * This is designed for wrong-path execution: enter speculative mode
+ * before executing wrong-path instructions, then call
+ * qemu_plugin_spec_mode_end() to discard all speculative writes.
+ *
+ * Must be paired with qemu_plugin_spec_mode_end().
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_spec_mode_begin(void);
+
+/**
+ * qemu_plugin_spec_mode_end() - exit speculative execution mode
+ *
+ * Discards all speculative writes accumulated since
+ * qemu_plugin_spec_mode_begin() and returns to normal execution.
+ * Real guest memory is unmodified.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_spec_mode_end(void);
+
 #endif /* QEMU_QEMU_PLUGIN_H */

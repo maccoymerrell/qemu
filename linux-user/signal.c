@@ -990,6 +990,19 @@ static void host_sigsegv_handler(CPUState *cpu, siginfo_t *info,
         die_from_signal(info);
     }
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * During speculative (wrong-path) execution the PC may point to
+     * unmapped or read-only memory.  Do not deliver the fault to the
+     * guest; instead, longjmp back to cpu_plugin_exec_inline's
+     * sigsetjmp so the plugin can handle the error gracefully.
+     */
+    if (cpu->plugin_spec_mode) {
+        sigprocmask(SIG_SETMASK, host_signal_mask(uc), NULL);
+        cpu_loop_exit(cpu);
+    }
+#endif
+
     maperr = true;
     if (is_valid && info->si_code == SEGV_ACCERR) {
         /*

@@ -675,6 +675,18 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
     cflags |= CF_MEMI_ONLY;
 
     /*
+     * Force all memory operations through the slow-path helpers so
+     * that the speculative store buffer in user-exec.c / cputlb.c
+     * can intercept every load and store.  Without this, the JIT
+     * fast path would emit inline memory accesses that bypass the
+     * store buffer, causing silent memory corruption or segfaults
+     * on unmapped pages during wrong-path execution.
+     */
+    if (cpu->plugin_spec_mode) {
+        cflags |= CF_FORCE_SLOW;
+    }
+
+    /*
      * Before attempting translation, verify the PC page is mapped.
      * During wrong-path execution the PC may point to unmapped memory;
      * probing non-faultingly avoids an exception in tb_gen_code.
@@ -704,10 +716,37 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
      * to cpu->running. Save and restore to avoid assertion failures.
      */
     saved_running = cpu->running;
-    cpu_tb_exec(cpu, tb, &tb_exit);
-    cpu->running = saved_running;
 
-    return true;
+    /*
+     * Set up a local exception landing pad so that any fault during
+     * wrong-path execution (e.g. SIGSEGV from an unmapped page) is
+     * caught here instead of propagating to the outer cpu_exec loop.
+     * The signal handler skips guest signal delivery when
+     * plugin_spec_mode is set and calls cpu_loop_exit(), which
+     * longjmps back here.
+     */
+    sigjmp_buf saved_jmp_env;
+    memcpy(&saved_jmp_env, &cpu->jmp_env, sizeof(sigjmp_buf));
+
+    if (sigsetjmp(cpu->jmp_env, 0) == 0) {
+        cpu_tb_exec(cpu, tb, &tb_exit);
+        cpu->running = saved_running;
+        memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
+        return true;
+    } else {
+        /* Exception during wrong-path execution; clean up and report */
+        cpu->neg.can_do_io = true;
+        qemu_plugin_disable_mem_helpers(cpu);
+#ifdef CONFIG_USER_ONLY
+        clear_helper_retaddr();
+        if (have_mmap_lock()) {
+            mmap_unlock();
+        }
+#endif
+        cpu->running = saved_running;
+        memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
+        return false;
+    }
 }
 
 void cpu_plugin_flush_tlb(CPUState *cpu)

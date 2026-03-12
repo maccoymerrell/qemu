@@ -202,8 +202,14 @@ static void simulate_wrong_path(uint64_t branch_pc,
         }
 
         /* Use Smith predictor for wrong-path branch direction */
-        if (smith_predict_taken(br->smith_counter) && br->has_taken_target) {
-            current_pc = br->taken_target;
+        if (smith_predict_taken(br->smith_counter)) {
+            if (br->has_taken_target) {
+                current_pc = br->taken_target;
+            } else {
+                /* Predicted taken but target unknown; stop simulation */
+                early_exit = true;
+                break;
+            }
         } else {
             current_pc = br->fall_through;
         }
@@ -262,7 +268,11 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         br->pc = prev_last;
         br->fall_through = prev_ft;
         br->smith_counter = 1; /* Start weakly not-taken */
-        g_hash_table_insert(branch_map, &br->pc, br);
+        /*
+         * Key points into the value struct; safe because we only insert
+         * new entries (never duplicates) and use g_hash_table_replace.
+         */
+        g_hash_table_replace(branch_map, &br->pc, br);
     }
 
     /* Record taken target if this is a taken branch */
@@ -333,7 +343,11 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         block->insn_sizes[i] = (uint32_t)qemu_plugin_insn_size(insn);
     }
 
-    /* Insert into block map (replaces on retranslation) */
+    /*
+     * Insert into block map (replaces on retranslation).
+     * Key points into the value struct; g_hash_table_replace stores the
+     * new key before freeing the old value, so this is safe.
+     */
     g_mutex_lock(&data_lock);
     g_hash_table_replace(block_map, &block->start_pc, block);
     stat_blocks_translated++;

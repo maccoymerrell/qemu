@@ -65,11 +65,18 @@ typedef uint64_t qemu_plugin_id_t;
  *
  * version 4:
  * - added qemu_plugin_read_memory_vaddr
+ *
+ * version 5:
+ * - added qemu_plugin_write_register
+ * - added qemu_plugin_cpu_state_save, qemu_plugin_cpu_state_restore,
+ *   qemu_plugin_cpu_state_free (CPU state snapshot/rollback)
+ * - added qemu_plugin_set_pc (set program counter)
+ * - added qemu_plugin_exec_inline_insn (execute one instruction)
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 4
+#define QEMU_PLUGIN_VERSION 5
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -255,8 +262,8 @@ typedef struct {
  * @QEMU_PLUGIN_CB_R_REGS: callback reads the CPU's regs
  * @QEMU_PLUGIN_CB_RW_REGS: callback reads and writes the CPU's regs
  *
- * Note: currently QEMU_PLUGIN_CB_RW_REGS is unused, plugins cannot change
- * system register state.
+ * QEMU_PLUGIN_CB_RW_REGS enables write_register, cpu_state_restore,
+ * set_pc, and exec_inline_insn from within the callback.
  */
 enum qemu_plugin_cb_flags {
     QEMU_PLUGIN_CB_NO_REGS,
@@ -1001,5 +1008,103 @@ void qemu_plugin_u64_set(qemu_plugin_u64 entry, unsigned int vcpu_index,
  */
 QEMU_PLUGIN_API
 uint64_t qemu_plugin_u64_sum(qemu_plugin_u64 entry);
+
+/* ================ CPU State Snapshot/Rollback API ================ */
+
+/**
+ * struct qemu_plugin_cpu_state - Opaque handle to a saved CPU state
+ *
+ * Holds a complete snapshot of the CPU's register state, captured via
+ * the GDB register interface. Architecture-agnostic: works with any
+ * target (x86, ARM, RISC-V, etc.).
+ */
+struct qemu_plugin_cpu_state;
+
+/**
+ * qemu_plugin_write_register() - write register for current vCPU
+ *
+ * @handle: a @qemu_plugin_reg_handle handle from qemu_plugin_get_registers()
+ * @buf: A GByteArray containing the data to write, in target byte order
+ *
+ * This function is only available in a context that register write access is
+ * explicitly requested via the QEMU_PLUGIN_CB_RW_REGS flag.
+ *
+ * Returns the number of bytes written. On failure returns -1.
+ */
+QEMU_PLUGIN_API
+int qemu_plugin_write_register(struct qemu_plugin_register *handle,
+                               GByteArray *buf);
+
+/**
+ * qemu_plugin_cpu_state_save() - snapshot all CPU registers
+ *
+ * Captures the complete register state of the current vCPU using the
+ * architecture-agnostic GDB register interface. The returned handle
+ * must be freed with qemu_plugin_cpu_state_free().
+ *
+ * This function is only available in a context that register read access is
+ * explicitly requested via QEMU_PLUGIN_CB_R_REGS or QEMU_PLUGIN_CB_RW_REGS.
+ *
+ * Returns an opaque handle to the saved state, or NULL on failure.
+ */
+QEMU_PLUGIN_API
+struct qemu_plugin_cpu_state *qemu_plugin_cpu_state_save(void);
+
+/**
+ * qemu_plugin_cpu_state_restore() - restore previously saved CPU registers
+ *
+ * @state: handle returned by qemu_plugin_cpu_state_save()
+ *
+ * Restores the complete register state of the current vCPU from a
+ * previously saved snapshot. After restoration, translation and TLB
+ * caches are flushed to ensure consistency.
+ *
+ * This function is only available in a context that register write access is
+ * explicitly requested via QEMU_PLUGIN_CB_RW_REGS.
+ *
+ * Returns true on success, false on failure.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_cpu_state_restore(struct qemu_plugin_cpu_state *state);
+
+/**
+ * qemu_plugin_cpu_state_free() - free a CPU state snapshot
+ *
+ * @state: handle returned by qemu_plugin_cpu_state_save()
+ *
+ * Releases all memory associated with the state snapshot.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_cpu_state_free(struct qemu_plugin_cpu_state *state);
+
+/**
+ * qemu_plugin_set_pc() - set the program counter of the current vCPU
+ *
+ * @pc: the new program counter value
+ *
+ * Sets the PC to the given address. Must be used together with
+ * state save/restore for wrong-path execution scenarios.
+ *
+ * This function is only available in a context that register write access is
+ * explicitly requested via QEMU_PLUGIN_CB_RW_REGS.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_set_pc(uint64_t pc);
+
+/**
+ * qemu_plugin_exec_inline_insn() - execute one instruction at current PC
+ *
+ * Translates and executes exactly one instruction at the current program
+ * counter. Plugin instrumentation callbacks are suppressed during this
+ * execution to avoid recursive callbacks.
+ *
+ * This is designed for wrong-path simulation: save state, set PC to wrong
+ * target, execute instructions one at a time collecting memory accesses,
+ * then restore state.
+ *
+ * Returns true on success, false on failure (e.g. unmapped address).
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_exec_inline_insn(void);
 
 #endif /* QEMU_QEMU_PLUGIN_H */

@@ -614,6 +614,63 @@ void cpu_exec_step_atomic(CPUState *cpu)
     end_exclusive();
 }
 
+/*
+ * cpu_plugin_exec_inline() - Execute one instruction at the current PC.
+ *
+ * This is designed to be called from within a plugin callback context,
+ * where the CPU is already running and we are inside the execution loop.
+ * Unlike cpu_exec_step_atomic, this does not manage the exclusive context
+ * or running state.
+ *
+ * The caller must disable plugin instrumentation during this call (by
+ * temporarily setting cpu->plugin_disabled) to avoid recursive callbacks.
+ *
+ * Returns true on success, false on failure (e.g. unmapped PC).
+ */
+bool cpu_plugin_exec_inline(CPUState *cpu)
+{
+    CPUArchState *env = cpu_env(cpu);
+    TranslationBlock *tb;
+    vaddr pc;
+    uint64_t cs_base;
+    uint32_t flags, cflags;
+    int tb_exit;
+    bool saved_running;
+
+    cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
+
+    cflags = curr_cflags(cpu);
+    /* Execute in serial context, exactly 1 instruction, no chaining */
+    cflags &= ~CF_PARALLEL;
+    cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR | 1;
+    /*
+     * Suppress plugin instrumentation for wrong-path execution.
+     * Use CF_MEMI_ONLY to prevent translation-time plugin callbacks
+     * from firing during wrong-path TB generation.
+     */
+    cflags |= CF_MEMI_ONLY;
+
+    tb = tb_lookup(cpu, pc, cs_base, flags, cflags);
+    if (tb == NULL) {
+        mmap_lock();
+        tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
+        mmap_unlock();
+        if (tb == NULL) {
+            return false;
+        }
+    }
+
+    /*
+     * Temporarily mark the CPU as not running to satisfy assertions
+     * inside cpu_tb_exec that may check running state, then restore.
+     */
+    saved_running = cpu->running;
+    cpu_tb_exec(cpu, tb, &tb_exit);
+    cpu->running = saved_running;
+
+    return true;
+}
+
 void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
 {
     /*

@@ -44,6 +44,9 @@
 #include "exec/target_page.h"
 #include "exec/translation-block.h"
 #include "exec/translator.h"
+#include "exec/tb-flush.h"
+#include "exec/cputlb.h"
+#include "exec/cpu-common.h"
 #include "disas/disas.h"
 #include "plugin.h"
 
@@ -460,6 +463,104 @@ int qemu_plugin_read_register(struct qemu_plugin_register *reg, GByteArray *buf)
     g_assert(current_cpu);
 
     return gdb_read_register(current_cpu, buf, GPOINTER_TO_INT(reg) - 1);
+}
+
+int qemu_plugin_write_register(struct qemu_plugin_register *reg,
+                               GByteArray *buf)
+{
+    g_assert(current_cpu);
+
+    return gdb_write_register(current_cpu, buf->data,
+                              GPOINTER_TO_INT(reg) - 1);
+}
+
+/*
+ * CPU state snapshot structure.
+ * Saves all registers via the GDB interface for architecture-agnostic
+ * state capture and rollback.
+ */
+struct qemu_plugin_cpu_state {
+    int n_regs;             /* Number of registers saved */
+    int *reg_ids;           /* GDB register IDs */
+    GByteArray **reg_data;  /* Register value buffers */
+};
+
+struct qemu_plugin_cpu_state *qemu_plugin_cpu_state_save(void)
+{
+    g_assert(current_cpu);
+
+    g_autoptr(GArray) regs = gdb_get_register_list(current_cpu);
+    if (!regs || regs->len == 0) {
+        return NULL;
+    }
+
+    struct qemu_plugin_cpu_state *state = g_new0(struct qemu_plugin_cpu_state,
+                                                 1);
+    state->n_regs = regs->len;
+    state->reg_ids = g_new(int, regs->len);
+    state->reg_data = g_new0(GByteArray *, regs->len);
+
+    for (guint i = 0; i < regs->len; i++) {
+        GDBRegDesc *grd = &g_array_index(regs, GDBRegDesc, i);
+        state->reg_ids[i] = grd->gdb_reg;
+        state->reg_data[i] = g_byte_array_new();
+        gdb_read_register(current_cpu, state->reg_data[i], grd->gdb_reg);
+    }
+
+    return state;
+}
+
+bool qemu_plugin_cpu_state_restore(struct qemu_plugin_cpu_state *state)
+{
+    g_assert(current_cpu);
+
+    if (!state) {
+        return false;
+    }
+
+    for (int i = 0; i < state->n_regs; i++) {
+        if (state->reg_data[i] && state->reg_data[i]->len > 0) {
+            gdb_write_register(current_cpu, state->reg_data[i]->data,
+                               state->reg_ids[i]);
+        }
+    }
+
+    /*
+     * After restoring registers, flush the TB and TLB caches to ensure
+     * the CPU picks up the restored PC and any changed state.
+     */
+    tb_flush(current_cpu);
+    tlb_flush(current_cpu);
+
+    return true;
+}
+
+void qemu_plugin_cpu_state_free(struct qemu_plugin_cpu_state *state)
+{
+    if (!state) {
+        return;
+    }
+    for (int i = 0; i < state->n_regs; i++) {
+        if (state->reg_data[i]) {
+            g_byte_array_unref(state->reg_data[i]);
+        }
+    }
+    g_free(state->reg_ids);
+    g_free(state->reg_data);
+    g_free(state);
+}
+
+void qemu_plugin_set_pc(uint64_t pc)
+{
+    g_assert(current_cpu);
+    g_assert(current_cpu->cc->set_pc);
+    current_cpu->cc->set_pc(current_cpu, (vaddr)pc);
+}
+
+bool qemu_plugin_exec_inline_insn(void)
+{
+    g_assert(current_cpu);
+    return cpu_plugin_exec_inline(current_cpu);
 }
 
 struct qemu_plugin_scoreboard *qemu_plugin_scoreboard_new(size_t element_size)

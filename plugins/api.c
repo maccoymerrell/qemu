@@ -40,6 +40,7 @@
 #include "qemu/plugin.h"
 #include "qemu/log.h"
 #include "tcg/tcg.h"
+#include "hw/core/cpu.h"
 #include "exec/gdbstub.h"
 #include "exec/target_page.h"
 #include "exec/translation-block.h"
@@ -555,6 +556,13 @@ void qemu_plugin_set_pc(uint64_t pc)
     g_assert(current_cpu);
     g_assert(current_cpu->cc->set_pc);
     current_cpu->cc->set_pc(current_cpu, (vaddr)pc);
+}
+
+uint64_t qemu_plugin_get_pc(void)
+{
+    g_assert(current_cpu);
+    g_assert(current_cpu->cc->get_pc);
+    return (uint64_t)current_cpu->cc->get_pc(current_cpu);
 }
 
 bool qemu_plugin_exec_inline_insn(void)

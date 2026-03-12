@@ -70,7 +70,7 @@ typedef uint64_t qemu_plugin_id_t;
  * - added qemu_plugin_write_register
  * - added qemu_plugin_cpu_state_save, qemu_plugin_cpu_state_restore,
  *   qemu_plugin_cpu_state_free (CPU state snapshot/rollback)
- * - added qemu_plugin_set_pc (set program counter)
+ * - added qemu_plugin_set_pc, qemu_plugin_get_pc (program counter access)
  * - added qemu_plugin_exec_inline_insn (execute one instruction)
  */
 
@@ -1090,6 +1090,15 @@ void qemu_plugin_cpu_state_free(struct qemu_plugin_cpu_state *state);
  */
 QEMU_PLUGIN_API
 void qemu_plugin_set_pc(uint64_t pc);
+
+/**
+ * qemu_plugin_get_pc() - get the current program counter
+ *
+ * Returns the current program counter of the current vCPU.
+ * Useful for tracking PC changes during wrong-path execution.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_get_pc(void);
 
 /**
  * qemu_plugin_exec_inline_insn() - execute one instruction at current PC

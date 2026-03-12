@@ -2349,9 +2349,10 @@ static uint16_t do_ld_2(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
             }
         }
         /* Overlay speculative bytes (host endian at this point) */
-        uint16_t host_val = ret;
-        spec_load_bytes(cpu, p->addr, &host_val, &host_val, 2);
-        return host_val;
+        uint16_t src_val = ret;
+        uint16_t out_val;
+        spec_load_bytes(cpu, p->addr, &src_val, &out_val, 2);
+        return out_val;
     }
 #endif
     if (unlikely(p->flags & TLB_MMIO)) {
@@ -2388,9 +2389,10 @@ static uint32_t do_ld_4(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
                 ret = bswap32(ret);
             }
         }
-        uint32_t host_val = ret;
-        spec_load_bytes(cpu, p->addr, &host_val, &host_val, 4);
-        return host_val;
+        uint32_t src_val = ret;
+        uint32_t out_val;
+        spec_load_bytes(cpu, p->addr, &src_val, &out_val, 4);
+        return out_val;
     }
 #endif
     if (unlikely(p->flags & TLB_MMIO)) {
@@ -2427,9 +2429,10 @@ static uint64_t do_ld_8(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
                 ret = bswap64(ret);
             }
         }
-        uint64_t host_val = ret;
-        spec_load_bytes(cpu, p->addr, &host_val, &host_val, 8);
-        return host_val;
+        uint64_t src_val = ret;
+        uint64_t out_val;
+        spec_load_bytes(cpu, p->addr, &src_val, &out_val, 8);
+        return out_val;
     }
 #endif
     if (unlikely(p->flags & TLB_MMIO)) {

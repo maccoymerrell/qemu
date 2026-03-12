@@ -46,6 +46,7 @@
 #include "tb-internal.h"
 #include "internal-common.h"
 #include "internal-target.h"
+#include "exec/cputlb.h"
 
 /* -icount align implementation. */
 
@@ -707,6 +708,11 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
     cpu->running = saved_running;
 
     return true;
+}
+
+void cpu_plugin_flush_tlb(CPUState *cpu)
+{
+    tlb_flush(cpu);
 }
 
 void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)

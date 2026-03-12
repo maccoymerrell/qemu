@@ -592,6 +592,17 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
     g_assert(current_cpu);
     g_assert(!current_cpu->plugin_spec_mode);
 
+    /*
+     * Flush the TLB before entering speculative mode.  Without this,
+     * wrong-path generated addresses can hit stale fast-path TLB entries
+     * whose addends point to valid host memory for a *different* guest page.
+     * The resulting haddr dereference in the load/store fast path causes a
+     * segfault.  Flushing forces every access through the slow path where
+     * our spec-mode interception (page validity probes, store buffer) can
+     * safely handle unmapped or mismatched pages.
+     */
+    cpu_plugin_flush_tlb(current_cpu);
+
     current_cpu->plugin_spec_store_buf = g_hash_table_new(g_direct_hash,
                                                            g_direct_equal);
     current_cpu->plugin_spec_page_cache = g_hash_table_new(g_direct_hash,
@@ -622,6 +633,14 @@ void qemu_plugin_spec_mode_end(void)
         g_hash_table_destroy(current_cpu->plugin_spec_page_cache);
         current_cpu->plugin_spec_page_cache = NULL;
     }
+
+    /*
+     * Flush the TLB after leaving speculative mode.  During wrong-path
+     * execution, TLB entries may have been populated for guest addresses
+     * that are not part of the correct execution path.  These stale entries
+     * could cause incorrect translations once normal execution resumes.
+     */
+    cpu_plugin_flush_tlb(current_cpu);
 }
 
 struct qemu_plugin_scoreboard *qemu_plugin_scoreboard_new(size_t element_size)

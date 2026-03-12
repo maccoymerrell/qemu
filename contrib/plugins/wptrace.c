@@ -561,7 +561,7 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             insn_size = (uint32_t)(post_pc - pre_pc);
             is_sequential = true;
         } else {
-            /* Branch or backwards jump - use block_map if available */
+            /* Branch or backwards jump - use template_map if available */
             g_mutex_lock(&data_lock);
             BBTemplate *known = find_template(bb_start_pc);
             g_mutex_unlock(&data_lock);
@@ -936,17 +936,15 @@ static BBV *bbv_new(uint64_t interval_id)
 static void bbv_increment(BBV *bbv, uint64_t bb_pc, uint64_t n_insns)
 {
     uint32_t bb_idx;
-    gpointer key = GUINT_TO_POINTER((guint)bb_pc);
 
     /* Get or assign a BB index */
-    if (!g_hash_table_contains(bbv_bb_map, key)) {
-        uint32_t *idx = g_new(uint32_t, 1);
-        *idx = next_bb_index++;
-        g_hash_table_insert(bbv_bb_map, key, idx);
-    }
-    uint32_t *idx_ptr = g_hash_table_lookup(bbv_bb_map, key);
+    uint32_t *idx_ptr = g_hash_table_lookup(bbv_bb_map, &bb_pc);
     if (!idx_ptr) {
-        return;
+        uint64_t *new_key = g_new(uint64_t, 1);
+        *new_key = bb_pc;
+        idx_ptr = g_new(uint32_t, 1);
+        *idx_ptr = next_bb_index++;
+        g_hash_table_insert(bbv_bb_map, new_key, idx_ptr);
     }
     bb_idx = *idx_ptr;
 
@@ -1036,7 +1034,7 @@ static GArray *kmeans_cluster(GArray *bbvs, int k)
     /* Initialize centers by picking k evenly-spaced BBVs */
     int *center_indices = g_new0(int, k);
     for (int i = 0; i < k; i++) {
-        center_indices[i] = (int)((int64_t)i * n / k);
+        center_indices[i] = i * n / k;
     }
 
     /* K-means iterations */
@@ -1171,8 +1169,9 @@ static GArray *read_simpoints_file(const char *path)
         return specs;
     }
 
-    char line[256];
-    while (fgets(line, sizeof(line), f)) {
+    char *line = NULL;
+    size_t line_len = 0;
+    while (getline(&line, &line_len, f) != -1) {
         if (line[0] == '#' || line[0] == '\n') {
             continue;
         }
@@ -1183,6 +1182,7 @@ static GArray *read_simpoints_file(const char *path)
             g_array_append_val(specs, sp);
         }
     }
+    free(line);
 
     fclose(f);
     return specs;
@@ -1565,7 +1565,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
             {
                 g_autofree char *msg = g_strdup_printf(
                     "SimPoints discovery complete: "
-                    "%" G_GUINT32_FORMAT " intervals, "
+                    "%u intervals, "
                     "%u simpoints written to %s\n",
                     bbv_collection->len, specs->len, sp_path);
                 qemu_plugin_outs(msg);
@@ -1763,8 +1763,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     /* SimPoints initialization */
     if (simpoint_mode == SP_DISCOVER) {
         bbv_collection = g_array_new(false, false, sizeof(BBV *));
-        bbv_bb_map = g_hash_table_new_full(g_direct_hash, g_direct_equal,
-                                           NULL, g_free);
+        bbv_bb_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                           g_free, g_free);
         current_bbv = bbv_new(0);
     } else if (simpoint_mode == SP_TRACE) {
         simpoint_specs = read_simpoints_file(simpoint_file_path);

@@ -41,6 +41,79 @@
 
 __thread uintptr_t helper_retaddr;
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Speculative store buffer helpers for wrong-path execution (user-mode).
+ *
+ * These mirror the helpers in cputlb.c (system-mode only) but are needed
+ * here because user-exec.c is compiled for CONFIG_USER_ONLY targets while
+ * cputlb.c is compiled only for CONFIG_SYSTEM_ONLY targets.
+ *
+ * When a plugin enters speculative mode (cpu->plugin_spec_mode == true),
+ * all guest memory stores are redirected to a per-byte hash table
+ * (cpu->plugin_spec_store_buf) instead of modifying real guest memory.
+ * Loads check the buffer first for store-to-load forwarding, falling
+ * back to real memory (or zero for unmapped pages).
+ */
+
+static inline bool cpu_plugin_spec_active(CPUState *cpu)
+{
+    return unlikely(cpu->plugin_spec_mode && cpu->plugin_spec_store_buf);
+}
+
+static inline void spec_store_byte(CPUState *cpu, vaddr addr, uint8_t val)
+{
+    g_hash_table_insert(cpu->plugin_spec_store_buf,
+                        GUINT_TO_POINTER((guintptr)addr),
+                        GUINT_TO_POINTER((guint)val));
+}
+
+static inline bool spec_load_byte(CPUState *cpu, vaddr addr, uint8_t *val)
+{
+    gpointer v;
+    if (g_hash_table_lookup_extended(cpu->plugin_spec_store_buf,
+                                     GUINT_TO_POINTER((guintptr)addr),
+                                     NULL, &v)) {
+        *val = (uint8_t)GPOINTER_TO_UINT(v);
+        return true;
+    }
+    return false;
+}
+
+static void spec_store_bytes(CPUState *cpu, vaddr addr,
+                             const void *buf, int size)
+{
+    const uint8_t *p = buf;
+    for (int i = 0; i < size; i++) {
+        spec_store_byte(cpu, addr + i, p[i]);
+    }
+}
+
+/*
+ * Load N bytes with store-to-load forwarding during speculative execution.
+ * Reads from real memory (via host pointer) for accessible pages, overlaying
+ * any bytes present in the speculative store buffer.  For inaccessible pages,
+ * returns zero for bytes not in the buffer.
+ */
+static void spec_load_bytes_user(CPUState *cpu, vaddr guest_addr,
+                                 void *out, int size)
+{
+    uint8_t *op = out;
+    for (int i = 0; i < size; i++) {
+        vaddr byte_addr = guest_addr + i;
+        if (!spec_load_byte(cpu, byte_addr, &op[i])) {
+            /* Not in spec buffer; try real memory */
+            if (guest_addr_valid_untagged(byte_addr) &&
+                (page_get_flags(byte_addr) & PAGE_READ)) {
+                op[i] = *(uint8_t *)g2h(cpu, byte_addr);
+            } else {
+                op[i] = 0;
+            }
+        }
+    }
+}
+#endif /* CONFIG_PLUGIN */
+
 //#define DEBUG_SIGNAL
 
 void cpu_interrupt(CPUState *cpu, int mask)
@@ -1059,6 +1132,14 @@ static uint8_t do_ld1_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
     void *haddr;
     uint8_t ret;
 
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        uint8_t result = 0;
+        spec_load_bytes_user(cpu, addr, &result, 1);
+        return result;
+    }
+#endif
+
     cpu_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     haddr = cpu_mmu_lookup(cpu, addr, get_memop(oi), ra, access_type);
     ret = ldub_p(haddr);
@@ -1072,6 +1153,16 @@ static uint16_t do_ld2_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
     void *haddr;
     uint16_t ret;
     MemOp mop = get_memop(oi);
+
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        spec_load_bytes_user(cpu, addr, &ret, 2);
+        if (mop & MO_BSWAP) {
+            ret = bswap16(ret);
+        }
+        return ret;
+    }
+#endif
 
     cpu_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     haddr = cpu_mmu_lookup(cpu, addr, mop, ra, access_type);
@@ -1091,6 +1182,16 @@ static uint32_t do_ld4_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
     uint32_t ret;
     MemOp mop = get_memop(oi);
 
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        spec_load_bytes_user(cpu, addr, &ret, 4);
+        if (mop & MO_BSWAP) {
+            ret = bswap32(ret);
+        }
+        return ret;
+    }
+#endif
+
     cpu_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     haddr = cpu_mmu_lookup(cpu, addr, mop, ra, access_type);
     ret = load_atom_4(cpu, ra, haddr, mop);
@@ -1108,6 +1209,16 @@ static uint64_t do_ld8_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
     void *haddr;
     uint64_t ret;
     MemOp mop = get_memop(oi);
+
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        spec_load_bytes_user(cpu, addr, &ret, 8);
+        if (mop & MO_BSWAP) {
+            ret = bswap64(ret);
+        }
+        return ret;
+    }
+#endif
 
     cpu_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     haddr = cpu_mmu_lookup(cpu, addr, mop, ra, access_type);
@@ -1127,6 +1238,16 @@ static Int128 do_ld16_mmu(CPUState *cpu, abi_ptr addr,
     Int128 ret;
     MemOp mop = get_memop(oi);
 
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        spec_load_bytes_user(cpu, addr, &ret, 16);
+        if (mop & MO_BSWAP) {
+            ret = bswap128(ret);
+        }
+        return ret;
+    }
+#endif
+
     tcg_debug_assert((mop & MO_SIZE) == MO_128);
     cpu_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     haddr = cpu_mmu_lookup(cpu, addr, mop, ra, MMU_DATA_LOAD);
@@ -1144,6 +1265,13 @@ static void do_st1_mmu(CPUState *cpu, vaddr addr, uint8_t val,
 {
     void *haddr;
 
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        spec_store_byte(cpu, addr, val);
+        return;
+    }
+#endif
+
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     haddr = cpu_mmu_lookup(cpu, addr, get_memop(oi), ra, MMU_DATA_STORE);
     stb_p(haddr, val);
@@ -1155,6 +1283,17 @@ static void do_st2_mmu(CPUState *cpu, vaddr addr, uint16_t val,
 {
     void *haddr;
     MemOp mop = get_memop(oi);
+
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        if (mop & MO_BSWAP) {
+            val = bswap16(val);
+        }
+        uint16_t host_val = val;
+        spec_store_bytes(cpu, addr, &host_val, 2);
+        return;
+    }
+#endif
 
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     haddr = cpu_mmu_lookup(cpu, addr, mop, ra, MMU_DATA_STORE);
@@ -1172,6 +1311,17 @@ static void do_st4_mmu(CPUState *cpu, vaddr addr, uint32_t val,
     void *haddr;
     MemOp mop = get_memop(oi);
 
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        if (mop & MO_BSWAP) {
+            val = bswap32(val);
+        }
+        uint32_t host_val = val;
+        spec_store_bytes(cpu, addr, &host_val, 4);
+        return;
+    }
+#endif
+
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     haddr = cpu_mmu_lookup(cpu, addr, mop, ra, MMU_DATA_STORE);
 
@@ -1188,6 +1338,17 @@ static void do_st8_mmu(CPUState *cpu, vaddr addr, uint64_t val,
     void *haddr;
     MemOp mop = get_memop(oi);
 
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        if (mop & MO_BSWAP) {
+            val = bswap64(val);
+        }
+        uint64_t host_val = val;
+        spec_store_bytes(cpu, addr, &host_val, 8);
+        return;
+    }
+#endif
+
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     haddr = cpu_mmu_lookup(cpu, addr, mop, ra, MMU_DATA_STORE);
 
@@ -1203,6 +1364,17 @@ static void do_st16_mmu(CPUState *cpu, vaddr addr, Int128 val,
 {
     void *haddr;
     MemOpIdx mop = get_memop(oi);
+
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        if (mop & MO_BSWAP) {
+            val = bswap128(val);
+        }
+        Int128 host_val = val;
+        spec_store_bytes(cpu, addr, &host_val, 16);
+        return;
+    }
+#endif
 
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     haddr = cpu_mmu_lookup(cpu, addr, mop, ra, MMU_DATA_STORE);

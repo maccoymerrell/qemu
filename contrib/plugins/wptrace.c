@@ -60,6 +60,9 @@ static char *trace_path;
 static FILE *trace_file;
 static const char *target_name;
 
+/* Maximum bytes to prefetch for instruction data in trace output */
+#define MAX_INSN_BYTES 16
+
 /* ========================= Data Structures ========================= */
 
 /*
@@ -199,13 +202,6 @@ static void vcpu_mem_cb(unsigned int cpu_index,
     g_array_append_val(wp_mem_accesses, acc);
 }
 
-/* ========================= vCPU Init Callback ========================= */
-
-static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
-{
-    /* Nothing needed now - register enumeration handled by new API */
-}
-
 /* ========================= Wrong-Path Simulation ========================= */
 
 /*
@@ -273,7 +269,7 @@ static void simulate_wrong_path(uint64_t branch_pc,
          * We read before execution to capture the instruction fetch (IF).
          */
         g_byte_array_set_size(insn_buf, 0);
-        qemu_plugin_read_memory_vaddr(pre_pc, insn_buf, 16);
+        qemu_plugin_read_memory_vaddr(pre_pc, insn_buf, MAX_INSN_BYTES);
 
         /* Track current instruction PC for memory callback */
         wp_current_insn_pc = pre_pc;
@@ -304,7 +300,7 @@ static void simulate_wrong_path(uint64_t branch_pc,
             /* Include instruction bytes */
             if (insn_buf->len > 0) {
                 fprintf(trace_file, " bytes=");
-                for (uint32_t b = 0; b < insn_buf->len && b < 16; b++) {
+                for (uint32_t b = 0; b < insn_buf->len && b < MAX_INSN_BYTES; b++) {
                     fprintf(trace_file, "%02x", insn_buf->data[b]);
                 }
             }
@@ -645,7 +641,6 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         vcpu_sb, VCPUScoreBoard, prev_fall_through);
 
     /* Register callbacks */
-    qemu_plugin_register_vcpu_init_cb(id, vcpu_init_cb);
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
     qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
 

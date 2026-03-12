@@ -661,8 +661,10 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
     }
 
     /*
-     * Temporarily mark the CPU as not running to satisfy assertions
-     * inside cpu_tb_exec that may check running state, then restore.
+     * cpu_tb_exec may check running state internally.
+     * Since this is called from the vCPU thread's plugin callback,
+     * which is single-threaded per vCPU, there is no concurrent access
+     * to cpu->running. Save and restore to avoid assertion failures.
      */
     saved_running = cpu->running;
     cpu_tb_exec(cpu, tb, &tb_exit);

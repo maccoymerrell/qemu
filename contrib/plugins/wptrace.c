@@ -274,6 +274,12 @@ static void vcpu_mem_cb(unsigned int cpu_index,
                         uint64_t vaddr,
                         void *udata)
 {
+    /*
+     * Recover the instruction PC from the userdata pointer.
+     * This cast-through-pointer pattern is safe for instruction PCs
+     * because QEMU targets 64-bit hosts where sizeof(void*) >= 8,
+     * and 32-bit target PCs always fit in a 32-bit host pointer.
+     */
     uint64_t insn_pc = (uint64_t)(uintptr_t)udata;
 
     g_mutex_lock(&data_lock);
@@ -376,6 +382,12 @@ static void simulate_wrong_path(uint64_t branch_pc,
                     stat_wp_mem_fetches++;
                 } else {
                     stat_wp_mem_fetch_fails++;
+                    /* Fall back to cached bytes from translation time */
+                    if (block->insn_data && block->insn_data[i]) {
+                        g_byte_array_append(mem_buf, block->insn_data[i],
+                                            block->insn_sizes[i]);
+                        mem_ok = true;
+                    }
                 }
 
                 /* Look up last-known memory address for this insn PC */
@@ -640,13 +652,19 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         block->insn_pcs[i] = insn_pc;
         block->insn_sizes[i] = insn_size;
 
-        /* Cache raw instruction bytes for wrong-path reference */
+        /*
+         * Cache raw instruction bytes during translation.
+         * These serve as a fallback if guest memory reads fail during
+         * wrong-path simulation (e.g., if the page is remapped).
+         */
         block->insn_data[i] = g_new(uint8_t, insn_size);
         qemu_plugin_insn_data(insn, block->insn_data[i], insn_size);
 
         /*
          * Register per-instruction memory callback to track data addresses.
-         * The instruction PC is passed as userdata for the address mapping.
+         * The instruction PC is passed as userdata via a pointer cast.
+         * This is safe because QEMU targets 64-bit hosts where
+         * sizeof(void*) >= 8, and 32-bit target PCs fit in 32-bit pointers.
          * Only enabled when tracefile is specified to avoid overhead in
          * summary-only mode.
          */

@@ -667,6 +667,20 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
      * to cpu->running. Save and restore to avoid assertion failures.
      */
     saved_running = cpu->running;
+
+    /*
+     * Safety net: catch exceptions that occur during wrong-path execution.
+     * During speculative execution, instructions may access invalid memory
+     * or trigger faults. The page validity checks in the TLB helpers
+     * handle most cases, but this sigsetjmp catches any remaining
+     * exceptions (e.g. from tb_gen_code or unexpected faults).
+     */
+    if (sigsetjmp(cpu->jmp_env, 0) != 0) {
+        cpu_exec_longjmp_cleanup(cpu);
+        cpu->running = saved_running;
+        return false;
+    }
+
     cpu_tb_exec(cpu, tb, &tb_exit);
     cpu->running = saved_running;
 

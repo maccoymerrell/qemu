@@ -547,9 +547,15 @@ struct CPUState {
      * of modifying real guest memory. Loads check the buffer first
      * for store-to-load forwarding. The buffer is discarded when
      * speculative mode ends.
+     *
+     * The page validity cache (spec_page_cache) tracks which guest
+     * pages are accessible during speculative execution. Accesses
+     * to invalid pages return zero for loads and are silently
+     * discarded for stores, preventing faults on the wrong path.
      */
     bool plugin_spec_mode;
     GHashTable *plugin_spec_store_buf;
+    GHashTable *plugin_spec_page_cache;
 #endif
 
     /* TODO Move common fields from CPUArchState here. */

@@ -111,6 +111,62 @@ static void spec_load_bytes(CPUState *cpu, vaddr guest_addr,
         }
     }
 }
+
+/*
+ * Check if a guest virtual address is accessible during speculative
+ * execution, using the page validity cache to avoid repeated TLB probes.
+ * Returns true if the page is valid and accessible, false otherwise.
+ */
+static bool spec_addr_valid(CPUState *cpu, vaddr addr,
+                            MMUAccessType access_type, int mmu_idx)
+{
+    vaddr page = addr & TARGET_PAGE_MASK;
+
+    /* Check the page validity cache first */
+    if (cpu->plugin_spec_page_cache) {
+        gpointer cached = g_hash_table_lookup(cpu->plugin_spec_page_cache,
+                                              GUINT_TO_POINTER((guintptr)page));
+        if (cached != NULL) {
+            /* Cache entries: GUINT 1 = valid, GUINT 2 = invalid */
+            return GPOINTER_TO_UINT(cached) == 1;
+        }
+    }
+
+    /* Not cached - probe the page non-faultingly */
+    void *host;
+    int flags = probe_access_flags(cpu_env(cpu), addr, 0,
+                                   access_type, mmu_idx,
+                                   true, &host, 0);
+
+    bool valid = !(flags & TLB_INVALID_MASK);
+
+    /* Cache the result */
+    if (cpu->plugin_spec_page_cache) {
+        g_hash_table_insert(cpu->plugin_spec_page_cache,
+                            GUINT_TO_POINTER((guintptr)page),
+                            GUINT_TO_POINTER(valid ? 1u : 2u));
+    }
+
+    return valid;
+}
+
+/*
+ * Load N bytes during speculative execution, falling back to zero for
+ * bytes not in the speculative store buffer.
+ * Used when the target page is invalid (unmapped) during wrong-path
+ * execution - a real processor would raise an exception and not execute
+ * the instruction.
+ */
+static void spec_load_bytes_or_zero(CPUState *cpu, vaddr guest_addr,
+                                    void *out, int size)
+{
+    uint8_t *op = out;
+    for (int i = 0; i < size; i++) {
+        if (!spec_load_byte(cpu, guest_addr + i, &op[i])) {
+            op[i] = 0;
+        }
+    }
+}
 #endif /* CONFIG_PLUGIN */
 
 /* DEBUG defines, enable DEBUG_TLB_LOG to log to the CPU_LOG_MMU target */
@@ -2456,6 +2512,17 @@ static uint8_t do_ld1_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
     MMULookupLocals l;
     bool crosspage;
 
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        int mmu_idx = get_mmuidx(oi);
+        if (!spec_addr_valid(cpu, addr, access_type, mmu_idx)) {
+            uint8_t result;
+            spec_load_bytes_or_zero(cpu, addr, &result, 1);
+            return result;
+        }
+    }
+#endif
+
     cpu_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     crosspage = mmu_lookup(cpu, addr, oi, ra, access_type, &l);
     tcg_debug_assert(!crosspage);
@@ -2470,6 +2537,17 @@ static uint16_t do_ld2_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
     bool crosspage;
     uint16_t ret;
     uint8_t a, b;
+
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        int mmu_idx = get_mmuidx(oi);
+        if (!spec_addr_valid(cpu, addr, access_type, mmu_idx)) {
+            uint16_t result;
+            spec_load_bytes_or_zero(cpu, addr, &result, 2);
+            return result;
+        }
+    }
+#endif
 
     cpu_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     crosspage = mmu_lookup(cpu, addr, oi, ra, access_type, &l);
@@ -2495,6 +2573,17 @@ static uint32_t do_ld4_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
     bool crosspage;
     uint32_t ret;
 
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        int mmu_idx = get_mmuidx(oi);
+        if (!spec_addr_valid(cpu, addr, access_type, mmu_idx)) {
+            uint32_t result;
+            spec_load_bytes_or_zero(cpu, addr, &result, 4);
+            return result;
+        }
+    }
+#endif
+
     cpu_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     crosspage = mmu_lookup(cpu, addr, oi, ra, access_type, &l);
     if (likely(!crosspage)) {
@@ -2515,6 +2604,17 @@ static uint64_t do_ld8_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
     MMULookupLocals l;
     bool crosspage;
     uint64_t ret;
+
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        int mmu_idx = get_mmuidx(oi);
+        if (!spec_addr_valid(cpu, addr, access_type, mmu_idx)) {
+            uint64_t result;
+            spec_load_bytes_or_zero(cpu, addr, &result, 8);
+            return result;
+        }
+    }
+#endif
 
     cpu_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     crosspage = mmu_lookup(cpu, addr, oi, ra, access_type, &l);
@@ -2538,6 +2638,17 @@ static Int128 do_ld16_mmu(CPUState *cpu, vaddr addr,
     uint64_t a, b;
     Int128 ret;
     int first;
+
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        int mmu_idx = get_mmuidx(oi);
+        if (!spec_addr_valid(cpu, addr, MMU_DATA_LOAD, mmu_idx)) {
+            Int128 result;
+            spec_load_bytes_or_zero(cpu, addr, &result, 16);
+            return result;
+        }
+    }
+#endif
 
     cpu_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_LOAD, &l);
@@ -2904,6 +3015,13 @@ static void do_st1_mmu(CPUState *cpu, vaddr addr, uint8_t val,
     MMULookupLocals l;
     bool crosspage;
 
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        spec_store_byte(cpu, addr, val);
+        return;
+    }
+#endif
+
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
     tcg_debug_assert(!crosspage);
@@ -2917,6 +3035,18 @@ static void do_st2_mmu(CPUState *cpu, vaddr addr, uint16_t val,
     MMULookupLocals l;
     bool crosspage;
     uint8_t a, b;
+
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        MemOp memop = get_memop(oi);
+        if (memop & MO_BSWAP) {
+            val = bswap16(val);
+        }
+        uint16_t host_val = val;
+        spec_store_bytes(cpu, addr, &host_val, 2);
+        return;
+    }
+#endif
 
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
@@ -2940,6 +3070,18 @@ static void do_st4_mmu(CPUState *cpu, vaddr addr, uint32_t val,
     MMULookupLocals l;
     bool crosspage;
 
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        MemOp memop = get_memop(oi);
+        if (memop & MO_BSWAP) {
+            val = bswap32(val);
+        }
+        uint32_t host_val = val;
+        spec_store_bytes(cpu, addr, &host_val, 4);
+        return;
+    }
+#endif
+
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
     if (likely(!crosspage)) {
@@ -2960,6 +3102,18 @@ static void do_st8_mmu(CPUState *cpu, vaddr addr, uint64_t val,
 {
     MMULookupLocals l;
     bool crosspage;
+
+#ifdef CONFIG_PLUGIN
+    if (cpu_plugin_spec_active(cpu)) {
+        MemOp memop = get_memop(oi);
+        if (memop & MO_BSWAP) {
+            val = bswap64(val);
+        }
+        uint64_t host_val = val;
+        spec_store_bytes(cpu, addr, &host_val, 8);
+        return;
+    }
+#endif
 
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
@@ -2984,11 +3138,10 @@ static void do_st16_mmu(CPUState *cpu, vaddr addr, Int128 val,
     uint64_t a, b;
     int first;
 
-    cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
-    crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
-        if (l.memop & MO_BSWAP) {
+        MemOp memop = get_memop(oi);
+        if (memop & MO_BSWAP) {
             val = bswap128(val);
         }
         Int128 host_val = val;
@@ -2996,6 +3149,9 @@ static void do_st16_mmu(CPUState *cpu, vaddr addr, Int128 val,
         return;
     }
 #endif
+
+    cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
+    crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
     if (likely(!crosspage)) {
         if (unlikely(l.page[0].flags & TLB_MMIO)) {
             if ((l.memop & MO_BSWAP) != MO_LE) {

@@ -306,9 +306,10 @@ static uint8_t parse_x86_reg(const char *name)
     if (name[0] == 'r' && name[1] >= '0' && name[1] <= '9') {
         char *end;
         long n = strtol(name + 1, &end, 10);
+        /* R8 maps to GPR6 (index = n - 8 + 6 = n - 2) */
         if (n >= 8 && n <= 15 &&
             (*end == '\0' || *end == 'b' || *end == 'w' || *end == 'd')) {
-            return REG_GPR0 + (uint8_t)(n - 8 + 6);
+            return REG_GPR0 + (uint8_t)(n - 2);
         }
     }
 
@@ -365,7 +366,7 @@ static uint8_t parse_aarch64_reg(const char *name)
 
     /* Vector/FP: v0-v31, d0-d31, s0-s31, q0-q31, h0-h31, b0-b31 */
     if ((name[0] == 'v' || name[0] == 'd' || name[0] == 's' ||
-         name[0] == 'q' || name[0] == 'h') &&
+         name[0] == 'q' || name[0] == 'h' || name[0] == 'b') &&
         name[1] >= '0' && name[1] <= '9') {
         int n = atoi(name + 1);
         if (n >= 0 && n < 32) return REG_VEC0 + (uint8_t)n;
@@ -1161,6 +1162,11 @@ static void parse_x86_operands(const char *operands, InsnFields *out)
                 if (i < n_ops - 1) {
                     add_src_reg(out, r);
                 } else {
+                    /*
+                     * Last operand is the destination. For 2-operand SSE
+                     * it is also an implicit source (e.g. addps %xmm0,%xmm1
+                     * means xmm1 += xmm0). Conservative for 3-operand AVX.
+                     */
                     add_src_reg(out, r);
                     add_dst_reg(out, r);
                 }

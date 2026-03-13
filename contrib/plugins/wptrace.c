@@ -312,16 +312,25 @@ static GHashTable *mips_reg_ht;
 static GHashTable *mnemonic_ht;
 
 /*
+ * Bias added to register IDs when storing in hash tables, so that
+ * REG_NONE (0) is distinguishable from a hash-table miss (NULL).
+ * Encode: GUINT_TO_POINTER(reg_id + REG_HASH_BIAS)
+ * Decode: GPOINTER_TO_UINT(val) - REG_HASH_BIAS
+ */
+#define REG_HASH_BIAS 1
+
+/*
  * Build a register-name hash table from a RegEntry array.
- * Values are stored as GUINT_TO_POINTER(reg_id + 1) so that REG_NONE (0)
- * is distinguishable from a hash miss (NULL).
+ * Values are stored with REG_HASH_BIAS so REG_NONE is distinguishable
+ * from a hash miss (NULL).
  */
 static GHashTable *build_reg_hash_table(const RegEntry *entries)
 {
     GHashTable *ht = g_hash_table_new(g_str_hash, g_str_equal);
     for (int i = 0; entries[i].name; i++) {
         g_hash_table_insert(ht, (gpointer)entries[i].name,
-                            GUINT_TO_POINTER((guint)entries[i].reg_id + 1));
+                            GUINT_TO_POINTER((guint)entries[i].reg_id
+                                             + REG_HASH_BIAS));
     }
     return ht;
 }
@@ -335,7 +344,7 @@ static inline bool reg_hash_lookup(GHashTable *ht, const char *name,
 {
     gpointer val = g_hash_table_lookup(ht, name);
     if (val) {
-        *reg_id = (uint8_t)(GPOINTER_TO_UINT(val) - 1);
+        *reg_id = (uint8_t)(GPOINTER_TO_UINT(val) - REG_HASH_BIAS);
         return true;
     }
     return false;
@@ -3906,12 +3915,17 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     branch_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
                                        NULL, g_free);
 
-    /* Build per-ISA register and mnemonic hash tables for O(1) lookup */
+    /* Build per-ISA register hash tables: values are biased uint8_t IDs */
     x86_reg_ht = build_reg_hash_table(x86_reg_entries);
     aarch64_reg_ht = build_reg_hash_table(aarch64_reg_entries);
     riscv_reg_ht = build_reg_hash_table(riscv_reg_entries);
     mips_reg_ht = build_reg_hash_table(mips_reg_entries);
 
+    /*
+     * Build mnemonic hash table: values are pointers to the static
+     * mnemonic_table[] entries (not encoded integers like the register
+     * tables), since each entry carries both opcode and branch_type.
+     */
     mnemonic_ht = g_hash_table_new(g_str_hash, g_str_equal);
     for (int i = 0; mnemonic_table[i].name; i++) {
         g_hash_table_insert(mnemonic_ht, (gpointer)mnemonic_table[i].name,

@@ -543,12 +543,6 @@ bool qemu_plugin_cpu_state_restore(struct qemu_plugin_cpu_state *state)
         }
     }
 
-    /*
-     * After restoring registers, flush the TB cache to ensure
-     * the CPU picks up the restored PC and any changed state.
-     */
-    tb_flush(current_cpu);
-
     return true;
 }
 

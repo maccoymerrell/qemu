@@ -537,16 +537,23 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
      * page cache would leak and the CPU state would remain corrupted.
      */
     if (cpu->plugin_spec_mode) {
-        qemu_plugin_spec_mode_end();
         /*
          * Restore CPU state from the snapshot saved before wrong-path
          * execution began.  The plugin stashes this in
          * plugin_spec_saved_state.
+         *
+         * Save the pointer before calling spec_mode_end(), because
+         * that function clears plugin_spec_saved_state as part of
+         * its cleanup.  Without this, the state would never be
+         * restored and normal execution would resume with corrupted
+         * registers, causing a crash.
          */
-        if (cpu->plugin_spec_saved_state) {
-            qemu_plugin_cpu_state_restore(cpu->plugin_spec_saved_state);
-            qemu_plugin_cpu_state_free(cpu->plugin_spec_saved_state);
-            cpu->plugin_spec_saved_state = NULL;
+        struct qemu_plugin_cpu_state *saved =
+            cpu->plugin_spec_saved_state;
+        qemu_plugin_spec_mode_end();
+        if (saved) {
+            qemu_plugin_cpu_state_restore(saved);
+            qemu_plugin_cpu_state_free(saved);
         }
     }
 #endif

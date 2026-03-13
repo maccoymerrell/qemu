@@ -684,6 +684,9 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
  */
 static void write_text_header(FILE *f)
 {
+    if (!f) {
+        return;
+    }
     GHashTableIter iter;
     gpointer value;
 
@@ -715,6 +718,9 @@ static void write_text_header(FILE *f)
  */
 static void write_text_body(FILE *f, GArray *body_entries)
 {
+    if (!f) {
+        return;
+    }
     fprintf(f, "BODY\n----\n");
 
     for (guint i = 0; i < body_entries->len; i++) {
@@ -799,17 +805,26 @@ static void write_text_trace(FILE *f, GArray *body_entries)
  */
 static inline void write_u8(FILE *f, uint8_t v)
 {
+    if (!f) {
+        return;
+    }
     fwrite(&v, 1, 1, f);
 }
 
 static inline void write_u16(FILE *f, uint16_t v)
 {
+    if (!f) {
+        return;
+    }
     uint8_t buf[2] = { v & 0xFF, (v >> 8) & 0xFF };
     fwrite(buf, 1, 2, f);
 }
 
 static inline void write_u32(FILE *f, uint32_t v)
 {
+    if (!f) {
+        return;
+    }
     uint8_t buf[4] = {
         v & 0xFF, (v >> 8) & 0xFF,
         (v >> 16) & 0xFF, (v >> 24) & 0xFF
@@ -819,6 +834,9 @@ static inline void write_u32(FILE *f, uint32_t v)
 
 static inline void write_u64(FILE *f, uint64_t v)
 {
+    if (!f) {
+        return;
+    }
     uint8_t buf[8] = {
         v & 0xFF, (v >> 8) & 0xFF,
         (v >> 16) & 0xFF, (v >> 24) & 0xFF,
@@ -846,6 +864,9 @@ static inline void write_u64(FILE *f, uint64_t v)
  */
 static void write_bin_header(FILE *f)
 {
+    if (!f) {
+        return;
+    }
     GHashTableIter iter;
     gpointer value;
 
@@ -894,6 +915,9 @@ static void write_bin_header(FILE *f)
  */
 static void write_bin_body(FILE *f, GArray *body_entries)
 {
+    if (!f) {
+        return;
+    }
     write_u32(f, body_entries->len);
 
     for (guint i = 0; i < body_entries->len; i++) {
@@ -1550,6 +1574,30 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         sb_prev_fall_through, fall_through);
 }
 
+/* ========================= Flush Callback ========================= */
+
+/*
+ * Called when the TB cache is flushed.
+ *
+ * During wrong-path execution, tb_gen_code() may trigger tb_flush() when
+ * the code buffer is full. This causes cpu_loop_exit() → longjmp back to
+ * the outer cpu_exec_setjmp() handler, bypassing simulate_wrong_path_ext()'s
+ * cleanup code. The QEMU core recovers spec_mode via cpu_exec_longjmp_cleanup(),
+ * but the plugin's wp_in_progress flag and wp_mem_accesses array are left
+ * in a stale state. Reset them here so subsequent vcpu_tb_exec() callbacks
+ * are not permanently suppressed.
+ */
+static void vcpu_tb_flush(qemu_plugin_id_t id)
+{
+    if (wp_in_progress) {
+        wp_in_progress = false;
+        if (wp_mem_accesses) {
+            g_array_unref(wp_mem_accesses);
+            wp_mem_accesses = NULL;
+        }
+    }
+}
+
 /* ========================= Exit / Statistics ========================= */
 
 static void plugin_exit(qemu_plugin_id_t id, void *p)
@@ -1801,6 +1849,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
 
     /* Register callbacks */
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
+    qemu_plugin_register_flush_cb(id, vcpu_tb_flush);
     qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
 
     return 0;

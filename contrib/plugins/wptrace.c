@@ -312,6 +312,40 @@ static GHashTable *mips_reg_ht;
 static GHashTable *mnemonic_ht;
 
 /*
+ * Prefix classification hash table: maps prefix strings to MnemonicEntry
+ * pointers for O(1) prefix-based mnemonic classification.
+ * Two kinds of entries:
+ *   - Dot-prefixes (e.g. "fadd.", "lr.", "b."): matched by extracting the
+ *     mnemonic up to and including the first '.'.
+ *   - Bare prefixes (e.g. "amo", "cmov", "set"): matched by truncating the
+ *     mnemonic to known prefix lengths (4, then 3).
+ */
+static GHashTable *prefix_ht;
+
+/*
+ * x86 instruction prefix set: contains prefixes like "lock", "rep", etc.
+ * Used to strip instruction prefixes before mnemonic classification.
+ */
+static GHashTable *insn_prefix_ht;
+
+/*
+ * Plugin option hash table: maps option name strings to PluginOptId values
+ * (encoded via GINT_TO_POINTER) for O(1) option dispatch.
+ */
+static GHashTable *option_ht;
+
+enum PluginOptId {
+    OPT_DEPTH = 1,   /* Start at 1 so 0 (NULL) indicates not-found */
+    OPT_OUTFILE,
+    OPT_DEBUG,
+    OPT_WP,
+    OPT_START,
+    OPT_STOP,
+    OPT_PROGRAM,
+    OPT_SPFILE,
+};
+
+/*
  * Bias added to register IDs when storing in hash tables, so that
  * REG_NONE (0) is distinguishable from a hash-table miss (NULL).
  * Encode: GUINT_TO_POINTER(reg_id + REG_HASH_BIAS)
@@ -406,8 +440,8 @@ static uint8_t parse_x86_reg(const char *name)
     }
 
     /* XMM/YMM/ZMM registers */
-    if (strncmp(name, "xmm", 3) == 0 || strncmp(name, "ymm", 3) == 0 ||
-        strncmp(name, "zmm", 3) == 0) {
+    if (name[1] == 'm' && name[2] == 'm' &&
+        (name[0] == 'x' || name[0] == 'y' || name[0] == 'z')) {
         int n = atoi(name + 3);
         if (n >= 0 && n < 32) {
             return REG_VEC0 + (uint8_t)n;
@@ -415,7 +449,7 @@ static uint8_t parse_x86_reg(const char *name)
     }
 
     /* x87 FP stack */
-    if (strncmp(name, "st", 2) == 0) return REG_FPR0;
+    if (name[0] == 's' && name[1] == 't') return REG_FPR0;
 
     return REG_NONE;
 }
@@ -900,6 +934,77 @@ static const MnemonicEntry mnemonic_table[] = {
     {"ecall",    GEN_OP_SYSCALL,  BRANCH_SYSCALL_TYPE},
     {"ebreak",   GEN_OP_SYSCALL,  BRANCH_SYSCALL_TYPE},
     {"fence",    GEN_OP_FENCE,    BRANCH_NONE},
+    /* AArch64 / MIPS unconditional branch */
+    {"b",        GEN_OP_BRANCH,   BRANCH_DIRECT_JUMP},
+    /* AArch64 compare-and-branch / test-and-branch */
+    {"cbz",      GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"cbnz",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"tbz",      GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"tbnz",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    /* MIPS branch-likely variants */
+    {"beql",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"bnel",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"blezl",    GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"bgtzl",    GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"bltzl",    GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"bgezl",    GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    /* MIPS branch-and-link */
+    {"bltzal",   GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"bgezal",   GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {NULL,       0,               0}
+};
+
+/*
+ * Prefix classification table for mnemonic patterns that can't be
+ * handled by exact match. Two kinds of entries:
+ *   - Dot-prefixes (e.g. "fadd."): matched when mnemonic contains '.'
+ *   - Bare prefixes (e.g. "amo"): matched by truncating to prefix length
+ */
+static const MnemonicEntry prefix_class_table[] = {
+    /* AArch64 conditional branches: b.eq, b.ne, b.gt, etc. */
+    {"b.",       GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    /* RISC-V FP instructions with dot suffix */
+    {"fadd.",    GEN_OP_FP_ADD,   BRANCH_NONE},
+    {"fsub.",    GEN_OP_FP_SUB,   BRANCH_NONE},
+    {"fmul.",    GEN_OP_FP_MUL,   BRANCH_NONE},
+    {"fdiv.",    GEN_OP_FP_DIV,   BRANCH_NONE},
+    {"fsqrt.",   GEN_OP_FP_SQRT,  BRANCH_NONE},
+    {"fmv.",     GEN_OP_FP_MOV,   BRANCH_NONE},
+    {"fsgnj.",   GEN_OP_FP_MOV,   BRANCH_NONE},
+    {"fsgnjn.",  GEN_OP_FP_MOV,   BRANCH_NONE},
+    {"fsgnjx.",  GEN_OP_FP_MOV,   BRANCH_NONE},
+    {"fcvt.",    GEN_OP_FP_CVT,   BRANCH_NONE},
+    {"feq.",     GEN_OP_FP_CMP,   BRANCH_NONE},
+    {"flt.",     GEN_OP_FP_CMP,   BRANCH_NONE},
+    {"fle.",     GEN_OP_FP_CMP,   BRANCH_NONE},
+    {"fmadd.",   GEN_OP_FP_MUL,   BRANCH_NONE},
+    {"fmsub.",   GEN_OP_FP_MUL,   BRANCH_NONE},
+    {"fnmadd.",  GEN_OP_FP_MUL,   BRANCH_NONE},
+    {"fnmsub.",  GEN_OP_FP_MUL,   BRANCH_NONE},
+    /* RISC-V atomic ops */
+    {"lr.",      GEN_OP_LOAD,     BRANCH_NONE},
+    {"sc.",      GEN_OP_STORE,    BRANCH_NONE},
+    {"fence.",   GEN_OP_FENCE,    BRANCH_NONE},
+    /* MIPS FP instructions with dot suffix */
+    {"add.",     GEN_OP_FP_ADD,   BRANCH_NONE},
+    {"sub.",     GEN_OP_FP_SUB,   BRANCH_NONE},
+    {"mul.",     GEN_OP_FP_MUL,   BRANCH_NONE},
+    {"div.",     GEN_OP_FP_DIV,   BRANCH_NONE},
+    {"sqrt.",    GEN_OP_FP_SQRT,  BRANCH_NONE},
+    {"mov.",     GEN_OP_FP_MOV,   BRANCH_NONE},
+    {"cvt.",     GEN_OP_FP_CVT,   BRANCH_NONE},
+    {"c.",       GEN_OP_FP_CMP,   BRANCH_NONE},
+    {"madd.",    GEN_OP_FP_MUL,   BRANCH_NONE},
+    {"msub.",    GEN_OP_FP_MUL,   BRANCH_NONE},
+    {"nmadd.",   GEN_OP_FP_MUL,   BRANCH_NONE},
+    {"nmsub.",   GEN_OP_FP_MUL,   BRANCH_NONE},
+    /* Non-dot bare prefixes: matched by truncating mnemonic to 3-4 chars */
+    {"amo",      GEN_OP_XCHG,     BRANCH_NONE},    /* RISC-V atomic */
+    {"cmov",     GEN_OP_CMOV,     BRANCH_NONE},    /* x86 cmov<cc> */
+    {"set",      GEN_OP_SETCC,    BRANCH_NONE},    /* x86 set<cc> */
+    {"nop",      GEN_OP_NOP,      BRANCH_NONE},    /* NOP variants */
+    {"cvt",      GEN_OP_FP_CVT,   BRANCH_NONE},    /* x86 cvt... */
+    {"vcvt",     GEN_OP_FP_CVT,   BRANCH_NONE},    /* x86 vcvt... */
     {NULL,       0,               0}
 };
 
@@ -920,9 +1025,63 @@ static bool lookup_mnemonic(const char *mnem, uint8_t *opcode,
 }
 
 /*
+ * Try to classify a mnemonic by prefix match using O(1) hash lookups.
+ * Two strategies:
+ *   1. Dot-prefix: extract the portion up to and including the first '.'
+ *      and look it up (e.g., "fadd.s" → key "fadd.").
+ *   2. Bare-prefix: truncate the mnemonic to lengths 4 then 3, requiring
+ *      the mnemonic to be strictly longer than the prefix. This handles
+ *      patterns like "cmov<cc>", "set<cc>", "amo*", etc.
+ */
+static bool lookup_prefix_class(const char *mnem, uint8_t *opcode,
+                                uint8_t *branch_type)
+{
+    char buf[16];
+
+    /* Dot-prefix: extract up to first '.' inclusive */
+    const char *dot = strchr(mnem, '.');
+    if (dot) {
+        size_t plen = (size_t)(dot - mnem) + 1;
+        if (plen < sizeof(buf)) {
+            memcpy(buf, mnem, plen);
+            buf[plen] = '\0';
+            const MnemonicEntry *e = g_hash_table_lookup(prefix_ht, buf);
+            if (e) {
+                *opcode = e->opcode;
+                *branch_type = e->branch_type;
+                return true;
+            }
+        }
+    }
+
+    /* Bare-prefix: try lengths 4 then 3 (covers all known non-dot patterns) */
+    size_t mlen = strlen(mnem);
+    for (int plen = 4; plen >= 3; plen--) {
+        if ((size_t)plen < mlen) {
+            memcpy(buf, mnem, plen);
+            buf[plen] = '\0';
+            const MnemonicEntry *e = g_hash_table_lookup(prefix_ht, buf);
+            if (e) {
+                *opcode = e->opcode;
+                *branch_type = e->branch_type;
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+/*
  * Classify a mnemonic string to GenericOpcode + BranchType.
- * Handles x86 size suffixes, AVX v-prefix, conditional branches,
- * cmov/setcc variants, and AArch64 conditional branches.
+ *
+ * Uses a three-level lookup strategy:
+ *   1. Exact match via mnemonic hash table (O(1)).
+ *   2. Prefix match via prefix hash table (O(1) per probe, at most 3 probes).
+ *   3. AVX v-prefix stripping and x86 size-suffix stripping with retry.
+ *
+ * The only remaining strcmp is for the x86 j<cc>/jmp disambiguation,
+ * which requires character manipulation that can't be table-driven.
  */
 static void classify_mnemonic(const char *mnem, uint8_t *opcode,
                               uint8_t *branch_type)
@@ -934,17 +1093,18 @@ static void classify_mnemonic(const char *mnem, uint8_t *opcode,
         return;
     }
 
-    /* Skip x86 lock/rep prefixes (appear before mnemonic separated by space) */
-    if (strncmp(mnem, "lock ", 5) == 0) {
-        mnem += 5;
-    } else if (strncmp(mnem, "rep ", 4) == 0) {
-        mnem += 4;
-    } else if (strncmp(mnem, "repz ", 5) == 0) {
-        mnem += 5;
-    } else if (strncmp(mnem, "repnz ", 6) == 0) {
-        mnem += 6;
-    } else if (strncmp(mnem, "data16 ", 7) == 0) {
-        mnem += 7;
+    /* Strip x86 instruction prefixes (lock, rep, etc.) via hash lookup */
+    const char *sp = strchr(mnem, ' ');
+    if (sp) {
+        size_t plen = (size_t)(sp - mnem);
+        if (plen < 16) {
+            char pfx[16];
+            memcpy(pfx, mnem, plen);
+            pfx[plen] = '\0';
+            if (g_hash_table_contains(insn_prefix_ht, pfx)) {
+                mnem = sp + 1;
+            }
+        }
     }
 
     /* x86 conditional branches: j<cc> (not jmp/jmpq) */
@@ -962,180 +1122,13 @@ static void classify_mnemonic(const char *mnem, uint8_t *opcode,
         }
     }
 
-    /* AArch64 conditional branches: b.eq, b.ne, b.gt, etc. */
-    if (trace_isa == TRACE_ISA_AARCH64 && mnem[0] == 'b' && mnem[1] == '.') {
-        *opcode = GEN_OP_BRANCH;
-        *branch_type = BRANCH_COND_DIRECT;
-        return;
-    }
-
-    /* AArch64 unconditional branch */
-    if (trace_isa == TRACE_ISA_AARCH64 && strcmp(mnem, "b") == 0) {
-        *opcode = GEN_OP_BRANCH;
-        *branch_type = BRANCH_DIRECT_JUMP;
-        return;
-    }
-
-    /* AArch64 ret */
-    if (trace_isa == TRACE_ISA_AARCH64 && strcmp(mnem, "ret") == 0) {
-        *opcode = GEN_OP_RET;
-        *branch_type = BRANCH_RETURN;
-        return;
-    }
-
-    /* AArch64 compare and branch: cbz, cbnz, tbz, tbnz */
-    if (trace_isa == TRACE_ISA_AARCH64 && (strncmp(mnem, "cbz", 3) == 0 ||
-                    strncmp(mnem, "cbnz", 4) == 0 ||
-                    strncmp(mnem, "tbz", 3) == 0 ||
-                    strncmp(mnem, "tbnz", 4) == 0)) {
-        *opcode = GEN_OP_BRANCH;
-        *branch_type = BRANCH_COND_DIRECT;
-        return;
-    }
-
-    /*
-     * RISC-V FP instructions with dot suffix: fadd.s, fsub.d, etc.
-     * Must be checked before table lookup since "fadd.s" != "fadd".
-     */
-    if (trace_isa == TRACE_ISA_RISCV) {
-        if (strncmp(mnem, "fadd.", 5) == 0) {
-            *opcode = GEN_OP_FP_ADD; return;
-        }
-        if (strncmp(mnem, "fsub.", 5) == 0) {
-            *opcode = GEN_OP_FP_SUB; return;
-        }
-        if (strncmp(mnem, "fmul.", 5) == 0) {
-            *opcode = GEN_OP_FP_MUL; return;
-        }
-        if (strncmp(mnem, "fdiv.", 5) == 0) {
-            *opcode = GEN_OP_FP_DIV; return;
-        }
-        if (strncmp(mnem, "fsqrt.", 6) == 0) {
-            *opcode = GEN_OP_FP_SQRT; return;
-        }
-        if (strncmp(mnem, "fmv.", 4) == 0 ||
-            strncmp(mnem, "fsgnj", 5) == 0) {
-            *opcode = GEN_OP_FP_MOV; return;
-        }
-        if (strncmp(mnem, "fcvt.", 5) == 0) {
-            *opcode = GEN_OP_FP_CVT; return;
-        }
-        if (strncmp(mnem, "feq.", 4) == 0 ||
-            strncmp(mnem, "flt.", 4) == 0 ||
-            strncmp(mnem, "fle.", 4) == 0) {
-            *opcode = GEN_OP_FP_CMP; return;
-        }
-        if (strncmp(mnem, "fmadd.", 6) == 0 ||
-            strncmp(mnem, "fmsub.", 6) == 0 ||
-            strncmp(mnem, "fnmadd.", 7) == 0 ||
-            strncmp(mnem, "fnmsub.", 7) == 0) {
-            *opcode = GEN_OP_FP_MUL; return;
-        }
-        /* RISC-V atomic ops: lr.w/d, sc.w/d, amo*.w/d */
-        if (strncmp(mnem, "lr.", 3) == 0) {
-            *opcode = GEN_OP_LOAD; return;
-        }
-        if (strncmp(mnem, "sc.", 3) == 0) {
-            *opcode = GEN_OP_STORE; return;
-        }
-        if (strncmp(mnem, "amo", 3) == 0) {
-            *opcode = GEN_OP_XCHG; return;
-        }
-        /* RISC-V fence instructions */
-        if (strncmp(mnem, "fence", 5) == 0) {
-            *opcode = GEN_OP_FENCE; return;
-        }
-    }
-
-    /*
-     * MIPS FP instructions with dot suffix: add.s, sub.d, etc.
-     * Also MIPS unconditional branch pseudo-instruction: b
-     */
-    if (trace_isa == TRACE_ISA_MIPS) {
-        /* MIPS unconditional branch: b */
-        if (strcmp(mnem, "b") == 0) {
-            *opcode = GEN_OP_BRANCH;
-            *branch_type = BRANCH_DIRECT_JUMP;
-            return;
-        }
-        /* MIPS branch-likely variants: beql, bnel, etc. */
-        if (strncmp(mnem, "beql", 4) == 0 ||
-            strncmp(mnem, "bnel", 4) == 0 ||
-            strncmp(mnem, "blezl", 5) == 0 ||
-            strncmp(mnem, "bgtzl", 5) == 0 ||
-            strncmp(mnem, "bltzl", 5) == 0 ||
-            strncmp(mnem, "bgezl", 5) == 0) {
-            *opcode = GEN_OP_BRANCH;
-            *branch_type = BRANCH_COND_DIRECT;
-            return;
-        }
-        /* MIPS branch-and-link: bltzal, bgezal */
-        if (strcmp(mnem, "bltzal") == 0 ||
-            strcmp(mnem, "bgezal") == 0) {
-            *opcode = GEN_OP_BRANCH;
-            *branch_type = BRANCH_COND_DIRECT;
-            return;
-        }
-        /* MIPS FP with dot suffix */
-        if (strncmp(mnem, "add.", 4) == 0) {
-            *opcode = GEN_OP_FP_ADD; return;
-        }
-        if (strncmp(mnem, "sub.", 4) == 0) {
-            *opcode = GEN_OP_FP_SUB; return;
-        }
-        if (strncmp(mnem, "mul.", 4) == 0) {
-            *opcode = GEN_OP_FP_MUL; return;
-        }
-        if (strncmp(mnem, "div.", 4) == 0) {
-            *opcode = GEN_OP_FP_DIV; return;
-        }
-        if (strncmp(mnem, "sqrt.", 5) == 0) {
-            *opcode = GEN_OP_FP_SQRT; return;
-        }
-        if (strncmp(mnem, "mov.", 4) == 0) {
-            *opcode = GEN_OP_FP_MOV; return;
-        }
-        if (strncmp(mnem, "cvt.", 4) == 0) {
-            *opcode = GEN_OP_FP_CVT; return;
-        }
-        if (strncmp(mnem, "c.", 2) == 0) {
-            *opcode = GEN_OP_FP_CMP; return;
-        }
-        /* MIPS madd/msub FP */
-        if (strncmp(mnem, "madd.", 5) == 0 ||
-            strncmp(mnem, "msub.", 5) == 0 ||
-            strncmp(mnem, "nmadd.", 6) == 0 ||
-            strncmp(mnem, "nmsub.", 6) == 0) {
-            *opcode = GEN_OP_FP_MUL; return;
-        }
-    }
-
-    /* x86 cmov<cc> variants */
-    if (trace_isa == TRACE_ISA_X86 && strncmp(mnem, "cmov", 4) == 0) {
-        *opcode = GEN_OP_CMOV;
-        return;
-    }
-
-    /* x86 set<cc> variants */
-    if (trace_isa == TRACE_ISA_X86 && strncmp(mnem, "set", 3) == 0 && strlen(mnem) > 3) {
-        *opcode = GEN_OP_SETCC;
-        return;
-    }
-
-    /* FP conversion: cvt.../vcvt... (x86) */
-    if (strncmp(mnem, "cvt", 3) == 0 || strncmp(mnem, "vcvt", 4) == 0) {
-        *opcode = GEN_OP_FP_CVT;
-        return;
-    }
-
-    /* NOP variants (x86: nopl, nopw, etc.) */
-    if (strncmp(mnem, "nop", 3) == 0) {
-        *opcode = GEN_OP_NOP;
-        return;
-    }
-
-    /* Direct lookup in table */
+    /* Exact match in mnemonic hash table */
     if (lookup_mnemonic(mnem, opcode, branch_type)) {
+        return;
+    }
+
+    /* Prefix-based classification (dot-prefix and bare-prefix) */
+    if (lookup_prefix_class(mnem, opcode, branch_type)) {
         return;
     }
 
@@ -1144,9 +1137,12 @@ static void classify_mnemonic(const char *mnem, uint8_t *opcode,
         if (lookup_mnemonic(mnem + 1, opcode, branch_type)) {
             return;
         }
+        if (lookup_prefix_class(mnem + 1, opcode, branch_type)) {
+            return;
+        }
     }
 
-    /* x86 size suffix: strip trailing q/l/w/b and retry (x86 only) */
+    /* x86 size suffix: strip trailing q/l/w/b and retry */
     if (trace_isa == TRACE_ISA_X86) {
         size_t len = strlen(mnem);
         if (len > 1) {
@@ -1158,9 +1154,15 @@ static void classify_mnemonic(const char *mnem, uint8_t *opcode,
                 if (lookup_mnemonic(base, opcode, branch_type)) {
                     return;
                 }
+                if (lookup_prefix_class(base, opcode, branch_type)) {
+                    return;
+                }
                 /* Also try AVX v-prefix + stripped suffix */
                 if (base[0] == 'v' && strlen(base) > 1) {
                     if (lookup_mnemonic(base + 1, opcode, branch_type)) {
+                        return;
+                    }
+                    if (lookup_prefix_class(base + 1, opcode, branch_type)) {
                         return;
                     }
                 }
@@ -3821,6 +3823,9 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     g_hash_table_unref(riscv_reg_ht);
     g_hash_table_unref(mips_reg_ht);
     g_hash_table_unref(mnemonic_ht);
+    g_hash_table_unref(prefix_ht);
+    g_hash_table_unref(insn_prefix_ht);
+    g_hash_table_unref(option_ht);
     qemu_plugin_scoreboard_free(vcpu_sb);
     g_free(output_base_path);
     g_free(program_name);
@@ -3853,34 +3858,68 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                 "instruction decode will be limited\n", target_name);
     }
 
-    /* Parse arguments */
+    /*
+     * Build plugin option hash table early, before argument parsing.
+     * Maps option name strings to PluginOptId for O(1) dispatch.
+     */
+    option_ht = g_hash_table_new(g_str_hash, g_str_equal);
+    {
+        static const struct { const char *name; int id; }
+        opt_entries[] = {
+            {"depth",   OPT_DEPTH},   {"outfile", OPT_OUTFILE},
+            {"debug",   OPT_DEBUG},   {"wp",      OPT_WP},
+            {"start",   OPT_START},   {"stop",    OPT_STOP},
+            {"program", OPT_PROGRAM}, {"spfile",  OPT_SPFILE},
+            {NULL, 0}
+        };
+        for (int i = 0; opt_entries[i].name; i++) {
+            g_hash_table_insert(option_ht,
+                                (gpointer)opt_entries[i].name,
+                                GINT_TO_POINTER(opt_entries[i].id));
+        }
+    }
+
+    /* Parse arguments via hash table dispatch */
     for (int i = 0; i < argc; i++) {
         char *opt = argv[i];
         g_auto(GStrv) tokens = g_strsplit(opt, "=", 2);
 
-        if (g_strcmp0(tokens[0], "depth") == 0) {
+        gpointer val = tokens[0] ?
+            g_hash_table_lookup(option_ht, tokens[0]) : NULL;
+        if (!val) {
+            fprintf(stderr, "wptrace: unknown option: %s\n", opt);
+            return -1;
+        }
+
+        switch (GPOINTER_TO_INT(val)) {
+        case OPT_DEPTH:
             max_wrong_path_depth = atoi(tokens[1]);
             if (max_wrong_path_depth <= 0) {
                 fprintf(stderr, "wptrace: invalid depth: %s\n", tokens[1]);
                 return -1;
             }
-        } else if (g_strcmp0(tokens[0], "outfile") == 0) {
+            break;
+        case OPT_OUTFILE:
             output_base_path = g_strdup(tokens[1]);
-        } else if (g_strcmp0(tokens[0], "debug") == 0) {
+            break;
+        case OPT_DEBUG:
             enable_debug_text = (atoi(tokens[1]) != 0);
-        } else if (g_strcmp0(tokens[0], "wp") == 0) {
+            break;
+        case OPT_WP:
             enable_wrong_path = (atoi(tokens[1]) != 0);
-        } else if (g_strcmp0(tokens[0], "start") == 0) {
+            break;
+        case OPT_START:
             trace_start_insn = g_ascii_strtoull(tokens[1], NULL, 10);
-        } else if (g_strcmp0(tokens[0], "stop") == 0) {
+            break;
+        case OPT_STOP:
             trace_stop_insn = g_ascii_strtoull(tokens[1], NULL, 10);
-        } else if (g_strcmp0(tokens[0], "program") == 0) {
+            break;
+        case OPT_PROGRAM:
             program_name = g_strdup(tokens[1]);
-        } else if (g_strcmp0(tokens[0], "spfile") == 0) {
+            break;
+        case OPT_SPFILE:
             simpoints_file_path = g_strdup(tokens[1]);
-        } else {
-            fprintf(stderr, "wptrace: unknown option: %s\n", opt);
-            return -1;
+            break;
         }
     }
 
@@ -3930,6 +3969,32 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     for (int i = 0; mnemonic_table[i].name; i++) {
         g_hash_table_insert(mnemonic_ht, (gpointer)mnemonic_table[i].name,
                             (gpointer)&mnemonic_table[i]);
+    }
+
+    /*
+     * Build prefix classification hash table: maps prefix strings to
+     * MnemonicEntry pointers for O(1) prefix-based lookup.
+     */
+    prefix_ht = g_hash_table_new(g_str_hash, g_str_equal);
+    for (int i = 0; prefix_class_table[i].name; i++) {
+        g_hash_table_insert(prefix_ht, (gpointer)prefix_class_table[i].name,
+                            (gpointer)&prefix_class_table[i]);
+    }
+
+    /*
+     * Build x86 instruction prefix set for lock/rep/data16 stripping.
+     * Values are non-NULL sentinels; only membership is checked.
+     */
+    insn_prefix_ht = g_hash_table_new(g_str_hash, g_str_equal);
+    {
+        static const char *const insn_prefixes[] = {
+            "lock", "rep", "repz", "repnz", "data16", NULL
+        };
+        for (int i = 0; insn_prefixes[i]; i++) {
+            g_hash_table_insert(insn_prefix_ht,
+                                (gpointer)insn_prefixes[i],
+                                GINT_TO_POINTER(1));
+        }
     }
 
     /* Initialize per-vCPU scoreboard */

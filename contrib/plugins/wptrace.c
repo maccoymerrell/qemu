@@ -224,18 +224,7 @@ typedef struct {
     int64_t immediate;
 } InsnFields;
 
-/* ========================= x86 -> Generic Decode ========================= */
-
-static inline int64_t sign_extend(uint64_t val, uint8_t nbytes)
-{
-    switch (nbytes) {
-    case 1: return (int64_t)(int8_t)val;
-    case 2: return (int64_t)(int16_t)val;
-    case 4: return (int64_t)(int32_t)val;
-    case 8: return (int64_t)val;
-    default: return (int64_t)val;
-    }
-}
+/* ========================= Disassembly-Based Generic Decode ========================= */
 
 static inline void add_src_reg(InsnFields *f, uint8_t reg_id)
 {
@@ -264,950 +253,1140 @@ static inline void add_dst_reg(InsnFields *f, uint8_t reg_id)
 }
 
 /*
- * x86 GPR index (0-15) to GenericRegId.
- * x86-64: 0=RAX 1=RCX 2=RDX 3=RBX 4=RSP 5=RBP 6=RSI 7=RDI 8-15=R8-R15
+ * Parse x86 register name (without % prefix) to GenericRegId.
+ * Handles 64/32/16/8-bit variants and extended registers R8-R15.
  */
-static uint8_t x86_gpr_to_generic(uint8_t x86_reg)
+static uint8_t parse_x86_reg(const char *name)
 {
-    static const uint8_t map[16] = {
-        1,    /* 0: RAX -> GPR0 */
-        2,    /* 1: RCX -> GPR1 */
-        3,    /* 2: RDX -> GPR2 */
-        4,    /* 3: RBX -> GPR3 */
-        250,  /* 4: RSP -> REG_SP */
-        254,  /* 5: RBP -> REG_FP_REG */
-        5,    /* 6: RSI -> GPR4 */
-        6,    /* 7: RDI -> GPR5 */
-        7,    /* 8: R8  -> GPR6 */
-        8,    /* 9: R9  -> GPR7 */
-        9,    /* 10: R10 -> GPR8 */
-        10,   /* 11: R11 -> GPR9 */
-        11,   /* 12: R12 -> GPR10 */
-        12,   /* 13: R13 -> GPR11 */
-        13,   /* 14: R14 -> GPR12 */
-        14,   /* 15: R15 -> GPR13 */
-    };
-    return (x86_reg < 16) ? map[x86_reg] : REG_NONE;
+    if (!name || !*name) {
+        return REG_NONE;
+    }
+
+    /* 64-bit GPRs */
+    if (strcmp(name, "rax") == 0) return REG_GPR0;
+    if (strcmp(name, "rcx") == 0) return REG_GPR1;
+    if (strcmp(name, "rdx") == 0) return REG_GPR2;
+    if (strcmp(name, "rbx") == 0) return REG_GPR3;
+    if (strcmp(name, "rsp") == 0) return REG_SP;
+    if (strcmp(name, "rbp") == 0) return REG_FP_REG;
+    if (strcmp(name, "rsi") == 0) return REG_GPR4;
+    if (strcmp(name, "rdi") == 0) return REG_GPR5;
+
+    /* 32-bit GPRs */
+    if (strcmp(name, "eax") == 0) return REG_GPR0;
+    if (strcmp(name, "ecx") == 0) return REG_GPR1;
+    if (strcmp(name, "edx") == 0) return REG_GPR2;
+    if (strcmp(name, "ebx") == 0) return REG_GPR3;
+    if (strcmp(name, "esp") == 0) return REG_SP;
+    if (strcmp(name, "ebp") == 0) return REG_FP_REG;
+    if (strcmp(name, "esi") == 0) return REG_GPR4;
+    if (strcmp(name, "edi") == 0) return REG_GPR5;
+
+    /* 16-bit GPRs */
+    if (strcmp(name, "ax") == 0) return REG_GPR0;
+    if (strcmp(name, "cx") == 0) return REG_GPR1;
+    if (strcmp(name, "dx") == 0) return REG_GPR2;
+    if (strcmp(name, "bx") == 0) return REG_GPR3;
+    if (strcmp(name, "sp") == 0) return REG_SP;
+    if (strcmp(name, "bp") == 0) return REG_FP_REG;
+    if (strcmp(name, "si") == 0) return REG_GPR4;
+    if (strcmp(name, "di") == 0) return REG_GPR5;
+
+    /* 8-bit GPRs */
+    if (strcmp(name, "al") == 0 || strcmp(name, "ah") == 0) return REG_GPR0;
+    if (strcmp(name, "cl") == 0 || strcmp(name, "ch") == 0) return REG_GPR1;
+    if (strcmp(name, "dl") == 0 || strcmp(name, "dh") == 0) return REG_GPR2;
+    if (strcmp(name, "bl") == 0 || strcmp(name, "bh") == 0) return REG_GPR3;
+    if (strcmp(name, "spl") == 0) return REG_SP;
+    if (strcmp(name, "bpl") == 0) return REG_FP_REG;
+    if (strcmp(name, "sil") == 0) return REG_GPR4;
+    if (strcmp(name, "dil") == 0) return REG_GPR5;
+
+    /* Extended registers R8-R15 (with optional b/w/d suffix) */
+    if (name[0] == 'r' && name[1] >= '0' && name[1] <= '9') {
+        char *end;
+        long n = strtol(name + 1, &end, 10);
+        if (n >= 8 && n <= 15 &&
+            (*end == '\0' || *end == 'b' || *end == 'w' || *end == 'd')) {
+            return REG_GPR0 + (uint8_t)(n - 8 + 6);
+        }
+    }
+
+    /* XMM/YMM/ZMM registers */
+    if (strncmp(name, "xmm", 3) == 0 || strncmp(name, "ymm", 3) == 0 ||
+        strncmp(name, "zmm", 3) == 0) {
+        int n = atoi(name + 3);
+        if (n >= 0 && n < 32) {
+            return REG_VEC0 + (uint8_t)n;
+        }
+    }
+
+    /* x87 FP stack */
+    if (strncmp(name, "st", 2) == 0) return REG_FPR0;
+
+    /* Special registers */
+    if (strcmp(name, "rip") == 0 || strcmp(name, "eip") == 0) return REG_IP;
+    if (strcmp(name, "rflags") == 0 || strcmp(name, "eflags") == 0) {
+        return REG_FLAGS;
+    }
+
+    return REG_NONE;
 }
 
-static inline uint8_t x86_xmm_to_generic(uint8_t x86_reg)
+/*
+ * Parse AArch64 register name to GenericRegId.
+ */
+static uint8_t parse_aarch64_reg(const char *name)
 {
-    return (x86_reg < 32) ? (REG_VEC0 + x86_reg) : REG_NONE;
+    if (!name || !*name) {
+        return REG_NONE;
+    }
+
+    /* General purpose: x0-x30, w0-w30 */
+    if ((name[0] == 'x' || name[0] == 'w') &&
+        name[1] >= '0' && name[1] <= '9') {
+        int n = atoi(name + 1);
+        if (n >= 0 && n <= 30) return REG_GPR0 + (uint8_t)n;
+    }
+
+    /* Zero register - reads as zero, no dependency */
+    if (strcmp(name, "xzr") == 0 || strcmp(name, "wzr") == 0) {
+        return REG_NONE;
+    }
+
+    /* Stack pointer */
+    if (strcmp(name, "sp") == 0) return REG_SP;
+
+    /* Link register (x30) */
+    if (strcmp(name, "lr") == 0) return REG_LR;
+
+    /* Frame pointer (x29) */
+    if (strcmp(name, "fp") == 0) return REG_FP_REG;
+
+    /* Vector/FP: v0-v31, d0-d31, s0-s31, q0-q31, h0-h31, b0-b31 */
+    if ((name[0] == 'v' || name[0] == 'd' || name[0] == 's' ||
+         name[0] == 'q' || name[0] == 'h') &&
+        name[1] >= '0' && name[1] <= '9') {
+        int n = atoi(name + 1);
+        if (n >= 0 && n < 32) return REG_VEC0 + (uint8_t)n;
+    }
+
+    return REG_NONE;
 }
 
-/* Internal x86 decode state */
+/* Mnemonic-to-opcode lookup table entry */
 typedef struct {
-    uint8_t rex;
-    bool has_rex;
-    bool has_66;
-    bool has_f2;
-    bool has_f3;
-    uint8_t opcode_bytes[3];
-    uint8_t opcode_len;
-    bool is_twobyte;
-    bool has_modrm;
-    uint8_t modrm;
-    bool has_sib;
-    uint8_t sib;
-    uint8_t disp_size;
-    int32_t disp;
-    uint8_t imm_size;
-    int64_t imm;
-} X86DecodeState;
+    const char *name;
+    uint8_t opcode;
+    uint8_t branch_type;
+} MnemonicEntry;
 
-static void x86_raw_decode(const uint8_t *bytes, uint32_t len,
-                            X86DecodeState *s)
+/* Searched linearly (only called at translate time) */
+static const MnemonicEntry mnemonic_table[] = {
+    /* Integer ALU */
+    {"add",      GEN_OP_INT_ADD,  BRANCH_NONE},
+    {"adc",      GEN_OP_INT_ADC,  BRANCH_NONE},
+    {"sub",      GEN_OP_INT_SUB,  BRANCH_NONE},
+    {"sbb",      GEN_OP_INT_SBB,  BRANCH_NONE},
+    {"imul",     GEN_OP_INT_MUL,  BRANCH_NONE},
+    {"mul",      GEN_OP_INT_MUL,  BRANCH_NONE},
+    {"idiv",     GEN_OP_INT_DIV,  BRANCH_NONE},
+    {"div",      GEN_OP_INT_DIV,  BRANCH_NONE},
+    {"and",      GEN_OP_AND,      BRANCH_NONE},
+    {"or",       GEN_OP_OR,       BRANCH_NONE},
+    {"xor",      GEN_OP_XOR,      BRANCH_NONE},
+    {"not",      GEN_OP_NOT,      BRANCH_NONE},
+    {"neg",      GEN_OP_NEG,      BRANCH_NONE},
+    {"inc",      GEN_OP_INC,      BRANCH_NONE},
+    {"dec",      GEN_OP_DEC,      BRANCH_NONE},
+    /* Shifts/rotates */
+    {"shl",      GEN_OP_SHL,      BRANCH_NONE},
+    {"sal",      GEN_OP_SHL,      BRANCH_NONE},
+    {"shr",      GEN_OP_SHR,      BRANCH_NONE},
+    {"sar",      GEN_OP_SAR,      BRANCH_NONE},
+    {"rol",      GEN_OP_ROL,      BRANCH_NONE},
+    {"ror",      GEN_OP_ROR,      BRANCH_NONE},
+    /* Data movement */
+    {"mov",      GEN_OP_MOV,      BRANCH_NONE},
+    {"lea",      GEN_OP_LEA,      BRANCH_NONE},
+    {"push",     GEN_OP_PUSH,     BRANCH_NONE},
+    {"pop",      GEN_OP_POP,      BRANCH_NONE},
+    {"xchg",     GEN_OP_XCHG,     BRANCH_NONE},
+    /* Sign/zero extend */
+    {"movsx",    GEN_OP_MOVSX,    BRANCH_NONE},
+    {"movsxd",   GEN_OP_MOVSX,    BRANCH_NONE},
+    {"movsl",    GEN_OP_MOVSX,    BRANCH_NONE},
+    {"movzx",    GEN_OP_MOVZX,    BRANCH_NONE},
+    {"movzb",    GEN_OP_MOVZX,    BRANCH_NONE},
+    {"cltq",     GEN_OP_MOVSX,    BRANCH_NONE},
+    {"cqto",     GEN_OP_MOVSX,    BRANCH_NONE},
+    {"cwtl",     GEN_OP_MOVSX,    BRANCH_NONE},
+    {"cdqe",     GEN_OP_MOVSX,    BRANCH_NONE},
+    {"cbw",      GEN_OP_MOVSX,    BRANCH_NONE},
+    {"cwde",     GEN_OP_MOVSX,    BRANCH_NONE},
+    {"cdq",      GEN_OP_MOVSX,    BRANCH_NONE},
+    {"cqo",      GEN_OP_MOVSX,    BRANCH_NONE},
+    /* Comparison */
+    {"cmp",      GEN_OP_CMP,      BRANCH_NONE},
+    {"test",     GEN_OP_TEST,     BRANCH_NONE},
+    /* Control flow */
+    {"jmp",      GEN_OP_BRANCH,   BRANCH_DIRECT_JUMP},
+    {"call",     GEN_OP_CALL,     BRANCH_DIRECT_CALL},
+    {"ret",      GEN_OP_RET,      BRANCH_RETURN},
+    {"nop",      GEN_OP_NOP,      BRANCH_NONE},
+    {"syscall",  GEN_OP_SYSCALL,  BRANCH_SYSCALL_TYPE},
+    {"sysenter", GEN_OP_SYSCALL,  BRANCH_SYSCALL_TYPE},
+    {"int",      GEN_OP_SYSCALL,  BRANCH_SYSCALL_TYPE},
+    /* Fences */
+    {"mfence",   GEN_OP_FENCE,    BRANCH_NONE},
+    {"lfence",   GEN_OP_FENCE,    BRANCH_NONE},
+    {"sfence",   GEN_OP_FENCE,    BRANCH_NONE},
+    /* Scalar FP */
+    {"addss",    GEN_OP_FP_ADD,   BRANCH_NONE},
+    {"addsd",    GEN_OP_FP_ADD,   BRANCH_NONE},
+    {"addps",    GEN_OP_FP_ADD,   BRANCH_NONE},
+    {"addpd",    GEN_OP_FP_ADD,   BRANCH_NONE},
+    {"subss",    GEN_OP_FP_SUB,   BRANCH_NONE},
+    {"subsd",    GEN_OP_FP_SUB,   BRANCH_NONE},
+    {"subps",    GEN_OP_FP_SUB,   BRANCH_NONE},
+    {"subpd",    GEN_OP_FP_SUB,   BRANCH_NONE},
+    {"mulss",    GEN_OP_FP_MUL,   BRANCH_NONE},
+    {"mulsd",    GEN_OP_FP_MUL,   BRANCH_NONE},
+    {"mulps",    GEN_OP_FP_MUL,   BRANCH_NONE},
+    {"mulpd",    GEN_OP_FP_MUL,   BRANCH_NONE},
+    {"divss",    GEN_OP_FP_DIV,   BRANCH_NONE},
+    {"divsd",    GEN_OP_FP_DIV,   BRANCH_NONE},
+    {"divps",    GEN_OP_FP_DIV,   BRANCH_NONE},
+    {"divpd",    GEN_OP_FP_DIV,   BRANCH_NONE},
+    {"sqrtss",   GEN_OP_FP_SQRT,  BRANCH_NONE},
+    {"sqrtsd",   GEN_OP_FP_SQRT,  BRANCH_NONE},
+    {"sqrtps",   GEN_OP_FP_SQRT,  BRANCH_NONE},
+    {"sqrtpd",   GEN_OP_FP_SQRT,  BRANCH_NONE},
+    {"movss",    GEN_OP_FP_MOV,   BRANCH_NONE},
+    {"movsd",    GEN_OP_FP_MOV,   BRANCH_NONE},
+    {"ucomiss",  GEN_OP_FP_CMP,   BRANCH_NONE},
+    {"ucomisd",  GEN_OP_FP_CMP,   BRANCH_NONE},
+    {"comiss",   GEN_OP_FP_CMP,   BRANCH_NONE},
+    {"comisd",   GEN_OP_FP_CMP,   BRANCH_NONE},
+    /* Vector mov */
+    {"movaps",   GEN_OP_VEC_MOV,  BRANCH_NONE},
+    {"movapd",   GEN_OP_VEC_MOV,  BRANCH_NONE},
+    {"movups",   GEN_OP_VEC_MOV,  BRANCH_NONE},
+    {"movupd",   GEN_OP_VEC_MOV,  BRANCH_NONE},
+    {"movdqa",   GEN_OP_VEC_MOV,  BRANCH_NONE},
+    {"movdqu",   GEN_OP_VEC_MOV,  BRANCH_NONE},
+    /* Vector logic */
+    {"andps",    GEN_OP_VEC_LOGIC, BRANCH_NONE},
+    {"andpd",    GEN_OP_VEC_LOGIC, BRANCH_NONE},
+    {"orps",     GEN_OP_VEC_LOGIC, BRANCH_NONE},
+    {"orpd",     GEN_OP_VEC_LOGIC, BRANCH_NONE},
+    {"xorps",    GEN_OP_VEC_LOGIC, BRANCH_NONE},
+    {"xorpd",    GEN_OP_VEC_LOGIC, BRANCH_NONE},
+    {"andnps",   GEN_OP_VEC_LOGIC, BRANCH_NONE},
+    {"andnpd",   GEN_OP_VEC_LOGIC, BRANCH_NONE},
+    {"pand",     GEN_OP_VEC_LOGIC, BRANCH_NONE},
+    {"pandn",    GEN_OP_VEC_LOGIC, BRANCH_NONE},
+    {"por",      GEN_OP_VEC_LOGIC, BRANCH_NONE},
+    {"pxor",     GEN_OP_VEC_LOGIC, BRANCH_NONE},
+    /* Vector shuffle */
+    {"shufps",   GEN_OP_VEC_SHUF, BRANCH_NONE},
+    {"shufpd",   GEN_OP_VEC_SHUF, BRANCH_NONE},
+    {"pshufd",   GEN_OP_VEC_SHUF, BRANCH_NONE},
+    {"pshufb",   GEN_OP_VEC_SHUF, BRANCH_NONE},
+    /* Vector add/sub/mul */
+    {"paddb",    GEN_OP_VEC_ADD,  BRANCH_NONE},
+    {"paddw",    GEN_OP_VEC_ADD,  BRANCH_NONE},
+    {"paddd",    GEN_OP_VEC_ADD,  BRANCH_NONE},
+    {"paddq",    GEN_OP_VEC_ADD,  BRANCH_NONE},
+    {"psubb",    GEN_OP_VEC_SUB,  BRANCH_NONE},
+    {"psubw",    GEN_OP_VEC_SUB,  BRANCH_NONE},
+    {"psubd",    GEN_OP_VEC_SUB,  BRANCH_NONE},
+    {"psubq",    GEN_OP_VEC_SUB,  BRANCH_NONE},
+    {"pmulld",   GEN_OP_VEC_MUL,  BRANCH_NONE},
+    {"pmullw",   GEN_OP_VEC_MUL,  BRANCH_NONE},
+    /* AArch64 ALU */
+    {"adds",     GEN_OP_INT_ADD,  BRANCH_NONE},
+    {"subs",     GEN_OP_INT_SUB,  BRANCH_NONE},
+    {"madd",     GEN_OP_INT_MUL,  BRANCH_NONE},
+    {"msub",     GEN_OP_INT_MUL,  BRANCH_NONE},
+    {"sdiv",     GEN_OP_INT_DIV,  BRANCH_NONE},
+    {"udiv",     GEN_OP_INT_DIV,  BRANCH_NONE},
+    {"orr",      GEN_OP_OR,       BRANCH_NONE},
+    {"orn",      GEN_OP_OR,       BRANCH_NONE},
+    {"eor",      GEN_OP_XOR,      BRANCH_NONE},
+    {"eon",      GEN_OP_XOR,      BRANCH_NONE},
+    {"mvn",      GEN_OP_NOT,      BRANCH_NONE},
+    {"bic",      GEN_OP_AND,      BRANCH_NONE},
+    {"lsl",      GEN_OP_SHL,      BRANCH_NONE},
+    {"lsr",      GEN_OP_SHR,      BRANCH_NONE},
+    {"asr",      GEN_OP_SAR,      BRANCH_NONE},
+    /* AArch64 data movement */
+    {"movz",     GEN_OP_MOV,      BRANCH_NONE},
+    {"movn",     GEN_OP_MOV,      BRANCH_NONE},
+    {"movk",     GEN_OP_MOV,      BRANCH_NONE},
+    {"ldr",      GEN_OP_LOAD,     BRANCH_NONE},
+    {"ldp",      GEN_OP_LOAD,     BRANCH_NONE},
+    {"ldrb",     GEN_OP_LOAD,     BRANCH_NONE},
+    {"ldrh",     GEN_OP_LOAD,     BRANCH_NONE},
+    {"ldrsb",    GEN_OP_LOAD,     BRANCH_NONE},
+    {"ldrsh",    GEN_OP_LOAD,     BRANCH_NONE},
+    {"ldrsw",    GEN_OP_LOAD,     BRANCH_NONE},
+    {"str",      GEN_OP_STORE,    BRANCH_NONE},
+    {"stp",      GEN_OP_STORE,    BRANCH_NONE},
+    {"strb",     GEN_OP_STORE,    BRANCH_NONE},
+    {"strh",     GEN_OP_STORE,    BRANCH_NONE},
+    /* AArch64 comparison */
+    {"cmn",      GEN_OP_CMP,      BRANCH_NONE},
+    {"tst",      GEN_OP_TEST,     BRANCH_NONE},
+    /* AArch64 control flow */
+    {"bl",       GEN_OP_CALL,     BRANCH_DIRECT_CALL},
+    {"blr",      GEN_OP_CALL,     BRANCH_INDIRECT_CALL},
+    {"br",       GEN_OP_BRANCH,   BRANCH_INDIRECT_JUMP},
+    {"svc",      GEN_OP_SYSCALL,  BRANCH_SYSCALL_TYPE},
+    /* AArch64 conditional */
+    {"csel",     GEN_OP_CMOV,     BRANCH_NONE},
+    {"csinc",    GEN_OP_CMOV,     BRANCH_NONE},
+    {"csinv",    GEN_OP_CMOV,     BRANCH_NONE},
+    {"csneg",    GEN_OP_CMOV,     BRANCH_NONE},
+    /* AArch64 FP */
+    {"fadd",     GEN_OP_FP_ADD,   BRANCH_NONE},
+    {"fsub",     GEN_OP_FP_SUB,   BRANCH_NONE},
+    {"fmul",     GEN_OP_FP_MUL,   BRANCH_NONE},
+    {"fdiv",     GEN_OP_FP_DIV,   BRANCH_NONE},
+    {"fsqrt",    GEN_OP_FP_SQRT,  BRANCH_NONE},
+    {"fmov",     GEN_OP_FP_MOV,   BRANCH_NONE},
+    {"fcmp",     GEN_OP_FP_CMP,   BRANCH_NONE},
+    {"fcvt",     GEN_OP_FP_CVT,   BRANCH_NONE},
+    {"fcvtzs",   GEN_OP_FP_CVT,   BRANCH_NONE},
+    {"fcvtzu",   GEN_OP_FP_CVT,   BRANCH_NONE},
+    {"scvtf",    GEN_OP_FP_CVT,   BRANCH_NONE},
+    {"ucvtf",    GEN_OP_FP_CVT,   BRANCH_NONE},
+    {NULL,       0,               0}
+};
+
+/*
+ * Look up a base mnemonic in the table.
+ * Returns true if found, filling opcode and branch_type.
+ */
+static bool lookup_mnemonic(const char *mnem, uint8_t *opcode,
+                            uint8_t *branch_type)
 {
-    if (!bytes || len == 0) {
-        return;
-    }
-
-    uint32_t pos = 0;
-
-    /* Scan prefixes */
-    while (pos < len) {
-        uint8_t b = bytes[pos];
-        if (b == 0x66) {
-            s->has_66 = true; pos++;
-        } else if (b == 0xF2) {
-            s->has_f2 = true; pos++;
-        } else if (b == 0xF3) {
-            s->has_f3 = true; pos++;
-        } else if (b == 0x67 || b == 0xF0 ||
-                   (b >= 0x26 && b <= 0x3E && (b & 0x07) == 0x06) ||
-                   b == 0x64 || b == 0x65) {
-            pos++;
-        } else if ((b & 0xF0) == 0x40) {
-            s->has_rex = true;
-            s->rex = b;
-            pos++;
-        } else {
-            break;
+    for (int i = 0; mnemonic_table[i].name; i++) {
+        if (strcmp(mnem, mnemonic_table[i].name) == 0) {
+            *opcode = mnemonic_table[i].opcode;
+            *branch_type = mnemonic_table[i].branch_type;
+            return true;
         }
     }
-
-    if (pos >= len) {
-        return;
-    }
-
-    /* Read opcode */
-    uint8_t op1 = bytes[pos++];
-    s->opcode_bytes[0] = op1;
-    s->opcode_len = 1;
-
-    if (op1 == 0x0F && pos < len) {
-        s->is_twobyte = true;
-        uint8_t op2 = bytes[pos++];
-        s->opcode_bytes[1] = op2;
-        s->opcode_len = 2;
-
-        if ((op2 == 0x38 || op2 == 0x3A) && pos < len) {
-            s->opcode_bytes[2] = bytes[pos++];
-            s->opcode_len = 3;
-        }
-    }
-
-    /* Determine ModRM presence and immediate size */
-    bool has_modrm = false;
-    uint8_t imm_size = 0;
-
-    if (s->opcode_len >= 2) {
-        has_modrm = true;
-        if (s->opcode_len == 2) {
-            uint8_t op2 = s->opcode_bytes[1];
-            if (op2 >= 0x80 && op2 <= 0x8F) {
-                has_modrm = false;
-                imm_size = 4;
-            }
-        }
-    } else {
-        switch (op1) {
-        case 0x00 ... 0x03: case 0x08 ... 0x0B:
-        case 0x10 ... 0x13: case 0x18 ... 0x1B:
-        case 0x20 ... 0x23: case 0x28 ... 0x2B:
-        case 0x30 ... 0x33: case 0x38 ... 0x3B:
-            has_modrm = true;
-            break;
-        case 0x04: case 0x0C: case 0x14: case 0x1C:
-        case 0x24: case 0x2C: case 0x34: case 0x3C:
-            imm_size = 1; break;
-        case 0x05: case 0x0D: case 0x15: case 0x1D:
-        case 0x25: case 0x2D: case 0x35: case 0x3D:
-            imm_size = 4; break;
-        case 0x80: imm_size = 1; has_modrm = true; break;
-        case 0x81: imm_size = 4; has_modrm = true; break;
-        case 0x83: imm_size = 1; has_modrm = true; break;
-        case 0x84: case 0x85: has_modrm = true; break;
-        case 0xA8: imm_size = 1; break;
-        case 0xA9: imm_size = 4; break;
-        case 0x86: case 0x87: has_modrm = true; break;
-        case 0x88 ... 0x8B: has_modrm = true; break;
-        case 0x8C: case 0x8E: has_modrm = true; break;
-        case 0x8D: has_modrm = true; break;
-        case 0xA0: case 0xA1: case 0xA2: case 0xA3: imm_size = 4; break;
-        case 0xB0 ... 0xB7: imm_size = 1; break;
-        case 0xB8 ... 0xBF: imm_size = 4; break;
-        case 0xC0: case 0xC1: has_modrm = true; imm_size = 1; break;
-        case 0xC2: imm_size = 2; break;
-        case 0xC6: has_modrm = true; imm_size = 1; break;
-        case 0xC7: has_modrm = true; imm_size = 4; break;
-        case 0xD0 ... 0xD3: has_modrm = true; break;
-        case 0xE4: case 0xE5: case 0xE6: case 0xE7: imm_size = 1; break;
-        case 0xE8: imm_size = 4; break;
-        case 0xE9: imm_size = 4; break;
-        case 0xEB: imm_size = 1; break;
-        case 0x70 ... 0x7F: imm_size = 1; break;
-        case 0xF6: case 0xF7: has_modrm = true; break;
-        case 0xFE: case 0xFF: has_modrm = true; break;
-        default: break;
-        }
-    }
-
-    /* Read ModRM / SIB / Displacement */
-    if (has_modrm && pos < len) {
-        s->has_modrm = true;
-        s->modrm = bytes[pos++];
-        uint8_t mod = (s->modrm >> 6) & 3;
-        uint8_t rm = s->modrm & 7;
-
-        if (mod != 3 && rm == 4 && pos < len) {
-            s->has_sib = true;
-            s->sib = bytes[pos++];
-        }
-
-        uint8_t disp_size = 0;
-        if (mod == 1) {
-            disp_size = 1;
-        } else if (mod == 2) {
-            disp_size = 4;
-        } else if (mod == 0 && rm == 5) {
-            disp_size = 4;
-        }
-        if (s->has_sib && mod == 0 && (s->sib & 7) == 5) {
-            disp_size = 4;
-        }
-
-        s->disp_size = disp_size;
-        if (disp_size > 0 && pos + disp_size <= len) {
-            uint64_t dval = 0;
-            for (uint8_t i = 0; i < disp_size; i++) {
-                dval |= (uint64_t)bytes[pos++] << (i * 8);
-            }
-            s->disp = (int32_t)sign_extend(dval, disp_size);
-        }
-
-        if (!s->is_twobyte && (op1 == 0xF6 || op1 == 0xF7)) {
-            uint8_t reg = (s->modrm >> 3) & 7;
-            if (reg == 0) {
-                imm_size = (op1 == 0xF6) ? 1 : 4;
-            }
-        }
-    }
-
-    /* Read immediate */
-    s->imm_size = imm_size;
-    if (imm_size > 0 && pos + imm_size <= len) {
-        uint64_t ival = 0;
-        for (uint8_t i = 0; i < imm_size; i++) {
-            ival |= (uint64_t)bytes[pos++] << (i * 8);
-        }
-        s->imm = sign_extend(ival, imm_size);
-    }
+    return false;
 }
 
-/* Add memory addressing registers as source dependencies */
-static void x86_add_mem_addr_regs(const X86DecodeState *s, InsnFields *out)
+/*
+ * Classify a mnemonic string to GenericOpcode + BranchType.
+ * Handles x86 size suffixes, AVX v-prefix, conditional branches,
+ * cmov/setcc variants, and AArch64 conditional branches.
+ */
+static void classify_mnemonic(const char *mnem, uint8_t *opcode,
+                              uint8_t *branch_type)
 {
-    if (!s->has_modrm) {
-        return;
-    }
-    uint8_t mod = (s->modrm >> 6) & 3;
-    uint8_t rm = s->modrm & 7;
-    if (s->has_rex && (s->rex & 0x01)) {
-        rm |= 8;
-    }
+    *opcode = GEN_OP_UNKNOWN;
+    *branch_type = BRANCH_NONE;
 
-    if (mod == 3) {
+    if (!mnem || !*mnem) {
         return;
     }
 
-    if (s->has_sib) {
-        uint8_t base = s->sib & 7;
-        uint8_t index = (s->sib >> 3) & 7;
-        if (s->has_rex) {
-            if (s->rex & 0x01) {
-                base |= 8;
+    /* Skip x86 lock/rep prefixes (appear before mnemonic separated by space) */
+    if (strncmp(mnem, "lock ", 5) == 0) {
+        mnem += 5;
+    } else if (strncmp(mnem, "rep ", 4) == 0) {
+        mnem += 4;
+    } else if (strncmp(mnem, "repz ", 5) == 0) {
+        mnem += 5;
+    } else if (strncmp(mnem, "repnz ", 6) == 0) {
+        mnem += 6;
+    } else if (strncmp(mnem, "data16 ", 7) == 0) {
+        mnem += 7;
+    }
+
+    /* x86 conditional branches: j<cc> (not jmp/jmpq) */
+    if (is_x86 && mnem[0] == 'j') {
+        char tmp[32];
+        g_strlcpy(tmp, mnem, sizeof(tmp));
+        size_t tlen = strlen(tmp);
+        if (tlen > 1 && tmp[tlen - 1] == 'q') {
+            tmp[tlen - 1] = '\0';
+        }
+        if (strcmp(tmp, "jmp") != 0) {
+            *opcode = GEN_OP_BRANCH;
+            *branch_type = BRANCH_COND_DIRECT;
+            return;
+        }
+    }
+
+    /* AArch64 conditional branches: b.eq, b.ne, b.gt, etc. */
+    if (!is_x86 && mnem[0] == 'b' && mnem[1] == '.') {
+        *opcode = GEN_OP_BRANCH;
+        *branch_type = BRANCH_COND_DIRECT;
+        return;
+    }
+
+    /* AArch64 unconditional branch */
+    if (!is_x86 && strcmp(mnem, "b") == 0) {
+        *opcode = GEN_OP_BRANCH;
+        *branch_type = BRANCH_DIRECT_JUMP;
+        return;
+    }
+
+    /* AArch64 ret */
+    if (!is_x86 && strcmp(mnem, "ret") == 0) {
+        *opcode = GEN_OP_RET;
+        *branch_type = BRANCH_RETURN;
+        return;
+    }
+
+    /* AArch64 compare and branch: cbz, cbnz, tbz, tbnz */
+    if (!is_x86 && (strncmp(mnem, "cbz", 3) == 0 ||
+                    strncmp(mnem, "cbnz", 4) == 0 ||
+                    strncmp(mnem, "tbz", 3) == 0 ||
+                    strncmp(mnem, "tbnz", 4) == 0)) {
+        *opcode = GEN_OP_BRANCH;
+        *branch_type = BRANCH_COND_DIRECT;
+        return;
+    }
+
+    /* x86 cmov<cc> variants */
+    if (is_x86 && strncmp(mnem, "cmov", 4) == 0) {
+        *opcode = GEN_OP_CMOV;
+        return;
+    }
+
+    /* x86 set<cc> variants */
+    if (is_x86 && strncmp(mnem, "set", 3) == 0 && strlen(mnem) > 3) {
+        *opcode = GEN_OP_SETCC;
+        return;
+    }
+
+    /* FP conversion: cvt.../vcvt... (x86) */
+    if (strncmp(mnem, "cvt", 3) == 0 || strncmp(mnem, "vcvt", 4) == 0) {
+        *opcode = GEN_OP_FP_CVT;
+        return;
+    }
+
+    /* NOP variants (x86: nopl, nopw, etc.) */
+    if (strncmp(mnem, "nop", 3) == 0) {
+        *opcode = GEN_OP_NOP;
+        return;
+    }
+
+    /* Direct lookup in table */
+    if (lookup_mnemonic(mnem, opcode, branch_type)) {
+        return;
+    }
+
+    /* AVX v-prefix: strip 'v' and retry */
+    if (mnem[0] == 'v' && strlen(mnem) > 1) {
+        if (lookup_mnemonic(mnem + 1, opcode, branch_type)) {
+            return;
+        }
+    }
+
+    /* x86 size suffix: strip trailing q/l/w/b and retry */
+    size_t len = strlen(mnem);
+    if (len > 1) {
+        char base[32];
+        g_strlcpy(base, mnem, sizeof(base));
+        char last = base[len - 1];
+        if (last == 'q' || last == 'l' || last == 'w' || last == 'b') {
+            base[len - 1] = '\0';
+            if (lookup_mnemonic(base, opcode, branch_type)) {
+                return;
             }
-            if (s->rex & 0x02) {
-                index |= 8;
+            /* Also try AVX v-prefix + stripped suffix */
+            if (base[0] == 'v' && strlen(base) > 1) {
+                if (lookup_mnemonic(base + 1, opcode, branch_type)) {
+                    return;
+                }
             }
-        }
-        if (!(base == 5 && mod == 0)) {
-            add_src_reg(out, x86_gpr_to_generic(base));
-        }
-        if (index != 4) {
-            add_src_reg(out, x86_gpr_to_generic(index));
-        }
-    } else {
-        if (!(rm == 5 && mod == 0)) {
-            add_src_reg(out, x86_gpr_to_generic(rm));
         }
     }
 }
 
 /*
- * Map x86 decode state to ISA-agnostic InsnFields.
+ * Split operand string by top-level commas (respecting parentheses/brackets).
+ * Returns the number of operands found.
  */
-static void x86_map_to_generic(const X86DecodeState *s, InsnFields *out)
+#define MAX_OPS 4
+#define MAX_OP_LEN 64
+
+static int split_operands(const char *s, char ops[][MAX_OP_LEN], int max_ops)
 {
-    uint8_t op1 = s->opcode_bytes[0];
+    int n = 0, depth = 0, pos = 0;
 
-    uint8_t reg_idx = 0, rm_idx = 0;
-    bool rm_is_reg = false;
-
-    if (s->has_modrm) {
-        uint8_t mod = (s->modrm >> 6) & 3;
-        reg_idx = (s->modrm >> 3) & 7;
-        rm_idx = s->modrm & 7;
-
-        if (s->has_rex) {
-            if (s->rex & 0x04) {
-                reg_idx |= 8;
-            }
-            if (s->rex & 0x01) {
-                rm_idx |= 8;
-            }
-        }
-
-        rm_is_reg = (mod == 3);
+    while (*s == ' ' || *s == '\t') {
+        s++;
     }
 
-    uint8_t reg_gen = x86_gpr_to_generic(reg_idx);
-    uint8_t rm_gen = rm_is_reg ? x86_gpr_to_generic(rm_idx) : REG_NONE;
+    while (*s && n < max_ops) {
+        if (*s == '(' || *s == '[') {
+            depth++;
+        } else if (*s == ')' || *s == ']') {
+            depth--;
+        } else if (*s == ',' && depth == 0) {
+            ops[n][pos] = '\0';
+            n++;
+            pos = 0;
+            s++;
+            while (*s == ' ' || *s == '\t') {
+                s++;
+            }
+            continue;
+        }
+        if (pos < MAX_OP_LEN - 1) {
+            ops[n][pos++] = *s;
+        }
+        s++;
+    }
+    if (pos > 0 || n > 0) {
+        ops[n][pos] = '\0';
+        n++;
+    }
+    return n;
+}
 
-    if (s->imm_size > 0) {
-        out->has_immediate = true;
-        out->immediate = s->imm;
+/* Check if an operand contains a memory reference */
+static bool is_memory_operand(const char *op)
+{
+    return strchr(op, '(') != NULL || strchr(op, '[') != NULL;
+}
+
+/*
+ * Extract the first register from an x86 AT&T operand.
+ * Scans for %name pattern. Skips '*' prefix for indirect operands.
+ */
+static uint8_t extract_x86_reg(const char *op)
+{
+    while (*op == ' ' || *op == '\t' || *op == '*') {
+        op++;
     }
 
-    if (!s->is_twobyte) {
-        uint8_t alu_group = (op1 >> 3) & 7;
-        bool d_bit = (op1 & 0x02) != 0;
+    const char *pct = strchr(op, '%');
+    if (!pct) {
+        return REG_NONE;
+    }
 
-        switch (op1) {
-        case 0x00 ... 0x03:
-        case 0x08 ... 0x0B:
-        case 0x10 ... 0x13:
-        case 0x18 ... 0x1B:
-        case 0x20 ... 0x23:
-        case 0x28 ... 0x2B:
-        case 0x30 ... 0x33:
-        case 0x38 ... 0x3B:
-        {
-            static const uint8_t grp_ops[] = {
-                GEN_OP_INT_ADD, GEN_OP_OR, GEN_OP_INT_ADC, GEN_OP_INT_SBB,
-                GEN_OP_AND, GEN_OP_INT_SUB, GEN_OP_XOR, GEN_OP_CMP
-            };
-            out->opcode = grp_ops[alu_group];
-            if (d_bit) {
-                add_src_reg(out, reg_gen);
-                if (rm_is_reg) {
-                    add_src_reg(out, rm_gen);
-                } else {
-                    x86_add_mem_addr_regs(s, out);
-                }
-                if (out->opcode != GEN_OP_CMP) {
-                    add_dst_reg(out, reg_gen);
-                }
-            } else {
-                add_src_reg(out, reg_gen);
-                if (rm_is_reg) {
-                    add_src_reg(out, rm_gen);
-                    if (out->opcode != GEN_OP_CMP) {
-                        add_dst_reg(out, rm_gen);
-                    }
-                } else {
-                    x86_add_mem_addr_regs(s, out);
-                }
-            }
-            add_dst_reg(out, REG_FLAGS);
-            break;
+    /* If there's a '(' before the %, this is a memory operand base */
+    for (const char *p = op; p < pct; p++) {
+        if (*p == '(') {
+            return REG_NONE;
         }
+    }
 
-        case 0x04: case 0x05:
-        case 0x0C: case 0x0D:
-        case 0x14: case 0x15:
-        case 0x1C: case 0x1D:
-        case 0x24: case 0x25:
-        case 0x2C: case 0x2D:
-        case 0x34: case 0x35:
-        case 0x3C: case 0x3D:
-        {
-            static const uint8_t grp_ops[] = {
-                GEN_OP_INT_ADD, GEN_OP_OR, GEN_OP_INT_ADC, GEN_OP_INT_SBB,
-                GEN_OP_AND, GEN_OP_INT_SUB, GEN_OP_XOR, GEN_OP_CMP
-            };
-            out->opcode = grp_ops[alu_group];
-            add_src_reg(out, REG_GPR0);
-            if (out->opcode != GEN_OP_CMP) {
-                add_dst_reg(out, REG_GPR0);
+    pct++;
+    char name[16];
+    int i = 0;
+    while (*pct && *pct != ',' && *pct != ')' && *pct != ' ' &&
+           *pct != '\t' && i < 15) {
+        name[i++] = *pct++;
+    }
+    name[i] = '\0';
+    return parse_x86_reg(name);
+}
+
+/*
+ * Extract address registers from an x86 AT&T memory operand.
+ * Format: disp(%base,%index,scale)
+ */
+static void extract_x86_mem_regs(const char *op, InsnFields *out)
+{
+    const char *p = strchr(op, '(');
+    if (!p) {
+        return;
+    }
+    p++;
+
+    while (*p && *p != ')') {
+        if (*p == '%') {
+            p++;
+            char name[16];
+            int i = 0;
+            while (*p && *p != ',' && *p != ')' && *p != ' ' && i < 15) {
+                name[i++] = *p++;
             }
-            add_dst_reg(out, REG_FLAGS);
-            break;
+            name[i] = '\0';
+            uint8_t reg_id = parse_x86_reg(name);
+            add_src_reg(out, reg_id);
+        } else {
+            p++;
         }
+    }
+}
 
-        case 0x80: case 0x81: case 0x83:
-        {
-            static const uint8_t g1_ops[] = {
-                GEN_OP_INT_ADD, GEN_OP_OR, GEN_OP_INT_ADC, GEN_OP_INT_SBB,
-                GEN_OP_AND, GEN_OP_INT_SUB, GEN_OP_XOR, GEN_OP_CMP
-            };
-            uint8_t ext = (s->modrm >> 3) & 7;
-            out->opcode = g1_ops[ext];
-            if (rm_is_reg) {
-                add_src_reg(out, rm_gen);
-                if (out->opcode != GEN_OP_CMP) {
-                    add_dst_reg(out, rm_gen);
-                }
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            add_dst_reg(out, REG_FLAGS);
-            break;
+/*
+ * Extract the first register from an AArch64 operand.
+ */
+static uint8_t extract_aarch64_reg(const char *op)
+{
+    while (*op == ' ' || *op == '\t') {
+        op++;
+    }
+
+    if (*op == '#' || *op == '=') {
+        return REG_NONE;
+    }
+    if (*op == '[') {
+        return REG_NONE;
+    }
+
+    char name[16];
+    int i = 0;
+    while (*op && *op != ',' && *op != ']' && *op != '!' &&
+           *op != ' ' && *op != '\t' && i < 15) {
+        name[i++] = *op++;
+    }
+    name[i] = '\0';
+    return parse_aarch64_reg(name);
+}
+
+/*
+ * Extract address registers from an AArch64 memory operand.
+ * Format: [base, #imm] or [base, Xn]
+ */
+static void extract_aarch64_mem_regs(const char *op, InsnFields *out)
+{
+    const char *p = strchr(op, '[');
+    if (!p) {
+        return;
+    }
+    p++;
+
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+
+    char name[16];
+    int i = 0;
+    while (*p && *p != ',' && *p != ']' && *p != ' ' &&
+           *p != '\t' && i < 15) {
+        name[i++] = *p++;
+    }
+    name[i] = '\0';
+    uint8_t base = parse_aarch64_reg(name);
+    add_src_reg(out, base);
+
+    /* Look for index register after comma */
+    const char *bracket_end = strchr(op, ']');
+    const char *comma = strchr(p, ',');
+    if (comma && bracket_end && comma < bracket_end) {
+        comma++;
+        while (*comma == ' ' || *comma == '\t') {
+            comma++;
         }
-
-        case 0x84: case 0x85:
-            out->opcode = GEN_OP_TEST;
-            add_src_reg(out, reg_gen);
-            if (rm_is_reg) {
-                add_src_reg(out, rm_gen);
-            } else {
-                x86_add_mem_addr_regs(s, out);
+        if (*comma != '#') {
+            i = 0;
+            while (*comma && *comma != ',' && *comma != ']' &&
+                   *comma != ' ' && i < 15) {
+                name[i++] = *comma++;
             }
-            add_dst_reg(out, REG_FLAGS);
-            break;
-
-        case 0xA8: case 0xA9:
-            out->opcode = GEN_OP_TEST;
-            add_src_reg(out, REG_GPR0);
-            add_dst_reg(out, REG_FLAGS);
-            break;
-
-        case 0x86: case 0x87:
-            out->opcode = GEN_OP_XCHG;
-            add_src_reg(out, reg_gen);
-            add_dst_reg(out, reg_gen);
-            if (rm_is_reg) {
-                add_src_reg(out, rm_gen);
-                add_dst_reg(out, rm_gen);
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            break;
-
-        case 0x88: case 0x89:
-            if (rm_is_reg) {
-                out->opcode = GEN_OP_MOV;
-                add_src_reg(out, reg_gen);
-                add_dst_reg(out, rm_gen);
-            } else {
-                out->opcode = GEN_OP_STORE;
-                add_src_reg(out, reg_gen);
-                x86_add_mem_addr_regs(s, out);
-            }
-            break;
-        case 0x8A: case 0x8B:
-            if (rm_is_reg) {
-                out->opcode = GEN_OP_MOV;
-                add_src_reg(out, rm_gen);
-                add_dst_reg(out, reg_gen);
-            } else {
-                out->opcode = GEN_OP_LOAD;
-                add_dst_reg(out, reg_gen);
-                x86_add_mem_addr_regs(s, out);
-            }
-            break;
-
-        case 0x8D:
-            out->opcode = GEN_OP_LEA;
-            add_dst_reg(out, reg_gen);
-            x86_add_mem_addr_regs(s, out);
-            break;
-
-        case 0x90:
-        {
-            uint8_t ext_rm = op1 & 7;
-            if (s->has_rex && (s->rex & 0x01)) {
-                ext_rm |= 8;
-            }
-            if (ext_rm == 0) {
-                out->opcode = GEN_OP_NOP;
-            } else {
-                out->opcode = GEN_OP_XCHG;
-                add_src_reg(out, REG_GPR0);
-                add_dst_reg(out, REG_GPR0);
-                add_src_reg(out, x86_gpr_to_generic(ext_rm));
-                add_dst_reg(out, x86_gpr_to_generic(ext_rm));
-            }
-            break;
+            name[i] = '\0';
+            uint8_t idx = parse_aarch64_reg(name);
+            add_src_reg(out, idx);
         }
+    }
+}
 
-        case 0xA0: case 0xA1:
+/*
+ * Parse x86 AT&T operands and populate source/destination registers.
+ * In AT&T syntax, source comes first, destination last.
+ */
+static void parse_x86_operands(const char *operands, InsnFields *out)
+{
+    char ops[MAX_OPS][MAX_OP_LEN];
+    int n_ops = split_operands(operands, ops, MAX_OPS);
+
+    if (n_ops == 0) {
+        return;
+    }
+
+    bool op_is_mem[MAX_OPS];
+    for (int i = 0; i < n_ops; i++) {
+        op_is_mem[i] = is_memory_operand(ops[i]);
+    }
+
+    /* Adjust opcode for MOV with memory operand */
+    if (out->opcode == GEN_OP_MOV && n_ops >= 2) {
+        if (op_is_mem[0]) {
             out->opcode = GEN_OP_LOAD;
-            add_dst_reg(out, REG_GPR0);
-            break;
-        case 0xA2: case 0xA3:
+        } else if (op_is_mem[1]) {
             out->opcode = GEN_OP_STORE;
+        }
+    }
+
+    /* Check for indirect branch/call (operand starts with '*') */
+    if (out->branch_type == BRANCH_DIRECT_JUMP ||
+        out->branch_type == BRANCH_DIRECT_CALL) {
+        const char *t = ops[0];
+        while (*t == ' ' || *t == '\t') {
+            t++;
+        }
+        if (*t == '*') {
+            out->branch_type = (out->branch_type == BRANCH_DIRECT_JUMP) ?
+                               BRANCH_INDIRECT_JUMP : BRANCH_INDIRECT_CALL;
+        }
+    }
+
+    switch (out->opcode) {
+    /* Two-operand ALU: src, src+dst; FLAGS is dst */
+    case GEN_OP_INT_ADD: case GEN_OP_INT_SUB: case GEN_OP_AND:
+    case GEN_OP_OR: case GEN_OP_XOR: case GEN_OP_INT_ADC:
+    case GEN_OP_INT_SBB: case GEN_OP_SHL: case GEN_OP_SHR:
+    case GEN_OP_SAR: case GEN_OP_ROL: case GEN_OP_ROR:
+        if (n_ops >= 2) {
+            uint8_t src = extract_x86_reg(ops[0]);
+            uint8_t dst = extract_x86_reg(ops[1]);
+            if (src != REG_NONE) add_src_reg(out, src);
+            if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
+            if (dst != REG_NONE) {
+                add_src_reg(out, dst);
+                add_dst_reg(out, dst);
+            }
+            if (op_is_mem[1]) extract_x86_mem_regs(ops[1], out);
+        } else if (n_ops == 1) {
+            uint8_t r = extract_x86_reg(ops[0]);
+            if (r != REG_NONE) { add_src_reg(out, r); add_dst_reg(out, r); }
+            if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
+        }
+        add_dst_reg(out, REG_FLAGS);
+        break;
+
+    /* Data movement: src -> dst */
+    case GEN_OP_MOV: case GEN_OP_MOVSX: case GEN_OP_MOVZX:
+    case GEN_OP_CMOV:
+        if (n_ops >= 2) {
+            uint8_t src = extract_x86_reg(ops[0]);
+            uint8_t dst = extract_x86_reg(ops[1]);
+            if (src != REG_NONE) add_src_reg(out, src);
+            if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
+            if (dst != REG_NONE) add_dst_reg(out, dst);
+            if (op_is_mem[1]) extract_x86_mem_regs(ops[1], out);
+        }
+        if (out->opcode == GEN_OP_CMOV) add_src_reg(out, REG_FLAGS);
+        break;
+
+    /* Load from memory */
+    case GEN_OP_LOAD:
+        if (n_ops >= 2) {
+            if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
+            uint8_t dst = extract_x86_reg(ops[n_ops - 1]);
+            if (dst != REG_NONE) add_dst_reg(out, dst);
+        }
+        break;
+
+    /* Store to memory */
+    case GEN_OP_STORE:
+        if (n_ops >= 2) {
+            uint8_t src = extract_x86_reg(ops[0]);
+            if (src != REG_NONE) add_src_reg(out, src);
+            if (op_is_mem[n_ops - 1]) {
+                extract_x86_mem_regs(ops[n_ops - 1], out);
+            }
+        }
+        break;
+
+    /* LEA: addr regs as sources, register as dest */
+    case GEN_OP_LEA:
+        if (n_ops >= 2) {
+            extract_x86_mem_regs(ops[0], out);
+            uint8_t dst = extract_x86_reg(ops[1]);
+            if (dst != REG_NONE) add_dst_reg(out, dst);
+        }
+        break;
+
+    /* CMP/TEST: both operands are sources, FLAGS is dst */
+    case GEN_OP_CMP: case GEN_OP_TEST:
+        for (int i = 0; i < n_ops && i < 2; i++) {
+            uint8_t r = extract_x86_reg(ops[i]);
+            if (r != REG_NONE) add_src_reg(out, r);
+            if (op_is_mem[i]) extract_x86_mem_regs(ops[i], out);
+        }
+        add_dst_reg(out, REG_FLAGS);
+        break;
+
+    /* PUSH: src + SP */
+    case GEN_OP_PUSH:
+        if (n_ops >= 1) {
+            uint8_t r = extract_x86_reg(ops[0]);
+            if (r != REG_NONE) add_src_reg(out, r);
+            if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
+        }
+        add_src_reg(out, REG_SP);
+        add_dst_reg(out, REG_SP);
+        break;
+
+    /* POP: dst + SP */
+    case GEN_OP_POP:
+        if (n_ops >= 1) {
+            uint8_t r = extract_x86_reg(ops[0]);
+            if (r != REG_NONE) add_dst_reg(out, r);
+        }
+        add_src_reg(out, REG_SP);
+        add_dst_reg(out, REG_SP);
+        break;
+
+    /* XCHG: both operands are src+dst */
+    case GEN_OP_XCHG:
+        for (int i = 0; i < n_ops && i < 2; i++) {
+            uint8_t r = extract_x86_reg(ops[i]);
+            if (r != REG_NONE) {
+                add_src_reg(out, r);
+                add_dst_reg(out, r);
+            }
+            if (op_is_mem[i]) extract_x86_mem_regs(ops[i], out);
+        }
+        break;
+
+    /* Unary: operand is both src and dst */
+    case GEN_OP_NOT: case GEN_OP_NEG: case GEN_OP_INC: case GEN_OP_DEC:
+        if (n_ops >= 1) {
+            uint8_t r = extract_x86_reg(ops[0]);
+            if (r != REG_NONE) {
+                add_src_reg(out, r);
+                add_dst_reg(out, r);
+            }
+            if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
+        }
+        if (out->opcode != GEN_OP_NOT) add_dst_reg(out, REG_FLAGS);
+        break;
+
+    /* CALL: may have indirect operand */
+    case GEN_OP_CALL:
+    {
+        if (n_ops >= 1) {
+            const char *t = ops[0];
+            while (*t == ' ' || *t == '\t') t++;
+            if (*t == '*') {
+                if (op_is_mem[0]) {
+                    extract_x86_mem_regs(ops[0], out);
+                } else {
+                    uint8_t r = extract_x86_reg(ops[0]);
+                    if (r != REG_NONE) add_src_reg(out, r);
+                }
+            }
+        }
+        add_src_reg(out, REG_SP);
+        add_dst_reg(out, REG_SP);
+        add_dst_reg(out, REG_IP);
+        break;
+    }
+
+    /* RET */
+    case GEN_OP_RET:
+        add_src_reg(out, REG_SP);
+        add_dst_reg(out, REG_SP);
+        add_dst_reg(out, REG_IP);
+        break;
+
+    /* Branch */
+    case GEN_OP_BRANCH:
+        if (out->branch_type == BRANCH_COND_DIRECT) {
+            add_src_reg(out, REG_FLAGS);
+        }
+        if (out->branch_type == BRANCH_INDIRECT_JUMP && n_ops >= 1) {
+            const char *t = ops[0];
+            while (*t == ' ' || *t == '\t') t++;
+            if (*t == '*') {
+                if (op_is_mem[0]) {
+                    extract_x86_mem_regs(ops[0], out);
+                } else {
+                    uint8_t r = extract_x86_reg(ops[0]);
+                    if (r != REG_NONE) add_src_reg(out, r);
+                }
+            }
+        }
+        break;
+
+    /* MUL/IMUL */
+    case GEN_OP_INT_MUL:
+        if (n_ops >= 2) {
+            for (int i = 0; i < n_ops; i++) {
+                uint8_t r = extract_x86_reg(ops[i]);
+                if (r != REG_NONE) add_src_reg(out, r);
+                if (op_is_mem[i]) extract_x86_mem_regs(ops[i], out);
+            }
+            uint8_t dst = extract_x86_reg(ops[n_ops - 1]);
+            if (dst != REG_NONE) add_dst_reg(out, dst);
+        } else if (n_ops == 1) {
             add_src_reg(out, REG_GPR0);
-            break;
-
-        case 0xB0 ... 0xB7:
-        {
-            uint8_t r = (op1 & 7);
-            if (s->has_rex && (s->rex & 0x01)) {
-                r |= 8;
-            }
-            out->opcode = GEN_OP_MOV;
-            add_dst_reg(out, x86_gpr_to_generic(r));
-            break;
+            uint8_t r = extract_x86_reg(ops[0]);
+            if (r != REG_NONE) add_src_reg(out, r);
+            if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
+            add_dst_reg(out, REG_GPR0);
+            add_dst_reg(out, REG_GPR2);
         }
+        add_dst_reg(out, REG_FLAGS);
+        break;
 
-        case 0xB8 ... 0xBF:
-        {
-            uint8_t r = (op1 & 7);
-            if (s->has_rex && (s->rex & 0x01)) {
-                r |= 8;
-            }
-            out->opcode = GEN_OP_MOV;
-            add_dst_reg(out, x86_gpr_to_generic(r));
-            break;
+    /* DIV/IDIV */
+    case GEN_OP_INT_DIV:
+        add_src_reg(out, REG_GPR0);
+        add_src_reg(out, REG_GPR2);
+        if (n_ops >= 1) {
+            uint8_t r = extract_x86_reg(ops[0]);
+            if (r != REG_NONE) add_src_reg(out, r);
+            if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
         }
+        add_dst_reg(out, REG_GPR0);
+        add_dst_reg(out, REG_GPR2);
+        break;
 
-        case 0xC0: case 0xC1: case 0xD0: case 0xD1:
-        case 0xD2: case 0xD3:
-        {
-            static const uint8_t shift_ops[] = {
-                GEN_OP_ROL, GEN_OP_ROR, GEN_OP_ROL, GEN_OP_ROR,
-                GEN_OP_SHL, GEN_OP_SHR, GEN_OP_SHL, GEN_OP_SAR
-            };
-            uint8_t ext = (s->modrm >> 3) & 7;
-            out->opcode = shift_ops[ext];
-            if (rm_is_reg) {
-                add_src_reg(out, rm_gen);
-                add_dst_reg(out, rm_gen);
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            if (op1 == 0xD2 || op1 == 0xD3) {
-                add_src_reg(out, REG_GPR1);
-            }
-            add_dst_reg(out, REG_FLAGS);
-            break;
+    /* SETCC: FLAGS as src */
+    case GEN_OP_SETCC:
+        add_src_reg(out, REG_FLAGS);
+        if (n_ops >= 1) {
+            uint8_t r = extract_x86_reg(ops[0]);
+            if (r != REG_NONE) add_dst_reg(out, r);
+            if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
         }
+        break;
 
-        case 0xC2: case 0xC3:
-            out->opcode = GEN_OP_RET;
-            out->branch_type = BRANCH_RETURN;
-            add_src_reg(out, REG_SP);
-            add_dst_reg(out, REG_SP);
-            add_dst_reg(out, REG_IP);
-            break;
-
-        case 0xC6: case 0xC7:
-            if (rm_is_reg) {
-                out->opcode = GEN_OP_MOV;
-                add_dst_reg(out, rm_gen);
-            } else {
-                out->opcode = GEN_OP_STORE;
-                x86_add_mem_addr_regs(s, out);
+    /* FP/Vector: AT&T srcs first, dst last */
+    case GEN_OP_FP_ADD: case GEN_OP_FP_SUB: case GEN_OP_FP_MUL:
+    case GEN_OP_FP_DIV: case GEN_OP_FP_SQRT: case GEN_OP_FP_MOV:
+    case GEN_OP_FP_CVT: case GEN_OP_FP_CMP:
+    case GEN_OP_VEC_ADD: case GEN_OP_VEC_SUB: case GEN_OP_VEC_MUL:
+    case GEN_OP_VEC_MOV: case GEN_OP_VEC_SHUF: case GEN_OP_VEC_LOGIC:
+        for (int i = 0; i < n_ops; i++) {
+            uint8_t r = extract_x86_reg(ops[i]);
+            if (r != REG_NONE) {
+                if (i < n_ops - 1) {
+                    add_src_reg(out, r);
+                } else {
+                    add_src_reg(out, r);
+                    add_dst_reg(out, r);
+                }
             }
-            break;
-
-        case 0x50 ... 0x57:
-        {
-            uint8_t r = (op1 & 7);
-            if (s->has_rex && (s->rex & 0x01)) {
-                r |= 8;
-            }
-            out->opcode = GEN_OP_PUSH;
-            add_src_reg(out, x86_gpr_to_generic(r));
-            add_src_reg(out, REG_SP);
-            add_dst_reg(out, REG_SP);
-            break;
+            if (op_is_mem[i]) extract_x86_mem_regs(ops[i], out);
         }
+        if (out->opcode == GEN_OP_FP_CMP) add_dst_reg(out, REG_FLAGS);
+        break;
 
-        case 0x58 ... 0x5F:
-        {
-            uint8_t r = (op1 & 7);
-            if (s->has_rex && (s->rex & 0x01)) {
-                r |= 8;
-            }
-            out->opcode = GEN_OP_POP;
-            add_dst_reg(out, x86_gpr_to_generic(r));
-            add_src_reg(out, REG_SP);
-            add_dst_reg(out, REG_SP);
-            break;
-        }
+    default:
+        break;
+    }
 
-        case 0x70 ... 0x7F:
-            out->opcode = GEN_OP_BRANCH;
-            out->branch_type = BRANCH_COND_DIRECT;
-            add_src_reg(out, REG_FLAGS);
-            break;
-
-        case 0xEB: case 0xE9:
-            out->opcode = GEN_OP_BRANCH;
-            out->branch_type = BRANCH_DIRECT_JUMP;
-            break;
-
-        case 0xE8:
-            out->opcode = GEN_OP_CALL;
-            out->branch_type = BRANCH_DIRECT_CALL;
-            add_src_reg(out, REG_SP);
-            add_dst_reg(out, REG_SP);
-            add_dst_reg(out, REG_IP);
-            break;
-
-        case 0xF6: case 0xF7:
-        {
-            uint8_t ext = (s->modrm >> 3) & 7;
-            switch (ext) {
-            case 0:
-                out->opcode = GEN_OP_TEST;
-                if (rm_is_reg) {
-                    add_src_reg(out, rm_gen);
-                } else {
-                    x86_add_mem_addr_regs(s, out);
-                }
-                add_dst_reg(out, REG_FLAGS);
-                break;
-            case 2:
-                out->opcode = GEN_OP_NOT;
-                if (rm_is_reg) {
-                    add_src_reg(out, rm_gen);
-                    add_dst_reg(out, rm_gen);
-                } else {
-                    x86_add_mem_addr_regs(s, out);
-                }
-                break;
-            case 3:
-                out->opcode = GEN_OP_NEG;
-                if (rm_is_reg) {
-                    add_src_reg(out, rm_gen);
-                    add_dst_reg(out, rm_gen);
-                } else {
-                    x86_add_mem_addr_regs(s, out);
-                }
-                add_dst_reg(out, REG_FLAGS);
-                break;
-            case 4: case 5:
-                out->opcode = GEN_OP_INT_MUL;
-                add_src_reg(out, REG_GPR0);
-                if (rm_is_reg) {
-                    add_src_reg(out, rm_gen);
-                } else {
-                    x86_add_mem_addr_regs(s, out);
-                }
-                add_dst_reg(out, REG_GPR0);
-                add_dst_reg(out, REG_GPR2);
-                add_dst_reg(out, REG_FLAGS);
-                break;
-            case 6: case 7:
-                out->opcode = GEN_OP_INT_DIV;
-                add_src_reg(out, REG_GPR0);
-                add_src_reg(out, REG_GPR2);
-                if (rm_is_reg) {
-                    add_src_reg(out, rm_gen);
-                } else {
-                    x86_add_mem_addr_regs(s, out);
-                }
-                add_dst_reg(out, REG_GPR0);
-                add_dst_reg(out, REG_GPR2);
-                break;
-            default:
-                out->opcode = GEN_OP_UNKNOWN;
-                break;
-            }
-            break;
-        }
-
-        case 0xFE: case 0xFF:
-        {
-            uint8_t ext = (s->modrm >> 3) & 7;
-            switch (ext) {
-            case 0:
-                out->opcode = GEN_OP_INC;
-                if (rm_is_reg) {
-                    add_src_reg(out, rm_gen);
-                    add_dst_reg(out, rm_gen);
-                } else {
-                    x86_add_mem_addr_regs(s, out);
-                }
-                add_dst_reg(out, REG_FLAGS);
-                break;
-            case 1:
-                out->opcode = GEN_OP_DEC;
-                if (rm_is_reg) {
-                    add_src_reg(out, rm_gen);
-                    add_dst_reg(out, rm_gen);
-                } else {
-                    x86_add_mem_addr_regs(s, out);
-                }
-                add_dst_reg(out, REG_FLAGS);
-                break;
-            case 2:
-                out->opcode = GEN_OP_CALL;
-                out->branch_type = BRANCH_INDIRECT_CALL;
-                if (rm_is_reg) {
-                    add_src_reg(out, rm_gen);
-                } else {
-                    x86_add_mem_addr_regs(s, out);
-                }
-                add_src_reg(out, REG_SP);
-                add_dst_reg(out, REG_SP);
-                add_dst_reg(out, REG_IP);
-                break;
-            case 4:
-                out->opcode = GEN_OP_BRANCH;
-                out->branch_type = BRANCH_INDIRECT_JUMP;
-                if (rm_is_reg) {
-                    add_src_reg(out, rm_gen);
-                } else {
-                    x86_add_mem_addr_regs(s, out);
-                }
-                break;
-            case 6:
-                out->opcode = GEN_OP_PUSH;
-                if (rm_is_reg) {
-                    add_src_reg(out, rm_gen);
-                } else {
-                    x86_add_mem_addr_regs(s, out);
-                }
-                add_src_reg(out, REG_SP);
-                add_dst_reg(out, REG_SP);
-                break;
-            default:
-                out->opcode = GEN_OP_UNKNOWN;
-                break;
-            }
-            break;
-        }
-
-        case 0xCD:
-            out->opcode = GEN_OP_SYSCALL;
-            out->branch_type = BRANCH_SYSCALL_TYPE;
-            break;
-
-        default:
-            out->opcode = GEN_OP_UNKNOWN;
-            break;
-        }
-    } else {
-        /* 2-byte opcodes (0F xx) */
-        uint8_t op2 = s->opcode_bytes[1];
-
-        switch (op2) {
-        case 0x80 ... 0x8F:
-            out->opcode = GEN_OP_BRANCH;
-            out->branch_type = BRANCH_COND_DIRECT;
-            add_src_reg(out, REG_FLAGS);
-            break;
-
-        case 0x90 ... 0x9F:
-            out->opcode = GEN_OP_SETCC;
-            add_src_reg(out, REG_FLAGS);
-            if (rm_is_reg) {
-                add_dst_reg(out, rm_gen);
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            break;
-
-        case 0x40 ... 0x4F:
-            out->opcode = GEN_OP_CMOV;
-            add_src_reg(out, REG_FLAGS);
-            add_src_reg(out, reg_gen);
-            if (rm_is_reg) {
-                add_src_reg(out, rm_gen);
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            add_dst_reg(out, reg_gen);
-            break;
-
-        case 0xAF:
-            out->opcode = GEN_OP_INT_MUL;
-            add_src_reg(out, reg_gen);
-            if (rm_is_reg) {
-                add_src_reg(out, rm_gen);
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            add_dst_reg(out, reg_gen);
-            add_dst_reg(out, REG_FLAGS);
-            break;
-
-        case 0xB6: case 0xB7:
-            out->opcode = GEN_OP_MOVZX;
-            add_dst_reg(out, reg_gen);
-            if (rm_is_reg) {
-                add_src_reg(out, rm_gen);
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            break;
-
-        case 0xBE: case 0xBF:
-            out->opcode = GEN_OP_MOVSX;
-            add_dst_reg(out, reg_gen);
-            if (rm_is_reg) {
-                add_src_reg(out, rm_gen);
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            break;
-
-        case 0x05:
-            out->opcode = GEN_OP_SYSCALL;
-            out->branch_type = BRANCH_SYSCALL_TYPE;
-            break;
-
-        case 0xAE:
-            out->opcode = GEN_OP_FENCE;
-            break;
-
-        case 0x1F:
-            out->opcode = GEN_OP_NOP;
-            break;
-
-        case 0x10: case 0x11:
-        case 0x28: case 0x29:
-        case 0x6F: case 0x7F:
-        {
-            bool is_store = (op2 == 0x11 || op2 == 0x29 || op2 == 0x7F);
-            uint8_t xmm_reg = x86_xmm_to_generic(reg_idx);
-            uint8_t xmm_rm = rm_is_reg ? x86_xmm_to_generic(rm_idx)
-                                       : REG_NONE;
-            if (is_store) {
-                if (rm_is_reg) {
-                    out->opcode = GEN_OP_VEC_MOV;
-                    add_src_reg(out, xmm_reg);
-                    add_dst_reg(out, xmm_rm);
-                } else {
-                    out->opcode = GEN_OP_STORE;
-                    add_src_reg(out, xmm_reg);
-                    x86_add_mem_addr_regs(s, out);
-                }
-            } else {
-                if (rm_is_reg) {
-                    out->opcode = GEN_OP_VEC_MOV;
-                    add_src_reg(out, xmm_rm);
-                    add_dst_reg(out, xmm_reg);
-                } else {
-                    out->opcode = GEN_OP_LOAD;
-                    add_dst_reg(out, xmm_reg);
-                    x86_add_mem_addr_regs(s, out);
-                }
-            }
-            break;
-        }
-
-        case 0x58:
-            out->opcode = GEN_OP_FP_ADD;
-            add_src_reg(out, x86_xmm_to_generic(reg_idx));
-            if (rm_is_reg) {
-                add_src_reg(out, x86_xmm_to_generic(rm_idx));
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
-            break;
-        case 0x59:
-            out->opcode = GEN_OP_FP_MUL;
-            add_src_reg(out, x86_xmm_to_generic(reg_idx));
-            if (rm_is_reg) {
-                add_src_reg(out, x86_xmm_to_generic(rm_idx));
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
-            break;
-        case 0x5C:
-            out->opcode = GEN_OP_FP_SUB;
-            add_src_reg(out, x86_xmm_to_generic(reg_idx));
-            if (rm_is_reg) {
-                add_src_reg(out, x86_xmm_to_generic(rm_idx));
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
-            break;
-        case 0x5E:
-            out->opcode = GEN_OP_FP_DIV;
-            add_src_reg(out, x86_xmm_to_generic(reg_idx));
-            if (rm_is_reg) {
-                add_src_reg(out, x86_xmm_to_generic(rm_idx));
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
-            break;
-        case 0x51:
-            out->opcode = GEN_OP_FP_SQRT;
-            if (rm_is_reg) {
-                add_src_reg(out, x86_xmm_to_generic(rm_idx));
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
-            break;
-
-        case 0x2E: case 0x2F:
-            out->opcode = GEN_OP_FP_CMP;
-            add_src_reg(out, x86_xmm_to_generic(reg_idx));
-            if (rm_is_reg) {
-                add_src_reg(out, x86_xmm_to_generic(rm_idx));
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            add_dst_reg(out, REG_FLAGS);
-            break;
-
-        case 0x54: case 0x55:
-        case 0x56: case 0x57:
-            out->opcode = GEN_OP_VEC_LOGIC;
-            add_src_reg(out, x86_xmm_to_generic(reg_idx));
-            if (rm_is_reg) {
-                add_src_reg(out, x86_xmm_to_generic(rm_idx));
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
-            break;
-
-        case 0xC6:
-            out->opcode = GEN_OP_VEC_SHUF;
-            add_src_reg(out, x86_xmm_to_generic(reg_idx));
-            if (rm_is_reg) {
-                add_src_reg(out, x86_xmm_to_generic(rm_idx));
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
-            break;
-
-        case 0x2A: case 0x2C: case 0x2D:
-        case 0x5A: case 0x5B:
-        case 0xE6:
-            out->opcode = GEN_OP_FP_CVT;
-            if (rm_is_reg) {
-                add_src_reg(out, x86_xmm_to_generic(rm_idx));
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
-            break;
-
-        case 0xD4:
-        case 0xFC: case 0xFD: case 0xFE:
-            out->opcode = GEN_OP_VEC_ADD;
-            add_src_reg(out, x86_xmm_to_generic(reg_idx));
-            if (rm_is_reg) {
-                add_src_reg(out, x86_xmm_to_generic(rm_idx));
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
-            break;
-
-        case 0xF8: case 0xF9: case 0xFA: case 0xFB:
-            out->opcode = GEN_OP_VEC_SUB;
-            add_src_reg(out, x86_xmm_to_generic(reg_idx));
-            if (rm_is_reg) {
-                add_src_reg(out, x86_xmm_to_generic(rm_idx));
-            } else {
-                x86_add_mem_addr_regs(s, out);
-            }
-            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
-            break;
-
-        default:
-            out->opcode = GEN_OP_UNKNOWN;
+    /* Extract immediate value from operands */
+    for (int i = 0; i < n_ops; i++) {
+        const char *t = ops[i];
+        while (*t == ' ' || *t == '\t') t++;
+        if (*t == '$') {
+            out->has_immediate = true;
+            out->immediate = strtoll(t + 1, NULL, 0);
             break;
         }
     }
 }
 
-static void decode_insn_to_generic(const uint8_t *bytes, uint32_t len,
-                                    InsnFields *out)
+/*
+ * Parse AArch64 operands and populate source/destination registers.
+ * First operand is typically destination, rest are sources.
+ */
+static void parse_aarch64_operands(const char *operands, InsnFields *out)
+{
+    char ops[MAX_OPS][MAX_OP_LEN];
+    int n_ops = split_operands(operands, ops, MAX_OPS);
+
+    if (n_ops == 0) {
+        return;
+    }
+
+    switch (out->opcode) {
+    /* ALU: dst = op(src1, src2) */
+    case GEN_OP_INT_ADD: case GEN_OP_INT_SUB: case GEN_OP_INT_MUL:
+    case GEN_OP_INT_DIV: case GEN_OP_AND: case GEN_OP_OR:
+    case GEN_OP_XOR: case GEN_OP_NOT: case GEN_OP_SHL:
+    case GEN_OP_SHR: case GEN_OP_SAR:
+    {
+        if (n_ops >= 1) {
+            uint8_t dst = extract_aarch64_reg(ops[0]);
+            if (dst != REG_NONE) add_dst_reg(out, dst);
+        }
+        for (int i = 1; i < n_ops; i++) {
+            uint8_t src = extract_aarch64_reg(ops[i]);
+            if (src != REG_NONE) add_src_reg(out, src);
+        }
+        break;
+    }
+
+    /* MOV: dst, src */
+    case GEN_OP_MOV: case GEN_OP_MOVSX: case GEN_OP_MOVZX:
+    case GEN_OP_CMOV:
+    {
+        if (n_ops >= 1) {
+            uint8_t dst = extract_aarch64_reg(ops[0]);
+            if (dst != REG_NONE) add_dst_reg(out, dst);
+        }
+        for (int i = 1; i < n_ops; i++) {
+            uint8_t src = extract_aarch64_reg(ops[i]);
+            if (src != REG_NONE) add_src_reg(out, src);
+        }
+        break;
+    }
+
+    /* LOAD: dst, [base, offset] */
+    case GEN_OP_LOAD:
+    {
+        if (n_ops >= 1) {
+            uint8_t dst = extract_aarch64_reg(ops[0]);
+            if (dst != REG_NONE) add_dst_reg(out, dst);
+        }
+        /* For ldp: second operand is also a dest */
+        if (n_ops >= 3) {
+            uint8_t dst2 = extract_aarch64_reg(ops[1]);
+            if (dst2 != REG_NONE) add_dst_reg(out, dst2);
+        }
+        for (int i = 0; i < n_ops; i++) {
+            if (is_memory_operand(ops[i])) {
+                extract_aarch64_mem_regs(ops[i], out);
+            }
+        }
+        break;
+    }
+
+    /* STORE: src, [base, offset] */
+    case GEN_OP_STORE:
+    {
+        if (n_ops >= 1) {
+            uint8_t src = extract_aarch64_reg(ops[0]);
+            if (src != REG_NONE) add_src_reg(out, src);
+        }
+        /* For stp: second operand is also a source */
+        if (n_ops >= 3) {
+            uint8_t src2 = extract_aarch64_reg(ops[1]);
+            if (src2 != REG_NONE) add_src_reg(out, src2);
+        }
+        for (int i = 0; i < n_ops; i++) {
+            if (is_memory_operand(ops[i])) {
+                extract_aarch64_mem_regs(ops[i], out);
+            }
+        }
+        break;
+    }
+
+    /* CMP/TST: all operands are sources */
+    case GEN_OP_CMP: case GEN_OP_TEST:
+        for (int i = 0; i < n_ops; i++) {
+            uint8_t r = extract_aarch64_reg(ops[i]);
+            if (r != REG_NONE) add_src_reg(out, r);
+        }
+        add_dst_reg(out, REG_FLAGS);
+        break;
+
+    /* Branch: operand is src register or target */
+    case GEN_OP_BRANCH:
+        for (int i = 0; i < n_ops; i++) {
+            uint8_t r = extract_aarch64_reg(ops[i]);
+            if (r != REG_NONE) add_src_reg(out, r);
+        }
+        break;
+
+    /* CALL (bl/blr): link register is dst */
+    case GEN_OP_CALL:
+        if (out->branch_type == BRANCH_INDIRECT_CALL && n_ops >= 1) {
+            uint8_t r = extract_aarch64_reg(ops[0]);
+            if (r != REG_NONE) add_src_reg(out, r);
+        }
+        add_dst_reg(out, REG_LR);
+        break;
+
+    /* RET */
+    case GEN_OP_RET:
+        add_src_reg(out, REG_LR);
+        break;
+
+    /* FP/Vector: dst, src1, src2 */
+    case GEN_OP_FP_ADD: case GEN_OP_FP_SUB: case GEN_OP_FP_MUL:
+    case GEN_OP_FP_DIV: case GEN_OP_FP_SQRT: case GEN_OP_FP_MOV:
+    case GEN_OP_FP_CVT: case GEN_OP_FP_CMP:
+    {
+        if (out->opcode == GEN_OP_FP_CMP) {
+            for (int i = 0; i < n_ops; i++) {
+                uint8_t r = extract_aarch64_reg(ops[i]);
+                if (r != REG_NONE) add_src_reg(out, r);
+            }
+            add_dst_reg(out, REG_FLAGS);
+        } else {
+            if (n_ops >= 1) {
+                uint8_t dst = extract_aarch64_reg(ops[0]);
+                if (dst != REG_NONE) add_dst_reg(out, dst);
+            }
+            for (int i = 1; i < n_ops; i++) {
+                uint8_t src = extract_aarch64_reg(ops[i]);
+                if (src != REG_NONE) add_src_reg(out, src);
+            }
+        }
+        break;
+    }
+
+    default:
+        if (n_ops >= 1) {
+            uint8_t dst = extract_aarch64_reg(ops[0]);
+            if (dst != REG_NONE) add_dst_reg(out, dst);
+        }
+        for (int i = 1; i < n_ops; i++) {
+            uint8_t src = extract_aarch64_reg(ops[i]);
+            if (src != REG_NONE) add_src_reg(out, src);
+        }
+        break;
+    }
+
+    /* Extract immediate value (#N) */
+    for (int i = 0; i < n_ops; i++) {
+        const char *t = ops[i];
+        while (*t == ' ' || *t == '\t') t++;
+        if (*t == '#') {
+            out->has_immediate = true;
+            out->immediate = strtoll(t + 1, NULL, 0);
+            break;
+        }
+    }
+}
+
+/*
+ * Decode a disassembly string into ISA-agnostic InsnFields.
+ * Uses the disassembly from qemu_plugin_insn_disas().
+ */
+static void decode_disas_to_generic(const char *disas, InsnFields *out)
 {
     memset(out, 0, sizeof(*out));
 
-    if (is_x86) {
-        X86DecodeState s;
-        memset(&s, 0, sizeof(s));
-        x86_raw_decode(bytes, len, &s);
-        x86_map_to_generic(&s, out);
+    if (!disas || !*disas) {
+        return;
+    }
+
+    /* Extract mnemonic (first space-delimited token) */
+    char mnem[64];
+    const char *p = disas;
+    int i = 0;
+    while (*p && *p != ' ' && *p != '\t' && i < 63) {
+        mnem[i++] = *p++;
+    }
+    mnem[i] = '\0';
+
+    /* Classify mnemonic -> opcode + branch_type */
+    classify_mnemonic(mnem, &out->opcode, &out->branch_type);
+
+    /* Skip whitespace to get to operands */
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+
+    /* Parse operands for register and immediate extraction */
+    if (*p) {
+        if (is_x86) {
+            parse_x86_operands(p, out);
+        } else {
+            parse_aarch64_operands(p, out);
+        }
     }
 }
 
@@ -1545,8 +1724,7 @@ static BBTemplate *find_template(uint64_t start_pc)
 static BBTemplate *get_or_create_template(uint64_t start_pc,
                                           uint32_t n_insns,
                                           uint64_t *insn_pcs,
-                                          uint32_t *insn_sizes,
-                                          uint8_t **insn_bytes,
+                                          char **insn_disas,
                                           uint64_t fall_through_pc)
 {
     BBTemplate *tmpl = find_template(start_pc);
@@ -1568,9 +1746,8 @@ static BBTemplate *get_or_create_template(uint64_t start_pc,
     /* Decode all instructions to ISA-agnostic generic fields */
     tmpl->insn_fields = g_new0(InsnFields, n_insns);
     for (uint32_t i = 0; i < n_insns; i++) {
-        if (insn_bytes && insn_bytes[i] && insn_sizes[i] > 0) {
-            decode_insn_to_generic(insn_bytes[i], insn_sizes[i],
-                                   &tmpl->insn_fields[i]);
+        if (insn_disas && insn_disas[i]) {
+            decode_disas_to_generic(insn_disas[i], &tmpl->insn_fields[i]);
         }
     }
 
@@ -1622,7 +1799,6 @@ static void vcpu_mem_cb(unsigned int cpu_index,
 static WPBBEntry create_wp_bb_entry(uint64_t bb_start_pc,
                                     GArray *insn_pcs_arr,
                                     GArray *insn_sizes_arr,
-                                    GArray *insn_bytes_arr,
                                     GArray *mem_accesses,
                                     guint mem_start_idx)
 {
@@ -1639,32 +1815,21 @@ static WPBBEntry create_wp_bb_entry(uint64_t bb_start_pc,
     BBTemplate *tmpl = find_template(bb_start_pc);
 
     if (!tmpl && n_insns > 0) {
-        /* Create template from wrong-path data */
+        /* Create template from wrong-path data (no disassembly available) */
         uint64_t *pcs = g_new0(uint64_t, n_insns);
-        uint32_t *sizes = g_new0(uint32_t, n_insns);
-        uint8_t **bytes = g_new0(uint8_t *, n_insns);
         uint64_t ft_pc = 0;
 
         for (uint32_t i = 0; i < n_insns; i++) {
             pcs[i] = g_array_index(insn_pcs_arr, uint64_t, i);
-            sizes[i] = g_array_index(insn_sizes_arr, uint32_t, i);
-            if (insn_bytes_arr) {
-                uint8_t *src = g_array_index(insn_bytes_arr, uint8_t *, i);
-                bytes[i] = g_memdup2(src, sizes[i]);
-            }
         }
-        ft_pc = pcs[n_insns - 1] + sizes[n_insns - 1];
+        uint32_t last_size = g_array_index(insn_sizes_arr, uint32_t,
+                                            n_insns - 1);
+        ft_pc = pcs[n_insns - 1] + last_size;
 
-        tmpl = get_or_create_template(bb_start_pc, n_insns, pcs, sizes,
-                                      bytes, ft_pc);
+        tmpl = get_or_create_template(bb_start_pc, n_insns, pcs,
+                                      NULL, ft_pc);
 
-        /* get_or_create_template makes its own copies */
-        for (uint32_t i = 0; i < n_insns; i++) {
-            g_free(bytes[i]);
-        }
         g_free(pcs);
-        g_free(sizes);
-        g_free(bytes);
     }
 
     entry.template_id = tmpl ? tmpl->template_id : UINT32_MAX;
@@ -1727,7 +1892,6 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     /* State for grouping instructions into BBs */
     GArray *bb_insn_pcs = g_array_new(false, false, sizeof(uint64_t));
     GArray *bb_insn_sizes = g_array_new(false, false, sizeof(uint32_t));
-    GArray *bb_insn_bytes = g_array_new(false, false, sizeof(uint8_t *));
     uint64_t bb_start_pc = wrong_target;
     guint bb_mem_start_idx = 0;
 
@@ -1739,7 +1903,6 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         g_byte_array_unref(insn_buf);
         g_array_unref(bb_insn_pcs);
         g_array_unref(bb_insn_sizes);
-        g_array_unref(bb_insn_bytes);
         return wp_chain;
     }
 
@@ -1800,10 +1963,6 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         /* Record instruction in current BB */
         g_array_append_val(bb_insn_pcs, pre_pc);
         g_array_append_val(bb_insn_sizes, insn_size);
-        uint8_t *bytes_copy = g_memdup2(insn_buf->data,
-                                         insn_size < insn_buf->len ?
-                                         insn_size : insn_buf->len);
-        g_array_append_val(bb_insn_bytes, bytes_copy);
 
         /* Track memory accesses */
         for (guint m = bb_mem_start_idx; m < wp_mem_accesses->len; m++) {
@@ -1818,7 +1977,7 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             /* Finalize current WP BB */
             WPBBEntry wp_bb = create_wp_bb_entry(
                 bb_start_pc, bb_insn_pcs, bb_insn_sizes,
-                bb_insn_bytes, wp_mem_accesses, bb_mem_start_idx);
+                wp_mem_accesses, bb_mem_start_idx);
 
             /* Add branch target as dynamic param */
             DynParam target_dp = {
@@ -1832,11 +1991,6 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             bb_mem_start_idx = wp_mem_accesses->len;
             g_array_set_size(bb_insn_pcs, 0);
             g_array_set_size(bb_insn_sizes, 0);
-            /* Free old byte pointers before clearing */
-            for (guint j = 0; j < bb_insn_bytes->len; j++) {
-                g_free(g_array_index(bb_insn_bytes, uint8_t *, j));
-            }
-            g_array_set_size(bb_insn_bytes, 0);
             bb_start_pc = post_pc;
         }
     }
@@ -1845,7 +1999,7 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     if (bb_insn_pcs->len > 0) {
         WPBBEntry wp_bb = create_wp_bb_entry(
             bb_start_pc, bb_insn_pcs, bb_insn_sizes,
-            bb_insn_bytes, wp_mem_accesses, bb_mem_start_idx);
+            wp_mem_accesses, bb_mem_start_idx);
         if (early_exit) {
             wp_bb.exception = true;
         }
@@ -1872,13 +2026,8 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     wp_mem_accesses = NULL;
     g_byte_array_unref(insn_buf);
 
-    /* Free remaining byte arrays */
-    for (guint j = 0; j < bb_insn_bytes->len; j++) {
-        g_free(g_array_index(bb_insn_bytes, uint8_t *, j));
-    }
     g_array_unref(bb_insn_pcs);
     g_array_unref(bb_insn_sizes);
-    g_array_unref(bb_insn_bytes);
 
     /* Update statistics */
     stat_wp_simulations++;
@@ -2522,17 +2671,14 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
     /* Collect instruction data for BB template */
     uint64_t *insn_pcs = g_new0(uint64_t, n_insns);
-    uint32_t *insn_sizes = g_new0(uint32_t, n_insns);
-    uint8_t **insn_bytes_arr = g_new0(uint8_t *, n_insns);
+    char **insn_disas_arr = g_new0(char *, n_insns);
 
     for (size_t i = 0; i < n_insns; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
         insn_pcs[i] = qemu_plugin_insn_vaddr(insn);
-        insn_sizes[i] = (uint32_t)qemu_plugin_insn_size(insn);
 
-        /* Capture instruction bytes */
-        insn_bytes_arr[i] = g_new0(uint8_t, insn_sizes[i]);
-        qemu_plugin_insn_data(insn, insn_bytes_arr[i], insn_sizes[i]);
+        /* Get disassembly string from QEMU's internal disassembler */
+        insn_disas_arr[i] = qemu_plugin_insn_disas(insn);
 
         /* Register per-instruction memory callback with PC as udata */
         qemu_plugin_register_vcpu_mem_cb(
@@ -2542,17 +2688,16 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
     /* Create or update BB template */
     g_mutex_lock(&data_lock);
-    get_or_create_template(pc, (uint32_t)n_insns, insn_pcs, insn_sizes,
-                           insn_bytes_arr, fall_through);
+    get_or_create_template(pc, (uint32_t)n_insns, insn_pcs,
+                           insn_disas_arr, fall_through);
     g_mutex_unlock(&data_lock);
 
     /* Free temporary arrays (template made copies) */
     for (size_t i = 0; i < n_insns; i++) {
-        g_free(insn_bytes_arr[i]);
+        g_free(insn_disas_arr[i]);
     }
     g_free(insn_pcs);
-    g_free(insn_sizes);
-    g_free(insn_bytes_arr);
+    g_free(insn_disas_arr);
 
     /*
      * Instrument the block for execution tracking.

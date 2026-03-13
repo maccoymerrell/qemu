@@ -34,6 +34,7 @@ static uint64_t simpoint_interval = 100000000;  /* 100M instructions */
 static int num_simpoints = 10;
 static int simpoint_warmup = 10;    /* min intervals before clustering */
 static int kmeans_max_iter = 100;
+static const int simpoint_max_symbols = 5;  /* max symbols listed per simpoint */
 
 /* ========================= Data Structures ========================= */
 
@@ -402,9 +403,9 @@ static void write_simpoints_file(const char *path, GArray *specs)
         GHashTable *seen_syms = g_hash_table_new(g_str_hash, g_str_equal);
         g_autoptr(GString) sym_line = g_string_new(NULL);
         int sym_count = 0;
-        static const int MAX_SYMBOLS = 5;
 
-        for (guint p = 0; p < pairs->len && sym_count < MAX_SYMBOLS; p++) {
+        for (guint p = 0; p < pairs->len && sym_count < simpoint_max_symbols;
+             p++) {
             BBCountPair *pair = &g_array_index(pairs, BBCountPair, p);
             uint64_t *pc_ptr = g_hash_table_lookup(
                 idx_to_pc, GUINT_TO_POINTER(pair->bb_idx));

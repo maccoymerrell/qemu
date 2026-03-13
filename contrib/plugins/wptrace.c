@@ -5,28 +5,27 @@
  *
  *   HEADER: A map of BB templates encoding all unique basic blocks within
  *           the traced window, with static instruction context (PCs, sizes,
- *           raw instruction bytes).
+ *           raw instruction bytes, and decoded x86 fields when applicable).
  *
  *   BODY:   The execution trace of BBs as they executed on the correct-path,
  *           with dynamic context (branch targets, memory addresses) and
  *           wrong-path BB sequences per correct-path BB.
  *
  * Two output modes:
- *   - Packed binary (.bin): Dense byte-level encoding of header + body
+ *   - Packed binary (.bin): Compact ULEB128-based encoding of header + body
  *   - Debug text (.txt): Human-readable representation (toggleable)
  *
  * Features:
  *   - BB template deduplication (unique BBs stored once in header)
  *   - Wrong-path execution with real IF and DF addresses
  *   - Start/stop tracing by instruction number
- *   - SimPoints methodology for automatic simpoint discovery and tracing
- *   - ISA-agnostic (no instruction decoding required)
+ *   - x86 instruction field extraction (prefixes, opcode, ModRM, SIB, disp, imm)
+ *   - Compact LEB128 variable-length integer encoding
+ *   - ISA-agnostic core (x86 decode is optional enrichment)
  *
  * Usage:
  *   -plugin wptrace[,depth=N][,outfile=PATH][,debug=1]
- *                  [,start=N][,stop=N]
- *                  [,simpoints=discover|trace][,spfile=PATH]
- *                  [,interval=N][,num_simpoints=K][,warmup=N]
+ *                  [,wp=0|1][,start=N][,stop=N]
  *                  [,program=NAME]
  *
  * Copyright (c) 2025
@@ -54,26 +53,253 @@ static char *program_name = NULL;
 static uint64_t trace_start_insn = 0;
 static uint64_t trace_stop_insn = UINT64_MAX;
 static const char *target_name;
-
-/* SimPoints configuration */
-enum SimPointMode {
-    SP_NONE = 0,       /* No simpoints - use start/stop or trace everything */
-    SP_DISCOVER,       /* Discover simpoints: collect BBVs, cluster, output */
-    SP_TRACE,          /* Trace at simpoints specified in spfile */
-};
-static enum SimPointMode simpoint_mode = SP_NONE;
-static char *simpoint_file_path = NULL;
-static uint64_t simpoint_interval = 100000000;  /* 100M instructions */
-static int num_simpoints = 10;
-static int simpoint_warmup = 10; /* min intervals before clustering */
-static int kmeans_max_iter = 100;
+static bool is_x86 = false;
 
 #define MAX_INSN_BYTES 16
 
 /* Magic for binary format */
-#define WPT_MAGIC  0x54505701  /* "WPT\x01" - version 1 */
+#define WPT_MAGIC  0x54505702  /* "WPT\x02" - version 2 */
 
 /* ========================= Data Structures ========================= */
+
+/* Decoded x86 instruction fields for trace enrichment */
+typedef struct {
+    uint8_t n_prefixes;         /* Number of prefix bytes */
+    uint8_t opcode_len;         /* Opcode length (1-3 bytes) */
+    uint8_t opcode[3];          /* Opcode bytes */
+    bool has_modrm;             /* Has ModRM byte */
+    uint8_t modrm;              /* ModRM byte */
+    bool has_sib;               /* Has SIB byte */
+    uint8_t sib;                /* SIB byte */
+    uint8_t disp_size;          /* Displacement size (0/1/2/4) */
+    int32_t disp;               /* Displacement value */
+    uint8_t imm_size;           /* Immediate size (0/1/2/4/8) */
+    int64_t imm;                /* Immediate value */
+} X86InsnFields;
+
+/*
+ * Lightweight x86 instruction field extraction.
+ * Best-effort decoder for trace enrichment, not a full disassembler.
+ */
+static void decode_x86_insn(const uint8_t *bytes, uint32_t len,
+                             X86InsnFields *out)
+{
+    memset(out, 0, sizeof(*out));
+    uint32_t pos = 0;
+
+    if (len == 0) {
+        return;
+    }
+
+    /* Scan prefix bytes */
+    while (pos < len) {
+        uint8_t b = bytes[pos];
+        if (b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 ||
+            b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 ||
+            b == 0x64 || b == 0x65 || (b >= 0x40 && b <= 0x4F)) {
+            out->n_prefixes++;
+            pos++;
+        } else {
+            break;
+        }
+    }
+
+    if (pos >= len) {
+        return;
+    }
+
+    /* Read opcode */
+    out->opcode[0] = bytes[pos++];
+    out->opcode_len = 1;
+
+    if (out->opcode[0] == 0x0F && pos < len) {
+        out->opcode[1] = bytes[pos++];
+        out->opcode_len = 2;
+
+        if ((out->opcode[1] == 0x38 || out->opcode[1] == 0x3A) &&
+            pos < len) {
+            out->opcode[2] = bytes[pos++];
+            out->opcode_len = 3;
+        }
+    }
+
+    /*
+     * Determine if opcode requires ModRM.
+     * For 2/3-byte opcodes, most require ModRM.
+     * For 1-byte opcodes, use a simplified check.
+     */
+    bool needs_modrm = false;
+    uint8_t imm_bytes = 0;
+
+    if (out->opcode_len >= 2) {
+        /* Most 2/3-byte opcodes have ModRM */
+        needs_modrm = true;
+
+        /* 2-byte conditional jumps (0F 80-8F) do not have ModRM */
+        if (out->opcode_len == 2 &&
+            out->opcode[1] >= 0x80 && out->opcode[1] <= 0x8F) {
+            needs_modrm = false;
+            imm_bytes = 4; /* rel32 */
+        }
+    } else {
+        uint8_t op = out->opcode[0];
+
+        /* Opcodes that generally have ModRM byte */
+        if ((op >= 0x00 && op <= 0x03) || /* ADD r/m, r / ADD r, r/m */
+            (op >= 0x08 && op <= 0x0B) || /* OR */
+            (op >= 0x10 && op <= 0x13) || /* ADC */
+            (op >= 0x18 && op <= 0x1B) || /* SBB */
+            (op >= 0x20 && op <= 0x23) || /* AND */
+            (op >= 0x28 && op <= 0x2B) || /* SUB */
+            (op >= 0x30 && op <= 0x33) || /* XOR */
+            (op >= 0x38 && op <= 0x3B) || /* CMP */
+            (op >= 0x80 && op <= 0x83) || /* Grp1 imm */
+            op == 0x84 || op == 0x85 ||   /* TEST */
+            (op >= 0x86 && op <= 0x8F) || /* XCHG, LEA, MOV, POP */
+            op == 0xC0 || op == 0xC1 ||   /* Shift Grp2 imm8 */
+            op == 0xC6 || op == 0xC7 ||   /* MOV imm */
+            op == 0xD0 || op == 0xD1 ||   /* Shift Grp2 1 */
+            op == 0xD2 || op == 0xD3 ||   /* Shift Grp2 CL */
+            op == 0xF6 || op == 0xF7 ||   /* Grp3 */
+            op == 0xFE || op == 0xFF ||   /* Grp4/5 */
+            op == 0x63 || op == 0x69 || op == 0x6B) { /* MOVSXD, IMUL */
+            needs_modrm = true;
+        }
+
+        /* Determine immediate size for 1-byte opcodes */
+        if (op >= 0x04 && op <= 0x05) {
+            /* ADD AL/eAX, imm */
+            imm_bytes = (op & 1) ? 4 : 1;
+        } else if (op >= 0x0C && op <= 0x0D) {
+            imm_bytes = (op & 1) ? 4 : 1; /* OR AL/eAX */
+        } else if (op >= 0x14 && op <= 0x15) {
+            imm_bytes = (op & 1) ? 4 : 1; /* ADC AL/eAX */
+        } else if (op >= 0x1C && op <= 0x1D) {
+            imm_bytes = (op & 1) ? 4 : 1; /* SBB AL/eAX */
+        } else if (op >= 0x24 && op <= 0x25) {
+            imm_bytes = (op & 1) ? 4 : 1; /* AND AL/eAX */
+        } else if (op >= 0x2C && op <= 0x2D) {
+            imm_bytes = (op & 1) ? 4 : 1; /* SUB AL/eAX */
+        } else if (op >= 0x34 && op <= 0x35) {
+            imm_bytes = (op & 1) ? 4 : 1; /* XOR AL/eAX */
+        } else if (op >= 0x3C && op <= 0x3D) {
+            imm_bytes = (op & 1) ? 4 : 1; /* CMP AL/eAX */
+        } else if (op == 0x68) {
+            imm_bytes = 4; /* PUSH imm32 */
+        } else if (op == 0x6A) {
+            imm_bytes = 1; /* PUSH imm8 */
+        } else if (op == 0x69) {
+            imm_bytes = 4; /* IMUL r, r/m, imm32 */
+        } else if (op == 0x6B) {
+            imm_bytes = 1; /* IMUL r, r/m, imm8 */
+        } else if (op >= 0x70 && op <= 0x7F) {
+            imm_bytes = 1; /* Jcc rel8 */
+        } else if (op == 0x80 || op == 0x82) {
+            imm_bytes = 1; /* Grp1 r/m8, imm8 */
+        } else if (op == 0x81) {
+            imm_bytes = 4; /* Grp1 r/m, imm32 */
+        } else if (op == 0x83) {
+            imm_bytes = 1; /* Grp1 r/m, imm8 */
+        } else if (op == 0xA8) {
+            imm_bytes = 1; /* TEST AL, imm8 */
+        } else if (op == 0xA9) {
+            imm_bytes = 4; /* TEST eAX, imm32 */
+        } else if (op >= 0xB0 && op <= 0xB7) {
+            imm_bytes = 1; /* MOV r8, imm8 */
+        } else if (op >= 0xB8 && op <= 0xBF) {
+            imm_bytes = 4; /* MOV r, imm32 (or imm64 with REX.W) */
+        } else if (op == 0xC0 || op == 0xC1) {
+            imm_bytes = 1; /* Shift Grp2 imm8 */
+        } else if (op == 0xC2) {
+            imm_bytes = 2; /* RET imm16 */
+        } else if (op == 0xC6) {
+            imm_bytes = 1; /* MOV r/m8, imm8 */
+        } else if (op == 0xC7) {
+            imm_bytes = 4; /* MOV r/m, imm32 */
+        } else if (op == 0xCD) {
+            imm_bytes = 1; /* INT imm8 */
+        } else if (op == 0xE8 || op == 0xE9) {
+            imm_bytes = 4; /* CALL/JMP rel32 */
+        } else if (op == 0xEB) {
+            imm_bytes = 1; /* JMP rel8 */
+        } else if (op == 0xE4 || op == 0xE5 || op == 0xE6 || op == 0xE7) {
+            imm_bytes = 1; /* IN/OUT imm8 */
+        }
+    }
+
+    /* Read ModRM if needed */
+    if (needs_modrm && pos < len) {
+        out->has_modrm = true;
+        out->modrm = bytes[pos++];
+
+        uint8_t mod = (out->modrm >> 6) & 3;
+        uint8_t rm = out->modrm & 7;
+
+        /* SIB byte: present when mod != 11 and rm == 4 */
+        if (mod != 3 && rm == 4 && pos < len) {
+            out->has_sib = true;
+            out->sib = bytes[pos++];
+        }
+
+        /* Displacement */
+        if (mod == 1) {
+            out->disp_size = 1;
+        } else if (mod == 2) {
+            out->disp_size = 4;
+        } else if (mod == 0 && rm == 5) {
+            out->disp_size = 4; /* RIP-relative or disp32 */
+        }
+
+        /* Read displacement bytes */
+        if (out->disp_size > 0 && pos + out->disp_size <= len) {
+            uint32_t d = 0;
+            for (uint8_t i = 0; i < out->disp_size; i++) {
+                d |= (uint32_t)bytes[pos++] << (i * 8);
+            }
+            /* Sign-extend 1-byte displacement */
+            if (out->disp_size == 1 && (d & 0x80)) {
+                d |= 0xFFFFFF00;
+            }
+            out->disp = (int32_t)d;
+        }
+
+        /* Determine immediate for ModRM opcodes that also have immediates */
+        if (out->opcode_len == 1) {
+            uint8_t op = out->opcode[0];
+            if (op == 0xF6) {
+                /* Grp3: TEST r/m8, imm8 when reg==0 */
+                uint8_t reg = (out->modrm >> 3) & 7;
+                if (reg == 0) {
+                    imm_bytes = 1;
+                }
+            } else if (op == 0xF7) {
+                /* Grp3: TEST r/m, imm32 when reg==0 */
+                uint8_t reg = (out->modrm >> 3) & 7;
+                if (reg == 0) {
+                    imm_bytes = 4;
+                }
+            }
+        }
+    }
+
+    /* Read immediate bytes */
+    if (imm_bytes > 0 && pos + imm_bytes <= len) {
+        out->imm_size = imm_bytes;
+        uint64_t imm = 0;
+        for (uint8_t i = 0; i < imm_bytes; i++) {
+            imm |= (uint64_t)bytes[pos++] << (i * 8);
+        }
+        /* Sign-extend */
+        if (imm_bytes == 1 && (imm & 0x80)) {
+            imm |= ~(uint64_t)0xFF;
+        } else if (imm_bytes == 2 && (imm & 0x8000)) {
+            imm |= ~(uint64_t)0xFFFF;
+        } else if (imm_bytes == 4 && (imm & 0x80000000ULL)) {
+            imm |= ~(uint64_t)0xFFFFFFFF;
+        }
+        out->imm = (int64_t)imm;
+    }
+}
 
 /*
  * BB Template - static instruction context for a unique basic block.
@@ -87,6 +313,7 @@ typedef struct {
     uint32_t *insn_sizes;       /* Array of instruction sizes in bytes */
     uint8_t **insn_bytes;       /* Array of raw instruction byte arrays */
     uint64_t fall_through_pc;   /* PC after last instruction (sequential) */
+    X86InsnFields *insn_fields; /* Decoded fields per insn (x86 only, else NULL) */
 } BBTemplate;
 
 /*
@@ -167,29 +394,6 @@ typedef struct {
     FILE *bin_file;             /* Binary output */
 } TraceSegment;
 
-/* ========================= SimPoints Structures ========================= */
-
-/*
- * Sparse BBV (Basic Block Vector) for one interval.
- * Maps bb_index → execution count for that interval.
- */
-typedef struct {
-    GHashTable *counts;         /* uint32 bb_index → uint64 count */
-    uint64_t total_insns;       /* Total instructions in interval */
-    uint64_t interval_id;       /* Which interval (0-based) */
-} BBV;
-
-/*
- * SimPoint specification: an interval to trace.
- */
-typedef struct {
-    uint64_t interval_id;       /* Which interval */
-    uint64_t start_insn;        /* Start instruction number */
-    uint64_t stop_insn;         /* Stop instruction number */
-    int cluster_id;             /* Cluster this simpoint represents */
-    double weight;              /* Weight (fraction of total intervals) */
-} SimPointSpec;
-
 /* ========================= Global State ========================= */
 
 static GMutex data_lock;
@@ -213,15 +417,6 @@ static uint32_t body_seq_num = 0;
 static bool wp_in_progress = false;
 static GArray *wp_mem_accesses = NULL;
 static uint64_t wp_current_insn_pc = 0;
-
-/* SimPoints state */
-static GArray *bbv_collection = NULL;  /* GArray of BBV* (discovery mode) */
-static GHashTable *bbv_bb_map = NULL;  /* bb start_pc → bb_index for BBV */
-static uint32_t next_bb_index = 1;
-static BBV *current_bbv = NULL;
-static GArray *simpoint_specs = NULL;  /* GArray of SimPointSpec */
-static int current_sp_index = 0;       /* Index into simpoint_specs */
-static bool simpoints_exhausted = false;
 
 /* Correct-path memory accesses for current BB */
 static GArray *cp_mem_accesses = NULL;
@@ -283,19 +478,10 @@ static void bb_template_free(gpointer data)
         }
         g_free(tmpl->insn_bytes);
     }
+    g_free(tmpl->insn_fields);
     g_free(tmpl->insn_pcs);
     g_free(tmpl->insn_sizes);
     g_free(tmpl);
-}
-
-static void bbv_free(BBV *bbv)
-{
-    if (bbv) {
-        if (bbv->counts) {
-            g_hash_table_unref(bbv->counts);
-        }
-        g_free(bbv);
-    }
 }
 
 static TraceSegment *trace_segment_new(const char *label,
@@ -364,6 +550,16 @@ static BBTemplate *get_or_create_template(uint64_t start_pc,
         tmpl->insn_sizes[i] = insn_sizes[i];
         if (insn_bytes && insn_bytes[i]) {
             tmpl->insn_bytes[i] = g_memdup2(insn_bytes[i], insn_sizes[i]);
+        }
+    }
+
+    if (is_x86) {
+        tmpl->insn_fields = g_new0(X86InsnFields, n_insns);
+        for (uint32_t i = 0; i < n_insns; i++) {
+            if (insn_bytes && insn_bytes[i]) {
+                decode_x86_insn(insn_bytes[i], insn_sizes[i],
+                                &tmpl->insn_fields[i]);
+            }
         }
     }
 
@@ -707,7 +903,34 @@ static void write_text_header(FILE *f)
                     fprintf(f, "%02x", tmpl->insn_bytes[i][b]);
                 }
             }
-            fprintf(f, " (%u bytes)\n", tmpl->insn_sizes[i]);
+            fprintf(f, " (%u bytes)", tmpl->insn_sizes[i]);
+            if (tmpl->insn_fields) {
+                X86InsnFields *fld = &tmpl->insn_fields[i];
+                if (fld->opcode_len > 0) {
+                    fprintf(f, " [");
+                    if (fld->n_prefixes > 0) {
+                        fprintf(f, "%u pfx ", fld->n_prefixes);
+                    }
+                    fprintf(f, "op=");
+                    for (uint8_t o = 0; o < fld->opcode_len; o++) {
+                        fprintf(f, "%02X", fld->opcode[o]);
+                    }
+                    if (fld->has_modrm) {
+                        fprintf(f, " modrm=0x%02x", fld->modrm);
+                    }
+                    if (fld->has_sib) {
+                        fprintf(f, " sib=0x%02x", fld->sib);
+                    }
+                    if (fld->disp_size > 0) {
+                        fprintf(f, " disp=%d", fld->disp);
+                    }
+                    if (fld->imm_size > 0) {
+                        fprintf(f, " imm=%" PRId64, fld->imm);
+                    }
+                    fprintf(f, "]");
+                }
+            }
+            fprintf(f, "\n");
         }
         fprintf(f, "\n");
     }
@@ -803,6 +1026,39 @@ static void write_text_trace(FILE *f, GArray *body_entries)
 /*
  * Helper to write packed little-endian values.
  */
+static void write_uleb128(FILE *f, uint64_t v)
+{
+    if (!f) {
+        return;
+    }
+    do {
+        uint8_t byte = v & 0x7F;
+        v >>= 7;
+        if (v != 0) {
+            byte |= 0x80;
+        }
+        fwrite(&byte, 1, 1, f);
+    } while (v != 0);
+}
+
+static void write_sleb128(FILE *f, int64_t v)
+{
+    if (!f) {
+        return;
+    }
+    bool more = true;
+    while (more) {
+        uint8_t byte = v & 0x7F;
+        v >>= 7;
+        if ((v == 0 && !(byte & 0x40)) || (v == -1 && (byte & 0x40))) {
+            more = false;
+        } else {
+            byte |= 0x80;
+        }
+        fwrite(&byte, 1, 1, f);
+    }
+}
+
 static inline void write_u8(FILE *f, uint8_t v)
 {
     if (!f) {
@@ -847,20 +1103,31 @@ static inline void write_u64(FILE *f, uint64_t v)
 }
 
 /*
- * Write the header section in packed binary format.
+ * Write the header section in packed binary format (v2 ULEB128).
  *
  * Binary header layout:
- *   magic:          uint32 (WPT_MAGIC)
- *   num_templates:  uint32
+ *   magic:            uint32 (WPT_MAGIC v2)
+ *   num_templates:    ULEB128
  *   For each template:
- *     template_id:    uint32
- *     start_pc:       uint64
- *     num_insns:      uint16
- *     fall_through:   uint64
+ *     template_id:      ULEB128
+ *     start_pc:         uint64
+ *     num_insns:        ULEB128
+ *     fall_through_pc:  uint64
  *     For each instruction:
- *       pc:           uint64
- *       size:         uint8
- *       bytes:        [size bytes]
+ *       pc:             uint64
+ *       size:           ULEB128
+ *       bytes:          [size bytes]
+ *       has_fields:     uint8 (1 if decoded fields, 0 otherwise)
+ *       If has_fields:
+ *         n_prefixes:   uint8
+ *         opcode_len:   uint8
+ *         opcode:       [opcode_len bytes]
+ *         modrm:        uint8 (0xFF if no modrm)
+ *         sib:          uint8 (0xFF if no sib)
+ *         disp_size:    uint8
+ *         disp:         [disp_size bytes, little-endian]
+ *         imm_size:     uint8
+ *         imm:          [imm_size bytes, little-endian]
  */
 static void write_bin_header(FILE *f)
 {
@@ -871,61 +1138,92 @@ static void write_bin_header(FILE *f)
     gpointer value;
 
     write_u32(f, WPT_MAGIC);
-    write_u32(f, g_hash_table_size(template_map));
+    write_uleb128(f, g_hash_table_size(template_map));
 
     g_hash_table_iter_init(&iter, template_map);
     while (g_hash_table_iter_next(&iter, NULL, &value)) {
         BBTemplate *tmpl = value;
-        write_u32(f, tmpl->template_id);
+        write_uleb128(f, tmpl->template_id);
         write_u64(f, tmpl->start_pc);
-        write_u16(f, (uint16_t)tmpl->n_insns);
+        write_uleb128(f, tmpl->n_insns);
         write_u64(f, tmpl->fall_through_pc);
 
         for (uint32_t i = 0; i < tmpl->n_insns; i++) {
             write_u64(f, tmpl->insn_pcs[i]);
-            uint8_t sz = (uint8_t)(tmpl->insn_sizes[i] & 0xFF);
-            write_u8(f, sz);
+            uint32_t sz = tmpl->insn_sizes[i];
+            write_uleb128(f, sz);
             if (tmpl->insn_bytes && tmpl->insn_bytes[i]) {
                 fwrite(tmpl->insn_bytes[i], 1, sz, f);
+            }
+
+            /* Write decoded instruction fields */
+            if (tmpl->insn_fields && tmpl->insn_fields[i].opcode_len > 0) {
+                X86InsnFields *fld = &tmpl->insn_fields[i];
+                write_u8(f, 1); /* has_fields */
+                write_u8(f, fld->n_prefixes);
+                write_u8(f, fld->opcode_len);
+                fwrite(fld->opcode, 1, fld->opcode_len, f);
+                write_u8(f, fld->has_modrm ? fld->modrm : 0xFF);
+                write_u8(f, fld->has_sib ? fld->sib : 0xFF);
+                write_u8(f, fld->disp_size);
+                if (fld->disp_size > 0) {
+                    /* Write displacement as little-endian */
+                    int32_t d = fld->disp;
+                    for (uint8_t b = 0; b < fld->disp_size; b++) {
+                        uint8_t byte = (d >> (b * 8)) & 0xFF;
+                        fwrite(&byte, 1, 1, f);
+                    }
+                }
+                write_u8(f, fld->imm_size);
+                if (fld->imm_size > 0) {
+                    /* Write immediate as little-endian */
+                    int64_t imm = fld->imm;
+                    for (uint8_t b = 0; b < fld->imm_size; b++) {
+                        uint8_t byte = (imm >> (b * 8)) & 0xFF;
+                        fwrite(&byte, 1, 1, f);
+                    }
+                }
+            } else {
+                write_u8(f, 0); /* no fields */
             }
         }
     }
 }
 
 /*
- * Write the body section in packed binary format.
+ * Write the body section in packed binary format (v2 ULEB128).
  *
  * Binary body layout:
- *   num_entries:    uint32
+ *   num_entries:      ULEB128
  *   For each entry:
- *     seq_num:       uint32
- *     template_id:   uint32
- *     num_dyn:       uint16
+ *     template_id:      ULEB128  (seq_num implicit from position)
+ *     num_dyn:          ULEB128
  *     For each dyn_param:
- *       type:         uint8
- *       value:        uint64
- *     num_wp:        uint16
+ *       type:           uint8
+ *       value:          uint64
+ *     num_wp:           ULEB128
  *     For each wp_bb:
- *       template_id:  uint32
- *       start_pc:     uint64
- *       num_dyn:      uint16
+ *       template_id:    ULEB128
+ *       start_pc:       uint64
+ *       num_dyn:        ULEB128
+ *       n_insns_executed: ULEB128
+ *       exception:      uint8
  *       For each dyn_param:
- *         type:       uint8
- *         value:      uint64
+ *         type:         uint8
+ *         value:        uint64
  */
 static void write_bin_body(FILE *f, GArray *body_entries)
 {
     if (!f) {
         return;
     }
-    write_u32(f, body_entries->len);
+    write_uleb128(f, body_entries->len);
 
     for (guint i = 0; i < body_entries->len; i++) {
         BodyEntry *entry = &g_array_index(body_entries, BodyEntry, i);
 
-        write_u32(f, entry->seq_num);
-        write_u32(f, entry->template_id);
-        write_u16(f, (uint16_t)entry->dyn_params->len);
+        write_uleb128(f, entry->template_id);
+        write_uleb128(f, entry->dyn_params->len);
 
         for (guint d = 0; d < entry->dyn_params->len; d++) {
             DynParam *dp = &g_array_index(entry->dyn_params, DynParam, d);
@@ -933,15 +1231,15 @@ static void write_bin_body(FILE *f, GArray *body_entries)
             write_u64(f, dp->value);
         }
 
-        uint16_t num_wp = entry->wp_entries ? entry->wp_entries->len : 0;
-        write_u16(f, num_wp);
+        uint32_t num_wp = entry->wp_entries ? entry->wp_entries->len : 0;
+        write_uleb128(f, num_wp);
 
-        for (uint16_t w = 0; w < num_wp; w++) {
+        for (uint32_t w = 0; w < num_wp; w++) {
             WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
-            write_u32(f, wp->template_id);
+            write_uleb128(f, wp->template_id);
             write_u64(f, wp->start_pc);
-            write_u16(f, (uint16_t)wp->dyn_params->len);
-            write_u32(f, wp->n_insns_executed);
+            write_uleb128(f, wp->dyn_params->len);
+            write_uleb128(f, wp->n_insns_executed);
             write_u8(f, wp->exception ? 1 : 0);
 
             for (guint d = 0; d < wp->dyn_params->len; d++) {
@@ -964,272 +1262,6 @@ static void write_bin_trace(FILE *f, GArray *body_entries)
     write_bin_body(f, body_entries);
 }
 
-/* ========================= SimPoints: BBV Collection ========================= */
-
-static BBV *bbv_new(uint64_t interval_id)
-{
-    BBV *bbv = g_new0(BBV, 1);
-    bbv->counts = g_hash_table_new_full(g_direct_hash, g_direct_equal,
-                                        NULL, g_free);
-    bbv->interval_id = interval_id;
-    return bbv;
-}
-
-static void bbv_increment(BBV *bbv, uint64_t bb_pc, uint64_t n_insns)
-{
-    uint32_t bb_idx;
-
-    /* Get or assign a BB index */
-    uint32_t *idx_ptr = g_hash_table_lookup(bbv_bb_map, &bb_pc);
-    if (!idx_ptr) {
-        uint64_t *new_key = g_new(uint64_t, 1);
-        *new_key = bb_pc;
-        idx_ptr = g_new(uint32_t, 1);
-        *idx_ptr = next_bb_index++;
-        g_hash_table_insert(bbv_bb_map, new_key, idx_ptr);
-    }
-    bb_idx = *idx_ptr;
-
-    /* Increment count for this BB */
-    gpointer bb_key = GUINT_TO_POINTER(bb_idx);
-    uint64_t *count = g_hash_table_lookup(bbv->counts, bb_key);
-    if (!count) {
-        count = g_new0(uint64_t, 1);
-        g_hash_table_insert(bbv->counts, bb_key, count);
-    }
-    *count += n_insns;
-    bbv->total_insns += n_insns;
-}
-
-/* ========================= SimPoints: K-Means ========================= */
-
-/*
- * Compute squared L2 distance between two sparse BBVs.
- * Both are GHashTables mapping uint32 bb_index → uint64 count.
- * We normalize by total instructions to get frequency vectors.
- */
-static double bbv_distance_sq(BBV *a, BBV *b)
-{
-    double dist = 0.0;
-    GHashTableIter iter;
-    gpointer key, value;
-    double a_total = a->total_insns > 0 ? (double)a->total_insns : 1.0;
-    double b_total = b->total_insns > 0 ? (double)b->total_insns : 1.0;
-
-    /* Iterate over a's entries */
-    g_hash_table_iter_init(&iter, a->counts);
-    while (g_hash_table_iter_next(&iter, &key, &value)) {
-        double a_freq = (double)(*(uint64_t *)value) / a_total;
-        uint64_t *b_count = g_hash_table_lookup(b->counts, key);
-        double b_freq = b_count ? (double)(*b_count) / b_total : 0.0;
-        double diff = a_freq - b_freq;
-        dist += diff * diff;
-    }
-
-    /* Iterate over b's entries not in a */
-    g_hash_table_iter_init(&iter, b->counts);
-    while (g_hash_table_iter_next(&iter, &key, &value)) {
-        if (!g_hash_table_contains(a->counts, key)) {
-            double b_freq = (double)(*(uint64_t *)value) / b_total;
-            dist += b_freq * b_freq;
-        }
-    }
-
-    return dist;
-}
-
-/*
- * Simple k-means clustering on BBVs.
- * Returns an array of SimPointSpec with the representative interval
- * for each cluster.
- */
-static gint simpoint_spec_compare(gconstpointer a, gconstpointer b)
-{
-    const SimPointSpec *sa = a;
-    const SimPointSpec *sb = b;
-    if (sa->start_insn < sb->start_insn) {
-        return -1;
-    }
-    if (sa->start_insn > sb->start_insn) {
-        return 1;
-    }
-    return 0;
-}
-
-static GArray *kmeans_cluster(GArray *bbvs, int k)
-{
-    int n = bbvs->len;
-    GArray *specs = g_array_new(false, false, sizeof(SimPointSpec));
-
-    if (n == 0 || k <= 0) {
-        return specs;
-    }
-
-    if (k > n) {
-        k = n;
-    }
-
-    /* Cluster assignments: which cluster each BBV belongs to */
-    int *assignments = g_new0(int, n);
-    int *cluster_sizes = g_new0(int, k);
-
-    /* Initialize centers by picking k evenly-spaced BBVs */
-    int *center_indices = g_new0(int, k);
-    for (int i = 0; i < k; i++) {
-        center_indices[i] = i * n / k;
-    }
-
-    /* K-means iterations */
-    for (int iter = 0; iter < kmeans_max_iter; iter++) {
-        bool changed = false;
-
-        /* Assign each BBV to nearest center */
-        memset(cluster_sizes, 0, sizeof(int) * k);
-        for (int i = 0; i < n; i++) {
-            BBV *bbv = g_array_index(bbvs, BBV *, i);
-            double best_dist = -1;
-            int best_cluster = 0;
-
-            for (int c = 0; c < k; c++) {
-                BBV *center = g_array_index(bbvs, BBV *, center_indices[c]);
-                double d = bbv_distance_sq(bbv, center);
-                if (best_dist < 0 || d < best_dist) {
-                    best_dist = d;
-                    best_cluster = c;
-                }
-            }
-
-            if (assignments[i] != best_cluster) {
-                assignments[i] = best_cluster;
-                changed = true;
-            }
-            cluster_sizes[best_cluster]++;
-        }
-
-        if (!changed) {
-            break;
-        }
-
-        /* Update centers: pick the medoid (BBV closest to cluster mean) */
-        for (int c = 0; c < k; c++) {
-            if (cluster_sizes[c] == 0) {
-                continue;
-            }
-
-            double best_total_dist = -1;
-            int best_idx = center_indices[c];
-
-            for (int i = 0; i < n; i++) {
-                if (assignments[i] != c) {
-                    continue;
-                }
-
-                /* Compute total distance from i to all others in cluster */
-                double total_dist = 0;
-                for (int j = 0; j < n; j++) {
-                    if (assignments[j] != c || i == j) {
-                        continue;
-                    }
-                    BBV *bi = g_array_index(bbvs, BBV *, i);
-                    BBV *bj = g_array_index(bbvs, BBV *, j);
-                    total_dist += bbv_distance_sq(bi, bj);
-                }
-
-                if (best_total_dist < 0 || total_dist < best_total_dist) {
-                    best_total_dist = total_dist;
-                    best_idx = i;
-                }
-            }
-
-            center_indices[c] = best_idx;
-        }
-    }
-
-    /* Build simpoint specs from cluster centers */
-    for (int c = 0; c < k; c++) {
-        if (cluster_sizes[c] == 0) {
-            continue;
-        }
-
-        BBV *center_bbv = g_array_index(bbvs, BBV *, center_indices[c]);
-        SimPointSpec spec = {
-            .interval_id = center_bbv->interval_id,
-            .start_insn = center_bbv->interval_id * simpoint_interval,
-            .stop_insn = (center_bbv->interval_id + 1) * simpoint_interval,
-            .cluster_id = c,
-            .weight = (double)cluster_sizes[c] / n,
-        };
-        g_array_append_val(specs, spec);
-    }
-
-    /* Sort by start_insn */
-    g_array_sort(specs, simpoint_spec_compare);
-
-    g_free(assignments);
-    g_free(cluster_sizes);
-    g_free(center_indices);
-
-    return specs;
-}
-
-/*
- * Write simpoints specification file.
- * Format: interval_id,start_insn,stop_insn,cluster_id,weight
- */
-static void write_simpoints_file(const char *path, GArray *specs)
-{
-    FILE *f = fopen(path, "w");
-    if (!f) {
-        fprintf(stderr, "wptrace: cannot open simpoints file: %s\n", path);
-        return;
-    }
-
-    fprintf(f, "# SimPoints specification\n");
-    fprintf(f, "# interval_id,start_insn,stop_insn,cluster_id,weight\n");
-    fprintf(f, "# interval_size=%" PRIu64 "\n", simpoint_interval);
-    fprintf(f, "# num_clusters=%d\n", num_simpoints);
-
-    for (guint i = 0; i < specs->len; i++) {
-        SimPointSpec *sp = &g_array_index(specs, SimPointSpec, i);
-        fprintf(f, "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d,%.6f\n",
-                sp->interval_id, sp->start_insn, sp->stop_insn,
-                sp->cluster_id, sp->weight);
-    }
-
-    fclose(f);
-}
-
-/*
- * Read simpoints specification file.
- */
-static GArray *read_simpoints_file(const char *path)
-{
-    GArray *specs = g_array_new(false, false, sizeof(SimPointSpec));
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        fprintf(stderr, "wptrace: cannot open simpoints file: %s\n", path);
-        return specs;
-    }
-
-    char *line = NULL;
-    size_t line_len = 0;
-    while (getline(&line, &line_len, f) != -1) {
-        if (line[0] == '#' || line[0] == '\n') {
-            continue;
-        }
-        SimPointSpec sp;
-        if (sscanf(line, "%" SCNu64 ",%" SCNu64 ",%" SCNu64 ",%d,%lf",
-                   &sp.interval_id, &sp.start_insn, &sp.stop_insn,
-                   &sp.cluster_id, &sp.weight) == 5) {
-            g_array_append_val(specs, sp);
-        }
-    }
-    free(line);
-
-    fclose(f);
-    return specs;
-}
-
 /* ========================= Trace State Management ========================= */
 
 /*
@@ -1249,24 +1281,10 @@ static void start_trace_segment(const char *label,
     g_autofree char *bin_path = NULL;
     g_autofree char *txt_path = NULL;
 
-    if (simpoint_mode == SP_TRACE) {
-        /*
-         * SimPoints mode: files named as program_instrnum.{bin,txt}
-         * per the spec's naming convention.
-         */
-        bin_path = g_strdup_printf("%s.bin", label);
+    if (output_base_path) {
+        bin_path = g_strdup_printf("%s.bin", output_base_path);
         if (enable_debug_text) {
-            txt_path = g_strdup_printf("%s.txt", label);
-        }
-    } else {
-        /*
-         * Simple start/stop mode: files named as outfile.{bin,txt}
-         */
-        if (output_base_path) {
-            bin_path = g_strdup_printf("%s.bin", output_base_path);
-            if (enable_debug_text) {
-                txt_path = g_strdup_printf("%s.txt", output_base_path);
-            }
+            txt_path = g_strdup_printf("%s.txt", output_base_path);
         }
     }
 
@@ -1331,72 +1349,14 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         return;
     }
 
-    /* --- SimPoints BBV collection --- */
-    if (simpoint_mode == SP_DISCOVER && bbv_bb_map) {
-        if (!current_bbv) {
-            current_bbv = bbv_new(0);
-        }
-
-        /* Look up template to get instruction count */
-        g_mutex_lock(&data_lock);
-        BBTemplate *tmpl = find_template(current_pc);
-        uint32_t n_insns = tmpl ? tmpl->n_insns : 1;
-        g_mutex_unlock(&data_lock);
-
-        bbv_increment(current_bbv, current_pc, n_insns);
-
-        /* Check if interval is complete */
-        if (current_bbv->total_insns >= simpoint_interval) {
-            current_bbv->interval_id = bbv_collection->len;
-            g_array_append_val(bbv_collection, current_bbv);
-            current_bbv = bbv_new(bbv_collection->len);
-        }
-    }
-
     /* --- Tracing window management --- */
-    if (simpoint_mode == SP_TRACE && simpoint_specs && !simpoints_exhausted) {
-        /* Check if we need to start/stop a simpoint segment */
-        if (!trace_active && current_sp_index < (int)simpoint_specs->len) {
-            SimPointSpec *sp = &g_array_index(simpoint_specs,
-                                              SimPointSpec,
-                                              current_sp_index);
-            if (icount >= sp->start_insn) {
-                g_autofree char *label = NULL;
-                if (program_name) {
-                    label = g_strdup_printf("%s_%" PRIu64,
-                                           program_name, sp->start_insn);
-                } else {
-                    label = g_strdup_printf("sp_%" PRIu64, sp->start_insn);
-                }
-                start_trace_segment(label, sp->start_insn, sp->stop_insn);
-            }
-        }
-
-        if (trace_active && current_segment) {
-            SimPointSpec *sp = &g_array_index(simpoint_specs,
-                                              SimPointSpec,
-                                              current_sp_index);
-            if (icount >= sp->stop_insn) {
-                finish_trace_segment();
-                current_sp_index++;
-                if (current_sp_index >= (int)simpoint_specs->len) {
-                    simpoints_exhausted = true;
-                    /* All simpoints traced, can exit */
-                    exit(0);
-                }
-            }
-        }
-    } else if (simpoint_mode == SP_NONE) {
-        /* Simple start/stop mode */
-        if (!trace_active && icount >= trace_start_insn &&
-            icount < trace_stop_insn) {
-            start_trace_segment("trace", trace_start_insn, trace_stop_insn);
-        }
-        if (trace_active && icount >= trace_stop_insn) {
-            finish_trace_segment();
-            /* Stop QEMU early */
-            exit(0);
-        }
+    if (!trace_active && icount >= trace_start_insn &&
+        icount < trace_stop_insn) {
+        start_trace_segment("trace", trace_start_insn, trace_stop_insn);
+    }
+    if (trace_active && icount >= trace_stop_insn) {
+        finish_trace_segment();
+        exit(0);
     }
 
     /* Skip initial block (no previous context) */
@@ -1607,49 +1567,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
         finish_trace_segment();
     }
 
-    /* SimPoints discovery: run clustering and output */
-    if (simpoint_mode == SP_DISCOVER && bbv_collection) {
-        /* Add final partial interval */
-        if (current_bbv && current_bbv->total_insns > 0) {
-            current_bbv->interval_id = bbv_collection->len;
-            g_array_append_val(bbv_collection, current_bbv);
-            current_bbv = NULL;
-        }
-
-        if (bbv_collection->len > 0) {
-            GArray *specs = kmeans_cluster(bbv_collection, num_simpoints);
-
-            /* Write simpoints file */
-            g_autofree char *sp_path = NULL;
-            if (output_base_path) {
-                sp_path = g_strdup_printf("%s.simpoints", output_base_path);
-            } else {
-                sp_path = g_strdup("wptrace.simpoints");
-            }
-            write_simpoints_file(sp_path, specs);
-
-            {
-                g_autofree char *msg = g_strdup_printf(
-                    "SimPoints discovery complete: "
-                    "%u intervals, "
-                    "%u simpoints written to %s\n",
-                    bbv_collection->len, specs->len, sp_path);
-                qemu_plugin_outs(msg);
-            }
-
-            g_array_unref(specs);
-        }
-
-        /* Cleanup BBVs */
-        for (guint i = 0; i < bbv_collection->len; i++) {
-            bbv_free(g_array_index(bbv_collection, BBV *, i));
-        }
-        g_array_unref(bbv_collection);
-        if (current_bbv) {
-            bbv_free(current_bbv);
-        }
-    }
-
     /* Print statistics */
     g_autoptr(GString) report = g_string_new("");
 
@@ -1713,18 +1630,11 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     if (cp_mem_accesses) {
         g_array_unref(cp_mem_accesses);
     }
-    if (bbv_bb_map) {
-        g_hash_table_unref(bbv_bb_map);
-    }
-    if (simpoint_specs) {
-        g_array_unref(simpoint_specs);
-    }
     g_hash_table_unref(template_map);
     g_hash_table_unref(branch_map);
     qemu_plugin_scoreboard_free(vcpu_sb);
     g_free(output_base_path);
     g_free(program_name);
-    g_free(simpoint_file_path);
 }
 
 /* ========================= Plugin Installation ========================= */
@@ -1734,6 +1644,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                         int argc, char **argv)
 {
     target_name = info->target_name;
+    is_x86 = (g_str_has_prefix(target_name, "x86_64") ||
+              g_str_has_prefix(target_name, "i386"));
 
     /* Parse arguments */
     for (int i = 0; i < argc; i++) {
@@ -1758,36 +1670,6 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             trace_stop_insn = g_ascii_strtoull(tokens[1], NULL, 10);
         } else if (g_strcmp0(tokens[0], "program") == 0) {
             program_name = g_strdup(tokens[1]);
-        } else if (g_strcmp0(tokens[0], "simpoints") == 0) {
-            if (g_strcmp0(tokens[1], "discover") == 0) {
-                simpoint_mode = SP_DISCOVER;
-            } else if (g_strcmp0(tokens[1], "trace") == 0) {
-                simpoint_mode = SP_TRACE;
-            } else {
-                fprintf(stderr,
-                        "wptrace: invalid simpoints mode: %s "
-                        "(use 'discover' or 'trace')\n", tokens[1]);
-                return -1;
-            }
-        } else if (g_strcmp0(tokens[0], "spfile") == 0) {
-            simpoint_file_path = g_strdup(tokens[1]);
-        } else if (g_strcmp0(tokens[0], "interval") == 0) {
-            simpoint_interval = g_ascii_strtoull(tokens[1], NULL, 10);
-            if (simpoint_interval == 0) {
-                fprintf(stderr, "wptrace: invalid interval: %s\n", tokens[1]);
-                return -1;
-            }
-        } else if (g_strcmp0(tokens[0], "num_simpoints") == 0) {
-            num_simpoints = atoi(tokens[1]);
-            if (num_simpoints <= 0) {
-                fprintf(stderr, "wptrace: invalid num_simpoints: %s\n",
-                        tokens[1]);
-                return -1;
-            }
-        } else if (g_strcmp0(tokens[0], "warmup") == 0) {
-            simpoint_warmup = atoi(tokens[1]);
-        } else if (g_strcmp0(tokens[0], "kmeans_iter") == 0) {
-            kmeans_max_iter = atoi(tokens[1]);
         } else {
             fprintf(stderr, "wptrace: unknown option: %s\n", opt);
             return -1;
@@ -1795,12 +1677,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     }
 
     /* Validate configuration */
-    if (simpoint_mode == SP_TRACE && !simpoint_file_path) {
-        fprintf(stderr, "wptrace: simpoints=trace requires spfile=PATH\n");
-        return -1;
-    }
-
-    if (!output_base_path && simpoint_mode != SP_DISCOVER) {
+    if (!output_base_path) {
         /* Default output base path */
         output_base_path = g_strdup("wptrace_out");
     }
@@ -1826,24 +1703,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     /* Initialize correct-path memory access collection */
     cp_mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
 
-    /* SimPoints initialization */
-    if (simpoint_mode == SP_DISCOVER) {
-        bbv_collection = g_array_new(false, false, sizeof(BBV *));
-        bbv_bb_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
-                                           g_free, g_free);
-        current_bbv = bbv_new(0);
-    } else if (simpoint_mode == SP_TRACE) {
-        simpoint_specs = read_simpoints_file(simpoint_file_path);
-        if (simpoint_specs->len == 0) {
-            fprintf(stderr, "wptrace: no simpoints found in %s\n",
-                    simpoint_file_path);
-            return -1;
-        }
-        current_sp_index = 0;
-    }
-
     /* For simple start/stop, auto-start if start is 0 */
-    if (simpoint_mode == SP_NONE && trace_start_insn == 0) {
+    if (trace_start_insn == 0) {
         start_trace_segment("trace", 0, trace_stop_insn);
     }
 

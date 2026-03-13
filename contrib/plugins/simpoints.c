@@ -34,6 +34,7 @@ static uint64_t simpoint_interval = 100000000;  /* 100M instructions */
 static int num_simpoints = 10;
 static int simpoint_warmup = 10;    /* min intervals before clustering */
 static int kmeans_max_iter = 100;
+static const int simpoint_max_symbols = 5;  /* max symbols listed per simpoint */
 
 /* ========================= Data Structures ========================= */
 
@@ -72,6 +73,9 @@ static GMutex data_lock;
 
 /* BB information: start_pc -> n_insns (lightweight, no full template) */
 static GHashTable *bb_insn_map;     /* uint64* start_pc -> uint32* n_insns */
+
+/* BB symbol names: start_pc -> symbol (optional, best-effort) */
+static GHashTable *bb_symbol_map;   /* uint64* start_pc -> char* symbol */
 
 /* Per-vCPU scoreboard */
 static struct qemu_plugin_scoreboard *vcpu_sb;
@@ -129,6 +133,25 @@ static void bbv_increment(BBV *bbv, uint64_t bb_pc, uint64_t n_insns)
     }
     *count += n_insns;
     bbv->total_insns += n_insns;
+}
+
+/* Helper for sorting (bb_index, count) pairs by count descending */
+typedef struct {
+    uint32_t bb_idx;
+    uint64_t count;
+} BBCountPair;
+
+static gint bbcount_compare_desc(gconstpointer a, gconstpointer b)
+{
+    const BBCountPair *pa = a;
+    const BBCountPair *pb = b;
+    if (pa->count > pb->count) {
+        return -1;
+    }
+    if (pa->count < pb->count) {
+        return 1;
+    }
+    return 0;
 }
 
 /* ========================= K-Means Clustering ========================= */
@@ -307,6 +330,8 @@ static GArray *kmeans_cluster(GArray *bbvs, int k)
 /*
  * Write simpoints specification file.
  * Format: interval_id,start_insn,stop_insn,cluster_id,weight
+ * Each simpoint entry is followed by a comment listing the most common
+ * symbols (function names) in its representative BBV, if available.
  */
 static void write_simpoints_file(const char *path, GArray *specs)
 {
@@ -314,6 +339,24 @@ static void write_simpoints_file(const char *path, GArray *specs)
     if (!f) {
         fprintf(stderr, "simpoints: cannot open simpoints file: %s\n", path);
         return;
+    }
+
+    /*
+     * Build reverse map: bb_index -> bb_pc so we can resolve symbols
+     * from the BBV's sparse count entries.
+     */
+    GHashTable *idx_to_pc = g_hash_table_new(g_direct_hash, g_direct_equal);
+    {
+        GHashTableIter iter;
+        gpointer key, value;
+        g_hash_table_iter_init(&iter, bbv_bb_map);
+        while (g_hash_table_iter_next(&iter, &key, &value)) {
+            uint64_t *pc_ptr = key;
+            uint32_t *idx_ptr = value;
+            g_hash_table_insert(idx_to_pc,
+                                GUINT_TO_POINTER(*idx_ptr),
+                                pc_ptr);
+        }
     }
 
     fprintf(f, "# SimPoints specification\n");
@@ -326,9 +369,70 @@ static void write_simpoints_file(const char *path, GArray *specs)
         fprintf(f, "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d,%.6f\n",
                 sp->interval_id, sp->start_insn, sp->stop_insn,
                 sp->cluster_id, sp->weight);
+
+        /* Find the center BBV for this simpoint and list top symbols */
+        BBV *bbv = NULL;
+        for (guint j = 0; j < bbv_collection->len; j++) {
+            BBV *candidate = g_array_index(bbv_collection, BBV *, j);
+            if (candidate->interval_id == sp->interval_id) {
+                bbv = candidate;
+                break;
+            }
+        }
+        if (!bbv || g_hash_table_size(bb_symbol_map) == 0) {
+            continue;
+        }
+
+        /* Collect (bb_index, count) pairs from the BBV */
+        GArray *pairs = g_array_new(false, false, sizeof(BBCountPair));
+        {
+            GHashTableIter biter;
+            gpointer bkey, bvalue;
+            g_hash_table_iter_init(&biter, bbv->counts);
+            while (g_hash_table_iter_next(&biter, &bkey, &bvalue)) {
+                BBCountPair pair = {
+                    .bb_idx = GPOINTER_TO_UINT(bkey),
+                    .count = *(uint64_t *)bvalue,
+                };
+                g_array_append_val(pairs, pair);
+            }
+        }
+        g_array_sort(pairs, bbcount_compare_desc);
+
+        /* Collect unique symbols from top blocks */
+        GHashTable *seen_syms = g_hash_table_new(g_str_hash, g_str_equal);
+        g_autoptr(GString) sym_line = g_string_new(NULL);
+        int sym_count = 0;
+
+        for (guint p = 0; p < pairs->len && sym_count < simpoint_max_symbols;
+             p++) {
+            BBCountPair *pair = &g_array_index(pairs, BBCountPair, p);
+            uint64_t *pc_ptr = g_hash_table_lookup(
+                idx_to_pc, GUINT_TO_POINTER(pair->bb_idx));
+            if (!pc_ptr) {
+                continue;
+            }
+            char *sym = g_hash_table_lookup(bb_symbol_map, pc_ptr);
+            if (sym && !g_hash_table_contains(seen_syms, sym)) {
+                g_hash_table_add(seen_syms, sym);
+                if (sym_line->len > 0) {
+                    g_string_append(sym_line, ", ");
+                }
+                g_string_append(sym_line, sym);
+                sym_count++;
+            }
+        }
+
+        if (sym_line->len > 0) {
+            fprintf(f, "# top_symbols: %s\n", sym_line->str);
+        }
+
+        g_hash_table_unref(seen_syms);
+        g_array_unref(pairs);
     }
 
     fclose(f);
+    g_hash_table_unref(idx_to_pc);
 }
 
 /* ========================= Execution Callback ========================= */
@@ -373,7 +477,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     uint64_t pc = qemu_plugin_tb_vaddr(tb);
     size_t n_insns = qemu_plugin_tb_n_insns(tb);
 
-    /* Record BB instruction count */
+    /* Record BB instruction count and symbol name */
     g_mutex_lock(&data_lock);
     if (!g_hash_table_contains(bb_insn_map, &pc)) {
         uint64_t *key = g_new(uint64_t, 1);
@@ -381,6 +485,18 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         *key = pc;
         *val = (uint32_t)n_insns;
         g_hash_table_insert(bb_insn_map, key, val);
+
+        /* Best-effort symbol lookup for the first instruction */
+        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, 0);
+        if (insn) {
+            const char *sym = qemu_plugin_insn_symbol(insn);
+            if (sym) {
+                uint64_t *sym_key = g_new(uint64_t, 1);
+                *sym_key = pc;
+                g_hash_table_insert(bb_symbol_map, sym_key,
+                                    g_strdup(sym));
+            }
+        }
     }
     g_mutex_unlock(&data_lock);
 
@@ -456,6 +572,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
 
     g_hash_table_unref(bbv_bb_map);
     g_hash_table_unref(bb_insn_map);
+    g_hash_table_unref(bb_symbol_map);
     g_free(output_path);
 }
 
@@ -505,6 +622,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     g_mutex_init(&data_lock);
     bb_insn_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
                                         g_free, g_free);
+    bb_symbol_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                          g_free, g_free);
     bbv_collection = g_array_new(false, false, sizeof(BBV *));
     bbv_bb_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
                                        g_free, g_free);

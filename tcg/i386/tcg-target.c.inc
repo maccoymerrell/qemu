@@ -2203,18 +2203,12 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
         tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_L0, TCG_REG_L0,
                    offsetof(CPUTLBEntry, addend));
     } else if (tb_cflags(s->gen_tb) & CF_FORCE_SLOW) {
-        /*
-         * CF_FORCE_SLOW: unconditionally use the slow path for all
-         * memory operations.  This is used during wrong-path (speculative)
-         * execution so that every load/store goes through the helpers in
-         * user-exec.c, where the speculative store buffer can intercept them.
-         */
+        /* Force all memory ops through slow-path for spec store buffer */
         ldst = new_ldst_label(s);
         ldst->is_ld = is_ld;
         ldst->oi = oi;
         ldst->addr_reg = addr;
 
-        /* Unconditional jump to slow path */
         tcg_out_opc(s, OPC_JMP_long, 0, 0, 0);
         ldst->label_ptr[0] = s->code_ptr;
         s->code_ptr += 4;

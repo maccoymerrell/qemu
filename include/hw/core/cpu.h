@@ -540,29 +540,9 @@ struct CPUState {
 #ifdef CONFIG_PLUGIN
     CPUPluginState *plugin_state;
 
-    /*
-     * Wrong-path speculative store buffer.
-     * When plugin_spec_mode is true, all guest memory stores are
-     * redirected to a per-CPU hash table (spec_store_buf) instead
-     * of modifying real guest memory. Loads check the buffer first
-     * for store-to-load forwarding. The buffer is discarded when
-     * speculative mode ends.
-     *
-     * The page validity cache (spec_page_cache) tracks which guest
-     * pages are accessible during speculative execution. Accesses
-     * to invalid pages return zero for loads and are silently
-     * discarded for stores, preventing faults on the wrong path.
-     */
+    /* Wrong-path speculative execution state (see internal-common.h) */
     bool plugin_spec_mode;
     GHashTable *plugin_spec_store_buf;
-    GHashTable *plugin_spec_page_cache;
-
-    /*
-     * Saved CPU state snapshot for wrong-path recovery.
-     * Set by the plugin before entering speculative mode, read by
-     * cpu_exec_longjmp_cleanup if an exception escapes wrong-path
-     * execution so we can restore the correct architectural state.
-     */
     struct qemu_plugin_cpu_state *plugin_spec_saved_state;
 #endif
 

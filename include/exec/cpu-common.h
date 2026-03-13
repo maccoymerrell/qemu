@@ -26,24 +26,8 @@
 void cpu_exec_init_all(void);
 void cpu_exec_step_atomic(CPUState *cpu);
 
-/**
- * cpu_plugin_exec_inline() - Execute one instruction at the current PC.
- *
- * Designed to be called from within a plugin callback context where
- * the CPU is already running. Does not manage exclusive context.
- *
- * Returns true on success, false on failure.
- */
+/* Plugin helpers for wrong-path speculative execution */
 bool cpu_plugin_exec_inline(CPUState *cpu);
-
-/**
- * cpu_plugin_flush_tlb() - Flush the TLB for the given CPU.
- *
- * Wrapper around tlb_flush() for use from common (non-target-specific)
- * code such as plugins/api.c where cputlb.h cannot be directly included.
- * Called at speculative mode boundaries to ensure wrong-path addresses
- * cannot hit stale fast-path TLB entries.
- */
 void cpu_plugin_flush_tlb(CPUState *cpu);
 
 #define REAL_HOST_PAGE_ALIGN(addr) ROUND_UP((addr), qemu_real_host_page_size())

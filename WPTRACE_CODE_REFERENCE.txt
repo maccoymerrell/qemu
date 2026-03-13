@@ -1,0 +1,478 @@
+===================================================================================
+WPTRACE PLUGIN - DETAILED CODE PATTERNS & REFERENCE
+===================================================================================
+
+1. CLASSIFY_MNEMONIC() - DETAILED CONTROL FLOW (Lines 599-723)
+===================================================================================
+
+Full source code pattern:
+
+```c
+static void classify_mnemonic(const char *mnem, uint8_t *opcode,
+                              uint8_t *branch_type)
+{
+    *opcode = GEN_OP_UNKNOWN;
+    *branch_type = BRANCH_NONE;
+
+    if (!mnem || !*mnem) {
+        return;
+    }
+
+    /* Skip x86 lock/rep prefixes */
+    if (strncmp(mnem, "lock ", 5) == 0) {
+        mnem += 5;
+    } else if (strncmp(mnem, "rep ", 4) == 0) {
+        mnem += 4;
+    } else if (strncmp(mnem, "repz ", 5) == 0) {
+        mnem += 5;
+    } else if (strncmp(mnem, "repnz ", 6) == 0) {
+        mnem += 6;
+    } else if (strncmp(mnem, "data16 ", 7) == 0) {
+        mnem += 7;
+    }
+
+    /* x86 conditional branches: j<cc> (not jmp/jmpq) */
+    if (trace_isa == TRACE_ISA_X86 && mnem[0] == 'j') {
+        char tmp[32];
+        g_strlcpy(tmp, mnem, sizeof(tmp));
+        size_t tlen = strlen(tmp);
+        if (tlen > 1 && tmp[tlen - 1] == 'q') {
+            tmp[tlen - 1] = '\0';
+        }
+        if (strcmp(tmp, "jmp") != 0) {
+            *opcode = GEN_OP_BRANCH;
+            *branch_type = BRANCH_COND_DIRECT;
+            return;
+        }
+    }
+
+    /* AArch64 conditional branches: b.eq, b.ne, b.gt, etc. */
+    if (trace_isa == TRACE_ISA_AARCH64 && mnem[0] == 'b' && mnem[1] == '.') {
+        *opcode = GEN_OP_BRANCH;
+        *branch_type = BRANCH_COND_DIRECT;
+        return;
+    }
+
+    /* AArch64 unconditional branch */
+    if (trace_isa == TRACE_ISA_AARCH64 && strcmp(mnem, "b") == 0) {
+        *opcode = GEN_OP_BRANCH;
+        *branch_type = BRANCH_DIRECT_JUMP;
+        return;
+    }
+
+    /* AArch64 ret */
+    if (trace_isa == TRACE_ISA_AARCH64 && strcmp(mnem, "ret") == 0) {
+        *opcode = GEN_OP_RET;
+        *branch_type = BRANCH_RETURN;
+        return;
+    }
+
+    /* AArch64 compare and branch: cbz, cbnz, tbz, tbnz */
+    if (trace_isa == TRACE_ISA_AARCH64 && (strncmp(mnem, "cbz", 3) == 0 ||
+                    strncmp(mnem, "cbnz", 4) == 0 ||
+                    strncmp(mnem, "tbz", 3) == 0 ||
+                    strncmp(mnem, "tbnz", 4) == 0)) {
+        *opcode = GEN_OP_BRANCH;
+        *branch_type = BRANCH_COND_DIRECT;
+        return;
+    }
+
+    /* x86 cmov<cc> variants */
+    if (trace_isa == TRACE_ISA_X86 && strncmp(mnem, "cmov", 4) == 0) {
+        *opcode = GEN_OP_CMOV;
+        return;
+    }
+
+    /* x86 set<cc> variants */
+    if (trace_isa == TRACE_ISA_X86 && strncmp(mnem, "set", 3) == 0 && strlen(mnem) > 3) {
+        *opcode = GEN_OP_SETCC;
+        return;
+    }
+
+    /* FP conversion: cvt.../vcvt... (x86) */
+    if (strncmp(mnem, "cvt", 3) == 0 || strncmp(mnem, "vcvt", 4) == 0) {
+        *opcode = GEN_OP_FP_CVT;
+        return;
+    }
+
+    /* NOP variants (x86: nopl, nopw, etc.) */
+    if (strncmp(mnem, "nop", 3) == 0) {
+        *opcode = GEN_OP_NOP;
+        return;
+    }
+
+    /* Direct lookup in table */
+    if (lookup_mnemonic(mnem, opcode, branch_type)) {
+        return;
+    }
+
+    /* AVX v-prefix: strip 'v' and retry */
+    if (mnem[0] == 'v' && strlen(mnem) > 1) {
+        if (lookup_mnemonic(mnem + 1, opcode, branch_type)) {
+            return;
+        }
+    }
+
+    /* x86 size suffix: strip trailing q/l/w/b and retry */
+    size_t len = strlen(mnem);
+    if (len > 1) {
+        char base[32];
+        g_strlcpy(base, mnem, sizeof(base));
+        char last = base[len - 1];
+        if (last == 'q' || last == 'l' || last == 'w' || last == 'b') {
+            base[len - 1] = '\0';
+            if (lookup_mnemonic(base, opcode, branch_type)) {
+                return;
+            }
+            /* Also try AVX v-prefix + stripped suffix */
+            if (base[0] == 'v' && strlen(base) > 1) {
+                if (lookup_mnemonic(base + 1, opcode, branch_type)) {
+                    return;
+                }
+            }
+        }
+    }
+}
+```
+
+KEY PATTERNS FOR NEW ISAs:
+- Add ISA-specific branch detection (like AArch64's b.<cc> pattern)
+- Add ISA-specific instruction variants (like AArch64's compare-and-branch)
+- Keep generic fallback paths (size suffix, prefixes, CVT, NOP)
+
+---
+
+2. PARSE_X86_OPERANDS() - ALU OPERATIONS PATTERN (Lines 948-970)
+===================================================================================
+
+```c
+/* Two-operand ALU: src, src+dst; FLAGS is dst */
+case GEN_OP_INT_ADD: case GEN_OP_INT_SUB: case GEN_OP_AND:
+case GEN_OP_OR: case GEN_OP_XOR: case GEN_OP_INT_ADC:
+case GEN_OP_INT_SBB: case GEN_OP_SHL: case GEN_OP_SHR:
+case GEN_OP_SAR: case GEN_OP_ROL: case GEN_OP_ROR:
+    if (n_ops >= 2) {
+        uint8_t src = extract_x86_reg(ops[0]);
+        uint8_t dst = extract_x86_reg(ops[1]);
+        if (src != REG_NONE) add_src_reg(out, src);
+        if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
+        if (dst != REG_NONE) {
+            add_src_reg(out, dst);  /* Destination is also implicit source */
+            add_dst_reg(out, dst);
+        }
+        if (op_is_mem[1]) extract_x86_mem_regs(ops[1], out);
+    } else if (n_ops == 1) {
+        uint8_t r = extract_x86_reg(ops[0]);
+        if (r != REG_NONE) { add_src_reg(out, r); add_dst_reg(out, r); }
+        if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
+    }
+    add_dst_reg(out, REG_FLAGS);  /* All ALU ops modify FLAGS */
+    break;
+```
+
+PATTERN FOR NEW ISAs: Follow operand count, handle memory addressing, add FLAGS/status as needed.
+
+---
+
+3. PARSE_AARCH64_OPERANDS() - ALU OPERATIONS PATTERN (Lines 1219-1233)
+===================================================================================
+
+```c
+/* ALU: dst = op(src1, src2) */
+case GEN_OP_INT_ADD: case GEN_OP_INT_SUB: case GEN_OP_INT_MUL:
+case GEN_OP_INT_DIV: case GEN_OP_AND: case GEN_OP_OR:
+case GEN_OP_XOR: case GEN_OP_NOT: case GEN_OP_SHL:
+case GEN_OP_SHR: case GEN_OP_SAR:
+{
+    if (n_ops >= 1) {
+        uint8_t dst = extract_aarch64_reg(ops[0]);
+        if (dst != REG_NONE) add_dst_reg(out, dst);
+    }
+    for (int i = 1; i < n_ops; i++) {
+        uint8_t src = extract_aarch64_reg(ops[i]);
+        if (src != REG_NONE) add_src_reg(out, src);
+    }
+    break;
+}
+```
+
+PATTERN FOR NEW ISAs: First operand is destination (for RISC-ISA), rest are sources.
+For ARM-style ISAs, always clear operands pattern: ops[0]=dst, ops[1..n]=sources.
+
+---
+
+4. PARSE_RISCV_REG() TEMPLATE - SHOULD BE ADDED
+===================================================================================
+
+```c
+/*
+ * Parse RISC-V register name to GenericRegId.
+ * Supports:
+ * - x0-x31 (xzero, xra, xsp, ... naming conventions)
+ * - f0-f31 (floating-point)
+ * - Alternative ABI names (zero, ra, sp, gp, tp, t0-t6, s0-s11, a0-a7, etc.)
+ */
+static uint8_t parse_riscv_reg(const char *name)
+{
+    if (!name || !*name) {
+        return REG_NONE;
+    }
+
+    /* Register file: x0-x31 */
+    if (name[0] == 'x' && name[1] >= '0' && name[1] <= '9') {
+        int n = atoi(name + 1);
+        if (n >= 0 && n <= 31) {
+            if (n == 0) return REG_NONE;  /* x0 (zero) - no dependency */
+            return REG_GPR0 + (uint8_t)(n - 1);  /* Adjust: x1→REG_GPR0 */
+        }
+    }
+
+    /* Floating-point: f0-f31 */
+    if (name[0] == 'f' && name[1] >= '0' && name[1] <= '9') {
+        int n = atoi(name + 1);
+        if (n >= 0 && n <= 31) {
+            return REG_FPR0 + (uint8_t)n;
+        }
+    }
+
+    /* ABI names */
+    if (strcmp(name, "zero") == 0) return REG_NONE;
+    if (strcmp(name, "ra") == 0) return REG_LR;     /* x1 */
+    if (strcmp(name, "sp") == 0) return REG_SP;     /* x2 */
+    if (strcmp(name, "gp") == 0) return REG_GPR3;   /* x3 - general purpose */
+    if (strcmp(name, "tp") == 0) return REG_GPR4;   /* x4 */
+    if (strcmp(name, "fp") == 0) return REG_FP_REG; /* x8 */
+
+    /* t0-t6 (temporary): x5-x7, x28-x30 */
+    if (strncmp(name, "t", 1) == 0) {
+        int n = atoi(name + 1);
+        if (n >= 0 && n <= 6) {
+            if (n <= 2) return REG_GPR4 + (uint8_t)n;    /* t0-t2: x5-x7 */
+            else return REG_GPR27 + (uint8_t)(n - 3);    /* t3-t6: x28-x31 */
+        }
+    }
+
+    /* s0-s11 (saved): x8-x9, x18-x27 */
+    if (strncmp(name, "s", 1) == 0) {
+        int n = atoi(name + 1);
+        if (n >= 0 && n <= 11) {
+            if (n <= 1) return REG_FP_REG + (uint8_t)n;     /* s0-s1: x8-x9 */
+            else return REG_GPR17 + (uint8_t)(n - 2);       /* s2-s11: x18-x27 */
+        }
+    }
+
+    /* a0-a7 (arguments): x10-x17 */
+    if (strncmp(name, "a", 1) == 0) {
+        int n = atoi(name + 1);
+        if (n >= 0 && n <= 7) {
+            return REG_GPR9 + (uint8_t)n;  /* a0-a7: x10-x17 */
+        }
+    }
+
+    return REG_NONE;
+}
+```
+
+---
+
+5. PARSE_MIPS_REG() TEMPLATE - SHOULD BE ADDED
+===================================================================================
+
+```c
+/*
+ * Parse MIPS register name to GenericRegId.
+ * Supports:
+ * - $0-$31 (numeric)
+ * - $zero, $at, $v0, $v1, $a0-$a3, $t0-$t9, $s0-$s7, $t8, $t9, $k0, $k1,
+ *   $gp, $sp, $fp, $ra (ABI names)
+ */
+static uint8_t parse_mips_reg(const char *name)
+{
+    if (!name || !*name) {
+        return REG_NONE;
+    }
+
+    /* Numeric: $0-$31 */
+    if (name[0] == '$') {
+        if (name[1] >= '0' && name[1] <= '9') {
+            int n = atoi(name + 1);
+            if (n >= 0 && n <= 31) {
+                if (n == 0) return REG_NONE;  /* $0 (zero) - no dependency */
+                return REG_GPR0 + (uint8_t)(n - 1);
+            }
+        }
+        name++;  /* Skip $ prefix for ABI names */
+    }
+
+    /* ABI names */
+    if (strcmp(name, "zero") == 0) return REG_NONE;
+    if (strcmp(name, "at") == 0)   return REG_GPR0;     /* $1 */
+    if (strcmp(name, "gp") == 0)   return REG_GPR28;    /* $28 */
+    if (strcmp(name, "sp") == 0)   return REG_SP;       /* $29 */
+    if (strcmp(name, "fp") == 0)   return REG_FP_REG;   /* $30 */
+    if (strcmp(name, "ra") == 0)   return REG_LR;       /* $31 */
+
+    /* $v0-$v1 (return): $2-$3 */
+    if (strncmp(name, "v", 1) == 0) {
+        int n = atoi(name + 1);
+        if (n >= 0 && n <= 1) {
+            return REG_GPR1 + (uint8_t)n;
+        }
+    }
+
+    /* $a0-$a3 (arguments): $4-$7 */
+    if (strncmp(name, "a", 1) == 0) {
+        int n = atoi(name + 1);
+        if (n >= 0 && n <= 3) {
+            return REG_GPR3 + (uint8_t)n;
+        }
+    }
+
+    /* $t0-$t9 (temporary): $8-$15, $24-$25 */
+    if (strncmp(name, "t", 1) == 0) {
+        int n = atoi(name + 1);
+        if (n >= 0 && n <= 9) {
+            if (n <= 7) return REG_GPR7 + (uint8_t)n;    /* $t0-$t7: $8-$15 */
+            else return REG_GPR23 + (uint8_t)(n - 8);    /* $t8-$t9: $24-$25 */
+        }
+    }
+
+    /* $s0-$s7 (saved): $16-$23 */
+    if (strncmp(name, "s", 1) == 0) {
+        int n = atoi(name + 1);
+        if (n >= 0 && n <= 7) {
+            return REG_GPR15 + (uint8_t)n;
+        }
+    }
+
+    /* $k0-$k1 (kernel): $26-$27 */
+    if (strncmp(name, "k", 1) == 0) {
+        int n = atoi(name + 1);
+        if (n >= 0 && n <= 1) {
+            return REG_GPR25 + (uint8_t)n;
+        }
+    }
+
+    return REG_NONE;
+}
+```
+
+---
+
+6. MNEMONICS TO ADD TO TABLE
+===================================================================================
+
+RISC-V Instructions (to append before {NULL, 0, 0}):
+```c
+    /* RISC-V ALU */
+    {"add",      GEN_OP_INT_ADD,  BRANCH_NONE},
+    {"addi",     GEN_OP_INT_ADD,  BRANCH_NONE},
+    {"addw",     GEN_OP_INT_ADD,  BRANCH_NONE},
+    {"addiw",    GEN_OP_INT_ADD,  BRANCH_NONE},
+    {"sub",      GEN_OP_INT_SUB,  BRANCH_NONE},
+    {"subw",     GEN_OP_INT_SUB,  BRANCH_NONE},
+    {"mul",      GEN_OP_INT_MUL,  BRANCH_NONE},
+    {"mulw",     GEN_OP_INT_MUL,  BRANCH_NONE},
+    {"div",      GEN_OP_INT_DIV,  BRANCH_NONE},
+    {"divu",     GEN_OP_INT_DIV,  BRANCH_NONE},
+    {"and",      GEN_OP_AND,      BRANCH_NONE},
+    {"andi",     GEN_OP_AND,      BRANCH_NONE},
+    {"or",       GEN_OP_OR,       BRANCH_NONE},
+    {"ori",      GEN_OP_OR,       BRANCH_NONE},
+    {"xor",      GEN_OP_XOR,      BRANCH_NONE},
+    {"xori",     GEN_OP_XOR,      BRANCH_NONE},
+    /* RISC-V shifts */
+    {"sll",      GEN_OP_SHL,      BRANCH_NONE},
+    {"slli",     GEN_OP_SHL,      BRANCH_NONE},
+    {"srl",      GEN_OP_SHR,      BRANCH_NONE},
+    {"srli",     GEN_OP_SHR,      BRANCH_NONE},
+    {"sra",      GEN_OP_SAR,      BRANCH_NONE},
+    {"srai",     GEN_OP_SAR,      BRANCH_NONE},
+    /* RISC-V memory */
+    {"lw",       GEN_OP_LOAD,     BRANCH_NONE},
+    {"ld",       GEN_OP_LOAD,     BRANCH_NONE},
+    {"lh",       GEN_OP_LOAD,     BRANCH_NONE},
+    {"lb",       GEN_OP_LOAD,     BRANCH_NONE},
+    {"sw",       GEN_OP_STORE,    BRANCH_NONE},
+    {"sd",       GEN_OP_STORE,    BRANCH_NONE},
+    {"sh",       GEN_OP_STORE,    BRANCH_NONE},
+    {"sb",       GEN_OP_STORE,    BRANCH_NONE},
+    /* RISC-V comparison */
+    {"beq",      GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"bne",      GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"blt",      GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"bge",      GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"bltu",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"bgeu",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    /* RISC-V control */
+    {"jal",      GEN_OP_CALL,     BRANCH_DIRECT_CALL},
+    {"jalr",     GEN_OP_CALL,     BRANCH_INDIRECT_CALL},
+    {"ret",      GEN_OP_RET,      BRANCH_RETURN},  /* pseudo: jalr x0, ra */
+    /* RISC-V FP */
+    {"fadd.s",   GEN_OP_FP_ADD,   BRANCH_NONE},
+    {"fadd.d",   GEN_OP_FP_ADD,   BRANCH_NONE},
+    {"fsub.s",   GEN_OP_FP_SUB,   BRANCH_NONE},
+    {"fsub.d",   GEN_OP_FP_SUB,   BRANCH_NONE},
+    {"fmul.s",   GEN_OP_FP_MUL,   BRANCH_NONE},
+    {"fmul.d",   GEN_OP_FP_MUL,   BRANCH_NONE},
+    {"fdiv.s",   GEN_OP_FP_DIV,   BRANCH_NONE},
+    {"fdiv.d",   GEN_OP_FP_DIV,   BRANCH_NONE},
+    {"fsqrt.s",  GEN_OP_FP_SQRT,  BRANCH_NONE},
+    {"fsqrt.d",  GEN_OP_FP_SQRT,  BRANCH_NONE},
+    {"flw",      GEN_OP_LOAD,     BRANCH_NONE},
+    {"fld",      GEN_OP_LOAD,     BRANCH_NONE},
+    {"fsw",      GEN_OP_STORE,    BRANCH_NONE},
+    {"fsd",      GEN_OP_STORE,    BRANCH_NONE},
+```
+
+MIPS Instructions (to append before {NULL, 0, 0}):
+```c
+    /* MIPS ALU */
+    {"add",      GEN_OP_INT_ADD,  BRANCH_NONE},
+    {"addu",     GEN_OP_INT_ADD,  BRANCH_NONE},
+    {"addi",     GEN_OP_INT_ADD,  BRANCH_NONE},
+    {"addiu",    GEN_OP_INT_ADD,  BRANCH_NONE},
+    {"sub",      GEN_OP_INT_SUB,  BRANCH_NONE},
+    {"subu",     GEN_OP_INT_SUB,  BRANCH_NONE},
+    {"mult",     GEN_OP_INT_MUL,  BRANCH_NONE},
+    {"multu",    GEN_OP_INT_MUL,  BRANCH_NONE},
+    {"mul",      GEN_OP_INT_MUL,  BRANCH_NONE},
+    {"div",      GEN_OP_INT_DIV,  BRANCH_NONE},
+    {"divu",     GEN_OP_INT_DIV,  BRANCH_NONE},
+    {"and",      GEN_OP_AND,      BRANCH_NONE},
+    {"andi",     GEN_OP_AND,      BRANCH_NONE},
+    {"or",       GEN_OP_OR,       BRANCH_NONE},
+    {"ori",      GEN_OP_OR,       BRANCH_NONE},
+    {"xor",      GEN_OP_XOR,      BRANCH_NONE},
+    {"xori",     GEN_OP_XOR,      BRANCH_NONE},
+    /* MIPS shifts */
+    {"sll",      GEN_OP_SHL,      BRANCH_NONE},
+    {"slli",     GEN_OP_SHL,      BRANCH_NONE},
+    {"srl",      GEN_OP_SHR,      BRANCH_NONE},
+    {"srli",     GEN_OP_SHR,      BRANCH_NONE},
+    {"sra",      GEN_OP_SAR,      BRANCH_NONE},
+    {"srai",     GEN_OP_SAR,      BRANCH_NONE},
+    /* MIPS memory */
+    {"lw",       GEN_OP_LOAD,     BRANCH_NONE},
+    {"ld",       GEN_OP_LOAD,     BRANCH_NONE},
+    {"lh",       GEN_OP_LOAD,     BRANCH_NONE},
+    {"lb",       GEN_OP_LOAD,     BRANCH_NONE},
+    {"sw",       GEN_OP_STORE,    BRANCH_NONE},
+    {"sd",       GEN_OP_STORE,    BRANCH_NONE},
+    {"sh",       GEN_OP_STORE,    BRANCH_NONE},
+    {"sb",       GEN_OP_STORE,    BRANCH_NONE},
+    /* MIPS comparison branches */
+    {"beq",      GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"bne",      GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"bltz",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"bgez",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"blez",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    {"bgtz",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    /* MIPS control */
+    {"j",        GEN_OP_BRANCH,   BRANCH_DIRECT_JUMP},
+    {"jal",      GEN_OP_CALL,     BRANCH_DIRECT_CALL},
+    {"jr",       GEN_OP_BRANCH,   BRANCH_INDIRECT_JUMP},
+    {"jalr",     GEN_OP_CALL,     BRANCH_INDIRECT_CALL},
+```
+
+___BEGIN___COMMAND_DONE_MARKER___0

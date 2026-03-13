@@ -26,7 +26,7 @@
  * Usage:
  *   -plugin wptrace[,depth=N][,outfile=PATH][,debug=1]
  *                  [,wp=0|1][,start=N][,stop=N]
- *                  [,program=NAME]
+ *                  [,spfile=PATH][,program=NAME]
  *
  * Copyright (c) 2025
  *
@@ -54,6 +54,20 @@ static uint64_t trace_start_insn = 0;
 static uint64_t trace_stop_insn = UINT64_MAX;
 static const char *target_name;
 static bool is_x86 = false;
+
+/* SimPoints-driven tracing */
+static char *simpoints_file_path = NULL;
+
+typedef struct {
+    uint64_t interval_id;
+    uint64_t start_insn;
+    uint64_t stop_insn;
+    int cluster_id;
+    double weight;
+} SimPointEntry;
+
+static GArray *simpoints_list = NULL;  /* GArray of SimPointEntry, sorted */
+static guint simpoints_current_idx = 0;
 
 #define MAX_INSN_BYTES 16
 
@@ -1245,6 +1259,57 @@ static void write_bin_trace(FILE *f, GArray *body_entries)
 
 /* ========================= Trace State Management ========================= */
 
+static gint simpoint_entry_compare(gconstpointer a, gconstpointer b)
+{
+    const SimPointEntry *sa = a;
+    const SimPointEntry *sb = b;
+    if (sa->start_insn < sb->start_insn) {
+        return -1;
+    }
+    if (sa->start_insn > sb->start_insn) {
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * Parse a simpoints CSV file produced by the simpoints plugin.
+ * Format: interval_id,start_insn,stop_insn,cluster_id,weight
+ * Lines starting with '#' are comments.
+ */
+static GArray *parse_simpoints_file(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "wptrace: cannot open simpoints file: %s\n", path);
+        return NULL;
+    }
+
+    GArray *entries = g_array_new(false, false, sizeof(SimPointEntry));
+    char line[512];
+
+    while (fgets(line, sizeof(line), f)) {
+        /* Skip comments and blank lines */
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') {
+            continue;
+        }
+
+        SimPointEntry sp;
+        if (sscanf(line, "%" SCNu64 ",%" SCNu64 ",%" SCNu64 ",%d,%lf",
+                   &sp.interval_id, &sp.start_insn, &sp.stop_insn,
+                   &sp.cluster_id, &sp.weight) == 5) {
+            g_array_append_val(entries, sp);
+        }
+    }
+
+    fclose(f);
+
+    /* Sort by start_insn ascending */
+    g_array_sort(entries, simpoint_entry_compare);
+
+    return entries;
+}
+
 /*
  * Start a new trace segment with the given label and instruction range.
  */
@@ -1263,9 +1328,18 @@ static void start_trace_segment(const char *label,
     g_autofree char *txt_path = NULL;
 
     if (output_base_path) {
-        bin_path = g_strdup_printf("%s.bin", output_base_path);
-        if (enable_debug_text) {
-            txt_path = g_strdup_printf("%s.txt", output_base_path);
+        if (simpoints_list) {
+            /* Per-simpoint output files: outfile_sp0.bin, outfile_sp1.bin, ... */
+            bin_path = g_strdup_printf("%s_%s.bin", output_base_path, label);
+            if (enable_debug_text) {
+                txt_path = g_strdup_printf("%s_%s.txt",
+                                           output_base_path, label);
+            }
+        } else {
+            bin_path = g_strdup_printf("%s.bin", output_base_path);
+            if (enable_debug_text) {
+                txt_path = g_strdup_printf("%s.txt", output_base_path);
+            }
         }
     }
 
@@ -1331,13 +1405,38 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     }
 
     /* --- Tracing window management --- */
-    if (!trace_active && icount >= trace_start_insn &&
-        icount < trace_stop_insn) {
-        start_trace_segment("trace", trace_start_insn, trace_stop_insn);
-    }
-    if (trace_active && icount >= trace_stop_insn) {
-        finish_trace_segment();
-        exit(0);
+    if (simpoints_list) {
+        /* SimPoints-driven tracing: cycle through simpoint intervals */
+        if (trace_active && icount >= trace_stop_insn) {
+            finish_trace_segment();
+            simpoints_current_idx++;
+        }
+        if (!trace_active && simpoints_current_idx < simpoints_list->len) {
+            SimPointEntry *sp = &g_array_index(simpoints_list,
+                                               SimPointEntry,
+                                               simpoints_current_idx);
+            if (icount >= sp->start_insn && icount < sp->stop_insn) {
+                trace_start_insn = sp->start_insn;
+                trace_stop_insn = sp->stop_insn;
+                g_autofree char *label =
+                    g_strdup_printf("sp%u", simpoints_current_idx);
+                start_trace_segment(label, sp->start_insn, sp->stop_insn);
+            }
+        }
+        if (!trace_active && simpoints_current_idx >= simpoints_list->len) {
+            /* All simpoints traced */
+            exit(0);
+        }
+    } else {
+        /* Simple start/stop mode */
+        if (!trace_active && icount >= trace_start_insn &&
+            icount < trace_stop_insn) {
+            start_trace_segment("trace", trace_start_insn, trace_stop_insn);
+        }
+        if (trace_active && icount >= trace_stop_insn) {
+            finish_trace_segment();
+            exit(0);
+        }
     }
 
     /* Skip initial block (no previous context) */
@@ -1600,6 +1699,15 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
             (double)stat_wp_total_insns / stat_wp_simulations);
     }
 
+    if (simpoints_list) {
+        g_string_append_printf(report,
+            "\nSimPoints tracing:\n");
+        g_string_append_printf(report,
+            "  SimPoints loaded: %u\n", simpoints_list->len);
+        g_string_append_printf(report,
+            "  SimPoints traced: %u\n", simpoints_current_idx);
+    }
+
     g_string_append_printf(report,
         "==========================================\n");
 
@@ -1611,11 +1719,15 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     if (cp_mem_accesses) {
         g_array_unref(cp_mem_accesses);
     }
+    if (simpoints_list) {
+        g_array_unref(simpoints_list);
+    }
     g_hash_table_unref(template_map);
     g_hash_table_unref(branch_map);
     qemu_plugin_scoreboard_free(vcpu_sb);
     g_free(output_base_path);
     g_free(program_name);
+    g_free(simpoints_file_path);
 }
 
 /* ========================= Plugin Installation ========================= */
@@ -1651,6 +1763,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             trace_stop_insn = g_ascii_strtoull(tokens[1], NULL, 10);
         } else if (g_strcmp0(tokens[0], "program") == 0) {
             program_name = g_strdup(tokens[1]);
+        } else if (g_strcmp0(tokens[0], "spfile") == 0) {
+            simpoints_file_path = g_strdup(tokens[1]);
         } else {
             fprintf(stderr, "wptrace: unknown option: %s\n", opt);
             return -1;
@@ -1661,6 +1775,24 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     if (!output_base_path) {
         /* Default output base path */
         output_base_path = g_strdup("wptrace_out");
+    }
+
+    /* Load simpoints file if provided */
+    if (simpoints_file_path) {
+        simpoints_list = parse_simpoints_file(simpoints_file_path);
+        if (!simpoints_list || simpoints_list->len == 0) {
+            fprintf(stderr, "wptrace: no valid simpoints in: %s\n",
+                    simpoints_file_path);
+            g_free(simpoints_file_path);
+            return -1;
+        }
+        fprintf(stderr, "wptrace: loaded %u simpoints from %s\n",
+                simpoints_list->len, simpoints_file_path);
+        simpoints_current_idx = 0;
+
+        /* spfile overrides manual start/stop */
+        trace_start_insn = 0;
+        trace_stop_insn = UINT64_MAX;
     }
 
     /* Initialize data structures */
@@ -1684,8 +1816,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     /* Initialize correct-path memory access collection */
     cp_mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
 
-    /* For simple start/stop, auto-start if start is 0 */
-    if (trace_start_insn == 0) {
+    /* For simple start/stop, auto-start if start is 0 (not simpoints mode) */
+    if (!simpoints_list && trace_start_insn == 0) {
         start_trace_segment("trace", 0, trace_stop_insn);
     }
 

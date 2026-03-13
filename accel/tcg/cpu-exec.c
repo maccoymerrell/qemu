@@ -532,22 +532,10 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
 
 #ifdef CONFIG_PLUGIN
     /*
-     * If an exception occurred during speculative (wrong-path) execution,
-     * clean up the speculative state.  Without this, the store buffer and
-     * page cache would leak and the CPU state would remain corrupted.
+     * Clean up speculative state after an exception during wrong-path
+     * execution.  Save the pointer before spec_mode_end() clears it.
      */
     if (cpu->plugin_spec_mode) {
-        /*
-         * Restore CPU state from the snapshot saved before wrong-path
-         * execution began.  The plugin stashes this in
-         * plugin_spec_saved_state.
-         *
-         * Save the pointer before calling spec_mode_end(), because
-         * that function clears plugin_spec_saved_state as part of
-         * its cleanup.  Without this, the state would never be
-         * restored and normal execution would resume with corrupted
-         * registers, causing a crash.
-         */
         struct qemu_plugin_cpu_state *saved =
             cpu->plugin_spec_saved_state;
         qemu_plugin_spec_mode_end();
@@ -646,16 +634,7 @@ void cpu_exec_step_atomic(CPUState *cpu)
 }
 
 /*
- * cpu_plugin_exec_inline() - Execute one instruction at the current PC.
- *
- * This is designed to be called from within a plugin callback context,
- * where the CPU is already running and we are inside the execution loop.
- * Unlike cpu_exec_step_atomic, this does not manage the exclusive context
- * or running state.
- *
- * The caller must disable plugin instrumentation during this call (by
- * temporarily setting cpu->plugin_disabled) to avoid recursive callbacks.
- *
+ * Execute one instruction at the current PC from a plugin callback.
  * Returns true on success, false on failure (e.g. unmapped PC).
  */
 bool cpu_plugin_exec_inline(CPUState *cpu)
@@ -674,30 +653,14 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
     /* Execute in serial context, exactly 1 instruction, no chaining */
     cflags &= ~CF_PARALLEL;
     cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR | 1;
-    /*
-     * Suppress plugin instrumentation for wrong-path execution.
-     * Use CF_MEMI_ONLY to prevent translation-time plugin callbacks
-     * from firing during wrong-path TB generation.
-     */
     cflags |= CF_MEMI_ONLY;
 
-    /*
-     * Force all memory operations through the slow-path helpers so
-     * that the speculative store buffer in user-exec.c / cputlb.c
-     * can intercept every load and store.  Without this, the JIT
-     * fast path would emit inline memory accesses that bypass the
-     * store buffer, causing silent memory corruption or segfaults
-     * on unmapped pages during wrong-path execution.
-     */
+    /* Force slow-path memory ops so the spec store buffer can intercept */
     if (cpu->plugin_spec_mode) {
         cflags |= CF_FORCE_SLOW;
     }
 
-    /*
-     * Before attempting translation, verify the PC page is mapped.
-     * During wrong-path execution the PC may point to unmapped memory;
-     * probing non-faultingly avoids an exception in tb_gen_code.
-     */
+    /* Verify the PC page is mapped before translation */
     void *host;
     int pflags = probe_access_flags(env, pc, 1, MMU_INST_FETCH,
                                     cpu_mmu_index(cpu, true),
@@ -717,20 +680,14 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
     }
 
     /*
-     * cpu_tb_exec may check running state internally.
-     * Since this is called from the vCPU thread's plugin callback,
-     * which is single-threaded per vCPU, there is no concurrent access
-     * to cpu->running. Save and restore to avoid assertion failures.
+     * Save and restore cpu->running to avoid assertion failures
+     * when called from a plugin callback context.
      */
     saved_running = cpu->running;
 
     /*
-     * Set up a local exception landing pad so that any fault during
-     * wrong-path execution (e.g. SIGSEGV from an unmapped page) is
-     * caught here instead of propagating to the outer cpu_exec loop.
-     * The signal handler skips guest signal delivery when
-     * plugin_spec_mode is set and calls cpu_loop_exit(), which
-     * longjmps back here.
+     * Set up a local exception landing pad so faults during wrong-path
+     * execution longjmp back here instead of the outer cpu_exec loop.
      */
     sigjmp_buf saved_jmp_env;
     memcpy(&saved_jmp_env, &cpu->jmp_env, sizeof(sigjmp_buf));

@@ -43,57 +43,8 @@ __thread uintptr_t helper_retaddr;
 
 #ifdef CONFIG_PLUGIN
 /*
- * Speculative store buffer helpers for wrong-path execution (user-mode).
- *
- * These mirror the helpers in cputlb.c (system-mode only) but are needed
- * here because user-exec.c is compiled for CONFIG_USER_ONLY targets while
- * cputlb.c is compiled only for CONFIG_SYSTEM_ONLY targets.
- *
- * When a plugin enters speculative mode (cpu->plugin_spec_mode == true),
- * all guest memory stores are redirected to a per-byte hash table
- * (cpu->plugin_spec_store_buf) instead of modifying real guest memory.
- * Loads check the buffer first for store-to-load forwarding, falling
- * back to real memory (or zero for unmapped pages).
- */
-
-static inline bool cpu_plugin_spec_active(CPUState *cpu)
-{
-    return unlikely(cpu->plugin_spec_mode && cpu->plugin_spec_store_buf);
-}
-
-static inline void spec_store_byte(CPUState *cpu, vaddr addr, uint8_t val)
-{
-    g_hash_table_insert(cpu->plugin_spec_store_buf,
-                        GUINT_TO_POINTER((guintptr)addr),
-                        GUINT_TO_POINTER((guint)val));
-}
-
-static inline bool spec_load_byte(CPUState *cpu, vaddr addr, uint8_t *val)
-{
-    gpointer v;
-    if (g_hash_table_lookup_extended(cpu->plugin_spec_store_buf,
-                                     GUINT_TO_POINTER((guintptr)addr),
-                                     NULL, &v)) {
-        *val = (uint8_t)GPOINTER_TO_UINT(v);
-        return true;
-    }
-    return false;
-}
-
-static void spec_store_bytes(CPUState *cpu, vaddr addr,
-                             const void *buf, int size)
-{
-    const uint8_t *p = buf;
-    for (int i = 0; i < size; i++) {
-        spec_store_byte(cpu, addr + i, p[i]);
-    }
-}
-
-/*
- * Load N bytes with store-to-load forwarding during speculative execution.
- * Reads from real memory (via host pointer) for accessible pages, overlaying
- * any bytes present in the speculative store buffer.  For inaccessible pages,
- * returns zero for bytes not in the buffer.
+ * Load N bytes with store-to-load forwarding (user mode).
+ * Checks page validity via g2h; returns zero for unmapped bytes.
  */
 static void spec_load_bytes_user(CPUState *cpu, vaddr guest_addr,
                                  void *out, int size)

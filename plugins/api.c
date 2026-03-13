@@ -599,8 +599,6 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
 
     current_cpu->plugin_spec_store_buf = g_hash_table_new(g_direct_hash,
                                                            g_direct_equal);
-    current_cpu->plugin_spec_page_cache = g_hash_table_new(g_direct_hash,
-                                                            g_direct_equal);
     current_cpu->plugin_spec_saved_state = saved_state;
     current_cpu->plugin_spec_mode = true;
 }
@@ -622,10 +620,6 @@ void qemu_plugin_spec_mode_end(void)
     if (current_cpu->plugin_spec_store_buf) {
         g_hash_table_destroy(current_cpu->plugin_spec_store_buf);
         current_cpu->plugin_spec_store_buf = NULL;
-    }
-    if (current_cpu->plugin_spec_page_cache) {
-        g_hash_table_destroy(current_cpu->plugin_spec_page_cache);
-        current_cpu->plugin_spec_page_cache = NULL;
     }
 
     /*

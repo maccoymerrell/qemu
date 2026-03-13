@@ -2590,6 +2590,8 @@ static uint32_t body_seq_num = 0;
 static bool wp_in_progress = false;
 static GArray *wp_mem_accesses = NULL;
 static uint64_t wp_current_insn_pc = 0;
+static uint64_t wp_saved_insn_count = 0;
+static unsigned int wp_saved_cpu_index = 0;
 
 /* Correct-path memory accesses for current BB */
 static GArray *cp_mem_accesses = NULL;
@@ -2885,6 +2887,14 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
 
     /* Initialize wrong-path memory access collection */
     wp_mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
+
+    /*
+     * Save the correct-path instruction count before entering wrong-path.
+     * Wrong-path TB execution triggers the inline QEMU_PLUGIN_INLINE_ADD_U64
+     * which would corrupt the count. We restore it after wrong-path ends.
+     */
+    wp_saved_cpu_index = cpu_index;
+    wp_saved_insn_count = qemu_plugin_u64_get(sb_insn_count, cpu_index);
     wp_in_progress = true;
 
     /* Enter speculative mode, providing saved state for exception recovery */
@@ -2990,6 +3000,9 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
 
     /* Stop wrong-path collection */
     wp_in_progress = false;
+
+    /* Restore correct-path instruction count */
+    qemu_plugin_u64_set(sb_insn_count, cpu_index, wp_saved_insn_count);
 
     /* Exit speculative mode */
     qemu_plugin_spec_mode_end();
@@ -3725,6 +3738,10 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
 {
     if (wp_in_progress) {
         wp_in_progress = false;
+        /* Restore the correct-path instruction count that was saved before
+         * wrong-path execution began. */
+        qemu_plugin_u64_set(sb_insn_count, wp_saved_cpu_index,
+                            wp_saved_insn_count);
         if (wp_mem_accesses) {
             g_array_unref(wp_mem_accesses);
             wp_mem_accesses = NULL;

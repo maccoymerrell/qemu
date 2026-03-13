@@ -58,7 +58,7 @@ static bool is_x86 = false;
 #define MAX_INSN_BYTES 16
 
 /* Magic for binary format */
-#define WPT_MAGIC  0x54505702  /* "WPT\x02" - version 2 */
+#define WPT_MAGIC  0x54505702  /* 'T','P','W',0x02 little-endian - version 2 */
 
 /* ========================= Data Structures ========================= */
 
@@ -81,6 +81,17 @@ typedef struct {
  * Lightweight x86 instruction field extraction.
  * Best-effort decoder for trace enrichment, not a full disassembler.
  */
+/* Sign-extend a value of @nbytes width to a 64-bit signed integer */
+static inline int64_t sign_extend(uint64_t val, uint8_t nbytes)
+{
+    switch (nbytes) {
+    case 1: return (int64_t)(int8_t)(uint8_t)val;
+    case 2: return (int64_t)(int16_t)(uint16_t)val;
+    case 4: return (int64_t)(int32_t)(uint32_t)val;
+    default: return (int64_t)val;
+    }
+}
+
 static void decode_x86_insn(const uint8_t *bytes, uint32_t len,
                              X86InsnFields *out)
 {
@@ -256,11 +267,7 @@ static void decode_x86_insn(const uint8_t *bytes, uint32_t len,
             for (uint8_t i = 0; i < out->disp_size; i++) {
                 d |= (uint32_t)bytes[pos++] << (i * 8);
             }
-            /* Sign-extend 1-byte displacement */
-            if (out->disp_size == 1 && (d & 0x80)) {
-                d |= 0xFFFFFF00;
-            }
-            out->disp = (int32_t)d;
+            out->disp = (int32_t)sign_extend(d, out->disp_size);
         }
 
         /* Determine immediate for ModRM opcodes that also have immediates */
@@ -289,15 +296,7 @@ static void decode_x86_insn(const uint8_t *bytes, uint32_t len,
         for (uint8_t i = 0; i < imm_bytes; i++) {
             imm |= (uint64_t)bytes[pos++] << (i * 8);
         }
-        /* Sign-extend */
-        if (imm_bytes == 1 && (imm & 0x80)) {
-            imm |= ~(uint64_t)0xFF;
-        } else if (imm_bytes == 2 && (imm & 0x8000)) {
-            imm |= ~(uint64_t)0xFFFF;
-        } else if (imm_bytes == 4 && (imm & 0x80000000ULL)) {
-            imm |= ~(uint64_t)0xFFFFFFFF;
-        }
-        out->imm = (int64_t)imm;
+        out->imm = sign_extend(imm, imm_bytes);
     }
 }
 

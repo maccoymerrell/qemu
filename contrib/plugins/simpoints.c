@@ -42,7 +42,7 @@ static int kmeans_max_iter = 100;
  * Maps bb_index -> execution count for that interval.
  */
 typedef struct {
-    GHashTable *counts;         /* uint32 bb_index -> uint64 count */
+    GHashTable *counts;         /* GUINT_TO_POINTER(bb_index) → uint64* count */
     uint64_t total_insns;       /* Total instructions in interval */
     uint64_t interval_id;       /* Which interval (0-based) */
 } BBV;

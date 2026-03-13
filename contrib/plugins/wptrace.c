@@ -236,6 +236,111 @@ typedef struct {
 
 /* ========================= Disassembly-Based Generic Decode ========================= */
 
+/*
+ * Register name → GenericRegId mapping entry.
+ * Used to build per-ISA hash tables for O(1) register name lookups.
+ */
+typedef struct {
+    const char *name;
+    uint8_t reg_id;
+} RegEntry;
+
+/*
+ * x86 register name table: maps all 64/32/16/8-bit GPR variants
+ * and special registers to GenericRegId for hash table initialization.
+ */
+static const RegEntry x86_reg_entries[] = {
+    /* 64-bit GPRs */
+    {"rax", REG_GPR0}, {"rcx", REG_GPR1}, {"rdx", REG_GPR2},
+    {"rbx", REG_GPR3}, {"rsp", REG_SP},   {"rbp", REG_FP_REG},
+    {"rsi", REG_GPR4}, {"rdi", REG_GPR5},
+    /* 32-bit GPRs */
+    {"eax", REG_GPR0}, {"ecx", REG_GPR1}, {"edx", REG_GPR2},
+    {"ebx", REG_GPR3}, {"esp", REG_SP},   {"ebp", REG_FP_REG},
+    {"esi", REG_GPR4}, {"edi", REG_GPR5},
+    /* 16-bit GPRs */
+    {"ax", REG_GPR0}, {"cx", REG_GPR1}, {"dx", REG_GPR2},
+    {"bx", REG_GPR3}, {"sp", REG_SP},   {"bp", REG_FP_REG},
+    {"si", REG_GPR4}, {"di", REG_GPR5},
+    /* 8-bit GPRs */
+    {"al", REG_GPR0}, {"ah", REG_GPR0},
+    {"cl", REG_GPR1}, {"ch", REG_GPR1},
+    {"dl", REG_GPR2}, {"dh", REG_GPR2},
+    {"bl", REG_GPR3}, {"bh", REG_GPR3},
+    {"spl", REG_SP},  {"bpl", REG_FP_REG},
+    {"sil", REG_GPR4}, {"dil", REG_GPR5},
+    /* Special registers */
+    {"rip", REG_IP}, {"eip", REG_IP},
+    {"rflags", REG_FLAGS}, {"eflags", REG_FLAGS},
+    {NULL, 0}
+};
+
+/*
+ * AArch64 register name table for exact-match lookups.
+ */
+static const RegEntry aarch64_reg_entries[] = {
+    {"xzr", REG_NONE}, {"wzr", REG_NONE},
+    {"sp", REG_SP}, {"lr", REG_LR}, {"fp", REG_FP_REG},
+    {NULL, 0}
+};
+
+/*
+ * RISC-V register name table for exact-match lookups.
+ */
+static const RegEntry riscv_reg_entries[] = {
+    {"zero", REG_NONE},
+    {"ra", REG_LR}, {"sp", REG_SP}, {"gp", REG_GPR3},
+    {"tp", REG_GPR4}, {"fp", REG_FP_REG},
+    {NULL, 0}
+};
+
+/*
+ * MIPS register name table for exact-match lookups.
+ */
+static const RegEntry mips_reg_entries[] = {
+    {"zero", REG_NONE}, {"0", REG_NONE},
+    {"at", REG_GPR1}, {"sp", REG_SP}, {"fp", REG_FP_REG},
+    {"ra", REG_LR}, {"gp", REG_GPR28},
+    {NULL, 0}
+};
+
+/* Per-ISA register hash tables and mnemonic hash table (built once at init) */
+static GHashTable *x86_reg_ht;
+static GHashTable *aarch64_reg_ht;
+static GHashTable *riscv_reg_ht;
+static GHashTable *mips_reg_ht;
+static GHashTable *mnemonic_ht;
+
+/*
+ * Build a register-name hash table from a RegEntry array.
+ * Values are stored as GUINT_TO_POINTER(reg_id + 1) so that REG_NONE (0)
+ * is distinguishable from a hash miss (NULL).
+ */
+static GHashTable *build_reg_hash_table(const RegEntry *entries)
+{
+    GHashTable *ht = g_hash_table_new(g_str_hash, g_str_equal);
+    for (int i = 0; entries[i].name; i++) {
+        g_hash_table_insert(ht, (gpointer)entries[i].name,
+                            GUINT_TO_POINTER((guint)entries[i].reg_id + 1));
+    }
+    return ht;
+}
+
+/*
+ * Look up a register name in a pre-built hash table.
+ * Returns true if found, writing the register ID to *reg_id.
+ */
+static inline bool reg_hash_lookup(GHashTable *ht, const char *name,
+                                   uint8_t *reg_id)
+{
+    gpointer val = g_hash_table_lookup(ht, name);
+    if (val) {
+        *reg_id = (uint8_t)(GPOINTER_TO_UINT(val) - 1);
+        return true;
+    }
+    return false;
+}
+
 static inline void add_src_reg(InsnFields *f, uint8_t reg_id)
 {
     if (reg_id == REG_NONE || f->n_src_regs >= MAX_SRC_REGS) {
@@ -264,53 +369,21 @@ static inline void add_dst_reg(InsnFields *f, uint8_t reg_id)
 
 /*
  * Parse x86 register name (without % prefix) to GenericRegId.
- * Handles 64/32/16/8-bit variants and extended registers R8-R15.
+ * Uses hash table for exact matches, with fallback for extended registers,
+ * vector registers, and x87 FP stack (which use prefix/numeric parsing).
  */
 static uint8_t parse_x86_reg(const char *name)
 {
+    uint8_t reg_id;
+
     if (!name || !*name) {
         return REG_NONE;
     }
 
-    /* 64-bit GPRs */
-    if (strcmp(name, "rax") == 0) return REG_GPR0;
-    if (strcmp(name, "rcx") == 0) return REG_GPR1;
-    if (strcmp(name, "rdx") == 0) return REG_GPR2;
-    if (strcmp(name, "rbx") == 0) return REG_GPR3;
-    if (strcmp(name, "rsp") == 0) return REG_SP;
-    if (strcmp(name, "rbp") == 0) return REG_FP_REG;
-    if (strcmp(name, "rsi") == 0) return REG_GPR4;
-    if (strcmp(name, "rdi") == 0) return REG_GPR5;
-
-    /* 32-bit GPRs */
-    if (strcmp(name, "eax") == 0) return REG_GPR0;
-    if (strcmp(name, "ecx") == 0) return REG_GPR1;
-    if (strcmp(name, "edx") == 0) return REG_GPR2;
-    if (strcmp(name, "ebx") == 0) return REG_GPR3;
-    if (strcmp(name, "esp") == 0) return REG_SP;
-    if (strcmp(name, "ebp") == 0) return REG_FP_REG;
-    if (strcmp(name, "esi") == 0) return REG_GPR4;
-    if (strcmp(name, "edi") == 0) return REG_GPR5;
-
-    /* 16-bit GPRs */
-    if (strcmp(name, "ax") == 0) return REG_GPR0;
-    if (strcmp(name, "cx") == 0) return REG_GPR1;
-    if (strcmp(name, "dx") == 0) return REG_GPR2;
-    if (strcmp(name, "bx") == 0) return REG_GPR3;
-    if (strcmp(name, "sp") == 0) return REG_SP;
-    if (strcmp(name, "bp") == 0) return REG_FP_REG;
-    if (strcmp(name, "si") == 0) return REG_GPR4;
-    if (strcmp(name, "di") == 0) return REG_GPR5;
-
-    /* 8-bit GPRs */
-    if (strcmp(name, "al") == 0 || strcmp(name, "ah") == 0) return REG_GPR0;
-    if (strcmp(name, "cl") == 0 || strcmp(name, "ch") == 0) return REG_GPR1;
-    if (strcmp(name, "dl") == 0 || strcmp(name, "dh") == 0) return REG_GPR2;
-    if (strcmp(name, "bl") == 0 || strcmp(name, "bh") == 0) return REG_GPR3;
-    if (strcmp(name, "spl") == 0) return REG_SP;
-    if (strcmp(name, "bpl") == 0) return REG_FP_REG;
-    if (strcmp(name, "sil") == 0) return REG_GPR4;
-    if (strcmp(name, "dil") == 0) return REG_GPR5;
+    /* O(1) hash lookup for all known exact register names */
+    if (reg_hash_lookup(x86_reg_ht, name, &reg_id)) {
+        return reg_id;
+    }
 
     /* Extended registers R8-R15 (with optional b/w/d suffix) */
     if (name[0] == 'r' && name[1] >= '0' && name[1] <= '9') {
@@ -335,20 +408,17 @@ static uint8_t parse_x86_reg(const char *name)
     /* x87 FP stack */
     if (strncmp(name, "st", 2) == 0) return REG_FPR0;
 
-    /* Special registers */
-    if (strcmp(name, "rip") == 0 || strcmp(name, "eip") == 0) return REG_IP;
-    if (strcmp(name, "rflags") == 0 || strcmp(name, "eflags") == 0) {
-        return REG_FLAGS;
-    }
-
     return REG_NONE;
 }
 
 /*
  * Parse AArch64 register name to GenericRegId.
+ * Uses hash table for special names, with numeric parsing for x/w/vector regs.
  */
 static uint8_t parse_aarch64_reg(const char *name)
 {
+    uint8_t reg_id;
+
     if (!name || !*name) {
         return REG_NONE;
     }
@@ -360,19 +430,10 @@ static uint8_t parse_aarch64_reg(const char *name)
         if (n >= 0 && n <= 30) return REG_GPR0 + (uint8_t)n;
     }
 
-    /* Zero register - reads as zero, no dependency */
-    if (strcmp(name, "xzr") == 0 || strcmp(name, "wzr") == 0) {
-        return REG_NONE;
+    /* O(1) hash lookup for special register names (xzr, wzr, sp, lr, fp) */
+    if (reg_hash_lookup(aarch64_reg_ht, name, &reg_id)) {
+        return reg_id;
     }
-
-    /* Stack pointer */
-    if (strcmp(name, "sp") == 0) return REG_SP;
-
-    /* Link register (x30) */
-    if (strcmp(name, "lr") == 0) return REG_LR;
-
-    /* Frame pointer (x29) */
-    if (strcmp(name, "fp") == 0) return REG_FP_REG;
 
     /* Vector/FP: v0-v31, d0-d31, s0-s31, q0-q31, h0-h31, b0-b31 */
     if ((name[0] == 'v' || name[0] == 'd' || name[0] == 's' ||
@@ -387,23 +448,20 @@ static uint8_t parse_aarch64_reg(const char *name)
 
 /*
  * Parse RISC-V register name to GenericRegId.
- * Handles ABI names (a0-a7, s0-s11, t0-t6, etc.) and x-register notation.
+ * Uses hash table for special names, with numeric parsing for t/s/a/x/f regs.
  */
 static uint8_t parse_riscv_reg(const char *name)
 {
+    uint8_t reg_id;
+
     if (!name || !*name) {
         return REG_NONE;
     }
 
-    /* Zero register: reads as zero, no dependency */
-    if (strcmp(name, "zero") == 0) return REG_NONE;
-
-    /* Special named registers */
-    if (strcmp(name, "ra") == 0) return REG_LR;       /* x1 */
-    if (strcmp(name, "sp") == 0) return REG_SP;        /* x2 */
-    if (strcmp(name, "gp") == 0) return REG_GPR3;      /* x3 */
-    if (strcmp(name, "tp") == 0) return REG_GPR4;      /* x4 */
-    if (strcmp(name, "fp") == 0) return REG_FP_REG;    /* x8 = s0 */
+    /* O(1) hash lookup for special register names (zero, ra, sp, gp, tp, fp) */
+    if (reg_hash_lookup(riscv_reg_ht, name, &reg_id)) {
+        return reg_id;
+    }
 
     /* Temporary registers: t0-t6 */
     if (name[0] == 't' && name[1] >= '0' && name[1] <= '6' &&
@@ -468,11 +526,13 @@ static uint8_t parse_riscv_reg(const char *name)
 
 /*
  * Parse MIPS register name to GenericRegId.
- * Handles ABI names (default oldabi) and numeric $N notation.
+ * Uses hash table for special names, with numeric parsing for indexed regs.
  * QEMU's MIPS disassembler outputs names without $ prefix for GPRs.
  */
 static uint8_t parse_mips_reg(const char *name)
 {
+    uint8_t reg_id;
+
     if (!name || !*name) {
         return REG_NONE;
     }
@@ -481,15 +541,10 @@ static uint8_t parse_mips_reg(const char *name)
     const char *p = name;
     if (*p == '$') p++;
 
-    /* Zero register */
-    if (strcmp(p, "zero") == 0 || strcmp(p, "0") == 0) return REG_NONE;
-
-    /* Named special registers */
-    if (strcmp(p, "at") == 0) return REG_GPR1;         /* $1 */
-    if (strcmp(p, "sp") == 0) return REG_SP;            /* $29 */
-    if (strcmp(p, "fp") == 0) return REG_FP_REG;        /* $30 */
-    if (strcmp(p, "ra") == 0) return REG_LR;            /* $31 */
-    if (strcmp(p, "gp") == 0) return REG_GPR28;         /* $28 */
+    /* O(1) hash lookup for special register names (zero, at, sp, fp, ra, gp) */
+    if (reg_hash_lookup(mips_reg_ht, p, &reg_id)) {
+        return reg_id;
+    }
 
     /* Return values: v0-v1 */
     if (p[0] == 'v' && (p[1] == '0' || p[1] == '1') && p[2] == '\0') {
@@ -840,18 +895,17 @@ static const MnemonicEntry mnemonic_table[] = {
 };
 
 /*
- * Look up a base mnemonic in the table.
+ * Look up a base mnemonic in the hash table (O(1) average case).
  * Returns true if found, filling opcode and branch_type.
  */
 static bool lookup_mnemonic(const char *mnem, uint8_t *opcode,
                             uint8_t *branch_type)
 {
-    for (int i = 0; mnemonic_table[i].name; i++) {
-        if (strcmp(mnem, mnemonic_table[i].name) == 0) {
-            *opcode = mnemonic_table[i].opcode;
-            *branch_type = mnemonic_table[i].branch_type;
-            return true;
-        }
+    const MnemonicEntry *entry = g_hash_table_lookup(mnemonic_ht, mnem);
+    if (entry) {
+        *opcode = entry->opcode;
+        *branch_type = entry->branch_type;
+        return true;
     }
     return false;
 }
@@ -3753,6 +3807,11 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     }
     g_hash_table_unref(template_map);
     g_hash_table_unref(branch_map);
+    g_hash_table_unref(x86_reg_ht);
+    g_hash_table_unref(aarch64_reg_ht);
+    g_hash_table_unref(riscv_reg_ht);
+    g_hash_table_unref(mips_reg_ht);
+    g_hash_table_unref(mnemonic_ht);
     qemu_plugin_scoreboard_free(vcpu_sb);
     g_free(output_base_path);
     g_free(program_name);
@@ -3846,6 +3905,18 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                                          NULL, bb_template_free);
     branch_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
                                        NULL, g_free);
+
+    /* Build per-ISA register and mnemonic hash tables for O(1) lookup */
+    x86_reg_ht = build_reg_hash_table(x86_reg_entries);
+    aarch64_reg_ht = build_reg_hash_table(aarch64_reg_entries);
+    riscv_reg_ht = build_reg_hash_table(riscv_reg_entries);
+    mips_reg_ht = build_reg_hash_table(mips_reg_entries);
+
+    mnemonic_ht = g_hash_table_new(g_str_hash, g_str_equal);
+    for (int i = 0; mnemonic_table[i].name; i++) {
+        g_hash_table_insert(mnemonic_ht, (gpointer)mnemonic_table[i].name,
+                            (gpointer)&mnemonic_table[i]);
+    }
 
     /* Initialize per-vCPU scoreboard */
     vcpu_sb = qemu_plugin_scoreboard_new(sizeof(VCPUScoreBoard));

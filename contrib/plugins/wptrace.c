@@ -5,7 +5,8 @@
  *
  *   HEADER: A map of BB templates encoding all unique basic blocks within
  *           the traced window, with static instruction context (PCs, sizes,
- *           raw instruction bytes, and decoded x86 fields when applicable).
+ *           ISA-agnostic decoded instruction fields (operation type,
+ *           branch type, source/destination registers).
  *
  *   BODY:   The execution trace of BBs as they executed on the correct-path,
  *           with dynamic context (branch targets, memory addresses) and
@@ -19,9 +20,9 @@
  *   - BB template deduplication (unique BBs stored once in header)
  *   - Wrong-path execution with real IF and DF addresses
  *   - Start/stop tracing by instruction number
- *   - x86 instruction field extraction (prefixes, opcode, ModRM, SIB, disp, imm)
+ *   - ISA-agnostic instruction decode (x86 currently supported)
  *   - Compact LEB128 variable-length integer encoding
- *   - ISA-agnostic core (x86 decode is optional enrichment)
+ *   - Extensible: additional ISA decoders can be added for ARM, RISC-V, etc.
  *
  * Usage:
  *   -plugin wptrace[,depth=N][,outfile=PATH][,debug=1]
@@ -72,57 +73,273 @@ static guint simpoints_current_idx = 0;
 #define MAX_INSN_BYTES 16
 
 /* Magic for binary format */
-#define WPT_MAGIC  0x54505702  /* 'T','P','W',0x02 little-endian - version 2 */
+#define WPT_MAGIC  0x54505703  /* 'T','P','W',0x03 little-endian - version 3 */
 
-/* ========================= Data Structures ========================= */
+/* ========================= ISA-Agnostic Instruction Fields ========================= */
 
-/* Decoded x86 instruction fields for trace enrichment */
-typedef struct {
-    uint8_t n_prefixes;         /* Number of prefix bytes */
-    uint8_t opcode_len;         /* Opcode length (1-3 bytes) */
-    uint8_t opcode[3];          /* Opcode bytes */
-    bool has_modrm;             /* Has ModRM byte */
-    uint8_t modrm;              /* ModRM byte */
-    bool has_sib;               /* Has SIB byte */
-    uint8_t sib;                /* SIB byte */
-    uint8_t disp_size;          /* Displacement size (0/1/2/4) */
-    int32_t disp;               /* Displacement value */
-    uint8_t imm_size;           /* Immediate size (0/1/2/4/8) */
-    int64_t imm;                /* Immediate value */
-} X86InsnFields;
+/* Maximum source/destination registers per instruction */
+#define MAX_SRC_REGS 4
+#define MAX_DST_REGS 4
 
 /*
- * Lightweight x86 instruction field extraction.
- * Best-effort decoder for trace enrichment, not a full disassembler.
+ * ISA-agnostic generic opcodes.
+ * Each value encodes the generic function of an instruction's operation,
+ * consistent across all ISAs supported by QEMU.
  */
-/* Sign-extend a value of @nbytes width to a 64-bit signed integer */
+enum GenericOpcode {
+    GEN_OP_UNKNOWN = 0,
+    GEN_OP_INT_ADD = 1,
+    GEN_OP_INT_SUB = 2,
+    GEN_OP_INT_MUL = 3,
+    GEN_OP_INT_DIV = 4,
+    GEN_OP_AND = 5,
+    GEN_OP_OR = 6,
+    GEN_OP_XOR = 7,
+    GEN_OP_NOT = 8,
+    GEN_OP_SHL = 9,
+    GEN_OP_SHR = 10,
+    GEN_OP_SAR = 11,
+    GEN_OP_ROL = 12,
+    GEN_OP_ROR = 13,
+    GEN_OP_MOV = 14,
+    GEN_OP_LOAD = 15,
+    GEN_OP_STORE = 16,
+    GEN_OP_PUSH = 17,
+    GEN_OP_POP = 18,
+    GEN_OP_LEA = 19,
+    GEN_OP_MOVSX = 20,
+    GEN_OP_MOVZX = 21,
+    GEN_OP_XCHG = 22,
+    GEN_OP_CMP = 23,
+    GEN_OP_TEST = 24,
+    GEN_OP_BRANCH = 25,
+    GEN_OP_CALL = 26,
+    GEN_OP_RET = 27,
+    GEN_OP_FP_ADD = 28,
+    GEN_OP_FP_SUB = 29,
+    GEN_OP_FP_MUL = 30,
+    GEN_OP_FP_DIV = 31,
+    GEN_OP_FP_SQRT = 32,
+    GEN_OP_FP_MOV = 33,
+    GEN_OP_FP_CVT = 34,
+    GEN_OP_FP_CMP = 35,
+    GEN_OP_VEC_ADD = 36,
+    GEN_OP_VEC_SUB = 37,
+    GEN_OP_VEC_MUL = 38,
+    GEN_OP_VEC_MOV = 39,
+    GEN_OP_VEC_SHUF = 40,
+    GEN_OP_VEC_LOGIC = 41,
+    GEN_OP_NOP = 42,
+    GEN_OP_SYSCALL = 43,
+    GEN_OP_FENCE = 44,
+    GEN_OP_CMOV = 45,
+    GEN_OP_SETCC = 46,
+    GEN_OP_INT_ADC = 47,
+    GEN_OP_INT_SBB = 48,
+    GEN_OP_NEG = 49,
+    GEN_OP_INC = 50,
+    GEN_OP_DEC = 51,
+    GEN_OP_COUNT
+};
+
+/*
+ * Branch type classification.
+ */
+enum BranchType {
+    BRANCH_NONE = 0,
+    BRANCH_DIRECT_JUMP = 1,
+    BRANCH_INDIRECT_JUMP = 2,
+    BRANCH_DIRECT_CALL = 3,
+    BRANCH_INDIRECT_CALL = 4,
+    BRANCH_RETURN = 5,
+    BRANCH_COND_DIRECT = 6,
+    BRANCH_SYSCALL_TYPE = 7,
+};
+
+/*
+ * ISA-agnostic register IDs.
+ * Consistent numbering across ISAs with reserved special register IDs.
+ */
+enum GenericRegId {
+    REG_NONE = 0,
+    /* General-purpose integer registers: 1-32 */
+    REG_GPR0 = 1,
+    REG_GPR1 = 2,
+    REG_GPR2 = 3,
+    REG_GPR3 = 4,
+    REG_GPR4 = 5,
+    REG_GPR5 = 6,
+    REG_GPR6 = 7,
+    REG_GPR7 = 8,
+    REG_GPR8 = 9,
+    REG_GPR9 = 10,
+    REG_GPR10 = 11,
+    REG_GPR11 = 12,
+    REG_GPR12 = 13,
+    REG_GPR13 = 14,
+    REG_GPR14 = 15,
+    REG_GPR15 = 16,
+    REG_GPR16 = 17,
+    REG_GPR17 = 18,
+    REG_GPR18 = 19,
+    REG_GPR19 = 20,
+    REG_GPR20 = 21,
+    REG_GPR21 = 22,
+    REG_GPR22 = 23,
+    REG_GPR23 = 24,
+    REG_GPR24 = 25,
+    REG_GPR25 = 26,
+    REG_GPR26 = 27,
+    REG_GPR27 = 28,
+    REG_GPR28 = 29,
+    REG_GPR29 = 30,
+    REG_GPR30 = 31,
+    REG_GPR31 = 32,
+    /* Floating-point registers: 33-64 */
+    REG_FPR0 = 33,
+    /* FPR1-FPR31 follow sequentially (34-64) */
+    /* Vector/SIMD registers: 65-96 */
+    REG_VEC0 = 65,
+    /* VEC1-VEC31 follow sequentially (66-96) */
+    /* Special registers: 250-254 */
+    REG_SP = 250,
+    REG_FLAGS = 251,
+    REG_IP = 252,
+    REG_LR = 253,
+    REG_FP_REG = 254,
+};
+
+/*
+ * Decoded ISA-agnostic instruction fields.
+ * Standardized per-instruction representation stored in BB templates.
+ */
+typedef struct {
+    uint8_t opcode;                 /* GenericOpcode */
+    uint8_t branch_type;            /* BranchType (BRANCH_NONE if not branch) */
+    uint8_t n_src_regs;
+    uint8_t n_dst_regs;
+    uint8_t src_regs[MAX_SRC_REGS]; /* Source register IDs (GenericRegId) */
+    uint8_t dst_regs[MAX_DST_REGS]; /* Destination register IDs (GenericRegId) */
+    bool has_immediate;
+    int64_t immediate;
+} InsnFields;
+
+/* ========================= x86 -> Generic Decode ========================= */
+
 static inline int64_t sign_extend(uint64_t val, uint8_t nbytes)
 {
     switch (nbytes) {
-    case 1: return (int64_t)(int8_t)(uint8_t)val;
-    case 2: return (int64_t)(int16_t)(uint16_t)val;
-    case 4: return (int64_t)(int32_t)(uint32_t)val;
+    case 1: return (int64_t)(int8_t)val;
+    case 2: return (int64_t)(int16_t)val;
+    case 4: return (int64_t)(int32_t)val;
+    case 8: return (int64_t)val;
     default: return (int64_t)val;
     }
 }
 
-static void decode_x86_insn(const uint8_t *bytes, uint32_t len,
-                             X86InsnFields *out)
+static inline void add_src_reg(InsnFields *f, uint8_t reg_id)
 {
-    memset(out, 0, sizeof(*out));
-    uint32_t pos = 0;
+    if (reg_id == REG_NONE || f->n_src_regs >= MAX_SRC_REGS) {
+        return;
+    }
+    for (uint8_t i = 0; i < f->n_src_regs; i++) {
+        if (f->src_regs[i] == reg_id) {
+            return;
+        }
+    }
+    f->src_regs[f->n_src_regs++] = reg_id;
+}
 
-    if (len == 0) {
+static inline void add_dst_reg(InsnFields *f, uint8_t reg_id)
+{
+    if (reg_id == REG_NONE || f->n_dst_regs >= MAX_DST_REGS) {
+        return;
+    }
+    for (uint8_t i = 0; i < f->n_dst_regs; i++) {
+        if (f->dst_regs[i] == reg_id) {
+            return;
+        }
+    }
+    f->dst_regs[f->n_dst_regs++] = reg_id;
+}
+
+/*
+ * x86 GPR index (0-15) to GenericRegId.
+ * x86-64: 0=RAX 1=RCX 2=RDX 3=RBX 4=RSP 5=RBP 6=RSI 7=RDI 8-15=R8-R15
+ */
+static uint8_t x86_gpr_to_generic(uint8_t x86_reg)
+{
+    static const uint8_t map[16] = {
+        1,    /* 0: RAX -> GPR0 */
+        2,    /* 1: RCX -> GPR1 */
+        3,    /* 2: RDX -> GPR2 */
+        4,    /* 3: RBX -> GPR3 */
+        250,  /* 4: RSP -> REG_SP */
+        254,  /* 5: RBP -> REG_FP_REG */
+        5,    /* 6: RSI -> GPR4 */
+        6,    /* 7: RDI -> GPR5 */
+        7,    /* 8: R8  -> GPR6 */
+        8,    /* 9: R9  -> GPR7 */
+        9,    /* 10: R10 -> GPR8 */
+        10,   /* 11: R11 -> GPR9 */
+        11,   /* 12: R12 -> GPR10 */
+        12,   /* 13: R13 -> GPR11 */
+        13,   /* 14: R14 -> GPR12 */
+        14,   /* 15: R15 -> GPR13 */
+    };
+    return (x86_reg < 16) ? map[x86_reg] : REG_NONE;
+}
+
+static inline uint8_t x86_xmm_to_generic(uint8_t x86_reg)
+{
+    return (x86_reg < 32) ? (REG_VEC0 + x86_reg) : REG_NONE;
+}
+
+/* Internal x86 decode state */
+typedef struct {
+    uint8_t rex;
+    bool has_rex;
+    bool has_66;
+    bool has_f2;
+    bool has_f3;
+    uint8_t opcode_bytes[3];
+    uint8_t opcode_len;
+    bool is_twobyte;
+    bool has_modrm;
+    uint8_t modrm;
+    bool has_sib;
+    uint8_t sib;
+    uint8_t disp_size;
+    int32_t disp;
+    uint8_t imm_size;
+    int64_t imm;
+} X86DecodeState;
+
+static void x86_raw_decode(const uint8_t *bytes, uint32_t len,
+                            X86DecodeState *s)
+{
+    if (!bytes || len == 0) {
         return;
     }
 
-    /* Scan prefix bytes */
+    uint32_t pos = 0;
+
+    /* Scan prefixes */
     while (pos < len) {
         uint8_t b = bytes[pos];
-        if (b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 ||
-            b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 ||
-            b == 0x64 || b == 0x65 || (b >= 0x40 && b <= 0x4F)) {
-            out->n_prefixes++;
+        if (b == 0x66) {
+            s->has_66 = true; pos++;
+        } else if (b == 0xF2) {
+            s->has_f2 = true; pos++;
+        } else if (b == 0xF3) {
+            s->has_f3 = true; pos++;
+        } else if (b == 0x67 || b == 0xF0 ||
+                   (b >= 0x26 && b <= 0x3E && (b & 0x07) == 0x06) ||
+                   b == 0x64 || b == 0x65) {
+            pos++;
+        } else if ((b & 0xF0) == 0x40) {
+            s->has_rex = true;
+            s->rex = b;
             pos++;
         } else {
             break;
@@ -134,199 +351,986 @@ static void decode_x86_insn(const uint8_t *bytes, uint32_t len,
     }
 
     /* Read opcode */
-    out->opcode[0] = bytes[pos++];
-    out->opcode_len = 1;
+    uint8_t op1 = bytes[pos++];
+    s->opcode_bytes[0] = op1;
+    s->opcode_len = 1;
 
-    if (out->opcode[0] == 0x0F && pos < len) {
-        out->opcode[1] = bytes[pos++];
-        out->opcode_len = 2;
+    if (op1 == 0x0F && pos < len) {
+        s->is_twobyte = true;
+        uint8_t op2 = bytes[pos++];
+        s->opcode_bytes[1] = op2;
+        s->opcode_len = 2;
 
-        if ((out->opcode[1] == 0x38 || out->opcode[1] == 0x3A) &&
-            pos < len) {
-            out->opcode[2] = bytes[pos++];
-            out->opcode_len = 3;
+        if ((op2 == 0x38 || op2 == 0x3A) && pos < len) {
+            s->opcode_bytes[2] = bytes[pos++];
+            s->opcode_len = 3;
         }
     }
 
-    /*
-     * Determine if opcode requires ModRM.
-     * For 2/3-byte opcodes, most require ModRM.
-     * For 1-byte opcodes, use a simplified check.
-     */
-    bool needs_modrm = false;
-    uint8_t imm_bytes = 0;
+    /* Determine ModRM presence and immediate size */
+    bool has_modrm = false;
+    uint8_t imm_size = 0;
 
-    if (out->opcode_len >= 2) {
-        /* Most 2/3-byte opcodes have ModRM */
-        needs_modrm = true;
-
-        /* 2-byte conditional jumps (0F 80-8F) do not have ModRM */
-        if (out->opcode_len == 2 &&
-            out->opcode[1] >= 0x80 && out->opcode[1] <= 0x8F) {
-            needs_modrm = false;
-            imm_bytes = 4; /* rel32 */
+    if (s->opcode_len >= 2) {
+        has_modrm = true;
+        if (s->opcode_len == 2) {
+            uint8_t op2 = s->opcode_bytes[1];
+            if (op2 >= 0x80 && op2 <= 0x8F) {
+                has_modrm = false;
+                imm_size = 4;
+            }
         }
     } else {
-        uint8_t op = out->opcode[0];
-
-        /* Opcodes that generally have ModRM byte */
-        if ((op <= 0x03) ||                /* ADD r/m, r / ADD r, r/m */
-            (op >= 0x08 && op <= 0x0B) || /* OR */
-            (op >= 0x10 && op <= 0x13) || /* ADC */
-            (op >= 0x18 && op <= 0x1B) || /* SBB */
-            (op >= 0x20 && op <= 0x23) || /* AND */
-            (op >= 0x28 && op <= 0x2B) || /* SUB */
-            (op >= 0x30 && op <= 0x33) || /* XOR */
-            (op >= 0x38 && op <= 0x3B) || /* CMP */
-            (op >= 0x80 && op <= 0x83) || /* Grp1 imm */
-            op == 0x84 || op == 0x85 ||   /* TEST */
-            (op >= 0x86 && op <= 0x8F) || /* XCHG, LEA, MOV, POP */
-            op == 0xC0 || op == 0xC1 ||   /* Shift Grp2 imm8 */
-            op == 0xC6 || op == 0xC7 ||   /* MOV imm */
-            op == 0xD0 || op == 0xD1 ||   /* Shift Grp2 1 */
-            op == 0xD2 || op == 0xD3 ||   /* Shift Grp2 CL */
-            op == 0xF6 || op == 0xF7 ||   /* Grp3 */
-            op == 0xFE || op == 0xFF ||   /* Grp4/5 */
-            op == 0x63 || op == 0x69 || op == 0x6B) { /* MOVSXD, IMUL */
-            needs_modrm = true;
-        }
-
-        /* Determine immediate size for 1-byte opcodes */
-        if (op >= 0x04 && op <= 0x05) {
-            /* ADD AL/eAX, imm */
-            imm_bytes = (op & 1) ? 4 : 1;
-        } else if (op >= 0x0C && op <= 0x0D) {
-            imm_bytes = (op & 1) ? 4 : 1; /* OR AL/eAX */
-        } else if (op >= 0x14 && op <= 0x15) {
-            imm_bytes = (op & 1) ? 4 : 1; /* ADC AL/eAX */
-        } else if (op >= 0x1C && op <= 0x1D) {
-            imm_bytes = (op & 1) ? 4 : 1; /* SBB AL/eAX */
-        } else if (op >= 0x24 && op <= 0x25) {
-            imm_bytes = (op & 1) ? 4 : 1; /* AND AL/eAX */
-        } else if (op >= 0x2C && op <= 0x2D) {
-            imm_bytes = (op & 1) ? 4 : 1; /* SUB AL/eAX */
-        } else if (op >= 0x34 && op <= 0x35) {
-            imm_bytes = (op & 1) ? 4 : 1; /* XOR AL/eAX */
-        } else if (op >= 0x3C && op <= 0x3D) {
-            imm_bytes = (op & 1) ? 4 : 1; /* CMP AL/eAX */
-        } else if (op == 0x68) {
-            imm_bytes = 4; /* PUSH imm32 */
-        } else if (op == 0x6A) {
-            imm_bytes = 1; /* PUSH imm8 */
-        } else if (op == 0x69) {
-            imm_bytes = 4; /* IMUL r, r/m, imm32 */
-        } else if (op == 0x6B) {
-            imm_bytes = 1; /* IMUL r, r/m, imm8 */
-        } else if (op >= 0x70 && op <= 0x7F) {
-            imm_bytes = 1; /* Jcc rel8 */
-        } else if (op == 0x80 || op == 0x82) {
-            imm_bytes = 1; /* Grp1 r/m8, imm8 */
-        } else if (op == 0x81) {
-            imm_bytes = 4; /* Grp1 r/m, imm32 */
-        } else if (op == 0x83) {
-            imm_bytes = 1; /* Grp1 r/m, imm8 */
-        } else if (op == 0xA8) {
-            imm_bytes = 1; /* TEST AL, imm8 */
-        } else if (op == 0xA9) {
-            imm_bytes = 4; /* TEST eAX, imm32 */
-        } else if (op >= 0xB0 && op <= 0xB7) {
-            imm_bytes = 1; /* MOV r8, imm8 */
-        } else if (op >= 0xB8 && op <= 0xBF) {
-            imm_bytes = 4; /* MOV r, imm32 (or imm64 with REX.W) */
-        } else if (op == 0xC0 || op == 0xC1) {
-            imm_bytes = 1; /* Shift Grp2 imm8 */
-        } else if (op == 0xC2) {
-            imm_bytes = 2; /* RET imm16 */
-        } else if (op == 0xC6) {
-            imm_bytes = 1; /* MOV r/m8, imm8 */
-        } else if (op == 0xC7) {
-            imm_bytes = 4; /* MOV r/m, imm32 */
-        } else if (op == 0xCD) {
-            imm_bytes = 1; /* INT imm8 */
-        } else if (op == 0xE8 || op == 0xE9) {
-            imm_bytes = 4; /* CALL/JMP rel32 */
-        } else if (op == 0xEB) {
-            imm_bytes = 1; /* JMP rel8 */
-        } else if (op == 0xE4 || op == 0xE5 || op == 0xE6 || op == 0xE7) {
-            imm_bytes = 1; /* IN/OUT imm8 */
+        switch (op1) {
+        case 0x00 ... 0x03: case 0x08 ... 0x0B:
+        case 0x10 ... 0x13: case 0x18 ... 0x1B:
+        case 0x20 ... 0x23: case 0x28 ... 0x2B:
+        case 0x30 ... 0x33: case 0x38 ... 0x3B:
+            has_modrm = true;
+            break;
+        case 0x04: case 0x0C: case 0x14: case 0x1C:
+        case 0x24: case 0x2C: case 0x34: case 0x3C:
+            imm_size = 1; break;
+        case 0x05: case 0x0D: case 0x15: case 0x1D:
+        case 0x25: case 0x2D: case 0x35: case 0x3D:
+            imm_size = 4; break;
+        case 0x80: imm_size = 1; has_modrm = true; break;
+        case 0x81: imm_size = 4; has_modrm = true; break;
+        case 0x83: imm_size = 1; has_modrm = true; break;
+        case 0x84: case 0x85: has_modrm = true; break;
+        case 0xA8: imm_size = 1; break;
+        case 0xA9: imm_size = 4; break;
+        case 0x86: case 0x87: has_modrm = true; break;
+        case 0x88 ... 0x8B: has_modrm = true; break;
+        case 0x8C: case 0x8E: has_modrm = true; break;
+        case 0x8D: has_modrm = true; break;
+        case 0xA0: case 0xA1: case 0xA2: case 0xA3: imm_size = 4; break;
+        case 0xB0 ... 0xB7: imm_size = 1; break;
+        case 0xB8 ... 0xBF: imm_size = 4; break;
+        case 0xC0: case 0xC1: has_modrm = true; imm_size = 1; break;
+        case 0xC2: imm_size = 2; break;
+        case 0xC6: has_modrm = true; imm_size = 1; break;
+        case 0xC7: has_modrm = true; imm_size = 4; break;
+        case 0xD0 ... 0xD3: has_modrm = true; break;
+        case 0xE4: case 0xE5: case 0xE6: case 0xE7: imm_size = 1; break;
+        case 0xE8: imm_size = 4; break;
+        case 0xE9: imm_size = 4; break;
+        case 0xEB: imm_size = 1; break;
+        case 0x70 ... 0x7F: imm_size = 1; break;
+        case 0xF6: case 0xF7: has_modrm = true; break;
+        case 0xFE: case 0xFF: has_modrm = true; break;
+        default: break;
         }
     }
 
-    /* Read ModRM if needed */
-    if (needs_modrm && pos < len) {
-        out->has_modrm = true;
-        out->modrm = bytes[pos++];
+    /* Read ModRM / SIB / Displacement */
+    if (has_modrm && pos < len) {
+        s->has_modrm = true;
+        s->modrm = bytes[pos++];
+        uint8_t mod = (s->modrm >> 6) & 3;
+        uint8_t rm = s->modrm & 7;
 
-        uint8_t mod = (out->modrm >> 6) & 3;
-        uint8_t rm = out->modrm & 7;
-
-        /* SIB byte: present when mod != 11 and rm == 4 */
         if (mod != 3 && rm == 4 && pos < len) {
-            out->has_sib = true;
-            out->sib = bytes[pos++];
+            s->has_sib = true;
+            s->sib = bytes[pos++];
         }
 
-        /* Displacement */
+        uint8_t disp_size = 0;
         if (mod == 1) {
-            out->disp_size = 1;
+            disp_size = 1;
         } else if (mod == 2) {
-            out->disp_size = 4;
+            disp_size = 4;
         } else if (mod == 0 && rm == 5) {
-            out->disp_size = 4; /* RIP-relative or disp32 */
+            disp_size = 4;
+        }
+        if (s->has_sib && mod == 0 && (s->sib & 7) == 5) {
+            disp_size = 4;
         }
 
-        /* Read displacement bytes */
-        if (out->disp_size > 0 && pos + out->disp_size <= len) {
-            uint32_t d = 0;
-            for (uint8_t i = 0; i < out->disp_size; i++) {
-                d |= (uint32_t)bytes[pos++] << (i * 8);
+        s->disp_size = disp_size;
+        if (disp_size > 0 && pos + disp_size <= len) {
+            uint64_t dval = 0;
+            for (uint8_t i = 0; i < disp_size; i++) {
+                dval |= (uint64_t)bytes[pos++] << (i * 8);
             }
-            out->disp = (int32_t)sign_extend(d, out->disp_size);
+            s->disp = (int32_t)sign_extend(dval, disp_size);
         }
 
-        /* Determine immediate for ModRM opcodes that also have immediates */
-        if (out->opcode_len == 1) {
-            uint8_t op = out->opcode[0];
-            if (op == 0xF6) {
-                /* Grp3: TEST r/m8, imm8 when reg==0 */
-                uint8_t reg = (out->modrm >> 3) & 7;
-                if (reg == 0) {
-                    imm_bytes = 1;
-                }
-            } else if (op == 0xF7) {
-                /* Grp3: TEST r/m, imm32 when reg==0 */
-                uint8_t reg = (out->modrm >> 3) & 7;
-                if (reg == 0) {
-                    imm_bytes = 4;
-                }
+        if (!s->is_twobyte && (op1 == 0xF6 || op1 == 0xF7)) {
+            uint8_t reg = (s->modrm >> 3) & 7;
+            if (reg == 0) {
+                imm_size = (op1 == 0xF6) ? 1 : 4;
             }
         }
     }
 
-    /* Read immediate bytes */
-    if (imm_bytes > 0 && pos + imm_bytes <= len) {
-        out->imm_size = imm_bytes;
-        uint64_t imm = 0;
-        for (uint8_t i = 0; i < imm_bytes; i++) {
-            imm |= (uint64_t)bytes[pos++] << (i * 8);
+    /* Read immediate */
+    s->imm_size = imm_size;
+    if (imm_size > 0 && pos + imm_size <= len) {
+        uint64_t ival = 0;
+        for (uint8_t i = 0; i < imm_size; i++) {
+            ival |= (uint64_t)bytes[pos++] << (i * 8);
         }
-        out->imm = sign_extend(imm, imm_bytes);
+        s->imm = sign_extend(ival, imm_size);
+    }
+}
+
+/* Add memory addressing registers as source dependencies */
+static void x86_add_mem_addr_regs(const X86DecodeState *s, InsnFields *out)
+{
+    if (!s->has_modrm) {
+        return;
+    }
+    uint8_t mod = (s->modrm >> 6) & 3;
+    uint8_t rm = s->modrm & 7;
+    if (s->has_rex && (s->rex & 0x01)) {
+        rm |= 8;
+    }
+
+    if (mod == 3) {
+        return;
+    }
+
+    if (s->has_sib) {
+        uint8_t base = s->sib & 7;
+        uint8_t index = (s->sib >> 3) & 7;
+        if (s->has_rex) {
+            if (s->rex & 0x01) {
+                base |= 8;
+            }
+            if (s->rex & 0x02) {
+                index |= 8;
+            }
+        }
+        if (!(base == 5 && mod == 0)) {
+            add_src_reg(out, x86_gpr_to_generic(base));
+        }
+        if (index != 4) {
+            add_src_reg(out, x86_gpr_to_generic(index));
+        }
+    } else {
+        if (!(rm == 5 && mod == 0)) {
+            add_src_reg(out, x86_gpr_to_generic(rm));
+        }
     }
 }
 
 /*
+ * Map x86 decode state to ISA-agnostic InsnFields.
+ */
+static void x86_map_to_generic(const X86DecodeState *s, InsnFields *out)
+{
+    uint8_t op1 = s->opcode_bytes[0];
+
+    uint8_t reg_idx = 0, rm_idx = 0;
+    bool rm_is_reg = false;
+
+    if (s->has_modrm) {
+        uint8_t mod = (s->modrm >> 6) & 3;
+        reg_idx = (s->modrm >> 3) & 7;
+        rm_idx = s->modrm & 7;
+
+        if (s->has_rex) {
+            if (s->rex & 0x04) {
+                reg_idx |= 8;
+            }
+            if (s->rex & 0x01) {
+                rm_idx |= 8;
+            }
+        }
+
+        rm_is_reg = (mod == 3);
+    }
+
+    uint8_t reg_gen = x86_gpr_to_generic(reg_idx);
+    uint8_t rm_gen = rm_is_reg ? x86_gpr_to_generic(rm_idx) : REG_NONE;
+
+    if (s->imm_size > 0) {
+        out->has_immediate = true;
+        out->immediate = s->imm;
+    }
+
+    if (!s->is_twobyte) {
+        uint8_t alu_group = (op1 >> 3) & 7;
+        bool d_bit = (op1 & 0x02) != 0;
+
+        switch (op1) {
+        case 0x00 ... 0x03:
+        case 0x08 ... 0x0B:
+        case 0x10 ... 0x13:
+        case 0x18 ... 0x1B:
+        case 0x20 ... 0x23:
+        case 0x28 ... 0x2B:
+        case 0x30 ... 0x33:
+        case 0x38 ... 0x3B:
+        {
+            static const uint8_t grp_ops[] = {
+                GEN_OP_INT_ADD, GEN_OP_OR, GEN_OP_INT_ADC, GEN_OP_INT_SBB,
+                GEN_OP_AND, GEN_OP_INT_SUB, GEN_OP_XOR, GEN_OP_CMP
+            };
+            out->opcode = grp_ops[alu_group];
+            if (d_bit) {
+                add_src_reg(out, reg_gen);
+                if (rm_is_reg) {
+                    add_src_reg(out, rm_gen);
+                } else {
+                    x86_add_mem_addr_regs(s, out);
+                }
+                if (out->opcode != GEN_OP_CMP) {
+                    add_dst_reg(out, reg_gen);
+                }
+            } else {
+                add_src_reg(out, reg_gen);
+                if (rm_is_reg) {
+                    add_src_reg(out, rm_gen);
+                    if (out->opcode != GEN_OP_CMP) {
+                        add_dst_reg(out, rm_gen);
+                    }
+                } else {
+                    x86_add_mem_addr_regs(s, out);
+                }
+            }
+            add_dst_reg(out, REG_FLAGS);
+            break;
+        }
+
+        case 0x04: case 0x05:
+        case 0x0C: case 0x0D:
+        case 0x14: case 0x15:
+        case 0x1C: case 0x1D:
+        case 0x24: case 0x25:
+        case 0x2C: case 0x2D:
+        case 0x34: case 0x35:
+        case 0x3C: case 0x3D:
+        {
+            static const uint8_t grp_ops[] = {
+                GEN_OP_INT_ADD, GEN_OP_OR, GEN_OP_INT_ADC, GEN_OP_INT_SBB,
+                GEN_OP_AND, GEN_OP_INT_SUB, GEN_OP_XOR, GEN_OP_CMP
+            };
+            out->opcode = grp_ops[alu_group];
+            add_src_reg(out, REG_GPR0);
+            if (out->opcode != GEN_OP_CMP) {
+                add_dst_reg(out, REG_GPR0);
+            }
+            add_dst_reg(out, REG_FLAGS);
+            break;
+        }
+
+        case 0x80: case 0x81: case 0x83:
+        {
+            static const uint8_t g1_ops[] = {
+                GEN_OP_INT_ADD, GEN_OP_OR, GEN_OP_INT_ADC, GEN_OP_INT_SBB,
+                GEN_OP_AND, GEN_OP_INT_SUB, GEN_OP_XOR, GEN_OP_CMP
+            };
+            uint8_t ext = (s->modrm >> 3) & 7;
+            out->opcode = g1_ops[ext];
+            if (rm_is_reg) {
+                add_src_reg(out, rm_gen);
+                if (out->opcode != GEN_OP_CMP) {
+                    add_dst_reg(out, rm_gen);
+                }
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            add_dst_reg(out, REG_FLAGS);
+            break;
+        }
+
+        case 0x84: case 0x85:
+            out->opcode = GEN_OP_TEST;
+            add_src_reg(out, reg_gen);
+            if (rm_is_reg) {
+                add_src_reg(out, rm_gen);
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            add_dst_reg(out, REG_FLAGS);
+            break;
+
+        case 0xA8: case 0xA9:
+            out->opcode = GEN_OP_TEST;
+            add_src_reg(out, REG_GPR0);
+            add_dst_reg(out, REG_FLAGS);
+            break;
+
+        case 0x86: case 0x87:
+            out->opcode = GEN_OP_XCHG;
+            add_src_reg(out, reg_gen);
+            add_dst_reg(out, reg_gen);
+            if (rm_is_reg) {
+                add_src_reg(out, rm_gen);
+                add_dst_reg(out, rm_gen);
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            break;
+
+        case 0x88: case 0x89:
+            if (rm_is_reg) {
+                out->opcode = GEN_OP_MOV;
+                add_src_reg(out, reg_gen);
+                add_dst_reg(out, rm_gen);
+            } else {
+                out->opcode = GEN_OP_STORE;
+                add_src_reg(out, reg_gen);
+                x86_add_mem_addr_regs(s, out);
+            }
+            break;
+        case 0x8A: case 0x8B:
+            if (rm_is_reg) {
+                out->opcode = GEN_OP_MOV;
+                add_src_reg(out, rm_gen);
+                add_dst_reg(out, reg_gen);
+            } else {
+                out->opcode = GEN_OP_LOAD;
+                add_dst_reg(out, reg_gen);
+                x86_add_mem_addr_regs(s, out);
+            }
+            break;
+
+        case 0x8D:
+            out->opcode = GEN_OP_LEA;
+            add_dst_reg(out, reg_gen);
+            x86_add_mem_addr_regs(s, out);
+            break;
+
+        case 0x90:
+        {
+            uint8_t ext_rm = op1 & 7;
+            if (s->has_rex && (s->rex & 0x01)) {
+                ext_rm |= 8;
+            }
+            if (ext_rm == 0) {
+                out->opcode = GEN_OP_NOP;
+            } else {
+                out->opcode = GEN_OP_XCHG;
+                add_src_reg(out, REG_GPR0);
+                add_dst_reg(out, REG_GPR0);
+                add_src_reg(out, x86_gpr_to_generic(ext_rm));
+                add_dst_reg(out, x86_gpr_to_generic(ext_rm));
+            }
+            break;
+        }
+
+        case 0xA0: case 0xA1:
+            out->opcode = GEN_OP_LOAD;
+            add_dst_reg(out, REG_GPR0);
+            break;
+        case 0xA2: case 0xA3:
+            out->opcode = GEN_OP_STORE;
+            add_src_reg(out, REG_GPR0);
+            break;
+
+        case 0xB0 ... 0xB7:
+        {
+            uint8_t r = (op1 & 7);
+            if (s->has_rex && (s->rex & 0x01)) {
+                r |= 8;
+            }
+            out->opcode = GEN_OP_MOV;
+            add_dst_reg(out, x86_gpr_to_generic(r));
+            break;
+        }
+
+        case 0xB8 ... 0xBF:
+        {
+            uint8_t r = (op1 & 7);
+            if (s->has_rex && (s->rex & 0x01)) {
+                r |= 8;
+            }
+            out->opcode = GEN_OP_MOV;
+            add_dst_reg(out, x86_gpr_to_generic(r));
+            break;
+        }
+
+        case 0xC0: case 0xC1: case 0xD0: case 0xD1:
+        case 0xD2: case 0xD3:
+        {
+            static const uint8_t shift_ops[] = {
+                GEN_OP_ROL, GEN_OP_ROR, GEN_OP_ROL, GEN_OP_ROR,
+                GEN_OP_SHL, GEN_OP_SHR, GEN_OP_SHL, GEN_OP_SAR
+            };
+            uint8_t ext = (s->modrm >> 3) & 7;
+            out->opcode = shift_ops[ext];
+            if (rm_is_reg) {
+                add_src_reg(out, rm_gen);
+                add_dst_reg(out, rm_gen);
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            if (op1 == 0xD2 || op1 == 0xD3) {
+                add_src_reg(out, REG_GPR1);
+            }
+            add_dst_reg(out, REG_FLAGS);
+            break;
+        }
+
+        case 0xC2: case 0xC3:
+            out->opcode = GEN_OP_RET;
+            out->branch_type = BRANCH_RETURN;
+            add_src_reg(out, REG_SP);
+            add_dst_reg(out, REG_SP);
+            add_dst_reg(out, REG_IP);
+            break;
+
+        case 0xC6: case 0xC7:
+            if (rm_is_reg) {
+                out->opcode = GEN_OP_MOV;
+                add_dst_reg(out, rm_gen);
+            } else {
+                out->opcode = GEN_OP_STORE;
+                x86_add_mem_addr_regs(s, out);
+            }
+            break;
+
+        case 0x50 ... 0x57:
+        {
+            uint8_t r = (op1 & 7);
+            if (s->has_rex && (s->rex & 0x01)) {
+                r |= 8;
+            }
+            out->opcode = GEN_OP_PUSH;
+            add_src_reg(out, x86_gpr_to_generic(r));
+            add_src_reg(out, REG_SP);
+            add_dst_reg(out, REG_SP);
+            break;
+        }
+
+        case 0x58 ... 0x5F:
+        {
+            uint8_t r = (op1 & 7);
+            if (s->has_rex && (s->rex & 0x01)) {
+                r |= 8;
+            }
+            out->opcode = GEN_OP_POP;
+            add_dst_reg(out, x86_gpr_to_generic(r));
+            add_src_reg(out, REG_SP);
+            add_dst_reg(out, REG_SP);
+            break;
+        }
+
+        case 0x70 ... 0x7F:
+            out->opcode = GEN_OP_BRANCH;
+            out->branch_type = BRANCH_COND_DIRECT;
+            add_src_reg(out, REG_FLAGS);
+            break;
+
+        case 0xEB: case 0xE9:
+            out->opcode = GEN_OP_BRANCH;
+            out->branch_type = BRANCH_DIRECT_JUMP;
+            break;
+
+        case 0xE8:
+            out->opcode = GEN_OP_CALL;
+            out->branch_type = BRANCH_DIRECT_CALL;
+            add_src_reg(out, REG_SP);
+            add_dst_reg(out, REG_SP);
+            add_dst_reg(out, REG_IP);
+            break;
+
+        case 0xF6: case 0xF7:
+        {
+            uint8_t ext = (s->modrm >> 3) & 7;
+            switch (ext) {
+            case 0:
+                out->opcode = GEN_OP_TEST;
+                if (rm_is_reg) {
+                    add_src_reg(out, rm_gen);
+                } else {
+                    x86_add_mem_addr_regs(s, out);
+                }
+                add_dst_reg(out, REG_FLAGS);
+                break;
+            case 2:
+                out->opcode = GEN_OP_NOT;
+                if (rm_is_reg) {
+                    add_src_reg(out, rm_gen);
+                    add_dst_reg(out, rm_gen);
+                } else {
+                    x86_add_mem_addr_regs(s, out);
+                }
+                break;
+            case 3:
+                out->opcode = GEN_OP_NEG;
+                if (rm_is_reg) {
+                    add_src_reg(out, rm_gen);
+                    add_dst_reg(out, rm_gen);
+                } else {
+                    x86_add_mem_addr_regs(s, out);
+                }
+                add_dst_reg(out, REG_FLAGS);
+                break;
+            case 4: case 5:
+                out->opcode = GEN_OP_INT_MUL;
+                add_src_reg(out, REG_GPR0);
+                if (rm_is_reg) {
+                    add_src_reg(out, rm_gen);
+                } else {
+                    x86_add_mem_addr_regs(s, out);
+                }
+                add_dst_reg(out, REG_GPR0);
+                add_dst_reg(out, REG_GPR2);
+                add_dst_reg(out, REG_FLAGS);
+                break;
+            case 6: case 7:
+                out->opcode = GEN_OP_INT_DIV;
+                add_src_reg(out, REG_GPR0);
+                add_src_reg(out, REG_GPR2);
+                if (rm_is_reg) {
+                    add_src_reg(out, rm_gen);
+                } else {
+                    x86_add_mem_addr_regs(s, out);
+                }
+                add_dst_reg(out, REG_GPR0);
+                add_dst_reg(out, REG_GPR2);
+                break;
+            default:
+                out->opcode = GEN_OP_UNKNOWN;
+                break;
+            }
+            break;
+        }
+
+        case 0xFE: case 0xFF:
+        {
+            uint8_t ext = (s->modrm >> 3) & 7;
+            switch (ext) {
+            case 0:
+                out->opcode = GEN_OP_INC;
+                if (rm_is_reg) {
+                    add_src_reg(out, rm_gen);
+                    add_dst_reg(out, rm_gen);
+                } else {
+                    x86_add_mem_addr_regs(s, out);
+                }
+                add_dst_reg(out, REG_FLAGS);
+                break;
+            case 1:
+                out->opcode = GEN_OP_DEC;
+                if (rm_is_reg) {
+                    add_src_reg(out, rm_gen);
+                    add_dst_reg(out, rm_gen);
+                } else {
+                    x86_add_mem_addr_regs(s, out);
+                }
+                add_dst_reg(out, REG_FLAGS);
+                break;
+            case 2:
+                out->opcode = GEN_OP_CALL;
+                out->branch_type = BRANCH_INDIRECT_CALL;
+                if (rm_is_reg) {
+                    add_src_reg(out, rm_gen);
+                } else {
+                    x86_add_mem_addr_regs(s, out);
+                }
+                add_src_reg(out, REG_SP);
+                add_dst_reg(out, REG_SP);
+                add_dst_reg(out, REG_IP);
+                break;
+            case 4:
+                out->opcode = GEN_OP_BRANCH;
+                out->branch_type = BRANCH_INDIRECT_JUMP;
+                if (rm_is_reg) {
+                    add_src_reg(out, rm_gen);
+                } else {
+                    x86_add_mem_addr_regs(s, out);
+                }
+                break;
+            case 6:
+                out->opcode = GEN_OP_PUSH;
+                if (rm_is_reg) {
+                    add_src_reg(out, rm_gen);
+                } else {
+                    x86_add_mem_addr_regs(s, out);
+                }
+                add_src_reg(out, REG_SP);
+                add_dst_reg(out, REG_SP);
+                break;
+            default:
+                out->opcode = GEN_OP_UNKNOWN;
+                break;
+            }
+            break;
+        }
+
+        case 0xCD:
+            out->opcode = GEN_OP_SYSCALL;
+            out->branch_type = BRANCH_SYSCALL_TYPE;
+            break;
+
+        default:
+            out->opcode = GEN_OP_UNKNOWN;
+            break;
+        }
+    } else {
+        /* 2-byte opcodes (0F xx) */
+        uint8_t op2 = s->opcode_bytes[1];
+
+        switch (op2) {
+        case 0x80 ... 0x8F:
+            out->opcode = GEN_OP_BRANCH;
+            out->branch_type = BRANCH_COND_DIRECT;
+            add_src_reg(out, REG_FLAGS);
+            break;
+
+        case 0x90 ... 0x9F:
+            out->opcode = GEN_OP_SETCC;
+            add_src_reg(out, REG_FLAGS);
+            if (rm_is_reg) {
+                add_dst_reg(out, rm_gen);
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            break;
+
+        case 0x40 ... 0x4F:
+            out->opcode = GEN_OP_CMOV;
+            add_src_reg(out, REG_FLAGS);
+            add_src_reg(out, reg_gen);
+            if (rm_is_reg) {
+                add_src_reg(out, rm_gen);
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            add_dst_reg(out, reg_gen);
+            break;
+
+        case 0xAF:
+            out->opcode = GEN_OP_INT_MUL;
+            add_src_reg(out, reg_gen);
+            if (rm_is_reg) {
+                add_src_reg(out, rm_gen);
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            add_dst_reg(out, reg_gen);
+            add_dst_reg(out, REG_FLAGS);
+            break;
+
+        case 0xB6: case 0xB7:
+            out->opcode = GEN_OP_MOVZX;
+            add_dst_reg(out, reg_gen);
+            if (rm_is_reg) {
+                add_src_reg(out, rm_gen);
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            break;
+
+        case 0xBE: case 0xBF:
+            out->opcode = GEN_OP_MOVSX;
+            add_dst_reg(out, reg_gen);
+            if (rm_is_reg) {
+                add_src_reg(out, rm_gen);
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            break;
+
+        case 0x05:
+            out->opcode = GEN_OP_SYSCALL;
+            out->branch_type = BRANCH_SYSCALL_TYPE;
+            break;
+
+        case 0xAE:
+            out->opcode = GEN_OP_FENCE;
+            break;
+
+        case 0x1F:
+            out->opcode = GEN_OP_NOP;
+            break;
+
+        case 0x10: case 0x11:
+        case 0x28: case 0x29:
+        case 0x6F: case 0x7F:
+        {
+            bool is_store = (op2 == 0x11 || op2 == 0x29 || op2 == 0x7F);
+            uint8_t xmm_reg = x86_xmm_to_generic(reg_idx);
+            uint8_t xmm_rm = rm_is_reg ? x86_xmm_to_generic(rm_idx)
+                                       : REG_NONE;
+            if (is_store) {
+                if (rm_is_reg) {
+                    out->opcode = GEN_OP_VEC_MOV;
+                    add_src_reg(out, xmm_reg);
+                    add_dst_reg(out, xmm_rm);
+                } else {
+                    out->opcode = GEN_OP_STORE;
+                    add_src_reg(out, xmm_reg);
+                    x86_add_mem_addr_regs(s, out);
+                }
+            } else {
+                if (rm_is_reg) {
+                    out->opcode = GEN_OP_VEC_MOV;
+                    add_src_reg(out, xmm_rm);
+                    add_dst_reg(out, xmm_reg);
+                } else {
+                    out->opcode = GEN_OP_LOAD;
+                    add_dst_reg(out, xmm_reg);
+                    x86_add_mem_addr_regs(s, out);
+                }
+            }
+            break;
+        }
+
+        case 0x58:
+            out->opcode = GEN_OP_FP_ADD;
+            add_src_reg(out, x86_xmm_to_generic(reg_idx));
+            if (rm_is_reg) {
+                add_src_reg(out, x86_xmm_to_generic(rm_idx));
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
+            break;
+        case 0x59:
+            out->opcode = GEN_OP_FP_MUL;
+            add_src_reg(out, x86_xmm_to_generic(reg_idx));
+            if (rm_is_reg) {
+                add_src_reg(out, x86_xmm_to_generic(rm_idx));
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
+            break;
+        case 0x5C:
+            out->opcode = GEN_OP_FP_SUB;
+            add_src_reg(out, x86_xmm_to_generic(reg_idx));
+            if (rm_is_reg) {
+                add_src_reg(out, x86_xmm_to_generic(rm_idx));
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
+            break;
+        case 0x5E:
+            out->opcode = GEN_OP_FP_DIV;
+            add_src_reg(out, x86_xmm_to_generic(reg_idx));
+            if (rm_is_reg) {
+                add_src_reg(out, x86_xmm_to_generic(rm_idx));
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
+            break;
+        case 0x51:
+            out->opcode = GEN_OP_FP_SQRT;
+            if (rm_is_reg) {
+                add_src_reg(out, x86_xmm_to_generic(rm_idx));
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
+            break;
+
+        case 0x2E: case 0x2F:
+            out->opcode = GEN_OP_FP_CMP;
+            add_src_reg(out, x86_xmm_to_generic(reg_idx));
+            if (rm_is_reg) {
+                add_src_reg(out, x86_xmm_to_generic(rm_idx));
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            add_dst_reg(out, REG_FLAGS);
+            break;
+
+        case 0x54: case 0x55:
+        case 0x56: case 0x57:
+            out->opcode = GEN_OP_VEC_LOGIC;
+            add_src_reg(out, x86_xmm_to_generic(reg_idx));
+            if (rm_is_reg) {
+                add_src_reg(out, x86_xmm_to_generic(rm_idx));
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
+            break;
+
+        case 0xC6:
+            out->opcode = GEN_OP_VEC_SHUF;
+            add_src_reg(out, x86_xmm_to_generic(reg_idx));
+            if (rm_is_reg) {
+                add_src_reg(out, x86_xmm_to_generic(rm_idx));
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
+            break;
+
+        case 0x2A: case 0x2C: case 0x2D:
+        case 0x5A: case 0x5B:
+        case 0xE6:
+            out->opcode = GEN_OP_FP_CVT;
+            if (rm_is_reg) {
+                add_src_reg(out, x86_xmm_to_generic(rm_idx));
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
+            break;
+
+        case 0xD4:
+        case 0xFC: case 0xFD: case 0xFE:
+            out->opcode = GEN_OP_VEC_ADD;
+            add_src_reg(out, x86_xmm_to_generic(reg_idx));
+            if (rm_is_reg) {
+                add_src_reg(out, x86_xmm_to_generic(rm_idx));
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
+            break;
+
+        case 0xF8: case 0xF9: case 0xFA: case 0xFB:
+            out->opcode = GEN_OP_VEC_SUB;
+            add_src_reg(out, x86_xmm_to_generic(reg_idx));
+            if (rm_is_reg) {
+                add_src_reg(out, x86_xmm_to_generic(rm_idx));
+            } else {
+                x86_add_mem_addr_regs(s, out);
+            }
+            add_dst_reg(out, x86_xmm_to_generic(reg_idx));
+            break;
+
+        default:
+            out->opcode = GEN_OP_UNKNOWN;
+            break;
+        }
+    }
+}
+
+static void decode_insn_to_generic(const uint8_t *bytes, uint32_t len,
+                                    InsnFields *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    if (is_x86) {
+        X86DecodeState s;
+        memset(&s, 0, sizeof(s));
+        x86_raw_decode(bytes, len, &s);
+        x86_map_to_generic(&s, out);
+    }
+}
+
+/* ========================= String Helpers for Text Output ========================= */
+
+static const char *generic_opcode_name(uint8_t op)
+{
+    static const char *names[] = {
+        [GEN_OP_UNKNOWN]  = "UNKNOWN",
+        [GEN_OP_INT_ADD]  = "INT_ADD",
+        [GEN_OP_INT_SUB]  = "INT_SUB",
+        [GEN_OP_INT_MUL]  = "INT_MUL",
+        [GEN_OP_INT_DIV]  = "INT_DIV",
+        [GEN_OP_AND]      = "AND",
+        [GEN_OP_OR]       = "OR",
+        [GEN_OP_XOR]      = "XOR",
+        [GEN_OP_NOT]      = "NOT",
+        [GEN_OP_SHL]      = "SHL",
+        [GEN_OP_SHR]      = "SHR",
+        [GEN_OP_SAR]      = "SAR",
+        [GEN_OP_ROL]      = "ROL",
+        [GEN_OP_ROR]      = "ROR",
+        [GEN_OP_MOV]      = "MOV",
+        [GEN_OP_LOAD]     = "LOAD",
+        [GEN_OP_STORE]    = "STORE",
+        [GEN_OP_PUSH]     = "PUSH",
+        [GEN_OP_POP]      = "POP",
+        [GEN_OP_LEA]      = "LEA",
+        [GEN_OP_MOVSX]    = "MOVSX",
+        [GEN_OP_MOVZX]    = "MOVZX",
+        [GEN_OP_XCHG]     = "XCHG",
+        [GEN_OP_CMP]      = "CMP",
+        [GEN_OP_TEST]     = "TEST",
+        [GEN_OP_BRANCH]   = "BRANCH",
+        [GEN_OP_CALL]     = "CALL",
+        [GEN_OP_RET]      = "RET",
+        [GEN_OP_FP_ADD]   = "FP_ADD",
+        [GEN_OP_FP_SUB]   = "FP_SUB",
+        [GEN_OP_FP_MUL]   = "FP_MUL",
+        [GEN_OP_FP_DIV]   = "FP_DIV",
+        [GEN_OP_FP_SQRT]  = "FP_SQRT",
+        [GEN_OP_FP_MOV]   = "FP_MOV",
+        [GEN_OP_FP_CVT]   = "FP_CVT",
+        [GEN_OP_FP_CMP]   = "FP_CMP",
+        [GEN_OP_VEC_ADD]  = "VEC_ADD",
+        [GEN_OP_VEC_SUB]  = "VEC_SUB",
+        [GEN_OP_VEC_MUL]  = "VEC_MUL",
+        [GEN_OP_VEC_MOV]  = "VEC_MOV",
+        [GEN_OP_VEC_SHUF] = "VEC_SHUF",
+        [GEN_OP_VEC_LOGIC] = "VEC_LOGIC",
+        [GEN_OP_NOP]      = "NOP",
+        [GEN_OP_SYSCALL]  = "SYSCALL",
+        [GEN_OP_FENCE]    = "FENCE",
+        [GEN_OP_CMOV]     = "CMOV",
+        [GEN_OP_SETCC]    = "SETCC",
+        [GEN_OP_INT_ADC]  = "INT_ADC",
+        [GEN_OP_INT_SBB]  = "INT_SBB",
+        [GEN_OP_NEG]      = "NEG",
+        [GEN_OP_INC]      = "INC",
+        [GEN_OP_DEC]      = "DEC",
+    };
+    return (op < GEN_OP_COUNT) ? names[op] : "UNKNOWN";
+}
+
+static const char *branch_type_name(uint8_t bt)
+{
+    static const char *names[] = {
+        [BRANCH_NONE]          = "NONE",
+        [BRANCH_DIRECT_JUMP]   = "DIRECT_JUMP",
+        [BRANCH_INDIRECT_JUMP] = "INDIRECT_JUMP",
+        [BRANCH_DIRECT_CALL]   = "DIRECT_CALL",
+        [BRANCH_INDIRECT_CALL] = "INDIRECT_CALL",
+        [BRANCH_RETURN]        = "RETURN",
+        [BRANCH_COND_DIRECT]   = "COND_DIRECT",
+        [BRANCH_SYSCALL_TYPE]  = "SYSCALL",
+    };
+    return (bt <= BRANCH_SYSCALL_TYPE) ? names[bt] : "UNKNOWN";
+}
+
+static const char *generic_reg_name(uint8_t reg_id)
+{
+    static char buf[16];
+
+    if (reg_id == REG_NONE) {
+        return "NONE";
+    }
+    if (reg_id >= REG_GPR0 && reg_id <= REG_GPR31) {
+        snprintf(buf, sizeof(buf), "GPR%u", reg_id - REG_GPR0);
+        return buf;
+    }
+    if (reg_id >= REG_FPR0 && reg_id <= REG_FPR0 + 31) {
+        snprintf(buf, sizeof(buf), "FPR%u", reg_id - REG_FPR0);
+        return buf;
+    }
+    if (reg_id >= REG_VEC0 && reg_id <= REG_VEC0 + 31) {
+        snprintf(buf, sizeof(buf), "VEC%u", reg_id - REG_VEC0);
+        return buf;
+    }
+    switch (reg_id) {
+    case REG_SP:      return "SP";
+    case REG_FLAGS:   return "FLAGS";
+    case REG_IP:      return "IP";
+    case REG_LR:      return "LR";
+    case REG_FP_REG:  return "FP";
+    default:
+        snprintf(buf, sizeof(buf), "R%u", reg_id);
+        return buf;
+    }
+}
+
+/* ========================= Data Structures ========================= */
+
+/*
  * BB Template - static instruction context for a unique basic block.
- * Populated during translation and referenced by ID in the trace body.
+ * Each instruction is represented by its PC and ISA-agnostic decoded fields.
  */
 typedef struct {
-    uint32_t template_id;       /* Unique ID for this template */
-    uint64_t start_pc;          /* Block start address */
-    uint32_t n_insns;           /* Number of instructions */
-    uint64_t *insn_pcs;         /* Array of instruction PCs */
-    uint32_t *insn_sizes;       /* Array of instruction sizes in bytes */
-    uint8_t **insn_bytes;       /* Array of raw instruction byte arrays */
-    uint64_t fall_through_pc;   /* PC after last instruction (sequential) */
-    X86InsnFields *insn_fields; /* Decoded fields per insn (x86 only, else NULL) */
+    uint32_t template_id;
+    uint64_t start_pc;
+    uint32_t n_insns;
+    uint64_t *insn_pcs;
+    uint64_t fall_through_pc;
+    InsnFields *insn_fields;    /* Decoded ISA-agnostic fields per insn */
 } BBTemplate;
 
 /*
@@ -485,15 +1489,8 @@ static void body_entry_clear(BodyEntry *entry)
 static void bb_template_free(gpointer data)
 {
     BBTemplate *tmpl = data;
-    if (tmpl->insn_bytes) {
-        for (uint32_t i = 0; i < tmpl->n_insns; i++) {
-            g_free(tmpl->insn_bytes[i]);
-        }
-        g_free(tmpl->insn_bytes);
-    }
     g_free(tmpl->insn_fields);
     g_free(tmpl->insn_pcs);
-    g_free(tmpl->insn_sizes);
     g_free(tmpl);
 }
 
@@ -530,6 +1527,15 @@ static void trace_segment_free(TraceSegment *seg)
 /* ========================= BB Template Management ========================= */
 
 /*
+ * Look up a template by start PC.
+ * Must be called with data_lock held.
+ */
+static BBTemplate *find_template(uint64_t start_pc)
+{
+    return g_hash_table_lookup(template_map, &start_pc);
+}
+
+/*
  * Find or create a BB template for the given start PC.
  * If a template already exists for this PC, returns it.
  * Otherwise creates a new one with the given instruction data.
@@ -543,7 +1549,7 @@ static BBTemplate *get_or_create_template(uint64_t start_pc,
                                           uint8_t **insn_bytes,
                                           uint64_t fall_through_pc)
 {
-    BBTemplate *tmpl = g_hash_table_lookup(template_map, &start_pc);
+    BBTemplate *tmpl = find_template(start_pc);
     if (tmpl) {
         return tmpl;
     }
@@ -553,41 +1559,24 @@ static BBTemplate *get_or_create_template(uint64_t start_pc,
     tmpl->start_pc = start_pc;
     tmpl->n_insns = n_insns;
     tmpl->fall_through_pc = fall_through_pc;
-
     tmpl->insn_pcs = g_new0(uint64_t, n_insns);
-    tmpl->insn_sizes = g_new0(uint32_t, n_insns);
-    tmpl->insn_bytes = g_new0(uint8_t *, n_insns);
 
     for (uint32_t i = 0; i < n_insns; i++) {
         tmpl->insn_pcs[i] = insn_pcs[i];
-        tmpl->insn_sizes[i] = insn_sizes[i];
-        if (insn_bytes && insn_bytes[i]) {
-            tmpl->insn_bytes[i] = g_memdup2(insn_bytes[i], insn_sizes[i]);
-        }
     }
 
-    if (is_x86) {
-        tmpl->insn_fields = g_new0(X86InsnFields, n_insns);
-        for (uint32_t i = 0; i < n_insns; i++) {
-            if (insn_bytes && insn_bytes[i]) {
-                decode_x86_insn(insn_bytes[i], insn_sizes[i],
-                                &tmpl->insn_fields[i]);
-            }
+    /* Decode all instructions to ISA-agnostic generic fields */
+    tmpl->insn_fields = g_new0(InsnFields, n_insns);
+    for (uint32_t i = 0; i < n_insns; i++) {
+        if (insn_bytes && insn_bytes[i] && insn_sizes[i] > 0) {
+            decode_insn_to_generic(insn_bytes[i], insn_sizes[i],
+                                   &tmpl->insn_fields[i]);
         }
     }
 
     g_hash_table_replace(template_map, &tmpl->start_pc, tmpl);
     stat_blocks_translated++;
     return tmpl;
-}
-
-/*
- * Look up a template by start PC.
- * Must be called with data_lock held.
- */
-static BBTemplate *find_template(uint64_t start_pc)
-{
-    return g_hash_table_lookup(template_map, &start_pc);
 }
 
 /* ========================= Memory Access Tracking ========================= */
@@ -707,6 +1696,21 @@ static WPBBEntry create_wp_bb_entry(uint64_t bb_start_pc,
 }
 
 /*
+ * Derive instruction size from consecutive PCs in a BB template.
+ * For the last instruction, uses fall_through_pc.
+ */
+static inline uint32_t template_insn_size(const BBTemplate *tmpl, uint32_t idx)
+{
+    if (idx >= tmpl->n_insns) {
+        return 0;
+    }
+    if (idx + 1 < tmpl->n_insns) {
+        return (uint32_t)(tmpl->insn_pcs[idx + 1] - tmpl->insn_pcs[idx]);
+    }
+    return (uint32_t)(tmpl->fall_through_pc - tmpl->insn_pcs[idx]);
+}
+
+/*
  * Execute wrong-path instructions starting from @wrong_target.
  * Returns a GArray of WPBBEntry representing the wrong-path BB chain.
  */
@@ -783,7 +1787,7 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             if (known) {
                 uint32_t idx_in_bb = bb_insn_pcs->len;
                 if (idx_in_bb < known->n_insns) {
-                    insn_size = known->insn_sizes[idx_in_bb];
+                    insn_size = template_insn_size(known, idx_in_bb);
                 }
             }
             if (insn_size == 0) {
@@ -910,38 +1914,28 @@ static void write_text_header(FILE *f)
                 tmpl->n_insns, tmpl->fall_through_pc);
 
         for (uint32_t i = 0; i < tmpl->n_insns; i++) {
-            fprintf(f, "  [%u] 0x%" PRIx64 ": ", i, tmpl->insn_pcs[i]);
-            if (tmpl->insn_bytes && tmpl->insn_bytes[i]) {
-                for (uint32_t b = 0; b < tmpl->insn_sizes[i]; b++) {
-                    fprintf(f, "%02x", tmpl->insn_bytes[i][b]);
-                }
+            InsnFields *fld = &tmpl->insn_fields[i];
+            fprintf(f, "  [%u] 0x%" PRIx64 ": op=%s",
+                    i, tmpl->insn_pcs[i], generic_opcode_name(fld->opcode));
+
+            if (fld->branch_type != BRANCH_NONE) {
+                fprintf(f, " br=%s", branch_type_name(fld->branch_type));
             }
-            fprintf(f, " (%u bytes)", tmpl->insn_sizes[i]);
-            if (tmpl->insn_fields) {
-                X86InsnFields *fld = &tmpl->insn_fields[i];
-                if (fld->opcode_len > 0) {
-                    fprintf(f, " [");
-                    if (fld->n_prefixes > 0) {
-                        fprintf(f, "%u pfx ", fld->n_prefixes);
-                    }
-                    fprintf(f, "op=");
-                    for (uint8_t o = 0; o < fld->opcode_len; o++) {
-                        fprintf(f, "%02X", fld->opcode[o]);
-                    }
-                    if (fld->has_modrm) {
-                        fprintf(f, " modrm=0x%02x", fld->modrm);
-                    }
-                    if (fld->has_sib) {
-                        fprintf(f, " sib=0x%02x", fld->sib);
-                    }
-                    if (fld->disp_size > 0) {
-                        fprintf(f, " disp=%d", fld->disp);
-                    }
-                    if (fld->imm_size > 0) {
-                        fprintf(f, " imm=%" PRId64, fld->imm);
-                    }
-                    fprintf(f, "]");
-                }
+
+            fprintf(f, " src=[");
+            for (uint8_t s = 0; s < fld->n_src_regs; s++) {
+                if (s > 0) fprintf(f, ",");
+                fprintf(f, "%s", generic_reg_name(fld->src_regs[s]));
+            }
+            fprintf(f, "] dst=[");
+            for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
+                if (d > 0) fprintf(f, ",");
+                fprintf(f, "%s", generic_reg_name(fld->dst_regs[d]));
+            }
+            fprintf(f, "]");
+
+            if (fld->has_immediate) {
+                fprintf(f, " imm=%" PRId64, fld->immediate);
             }
             fprintf(f, "\n");
         }
@@ -1098,10 +2092,10 @@ static inline void write_u64(FILE *f, uint64_t v)
 }
 
 /*
- * Write the header section in packed binary format (v2 ULEB128).
+ * Write the header section in packed binary format (v3 ULEB128).
  *
  * Binary header layout:
- *   magic:            uint32 (WPT_MAGIC v2)
+ *   magic:            uint32 (WPT_MAGIC v3)
  *   num_templates:    ULEB128
  *   For each template:
  *     template_id:      ULEB128
@@ -1110,19 +2104,14 @@ static inline void write_u64(FILE *f, uint64_t v)
  *     fall_through_pc:  uint64
  *     For each instruction:
  *       pc:             uint64
- *       size:           ULEB128
- *       bytes:          [size bytes]
- *       has_fields:     uint8 (1 if decoded fields, 0 otherwise)
- *       If has_fields:
- *         n_prefixes:   uint8
- *         opcode_len:   uint8
- *         opcode:       [opcode_len bytes]
- *         modrm:        uint8 (0xFF if no modrm)
- *         sib:          uint8 (0xFF if no sib)
- *         disp_size:    uint8
- *         disp:         [disp_size bytes, little-endian]
- *         imm_size:     uint8
- *         imm:          [imm_size bytes, little-endian]
+ *       opcode:         uint8 (GenericOpcode)
+ *       branch_type:    uint8 (BranchType)
+ *       n_src:          uint8
+ *       n_dst:          uint8
+ *       src_regs:       [n_src bytes] (GenericRegId)
+ *       dst_regs:       [n_dst bytes] (GenericRegId)
+ *       has_imm:        uint8 (0 or 1)
+ *       imm:            uint64 (only if has_imm == 1)
  */
 static void write_bin_header(FILE *f)
 {
@@ -1144,42 +2133,23 @@ static void write_bin_header(FILE *f)
         write_u64(f, tmpl->fall_through_pc);
 
         for (uint32_t i = 0; i < tmpl->n_insns; i++) {
-            write_u64(f, tmpl->insn_pcs[i]);
-            uint32_t sz = tmpl->insn_sizes[i];
-            write_uleb128(f, sz);
-            if (tmpl->insn_bytes && tmpl->insn_bytes[i]) {
-                fwrite(tmpl->insn_bytes[i], 1, sz, f);
-            }
+            InsnFields *fld = &tmpl->insn_fields[i];
 
-            /* Write decoded instruction fields */
-            if (tmpl->insn_fields && tmpl->insn_fields[i].opcode_len > 0) {
-                X86InsnFields *fld = &tmpl->insn_fields[i];
-                write_u8(f, 1); /* has_fields */
-                write_u8(f, fld->n_prefixes);
-                write_u8(f, fld->opcode_len);
-                fwrite(fld->opcode, 1, fld->opcode_len, f);
-                write_u8(f, fld->has_modrm ? fld->modrm : 0xFF);
-                write_u8(f, fld->has_sib ? fld->sib : 0xFF);
-                write_u8(f, fld->disp_size);
-                if (fld->disp_size > 0) {
-                    /* Write displacement as little-endian */
-                    int32_t d = fld->disp;
-                    for (uint8_t b = 0; b < fld->disp_size; b++) {
-                        uint8_t byte = (d >> (b * 8)) & 0xFF;
-                        fwrite(&byte, 1, 1, f);
-                    }
-                }
-                write_u8(f, fld->imm_size);
-                if (fld->imm_size > 0) {
-                    /* Write immediate as little-endian */
-                    int64_t imm = fld->imm;
-                    for (uint8_t b = 0; b < fld->imm_size; b++) {
-                        uint8_t byte = (imm >> (b * 8)) & 0xFF;
-                        fwrite(&byte, 1, 1, f);
-                    }
-                }
-            } else {
-                write_u8(f, 0); /* no fields */
+            /* Per-insn: pc + generic decoded fields */
+            write_u64(f, tmpl->insn_pcs[i]);
+            write_u8(f, fld->opcode);
+            write_u8(f, fld->branch_type);
+            write_u8(f, fld->n_src_regs);
+            write_u8(f, fld->n_dst_regs);
+            for (uint8_t s = 0; s < fld->n_src_regs; s++) {
+                write_u8(f, fld->src_regs[s]);
+            }
+            for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
+                write_u8(f, fld->dst_regs[d]);
+            }
+            write_u8(f, fld->has_immediate ? 1 : 0);
+            if (fld->has_immediate) {
+                write_u64(f, (uint64_t)fld->immediate);
             }
         }
     }

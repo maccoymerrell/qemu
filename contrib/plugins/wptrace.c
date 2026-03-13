@@ -20,9 +20,9 @@
  *   - BB template deduplication (unique BBs stored once in header)
  *   - Wrong-path execution with real IF and DF addresses
  *   - Start/stop tracing by instruction number
- *   - ISA-agnostic instruction decode (x86 currently supported)
+ *   - ISA-agnostic instruction decode using qemu_plugin_insn_disas()
+ *   - Supports all QEMU architectures (x86, ARM, RISC-V, etc.)
  *   - Compact LEB128 variable-length integer encoding
- *   - Extensible: additional ISA decoders can be added for ARM, RISC-V, etc.
  *
  * Usage:
  *   -plugin wptrace[,depth=N][,outfile=PATH][,debug=1]
@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include <qemu-plugin.h>
 
@@ -1198,17 +1199,514 @@ static void x86_map_to_generic(const X86DecodeState *s, InsnFields *out)
     }
 }
 
-static void decode_insn_to_generic(const uint8_t *bytes, uint32_t len,
+/* ========================= Disassembly-Based ISA-Agnostic Decode ========================= */
+
+/*
+ * Helper: Parse a register name from disassembly to GenericRegId.
+ * Maps common register names across x86, ARM, RISC-V, etc.
+ */
+static uint8_t parse_reg_from_disas(const char *reg_str)
+{
+    if (!reg_str || !*reg_str) {
+        return REG_NONE;
+    }
+
+    /* Skip common prefixes like % (AT&T) or $ (immediates) */
+    while (*reg_str == '%' || *reg_str == '$' || *reg_str == '#') {
+        reg_str++;
+    }
+
+    if (!*reg_str) {
+        return REG_NONE;
+    }
+
+    /* x86/x86-64 registers (AT&T and Intel syntax) */
+    if (strcmp(reg_str, "rax") == 0 || strcmp(reg_str, "eax") == 0 ||
+        strcmp(reg_str, "ax") == 0 || strcmp(reg_str, "al") == 0 ||
+        strcmp(reg_str, "ah") == 0) {
+        return REG_GPR0;
+    }
+    if (strcmp(reg_str, "rcx") == 0 || strcmp(reg_str, "ecx") == 0 ||
+        strcmp(reg_str, "cx") == 0 || strcmp(reg_str, "cl") == 0 ||
+        strcmp(reg_str, "ch") == 0) {
+        return REG_GPR1;
+    }
+    if (strcmp(reg_str, "rdx") == 0 || strcmp(reg_str, "edx") == 0 ||
+        strcmp(reg_str, "dx") == 0 || strcmp(reg_str, "dl") == 0 ||
+        strcmp(reg_str, "dh") == 0) {
+        return REG_GPR2;
+    }
+    if (strcmp(reg_str, "rbx") == 0 || strcmp(reg_str, "ebx") == 0 ||
+        strcmp(reg_str, "bx") == 0 || strcmp(reg_str, "bl") == 0 ||
+        strcmp(reg_str, "bh") == 0) {
+        return REG_GPR3;
+    }
+    if (strcmp(reg_str, "rsp") == 0 || strcmp(reg_str, "esp") == 0 ||
+        strcmp(reg_str, "sp") == 0) {
+        return REG_SP;
+    }
+    if (strcmp(reg_str, "rbp") == 0 || strcmp(reg_str, "ebp") == 0 ||
+        strcmp(reg_str, "bp") == 0) {
+        return REG_FP_REG;
+    }
+    if (strcmp(reg_str, "rsi") == 0 || strcmp(reg_str, "esi") == 0 ||
+        strcmp(reg_str, "si") == 0 || strcmp(reg_str, "sil") == 0) {
+        return REG_GPR4;
+    }
+    if (strcmp(reg_str, "rdi") == 0 || strcmp(reg_str, "edi") == 0 ||
+        strcmp(reg_str, "di") == 0 || strcmp(reg_str, "dil") == 0) {
+        return REG_GPR5;
+    }
+    if (strcmp(reg_str, "r8") == 0 || strcmp(reg_str, "r8d") == 0 ||
+        strcmp(reg_str, "r8w") == 0 || strcmp(reg_str, "r8b") == 0) {
+        return REG_GPR6;
+    }
+    if (strcmp(reg_str, "r9") == 0 || strcmp(reg_str, "r9d") == 0 ||
+        strcmp(reg_str, "r9w") == 0 || strcmp(reg_str, "r9b") == 0) {
+        return REG_GPR7;
+    }
+    if (strcmp(reg_str, "r10") == 0 || strcmp(reg_str, "r10d") == 0 ||
+        strcmp(reg_str, "r10w") == 0 || strcmp(reg_str, "r10b") == 0) {
+        return REG_GPR8;
+    }
+    if (strcmp(reg_str, "r11") == 0 || strcmp(reg_str, "r11d") == 0 ||
+        strcmp(reg_str, "r11w") == 0 || strcmp(reg_str, "r11b") == 0) {
+        return REG_GPR9;
+    }
+    if (strcmp(reg_str, "r12") == 0 || strcmp(reg_str, "r12d") == 0 ||
+        strcmp(reg_str, "r12w") == 0 || strcmp(reg_str, "r12b") == 0) {
+        return REG_GPR10;
+    }
+    if (strcmp(reg_str, "r13") == 0 || strcmp(reg_str, "r13d") == 0 ||
+        strcmp(reg_str, "r13w") == 0 || strcmp(reg_str, "r13b") == 0) {
+        return REG_GPR11;
+    }
+    if (strcmp(reg_str, "r14") == 0 || strcmp(reg_str, "r14d") == 0 ||
+        strcmp(reg_str, "r14w") == 0 || strcmp(reg_str, "r14b") == 0) {
+        return REG_GPR12;
+    }
+    if (strcmp(reg_str, "r15") == 0 || strcmp(reg_str, "r15d") == 0 ||
+        strcmp(reg_str, "r15w") == 0 || strcmp(reg_str, "r15b") == 0) {
+        return REG_GPR13;
+    }
+    if (strcmp(reg_str, "rip") == 0 || strcmp(reg_str, "eip") == 0 ||
+        strcmp(reg_str, "ip") == 0 || strcmp(reg_str, "pc") == 0) {
+        return REG_IP;
+    }
+
+    /* x86 segment/flag registers */
+    if (strcmp(reg_str, "rflags") == 0 || strcmp(reg_str, "eflags") == 0 ||
+        strcmp(reg_str, "flags") == 0) {
+        return REG_FLAGS;
+    }
+
+    /* x86 vector registers */
+    if (strncmp(reg_str, "xmm", 3) == 0 || strncmp(reg_str, "ymm", 3) == 0 ||
+        strncmp(reg_str, "zmm", 3) == 0) {
+        int idx = atoi(reg_str + 3);
+        if (idx >= 0 && idx < 32) {
+            return REG_VEC0 + idx;
+        }
+    }
+
+    /* ARM registers */
+    if (reg_str[0] == 'r' && isdigit(reg_str[1])) {
+        int idx = atoi(reg_str + 1);
+        if (idx >= 0 && idx <= 15) {
+            if (idx == 13) return REG_SP;  /* r13 = SP */
+            if (idx == 14) return REG_LR;  /* r14 = LR */
+            if (idx == 15) return REG_IP;  /* r15 = PC */
+            if (idx <= 12) return REG_GPR0 + idx;
+        }
+    }
+    if (reg_str[0] == 'x' && isdigit(reg_str[1])) {  /* ARM64 */
+        int idx = atoi(reg_str + 1);
+        if (idx >= 0 && idx <= 30) {
+            if (idx == 29) return REG_FP_REG;
+            if (idx == 30) return REG_LR;
+            return REG_GPR0 + idx;
+        }
+    }
+    if (strcmp(reg_str, "sp") == 0) return REG_SP;
+    if (strcmp(reg_str, "lr") == 0) return REG_LR;
+    if (strcmp(reg_str, "fp") == 0) return REG_FP_REG;
+
+    /* RISC-V registers */
+    if (reg_str[0] == 'x' && isdigit(reg_str[1]) && strchr(reg_str, 'm') == NULL) {
+        int idx = atoi(reg_str + 1);
+        if (idx >= 0 && idx < 32) {
+            if (idx == 0) return REG_NONE;  /* x0 is always zero */
+            if (idx == 1) return REG_LR;    /* x1 = ra (return address) */
+            if (idx == 2) return REG_SP;    /* x2 = sp */
+            if (idx == 8) return REG_FP_REG; /* x8 = fp/s0 */
+            return REG_GPR0 + idx;
+        }
+    }
+
+    return REG_NONE;
+}
+
+/*
+ * Helper: Extract operands (registers and immediates) from disassembly string.
+ * Disassembly format varies by architecture:
+ *   x86 AT&T: "mov $0x10, %rax"  or "add %rbx, %rax"
+ *   x86 Intel: "mov rax, 0x10"    or "add rax, rbx"
+ *   ARM: "mov r0, #16"            or "add r0, r1, r2"
+ *   RISC-V: "addi x10, x11, 16"
+ */
+static void extract_operands_from_disas(const char *disas, InsnFields *out)
+{
+    if (!disas) {
+        return;
+    }
+
+    /* Find the start of operands (after mnemonic) */
+    const char *operands = strchr(disas, ' ');
+    if (!operands) {
+        const char *tab = strchr(disas, '\t');
+        if (!tab) {
+            return;
+        }
+        operands = tab;
+    }
+
+    /* Skip whitespace */
+    while (*operands && (*operands == ' ' || *operands == '\t')) {
+        operands++;
+    }
+
+    if (!*operands) {
+        return;
+    }
+
+    /* Parse operands - split by comma */
+    char *ops_copy = g_strdup(operands);
+    char *saveptr = NULL;
+    char *token = strtok_r(ops_copy, ",", &saveptr);
+
+    int operand_idx = 0;
+    bool first_is_dest = true;  /* Most instructions: dest = first operand */
+
+    /* Determine instruction format from mnemonic */
+    if (strncmp(disas, "cmp", 3) == 0 || strncmp(disas, "test", 4) == 0) {
+        first_is_dest = false;  /* Comparison: all operands are sources */
+    }
+
+    while (token && operand_idx < 4) {
+        /* Trim whitespace */
+        while (*token == ' ' || *token == '\t') token++;
+        char *end = token + strlen(token) - 1;
+        while (end > token && (*end == ' ' || *end == '\t' || *end == '\n')) {
+            *end = '\0';
+            end--;
+        }
+
+        /* Check for memory operands (parentheses or brackets) */
+        bool is_memory = (strchr(token, '(') != NULL || strchr(token, '[') != NULL);
+
+        /* Check for immediate (starts with $ or # or 0x) */
+        bool is_immediate = (*token == '$' || *token == '#' ||
+                             strncmp(token, "0x", 2) == 0 ||
+                             (*token == '-' && isdigit(token[1])) ||
+                             (isdigit(*token) && !isalpha(*token)));
+
+        if (is_immediate) {
+            /* Parse immediate value */
+            char *imm_str = token;
+            if (*imm_str == '$' || *imm_str == '#') {
+                imm_str++;
+            }
+            out->has_immediate = true;
+            out->immediate = (int64_t)strtoll(imm_str, NULL, 0);
+        } else if (is_memory) {
+            /* Memory operand - extract base/index registers */
+            /* Format examples:
+             *   x86 AT&T: 0x10(%rax,%rbx,4)  or (%rsp)
+             *   x86 Intel: [rax + rbx*4 + 0x10]  or [rsp]
+             *   ARM: [r0, r1]  or [sp, #16]
+             */
+            char *paren_start = strchr(token, '(');
+            if (!paren_start) {
+                paren_start = strchr(token, '[');
+            }
+            if (paren_start) {
+                char *paren_end = strchr(paren_start, ')');
+                if (!paren_end) {
+                    paren_end = strchr(paren_start, ']');
+                }
+                if (paren_end) {
+                    /* Extract register names between parens */
+                    char *mem_copy = g_strndup(paren_start + 1,
+                                               paren_end - paren_start - 1);
+                    char *mem_saveptr = NULL;
+                    char *reg_token = strtok_r(mem_copy, ",+*", &mem_saveptr);
+                    while (reg_token) {
+                        while (*reg_token == ' ' || *reg_token == '\t') {
+                            reg_token++;
+                        }
+                        if (*reg_token && !isdigit(*reg_token) &&
+                            *reg_token != '#' && *reg_token != '$' &&
+                            strncmp(reg_token, "0x", 2) != 0) {
+                            uint8_t reg_id = parse_reg_from_disas(reg_token);
+                            if (reg_id != REG_NONE) {
+                                add_src_reg(out, reg_id);
+                            }
+                        }
+                        reg_token = strtok_r(NULL, ",+*", &mem_saveptr);
+                    }
+                    g_free(mem_copy);
+                }
+            }
+        } else {
+            /* Regular register operand */
+            uint8_t reg_id = parse_reg_from_disas(token);
+            if (reg_id != REG_NONE) {
+                if (operand_idx == 0 && first_is_dest) {
+                    add_dst_reg(out, reg_id);
+                } else {
+                    add_src_reg(out, reg_id);
+                }
+            }
+        }
+
+        token = strtok_r(NULL, ",", &saveptr);
+        operand_idx++;
+    }
+
+    g_free(ops_copy);
+}
+
+/*
+ * Helper: Map instruction mnemonic to GenericOpcode.
+ * Uses prefix matching to handle instruction variants (e.g., addl, addq, adds, etc.).
+ */
+static uint8_t mnemonic_to_opcode(const char *mnemonic)
+{
+    if (!mnemonic || !*mnemonic) {
+        return GEN_OP_UNKNOWN;
+    }
+
+    /* ALU operations */
+    if (strncmp(mnemonic, "add", 3) == 0) return GEN_OP_INT_ADD;
+    if (strncmp(mnemonic, "sub", 3) == 0) return GEN_OP_INT_SUB;
+    if (strncmp(mnemonic, "imul", 4) == 0 || strncmp(mnemonic, "mul", 3) == 0) {
+        return GEN_OP_INT_MUL;
+    }
+    if (strncmp(mnemonic, "idiv", 4) == 0 || strncmp(mnemonic, "div", 3) == 0) {
+        return GEN_OP_INT_DIV;
+    }
+    if (strncmp(mnemonic, "and", 3) == 0) return GEN_OP_AND;
+    if (strncmp(mnemonic, "or", 2) == 0 && mnemonic[2] != 'n') return GEN_OP_OR;
+    if (strncmp(mnemonic, "xor", 3) == 0) return GEN_OP_XOR;
+    if (strncmp(mnemonic, "not", 3) == 0) return GEN_OP_NOT;
+    if (strncmp(mnemonic, "shl", 3) == 0 || strncmp(mnemonic, "sal", 3) == 0 ||
+        strncmp(mnemonic, "lsl", 3) == 0) {
+        return GEN_OP_SHL;
+    }
+    if (strncmp(mnemonic, "shr", 3) == 0 || strncmp(mnemonic, "lsr", 3) == 0) {
+        return GEN_OP_SHR;
+    }
+    if (strncmp(mnemonic, "sar", 3) == 0 || strncmp(mnemonic, "asr", 3) == 0) {
+        return GEN_OP_SAR;
+    }
+    if (strncmp(mnemonic, "rol", 3) == 0) return GEN_OP_ROL;
+    if (strncmp(mnemonic, "ror", 3) == 0) return GEN_OP_ROR;
+
+    /* ADC/SBB (add/sub with carry) */
+    if (strncmp(mnemonic, "adc", 3) == 0) return GEN_OP_INT_ADC;
+    if (strncmp(mnemonic, "sbb", 3) == 0) return GEN_OP_INT_SBB;
+
+    /* Data movement */
+    if (strncmp(mnemonic, "mov", 3) == 0) {
+        if (strncmp(mnemonic, "movs", 4) == 0 && mnemonic[4] == 'x') {
+            return GEN_OP_MOVSX;
+        }
+        if (strncmp(mnemonic, "movz", 4) == 0 && mnemonic[4] == 'x') {
+            return GEN_OP_MOVZX;
+        }
+        return GEN_OP_MOV;
+    }
+    if (strncmp(mnemonic, "lea", 3) == 0) return GEN_OP_LEA;
+    if (strncmp(mnemonic, "xchg", 4) == 0) return GEN_OP_XCHG;
+
+    /* Load/Store (architecture-specific mnemonics) */
+    if (strncmp(mnemonic, "ld", 2) == 0 && mnemonic[2] != 'm') return GEN_OP_LOAD;
+    if (strncmp(mnemonic, "st", 2) == 0 && mnemonic[2] != 'o') return GEN_OP_STORE;
+    if (strncmp(mnemonic, "ldr", 3) == 0) return GEN_OP_LOAD;
+    if (strncmp(mnemonic, "str", 3) == 0) return GEN_OP_STORE;
+    if (strncmp(mnemonic, "push", 4) == 0) return GEN_OP_PUSH;
+    if (strncmp(mnemonic, "pop", 3) == 0) return GEN_OP_POP;
+
+    /* Comparisons */
+    if (strncmp(mnemonic, "cmp", 3) == 0) return GEN_OP_CMP;
+    if (strncmp(mnemonic, "test", 4) == 0) return GEN_OP_TEST;
+
+    /* Branches and calls */
+    if (strncmp(mnemonic, "call", 4) == 0 || strncmp(mnemonic, "bl", 2) == 0) {
+        return GEN_OP_CALL;
+    }
+    if (strncmp(mnemonic, "ret", 3) == 0) return GEN_OP_RET;
+    if (strncmp(mnemonic, "jmp", 3) == 0 || strncmp(mnemonic, "b ", 2) == 0 ||
+        mnemonic[0] == 'j') {  /* j* covers all conditional jumps */
+        return GEN_OP_BRANCH;
+    }
+
+    /* Floating-point operations */
+    if (strncmp(mnemonic, "fadd", 4) == 0 || strncmp(mnemonic, "addss", 5) == 0 ||
+        strncmp(mnemonic, "addsd", 5) == 0 || strncmp(mnemonic, "addps", 5) == 0 ||
+        strncmp(mnemonic, "addpd", 5) == 0 || strncmp(mnemonic, "vadd", 4) == 0) {
+        return GEN_OP_FP_ADD;
+    }
+    if (strncmp(mnemonic, "fsub", 4) == 0 || strncmp(mnemonic, "subss", 5) == 0 ||
+        strncmp(mnemonic, "subsd", 5) == 0 || strncmp(mnemonic, "subps", 5) == 0 ||
+        strncmp(mnemonic, "subpd", 5) == 0 || strncmp(mnemonic, "vsub", 4) == 0) {
+        return GEN_OP_FP_SUB;
+    }
+    if (strncmp(mnemonic, "fmul", 4) == 0 || strncmp(mnemonic, "mulss", 5) == 0 ||
+        strncmp(mnemonic, "mulsd", 5) == 0 || strncmp(mnemonic, "mulps", 5) == 0 ||
+        strncmp(mnemonic, "mulpd", 5) == 0 || strncmp(mnemonic, "vmul", 4) == 0) {
+        return GEN_OP_FP_MUL;
+    }
+    if (strncmp(mnemonic, "fdiv", 4) == 0 || strncmp(mnemonic, "divss", 5) == 0 ||
+        strncmp(mnemonic, "divsd", 5) == 0 || strncmp(mnemonic, "divps", 5) == 0 ||
+        strncmp(mnemonic, "divpd", 5) == 0 || strncmp(mnemonic, "vdiv", 4) == 0) {
+        return GEN_OP_FP_DIV;
+    }
+    if (strncmp(mnemonic, "fsqrt", 5) == 0 || strncmp(mnemonic, "sqrtss", 6) == 0 ||
+        strncmp(mnemonic, "sqrtsd", 6) == 0 || strncmp(mnemonic, "sqrtps", 6) == 0 ||
+        strncmp(mnemonic, "sqrtpd", 6) == 0 || strncmp(mnemonic, "vsqrt", 5) == 0) {
+        return GEN_OP_FP_SQRT;
+    }
+    if (strncmp(mnemonic, "fma", 3) == 0 || strncmp(mnemonic, "vfma", 4) == 0) {
+        return GEN_OP_FP_FMA;
+    }
+
+    /* Vector/SIMD operations */
+    if (strncmp(mnemonic, "padd", 4) == 0 || strncmp(mnemonic, "vpadd", 5) == 0) {
+        return GEN_OP_VEC_ADD;
+    }
+    if (strncmp(mnemonic, "psub", 4) == 0 || strncmp(mnemonic, "vpsub", 5) == 0) {
+        return GEN_OP_VEC_SUB;
+    }
+    if (strncmp(mnemonic, "pmul", 4) == 0 || strncmp(mnemonic, "vpmul", 5) == 0) {
+        return GEN_OP_VEC_MUL;
+    }
+    if (strncmp(mnemonic, "pand", 4) == 0 || strncmp(mnemonic, "vpand", 5) == 0) {
+        return GEN_OP_VEC_AND;
+    }
+    if (strncmp(mnemonic, "por", 3) == 0 || strncmp(mnemonic, "vpor", 4) == 0) {
+        return GEN_OP_VEC_OR;
+    }
+    if (strncmp(mnemonic, "pxor", 4) == 0 || strncmp(mnemonic, "vpxor", 5) == 0) {
+        return GEN_OP_VEC_XOR;
+    }
+
+    /* System/special */
+    if (strncmp(mnemonic, "nop", 3) == 0) return GEN_OP_NOP;
+    if (strncmp(mnemonic, "hlt", 3) == 0 || strncmp(mnemonic, "halt", 4) == 0) {
+        return GEN_OP_HALT;
+    }
+    if (strncmp(mnemonic, "syscall", 7) == 0 || strncmp(mnemonic, "svc", 3) == 0 ||
+        strncmp(mnemonic, "int", 3) == 0) {
+        return GEN_OP_SYSCALL;
+    }
+
+    return GEN_OP_UNKNOWN;
+}
+
+/*
+ * Helper: Determine branch type from instruction mnemonic.
+ */
+static uint8_t mnemonic_to_branch_type(const char *mnemonic)
+{
+    if (!mnemonic || !*mnemonic) {
+        return BRANCH_NONE;
+    }
+
+    /* Direct unconditional jumps */
+    if (strcmp(mnemonic, "jmp") == 0 || strcmp(mnemonic, "jmpq") == 0 ||
+        strcmp(mnemonic, "jmpl") == 0 || strcmp(mnemonic, "b") == 0) {
+        return BRANCH_DIRECT_JUMP;
+    }
+
+    /* Indirect jumps */
+    if (strncmp(mnemonic, "jmp", 3) == 0 && strchr(mnemonic, '*') != NULL) {
+        return BRANCH_INDIRECT_JUMP;
+    }
+
+    /* Conditional branches */
+    if (mnemonic[0] == 'j' && strcmp(mnemonic, "jmp") != 0 &&
+        strcmp(mnemonic, "jmpq") != 0 && strcmp(mnemonic, "jmpl") != 0) {
+        /* je, jne, jz, jnz, jl, jle, jg, jge, etc. */
+        return BRANCH_CONDITIONAL;
+    }
+    /* ARM conditional branches */
+    if (mnemonic[0] == 'b' && mnemonic[1] != 'l' && mnemonic[1] != ' ' &&
+        mnemonic[1] != '\0') {
+        /* beq, bne, blt, bge, etc. */
+        return BRANCH_CONDITIONAL;
+    }
+
+    /* Direct calls */
+    if (strcmp(mnemonic, "call") == 0 || strcmp(mnemonic, "callq") == 0 ||
+        strcmp(mnemonic, "calll") == 0 || strcmp(mnemonic, "bl") == 0) {
+        return BRANCH_DIRECT_CALL;
+    }
+
+    /* Indirect calls */
+    if (strncmp(mnemonic, "call", 4) == 0 && strchr(mnemonic, '*') != NULL) {
+        return BRANCH_INDIRECT_CALL;
+    }
+
+    /* Returns */
+    if (strncmp(mnemonic, "ret", 3) == 0 || strcmp(mnemonic, "bx") == 0) {
+        return BRANCH_RETURN;
+    }
+
+    return BRANCH_NONE;
+}
+
+/*
+ * New decode function using qemu_plugin_insn_disas().
+ * This replaces the manual bit-interpretation approach with
+ * QEMU's internal disassembler for ISA-agnostic decoding.
+ */
+static void decode_insn_from_disas(struct qemu_plugin_insn *insn,
                                     InsnFields *out)
 {
     memset(out, 0, sizeof(*out));
 
-    if (is_x86) {
-        X86DecodeState s;
-        memset(&s, 0, sizeof(s));
-        x86_raw_decode(bytes, len, &s);
-        x86_map_to_generic(&s, out);
+    /* Get disassembly string from QEMU */
+    char *disas = qemu_plugin_insn_disas(insn);
+    if (!disas) {
+        out->opcode = GEN_OP_UNKNOWN;
+        return;
     }
+
+    /* Extract mnemonic (first word) */
+    char *mnemonic_end = strchr(disas, ' ');
+    if (!mnemonic_end) {
+        mnemonic_end = strchr(disas, '\t');
+    }
+
+    char *mnemonic;
+    if (mnemonic_end) {
+        mnemonic = g_strndup(disas, mnemonic_end - disas);
+    } else {
+        mnemonic = g_strdup(disas);
+    }
+
+    /* Map mnemonic to generic opcode */
+    out->opcode = mnemonic_to_opcode(mnemonic);
+
+    /* Determine branch type */
+    out->branch_type = mnemonic_to_branch_type(mnemonic);
+
+    /* Extract operands (registers and immediates) */
+    extract_operands_from_disas(disas, out);
+
+    g_free(mnemonic);
+    g_free(disas);
 }
 
 /* ========================= String Helpers for Text Output ========================= */
@@ -1545,8 +2043,7 @@ static BBTemplate *find_template(uint64_t start_pc)
 static BBTemplate *get_or_create_template(uint64_t start_pc,
                                           uint32_t n_insns,
                                           uint64_t *insn_pcs,
-                                          uint32_t *insn_sizes,
-                                          uint8_t **insn_bytes,
+                                          struct qemu_plugin_insn **insns,
                                           uint64_t fall_through_pc)
 {
     BBTemplate *tmpl = find_template(start_pc);
@@ -1565,12 +2062,11 @@ static BBTemplate *get_or_create_template(uint64_t start_pc,
         tmpl->insn_pcs[i] = insn_pcs[i];
     }
 
-    /* Decode all instructions to ISA-agnostic generic fields */
+    /* Decode all instructions to ISA-agnostic generic fields using disassembly */
     tmpl->insn_fields = g_new0(InsnFields, n_insns);
     for (uint32_t i = 0; i < n_insns; i++) {
-        if (insn_bytes && insn_bytes[i] && insn_sizes[i] > 0) {
-            decode_insn_to_generic(insn_bytes[i], insn_sizes[i],
-                                   &tmpl->insn_fields[i]);
+        if (insns && insns[i]) {
+            decode_insn_from_disas(insns[i], &tmpl->insn_fields[i]);
         }
     }
 
@@ -2507,7 +3003,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
 /*
  * Called when a basic block is translated.
- * Creates BB templates with instruction bytes and instruments the block.
+ * Creates BB templates using disassembly and instruments the block.
  */
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
@@ -2520,19 +3016,14 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     size_t last_insn_size = qemu_plugin_insn_size(last_insn);
     uint64_t fall_through = last_insn_pc + last_insn_size;
 
-    /* Collect instruction data for BB template */
+    /* Collect instruction pointers and PCs for BB template */
     uint64_t *insn_pcs = g_new0(uint64_t, n_insns);
-    uint32_t *insn_sizes = g_new0(uint32_t, n_insns);
-    uint8_t **insn_bytes_arr = g_new0(uint8_t *, n_insns);
+    struct qemu_plugin_insn **insns = g_new0(struct qemu_plugin_insn *, n_insns);
 
     for (size_t i = 0; i < n_insns; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
         insn_pcs[i] = qemu_plugin_insn_vaddr(insn);
-        insn_sizes[i] = (uint32_t)qemu_plugin_insn_size(insn);
-
-        /* Capture instruction bytes */
-        insn_bytes_arr[i] = g_new0(uint8_t, insn_sizes[i]);
-        qemu_plugin_insn_data(insn, insn_bytes_arr[i], insn_sizes[i]);
+        insns[i] = insn;
 
         /* Register per-instruction memory callback with PC as udata */
         qemu_plugin_register_vcpu_mem_cb(
@@ -2540,19 +3031,15 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             QEMU_PLUGIN_MEM_RW, (void *)(uintptr_t)insn_pcs[i]);
     }
 
-    /* Create or update BB template */
+    /* Create or update BB template using disassembly-based decode */
     g_mutex_lock(&data_lock);
-    get_or_create_template(pc, (uint32_t)n_insns, insn_pcs, insn_sizes,
-                           insn_bytes_arr, fall_through);
+    get_or_create_template(pc, (uint32_t)n_insns, insn_pcs, insns,
+                           fall_through);
     g_mutex_unlock(&data_lock);
 
-    /* Free temporary arrays (template made copies) */
-    for (size_t i = 0; i < n_insns; i++) {
-        g_free(insn_bytes_arr[i]);
-    }
+    /* Free temporary arrays */
     g_free(insn_pcs);
-    g_free(insn_sizes);
-    g_free(insn_bytes_arr);
+    g_free(insns);
 
     /*
      * Instrument the block for execution tracking.

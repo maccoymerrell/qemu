@@ -2882,6 +2882,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         trace_isa = TRACE_ISA_AARCH64;
     } else {
         trace_isa = TRACE_ISA_UNKNOWN;
+        fprintf(stderr, "wptrace: warning: unsupported ISA '%s', "
+                "instruction decode will be limited\n", target_name);
     }
 
     /* Parse arguments */

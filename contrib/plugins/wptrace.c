@@ -1578,7 +1578,7 @@ static uint8_t mnemonic_to_opcode(const char *mnemonic)
         return GEN_OP_FP_SQRT;
     }
     if (strncmp(mnemonic, "fma", 3) == 0 || strncmp(mnemonic, "vfma", 4) == 0) {
-        return GEN_OP_FP_FMA;
+        return GEN_OP_FP_CVT;  /* Use CVT as a placeholder for FMA */
     }
 
     /* Vector/SIMD operations */
@@ -1592,19 +1592,19 @@ static uint8_t mnemonic_to_opcode(const char *mnemonic)
         return GEN_OP_VEC_MUL;
     }
     if (strncmp(mnemonic, "pand", 4) == 0 || strncmp(mnemonic, "vpand", 5) == 0) {
-        return GEN_OP_VEC_AND;
+        return GEN_OP_VEC_LOGIC;  /* Use LOGIC for AND/OR/XOR */
     }
     if (strncmp(mnemonic, "por", 3) == 0 || strncmp(mnemonic, "vpor", 4) == 0) {
-        return GEN_OP_VEC_OR;
+        return GEN_OP_VEC_LOGIC;
     }
     if (strncmp(mnemonic, "pxor", 4) == 0 || strncmp(mnemonic, "vpxor", 5) == 0) {
-        return GEN_OP_VEC_XOR;
+        return GEN_OP_VEC_LOGIC;
     }
 
     /* System/special */
     if (strncmp(mnemonic, "nop", 3) == 0) return GEN_OP_NOP;
     if (strncmp(mnemonic, "hlt", 3) == 0 || strncmp(mnemonic, "halt", 4) == 0) {
-        return GEN_OP_HALT;
+        return GEN_OP_UNKNOWN;  /* HALT not in enum, use UNKNOWN */
     }
     if (strncmp(mnemonic, "syscall", 7) == 0 || strncmp(mnemonic, "svc", 3) == 0 ||
         strncmp(mnemonic, "int", 3) == 0) {
@@ -1638,13 +1638,13 @@ static uint8_t mnemonic_to_branch_type(const char *mnemonic)
     if (mnemonic[0] == 'j' && strcmp(mnemonic, "jmp") != 0 &&
         strcmp(mnemonic, "jmpq") != 0 && strcmp(mnemonic, "jmpl") != 0) {
         /* je, jne, jz, jnz, jl, jle, jg, jge, etc. */
-        return BRANCH_CONDITIONAL;
+        return BRANCH_COND_DIRECT;
     }
     /* ARM conditional branches */
     if (mnemonic[0] == 'b' && mnemonic[1] != 'l' && mnemonic[1] != ' ' &&
         mnemonic[1] != '\0') {
         /* beq, bne, blt, bge, etc. */
-        return BRANCH_CONDITIONAL;
+        return BRANCH_COND_DIRECT;
     }
 
     /* Direct calls */
@@ -2151,10 +2151,11 @@ static WPBBEntry create_wp_bb_entry(uint64_t bb_start_pc,
         }
         ft_pc = pcs[n_insns - 1] + sizes[n_insns - 1];
 
-        tmpl = get_or_create_template(bb_start_pc, n_insns, pcs, sizes,
-                                      bytes, ft_pc);
+        /* During wrong-path execution we don't have qemu_plugin_insn pointers,
+         * so pass NULL and skip disassembly-based decode for these BBs */
+        tmpl = get_or_create_template(bb_start_pc, n_insns, pcs, NULL, ft_pc);
 
-        /* get_or_create_template makes its own copies */
+        /* Free temporary arrays */
         for (uint32_t i = 0; i < n_insns; i++) {
             g_free(bytes[i]);
         }

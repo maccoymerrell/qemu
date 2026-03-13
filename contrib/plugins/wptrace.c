@@ -145,7 +145,7 @@ static void decode_x86_insn(const uint8_t *bytes, uint32_t len,
         uint8_t op = out->opcode[0];
 
         /* Opcodes that generally have ModRM byte */
-        if ((op >= 0x00 && op <= 0x03) || /* ADD r/m, r / ADD r, r/m */
+        if ((op <= 0x03) ||                /* ADD r/m, r / ADD r, r/m */
             (op >= 0x08 && op <= 0x0B) || /* OR */
             (op >= 0x10 && op <= 0x13) || /* ADC */
             (op >= 0x18 && op <= 0x1B) || /* SBB */
@@ -1039,24 +1039,6 @@ static void write_uleb128(FILE *f, uint64_t v)
         }
         fwrite(&byte, 1, 1, f);
     } while (v != 0);
-}
-
-static void write_sleb128(FILE *f, int64_t v)
-{
-    if (!f) {
-        return;
-    }
-    bool more = true;
-    while (more) {
-        uint8_t byte = v & 0x7F;
-        v >>= 7;
-        if ((v == 0 && !(byte & 0x40)) || (v == -1 && (byte & 0x40))) {
-            more = false;
-        } else {
-            byte |= 0x80;
-        }
-        fwrite(&byte, 1, 1, f);
-    }
 }
 
 static inline void write_u8(FILE *f, uint8_t v)

@@ -54,7 +54,16 @@ static char *program_name = NULL;
 static uint64_t trace_start_insn = 0;
 static uint64_t trace_stop_insn = UINT64_MAX;
 static const char *target_name;
-static bool is_x86 = false;
+
+/* ISA enum for extensibility: add new ISAs here */
+typedef enum {
+    TRACE_ISA_UNKNOWN = 0,
+    TRACE_ISA_X86     = 1,   /* x86_64 and i386 */
+    TRACE_ISA_AARCH64 = 2,   /* AArch64 (ARMv8+) */
+    /* Future ISAs: TRACE_ISA_RISCV = 3, TRACE_ISA_MIPS = 4, ... */
+} TraceISA;
+
+static TraceISA trace_isa = TRACE_ISA_UNKNOWN;
 
 /* SimPoints-driven tracing */
 static char *simpoints_file_path = NULL;
@@ -73,7 +82,7 @@ static guint simpoints_current_idx = 0;
 #define MAX_INSN_BYTES 16
 
 /* Magic for binary format */
-#define WPT_MAGIC  0x54505703  /* 'T','P','W',0x03 little-endian - version 3 */
+#define WPT_MAGIC  0x54505704  /* 'T','P','W',0x04 little-endian - version 4 */
 
 /* ========================= ISA-Agnostic Instruction Fields ========================= */
 
@@ -611,7 +620,7 @@ static void classify_mnemonic(const char *mnem, uint8_t *opcode,
     }
 
     /* x86 conditional branches: j<cc> (not jmp/jmpq) */
-    if (is_x86 && mnem[0] == 'j') {
+    if (trace_isa == TRACE_ISA_X86 && mnem[0] == 'j') {
         char tmp[32];
         g_strlcpy(tmp, mnem, sizeof(tmp));
         size_t tlen = strlen(tmp);
@@ -626,28 +635,28 @@ static void classify_mnemonic(const char *mnem, uint8_t *opcode,
     }
 
     /* AArch64 conditional branches: b.eq, b.ne, b.gt, etc. */
-    if (!is_x86 && mnem[0] == 'b' && mnem[1] == '.') {
+    if (trace_isa == TRACE_ISA_AARCH64 && mnem[0] == 'b' && mnem[1] == '.') {
         *opcode = GEN_OP_BRANCH;
         *branch_type = BRANCH_COND_DIRECT;
         return;
     }
 
     /* AArch64 unconditional branch */
-    if (!is_x86 && strcmp(mnem, "b") == 0) {
+    if (trace_isa == TRACE_ISA_AARCH64 && strcmp(mnem, "b") == 0) {
         *opcode = GEN_OP_BRANCH;
         *branch_type = BRANCH_DIRECT_JUMP;
         return;
     }
 
     /* AArch64 ret */
-    if (!is_x86 && strcmp(mnem, "ret") == 0) {
+    if (trace_isa == TRACE_ISA_AARCH64 && strcmp(mnem, "ret") == 0) {
         *opcode = GEN_OP_RET;
         *branch_type = BRANCH_RETURN;
         return;
     }
 
     /* AArch64 compare and branch: cbz, cbnz, tbz, tbnz */
-    if (!is_x86 && (strncmp(mnem, "cbz", 3) == 0 ||
+    if (trace_isa == TRACE_ISA_AARCH64 && (strncmp(mnem, "cbz", 3) == 0 ||
                     strncmp(mnem, "cbnz", 4) == 0 ||
                     strncmp(mnem, "tbz", 3) == 0 ||
                     strncmp(mnem, "tbnz", 4) == 0)) {
@@ -657,13 +666,13 @@ static void classify_mnemonic(const char *mnem, uint8_t *opcode,
     }
 
     /* x86 cmov<cc> variants */
-    if (is_x86 && strncmp(mnem, "cmov", 4) == 0) {
+    if (trace_isa == TRACE_ISA_X86 && strncmp(mnem, "cmov", 4) == 0) {
         *opcode = GEN_OP_CMOV;
         return;
     }
 
     /* x86 set<cc> variants */
-    if (is_x86 && strncmp(mnem, "set", 3) == 0 && strlen(mnem) > 3) {
+    if (trace_isa == TRACE_ISA_X86 && strncmp(mnem, "set", 3) == 0 && strlen(mnem) > 3) {
         *opcode = GEN_OP_SETCC;
         return;
     }
@@ -1388,10 +1397,16 @@ static void decode_disas_to_generic(const char *disas, InsnFields *out)
 
     /* Parse operands for register and immediate extraction */
     if (*p) {
-        if (is_x86) {
+        switch (trace_isa) {
+        case TRACE_ISA_X86:
             parse_x86_operands(p, out);
-        } else {
+            break;
+        case TRACE_ISA_AARCH64:
             parse_aarch64_operands(p, out);
+            break;
+        default:
+            /* Unknown ISA: no operand parsing */
+            break;
         }
     }
 }
@@ -2247,10 +2262,11 @@ static inline void write_u64(FILE *f, uint64_t v)
 }
 
 /*
- * Write the header section in packed binary format (v3 ULEB128).
+ * Write the header section in packed binary format (v4 ULEB128).
  *
  * Binary header layout:
- *   magic:            uint32 (WPT_MAGIC v3)
+ *   magic:            uint32 (WPT_MAGIC v4)
+ *   isa:              uint8  (TraceISA enum value)
  *   num_templates:    ULEB128
  *   For each template:
  *     template_id:      ULEB128
@@ -2277,6 +2293,7 @@ static void write_bin_header(FILE *f)
     gpointer value;
 
     write_u32(f, WPT_MAGIC);
+    write_u8(f, (uint8_t)trace_isa);
     write_uleb128(f, g_hash_table_size(template_map));
 
     g_hash_table_iter_init(&iter, template_map);
@@ -2311,7 +2328,7 @@ static void write_bin_header(FILE *f)
 }
 
 /*
- * Write the body section in packed binary format (v3 ULEB128).
+ * Write the body section in packed binary format (v4 ULEB128).
  *
  * Binary body layout:
  *   num_entries:      ULEB128
@@ -2858,8 +2875,14 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                         int argc, char **argv)
 {
     target_name = info->target_name;
-    is_x86 = (g_str_has_prefix(target_name, "x86_64") ||
-              g_str_has_prefix(target_name, "i386"));
+    if (g_str_has_prefix(target_name, "x86_64") ||
+        g_str_has_prefix(target_name, "i386")) {
+        trace_isa = TRACE_ISA_X86;
+    } else if (g_str_has_prefix(target_name, "aarch64")) {
+        trace_isa = TRACE_ISA_AARCH64;
+    } else {
+        trace_isa = TRACE_ISA_UNKNOWN;
+    }
 
     /* Parse arguments */
     for (int i = 0; i < argc; i++) {

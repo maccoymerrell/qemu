@@ -2156,7 +2156,7 @@ static void write_bin_header(FILE *f)
 }
 
 /*
- * Write the body section in packed binary format (v2 ULEB128).
+ * Write the body section in packed binary format (v3 ULEB128).
  *
  * Binary body layout:
  *   num_entries:      ULEB128

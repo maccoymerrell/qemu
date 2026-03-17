@@ -2570,6 +2570,7 @@ typedef struct {
 /* ========================= Global State ========================= */
 
 static GMutex data_lock;
+static GMutex exec_lock;
 static GHashTable *template_map;    /* start_pc (uint64*) → BBTemplate* */
 static GHashTable *branch_map;      /* branch_pc (uint64*) → BranchRecord* */
 static uint32_t next_template_id = 1;
@@ -2587,14 +2588,14 @@ static TraceSegment *current_segment = NULL;
 static uint32_t body_seq_num = 0;
 
 /* Wrong-path execution state */
-static bool wp_in_progress = false;
-static GArray *wp_mem_accesses = NULL;
-static uint64_t wp_current_insn_pc = 0;
-static uint64_t wp_saved_insn_count = 0;
-static unsigned int wp_saved_cpu_index = 0;
+static __thread bool wp_in_progress = false;
+static __thread GArray *wp_mem_accesses = NULL;
+static __thread uint64_t wp_current_insn_pc = 0;
+static __thread uint64_t wp_saved_insn_count = 0;
+static __thread unsigned int wp_saved_cpu_index = 0;
 
 /* Correct-path memory accesses for current BB */
-static GArray *cp_mem_accesses = NULL;
+static __thread GArray *cp_mem_accesses = NULL;
 
 /* Statistics */
 static uint64_t stat_blocks_translated;
@@ -2921,30 +2922,44 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         sim_insns++;
         uint64_t post_pc = qemu_plugin_get_pc();
 
-        /* Determine instruction size */
-        uint32_t insn_size;
-        bool is_sequential;
-        if (post_pc > pre_pc && (post_pc - pre_pc) <= MAX_INSN_BYTES) {
-            insn_size = (uint32_t)(post_pc - pre_pc);
-            is_sequential = true;
-        } else {
-            /* Branch or backwards jump - use template_map if available */
-            g_mutex_lock(&data_lock);
-            BBTemplate *known = find_template(bb_start_pc);
-            g_mutex_unlock(&data_lock);
+        /*
+         * Look up the template for this instruction's PC.
+         * The template is created by vcpu_tb_trans during tb_gen_code
+         * inside cpu_plugin_exec_inline, so it should exist by now.
+         */
+        g_mutex_lock(&data_lock);
+        BBTemplate *insn_tmpl = find_template(pre_pc);
+        g_mutex_unlock(&data_lock);
 
-            insn_size = 0;
-            if (known) {
-                uint32_t idx_in_bb = bb_insn_pcs->len;
-                if (idx_in_bb < known->n_insns) {
-                    insn_size = template_insn_size(known, idx_in_bb);
+        /* Determine instruction size and branch type from template */
+        uint32_t insn_size = 0;
+        uint8_t br_type = BRANCH_NONE;
+
+        if (insn_tmpl && insn_tmpl->n_insns > 0) {
+            insn_size = template_insn_size(insn_tmpl, 0);
+            br_type = insn_tmpl->insn_fields[0].branch_type;
+        }
+
+        /* Fallback instruction size from post_pc or buffer length */
+        if (insn_size == 0) {
+            if (post_pc > pre_pc && (post_pc - pre_pc) <= MAX_INSN_BYTES) {
+                insn_size = (uint32_t)(post_pc - pre_pc);
+            } else {
+                g_mutex_lock(&data_lock);
+                BBTemplate *known = find_template(bb_start_pc);
+                g_mutex_unlock(&data_lock);
+
+                if (known) {
+                    uint32_t idx_in_bb = bb_insn_pcs->len;
+                    if (idx_in_bb < known->n_insns) {
+                        insn_size = template_insn_size(known, idx_in_bb);
+                    }
+                }
+                if (insn_size == 0) {
+                    insn_size = insn_buf->len < MAX_INSN_BYTES ?
+                                insn_buf->len : MAX_INSN_BYTES;
                 }
             }
-            if (insn_size == 0) {
-                insn_size = insn_buf->len < MAX_INSN_BYTES ?
-                            insn_buf->len : MAX_INSN_BYTES;
-            }
-            is_sequential = false;
         }
 
         /* Record instruction in current BB */
@@ -2959,8 +2974,33 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             }
         }
 
-        /* Check for BB boundary (non-sequential PC) */
-        if (!is_sequential) {
+        /*
+         * Detect BB boundary: the instruction is a branch (from template)
+         * or the PC moved non-sequentially (fallback detection).
+         */
+        bool is_branch = (br_type != BRANCH_NONE);
+        bool is_non_sequential = (post_pc != pre_pc + insn_size);
+        if (is_non_sequential && !is_branch) {
+            is_branch = true;
+        }
+
+        if (is_branch) {
+            uint64_t fall_through = pre_pc + insn_size;
+            uint64_t chosen_target;
+
+            if (br_type == BRANCH_COND_DIRECT) {
+                /* Always predict not-taken for conditional branches */
+                chosen_target = fall_through;
+            } else {
+                /* Follow natural execution for unconditional/call/return */
+                chosen_target = post_pc;
+            }
+
+            /* Redirect PC if the chosen target differs from natural */
+            if (chosen_target != post_pc) {
+                qemu_plugin_set_pc(chosen_target);
+            }
+
             /* Finalize current WP BB */
             WPBBEntry wp_bb = create_wp_bb_entry(
                 bb_start_pc, bb_insn_pcs, bb_insn_sizes,
@@ -2969,7 +3009,7 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             /* Add branch target as dynamic param */
             DynParam target_dp = {
                 .type = DYN_BRANCH_TARGET,
-                .value = post_pc,
+                .value = chosen_target,
             };
             g_array_append_val(wp_bb.dyn_params, target_dp);
             g_array_append_val(wp_chain, wp_bb);
@@ -2978,7 +3018,7 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             bb_mem_start_idx = wp_mem_accesses->len;
             g_array_set_size(bb_insn_pcs, 0);
             g_array_set_size(bb_insn_sizes, 0);
-            bb_start_pc = post_pc;
+            bb_start_pc = chosen_target;
         }
     }
 
@@ -3505,6 +3545,8 @@ static void finish_trace_segment(void)
  */
 static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 {
+    g_mutex_lock(&exec_lock);
+
     uint64_t current_pc = qemu_plugin_u64_get(sb_current_pc, cpu_index);
     uint64_t prev_last = qemu_plugin_u64_get(sb_prev_last_pc, cpu_index);
     uint64_t prev_ft = qemu_plugin_u64_get(sb_prev_fall_through, cpu_index);
@@ -3512,7 +3554,12 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     /* Don't trigger inside wrong-path execution */
     if (wp_in_progress) {
+        g_mutex_unlock(&exec_lock);
         return;
+    }
+
+    if (!cp_mem_accesses) {
+        cp_mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
     }
 
     /* --- Tracing window management --- */
@@ -3536,6 +3583,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         }
         if (!trace_active && simpoints_current_idx >= simpoints_list->len) {
             /* All simpoints traced */
+            g_mutex_unlock(&exec_lock);
             exit(0);
         }
     } else {
@@ -3546,12 +3594,14 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         }
         if (trace_active && icount >= trace_stop_insn) {
             finish_trace_segment();
+            g_mutex_unlock(&exec_lock);
             exit(0);
         }
     }
 
     /* Skip initial block (no previous context) */
     if (prev_ft == 0) {
+        g_mutex_unlock(&exec_lock);
         return;
     }
 
@@ -3642,6 +3692,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
             g_array_set_size(cp_mem_accesses, 0);
         }
     }
+
+    g_mutex_unlock(&exec_lock);
 }
 
 /* ========================= Translation Callback ========================= */
@@ -3736,6 +3788,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
  */
 static void vcpu_tb_flush(qemu_plugin_id_t id)
 {
+    g_mutex_lock(&exec_lock);
+
     if (wp_in_progress) {
         wp_in_progress = false;
         /* Restore the correct-path instruction count that was saved before
@@ -3747,16 +3801,22 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
             wp_mem_accesses = NULL;
         }
     }
+
+    g_mutex_unlock(&exec_lock);
 }
 
 /* ========================= Exit / Statistics ========================= */
 
 static void plugin_exit(qemu_plugin_id_t id, void *p)
 {
+    g_mutex_lock(&exec_lock);
+
     /* Finish any active trace segment */
     if (trace_active) {
         finish_trace_segment();
     }
+
+    g_mutex_unlock(&exec_lock);
 
     /* Print statistics */
     g_autoptr(GString) report = g_string_new("");
@@ -3966,6 +4026,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
 
     /* Initialize data structures */
     g_mutex_init(&data_lock);
+    g_mutex_init(&exec_lock);
     template_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
                                          NULL, bb_template_free);
     branch_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
@@ -4024,9 +4085,6 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         vcpu_sb, VCPUScoreBoard, prev_fall_through);
     sb_insn_count = qemu_plugin_scoreboard_u64_in_struct(
         vcpu_sb, VCPUScoreBoard, insn_count);
-
-    /* Initialize correct-path memory access collection */
-    cp_mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
 
     /* For simple start/stop, auto-start if start is 0 (not simpoints mode) */
     if (!simpoints_list && trace_start_insn == 0) {

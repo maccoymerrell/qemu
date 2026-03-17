@@ -650,10 +650,11 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
     cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
 
     cflags = curr_cflags(cpu);
-    /* Execute in serial context, exactly 1 instruction, no chaining */
+    /* Execute in serial context, exactly 1 instruction, no chaining.
+     * CF_SINGLE_STEP prevents rep-prefixed instructions from looping. */
     cflags &= ~CF_PARALLEL;
-    cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR | 1;
-    cflags |= CF_MEMI_ONLY;
+    cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR | CF_MEMI_ONLY
+            | CF_SINGLE_STEP | 1;
 
     /* Force slow-path memory ops so the spec store buffer can intercept */
     if (cpu->plugin_spec_mode) {
@@ -716,6 +717,43 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
 void cpu_plugin_flush_tlb(CPUState *cpu)
 {
     tlb_flush(cpu);
+}
+
+size_t cpu_plugin_arch_state_size(void)
+{
+    /*
+     * Only save execution state up to end_reset_fields.  Fields beyond
+     * that boundary are static configuration (CPUID, features) or
+     * externally-managed pointers (KVM/HVF buffers, Xen timers, mutexes)
+     * that must not be rolled back by speculative execution.
+     */
+    return offsetof(CPUArchState, end_reset_fields);
+}
+
+void cpu_plugin_arch_state_restore(void *saved, size_t size)
+{
+    CPUArchState *env = cpu_env(current_cpu);
+
+    /*
+     * Preserve debug breakpoint/watchpoint pointers across restore.
+     * These are managed by the GDB debug subsystem and must not be
+     * rolled back during speculative execution.
+     */
+#if defined(TARGET_I386)
+    void *bp_save[4];
+    memcpy(bp_save, env->cpu_breakpoint, sizeof(bp_save));
+    memcpy(env, saved, size);
+    memcpy(env->cpu_breakpoint, bp_save, sizeof(bp_save));
+#elif defined(TARGET_ARM)
+    void *bp_save[16], *wp_save[16];
+    memcpy(bp_save, env->cpu_breakpoint, sizeof(bp_save));
+    memcpy(wp_save, env->cpu_watchpoint, sizeof(wp_save));
+    memcpy(env, saved, size);
+    memcpy(env->cpu_breakpoint, bp_save, sizeof(bp_save));
+    memcpy(env->cpu_watchpoint, wp_save, sizeof(wp_save));
+#else
+    memcpy(env, saved, size);
+#endif
 }
 
 void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)

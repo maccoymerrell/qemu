@@ -493,37 +493,26 @@ int qemu_plugin_write_register(struct qemu_plugin_register *reg,
 }
 
 /*
- * CPU state snapshot structure.
- * Saves all registers via the GDB interface for architecture-agnostic
- * state capture and rollback.
+ * CPU state save/restore for speculative execution rollback.
+ * Snapshots execution state (up to end_reset_fields) via memcpy,
+ * capturing all internal state (lazy flags, FPU, etc.) that the
+ * GDB register interface would miss.  Static config (CPUID, features)
+ * and externally-managed pointers (timers, buffers) are excluded.
  */
 struct qemu_plugin_cpu_state {
-    int n_regs;             /* Number of registers saved */
-    int *reg_ids;           /* GDB register IDs */
-    GByteArray **reg_data;  /* Register value buffers */
+    void *arch_state;       /* Raw copy of CPUArchState execution fields */
+    size_t arch_state_size; /* offsetof(CPUArchState, end_reset_fields) */
 };
 
 struct qemu_plugin_cpu_state *qemu_plugin_cpu_state_save(void)
 {
     g_assert(current_cpu);
 
-    g_autoptr(GArray) regs = gdb_get_register_list(current_cpu);
-    if (!regs || regs->len == 0) {
-        return NULL;
-    }
-
-    struct qemu_plugin_cpu_state *state = g_new0(struct qemu_plugin_cpu_state,
-                                                 1);
-    state->n_regs = regs->len;
-    state->reg_ids = g_new(int, regs->len);
-    state->reg_data = g_new0(GByteArray *, regs->len);
-
-    for (guint i = 0; i < regs->len; i++) {
-        GDBRegDesc *grd = &g_array_index(regs, GDBRegDesc, i);
-        state->reg_ids[i] = grd->gdb_reg;
-        state->reg_data[i] = g_byte_array_new();
-        gdb_read_register(current_cpu, state->reg_data[i], grd->gdb_reg);
-    }
+    struct qemu_plugin_cpu_state *state = g_new(struct qemu_plugin_cpu_state,
+                                                1);
+    state->arch_state_size = cpu_plugin_arch_state_size();
+    state->arch_state = g_memdup2((void *)(current_cpu + 1),
+                                  state->arch_state_size);
 
     return state;
 }
@@ -536,13 +525,7 @@ bool qemu_plugin_cpu_state_restore(struct qemu_plugin_cpu_state *state)
         return false;
     }
 
-    for (int i = 0; i < state->n_regs; i++) {
-        if (state->reg_data[i] && state->reg_data[i]->len > 0) {
-            gdb_write_register(current_cpu, state->reg_data[i]->data,
-                               state->reg_ids[i]);
-        }
-    }
-
+    cpu_plugin_arch_state_restore(state->arch_state, state->arch_state_size);
     return true;
 }
 
@@ -551,13 +534,7 @@ void qemu_plugin_cpu_state_free(struct qemu_plugin_cpu_state *state)
     if (!state) {
         return;
     }
-    for (int i = 0; i < state->n_regs; i++) {
-        if (state->reg_data[i]) {
-            g_byte_array_unref(state->reg_data[i]);
-        }
-    }
-    g_free(state->reg_ids);
-    g_free(state->reg_data);
+    g_free(state->arch_state);
     g_free(state);
 }
 
@@ -589,8 +566,11 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
     /* Flush TLB to force slow-path for all spec-mode memory accesses */
     cpu_plugin_flush_tlb(current_cpu);
 
-    current_cpu->plugin_spec_store_buf = g_hash_table_new(g_direct_hash,
-                                                           g_direct_equal);
+    /* Reuse existing hash table (cleared on previous spec_mode_end) */
+    if (!current_cpu->plugin_spec_store_buf) {
+        current_cpu->plugin_spec_store_buf = g_hash_table_new(g_direct_hash,
+                                                               g_direct_equal);
+    }
     current_cpu->plugin_spec_saved_state = saved_state;
     current_cpu->plugin_spec_mode = true;
 }
@@ -605,9 +585,10 @@ void qemu_plugin_spec_mode_end(void)
 
     current_cpu->plugin_spec_mode = false;
     current_cpu->plugin_spec_saved_state = NULL;
+
+    /* Flush store buffer data but retain the hash table for reuse */
     if (current_cpu->plugin_spec_store_buf) {
-        g_hash_table_destroy(current_cpu->plugin_spec_store_buf);
-        current_cpu->plugin_spec_store_buf = NULL;
+        g_hash_table_remove_all(current_cpu->plugin_spec_store_buf);
     }
 
     /* Flush stale TLB entries from wrong-path execution */

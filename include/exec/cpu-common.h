@@ -29,6 +29,8 @@ void cpu_exec_step_atomic(CPUState *cpu);
 /* Plugin helpers for wrong-path speculative execution */
 bool cpu_plugin_exec_inline(CPUState *cpu);
 void cpu_plugin_flush_tlb(CPUState *cpu);
+size_t cpu_plugin_arch_state_size(void);
+void cpu_plugin_arch_state_restore(void *saved, size_t size);
 
 #define REAL_HOST_PAGE_ALIGN(addr) ROUND_UP((addr), qemu_real_host_page_size())
 

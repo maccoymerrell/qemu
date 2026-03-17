@@ -32,6 +32,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 static char *output_path = NULL;
 static uint64_t simpoint_interval = 100000000;  /* 100M instructions */
 static int num_simpoints = 10;
+static bool num_simpoints_overridden;
 static int simpoint_warmup = 10;    /* min intervals before clustering */
 static int kmeans_max_iter = 100;
 static const int simpoint_max_symbols = 5;  /* max symbols listed per simpoint */
@@ -348,6 +349,110 @@ static GArray *kmeans_cluster(GArray *bbvs, int k)
     return specs;
 }
 
+static double clustering_silhouette_score(GArray *bbvs, int k)
+{
+    int n = bbvs->len;
+    int *cluster_sizes;
+    double *dist_matrix;
+    double total_score = 0.0;
+
+    if (n <= 1 || k <= 1) {
+        return -1.0;
+    }
+
+    cluster_sizes = g_new0(int, k);
+    for (int i = 0; i < n; i++) {
+        BBV *bbv = g_array_index(bbvs, BBV *, i);
+        if (bbv->cluster_id >= 0 && bbv->cluster_id < k) {
+            cluster_sizes[bbv->cluster_id]++;
+        }
+    }
+
+    dist_matrix = g_new(double, (size_t)n * n);
+    for (int i = 0; i < n; i++) {
+        BBV *bi = g_array_index(bbvs, BBV *, i);
+        for (int j = i; j < n; j++) {
+            BBV *bj = g_array_index(bbvs, BBV *, j);
+            double d = (i == j) ? 0.0 : bbv_distance_sq(bi, bj);
+            dist_matrix[(size_t)i * n + j] = d;
+            dist_matrix[(size_t)j * n + i] = d;
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        BBV *bi = g_array_index(bbvs, BBV *, i);
+        int own_cluster = bi->cluster_id;
+        double a = 0.0;
+        double b = -1.0;
+        double *cluster_dists = g_new0(double, k);
+
+        if (own_cluster < 0 || own_cluster >= k || cluster_sizes[own_cluster] <= 1) {
+            g_free(cluster_dists);
+            continue;
+        }
+
+        for (int j = 0; j < n; j++) {
+            BBV *bj = g_array_index(bbvs, BBV *, j);
+            int cj = bj->cluster_id;
+            if (cj >= 0 && cj < k && i != j) {
+                cluster_dists[cj] += dist_matrix[(size_t)i * n + j];
+            }
+        }
+
+        a = cluster_dists[own_cluster] / (cluster_sizes[own_cluster] - 1);
+        for (int c = 0; c < k; c++) {
+            if (c == own_cluster || cluster_sizes[c] == 0) {
+                continue;
+            }
+            double avg = cluster_dists[c] / cluster_sizes[c];
+            if (b < 0 || avg < b) {
+                b = avg;
+            }
+        }
+
+        if (b > 0.0 || a > 0.0) {
+            double denom = (a > b) ? a : b;
+            total_score += (b - a) / denom;
+        }
+
+        g_free(cluster_dists);
+    }
+
+    g_free(dist_matrix);
+    g_free(cluster_sizes);
+    return total_score / n;
+}
+
+static int auto_select_num_simpoints(GArray *bbvs)
+{
+    int n = bbvs->len;
+    int best_k = 1;
+    double best_score = -2.0;
+    int max_k;
+
+    if (n <= 2) {
+        return 1;
+    }
+
+    max_k = MIN(n, 20);
+    for (int k = 2; k <= max_k; k++) {
+        g_autoptr(GArray) specs = kmeans_cluster(bbvs, k);
+        double score;
+
+        if (specs->len < 2) {
+            continue;
+        }
+
+        score = clustering_silhouette_score(bbvs, k);
+        if (score > best_score) {
+            best_score = score;
+            best_k = k;
+        }
+    }
+
+    return best_k;
+}
+
 /* ========================= SimPoints File I/O ========================= */
 
 /*
@@ -601,7 +706,11 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     }
 
     if (bbv_collection->len >= (guint)simpoint_warmup) {
-        GArray *specs = kmeans_cluster(bbv_collection, num_simpoints);
+        int selected_simpoints = num_simpoints_overridden ?
+            num_simpoints : auto_select_num_simpoints(bbv_collection);
+        GArray *specs = kmeans_cluster(bbv_collection, selected_simpoints);
+
+        num_simpoints = selected_simpoints;
 
         write_simpoints_file(output_path, specs);
 
@@ -613,6 +722,9 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
             "Intervals collected:    %u\n", bbv_collection->len);
         g_string_append_printf(report,
             "SimPoints discovered:   %u\n", specs->len);
+        g_string_append_printf(report,
+            "Cluster count:          %d (%s)\n", selected_simpoints,
+            num_simpoints_overridden ? "manual" : "auto");
         g_string_append_printf(report,
             "Total instructions:     %" PRIu64 "\n", total_insns);
         g_string_append_printf(report,
@@ -672,6 +784,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
                         tokens[1]);
                 return -1;
             }
+            num_simpoints_overridden = true;
         } else if (g_strcmp0(tokens[0], "warmup") == 0) {
             simpoint_warmup = atoi(tokens[1]);
         } else if (g_strcmp0(tokens[0], "kmeans_iter") == 0) {

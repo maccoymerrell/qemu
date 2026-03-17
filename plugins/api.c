@@ -558,6 +558,12 @@ bool qemu_plugin_exec_inline_insn(void)
     return cpu_plugin_exec_inline(current_cpu);
 }
 
+bool qemu_plugin_exec_tb(void)
+{
+    g_assert(current_cpu);
+    return cpu_plugin_exec_tb(current_cpu);
+}
+
 void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
 {
     g_assert(current_cpu);

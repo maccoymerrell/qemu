@@ -2590,7 +2590,6 @@ static uint32_t body_seq_num = 0;
 /* Wrong-path execution state */
 static __thread bool wp_in_progress = false;
 static __thread GArray *wp_mem_accesses = NULL;
-static __thread uint64_t wp_current_insn_pc = 0;
 static __thread uint64_t wp_saved_insn_count = 0;
 static __thread unsigned int wp_saved_cpu_index = 0;
 
@@ -2742,6 +2741,7 @@ static BBTemplate *get_or_create_template(uint64_t start_pc,
  * Per-instruction memory access callback.
  * During wrong-path execution (wp_in_progress), records data addresses.
  * During correct-path execution with tracing active, records data addresses.
+ * The insn_pc comes from udata set during vcpu_tb_trans registration.
  */
 static void vcpu_mem_cb(unsigned int cpu_index,
                         qemu_plugin_meminfo_t info,
@@ -2752,7 +2752,7 @@ static void vcpu_mem_cb(unsigned int cpu_index,
 
     if (wp_in_progress && wp_mem_accesses) {
         WPMemAccess acc = {
-            .insn_pc = wp_current_insn_pc ? wp_current_insn_pc : insn_pc,
+            .insn_pc = insn_pc,
             .mem_vaddr = vaddr,
             .is_store = qemu_plugin_mem_is_store(info),
         };
@@ -2773,90 +2773,18 @@ static void vcpu_mem_cb(unsigned int cpu_index,
 /* ========================= Wrong-Path Simulation ========================= */
 
 /*
- * Create a WPBBEntry from a sequence of wrong-path instructions.
- * Groups consecutive instructions into a BB and matches to a template.
- */
-static WPBBEntry create_wp_bb_entry(uint64_t bb_start_pc,
-                                    GArray *insn_pcs_arr,
-                                    GArray *insn_sizes_arr,
-                                    GArray *mem_accesses,
-                                    guint mem_start_idx)
-{
-    WPBBEntry entry;
-    uint32_t n_insns = insn_pcs_arr->len;
-
-    entry.start_pc = bb_start_pc;
-    entry.dyn_params = g_array_new(false, false, sizeof(DynParam));
-    entry.n_insns_executed = n_insns;
-    entry.exception = false;
-
-    /* Try to find existing template */
-    g_mutex_lock(&data_lock);
-    BBTemplate *tmpl = find_template(bb_start_pc);
-
-    if (!tmpl && n_insns > 0) {
-        /* Create template from wrong-path data (no disassembly available) */
-        uint64_t *pcs = g_new0(uint64_t, n_insns);
-        uint64_t ft_pc = 0;
-
-        for (uint32_t i = 0; i < n_insns; i++) {
-            pcs[i] = g_array_index(insn_pcs_arr, uint64_t, i);
-        }
-        uint32_t last_size = g_array_index(insn_sizes_arr, uint32_t,
-                                            n_insns - 1);
-        ft_pc = pcs[n_insns - 1] + last_size;
-
-        tmpl = get_or_create_template(bb_start_pc, n_insns, pcs,
-                                      NULL, ft_pc);
-
-        g_free(pcs);
-    }
-
-    entry.template_id = tmpl ? tmpl->template_id : UINT32_MAX;
-    g_mutex_unlock(&data_lock);
-
-    /* Collect memory access dynamic params for this WP BB */
-    if (mem_accesses) {
-        for (guint m = mem_start_idx; m < mem_accesses->len; m++) {
-            WPMemAccess *acc = &g_array_index(mem_accesses, WPMemAccess, m);
-            /* Check if this access belongs to an instruction in this BB */
-            bool in_bb = false;
-            for (uint32_t i = 0; i < n_insns; i++) {
-                if (acc->insn_pc == g_array_index(insn_pcs_arr, uint64_t, i)) {
-                    in_bb = true;
-                    break;
-                }
-            }
-            if (in_bb) {
-                DynParam dp = {
-                    .type = acc->is_store ? DYN_STORE_ADDR : DYN_LOAD_ADDR,
-                    .value = acc->mem_vaddr,
-                };
-                g_array_append_val(entry.dyn_params, dp);
-            }
-        }
-    }
-
-    return entry;
-}
-
-/*
- * Derive instruction size from consecutive PCs in a BB template.
- * For the last instruction, uses fall_through_pc.
- */
-static inline uint32_t template_insn_size(const BBTemplate *tmpl, uint32_t idx)
-{
-    if (idx >= tmpl->n_insns) {
-        return 0;
-    }
-    if (idx + 1 < tmpl->n_insns) {
-        return (uint32_t)(tmpl->insn_pcs[idx + 1] - tmpl->insn_pcs[idx]);
-    }
-    return (uint32_t)(tmpl->fall_through_pc - tmpl->insn_pcs[idx]);
-}
-
-/*
- * Execute wrong-path instructions starting from @wrong_target.
+ * Execute wrong-path basic blocks starting from @wrong_target.
+ *
+ * Flow per iteration:
+ *   1. Execute one full TB at current PC via qemu_plugin_exec_tb().
+ *      This triggers vcpu_tb_trans (template creation) and vcpu_mem_cb
+ *      (memory access recording), but NOT vcpu_tb_exec or inline stores.
+ *   2. Look up the template created by vcpu_tb_trans.
+ *   3. Build a WPBBEntry from the template and collected memory accesses.
+ *   4. Decide the next PC: not-taken for conditional branches, natural
+ *      execution for unconditional/call/return.
+ *   5. Repeat until instruction depth reached or fault.
+ *
  * Returns a GArray of WPBBEntry representing the wrong-path BB chain.
  */
 static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
@@ -2867,22 +2795,12 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     GArray *wp_chain = g_array_new(false, false, sizeof(WPBBEntry));
     uint64_t sim_insns = 0;
     bool early_exit = false;
-    GByteArray *insn_buf = g_byte_array_new();
-
-    /* State for grouping instructions into BBs */
-    GArray *bb_insn_pcs = g_array_new(false, false, sizeof(uint64_t));
-    GArray *bb_insn_sizes = g_array_new(false, false, sizeof(uint32_t));
-    uint64_t bb_start_pc = wrong_target;
-    guint bb_mem_start_idx = 0;
 
     /* Save complete CPU state for rollback */
     struct qemu_plugin_cpu_state *saved_state = qemu_plugin_cpu_state_save();
     if (!saved_state) {
         stat_wp_early_exits++;
         stat_wp_simulations++;
-        g_byte_array_unref(insn_buf);
-        g_array_unref(bb_insn_pcs);
-        g_array_unref(bb_insn_sizes);
         return wp_chain;
     }
 
@@ -2891,8 +2809,8 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
 
     /*
      * Save the correct-path instruction count before entering wrong-path.
-     * Wrong-path TB execution triggers the inline QEMU_PLUGIN_INLINE_ADD_U64
-     * which would corrupt the count. We restore it after wrong-path ends.
+     * Inline stores are suppressed by CF_MEMI_ONLY during TB execution,
+     * but vcpu_tb_trans still fires and may trigger inline registration.
      */
     wp_saved_cpu_index = cpu_index;
     wp_saved_insn_count = qemu_plugin_u64_get(sb_insn_count, cpu_index);
@@ -2904,135 +2822,82 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     /* Set PC to wrong-path target */
     qemu_plugin_set_pc(wrong_target);
 
-    for (int depth = 0; depth < max_wrong_path_depth; depth++) {
+    while (sim_insns < (uint64_t)max_wrong_path_depth) {
         uint64_t pre_pc = qemu_plugin_get_pc();
+        guint mem_start_idx = wp_mem_accesses->len;
 
-        /* Read instruction bytes at current PC */
-        g_byte_array_set_size(insn_buf, 0);
-        qemu_plugin_read_memory_vaddr(pre_pc, insn_buf, MAX_INSN_BYTES);
-
-        wp_current_insn_pc = pre_pc;
-
-        /* Execute exactly one instruction */
-        if (!qemu_plugin_exec_inline_insn()) {
+        /* Execute one full translation block */
+        if (!qemu_plugin_exec_tb()) {
             early_exit = true;
             break;
         }
 
-        sim_insns++;
         uint64_t post_pc = qemu_plugin_get_pc();
 
         /*
-         * Look up the template for this instruction's PC.
-         * The template is created by vcpu_tb_trans during tb_gen_code
-         * inside cpu_plugin_exec_inline, so it should exist by now.
+         * Look up the template for this TB.  vcpu_tb_trans fires during
+         * tb_gen_code inside qemu_plugin_exec_tb, creating the template.
          */
         g_mutex_lock(&data_lock);
-        BBTemplate *insn_tmpl = find_template(pre_pc);
+        BBTemplate *tmpl = find_template(pre_pc);
         g_mutex_unlock(&data_lock);
 
-        /* Determine instruction size and branch type from template */
-        uint32_t insn_size = 0;
-        uint8_t br_type = BRANCH_NONE;
-
-        if (insn_tmpl && insn_tmpl->n_insns > 0) {
-            insn_size = template_insn_size(insn_tmpl, 0);
-            br_type = insn_tmpl->insn_fields[0].branch_type;
+        if (!tmpl) {
+            early_exit = true;
+            break;
         }
 
-        /* Fallback instruction size from post_pc or buffer length */
-        if (insn_size == 0) {
-            if (post_pc > pre_pc && (post_pc - pre_pc) <= MAX_INSN_BYTES) {
-                insn_size = (uint32_t)(post_pc - pre_pc);
-            } else {
-                g_mutex_lock(&data_lock);
-                BBTemplate *known = find_template(bb_start_pc);
-                g_mutex_unlock(&data_lock);
+        sim_insns += tmpl->n_insns;
 
-                if (known) {
-                    uint32_t idx_in_bb = bb_insn_pcs->len;
-                    if (idx_in_bb < known->n_insns) {
-                        insn_size = template_insn_size(known, idx_in_bb);
-                    }
-                }
-                if (insn_size == 0) {
-                    insn_size = insn_buf->len < MAX_INSN_BYTES ?
-                                insn_buf->len : MAX_INSN_BYTES;
-                }
-            }
-        }
+        /* Build WPBBEntry from template */
+        WPBBEntry wp_bb;
+        wp_bb.start_pc = pre_pc;
+        wp_bb.template_id = tmpl->template_id;
+        wp_bb.n_insns_executed = tmpl->n_insns;
+        wp_bb.exception = false;
+        wp_bb.dyn_params = g_array_new(false, false, sizeof(DynParam));
 
-        /* Record instruction in current BB */
-        g_array_append_val(bb_insn_pcs, pre_pc);
-        g_array_append_val(bb_insn_sizes, insn_size);
-
-        /* Track memory accesses */
-        for (guint m = bb_mem_start_idx; m < wp_mem_accesses->len; m++) {
-            WPMemAccess *acc = &g_array_index(wp_mem_accesses, WPMemAccess, m);
-            if (acc->insn_pc == pre_pc) {
-                stat_wp_total_mem_accesses++;
-            }
+        /* Collect memory access dynamic params for this WP BB */
+        for (guint m = mem_start_idx; m < wp_mem_accesses->len; m++) {
+            WPMemAccess *acc = &g_array_index(wp_mem_accesses,
+                                              WPMemAccess, m);
+            DynParam dp = {
+                .type = acc->is_store ? DYN_STORE_ADDR : DYN_LOAD_ADDR,
+                .value = acc->mem_vaddr,
+            };
+            g_array_append_val(wp_bb.dyn_params, dp);
+            stat_wp_total_mem_accesses++;
         }
 
         /*
-         * Detect BB boundary: the instruction is a branch (from template)
-         * or the PC moved non-sequentially (fallback detection).
+         * Decide next PC from the last instruction's branch type.
+         * Conditional branches: predict not-taken (fall-through).
+         * Unconditional/call/return: follow natural execution (post_pc).
          */
-        bool is_branch = (br_type != BRANCH_NONE);
-        bool is_non_sequential = (post_pc != pre_pc + insn_size);
-        if (is_non_sequential && !is_branch) {
-            is_branch = true;
+        uint8_t last_br = tmpl->insn_fields[tmpl->n_insns - 1].branch_type;
+        uint64_t chosen_target;
+
+        if (last_br == BRANCH_COND_DIRECT) {
+            chosen_target = tmpl->fall_through_pc;
+        } else {
+            chosen_target = post_pc;
         }
 
-        if (is_branch) {
-            uint64_t fall_through = pre_pc + insn_size;
-            uint64_t chosen_target;
+        DynParam target_dp = {
+            .type = DYN_BRANCH_TARGET,
+            .value = chosen_target,
+        };
+        g_array_append_val(wp_bb.dyn_params, target_dp);
+        g_array_append_val(wp_chain, wp_bb);
 
-            if (br_type == BRANCH_COND_DIRECT) {
-                /* Always predict not-taken for conditional branches */
-                chosen_target = fall_through;
-            } else {
-                /* Follow natural execution for unconditional/call/return */
-                chosen_target = post_pc;
-            }
-
-            /* Redirect PC if the chosen target differs from natural */
-            if (chosen_target != post_pc) {
-                qemu_plugin_set_pc(chosen_target);
-            }
-
-            /* Finalize current WP BB */
-            WPBBEntry wp_bb = create_wp_bb_entry(
-                bb_start_pc, bb_insn_pcs, bb_insn_sizes,
-                wp_mem_accesses, bb_mem_start_idx);
-
-            /* Add branch target as dynamic param */
-            DynParam target_dp = {
-                .type = DYN_BRANCH_TARGET,
-                .value = chosen_target,
-            };
-            g_array_append_val(wp_bb.dyn_params, target_dp);
-            g_array_append_val(wp_chain, wp_bb);
-
-            /* Start new BB */
-            bb_mem_start_idx = wp_mem_accesses->len;
-            g_array_set_size(bb_insn_pcs, 0);
-            g_array_set_size(bb_insn_sizes, 0);
-            bb_start_pc = chosen_target;
+        /* Redirect PC if prediction differs from natural execution */
+        if (chosen_target != post_pc) {
+            qemu_plugin_set_pc(chosen_target);
         }
     }
 
-    /* Finalize any remaining instructions as a WP BB */
-    if (bb_insn_pcs->len > 0) {
-        WPBBEntry wp_bb = create_wp_bb_entry(
-            bb_start_pc, bb_insn_pcs, bb_insn_sizes,
-            wp_mem_accesses, bb_mem_start_idx);
-        if (early_exit) {
-            wp_bb.exception = true;
-        }
-        g_array_append_val(wp_chain, wp_bb);
-    } else if (early_exit && wp_chain->len > 0) {
-        /* Exception on first insn of new BB - mark previous BB */
+    /* Mark the last BB as exception if we exited early */
+    if (early_exit && wp_chain->len > 0) {
         WPBBEntry *last = &g_array_index(wp_chain, WPBBEntry,
                                           wp_chain->len - 1);
         last->exception = true;
@@ -3054,10 +2919,6 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     /* Clean up */
     g_array_unref(wp_mem_accesses);
     wp_mem_accesses = NULL;
-    g_byte_array_unref(insn_buf);
-
-    g_array_unref(bb_insn_pcs);
-    g_array_unref(bb_insn_sizes);
 
     /* Update statistics */
     stat_wp_simulations++;

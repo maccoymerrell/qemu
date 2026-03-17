@@ -714,6 +714,78 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
     }
 }
 
+/*
+ * Execute one full translation block at the current PC from a plugin callback.
+ * Non-memory plugin callbacks (tb_exec, insn_exec, inline ops) are suppressed
+ * via CF_MEMI_ONLY, so the plugin's scoreboard is not corrupted.  Translation
+ * callbacks (vcpu_tb_trans) and memory callbacks (vcpu_mem_cb) still fire.
+ * CF_SINGLE_STEP prevents rep-prefixed instructions from looping internally.
+ * Returns true on success, false on failure (e.g. unmapped PC, exception).
+ */
+bool cpu_plugin_exec_tb(CPUState *cpu)
+{
+    CPUArchState *env = cpu_env(cpu);
+    TranslationBlock *tb;
+    vaddr pc;
+    uint64_t cs_base;
+    uint32_t flags, cflags;
+    int tb_exit;
+    bool saved_running;
+
+    cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
+
+    cflags = curr_cflags(cpu);
+    cflags &= ~CF_PARALLEL;
+    cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR | CF_MEMI_ONLY
+            | CF_SINGLE_STEP;
+
+    if (cpu->plugin_spec_mode) {
+        cflags |= CF_FORCE_SLOW;
+    }
+
+    void *host;
+    int pflags = probe_access_flags(env, pc, 1, MMU_INST_FETCH,
+                                    cpu_mmu_index(cpu, true),
+                                    true, &host, 0);
+    if (pflags & TLB_INVALID_MASK) {
+        return false;
+    }
+
+    tb = tb_lookup(cpu, pc, cs_base, flags, cflags);
+    if (tb == NULL) {
+        mmap_lock();
+        tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
+        mmap_unlock();
+        if (tb == NULL) {
+            return false;
+        }
+    }
+
+    saved_running = cpu->running;
+
+    sigjmp_buf saved_jmp_env;
+    memcpy(&saved_jmp_env, &cpu->jmp_env, sizeof(sigjmp_buf));
+
+    if (sigsetjmp(cpu->jmp_env, 0) == 0) {
+        cpu_tb_exec(cpu, tb, &tb_exit);
+        cpu->running = saved_running;
+        memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
+        return true;
+    } else {
+        cpu->neg.can_do_io = true;
+        qemu_plugin_disable_mem_helpers(cpu);
+#ifdef CONFIG_USER_ONLY
+        clear_helper_retaddr();
+        if (have_mmap_lock()) {
+            mmap_unlock();
+        }
+#endif
+        cpu->running = saved_running;
+        memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
+        return false;
+    }
+}
+
 void cpu_plugin_flush_tlb(CPUState *cpu)
 {
     tlb_flush(cpu);

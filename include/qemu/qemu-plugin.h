@@ -1116,6 +1116,25 @@ uint64_t qemu_plugin_get_pc(void);
 QEMU_PLUGIN_API
 bool qemu_plugin_exec_inline_insn(void);
 
+/**
+ * qemu_plugin_exec_tb() - execute one full translation block at current PC
+ *
+ * Translates and executes a complete basic block at the current program
+ * counter.  Non-memory plugin callbacks (tb_exec, insn_exec, inline ops)
+ * are suppressed to avoid scoreboard corruption.  Translation callbacks
+ * (vcpu_tb_trans) and memory callbacks (vcpu_mem_cb) still fire, so the
+ * plugin receives template creation and memory-access data.
+ *
+ * After return, qemu_plugin_get_pc() reflects where the branch at the
+ * end of the block went.  The plugin can look up the template created
+ * by vcpu_tb_trans for the executed block's start PC.
+ *
+ * Returns true on success, false on failure (e.g. unmapped address,
+ * exception during execution).
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_exec_tb(void);
+
 /* ================ Speculative Store Buffer API ================ */
 
 /**

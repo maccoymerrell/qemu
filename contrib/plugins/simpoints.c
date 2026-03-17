@@ -46,6 +46,7 @@ typedef struct {
     GHashTable *counts;         /* GUINT_TO_POINTER(bb_index) → uint64* count */
     uint64_t total_insns;       /* Total instructions in interval */
     uint64_t interval_id;       /* Which interval (0-based) */
+    int cluster_id;             /* Cluster assignment from k-means */
 } BBV;
 
 /*
@@ -96,6 +97,7 @@ static BBV *bbv_new(uint64_t interval_id)
     bbv->counts = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                         NULL, g_free);
     bbv->interval_id = interval_id;
+    bbv->cluster_id = -1;
     return bbv;
 }
 
@@ -135,20 +137,36 @@ static void bbv_increment(BBV *bbv, uint64_t bb_pc, uint64_t n_insns)
     bbv->total_insns += n_insns;
 }
 
-/* Helper for sorting (bb_index, count) pairs by count descending */
-typedef struct {
-    uint32_t bb_idx;
-    uint64_t count;
-} BBCountPair;
-
-static gint bbcount_compare_desc(gconstpointer a, gconstpointer b)
+static void hash_table_add_u64(GHashTable *table, const char *key, uint64_t add)
 {
-    const BBCountPair *pa = a;
-    const BBCountPair *pb = b;
-    if (pa->count > pb->count) {
+    uint64_t *value = g_hash_table_lookup(table, key);
+    if (!value) {
+        value = g_new0(uint64_t, 1);
+        g_hash_table_insert(table, (gpointer)key, value);
+    }
+    *value += add;
+}
+
+typedef struct {
+    const char *sym;
+    uint64_t in_count;
+    double score;
+} SymbolScore;
+
+static gint symbol_score_compare_desc(gconstpointer a, gconstpointer b)
+{
+    const SymbolScore *sa = a;
+    const SymbolScore *sb = b;
+    if (sa->score > sb->score) {
         return -1;
     }
-    if (pa->count < pb->count) {
+    if (sa->score < sb->score) {
+        return 1;
+    }
+    if (sa->in_count > sb->in_count) {
+        return -1;
+    }
+    if (sa->in_count < sb->in_count) {
         return 1;
     }
     return 0;
@@ -299,6 +317,11 @@ static GArray *kmeans_cluster(GArray *bbvs, int k)
     }
 
     /* Build simpoint specs from cluster centers */
+    for (int i = 0; i < n; i++) {
+        BBV *bbv = g_array_index(bbvs, BBV *, i);
+        bbv->cluster_id = assignments[i];
+    }
+
     for (int c = 0; c < k; c++) {
         if (cluster_sizes[c] == 0) {
             continue;
@@ -330,8 +353,8 @@ static GArray *kmeans_cluster(GArray *bbvs, int k)
 /*
  * Write simpoints specification file.
  * Format: interval_id,start_insn,stop_insn,cluster_id,weight
- * Each simpoint entry is followed by a comment listing the most common
- * symbols (function names) in its representative BBV, if available.
+ * Each simpoint entry is followed by a comment listing symbols that are
+ * most characteristic of that cluster (vs. all other clusters), if available.
  */
 static void write_simpoints_file(const char *path, GArray *specs)
 {
@@ -364,74 +387,120 @@ static void write_simpoints_file(const char *path, GArray *specs)
     fprintf(f, "# interval_size=%" PRIu64 "\n", simpoint_interval);
     fprintf(f, "# num_clusters=%d\n", num_simpoints);
 
+    GHashTable *global_sym_counts = g_hash_table_new_full(
+        g_str_hash, g_str_equal, NULL, g_free);
+    GHashTable **cluster_sym_counts = g_new0(GHashTable *, num_simpoints);
+    uint64_t *cluster_total_insns = g_new0(uint64_t, num_simpoints);
+    uint64_t global_total_insns = 0;
+
+    for (guint i = 0; i < bbv_collection->len; i++) {
+        BBV *bbv = g_array_index(bbv_collection, BBV *, i);
+        int cluster = bbv->cluster_id;
+        GHashTableIter biter;
+        gpointer bkey, bvalue;
+
+        if (cluster < 0 || cluster >= num_simpoints) {
+            continue;
+        }
+
+        if (!cluster_sym_counts[cluster]) {
+            cluster_sym_counts[cluster] = g_hash_table_new_full(
+                g_str_hash, g_str_equal, NULL, g_free);
+        }
+
+        g_hash_table_iter_init(&biter, bbv->counts);
+        while (g_hash_table_iter_next(&biter, &bkey, &bvalue)) {
+            uint32_t bb_idx = GPOINTER_TO_UINT(bkey);
+            uint64_t count = *(uint64_t *)bvalue;
+            uint64_t *pc_ptr = g_hash_table_lookup(
+                idx_to_pc, GUINT_TO_POINTER(bb_idx));
+            char *sym;
+
+            if (!pc_ptr) {
+                continue;
+            }
+            sym = g_hash_table_lookup(bb_symbol_map, pc_ptr);
+            if (!sym) {
+                continue;
+            }
+
+            hash_table_add_u64(global_sym_counts, sym, count);
+            hash_table_add_u64(cluster_sym_counts[cluster], sym, count);
+            cluster_total_insns[cluster] += count;
+            global_total_insns += count;
+        }
+    }
+
     for (guint i = 0; i < specs->len; i++) {
         SimPointSpec *sp = &g_array_index(specs, SimPointSpec, i);
         fprintf(f, "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d,%.6f\n",
                 sp->interval_id, sp->start_insn, sp->stop_insn,
                 sp->cluster_id, sp->weight);
 
-        /* Find the center BBV for this simpoint and list top symbols */
-        BBV *bbv = NULL;
-        for (guint j = 0; j < bbv_collection->len; j++) {
-            BBV *candidate = g_array_index(bbv_collection, BBV *, j);
-            if (candidate->interval_id == sp->interval_id) {
-                bbv = candidate;
-                break;
-            }
-        }
-        if (!bbv || g_hash_table_size(bb_symbol_map) == 0) {
+        if (g_hash_table_size(bb_symbol_map) == 0 ||
+            sp->cluster_id < 0 || sp->cluster_id >= num_simpoints ||
+            !cluster_sym_counts[sp->cluster_id] ||
+            cluster_total_insns[sp->cluster_id] == 0) {
             continue;
         }
 
-        /* Collect (bb_index, count) pairs from the BBV */
-        GArray *pairs = g_array_new(false, false, sizeof(BBCountPair));
-        {
-            GHashTableIter biter;
-            gpointer bkey, bvalue;
-            g_hash_table_iter_init(&biter, bbv->counts);
-            while (g_hash_table_iter_next(&biter, &bkey, &bvalue)) {
-                BBCountPair pair = {
-                    .bb_idx = GPOINTER_TO_UINT(bkey),
-                    .count = *(uint64_t *)bvalue,
-                };
-                g_array_append_val(pairs, pair);
-            }
-        }
-        g_array_sort(pairs, bbcount_compare_desc);
-
-        /* Collect unique symbols from top blocks */
-        GHashTable *seen_syms = g_hash_table_new(g_str_hash, g_str_equal);
+        /* Rank symbols by cluster uniqueness: in-cluster freq - out-cluster freq */
+        GArray *scores = g_array_new(false, false, sizeof(SymbolScore));
         g_autoptr(GString) sym_line = g_string_new(NULL);
-        int sym_count = 0;
+        uint64_t cluster_total = cluster_total_insns[sp->cluster_id];
+        uint64_t outside_total = global_total_insns - cluster_total;
+        GHashTable *cluster_map = cluster_sym_counts[sp->cluster_id];
+        GHashTableIter siter;
+        gpointer skey, svalue;
 
-        for (guint p = 0; p < pairs->len && sym_count < simpoint_max_symbols;
-             p++) {
-            BBCountPair *pair = &g_array_index(pairs, BBCountPair, p);
-            uint64_t *pc_ptr = g_hash_table_lookup(
-                idx_to_pc, GUINT_TO_POINTER(pair->bb_idx));
-            if (!pc_ptr) {
-                continue;
-            }
-            char *sym = g_hash_table_lookup(bb_symbol_map, pc_ptr);
-            if (sym && !g_hash_table_contains(seen_syms, sym)) {
-                g_hash_table_add(seen_syms, sym);
-                if (sym_line->len > 0) {
-                    g_string_append(sym_line, ", ");
-                }
-                g_string_append(sym_line, sym);
-                sym_count++;
+        g_hash_table_iter_init(&siter, cluster_map);
+        while (g_hash_table_iter_next(&siter, &skey, &svalue)) {
+            const char *sym = skey;
+            uint64_t in_count = *(uint64_t *)svalue;
+            uint64_t *global_count_ptr = g_hash_table_lookup(global_sym_counts,
+                                                             sym);
+            uint64_t global_count = global_count_ptr ? *global_count_ptr : 0;
+            uint64_t outside_count = (global_count >= in_count) ?
+                (global_count - in_count) : 0;
+            double in_freq = (double)in_count / (double)cluster_total;
+            double out_freq = (outside_total > 0) ?
+                ((double)outside_count / (double)outside_total) : 0.0;
+            double score = in_freq - out_freq;
+
+            if (score > 0) {
+                SymbolScore s = {
+                    .sym = sym,
+                    .in_count = in_count,
+                    .score = score,
+                };
+                g_array_append_val(scores, s);
             }
         }
+        g_array_sort(scores, symbol_score_compare_desc);
 
-        if (sym_line->len > 0) {
-            fprintf(f, "# top_symbols: %s\n", sym_line->str);
+        for (guint s = 0; s < scores->len && s < simpoint_max_symbols; s++) {
+            SymbolScore *entry = &g_array_index(scores, SymbolScore, s);
+            if (sym_line->len > 0) {
+                g_string_append(sym_line, ", ");
+            }
+            g_string_append(sym_line, entry->sym);
+        }
+        if (scores->len > 0) {
+            fprintf(f, "# unique_cluster_symbols: %s\n", sym_line->str);
         }
 
-        g_hash_table_unref(seen_syms);
-        g_array_unref(pairs);
+        g_array_unref(scores);
     }
 
     fclose(f);
+    g_hash_table_unref(global_sym_counts);
+    for (int c = 0; c < num_simpoints; c++) {
+        if (cluster_sym_counts[c]) {
+            g_hash_table_unref(cluster_sym_counts[c]);
+        }
+    }
+    g_free(cluster_sym_counts);
+    g_free(cluster_total_insns);
     g_hash_table_unref(idx_to_pc);
 }
 

@@ -27,7 +27,7 @@
  * Usage:
  *   -plugin wptrace[,depth=N][,outfile=PATH][,debug=1]
  *                  [,wp=0|1][,start=N][,stop=N]
- *                  [,spfile=PATH][,program=NAME]
+ *                  [,spfile=PATH][,spinterval=N][,program=NAME]
  *
  * Copyright (c) 2025
  *
@@ -68,6 +68,7 @@ static TraceISA trace_isa = TRACE_ISA_UNKNOWN;
 
 /* SimPoints-driven tracing */
 static char *simpoints_file_path = NULL;
+static uint64_t simpoint_interval_insns = 100000000ULL;
 
 typedef struct {
     uint64_t interval_id;
@@ -82,8 +83,19 @@ static guint simpoints_current_idx = 0;
 
 #define MAX_INSN_BYTES 16
 
-/* Magic for binary format */
-#define WPT_MAGIC  0x54505704  /* 'T','P','W',0x04 little-endian - version 4 */
+/*
+ * Magic for binary format.
+ * v10 removes the per-entry dyn_patch selector and always encodes
+ * dynamic parameters using patch payloads.
+ */
+#define WPT_MAGIC  0x5450570a  /* 'T','P','W',0x0a little-endian - version 10 */
+
+#define WPT_ISA_BITS 3
+#define WPT_OPCODE_BITS 6
+#define WPT_BRANCH_BITS 3
+#define WPT_REG_COUNT_BITS 3
+#define WPT_REG_BITS 8
+#define WPT_DYN_TYPE_BITS 1
 
 /* ========================= ISA-Agnostic Instruction Fields ========================= */
 
@@ -165,6 +177,17 @@ enum BranchType {
     BRANCH_COND_DIRECT = 6,
     BRANCH_SYSCALL_TYPE = 7,
 };
+
+_Static_assert(TRACE_ISA_MIPS < (1U << WPT_ISA_BITS),
+               "TraceISA no longer fits packed width");
+_Static_assert(GEN_OP_COUNT <= (1U << WPT_OPCODE_BITS),
+               "GenericOpcode no longer fits packed width");
+_Static_assert(BRANCH_SYSCALL_TYPE < (1U << WPT_BRANCH_BITS),
+               "BranchType no longer fits packed width");
+_Static_assert(MAX_SRC_REGS <= ((1U << WPT_REG_COUNT_BITS) - 1),
+               "MAX_SRC_REGS no longer fits packed width");
+_Static_assert(MAX_DST_REGS <= ((1U << WPT_REG_COUNT_BITS) - 1),
+               "MAX_DST_REGS no longer fits packed width");
 
 /*
  * ISA-agnostic register IDs.
@@ -343,6 +366,7 @@ enum PluginOptId {
     OPT_STOP,
     OPT_PROGRAM,
     OPT_SPFILE,
+    OPT_SPINTERVAL,
 };
 
 /*
@@ -2883,11 +2907,6 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             chosen_target = post_pc;
         }
 
-        DynParam target_dp = {
-            .type = DYN_BRANCH_TARGET,
-            .value = chosen_target,
-        };
-        g_array_append_val(wp_bb.dyn_params, target_dp);
         g_array_append_val(wp_chain, wp_bb);
 
         /* Redirect PC if prediction differs from natural execution */
@@ -3071,191 +3090,355 @@ static void write_text_trace(FILE *f, GArray *body_entries)
 /* ========================= Output: Binary Format ========================= */
 
 /*
- * Helper to write packed little-endian values.
+ * Bit writer for tightly packed binary output.
+ * Bits are appended least-significant-bit first.
  */
-static void write_uleb128(FILE *f, uint64_t v)
+typedef struct {
+    FILE *f;
+    uint8_t cur;
+    uint8_t used;
+} BitWriter;
+
+static inline void bw_init(BitWriter *bw, FILE *f)
 {
-    if (!f) {
-        return;
+    bw->f = f;
+    bw->cur = 0;
+    bw->used = 0;
+}
+
+static inline void bw_flush(BitWriter *bw)
+{
+    if (bw->used > 0) {
+        fwrite(&bw->cur, 1, 1, bw->f);
+        bw->cur = 0;
+        bw->used = 0;
     }
+}
+
+static void bw_write_bits(BitWriter *bw, uint64_t value, uint8_t nbits)
+{
+    while (nbits > 0) {
+        uint8_t avail = 8 - bw->used;
+        uint8_t take = MIN(avail, nbits);
+        uint8_t mask = (1U << take) - 1U;
+
+        bw->cur |= (uint8_t)((value & mask) << bw->used);
+        value >>= take;
+        bw->used += take;
+        nbits -= take;
+
+        if (bw->used == 8) {
+            fwrite(&bw->cur, 1, 1, bw->f);
+            bw->cur = 0;
+            bw->used = 0;
+        }
+    }
+}
+
+static void bw_write_uleb128(BitWriter *bw, uint64_t v)
+{
     do {
         uint8_t byte = v & 0x7F;
         v >>= 7;
         if (v != 0) {
             byte |= 0x80;
         }
-        fwrite(&byte, 1, 1, f);
+        bw_write_bits(bw, byte, 8);
     } while (v != 0);
 }
 
-static inline void write_u8(FILE *f, uint8_t v)
+static void bw_write_sleb128(BitWriter *bw, int64_t v)
 {
-    if (!f) {
-        return;
-    }
-    fwrite(&v, 1, 1, f);
-}
+    bool more = true;
 
-static inline void write_u16(FILE *f, uint16_t v)
-{
-    if (!f) {
-        return;
+    while (more) {
+        uint8_t byte = (uint8_t)(v & 0x7F);
+        bool sign = (byte & 0x40) != 0;
+        v >>= 7;
+        more = !((v == 0 && !sign) || (v == -1 && sign));
+        if (more) {
+            byte |= 0x80;
+        }
+        bw_write_bits(bw, byte, 8);
     }
-    uint8_t buf[2] = { v & 0xFF, (v >> 8) & 0xFF };
-    fwrite(buf, 1, 2, f);
-}
-
-static inline void write_u32(FILE *f, uint32_t v)
-{
-    if (!f) {
-        return;
-    }
-    uint8_t buf[4] = {
-        v & 0xFF, (v >> 8) & 0xFF,
-        (v >> 16) & 0xFF, (v >> 24) & 0xFF
-    };
-    fwrite(buf, 1, 4, f);
-}
-
-static inline void write_u64(FILE *f, uint64_t v)
-{
-    if (!f) {
-        return;
-    }
-    uint8_t buf[8] = {
-        v & 0xFF, (v >> 8) & 0xFF,
-        (v >> 16) & 0xFF, (v >> 24) & 0xFF,
-        (v >> 32) & 0xFF, (v >> 40) & 0xFF,
-        (v >> 48) & 0xFF, (v >> 56) & 0xFF,
-    };
-    fwrite(buf, 1, 8, f);
 }
 
 /*
- * Write the header section in packed binary format (v4 ULEB128).
+ * Write the header section in packed binary format (v6 bit-packed).
  *
  * Binary header layout:
- *   magic:            uint32 (WPT_MAGIC v4)
- *   isa:              uint8  (TraceISA enum value)
+ *   magic:            32 bits
+ *   isa:              3 bits (TraceISA)
  *   num_templates:    ULEB128
  *   For each template:
  *     template_id:      ULEB128
- *     start_pc:         uint64
+ *     start_pc:         ULEB128
  *     num_insns:        ULEB128
- *     fall_through_pc:  uint64
+ *     fall_through_pc:  ULEB128
  *     For each instruction:
- *       pc:             uint64
- *       opcode:         uint8 (GenericOpcode)
- *       branch_type:    uint8 (BranchType)
- *       n_src:          uint8
- *       n_dst:          uint8
+ *       pc:             ULEB128
+ *       opcode:         6 bits (GenericOpcode)
+ *       branch_type:    3 bits (BranchType)
+ *       n_src:          3 bits
+ *       n_dst:          3 bits
  *       src_regs:       [n_src bytes] (GenericRegId)
  *       dst_regs:       [n_dst bytes] (GenericRegId)
- *       has_imm:        uint8 (0 or 1)
- *       imm:            uint64 (only if has_imm == 1)
+ *       has_imm:        1 bit
+ *       imm:            SLEB128 (only if has_imm == 1)
  */
-static void write_bin_header(FILE *f)
+static void write_bin_header(BitWriter *bw)
 {
-    if (!f) {
-        return;
-    }
     GHashTableIter iter;
     gpointer value;
 
-    write_u32(f, WPT_MAGIC);
-    write_u8(f, (uint8_t)trace_isa);
-    write_uleb128(f, g_hash_table_size(template_map));
+    bw_write_bits(bw, WPT_MAGIC, 32);
+    bw_write_bits(bw, (uint8_t)trace_isa, WPT_ISA_BITS);
+    bw_write_uleb128(bw, g_hash_table_size(template_map));
 
     g_hash_table_iter_init(&iter, template_map);
     while (g_hash_table_iter_next(&iter, NULL, &value)) {
         BBTemplate *tmpl = value;
-        write_uleb128(f, tmpl->template_id);
-        write_u64(f, tmpl->start_pc);
-        write_uleb128(f, tmpl->n_insns);
-        write_u64(f, tmpl->fall_through_pc);
+        bw_write_uleb128(bw, tmpl->template_id);
+        bw_write_uleb128(bw, tmpl->start_pc);
+        bw_write_uleb128(bw, tmpl->n_insns);
+        bw_write_uleb128(bw, tmpl->fall_through_pc);
 
         for (uint32_t i = 0; i < tmpl->n_insns; i++) {
             InsnFields *fld = &tmpl->insn_fields[i];
 
-            /* Per-insn: pc + generic decoded fields */
-            write_u64(f, tmpl->insn_pcs[i]);
-            write_u8(f, fld->opcode);
-            write_u8(f, fld->branch_type);
-            write_u8(f, fld->n_src_regs);
-            write_u8(f, fld->n_dst_regs);
+            /* Per-insn: pc + compact decoded fields */
+            bw_write_uleb128(bw, tmpl->insn_pcs[i]);
+            bw_write_bits(bw, fld->opcode, WPT_OPCODE_BITS);
+            bw_write_bits(bw, fld->branch_type, WPT_BRANCH_BITS);
+            bw_write_bits(bw, fld->n_src_regs, WPT_REG_COUNT_BITS);
+            bw_write_bits(bw, fld->n_dst_regs, WPT_REG_COUNT_BITS);
+            bw_write_bits(bw, fld->has_immediate ? 1 : 0, 1);
+
             for (uint8_t s = 0; s < fld->n_src_regs; s++) {
-                write_u8(f, fld->src_regs[s]);
+                bw_write_bits(bw, fld->src_regs[s], WPT_REG_BITS);
             }
             for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
-                write_u8(f, fld->dst_regs[d]);
+                bw_write_bits(bw, fld->dst_regs[d], WPT_REG_BITS);
             }
-            write_u8(f, fld->has_immediate ? 1 : 0);
             if (fld->has_immediate) {
-                write_u64(f, (uint64_t)fld->immediate);
+                bw_write_sleb128(bw, fld->immediate);
             }
         }
     }
 }
 
+static gboolean dyn_param_array_equal(const GArray *a, const GArray *b)
+{
+    if (a == b) {
+        return true;
+    }
+    if (!a || !b || a->len != b->len) {
+        return false;
+    }
+
+    for (guint i = 0; i < a->len; i++) {
+        const DynParam *da = &g_array_index(a, DynParam, i);
+        const DynParam *db = &g_array_index(b, DynParam, i);
+        if (da->type != db->type || da->value != db->value) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static GArray *dyn_param_array_clone(const GArray *src)
+{
+    GArray *dst = g_array_sized_new(false, false, sizeof(DynParam),
+                                    src ? src->len : 0);
+
+    if (!src) {
+        return dst;
+    }
+
+    for (guint i = 0; i < src->len; i++) {
+        const DynParam *d = &g_array_index(src, DynParam, i);
+        DynParam copy = {
+            .type = d->type,
+            .value = d->value,
+        };
+        g_array_append_val(dst, copy);
+    }
+
+    return dst;
+}
+
+static void dyn_param_array_unref_value(gpointer value)
+{
+    if (value) {
+        g_array_unref((GArray *)value);
+    }
+}
+
+static inline uint8_t dyn_param_type_bit(const DynParam *dp)
+{
+    g_assert(dp->type == DYN_LOAD_ADDR || dp->type == DYN_STORE_ADDR);
+    return (dp->type == DYN_STORE_ADDR) ? 1 : 0;
+}
+
+static void dyn_param_collect_changed_positions(const GArray *prev_dyn,
+                                                const GArray *cur_dyn,
+                                                GArray *changed_positions)
+{
+    guint prev_len = prev_dyn ? prev_dyn->len : 0;
+    guint cur_len = cur_dyn ? cur_dyn->len : 0;
+    guint common = MIN(prev_len, cur_len);
+
+    for (guint i = 0; i < common; i++) {
+        const DynParam *prev = &g_array_index(prev_dyn, DynParam, i);
+        const DynParam *cur = &g_array_index(cur_dyn, DynParam, i);
+
+        if (prev->type != cur->type || prev->value != cur->value) {
+            g_array_append_val(changed_positions, i);
+        }
+    }
+
+    for (guint i = common; i < cur_len; i++) {
+        g_array_append_val(changed_positions, i);
+    }
+}
+
+static void write_dyn_param_patch(BitWriter *bw,
+                                  const GArray *prev_dyn,
+                                  const GArray *cur_dyn,
+                                  const GArray *changed_positions)
+{
+    int64_t prev_pos = -1;
+
+    bw_write_uleb128(bw, cur_dyn->len);
+    bw_write_uleb128(bw, changed_positions->len);
+
+    for (guint c = 0; c < changed_positions->len; c++) {
+        guint pos = g_array_index(changed_positions, guint, c);
+        const DynParam *cur = &g_array_index(cur_dyn, DynParam, pos);
+        uint64_t pos_gap = (uint64_t)(pos - (guint)(prev_pos + 1));
+        int64_t base_value = 0;
+        int64_t delta;
+
+        if (prev_dyn && pos < prev_dyn->len) {
+            const DynParam *prev = &g_array_index(prev_dyn, DynParam, pos);
+            base_value = prev->value;
+        }
+        delta = (int64_t)cur->value - base_value;
+
+        bw_write_uleb128(bw, pos_gap);
+        bw_write_bits(bw, dyn_param_type_bit(cur), WPT_DYN_TYPE_BITS);
+        bw_write_sleb128(bw, delta);
+
+        prev_pos = pos;
+    }
+}
+
 /*
- * Write the body section in packed binary format (v4 ULEB128).
+ * Write the body section in packed binary format (v10 bit-packed).
  *
  * Binary body layout:
  *   num_entries:      ULEB128
  *   For each entry:
- *     template_id:      ULEB128  (seq_num implicit from position)
- *     num_dyn:          ULEB128
- *     For each dyn_param:
- *       type:           uint8
- *       value:          uint64
+ *     template_id_delta: SLEB128 (from previous entry template id)
+ *     dyn_unchanged:    1 bit (vs last instance of this template_id)
+ *     [if dyn_unchanged==0]
+ *       num_dyn:        ULEB128 (new current length)
+ *       num_changed:    ULEB128
+ *       changed entries:
+ *         pos_gap:      ULEB128 (gap from prior changed position)
+ *         type:         1 bit (0=load, 1=store)
+ *         value_delta:  SLEB128 (from previous value at same position)
  *     num_wp:           ULEB128
  *     For each wp_bb:
- *       template_id:    ULEB128
- *       start_pc:       uint64
- *       num_dyn:        ULEB128
- *       n_insns_executed: ULEB128
- *       exception:      uint8
- *       For each dyn_param:
- *         type:         uint8
- *         value:        uint64
+ *       template_id_delta: SLEB128 (from previous wp template id)
+ *       dyn_unchanged:  1 bit (vs last instance of this wp template_id)
+ *       [if dyn_unchanged==0] (payload same as correct-path format above)
+ *       exception:      1 bit
  */
-static void write_bin_body(FILE *f, GArray *body_entries)
+static void write_bin_body(BitWriter *bw, GArray *body_entries)
 {
-    if (!f) {
-        return;
-    }
-    write_uleb128(f, body_entries->len);
+    int64_t prev_entry_template = 0;
+    GHashTable *cp_dyn_state = g_hash_table_new_full(g_int_hash, g_int_equal,
+                                                      g_free,
+                                                      dyn_param_array_unref_value);
+    GHashTable *wp_dyn_state = g_hash_table_new_full(g_int_hash, g_int_equal,
+                                                      g_free,
+                                                      dyn_param_array_unref_value);
+
+    bw_write_uleb128(bw, body_entries->len);
 
     for (guint i = 0; i < body_entries->len; i++) {
         BodyEntry *entry = &g_array_index(body_entries, BodyEntry, i);
+        int64_t entry_tmpl = entry->template_id;
+        int64_t prev_wp_template = 0;
 
-        write_uleb128(f, entry->template_id);
-        write_uleb128(f, entry->dyn_params->len);
+        bw_write_sleb128(bw, entry_tmpl - prev_entry_template);
+        prev_entry_template = entry_tmpl;
+        {
+            GArray *prev_dyn = g_hash_table_lookup(cp_dyn_state,
+                                                   &entry->template_id);
+            gboolean unchanged = prev_dyn &&
+                dyn_param_array_equal(prev_dyn, entry->dyn_params);
+            bw_write_bits(bw, unchanged ? 1 : 0, 1);
 
-        for (guint d = 0; d < entry->dyn_params->len; d++) {
-            DynParam *dp = &g_array_index(entry->dyn_params, DynParam, d);
-            write_u8(f, dp->type);
-            write_u64(f, dp->value);
+            if (!unchanged) {
+                g_autoptr(GArray) changed_positions = g_array_new(false,
+                                                                  false,
+                                                                  sizeof(guint));
+
+                dyn_param_collect_changed_positions(prev_dyn,
+                                                   entry->dyn_params,
+                                                   changed_positions);
+                write_dyn_param_patch(bw, prev_dyn, entry->dyn_params,
+                                      changed_positions);
+
+                uint32_t *key = g_new(uint32_t, 1);
+                *key = entry->template_id;
+                g_hash_table_replace(cp_dyn_state, key,
+                                     dyn_param_array_clone(entry->dyn_params));
+            }
         }
 
         uint32_t num_wp = entry->wp_entries ? entry->wp_entries->len : 0;
-        write_uleb128(f, num_wp);
+        bw_write_uleb128(bw, num_wp);
 
         for (uint32_t w = 0; w < num_wp; w++) {
             WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
-            write_uleb128(f, wp->template_id);
-            write_u64(f, wp->start_pc);
-            write_uleb128(f, wp->dyn_params->len);
-            write_uleb128(f, wp->n_insns_executed);
-            write_u8(f, wp->exception ? 1 : 0);
+            int64_t wp_tmpl = wp->template_id;
 
-            for (guint d = 0; d < wp->dyn_params->len; d++) {
-                DynParam *dp = &g_array_index(wp->dyn_params, DynParam, d);
-                write_u8(f, dp->type);
-                write_u64(f, dp->value);
+            bw_write_sleb128(bw, wp_tmpl - prev_wp_template);
+            prev_wp_template = wp_tmpl;
+            {
+                GArray *prev_dyn = g_hash_table_lookup(wp_dyn_state,
+                                                       &wp->template_id);
+                gboolean unchanged = prev_dyn &&
+                    dyn_param_array_equal(prev_dyn, wp->dyn_params);
+                bw_write_bits(bw, unchanged ? 1 : 0, 1);
+
+                if (!unchanged) {
+                    g_autoptr(GArray) changed_positions = g_array_new(false,
+                                                                      false,
+                                                                      sizeof(guint));
+
+                    dyn_param_collect_changed_positions(prev_dyn,
+                                                       wp->dyn_params,
+                                                       changed_positions);
+                    write_dyn_param_patch(bw, prev_dyn, wp->dyn_params,
+                                          changed_positions);
+
+                    uint32_t *key = g_new(uint32_t, 1);
+                    *key = wp->template_id;
+                    g_hash_table_replace(wp_dyn_state, key,
+                                         dyn_param_array_clone(wp->dyn_params));
+                }
             }
+            bw_write_bits(bw, wp->exception ? 1 : 0, 1);
         }
     }
+
+    g_hash_table_unref(cp_dyn_state);
+    g_hash_table_unref(wp_dyn_state);
 }
 
 /*
@@ -3263,10 +3446,14 @@ static void write_bin_body(FILE *f, GArray *body_entries)
  */
 static void write_bin_trace(FILE *f, GArray *body_entries)
 {
+    BitWriter bw;
+
     g_mutex_lock(&data_lock);
-    write_bin_header(f);
+    bw_init(&bw, f);
+    write_bin_header(&bw);
     g_mutex_unlock(&data_lock);
-    write_bin_body(f, body_entries);
+    write_bin_body(&bw, body_entries);
+    bw_flush(&bw);
 }
 
 /* ========================= Trace State Management ========================= */
@@ -3284,9 +3471,41 @@ static gint simpoint_entry_compare(gconstpointer a, gconstpointer b)
     return 0;
 }
 
+static void load_simpoint_weights_file(const char *path, GArray *entries)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        double weight;
+        int cluster;
+
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') {
+            continue;
+        }
+
+        if (sscanf(line, "%lf %d", &weight, &cluster) == 2) {
+            for (guint i = 0; i < entries->len; i++) {
+                SimPointEntry *sp = &g_array_index(entries, SimPointEntry, i);
+                if (sp->cluster_id == cluster) {
+                    sp->weight = weight;
+                }
+            }
+        }
+    }
+
+    fclose(f);
+}
+
 /*
- * Parse a simpoints CSV file produced by the simpoints plugin.
- * Format: interval_id,start_insn,stop_insn,cluster_id,weight
+ * Parse native SimPoint selections.
+ * Input format:
+ *   <interval_id> <cluster_id>
+ * where start/stop are derived from
+ *   interval_id * simpoint_interval_insns.
  * Lines starting with '#' are comments.
  */
 static GArray *parse_simpoints_file(const char *path)
@@ -3299,6 +3518,7 @@ static GArray *parse_simpoints_file(const char *path)
 
     GArray *entries = g_array_new(false, false, sizeof(SimPointEntry));
     char line[512];
+    bool warned_legacy = false;
 
     while (fgets(line, sizeof(line), f)) {
         /* Skip comments and blank lines */
@@ -3306,15 +3526,52 @@ static GArray *parse_simpoints_file(const char *path)
             continue;
         }
 
-        SimPointEntry sp;
-        if (sscanf(line, "%" SCNu64 ",%" SCNu64 ",%" SCNu64 ",%d,%lf",
-                   &sp.interval_id, &sp.start_insn, &sp.stop_insn,
-                   &sp.cluster_id, &sp.weight) == 5) {
-            g_array_append_val(entries, sp);
+        SimPointEntry sp = {0};
+
+        if (strchr(line, ',')) {
+            if (!warned_legacy) {
+                fprintf(stderr,
+                        "wptrace: legacy simpoints CSV format is no longer "
+                        "supported; use native SimPoint .simpoints output\n");
+                warned_legacy = true;
+            }
+            continue;
+        }
+
+        {
+            uint64_t interval_id;
+            int cluster_id = -1;
+            int parsed = sscanf(line, "%" SCNu64 " %d", &interval_id,
+                                &cluster_id);
+
+            if (parsed >= 1) {
+                uint64_t start = interval_id * simpoint_interval_insns;
+                uint64_t stop = (simpoint_interval_insns > UINT64_MAX - start)
+                    ? UINT64_MAX
+                    : start + simpoint_interval_insns;
+
+                sp.interval_id = interval_id;
+                sp.start_insn = start;
+                sp.stop_insn = stop;
+                sp.cluster_id = (parsed == 2) ? cluster_id : (int)entries->len;
+                sp.weight = 0.0;
+                g_array_append_val(entries, sp);
+            }
         }
     }
 
     fclose(f);
+
+    {
+        g_autofree char *weights_path = NULL;
+        if (g_str_has_suffix(path, ".simpoints")) {
+            weights_path = g_strndup(path, strlen(path) - strlen(".simpoints"));
+            weights_path = g_strconcat(weights_path, ".weights", NULL);
+        } else {
+            weights_path = g_strdup_printf("%s.weights", path);
+        }
+        load_simpoint_weights_file(weights_path, entries);
+    }
 
     /* Sort by start_insn ascending */
     g_array_sort(entries, simpoint_entry_compare);
@@ -3406,21 +3663,21 @@ static void finish_trace_segment(void)
  */
 static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 {
+    uint64_t n_insns = (uint64_t)(uintptr_t)udata;
+
     g_mutex_lock(&exec_lock);
 
-    uint64_t current_pc = qemu_plugin_u64_get(sb_current_pc, cpu_index);
-    uint64_t prev_last = qemu_plugin_u64_get(sb_prev_last_pc, cpu_index);
-    uint64_t prev_ft = qemu_plugin_u64_get(sb_prev_fall_through, cpu_index);
+    if (!wp_in_progress) {
+        uint64_t icount_prev = qemu_plugin_u64_get(sb_insn_count, cpu_index);
+        qemu_plugin_u64_set(sb_insn_count, cpu_index, icount_prev + n_insns);
+    }
+
     uint64_t icount = qemu_plugin_u64_get(sb_insn_count, cpu_index);
 
     /* Don't trigger inside wrong-path execution */
     if (wp_in_progress) {
         g_mutex_unlock(&exec_lock);
         return;
-    }
-
-    if (!cp_mem_accesses) {
-        cp_mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
     }
 
     /* --- Tracing window management --- */
@@ -3459,6 +3716,19 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
             exit(0);
         }
     }
+
+    if (!trace_active || !current_segment) {
+        g_mutex_unlock(&exec_lock);
+        return;
+    }
+
+    if (!cp_mem_accesses) {
+        cp_mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
+    }
+
+    uint64_t current_pc = qemu_plugin_u64_get(sb_current_pc, cpu_index);
+    uint64_t prev_last = qemu_plugin_u64_get(sb_prev_last_pc, cpu_index);
+    uint64_t prev_ft = qemu_plugin_u64_get(sb_prev_fall_through, cpu_index);
 
     /* Skip initial block (no previous context) */
     if (prev_ft == 0) {
@@ -3510,19 +3780,12 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     /* --- Collect body entry if tracing is active --- */
     if (trace_active && current_segment) {
         BodyEntry entry;
+        guint cp_mem_len = cp_mem_accesses ? cp_mem_accesses->len : 0;
         entry.seq_num = ++body_seq_num;
         entry.template_id = cp_tmpl ? cp_tmpl->template_id : 0;
-        entry.dyn_params = g_array_new(false, false, sizeof(DynParam));
+        entry.dyn_params = g_array_sized_new(false, false,
+                             sizeof(DynParam), cp_mem_len);
         entry.wp_entries = NULL;
-
-        /* Add branch target dynamic param if branch was taken */
-        if (branch_taken) {
-            DynParam dp = {
-                .type = DYN_BRANCH_TARGET,
-                .value = current_pc,
-            };
-            g_array_append_val(entry.dyn_params, dp);
-        }
 
         /* Collect correct-path memory accesses */
         if (cp_mem_accesses) {
@@ -3547,11 +3810,6 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         }
 
         g_array_append_val(current_segment->body_entries, entry);
-    } else {
-        /* Clear any accumulated memory accesses when not tracing */
-        if (cp_mem_accesses) {
-            g_array_set_size(cp_mem_accesses, 0);
-        }
     }
 
     g_mutex_unlock(&exec_lock);
@@ -3612,19 +3870,15 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         tb, QEMU_PLUGIN_INLINE_STORE_U64, sb_current_pc, pc);
 
     /*
-     * Step 2: Add instruction count for this block.
-     */
-    qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
-        tb, QEMU_PLUGIN_INLINE_ADD_U64, sb_insn_count, n_insns);
-
-    /*
-     * Step 3: Register execution callback.
+     * Step 2: Register execution callback.
+     * The callback updates sb_insn_count only when not in speculative mode.
      */
     qemu_plugin_register_vcpu_tb_exec_cb(
-        tb, vcpu_tb_exec, QEMU_PLUGIN_CB_RW_REGS, NULL);
+        tb, vcpu_tb_exec, QEMU_PLUGIN_CB_RW_REGS,
+        (void *)(uintptr_t)n_insns);
 
     /*
-     * Step 4: Update prev_* values for the NEXT block's callback.
+     * Step 3: Update prev_* values for the NEXT block's callback.
      */
     qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
         first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
@@ -3808,6 +4062,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             {"debug",   OPT_DEBUG},   {"wp",      OPT_WP},
             {"start",   OPT_START},   {"stop",    OPT_STOP},
             {"program", OPT_PROGRAM}, {"spfile",  OPT_SPFILE},
+            {"spinterval", OPT_SPINTERVAL},
             {NULL, 0}
         };
         for (int i = 0; opt_entries[i].name; i++) {
@@ -3857,6 +4112,13 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             break;
         case OPT_SPFILE:
             simpoints_file_path = g_strdup(tokens[1]);
+            break;
+        case OPT_SPINTERVAL:
+            simpoint_interval_insns = g_ascii_strtoull(tokens[1], NULL, 10);
+            if (simpoint_interval_insns == 0) {
+                fprintf(stderr, "wptrace: invalid spinterval: %s\n", tokens[1]);
+                return -1;
+            }
             break;
         }
     }

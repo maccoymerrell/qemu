@@ -13,7 +13,8 @@
  *           wrong-path BB sequences per correct-path BB.
  *
  * Two output modes:
- *   - Packed binary (.bin): Compact ULEB128-based encoding of header + body
+ *   - Packed binary (.bin): Compact ULEB128-based encoding with streamed body
+ *     records and a template footer
  *   - Debug text (.txt): Human-readable representation (toggleable)
  *
  * Features:
@@ -83,8 +84,8 @@ static guint simpoints_current_idx = 0;
 
 #define MAX_INSN_BYTES 16
 
-/* Binary format magic/version 0.3 */
-#define WPT_MAGIC  0x54505703  /* 'T','P','W',0x03 little-endian - version 0.3 */
+/* Binary format magic/version 0.4 */
+#define WPT_MAGIC  0x54505704  /* 'T','P','W',0x04 little-endian - version 0.4 */
 
 #define WPT_ISA_BITS 3
 #define WPT_OPCODE_BITS 8
@@ -2625,6 +2626,7 @@ typedef struct {
     uint64_t current_pc;        /* Current block's start PC */
     uint64_t prev_last_pc;      /* Last insn PC of previous block */
     uint64_t prev_fall_through; /* Expected sequential next from prev block */
+    uint64_t prev_bb_ends_in_branch; /* Previous BB ended in a branch */
     uint64_t insn_count;        /* Total instructions executed */
 } VCPUScoreBoard;
 
@@ -2648,16 +2650,19 @@ typedef struct {
     bool is_store;              /* Whether this was a store operation */
 } WPMemAccess;
 
+typedef struct BodyStreamState BodyStreamState;
+
 /*
- * Trace state - collects body entries for a single trace segment.
+ * Trace state for a single trace segment.
  */
 typedef struct {
-    GArray *body_entries;       /* GArray of BodyEntry */
     uint64_t start_insn;        /* Instruction number at trace start */
     uint64_t stop_insn;         /* Instruction number at trace end */
     char *label;                /* Label for output file naming */
     FILE *text_file;            /* Debug text output (NULL if disabled) */
+    FILE *text_body_tmp;        /* Streaming text body staging */
     FILE *bin_file;             /* Binary output */
+    BodyStreamState *bin_stream;
 } TraceSegment;
 
 /* ========================= Global State ========================= */
@@ -2673,6 +2678,7 @@ static struct qemu_plugin_scoreboard *vcpu_sb;
 static qemu_plugin_u64 sb_current_pc;
 static qemu_plugin_u64 sb_prev_last_pc;
 static qemu_plugin_u64 sb_prev_fall_through;
+static qemu_plugin_u64 sb_prev_bb_ends_in_branch;
 static qemu_plugin_u64 sb_insn_count;
 
 /* Tracing state */
@@ -2764,7 +2770,6 @@ static TraceSegment *trace_segment_new(const char *label,
                                        uint64_t start, uint64_t stop)
 {
     TraceSegment *seg = g_new0(TraceSegment, 1);
-    seg->body_entries = g_array_new(false, false, sizeof(BodyEntry));
     seg->start_insn = start;
     seg->stop_insn = stop;
     seg->label = g_strdup(label);
@@ -2776,10 +2781,12 @@ static void trace_segment_free(TraceSegment *seg)
     if (!seg) {
         return;
     }
-    for (guint i = 0; i < seg->body_entries->len; i++) {
-        body_entry_clear(&g_array_index(seg->body_entries, BodyEntry, i));
+    if (seg->bin_stream) {
+        g_free(seg->bin_stream);
     }
-    g_array_unref(seg->body_entries);
+    if (seg->text_body_tmp) {
+        fclose(seg->text_body_tmp);
+    }
     if (seg->text_file) {
         fclose(seg->text_file);
     }
@@ -3026,6 +3033,7 @@ static void wp_poison_target(GArray *poisoned_targets, uint64_t pc)
 static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                                        uint64_t correct_target,
                                        uint64_t wrong_target,
+                                       bool use_smith_prediction,
                                        unsigned int cpu_index)
 {
     GArray *wp_chain = g_array_new(false, false, sizeof(WPBBEntry));
@@ -3220,15 +3228,30 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
 
         /*
          * Decide next PC from the last instruction's branch type.
-         * Conditional branches: predict not-taken (fall-through).
-         * Unconditional/call/return: follow natural execution (post_pc).
+         * On wrong-path conditional branches, follow Smith predictor when
+         * requested; otherwise keep natural execution.
          */
         InsnFields *last_fld = &tmpl->insn_fields[tmpl->n_insns - 1];
         uint8_t last_br = last_fld->branch_type;
         uint64_t chosen_target;
+        bool conditional = (last_br != BRANCH_NONE && last_fld->branch_conditional);
 
-        if (last_br != BRANCH_NONE && last_fld->branch_conditional) {
-            chosen_target = tmpl->fall_through_pc;
+        if (conditional && use_smith_prediction) {
+            bool pred_taken = false;
+            BranchRecord *inner_br;
+
+            g_mutex_lock(&data_lock);
+            inner_br = g_hash_table_lookup(branch_map, &tmpl->insn_pcs[tmpl->n_insns - 1]);
+            if (inner_br) {
+                pred_taken = (inner_br->smith_counter >= 2);
+            }
+            g_mutex_unlock(&data_lock);
+
+            if (pred_taken) {
+                chosen_target = post_pc;
+            } else {
+                chosen_target = tmpl->fall_through_pc;
+            }
         } else {
             chosen_target = post_pc;
         }
@@ -3374,101 +3397,106 @@ static void write_text_header(FILE *f)
 /*
  * Write the body section (execution trace) in human-readable text format.
  */
-static void write_text_body(FILE *f, GArray *body_entries)
+static void write_text_body_entry(FILE *f, const BodyEntry *entry)
 {
     if (!f) {
         return;
     }
-    fprintf(f, "BODY\n----\n");
+    fprintf(f, "%04u BB%" PRIu32 " [",
+            entry->seq_num, entry->template_id);
 
-    for (guint i = 0; i < body_entries->len; i++) {
-        BodyEntry *entry = &g_array_index(body_entries, BodyEntry, i);
-
-        fprintf(f, "%04u BB%" PRIu32 " [",
-                entry->seq_num, entry->template_id);
-
-        /* Write dynamic parameters */
-        for (guint d = 0; d < entry->dyn_params->len; d++) {
-            DynParam *dp = &g_array_index(entry->dyn_params, DynParam, d);
-            if (d > 0) {
-                fprintf(f, " ");
-            }
-            switch (dp->type) {
-            case DYN_BRANCH_TARGET:
-                fprintf(f, "target=0x%" PRIx64, dp->value);
-                break;
-            case DYN_LOAD_ADDR:
-                fprintf(f, "load=0x%" PRIx64, dp->value);
-                break;
-            case DYN_STORE_ADDR:
-                fprintf(f, "store=0x%" PRIx64, dp->value);
-                break;
-            }
+    /* Write dynamic parameters */
+    for (guint d = 0; d < entry->dyn_params->len; d++) {
+        DynParam *dp = &g_array_index(entry->dyn_params, DynParam, d);
+        if (d > 0) {
+            fprintf(f, " ");
         }
-        fprintf(f, "]");
-
-        /* Write wrong-path BB chain */
-        if (entry->wp_entries) {
-            for (guint w = 0; w < entry->wp_entries->len; w++) {
-                WPBBEntry *wp = &g_array_index(entry->wp_entries,
-                                               WPBBEntry, w);
-                if (wp->template_id != UINT32_MAX) {
-                    fprintf(f, " [wp%u=BB%" PRIu32, w, wp->template_id);
-                } else {
-                    fprintf(f, " [wp%u=0x%" PRIx64, w, wp->start_pc);
-                }
-
-                /* WP dynamic params */
-                for (guint d = 0; d < wp->dyn_params->len; d++) {
-                    DynParam *dp = &g_array_index(wp->dyn_params,
-                                                  DynParam, d);
-                    switch (dp->type) {
-                    case DYN_BRANCH_TARGET:
-                        fprintf(f, " target=0x%" PRIx64, dp->value);
-                        break;
-                    case DYN_LOAD_ADDR:
-                        fprintf(f, " load=0x%" PRIx64, dp->value);
-                        break;
-                    case DYN_STORE_ADDR:
-                        fprintf(f, " store=0x%" PRIx64, dp->value);
-                        break;
-                    }
-                }
-                if (wp->exception) {
-                    fprintf(f, " EXCEPTION");
-                    fprintf(f, " exid=%s",
-                            generic_exception_name(wp->exception_id));
-                    if (wp->has_exception_reg) {
-                        fprintf(f, " exreg=%s",
-                                generic_reg_name(wp->exception_reg_id));
-                    }
-                }
-                if (wp->translation_unavailable) {
-                    fprintf(f, " TRANSLATION_UNAVAILABLE");
-                }
-                if (wp->poison_mask && wp->poison_mask->len > 0) {
-                    fprintf(f, " poison=");
-                    for (guint p = 0; p < wp->poison_mask->len; p++) {
-                        fprintf(f, "%u", wp->poison_mask->data[p] ? 1 : 0);
-                    }
-                }
-                fprintf(f, " n_insns=%" PRIu32, wp->n_insns_executed);
-                fprintf(f, "]");
-            }
+        switch (dp->type) {
+        case DYN_BRANCH_TARGET:
+            fprintf(f, "target=0x%" PRIx64, dp->value);
+            break;
+        case DYN_LOAD_ADDR:
+            fprintf(f, "load=0x%" PRIx64, dp->value);
+            break;
+        case DYN_STORE_ADDR:
+            fprintf(f, "store=0x%" PRIx64, dp->value);
+            break;
         }
-        fprintf(f, "\n");
     }
+    fprintf(f, "]");
+
+    /* Write wrong-path BB chain */
+    if (entry->wp_entries) {
+        for (guint w = 0; w < entry->wp_entries->len; w++) {
+            WPBBEntry *wp = &g_array_index(entry->wp_entries,
+                                           WPBBEntry, w);
+            if (wp->template_id != UINT32_MAX) {
+                fprintf(f, " [wp%u=BB%" PRIu32, w, wp->template_id);
+            } else {
+                fprintf(f, " [wp%u=0x%" PRIx64, w, wp->start_pc);
+            }
+
+            /* WP dynamic params */
+            for (guint d = 0; d < wp->dyn_params->len; d++) {
+                DynParam *dp = &g_array_index(wp->dyn_params,
+                                              DynParam, d);
+                switch (dp->type) {
+                case DYN_BRANCH_TARGET:
+                    fprintf(f, " target=0x%" PRIx64, dp->value);
+                    break;
+                case DYN_LOAD_ADDR:
+                    fprintf(f, " load=0x%" PRIx64, dp->value);
+                    break;
+                case DYN_STORE_ADDR:
+                    fprintf(f, " store=0x%" PRIx64, dp->value);
+                    break;
+                }
+            }
+            if (wp->exception) {
+                fprintf(f, " EXCEPTION");
+                fprintf(f, " exid=%s",
+                        generic_exception_name(wp->exception_id));
+                if (wp->has_exception_reg) {
+                    fprintf(f, " exreg=%s",
+                            generic_reg_name(wp->exception_reg_id));
+                }
+            }
+            if (wp->translation_unavailable) {
+                fprintf(f, " TRANSLATION_UNAVAILABLE");
+            }
+            if (wp->poison_mask && wp->poison_mask->len > 0) {
+                fprintf(f, " poison=");
+                for (guint p = 0; p < wp->poison_mask->len; p++) {
+                    fprintf(f, "%u", wp->poison_mask->data[p] ? 1 : 0);
+                }
+            }
+            fprintf(f, " n_insns=%" PRIu32, wp->n_insns_executed);
+            fprintf(f, "]");
+        }
+    }
+    fprintf(f, "\n");
 }
 
 /*
- * Write a complete trace in text format (header + body).
+ * Write a complete trace in text format (header + streamed body).
  */
-static void write_text_trace(FILE *f, GArray *body_entries)
+static void write_text_trace(FILE *f, FILE *body_tmp)
 {
+    uint8_t buf[8192];
+    size_t nread;
+
     g_mutex_lock(&data_lock);
     write_text_header(f);
     g_mutex_unlock(&data_lock);
-    write_text_body(f, body_entries);
+    fprintf(f, "BODY\n----\n");
+    if (!body_tmp) {
+        return;
+    }
+    fflush(body_tmp);
+    rewind(body_tmp);
+    while ((nread = fread(buf, 1, sizeof(buf), body_tmp)) > 0) {
+        fwrite(buf, 1, nread, f);
+    }
 }
 
 /* ========================= Output: Binary Format ========================= */
@@ -3574,12 +3602,18 @@ static void bw_write_bytes(BitWriter *bw, const uint8_t *buf, size_t len)
     }
 }
 
+struct BodyStreamState {
+    BitWriter bw;
+    int64_t prev_entry_template;
+    GHashTable *cp_dyn_state;   /* template_id -> last dyn params */
+    GHashTable *wp_dyn_state;   /* wp template_id -> last dyn params */
+    uint64_t num_entries;
+};
+
 /*
- * Write the header section in packed binary format (v0.3).
+ * Write template metadata section in packed binary format.
  *
- * Binary header layout:
- *   magic:            32 bits
- *   isa:              3 bits (TraceISA)
+ * Template metadata layout:
  *   num_templates:    ULEB128
  *   For each template:
  *     template_id:      ULEB128
@@ -3598,13 +3632,11 @@ static void bw_write_bytes(BitWriter *bw, const uint8_t *buf, size_t len)
  *       has_imm:        1 bit
  *       imm:            SLEB128 (only if has_imm == 1)
  */
-static void write_bin_header(BitWriter *bw)
+static void write_bin_templates(BitWriter *bw)
 {
     GHashTableIter iter;
     gpointer value;
 
-    bw_write_bits(bw, WPT_MAGIC, 32);
-    bw_write_bits(bw, (uint8_t)trace_isa, WPT_ISA_BITS);
     bw_write_uleb128(bw, g_hash_table_size(template_map));
 
     g_hash_table_iter_init(&iter, template_map);
@@ -3772,126 +3804,78 @@ static guint poison_mask_effective_len(const GByteArray *poison_mask)
     return 0;
 }
 
-/*
- * Write the body section in packed binary format.
- *
- * Binary body layout:
- *   num_entries:      ULEB128
- *   num_wp_chains:    ULEB128
- *   For each chain:
- *     chain_len:        ULEB128
- *     template_deltas:  [chain_len x SLEB128]
- *
- *   For each entry:
- *     template_id_delta: SLEB128 (from previous entry template id)
- *     dyn_unchanged:     1 bit (vs last instance of this template_id)
- *     [if dyn_unchanged==0]
- *       num_dyn:         ULEB128
- *       num_changed:     ULEB128
- *       changed entries:
- *         pos_gap:       ULEB128
- *         type:          1 bit (0=load, 1=store)
- *         value_delta:   SLEB128
- *
- *     wp_chain_id:       ULEB128
- *     For each wp_bb in referenced chain:
- *       dyn_unchanged:   1 bit (vs last instance of this wp template_id)
- *       [if dyn_unchanged==0] (payload same as correct-path format above)
- *
- *     num_wp_events:     ULEB128
- *     For each wp_event (exception or translation-unavailable):
- *       wp_index_gap:    ULEB128
- *       translation_unavailable: 1 bit
- *       exception:       1 bit
- *       [if exception==1]
- *         exid:          8 bits
- *         has_exreg:     1 bit
- *         exreg:         8 bits (if has_exreg==1)
- *         poison_len:    ULEB128
- *         poison_mask:   poison_len bytes
- */
-static void write_bin_body(BitWriter *bw, GArray *body_entries)
+static BodyStreamState *body_stream_new(FILE *f)
 {
-    int64_t prev_entry_template = 0;
-    GHashTable *cp_dyn_state = g_hash_table_new_full(g_int_hash, g_int_equal,
-                                                      g_free,
-                                                      dyn_param_array_unref_value);
-    GHashTable *wp_dyn_state = g_hash_table_new_full(g_int_hash, g_int_equal,
-                                                      g_free,
-                                                      dyn_param_array_unref_value);
-    GHashTable *wp_chain_id_map = g_hash_table_new_full(g_str_hash, g_str_equal,
-                                                         g_free, g_free);
-    GPtrArray *wp_chain_defs = g_ptr_array_new_with_free_func(
-        (GDestroyNotify)g_array_unref);
-    GArray *entry_chain_ids = g_array_sized_new(false, false, sizeof(uint32_t),
-                                                body_entries->len);
+    BodyStreamState *st = g_new0(BodyStreamState, 1);
 
-    /* Build wrong-path chain dictionary once for this trace segment. */
-    for (guint i = 0; i < body_entries->len; i++) {
-        BodyEntry *entry = &g_array_index(body_entries, BodyEntry, i);
-        uint32_t num_wp = entry->wp_entries ? entry->wp_entries->len : 0;
-        g_autoptr(GString) sig = g_string_new(NULL);
-        uint32_t chain_id;
-        gpointer found_val = NULL;
+    bw_init(&st->bw, f);
+    bw_write_bits(&st->bw, WPT_MAGIC, 32);
+    bw_write_bits(&st->bw, (uint8_t)trace_isa, WPT_ISA_BITS);
+    st->cp_dyn_state = g_hash_table_new_full(g_int_hash, g_int_equal,
+                                             g_free,
+                                             dyn_param_array_unref_value);
+    st->wp_dyn_state = g_hash_table_new_full(g_int_hash, g_int_equal,
+                                             g_free,
+                                             dyn_param_array_unref_value);
+    return st;
+}
+
+static void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
+{
+    int64_t entry_tmpl = entry->template_id;
+    uint32_t num_wp = entry->wp_entries ? entry->wp_entries->len : 0;
+    uint64_t body_start_bits = bw_tell_bits(&st->bw);
+
+    bw_write_bits(&st->bw, 1, 1); /* entry marker */
+    bw_write_sleb128(&st->bw, entry_tmpl - st->prev_entry_template);
+    st->prev_entry_template = entry_tmpl;
+    {
+        GArray *prev_dyn = g_hash_table_lookup(st->cp_dyn_state,
+                                               &entry->template_id);
+        gboolean unchanged = prev_dyn &&
+            dyn_param_array_equal(prev_dyn, entry->dyn_params);
+        bw_write_bits(&st->bw, unchanged ? 1 : 0, 1);
+
+        if (!unchanged) {
+            g_autoptr(GArray) changed_positions = g_array_new(false,
+                                                              false,
+                                                              sizeof(guint));
+
+            dyn_param_collect_changed_positions(prev_dyn,
+                                                entry->dyn_params,
+                                                changed_positions);
+            write_dyn_param_patch(&st->bw, prev_dyn, entry->dyn_params,
+                                  changed_positions, false);
+
+            {
+                uint32_t *key = g_new(uint32_t, 1);
+                *key = entry->template_id;
+                g_hash_table_replace(st->cp_dyn_state, key,
+                                     dyn_param_array_clone(entry->dyn_params));
+            }
+        }
+    }
+
+    bw_write_uleb128(&st->bw, num_wp);
+    /*
+     * We intentionally encode only one wrong-path chain per correct-path BB:
+     * the Smith-predicted continuation. Encoding the full wrong-path tree up
+     * to depth 64 is not tractable in the presence of indirect control-flow
+     * because fanout can explode and target sets are runtime-dependent.
+     */
+    {
+        int64_t prev_wp_tid = 0;
 
         for (uint32_t w = 0; w < num_wp; w++) {
-            WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
-            g_string_append_printf(sig, "%" PRIu32 ",", wp->template_id);
-        }
-
-        if (g_hash_table_lookup_extended(wp_chain_id_map, sig->str,
-                                         NULL, &found_val)) {
-            chain_id = *(uint32_t *)found_val;
-        } else {
-            GArray *chain = g_array_sized_new(false, false, sizeof(uint32_t),
-                                              num_wp);
-            uint32_t *stored_id = g_new(uint32_t, 1);
-            chain_id = wp_chain_defs->len;
-
-            for (uint32_t w = 0; w < num_wp; w++) {
-                WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
-                g_array_append_val(chain, wp->template_id);
-            }
-
-            *stored_id = chain_id;
-            g_hash_table_insert(wp_chain_id_map,
-                                g_strdup(sig->str), stored_id);
-            g_ptr_array_add(wp_chain_defs, chain);
-        }
-
-        g_array_append_val(entry_chain_ids, chain_id);
-    }
-
-    bw_write_uleb128(bw, body_entries->len);
-    bw_write_uleb128(bw, wp_chain_defs->len);
-
-    for (guint c = 0; c < wp_chain_defs->len; c++) {
-        GArray *chain = g_ptr_array_index(wp_chain_defs, c);
-        int64_t prev_tid = 0;
-
-        bw_write_uleb128(bw, chain->len);
-        for (guint w = 0; w < chain->len; w++) {
-            uint32_t tid = g_array_index(chain, uint32_t, w);
-            bw_write_sleb128(bw, (int64_t)tid - prev_tid);
-            prev_tid = tid;
-        }
-    }
-
-    for (guint i = 0; i < body_entries->len; i++) {
-        BodyEntry *entry = &g_array_index(body_entries, BodyEntry, i);
-        int64_t entry_tmpl = entry->template_id;
-        uint32_t chain_id = g_array_index(entry_chain_ids, uint32_t, i);
-        GArray *chain = g_ptr_array_index(wp_chain_defs, chain_id);
-        uint32_t num_wp = chain->len;
-
-        bw_write_sleb128(bw, entry_tmpl - prev_entry_template);
-        prev_entry_template = entry_tmpl;
-        {
-            GArray *prev_dyn = g_hash_table_lookup(cp_dyn_state,
-                                                   &entry->template_id);
+            const WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
+            uint32_t wp_tmpl = wp->template_id;
+            GArray *prev_dyn = g_hash_table_lookup(st->wp_dyn_state, &wp_tmpl);
             gboolean unchanged = prev_dyn &&
-                dyn_param_array_equal(prev_dyn, entry->dyn_params);
-            bw_write_bits(bw, unchanged ? 1 : 0, 1);
+                dyn_param_array_equal(prev_dyn, wp->dyn_params);
+
+            bw_write_sleb128(&st->bw, (int64_t)wp_tmpl - prev_wp_tid);
+            prev_wp_tid = wp_tmpl;
+            bw_write_bits(&st->bw, unchanged ? 1 : 0, 1);
 
             if (!unchanged) {
                 g_autoptr(GArray) changed_positions = g_array_new(false,
@@ -3899,137 +3883,97 @@ static void write_bin_body(BitWriter *bw, GArray *body_entries)
                                                                   sizeof(guint));
 
                 dyn_param_collect_changed_positions(prev_dyn,
-                                                   entry->dyn_params,
-                                                   changed_positions);
-                write_dyn_param_patch(bw, prev_dyn, entry->dyn_params,
-                                      changed_positions, false);
+                                                    wp->dyn_params,
+                                                    changed_positions);
+                write_dyn_param_patch(&st->bw, prev_dyn, wp->dyn_params,
+                                      changed_positions, true);
 
-                uint32_t *key = g_new(uint32_t, 1);
-                *key = entry->template_id;
-                g_hash_table_replace(cp_dyn_state, key,
-                                     dyn_param_array_clone(entry->dyn_params));
-            }
-        }
-
-        bw_write_uleb128(bw, chain_id);
-
-        for (uint32_t w = 0; w < num_wp; w++) {
-            WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
-            uint32_t wp_tmpl = g_array_index(chain, uint32_t, w);
-
-            g_assert(wp->template_id == wp_tmpl);
-            {
-                GArray *prev_dyn = g_hash_table_lookup(wp_dyn_state,
-                                                       &wp_tmpl);
-                gboolean unchanged = prev_dyn &&
-                    dyn_param_array_equal(prev_dyn, wp->dyn_params);
-                bw_write_bits(bw, unchanged ? 1 : 0, 1);
-
-                if (!unchanged) {
-                    g_autoptr(GArray) changed_positions = g_array_new(false,
-                                                                      false,
-                                                                      sizeof(guint));
-
-                    dyn_param_collect_changed_positions(prev_dyn,
-                                                       wp->dyn_params,
-                                                       changed_positions);
-                    write_dyn_param_patch(bw, prev_dyn, wp->dyn_params,
-                                          changed_positions, true);
-
+                {
                     uint32_t *key = g_new(uint32_t, 1);
                     *key = wp_tmpl;
-                    g_hash_table_replace(wp_dyn_state, key,
+                    g_hash_table_replace(st->wp_dyn_state, key,
                                          dyn_param_array_clone(wp->dyn_params));
                 }
             }
         }
-
-        {
-            uint32_t num_events = 0;
-            int64_t prev_event_idx = -1;
-            uint64_t exc_start_bits;
-
-            for (uint32_t w = 0; w < num_wp; w++) {
-                WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
-                if (wp->exception || wp->translation_unavailable) {
-                    num_events++;
-                }
-            }
-
-            bw_write_uleb128(bw, num_events);
-            exc_start_bits = bw_tell_bits(bw);
-
-            for (uint32_t w = 0; w < num_wp; w++) {
-                WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
-
-                if (!wp->exception && !wp->translation_unavailable) {
-                    continue;
-                }
-
-                bw_write_uleb128(bw, (uint64_t)(w - (uint32_t)(prev_event_idx + 1)));
-                bw_write_bits(bw, wp->translation_unavailable ? 1 : 0, 1);
-                bw_write_bits(bw, wp->exception ? 1 : 0, 1);
-
-                if (wp->exception) {
-                    bw_write_bits(bw, wp->exception_id, 8);
-                    bw_write_bits(bw, wp->has_exception_reg ? 1 : 0, 1);
-                    if (wp->has_exception_reg) {
-                        bw_write_bits(bw, wp->exception_reg_id, WPT_REG_BITS);
-                    }
-                    if (wp->poison_mask) {
-                        guint poison_len =
-                            poison_mask_effective_len(wp->poison_mask);
-
-                        bw_write_uleb128(bw, poison_len);
-                        if (poison_len > 0) {
-                            bw_write_bytes(bw, wp->poison_mask->data,
-                                           poison_len);
-                        }
-                        stat_bin_wp_poison_bits += bits_for_uleb128(poison_len)
-                                                 + ((uint64_t)poison_len * 8);
-                    } else {
-                        bw_write_uleb128(bw, 0);
-                        stat_bin_wp_poison_bits += bits_for_uleb128(0);
-                    }
-                }
-
-                prev_event_idx = w;
-            }
-
-            stat_bin_wp_exception_bits += bw_tell_bits(bw) - exc_start_bits;
-        }
     }
 
-    g_hash_table_unref(cp_dyn_state);
-    g_hash_table_unref(wp_dyn_state);
-    g_hash_table_unref(wp_chain_id_map);
-    g_ptr_array_unref(wp_chain_defs);
-    g_array_unref(entry_chain_ids);
+    {
+        uint32_t num_events = 0;
+        int64_t prev_event_idx = -1;
+        uint64_t exc_start_bits;
+
+        for (uint32_t w = 0; w < num_wp; w++) {
+            const WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
+            if (wp->exception || wp->translation_unavailable) {
+                num_events++;
+            }
+        }
+
+        bw_write_uleb128(&st->bw, num_events);
+        exc_start_bits = bw_tell_bits(&st->bw);
+
+        for (uint32_t w = 0; w < num_wp; w++) {
+            const WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
+
+            if (!wp->exception && !wp->translation_unavailable) {
+                continue;
+            }
+
+            bw_write_uleb128(&st->bw, (uint64_t)(w - (uint32_t)(prev_event_idx + 1)));
+            bw_write_bits(&st->bw, wp->translation_unavailable ? 1 : 0, 1);
+            bw_write_bits(&st->bw, wp->exception ? 1 : 0, 1);
+
+            if (wp->exception) {
+                bw_write_bits(&st->bw, wp->exception_id, 8);
+                bw_write_bits(&st->bw, wp->has_exception_reg ? 1 : 0, 1);
+                if (wp->has_exception_reg) {
+                    bw_write_bits(&st->bw, wp->exception_reg_id, WPT_REG_BITS);
+                }
+                if (wp->poison_mask) {
+                    guint poison_len = poison_mask_effective_len(wp->poison_mask);
+
+                    bw_write_uleb128(&st->bw, poison_len);
+                    if (poison_len > 0) {
+                        bw_write_bytes(&st->bw, wp->poison_mask->data, poison_len);
+                    }
+                    stat_bin_wp_poison_bits += bits_for_uleb128(poison_len)
+                                             + ((uint64_t)poison_len * 8);
+                } else {
+                    bw_write_uleb128(&st->bw, 0);
+                    stat_bin_wp_poison_bits += bits_for_uleb128(0);
+                }
+            }
+
+            prev_event_idx = w;
+        }
+
+        stat_bin_wp_exception_bits += bw_tell_bits(&st->bw) - exc_start_bits;
+    }
+
+    st->num_entries++;
+    stat_bin_body_bits += bw_tell_bits(&st->bw) - body_start_bits;
 }
 
-/*
- * Write a complete trace in binary format (header + body).
- */
-static void write_bin_trace(FILE *f, GArray *body_entries)
+static void body_stream_finish(BodyStreamState *st)
 {
-    BitWriter bw;
-    uint64_t pre_header_bits;
-    uint64_t post_header_bits;
-    uint64_t post_body_bits;
+    uint64_t footer_start_bits;
+    uint64_t end_bits;
 
+    bw_write_bits(&st->bw, 0, 1); /* footer marker */
+    footer_start_bits = bw_tell_bits(&st->bw);
+    bw_write_uleb128(&st->bw, st->num_entries);
     g_mutex_lock(&data_lock);
-    bw_init(&bw, f);
-    pre_header_bits = bw_tell_bits(&bw);
-    write_bin_header(&bw);
-    post_header_bits = bw_tell_bits(&bw);
+    write_bin_templates(&st->bw);
     g_mutex_unlock(&data_lock);
-    write_bin_body(&bw, body_entries);
-    post_body_bits = bw_tell_bits(&bw);
-    bw_flush(&bw);
+    bw_flush(&st->bw);
+    end_bits = bw_tell_bits(&st->bw);
 
-    stat_bin_header_bits += post_header_bits - pre_header_bits;
-    stat_bin_body_bits += post_body_bits - post_header_bits;
-    stat_bin_total_bits += post_body_bits;
+    stat_bin_header_bits += end_bits - footer_start_bits;
+    stat_bin_total_bits += end_bits;
+
+    g_hash_table_unref(st->cp_dyn_state);
+    g_hash_table_unref(st->wp_dyn_state);
 }
 
 /* ========================= Trace State Management ========================= */
@@ -4181,6 +4125,11 @@ static void start_trace_segment(const char *label,
         if (!current_segment->bin_file) {
             fprintf(stderr, "wptrace: cannot open binary output: %s\n",
                     bin_path);
+        } else {
+            current_segment->bin_stream = body_stream_new(current_segment->bin_file);
+            if (!current_segment->bin_stream) {
+                fprintf(stderr, "wptrace: cannot initialize binary stream\n");
+            }
         }
     }
 
@@ -4189,6 +4138,11 @@ static void start_trace_segment(const char *label,
         if (!current_segment->text_file) {
             fprintf(stderr, "wptrace: cannot open text output: %s\n",
                     txt_path);
+        } else {
+            current_segment->text_body_tmp = tmpfile();
+            if (!current_segment->text_body_tmp) {
+                fprintf(stderr, "wptrace: cannot create text body staging file\n");
+            }
         }
     }
 
@@ -4207,13 +4161,12 @@ static void finish_trace_segment(void)
     trace_active = false;
 
     /* Write outputs */
-    if (current_segment->bin_file) {
-        write_bin_trace(current_segment->bin_file,
-                        current_segment->body_entries);
+    if (current_segment->bin_stream) {
+        body_stream_finish(current_segment->bin_stream);
     }
     if (current_segment->text_file) {
         write_text_trace(current_segment->text_file,
-                         current_segment->body_entries);
+                         current_segment->text_body_tmp);
     }
 
     trace_segment_free(current_segment);
@@ -4293,6 +4246,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     uint64_t current_pc = qemu_plugin_u64_get(sb_current_pc, cpu_index);
     uint64_t prev_last = qemu_plugin_u64_get(sb_prev_last_pc, cpu_index);
     uint64_t prev_ft = qemu_plugin_u64_get(sb_prev_fall_through, cpu_index);
+    bool prev_is_branch = qemu_plugin_u64_get(sb_prev_bb_ends_in_branch,
+                                              cpu_index);
 
     /* Skip initial block (no previous context) */
     if (prev_ft == 0) {
@@ -4304,16 +4259,18 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     g_mutex_lock(&data_lock);
 
-    stat_branches_observed++;
-    if (branch_taken) {
-        stat_branches_taken++;
-    } else {
-        stat_branches_not_taken++;
+    if (prev_is_branch) {
+        stat_branches_observed++;
+        if (branch_taken) {
+            stat_branches_taken++;
+        } else {
+            stat_branches_not_taken++;
+        }
     }
 
     /* Find or create branch record */
     BranchRecord *br = g_hash_table_lookup(branch_map, &prev_last);
-    if (!br) {
+    if (prev_is_branch && !br) {
         br = g_new0(BranchRecord, 1);
         br->pc = prev_last;
         br->fall_through = prev_ft;
@@ -4321,16 +4278,20 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         g_hash_table_replace(branch_map, &br->pc, br);
     }
 
-    if (branch_taken) {
+    if (prev_is_branch && branch_taken) {
         br->taken_target = current_pc;
         br->has_taken_target = true;
     }
 
-    br->smith_counter = smith_update(br->smith_counter, branch_taken);
+    if (prev_is_branch) {
+        br->smith_counter = smith_update(br->smith_counter, branch_taken);
+    }
 
     /* Determine wrong-path target */
     uint64_t wrong_target = 0;
-    if (branch_taken) {
+    if (!prev_is_branch) {
+        wrong_target = 0;
+    } else if (branch_taken) {
         wrong_target = prev_ft;
     } else if (br->has_taken_target) {
         wrong_target = br->taken_target;
@@ -4371,12 +4332,20 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         /* Run wrong-path execution if enabled and target is known */
         if (enable_wrong_path && wrong_target != 0) {
             entry.wp_entries = simulate_wrong_path_ext(
-                prev_last, current_pc, wrong_target, cpu_index);
+                prev_last, current_pc, wrong_target,
+                true,
+                cpu_index);
         } else if (wrong_target == 0) {
             stat_wp_skipped++;
         }
 
-        g_array_append_val(current_segment->body_entries, entry);
+        if (current_segment->bin_stream) {
+            body_stream_write_entry(current_segment->bin_stream, &entry);
+        }
+        if (current_segment->text_body_tmp) {
+            write_text_body_entry(current_segment->text_body_tmp, &entry);
+        }
+        body_entry_clear(&entry);
     }
 
     g_mutex_unlock(&exec_lock);
@@ -4398,6 +4367,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     uint64_t last_insn_pc = qemu_plugin_insn_vaddr(last_insn);
     size_t last_insn_size = qemu_plugin_insn_size(last_insn);
     uint64_t fall_through = last_insn_pc + last_insn_size;
+    uint64_t bb_ends_in_branch = 0;
 
     /* Collect instruction data for BB template */
     uint64_t *insn_pcs = g_new0(uint64_t, n_insns);
@@ -4425,9 +4395,15 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
     /* Create or update BB template */
     g_mutex_lock(&data_lock);
-    get_or_create_template(pc, (uint32_t)n_insns, insn_pcs,
-                           insn_disas_arr, insn_sizes, insn_bytes,
-                           symbol_name, fall_through);
+    {
+        BBTemplate *tmpl = get_or_create_template(pc, (uint32_t)n_insns, insn_pcs,
+                                                  insn_disas_arr, insn_sizes, insn_bytes,
+                                                  symbol_name, fall_through);
+        if (tmpl && tmpl->n_insns > 0) {
+            InsnFields *last_fld = &tmpl->insn_fields[tmpl->n_insns - 1];
+            bb_ends_in_branch = (last_fld->branch_type != BRANCH_NONE) ? 1 : 0;
+        }
+    }
     g_mutex_unlock(&data_lock);
 
     /* Free temporary arrays (template made copies) */
@@ -4460,6 +4436,9 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
         first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
         sb_prev_fall_through, fall_through);
+    qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
+        first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
+        sb_prev_bb_ends_in_branch, bb_ends_in_branch);
 }
 
 /* ========================= Flush Callback ========================= */
@@ -4806,6 +4785,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         vcpu_sb, VCPUScoreBoard, prev_last_pc);
     sb_prev_fall_through = qemu_plugin_scoreboard_u64_in_struct(
         vcpu_sb, VCPUScoreBoard, prev_fall_through);
+    sb_prev_bb_ends_in_branch = qemu_plugin_scoreboard_u64_in_struct(
+        vcpu_sb, VCPUScoreBoard, prev_bb_ends_in_branch);
     sb_insn_count = qemu_plugin_scoreboard_u64_in_struct(
         vcpu_sb, VCPUScoreBoard, insn_count);
 

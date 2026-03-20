@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-WPT_MAGIC = 0x54505701
+WPT_MAGIC = 0x54505703
 
 WPT_ISA_BITS = 3
 WPT_OPCODE_BITS = 8
@@ -256,10 +256,10 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
         )
 
     isa = br.read_bits(WPT_ISA_BITS)
-    opcode_names = read_name_table(br)
-    branch_names = read_name_table(br)
-    exception_names = read_name_table(br)
-    reg_names = read_name_table(br)
+    opcode_names = dict(OPCODE_NAMES)
+    branch_names = dict(BRANCH_NAMES)
+    exception_names = dict(EXCEPTION_NAMES_DEFAULT)
+    reg_names: dict[int, str] = {}
 
     num_templates = br.read_uleb128()
 
@@ -271,7 +271,7 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
         start_pc = br.read_uleb128()
         n_insns = br.read_uleb128()
         fall_through_pc = br.read_uleb128()
-        symbol_name = read_string(br)
+        symbol_name = ""
 
         insns: list[dict] = []
         for _ in range(n_insns):
@@ -286,8 +286,9 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
             src_regs = [br.read_bits(WPT_REG_BITS) for _ in range(n_src)]
             dst_regs = [br.read_bits(WPT_REG_BITS) for _ in range(n_dst)]
             imm = br.read_sleb128() if has_imm else None
-            raw_len = br.read_uleb128()
-            raw_bytes = read_bytes(br, raw_len)
+            # v0.3 keeps only instruction size in the header (raw bytes removed).
+            _insn_size = br.read_uleb128()
+            raw_bytes = b""
 
             insns.append({
                 "pc": pc,
@@ -312,6 +313,20 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
         template_by_id[template_id] = tmpl
 
     num_entries = br.read_uleb128()
+    num_wp_chains = br.read_uleb128()
+    wp_chains: list[list[int]] = []
+
+    for _ in range(num_wp_chains):
+        chain_len = br.read_uleb128()
+        prev_tid = 0
+        chain: list[int] = []
+
+        for _ in range(chain_len):
+            prev_tid = prev_tid + br.read_sleb128()
+            chain.append(prev_tid)
+
+        wp_chains.append(chain)
+
     entries: list[dict] = []
 
     prev_entry_template = 0
@@ -336,13 +351,16 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
                                                  value=d.value)
                                         for d in cp_dyn]
 
-        num_wp = br.read_uleb128()
-        prev_wp_template = 0
+        chain_id = br.read_uleb128()
+        if chain_id >= len(wp_chains):
+            raise ValueError("wp chain id out of range")
+
+        chain = wp_chains[chain_id]
+        num_wp = len(chain)
         wp_entries: list[dict] = []
 
         for w in range(num_wp):
-            wp_tmpl = prev_wp_template + br.read_sleb128()
-            prev_wp_template = wp_tmpl
+            wp_tmpl = chain[w]
 
             wp_unchanged = br.read_bits(1)
             prev_wp_dyn = wp_dyn_state.get(wp_tmpl, [])
@@ -358,22 +376,12 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
                                                   value=d.value)
                                          for d in wp_dyn]
 
-            exception = br.read_bits(1)
             translation_unavailable = False
+            exception = False
             exception_id = 0
             exception_name = None
             exreg_name = None
             poison_mask: list[int] = []
-            translation_unavailable = bool(br.read_bits(1))
-            if exception:
-                exception_id = br.read_bits(8)
-                exception_name = exception_names.get(exception_id, "UNKNOWN")
-                has_exreg = br.read_bits(1)
-                if has_exreg:
-                    exreg_id = br.read_bits(WPT_REG_BITS)
-                    exreg_name = reg_names.get(exreg_id, reg_name(exreg_id))
-                poison_len = br.read_uleb128()
-                poison_mask = [br.read_bits(8) for _ in range(poison_len)]
             wp_n_insns = 0
             if wp_tmpl in template_by_id:
                 wp_n_insns = template_by_id[wp_tmpl]["n_insns"]
@@ -390,6 +398,38 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
                 "poison_mask": poison_mask,
                 "n_insns": wp_n_insns,
             })
+
+        num_wp_events = br.read_uleb128()
+        prev_wp_event_idx = -1
+        for _ in range(num_wp_events):
+            wp_idx_gap = br.read_uleb128()
+            wp_idx = prev_wp_event_idx + 1 + wp_idx_gap
+
+            if wp_idx >= num_wp:
+                raise ValueError("wp event index out of range")
+
+            translation_unavailable = bool(br.read_bits(1))
+            exception = bool(br.read_bits(1))
+
+            target = wp_entries[wp_idx]
+            target["translation_unavailable"] = translation_unavailable
+            target["exception"] = exception
+
+            if exception:
+                exception_id = br.read_bits(8)
+                target["exception_id"] = exception_id
+                target["exception_name"] = exception_names.get(exception_id,
+                                                                  "UNKNOWN")
+                has_exreg = br.read_bits(1)
+                if has_exreg:
+                    exreg_id = br.read_bits(WPT_REG_BITS)
+                    target["exception_reg"] = reg_names.get(exreg_id,
+                                                              reg_name(exreg_id))
+                poison_len = br.read_uleb128()
+                target["poison_mask"] = [br.read_bits(8)
+                                          for _ in range(poison_len)]
+
+            prev_wp_event_idx = wp_idx
 
         entries.append({
             "seq_num": seq_num,
@@ -515,7 +555,7 @@ def first_diff_line(a: str, b: str) -> tuple[int, str, str] | None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Decode wptrace binary (.bin, format v0.1) and reconstruct debug text format"
+            "Decode wptrace binary (.bin, format v0.3) and reconstruct debug text format"
         )
     )
     parser.add_argument("bin", type=Path, help="Input wptrace binary file")

@@ -83,8 +83,8 @@ static guint simpoints_current_idx = 0;
 
 #define MAX_INSN_BYTES 16
 
-/* Binary format magic/version 0.1 */
-#define WPT_MAGIC  0x54505701  /* 'T','P','W',0x01 little-endian - version 0.1 */
+/* Binary format magic/version 0.3 */
+#define WPT_MAGIC  0x54505703  /* 'T','P','W',0x03 little-endian - version 0.3 */
 
 #define WPT_ISA_BITS 3
 #define WPT_OPCODE_BITS 8
@@ -2700,6 +2700,15 @@ static uint64_t stat_wp_total_insns;
 static uint64_t stat_wp_early_exits;
 static uint64_t stat_wp_total_mem_accesses;
 
+/* Binary format accounting */
+static uint64_t stat_bin_total_bits;
+static uint64_t stat_bin_header_bits;
+static uint64_t stat_bin_body_bits;
+static uint64_t stat_bin_dyn_cp_bits;
+static uint64_t stat_bin_dyn_wp_bits;
+static uint64_t stat_bin_wp_exception_bits;
+static uint64_t stat_bin_wp_poison_bits;
+
 /* ========================= Smith Predictor ========================= */
 
 static inline uint8_t smith_update(uint8_t counter, bool taken)
@@ -3472,6 +3481,7 @@ typedef struct {
     FILE *f;
     uint8_t cur;
     uint8_t used;
+    uint64_t total_bits;
 } BitWriter;
 
 static inline void bw_init(BitWriter *bw, FILE *f)
@@ -3479,6 +3489,12 @@ static inline void bw_init(BitWriter *bw, FILE *f)
     bw->f = f;
     bw->cur = 0;
     bw->used = 0;
+    bw->total_bits = 0;
+}
+
+static inline uint64_t bw_tell_bits(const BitWriter *bw)
+{
+    return bw->total_bits;
 }
 
 static inline void bw_flush(BitWriter *bw)
@@ -3500,6 +3516,7 @@ static void bw_write_bits(BitWriter *bw, uint64_t value, uint8_t nbits)
         bw->cur |= (uint8_t)((value & mask) << bw->used);
         value >>= take;
         bw->used += take;
+        bw->total_bits += take;
         nbits -= take;
 
         if (bw->used == 8) {
@@ -3508,6 +3525,18 @@ static void bw_write_bits(BitWriter *bw, uint64_t value, uint8_t nbits)
             bw->used = 0;
         }
     }
+}
+
+static uint32_t bits_for_uleb128(uint64_t v)
+{
+    uint32_t bits = 0;
+
+    do {
+        bits += 8;
+        v >>= 7;
+    } while (v != 0);
+
+    return bits;
 }
 
 static void bw_write_uleb128(BitWriter *bw, uint64_t v)
@@ -3545,87 +3574,18 @@ static void bw_write_bytes(BitWriter *bw, const uint8_t *buf, size_t len)
     }
 }
 
-static void bw_write_string(BitWriter *bw, const char *s)
-{
-    size_t len = s ? strlen(s) : 0;
-
-    bw_write_uleb128(bw, len);
-    if (len) {
-        bw_write_bytes(bw, (const uint8_t *)s, len);
-    }
-}
-
-static void write_bin_enum_name_tables(BitWriter *bw)
-{
-    /* Opcode names */
-    bw_write_uleb128(bw, GEN_OP_COUNT);
-    for (uint32_t i = 0; i < GEN_OP_COUNT; i++) {
-        bw_write_uleb128(bw, i);
-        bw_write_string(bw, generic_opcode_name(i));
-    }
-
-    /* Branch names */
-    bw_write_uleb128(bw, BRANCH_TYPE_COUNT);
-    for (uint32_t i = 0; i < BRANCH_TYPE_COUNT; i++) {
-        bw_write_uleb128(bw, i);
-        bw_write_string(bw, branch_type_name(i));
-    }
-
-    /* Exception names */
-    bw_write_uleb128(bw, GEN_EXC_COUNT);
-    for (uint32_t i = 0; i < GEN_EXC_COUNT; i++) {
-        bw_write_uleb128(bw, i);
-        bw_write_string(bw, generic_exception_name(i));
-    }
-
-    /* Register names */
-    bw_write_uleb128(bw, 198);
-    bw_write_uleb128(bw, REG_NONE);
-    bw_write_string(bw, generic_reg_name(REG_NONE));
-    for (uint32_t i = 0; i < 64; i++) {
-        uint8_t rid = REG_GPR0 + i;
-        bw_write_uleb128(bw, rid);
-        bw_write_string(bw, generic_reg_name(rid));
-    }
-    for (uint32_t i = 0; i < 64; i++) {
-        uint8_t rid = REG_FPR0 + i;
-        bw_write_uleb128(bw, rid);
-        bw_write_string(bw, generic_reg_name(rid));
-    }
-    for (uint32_t i = 0; i < 64; i++) {
-        uint8_t rid = REG_VEC0 + i;
-        bw_write_uleb128(bw, rid);
-        bw_write_string(bw, generic_reg_name(rid));
-    }
-    bw_write_uleb128(bw, REG_SP);
-    bw_write_string(bw, generic_reg_name(REG_SP));
-    bw_write_uleb128(bw, REG_FLAGS);
-    bw_write_string(bw, generic_reg_name(REG_FLAGS));
-    bw_write_uleb128(bw, REG_IP);
-    bw_write_string(bw, generic_reg_name(REG_IP));
-    bw_write_uleb128(bw, REG_LR);
-    bw_write_string(bw, generic_reg_name(REG_LR));
-    bw_write_uleb128(bw, REG_FP_REG);
-    bw_write_string(bw, generic_reg_name(REG_FP_REG));
-}
-
 /*
- * Write the header section in packed binary format (v0.1).
+ * Write the header section in packed binary format (v0.3).
  *
  * Binary header layout:
  *   magic:            32 bits
  *   isa:              3 bits (TraceISA)
- *   opcode_names:     id->string table
- *   branch_names:     id->string table
- *   exception_names:  id->string table
- *   register_names:   id->string table
  *   num_templates:    ULEB128
  *   For each template:
  *     template_id:      ULEB128
  *     start_pc:         ULEB128
  *     num_insns:        ULEB128
  *     fall_through_pc:  ULEB128
- *     symbol_name:      length-prefixed UTF-8 string
  *     For each instruction:
  *       pc:             ULEB128
  *       opcode:         8 bits (GenericOpcode)
@@ -3637,8 +3597,6 @@ static void write_bin_enum_name_tables(BitWriter *bw)
  *       dst_regs:       [n_dst bytes] (GenericRegId)
  *       has_imm:        1 bit
  *       imm:            SLEB128 (only if has_imm == 1)
- *       raw_size:       ULEB128
- *       raw_bytes:      raw_size bytes
  */
 static void write_bin_header(BitWriter *bw)
 {
@@ -3647,7 +3605,6 @@ static void write_bin_header(BitWriter *bw)
 
     bw_write_bits(bw, WPT_MAGIC, 32);
     bw_write_bits(bw, (uint8_t)trace_isa, WPT_ISA_BITS);
-    write_bin_enum_name_tables(bw);
     bw_write_uleb128(bw, g_hash_table_size(template_map));
 
     g_hash_table_iter_init(&iter, template_map);
@@ -3657,7 +3614,6 @@ static void write_bin_header(BitWriter *bw)
         bw_write_uleb128(bw, tmpl->start_pc);
         bw_write_uleb128(bw, tmpl->n_insns);
         bw_write_uleb128(bw, tmpl->fall_through_pc);
-        bw_write_string(bw, tmpl->symbol_name);
 
         for (uint32_t i = 0; i < tmpl->n_insns; i++) {
             InsnFields *fld = &tmpl->insn_fields[i];
@@ -3681,9 +3637,6 @@ static void write_bin_header(BitWriter *bw)
                 bw_write_sleb128(bw, fld->immediate);
             }
             bw_write_uleb128(bw, tmpl->insn_sizes[i]);
-            bw_write_bytes(bw,
-                           &tmpl->insn_bytes[(size_t)i * MAX_INSN_BYTES],
-                           tmpl->insn_sizes[i]);
         }
     }
 }
@@ -3767,9 +3720,11 @@ static void dyn_param_collect_changed_positions(const GArray *prev_dyn,
 static void write_dyn_param_patch(BitWriter *bw,
                                   const GArray *prev_dyn,
                                   const GArray *cur_dyn,
-                                  const GArray *changed_positions)
+                                  const GArray *changed_positions,
+                                  bool is_wp)
 {
     int64_t prev_pos = -1;
+    uint64_t patch_start_bits = bw_tell_bits(bw);
 
     bw_write_uleb128(bw, cur_dyn->len);
     bw_write_uleb128(bw, changed_positions->len);
@@ -3793,6 +3748,12 @@ static void write_dyn_param_patch(BitWriter *bw,
 
         prev_pos = pos;
     }
+
+    if (is_wp) {
+        stat_bin_dyn_wp_bits += bw_tell_bits(bw) - patch_start_bits;
+    } else {
+        stat_bin_dyn_cp_bits += bw_tell_bits(bw) - patch_start_bits;
+    }
 }
 
 /* Return the number of poison bytes that carry useful data. */
@@ -3812,32 +3773,42 @@ static guint poison_mask_effective_len(const GByteArray *poison_mask)
 }
 
 /*
- * Write the body section in packed binary format (v0.1).
+ * Write the body section in packed binary format.
  *
  * Binary body layout:
  *   num_entries:      ULEB128
+ *   num_wp_chains:    ULEB128
+ *   For each chain:
+ *     chain_len:        ULEB128
+ *     template_deltas:  [chain_len x SLEB128]
+ *
  *   For each entry:
  *     template_id_delta: SLEB128 (from previous entry template id)
- *     dyn_unchanged:    1 bit (vs last instance of this template_id)
+ *     dyn_unchanged:     1 bit (vs last instance of this template_id)
  *     [if dyn_unchanged==0]
- *       num_dyn:        ULEB128 (new current length)
- *       num_changed:    ULEB128
+ *       num_dyn:         ULEB128
+ *       num_changed:     ULEB128
  *       changed entries:
- *         pos_gap:      ULEB128 (gap from prior changed position)
- *         type:         1 bit (0=load, 1=store)
- *         value_delta:  SLEB128 (from previous value at same position)
- *     num_wp:           ULEB128
- *     For each wp_bb:
- *       template_id_delta: SLEB128 (from previous wp template id)
- *       dyn_unchanged:  1 bit (vs last instance of this wp template_id)
+ *         pos_gap:       ULEB128
+ *         type:          1 bit (0=load, 1=store)
+ *         value_delta:   SLEB128
+ *
+ *     wp_chain_id:       ULEB128
+ *     For each wp_bb in referenced chain:
+ *       dyn_unchanged:   1 bit (vs last instance of this wp template_id)
  *       [if dyn_unchanged==0] (payload same as correct-path format above)
- *       exception:      1 bit
+ *
+ *     num_wp_events:     ULEB128
+ *     For each wp_event (exception or translation-unavailable):
+ *       wp_index_gap:    ULEB128
  *       translation_unavailable: 1 bit
- *       exid:           8 bits (GenericExceptionId, if exception==1)
- *       has_exreg:      1 bit (if exception==1)
- *       exreg:          8 bits (if has_exreg==1)
- *       poison_len:     ULEB128 (if exception==1)
- *       poison_mask:    poison_len bytes (0 or 1 per insn, if exception==1)
+ *       exception:       1 bit
+ *       [if exception==1]
+ *         exid:          8 bits
+ *         has_exreg:     1 bit
+ *         exreg:         8 bits (if has_exreg==1)
+ *         poison_len:    ULEB128
+ *         poison_mask:   poison_len bytes
  */
 static void write_bin_body(BitWriter *bw, GArray *body_entries)
 {
@@ -3848,13 +3819,70 @@ static void write_bin_body(BitWriter *bw, GArray *body_entries)
     GHashTable *wp_dyn_state = g_hash_table_new_full(g_int_hash, g_int_equal,
                                                       g_free,
                                                       dyn_param_array_unref_value);
+    GHashTable *wp_chain_id_map = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                                         g_free, g_free);
+    GPtrArray *wp_chain_defs = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)g_array_unref);
+    GArray *entry_chain_ids = g_array_sized_new(false, false, sizeof(uint32_t),
+                                                body_entries->len);
+
+    /* Build wrong-path chain dictionary once for this trace segment. */
+    for (guint i = 0; i < body_entries->len; i++) {
+        BodyEntry *entry = &g_array_index(body_entries, BodyEntry, i);
+        uint32_t num_wp = entry->wp_entries ? entry->wp_entries->len : 0;
+        g_autoptr(GString) sig = g_string_new(NULL);
+        uint32_t chain_id;
+        gpointer found_val = NULL;
+
+        for (uint32_t w = 0; w < num_wp; w++) {
+            WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
+            g_string_append_printf(sig, "%" PRIu32 ",", wp->template_id);
+        }
+
+        if (g_hash_table_lookup_extended(wp_chain_id_map, sig->str,
+                                         NULL, &found_val)) {
+            chain_id = *(uint32_t *)found_val;
+        } else {
+            GArray *chain = g_array_sized_new(false, false, sizeof(uint32_t),
+                                              num_wp);
+            uint32_t *stored_id = g_new(uint32_t, 1);
+            chain_id = wp_chain_defs->len;
+
+            for (uint32_t w = 0; w < num_wp; w++) {
+                WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
+                g_array_append_val(chain, wp->template_id);
+            }
+
+            *stored_id = chain_id;
+            g_hash_table_insert(wp_chain_id_map,
+                                g_strdup(sig->str), stored_id);
+            g_ptr_array_add(wp_chain_defs, chain);
+        }
+
+        g_array_append_val(entry_chain_ids, chain_id);
+    }
 
     bw_write_uleb128(bw, body_entries->len);
+    bw_write_uleb128(bw, wp_chain_defs->len);
+
+    for (guint c = 0; c < wp_chain_defs->len; c++) {
+        GArray *chain = g_ptr_array_index(wp_chain_defs, c);
+        int64_t prev_tid = 0;
+
+        bw_write_uleb128(bw, chain->len);
+        for (guint w = 0; w < chain->len; w++) {
+            uint32_t tid = g_array_index(chain, uint32_t, w);
+            bw_write_sleb128(bw, (int64_t)tid - prev_tid);
+            prev_tid = tid;
+        }
+    }
 
     for (guint i = 0; i < body_entries->len; i++) {
         BodyEntry *entry = &g_array_index(body_entries, BodyEntry, i);
         int64_t entry_tmpl = entry->template_id;
-        int64_t prev_wp_template = 0;
+        uint32_t chain_id = g_array_index(entry_chain_ids, uint32_t, i);
+        GArray *chain = g_ptr_array_index(wp_chain_defs, chain_id);
+        uint32_t num_wp = chain->len;
 
         bw_write_sleb128(bw, entry_tmpl - prev_entry_template);
         prev_entry_template = entry_tmpl;
@@ -3874,7 +3902,7 @@ static void write_bin_body(BitWriter *bw, GArray *body_entries)
                                                    entry->dyn_params,
                                                    changed_positions);
                 write_dyn_param_patch(bw, prev_dyn, entry->dyn_params,
-                                      changed_positions);
+                                      changed_positions, false);
 
                 uint32_t *key = g_new(uint32_t, 1);
                 *key = entry->template_id;
@@ -3883,18 +3911,16 @@ static void write_bin_body(BitWriter *bw, GArray *body_entries)
             }
         }
 
-        uint32_t num_wp = entry->wp_entries ? entry->wp_entries->len : 0;
-        bw_write_uleb128(bw, num_wp);
+        bw_write_uleb128(bw, chain_id);
 
         for (uint32_t w = 0; w < num_wp; w++) {
             WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
-            int64_t wp_tmpl = wp->template_id;
+            uint32_t wp_tmpl = g_array_index(chain, uint32_t, w);
 
-            bw_write_sleb128(bw, wp_tmpl - prev_wp_template);
-            prev_wp_template = wp_tmpl;
+            g_assert(wp->template_id == wp_tmpl);
             {
                 GArray *prev_dyn = g_hash_table_lookup(wp_dyn_state,
-                                                       &wp->template_id);
+                                                       &wp_tmpl);
                 gboolean unchanged = prev_dyn &&
                     dyn_param_array_equal(prev_dyn, wp->dyn_params);
                 bw_write_bits(bw, unchanged ? 1 : 0, 1);
@@ -3908,39 +3934,77 @@ static void write_bin_body(BitWriter *bw, GArray *body_entries)
                                                        wp->dyn_params,
                                                        changed_positions);
                     write_dyn_param_patch(bw, prev_dyn, wp->dyn_params,
-                                          changed_positions);
+                                          changed_positions, true);
 
                     uint32_t *key = g_new(uint32_t, 1);
-                    *key = wp->template_id;
+                    *key = wp_tmpl;
                     g_hash_table_replace(wp_dyn_state, key,
                                          dyn_param_array_clone(wp->dyn_params));
                 }
             }
-            bw_write_bits(bw, wp->exception ? 1 : 0, 1);
-            bw_write_bits(bw, wp->translation_unavailable ? 1 : 0, 1);
-            if (wp->exception) {
-                bw_write_bits(bw, wp->exception_id, 8);
-                bw_write_bits(bw, wp->has_exception_reg ? 1 : 0, 1);
-                if (wp->has_exception_reg) {
-                    bw_write_bits(bw, wp->exception_reg_id, WPT_REG_BITS);
-                }
-                if (wp->poison_mask) {
-                    guint poison_len =
-                        poison_mask_effective_len(wp->poison_mask);
+        }
 
-                    bw_write_uleb128(bw, poison_len);
-                    if (poison_len > 0) {
-                        bw_write_bytes(bw, wp->poison_mask->data, poison_len);
-                    }
-                } else {
-                    bw_write_uleb128(bw, 0);
+        {
+            uint32_t num_events = 0;
+            int64_t prev_event_idx = -1;
+            uint64_t exc_start_bits;
+
+            for (uint32_t w = 0; w < num_wp; w++) {
+                WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
+                if (wp->exception || wp->translation_unavailable) {
+                    num_events++;
                 }
             }
+
+            bw_write_uleb128(bw, num_events);
+            exc_start_bits = bw_tell_bits(bw);
+
+            for (uint32_t w = 0; w < num_wp; w++) {
+                WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
+
+                if (!wp->exception && !wp->translation_unavailable) {
+                    continue;
+                }
+
+                bw_write_uleb128(bw, (uint64_t)(w - (uint32_t)(prev_event_idx + 1)));
+                bw_write_bits(bw, wp->translation_unavailable ? 1 : 0, 1);
+                bw_write_bits(bw, wp->exception ? 1 : 0, 1);
+
+                if (wp->exception) {
+                    bw_write_bits(bw, wp->exception_id, 8);
+                    bw_write_bits(bw, wp->has_exception_reg ? 1 : 0, 1);
+                    if (wp->has_exception_reg) {
+                        bw_write_bits(bw, wp->exception_reg_id, WPT_REG_BITS);
+                    }
+                    if (wp->poison_mask) {
+                        guint poison_len =
+                            poison_mask_effective_len(wp->poison_mask);
+
+                        bw_write_uleb128(bw, poison_len);
+                        if (poison_len > 0) {
+                            bw_write_bytes(bw, wp->poison_mask->data,
+                                           poison_len);
+                        }
+                        stat_bin_wp_poison_bits += bits_for_uleb128(poison_len)
+                                                 + ((uint64_t)poison_len * 8);
+                    } else {
+                        bw_write_uleb128(bw, 0);
+                        stat_bin_wp_poison_bits += bits_for_uleb128(0);
+                    }
+                }
+
+                prev_event_idx = w;
+            }
+
+            stat_bin_wp_exception_bits += bw_tell_bits(bw) - exc_start_bits;
         }
     }
 
     g_hash_table_unref(cp_dyn_state);
     g_hash_table_unref(wp_dyn_state);
+    g_hash_table_unref(wp_chain_id_map);
+    g_ptr_array_unref(wp_chain_defs);
+    g_array_unref(entry_chain_ids);
 }
 
 /*
@@ -3949,13 +4013,23 @@ static void write_bin_body(BitWriter *bw, GArray *body_entries)
 static void write_bin_trace(FILE *f, GArray *body_entries)
 {
     BitWriter bw;
+    uint64_t pre_header_bits;
+    uint64_t post_header_bits;
+    uint64_t post_body_bits;
 
     g_mutex_lock(&data_lock);
     bw_init(&bw, f);
+    pre_header_bits = bw_tell_bits(&bw);
     write_bin_header(&bw);
+    post_header_bits = bw_tell_bits(&bw);
     g_mutex_unlock(&data_lock);
     write_bin_body(&bw, body_entries);
+    post_body_bits = bw_tell_bits(&bw);
     bw_flush(&bw);
+
+    stat_bin_header_bits += post_header_bits - pre_header_bits;
+    stat_bin_body_bits += post_body_bits - post_header_bits;
+    stat_bin_total_bits += post_body_bits;
 }
 
 /* ========================= Trace State Management ========================= */
@@ -4366,23 +4440,20 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     g_free(insn_bytes);
 
     /*
-     * Instrument the block for execution tracking.
-     * Step 1: Store current block's start PC into scoreboard.
+    * Instrument the block for execution tracking.
+    * Store current block's start PC into scoreboard.
      */
     qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
         tb, QEMU_PLUGIN_INLINE_STORE_U64, sb_current_pc, pc);
 
-    /*
-     * Step 2: Register execution callback.
+    /* Register execution callback.
      * The callback updates sb_insn_count only when not in speculative mode.
      */
     qemu_plugin_register_vcpu_tb_exec_cb(
         tb, vcpu_tb_exec, QEMU_PLUGIN_CB_RW_REGS,
         (void *)(uintptr_t)n_insns);
 
-    /*
-     * Step 3: Update prev_* values for the NEXT block's callback.
-     */
+    /* Update prev_* values for the next block's callback. */
     qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
         first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
         sb_prev_last_pc, last_insn_pc);
@@ -4495,6 +4566,32 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
             "  SimPoints loaded: %u\n", simpoints_list->len);
         g_string_append_printf(report,
             "  SimPoints traced: %u\n", simpoints_current_idx);
+    }
+
+    if (stat_bin_total_bits > 0) {
+        g_string_append_printf(report,
+            "\nBinary accounting:\n");
+        g_string_append_printf(report,
+            "  Total bits: %" PRIu64 " (%.2f MiB)\n",
+            stat_bin_total_bits,
+            (double)stat_bin_total_bits / 8.0 / (1024.0 * 1024.0));
+        g_string_append_printf(report,
+            "  Header bits: %" PRIu64 " (%.2f%%)\n",
+            stat_bin_header_bits,
+            100.0 * (double)stat_bin_header_bits / stat_bin_total_bits);
+        g_string_append_printf(report,
+            "  Body bits: %" PRIu64 " (%.2f%%)\n",
+            stat_bin_body_bits,
+            100.0 * (double)stat_bin_body_bits / stat_bin_total_bits);
+        g_string_append_printf(report,
+            "  Dyn bits (CP/WP): %" PRIu64 " / %" PRIu64 "\n",
+            stat_bin_dyn_cp_bits, stat_bin_dyn_wp_bits);
+        g_string_append_printf(report,
+            "  WP exception bits: %" PRIu64 "\n",
+            stat_bin_wp_exception_bits);
+        g_string_append_printf(report,
+            "  WP poison bits: %" PRIu64 "\n",
+            stat_bin_wp_poison_bits);
     }
 
     g_string_append_printf(report,

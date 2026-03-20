@@ -83,19 +83,8 @@ static guint simpoints_current_idx = 0;
 
 #define MAX_INSN_BYTES 16
 
-/*
- * Magic for binary format.
- * v12 adds:
- *   - generic exception id for wrong-path exceptions
- *   - explicit translation-unavailable marker (not treated as exception)
- *
- * v11 adds:
- *   - branch conditional flag
- *   - template symbol + raw instruction bytes
- *   - enum name tables in header
- *   - wrong-path exception dependency masks
- */
-#define WPT_MAGIC  0x5450570c  /* 'T','P','W',0x0c little-endian - version 12 */
+/* Binary format magic/version 0.1 */
+#define WPT_MAGIC  0x54505701  /* 'T','P','W',0x01 little-endian - version 0.1 */
 
 #define WPT_ISA_BITS 3
 #define WPT_OPCODE_BITS 8
@@ -182,7 +171,7 @@ enum BranchType {
     BRANCH_INDIRECT_CALL = 4,
     BRANCH_RETURN = 5,
     BRANCH_SYSCALL_TYPE = 6,
-    BRANCH_COND_DIRECT = 7, /* legacy table value; normalized at classify */
+    BRANCH_COND_DIRECT = 7,
     BRANCH_TYPE_COUNT,
 };
 
@@ -2520,7 +2509,7 @@ static const char *branch_type_name(uint8_t bt)
         [BRANCH_INDIRECT_CALL] = "INDIRECT_CALL",
         [BRANCH_RETURN]        = "RETURN",
         [BRANCH_SYSCALL_TYPE]  = "SYSCALL",
-        [BRANCH_COND_DIRECT]   = "COND_DIRECT_LEGACY",
+        [BRANCH_COND_DIRECT]   = "COND_DIRECT",
     };
     return (bt < BRANCH_TYPE_COUNT) ? names[bt] : "UNKNOWN";
 }
@@ -3140,12 +3129,14 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             recovery_pc = tmpl->fall_through_pc;
 
             fault_wp.poison_mask = g_byte_array_sized_new(tmpl->n_insns);
-            g_byte_array_set_size(fault_wp.poison_mask, tmpl->n_insns);
-            memset(fault_wp.poison_mask->data, 0, tmpl->n_insns);
             if (tmpl->n_insns > 0) {
                 uint32_t fault_idx = find_faulting_insn_index(
                     tmpl, fault_wp.exception_id);
                 if (fault_idx < tmpl->n_insns) {
+                    g_byte_array_set_size(fault_wp.poison_mask,
+                                          (guint)fault_idx + 1);
+                    memset(fault_wp.poison_mask->data, 0,
+                           fault_wp.poison_mask->len);
                     fault_wp.poison_mask->data[fault_idx] = 1;
                 }
             }
@@ -3619,7 +3610,7 @@ static void write_bin_enum_name_tables(BitWriter *bw)
 }
 
 /*
- * Write the header section in packed binary format (v12 bit-packed).
+ * Write the header section in packed binary format (v0.1).
  *
  * Binary header layout:
  *   magic:            32 bits
@@ -3804,8 +3795,24 @@ static void write_dyn_param_patch(BitWriter *bw,
     }
 }
 
+/* Return the number of poison bytes that carry useful data. */
+static guint poison_mask_effective_len(const GByteArray *poison_mask)
+{
+    if (!poison_mask || poison_mask->len == 0) {
+        return 0;
+    }
+
+    for (gint i = (gint)poison_mask->len - 1; i >= 0; i--) {
+        if (poison_mask->data[i] != 0) {
+            return (guint)i + 1;
+        }
+    }
+
+    return 0;
+}
+
 /*
- * Write the body section in packed binary format (v12 bit-packed).
+ * Write the body section in packed binary format (v0.1).
  *
  * Binary body layout:
  *   num_entries:      ULEB128
@@ -3829,8 +3836,8 @@ static void write_dyn_param_patch(BitWriter *bw,
  *       exid:           8 bits (GenericExceptionId, if exception==1)
  *       has_exreg:      1 bit (if exception==1)
  *       exreg:          8 bits (if has_exreg==1)
- *       poison_len:     ULEB128
- *       poison_mask:    poison_len bytes (0 or 1 per insn)
+ *       poison_len:     ULEB128 (if exception==1)
+ *       poison_mask:    poison_len bytes (0 or 1 per insn, if exception==1)
  */
 static void write_bin_body(BitWriter *bw, GArray *body_entries)
 {
@@ -3917,13 +3924,17 @@ static void write_bin_body(BitWriter *bw, GArray *body_entries)
                 if (wp->has_exception_reg) {
                     bw_write_bits(bw, wp->exception_reg_id, WPT_REG_BITS);
                 }
-            }
-            if (wp->poison_mask && wp->poison_mask->len > 0) {
-                bw_write_uleb128(bw, wp->poison_mask->len);
-                bw_write_bytes(bw, wp->poison_mask->data,
-                               wp->poison_mask->len);
-            } else {
-                bw_write_uleb128(bw, 0);
+                if (wp->poison_mask) {
+                    guint poison_len =
+                        poison_mask_effective_len(wp->poison_mask);
+
+                    bw_write_uleb128(bw, poison_len);
+                    if (poison_len > 0) {
+                        bw_write_bytes(bw, wp->poison_mask->data, poison_len);
+                    }
+                } else {
+                    bw_write_uleb128(bw, 0);
+                }
             }
         }
     }
@@ -4009,8 +4020,6 @@ static GArray *parse_simpoints_file(const char *path)
 
     GArray *entries = g_array_new(false, false, sizeof(SimPointEntry));
     char line[512];
-    bool warned_legacy = false;
-
     while (fgets(line, sizeof(line), f)) {
         /* Skip comments and blank lines */
         if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') {
@@ -4018,16 +4027,6 @@ static GArray *parse_simpoints_file(const char *path)
         }
 
         SimPointEntry sp = {0};
-
-        if (strchr(line, ',')) {
-            if (!warned_legacy) {
-                fprintf(stderr,
-                        "wptrace: legacy simpoints CSV format is no longer "
-                        "supported; use native SimPoint .simpoints output\n");
-                warned_legacy = true;
-            }
-            continue;
-        }
 
         {
             uint64_t interval_id;

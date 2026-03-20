@@ -6,16 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-WPT_MAGIC_V9 = 0x54505709
-WPT_MAGIC_V10 = 0x5450570A
-WPT_MAGIC_V11 = 0x5450570B
-WPT_MAGIC_V12 = 0x5450570C
+WPT_MAGIC = 0x54505701
 
 WPT_ISA_BITS = 3
-WPT_OPCODE_BITS_LEGACY = 6
-WPT_BRANCH_BITS_LEGACY = 3
-WPT_OPCODE_BITS_V11 = 8
-WPT_BRANCH_BITS_V11 = 8
+WPT_OPCODE_BITS = 8
+WPT_BRANCH_BITS = 8
 WPT_REG_COUNT_BITS = 3
 WPT_REG_BITS = 8
 
@@ -78,18 +73,7 @@ OPCODE_NAMES = {
 }
 
 
-BRANCH_NAMES_LEGACY = {
-    0: "NONE",
-    1: "DIRECT_JUMP",
-    2: "INDIRECT_JUMP",
-    3: "DIRECT_CALL",
-    4: "INDIRECT_CALL",
-    5: "RETURN",
-    6: "COND_DIRECT",
-    7: "SYSCALL",
-}
-
-BRANCH_NAMES_V11 = {
+BRANCH_NAMES = {
     0: "NONE",
     1: "DIRECT_JUMP",
     2: "INDIRECT_JUMP",
@@ -97,7 +81,7 @@ BRANCH_NAMES_V11 = {
     4: "INDIRECT_CALL",
     5: "RETURN",
     6: "SYSCALL",
-    7: "COND_DIRECT_LEGACY",
+    7: "COND_DIRECT",
 }
 
 EXCEPTION_NAMES_DEFAULT = {
@@ -225,22 +209,6 @@ def reg_name(reg_id: int) -> str:
     return f"R{reg_id}"
 
 
-def decode_dyn_full(br: BitReader) -> list[DynParam]:
-    num_dyn = br.read_uleb128()
-    prev_value = 0
-    out: list[DynParam] = []
-
-    for _ in range(num_dyn):
-        type_bit = br.read_bits(1)
-        delta = br.read_sleb128()
-        value = add_delta_u64(prev_value, delta)
-        prev_value = value
-        type_name = "store" if type_bit else "load"
-        out.append(DynParam(type_name=type_name, value=value))
-
-    return out
-
-
 def decode_dyn_patch(br: BitReader, prev_dyn: list[DynParam]) -> list[DynParam]:
     new_len = br.read_uleb128()
     num_changed = br.read_uleb128()
@@ -282,49 +250,16 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
     br = BitReader(data)
 
     magic = br.read_bits(32)
-    if magic == WPT_MAGIC_V9:
-        has_dyn_patch_flag = True
-        has_v11_features = False
-        has_v12_features = False
-        opcode_bits = WPT_OPCODE_BITS_LEGACY
-        branch_bits = WPT_BRANCH_BITS_LEGACY
-    elif magic == WPT_MAGIC_V10:
-        has_dyn_patch_flag = False
-        has_v11_features = False
-        has_v12_features = False
-        opcode_bits = WPT_OPCODE_BITS_LEGACY
-        branch_bits = WPT_BRANCH_BITS_LEGACY
-    elif magic == WPT_MAGIC_V11:
-        has_dyn_patch_flag = False
-        has_v11_features = True
-        has_v12_features = False
-        opcode_bits = WPT_OPCODE_BITS_V11
-        branch_bits = WPT_BRANCH_BITS_V11
-    elif magic == WPT_MAGIC_V12:
-        has_dyn_patch_flag = False
-        has_v11_features = True
-        has_v12_features = True
-        opcode_bits = WPT_OPCODE_BITS_V11
-        branch_bits = WPT_BRANCH_BITS_V11
-    else:
+    if magic != WPT_MAGIC:
         raise ValueError(
-            f"Bad magic 0x{magic:08x}, expected 0x{WPT_MAGIC_V9:08x} "
-            f"or 0x{WPT_MAGIC_V10:08x} or 0x{WPT_MAGIC_V11:08x} "
-            f"or 0x{WPT_MAGIC_V12:08x}"
+            f"Bad magic 0x{magic:08x}, expected 0x{WPT_MAGIC:08x}"
         )
 
     isa = br.read_bits(WPT_ISA_BITS)
-
-    if has_v11_features:
-        opcode_names = read_name_table(br)
-        branch_names = read_name_table(br)
-        exception_names = read_name_table(br) if has_v12_features else dict(EXCEPTION_NAMES_DEFAULT)
-        reg_names = read_name_table(br)
-    else:
-        opcode_names = dict(OPCODE_NAMES)
-        branch_names = dict(BRANCH_NAMES_LEGACY)
-        exception_names = dict(EXCEPTION_NAMES_DEFAULT)
-        reg_names = {}
+    opcode_names = read_name_table(br)
+    branch_names = read_name_table(br)
+    exception_names = read_name_table(br)
+    reg_names = read_name_table(br)
 
     num_templates = br.read_uleb128()
 
@@ -336,14 +271,14 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
         start_pc = br.read_uleb128()
         n_insns = br.read_uleb128()
         fall_through_pc = br.read_uleb128()
-        symbol_name = read_string(br) if has_v11_features else ""
+        symbol_name = read_string(br)
 
         insns: list[dict] = []
         for _ in range(n_insns):
             pc = br.read_uleb128()
-            opcode = br.read_bits(opcode_bits)
-            branch_type = br.read_bits(branch_bits)
-            branch_conditional = bool(br.read_bits(1)) if has_v11_features else (branch_type == 6)
+            opcode = br.read_bits(WPT_OPCODE_BITS)
+            branch_type = br.read_bits(WPT_BRANCH_BITS)
+            branch_conditional = bool(br.read_bits(1))
             n_src = br.read_bits(WPT_REG_COUNT_BITS)
             n_dst = br.read_bits(WPT_REG_COUNT_BITS)
             has_imm = br.read_bits(1)
@@ -351,10 +286,8 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
             src_regs = [br.read_bits(WPT_REG_BITS) for _ in range(n_src)]
             dst_regs = [br.read_bits(WPT_REG_BITS) for _ in range(n_dst)]
             imm = br.read_sleb128() if has_imm else None
-            raw_bytes = b""
-            if has_v11_features:
-                raw_len = br.read_uleb128()
-                raw_bytes = read_bytes(br, raw_len)
+            raw_len = br.read_uleb128()
+            raw_bytes = read_bytes(br, raw_len)
 
             insns.append({
                 "pc": pc,
@@ -398,14 +331,7 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
             cp_dyn = [DynParam(type_name=d.type_name, value=d.value)
                       for d in cp_dyn_state[entry_tmpl]]
         else:
-            if has_dyn_patch_flag:
-                use_patch = br.read_bits(1)
-                if use_patch:
-                    cp_dyn = decode_dyn_patch(br, prev_cp_dyn)
-                else:
-                    cp_dyn = decode_dyn_full(br)
-            else:
-                cp_dyn = decode_dyn_patch(br, prev_cp_dyn)
+            cp_dyn = decode_dyn_patch(br, prev_cp_dyn)
             cp_dyn_state[entry_tmpl] = [DynParam(type_name=d.type_name,
                                                  value=d.value)
                                         for d in cp_dyn]
@@ -427,14 +353,7 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
                 wp_dyn = [DynParam(type_name=d.type_name, value=d.value)
                           for d in wp_dyn_state[wp_tmpl]]
             else:
-                if has_dyn_patch_flag:
-                    use_patch = br.read_bits(1)
-                    if use_patch:
-                        wp_dyn = decode_dyn_patch(br, prev_wp_dyn)
-                    else:
-                        wp_dyn = decode_dyn_full(br)
-                else:
-                    wp_dyn = decode_dyn_patch(br, prev_wp_dyn)
+                wp_dyn = decode_dyn_patch(br, prev_wp_dyn)
                 wp_dyn_state[wp_tmpl] = [DynParam(type_name=d.type_name,
                                                   value=d.value)
                                          for d in wp_dyn]
@@ -445,21 +364,14 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
             exception_name = None
             exreg_name = None
             poison_mask: list[int] = []
-            if has_v11_features:
-                if has_v12_features:
-                    translation_unavailable = bool(br.read_bits(1))
-                    if exception:
-                        exception_id = br.read_bits(8)
-                        exception_name = exception_names.get(exception_id, "UNKNOWN")
-                        has_exreg = br.read_bits(1)
-                        if has_exreg:
-                            exreg_id = br.read_bits(WPT_REG_BITS)
-                            exreg_name = reg_names.get(exreg_id, reg_name(exreg_id))
-                else:
-                    has_exreg = br.read_bits(1)
-                    if has_exreg:
-                        exreg_id = br.read_bits(WPT_REG_BITS)
-                        exreg_name = reg_names.get(exreg_id, reg_name(exreg_id))
+            translation_unavailable = bool(br.read_bits(1))
+            if exception:
+                exception_id = br.read_bits(8)
+                exception_name = exception_names.get(exception_id, "UNKNOWN")
+                has_exreg = br.read_bits(1)
+                if has_exreg:
+                    exreg_id = br.read_bits(WPT_REG_BITS)
+                    exreg_name = reg_names.get(exreg_id, reg_name(exreg_id))
                 poison_len = br.read_uleb128()
                 poison_mask = [br.read_bits(8) for _ in range(poison_len)]
             wp_n_insns = 0
@@ -500,7 +412,7 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
 def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
     out: list[str] = []
     opcode_names: dict[int, str] = meta.get("opcode_names", OPCODE_NAMES)
-    branch_names: dict[int, str] = meta.get("branch_names", BRANCH_NAMES_V11)
+    branch_names: dict[int, str] = meta.get("branch_names", BRANCH_NAMES)
     exception_names: dict[int, str] = meta.get("exception_names", EXCEPTION_NAMES_DEFAULT)
     reg_names: dict[int, str] = meta.get("reg_names", {})
 
@@ -603,7 +515,7 @@ def first_diff_line(a: str, b: str) -> tuple[int, str, str] | None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Decode wptrace binary (.bin, v9/v10/v11/v12) and reconstruct debug text format"
+            "Decode wptrace binary (.bin, format v0.1) and reconstruct debug text format"
         )
     )
     parser.add_argument("bin", type=Path, help="Input wptrace binary file")

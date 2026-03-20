@@ -182,8 +182,13 @@ enum GenericExceptionId {
     GEN_EXC_INT_DIVIDE_BY_ZERO = 2,
     GEN_EXC_FP_DIVIDE_BY_ZERO = 3,
     GEN_EXC_MEMORY_ACCESS = 4,
-    GEN_EXC_SYSCALL = 5,
     GEN_EXC_COUNT,
+};
+
+enum WPStopReason {
+    WP_STOP_NONE = 0,
+    WP_STOP_SYSCALL_USERMODE = 1,
+    WP_STOP_REASON_COUNT,
 };
 
 _Static_assert(TRACE_ISA_MIPS < (1U << WPT_ISA_BITS),
@@ -717,8 +722,19 @@ static const MnemonicEntry mnemonic_table[] = {
     {"movsx",    GEN_OP_MOVSX,    BRANCH_NONE},
     {"movsxd",   GEN_OP_MOVSX,    BRANCH_NONE},
     {"movsl",    GEN_OP_MOVSX,    BRANCH_NONE},
+    {"movsbw",   GEN_OP_MOVSX,    BRANCH_NONE},
+    {"movsbl",   GEN_OP_MOVSX,    BRANCH_NONE},
+    {"movswl",   GEN_OP_MOVSX,    BRANCH_NONE},
+    {"movsbq",   GEN_OP_MOVSX,    BRANCH_NONE},
+    {"movswq",   GEN_OP_MOVSX,    BRANCH_NONE},
+    {"movslq",   GEN_OP_MOVSX,    BRANCH_NONE},
     {"movzx",    GEN_OP_MOVZX,    BRANCH_NONE},
     {"movzb",    GEN_OP_MOVZX,    BRANCH_NONE},
+    {"movzbw",   GEN_OP_MOVZX,    BRANCH_NONE},
+    {"movzbl",   GEN_OP_MOVZX,    BRANCH_NONE},
+    {"movzwl",   GEN_OP_MOVZX,    BRANCH_NONE},
+    {"movzbq",   GEN_OP_MOVZX,    BRANCH_NONE},
+    {"movzwq",   GEN_OP_MOVZX,    BRANCH_NONE},
     {"cltq",     GEN_OP_MOVSX,    BRANCH_NONE},
     {"cqto",     GEN_OP_MOVSX,    BRANCH_NONE},
     {"cwtl",     GEN_OP_MOVSX,    BRANCH_NONE},
@@ -769,6 +785,20 @@ static const MnemonicEntry mnemonic_table[] = {
     {"ucomisd",  GEN_OP_FP_CMP,   BRANCH_NONE},
     {"comiss",   GEN_OP_FP_CMP,   BRANCH_NONE},
     {"comisd",   GEN_OP_FP_CMP,   BRANCH_NONE},
+    /* x87 FP */
+    {"fld",      GEN_OP_FP_MOV,   BRANCH_NONE},
+    {"fld1",     GEN_OP_FP_MOV,   BRANCH_NONE},
+    {"fldz",     GEN_OP_FP_MOV,   BRANCH_NONE},
+    {"fldcw",    GEN_OP_FP_MOV,   BRANCH_NONE},
+    {"fst",      GEN_OP_FP_MOV,   BRANCH_NONE},
+    {"fstp",     GEN_OP_FP_MOV,   BRANCH_NONE},
+    {"fnstcw",   GEN_OP_STORE,    BRANCH_NONE},
+    {"fsubr",    GEN_OP_FP_SUB,   BRANCH_NONE},
+    {"fdivr",    GEN_OP_FP_DIV,   BRANCH_NONE},
+    {"fdivp",    GEN_OP_FP_DIV,   BRANCH_NONE},
+    {"fdivrp",   GEN_OP_FP_DIV,   BRANCH_NONE},
+    {"wait",     GEN_OP_FENCE,    BRANCH_NONE},
+    {"fwait",    GEN_OP_FENCE,    BRANCH_NONE},
     /* Vector mov */
     {"movaps",   GEN_OP_VEC_MOV,  BRANCH_NONE},
     {"movapd",   GEN_OP_VEC_MOV,  BRANCH_NONE},
@@ -776,6 +806,14 @@ static const MnemonicEntry mnemonic_table[] = {
     {"movupd",   GEN_OP_VEC_MOV,  BRANCH_NONE},
     {"movdqa",   GEN_OP_VEC_MOV,  BRANCH_NONE},
     {"movdqu",   GEN_OP_VEC_MOV,  BRANCH_NONE},
+    {"movd",     GEN_OP_VEC_MOV,  BRANCH_NONE},
+    {"movq",     GEN_OP_VEC_MOV,  BRANCH_NONE},
+    {"vmovd",    GEN_OP_VEC_MOV,  BRANCH_NONE},
+    {"vmovq",    GEN_OP_VEC_MOV,  BRANCH_NONE},
+    {"vmovdqa",  GEN_OP_VEC_MOV,  BRANCH_NONE},
+    {"vmovdqu",  GEN_OP_VEC_MOV,  BRANCH_NONE},
+    {"stmxcsr",  GEN_OP_STORE,    BRANCH_NONE},
+    {"ldmxcsr",  GEN_OP_LOAD,     BRANCH_NONE},
     /* Vector logic */
     {"andps",    GEN_OP_VEC_LOGIC, BRANCH_NONE},
     {"andpd",    GEN_OP_VEC_LOGIC, BRANCH_NONE},
@@ -2554,10 +2592,19 @@ static const char *generic_exception_name(uint8_t exid)
         [GEN_EXC_INT_DIVIDE_BY_ZERO] = "INT_DIVIDE_BY_ZERO",
         [GEN_EXC_FP_DIVIDE_BY_ZERO] = "FP_DIVIDE_BY_ZERO",
         [GEN_EXC_MEMORY_ACCESS] = "MEMORY_ACCESS",
-        [GEN_EXC_SYSCALL] = "SYSCALL",
     };
 
     return (exid < GEN_EXC_COUNT) ? names[exid] : "UNKNOWN";
+}
+
+static const char *wp_stop_reason_name(uint8_t reason)
+{
+    static const char *names[] = {
+        [WP_STOP_NONE] = "NONE",
+        [WP_STOP_SYSCALL_USERMODE] = "SYSCALL_USERMODE",
+    };
+
+    return (reason < WP_STOP_REASON_COUNT) ? names[reason] : "UNKNOWN";
 }
 
 /* ========================= Data Structures ========================= */
@@ -2601,11 +2648,13 @@ typedef struct {
     uint64_t start_pc;          /* Start PC (for identification) */
     GArray *dyn_params;         /* GArray of DynParam */
     uint32_t n_insns_executed;  /* Number of insns executed in this WP BB */
-    bool exception;             /* True if WP BB ended due to exception */
+    bool fault;                 /* True if WP BB ended due to fault/stop */
     bool translation_unavailable; /* Template lookup failed for this WP PC */
+    uint8_t stop_reason;        /* WPStopReason */
     uint8_t exception_id;       /* GenericExceptionId */
     uint8_t exception_reg_id;   /* Register impacted by exception */
     bool has_exception_reg;
+    bool has_exception_class;
     GByteArray *poison_mask;    /* Per-insn mask: 1 marks the faulting insn */
 } WPBBEntry;
 
@@ -2624,6 +2673,7 @@ typedef struct {
  */
 typedef struct {
     uint64_t current_pc;        /* Current block's start PC */
+    uint64_t prev_start_pc;     /* Previous block's start PC */
     uint64_t prev_last_pc;      /* Last insn PC of previous block */
     uint64_t prev_fall_through; /* Expected sequential next from prev block */
     uint64_t prev_bb_ends_in_branch; /* Previous BB ended in a branch */
@@ -2676,6 +2726,7 @@ static uint32_t next_template_id = 1;
 /* Per-vCPU scoreboard */
 static struct qemu_plugin_scoreboard *vcpu_sb;
 static qemu_plugin_u64 sb_current_pc;
+static qemu_plugin_u64 sb_prev_start_pc;
 static qemu_plugin_u64 sb_prev_last_pc;
 static qemu_plugin_u64 sb_prev_fall_through;
 static qemu_plugin_u64 sb_prev_bb_ends_in_branch;
@@ -2691,6 +2742,10 @@ static __thread bool wp_in_progress = false;
 static __thread GArray *wp_mem_accesses = NULL;
 static __thread uint64_t wp_saved_insn_count = 0;
 static __thread unsigned int wp_saved_cpu_index = 0;
+static __thread uint64_t wp_saved_prev_start_pc = 0;
+static __thread uint64_t wp_saved_prev_last_pc = 0;
+static __thread uint64_t wp_saved_prev_fall_through = 0;
+static __thread uint64_t wp_saved_prev_bb_ends_in_branch = 0;
 
 /* Correct-path memory accesses for current BB */
 static __thread GArray *cp_mem_accesses = NULL;
@@ -2842,6 +2897,8 @@ static uint8_t choose_exception_reg_id(const BBTemplate *tmpl)
 static uint8_t infer_generic_exception_id(const BBTemplate *tmpl)
 {
     bool saw_mem = false;
+    bool saw_fp_div = false;
+    bool saw_int_div = false;
 
     if (!tmpl) {
         return GEN_EXC_UNKNOWN;
@@ -2851,23 +2908,41 @@ static uint8_t infer_generic_exception_id(const BBTemplate *tmpl)
         const InsnFields *fld = &tmpl->insn_fields[i];
 
         if (fld->opcode == GEN_OP_FP_DIV) {
-            return GEN_EXC_FP_DIVIDE_BY_ZERO;
+            saw_fp_div = true;
         }
         if (fld->opcode == GEN_OP_INT_DIV) {
-            return GEN_EXC_INT_DIVIDE_BY_ZERO;
+            saw_int_div = true;
         }
         if (fld->opcode == GEN_OP_LOAD || fld->opcode == GEN_OP_STORE) {
             saw_mem = true;
         }
-        if (fld->opcode == GEN_OP_SYSCALL) {
-            return GEN_EXC_SYSCALL;
-        }
     }
 
+    if (saw_fp_div) {
+        return GEN_EXC_FP_DIVIDE_BY_ZERO;
+    }
+    if (saw_int_div) {
+        return GEN_EXC_INT_DIVIDE_BY_ZERO;
+    }
     if (saw_mem) {
         return GEN_EXC_MEMORY_ACCESS;
     }
     return GEN_EXC_UNKNOWN;
+}
+
+static bool template_has_syscall(const BBTemplate *tmpl)
+{
+    if (!tmpl) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+        if (tmpl->insn_fields[i].opcode == GEN_OP_SYSCALL) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 static uint32_t find_faulting_insn_index(const BBTemplate *tmpl, uint8_t exid)
@@ -2892,11 +2967,6 @@ static uint32_t find_faulting_insn_index(const BBTemplate *tmpl, uint8_t exid)
             break;
         case GEN_EXC_MEMORY_ACCESS:
             if (fld->opcode == GEN_OP_LOAD || fld->opcode == GEN_OP_STORE) {
-                return i;
-            }
-            break;
-        case GEN_EXC_SYSCALL:
-            if (fld->opcode == GEN_OP_SYSCALL) {
                 return i;
             }
             break;
@@ -3061,6 +3131,12 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
      */
     wp_saved_cpu_index = cpu_index;
     wp_saved_insn_count = qemu_plugin_u64_get(sb_insn_count, cpu_index);
+    wp_saved_prev_start_pc = qemu_plugin_u64_get(sb_prev_start_pc, cpu_index);
+    wp_saved_prev_last_pc = qemu_plugin_u64_get(sb_prev_last_pc, cpu_index);
+    wp_saved_prev_fall_through = qemu_plugin_u64_get(sb_prev_fall_through,
+                                                     cpu_index);
+    wp_saved_prev_bb_ends_in_branch =
+        qemu_plugin_u64_get(sb_prev_bb_ends_in_branch, cpu_index);
     wp_in_progress = true;
 
     /* Enter speculative mode, providing saved state for exception recovery */
@@ -3087,25 +3163,14 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         g_mutex_unlock(&data_lock);
 
         if (!tmpl) {
-            WPBBEntry fault_wp = {
-                .template_id = UINT32_MAX,
-                .start_pc = pre_pc,
-                .dyn_params = g_array_new(false, false, sizeof(DynParam)),
-                .n_insns_executed = 0,
-                .exception = false,
-                .translation_unavailable = true,
-                .exception_id = GEN_EXC_NONE,
-                .exception_reg_id = REG_NONE,
-                .has_exception_reg = false,
-                .poison_mask = NULL,
-            };
-            g_array_append_val(wp_chain, fault_wp);
             early_exit = true;
             break;
         }
 
         if (!tb_ok) {
             uint64_t recovery_pc = qemu_plugin_get_pc();
+            uint8_t exception_id;
+            bool has_syscall;
 
             if (pre_pc == last_fault_pc) {
                 repeated_fault_pc++;
@@ -3114,20 +3179,31 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                 last_fault_pc = pre_pc;
             }
 
+            exception_id = infer_generic_exception_id(tmpl);
+            has_syscall = template_has_syscall(tmpl);
+
             WPBBEntry fault_wp = {
                 .template_id = tmpl->template_id,
                 .start_pc = pre_pc,
                 .dyn_params = g_array_new(false, false, sizeof(DynParam)),
                 .n_insns_executed = tmpl->n_insns,
-                .exception = true,
+                .fault = true,
                 .translation_unavailable = false,
-                .exception_id = infer_generic_exception_id(tmpl),
-                .exception_reg_id = choose_exception_reg_id(tmpl),
+                .stop_reason = has_syscall ? WP_STOP_SYSCALL_USERMODE
+                                           : WP_STOP_NONE,
+                .exception_id = (exception_id == GEN_EXC_UNKNOWN)
+                    ? GEN_EXC_NONE : exception_id,
+                .exception_reg_id = REG_NONE,
                 .has_exception_reg = false,
+                .has_exception_class = false,
                 .poison_mask = NULL,
             };
 
-            fault_wp.has_exception_reg = (fault_wp.exception_reg_id != REG_NONE);
+            if (!has_syscall && exception_id != GEN_EXC_UNKNOWN) {
+                fault_wp.has_exception_class = true;
+                fault_wp.exception_reg_id = choose_exception_reg_id(tmpl);
+                fault_wp.has_exception_reg = (fault_wp.exception_reg_id != REG_NONE);
+            }
 
             /* Collect memory access dynamic params for this faulting WP BB. */
             for (guint m = mem_start_idx; m < wp_mem_accesses->len; m++) {
@@ -3147,25 +3223,43 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
 
             fault_wp.poison_mask = g_byte_array_sized_new(tmpl->n_insns);
             if (tmpl->n_insns > 0) {
-                uint32_t fault_idx = find_faulting_insn_index(
-                    tmpl, fault_wp.exception_id);
+                uint32_t fault_idx = tmpl->n_insns - 1;
+
+                if (fault_wp.stop_reason == WP_STOP_SYSCALL_USERMODE) {
+                    for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+                        if (tmpl->insn_fields[i].opcode == GEN_OP_SYSCALL) {
+                            fault_idx = i;
+                            break;
+                        }
+                    }
+                } else if (fault_wp.has_exception_class) {
+                    fault_idx = find_faulting_insn_index(
+                        tmpl, fault_wp.exception_id);
+                }
                 if (fault_idx < tmpl->n_insns) {
                     g_byte_array_set_size(fault_wp.poison_mask,
                                           (guint)fault_idx + 1);
                     memset(fault_wp.poison_mask->data, 0,
                            fault_wp.poison_mask->len);
                     fault_wp.poison_mask->data[fault_idx] = 1;
+
+                    if (fault_idx + 1 < tmpl->n_insns) {
+                        recovery_pc = tmpl->insn_pcs[fault_idx]
+                                    + tmpl->insn_sizes[fault_idx];
+                    } else {
+                        recovery_pc = tmpl->fall_through_pc;
+                    }
                 }
             }
 
             g_array_index(wp_chain, WPBBEntry, wp_chain->len - 1) = fault_wp;
 
             /*
-             * A syscall exception is terminal for speculative wrong-path
-             * continuation; recovering to fall-through can walk into
-             * non-code bytes and produce bogus templates.
+             * Syscalls are terminal for speculative wrong-path continuation in
+             * user mode; recovering to fall-through can walk into non-code
+             * bytes and produce bogus templates.
              */
-            if (fault_wp.exception_id == GEN_EXC_SYSCALL) {
+            if (fault_wp.stop_reason == WP_STOP_SYSCALL_USERMODE) {
                 early_exit = true;
                 break;
             }
@@ -3206,11 +3300,13 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         wp_bb.start_pc = pre_pc;
         wp_bb.template_id = tmpl->template_id;
         wp_bb.n_insns_executed = tmpl->n_insns;
-        wp_bb.exception = false;
+        wp_bb.fault = false;
         wp_bb.translation_unavailable = false;
+        wp_bb.stop_reason = WP_STOP_NONE;
         wp_bb.exception_id = GEN_EXC_NONE;
         wp_bb.exception_reg_id = REG_NONE;
         wp_bb.has_exception_reg = false;
+        wp_bb.has_exception_class = false;
         wp_bb.poison_mask = NULL;
         wp_bb.dyn_params = g_array_new(false, false, sizeof(DynParam));
 
@@ -3238,17 +3334,27 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
 
         if (conditional && use_smith_prediction) {
             bool pred_taken = false;
+            bool has_inner_br = false;
+            bool natural_taken = (post_pc != tmpl->fall_through_pc);
             BranchRecord *inner_br;
 
             g_mutex_lock(&data_lock);
             inner_br = g_hash_table_lookup(branch_map, &tmpl->insn_pcs[tmpl->n_insns - 1]);
             if (inner_br) {
+                has_inner_br = true;
                 pred_taken = (inner_br->smith_counter >= 2);
             }
             g_mutex_unlock(&data_lock);
 
-            if (pred_taken) {
+            if (!has_inner_br) {
+                /* No predictor history yet: preserve natural execution path. */
                 chosen_target = post_pc;
+            } else if (pred_taken == natural_taken) {
+                chosen_target = post_pc;
+            } else if (pred_taken) {
+                chosen_target = inner_br->has_taken_target
+                    ? inner_br->taken_target
+                    : post_pc;
             } else {
                 chosen_target = tmpl->fall_through_pc;
             }
@@ -3275,6 +3381,12 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
 
     /* Restore correct-path instruction count */
     qemu_plugin_u64_set(sb_insn_count, cpu_index, wp_saved_insn_count);
+    qemu_plugin_u64_set(sb_prev_start_pc, cpu_index, wp_saved_prev_start_pc);
+    qemu_plugin_u64_set(sb_prev_last_pc, cpu_index, wp_saved_prev_last_pc);
+    qemu_plugin_u64_set(sb_prev_fall_through, cpu_index,
+                        wp_saved_prev_fall_through);
+    qemu_plugin_u64_set(sb_prev_bb_ends_in_branch, cpu_index,
+                        wp_saved_prev_bb_ends_in_branch);
 
     /* Exit speculative mode */
     qemu_plugin_spec_mode_end();
@@ -3300,6 +3412,10 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
 
 /* ========================= Output: Text Format ========================= */
 
+static bool is_wait_prefix_insn(const BBTemplate *t, uint32_t idx);
+static bool is_x87_opcode_byte(uint8_t b);
+static BBTemplate *find_wait_prefix_predecessor(uint64_t start_pc);
+
 /*
  * Write the header section (BB templates) in human-readable text format.
  */
@@ -3319,6 +3435,10 @@ static void write_text_header(FILE *f)
     fprintf(f, "BRANCHES %u\n", BRANCH_TYPE_COUNT);
     for (uint32_t i = 0; i < BRANCH_TYPE_COUNT; i++) {
         fprintf(f, "B %u %s\n", i, branch_type_name(i));
+    }
+    fprintf(f, "WP_STOP_REASONS %u\n", WP_STOP_REASON_COUNT);
+    for (uint32_t i = 0; i < WP_STOP_REASON_COUNT; i++) {
+        fprintf(f, "S %u %s\n", i, wp_stop_reason_name(i));
     }
     fprintf(f, "EXCEPTIONS %u\n", GEN_EXC_COUNT);
     for (uint32_t i = 0; i < GEN_EXC_COUNT; i++) {
@@ -3350,6 +3470,8 @@ static void write_text_header(FILE *f)
     g_hash_table_iter_init(&iter, template_map);
     while (g_hash_table_iter_next(&iter, NULL, &value)) {
         BBTemplate *tmpl = value;
+        BBTemplate *pred_wait = find_wait_prefix_predecessor(tmpl->start_pc);
+        bool skip_first_as_merged_suffix = false;
         fprintf(f, "BB%" PRIu32 " [pc=0x%" PRIx64 ", insns=%" PRIu32
                 ", fall_through=0x%" PRIx64 "]\n",
                 tmpl->template_id, tmpl->start_pc,
@@ -3358,35 +3480,74 @@ static void write_text_header(FILE *f)
             fprintf(f, "  symbol=%s\n", tmpl->symbol_name);
         }
 
+        if (pred_wait && tmpl->n_insns > 0 && tmpl->insn_sizes[0] > 0) {
+            uint8_t first_b = tmpl->insn_bytes[0];
+            skip_first_as_merged_suffix = is_x87_opcode_byte(first_b);
+        }
+
         for (uint32_t i = 0; i < tmpl->n_insns; i++) {
             InsnFields *fld = &tmpl->insn_fields[i];
-            fprintf(f, "  [%u] 0x%" PRIx64 ": op=%s",
-                    i, tmpl->insn_pcs[i], generic_opcode_name(fld->opcode));
+            const InsnFields *print_fld = fld;
+            uint64_t print_pc = tmpl->insn_pcs[i];
+            bool merged_wait_prefix = false;
+            uint8_t merged_bytes[MAX_INSN_BYTES] = {0};
+            uint8_t merged_size = 0;
 
-            if (fld->branch_type != BRANCH_NONE) {
-                fprintf(f, " br=%s", branch_type_name(fld->branch_type));
-                fprintf(f, " cond=%u", fld->branch_conditional ? 1 : 0);
+            if (skip_first_as_merged_suffix && i == 0) {
+                continue;
+            }
+
+            if (i == tmpl->n_insns - 1 && is_wait_prefix_insn(tmpl, i)) {
+                BBTemplate *succ = find_template(tmpl->fall_through_pc);
+                if (succ && succ->n_insns > 0 && succ->insn_sizes[0] > 0 &&
+                    succ->insn_pcs[0] == tmpl->insn_pcs[i] + 1 &&
+                    is_x87_opcode_byte(succ->insn_bytes[0])) {
+                    uint8_t succ_size = succ->insn_sizes[0];
+                    merged_size = (uint8_t)MIN((int)MAX_INSN_BYTES,
+                                               1 + (int)succ_size);
+                    merged_bytes[0] = 0x9b;
+                    if (merged_size > 1) {
+                        memcpy(&merged_bytes[1], &succ->insn_bytes[0],
+                               merged_size - 1);
+                    }
+                    print_fld = &succ->insn_fields[0];
+                    merged_wait_prefix = true;
+                }
+            }
+
+            fprintf(f, "  [%u] 0x%" PRIx64 ": op=%s",
+                    i, print_pc, generic_opcode_name(print_fld->opcode));
+
+            if (print_fld->branch_type != BRANCH_NONE) {
+                fprintf(f, " br=%s", branch_type_name(print_fld->branch_type));
+                fprintf(f, " cond=%u", print_fld->branch_conditional ? 1 : 0);
             }
 
             fprintf(f, " src=[");
-            for (uint8_t s = 0; s < fld->n_src_regs; s++) {
+            for (uint8_t s = 0; s < print_fld->n_src_regs; s++) {
                 if (s > 0) fprintf(f, ",");
-                fprintf(f, "%s", generic_reg_name(fld->src_regs[s]));
+                fprintf(f, "%s", generic_reg_name(print_fld->src_regs[s]));
             }
             fprintf(f, "] dst=[");
-            for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
+            for (uint8_t d = 0; d < print_fld->n_dst_regs; d++) {
                 if (d > 0) fprintf(f, ",");
-                fprintf(f, "%s", generic_reg_name(fld->dst_regs[d]));
+                fprintf(f, "%s", generic_reg_name(print_fld->dst_regs[d]));
             }
             fprintf(f, "]");
 
-            if (fld->has_immediate) {
-                fprintf(f, " imm=%" PRId64, fld->immediate);
+            if (print_fld->has_immediate) {
+                fprintf(f, " imm=%" PRId64, print_fld->immediate);
             }
             fprintf(f, " bytes=");
-            for (uint8_t b = 0; b < tmpl->insn_sizes[i]; b++) {
-                fprintf(f, "%02x",
-                        tmpl->insn_bytes[(size_t)i * MAX_INSN_BYTES + b]);
+            if (merged_wait_prefix) {
+                for (uint8_t b = 0; b < merged_size; b++) {
+                    fprintf(f, "%02x", merged_bytes[b]);
+                }
+            } else {
+                for (uint8_t b = 0; b < tmpl->insn_sizes[i]; b++) {
+                    fprintf(f, "%02x",
+                            tmpl->insn_bytes[(size_t)i * MAX_INSN_BYTES + b]);
+                }
             }
             fprintf(f, "\n");
         }
@@ -3452,13 +3613,19 @@ static void write_text_body_entry(FILE *f, const BodyEntry *entry)
                     break;
                 }
             }
-            if (wp->exception) {
-                fprintf(f, " EXCEPTION");
-                fprintf(f, " exid=%s",
-                        generic_exception_name(wp->exception_id));
-                if (wp->has_exception_reg) {
-                    fprintf(f, " exreg=%s",
-                            generic_reg_name(wp->exception_reg_id));
+            if (wp->fault) {
+                fprintf(f, " FAULT");
+                if (wp->stop_reason != WP_STOP_NONE) {
+                    fprintf(f, " stop=%s",
+                            wp_stop_reason_name(wp->stop_reason));
+                }
+                if (wp->has_exception_class) {
+                    fprintf(f, " exid=%s",
+                            generic_exception_name(wp->exception_id));
+                    if (wp->has_exception_reg) {
+                        fprintf(f, " exreg=%s",
+                                generic_reg_name(wp->exception_reg_id));
+                    }
                 }
             }
             if (wp->translation_unavailable) {
@@ -3475,6 +3642,43 @@ static void write_text_body_entry(FILE *f, const BodyEntry *entry)
         }
     }
     fprintf(f, "\n");
+}
+
+static bool is_wait_prefix_insn(const BBTemplate *t, uint32_t idx)
+{
+    return t && idx < t->n_insns &&
+           t->insn_sizes[idx] == 1 &&
+           t->insn_bytes[(size_t)idx * MAX_INSN_BYTES] == 0x9b;
+}
+
+static bool is_x87_opcode_byte(uint8_t b)
+{
+    return b >= 0xd8 && b <= 0xdf;
+}
+
+/* Find predecessor template that ends with standalone 0x9b before @start_pc. */
+static BBTemplate *find_wait_prefix_predecessor(uint64_t start_pc)
+{
+    GHashTableIter it;
+    gpointer v;
+
+    g_hash_table_iter_init(&it, template_map);
+    while (g_hash_table_iter_next(&it, NULL, &v)) {
+        BBTemplate *cand = v;
+        uint32_t last;
+
+        if (!cand || cand->n_insns == 0 || cand->fall_through_pc != start_pc) {
+            continue;
+        }
+
+        last = cand->n_insns - 1;
+        if (cand->insn_pcs[last] + 1 == start_pc &&
+            is_wait_prefix_insn(cand, last)) {
+            return cand;
+        }
+    }
+
+    return NULL;
 }
 
 /*
@@ -3905,7 +4109,7 @@ static void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
 
         for (uint32_t w = 0; w < num_wp; w++) {
             const WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
-            if (wp->exception || wp->translation_unavailable) {
+            if (wp->fault || wp->translation_unavailable) {
                 num_events++;
             }
         }
@@ -3916,19 +4120,23 @@ static void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
         for (uint32_t w = 0; w < num_wp; w++) {
             const WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
 
-            if (!wp->exception && !wp->translation_unavailable) {
+            if (!wp->fault && !wp->translation_unavailable) {
                 continue;
             }
 
             bw_write_uleb128(&st->bw, (uint64_t)(w - (uint32_t)(prev_event_idx + 1)));
             bw_write_bits(&st->bw, wp->translation_unavailable ? 1 : 0, 1);
-            bw_write_bits(&st->bw, wp->exception ? 1 : 0, 1);
+            bw_write_bits(&st->bw, wp->fault ? 1 : 0, 1);
 
-            if (wp->exception) {
-                bw_write_bits(&st->bw, wp->exception_id, 8);
-                bw_write_bits(&st->bw, wp->has_exception_reg ? 1 : 0, 1);
-                if (wp->has_exception_reg) {
-                    bw_write_bits(&st->bw, wp->exception_reg_id, WPT_REG_BITS);
+            if (wp->fault) {
+                bw_write_bits(&st->bw, wp->stop_reason, 8);
+                bw_write_bits(&st->bw, wp->has_exception_class ? 1 : 0, 1);
+                if (wp->has_exception_class) {
+                    bw_write_bits(&st->bw, wp->exception_id, 8);
+                    bw_write_bits(&st->bw, wp->has_exception_reg ? 1 : 0, 1);
+                    if (wp->has_exception_reg) {
+                        bw_write_bits(&st->bw, wp->exception_reg_id, WPT_REG_BITS);
+                    }
                 }
                 if (wp->poison_mask) {
                     guint poison_len = poison_mask_effective_len(wp->poison_mask);
@@ -4244,6 +4452,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     }
 
     uint64_t current_pc = qemu_plugin_u64_get(sb_current_pc, cpu_index);
+    uint64_t prev_start = qemu_plugin_u64_get(sb_prev_start_pc, cpu_index);
     uint64_t prev_last = qemu_plugin_u64_get(sb_prev_last_pc, cpu_index);
     uint64_t prev_ft = qemu_plugin_u64_get(sb_prev_fall_through, cpu_index);
     bool prev_is_branch = qemu_plugin_u64_get(sb_prev_bb_ends_in_branch,
@@ -4300,8 +4509,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         wrong_target = prev_ft;
     }
 
-    /* Find template for correct-path BB */
-    BBTemplate *cp_tmpl = find_template(current_pc);
+    /* Find template for previous BB (the one whose dynamic params we carry). */
+    BBTemplate *cp_tmpl = find_template(prev_start);
 
     g_mutex_unlock(&data_lock);
 
@@ -4353,6 +4562,19 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
 /* ========================= Translation Callback ========================= */
 
+static bool disas_starts_with_fp_mnemonic(const char *disas)
+{
+    if (!disas) {
+        return false;
+    }
+
+    while (*disas && g_ascii_isspace(*disas)) {
+        disas++;
+    }
+
+    return (disas[0] == 'f' || disas[0] == 'F');
+}
+
 /*
  * Called when a basic block is translated.
  * Creates BB templates with instruction bytes and instruments the block.
@@ -4369,35 +4591,93 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     uint64_t fall_through = last_insn_pc + last_insn_size;
     uint64_t bb_ends_in_branch = 0;
 
-    /* Collect instruction data for BB template */
-    uint64_t *insn_pcs = g_new0(uint64_t, n_insns);
-    char **insn_disas_arr = g_new0(char *, n_insns);
-    uint8_t *insn_sizes = g_new0(uint8_t, n_insns);
-    uint8_t *insn_bytes = g_new0(uint8_t, n_insns * MAX_INSN_BYTES);
+    /* Collect raw instruction data for BB template and callbacks */
+    uint64_t *raw_insn_pcs = g_new0(uint64_t, n_insns);
+    char **raw_insn_disas_arr = g_new0(char *, n_insns);
+    uint8_t *raw_insn_sizes = g_new0(uint8_t, n_insns);
+    uint8_t *raw_insn_bytes = g_new0(uint8_t, n_insns * MAX_INSN_BYTES);
+    uint64_t *tmpl_insn_pcs = g_new0(uint64_t, n_insns);
+    char **tmpl_insn_disas_arr = g_new0(char *, n_insns);
+    uint8_t *tmpl_insn_sizes = g_new0(uint8_t, n_insns);
+    uint8_t *tmpl_insn_bytes = g_new0(uint8_t, n_insns * MAX_INSN_BYTES);
+    size_t tmpl_n_insns = 0;
     const char *symbol_name = qemu_plugin_insn_symbol(first_insn);
 
     for (size_t i = 0; i < n_insns; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
-        insn_pcs[i] = qemu_plugin_insn_vaddr(insn);
+        raw_insn_pcs[i] = qemu_plugin_insn_vaddr(insn);
 
         /* Get disassembly string from QEMU's internal disassembler */
-        insn_disas_arr[i] = qemu_plugin_insn_disas(insn);
-        insn_sizes[i] = (uint8_t)MIN(qemu_plugin_insn_size(insn), MAX_INSN_BYTES);
+        raw_insn_disas_arr[i] = qemu_plugin_insn_disas(insn);
+        raw_insn_sizes[i] = (uint8_t)MIN(qemu_plugin_insn_size(insn), MAX_INSN_BYTES);
         qemu_plugin_insn_data(insn,
-                      &insn_bytes[i * MAX_INSN_BYTES],
-                      insn_sizes[i]);
+                      &raw_insn_bytes[i * MAX_INSN_BYTES],
+                      raw_insn_sizes[i]);
 
         /* Register per-instruction memory callback with PC as udata */
         qemu_plugin_register_vcpu_mem_cb(
             insn, vcpu_mem_cb, QEMU_PLUGIN_CB_NO_REGS,
-            QEMU_PLUGIN_MEM_RW, (void *)(uintptr_t)insn_pcs[i]);
+            QEMU_PLUGIN_MEM_RW, (void *)(uintptr_t)raw_insn_pcs[i]);
+    }
+
+    /*
+     * Normalize template instruction stream for x86 x87 wait-prefix encoding.
+     * Binutils often prints "9b dd d8" as a single prefixed instruction,
+     * while QEMU disassembly can surface a standalone "9b" followed by the
+     * x87 op. Coalesce these into one traced instruction so bytes/opcode align
+     * with disassembly expectations.
+     */
+    for (size_t i = 0; i < n_insns; i++) {
+        bool can_merge_wait_prefix =
+            (trace_isa == TRACE_ISA_X86) &&
+            (i + 1 < n_insns) &&
+            (raw_insn_sizes[i] == 1) &&
+            (raw_insn_bytes[i * MAX_INSN_BYTES] == 0x9b) &&
+            (raw_insn_pcs[i] + 1 == raw_insn_pcs[i + 1]) &&
+            disas_starts_with_fp_mnemonic(raw_insn_disas_arr[i + 1]);
+
+        if (can_merge_wait_prefix) {
+            uint8_t next_sz = raw_insn_sizes[i + 1];
+            uint8_t merged_sz = (uint8_t)MIN((int)MAX_INSN_BYTES,
+                                             1 + (int)next_sz);
+
+            tmpl_insn_pcs[tmpl_n_insns] = raw_insn_pcs[i];
+            tmpl_insn_disas_arr[tmpl_n_insns] = raw_insn_disas_arr[i + 1];
+            raw_insn_disas_arr[i + 1] = NULL;
+            tmpl_insn_sizes[tmpl_n_insns] = merged_sz;
+            memset(&tmpl_insn_bytes[tmpl_n_insns * MAX_INSN_BYTES], 0,
+                   MAX_INSN_BYTES);
+            tmpl_insn_bytes[tmpl_n_insns * MAX_INSN_BYTES] = 0x9b;
+            if (merged_sz > 1) {
+                memcpy(&tmpl_insn_bytes[tmpl_n_insns * MAX_INSN_BYTES + 1],
+                       &raw_insn_bytes[(i + 1) * MAX_INSN_BYTES],
+                       merged_sz - 1);
+            }
+
+            tmpl_n_insns++;
+            i++;
+            continue;
+        }
+
+        tmpl_insn_pcs[tmpl_n_insns] = raw_insn_pcs[i];
+        tmpl_insn_disas_arr[tmpl_n_insns] = raw_insn_disas_arr[i];
+        raw_insn_disas_arr[i] = NULL;
+        tmpl_insn_sizes[tmpl_n_insns] = raw_insn_sizes[i];
+        memcpy(&tmpl_insn_bytes[tmpl_n_insns * MAX_INSN_BYTES],
+               &raw_insn_bytes[i * MAX_INSN_BYTES],
+               MAX_INSN_BYTES);
+        tmpl_n_insns++;
     }
 
     /* Create or update BB template */
     g_mutex_lock(&data_lock);
     {
-        BBTemplate *tmpl = get_or_create_template(pc, (uint32_t)n_insns, insn_pcs,
-                                                  insn_disas_arr, insn_sizes, insn_bytes,
+        BBTemplate *tmpl = get_or_create_template(pc,
+                                                  (uint32_t)tmpl_n_insns,
+                                                  tmpl_insn_pcs,
+                                                  tmpl_insn_disas_arr,
+                                                  tmpl_insn_sizes,
+                                                  tmpl_insn_bytes,
                                                   symbol_name, fall_through);
         if (tmpl && tmpl->n_insns > 0) {
             InsnFields *last_fld = &tmpl->insn_fields[tmpl->n_insns - 1];
@@ -4408,12 +4688,19 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
     /* Free temporary arrays (template made copies) */
     for (size_t i = 0; i < n_insns; i++) {
-        g_free(insn_disas_arr[i]);
+        g_free(raw_insn_disas_arr[i]);
     }
-    g_free(insn_pcs);
-    g_free(insn_disas_arr);
-    g_free(insn_sizes);
-    g_free(insn_bytes);
+    for (size_t i = 0; i < tmpl_n_insns; i++) {
+        g_free(tmpl_insn_disas_arr[i]);
+    }
+    g_free(raw_insn_pcs);
+    g_free(raw_insn_disas_arr);
+    g_free(raw_insn_sizes);
+    g_free(raw_insn_bytes);
+    g_free(tmpl_insn_pcs);
+    g_free(tmpl_insn_disas_arr);
+    g_free(tmpl_insn_sizes);
+    g_free(tmpl_insn_bytes);
 
     /*
     * Instrument the block for execution tracking.
@@ -4430,6 +4717,9 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         (void *)(uintptr_t)n_insns);
 
     /* Update prev_* values for the next block's callback. */
+    qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
+        first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
+        sb_prev_start_pc, pc);
     qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
         first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
         sb_prev_last_pc, last_insn_pc);
@@ -4464,6 +4754,14 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
          * wrong-path execution began. */
         qemu_plugin_u64_set(sb_insn_count, wp_saved_cpu_index,
                             wp_saved_insn_count);
+        qemu_plugin_u64_set(sb_prev_start_pc, wp_saved_cpu_index,
+                            wp_saved_prev_start_pc);
+        qemu_plugin_u64_set(sb_prev_last_pc, wp_saved_cpu_index,
+                            wp_saved_prev_last_pc);
+        qemu_plugin_u64_set(sb_prev_fall_through, wp_saved_cpu_index,
+                            wp_saved_prev_fall_through);
+        qemu_plugin_u64_set(sb_prev_bb_ends_in_branch, wp_saved_cpu_index,
+                            wp_saved_prev_bb_ends_in_branch);
         if (wp_mem_accesses) {
             g_array_unref(wp_mem_accesses);
             wp_mem_accesses = NULL;
@@ -4781,6 +5079,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     vcpu_sb = qemu_plugin_scoreboard_new(sizeof(VCPUScoreBoard));
     sb_current_pc = qemu_plugin_scoreboard_u64_in_struct(
         vcpu_sb, VCPUScoreBoard, current_pc);
+    sb_prev_start_pc = qemu_plugin_scoreboard_u64_in_struct(
+        vcpu_sb, VCPUScoreBoard, prev_start_pc);
     sb_prev_last_pc = qemu_plugin_scoreboard_u64_in_struct(
         vcpu_sb, VCPUScoreBoard, prev_last_pc);
     sb_prev_fall_through = qemu_plugin_scoreboard_u64_in_struct(

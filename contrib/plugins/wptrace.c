@@ -85,14 +85,21 @@ static guint simpoints_current_idx = 0;
 
 /*
  * Magic for binary format.
- * v10 removes the per-entry dyn_patch selector and always encodes
- * dynamic parameters using patch payloads.
+ * v12 adds:
+ *   - generic exception id for wrong-path exceptions
+ *   - explicit translation-unavailable marker (not treated as exception)
+ *
+ * v11 adds:
+ *   - branch conditional flag
+ *   - template symbol + raw instruction bytes
+ *   - enum name tables in header
+ *   - wrong-path exception dependency masks
  */
-#define WPT_MAGIC  0x5450570a  /* 'T','P','W',0x0a little-endian - version 10 */
+#define WPT_MAGIC  0x5450570c  /* 'T','P','W',0x0c little-endian - version 12 */
 
 #define WPT_ISA_BITS 3
-#define WPT_OPCODE_BITS 6
-#define WPT_BRANCH_BITS 3
+#define WPT_OPCODE_BITS 8
+#define WPT_BRANCH_BITS 8
 #define WPT_REG_COUNT_BITS 3
 #define WPT_REG_BITS 8
 #define WPT_DYN_TYPE_BITS 1
@@ -174,15 +181,26 @@ enum BranchType {
     BRANCH_DIRECT_CALL = 3,
     BRANCH_INDIRECT_CALL = 4,
     BRANCH_RETURN = 5,
-    BRANCH_COND_DIRECT = 6,
-    BRANCH_SYSCALL_TYPE = 7,
+    BRANCH_SYSCALL_TYPE = 6,
+    BRANCH_COND_DIRECT = 7, /* legacy table value; normalized at classify */
+    BRANCH_TYPE_COUNT,
+};
+
+enum GenericExceptionId {
+    GEN_EXC_NONE = 0,
+    GEN_EXC_UNKNOWN = 1,
+    GEN_EXC_INT_DIVIDE_BY_ZERO = 2,
+    GEN_EXC_FP_DIVIDE_BY_ZERO = 3,
+    GEN_EXC_MEMORY_ACCESS = 4,
+    GEN_EXC_SYSCALL = 5,
+    GEN_EXC_COUNT,
 };
 
 _Static_assert(TRACE_ISA_MIPS < (1U << WPT_ISA_BITS),
                "TraceISA no longer fits packed width");
 _Static_assert(GEN_OP_COUNT <= (1U << WPT_OPCODE_BITS),
                "GenericOpcode no longer fits packed width");
-_Static_assert(BRANCH_SYSCALL_TYPE < (1U << WPT_BRANCH_BITS),
+_Static_assert(BRANCH_TYPE_COUNT <= (1U << WPT_BRANCH_BITS),
                "BranchType no longer fits packed width");
 _Static_assert(MAX_SRC_REGS <= ((1U << WPT_REG_COUNT_BITS) - 1),
                "MAX_SRC_REGS no longer fits packed width");
@@ -195,7 +213,7 @@ _Static_assert(MAX_DST_REGS <= ((1U << WPT_REG_COUNT_BITS) - 1),
  */
 enum GenericRegId {
     REG_NONE = 0,
-    /* General-purpose integer registers: 1-32 */
+    /* General-purpose integer registers: 1-64 */
     REG_GPR0 = 1,
     REG_GPR1 = 2,
     REG_GPR2 = 3,
@@ -228,12 +246,13 @@ enum GenericRegId {
     REG_GPR29 = 30,
     REG_GPR30 = 31,
     REG_GPR31 = 32,
-    /* Floating-point registers: 33-64 */
-    REG_FPR0 = 33,
-    /* FPR1-FPR31 follow sequentially (34-64) */
-    /* Vector/SIMD registers: 65-96 */
-    REG_VEC0 = 65,
-    /* VEC1-VEC31 follow sequentially (66-96) */
+    /* GPR32-GPR63 follow sequentially (33-64) */
+    /* Floating-point registers: 65-128 */
+    REG_FPR0 = 65,
+    /* FPR1-FPR63 follow sequentially (66-128) */
+    /* Vector/SIMD registers: 129-192 */
+    REG_VEC0 = 129,
+    /* VEC1-VEC63 follow sequentially (130-192) */
     /* Special registers: 250-254 */
     REG_SP = 250,
     REG_FLAGS = 251,
@@ -249,6 +268,7 @@ enum GenericRegId {
 typedef struct {
     uint8_t opcode;                 /* GenericOpcode */
     uint8_t branch_type;            /* BranchType (BRANCH_NONE if not branch) */
+    bool branch_conditional;
     uint8_t n_src_regs;
     uint8_t n_dst_regs;
     uint8_t src_regs[MAX_SRC_REGS]; /* Source register IDs (GenericRegId) */
@@ -669,6 +689,7 @@ typedef struct {
     const char *name;
     uint8_t opcode;
     uint8_t branch_type;
+    bool branch_conditional;
 } MnemonicEntry;
 
 /* Searched linearly (only called at translate time) */
@@ -1037,12 +1058,14 @@ static const MnemonicEntry prefix_class_table[] = {
  * Returns true if found, filling opcode and branch_type.
  */
 static bool lookup_mnemonic(const char *mnem, uint8_t *opcode,
-                            uint8_t *branch_type)
+                            uint8_t *branch_type,
+                            bool *branch_conditional)
 {
     const MnemonicEntry *entry = g_hash_table_lookup(mnemonic_ht, mnem);
     if (entry) {
         *opcode = entry->opcode;
         *branch_type = entry->branch_type;
+        *branch_conditional = entry->branch_conditional;
         return true;
     }
     return false;
@@ -1058,7 +1081,8 @@ static bool lookup_mnemonic(const char *mnem, uint8_t *opcode,
  *      patterns like "cmov<cc>", "set<cc>", "amo*", etc.
  */
 static bool lookup_prefix_class(const char *mnem, uint8_t *opcode,
-                                uint8_t *branch_type)
+                                uint8_t *branch_type,
+                                bool *branch_conditional)
 {
     char buf[16];
 
@@ -1073,6 +1097,7 @@ static bool lookup_prefix_class(const char *mnem, uint8_t *opcode,
             if (e) {
                 *opcode = e->opcode;
                 *branch_type = e->branch_type;
+                *branch_conditional = e->branch_conditional;
                 return true;
             }
         }
@@ -1088,6 +1113,7 @@ static bool lookup_prefix_class(const char *mnem, uint8_t *opcode,
             if (e) {
                 *opcode = e->opcode;
                 *branch_type = e->branch_type;
+                *branch_conditional = e->branch_conditional;
                 return true;
             }
         }
@@ -1108,10 +1134,12 @@ static bool lookup_prefix_class(const char *mnem, uint8_t *opcode,
  * which requires character manipulation that can't be table-driven.
  */
 static void classify_mnemonic(const char *mnem, uint8_t *opcode,
-                              uint8_t *branch_type)
+                              uint8_t *branch_type,
+                              bool *branch_conditional)
 {
     *opcode = GEN_OP_UNKNOWN;
     *branch_type = BRANCH_NONE;
+    *branch_conditional = false;
 
     if (!mnem || !*mnem) {
         return;
@@ -1141,27 +1169,30 @@ static void classify_mnemonic(const char *mnem, uint8_t *opcode,
         }
         if (strcmp(tmp, "jmp") != 0) {
             *opcode = GEN_OP_BRANCH;
-            *branch_type = BRANCH_COND_DIRECT;
+            *branch_type = BRANCH_DIRECT_JUMP;
+            *branch_conditional = true;
             return;
         }
     }
 
     /* Exact match in mnemonic hash table */
-    if (lookup_mnemonic(mnem, opcode, branch_type)) {
+    if (lookup_mnemonic(mnem, opcode, branch_type, branch_conditional)) {
         return;
     }
 
     /* Prefix-based classification (dot-prefix and bare-prefix) */
-    if (lookup_prefix_class(mnem, opcode, branch_type)) {
+    if (lookup_prefix_class(mnem, opcode, branch_type, branch_conditional)) {
         return;
     }
 
     /* AVX v-prefix: strip 'v' and retry (x86 only) */
     if (trace_isa == TRACE_ISA_X86 && mnem[0] == 'v' && strlen(mnem) > 1) {
-        if (lookup_mnemonic(mnem + 1, opcode, branch_type)) {
+        if (lookup_mnemonic(mnem + 1, opcode, branch_type,
+                            branch_conditional)) {
             return;
         }
-        if (lookup_prefix_class(mnem + 1, opcode, branch_type)) {
+        if (lookup_prefix_class(mnem + 1, opcode, branch_type,
+                                branch_conditional)) {
             return;
         }
     }
@@ -1175,23 +1206,33 @@ static void classify_mnemonic(const char *mnem, uint8_t *opcode,
             char last = base[len - 1];
             if (last == 'q' || last == 'l' || last == 'w' || last == 'b') {
                 base[len - 1] = '\0';
-                if (lookup_mnemonic(base, opcode, branch_type)) {
+                if (lookup_mnemonic(base, opcode, branch_type,
+                                    branch_conditional)) {
                     return;
                 }
-                if (lookup_prefix_class(base, opcode, branch_type)) {
+                if (lookup_prefix_class(base, opcode, branch_type,
+                                        branch_conditional)) {
                     return;
                 }
                 /* Also try AVX v-prefix + stripped suffix */
                 if (base[0] == 'v' && strlen(base) > 1) {
-                    if (lookup_mnemonic(base + 1, opcode, branch_type)) {
+                    if (lookup_mnemonic(base + 1, opcode, branch_type,
+                                        branch_conditional)) {
                         return;
                     }
-                    if (lookup_prefix_class(base + 1, opcode, branch_type)) {
+                    if (lookup_prefix_class(base + 1, opcode, branch_type,
+                                            branch_conditional)) {
                         return;
                     }
                 }
             }
         }
+    }
+
+    /* Backward table compatibility: conditional-direct maps to type+flag. */
+    if (*branch_type == BRANCH_COND_DIRECT) {
+        *branch_type = BRANCH_DIRECT_JUMP;
+        *branch_conditional = true;
     }
 }
 
@@ -1571,7 +1612,7 @@ static void parse_x86_operands(const char *operands, InsnFields *out)
 
     /* Branch */
     case GEN_OP_BRANCH:
-        if (out->branch_type == BRANCH_COND_DIRECT) {
+        if (out->branch_conditional) {
             add_src_reg(out, REG_FLAGS);
         }
         if (out->branch_type == BRANCH_INDIRECT_JUMP && n_ops >= 1) {
@@ -2361,8 +2402,25 @@ static void decode_disas_to_generic(const char *disas, InsnFields *out)
     }
     mnem[i] = '\0';
 
-    /* Classify mnemonic -> opcode + branch_type */
-    classify_mnemonic(mnem, &out->opcode, &out->branch_type);
+    /* Classify mnemonic -> opcode + branch type + conditional flag */
+    classify_mnemonic(mnem, &out->opcode, &out->branch_type,
+                      &out->branch_conditional);
+
+    if (out->branch_type != BRANCH_NONE && strchr(disas, ' ')) {
+        char pfx[16];
+        const char *sp = strchr(disas, ' ');
+        size_t plen = (size_t)(sp - disas);
+
+        if (plen < sizeof(pfx)) {
+            memcpy(pfx, disas, plen);
+            pfx[plen] = '\0';
+            if (g_strcmp0(pfx, "bnd") == 0 ||
+                g_strcmp0(pfx, "pt") == 0 ||
+                g_strcmp0(pfx, "pn") == 0) {
+                out->branch_conditional = true;
+            }
+        }
+    }
 
     /* Skip whitespace to get to operands */
     while (*p == ' ' || *p == '\t') {
@@ -2461,10 +2519,10 @@ static const char *branch_type_name(uint8_t bt)
         [BRANCH_DIRECT_CALL]   = "DIRECT_CALL",
         [BRANCH_INDIRECT_CALL] = "INDIRECT_CALL",
         [BRANCH_RETURN]        = "RETURN",
-        [BRANCH_COND_DIRECT]   = "COND_DIRECT",
         [BRANCH_SYSCALL_TYPE]  = "SYSCALL",
+        [BRANCH_COND_DIRECT]   = "COND_DIRECT_LEGACY",
     };
-    return (bt <= BRANCH_SYSCALL_TYPE) ? names[bt] : "UNKNOWN";
+    return (bt < BRANCH_TYPE_COUNT) ? names[bt] : "UNKNOWN";
 }
 
 static const char *generic_reg_name(uint8_t reg_id)
@@ -2474,15 +2532,15 @@ static const char *generic_reg_name(uint8_t reg_id)
     if (reg_id == REG_NONE) {
         return "NONE";
     }
-    if (reg_id >= REG_GPR0 && reg_id <= REG_GPR31) {
+    if (reg_id >= REG_GPR0 && reg_id <= (REG_GPR0 + 63)) {
         snprintf(buf, sizeof(buf), "GPR%u", reg_id - REG_GPR0);
         return buf;
     }
-    if (reg_id >= REG_FPR0 && reg_id <= REG_FPR0 + 31) {
+    if (reg_id >= REG_FPR0 && reg_id <= (REG_FPR0 + 63)) {
         snprintf(buf, sizeof(buf), "FPR%u", reg_id - REG_FPR0);
         return buf;
     }
-    if (reg_id >= REG_VEC0 && reg_id <= REG_VEC0 + 31) {
+    if (reg_id >= REG_VEC0 && reg_id <= (REG_VEC0 + 63)) {
         snprintf(buf, sizeof(buf), "VEC%u", reg_id - REG_VEC0);
         return buf;
     }
@@ -2498,6 +2556,20 @@ static const char *generic_reg_name(uint8_t reg_id)
     }
 }
 
+static const char *generic_exception_name(uint8_t exid)
+{
+    static const char *names[] = {
+        [GEN_EXC_NONE] = "NONE",
+        [GEN_EXC_UNKNOWN] = "UNKNOWN",
+        [GEN_EXC_INT_DIVIDE_BY_ZERO] = "INT_DIVIDE_BY_ZERO",
+        [GEN_EXC_FP_DIVIDE_BY_ZERO] = "FP_DIVIDE_BY_ZERO",
+        [GEN_EXC_MEMORY_ACCESS] = "MEMORY_ACCESS",
+        [GEN_EXC_SYSCALL] = "SYSCALL",
+    };
+
+    return (exid < GEN_EXC_COUNT) ? names[exid] : "UNKNOWN";
+}
+
 /* ========================= Data Structures ========================= */
 
 /*
@@ -2510,6 +2582,9 @@ typedef struct {
     uint32_t n_insns;
     uint64_t *insn_pcs;
     uint64_t fall_through_pc;
+    char *symbol_name;         /* Best-effort symbol for first instruction */
+    uint8_t *insn_sizes;       /* Size per instruction */
+    uint8_t *insn_bytes;       /* Flat buffer: n_insns * MAX_INSN_BYTES */
     InsnFields *insn_fields;    /* Decoded ISA-agnostic fields per insn */
 } BBTemplate;
 
@@ -2537,6 +2612,11 @@ typedef struct {
     GArray *dyn_params;         /* GArray of DynParam */
     uint32_t n_insns_executed;  /* Number of insns executed in this WP BB */
     bool exception;             /* True if WP BB ended due to exception */
+    bool translation_unavailable; /* Template lookup failed for this WP PC */
+    uint8_t exception_id;       /* GenericExceptionId */
+    uint8_t exception_reg_id;   /* Register impacted by exception */
+    bool has_exception_reg;
+    GByteArray *poison_mask;    /* Per-insn mask: 1 means dependent on poison */
 } WPBBEntry;
 
 /*
@@ -2655,6 +2735,9 @@ static void dyn_param_array_free(GArray *arr)
 static void wp_bb_entry_clear(WPBBEntry *entry)
 {
     dyn_param_array_free(entry->dyn_params);
+    if (entry->poison_mask) {
+        g_byte_array_unref(entry->poison_mask);
+    }
 }
 
 static void body_entry_clear(BodyEntry *entry)
@@ -2673,6 +2756,9 @@ static void bb_template_free(gpointer data)
     BBTemplate *tmpl = data;
     g_free(tmpl->insn_fields);
     g_free(tmpl->insn_pcs);
+    g_free(tmpl->symbol_name);
+    g_free(tmpl->insn_sizes);
+    g_free(tmpl->insn_bytes);
     g_free(tmpl);
 }
 
@@ -2717,6 +2803,139 @@ static BBTemplate *find_template(uint64_t start_pc)
     return g_hash_table_lookup(template_map, &start_pc);
 }
 
+static BBTemplate *find_template_by_id(uint32_t template_id)
+{
+    GHashTableIter iter;
+    gpointer value;
+
+    g_hash_table_iter_init(&iter, template_map);
+    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+        BBTemplate *tmpl = value;
+        if (tmpl->template_id == template_id) {
+            return tmpl;
+        }
+    }
+    return NULL;
+}
+
+static uint8_t choose_exception_reg_id(const BBTemplate *tmpl)
+{
+    /* Prefer FP division destinations so poisoning follows FP fault chains. */
+    for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+        const InsnFields *fld = &tmpl->insn_fields[i];
+        if (fld->opcode != GEN_OP_FP_DIV) {
+            continue;
+        }
+        for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
+            if (fld->dst_regs[d] != REG_NONE) {
+                return fld->dst_regs[d];
+            }
+        }
+        for (uint8_t s = 0; s < fld->n_src_regs; s++) {
+            if (fld->src_regs[s] != REG_NONE) {
+                return fld->src_regs[s];
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+        const InsnFields *fld = &tmpl->insn_fields[i];
+        for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
+            if (fld->dst_regs[d] != REG_NONE) {
+                return fld->dst_regs[d];
+            }
+        }
+    }
+    return REG_NONE;
+}
+
+static uint8_t infer_generic_exception_id(const BBTemplate *tmpl)
+{
+    bool saw_mem = false;
+
+    if (!tmpl) {
+        return GEN_EXC_UNKNOWN;
+    }
+
+    for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+        const InsnFields *fld = &tmpl->insn_fields[i];
+
+        if (fld->opcode == GEN_OP_FP_DIV) {
+            return GEN_EXC_FP_DIVIDE_BY_ZERO;
+        }
+        if (fld->opcode == GEN_OP_INT_DIV) {
+            return GEN_EXC_INT_DIVIDE_BY_ZERO;
+        }
+        if (fld->opcode == GEN_OP_LOAD || fld->opcode == GEN_OP_STORE) {
+            saw_mem = true;
+        }
+        if (fld->opcode == GEN_OP_SYSCALL) {
+            return GEN_EXC_SYSCALL;
+        }
+    }
+
+    if (saw_mem) {
+        return GEN_EXC_MEMORY_ACCESS;
+    }
+    return GEN_EXC_UNKNOWN;
+}
+
+static void annotate_wp_dependency_masks(GArray *wp_chain)
+{
+    bool poisoned[256] = { false };
+    bool poison_active = false;
+
+    g_mutex_lock(&data_lock);
+    for (guint i = 0; i < wp_chain->len; i++) {
+        WPBBEntry *wp = &g_array_index(wp_chain, WPBBEntry, i);
+        BBTemplate *tmpl = find_template_by_id(wp->template_id);
+
+        if (!tmpl) {
+            continue;
+        }
+
+        if (!wp->poison_mask) {
+            wp->poison_mask = g_byte_array_sized_new(tmpl->n_insns);
+        }
+        g_byte_array_set_size(wp->poison_mask, tmpl->n_insns);
+        memset(wp->poison_mask->data, 0, tmpl->n_insns);
+
+        if (wp->exception && wp->has_exception_reg) {
+            poisoned[wp->exception_reg_id] = true;
+            poison_active = true;
+        }
+
+        if (!poison_active) {
+            continue;
+        }
+
+        for (uint32_t insn = 0; insn < tmpl->n_insns; insn++) {
+            const InsnFields *fld = &tmpl->insn_fields[insn];
+            bool dependent = false;
+
+            for (uint8_t s = 0; s < fld->n_src_regs; s++) {
+                uint8_t reg_id = fld->src_regs[s];
+                if (reg_id != REG_NONE && poisoned[reg_id]) {
+                    dependent = true;
+                    break;
+                }
+            }
+
+            wp->poison_mask->data[insn] = dependent ? 1 : 0;
+
+            if (dependent) {
+                for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
+                    uint8_t reg_id = fld->dst_regs[d];
+                    if (reg_id != REG_NONE) {
+                        poisoned[reg_id] = true;
+                    }
+                }
+            }
+        }
+    }
+    g_mutex_unlock(&data_lock);
+}
+
 /*
  * Find or create a BB template for the given start PC.
  * If a template already exists for this PC, returns it.
@@ -2728,6 +2947,9 @@ static BBTemplate *get_or_create_template(uint64_t start_pc,
                                           uint32_t n_insns,
                                           uint64_t *insn_pcs,
                                           char **insn_disas,
+                                          uint8_t *insn_sizes,
+                                          uint8_t *insn_bytes,
+                                          const char *symbol_name,
                                           uint64_t fall_through_pc)
 {
     BBTemplate *tmpl = find_template(start_pc);
@@ -2741,9 +2963,16 @@ static BBTemplate *get_or_create_template(uint64_t start_pc,
     tmpl->n_insns = n_insns;
     tmpl->fall_through_pc = fall_through_pc;
     tmpl->insn_pcs = g_new0(uint64_t, n_insns);
+    tmpl->insn_sizes = g_new0(uint8_t, n_insns);
+    tmpl->insn_bytes = g_new0(uint8_t, n_insns * MAX_INSN_BYTES);
+    tmpl->symbol_name = symbol_name ? g_strdup(symbol_name) : NULL;
 
     for (uint32_t i = 0; i < n_insns; i++) {
         tmpl->insn_pcs[i] = insn_pcs[i];
+        tmpl->insn_sizes[i] = insn_sizes[i];
+        memcpy(&tmpl->insn_bytes[(size_t)i * MAX_INSN_BYTES],
+               &insn_bytes[(size_t)i * MAX_INSN_BYTES],
+               MAX_INSN_BYTES);
     }
 
     /* Decode all instructions to ISA-agnostic generic fields */
@@ -2794,6 +3023,24 @@ static void vcpu_mem_cb(unsigned int cpu_index,
     }
 }
 
+static bool wp_target_is_poisoned(const GArray *poisoned_targets, uint64_t pc)
+{
+    for (guint i = 0; i < poisoned_targets->len; i++) {
+        uint64_t poisoned_pc = g_array_index(poisoned_targets, uint64_t, i);
+        if (poisoned_pc == pc) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void wp_poison_target(GArray *poisoned_targets, uint64_t pc)
+{
+    if (!wp_target_is_poisoned(poisoned_targets, pc)) {
+        g_array_append_val(poisoned_targets, pc);
+    }
+}
+
 /* ========================= Wrong-Path Simulation ========================= */
 
 /*
@@ -2817,8 +3064,13 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                                        unsigned int cpu_index)
 {
     GArray *wp_chain = g_array_new(false, false, sizeof(WPBBEntry));
+    GArray *poisoned_targets = g_array_new(false, false, sizeof(uint64_t));
     uint64_t sim_insns = 0;
     bool early_exit = false;
+    uint64_t last_fault_pc = UINT64_MAX;
+    unsigned int repeated_fault_pc = 0;
+    bool poisoned_regs[256] = { false };
+    bool poison_active = false;
 
     /* Save complete CPU state for rollback */
     struct qemu_plugin_cpu_state *saved_state = qemu_plugin_cpu_state_save();
@@ -2849,27 +3101,111 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     while (sim_insns < (uint64_t)max_wrong_path_depth) {
         uint64_t pre_pc = qemu_plugin_get_pc();
         guint mem_start_idx = wp_mem_accesses->len;
+        BBTemplate *tmpl = NULL;
+        bool tb_ok;
 
-        /* Execute one full translation block */
-        if (!qemu_plugin_exec_tb()) {
+        if (wp_target_is_poisoned(poisoned_targets, pre_pc)) {
+            early_exit = true;
+            break;
+        }
+
+        tb_ok = qemu_plugin_exec_tb();
+
+        g_mutex_lock(&data_lock);
+        tmpl = find_template(pre_pc);
+        g_mutex_unlock(&data_lock);
+
+        if (!tmpl) {
+            WPBBEntry fault_wp = {
+                .template_id = UINT32_MAX,
+                .start_pc = pre_pc,
+                .dyn_params = g_array_new(false, false, sizeof(DynParam)),
+                .n_insns_executed = 0,
+                .exception = false,
+                .translation_unavailable = true,
+                .exception_id = GEN_EXC_NONE,
+                .exception_reg_id = REG_NONE,
+                .has_exception_reg = false,
+                .poison_mask = NULL,
+            };
+            g_array_append_val(wp_chain, fault_wp);
+            early_exit = true;
+            break;
+        }
+
+        if (!tb_ok) {
+            uint64_t recovery_pc = qemu_plugin_get_pc();
+
+            if (pre_pc == last_fault_pc) {
+                repeated_fault_pc++;
+            } else {
+                repeated_fault_pc = 0;
+                last_fault_pc = pre_pc;
+            }
+
+            WPBBEntry fault_wp = {
+                .template_id = tmpl->template_id,
+                .start_pc = pre_pc,
+                .dyn_params = g_array_new(false, false, sizeof(DynParam)),
+                .n_insns_executed = tmpl->n_insns,
+                .exception = true,
+                .translation_unavailable = false,
+                .exception_id = infer_generic_exception_id(tmpl),
+                .exception_reg_id = choose_exception_reg_id(tmpl),
+                .has_exception_reg = false,
+                .poison_mask = NULL,
+            };
+
+            fault_wp.has_exception_reg = (fault_wp.exception_reg_id != REG_NONE);
+
+            /* Collect memory access dynamic params for this faulting WP BB. */
+            for (guint m = mem_start_idx; m < wp_mem_accesses->len; m++) {
+                WPMemAccess *acc = &g_array_index(wp_mem_accesses,
+                                                  WPMemAccess, m);
+                DynParam dp = {
+                    .type = acc->is_store ? DYN_STORE_ADDR : DYN_LOAD_ADDR,
+                    .value = acc->mem_vaddr,
+                };
+                g_array_append_val(fault_wp.dyn_params, dp);
+                stat_wp_total_mem_accesses++;
+            }
+
+            g_array_append_val(wp_chain, fault_wp);
+            sim_insns += tmpl->n_insns;
+            recovery_pc = tmpl->fall_through_pc;
+
+            if (fault_wp.has_exception_reg) {
+                poisoned_regs[fault_wp.exception_reg_id] = true;
+                poison_active = true;
+            }
+            wp_poison_target(poisoned_targets, pre_pc);
+            repeated_fault_pc = 0;
+            last_fault_pc = UINT64_MAX;
+
+            if (sim_insns < (uint64_t)max_wrong_path_depth) {
+                if (repeated_fault_pc >= 16) {
+                    early_exit = true;
+                    break;
+                }
+                if (wp_target_is_poisoned(poisoned_targets, recovery_pc)) {
+                    early_exit = true;
+                    break;
+                }
+                /* Re-arm speculative mode and continue past the faulting TB. */
+                qemu_plugin_spec_mode_end();
+                qemu_plugin_cpu_state_restore(saved_state);
+                qemu_plugin_spec_mode_begin(saved_state);
+                qemu_plugin_set_pc(recovery_pc);
+                continue;
+            }
+
             early_exit = true;
             break;
         }
 
         uint64_t post_pc = qemu_plugin_get_pc();
-
-        /*
-         * Look up the template for this TB.  vcpu_tb_trans fires during
-         * tb_gen_code inside qemu_plugin_exec_tb, creating the template.
-         */
-        g_mutex_lock(&data_lock);
-        BBTemplate *tmpl = find_template(pre_pc);
-        g_mutex_unlock(&data_lock);
-
-        if (!tmpl) {
-            early_exit = true;
-            break;
-        }
+        repeated_fault_pc = 0;
+        last_fault_pc = UINT64_MAX;
 
         sim_insns += tmpl->n_insns;
 
@@ -2879,6 +3215,11 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         wp_bb.template_id = tmpl->template_id;
         wp_bb.n_insns_executed = tmpl->n_insns;
         wp_bb.exception = false;
+        wp_bb.translation_unavailable = false;
+        wp_bb.exception_id = GEN_EXC_NONE;
+        wp_bb.exception_reg_id = REG_NONE;
+        wp_bb.has_exception_reg = false;
+        wp_bb.poison_mask = NULL;
         wp_bb.dyn_params = g_array_new(false, false, sizeof(DynParam));
 
         /* Collect memory access dynamic params for this WP BB */
@@ -2898,10 +3239,11 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
          * Conditional branches: predict not-taken (fall-through).
          * Unconditional/call/return: follow natural execution (post_pc).
          */
-        uint8_t last_br = tmpl->insn_fields[tmpl->n_insns - 1].branch_type;
+        InsnFields *last_fld = &tmpl->insn_fields[tmpl->n_insns - 1];
+        uint8_t last_br = last_fld->branch_type;
         uint64_t chosen_target;
 
-        if (last_br == BRANCH_COND_DIRECT) {
+        if (last_br != BRANCH_NONE && last_fld->branch_conditional) {
             chosen_target = tmpl->fall_through_pc;
         } else {
             chosen_target = post_pc;
@@ -2909,18 +3251,51 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
 
         g_array_append_val(wp_chain, wp_bb);
 
+        if (wp_target_is_poisoned(poisoned_targets, chosen_target)) {
+            early_exit = true;
+            break;
+        }
+
         /* Redirect PC if prediction differs from natural execution */
         if (chosen_target != post_pc) {
             qemu_plugin_set_pc(chosen_target);
         }
+
+        if (poison_active) {
+            bool branch_dependent = false;
+
+            for (uint32_t insn = 0; insn < tmpl->n_insns; insn++) {
+                const InsnFields *fld = &tmpl->insn_fields[insn];
+                bool dependent = false;
+
+                for (uint8_t s = 0; s < fld->n_src_regs; s++) {
+                    uint8_t reg_id = fld->src_regs[s];
+                    if (reg_id != REG_NONE && poisoned_regs[reg_id]) {
+                        dependent = true;
+                        break;
+                    }
+                }
+
+                if (dependent) {
+                    for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
+                        uint8_t reg_id = fld->dst_regs[d];
+                        if (reg_id != REG_NONE) {
+                            poisoned_regs[reg_id] = true;
+                        }
+                    }
+                    if (insn == tmpl->n_insns - 1 && fld->branch_type != BRANCH_NONE) {
+                        branch_dependent = true;
+                    }
+                }
+            }
+
+            if (branch_dependent) {
+                wp_poison_target(poisoned_targets, chosen_target);
+            }
+        }
     }
 
-    /* Mark the last BB as exception if we exited early */
-    if (early_exit && wp_chain->len > 0) {
-        WPBBEntry *last = &g_array_index(wp_chain, WPBBEntry,
-                                          wp_chain->len - 1);
-        last->exception = true;
-    }
+    annotate_wp_dependency_masks(wp_chain);
 
     /* Stop wrong-path collection */
     wp_in_progress = false;
@@ -2938,6 +3313,7 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     /* Clean up */
     g_array_unref(wp_mem_accesses);
     wp_mem_accesses = NULL;
+    g_array_unref(poisoned_targets);
 
     /* Update statistics */
     stat_wp_simulations++;
@@ -2962,6 +3338,40 @@ static void write_text_header(FILE *f)
     GHashTableIter iter;
     gpointer value;
 
+    fprintf(f, "ENUMS\n-----\n");
+    fprintf(f, "OPCODES %u\n", GEN_OP_COUNT);
+    for (uint32_t i = 0; i < GEN_OP_COUNT; i++) {
+        fprintf(f, "O %u %s\n", i, generic_opcode_name(i));
+    }
+    fprintf(f, "BRANCHES %u\n", BRANCH_TYPE_COUNT);
+    for (uint32_t i = 0; i < BRANCH_TYPE_COUNT; i++) {
+        fprintf(f, "B %u %s\n", i, branch_type_name(i));
+    }
+    fprintf(f, "EXCEPTIONS %u\n", GEN_EXC_COUNT);
+    for (uint32_t i = 0; i < GEN_EXC_COUNT; i++) {
+        fprintf(f, "E %u %s\n", i, generic_exception_name(i));
+    }
+    fprintf(f, "REGS 198\n");
+    fprintf(f, "R %u %s\n", REG_NONE, generic_reg_name(REG_NONE));
+    for (uint32_t i = 0; i < 64; i++) {
+        uint8_t rid = REG_GPR0 + i;
+        fprintf(f, "R %u %s\n", rid, generic_reg_name(rid));
+    }
+    for (uint32_t i = 0; i < 64; i++) {
+        uint8_t rid = REG_FPR0 + i;
+        fprintf(f, "R %u %s\n", rid, generic_reg_name(rid));
+    }
+    for (uint32_t i = 0; i < 64; i++) {
+        uint8_t rid = REG_VEC0 + i;
+        fprintf(f, "R %u %s\n", rid, generic_reg_name(rid));
+    }
+    fprintf(f, "R %u %s\n", REG_SP, generic_reg_name(REG_SP));
+    fprintf(f, "R %u %s\n", REG_FLAGS, generic_reg_name(REG_FLAGS));
+    fprintf(f, "R %u %s\n", REG_IP, generic_reg_name(REG_IP));
+    fprintf(f, "R %u %s\n", REG_LR, generic_reg_name(REG_LR));
+    fprintf(f, "R %u %s\n", REG_FP_REG, generic_reg_name(REG_FP_REG));
+    fprintf(f, "\n");
+
     fprintf(f, "HEADER\n------\n");
 
     g_hash_table_iter_init(&iter, template_map);
@@ -2971,6 +3381,9 @@ static void write_text_header(FILE *f)
                 ", fall_through=0x%" PRIx64 "]\n",
                 tmpl->template_id, tmpl->start_pc,
                 tmpl->n_insns, tmpl->fall_through_pc);
+        if (tmpl->symbol_name) {
+            fprintf(f, "  symbol=%s\n", tmpl->symbol_name);
+        }
 
         for (uint32_t i = 0; i < tmpl->n_insns; i++) {
             InsnFields *fld = &tmpl->insn_fields[i];
@@ -2979,6 +3392,7 @@ static void write_text_header(FILE *f)
 
             if (fld->branch_type != BRANCH_NONE) {
                 fprintf(f, " br=%s", branch_type_name(fld->branch_type));
+                fprintf(f, " cond=%u", fld->branch_conditional ? 1 : 0);
             }
 
             fprintf(f, " src=[");
@@ -2995,6 +3409,11 @@ static void write_text_header(FILE *f)
 
             if (fld->has_immediate) {
                 fprintf(f, " imm=%" PRId64, fld->immediate);
+            }
+            fprintf(f, " bytes=");
+            for (uint8_t b = 0; b < tmpl->insn_sizes[i]; b++) {
+                fprintf(f, "%02x",
+                        tmpl->insn_bytes[(size_t)i * MAX_INSN_BYTES + b]);
             }
             fprintf(f, "\n");
         }
@@ -3067,6 +3486,21 @@ static void write_text_body(FILE *f, GArray *body_entries)
                 }
                 if (wp->exception) {
                     fprintf(f, " EXCEPTION");
+                    fprintf(f, " exid=%s",
+                            generic_exception_name(wp->exception_id));
+                    if (wp->has_exception_reg) {
+                        fprintf(f, " exreg=%s",
+                                generic_reg_name(wp->exception_reg_id));
+                    }
+                }
+                if (wp->translation_unavailable) {
+                    fprintf(f, " TRANSLATION_UNAVAILABLE");
+                }
+                if (wp->poison_mask && wp->poison_mask->len > 0) {
+                    fprintf(f, " poison=");
+                    for (guint p = 0; p < wp->poison_mask->len; p++) {
+                        fprintf(f, "%u", wp->poison_mask->data[p] ? 1 : 0);
+                    }
                 }
                 fprintf(f, " n_insns=%" PRIu32, wp->n_insns_executed);
                 fprintf(f, "]");
@@ -3163,28 +3597,107 @@ static void bw_write_sleb128(BitWriter *bw, int64_t v)
     }
 }
 
+static void bw_write_bytes(BitWriter *bw, const uint8_t *buf, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        bw_write_bits(bw, buf[i], 8);
+    }
+}
+
+static void bw_write_string(BitWriter *bw, const char *s)
+{
+    size_t len = s ? strlen(s) : 0;
+
+    bw_write_uleb128(bw, len);
+    if (len) {
+        bw_write_bytes(bw, (const uint8_t *)s, len);
+    }
+}
+
+static void write_bin_enum_name_tables(BitWriter *bw)
+{
+    /* Opcode names */
+    bw_write_uleb128(bw, GEN_OP_COUNT);
+    for (uint32_t i = 0; i < GEN_OP_COUNT; i++) {
+        bw_write_uleb128(bw, i);
+        bw_write_string(bw, generic_opcode_name(i));
+    }
+
+    /* Branch names */
+    bw_write_uleb128(bw, BRANCH_TYPE_COUNT);
+    for (uint32_t i = 0; i < BRANCH_TYPE_COUNT; i++) {
+        bw_write_uleb128(bw, i);
+        bw_write_string(bw, branch_type_name(i));
+    }
+
+    /* Exception names */
+    bw_write_uleb128(bw, GEN_EXC_COUNT);
+    for (uint32_t i = 0; i < GEN_EXC_COUNT; i++) {
+        bw_write_uleb128(bw, i);
+        bw_write_string(bw, generic_exception_name(i));
+    }
+
+    /* Register names */
+    bw_write_uleb128(bw, 198);
+    bw_write_uleb128(bw, REG_NONE);
+    bw_write_string(bw, generic_reg_name(REG_NONE));
+    for (uint32_t i = 0; i < 64; i++) {
+        uint8_t rid = REG_GPR0 + i;
+        bw_write_uleb128(bw, rid);
+        bw_write_string(bw, generic_reg_name(rid));
+    }
+    for (uint32_t i = 0; i < 64; i++) {
+        uint8_t rid = REG_FPR0 + i;
+        bw_write_uleb128(bw, rid);
+        bw_write_string(bw, generic_reg_name(rid));
+    }
+    for (uint32_t i = 0; i < 64; i++) {
+        uint8_t rid = REG_VEC0 + i;
+        bw_write_uleb128(bw, rid);
+        bw_write_string(bw, generic_reg_name(rid));
+    }
+    bw_write_uleb128(bw, REG_SP);
+    bw_write_string(bw, generic_reg_name(REG_SP));
+    bw_write_uleb128(bw, REG_FLAGS);
+    bw_write_string(bw, generic_reg_name(REG_FLAGS));
+    bw_write_uleb128(bw, REG_IP);
+    bw_write_string(bw, generic_reg_name(REG_IP));
+    bw_write_uleb128(bw, REG_LR);
+    bw_write_string(bw, generic_reg_name(REG_LR));
+    bw_write_uleb128(bw, REG_FP_REG);
+    bw_write_string(bw, generic_reg_name(REG_FP_REG));
+}
+
 /*
- * Write the header section in packed binary format (v6 bit-packed).
+ * Write the header section in packed binary format (v12 bit-packed).
  *
  * Binary header layout:
  *   magic:            32 bits
  *   isa:              3 bits (TraceISA)
+ *   opcode_names:     id->string table
+ *   branch_names:     id->string table
+ *   exception_names:  id->string table
+ *   register_names:   id->string table
  *   num_templates:    ULEB128
  *   For each template:
  *     template_id:      ULEB128
  *     start_pc:         ULEB128
  *     num_insns:        ULEB128
  *     fall_through_pc:  ULEB128
+ *     symbol_name:      length-prefixed UTF-8 string
  *     For each instruction:
  *       pc:             ULEB128
- *       opcode:         6 bits (GenericOpcode)
- *       branch_type:    3 bits (BranchType)
+ *       opcode:         8 bits (GenericOpcode)
+ *       branch_type:    8 bits (BranchType)
+ *       branch_cond:    1 bit
  *       n_src:          3 bits
  *       n_dst:          3 bits
  *       src_regs:       [n_src bytes] (GenericRegId)
  *       dst_regs:       [n_dst bytes] (GenericRegId)
  *       has_imm:        1 bit
  *       imm:            SLEB128 (only if has_imm == 1)
+ *       raw_size:       ULEB128
+ *       raw_bytes:      raw_size bytes
  */
 static void write_bin_header(BitWriter *bw)
 {
@@ -3193,6 +3706,7 @@ static void write_bin_header(BitWriter *bw)
 
     bw_write_bits(bw, WPT_MAGIC, 32);
     bw_write_bits(bw, (uint8_t)trace_isa, WPT_ISA_BITS);
+    write_bin_enum_name_tables(bw);
     bw_write_uleb128(bw, g_hash_table_size(template_map));
 
     g_hash_table_iter_init(&iter, template_map);
@@ -3202,6 +3716,7 @@ static void write_bin_header(BitWriter *bw)
         bw_write_uleb128(bw, tmpl->start_pc);
         bw_write_uleb128(bw, tmpl->n_insns);
         bw_write_uleb128(bw, tmpl->fall_through_pc);
+        bw_write_string(bw, tmpl->symbol_name);
 
         for (uint32_t i = 0; i < tmpl->n_insns; i++) {
             InsnFields *fld = &tmpl->insn_fields[i];
@@ -3210,6 +3725,7 @@ static void write_bin_header(BitWriter *bw)
             bw_write_uleb128(bw, tmpl->insn_pcs[i]);
             bw_write_bits(bw, fld->opcode, WPT_OPCODE_BITS);
             bw_write_bits(bw, fld->branch_type, WPT_BRANCH_BITS);
+            bw_write_bits(bw, fld->branch_conditional ? 1 : 0, 1);
             bw_write_bits(bw, fld->n_src_regs, WPT_REG_COUNT_BITS);
             bw_write_bits(bw, fld->n_dst_regs, WPT_REG_COUNT_BITS);
             bw_write_bits(bw, fld->has_immediate ? 1 : 0, 1);
@@ -3223,6 +3739,10 @@ static void write_bin_header(BitWriter *bw)
             if (fld->has_immediate) {
                 bw_write_sleb128(bw, fld->immediate);
             }
+            bw_write_uleb128(bw, tmpl->insn_sizes[i]);
+            bw_write_bytes(bw,
+                           &tmpl->insn_bytes[(size_t)i * MAX_INSN_BYTES],
+                           tmpl->insn_sizes[i]);
         }
     }
 }
@@ -3335,7 +3855,7 @@ static void write_dyn_param_patch(BitWriter *bw,
 }
 
 /*
- * Write the body section in packed binary format (v10 bit-packed).
+ * Write the body section in packed binary format (v12 bit-packed).
  *
  * Binary body layout:
  *   num_entries:      ULEB128
@@ -3355,6 +3875,12 @@ static void write_dyn_param_patch(BitWriter *bw,
  *       dyn_unchanged:  1 bit (vs last instance of this wp template_id)
  *       [if dyn_unchanged==0] (payload same as correct-path format above)
  *       exception:      1 bit
+ *       translation_unavailable: 1 bit
+ *       exid:           8 bits (GenericExceptionId, if exception==1)
+ *       has_exreg:      1 bit (if exception==1)
+ *       exreg:          8 bits (if has_exreg==1)
+ *       poison_len:     ULEB128
+ *       poison_mask:    poison_len bytes (0 or 1 per insn)
  */
 static void write_bin_body(BitWriter *bw, GArray *body_entries)
 {
@@ -3434,6 +3960,21 @@ static void write_bin_body(BitWriter *bw, GArray *body_entries)
                 }
             }
             bw_write_bits(bw, wp->exception ? 1 : 0, 1);
+            bw_write_bits(bw, wp->translation_unavailable ? 1 : 0, 1);
+            if (wp->exception) {
+                bw_write_bits(bw, wp->exception_id, 8);
+                bw_write_bits(bw, wp->has_exception_reg ? 1 : 0, 1);
+                if (wp->has_exception_reg) {
+                    bw_write_bits(bw, wp->exception_reg_id, WPT_REG_BITS);
+                }
+            }
+            if (wp->poison_mask && wp->poison_mask->len > 0) {
+                bw_write_uleb128(bw, wp->poison_mask->len);
+                bw_write_bytes(bw, wp->poison_mask->data,
+                               wp->poison_mask->len);
+            } else {
+                bw_write_uleb128(bw, 0);
+            }
         }
     }
 
@@ -3770,6 +4311,9 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         wrong_target = prev_ft;
     } else if (br->has_taken_target) {
         wrong_target = br->taken_target;
+    } else {
+        /* Always explore a speculative path when wrong-path tracing is enabled. */
+        wrong_target = prev_ft;
     }
 
     /* Find template for correct-path BB */
@@ -3835,6 +4379,9 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     /* Collect instruction data for BB template */
     uint64_t *insn_pcs = g_new0(uint64_t, n_insns);
     char **insn_disas_arr = g_new0(char *, n_insns);
+    uint8_t *insn_sizes = g_new0(uint8_t, n_insns);
+    uint8_t *insn_bytes = g_new0(uint8_t, n_insns * MAX_INSN_BYTES);
+    const char *symbol_name = qemu_plugin_insn_symbol(first_insn);
 
     for (size_t i = 0; i < n_insns; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
@@ -3842,6 +4389,10 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
         /* Get disassembly string from QEMU's internal disassembler */
         insn_disas_arr[i] = qemu_plugin_insn_disas(insn);
+        insn_sizes[i] = (uint8_t)MIN(qemu_plugin_insn_size(insn), MAX_INSN_BYTES);
+        qemu_plugin_insn_data(insn,
+                      &insn_bytes[i * MAX_INSN_BYTES],
+                      insn_sizes[i]);
 
         /* Register per-instruction memory callback with PC as udata */
         qemu_plugin_register_vcpu_mem_cb(
@@ -3852,7 +4403,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     /* Create or update BB template */
     g_mutex_lock(&data_lock);
     get_or_create_template(pc, (uint32_t)n_insns, insn_pcs,
-                           insn_disas_arr, fall_through);
+                           insn_disas_arr, insn_sizes, insn_bytes,
+                           symbol_name, fall_through);
     g_mutex_unlock(&data_lock);
 
     /* Free temporary arrays (template made copies) */
@@ -3861,6 +4413,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     }
     g_free(insn_pcs);
     g_free(insn_disas_arr);
+    g_free(insn_sizes);
+    g_free(insn_bytes);
 
     /*
      * Instrument the block for execution tracking.

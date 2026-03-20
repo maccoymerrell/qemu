@@ -272,6 +272,32 @@ typedef struct {
     int64_t immediate;
 } InsnFields;
 
+static inline void add_src_reg(InsnFields *out, uint8_t reg)
+{
+    if (reg == REG_NONE || out->n_src_regs >= MAX_SRC_REGS) {
+        return;
+    }
+    for (uint8_t i = 0; i < out->n_src_regs; i++) {
+        if (out->src_regs[i] == reg) {
+            return;
+        }
+    }
+    out->src_regs[out->n_src_regs++] = reg;
+}
+
+static inline void add_dst_reg(InsnFields *out, uint8_t reg)
+{
+    if (reg == REG_NONE || out->n_dst_regs >= MAX_DST_REGS) {
+        return;
+    }
+    for (uint8_t i = 0; i < out->n_dst_regs; i++) {
+        if (out->dst_regs[i] == reg) {
+            return;
+        }
+    }
+    out->dst_regs[out->n_dst_regs++] = reg;
+}
+
 /* ========================= Disassembly-Based Generic Decode ========================= */
 
 /*
@@ -283,6 +309,34 @@ typedef struct {
     uint8_t reg_id;
 } RegEntry;
 
+typedef struct {
+    const char *name;
+    uint8_t opcode;
+    uint8_t branch_type;
+    bool branch_conditional;
+} MnemonicEntry;
+
+enum PluginOptId {
+    OPT_DEPTH = 1,
+    OPT_OUTFILE,
+    OPT_DEBUG,
+    OPT_WP,
+    OPT_START,
+    OPT_STOP,
+    OPT_PROGRAM,
+    OPT_SPFILE,
+    OPT_SPINTERVAL,
+};
+
+static GHashTable *x86_reg_ht;
+static GHashTable *aarch64_reg_ht;
+static GHashTable *riscv_reg_ht;
+static GHashTable *mips_reg_ht;
+static GHashTable *mnemonic_ht;
+static GHashTable *prefix_ht;
+static GHashTable *insn_prefix_ht;
+static GHashTable *option_ht;
+
 /*
  * x86 register name table: maps all 64/32/16/8-bit GPR variants
  * and special registers to GenericRegId for hash table initialization.
@@ -290,6 +344,168 @@ typedef struct {
 
 /* Static data tables (register and mnemonic mappings) */
 #include "wptrace_data.inc"
+
+#define REG_HASH_BIAS 1
+
+static GHashTable *build_reg_hash_table(const RegEntry *entries)
+{
+    GHashTable *ht = g_hash_table_new(g_str_hash, g_str_equal);
+
+    for (int i = 0; entries[i].name; i++) {
+        g_hash_table_insert(ht, (gpointer)entries[i].name,
+                            GINT_TO_POINTER((int)entries[i].reg_id +
+                                            REG_HASH_BIAS));
+    }
+    return ht;
+}
+
+static uint8_t reg_hash_lookup(GHashTable *ht, const char *name)
+{
+    gpointer val;
+
+    if (!name || !*name) {
+        return REG_NONE;
+    }
+
+    val = g_hash_table_lookup(ht, name);
+    if (!val) {
+        return REG_NONE;
+    }
+
+    return (uint8_t)(GPOINTER_TO_INT(val) - REG_HASH_BIAS);
+}
+
+static uint8_t parse_x86_reg(const char *name)
+{
+    if (!name || !*name) {
+        return REG_NONE;
+    }
+
+    return reg_hash_lookup(x86_reg_ht, name);
+}
+
+static uint8_t parse_aarch64_reg(const char *name)
+{
+    uint8_t reg = reg_hash_lookup(aarch64_reg_ht, name);
+    char kind;
+    char *endp = NULL;
+    unsigned long idx;
+
+    if (reg != REG_NONE) {
+        return reg;
+    }
+    if (!name || !name[0]) {
+        return REG_NONE;
+    }
+
+    kind = name[0];
+    if (!(kind == 'x' || kind == 'w' || kind == 'v' || kind == 'q' ||
+          kind == 's' || kind == 'd')) {
+        return REG_NONE;
+    }
+
+    idx = strtoul(name + 1, &endp, 10);
+    if (!endp || *endp != '\0' || idx >= 32) {
+        return REG_NONE;
+    }
+
+    if (kind == 'x' || kind == 'w') {
+        return (uint8_t)(REG_GPR0 + idx);
+    }
+    if (kind == 's' || kind == 'd') {
+        return (uint8_t)(REG_FPR0 + idx);
+    }
+    return (uint8_t)(REG_VEC0 + idx);
+}
+
+static uint8_t parse_riscv_reg(const char *name)
+{
+    uint8_t reg = reg_hash_lookup(riscv_reg_ht, name);
+    char kind;
+    char *endp = NULL;
+    unsigned long idx;
+
+    if (reg != REG_NONE) {
+        return reg;
+    }
+    if (!name || !name[0]) {
+        return REG_NONE;
+    }
+
+    kind = name[0];
+    if (!(kind == 'x' || kind == 'f' || kind == 'v')) {
+        return REG_NONE;
+    }
+
+    idx = strtoul(name + 1, &endp, 10);
+    if (!endp || *endp != '\0' || idx >= 32) {
+        return REG_NONE;
+    }
+
+    if (kind == 'x') {
+        if (idx == 0) {
+            return REG_NONE;
+        }
+        if (idx == 1) {
+            return REG_LR;
+        }
+        if (idx == 2) {
+            return REG_SP;
+        }
+        if (idx == 8) {
+            return REG_FP_REG;
+        }
+        return (uint8_t)(REG_GPR0 + idx);
+    }
+    if (kind == 'f') {
+        return (uint8_t)(REG_FPR0 + idx);
+    }
+    return (uint8_t)(REG_VEC0 + idx);
+}
+
+static uint8_t parse_mips_reg(const char *name)
+{
+    uint8_t reg;
+    char *endp = NULL;
+    unsigned long idx;
+
+    if (!name || !name[0]) {
+        return REG_NONE;
+    }
+
+    if (name[0] == '$') {
+        name++;
+    }
+
+    reg = reg_hash_lookup(mips_reg_ht, name);
+    if (reg != REG_NONE) {
+        return reg;
+    }
+
+    if (name[0] == 'r' || (name[0] >= '0' && name[0] <= '9')) {
+        const char *digits = (name[0] == 'r') ? name + 1 : name;
+
+        idx = strtoul(digits, &endp, 10);
+        if (!endp || *endp != '\0' || idx >= 32) {
+            return REG_NONE;
+        }
+        if (idx == 0) {
+            return REG_NONE;
+        }
+        if (idx == 29) {
+            return REG_SP;
+        }
+        if (idx == 30) {
+            return REG_FP_REG;
+        }
+        if (idx == 31) {
+            return REG_LR;
+        }
+        return (uint8_t)(REG_GPR0 + (idx - 1));
+    }
+
+    return REG_NONE;
+}
 
 
 /*

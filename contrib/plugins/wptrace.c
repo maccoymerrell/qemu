@@ -288,7 +288,7 @@ typedef struct {
     const char *name;
     uint8_t opcode;
     uint8_t branch_type;
-    bool branch_conditional;
+    bool branch_conditional; /* defaults to false when omitted in table rows */
 } MnemonicEntry;
 
 #include "wptrace_tables.inc"

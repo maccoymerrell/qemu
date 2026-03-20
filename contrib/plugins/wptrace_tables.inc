@@ -163,7 +163,6 @@ static const MnemonicEntry mnemonic_table[] = {
     {"comiss",   GEN_OP_FP_CMP,   BRANCH_NONE},
     {"comisd",   GEN_OP_FP_CMP,   BRANCH_NONE},
     /* x87 FP */
-    {"fld",      GEN_OP_FP_MOV,   BRANCH_NONE},
     {"fld1",     GEN_OP_FP_MOV,   BRANCH_NONE},
     {"fldz",     GEN_OP_FP_MOV,   BRANCH_NONE},
     {"fldcw",    GEN_OP_FP_MOV,   BRANCH_NONE},

@@ -657,6 +657,96 @@ static void extract_aarch64_mem_regs(const char *op, InsnFields *out)
         }
     }
 }
+/* ========================= Unified Operand Parsing Macros ========================= */
+
+/*
+ * These macros eliminate duplication across ISA-specific operand parsers by
+ * providing common patterns for register extraction and classification.
+ */
+
+/* Common pattern: dst = op(src, src) for ALU/FP/VEC operations */
+#define PARSE_ALU_DSTS(n_ops, ops, extract_fn) \
+    do { \
+        if (n_ops >= 1) { \
+            uint8_t dst = extract_fn(ops[0]); \
+            if (dst != REG_NONE) add_dst_reg(out, dst); \
+        } \
+        for (int i = 1; i < n_ops; i++) { \
+            uint8_t src = extract_fn(ops[i]); \
+            if (src != REG_NONE) add_src_reg(out, src); \
+        } \
+    } while(0)
+
+#define PARSE_MOV_OPS(n_ops, ops, extract_fn) PARSE_ALU_DSTS(n_ops, ops, extract_fn)
+#define PARSE_FP_OPS(n_ops, ops, extract_fn) PARSE_ALU_DSTS(n_ops, ops, extract_fn)
+#define PARSE_VEC_OPS(n_ops, ops, extract_fn) PARSE_ALU_DSTS(n_ops, ops, extract_fn)
+
+/* LOAD: dst, [mem] with optional second dst for pair loads */
+#define PARSE_LOAD_OPS(n_ops, ops, extract_fn, extract_mem_fn, support_pair) \
+    do { \
+        if (n_ops >= 1) { \
+            uint8_t dst = extract_fn(ops[0]); \
+            if (dst != REG_NONE) add_dst_reg(out, dst); \
+        } \
+        if (support_pair && n_ops >= 3) { \
+            uint8_t dst2 = extract_fn(ops[1]); \
+            if (dst2 != REG_NONE) add_dst_reg(out, dst2); \
+        } \
+        for (int i = 0; i < n_ops; i++) { \
+            if (is_memory_operand(ops[i])) { \
+                extract_mem_fn(ops[i], out); \
+            } \
+        } \
+    } while(0)
+
+/* STORE: src, [mem] with optional second src for pair stores */
+#define PARSE_STORE_OPS(n_ops, ops, extract_fn, extract_mem_fn, support_pair) \
+    do { \
+        if (n_ops >= 1) { \
+            uint8_t src = extract_fn(ops[0]); \
+            if (src != REG_NONE) add_src_reg(out, src); \
+        } \
+        if (support_pair && n_ops >= 3) { \
+            uint8_t src2 = extract_fn(ops[1]); \
+            if (src2 != REG_NONE) add_src_reg(out, src2); \
+        } \
+        for (int i = 0; i < n_ops; i++) { \
+            if (is_memory_operand(ops[i])) { \
+                extract_mem_fn(ops[i], out); \
+            } \
+        } \
+    } while(0)
+
+/* CMP/TEST: all operands are sources, FLAGS is destination */
+#define PARSE_CMP_OPS(n_ops, ops, extract_fn) \
+    do { \
+        for (int i = 0; i < n_ops; i++) { \
+            uint8_t r = extract_fn(ops[i]); \
+            if (r != REG_NONE) add_src_reg(out, r); \
+        } \
+        add_dst_reg(out, REG_FLAGS); \
+    } while(0)
+
+/* BRANCH: potential register operands as sources */
+#define PARSE_BRANCH_OPS(n_ops, ops, extract_fn) \
+    do { \
+        for (int i = 0; i < n_ops; i++) { \
+            uint8_t r = extract_fn(ops[i]); \
+            if (r != REG_NONE) add_src_reg(out, r); \
+        } \
+    } while(0)
+
+/* CALL: link register as destination, operands as sources */
+#define PARSE_CALL_OPS(n_ops, ops, extract_fn, link_reg) \
+    do { \
+        add_dst_reg(out, link_reg); \
+        for (int i = 0; i < n_ops; i++) { \
+            uint8_t r = extract_fn(ops[i]); \
+            if (r != REG_NONE) add_src_reg(out, r); \
+        } \
+    } while(0)
+
+/* ========================= ISA-Specific Operand Parsers ========================= */
 
 /*
  * Parse x86 AT&T operands and populate source/destination registers.
@@ -666,11 +756,9 @@ static void parse_x86_operands(const char *operands, InsnFields *out)
 {
     char ops[MAX_OPS][MAX_OP_LEN];
     int n_ops = split_operands(operands, ops, MAX_OPS);
+    if (n_ops == 0) return;
 
-    if (n_ops == 0) {
-        return;
-    }
-
+    /* Pre-compute memory operands for x86 AT&T syntax */
     bool op_is_mem[MAX_OPS];
     for (int i = 0; i < n_ops; i++) {
         op_is_mem[i] = is_memory_operand(ops[i]);
@@ -678,20 +766,14 @@ static void parse_x86_operands(const char *operands, InsnFields *out)
 
     /* Adjust opcode for MOV with memory operand */
     if (out->opcode == GEN_OP_MOV && n_ops >= 2) {
-        if (op_is_mem[0]) {
-            out->opcode = GEN_OP_LOAD;
-        } else if (op_is_mem[1]) {
-            out->opcode = GEN_OP_STORE;
-        }
+        if (op_is_mem[0]) out->opcode = GEN_OP_LOAD;
+        else if (op_is_mem[1]) out->opcode = GEN_OP_STORE;
     }
 
     /* Check for indirect branch/call (operand starts with '*') */
-    if (out->branch_type == BRANCH_DIRECT_JUMP ||
-        out->branch_type == BRANCH_DIRECT_CALL) {
+    if (out->branch_type == BRANCH_DIRECT_JUMP || out->branch_type == BRANCH_DIRECT_CALL) {
         const char *t = ops[0];
-        while (*t == ' ' || *t == '\t') {
-            t++;
-        }
+        while (*t == ' ' || *t == '\t') t++;
         if (*t == '*') {
             out->branch_type = (out->branch_type == BRANCH_DIRECT_JUMP) ?
                                BRANCH_INDIRECT_JUMP : BRANCH_INDIRECT_CALL;
@@ -699,20 +781,16 @@ static void parse_x86_operands(const char *operands, InsnFields *out)
     }
 
     switch (out->opcode) {
-    /* Two-operand ALU: src, src+dst; FLAGS is dst */
-    case GEN_OP_INT_ADD: case GEN_OP_INT_SUB: case GEN_OP_AND:
-    case GEN_OP_OR: case GEN_OP_XOR: case GEN_OP_INT_ADC:
-    case GEN_OP_INT_SBB: case GEN_OP_SHL: case GEN_OP_SHR:
-    case GEN_OP_SAR: case GEN_OP_ROL: case GEN_OP_ROR:
+    /* Two-operand ALU: src, src+dst; FLAGS is dst (AT&T syntax) */
+    case GEN_OP_INT_ADD: case GEN_OP_INT_SUB: case GEN_OP_AND: case GEN_OP_OR:
+    case GEN_OP_XOR: case GEN_OP_INT_ADC: case GEN_OP_INT_SBB:
+    case GEN_OP_SHL: case GEN_OP_SHR: case GEN_OP_SAR: case GEN_OP_ROL: case GEN_OP_ROR:
         if (n_ops >= 2) {
             uint8_t src = extract_x86_reg(ops[0]);
             uint8_t dst = extract_x86_reg(ops[1]);
             if (src != REG_NONE) add_src_reg(out, src);
             if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
-            if (dst != REG_NONE) {
-                add_src_reg(out, dst);
-                add_dst_reg(out, dst);
-            }
+            if (dst != REG_NONE) { add_src_reg(out, dst); add_dst_reg(out, dst); }
             if (op_is_mem[1]) extract_x86_mem_regs(ops[1], out);
         } else if (n_ops == 1) {
             uint8_t r = extract_x86_reg(ops[0]);
@@ -723,11 +801,9 @@ static void parse_x86_operands(const char *operands, InsnFields *out)
         break;
 
     /* Data movement: src -> dst */
-    case GEN_OP_MOV: case GEN_OP_MOVSX: case GEN_OP_MOVZX:
-    case GEN_OP_CMOV:
+    case GEN_OP_MOV: case GEN_OP_MOVSX: case GEN_OP_MOVZX: case GEN_OP_CMOV:
         if (n_ops >= 2) {
-            uint8_t src = extract_x86_reg(ops[0]);
-            uint8_t dst = extract_x86_reg(ops[1]);
+            uint8_t src = extract_x86_reg(ops[0]), dst = extract_x86_reg(ops[1]);
             if (src != REG_NONE) add_src_reg(out, src);
             if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
             if (dst != REG_NONE) add_dst_reg(out, dst);
@@ -750,9 +826,7 @@ static void parse_x86_operands(const char *operands, InsnFields *out)
         if (n_ops >= 2) {
             uint8_t src = extract_x86_reg(ops[0]);
             if (src != REG_NONE) add_src_reg(out, src);
-            if (op_is_mem[n_ops - 1]) {
-                extract_x86_mem_regs(ops[n_ops - 1], out);
-            }
+            if (op_is_mem[n_ops - 1]) extract_x86_mem_regs(ops[n_ops - 1], out);
         }
         break;
 
@@ -782,8 +856,7 @@ static void parse_x86_operands(const char *operands, InsnFields *out)
             if (r != REG_NONE) add_src_reg(out, r);
             if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
         }
-        add_src_reg(out, REG_SP);
-        add_dst_reg(out, REG_SP);
+        add_src_reg(out, REG_SP); add_dst_reg(out, REG_SP);
         break;
 
     /* POP: dst + SP */
@@ -792,18 +865,14 @@ static void parse_x86_operands(const char *operands, InsnFields *out)
             uint8_t r = extract_x86_reg(ops[0]);
             if (r != REG_NONE) add_dst_reg(out, r);
         }
-        add_src_reg(out, REG_SP);
-        add_dst_reg(out, REG_SP);
+        add_src_reg(out, REG_SP); add_dst_reg(out, REG_SP);
         break;
 
     /* XCHG: both operands are src+dst */
     case GEN_OP_XCHG:
         for (int i = 0; i < n_ops && i < 2; i++) {
             uint8_t r = extract_x86_reg(ops[i]);
-            if (r != REG_NONE) {
-                add_src_reg(out, r);
-                add_dst_reg(out, r);
-            }
+            if (r != REG_NONE) { add_src_reg(out, r); add_dst_reg(out, r); }
             if (op_is_mem[i]) extract_x86_mem_regs(ops[i], out);
         }
         break;
@@ -812,10 +881,7 @@ static void parse_x86_operands(const char *operands, InsnFields *out)
     case GEN_OP_NOT: case GEN_OP_NEG: case GEN_OP_INC: case GEN_OP_DEC:
         if (n_ops >= 1) {
             uint8_t r = extract_x86_reg(ops[0]);
-            if (r != REG_NONE) {
-                add_src_reg(out, r);
-                add_dst_reg(out, r);
-            }
+            if (r != REG_NONE) { add_src_reg(out, r); add_dst_reg(out, r); }
             if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
         }
         if (out->opcode != GEN_OP_NOT) add_dst_reg(out, REG_FLAGS);
@@ -823,44 +889,34 @@ static void parse_x86_operands(const char *operands, InsnFields *out)
 
     /* CALL: may have indirect operand */
     case GEN_OP_CALL:
-    {
         if (n_ops >= 1) {
             const char *t = ops[0];
             while (*t == ' ' || *t == '\t') t++;
             if (*t == '*') {
-                if (op_is_mem[0]) {
-                    extract_x86_mem_regs(ops[0], out);
-                } else {
+                if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
+                else {
                     uint8_t r = extract_x86_reg(ops[0]);
                     if (r != REG_NONE) add_src_reg(out, r);
                 }
             }
         }
-        add_src_reg(out, REG_SP);
-        add_dst_reg(out, REG_SP);
-        add_dst_reg(out, REG_IP);
+        add_src_reg(out, REG_SP); add_dst_reg(out, REG_SP); add_dst_reg(out, REG_IP);
         break;
-    }
 
     /* RET */
     case GEN_OP_RET:
-        add_src_reg(out, REG_SP);
-        add_dst_reg(out, REG_SP);
-        add_dst_reg(out, REG_IP);
+        add_src_reg(out, REG_SP); add_dst_reg(out, REG_SP); add_dst_reg(out, REG_IP);
         break;
 
     /* Branch */
     case GEN_OP_BRANCH:
-        if (out->branch_conditional) {
-            add_src_reg(out, REG_FLAGS);
-        }
+        if (out->branch_conditional) add_src_reg(out, REG_FLAGS);
         if (out->branch_type == BRANCH_INDIRECT_JUMP && n_ops >= 1) {
             const char *t = ops[0];
             while (*t == ' ' || *t == '\t') t++;
             if (*t == '*') {
-                if (op_is_mem[0]) {
-                    extract_x86_mem_regs(ops[0], out);
-                } else {
+                if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
+                else {
                     uint8_t r = extract_x86_reg(ops[0]);
                     if (r != REG_NONE) add_src_reg(out, r);
                 }
@@ -883,23 +939,20 @@ static void parse_x86_operands(const char *operands, InsnFields *out)
             uint8_t r = extract_x86_reg(ops[0]);
             if (r != REG_NONE) add_src_reg(out, r);
             if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
-            add_dst_reg(out, REG_GPR0);
-            add_dst_reg(out, REG_GPR2);
+            add_dst_reg(out, REG_GPR0); add_dst_reg(out, REG_GPR2);
         }
         add_dst_reg(out, REG_FLAGS);
         break;
 
     /* DIV/IDIV */
     case GEN_OP_INT_DIV:
-        add_src_reg(out, REG_GPR0);
-        add_src_reg(out, REG_GPR2);
+        add_src_reg(out, REG_GPR0); add_src_reg(out, REG_GPR2);
         if (n_ops >= 1) {
             uint8_t r = extract_x86_reg(ops[0]);
             if (r != REG_NONE) add_src_reg(out, r);
             if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
         }
-        add_dst_reg(out, REG_GPR0);
-        add_dst_reg(out, REG_GPR2);
+        add_dst_reg(out, REG_GPR0); add_dst_reg(out, REG_GPR2);
         break;
 
     /* SETCC: FLAGS as src */
@@ -913,33 +966,22 @@ static void parse_x86_operands(const char *operands, InsnFields *out)
         break;
 
     /* FP/Vector: AT&T srcs first, dst last */
-    case GEN_OP_FP_ADD: case GEN_OP_FP_SUB: case GEN_OP_FP_MUL:
-    case GEN_OP_FP_DIV: case GEN_OP_FP_SQRT: case GEN_OP_FP_MOV:
-    case GEN_OP_FP_CVT: case GEN_OP_FP_CMP:
+    case GEN_OP_FP_ADD: case GEN_OP_FP_SUB: case GEN_OP_FP_MUL: case GEN_OP_FP_DIV:
+    case GEN_OP_FP_SQRT: case GEN_OP_FP_MOV: case GEN_OP_FP_CVT: case GEN_OP_FP_CMP:
     case GEN_OP_VEC_ADD: case GEN_OP_VEC_SUB: case GEN_OP_VEC_MUL:
     case GEN_OP_VEC_MOV: case GEN_OP_VEC_SHUF: case GEN_OP_VEC_LOGIC:
         for (int i = 0; i < n_ops; i++) {
             uint8_t r = extract_x86_reg(ops[i]);
             if (r != REG_NONE) {
-                if (i < n_ops - 1) {
-                    add_src_reg(out, r);
-                } else {
-                    /*
-                     * Last operand is the destination. For 2-operand SSE
-                     * it is also an implicit source (e.g. addps %xmm0,%xmm1
-                     * means xmm1 += xmm0). Conservative for 3-operand AVX.
-                     */
-                    add_src_reg(out, r);
-                    add_dst_reg(out, r);
-                }
+                if (i < n_ops - 1) add_src_reg(out, r);
+                else { add_src_reg(out, r); add_dst_reg(out, r); }
             }
             if (op_is_mem[i]) extract_x86_mem_regs(ops[i], out);
         }
         if (out->opcode == GEN_OP_FP_CMP) add_dst_reg(out, REG_FLAGS);
         break;
 
-    default:
-        break;
+    default: break;
     }
 
     /* Extract immediate value from operands */
@@ -962,149 +1004,43 @@ static void parse_aarch64_operands(const char *operands, InsnFields *out)
 {
     char ops[MAX_OPS][MAX_OP_LEN];
     int n_ops = split_operands(operands, ops, MAX_OPS);
-
-    if (n_ops == 0) {
-        return;
-    }
+    if (n_ops == 0) return;
 
     switch (out->opcode) {
-    /* ALU: dst = op(src1, src2) */
     case GEN_OP_INT_ADD: case GEN_OP_INT_SUB: case GEN_OP_INT_MUL:
     case GEN_OP_INT_DIV: case GEN_OP_AND: case GEN_OP_OR:
     case GEN_OP_XOR: case GEN_OP_NOT: case GEN_OP_SHL:
     case GEN_OP_SHR: case GEN_OP_SAR:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_aarch64_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_aarch64_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* MOV: dst, src */
-    case GEN_OP_MOV: case GEN_OP_MOVSX: case GEN_OP_MOVZX:
-    case GEN_OP_CMOV:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_aarch64_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_aarch64_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* LOAD: dst, [base, offset] */
+        PARSE_ALU_DSTS(n_ops, ops, extract_aarch64_reg); break;
+    case GEN_OP_MOV: case GEN_OP_MOVSX: case GEN_OP_MOVZX: case GEN_OP_CMOV:
+        PARSE_MOV_OPS(n_ops, ops, extract_aarch64_reg); break;
     case GEN_OP_LOAD:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_aarch64_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        /* For ldp: second operand is also a dest */
-        if (n_ops >= 3) {
-            uint8_t dst2 = extract_aarch64_reg(ops[1]);
-            if (dst2 != REG_NONE) add_dst_reg(out, dst2);
-        }
-        for (int i = 0; i < n_ops; i++) {
-            if (is_memory_operand(ops[i])) {
-                extract_aarch64_mem_regs(ops[i], out);
-            }
-        }
-        break;
-    }
-
-    /* STORE: src, [base, offset] */
+        PARSE_LOAD_OPS(n_ops, ops, extract_aarch64_reg, extract_aarch64_mem_regs, true); break;
     case GEN_OP_STORE:
-    {
-        if (n_ops >= 1) {
-            uint8_t src = extract_aarch64_reg(ops[0]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        /* For stp: second operand is also a source */
-        if (n_ops >= 3) {
-            uint8_t src2 = extract_aarch64_reg(ops[1]);
-            if (src2 != REG_NONE) add_src_reg(out, src2);
-        }
-        for (int i = 0; i < n_ops; i++) {
-            if (is_memory_operand(ops[i])) {
-                extract_aarch64_mem_regs(ops[i], out);
-            }
-        }
-        break;
-    }
-
-    /* CMP/TST: all operands are sources */
+        PARSE_STORE_OPS(n_ops, ops, extract_aarch64_reg, extract_aarch64_mem_regs, true); break;
     case GEN_OP_CMP: case GEN_OP_TEST:
-        for (int i = 0; i < n_ops; i++) {
-            uint8_t r = extract_aarch64_reg(ops[i]);
-            if (r != REG_NONE) add_src_reg(out, r);
-        }
-        add_dst_reg(out, REG_FLAGS);
-        break;
-
-    /* Branch: operand is src register or target */
+        PARSE_CMP_OPS(n_ops, ops, extract_aarch64_reg); break;
     case GEN_OP_BRANCH:
-        for (int i = 0; i < n_ops; i++) {
-            uint8_t r = extract_aarch64_reg(ops[i]);
-            if (r != REG_NONE) add_src_reg(out, r);
-        }
-        break;
-
-    /* CALL (bl/blr): link register is dst */
+        PARSE_BRANCH_OPS(n_ops, ops, extract_aarch64_reg); break;
     case GEN_OP_CALL:
         if (out->branch_type == BRANCH_INDIRECT_CALL && n_ops >= 1) {
             uint8_t r = extract_aarch64_reg(ops[0]);
             if (r != REG_NONE) add_src_reg(out, r);
         }
-        add_dst_reg(out, REG_LR);
-        break;
-
-    /* RET */
+        add_dst_reg(out, REG_LR); break;
     case GEN_OP_RET:
-        add_src_reg(out, REG_LR);
-        break;
-
-    /* FP/Vector: dst, src1, src2 */
+        add_src_reg(out, REG_LR); break;
     case GEN_OP_FP_ADD: case GEN_OP_FP_SUB: case GEN_OP_FP_MUL:
     case GEN_OP_FP_DIV: case GEN_OP_FP_SQRT: case GEN_OP_FP_MOV:
     case GEN_OP_FP_CVT: case GEN_OP_FP_CMP:
-    {
         if (out->opcode == GEN_OP_FP_CMP) {
-            for (int i = 0; i < n_ops; i++) {
-                uint8_t r = extract_aarch64_reg(ops[i]);
-                if (r != REG_NONE) add_src_reg(out, r);
-            }
-            add_dst_reg(out, REG_FLAGS);
+            PARSE_CMP_OPS(n_ops, ops, extract_aarch64_reg);
         } else {
-            if (n_ops >= 1) {
-                uint8_t dst = extract_aarch64_reg(ops[0]);
-                if (dst != REG_NONE) add_dst_reg(out, dst);
-            }
-            for (int i = 1; i < n_ops; i++) {
-                uint8_t src = extract_aarch64_reg(ops[i]);
-                if (src != REG_NONE) add_src_reg(out, src);
-            }
+            PARSE_FP_OPS(n_ops, ops, extract_aarch64_reg);
         }
         break;
-    }
-
     default:
-        if (n_ops >= 1) {
-            uint8_t dst = extract_aarch64_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_aarch64_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
+        PARSE_ALU_DSTS(n_ops, ops, extract_aarch64_reg); break;
     }
 
     /* Extract immediate value (#N) */
@@ -1185,112 +1121,24 @@ static void parse_riscv_operands(const char *operands, InsnFields *out)
 {
     char ops[MAX_OPS][MAX_OP_LEN];
     int n_ops = split_operands(operands, ops, MAX_OPS);
-
-    if (n_ops == 0) {
-        return;
-    }
+    if (n_ops == 0) return;
 
     switch (out->opcode) {
-    /* ALU: rd, rs1, rs2/imm */
     case GEN_OP_INT_ADD: case GEN_OP_INT_SUB: case GEN_OP_INT_MUL:
     case GEN_OP_INT_DIV: case GEN_OP_AND: case GEN_OP_OR:
     case GEN_OP_XOR: case GEN_OP_SHL: case GEN_OP_SHR:
     case GEN_OP_SAR: case GEN_OP_ROL: case GEN_OP_ROR:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_riscv_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_riscv_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* MOV / LUI / LI / MV: rd, src_or_imm */
     case GEN_OP_MOV: case GEN_OP_MOVSX: case GEN_OP_MOVZX:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_riscv_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_riscv_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* LOAD: rd, offset(rs1) */
+    case GEN_OP_CMP: case GEN_OP_LEA:
+        PARSE_ALU_DSTS(n_ops, ops, extract_riscv_reg); break;
     case GEN_OP_LOAD:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_riscv_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 0; i < n_ops; i++) {
-            if (is_memory_operand(ops[i])) {
-                extract_riscv_mem_regs(ops[i], out);
-            }
-        }
-        break;
-    }
-
-    /* STORE: rs2, offset(rs1) */
+        PARSE_LOAD_OPS(n_ops, ops, extract_riscv_reg, extract_riscv_mem_regs, false); break;
     case GEN_OP_STORE:
-    {
-        if (n_ops >= 1) {
-            uint8_t src = extract_riscv_reg(ops[0]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        for (int i = 0; i < n_ops; i++) {
-            if (is_memory_operand(ops[i])) {
-                extract_riscv_mem_regs(ops[i], out);
-            }
-        }
-        break;
-    }
-
-    /* CMP (slt/slti/sltu/sltiu): rd, rs1, rs2/imm */
-    case GEN_OP_CMP:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_riscv_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_riscv_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* LEA (auipc): rd, imm */
-    case GEN_OP_LEA:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_riscv_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        break;
-    }
-
-    /* Branch: rs1, rs2, target */
+        PARSE_STORE_OPS(n_ops, ops, extract_riscv_reg, extract_riscv_mem_regs, false); break;
     case GEN_OP_BRANCH:
-    {
-        for (int i = 0; i < n_ops; i++) {
-            uint8_t r = extract_riscv_reg(ops[i]);
-            if (r != REG_NONE) add_src_reg(out, r);
-        }
-        break;
-    }
-
-    /* CALL (jal/jalr): link reg is implicit ra or specified */
+        PARSE_BRANCH_OPS(n_ops, ops, extract_riscv_reg); break;
     case GEN_OP_CALL:
-    {
         if (out->branch_type == BRANCH_INDIRECT_CALL && n_ops >= 1) {
-            /* jalr rs1 or jalr rd, offset(rs1) */
             for (int i = 0; i < n_ops; i++) {
                 if (is_memory_operand(ops[i])) {
                     extract_riscv_mem_regs(ops[i], out);
@@ -1300,57 +1148,22 @@ static void parse_riscv_operands(const char *operands, InsnFields *out)
                 }
             }
         }
-        add_dst_reg(out, REG_LR);
-        break;
-    }
-
-    /* RET */
+        add_dst_reg(out, REG_LR); break;
     case GEN_OP_RET:
-        add_src_reg(out, REG_LR);
-        break;
-
-    /* FP: rd, rs1, rs2 (RISC-V: dest first like integer) */
+        add_src_reg(out, REG_LR); break;
     case GEN_OP_FP_ADD: case GEN_OP_FP_SUB: case GEN_OP_FP_MUL:
     case GEN_OP_FP_DIV: case GEN_OP_FP_SQRT: case GEN_OP_FP_MOV:
     case GEN_OP_FP_CVT: case GEN_OP_FP_CMP:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_riscv_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_riscv_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* XCHG (atomic ops): rd, rs2, (rs1) */
+        PARSE_FP_OPS(n_ops, ops, extract_riscv_reg); break;
     case GEN_OP_XCHG:
-    {
         for (int i = 0; i < n_ops; i++) {
             uint8_t r = extract_riscv_reg(ops[i]);
-            if (r != REG_NONE) {
-                add_src_reg(out, r);
-                add_dst_reg(out, r);
-            }
-            if (is_memory_operand(ops[i])) {
-                extract_riscv_mem_regs(ops[i], out);
-            }
+            if (r != REG_NONE) { add_src_reg(out, r); add_dst_reg(out, r); }
+            if (is_memory_operand(ops[i])) extract_riscv_mem_regs(ops[i], out);
         }
         break;
-    }
-
     default:
-        if (n_ops >= 1) {
-            uint8_t dst = extract_riscv_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_riscv_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
+        PARSE_ALU_DSTS(n_ops, ops, extract_riscv_reg); break;
     }
 
     /* Extract immediate value (bare number) */
@@ -1358,7 +1171,6 @@ static void parse_riscv_operands(const char *operands, InsnFields *out)
         const char *t = ops[i];
         while (*t == ' ' || *t == '\t') t++;
         if ((*t >= '0' && *t <= '9') || *t == '-') {
-            /* Skip if this is part of a memory operand offset(reg) */
             const char *paren = strchr(t, '(');
             if (!paren) {
                 out->has_immediate = true;
@@ -1441,104 +1253,22 @@ static void parse_mips_operands(const char *operands, InsnFields *out)
 {
     char ops[MAX_OPS][MAX_OP_LEN];
     int n_ops = split_operands(operands, ops, MAX_OPS);
-
-    if (n_ops == 0) {
-        return;
-    }
+    if (n_ops == 0) return;
 
     switch (out->opcode) {
-    /* ALU: rd, rs, rt/imm */
     case GEN_OP_INT_ADD: case GEN_OP_INT_SUB: case GEN_OP_INT_MUL:
     case GEN_OP_INT_DIV: case GEN_OP_AND: case GEN_OP_OR:
     case GEN_OP_XOR: case GEN_OP_NOT: case GEN_OP_SHL:
     case GEN_OP_SHR: case GEN_OP_SAR:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_mips_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_mips_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* MOV / LUI / LI / MOVE / MFHI / MFLO: rd, src_or_imm */
     case GEN_OP_MOV: case GEN_OP_MOVSX: case GEN_OP_MOVZX:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_mips_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_mips_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* LOAD: rt, offset(base) */
+    case GEN_OP_CMP: case GEN_OP_LEA:
+        PARSE_ALU_DSTS(n_ops, ops, extract_mips_reg); break;
     case GEN_OP_LOAD:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_mips_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 0; i < n_ops; i++) {
-            if (is_memory_operand(ops[i])) {
-                extract_mips_mem_regs(ops[i], out);
-            }
-        }
-        break;
-    }
-
-    /* STORE: rt, offset(base) */
+        PARSE_LOAD_OPS(n_ops, ops, extract_mips_reg, extract_mips_mem_regs, false); break;
     case GEN_OP_STORE:
-    {
-        if (n_ops >= 1) {
-            uint8_t src = extract_mips_reg(ops[0]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        for (int i = 0; i < n_ops; i++) {
-            if (is_memory_operand(ops[i])) {
-                extract_mips_mem_regs(ops[i], out);
-            }
-        }
-        break;
-    }
-
-    /* CMP (slt/sltu): rd, rs, rt */
-    case GEN_OP_CMP:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_mips_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_mips_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* LEA (la): rd, address */
-    case GEN_OP_LEA:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_mips_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        break;
-    }
-
-    /* Branch: rs, rt, target or rs, target */
+        PARSE_STORE_OPS(n_ops, ops, extract_mips_reg, extract_mips_mem_regs, false); break;
     case GEN_OP_BRANCH:
-    {
-        for (int i = 0; i < n_ops; i++) {
-            uint8_t r = extract_mips_reg(ops[i]);
-            if (r != REG_NONE) add_src_reg(out, r);
-        }
+        PARSE_BRANCH_OPS(n_ops, ops, extract_mips_reg);
         /* MIPS jr $ra is a return */
         if (out->branch_type == BRANCH_INDIRECT_JUMP && n_ops >= 1) {
             uint8_t r = extract_mips_reg(ops[0]);
@@ -1548,61 +1278,22 @@ static void parse_mips_operands(const char *operands, InsnFields *out)
             }
         }
         break;
-    }
-
-    /* CALL (jal/jalr): target or rd, rs */
     case GEN_OP_CALL:
-    {
         if (out->branch_type == BRANCH_INDIRECT_CALL && n_ops >= 1) {
             uint8_t r = extract_mips_reg(ops[0]);
             if (r != REG_NONE) add_src_reg(out, r);
         }
-        add_dst_reg(out, REG_LR);
-        break;
-    }
-
-    /* RET */
+        add_dst_reg(out, REG_LR); break;
     case GEN_OP_RET:
-        add_src_reg(out, REG_LR);
-        break;
-
-    /* FP: fd, fs, ft */
+        add_src_reg(out, REG_LR); break;
     case GEN_OP_FP_ADD: case GEN_OP_FP_SUB: case GEN_OP_FP_MUL:
     case GEN_OP_FP_DIV: case GEN_OP_FP_SQRT: case GEN_OP_FP_MOV:
     case GEN_OP_FP_CVT:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_mips_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_mips_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* FP compare: MIPS sets condition code, not register */
+        PARSE_FP_OPS(n_ops, ops, extract_mips_reg); break;
     case GEN_OP_FP_CMP:
-    {
-        for (int i = 0; i < n_ops; i++) {
-            uint8_t r = extract_mips_reg(ops[i]);
-            if (r != REG_NONE) add_src_reg(out, r);
-        }
-        add_dst_reg(out, REG_FLAGS);
-        break;
-    }
-
+        PARSE_CMP_OPS(n_ops, ops, extract_mips_reg); break;
     default:
-        if (n_ops >= 1) {
-            uint8_t dst = extract_mips_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_mips_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
+        PARSE_ALU_DSTS(n_ops, ops, extract_mips_reg); break;
     }
 
     /* Extract immediate value (bare number or hex) */

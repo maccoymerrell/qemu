@@ -316,6 +316,7 @@ typedef struct {
     bool branch_conditional;
 } MnemonicEntry;
 
+/* Option IDs used by the plugin option hash-table dispatch in install(). */
 enum PluginOptId {
     OPT_DEPTH = 1,
     OPT_OUTFILE,
@@ -405,7 +406,7 @@ static uint8_t parse_aarch64_reg(const char *name)
     }
 
     idx = strtoul(name + 1, &endp, 10);
-    if (!endp || *endp != '\0' || idx >= 32) {
+    if (*endp != '\0' || idx >= 32) {
         return REG_NONE;
     }
 
@@ -438,7 +439,7 @@ static uint8_t parse_riscv_reg(const char *name)
     }
 
     idx = strtoul(name + 1, &endp, 10);
-    if (!endp || *endp != '\0' || idx >= 32) {
+    if (*endp != '\0' || idx >= 32) {
         return REG_NONE;
     }
 
@@ -486,7 +487,7 @@ static uint8_t parse_mips_reg(const char *name)
         const char *digits = (name[0] == 'r') ? name + 1 : name;
 
         idx = strtoul(digits, &endp, 10);
-        if (!endp || *endp != '\0' || idx >= 32) {
+        if (*endp != '\0' || idx >= 32) {
             return REG_NONE;
         }
         if (idx == 0) {

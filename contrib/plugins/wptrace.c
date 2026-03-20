@@ -2616,7 +2616,7 @@ typedef struct {
     uint8_t exception_id;       /* GenericExceptionId */
     uint8_t exception_reg_id;   /* Register impacted by exception */
     bool has_exception_reg;
-    GByteArray *poison_mask;    /* Per-insn mask: 1 means dependent on poison */
+    GByteArray *poison_mask;    /* Per-insn mask: 1 marks the faulting insn */
 } WPBBEntry;
 
 /*
@@ -2803,24 +2803,9 @@ static BBTemplate *find_template(uint64_t start_pc)
     return g_hash_table_lookup(template_map, &start_pc);
 }
 
-static BBTemplate *find_template_by_id(uint32_t template_id)
-{
-    GHashTableIter iter;
-    gpointer value;
-
-    g_hash_table_iter_init(&iter, template_map);
-    while (g_hash_table_iter_next(&iter, NULL, &value)) {
-        BBTemplate *tmpl = value;
-        if (tmpl->template_id == template_id) {
-            return tmpl;
-        }
-    }
-    return NULL;
-}
-
 static uint8_t choose_exception_reg_id(const BBTemplate *tmpl)
 {
-    /* Prefer FP division destinations so poisoning follows FP fault chains. */
+    /* Prefer FP division destinations for exception bookkeeping. */
     for (uint32_t i = 0; i < tmpl->n_insns; i++) {
         const InsnFields *fld = &tmpl->insn_fields[i];
         if (fld->opcode != GEN_OP_FP_DIV) {
@@ -2880,60 +2865,42 @@ static uint8_t infer_generic_exception_id(const BBTemplate *tmpl)
     return GEN_EXC_UNKNOWN;
 }
 
-static void annotate_wp_dependency_masks(GArray *wp_chain)
+static uint32_t find_faulting_insn_index(const BBTemplate *tmpl, uint8_t exid)
 {
-    bool poisoned[256] = { false };
-    bool poison_active = false;
+    if (!tmpl || tmpl->n_insns == 0) {
+        return 0;
+    }
 
-    g_mutex_lock(&data_lock);
-    for (guint i = 0; i < wp_chain->len; i++) {
-        WPBBEntry *wp = &g_array_index(wp_chain, WPBBEntry, i);
-        BBTemplate *tmpl = find_template_by_id(wp->template_id);
+    for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+        const InsnFields *fld = &tmpl->insn_fields[i];
 
-        if (!tmpl) {
-            continue;
-        }
-
-        if (!wp->poison_mask) {
-            wp->poison_mask = g_byte_array_sized_new(tmpl->n_insns);
-        }
-        g_byte_array_set_size(wp->poison_mask, tmpl->n_insns);
-        memset(wp->poison_mask->data, 0, tmpl->n_insns);
-
-        if (wp->exception && wp->has_exception_reg) {
-            poisoned[wp->exception_reg_id] = true;
-            poison_active = true;
-        }
-
-        if (!poison_active) {
-            continue;
-        }
-
-        for (uint32_t insn = 0; insn < tmpl->n_insns; insn++) {
-            const InsnFields *fld = &tmpl->insn_fields[insn];
-            bool dependent = false;
-
-            for (uint8_t s = 0; s < fld->n_src_regs; s++) {
-                uint8_t reg_id = fld->src_regs[s];
-                if (reg_id != REG_NONE && poisoned[reg_id]) {
-                    dependent = true;
-                    break;
-                }
+        switch (exid) {
+        case GEN_EXC_FP_DIVIDE_BY_ZERO:
+            if (fld->opcode == GEN_OP_FP_DIV) {
+                return i;
             }
-
-            wp->poison_mask->data[insn] = dependent ? 1 : 0;
-
-            if (dependent) {
-                for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
-                    uint8_t reg_id = fld->dst_regs[d];
-                    if (reg_id != REG_NONE) {
-                        poisoned[reg_id] = true;
-                    }
-                }
+            break;
+        case GEN_EXC_INT_DIVIDE_BY_ZERO:
+            if (fld->opcode == GEN_OP_INT_DIV) {
+                return i;
             }
+            break;
+        case GEN_EXC_MEMORY_ACCESS:
+            if (fld->opcode == GEN_OP_LOAD || fld->opcode == GEN_OP_STORE) {
+                return i;
+            }
+            break;
+        case GEN_EXC_SYSCALL:
+            if (fld->opcode == GEN_OP_SYSCALL) {
+                return i;
+            }
+            break;
+        default:
+            break;
         }
     }
-    g_mutex_unlock(&data_lock);
+
+    return tmpl->n_insns - 1;
 }
 
 /*
@@ -3069,8 +3036,6 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     bool early_exit = false;
     uint64_t last_fault_pc = UINT64_MAX;
     unsigned int repeated_fault_pc = 0;
-    bool poisoned_regs[256] = { false };
-    bool poison_active = false;
 
     /* Save complete CPU state for rollback */
     struct qemu_plugin_cpu_state *saved_state = qemu_plugin_cpu_state_save();
@@ -3174,10 +3139,29 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             sim_insns += tmpl->n_insns;
             recovery_pc = tmpl->fall_through_pc;
 
-            if (fault_wp.has_exception_reg) {
-                poisoned_regs[fault_wp.exception_reg_id] = true;
-                poison_active = true;
+            fault_wp.poison_mask = g_byte_array_sized_new(tmpl->n_insns);
+            g_byte_array_set_size(fault_wp.poison_mask, tmpl->n_insns);
+            memset(fault_wp.poison_mask->data, 0, tmpl->n_insns);
+            if (tmpl->n_insns > 0) {
+                uint32_t fault_idx = find_faulting_insn_index(
+                    tmpl, fault_wp.exception_id);
+                if (fault_idx < tmpl->n_insns) {
+                    fault_wp.poison_mask->data[fault_idx] = 1;
+                }
             }
+
+            g_array_index(wp_chain, WPBBEntry, wp_chain->len - 1) = fault_wp;
+
+            /*
+             * A syscall exception is terminal for speculative wrong-path
+             * continuation; recovering to fall-through can walk into
+             * non-code bytes and produce bogus templates.
+             */
+            if (fault_wp.exception_id == GEN_EXC_SYSCALL) {
+                early_exit = true;
+                break;
+            }
+
             wp_poison_target(poisoned_targets, pre_pc);
             repeated_fault_pc = 0;
             last_fault_pc = UINT64_MAX;
@@ -3261,41 +3245,7 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             qemu_plugin_set_pc(chosen_target);
         }
 
-        if (poison_active) {
-            bool branch_dependent = false;
-
-            for (uint32_t insn = 0; insn < tmpl->n_insns; insn++) {
-                const InsnFields *fld = &tmpl->insn_fields[insn];
-                bool dependent = false;
-
-                for (uint8_t s = 0; s < fld->n_src_regs; s++) {
-                    uint8_t reg_id = fld->src_regs[s];
-                    if (reg_id != REG_NONE && poisoned_regs[reg_id]) {
-                        dependent = true;
-                        break;
-                    }
-                }
-
-                if (dependent) {
-                    for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
-                        uint8_t reg_id = fld->dst_regs[d];
-                        if (reg_id != REG_NONE) {
-                            poisoned_regs[reg_id] = true;
-                        }
-                    }
-                    if (insn == tmpl->n_insns - 1 && fld->branch_type != BRANCH_NONE) {
-                        branch_dependent = true;
-                    }
-                }
-            }
-
-            if (branch_dependent) {
-                wp_poison_target(poisoned_targets, chosen_target);
-            }
-        }
     }
-
-    annotate_wp_dependency_masks(wp_chain);
 
     /* Stop wrong-path collection */
     wp_in_progress = false;

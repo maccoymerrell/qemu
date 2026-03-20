@@ -2626,7 +2626,7 @@ typedef struct {
     uint64_t current_pc;        /* Current block's start PC */
     uint64_t prev_last_pc;      /* Last insn PC of previous block */
     uint64_t prev_fall_through; /* Expected sequential next from prev block */
-    uint64_t prev_is_branch;    /* Previous BB ended in a branch */
+    uint64_t prev_bb_ends_in_branch; /* Previous BB ended in a branch */
     uint64_t insn_count;        /* Total instructions executed */
 } VCPUScoreBoard;
 
@@ -2678,7 +2678,7 @@ static struct qemu_plugin_scoreboard *vcpu_sb;
 static qemu_plugin_u64 sb_current_pc;
 static qemu_plugin_u64 sb_prev_last_pc;
 static qemu_plugin_u64 sb_prev_fall_through;
-static qemu_plugin_u64 sb_prev_is_branch;
+static qemu_plugin_u64 sb_prev_bb_ends_in_branch;
 static qemu_plugin_u64 sb_insn_count;
 
 /* Tracing state */
@@ -4246,7 +4246,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     uint64_t current_pc = qemu_plugin_u64_get(sb_current_pc, cpu_index);
     uint64_t prev_last = qemu_plugin_u64_get(sb_prev_last_pc, cpu_index);
     uint64_t prev_ft = qemu_plugin_u64_get(sb_prev_fall_through, cpu_index);
-    bool prev_is_branch = (qemu_plugin_u64_get(sb_prev_is_branch, cpu_index) != 0);
+    bool prev_is_branch = qemu_plugin_u64_get(sb_prev_bb_ends_in_branch,
+                                              cpu_index);
 
     /* Skip initial block (no previous context) */
     if (prev_ft == 0) {
@@ -4366,7 +4367,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     uint64_t last_insn_pc = qemu_plugin_insn_vaddr(last_insn);
     size_t last_insn_size = qemu_plugin_insn_size(last_insn);
     uint64_t fall_through = last_insn_pc + last_insn_size;
-    uint64_t is_branch = 0;
+    uint64_t bb_ends_in_branch = 0;
 
     /* Collect instruction data for BB template */
     uint64_t *insn_pcs = g_new0(uint64_t, n_insns);
@@ -4400,7 +4401,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                                                   symbol_name, fall_through);
         if (tmpl && tmpl->n_insns > 0) {
             InsnFields *last_fld = &tmpl->insn_fields[tmpl->n_insns - 1];
-            is_branch = (last_fld->branch_type != BRANCH_NONE) ? 1 : 0;
+            bb_ends_in_branch = (last_fld->branch_type != BRANCH_NONE) ? 1 : 0;
         }
     }
     g_mutex_unlock(&data_lock);
@@ -4437,7 +4438,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         sb_prev_fall_through, fall_through);
     qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
         first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
-        sb_prev_is_branch, is_branch);
+        sb_prev_bb_ends_in_branch, bb_ends_in_branch);
 }
 
 /* ========================= Flush Callback ========================= */
@@ -4784,8 +4785,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         vcpu_sb, VCPUScoreBoard, prev_last_pc);
     sb_prev_fall_through = qemu_plugin_scoreboard_u64_in_struct(
         vcpu_sb, VCPUScoreBoard, prev_fall_through);
-    sb_prev_is_branch = qemu_plugin_scoreboard_u64_in_struct(
-        vcpu_sb, VCPUScoreBoard, prev_is_branch);
+    sb_prev_bb_ends_in_branch = qemu_plugin_scoreboard_u64_in_struct(
+        vcpu_sb, VCPUScoreBoard, prev_bb_ends_in_branch);
     sb_insn_count = qemu_plugin_scoreboard_u64_in_struct(
         vcpu_sb, VCPUScoreBoard, insn_count);
 

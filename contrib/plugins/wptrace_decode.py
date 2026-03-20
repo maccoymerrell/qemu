@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-WPT_MAGIC = 0x54505703
+WPT_MAGIC = 0x54505704
 
 WPT_ISA_BITS = 3
 WPT_OPCODE_BITS = 8
@@ -261,79 +261,22 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
     exception_names = dict(EXCEPTION_NAMES_DEFAULT)
     reg_names: dict[int, str] = {}
 
-    num_templates = br.read_uleb128()
-
+    entries: list[dict] = []
     templates: list[dict] = []
     template_by_id: dict[int, dict] = {}
-
-    for _ in range(num_templates):
-        template_id = br.read_uleb128()
-        start_pc = br.read_uleb128()
-        n_insns = br.read_uleb128()
-        fall_through_pc = br.read_uleb128()
-        symbol_name = ""
-
-        insns: list[dict] = []
-        for _ in range(n_insns):
-            pc = br.read_uleb128()
-            opcode = br.read_bits(WPT_OPCODE_BITS)
-            branch_type = br.read_bits(WPT_BRANCH_BITS)
-            branch_conditional = bool(br.read_bits(1))
-            n_src = br.read_bits(WPT_REG_COUNT_BITS)
-            n_dst = br.read_bits(WPT_REG_COUNT_BITS)
-            has_imm = br.read_bits(1)
-
-            src_regs = [br.read_bits(WPT_REG_BITS) for _ in range(n_src)]
-            dst_regs = [br.read_bits(WPT_REG_BITS) for _ in range(n_dst)]
-            imm = br.read_sleb128() if has_imm else None
-            # v0.3 keeps only instruction size in the header (raw bytes removed).
-            _insn_size = br.read_uleb128()
-            raw_bytes = b""
-
-            insns.append({
-                "pc": pc,
-                "opcode": opcode,
-                "branch_type": branch_type,
-                "branch_conditional": branch_conditional,
-                "src_regs": src_regs,
-                "dst_regs": dst_regs,
-                "imm": imm,
-                "raw_bytes": raw_bytes,
-            })
-
-        tmpl = {
-            "template_id": template_id,
-            "start_pc": start_pc,
-            "n_insns": n_insns,
-            "fall_through_pc": fall_through_pc,
-            "symbol_name": symbol_name,
-            "insns": insns,
-        }
-        templates.append(tmpl)
-        template_by_id[template_id] = tmpl
-
-    num_entries = br.read_uleb128()
-    num_wp_chains = br.read_uleb128()
-    wp_chains: list[list[int]] = []
-
-    for _ in range(num_wp_chains):
-        chain_len = br.read_uleb128()
-        prev_tid = 0
-        chain: list[int] = []
-
-        for _ in range(chain_len):
-            prev_tid = prev_tid + br.read_sleb128()
-            chain.append(prev_tid)
-
-        wp_chains.append(chain)
-
-    entries: list[dict] = []
 
     prev_entry_template = 0
     cp_dyn_state: dict[int, list[DynParam]] = {}
     wp_dyn_state: dict[int, list[DynParam]] = {}
+    footer_num_entries: int | None = None
 
-    for seq_num in range(1, num_entries + 1):
+    while True:
+        marker = br.read_bits(1)
+        if marker == 0:
+            footer_num_entries = br.read_uleb128()
+            break
+
+        seq_num = len(entries) + 1
         entry_tmpl = prev_entry_template + br.read_sleb128()
         prev_entry_template = entry_tmpl
 
@@ -351,16 +294,13 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
                                                  value=d.value)
                                         for d in cp_dyn]
 
-        chain_id = br.read_uleb128()
-        if chain_id >= len(wp_chains):
-            raise ValueError("wp chain id out of range")
-
-        chain = wp_chains[chain_id]
-        num_wp = len(chain)
+        num_wp = br.read_uleb128()
+        prev_wp_tmpl = 0
         wp_entries: list[dict] = []
 
         for w in range(num_wp):
-            wp_tmpl = chain[w]
+            wp_tmpl = prev_wp_tmpl + br.read_sleb128()
+            prev_wp_tmpl = wp_tmpl
 
             wp_unchanged = br.read_bits(1)
             prev_wp_dyn = wp_dyn_state.get(wp_tmpl, [])
@@ -437,6 +377,62 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
             "dyn_params": cp_dyn,
             "wp_entries": wp_entries,
         })
+
+    num_templates = br.read_uleb128()
+    for _ in range(num_templates):
+        template_id = br.read_uleb128()
+        start_pc = br.read_uleb128()
+        n_insns = br.read_uleb128()
+        fall_through_pc = br.read_uleb128()
+        symbol_name = ""
+
+        insns: list[dict] = []
+        for _ in range(n_insns):
+            pc = br.read_uleb128()
+            opcode = br.read_bits(WPT_OPCODE_BITS)
+            branch_type = br.read_bits(WPT_BRANCH_BITS)
+            branch_conditional = bool(br.read_bits(1))
+            n_src = br.read_bits(WPT_REG_COUNT_BITS)
+            n_dst = br.read_bits(WPT_REG_COUNT_BITS)
+            has_imm = br.read_bits(1)
+            src_regs = [br.read_bits(WPT_REG_BITS) for _ in range(n_src)]
+            dst_regs = [br.read_bits(WPT_REG_BITS) for _ in range(n_dst)]
+            imm = br.read_sleb128() if has_imm else None
+            _insn_size = br.read_uleb128()
+            raw_bytes = b""
+
+            insns.append({
+                "pc": pc,
+                "opcode": opcode,
+                "branch_type": branch_type,
+                "branch_conditional": branch_conditional,
+                "src_regs": src_regs,
+                "dst_regs": dst_regs,
+                "imm": imm,
+                "raw_bytes": raw_bytes,
+            })
+
+        tmpl = {
+            "template_id": template_id,
+            "start_pc": start_pc,
+            "n_insns": n_insns,
+            "fall_through_pc": fall_through_pc,
+            "symbol_name": symbol_name,
+            "insns": insns,
+        }
+        templates.append(tmpl)
+        template_by_id[template_id] = tmpl
+
+    for entry in entries:
+        for wp in entry["wp_entries"]:
+            wp_tmpl = wp["template_id"]
+            if wp_tmpl in template_by_id:
+                wp["n_insns"] = template_by_id[wp_tmpl]["n_insns"]
+
+    if footer_num_entries is not None and footer_num_entries != len(entries):
+        raise ValueError(
+            f"Footer entry count mismatch: {footer_num_entries} != {len(entries)}"
+        )
 
     meta = {
         "magic": magic,
@@ -555,7 +551,7 @@ def first_diff_line(a: str, b: str) -> tuple[int, str, str] | None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Decode wptrace binary (.bin, format v0.3) and reconstruct debug text format"
+            "Decode wptrace binary (.bin, format v0.4) and reconstruct debug text format"
         )
     )
     parser.add_argument("bin", type=Path, help="Input wptrace binary file")

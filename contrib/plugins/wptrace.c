@@ -59,17 +59,6 @@ static const char *target_name;
 static FILE *unknown_warn_file;
 static GMutex unknown_warn_lock;
 
-/* ISA enum for extensibility: add new ISAs here */
-typedef enum {
-    TRACE_ISA_UNKNOWN = 0,
-    TRACE_ISA_X86     = 1,   /* x86_64 and i386 */
-    TRACE_ISA_AARCH64 = 2,   /* AArch64 (ARMv8+) */
-    TRACE_ISA_RISCV   = 3,   /* RISC-V (RV32/RV64) */
-    TRACE_ISA_MIPS    = 4,   /* MIPS (mips/mips64/mipsel/mips64el) */
-} TraceISA;
-
-static TraceISA trace_isa = TRACE_ISA_UNKNOWN;
-
 /* SimPoints-driven tracing */
 static char *simpoints_file_path = NULL;
 static uint64_t simpoint_interval_insns = 100000000ULL;
@@ -104,6 +93,9 @@ static guint simpoints_current_idx = 0;
 #define MAX_DST_REGS 4
 
 #include "wptrace_mnemonics.h"
+
+/* TraceISA enum is defined in wptrace_mnemonics.h alongside isa_properties[] */
+static TraceISA trace_isa = TRACE_ISA_UNKNOWN;
 
 _Static_assert(TRACE_ISA_MIPS < (1U << WPT_ISA_BITS),
                "TraceISA no longer fits packed width");
@@ -292,7 +284,9 @@ static bool lookup_mnemonic(const char *mnem, uint8_t *opcode,
                             uint8_t *branch_type,
                             uint16_t *flags,
                             const uint8_t **capture_kinds,
-                            const char **operand_regex)
+                            const char **operand_regex,
+                            const uint8_t **implicit_src,
+                            const uint8_t **implicit_dst)
 {
     const MnemonicEntry *entry = g_hash_table_lookup(isa.mnemonic_ht, mnem);
     if (entry) {
@@ -301,6 +295,8 @@ static bool lookup_mnemonic(const char *mnem, uint8_t *opcode,
         *flags = entry->flags;
         *capture_kinds = entry->capture_kinds;
         *operand_regex = entry->operand_regex;
+        *implicit_src = entry->implicit_src_regs;
+        *implicit_dst = entry->implicit_dst_regs;
         return true;
     }
     return false;
@@ -314,7 +310,9 @@ static bool lookup_mnem_regex_fallback(const char *mnem, uint8_t *opcode,
                                        uint8_t *branch_type,
                                        uint16_t *flags,
                                        const uint8_t **capture_kinds,
-                                       const char **operand_regex)
+                                       const char **operand_regex,
+                                       const uint8_t **implicit_src,
+                                       const uint8_t **implicit_dst)
 {
     GArray *arr = isa.mnem_re_arr;
 
@@ -331,6 +329,8 @@ static bool lookup_mnem_regex_fallback(const char *mnem, uint8_t *opcode,
             *flags = e->flags;
             *capture_kinds = e->capture_kinds;
             *operand_regex = e->operand_regex;
+            *implicit_src = e->implicit_src_regs;
+            *implicit_dst = e->implicit_dst_regs;
             return true;
         }
     }
@@ -353,13 +353,17 @@ static void classify_mnemonic(const char *mnem, uint8_t *opcode,
                               uint8_t *branch_type,
                               uint16_t *flags,
                               const uint8_t **capture_kinds,
-                              const char **operand_regex)
+                              const char **operand_regex,
+                              const uint8_t **implicit_src,
+                              const uint8_t **implicit_dst)
 {
     *opcode = GEN_OP_UNKNOWN;
     *branch_type = BRANCH_NONE;
     *flags = MF_NONE;
     *capture_kinds = NULL;
     *operand_regex = NULL;
+    *implicit_src = NULL;
+    *implicit_dst = NULL;
 
     if (!mnem || !*mnem) {
         return;
@@ -367,13 +371,15 @@ static void classify_mnemonic(const char *mnem, uint8_t *opcode,
 
     /* Exact match in mnemonic hash table */
     if (lookup_mnemonic(mnem, opcode, branch_type, flags,
-                        capture_kinds, operand_regex)) {
+                        capture_kinds, operand_regex,
+                        implicit_src, implicit_dst)) {
         return;
     }
 
     /* Regex pattern fallback */
     lookup_mnem_regex_fallback(mnem, opcode, branch_type, flags,
-                               capture_kinds, operand_regex);
+                               capture_kinds, operand_regex,
+                               implicit_src, implicit_dst);
 }
 
 /*
@@ -595,7 +601,9 @@ static void extract_mem_regs_from_operand(const char *op, InsnFields *out)
  * All instruction semantics previously hardcoded per-ISA are now encoded
  * in MnemonicFlags and applied uniformly here.
  */
-static void apply_mnemonic_flags(InsnFields *out, uint16_t flags)
+static void apply_mnemonic_flags(InsnFields *out, uint16_t flags,
+                                 const uint8_t *implicit_src,
+                                 const uint8_t *implicit_dst)
 {
     if (flags & MF_FLAGS_DST) {
         add_dst_reg(out, REG_FLAGS);
@@ -618,6 +626,18 @@ static void apply_mnemonic_flags(InsnFields *out, uint16_t flags)
     }
     if (flags & MF_CONDITIONAL) {
         out->branch_conditional = true;
+    }
+
+    /* Per-instruction implicit registers from the mnemonic table */
+    if (implicit_src) {
+        for (int i = 0; i < 2; i++) {
+            add_src_reg(out, implicit_src[i]);
+        }
+    }
+    if (implicit_dst) {
+        for (int i = 0; i < 2; i++) {
+            add_dst_reg(out, implicit_dst[i]);
+        }
     }
 }
 
@@ -651,12 +671,20 @@ static inline void extract_immediate(const char *op, InsnFields *out)
 static void parse_operands(const char *operands, InsnFields *out,
                            const uint8_t capture_kinds[4],
                            const char *operand_regex,
-                           uint16_t flags)
+                           uint16_t flags,
+                           const uint8_t *implicit_src,
+                           const uint8_t *implicit_dst)
 {
     char ops[MAX_OPS][MAX_OP_LEN];
     int n_ops = split_operands_regex(operands, operand_regex, ops, MAX_OPS);
 
     if (n_ops == 0) {
+        /*
+         * Operand regex failed to match (e.g. MIPS branch disassembly
+         * like "bnez s1," with a trailing comma and truncated target).
+         * Still apply flag-driven effects so branch_conditional etc. are set.
+         */
+        apply_mnemonic_flags(out, flags, implicit_src, implicit_dst);
         return;
     }
 
@@ -769,7 +797,7 @@ static void parse_operands(const char *operands, InsnFields *out,
     }
 
     /* Apply flag-driven implicit register effects */
-    apply_mnemonic_flags(out, flags);
+    apply_mnemonic_flags(out, flags, implicit_src, implicit_dst);
 
     /* Flag-driven LR-based RET promotion (non-x86 ISAs) */
     if ((flags & MF_CHK_LR_RET) && n_ops >= 1 &&
@@ -806,6 +834,8 @@ static void decode_disas_to_generic(uint64_t pc, const char *disas,
 {
     const uint8_t *capture_kinds = NULL;
     const char *operand_regex = NULL;
+    const uint8_t *implicit_src = NULL;
+    const uint8_t *implicit_dst = NULL;
 
     memset(out, 0, sizeof(*out));
 
@@ -842,7 +872,8 @@ static void decode_disas_to_generic(uint64_t pc, const char *disas,
     /* Classify mnemonic -> opcode + branch type + flags */
     uint16_t flags = MF_NONE;
     classify_mnemonic(mnem, &out->opcode, &out->branch_type,
-                      &flags, &capture_kinds, &operand_regex);
+                      &flags, &capture_kinds, &operand_regex,
+                      &implicit_src, &implicit_dst);
 
     if (out->opcode == GEN_OP_UNKNOWN) {
         warn_unknown_instruction(pc, "unknown_mnemonic", mnem, disas);
@@ -859,7 +890,11 @@ static void decode_disas_to_generic(uint64_t pc, const char *disas,
 
     /* Parse operands using unified ISA-agnostic parser */
     if (*p) {
-        parse_operands(p, out, capture_kinds, operand_regex, flags);
+        parse_operands(p, out, capture_kinds, operand_regex, flags,
+                       implicit_src, implicit_dst);
+    } else {
+        /* No operands — still apply flag-driven and per-instruction implicits */
+        apply_mnemonic_flags(out, flags, implicit_src, implicit_dst);
     }
 }
 
@@ -1249,6 +1284,28 @@ static BBTemplate *find_template(uint64_t start_pc)
     return g_hash_table_lookup(template_map, &start_pc);
 }
 
+/*
+ * Return the index of the branch instruction within a BB template.
+ *
+ * After template creation, delay-slot ISAs (e.g. MIPS) have already
+ * been reordered so the branch is the last instruction in every case.
+ *
+ * Returns -1 if no branch instruction is found.
+ */
+static int template_branch_index(const BBTemplate *tmpl)
+{
+    if (!tmpl || tmpl->n_insns == 0) {
+        return -1;
+    }
+
+    uint32_t last = tmpl->n_insns - 1;
+    if (tmpl->insn_fields[last].branch_type != BRANCH_NONE) {
+        return (int)last;
+    }
+
+    return -1;
+}
+
 static uint8_t choose_exception_reg_id(const BBTemplate *tmpl)
 {
     /* Prefer FP division destinations for exception bookkeeping. */
@@ -1409,6 +1466,47 @@ static BBTemplate *get_or_create_template(uint64_t start_pc,
         if (insn_disas && insn_disas[i]) {
             decode_disas_to_generic(tmpl->insn_pcs[i], insn_disas[i],
                                     &tmpl->insn_fields[i]);
+        }
+    }
+
+    /*
+     * Delay-slot reordering: swap [branch, delay] → [delay, branch].
+     *
+     * On ISAs with branch delay slots (e.g. MIPS) QEMU's TCG encodes the
+     * delay-slot instruction immediately after the branch in program order.
+     * Architecturally the delay slot executes before the branch takes
+     * effect, so we reorder the template to execution order.  This lets
+     * all downstream code (template_branch_index, wrong-path steering,
+     * etc.) treat the last instruction as the branch uniformly across
+     * ISAs with no special-case checks.
+     */
+    if (isa_properties[trace_isa].branch_delay_slots > 0 && n_insns >= 2) {
+        uint32_t br = n_insns - 2;
+        uint32_t ds = n_insns - 1;
+        if (tmpl->insn_fields[br].branch_type != BRANCH_NONE &&
+            tmpl->insn_fields[ds].branch_type == BRANCH_NONE) {
+            /* Swap PCs */
+            uint64_t tmp_pc = tmpl->insn_pcs[br];
+            tmpl->insn_pcs[br] = tmpl->insn_pcs[ds];
+            tmpl->insn_pcs[ds] = tmp_pc;
+            /* Swap sizes */
+            uint8_t tmp_sz = tmpl->insn_sizes[br];
+            tmpl->insn_sizes[br] = tmpl->insn_sizes[ds];
+            tmpl->insn_sizes[ds] = tmp_sz;
+            /* Swap raw bytes */
+            uint8_t tmp_bytes[MAX_INSN_BYTES];
+            memcpy(tmp_bytes,
+                   &tmpl->insn_bytes[(size_t)br * MAX_INSN_BYTES],
+                   MAX_INSN_BYTES);
+            memcpy(&tmpl->insn_bytes[(size_t)br * MAX_INSN_BYTES],
+                   &tmpl->insn_bytes[(size_t)ds * MAX_INSN_BYTES],
+                   MAX_INSN_BYTES);
+            memcpy(&tmpl->insn_bytes[(size_t)ds * MAX_INSN_BYTES],
+                   tmp_bytes, MAX_INSN_BYTES);
+            /* Swap decoded fields */
+            InsnFields tmp_fld = tmpl->insn_fields[br];
+            tmpl->insn_fields[br] = tmpl->insn_fields[ds];
+            tmpl->insn_fields[ds] = tmp_fld;
         }
     }
 
@@ -1710,14 +1808,16 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         }
 
         /*
-         * Decide next PC from the last instruction's branch type.
+         * Decide next PC from the branch instruction's type.
          * On wrong-path conditional branches, follow Smith predictor when
          * requested; otherwise keep natural execution.
          */
-        InsnFields *last_fld = &tmpl->insn_fields[tmpl->n_insns - 1];
-        uint8_t last_br = last_fld->branch_type;
+        int br_idx = template_branch_index(tmpl);
+        uint8_t last_br = (br_idx >= 0) ? tmpl->insn_fields[br_idx].branch_type
+                                        : BRANCH_NONE;
         uint64_t chosen_target;
-        bool conditional = (last_br != BRANCH_NONE && last_fld->branch_conditional);
+        bool conditional = (br_idx >= 0 && last_br != BRANCH_NONE &&
+                            tmpl->insn_fields[br_idx].branch_conditional);
 
         if (conditional && use_smith_prediction) {
             bool pred_taken = false;
@@ -1726,7 +1826,8 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             BranchRecord *inner_br;
 
             g_mutex_lock(&data_lock);
-            inner_br = g_hash_table_lookup(branch_map, &tmpl->insn_pcs[tmpl->n_insns - 1]);
+            inner_br = g_hash_table_lookup(branch_map,
+                                           &tmpl->insn_pcs[br_idx]);
             if (inner_br) {
                 has_inner_br = true;
                 pred_taken = (inner_br->smith_counter >= 2);
@@ -2959,13 +3060,17 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     size_t last_insn_size = qemu_plugin_insn_size(last_insn);
     uint64_t fall_through = last_insn_pc + last_insn_size;
     uint64_t bb_ends_in_branch = 0;
+    uint64_t effective_last_pc = last_insn_pc;
     BBTemplate *existing_tmpl;
 
     g_mutex_lock(&data_lock);
     existing_tmpl = find_template(pc);
     if (existing_tmpl && existing_tmpl->n_insns > 0) {
-        InsnFields *last_fld = &existing_tmpl->insn_fields[existing_tmpl->n_insns - 1];
-        bb_ends_in_branch = (last_fld->branch_type != BRANCH_NONE) ? 1 : 0;
+        int br_idx = template_branch_index(existing_tmpl);
+        bb_ends_in_branch = (br_idx >= 0) ? 1 : 0;
+        if (br_idx >= 0) {
+            effective_last_pc = existing_tmpl->insn_pcs[br_idx];
+        }
     }
     g_mutex_unlock(&data_lock);
 
@@ -3059,8 +3164,11 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                                                       tmpl_insn_bytes,
                                                       symbol_name, fall_through);
             if (tmpl && tmpl->n_insns > 0) {
-                InsnFields *last_fld = &tmpl->insn_fields[tmpl->n_insns - 1];
-                bb_ends_in_branch = (last_fld->branch_type != BRANCH_NONE) ? 1 : 0;
+                int br_idx = template_branch_index(tmpl);
+                bb_ends_in_branch = (br_idx >= 0) ? 1 : 0;
+                if (br_idx >= 0) {
+                    effective_last_pc = tmpl->insn_pcs[br_idx];
+                }
             }
         }
         g_mutex_unlock(&data_lock);
@@ -3112,7 +3220,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         sb_prev_start_pc, pc);
     qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
         first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
-        sb_prev_last_pc, last_insn_pc);
+        sb_prev_last_pc, effective_last_pc);
     qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
         first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
         sb_prev_fall_through, fall_through);
@@ -3465,44 +3573,13 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      * Set up the ISA descriptor: mnemonic tables, register tables,
      * and syntax-driven extraction parameters.
      */
-    const MnemonicEntry *active_mnem_table = NULL;
-    const RegEntry *active_reg_table = NULL;
-    switch (trace_isa) {
-    case TRACE_ISA_X86:
-        active_mnem_table = x86_mnemonic_table;
-        active_reg_table = x86_reg_entries;
-        isa.reg_prefix = '%';
-        isa.mem_open = '(';
-        isa.indirect_star = true;
-        isa.strip_dollar = false;
-        break;
-    case TRACE_ISA_AARCH64:
-        active_mnem_table = aarch64_mnemonic_table;
-        active_reg_table = aarch64_reg_entries;
-        isa.reg_prefix = '\0';
-        isa.mem_open = '[';
-        isa.indirect_star = false;
-        isa.strip_dollar = false;
-        break;
-    case TRACE_ISA_RISCV:
-        active_mnem_table = riscv_mnemonic_table;
-        active_reg_table = riscv_reg_entries;
-        isa.reg_prefix = '\0';
-        isa.mem_open = '(';
-        isa.indirect_star = false;
-        isa.strip_dollar = false;
-        break;
-    case TRACE_ISA_MIPS:
-        active_mnem_table = mips_mnemonic_table;
-        active_reg_table = mips_reg_entries;
-        isa.reg_prefix = '\0';
-        isa.mem_open = '(';
-        isa.indirect_star = false;
-        isa.strip_dollar = true;
-        break;
-    default:
-        break;
-    }
+    const IsaProperties *props = &isa_properties[trace_isa];
+    const MnemonicEntry *active_mnem_table = props->mnemonic_table;
+    const RegEntry *active_reg_table = props->reg_table;
+    isa.reg_prefix = props->reg_prefix;
+    isa.mem_open = props->mem_open;
+    isa.indirect_star = props->indirect_star;
+    isa.strip_dollar = props->strip_dollar;
 
     if (active_mnem_table) {
         isa.mnemonic_ht = g_hash_table_new(g_str_hash, g_str_equal);

@@ -134,37 +134,35 @@ typedef struct {
 
 /* ========================= Disassembly-Based Generic Decode ========================= */
 
-/* Per-ISA register hash tables (built once at init) */
-static GHashTable *x86_reg_ht;
-static GHashTable *aarch64_reg_ht;
-static GHashTable *riscv_reg_ht;
-static GHashTable *mips_reg_ht;
-
 /*
- * Per-ISA compiled mnemonic regex fallback arrays.
- * Each array pairs a compiled GRegex with the originating MnemonicEntry
- * for MNEM_RE entries (name == NULL, mnem_re != NULL).
- * Built once at init; tried in order when exact hash lookup fails.
+ * Compiled regex fallback arrays for mnemonic and register lookup.
+ * Each entry pairs a compiled GRegex with the originating table entry.
+ * Built once at init; tried in order when the exact hash lookup misses.
  */
 typedef struct {
     GRegex *re;
     const MnemonicEntry *entry;
 } CompiledMnemRe;
 
-typedef uint8_t (*ExtractRegFn)(const char *op);
-typedef void (*ExtractMemRegsFn)(const char *op, InsnFields *out);
+typedef struct {
+    GRegex *re;
+    const RegEntry *entry;
+} CompiledRegRe;
 
 /*
  * ISA descriptor: concentrates all ISA-specific behaviour into a single
- * struct so that the generic operand parser and mnemonic lookup need
- * zero switch-on-ISA logic.  Set once at plugin init.
+ * struct so that the generic operand parser, mnemonic lookup, and register
+ * extraction need zero switch-on-ISA logic.  Set once at plugin init.
  */
 typedef struct {
-    ExtractRegFn    extract_reg;     /* extract register from operand token  */
-    ExtractMemRegsFn extract_mem;    /* extract memory address registers     */
     GHashTable     *mnemonic_ht;     /* exact-match mnemonic → MnemonicEntry */
     GArray         *mnem_re_arr;     /* compiled regex fallback (linear scan)*/
+    GHashTable     *reg_ht;          /* exact-match register name → biased ID*/
+    GArray         *reg_re_arr;      /* compiled regex fallback for registers*/
+    char            reg_prefix;      /* register name prefix ('%' x86, 0 oth)*/
+    char            mem_open;        /* memory operand opener ('(' or '[')   */
     bool            indirect_star;   /* x86: '*' marks indirect branch       */
+    bool            strip_dollar;    /* MIPS: strip leading '$' from names   */
 } IsaDesc;
 
 static IsaDesc isa;                  /* active ISA (set once at init)        */
@@ -207,22 +205,6 @@ enum PluginOptId {
 #define REG_HASH_BIAS 1
 
 /*
- * Build a register-name hash table from a RegEntry array.
- * Values are stored with REG_HASH_BIAS so REG_NONE is distinguishable
- * from a hash miss (NULL).
- */
-static GHashTable *build_reg_hash_table(const RegEntry *entries)
-{
-    GHashTable *ht = g_hash_table_new(g_str_hash, g_str_equal);
-    for (int i = 0; entries[i].name; i++) {
-        g_hash_table_insert(ht, (gpointer)entries[i].name,
-                            GUINT_TO_POINTER((guint)entries[i].reg_id
-                                             + REG_HASH_BIAS));
-    }
-    return ht;
-}
-
-/*
  * Look up a register name in a pre-built hash table.
  * Returns true if found, writing the register ID to *reg_id.
  */
@@ -238,49 +220,39 @@ static inline bool reg_hash_lookup(GHashTable *ht, const char *name,
 }
 
 
-static bool parse_u8_suffix(const char *s, int *out)
-{
-    char *end;
-    long v;
-
-    if (!s || !*s) {
-        return false;
-    }
-
-    v = strtol(s, &end, 10);
-    if (*end != '\0' || v < 0 || v > UINT8_MAX) {
-        return false;
-    }
-
-    *out = (int)v;
-    return true;
-}
-
-static uint8_t reg_lookup_with_ranges(GHashTable *ht, const char *name,
-                                      const RegRangeEntry *ranges)
+/*
+ * Unified register name lookup: exact hash table first, then regex fallback.
+ * Uses the active ISA's reg_ht and reg_re_arr from the IsaDesc.
+ * For regex entries, the first capture group is parsed as an integer
+ * and combined with reg_id + re_adj to compute the final register ID.
+ */
+static uint8_t parse_reg(const char *name)
 {
     uint8_t reg_id;
 
-    if (reg_hash_lookup(ht, name, &reg_id)) {
+    if (!name || !*name) {
+        return REG_NONE;
+    }
+
+    if (reg_hash_lookup(isa.reg_ht, name, &reg_id)) {
         return reg_id;
     }
 
-    for (int i = 0; ranges && ranges[i].prefix; i++) {
-        const RegRangeEntry *r = &ranges[i];
-        size_t plen = strlen(r->prefix);
-        int idx;
-
-        if (strncmp(name, r->prefix, plen) != 0) {
-            continue;
+    for (guint i = 0; i < isa.reg_re_arr->len; i++) {
+        CompiledRegRe *cre = &g_array_index(isa.reg_re_arr,
+                                            CompiledRegRe, i);
+        GMatchInfo *mi = NULL;
+        if (g_regex_match(cre->re, name, 0, &mi)) {
+            int result = cre->entry->reg_id;
+            char *num_str = g_match_info_fetch(mi, 1);
+            if (num_str && *num_str) {
+                result += atoi(num_str) + cre->entry->re_adj;
+            }
+            g_free(num_str);
+            g_match_info_free(mi);
+            return (uint8_t)result;
         }
-        if (!parse_u8_suffix(name + plen, &idx)) {
-            continue;
-        }
-        if (idx < r->min_idx || idx > r->max_idx) {
-            continue;
-        }
-
-        return (uint8_t)(r->base_reg + (idx - r->min_idx));
+        g_match_info_free(mi);
     }
 
     return REG_NONE;
@@ -310,94 +282,6 @@ static inline void add_dst_reg(InsnFields *f, uint8_t reg_id)
         }
     }
     f->dst_regs[f->n_dst_regs++] = reg_id;
-}
-
-/*
- * Parse x86 register name (without % prefix) to GenericRegId.
- * Uses hash table for exact matches, with fallback for extended registers,
- * vector registers, and x87 FP stack (which use prefix/numeric parsing).
- */
-static uint8_t parse_x86_reg(const char *name)
-{
-    uint8_t reg_id;
-
-    if (!name || !*name) {
-        return REG_NONE;
-    }
-
-    /* O(1) hash lookup for all known exact register names */
-    if (reg_hash_lookup(x86_reg_ht, name, &reg_id)) {
-        return reg_id;
-    }
-
-    /* Extended registers R8-R15 (with optional b/w/d suffix) */
-    if (name[0] == 'r' && name[1] >= '0' && name[1] <= '9') {
-        char *end;
-        long n = strtol(name + 1, &end, 10);
-        /* R8 maps to GPR6 (index = n - 8 + 6 = n - 2) */
-        if (n >= 8 && n <= 15 &&
-            (*end == '\0' || *end == 'b' || *end == 'w' || *end == 'd')) {
-            return REG_GPR0 + (uint8_t)(n - 2);
-        }
-    }
-
-    /* XMM/YMM/ZMM registers */
-    if (name[1] == 'm' && name[2] == 'm' &&
-        (name[0] == 'x' || name[0] == 'y' || name[0] == 'z')) {
-        int n = atoi(name + 3);
-        if (n >= 0 && n < 32) {
-            return REG_VEC0 + (uint8_t)n;
-        }
-    }
-
-    /* x87 FP stack */
-    if (name[0] == 's' && name[1] == 't') return REG_FPR0;
-
-    return REG_NONE;
-}
-
-/*
- * Parse AArch64 register name to GenericRegId.
- * Uses hash table for special names, with numeric parsing for x/w/vector regs.
- */
-static uint8_t parse_aarch64_reg(const char *name)
-{
-    if (!name || !*name) {
-        return REG_NONE;
-    }
-
-    return reg_lookup_with_ranges(aarch64_reg_ht, name, aarch64_reg_ranges);
-}
-
-/*
- * Parse RISC-V register name to GenericRegId.
- * Uses hash table for special names, with numeric parsing for t/s/a/x/f regs.
- */
-static uint8_t parse_riscv_reg(const char *name)
-{
-    if (!name || !*name) {
-        return REG_NONE;
-    }
-
-    return reg_lookup_with_ranges(riscv_reg_ht, name, riscv_reg_ranges);
-}
-
-/*
- * Parse MIPS register name to GenericRegId.
- * Uses hash table for special names, with numeric parsing for indexed regs.
- * QEMU's MIPS disassembler outputs names without $ prefix for GPRs.
- */
-static uint8_t parse_mips_reg(const char *name)
-{
-    if (!name || !*name) {
-        return REG_NONE;
-    }
-
-    /* Skip optional $ prefix */
-    const char *p = name;
-    if (*p == '$') p++;
-
-    return reg_lookup_with_ranges(mips_reg_ht, p, mips_reg_ranges);
 }
 
 /*
@@ -599,156 +483,67 @@ static bool is_memory_operand(const char *op)
     return strchr(op, '(') != NULL || strchr(op, '[') != NULL;
 }
 
-/*
- * Extract the first register from an x86 AT&T operand.
- * Scans for %name pattern. Skips '*' prefix for indirect operands.
- */
-static uint8_t extract_x86_reg(const char *op)
-{
-    for (;;) {
-        op = skip_ascii_ws(op);
-        if (*op != '*') {
-            break;
-        }
-        op++;
-    }
-
-    const char *pct = strchr(op, '%');
-    if (!pct) {
-        return REG_NONE;
-    }
-
-    /* If there's a '(' before the %, this is a memory operand base */
-    if (memchr(op, '(', (size_t)(pct - op))) {
-        return REG_NONE;
-    }
-
-    char name[16];
-    if (!copy_token_delim(pct + 1, ",) \t", name, sizeof(name))) {
-        return REG_NONE;
-    }
-    return parse_x86_reg(name);
-}
-
-/*
- * Extract address registers from an x86 AT&T memory operand.
- * Format: disp(%base,%index,scale)
- */
-static void extract_x86_mem_regs(const char *op, InsnFields *out)
-{
-    const char *p = strchr(op, '(');
-    if (!p) {
-        return;
-    }
-    p++;
-
-    while (*p && *p != ')') {
-        const char *pct = strchr(p, '%');
-        const char *end = strchr(p, ')');
-        char name[16];
-
-        if (!pct || (end && pct > end)) {
-            return;
-        }
-
-        if (copy_token_delim(pct + 1, ",) \t", name, sizeof(name))) {
-            add_src_reg(out, parse_x86_reg(name));
-        }
-
-        p = pct + 1 + strcspn(pct + 1, ",)");
-        if (*p == ',') {
-            p++;
-        }
-    }
-}
-
 static inline bool x86_is_indirect_operand(const char *op)
 {
     return *skip_ascii_ws(op) == '*';
 }
 
 /*
- * Extract the first register from an AArch64 operand.
+ * Extract the first register from an operand token.
+ * Behaviour is driven by the ISA descriptor fields:
+ *   - reg_prefix ('%' for x86, '\0' for others)
+ *   - mem_open   ('(' or '[')
+ *   - strip_dollar (MIPS: strip leading '$')
  */
-static uint8_t extract_aarch64_reg(const char *op)
+static uint8_t extract_reg_from_operand(const char *op)
 {
     char name[16];
-
     op = skip_ascii_ws(op);
 
-    if (*op == '#' || *op == '=') {
-        return REG_NONE;
-    }
-    if (*op == '[') {
-        return REG_NONE;
-    }
+    if (isa.reg_prefix) {
+        /* x86: register is %name; skip leading '*' (indirect marker) */
+        while (*op == '*') {
+            op = skip_ascii_ws(op + 1);
+        }
+        const char *pfx = strchr(op, isa.reg_prefix);
+        if (!pfx) {
+            return REG_NONE;
+        }
+        if (memchr(op, isa.mem_open, (size_t)(pfx - op))) {
+            return REG_NONE;
+        }
+        if (!copy_token_delim(pfx + 1, ",() \t", name, sizeof(name))) {
+            return REG_NONE;
+        }
+    } else {
+        /* Non-prefix ISAs: register name starts the operand */
+        if (*op == '#' || *op == '=') return REG_NONE;
+        if (*op == isa.mem_open) return REG_NONE;
+        if ((*op >= '0' && *op <= '9') || *op == '-') return REG_NONE;
+        if (op[0] == '0' && op[1] == 'x') return REG_NONE;
 
-    if (!copy_token_delim(op, ",]! \t", name, sizeof(name))) {
-        return REG_NONE;
-    }
-    return parse_aarch64_reg(name);
-}
+        const char *p = op;
+        if (isa.strip_dollar && *p == '$') p++;
 
-/*
- * Extract address registers from an AArch64 memory operand.
- * Format: [base, #imm] or [base, Xn]
- */
-static void extract_aarch64_mem_regs(const char *op, InsnFields *out)
-{
-    const char *p = strchr(op, '[');
-    char name[16];
-    const char *bracket_end;
-    const char *comma;
-
-    if (!p) {
-        return;
-    }
-    p = skip_ascii_ws(p + 1);
-
-    if (!copy_token_delim(p, ",] \t", name, sizeof(name))) {
-        return;
-    }
-    add_src_reg(out, parse_aarch64_reg(name));
-
-    /* Look for index register after comma */
-    bracket_end = strchr(p, ']');
-    comma = strchr(p, ',');
-    if (comma && bracket_end && comma < bracket_end) {
-        comma = skip_ascii_ws(comma + 1);
-        if (*comma != '#') {
-            if (copy_token_delim(comma, ",] \t", name, sizeof(name))) {
-                add_src_reg(out, parse_aarch64_reg(name));
-            }
+        const char *delims = (isa.mem_open == '[') ? ",]! \t" : ",() \t";
+        if (!copy_token_delim(p, delims, name, sizeof(name))) {
+            return REG_NONE;
         }
     }
-}
 
-static inline uint8_t extract_named_reg_token(const char *op,
-                                              bool skip_hex_prefix,
-                                              ExtractRegFn parse_reg)
-{
-    char name[16];
-
-    op = skip_ascii_ws(op);
-
-    if ((*op >= '0' && *op <= '9') || *op == '-' || *op == '(') {
-        return REG_NONE;
-    }
-
-    if (skip_hex_prefix && op[0] == '0' && op[1] == 'x') {
-        return REG_NONE;
-    }
-
-    if (!copy_token_delim(op, ",() \t", name, sizeof(name))) {
-        return REG_NONE;
-    }
     return parse_reg(name);
 }
 
-static inline void extract_paren_mem_base_reg(const char *op, InsnFields *out,
-                                              ExtractRegFn parse_reg)
+/*
+ * Extract address registers from a memory operand.
+ * Behaviour branches on ISA syntax:
+ *  - x86:  disp(%base,%index,scale)  — iterate %name inside parens
+ *  - AArch64: [base, idx]            — base + optional index
+ *  - RISC-V/MIPS: offset(base)       — single base in parens
+ */
+static void extract_mem_regs_from_operand(const char *op, InsnFields *out)
 {
-    const char *p = strchr(op, '(');
+    const char *p = strchr(op, isa.mem_open);
     char name[16];
 
     if (!p) {
@@ -756,36 +551,43 @@ static inline void extract_paren_mem_base_reg(const char *op, InsnFields *out,
     }
     p = skip_ascii_ws(p + 1);
 
-    if (!copy_token_delim(p, "), \t", name, sizeof(name))) {
-        return;
+    if (isa.reg_prefix) {
+        /* x86: find all %name inside parentheses */
+        while (*p && *p != ')') {
+            const char *pfx = strchr(p, isa.reg_prefix);
+            const char *end = strchr(p, ')');
+            if (!pfx || (end && pfx > end)) {
+                return;
+            }
+            if (copy_token_delim(pfx + 1, ",() \t", name, sizeof(name))) {
+                add_src_reg(out, parse_reg(name));
+            }
+            p = pfx + 1 + strcspn(pfx + 1, ",)");
+            if (*p == ',') p++;
+        }
+    } else if (isa.mem_open == '[') {
+        /* AArch64: [base, optional_index] */
+        if (copy_token_delim(p, ",] \t", name, sizeof(name))) {
+            add_src_reg(out, parse_reg(name));
+        }
+        const char *bracket_end = strchr(p, ']');
+        const char *comma = strchr(p, ',');
+        if (comma && bracket_end && comma < bracket_end) {
+            comma = skip_ascii_ws(comma + 1);
+            if (*comma != '#') {
+                if (copy_token_delim(comma, ",] \t", name, sizeof(name))) {
+                    add_src_reg(out, parse_reg(name));
+                }
+            }
+        }
+    } else {
+        /* RISC-V/MIPS: offset(base) */
+        const char *q = p;
+        if (isa.strip_dollar && *q == '$') q++;
+        if (copy_token_delim(q, "), \t", name, sizeof(name))) {
+            add_src_reg(out, parse_reg(name));
+        }
     }
-    add_src_reg(out, parse_reg(name));
-}
-
-/*
- * Extract the first register from a RISC-V operand.
- */
-static uint8_t extract_riscv_reg(const char *op)
-{
-    return extract_named_reg_token(op, false, parse_riscv_reg);
-}
-
-static void extract_riscv_mem_regs(const char *op, InsnFields *out)
-{
-    extract_paren_mem_base_reg(op, out, parse_riscv_reg);
-}
-
-/*
- * Extract the first register from a MIPS operand.
- */
-static uint8_t extract_mips_reg(const char *op)
-{
-    return extract_named_reg_token(op, true, parse_mips_reg);
-}
-
-static void extract_mips_mem_regs(const char *op, InsnFields *out)
-{
-    extract_paren_mem_base_reg(op, out, parse_mips_reg);
 }
 
 /*
@@ -841,10 +643,10 @@ static inline void extract_immediate(const char *op, InsnFields *out)
 /*
  * Unified operand parser — ISA-agnostic.
  *
- * Uses the active ISA descriptor (isa.extract_reg, isa.extract_mem)
- * and the per-instruction capture_kinds/flags to parse operand strings
- * into InsnFields.  All ISA-specific behaviour is concentrated in the
- * function pointers set once at plugin init.
+ * Uses the ISA descriptor fields and the per-instruction
+ * capture_kinds/flags to parse operand strings into InsnFields.
+ * All ISA-specific behaviour is concentrated in the descriptor
+ * fields set once at plugin init.
  */
 static void parse_operands(const char *operands, InsnFields *out,
                            const uint8_t capture_kinds[4],
@@ -887,21 +689,21 @@ static void parse_operands(const char *operands, InsnFields *out,
     for (int i = 0; i < n; i++) {
         switch (capture_kinds[i]) {
         case CAP_SRC_REG: {
-            uint8_t r = isa.extract_reg(ops[i]);
+            uint8_t r = extract_reg_from_operand(ops[i]);
             if (r != REG_NONE) {
                 add_src_reg(out, r);
             }
             break;
         }
         case CAP_DST_REG: {
-            uint8_t r = isa.extract_reg(ops[i]);
+            uint8_t r = extract_reg_from_operand(ops[i]);
             if (r != REG_NONE) {
                 add_dst_reg(out, r);
             }
             break;
         }
         case CAP_RW_REG: {
-            uint8_t r = isa.extract_reg(ops[i]);
+            uint8_t r = extract_reg_from_operand(ops[i]);
             if (r != REG_NONE) {
                 add_src_reg(out, r);
                 add_dst_reg(out, r);
@@ -912,14 +714,14 @@ static void parse_operands(const char *operands, InsnFields *out,
         case CAP_DST_MEM:
         case CAP_MEM_ADDR:
             if (op_is_mem[i]) {
-                isa.extract_mem(ops[i], out);
+                extract_mem_regs_from_operand(ops[i], out);
             }
             break;
         case CAP_SRC_REG_OR_MEM:
             if (op_is_mem[i]) {
-                isa.extract_mem(ops[i], out);
+                extract_mem_regs_from_operand(ops[i], out);
             } else {
-                uint8_t r = isa.extract_reg(ops[i]);
+                uint8_t r = extract_reg_from_operand(ops[i]);
                 if (r != REG_NONE) {
                     add_src_reg(out, r);
                 }
@@ -927,9 +729,9 @@ static void parse_operands(const char *operands, InsnFields *out,
             break;
         case CAP_DST_REG_OR_MEM:
             if (op_is_mem[i]) {
-                isa.extract_mem(ops[i], out);
+                extract_mem_regs_from_operand(ops[i], out);
             } else {
-                uint8_t r = isa.extract_reg(ops[i]);
+                uint8_t r = extract_reg_from_operand(ops[i]);
                 if (r != REG_NONE) {
                     add_dst_reg(out, r);
                 }
@@ -937,9 +739,9 @@ static void parse_operands(const char *operands, InsnFields *out,
             break;
         case CAP_RW_REG_OR_MEM:
             if (op_is_mem[i]) {
-                isa.extract_mem(ops[i], out);
+                extract_mem_regs_from_operand(ops[i], out);
             } else {
-                uint8_t r = isa.extract_reg(ops[i]);
+                uint8_t r = extract_reg_from_operand(ops[i]);
                 if (r != REG_NONE) {
                     add_src_reg(out, r);
                     add_dst_reg(out, r);
@@ -971,7 +773,7 @@ static void parse_operands(const char *operands, InsnFields *out,
 
     /* Flag-driven LR-based RET promotion (non-x86 ISAs) */
     if ((flags & MF_CHK_LR_RET) && n_ops >= 1 &&
-        isa.extract_reg(ops[0]) == REG_LR) {
+        extract_reg_from_operand(ops[0]) == REG_LR) {
         out->opcode = GEN_OP_RET;
         out->branch_type = BRANCH_RETURN;
         add_src_reg(out, REG_LR);
@@ -3483,10 +3285,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     }
     g_hash_table_unref(template_map);
     g_hash_table_unref(branch_map);
-    g_hash_table_unref(x86_reg_ht);
-    g_hash_table_unref(aarch64_reg_ht);
-    g_hash_table_unref(riscv_reg_ht);
-    g_hash_table_unref(mips_reg_ht);
 
     if (isa.mnemonic_ht) {
         g_hash_table_unref(isa.mnemonic_ht);
@@ -3498,6 +3296,17 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
             g_regex_unref(c->re);
         }
         g_array_unref(isa.mnem_re_arr);
+    }
+    if (isa.reg_ht) {
+        g_hash_table_unref(isa.reg_ht);
+    }
+    if (isa.reg_re_arr) {
+        for (guint j = 0; j < isa.reg_re_arr->len; j++) {
+            CompiledRegRe *c = &g_array_index(isa.reg_re_arr,
+                                              CompiledRegRe, j);
+            g_regex_unref(c->re);
+        }
+        g_array_unref(isa.reg_re_arr);
     }
 
     g_hash_table_unref(insn_prefix_ht);
@@ -3652,52 +3461,57 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     branch_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
                                        NULL, g_free);
 
-    /* Build per-ISA register hash tables: values are biased uint8_t IDs */
-    x86_reg_ht = build_reg_hash_table(x86_reg_entries);
-    aarch64_reg_ht = build_reg_hash_table(aarch64_reg_entries);
-    riscv_reg_ht = build_reg_hash_table(riscv_reg_entries);
-    mips_reg_ht = build_reg_hash_table(mips_reg_entries);
-
     /*
-     * Build mnemonic hash table and regex fallback array for the active ISA.
-     * Set up the ISA descriptor with extraction function pointers.
+     * Set up the ISA descriptor: mnemonic tables, register tables,
+     * and syntax-driven extraction parameters.
      */
-    const MnemonicEntry *active_table = NULL;
+    const MnemonicEntry *active_mnem_table = NULL;
+    const RegEntry *active_reg_table = NULL;
     switch (trace_isa) {
     case TRACE_ISA_X86:
-        active_table = x86_mnemonic_table;
-        isa.extract_reg = extract_x86_reg;
-        isa.extract_mem = extract_x86_mem_regs;
+        active_mnem_table = x86_mnemonic_table;
+        active_reg_table = x86_reg_entries;
+        isa.reg_prefix = '%';
+        isa.mem_open = '(';
         isa.indirect_star = true;
+        isa.strip_dollar = false;
         break;
     case TRACE_ISA_AARCH64:
-        active_table = aarch64_mnemonic_table;
-        isa.extract_reg = extract_aarch64_reg;
-        isa.extract_mem = extract_aarch64_mem_regs;
+        active_mnem_table = aarch64_mnemonic_table;
+        active_reg_table = aarch64_reg_entries;
+        isa.reg_prefix = '\0';
+        isa.mem_open = '[';
         isa.indirect_star = false;
+        isa.strip_dollar = false;
         break;
     case TRACE_ISA_RISCV:
-        active_table = riscv_mnemonic_table;
-        isa.extract_reg = extract_riscv_reg;
-        isa.extract_mem = extract_riscv_mem_regs;
+        active_mnem_table = riscv_mnemonic_table;
+        active_reg_table = riscv_reg_entries;
+        isa.reg_prefix = '\0';
+        isa.mem_open = '(';
         isa.indirect_star = false;
+        isa.strip_dollar = false;
         break;
     case TRACE_ISA_MIPS:
-        active_table = mips_mnemonic_table;
-        isa.extract_reg = extract_mips_reg;
-        isa.extract_mem = extract_mips_mem_regs;
+        active_mnem_table = mips_mnemonic_table;
+        active_reg_table = mips_reg_entries;
+        isa.reg_prefix = '\0';
+        isa.mem_open = '(';
         isa.indirect_star = false;
+        isa.strip_dollar = true;
         break;
     default:
         break;
     }
 
-    if (active_table) {
+    if (active_mnem_table) {
         isa.mnemonic_ht = g_hash_table_new(g_str_hash, g_str_equal);
         isa.mnem_re_arr = g_array_new(FALSE, FALSE, sizeof(CompiledMnemRe));
 
-        for (int i = 0; active_table[i].name || active_table[i].mnem_re; i++) {
-            const MnemonicEntry *e = &active_table[i];
+        for (int i = 0;
+             active_mnem_table[i].name || active_mnem_table[i].mnem_re;
+             i++) {
+            const MnemonicEntry *e = &active_mnem_table[i];
             if (e->name) {
                 g_hash_table_insert(isa.mnemonic_ht,
                                     (gpointer)e->name, (gpointer)e);
@@ -3712,6 +3526,35 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                 } else {
                     g_warning("wptrace: bad mnem_re '%s': %s",
                               e->mnem_re, err->message);
+                    g_error_free(err);
+                }
+            }
+        }
+    }
+
+    if (active_reg_table) {
+        isa.reg_ht = g_hash_table_new(g_str_hash, g_str_equal);
+        isa.reg_re_arr = g_array_new(FALSE, FALSE, sizeof(CompiledRegRe));
+
+        for (int i = 0;
+             active_reg_table[i].name || active_reg_table[i].reg_re;
+             i++) {
+            const RegEntry *e = &active_reg_table[i];
+            if (e->name) {
+                g_hash_table_insert(isa.reg_ht, (gpointer)e->name,
+                                    GUINT_TO_POINTER((guint)e->reg_id
+                                                     + REG_HASH_BIAS));
+            }
+            if (e->reg_re) {
+                GError *err = NULL;
+                GRegex *re = g_regex_new(e->reg_re, G_REGEX_ANCHORED, 0,
+                                         &err);
+                if (re) {
+                    CompiledRegRe cre = { .re = re, .entry = e };
+                    g_array_append_val(isa.reg_re_arr, cre);
+                } else {
+                    g_warning("wptrace: bad reg_re '%s': %s",
+                              e->reg_re, err->message);
                     g_error_free(err);
                 }
             }

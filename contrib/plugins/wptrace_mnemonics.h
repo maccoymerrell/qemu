@@ -192,128 +192,130 @@ enum GenericRegId {
 
 /*
  * Register name → GenericRegId mapping entry.
- * Used to build per-ISA hash tables for O(1) register name lookups.
+ *
+ * Supports both exact-match and regex-fallback lookup, mirroring the
+ * mnemonic lookup pattern:
+ *   - Exact entries (name != NULL) go into a hash table for O(1) lookup.
+ *   - Regex entries (reg_re != NULL) are compiled at init and tried in
+ *     order when the hash table misses.  The first capture group is
+ *     parsed as an integer and the result is:
+ *         reg_id + captured_number + re_adj
  */
 typedef struct {
-    const char *name;
-    uint8_t reg_id;
+    const char *name;       /* exact register name, or NULL for regex-only  */
+    const char *reg_re;     /* regex pattern, or NULL for exact-only        */
+    uint8_t     reg_id;     /* register ID (exact) or base ID (regex)       */
+    int8_t      re_adj;     /* adjustment added to capture group for regex  */
 } RegEntry;
 
-/*
- * Register range mapping entry.
- * Matches names in the form <prefix><number> and maps them to a contiguous
- * GenericRegId interval: base_reg + (number - min_idx).
- */
-typedef struct {
-    const char *prefix;
-    uint8_t min_idx;
-    uint8_t max_idx;
-    uint8_t base_reg;
-} RegRangeEntry;
+/* Helper macros for building register tables */
+#define REG(n, id)             { .name = (n), .reg_re = NULL, \
+                                 .reg_id = (id), .re_adj = 0 }
+#define REG_RE(re, base, adj)  { .name = NULL, .reg_re = (re), \
+                                 .reg_id = (base), .re_adj = (adj) }
+#define REG_END                { .name = NULL, .reg_re = NULL, \
+                                 .reg_id = REG_NONE, .re_adj = 0 }
 
 /*
- * x86 register name table: maps all 64/32/16/8-bit GPR variants
- * and special registers to GenericRegId for hash table initialization.
+ * x86 register table: exact entries for standard GPR/special names,
+ * regex entries for extended GPRs (r8-r15), SIMD, and x87.
  */
 static const RegEntry x86_reg_entries[] = {
     /* 64-bit GPRs */
-    {"rax", REG_GPR0}, {"rcx", REG_GPR1}, {"rdx", REG_GPR2},
-    {"rbx", REG_GPR3}, {"rsp", REG_SP},   {"rbp", REG_FP_REG},
-    {"rsi", REG_GPR4}, {"rdi", REG_GPR5},
+    REG("rax", REG_GPR0), REG("rcx", REG_GPR1), REG("rdx", REG_GPR2),
+    REG("rbx", REG_GPR3), REG("rsp", REG_SP),   REG("rbp", REG_FP_REG),
+    REG("rsi", REG_GPR4), REG("rdi", REG_GPR5),
     /* 32-bit GPRs */
-    {"eax", REG_GPR0}, {"ecx", REG_GPR1}, {"edx", REG_GPR2},
-    {"ebx", REG_GPR3}, {"esp", REG_SP},   {"ebp", REG_FP_REG},
-    {"esi", REG_GPR4}, {"edi", REG_GPR5},
+    REG("eax", REG_GPR0), REG("ecx", REG_GPR1), REG("edx", REG_GPR2),
+    REG("ebx", REG_GPR3), REG("esp", REG_SP),   REG("ebp", REG_FP_REG),
+    REG("esi", REG_GPR4), REG("edi", REG_GPR5),
     /* 16-bit GPRs */
-    {"ax", REG_GPR0}, {"cx", REG_GPR1}, {"dx", REG_GPR2},
-    {"bx", REG_GPR3}, {"sp", REG_SP},   {"bp", REG_FP_REG},
-    {"si", REG_GPR4}, {"di", REG_GPR5},
+    REG("ax", REG_GPR0), REG("cx", REG_GPR1), REG("dx", REG_GPR2),
+    REG("bx", REG_GPR3), REG("sp", REG_SP),   REG("bp", REG_FP_REG),
+    REG("si", REG_GPR4), REG("di", REG_GPR5),
     /* 8-bit GPRs */
-    {"al", REG_GPR0}, {"ah", REG_GPR0},
-    {"cl", REG_GPR1}, {"ch", REG_GPR1},
-    {"dl", REG_GPR2}, {"dh", REG_GPR2},
-    {"bl", REG_GPR3}, {"bh", REG_GPR3},
-    {"spl", REG_SP},  {"bpl", REG_FP_REG},
-    {"sil", REG_GPR4}, {"dil", REG_GPR5},
+    REG("al", REG_GPR0), REG("ah", REG_GPR0),
+    REG("cl", REG_GPR1), REG("ch", REG_GPR1),
+    REG("dl", REG_GPR2), REG("dh", REG_GPR2),
+    REG("bl", REG_GPR3), REG("bh", REG_GPR3),
+    REG("spl", REG_SP),  REG("bpl", REG_FP_REG),
+    REG("sil", REG_GPR4), REG("dil", REG_GPR5),
     /* Special registers */
-    {"rip", REG_IP}, {"eip", REG_IP},
-    {"rflags", REG_FLAGS}, {"eflags", REG_FLAGS},
-    {NULL, 0}
+    REG("rip", REG_IP), REG("eip", REG_IP),
+    REG("rflags", REG_FLAGS), REG("eflags", REG_FLAGS),
+    REG("st", REG_FPR0),
+    /* Extended GPRs r8-r15 (with optional b/w/d suffix) */
+    REG_RE("^r((?:8|9|1[0-5]))[bwd]?$", REG_GPR0, -2),
+    /* XMM/YMM/ZMM vector registers */
+    REG_RE("^[xyz]mm(\\d+)$", REG_VEC0, 0),
+    /* MMX registers */
+    REG_RE("^mm(\\d+)$", REG_VEC0, 0),
+    REG_END
 };
 
 /*
- * AArch64 register name table for exact-match lookups.
+ * AArch64 register table: exact entries for special names,
+ * regex entries for numbered x/w GPRs and v/d/s/q/h/b vector aliases.
  */
 static const RegEntry aarch64_reg_entries[] = {
-    {"xzr", REG_NONE}, {"wzr", REG_NONE},
-    {"sp", REG_SP}, {"lr", REG_LR}, {"fp", REG_FP_REG},
-    {NULL, 0}
-};
-
-/* AArch64 register ranges: x/w GPRs and v/d/s/q/h/b vector aliases. */
-static const RegRangeEntry aarch64_reg_ranges[] = {
-    {"x", 0, 30, REG_GPR0},
-    {"w", 0, 30, REG_GPR0},
-    {"v", 0, 31, REG_VEC0},
-    {"d", 0, 31, REG_VEC0},
-    {"s", 0, 31, REG_VEC0},
-    {"q", 0, 31, REG_VEC0},
-    {"h", 0, 31, REG_VEC0},
-    {"b", 0, 31, REG_VEC0},
-    {NULL, 0, 0, 0}
+    REG("xzr", REG_NONE), REG("wzr", REG_NONE),
+    REG("sp", REG_SP), REG("lr", REG_LR), REG("fp", REG_FP_REG),
+    /* x0-x30, w0-w30 → GPR0+n */
+    REG_RE("^[xw](\\d+)$", REG_GPR0, 0),
+    /* v/d/s/q/h/b 0-31 → VEC0+n */
+    REG_RE("^[vdsqhb](\\d+)$", REG_VEC0, 0),
+    REG_END
 };
 
 /*
- * RISC-V register name table for exact-match lookups.
+ * RISC-V register table: exact entries for special names,
+ * regex entries for ABI (t/s/a) and raw (x/f) register forms.
+ * Order matters: more specific patterns (ft, fs, fa) before generic (f).
  */
 static const RegEntry riscv_reg_entries[] = {
-    {"zero", REG_NONE},
-    {"ra", REG_LR}, {"sp", REG_SP}, {"gp", REG_GPR3},
-    {"tp", REG_GPR4}, {"fp", REG_FP_REG},
-    {"x0", REG_NONE}, {"x1", REG_LR}, {"x2", REG_SP}, {"x8", REG_FP_REG},
-    {"s0", REG_FP_REG}, {"s1", REG_GPR9},
-    {NULL, 0}
-};
-
-/* RISC-V register ranges for ABI and x/f naming forms. */
-static const RegRangeEntry riscv_reg_ranges[] = {
-    {"t", 0, 2, REG_GPR5},
-    {"t", 3, 6, REG_GPR28},
-    {"s", 2, 11, REG_GPR18},
-    {"a", 0, 7, REG_GPR10},
-    {"x", 3, 31, REG_GPR3},
-    {"ft", 0, 7, REG_FPR0},
-    {"ft", 8, 11, REG_FPR0 + 28},
-    {"fs", 0, 1, REG_FPR0 + 8},
-    {"fs", 2, 11, REG_FPR0 + 18},
-    {"fa", 0, 7, REG_FPR0 + 10},
-    {"f", 0, 31, REG_FPR0},
-    {NULL, 0, 0, 0}
+    REG("zero", REG_NONE),
+    REG("ra", REG_LR), REG("sp", REG_SP), REG("gp", REG_GPR3),
+    REG("tp", REG_GPR4), REG("fp", REG_FP_REG),
+    REG("x0", REG_NONE), REG("x1", REG_LR), REG("x2", REG_SP),
+    REG("x8", REG_FP_REG), REG("s0", REG_FP_REG), REG("s1", REG_GPR9),
+    /* GPR ranges */
+    REG_RE("^t([0-2])$",  REG_GPR5,  0),     /* t0-2  → GPR5-7   */
+    REG_RE("^t([3-6])$",  REG_GPR28, -3),    /* t3-6  → GPR28-31 */
+    REG_RE("^s(\\d+)$",   REG_GPR18, -2),    /* s2-11 → GPR18-27 */
+    REG_RE("^a([0-7])$",  REG_GPR10, 0),     /* a0-7  → GPR10-17 */
+    REG_RE("^x(\\d+)$",   REG_GPR0,  0),     /* x3-31 → GPR3-31  */
+    /* FPR ranges (specific before generic) */
+    REG_RE("^ft([0-7])$", REG_FPR0,      0), /* ft0-7  → FPR0-7   */
+    REG_RE("^ft(\\d+)$",  REG_FPR0,     20), /* ft8-11 → FPR28-31 */
+    REG_RE("^fs([01])$",  REG_FPR0 + 8,  0), /* fs0-1  → FPR8-9   */
+    REG_RE("^fs(\\d+)$",  REG_FPR0 + 18,-2), /* fs2-11 → FPR18-27 */
+    REG_RE("^fa([0-7])$", REG_FPR0 + 10, 0), /* fa0-7  → FPR10-17 */
+    REG_RE("^f(\\d+)$",   REG_FPR0,      0), /* f0-31  → FPR0-31  */
+    REG_END
 };
 
 /*
- * MIPS register name table for exact-match lookups.
+ * MIPS register table: exact entries for special names,
+ * regex entries for ABI (v/a/t/s/k) and numeric register forms.
+ * Register names may have an optional $ prefix (stripped before lookup).
  */
 static const RegEntry mips_reg_entries[] = {
-    {"zero", REG_NONE}, {"0", REG_NONE},
-    {"at", REG_GPR1}, {"sp", REG_SP}, {"fp", REG_FP_REG},
-    {"ra", REG_LR}, {"gp", REG_GPR28},
-    {"s8", REG_FP_REG},
-    {"29", REG_SP}, {"30", REG_FP_REG}, {"31", REG_LR},
-    {NULL, 0}
-};
-
-/* MIPS register ranges (oldabi/default naming in QEMU disassembly). */
-static const RegRangeEntry mips_reg_ranges[] = {
-    {"v", 0, 1, REG_GPR2},
-    {"a", 0, 7, REG_GPR4},
-    {"t", 0, 7, REG_GPR8},
-    {"t", 8, 9, REG_GPR24},
-    {"s", 0, 7, REG_GPR16},
-    {"k", 0, 1, REG_GPR26},
-    {"", 1, 28, REG_GPR1},
-    {"f", 0, 31, REG_FPR0},
-    {NULL, 0, 0, 0}
+    REG("zero", REG_NONE), REG("0", REG_NONE),
+    REG("at", REG_GPR1), REG("sp", REG_SP), REG("fp", REG_FP_REG),
+    REG("ra", REG_LR), REG("gp", REG_GPR28),
+    REG("s8", REG_FP_REG),
+    REG("29", REG_SP), REG("30", REG_FP_REG), REG("31", REG_LR),
+    /* GPR ranges */
+    REG_RE("^v([01])$",   REG_GPR2,  0),     /* v0-1  → GPR2-3   */
+    REG_RE("^a([0-7])$",  REG_GPR4,  0),     /* a0-7  → GPR4-11  */
+    REG_RE("^t([0-7])$",  REG_GPR8,  0),     /* t0-7  → GPR8-15  */
+    REG_RE("^t([89])$",   REG_GPR24, -8),    /* t8-9  → GPR24-25 */
+    REG_RE("^s([0-7])$",  REG_GPR16, 0),     /* s0-7  → GPR16-23 */
+    REG_RE("^k([01])$",   REG_GPR26, 0),     /* k0-1  → GPR26-27 */
+    REG_RE("^(\\d+)$",    REG_GPR0,  0),     /* $1-28 → GPR1-28  */
+    /* FPR ranges */
+    REG_RE("^f(\\d+)$",   REG_FPR0,  0),     /* f0-31 → FPR0-31  */
+    REG_END
 };
 
 /* Mnemonic-to-opcode lookup table entry */

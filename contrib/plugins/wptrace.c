@@ -51,10 +51,13 @@ static int max_wrong_path_depth = 64;
 static bool enable_wrong_path = true;
 static bool enable_debug_text = false;
 static char *output_base_path = NULL;
+static char *unknown_warn_path = NULL;
 static char *program_name = NULL;
 static uint64_t trace_start_insn = 0;
 static uint64_t trace_stop_insn = UINT64_MAX;
 static const char *target_name;
+static FILE *unknown_warn_file;
+static GMutex unknown_warn_lock;
 
 /* ISA enum for extensibility: add new ISAs here */
 typedef enum {
@@ -100,96 +103,7 @@ static guint simpoints_current_idx = 0;
 #define MAX_SRC_REGS 4
 #define MAX_DST_REGS 4
 
-/*
- * ISA-agnostic generic opcodes.
- * Each value encodes the generic function of an instruction's operation,
- * consistent across all ISAs supported by QEMU.
- */
-enum GenericOpcode {
-    GEN_OP_UNKNOWN = 0,
-    GEN_OP_INT_ADD = 1,
-    GEN_OP_INT_SUB = 2,
-    GEN_OP_INT_MUL = 3,
-    GEN_OP_INT_DIV = 4,
-    GEN_OP_AND = 5,
-    GEN_OP_OR = 6,
-    GEN_OP_XOR = 7,
-    GEN_OP_NOT = 8,
-    GEN_OP_SHL = 9,
-    GEN_OP_SHR = 10,
-    GEN_OP_SAR = 11,
-    GEN_OP_ROL = 12,
-    GEN_OP_ROR = 13,
-    GEN_OP_MOV = 14,
-    GEN_OP_LOAD = 15,
-    GEN_OP_STORE = 16,
-    GEN_OP_PUSH = 17,
-    GEN_OP_POP = 18,
-    GEN_OP_LEA = 19,
-    GEN_OP_MOVSX = 20,
-    GEN_OP_MOVZX = 21,
-    GEN_OP_XCHG = 22,
-    GEN_OP_CMP = 23,
-    GEN_OP_TEST = 24,
-    GEN_OP_BRANCH = 25,
-    GEN_OP_CALL = 26,
-    GEN_OP_RET = 27,
-    GEN_OP_FP_ADD = 28,
-    GEN_OP_FP_SUB = 29,
-    GEN_OP_FP_MUL = 30,
-    GEN_OP_FP_DIV = 31,
-    GEN_OP_FP_SQRT = 32,
-    GEN_OP_FP_MOV = 33,
-    GEN_OP_FP_CVT = 34,
-    GEN_OP_FP_CMP = 35,
-    GEN_OP_VEC_ADD = 36,
-    GEN_OP_VEC_SUB = 37,
-    GEN_OP_VEC_MUL = 38,
-    GEN_OP_VEC_MOV = 39,
-    GEN_OP_VEC_SHUF = 40,
-    GEN_OP_VEC_LOGIC = 41,
-    GEN_OP_NOP = 42,
-    GEN_OP_SYSCALL = 43,
-    GEN_OP_FENCE = 44,
-    GEN_OP_CMOV = 45,
-    GEN_OP_SETCC = 46,
-    GEN_OP_INT_ADC = 47,
-    GEN_OP_INT_SBB = 48,
-    GEN_OP_NEG = 49,
-    GEN_OP_INC = 50,
-    GEN_OP_DEC = 51,
-    GEN_OP_COUNT
-};
-
-/*
- * Branch type classification.
- */
-enum BranchType {
-    BRANCH_NONE = 0,
-    BRANCH_DIRECT_JUMP = 1,
-    BRANCH_INDIRECT_JUMP = 2,
-    BRANCH_DIRECT_CALL = 3,
-    BRANCH_INDIRECT_CALL = 4,
-    BRANCH_RETURN = 5,
-    BRANCH_SYSCALL_TYPE = 6,
-    BRANCH_COND_DIRECT = 7,
-    BRANCH_TYPE_COUNT,
-};
-
-enum GenericExceptionId {
-    GEN_EXC_NONE = 0,
-    GEN_EXC_UNKNOWN = 1,
-    GEN_EXC_INT_DIVIDE_BY_ZERO = 2,
-    GEN_EXC_FP_DIVIDE_BY_ZERO = 3,
-    GEN_EXC_MEMORY_ACCESS = 4,
-    GEN_EXC_COUNT,
-};
-
-enum WPStopReason {
-    WP_STOP_NONE = 0,
-    WP_STOP_SYSCALL_USERMODE = 1,
-    WP_STOP_REASON_COUNT,
-};
+#include "wptrace_mnemonics.h"
 
 _Static_assert(TRACE_ISA_MIPS < (1U << WPT_ISA_BITS),
                "TraceISA no longer fits packed width");
@@ -201,60 +115,6 @@ _Static_assert(MAX_SRC_REGS <= ((1U << WPT_REG_COUNT_BITS) - 1),
                "MAX_SRC_REGS no longer fits packed width");
 _Static_assert(MAX_DST_REGS <= ((1U << WPT_REG_COUNT_BITS) - 1),
                "MAX_DST_REGS no longer fits packed width");
-
-/*
- * ISA-agnostic register IDs.
- * Consistent numbering across ISAs with reserved special register IDs.
- */
-enum GenericRegId {
-    REG_NONE = 0,
-    /* General-purpose integer registers: 1-64 */
-    REG_GPR0 = 1,
-    REG_GPR1 = 2,
-    REG_GPR2 = 3,
-    REG_GPR3 = 4,
-    REG_GPR4 = 5,
-    REG_GPR5 = 6,
-    REG_GPR6 = 7,
-    REG_GPR7 = 8,
-    REG_GPR8 = 9,
-    REG_GPR9 = 10,
-    REG_GPR10 = 11,
-    REG_GPR11 = 12,
-    REG_GPR12 = 13,
-    REG_GPR13 = 14,
-    REG_GPR14 = 15,
-    REG_GPR15 = 16,
-    REG_GPR16 = 17,
-    REG_GPR17 = 18,
-    REG_GPR18 = 19,
-    REG_GPR19 = 20,
-    REG_GPR20 = 21,
-    REG_GPR21 = 22,
-    REG_GPR22 = 23,
-    REG_GPR23 = 24,
-    REG_GPR24 = 25,
-    REG_GPR25 = 26,
-    REG_GPR26 = 27,
-    REG_GPR27 = 28,
-    REG_GPR28 = 29,
-    REG_GPR29 = 30,
-    REG_GPR30 = 31,
-    REG_GPR31 = 32,
-    /* GPR32-GPR63 follow sequentially (33-64) */
-    /* Floating-point registers: 65-128 */
-    REG_FPR0 = 65,
-    /* FPR1-FPR63 follow sequentially (66-128) */
-    /* Vector/SIMD registers: 129-192 */
-    REG_VEC0 = 129,
-    /* VEC1-VEC63 follow sequentially (130-192) */
-    /* Special registers: 250-254 */
-    REG_SP = 250,
-    REG_FLAGS = 251,
-    REG_IP = 252,
-    REG_LR = 253,
-    REG_FP_REG = 254,
-};
 
 /*
  * Decoded ISA-agnostic instruction fields.
@@ -274,97 +134,43 @@ typedef struct {
 
 /* ========================= Disassembly-Based Generic Decode ========================= */
 
-/*
- * Register name → GenericRegId mapping entry.
- * Used to build per-ISA hash tables for O(1) register name lookups.
- */
-typedef struct {
-    const char *name;
-    uint8_t reg_id;
-} RegEntry;
-
-/*
- * x86 register name table: maps all 64/32/16/8-bit GPR variants
- * and special registers to GenericRegId for hash table initialization.
- */
-static const RegEntry x86_reg_entries[] = {
-    /* 64-bit GPRs */
-    {"rax", REG_GPR0}, {"rcx", REG_GPR1}, {"rdx", REG_GPR2},
-    {"rbx", REG_GPR3}, {"rsp", REG_SP},   {"rbp", REG_FP_REG},
-    {"rsi", REG_GPR4}, {"rdi", REG_GPR5},
-    /* 32-bit GPRs */
-    {"eax", REG_GPR0}, {"ecx", REG_GPR1}, {"edx", REG_GPR2},
-    {"ebx", REG_GPR3}, {"esp", REG_SP},   {"ebp", REG_FP_REG},
-    {"esi", REG_GPR4}, {"edi", REG_GPR5},
-    /* 16-bit GPRs */
-    {"ax", REG_GPR0}, {"cx", REG_GPR1}, {"dx", REG_GPR2},
-    {"bx", REG_GPR3}, {"sp", REG_SP},   {"bp", REG_FP_REG},
-    {"si", REG_GPR4}, {"di", REG_GPR5},
-    /* 8-bit GPRs */
-    {"al", REG_GPR0}, {"ah", REG_GPR0},
-    {"cl", REG_GPR1}, {"ch", REG_GPR1},
-    {"dl", REG_GPR2}, {"dh", REG_GPR2},
-    {"bl", REG_GPR3}, {"bh", REG_GPR3},
-    {"spl", REG_SP},  {"bpl", REG_FP_REG},
-    {"sil", REG_GPR4}, {"dil", REG_GPR5},
-    /* Special registers */
-    {"rip", REG_IP}, {"eip", REG_IP},
-    {"rflags", REG_FLAGS}, {"eflags", REG_FLAGS},
-    {NULL, 0}
-};
-
-/*
- * AArch64 register name table for exact-match lookups.
- */
-static const RegEntry aarch64_reg_entries[] = {
-    {"xzr", REG_NONE}, {"wzr", REG_NONE},
-    {"sp", REG_SP}, {"lr", REG_LR}, {"fp", REG_FP_REG},
-    {NULL, 0}
-};
-
-/*
- * RISC-V register name table for exact-match lookups.
- */
-static const RegEntry riscv_reg_entries[] = {
-    {"zero", REG_NONE},
-    {"ra", REG_LR}, {"sp", REG_SP}, {"gp", REG_GPR3},
-    {"tp", REG_GPR4}, {"fp", REG_FP_REG},
-    {NULL, 0}
-};
-
-/*
- * MIPS register name table for exact-match lookups.
- */
-static const RegEntry mips_reg_entries[] = {
-    {"zero", REG_NONE}, {"0", REG_NONE},
-    {"at", REG_GPR1}, {"sp", REG_SP}, {"fp", REG_FP_REG},
-    {"ra", REG_LR}, {"gp", REG_GPR28},
-    {NULL, 0}
-};
-
-/* Per-ISA register and mnemonic hash tables (built once at init) */
+/* Per-ISA register hash tables (built once at init) */
 static GHashTable *x86_reg_ht;
 static GHashTable *aarch64_reg_ht;
 static GHashTable *riscv_reg_ht;
 static GHashTable *mips_reg_ht;
-static GHashTable *x86_mnemonic_ht;
-static GHashTable *aarch64_mnemonic_ht;
-static GHashTable *riscv_mnemonic_ht;
-static GHashTable *mips_mnemonic_ht;
 
 /*
- * Prefix classification hash table: maps prefix strings to MnemonicEntry
- * pointers for O(1) prefix-based mnemonic classification.
- * Two kinds of entries:
- *   - Dot-prefixes (e.g. "fadd.", "lr.", "b."): matched by extracting the
- *     mnemonic up to and including the first '.'.
- *   - Bare prefixes (e.g. "amo", "cmov", "set"): matched by truncating the
- *     mnemonic to known prefix lengths (4, then 3).
+ * Per-ISA compiled mnemonic regex fallback arrays.
+ * Each array pairs a compiled GRegex with the originating MnemonicEntry
+ * for MNEM_RE entries (name == NULL, mnem_re != NULL).
+ * Built once at init; tried in order when exact hash lookup fails.
  */
-static GHashTable *x86_prefix_ht;
-static GHashTable *aarch64_prefix_ht;
-static GHashTable *riscv_prefix_ht;
-static GHashTable *mips_prefix_ht;
+typedef struct {
+    GRegex *re;
+    const MnemonicEntry *entry;
+} CompiledMnemRe;
+
+typedef uint8_t (*ExtractRegFn)(const char *op);
+typedef void (*ExtractMemRegsFn)(const char *op, InsnFields *out);
+
+/*
+ * ISA descriptor: concentrates all ISA-specific behaviour into a single
+ * struct so that the generic operand parser and mnemonic lookup need
+ * zero switch-on-ISA logic.  Set once at plugin init.
+ */
+typedef struct {
+    ExtractRegFn    extract_reg;     /* extract register from operand token  */
+    ExtractMemRegsFn extract_mem;    /* extract memory address registers     */
+    GHashTable     *mnemonic_ht;     /* exact-match mnemonic → MnemonicEntry */
+    GArray         *mnem_re_arr;     /* compiled regex fallback (linear scan)*/
+    bool            indirect_star;   /* x86: '*' marks indirect branch       */
+} IsaDesc;
+
+static IsaDesc isa;                  /* active ISA (set once at init)        */
+
+/* Cache of compiled operand regex patterns (pattern string -> GRegex*). */
+static GHashTable *operand_regex_ht;
 
 /*
  * x86 instruction prefix set: contains prefixes like "lock", "rep", etc.
@@ -377,6 +183,8 @@ static GHashTable *insn_prefix_ht;
  * (encoded via GINT_TO_POINTER) for O(1) option dispatch.
  */
 static GHashTable *option_ht;
+/* Forward declaration used by warning path before global-state block. */
+static uint64_t stat_unknown_insn_warnings;
 
 enum PluginOptId {
     OPT_DEPTH = 1,   /* Start at 1 so 0 (NULL) indicates not-found */
@@ -427,6 +235,55 @@ static inline bool reg_hash_lookup(GHashTable *ht, const char *name,
         return true;
     }
     return false;
+}
+
+
+static bool parse_u8_suffix(const char *s, int *out)
+{
+    char *end;
+    long v;
+
+    if (!s || !*s) {
+        return false;
+    }
+
+    v = strtol(s, &end, 10);
+    if (*end != '\0' || v < 0 || v > UINT8_MAX) {
+        return false;
+    }
+
+    *out = (int)v;
+    return true;
+}
+
+static uint8_t reg_lookup_with_ranges(GHashTable *ht, const char *name,
+                                      const RegRangeEntry *ranges)
+{
+    uint8_t reg_id;
+
+    if (reg_hash_lookup(ht, name, &reg_id)) {
+        return reg_id;
+    }
+
+    for (int i = 0; ranges && ranges[i].prefix; i++) {
+        const RegRangeEntry *r = &ranges[i];
+        size_t plen = strlen(r->prefix);
+        int idx;
+
+        if (strncmp(name, r->prefix, plen) != 0) {
+            continue;
+        }
+        if (!parse_u8_suffix(name + plen, &idx)) {
+            continue;
+        }
+        if (idx < r->min_idx || idx > r->max_idx) {
+            continue;
+        }
+
+        return (uint8_t)(r->base_reg + (idx - r->min_idx));
+    }
+
+    return REG_NONE;
 }
 
 static inline void add_src_reg(InsnFields *f, uint8_t reg_id)
@@ -505,33 +362,11 @@ static uint8_t parse_x86_reg(const char *name)
  */
 static uint8_t parse_aarch64_reg(const char *name)
 {
-    uint8_t reg_id;
-
     if (!name || !*name) {
         return REG_NONE;
     }
 
-    /* General purpose: x0-x30, w0-w30 */
-    if ((name[0] == 'x' || name[0] == 'w') &&
-        name[1] >= '0' && name[1] <= '9') {
-        int n = atoi(name + 1);
-        if (n >= 0 && n <= 30) return REG_GPR0 + (uint8_t)n;
-    }
-
-    /* O(1) hash lookup for special register names (xzr, wzr, sp, lr, fp) */
-    if (reg_hash_lookup(aarch64_reg_ht, name, &reg_id)) {
-        return reg_id;
-    }
-
-    /* Vector/FP: v0-v31, d0-d31, s0-s31, q0-q31, h0-h31, b0-b31 */
-    if ((name[0] == 'v' || name[0] == 'd' || name[0] == 's' ||
-         name[0] == 'q' || name[0] == 'h' || name[0] == 'b') &&
-        name[1] >= '0' && name[1] <= '9') {
-        int n = atoi(name + 1);
-        if (n >= 0 && n < 32) return REG_VEC0 + (uint8_t)n;
-    }
-
-    return REG_NONE;
+    return reg_lookup_with_ranges(aarch64_reg_ht, name, aarch64_reg_ranges);
 }
 
 /*
@@ -540,76 +375,11 @@ static uint8_t parse_aarch64_reg(const char *name)
  */
 static uint8_t parse_riscv_reg(const char *name)
 {
-    uint8_t reg_id;
-
     if (!name || !*name) {
         return REG_NONE;
     }
 
-    /* O(1) hash lookup for special register names (zero, ra, sp, gp, tp, fp) */
-    if (reg_hash_lookup(riscv_reg_ht, name, &reg_id)) {
-        return reg_id;
-    }
-
-    /* Temporary registers: t0-t6 */
-    if (name[0] == 't' && name[1] >= '0' && name[1] <= '6' &&
-        name[2] == '\0') {
-        int n = name[1] - '0';
-        if (n <= 2) return REG_GPR5 + (uint8_t)n;      /* t0=x5..t2=x7 */
-        return REG_GPR28 + (uint8_t)(n - 3);            /* t3=x28..t6=x31 */
-    }
-
-    /* Saved registers: s0-s11 */
-    if (name[0] == 's' && name[1] >= '0' && name[1] <= '9') {
-        int n = atoi(name + 1);
-        if (n == 0) return REG_FP_REG;                  /* s0 = fp = x8 */
-        if (n == 1) return REG_GPR9;                     /* s1 = x9 */
-        if (n >= 2 && n <= 11) {
-            return REG_GPR18 + (uint8_t)(n - 2);        /* s2=x18..s11=x27 */
-        }
-    }
-
-    /* Argument registers: a0-a7 */
-    if (name[0] == 'a' && name[1] >= '0' && name[1] <= '7' &&
-        name[2] == '\0') {
-        int n = name[1] - '0';
-        return REG_GPR10 + (uint8_t)n;                  /* a0=x10..a7=x17 */
-    }
-
-    /* x-register notation: x0-x31 */
-    if (name[0] == 'x' && name[1] >= '0' && name[1] <= '9') {
-        int n = atoi(name + 1);
-        if (n == 0) return REG_NONE;
-        if (n == 1) return REG_LR;
-        if (n == 2) return REG_SP;
-        if (n == 8) return REG_FP_REG;
-        if (n >= 3 && n <= 31) return REG_GPR0 + (uint8_t)n;
-    }
-
-    /* RISC-V FP ABI names: ft0-ft11, fs0-fs11, fa0-fa7 */
-    if (name[0] == 'f') {
-        if (name[1] == 't' && name[2] >= '0' && name[2] <= '9') {
-            int n = atoi(name + 2);
-            if (n >= 0 && n <= 7) return REG_FPR0 + (uint8_t)n;
-            if (n >= 8 && n <= 11) return REG_FPR0 + (uint8_t)(n + 20);
-        }
-        if (name[1] == 's' && name[2] >= '0' && name[2] <= '9') {
-            int n = atoi(name + 2);
-            if (n >= 0 && n <= 1) return REG_FPR0 + (uint8_t)(n + 8);
-            if (n >= 2 && n <= 11) return REG_FPR0 + (uint8_t)(n + 16);
-        }
-        if (name[1] == 'a' && name[2] >= '0' && name[2] <= '7') {
-            int n = atoi(name + 2);
-            return REG_FPR0 + (uint8_t)(n + 10);
-        }
-        /* f0-f31 notation */
-        if (name[1] >= '0' && name[1] <= '9') {
-            int n = atoi(name + 1);
-            if (n >= 0 && n < 32) return REG_FPR0 + (uint8_t)n;
-        }
-    }
-
-    return REG_NONE;
+    return reg_lookup_with_ranges(riscv_reg_ht, name, riscv_reg_ranges);
 }
 
 /*
@@ -619,8 +389,6 @@ static uint8_t parse_riscv_reg(const char *name)
  */
 static uint8_t parse_mips_reg(const char *name)
 {
-    uint8_t reg_id;
-
     if (!name || !*name) {
         return REG_NONE;
     }
@@ -629,172 +397,57 @@ static uint8_t parse_mips_reg(const char *name)
     const char *p = name;
     if (*p == '$') p++;
 
-    /* O(1) hash lookup for special register names (zero, at, sp, fp, ra, gp) */
-    if (reg_hash_lookup(mips_reg_ht, p, &reg_id)) {
-        return reg_id;
-    }
-
-    /* Return values: v0-v1 */
-    if (p[0] == 'v' && (p[1] == '0' || p[1] == '1') && p[2] == '\0') {
-        return REG_GPR0 + (uint8_t)(2 + (p[1] - '0'));  /* v0=$2, v1=$3 */
-    }
-
-    /* Arguments: a0-a7 (a0-a3 in oldabi, a0-a7 in newabi) */
-    if (p[0] == 'a' && p[1] >= '0' && p[1] <= '7' && p[2] == '\0') {
-        return REG_GPR0 + (uint8_t)(4 + (p[1] - '0'));
-    }
-
-    /*
-     * Temporaries: t0-t9 (oldabi mapping, QEMU default).
-     * In oldabi: t0-t7=$8-$15, t8-t9=$24-$25
-     */
-    if (p[0] == 't' && p[1] >= '0' && p[1] <= '9' && p[2] == '\0') {
-        int n = p[1] - '0';
-        if (n <= 7) return REG_GPR0 + (uint8_t)(8 + n);
-        if (n == 8) return REG_GPR24;
-        if (n == 9) return REG_GPR25;
-    }
-
-    /* Saved: s0-s8 */
-    if (p[0] == 's' && p[1] >= '0' && p[1] <= '8' && p[2] == '\0') {
-        int n = p[1] - '0';
-        if (n <= 7) return REG_GPR0 + (uint8_t)(16 + n);  /* s0=$16..s7=$23 */
-        if (n == 8) return REG_FP_REG;                      /* s8=$30=fp */
-    }
-
-    /* Kernel: k0-k1 */
-    if (p[0] == 'k' && (p[1] == '0' || p[1] == '1') && p[2] == '\0') {
-        return REG_GPR0 + (uint8_t)(26 + (p[1] - '0'));
-    }
-
-    /* Numeric GPR: $1-$31 */
-    if (p[0] >= '1' && p[0] <= '9') {
-        int n = atoi(p);
-        if (n == 29) return REG_SP;
-        if (n == 30) return REG_FP_REG;
-        if (n == 31) return REG_LR;
-        if (n >= 1 && n <= 31) return REG_GPR0 + (uint8_t)n;
-    }
-
-    /* FP registers: $f0-$f31 or f0-f31 */
-    if (p[0] == 'f' && p[1] >= '0' && p[1] <= '9') {
-        int n = atoi(p + 1);
-        if (n >= 0 && n < 32) return REG_FPR0 + (uint8_t)n;
-    }
-
-    return REG_NONE;
+    return reg_lookup_with_ranges(mips_reg_ht, p, mips_reg_ranges);
 }
 
-/* Mnemonic-to-opcode lookup table entry */
-typedef struct {
-    const char *name;
-    uint8_t opcode;
-    uint8_t branch_type;
-    bool branch_conditional;
-} MnemonicEntry;
-
-#include "wptrace_mnemonics.h"
-
 /*
- * Look up a base mnemonic in the hash table (O(1) average case).
- * Returns true if found, filling opcode and branch_type.
+ * Look up a base mnemonic in the active ISA's hash table (O(1)).
+ * Returns true if found, filling opcode, branch_type, flags, etc.
  */
 static bool lookup_mnemonic(const char *mnem, uint8_t *opcode,
                             uint8_t *branch_type,
-                            bool *branch_conditional)
+                            uint16_t *flags,
+                            const uint8_t **capture_kinds,
+                            const char **operand_regex)
 {
-    GHashTable *mnemonic_ht = NULL;
-
-    switch (trace_isa) {
-    case TRACE_ISA_X86:
-        mnemonic_ht = x86_mnemonic_ht;
-        break;
-    case TRACE_ISA_AARCH64:
-        mnemonic_ht = aarch64_mnemonic_ht;
-        break;
-    case TRACE_ISA_RISCV:
-        mnemonic_ht = riscv_mnemonic_ht;
-        break;
-    case TRACE_ISA_MIPS:
-        mnemonic_ht = mips_mnemonic_ht;
-        break;
-    default:
-        return false;
-    }
-
-    const MnemonicEntry *entry = g_hash_table_lookup(mnemonic_ht, mnem);
+    const MnemonicEntry *entry = g_hash_table_lookup(isa.mnemonic_ht, mnem);
     if (entry) {
         *opcode = entry->opcode;
         *branch_type = entry->branch_type;
-        *branch_conditional = entry->branch_conditional;
+        *flags = entry->flags;
+        *capture_kinds = entry->capture_kinds;
+        *operand_regex = entry->operand_regex;
         return true;
     }
     return false;
 }
 
 /*
- * Try to classify a mnemonic by prefix match using O(1) hash lookups.
- * Two strategies:
- *   1. Dot-prefix: extract the portion up to and including the first '.'
- *      and look it up (e.g., "fadd.s" → key "fadd.").
- *   2. Bare-prefix: truncate the mnemonic to lengths 4 then 3, requiring
- *      the mnemonic to be strictly longer than the prefix. This handles
- *      patterns like "cmov<cc>", "set<cc>", "amo*", etc.
+ * Try to classify a mnemonic by regex pattern matching.
+ * Iterates over the active ISA's compiled regex array in order.
  */
-static bool lookup_prefix_class(const char *mnem, uint8_t *opcode,
-                                uint8_t *branch_type,
-                                bool *branch_conditional)
+static bool lookup_mnem_regex_fallback(const char *mnem, uint8_t *opcode,
+                                       uint8_t *branch_type,
+                                       uint16_t *flags,
+                                       const uint8_t **capture_kinds,
+                                       const char **operand_regex)
 {
-    char buf[16];
-    GHashTable *prefix_ht = NULL;
+    GArray *arr = isa.mnem_re_arr;
 
-    switch (trace_isa) {
-    case TRACE_ISA_X86:
-        prefix_ht = x86_prefix_ht;
-        break;
-    case TRACE_ISA_AARCH64:
-        prefix_ht = aarch64_prefix_ht;
-        break;
-    case TRACE_ISA_RISCV:
-        prefix_ht = riscv_prefix_ht;
-        break;
-    case TRACE_ISA_MIPS:
-        prefix_ht = mips_prefix_ht;
-        break;
-    default:
+    if (!arr) {
         return false;
     }
 
-    /* Dot-prefix: extract up to first '.' inclusive */
-    const char *dot = strchr(mnem, '.');
-    if (dot) {
-        size_t plen = (size_t)(dot - mnem) + 1;
-        if (plen < sizeof(buf)) {
-            memcpy(buf, mnem, plen);
-            buf[plen] = '\0';
-            const MnemonicEntry *e = g_hash_table_lookup(prefix_ht, buf);
-            if (e) {
-                *opcode = e->opcode;
-                *branch_type = e->branch_type;
-                *branch_conditional = e->branch_conditional;
-                return true;
-            }
-        }
-    }
-
-    /* Bare-prefix: try lengths 4 then 3 (covers all known non-dot patterns) */
-    size_t mlen = strlen(mnem);
-    for (int plen = 4; plen >= 3; plen--) {
-        if ((size_t)plen < mlen) {
-            memcpy(buf, mnem, plen);
-            buf[plen] = '\0';
-            const MnemonicEntry *e = g_hash_table_lookup(prefix_ht, buf);
-            if (e) {
-                *opcode = e->opcode;
-                *branch_type = e->branch_type;
-                *branch_conditional = e->branch_conditional;
-                return true;
-            }
+    for (guint i = 0; i < arr->len; i++) {
+        const CompiledMnemRe *cmr = &g_array_index(arr, CompiledMnemRe, i);
+        if (g_regex_match(cmr->re, mnem, 0, NULL)) {
+            const MnemonicEntry *e = cmr->entry;
+            *opcode = e->opcode;
+            *branch_type = e->branch_type;
+            *flags = e->flags;
+            *capture_kinds = e->capture_kinds;
+            *operand_regex = e->operand_regex;
+            return true;
         }
     }
 
@@ -802,117 +455,41 @@ static bool lookup_prefix_class(const char *mnem, uint8_t *opcode,
 }
 
 /*
- * Classify a mnemonic string to GenericOpcode + BranchType.
+ * Classify a mnemonic string to GenericOpcode + BranchType + flags.
  *
- * Uses a three-level lookup strategy:
+ * Uses a two-level lookup strategy:
  *   1. Exact match via mnemonic hash table (O(1)).
- *   2. Prefix match via prefix hash table (O(1) per probe, at most 3 probes).
- *   3. AVX v-prefix stripping and x86 size-suffix stripping with retry.
+ *   2. Regex pattern fallback via per-ISA compiled regex array (linear scan).
  *
- * The only remaining strcmp is for the x86 j<cc>/jmp disambiguation,
- * which requires character manipulation that can't be table-driven.
+ * All instruction semantics (conditionality, implicit registers, MOV→LOAD/STORE
+ * promotion, indirect branch checking) are encoded in the MnemonicFlags field,
+ * so adding new instructions requires only table changes.
  */
 static void classify_mnemonic(const char *mnem, uint8_t *opcode,
                               uint8_t *branch_type,
-                              bool *branch_conditional)
+                              uint16_t *flags,
+                              const uint8_t **capture_kinds,
+                              const char **operand_regex)
 {
     *opcode = GEN_OP_UNKNOWN;
     *branch_type = BRANCH_NONE;
-    *branch_conditional = false;
+    *flags = MF_NONE;
+    *capture_kinds = NULL;
+    *operand_regex = NULL;
 
     if (!mnem || !*mnem) {
         return;
     }
 
-    /* Strip x86 instruction prefixes (lock, rep, etc.) via hash lookup */
-    const char *sp = strchr(mnem, ' ');
-    if (sp) {
-        size_t plen = (size_t)(sp - mnem);
-        if (plen < 16) {
-            char pfx[16];
-            memcpy(pfx, mnem, plen);
-            pfx[plen] = '\0';
-            if (g_hash_table_contains(insn_prefix_ht, pfx)) {
-                mnem = sp + 1;
-            }
-        }
-    }
-
-    /* x86 conditional branches: j<cc> (not jmp/jmpq) */
-    if (trace_isa == TRACE_ISA_X86 && mnem[0] == 'j') {
-        char tmp[32];
-        g_strlcpy(tmp, mnem, sizeof(tmp));
-        size_t tlen = strlen(tmp);
-        if (tlen > 1 && tmp[tlen - 1] == 'q') {
-            tmp[tlen - 1] = '\0';
-        }
-        if (strcmp(tmp, "jmp") != 0) {
-            *opcode = GEN_OP_BRANCH;
-            *branch_type = BRANCH_DIRECT_JUMP;
-            *branch_conditional = true;
-            return;
-        }
-    }
-
     /* Exact match in mnemonic hash table */
-    if (lookup_mnemonic(mnem, opcode, branch_type, branch_conditional)) {
+    if (lookup_mnemonic(mnem, opcode, branch_type, flags,
+                        capture_kinds, operand_regex)) {
         return;
     }
 
-    /* Prefix-based classification (dot-prefix and bare-prefix) */
-    if (lookup_prefix_class(mnem, opcode, branch_type, branch_conditional)) {
-        return;
-    }
-
-    /* AVX v-prefix: strip 'v' and retry (x86 only) */
-    if (trace_isa == TRACE_ISA_X86 && mnem[0] == 'v' && strlen(mnem) > 1) {
-        if (lookup_mnemonic(mnem + 1, opcode, branch_type,
-                            branch_conditional)) {
-            return;
-        }
-        if (lookup_prefix_class(mnem + 1, opcode, branch_type,
-                                branch_conditional)) {
-            return;
-        }
-    }
-
-    /* x86 size suffix: strip trailing q/l/w/b and retry */
-    if (trace_isa == TRACE_ISA_X86) {
-        size_t len = strlen(mnem);
-        if (len > 1) {
-            char base[32];
-            g_strlcpy(base, mnem, sizeof(base));
-            char last = base[len - 1];
-            if (last == 'q' || last == 'l' || last == 'w' || last == 'b') {
-                base[len - 1] = '\0';
-                if (lookup_mnemonic(base, opcode, branch_type,
-                                    branch_conditional)) {
-                    return;
-                }
-                if (lookup_prefix_class(base, opcode, branch_type,
-                                        branch_conditional)) {
-                    return;
-                }
-                /* Also try AVX v-prefix + stripped suffix */
-                if (base[0] == 'v' && strlen(base) > 1) {
-                    if (lookup_mnemonic(base + 1, opcode, branch_type,
-                                        branch_conditional)) {
-                        return;
-                    }
-                    if (lookup_prefix_class(base + 1, opcode, branch_type,
-                                            branch_conditional)) {
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    /* Backward table compatibility: conditional-direct maps to type+flag. */
-    if (*branch_type == BRANCH_COND_DIRECT) {
-        *branch_type = BRANCH_DIRECT_JUMP;
-        *branch_conditional = true;
-    }
+    /* Regex pattern fallback */
+    lookup_mnem_regex_fallback(mnem, opcode, branch_type, flags,
+                               capture_kinds, operand_regex);
 }
 
 /*
@@ -921,39 +498,98 @@ static void classify_mnemonic(const char *mnem, uint8_t *opcode,
  */
 #define MAX_OPS 4
 #define MAX_OP_LEN 64
+#define ASCII_WS " \t"
 
-static int split_operands(const char *s, char ops[][MAX_OP_LEN], int max_ops)
+static inline const char *skip_ascii_ws(const char *s)
 {
-    int n = 0, depth = 0, pos = 0;
+    return s + strspn(s, ASCII_WS);
+}
 
-    while (*s == ' ' || *s == '\t') {
-        s++;
+static inline bool copy_token_delim(const char *s, const char *delims,
+                                    char *dst, size_t dst_sz)
+{
+    size_t n = strcspn(s, delims);
+
+    if (n == 0 || n >= dst_sz) {
+        return false;
     }
 
-    while (*s && n < max_ops) {
-        if (*s == '(' || *s == '[') {
-            depth++;
-        } else if (*s == ')' || *s == ']') {
-            depth--;
-        } else if (*s == ',' && depth == 0) {
-            ops[n][pos] = '\0';
-            n++;
-            pos = 0;
-            s++;
-            while (*s == ' ' || *s == '\t') {
-                s++;
-            }
+    memcpy(dst, s, n);
+    dst[n] = '\0';
+    return true;
+}
+
+static GRegex *get_operand_regex(const char *pattern)
+{
+    GRegex *re;
+    GError *err = NULL;
+
+    if (!pattern || !*pattern) {
+        return NULL;
+    }
+
+    re = g_hash_table_lookup(operand_regex_ht, pattern);
+    if (re) {
+        return re;
+    }
+
+    re = g_regex_new(pattern, G_REGEX_OPTIMIZE, 0, &err);
+    if (!re) {
+        if (err) {
+            g_error_free(err);
+        }
+        return NULL;
+    }
+
+    g_hash_table_insert(operand_regex_ht, (gpointer)pattern, re);
+    return re;
+}
+
+static int split_operands_regex(const char *s, const char *pattern,
+                                char ops[][MAX_OP_LEN], int max_ops)
+{
+    GRegex *re;
+    GMatchInfo *mi = NULL;
+    int n = 0;
+    const char *p = skip_ascii_ws(s);
+
+    if (!*p) {
+        return 0;
+    }
+
+    re = get_operand_regex(pattern);
+    if (!re) {
+        return 0;
+    }
+
+    if (!g_regex_match(re, p, 0, &mi)) {
+        if (mi) {
+            g_match_info_free(mi);
+        }
+        return 0;
+    }
+
+    for (int gi = 1; gi <= max_ops; gi++) {
+        gchar *cap = g_match_info_fetch(mi, gi);
+        if (!cap) {
+            break;
+        }
+
+        g_strstrip(cap);
+        if (!*cap) {
+            g_free(cap);
             continue;
         }
-        if (pos < MAX_OP_LEN - 1) {
-            ops[n][pos++] = *s;
-        }
-        s++;
-    }
-    if (pos > 0 || n > 0) {
-        ops[n][pos] = '\0';
+
+        g_strlcpy(ops[n], cap, MAX_OP_LEN);
+        g_free(cap);
         n++;
+        if (n >= max_ops) {
+            break;
+        }
     }
+
+    g_match_info_free(mi);
     return n;
 }
 
@@ -969,7 +605,11 @@ static bool is_memory_operand(const char *op)
  */
 static uint8_t extract_x86_reg(const char *op)
 {
-    while (*op == ' ' || *op == '\t' || *op == '*') {
+    for (;;) {
+        op = skip_ascii_ws(op);
+        if (*op != '*') {
+            break;
+        }
         op++;
     }
 
@@ -979,20 +619,14 @@ static uint8_t extract_x86_reg(const char *op)
     }
 
     /* If there's a '(' before the %, this is a memory operand base */
-    for (const char *p = op; p < pct; p++) {
-        if (*p == '(') {
-            return REG_NONE;
-        }
+    if (memchr(op, '(', (size_t)(pct - op))) {
+        return REG_NONE;
     }
 
-    pct++;
     char name[16];
-    int i = 0;
-    while (*pct && *pct != ',' && *pct != ')' && *pct != ' ' &&
-           *pct != '\t' && i < 15) {
-        name[i++] = *pct++;
+    if (!copy_token_delim(pct + 1, ",) \t", name, sizeof(name))) {
+        return REG_NONE;
     }
-    name[i] = '\0';
     return parse_x86_reg(name);
 }
 
@@ -1009,20 +643,28 @@ static void extract_x86_mem_regs(const char *op, InsnFields *out)
     p++;
 
     while (*p && *p != ')') {
-        if (*p == '%') {
-            p++;
-            char name[16];
-            int i = 0;
-            while (*p && *p != ',' && *p != ')' && *p != ' ' && i < 15) {
-                name[i++] = *p++;
-            }
-            name[i] = '\0';
-            uint8_t reg_id = parse_x86_reg(name);
-            add_src_reg(out, reg_id);
-        } else {
+        const char *pct = strchr(p, '%');
+        const char *end = strchr(p, ')');
+        char name[16];
+
+        if (!pct || (end && pct > end)) {
+            return;
+        }
+
+        if (copy_token_delim(pct + 1, ",) \t", name, sizeof(name))) {
+            add_src_reg(out, parse_x86_reg(name));
+        }
+
+        p = pct + 1 + strcspn(pct + 1, ",)");
+        if (*p == ',') {
             p++;
         }
     }
+}
+
+static inline bool x86_is_indirect_operand(const char *op)
+{
+    return *skip_ascii_ws(op) == '*';
 }
 
 /*
@@ -1030,9 +672,9 @@ static void extract_x86_mem_regs(const char *op, InsnFields *out)
  */
 static uint8_t extract_aarch64_reg(const char *op)
 {
-    while (*op == ' ' || *op == '\t') {
-        op++;
-    }
+    char name[16];
+
+    op = skip_ascii_ws(op);
 
     if (*op == '#' || *op == '=') {
         return REG_NONE;
@@ -1041,13 +683,9 @@ static uint8_t extract_aarch64_reg(const char *op)
         return REG_NONE;
     }
 
-    char name[16];
-    int i = 0;
-    while (*op && *op != ',' && *op != ']' && *op != '!' &&
-           *op != ' ' && *op != '\t' && i < 15) {
-        name[i++] = *op++;
+    if (!copy_token_delim(op, ",]! \t", name, sizeof(name))) {
+        return REG_NONE;
     }
-    name[i] = '\0';
     return parse_aarch64_reg(name);
 }
 
@@ -1058,54 +696,163 @@ static uint8_t extract_aarch64_reg(const char *op)
 static void extract_aarch64_mem_regs(const char *op, InsnFields *out)
 {
     const char *p = strchr(op, '[');
+    char name[16];
+    const char *bracket_end;
+    const char *comma;
+
     if (!p) {
         return;
     }
-    p++;
+    p = skip_ascii_ws(p + 1);
 
-    while (*p == ' ' || *p == '\t') {
-        p++;
+    if (!copy_token_delim(p, ",] \t", name, sizeof(name))) {
+        return;
     }
-
-    char name[16];
-    int i = 0;
-    while (*p && *p != ',' && *p != ']' && *p != ' ' &&
-           *p != '\t' && i < 15) {
-        name[i++] = *p++;
-    }
-    name[i] = '\0';
-    uint8_t base = parse_aarch64_reg(name);
-    add_src_reg(out, base);
+    add_src_reg(out, parse_aarch64_reg(name));
 
     /* Look for index register after comma */
-    const char *bracket_end = strchr(op, ']');
-    const char *comma = strchr(p, ',');
+    bracket_end = strchr(p, ']');
+    comma = strchr(p, ',');
     if (comma && bracket_end && comma < bracket_end) {
-        comma++;
-        while (*comma == ' ' || *comma == '\t') {
-            comma++;
-        }
+        comma = skip_ascii_ws(comma + 1);
         if (*comma != '#') {
-            i = 0;
-            while (*comma && *comma != ',' && *comma != ']' &&
-                   *comma != ' ' && i < 15) {
-                name[i++] = *comma++;
+            if (copy_token_delim(comma, ",] \t", name, sizeof(name))) {
+                add_src_reg(out, parse_aarch64_reg(name));
             }
-            name[i] = '\0';
-            uint8_t idx = parse_aarch64_reg(name);
-            add_src_reg(out, idx);
+        }
+    }
+}
+
+static inline uint8_t extract_named_reg_token(const char *op,
+                                              bool skip_hex_prefix,
+                                              ExtractRegFn parse_reg)
+{
+    char name[16];
+
+    op = skip_ascii_ws(op);
+
+    if ((*op >= '0' && *op <= '9') || *op == '-' || *op == '(') {
+        return REG_NONE;
+    }
+
+    if (skip_hex_prefix && op[0] == '0' && op[1] == 'x') {
+        return REG_NONE;
+    }
+
+    if (!copy_token_delim(op, ",() \t", name, sizeof(name))) {
+        return REG_NONE;
+    }
+    return parse_reg(name);
+}
+
+static inline void extract_paren_mem_base_reg(const char *op, InsnFields *out,
+                                              ExtractRegFn parse_reg)
+{
+    const char *p = strchr(op, '(');
+    char name[16];
+
+    if (!p) {
+        return;
+    }
+    p = skip_ascii_ws(p + 1);
+
+    if (!copy_token_delim(p, "), \t", name, sizeof(name))) {
+        return;
+    }
+    add_src_reg(out, parse_reg(name));
+}
+
+/*
+ * Extract the first register from a RISC-V operand.
+ */
+static uint8_t extract_riscv_reg(const char *op)
+{
+    return extract_named_reg_token(op, false, parse_riscv_reg);
+}
+
+static void extract_riscv_mem_regs(const char *op, InsnFields *out)
+{
+    extract_paren_mem_base_reg(op, out, parse_riscv_reg);
+}
+
+/*
+ * Extract the first register from a MIPS operand.
+ */
+static uint8_t extract_mips_reg(const char *op)
+{
+    return extract_named_reg_token(op, true, parse_mips_reg);
+}
+
+static void extract_mips_mem_regs(const char *op, InsnFields *out)
+{
+    extract_paren_mem_base_reg(op, out, parse_mips_reg);
+}
+
+/*
+ * Apply flag-driven implicit-register and opcode adjustments.
+ * All instruction semantics previously hardcoded per-ISA are now encoded
+ * in MnemonicFlags and applied uniformly here.
+ */
+static void apply_mnemonic_flags(InsnFields *out, uint16_t flags)
+{
+    if (flags & MF_FLAGS_DST) {
+        add_dst_reg(out, REG_FLAGS);
+    }
+    if (flags & MF_FLAGS_SRC) {
+        add_src_reg(out, REG_FLAGS);
+    }
+    if (flags & MF_SP_RW) {
+        add_src_reg(out, REG_SP);
+        add_dst_reg(out, REG_SP);
+    }
+    if (flags & MF_LR_DST) {
+        add_dst_reg(out, REG_LR);
+    }
+    if (flags & MF_LR_SRC) {
+        add_src_reg(out, REG_LR);
+    }
+    if (flags & MF_IP_DST) {
+        add_dst_reg(out, REG_IP);
+    }
+    if (flags & MF_CONDITIONAL) {
+        out->branch_conditional = true;
+    }
+}
+
+/*
+ * Extract an immediate value from a single operand token.
+ * Handles both x86 '$' prefix and bare numeric immediates.
+ */
+static inline void extract_immediate(const char *op, InsnFields *out)
+{
+    const char *t = skip_ascii_ws(op);
+
+    if (*t == '$') {
+        out->has_immediate = true;
+        out->immediate = strtoll(t + 1, NULL, 0);
+    } else if ((*t >= '0' && *t <= '9') || *t == '-') {
+        if (!strchr(t, '(') && !strchr(t, '[')) {
+            out->has_immediate = true;
+            out->immediate = strtoll(t, NULL, 0);
         }
     }
 }
 
 /*
- * Parse x86 AT&T operands and populate source/destination registers.
- * In AT&T syntax, source comes first, destination last.
+ * Unified operand parser — ISA-agnostic.
+ *
+ * Uses the active ISA descriptor (isa.extract_reg, isa.extract_mem)
+ * and the per-instruction capture_kinds/flags to parse operand strings
+ * into InsnFields.  All ISA-specific behaviour is concentrated in the
+ * function pointers set once at plugin init.
  */
-static void parse_x86_operands(const char *operands, InsnFields *out)
+static void parse_operands(const char *operands, InsnFields *out,
+                           const uint8_t capture_kinds[4],
+                           const char *operand_regex,
+                           uint16_t flags)
 {
     char ops[MAX_OPS][MAX_OP_LEN];
-    int n_ops = split_operands(operands, ops, MAX_OPS);
+    int n_ops = split_operands_regex(operands, operand_regex, ops, MAX_OPS);
 
     if (n_ops == 0) {
         return;
@@ -1116,8 +863,8 @@ static void parse_x86_operands(const char *operands, InsnFields *out)
         op_is_mem[i] = is_memory_operand(ops[i]);
     }
 
-    /* Adjust opcode for MOV with memory operand */
-    if (out->opcode == GEN_OP_MOV && n_ops >= 2) {
+    /* Flag-driven MOV → LOAD/STORE promotion */
+    if ((flags & MF_MOV_PROMOTE) && n_ops >= 2) {
         if (op_is_mem[0]) {
             out->opcode = GEN_OP_LOAD;
         } else if (op_is_mem[1]) {
@@ -1125,1006 +872,192 @@ static void parse_x86_operands(const char *operands, InsnFields *out)
         }
     }
 
-    /* Check for indirect branch/call (operand starts with '*') */
-    if (out->branch_type == BRANCH_DIRECT_JUMP ||
-        out->branch_type == BRANCH_DIRECT_CALL) {
-        const char *t = ops[0];
-        while (*t == ' ' || *t == '\t') {
-            t++;
-        }
-        if (*t == '*') {
-            out->branch_type = (out->branch_type == BRANCH_DIRECT_JUMP) ?
-                               BRANCH_INDIRECT_JUMP : BRANCH_INDIRECT_CALL;
+    /* Flag-driven indirect branch/call detection (x86 '*' prefix) */
+    if ((flags & MF_CHK_INDIRECT) && isa.indirect_star && n_ops >= 1 &&
+        x86_is_indirect_operand(ops[0])) {
+        if (out->branch_type == BRANCH_DIRECT_JUMP) {
+            out->branch_type = BRANCH_INDIRECT_JUMP;
+        } else if (out->branch_type == BRANCH_DIRECT_CALL) {
+            out->branch_type = BRANCH_INDIRECT_CALL;
         }
     }
 
-    switch (out->opcode) {
-    /* Two-operand ALU: src, src+dst; FLAGS is dst */
-    case GEN_OP_INT_ADD: case GEN_OP_INT_SUB: case GEN_OP_AND:
-    case GEN_OP_OR: case GEN_OP_XOR: case GEN_OP_INT_ADC:
-    case GEN_OP_INT_SBB: case GEN_OP_SHL: case GEN_OP_SHR:
-    case GEN_OP_SAR: case GEN_OP_ROL: case GEN_OP_ROR:
-        if (n_ops >= 2) {
-            uint8_t src = extract_x86_reg(ops[0]);
-            uint8_t dst = extract_x86_reg(ops[1]);
-            if (src != REG_NONE) add_src_reg(out, src);
-            if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
-            if (dst != REG_NONE) {
-                add_src_reg(out, dst);
-                add_dst_reg(out, dst);
+    /* Process each capture slot */
+    int n = MIN(n_ops, 4);
+    for (int i = 0; i < n; i++) {
+        switch (capture_kinds[i]) {
+        case CAP_SRC_REG: {
+            uint8_t r = isa.extract_reg(ops[i]);
+            if (r != REG_NONE) {
+                add_src_reg(out, r);
             }
-            if (op_is_mem[1]) extract_x86_mem_regs(ops[1], out);
-        } else if (n_ops == 1) {
-            uint8_t r = extract_x86_reg(ops[0]);
-            if (r != REG_NONE) { add_src_reg(out, r); add_dst_reg(out, r); }
-            if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
+            break;
         }
-        add_dst_reg(out, REG_FLAGS);
-        break;
-
-    /* Data movement: src -> dst */
-    case GEN_OP_MOV: case GEN_OP_MOVSX: case GEN_OP_MOVZX:
-    case GEN_OP_CMOV:
-        if (n_ops >= 2) {
-            uint8_t src = extract_x86_reg(ops[0]);
-            uint8_t dst = extract_x86_reg(ops[1]);
-            if (src != REG_NONE) add_src_reg(out, src);
-            if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-            if (op_is_mem[1]) extract_x86_mem_regs(ops[1], out);
-        }
-        if (out->opcode == GEN_OP_CMOV) add_src_reg(out, REG_FLAGS);
-        break;
-
-    /* Load from memory */
-    case GEN_OP_LOAD:
-        if (n_ops >= 2) {
-            if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
-            uint8_t dst = extract_x86_reg(ops[n_ops - 1]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        break;
-
-    /* Store to memory */
-    case GEN_OP_STORE:
-        if (n_ops >= 2) {
-            uint8_t src = extract_x86_reg(ops[0]);
-            if (src != REG_NONE) add_src_reg(out, src);
-            if (op_is_mem[n_ops - 1]) {
-                extract_x86_mem_regs(ops[n_ops - 1], out);
+        case CAP_DST_REG: {
+            uint8_t r = isa.extract_reg(ops[i]);
+            if (r != REG_NONE) {
+                add_dst_reg(out, r);
             }
+            break;
         }
-        break;
-
-    /* LEA: addr regs as sources, register as dest */
-    case GEN_OP_LEA:
-        if (n_ops >= 2) {
-            extract_x86_mem_regs(ops[0], out);
-            uint8_t dst = extract_x86_reg(ops[1]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        break;
-
-    /* CMP/TEST: both operands are sources, FLAGS is dst */
-    case GEN_OP_CMP: case GEN_OP_TEST:
-        for (int i = 0; i < n_ops && i < 2; i++) {
-            uint8_t r = extract_x86_reg(ops[i]);
-            if (r != REG_NONE) add_src_reg(out, r);
-            if (op_is_mem[i]) extract_x86_mem_regs(ops[i], out);
-        }
-        add_dst_reg(out, REG_FLAGS);
-        break;
-
-    /* PUSH: src + SP */
-    case GEN_OP_PUSH:
-        if (n_ops >= 1) {
-            uint8_t r = extract_x86_reg(ops[0]);
-            if (r != REG_NONE) add_src_reg(out, r);
-            if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
-        }
-        add_src_reg(out, REG_SP);
-        add_dst_reg(out, REG_SP);
-        break;
-
-    /* POP: dst + SP */
-    case GEN_OP_POP:
-        if (n_ops >= 1) {
-            uint8_t r = extract_x86_reg(ops[0]);
-            if (r != REG_NONE) add_dst_reg(out, r);
-        }
-        add_src_reg(out, REG_SP);
-        add_dst_reg(out, REG_SP);
-        break;
-
-    /* XCHG: both operands are src+dst */
-    case GEN_OP_XCHG:
-        for (int i = 0; i < n_ops && i < 2; i++) {
-            uint8_t r = extract_x86_reg(ops[i]);
+        case CAP_RW_REG: {
+            uint8_t r = isa.extract_reg(ops[i]);
             if (r != REG_NONE) {
                 add_src_reg(out, r);
                 add_dst_reg(out, r);
             }
-            if (op_is_mem[i]) extract_x86_mem_regs(ops[i], out);
+            break;
         }
-        break;
-
-    /* Unary: operand is both src and dst */
-    case GEN_OP_NOT: case GEN_OP_NEG: case GEN_OP_INC: case GEN_OP_DEC:
-        if (n_ops >= 1) {
-            uint8_t r = extract_x86_reg(ops[0]);
-            if (r != REG_NONE) {
-                add_src_reg(out, r);
-                add_dst_reg(out, r);
+        case CAP_SRC_MEM:
+        case CAP_DST_MEM:
+        case CAP_MEM_ADDR:
+            if (op_is_mem[i]) {
+                isa.extract_mem(ops[i], out);
             }
-            if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
-        }
-        if (out->opcode != GEN_OP_NOT) add_dst_reg(out, REG_FLAGS);
-        break;
-
-    /* CALL: may have indirect operand */
-    case GEN_OP_CALL:
-    {
-        if (n_ops >= 1) {
-            const char *t = ops[0];
-            while (*t == ' ' || *t == '\t') t++;
-            if (*t == '*') {
-                if (op_is_mem[0]) {
-                    extract_x86_mem_regs(ops[0], out);
-                } else {
-                    uint8_t r = extract_x86_reg(ops[0]);
-                    if (r != REG_NONE) add_src_reg(out, r);
-                }
-            }
-        }
-        add_src_reg(out, REG_SP);
-        add_dst_reg(out, REG_SP);
-        add_dst_reg(out, REG_IP);
-        break;
-    }
-
-    /* RET */
-    case GEN_OP_RET:
-        add_src_reg(out, REG_SP);
-        add_dst_reg(out, REG_SP);
-        add_dst_reg(out, REG_IP);
-        break;
-
-    /* Branch */
-    case GEN_OP_BRANCH:
-        if (out->branch_conditional) {
-            add_src_reg(out, REG_FLAGS);
-        }
-        if (out->branch_type == BRANCH_INDIRECT_JUMP && n_ops >= 1) {
-            const char *t = ops[0];
-            while (*t == ' ' || *t == '\t') t++;
-            if (*t == '*') {
-                if (op_is_mem[0]) {
-                    extract_x86_mem_regs(ops[0], out);
-                } else {
-                    uint8_t r = extract_x86_reg(ops[0]);
-                    if (r != REG_NONE) add_src_reg(out, r);
-                }
-            }
-        }
-        break;
-
-    /* MUL/IMUL */
-    case GEN_OP_INT_MUL:
-        if (n_ops >= 2) {
-            for (int i = 0; i < n_ops; i++) {
-                uint8_t r = extract_x86_reg(ops[i]);
-                if (r != REG_NONE) add_src_reg(out, r);
-                if (op_is_mem[i]) extract_x86_mem_regs(ops[i], out);
-            }
-            uint8_t dst = extract_x86_reg(ops[n_ops - 1]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        } else if (n_ops == 1) {
-            add_src_reg(out, REG_GPR0);
-            uint8_t r = extract_x86_reg(ops[0]);
-            if (r != REG_NONE) add_src_reg(out, r);
-            if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
-            add_dst_reg(out, REG_GPR0);
-            add_dst_reg(out, REG_GPR2);
-        }
-        add_dst_reg(out, REG_FLAGS);
-        break;
-
-    /* DIV/IDIV */
-    case GEN_OP_INT_DIV:
-        add_src_reg(out, REG_GPR0);
-        add_src_reg(out, REG_GPR2);
-        if (n_ops >= 1) {
-            uint8_t r = extract_x86_reg(ops[0]);
-            if (r != REG_NONE) add_src_reg(out, r);
-            if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
-        }
-        add_dst_reg(out, REG_GPR0);
-        add_dst_reg(out, REG_GPR2);
-        break;
-
-    /* SETCC: FLAGS as src */
-    case GEN_OP_SETCC:
-        add_src_reg(out, REG_FLAGS);
-        if (n_ops >= 1) {
-            uint8_t r = extract_x86_reg(ops[0]);
-            if (r != REG_NONE) add_dst_reg(out, r);
-            if (op_is_mem[0]) extract_x86_mem_regs(ops[0], out);
-        }
-        break;
-
-    /* FP/Vector: AT&T srcs first, dst last */
-    case GEN_OP_FP_ADD: case GEN_OP_FP_SUB: case GEN_OP_FP_MUL:
-    case GEN_OP_FP_DIV: case GEN_OP_FP_SQRT: case GEN_OP_FP_MOV:
-    case GEN_OP_FP_CVT: case GEN_OP_FP_CMP:
-    case GEN_OP_VEC_ADD: case GEN_OP_VEC_SUB: case GEN_OP_VEC_MUL:
-    case GEN_OP_VEC_MOV: case GEN_OP_VEC_SHUF: case GEN_OP_VEC_LOGIC:
-        for (int i = 0; i < n_ops; i++) {
-            uint8_t r = extract_x86_reg(ops[i]);
-            if (r != REG_NONE) {
-                if (i < n_ops - 1) {
+            break;
+        case CAP_SRC_REG_OR_MEM:
+            if (op_is_mem[i]) {
+                isa.extract_mem(ops[i], out);
+            } else {
+                uint8_t r = isa.extract_reg(ops[i]);
+                if (r != REG_NONE) {
                     add_src_reg(out, r);
-                } else {
-                    /*
-                     * Last operand is the destination. For 2-operand SSE
-                     * it is also an implicit source (e.g. addps %xmm0,%xmm1
-                     * means xmm1 += xmm0). Conservative for 3-operand AVX.
-                     */
+                }
+            }
+            break;
+        case CAP_DST_REG_OR_MEM:
+            if (op_is_mem[i]) {
+                isa.extract_mem(ops[i], out);
+            } else {
+                uint8_t r = isa.extract_reg(ops[i]);
+                if (r != REG_NONE) {
+                    add_dst_reg(out, r);
+                }
+            }
+            break;
+        case CAP_RW_REG_OR_MEM:
+            if (op_is_mem[i]) {
+                isa.extract_mem(ops[i], out);
+            } else {
+                uint8_t r = isa.extract_reg(ops[i]);
+                if (r != REG_NONE) {
                     add_src_reg(out, r);
                     add_dst_reg(out, r);
                 }
             }
-            if (op_is_mem[i]) extract_x86_mem_regs(ops[i], out);
-        }
-        if (out->opcode == GEN_OP_FP_CMP) add_dst_reg(out, REG_FLAGS);
-        break;
-
-    default:
-        break;
-    }
-
-    /* Extract immediate value from operands */
-    for (int i = 0; i < n_ops; i++) {
-        const char *t = ops[i];
-        while (*t == ' ' || *t == '\t') t++;
-        if (*t == '$') {
-            out->has_immediate = true;
-            out->immediate = strtoll(t + 1, NULL, 0);
+            break;
+        case CAP_IMM:
+            extract_immediate(ops[i], out);
+            break;
+        case CAP_BRANCH_TARGET:
+            break;
+        default:
             break;
         }
     }
-}
 
-/*
- * Parse AArch64 operands and populate source/destination registers.
- * First operand is typically destination, rest are sources.
- */
-static void parse_aarch64_operands(const char *operands, InsnFields *out)
-{
-    char ops[MAX_OPS][MAX_OP_LEN];
-    int n_ops = split_operands(operands, ops, MAX_OPS);
-
-    if (n_ops == 0) {
-        return;
-    }
-
-    switch (out->opcode) {
-    /* ALU: dst = op(src1, src2) */
-    case GEN_OP_INT_ADD: case GEN_OP_INT_SUB: case GEN_OP_INT_MUL:
-    case GEN_OP_INT_DIV: case GEN_OP_AND: case GEN_OP_OR:
-    case GEN_OP_XOR: case GEN_OP_NOT: case GEN_OP_SHL:
-    case GEN_OP_SHR: case GEN_OP_SAR:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_aarch64_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_aarch64_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* MOV: dst, src */
-    case GEN_OP_MOV: case GEN_OP_MOVSX: case GEN_OP_MOVZX:
-    case GEN_OP_CMOV:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_aarch64_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_aarch64_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* LOAD: dst, [base, offset] */
-    case GEN_OP_LOAD:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_aarch64_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        /* For ldp: second operand is also a dest */
-        if (n_ops >= 3) {
-            uint8_t dst2 = extract_aarch64_reg(ops[1]);
-            if (dst2 != REG_NONE) add_dst_reg(out, dst2);
-        }
+    /* Fallback immediate extraction for operands not covered by CAP_IMM */
+    if (!out->has_immediate) {
         for (int i = 0; i < n_ops; i++) {
-            if (is_memory_operand(ops[i])) {
-                extract_aarch64_mem_regs(ops[i], out);
-            }
-        }
-        break;
-    }
-
-    /* STORE: src, [base, offset] */
-    case GEN_OP_STORE:
-    {
-        if (n_ops >= 1) {
-            uint8_t src = extract_aarch64_reg(ops[0]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        /* For stp: second operand is also a source */
-        if (n_ops >= 3) {
-            uint8_t src2 = extract_aarch64_reg(ops[1]);
-            if (src2 != REG_NONE) add_src_reg(out, src2);
-        }
-        for (int i = 0; i < n_ops; i++) {
-            if (is_memory_operand(ops[i])) {
-                extract_aarch64_mem_regs(ops[i], out);
-            }
-        }
-        break;
-    }
-
-    /* CMP/TST: all operands are sources */
-    case GEN_OP_CMP: case GEN_OP_TEST:
-        for (int i = 0; i < n_ops; i++) {
-            uint8_t r = extract_aarch64_reg(ops[i]);
-            if (r != REG_NONE) add_src_reg(out, r);
-        }
-        add_dst_reg(out, REG_FLAGS);
-        break;
-
-    /* Branch: operand is src register or target */
-    case GEN_OP_BRANCH:
-        for (int i = 0; i < n_ops; i++) {
-            uint8_t r = extract_aarch64_reg(ops[i]);
-            if (r != REG_NONE) add_src_reg(out, r);
-        }
-        break;
-
-    /* CALL (bl/blr): link register is dst */
-    case GEN_OP_CALL:
-        if (out->branch_type == BRANCH_INDIRECT_CALL && n_ops >= 1) {
-            uint8_t r = extract_aarch64_reg(ops[0]);
-            if (r != REG_NONE) add_src_reg(out, r);
-        }
-        add_dst_reg(out, REG_LR);
-        break;
-
-    /* RET */
-    case GEN_OP_RET:
-        add_src_reg(out, REG_LR);
-        break;
-
-    /* FP/Vector: dst, src1, src2 */
-    case GEN_OP_FP_ADD: case GEN_OP_FP_SUB: case GEN_OP_FP_MUL:
-    case GEN_OP_FP_DIV: case GEN_OP_FP_SQRT: case GEN_OP_FP_MOV:
-    case GEN_OP_FP_CVT: case GEN_OP_FP_CMP:
-    {
-        if (out->opcode == GEN_OP_FP_CMP) {
-            for (int i = 0; i < n_ops; i++) {
-                uint8_t r = extract_aarch64_reg(ops[i]);
-                if (r != REG_NONE) add_src_reg(out, r);
-            }
-            add_dst_reg(out, REG_FLAGS);
-        } else {
-            if (n_ops >= 1) {
-                uint8_t dst = extract_aarch64_reg(ops[0]);
-                if (dst != REG_NONE) add_dst_reg(out, dst);
-            }
-            for (int i = 1; i < n_ops; i++) {
-                uint8_t src = extract_aarch64_reg(ops[i]);
-                if (src != REG_NONE) add_src_reg(out, src);
-            }
-        }
-        break;
-    }
-
-    default:
-        if (n_ops >= 1) {
-            uint8_t dst = extract_aarch64_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_aarch64_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* Extract immediate value (#N) */
-    for (int i = 0; i < n_ops; i++) {
-        const char *t = ops[i];
-        while (*t == ' ' || *t == '\t') t++;
-        if (*t == '#') {
-            out->has_immediate = true;
-            out->immediate = strtoll(t + 1, NULL, 0);
-            break;
-        }
-    }
-}
-
-/*
- * Extract the first register from a RISC-V operand.
- * RISC-V uses bare ABI names (a0, sp, ra, t0, etc.) without prefix.
- */
-static uint8_t extract_riscv_reg(const char *op)
-{
-    while (*op == ' ' || *op == '\t') {
-        op++;
-    }
-
-    /* Skip immediate-only operands (numeric or hex) */
-    if ((*op >= '0' && *op <= '9') || *op == '-') {
-        return REG_NONE;
-    }
-
-    /* Skip memory operand brackets */
-    if (*op == '(') {
-        return REG_NONE;
-    }
-
-    char name[16];
-    int i = 0;
-    while (*op && *op != ',' && *op != '(' && *op != ')' &&
-           *op != ' ' && *op != '\t' && i < 15) {
-        name[i++] = *op++;
-    }
-    name[i] = '\0';
-    return parse_riscv_reg(name);
-}
-
-/*
- * Extract address registers from a RISC-V memory operand.
- * Format: offset(base)  e.g., 0(sp) or 100(a0)
- */
-static void extract_riscv_mem_regs(const char *op, InsnFields *out)
-{
-    const char *p = strchr(op, '(');
-    if (!p) {
-        return;
-    }
-    p++;
-
-    while (*p == ' ' || *p == '\t') {
-        p++;
-    }
-
-    char name[16];
-    int i = 0;
-    while (*p && *p != ')' && *p != ',' && *p != ' ' && i < 15) {
-        name[i++] = *p++;
-    }
-    name[i] = '\0';
-    uint8_t base = parse_riscv_reg(name);
-    add_src_reg(out, base);
-}
-
-/*
- * Parse RISC-V operands and populate source/destination registers.
- * RISC-V convention: first operand is typically destination.
- * Loads: rd, offset(rs1)   Stores: rs2, offset(rs1)
- * ALU:   rd, rs1, rs2/imm  Branches: rs1, rs2, target
- */
-static void parse_riscv_operands(const char *operands, InsnFields *out)
-{
-    char ops[MAX_OPS][MAX_OP_LEN];
-    int n_ops = split_operands(operands, ops, MAX_OPS);
-
-    if (n_ops == 0) {
-        return;
-    }
-
-    switch (out->opcode) {
-    /* ALU: rd, rs1, rs2/imm */
-    case GEN_OP_INT_ADD: case GEN_OP_INT_SUB: case GEN_OP_INT_MUL:
-    case GEN_OP_INT_DIV: case GEN_OP_AND: case GEN_OP_OR:
-    case GEN_OP_XOR: case GEN_OP_SHL: case GEN_OP_SHR:
-    case GEN_OP_SAR: case GEN_OP_ROL: case GEN_OP_ROR:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_riscv_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_riscv_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* MOV / LUI / LI / MV: rd, src_or_imm */
-    case GEN_OP_MOV: case GEN_OP_MOVSX: case GEN_OP_MOVZX:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_riscv_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_riscv_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* LOAD: rd, offset(rs1) */
-    case GEN_OP_LOAD:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_riscv_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 0; i < n_ops; i++) {
-            if (is_memory_operand(ops[i])) {
-                extract_riscv_mem_regs(ops[i], out);
-            }
-        }
-        break;
-    }
-
-    /* STORE: rs2, offset(rs1) */
-    case GEN_OP_STORE:
-    {
-        if (n_ops >= 1) {
-            uint8_t src = extract_riscv_reg(ops[0]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        for (int i = 0; i < n_ops; i++) {
-            if (is_memory_operand(ops[i])) {
-                extract_riscv_mem_regs(ops[i], out);
-            }
-        }
-        break;
-    }
-
-    /* CMP (slt/slti/sltu/sltiu): rd, rs1, rs2/imm */
-    case GEN_OP_CMP:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_riscv_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_riscv_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* LEA (auipc): rd, imm */
-    case GEN_OP_LEA:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_riscv_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        break;
-    }
-
-    /* Branch: rs1, rs2, target */
-    case GEN_OP_BRANCH:
-    {
-        for (int i = 0; i < n_ops; i++) {
-            uint8_t r = extract_riscv_reg(ops[i]);
-            if (r != REG_NONE) add_src_reg(out, r);
-        }
-        break;
-    }
-
-    /* CALL (jal/jalr): link reg is implicit ra or specified */
-    case GEN_OP_CALL:
-    {
-        if (out->branch_type == BRANCH_INDIRECT_CALL && n_ops >= 1) {
-            /* jalr rs1 or jalr rd, offset(rs1) */
-            for (int i = 0; i < n_ops; i++) {
-                if (is_memory_operand(ops[i])) {
-                    extract_riscv_mem_regs(ops[i], out);
-                } else {
-                    uint8_t r = extract_riscv_reg(ops[i]);
-                    if (r != REG_NONE) add_src_reg(out, r);
-                }
-            }
-        }
-        add_dst_reg(out, REG_LR);
-        break;
-    }
-
-    /* RET */
-    case GEN_OP_RET:
-        add_src_reg(out, REG_LR);
-        break;
-
-    /* FP: rd, rs1, rs2 (RISC-V: dest first like integer) */
-    case GEN_OP_FP_ADD: case GEN_OP_FP_SUB: case GEN_OP_FP_MUL:
-    case GEN_OP_FP_DIV: case GEN_OP_FP_SQRT: case GEN_OP_FP_MOV:
-    case GEN_OP_FP_CVT: case GEN_OP_FP_CMP:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_riscv_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_riscv_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* XCHG (atomic ops): rd, rs2, (rs1) */
-    case GEN_OP_XCHG:
-    {
-        for (int i = 0; i < n_ops; i++) {
-            uint8_t r = extract_riscv_reg(ops[i]);
-            if (r != REG_NONE) {
-                add_src_reg(out, r);
-                add_dst_reg(out, r);
-            }
-            if (is_memory_operand(ops[i])) {
-                extract_riscv_mem_regs(ops[i], out);
-            }
-        }
-        break;
-    }
-
-    default:
-        if (n_ops >= 1) {
-            uint8_t dst = extract_riscv_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_riscv_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* Extract immediate value (bare number) */
-    for (int i = 0; i < n_ops; i++) {
-        const char *t = ops[i];
-        while (*t == ' ' || *t == '\t') t++;
-        if ((*t >= '0' && *t <= '9') || *t == '-') {
-            /* Skip if this is part of a memory operand offset(reg) */
-            const char *paren = strchr(t, '(');
-            if (!paren) {
-                out->has_immediate = true;
-                out->immediate = strtoll(t, NULL, 0);
+            extract_immediate(ops[i], out);
+            if (out->has_immediate) {
                 break;
             }
         }
     }
-}
 
-/*
- * Extract the first register from a MIPS operand.
- * QEMU's MIPS disassembler outputs ABI names without $ prefix for GPRs.
- */
-static uint8_t extract_mips_reg(const char *op)
-{
-    while (*op == ' ' || *op == '\t') {
-        op++;
-    }
+    /* Apply flag-driven implicit register effects */
+    apply_mnemonic_flags(out, flags);
 
-    /* Skip immediate-only operands */
-    if (*op == '0' && op[1] == 'x') {
-        return REG_NONE;  /* hex literal */
-    }
-    if ((*op >= '0' && *op <= '9') || *op == '-') {
-        return REG_NONE;
-    }
-    if (*op == '(') {
-        return REG_NONE;
-    }
-
-    /* $ prefix indicates a register in some MIPS outputs */
-    const char *start = op;
-
-    char name[16];
-    int i = 0;
-    /* Include $ in name if present, parse_mips_reg handles it */
-    const char *p = start;
-    while (*p && *p != ',' && *p != '(' && *p != ')' &&
-           *p != ' ' && *p != '\t' && i < 15) {
-        name[i++] = *p++;
-    }
-    name[i] = '\0';
-    return parse_mips_reg(name);
-}
-
-/*
- * Extract address registers from a MIPS memory operand.
- * Format: offset(base) e.g., 0(sp) or 100(t0)
- */
-static void extract_mips_mem_regs(const char *op, InsnFields *out)
-{
-    const char *p = strchr(op, '(');
-    if (!p) {
-        return;
-    }
-    p++;
-
-    while (*p == ' ' || *p == '\t') {
-        p++;
-    }
-
-    char name[16];
-    int i = 0;
-    while (*p && *p != ')' && *p != ',' && *p != ' ' && i < 15) {
-        name[i++] = *p++;
-    }
-    name[i] = '\0';
-    uint8_t base = parse_mips_reg(name);
-    add_src_reg(out, base);
-}
-
-/*
- * Parse MIPS operands and populate source/destination registers.
- * MIPS convention: first operand is typically destination.
- * Loads: rt, offset(base)  Stores: rt, offset(base)
- * ALU:   rd, rs, rt/imm    Branches: rs, rt, target
- */
-static void parse_mips_operands(const char *operands, InsnFields *out)
-{
-    char ops[MAX_OPS][MAX_OP_LEN];
-    int n_ops = split_operands(operands, ops, MAX_OPS);
-
-    if (n_ops == 0) {
-        return;
-    }
-
-    switch (out->opcode) {
-    /* ALU: rd, rs, rt/imm */
-    case GEN_OP_INT_ADD: case GEN_OP_INT_SUB: case GEN_OP_INT_MUL:
-    case GEN_OP_INT_DIV: case GEN_OP_AND: case GEN_OP_OR:
-    case GEN_OP_XOR: case GEN_OP_NOT: case GEN_OP_SHL:
-    case GEN_OP_SHR: case GEN_OP_SAR:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_mips_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_mips_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* MOV / LUI / LI / MOVE / MFHI / MFLO: rd, src_or_imm */
-    case GEN_OP_MOV: case GEN_OP_MOVSX: case GEN_OP_MOVZX:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_mips_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_mips_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* LOAD: rt, offset(base) */
-    case GEN_OP_LOAD:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_mips_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 0; i < n_ops; i++) {
-            if (is_memory_operand(ops[i])) {
-                extract_mips_mem_regs(ops[i], out);
-            }
-        }
-        break;
-    }
-
-    /* STORE: rt, offset(base) */
-    case GEN_OP_STORE:
-    {
-        if (n_ops >= 1) {
-            uint8_t src = extract_mips_reg(ops[0]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        for (int i = 0; i < n_ops; i++) {
-            if (is_memory_operand(ops[i])) {
-                extract_mips_mem_regs(ops[i], out);
-            }
-        }
-        break;
-    }
-
-    /* CMP (slt/sltu): rd, rs, rt */
-    case GEN_OP_CMP:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_mips_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_mips_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* LEA (la): rd, address */
-    case GEN_OP_LEA:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_mips_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        break;
-    }
-
-    /* Branch: rs, rt, target or rs, target */
-    case GEN_OP_BRANCH:
-    {
-        for (int i = 0; i < n_ops; i++) {
-            uint8_t r = extract_mips_reg(ops[i]);
-            if (r != REG_NONE) add_src_reg(out, r);
-        }
-        /* MIPS jr $ra is a return */
-        if (out->branch_type == BRANCH_INDIRECT_JUMP && n_ops >= 1) {
-            uint8_t r = extract_mips_reg(ops[0]);
-            if (r == REG_LR) {
-                out->opcode = GEN_OP_RET;
-                out->branch_type = BRANCH_RETURN;
-            }
-        }
-        break;
-    }
-
-    /* CALL (jal/jalr): target or rd, rs */
-    case GEN_OP_CALL:
-    {
-        if (out->branch_type == BRANCH_INDIRECT_CALL && n_ops >= 1) {
-            uint8_t r = extract_mips_reg(ops[0]);
-            if (r != REG_NONE) add_src_reg(out, r);
-        }
-        add_dst_reg(out, REG_LR);
-        break;
-    }
-
-    /* RET */
-    case GEN_OP_RET:
+    /* Flag-driven LR-based RET promotion (non-x86 ISAs) */
+    if ((flags & MF_CHK_LR_RET) && n_ops >= 1 &&
+        isa.extract_reg(ops[0]) == REG_LR) {
+        out->opcode = GEN_OP_RET;
+        out->branch_type = BRANCH_RETURN;
         add_src_reg(out, REG_LR);
-        break;
+    }
+}
 
-    /* FP: fd, fs, ft */
-    case GEN_OP_FP_ADD: case GEN_OP_FP_SUB: case GEN_OP_FP_MUL:
-    case GEN_OP_FP_DIV: case GEN_OP_FP_SQRT: case GEN_OP_FP_MOV:
-    case GEN_OP_FP_CVT:
-    {
-        if (n_ops >= 1) {
-            uint8_t dst = extract_mips_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_mips_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
+static void warn_unknown_instruction(uint64_t pc, const char *reason,
+                                     const char *mnem, const char *disas)
+{
+    if (!unknown_warn_file) {
+        return;
     }
 
-    /* FP compare: MIPS sets condition code, not register */
-    case GEN_OP_FP_CMP:
-    {
-        for (int i = 0; i < n_ops; i++) {
-            uint8_t r = extract_mips_reg(ops[i]);
-            if (r != REG_NONE) add_src_reg(out, r);
-        }
-        add_dst_reg(out, REG_FLAGS);
-        break;
-    }
-
-    default:
-        if (n_ops >= 1) {
-            uint8_t dst = extract_mips_reg(ops[0]);
-            if (dst != REG_NONE) add_dst_reg(out, dst);
-        }
-        for (int i = 1; i < n_ops; i++) {
-            uint8_t src = extract_mips_reg(ops[i]);
-            if (src != REG_NONE) add_src_reg(out, src);
-        }
-        break;
-    }
-
-    /* Extract immediate value (bare number or hex) */
-    for (int i = 0; i < n_ops; i++) {
-        const char *t = ops[i];
-        while (*t == ' ' || *t == '\t') t++;
-        if ((*t >= '0' && *t <= '9') || *t == '-') {
-            const char *paren = strchr(t, '(');
-            if (!paren) {
-                out->has_immediate = true;
-                out->immediate = strtoll(t, NULL, 0);
-                break;
-            }
-        }
-    }
+    g_mutex_lock(&unknown_warn_lock);
+    fprintf(unknown_warn_file,
+            "pc=0x%" PRIx64 " isa=%u reason=%s mnemonic=%s disas=\"%s\"\n",
+            pc, (unsigned int)trace_isa, reason,
+            mnem ? mnem : "<none>", disas ? disas : "");
+    fflush(unknown_warn_file);
+    stat_unknown_insn_warnings++;
+    g_mutex_unlock(&unknown_warn_lock);
 }
 
 /*
  * Decode a disassembly string into ISA-agnostic InsnFields.
  * Uses the disassembly from qemu_plugin_insn_disas().
  */
-static void decode_disas_to_generic(const char *disas, InsnFields *out)
+static void decode_disas_to_generic(uint64_t pc, const char *disas,
+                                    InsnFields *out)
 {
+    const uint8_t *capture_kinds = NULL;
+    const char *operand_regex = NULL;
+
     memset(out, 0, sizeof(*out));
 
     if (!disas || !*disas) {
         return;
     }
 
-    /* Extract mnemonic (first space-delimited token) */
+    /*
+     * Extract mnemonic: skip instruction prefixes (lock, rep, bnd, ...)
+     * then take the first non-prefix token as the mnemonic.
+     */
     char mnem[64];
     const char *p = disas;
-    int i = 0;
-    while (*p && *p != ' ' && *p != '\t' && i < 63) {
-        mnem[i++] = *p++;
-    }
-    mnem[i] = '\0';
 
-    /* Classify mnemonic -> opcode + branch type + conditional flag */
-    classify_mnemonic(mnem, &out->opcode, &out->branch_type,
-                      &out->branch_conditional);
-
-    if (out->branch_type != BRANCH_NONE && strchr(disas, ' ')) {
-        char pfx[16];
-        const char *sp = strchr(disas, ' ');
-        size_t plen = (size_t)(sp - disas);
-
-        if (plen < sizeof(pfx)) {
-            memcpy(pfx, disas, plen);
-            pfx[plen] = '\0';
-            if (g_strcmp0(pfx, "bnd") == 0 ||
-                g_strcmp0(pfx, "pt") == 0 ||
-                g_strcmp0(pfx, "pn") == 0) {
-                out->branch_conditional = true;
-            }
+    for (;;) {
+        p = skip_ascii_ws(p);
+        size_t mlen = strcspn(p, ASCII_WS);
+        if (mlen == 0) {
+            return;
         }
+        if (mlen >= sizeof(mnem)) {
+            mlen = sizeof(mnem) - 1;
+        }
+        memcpy(mnem, p, mlen);
+        mnem[mlen] = '\0';
+        p += mlen;
+
+        /* If this token is a known instruction prefix, skip it */
+        if (!g_hash_table_contains(insn_prefix_ht, mnem)) {
+            break;
+        }
+    }
+
+    /* Classify mnemonic -> opcode + branch type + flags */
+    uint16_t flags = MF_NONE;
+    classify_mnemonic(mnem, &out->opcode, &out->branch_type,
+                      &flags, &capture_kinds, &operand_regex);
+
+    if (out->opcode == GEN_OP_UNKNOWN) {
+        warn_unknown_instruction(pc, "unknown_mnemonic", mnem, disas);
+        return;
+    }
+
+    if (!capture_kinds || !operand_regex) {
+        warn_unknown_instruction(pc, "missing_capture_info", mnem, disas);
+        return;
     }
 
     /* Skip whitespace to get to operands */
-    while (*p == ' ' || *p == '\t') {
-        p++;
-    }
+    p = skip_ascii_ws(p);
 
-    /* Parse operands for register and immediate extraction */
+    /* Parse operands using unified ISA-agnostic parser */
     if (*p) {
-        switch (trace_isa) {
-        case TRACE_ISA_X86:
-            parse_x86_operands(p, out);
-            break;
-        case TRACE_ISA_AARCH64:
-            parse_aarch64_operands(p, out);
-            break;
-        case TRACE_ISA_RISCV:
-            parse_riscv_operands(p, out);
-            break;
-        case TRACE_ISA_MIPS:
-            parse_mips_operands(p, out);
-            break;
-        default:
-            /* Unknown ISA: no operand parsing */
-            break;
-        }
+        parse_operands(p, out, capture_kinds, operand_regex, flags);
     }
 }
 
@@ -2672,7 +1605,8 @@ static BBTemplate *get_or_create_template(uint64_t start_pc,
     tmpl->insn_fields = g_new0(InsnFields, n_insns);
     for (uint32_t i = 0; i < n_insns; i++) {
         if (insn_disas && insn_disas[i]) {
-            decode_disas_to_generic(insn_disas[i], &tmpl->insn_fields[i]);
+            decode_disas_to_generic(tmpl->insn_pcs[i], insn_disas[i],
+                                    &tmpl->insn_fields[i]);
         }
     }
 
@@ -3643,6 +2577,32 @@ static void write_dyn_param_patch(BitWriter *bw,
     }
 }
 
+static bool body_stream_emit_dyn_patch(BitWriter *bw,
+                                       GHashTable *dyn_state,
+                                       uint32_t template_id,
+                                       const GArray *cur_dyn,
+                                       bool is_wp)
+{
+    GArray *prev_dyn = g_hash_table_lookup(dyn_state, &template_id);
+    bool unchanged = prev_dyn && dyn_param_array_equal(prev_dyn, cur_dyn);
+
+    bw_write_bits(bw, unchanged ? 1 : 0, 1);
+    if (unchanged) {
+        return true;
+    }
+
+    g_autoptr(GArray) changed_positions = g_array_new(false, false,
+                                                      sizeof(guint));
+    uint32_t *key = g_new(uint32_t, 1);
+
+    dyn_param_collect_changed_positions(prev_dyn, cur_dyn, changed_positions);
+    write_dyn_param_patch(bw, prev_dyn, cur_dyn, changed_positions, is_wp);
+
+    *key = template_id;
+    g_hash_table_replace(dyn_state, key, dyn_param_array_clone(cur_dyn));
+    return false;
+}
+
 /* Return the number of poison bytes that carry useful data. */
 static guint poison_mask_effective_len(const GByteArray *poison_mask)
 {
@@ -3684,32 +2644,9 @@ static void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
     bw_write_bits(&st->bw, 1, 1); /* entry marker */
     bw_write_sleb128(&st->bw, entry_tmpl - st->prev_entry_template);
     st->prev_entry_template = entry_tmpl;
-    {
-        GArray *prev_dyn = g_hash_table_lookup(st->cp_dyn_state,
-                                               &entry->template_id);
-        gboolean unchanged = prev_dyn &&
-            dyn_param_array_equal(prev_dyn, entry->dyn_params);
-        bw_write_bits(&st->bw, unchanged ? 1 : 0, 1);
-
-        if (!unchanged) {
-            g_autoptr(GArray) changed_positions = g_array_new(false,
-                                                              false,
-                                                              sizeof(guint));
-
-            dyn_param_collect_changed_positions(prev_dyn,
-                                                entry->dyn_params,
-                                                changed_positions);
-            write_dyn_param_patch(&st->bw, prev_dyn, entry->dyn_params,
-                                  changed_positions, false);
-
-            {
-                uint32_t *key = g_new(uint32_t, 1);
-                *key = entry->template_id;
-                g_hash_table_replace(st->cp_dyn_state, key,
-                                     dyn_param_array_clone(entry->dyn_params));
-            }
-        }
-    }
+    body_stream_emit_dyn_patch(&st->bw, st->cp_dyn_state,
+                               entry->template_id, entry->dyn_params,
+                               false);
 
     bw_write_uleb128(&st->bw, num_wp);
     /*
@@ -3724,32 +2661,11 @@ static void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
         for (uint32_t w = 0; w < num_wp; w++) {
             const WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
             uint32_t wp_tmpl = wp->template_id;
-            GArray *prev_dyn = g_hash_table_lookup(st->wp_dyn_state, &wp_tmpl);
-            gboolean unchanged = prev_dyn &&
-                dyn_param_array_equal(prev_dyn, wp->dyn_params);
 
             bw_write_sleb128(&st->bw, (int64_t)wp_tmpl - prev_wp_tid);
             prev_wp_tid = wp_tmpl;
-            bw_write_bits(&st->bw, unchanged ? 1 : 0, 1);
-
-            if (!unchanged) {
-                g_autoptr(GArray) changed_positions = g_array_new(false,
-                                                                  false,
-                                                                  sizeof(guint));
-
-                dyn_param_collect_changed_positions(prev_dyn,
-                                                    wp->dyn_params,
-                                                    changed_positions);
-                write_dyn_param_patch(&st->bw, prev_dyn, wp->dyn_params,
-                                      changed_positions, true);
-
-                {
-                    uint32_t *key = g_new(uint32_t, 1);
-                    *key = wp_tmpl;
-                    g_hash_table_replace(st->wp_dyn_state, key,
-                                         dyn_param_array_clone(wp->dyn_params));
-                }
-            }
+            body_stream_emit_dyn_patch(&st->bw, st->wp_dyn_state, wp_tmpl,
+                                       wp->dyn_params, true);
         }
     }
 
@@ -4241,117 +3157,138 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     size_t last_insn_size = qemu_plugin_insn_size(last_insn);
     uint64_t fall_through = last_insn_pc + last_insn_size;
     uint64_t bb_ends_in_branch = 0;
+    BBTemplate *existing_tmpl;
 
-    /* Collect raw instruction data for BB template and callbacks */
-    uint64_t *raw_insn_pcs = g_new0(uint64_t, n_insns);
-    char **raw_insn_disas_arr = g_new0(char *, n_insns);
-    uint8_t *raw_insn_sizes = g_new0(uint8_t, n_insns);
-    uint8_t *raw_insn_bytes = g_new0(uint8_t, n_insns * MAX_INSN_BYTES);
-    uint64_t *tmpl_insn_pcs = g_new0(uint64_t, n_insns);
-    char **tmpl_insn_disas_arr = g_new0(char *, n_insns);
-    uint8_t *tmpl_insn_sizes = g_new0(uint8_t, n_insns);
-    uint8_t *tmpl_insn_bytes = g_new0(uint8_t, n_insns * MAX_INSN_BYTES);
-    size_t tmpl_n_insns = 0;
-    const char *symbol_name = qemu_plugin_insn_symbol(first_insn);
-
-    for (size_t i = 0; i < n_insns; i++) {
-        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
-        raw_insn_pcs[i] = qemu_plugin_insn_vaddr(insn);
-
-        /* Get disassembly string from QEMU's internal disassembler */
-        raw_insn_disas_arr[i] = qemu_plugin_insn_disas(insn);
-        raw_insn_sizes[i] = (uint8_t)MIN(qemu_plugin_insn_size(insn), MAX_INSN_BYTES);
-        qemu_plugin_insn_data(insn,
-                      &raw_insn_bytes[i * MAX_INSN_BYTES],
-                      raw_insn_sizes[i]);
-
-        /* Register per-instruction memory callback with PC as udata */
-        qemu_plugin_register_vcpu_mem_cb(
-            insn, vcpu_mem_cb, QEMU_PLUGIN_CB_NO_REGS,
-            QEMU_PLUGIN_MEM_RW, (void *)(uintptr_t)raw_insn_pcs[i]);
-    }
-
-    /*
-     * Normalize template instruction stream for x86 x87 wait-prefix encoding.
-     * Binutils often prints "9b dd d8" as a single prefixed instruction,
-     * while QEMU disassembly can surface a standalone "9b" followed by the
-     * x87 op. Coalesce these into one traced instruction so bytes/opcode align
-     * with disassembly expectations.
-     */
-    for (size_t i = 0; i < n_insns; i++) {
-        bool can_merge_wait_prefix =
-            (trace_isa == TRACE_ISA_X86) &&
-            (i + 1 < n_insns) &&
-            (raw_insn_sizes[i] == 1) &&
-            (raw_insn_bytes[i * MAX_INSN_BYTES] == 0x9b) &&
-            (raw_insn_pcs[i] + 1 == raw_insn_pcs[i + 1]) &&
-            disas_starts_with_fp_mnemonic(raw_insn_disas_arr[i + 1]);
-
-        if (can_merge_wait_prefix) {
-            uint8_t next_sz = raw_insn_sizes[i + 1];
-            uint8_t merged_sz = (uint8_t)MIN((int)MAX_INSN_BYTES,
-                                             1 + (int)next_sz);
-
-            tmpl_insn_pcs[tmpl_n_insns] = raw_insn_pcs[i];
-            tmpl_insn_disas_arr[tmpl_n_insns] = raw_insn_disas_arr[i + 1];
-            raw_insn_disas_arr[i + 1] = NULL;
-            tmpl_insn_sizes[tmpl_n_insns] = merged_sz;
-            memset(&tmpl_insn_bytes[tmpl_n_insns * MAX_INSN_BYTES], 0,
-                   MAX_INSN_BYTES);
-            tmpl_insn_bytes[tmpl_n_insns * MAX_INSN_BYTES] = 0x9b;
-            if (merged_sz > 1) {
-                memcpy(&tmpl_insn_bytes[tmpl_n_insns * MAX_INSN_BYTES + 1],
-                       &raw_insn_bytes[(i + 1) * MAX_INSN_BYTES],
-                       merged_sz - 1);
-            }
-
-            tmpl_n_insns++;
-            i++;
-            continue;
-        }
-
-        tmpl_insn_pcs[tmpl_n_insns] = raw_insn_pcs[i];
-        tmpl_insn_disas_arr[tmpl_n_insns] = raw_insn_disas_arr[i];
-        raw_insn_disas_arr[i] = NULL;
-        tmpl_insn_sizes[tmpl_n_insns] = raw_insn_sizes[i];
-        memcpy(&tmpl_insn_bytes[tmpl_n_insns * MAX_INSN_BYTES],
-               &raw_insn_bytes[i * MAX_INSN_BYTES],
-               MAX_INSN_BYTES);
-        tmpl_n_insns++;
-    }
-
-    /* Create or update BB template */
     g_mutex_lock(&data_lock);
-    {
-        BBTemplate *tmpl = get_or_create_template(pc,
-                                                  (uint32_t)tmpl_n_insns,
-                                                  tmpl_insn_pcs,
-                                                  tmpl_insn_disas_arr,
-                                                  tmpl_insn_sizes,
-                                                  tmpl_insn_bytes,
-                                                  symbol_name, fall_through);
-        if (tmpl && tmpl->n_insns > 0) {
-            InsnFields *last_fld = &tmpl->insn_fields[tmpl->n_insns - 1];
-            bb_ends_in_branch = (last_fld->branch_type != BRANCH_NONE) ? 1 : 0;
-        }
+    existing_tmpl = find_template(pc);
+    if (existing_tmpl && existing_tmpl->n_insns > 0) {
+        InsnFields *last_fld = &existing_tmpl->insn_fields[existing_tmpl->n_insns - 1];
+        bb_ends_in_branch = (last_fld->branch_type != BRANCH_NONE) ? 1 : 0;
     }
     g_mutex_unlock(&data_lock);
 
-    /* Free temporary arrays (template made copies) */
-    for (size_t i = 0; i < n_insns; i++) {
-        g_free(raw_insn_disas_arr[i]);
+    if (!existing_tmpl) {
+        /* Collect raw instruction data for first-time BB template creation. */
+        uint64_t *raw_insn_pcs = g_new0(uint64_t, n_insns);
+        char **raw_insn_disas_arr = g_new0(char *, n_insns);
+        uint8_t *raw_insn_sizes = g_new0(uint8_t, n_insns);
+        uint8_t *raw_insn_bytes = g_new0(uint8_t, n_insns * MAX_INSN_BYTES);
+        uint64_t *tmpl_insn_pcs = g_new0(uint64_t, n_insns);
+        char **tmpl_insn_disas_arr = g_new0(char *, n_insns);
+        uint8_t *tmpl_insn_sizes = g_new0(uint8_t, n_insns);
+        uint8_t *tmpl_insn_bytes = g_new0(uint8_t, n_insns * MAX_INSN_BYTES);
+        size_t tmpl_n_insns = 0;
+        const char *symbol_name = qemu_plugin_insn_symbol(first_insn);
+
+        for (size_t i = 0; i < n_insns; i++) {
+            struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+            raw_insn_pcs[i] = qemu_plugin_insn_vaddr(insn);
+
+            /* Get disassembly string from QEMU's internal disassembler */
+            raw_insn_disas_arr[i] = qemu_plugin_insn_disas(insn);
+            raw_insn_sizes[i] = (uint8_t)MIN(qemu_plugin_insn_size(insn), MAX_INSN_BYTES);
+            qemu_plugin_insn_data(insn,
+                          &raw_insn_bytes[i * MAX_INSN_BYTES],
+                          raw_insn_sizes[i]);
+
+            /* Register per-instruction memory callback with PC as udata */
+            qemu_plugin_register_vcpu_mem_cb(
+                insn, vcpu_mem_cb, QEMU_PLUGIN_CB_NO_REGS,
+                QEMU_PLUGIN_MEM_RW, (void *)(uintptr_t)raw_insn_pcs[i]);
+        }
+
+        /*
+         * Normalize template instruction stream for x86 x87 wait-prefix encoding.
+         * Binutils often prints "9b dd d8" as a single prefixed instruction,
+         * while QEMU disassembly can surface a standalone "9b" followed by the
+         * x87 op. Coalesce these into one traced instruction so bytes/opcode align
+         * with disassembly expectations.
+         */
+        for (size_t i = 0; i < n_insns; i++) {
+            bool can_merge_wait_prefix =
+                (trace_isa == TRACE_ISA_X86) &&
+                (i + 1 < n_insns) &&
+                (raw_insn_sizes[i] == 1) &&
+                (raw_insn_bytes[i * MAX_INSN_BYTES] == 0x9b) &&
+                (raw_insn_pcs[i] + 1 == raw_insn_pcs[i + 1]) &&
+                disas_starts_with_fp_mnemonic(raw_insn_disas_arr[i + 1]);
+
+            if (can_merge_wait_prefix) {
+                uint8_t next_sz = raw_insn_sizes[i + 1];
+                uint8_t merged_sz = (uint8_t)MIN((int)MAX_INSN_BYTES,
+                                                 1 + (int)next_sz);
+
+                tmpl_insn_pcs[tmpl_n_insns] = raw_insn_pcs[i];
+                tmpl_insn_disas_arr[tmpl_n_insns] = raw_insn_disas_arr[i + 1];
+                raw_insn_disas_arr[i + 1] = NULL;
+                tmpl_insn_sizes[tmpl_n_insns] = merged_sz;
+                memset(&tmpl_insn_bytes[tmpl_n_insns * MAX_INSN_BYTES], 0,
+                       MAX_INSN_BYTES);
+                tmpl_insn_bytes[tmpl_n_insns * MAX_INSN_BYTES] = 0x9b;
+                if (merged_sz > 1) {
+                    memcpy(&tmpl_insn_bytes[tmpl_n_insns * MAX_INSN_BYTES + 1],
+                           &raw_insn_bytes[(i + 1) * MAX_INSN_BYTES],
+                           merged_sz - 1);
+                }
+
+                tmpl_n_insns++;
+                i++;
+                continue;
+            }
+
+            tmpl_insn_pcs[tmpl_n_insns] = raw_insn_pcs[i];
+            tmpl_insn_disas_arr[tmpl_n_insns] = raw_insn_disas_arr[i];
+            raw_insn_disas_arr[i] = NULL;
+            tmpl_insn_sizes[tmpl_n_insns] = raw_insn_sizes[i];
+            memcpy(&tmpl_insn_bytes[tmpl_n_insns * MAX_INSN_BYTES],
+                   &raw_insn_bytes[i * MAX_INSN_BYTES],
+                   MAX_INSN_BYTES);
+            tmpl_n_insns++;
+        }
+
+        /* Create or update BB template */
+        g_mutex_lock(&data_lock);
+        {
+            BBTemplate *tmpl = get_or_create_template(pc,
+                                                      (uint32_t)tmpl_n_insns,
+                                                      tmpl_insn_pcs,
+                                                      tmpl_insn_disas_arr,
+                                                      tmpl_insn_sizes,
+                                                      tmpl_insn_bytes,
+                                                      symbol_name, fall_through);
+            if (tmpl && tmpl->n_insns > 0) {
+                InsnFields *last_fld = &tmpl->insn_fields[tmpl->n_insns - 1];
+                bb_ends_in_branch = (last_fld->branch_type != BRANCH_NONE) ? 1 : 0;
+            }
+        }
+        g_mutex_unlock(&data_lock);
+
+        /* Free temporary arrays (template made copies) */
+        for (size_t i = 0; i < n_insns; i++) {
+            g_free(raw_insn_disas_arr[i]);
+        }
+        for (size_t i = 0; i < tmpl_n_insns; i++) {
+            g_free(tmpl_insn_disas_arr[i]);
+        }
+        g_free(raw_insn_pcs);
+        g_free(raw_insn_disas_arr);
+        g_free(raw_insn_sizes);
+        g_free(raw_insn_bytes);
+        g_free(tmpl_insn_pcs);
+        g_free(tmpl_insn_disas_arr);
+        g_free(tmpl_insn_sizes);
+        g_free(tmpl_insn_bytes);
+    } else {
+        /* Re-translation of known BB: only dynamic memory callbacks needed. */
+        for (size_t i = 0; i < n_insns; i++) {
+            struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+            uint64_t insn_pc = qemu_plugin_insn_vaddr(insn);
+
+            qemu_plugin_register_vcpu_mem_cb(
+                insn, vcpu_mem_cb, QEMU_PLUGIN_CB_NO_REGS,
+                QEMU_PLUGIN_MEM_RW, (void *)(uintptr_t)insn_pc);
+        }
     }
-    for (size_t i = 0; i < tmpl_n_insns; i++) {
-        g_free(tmpl_insn_disas_arr[i]);
-    }
-    g_free(raw_insn_pcs);
-    g_free(raw_insn_disas_arr);
-    g_free(raw_insn_sizes);
-    g_free(raw_insn_bytes);
-    g_free(tmpl_insn_pcs);
-    g_free(tmpl_insn_disas_arr);
-    g_free(tmpl_insn_sizes);
-    g_free(tmpl_insn_bytes);
 
     /*
     * Instrument the block for execution tracking.
@@ -4480,6 +3417,9 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     g_string_append_printf(report,
         "  Early exits (execution fault): %" PRIu64 "\n",
         stat_wp_early_exits);
+    g_string_append_printf(report,
+        "  Unknown instruction warnings: %" PRIu64 "\n",
+        stat_unknown_insn_warnings);
 
     if (stat_wp_simulations > 0) {
         g_string_append_printf(report,
@@ -4529,6 +3469,11 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
 
     qemu_plugin_outs(report->str);
 
+    if (unknown_warn_file) {
+        fclose(unknown_warn_file);
+    }
+    g_free(unknown_warn_path);
+
     /* Cleanup */
     if (cp_mem_accesses) {
         g_array_unref(cp_mem_accesses);
@@ -4542,15 +3487,21 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     g_hash_table_unref(aarch64_reg_ht);
     g_hash_table_unref(riscv_reg_ht);
     g_hash_table_unref(mips_reg_ht);
-    g_hash_table_unref(x86_mnemonic_ht);
-    g_hash_table_unref(aarch64_mnemonic_ht);
-    g_hash_table_unref(riscv_mnemonic_ht);
-    g_hash_table_unref(mips_mnemonic_ht);
-    g_hash_table_unref(x86_prefix_ht);
-    g_hash_table_unref(aarch64_prefix_ht);
-    g_hash_table_unref(riscv_prefix_ht);
-    g_hash_table_unref(mips_prefix_ht);
+
+    if (isa.mnemonic_ht) {
+        g_hash_table_unref(isa.mnemonic_ht);
+    }
+    if (isa.mnem_re_arr) {
+        for (guint j = 0; j < isa.mnem_re_arr->len; j++) {
+            CompiledMnemRe *c = &g_array_index(isa.mnem_re_arr,
+                                               CompiledMnemRe, j);
+            g_regex_unref(c->re);
+        }
+        g_array_unref(isa.mnem_re_arr);
+    }
+
     g_hash_table_unref(insn_prefix_ht);
+    g_hash_table_unref(operand_regex_ht);
     g_hash_table_unref(option_ht);
     qemu_plugin_scoreboard_free(vcpu_sb);
     g_free(output_base_path);
@@ -4663,6 +3614,17 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         output_base_path = g_strdup("wptrace_out");
     }
 
+    unknown_warn_path = g_strdup_printf("%s.unknown_warnings.log",
+                                        output_base_path);
+    unknown_warn_file = fopen(unknown_warn_path, "w");
+    if (!unknown_warn_file) {
+        fprintf(stderr, "wptrace: cannot open unknown-warning output: %s\n",
+                unknown_warn_path);
+    } else {
+        fprintf(unknown_warn_file, "# wptrace unknown instruction warnings\n");
+        fflush(unknown_warn_file);
+    }
+
     /* Load simpoints file if provided */
     if (simpoints_file_path) {
         simpoints_list = parse_simpoints_file(simpoints_file_path);
@@ -4684,6 +3646,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     /* Initialize data structures */
     g_mutex_init(&data_lock);
     g_mutex_init(&exec_lock);
+    g_mutex_init(&unknown_warn_lock);
     template_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
                                          NULL, bb_template_free);
     branch_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
@@ -4696,61 +3659,63 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     mips_reg_ht = build_reg_hash_table(mips_reg_entries);
 
     /*
-     * Build per-ISA mnemonic hash tables: values are pointers to static
-     * MnemonicEntry rows, since each entry carries opcode + branch_type.
+     * Build mnemonic hash table and regex fallback array for the active ISA.
+     * Set up the ISA descriptor with extraction function pointers.
      */
-    x86_mnemonic_ht = g_hash_table_new(g_str_hash, g_str_equal);
-    for (int i = 0; x86_mnemonic_table[i].name; i++) {
-        g_hash_table_insert(x86_mnemonic_ht,
-                            (gpointer)x86_mnemonic_table[i].name,
-                            (gpointer)&x86_mnemonic_table[i]);
-    }
-    aarch64_mnemonic_ht = g_hash_table_new(g_str_hash, g_str_equal);
-    for (int i = 0; aarch64_mnemonic_table[i].name; i++) {
-        g_hash_table_insert(aarch64_mnemonic_ht,
-                            (gpointer)aarch64_mnemonic_table[i].name,
-                            (gpointer)&aarch64_mnemonic_table[i]);
-    }
-    riscv_mnemonic_ht = g_hash_table_new(g_str_hash, g_str_equal);
-    for (int i = 0; riscv_mnemonic_table[i].name; i++) {
-        g_hash_table_insert(riscv_mnemonic_ht,
-                            (gpointer)riscv_mnemonic_table[i].name,
-                            (gpointer)&riscv_mnemonic_table[i]);
-    }
-    mips_mnemonic_ht = g_hash_table_new(g_str_hash, g_str_equal);
-    for (int i = 0; mips_mnemonic_table[i].name; i++) {
-        g_hash_table_insert(mips_mnemonic_ht,
-                            (gpointer)mips_mnemonic_table[i].name,
-                            (gpointer)&mips_mnemonic_table[i]);
+    const MnemonicEntry *active_table = NULL;
+    switch (trace_isa) {
+    case TRACE_ISA_X86:
+        active_table = x86_mnemonic_table;
+        isa.extract_reg = extract_x86_reg;
+        isa.extract_mem = extract_x86_mem_regs;
+        isa.indirect_star = true;
+        break;
+    case TRACE_ISA_AARCH64:
+        active_table = aarch64_mnemonic_table;
+        isa.extract_reg = extract_aarch64_reg;
+        isa.extract_mem = extract_aarch64_mem_regs;
+        isa.indirect_star = false;
+        break;
+    case TRACE_ISA_RISCV:
+        active_table = riscv_mnemonic_table;
+        isa.extract_reg = extract_riscv_reg;
+        isa.extract_mem = extract_riscv_mem_regs;
+        isa.indirect_star = false;
+        break;
+    case TRACE_ISA_MIPS:
+        active_table = mips_mnemonic_table;
+        isa.extract_reg = extract_mips_reg;
+        isa.extract_mem = extract_mips_mem_regs;
+        isa.indirect_star = false;
+        break;
+    default:
+        break;
     }
 
-    /*
-     * Build per-ISA prefix classification hash tables: maps prefix strings to
-     * MnemonicEntry pointers for O(1) prefix-based lookup.
-     */
-    x86_prefix_ht = g_hash_table_new(g_str_hash, g_str_equal);
-    for (int i = 0; x86_prefix_class_table[i].name; i++) {
-        g_hash_table_insert(x86_prefix_ht,
-                            (gpointer)x86_prefix_class_table[i].name,
-                            (gpointer)&x86_prefix_class_table[i]);
-    }
-    aarch64_prefix_ht = g_hash_table_new(g_str_hash, g_str_equal);
-    for (int i = 0; aarch64_prefix_class_table[i].name; i++) {
-        g_hash_table_insert(aarch64_prefix_ht,
-                            (gpointer)aarch64_prefix_class_table[i].name,
-                            (gpointer)&aarch64_prefix_class_table[i]);
-    }
-    riscv_prefix_ht = g_hash_table_new(g_str_hash, g_str_equal);
-    for (int i = 0; riscv_prefix_class_table[i].name; i++) {
-        g_hash_table_insert(riscv_prefix_ht,
-                            (gpointer)riscv_prefix_class_table[i].name,
-                            (gpointer)&riscv_prefix_class_table[i]);
-    }
-    mips_prefix_ht = g_hash_table_new(g_str_hash, g_str_equal);
-    for (int i = 0; mips_prefix_class_table[i].name; i++) {
-        g_hash_table_insert(mips_prefix_ht,
-                            (gpointer)mips_prefix_class_table[i].name,
-                            (gpointer)&mips_prefix_class_table[i]);
+    if (active_table) {
+        isa.mnemonic_ht = g_hash_table_new(g_str_hash, g_str_equal);
+        isa.mnem_re_arr = g_array_new(FALSE, FALSE, sizeof(CompiledMnemRe));
+
+        for (int i = 0; active_table[i].name || active_table[i].mnem_re; i++) {
+            const MnemonicEntry *e = &active_table[i];
+            if (e->name) {
+                g_hash_table_insert(isa.mnemonic_ht,
+                                    (gpointer)e->name, (gpointer)e);
+            }
+            if (e->mnem_re) {
+                GError *err = NULL;
+                GRegex *re = g_regex_new(e->mnem_re, G_REGEX_ANCHORED, 0,
+                                         &err);
+                if (re) {
+                    CompiledMnemRe cre = { .re = re, .entry = e };
+                    g_array_append_val(isa.mnem_re_arr, cre);
+                } else {
+                    g_warning("wptrace: bad mnem_re '%s': %s",
+                              e->mnem_re, err->message);
+                    g_error_free(err);
+                }
+            }
+        }
     }
 
     /*
@@ -4758,16 +3723,16 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      * Values are non-NULL sentinels; only membership is checked.
      */
     insn_prefix_ht = g_hash_table_new(g_str_hash, g_str_equal);
-    {
-        static const char *const insn_prefixes[] = {
-            "lock", "rep", "repz", "repnz", "data16", NULL
-        };
-        for (int i = 0; insn_prefixes[i]; i++) {
-            g_hash_table_insert(insn_prefix_ht,
-                                (gpointer)insn_prefixes[i],
-                                GINT_TO_POINTER(1));
-        }
+    for (int i = 0; x86_insn_prefixes[i]; i++) {
+        g_hash_table_insert(insn_prefix_ht,
+                            (gpointer)x86_insn_prefixes[i],
+                            GINT_TO_POINTER(1));
     }
+
+    /* Cache for compiled operand regex patterns. */
+    operand_regex_ht = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                             NULL,
+                                             (GDestroyNotify)g_regex_unref);
 
     /* Initialize per-vCPU scoreboard */
     vcpu_sb = qemu_plugin_scoreboard_new(sizeof(VCPUScoreBoard));

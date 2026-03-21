@@ -4,469 +4,854 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
-/* x86 mnemonic table */
+/*
+ * ISA-agnostic generic opcodes.
+ * Each value encodes the generic function of an instruction's operation,
+ * consistent across all ISAs supported by QEMU.
+ */
+enum GenericOpcode {
+    GEN_OP_UNKNOWN = 0,
+    GEN_OP_INT_ADD = 1,
+    GEN_OP_INT_SUB = 2,
+    GEN_OP_INT_MUL = 3,
+    GEN_OP_INT_DIV = 4,
+    GEN_OP_AND = 5,
+    GEN_OP_OR = 6,
+    GEN_OP_XOR = 7,
+    GEN_OP_NOT = 8,
+    GEN_OP_SHL = 9,
+    GEN_OP_SHR = 10,
+    GEN_OP_SAR = 11,
+    GEN_OP_ROL = 12,
+    GEN_OP_ROR = 13,
+    GEN_OP_MOV = 14,
+    GEN_OP_LOAD = 15,
+    GEN_OP_STORE = 16,
+    GEN_OP_PUSH = 17,
+    GEN_OP_POP = 18,
+    GEN_OP_LEA = 19,
+    GEN_OP_MOVSX = 20,
+    GEN_OP_MOVZX = 21,
+    GEN_OP_XCHG = 22,
+    GEN_OP_CMP = 23,
+    GEN_OP_TEST = 24,
+    GEN_OP_BRANCH = 25,
+    GEN_OP_CALL = 26,
+    GEN_OP_RET = 27,
+    GEN_OP_FP_ADD = 28,
+    GEN_OP_FP_SUB = 29,
+    GEN_OP_FP_MUL = 30,
+    GEN_OP_FP_DIV = 31,
+    GEN_OP_FP_SQRT = 32,
+    GEN_OP_FP_MOV = 33,
+    GEN_OP_FP_CVT = 34,
+    GEN_OP_FP_CMP = 35,
+    GEN_OP_VEC_ADD = 36,
+    GEN_OP_VEC_SUB = 37,
+    GEN_OP_VEC_MUL = 38,
+    GEN_OP_VEC_MOV = 39,
+    GEN_OP_VEC_SHUF = 40,
+    GEN_OP_VEC_LOGIC = 41,
+    GEN_OP_NOP = 42,
+    GEN_OP_SYSCALL = 43,
+    GEN_OP_FENCE = 44,
+    GEN_OP_CMOV = 45,
+    GEN_OP_SETCC = 46,
+    GEN_OP_INT_ADC = 47,
+    GEN_OP_INT_SBB = 48,
+    GEN_OP_NEG = 49,
+    GEN_OP_INC = 50,
+    GEN_OP_DEC = 51,
+    GEN_OP_COUNT
+};
+
+/*
+ * Branch type classification.
+ */
+enum BranchType {
+    BRANCH_NONE = 0,
+    BRANCH_DIRECT_JUMP = 1,
+    BRANCH_INDIRECT_JUMP = 2,
+    BRANCH_DIRECT_CALL = 3,
+    BRANCH_INDIRECT_CALL = 4,
+    BRANCH_RETURN = 5,
+    BRANCH_SYSCALL_TYPE = 6,
+    BRANCH_COND_DIRECT = 7,
+    BRANCH_TYPE_COUNT,
+};
+
+enum GenericExceptionId {
+    GEN_EXC_NONE = 0,
+    GEN_EXC_UNKNOWN = 1,
+    GEN_EXC_INT_DIVIDE_BY_ZERO = 2,
+    GEN_EXC_FP_DIVIDE_BY_ZERO = 3,
+    GEN_EXC_MEMORY_ACCESS = 4,
+    GEN_EXC_COUNT,
+};
+
+enum WPStopReason {
+    WP_STOP_NONE = 0,
+    WP_STOP_SYSCALL_USERMODE = 1,
+    WP_STOP_REASON_COUNT,
+};
+
+/*
+ * Regex capture semantic tags. Each regex capture group is assigned one
+ * meaning in MnemonicEntry.capture_kinds.
+ */
+enum OperandCaptureKind {
+    CAP_NONE = 0,
+    CAP_SRC_REG,
+    CAP_DST_REG,
+    CAP_RW_REG,
+    CAP_SRC_MEM,
+    CAP_DST_MEM,
+    CAP_MEM_ADDR,
+    CAP_SRC_REG_OR_MEM,
+    CAP_DST_REG_OR_MEM,
+    CAP_RW_REG_OR_MEM,
+    CAP_IMM,
+    CAP_BRANCH_TARGET,
+};
+
+/*
+ * Mnemonic entry flags.
+ *
+ * Each bit encodes an implicit property of the instruction so that all
+ * instruction semantics are table-driven.  The operand-parsing code
+ * applies these flags generically after capture-group processing,
+ * eliminating per-opcode special-case logic.
+ */
+enum MnemonicFlags {
+    MF_NONE         = 0,
+    MF_CONDITIONAL  = (1 << 0),  /* Branch/CMOV/SETcc is conditional            */
+    MF_FLAGS_DST    = (1 << 1),  /* Implicitly writes FLAGS / condition codes    */
+    MF_FLAGS_SRC    = (1 << 2),  /* Implicitly reads  FLAGS / condition codes    */
+    MF_SP_RW        = (1 << 3),  /* Implicitly reads+writes stack pointer (SP)   */
+    MF_LR_DST       = (1 << 4),  /* Implicitly writes link register (LR / RA)   */
+    MF_LR_SRC       = (1 << 5),  /* Implicitly reads  link register (LR / RA)   */
+    MF_IP_DST       = (1 << 6),  /* Implicitly writes instruction pointer (IP)  */
+    MF_MOV_PROMOTE  = (1 << 7),  /* Promote MOV→LOAD/STORE based on mem operand */
+    MF_CHK_INDIRECT = (1 << 8),  /* Check for indirect branch/call (x86 '*')    */
+    MF_CHK_LR_RET   = (1 << 9),  /* If target reg == LR treat as RET            */
+};
+
+/*
+ * ISA-agnostic register IDs.
+ * Consistent numbering across ISAs with reserved special register IDs.
+ */
+enum GenericRegId {
+    REG_NONE = 0,
+    /* General-purpose integer registers: 1-64 */
+    REG_GPR0 = 1,
+    REG_GPR1 = 2,
+    REG_GPR2 = 3,
+    REG_GPR3 = 4,
+    REG_GPR4 = 5,
+    REG_GPR5 = 6,
+    REG_GPR6 = 7,
+    REG_GPR7 = 8,
+    REG_GPR8 = 9,
+    REG_GPR9 = 10,
+    REG_GPR10 = 11,
+    REG_GPR11 = 12,
+    REG_GPR12 = 13,
+    REG_GPR13 = 14,
+    REG_GPR14 = 15,
+    REG_GPR15 = 16,
+    REG_GPR16 = 17,
+    REG_GPR17 = 18,
+    REG_GPR18 = 19,
+    REG_GPR19 = 20,
+    REG_GPR20 = 21,
+    REG_GPR21 = 22,
+    REG_GPR22 = 23,
+    REG_GPR23 = 24,
+    REG_GPR24 = 25,
+    REG_GPR25 = 26,
+    REG_GPR26 = 27,
+    REG_GPR27 = 28,
+    REG_GPR28 = 29,
+    REG_GPR29 = 30,
+    REG_GPR30 = 31,
+    REG_GPR31 = 32,
+    /* GPR32-GPR63 follow sequentially (33-64) */
+    /* Floating-point registers: 65-128 */
+    REG_FPR0 = 65,
+    /* FPR1-FPR63 follow sequentially (66-128) */
+    /* Vector/SIMD registers: 129-192 */
+    REG_VEC0 = 129,
+    /* VEC1-VEC63 follow sequentially (130-192) */
+    /* Special registers: 250-254 */
+    REG_SP = 250,
+    REG_FLAGS = 251,
+    REG_IP = 252,
+    REG_LR = 253,
+    REG_FP_REG = 254,
+};
+
+/*
+ * Register name → GenericRegId mapping entry.
+ * Used to build per-ISA hash tables for O(1) register name lookups.
+ */
+typedef struct {
+    const char *name;
+    uint8_t reg_id;
+} RegEntry;
+
+/*
+ * Register range mapping entry.
+ * Matches names in the form <prefix><number> and maps them to a contiguous
+ * GenericRegId interval: base_reg + (number - min_idx).
+ */
+typedef struct {
+    const char *prefix;
+    uint8_t min_idx;
+    uint8_t max_idx;
+    uint8_t base_reg;
+} RegRangeEntry;
+
+/*
+ * x86 register name table: maps all 64/32/16/8-bit GPR variants
+ * and special registers to GenericRegId for hash table initialization.
+ */
+static const RegEntry x86_reg_entries[] = {
+    /* 64-bit GPRs */
+    {"rax", REG_GPR0}, {"rcx", REG_GPR1}, {"rdx", REG_GPR2},
+    {"rbx", REG_GPR3}, {"rsp", REG_SP},   {"rbp", REG_FP_REG},
+    {"rsi", REG_GPR4}, {"rdi", REG_GPR5},
+    /* 32-bit GPRs */
+    {"eax", REG_GPR0}, {"ecx", REG_GPR1}, {"edx", REG_GPR2},
+    {"ebx", REG_GPR3}, {"esp", REG_SP},   {"ebp", REG_FP_REG},
+    {"esi", REG_GPR4}, {"edi", REG_GPR5},
+    /* 16-bit GPRs */
+    {"ax", REG_GPR0}, {"cx", REG_GPR1}, {"dx", REG_GPR2},
+    {"bx", REG_GPR3}, {"sp", REG_SP},   {"bp", REG_FP_REG},
+    {"si", REG_GPR4}, {"di", REG_GPR5},
+    /* 8-bit GPRs */
+    {"al", REG_GPR0}, {"ah", REG_GPR0},
+    {"cl", REG_GPR1}, {"ch", REG_GPR1},
+    {"dl", REG_GPR2}, {"dh", REG_GPR2},
+    {"bl", REG_GPR3}, {"bh", REG_GPR3},
+    {"spl", REG_SP},  {"bpl", REG_FP_REG},
+    {"sil", REG_GPR4}, {"dil", REG_GPR5},
+    /* Special registers */
+    {"rip", REG_IP}, {"eip", REG_IP},
+    {"rflags", REG_FLAGS}, {"eflags", REG_FLAGS},
+    {NULL, 0}
+};
+
+/*
+ * AArch64 register name table for exact-match lookups.
+ */
+static const RegEntry aarch64_reg_entries[] = {
+    {"xzr", REG_NONE}, {"wzr", REG_NONE},
+    {"sp", REG_SP}, {"lr", REG_LR}, {"fp", REG_FP_REG},
+    {NULL, 0}
+};
+
+/* AArch64 register ranges: x/w GPRs and v/d/s/q/h/b vector aliases. */
+static const RegRangeEntry aarch64_reg_ranges[] = {
+    {"x", 0, 30, REG_GPR0},
+    {"w", 0, 30, REG_GPR0},
+    {"v", 0, 31, REG_VEC0},
+    {"d", 0, 31, REG_VEC0},
+    {"s", 0, 31, REG_VEC0},
+    {"q", 0, 31, REG_VEC0},
+    {"h", 0, 31, REG_VEC0},
+    {"b", 0, 31, REG_VEC0},
+    {NULL, 0, 0, 0}
+};
+
+/*
+ * RISC-V register name table for exact-match lookups.
+ */
+static const RegEntry riscv_reg_entries[] = {
+    {"zero", REG_NONE},
+    {"ra", REG_LR}, {"sp", REG_SP}, {"gp", REG_GPR3},
+    {"tp", REG_GPR4}, {"fp", REG_FP_REG},
+    {"x0", REG_NONE}, {"x1", REG_LR}, {"x2", REG_SP}, {"x8", REG_FP_REG},
+    {"s0", REG_FP_REG}, {"s1", REG_GPR9},
+    {NULL, 0}
+};
+
+/* RISC-V register ranges for ABI and x/f naming forms. */
+static const RegRangeEntry riscv_reg_ranges[] = {
+    {"t", 0, 2, REG_GPR5},
+    {"t", 3, 6, REG_GPR28},
+    {"s", 2, 11, REG_GPR18},
+    {"a", 0, 7, REG_GPR10},
+    {"x", 3, 31, REG_GPR3},
+    {"ft", 0, 7, REG_FPR0},
+    {"ft", 8, 11, REG_FPR0 + 28},
+    {"fs", 0, 1, REG_FPR0 + 8},
+    {"fs", 2, 11, REG_FPR0 + 18},
+    {"fa", 0, 7, REG_FPR0 + 10},
+    {"f", 0, 31, REG_FPR0},
+    {NULL, 0, 0, 0}
+};
+
+/*
+ * MIPS register name table for exact-match lookups.
+ */
+static const RegEntry mips_reg_entries[] = {
+    {"zero", REG_NONE}, {"0", REG_NONE},
+    {"at", REG_GPR1}, {"sp", REG_SP}, {"fp", REG_FP_REG},
+    {"ra", REG_LR}, {"gp", REG_GPR28},
+    {"s8", REG_FP_REG},
+    {"29", REG_SP}, {"30", REG_FP_REG}, {"31", REG_LR},
+    {NULL, 0}
+};
+
+/* MIPS register ranges (oldabi/default naming in QEMU disassembly). */
+static const RegRangeEntry mips_reg_ranges[] = {
+    {"v", 0, 1, REG_GPR2},
+    {"a", 0, 7, REG_GPR4},
+    {"t", 0, 7, REG_GPR8},
+    {"t", 8, 9, REG_GPR24},
+    {"s", 0, 7, REG_GPR16},
+    {"k", 0, 1, REG_GPR26},
+    {"", 1, 28, REG_GPR1},
+    {"f", 0, 31, REG_FPR0},
+    {NULL, 0, 0, 0}
+};
+
+/* Mnemonic-to-opcode lookup table entry */
+typedef struct {
+    /*
+     * Exact mnemonic string for O(1) hash-table lookup.
+     * NULL when this entry uses mnem_re instead (pattern fallback).
+     */
+    const char *name;
+    /*
+     * POSIX-extended regex matching the mnemonic.
+     * Used only when name == NULL; tried in array order after hash miss.
+     * NULL when this entry uses exact name matching.
+     */
+    const char *mnem_re;
+    uint8_t opcode;
+    uint8_t branch_type;
+    uint16_t flags;             /* MnemonicFlags bitfield */
+    /* Regex used to capture operand fields (groups 1..4). */
+    const char *operand_regex;
+    uint8_t capture_kinds[4];
+} MnemonicEntry;
+
+/*
+ * Convenience macros for table entries.
+ *
+ * MNEM(name, op, br, fl, re, c0, c1, c2, c3)   – exact-match entry
+ * MNEM_RE(pat, op, br, fl, re, c0, c1, c2, c3)  – regex-pattern entry
+ * MNEM_END                                        – sentinel
+ *
+ * Common flag combinations:
+ *   F_ALU     – ALU op that writes FLAGS
+ *   F_CMP     – compare that writes FLAGS
+ *   F_COND    – conditional on FLAGS (cmov, setcc, j<cc>)
+ *   F_CALL    – call (SP r/w + IP dst + LR dst)
+ *   F_RET     – return (SP r/w + IP dst + LR src)
+ *   F_PUSH    – push (SP r/w)
+ *   F_BRANCH  – unconditional branch (check-indirect)
+ *   F_CBRANCH – conditional branch (check-indirect + conditional + flags-src)
+ */
+#define F_ALU       (MF_FLAGS_DST)
+#define F_CMP       (MF_FLAGS_DST)
+#define F_COND      (MF_CONDITIONAL | MF_FLAGS_SRC)
+#define F_CALL_X86  (MF_CHK_INDIRECT | MF_SP_RW | MF_IP_DST)
+#define F_RET_X86   (MF_SP_RW | MF_IP_DST)
+#define F_CALL_RISC (MF_LR_DST)
+#define F_RET_RISC  (MF_LR_SRC)
+#define F_PUSH      (MF_SP_RW)
+#define F_BRANCH    (MF_CHK_INDIRECT)
+#define F_CBRANCH   (MF_CONDITIONAL | MF_FLAGS_SRC)
+
+#define MNEM(n, op, br, fl, re, c0, c1, c2, c3)  \
+    { (n), NULL, (op), (br), (fl), (re), { (c0), (c1), (c2), (c3) } }
+
+#define MNEM_RE(pat, op, br, fl, re, c0, c1, c2, c3)  \
+    { NULL, (pat), (op), (br), (fl), (re), { (c0), (c1), (c2), (c3) } }
+
+#define MNEM_END  \
+    { NULL, NULL, 0, 0, MF_NONE, WPT_OP_RE_STD, { CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE } }
+
+/*
+ * Standard operand capture regex supporting commas inside one [] or () group.
+ * Captures up to 4 top-level operands as groups 1..4.
+ */
+#define WPT_OP_RE_STD \
+    "^\\s*((?:\\[[^\\]]*\\]|\\([^\\)]*\\)|[^,])+?)\\s*" \
+    "(?:,\\s*((?:\\[[^\\]]*\\]|\\([^\\)]*\\)|[^,])+?)\\s*)?" \
+    "(?:,\\s*((?:\\[[^\\]]*\\]|\\([^\\)]*\\)|[^,])+?)\\s*)?" \
+    "(?:,\\s*((?:\\[[^\\]]*\\]|\\([^\\)]*\\)|[^,])+?)\\s*)?$"
+
+/* x86 mnemonic table (exact matches + regex fallback patterns) */
 static const MnemonicEntry x86_mnemonic_table[] = {
     /* Integer ALU */
-    {"add",      GEN_OP_INT_ADD,  BRANCH_NONE},
-    {"adc",      GEN_OP_INT_ADC,  BRANCH_NONE},
-    {"sub",      GEN_OP_INT_SUB,  BRANCH_NONE},
-    {"sbb",      GEN_OP_INT_SBB,  BRANCH_NONE},
-    {"imul",     GEN_OP_INT_MUL,  BRANCH_NONE},
-    {"mul",      GEN_OP_INT_MUL,  BRANCH_NONE},
-    {"idiv",     GEN_OP_INT_DIV,  BRANCH_NONE},
-    {"div",      GEN_OP_INT_DIV,  BRANCH_NONE},
-    {"and",      GEN_OP_AND,      BRANCH_NONE},
-    {"or",       GEN_OP_OR,       BRANCH_NONE},
-    {"xor",      GEN_OP_XOR,      BRANCH_NONE},
-    {"not",      GEN_OP_NOT,      BRANCH_NONE},
-    {"neg",      GEN_OP_NEG,      BRANCH_NONE},
-    {"inc",      GEN_OP_INC,      BRANCH_NONE},
-    {"dec",      GEN_OP_DEC,      BRANCH_NONE},
+    MNEM("add",  GEN_OP_INT_ADD, BRANCH_NONE, F_ALU, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_RW_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("adc",  GEN_OP_INT_ADC, BRANCH_NONE, F_ALU|MF_FLAGS_SRC, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_RW_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("sub",  GEN_OP_INT_SUB, BRANCH_NONE, F_ALU, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_RW_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("sbb",  GEN_OP_INT_SBB, BRANCH_NONE, F_ALU|MF_FLAGS_SRC, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_RW_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("imul", GEN_OP_INT_MUL, BRANCH_NONE, F_ALU, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("mul",  GEN_OP_INT_MUL, BRANCH_NONE, F_ALU, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("idiv", GEN_OP_INT_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("div",  GEN_OP_INT_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("and",  GEN_OP_AND, BRANCH_NONE, F_ALU, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_RW_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("or",   GEN_OP_OR,  BRANCH_NONE, F_ALU, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_RW_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("xor",  GEN_OP_XOR, BRANCH_NONE, F_ALU, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_RW_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("not",  GEN_OP_NOT, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_RW_REG_OR_MEM, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("neg",  GEN_OP_NEG, BRANCH_NONE, F_ALU, WPT_OP_RE_STD, CAP_RW_REG_OR_MEM, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("inc",  GEN_OP_INC, BRANCH_NONE, F_ALU, WPT_OP_RE_STD, CAP_RW_REG_OR_MEM, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("dec",  GEN_OP_DEC, BRANCH_NONE, F_ALU, WPT_OP_RE_STD, CAP_RW_REG_OR_MEM, CAP_NONE, CAP_NONE, CAP_NONE),
     /* Shifts/rotates */
-    {"shl",      GEN_OP_SHL,      BRANCH_NONE},
-    {"sal",      GEN_OP_SHL,      BRANCH_NONE},
-    {"shr",      GEN_OP_SHR,      BRANCH_NONE},
-    {"sar",      GEN_OP_SAR,      BRANCH_NONE},
-    {"rol",      GEN_OP_ROL,      BRANCH_NONE},
-    {"ror",      GEN_OP_ROR,      BRANCH_NONE},
+    MNEM("shl", GEN_OP_SHL, BRANCH_NONE, F_ALU, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_RW_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("sal", GEN_OP_SHL, BRANCH_NONE, F_ALU, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_RW_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("shr", GEN_OP_SHR, BRANCH_NONE, F_ALU, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_RW_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("sar", GEN_OP_SAR, BRANCH_NONE, F_ALU, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_RW_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("rol", GEN_OP_ROL, BRANCH_NONE, F_ALU, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_RW_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("ror", GEN_OP_ROR, BRANCH_NONE, F_ALU, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_RW_REG_OR_MEM, CAP_NONE, CAP_NONE),
     /* Data movement */
-    {"mov",      GEN_OP_MOV,      BRANCH_NONE},
-    {"lea",      GEN_OP_LEA,      BRANCH_NONE},
-    {"push",     GEN_OP_PUSH,     BRANCH_NONE},
-    {"pop",      GEN_OP_POP,      BRANCH_NONE},
-    {"xchg",     GEN_OP_XCHG,     BRANCH_NONE},
+    MNEM("mov",   GEN_OP_MOV, BRANCH_NONE, MF_MOV_PROMOTE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("lea",   GEN_OP_LEA, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_MEM_ADDR, CAP_DST_REG, CAP_NONE, CAP_NONE),
+    MNEM("push",  GEN_OP_PUSH, BRANCH_NONE, F_PUSH, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("pop",   GEN_OP_POP,  BRANCH_NONE, F_PUSH, WPT_OP_RE_STD, CAP_DST_REG, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("xchg",  GEN_OP_XCHG, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_RW_REG_OR_MEM, CAP_RW_REG_OR_MEM, CAP_NONE, CAP_NONE),
     /* Sign/zero extend */
-    {"movsx",    GEN_OP_MOVSX,    BRANCH_NONE},
-    {"movsxd",   GEN_OP_MOVSX,    BRANCH_NONE},
-    {"movsl",    GEN_OP_MOVSX,    BRANCH_NONE},
-    {"movsbw",   GEN_OP_MOVSX,    BRANCH_NONE},
-    {"movsbl",   GEN_OP_MOVSX,    BRANCH_NONE},
-    {"movswl",   GEN_OP_MOVSX,    BRANCH_NONE},
-    {"movsbq",   GEN_OP_MOVSX,    BRANCH_NONE},
-    {"movswq",   GEN_OP_MOVSX,    BRANCH_NONE},
-    {"movslq",   GEN_OP_MOVSX,    BRANCH_NONE},
-    {"movzx",    GEN_OP_MOVZX,    BRANCH_NONE},
-    {"movzb",    GEN_OP_MOVZX,    BRANCH_NONE},
-    {"movzbw",   GEN_OP_MOVZX,    BRANCH_NONE},
-    {"movzbl",   GEN_OP_MOVZX,    BRANCH_NONE},
-    {"movzwl",   GEN_OP_MOVZX,    BRANCH_NONE},
-    {"movzbq",   GEN_OP_MOVZX,    BRANCH_NONE},
-    {"movzwq",   GEN_OP_MOVZX,    BRANCH_NONE},
-    {"cltq",     GEN_OP_MOVSX,    BRANCH_NONE},
-    {"cqto",     GEN_OP_MOVSX,    BRANCH_NONE},
-    {"cwtl",     GEN_OP_MOVSX,    BRANCH_NONE},
-    {"cdqe",     GEN_OP_MOVSX,    BRANCH_NONE},
-    {"cbw",      GEN_OP_MOVSX,    BRANCH_NONE},
-    {"cwde",     GEN_OP_MOVSX,    BRANCH_NONE},
-    {"cdq",      GEN_OP_MOVSX,    BRANCH_NONE},
-    {"cqo",      GEN_OP_MOVSX,    BRANCH_NONE},
+    MNEM("movsx",  GEN_OP_MOVSX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("movsxd", GEN_OP_MOVSX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("movsl",  GEN_OP_MOVSX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("movsbw", GEN_OP_MOVSX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("movsbl", GEN_OP_MOVSX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("movswl", GEN_OP_MOVSX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("movsbq", GEN_OP_MOVSX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("movswq", GEN_OP_MOVSX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("movslq", GEN_OP_MOVSX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("movzx",  GEN_OP_MOVZX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("movzb",  GEN_OP_MOVZX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("movzbw", GEN_OP_MOVZX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("movzbl", GEN_OP_MOVZX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("movzwl", GEN_OP_MOVZX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("movzbq", GEN_OP_MOVZX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("movzwq", GEN_OP_MOVZX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("cltq",   GEN_OP_MOVSX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("cqto",   GEN_OP_MOVSX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("cwtl",   GEN_OP_MOVSX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("cdqe",   GEN_OP_MOVSX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("cbw",    GEN_OP_MOVSX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("cwde",   GEN_OP_MOVSX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("cdq",    GEN_OP_MOVSX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("cqo",    GEN_OP_MOVSX, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
     /* Comparison */
-    {"cmp",      GEN_OP_CMP,      BRANCH_NONE},
-    {"test",     GEN_OP_TEST,     BRANCH_NONE},
+    MNEM("cmp",  GEN_OP_CMP,  BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("test", GEN_OP_TEST, BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_NONE, CAP_NONE),
     /* Control flow */
-    {"jmp",      GEN_OP_BRANCH,   BRANCH_DIRECT_JUMP},
-    {"call",     GEN_OP_CALL,     BRANCH_DIRECT_CALL},
-    {"ret",      GEN_OP_RET,      BRANCH_RETURN},
-    {"nop",      GEN_OP_NOP,      BRANCH_NONE},
-    {"syscall",  GEN_OP_SYSCALL,  BRANCH_SYSCALL_TYPE},
-    {"sysenter", GEN_OP_SYSCALL,  BRANCH_SYSCALL_TYPE},
-    {"int",      GEN_OP_SYSCALL,  BRANCH_SYSCALL_TYPE},
+    MNEM("jmp",      GEN_OP_BRANCH, BRANCH_DIRECT_JUMP,  F_BRANCH, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("call",     GEN_OP_CALL,   BRANCH_DIRECT_CALL,  F_CALL_X86, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("ret",      GEN_OP_RET,    BRANCH_RETURN, F_RET_X86, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("nop",      GEN_OP_NOP,    BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("syscall",  GEN_OP_SYSCALL, BRANCH_SYSCALL_TYPE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("sysenter", GEN_OP_SYSCALL, BRANCH_SYSCALL_TYPE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("int",      GEN_OP_SYSCALL, BRANCH_SYSCALL_TYPE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
     /* Fences */
-    {"mfence",   GEN_OP_FENCE,    BRANCH_NONE},
-    {"lfence",   GEN_OP_FENCE,    BRANCH_NONE},
-    {"sfence",   GEN_OP_FENCE,    BRANCH_NONE},
+    MNEM("mfence", GEN_OP_FENCE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("lfence", GEN_OP_FENCE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("sfence", GEN_OP_FENCE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
     /* Scalar FP */
-    {"addss",    GEN_OP_FP_ADD,   BRANCH_NONE},
-    {"addsd",    GEN_OP_FP_ADD,   BRANCH_NONE},
-    {"addps",    GEN_OP_FP_ADD,   BRANCH_NONE},
-    {"addpd",    GEN_OP_FP_ADD,   BRANCH_NONE},
-    {"subss",    GEN_OP_FP_SUB,   BRANCH_NONE},
-    {"subsd",    GEN_OP_FP_SUB,   BRANCH_NONE},
-    {"subps",    GEN_OP_FP_SUB,   BRANCH_NONE},
-    {"subpd",    GEN_OP_FP_SUB,   BRANCH_NONE},
-    {"mulss",    GEN_OP_FP_MUL,   BRANCH_NONE},
-    {"mulsd",    GEN_OP_FP_MUL,   BRANCH_NONE},
-    {"mulps",    GEN_OP_FP_MUL,   BRANCH_NONE},
-    {"mulpd",    GEN_OP_FP_MUL,   BRANCH_NONE},
-    {"divss",    GEN_OP_FP_DIV,   BRANCH_NONE},
-    {"divsd",    GEN_OP_FP_DIV,   BRANCH_NONE},
-    {"divps",    GEN_OP_FP_DIV,   BRANCH_NONE},
-    {"divpd",    GEN_OP_FP_DIV,   BRANCH_NONE},
-    {"sqrtss",   GEN_OP_FP_SQRT,  BRANCH_NONE},
-    {"sqrtsd",   GEN_OP_FP_SQRT,  BRANCH_NONE},
-    {"sqrtps",   GEN_OP_FP_SQRT,  BRANCH_NONE},
-    {"sqrtpd",   GEN_OP_FP_SQRT,  BRANCH_NONE},
-    {"movss",    GEN_OP_FP_MOV,   BRANCH_NONE},
-    {"movsd",    GEN_OP_FP_MOV,   BRANCH_NONE},
-    {"ucomiss",  GEN_OP_FP_CMP,   BRANCH_NONE},
-    {"ucomisd",  GEN_OP_FP_CMP,   BRANCH_NONE},
-    {"comiss",   GEN_OP_FP_CMP,   BRANCH_NONE},
-    {"comisd",   GEN_OP_FP_CMP,   BRANCH_NONE},
+    MNEM("addss",   GEN_OP_FP_ADD,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("addsd",   GEN_OP_FP_ADD,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("addps",   GEN_OP_FP_ADD,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("addpd",   GEN_OP_FP_ADD,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("subss",   GEN_OP_FP_SUB,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("subsd",   GEN_OP_FP_SUB,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("subps",   GEN_OP_FP_SUB,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("subpd",   GEN_OP_FP_SUB,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("mulss",   GEN_OP_FP_MUL,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("mulsd",   GEN_OP_FP_MUL,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("mulps",   GEN_OP_FP_MUL,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("mulpd",   GEN_OP_FP_MUL,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("divss",   GEN_OP_FP_DIV,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("divsd",   GEN_OP_FP_DIV,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("divps",   GEN_OP_FP_DIV,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("divpd",   GEN_OP_FP_DIV,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("sqrtss",  GEN_OP_FP_SQRT, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("sqrtsd",  GEN_OP_FP_SQRT, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("sqrtps",  GEN_OP_FP_SQRT, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("sqrtpd",  GEN_OP_FP_SQRT, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("movss",   GEN_OP_FP_MOV,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("movsd",   GEN_OP_FP_MOV,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("ucomiss", GEN_OP_FP_CMP,  BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("ucomisd", GEN_OP_FP_CMP,  BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("comiss",  GEN_OP_FP_CMP,  BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("comisd",  GEN_OP_FP_CMP,  BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
     /* x87 FP */
-    {"fld",      GEN_OP_FP_MOV,   BRANCH_NONE},
-    {"fld1",     GEN_OP_FP_MOV,   BRANCH_NONE},
-    {"fldz",     GEN_OP_FP_MOV,   BRANCH_NONE},
-    {"fldcw",    GEN_OP_FP_MOV,   BRANCH_NONE},
-    {"fst",      GEN_OP_FP_MOV,   BRANCH_NONE},
-    {"fstp",     GEN_OP_FP_MOV,   BRANCH_NONE},
-    {"fnstcw",   GEN_OP_STORE,    BRANCH_NONE},
-    {"fsubr",    GEN_OP_FP_SUB,   BRANCH_NONE},
-    {"fdivr",    GEN_OP_FP_DIV,   BRANCH_NONE},
-    {"fdivp",    GEN_OP_FP_DIV,   BRANCH_NONE},
-    {"fdivrp",   GEN_OP_FP_DIV,   BRANCH_NONE},
-    {"wait",     GEN_OP_FENCE,    BRANCH_NONE},
-    {"fwait",    GEN_OP_FENCE,    BRANCH_NONE},
+    MNEM("fld",    GEN_OP_FP_MOV,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("fld1",   GEN_OP_FP_MOV,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("fldz",   GEN_OP_FP_MOV,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("fldcw",  GEN_OP_FP_MOV,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("fst",    GEN_OP_FP_MOV,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("fstp",   GEN_OP_FP_MOV,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("fnstcw", GEN_OP_STORE,   BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG, CAP_DST_MEM, CAP_NONE, CAP_NONE),
+    MNEM("fsubr",  GEN_OP_FP_SUB,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("fdivr",  GEN_OP_FP_DIV,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("fdivp",  GEN_OP_FP_DIV,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("fdivrp", GEN_OP_FP_DIV,  BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("wait",   GEN_OP_FENCE,   BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("fwait",  GEN_OP_FENCE,   BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
     /* Vector mov */
-    {"movaps",   GEN_OP_VEC_MOV,  BRANCH_NONE},
-    {"movapd",   GEN_OP_VEC_MOV,  BRANCH_NONE},
-    {"movups",   GEN_OP_VEC_MOV,  BRANCH_NONE},
-    {"movupd",   GEN_OP_VEC_MOV,  BRANCH_NONE},
-    {"movdqa",   GEN_OP_VEC_MOV,  BRANCH_NONE},
-    {"movdqu",   GEN_OP_VEC_MOV,  BRANCH_NONE},
-    {"movd",     GEN_OP_VEC_MOV,  BRANCH_NONE},
-    {"movq",     GEN_OP_VEC_MOV,  BRANCH_NONE},
-    {"vmovd",    GEN_OP_VEC_MOV,  BRANCH_NONE},
-    {"vmovq",    GEN_OP_VEC_MOV,  BRANCH_NONE},
-    {"vmovdqa",  GEN_OP_VEC_MOV,  BRANCH_NONE},
-    {"vmovdqu",  GEN_OP_VEC_MOV,  BRANCH_NONE},
-    {"stmxcsr",  GEN_OP_STORE,    BRANCH_NONE},
-    {"ldmxcsr",  GEN_OP_LOAD,     BRANCH_NONE},
+    MNEM("movaps",  GEN_OP_VEC_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("movapd",  GEN_OP_VEC_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("movups",  GEN_OP_VEC_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("movupd",  GEN_OP_VEC_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("movdqa",  GEN_OP_VEC_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("movdqu",  GEN_OP_VEC_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("movd",    GEN_OP_VEC_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("movq",    GEN_OP_VEC_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("vmovd",   GEN_OP_VEC_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("vmovq",   GEN_OP_VEC_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("vmovdqa", GEN_OP_VEC_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("vmovdqu", GEN_OP_VEC_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("stmxcsr", GEN_OP_STORE,   BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG, CAP_DST_MEM, CAP_NONE, CAP_NONE),
+    MNEM("ldmxcsr", GEN_OP_LOAD,    BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_MEM, CAP_DST_REG, CAP_NONE, CAP_NONE),
     /* Vector logic */
-    {"andps",    GEN_OP_VEC_LOGIC, BRANCH_NONE},
-    {"andpd",    GEN_OP_VEC_LOGIC, BRANCH_NONE},
-    {"orps",     GEN_OP_VEC_LOGIC, BRANCH_NONE},
-    {"orpd",     GEN_OP_VEC_LOGIC, BRANCH_NONE},
-    {"xorps",    GEN_OP_VEC_LOGIC, BRANCH_NONE},
-    {"xorpd",    GEN_OP_VEC_LOGIC, BRANCH_NONE},
-    {"andnps",   GEN_OP_VEC_LOGIC, BRANCH_NONE},
-    {"andnpd",   GEN_OP_VEC_LOGIC, BRANCH_NONE},
-    {"pand",     GEN_OP_VEC_LOGIC, BRANCH_NONE},
-    {"pandn",    GEN_OP_VEC_LOGIC, BRANCH_NONE},
-    {"por",      GEN_OP_VEC_LOGIC, BRANCH_NONE},
-    {"pxor",     GEN_OP_VEC_LOGIC, BRANCH_NONE},
+    MNEM("andps",  GEN_OP_VEC_LOGIC, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("andpd",  GEN_OP_VEC_LOGIC, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("orps",   GEN_OP_VEC_LOGIC, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("orpd",   GEN_OP_VEC_LOGIC, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("xorps",  GEN_OP_VEC_LOGIC, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("xorpd",  GEN_OP_VEC_LOGIC, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("andnps", GEN_OP_VEC_LOGIC, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("andnpd", GEN_OP_VEC_LOGIC, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("pand",   GEN_OP_VEC_LOGIC, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("pandn",  GEN_OP_VEC_LOGIC, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("por",    GEN_OP_VEC_LOGIC, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("pxor",   GEN_OP_VEC_LOGIC, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
     /* Vector shuffle */
-    {"shufps",   GEN_OP_VEC_SHUF, BRANCH_NONE},
-    {"shufpd",   GEN_OP_VEC_SHUF, BRANCH_NONE},
-    {"pshufd",   GEN_OP_VEC_SHUF, BRANCH_NONE},
-    {"pshufb",   GEN_OP_VEC_SHUF, BRANCH_NONE},
+    MNEM("shufps", GEN_OP_VEC_SHUF, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("shufpd", GEN_OP_VEC_SHUF, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("pshufd", GEN_OP_VEC_SHUF, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("pshufb", GEN_OP_VEC_SHUF, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
     /* Vector add/sub/mul */
-    {"paddb",    GEN_OP_VEC_ADD,  BRANCH_NONE},
-    {"paddw",    GEN_OP_VEC_ADD,  BRANCH_NONE},
-    {"paddd",    GEN_OP_VEC_ADD,  BRANCH_NONE},
-    {"paddq",    GEN_OP_VEC_ADD,  BRANCH_NONE},
-    {"psubb",    GEN_OP_VEC_SUB,  BRANCH_NONE},
-    {"psubw",    GEN_OP_VEC_SUB,  BRANCH_NONE},
-    {"psubd",    GEN_OP_VEC_SUB,  BRANCH_NONE},
-    {"psubq",    GEN_OP_VEC_SUB,  BRANCH_NONE},
-    {"pmulld",   GEN_OP_VEC_MUL,  BRANCH_NONE},
-    {"pmullw",   GEN_OP_VEC_MUL,  BRANCH_NONE},
-    {NULL,       0,               0}
+    MNEM("paddb",  GEN_OP_VEC_ADD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("paddw",  GEN_OP_VEC_ADD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("paddd",  GEN_OP_VEC_ADD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("paddq",  GEN_OP_VEC_ADD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("psubb",  GEN_OP_VEC_SUB, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("psubw",  GEN_OP_VEC_SUB, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("psubd",  GEN_OP_VEC_SUB, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("psubq",  GEN_OP_VEC_SUB, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("pmulld", GEN_OP_VEC_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("pmullw", GEN_OP_VEC_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+
+    /*
+     * Regex fallback patterns – tried in order when exact lookup fails.
+     * These replace the old prefix_class_table + the j<cc> special-case.
+     */
+    /* x86 conditional jumps: j<cc> but not jmp */
+    MNEM_RE("^j(?!mp).+",  GEN_OP_BRANCH, BRANCH_DIRECT_JUMP, F_CBRANCH, WPT_OP_RE_STD, CAP_BRANCH_TARGET, CAP_NONE, CAP_NONE, CAP_NONE),
+    /* x86 cmov<cc> */
+    MNEM_RE("^cmov.+",     GEN_OP_CMOV,   BRANCH_NONE, F_COND, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    /* x86 set<cc> */
+    MNEM_RE("^set.+",      GEN_OP_SETCC,  BRANCH_NONE, F_COND, WPT_OP_RE_STD, CAP_DST_REG_OR_MEM, CAP_NONE, CAP_NONE, CAP_NONE),
+    /* x86 NOP variants (e.g. nopl, nopw) */
+    MNEM_RE("^nop.+",      GEN_OP_NOP,    BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+    /* x86 cvt... and vcvt... conversion families */
+    MNEM_RE("^v?cvt.+",    GEN_OP_FP_CVT, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_NONE, CAP_NONE, CAP_NONE, CAP_NONE),
+
+    MNEM_END
 };
 
 /* AArch64 mnemonic table */
 static const MnemonicEntry aarch64_mnemonic_table[] = {
     /* AArch64 ALU */
-    {"add",      GEN_OP_INT_ADD,  BRANCH_NONE},
-    {"adds",     GEN_OP_INT_ADD,  BRANCH_NONE},
-    {"sub",      GEN_OP_INT_SUB,  BRANCH_NONE},
-    {"subs",     GEN_OP_INT_SUB,  BRANCH_NONE},
-    {"madd",     GEN_OP_INT_MUL,  BRANCH_NONE},
-    {"msub",     GEN_OP_INT_MUL,  BRANCH_NONE},
-    {"sdiv",     GEN_OP_INT_DIV,  BRANCH_NONE},
-    {"udiv",     GEN_OP_INT_DIV,  BRANCH_NONE},
-    {"and",      GEN_OP_AND,      BRANCH_NONE},
-    {"orr",      GEN_OP_OR,       BRANCH_NONE},
-    {"orn",      GEN_OP_OR,       BRANCH_NONE},
-    {"eor",      GEN_OP_XOR,      BRANCH_NONE},
-    {"eon",      GEN_OP_XOR,      BRANCH_NONE},
-    {"mvn",      GEN_OP_NOT,      BRANCH_NONE},
-    {"bic",      GEN_OP_AND,      BRANCH_NONE},
-    {"lsl",      GEN_OP_SHL,      BRANCH_NONE},
-    {"lsr",      GEN_OP_SHR,      BRANCH_NONE},
-    {"asr",      GEN_OP_SAR,      BRANCH_NONE},
+    MNEM("add", GEN_OP_INT_ADD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("adds", GEN_OP_INT_ADD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("sub", GEN_OP_INT_SUB, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("subs", GEN_OP_INT_SUB, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("madd", GEN_OP_INT_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("msub", GEN_OP_INT_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("sdiv", GEN_OP_INT_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("udiv", GEN_OP_INT_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("and", GEN_OP_AND, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("orr", GEN_OP_OR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("orn", GEN_OP_OR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("eor", GEN_OP_XOR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("eon", GEN_OP_XOR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("mvn", GEN_OP_NOT, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("bic", GEN_OP_AND, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("lsl", GEN_OP_SHL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("lsr", GEN_OP_SHR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("asr", GEN_OP_SAR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
     /* AArch64 data movement */
-    {"mov",      GEN_OP_MOV,      BRANCH_NONE},
-    {"movz",     GEN_OP_MOV,      BRANCH_NONE},
-    {"movn",     GEN_OP_MOV,      BRANCH_NONE},
-    {"movk",     GEN_OP_MOV,      BRANCH_NONE},
-    {"ldr",      GEN_OP_LOAD,     BRANCH_NONE},
-    {"ldp",      GEN_OP_LOAD,     BRANCH_NONE},
-    {"ldrb",     GEN_OP_LOAD,     BRANCH_NONE},
-    {"ldrh",     GEN_OP_LOAD,     BRANCH_NONE},
-    {"ldrsb",    GEN_OP_LOAD,     BRANCH_NONE},
-    {"ldrsh",    GEN_OP_LOAD,     BRANCH_NONE},
-    {"ldrsw",    GEN_OP_LOAD,     BRANCH_NONE},
-    {"str",      GEN_OP_STORE,    BRANCH_NONE},
-    {"stp",      GEN_OP_STORE,    BRANCH_NONE},
-    {"strb",     GEN_OP_STORE,    BRANCH_NONE},
-    {"strh",     GEN_OP_STORE,    BRANCH_NONE},
+    MNEM("mov", GEN_OP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("movz", GEN_OP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("movn", GEN_OP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("movk", GEN_OP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("ldr", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("ldp", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("ldrb", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("ldrh", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("ldrsb", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("ldrsh", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("ldrsw", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("str", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("stp", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("strb", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("strh", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
     /* AArch64 comparison */
-    {"cmp",      GEN_OP_CMP,      BRANCH_NONE},
-    {"cmn",      GEN_OP_CMP,      BRANCH_NONE},
-    {"tst",      GEN_OP_TEST,     BRANCH_NONE},
+    MNEM("cmp", GEN_OP_CMP, BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("cmn", GEN_OP_CMP, BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("tst", GEN_OP_TEST, BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_NONE, CAP_NONE),
     /* AArch64 control flow */
-    {"b",        GEN_OP_BRANCH,   BRANCH_DIRECT_JUMP},
-    {"bl",       GEN_OP_CALL,     BRANCH_DIRECT_CALL},
-    {"blr",      GEN_OP_CALL,     BRANCH_INDIRECT_CALL},
-    {"br",       GEN_OP_BRANCH,   BRANCH_INDIRECT_JUMP},
-    {"ret",      GEN_OP_RET,      BRANCH_RETURN},
-    {"svc",      GEN_OP_SYSCALL,  BRANCH_SYSCALL_TYPE},
+    MNEM("b", GEN_OP_BRANCH, BRANCH_DIRECT_JUMP, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("bl", GEN_OP_CALL, BRANCH_DIRECT_CALL, F_CALL_RISC, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("blr", GEN_OP_CALL, BRANCH_INDIRECT_CALL, F_CALL_RISC, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("br", GEN_OP_BRANCH, BRANCH_INDIRECT_JUMP, MF_CHK_LR_RET, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("ret", GEN_OP_RET, BRANCH_RETURN, F_RET_RISC, WPT_OP_RE_STD, CAP_SRC_REG, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("svc", GEN_OP_SYSCALL, BRANCH_SYSCALL_TYPE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
     /* AArch64 conditional */
-    {"cbz",      GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"cbnz",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"tbz",      GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"tbnz",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"csel",     GEN_OP_CMOV,     BRANCH_NONE},
-    {"csinc",    GEN_OP_CMOV,     BRANCH_NONE},
-    {"csinv",    GEN_OP_CMOV,     BRANCH_NONE},
-    {"csneg",    GEN_OP_CMOV,     BRANCH_NONE},
+    MNEM("cbz", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("cbnz", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("tbz", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("tbnz", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("csel", GEN_OP_CMOV, BRANCH_NONE, F_COND, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("csinc", GEN_OP_CMOV, BRANCH_NONE, F_COND, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("csinv", GEN_OP_CMOV, BRANCH_NONE, F_COND, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("csneg", GEN_OP_CMOV, BRANCH_NONE, F_COND, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
     /* AArch64 FP */
-    {"fadd",     GEN_OP_FP_ADD,   BRANCH_NONE},
-    {"fsub",     GEN_OP_FP_SUB,   BRANCH_NONE},
-    {"fmul",     GEN_OP_FP_MUL,   BRANCH_NONE},
-    {"fdiv",     GEN_OP_FP_DIV,   BRANCH_NONE},
-    {"fsqrt",    GEN_OP_FP_SQRT,  BRANCH_NONE},
-    {"fmov",     GEN_OP_FP_MOV,   BRANCH_NONE},
-    {"fcmp",     GEN_OP_FP_CMP,   BRANCH_NONE},
-    {"fcvt",     GEN_OP_FP_CVT,   BRANCH_NONE},
-    {"fcvtzs",   GEN_OP_FP_CVT,   BRANCH_NONE},
-    {"fcvtzu",   GEN_OP_FP_CVT,   BRANCH_NONE},
-    {"scvtf",    GEN_OP_FP_CVT,   BRANCH_NONE},
-    {"ucvtf",    GEN_OP_FP_CVT,   BRANCH_NONE},
-    {NULL,       0,               0}
+    MNEM("fadd", GEN_OP_FP_ADD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("fsub", GEN_OP_FP_SUB, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("fmul", GEN_OP_FP_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("fdiv", GEN_OP_FP_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("fsqrt", GEN_OP_FP_SQRT, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("fmov", GEN_OP_FP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("fcmp", GEN_OP_FP_CMP, BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM("fcvt", GEN_OP_FP_CVT, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("fcvtzs", GEN_OP_FP_CVT, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("fcvtzu", GEN_OP_FP_CVT, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("scvtf", GEN_OP_FP_CVT, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("ucvtf", GEN_OP_FP_CVT, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    /* Regex fallback patterns (merged from prefix table) */
+    /* AArch64 conditional branches: b.eq, b.ne, b.gt, etc. */
+    MNEM_RE("^b\\..+", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+
+    MNEM_END
 };
 
 /* RISC-V mnemonic table */
 static const MnemonicEntry riscv_mnemonic_table[] = {
     /* Integer ALU */
-    {"add",      GEN_OP_INT_ADD,  BRANCH_NONE},
-    {"addi",     GEN_OP_INT_ADD,  BRANCH_NONE},
-    {"addw",     GEN_OP_INT_ADD,  BRANCH_NONE},
-    {"addiw",    GEN_OP_INT_ADD,  BRANCH_NONE},
-    {"sub",      GEN_OP_INT_SUB,  BRANCH_NONE},
-    {"subw",     GEN_OP_INT_SUB,  BRANCH_NONE},
-    {"andi",     GEN_OP_AND,      BRANCH_NONE},
-    {"ori",      GEN_OP_OR,       BRANCH_NONE},
-    {"xori",     GEN_OP_XOR,      BRANCH_NONE},
+    MNEM("add", GEN_OP_INT_ADD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("addi", GEN_OP_INT_ADD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("addw", GEN_OP_INT_ADD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("addiw", GEN_OP_INT_ADD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("sub", GEN_OP_INT_SUB, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("subw", GEN_OP_INT_SUB, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("andi", GEN_OP_AND, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("ori", GEN_OP_OR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("xori", GEN_OP_XOR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
     /* Shifts */
-    {"sll",      GEN_OP_SHL,      BRANCH_NONE},
-    {"slli",     GEN_OP_SHL,      BRANCH_NONE},
-    {"sllw",     GEN_OP_SHL,      BRANCH_NONE},
-    {"slliw",    GEN_OP_SHL,      BRANCH_NONE},
-    {"srl",      GEN_OP_SHR,      BRANCH_NONE},
-    {"srli",     GEN_OP_SHR,      BRANCH_NONE},
-    {"srlw",     GEN_OP_SHR,      BRANCH_NONE},
-    {"srliw",    GEN_OP_SHR,      BRANCH_NONE},
-    {"sra",      GEN_OP_SAR,      BRANCH_NONE},
-    {"srai",     GEN_OP_SAR,      BRANCH_NONE},
-    {"sraw",     GEN_OP_SAR,      BRANCH_NONE},
-    {"sraiw",    GEN_OP_SAR,      BRANCH_NONE},
+    MNEM("sll", GEN_OP_SHL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("slli", GEN_OP_SHL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("sllw", GEN_OP_SHL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("slliw", GEN_OP_SHL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("srl", GEN_OP_SHR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("srli", GEN_OP_SHR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("srlw", GEN_OP_SHR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("srliw", GEN_OP_SHR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("sra", GEN_OP_SAR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("srai", GEN_OP_SAR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("sraw", GEN_OP_SAR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("sraiw", GEN_OP_SAR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
     /* Multiply and divide */
-    {"mul",      GEN_OP_INT_MUL,  BRANCH_NONE},
-    {"mulh",     GEN_OP_INT_MUL,  BRANCH_NONE},
-    {"mulhu",    GEN_OP_INT_MUL,  BRANCH_NONE},
-    {"mulhsu",   GEN_OP_INT_MUL,  BRANCH_NONE},
-    {"mulw",     GEN_OP_INT_MUL,  BRANCH_NONE},
-    {"div",      GEN_OP_INT_DIV,  BRANCH_NONE},
-    {"divu",     GEN_OP_INT_DIV,  BRANCH_NONE},
-    {"divw",     GEN_OP_INT_DIV,  BRANCH_NONE},
-    {"divuw",    GEN_OP_INT_DIV,  BRANCH_NONE},
-    {"rem",      GEN_OP_INT_DIV,  BRANCH_NONE},
-    {"remu",     GEN_OP_INT_DIV,  BRANCH_NONE},
-    {"remw",     GEN_OP_INT_DIV,  BRANCH_NONE},
-    {"remuw",    GEN_OP_INT_DIV,  BRANCH_NONE},
+    MNEM("mul", GEN_OP_INT_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("mulh", GEN_OP_INT_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("mulhu", GEN_OP_INT_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("mulhsu", GEN_OP_INT_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("mulw", GEN_OP_INT_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("div", GEN_OP_INT_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("divu", GEN_OP_INT_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("divw", GEN_OP_INT_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("divuw", GEN_OP_INT_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("rem", GEN_OP_INT_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("remu", GEN_OP_INT_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("remw", GEN_OP_INT_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("remuw", GEN_OP_INT_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
     /* Compare */
-    {"slt",      GEN_OP_CMP,      BRANCH_NONE},
-    {"slti",     GEN_OP_CMP,      BRANCH_NONE},
-    {"sltu",     GEN_OP_CMP,      BRANCH_NONE},
-    {"sltiu",    GEN_OP_CMP,      BRANCH_NONE},
+    MNEM("slt", GEN_OP_CMP, BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("slti", GEN_OP_CMP, BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("sltu", GEN_OP_CMP, BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("sltiu", GEN_OP_CMP, BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
     /* Data movement */
-    {"lui",      GEN_OP_MOV,      BRANCH_NONE},
-    {"auipc",    GEN_OP_LEA,      BRANCH_NONE},
-    {"li",       GEN_OP_MOV,      BRANCH_NONE},
-    {"la",       GEN_OP_LEA,      BRANCH_NONE},
-    {"mv",       GEN_OP_MOV,      BRANCH_NONE},
+    MNEM("lui", GEN_OP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("auipc", GEN_OP_LEA, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("li", GEN_OP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("la", GEN_OP_LEA, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("mv", GEN_OP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
     /* Loads/stores */
-    {"lb",       GEN_OP_LOAD,     BRANCH_NONE},
-    {"lbu",      GEN_OP_LOAD,     BRANCH_NONE},
-    {"lh",       GEN_OP_LOAD,     BRANCH_NONE},
-    {"lhu",      GEN_OP_LOAD,     BRANCH_NONE},
-    {"lw",       GEN_OP_LOAD,     BRANCH_NONE},
-    {"lwu",      GEN_OP_LOAD,     BRANCH_NONE},
-    {"ld",       GEN_OP_LOAD,     BRANCH_NONE},
-    {"sb",       GEN_OP_STORE,    BRANCH_NONE},
-    {"sh",       GEN_OP_STORE,    BRANCH_NONE},
-    {"sw",       GEN_OP_STORE,    BRANCH_NONE},
-    {"sd",       GEN_OP_STORE,    BRANCH_NONE},
-    {"flw",      GEN_OP_LOAD,     BRANCH_NONE},
-    {"fld",      GEN_OP_LOAD,     BRANCH_NONE},
-    {"fsw",      GEN_OP_STORE,    BRANCH_NONE},
-    {"fsd",      GEN_OP_STORE,    BRANCH_NONE},
+    MNEM("lb", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("lbu", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("lh", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("lhu", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("lw", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("lwu", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("ld", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("sb", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("sh", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("sw", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("sd", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("flw", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("fld", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("fsw", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("fsd", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
     /* Control flow */
-    {"jal",      GEN_OP_CALL,     BRANCH_DIRECT_CALL},
-    {"jalr",     GEN_OP_CALL,     BRANCH_INDIRECT_CALL},
-    {"beq",      GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"bne",      GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"blt",      GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"bge",      GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"bltu",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"bgeu",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
+    MNEM("jal", GEN_OP_CALL, BRANCH_DIRECT_CALL, F_CALL_RISC, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("jalr", GEN_OP_CALL, BRANCH_INDIRECT_CALL, F_CALL_RISC, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("beq", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("bne", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("blt", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("bge", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("bltu", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("bgeu", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
     /* System */
-    {"ecall",    GEN_OP_SYSCALL,  BRANCH_SYSCALL_TYPE},
-    {"ebreak",   GEN_OP_SYSCALL,  BRANCH_SYSCALL_TYPE},
-    {"fence",    GEN_OP_FENCE,    BRANCH_NONE},
-    {NULL,       0,               0}
+    MNEM("ecall", GEN_OP_SYSCALL, BRANCH_SYSCALL_TYPE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("ebreak", GEN_OP_SYSCALL, BRANCH_SYSCALL_TYPE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("fence", GEN_OP_FENCE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    /* Regex fallback patterns (merged from prefix table) */
+    /* RISC-V FP instructions with dot suffix */
+    MNEM_RE("^fadd\\..+", GEN_OP_FP_ADD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^fsub\\..+", GEN_OP_FP_SUB, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^fmul\\..+", GEN_OP_FP_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^fdiv\\..+", GEN_OP_FP_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^fsqrt\\..+", GEN_OP_FP_SQRT, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^fmv\\..+", GEN_OP_FP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^fsgnj\\..+", GEN_OP_FP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^fsgnjn\\..+", GEN_OP_FP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^fsgnjx\\..+", GEN_OP_FP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^fcvt\\..+", GEN_OP_FP_CVT, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^feq\\..+", GEN_OP_FP_CMP, BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^flt\\..+", GEN_OP_FP_CMP, BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^fle\\..+", GEN_OP_FP_CMP, BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^fmadd\\..+", GEN_OP_FP_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^fmsub\\..+", GEN_OP_FP_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^fnmadd\\..+", GEN_OP_FP_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^fnmsub\\..+", GEN_OP_FP_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    /* RISC-V atomic ops */
+    MNEM_RE("^lr\\..+", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM_RE("^sc\\..+", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM_RE("^fence\\..+", GEN_OP_FENCE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    /* Non-dot bare prefixes */
+    MNEM_RE("^amo.+", GEN_OP_XCHG, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_RW_REG_OR_MEM, CAP_RW_REG_OR_MEM, CAP_RW_REG_OR_MEM, CAP_RW_REG_OR_MEM), /* RISC-V atomic */
+
+    MNEM_END
 };
 
 /* MIPS mnemonic table */
 static const MnemonicEntry mips_mnemonic_table[] = {
     /* Integer ALU */
-    {"add",      GEN_OP_INT_ADD,  BRANCH_NONE},
-    {"addi",     GEN_OP_INT_ADD,  BRANCH_NONE},
-    {"addiu",    GEN_OP_INT_ADD,  BRANCH_NONE},
-    {"addu",     GEN_OP_INT_ADD,  BRANCH_NONE},
-    {"sub",      GEN_OP_INT_SUB,  BRANCH_NONE},
-    {"subu",     GEN_OP_INT_SUB,  BRANCH_NONE},
-    {"and",      GEN_OP_AND,      BRANCH_NONE},
-    {"andi",     GEN_OP_AND,      BRANCH_NONE},
-    {"or",       GEN_OP_OR,       BRANCH_NONE},
-    {"ori",      GEN_OP_OR,       BRANCH_NONE},
-    {"xor",      GEN_OP_XOR,      BRANCH_NONE},
-    {"xori",     GEN_OP_XOR,      BRANCH_NONE},
-    {"nor",      GEN_OP_OR,       BRANCH_NONE},
+    MNEM("add", GEN_OP_INT_ADD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("addi", GEN_OP_INT_ADD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("addiu", GEN_OP_INT_ADD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("addu", GEN_OP_INT_ADD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("sub", GEN_OP_INT_SUB, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("subu", GEN_OP_INT_SUB, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("and", GEN_OP_AND, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("andi", GEN_OP_AND, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("or", GEN_OP_OR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("ori", GEN_OP_OR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("xor", GEN_OP_XOR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("xori", GEN_OP_XOR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("nor", GEN_OP_OR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
     /* Shifts */
-    {"sll",      GEN_OP_SHL,      BRANCH_NONE},
-    {"sllv",     GEN_OP_SHL,      BRANCH_NONE},
-    {"srl",      GEN_OP_SHR,      BRANCH_NONE},
-    {"srlv",     GEN_OP_SHR,      BRANCH_NONE},
-    {"sra",      GEN_OP_SAR,      BRANCH_NONE},
-    {"srav",     GEN_OP_SAR,      BRANCH_NONE},
+    MNEM("sll", GEN_OP_SHL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("sllv", GEN_OP_SHL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("srl", GEN_OP_SHR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("srlv", GEN_OP_SHR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("sra", GEN_OP_SAR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("srav", GEN_OP_SAR, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
     /* Multiply and divide */
-    {"mul",      GEN_OP_INT_MUL,  BRANCH_NONE},
-    {"mult",     GEN_OP_INT_MUL,  BRANCH_NONE},
-    {"multu",    GEN_OP_INT_MUL,  BRANCH_NONE},
-    {"div",      GEN_OP_INT_DIV,  BRANCH_NONE},
-    {"divu",     GEN_OP_INT_DIV,  BRANCH_NONE},
-    {"rem",      GEN_OP_INT_DIV,  BRANCH_NONE},
-    {"remu",     GEN_OP_INT_DIV,  BRANCH_NONE},
+    MNEM("mul", GEN_OP_INT_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("mult", GEN_OP_INT_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("multu", GEN_OP_INT_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("div", GEN_OP_INT_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("divu", GEN_OP_INT_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("rem", GEN_OP_INT_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("remu", GEN_OP_INT_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
     /* Compare */
-    {"slt",      GEN_OP_CMP,      BRANCH_NONE},
-    {"slti",     GEN_OP_CMP,      BRANCH_NONE},
-    {"sltu",     GEN_OP_CMP,      BRANCH_NONE},
-    {"sltiu",    GEN_OP_CMP,      BRANCH_NONE},
+    MNEM("slt", GEN_OP_CMP, BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("slti", GEN_OP_CMP, BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("sltu", GEN_OP_CMP, BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("sltiu", GEN_OP_CMP, BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
     /* Data movement */
-    {"lui",      GEN_OP_MOV,      BRANCH_NONE},
-    {"li",       GEN_OP_MOV,      BRANCH_NONE},
-    {"la",       GEN_OP_LEA,      BRANCH_NONE},
-    {"move",     GEN_OP_MOV,      BRANCH_NONE},
-    {"mfhi",     GEN_OP_MOV,      BRANCH_NONE},
-    {"mflo",     GEN_OP_MOV,      BRANCH_NONE},
-    {"mthi",     GEN_OP_MOV,      BRANCH_NONE},
-    {"mtlo",     GEN_OP_MOV,      BRANCH_NONE},
+    MNEM("lui", GEN_OP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("li", GEN_OP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("la", GEN_OP_LEA, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("move", GEN_OP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("mfhi", GEN_OP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("mflo", GEN_OP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("mthi", GEN_OP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("mtlo", GEN_OP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
     /* Loads/stores */
-    {"lb",       GEN_OP_LOAD,     BRANCH_NONE},
-    {"lbu",      GEN_OP_LOAD,     BRANCH_NONE},
-    {"lh",       GEN_OP_LOAD,     BRANCH_NONE},
-    {"lhu",      GEN_OP_LOAD,     BRANCH_NONE},
-    {"lw",       GEN_OP_LOAD,     BRANCH_NONE},
-    {"lwl",      GEN_OP_LOAD,     BRANCH_NONE},
-    {"lwr",      GEN_OP_LOAD,     BRANCH_NONE},
-    {"ld",       GEN_OP_LOAD,     BRANCH_NONE},
-    {"sb",       GEN_OP_STORE,    BRANCH_NONE},
-    {"sh",       GEN_OP_STORE,    BRANCH_NONE},
-    {"sw",       GEN_OP_STORE,    BRANCH_NONE},
-    {"swl",      GEN_OP_STORE,    BRANCH_NONE},
-    {"swr",      GEN_OP_STORE,    BRANCH_NONE},
-    {"sd",       GEN_OP_STORE,    BRANCH_NONE},
-    {"lwc1",     GEN_OP_LOAD,     BRANCH_NONE},
-    {"ldc1",     GEN_OP_LOAD,     BRANCH_NONE},
-    {"swc1",     GEN_OP_STORE,    BRANCH_NONE},
-    {"sdc1",     GEN_OP_STORE,    BRANCH_NONE},
+    MNEM("lb", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("lbu", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("lh", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("lhu", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("lw", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("lwl", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("lwr", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("ld", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("sb", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("sh", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("sw", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("swl", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("swr", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("sd", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("lwc1", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("ldc1", GEN_OP_LOAD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("swc1", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
+    MNEM("sdc1", GEN_OP_STORE, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_MEM, CAP_NONE, CAP_NONE),
     /* Control flow */
-    {"j",        GEN_OP_BRANCH,   BRANCH_DIRECT_JUMP},
-    {"jal",      GEN_OP_CALL,     BRANCH_DIRECT_CALL},
-    {"jalr",     GEN_OP_CALL,     BRANCH_INDIRECT_CALL},
-    {"jr",       GEN_OP_BRANCH,   BRANCH_INDIRECT_JUMP},
-    {"beq",      GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"bne",      GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"blez",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"bgtz",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"bltz",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"bgez",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"beqz",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"bnez",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"beql",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"bnel",     GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"blezl",    GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"bgtzl",    GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"bltzl",    GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"bgezl",    GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"bltzal",   GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {"bgezal",   GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {NULL,       0,               0}
-};
-
-/* x86 prefix classification table */
-static const MnemonicEntry x86_prefix_class_table[] = {
-    /* Non-dot bare prefixes: matched by truncating mnemonic to 3-4 chars */
-    {"cmov",     GEN_OP_CMOV,     BRANCH_NONE},    /* x86 cmov<cc> */
-    {"set",      GEN_OP_SETCC,    BRANCH_NONE},    /* x86 set<cc> */
-    {"nop",      GEN_OP_NOP,      BRANCH_NONE},    /* NOP variants */
-    {"cvt",      GEN_OP_FP_CVT,   BRANCH_NONE},    /* x86 cvt... */
-    {"vcvt",     GEN_OP_FP_CVT,   BRANCH_NONE},    /* x86 vcvt... */
-    {NULL,       0,               0}
-};
-
-/* AArch64 prefix classification table */
-static const MnemonicEntry aarch64_prefix_class_table[] = {
-    /* AArch64 conditional branches: b.eq, b.ne, b.gt, etc. */
-    {"b.",       GEN_OP_BRANCH,   BRANCH_COND_DIRECT},
-    {NULL,       0,               0}
-};
-
-/* RISC-V prefix classification table */
-static const MnemonicEntry riscv_prefix_class_table[] = {
-    /* RISC-V FP instructions with dot suffix */
-    {"fadd.",    GEN_OP_FP_ADD,   BRANCH_NONE},
-    {"fsub.",    GEN_OP_FP_SUB,   BRANCH_NONE},
-    {"fmul.",    GEN_OP_FP_MUL,   BRANCH_NONE},
-    {"fdiv.",    GEN_OP_FP_DIV,   BRANCH_NONE},
-    {"fsqrt.",   GEN_OP_FP_SQRT,  BRANCH_NONE},
-    {"fmv.",     GEN_OP_FP_MOV,   BRANCH_NONE},
-    {"fsgnj.",   GEN_OP_FP_MOV,   BRANCH_NONE},
-    {"fsgnjn.",  GEN_OP_FP_MOV,   BRANCH_NONE},
-    {"fsgnjx.",  GEN_OP_FP_MOV,   BRANCH_NONE},
-    {"fcvt.",    GEN_OP_FP_CVT,   BRANCH_NONE},
-    {"feq.",     GEN_OP_FP_CMP,   BRANCH_NONE},
-    {"flt.",     GEN_OP_FP_CMP,   BRANCH_NONE},
-    {"fle.",     GEN_OP_FP_CMP,   BRANCH_NONE},
-    {"fmadd.",   GEN_OP_FP_MUL,   BRANCH_NONE},
-    {"fmsub.",   GEN_OP_FP_MUL,   BRANCH_NONE},
-    {"fnmadd.",  GEN_OP_FP_MUL,   BRANCH_NONE},
-    {"fnmsub.",  GEN_OP_FP_MUL,   BRANCH_NONE},
-    /* RISC-V atomic ops */
-    {"lr.",      GEN_OP_LOAD,     BRANCH_NONE},
-    {"sc.",      GEN_OP_STORE,    BRANCH_NONE},
-    {"fence.",   GEN_OP_FENCE,    BRANCH_NONE},
-    /* Non-dot bare prefixes */
-    {"amo",      GEN_OP_XCHG,     BRANCH_NONE},    /* RISC-V atomic */
-    {NULL,       0,               0}
-};
-
-/* MIPS prefix classification table */
-static const MnemonicEntry mips_prefix_class_table[] = {
+    MNEM("j", GEN_OP_BRANCH, BRANCH_DIRECT_JUMP, MF_NONE, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("jal", GEN_OP_CALL, BRANCH_DIRECT_CALL, F_CALL_RISC, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("jalr", GEN_OP_CALL, BRANCH_INDIRECT_CALL, F_CALL_RISC, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_NONE, CAP_NONE, CAP_NONE),
+    MNEM("jr", GEN_OP_BRANCH, BRANCH_INDIRECT_JUMP, MF_CHK_LR_RET, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("beq", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("bne", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("blez", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("bgtz", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("bltz", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("bgez", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("beqz", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("bnez", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("beql", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("bnel", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("blezl", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("bgtzl", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("bltzl", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("bgezl", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("bltzal", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM("bgezal", GEN_OP_BRANCH, BRANCH_COND_DIRECT, MF_CONDITIONAL, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    /* Regex fallback patterns (merged from prefix table) */
     /* MIPS FP instructions with dot suffix */
-    {"add.",     GEN_OP_FP_ADD,   BRANCH_NONE},
-    {"sub.",     GEN_OP_FP_SUB,   BRANCH_NONE},
-    {"mul.",     GEN_OP_FP_MUL,   BRANCH_NONE},
-    {"div.",     GEN_OP_FP_DIV,   BRANCH_NONE},
-    {"sqrt.",    GEN_OP_FP_SQRT,  BRANCH_NONE},
-    {"mov.",     GEN_OP_FP_MOV,   BRANCH_NONE},
-    {"cvt.",     GEN_OP_FP_CVT,   BRANCH_NONE},
-    {"c.",       GEN_OP_FP_CMP,   BRANCH_NONE},
-    {"madd.",    GEN_OP_FP_MUL,   BRANCH_NONE},
-    {"msub.",    GEN_OP_FP_MUL,   BRANCH_NONE},
-    {"nmadd.",   GEN_OP_FP_MUL,   BRANCH_NONE},
-    {"nmsub.",   GEN_OP_FP_MUL,   BRANCH_NONE},
-    {NULL,       0,               0}
+    MNEM_RE("^add\\..+", GEN_OP_FP_ADD, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^sub\\..+", GEN_OP_FP_SUB, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^mul\\..+", GEN_OP_FP_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^div\\..+", GEN_OP_FP_DIV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^sqrt\\..+", GEN_OP_FP_SQRT, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^mov\\..+", GEN_OP_FP_MOV, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^cvt\\..+", GEN_OP_FP_CVT, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^c\\..+", GEN_OP_FP_CMP, BRANCH_NONE, F_CMP, WPT_OP_RE_STD, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_NONE, CAP_NONE),
+    MNEM_RE("^madd\\..+", GEN_OP_FP_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^msub\\..+", GEN_OP_FP_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^nmadd\\..+", GEN_OP_FP_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+    MNEM_RE("^nmsub\\..+", GEN_OP_FP_MUL, BRANCH_NONE, MF_NONE, WPT_OP_RE_STD, CAP_DST_REG, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM, CAP_SRC_REG_OR_MEM),
+
+    MNEM_END
+};
+
+
+
+
+
+/* x86 instruction prefixes stripped before mnemonic classification. */
+static const char *const x86_insn_prefixes[] = {
+    "lock", "rep", "repz", "repnz", "data16", "bnd", "notrack", NULL
 };

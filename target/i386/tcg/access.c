@@ -29,18 +29,6 @@ void access_prepare_mmu(X86Access *ret, CPUX86State *env,
     ret->ra = ra;
 
     haddr1 = probe_access(env, vaddr, size1, type, mmu_idx, ra);
-#ifdef CONFIG_PLUGIN
-    /*
-     * In speculative mode, force all accesses through the slow path so that
-     * loads/stores are intercepted by the speculative store buffer.
-     * access_ptr() returns NULL when haddr1 is NULL, so callers fall back
-     * to cpu_st/cpu_ld helpers.  Skip cross-page setup since it is unused.
-     */
-    if (env_cpu(env)->plugin_spec_mode) {
-        ret->haddr1 = NULL;
-        return;
-    }
-#endif
     ret->haddr1 = haddr1;
 
     if (unlikely(size2)) {

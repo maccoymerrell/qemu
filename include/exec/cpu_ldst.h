@@ -328,6 +328,12 @@ uint64_t cpu_ldq_code(CPUArchState *env, abi_ptr addr);
 static inline void *tlb_vaddr_to_host(CPUArchState *env, abi_ptr addr,
                                       MMUAccessType access_type, int mmu_idx)
 {
+#ifdef CONFIG_PLUGIN
+    if (access_type == MMU_DATA_STORE &&
+        unlikely(env_cpu(env)->plugin_spec_mode)) {
+        return NULL;
+    }
+#endif
     return g2h(env_cpu(env), addr);
 }
 #else

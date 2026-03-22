@@ -289,14 +289,18 @@ static void dcbz_common(CPUPPCState *env, target_ulong addr,
     haddr = tlb_vaddr_to_host(env, addr, MMU_DATA_STORE, mmu_idx);
 #else
     haddr = probe_write(env, addr, dcbz_size, mmu_idx, retaddr);
+#endif
     if (unlikely(!haddr)) {
-        /* Slow path */
+        /*
+         * Slow path for I/O (system mode) or plugin speculative
+         * execution (user mode) where stores must route through
+         * the per-vCPU store buffer.
+         */
         for (int i = 0; i < dcbz_size; i += 8) {
             cpu_stq_mmuidx_ra(env, addr + i, 0, mmu_idx, retaddr);
         }
         return;
     }
-#endif
 
     set_helper_retaddr(retaddr);
     memset(haddr, 0, dcbz_size);

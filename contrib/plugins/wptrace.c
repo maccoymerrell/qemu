@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <qemu-plugin.h>
 
@@ -59,6 +60,97 @@ static const char *target_name;
 static FILE *unknown_warn_file;
 static GMutex unknown_warn_lock;
 
+/* Header metadata */
+static char *qemu_command_line = NULL;
+static char *trace_comment = NULL;
+static bool enable_mem_data = false;
+static bool enable_mem_alloc = false;
+
+/*
+ * Memory allocation event types (for binary body stream tag 2).
+ * Intercepts brk/mmap/mremap/munmap syscalls.
+ */
+enum MemAllocEventType {
+    MEMALLOC_MAP   = 0,   /* mmap/brk allocation */
+    MEMALLOC_UNMAP = 1,   /* munmap/brk deallocation */
+    MEMALLOC_REMAP = 2,   /* mremap */
+};
+
+typedef struct {
+    uint8_t  event_type;   /* MemAllocEventType */
+    uint64_t vaddr;        /* Base virtual address */
+    uint64_t size;         /* Size in bytes */
+    uint64_t new_vaddr;    /* New vaddr (mremap only) */
+    uint64_t new_size;     /* New size (mremap only) */
+} MemAllocEvent;
+
+/*
+ * ISA-specific recognised syscall numbers for memory management.
+ * We populate this once at init based on trace_isa.
+ */
+typedef struct {
+    int64_t nr_brk;
+    int64_t nr_mmap;
+    int64_t nr_munmap;
+    int64_t nr_mremap;
+} SyscallMemNums;
+
+static SyscallMemNums mem_syscall_nums;  /* set in qemu_plugin_install */
+
+/*
+ * Per-vCPU pending syscall state for memalloc tracking.
+ * Stores the syscall number and key arguments on entry so the return
+ * handler can correlate the result with the original call.
+ */
+typedef struct {
+    int64_t  nr;          /* Syscall number, or -1 if no pending mem syscall */
+    uint64_t a1, a2, a3; /* First 3 arguments */
+} PendingMemSyscall;
+
+static __thread PendingMemSyscall pending_mem_syscall = { .nr = -1 };
+
+/* Queued memalloc events: per-thread, flushed into the BB body stream. */
+static __thread GArray *memalloc_event_queue = NULL;   /* GArray of MemAllocEvent */
+
+/* SyncEventType is defined in wptrace_mnemonics.h */
+#include "wptrace_mnemonics.h"
+
+typedef struct {
+    SyncEventType type;
+    uint64_t addr;  /* futex word virtual address (FUTEX events only) */
+} SyncEvent;
+
+/* ISA-specific syscall numbers for sync primitives, set at init time. */
+typedef struct {
+    int64_t nr_futex;
+    int64_t nr_sched_yield;
+} SyscallSyncNums;
+
+static SyscallSyncNums sync_syscall_nums;
+
+/* Per-vCPU pending sync-syscall state for futex wait/wake correlation. */
+typedef struct {
+    int64_t  nr;   /* Syscall number, or -1 if no pending sync syscall */
+    uint64_t a1;   /* futex word address (uaddr) */
+    int64_t  a2;   /* futex op */
+} PendingSyncSyscall;
+
+static __thread PendingSyncSyscall pending_sync_syscall = { .nr = -1 };
+
+/* Queued sync events: per-thread, flushed into the BB body stream. */
+static __thread GArray *sync_event_queue = NULL;
+
+/*
+ * Multi-thread tracing: when enable_threads is set (threads=1), each vCPU
+ * gets its own TraceSegment and output files (outfile_tN.bin / outfile_tN.txt).
+ * Thread IDs are assigned monotonically as vCPUs are initialised.
+ */
+static bool enable_threads = false;
+/* Unified multi-thread tracing: tracks which cpu last executed,
+ * so SYNC_THREAD_SWITCH events are emitted into the single body stream
+ * whenever execution switches to a different vCPU. */
+static int64_t last_exec_cpu_index = -1;
+
 /* SimPoints-driven tracing */
 static char *simpoints_file_path = NULL;
 static uint64_t simpoint_interval_insns = 100000000ULL;
@@ -76,8 +168,14 @@ static guint simpoints_current_idx = 0;
 
 #define MAX_INSN_BYTES 16
 
-/* Binary format magic/version 0.4 */
-#define WPT_MAGIC  0x54505704  /* 'T','P','W',0x04 little-endian - version 0.4 */
+/* Binary format magic/version 0.6 */
+#define WPT_MAGIC  0x54505707  /* 'T','P','W',0x07 little-endian - version 0.7 */
+
+/* Body entry tags (2-bit field) */
+#define BODY_TAG_END      0   /* end-of-body sentinel */
+#define BODY_TAG_ENTRY    1   /* normal BB body entry */
+#define BODY_TAG_MEMALLOC 2   /* memory allocation event */
+#define BODY_TAG_SYNC     3   /* synchronisation event (sched_yield / futex) */
 
 #define WPT_ISA_BITS 3
 #define WPT_OPCODE_BITS 8
@@ -85,14 +183,21 @@ static guint simpoints_current_idx = 0;
 #define WPT_REG_COUNT_BITS 3
 #define WPT_REG_BITS 8
 #define WPT_DYN_TYPE_BITS 1
+#define WPT_HEADER_FLAGS_BITS 8
+#define WPT_MEM_DATA_SIZE_BITS 3
+#define WPT_SYNC_HINT_BITS 4
+
+/* Header feature flags */
+#define WPT_FLAG_MEM_DATA   (1 << 0)  /* Load/store data values captured */
+#define WPT_FLAG_REG_DATA   (1 << 1)  /* Register values captured (reserved) */
+#define WPT_FLAG_MEM_ALLOC  (1 << 2)  /* Memory allocation events tracked */
+#define WPT_FLAG_THREADS    (1 << 3)  /* Multi-thread tracing: per-thread file */
 
 /* ========================= ISA-Agnostic Instruction Fields ========================= */
 
 /* Maximum source/destination registers per instruction */
 #define MAX_SRC_REGS 4
 #define MAX_DST_REGS 4
-
-#include "wptrace_mnemonics.h"
 
 /* TraceISA enum is defined in wptrace_mnemonics.h alongside isa_properties[] */
 static TraceISA trace_isa = TRACE_ISA_UNKNOWN;
@@ -107,6 +212,8 @@ _Static_assert(MAX_SRC_REGS <= ((1U << WPT_REG_COUNT_BITS) - 1),
                "MAX_SRC_REGS no longer fits packed width");
 _Static_assert(MAX_DST_REGS <= ((1U << WPT_REG_COUNT_BITS) - 1),
                "MAX_DST_REGS no longer fits packed width");
+_Static_assert(SYNC_ATOMIC < (1U << WPT_SYNC_HINT_BITS),
+               "SyncEventType no longer fits packed width");
 
 /*
  * Decoded ISA-agnostic instruction fields.
@@ -122,6 +229,7 @@ typedef struct {
     uint8_t dst_regs[MAX_DST_REGS]; /* Destination register IDs (GenericRegId) */
     bool has_immediate;
     int64_t immediate;
+    uint8_t sync_hint;              /* SyncEventType: nonzero if insn implies sync */
 } InsnFields;
 
 /* ========================= Disassembly-Based Generic Decode ========================= */
@@ -186,6 +294,10 @@ enum PluginOptId {
     OPT_PROGRAM,
     OPT_SPFILE,
     OPT_SPINTERVAL,
+    OPT_COMMENT,
+    OPT_MEMDATA,
+    OPT_MEMALLOC,
+    OPT_THREADS,
 };
 
 /*
@@ -849,6 +961,7 @@ static void decode_disas_to_generic(uint64_t pc, const char *disas,
      */
     char mnem[64];
     const char *p = disas;
+    bool has_lock_prefix = false;
 
     for (;;) {
         p = skip_ascii_ws(p);
@@ -867,6 +980,9 @@ static void decode_disas_to_generic(uint64_t pc, const char *disas,
         if (!g_hash_table_contains(insn_prefix_ht, mnem)) {
             break;
         }
+        if (strcmp(mnem, "lock") == 0) {
+            has_lock_prefix = true;
+        }
     }
 
     /* Classify mnemonic -> opcode + branch type + flags */
@@ -874,6 +990,11 @@ static void decode_disas_to_generic(uint64_t pc, const char *disas,
     classify_mnemonic(mnem, &out->opcode, &out->branch_type,
                       &flags, &capture_kinds, &operand_regex,
                       &implicit_src, &implicit_dst);
+
+    /* Tag as SYNC_ATOMIC if mnemonic has MF_ATOMIC or lock prefix present */
+    if ((flags & MF_ATOMIC) || has_lock_prefix) {
+        out->sync_hint = SYNC_ATOMIC;
+    }
 
     if (out->opcode == GEN_OP_UNKNOWN) {
         warn_unknown_instruction(pc, "unknown_mnemonic", mnem, disas);
@@ -1058,6 +1179,9 @@ enum DynParamType {
 typedef struct {
     uint8_t type;               /* DynParamType */
     uint64_t value;             /* Address value */
+    uint8_t data_size;          /* Byte size of data (1/2/4/8/16), 0 if N/A */
+    uint64_t data_lo;           /* Lower 64 bits of load/store data */
+    uint64_t data_hi;           /* Upper 64 bits (for 128-bit values) */
 } DynParam;
 
 /*
@@ -1119,6 +1243,9 @@ typedef struct {
     uint64_t insn_pc;           /* PC of the instruction making the access */
     uint64_t mem_vaddr;         /* Virtual address of the memory access */
     bool is_store;              /* Whether this was a store operation */
+    uint8_t data_size;          /* Size in bytes (1/2/4/8/16), 0 if not captured */
+    uint64_t data_lo;           /* Lower 64 bits of data value */
+    uint64_t data_hi;           /* Upper 64 bits (for 128-bit accesses) */
 } WPMemAccess;
 
 typedef struct BodyStreamState BodyStreamState;
@@ -1134,6 +1261,9 @@ typedef struct {
     FILE *text_body_tmp;        /* Streaming text body staging */
     FILE *bin_file;             /* Binary output */
     BodyStreamState *bin_stream;
+    uint32_t thread_id;         /* Assigned thread index (0 = main/only thread) */
+    uint32_t body_seq_num;      /* Per-segment entry sequence counter */
+    char start_datetime[64];    /* Datetime captured at segment start */
 } TraceSegment;
 
 /* ========================= Global State ========================= */
@@ -1156,7 +1286,6 @@ static qemu_plugin_u64 sb_insn_count;
 /* Tracing state */
 static bool trace_active = false;
 static TraceSegment *current_segment = NULL;
-static uint32_t body_seq_num = 0;
 
 /* Wrong-path execution state */
 static __thread bool wp_in_progress = false;
@@ -1530,22 +1659,48 @@ static void vcpu_mem_cb(unsigned int cpu_index,
 {
     uint64_t insn_pc = (uint64_t)(uintptr_t)udata;
 
+    WPMemAccess acc = {
+        .insn_pc = insn_pc,
+        .mem_vaddr = vaddr,
+        .is_store = qemu_plugin_mem_is_store(info),
+        .data_size = 0,
+        .data_lo = 0,
+        .data_hi = 0,
+    };
+
+    if (enable_mem_data) {
+        qemu_plugin_mem_value val = qemu_plugin_mem_get_value(info);
+        switch (val.type) {
+        case QEMU_PLUGIN_MEM_VALUE_U8:
+            acc.data_size = 1;
+            acc.data_lo = val.data.u8;
+            break;
+        case QEMU_PLUGIN_MEM_VALUE_U16:
+            acc.data_size = 2;
+            acc.data_lo = val.data.u16;
+            break;
+        case QEMU_PLUGIN_MEM_VALUE_U32:
+            acc.data_size = 4;
+            acc.data_lo = val.data.u32;
+            break;
+        case QEMU_PLUGIN_MEM_VALUE_U64:
+            acc.data_size = 8;
+            acc.data_lo = val.data.u64;
+            break;
+        case QEMU_PLUGIN_MEM_VALUE_U128:
+            acc.data_size = 16;
+            acc.data_lo = val.data.u128.low;
+            acc.data_hi = val.data.u128.high;
+            break;
+        }
+    }
+
     if (wp_in_progress && wp_mem_accesses) {
-        WPMemAccess acc = {
-            .insn_pc = insn_pc,
-            .mem_vaddr = vaddr,
-            .is_store = qemu_plugin_mem_is_store(info),
-        };
         g_array_append_val(wp_mem_accesses, acc);
         return;
     }
 
     if (trace_active && cp_mem_accesses) {
-        WPMemAccess acc = {
-            .insn_pc = insn_pc,
-            .mem_vaddr = vaddr,
-            .is_store = qemu_plugin_mem_is_store(info),
-        };
         g_array_append_val(cp_mem_accesses, acc);
     }
 }
@@ -1802,6 +1957,9 @@ static GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             DynParam dp = {
                 .type = acc->is_store ? DYN_STORE_ADDR : DYN_LOAD_ADDR,
                 .value = acc->mem_vaddr,
+                .data_size = acc->data_size,
+                .data_lo = acc->data_lo,
+                .data_hi = acc->data_hi,
             };
             g_array_append_val(wp_bb.dyn_params, dp);
             stat_wp_total_mem_accesses++;
@@ -1907,13 +2065,27 @@ static BBTemplate *find_wait_prefix_predecessor(uint64_t start_pc);
 /*
  * Write the header section (BB templates) in human-readable text format.
  */
-static void write_text_header(FILE *f)
+static void write_text_header(FILE *f, uint32_t thread_id,
+                              const char *seg_datetime)
 {
     if (!f) {
         return;
     }
     GHashTableIter iter;
     gpointer value;
+
+    fprintf(f, "META\n----\n");
+    fprintf(f, "VERSION 0x%08X\n", WPT_MAGIC);
+    fprintf(f, "ISA %s\n", target_name ? target_name : "unknown");
+    fprintf(f, "COMMAND %s\n", qemu_command_line ? qemu_command_line : "");
+    fprintf(f, "DATETIME %s\n", seg_datetime ? seg_datetime : "");
+    fprintf(f, "COMMENT %s\n", trace_comment ? trace_comment : "");
+    fprintf(f, "THREAD %u\n", thread_id);
+    fprintf(f, "FLAGS");
+    if (enable_mem_data)  { fprintf(f, " MEM_DATA"); }
+    if (enable_mem_alloc) { fprintf(f, " MEM_ALLOC"); }
+    if (enable_threads)   { fprintf(f, " THREADS"); }
+    fprintf(f, "\n\n");
 
     fprintf(f, "ENUMS\n-----\n");
     fprintf(f, "OPCODES %u\n", GEN_OP_COUNT);
@@ -2026,6 +2198,19 @@ static void write_text_header(FILE *f)
             if (print_fld->has_immediate) {
                 fprintf(f, " imm=%" PRId64, print_fld->immediate);
             }
+            if (print_fld->sync_hint != SYNC_NONE) {
+                static const char * const sh_names[] = {
+                    [SYNC_NONE]         = "NONE",
+                    [SYNC_YIELD]        = "YIELD",
+                    [SYNC_FUTEX_WAIT]   = "FUTEX_WAIT",
+                    [SYNC_FUTEX_WAKE]   = "FUTEX_WAKE",
+                    [SYNC_THREAD_SWITCH]= "THREAD_SWITCH",
+                    [SYNC_ATOMIC]       = "ATOMIC",
+                };
+                fprintf(f, " sync=%s",
+                        print_fld->sync_hint <= SYNC_ATOMIC
+                            ? sh_names[print_fld->sync_hint] : "UNKNOWN");
+            }
             fprintf(f, " bytes=");
             if (merged_wait_prefix) {
                 for (uint8_t b = 0; b < merged_size; b++) {
@@ -2071,6 +2256,14 @@ static void write_text_body_entry(FILE *f, const BodyEntry *entry)
             fprintf(f, "store=0x%" PRIx64, dp->value);
             break;
         }
+        if (enable_mem_data && dp->data_size > 0) {
+            if (dp->data_size <= 8) {
+                fprintf(f, ":data=0x%" PRIx64, dp->data_lo);
+            } else {
+                fprintf(f, ":data=0x%" PRIx64 "%016" PRIx64,
+                        dp->data_hi, dp->data_lo);
+            }
+        }
     }
     fprintf(f, "]");
 
@@ -2099,6 +2292,14 @@ static void write_text_body_entry(FILE *f, const BodyEntry *entry)
                 case DYN_STORE_ADDR:
                     fprintf(f, " store=0x%" PRIx64, dp->value);
                     break;
+                }
+                if (enable_mem_data && dp->data_size > 0) {
+                    if (dp->data_size <= 8) {
+                        fprintf(f, ":data=0x%" PRIx64, dp->data_lo);
+                    } else {
+                        fprintf(f, ":data=0x%" PRIx64 "%016" PRIx64,
+                                dp->data_hi, dp->data_lo);
+                    }
                 }
             }
             if (wp->fault) {
@@ -2172,13 +2373,14 @@ static BBTemplate *find_wait_prefix_predecessor(uint64_t start_pc)
 /*
  * Write a complete trace in text format (header + streamed body).
  */
-static void write_text_trace(FILE *f, FILE *body_tmp)
+static void write_text_trace(FILE *f, FILE *body_tmp,
+                             uint32_t thread_id, const char *seg_datetime)
 {
     uint8_t buf[8192];
     size_t nread;
 
     g_mutex_lock(&data_lock);
-    write_text_header(f);
+    write_text_header(f, thread_id, seg_datetime);
     g_mutex_unlock(&data_lock);
     fprintf(f, "BODY\n----\n");
     if (!body_tmp) {
@@ -2338,6 +2540,15 @@ static void write_bin_templates(BitWriter *bw)
         bw_write_uleb128(bw, tmpl->start_pc);
         bw_write_uleb128(bw, tmpl->n_insns);
         bw_write_uleb128(bw, tmpl->fall_through_pc);
+        {
+            /* Symbol name: ULEB128 length followed by UTF-8 bytes */
+            const char *sym = tmpl->symbol_name ? tmpl->symbol_name : "";
+            size_t sym_len = strlen(sym);
+            bw_write_uleb128(bw, sym_len);
+            for (size_t si = 0; si < sym_len; si++) {
+                bw_write_bits(bw, (uint8_t)sym[si], 8);
+            }
+        }
 
         for (uint32_t i = 0; i < tmpl->n_insns; i++) {
             InsnFields *fld = &tmpl->insn_fields[i];
@@ -2350,6 +2561,7 @@ static void write_bin_templates(BitWriter *bw)
             bw_write_bits(bw, fld->n_src_regs, WPT_REG_COUNT_BITS);
             bw_write_bits(bw, fld->n_dst_regs, WPT_REG_COUNT_BITS);
             bw_write_bits(bw, fld->has_immediate ? 1 : 0, 1);
+            bw_write_bits(bw, fld->sync_hint, WPT_SYNC_HINT_BITS);
 
             for (uint8_t s = 0; s < fld->n_src_regs; s++) {
                 bw_write_bits(bw, fld->src_regs[s], WPT_REG_BITS);
@@ -2361,6 +2573,11 @@ static void write_bin_templates(BitWriter *bw)
                 bw_write_sleb128(bw, fld->immediate);
             }
             bw_write_uleb128(bw, tmpl->insn_sizes[i]);
+            for (uint8_t b = 0; b < tmpl->insn_sizes[i]; b++) {
+                bw_write_bits(bw,
+                              tmpl->insn_bytes[(size_t)i * MAX_INSN_BYTES + b],
+                              8);
+            }
         }
     }
 }
@@ -2522,13 +2739,102 @@ static guint poison_mask_effective_len(const GByteArray *poison_mask)
     return 0;
 }
 
-static BodyStreamState *body_stream_new(FILE *f)
+/*
+ * Encode data_size into 3-bit code: 0=1B, 1=2B, 2=4B, 3=8B, 4=16B
+ */
+static inline uint8_t mem_data_size_code(uint8_t data_size)
+{
+    switch (data_size) {
+    case 1:  return 0;
+    case 2:  return 1;
+    case 4:  return 2;
+    case 8:  return 3;
+    case 16: return 4;
+    default: return 0;
+    }
+}
+
+/*
+ * Write memory data values for all entries in a dyn params array.
+ * Called after each dyn_patch when WPT_FLAG_MEM_DATA is set.
+ */
+static void write_mem_data_values(BitWriter *bw, const GArray *dyn_params)
+{
+    guint count = dyn_params ? dyn_params->len : 0;
+    for (guint i = 0; i < count; i++) {
+        const DynParam *dp = &g_array_index(dyn_params, DynParam, i);
+        uint8_t sz = dp->data_size;
+        if (sz == 0) {
+            sz = 1;
+        }
+        bw_write_bits(bw, mem_data_size_code(sz), WPT_MEM_DATA_SIZE_BITS);
+        /* Write raw bytes, little-endian */
+        for (uint8_t b = 0; b < sz && b < 8; b++) {
+            bw_write_bits(bw, (dp->data_lo >> (b * 8)) & 0xFF, 8);
+        }
+        for (uint8_t b = 0; b < sz - 8 && sz > 8; b++) {
+            bw_write_bits(bw, (dp->data_hi >> (b * 8)) & 0xFF, 8);
+        }
+    }
+}
+
+static BodyStreamState *body_stream_new(FILE *f, uint32_t thread_id,
+                                        const char *seg_datetime)
 {
     BodyStreamState *st = g_new0(BodyStreamState, 1);
 
     bw_init(&st->bw, f);
     bw_write_bits(&st->bw, WPT_MAGIC, 32);
     bw_write_bits(&st->bw, (uint8_t)trace_isa, WPT_ISA_BITS);
+
+    /* Header flags */
+    uint8_t flags = 0;
+    if (enable_mem_data) {
+        flags |= WPT_FLAG_MEM_DATA;
+    }
+    if (enable_mem_alloc) {
+        flags |= WPT_FLAG_MEM_ALLOC;
+    }
+    if (enable_threads) {
+        flags |= WPT_FLAG_THREADS;
+    }
+    bw_write_bits(&st->bw, flags, WPT_HEADER_FLAGS_BITS);
+
+    /* Command string */
+    {
+        const char *cmd = qemu_command_line ? qemu_command_line : "";
+        size_t len = strlen(cmd);
+        bw_write_uleb128(&st->bw, len);
+        bw_write_bytes(&st->bw, (const uint8_t *)cmd, len);
+    }
+
+    /* Date/time string (captured at segment start) */
+    {
+        const char *dt_str = (seg_datetime && *seg_datetime) ? seg_datetime : "";
+        size_t len = strlen(dt_str);
+        bw_write_uleb128(&st->bw, len);
+        bw_write_bytes(&st->bw, (const uint8_t *)dt_str, len);
+    }
+
+    /* Comment string */
+    {
+        const char *comment = trace_comment ? trace_comment : "";
+        size_t len = strlen(comment);
+        bw_write_uleb128(&st->bw, len);
+        bw_write_bytes(&st->bw, (const uint8_t *)comment, len);
+    }
+
+    /* Target name string (e.g. "mipsel", "aarch64") — exact target_name */
+    {
+        const char *tname = target_name ? target_name : "";
+        size_t len = strlen(tname);
+        bw_write_uleb128(&st->bw, len);
+        bw_write_bytes(&st->bw, (const uint8_t *)tname, len);
+    }
+
+    /* Thread ID (v0.6+): always present; 0 for single-thread traces */
+    bw_write_uleb128(&st->bw, (uint64_t)thread_id);
+
     st->cp_dyn_state = g_hash_table_new_full(g_int_hash, g_int_equal,
                                              g_free,
                                              dyn_param_array_unref_value);
@@ -2544,12 +2850,15 @@ static void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
     uint32_t num_wp = entry->wp_entries ? entry->wp_entries->len : 0;
     uint64_t body_start_bits = bw_tell_bits(&st->bw);
 
-    bw_write_bits(&st->bw, 1, 1); /* entry marker */
+    bw_write_bits(&st->bw, BODY_TAG_ENTRY, 2); /* body entry */
     bw_write_sleb128(&st->bw, entry_tmpl - st->prev_entry_template);
     st->prev_entry_template = entry_tmpl;
     body_stream_emit_dyn_patch(&st->bw, st->cp_dyn_state,
                                entry->template_id, entry->dyn_params,
                                false);
+    if (enable_mem_data) {
+        write_mem_data_values(&st->bw, entry->dyn_params);
+    }
 
     bw_write_uleb128(&st->bw, num_wp);
     /*
@@ -2569,6 +2878,9 @@ static void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
             prev_wp_tid = wp_tmpl;
             body_stream_emit_dyn_patch(&st->bw, st->wp_dyn_state, wp_tmpl,
                                        wp->dyn_params, true);
+            if (enable_mem_data) {
+                write_mem_data_values(&st->bw, wp->dyn_params);
+            }
         }
     }
 
@@ -2633,12 +2945,45 @@ static void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
     stat_bin_body_bits += bw_tell_bits(&st->bw) - body_start_bits;
 }
 
+/*
+ * Write a memalloc event with tag=2 to the binary body stream.
+ * Format: tag(2) | event_type(2) | vaddr(uleb128) | size(uleb128)
+ *         + for MEMALLOC_REMAP: new_vaddr(uleb128) | new_size(uleb128)
+ */
+static void body_stream_write_memalloc_event(BodyStreamState *st,
+                                             const MemAllocEvent *ev)
+{
+    bw_write_bits(&st->bw, BODY_TAG_MEMALLOC, 2);
+    bw_write_bits(&st->bw, ev->event_type, 2);
+    bw_write_uleb128(&st->bw, ev->vaddr);
+    bw_write_uleb128(&st->bw, ev->size);
+    if (ev->event_type == MEMALLOC_REMAP) {
+        bw_write_uleb128(&st->bw, ev->new_vaddr);
+        bw_write_uleb128(&st->bw, ev->new_size);
+    }
+}
+
+/*
+ * Write a sync event with tag BODY_TAG_SYNC to the binary body stream.
+ * Format: tag(2)=3 | sync_type(4) | [addr(uleb128) for FUTEX events]
+ */
+static void body_stream_write_sync_event(BodyStreamState *st,
+                                         const SyncEvent *ev)
+{
+    bw_write_bits(&st->bw, BODY_TAG_SYNC, 2);
+    bw_write_bits(&st->bw, (uint32_t)ev->type, WPT_SYNC_HINT_BITS);
+    if (ev->type == SYNC_FUTEX_WAIT || ev->type == SYNC_FUTEX_WAKE ||
+        ev->type == SYNC_THREAD_SWITCH) {
+        bw_write_uleb128(&st->bw, ev->addr);  /* addr = futex address, or thread_id for THREAD_SWITCH */
+    }
+}
+
 static void body_stream_finish(BodyStreamState *st)
 {
     uint64_t footer_start_bits;
     uint64_t end_bits;
 
-    bw_write_bits(&st->bw, 0, 1); /* footer marker */
+    bw_write_bits(&st->bw, BODY_TAG_END, 2); /* end of body */
     footer_start_bits = bw_tell_bits(&st->bw);
     bw_write_uleb128(&st->bw, st->num_entries);
     g_mutex_lock(&data_lock);
@@ -2776,7 +3121,19 @@ static void start_trace_segment(const char *label,
     }
 
     current_segment = trace_segment_new(label, start, stop);
-    body_seq_num = 0;
+    current_segment->thread_id = 0;
+    current_segment->body_seq_num = 0;
+
+    /* Capture segment start time into the segment (used by both binary
+     * header, written now, and text META section, written at finish). */
+    {
+        time_t now = time(NULL);
+        struct tm tm_buf;
+        localtime_r(&now, &tm_buf);
+        strftime(current_segment->start_datetime,
+                 sizeof(current_segment->start_datetime),
+                 "%Y-%m-%d %H:%M:%S", &tm_buf);
+    }
 
     /* Determine output file paths based on mode */
     g_autofree char *bin_path = NULL;
@@ -2804,7 +3161,10 @@ static void start_trace_segment(const char *label,
             fprintf(stderr, "wptrace: cannot open binary output: %s\n",
                     bin_path);
         } else {
-            current_segment->bin_stream = body_stream_new(current_segment->bin_file);
+            current_segment->bin_stream = body_stream_new(
+                current_segment->bin_file,
+                current_segment->thread_id,
+                current_segment->start_datetime);
             if (!current_segment->bin_stream) {
                 fprintf(stderr, "wptrace: cannot initialize binary stream\n");
             }
@@ -2844,7 +3204,9 @@ static void finish_trace_segment(void)
     }
     if (current_segment->text_file) {
         write_text_trace(current_segment->text_file,
-                         current_segment->text_body_tmp);
+                         current_segment->text_body_tmp,
+                         current_segment->thread_id,
+                         current_segment->start_datetime);
     }
 
     trace_segment_free(current_segment);
@@ -2912,7 +3274,9 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         }
     }
 
-    if (!trace_active || !current_segment) {
+    /* --- Look up the active segment --- */
+    TraceSegment *seg = current_segment;
+    if (!trace_active || !seg) {
         g_mutex_unlock(&exec_lock);
         return;
     }
@@ -2985,10 +3349,10 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     g_mutex_unlock(&data_lock);
 
     /* --- Collect body entry if tracing is active --- */
-    if (trace_active && current_segment) {
+    {
         BodyEntry entry;
         guint cp_mem_len = cp_mem_accesses ? cp_mem_accesses->len : 0;
-        entry.seq_num = ++body_seq_num;
+        entry.seq_num = ++seg->body_seq_num;
         entry.template_id = cp_tmpl ? cp_tmpl->template_id : 0;
         entry.dyn_params = g_array_sized_new(false, false,
                              sizeof(DynParam), cp_mem_len);
@@ -3002,14 +3366,21 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
                 DynParam dp = {
                     .type = acc->is_store ? DYN_STORE_ADDR : DYN_LOAD_ADDR,
                     .value = acc->mem_vaddr,
+                    .data_size = acc->data_size,
+                    .data_lo = acc->data_lo,
+                    .data_hi = acc->data_hi,
                 };
                 g_array_append_val(entry.dyn_params, dp);
             }
             g_array_set_size(cp_mem_accesses, 0);
         }
 
-        /* Run wrong-path execution if enabled and target is known */
-        if (enable_wrong_path && wrong_target != 0) {
+        /* Run wrong-path execution if enabled and target is known.
+         * Wrong-path is suppressed when the previous BB ends with a
+         * pending sync event (yield / futex), because the control-flow
+         * edge is dictated by the scheduler, not the branch predictor. */
+        if (enable_wrong_path && wrong_target != 0 &&
+            !(sync_event_queue && sync_event_queue->len > 0)) {
             entry.wp_entries = simulate_wrong_path_ext(
                 prev_last, current_pc, wrong_target,
                 true,
@@ -3018,11 +3389,75 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
             stat_wp_skipped++;
         }
 
-        if (current_segment->bin_stream) {
-            body_stream_write_entry(current_segment->bin_stream, &entry);
+        if (seg->bin_stream) {
+            /* Emit THREAD_SWITCH when execution moves to a different vCPU */
+            if (enable_threads && (int64_t)cpu_index != last_exec_cpu_index) {
+                SyncEvent ts = { .type = SYNC_THREAD_SWITCH,
+                                 .addr = (uint64_t)cpu_index };
+                body_stream_write_sync_event(seg->bin_stream, &ts);
+                if (seg->text_body_tmp) {
+                    fprintf(seg->text_body_tmp,
+                            "SYNC type=THREAD_SWITCH thread=%u\n", cpu_index);
+                }
+                last_exec_cpu_index = (int64_t)cpu_index;
+            }
+            /* Flush queued sync events (YIELD/FUTEX_*) before the body entry */
+            if (enable_threads && sync_event_queue && sync_event_queue->len > 0) {
+                static const char * const sync_type_names[] = {
+                    [SYNC_NONE]         = "NONE",
+                    [SYNC_YIELD]        = "YIELD",
+                    [SYNC_FUTEX_WAIT]   = "FUTEX_WAIT",
+                    [SYNC_FUTEX_WAKE]   = "FUTEX_WAKE",
+                    [SYNC_THREAD_SWITCH]= "THREAD_SWITCH",
+                    [SYNC_ATOMIC]       = "ATOMIC",
+                };
+                for (guint si = 0; si < sync_event_queue->len; si++) {
+                    const SyncEvent *ev = &g_array_index(
+                        sync_event_queue, SyncEvent, si);
+                    body_stream_write_sync_event(seg->bin_stream, ev);
+                    if (seg->text_body_tmp) {
+                        if (ev->type == SYNC_YIELD) {
+                            fprintf(seg->text_body_tmp, "SYNC type=YIELD\n");
+                        } else {
+                            fprintf(seg->text_body_tmp,
+                                    "SYNC type=%s addr=0x%" PRIx64 "\n",
+                                    sync_type_names[ev->type], ev->addr);
+                        }
+                    }
+                }
+                g_array_set_size(sync_event_queue, 0);
+            }
+            /* Flush queued memalloc events before the body entry */
+            if (enable_mem_alloc && memalloc_event_queue &&
+                memalloc_event_queue->len > 0) {
+                for (guint mei = 0; mei < memalloc_event_queue->len; mei++) {
+                    const MemAllocEvent *ev = &g_array_index(
+                        memalloc_event_queue, MemAllocEvent, mei);
+                    body_stream_write_memalloc_event(seg->bin_stream, ev);
+                    if (seg->text_body_tmp) {
+                        static const char *type_names[] = {
+                            "MAP", "UNMAP", "REMAP"
+                        };
+                        fprintf(seg->text_body_tmp,
+                                "MEMALLOC type=%s vaddr=0x%" PRIx64
+                                " size=0x%" PRIx64,
+                                type_names[ev->event_type],
+                                ev->vaddr, ev->size);
+                        if (ev->event_type == MEMALLOC_REMAP) {
+                            fprintf(seg->text_body_tmp,
+                                    " new_vaddr=0x%" PRIx64
+                                    " new_size=0x%" PRIx64,
+                                    ev->new_vaddr, ev->new_size);
+                        }
+                        fprintf(seg->text_body_tmp, "\n");
+                    }
+                }
+                g_array_set_size(memalloc_event_queue, 0);
+            }
+            body_stream_write_entry(seg->bin_stream, &entry);
         }
-        if (current_segment->text_body_tmp) {
-            write_text_body_entry(current_segment->text_body_tmp, &entry);
+        if (seg->text_body_tmp) {
+            write_text_body_entry(seg->text_body_tmp, &entry);
         }
         body_entry_clear(&entry);
     }
@@ -3269,6 +3704,151 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
     g_mutex_unlock(&exec_lock);
 }
 
+/*
+ * Syscall entry: record the pending memory-management syscall for correlation
+ * with its return value.  Only brk/mmap/munmap/mremap are tracked.
+ */
+static void vcpu_syscall_cb(qemu_plugin_id_t id, unsigned int vcpu_index,
+                            int64_t num,
+                            uint64_t a1, uint64_t a2, uint64_t a3,
+                            uint64_t a4, uint64_t a5, uint64_t a6,
+                            uint64_t a7, uint64_t a8)
+{
+    if (enable_mem_alloc) {
+        if (num == mem_syscall_nums.nr_brk ||
+            num == mem_syscall_nums.nr_mmap ||
+            num == mem_syscall_nums.nr_munmap ||
+            num == mem_syscall_nums.nr_mremap) {
+            pending_mem_syscall.nr = num;
+            pending_mem_syscall.a1 = a1;
+            pending_mem_syscall.a2 = a2;
+            pending_mem_syscall.a3 = a3;
+        }
+    }
+
+    if (enable_threads) {
+        if (num == sync_syscall_nums.nr_futex) {
+            /*
+             * FUTEX_WAIT (op & 0x7f == 0) or FUTEX_WAIT_BITSET (op & 0x7f == 9):
+             * the thread is about to sleep.  Record the futex word address so the
+             * return handler can emit SYNC_FUTEX_WAIT / SYNC_FUTEX_WAKE.
+             */
+            int64_t op = (int64_t)a2 & 0x7f;  /* strip FUTEX_PRIVATE_FLAG */
+            if (op == 0 || op == 9) {           /* FUTEX_WAIT / FUTEX_WAIT_BITSET */
+                pending_sync_syscall.nr = num;
+                pending_sync_syscall.a1 = a1;
+                pending_sync_syscall.a2 = (int64_t)a2;
+            }
+        } else if (num == sync_syscall_nums.nr_sched_yield) {
+            pending_sync_syscall.nr = num;
+        }
+    }
+}
+
+/*
+ * Syscall return: if we were tracking a memory-management syscall, decode the
+ * result and enqueue a MemAllocEvent.
+ *
+ * brk(addr):   if ret != -1, records MAP(ret, delta) or UNMAP depending on
+ *              direction.  We compute approximate mapping size as |ret - prev|.
+ * mmap(addr,len,...): if ret != MAP_FAILED(-1), records MAP(ret, len).
+ * munmap(addr, len): if ret == 0, records UNMAP(addr, len).
+ * mremap(addr, old_len, new_len, ...): if ret != -1, records REMAP.
+ */
+static void vcpu_syscall_ret_cb(qemu_plugin_id_t id, unsigned int vcpu_index,
+                                int64_t num, int64_t ret)
+{
+    /* --- memalloc tracking --- */
+    if (enable_mem_alloc && pending_mem_syscall.nr == num) {
+        MemAllocEvent ev = {0};
+        bool valid = false;
+
+        if (num == mem_syscall_nums.nr_mmap) {
+            if (ret != -1 && ret != 0) {
+                ev.event_type = MEMALLOC_MAP;
+                ev.vaddr = (uint64_t)ret;
+                ev.size  = pending_mem_syscall.a2;
+                valid = true;
+            }
+        } else if (num == mem_syscall_nums.nr_munmap) {
+            if (ret == 0) {
+                ev.event_type = MEMALLOC_UNMAP;
+                ev.vaddr = pending_mem_syscall.a1;
+                ev.size  = pending_mem_syscall.a2;
+                valid = true;
+            }
+        } else if (num == mem_syscall_nums.nr_mremap) {
+            if (ret != (int64_t)-1) {
+                ev.event_type = MEMALLOC_REMAP;
+                ev.vaddr     = pending_mem_syscall.a1;
+                ev.size      = pending_mem_syscall.a2;
+                ev.new_vaddr = (uint64_t)ret;
+                ev.new_size  = pending_mem_syscall.a3;
+                valid = true;
+            }
+        } else if (num == mem_syscall_nums.nr_brk) {
+            if (ret != -1) {
+                static __thread uint64_t prev_brk = 0;
+                uint64_t new_brk = (uint64_t)ret;
+                if (prev_brk != 0 && new_brk != prev_brk) {
+                    if (new_brk > prev_brk) {
+                        ev.event_type = MEMALLOC_MAP;
+                        ev.vaddr = prev_brk;
+                        ev.size  = new_brk - prev_brk;
+                    } else {
+                        ev.event_type = MEMALLOC_UNMAP;
+                        ev.vaddr = new_brk;
+                        ev.size  = prev_brk - new_brk;
+                    }
+                    valid = true;
+                }
+                prev_brk = new_brk;
+            }
+        }
+
+        pending_mem_syscall.nr = -1;
+
+        if (valid && trace_active) {
+            /* Lazy initialisation for worker threads in multi-thread mode. */
+            if (!memalloc_event_queue) {
+                memalloc_event_queue = g_array_new(FALSE, FALSE,
+                                                   sizeof(MemAllocEvent));
+            }
+            g_array_append_val(memalloc_event_queue, ev);
+        }
+    }
+
+    /* --- sync event tracking (threads mode only) --- */
+    if (enable_threads && pending_sync_syscall.nr == num && trace_active) {
+        SyncEvent ev = {0};
+        bool valid = false;
+
+        if (num == sync_syscall_nums.nr_sched_yield) {
+            ev.type = SYNC_YIELD;
+            valid = true;
+        } else if (num == sync_syscall_nums.nr_futex) {
+            /*
+             * We only tracked FUTEX_WAIT on entry, so any return is
+             * SYNC_FUTEX_WAKE (the thread was woken, timed out, or signalled).
+             */
+            ev.type = SYNC_FUTEX_WAKE;
+            ev.addr = pending_sync_syscall.a1;
+            valid = true;
+        }
+
+        pending_sync_syscall.nr = -1;
+
+        if (valid) {
+            if (!sync_event_queue) {
+                sync_event_queue = g_array_new(FALSE, FALSE, sizeof(SyncEvent));
+            }
+            g_array_append_val(sync_event_queue, ev);
+        }
+    } else {
+        pending_sync_syscall.nr = -1;
+    }
+}
+
 /* ========================= Exit / Statistics ========================= */
 
 static void plugin_exit(qemu_plugin_id_t id, void *p)
@@ -3452,6 +4032,26 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                 "instruction decode will be limited\n", target_name);
     }
 
+    /* Best-effort capture of the full QEMU command line via /proc/self/cmdline */
+    {
+        FILE *cmdline_f = fopen("/proc/self/cmdline", "r");
+        if (cmdline_f) {
+            char buf[4096];
+            size_t n = fread(buf, 1, sizeof(buf) - 1, cmdline_f);
+            fclose(cmdline_f);
+            if (n > 0) {
+                /* Replace NUL separators with spaces */
+                for (size_t i = 0; i < n - 1; i++) {
+                    if (buf[i] == '\0') {
+                        buf[i] = ' ';
+                    }
+                }
+                buf[n] = '\0';
+                qemu_command_line = g_strdup(buf);
+            }
+        }
+    }
+
     /*
      * Build plugin option hash table early, before argument parsing.
      * Maps option name strings to PluginOptId for O(1) dispatch.
@@ -3465,6 +4065,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             {"start",   OPT_START},   {"stop",    OPT_STOP},
             {"program", OPT_PROGRAM}, {"spfile",  OPT_SPFILE},
             {"spinterval", OPT_SPINTERVAL},
+            {"comment", OPT_COMMENT}, {"memdata", OPT_MEMDATA},
+            {"memalloc", OPT_MEMALLOC}, {"threads", OPT_THREADS},
             {NULL, 0}
         };
         for (int i = 0; opt_entries[i].name; i++) {
@@ -3521,6 +4123,18 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                 fprintf(stderr, "wptrace: invalid spinterval: %s\n", tokens[1]);
                 return -1;
             }
+            break;
+        case OPT_COMMENT:
+            trace_comment = g_strdup(tokens[1]);
+            break;
+        case OPT_MEMDATA:
+            enable_mem_data = (atoi(tokens[1]) != 0);
+            break;
+        case OPT_MEMALLOC:
+            enable_mem_alloc = (atoi(tokens[1]) != 0);
+            break;
+        case OPT_THREADS:
+            enable_threads = (atoi(tokens[1]) != 0);
             break;
         }
     }
@@ -3669,14 +4283,102 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     sb_insn_count = qemu_plugin_scoreboard_u64_in_struct(
         vcpu_sb, VCPUScoreBoard, insn_count);
 
-    /* For simple start/stop, auto-start if start is 0 (not simpoints mode) */
+    /* For simple start/stop, auto-start if start is 0 (not simpoints mode). */
     if (!simpoints_list && trace_start_insn == 0) {
         start_trace_segment("trace", 0, trace_stop_insn);
+    }
+
+    /* Initialise memalloc syscall number table and event queue */
+    if (enable_mem_alloc) {
+        /*
+         * Syscall numbers for brk/mmap/munmap/mremap per architecture.
+         * x86_64:    9/11/12/25
+         * AArch64:   222/215/214/216  (ARM64 unified UAPI table)
+         * RISC-V 64: 222/215/214/216  (same unified table)
+         * MIPS N64:  5009/5011/5012/5024  (MIPS N64 base 5000)
+         */
+        switch (trace_isa) {
+        case TRACE_ISA_X86:
+            mem_syscall_nums.nr_mmap   = 9;
+            mem_syscall_nums.nr_munmap = 11;
+            mem_syscall_nums.nr_brk    = 12;
+            mem_syscall_nums.nr_mremap = 25;
+            break;
+        case TRACE_ISA_AARCH64:
+        case TRACE_ISA_RISCV:
+            mem_syscall_nums.nr_brk    = 214;
+            mem_syscall_nums.nr_munmap = 215;
+            mem_syscall_nums.nr_mremap = 216;
+            mem_syscall_nums.nr_mmap   = 222;
+            break;
+        case TRACE_ISA_MIPS:
+            if (g_str_has_prefix(target_name, "mipsel") ||
+                g_str_has_prefix(target_name, "mips32")) {
+                /* MIPS32 O32 ABI (mipsel-linux-gnu) */
+                mem_syscall_nums.nr_brk    = 4045;
+                mem_syscall_nums.nr_munmap = 4091;
+                mem_syscall_nums.nr_mremap = 4167;
+                mem_syscall_nums.nr_mmap   = 4210;  /* mmap2 */
+            } else {
+                /* MIPS64 N64 ABI (mips64el-linux-gnu) */
+                mem_syscall_nums.nr_mmap   = 5009;
+                mem_syscall_nums.nr_munmap = 5011;
+                mem_syscall_nums.nr_brk    = 5012;
+                mem_syscall_nums.nr_mremap = 5024;
+            }
+            break;
+        default:
+            /* Unknown ISA: disable memalloc tracking */
+            enable_mem_alloc = false;
+            fprintf(stderr, "wptrace: memalloc not supported for ISA '%s'\n",
+                    target_name);
+            break;
+        }
+        if (enable_mem_alloc) {
+            memalloc_event_queue = g_array_new(FALSE, FALSE,
+                                               sizeof(MemAllocEvent));
+        }
+    }
+
+    /* Initialise sync syscall number table (needed for threads=1) */
+    if (enable_threads) {
+        switch (trace_isa) {
+        case TRACE_ISA_X86:
+            sync_syscall_nums.nr_futex       = 202;
+            sync_syscall_nums.nr_sched_yield = 24;
+            break;
+        case TRACE_ISA_AARCH64:
+        case TRACE_ISA_RISCV:
+            sync_syscall_nums.nr_futex       = 98;
+            sync_syscall_nums.nr_sched_yield = 124;
+            break;
+        case TRACE_ISA_MIPS:
+            if (g_str_has_prefix(target_name, "mipsel") ||
+                g_str_has_prefix(target_name, "mips32")) {
+                /* MIPS32 O32 ABI */
+                sync_syscall_nums.nr_futex       = 4238;
+                sync_syscall_nums.nr_sched_yield = 4162;
+            } else {
+                /* MIPS64 N64 ABI */
+                sync_syscall_nums.nr_futex       = 5238;
+                sync_syscall_nums.nr_sched_yield = 5162;
+            }
+            break;
+        default:
+            fprintf(stderr,
+                    "wptrace: threads sync tracking not supported for ISA '%s'\n",
+                    target_name);
+            break;
+        }
     }
 
     /* Register callbacks */
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
     qemu_plugin_register_flush_cb(id, vcpu_tb_flush);
+    if (enable_mem_alloc || enable_threads) {
+        qemu_plugin_register_vcpu_syscall_cb(id, vcpu_syscall_cb);
+        qemu_plugin_register_vcpu_syscall_ret_cb(id, vcpu_syscall_ret_cb);
+    }
     qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
 
     return 0;

@@ -1524,6 +1524,17 @@ void *probe_access(CPUArchState *env, vaddr addr, int size,
         }
     }
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * In speculative mode, return NULL so callers fall back to the
+     * cpu_ld/cpu_st slow-path helpers where the spec store buffer
+     * and load overlay intercept the access.
+     */
+    if (cpu_plugin_spec_active(env_cpu(env))) {
+        return NULL;
+    }
+#endif
+
     return host;
 }
 

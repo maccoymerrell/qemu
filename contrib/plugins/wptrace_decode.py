@@ -6,13 +6,54 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-WPT_MAGIC = 0x54505704
+WPT_MAGIC = 0x54505707
 
 WPT_ISA_BITS = 3
 WPT_OPCODE_BITS = 8
 WPT_BRANCH_BITS = 8
 WPT_REG_COUNT_BITS = 3
 WPT_REG_BITS = 8
+WPT_HEADER_FLAGS_BITS = 8
+WPT_MEM_DATA_SIZE_BITS = 3
+
+WPT_FLAG_MEM_DATA  = 1 << 0
+WPT_FLAG_REG_DATA  = 1 << 1
+WPT_FLAG_MEM_ALLOC = 1 << 2
+WPT_FLAG_THREADS   = 1 << 3
+
+# Body entry tags (2-bit)
+BODY_TAG_END      = 0
+BODY_TAG_ENTRY    = 1
+BODY_TAG_MEMALLOC = 2
+BODY_TAG_SYNC     = 3
+
+WPT_SYNC_TYPE_BITS = 4
+WPT_SYNC_HINT_BITS = 4
+
+# Sync event types (must match SyncEventType enum in wptrace_mnemonics.h)
+SYNC_NONE          = 0
+SYNC_YIELD         = 1
+SYNC_FUTEX_WAIT    = 2
+SYNC_FUTEX_WAKE    = 3
+SYNC_THREAD_SWITCH = 4
+SYNC_ATOMIC        = 5
+SYNC_TYPE_NAMES    = {0: "NONE", 1: "YIELD", 2: "FUTEX_WAIT", 3: "FUTEX_WAKE",
+                      4: "THREAD_SWITCH", 5: "ATOMIC"}
+
+# MemAlloc event types
+MEMALLOC_MAP   = 0
+MEMALLOC_UNMAP = 1
+MEMALLOC_REMAP = 2
+MEMALLOC_TYPE_NAMES = {0: "MAP", 1: "UNMAP", 2: "REMAP"}
+
+# ISA enum values (must match TraceISA in wptrace_mnemonics.h)
+ISA_NAMES = {
+    0: "unknown",
+    1: "x86_64",
+    2: "aarch64",
+    3: "riscv64",
+    4: "mipsel",
+}
 
 BRANCH_NONE = 0
 
@@ -90,14 +131,41 @@ EXCEPTION_NAMES_DEFAULT = {
     2: "INT_DIVIDE_BY_ZERO",
     3: "FP_DIVIDE_BY_ZERO",
     4: "MEMORY_ACCESS",
-    5: "SYSCALL",
 }
+
+WP_STOP_REASON_NAMES = {
+    0: "NONE",
+    1: "SYSCALL_USERMODE",
+}
+
+
+def build_reg_names() -> dict[int, str]:
+    names: dict[int, str] = {}
+    names[0] = "NONE"
+    for i in range(64):
+        names[1 + i] = f"GPR{i}"
+    for i in range(64):
+        names[65 + i] = f"FPR{i}"
+    for i in range(64):
+        names[129 + i] = f"VEC{i}"
+    names[250] = "SP"
+    names[251] = "FLAGS"
+    names[252] = "IP"
+    names[253] = "LR"
+    names[254] = "FP"
+    return names
+
+
+REG_NAMES_DEFAULT = build_reg_names()
 
 
 @dataclass
 class DynParam:
     type_name: str
     value: int
+    data_size: int = 0
+    data_lo: int = 0
+    data_hi: int = 0
 
 
 def add_delta_u64(base: int, delta: int) -> int:
@@ -241,8 +309,35 @@ def decode_dyn_patch(br: BitReader, prev_dyn: list[DynParam]) -> list[DynParam]:
     return out
 
 
-def format_dyn(dp: DynParam) -> str:
-    return f"{dp.type_name}=0x{dp.value:x}"
+# Byte sizes corresponding to 3-bit size codes used for mem data
+_MEM_DATA_SIZE_TABLE = [1, 2, 4, 8, 16, 1, 1, 1]
+
+
+def read_mem_data_values(br: "BitReader", params: list[DynParam]) -> None:
+    """Read and attach data values to each DynParam in-place."""
+    for dp in params:
+        code = br.read_bits(WPT_MEM_DATA_SIZE_BITS)
+        sz = _MEM_DATA_SIZE_TABLE[code]
+        dp.data_size = sz
+        lo = 0
+        for b in range(min(sz, 8)):
+            lo |= br.read_bits(8) << (b * 8)
+        dp.data_lo = lo
+        hi = 0
+        if sz > 8:
+            for b in range(sz - 8):
+                hi |= br.read_bits(8) << (b * 8)
+        dp.data_hi = hi
+
+
+def format_dyn(dp: DynParam, show_data: bool = False) -> str:
+    s = f"{dp.type_name}=0x{dp.value:x}"
+    if show_data and dp.data_size > 0:
+        if dp.data_size <= 8:
+            s += f":data=0x{dp.data_lo:x}"
+        else:
+            s += f":data=0x{dp.data_hi:x}{dp.data_lo:016x}"
+    return s
 
 
 def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
@@ -256,12 +351,28 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
         )
 
     isa = br.read_bits(WPT_ISA_BITS)
+
+    # v0.6 header: flags, command, datetime, comment, target_name, thread_id
+    flags = br.read_bits(WPT_HEADER_FLAGS_BITS)
+    command      = read_string(br)
+    datetime_str = read_string(br)
+    comment      = read_string(br)
+    target_name  = read_string(br)
+    thread_id    = br.read_uleb128()   # v0.6: always present (0 = single-thread)
+
+    has_mem_data  = bool(flags & WPT_FLAG_MEM_DATA)
+    has_mem_alloc = bool(flags & WPT_FLAG_MEM_ALLOC)
+    is_threaded   = bool(flags & WPT_FLAG_THREADS)
+
     opcode_names = dict(OPCODE_NAMES)
     branch_names = dict(BRANCH_NAMES)
     exception_names = dict(EXCEPTION_NAMES_DEFAULT)
-    reg_names: dict[int, str] = {}
+    stop_reason_names = dict(WP_STOP_REASON_NAMES)
+    reg_names: dict[int, str] = dict(REG_NAMES_DEFAULT)
 
     entries: list[dict] = []
+    memalloc_events: list[dict] = []
+    sync_events: list[dict] = []
     templates: list[dict] = []
     template_by_id: dict[int, dict] = {}
 
@@ -271,11 +382,48 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
     footer_num_entries: int | None = None
 
     while True:
-        marker = br.read_bits(1)
-        if marker == 0:
+        tag = br.read_bits(2)
+
+        if tag == BODY_TAG_END:
             footer_num_entries = br.read_uleb128()
             break
 
+        if tag == BODY_TAG_MEMALLOC:
+            event_type = br.read_bits(2)
+            vaddr = br.read_uleb128()
+            size  = br.read_uleb128()
+            new_vaddr = 0
+            new_size  = 0
+            if event_type == MEMALLOC_REMAP:
+                new_vaddr = br.read_uleb128()
+                new_size  = br.read_uleb128()
+            memalloc_events.append({
+                "event_type": event_type,
+                "type_name": MEMALLOC_TYPE_NAMES.get(event_type, "UNKNOWN"),
+                "vaddr": vaddr,
+                "size": size,
+                "new_vaddr": new_vaddr,
+                "new_size": new_size,
+                # associate with next body entry
+                "before_entry": len(entries),
+            })
+            continue
+
+        if tag == BODY_TAG_SYNC:
+            sync_type = br.read_bits(WPT_SYNC_TYPE_BITS)
+            addr = 0
+            if sync_type in (SYNC_FUTEX_WAIT, SYNC_FUTEX_WAKE,
+                             SYNC_THREAD_SWITCH):
+                addr = br.read_uleb128()
+            sync_events.append({
+                "sync_type": sync_type,
+                "type_name": SYNC_TYPE_NAMES.get(sync_type, "UNKNOWN"),
+                "addr": addr,
+                "before_entry": len(entries),
+            })
+            continue
+
+        # tag == BODY_TAG_ENTRY
         seq_num = len(entries) + 1
         entry_tmpl = prev_entry_template + br.read_sleb128()
         prev_entry_template = entry_tmpl
@@ -293,6 +441,9 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
             cp_dyn_state[entry_tmpl] = [DynParam(type_name=d.type_name,
                                                  value=d.value)
                                         for d in cp_dyn]
+
+        if has_mem_data:
+            read_mem_data_values(br, cp_dyn)
 
         num_wp = br.read_uleb128()
         prev_wp_tmpl = 0
@@ -316,12 +467,9 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
                                                   value=d.value)
                                          for d in wp_dyn]
 
-            translation_unavailable = False
-            exception = False
-            exception_id = 0
-            exception_name = None
-            exreg_name = None
-            poison_mask: list[int] = []
+            if has_mem_data:
+                read_mem_data_values(br, wp_dyn)
+
             wp_n_insns = 0
             if wp_tmpl in template_by_id:
                 wp_n_insns = template_by_id[wp_tmpl]["n_insns"]
@@ -330,12 +478,16 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
                 "index": w,
                 "template_id": wp_tmpl,
                 "dyn_params": wp_dyn,
-                "exception": bool(exception),
-                "translation_unavailable": translation_unavailable,
-                "exception_id": exception_id,
-                "exception_name": exception_name,
-                "exception_reg": exreg_name,
-                "poison_mask": poison_mask,
+                "fault": False,
+                "translation_unavailable": False,
+                "stop_reason": 0,
+                "stop_reason_name": None,
+                "has_exception_class": False,
+                "exception_id": 0,
+                "exception_name": None,
+                "has_exception_reg": False,
+                "exception_reg": None,
+                "poison_mask": [],
                 "n_insns": wp_n_insns,
             })
 
@@ -349,22 +501,34 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
                 raise ValueError("wp event index out of range")
 
             translation_unavailable = bool(br.read_bits(1))
-            exception = bool(br.read_bits(1))
+            fault = bool(br.read_bits(1))
 
             target = wp_entries[wp_idx]
             target["translation_unavailable"] = translation_unavailable
-            target["exception"] = exception
+            target["fault"] = fault
 
-            if exception:
-                exception_id = br.read_bits(8)
-                target["exception_id"] = exception_id
-                target["exception_name"] = exception_names.get(exception_id,
-                                                                  "UNKNOWN")
-                has_exreg = br.read_bits(1)
-                if has_exreg:
-                    exreg_id = br.read_bits(WPT_REG_BITS)
-                    target["exception_reg"] = reg_names.get(exreg_id,
-                                                              reg_name(exreg_id))
+            if fault:
+                stop_reason = br.read_bits(8)
+                target["stop_reason"] = stop_reason
+                target["stop_reason_name"] = stop_reason_names.get(
+                    stop_reason, "UNKNOWN")
+
+                has_exception_class = bool(br.read_bits(1))
+                target["has_exception_class"] = has_exception_class
+
+                if has_exception_class:
+                    exception_id = br.read_bits(8)
+                    target["exception_id"] = exception_id
+                    target["exception_name"] = exception_names.get(
+                        exception_id, "UNKNOWN")
+
+                    has_exception_reg = bool(br.read_bits(1))
+                    target["has_exception_reg"] = has_exception_reg
+                    if has_exception_reg:
+                        exreg_id = br.read_bits(WPT_REG_BITS)
+                        target["exception_reg"] = reg_names.get(
+                            exreg_id, reg_name(exreg_id))
+
                 poison_len = br.read_uleb128()
                 target["poison_mask"] = [br.read_bits(8)
                                           for _ in range(poison_len)]
@@ -384,7 +548,8 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
         start_pc = br.read_uleb128()
         n_insns = br.read_uleb128()
         fall_through_pc = br.read_uleb128()
-        symbol_name = ""
+        sym_len = br.read_uleb128()
+        symbol_name = read_bytes(br, sym_len).decode('utf-8', errors='replace') if sym_len else ""
 
         insns: list[dict] = []
         for _ in range(n_insns):
@@ -395,11 +560,12 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
             n_src = br.read_bits(WPT_REG_COUNT_BITS)
             n_dst = br.read_bits(WPT_REG_COUNT_BITS)
             has_imm = br.read_bits(1)
+            sync_hint = br.read_bits(WPT_SYNC_HINT_BITS)
             src_regs = [br.read_bits(WPT_REG_BITS) for _ in range(n_src)]
             dst_regs = [br.read_bits(WPT_REG_BITS) for _ in range(n_dst)]
             imm = br.read_sleb128() if has_imm else None
-            _insn_size = br.read_uleb128()
-            raw_bytes = b""
+            insn_size = br.read_uleb128()
+            raw_bytes = read_bytes(br, insn_size)
 
             insns.append({
                 "pc": pc,
@@ -409,6 +575,7 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
                 "src_regs": src_regs,
                 "dst_regs": dst_regs,
                 "imm": imm,
+                "sync_hint": sync_hint,
                 "raw_bytes": raw_bytes,
             })
 
@@ -437,10 +604,22 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
     meta = {
         "magic": magic,
         "isa": isa,
+        "target_name": target_name,
+        "flags": flags,
+        "command": command,
+        "datetime": datetime_str,
+        "comment": comment,
+        "has_mem_data": has_mem_data,
+        "has_mem_alloc": has_mem_alloc,
+        "is_threaded": is_threaded,
+        "thread_id": thread_id,
         "opcode_names": opcode_names,
         "branch_names": branch_names,
+        "stop_reason_names": stop_reason_names,
         "exception_names": exception_names,
         "reg_names": reg_names,
+        "memalloc_events": memalloc_events,
+        "sync_events": sync_events,
     }
     return meta, templates, entries
 
@@ -449,11 +628,38 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
     out: list[str] = []
     opcode_names: dict[int, str] = meta.get("opcode_names", OPCODE_NAMES)
     branch_names: dict[int, str] = meta.get("branch_names", BRANCH_NAMES)
-    exception_names: dict[int, str] = meta.get("exception_names", EXCEPTION_NAMES_DEFAULT)
-    reg_names: dict[int, str] = meta.get("reg_names", {})
+    stop_reason_names: dict[int, str] = meta.get("stop_reason_names",
+                                                  WP_STOP_REASON_NAMES)
+    exception_names: dict[int, str] = meta.get("exception_names",
+                                               EXCEPTION_NAMES_DEFAULT)
+    reg_names: dict[int, str] = meta.get("reg_names", REG_NAMES_DEFAULT)
+    has_mem_data = meta.get("has_mem_data", False)
+    memalloc_events: list[dict] = meta.get("memalloc_events", [])
+    sync_events: list[dict]     = meta.get("sync_events", [])
 
     def reg_fmt(r: int) -> str:
         return reg_names.get(r, reg_name(r))
+
+    # META section
+    out.append("META")
+    out.append("----")
+    out.append(f"VERSION 0x{meta.get('magic', WPT_MAGIC):08X}")
+    isa_val = meta.get('isa', 0)
+    isa_name = meta.get('target_name') or ISA_NAMES.get(isa_val, "unknown")
+    out.append(f"ISA {isa_name}")
+    out.append(f"COMMAND {meta.get('command', '')}")
+    out.append(f"DATETIME {meta.get('datetime', '')}")
+    out.append(f"COMMENT {meta.get('comment', '')}")
+    out.append(f"THREAD {meta.get('thread_id', 0)}")
+    flags_str = ""
+    if has_mem_data:
+        flags_str += " MEM_DATA"
+    if meta.get("has_mem_alloc"):
+        flags_str += " MEM_ALLOC"
+    if meta.get("is_threaded"):
+        flags_str += " THREADS"
+    out.append(f"FLAGS{flags_str}")
+    out.append("")
 
     out.append("ENUMS")
     out.append("-----")
@@ -463,6 +669,9 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
     out.append(f"BRANCHES {len(branch_names)}")
     for k in sorted(branch_names):
         out.append(f"B {k} {branch_names[k]}")
+    out.append(f"WP_STOP_REASONS {len(stop_reason_names)}")
+    for k in sorted(stop_reason_names):
+        out.append(f"S {k} {stop_reason_names[k]}")
     out.append(f"EXCEPTIONS {len(exception_names)}")
     for k in sorted(exception_names):
         out.append(f"E {k} {exception_names[k]}")
@@ -498,6 +707,8 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
 
             if insn["imm"] is not None:
                 line += f" imm={insn['imm']}"
+            if insn.get("sync_hint", 0) != 0:
+                line += f" sync={SYNC_TYPE_NAMES.get(insn['sync_hint'], 'UNKNOWN')}"
             if insn.get("raw_bytes") is not None:
                 line += f" bytes={insn['raw_bytes'].hex()}"
 
@@ -508,20 +719,56 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
     out.append("BODY")
     out.append("----")
 
-    for entry in entries:
-        dyn_str = " ".join(format_dyn(dp) for dp in entry["dyn_params"])
+    next_memalloc_idx = 0
+    next_sync_idx = 0
+    for entry_idx, entry in enumerate(entries):
+        # Emit any sync events that occurred before this entry
+        while (next_sync_idx < len(sync_events) and
+               sync_events[next_sync_idx]["before_entry"] == entry_idx):
+            ev = sync_events[next_sync_idx]
+            if ev["sync_type"] in (SYNC_YIELD, SYNC_ATOMIC):
+                out.append(f"SYNC type={ev['type_name']}")
+            elif ev["sync_type"] == SYNC_THREAD_SWITCH:
+                out.append(f"SYNC type=THREAD_SWITCH thread={ev['addr']}")
+            else:
+                out.append(
+                    f"SYNC type={ev['type_name']} addr=0x{ev['addr']:x}"
+                )
+            next_sync_idx += 1
+
+        # Emit any memalloc events that occurred before this entry
+        while (next_memalloc_idx < len(memalloc_events) and
+               memalloc_events[next_memalloc_idx]["before_entry"] == entry_idx):
+            ev = memalloc_events[next_memalloc_idx]
+            line = (
+                f"MEMALLOC type={ev['type_name']} "
+                f"vaddr=0x{ev['vaddr']:x} size=0x{ev['size']:x}"
+            )
+            if ev["type_name"] == "REMAP":
+                line += (
+                    f" new_vaddr=0x{ev['new_vaddr']:x}"
+                    f" new_size=0x{ev['new_size']:x}"
+                )
+            out.append(line)
+            next_memalloc_idx += 1
+
+        dyn_str = " ".join(
+            format_dyn(dp, show_data=has_mem_data) for dp in entry["dyn_params"]
+        )
         line = f"{entry['seq_num']:04d} BB{entry['template_id']} [{dyn_str}]"
 
         for wp in entry["wp_entries"]:
             line += f" [wp{wp['index']}=BB{wp['template_id']}"
             for dp in wp["dyn_params"]:
-                line += f" {format_dyn(dp)}"
-            if wp["exception"]:
-                line += " EXCEPTION"
-                if wp.get("exception_name"):
-                    line += f" exid={wp['exception_name']}"
-                if wp.get("exception_reg"):
-                    line += f" exreg={wp['exception_reg']}"
+                line += f" {format_dyn(dp, show_data=has_mem_data)}"
+            if wp["fault"]:
+                line += " FAULT"
+                if wp.get("stop_reason", 0) != 0 and wp.get("stop_reason_name"):
+                    line += f" stop={wp['stop_reason_name']}"
+                if wp.get("has_exception_class"):
+                    line += f" exid={wp.get('exception_name', 'UNKNOWN')}"
+                    if wp.get("has_exception_reg") and wp.get("exception_reg"):
+                        line += f" exreg={wp['exception_reg']}"
             if wp.get("translation_unavailable"):
                 line += " TRANSLATION_UNAVAILABLE"
             if wp.get("poison_mask"):
@@ -551,7 +798,7 @@ def first_diff_line(a: str, b: str) -> tuple[int, str, str] | None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Decode wptrace binary (.bin, format v0.4) and reconstruct debug text format"
+            "Decode wptrace binary (.bin, format v0.5) and reconstruct debug text format"
         )
     )
     parser.add_argument("bin", type=Path, help="Input wptrace binary file")

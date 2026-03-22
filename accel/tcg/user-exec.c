@@ -868,6 +868,17 @@ void *probe_access(CPUArchState *env, vaddr addr, int size,
     flags = probe_access_internal(env, addr, size, access_type, false, ra);
     g_assert((flags & ~TLB_MMIO) == 0);
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * In speculative mode, return NULL so callers fall back to the
+     * cpu_ld/cpu_st slow-path helpers where the spec store buffer
+     * and load overlay intercept the access.
+     */
+    if (size && cpu_plugin_spec_active(env_cpu(env))) {
+        return NULL;
+    }
+#endif
+
     return size ? g2h(env_cpu(env), addr) : NULL;
 }
 

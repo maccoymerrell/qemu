@@ -802,6 +802,8 @@ void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
     /*
      * Trapless lookup.  In addition to actual invalid page, may
      * return NULL for I/O, watchpoints, clean pages, etc.
+     * In user-mode with CONFIG_PLUGIN, returns NULL during speculative
+     * execution so stores route through the per-vCPU store buffer.
      */
     mem = tlb_vaddr_to_host(env, vaddr, MMU_DATA_STORE, mmu_idx);
 
@@ -825,6 +827,13 @@ void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
             }
             return;
         }
+    }
+#else
+    if (unlikely(!mem)) {
+        for (int i = 0; i < blocklen; i++) {
+            cpu_stb_mmuidx_ra(env, vaddr + i, 0, mmu_idx, ra);
+        }
+        return;
     }
 #endif
 
@@ -966,18 +975,16 @@ static uint64_t set_step(CPUARMState *env, uint64_t toaddr,
      */
     mem = tlb_vaddr_to_host(env, toaddr, MMU_DATA_STORE, memidx);
 
-#ifndef CONFIG_USER_ONLY
     if (unlikely(!mem)) {
         /*
          * Slow-path: just do one byte write. This will handle the
          * watchpoint, invalid page, etc handling correctly.
-         * For clean code pages, the next iteration will see
-         * the page dirty and will use the fast path.
+         * In user-mode, this path is taken during plugin speculative
+         * execution so stores route through the per-vCPU store buffer.
          */
         cpu_stb_mmuidx_ra(env, toaddr, data, memidx, ra);
         return 1;
     }
-#endif
     /* Easy case: just memset the host memory */
     set_helper_retaddr(ra);
     memset(mem, data, setsize);
@@ -1006,15 +1013,14 @@ static uint64_t set_step_tags(CPUARMState *env, uint64_t toaddr,
      */
     mem = tlb_vaddr_to_host(env, cleanaddr, MMU_DATA_STORE, memidx);
 
-#ifndef CONFIG_USER_ONLY
     if (unlikely(!mem)) {
         /*
          * Slow-path: just do one write. This will handle the
          * watchpoint, invalid page, etc handling correctly.
          * The architecture requires that we do 16 bytes at a time,
          * and we know both ptr and size are 16 byte aligned.
-         * For clean code pages, the next iteration will see
-         * the page dirty and will use the fast path.
+         * In user-mode, this path is taken during plugin speculative
+         * execution so stores route through the per-vCPU store buffer.
          */
         uint64_t repldata = data * 0x0101010101010101ULL;
         MemOpIdx oi16 = make_memop_idx(MO_TE | MO_128, memidx);
@@ -1022,7 +1028,6 @@ static uint64_t set_step_tags(CPUARMState *env, uint64_t toaddr,
         mte_mops_set_tags(env, toaddr, 16, *mtedesc);
         return 16;
     }
-#endif
     /* Easy case: just memset the host memory */
     set_helper_retaddr(ra);
     memset(mem, data, setsize);
@@ -1337,12 +1342,11 @@ static uint64_t copy_step(CPUARMState *env, uint64_t toaddr, uint64_t fromaddr,
     wmem = tlb_vaddr_to_host(env, toaddr, MMU_DATA_STORE, wmemidx);
     rmem = tlb_vaddr_to_host(env, fromaddr, MMU_DATA_LOAD, rmemidx);
 
-#ifndef CONFIG_USER_ONLY
     /*
      * If we don't have host memory for both source and dest then just
      * do a single byte copy. This will handle watchpoints, invalid pages,
-     * etc correctly. For clean code pages, the next iteration will see
-     * the page dirty and will use the fast path.
+     * etc correctly. In user-mode, wmem is NULL during plugin speculative
+     * execution so stores route through the per-vCPU store buffer.
      */
     if (unlikely(!rmem || !wmem)) {
         uint8_t byte;
@@ -1358,7 +1362,6 @@ static uint64_t copy_step(CPUARMState *env, uint64_t toaddr, uint64_t fromaddr,
         }
         return 1;
     }
-#endif
     /* Easy case: just memmove the host memory */
     set_helper_retaddr(ra);
     memmove(wmem, rmem, copysize);
@@ -1411,12 +1414,11 @@ static uint64_t copy_step_rev(CPUARMState *env, uint64_t toaddr,
     wmem = tlb_vaddr_to_host(env, toaddr, MMU_DATA_STORE, wmemidx);
     rmem = tlb_vaddr_to_host(env, fromaddr, MMU_DATA_LOAD, rmemidx);
 
-#ifndef CONFIG_USER_ONLY
     /*
      * If we don't have host memory for both source and dest then just
      * do a single byte copy. This will handle watchpoints, invalid pages,
-     * etc correctly. For clean code pages, the next iteration will see
-     * the page dirty and will use the fast path.
+     * etc correctly. In user-mode, wmem is NULL during plugin speculative
+     * execution so stores route through the per-vCPU store buffer.
      */
     if (unlikely(!rmem || !wmem)) {
         uint8_t byte;
@@ -1432,7 +1434,6 @@ static uint64_t copy_step_rev(CPUARMState *env, uint64_t toaddr,
         }
         return 1;
     }
-#endif
     /*
      * Easy case: just memmove the host memory. Note that wmem and
      * rmem here point to the *last* byte to copy.

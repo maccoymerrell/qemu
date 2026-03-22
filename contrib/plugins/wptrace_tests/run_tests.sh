@@ -74,10 +74,10 @@ declare -A TESTS=(
 
 # Multi-thread tests use threads=1 and per-thread output files (_tN.bin)
 declare -A THREADED_TESTS=(
-    [x86]="multithreaded"
-    [aarch64]="multithreaded"
-    [riscv64]="multithreaded"
-    [mips]="multithreaded"
+    [x86]="multithreaded synctest"
+    [aarch64]="multithreaded synctest"
+    [riscv64]="multithreaded synctest"
+    [mips]="multithreaded synctest"
 )
 
 # Extra plugin options for specific tests (e.g. "memalloc=1").
@@ -92,6 +92,7 @@ declare -A EXTRA_PLUGIN_OPTS=(
 declare -A CONTENT_CHECK=(
     [heapalloc]="^MEMALLOC "
     [memdata]=":data=0xdeadbeef"
+    [synctest]="sync=ATOMIC"
 )
 
 ISA_ORDER=(x86 aarch64 riscv64 mips)
@@ -219,6 +220,14 @@ run_threaded() {
     # Content check: the unified trace must contain THREAD_SWITCH events
     if ! grep -qP "^SYNC type=THREAD_SWITCH" "${out}.txt" 2>/dev/null; then
         printf "  FAIL  %-34s  (no SYNC type=THREAD_SWITCH in trace)\n" "$label"
+        FAIL=$((FAIL + 1))
+        return
+    fi
+
+    # Optional extra content check (e.g. sync=ATOMIC for synctest)
+    local pattern="${CONTENT_CHECK[$name]:-}"
+    if [[ -n "$pattern" ]] && ! grep -qP "$pattern" "${out}.txt" 2>/dev/null; then
+        printf "  FAIL  %-34s  (no '%s' lines in trace)\n" "$label" "$pattern"
         FAIL=$((FAIL + 1))
         return
     fi

@@ -64,10 +64,10 @@ declare -A TESTS=(
 
 # C tests built from shared sources (not ISA-specific .S files)
 declare -A C_TESTS=(
-    [x86]="multithreaded"
-    [aarch64]="multithreaded"
-    [riscv64]="multithreaded"
-    [mips]="multithreaded"
+    [x86]="multithreaded synctest"
+    [aarch64]="multithreaded synctest"
+    [riscv64]="multithreaded synctest"
+    [mips]="multithreaded synctest"
 )
 
 ISA_ORDER=(x86 aarch64 riscv64 mips)

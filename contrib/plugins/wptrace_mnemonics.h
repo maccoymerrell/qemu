@@ -106,16 +106,18 @@ enum WPStopReason {
 
 /*
  * Sync event types.
- * Emitted into the body stream as annotations on BB edges to convey
- * thread-level synchronisation events to the trace consumer.
- * Instructions with MF_ATOMIC set produce SYNC_ATOMIC hints in the
- * template footer so the simulator can model memory ordering.
+ * SYNC_THREAD_SWITCH is emitted into the body stream when execution moves
+ * to a different vCPU.  SYNC_ATOMIC is a template-level hint on instructions
+ * that perform atomic/locked memory operations; the trace consumer uses the
+ * memory addresses of those operations to build a conflict graph for
+ * inter-thread scheduling.
+ *
+ * Synchronisation detection is based entirely on atomics — no syscall
+ * interception is used.  Every userspace synchronisation primitive ultimately
+ * resolves to atomic memory operations on shared addresses.
  */
 typedef enum {
     SYNC_NONE            = 0,   /* no sync (default for InsnFields.sync_hint) */
-    SYNC_YIELD           = 1,   /* sched_yield — voluntary reschedule */
-    SYNC_FUTEX_WAIT      = 2,   /* futex FUTEX_WAIT/BITSET — thread about to block */
-    SYNC_FUTEX_WAKE      = 3,   /* futex returned from wait — thread was woken */
     SYNC_THREAD_SWITCH   = 4,   /* context switch: new cpu_index takes over */
     SYNC_ATOMIC          = 5,   /* atomic / locked memory operation */
 } SyncEventType;

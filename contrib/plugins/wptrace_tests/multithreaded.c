@@ -4,9 +4,16 @@
  * Spawns two worker threads that share a mutex-protected counter.
  * Exercises:
  *   - Thread creation (pthread_create → clone syscall)
- *   - Mutex lock/unlock (futex FUTEX_WAIT / FUTEX_WAKE round-trips)
+ *   - Mutex lock/unlock (internally uses atomic operations)
  *   - sched_yield (voluntary scheduling)
- *   - Thread join (pthread_join → futex)
+ *   - Thread join (pthread_join)
+ *   - THREAD_SWITCH sync events when execution moves between vCPUs
+ *
+ * The trace records SYNC_ATOMIC hints on atomic/locked instructions
+ * used by the mutex implementation.  A Thread Segment Directory in
+ * the footer groups body entries into per-thread segments, with
+ * atomic BBs isolated as 1-BB segments so that ChampSim can use
+ * them as preemption points.
  *
  * Compiled with: -static -pthread
  * Used with plugin option: threads=1

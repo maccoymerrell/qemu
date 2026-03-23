@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-WPT_MAGIC = 0x54505707
+WPT_MAGIC = 0x54505708
 
 WPT_ISA_BITS = 3
 WPT_OPCODE_BITS = 8
@@ -16,10 +16,11 @@ WPT_REG_BITS = 8
 WPT_HEADER_FLAGS_BITS = 8
 WPT_MEM_DATA_SIZE_BITS = 3
 
-WPT_FLAG_MEM_DATA  = 1 << 0
-WPT_FLAG_REG_DATA  = 1 << 1
-WPT_FLAG_MEM_ALLOC = 1 << 2
-WPT_FLAG_THREADS   = 1 << 3
+WPT_FLAG_MEM_DATA    = 1 << 0
+WPT_FLAG_REG_DATA    = 1 << 1
+WPT_FLAG_MEM_ALLOC   = 1 << 2
+WPT_FLAG_THREADS     = 1 << 3
+WPT_FLAG_THREAD_DIR  = 1 << 4
 
 # Body entry tags (2-bit)
 BODY_TAG_END      = 0
@@ -32,13 +33,9 @@ WPT_SYNC_HINT_BITS = 4
 
 # Sync event types (must match SyncEventType enum in wptrace_mnemonics.h)
 SYNC_NONE          = 0
-SYNC_YIELD         = 1
-SYNC_FUTEX_WAIT    = 2
-SYNC_FUTEX_WAKE    = 3
 SYNC_THREAD_SWITCH = 4
 SYNC_ATOMIC        = 5
-SYNC_TYPE_NAMES    = {0: "NONE", 1: "YIELD", 2: "FUTEX_WAIT", 3: "FUTEX_WAKE",
-                      4: "THREAD_SWITCH", 5: "ATOMIC"}
+SYNC_TYPE_NAMES    = {0: "NONE", 4: "THREAD_SWITCH", 5: "ATOMIC"}
 
 # MemAlloc event types
 MEMALLOC_MAP   = 0
@@ -360,9 +357,10 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
     target_name  = read_string(br)
     thread_id    = br.read_uleb128()   # v0.6: always present (0 = single-thread)
 
-    has_mem_data  = bool(flags & WPT_FLAG_MEM_DATA)
-    has_mem_alloc = bool(flags & WPT_FLAG_MEM_ALLOC)
-    is_threaded   = bool(flags & WPT_FLAG_THREADS)
+    has_mem_data    = bool(flags & WPT_FLAG_MEM_DATA)
+    has_mem_alloc   = bool(flags & WPT_FLAG_MEM_ALLOC)
+    is_threaded     = bool(flags & WPT_FLAG_THREADS)
+    has_thread_dir  = bool(flags & WPT_FLAG_THREAD_DIR)
 
     opcode_names = dict(OPCODE_NAMES)
     branch_names = dict(BRANCH_NAMES)
@@ -385,6 +383,26 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
         tag = br.read_bits(2)
 
         if tag == BODY_TAG_END:
+            # Thread Segment Directory sits between BODY_TAG_END and
+            # the footer entry count when WPT_FLAG_THREAD_DIR is set.
+            seg_directory: list[dict] = []
+            if has_thread_dir:
+                num_segments = br.read_uleb128()
+                for _ in range(num_segments):
+                    seg_tid = br.read_uleb128()
+                    seg_offset = br.read_uleb128()
+                    seg_n_entries = br.read_uleb128()
+                    seg_flags = br.read_bits(8)
+                    seg_is_atomic = bool(seg_flags & 1)
+                    n_addrs = br.read_uleb128()
+                    addrs = [br.read_uleb128() for _ in range(n_addrs)]
+                    seg_directory.append({
+                        "thread_id": seg_tid,
+                        "body_bit_offset": seg_offset,
+                        "num_entries": seg_n_entries,
+                        "is_atomic": seg_is_atomic,
+                        "atomic_addrs": addrs,
+                    })
             footer_num_entries = br.read_uleb128()
             break
 
@@ -412,8 +430,7 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
         if tag == BODY_TAG_SYNC:
             sync_type = br.read_bits(WPT_SYNC_TYPE_BITS)
             addr = 0
-            if sync_type in (SYNC_FUTEX_WAIT, SYNC_FUTEX_WAKE,
-                             SYNC_THREAD_SWITCH):
+            if sync_type == SYNC_THREAD_SWITCH:
                 addr = br.read_uleb128()
             sync_events.append({
                 "sync_type": sync_type,
@@ -612,6 +629,8 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
         "has_mem_data": has_mem_data,
         "has_mem_alloc": has_mem_alloc,
         "is_threaded": is_threaded,
+        "has_thread_dir": has_thread_dir,
+        "seg_directory": seg_directory if has_thread_dir else [],
         "thread_id": thread_id,
         "opcode_names": opcode_names,
         "branch_names": branch_names,
@@ -726,14 +745,10 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
         while (next_sync_idx < len(sync_events) and
                sync_events[next_sync_idx]["before_entry"] == entry_idx):
             ev = sync_events[next_sync_idx]
-            if ev["sync_type"] in (SYNC_YIELD, SYNC_ATOMIC):
-                out.append(f"SYNC type={ev['type_name']}")
-            elif ev["sync_type"] == SYNC_THREAD_SWITCH:
+            if ev["sync_type"] == SYNC_THREAD_SWITCH:
                 out.append(f"SYNC type=THREAD_SWITCH thread={ev['addr']}")
             else:
-                out.append(
-                    f"SYNC type={ev['type_name']} addr=0x{ev['addr']:x}"
-                )
+                out.append(f"SYNC type={ev['type_name']}")
             next_sync_idx += 1
 
         # Emit any memalloc events that occurred before this entry
@@ -798,7 +813,7 @@ def first_diff_line(a: str, b: str) -> tuple[int, str, str] | None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Decode wptrace binary (.bin, format v0.5) and reconstruct debug text format"
+            "Decode wptrace binary (.bin, format v0.8) and reconstruct debug text format"
         )
     )
     parser.add_argument("bin", type=Path, help="Input wptrace binary file")

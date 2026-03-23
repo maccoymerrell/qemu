@@ -117,39 +117,40 @@ static __thread GArray *memalloc_event_queue = NULL;   /* GArray of MemAllocEven
 
 typedef struct {
     SyncEventType type;
-    uint64_t addr;  /* futex word virtual address (FUTEX events only) */
+    uint64_t addr;  /* thread_id for THREAD_SWITCH */
 } SyncEvent;
 
-/* ISA-specific syscall numbers for sync primitives, set at init time. */
-typedef struct {
-    int64_t nr_futex;
-    int64_t nr_sched_yield;
-} SyscallSyncNums;
-
-static SyscallSyncNums sync_syscall_nums;
-
-/* Per-vCPU pending sync-syscall state for futex wait/wake correlation. */
-typedef struct {
-    int64_t  nr;   /* Syscall number, or -1 if no pending sync syscall */
-    uint64_t a1;   /* futex word address (uaddr) */
-    int64_t  a2;   /* futex op */
-} PendingSyncSyscall;
-
-static __thread PendingSyncSyscall pending_sync_syscall = { .nr = -1 };
-
-/* Queued sync events: per-thread, flushed into the BB body stream. */
-static __thread GArray *sync_event_queue = NULL;
-
 /*
- * Multi-thread tracing: when enable_threads is set (threads=1), each vCPU
- * gets its own TraceSegment and output files (outfile_tN.bin / outfile_tN.txt).
- * Thread IDs are assigned monotonically as vCPUs are initialised.
+ * Multi-thread tracing: when enable_threads is set (threads=1), the body
+ * stream contains SYNC_THREAD_SWITCH events and the footer contains a
+ * Thread Segment Directory.  Thread IDs are assigned monotonically on
+ * first appearance of each cpu_index.
  */
 static bool enable_threads = false;
-/* Unified multi-thread tracing: tracks which cpu last executed,
- * so SYNC_THREAD_SWITCH events are emitted into the single body stream
- * whenever execution switches to a different vCPU. */
+/* Tracks which cpu last executed so SYNC_THREAD_SWITCH events are emitted
+ * into the single body stream whenever execution switches to a different vCPU. */
 static int64_t last_exec_cpu_index = -1;
+
+/*
+ * Thread ID assignment: cpu_index -> monotonic uint32_t.
+ * First vCPU observed gets thread_id=0 (main thread).
+ */
+static GHashTable *cpu_to_thread_id;  /* GUINT_TO_POINTER(cpu_index+1) -> GUINT_TO_POINTER(tid+1) */
+static uint32_t next_thread_id = 0;
+
+static uint32_t get_or_assign_thread_id(unsigned int cpu_index)
+{
+    gpointer val = g_hash_table_lookup(cpu_to_thread_id,
+                                        GUINT_TO_POINTER(cpu_index + 1));
+    if (val) {
+        return GPOINTER_TO_UINT(val) - 1;
+    }
+    uint32_t tid = next_thread_id++;
+    g_hash_table_insert(cpu_to_thread_id,
+                        GUINT_TO_POINTER(cpu_index + 1),
+                        GUINT_TO_POINTER(tid + 1));
+    return tid;
+}
 
 /* SimPoints-driven tracing */
 static char *simpoints_file_path = NULL;
@@ -169,7 +170,7 @@ static guint simpoints_current_idx = 0;
 #define MAX_INSN_BYTES 16
 
 /* Binary format magic/version 0.6 */
-#define WPT_MAGIC  0x54505707  /* 'T','P','W',0x07 little-endian - version 0.7 */
+#define WPT_MAGIC  0x54505708  /* 'T','P','W',0x08 little-endian - version 0.8 */
 
 /* Body entry tags (2-bit field) */
 #define BODY_TAG_END      0   /* end-of-body sentinel */
@@ -188,10 +189,11 @@ static guint simpoints_current_idx = 0;
 #define WPT_SYNC_HINT_BITS 4
 
 /* Header feature flags */
-#define WPT_FLAG_MEM_DATA   (1 << 0)  /* Load/store data values captured */
-#define WPT_FLAG_REG_DATA   (1 << 1)  /* Register values captured (reserved) */
-#define WPT_FLAG_MEM_ALLOC  (1 << 2)  /* Memory allocation events tracked */
-#define WPT_FLAG_THREADS    (1 << 3)  /* Multi-thread tracing: per-thread file */
+#define WPT_FLAG_MEM_DATA    (1 << 0)  /* Load/store data values captured */
+#define WPT_FLAG_REG_DATA    (1 << 1)  /* Register values captured (reserved) */
+#define WPT_FLAG_MEM_ALLOC   (1 << 2)  /* Memory allocation events tracked */
+#define WPT_FLAG_THREADS     (1 << 3)  /* Multi-thread tracing active */
+#define WPT_FLAG_THREAD_DIR  (1 << 4)  /* Thread Segment Directory in footer */
 
 /* ========================= ISA-Agnostic Instruction Fields ========================= */
 
@@ -2201,9 +2203,6 @@ static void write_text_header(FILE *f, uint32_t thread_id,
             if (print_fld->sync_hint != SYNC_NONE) {
                 static const char * const sh_names[] = {
                     [SYNC_NONE]         = "NONE",
-                    [SYNC_YIELD]        = "YIELD",
-                    [SYNC_FUTEX_WAIT]   = "FUTEX_WAIT",
-                    [SYNC_FUTEX_WAKE]   = "FUTEX_WAKE",
                     [SYNC_THREAD_SWITCH]= "THREAD_SWITCH",
                     [SYNC_ATOMIC]       = "ATOMIC",
                 };
@@ -2496,12 +2495,33 @@ static void bw_write_bytes(BitWriter *bw, const uint8_t *buf, size_t len)
     }
 }
 
+/*
+ * Thread Segment Directory entry.
+ * One per segment; accumulated during body emission and serialised
+ * into the footer after BODY_TAG_END.
+ */
+typedef struct {
+    uint32_t thread_id;
+    uint64_t body_bit_offset;     /* bit position of first body entry */
+    uint32_t num_entries;         /* BB body entries in this segment */
+    bool     is_atomic;           /* segment created by atomic-BB isolation */
+    GHashTable *atomic_addrs;     /* set of uint64_t atomic mem addresses */
+} SegmentDirEntry;
+
 struct BodyStreamState {
     BitWriter bw;
     int64_t prev_entry_template;
     GHashTable *cp_dyn_state;   /* template_id -> last dyn params */
     GHashTable *wp_dyn_state;   /* wp template_id -> last dyn params */
     uint64_t num_entries;
+
+    /* Thread segment directory (threads mode only) */
+    GArray *seg_dir;             /* GArray of SegmentDirEntry */
+    uint32_t cur_seg_thread_id;  /* thread_id of current segment */
+    uint64_t cur_seg_start_bits; /* bit offset where current segment began */
+    uint32_t cur_seg_num_entries;/* entries accumulated in current segment */
+    bool     cur_seg_is_atomic;  /* current segment is an atomic segment */
+    GHashTable *cur_seg_atomic_addrs; /* atomic addrs in current segment */
 };
 
 /*
@@ -2797,6 +2817,7 @@ static BodyStreamState *body_stream_new(FILE *f, uint32_t thread_id,
     }
     if (enable_threads) {
         flags |= WPT_FLAG_THREADS;
+        flags |= WPT_FLAG_THREAD_DIR;
     }
     bw_write_bits(&st->bw, flags, WPT_HEADER_FLAGS_BITS);
 
@@ -2841,6 +2862,18 @@ static BodyStreamState *body_stream_new(FILE *f, uint32_t thread_id,
     st->wp_dyn_state = g_hash_table_new_full(g_int_hash, g_int_equal,
                                              g_free,
                                              dyn_param_array_unref_value);
+
+    /* Initialise thread segment directory tracking */
+    if (enable_threads) {
+        st->seg_dir = g_array_new(FALSE, TRUE, sizeof(SegmentDirEntry));
+        st->cur_seg_thread_id = thread_id;
+        st->cur_seg_start_bits = bw_tell_bits(&st->bw);
+        st->cur_seg_num_entries = 0;
+        st->cur_seg_is_atomic = false;
+        st->cur_seg_atomic_addrs = g_hash_table_new(g_direct_hash,
+                                                     g_direct_equal);
+    }
+
     return st;
 }
 
@@ -2965,17 +2998,178 @@ static void body_stream_write_memalloc_event(BodyStreamState *st,
 
 /*
  * Write a sync event with tag BODY_TAG_SYNC to the binary body stream.
- * Format: tag(2)=3 | sync_type(4) | [addr(uleb128) for FUTEX events]
+ * Format: tag(2)=3 | sync_type(4) | [addr(uleb128) for THREAD_SWITCH]
  */
 static void body_stream_write_sync_event(BodyStreamState *st,
                                          const SyncEvent *ev)
 {
     bw_write_bits(&st->bw, BODY_TAG_SYNC, 2);
     bw_write_bits(&st->bw, (uint32_t)ev->type, WPT_SYNC_HINT_BITS);
-    if (ev->type == SYNC_FUTEX_WAIT || ev->type == SYNC_FUTEX_WAKE ||
-        ev->type == SYNC_THREAD_SWITCH) {
-        bw_write_uleb128(&st->bw, ev->addr);  /* addr = futex address, or thread_id for THREAD_SWITCH */
+    if (ev->type == SYNC_THREAD_SWITCH) {
+        bw_write_uleb128(&st->bw, ev->addr);
     }
+}
+
+/*
+ * Finalise the current thread segment and push it onto the directory.
+ * Called on thread switch or on stream finish.
+ */
+static void body_stream_close_segment(BodyStreamState *st)
+{
+    if (!st->seg_dir) {
+        return;
+    }
+
+    /* Only record segments that contain at least one entry */
+    if (st->cur_seg_num_entries > 0) {
+        SegmentDirEntry de;
+        de.thread_id = st->cur_seg_thread_id;
+        de.body_bit_offset = st->cur_seg_start_bits;
+        de.num_entries = st->cur_seg_num_entries;
+        de.is_atomic = st->cur_seg_is_atomic;
+        de.atomic_addrs = st->cur_seg_atomic_addrs;
+        st->cur_seg_atomic_addrs = NULL; /* ownership transferred */
+        g_array_append_val(st->seg_dir, de);
+    } else if (st->cur_seg_atomic_addrs) {
+        g_hash_table_unref(st->cur_seg_atomic_addrs);
+        st->cur_seg_atomic_addrs = NULL;
+    }
+}
+
+/*
+ * Open a new thread segment.
+ */
+static void body_stream_open_segment(BodyStreamState *st,
+                                     uint32_t thread_id, bool is_atomic)
+{
+    st->cur_seg_thread_id = thread_id;
+    st->cur_seg_start_bits = bw_tell_bits(&st->bw);
+    st->cur_seg_num_entries = 0;
+    st->cur_seg_is_atomic = is_atomic;
+    st->cur_seg_atomic_addrs = g_hash_table_new(g_direct_hash, g_direct_equal);
+}
+
+/*
+ * Check whether a BB template contains any SYNC_ATOMIC instruction.
+ */
+static bool template_has_atomic(const BBTemplate *tmpl)
+{
+    if (!tmpl) {
+        return false;
+    }
+    for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+        if (tmpl->insn_fields[i].sync_hint == SYNC_ATOMIC) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Collect atomic memory addresses from a body entry's dynamic params
+ * that correspond to SYNC_ATOMIC instructions in the template.
+ * Adds them to the current segment's atomic address set.
+ */
+static void body_stream_collect_atomic_addrs(BodyStreamState *st,
+                                             const BBTemplate *tmpl,
+                                             const BodyEntry *entry)
+{
+    if (!st->cur_seg_atomic_addrs || !tmpl || !entry->dyn_params) {
+        return;
+    }
+
+    /*
+     * Walk the template's instructions and the dynamic params in parallel.
+     * Each load/store instruction produces one DynParam with the memory address.
+     * We want addresses from instructions that have sync_hint == SYNC_ATOMIC.
+     */
+    uint32_t dyn_idx = 0;
+    for (uint32_t i = 0; i < tmpl->n_insns && dyn_idx < entry->dyn_params->len; i++) {
+        const InsnFields *fld = &tmpl->insn_fields[i];
+        /*
+         * Count how many DynParam entries this instruction contributes
+         * (one per memory access: load or store).
+         */
+        uint32_t dyn_start = dyn_idx;
+        while (dyn_idx < entry->dyn_params->len) {
+            const DynParam *dp = &g_array_index(entry->dyn_params,
+                                                DynParam, dyn_idx);
+            if (dp->type == DYN_LOAD_ADDR || dp->type == DYN_STORE_ADDR) {
+                if (fld->sync_hint == SYNC_ATOMIC) {
+                    g_hash_table_add(st->cur_seg_atomic_addrs,
+                                     GUINT_TO_POINTER((guintptr)dp->value));
+                }
+                dyn_idx++;
+            } else {
+                break;
+            }
+            /* Each instruction produces at most one load or store DynParam
+             * in the current scheme, so break after the first. */
+            break;
+        }
+        /* If no DynParam was consumed, this instruction had no mem access */
+        if (dyn_idx == dyn_start && fld->sync_hint == SYNC_ATOMIC) {
+            /* Atomic instruction with no memory operand recorded (e.g. fence).
+             * Nothing to add to the address set. */
+        }
+    }
+}
+
+/*
+ * Serialise the thread segment directory into the binary footer.
+ * Format: num_segments(ULEB128) followed by per-segment records.
+ */
+static void body_stream_write_seg_directory(BodyStreamState *st)
+{
+    if (!st->seg_dir) {
+        return;
+    }
+
+    bw_write_uleb128(&st->bw, st->seg_dir->len);
+
+    for (guint i = 0; i < st->seg_dir->len; i++) {
+        const SegmentDirEntry *de = &g_array_index(st->seg_dir,
+                                                    SegmentDirEntry, i);
+        bw_write_uleb128(&st->bw, de->thread_id);
+        bw_write_uleb128(&st->bw, de->body_bit_offset);
+        bw_write_uleb128(&st->bw, de->num_entries);
+
+        uint8_t seg_flags = de->is_atomic ? 1 : 0;
+        bw_write_bits(&st->bw, seg_flags, 8);
+
+        uint32_t n_addrs = de->atomic_addrs
+            ? g_hash_table_size(de->atomic_addrs) : 0;
+        bw_write_uleb128(&st->bw, n_addrs);
+
+        if (n_addrs > 0) {
+            GHashTableIter iter;
+            gpointer key;
+            g_hash_table_iter_init(&iter, de->atomic_addrs);
+            while (g_hash_table_iter_next(&iter, &key, NULL)) {
+                bw_write_uleb128(&st->bw, (uint64_t)(guintptr)key);
+            }
+        }
+    }
+}
+
+/*
+ * Free all segment directory entries' atomic_addrs hash tables.
+ */
+static void body_stream_free_seg_directory(BodyStreamState *st)
+{
+    if (!st->seg_dir) {
+        return;
+    }
+    for (guint i = 0; i < st->seg_dir->len; i++) {
+        SegmentDirEntry *de = &g_array_index(st->seg_dir,
+                                              SegmentDirEntry, i);
+        if (de->atomic_addrs) {
+            g_hash_table_unref(de->atomic_addrs);
+            de->atomic_addrs = NULL;
+        }
+    }
+    g_array_free(st->seg_dir, TRUE);
+    st->seg_dir = NULL;
 }
 
 static void body_stream_finish(BodyStreamState *st)
@@ -2983,8 +3177,19 @@ static void body_stream_finish(BodyStreamState *st)
     uint64_t footer_start_bits;
     uint64_t end_bits;
 
+    /* Close the final thread segment */
+    if (enable_threads) {
+        body_stream_close_segment(st);
+    }
+
     bw_write_bits(&st->bw, BODY_TAG_END, 2); /* end of body */
     footer_start_bits = bw_tell_bits(&st->bw);
+
+    /* Write thread segment directory (before templates, after body end) */
+    if (enable_threads && st->seg_dir) {
+        body_stream_write_seg_directory(st);
+    }
+
     bw_write_uleb128(&st->bw, st->num_entries);
     g_mutex_lock(&data_lock);
     write_bin_templates(&st->bw);
@@ -2997,6 +3202,13 @@ static void body_stream_finish(BodyStreamState *st)
 
     g_hash_table_unref(st->cp_dyn_state);
     g_hash_table_unref(st->wp_dyn_state);
+
+    if (enable_threads) {
+        body_stream_free_seg_directory(st);
+        if (st->cur_seg_atomic_addrs) {
+            g_hash_table_unref(st->cur_seg_atomic_addrs);
+        }
+    }
 }
 
 /* ========================= Trace State Management ========================= */
@@ -3121,7 +3333,8 @@ static void start_trace_segment(const char *label,
     }
 
     current_segment = trace_segment_new(label, start, stop);
-    current_segment->thread_id = 0;
+    current_segment->thread_id = enable_threads
+        ? get_or_assign_thread_id(0) : 0;
     current_segment->body_seq_num = 0;
 
     /* Capture segment start time into the segment (used by both binary
@@ -3375,12 +3588,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
             g_array_set_size(cp_mem_accesses, 0);
         }
 
-        /* Run wrong-path execution if enabled and target is known.
-         * Wrong-path is suppressed when the previous BB ends with a
-         * pending sync event (yield / futex), because the control-flow
-         * edge is dictated by the scheduler, not the branch predictor. */
-        if (enable_wrong_path && wrong_target != 0 &&
-            !(sync_event_queue && sync_event_queue->len > 0)) {
+        /* Run wrong-path execution if enabled and target is known. */
+        if (enable_wrong_path && wrong_target != 0) {
             entry.wp_entries = simulate_wrong_path_ext(
                 prev_last, current_pc, wrong_target,
                 true,
@@ -3392,41 +3601,42 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         if (seg->bin_stream) {
             /* Emit THREAD_SWITCH when execution moves to a different vCPU */
             if (enable_threads && (int64_t)cpu_index != last_exec_cpu_index) {
+                uint32_t new_tid = get_or_assign_thread_id(cpu_index);
+                /* Close previous thread's segment */
+                body_stream_close_segment(seg->bin_stream);
+
                 SyncEvent ts = { .type = SYNC_THREAD_SWITCH,
-                                 .addr = (uint64_t)cpu_index };
+                                 .addr = (uint64_t)new_tid };
                 body_stream_write_sync_event(seg->bin_stream, &ts);
                 if (seg->text_body_tmp) {
                     fprintf(seg->text_body_tmp,
-                            "SYNC type=THREAD_SWITCH thread=%u\n", cpu_index);
+                            "SYNC type=THREAD_SWITCH thread=%u\n", new_tid);
                 }
                 last_exec_cpu_index = (int64_t)cpu_index;
+
+                /* Open new segment for the new thread */
+                bool is_atomic = template_has_atomic(cp_tmpl);
+                body_stream_open_segment(seg->bin_stream, new_tid, is_atomic);
             }
-            /* Flush queued sync events (YIELD/FUTEX_*) before the body entry */
-            if (enable_threads && sync_event_queue && sync_event_queue->len > 0) {
-                static const char * const sync_type_names[] = {
-                    [SYNC_NONE]         = "NONE",
-                    [SYNC_YIELD]        = "YIELD",
-                    [SYNC_FUTEX_WAIT]   = "FUTEX_WAIT",
-                    [SYNC_FUTEX_WAKE]   = "FUTEX_WAKE",
-                    [SYNC_THREAD_SWITCH]= "THREAD_SWITCH",
-                    [SYNC_ATOMIC]       = "ATOMIC",
-                };
-                for (guint si = 0; si < sync_event_queue->len; si++) {
-                    const SyncEvent *ev = &g_array_index(
-                        sync_event_queue, SyncEvent, si);
-                    body_stream_write_sync_event(seg->bin_stream, ev);
-                    if (seg->text_body_tmp) {
-                        if (ev->type == SYNC_YIELD) {
-                            fprintf(seg->text_body_tmp, "SYNC type=YIELD\n");
-                        } else {
-                            fprintf(seg->text_body_tmp,
-                                    "SYNC type=%s addr=0x%" PRIx64 "\n",
-                                    sync_type_names[ev->type], ev->addr);
-                        }
-                    }
+
+            /*
+             * Atomic BB isolation: if this BB contains atomic instructions,
+             * emit it as its own 1-entry segment with segment breaks around it.
+             */
+            bool bb_is_atomic = template_has_atomic(cp_tmpl);
+            if (enable_threads && bb_is_atomic) {
+                /* Close the current (regular) segment before the atomic BB */
+                if (!seg->bin_stream->cur_seg_is_atomic &&
+                    seg->bin_stream->cur_seg_num_entries > 0) {
+                    body_stream_close_segment(seg->bin_stream);
+                    uint32_t tid = get_or_assign_thread_id(cpu_index);
+                    body_stream_open_segment(seg->bin_stream, tid, true);
+                } else if (!seg->bin_stream->cur_seg_is_atomic) {
+                    /* Segment has 0 entries — just mark it atomic */
+                    seg->bin_stream->cur_seg_is_atomic = true;
                 }
-                g_array_set_size(sync_event_queue, 0);
             }
+
             /* Flush queued memalloc events before the body entry */
             if (enable_mem_alloc && memalloc_event_queue &&
                 memalloc_event_queue->len > 0) {
@@ -3454,7 +3664,25 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
                 }
                 g_array_set_size(memalloc_event_queue, 0);
             }
+
             body_stream_write_entry(seg->bin_stream, &entry);
+            seg->bin_stream->cur_seg_num_entries++;
+
+            /* Collect atomic addresses for the segment directory */
+            if (enable_threads && bb_is_atomic) {
+                body_stream_collect_atomic_addrs(seg->bin_stream,
+                                                 cp_tmpl, &entry);
+            }
+
+            /*
+             * After writing an atomic BB, close the atomic segment and
+             * open a fresh regular segment for subsequent BBs.
+             */
+            if (enable_threads && bb_is_atomic) {
+                body_stream_close_segment(seg->bin_stream);
+                uint32_t tid = get_or_assign_thread_id(cpu_index);
+                body_stream_open_segment(seg->bin_stream, tid, false);
+            }
         }
         if (seg->text_body_tmp) {
             write_text_body_entry(seg->text_body_tmp, &entry);
@@ -3725,24 +3953,6 @@ static void vcpu_syscall_cb(qemu_plugin_id_t id, unsigned int vcpu_index,
             pending_mem_syscall.a3 = a3;
         }
     }
-
-    if (enable_threads) {
-        if (num == sync_syscall_nums.nr_futex) {
-            /*
-             * FUTEX_WAIT (op & 0x7f == 0) or FUTEX_WAIT_BITSET (op & 0x7f == 9):
-             * the thread is about to sleep.  Record the futex word address so the
-             * return handler can emit SYNC_FUTEX_WAIT / SYNC_FUTEX_WAKE.
-             */
-            int64_t op = (int64_t)a2 & 0x7f;  /* strip FUTEX_PRIVATE_FLAG */
-            if (op == 0 || op == 9) {           /* FUTEX_WAIT / FUTEX_WAIT_BITSET */
-                pending_sync_syscall.nr = num;
-                pending_sync_syscall.a1 = a1;
-                pending_sync_syscall.a2 = (int64_t)a2;
-            }
-        } else if (num == sync_syscall_nums.nr_sched_yield) {
-            pending_sync_syscall.nr = num;
-        }
-    }
 }
 
 /*
@@ -3816,36 +4026,6 @@ static void vcpu_syscall_ret_cb(qemu_plugin_id_t id, unsigned int vcpu_index,
             }
             g_array_append_val(memalloc_event_queue, ev);
         }
-    }
-
-    /* --- sync event tracking (threads mode only) --- */
-    if (enable_threads && pending_sync_syscall.nr == num && trace_active) {
-        SyncEvent ev = {0};
-        bool valid = false;
-
-        if (num == sync_syscall_nums.nr_sched_yield) {
-            ev.type = SYNC_YIELD;
-            valid = true;
-        } else if (num == sync_syscall_nums.nr_futex) {
-            /*
-             * We only tracked FUTEX_WAIT on entry, so any return is
-             * SYNC_FUTEX_WAKE (the thread was woken, timed out, or signalled).
-             */
-            ev.type = SYNC_FUTEX_WAKE;
-            ev.addr = pending_sync_syscall.a1;
-            valid = true;
-        }
-
-        pending_sync_syscall.nr = -1;
-
-        if (valid) {
-            if (!sync_event_queue) {
-                sync_event_queue = g_array_new(FALSE, FALSE, sizeof(SyncEvent));
-            }
-            g_array_append_val(sync_event_queue, ev);
-        }
-    } else {
-        pending_sync_syscall.nr = -1;
     }
 }
 
@@ -4340,42 +4520,15 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         }
     }
 
-    /* Initialise sync syscall number table (needed for threads=1) */
+    /* Initialise thread ID mapping (needed for threads=1) */
     if (enable_threads) {
-        switch (trace_isa) {
-        case TRACE_ISA_X86:
-            sync_syscall_nums.nr_futex       = 202;
-            sync_syscall_nums.nr_sched_yield = 24;
-            break;
-        case TRACE_ISA_AARCH64:
-        case TRACE_ISA_RISCV:
-            sync_syscall_nums.nr_futex       = 98;
-            sync_syscall_nums.nr_sched_yield = 124;
-            break;
-        case TRACE_ISA_MIPS:
-            if (g_str_has_prefix(target_name, "mipsel") ||
-                g_str_has_prefix(target_name, "mips32")) {
-                /* MIPS32 O32 ABI */
-                sync_syscall_nums.nr_futex       = 4238;
-                sync_syscall_nums.nr_sched_yield = 4162;
-            } else {
-                /* MIPS64 N64 ABI */
-                sync_syscall_nums.nr_futex       = 5238;
-                sync_syscall_nums.nr_sched_yield = 5162;
-            }
-            break;
-        default:
-            fprintf(stderr,
-                    "wptrace: threads sync tracking not supported for ISA '%s'\n",
-                    target_name);
-            break;
-        }
+        cpu_to_thread_id = g_hash_table_new(g_direct_hash, g_direct_equal);
     }
 
     /* Register callbacks */
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
     qemu_plugin_register_flush_cb(id, vcpu_tb_flush);
-    if (enable_mem_alloc || enable_threads) {
+    if (enable_mem_alloc) {
         qemu_plugin_register_vcpu_syscall_cb(id, vcpu_syscall_cb);
         qemu_plugin_register_vcpu_syscall_ret_cb(id, vcpu_syscall_ret_cb);
     }

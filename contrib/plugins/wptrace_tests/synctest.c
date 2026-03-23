@@ -7,14 +7,19 @@
  *
  *   - C11 atomic flag (spinlock) → sync=ATOMIC on load/store instructions
  *   - Atomic counter increment   → sync=ATOMIC with shared address
- *   - pthread_mutex_lock/unlock  → FUTEX_WAKE sync events
- *   - sched_yield                → YIELD sync events
  *   - THREAD_SWITCH              → thread interleaving markers
+ *
+ * Synchronisation detection is based entirely on atomic/locked memory
+ * operations — no system-call interception is used.  Every userspace
+ * synchronisation primitive ultimately resolves to atomic memory
+ * operations on shared addresses.
  *
  * A consuming simulator uses sync=ATOMIC annotations plus memory
  * addresses from MEMDATA records to track synchronization objects.
  * Two threads touching the same sync address implies a dependency;
- * between sync points, threads may execute in parallel.
+ * between sync points, threads may execute in parallel.  Atomic BBs
+ * are isolated as 1-BB segments in the Thread Segment Directory so
+ * ChampSim can use them as preemption points.
  *
  * Compiled with: -static -pthread
  * Used with plugin option: threads=1

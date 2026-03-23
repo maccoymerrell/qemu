@@ -50,6 +50,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
 static int max_wrong_path_depth = 64;
 static bool enable_wrong_path = true;
+static bool enable_smith_predictor = false;
 static bool enable_debug_text = false;
 static char *output_base_path = NULL;
 static char *unknown_warn_path = NULL;
@@ -275,6 +276,7 @@ enum PluginOptId {
     OPT_MEMDATA,
     OPT_MEMALLOC,
     OPT_THREADS,
+    OPT_SMITH,
 };
 
 /*
@@ -3211,7 +3213,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         if (enable_wrong_path && wrong_target != 0) {
             entry.wp_entries = simulate_wrong_path_ext(
                 prev_last, current_pc, wrong_target,
-                true,
+                enable_smith_predictor,
                 cpu_index);
         } else if (wrong_target == 0) {
             stat_wp_skipped++;
@@ -3855,6 +3857,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             {"spinterval", OPT_SPINTERVAL},
             {"comment", OPT_COMMENT}, {"memdata", OPT_MEMDATA},
             {"memalloc", OPT_MEMALLOC}, {"threads", OPT_THREADS},
+            {"smith", OPT_SMITH},
             {NULL, 0}
         };
         for (int i = 0; opt_entries[i].name; i++) {
@@ -3923,6 +3926,9 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             break;
         case OPT_THREADS:
             enable_threads = (atoi(tokens[1]) != 0);
+            break;
+        case OPT_SMITH:
+            enable_smith_predictor = (atoi(tokens[1]) != 0);
             break;
         }
     }

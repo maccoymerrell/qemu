@@ -5,6 +5,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
+#include "qemu/qemu-plugin.h"
 #include "disas/dis-asm.h"
 #include "disas/capstone.h"
 
@@ -334,6 +335,461 @@ bool cap_disas_plugin(disassemble_info *info, uint64_t pc, size_t size)
                            cap_insn->mnemonic, cap_insn->op_str);
     }
 
+    cs_close(&handle);
+    return true;
+}
+
+/*
+ * Map a Capstone generic group ID (CS_GRP_*) to a QEMU_PLUGIN_GRP_* bit.
+ */
+static uint16_t cap_group_to_plugin_bit(uint8_t grp)
+{
+    switch (grp) {
+    case CS_GRP_JUMP:            return QEMU_PLUGIN_GRP_JUMP;
+    case CS_GRP_CALL:            return QEMU_PLUGIN_GRP_CALL;
+    case CS_GRP_RET:             return QEMU_PLUGIN_GRP_RET;
+    case CS_GRP_INT:             return QEMU_PLUGIN_GRP_INT;
+    case CS_GRP_IRET:            return QEMU_PLUGIN_GRP_IRET;
+    case CS_GRP_PRIVILEGE:       return QEMU_PLUGIN_GRP_PRIVILEGE;
+    case CS_GRP_BRANCH_RELATIVE: return QEMU_PLUGIN_GRP_BRANCH_REL;
+    default:                     return 0;
+    }
+}
+
+/*
+ * Copy a Capstone register name into a fixed-size buffer.
+ */
+static void cap_copy_reg_name(char *dst, size_t dstsz,
+                              csh handle, unsigned int reg_id)
+{
+    if (reg_id == 0) {
+        dst[0] = '\0';
+        return;
+    }
+    const char *name = cs_reg_name(handle, reg_id);
+    if (name) {
+        g_strlcpy(dst, name, dstsz);
+    } else {
+        dst[0] = '\0';
+    }
+}
+
+/*
+ * Extract per-operand detail for x86 into the plugin operand struct.
+ */
+static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
+                                  qemu_plugin_insn_info *out)
+{
+    const cs_x86 *x86 = &insn->detail->x86;
+    uint8_t n = MIN(x86->op_count, QEMU_PLUGIN_INSN_DETAIL_MAX_OPS);
+    out->n_operands = n;
+
+    for (uint8_t i = 0; i < n; i++) {
+        const cs_x86_op *cop = &x86->operands[i];
+        qemu_plugin_operand *op = &out->operands[i];
+
+        op->type = cop->type;
+        op->access = cop->access;
+        op->size = cop->size;
+
+        switch (cop->type) {
+        case X86_OP_REG:
+            cap_copy_reg_name(op->reg_name,
+                              QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                              handle, cop->reg);
+            op->reg_id     = cop->reg;
+            op->index_name[0] = '\0';
+            op->index_id   = 0;
+            op->imm = 0;
+            break;
+        case X86_OP_IMM:
+            op->imm = cop->imm;
+            op->reg_name[0] = '\0';
+            op->reg_id     = 0;
+            op->index_name[0] = '\0';
+            op->index_id   = 0;
+            break;
+        case X86_OP_MEM:
+            cap_copy_reg_name(op->reg_name,
+                              QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                              handle, cop->mem.base);
+            op->reg_id     = cop->mem.base;
+            cap_copy_reg_name(op->index_name,
+                              QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                              handle, cop->mem.index);
+            op->index_id   = cop->mem.index;
+            op->imm = cop->mem.disp;
+            break;
+        default:
+            op->reg_name[0] = '\0';
+            op->reg_id     = 0;
+            op->index_name[0] = '\0';
+            op->index_id   = 0;
+            op->imm = 0;
+            break;
+        }
+    }
+
+    /* x86 prefixes */
+    out->has_lock = (x86->prefix[0] == X86_PREFIX_LOCK);
+    out->has_rep = (x86->prefix[0] == X86_PREFIX_REP ||
+                    x86->prefix[0] == X86_PREFIX_REPNE);
+}
+
+/*
+ * Extract per-operand detail for AArch64 into the plugin operand struct.
+ */
+static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
+                                    qemu_plugin_insn_info *out)
+{
+    const cs_arm64 *a64 = &insn->detail->arm64;
+    uint8_t n = MIN(a64->op_count, QEMU_PLUGIN_INSN_DETAIL_MAX_OPS);
+    out->n_operands = n;
+
+    for (uint8_t i = 0; i < n; i++) {
+        const cs_arm64_op *cop = &a64->operands[i];
+        qemu_plugin_operand *op = &out->operands[i];
+
+        op->type = cop->type;
+        op->access = cop->access;
+        op->size = 0; /* AArch64 Capstone doesn't provide per-op size */
+
+        switch (cop->type) {
+        case ARM64_OP_REG:
+            cap_copy_reg_name(op->reg_name,
+                              QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                              handle, cop->reg);
+            op->reg_id     = cop->reg;
+            op->index_name[0] = '\0';
+            op->index_id   = 0;
+            op->imm = 0;
+            break;
+        case ARM64_OP_IMM:
+            op->imm = cop->imm;
+            op->reg_name[0] = '\0';
+            op->reg_id     = 0;
+            op->index_name[0] = '\0';
+            op->index_id   = 0;
+            break;
+        case ARM64_OP_MEM:
+            cap_copy_reg_name(op->reg_name,
+                              QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                              handle, cop->mem.base);
+            op->reg_id     = cop->mem.base;
+            cap_copy_reg_name(op->index_name,
+                              QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                              handle, cop->mem.index);
+            op->index_id   = cop->mem.index;
+            op->imm = cop->mem.disp;
+            break;
+        default:
+            op->reg_name[0] = '\0';
+            op->reg_id     = 0;
+            op->index_name[0] = '\0';
+            op->index_id   = 0;
+            op->imm = 0;
+            break;
+        }
+    }
+}
+
+/*
+ * Extract per-operand detail for RISC-V or MIPS (no access info).
+ */
+static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
+                                      qemu_plugin_insn_info *out,
+                                      int cap_arch)
+{
+    const cs_detail *detail = insn->detail;
+    uint8_t n;
+
+    if (cap_arch == CS_ARCH_RISCV) {
+        n = MIN(detail->riscv.op_count, QEMU_PLUGIN_INSN_DETAIL_MAX_OPS);
+        out->n_operands = n;
+        for (uint8_t i = 0; i < n; i++) {
+            const cs_riscv_op *cop = &detail->riscv.operands[i];
+            qemu_plugin_operand *op = &out->operands[i];
+            op->type = cop->type;
+            op->access = 0; /* RISC-V Capstone lacks access info */
+            op->size = 0;
+            switch (cop->type) {
+            case RISCV_OP_REG:
+                cap_copy_reg_name(op->reg_name,
+                                  QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                                  handle, cop->reg);
+                op->reg_id     = cop->reg;
+                op->index_name[0] = '\0';
+                op->index_id   = 0;
+                op->imm = 0;
+                break;
+            case RISCV_OP_IMM:
+                op->imm = cop->imm;
+                op->reg_name[0] = '\0';
+                op->reg_id     = 0;
+                op->index_name[0] = '\0';
+                op->index_id   = 0;
+                break;
+            case RISCV_OP_MEM:
+                cap_copy_reg_name(op->reg_name,
+                                  QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                                  handle, cop->mem.base);
+                op->reg_id     = cop->mem.base;
+                op->index_name[0] = '\0';
+                op->index_id   = 0;
+                op->imm = cop->mem.disp;
+                break;
+            default:
+                op->reg_name[0] = '\0';
+                op->reg_id     = 0;
+                op->index_name[0] = '\0';
+                op->index_id   = 0;
+                op->imm = 0;
+                break;
+            }
+        }
+    } else if (cap_arch == CS_ARCH_MIPS) {
+        n = MIN(detail->mips.op_count, QEMU_PLUGIN_INSN_DETAIL_MAX_OPS);
+        out->n_operands = n;
+        for (uint8_t i = 0; i < n; i++) {
+            const cs_mips_op *cop = &detail->mips.operands[i];
+            qemu_plugin_operand *op = &out->operands[i];
+            op->type = cop->type;
+            op->access = 0; /* MIPS Capstone lacks access info */
+            op->size = 0;
+            switch (cop->type) {
+            case MIPS_OP_REG:
+                cap_copy_reg_name(op->reg_name,
+                                  QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                                  handle, cop->reg);
+                op->reg_id     = cop->reg;
+                op->index_name[0] = '\0';
+                op->index_id   = 0;
+                op->imm = 0;
+                break;
+            case MIPS_OP_IMM:
+                op->imm = cop->imm;
+                op->reg_name[0] = '\0';
+                op->reg_id     = 0;
+                op->index_name[0] = '\0';
+                op->index_id   = 0;
+                break;
+            case MIPS_OP_MEM:
+                cap_copy_reg_name(op->reg_name,
+                                  QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                                  handle, cop->mem.base);
+                op->reg_id     = cop->mem.base;
+                op->index_name[0] = '\0';
+                op->index_id   = 0;
+                op->imm = cop->mem.disp;
+                break;
+            default:
+                op->reg_name[0] = '\0';
+                op->reg_id     = 0;
+                op->index_name[0] = '\0';
+                op->index_id   = 0;
+                op->imm = 0;
+                break;
+            }
+        }
+    } else {
+        out->n_operands = 0;
+    }
+}
+
+/*
+ * Disassemble a single instruction with Capstone CS_OPT_DETAIL enabled
+ * and fill a qemu_plugin_insn_info struct with the structured results.
+ */
+bool cap_disas_plugin_detail(disassemble_info *info, uint64_t pc, size_t size,
+                             struct qemu_plugin_insn_info *out)
+{
+    uint8_t cap_buf[32];
+    const uint8_t *cbuf = cap_buf;
+    csh handle;
+    cs_insn *insn;
+
+    memset(out, 0, sizeof(*out));
+
+    if (cap_disas_start(info, &handle) != CS_ERR_OK) {
+        return false;
+    }
+
+    cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+
+    /*
+     * Allocate a fresh cs_insn AFTER enabling detail mode.
+     * In Capstone 5, cs_malloc only allocates the detail sub-struct
+     * when CS_OPT_DETAIL is already enabled on the handle.  The
+     * module-level cap_insn was allocated without detail and has
+     * detail == NULL.
+     */
+    insn = cs_malloc(handle);
+    if (!insn) {
+        cs_close(&handle);
+        return false;
+    }
+
+    assert(size < sizeof(cap_buf));
+    info->read_memory_func(pc, cap_buf, size, info);
+
+    if (!cs_disasm_iter(handle, &cbuf, &size, &pc, insn)) {
+        cs_free(insn, 1);
+        cs_close(&handle);
+        return false;
+    }
+
+    /* Copy mnemonic and operand string */
+    g_strlcpy(out->mnemonic, insn->mnemonic,
+              QEMU_PLUGIN_INSN_DETAIL_MNEMSZ);
+    g_strlcpy(out->op_str, insn->op_str,
+              QEMU_PLUGIN_INSN_DETAIL_OPSTRSZ);
+    out->insn_id = insn->id;
+
+    if (insn->detail) {
+        const cs_detail *detail = insn->detail;
+
+        /* Groups → bitmask */
+        for (uint8_t i = 0; i < detail->groups_count; i++) {
+            out->groups |= cap_group_to_plugin_bit(detail->groups[i]);
+        }
+
+        /* Implicit register reads */
+        out->n_regs_read = MIN(detail->regs_read_count,
+                               QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS);
+        for (uint8_t i = 0; i < out->n_regs_read; i++) {
+            cap_copy_reg_name(out->regs_read[i],
+                              QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                              handle, detail->regs_read[i]);
+            out->regs_read_id[i] = detail->regs_read[i];
+        }
+
+        /* Implicit register writes */
+        out->n_regs_write = MIN(detail->regs_write_count,
+                                QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS);
+        for (uint8_t i = 0; i < out->n_regs_write; i++) {
+            cap_copy_reg_name(out->regs_write[i],
+                              QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                              handle, detail->regs_write[i]);
+            out->regs_write_id[i] = detail->regs_write[i];
+        }
+
+        /* Per-operand detail — ISA-specific extraction */
+        switch (info->cap_arch) {
+        case CS_ARCH_X86:
+            cap_fill_x86_operands(handle, insn, out);
+            break;
+        case CS_ARCH_ARM64:
+            cap_fill_arm64_operands(handle, insn, out);
+            break;
+        default:
+            cap_fill_generic_operands(handle, insn, out,
+                                      info->cap_arch);
+            break;
+        }
+    }
+
+    cs_free(insn, 1);
+    cs_close(&handle);
+    return true;
+}
+
+/*
+ * Decode raw instruction bytes with a standalone Capstone handle.
+ *
+ * Unlike cap_disas_plugin_detail() this does not need a disassemble_info
+ * (no CPU state) — it opens its own Capstone context with the caller-
+ * supplied arch/mode and decodes directly from the byte buffer.  This
+ * lets plugins decode any ISA that Capstone supports, regardless of
+ * whether QEMU's per-target code uses Capstone internally.
+ */
+bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
+                          const uint8_t *data, size_t data_size,
+                          uint64_t pc, struct qemu_plugin_insn_info *out)
+{
+    csh handle;
+    cs_insn *insn;
+    cs_err err;
+
+    memset(out, 0, sizeof(*out));
+
+    err = cs_open(cap_arch, cap_mode, &handle);
+    if (err != CS_ERR_OK) {
+        return false;
+    }
+
+    /* x86 AT&T syntax to match QEMU's default disassembly style */
+    if (cap_arch == CS_ARCH_X86) {
+        cs_option(handle, CS_OPT_SYNTAX, CS_OPT_SYNTAX_ATT);
+    }
+
+    cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+
+    insn = cs_malloc(handle);
+    if (!insn) {
+        cs_close(&handle);
+        return false;
+    }
+
+    const uint8_t *code = data;
+    size_t sz = data_size;
+    uint64_t addr = pc;
+
+    if (!cs_disasm_iter(handle, &code, &sz, &addr, insn)) {
+        cs_free(insn, 1);
+        cs_close(&handle);
+        return false;
+    }
+
+    /* Copy mnemonic and operand string */
+    g_strlcpy(out->mnemonic, insn->mnemonic,
+              QEMU_PLUGIN_INSN_DETAIL_MNEMSZ);
+    g_strlcpy(out->op_str, insn->op_str,
+              QEMU_PLUGIN_INSN_DETAIL_OPSTRSZ);
+    out->insn_id = insn->id;
+
+    if (insn->detail) {
+        const cs_detail *detail = insn->detail;
+
+        /* Groups → bitmask */
+        for (uint8_t i = 0; i < detail->groups_count; i++) {
+            out->groups |= cap_group_to_plugin_bit(detail->groups[i]);
+        }
+
+        /* Implicit register reads */
+        out->n_regs_read = MIN(detail->regs_read_count,
+                               QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS);
+        for (uint8_t i = 0; i < out->n_regs_read; i++) {
+            cap_copy_reg_name(out->regs_read[i],
+                              QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                              handle, detail->regs_read[i]);
+            out->regs_read_id[i] = detail->regs_read[i];
+        }
+
+        /* Implicit register writes */
+        out->n_regs_write = MIN(detail->regs_write_count,
+                                QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS);
+        for (uint8_t i = 0; i < out->n_regs_write; i++) {
+            cap_copy_reg_name(out->regs_write[i],
+                              QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                              handle, detail->regs_write[i]);
+            out->regs_write_id[i] = detail->regs_write[i];
+        }
+
+        /* Per-operand detail — ISA-specific extraction */
+        switch (cap_arch) {
+        case CS_ARCH_X86:
+            cap_fill_x86_operands(handle, insn, out);
+            break;
+        case CS_ARCH_ARM64:
+            cap_fill_arm64_operands(handle, insn, out);
+            break;
+        default:
+            cap_fill_generic_operands(handle, insn, out, cap_arch);
+            break;
+        }
+    }
+
+    cs_free(insn, 1);
     cs_close(&handle);
     return true;
 }

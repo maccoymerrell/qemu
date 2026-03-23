@@ -308,6 +308,20 @@ char *qemu_plugin_insn_disas(const struct qemu_plugin_insn *insn)
                         insn->vaddr, insn->len);
 }
 
+bool qemu_plugin_insn_detail(const struct qemu_plugin_insn *insn,
+                             qemu_plugin_insn_info *info)
+{
+    return plugin_disas_detail(tcg_ctx->cpu, tcg_ctx->plugin_db,
+                               insn->vaddr, insn->len, info);
+}
+
+bool qemu_plugin_cap_decode(int cap_arch, unsigned int cap_mode,
+                            const uint8_t *data, size_t size,
+                            uint64_t pc, qemu_plugin_insn_info *info)
+{
+    return cap_disas_raw_detail(cap_arch, cap_mode, data, size, pc, info);
+}
+
 const char *qemu_plugin_insn_symbol(const struct qemu_plugin_insn *insn)
 {
     const char *sym = lookup_symbol(insn->vaddr);

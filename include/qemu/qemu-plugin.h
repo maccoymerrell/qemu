@@ -72,11 +72,15 @@ typedef uint64_t qemu_plugin_id_t;
  *   qemu_plugin_cpu_state_free (CPU state snapshot/rollback)
  * - added qemu_plugin_set_pc, qemu_plugin_get_pc (program counter access)
  * - added qemu_plugin_exec_inline_insn (execute one instruction)
+ *
+ * version 6:
+ * - added qemu_plugin_insn_detail (structured Capstone detail for
+ *   instruction operands, groups, and implicit registers)
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 5
+#define QEMU_PLUGIN_VERSION 6
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -765,6 +769,132 @@ qemu_plugin_register_vcpu_syscall_ret_cb(qemu_plugin_id_t id,
 QEMU_PLUGIN_API
 char *qemu_plugin_insn_disas(const struct qemu_plugin_insn *insn);
 
+/*
+ * Structured instruction detail from Capstone.
+ *
+ * Provides operand types, access modes, implicit registers, and
+ * instruction group classification without string parsing.
+ * Register names are ISA-native Capstone register name strings.
+ */
+
+#define QEMU_PLUGIN_INSN_DETAIL_MAX_OPS    8
+#define QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS  12
+#define QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ 12
+#define QEMU_PLUGIN_INSN_DETAIL_MNEMSZ     32
+#define QEMU_PLUGIN_INSN_DETAIL_OPSTRSZ    160
+
+/* Operand types (matching Capstone cs_op_type) */
+#define QEMU_PLUGIN_OP_INVALID 0
+#define QEMU_PLUGIN_OP_REG     1
+#define QEMU_PLUGIN_OP_IMM     2
+#define QEMU_PLUGIN_OP_MEM     3
+
+/* Operand access mode (bitmask) */
+#define QEMU_PLUGIN_OP_ACC_READ  1
+#define QEMU_PLUGIN_OP_ACC_WRITE 2
+
+/* Instruction group flags (bitmask) */
+#define QEMU_PLUGIN_GRP_JUMP       (1u << 0)
+#define QEMU_PLUGIN_GRP_CALL       (1u << 1)
+#define QEMU_PLUGIN_GRP_RET        (1u << 2)
+#define QEMU_PLUGIN_GRP_INT        (1u << 3)
+#define QEMU_PLUGIN_GRP_IRET       (1u << 4)
+#define QEMU_PLUGIN_GRP_PRIVILEGE  (1u << 5)
+#define QEMU_PLUGIN_GRP_BRANCH_REL (1u << 6)
+
+typedef struct qemu_plugin_operand {
+    uint8_t  type;     /* QEMU_PLUGIN_OP_* */
+    uint8_t  access;   /* bitmask of QEMU_PLUGIN_OP_ACC_*, 0 if unknown */
+    uint8_t  size;     /* operand size in bytes */
+    uint8_t  _pad;
+    uint16_t reg_id;   /* Capstone register ID for reg_name (0 = none) */
+    uint16_t index_id; /* Capstone register ID for index_name (0 = none) */
+    int64_t  imm;      /* IMM value, or MEM displacement */
+    /* REG name (or MEM base register name); empty string if none */
+    char     reg_name[QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ];
+    /* MEM index register name; empty string if none or not MEM */
+    char     index_name[QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ];
+} qemu_plugin_operand;
+
+typedef struct qemu_plugin_insn_info {
+    uint32_t insn_id;     /* Capstone instruction ID (X86_INS_*, ARM64_INS_*) */
+    uint16_t groups;      /* bitmask of QEMU_PLUGIN_GRP_* */
+    uint8_t  n_operands;
+    uint8_t  n_regs_read;
+    uint8_t  n_regs_write;
+    bool     has_lock;    /* x86 LOCK prefix detected */
+    bool     has_rep;     /* x86 REP/REPNZ prefix detected */
+    uint8_t  _pad;
+    char     mnemonic[QEMU_PLUGIN_INSN_DETAIL_MNEMSZ];
+    char     op_str[QEMU_PLUGIN_INSN_DETAIL_OPSTRSZ];
+    qemu_plugin_operand operands[QEMU_PLUGIN_INSN_DETAIL_MAX_OPS];
+    char     regs_read[QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS]
+                       [QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ];
+    char     regs_write[QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS]
+                        [QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ];
+    uint16_t regs_read_id[QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS];
+    uint16_t regs_write_id[QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS];
+} qemu_plugin_insn_info;
+
+/**
+ * qemu_plugin_insn_detail() - get structured instruction details
+ * @insn: opaque instruction handle from qemu_plugin_tb_get_insn()
+ * @info: output structure filled with Capstone detail fields
+ *
+ * Decodes the instruction using Capstone with detail mode enabled
+ * and fills @info with operand types, access modes, implicit register
+ * names, instruction groups, and prefix information.
+ *
+ * Register names are ISA-native strings from Capstone (e.g. "rax",
+ * "xmm0" for x86; "x0", "sp" for AArch64).
+ *
+ * Returns true on success, false if Capstone is unavailable or the
+ * instruction could not be decoded.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_insn_detail(const struct qemu_plugin_insn *insn,
+                             qemu_plugin_insn_info *info);
+
+/* Capstone architecture IDs for qemu_plugin_cap_decode() */
+#define QEMU_PLUGIN_CAP_ARCH_ARM    0
+#define QEMU_PLUGIN_CAP_ARCH_ARM64  1
+#define QEMU_PLUGIN_CAP_ARCH_MIPS   2
+#define QEMU_PLUGIN_CAP_ARCH_X86    3
+#define QEMU_PLUGIN_CAP_ARCH_RISCV  15
+
+/* Capstone mode flags for qemu_plugin_cap_decode() */
+#define QEMU_PLUGIN_CAP_MODE_LITTLE_ENDIAN  0u
+#define QEMU_PLUGIN_CAP_MODE_BIG_ENDIAN     (1u << 31)
+#define QEMU_PLUGIN_CAP_MODE_16             (1u << 1)
+#define QEMU_PLUGIN_CAP_MODE_32             (1u << 2)
+#define QEMU_PLUGIN_CAP_MODE_64             (1u << 3)
+#define QEMU_PLUGIN_CAP_MODE_RISCV32        QEMU_PLUGIN_CAP_MODE_32
+#define QEMU_PLUGIN_CAP_MODE_RISCV64        2u
+
+/**
+ * qemu_plugin_cap_decode() - decode raw instruction bytes via Capstone
+ * @cap_arch: Capstone architecture (QEMU_PLUGIN_CAP_ARCH_*)
+ * @cap_mode: Capstone mode flags (QEMU_PLUGIN_CAP_MODE_*)
+ * @data: pointer to raw instruction bytes
+ * @size: number of bytes available at @data
+ * @pc: virtual address of the instruction
+ * @info: output structure filled with Capstone detail fields
+ *
+ * Opens a standalone Capstone handle with the requested architecture
+ * and mode, enables detail mode, and decodes the first instruction
+ * from @data.  Unlike qemu_plugin_insn_detail(), this function does
+ * not depend on QEMU's per-target disassembler — it works for any
+ * ISA that Capstone supports, given the correct arch/mode.
+ *
+ * x86 automatically uses AT&T syntax.
+ *
+ * Returns true on success, false if Capstone cannot open or decode.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_cap_decode(int cap_arch, unsigned int cap_mode,
+                            const uint8_t *data, size_t size,
+                            uint64_t pc, qemu_plugin_insn_info *info);
+
 /**
  * qemu_plugin_insn_symbol() - best effort symbol lookup
  * @insn: instruction reference
@@ -1011,7 +1141,7 @@ uint64_t qemu_plugin_u64_sum(qemu_plugin_u64 entry);
 
 /* ================ CPU State Snapshot/Rollback API ================ */
 
-/**
+/*
  * struct qemu_plugin_cpu_state - Opaque handle to a saved CPU state
  *
  * Holds a complete snapshot of the CPU's register state, captured via

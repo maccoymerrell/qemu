@@ -459,11 +459,19 @@ bool cap_disas_target(disassemble_info *info, uint64_t pc, size_t size);
 bool cap_disas_host(disassemble_info *info, const void *code, size_t size);
 bool cap_disas_monitor(disassemble_info *info, uint64_t pc, int count);
 bool cap_disas_plugin(disassemble_info *info, uint64_t pc, size_t size);
+struct qemu_plugin_insn_info;
+bool cap_disas_plugin_detail(disassemble_info *info, uint64_t pc, size_t size,
+                             struct qemu_plugin_insn_info *out);
+bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
+                          const uint8_t *data, size_t data_size,
+                          uint64_t pc, struct qemu_plugin_insn_info *out);
 #else
 # define cap_disas_target(i, p, s)  false
 # define cap_disas_host(i, p, s)    false
 # define cap_disas_monitor(i, p, c) false
 # define cap_disas_plugin(i, p, c)  false
+# define cap_disas_plugin_detail(i, p, s, o) false
+# define cap_disas_raw_detail(a, m, d, ds, p, o) false
 #endif /* CONFIG_CAPSTONE */
 
 #ifndef ATTRIBUTE_UNUSED

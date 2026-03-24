@@ -19,44 +19,16 @@ WPT_MEM_DATA_SIZE_BITS = 3
 WPT_FLAG_MEM_DATA      = 1 << 0
 WPT_FLAG_REG_DATA      = 1 << 1
 WPT_FLAG_MEM_ALLOC     = 1 << 2
-WPT_FLAG_THREADED      = 1 << 3
 WPT_FLAG_HAS_TEMPLATES = 1 << 4
 
 # Body entry tags (2-bit)
 BODY_TAG_END      = 0
 BODY_TAG_ENTRY    = 1
 BODY_TAG_MEMALLOC = 2
-BODY_TAG_SYNC     = 3
 
-WPT_SYNC_OP_TYPE_BITS = 4
-WPT_SYNC_OBJ_TYPE_BITS = 4
 WPT_SYNC_HINT_BITS = 4
 
-# v0.9 Sync operation types (inline in body stream)
-SYNC_OP_LOCK      = 0
-SYNC_OP_UNLOCK    = 1
-SYNC_OP_SEM_INC   = 2
-SYNC_OP_SEM_DEC   = 3
-SYNC_OP_SPIN_MARK = 4
-SYNC_OP_OBJ_INIT  = 5
-
-SYNC_OP_NAMES = {
-    0: "LOCK",
-    1: "UNLOCK",
-    2: "SEM_INC",
-    3: "SEM_DEC",
-    4: "SPIN_MARK",
-    5: "OBJ_INIT",
-}
-
-# Sync object types for OBJ_INIT
-SYNC_OBJ_TYPE_NAMES = {
-    0: "UNKNOWN",
-    1: "MUTEX",
-    2: "SEMAPHORE",
-}
-
-# Template-level sync hints (in insn fields, unchanged from v0.8)
+# Template-level sync hints (in insn fields)
 SYNC_NONE          = 0
 SYNC_THREAD_SWITCH = 4
 SYNC_ATOMIC        = 5
@@ -430,7 +402,7 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
 
     isa = br.read_bits(WPT_ISA_BITS)
 
-    # v0.9 header: flags, command, datetime, comment, target_name, thread_id
+    # Header: flags, command, datetime, comment, target_name, thread_id
     flags = br.read_bits(WPT_HEADER_FLAGS_BITS)
     command      = read_string(br)
     datetime_str = read_string(br)
@@ -440,12 +412,7 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
 
     has_mem_data     = bool(flags & WPT_FLAG_MEM_DATA)
     has_mem_alloc    = bool(flags & WPT_FLAG_MEM_ALLOC)
-    is_threaded      = bool(flags & WPT_FLAG_THREADED)
     has_templates    = bool(flags & WPT_FLAG_HAS_TEMPLATES)
-
-    # v0.9: templates and num_threads are in the footer (after body),
-    # not in the header. This allows streaming body writes.
-    num_threads = 1
 
     opcode_names = dict(OPCODE_NAMES)
     branch_names = dict(BRANCH_NAMES)
@@ -458,7 +425,6 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
 
     entries: list[dict] = []
     memalloc_events: list[dict] = []
-    sync_events: list[dict] = []
 
     prev_entry_template = 0
     cp_dyn_state: dict[int, list[DynParam]] = {}
@@ -474,9 +440,6 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
             # Templates in footer for files with HAS_TEMPLATES flag
             if has_templates:
                 templates, template_by_id = decode_templates(br)
-                # num_threads follows templates for threaded origin files
-                if is_threaded:
-                    num_threads = br.read_uleb128()
             break
 
         if tag == BODY_TAG_MEMALLOC:
@@ -497,36 +460,6 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
                 "new_size": new_size,
                 "before_entry": len(entries),
             })
-            continue
-
-        if tag == BODY_TAG_SYNC:
-            sync_type = br.read_bits(WPT_SYNC_OP_TYPE_BITS)
-            sync_addr = br.read_uleb128()
-
-            sync_ev: dict = {
-                "sync_type": sync_type,
-                "type_name": SYNC_OP_NAMES.get(sync_type, "UNKNOWN"),
-                "addr": sync_addr,
-                "before_entry": len(entries),
-            }
-
-            # Parse type-specific payload
-            if sync_type == SYNC_OP_OBJ_INIT:
-                obj_type = br.read_bits(WPT_SYNC_OBJ_TYPE_BITS)
-                init_value = br.read_uleb128()
-                max_value = br.read_uleb128()
-                sync_ev["obj_type"] = obj_type
-                sync_ev["obj_type_name"] = SYNC_OBJ_TYPE_NAMES.get(
-                    obj_type, "UNKNOWN")
-                sync_ev["init_value"] = init_value
-                sync_ev["max_value"] = max_value
-            elif sync_type == SYNC_OP_SPIN_MARK:
-                loop_start = br.read_uleb128()
-                loop_count = br.read_uleb128()
-                sync_ev["loop_body_start_offset"] = loop_start
-                sync_ev["loop_body_entry_count"] = loop_count
-
-            sync_events.append(sync_ev)
             continue
 
         # tag == BODY_TAG_ENTRY
@@ -670,9 +603,7 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
         "comment": comment,
         "has_mem_data": has_mem_data,
         "has_mem_alloc": has_mem_alloc,
-        "is_threaded": is_threaded,
         "has_templates": has_templates,
-        "num_threads": num_threads,
         "thread_id": thread_id,
         "opcode_names": opcode_names,
         "branch_names": branch_names,
@@ -680,7 +611,6 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
         "exception_names": exception_names,
         "reg_names": reg_names,
         "memalloc_events": memalloc_events,
-        "sync_events": sync_events,
     }
     return meta, templates, entries
 
@@ -696,7 +626,6 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
     reg_names: dict[int, str] = meta.get("reg_names", REG_NAMES_DEFAULT)
     has_mem_data = meta.get("has_mem_data", False)
     memalloc_events: list[dict] = meta.get("memalloc_events", [])
-    sync_events: list[dict]     = meta.get("sync_events", [])
 
     def reg_fmt(r: int) -> str:
         return reg_names.get(r, reg_name(r))
@@ -717,13 +646,9 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
         flags_str += " MEM_DATA"
     if meta.get("has_mem_alloc"):
         flags_str += " MEM_ALLOC"
-    if meta.get("is_threaded"):
-        flags_str += " THREADED"
     if meta.get("has_templates"):
         flags_str += " HAS_TEMPLATES"
     out.append(f"FLAGS{flags_str}")
-    if meta.get("num_threads", 1) > 1:
-        out.append(f"NUM_THREADS {meta['num_threads']}")
     out.append("")
 
     out.append("ENUMS")
@@ -785,23 +710,7 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
     out.append("----")
 
     next_memalloc_idx = 0
-    next_sync_idx = 0
     for entry_idx, entry in enumerate(entries):
-        # Emit any sync events that occurred before this entry
-        while (next_sync_idx < len(sync_events) and
-               sync_events[next_sync_idx]["before_entry"] == entry_idx):
-            ev = sync_events[next_sync_idx]
-            line = f"SYNC type={ev['type_name']} addr=0x{ev['addr']:x}"
-            if ev["sync_type"] == SYNC_OP_OBJ_INIT:
-                line += (f" obj={ev.get('obj_type_name', 'UNKNOWN')}"
-                         f" init={ev.get('init_value', 0)}"
-                         f" max={ev.get('max_value', 0)}")
-            elif ev["sync_type"] == SYNC_OP_SPIN_MARK:
-                line += (f" start={ev.get('loop_body_start_offset', 0)}"
-                         f" count={ev.get('loop_body_entry_count', 0)}")
-            out.append(line)
-            next_sync_idx += 1
-
         # Emit any memalloc events that occurred before this entry
         while (next_memalloc_idx < len(memalloc_events) and
                memalloc_events[next_memalloc_idx]["before_entry"] == entry_idx):

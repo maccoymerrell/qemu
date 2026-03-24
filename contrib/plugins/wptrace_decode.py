@@ -403,6 +403,7 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
     isa = br.read_bits(WPT_ISA_BITS)
 
     # Header: flags, command, datetime, comment, target_name, thread_id
+    # thread_id is 0 for the monolithic trace (all threads interleaved)
     flags = br.read_bits(WPT_HEADER_FLAGS_BITS)
     command      = read_string(br)
     datetime_str = read_string(br)

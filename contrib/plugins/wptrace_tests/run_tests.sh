@@ -235,11 +235,11 @@ run_threaded() {
         return
     fi
 
-    # Verify the decoded text output contains THREAD_SWITCH markers
-    # (confirms the trace correctly tracks thread changes)
-    local check_file="${out}.decoded.txt"
-    [[ ! -f "$check_file" ]] && check_file="${out}.txt"
-    if [[ -f "$check_file" ]] && ! grep -q "THREAD_SWITCH" "$check_file" 2>/dev/null; then
+    # Verify the debug text output contains THREAD_SWITCH markers
+    # (confirms the trace correctly tracks thread changes).
+    # THREAD_SWITCH markers are written to the debug text output (not binary).
+    local txt_file="${out}.txt"
+    if [[ -f "$txt_file" ]] && ! grep -q "THREAD_SWITCH" "$txt_file" 2>/dev/null; then
         printf "  FAIL  %-34s  (no THREAD_SWITCH markers in trace)\n" "$label"
         FAIL=$((FAIL + 1))
         return

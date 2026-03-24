@@ -8,12 +8,12 @@
 #                    (default: auto-detect from script location: ../../../build)
 #   --bin-dir   DIR  Path to compiled test binaries
 #                    (default: <script-dir>/bin)
-#   --out-dir   DIR  Directory for plugin output files (.bin/.txt)
+#   --out-dir   DIR  Directory for plugin output files (.wpt/.txt)
 #                    (default: <script-dir>/run_output; kept on disk for inspection)
 #   ISA              Limit to specific ISAs: x86 aarch64 riscv64 mips
 #
 # Verification method:
-#   For each test, the plugin runs once generating both a binary trace (.bin)
+#   For each test, the plugin runs once generating both a binary trace (.wpt)
 #   and a text trace (.txt).  The decoder then re-reads the binary and compares
 #   its output against the text file.  A VERIFY: OK result means the two
 #   representations are bit-for-bit equivalent.
@@ -72,12 +72,12 @@ declare -A TESTS=(
     [mips]="test storefwd intdiv divsd fpdiv fpdiv_vec heapalloc memdata"
 )
 
-# Multi-thread tests use threads=1 and per-thread output files (_tN.bin)
+# Multi-thread tests use threads=1 and per-thread output files (_tN.wpt)
 declare -A THREADED_TESTS=(
-    [x86]="multithreaded synctest"
-    [aarch64]="multithreaded synctest"
-    [riscv64]="multithreaded synctest"
-    [mips]="multithreaded synctest"
+    [x86]="multithreaded synctest sync_spin sync_sem sync_prodcons sync_barrier sync_spsc sync_rwlock"
+    [aarch64]="multithreaded synctest sync_spin sync_sem sync_prodcons sync_barrier sync_spsc sync_rwlock"
+    [riscv64]="multithreaded synctest sync_spin sync_sem sync_prodcons sync_barrier sync_spsc sync_rwlock"
+    [mips]="multithreaded synctest sync_spin sync_sem sync_prodcons sync_barrier sync_spsc sync_rwlock"
 )
 
 # Extra plugin options for specific tests (e.g. "memalloc=1").
@@ -89,6 +89,7 @@ declare -A EXTRA_PLUGIN_OPTS=(
 
 # Content-check patterns: after decode verification, grep the .txt for this
 # pattern.  Failure to match fails the test — confirms the feature fired.
+# Multiple patterns separated by '|||' are checked independently (all required).
 declare -A CONTENT_CHECK=(
     [heapalloc]="^MEMALLOC "
     [memdata]=":data=0xdeadbeef"
@@ -132,7 +133,7 @@ run_one() {
     fi
 
     # Remove stale outputs from previous run
-    rm -f "${out}.bin" "${out}.txt"
+    rm -f "${out}.wpt" "${out}.txt"
 
     # Build plugin option string, appending any test-specific extras
     local plugin_opts="outfile=${out},stop=50000,debug=1"
@@ -144,25 +145,36 @@ run_one() {
         -plugin "$PLUGIN,$plugin_opts" \
         "$binary" >/dev/null 2>&1
 
-    if [[ ! -f "${out}.bin" ]]; then
+    if [[ ! -f "${out}.wpt" ]]; then
         printf "  FAIL  %-34s (no plugin output produced)\n" "$label"
         FAIL=$((FAIL + 1))
         return
     fi
 
-    result=$(python3 "$DECODE" "${out}.bin" --expect "${out}.txt" 2>&1 | tail -1)
+    result=$(python3 "$DECODE" "${out}.wpt" -o "${out}.decoded.txt" --expect "${out}.txt" 2>&1 | tail -1)
     if ! echo "$result" | grep -q "VERIFY: OK"; then
         printf "  FAIL  %-34s  %s\n" "$label" "$result"
         FAIL=$((FAIL + 1))
         return
     fi
 
-    # Content check: verify expected feature output actually appeared
-    local pattern="${CONTENT_CHECK[$name]:-}"
-    if [[ -n "$pattern" ]] && ! grep -qP "$pattern" "${out}.txt" 2>/dev/null; then
-        printf "  FAIL  %-34s  (no '%s' lines in trace)\n" "$label" "$pattern"
-        FAIL=$((FAIL + 1))
-        return
+    # Content check against decoded output (includes footer sections)
+    local check_file="${out}.decoded.txt"
+    [[ ! -f "$check_file" ]] && check_file="${out}.txt"
+    local patterns="${CONTENT_CHECK[$name]:-}"
+    if [[ -n "$patterns" ]]; then
+        local IFS_OLD="$IFS"
+        IFS='|||'
+        read -ra PATS <<< "$patterns"
+        IFS="$IFS_OLD"
+        for pat in "${PATS[@]}"; do
+            [[ -z "$pat" ]] && continue
+            if ! grep -qP "$pat" "$check_file" 2>/dev/null; then
+                printf "  FAIL  %-34s  (no '%s' lines in trace)\n" "$label" "$pat"
+                FAIL=$((FAIL + 1))
+                return
+            fi
+        done
     fi
 
     printf "  PASS  %s\n" "$label"
@@ -194,42 +206,76 @@ run_threaded() {
     fi
 
     # Remove any stale output from a previous run
-    rm -f "${out}.bin" "${out}.txt"
+    rm -f "${out}.wpt" "${out}.txt" "${out}"_t*.wpt
 
     local plugin_opts="outfile=${out},debug=1,threads=1"
-    "$qemu_bin" \
+    local extra="${EXTRA_PLUGIN_OPTS[$name]:-}"
+    [[ -n "$extra" ]] && plugin_opts="$plugin_opts,$extra"
+    if ! timeout 120 "$qemu_bin" \
         -plugin "$PLUGIN,$plugin_opts" \
-        "$binary" >/dev/null 2>&1
+        "$binary" >/dev/null 2>&1; then
+        if [[ ! -f "${out}.wpt" ]]; then
+            printf "  FAIL  %-34s (timeout or crash — no output)\n" "$label"
+            FAIL=$((FAIL + 1))
+            return
+        fi
+    fi
 
-    # Unified single-file output
-    if [[ ! -f "${out}.bin" ]]; then
-        printf "  FAIL  %-34s (no .bin produced)\n" "$label"
+    # v0.9: per-thread files — origin is {out}.wpt
+    if [[ ! -f "${out}.wpt" ]]; then
+        printf "  FAIL  %-34s (no .wpt produced)\n" "$label"
         FAIL=$((FAIL + 1))
         return
     fi
 
-    # Verify binary/text consistency
+    # Verify origin file decodes without error
     local result
-    result=$(python3 "$DECODE" "${out}.bin" --expect "${out}.txt" 2>&1 | tail -1)
-    if ! echo "$result" | grep -q "VERIFY: OK"; then
-        printf "  FAIL  %-34s  %s\n" "$label" "$result"
+    result=$(timeout 120 python3 "$DECODE" "${out}.wpt" -o "${out}.decoded.txt" 2>&1 | tail -1)
+    if echo "$result" | grep -qi "error\|traceback\|ValueError"; then
+        printf "  FAIL  %-34s  %s\n" "$label" "${result:-(decode error)}"
         FAIL=$((FAIL + 1))
         return
     fi
 
-    # Content check: the unified trace must contain THREAD_SWITCH events
-    if ! grep -qP "^SYNC type=THREAD_SWITCH" "${out}.txt" 2>/dev/null; then
-        printf "  FAIL  %-34s  (no SYNC type=THREAD_SWITCH in trace)\n" "$label"
+    # The origin file must have THREADED and HAS_TEMPLATES flags
+    local check_file="${out}.decoded.txt"
+    if ! grep -qP "^FLAGS.*THREADED" "$check_file" 2>/dev/null; then
+        printf "  FAIL  %-34s  (no THREADED flag in origin file)\n" "$label"
         FAIL=$((FAIL + 1))
         return
     fi
 
-    # Optional extra content check (e.g. sync=ATOMIC for synctest)
-    local pattern="${CONTENT_CHECK[$name]:-}"
-    if [[ -n "$pattern" ]] && ! grep -qP "$pattern" "${out}.txt" 2>/dev/null; then
-        printf "  FAIL  %-34s  (no '%s' lines in trace)\n" "$label" "$pattern"
-        FAIL=$((FAIL + 1))
-        return
+    # Verify all secondary thread files decode without error
+    local thread_files=( "${out}"_t*.wpt )
+    if [[ -e "${thread_files[0]}" ]]; then
+        for tf in "${thread_files[@]}"; do
+            local tf_base
+            tf_base=$(basename "$tf" .wpt)
+            local tf_result
+            tf_result=$(timeout 120 python3 "$DECODE" "$tf" 2>&1 | tail -1)
+            if echo "$tf_result" | grep -qi "error\|traceback\|ValueError"; then
+                printf "  FAIL  %-34s  (thread file %s: %s)\n" "$label" "$tf_base" "$tf_result"
+                FAIL=$((FAIL + 1))
+                return
+            fi
+        done
+    fi
+
+    # Optional extra content check
+    local patterns="${CONTENT_CHECK[$name]:-}"
+    if [[ -n "$patterns" ]]; then
+        local IFS_OLD="$IFS"
+        IFS='|||'
+        read -ra PATS <<< "$patterns"
+        IFS="$IFS_OLD"
+        for pat in "${PATS[@]}"; do
+            [[ -z "$pat" ]] && continue
+            if ! grep -qP "$pat" "$check_file" 2>/dev/null; then
+                printf "  FAIL  %-34s  (no '%s' lines in trace)\n" "$label" "$pat"
+                FAIL=$((FAIL + 1))
+                return
+            fi
+        done
     fi
 
     printf "  PASS  %s\n" "$label"

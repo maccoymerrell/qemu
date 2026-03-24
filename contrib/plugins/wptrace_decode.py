@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-WPT_MAGIC = 0x54505708
+WPT_MAGIC = 0x54505709
 
 WPT_ISA_BITS = 3
 WPT_OPCODE_BITS = 8
@@ -16,11 +16,11 @@ WPT_REG_BITS = 8
 WPT_HEADER_FLAGS_BITS = 8
 WPT_MEM_DATA_SIZE_BITS = 3
 
-WPT_FLAG_MEM_DATA    = 1 << 0
-WPT_FLAG_REG_DATA    = 1 << 1
-WPT_FLAG_MEM_ALLOC   = 1 << 2
-WPT_FLAG_THREADS     = 1 << 3
-WPT_FLAG_THREAD_DIR  = 1 << 4
+WPT_FLAG_MEM_DATA      = 1 << 0
+WPT_FLAG_REG_DATA      = 1 << 1
+WPT_FLAG_MEM_ALLOC     = 1 << 2
+WPT_FLAG_THREADED      = 1 << 3
+WPT_FLAG_HAS_TEMPLATES = 1 << 4
 
 # Body entry tags (2-bit)
 BODY_TAG_END      = 0
@@ -28,14 +28,39 @@ BODY_TAG_ENTRY    = 1
 BODY_TAG_MEMALLOC = 2
 BODY_TAG_SYNC     = 3
 
-WPT_SYNC_TYPE_BITS = 4
+WPT_SYNC_OP_TYPE_BITS = 4
+WPT_SYNC_OBJ_TYPE_BITS = 4
 WPT_SYNC_HINT_BITS = 4
 
-# Sync event types (must match SyncEventType enum in wptrace_mnemonics.h)
+# v0.9 Sync operation types (inline in body stream)
+SYNC_OP_LOCK      = 0
+SYNC_OP_UNLOCK    = 1
+SYNC_OP_SEM_INC   = 2
+SYNC_OP_SEM_DEC   = 3
+SYNC_OP_SPIN_MARK = 4
+SYNC_OP_OBJ_INIT  = 5
+
+SYNC_OP_NAMES = {
+    0: "LOCK",
+    1: "UNLOCK",
+    2: "SEM_INC",
+    3: "SEM_DEC",
+    4: "SPIN_MARK",
+    5: "OBJ_INIT",
+}
+
+# Sync object types for OBJ_INIT
+SYNC_OBJ_TYPE_NAMES = {
+    0: "UNKNOWN",
+    1: "MUTEX",
+    2: "SEMAPHORE",
+}
+
+# Template-level sync hints (in insn fields, unchanged from v0.8)
 SYNC_NONE          = 0
 SYNC_THREAD_SWITCH = 4
 SYNC_ATOMIC        = 5
-SYNC_TYPE_NAMES    = {0: "NONE", 4: "THREAD_SWITCH", 5: "ATOMIC"}
+SYNC_HINT_NAMES    = {0: "NONE", 4: "THREAD_SWITCH", 5: "ATOMIC"}
 
 # MemAlloc event types
 MEMALLOC_MAP   = 0
@@ -337,6 +362,62 @@ def format_dyn(dp: DynParam, show_data: bool = False) -> str:
     return s
 
 
+def decode_templates(br: BitReader) -> tuple[list[dict], dict[int, dict]]:
+    """Decode the template dictionary section."""
+    templates: list[dict] = []
+    template_by_id: dict[int, dict] = {}
+
+    num_templates = br.read_uleb128()
+    for _ in range(num_templates):
+        template_id = br.read_uleb128()
+        start_pc = br.read_uleb128()
+        n_insns = br.read_uleb128()
+        fall_through_pc = br.read_uleb128()
+        sym_len = br.read_uleb128()
+        symbol_name = read_bytes(br, sym_len).decode('utf-8', errors='replace') if sym_len else ""
+
+        insns: list[dict] = []
+        for _ in range(n_insns):
+            pc = br.read_uleb128()
+            opcode = br.read_bits(WPT_OPCODE_BITS)
+            branch_type = br.read_bits(WPT_BRANCH_BITS)
+            branch_conditional = bool(br.read_bits(1))
+            n_src = br.read_bits(WPT_REG_COUNT_BITS)
+            n_dst = br.read_bits(WPT_REG_COUNT_BITS)
+            has_imm = br.read_bits(1)
+            sync_hint = br.read_bits(WPT_SYNC_HINT_BITS)
+            src_regs = [br.read_bits(WPT_REG_BITS) for _ in range(n_src)]
+            dst_regs = [br.read_bits(WPT_REG_BITS) for _ in range(n_dst)]
+            imm = br.read_sleb128() if has_imm else None
+            insn_size = br.read_uleb128()
+            raw_bytes = read_bytes(br, insn_size)
+
+            insns.append({
+                "pc": pc,
+                "opcode": opcode,
+                "branch_type": branch_type,
+                "branch_conditional": branch_conditional,
+                "src_regs": src_regs,
+                "dst_regs": dst_regs,
+                "imm": imm,
+                "sync_hint": sync_hint,
+                "raw_bytes": raw_bytes,
+            })
+
+        tmpl = {
+            "template_id": template_id,
+            "start_pc": start_pc,
+            "n_insns": n_insns,
+            "fall_through_pc": fall_through_pc,
+            "symbol_name": symbol_name,
+            "insns": insns,
+        }
+        templates.append(tmpl)
+        template_by_id[template_id] = tmpl
+
+    return templates, template_by_id
+
+
 def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
     data = bin_path.read_bytes()
     br = BitReader(data)
@@ -349,18 +430,22 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
 
     isa = br.read_bits(WPT_ISA_BITS)
 
-    # v0.6 header: flags, command, datetime, comment, target_name, thread_id
+    # v0.9 header: flags, command, datetime, comment, target_name, thread_id
     flags = br.read_bits(WPT_HEADER_FLAGS_BITS)
     command      = read_string(br)
     datetime_str = read_string(br)
     comment      = read_string(br)
     target_name  = read_string(br)
-    thread_id    = br.read_uleb128()   # v0.6: always present (0 = single-thread)
+    thread_id    = br.read_uleb128()
 
-    has_mem_data    = bool(flags & WPT_FLAG_MEM_DATA)
-    has_mem_alloc   = bool(flags & WPT_FLAG_MEM_ALLOC)
-    is_threaded     = bool(flags & WPT_FLAG_THREADS)
-    has_thread_dir  = bool(flags & WPT_FLAG_THREAD_DIR)
+    has_mem_data     = bool(flags & WPT_FLAG_MEM_DATA)
+    has_mem_alloc    = bool(flags & WPT_FLAG_MEM_ALLOC)
+    is_threaded      = bool(flags & WPT_FLAG_THREADED)
+    has_templates    = bool(flags & WPT_FLAG_HAS_TEMPLATES)
+
+    # v0.9: templates and num_threads are in the footer (after body),
+    # not in the header. This allows streaming body writes.
+    num_threads = 1
 
     opcode_names = dict(OPCODE_NAMES)
     branch_names = dict(BRANCH_NAMES)
@@ -368,11 +453,12 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
     stop_reason_names = dict(WP_STOP_REASON_NAMES)
     reg_names: dict[int, str] = dict(REG_NAMES_DEFAULT)
 
+    templates: list[dict] = []
+    template_by_id: dict[int, dict] = {}
+
     entries: list[dict] = []
     memalloc_events: list[dict] = []
     sync_events: list[dict] = []
-    templates: list[dict] = []
-    template_by_id: dict[int, dict] = {}
 
     prev_entry_template = 0
     cp_dyn_state: dict[int, list[DynParam]] = {}
@@ -383,27 +469,14 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
         tag = br.read_bits(2)
 
         if tag == BODY_TAG_END:
-            # Thread Segment Directory sits between BODY_TAG_END and
-            # the footer entry count when WPT_FLAG_THREAD_DIR is set.
-            seg_directory: list[dict] = []
-            if has_thread_dir:
-                num_segments = br.read_uleb128()
-                for _ in range(num_segments):
-                    seg_tid = br.read_uleb128()
-                    seg_offset = br.read_uleb128()
-                    seg_n_entries = br.read_uleb128()
-                    seg_flags = br.read_bits(8)
-                    seg_is_atomic = bool(seg_flags & 1)
-                    n_addrs = br.read_uleb128()
-                    addrs = [br.read_uleb128() for _ in range(n_addrs)]
-                    seg_directory.append({
-                        "thread_id": seg_tid,
-                        "body_bit_offset": seg_offset,
-                        "num_entries": seg_n_entries,
-                        "is_atomic": seg_is_atomic,
-                        "atomic_addrs": addrs,
-                    })
             footer_num_entries = br.read_uleb128()
+
+            # Templates in footer for files with HAS_TEMPLATES flag
+            if has_templates:
+                templates, template_by_id = decode_templates(br)
+                # num_threads follows templates for threaded origin files
+                if is_threaded:
+                    num_threads = br.read_uleb128()
             break
 
         if tag == BODY_TAG_MEMALLOC:
@@ -422,22 +495,38 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
                 "size": size,
                 "new_vaddr": new_vaddr,
                 "new_size": new_size,
-                # associate with next body entry
                 "before_entry": len(entries),
             })
             continue
 
         if tag == BODY_TAG_SYNC:
-            sync_type = br.read_bits(WPT_SYNC_TYPE_BITS)
-            addr = 0
-            if sync_type == SYNC_THREAD_SWITCH:
-                addr = br.read_uleb128()
-            sync_events.append({
+            sync_type = br.read_bits(WPT_SYNC_OP_TYPE_BITS)
+            sync_addr = br.read_uleb128()
+
+            sync_ev: dict = {
                 "sync_type": sync_type,
-                "type_name": SYNC_TYPE_NAMES.get(sync_type, "UNKNOWN"),
-                "addr": addr,
+                "type_name": SYNC_OP_NAMES.get(sync_type, "UNKNOWN"),
+                "addr": sync_addr,
                 "before_entry": len(entries),
-            })
+            }
+
+            # Parse type-specific payload
+            if sync_type == SYNC_OP_OBJ_INIT:
+                obj_type = br.read_bits(WPT_SYNC_OBJ_TYPE_BITS)
+                init_value = br.read_uleb128()
+                max_value = br.read_uleb128()
+                sync_ev["obj_type"] = obj_type
+                sync_ev["obj_type_name"] = SYNC_OBJ_TYPE_NAMES.get(
+                    obj_type, "UNKNOWN")
+                sync_ev["init_value"] = init_value
+                sync_ev["max_value"] = max_value
+            elif sync_type == SYNC_OP_SPIN_MARK:
+                loop_start = br.read_uleb128()
+                loop_count = br.read_uleb128()
+                sync_ev["loop_body_start_offset"] = loop_start
+                sync_ev["loop_body_entry_count"] = loop_count
+
+            sync_events.append(sync_ev)
             continue
 
         # tag == BODY_TAG_ENTRY
@@ -559,54 +648,7 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
             "wp_entries": wp_entries,
         })
 
-    num_templates = br.read_uleb128()
-    for _ in range(num_templates):
-        template_id = br.read_uleb128()
-        start_pc = br.read_uleb128()
-        n_insns = br.read_uleb128()
-        fall_through_pc = br.read_uleb128()
-        sym_len = br.read_uleb128()
-        symbol_name = read_bytes(br, sym_len).decode('utf-8', errors='replace') if sym_len else ""
-
-        insns: list[dict] = []
-        for _ in range(n_insns):
-            pc = br.read_uleb128()
-            opcode = br.read_bits(WPT_OPCODE_BITS)
-            branch_type = br.read_bits(WPT_BRANCH_BITS)
-            branch_conditional = bool(br.read_bits(1))
-            n_src = br.read_bits(WPT_REG_COUNT_BITS)
-            n_dst = br.read_bits(WPT_REG_COUNT_BITS)
-            has_imm = br.read_bits(1)
-            sync_hint = br.read_bits(WPT_SYNC_HINT_BITS)
-            src_regs = [br.read_bits(WPT_REG_BITS) for _ in range(n_src)]
-            dst_regs = [br.read_bits(WPT_REG_BITS) for _ in range(n_dst)]
-            imm = br.read_sleb128() if has_imm else None
-            insn_size = br.read_uleb128()
-            raw_bytes = read_bytes(br, insn_size)
-
-            insns.append({
-                "pc": pc,
-                "opcode": opcode,
-                "branch_type": branch_type,
-                "branch_conditional": branch_conditional,
-                "src_regs": src_regs,
-                "dst_regs": dst_regs,
-                "imm": imm,
-                "sync_hint": sync_hint,
-                "raw_bytes": raw_bytes,
-            })
-
-        tmpl = {
-            "template_id": template_id,
-            "start_pc": start_pc,
-            "n_insns": n_insns,
-            "fall_through_pc": fall_through_pc,
-            "symbol_name": symbol_name,
-            "insns": insns,
-        }
-        templates.append(tmpl)
-        template_by_id[template_id] = tmpl
-
+    # Back-fill n_insns for waypoints now that templates are available
     for entry in entries:
         for wp in entry["wp_entries"]:
             wp_tmpl = wp["template_id"]
@@ -629,8 +671,8 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
         "has_mem_data": has_mem_data,
         "has_mem_alloc": has_mem_alloc,
         "is_threaded": is_threaded,
-        "has_thread_dir": has_thread_dir,
-        "seg_directory": seg_directory if has_thread_dir else [],
+        "has_templates": has_templates,
+        "num_threads": num_threads,
         "thread_id": thread_id,
         "opcode_names": opcode_names,
         "branch_names": branch_names,
@@ -676,8 +718,12 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
     if meta.get("has_mem_alloc"):
         flags_str += " MEM_ALLOC"
     if meta.get("is_threaded"):
-        flags_str += " THREADS"
+        flags_str += " THREADED"
+    if meta.get("has_templates"):
+        flags_str += " HAS_TEMPLATES"
     out.append(f"FLAGS{flags_str}")
+    if meta.get("num_threads", 1) > 1:
+        out.append(f"NUM_THREADS {meta['num_threads']}")
     out.append("")
 
     out.append("ENUMS")
@@ -727,7 +773,7 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
             if insn["imm"] is not None:
                 line += f" imm={insn['imm']}"
             if insn.get("sync_hint", 0) != 0:
-                line += f" sync={SYNC_TYPE_NAMES.get(insn['sync_hint'], 'UNKNOWN')}"
+                line += f" sync={SYNC_HINT_NAMES.get(insn['sync_hint'], 'UNKNOWN')}"
             if insn.get("raw_bytes") is not None:
                 line += f" bytes={insn['raw_bytes'].hex()}"
 
@@ -745,10 +791,15 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
         while (next_sync_idx < len(sync_events) and
                sync_events[next_sync_idx]["before_entry"] == entry_idx):
             ev = sync_events[next_sync_idx]
-            if ev["sync_type"] == SYNC_THREAD_SWITCH:
-                out.append(f"SYNC type=THREAD_SWITCH thread={ev['addr']}")
-            else:
-                out.append(f"SYNC type={ev['type_name']}")
+            line = f"SYNC type={ev['type_name']} addr=0x{ev['addr']:x}"
+            if ev["sync_type"] == SYNC_OP_OBJ_INIT:
+                line += (f" obj={ev.get('obj_type_name', 'UNKNOWN')}"
+                         f" init={ev.get('init_value', 0)}"
+                         f" max={ev.get('max_value', 0)}")
+            elif ev["sync_type"] == SYNC_OP_SPIN_MARK:
+                line += (f" start={ev.get('loop_body_start_offset', 0)}"
+                         f" count={ev.get('loop_body_entry_count', 0)}")
+            out.append(line)
             next_sync_idx += 1
 
         # Emit any memalloc events that occurred before this entry
@@ -813,7 +864,7 @@ def first_diff_line(a: str, b: str) -> tuple[int, str, str] | None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Decode wptrace binary (.bin, format v0.8) and reconstruct debug text format"
+            "Decode wptrace binary (.wpt, format v0.9) and reconstruct debug text format"
         )
     )
     parser.add_argument("bin", type=Path, help="Input wptrace binary file")

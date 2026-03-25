@@ -85,7 +85,7 @@ features:
   │  0  │ WPT_FLAG_MEM_DATA  │ Load/store data values present    │
   │  1  │ WPT_FLAG_REG_DATA  │ Register values (reserved)        │
   │  2  │ WPT_FLAG_MEM_ALLOC │ Memory allocation events present  │
-  │  3  │ WPT_FLAG_CAP_DATA  │ CHERI capability data available   │
+  │  3  │ WPT_FLAG_CAP_DATA  │ CHERI capability data present   │
   │  4  │ WPT_FLAG_THREAD_DIR│ Thread Segment Directory in footer│
   │ 5-7 │ (reserved)         │                                   │
   └─────┴────────────────────┴───────────────────────────────────┘
@@ -324,7 +324,7 @@ Per-instruction bit-level layout:
   ┌───────────┬───────────┬─────┬─────┬─────┬─────┬──────┐
   │ opcode(8) │ branch(8) │bc(1)│ns(3)│nd(3)│hi(1)│sh(4) │
   └───────────┴───────────┴─────┴─────┴─────┴─────┴──────┘
-                                                    29 bits fixed (incl. is_capability)
+                                                    29 bits fixed (including is_capability)
   followed by: src_regs[ns×8], dst_regs[nd×8], [imm], size, raw_bytes
 
   cp = is_capability (1 if CHERI capability instruction, 0 otherwise)

@@ -184,7 +184,7 @@ static guint simpoints_current_idx = 0;
 #define WPT_FLAG_MEM_DATA      (1 << 0)  /* Load/store data values captured */
 #define WPT_FLAG_REG_DATA      (1 << 1)  /* Register values captured (reserved) */
 #define WPT_FLAG_MEM_ALLOC     (1 << 2)  /* Memory allocation events tracked */
-#define WPT_FLAG_CAP_DATA      (1 << 3)  /* CHERI capability data available */
+#define WPT_FLAG_CAP_DATA      (1 << 3)  /* CHERI capability data present */
 #define WPT_FLAG_HAS_TEMPLATES (1 << 4)  /* This file contains the template dictionary */
 
 /* ========================= ISA-Agnostic Instruction Fields ========================= */
@@ -1741,6 +1741,8 @@ static void write_text_header(FILE *f, uint32_t thread_id,
     for (uint32_t i = 0; i < GEN_EXC_COUNT; i++) {
         fprintf(f, "E %u %s\n", i, generic_exception_name(i));
     }
+    /* 1(NONE) + 64(GPR) + 64(FPR) + 64(VEC) + 32(CAP) + 2(PCC,DDC)
+     * + 5(SP,FLAGS,IP,LR,FP) = 232 */
     fprintf(f, "REGS 232\n");
     fprintf(f, "R %u %s\n", REG_NONE, generic_reg_name(REG_NONE));
     for (uint32_t i = 0; i < 64; i++) {

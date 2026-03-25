@@ -668,3 +668,31 @@ uint64_t qemu_plugin_u64_sum(qemu_plugin_u64 entry)
     return total;
 }
 
+/*
+ * CHERI capability register stubs.
+ *
+ * These return false until the CHERI emulation core is integrated into
+ * the RISC-V (or other) target.  Once capability registers are present
+ * in CPURISCVState (or the relevant arch state), these will read the
+ * raw capability and decompose it into the ISA-agnostic cap_info
+ * struct.
+ */
+
+bool qemu_plugin_read_capability(struct qemu_plugin_register *reg,
+                                 qemu_plugin_cap_info *info)
+{
+    (void)reg;
+    if (info) {
+        memset(info, 0, sizeof(*info));
+    }
+    /* CHERI emulation core not yet integrated */
+    return false;
+}
+
+bool qemu_plugin_reg_is_capability(struct qemu_plugin_register *reg)
+{
+    (void)reg;
+    /* CHERI emulation core not yet integrated */
+    return false;
+}
+

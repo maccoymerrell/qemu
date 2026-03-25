@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-WPT_MAGIC = 0x54505709
+WPT_MAGIC = 0x5450570A
 
 WPT_ISA_BITS = 3
 WPT_OPCODE_BITS = 8
@@ -19,6 +19,7 @@ WPT_MEM_DATA_SIZE_BITS = 3
 WPT_FLAG_MEM_DATA      = 1 << 0
 WPT_FLAG_REG_DATA      = 1 << 1
 WPT_FLAG_MEM_ALLOC     = 1 << 2
+WPT_FLAG_CAP_DATA      = 1 << 3
 WPT_FLAG_HAS_TEMPLATES = 1 << 4
 
 # Body entry tags (2-bit)
@@ -105,6 +106,14 @@ OPCODE_NAMES = {
     49: "NEG",
     50: "INC",
     51: "DEC",
+    52: "CAP_INSPECT",
+    53: "CAP_MODIFY",
+    54: "CAP_SEAL",
+    55: "CAP_LOAD",
+    56: "CAP_STORE",
+    57: "CAP_BRANCH",
+    58: "CAP_MOV",
+    59: "CAP_BUILD",
 }
 
 
@@ -142,6 +151,10 @@ def build_reg_names() -> dict[int, str]:
         names[65 + i] = f"FPR{i}"
     for i in range(64):
         names[129 + i] = f"VEC{i}"
+    for i in range(32):
+        names[193 + i] = f"CAP{i}"
+    names[240] = "PCC"
+    names[241] = "DDC"
     names[250] = "SP"
     names[251] = "FLAGS"
     names[252] = "IP"
@@ -358,6 +371,7 @@ def decode_templates(br: BitReader) -> tuple[list[dict], dict[int, dict]]:
             n_dst = br.read_bits(WPT_REG_COUNT_BITS)
             has_imm = br.read_bits(1)
             sync_hint = br.read_bits(WPT_SYNC_HINT_BITS)
+            is_capability = bool(br.read_bits(1))
             src_regs = [br.read_bits(WPT_REG_BITS) for _ in range(n_src)]
             dst_regs = [br.read_bits(WPT_REG_BITS) for _ in range(n_dst)]
             imm = br.read_sleb128() if has_imm else None
@@ -373,6 +387,7 @@ def decode_templates(br: BitReader) -> tuple[list[dict], dict[int, dict]]:
                 "dst_regs": dst_regs,
                 "imm": imm,
                 "sync_hint": sync_hint,
+                "is_capability": is_capability,
                 "raw_bytes": raw_bytes,
             })
 
@@ -413,6 +428,7 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
 
     has_mem_data     = bool(flags & WPT_FLAG_MEM_DATA)
     has_mem_alloc    = bool(flags & WPT_FLAG_MEM_ALLOC)
+    has_cap_data     = bool(flags & WPT_FLAG_CAP_DATA)
     has_templates    = bool(flags & WPT_FLAG_HAS_TEMPLATES)
 
     opcode_names = dict(OPCODE_NAMES)
@@ -604,6 +620,7 @@ def decode_wptrace(bin_path: Path) -> tuple[dict, list[dict], list[dict]]:
         "comment": comment,
         "has_mem_data": has_mem_data,
         "has_mem_alloc": has_mem_alloc,
+        "has_cap_data": has_cap_data,
         "has_templates": has_templates,
         "thread_id": thread_id,
         "opcode_names": opcode_names,
@@ -647,6 +664,8 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
         flags_str += " MEM_DATA"
     if meta.get("has_mem_alloc"):
         flags_str += " MEM_ALLOC"
+    if meta.get("has_cap_data"):
+        flags_str += " CAP_DATA"
     if meta.get("has_templates"):
         flags_str += " HAS_TEMPLATES"
     out.append(f"FLAGS{flags_str}")
@@ -700,6 +719,8 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
                 line += f" imm={insn['imm']}"
             if insn.get("sync_hint", 0) != 0:
                 line += f" sync={SYNC_HINT_NAMES.get(insn['sync_hint'], 'UNKNOWN')}"
+            if insn.get("is_capability", False):
+                line += " [CAP]"
             if insn.get("raw_bytes") is not None:
                 line += f" bytes={insn['raw_bytes'].hex()}"
 

@@ -7,16 +7,14 @@
  *   - Mutex lock/unlock (internally uses atomic operations)
  *   - sched_yield (voluntary scheduling)
  *   - Thread join (pthread_join)
- *   - THREAD_SWITCH sync events when execution moves between vCPUs
  *
- * The trace records SYNC_ATOMIC hints on atomic/locked instructions
- * used by the mutex implementation.  A Thread Segment Directory in
- * the footer groups body entries into per-thread segments, with
- * atomic BBs isolated as 1-BB segments so that ChampSim can use
- * them as preemption points.
+ * Verifies that the trace records accurate thread IDs and notes
+ * when the executing thread changes (THREAD_SWITCH events in the
+ * monolithic output file).  No synchronisation information is
+ * encoded; this test exists only to confirm correct thread-ID
+ * tracking in the trace.
  *
  * Compiled with: -static -pthread
- * Used with plugin option: threads=1
  */
 
 #include <pthread.h>

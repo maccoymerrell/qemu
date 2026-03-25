@@ -67,10 +67,6 @@ static char *trace_comment = NULL;
 static bool enable_mem_data = false;
 static bool enable_mem_alloc = false;
 
-/* Sync object table (v0.9): addr → SyncObjectInfo */
-static GHashTable *sync_object_table;  /* guint64 key → SyncObjectInfo* value */
-static GMutex sync_table_lock;         /* protects sync_object_table */
-
 /*
  * Memory allocation event types (for binary body stream tag 2).
  * Intercepts brk/mmap/mremap/munmap syscalls.
@@ -120,70 +116,20 @@ static __thread GArray *memalloc_event_queue = NULL;   /* GArray of MemAllocEven
 /* SyncEventType is defined in wptrace_mnemonics.h */
 #include "wptrace_mnemonics.h"
 
-/* v0.9 Sync operation types (inline in body stream) */
-typedef enum {
-    SYNC_OP_LOCK      = 0,   /* acquire mutex at sync_addr */
-    SYNC_OP_UNLOCK    = 1,   /* release mutex at sync_addr */
-    SYNC_OP_SEM_INC   = 2,   /* increment (post/signal) semaphore */
-    SYNC_OP_SEM_DEC   = 3,   /* decrement (wait) semaphore */
-    SYNC_OP_SPIN_MARK = 4,   /* marks a spin-loop for simulator replay */
-    SYNC_OP_OBJ_INIT  = 5,   /* initialize a sync object */
-} SyncOpType;
-
-/* Sync object types for SYNC_OBJ_INIT */
-typedef enum {
-    SYNC_OBJ_UNKNOWN   = 0,
-    SYNC_OBJ_MUTEX     = 1,
-    SYNC_OBJ_SEMAPHORE = 2,  /* also covers barriers (inverted sem) */
-} SyncObjectType;
-
-/* Per-sync-object tracking state */
-typedef struct {
-    SyncObjectType type;
-    uint64_t       addr;
-    uint32_t       max_count;       /* semaphore max (0 = unbounded) */
-    uint32_t       init_value;      /* value at initialization */
-    uint64_t       first_observed;  /* first data value seen at trace start */
-    uint32_t       creator_thread;  /* thread that first touched it */
-    uint64_t       last_value;      /* last observed data value */
-    uint32_t       lock_owner;      /* thread_id holding the lock (MUTEX) */
-    bool           inverted;        /* true = barrier semantics (wait on 0) */
-    bool           init_emitted;    /* has SYNC_OBJ_INIT been written? */
-} SyncObjectInfo;
-
-/*
- * Multi-thread tracing (v0.9): each vCPU gets its own output file and
- * BodyStreamState.  Thread 0 writes body to a temp file during tracing;
- * at finalization the origin file is assembled as header + templates + body.
- * Secondary threads write directly to _tN.wpt files.
- */
-static bool enable_threads = false;
-
 /*
  * Thread ID assignment: cpu_index -> monotonic uint32_t.
  * First vCPU observed gets thread_id=0 (main thread).
  * MUST be called with exec_lock held (all current call sites satisfy this).
- */
-static GHashTable *cpu_to_thread_id;  /* GUINT_TO_POINTER(cpu_index+1) -> GUINT_TO_POINTER(tid+1) */
-static uint32_t next_thread_id = 0;
-
-/*
- * Per-thread output state: maps thread_id → ThreadFileState*.
- * Thread 0 (origin) streams body directly to the .wpt file;
- * templates + num_threads are appended in the footer at finalization.
- * Secondary threads write header+body directly to _tN.wpt.
+ *
+ * Multi-threaded processes are traced as a single monolithic file.
+ * The trace indicates when the executing thread changes but does NOT
+ * encode synchronisation information nor provide scheduling hints.
  */
 typedef struct BodyStreamState BodyStreamState;  /* forward declaration */
 
-typedef struct {
-    uint32_t thread_id;
-    FILE *file;              /* Output file handle */
-    BodyStreamState *stream; /* Body stream writer */
-    char *file_path;         /* Output file path */
-    bool is_origin;          /* true for thread 0 (origin) */
-} ThreadFileState;
-
-static GHashTable *thread_file_states;  /* uint32_t tid → ThreadFileState* */
+static GHashTable *cpu_to_thread_id;  /* GUINT_TO_POINTER(cpu_index+1) -> GUINT_TO_POINTER(tid+1) */
+static uint32_t next_thread_id = 0;
+static uint32_t last_active_thread = UINT32_MAX; /* for thread-switch detection */
 
 static uint32_t get_or_assign_thread_id(unsigned int cpu_index)
 {
@@ -223,7 +169,6 @@ static guint simpoints_current_idx = 0;
 #define BODY_TAG_END      0   /* end-of-body sentinel */
 #define BODY_TAG_ENTRY    1   /* normal BB body entry */
 #define BODY_TAG_MEMALLOC 2   /* memory allocation event */
-#define BODY_TAG_SYNC     3   /* synchronisation event (sched_yield / futex) */
 
 #define WPT_ISA_BITS 3
 #define WPT_OPCODE_BITS 8
@@ -239,12 +184,7 @@ static guint simpoints_current_idx = 0;
 #define WPT_FLAG_MEM_DATA      (1 << 0)  /* Load/store data values captured */
 #define WPT_FLAG_REG_DATA      (1 << 1)  /* Register values captured (reserved) */
 #define WPT_FLAG_MEM_ALLOC     (1 << 2)  /* Memory allocation events tracked */
-#define WPT_FLAG_THREADED      (1 << 3)  /* This file is part of a multi-thread trace */
 #define WPT_FLAG_HAS_TEMPLATES (1 << 4)  /* This file contains the template dictionary */
-
-/* Sync op type bit width in body stream records */
-#define WPT_SYNC_OP_TYPE_BITS  4
-#define WPT_SYNC_OBJ_TYPE_BITS 4
 
 /* ========================= ISA-Agnostic Instruction Fields ========================= */
 
@@ -325,7 +265,6 @@ enum PluginOptId {
     OPT_COMMENT,
     OPT_MEMDATA,
     OPT_MEMALLOC,
-    OPT_THREADS,
     OPT_SMITH,
 };
 
@@ -1759,10 +1698,8 @@ static void write_text_header(FILE *f, uint32_t thread_id,
     fprintf(f, "FLAGS");
     if (enable_mem_data)  { fprintf(f, " MEM_DATA"); }
     if (enable_mem_alloc) { fprintf(f, " MEM_ALLOC"); }
-    if (enable_threads)   { fprintf(f, " THREADED"); }
     fprintf(f, " HAS_TEMPLATES");
     fprintf(f, "\n");
-    if (enable_threads)   { fprintf(f, "NUM_THREADS %u\n", next_thread_id); }
     fprintf(f, "\n");
 
     fprintf(f, "ENUMS\n-----\n");
@@ -2177,9 +2114,8 @@ struct BodyStreamState {
     GHashTable *cp_dyn_state;   /* template_id -> last dyn params */
     GHashTable *wp_dyn_state;   /* wp template_id -> last dyn params */
     uint64_t num_entries;
-    uint32_t thread_id;         /* owning thread (v0.9) */
-    bool has_templates;         /* true for origin file (thread 0) */
-    bool is_threaded;           /* true for multi-threaded traces */
+    uint32_t thread_id;         /* owning thread */
+    bool has_templates;         /* true for origin file */
 };
 
 /*
@@ -2474,9 +2410,6 @@ static BodyStreamState *body_stream_new(FILE *f, uint32_t thread_id,
     if (enable_mem_alloc) {
         flags |= WPT_FLAG_MEM_ALLOC;
     }
-    if (enable_threads) {
-        flags |= WPT_FLAG_THREADED;
-    }
     if (has_templates) {
         flags |= WPT_FLAG_HAS_TEMPLATES;
     }
@@ -2519,7 +2452,6 @@ static BodyStreamState *body_stream_new(FILE *f, uint32_t thread_id,
 
     st->thread_id = thread_id;
     st->has_templates = has_templates;
-    st->is_threaded = enable_threads;
 
     st->cp_dyn_state = g_hash_table_new_full(g_int_hash, g_int_equal,
                                              g_free,
@@ -2651,202 +2583,10 @@ static void body_stream_write_memalloc_event(BodyStreamState *st,
 }
 
 /*
- * Write a v0.9 sync operation record to the binary body stream.
- * Format: tag(2)=BODY_TAG_SYNC | sync_type(4) | sync_addr(ULEB128)
- *         + type-specific payload
+ * Finish a body stream: write BODY_TAG_END + total_entry_count.
+ * Templates follow in the footer for origin/single-file traces.
  */
-static void body_stream_write_sync_op(BodyStreamState *st,
-                                      SyncOpType op_type,
-                                      uint64_t sync_addr)
-{
-    bw_write_bits(&st->bw, BODY_TAG_SYNC, 2);
-    bw_write_bits(&st->bw, (uint32_t)op_type, WPT_SYNC_OP_TYPE_BITS);
-    bw_write_uleb128(&st->bw, sync_addr);
-}
-
-/*
- * Write a SYNC_OBJ_INIT record with full payload.
- */
-static void body_stream_write_sync_obj_init(BodyStreamState *st,
-                                            uint64_t sync_addr,
-                                            SyncObjectType obj_type,
-                                            uint32_t init_value,
-                                            uint32_t max_value)
-{
-    bw_write_bits(&st->bw, BODY_TAG_SYNC, 2);
-    bw_write_bits(&st->bw, (uint32_t)SYNC_OP_OBJ_INIT, WPT_SYNC_OP_TYPE_BITS);
-    bw_write_uleb128(&st->bw, sync_addr);
-    bw_write_bits(&st->bw, (uint32_t)obj_type, WPT_SYNC_OBJ_TYPE_BITS);
-    bw_write_uleb128(&st->bw, init_value);
-    bw_write_uleb128(&st->bw, max_value);
-}
-
-/*
- * Write a SYNC_SPIN_MARK record with loop body metadata.
- * (Used during spin-loop detection — Phase 2 implementation.)
- */
-static void __attribute__((unused))
-body_stream_write_sync_spin_mark(BodyStreamState *st,
-                                             uint64_t sync_addr,
-                                             uint64_t loop_body_start_offset,
-                                             uint64_t loop_body_entry_count)
-{
-    bw_write_bits(&st->bw, BODY_TAG_SYNC, 2);
-    bw_write_bits(&st->bw, (uint32_t)SYNC_OP_SPIN_MARK, WPT_SYNC_OP_TYPE_BITS);
-    bw_write_uleb128(&st->bw, sync_addr);
-    bw_write_uleb128(&st->bw, loop_body_start_offset);
-    bw_write_uleb128(&st->bw, loop_body_entry_count);
-}
-
-/*
- * Check whether a BB template contains any SYNC_ATOMIC instruction.
- */
-static bool template_has_atomic(const BBTemplate *tmpl)
-{
-    if (!tmpl) {
-        return false;
-    }
-    for (uint32_t i = 0; i < tmpl->n_insns; i++) {
-        if (tmpl->insn_fields[i].sync_hint == SYNC_ATOMIC) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/* ========================= Sync Object Detection ========================= */
-
-/*
- * Get or create a SyncObjectInfo entry for the given address.
- * Must be called with sync_table_lock held.
- */
-static SyncObjectInfo *sync_object_get_or_create(uint64_t addr,
-                                                  uint64_t first_value,
-                                                  uint32_t thread_id)
-{
-    if (!sync_object_table) {
-        return NULL;
-    }
-
-    gpointer key = GUINT_TO_POINTER((guintptr)addr);
-    SyncObjectInfo *info = g_hash_table_lookup(sync_object_table, key);
-    if (info) {
-        return info;
-    }
-
-    info = g_new0(SyncObjectInfo, 1);
-    info->type = SYNC_OBJ_UNKNOWN;
-    info->addr = addr;
-    info->first_observed = first_value;
-    info->last_value = first_value;
-    info->creator_thread = thread_id;
-    info->init_emitted = false;
-    info->inverted = false;
-    g_hash_table_insert(sync_object_table, key, info);
-    return info;
-}
-
-/*
- * Try to emit SYNC_OBJ_INIT for a sync object when its type is first
- * determined. Returns true if an init was emitted.
- */
-static bool maybe_emit_sync_obj_init(BodyStreamState *st,
-                                     SyncObjectInfo *info)
-{
-    if (info->init_emitted || info->type == SYNC_OBJ_UNKNOWN) {
-        return false;
-    }
-
-    uint32_t init_val = (uint32_t)info->first_observed;
-    uint32_t max_val = info->max_count;
-
-    body_stream_write_sync_obj_init(st, info->addr, info->type,
-                                    init_val, max_val);
-    info->init_emitted = true;
-    return true;
-}
-
-/*
- * Detect whether an atomic operation on a given address represents
- * a lock acquisition (XCHG/CAS with 0→1 pattern).
- * Returns true if this looks like a lock acquire.
- */
-static bool detect_lock_acquire(const InsnFields *fld,
-                                uint64_t store_data,
-                                uint64_t load_data)
-{
-    if (fld->sync_hint != SYNC_ATOMIC) {
-        return false;
-    }
-
-    /* XCHG-based lock: writing 1 (or non-zero) and reading 0 means acquired */
-    if (fld->opcode == GEN_OP_XCHG) {
-        /* CAS pattern: old value was 0 (free), new value is 1 (locked) */
-        if (store_data == 1 && load_data == 0) {
-            return true;
-        }
-        /* Reverse convention: old=1 means free, new=0 means locked */
-        if (store_data == 0 && load_data == 1) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-/*
- * Detect whether a store to a known sync object address represents
- * an unlock operation (any write to a known MUTEX addr).
- */
-static bool detect_unlock(uint64_t addr, uint32_t thread_id)
-{
-    if (!sync_object_table) {
-        return false;
-    }
-
-    gpointer key = GUINT_TO_POINTER((guintptr)addr);
-    SyncObjectInfo *info = g_hash_table_lookup(sync_object_table, key);
-    if (!info || info->type != SYNC_OBJ_MUTEX) {
-        return false;
-    }
-
-    /* Any write to a known mutex from the owning thread is an unlock */
-    if (info->lock_owner == thread_id) {
-        return true;
-    }
-
-    return false;
-}
-
-/*
- * Detect semaphore increment (atomic add of a positive value).
- */
-static bool detect_sem_inc(const InsnFields *fld)
-{
-    if (fld->sync_hint != SYNC_ATOMIC) {
-        return false;
-    }
-    return (fld->opcode == GEN_OP_INT_ADD || fld->opcode == GEN_OP_INC);
-}
-
-/*
- * Detect semaphore decrement (atomic sub or dec).
- */
-static bool detect_sem_dec(const InsnFields *fld)
-{
-    if (fld->sync_hint != SYNC_ATOMIC) {
-        return false;
-    }
-    return (fld->opcode == GEN_OP_INT_SUB || fld->opcode == GEN_OP_DEC);
-}
-
-/*
- * Finish a body stream (v0.9): write BODY_TAG_END + total_entry_count.
- * For origin/single-threaded files, templates follow in the footer.
- * For threaded origin files, num_threads is also written after templates.
- */
-static void body_stream_finish(BodyStreamState *st, bool write_templates,
-                               uint32_t num_threads)
+static void body_stream_finish(BodyStreamState *st, bool write_templates)
 {
     uint64_t footer_start_bits;
     uint64_t end_bits;
@@ -2856,16 +2596,11 @@ static void body_stream_finish(BodyStreamState *st, bool write_templates,
 
     bw_write_uleb128(&st->bw, st->num_entries);
 
-    /* Templates in footer for origin/single-threaded files */
+    /* Templates in footer for origin/single-file traces */
     if (write_templates) {
         g_mutex_lock(&data_lock);
         write_bin_templates(&st->bw);
         g_mutex_unlock(&data_lock);
-    }
-
-    /* num_threads in footer for threaded origin files */
-    if (st->is_threaded && write_templates) {
-        bw_write_uleb128(&st->bw, (uint64_t)num_threads);
     }
 
     bw_flush(&st->bw);
@@ -2990,83 +2725,6 @@ static GArray *parse_simpoints_file(const char *path)
 }
 
 /*
- * Get or create a ThreadFileState for the given thread_id.
- * Must be called with exec_lock held.
- * Thread 0 (origin) streams body directly to the .wpt file;
- * templates are appended at finalization.
- * Secondary threads write header+body directly to _tN.wpt.
- */
-static ThreadFileState *get_or_create_thread_file(uint32_t thread_id,
-                                                  const char *datetime)
-{
-    if (!thread_file_states) {
-        return NULL;
-    }
-
-    gpointer key = GUINT_TO_POINTER(thread_id);
-    ThreadFileState *tfs = g_hash_table_lookup(thread_file_states, key);
-    if (tfs) {
-        return tfs;
-    }
-
-    tfs = g_new0(ThreadFileState, 1);
-    tfs->thread_id = thread_id;
-
-    if (thread_id == 0) {
-        /* Origin thread: stream body directly to the .wpt file.
-         * Templates + num_threads written in footer at finalization. */
-        TraceSegment *seg = current_segment;
-        g_autofree char *base = NULL;
-
-        if (seg && seg->label && simpoints_list) {
-            base = g_strdup_printf("%s_%s.wpt",
-                                   output_base_path, seg->label);
-        } else {
-            base = g_strdup_printf("%s.wpt", output_base_path);
-        }
-
-        tfs->is_origin = true;
-        tfs->file_path = g_strdup(base);
-        tfs->file = fopen(base, "wb");
-        if (!tfs->file) {
-            fprintf(stderr, "wptrace: cannot open origin file: %s\n", base);
-            g_free(tfs->file_path);
-            g_free(tfs);
-            return NULL;
-        }
-        /* Write header + stream body directly; has_templates=true
-         * so templates go in footer via body_stream_finish(). */
-        tfs->stream = body_stream_new(tfs->file, 0, datetime, true);
-    } else {
-        /* Secondary thread: write header + body to _tN.wpt directly */
-        TraceSegment *seg = current_segment;
-        g_autofree char *base = NULL;
-
-        if (seg && seg->label && simpoints_list) {
-            base = g_strdup_printf("%s_%s_t%u.wpt",
-                                   output_base_path, seg->label, thread_id);
-        } else {
-            base = g_strdup_printf("%s_t%u.wpt",
-                                   output_base_path, thread_id);
-        }
-
-        tfs->file_path = g_strdup(base);
-        tfs->file = fopen(base, "wb");
-        if (!tfs->file) {
-            fprintf(stderr, "wptrace: cannot open thread file: %s\n", base);
-            g_free(tfs->file_path);
-            g_free(tfs);
-            return NULL;
-        }
-        tfs->is_origin = false;
-        tfs->stream = body_stream_new(tfs->file, thread_id, datetime, false);
-    }
-
-    g_hash_table_insert(thread_file_states, key, tfs);
-    return tfs;
-}
-
-/*
  * Start a new trace segment with the given label and instruction range.
  */
 static void start_trace_segment(const char *label,
@@ -3091,19 +2749,12 @@ static void start_trace_segment(const char *label,
                  "%Y-%m-%d %H:%M:%S", &tm_buf);
     }
 
-    /* Initialize per-thread file state table */
-    if (enable_threads) {
-        thread_file_states = g_hash_table_new(g_direct_hash, g_direct_equal);
-        /* Initialize sync object table */
-        sync_object_table = g_hash_table_new_full(g_direct_hash, g_direct_equal,
-                                                   NULL, g_free);
-        g_mutex_init(&sync_table_lock);
-        /* Reset thread ID assignment for this segment */
-        if (cpu_to_thread_id) {
-            g_hash_table_remove_all(cpu_to_thread_id);
-        }
-        next_thread_id = 0;
+    /* Reset thread ID assignment for this segment */
+    if (cpu_to_thread_id) {
+        g_hash_table_remove_all(cpu_to_thread_id);
     }
+    next_thread_id = 0;
+    last_active_thread = UINT32_MAX;
 
     /* Determine output file paths based on mode */
     g_autofree char *bin_path = NULL;
@@ -3125,30 +2776,18 @@ static void start_trace_segment(const char *label,
     }
 
     if (bin_path) {
-        if (enable_threads) {
-            /* Multi-threaded: thread 0 streams directly to .wpt;
-             * templates + num_threads written in footer at finalization. */
-            current_segment->bin_file = NULL;
-            current_segment->bin_stream = NULL;
-            /* Save label for file path construction */
-            g_free(current_segment->label);
-            current_segment->label = g_strdup(label);
-            /* Create thread 0 file state (opens origin .wpt directly) */
-            get_or_create_thread_file(0, current_segment->start_datetime);
+        /* Write directly to the output file.
+         * Templates go in footer (has_templates flag set in header). */
+        current_segment->bin_file = fopen(bin_path, "wb");
+        if (!current_segment->bin_file) {
+            fprintf(stderr, "wptrace: cannot open binary output: %s\n",
+                    bin_path);
         } else {
-            /* Single-threaded: write directly to the output file.
-             * Templates go in footer (has_templates flag set in header). */
-            current_segment->bin_file = fopen(bin_path, "wb");
-            if (!current_segment->bin_file) {
-                fprintf(stderr, "wptrace: cannot open binary output: %s\n",
-                        bin_path);
-            } else {
-                current_segment->bin_stream = body_stream_new(
-                    current_segment->bin_file, 0,
-                    current_segment->start_datetime, true);
-                if (!current_segment->bin_stream) {
-                    fprintf(stderr, "wptrace: cannot initialize binary stream\n");
-                }
+            current_segment->bin_stream = body_stream_new(
+                current_segment->bin_file, 0,
+                current_segment->start_datetime, true);
+            if (!current_segment->bin_stream) {
+                fprintf(stderr, "wptrace: cannot initialize binary stream\n");
             }
         }
     }
@@ -3177,7 +2816,7 @@ static void start_trace_segment(const char *label,
  * v0.9 multi-threaded: finalize all per-thread streams.
  * Origin file (thread 0) gets templates + num_threads in footer.
  * Secondary thread files get BODY_TAG_END + entry_count only.
- * No temp file assembly needed — body is streamed directly.
+ * Must be called with exec_lock held.
  */
 static void finish_trace_segment(void)
 {
@@ -3188,52 +2827,9 @@ static void finish_trace_segment(void)
     trace_active = false;
     g_atomic_int_set(&trace_active_atomic, 0);
 
-    if (enable_threads && thread_file_states) {
-        uint32_t num_threads = next_thread_id;
-
-        /* Finalize all per-thread body streams */
-        GHashTableIter iter;
-        gpointer key, value;
-        g_hash_table_iter_init(&iter, thread_file_states);
-        while (g_hash_table_iter_next(&iter, &key, &value)) {
-            ThreadFileState *tfs = value;
-            if (tfs->stream) {
-                if (tfs->is_origin) {
-                    /* Origin: write templates + num_threads in footer */
-                    body_stream_finish(tfs->stream, true, num_threads);
-                } else {
-                    /* Secondary: no templates */
-                    body_stream_finish(tfs->stream, false, 0);
-                }
-                g_free(tfs->stream);
-                tfs->stream = NULL;
-            }
-            if (tfs->file) {
-                fclose(tfs->file);
-                tfs->file = NULL;
-            }
-        }
-
-        /* Clean up per-thread state */
-        g_hash_table_iter_init(&iter, thread_file_states);
-        while (g_hash_table_iter_next(&iter, &key, &value)) {
-            ThreadFileState *tfs = value;
-            g_free(tfs->file_path);
-            g_free(tfs);
-        }
-        g_hash_table_destroy(thread_file_states);
-        thread_file_states = NULL;
-
-        /* Clean up sync object table */
-        if (sync_object_table) {
-            g_hash_table_destroy(sync_object_table);
-            sync_object_table = NULL;
-        }
-    } else {
-        /* Single-threaded: finish the single stream */
-        if (current_segment->bin_stream) {
-            body_stream_finish(current_segment->bin_stream, true, 0);
-        }
+    /* Finish the single monolithic stream */
+    if (current_segment->bin_stream) {
+        body_stream_finish(current_segment->bin_stream, true);
     }
 
     if (current_segment->text_file) {
@@ -3430,21 +3026,23 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
         /*
          * Determine the output stream for this BB.
-         * Single-threaded: seg->bin_stream.
-         * Multi-threaded: per-thread stream from thread_file_states.
+         * All threads write to the single monolithic output file.
+         * Thread switches are noted via thread_id tracking.
          */
-        BodyStreamState *out_stream = NULL;
+        BodyStreamState *out_stream = seg->bin_stream;
         uint32_t cur_tid = 0;
 
-        if (enable_threads) {
+        if (cpu_to_thread_id) {
             cur_tid = get_or_assign_thread_id(cpu_index);
-            ThreadFileState *tfs = get_or_create_thread_file(
-                cur_tid, current_segment->start_datetime);
-            if (tfs) {
-                out_stream = tfs->stream;
+            if (cur_tid != last_active_thread) {
+                /* Thread switch detected — note in text output */
+                if (seg->text_body_tmp && last_active_thread != UINT32_MAX) {
+                    fprintf(seg->text_body_tmp,
+                            "THREAD_SWITCH from=%u to=%u\n",
+                            last_active_thread, cur_tid);
+                }
+                last_active_thread = cur_tid;
             }
-        } else {
-            out_stream = seg->bin_stream;
         }
 
         if (out_stream) {
@@ -3474,151 +3072,6 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
                     }
                 }
                 g_array_set_size(memalloc_event_queue, 0);
-            }
-
-            /*
-             * v0.9 sync detection: inspect atomic BBs for lock/unlock/sem ops.
-             * Emit inline SYNC records before the body entry.
-             */
-            if (enable_threads && cp_tmpl && template_has_atomic(cp_tmpl)
-                && entry.dyn_params) {
-                uint32_t dyn_idx = 0;
-                for (uint32_t i = 0;
-                     i < cp_tmpl->n_insns && dyn_idx < entry.dyn_params->len;
-                     i++) {
-                    const InsnFields *fld = &cp_tmpl->insn_fields[i];
-
-                    if (fld->sync_hint != SYNC_ATOMIC) {
-                        /* Non-atomic insn: skip past any DynParams it consumed */
-                        while (dyn_idx < entry.dyn_params->len) {
-                            const DynParam *dp = &g_array_index(
-                                entry.dyn_params, DynParam, dyn_idx);
-                            if (dp->type == DYN_LOAD_ADDR ||
-                                dp->type == DYN_STORE_ADDR) {
-                                /* Check for unlock: store to known mutex addr */
-                                if (dp->type == DYN_STORE_ADDR) {
-                                    g_mutex_lock(&sync_table_lock);
-                                    if (detect_unlock(dp->value, cur_tid)) {
-                                        SyncObjectInfo *info =
-                                            g_hash_table_lookup(
-                                                sync_object_table,
-                                                GUINT_TO_POINTER(
-                                                    (guintptr)dp->value));
-                                        if (info) {
-                                            info->lock_owner = UINT32_MAX;
-                                            info->last_value = dp->data_lo;
-                                        }
-                                        body_stream_write_sync_op(
-                                            out_stream, SYNC_OP_UNLOCK,
-                                            dp->value);
-                                        if (seg->text_body_tmp) {
-                                            fprintf(seg->text_body_tmp,
-                                                    "SYNC type=UNLOCK addr=0x%"
-                                                    PRIx64 "\n", dp->value);
-                                        }
-                                    }
-                                    g_mutex_unlock(&sync_table_lock);
-                                }
-                                dyn_idx++;
-                                break;
-                            }
-                            break;
-                        }
-                        continue;
-                    }
-
-                    /* Atomic instruction: find its DynParam */
-                    uint64_t mem_addr = 0;
-                    uint64_t store_val = 0;
-                    uint64_t load_val = 0;
-                    bool has_store = false;
-                    bool has_load = false;
-
-                    while (dyn_idx < entry.dyn_params->len) {
-                        const DynParam *dp = &g_array_index(
-                            entry.dyn_params, DynParam, dyn_idx);
-                        if (dp->type == DYN_LOAD_ADDR) {
-                            mem_addr = dp->value;
-                            load_val = dp->data_lo;
-                            has_load = true;
-                            dyn_idx++;
-                        } else if (dp->type == DYN_STORE_ADDR) {
-                            mem_addr = dp->value;
-                            store_val = dp->data_lo;
-                            has_store = true;
-                            dyn_idx++;
-                        } else {
-                            break;
-                        }
-                        break; /* one DynParam per insn */
-                    }
-
-                    if (!has_load && !has_store) {
-                        continue; /* fence or barrier without mem operand */
-                    }
-
-                    /* Classify the sync operation */
-                    g_mutex_lock(&sync_table_lock);
-                    SyncObjectInfo *info = sync_object_get_or_create(
-                        mem_addr,
-                        has_load ? load_val : store_val,
-                        cur_tid);
-
-                    if (info) {
-                        static const char *sync_obj_type_names[] = {
-                            "UNKNOWN", "MUTEX", "SEMAPHORE"
-                        };
-                        static const char *sync_op_names[] = {
-                            "LOCK", "UNLOCK", "SEM_INC", "SEM_DEC",
-                            "SPIN_MARK", "OBJ_INIT"
-                        };
-                        info->last_value = has_store ? store_val : load_val;
-                        SyncOpType detected_op = (SyncOpType)-1;
-
-                        if (detect_lock_acquire(fld, store_val, load_val)) {
-                            if (info->type == SYNC_OBJ_UNKNOWN) {
-                                info->type = SYNC_OBJ_MUTEX;
-                            }
-                            detected_op = SYNC_OP_LOCK;
-                            info->lock_owner = cur_tid;
-                        } else if (detect_sem_inc(fld)) {
-                            if (info->type == SYNC_OBJ_UNKNOWN) {
-                                info->type = SYNC_OBJ_SEMAPHORE;
-                            }
-                            detected_op = SYNC_OP_SEM_INC;
-                        } else if (detect_sem_dec(fld)) {
-                            if (info->type == SYNC_OBJ_UNKNOWN) {
-                                info->type = SYNC_OBJ_SEMAPHORE;
-                            }
-                            detected_op = SYNC_OP_SEM_DEC;
-                        }
-
-                        if (detected_op != (SyncOpType)-1) {
-                            bool did_init =
-                                maybe_emit_sync_obj_init(out_stream, info);
-                            if (did_init && seg->text_body_tmp) {
-                                fprintf(seg->text_body_tmp,
-                                        "SYNC type=OBJ_INIT addr=0x%"
-                                        PRIx64 " obj=%s init=%u max=%u\n",
-                                        info->addr,
-                                        sync_obj_type_names[info->type],
-                                        (uint32_t)info->first_observed,
-                                        info->max_count);
-                            }
-                            body_stream_write_sync_op(out_stream,
-                                                      detected_op,
-                                                      mem_addr);
-                            if (seg->text_body_tmp) {
-                                fprintf(seg->text_body_tmp,
-                                        "SYNC type=%s addr=0x%"
-                                        PRIx64 "\n",
-                                        sync_op_names[detected_op],
-                                        mem_addr);
-                            }
-                        }
-                    }
-                    g_mutex_unlock(&sync_table_lock);
-                }
             }
 
             body_stream_write_entry(out_stream, &entry);
@@ -4180,7 +3633,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             {"program", OPT_PROGRAM}, {"spfile",  OPT_SPFILE},
             {"spinterval", OPT_SPINTERVAL},
             {"comment", OPT_COMMENT}, {"memdata", OPT_MEMDATA},
-            {"memalloc", OPT_MEMALLOC}, {"threads", OPT_THREADS},
+            {"memalloc", OPT_MEMALLOC},
             {"smith", OPT_SMITH},
             {NULL, 0}
         };
@@ -4247,9 +3700,6 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             break;
         case OPT_MEMALLOC:
             enable_mem_alloc = (atoi(tokens[1]) != 0);
-            break;
-        case OPT_THREADS:
-            enable_threads = (atoi(tokens[1]) != 0);
             break;
         case OPT_SMITH:
             enable_smith_predictor = (atoi(tokens[1]) != 0);
@@ -4329,11 +3779,9 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     sb_insn_count = qemu_plugin_scoreboard_u64_in_struct(
         vcpu_sb, VCPUScoreBoard, insn_count);
 
-    /* Initialise thread ID mapping (needed for threads=1) — must happen
-     * before start_trace_segment() which calls get_or_assign_thread_id(). */
-    if (enable_threads) {
-        cpu_to_thread_id = g_hash_table_new(g_direct_hash, g_direct_equal);
-    }
+    /* Initialise thread ID mapping — always active so the trace records
+     * accurate thread IDs and notes when the executing thread changes. */
+    cpu_to_thread_id = g_hash_table_new(g_direct_hash, g_direct_equal);
 
     /* For simple start/stop, auto-start if start is 0 (not simpoints mode). */
     if (!simpoints_list && trace_start_insn == 0) {

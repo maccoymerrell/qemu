@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-WPT_MAGIC = 0x54505709
+WPT_MAGIC = 0x5450570A
 
 WPT_ISA_BITS = 3
 WPT_OPCODE_BITS = 8
@@ -105,6 +105,15 @@ OPCODE_NAMES = {
     49: "NEG",
     50: "INC",
     51: "DEC",
+    52: "INT_MADD",
+    53: "INT_MSUB",
+    54: "FP_MADD",
+    55: "FP_MSUB",
+    56: "INT_REM",
+    57: "INT_MULH",
+    58: "VEC_MADD",
+    59: "BITMANIP",
+    60: "CRYPTO",
 }
 
 
@@ -142,6 +151,7 @@ def build_reg_names() -> dict[int, str]:
         names[65 + i] = f"FPR{i}"
     for i in range(64):
         names[129 + i] = f"VEC{i}"
+    names[249] = "ZERO"
     names[250] = "SP"
     names[251] = "FLAGS"
     names[252] = "IP"

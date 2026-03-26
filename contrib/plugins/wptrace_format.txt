@@ -1,5 +1,5 @@
-wptrace Binary Trace Format — v0.8
-====================================
+wptrace Binary Trace Format — v0.10
+=====================================
 
 1. Notation & Primitives
 ------------------------
@@ -56,7 +56,7 @@ Written once at the start of the stream.
   ┌─────────────┬─────────┬────────────────────────────────┐
   │ Field       │ Encoding│ Description                    │
   ├─────────────┼─────────┼────────────────────────────────┤
-  │ magic       │ bits(32)│ 0x54505708 ('T','P','W',0x08)  │
+  │ magic       │ bits(32)│ 0x5450570A ('T','P','W',0x0A)  │
   │ isa         │ bits(3) │ TraceISA enum (see §10)        │
   │ flags       │ bits(8) │ Feature flags (see §3.1)       │
   │ command     │ string  │ QEMU command line              │
@@ -71,7 +71,7 @@ features:
 
   bit 0                          31 32  34 35      42
   ┌──────────────────────────────┬───┬──────────┐
-  │  0x54505708  (32 bits)       │001│ 00000000 │  ...strings...
+  │  0x5450570A  (32 bits)       │001│ 00000000 │  ...strings...
   └──────────────────────────────┴───┴──────────┘
    magic                         isa  flags=0x00
 
@@ -376,7 +376,7 @@ After BODY_TAG_END:
   └─────────────────────────────────────────────┘
 
 Readers that do not understand FLAG_THREAD_DIR will not know to skip
-the directory; this is intentional — the magic version (0x08)
+the directory; this is intentional — the magic version (0x0A)
 rejects old readers.
 
 
@@ -412,9 +412,26 @@ rejects old readers.
   │ 13 │ ROR      │ 31 │ FP_DIV   │ 49 │ NEG      │
   │ 14 │ MOV      │ 32 │ FP_SQRT  │ 50 │ INC      │
   │ 15 │ LOAD     │ 33 │ FP_MOV   │ 51 │ DEC      │
-  │ 16 │ STORE    │ 34 │ FP_CVT   │    │          │
-  │ 17 │ PUSH     │ 35 │ FP_CMP   │    │          │
+  │ 16 │ STORE    │ 34 │ FP_CVT   │ 52 │ INT_MADD │
+  │ 17 │ PUSH     │ 35 │ FP_CMP   │ 53 │ INT_MSUB │
   └────┴──────────┴────┴──────────┴────┴──────────┘
+  ┌────┬──────────┐
+  │ 54 │ FP_MADD  │  Fused FP multiply-add  (FMADD, VFMADD*, FMLA)
+  │ 55 │ FP_MSUB  │  Fused FP multiply-sub  (FMSUB, VFMSUB*, FMLS)
+  │ 56 │ INT_REM  │  Integer remainder       (REM, REMU)
+  │ 57 │ INT_MULH │  Integer multiply-high   (MULH, SMULH, UMULH)
+  │ 58 │ VEC_MADD │  Vector multiply-accum.  (MLA, SMLAL, MADDV)
+  │ 59 │ BITMANIP │  Bit manipulation        (CLZ, CTZ, POPCNT, BSWAP)
+  │ 60 │ CRYPTO   │  Cryptographic ops       (AES, SHA, CRC32)
+  └────┴──────────┘
+
+  Opcodes 52-60 distinguish operations with significantly different
+  latencies from their base category.  For example, fused multiply-add
+  (FP_MADD) has different pipeline timing than a plain FP_MUL on most
+  microarchitectures.  INT_REM separates remainder from division, and
+  INT_MULH separates multiply-high (which may have different latency
+  than a plain multiply on some designs).  BITMANIP and CRYPTO cover
+  instructions that often use dedicated functional units.
 
 10.3  BranchType — bits(8)
 
@@ -464,6 +481,7 @@ rejects old readers.
   │  1- 64 │ GPR0-GPR63  (general-purpose)          │
   │ 65-128 │ FPR0-FPR63  (floating-point)           │
   │129-192 │ VEC0-VEC63  (vector/SIMD)              │
+  │   249  │ ZERO        (hardwired zero register)  │
   │   250  │ SP          (stack pointer)             │
   │   251  │ FLAGS       (condition flags)           │
   │   252  │ IP          (instruction pointer)       │
@@ -471,12 +489,19 @@ rejects old readers.
   │   254  │ FP          (frame pointer)             │
   └─────────┴──────────────────────────────────────┘
 
+  The ZERO register (249) represents ISA registers that are hardwired
+  to always produce zero on read.  ISA-specific mappings:
+    riscv64: X0 (zero) → ZERO
+    mipsel:  $0 ($zero) → ZERO
+    aarch64: XZR / WZR  → ZERO
+    x86_64:  (no zero register)
+
   ISA-specific mappings (GPR0-31):
     x86_64:  GPR0=RAX GPR1=RCX GPR2=RDX GPR3=RBX GPR4=RSI GPR5=RDI
              GPR6-GPR13=R8-R15
     aarch64: GPR0-GPR30=X0-X30
-    riscv64: GPR0-GPR31=X0-X31
-    mipsel:  GPR0-GPR31=$0-$31
+    riscv64: GPR0-GPR31=X0-X31  (X0 maps to ZERO, not GPR0)
+    mipsel:  GPR0-GPR31=$0-$31  ($0 maps to ZERO, not GPR0)
 
   FPR and VEC ranges follow per-ISA conventions.
 

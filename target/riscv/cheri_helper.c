@@ -536,8 +536,27 @@ void helper_cheri_cspecialrw(CPURISCVState *env, uint32_t cd, uint32_t cs1,
     case 1:  /* DDC */
         special = &env->ddc;
         break;
+#ifndef CONFIG_USER_ONLY
+    case 12: /* STCC - Supervisor Trap Code Capability */
+        special = &env->stvecc;
+        break;
+    case 14: /* SScratchC - Supervisor Scratch Capability */
+        special = &env->sscratchc;
+        break;
+    case 15: /* SEPCC - Supervisor Exception PC Capability */
+        special = &env->sepcc;
+        break;
+    case 28: /* MTCC - Machine Trap Code Capability */
+        special = &env->mtvecc;
+        break;
+    case 30: /* MScratchC - Machine Scratch Capability */
+        special = &env->mscratchc;
+        break;
+    case 31: /* MEPCC - Machine Exception PC Capability */
+        special = &env->mepcc;
+        break;
+#endif
     default:
-        /* Other SCRs not yet implemented — raise illegal insn */
         riscv_raise_exception(env, RISCV_EXCP_ILLEGAL_INST, GETPC());
         return;
     }
@@ -548,9 +567,19 @@ void helper_cheri_cspecialrw(CPURISCVState *env, uint32_t cd, uint32_t cs1,
     /* Write new value if cs1 != 0 */
     if (src) {
         *special = *src;
-        if (scr == 0) {
-            /* Updating PCC cursor also updates pc */
-            env->pc = (target_ulong)cap_get_cursor(special);
+        /* Sync the integer CSR/PC with the capability cursor */
+        target_ulong cursor = (target_ulong)cap_get_cursor(special);
+        switch (scr) {
+        case 0: env->pc = cursor; break;
+#ifndef CONFIG_USER_ONLY
+        case 12: env->stvec = cursor; break;
+        case 14: env->sscratch = cursor; break;
+        case 15: env->sepc = cursor; break;
+        case 28: env->mtvec = cursor; break;
+        case 30: env->mscratch = cursor; break;
+        case 31: env->mepc = cursor; break;
+#endif
+        default: break;
         }
     }
 

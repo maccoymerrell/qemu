@@ -348,11 +348,17 @@ struct CPUArchState {
     target_ulong stvec;
     target_ulong sepc;
     target_ulong scause;
+    cap_register_t stvecc;    /* CHERI SCR 12: extends stvec */
+    cap_register_t sepcc;     /* CHERI SCR 15: extends sepc */
+    cap_register_t sscratchc; /* CHERI SCR 14: extends sscratch */
 
     target_ulong mtvec;
     target_ulong mepc;
     target_ulong mcause;
     target_ulong mtval;  /* since: priv-1.10.0 */
+    cap_register_t mtvecc;    /* CHERI SCR 28: extends mtvec */
+    cap_register_t mepcc;     /* CHERI SCR 31: extends mepc */
+    cap_register_t mscratchc; /* CHERI SCR 30: extends mscratch */
 
     uint64_t mctrctl;
     uint32_t sctrdepth;
@@ -410,6 +416,9 @@ struct CPUArchState {
     target_ulong vstvec;
     target_ulong vsscratch;
     target_ulong vsepc;
+    cap_register_t vstvecc;    /* CHERI: extends vstvec */
+    cap_register_t vsscratchc; /* CHERI: extends vsscratch */
+    cap_register_t vsepcc;     /* CHERI: extends vsepc */
     target_ulong vscause;
     target_ulong vstval;
     target_ulong vsatp;
@@ -424,6 +433,9 @@ struct CPUArchState {
     target_ulong stvec_hs;
     target_ulong sscratch_hs;
     target_ulong sepc_hs;
+    cap_register_t stvecc_hs;    /* CHERI: HS backup of stvecc */
+    cap_register_t sscratchc_hs; /* CHERI: HS backup of sscratchc */
+    cap_register_t sepcc_hs;     /* CHERI: HS backup of sepcc */
     target_ulong scause_hs;
     target_ulong stval_hs;
     target_ulong satp_hs;

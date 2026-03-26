@@ -1085,6 +1085,28 @@ static void riscv_cpu_reset_hold(Object *obj, ResetType type)
         for (i = 0; i < 32; i++) {
             env->gpcr[i] = cap_mk_null();
         }
+
+        /* M-mode trap SCRs: MTCC and MEPCC start as root capabilities */
+        env->mtvecc = cap_mk_root();
+        cap_set_addr(&env->mtvecc, (uint64_t)env->mtvec);
+        env->mepcc = cap_mk_root();
+        cap_set_addr(&env->mepcc, (uint64_t)env->mepc);
+        env->mscratchc = cap_mk_null();
+
+        /* S-mode trap SCRs: STCC and SEPCC start as root capabilities */
+        env->stvecc = cap_mk_root();
+        cap_set_addr(&env->stvecc, (uint64_t)env->stvec);
+        env->sepcc = cap_mk_root();
+        cap_set_addr(&env->sepcc, (uint64_t)env->sepc);
+        env->sscratchc = cap_mk_null();
+
+        /* Hypervisor/VS-mode capability variants start as null */
+        env->vstvecc = cap_mk_null();
+        env->vsepcc = cap_mk_null();
+        env->vsscratchc = cap_mk_null();
+        env->stvecc_hs = cap_mk_null();
+        env->sepcc_hs = cap_mk_null();
+        env->sscratchc_hs = cap_mk_null();
     }
 
     env->menvcfg = (cpu->cfg.ext_svpbmt ? MENVCFG_PBMTE : 0) |

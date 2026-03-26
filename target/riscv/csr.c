@@ -2956,7 +2956,11 @@ done:
 static RISCVException read_mtvec(CPURISCVState *env, int csrno,
                                  target_ulong *val)
 {
-    *val = env->mtvec;
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        *val = (target_ulong)cap_get_cursor(&env->mtvecc);
+    } else {
+        *val = env->mtvec;
+    }
     return RISCV_EXCP_NONE;
 }
 
@@ -2966,6 +2970,9 @@ static RISCVException write_mtvec(CPURISCVState *env, int csrno,
     /* bits [1:0] encode mode; 0 = direct, 1 = vectored, 2 >= reserved */
     if ((val & 3) < 2) {
         env->mtvec = val;
+        if (riscv_cpu_cfg(env)->ext_xcheri) {
+            cap_set_addr(&env->mtvecc, (uint64_t)val);
+        }
     } else {
         qemu_log_mask(LOG_UNIMP, "CSR_MTVEC: reserved mode not supported\n");
     }
@@ -3098,7 +3105,11 @@ static RISCVException write_mscratch_i128(CPURISCVState *env, int csrno,
 static RISCVException read_mscratch(CPURISCVState *env, int csrno,
                                     target_ulong *val)
 {
-    *val = env->mscratch;
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        *val = (target_ulong)cap_get_cursor(&env->mscratchc);
+    } else {
+        *val = env->mscratch;
+    }
     return RISCV_EXCP_NONE;
 }
 
@@ -3106,13 +3117,20 @@ static RISCVException write_mscratch(CPURISCVState *env, int csrno,
                                      target_ulong val)
 {
     env->mscratch = val;
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        cap_set_addr(&env->mscratchc, (uint64_t)val);
+    }
     return RISCV_EXCP_NONE;
 }
 
 static RISCVException read_mepc(CPURISCVState *env, int csrno,
                                 target_ulong *val)
 {
-    *val = env->mepc;
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        *val = (target_ulong)cap_get_cursor(&env->mepcc);
+    } else {
+        *val = env->mepc;
+    }
     return RISCV_EXCP_NONE;
 }
 
@@ -3120,6 +3138,9 @@ static RISCVException write_mepc(CPURISCVState *env, int csrno,
                                  target_ulong val)
 {
     env->mepc = val;
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        cap_set_addr(&env->mepcc, (uint64_t)val);
+    }
     return RISCV_EXCP_NONE;
 }
 
@@ -4036,7 +4057,11 @@ static RISCVException rmw_sieh(CPURISCVState *env, int csrno,
 static RISCVException read_stvec(CPURISCVState *env, int csrno,
                                  target_ulong *val)
 {
-    *val = env->stvec;
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        *val = (target_ulong)cap_get_cursor(&env->stvecc);
+    } else {
+        *val = env->stvec;
+    }
     return RISCV_EXCP_NONE;
 }
 
@@ -4046,6 +4071,9 @@ static RISCVException write_stvec(CPURISCVState *env, int csrno,
     /* bits [1:0] encode mode; 0 = direct, 1 = vectored, 2 >= reserved */
     if ((val & 3) < 2) {
         env->stvec = val;
+        if (riscv_cpu_cfg(env)->ext_xcheri) {
+            cap_set_addr(&env->stvecc, (uint64_t)val);
+        }
     } else {
         qemu_log_mask(LOG_UNIMP, "CSR_STVEC: reserved mode not supported\n");
     }
@@ -4089,7 +4117,11 @@ static RISCVException write_sscratch_i128(CPURISCVState *env, int csrno,
 static RISCVException read_sscratch(CPURISCVState *env, int csrno,
                                     target_ulong *val)
 {
-    *val = env->sscratch;
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        *val = (target_ulong)cap_get_cursor(&env->sscratchc);
+    } else {
+        *val = env->sscratch;
+    }
     return RISCV_EXCP_NONE;
 }
 
@@ -4097,13 +4129,20 @@ static RISCVException write_sscratch(CPURISCVState *env, int csrno,
                                      target_ulong val)
 {
     env->sscratch = val;
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        cap_set_addr(&env->sscratchc, (uint64_t)val);
+    }
     return RISCV_EXCP_NONE;
 }
 
 static RISCVException read_sepc(CPURISCVState *env, int csrno,
                                 target_ulong *val)
 {
-    *val = env->sepc;
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        *val = (target_ulong)cap_get_cursor(&env->sepcc);
+    } else {
+        *val = env->sepc;
+    }
     return RISCV_EXCP_NONE;
 }
 
@@ -4111,6 +4150,9 @@ static RISCVException write_sepc(CPURISCVState *env, int csrno,
                                  target_ulong val)
 {
     env->sepc = val;
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        cap_set_addr(&env->sepcc, (uint64_t)val);
+    }
     return RISCV_EXCP_NONE;
 }
 

@@ -162,8 +162,8 @@ static guint simpoints_current_idx = 0;
 
 #define MAX_INSN_BYTES 16
 
-/* Binary format magic/version 0.9 */
-#define WPT_MAGIC  0x54505709  /* 'T','P','W',0x09 little-endian - version 0.9 */
+/* Binary format magic/version 0.10 */
+#define WPT_MAGIC  0x5450570A  /* 'T','P','W',0x0A little-endian - version 0.10 */
 
 /* Body entry tags (2-bit field) */
 #define BODY_TAG_END      0   /* end-of-body sentinel */
@@ -688,6 +688,15 @@ static const char *generic_opcode_name(uint8_t op)
         [GEN_OP_NEG]      = "NEG",
         [GEN_OP_INC]      = "INC",
         [GEN_OP_DEC]      = "DEC",
+        [GEN_OP_INT_MADD] = "INT_MADD",
+        [GEN_OP_INT_MSUB] = "INT_MSUB",
+        [GEN_OP_FP_MADD]  = "FP_MADD",
+        [GEN_OP_FP_MSUB]  = "FP_MSUB",
+        [GEN_OP_INT_REM]  = "INT_REM",
+        [GEN_OP_INT_MULH] = "INT_MULH",
+        [GEN_OP_VEC_MADD] = "VEC_MADD",
+        [GEN_OP_BITMANIP] = "BITMANIP",
+        [GEN_OP_CRYPTO]   = "CRYPTO",
     };
     return (op < GEN_OP_COUNT) ? names[op] : "UNKNOWN";
 }
@@ -727,6 +736,7 @@ static const char *generic_reg_name(uint8_t reg_id)
         return buf;
     }
     switch (reg_id) {
+    case REG_ZERO:    return "ZERO";
     case REG_SP:      return "SP";
     case REG_FLAGS:   return "FLAGS";
     case REG_IP:      return "IP";
@@ -1719,7 +1729,7 @@ static void write_text_header(FILE *f, uint32_t thread_id,
     for (uint32_t i = 0; i < GEN_EXC_COUNT; i++) {
         fprintf(f, "E %u %s\n", i, generic_exception_name(i));
     }
-    fprintf(f, "REGS 198\n");
+    fprintf(f, "REGS 199\n");
     fprintf(f, "R %u %s\n", REG_NONE, generic_reg_name(REG_NONE));
     for (uint32_t i = 0; i < 64; i++) {
         uint8_t rid = REG_GPR0 + i;
@@ -1733,6 +1743,7 @@ static void write_text_header(FILE *f, uint32_t thread_id,
         uint8_t rid = REG_VEC0 + i;
         fprintf(f, "R %u %s\n", rid, generic_reg_name(rid));
     }
+    fprintf(f, "R %u %s\n", REG_ZERO, generic_reg_name(REG_ZERO));
     fprintf(f, "R %u %s\n", REG_SP, generic_reg_name(REG_SP));
     fprintf(f, "R %u %s\n", REG_FLAGS, generic_reg_name(REG_FLAGS));
     fprintf(f, "R %u %s\n", REG_IP, generic_reg_name(REG_IP));

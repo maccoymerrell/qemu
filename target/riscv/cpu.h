@@ -215,17 +215,33 @@ struct CPUArchState {
      * Register x[n] as seen by a standard RISC-V instruction is the cursor
      * (address) field of capability register c[n].  This means:
      *
-     *   gpr[i]  ==  gpcr[i]._cursor     (always, by invariant)
+     *   gpr[i]  ==  gpcr[i]._cursor     (always, after sync)
      *
-     * Any code that modifies gpr[i] must call cheri_gpr_to_cap(env, i) to
-     * propagate the new cursor into the capability (clearing the tag since
-     * the integer write does not preserve capability metadata).
+     * Reference architecture (CTSRD-CHERI/qemu):
+     *   The original implementation uses a SINGLE register file (GPCapRegs)
+     *   that replaces gpr[] entirely.  #ifdef TARGET_CHERI removes gpr[] and
+     *   integer access goes through _cr_cursor.  A lazy state machine tracks
+     *   whether a register holds CREG_INTEGER (NULL-derived) vs
+     *   CREG_FULLY_DECOMPRESSED (full capability).
      *
-     * Any CHERI instruction that modifies gpcr[i] must call
-     * cheri_cap_to_gpr(env, i) to propagate the cursor back.
+     * Our approach:
+     *   We keep gpr[] for compatibility with the standard RISC-V TCG code,
+     *   plus gpcr[] for capability metadata.  Synchronisation is handled by:
+     *   - cheri_cap_to_gpr(env, i): CHERI instruction wrote gpcr[i], copy
+     *     cursor to gpr[i].
+     *   - cheri_gpr_to_cap(env, i): Integer instruction wrote gpr[i], create
+     *     a NULL-derived capability (base=0, top=0, perms=0, cursor=gpr[i],
+     *     tag=false).  This mirrors update_capreg_to_intval() from the
+     *     original implementation.
+     *   - cheri_lazy_sync(env, i): Called automatically by get_cap_reg() /
+     *     get_cap_reg_const() in cheri_helper.c.  If gpr[i] != cursor,
+     *     an integer write happened since the last sync, so call
+     *     cheri_gpr_to_cap().  This is analogous to the CREG_INTEGER lazy
+     *     state in the original.
      *
-     * PCC = program counter capability, DDC = default data capability.
-     * These are additional architectural registers that have no integer alias.
+     * PCC = program counter capability (replaces PC in the original impl).
+     * DDC = default data capability.
+     * These are additional architectural registers with no integer alias.
      */
     cap_register_t gpcr[32];  /* general-purpose capability registers (c0-c31) */
     cap_register_t pcc;       /* program counter capability */
@@ -978,20 +994,49 @@ const char *priv_spec_to_str(int priv_version);
  *
  * Per UCAM-CL-TR-987 §3.5, in CHERI-RISC-V the integer registers and
  * the capability registers are aliases of the same architectural state.
- * An integer write to x[i] replaces the cursor of c[i] and clears the
- * tag (since integer writes cannot preserve capability metadata).
- * A CHERI instruction writing c[i] must propagate the new cursor back
- * to gpr[i].
+ * The integer view of register x[i] is the cursor (address) of capability
+ * register c[i].
+ *
+ * In the reference CTSRD-CHERI/qemu implementation, there is a SINGLE
+ * register file (GPCapRegs) that holds capabilities; there is no separate
+ * gpr[] array.  Integer reads return the cursor, and integer writes call
+ * update_capreg_to_intval() which creates a NULL-derived capability with:
+ *   - cursor = written integer value
+ *   - pesbt  = CAP_NULL_PESBT (null permissions/otype/bounds)
+ *   - base   = 0,  top = 0
+ *   - tag    = false
+ *
+ * Our implementation maintains gpr[] alongside gpcr[] for compatibility
+ * with the existing RISC-V translation code.  The invariant is:
+ *   gpr[i]  ==  gpcr[i]._cursor     (always, after sync)
+ *
+ * These helpers propagate changes between the two arrays.  Additionally,
+ * the CHERI helper accessor get_cap_reg_const() lazily syncs gpr → gpcr
+ * before reading, so CHERI instructions always see correct state even
+ * after integer writes that only touch gpr[].
  */
 
-/* Propagate gpr[i] → gpcr[i]: clear tag, set cursor from gpr. */
+/*
+ * Propagate gpr[i] → gpcr[i]: create a NULL-derived capability.
+ *
+ * Per UCAM-CL-TR-987: "Integer instructions read the address field of
+ * the capability register, and write a NULL-derived capability with
+ * the address field set to the new integer value."
+ *
+ * This mirrors update_capreg_to_intval() from CTSRD-CHERI/qemu.
+ */
 static inline void cheri_gpr_to_cap(CPURISCVState *env, int i)
 {
     if (i == 0) {
-        return; /* x0 is always zero */
+        return; /* x0/c0 is always zero/null */
     }
+    /* Create a NULL-derived capability: all metadata zeroed, only cursor set */
+    env->gpcr[i]._base   = 0;
+    env->gpcr[i]._top    = 0;
     env->gpcr[i]._cursor = (uint64_t)env->gpr[i];
-    env->gpcr[i].tag = false;  /* integer write clears tag */
+    env->gpcr[i].pesbt   = 0;   /* null permissions, null otype */
+    env->gpcr[i].flags   = 0;
+    env->gpcr[i].tag     = false;
 }
 
 /* Propagate gpcr[i] cursor → gpr[i]. */

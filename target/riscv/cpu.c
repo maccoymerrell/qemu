@@ -3072,6 +3072,16 @@ static bool riscv_cpu_read_capability(CPUState *cs, int gdb_reg,
     const cap_register_t *cap = NULL;
 
     if (gdb_reg >= 0 && gdb_reg < 32) {
+        /*
+         * Lazy sync: if a standard integer instruction wrote to gpr[i]
+         * since the last CHERI sync, the capability register may be stale.
+         * Create a NULL-derived capability from the current gpr value.
+         * This mirrors the lazy sync in cheri_helper.c:get_cap_reg_const().
+         */
+        if (gdb_reg != 0 &&
+            env->gpr[gdb_reg] != (target_ulong)env->gpcr[gdb_reg]._cursor) {
+            cheri_gpr_to_cap(env, gdb_reg);
+        }
         cap = &env->gpcr[gdb_reg];
     } else if (gdb_reg == 32) {
         /* PC register → PCC */

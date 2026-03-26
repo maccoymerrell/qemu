@@ -19,10 +19,30 @@
  * Helper to get a pointer to a capability register.
  * Index 0-31 = general-purpose capability registers (gpcr[0..31]).
  * For special registers, use cspecialrw.
+ *
+ * LAZY SYNC: In our implementation, standard RISC-V integer instructions
+ * write to gpr[] without updating gpcr[].  Before any CHERI helper reads
+ * a capability register, we must check whether gpr[i] has diverged from
+ * gpcr[i]._cursor.  If so, an integer instruction wrote to gpr[i] since
+ * the last CHERI sync, and we need to propagate gpr → gpcr (creating a
+ * NULL-derived capability).
+ *
+ * This is analogous to the CREG_INTEGER lazy state in the original
+ * CTSRD-CHERI/qemu: the capability register is logically an integer
+ * (NULL-derived with cursor = integer value), and we materialise it
+ * on first access by a CHERI instruction.
  */
+static inline void cheri_lazy_sync(CPURISCVState *env, uint32_t idx)
+{
+    if (idx != 0 && env->gpr[idx] != (target_ulong)env->gpcr[idx]._cursor) {
+        cheri_gpr_to_cap(env, idx);
+    }
+}
+
 static inline cap_register_t *get_cap_reg(CPURISCVState *env, uint32_t idx)
 {
     assert(idx < 32);
+    cheri_lazy_sync(env, idx);
     return &env->gpcr[idx];
 }
 
@@ -30,6 +50,7 @@ static inline const cap_register_t *get_cap_reg_const(CPURISCVState *env,
                                                        uint32_t idx)
 {
     assert(idx < 32);
+    cheri_lazy_sync(env, idx);
     return &env->gpcr[idx];
 }
 

@@ -373,7 +373,15 @@ static inline bool cap_in_bounds(const cap_register_t *c, uint64_t addr,
     if (addr < c->_base) {
         return false;
     }
-    /* Guard against overflow: if addr + size wraps, it is out of bounds. */
+    /*
+     * Check addr + size <= top.
+     * Rewrite as: size <= top - addr (safe because addr >= base >= 0).
+     * But we must also handle the case where top < addr (empty range or
+     * null capability where top == 0 and addr > 0).
+     */
+    if (c->_top < addr) {
+        return false; /* addr is already past the top */
+    }
     if (size > c->_top - addr) {
         return false;
     }

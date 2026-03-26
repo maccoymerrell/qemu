@@ -287,6 +287,14 @@ static inline void add_src_reg(InsnFields *f, uint8_t reg_id)
     if (reg_id == REG_NONE || f->n_src_regs >= MAX_SRC_REGS) {
         return;
     }
+    /*
+     * CHERI-RISC-V register aliasing: capability registers c[n] ARE
+     * integer registers x[n] (per UCAM-CL-TR-987 §3.5).  Map REG_CAP*
+     * → REG_GPR* so the trace uses a single register namespace.
+     * The is_capability flag on the instruction distinguishes cap vs
+     * integer access to the same register.
+     */
+    reg_id = cap_reg_to_gpr_alias(reg_id);
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         if (f->src_regs[i] == reg_id) {
             return;
@@ -300,6 +308,8 @@ static inline void add_dst_reg(InsnFields *f, uint8_t reg_id)
     if (reg_id == REG_NONE || f->n_dst_regs >= MAX_DST_REGS) {
         return;
     }
+    /* CHERI-RISC-V register aliasing (see add_src_reg comment above). */
+    reg_id = cap_reg_to_gpr_alias(reg_id);
     for (uint8_t i = 0; i < f->n_dst_regs; i++) {
         if (f->dst_regs[i] == reg_id) {
             return;
@@ -1759,10 +1769,13 @@ static void write_text_header(FILE *f, uint32_t thread_id,
     }
     for (uint32_t i = 0; i < 32; i++) {
         uint8_t rid = REG_CAP0 + i;
-        fprintf(f, "R %u %s\n", rid, generic_reg_name(rid));
+        fprintf(f, "R %u %s  # aliases GPR%u on CHERI-RISC-V\n",
+                rid, generic_reg_name(rid), i);
     }
-    fprintf(f, "R %u %s\n", REG_PCC, generic_reg_name(REG_PCC));
-    fprintf(f, "R %u %s\n", REG_DDC, generic_reg_name(REG_DDC));
+    fprintf(f, "R %u %s  # no GPR alias (PCC)\n",
+            REG_PCC, generic_reg_name(REG_PCC));
+    fprintf(f, "R %u %s  # no GPR alias (DDC)\n",
+            REG_DDC, generic_reg_name(REG_DDC));
     fprintf(f, "R %u %s\n", REG_SP, generic_reg_name(REG_SP));
     fprintf(f, "R %u %s\n", REG_FLAGS, generic_reg_name(REG_FLAGS));
     fprintf(f, "R %u %s\n", REG_IP, generic_reg_name(REG_IP));

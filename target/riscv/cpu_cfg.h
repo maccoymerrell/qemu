@@ -200,11 +200,24 @@ struct RISCVCPUConfig {
      *
      *  3. The CTSRD-CHERI/qemu project also implements CHERI as a
      *     conditional extension within the riscv target, not a fork.
+     *     Their approach uses #ifdef TARGET_CHERI to replace gpr[] with
+     *     GPCapRegs and PC with PCC, but the decode and translate loop
+     *     is shared.
      *
      * Functionality NOT available without a separate target: none that
      * matters for correctness.  A separate target would only be warranted
      * if CHERI required incompatible changes to the core decode loop or
      * memory-access path, but the spec is designed to be purely additive.
+     *
+     * Note on register model (see cpu.h for full details):
+     *   The original CTSRD-CHERI/qemu uses a single register file
+     *   (GPCapRegs replacing gpr[]) with lazy decompression states
+     *   (CREG_INTEGER, CREG_FULLY_DECOMPRESSED, CREG_TAGGED_CAP,
+     *   CREG_UNTAGGED_CAP).  Our implementation keeps gpr[] alongside
+     *   gpcr[] for compatibility and uses lazy sync (cheri_lazy_sync)
+     *   to detect when gpr differs from the capability cursor.  This
+     *   provides equivalent correctness without modifying all existing
+     *   RISC-V translation code.
      *
      * What IS currently stubbed out (future work):
      *  - Capability-bounded memory loads/stores (ld_*_ddc, st_*_cap, etc.)

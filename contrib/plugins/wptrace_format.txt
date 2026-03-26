@@ -475,6 +475,11 @@ rejects old readers.
   │ 65-128 │ FPR0-FPR63  (floating-point)           │
   │129-192 │ VEC0-VEC63  (vector/SIMD)              │
   │193-224 │ CAP0-CAP31  (CHERI capability)          │
+  │        │   NOTE: On CHERI-RISC-V, CAP_n aliases  │
+  │        │   GPR_n (same architectural register).   │
+  │        │   Operands are encoded as GPR IDs; the   │
+  │        │   is_capability flag distinguishes cap    │
+  │        │   vs integer access. (UCAM-CL-TR-987)    │
   │   240  │ PCC         (program counter cap)       │
   │   241  │ DDC         (default data cap)          │
   │   250  │ SP          (stack pointer)             │

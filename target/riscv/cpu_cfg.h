@@ -183,7 +183,36 @@ struct RISCVCPUConfig {
     bool ext_xtheadsync;
     bool ext_XVentanaCondOps;
 
-    /* CHERI capability extensions */
+    /*
+     * CHERI capability extensions (per UCAM-CL-TR-987).
+     *
+     * Architecture note: CHERI-RISC-V is implemented as an extension of the
+     * existing RISC-V target rather than a separate target.  This is the
+     * correct approach because:
+     *
+     *  1. CHERI does not change the base ISA encoding — it adds new
+     *     instructions in unused opcode space (major opcode 0x5b) and
+     *     reuses the standard register file (capabilities ARE GPRs).
+     *
+     *  2. A CHERI-RISC-V CPU must still execute all standard RISC-V
+     *     instructions unchanged; only the semantics of address formation
+     *     (via DDC/PCC bounds checking) are extended.
+     *
+     *  3. The CTSRD-CHERI/qemu project also implements CHERI as a
+     *     conditional extension within the riscv target, not a fork.
+     *
+     * Functionality NOT available without a separate target: none that
+     * matters for correctness.  A separate target would only be warranted
+     * if CHERI required incompatible changes to the core decode loop or
+     * memory-access path, but the spec is designed to be purely additive.
+     *
+     * What IS currently stubbed out (future work):
+     *  - Capability-bounded memory loads/stores (ld_*_ddc, st_*_cap, etc.)
+     *  - Tag memory tracking for capability validity in DRAM
+     *  - Full CHERI compressed-capability (cc128) encoding/decoding
+     *  - CInvoke (compartment call) instruction
+     *  - CHERI-specific CSRs beyond PCC/DDC (UTCC, UTDC, etc.)
+     */
     bool ext_xcheri;
 
     uint32_t pmu_mask;

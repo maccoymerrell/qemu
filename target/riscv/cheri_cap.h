@@ -359,23 +359,22 @@ static inline bool cap_is_equal(const cap_register_t *a,
 /* ---------- bounds checking ---------- */
 
 /*
- * Check whether an access of @p size bytes at the capability's cursor
- * is within the capability's bounds.
+ * Check whether an access of @p size bytes at address @p addr is within
+ * the capability's bounds.
  *
- * The access range is [cursor, cursor + size) and must satisfy:
- *   base <= cursor  &&  cursor + size <= top
+ * The access range is [addr, addr + size) and must satisfy:
+ *   base <= addr  &&  addr + size <= top
  *
  * @p size must be >= 1.  Returns true if the access is in bounds.
  */
-static inline bool cap_in_bounds(const cap_register_t *c, uint64_t size)
+static inline bool cap_in_bounds(const cap_register_t *c, uint64_t addr,
+                                 uint64_t size)
 {
-    uint64_t cursor = c->_cursor;
-
-    if (cursor < c->_base) {
+    if (addr < c->_base) {
         return false;
     }
-    /* Guard against overflow: if cursor + size wraps, it is out of bounds. */
-    if (size > c->_top - cursor) {
+    /* Guard against overflow: if addr + size wraps, it is out of bounds. */
+    if (size > c->_top - addr) {
         return false;
     }
     return true;

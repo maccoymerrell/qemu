@@ -209,8 +209,18 @@ enum GenericRegId {
     REG_VEC26, REG_VEC27, REG_VEC28, REG_VEC29, REG_VEC30, REG_VEC31,
     /*
      * Capability registers (CHERI): 193-224
-     * When CHERI is active, capability registers overlay GPRs (CAP_n
-     * holds the full capability whose cursor/address is GPR_n).
+     *
+     * Per UCAM-CL-TR-987, in CHERI-RISC-V capability registers ARE the
+     * general-purpose integer registers.  CAP_n is the same architectural
+     * register as GPR_n — the integer value seen by standard RISC-V
+     * instructions is the cursor (address) field of the capability.
+     *
+     * The separate REG_CAP* IDs exist in the ISA-agnostic trace format
+     * so that decoders can distinguish integer-only from capability-aware
+     * accesses.  For RISC-V, REG_CAP_n always aliases REG_GPR_n.
+     *
+     * PCC (program counter capability) and DDC (default data capability)
+     * are additional architectural state with no integer register alias.
      */
     REG_CAP0 = 193,
     REG_CAP1,  REG_CAP2,  REG_CAP3,  REG_CAP4,  REG_CAP5,  REG_CAP6,
@@ -229,6 +239,22 @@ enum GenericRegId {
     REG_LR = 253,
     REG_FP_REG = 254,
 };
+
+/*
+ * CHERI register aliasing helper.
+ *
+ * On CHERI-RISC-V (per UCAM-CL-TR-987 §3.5), capability register c[n]
+ * IS integer register x[n].  This function returns the GPR alias for a
+ * capability register ID, or the input unchanged if it is not a CAP
+ * register.  PCC and DDC have no integer alias and are returned unchanged.
+ */
+static inline uint8_t cap_reg_to_gpr_alias(uint8_t reg_id)
+{
+    if (reg_id >= REG_CAP0 && reg_id <= REG_CAP31) {
+        return (uint8_t)(REG_GPR0 + (reg_id - REG_CAP0));
+    }
+    return reg_id;
+}
 
 /*
  * Register classification: maps a Capstone register ID directly to

@@ -209,9 +209,23 @@ struct CPUArchState {
     target_ulong gprh[32]; /* 64 top bits of the 128-bit registers */
 
     /*
-     * CHERI capability state (Xcheri extension).
-     * General-purpose capability registers overlay GPRs: gpcr[i].cursor == gpr[i].
+     * CHERI capability state (Xcheri extension) — per UCAM-CL-TR-987.
+     *
+     * In CHERI-RISC-V the general-purpose integer registers ARE capabilities.
+     * Register x[n] as seen by a standard RISC-V instruction is the cursor
+     * (address) field of capability register c[n].  This means:
+     *
+     *   gpr[i]  ==  gpcr[i]._cursor     (always, by invariant)
+     *
+     * Any code that modifies gpr[i] must call cheri_gpr_to_cap(env, i) to
+     * propagate the new cursor into the capability (clearing the tag since
+     * the integer write does not preserve capability metadata).
+     *
+     * Any CHERI instruction that modifies gpcr[i] must call
+     * cheri_cap_to_gpr(env, i) to propagate the cursor back.
+     *
      * PCC = program counter capability, DDC = default data capability.
+     * These are additional architectural registers that have no integer alias.
      */
     cap_register_t gpcr[32];  /* general-purpose capability registers (c0-c31) */
     cap_register_t pcc;       /* program counter capability */
@@ -958,4 +972,35 @@ const char *satp_mode_str(uint8_t satp_mode, bool is_32_bit);
 void th_register_custom_csrs(RISCVCPU *cpu);
 
 const char *priv_spec_to_str(int priv_version);
+
+/*
+ * CHERI GPR ↔ capability synchronisation helpers.
+ *
+ * Per UCAM-CL-TR-987 §3.5, in CHERI-RISC-V the integer registers and
+ * the capability registers are aliases of the same architectural state.
+ * An integer write to x[i] replaces the cursor of c[i] and clears the
+ * tag (since integer writes cannot preserve capability metadata).
+ * A CHERI instruction writing c[i] must propagate the new cursor back
+ * to gpr[i].
+ */
+
+/* Propagate gpr[i] → gpcr[i]: clear tag, set cursor from gpr. */
+static inline void cheri_gpr_to_cap(CPURISCVState *env, int i)
+{
+    if (i == 0) {
+        return; /* x0 is always zero */
+    }
+    env->gpcr[i]._cursor = (uint64_t)env->gpr[i];
+    env->gpcr[i].tag = false;  /* integer write clears tag */
+}
+
+/* Propagate gpcr[i] cursor → gpr[i]. */
+static inline void cheri_cap_to_gpr(CPURISCVState *env, int i)
+{
+    if (i == 0) {
+        return; /* x0 is always zero */
+    }
+    env->gpr[i] = (target_ulong)env->gpcr[i]._cursor;
+}
+
 #endif /* RISCV_CPU_H */

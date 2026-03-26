@@ -154,9 +154,7 @@ void helper_cheri_csetbounds(CPURISCVState *env, uint32_t cd, uint32_t cs1,
     cap_register_t result = *src;
     cap_set_bounds(&result, (uint64_t)len);
     *dst = result;
-    if (cd < 32) {
-        env->gpr[cd] = (target_ulong)cap_get_cursor(dst);
-    }
+    cheri_cap_to_gpr(env, cd);
 }
 
 void helper_cheri_csetboundsexact(CPURISCVState *env, uint32_t cd,
@@ -190,9 +188,7 @@ void helper_cheri_candperm(CPURISCVState *env, uint32_t cd, uint32_t cs1,
     cap_register_t result = *src;
     cap_and_perms(&result, (uint32_t)mask);
     *dst = result;
-    if (cd < 32) {
-        env->gpr[cd] = (target_ulong)cap_get_cursor(dst);
-    }
+    cheri_cap_to_gpr(env, cd);
 }
 
 void helper_cheri_csetoffset(CPURISCVState *env, uint32_t cd, uint32_t cs1,
@@ -209,9 +205,7 @@ void helper_cheri_csetoffset(CPURISCVState *env, uint32_t cd, uint32_t cs1,
     cap_register_t result = *src;
     cap_set_offset(&result, (uint64_t)offset);
     *dst = result;
-    if (cd < 32) {
-        env->gpr[cd] = (target_ulong)cap_get_cursor(dst);
-    }
+    cheri_cap_to_gpr(env, cd);
 }
 
 void helper_cheri_csetaddr(CPURISCVState *env, uint32_t cd, uint32_t cs1,
@@ -228,9 +222,7 @@ void helper_cheri_csetaddr(CPURISCVState *env, uint32_t cd, uint32_t cs1,
     cap_register_t result = *src;
     cap_set_addr(&result, (uint64_t)addr);
     *dst = result;
-    if (cd < 32) {
-        env->gpr[cd] = (target_ulong)cap_get_cursor(dst);
-    }
+    cheri_cap_to_gpr(env, cd);
 }
 
 void helper_cheri_cincoffset(CPURISCVState *env, uint32_t cd, uint32_t cs1,
@@ -247,9 +239,7 @@ void helper_cheri_cincoffset(CPURISCVState *env, uint32_t cd, uint32_t cs1,
     cap_register_t result = *src;
     cap_inc_offset(&result, (int64_t)offset);
     *dst = result;
-    if (cd < 32) {
-        env->gpr[cd] = (target_ulong)cap_get_cursor(dst);
-    }
+    cheri_cap_to_gpr(env, cd);
 }
 
 void helper_cheri_csetflags(CPURISCVState *env, uint32_t cd, uint32_t cs1,
@@ -266,9 +256,7 @@ void helper_cheri_csetflags(CPURISCVState *env, uint32_t cd, uint32_t cs1,
     cap_register_t result = *src;
     cap_set_flags(&result, (uint8_t)flags);
     *dst = result;
-    if (cd < 32) {
-        env->gpr[cd] = (target_ulong)cap_get_cursor(dst);
-    }
+    cheri_cap_to_gpr(env, cd);
 }
 
 void helper_cheri_csethigh(CPURISCVState *env, uint32_t cd, uint32_t cs1,
@@ -282,9 +270,7 @@ void helper_cheri_csethigh(CPURISCVState *env, uint32_t cd, uint32_t cs1,
     result.pesbt = (uint64_t)high;
     result.tag = false;
     *dst = result;
-    if (cd < 32) {
-        env->gpr[cd] = (target_ulong)cap_get_cursor(dst);
-    }
+    cheri_cap_to_gpr(env, cd);
 }
 
 void helper_cheri_cmv(CPURISCVState *env, uint32_t cd, uint32_t cs1)
@@ -292,9 +278,7 @@ void helper_cheri_cmv(CPURISCVState *env, uint32_t cd, uint32_t cs1)
     const cap_register_t *src = get_cap_reg_const(env, cs1);
     cap_register_t *dst = get_cap_reg(env, cd);
     *dst = *src;
-    if (cd < 32) {
-        env->gpr[cd] = (target_ulong)cap_get_cursor(dst);
-    }
+    cheri_cap_to_gpr(env, cd);
 }
 
 void helper_cheri_ccleartag(CPURISCVState *env, uint32_t cd, uint32_t cs1)
@@ -305,9 +289,7 @@ void helper_cheri_ccleartag(CPURISCVState *env, uint32_t cd, uint32_t cs1)
     cap_register_t result = *src;
     cap_clear_tag(&result);
     *dst = result;
-    if (cd < 32) {
-        env->gpr[cd] = (target_ulong)cap_get_cursor(dst);
-    }
+    cheri_cap_to_gpr(env, cd);
 }
 
 /* ===========================================================================
@@ -342,9 +324,7 @@ void helper_cheri_cseal(CPURISCVState *env, uint32_t cd, uint32_t cs1,
     uint32_t otype = (uint32_t)(cap_get_cursor(auth) & 0xFFFF);
     cap_seal(&result, otype);
     *dst = result;
-    if (cd < 32) {
-        env->gpr[cd] = (target_ulong)cap_get_cursor(dst);
-    }
+    cheri_cap_to_gpr(env, cd);
 }
 
 void helper_cheri_cunseal(CPURISCVState *env, uint32_t cd, uint32_t cs1,
@@ -374,9 +354,7 @@ void helper_cheri_cunseal(CPURISCVState *env, uint32_t cd, uint32_t cs1,
     cap_register_t result = *src;
     cap_unseal(&result);
     *dst = result;
-    if (cd < 32) {
-        env->gpr[cd] = (target_ulong)cap_get_cursor(dst);
-    }
+    cheri_cap_to_gpr(env, cd);
 }
 
 void helper_cheri_csealentry(CPURISCVState *env, uint32_t cd, uint32_t cs1)
@@ -396,9 +374,7 @@ void helper_cheri_csealentry(CPURISCVState *env, uint32_t cd, uint32_t cs1)
     cap_register_t result = *src;
     cap_seal_entry(&result);
     *dst = result;
-    if (cd < 32) {
-        env->gpr[cd] = (target_ulong)cap_get_cursor(dst);
-    }
+    cheri_cap_to_gpr(env, cd);
 }
 
 /* ===========================================================================
@@ -421,9 +397,7 @@ void helper_cheri_cbuildcap(CPURISCVState *env, uint32_t cd, uint32_t cs1,
     cap_register_t result = *src;
     result.tag = true;
     *dst = result;
-    if (cd < 32) {
-        env->gpr[cd] = (target_ulong)cap_get_cursor(dst);
-    }
+    cheri_cap_to_gpr(env, cd);
 }
 
 void helper_cheri_ccopytype(CPURISCVState *env, uint32_t cd, uint32_t cs1,
@@ -441,9 +415,7 @@ void helper_cheri_ccopytype(CPURISCVState *env, uint32_t cd, uint32_t cs1,
         cap_clear_tag(&result);
     }
     *dst = result;
-    if (cd < 32) {
-        env->gpr[cd] = (target_ulong)cap_get_cursor(dst);
-    }
+    cheri_cap_to_gpr(env, cd);
 }
 
 void helper_cheri_ccseal(CPURISCVState *env, uint32_t cd, uint32_t cs1,
@@ -465,9 +437,7 @@ void helper_cheri_ccseal(CPURISCVState *env, uint32_t cd, uint32_t cs1,
         }
         *dst = result;
     }
-    if (cd < 32) {
-        env->gpr[cd] = (target_ulong)cap_get_cursor(dst);
-    }
+    cheri_cap_to_gpr(env, cd);
 }
 
 target_ulong helper_cheri_ctestsubset(CPURISCVState *env, uint32_t rd,
@@ -515,9 +485,7 @@ void helper_cheri_cfromptr(CPURISCVState *env, uint32_t cd, uint32_t cs1,
         cap_set_addr(&result, cap_get_base(auth) + (uint64_t)ptr);
         *dst = result;
     }
-    if (cd < 32) {
-        env->gpr[cd] = (target_ulong)cap_get_cursor(dst);
-    }
+    cheri_cap_to_gpr(env, cd);
 }
 
 target_ulong helper_cheri_csub(CPURISCVState *env, uint32_t rd,
@@ -569,7 +537,7 @@ void helper_cheri_cspecialrw(CPURISCVState *env, uint32_t cd, uint32_t cs1,
     if (cd != 0) {
         cap_register_t *dst = get_cap_reg(env, cd);
         *dst = old_val;
-        env->gpr[cd] = (target_ulong)cap_get_cursor(dst);
+        cheri_cap_to_gpr(env, cd);
     }
 }
 

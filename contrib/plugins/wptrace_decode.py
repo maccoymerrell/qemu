@@ -28,9 +28,9 @@ BODY_TAG_MEMALLOC = 2
 
 WPT_SYNC_HINT_BITS = 4
 
-# Template-level sync hints (in insn fields)
+# Template-level sync hints (in insn fields, not body-level records)
 SYNC_NONE          = 0
-SYNC_THREAD_SWITCH = 4
+SYNC_THREAD_SWITCH = 4   # debug display only, not a body record
 SYNC_ATOMIC        = 5
 SYNC_HINT_NAMES    = {0: "NONE", 4: "THREAD_SWITCH", 5: "ATOMIC"}
 

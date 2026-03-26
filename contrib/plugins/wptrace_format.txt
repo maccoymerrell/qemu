@@ -38,11 +38,9 @@ regions.  There are no byte-alignment gaps between regions.
   │  Sequence of tagged records:                             │
   │    tag=1 (ENTRY)    — correct-path BB + wrong-path chain │
   │    tag=2 (MEMALLOC) — memory map/unmap/remap event       │
-  │    tag=3 (SYNC)     — thread switch event                │
   │    tag=0 (END)      — terminates the body                │
   ├──────────────────────────────────────────────────────────┤
   │                        FOOTER                            │
-  │  [Thread Segment Directory]   (if FLAG_THREAD_DIR)       │
   │  num_entries(ULEB)            entry count for validation  │
   │  Template table               BB template definitions     │
   └──────────────────────────────────────────────────────────┘
@@ -57,7 +55,7 @@ Written once at the start of the stream.
   │ Field       │ Encoding│ Description                    │
   ├─────────────┼─────────┼────────────────────────────────┤
   │ magic       │ bits(32)│ 0x5450570A ('T','P','W',0x0A)  │
-  │ isa         │ bits(3) │ TraceISA enum (see §10)        │
+  │ isa         │ bits(3) │ TraceISA enum (see §9)         │
   │ flags       │ bits(8) │ Feature flags (see §3.1)       │
   │ command     │ string  │ QEMU command line              │
   │ datetime    │ string  │ Trace start timestamp          │
@@ -79,19 +77,17 @@ features:
 3.1  Header Flags
 ~~~~~~~~~~~~~~~~~
 
-  ┌─────┬────────────────────┬───────────────────────────────────┐
-  │ Bit │ Name               │ Effect                            │
-  ├─────┼────────────────────┼───────────────────────────────────┤
-  │  0  │ WPT_FLAG_MEM_DATA  │ Load/store data values present    │
-  │  1  │ WPT_FLAG_REG_DATA  │ Register values (reserved)        │
-  │  2  │ WPT_FLAG_MEM_ALLOC │ Memory allocation events present  │
-  │  3  │ WPT_FLAG_THREADS   │ Multi-thread mode active          │
-  │  4  │ WPT_FLAG_THREAD_DIR│ Thread Segment Directory in footer│
-  │ 5-7 │ (reserved)         │                                   │
-  └─────┴────────────────────┴───────────────────────────────────┘
+  ┌─────┬─────────────────────┬───────────────────────────────────┐
+  │ Bit │ Name                │ Effect                            │
+  ├─────┼─────────────────────┼───────────────────────────────────┤
+  │  0  │ WPT_FLAG_MEM_DATA   │ Load/store data values present    │
+  │  1  │ WPT_FLAG_REG_DATA   │ Register values (reserved)        │
+  │  2  │ WPT_FLAG_MEM_ALLOC  │ Memory allocation events present  │
+  │  3  │ (reserved)          │                                   │
+  │  4  │ WPT_FLAG_HAS_TEMPLATES │ Template dictionary in footer  │
+  │ 5-7 │ (reserved)          │                                   │
+  └─────┴─────────────────────┴───────────────────────────────────┘
 
-When THREADS is set, the body contains SYNC_THREAD_SWITCH events and
-the footer contains a segment directory (THREAD_DIR is also set).
 When MEM_DATA is set, every dyn-param record in the body is followed
 by its data value encoding.
 
@@ -107,7 +103,6 @@ tag:
   │ 00 │  END      — sentinel, terminates body
   │ 01 │  ENTRY    — correct-path BB execution + wrong-path chain
   │ 10 │  MEMALLOC — memory allocation event
-  │ 11 │  SYNC     — synchronisation / thread-switch event
   └────┘
 
 
@@ -190,35 +185,14 @@ Tracks mmap/munmap/mremap events from the traced program.
   └─────────────────────────────────────────────┘
 
 
-4.3  BODY_TAG_SYNC (tag=3) — Synchronisation Event
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Emitted when QEMU switches execution from one vCPU to another.
-
-  ┌──────────────────────────────────────────────┐
-  │ tag           bits(2) = 3                    │
-  │ sync_type     bits(4)                        │
-  │               4 = THREAD_SWITCH              │
-  │ [thread_id]   ULEB128   (THREAD_SWITCH only) │
-  └──────────────────────────────────────────────┘
-
-SYNC_THREAD_SWITCH carries the mapped thread_id (monotonic, 0-based)
-of the thread that is now executing.  The thread_id corresponds to
-entries in the Thread Segment Directory (§8).
-
-SYNC_ATOMIC (type=5) is not emitted as a body-level event — it only
-appears as a sync_hint annotation on individual instructions within
-templates (§7).
-
-
-4.4  BODY_TAG_END (tag=0) — Body Terminator
+4.3  BODY_TAG_END (tag=0) — Body Terminator
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
   ┌─────────────────┐
   │ tag  bits(2) = 0│
   └─────────────────┘
 
-Immediately followed by the footer (§8, §9).
+Immediately followed by the footer (§8).
 
 
 5. Dynamic Parameter Patch Encoding
@@ -332,58 +306,21 @@ uses these annotations in combination with the memory addresses from
 the corresponding dyn-param to identify synchronisation objects.
 
 
-8. Thread Segment Directory (Footer)
--------------------------------------
-
-Present when FLAG_THREAD_DIR is set.  Written between BODY_TAG_END
-and the entry count.
-
-  ┌──────────────────────────────────────────────────────────┐
-  │ num_segments       ULEB128                               │
-  │ ── for each segment (in body order) ──                   │
-  │ │ thread_id        ULEB128   monotonic (0 = main thread) │
-  │ │ body_bit_offset  ULEB128   bit position of first entry │
-  │ │ num_entries      ULEB128   BB entry count              │
-  │ │ flags            bits(8)   bit 0 = is_atomic           │
-  │ │ num_atomic_addrs ULEB128                               │
-  │ │ atomic_addrs     num_atomic_addrs × ULEB128            │
-  │ └──────────────────────────────────────────────────────│
-  └──────────────────────────────────────────────────────────┘
-
-A thread segment is a contiguous run of BODY_TAG_ENTRY records from a
-single thread.  Segment boundaries occur at:
-
-  1. SYNC_THREAD_SWITCH — execution moved to a different vCPU.
-  2. Atomic BB isolation — a BB whose template contains any
-     SYNC_ATOMIC instruction is emitted as its own 1-entry segment,
-     with breaks before and after.
-
-Atomic segments (flags bit 0 = 1) contain exactly one BB and list
-the virtual addresses of all atomic memory operations performed.
-Two atomic segments from different threads that share any address
-are in conflict and must execute in body order.
-
-
-9. Complete Footer Layout
+8. Complete Footer Layout
 -------------------------
 
 After BODY_TAG_END:
 
   ┌─────────────────────────────────────────────┐
-  │  [Thread Segment Directory]   §8            │
   │  num_entries    ULEB128  (validation count)  │
   │  Template Table              §7              │
   └─────────────────────────────────────────────┘
 
-Readers that do not understand FLAG_THREAD_DIR will not know to skip
-the directory; this is intentional — the magic version (0x0A)
-rejects old readers.
 
-
-10. Enumerations
+9. Enumerations
 ----------------
 
-10.1  TraceISA — bits(3)
+9.1  TraceISA — bits(3)
 
   ┌───┬───────────┐
   │ 0 │ unknown   │
@@ -393,7 +330,7 @@ rejects old readers.
   │ 4 │ mipsel    │
   └───┴───────────┘
 
-10.2  GenericOpcode — bits(8)
+9.2  GenericOpcode — bits(8)
 
   ┌────┬──────────┬────┬──────────┬────┬──────────┐
   │  0 │ UNKNOWN  │ 18 │ POP      │ 36 │ VEC_ADD  │
@@ -433,7 +370,7 @@ rejects old readers.
   than a plain multiply on some designs).  BITMANIP and CRYPTO cover
   instructions that often use dedicated functional units.
 
-10.3  BranchType — bits(8)
+9.3  BranchType — bits(8)
 
   ┌───┬───────────────┐
   │ 0 │ NONE          │
@@ -446,18 +383,17 @@ rejects old readers.
   │ 7 │ COND_DIRECT   │
   └───┴───────────────┘
 
-10.4  SyncEventType — bits(4)
+9.4  SyncEventType — bits(4)
 
   ┌───┬────────────────┐
   │ 0 │ NONE           │
-  │ 4 │ THREAD_SWITCH  │
   │ 5 │ ATOMIC         │
   └───┴────────────────┘
 
-  THREAD_SWITCH appears as a BODY_TAG_SYNC record.
-  ATOMIC appears only as sync_hint on template instructions.
+  ATOMIC appears only as sync_hint on template instructions (§7),
+  marking instructions that perform atomic/locked memory operations.
 
-10.5  GenericExceptionId — bits(8)
+9.5  GenericExceptionId — bits(8)
 
   ┌───┬────────────────────┐
   │ 0 │ NONE               │
@@ -467,14 +403,14 @@ rejects old readers.
   │ 4 │ MEMORY_ACCESS      │
   └───┴────────────────────┘
 
-10.6  WPStopReason — bits(8)
+9.6  WPStopReason — bits(8)
 
   ┌───┬──────────────────┐
   │ 0 │ NONE             │
   │ 1 │ SYSCALL_USERMODE │
   └───┴──────────────────┘
 
-10.7  GenericRegId — bits(8)
+9.7  GenericRegId — bits(8)
 
   ┌─────────┬──────────────────────────────────────┐
   │    0    │ NONE                                  │
@@ -505,7 +441,7 @@ rejects old readers.
 
   FPR and VEC ranges follow per-ISA conventions.
 
-10.8  MemAllocEventType — bits(2)
+9.8  MemAllocEventType — bits(2)
 
   ┌───┬────────┐
   │ 0 │ MAP    │
@@ -514,7 +450,7 @@ rejects old readers.
   └───┴────────┘
 
 
-11. Worked Example: Reading a Body Entry
+10. Worked Example: Reading a Body Entry
 -----------------------------------------
 
 Given a correct-path BB execution of template 5 (previous template
@@ -543,69 +479,7 @@ wrong-path BB (template 8) that faulted:
       ULEB(0)                 ← poison_len = 0
 
 
-12. Worked Example: Multi-Thread Trace Layout
-----------------------------------------------
-
-Two threads (T0, T1) executing BBs with an atomic spinlock:
-
-  HEADER: magic isa=1 flags=0x18 (THREADS|THREAD_DIR) ...
-
-  BODY:
-  ┌────────────────────────────────────────────────────────┐
-  │ ENTRY  BB100 [load=0x1000]        ← T0, segment S0   │  ← bit offset A
-  │ ENTRY  BB101 [load=0x1008]        ← T0, segment S0   │
-  │ ENTRY  BB101 [load=0x1008]        ← T0, segment S0   │
-  ├ ── T0 segment S0 closed (3 entries) ──────────────────┤
-  │ ENTRY  BB102 [store=0x2000]       ← T0, segment S1   │  ← bit offset B
-  │        (template has sync_hint=ATOMIC on lock xchg)   │
-  ├ ── T0 atomic segment S1 closed (1 entry) ─────────────┤
-  │ ENTRY  BB103 [load=0x1010]        ← T0, segment S2   │  ← bit offset C
-  │ ENTRY  BB104 []                   ← T0, segment S2   │
-  ├ ── T0 segment S2 closed (thread switch) ──────────────┤
-  │ SYNC   type=THREAD_SWITCH thread=1                    │
-  │ ENTRY  BB200 [load=0x3000]        ← T1, segment S3   │  ← bit offset D
-  │ ENTRY  BB201 [load=0x3008]        ← T1, segment S3   │
-  ├ ── T1 segment S3 closed ──────────────────────────────┤
-  │ ENTRY  BB202 [store=0x2000]       ← T1, segment S4   │  ← bit offset E
-  │        (template has sync_hint=ATOMIC on lock xchg)   │
-  ├ ── T1 atomic segment S4 closed (1 entry) ─────────────┤
-  │ ENTRY  BB203 []                   ← T1, segment S5   │  ← bit offset F
-  ├ ── T1 segment S5 closed (thread switch) ──────────────┤
-  │ SYNC   type=THREAD_SWITCH thread=0                    │
-  │ ENTRY  BB105 [load=0x1018]        ← T0, segment S6   │  ← bit offset G
-  │ END                                                   │
-  └────────────────────────────────────────────────────────┘
-
-  FOOTER:
-  ┌─────────────────────────────────────────────────────────┐
-  │ Thread Segment Directory:                               │
-  │  num_segments = 7                                       │
-  │                                                         │
-  │  S0: tid=0 offset=A entries=3 flags=0x00 addrs=0        │
-  │  S1: tid=0 offset=B entries=1 flags=0x01 addrs=1 [0x2000]│
-  │  S2: tid=0 offset=C entries=2 flags=0x00 addrs=0        │
-  │  S3: tid=1 offset=D entries=2 flags=0x00 addrs=0        │
-  │  S4: tid=1 offset=E entries=1 flags=0x01 addrs=1 [0x2000]│
-  │  S5: tid=1 offset=F entries=1 flags=0x00 addrs=0        │
-  │  S6: tid=0 offset=G entries=1 flags=0x00 addrs=0        │
-  ├─────────────────────────────────────────────────────────┤
-  │ num_entries = 11                                        │
-  │ Template Table: BB100, BB101, BB102, BB103, BB104,      │
-  │                 BB105, BB200, BB201, BB202, BB203        │
-  └─────────────────────────────────────────────────────────┘
-
-  S1 and S4 both touch address 0x2000 → conflict edge.
-  ChampSim must execute S1 before S4 (body order).
-
-  Scheduling:
-    T0: S0 → S1 → S2 → S6
-    T1:           S3 → S4 → S5
-    Constraint: S1 before S4 (shared atomic addr 0x2000)
-    Spawn: T1 becomes schedulable after S2 completes
-           (first T1 segment S3 appears after S2 in body)
-
-
-13. Bit-Width Summary
+11. Bit-Width Summary
 ----------------------
 
   ┌──────────────────────────┬──────────┬───────────────────┐
@@ -622,7 +496,6 @@ Two threads (T0, T1) executing BBs with an atomic spinlock:
   │ WPT_SYNC_HINT_BITS       │ 4 bits   │ SyncEventType      │
   │ WPT_MEM_DATA_SIZE_BITS   │ 3 bits   │ data size code     │
   │ memalloc event_type      │ 2 bits   │ MAP/UNMAP/REMAP    │
-  │ seg_dir flags            │ 8 bits   │ is_atomic          │
   │ branch_conditional       │ 1 bit    │ cond branch flag   │
   │ has_immediate            │ 1 bit    │ immediate present  │
   │ cp/wp_unchanged          │ 1 bit    │ dyn params reused  │
@@ -637,10 +510,10 @@ Two threads (T0, T1) executing BBs with an atomic spinlock:
   Variable-width fields (ULEB128 / SLEB128):
     template_delta, dyn param values, memory addresses, PCs,
     immediate values, string lengths, entry counts, template IDs,
-    poison lengths, segment directory fields.
+    poison lengths.
 
 
-14. Design Rationale
+12. Design Rationale
 --------------------
 
 Bit-level packing:  Traces can contain billions of entries.  Byte-
@@ -661,9 +534,3 @@ execution.  Writing them to the footer avoids reserving space or
 backpatching.  The reader must buffer body entries and resolve template
 references in a second pass (or stream the body and look up templates
 by ID as they arrive from the footer).
-
-Segment directory for threading:  Body-level interleaving preserves
-QEMU execution order.  The directory enables random access to specific
-thread segments and provides the metadata (body offsets, atomic
-addresses) needed for conflict-aware scheduling without scanning the
-body.

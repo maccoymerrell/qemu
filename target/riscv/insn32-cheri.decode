@@ -1,0 +1,168 @@
+#
+# CHERI RISC-V instruction encodings (V9)
+#
+# Adapted from CTSRD-CHERI/qemu (BSD-2-Clause)
+#
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Copyright (c) 2020 Alex Richardson
+# Copyright (c) 2020-2023 University of Cambridge
+#
+
+# Fields for capability registers (same bit positions as GPR fields)
+%cs2       20:5
+%cs1       15:5
+%cd         7:5
+
+# Argument sets for CHERI instructions
+&ccr cd cs1 rs2        # cap-cap-reg: cd = f(cs1, rs2)
+&rcc rd cs1 cs2        # reg-cap-cap: rd = f(cs1, cs2)
+&ccc cd cs1 cs2        # cap-cap-cap: cd = f(cs1, cs2)
+&rc  rd cs1            # reg-cap: rd = f(cs1)
+&cc  cd cs1            # cap-cap: cd = f(cs1)
+&cci imm cs1 cd        # cap-cap-imm: cd = f(cs1, imm)
+
+# Formats
+@ccr .......   ..... ..... ... ..... ....... &ccr %cd %cs1 %rs2
+@rcc .......   ..... ..... ... ..... ....... &rcc %rd %cs1 %cs2
+@ccc .......   ..... ..... ... ..... ....... &ccc %cd %cs1 %cs2
+@rc  .......   ..... ..... ... ..... ....... &rc  %rd %cs1
+@cc  .......   ..... ..... ... ..... ....... &cc  %cd %cs1
+@cci ............      ..... ... ..... ....... &cci %cd %cs1 imm=%imm_i
+
+# Unsigned immediate for csetboundsimm
+%imm_i_unsigned    20:12
+@cci_unsigned   ............    ..... ... ..... ....... &cci imm=%imm_i_unsigned %cs1 %cd
+
+# Two-source format (rs1 + rs2, no destination)
+@r_2source ....... ..... .....   ... ..... ....... %rs2 %rs1
+
+# Atomic formats for cap-relative loads/stores
+@atom_ld_cap_or_ddc .......   ..... ..... ... ..... ....... &atomic aq=1 rl=1 rs2=0  %rs1 %rd
+@atom_st_cap_or_ddc .......   ..... ..... ... ..... ....... &atomic aq=1 rl=1 rd=0   %rs2 %rs1
+
+# =============================================================================
+# Three-operand capability instructions (opcode = 1011011 = 0x5b)
+# =============================================================================
+
+cspecialrw      0000001  ..... ..... 000 ..... 1011011 @ccc
+csetbounds      0001000  ..... ..... 000 ..... 1011011 @ccr
+csetboundsexact 0001001  ..... ..... 000 ..... 1011011 @ccr
+cseal           0001011  ..... ..... 000 ..... 1011011 @ccc
+cunseal         0001100  ..... ..... 000 ..... 1011011 @ccc
+candperm        0001101  ..... ..... 000 ..... 1011011 @ccr
+csetflags       0001110  ..... ..... 000 ..... 1011011 @ccr
+csetoffset      0001111  ..... ..... 000 ..... 1011011 @ccr
+csetaddr        0010000  ..... ..... 000 ..... 1011011 @ccr
+cincoffset      0010001  ..... ..... 000 ..... 1011011 @ccr
+ctoptr          0010010  ..... ..... 000 ..... 1011011 @rcc
+cfromptr        0010011  ..... ..... 000 ..... 1011011 @ccr
+csub            0010100  ..... ..... 000 ..... 1011011 @rcc
+csethigh        0010110  ..... ..... 000 ..... 1011011 @ccr
+cbuildcap       0011101  ..... ..... 000 ..... 1011011 @ccc
+ccopytype       0011110  ..... ..... 000 ..... 1011011 @ccc
+ccseal          0011111  ..... ..... 000 ..... 1011011 @ccc
+ctestsubset     0100000  ..... ..... 000 ..... 1011011 @rcc
+cseqx           0100001  ..... ..... 000 ..... 1011011 @rcc
+
+# =============================================================================
+# Two-operand capability instructions (source and dest)
+# =============================================================================
+
+cgetperm    1111111  00000 ..... 000 ..... 1011011 @rc
+cgettype    1111111  00001 ..... 000 ..... 1011011 @rc
+cgetbase    1111111  00010 ..... 000 ..... 1011011 @rc
+cgetlen     1111111  00011 ..... 000 ..... 1011011 @rc
+cgettag     1111111  00100 ..... 000 ..... 1011011 @rc
+cgetsealed  1111111  00101 ..... 000 ..... 1011011 @rc
+cgetoffset  1111111  00110 ..... 000 ..... 1011011 @rc
+cgetflags   1111111  00111 ..... 000 ..... 1011011 @rc
+cgetaddr    1111111  01111 ..... 000 ..... 1011011 @rc
+cgethigh    1111111  10111 ..... 000 ..... 1011011 @rc
+crrl        1111111  01000 ..... 000 ..... 1011011 @r2
+cram        1111111  01001 ..... 000 ..... 1011011 @r2
+cmv         1111111  01010 ..... 000 ..... 1011011 @cc
+ccleartag   1111111  01011 ..... 000 ..... 1011011 @cc
+jalr_cap    1111111  01100 ..... 000 ..... 1011011 @cc
+csealentry  1111111  10001 ..... 000 ..... 1011011 @cc
+cloadtags   1111111  10010 ..... 000 ..... 1011011 @rc
+jalr_pcc    1111111  10100 ..... 000 ..... 1011011 @r2
+
+# =============================================================================
+# Two-operand source instructions (no writeback)
+# =============================================================================
+
+cinvoke     1111110  ..... ..... 000 00001 1011011 @r_2source
+
+# =============================================================================
+# Immediate instructions
+# =============================================================================
+
+caddi         ............     ..... 001 ..... 1011011 @cci
+csetboundsimm ............     ..... 010 ..... 1011011 @cci_unsigned
+
+# =============================================================================
+# RV64-specific CHERI loads/stores via DDC and capability
+# =============================================================================
+
+# Loads via DDC (Default Data Capability)
+ld_b_ddc    1111101  00000 ..... 000 ..... 1011011 @r2
+ld_h_ddc    1111101  00001 ..... 000 ..... 1011011 @r2
+ld_w_ddc    1111101  00010 ..... 000 ..... 1011011 @r2
+ld_d_ddc    1111101  00011 ..... 000 ..... 1011011 @r2
+ld_bu_ddc   1111101  00100 ..... 000 ..... 1011011 @r2
+ld_hu_ddc   1111101  00101 ..... 000 ..... 1011011 @r2
+ld_wu_ddc   1111101  00110 ..... 000 ..... 1011011 @r2
+ld_c_ddc    1111101  10111 ..... 000 ..... 1011011 @r2
+
+# Loads via capability register
+ld_b_cap    1111101  01000 ..... 000 ..... 1011011 @r2
+ld_h_cap    1111101  01001 ..... 000 ..... 1011011 @r2
+ld_w_cap    1111101  01010 ..... 000 ..... 1011011 @r2
+ld_d_cap    1111101  01011 ..... 000 ..... 1011011 @r2
+ld_bu_cap   1111101  01100 ..... 000 ..... 1011011 @r2
+ld_hu_cap   1111101  01101 ..... 000 ..... 1011011 @r2
+ld_wu_cap   1111101  01110 ..... 000 ..... 1011011 @r2
+ld_c_cap    1111101  11111 ..... 000 ..... 1011011 @r2
+
+# Stores via DDC
+st_b_ddc    1111100  ..... ..... 000 00000 1011011 @r_2source
+st_h_ddc    1111100  ..... ..... 000 00001 1011011 @r_2source
+st_w_ddc    1111100  ..... ..... 000 00010 1011011 @r_2source
+st_d_ddc    1111100  ..... ..... 000 00011 1011011 @r_2source
+st_c_ddc    1111100  ..... ..... 000 00100 1011011 @r_2source
+
+# Stores via capability register
+st_b_cap    1111100  ..... ..... 000 01000 1011011 @r_2source
+st_h_cap    1111100  ..... ..... 000 01001 1011011 @r_2source
+st_w_cap    1111100  ..... ..... 000 01010 1011011 @r_2source
+st_d_cap    1111100  ..... ..... 000 01011 1011011 @r_2source
+st_c_cap    1111100  ..... ..... 000 01100 1011011 @r_2source
+
+# Load-reserved via DDC
+lr_b_ddc    1111101  10000 ..... 000 ..... 1011011 @atom_ld_cap_or_ddc
+lr_h_ddc    1111101  10001 ..... 000 ..... 1011011 @atom_ld_cap_or_ddc
+lr_w_ddc    1111101  10010 ..... 000 ..... 1011011 @atom_ld_cap_or_ddc
+lr_d_ddc    1111101  10011 ..... 000 ..... 1011011 @atom_ld_cap_or_ddc
+lr_c_ddc    1111101  10100 ..... 000 ..... 1011011 @atom_ld_cap_or_ddc
+
+# Load-reserved via capability
+lr_b_cap    1111101  11000 ..... 000 ..... 1011011 @atom_ld_cap_or_ddc
+lr_h_cap    1111101  11001 ..... 000 ..... 1011011 @atom_ld_cap_or_ddc
+lr_w_cap    1111101  11010 ..... 000 ..... 1011011 @atom_ld_cap_or_ddc
+lr_d_cap    1111101  11011 ..... 000 ..... 1011011 @atom_ld_cap_or_ddc
+lr_c_cap    1111101  11100 ..... 000 ..... 1011011 @atom_ld_cap_or_ddc
+
+# Store-conditional via DDC
+sc_b_ddc    1111100  ..... ..... 000 10000 1011011 @atom_st_cap_or_ddc
+sc_h_ddc    1111100  ..... ..... 000 10001 1011011 @atom_st_cap_or_ddc
+sc_w_ddc    1111100  ..... ..... 000 10010 1011011 @atom_st_cap_or_ddc
+sc_d_ddc    1111100  ..... ..... 000 10011 1011011 @atom_st_cap_or_ddc
+sc_c_ddc    1111100  ..... ..... 000 10100 1011011 @atom_st_cap_or_ddc
+
+# Store-conditional via capability
+sc_b_cap    1111100  ..... ..... 000 11000 1011011 @atom_st_cap_or_ddc
+sc_h_cap    1111100  ..... ..... 000 11001 1011011 @atom_st_cap_or_ddc
+sc_w_cap    1111100  ..... ..... 000 11010 1011011 @atom_st_cap_or_ddc
+sc_d_cap    1111100  ..... ..... 000 11011 1011011 @atom_st_cap_or_ddc
+sc_c_cap    1111100  ..... ..... 000 11100 1011011 @atom_st_cap_or_ddc

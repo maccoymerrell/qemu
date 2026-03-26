@@ -168,6 +168,16 @@ struct CPUClass {
     const char *gdb_core_xml_file;
     const gchar * (*gdb_arch_name)(CPUState *cpu);
 
+    /**
+     * @read_capability: Optional callback for reading CHERI capability data
+     * from a register. Returns true if the register is a capability register
+     * and fills cap_info_out with the capability fields. The cap_info_out
+     * is a pointer to a qemu_plugin_cap_info struct (cast to void* to avoid
+     * circular header dependency).
+     */
+    bool (*read_capability)(CPUState *cpu, int gdb_reg,
+                            void *cap_info_out);
+
     void (*disas_set_info)(CPUState *cpu, disassemble_info *info);
 
     const char *deprecation_note;

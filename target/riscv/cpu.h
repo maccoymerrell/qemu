@@ -32,6 +32,7 @@
 #include "cpu_cfg.h"
 #include "qapi/qapi-types-common.h"
 #include "cpu-qom.h"
+#include "cheri_cap.h"
 
 typedef struct CPUArchState CPURISCVState;
 
@@ -206,6 +207,15 @@ typedef struct PMUFixedCtrState {
 struct CPUArchState {
     target_ulong gpr[32];
     target_ulong gprh[32]; /* 64 top bits of the 128-bit registers */
+
+    /*
+     * CHERI capability state (Xcheri extension).
+     * General-purpose capability registers overlay GPRs: gpcr[i].cursor == gpr[i].
+     * PCC = program counter capability, DDC = default data capability.
+     */
+    cap_register_t gpcr[32];  /* general-purpose capability registers (c0-c31) */
+    cap_register_t pcc;       /* program counter capability */
+    cap_register_t ddc;       /* default data capability */
 
     /* vector coprocessor state. */
     uint64_t vreg[32 * RV_VLEN_MAX / 64] QEMU_ALIGNED(16);

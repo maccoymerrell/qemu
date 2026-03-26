@@ -21,3 +21,5 @@ GTAGS
 *.patch
 *.gcov
 build_wptrace/
+build-cheri/
+subprojects/.wraplock

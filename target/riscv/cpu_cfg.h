@@ -183,6 +183,9 @@ struct RISCVCPUConfig {
     bool ext_xtheadsync;
     bool ext_XVentanaCondOps;
 
+    /* CHERI capability extensions */
+    bool ext_xcheri;
+
     uint32_t pmu_mask;
     uint16_t vlenb;
     uint16_t elen;
@@ -238,5 +241,6 @@ MATERIALISE_EXT_PREDICATE(xtheadmemidx)
 MATERIALISE_EXT_PREDICATE(xtheadmempair)
 MATERIALISE_EXT_PREDICATE(xtheadsync)
 MATERIALISE_EXT_PREDICATE(XVentanaCondOps)
+MATERIALISE_EXT_PREDICATE(xcheri)
 
 #endif

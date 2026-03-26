@@ -2372,7 +2372,15 @@ void riscv_cpu_do_interrupt(CPUState *cs)
             tval = env->sw_check_code;
             break;
         case RISCV_EXCP_CHERI:
+            /*
+             * Per CTSRD-CHERI/qemu: tval encodes the CHERI cause in bits [4:0]
+             * and the register number in bits [10:5]. The fields were populated
+             * by raise_cheri_exception() in cheri_helper.c.
+             */
             tval = env->badaddr;
+            /* Reset tracking fields after consumption */
+            env->last_cap_cause = -1;
+            env->last_cap_index = -1;
             break;
         default:
             break;
@@ -2480,6 +2488,7 @@ void riscv_cpu_do_interrupt(CPUState *cs)
         env->scause = cause | ((target_ulong)async << (sxlen - 1));
         env->sepc = env->pc;
         if (riscv_cpu_cfg(env)->ext_xcheri) {
+            /* Save PCC → SEPCC (preserve full capability) */
             env->sepcc = env->pcc;
             cap_set_addr(&env->sepcc, (uint64_t)env->sepc);
         }
@@ -2489,8 +2498,8 @@ void riscv_cpu_do_interrupt(CPUState *cs)
         env->pc = (env->stvec >> 2 << 2) +
                   ((async && (env->stvec & 3) == 1) ? cause * 4 : 0);
         if (riscv_cpu_cfg(env)->ext_xcheri) {
-            env->pcc = env->stvecc;
-            cap_set_addr(&env->pcc, (uint64_t)env->pc);
+            /* Load PCC from STCC (trap handler capability) */
+            cheri_update_pcc_for_exc_handler(env, &env->stvecc, env->pc);
         }
         riscv_cpu_set_mode(env, PRV_S, virt);
 
@@ -2566,6 +2575,7 @@ void riscv_cpu_do_interrupt(CPUState *cs)
         }
         env->mepc = env->pc;
         if (riscv_cpu_cfg(env)->ext_xcheri) {
+            /* Save PCC → MEPCC (preserve full capability) */
             env->mepcc = env->pcc;
             cap_set_addr(&env->mepcc, (uint64_t)env->mepc);
         }
@@ -2583,8 +2593,8 @@ void riscv_cpu_do_interrupt(CPUState *cs)
                       ((async && (env->mtvec & 3) == 1) ? cause * 4 : 0);
         }
         if (riscv_cpu_cfg(env)->ext_xcheri && !nnmi_excep) {
-            env->pcc = env->mtvecc;
-            cap_set_addr(&env->pcc, (uint64_t)env->pc);
+            /* Load PCC from MTCC (trap handler capability) */
+            cheri_update_pcc_for_exc_handler(env, &env->mtvecc, env->pc);
         }
         riscv_cpu_set_mode(env, PRV_M, virt);
         src = env->mepc;

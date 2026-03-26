@@ -268,6 +268,17 @@ struct CPUArchState {
     target_ulong badaddr;
     target_ulong bins;
 
+    /*
+     * CHERI exception tracking — per CTSRD-CHERI/qemu.
+     * last_cap_cause: exception cause code (CheriCapExcCause), populated by
+     *   raise_cheri_exception() and consumed by riscv_cpu_do_interrupt() when
+     *   encoding xtval.
+     * last_cap_index: register number that caused the exception.
+     * These are reset to -1 after being consumed by the trap handler.
+     */
+    int8_t last_cap_cause;
+    int8_t last_cap_index;
+
     target_ulong guest_phys_fault_addr;
 
     target_ulong priv_ver;
@@ -1058,6 +1069,81 @@ static inline void cheri_cap_to_gpr(CPURISCVState *env, int i)
         return; /* x0 is always zero */
     }
     env->gpr[i] = (target_ulong)env->gpcr[i]._cursor;
+}
+
+/*
+ * Check whether the current PCC grants access to system registers.
+ * Per CTSRD-CHERI/qemu, this checks CAP_ACCESS_SYS_REGS permission on PCC.
+ * Used by sret/mret and CSpecialRW to gate privileged register access.
+ */
+static inline bool cheri_have_access_sysregs(CPURISCVState *env)
+{
+    return (cap_get_perms(&env->pcc) & CAP_ACCESS_SYS_REGS) != 0;
+}
+
+/*
+ * Update a Special Capability Register (SCR) that extends a CSR.
+ * Per CTSRD-CHERI/qemu: update_special_register() —
+ *  - If the SCR is sealed, clear the tag and update the cursor
+ *  - If the new cursor would be unrepresentable, clear the tag
+ *  - Otherwise, just update the cursor
+ *
+ * This ensures that CSR writes (which only provide an integer value) properly
+ * update the capability metadata of the corresponding SCR.
+ */
+static inline void update_special_register(CPURISCVState *env,
+                                           cap_register_t *scr,
+                                           target_ulong new_value)
+{
+    target_ulong new_cursor = new_value;
+
+    if (!cap_is_sealed_entry(scr) && cap_is_sealed(scr)) {
+        /*
+         * Attempting to modify a sealed SCR: clear the tag and update cursor.
+         * This matches CTSRD-CHERI/qemu behavior.
+         */
+        scr->tag = false;
+    }
+
+    scr->_cursor = (uint64_t)new_cursor;
+}
+
+/*
+ * Update PCC for exception return (sret/mret).
+ * Per CTSRD-CHERI/qemu: cheri_update_pcc_for_exc_return() —
+ *  - Copy the EPCC (sepcc/mepcc) to PCC
+ *  - Set PCC cursor to the return address
+ *  - If the EPCC is sealed, clear the tag (architectural requirement)
+ */
+static inline void cheri_update_pcc_for_exc_return(CPURISCVState *env,
+                                                   cap_register_t *epcc,
+                                                   target_ulong retpc)
+{
+    env->pcc = *epcc;
+    cap_set_addr(&env->pcc, (uint64_t)retpc);
+    /*
+     * If the EPCC was sealed, the address change above may have made PCC
+     * unrepresentable. In that case, clear the tag per CHERI spec.
+     */
+    if (cap_is_sealed(epcc)) {
+        if ((target_ulong)cap_get_cursor(&env->pcc) != retpc) {
+            env->pcc.tag = false;
+        }
+    }
+}
+
+/*
+ * Update PCC for exception handler entry.
+ * Per CTSRD-CHERI/qemu: cheri_update_pcc_for_exc_handler() —
+ *  - Copy the TVEC capability (stvecc/mtvecc) to PCC
+ *  - Set PCC cursor to the handler address (new_pc)
+ */
+static inline void cheri_update_pcc_for_exc_handler(CPURISCVState *env,
+                                                    cap_register_t *tvecc,
+                                                    target_ulong new_pc)
+{
+    env->pcc = *tvecc;
+    cap_set_addr(&env->pcc, (uint64_t)new_pc);
 }
 
 #endif /* RISCV_CPU_H */

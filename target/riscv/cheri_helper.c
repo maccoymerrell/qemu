@@ -57,10 +57,16 @@ static inline const cap_register_t *get_cap_reg_const(CPURISCVState *env,
 /*
  * Raise a CHERI capability exception.
  * Maps to RISC-V mcause = 28 (CHERI fault) with mtval encoding the cause.
+ *
+ * Per CTSRD-CHERI/qemu: stores cause/regnum in env fields, then the trap
+ * handler (riscv_cpu_do_interrupt) encodes them into xtval as:
+ *   xtval = cause[4:0] | (regnum[5:0] << 5)
  */
 static void raise_cheri_exception(CPURISCVState *env, uint32_t cause,
                                   uint32_t regnum, uintptr_t ra)
 {
+    env->last_cap_cause = (int8_t)cause;
+    env->last_cap_index = (int8_t)regnum;
     env->badaddr = (target_ulong)((cause & 0x1f) | ((regnum & 0x3f) << 5));
     riscv_raise_exception(env, RISCV_EXCP_CHERI, ra);
 }
@@ -74,6 +80,7 @@ static void raise_cheri_exception(CPURISCVState *env, uint32_t cause,
 #define CapEx_PermitStoreViolation       0x13
 #define CapEx_PermitSealViolation        0x17
 #define CapEx_PermitUnsealViolation      0x1B
+#define CapEx_AccessSystemRegsViolation  0x18
 
 /* ===========================================================================
  * Capability inspection helpers
@@ -527,6 +534,15 @@ void helper_cheri_cspecialrw(CPURISCVState *env, uint32_t cd, uint32_t cs1,
     cap_register_t old_val;
     cap_register_t *src = (cs1 != 0) ? get_cap_reg(env, cs1) : NULL;
     cap_register_t *special;
+
+    /*
+     * Per CTSRD-CHERI/qemu: CSpecialRW requires Access_System_Registers
+     * permission in PCC for system-mode SCRs (anything beyond DDC).
+     */
+    if (scr >= 2 && !cheri_have_access_sysregs(env)) {
+        raise_cheri_exception(env, CapEx_AccessSystemRegsViolation, 0, GETPC());
+        return;
+    }
 
     /* Select the special capability register */
     switch (scr) {

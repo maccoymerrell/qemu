@@ -55,11 +55,20 @@
 #define CAP_PERM_SYSTEM     (1u << 7)   /* 0x080 */
 #define CAP_PERM_SETCID     (1u << 8)   /* 0x100 */
 
+/*
+ * CAP_ACCESS_SYS_REGS is the CHERI permission that gates access to
+ * system registers (sret/mret/CSpecialRW).  Per the CHERI specification,
+ * this maps to CAP_PERM_SYSTEM (bit 7) on RISC-V.
+ */
+#define CAP_ACCESS_SYS_REGS  CAP_PERM_SYSTEM
+
 #define CAP_PERMS_ALL       0x1FFu      /* bits [8:0] */
 
 /* Object type constants. */
 #define CAP_OTYPE_UNSEALED  0u
 #define CAP_OTYPE_SENTRY    1u
+#define CAP_OTYPE_SENTRY_ID 3u  /* Interrupt-disabled sentry */
+#define CAP_OTYPE_SENTRY_IE 4u  /* Interrupt-enabled sentry */
 
 /*
  * pesbt layout (simplified compressed format)
@@ -200,6 +209,18 @@ static inline uint32_t cap_get_otype(const cap_register_t *c)
 static inline bool cap_is_sealed(const cap_register_t *c)
 {
     return cap_get_otype(c) != CAP_OTYPE_UNSEALED;
+}
+
+/**
+ * Return true if @p c is a sentry capability (sealed with sentry otype).
+ * Sentries can be used as indirect jump targets but not modified.
+ */
+static inline bool cap_is_sealed_entry(const cap_register_t *c)
+{
+    uint32_t ot = cap_get_otype(c);
+    return ot == CAP_OTYPE_SENTRY ||
+           ot == CAP_OTYPE_SENTRY_ID ||
+           ot == CAP_OTYPE_SENTRY_IE;
 }
 
 static inline bool cap_get_tag(const cap_register_t *c)

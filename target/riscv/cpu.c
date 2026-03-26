@@ -1107,6 +1107,10 @@ static void riscv_cpu_reset_hold(Object *obj, ResetType type)
         env->stvecc_hs = cap_mk_null();
         env->sepcc_hs = cap_mk_null();
         env->sscratchc_hs = cap_mk_null();
+
+        /* CHERI exception tracking fields */
+        env->last_cap_cause = -1;
+        env->last_cap_index = -1;
     }
 
     env->menvcfg = (cpu->cfg.ext_svpbmt ? MENVCFG_PBMTE : 0) |

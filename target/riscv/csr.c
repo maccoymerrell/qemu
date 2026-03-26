@@ -5140,7 +5140,11 @@ static RISCVException write_vsstatus(CPURISCVState *env, int csrno,
 static RISCVException read_vstvec(CPURISCVState *env, int csrno,
                                   target_ulong *val)
 {
-    *val = env->vstvec;
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        *val = (target_ulong)cap_get_cursor(&env->vstvecc);
+    } else {
+        *val = env->vstvec;
+    }
     return RISCV_EXCP_NONE;
 }
 
@@ -5150,6 +5154,9 @@ static RISCVException write_vstvec(CPURISCVState *env, int csrno,
     /* bits [1:0] encode mode; 0 = direct, 1 = vectored, 2 >= reserved */
     if ((val & 3) < 2) {
         env->vstvec = val;
+        if (riscv_cpu_cfg(env)->ext_xcheri) {
+            cap_set_addr(&env->vstvecc, (uint64_t)val);
+        }
     } else {
         qemu_log_mask(LOG_UNIMP, "CSR_VSTVEC: reserved mode not supported\n");
     }
@@ -5159,7 +5166,11 @@ static RISCVException write_vstvec(CPURISCVState *env, int csrno,
 static RISCVException read_vsscratch(CPURISCVState *env, int csrno,
                                      target_ulong *val)
 {
-    *val = env->vsscratch;
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        *val = (target_ulong)cap_get_cursor(&env->vsscratchc);
+    } else {
+        *val = env->vsscratch;
+    }
     return RISCV_EXCP_NONE;
 }
 
@@ -5167,13 +5178,20 @@ static RISCVException write_vsscratch(CPURISCVState *env, int csrno,
                                       target_ulong val)
 {
     env->vsscratch = val;
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        cap_set_addr(&env->vsscratchc, (uint64_t)val);
+    }
     return RISCV_EXCP_NONE;
 }
 
 static RISCVException read_vsepc(CPURISCVState *env, int csrno,
                                  target_ulong *val)
 {
-    *val = env->vsepc;
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        *val = (target_ulong)cap_get_cursor(&env->vsepcc);
+    } else {
+        *val = env->vsepc;
+    }
     return RISCV_EXCP_NONE;
 }
 
@@ -5181,6 +5199,9 @@ static RISCVException write_vsepc(CPURISCVState *env, int csrno,
                                   target_ulong val)
 {
     env->vsepc = val;
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        cap_set_addr(&env->vsepcc, (uint64_t)val);
+    }
     return RISCV_EXCP_NONE;
 }
 

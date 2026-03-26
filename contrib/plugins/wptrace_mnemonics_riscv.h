@@ -11,6 +11,7 @@
 
 /* RISCV: 95/96 classified, 1 REG_NONE */
 static const RegClassification riscv_reg_class[RISCV_REG_ENDING] = {
+    [RISCV_REG_X0] = { REG_ZERO },  /* zero (hardwired zero) */
     [RISCV_REG_X1] = { REG_LR },  /* ra */
     [RISCV_REG_X2] = { REG_SP },  /* sp */
     [RISCV_REG_X3] = { REG_GPR3 },  /* gp */

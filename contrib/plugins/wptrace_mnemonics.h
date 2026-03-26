@@ -71,6 +71,15 @@ enum GenericOpcode {
     GEN_OP_NEG = 49,
     GEN_OP_INC = 50,
     GEN_OP_DEC = 51,
+    GEN_OP_INT_MADD = 52,    /* Integer multiply-accumulate (MADD, SMADDL, etc.) */
+    GEN_OP_INT_MSUB = 53,    /* Integer multiply-subtract   (MSUB, SMSUBL, etc.) */
+    GEN_OP_FP_MADD = 54,     /* FP fused multiply-add       (FMADD, FMLA, etc.)  */
+    GEN_OP_FP_MSUB = 55,     /* FP fused multiply-sub       (FMSUB, FMLS, etc.)  */
+    GEN_OP_INT_REM = 56,     /* Integer remainder / modulo   (REM, REMU, etc.)    */
+    GEN_OP_INT_MULH = 57,    /* Integer multiply-high        (MULH, SMULH, etc.)  */
+    GEN_OP_VEC_MADD = 58,    /* Vector multiply-accumulate   (MLA, SMLAL, etc.)   */
+    GEN_OP_BITMANIP = 59,    /* Bit manipulation (CLZ, CTZ, POPCNT, BSWAP, etc.)  */
+    GEN_OP_CRYPTO = 60,      /* Cryptographic ops (AES, SHA, CRC32, etc.)         */
     GEN_OP_COUNT
 };
 
@@ -198,7 +207,8 @@ enum GenericRegId {
     REG_VEC14, REG_VEC15, REG_VEC16, REG_VEC17, REG_VEC18, REG_VEC19,
     REG_VEC20, REG_VEC21, REG_VEC22, REG_VEC23, REG_VEC24, REG_VEC25,
     REG_VEC26, REG_VEC27, REG_VEC28, REG_VEC29, REG_VEC30, REG_VEC31,
-    /* Special registers: 250-254 */
+    /* Special registers: 249-254 */
+    REG_ZERO = 249,
     REG_SP = 250,
     REG_FLAGS = 251,
     REG_IP = 252,

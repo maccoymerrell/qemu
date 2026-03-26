@@ -11,6 +11,7 @@
 
 /* MIPS: 63/136 classified, 73 REG_NONE */
 static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
+    [MIPS_REG_ZERO] = { REG_ZERO },  /* $zero (hardwired zero) */
     [MIPS_REG_AT] = { REG_GPR1 },  /* at */
     [MIPS_REG_V0] = { REG_GPR2 },  /* v0 */
     [MIPS_REG_V1] = { REG_GPR3 },  /* v1 */

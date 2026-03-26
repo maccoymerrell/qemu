@@ -38,6 +38,7 @@
 #include "kvm/kvm_riscv.h"
 #include "tcg/tcg-cpu.h"
 #include "tcg/tcg.h"
+#include "cheri_tag_mem.h"
 
 /* RISC-V CPU definitions */
 static const char riscv_single_letter_exts[] = "IEMAFDQCBPVH";
@@ -1111,6 +1112,9 @@ static void riscv_cpu_reset_hold(Object *obj, ResetType type)
         /* CHERI exception tracking fields */
         env->last_cap_cause = -1;
         env->last_cap_index = -1;
+
+        /* Initialize the global tag memory subsystem */
+        cheri_tag_init();
     }
 
     env->menvcfg = (cpu->cfg.ext_svpbmt ? MENVCFG_PBMTE : 0) |

@@ -25,6 +25,7 @@ riscv_ss.add(files(
   'zce_helper.c',
   'vcrypto_helper.c',
   'cheri_helper.c',
+  'cheri_tag_mem.c',
 ))
 
 riscv_system_ss = ss.source_set()

@@ -14,6 +14,8 @@
 #include "exec/exec-all.h"
 #include "exec/helper-proto.h"
 #include "cheri_cap.h"
+#include "cheri_tag_mem.h"
+#include "exec/cpu_ldst.h"
 
 /*
  * Helper to get a pointer to a capability register.
@@ -658,4 +660,446 @@ void helper_cheri_caddi(CPURISCVState *env, uint32_t cd, uint32_t cs1)
     /* The new cursor value is already in gpr[cd] from the caller */
     cap_set_addr(&result, (uint64_t)env->gpr[cd]);
     *dst = result;
+}
+
+/* ===========================================================================
+ * Load/Store via DDC helpers
+ *
+ * These implement CHERI loads/stores where the effective address is formed
+ * by adding an offset in rs1 to the DDC (Default Data Capability) base.
+ * DDC bounds and permissions are checked before the memory access.
+ * ===========================================================================*/
+
+/*
+ * Helper: check DDC for a load/store access.
+ *  - Tag must be valid
+ *  - Must not be sealed
+ *  - Must have the required permission (LOAD or STORE)
+ *  - Address must be in bounds
+ *
+ * Returns the physical effective address (DDC.base + addr_offset).
+ */
+static inline target_ulong check_ddc(CPURISCVState *env, target_ulong addr,
+                                     uint32_t size, uint32_t perm_needed,
+                                     uintptr_t ra)
+{
+    const cap_register_t *ddc = &env->ddc;
+
+    if (!cap_get_tag(ddc)) {
+        raise_cheri_exception(env, CapEx_TagViolation, /*DDC*/ 1, ra);
+    }
+    if (cap_is_sealed(ddc)) {
+        raise_cheri_exception(env, CapEx_SealViolation, 1, ra);
+    }
+    if (!(cap_get_perms(ddc) & perm_needed)) {
+        uint32_t cause = (perm_needed & CAP_PERM_LOAD)
+                             ? CapEx_PermitLoadViolation
+                             : CapEx_PermitStoreViolation;
+        raise_cheri_exception(env, cause, 1, ra);
+    }
+
+    /* Effective address = DDC.base + addr (offset from rs1) */
+    uint64_t ea = cap_get_base(ddc) + (uint64_t)addr;
+    if (!cap_in_bounds(ddc, ea, size)) {
+        raise_cheri_exception(env, CapEx_LengthViolation, 1, ra);
+    }
+
+    return (target_ulong)ea;
+}
+
+/*
+ * Load via DDC: rd = mem[DDC.base + rs1]
+ * @addr is the value of rs1 (offset from DDC base).
+ * @memop_size is the MO_SIZE part (1/2/4/8).
+ */
+target_ulong helper_cheri_load_ddc(CPURISCVState *env, target_ulong addr,
+                                   uint32_t memop_size)
+{
+    uint32_t size = 1u << (memop_size & MO_SIZE);
+    target_ulong ea = check_ddc(env, addr, size, CAP_PERM_LOAD, GETPC());
+    target_ulong val;
+
+    switch (memop_size & MO_SIZE) {
+    case MO_8:
+        val = (target_ulong)cpu_ldub_data_ra(env, ea, GETPC());
+        /* Sign extend if needed — handled by caller's MO flags */
+        break;
+    case MO_16:
+        val = (target_ulong)cpu_lduw_data_ra(env, ea, GETPC());
+        break;
+    case MO_32:
+        val = (target_ulong)cpu_ldl_data_ra(env, ea, GETPC());
+        break;
+    case MO_64:
+        val = (target_ulong)cpu_ldq_data_ra(env, ea, GETPC());
+        break;
+    default:
+        val = 0;
+    }
+    return val;
+}
+
+/*
+ * Store via DDC: mem[DDC.base + rs1] = rs2
+ */
+void helper_cheri_store_ddc(CPURISCVState *env, target_ulong addr,
+                            target_ulong val, uint32_t memop_size)
+{
+    uint32_t size = 1u << (memop_size & MO_SIZE);
+    target_ulong ea = check_ddc(env, addr, size, CAP_PERM_STORE, GETPC());
+
+    switch (memop_size & MO_SIZE) {
+    case MO_8:
+        cpu_stb_data_ra(env, ea, (uint8_t)val, GETPC());
+        break;
+    case MO_16:
+        cpu_stw_data_ra(env, ea, (uint16_t)val, GETPC());
+        break;
+    case MO_32:
+        cpu_stl_data_ra(env, ea, (uint32_t)val, GETPC());
+        break;
+    case MO_64:
+        cpu_stq_data_ra(env, ea, (uint64_t)val, GETPC());
+        break;
+    }
+
+    /* Non-capability store: clear any tag at this granule */
+    hwaddr paddr = ea;  /* In softmmu this would be translated */
+    cheri_tag_clear(paddr);
+}
+
+/* ===========================================================================
+ * Load/Store via Capability register helpers
+ *
+ * Effective address = cap.cursor + offset (rs2)
+ * Cap bounds and permissions are checked.
+ * ===========================================================================*/
+
+static inline target_ulong check_cap(CPURISCVState *env, uint32_t cs,
+                                     target_ulong offset,
+                                     uint32_t size, uint32_t perm_needed,
+                                     uintptr_t ra)
+{
+    const cap_register_t *cap = get_cap_reg_const(env, cs);
+
+    if (!cap_get_tag(cap)) {
+        raise_cheri_exception(env, CapEx_TagViolation, cs, ra);
+    }
+    if (cap_is_sealed(cap)) {
+        raise_cheri_exception(env, CapEx_SealViolation, cs, ra);
+    }
+    if (!(cap_get_perms(cap) & perm_needed)) {
+        uint32_t cause = (perm_needed & CAP_PERM_LOAD)
+                             ? CapEx_PermitLoadViolation
+                             : CapEx_PermitStoreViolation;
+        raise_cheri_exception(env, cause, cs, ra);
+    }
+
+    uint64_t ea = cap_get_cursor(cap) + (uint64_t)offset;
+    if (!cap_in_bounds(cap, ea, size)) {
+        raise_cheri_exception(env, CapEx_LengthViolation, cs, ra);
+    }
+
+    return (target_ulong)ea;
+}
+
+target_ulong helper_cheri_load_cap(CPURISCVState *env, uint32_t cs,
+                                   target_ulong offset, uint32_t memop_size)
+{
+    uint32_t size = 1u << (memop_size & MO_SIZE);
+    target_ulong ea = check_cap(env, cs, offset, size, CAP_PERM_LOAD,
+                                GETPC());
+    target_ulong val;
+
+    switch (memop_size & MO_SIZE) {
+    case MO_8:
+        val = (target_ulong)cpu_ldub_data_ra(env, ea, GETPC());
+        break;
+    case MO_16:
+        val = (target_ulong)cpu_lduw_data_ra(env, ea, GETPC());
+        break;
+    case MO_32:
+        val = (target_ulong)cpu_ldl_data_ra(env, ea, GETPC());
+        break;
+    case MO_64:
+        val = (target_ulong)cpu_ldq_data_ra(env, ea, GETPC());
+        break;
+    default:
+        val = 0;
+    }
+    return val;
+}
+
+void helper_cheri_store_cap(CPURISCVState *env, uint32_t cs,
+                            target_ulong offset, target_ulong val,
+                            uint32_t memop_size)
+{
+    uint32_t size = 1u << (memop_size & MO_SIZE);
+    target_ulong ea = check_cap(env, cs, offset, size, CAP_PERM_STORE,
+                                GETPC());
+
+    switch (memop_size & MO_SIZE) {
+    case MO_8:
+        cpu_stb_data_ra(env, ea, (uint8_t)val, GETPC());
+        break;
+    case MO_16:
+        cpu_stw_data_ra(env, ea, (uint16_t)val, GETPC());
+        break;
+    case MO_32:
+        cpu_stl_data_ra(env, ea, (uint32_t)val, GETPC());
+        break;
+    case MO_64:
+        cpu_stq_data_ra(env, ea, (uint64_t)val, GETPC());
+        break;
+    }
+
+    hwaddr paddr = ea;
+    cheri_tag_clear(paddr);
+}
+
+/* ===========================================================================
+ * Capability Load (LC) / Store (SC) — 16-byte capability with tag
+ *
+ * LC reads 16 bytes + tag bit.  SC writes 16 bytes + sets tag if valid.
+ * ===========================================================================*/
+
+/*
+ * Load capability via DDC: cd = mem_cap[DDC.base + rs1]
+ */
+void helper_cheri_load_cap_ddc(CPURISCVState *env, uint32_t cd,
+                               target_ulong addr)
+{
+    target_ulong ea = check_ddc(env, addr, CHERI_CAP_SIZE,
+                                CAP_PERM_LOAD | CAP_PERM_LOAD_CAP, GETPC());
+
+    /* Load the two 64-bit halves (pesbt ∥ cursor, little-endian) */
+    uint64_t cursor_val = cpu_ldq_data_ra(env, ea, GETPC());
+    uint64_t pesbt_val  = cpu_ldq_data_ra(env, ea + 8, GETPC());
+
+    /* Read the tag from tag memory */
+    hwaddr paddr = ea;  /* TODO: proper VA→PA in softmmu */
+    bool tag = cheri_tag_get(paddr & ~(hwaddr)(CHERI_CAP_SIZE - 1));
+
+    /* Construct the capability */
+    cap_register_t result;
+    result.pesbt   = pesbt_val;
+    result._cursor = cursor_val;
+    result.flags   = 0;
+    result.tag     = tag;
+
+    /* Decompress bounds from pesbt */
+    cc128_decompress(&result);
+
+    /* Write to destination register */
+    if (cd != 0) {
+        env->gpcr[cd] = result;
+        env->gpr[cd]  = (target_ulong)result._cursor;
+    }
+}
+
+/*
+ * Store capability via DDC: mem_cap[DDC.base + rs1] = cs2
+ */
+void helper_cheri_store_cap_ddc(CPURISCVState *env, uint32_t cs2,
+                                target_ulong addr)
+{
+    target_ulong ea = check_ddc(env, addr, CHERI_CAP_SIZE,
+                                CAP_PERM_STORE | CAP_PERM_STORE_CAP, GETPC());
+
+    const cap_register_t *src = get_cap_reg_const(env, cs2);
+
+    /* Store the two 64-bit halves */
+    cpu_stq_data_ra(env, ea, (uint64_t)src->_cursor, GETPC());
+    cpu_stq_data_ra(env, ea + 8, src->pesbt, GETPC());
+
+    /* Update tag memory */
+    hwaddr paddr = ea & ~(hwaddr)(CHERI_CAP_SIZE - 1);
+    if (src->tag) {
+        cheri_tag_set(paddr);
+    } else {
+        cheri_tag_clear(paddr);
+    }
+}
+
+/*
+ * Load capability via capability register: cd = mem_cap[cs1.cursor + offset]
+ */
+void helper_cheri_load_cap_via_cap(CPURISCVState *env, uint32_t cd,
+                                   uint32_t cs1, target_ulong offset)
+{
+    target_ulong ea = check_cap(env, cs1, offset, CHERI_CAP_SIZE,
+                                CAP_PERM_LOAD | CAP_PERM_LOAD_CAP, GETPC());
+
+    uint64_t cursor_val = cpu_ldq_data_ra(env, ea, GETPC());
+    uint64_t pesbt_val  = cpu_ldq_data_ra(env, ea + 8, GETPC());
+
+    hwaddr paddr = ea & ~(hwaddr)(CHERI_CAP_SIZE - 1);
+    bool tag = cheri_tag_get(paddr);
+
+    cap_register_t result;
+    result.pesbt   = pesbt_val;
+    result._cursor = cursor_val;
+    result.flags   = 0;
+    result.tag     = tag;
+    cc128_decompress(&result);
+
+    if (cd != 0) {
+        env->gpcr[cd] = result;
+        env->gpr[cd]  = (target_ulong)result._cursor;
+    }
+}
+
+/*
+ * Store capability via capability register: mem_cap[cs1.cursor + offset] = cs2
+ */
+void helper_cheri_store_cap_via_cap(CPURISCVState *env, uint32_t cs2,
+                                    uint32_t cs1, target_ulong offset)
+{
+    target_ulong ea = check_cap(env, cs1, offset, CHERI_CAP_SIZE,
+                                CAP_PERM_STORE | CAP_PERM_STORE_CAP, GETPC());
+
+    const cap_register_t *src = get_cap_reg_const(env, cs2);
+
+    cpu_stq_data_ra(env, ea, (uint64_t)src->_cursor, GETPC());
+    cpu_stq_data_ra(env, ea + 8, src->pesbt, GETPC());
+
+    hwaddr paddr = ea & ~(hwaddr)(CHERI_CAP_SIZE - 1);
+    if (src->tag) {
+        cheri_tag_set(paddr);
+    } else {
+        cheri_tag_clear(paddr);
+    }
+}
+
+/* ===========================================================================
+ * Atomic LR/SC via DDC
+ * ===========================================================================*/
+
+target_ulong helper_cheri_lr_ddc(CPURISCVState *env, target_ulong addr,
+                                 uint32_t memop_size)
+{
+    uint32_t size = 1u << (memop_size & MO_SIZE);
+    target_ulong ea = check_ddc(env, addr, size, CAP_PERM_LOAD, GETPC());
+    target_ulong val;
+
+    switch (memop_size & MO_SIZE) {
+    case MO_8:
+        val = (target_ulong)cpu_ldub_data_ra(env, ea, GETPC());
+        break;
+    case MO_16:
+        val = (target_ulong)cpu_lduw_data_ra(env, ea, GETPC());
+        break;
+    case MO_32:
+        val = (target_ulong)cpu_ldl_data_ra(env, ea, GETPC());
+        break;
+    case MO_64:
+        val = (target_ulong)cpu_ldq_data_ra(env, ea, GETPC());
+        break;
+    default:
+        val = 0;
+    }
+
+    /* Set the reservation */
+    env->load_res = ea;
+    env->load_val = val;
+    return val;
+}
+
+target_ulong helper_cheri_sc_ddc(CPURISCVState *env, target_ulong addr,
+                                 target_ulong val, uint32_t memop_size)
+{
+    uint32_t size = 1u << (memop_size & MO_SIZE);
+    target_ulong ea = check_ddc(env, addr, size, CAP_PERM_STORE, GETPC());
+
+    /* Check reservation */
+    if (env->load_res != ea) {
+        return 1;  /* SC failed */
+    }
+    env->load_res = -1;  /* Clear reservation */
+
+    switch (memop_size & MO_SIZE) {
+    case MO_8:
+        cpu_stb_data_ra(env, ea, (uint8_t)val, GETPC());
+        break;
+    case MO_16:
+        cpu_stw_data_ra(env, ea, (uint16_t)val, GETPC());
+        break;
+    case MO_32:
+        cpu_stl_data_ra(env, ea, (uint32_t)val, GETPC());
+        break;
+    case MO_64:
+        cpu_stq_data_ra(env, ea, (uint64_t)val, GETPC());
+        break;
+    }
+
+    hwaddr paddr = ea;
+    cheri_tag_clear(paddr);
+    return 0;  /* SC succeeded */
+}
+
+/* ===========================================================================
+ * Atomic LR/SC via capability register
+ * ===========================================================================*/
+
+target_ulong helper_cheri_lr_cap(CPURISCVState *env, uint32_t cs,
+                                 target_ulong offset, uint32_t memop_size)
+{
+    uint32_t size = 1u << (memop_size & MO_SIZE);
+    target_ulong ea = check_cap(env, cs, offset, size, CAP_PERM_LOAD,
+                                GETPC());
+    target_ulong val;
+
+    switch (memop_size & MO_SIZE) {
+    case MO_8:
+        val = (target_ulong)cpu_ldub_data_ra(env, ea, GETPC());
+        break;
+    case MO_16:
+        val = (target_ulong)cpu_lduw_data_ra(env, ea, GETPC());
+        break;
+    case MO_32:
+        val = (target_ulong)cpu_ldl_data_ra(env, ea, GETPC());
+        break;
+    case MO_64:
+        val = (target_ulong)cpu_ldq_data_ra(env, ea, GETPC());
+        break;
+    default:
+        val = 0;
+    }
+
+    env->load_res = ea;
+    env->load_val = val;
+    return val;
+}
+
+target_ulong helper_cheri_sc_cap(CPURISCVState *env, uint32_t cs,
+                                 target_ulong offset, target_ulong val,
+                                 uint32_t memop_size)
+{
+    uint32_t size = 1u << (memop_size & MO_SIZE);
+    target_ulong ea = check_cap(env, cs, offset, size, CAP_PERM_STORE,
+                                GETPC());
+
+    if (env->load_res != ea) {
+        return 1;  /* SC failed */
+    }
+    env->load_res = -1;
+
+    switch (memop_size & MO_SIZE) {
+    case MO_8:
+        cpu_stb_data_ra(env, ea, (uint8_t)val, GETPC());
+        break;
+    case MO_16:
+        cpu_stw_data_ra(env, ea, (uint16_t)val, GETPC());
+        break;
+    case MO_32:
+        cpu_stl_data_ra(env, ea, (uint32_t)val, GETPC());
+        break;
+    case MO_64:
+        cpu_stq_data_ra(env, ea, (uint64_t)val, GETPC());
+        break;
+    }
+
+    hwaddr paddr = ea;
+    cheri_tag_clear(paddr);
+    return 0;
 }

@@ -1331,6 +1331,28 @@ static void riscv_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *ctx = container_of(dcbase, DisasContext, base);
     CPURISCVState *env = cpu_env(cpu);
+
+    /*
+     * PCC bounds check: if CHERI is enabled, verify that the current PC
+     * is within the PCC bounds before fetching the instruction.
+     * This is done at translation time using the env's PCC bounds.
+     * A full implementation would emit TCG ops that check dynamically,
+     * but since PCC bounds only change on trap/return/jump (which end
+     * the TB), checking at translate time against env->pcc is sufficient.
+     */
+    if (ctx->cfg_ptr->ext_xcheri) {
+        uint64_t pc = (uint64_t)ctx->base.pc_next;
+        /* Check at least 2 bytes (compressed insn minimum) */
+        if (!cap_in_bounds(&env->pcc, pc, 2)) {
+            generate_exception(ctx, RISCV_EXCP_CHERI);
+            return;
+        }
+        if (!(cap_get_perms(&env->pcc) & CAP_PERM_EXECUTE)) {
+            generate_exception(ctx, RISCV_EXCP_CHERI);
+            return;
+        }
+    }
+
     uint16_t opcode16 = translator_lduw(env, &ctx->base, ctx->base.pc_next);
 
     ctx->ol = ctx->xl;

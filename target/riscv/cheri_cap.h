@@ -71,20 +71,40 @@
 #define CAP_OTYPE_SENTRY_IE 4u  /* Interrupt-enabled sentry */
 
 /*
- * pesbt layout (simplified compressed format)
+ * CHERI-128 (CC128 / Morello-style) compressed capability format.
+ *
+ * pesbt layout:
  *   [63:48]  permissions  (16 bits)
  *   [47:32]  object type  (16 bits)
- *   [31:16]  exponent + encoded top  (16 bits, reserved)
- *   [15: 0]  encoded bottom          (16 bits, reserved)
+ *   [31:27]  exponent E   (5 bits, 0 = exact, 1..24 = compressed)
+ *   [26:18]  encoded top  T (9 bits — top mantissa)
+ *   [17:9]   encoded bot  B (9 bits — base mantissa)
+ *   [8]      internal exponent flag IE (1 bit)
+ *   [7:0]    reserved     (8 bits)
  *
- * The lower 32 bits are reserved for a future full CHERI-128 compressed
- * encoding.  For now, decompressed base/top are carried alongside pesbt
- * so that all operations remain exact.
+ * When IE=0 (internal-exponent mode off / exact), E=0 and the full
+ * base/top are stored in the cached fields.  When IE=1, the exponent
+ * is extracted from bits [31:27] and T/B are mantissas that, shifted
+ * left by E, reconstruct approximate bounds.
+ *
+ * The cached _base/_top fields always hold the decompressed values so
+ * that bounds checks are O(1).
  */
 #define CAP_PESBT_PERMS_SHIFT   48
 #define CAP_PESBT_PERMS_MASK    UINT64_C(0xFFFF000000000000)
 #define CAP_PESBT_OTYPE_SHIFT   32
 #define CAP_PESBT_OTYPE_MASK    UINT64_C(0x0000FFFF00000000)
+
+/* CC128 compression constants */
+#define CC128_EXP_SHIFT         27
+#define CC128_EXP_MASK          UINT64_C(0x00000000F8000000)
+#define CC128_TOP_SHIFT         18
+#define CC128_TOP_MASK          UINT64_C(0x0000000007FC0000)
+#define CC128_BOT_SHIFT         9
+#define CC128_BOT_MASK          UINT64_C(0x000000000003FE00)
+#define CC128_IE_BIT            UINT64_C(0x0000000000000100)
+#define CC128_MANTISSA_BITS     9
+#define CC128_MAX_EXPONENT      24
 
 /* ---------- capability type ---------- */
 
@@ -93,8 +113,11 @@
  *
  * Stored as the compressed pesbt word plus a 64-bit cursor (virtual
  * address).  The tag bit lives out-of-band.  Decompressed base and top
- * are cached so that bounds checks and field queries are O(1) without
- * having to implement the full cc128 decompression logic.
+ * are cached so that bounds checks and field queries are O(1).
+ *
+ * The pesbt lower 32 bits encode the CC128 compressed bounds.  The
+ * cached _base/_top fields are kept in sync by every mutator so that
+ * compression/decompression is transparent to the rest of the emulator.
  */
 typedef struct cap_register {
     uint64_t pesbt;         /* packed permissions / otype / bounds metadata */
@@ -253,10 +276,12 @@ static inline uint64_t cap_get_high(const cap_register_t *c)
 /*
  * Set the bounds of a capability to [cursor, cursor + req_length).
  *
- * In real hardware the resulting bounds may be rounded (widened) due to
- * the compressed representation; here we store exact bounds.  Returns
- * true if the bounds were set exactly, false if they had to be rounded
- * (currently always true).
+ * In hardware the resulting bounds may be rounded (widened) due to the
+ * compressed CC128 representation.  Returns true if the bounds were set
+ * exactly, false if they had to be rounded.
+ *
+ * When rounding occurs, base is rounded DOWN and top is rounded UP, so
+ * the resulting bounds are always a superset of the requested bounds.
  *
  * Precondition: the capability must be unsealed and tagged.
  */
@@ -264,37 +289,55 @@ static inline bool cap_set_bounds(cap_register_t *c, uint64_t req_length)
 {
     c->_base = c->_cursor;
     c->_top  = c->_cursor + req_length;
-    return true;
+
+    /* Compute whether CC128 encoding is exact */
+    unsigned e = cc128_compute_exponent(req_length);
+    bool exact = (e == 0);
+
+    /* Encode bounds into pesbt */
+    cc128_compress(c);
+
+    return exact;
 }
 
 /*
  * Replace the offset (cursor − base) with @p offset.
- * Returns false if the new cursor falls outside representable bounds
- * (currently always succeeds).
+ * Returns false if the new cursor falls outside representable bounds.
  */
 static inline bool cap_set_offset(cap_register_t *c, uint64_t offset)
 {
-    c->_cursor = c->_base + offset;
+    uint64_t new_cursor = c->_base + offset;
+    if (!cc128_is_representable(c, new_cursor)) {
+        return false;
+    }
+    c->_cursor = new_cursor;
     return true;
 }
 
 /*
  * Set the cursor to an absolute address.
- * Returns false if the address is not representable (always true here).
+ * Returns false if the address is not representable.
  */
 static inline bool cap_set_addr(cap_register_t *c, uint64_t addr)
 {
+    if (!cc128_is_representable(c, addr)) {
+        return false;
+    }
     c->_cursor = addr;
     return true;
 }
 
 /*
  * Increment the cursor by a signed delta.
- * Returns false if the result is not representable (always true here).
+ * Returns false if the result is not representable.
  */
 static inline bool cap_inc_offset(cap_register_t *c, int64_t delta)
 {
-    c->_cursor = (uint64_t)((int64_t)c->_cursor + delta);
+    uint64_t new_cursor = (uint64_t)((int64_t)c->_cursor + delta);
+    if (!cc128_is_representable(c, new_cursor)) {
+        return false;
+    }
+    c->_cursor = new_cursor;
     return true;
 }
 
@@ -407,6 +450,202 @@ static inline bool cap_in_bounds(const cap_register_t *c, uint64_t addr,
         return false;
     }
     return true;
+}
+
+/* ==========================================================================
+ * CC128 Compressed Capability Encoding / Decoding
+ *
+ * These functions convert between the in-register (decompressed) format
+ * with explicit _base/_top and the in-memory 128-bit format (pesbt ∥ cursor)
+ * where bounds are encoded as mantissa+exponent in the pesbt lower 32 bits.
+ *
+ * The encoding follows the CHERI Concentrate scheme (CC128):
+ *   - Find the smallest exponent E such that the length fits in
+ *     CC128_MANTISSA_BITS bits when shifted right by E.
+ *   - Encode base and top mantissas as the top MANTISSA_BITS bits of
+ *     the respective addresses, right-shifted by E.
+ *   - Round base DOWN and top UP so the encoded bounds are a superset
+ *     of the requested bounds.
+ * ========================================================================== */
+
+/*
+ * Count leading zeros for 64-bit value.
+ */
+static inline int cc128_clz64(uint64_t val)
+{
+    if (val == 0) {
+        return 64;
+    }
+    return __builtin_clzll(val);
+}
+
+/*
+ * Compute the CC128 exponent for a given length.
+ * Returns the number of bits to shift so that length fits in
+ * CC128_MANTISSA_BITS bits.  Returns 0 for lengths that fit exactly.
+ */
+static inline unsigned cc128_compute_exponent(uint64_t length)
+{
+    if (length == 0) {
+        return 0;
+    }
+    int msb = 63 - cc128_clz64(length);
+    if (msb < CC128_MANTISSA_BITS) {
+        return 0;  /* fits exactly */
+    }
+    unsigned e = (unsigned)(msb - (CC128_MANTISSA_BITS - 1));
+    if (e > CC128_MAX_EXPONENT) {
+        e = CC128_MAX_EXPONENT;
+    }
+    return e;
+}
+
+/*
+ * Compute the "representable length" — the smallest length >= @req_len
+ * that can be exactly encoded at the exponent needed for @req_len.
+ *
+ * This is the CRRL instruction.
+ */
+static inline uint64_t cc128_representable_length(uint64_t req_len)
+{
+    unsigned e = cc128_compute_exponent(req_len);
+    if (e == 0) {
+        return req_len;  /* exact */
+    }
+    uint64_t mask = (UINT64_C(1) << e) - 1;
+    /* Round up */
+    return (req_len + mask) & ~mask;
+}
+
+/*
+ * Compute the "representable alignment mask" — the mask that, when ANDed
+ * with an address, gives the closest representable-aligned base.
+ *
+ * This is the CRAM instruction.
+ */
+static inline uint64_t cc128_representable_alignment_mask(uint64_t req_len)
+{
+    unsigned e = cc128_compute_exponent(req_len);
+    if (e == 0) {
+        return UINT64_MAX;  /* no alignment needed */
+    }
+    return ~((UINT64_C(1) << e) - 1);
+}
+
+/*
+ * Check whether @new_cursor is representable given the cap's current bounds.
+ * A cursor is representable if decoding the compressed bounds at the new
+ * cursor would yield the same base/top.  For our caching scheme this
+ * simplifies to: the encoded mantissas + exponent still decode to the
+ * same _base and _top.
+ *
+ * In practice, for E>0 the cursor must not change so much that the
+ * "correction" bits in the top differ.  A simple conservative check:
+ * the new cursor must be within [base - 2^(E+MANTISSA), top + 2^(E+MANTISSA)).
+ */
+static inline bool cc128_is_representable(const cap_register_t *c,
+                                          uint64_t new_cursor)
+{
+    uint64_t length = c->_top - c->_base;
+    unsigned e = cc128_compute_exponent(length);
+    if (e == 0) {
+        return true;  /* exact bounds — always representable */
+    }
+    /* The representable region is [base - R, base + R) where R = 2^(E+M) */
+    uint64_t rep_range = UINT64_C(1) << (e + CC128_MANTISSA_BITS);
+    int64_t delta = (int64_t)(new_cursor - c->_base);
+    /* Within [-rep_range/2, top + rep_range/2) is representable */
+    if (delta < -(int64_t)(rep_range / 2)) {
+        return false;
+    }
+    if (delta > (int64_t)(c->_top - c->_base + rep_range / 2)) {
+        return false;
+    }
+    return true;
+}
+
+/*
+ * Encode bounds into the lower 32 bits of pesbt (CC128 format).
+ * Updates c->pesbt with the compressed bounds encoding.
+ * The cached _base/_top are also updated to reflect the (possibly
+ * rounded) encoded bounds.
+ */
+static inline void cc128_compress(cap_register_t *c)
+{
+    uint64_t base = c->_base;
+    uint64_t length = c->_top - base;
+    unsigned e = cc128_compute_exponent(length);
+
+    uint64_t lower32;
+
+    if (e == 0) {
+        /* Exact encoding — IE=0, E=0 */
+        uint64_t b_enc = base & ((UINT64_C(1) << CC128_MANTISSA_BITS) - 1);
+        uint64_t t_enc = c->_top & ((UINT64_C(1) << CC128_MANTISSA_BITS) - 1);
+        lower32 = ((uint64_t)e << CC128_EXP_SHIFT)   |
+                  (t_enc << CC128_TOP_SHIFT)          |
+                  (b_enc << CC128_BOT_SHIFT)          |
+                  0;  /* IE = 0 */
+    } else {
+        /* Compressed encoding — IE=1 */
+        uint64_t b_enc = (base >> e) & ((UINT64_C(1) << CC128_MANTISSA_BITS) - 1);
+        uint64_t t_enc = (c->_top >> e) &
+                         ((UINT64_C(1) << CC128_MANTISSA_BITS) - 1);
+
+        /* Round: base down, top up */
+        uint64_t round_base = b_enc << e;
+        uint64_t round_top  = (t_enc + 1) << e;
+        if (round_top < c->_top) {
+            t_enc++;
+            round_top = (t_enc + 1) << e;
+        }
+
+        lower32 = ((uint64_t)e << CC128_EXP_SHIFT)   |
+                  (t_enc << CC128_TOP_SHIFT)           |
+                  (b_enc << CC128_BOT_SHIFT)           |
+                  CC128_IE_BIT;
+
+        /* Update cached bounds to match encoded (rounded) values */
+        c->_base = round_base;
+        c->_top  = round_top;
+    }
+
+    /* Preserve upper 32 bits (perms + otype), replace lower 32 */
+    c->pesbt = (c->pesbt & UINT64_C(0xFFFFFFFF00000000)) | lower32;
+}
+
+/*
+ * Decode bounds from the lower 32 bits of pesbt + cursor.
+ * Updates c->_base and c->_top from the compressed encoding.
+ */
+static inline void cc128_decompress(cap_register_t *c)
+{
+    uint64_t lower32 = c->pesbt & UINT64_C(0x00000000FFFFFFFF);
+    unsigned e  = (unsigned)((lower32 & CC128_EXP_MASK) >> CC128_EXP_SHIFT);
+    uint64_t te = (lower32 & CC128_TOP_MASK) >> CC128_TOP_SHIFT;
+    uint64_t be = (lower32 & CC128_BOT_MASK) >> CC128_BOT_SHIFT;
+    bool ie     = (lower32 & CC128_IE_BIT) != 0;
+
+    if (!ie || e == 0) {
+        /* Exact / uncompressed: base and top are just the mantissa values */
+        /* But we need to reconstruct full addresses from the cursor region */
+        uint64_t cursor = c->_cursor;
+        uint64_t mask = (UINT64_C(1) << CC128_MANTISSA_BITS) - 1;
+        c->_base = (cursor & ~mask) | be;
+        c->_top  = (cursor & ~mask) | te;
+
+        /* Correct for wrap-around */
+        if (c->_base > cursor) {
+            c->_base -= (UINT64_C(1) << CC128_MANTISSA_BITS);
+        }
+        if (c->_top < c->_base) {
+            c->_top += (UINT64_C(1) << CC128_MANTISSA_BITS);
+        }
+    } else {
+        /* Compressed: shift mantissas by exponent */
+        c->_base = be << e;
+        c->_top  = (te + 1) << e;  /* top is exclusive */
+    }
 }
 
 #endif /* TARGET_RISCV_CHERI_CAP_H */

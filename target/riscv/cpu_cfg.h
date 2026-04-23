@@ -183,6 +183,51 @@ struct RISCVCPUConfig {
     bool ext_xtheadsync;
     bool ext_XVentanaCondOps;
 
+    /*
+     * CHERI capability extensions (per UCAM-CL-TR-987).
+     *
+     * Architecture note: CHERI-RISC-V is implemented as an extension of the
+     * existing RISC-V target rather than a separate target.  This is the
+     * correct approach because:
+     *
+     *  1. CHERI does not change the base ISA encoding — it adds new
+     *     instructions in unused opcode space (major opcode 0x5b) and
+     *     reuses the standard register file (capabilities ARE GPRs).
+     *
+     *  2. A CHERI-RISC-V CPU must still execute all standard RISC-V
+     *     instructions unchanged; only the semantics of address formation
+     *     (via DDC/PCC bounds checking) are extended.
+     *
+     *  3. The CTSRD-CHERI/qemu project also implements CHERI as a
+     *     conditional extension within the riscv target, not a fork.
+     *     Their approach uses #ifdef TARGET_CHERI to replace gpr[] with
+     *     GPCapRegs and PC with PCC, but the decode and translate loop
+     *     is shared.
+     *
+     * Functionality NOT available without a separate target: none that
+     * matters for correctness.  A separate target would only be warranted
+     * if CHERI required incompatible changes to the core decode loop or
+     * memory-access path, but the spec is designed to be purely additive.
+     *
+     * Note on register model (see cpu.h for full details):
+     *   The original CTSRD-CHERI/qemu uses a single register file
+     *   (GPCapRegs replacing gpr[]) with lazy decompression states
+     *   (CREG_INTEGER, CREG_FULLY_DECOMPRESSED, CREG_TAGGED_CAP,
+     *   CREG_UNTAGGED_CAP).  Our implementation keeps gpr[] alongside
+     *   gpcr[] for compatibility and uses lazy sync (cheri_lazy_sync)
+     *   to detect when gpr differs from the capability cursor.  This
+     *   provides equivalent correctness without modifying all existing
+     *   RISC-V translation code.
+     *
+     * What IS currently stubbed out (future work):
+     *  - Capability-bounded memory loads/stores (ld_*_ddc, st_*_cap, etc.)
+     *  - Tag memory tracking for capability validity in DRAM
+     *  - Full CHERI compressed-capability (cc128) encoding/decoding
+     *  - CInvoke (compartment call) instruction
+     *  - CHERI-specific CSRs beyond PCC/DDC (UTCC, UTDC, etc.)
+     */
+    bool ext_xcheri;
+
     uint32_t pmu_mask;
     uint16_t vlenb;
     uint16_t elen;
@@ -238,5 +283,6 @@ MATERIALISE_EXT_PREDICATE(xtheadmemidx)
 MATERIALISE_EXT_PREDICATE(xtheadmempair)
 MATERIALISE_EXT_PREDICATE(xtheadsync)
 MATERIALISE_EXT_PREDICATE(XVentanaCondOps)
+MATERIALISE_EXT_PREDICATE(xcheri)
 
 #endif

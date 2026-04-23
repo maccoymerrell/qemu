@@ -162,8 +162,8 @@ static guint simpoints_current_idx = 0;
 
 #define MAX_INSN_BYTES 16
 
-/* Binary format magic/version 0.9 */
-#define WPT_MAGIC  0x54505709  /* 'T','P','W',0x09 little-endian - version 0.9 */
+/* Binary format magic/version 0.10 (added CHERI capability support) */
+#define WPT_MAGIC  0x5450570A  /* 'T','P','W',0x0A little-endian - version 0.10 */
 
 /* Body entry tags (2-bit field) */
 #define BODY_TAG_END      0   /* end-of-body sentinel */
@@ -184,6 +184,7 @@ static guint simpoints_current_idx = 0;
 #define WPT_FLAG_MEM_DATA      (1 << 0)  /* Load/store data values captured */
 #define WPT_FLAG_REG_DATA      (1 << 1)  /* Register values captured (reserved) */
 #define WPT_FLAG_MEM_ALLOC     (1 << 2)  /* Memory allocation events tracked */
+#define WPT_FLAG_CAP_DATA      (1 << 3)  /* CHERI capability data present */
 #define WPT_FLAG_HAS_TEMPLATES (1 << 4)  /* This file contains the template dictionary */
 
 /* ========================= ISA-Agnostic Instruction Fields ========================= */
@@ -227,6 +228,7 @@ typedef struct {
     bool has_immediate;
     int64_t immediate;
     uint8_t sync_hint;              /* SyncEventType: nonzero if insn implies sync */
+    bool is_capability;             /* True if this is a CHERI capability insn */
 } InsnFields;
 
 /* ========================= Disassembly-Based Generic Decode ========================= */
@@ -285,6 +287,14 @@ static inline void add_src_reg(InsnFields *f, uint8_t reg_id)
     if (reg_id == REG_NONE || f->n_src_regs >= MAX_SRC_REGS) {
         return;
     }
+    /*
+     * CHERI-RISC-V register aliasing: capability registers c[n] ARE
+     * integer registers x[n] (per UCAM-CL-TR-987 §3.5).  Map REG_CAP*
+     * → REG_GPR* so the trace uses a single register namespace.
+     * The is_capability flag on the instruction distinguishes cap vs
+     * integer access to the same register.
+     */
+    reg_id = cap_reg_to_gpr_alias(reg_id);
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         if (f->src_regs[i] == reg_id) {
             return;
@@ -298,6 +308,8 @@ static inline void add_dst_reg(InsnFields *f, uint8_t reg_id)
     if (reg_id == REG_NONE || f->n_dst_regs >= MAX_DST_REGS) {
         return;
     }
+    /* CHERI-RISC-V register aliasing (see add_src_reg comment above). */
+    reg_id = cap_reg_to_gpr_alias(reg_id);
     for (uint8_t i = 0; i < f->n_dst_regs; i++) {
         if (f->dst_regs[i] == reg_id) {
             return;
@@ -473,6 +485,12 @@ static void decode_detail_to_generic(uint64_t pc,
     /* LOCK prefix → SYNC_ATOMIC (from Capstone detail, not string scan) */
     if (info->has_lock || (flags & MF_ATOMIC)) {
         out->sync_hint = SYNC_ATOMIC;
+    }
+
+    /* Mark CHERI capability instructions */
+    if (out->opcode >= GEN_OP_CAP_INSPECT &&
+        out->opcode <= GEN_OP_CAP_BUILD) {
+        out->is_capability = true;
     }
 
     if (out->opcode == GEN_OP_UNKNOWN) {
@@ -688,6 +706,14 @@ static const char *generic_opcode_name(uint8_t op)
         [GEN_OP_NEG]      = "NEG",
         [GEN_OP_INC]      = "INC",
         [GEN_OP_DEC]      = "DEC",
+        [GEN_OP_CAP_INSPECT] = "CAP_INSPECT",
+        [GEN_OP_CAP_MODIFY]  = "CAP_MODIFY",
+        [GEN_OP_CAP_SEAL]    = "CAP_SEAL",
+        [GEN_OP_CAP_LOAD]    = "CAP_LOAD",
+        [GEN_OP_CAP_STORE]   = "CAP_STORE",
+        [GEN_OP_CAP_BRANCH]  = "CAP_BRANCH",
+        [GEN_OP_CAP_MOV]     = "CAP_MOV",
+        [GEN_OP_CAP_BUILD]   = "CAP_BUILD",
     };
     return (op < GEN_OP_COUNT) ? names[op] : "UNKNOWN";
 }
@@ -726,7 +752,13 @@ static const char *generic_reg_name(uint8_t reg_id)
         snprintf(buf, sizeof(buf), "VEC%u", reg_id - REG_VEC0);
         return buf;
     }
+    if (reg_id >= REG_CAP0 && reg_id <= REG_CAP31) {
+        snprintf(buf, sizeof(buf), "CAP%u", reg_id - REG_CAP0);
+        return buf;
+    }
     switch (reg_id) {
+    case REG_PCC:     return "PCC";
+    case REG_DDC:     return "DDC";
     case REG_SP:      return "SP";
     case REG_FLAGS:   return "FLAGS";
     case REG_IP:      return "IP";
@@ -1719,7 +1751,9 @@ static void write_text_header(FILE *f, uint32_t thread_id,
     for (uint32_t i = 0; i < GEN_EXC_COUNT; i++) {
         fprintf(f, "E %u %s\n", i, generic_exception_name(i));
     }
-    fprintf(f, "REGS 198\n");
+    /* 1(NONE) + 64(GPR) + 64(FPR) + 64(VEC) + 32(CAP) + 2(PCC,DDC)
+     * + 5(SP,FLAGS,IP,LR,FP) = 232 */
+    fprintf(f, "REGS 232\n");
     fprintf(f, "R %u %s\n", REG_NONE, generic_reg_name(REG_NONE));
     for (uint32_t i = 0; i < 64; i++) {
         uint8_t rid = REG_GPR0 + i;
@@ -1733,6 +1767,15 @@ static void write_text_header(FILE *f, uint32_t thread_id,
         uint8_t rid = REG_VEC0 + i;
         fprintf(f, "R %u %s\n", rid, generic_reg_name(rid));
     }
+    for (uint32_t i = 0; i < 32; i++) {
+        uint8_t rid = REG_CAP0 + i;
+        fprintf(f, "R %u %s  # aliases GPR%u on CHERI-RISC-V\n",
+                rid, generic_reg_name(rid), i);
+    }
+    fprintf(f, "R %u %s  # no GPR alias (PCC)\n",
+            REG_PCC, generic_reg_name(REG_PCC));
+    fprintf(f, "R %u %s  # no GPR alias (DDC)\n",
+            REG_DDC, generic_reg_name(REG_DDC));
     fprintf(f, "R %u %s\n", REG_SP, generic_reg_name(REG_SP));
     fprintf(f, "R %u %s\n", REG_FLAGS, generic_reg_name(REG_FLAGS));
     fprintf(f, "R %u %s\n", REG_IP, generic_reg_name(REG_IP));
@@ -1822,6 +1865,9 @@ static void write_text_header(FILE *f, uint32_t thread_id,
                 fprintf(f, " sync=%s",
                         print_fld->sync_hint <= SYNC_ATOMIC
                             ? sh_names[print_fld->sync_hint] : "UNKNOWN");
+            }
+            if (print_fld->is_capability) {
+                fprintf(f, " [CAP]");
             }
             fprintf(f, " bytes=");
             if (merged_wait_prefix) {
@@ -2176,6 +2222,7 @@ static void write_bin_templates(BitWriter *bw)
             bw_write_bits(bw, fld->n_dst_regs, WPT_REG_COUNT_BITS);
             bw_write_bits(bw, fld->has_immediate ? 1 : 0, 1);
             bw_write_bits(bw, fld->sync_hint, WPT_SYNC_HINT_BITS);
+            bw_write_bits(bw, fld->is_capability ? 1 : 0, 1);
 
             for (uint8_t s = 0; s < fld->n_src_regs; s++) {
                 bw_write_bits(bw, fld->src_regs[s], WPT_REG_BITS);

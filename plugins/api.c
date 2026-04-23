@@ -668,3 +668,41 @@ uint64_t qemu_plugin_u64_sum(qemu_plugin_u64 entry)
     return total;
 }
 
+/*
+ * CHERI capability register access.
+ *
+ * These use the CPUClass::read_capability callback registered by
+ * targets that implement CHERI capabilities (currently RISC-V with
+ * the xcheri extension).
+ */
+
+bool qemu_plugin_read_capability(struct qemu_plugin_register *reg,
+                                 qemu_plugin_cap_info *info)
+{
+    g_assert(current_cpu);
+
+    if (info) {
+        memset(info, 0, sizeof(*info));
+    }
+
+    if (!current_cpu->cc->read_capability) {
+        return false;
+    }
+
+    /* Extract the GDB register number from the handle */
+    int gdb_reg = GPOINTER_TO_INT(reg) >> 1;
+    return current_cpu->cc->read_capability(current_cpu, gdb_reg, info);
+}
+
+bool qemu_plugin_reg_is_capability(struct qemu_plugin_register *reg)
+{
+    g_assert(current_cpu);
+
+    if (!current_cpu->cc->read_capability) {
+        return false;
+    }
+
+    int gdb_reg = GPOINTER_TO_INT(reg) >> 1;
+    return current_cpu->cc->read_capability(current_cpu, gdb_reg, NULL);
+}
+

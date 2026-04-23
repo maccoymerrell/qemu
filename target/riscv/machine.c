@@ -400,6 +400,83 @@ static const VMStateDescription vmstate_ssp = {
     }
 };
 
+/*
+ * CHERI capability register VMState.
+ *
+ * Each cap_register_t is serialized as its constituent fields:
+ *   pesbt (u64), _cursor (u64), _base (u64), _top (u64),
+ *   flags (u8), tag (bool).
+ */
+static const VMStateDescription vmstate_cap_register = {
+    .name = "cap_register",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(pesbt,   cap_register_t),
+        VMSTATE_UINT64(_cursor, cap_register_t),
+        VMSTATE_UINT64(_base,   cap_register_t),
+        VMSTATE_UINT64(_top,    cap_register_t),
+        VMSTATE_UINT8(flags,    cap_register_t),
+        VMSTATE_BOOL(tag,       cap_register_t),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool cheri_needed(void *opaque)
+{
+    RISCVCPU *cpu = opaque;
+    return cpu->cfg.ext_xcheri;
+}
+
+static const VMStateDescription vmstate_cheri = {
+    .name = "cpu/cheri",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = cheri_needed,
+    .fields = (const VMStateField[]) {
+        /* General-purpose capability registers */
+        VMSTATE_STRUCT_ARRAY(env.gpcr, RISCVCPU, 32, 0,
+                             vmstate_cap_register, cap_register_t),
+        /* PCC and DDC */
+        VMSTATE_STRUCT(env.pcc, RISCVCPU, 0,
+                       vmstate_cap_register, cap_register_t),
+        VMSTATE_STRUCT(env.ddc, RISCVCPU, 0,
+                       vmstate_cap_register, cap_register_t),
+        /* M-mode SCRs */
+        VMSTATE_STRUCT(env.mtvecc, RISCVCPU, 0,
+                       vmstate_cap_register, cap_register_t),
+        VMSTATE_STRUCT(env.mepcc, RISCVCPU, 0,
+                       vmstate_cap_register, cap_register_t),
+        VMSTATE_STRUCT(env.mscratchc, RISCVCPU, 0,
+                       vmstate_cap_register, cap_register_t),
+        /* S-mode SCRs */
+        VMSTATE_STRUCT(env.stvecc, RISCVCPU, 0,
+                       vmstate_cap_register, cap_register_t),
+        VMSTATE_STRUCT(env.sepcc, RISCVCPU, 0,
+                       vmstate_cap_register, cap_register_t),
+        VMSTATE_STRUCT(env.sscratchc, RISCVCPU, 0,
+                       vmstate_cap_register, cap_register_t),
+        /* VS-mode SCRs */
+        VMSTATE_STRUCT(env.vstvecc, RISCVCPU, 0,
+                       vmstate_cap_register, cap_register_t),
+        VMSTATE_STRUCT(env.vsepcc, RISCVCPU, 0,
+                       vmstate_cap_register, cap_register_t),
+        VMSTATE_STRUCT(env.vsscratchc, RISCVCPU, 0,
+                       vmstate_cap_register, cap_register_t),
+        /* HS-mode backup SCRs */
+        VMSTATE_STRUCT(env.stvecc_hs, RISCVCPU, 0,
+                       vmstate_cap_register, cap_register_t),
+        VMSTATE_STRUCT(env.sepcc_hs, RISCVCPU, 0,
+                       vmstate_cap_register, cap_register_t),
+        VMSTATE_STRUCT(env.sscratchc_hs, RISCVCPU, 0,
+                       vmstate_cap_register, cap_register_t),
+        /* CHERI exception tracking */
+        VMSTATE_INT8(env.last_cap_cause, RISCVCPU),
+        VMSTATE_INT8(env.last_cap_index, RISCVCPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 const VMStateDescription vmstate_riscv_cpu = {
     .name = "cpu",
     .version_id = 10,
@@ -476,6 +553,7 @@ const VMStateDescription vmstate_riscv_cpu = {
         &vmstate_elp,
         &vmstate_ssp,
         &vmstate_ctr,
+        &vmstate_cheri,
         NULL
     }
 };

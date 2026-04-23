@@ -1289,3 +1289,65 @@ DEF_HELPER_4(vsm4r_vs, void, ptr, ptr, env, i32)
 #ifndef CONFIG_USER_ONLY
 DEF_HELPER_1(ssamoswap_disabled, void, env)
 #endif
+
+/* CHERI capability helpers */
+DEF_HELPER_3(cheri_cgetperm, tl, env, i32, i32)
+DEF_HELPER_3(cheri_cgettype, tl, env, i32, i32)
+DEF_HELPER_3(cheri_cgetbase, tl, env, i32, i32)
+DEF_HELPER_3(cheri_cgetlen, tl, env, i32, i32)
+DEF_HELPER_3(cheri_cgettag, tl, env, i32, i32)
+DEF_HELPER_3(cheri_cgetsealed, tl, env, i32, i32)
+DEF_HELPER_3(cheri_cgetoffset, tl, env, i32, i32)
+DEF_HELPER_3(cheri_cgetflags, tl, env, i32, i32)
+DEF_HELPER_3(cheri_cgetaddr, tl, env, i32, i32)
+DEF_HELPER_3(cheri_cgethigh, tl, env, i32, i32)
+DEF_HELPER_4(cheri_csetbounds, void, env, i32, i32, tl)
+DEF_HELPER_4(cheri_csetboundsexact, void, env, i32, i32, tl)
+DEF_HELPER_4(cheri_csetboundsimm, void, env, i32, i32, tl)
+DEF_HELPER_4(cheri_candperm, void, env, i32, i32, tl)
+DEF_HELPER_4(cheri_csetoffset, void, env, i32, i32, tl)
+DEF_HELPER_4(cheri_csetaddr, void, env, i32, i32, tl)
+DEF_HELPER_4(cheri_cincoffset, void, env, i32, i32, tl)
+DEF_HELPER_4(cheri_csetflags, void, env, i32, i32, tl)
+DEF_HELPER_4(cheri_csethigh, void, env, i32, i32, tl)
+DEF_HELPER_3(cheri_cmv, void, env, i32, i32)
+DEF_HELPER_3(cheri_ccleartag, void, env, i32, i32)
+DEF_HELPER_4(cheri_cseal, void, env, i32, i32, i32)
+DEF_HELPER_4(cheri_cunseal, void, env, i32, i32, i32)
+DEF_HELPER_3(cheri_csealentry, void, env, i32, i32)
+DEF_HELPER_4(cheri_cbuildcap, void, env, i32, i32, i32)
+DEF_HELPER_4(cheri_ccopytype, void, env, i32, i32, i32)
+DEF_HELPER_4(cheri_ccseal, void, env, i32, i32, i32)
+DEF_HELPER_4(cheri_ctestsubset, tl, env, i32, i32, i32)
+DEF_HELPER_4(cheri_ctoptr, tl, env, i32, i32, i32)
+DEF_HELPER_4(cheri_cfromptr, void, env, i32, i32, tl)
+DEF_HELPER_4(cheri_csub, tl, env, i32, i32, i32)
+DEF_HELPER_4(cheri_cspecialrw, void, env, i32, i32, i32)
+DEF_HELPER_4(cheri_cseqx, tl, env, i32, i32, i32)
+DEF_HELPER_2(cheri_jalr_cap, tl, env, i32)
+DEF_HELPER_2(cheri_jalr_pcc, tl, env, tl)
+DEF_HELPER_3(cheri_caddi, void, env, i32, i32)
+
+/* CHERI Load/Store via DDC */
+DEF_HELPER_3(cheri_load_ddc, tl, env, tl, i32)
+DEF_HELPER_4(cheri_store_ddc, void, env, tl, tl, i32)
+
+/* CHERI Load/Store via capability register */
+DEF_HELPER_4(cheri_load_cap, tl, env, i32, tl, i32)
+DEF_HELPER_5(cheri_store_cap, void, env, i32, tl, tl, i32)
+
+/* CHERI Capability Load/Store (LC/SC) via DDC */
+DEF_HELPER_3(cheri_load_cap_ddc, void, env, i32, tl)
+DEF_HELPER_3(cheri_store_cap_ddc, void, env, i32, tl)
+
+/* CHERI Capability Load/Store (LC/SC) via capability register */
+DEF_HELPER_4(cheri_load_cap_via_cap, void, env, i32, i32, tl)
+DEF_HELPER_4(cheri_store_cap_via_cap, void, env, i32, i32, tl)
+
+/* CHERI Atomic LR/SC via DDC */
+DEF_HELPER_3(cheri_lr_ddc, tl, env, tl, i32)
+DEF_HELPER_4(cheri_sc_ddc, tl, env, tl, tl, i32)
+
+/* CHERI Atomic LR/SC via capability register */
+DEF_HELPER_4(cheri_lr_cap, tl, env, i32, tl, i32)
+DEF_HELPER_5(cheri_sc_cap, tl, env, i32, tl, tl, i32)

@@ -1301,4 +1301,69 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state);
 QEMU_PLUGIN_API
 void qemu_plugin_spec_mode_end(void);
 
+/* ================ CHERI Capability API ================ */
+
+/**
+ * ISA-agnostic capability representation.
+ *
+ * Generalizes CHERI capabilities across RISC-V and MIPS (and any
+ * future ISA that adds capability-hardware support).  A valid
+ * capability grants authority to access addresses in [base, top)
+ * with the permission set given by @perms.
+ */
+typedef struct {
+    uint64_t base;        /**< Inclusive lower bound                  */
+    uint64_t top;         /**< Exclusive upper bound                  */
+    uint64_t cursor;      /**< Current address (= GPR value)          */
+    uint32_t perms;       /**< Permission bitmask (QEMU_PLUGIN_CAP_PERM_*) */
+    uint32_t otype;       /**< Object type (0 = unsealed)             */
+    uint8_t  tag;         /**< Validity tag (1 = valid capability)    */
+    uint8_t  sealed;      /**< 1 if sealed, 0 if unsealed             */
+    uint8_t  flags;       /**< ISA-specific flags                     */
+    uint8_t  _pad;
+} qemu_plugin_cap_info;
+
+/* ISA-agnostic capability permission bits */
+#define QEMU_PLUGIN_CAP_PERM_EXECUTE    (1u << 0)
+#define QEMU_PLUGIN_CAP_PERM_LOAD       (1u << 1)
+#define QEMU_PLUGIN_CAP_PERM_STORE      (1u << 2)
+#define QEMU_PLUGIN_CAP_PERM_LOAD_CAP   (1u << 3)
+#define QEMU_PLUGIN_CAP_PERM_STORE_CAP  (1u << 4)
+#define QEMU_PLUGIN_CAP_PERM_SEAL       (1u << 5)
+#define QEMU_PLUGIN_CAP_PERM_CINVOKE    (1u << 6)
+#define QEMU_PLUGIN_CAP_PERM_UNSEAL     (1u << 7)
+#define QEMU_PLUGIN_CAP_PERM_SYSTEM     (1u << 8)
+#define QEMU_PLUGIN_CAP_PERM_SETCID     (1u << 9)
+
+/**
+ * qemu_plugin_read_capability() - read a capability register
+ * @reg_handle: register handle from qemu_plugin_get_registers()
+ * @cap_info: output structure for decomposed capability fields
+ *
+ * Reads the specified register as a CHERI capability and fills
+ * @cap_info with the fields in an ISA-agnostic format.  Works for
+ * both general-purpose capability registers (c0-c31) and special
+ * capabilities (PCC, DDC).
+ *
+ * Only available from callbacks that requested register-read access
+ * (QEMU_PLUGIN_CB_R_REGS).
+ *
+ * Returns true if the register is a capability register and was
+ * successfully read, false otherwise (e.g. non-CHERI target or
+ * scalar register).
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_read_capability(struct qemu_plugin_register *reg_handle,
+                                 qemu_plugin_cap_info *cap_info);
+
+/**
+ * qemu_plugin_reg_is_capability() - check if a register is a capability
+ * @reg_handle: register handle from qemu_plugin_get_registers()
+ *
+ * Returns true if the register is a CHERI capability register, false
+ * for scalar registers or on non-CHERI targets.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_reg_is_capability(struct qemu_plugin_register *reg_handle);
+
 #endif /* QEMU_QEMU_PLUGIN_H */

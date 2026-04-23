@@ -1208,6 +1208,10 @@ static uint32_t opcode_at(DisasContextBase *dcbase, target_ulong pc)
 /* Include decoders for factored-out extensions */
 #include "decode-XVentanaCondOps.c.inc"
 
+/* Include the CHERI capability decoder */
+#include "decode-insn32-cheri.c.inc"
+#include "insn_trans/trans_cheri.c.inc"
+
 /* The specification allows for longer insns, but not supported by qemu. */
 #define MAX_INSN_LEN  4
 
@@ -1220,6 +1224,7 @@ const RISCVDecoder decoder_table[] = {
     { always_true_p, decode_insn32 },
     { has_xthead_p, decode_xthead},
     { has_XVentanaCondOps_p, decode_XVentanaCodeOps},
+    { has_xcheri_p, decode_insn32_cheri},
 };
 
 const size_t decoder_table_size = ARRAY_SIZE(decoder_table);
@@ -1326,6 +1331,28 @@ static void riscv_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *ctx = container_of(dcbase, DisasContext, base);
     CPURISCVState *env = cpu_env(cpu);
+
+    /*
+     * PCC bounds check: if CHERI is enabled, verify that the current PC
+     * is within the PCC bounds before fetching the instruction.
+     * This is done at translation time using the env's PCC bounds.
+     * A full implementation would emit TCG ops that check dynamically,
+     * but since PCC bounds only change on trap/return/jump (which end
+     * the TB), checking at translate time against env->pcc is sufficient.
+     */
+    if (ctx->cfg_ptr->ext_xcheri) {
+        uint64_t pc = (uint64_t)ctx->base.pc_next;
+        /* Check at least 2 bytes (compressed insn minimum) */
+        if (!cap_in_bounds(&env->pcc, pc, 2)) {
+            generate_exception(ctx, RISCV_EXCP_CHERI);
+            return;
+        }
+        if (!(cap_get_perms(&env->pcc) & CAP_PERM_EXECUTE)) {
+            generate_exception(ctx, RISCV_EXCP_CHERI);
+            return;
+        }
+    }
+
     uint16_t opcode16 = translator_lduw(env, &ctx->base, ctx->base.pc_next);
 
     ctx->ol = ctx->xl;

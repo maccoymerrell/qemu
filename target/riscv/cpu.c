@@ -38,6 +38,7 @@
 #include "kvm/kvm_riscv.h"
 #include "tcg/tcg-cpu.h"
 #include "tcg/tcg.h"
+#include "cheri_tag_mem.h"
 
 /* RISC-V CPU definitions */
 static const char riscv_single_letter_exts[] = "IEMAFDQCBPVH";
@@ -236,6 +237,7 @@ const RISCVIsaExtData isa_edata_arr[] = {
     ISA_EXT_DATA_ENTRY(xtheadmempair, PRIV_VERSION_1_11_0, ext_xtheadmempair),
     ISA_EXT_DATA_ENTRY(xtheadsync, PRIV_VERSION_1_11_0, ext_xtheadsync),
     ISA_EXT_DATA_ENTRY(xventanacondops, PRIV_VERSION_1_12_0, ext_XVentanaCondOps),
+    ISA_EXT_DATA_ENTRY(xcheri, PRIV_VERSION_1_12_0, ext_xcheri),
 
     { },
 };
@@ -1071,6 +1073,50 @@ static void riscv_cpu_reset_hold(Object *obj, ResetType type)
     env->bins = 0;
     env->two_stage_lookup = false;
 
+    /* Initialize CHERI capability state */
+    if (cpu->cfg.ext_xcheri) {
+        /* PCC starts as root (almighty) capability with cursor at resetvec */
+        env->pcc = cap_mk_root();
+        cap_set_addr(&env->pcc, (uint64_t)env->resetvec);
+
+        /* DDC starts as root (almighty) capability */
+        env->ddc = cap_mk_root();
+
+        /* All general-purpose capability registers start as null */
+        for (i = 0; i < 32; i++) {
+            env->gpcr[i] = cap_mk_null();
+        }
+
+        /* M-mode trap SCRs: MTCC and MEPCC start as root capabilities */
+        env->mtvecc = cap_mk_root();
+        cap_set_addr(&env->mtvecc, (uint64_t)env->mtvec);
+        env->mepcc = cap_mk_root();
+        cap_set_addr(&env->mepcc, (uint64_t)env->mepc);
+        env->mscratchc = cap_mk_null();
+
+        /* S-mode trap SCRs: STCC and SEPCC start as root capabilities */
+        env->stvecc = cap_mk_root();
+        cap_set_addr(&env->stvecc, (uint64_t)env->stvec);
+        env->sepcc = cap_mk_root();
+        cap_set_addr(&env->sepcc, (uint64_t)env->sepc);
+        env->sscratchc = cap_mk_null();
+
+        /* Hypervisor/VS-mode capability variants start as null */
+        env->vstvecc = cap_mk_null();
+        env->vsepcc = cap_mk_null();
+        env->vsscratchc = cap_mk_null();
+        env->stvecc_hs = cap_mk_null();
+        env->sepcc_hs = cap_mk_null();
+        env->sscratchc_hs = cap_mk_null();
+
+        /* CHERI exception tracking fields */
+        env->last_cap_cause = -1;
+        env->last_cap_index = -1;
+
+        /* Initialize the global tag memory subsystem */
+        cheri_tag_init();
+    }
+
     env->menvcfg = (cpu->cfg.ext_svpbmt ? MENVCFG_PBMTE : 0) |
                    (!cpu->cfg.ext_svade && cpu->cfg.ext_svadu ?
                     MENVCFG_ADUE : 0);
@@ -1727,6 +1773,7 @@ const RISCVCPUMultiExtConfig riscv_cpu_vendor_exts[] = {
     MULTI_EXT_CFG_BOOL("xtheadmempair", ext_xtheadmempair, false),
     MULTI_EXT_CFG_BOOL("xtheadsync", ext_xtheadsync, false),
     MULTI_EXT_CFG_BOOL("xventanacondops", ext_XVentanaCondOps, false),
+    MULTI_EXT_CFG_BOOL("xcheri", ext_xcheri, false),
 
     { },
 };
@@ -3035,6 +3082,75 @@ static const struct SysemuCPUOps riscv_sysemu_ops = {
 };
 #endif
 
+/*
+ * Read CHERI capability data from a register.
+ * gdb_reg 0-31 = general-purpose registers (check gpcr[]),
+ * gdb_reg 32 = pc (check pcc).
+ * Returns true if the register is a capability register.
+ * cap_info_out must point to a qemu_plugin_cap_info (cast to void*).
+ */
+static bool riscv_cpu_read_capability(CPUState *cs, int gdb_reg,
+                                      void *cap_info_out)
+{
+    RISCVCPU *cpu = RISCV_CPU(cs);
+    CPURISCVState *env = &cpu->env;
+
+    if (!cpu->cfg.ext_xcheri) {
+        return false;
+    }
+
+    const cap_register_t *cap = NULL;
+
+    if (gdb_reg >= 0 && gdb_reg < 32) {
+        /*
+         * Lazy sync: if a standard integer instruction wrote to gpr[i]
+         * since the last CHERI sync, the capability register may be stale.
+         * Create a NULL-derived capability from the current gpr value.
+         * This mirrors the lazy sync in cheri_helper.c:get_cap_reg_const().
+         */
+        if (gdb_reg != 0 &&
+            env->gpr[gdb_reg] != (target_ulong)env->gpcr[gdb_reg]._cursor) {
+            cheri_gpr_to_cap(env, gdb_reg);
+        }
+        cap = &env->gpcr[gdb_reg];
+    } else if (gdb_reg == 32) {
+        /* PC register → PCC */
+        cap = &env->pcc;
+    } else {
+        return false;
+    }
+
+    if (cap_info_out) {
+        /*
+         * Fill in the ISA-agnostic capability info struct.
+         * We cast to uint8_t* and write fields at known offsets to avoid
+         * including the plugin header here.  The struct layout is:
+         *   uint64_t base, top, cursor; uint32_t perms, otype;
+         *   uint8_t tag, sealed, flags, _pad;
+         */
+        uint8_t *out = (uint8_t *)cap_info_out;
+        uint64_t base = cap_get_base(cap);
+        uint64_t top = cap_get_top(cap);
+        uint64_t cursor = cap_get_cursor(cap);
+        uint32_t perms = cap_get_perms(cap);
+        uint32_t otype = cap_get_otype(cap);
+        uint8_t tag = cap_get_tag(cap) ? 1 : 0;
+        uint8_t sealed = cap_is_sealed(cap) ? 1 : 0;
+        uint8_t flags = cap_get_flags(cap);
+
+        memcpy(out + 0, &base, 8);
+        memcpy(out + 8, &top, 8);
+        memcpy(out + 16, &cursor, 8);
+        memcpy(out + 24, &perms, 4);
+        memcpy(out + 28, &otype, 4);
+        out[32] = tag;
+        out[33] = sealed;
+        out[34] = flags;
+        out[35] = 0; /* _pad */
+    }
+    return true;
+}
+
 static void riscv_cpu_common_class_init(ObjectClass *c, void *data)
 {
     RISCVCPUClass *mcc = RISCV_CPU_CLASS(c);
@@ -3057,6 +3173,7 @@ static void riscv_cpu_common_class_init(ObjectClass *c, void *data)
     cc->gdb_write_register = riscv_cpu_gdb_write_register;
     cc->gdb_stop_before_watchpoint = true;
     cc->disas_set_info = riscv_cpu_disas_set_info;
+    cc->read_capability = riscv_cpu_read_capability;
 #ifndef CONFIG_USER_ONLY
     cc->sysemu_ops = &riscv_sysemu_ops;
     cc->get_arch_id = riscv_get_arch_id;

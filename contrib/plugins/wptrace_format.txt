@@ -1,5 +1,5 @@
-wptrace Binary Trace Format — v0.8
-====================================
+wptrace Binary Trace Format — v0.10
+=====================================
 
 1. Notation & Primitives
 ------------------------
@@ -85,7 +85,7 @@ features:
   │  0  │ WPT_FLAG_MEM_DATA  │ Load/store data values present    │
   │  1  │ WPT_FLAG_REG_DATA  │ Register values (reserved)        │
   │  2  │ WPT_FLAG_MEM_ALLOC │ Memory allocation events present  │
-  │  3  │ WPT_FLAG_THREADS   │ Multi-thread mode active          │
+  │  3  │ WPT_FLAG_CAP_DATA  │ CHERI capability data present   │
   │  4  │ WPT_FLAG_THREAD_DIR│ Thread Segment Directory in footer│
   │ 5-7 │ (reserved)         │                                   │
   └─────┴────────────────────┴───────────────────────────────────┘
@@ -309,6 +309,7 @@ Written after the entry count in the footer:
   │ │ │ n_dst_regs       bits(3)   (max 7)                │
   │ │ │ has_immediate    bits(1)                          │
   │ │ │ sync_hint        bits(4)   SyncEventType          │
+  │ │ │ is_capability    bits(1)   CHERI cap insn flag     │
   │ │ │ src_regs         n_src × bits(8) GenericRegId     │
   │ │ │ dst_regs         n_dst × bits(8) GenericRegId     │
   │ │ │ [immediate]      SLEB128  (if has_immediate=1)    │
@@ -323,8 +324,10 @@ Per-instruction bit-level layout:
   ┌───────────┬───────────┬─────┬─────┬─────┬─────┬──────┐
   │ opcode(8) │ branch(8) │bc(1)│ns(3)│nd(3)│hi(1)│sh(4) │
   └───────────┴───────────┴─────┴─────┴─────┴─────┴──────┘
-                                                    28 bits fixed
+                                                    29 bits fixed (including is_capability)
   followed by: src_regs[ns×8], dst_regs[nd×8], [imm], size, raw_bytes
+
+  cp = is_capability (1 if CHERI capability instruction, 0 otherwise)
 
 The sync_hint field marks instructions that perform atomic/locked
 memory operations (sync_hint=5=SYNC_ATOMIC).  The trace consumer
@@ -413,7 +416,14 @@ rejects old readers.
   │ 14 │ MOV      │ 32 │ FP_SQRT  │ 50 │ INC      │
   │ 15 │ LOAD     │ 33 │ FP_MOV   │ 51 │ DEC      │
   │ 16 │ STORE    │ 34 │ FP_CVT   │    │          │
-  │ 17 │ PUSH     │ 35 │ FP_CMP   │    │          │
+  │ 17 │ PUSH     │ 35 │ FP_CMP   │ 52 │CAP_INSPECT│
+  │    │          │    │          │ 53 │CAP_MODIFY│
+  │    │          │    │          │ 54 │CAP_SEAL  │
+  │    │          │    │          │ 55 │CAP_LOAD  │
+  │    │          │    │          │ 56 │CAP_STORE │
+  │    │          │    │          │ 57 │CAP_BRANCH│
+  │    │          │    │          │ 58 │CAP_MOV   │
+  │    │          │    │          │ 59 │CAP_BUILD │
   └────┴──────────┴────┴──────────┴────┴──────────┘
 
 10.3  BranchType — bits(8)
@@ -464,6 +474,14 @@ rejects old readers.
   │  1- 64 │ GPR0-GPR63  (general-purpose)          │
   │ 65-128 │ FPR0-FPR63  (floating-point)           │
   │129-192 │ VEC0-VEC63  (vector/SIMD)              │
+  │193-224 │ CAP0-CAP31  (CHERI capability)          │
+  │        │   NOTE: On CHERI-RISC-V, CAP_n aliases  │
+  │        │   GPR_n (same architectural register).   │
+  │        │   Operands are encoded as GPR IDs; the   │
+  │        │   is_capability flag distinguishes cap    │
+  │        │   vs integer access. (UCAM-CL-TR-987)    │
+  │   240  │ PCC         (program counter cap)       │
+  │   241  │ DDC         (default data cap)          │
   │   250  │ SP          (stack pointer)             │
   │   251  │ FLAGS       (condition flags)           │
   │   252  │ IP          (instruction pointer)       │
@@ -477,6 +495,10 @@ rejects old readers.
     aarch64: GPR0-GPR30=X0-X30
     riscv64: GPR0-GPR31=X0-X31
     mipsel:  GPR0-GPR31=$0-$31
+
+  When CHERI is active, CAP_n holds the full capability whose
+  cursor/address is GPR_n.  PCC is the program counter capability
+  and DDC is the default data capability.
 
   FPR and VEC ranges follow per-ISA conventions.
 
@@ -600,6 +622,7 @@ Two threads (T0, T1) executing BBs with an atomic spinlock:
   │ seg_dir flags            │ 8 bits   │ is_atomic          │
   │ branch_conditional       │ 1 bit    │ cond branch flag   │
   │ has_immediate            │ 1 bit    │ immediate present  │
+  │ is_capability            │ 1 bit    │ CHERI cap insn     │
   │ cp/wp_unchanged          │ 1 bit    │ dyn params reused  │
   │ translation_unavailable  │ 1 bit    │ WP xlat error      │
   │ fault                    │ 1 bit    │ WP fault flag      │

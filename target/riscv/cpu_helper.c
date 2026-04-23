@@ -723,6 +723,17 @@ void riscv_cpu_swap_hypervisor_regs(CPURISCVState *env)
         env->vsepc = env->sepc;
         env->sepc = env->sepc_hs;
 
+        if (riscv_cpu_cfg(env)->ext_xcheri) {
+            env->vstvecc = env->stvecc;
+            env->stvecc = env->stvecc_hs;
+
+            env->vsscratchc = env->sscratchc;
+            env->sscratchc = env->sscratchc_hs;
+
+            env->vsepcc = env->sepcc;
+            env->sepcc = env->sepcc_hs;
+        }
+
         env->vscause = env->scause;
         env->scause = env->scause_hs;
 
@@ -745,6 +756,17 @@ void riscv_cpu_swap_hypervisor_regs(CPURISCVState *env)
 
         env->sepc_hs = env->sepc;
         env->sepc = env->vsepc;
+
+        if (riscv_cpu_cfg(env)->ext_xcheri) {
+            env->stvecc_hs = env->stvecc;
+            env->stvecc = env->vstvecc;
+
+            env->sscratchc_hs = env->sscratchc;
+            env->sscratchc = env->vsscratchc;
+
+            env->sepcc_hs = env->sepcc;
+            env->sepcc = env->vsepcc;
+        }
 
         env->scause_hs = env->scause;
         env->scause = env->vscause;
@@ -2349,6 +2371,17 @@ void riscv_cpu_do_interrupt(CPUState *cs)
         case RISCV_EXCP_SW_CHECK:
             tval = env->sw_check_code;
             break;
+        case RISCV_EXCP_CHERI:
+            /*
+             * Per CTSRD-CHERI/qemu: tval encodes the CHERI cause in bits [4:0]
+             * and the register number in bits [10:5]. The fields were populated
+             * by raise_cheri_exception() in cheri_helper.c.
+             */
+            tval = env->badaddr;
+            /* Reset tracking fields after consumption */
+            env->last_cap_cause = -1;
+            env->last_cap_index = -1;
+            break;
         default:
             break;
         }
@@ -2454,11 +2487,20 @@ void riscv_cpu_do_interrupt(CPUState *cs)
         sxlen = 16 << riscv_cpu_sxl(env);
         env->scause = cause | ((target_ulong)async << (sxlen - 1));
         env->sepc = env->pc;
+        if (riscv_cpu_cfg(env)->ext_xcheri) {
+            /* Save PCC → SEPCC (preserve full capability) */
+            env->sepcc = env->pcc;
+            cap_set_addr(&env->sepcc, (uint64_t)env->sepc);
+        }
         env->stval = tval;
         env->htval = htval;
         env->htinst = tinst;
         env->pc = (env->stvec >> 2 << 2) +
                   ((async && (env->stvec & 3) == 1) ? cause * 4 : 0);
+        if (riscv_cpu_cfg(env)->ext_xcheri) {
+            /* Load PCC from STCC (trap handler capability) */
+            cheri_update_pcc_for_exc_handler(env, &env->stvecc, env->pc);
+        }
         riscv_cpu_set_mode(env, PRV_S, virt);
 
         src = env->sepc;
@@ -2532,6 +2574,11 @@ void riscv_cpu_do_interrupt(CPUState *cs)
             env->mtval2 = mtval2;
         }
         env->mepc = env->pc;
+        if (riscv_cpu_cfg(env)->ext_xcheri) {
+            /* Save PCC → MEPCC (preserve full capability) */
+            env->mepcc = env->pcc;
+            cap_set_addr(&env->mepcc, (uint64_t)env->mepc);
+        }
         env->mtval = tval;
         env->mtinst = tinst;
 
@@ -2544,6 +2591,10 @@ void riscv_cpu_do_interrupt(CPUState *cs)
         } else {
             env->pc = (env->mtvec >> 2 << 2) +
                       ((async && (env->mtvec & 3) == 1) ? cause * 4 : 0);
+        }
+        if (riscv_cpu_cfg(env)->ext_xcheri && !nnmi_excep) {
+            /* Load PCC from MTCC (trap handler capability) */
+            cheri_update_pcc_for_exc_handler(env, &env->mtvecc, env->pc);
         }
         riscv_cpu_set_mode(env, PRV_M, virt);
         src = env->mepc;

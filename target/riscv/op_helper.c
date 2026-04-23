@@ -278,7 +278,21 @@ target_ulong helper_sret(CPURISCVState *env)
         riscv_raise_exception(env, RISCV_EXCP_ILLEGAL_INST, GETPC());
     }
 
+    /*
+     * CHERI: Per CTSRD-CHERI/qemu, sret requires Access_System_Registers
+     * permission in PCC.  Without it, a CHERI exception is raised.
+     */
+    if (riscv_cpu_cfg(env)->ext_xcheri && !cheri_have_access_sysregs(env)) {
+        env->last_cap_cause = 0x18; /* CapEx_AccessSystemRegsViolation */
+        env->last_cap_index = 0;    /* PCC */
+        env->badaddr = (target_ulong)(0x18 | (0 << 5));
+        riscv_raise_exception(env, RISCV_EXCP_CHERI, GETPC());
+    }
+
     target_ulong retpc = env->sepc;
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        retpc = (target_ulong)cap_get_cursor(&env->sepcc);
+    }
     if (!riscv_cpu_allow_16bit_insn(&env_archcpu(env)->cfg,
                                     env->priv_ver,
                                     env->misa_ext) && (retpc & 0x3)) {
@@ -349,6 +363,10 @@ target_ulong helper_sret(CPURISCVState *env)
                             src_priv, src_virt);
     }
 
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        cheri_update_pcc_for_exc_return(env, &env->sepcc, retpc);
+    }
+
     return retpc;
 }
 
@@ -390,7 +408,21 @@ static target_ulong ssdbltrp_mxret(CPURISCVState *env, target_ulong mstatus,
 
 target_ulong helper_mret(CPURISCVState *env)
 {
+    /*
+     * CHERI: Per CTSRD-CHERI/qemu, mret requires Access_System_Registers
+     * permission in PCC.  Without it, a CHERI exception is raised.
+     */
+    if (riscv_cpu_cfg(env)->ext_xcheri && !cheri_have_access_sysregs(env)) {
+        env->last_cap_cause = 0x18; /* CapEx_AccessSystemRegsViolation */
+        env->last_cap_index = 0;    /* PCC */
+        env->badaddr = (target_ulong)(0x18 | (0 << 5));
+        riscv_raise_exception(env, RISCV_EXCP_CHERI, GETPC());
+    }
+
     target_ulong retpc = env->mepc;
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        retpc = (target_ulong)cap_get_cursor(&env->mepcc);
+    }
     uint64_t mstatus = env->mstatus;
     target_ulong prev_priv = get_field(mstatus, MSTATUS_MPP);
     uintptr_t ra = GETPC();
@@ -433,6 +465,10 @@ target_ulong helper_mret(CPURISCVState *env)
     if (riscv_cpu_cfg(env)->ext_smctr || riscv_cpu_cfg(env)->ext_ssctr) {
         riscv_ctr_add_entry(env, env->pc, retpc, CTRDATA_TYPE_EXCEP_INT_RET,
                             PRV_M, false);
+    }
+
+    if (riscv_cpu_cfg(env)->ext_xcheri) {
+        cheri_update_pcc_for_exc_return(env, &env->mepcc, retpc);
     }
 
     return retpc;

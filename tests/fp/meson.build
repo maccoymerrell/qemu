@@ -1,6 +1,13 @@
 if 'CONFIG_TCG' not in config_all_accel
   subdir_done()
 endif
+
+# Skip fp tests if softfloat subproject is not available
+sf3_wrap = meson.project_source_root() / 'subprojects' / 'berkeley-softfloat-3' / 'meson.build'
+if not fs.exists(sf3_wrap)
+  subdir_done()
+endif
+
 # There are namespace pollution issues on Windows, due to osdep.h
 # bringing in Windows headers that define a FLOAT128 type.
 if host_os == 'windows'

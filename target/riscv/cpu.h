@@ -32,6 +32,7 @@
 #include "cpu_cfg.h"
 #include "qapi/qapi-types-common.h"
 #include "cpu-qom.h"
+#include "cheri_cap.h"
 
 typedef struct CPUArchState CPURISCVState;
 
@@ -207,6 +208,45 @@ struct CPUArchState {
     target_ulong gpr[32];
     target_ulong gprh[32]; /* 64 top bits of the 128-bit registers */
 
+    /*
+     * CHERI capability state (Xcheri extension) — per UCAM-CL-TR-987.
+     *
+     * In CHERI-RISC-V the general-purpose integer registers ARE capabilities.
+     * Register x[n] as seen by a standard RISC-V instruction is the cursor
+     * (address) field of capability register c[n].  This means:
+     *
+     *   gpr[i]  ==  gpcr[i]._cursor     (always, after sync)
+     *
+     * Reference architecture (CTSRD-CHERI/qemu):
+     *   The original implementation uses a SINGLE register file (GPCapRegs)
+     *   that replaces gpr[] entirely.  #ifdef TARGET_CHERI removes gpr[] and
+     *   integer access goes through _cr_cursor.  A lazy state machine tracks
+     *   whether a register holds CREG_INTEGER (NULL-derived) vs
+     *   CREG_FULLY_DECOMPRESSED (full capability).
+     *
+     * Our approach:
+     *   We keep gpr[] for compatibility with the standard RISC-V TCG code,
+     *   plus gpcr[] for capability metadata.  Synchronisation is handled by:
+     *   - cheri_cap_to_gpr(env, i): CHERI instruction wrote gpcr[i], copy
+     *     cursor to gpr[i].
+     *   - cheri_gpr_to_cap(env, i): Integer instruction wrote gpr[i], create
+     *     a NULL-derived capability (base=0, top=0, perms=0, cursor=gpr[i],
+     *     tag=false).  This mirrors update_capreg_to_intval() from the
+     *     original implementation.
+     *   - cheri_lazy_sync(env, i): Called automatically by get_cap_reg() /
+     *     get_cap_reg_const() in cheri_helper.c.  If gpr[i] != cursor,
+     *     an integer write happened since the last sync, so call
+     *     cheri_gpr_to_cap().  This is analogous to the CREG_INTEGER lazy
+     *     state in the original.
+     *
+     * PCC = program counter capability (replaces PC in the original impl).
+     * DDC = default data capability.
+     * These are additional architectural registers with no integer alias.
+     */
+    cap_register_t gpcr[32];  /* general-purpose capability registers (c0-c31) */
+    cap_register_t pcc;       /* program counter capability */
+    cap_register_t ddc;       /* default data capability */
+
     /* vector coprocessor state. */
     uint64_t vreg[32 * RV_VLEN_MAX / 64] QEMU_ALIGNED(16);
     target_ulong vxrm;
@@ -227,6 +267,17 @@ struct CPUArchState {
 
     target_ulong badaddr;
     target_ulong bins;
+
+    /*
+     * CHERI exception tracking — per CTSRD-CHERI/qemu.
+     * last_cap_cause: exception cause code (CheriCapExcCause), populated by
+     *   raise_cheri_exception() and consumed by riscv_cpu_do_interrupt() when
+     *   encoding xtval.
+     * last_cap_index: register number that caused the exception.
+     * These are reset to -1 after being consumed by the trap handler.
+     */
+    int8_t last_cap_cause;
+    int8_t last_cap_index;
 
     target_ulong guest_phys_fault_addr;
 
@@ -308,11 +359,17 @@ struct CPUArchState {
     target_ulong stvec;
     target_ulong sepc;
     target_ulong scause;
+    cap_register_t stvecc;    /* CHERI SCR 12: extends stvec */
+    cap_register_t sepcc;     /* CHERI SCR 15: extends sepc */
+    cap_register_t sscratchc; /* CHERI SCR 14: extends sscratch */
 
     target_ulong mtvec;
     target_ulong mepc;
     target_ulong mcause;
     target_ulong mtval;  /* since: priv-1.10.0 */
+    cap_register_t mtvecc;    /* CHERI SCR 28: extends mtvec */
+    cap_register_t mepcc;     /* CHERI SCR 31: extends mepc */
+    cap_register_t mscratchc; /* CHERI SCR 30: extends mscratch */
 
     uint64_t mctrctl;
     uint32_t sctrdepth;
@@ -370,6 +427,9 @@ struct CPUArchState {
     target_ulong vstvec;
     target_ulong vsscratch;
     target_ulong vsepc;
+    cap_register_t vstvecc;    /* CHERI: extends vstvec */
+    cap_register_t vsscratchc; /* CHERI: extends vsscratch */
+    cap_register_t vsepcc;     /* CHERI: extends vsepc */
     target_ulong vscause;
     target_ulong vstval;
     target_ulong vsatp;
@@ -384,6 +444,9 @@ struct CPUArchState {
     target_ulong stvec_hs;
     target_ulong sscratch_hs;
     target_ulong sepc_hs;
+    cap_register_t stvecc_hs;    /* CHERI: HS backup of stvecc */
+    cap_register_t sscratchc_hs; /* CHERI: HS backup of sscratchc */
+    cap_register_t sepcc_hs;     /* CHERI: HS backup of sepcc */
     target_ulong scause_hs;
     target_ulong stval_hs;
     target_ulong satp_hs;
@@ -948,4 +1011,139 @@ const char *satp_mode_str(uint8_t satp_mode, bool is_32_bit);
 void th_register_custom_csrs(RISCVCPU *cpu);
 
 const char *priv_spec_to_str(int priv_version);
+
+/*
+ * CHERI GPR ↔ capability synchronisation helpers.
+ *
+ * Per UCAM-CL-TR-987 §3.5, in CHERI-RISC-V the integer registers and
+ * the capability registers are aliases of the same architectural state.
+ * The integer view of register x[i] is the cursor (address) of capability
+ * register c[i].
+ *
+ * In the reference CTSRD-CHERI/qemu implementation, there is a SINGLE
+ * register file (GPCapRegs) that holds capabilities; there is no separate
+ * gpr[] array.  Integer reads return the cursor, and integer writes call
+ * update_capreg_to_intval() which creates a NULL-derived capability with:
+ *   - cursor = written integer value
+ *   - pesbt  = CAP_NULL_PESBT (null permissions/otype/bounds)
+ *   - base   = 0,  top = 0
+ *   - tag    = false
+ *
+ * Our implementation maintains gpr[] alongside gpcr[] for compatibility
+ * with the existing RISC-V translation code.  The invariant is:
+ *   gpr[i]  ==  gpcr[i]._cursor     (always, after sync)
+ *
+ * These helpers propagate changes between the two arrays.  Additionally,
+ * the CHERI helper accessor get_cap_reg_const() lazily syncs gpr → gpcr
+ * before reading, so CHERI instructions always see correct state even
+ * after integer writes that only touch gpr[].
+ */
+
+/*
+ * Propagate gpr[i] → gpcr[i]: create a NULL-derived capability.
+ *
+ * Per UCAM-CL-TR-987: "Integer instructions read the address field of
+ * the capability register, and write a NULL-derived capability with
+ * the address field set to the new integer value."
+ *
+ * This mirrors update_capreg_to_intval() from CTSRD-CHERI/qemu.
+ */
+static inline void cheri_gpr_to_cap(CPURISCVState *env, int i)
+{
+    if (i == 0) {
+        return; /* x0/c0 is always zero/null */
+    }
+    /* Create a NULL-derived capability: all metadata zeroed, only cursor set */
+    env->gpcr[i]._base   = 0;
+    env->gpcr[i]._top    = 0;
+    env->gpcr[i]._cursor = (uint64_t)env->gpr[i];
+    env->gpcr[i].pesbt   = 0;   /* null permissions, null otype */
+    env->gpcr[i].flags   = 0;
+    env->gpcr[i].tag     = false;
+}
+
+/* Propagate gpcr[i] cursor → gpr[i]. */
+static inline void cheri_cap_to_gpr(CPURISCVState *env, int i)
+{
+    if (i == 0) {
+        return; /* x0 is always zero */
+    }
+    env->gpr[i] = (target_ulong)env->gpcr[i]._cursor;
+}
+
+/*
+ * Check whether the current PCC grants access to system registers.
+ * Per CTSRD-CHERI/qemu, this checks CAP_ACCESS_SYS_REGS permission on PCC.
+ * Used by sret/mret and CSpecialRW to gate privileged register access.
+ */
+static inline bool cheri_have_access_sysregs(CPURISCVState *env)
+{
+    return (cap_get_perms(&env->pcc) & CAP_ACCESS_SYS_REGS) != 0;
+}
+
+/*
+ * Update a Special Capability Register (SCR) that extends a CSR.
+ * Per CTSRD-CHERI/qemu: update_special_register() —
+ *  - If the SCR is sealed, clear the tag and update the cursor
+ *  - If the new cursor would be unrepresentable, clear the tag
+ *  - Otherwise, just update the cursor
+ *
+ * This ensures that CSR writes (which only provide an integer value) properly
+ * update the capability metadata of the corresponding SCR.
+ */
+static inline void update_special_register(CPURISCVState *env,
+                                           cap_register_t *scr,
+                                           target_ulong new_value)
+{
+    target_ulong new_cursor = new_value;
+
+    if (!cap_is_sealed_entry(scr) && cap_is_sealed(scr)) {
+        /*
+         * Attempting to modify a sealed SCR: clear the tag and update cursor.
+         * This matches CTSRD-CHERI/qemu behavior.
+         */
+        scr->tag = false;
+    }
+
+    scr->_cursor = (uint64_t)new_cursor;
+}
+
+/*
+ * Update PCC for exception return (sret/mret).
+ * Per CTSRD-CHERI/qemu: cheri_update_pcc_for_exc_return() —
+ *  - Copy the EPCC (sepcc/mepcc) to PCC
+ *  - Set PCC cursor to the return address
+ *  - If the EPCC is sealed, clear the tag (architectural requirement)
+ */
+static inline void cheri_update_pcc_for_exc_return(CPURISCVState *env,
+                                                   cap_register_t *epcc,
+                                                   target_ulong retpc)
+{
+    env->pcc = *epcc;
+    cap_set_addr(&env->pcc, (uint64_t)retpc);
+    /*
+     * If the EPCC was sealed, the address change above may have made PCC
+     * unrepresentable. In that case, clear the tag per CHERI spec.
+     */
+    if (cap_is_sealed(epcc)) {
+        if ((target_ulong)cap_get_cursor(&env->pcc) != retpc) {
+            env->pcc.tag = false;
+        }
+    }
+}
+
+/*
+ * Update PCC for exception handler entry.
+ * Per CTSRD-CHERI/qemu: cheri_update_pcc_for_exc_handler() —
+ *  - Copy the TVEC capability (stvecc/mtvecc) to PCC
+ *  - Set PCC cursor to the handler address (new_pc)
+ */
+static inline void cheri_update_pcc_for_exc_handler(CPURISCVState *env,
+                                                    cap_register_t *tvecc,
+                                                    target_ulong new_pc)
+{
+    env->pcc = *tvecc;
+    cap_set_addr(&env->pcc, (uint64_t)new_pc);
+}
+
 #endif /* RISCV_CPU_H */

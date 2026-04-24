@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Reference decoder for the champsim_tracer binary trace format v1.1.
+Reference decoder for the champsim_tracer binary trace format v1.2.
 
-Format v1.1 is byte-aligned throughout: every record and sub-record
+Format v1.2 is byte-aligned throughout: every record and sub-record
 starts on a byte boundary, and most fields are plain u8 / u32 / u64
 or ULEB128/SLEB128.  See champsim_tracer_format.md for the full spec.
 """
@@ -17,8 +17,8 @@ from pathlib import Path
 # --- Format constants ------------------------------------------------
 
 # 'C','S','T',0x11 little-endian
-CST_MAGIC = 0x11545343
-CST_TRAILER_MAGIC = 0x11545343FFFFFFFF
+CST_MAGIC = 0x12545343
+CST_TRAILER_MAGIC = 0x12545343FFFFFFFF
 CST_TRAILER_SIZE = 64
 
 CST_FLAG_MEM_DATA      = 1 << 0
@@ -391,7 +391,7 @@ def _read_mem_data_values(br: ByteReader, params: list[DynParam]) -> None:
 
 def decode_champsim_tracer(bin_path: Path
                            ) -> tuple[dict, list[dict], list[dict]]:
-    """Decode a v1.1 trace file.  Returns (meta, templates, entries).
+    """Decode a v1.2 trace file.  Returns (meta, templates, entries).
     Public API; stable across minor revisions of the decoder."""
     data = bin_path.read_bytes()
     if len(data) < CST_TRAILER_SIZE:
@@ -427,7 +427,7 @@ def decode_champsim_tracer(bin_path: Path
 
     has_mem_data = bool(flags & CST_FLAG_MEM_DATA)
 
-    # --- Read templates first (always present in v1.1) ---
+    # --- Read templates first (always present since v1.1) ---
     templates: list[dict] = []
     template_by_id: dict[int, dict] = {}
     if templates_count > 0:
@@ -527,6 +527,7 @@ def decode_champsim_tracer(bin_path: Path
                 "dyn_params": wp_dyn,
                 "fault": False,
                 "translation_unavailable": False,
+                "fault_insn_index": None,
                 "n_insns": template_by_id.get(wp_tmpl, {}).get("n_insns", 0),
             })
 
@@ -542,7 +543,11 @@ def decode_champsim_tracer(bin_path: Path
             evf = evb.u8()
             wp_entries[idx]["translation_unavailable"] = bool(
                 evf & CST_WP_EVENT_TRANSLATION_UNAVAIL)
-            wp_entries[idx]["fault"] = bool(evf & CST_WP_EVENT_FAULT)
+            is_fault = bool(evf & CST_WP_EVENT_FAULT)
+            wp_entries[idx]["fault"] = is_fault
+            if is_fault:
+                # v1.2: chain-relative index of the faulting insn.
+                wp_entries[idx]["fault_insn_index"] = evb.uleb()
             prev_evt_idx = idx
 
         entries.append({
@@ -679,7 +684,11 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
             for dp in wp["dyn_params"]:
                 line += f" {_format_dyn(dp, has_mem_data)}"
             if wp["fault"]:
-                line += " FAULT"
+                fi = wp.get("fault_insn_index")
+                if fi is not None:
+                    line += f" FAULT@insn{fi}"
+                else:
+                    line += " FAULT"
             if wp.get("translation_unavailable"):
                 line += " TRANSLATION_UNAVAILABLE"
             line += f" n_insns={wp['n_insns']}]"
@@ -701,7 +710,7 @@ def _first_diff_line(a: str, b: str) -> tuple[int, str, str] | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Decode champsim_tracer binary (.wpt, v1.1) to text")
+        description="Decode champsim_tracer binary (.wpt, v1.2) to text")
     parser.add_argument("bin", type=Path)
     parser.add_argument("-o", "--out", type=Path)
     parser.add_argument("--expect", type=Path)

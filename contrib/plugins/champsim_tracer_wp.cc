@@ -170,6 +170,18 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                 .n_insns_executed = wp_chain_insns,
                 .fault = true,
                 .translation_unavailable = false,
+                /*
+                 * Default: the insn at the end of the merged chain took
+                 * the exception. Each speculative TB is forced to a
+                 * single guest insn via CF_SINGLE_STEP in
+                 * cpu_plugin_exec_tb(), so the faulting architectural PC
+                 * is exactly `pre_pc`, which is the last insn appended
+                 * to the chain => index wp_chain_insns - 1. Overridden
+                 * below if we detect a SYSCALL in the template (WP
+                 * syscalls are treated like faults).
+                 */
+                .fault_insn_index = (wp_chain_insns > 0)
+                                    ? (wp_chain_insns - 1) : 0,
                 .tmpl = bb_tmpl,
             };
 
@@ -188,6 +200,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                         break;
                     }
                 }
+                fault_wp.fault_insn_index = fault_idx;
                 if (fault_idx + 1 < bb_tmpl->n_insns) {
                     recovery_pc = bb_tmpl->insn_pcs[fault_idx]
                                 + bb_tmpl->insn_sizes[fault_idx];
@@ -258,6 +271,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         wp_bb.n_insns_executed = wp_chain_insns;
         wp_bb.fault = false;
         wp_bb.translation_unavailable = false;
+        wp_bb.fault_insn_index = 0;  /* undefined when !fault */
         wp_bb.tmpl = bb_tmpl;
         wp_bb.dyn_params = g_array_new(false, false, sizeof(DynParam));
         for (guint m = 0; m < wp_chain_mems->len; m++) {

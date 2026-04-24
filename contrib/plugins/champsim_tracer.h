@@ -30,12 +30,15 @@ extern "C" {
 #define MAX_DST_REGS 4
 
 /*
- * Binary format magic/version 1.1.
- * Bytes in file order: 'C','S','T',0x11 → u32 LE 0x11545343.
+ * Binary format magic/version 1.2.
+ * Bytes in file order: 'C','S','T',0x12 → u32 LE 0x12545343.
  * ASCII: C=0x43 S=0x53 T=0x54.  "CST" = ChampSimTracer.
+ *
+ * v1.2 adds a ULEB fault_insn_index to WP event records when
+ * CST_WP_EVENT_FAULT is set (see format spec §3.1.2).
  */
-#define CST_MAGIC          0x11545343u
-#define CST_TRAILER_MAGIC  0x11545343FFFFFFFFull
+#define CST_MAGIC          0x12545343u
+#define CST_TRAILER_MAGIC  0x12545343FFFFFFFFull
 #define CST_TRAILER_SIZE   64
 
 /* Body entry tags (1 byte) */
@@ -62,7 +65,7 @@ extern "C" {
 /* Dyn-patch flags byte */
 #define CST_DYN_FLAG_UNCHANGED (1u << 0)
 
-/* Header feature flags (v1.1: templates are always present) */
+/* Header feature flags (templates are always present since v1.1) */
 #define CST_FLAG_MEM_DATA      (1 << 0)
 #define CST_FLAG_REG_DATA      (1 << 1)
 /* bits 2..7 reserved */
@@ -133,6 +136,14 @@ typedef struct {
     uint32_t n_insns_executed;
     bool fault;
     bool translation_unavailable;
+    /*
+     * Index (within the merged BB template, i.e. chain-relative) of the
+     * instruction that raised the synchronous exception when `fault`
+     * is true. Undefined otherwise. Consumers (e.g. ChampSim) use this
+     * to flag the specific uop as non-completing so its dependent
+     * slice is naturally squashed.
+     */
+    uint32_t fault_insn_index;
     BBTemplate *tmpl;  /* Non-owning; for per-insn schema access */
 } WPBBEntry;
 

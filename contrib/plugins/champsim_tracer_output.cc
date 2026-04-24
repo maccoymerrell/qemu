@@ -1,5 +1,5 @@
 /*
- * Wrong-Path Tracing Plugin — binary format v1.1 writer.
+ * Wrong-Path Tracing Plugin — binary format v1.2 writer.
  *
  * BitWriter primitives, template dictionary serializer, dyn-param
  * patch emitter, body entry streamer, and trailer writer for the
@@ -704,6 +704,14 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
                 evf |= CST_WP_EVENT_FAULT;
             }
             bw_write_u8(&sub, evf);
+            /*
+             * v1.2: when CST_WP_EVENT_FAULT is set, emit the
+             * chain-relative index of the faulting instruction so
+             * consumers can flag that specific uop as non-completing.
+             */
+            if (wp->fault) {
+                bw_write_uleb128(&sub, (uint64_t)wp->fault_insn_index);
+            }
             prev_event_idx = w;
         }
         stat_bin_wp_exception_bits += (bw_tell_bytes(&sub) - ev_start) * 8;

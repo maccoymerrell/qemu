@@ -1,5 +1,5 @@
 #!/bin/bash
-# End-to-end smoke test for wptrace_genval on x86_64.
+# End-to-end smoke test for champsim_tracer_genval on x86_64.
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GENVAL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"

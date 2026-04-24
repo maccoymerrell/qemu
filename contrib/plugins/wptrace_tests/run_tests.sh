@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run the wptrace plugin on all test binaries and verify binary/text consistency.
+# Run the champsim_tracer plugin on all test binaries and verify binary/text consistency.
 #
 # Usage:
 #   ./run_tests.sh [--build-dir DIR] [--bin-dir DIR] [--out-dir DIR] [ISA ...]
@@ -43,12 +43,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-PLUGIN="$BUILD_DIR/contrib/plugins/libwptrace.so"
-DECODE="$QEMU_ROOT/contrib/plugins/wptrace_decode.py"
+PLUGIN="$BUILD_DIR/contrib/plugins/libchampsim_tracer.so"
+DECODE="$QEMU_ROOT/contrib/plugins/champsim_tracer_decode.py"
 
 if [[ ! -f "$PLUGIN" ]]; then
     echo "ERROR: plugin not found: $PLUGIN"
-    echo "       Run: ninja -C '$BUILD_DIR' contrib/plugins/libwptrace.so"
+    echo "       Run: ninja -C '$BUILD_DIR' contrib/plugins/libchampsim_tracer.so"
     exit 1
 fi
 

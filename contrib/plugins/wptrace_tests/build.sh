@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build all wptrace test binaries for x86, aarch64, riscv64, and mips.
+# Build all champsim_tracer test binaries for x86, aarch64, riscv64, and mips.
 #
 # Usage:
 #   ./build.sh [--out-dir DIR] [ISA ...]
@@ -104,18 +104,18 @@ build_one() {
         return
     fi
 
-    if $cc $flags -o "$out" "$src" 2>/tmp/wptrace_build_err_$$; then
+    if $cc $flags -o "$out" "$src" 2>/tmp/champsim_tracer_build_err_$$; then
         printf "  CC    %-36s -> bin/%s_%s\n" "$isa/$name.S" "$name" "$isa"
         BUILT=$((BUILT + 1))
     else
         printf "  FAIL  %-36s\n" "$isa/$name.S"
-        cat /tmp/wptrace_build_err_$$
+        cat /tmp/champsim_tracer_build_err_$$
         FAILED=$((FAILED + 1))
     fi
-    rm -f /tmp/wptrace_build_err_$$
+    rm -f /tmp/champsim_tracer_build_err_$$
 }
 
-# build_one_c: compile a shared C source (from wptrace_tests/) for an ISA.
+# build_one_c: compile a shared C source (from champsim_tracer_tests/) for an ISA.
 # Uses -static -pthread instead of the assembly-specific nostdlib flags.
 build_one_c() {
     local isa="$1"
@@ -141,15 +141,15 @@ build_one_c() {
         return
     fi
 
-    if $cc $extra_flags -o "$out" "$src" 2>/tmp/wptrace_build_err_$$; then
+    if $cc $extra_flags -o "$out" "$src" 2>/tmp/champsim_tracer_build_err_$$; then
         printf "  CC    %-36s -> bin/%s_%s\n" "$name.c[$isa]" "$name" "$isa"
         BUILT=$((BUILT + 1))
     else
         printf "  FAIL  %-36s\n" "$name.c[$isa]"
-        cat /tmp/wptrace_build_err_$$
+        cat /tmp/champsim_tracer_build_err_$$
         FAILED=$((FAILED + 1))
     fi
-    rm -f /tmp/wptrace_build_err_$$
+    rm -f /tmp/champsim_tracer_build_err_$$
 }
 
 for isa in "${ISA_ORDER[@]}"; do

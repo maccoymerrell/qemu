@@ -1,8 +1,8 @@
-#ifndef WPTRACE_MNEMONICS_MIPS_H
-#define WPTRACE_MNEMONICS_MIPS_H
+#ifndef CHAMPSIM_TRACER_MNEMONICS_MIPS_H
+#define CHAMPSIM_TRACER_MNEMONICS_MIPS_H
 
 /*
- * ISA-specific classification tables for wptrace — mips.
+ * ISA-specific classification tables for champsim_tracer — mips.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -721,4 +721,4 @@ static const InsnClassification mips_insn_class[MIPS_INS_ENDING] = {
     [MIPS_INS_MTP2]                 = { GEN_OP_MOV,       BRANCH_NONE,          MF_NONE },
 };
 
-#endif /* WPTRACE_MNEMONICS_MIPS_H */
+#endif /* CHAMPSIM_TRACER_MNEMONICS_MIPS_H */

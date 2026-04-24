@@ -1,9 +1,9 @@
-# wptrace_genval — procedural validation of the wptrace plugin
+# champsim_tracer_genval — procedural validation of the champsim_tracer plugin
 
 This directory contains a seed-driven generator that produces C++ programs
 with known, deterministic control flow, load/store addresses, load/store
 data, and opcode composition.  The programs are compiled for each of the
-four ISAs supported by the wptrace plugin (x86_64, aarch64, riscv64,
+four ISAs supported by the champsim_tracer plugin (x86_64, aarch64, riscv64,
 mipsel), traced under QEMU with the plugin, and then verified against the
 metadata that was emitted alongside the program at generation time.
 
@@ -29,7 +29,7 @@ exercises the plugin across:
                                              <prog>_<isa>
                                                    |
                +-----------+                      v
-               | wptrace   | <--- qemu-<isa> -plugin libwptrace
+               | champsim_tracer   | <--- qemu-<isa> -plugin libchampsim_tracer
                | plugin    |             ...prog_<isa>
                +-----------+
                      |
@@ -38,7 +38,7 @@ exercises the plugin across:
                      |
                      v
              +---------------+         +------------------+
-             | wptrace_decode| ---+--> | genval validate  |
+             | champsim_tracer_decode| ---+--> | genval validate  |
              +---------------+    |    +------------------+
                                   |
                            +------+------+
@@ -59,16 +59,16 @@ exercises the plugin across:
    Missing toolchains are skipped, not errors.
 
 3. **`genval trace`** runs each `out/<prog>_<isa>` under `qemu-<isa>` with
-   `libwptrace.so`, producing `out/<prog>_<isa>.wpt` / `.txt`.
+   `libchampsim_tracer.so`, producing `out/<prog>_<isa>.wpt` / `.txt`.
 
 4. **`genval analyze`** disassembles the compiled binary with Capstone
    (reusing the mnemonic → `GenericOpcode` mapping from
-   `wptrace_mnemonic_survey.py`) and extends the metadata with
+   `champsim_tracer_mnemonic_survey.py`) and extends the metadata with
    *per-block expected opcode sequences* — the ground truth for template
    validation.
 
 5. **`genval validate`** decodes the `.wpt` file (via
-   `wptrace_decode.decode_wptrace`) and checks, for every assertion in
+   `champsim_tracer_decode.decode_champsim_tracer`) and checks, for every assertion in
    the metadata:
      * correct-path BB execution order matches `metadata.correct_path`,
      * every CP BB's dynamic load/store addresses match the planned set,
@@ -135,7 +135,7 @@ from the "store arena" slots any WP BB it might trigger can write.
 ## Relationship to the PIN tracer
 
 Metadata in `*.meta.json` is tracer-agnostic: it describes the expected
-*behaviour* of the program, not the shape of the wptrace binary format.
+*behaviour* of the program, not the shape of the champsim_tracer binary format.
 A future `validator_pin.py` could consume the same metadata and check a
 PIN-generated trace in the same way.  Cross-tracer equivalence is then
 "both validators pass on the same binary + metadata."

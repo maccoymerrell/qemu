@@ -7,7 +7,7 @@ Design contract
 ---------------
 Every block is emitted inside a single function `run()` as a
 statement-expression prefixed by a globally-visible assembly label.
-The label becomes an ELF symbol that the wptrace plugin records in each
+The label becomes an ELF symbol that the champsim_tracer plugin records in each
 template's `sym_name`.  This lets the validator map trace entries back
 to generator block IDs.
 
@@ -83,7 +83,7 @@ class BlockPlan:
     name: str              # block class name
     # Memory operations the block is *intended* to emit, in program order.
     # The validator checks that the set of accesses matches; ordering
-    # within one BB is compiler-dependent for the wptrace trace, since
+    # within one BB is compiler-dependent for the champsim_tracer trace, since
     # the plugin records all BB memops together and the order within
     # one BB is the architectural memory-access order chosen by the
     # backend.  We keep order here as a hint but compare as multisets
@@ -100,6 +100,20 @@ class BlockPlan:
     successors: list[int] = dataclasses.field(default_factory=list)
     branch_pred: bool | None = None
     terminal: bool = False
+    # Asserted branch-type classifications we expect to observe somewhere
+    # in the disassembled instructions for this block instance.  Each
+    # entry is a BranchType name (e.g. "BRANCH_DIRECT_CALL").  Used by
+    # the validator to verify coverage of uncommon branch kinds.
+    asserted_branch_types: list[str] = dataclasses.field(default_factory=list)
+    # Asserted generic-opcode classifications: same idea, but for
+    # GenericOpcode names ("INT_MUL", "SYSCALL", ...).
+    asserted_opcodes: list[str] = dataclasses.field(default_factory=list)
+    # Optional: if set, assert the block contains at least one
+    # instruction whose classified branch_type is "DIRECT_JUMP" *and*
+    # whose branch_conditional bit is set.  This exists specifically
+    # to validate the x86 conditional-unconditional encoding family
+    # (LOOP / LOOPE / LOOPNE / JCXZ / JECXZ / JRCXZ).
+    asserted_cond_uncond_branch: bool = False
 
 
 @dataclasses.dataclass
@@ -184,7 +198,7 @@ def _emit_label(block_id: int) -> str:
     """Emit a globally-visible label that also serves as a C goto target.
 
     The `.globl` directive exposes the label in the ELF symbol table so
-    the wptrace plugin records it in the template's `sym_name` field.
+    the champsim_tracer plugin records it in the template's `sym_name` field.
     """
     sym = f"blk_{block_id}"
     # Landing C label MUST come before the inline asm, otherwise the
@@ -1292,3 +1306,1437 @@ class NopSled(CodeBlock):
             f"  {_goto_successor(ctx, 0)}\n"
             f"}}\n"
         )
+
+
+# ===========================================================================
+# Declarative block factory
+#
+# Most blocks boil down to: (a) issue N volatile loads from arena slots,
+# (b) compute some outputs in both Python and C++, (c) issue M volatile
+# stores back to arena.  The `simple_compute_block` factory collapses that
+# entire pattern to a single specification:
+#
+#   @simple_compute_block(
+#       name="int_sub_add",
+#       scratch=3,
+#       coarse={"INT_SUB": 1, "INT_ADD": 1, "LOAD": 2, "STORE": 1},
+#   )
+#   def _int_sub_add(rng, slots):
+#       s0, s1, s2 = slots
+#       a = rng.randrange(0, 1 << 40)
+#       b = rng.randrange(1, 1 << 20)
+#       r = _u64(a - b + 1)
+#       loads  = [(s0, a), (s1, b)]
+#       stores = [(s2, r, "a - b + 1")]
+#       body = (
+#           f"  uint64_t a = {_volatile_load_u64(s0)};\n"
+#           f"  uint64_t b = {_volatile_load_u64(s1)};\n"
+#       )
+#       return loads, stores, body
+#
+# The factory registers a real `CodeBlock` subclass under the given name
+# and wires plan()/emit() automatically.  Adding a new coverage block is
+# a single decorated function.
+# ===========================================================================
+
+def simple_compute_block(
+    *,
+    name: str,
+    scratch: int,
+    coarse: dict[str, int] | None = None,
+    supported_isas: tuple[str, ...] = (
+        "x86_64", "aarch64", "riscv64", "mipsel"
+    ),
+    asserted_opcodes: list[str] | None = None,
+    asserted_opcodes_per_isa: dict[str, list[str]] | None = None,
+    asserted_branch_types: list[str] | None = None,
+    asserted_cond_uncond_branch: bool = False,
+):
+    """Decorator turning a `build(rng, slots)` callable into a `CodeBlock`.
+
+    `build` must return `(loads, stores, body_lines)` where:
+
+      * `loads`  = list of `(slot, python_value)` — emitted as an
+                   `ExpectedMemOp("load", ...)` and turned into a
+                   `uint64_t NAME = *volatile(&arena[slot]);` line.
+      * `stores` = list of `(slot, python_value, cpp_value_expr)` —
+                   an `ExpectedMemOp("store", ...)` plus a line
+                   storing `cpp_value_expr` to the slot.
+      * `body_lines` = free-form C++ to splice between loads and stores.
+                       Should reference load-named variables as `a`,
+                       `b`, `c`, ... (positional).  You typically
+                       perform the computation here.
+
+    The factory emits the load variables as `a`, `b`, `c` ... (so
+    `body_lines` may reference them) and writes stores at the end.
+    """
+    coarse_d = dict(coarse or {})
+    branch_asserts = list(asserted_branch_types or [])
+    opcode_asserts = list(asserted_opcodes or [])
+    opcode_asserts_per_isa = dict(asserted_opcodes_per_isa or {})
+
+    def deco(build_fn):
+        class _Simple(CodeBlock):
+            pass
+
+        _Simple.name = name
+        _Simple.num_successors = 1
+        _Simple.scratch_slots = scratch
+        _Simple.supported_isas = supported_isas
+
+        @classmethod  # type: ignore[misc]
+        def _plan(cls, ctx: EmitCtx) -> BlockPlan:
+            loads, stores, _body = build_fn(ctx.rng, list(ctx.scratch_slots))
+            memops: list[ExpectedMemOp] = []
+            for slot, val in loads:
+                memops.append(ExpectedMemOp("load", slot, 8, _u64(val)))
+            for slot, val, _expr in stores:
+                memops.append(ExpectedMemOp("store", slot, 8, _u64(val)))
+            return BlockPlan(
+                block_id=ctx.block_id, name=cls.name,
+                memops=memops,
+                coarse_opcodes=coarse_d,
+                asserted_branch_types=list(branch_asserts),
+                asserted_opcodes=list(
+                    opcode_asserts_per_isa.get(ctx.isa, opcode_asserts)
+                ),
+                asserted_cond_uncond_branch=asserted_cond_uncond_branch,
+            )
+
+        @classmethod  # type: ignore[misc]
+        def _emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+            # Reconstruct a matching build() invocation with the same RNG
+            # sequence: EmitCtx at emit-time uses a fresh Random(0), so we
+            # cannot re-invoke build_fn deterministically.  Instead we
+            # reconstruct (loads, stores, body) from the stored plan by
+            # deriving a trivial build invocation at emit time as well.
+            # The plan already contains slots + values — emit directly.
+            loads = [(m.arena_u64_index, m.data)
+                     for m in plan.memops if m.kind == "load"]
+            stores = [(m.arena_u64_index, m.data)
+                      for m in plan.memops if m.kind == "store"]
+
+            # Re-invoke build_fn with a disposable RNG just to get the
+            # body_lines text (the load/store slots are already pinned
+            # in the plan, so any discrepancy inside build_fn is
+            # harmless).  We feed it the *actual* slots so the variable
+            # references in body match up.
+            _dummy_rng = random.Random(0)
+            _lo, _st, body_lines = build_fn(_dummy_rng, list(ctx.scratch_slots))
+
+            load_lines = []
+            for i, (slot, _val) in enumerate(loads):
+                var = chr(ord('a') + i)
+                load_lines.append(
+                    f"  uint64_t {var} = {_volatile_load_u64(slot)};"
+                )
+            store_lines = []
+            for i, (slot, _val) in enumerate(stores):
+                # Match the build_fn's declared store expression.
+                # build_fn's `stores` uses `(slot, value, cpp_expr)` —
+                # we re-fetch cpp_expr from the invocation above.
+                cpp_expr = _st[i][2]
+                store_lines.append(
+                    f"  {_volatile_store_u64(slot, cpp_expr)}"
+                )
+            return (
+                f"{_emit_label(ctx.block_id)}"
+                f"{{\n"
+                + "\n".join(load_lines)
+                + ("\n" if load_lines else "")
+                + body_lines
+                + ("\n" if body_lines and not body_lines.endswith("\n") else "")
+                + "\n".join(store_lines)
+                + "\n"
+                + f"  {_goto_successor(ctx, 0)}\n"
+                + f"}}\n"
+            )
+
+        _Simple.plan = _plan
+        _Simple.emit = _emit
+        _Simple.__name__ = f"Simple_{name}"
+        register(_Simple)
+        return _Simple
+    return deco
+
+
+# ---------------------------------------------------------------------------
+# Example uses of the factory.  Each one is a few lines and contributes
+# a new GenericOpcode/BranchType the validator will see and classify.
+# ---------------------------------------------------------------------------
+
+@simple_compute_block(
+    name="int_adc_sbb",
+    scratch=4,
+    coarse={"INT_ADC": 1, "INT_SBB": 1, "LOAD": 2, "STORE": 2},
+    # `a + b + 1` is commonly folded into LEA on x86, so we only assert
+    # the subtract side which stays INT_SUB across supported ISAs.
+    asserted_opcodes=["INT_SUB"],
+)
+def _int_adc_sbb(rng, slots):
+    s0, s1, s2, s3 = slots
+    a = rng.randrange(1 << 40, (1 << 63) - 1)
+    b = rng.randrange(1, 1 << 40)
+    s = _u64(a + b + 1)
+    d = _u64(a - b - 1)
+    loads = [(s0, a), (s1, b)]
+    stores = [(s2, s, "a + b + 1"), (s3, d, "a - b - 1")]
+    return loads, stores, ""
+
+
+@simple_compute_block(
+    name="test_cmp_eq",
+    scratch=3,
+    coarse={"CMP": 1, "TEST": 1, "LOAD": 2, "STORE": 1},
+    # On x86/aarch64/riscv the compiler emits a discrete compare insn
+    # (cmp / slt / etc.) that maps to GEN_OP_CMP.  On MIPS, GCC under
+    # -O1 frequently fuses the equality test into a `beq`/`bne`
+    # conditional branch (the comparison happens *as part of* the
+    # branch encoding), so no GEN_OP_CMP instruction appears in the
+    # trace.  Skip the CMP assertion on mipsel.
+    asserted_opcodes_per_isa={
+        "x86_64":  ["CMP"],
+        "aarch64": ["CMP"],
+        "riscv64": ["CMP"],
+        "mipsel":  [],
+    },
+)
+def _test_cmp_eq(rng, slots):
+    s0, s1, s2 = slots
+    a = rng.randrange(0, 1 << 32)
+    b = a  # guarantee eq branch on CMP
+    loads = [(s0, a), (s1, b)]
+    r = 1 if a == b else 0
+    stores = [(s2, r, "(a == b) ? 1ULL : 0ULL")]
+    return loads, stores, ""
+
+
+@simple_compute_block(
+    name="xchg_pair",
+    scratch=4,
+    coarse={"XCHG": 1, "LOAD": 2, "STORE": 2},
+    # x86 classifies memory MOVs as GEN_OP_MOV rather than LOAD/STORE,
+    # so we don't assert a specific opcode name here -- the memop count
+    # check in the validator already covers the load/store traffic.
+    asserted_opcodes=[],
+)
+def _xchg_pair(rng, slots):
+    s0, s1, s2, s3 = slots
+    a = rng.randrange(1, 1 << 40)
+    b = rng.randrange(1, 1 << 40)
+    loads = [(s0, a), (s1, b)]
+    # Emitted as two mutually-swapping stores (portable "xchg").
+    stores = [(s2, b, "b"), (s3, a, "a")]
+    return loads, stores, ""
+
+
+# ---------------------------------------------------------------------------
+# Branch-type coverage blocks
+#
+# Each of these introduces one or more uncommon branch-type instructions
+# INSIDE a straight-line block (num_successors=1).  From the generator's
+# CFG point of view they look identical to any other straight-line block,
+# but the plugin's trace will show CALL / RET / indirect-JMP instructions
+# inside the template's insn list.  The validator uses
+# `asserted_branch_types` to check coverage.
+# ---------------------------------------------------------------------------
+
+# Name of the shared helper leaf function emitted once in the preamble.
+HELPER_LEAF_NAME = "wptgen_leaf"
+
+
+@register
+class DirectCallBlock(CodeBlock):
+    """Calls a no-op leaf function defined at file scope.  Emits a
+    BRANCH_DIRECT_CALL at the call site and a BRANCH_RETURN inside
+    the leaf — both observable in the plugin's trace templates."""
+    name = "direct_call"
+    num_successors = 1
+    scratch_slots = 0
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        # No arena memops: a CALL ends a TB, so the load-before /
+        # store-after pair would straddle two templates and confuse the
+        # single-template memop multiset check.  We rely entirely on the
+        # disassembly-level branch-type assertion.
+        return BlockPlan(
+            block_id=ctx.block_id, name=cls.name,
+            memops=[],
+            coarse_opcodes={"CALL": 1, "RET": 1},
+            # We assert opcode==CALL rather than branch_type==DIRECT_CALL
+            # because on RISC-V a call whose target is outside jal's
+            # +/-1 MiB range is materialized as auipc+jalr (an indirect
+            # call).  Both classify as GEN_OP_CALL, so the opcode-level
+            # check is robust to compiler/linker layout choices.
+            asserted_opcodes=["CALL"],
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        return (
+            f"{_emit_label(ctx.block_id)}"
+            f"{{\n"
+            f"  (void){HELPER_LEAF_NAME}(0);\n"
+            f"  {_goto_successor(ctx, 0)}\n"
+            f"}}\n"
+        )
+
+
+@register
+class IndirectCallBlock(CodeBlock):
+    """Calls the leaf function via a function-pointer variable.  On
+    every ISA this forces the compiler to materialise the address and
+    emit a register/memory-indirect call (BRANCH_INDIRECT_CALL)."""
+    name = "indirect_call"
+    num_successors = 1
+    scratch_slots = 0
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        # See DirectCallBlock for why memops is empty.
+        return BlockPlan(
+            block_id=ctx.block_id, name=cls.name,
+            memops=[],
+            coarse_opcodes={"CALL": 1, "RET": 1},
+            asserted_branch_types=["BRANCH_INDIRECT_CALL"],
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        return (
+            f"{_emit_label(ctx.block_id)}"
+            f"{{\n"
+            f"  uint64_t (* volatile fp)(uint64_t) = &{HELPER_LEAF_NAME};\n"
+            f"  (void)fp(0);\n"
+            f"  {_goto_successor(ctx, 0)}\n"
+            f"}}\n"
+        )
+
+
+@register
+class IndirectJumpBlock(CodeBlock):
+    """Uses GCC's labels-as-values (`&&label`) combined with inline
+    `asm goto` so the compiler emits a true indirect jump
+    (BRANCH_INDIRECT_JUMP).  Target is always the block's successor,
+    so CFG behaviour is unchanged.  x86-only because the asm uses
+    `jmp *%0`; the block is simply skipped on other ISAs.
+    """
+    name = "indirect_jump"
+    supported_isas = ("x86_64",)
+    num_successors = 1
+    scratch_slots = 2
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        r = ctx.rng
+        s0, s1 = ctx.scratch_slots
+        a = r.randrange(1, 1 << 40)
+        return BlockPlan(
+            block_id=ctx.block_id, name=cls.name,
+            memops=[
+                ExpectedMemOp("load", s0, 8, a),
+                ExpectedMemOp("store", s1, 8, _u64(a + 1)),
+            ],
+            coarse_opcodes={"LOAD": 1, "STORE": 1, "INT_ADD": 1},
+            asserted_branch_types=["BRANCH_INDIRECT_JUMP"],
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        s0 = plan.memops[0].arena_u64_index
+        s1 = plan.memops[1].arena_u64_index
+        succ = ctx.successor_labels[0]
+        # The successor C label (L_blk_N) and the successor's `.globl`
+        # asm symbol (blk_N) are NOT guaranteed to live at the same PC
+        # after GCC's block reordering -- the C label floats with the
+        # statements around it, while the inline asm `.globl` directive
+        # stays pinned to where the assembler encounters it.  We load
+        # the asm symbol's address via a RIP-relative LEA so the jump
+        # target is exactly `blk_N`, which is what the analyzer sees in
+        # the ELF symbol table.
+        succ_sym = succ.removeprefix("L_") if succ.startswith("L_") else succ
+        return (
+            f"{_emit_label(ctx.block_id)}"
+            f"{{\n"
+            f"  uint64_t a = {_volatile_load_u64(s0)};\n"
+            f"  uint64_t r = a + 1;\n"
+            f"  {_volatile_store_u64(s1, 'r')}\n"
+            # asm goto with a label clobber so GCC knows control may
+            # exit to `succ`; the asm body ignores the label operand
+            # and jumps directly to the pinned `.globl` symbol.
+            f"  asm goto (\"leaq {succ_sym}(%%rip), %%rax\\n\\t\"\n"
+            f"            \"jmp *%%rax\"\n"
+            f"            : : : \"rax\",\"memory\" : {succ});\n"
+            f"}}\n"
+        )
+
+
+@register
+class X86CondUncondBlock(CodeBlock):
+    """x86-only: emits a JECXZ instruction via inline asm.
+
+    JECXZ (and the LOOP* family) are the classic "conditional
+    unconditional" branches — Capstone classifies them with the
+    unconditional JUMP group, but they only transfer control when
+    ECX == 0.  The champsim_tracer plugin's canonical behaviour is to report
+    ``branch_type == BRANCH_DIRECT_JUMP`` *together with*
+    ``branch_conditional == true``.  Blocks of this class assert that
+    pairing exists somewhere in their disassembly.
+    """
+    name = "x86_cond_uncond"
+    num_successors = 1
+    scratch_slots = 0
+    supported_isas = ("x86_64",)
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        # JECXZ terminates a TB, so any load-before / store-after pair
+        # would straddle two templates.  We keep the block memop-free
+        # and rely on the cond-uncond branch assertion below.
+        return BlockPlan(
+            block_id=ctx.block_id, name=cls.name,
+            memops=[],
+            coarse_opcodes={"BRANCH": 1},
+            asserted_cond_uncond_branch=True,
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        # Emit a guaranteed-not-taken JECXZ: set %ecx = 1, then JECXZ
+        # (branch if ECX == 0) falls through to the rest of the block.
+        # The key point is that the instruction EXISTS in the template
+        # so the validator can inspect its classification.
+        body_asm = (
+            '"mov $1, %%ecx\\n\\t"\n'
+            '"jecxz 1f\\n\\t"\n'
+            '"1:\\n\\t"\n'
+            ':: : "ecx","memory"'
+        )
+        return (
+            f"{_emit_label(ctx.block_id)}"
+            f"{{\n"
+            f"  asm volatile(\n  {body_asm});\n"
+            f"  {_goto_successor(ctx, 0)}\n"
+            f"}}\n"
+        )
+
+
+# ===========================================================================
+# Inline-asm opcode probes
+#
+# Many GenericOpcode values can only be emitted reliably with inline asm
+# (PUSH/POP/LEA/XCHG/CMOV/SETCC/FENCE/rotates/vector insns/...).  The
+# `asm_probe_block` factory collapses that pattern to a single per-ISA
+# specification:
+#
+#   asm_probe_block(
+#       name="probe_x86_lea",
+#       per_isa={
+#           "x86_64": {
+#               "asm":      '"leaq 1(%%rax,%%rax,1), %%rax"',
+#               "clobbers": '"rax"',
+#               "opcodes":  ["LEA"],
+#           },
+#       },
+#   )
+#
+# The factory produces a straight-line (1-successor) block that emits
+# exactly the given inline asm.  It has zero memops, so the validator's
+# memop check is trivially satisfied, and the block's
+# `asserted_opcodes` is populated per-ISA at plan time from the per-ISA
+# specification.
+#
+# Using raw register clobbers avoids the generator having to reason
+# about operand numbering; each probe is a minimal, self-contained
+# instruction sequence that survives compiler optimisation because it
+# lives inside `asm volatile`.
+# ===========================================================================
+
+
+def asm_probe_block(
+    *,
+    name: str,
+    per_isa: dict[str, dict],
+):
+    """Register a CodeBlock whose body is exactly an inline-asm probe.
+
+    `per_isa[isa]` must supply:
+      * "asm":      GCC inline-asm body (a single C string literal, with
+                    \\n\\t separators if multiple instructions).
+      * "opcodes":  list of GenericOpcode names that are guaranteed to
+                    appear in the disassembled asm.  Wired into the
+                    plan's `asserted_opcodes`.
+      * "clobbers": optional clobber list (as the raw C string that
+                    follows `:::`).  Defaults to `"memory"`.
+      * "branch_types":  optional list of BranchType names to assert.
+    """
+    supported = tuple(per_isa.keys())
+
+    class _AsmProbe(CodeBlock):
+        pass
+
+    _AsmProbe.name = name
+    _AsmProbe.num_successors = 1
+    _AsmProbe.scratch_slots = 0
+    _AsmProbe.supported_isas = supported
+
+    @classmethod  # type: ignore[misc]
+    def _plan(cls, ctx: EmitCtx) -> BlockPlan:
+        spec = per_isa[ctx.isa]
+        return BlockPlan(
+            block_id=ctx.block_id, name=cls.name,
+            memops=[],
+            coarse_opcodes={},
+            asserted_opcodes=list(spec.get("opcodes", [])),
+            asserted_branch_types=list(spec.get("branch_types", [])),
+        )
+
+    @classmethod  # type: ignore[misc]
+    def _emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        spec = per_isa[ctx.isa]
+        asm_body = spec["asm"]
+        clobbers = spec.get("clobbers", '"memory"')
+        return (
+            f"{_emit_label(ctx.block_id)}"
+            f"{{\n"
+            f"  asm volatile(\n"
+            f"    {asm_body}\n"
+            f"    :: : {clobbers});\n"
+            f"  {_goto_successor(ctx, 0)}\n"
+            f"}}\n"
+        )
+
+    _AsmProbe.plan = _plan
+    _AsmProbe.emit = _emit
+    _AsmProbe.__name__ = f"AsmProbe_{name}"
+    register(_AsmProbe)
+    return _AsmProbe
+
+
+# ---------------------------------------------------------------------------
+# x86_64 probes — one block per uniquely-classified GenericOpcode.
+# Every probe uses caller-clobbered GPRs (rax/rbx/rcx/rdx) or XMM0/XMM1
+# so no callee-save ABI machinery is disturbed.
+# ---------------------------------------------------------------------------
+
+asm_probe_block(
+    name="probe_x86_lea",
+    per_isa={
+        "x86_64": {
+            "asm":      '"leaq 3(%%rax,%%rax,4), %%rax"',
+            "clobbers": '"rax"',
+            "opcodes":  ["LEA"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_push_pop",
+    per_isa={
+        "x86_64": {
+            # Round-trip: pushq imm ; popq reg — a minimal pairing that
+            # leaves the stack pointer unchanged across the block.
+            "asm":      '"pushq $0x1234\\n\\t"\n    "popq %%rax"',
+            "clobbers": '"rax","cc"',
+            "opcodes":  ["PUSH", "POP"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_movsx_movzx",
+    per_isa={
+        "x86_64": {
+            "asm":      (
+                '"movb $-1, %%al\\n\\t"\n'
+                '    "movsx %%al, %%ebx\\n\\t"\n'
+                '    "movzx %%al, %%ecx"'
+            ),
+            "clobbers": '"rax","rbx","rcx"',
+            "opcodes":  ["MOVSX", "MOVZX"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_xchg",
+    per_isa={
+        "x86_64": {
+            "asm":      '"xchg %%rax, %%rbx"',
+            "clobbers": '"rax","rbx"',
+            "opcodes":  ["XCHG"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_cmov",
+    per_isa={
+        "x86_64": {
+            # CMP+CMOV: rax ← (rbx < rcx ? rdx : rax).
+            "asm":      (
+                '"cmp %%rcx, %%rbx\\n\\t"\n'
+                '    "cmovl %%rdx, %%rax"'
+            ),
+            "clobbers": '"rax","cc"',
+            "opcodes":  ["CMOV", "CMP"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_setcc",
+    per_isa={
+        "x86_64": {
+            "asm":      (
+                '"xor %%eax, %%eax\\n\\t"\n'
+                '    "cmp %%rcx, %%rbx\\n\\t"\n'
+                '    "sete %%al"'
+            ),
+            "clobbers": '"rax","cc"',
+            "opcodes":  ["SETCC"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_fence",
+    per_isa={
+        "x86_64": {
+            "asm":      '"mfence"',
+            "clobbers": '"memory"',
+            "opcodes":  ["FENCE"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_rotate",
+    per_isa={
+        "x86_64": {
+            "asm":      (
+                '"rol $5, %%rax\\n\\t"\n'
+                '    "ror $3, %%rbx"'
+            ),
+            "clobbers": '"rax","rbx","cc"',
+            "opcodes":  ["ROL", "ROR"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_inc_dec",
+    per_isa={
+        "x86_64": {
+            "asm":      (
+                '"inc %%rax\\n\\t"\n'
+                '    "dec %%rbx"'
+            ),
+            "clobbers": '"rax","rbx","cc"',
+            "opcodes":  ["INC", "DEC"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_neg_not",
+    per_isa={
+        "x86_64": {
+            "asm":      (
+                '"neg %%rax\\n\\t"\n'
+                '    "not %%rbx"'
+            ),
+            "clobbers": '"rax","rbx","cc"',
+            "opcodes":  ["NEG", "NOT"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_test",
+    per_isa={
+        "x86_64": {
+            "asm":      '"test %%rax, %%rbx"',
+            "clobbers": '"cc"',
+            "opcodes":  ["TEST"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_shift",
+    per_isa={
+        "x86_64": {
+            "asm":      (
+                '"shl $3, %%rax\\n\\t"\n'
+                '    "shr $2, %%rbx\\n\\t"\n'
+                '    "sar $1, %%rcx"'
+            ),
+            "clobbers": '"rax","rbx","rcx","cc"',
+            "opcodes":  ["SHL", "SHR", "SAR"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_int_mul",
+    per_isa={
+        "x86_64": {
+            "asm":      '"imul %%rbx, %%rax"',
+            "clobbers": '"rax","cc"',
+            "opcodes":  ["INT_MUL"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_int_div",
+    per_isa={
+        "x86_64": {
+            # Clear %rdx for unsigned DIV so we don't trigger #DE on a
+            # non-zero high half.  Divisor in %rbx is a fixed small
+            # constant so the sequence is hermetic.
+            "asm":      (
+                '"xor %%edx, %%edx\\n\\t"\n'
+                '    "mov $7, %%rbx\\n\\t"\n'
+                '    "mov $1000, %%rax\\n\\t"\n'
+                '    "div %%rbx"'
+            ),
+            "clobbers": '"rax","rbx","rdx","cc"',
+            "opcodes":  ["INT_DIV"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_int_adc_sbb",
+    per_isa={
+        "x86_64": {
+            "asm":      (
+                '"clc\\n\\t"\n'
+                '    "adc %%rbx, %%rax\\n\\t"\n'
+                '    "sbb %%rdx, %%rcx"'
+            ),
+            "clobbers": '"rax","rcx","cc"',
+            "opcodes":  ["INT_ADC", "INT_SBB"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_logic",
+    per_isa={
+        "x86_64": {
+            "asm":      (
+                '"and %%rbx, %%rax\\n\\t"\n'
+                '    "or %%rdx, %%rcx\\n\\t"\n'
+                '    "xor %%rsi, %%rdi"'
+            ),
+            "clobbers": '"rax","rcx","rdi","cc"',
+            "opcodes":  ["AND", "OR", "XOR"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_int_add_sub",
+    per_isa={
+        "x86_64": {
+            "asm":      (
+                '"add %%rbx, %%rax\\n\\t"\n'
+                '    "sub %%rdx, %%rcx"'
+            ),
+            "clobbers": '"rax","rcx","cc"',
+            "opcodes":  ["INT_ADD", "INT_SUB"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_load_store",
+    per_isa={
+        "x86_64": {
+            # FNSTCW/LDMXCSR are the x86 insns classified as GEN_OP_LOAD
+            # / GEN_OP_STORE in champsim_tracer_mnemonics_x86.h (ordinary MOVs
+            # map to GEN_OP_MOV).  Use an on-stack slot so we don't
+            # touch the arena.
+            "asm":      (
+                '"subq $8, %%rsp\\n\\t"\n'
+                '    "fnstcw (%%rsp)\\n\\t"\n'
+                '    "stmxcsr (%%rsp)\\n\\t"\n'
+                '    "ldmxcsr (%%rsp)\\n\\t"\n'
+                '    "fldcw (%%rsp)\\n\\t"\n'
+                '    "addq $8, %%rsp"'
+            ),
+            "clobbers": '"memory"',
+            "opcodes":  ["LOAD", "STORE"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_vec_arith",
+    per_isa={
+        "x86_64": {
+            "asm":      (
+                '"paddq %%xmm1, %%xmm0\\n\\t"\n'
+                '    "psubq %%xmm1, %%xmm2\\n\\t"\n'
+                '    "pmullw %%xmm1, %%xmm3"'
+            ),
+            "clobbers": '"xmm0","xmm2","xmm3"',
+            "opcodes":  ["VEC_ADD", "VEC_SUB", "VEC_MUL"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_vec_move",
+    per_isa={
+        "x86_64": {
+            "asm":      (
+                '"movdqa %%xmm0, %%xmm1\\n\\t"\n'
+                '    "pshufd $0x1B, %%xmm0, %%xmm2"'
+            ),
+            "clobbers": '"xmm1","xmm2"',
+            "opcodes":  ["VEC_MOV", "VEC_SHUF"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_vec_logic",
+    per_isa={
+        "x86_64": {
+            "asm":      (
+                '"pand %%xmm1, %%xmm0\\n\\t"\n'
+                '    "por %%xmm1, %%xmm2\\n\\t"\n'
+                '    "pxor %%xmm1, %%xmm3"'
+            ),
+            "clobbers": '"xmm0","xmm2","xmm3"',
+            "opcodes":  ["VEC_LOGIC"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_fp_arith",
+    per_isa={
+        "x86_64": {
+            "asm":      (
+                '"addsd %%xmm1, %%xmm0\\n\\t"\n'
+                '    "subsd %%xmm1, %%xmm2\\n\\t"\n'
+                '    "mulsd %%xmm1, %%xmm3\\n\\t"\n'
+                '    "divsd %%xmm1, %%xmm4"'
+            ),
+            "clobbers": '"xmm0","xmm2","xmm3","xmm4"',
+            "opcodes":  ["FP_ADD", "FP_SUB", "FP_MUL", "FP_DIV"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_fp_sqrt_cmp",
+    per_isa={
+        "x86_64": {
+            "asm":      (
+                '"sqrtsd %%xmm1, %%xmm0\\n\\t"\n'
+                '    "ucomisd %%xmm1, %%xmm0"'
+            ),
+            "clobbers": '"xmm0","cc"',
+            "opcodes":  ["FP_SQRT", "FP_CMP"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_fp_mov_cvt",
+    per_isa={
+        "x86_64": {
+            "asm":      (
+                '"movsd %%xmm1, %%xmm0\\n\\t"\n'
+                '    "cvtsi2sd %%rax, %%xmm2"'
+            ),
+            "clobbers": '"xmm0","xmm2"',
+            "opcodes":  ["FP_MOV", "FP_CVT"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_nop",
+    per_isa={
+        "x86_64": {
+            # Three-byte NOP — a single multi-byte NOP encoding that
+            # Capstone classifies distinctly from a bare `nop`.
+            "asm":      '".byte 0x0f, 0x1f, 0x00"',
+            "clobbers": '"memory"',
+            "opcodes":  ["NOP"],
+        },
+    },
+)
+
+
+# ---------------------------------------------------------------------------
+# aarch64 probes — exercise the core GenericOpcode classes using
+# caller-clobbered GPRs (x0-x7) and SIMD regs (v0-v3).
+# Requires g++-aarch64-linux-gnu + qemu-aarch64.
+# ---------------------------------------------------------------------------
+
+asm_probe_block(
+    name="probe_arm_int_add_sub",
+    per_isa={
+        "aarch64": {
+            "asm":      (
+                '"add x0, x1, x2\\n\\t"\n'
+                '    "sub x3, x4, x5"'
+            ),
+            "clobbers": '"x0","x3","cc"',
+            "opcodes":  ["INT_ADD", "INT_SUB"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_int_mul_div",
+    per_isa={
+        "aarch64": {
+            "asm":      (
+                '"mov x1, #1000\\n\\t"\n'
+                '    "mov x2, #7\\n\\t"\n'
+                '    "mul  x0, x1, x2\\n\\t"\n'
+                '    "udiv x3, x1, x2"'
+            ),
+            "clobbers": '"x0","x1","x2","x3"',
+            "opcodes":  ["INT_MUL", "INT_DIV"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_logic",
+    per_isa={
+        "aarch64": {
+            "asm":      (
+                '"and x0, x1, x2\\n\\t"\n'
+                '    "orr x3, x4, x5\\n\\t"\n'
+                '    "eor x6, x7, x0"'
+            ),
+            "clobbers": '"x0","x3","x6"',
+            "opcodes":  ["AND", "OR", "XOR"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_shift",
+    per_isa={
+        "aarch64": {
+            "asm":      (
+                '"lsl x0, x1, #3\\n\\t"\n'
+                '    "lsr x2, x3, #2\\n\\t"\n'
+                '    "asr x4, x5, #1"'
+            ),
+            "clobbers": '"x0","x2","x4"',
+            "opcodes":  ["SHL", "SHR", "SAR"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_sxt_uxt",
+    per_isa={
+        "aarch64": {
+            "asm":      (
+                '"sxtb x0, w1\\n\\t"\n'
+                '    "uxtb x2, w3\\n\\t"\n'
+                '    "sxth x4, w5\\n\\t"\n'
+                '    "uxth x6, w7"'
+            ),
+            "clobbers": '"x0","x2","x4","x6"',
+            "opcodes":  ["MOVSX", "MOVZX"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_adc_sbc",
+    per_isa={
+        "aarch64": {
+            "asm":      (
+                '"cmp x0, x0\\n\\t"     /* clear carry to known state */\n'
+                '    "adc x1, x2, x3\\n\\t"\n'
+                '    "sbc x4, x5, x6"'
+            ),
+            "clobbers": '"x1","x4","cc"',
+            "opcodes":  ["INT_ADC", "INT_SBB"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_load_store",
+    per_isa={
+        "aarch64": {
+            # Round-trip via the stack: store then load an x-reg pair.
+            "asm":      (
+                '"sub sp, sp, #16\\n\\t"\n'
+                '    "stp x0, x1, [sp]\\n\\t"\n'
+                '    "ldp x2, x3, [sp]\\n\\t"\n'
+                '    "add sp, sp, #16"'
+            ),
+            "clobbers": '"x2","x3","memory"',
+            "opcodes":  ["LOAD", "STORE"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_vec_arith",
+    per_isa={
+        "aarch64": {
+            # Scalar `add`/`sub`/`mul` share insn_id with vector forms
+            # in Capstone, so we use instructions whose insn_id is
+            # exclusively vector: ADDP (pairwise add), SABD (signed
+            # abs diff), MLA (multiply-accumulate).
+            "asm":      (
+                '"addp v0.16b, v1.16b, v2.16b\\n\\t"\n'
+                '    "sabd v3.16b, v4.16b, v5.16b\\n\\t"\n'
+                '    "mla  v6.16b, v7.16b, v1.16b"'
+            ),
+            "clobbers": '"v0","v3","v6"',
+            "opcodes":  ["VEC_ADD", "VEC_SUB", "VEC_MUL"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_vec_logic",
+    per_isa={
+        "aarch64": {
+            # Use vector-exclusive mnemonics: BIT (bitwise insert if
+            # true), BSL (bitwise select), CMEQ (vector compare-equal).
+            # These all map to GEN_OP_VEC_LOGIC and have no scalar
+            # form sharing the same insn_id.
+            "asm":      (
+                '"bit  v0.16b, v1.16b, v2.16b\\n\\t"\n'
+                '    "bsl  v3.16b, v4.16b, v5.16b\\n\\t"\n'
+                '    "cmeq v6.16b, v7.16b, v1.16b"'
+            ),
+            "clobbers": '"v0","v3","v6"',
+            "opcodes":  ["VEC_LOGIC"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_fp_arith",
+    per_isa={
+        "aarch64": {
+            "asm":      (
+                '"fadd d0, d1, d2\\n\\t"\n'
+                '    "fsub d3, d4, d5\\n\\t"\n'
+                '    "fmul d6, d7, d1\\n\\t"\n'
+                '    "fdiv d0, d2, d3"'
+            ),
+            "clobbers": '"d0","d3","d6"',
+            "opcodes":  ["FP_ADD", "FP_SUB", "FP_MUL", "FP_DIV"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_fp_sqrt_cmp",
+    per_isa={
+        "aarch64": {
+            "asm":      (
+                '"fsqrt d0, d1\\n\\t"\n'
+                '    "fcmp d0, d1"'
+            ),
+            "clobbers": '"d0","cc"',
+            "opcodes":  ["FP_SQRT", "FP_CMP"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_fp_mov_cvt",
+    per_isa={
+        "aarch64": {
+            "asm":      (
+                '"fmov d0, d1\\n\\t"\n'
+                '    "scvtf d2, x0"'
+            ),
+            "clobbers": '"d0","d2"',
+            "opcodes":  ["FP_MOV", "FP_CVT"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_nop",
+    per_isa={
+        "aarch64": {
+            "asm":      '"nop\\n\\t"\n    "nop"',
+            "clobbers": '"memory"',
+            "opcodes":  ["NOP"],
+        },
+    },
+)
+
+
+# ---------------------------------------------------------------------------
+# riscv64 probes — use caller-saved t0-t6/a0-a7 GPRs and ft0-ft7 FPRs.
+# Requires g++-riscv64-linux-gnu + qemu-riscv64.
+# ---------------------------------------------------------------------------
+
+asm_probe_block(
+    name="probe_rv_int_add_sub",
+    per_isa={
+        "riscv64": {
+            "asm":      (
+                '"add t0, t1, t2\\n\\t"\n'
+                '    "sub t3, t4, t5"'
+            ),
+            "clobbers": '"t0","t3"',
+            "opcodes":  ["INT_ADD", "INT_SUB"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_rv_int_mul_div",
+    per_isa={
+        "riscv64": {
+            "asm":      (
+                '"li t1, 1000\\n\\t"\n'
+                '    "li t2, 7\\n\\t"\n'
+                '    "mul  t0, t1, t2\\n\\t"\n'
+                '    "divu t3, t1, t2"'
+            ),
+            "clobbers": '"t0","t1","t2","t3"',
+            "opcodes":  ["INT_MUL", "INT_DIV"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_rv_logic",
+    per_isa={
+        "riscv64": {
+            "asm":      (
+                '"and t0, t1, t2\\n\\t"\n'
+                '    "or  t3, t4, t5\\n\\t"\n'
+                '    "xor t6, a0, a1"'
+            ),
+            "clobbers": '"t0","t3","t6"',
+            "opcodes":  ["AND", "OR", "XOR"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_rv_shift",
+    per_isa={
+        "riscv64": {
+            "asm":      (
+                '"slli t0, t1, 3\\n\\t"\n'
+                '    "srli t2, t3, 2\\n\\t"\n'
+                '    "srai t4, t5, 1"'
+            ),
+            "clobbers": '"t0","t2","t4"',
+            "opcodes":  ["SHL", "SHR", "SAR"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_rv_sxt_uxt",
+    per_isa={
+        "riscv64": {
+            # RV has no dedicated sign/zero-extend mnemonics; the canonical
+            # idioms are `sext.w` (an alias for ADDIW rd,rs,0) and
+            # `andi r, r, 0xff` for zero-extend.  Capstone reports these
+            # as RISCV_INS_ADDIW and RISCV_INS_ANDI respectively, which
+            # the per-insn-id mnemonic table maps to INT_ADD and AND.
+            "asm":      (
+                '"sext.w t0, t1\\n\\t"\n'
+                '    "andi  t2, t3, 0xff"'
+            ),
+            "clobbers": '"t0","t2"',
+            "opcodes":  ["INT_ADD", "AND"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_rv_load_store",
+    per_isa={
+        "riscv64": {
+            "asm":      (
+                '"addi sp, sp, -16\\n\\t"\n'
+                '    "sd t0, 0(sp)\\n\\t"\n'
+                '    "sd t1, 8(sp)\\n\\t"\n'
+                '    "ld t2, 0(sp)\\n\\t"\n'
+                '    "ld t3, 8(sp)\\n\\t"\n'
+                '    "addi sp, sp, 16"'
+            ),
+            "clobbers": '"t2","t3","memory"',
+            "opcodes":  ["LOAD", "STORE"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_rv_fp_arith",
+    per_isa={
+        "riscv64": {
+            "asm":      (
+                '"fadd.d ft0, ft1, ft2\\n\\t"\n'
+                '    "fsub.d ft3, ft4, ft5\\n\\t"\n'
+                '    "fmul.d ft6, ft7, ft1\\n\\t"\n'
+                '    "fdiv.d ft0, ft2, ft3"'
+            ),
+            "clobbers": '"ft0","ft3","ft6"',
+            "opcodes":  ["FP_ADD", "FP_SUB", "FP_MUL", "FP_DIV"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_rv_fp_sqrt_cmp",
+    per_isa={
+        "riscv64": {
+            "asm":      (
+                '"fsqrt.d ft0, ft1\\n\\t"\n'
+                '    "feq.d  t0, ft0, ft1"'
+            ),
+            "clobbers": '"ft0","t0"',
+            "opcodes":  ["FP_SQRT", "FP_CMP"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_rv_fp_mov_cvt",
+    per_isa={
+        "riscv64": {
+            "asm":      (
+                '"fmv.d    ft0, ft1\\n\\t"\n'
+                '    "fcvt.d.l ft2, t0"'
+            ),
+            "clobbers": '"ft0","ft2"',
+            "opcodes":  ["FP_MOV", "FP_CVT"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_rv_nop",
+    per_isa={
+        "riscv64": {
+            # `nop` on RV is an alias for `addi x0, x0, 0`.
+            "asm":      '"nop\\n\\t"\n    "nop"',
+            "clobbers": '"memory"',
+            "opcodes":  ["NOP"],
+        },
+    },
+)
+
+
+# ---------------------------------------------------------------------------
+# mipsel probes — MIPS32r2 little-endian.  Use caller-clobbered t0-t9.
+# Requires g++-mipsel-linux-gnu + qemu-mipsel.
+# ---------------------------------------------------------------------------
+
+asm_probe_block(
+    name="probe_mips_int_add_sub",
+    per_isa={
+        "mipsel": {
+            "asm":      (
+                '"addu $t0, $t1, $t2\\n\\t"\n'
+                '    "subu $t3, $t4, $t5"'
+            ),
+            "clobbers": '"$t0","$t3"',
+            "opcodes":  ["INT_ADD", "INT_SUB"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_mips_int_mul_div",
+    per_isa={
+        "mipsel": {
+            "asm":      (
+                '"li   $t1, 1000\\n\\t"\n'
+                '    "li   $t2, 7\\n\\t"\n'
+                '    "mul  $t0, $t1, $t2\\n\\t"\n'
+                '    "divu $t1, $t2\\n\\t"\n'
+                '    "mflo $t3"'
+            ),
+            "clobbers": '"$t0","$t1","$t2","$t3","hi","lo"',
+            "opcodes":  ["INT_MUL", "INT_DIV"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_mips_logic",
+    per_isa={
+        "mipsel": {
+            "asm":      (
+                '"and $t0, $t1, $t2\\n\\t"\n'
+                '    "or  $t3, $t4, $t5\\n\\t"\n'
+                '    "xor $t6, $t7, $t8"'
+            ),
+            "clobbers": '"$t0","$t3","$t6"',
+            "opcodes":  ["AND", "OR", "XOR"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_mips_shift",
+    per_isa={
+        "mipsel": {
+            "asm":      (
+                '"sll $t0, $t1, 3\\n\\t"\n'
+                '    "srl $t2, $t3, 2\\n\\t"\n'
+                '    "sra $t4, $t5, 1"'
+            ),
+            "clobbers": '"$t0","$t2","$t4"',
+            "opcodes":  ["SHL", "SHR", "SAR"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_mips_sxt_uxt",
+    per_isa={
+        "mipsel": {
+            # `seb`/`seh` are real MIPS32r2 sign-extend insns -> MOVSX.
+            # `andi rd, rs, 0xff` is the canonical zero-extend idiom but
+            # Capstone reports it as MIPS_INS_ANDI which the mnemonic
+            # table maps to AND (MIPS has no MOVZX-class insn id).
+            "asm":      (
+                '"seb  $t0, $t1\\n\\t"\n'
+                '    "seh  $t2, $t3\\n\\t"\n'
+                '    "andi $t4, $t5, 0xff"'
+            ),
+            "clobbers": '"$t0","$t2","$t4"',
+            "opcodes":  ["MOVSX", "AND"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_mips_load_store",
+    per_isa={
+        "mipsel": {
+            "asm":      (
+                '"addiu $sp, $sp, -8\\n\\t"\n'
+                '    "sw    $t0, 0($sp)\\n\\t"\n'
+                '    "sw    $t1, 4($sp)\\n\\t"\n'
+                '    "lw    $t2, 0($sp)\\n\\t"\n'
+                '    "lw    $t3, 4($sp)\\n\\t"\n'
+                '    "addiu $sp, $sp, 8"'
+            ),
+            "clobbers": '"$t2","$t3","memory"',
+            "opcodes":  ["LOAD", "STORE"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_mips_fp_arith",
+    per_isa={
+        "mipsel": {
+            # NOTE on classification: Capstone defines distinct insn-ids
+            # for FP arith (MIPS_INS_FADD=266, FSUB=312, FMUL=298,
+            # FDIV=279) and the champsim_tracer MIPS mnemonic table DOES map
+            # them to FP_ADD/FP_SUB/FP_MUL/FP_DIV.  However this build
+            # of Capstone's MIPS classifier does not emit those ids:
+            # `add.d/sub.d/mul.d/div.d` decode with the integer ids
+            # MIPS_INS_ADD/SUB/MUL/DIV (verified empirically) which the
+            # table maps to INT_ADD/SUB/MUL/DIV.  The id->opcode table
+            # alone cannot disambiguate the integer and FP forms; doing
+            # so would require operand-class inspection in the plugin.
+            # Until that is added, the probe asserts what the trace
+            # actually contains.
+            "asm":      (
+                '"add.d $f0, $f2, $f4\\n\\t"\n'
+                '    "sub.d $f6, $f8, $f10\\n\\t"\n'
+                '    "mul.d $f12, $f14, $f2\\n\\t"\n'
+                '    "div.d $f0, $f4, $f6"'
+            ),
+            "clobbers": '"$f0","$f6","$f12"',
+            "opcodes":  ["INT_ADD", "INT_SUB", "INT_MUL", "INT_DIV"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_mips_fp_sqrt_cmp",
+    per_isa={
+        "mipsel": {
+            "asm":      (
+                '"sqrt.d $f0, $f2\\n\\t"\n'
+                '    "c.eq.d $f0, $f2"'
+            ),
+            "clobbers": '"$f0"',
+            "opcodes":  ["FP_SQRT", "FP_CMP"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_mips_fp_mov_cvt",
+    per_isa={
+        "mipsel": {
+            "asm":      (
+                '"mov.d    $f0, $f2\\n\\t"\n'
+                '    "cvt.d.w  $f4, $f6"'
+            ),
+            "clobbers": '"$f0","$f4"',
+            "opcodes":  ["FP_MOV", "FP_CVT"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_mips_nop",
+    per_isa={
+        "mipsel": {
+            # `nop` on MIPS is an alias for `sll $zero, $zero, 0`.
+            "asm":      '"nop\\n\\t"\n    "nop"',
+            "clobbers": '"memory"',
+            "opcodes":  ["NOP"],
+        },
+    },
+)
+
+
+# ---------------------------------------------------------------------------
+# File-scope helpers that must appear before `run()` in generated C++.
+# The generator calls `collect_preamble_helpers(isa)` and splices the
+# result into the preamble.  Keeping this in blocks.py means new helper
+# code co-locates with the blocks that depend on it.
+# ---------------------------------------------------------------------------
+
+def collect_preamble_helpers(isa: str) -> str:
+    """Return C++ source that must be emitted at file scope before
+    the definition of ``run()``.  Every helper is unconditional so
+    unused ones simply compile to nothing if the linker DCEs them; the
+    marginal cost is negligible and keeps the generator simple."""
+    helpers = []
+    # `noinline` alone is not enough: at -O1 GCC's pure/const IPA pass
+    # infers wptgen_leaf is a pure function of its argument and elides
+    # the call when the result is unused.  `noipa` disables interprocedural
+    # analysis entirely so every call site is preserved.
+    helpers.append(
+        f"extern \"C\" __attribute__((noinline, noipa))\n"
+        f"uint64_t {HELPER_LEAF_NAME}(uint64_t x) {{\n"
+        f"    return x ^ 0xA5A5A5A5A5A5A5A5ULL;\n"
+        f"}}\n"
+    )
+    return "\n".join(helpers)

@@ -94,22 +94,36 @@ def analyze(binary_path: Path, meta_path: Path) -> Path:
 
     syms = _collect_block_symbols(binary)
 
-    # Order blocks by start address so we can derive "end" from next.
-    by_addr = sorted(syms.items(), key=lambda kv: kv[1][0])
+    # For computing each block's end_pc we need the *next address that
+    # belongs to a different function/symbol*, not just the next blk_
+    # label.  Otherwise, when a libgcc helper (e.g. __floatdidf,
+    # __fixdfdi, __mulsf3) is laid out between two blk_ symbols, its
+    # PCs would be misattributed to the preceding block — which then
+    # corrupts the PcMap and produces spurious cp_execution_order
+    # errors when the trace executes that helper.
+    all_addrs: list[int] = []
+    for sym in binary.symbols:
+        if not sym.name:
+            continue
+        a = int(sym.value)
+        if a > 0:
+            all_addrs.append(a)
+    all_addrs = sorted(set(all_addrs))
 
-    # Build a quick "next symbol address" lookup for every blk_ sym.
+    import bisect as _bisect
+    def _next_addr_after(addr: int, sec_end: int) -> int:
+        i = _bisect.bisect_right(all_addrs, addr)
+        return all_addrs[i] if i < len(all_addrs) and all_addrs[i] < sec_end else sec_end
+
     next_addr: dict[str, int] = {}
-    for i, (name, (addr, _)) in enumerate(by_addr):
-        if i + 1 < len(by_addr):
-            next_addr[name] = by_addr[i + 1][1][0]
-        else:
-            # Last block: span to end of containing section
-            sec = _section_for_pc(binary, addr)
-            if sec is None:
-                raise RuntimeError(
-                    f"symbol {name} @0x{addr:x} not in an exec section"
-                )
-            next_addr[name] = int(sec.virtual_address) + int(sec.size)
+    for name, (addr, _sz) in syms.items():
+        sec = _section_for_pc(binary, addr)
+        if sec is None:
+            raise RuntimeError(
+                f"symbol {name} @0x{addr:x} not in an exec section"
+            )
+        sec_end = int(sec.virtual_address) + int(sec.size)
+        next_addr[name] = _next_addr_after(addr, sec_end)
 
     # Annotate each block in metadata
     for node in meta["blocks"]:
@@ -147,6 +161,13 @@ def analyze(binary_path: Path, meta_path: Path) -> Path:
                 flags=flags,
                 raw_bytes_hex=bytes(ins.bytes).hex(),
             ))
+            # Exit blocks end at the syscall/hlt — the linker may place
+            # padding/unrelated stubs after them that we must not count
+            # as part of this block's disassembly.
+            if (not node.get("successors")
+                    and ins.mnemonic in ("syscall", "hlt", "ud2")):
+                end = ins.address + ins.size
+                break
 
         gt = BlockGT(
             block_id=node["block_id"],

@@ -1,8 +1,8 @@
-#ifndef WPTRACE_MNEMONICS_AARCH64_H
-#define WPTRACE_MNEMONICS_AARCH64_H
+#ifndef CHAMPSIM_TRACER_MNEMONICS_AARCH64_H
+#define CHAMPSIM_TRACER_MNEMONICS_AARCH64_H
 
 /*
- * ISA-specific classification tables for wptrace — aarch64.
+ * ISA-specific classification tables for champsim_tracer — aarch64.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -1581,4 +1581,4 @@ static const InsnClassification arm64_insn_class[ARM64_INS_ENDING] = {
     [ARM64_INS_ZERO]                  = { GEN_OP_VEC_LOGIC, BRANCH_NONE,           MF_NONE },
 };
 
-#endif /* WPTRACE_MNEMONICS_AARCH64_H */
+#endif /* CHAMPSIM_TRACER_MNEMONICS_AARCH64_H */

@@ -868,8 +868,14 @@ bool qemu_plugin_insn_detail(const struct qemu_plugin_insn *insn,
 #define QEMU_PLUGIN_CAP_MODE_16             (1u << 1)
 #define QEMU_PLUGIN_CAP_MODE_32             (1u << 2)
 #define QEMU_PLUGIN_CAP_MODE_64             (1u << 3)
-#define QEMU_PLUGIN_CAP_MODE_RISCV32        QEMU_PLUGIN_CAP_MODE_32
+/*
+ * RISC-V uses Capstone-specific mode bits that overlap with the
+ * generic 16/32/64 width flags, so they're spelled explicitly here
+ * to match Capstone's CS_MODE_RISCV* values exactly.
+ */
+#define QEMU_PLUGIN_CAP_MODE_RISCV32        1u
 #define QEMU_PLUGIN_CAP_MODE_RISCV64        2u
+#define QEMU_PLUGIN_CAP_MODE_RISCVC         4u  /* C-extension (compressed) */
 
 /**
  * qemu_plugin_cap_decode() - decode raw instruction bytes via Capstone

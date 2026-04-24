@@ -751,22 +751,33 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
         return false;
     }
 
-    tb = tb_lookup(cpu, pc, cs_base, flags, cflags);
-    if (tb == NULL) {
-        mmap_lock();
-        tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
-        mmap_unlock();
-        if (tb == NULL) {
-            return false;
-        }
-    }
-
     saved_running = cpu->running;
 
+    /*
+     * Install our sigsetjmp guard *before* tb_gen_code(): translation can
+     * itself fault (e.g. translator_ld() crossing into an unmapped page
+     * during plugin speculative execution), and that path siglongjmps
+     * through cpu->jmp_env via cpu_loop_exit_sigsegv().  If we set the
+     * guard only around cpu_tb_exec(), a translation-time fault would
+     * unwind all the way out to cpu_exec_setjmp(), abandoning the plugin
+     * callback frame above us with locks/state held -> deadlock on the
+     * next callback.
+     */
     sigjmp_buf saved_jmp_env;
     memcpy(&saved_jmp_env, &cpu->jmp_env, sizeof(sigjmp_buf));
 
     if (sigsetjmp(cpu->jmp_env, 0) == 0) {
+        tb = tb_lookup(cpu, pc, cs_base, flags, cflags);
+        if (tb == NULL) {
+            mmap_lock();
+            tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
+            mmap_unlock();
+            if (tb == NULL) {
+                cpu->running = saved_running;
+                memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
+                return false;
+            }
+        }
         cpu_tb_exec(cpu, tb, &tb_exit);
         cpu->running = saved_running;
         memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));

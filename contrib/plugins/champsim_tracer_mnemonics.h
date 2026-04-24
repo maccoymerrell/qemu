@@ -1,5 +1,5 @@
 /*
- * ISA-specific mnemonic tables for wptrace.
+ * ISA-specific mnemonic tables for champsim_tracer.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -87,21 +87,6 @@ enum BranchType {
     BRANCH_SYSCALL_TYPE = 6,
     BRANCH_COND_DIRECT = 7,
     BRANCH_TYPE_COUNT,
-};
-
-enum GenericExceptionId {
-    GEN_EXC_NONE = 0,
-    GEN_EXC_UNKNOWN = 1,
-    GEN_EXC_INT_DIVIDE_BY_ZERO = 2,
-    GEN_EXC_FP_DIVIDE_BY_ZERO = 3,
-    GEN_EXC_MEMORY_ACCESS = 4,
-    GEN_EXC_COUNT,
-};
-
-enum WPStopReason {
-    WP_STOP_NONE = 0,
-    WP_STOP_SYSCALL_USERMODE = 1,
-    WP_STOP_REASON_COUNT,
 };
 
 /*
@@ -230,13 +215,15 @@ typedef struct {
 } InsnClassification;
 
 
-#include "wptrace_mnemonics_x86.h"
-#include "wptrace_mnemonics_aarch64.h"
-#include "wptrace_mnemonics_riscv.h"
-#include "wptrace_mnemonics_mips.h"
+#ifdef CHAMPSIM_MNEMONIC_TABLES_IMPL
+
+#include "champsim_tracer_mnemonics_x86.h"
+#include "champsim_tracer_mnemonics_aarch64.h"
+#include "champsim_tracer_mnemonics_riscv.h"
+#include "champsim_tracer_mnemonics_mips.h"
 
 /* Classification table selectors (indexed by TraceISA) */
-static const RegClassification *const isa_reg_class[] = {
+const RegClassification *const isa_reg_class[] = {
     [TRACE_ISA_UNKNOWN] = NULL,
     [TRACE_ISA_X86]     = x86_reg_class,
     [TRACE_ISA_AARCH64] = arm64_reg_class,
@@ -244,7 +231,7 @@ static const RegClassification *const isa_reg_class[] = {
     [TRACE_ISA_MIPS]    = mips_reg_class,
 };
 
-static const unsigned isa_reg_class_size[] = {
+const unsigned isa_reg_class_size[] = {
     [TRACE_ISA_UNKNOWN] = 0,
     [TRACE_ISA_X86]     = X86_REG_ENDING,
     [TRACE_ISA_AARCH64] = ARM64_REG_ENDING,
@@ -254,7 +241,7 @@ static const unsigned isa_reg_class_size[] = {
 
 
 /* Classification table selector (indexed by TraceISA) */
-static const InsnClassification *const isa_insn_class[] = {
+const InsnClassification *const isa_insn_class[] = {
     [TRACE_ISA_UNKNOWN] = NULL,
     [TRACE_ISA_X86]     = x86_insn_class,
     [TRACE_ISA_AARCH64] = arm64_insn_class,
@@ -262,13 +249,30 @@ static const InsnClassification *const isa_insn_class[] = {
     [TRACE_ISA_MIPS]    = mips_insn_class,
 };
 
-static const unsigned isa_insn_class_size[] = {
+const unsigned isa_insn_class_size[] = {
     [TRACE_ISA_UNKNOWN] = 0,
     [TRACE_ISA_X86]     = X86_INS_ENDING,
     [TRACE_ISA_AARCH64] = ARM64_INS_ENDING,
     [TRACE_ISA_RISCV]   = RISCV_INS_ENDING,
     [TRACE_ISA_MIPS]    = MIPS_INS_ENDING,
 };
+
+#else /* CHAMPSIM_MNEMONIC_TABLES_IMPL */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+extern const RegClassification *const isa_reg_class[TRACE_ISA_MIPS + 1];
+extern const unsigned isa_reg_class_size[TRACE_ISA_MIPS + 1];
+extern const InsnClassification *const isa_insn_class[TRACE_ISA_MIPS + 1];
+extern const unsigned isa_insn_class_size[TRACE_ISA_MIPS + 1];
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* CHAMPSIM_MNEMONIC_TABLES_IMPL */
 
 
 /*
@@ -279,16 +283,56 @@ static const unsigned isa_insn_class_size[] = {
  *
  *   branch_delay_slots   — number of delay-slot instructions after a branch
  *                          (0 for most ISAs, 1 for MIPS)
+ *   target_prefixes      — NULL-terminated list of QEMU target_name
+ *                          prefixes that map to this ISA
+ *   cap_arch             — QEMU_PLUGIN_CAP_ARCH_* or -1 if unsupported
  */
 typedef struct {
-    uint8_t              branch_delay_slots;
+    uint8_t               branch_delay_slots;
+    const char *const    *target_prefixes;
+    int                   cap_arch;
 } IsaProperties;
 
-static const IsaProperties isa_properties[] = {
+#ifdef CHAMPSIM_MNEMONIC_TABLES_IMPL
+
+static const char *const isa_prefixes_x86[]     = { "x86_64", "i386", NULL };
+static const char *const isa_prefixes_aarch64[] = { "aarch64", NULL };
+static const char *const isa_prefixes_riscv[]   = { "riscv64", "riscv32", NULL };
+static const char *const isa_prefixes_mips[]    = { "mips64el", "mips64",
+                                                    "mipsel", "mips", NULL };
+
+const IsaProperties isa_properties[] = {
     [TRACE_ISA_UNKNOWN] = { 0 },
-    [TRACE_ISA_X86]     = { 0 },
-    [TRACE_ISA_AARCH64] = { 0 },
-    [TRACE_ISA_RISCV]   = { 0 },
-    [TRACE_ISA_MIPS]    = { 1 },
+    [TRACE_ISA_X86]     = {
+        .target_prefixes = isa_prefixes_x86,
+        .cap_arch = QEMU_PLUGIN_CAP_ARCH_X86,
+    },
+    [TRACE_ISA_AARCH64] = {
+        .target_prefixes = isa_prefixes_aarch64,
+        .cap_arch = QEMU_PLUGIN_CAP_ARCH_ARM64,
+    },
+    [TRACE_ISA_RISCV]   = {
+        .target_prefixes = isa_prefixes_riscv,
+        .cap_arch = QEMU_PLUGIN_CAP_ARCH_RISCV,
+    },
+    [TRACE_ISA_MIPS]    = {
+        .branch_delay_slots = 1,
+        .target_prefixes = isa_prefixes_mips,
+        .cap_arch = QEMU_PLUGIN_CAP_ARCH_MIPS,
+    },
 };
+
+#else /* CHAMPSIM_MNEMONIC_TABLES_IMPL */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+extern const IsaProperties isa_properties[TRACE_ISA_MIPS + 1];
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* CHAMPSIM_MNEMONIC_TABLES_IMPL */
 

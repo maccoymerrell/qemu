@@ -1,6 +1,6 @@
 """Mnemonic classifier.
 
-Thin wrapper around `wptrace_mnemonic_survey.parse_header`.  We reuse
+Thin wrapper around `champsim_tracer_mnemonic_survey.parse_header`.  We reuse
 its canonical "mnemonic → (GenericOpcode, BranchType, flags)" tables so
 the validator's ground-truth classification matches exactly what the
 plugin does in C.
@@ -19,16 +19,16 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent.parent
-_SURVEY_PATH = _PLUGIN_DIR / "wptrace_mnemonic_survey.py"
+_SURVEY_PATH = _PLUGIN_DIR / "champsim_tracer_mnemonic_survey.py"
 
 
 def _load_survey():
     if not _SURVEY_PATH.is_file():
         raise RuntimeError(
-            f"Could not locate wptrace_mnemonic_survey.py at {_SURVEY_PATH}"
+            f"Could not locate champsim_tracer_mnemonic_survey.py at {_SURVEY_PATH}"
         )
     spec = importlib.util.spec_from_file_location(
-        "wptrace_mnemonic_survey", _SURVEY_PATH
+        "champsim_tracer_mnemonic_survey", _SURVEY_PATH
     )
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -46,7 +46,7 @@ _ISA_TO_SURVEY = {
 
 
 class Classifier:
-    """Maps Capstone instruction IDs to wptrace GenericOpcode names."""
+    """Maps Capstone instruction IDs to champsim_tracer GenericOpcode names."""
 
     def __init__(self) -> None:
         self._survey = _load_survey()

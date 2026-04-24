@@ -1,5 +1,5 @@
 /*
- * multithreaded.c — wptrace multi-thread tracing test
+ * multithreaded.c — champsim_tracer multi-thread tracing test
  *
  * Spawns two worker threads that share a mutex-protected counter.
  * Exercises:

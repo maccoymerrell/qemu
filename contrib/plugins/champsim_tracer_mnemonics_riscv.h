@@ -1,8 +1,8 @@
-#ifndef WPTRACE_MNEMONICS_RISCV_H
-#define WPTRACE_MNEMONICS_RISCV_H
+#ifndef CHAMPSIM_TRACER_MNEMONICS_RISCV_H
+#define CHAMPSIM_TRACER_MNEMONICS_RISCV_H
 
 /*
- * ISA-specific classification tables for wptrace — riscv.
+ * ISA-specific classification tables for champsim_tracer — riscv.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -391,4 +391,4 @@ static const InsnClassification riscv_insn_class[RISCV_INS_ENDING] = {
     [RISCV_INS_C_XOR]               = { GEN_OP_XOR,       BRANCH_NONE,          MF_NONE },
 };
 
-#endif /* WPTRACE_MNEMONICS_RISCV_H */
+#endif /* CHAMPSIM_TRACER_MNEMONICS_RISCV_H */

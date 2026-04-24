@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""wptrace_genval CLI.
+"""champsim_tracer_genval CLI.
 
 Subcommands:
   generate   Build a seed-driven C++ source + metadata sidecar.
   build      Cross-compile the source for one or more ISAs.
-  trace      Run the wptrace plugin on a compiled binary.
+  trace      Run the champsim_tracer plugin on a compiled binary.
   analyze    Disassemble the binary, annotate metadata with ground truth.
   validate   Compare the decoded trace to the metadata.
   all        Run every step above for the requested ISAs.
@@ -43,7 +43,15 @@ ISA_CFLAGS = {
     "x86_64":  ["-static", "-nostdlib", "-nostartfiles"],
     "aarch64": ["-static", "-nostdlib", "-nostartfiles"],
     "riscv64": ["-static", "-nostdlib", "-nostartfiles",
-                "-march=rv64gc", "-mabi=lp64d"],
+                "-march=rv64gc", "-mabi=lp64d",
+                # We use -nostartfiles, so no crt0 sets up `gp` to
+                # __global_pointer$.  Without that, any compiler-emitted
+                # gp-relative load/store (driven by the small-data
+                # optimization or by linker relaxation) faults at runtime
+                # because gp == 0.  Disable both: no small-data placement
+                # and no linker relaxation.
+                "-msmall-data-limit=0", "-mno-relax",
+                "-Wl,--no-relax"],
     "mipsel":  ["-static", "-nostdlib", "-nostartfiles", "-e", "_start"],
 }
 
@@ -73,7 +81,7 @@ def _parse_seed(s: str) -> int:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Procedural validator for the QEMU wptrace plugin."
+        description="Procedural validator for the QEMU champsim_tracer plugin."
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -99,7 +107,7 @@ def _parse_args() -> argparse.Namespace:
     b.add_argument("--isa", choices=ISA_CHOICES, required=True)
 
     # trace
-    t = sub.add_parser("trace", help="Run the wptrace plugin on the binary")
+    t = sub.add_parser("trace", help="Run the champsim_tracer plugin on the binary")
     common(t)
     t.add_argument("--isa", choices=ISA_CHOICES, required=True)
     t.add_argument("--build-dir", type=Path, required=True,
@@ -201,6 +209,11 @@ def cmd_build(args, isa: str | None = None) -> int:
         "-std=c++17",
         str(cpp), "-o", str(out),
     ]
+    # 32-bit MIPS soft-float helpers (__floatdidf/__fixdfdi) live in
+    # libgcc; -nostdlib doesn't exclude libgcc, but we still need to
+    # link it explicitly because gcc's default driver glue is suppressed.
+    if isa == "mipsel":
+        cmd += ["-lgcc"]
     print(f"build[{isa}]: {' '.join(cmd)}")
     rc = subprocess.call(cmd)
     if rc != 0:
@@ -216,7 +229,7 @@ def cmd_trace(args, isa: str | None = None) -> int:
         print(f"trace[{isa}]: SKIP  binary not found: {bin_path}")
         return 0
     qemu = args.build_dir / ISA_QEMU[isa]
-    plugin = args.build_dir / "contrib" / "plugins" / "libwptrace.so"
+    plugin = args.build_dir / "contrib" / "plugins" / "libchampsim_tracer.so"
     if not qemu.is_file():
         print(f"trace[{isa}]: SKIP  qemu not found: {qemu}")
         return 0
@@ -227,7 +240,7 @@ def cmd_trace(args, isa: str | None = None) -> int:
     out_base = _trace_base(args.out_dir, prog, isa)
     plugin_opts = (
         f"outfile={out_base},"
-        f"depth={args.depth},stop={args.stop},debug=1,memdata=1"
+        f"depth={args.depth},stop={args.stop},memdata=1"
     )
     cmd = [
         str(qemu), "-plugin", f"{plugin},{plugin_opts}", str(bin_path),

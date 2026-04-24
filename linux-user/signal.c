@@ -759,6 +759,22 @@ void cpu_loop_exit_sigsegv(CPUState *cpu, target_ulong addr,
         tcg_ops->record_sigsegv(cpu, addr, access_type, maperr, ra);
     }
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * During plugin speculative (wrong-path) execution, faults discovered
+     * inside translator_ld()/probe_access_internal() must NOT queue a
+     * synchronous signal: the plugin's cpu_plugin_exec_tb() setjmp guard
+     * unwinds the stack so the wrong-path simulator can mark the BB as
+     * faulted, but the queued signal would still be delivered later on
+     * the correct path and kill the guest.  Just longjmp out and let the
+     * plugin observe the failure via its tb_ok=false return.
+     */
+    if (cpu->plugin_spec_mode) {
+        cpu->exception_index = EXCP_INTERRUPT;
+        cpu_loop_exit_restore(cpu, ra);
+    }
+#endif
+
     force_sig_fault(TARGET_SIGSEGV,
                     maperr ? TARGET_SEGV_MAPERR : TARGET_SEGV_ACCERR,
                     addr);
@@ -774,6 +790,14 @@ void cpu_loop_exit_sigbus(CPUState *cpu, target_ulong addr,
     if (tcg_ops->record_sigbus) {
         tcg_ops->record_sigbus(cpu, addr, access_type, ra);
     }
+
+#ifdef CONFIG_PLUGIN
+    /* See note in cpu_loop_exit_sigsegv() above. */
+    if (cpu->plugin_spec_mode) {
+        cpu->exception_index = EXCP_INTERRUPT;
+        cpu_loop_exit_restore(cpu, ra);
+    }
+#endif
 
     force_sig_fault(TARGET_SIGBUS, TARGET_BUS_ADRALN, addr);
     cpu->exception_index = EXCP_INTERRUPT;

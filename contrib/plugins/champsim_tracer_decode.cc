@@ -22,7 +22,8 @@ static uint8_t parse_reg_id(uint16_t cap_id)
     return active_reg_table[cap_id].reg_id;
 }
 
-static inline void add_src_reg(InsnFields *f, uint8_t reg_id)
+static inline void add_src_reg(InsnFields *f, uint8_t reg_id,
+                               InsnRegNames *names, const char *name)
 {
     if (reg_id == REG_NONE || f->n_src_regs >= MAX_SRC_REGS) {
         return;
@@ -32,10 +33,15 @@ static inline void add_src_reg(InsnFields *f, uint8_t reg_id)
             return;
         }
     }
+    if (names && name) {
+        g_strlcpy(names->src[f->n_src_regs], name,
+                  sizeof(names->src[0]));
+    }
     f->src_regs[f->n_src_regs++] = reg_id;
 }
 
-static inline void add_dst_reg(InsnFields *f, uint8_t reg_id)
+static inline void add_dst_reg(InsnFields *f, uint8_t reg_id,
+                               InsnRegNames *names, const char *name)
 {
     if (reg_id == REG_NONE || f->n_dst_regs >= MAX_DST_REGS) {
         return;
@@ -44,6 +50,10 @@ static inline void add_dst_reg(InsnFields *f, uint8_t reg_id)
         if (f->dst_regs[i] == reg_id) {
             return;
         }
+    }
+    if (names && name) {
+        g_strlcpy(names->dst[f->n_dst_regs], name,
+                  sizeof(names->dst[0]));
     }
     f->dst_regs[f->n_dst_regs++] = reg_id;
 }
@@ -106,10 +116,12 @@ static uint8_t branch_type_from_groups(uint16_t groups, uint16_t mf_flags)
 
 /*
  * Classify an instruction via direct insn_id array lookup (O(1)).
+ * Returns the table row (or NULL if out of range / no table) so
+ * callers can also access the optional .refine callback.
  */
-static void classify_insn_id(const qemu_plugin_insn_info *info,
-                             uint8_t *opcode, uint8_t *branch_type,
-                             uint16_t *flags)
+static const InsnClassification *classify_insn_id(
+    const qemu_plugin_insn_info *info,
+    uint8_t *opcode, uint8_t *branch_type, uint16_t *flags)
 {
     uint32_t id = info->insn_id;
 
@@ -118,11 +130,13 @@ static void classify_insn_id(const qemu_plugin_insn_info *info,
         *opcode = c->opcode;
         *branch_type = c->branch_type;
         *flags = c->flags;
-    } else {
-        *opcode = GEN_OP_UNKNOWN;
-        *branch_type = BRANCH_NONE;
-        *flags = MF_NONE;
+        return c;
     }
+
+    *opcode = GEN_OP_UNKNOWN;
+    *branch_type = BRANCH_NONE;
+    *flags = MF_NONE;
+    return NULL;
 }
 
 /*
@@ -132,16 +146,21 @@ static void classify_insn_id(const qemu_plugin_insn_info *info,
  */
 void decode_detail_to_generic(uint64_t pc,
                               const qemu_plugin_insn_info *info,
-                              InsnFields *out)
+                              InsnFields *out,
+                              InsnRegNames *out_names)
 {
     memset(out, 0, sizeof(*out));
+    if (out_names) {
+        memset(out_names, 0, sizeof(*out_names));
+    }
 
     if (!info || !info->mnemonic[0]) {
         return;
     }
 
     uint16_t flags = MF_NONE;
-    classify_insn_id(info, &out->opcode, &out->branch_type, &flags);
+    const InsnClassification *cls =
+        classify_insn_id(info, &out->opcode, &out->branch_type, &flags);
 
     if (info->has_lock || (flags & MF_ATOMIC)) {
         out->sync_hint = SYNC_ATOMIC;
@@ -220,16 +239,16 @@ void decode_detail_to_generic(uint64_t pc,
             }
             if (have_access_info) {
                 if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
-                    add_src_reg(out, r);
+                    add_src_reg(out, r, out_names, op->reg_name);
                 }
                 if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
-                    add_dst_reg(out, r);
+                    add_dst_reg(out, r, out_names, op->reg_name);
                 }
             } else {
                 if (first_is_dst && !seen_first_reg) {
-                    add_dst_reg(out, r);
+                    add_dst_reg(out, r, out_names, op->reg_name);
                 } else {
-                    add_src_reg(out, r);
+                    add_src_reg(out, r, out_names, op->reg_name);
                 }
                 seen_first_reg = true;
             }
@@ -244,11 +263,11 @@ void decode_detail_to_generic(uint64_t pc,
         case QEMU_PLUGIN_OP_MEM: {
             uint8_t base = parse_reg_id(op->reg_id);
             if (base != REG_NONE) {
-                add_src_reg(out, base);
+                add_src_reg(out, base, out_names, op->reg_name);
             }
             uint8_t idx = parse_reg_id(op->index_id);
             if (idx != REG_NONE) {
-                add_src_reg(out, idx);
+                add_src_reg(out, idx, out_names, op->index_name);
             }
             /*
              * Populate per-insn observed-max load/store count from
@@ -273,14 +292,26 @@ void decode_detail_to_generic(uint64_t pc,
     for (uint8_t i = 0; i < info->n_regs_read; i++) {
         uint8_t r = parse_reg_id(info->regs_read_id[i]);
         if (r != REG_NONE) {
-            add_src_reg(out, r);
+            add_src_reg(out, r, out_names, info->regs_read[i]);
         }
     }
     for (uint8_t i = 0; i < info->n_regs_write; i++) {
         uint8_t r = parse_reg_id(info->regs_write_id[i]);
         if (r != REG_NONE) {
-            add_dst_reg(out, r);
+            add_dst_reg(out, r, out_names, info->regs_write[i]);
         }
+    }
+
+    /*
+     * Optional ISA-specific post-classification refinement.  Each row
+     * in the per-ISA mnemonic table may attach a .refine callback that
+     * fixes up opcode/branch_type/etc. based on the operand-walk
+     * result above.  Used for cases where one Capstone insn_id covers
+     * multiple distinct semantics (e.g. RISC-V JALR: indirect call vs.
+     * indirect jump vs. ret).
+     */
+    if (cls && cls->refine) {
+        cls->refine(info, out);
     }
 
     /*

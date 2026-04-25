@@ -644,6 +644,712 @@ def _check_cp_memops(entries: list[dict],
     return issues
 
 
+def _check_memop_insn_attribution(
+        entries: list[dict],
+        template_runs: dict[int, list[tuple[int, int]]],
+        templates_by_id: dict[int, dict],
+        cp_set: set[int]) -> list[Issue]:
+    """Verify that each dyn_param's `insn_index` points at an instruction
+    whose schema (n_loads / n_stores) matches the access kind.
+
+    The decoder reconstructs `insn_index` by walking the template's
+    static (n_loads, n_stores) schema in program order; if the plugin
+    writes the schema and the dyn_param stream out of sync, the decoder
+    will still produce *some* mapping, but it will be wrong.  This
+    check catches that class of plugin bug:
+
+      * `insn_index` out of range  → tracer bug
+      * dp.type_name=='load' but insns[idx].n_loads == 0  → mis-attribution
+      * dp.type_name=='store' but insns[idx].n_stores == 0 → mis-attribution
+
+    We only inspect each template's *first* execution so the cost stays
+    O(distinct templates); subsequent executions follow the same
+    schema by construction.
+    """
+    issues: list[Issue] = []
+    seen_tids: set[int] = set()
+
+    for e in entries:
+        tid = e["template_id"]
+        if tid in seen_tids:
+            continue
+        # Only look at templates that participate in CP blocks; entries
+        # that pre-date the entry block are setup code and not part of
+        # the generator's contract.
+        runs = template_runs.get(tid, [])
+        if not any(bid in cp_set for bid, _ in runs):
+            continue
+        seen_tids.add(tid)
+
+        tmpl = templates_by_id.get(tid)
+        if tmpl is None:
+            continue
+        insns = tmpl.get("insns", [])
+        n = len(insns)
+
+        for dp in e.get("dyn_params", []):
+            idx = int(dp.insn_index)
+            kind = dp.type_name
+            if idx < 0 or idx >= n:
+                issues.append(Issue(
+                    "memop_insn_attribution", "error",
+                    f"template t{tid}: dyn_param ({kind} @ "
+                    f"0x{int(dp.value):x}) has out-of-range insn_index "
+                    f"{idx} (template has {n} insns)",
+                    {"template_id": tid, "insn_index": idx,
+                     "n_insns": n, "kind": kind},
+                ))
+                continue
+            ins = insns[idx]
+            n_l = int(ins.get("n_loads", 0))
+            n_s = int(ins.get("n_stores", 0))
+            if kind == "load" and n_l == 0:
+                issues.append(Issue(
+                    "memop_insn_attribution", "error",
+                    f"template t{tid}: load dyn_param attributed to "
+                    f"insn #{idx} at pc=0x{int(ins['pc']):x} which the "
+                    f"trace schema declares (n_loads=0, n_stores={n_s})",
+                    {"template_id": tid, "insn_index": idx,
+                     "pc": int(ins["pc"]), "kind": kind,
+                     "n_loads": n_l, "n_stores": n_s},
+                ))
+            elif kind == "store" and n_s == 0:
+                issues.append(Issue(
+                    "memop_insn_attribution", "error",
+                    f"template t{tid}: store dyn_param attributed to "
+                    f"insn #{idx} at pc=0x{int(ins['pc']):x} which the "
+                    f"trace schema declares (n_loads={n_l}, n_stores=0)",
+                    {"template_id": tid, "insn_index": idx,
+                     "pc": int(ins["pc"]), "kind": kind,
+                     "n_loads": n_l, "n_stores": n_s},
+                ))
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# Address-recompute check — uses captured §5.2 reg-snaps + Capstone python
+# to verify that each runtime memop's recorded VA matches the effective
+# address computed from base/index/disp/scale of the issuing insn.
+# ---------------------------------------------------------------------------
+
+# GenericRegId numbering (must match build_reg_names() in
+# champsim_tracer_decode.py): REG_NONE=0, GPRn=1+n, SP=250, FLAGS=251,
+# IP=252, LR=253, FP_REG=254.
+
+def _x86_64_name_to_genid() -> dict[str, int]:
+    m: dict[str, int] = {}
+    # GPR0..GPR5: rax, rcx, rdx, rbx, rsi, rdi
+    for stems, gid in [
+        (("rax", "eax", "ax", "al", "ah"), 1),
+        (("rcx", "ecx", "cx", "cl", "ch"), 2),
+        (("rdx", "edx", "dx", "dl", "dh"), 3),
+        (("rbx", "ebx", "bx", "bl", "bh"), 4),
+        (("rsi", "esi", "si", "sil"), 5),
+        (("rdi", "edi", "di", "dil"), 6),
+    ]:
+        for s in stems:
+            m[s] = gid
+    # GPR6..GPR13: r8..r15
+    for n in range(8, 16):
+        gid = 7 + (n - 8)  # r8 → REG_GPR6 → 7
+        for suf in ("", "d", "w", "b"):
+            m[f"r{n}{suf}"] = gid
+    # SP=250, FP_REG=254, IP=252
+    for s in ("rsp", "esp", "sp", "spl"):
+        m[s] = 250
+    for s in ("rbp", "ebp", "bp", "bpl"):
+        m[s] = 254
+    for s in ("rip", "eip"):
+        m[s] = 252
+    return m
+
+
+def _aarch64_name_to_genid() -> dict[str, int]:
+    m: dict[str, int] = {}
+    for n in range(31):
+        m[f"x{n}"] = 1 + n
+        m[f"w{n}"] = 1 + n
+    m["sp"] = 250
+    m["wsp"] = 250
+    m["lr"] = 253
+    m["fp"] = 254
+    m["xzr"] = 0
+    m["wzr"] = 0
+    return m
+
+
+def _riscv64_name_to_genid() -> dict[str, int]:
+    # Table mirrors champsim_tracer_mnemonics_riscv.h.
+    base = {
+        "zero": 0, "ra": 253, "sp": 250,
+        "gp": 4, "tp": 5,
+        "t0": 6, "t1": 7, "t2": 8,
+        "s0": 254, "fp": 254, "s1": 10,
+        "a0": 11, "a1": 12, "a2": 13, "a3": 14,
+        "a4": 15, "a5": 16, "a6": 17, "a7": 18,
+        "s2": 19, "s3": 20, "s4": 21, "s5": 22, "s6": 23, "s7": 24,
+        "s8": 25, "s9": 26, "s10": 27, "s11": 28,
+        "t3": 29, "t4": 30, "t5": 31, "t6": 32,
+    }
+    xnum_to_abi = ["zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
+                   "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5",
+                   "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7",
+                   "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"]
+    for i, abi in enumerate(xnum_to_abi):
+        base[f"x{i}"] = base[abi]
+    return base
+
+
+def _mipsel_name_to_genid() -> dict[str, int]:
+    base = {
+        "zero": 0, "at": 2,
+        "v0": 3, "v1": 4,
+        "a0": 5, "a1": 6, "a2": 7, "a3": 8,
+        "t0": 9, "t1": 10, "t2": 11, "t3": 12,
+        "t4": 13, "t5": 14, "t6": 15, "t7": 16,
+        "s0": 17, "s1": 18, "s2": 19, "s3": 20,
+        "s4": 21, "s5": 22, "s6": 23, "s7": 24,
+        "t8": 25, "t9": 26, "k0": 27, "k1": 28,
+        "gp": 29, "sp": 250, "fp": 254, "s8": 254, "ra": 253,
+    }
+    abi = ["zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+           "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+           "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+           "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"]
+    for i, n in enumerate(abi):
+        base[f"${i}"] = base[n]
+    return base
+
+
+_NAME_TO_GENID_BY_ISA = {
+    "x86_64":  _x86_64_name_to_genid(),
+    "aarch64": _aarch64_name_to_genid(),
+    "riscv64": _riscv64_name_to_genid(),
+    "mipsel":  _mipsel_name_to_genid(),
+}
+
+
+def _make_capstone(isa: str):
+    try:
+        import capstone as cs
+    except ImportError:
+        return None, None
+    if isa == "x86_64":
+        md = cs.Cs(cs.CS_ARCH_X86, cs.CS_MODE_64)
+        op_mem = cs.x86.X86_OP_MEM
+    elif isa == "aarch64":
+        md = cs.Cs(cs.CS_ARCH_ARM64, cs.CS_MODE_ARM)
+        op_mem = cs.arm64.ARM64_OP_MEM
+    elif isa == "riscv64":
+        md = cs.Cs(cs.CS_ARCH_RISCV,
+                   cs.CS_MODE_RISCV64 | cs.CS_MODE_RISCVC)
+        op_mem = cs.riscv.RISCV_OP_MEM
+    elif isa == "mipsel":
+        md = cs.Cs(cs.CS_ARCH_MIPS,
+                   cs.CS_MODE_MIPS32 | cs.CS_MODE_LITTLE_ENDIAN)
+        op_mem = cs.mips.MIPS_OP_MEM
+    else:
+        return None, None
+    md.detail = True
+    return md, op_mem
+
+
+def _get_mem_components(d, op, isa: str):
+    """Return (base_name, index_name, disp, scale, access) for a MEM
+    operand of a Capstone-decoded insn, normalised to lowercase names.
+
+    `access` is the Capstone access bitfield (1=R, 2=W, 0=unknown).
+    `scale` defaults to 1 except for x86 (uses op.mem.scale).
+    `index_name` is None unless the ISA exposes an index register.
+    """
+    base_id = op.mem.base
+    base_name = d.reg_name(base_id) if base_id else None
+    if base_name:
+        base_name = base_name.lower()
+    disp = int(op.mem.disp)
+    access = int(getattr(op, "access", 0) or 0)
+    if isa == "x86_64":
+        scale = int(op.mem.scale) if op.mem.scale else 1
+        idx_id = op.mem.index
+        index_name = (d.reg_name(idx_id).lower()
+                      if idx_id else None)
+        return base_name, index_name, disp, scale, access
+    if isa == "aarch64":
+        idx_id = op.mem.index
+        index_name = (d.reg_name(idx_id).lower()
+                      if idx_id else None)
+        return base_name, index_name, disp, 1, access
+    # RISC-V / MIPS: base + disp only
+    return base_name, None, disp, 1, access
+
+
+def _x86_mnemonic_mem_fallback(d, dp_kind):
+    """For x86 insns whose stack/string memop Capstone hides as an
+    implicit access (push/pop/call/ret/leave/enter, pushf/popf), derive
+    (base_name, index_name, disp, scale, op_size).
+
+    The tracer captures the VA via QEMU's mem callback, which fires for
+    these implicit accesses, so this is purely an EA-recomputation
+    helper.  Returns None if not recognized.
+
+    For PUSH-class (writes to [rsp - sizeof(op)]), QEMU updates rsp
+    *after* the access on x86, so the source-snap of rsp is the
+    pre-decrement value; the EA is therefore (rsp - op_size).  POP-
+    class reads at the current rsp.  CALL pushes the return addr
+    (EA = rsp - 8); RET pops it (EA = rsp).
+    """
+    mnem = (d.mnemonic or "").lower()
+    # operand size in bytes (default 8 for 64-bit mode)
+    # Capstone sets d.operands[0].size for explicit operands; for
+    # PUSH imm/reg it tracks the actual width.
+    op_size = 8
+    ops = getattr(d, "operands", []) or []
+    for op in ops:
+        sz = int(getattr(op, "size", 0) or 0)
+        if sz:
+            op_size = sz
+            break
+
+    if mnem in ("push", "pushf", "pushfq", "pushfd",
+                "pusha", "pushaw", "pushad",
+                "call", "callq"):
+        # store at rsp - op_size (call always pushes 8 in 64-bit)
+        if mnem in ("call", "callq"):
+            op_size = 8
+        if dp_kind != "store":
+            return None
+        return "rsp", None, -op_size, 1, op_size
+    if mnem in ("pop", "popf", "popfq", "popfd",
+                "popa", "popaw", "popad",
+                "ret", "retq", "retn", "retf", "iret", "iretq"):
+        if dp_kind != "load":
+            return None
+        return "rsp", None, 0, 1, op_size
+    if mnem in ("leave", "leaveq"):
+        # leave: mov rsp, rbp; pop rbp.  The memop is the pop@[rbp].
+        if dp_kind != "load":
+            return None
+        return "rbp", None, 0, 1, 8
+    if mnem in ("enter",):
+        # enter pushes rbp at [rsp-8]
+        if dp_kind != "store":
+            return None
+        return "rsp", None, -8, 1, 8
+    return None
+
+
+def _riscv_mnemonic_mem_fallback(d):
+    """For RISC-V insns that Capstone *doesn't* expose as a MEM
+    operand — compressed loads/stores (c.lw/c.sw/c.ld/c.sd, the *sp
+    variants, and the FP forms) and AMO/LR/SC — derive
+    (base_name, disp) from the operand list using the mnemonic.
+
+    Returns None if the insn is not a recognized memory access.
+    """
+    try:
+        import capstone as cs
+        REG = cs.riscv.RISCV_OP_REG
+        IMM = cs.riscv.RISCV_OP_IMM
+    except Exception:
+        return None
+    mnem = (d.mnemonic or "").lower()
+    ops = getattr(d, "operands", []) or []
+
+    def _name(op):
+        if op.type != REG:
+            return None
+        n = d.reg_name(op.reg)
+        return n.lower() if n else None
+
+    # Compressed loads / stores: data_reg, imm, base_reg.
+    # *sp variants have base implicitly = sp; capstone may emit it
+    # explicitly as ops[2] anyway.
+    is_c_load  = mnem in ("c.lw", "c.ld", "c.lq",
+                          "c.flw", "c.fld",
+                          "c.lwsp", "c.ldsp", "c.lqsp",
+                          "c.flwsp", "c.fldsp")
+    is_c_store = mnem in ("c.sw", "c.sd", "c.sq",
+                          "c.fsw", "c.fsd",
+                          "c.swsp", "c.sdsp", "c.sqsp",
+                          "c.fswsp", "c.fsdsp")
+    if is_c_load or is_c_store:
+        disp = 0
+        base_name = "sp" if mnem.endswith("sp") else None
+        for op in ops:
+            if op.type == IMM:
+                disp = int(op.imm)
+                break
+        if base_name is None:
+            # Last REG operand is the base.
+            for op in reversed(ops):
+                if op.type == REG:
+                    base_name = _name(op)
+                    break
+        return base_name, disp
+
+    # AMO / LR / SC: base register only, no displacement.  Capstone
+    # exposes the (rs1) base as the *last* REG operand for AMO and
+    # the second REG operand for LR.
+    if mnem.startswith("amo") or mnem.startswith("lr.") \
+            or mnem.startswith("sc."):
+        for op in reversed(ops):
+            if op.type == REG:
+                return _name(op), 0
+        return None
+    return None
+
+
+def _check_address_recompute(
+        entries: list[dict],
+        template_runs: dict[int, list[tuple[int, int]]],
+        templates_by_id: dict[int, dict],
+        cp_set: set[int],
+        isa: str) -> list[Issue]:
+    """Verify recorded memop VAs by recomputing the effective address
+    from §5.2 register snapshots and the issuing insn's addressing
+    mode (decoded via Capstone python).
+
+    Per CP entry with both `reg_snaps` and `dyn_params`:
+
+      * decode each insn's `raw_bytes` with Capstone,
+      * for each runtime memop dyn_param, find the MEM operand on the
+        issuing insn that matches the load/store kind,
+      * recover base / index register values from the entry's
+        `reg_snaps` (matched by GenericRegId on the insn's `src` slot),
+      * compute `EA = base + index*scale + disp` (mod 2^64) and
+        compare to dp.value.
+
+    Issues raised:
+      * `addr_recompute` (error)   — recomputed EA disagrees with VA.
+      * `addr_recompute` (info)    — skipped because reg snap missing,
+        unknown reg name, or no matching MEM operand (each only logs
+        once per (template, insn, reason)).
+    """
+    issues: list[Issue] = []
+
+    if not entries:
+        return issues
+
+    name_to_gid = _NAME_TO_GENID_BY_ISA.get(isa)
+    if name_to_gid is None:
+        issues.append(Issue(
+            "addr_recompute", "info",
+            f"address-recompute skipped for unsupported isa={isa}",
+        ))
+        return issues
+
+    md, op_mem_kind = _make_capstone(isa)
+    if md is None:
+        issues.append(Issue(
+            "addr_recompute", "warning",
+            "capstone python module not available; "
+            "address-recompute skipped",
+        ))
+        return issues
+
+    # Some QEMU targets (e.g. mipsel user-mode) expose no registers to
+    # plugins, so every reg snap reads back as zero.  Detect that case
+    # by sampling and skip with a single info entry rather than
+    # emitting a flood of false-positive base=0 mismatches.
+    nonzero_seen = False
+    for e in entries:
+        for s in (e.get("reg_snaps") or ()):
+            if int(s.get("lo", 0)) != 0 or int(s.get("hi", 0)) != 0:
+                nonzero_seen = True
+                break
+        if nonzero_seen:
+            break
+    if not nonzero_seen:
+        issues.append(Issue(
+            "addr_recompute", "info",
+            "address-recompute skipped: reg-data is uniformly zero "
+            "(target likely exposes no plugin registers)",
+        ))
+        return issues
+
+    mask64 = (1 << 64) - 1
+    decoded_cache: dict[int, list] = {}  # template_id_insn_pos → operands
+    skip_logged: set[tuple] = set()
+    n_checked = 0
+    n_skipped = 0
+    n_errors = 0
+    err_cap = 20
+
+    def _decode_insn(tid: int, idx: int, raw: bytes, pc: int):
+        key = (tid, idx)
+        if key in decoded_cache:
+            return decoded_cache[key]
+        try:
+            ds = list(md.disasm(bytes(raw), pc))
+        except Exception:
+            ds = []
+        decoded_cache[key] = ds
+        return ds
+
+    def _log_skip(reason: str, tid: int, idx: int, dp_kind: str):
+        key = (tid, idx, reason)
+        if key in skip_logged:
+            return
+        skip_logged.add(key)
+        issues.append(Issue(
+            "addr_recompute", "info",
+            f"template t{tid} insn #{idx}: {dp_kind} memop skipped "
+            f"({reason})",
+            {"template_id": tid, "insn_index": idx,
+             "kind": dp_kind, "reason": reason},
+        ))
+
+    for e in entries:
+        tid = e["template_id"]
+        runs = template_runs.get(tid, [])
+        if not any(bid in cp_set for bid, _ in runs):
+            continue
+        reg_snaps = e.get("reg_snaps") or []
+        dyn = e.get("dyn_params") or []
+        if not reg_snaps or not dyn:
+            continue
+        tmpl = templates_by_id.get(tid)
+        if tmpl is None:
+            continue
+        insns = tmpl.get("insns", [])
+
+        # Index reg-snaps by (insn_index, kind, reg_id) for O(1) lookup.
+        snap_by_key: dict[tuple, dict] = {}
+        for s in reg_snaps:
+            snap_by_key[(s["insn_index"], s["kind"], s["reg_id"])] = s
+
+        for dp in dyn:
+            i = int(getattr(dp, "insn_index", -1))
+            if i < 0 or i >= len(insns):
+                continue
+            ins = insns[i]
+            raw = ins.get("raw_bytes")
+            if not raw:
+                continue
+            decoded = _decode_insn(tid, i, raw, int(ins["pc"]))
+            if not decoded:
+                _log_skip("capstone_decode_failed", tid, i, dp.type_name)
+                n_skipped += 1
+                continue
+            d = decoded[0]
+            ops = getattr(d, "operands", []) or []
+
+            # Find the MEM operand whose access matches dp.type_name;
+            # fall back to the only MEM operand if access info is
+            # missing.
+            want_read = (dp.type_name == "load")
+            want_write = (dp.type_name == "store")
+            mem_ops = [op for op in ops if op.type == op_mem_kind]
+            chosen = None
+            base_name = index_name = None
+            disp = 0
+            scale = 1
+            if not mem_ops:
+                # RISC-V compressed and AMO insns aren't exposed as
+                # MEM ops by Capstone; reconstruct from the mnemonic.
+                if isa == "riscv64":
+                    fb = _riscv_mnemonic_mem_fallback(d)
+                    if fb is not None:
+                        base_name, disp = fb
+                    else:
+                        _log_skip("no_mem_operand", tid, i, dp.type_name)
+                        n_skipped += 1
+                        continue
+                elif isa == "x86_64":
+                    fb = _x86_mnemonic_mem_fallback(d, dp.type_name)
+                    if fb is not None:
+                        base_name, index_name, disp, scale, _opsz = fb
+                    else:
+                        _log_skip("no_mem_operand", tid, i, dp.type_name)
+                        n_skipped += 1
+                        continue
+                else:
+                    _log_skip("no_mem_operand", tid, i, dp.type_name)
+                    n_skipped += 1
+                    continue
+            else:
+                for op in mem_ops:
+                    acc = int(getattr(op, "access", 0) or 0)
+                    if acc == 0:
+                        continue
+                    if want_read and (acc & 1):
+                        chosen = op
+                        break
+                    if want_write and (acc & 2):
+                        chosen = op
+                        break
+                if chosen is None:
+                    # No access info or no match — fall back when there's a
+                    # single MEM operand.  Multiple-MEM-no-access cases are
+                    # ambiguous; skip them.
+                    if len(mem_ops) == 1:
+                        chosen = mem_ops[0]
+                    else:
+                        _log_skip("ambiguous_mem_operands", tid, i,
+                                  dp.type_name)
+                        n_skipped += 1
+                        continue
+                base_name, index_name, disp, scale, _ = \
+                    _get_mem_components(d, chosen, isa)
+
+            base_val = 0
+            if base_name and base_name not in ("", "0"):
+                gid = name_to_gid.get(base_name)
+                if gid is None:
+                    _log_skip(f"unknown_base_reg:{base_name}", tid, i,
+                              dp.type_name)
+                    n_skipped += 1
+                    continue
+                if gid == 0:
+                    base_val = 0   # zero register (xzr/x0)
+                else:
+                    s = snap_by_key.get((i, "src", gid))
+                    if s is None:
+                        _log_skip(f"missing_base_snap:{base_name}",
+                                  tid, i, dp.type_name)
+                        n_skipped += 1
+                        continue
+                    base_val = int(s["lo"])
+                    # x86: rip-relative addressing uses the *next* PC.
+                    if isa == "x86_64" and base_name == "rip":
+                        base_val = int(ins["pc"]) + len(raw)
+            elif isa == "x86_64":
+                # No base — pure absolute or [disp+scale*idx].
+                pass
+
+            idx_val = 0
+            if index_name and index_name not in ("", "0"):
+                gid = name_to_gid.get(index_name)
+                if gid is None:
+                    _log_skip(f"unknown_index_reg:{index_name}", tid,
+                              i, dp.type_name)
+                    n_skipped += 1
+                    continue
+                if gid != 0:
+                    s = snap_by_key.get((i, "src", gid))
+                    if s is None:
+                        _log_skip(f"missing_index_snap:{index_name}",
+                                  tid, i, dp.type_name)
+                        n_skipped += 1
+                        continue
+                    idx_val = int(s["lo"])
+
+            ea = (base_val + idx_val * scale + disp) & mask64
+            recorded = int(dp.value) & mask64
+            if ea != recorded:
+                n_errors += 1
+                if n_errors <= err_cap:
+                    issues.append(Issue(
+                        "addr_recompute", "error",
+                        f"template t{tid} insn #{i} pc=0x{ins['pc']:x}: "
+                        f"{dp.type_name} VA=0x{recorded:x} but "
+                        f"recomputed EA=0x{ea:x} from "
+                        f"base={base_name}=0x{base_val:x} "
+                        f"+ index={index_name}*{scale}=0x{idx_val * scale:x} "
+                        f"+ disp=0x{disp & mask64:x}",
+                        {"template_id": tid, "insn_index": i,
+                         "pc": int(ins["pc"]),
+                         "kind": dp.type_name,
+                         "recorded_va": recorded,
+                         "computed_ea": ea,
+                         "base_reg": base_name,
+                         "base_val": base_val,
+                         "index_reg": index_name,
+                         "index_val": idx_val,
+                         "scale": scale, "disp": disp},
+                    ))
+                continue
+            n_checked += 1
+
+    issues.append(Issue(
+        "addr_recompute", "info",
+        f"address-recompute: ok={n_checked} skipped={n_skipped} "
+        f"errors={n_errors}",
+        {"ok": n_checked, "skipped": n_skipped, "errors": n_errors},
+    ))
+    return issues
+
+
+def _check_opcode_coverage(templates: list[dict],
+                           blocks_by_id: dict[int, dict],
+                           pcmap: "PcMap",
+                           cp_set: set[int],
+                           isa: str) -> list[Issue]:
+    """Emit an info-level summary of which GenericOpcode classifications
+    were observed in CP-block templates.
+
+    Lists three sets:
+      * `seen` — distinct opcode names that appeared in the trace.
+      * `asserted_unseen` — any opcode that some block declared in
+        `asserted_opcodes` but which never appeared in the trace.  This
+        is also caught (as an error) by `_check_block_assertions`; we
+        re-surface it here so the coverage summary is self-contained.
+      * `reachable_unseen` — opcodes the mnemonic table lists as
+        reachable on this ISA but which no probe block has yet been
+        written for.  Tracks progress toward 100% coverage.
+    """
+    opcode_names, _ = _load_name_tables()
+
+    # Count opcodes across *all* observed template insns, not just
+    # those that map to a CP block.  Helper functions invoked from a
+    # CP block (e.g. the leaf called by DirectCallBlock) execute a
+    # RET that isn't located inside any blk_N PC range, so a
+    # CP-only count would systematically miss RET on every ISA.  As
+    # long as the template was emitted, the plugin saw the insn.
+    seen_ids: set[int] = set()
+    for t in templates:
+        for ins in t.get("insns", []):
+            seen_ids.add(int(ins["opcode"]))
+    seen_names = sorted(opcode_names.get(i, f"GEN_OP_{i}")
+                        for i in seen_ids)
+
+    asserted: set[str] = set()
+    for b in blocks_by_id.values():
+        if b["block_id"] not in cp_set:
+            continue
+        for op in b.get("asserted_opcodes", []) or []:
+            asserted.add(op)
+    asserted_unseen = sorted(asserted - set(seen_names))
+
+    # Reachable-on-ISA set: read it lazily from the survey tables so
+    # we don't duplicate the per-ISA opcode lists here.  Failure is
+    # non-fatal — we just skip the third bullet.
+    reachable_unseen: list[str] = []
+    try:
+        from . import classify as C
+        clf = C.get_classifier()
+        _, id_to_class, _ = clf._table_for(isa)
+        reachable: set[str] = set()
+        for triple in id_to_class.values():
+            if not triple:
+                continue
+            gen_op = triple[0]
+            if isinstance(gen_op, str) and gen_op.startswith("GEN_OP_"):
+                reachable.add(gen_op[len("GEN_OP_"):])
+        reachable_unseen = sorted(reachable - set(seen_names))
+    except Exception as exc:  # pragma: no cover - diagnostic path
+        reachable_unseen = []
+        return [Issue(
+            "opcode_coverage", "info",
+            f"opcode coverage: seen={len(seen_names)}; "
+            f"reachable-set lookup failed: {exc!r}",
+            {"seen": seen_names, "asserted_unseen": asserted_unseen},
+        )]
+
+    return [Issue(
+        "opcode_coverage", "info",
+        f"opcode coverage [{isa}]: "
+        f"seen={len(seen_names)} "
+        f"asserted_unseen={len(asserted_unseen)} "
+        f"reachable_unseen={len(reachable_unseen)}",
+        {
+            "seen": seen_names,
+            "asserted_unseen": asserted_unseen,
+            "reachable_unseen": reachable_unseen,
+        },
+    )]
+
+
 def _check_wrong_path_chains(entries: list[dict],
                              template_runs: dict[int, list[tuple[int, int]]],
                              cp_block_seq: list[int],
@@ -887,6 +1593,25 @@ def validate(meta_path: Path, trace_path: Path,
         issues += _check_cp_memops(cp_entries, template_runs,
                                    blocks_by_id, cp_set, arena_addr,
                                    arena_size)
+
+    # Per-instruction memop attribution: ensure every dyn_param's
+    # insn_index points at an instruction whose schema declares the
+    # matching access kind.  Independent of arena (works even when no
+    # `arena` symbol is present).
+    templates_by_id = {t["template_id"]: t for t in templates}
+    issues += _check_memop_insn_attribution(cp_entries, template_runs,
+                                            templates_by_id, cp_set)
+
+    # Address-recompute: only meaningful when reg-data was emitted.
+    isa = meta.get("isa", "x86_64")
+    issues += _check_address_recompute(cp_entries, template_runs,
+                                       templates_by_id, cp_set, isa)
+
+    # Coverage summary (info-level): tracks per-ISA progress toward
+    # 100 % generic-opcode coverage.  ISA is encoded in the metadata
+    # as `meta["isa"]`.
+    issues += _check_opcode_coverage(templates, blocks_by_id, pcmap,
+                                     cp_set, isa)
 
     issues += _check_wrong_path_chains(cp_entries, template_runs,
                                        cp_block_seq, correct_path,

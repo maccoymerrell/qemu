@@ -9,6 +9,15 @@
 
 #include <capstone/mips.h>
 
+static unsigned int cap_mode_mips(const char *target_name)
+{
+    unsigned int mode = QEMU_PLUGIN_CAP_MODE_32;
+    mode |= g_str_has_suffix(target_name, "el")
+          ? QEMU_PLUGIN_CAP_MODE_LITTLE_ENDIAN
+          : QEMU_PLUGIN_CAP_MODE_BIG_ENDIAN;
+    return mode;
+}
+
 /* MIPS: 63/136 classified, 73 REG_NONE */
 static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_AT] = { REG_GPR1 },  /* at */

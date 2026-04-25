@@ -26,8 +26,9 @@ extern "C" {
 
 /* ===== Constants ===== */
 #define MAX_INSN_BYTES 16
-#define MAX_SRC_REGS 4
-#define MAX_DST_REGS 4
+/* MAX_SRC_REGS / MAX_DST_REGS now live in champsim_tracer_mnemonics.h
+ * (alongside the InsnFields struct they size) so per-ISA mnemonic refiners
+ * compiled in the C tables TU can manipulate InsnFields directly. */
 
 /*
  * Binary format magic/version 1.2.
@@ -72,21 +73,36 @@ extern "C" {
 
 /* ===== Types ===== */
 
+/* InsnFields is defined in champsim_tracer_mnemonics.h. */
+
+/*
+ * Per-register snapshot, captured immediately before the issuing
+ * instruction executes.  size_code values:
+ *   0 = 4 bytes,  1 = 8 bytes,  2 = 16 bytes.
+ * `lo` carries the low 8 bytes (LE); `hi` carries the high 8 bytes
+ * for 16-byte registers and is 0 otherwise.  Registers the plugin
+ * could not resolve to a runtime handle on this target are emitted
+ * as size_code=0 lo=0 hi=0 (and do not advance the per-reg delta
+ * state).
+ */
 typedef struct {
-    uint8_t opcode;                 /* GenericOpcode */
-    uint8_t branch_type;            /* BranchType */
-    bool branch_conditional;
-    uint8_t n_src_regs;
-    uint8_t n_dst_regs;
-    uint8_t src_regs[MAX_SRC_REGS];
-    uint8_t dst_regs[MAX_DST_REGS];
-    bool has_immediate;
-    int64_t immediate;
-    uint8_t sync_hint;              /* SyncEventType */
-    uint8_t n_loads;                /* Observed max loads per execution  */
-    uint8_t n_stores;               /* Observed max stores per execution */
-    bool dynamic_memop;             /* Runtime observed > Capstone static */
-} InsnFields;
+    uint8_t  size_code;
+    uint64_t lo;
+    uint64_t hi;
+} RegSnap;
+
+/*
+ * Per-insn parallel name table for InsnFields.src_regs[] and
+ * InsnFields.dst_regs[].  Populated by the decoder only when
+ * enable_reg_data is true at translation time; consumed by the
+ * per-insn reg-snap callback to look up QEMU register handles via
+ * lookup_reg_handle().  Empty string means no Capstone runtime name
+ * is associated with that slot (→ emitted as a zero snap).
+ */
+typedef struct {
+    char src[MAX_SRC_REGS][16];
+    char dst[MAX_DST_REGS][16];
+} InsnRegNames;
 
 typedef struct {
     uint32_t template_id;
@@ -98,6 +114,13 @@ typedef struct {
     uint8_t *insn_sizes;
     uint8_t *insn_bytes;
     InsnFields *insn_fields;
+    /* Optional: parallel Capstone-name array, one entry per insn.
+     * Allocated only when reg-data capture is enabled at translation
+     * time. */
+    InsnRegNames *insn_reg_names;
+    /* Per-insn opaque udata for the reg-snap exec callback; lifetime
+     * equals the BBTemplate's.  Allocated only when reg-data is on. */
+    void *insn_snap_refs;
 } BBTemplate;
 
 enum DynParamType {
@@ -145,12 +168,21 @@ typedef struct {
      */
     uint32_t fault_insn_index;
     BBTemplate *tmpl;  /* Non-owning; for per-insn schema access */
+    /* RegSnap array, ordered: for each insn in the merged WP
+     * template, n_src snaps then n_dst snaps.  Captured pre-insn via
+     * a per-fragment wide regfile dump (see wp_capture_insn_snaps).
+     * NULL when reg-data is disabled. */
+    GArray *reg_snaps;
 } WPBBEntry;
 
 typedef struct {
     uint32_t seq_num;
     uint32_t template_id;
     GArray *dyn_params;
+    /* RegSnap array, ordered: for each insn in the template, n_src
+     * snaps then n_dst snaps.  Only populated when enable_reg_data
+     * is true; emitted in the §5.2 reg-data section. */
+    GArray *reg_snaps;
     GArray *wp_entries;
     BBTemplate *tmpl;  /* Non-owning; for per-insn schema access */
 } BodyEntry;
@@ -232,6 +264,7 @@ extern qemu_plugin_u64 sb_insn_count;
 
 extern int max_wrong_path_depth;
 extern bool enable_mem_data;
+extern bool enable_reg_data;
 extern const char *target_name;
 extern char *qemu_command_line;
 extern char *trace_comment;
@@ -268,7 +301,8 @@ extern uint64_t stat_bin_wp_exception_bits;
 /* Defined in champsim_tracer_decode.cc */
 void decode_detail_to_generic(uint64_t pc,
                               const qemu_plugin_insn_info *info,
-                              InsnFields *out);
+                              InsnFields *out,
+                              InsnRegNames *out_names);
 
 /* Defined in champsim_tracer.cc (BB template management) */
 BBTemplate *find_template(uint64_t start_pc);
@@ -276,6 +310,41 @@ BBTemplate *get_or_create_bb_template(uint64_t entry_pc,
                                       BBTemplate * const *fragments,
                                       guint n_fragments);
 int template_branch_index(const BBTemplate *tmpl);
+
+/*
+ * Look up a register handle by Capstone-style register name
+ * (case-insensitive) for @cpu_index.  Returns NULL when @name is
+ * empty or not exposed by qemu_plugin_get_registers() on this
+ * target.  Only meaningful when enable_reg_data is true.
+ */
+struct qemu_plugin_register *
+lookup_reg_handle(unsigned int cpu_index, const char *cap_reg_name);
+
+/*
+ * Wide regfile snapshot: opaque GHashTable<lowercase reg name -> RegSnap*>.
+ * Used by the wrong-path loop to capture pre-fragment register state
+ * (since CF_MEMI_ONLY in spec mode suppresses per-insn exec callbacks).
+ */
+typedef struct _WideRegSnap WideRegSnap;
+
+/*
+ * Capture a snapshot of every register exposed by the vCPU's
+ * reg-handle map.  Returns NULL when reg-data is disabled or the
+ * map is unavailable.  Caller must free with wide_reg_snap_free().
+ */
+WideRegSnap *wide_reg_snap_capture(unsigned int cpu_index);
+void         wide_reg_snap_free(WideRegSnap *w);
+
+/*
+ * Append per-insn (n_src + n_dst) RegSnap records sourced from a
+ * wide snapshot to @out_snaps, using @tmpl->insn_reg_names[insn_idx]
+ * as the lookup keys.  Missing names yield zero snaps.  No-op when
+ * reg-data is disabled.
+ */
+void wp_capture_insn_snaps(const WideRegSnap *wide,
+                           const BBTemplate *tmpl,
+                           uint32_t insn_idx,
+                           GArray *out_snaps);
 
 /* Defined in champsim_tracer_wp.cc */
 GArray *simulate_wrong_path_ext(uint64_t branch_pc,

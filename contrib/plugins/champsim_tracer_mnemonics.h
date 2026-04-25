@@ -203,15 +203,62 @@ typedef struct {
 
 
 /*
+ * Decoded per-instruction generic fields.
+ *
+ * Lives in this header (rather than champsim_tracer.h) so per-ISA
+ * mnemonic refiners — compiled in the C tables TU — can read and
+ * mutate fields directly without needing the rest of the tracer
+ * internals.
+ */
+#define MAX_SRC_REGS 4
+#define MAX_DST_REGS 4
+
+typedef struct InsnFields {
+    uint8_t opcode;                 /* GenericOpcode */
+    uint8_t branch_type;            /* BranchType */
+    bool    branch_conditional;
+    uint8_t n_src_regs;
+    uint8_t n_dst_regs;
+    uint8_t src_regs[MAX_SRC_REGS];
+    uint8_t dst_regs[MAX_DST_REGS];
+    bool    has_immediate;
+    int64_t immediate;
+    uint8_t sync_hint;              /* SyncEventType */
+    uint8_t n_loads;                /* Observed max loads per execution  */
+    uint8_t n_stores;               /* Observed max stores per execution */
+    bool    dynamic_memop;          /* Runtime observed > Capstone static */
+} InsnFields;
+
+
+/*
+ * Optional post-classification refiner.
+ *
+ * Some Capstone insn_ids cover several distinct semantics that only
+ * differ in operand encoding (e.g. RISC-V JALR is "indirect call",
+ * "indirect jump", or "ret" depending on rd/rs1).  A row may set
+ * .refine to a function that fixes up the decoded InsnFields after
+ * the generic operand-walk has populated src_regs/dst_regs/etc.
+ *
+ * The refiner is ISA-local: it is defined in the per-ISA mnemonic
+ * table file and never referenced from the ISA-agnostic decoder.
+ */
+struct qemu_plugin_insn_info; /* fwd-decl: full type from <qemu-plugin.h> */
+typedef void (*InsnRefineFn)(const struct qemu_plugin_insn_info *info,
+                             InsnFields *fields);
+
+/*
  * Instruction classification entry: maps a Capstone insn_id directly
  * to GenericOpcode + BranchType + MnemonicFlags via designated-initializer
  * arrays indexed by the Capstone enum value.  Eliminates all string-based
  * mnemonic matching (hash tables, regex, prefix stripping, caches).
+ *
+ * `.refine` is optional (NULL by default); see InsnRefineFn above.
  */
 typedef struct {
-    uint8_t  opcode;      /* GenericOpcode */
-    uint8_t  branch_type; /* BranchType */
-    uint16_t flags;       /* MnemonicFlags */
+    uint8_t      opcode;      /* GenericOpcode */
+    uint8_t      branch_type; /* BranchType */
+    uint16_t     flags;       /* MnemonicFlags */
+    InsnRefineFn refine;      /* optional, NULL if unused */
 } InsnClassification;
 
 
@@ -281,16 +328,22 @@ extern const unsigned isa_insn_class_size[TRACE_ISA_MIPS + 1];
  * Concentrates every ISA-specific knob into one place so that adding a
  * new ISA requires only a new row rather than scattered switch arms.
  *
- *   branch_delay_slots   — number of delay-slot instructions after a branch
- *                          (0 for most ISAs, 1 for MIPS)
- *   target_prefixes      — NULL-terminated list of QEMU target_name
- *                          prefixes that map to this ISA
- *   cap_arch             — QEMU_PLUGIN_CAP_ARCH_* or -1 if unsupported
+ *   branch_delay_slots       — number of delay-slot instructions after a
+ *                              branch (0 for most ISAs, 1 for MIPS)
+ *   target_prefixes          — NULL-terminated list of QEMU target_name
+ *                              prefixes that map to this ISA
+ *   cap_arch                 — QEMU_PLUGIN_CAP_ARCH_* or -1 if unsupported
+ *   cap_mode_for_target      — derives the QEMU_PLUGIN_CAP_MODE_* bitmask
+ *                              from target_name (handles e.g. RISC-V
+ *                              32/64 split, MIPS endianness)
  */
+typedef unsigned int (*CapModeForTargetFn)(const char *target_name);
+
 typedef struct {
     uint8_t               branch_delay_slots;
     const char *const    *target_prefixes;
     int                   cap_arch;
+    CapModeForTargetFn    cap_mode_for_target;
 } IsaProperties;
 
 #ifdef CHAMPSIM_MNEMONIC_TABLES_IMPL
@@ -306,19 +359,23 @@ const IsaProperties isa_properties[] = {
     [TRACE_ISA_X86]     = {
         .target_prefixes = isa_prefixes_x86,
         .cap_arch = QEMU_PLUGIN_CAP_ARCH_X86,
+        .cap_mode_for_target = cap_mode_x86,
     },
     [TRACE_ISA_AARCH64] = {
         .target_prefixes = isa_prefixes_aarch64,
         .cap_arch = QEMU_PLUGIN_CAP_ARCH_ARM64,
+        .cap_mode_for_target = cap_mode_aarch64,
     },
     [TRACE_ISA_RISCV]   = {
         .target_prefixes = isa_prefixes_riscv,
         .cap_arch = QEMU_PLUGIN_CAP_ARCH_RISCV,
+        .cap_mode_for_target = cap_mode_riscv,
     },
     [TRACE_ISA_MIPS]    = {
         .branch_delay_slots = 1,
         .target_prefixes = isa_prefixes_mips,
         .cap_arch = QEMU_PLUGIN_CAP_ARCH_MIPS,
+        .cap_mode_for_target = cap_mode_mips,
     },
 };
 

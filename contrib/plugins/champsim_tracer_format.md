@@ -86,7 +86,7 @@ are LEB128 per DWARF §7.6.
 
 ```
  bit 0  CST_FLAG_MEM_DATA       Per-access memory data values present
- bit 1  CST_FLAG_REG_DATA       (reserved, not yet emitted)
+ bit 1  CST_FLAG_REG_DATA       Per-insn source-register values present
  bits 2..7  reserved, must be 0
 ```
 
@@ -159,8 +159,9 @@ the body.
  ├──────────────────────────────────────────────────────────┤
  │ if CST_FLAG_MEM_DATA:                                     │
  │   cp_mem_data_section        (length-prefixed, §5)         │
- ├──────────────────────────────────────────────────────────┤
- │ wp_chain_section             (length-prefixed, §3.1.1)    │
+ ├──────────────────────────────────────────────────────────┤ │ if CST_FLAG_REG_DATA:                                     │
+ │   cp_reg_data_section        (length-prefixed, §5.2)       │
+ ├─────────────────────────────────────────────────────────── │ wp_chain_section             (length-prefixed, §3.1.1)    │
  ├──────────────────────────────────────────────────────────┤
  │ wp_events_section            (length-prefixed, §3.1.2)    │
  └──────────────────────────────────────────────────────────┘
@@ -186,6 +187,8 @@ A "length-prefixed section" is:
       wp_dyn_patch                 : §4.2
       if CST_FLAG_MEM_DATA:
         wp_mem_data_section : §5
+      if CST_FLAG_REG_DATA:
+        wp_reg_data_section : §5.2
 ```
 
 #### 3.1.2 WP events section payload
@@ -308,6 +311,103 @@ dyn-param array from §4:
 ```
 
 A 0 `data_size` from the plugin is remapped to 1 byte (defensive).
+
+---
+
+## 5.2 Register-data section
+
+Emitted only when `CST_FLAG_REG_DATA` is set.  One section per
+finalized basic-block entry — both **CP** entries and each **WP**
+entry within a CP entry's WP chain.  The section is length-prefixed
+(§3.1).
+
+### Layout
+
+The section contains, in template walk order:
+
+```
+    for i in 0..tmpl.n_insns:
+        for r in 0..tmpl.insn[i].n_src_regs:
+            reg_snap_record
+        for r in 0..tmpl.insn[i].n_dst_regs:
+            reg_snap_record
+```
+
+Per-snap record:
+
+```
+    size_code : u8                0=4B  1=8B  2=16B
+    delta_lo  : SLEB128            value_lo - state_lo[reg_id]
+    delta_hi  : SLEB128            present iff size_code == 2
+                                   value_hi - state_hi[reg_id]
+```
+
+Values are 64-bit little-endian halves of the register value
+(`lo` = bytes 0..7, `hi` = bytes 8..15).  Records are byte-aligned;
+no padding bits are introduced anywhere in the section.
+
+### Decoder state
+
+The decoder maintains two parallel arrays
+`state_lo[256]` / `state_hi[256]`, indexed by `GenericRegId`
+(§6's `src_regs[r]` / `dst_regs[r]`):
+
+* Both arrays are initialised to **all zeros** at the start of the
+  body stream (immediately after the header / before the first
+  `BODY_TAG_ENTRY`).
+* After reading `delta_lo` for `reg_id != REG_NONE`, the decoder
+  updates `state_lo[reg_id] += delta_lo` (mod 2⁶⁴) and reports the
+  updated value as the snap's absolute `lo`.  Likewise for
+  `delta_hi` when `size_code == 2`.
+* When `reg_id == REG_NONE` (an unbound operand slot, e.g. the
+  index register of a base-only addressing mode), the decoder
+  treats the deltas as raw values against a zero baseline and does
+  **not** mutate any state slot.
+
+CP entries share a single `cp_state_*` pair across the whole body
+stream.  Each CP entry's WP sub-section gets a **fresh** pair of
+state arrays seeded from the current `cp_state_*` at the moment the
+WP chain begins; WP entries within that chain accumulate deltas
+into this `wp_state_*` pair.  When the WP chain ends, `wp_state_*`
+is discarded — wrong-path execution is rolled back by QEMU
+(`qemu_plugin_cpu_state_restore()`) so its register effects must
+not leak into the next CP entry.
+
+This mirrors the §4 dyn-patch encoding model: each register-id slot
+behaves like an independent counter, so loop-invariant or
+infrequently-changing registers cost a single 0-byte SLEB after
+their first capture.
+
+### Capture semantics
+
+* CP snapshots are taken *before* the issuing instruction executes,
+  via a per-insn `R_REGS` callback.  Source and destination
+  registers are both read pre-execution.
+* WP snapshots are taken via a different mechanism: QEMU's
+  `qemu_plugin_spec_mode_begin()` path forces `CF_MEMI_ONLY` on
+  speculative TBs, which silently suppresses
+  `qemu_plugin_register_vcpu_insn_exec_cb()` registration, so the
+  CP per-insn callback never fires for WP fragments.  Instead, the
+  plugin captures a *wide* snapshot of the entire vCPU register
+  file before each `cpu_plugin_exec_tb()` call in the WP loop, and
+  attributes the captured values to the per-insn slots of the
+  just-translated fragment template.  Because spec mode also
+  forces `CF_SINGLE_STEP|1` (one guest insn per fragment), this is
+  semantically equivalent to a per-insn pre-execution snapshot.
+* If the runtime register name is empty or unresolvable on the
+  target, the writer emits a zero snap (`size_code=0`, `delta_lo=0`)
+  which leaves the state slot unchanged.  Such cases are also
+  logged to `unknown_regs.log` next to the trace.
+* Hardware registers wider than 16 B (e.g. 32 B AVX, 64 B AVX-512)
+  are truncated to their low 16 B and emitted with `size_code=2`.
+
+### Validator usage
+
+The validator recovers per-memop base/index values by walking the
+template's §6 per-operand metadata to map an operand to its
+`src_regs[r]` slot, then looking up the corresponding §5.2 snap by
+position.  Effective-address recompute uses the displacement and
+scale from §6 (not §5.2).
 
 ---
 

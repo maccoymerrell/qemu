@@ -9,6 +9,17 @@
 
 #include <capstone/x86.h>
 
+static unsigned int cap_mode_x86(const char *target_name)
+{
+    (void)target_name;
+    /*
+     * The Capstone decode of i386 instructions in 64-bit mode covers
+     * the same encodings; we don't currently distinguish 32-vs-64-bit
+     * instruction streams here.
+     */
+    return QEMU_PLUGIN_CAP_MODE_64;
+}
+
 /* X86: 191/245 classified, 54 REG_NONE */
 static const RegClassification x86_reg_class[X86_REG_ENDING] = {
     [X86_REG_AH] = { REG_GPR0 },  /* ah */

@@ -9,6 +9,59 @@
 
 #include <capstone/riscv.h>
 
+static unsigned int cap_mode_riscv(const char *target_name)
+{
+    unsigned int mode = g_str_has_prefix(target_name, "riscv32")
+                      ? QEMU_PLUGIN_CAP_MODE_RISCV32
+                      : QEMU_PLUGIN_CAP_MODE_RISCV64;
+    /* RVC is on by default for both base widths in our build. */
+    return mode | QEMU_PLUGIN_CAP_MODE_RISCVC;
+}
+
+/*
+ * Refiner: disambiguate JALR / C.JR forms.
+ *
+ * Capstone returns the same insn_id for every JALR variant
+ * (RISCV_INS_JALR) and the same id for every C.JR
+ * (RISCV_INS_C_JR), so the table cannot tell them apart on its
+ * own.  The encoding distinguishes:
+ *   jalr rd, rs1, imm  rd != x0   -> indirect CALL  (link in rd)
+ *   jalr x0, x1, 0     ("ret")    -> RETURN
+ *   jalr x0, rs1, imm  rs1 != x1  -> indirect JUMP
+ *   c.jr ra                       -> RETURN
+ *   c.jr <other>                  -> indirect JUMP  (table default)
+ *
+ * The generic decoder strips x0 as REG_NONE, so the rd==x0 case
+ * shows up here as n_dst_regs == 0.  rs1 == x1 shows up as REG_LR
+ * in src_regs.  Any "ret" pseudo Capstone emits with no operands
+ * is treated as RETURN.
+ */
+static void refine_riscv_indirect_jr(
+    const struct qemu_plugin_insn_info *info, InsnFields *f)
+{
+    (void)info;
+    if (f->n_dst_regs != 0) {
+        return; /* keep table default (indirect CALL) */
+    }
+
+    bool src_is_lr = false;
+    for (uint8_t i = 0; i < f->n_src_regs; i++) {
+        if (f->src_regs[i] == REG_LR) {
+            src_is_lr = true;
+            break;
+        }
+    }
+
+    if (src_is_lr || f->n_src_regs == 0) {
+        f->opcode = GEN_OP_RET;
+        f->branch_type = BRANCH_RETURN;
+    } else {
+        f->opcode = GEN_OP_BRANCH;
+        f->branch_type = BRANCH_INDIRECT_JUMP;
+    }
+    f->branch_conditional = false;
+}
+
 /* RISCV: 95/96 classified, 1 REG_NONE */
 static const RegClassification riscv_reg_class[RISCV_REG_ENDING] = {
     [RISCV_REG_X1] = { REG_LR },  /* ra */
@@ -130,7 +183,17 @@ static const InsnClassification riscv_insn_class[RISCV_INS_ENDING] = {
     [RISCV_INS_FENCE_I]             = { GEN_OP_FENCE,     BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_FENCE_TSO]           = { GEN_OP_FENCE,     BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_JAL]                 = { GEN_OP_CALL,      BRANCH_DIRECT_CALL,   MF_NONE },
-    [RISCV_INS_JALR]                = { GEN_OP_CALL,      BRANCH_INDIRECT_CALL, MF_NONE },
+    /*
+     * JALR encodes three distinct semantics depending on rd/rs1:
+     *   rd != x0                  : indirect CALL (link saved in rd)
+     *   rd == x0, rs1 == x1, imm 0: RETURN ("ret" pseudo)
+     *   rd == x0, rs1 != x1       : indirect JUMP
+     * Capstone gives all three the same insn_id, so the table
+     * default here is the most common case (indirect call); the
+     * rd==x0 forms are reclassified by refine_riscv_indirect_jr.
+     */
+    [RISCV_INS_JALR]                = { GEN_OP_CALL,      BRANCH_INDIRECT_CALL, MF_NONE,
+                                        .refine = refine_riscv_indirect_jr },
     [RISCV_INS_LB]                  = { GEN_OP_LOAD,      BRANCH_NONE,          MF_NONE },
     [RISCV_INS_LBU]                 = { GEN_OP_LOAD,      BRANCH_NONE,          MF_NONE },
     [RISCV_INS_LD]                  = { GEN_OP_LOAD,      BRANCH_NONE,          MF_NONE },
@@ -368,7 +431,13 @@ static const InsnClassification riscv_insn_class[RISCV_INS_ENDING] = {
     [RISCV_INS_C_J]                 = { GEN_OP_BRANCH,    BRANCH_DIRECT_JUMP,   MF_NONE },
     [RISCV_INS_C_JAL]               = { GEN_OP_CALL,      BRANCH_DIRECT_CALL,   MF_NONE },
     [RISCV_INS_C_JALR]              = { GEN_OP_CALL,      BRANCH_INDIRECT_CALL, MF_NONE },
-    [RISCV_INS_C_JR]                = { GEN_OP_BRANCH,    BRANCH_INDIRECT_JUMP, MF_NONE },
+    /*
+     * C.JR rs1 is RETURN when rs1 == x1 (ra) and indirect JUMP
+     * otherwise; both share the same insn_id, so the rs1==x1 case is
+     * promoted to BRANCH_RETURN in decode_detail_to_generic().
+     */
+    [RISCV_INS_C_JR]                = { GEN_OP_BRANCH,    BRANCH_INDIRECT_JUMP, MF_NONE,
+                                        .refine = refine_riscv_indirect_jr },
     [RISCV_INS_C_LD]                = { GEN_OP_LOAD,      BRANCH_NONE,          MF_NONE },
     [RISCV_INS_C_LDSP]              = { GEN_OP_LOAD,      BRANCH_NONE,          MF_NONE },
     [RISCV_INS_C_LI]                = { GEN_OP_MOV,       BRANCH_NONE,          MF_NONE },

@@ -389,6 +389,60 @@ def _read_mem_data_values(br: ByteReader, params: list[DynParam]) -> None:
         dp.data_hi = hi
 
 
+_REG_NONE = 0
+
+
+def _read_reg_data_section(
+    br: "ByteReader",
+    cp_tmpl: dict | None,
+    state_lo: list[int],
+    state_hi: list[int],
+) -> list[dict]:
+    """Read \u00a75.2 reg-data section: per-insn src then dst snapshots,
+    each {size_code:u8, delta_lo:SLEB, [delta_hi:SLEB if 16B]}.
+
+    Updates `state_lo`/`state_hi` (indexed by GenericRegId 0..255) so
+    subsequent entries can recover absolute values.  Returns a list
+    of {"insn_index", "kind"("src"|"dst"), "operand_index",
+    "reg_id", "size_code", "lo", "hi"} dicts in stream order.
+    """
+    snaps: list[dict] = []
+    if cp_tmpl is None:
+        return snaps
+    insns = cp_tmpl.get("insns", [])
+    for i, insn in enumerate(insns):
+        for kind, regs in (("src", insn.get("src_regs", [])),
+                           ("dst", insn.get("dst_regs", []))):
+            for op_i, reg_id in enumerate(regs):
+                code = br.u8()
+                if code > 2:
+                    raise ValueError(f"bad reg-data size_code: {code}")
+                delta_lo = br.sleb()
+                if reg_id != _REG_NONE:
+                    state_lo[reg_id] = (state_lo[reg_id] + delta_lo) & ((1 << 64) - 1)
+                    lo = state_lo[reg_id]
+                else:
+                    lo = delta_lo & ((1 << 64) - 1)
+                hi = 0
+                if code == 2:
+                    delta_hi = br.sleb()
+                    if reg_id != _REG_NONE:
+                        state_hi[reg_id] = (state_hi[reg_id] + delta_hi) & ((1 << 64) - 1)
+                        hi = state_hi[reg_id]
+                    else:
+                        hi = delta_hi & ((1 << 64) - 1)
+                snaps.append({
+                    "insn_index": i,
+                    "kind": kind,
+                    "operand_index": op_i,
+                    "reg_id": reg_id,
+                    "size_code": code,
+                    "lo": lo,
+                    "hi": hi,
+                })
+    return snaps
+
+
 def decode_champsim_tracer(bin_path: Path
                            ) -> tuple[dict, list[dict], list[dict]]:
     """Decode a v1.2 trace file.  Returns (meta, templates, entries).
@@ -426,6 +480,7 @@ def decode_champsim_tracer(bin_path: Path
     thread_id    = br.uleb()
 
     has_mem_data = bool(flags & CST_FLAG_MEM_DATA)
+    has_reg_data = bool(flags & CST_FLAG_REG_DATA)
 
     # --- Read templates first (always present since v1.1) ---
     templates: list[dict] = []
@@ -446,6 +501,10 @@ def decode_champsim_tracer(bin_path: Path
     prev_entry_template = 0
     cp_dyn_state: dict[int, list[DynParam]] = {}
     wp_dyn_state: dict[int, list[DynParam]] = {}
+    # Per-GenericRegId last-value state for \u00a75.2 reg-data SLEB deltas
+    # (CP only in v1).  Indexed 0..255; reset to zero at body start.
+    cp_reg_state_lo: list[int] = [0] * 256
+    cp_reg_state_hi: list[int] = [0] * 256
     footer_num_entries: int | None = None
 
     while True:
@@ -487,11 +546,23 @@ def decode_champsim_tracer(bin_path: Path
             mdb = body.sub()
             _read_mem_data_values(mdb, cp_dyn)
 
+        # CP reg_data sub-section
+        cp_reg_snaps: list[dict] = []
+        if has_reg_data:
+            rdb = body.sub()
+            cp_reg_snaps = _read_reg_data_section(
+                rdb, cp_tmpl, cp_reg_state_lo, cp_reg_state_hi)
+
         # WP chain sub-section
         wp_entries: list[dict] = []
         wpb = body.sub()
         num_wp = wpb.uleb()
         prev_wp_tmpl = 0
+        # Seed WP reg-state from the current CP reg-state.  Wrong-path
+        # execution begins at the CP architectural state and is rolled
+        # back at chain end, so cross-chain accumulation would be wrong.
+        wp_reg_state_lo = list(cp_reg_state_lo)
+        wp_reg_state_hi = list(cp_reg_state_hi)
         for w in range(num_wp):
             wp_tmpl = prev_wp_tmpl + wpb.sleb()
             prev_wp_tmpl = wp_tmpl
@@ -521,10 +592,18 @@ def decode_champsim_tracer(bin_path: Path
                 wmdb = wpb.sub()
                 _read_mem_data_values(wmdb, wp_dyn)
 
+            if has_reg_data:
+                wrdb = wpb.sub()
+                wp_reg_snaps = _read_reg_data_section(
+                    wrdb, wp_tmpl_dict, wp_reg_state_lo, wp_reg_state_hi)
+            else:
+                wp_reg_snaps = []
+
             wp_entries.append({
                 "index": w,
                 "template_id": wp_tmpl,
                 "dyn_params": wp_dyn,
+                "reg_snaps": wp_reg_snaps,
                 "fault": False,
                 "translation_unavailable": False,
                 "fault_insn_index": None,
@@ -554,6 +633,7 @@ def decode_champsim_tracer(bin_path: Path
             "seq_num": len(entries) + 1,
             "template_id": entry_tmpl,
             "dyn_params": cp_dyn,
+            "reg_snaps": cp_reg_snaps,
             "wp_entries": wp_entries,
         })
 
@@ -572,6 +652,7 @@ def decode_champsim_tracer(bin_path: Path
         "datetime": datetime_str,
         "comment": comment,
         "has_mem_data": has_mem_data,
+        "has_reg_data": has_reg_data,
         "thread_id": thread_id,
         "templates_off": templates_off,
         "templates_count": templates_count,

@@ -2716,6 +2716,443 @@ asm_probe_block(
 )
 
 
+# ===========================================================================
+# Coverage-completion probes
+#
+# The probes above predate this section and were added incrementally as
+# specific opcodes were noticed missing.  Everything below is the result
+# of a per-ISA audit against the GenericOpcode classifications in
+# `champsim_tracer_mnemonics_<isa>.h`: for every classification that is
+# reachable on a given ISA, there is at least one probe block that emits
+# an instruction guaranteed to receive that classification.  Combined
+# with the `--coverage` mode (see generator.py), this gives 100% generic
+# opcode coverage per ISA.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# x86_64 — completion
+# ---------------------------------------------------------------------------
+
+asm_probe_block(
+    name="probe_x86_mov",
+    per_isa={
+        "x86_64": {
+            # Plain register-to-register MOV, classified as GEN_OP_MOV
+            # (distinct from MOVSX/MOVZX/CMOV/etc.).
+            "asm":      '"mov %%rbx, %%rax"',
+            "clobbers": '"rax"',
+            "opcodes":  ["MOV"],
+        },
+    },
+)
+
+
+# ---------------------------------------------------------------------------
+# aarch64 — completion
+# ---------------------------------------------------------------------------
+
+asm_probe_block(
+    name="probe_arm_mov_not_neg",
+    per_isa={
+        "aarch64": {
+            # MOV xn, xm                 → GEN_OP_MOV
+            # MVN xn, xm                 → GEN_OP_NOT
+            # NEG xn, xm                 → GEN_OP_NEG
+            "asm":      (
+                '"mov x0, x1\\n\\t"\n'
+                '    "mvn x2, x3\\n\\t"\n'
+                '    "neg x4, x5"'
+            ),
+            "clobbers": '"x0","x2","x4"',
+            "opcodes":  ["MOV", "NOT", "NEG"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_cmp_test",
+    per_isa={
+        "aarch64": {
+            # CMP xn, xm  (alias of SUBS xzr, xn, xm) → GEN_OP_CMP
+            # TST xn, xm  (alias of ANDS xzr, xn, xm) → GEN_OP_TEST
+            "asm":      (
+                '"cmp x0, x1\\n\\t"\n'
+                '    "tst x2, x3"'
+            ),
+            "clobbers": '"cc"',
+            "opcodes":  ["CMP", "TEST"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_cmov_setcc",
+    per_isa={
+        "aarch64": {
+            # CSEL xd, xn, xm, cond  → GEN_OP_CMOV
+            # CSET xd, cond          → GEN_OP_SETCC
+            # CSINC xd, xn, xm, cond → GEN_OP_CMOV (covers a second CMOV id)
+            "asm":      (
+                '"cmp x0, x1\\n\\t"\n'
+                '    "csel x2, x3, x4, eq\\n\\t"\n'
+                '    "cset x5, ne\\n\\t"\n'
+                '    "csinc x6, x7, x0, gt"'
+            ),
+            "clobbers": '"x2","x5","x6","cc"',
+            "opcodes":  ["CMOV", "SETCC"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_fence",
+    per_isa={
+        "aarch64": {
+            # DMB / DSB / ISB all → GEN_OP_FENCE.  Use ISH domain (the
+            # smallest legal "real" barrier) for DMB/DSB.
+            "asm":      (
+                '"dmb ish\\n\\t"\n'
+                '    "dsb ish\\n\\t"\n'
+                '    "isb"'
+            ),
+            "clobbers": '"memory"',
+            "opcodes":  ["FENCE"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_lea",
+    per_isa={
+        "aarch64": {
+            # ADR xd, label  → GEN_OP_LEA (PC-relative address calc).
+            # ADRP loads the page address; ADR loads byte address.
+            # The `1:` label sits just before the asm body so ADR's
+            # +/-1MiB range is trivially satisfied.
+            "asm":      (
+                '"1:\\n\\t"\n'
+                '    "adr  x0, 1b\\n\\t"\n'
+                '    "adrp x1, 1b"'
+            ),
+            "clobbers": '"x0","x1"',
+            "opcodes":  ["LEA"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_xchg",
+    per_isa={
+        "aarch64": {
+            # SWP rs, rt, [rn]  → GEN_OP_XCHG (LSE atomic).  Requires
+            # ARMv8.1-A LSE; switch the assembler arch locally so the
+            # default v8.0-a baseline binary still assembles.  Operates
+            # on a stack slot to avoid touching the arena.
+            "asm":      (
+                '".arch armv8.1-a\\n\\t"\n'
+                '    "sub sp, sp, #16\\n\\t"\n'
+                '    "mov x0, sp\\n\\t"\n'
+                '    "mov x1, #0\\n\\t"\n'
+                '    "swp x2, x1, [x0]\\n\\t"\n'
+                '    "add sp, sp, #16\\n\\t"\n'
+                '    ".arch armv8-a"'
+            ),
+            "clobbers": '"x0","x1","x2","memory"',
+            "opcodes":  ["XCHG"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_rotate",
+    per_isa={
+        "aarch64": {
+            # ROR xd, xn, #imm           → GEN_OP_ROR
+            # EXTR xd, xn, xm, #imm      → GEN_OP_ROR (funnel-shift,
+            #                              implements rotate when xn==xm)
+            "asm":      (
+                '"ror  x0, x1, #5\\n\\t"\n'
+                '    "extr x2, x3, x3, #7"'
+            ),
+            "clobbers": '"x0","x2"',
+            "opcodes":  ["ROR"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_vec_mov",
+    per_isa={
+        "aarch64": {
+            # DUP / INS / MOVI all → GEN_OP_VEC_MOV.  The plain `mov`
+            # vector form (`mov v0.16b, v1.16b`) is an alias for ORR and
+            # classifies as GEN_OP_VEC_LOGIC, so we use the explicit
+            # broadcast/insert/immediate-move forms instead.
+            "asm":      (
+                '"dup  v0.16b, w1\\n\\t"\n'
+                '    "ins  v2.b[0], w3\\n\\t"\n'
+                '    "movi v4.16b, #0xAA"'
+            ),
+            "clobbers": '"v0","v2","v4"',
+            "opcodes":  ["VEC_MOV"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_vec_shuf",
+    per_isa={
+        "aarch64": {
+            # ZIP1 / UZP1 / TRN1 / EXT / TBL all → GEN_OP_VEC_SHUF.
+            "asm":      (
+                '"zip1 v0.16b, v1.16b, v2.16b\\n\\t"\n'
+                '    "uzp1 v3.16b, v4.16b, v5.16b\\n\\t"\n'
+                '    "trn1 v6.16b, v7.16b, v1.16b\\n\\t"\n'
+                '    "ext  v0.16b, v1.16b, v2.16b, #4\\n\\t"\n'
+                '    "tbl  v3.16b, {v4.16b}, v5.16b"'
+            ),
+            "clobbers": '"v0","v3","v6"',
+            "opcodes":  ["VEC_SHUF"],
+        },
+    },
+)
+
+
+# ---------------------------------------------------------------------------
+# riscv64 — completion
+# ---------------------------------------------------------------------------
+
+asm_probe_block(
+    name="probe_rv_mov",
+    per_isa={
+        "riscv64": {
+            # `mv rd, rs` is an assembler alias for `addi rd, rs, 0`.
+            # Capstone exposes a dedicated RISCV_INS_MV id for it,
+            # which the mnemonic table maps to GEN_OP_MOV (not
+            # GEN_OP_INT_ADD).  Asserting MOV documents the
+            # alias-vs-canonical-form distinction explicitly.
+            "asm":      '"mv t0, t1"',
+            "clobbers": '"t0"',
+            "opcodes":  ["MOV"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_rv_lea",
+    per_isa={
+        "riscv64": {
+            # AUIPC rd, imm  → GEN_OP_LEA (PC-relative address calc).
+            "asm":      '"auipc t0, 1"',
+            "clobbers": '"t0"',
+            "opcodes":  ["LEA"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_rv_fence",
+    per_isa={
+        "riscv64": {
+            # FENCE rw, rw → GEN_OP_FENCE.  FENCE.I requires the Zifencei
+            # extension which rv64gc includes; it's not strictly needed
+            # for opcode coverage here, so we stick with plain FENCE.
+            "asm":      '"fence rw, rw"',
+            "clobbers": '"memory"',
+            "opcodes":  ["FENCE"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_rv_xchg",
+    per_isa={
+        "riscv64": {
+            # AMOSWAP.D rd, rs2, (rs1) → GEN_OP_XCHG.  Targets a fresh
+            # stack slot so we do not perturb the arena.  rv64gc
+            # includes the A extension so amoswap is always available.
+            "asm":      (
+                '"addi sp, sp, -16\\n\\t"\n'
+                '    "li t1, 0xCAFE\\n\\t"\n'
+                '    "amoswap.d t0, t1, (sp)\\n\\t"\n'
+                '    "addi sp, sp, 16"'
+            ),
+            "clobbers": '"t0","t1","memory"',
+            "opcodes":  ["XCHG"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_rv_cmp",
+    per_isa={
+        "riscv64": {
+            # SLT / SLTU / SLTI all → GEN_OP_CMP in the riscv mnemonic
+            # table (RISC-V has no dedicated compare instruction; the
+            # set-less-than family fills that role).
+            "asm":      (
+                '"slt   t0, t1, t2\\n\\t"\n'
+                '    "sltu  t3, t4, t5\\n\\t"\n'
+                '    "slti  a0, a1, 5"'
+            ),
+            "clobbers": '"t0","t3","a0"',
+            "opcodes":  ["CMP"],
+        },
+    },
+)
+
+
+# ---------------------------------------------------------------------------
+# mipsel — completion
+# ---------------------------------------------------------------------------
+
+asm_probe_block(
+    name="probe_mips_mov",
+    per_isa={
+        "mipsel": {
+            # MIPS has no dedicated reg-to-reg MOV instruction; the
+            # canonical idiom is `move $rd, $rs` which is an alias for
+            # `addu $rd, $zero, $rs`.  Capstone reports it as
+            # MIPS_INS_MOVE which the mnemonic table maps to GEN_OP_MOV.
+            "asm":      '"move $t0, $t1"',
+            "clobbers": '"$t0"',
+            "opcodes":  ["MOV"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_mips_neg_not",
+    per_isa={
+        "mipsel": {
+            # NEGU is an alias for SUBU rd, $zero, rs → MIPS_INS_NEGU
+            #   → GEN_OP_NEG (per the mnemonic table; if that id is
+            #     unmapped on this Capstone build it will fall back to
+            #     SUBU/INT_SUB and the assertion below will flag it).
+            # NOT  is an alias for NOR  rd, $zero, rs → MIPS_INS_NOT
+            #   → GEN_OP_NOT.
+            "asm":      (
+                '"negu $t0, $t1\\n\\t"\n'
+                '    "not  $t2, $t3"'
+            ),
+            "clobbers": '"$t0","$t2"',
+            "opcodes":  ["NEG", "NOT"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_mips_cmov",
+    per_isa={
+        "mipsel": {
+            # MOVZ / MOVN → GEN_OP_CMOV.  Set $t1=0 first so MOVZ takes
+            # the move side without disturbing observable state.
+            "asm":      (
+                '"li   $t1, 0\\n\\t"\n'
+                '    "movz $t0, $t2, $t1\\n\\t"\n'
+                '    "movn $t3, $t4, $t5"'
+            ),
+            "clobbers": '"$t0","$t1","$t3"',
+            "opcodes":  ["CMOV"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_mips_rotate",
+    per_isa={
+        "mipsel": {
+            # ROTR / ROTRV → GEN_OP_ROR (MIPS32r2+).  No left-rotate;
+            # MIPS doesn't define one as a separate insn id.
+            "asm":      (
+                '"rotr  $t0, $t1, 5\\n\\t"\n'
+                '    "rotrv $t2, $t3, $t4"'
+            ),
+            "clobbers": '"$t0","$t2"',
+            "opcodes":  ["ROR"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_mips_fence",
+    per_isa={
+        "mipsel": {
+            # SYNC → GEN_OP_FENCE.
+            "asm":      '"sync"',
+            "clobbers": '"memory"',
+            "opcodes":  ["FENCE"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_mips_cmp",
+    per_isa={
+        "mipsel": {
+            # SLT / SLTU / SLTI → GEN_OP_CMP (same rationale as RISC-V).
+            "asm":      (
+                '"slt   $t0, $t1, $t2\\n\\t"\n'
+                '    "sltu  $t3, $t4, $t5\\n\\t"\n'
+                '    "slti  $t6, $t7, 5"'
+            ),
+            "clobbers": '"$t0","$t3","$t6"',
+            "opcodes":  ["CMP"],
+        },
+    },
+)
+
+# probe_mips_lea: intentionally omitted.
+#
+# GenericOpcode LEA on MIPS is reachable only via the MIPS32r6/MIPS64r6
+# AUIPC / ADDIUPC / ALUIPC instructions.  The default `mipsel-linux-gnu`
+# toolchain targets mips32r2 (pre-r6), where these mnemonics do not
+# assemble, so LEA is genuinely unreachable in this configuration.
+# `lui` is the natural MIPS32r2 "address-builder upper-half" instruction
+# but the mnemonic table classifies it as GEN_OP_MOV (covered by
+# probe_mips_mov).  Promoting the build target to mips32r6 would unlock
+# a LEA probe but breaks ABI compatibility with the qemu-user mipsel
+# binary, so we accept this gap on this ISA.
+
+
+# ===========================================================================
+# Coverage probe registry
+#
+# `coverage_probes_for_isa(isa)` returns the list of registered probe
+# block class names whose `supported_isas` includes `isa`.  The
+# generator's `--coverage` mode uses this to ensure every probe gets
+# scheduled at least once into the CFG.
+# ===========================================================================
+
+def coverage_probes_for_isa(isa: str) -> list[str]:
+    """Return the names of every probe-style block (asm-only, zero
+    memops, single successor) that supports `isa`.  Used by the
+    generator's coverage mode to guarantee one of each runs.
+
+    In addition to the auto-registered AsmProbe subclasses, we include
+    a hand-picked set of "essential coverage" CodeBlocks whose
+    classifications cannot be reproduced by inline-asm probes alone
+    (e.g. CALL/RET, INDIRECT_CALL, INDIRECT_JUMP), so a single
+    coverage trace also exercises those branch types.
+    """
+    out: list[str] = []
+    for name, cls in _REGISTRY.items():
+        # Probes are the auto-registered AsmProbe subclasses.  We
+        # recognise them structurally rather than by name pattern so a
+        # later rename of any probe doesn't silently exclude it.
+        if cls.__name__.startswith("AsmProbe_") and isa in cls.supported_isas:
+            out.append(name)
+
+    # Hand-picked CALL/RET/indirect-branch coverage.  These rely on the
+    # compiler so they live as full CodeBlocks, not asm probes.
+    extras = ["direct_call", "indirect_call", "indirect_jump"]
+    for nm in extras:
+        cls = _REGISTRY.get(nm)
+        if cls is not None and isa in cls.supported_isas and nm not in out:
+            out.append(nm)
+    return sorted(out)
+
+
 # ---------------------------------------------------------------------------
 # File-scope helpers that must appear before `run()` in generated C++.
 # The generator calls `collect_preamble_helpers(isa)` and splices the

@@ -63,7 +63,8 @@ class CFG:
 
 def _build_diamond_cfg(seed: int, num_diamonds: int,
                        side_len_range: tuple[int, int],
-                       isa: str = "x86_64") -> CFG:
+                       isa: str = "x86_64",
+                       coverage: bool = False) -> CFG:
     """Build a chain of `num_diamonds` diamonds plus entry and exit.
 
     Block layout inside each diamond:
@@ -71,6 +72,12 @@ def _build_diamond_cfg(seed: int, num_diamonds: int,
       T_0..T_{k-1}   (straight-line, various classes)
       F_0..F_{l-1}   (straight-line, various classes)
       join   (straight-line)
+
+    When `coverage=True`, every registered probe block that supports
+    `isa` is inserted as a straight-line node between the entry block
+    and the first diamond.  This guarantees that one trace exercises
+    100 % of the generic-opcode classifications reachable on `isa`,
+    independent of how the diamond RNG happens to pick blocks.
     """
     r = random.Random(hashlib.sha256(f"{seed}:cfg".encode()).digest())
 
@@ -94,6 +101,16 @@ def _build_diamond_cfg(seed: int, num_diamonds: int,
     entry_id = add(r.choice(straight_menu).name)
 
     prev_join = entry_id
+
+    # Coverage chain (optional): one of every probe, in registry order.
+    # We only insert names that are not already the entry block's class
+    # to avoid back-to-back duplicate blocks (harmless but noisy).
+    if coverage:
+        probes = B.coverage_probes_for_isa(isa)
+        for pname in probes:
+            new_id = add(pname)
+            nodes[prev_join].successors = [new_id]
+            prev_join = new_id
 
     for _ in range(num_diamonds):
         root_id = add(B.CondBranch.name)
@@ -454,6 +471,7 @@ class GenerateParams:
     num_diamonds: int = 8
     side_len_min: int = 2
     side_len_max: int = 4
+    coverage: bool = False
 
 
 def generate(params: GenerateParams, out_dir: Path, prog_name: str
@@ -468,6 +486,7 @@ def generate(params: GenerateParams, out_dir: Path, prog_name: str
         params.seed, params.num_diamonds,
         (params.side_len_min, params.side_len_max),
         isa=params.isa,
+        coverage=params.coverage,
     )
     arena_u64 = _assign_slots(cfg)
     plans, init_values = _plan_nodes(cfg, params.seed, params.isa)

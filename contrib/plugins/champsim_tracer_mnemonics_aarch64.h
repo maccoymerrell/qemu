@@ -9,6 +9,12 @@
 
 #include <capstone/arm64.h>
 
+static unsigned int cap_mode_aarch64(const char *target_name)
+{
+    (void)target_name;
+    return QEMU_PLUGIN_CAP_MODE_LITTLE_ENDIAN;
+}
+
 /* ARM64: 256/341 classified, 85 REG_NONE */
 static const RegClassification arm64_reg_class[ARM64_REG_ENDING] = {
     [ARM64_REG_FP] = { REG_FP_REG },  /* fp */

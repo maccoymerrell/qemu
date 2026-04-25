@@ -144,6 +144,18 @@ struct BodyStreamState {
     int64_t prev_entry_template;
     GHashTable *cp_dyn_state;
     GHashTable *wp_dyn_state;
+    /* Per-GenericRegId last-seen value, for SLEB-delta encoding of
+     * the §5.2 reg-data section.  Indexed 0..255; REG_NONE (0) is
+     * unused.  Reset to zero at body_stream_new. */
+    int64_t cp_reg_state_lo[256];
+    int64_t cp_reg_state_hi[256];
+    /* Same, but for the WP sub-section.  Re-seeded from cp state at
+     * the start of each CP entry's WP chain (since wrong-path
+     * execution begins from the CP register state and is rolled back
+     * when the chain ends, so cross-WP-chain accumulation would be
+     * incorrect). */
+    int64_t wp_reg_state_lo[256];
+    int64_t wp_reg_state_hi[256];
     uint64_t num_entries;
     uint32_t thread_id;
     uint64_t body_off;
@@ -480,6 +492,97 @@ static void emit_mem_data_section(BitWriter *main_bw, const GArray *dyn_params)
     bw_write_section(main_bw, bw_finish_buf(&sub));
 }
 
+/* ========================= Reg-data values =========================
+ *
+ * Emit per-instruction src then dst register snapshots.  Each snap:
+ *   u8 size_code   (0=4B, 1=8B, 2=16B)
+ *   SLEB128 delta_lo  (snap.lo - state[reg_id].lo)
+ *   SLEB128 delta_hi  (only when size_code==2)
+ *
+ * Per-reg-id state is carried across entries on BodyStreamState so
+ * static / loop-invariant register values cost a single 0-byte SLEB
+ * after the first capture.  REG_NONE (id 0) is skipped entirely.
+ *
+ * Snap ordering inside reg_snaps mirrors the template walk:
+ *   for each insn i in template:
+ *     for r in 0..n_src_regs[i]: one snap
+ *     for r in 0..n_dst_regs[i]: one snap
+ */
+
+static void write_one_reg_snap(BitWriter *bw,
+                               const RegSnap *s,
+                               uint8_t reg_id,
+                               int64_t *state_lo,
+                               int64_t *state_hi)
+{
+    bw_write_u8(bw, s->size_code);
+    if (reg_id == REG_NONE) {
+        /* No state slot; emit raw value as zero-baseline delta. */
+        bw_write_sleb128(bw, (int64_t)s->lo);
+        if (s->size_code == 2) {
+            bw_write_sleb128(bw, (int64_t)s->hi);
+        }
+        return;
+    }
+    int64_t cur_lo = (int64_t)s->lo;
+    int64_t delta_lo = cur_lo - state_lo[reg_id];
+    bw_write_sleb128(bw, delta_lo);
+    state_lo[reg_id] = cur_lo;
+    if (s->size_code == 2) {
+        int64_t cur_hi = (int64_t)s->hi;
+        int64_t delta_hi = cur_hi - state_hi[reg_id];
+        bw_write_sleb128(bw, delta_hi);
+        state_hi[reg_id] = cur_hi;
+    }
+}
+
+static void emit_reg_data_section(BitWriter *main_bw,
+                                  int64_t *state_lo,
+                                  int64_t *state_hi,
+                                  const BBTemplate *tmpl,
+                                  const GArray *reg_snaps)
+{
+    BitWriter sub;
+    bw_init_buf(&sub);
+
+    if (tmpl) {
+        /*
+         * Always emit one snap per template src/dst slot.  If the
+         * captured `reg_snaps` array is short — e.g. because a
+         * per-insn callback didn't fire for some reason — pad missing
+         * entries with a zero-baseline 4B snap (size_code=0,
+         * delta_lo=0) so the decoder's per-reg-id state stays
+         * unchanged.  Otherwise the decoder would read fewer bytes
+         * than we wrote (or vice versa) and lose stream sync.
+         */
+        const RegSnap zero_snap = { 0, 0, 0 };
+        guint pos = 0;
+        guint avail = reg_snaps ? reg_snaps->len : 0;
+        for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+            const InsnFields *f = &tmpl->insn_fields[i];
+            for (uint8_t r = 0; r < f->n_src_regs; r++) {
+                const RegSnap *s = (pos < avail)
+                    ? &g_array_index(reg_snaps, RegSnap, pos)
+                    : &zero_snap;
+                pos++;
+                write_one_reg_snap(&sub, s, f->src_regs[r],
+                                   state_lo, state_hi);
+            }
+            for (uint8_t r = 0; r < f->n_dst_regs; r++) {
+                const RegSnap *s = (pos < avail)
+                    ? &g_array_index(reg_snaps, RegSnap, pos)
+                    : &zero_snap;
+                pos++;
+                write_one_reg_snap(&sub, s, f->dst_regs[r],
+                                   state_lo, state_hi);
+            }
+        }
+    }
+
+    bw_byte_align(&sub);
+    bw_write_section(main_bw, bw_finish_buf(&sub));
+}
+
 /* ========================= Body stream ========================= */
 
 BodyStreamState *body_stream_new(FILE *f, uint32_t thread_id,
@@ -495,6 +598,9 @@ BodyStreamState *body_stream_new(FILE *f, uint32_t thread_id,
     uint8_t flags = 0;
     if (enable_mem_data) {
         flags |= CST_FLAG_MEM_DATA;
+    }
+    if (enable_reg_data) {
+        flags |= CST_FLAG_REG_DATA;
     }
     bw_write_u8(&st->bw, flags);
 
@@ -647,6 +753,11 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
     if (enable_mem_data) {
         emit_mem_data_section(&st->bw, entry->dyn_params);
     }
+    if (enable_reg_data) {
+        emit_reg_data_section(&st->bw,
+                              st->cp_reg_state_lo, st->cp_reg_state_hi,
+                              entry->tmpl, entry->reg_snaps);
+    }
 
     /* WP chain sub-section */
     {
@@ -654,6 +765,15 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
         bw_init_buf(&sub);
         bw_write_uleb128(&sub, num_wp);
         int64_t prev_wp_tid = 0;
+        if (enable_reg_data) {
+            /* Seed WP reg-state from CP reg-state: WP execution starts
+             * from the CP architectural state and is rolled back at
+             * the end of the chain. */
+            memcpy(st->wp_reg_state_lo, st->cp_reg_state_lo,
+                   sizeof(st->wp_reg_state_lo));
+            memcpy(st->wp_reg_state_hi, st->cp_reg_state_hi,
+                   sizeof(st->wp_reg_state_hi));
+        }
         for (uint32_t w = 0; w < num_wp; w++) {
             const WPBBEntry *wp = &g_array_index(entry->wp_entries,
                                                  WPBBEntry, w);
@@ -665,6 +785,12 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
                                        wp->dyn_params, true);
             if (enable_mem_data) {
                 emit_mem_data_section(&sub, wp->dyn_params);
+            }
+            if (enable_reg_data) {
+                emit_reg_data_section(&sub,
+                                      st->wp_reg_state_lo,
+                                      st->wp_reg_state_hi,
+                                      wp->tmpl, wp->reg_snaps);
             }
         }
         bw_byte_align(&sub);

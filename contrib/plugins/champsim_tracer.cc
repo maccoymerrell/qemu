@@ -45,6 +45,7 @@ GMutex unknown_warn_lock;
 char *qemu_command_line = NULL;
 char *trace_comment = NULL;
 bool enable_mem_data = false;
+bool enable_reg_data = false;
 
 /* ========================= Thread ID assignment ========================= */
 
@@ -100,6 +101,172 @@ unsigned active_reg_table_size;
 static GHashTable *option_ht;
 uint64_t stat_unknown_insn_warnings;
 
+/*
+ * Per-vCPU register-name -> qemu_plugin_register* map, populated
+ * lazily from qemu_plugin_get_registers() the first time a given
+ * vCPU executes a TB.  Used by the regdata=1 source-register capture
+ * path; ignored when enable_reg_data is false.
+ *
+ * Keys are lowercase strdup'd register names (e.g. "rax", "x0",
+ * "ra", "a0"); values are opaque handles owned by QEMU and stable
+ * for the lifetime of the vCPU.  Indexed by cpu_index; any cpu we
+ * have not seen yet has a NULL entry.
+ */
+static GHashTable **vcpu_reg_handles;     /* GHashTable*[max_cpus] */
+static unsigned       vcpu_reg_handles_n; /* allocated length      */
+static GMutex         vcpu_reg_handles_lock;
+
+static GHashTable *build_reg_name_to_handle(void)
+{
+    GArray *regs = qemu_plugin_get_registers();
+    GHashTable *ht = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                           g_free, NULL);
+    if (regs) {
+        for (guint i = 0; i < regs->len; i++) {
+            const qemu_plugin_reg_descriptor *d =
+                &g_array_index(regs, qemu_plugin_reg_descriptor, i);
+            if (!d->name || !d->handle) {
+                continue;
+            }
+            char *key = g_ascii_strdown(d->name, -1);
+            /* Some ISAs expose multiple aliases; keep the first one. */
+            if (!g_hash_table_contains(ht, key)) {
+                g_hash_table_insert(ht, key, d->handle);
+            } else {
+                g_free(key);
+            }
+        }
+        g_array_free(regs, true);
+    }
+
+    /*
+     * MIPS workaround: target/mips/cpu.c sets gdb_num_core_regs=73 and
+     * provides cc->gdb_read_register, but never registers a GDB
+     * feature (no gdb_core_xml_file, no static gdb-xml/mips*.xml).
+     * qemu_plugin_get_registers() walks cpu->gdb_regs (the feature
+     * list) so it returns 0 entries — even though gdb_read_register
+     * fully supports gpr/sp/ra/pc lookups for any reg < 73.  The
+     * plugin handle is just GINT_TO_POINTER(reg + 1), so we can
+     * synthesize the name -> handle map ourselves using the well-
+     * known MIPS GDB register numbering (see target/mips/gdbstub.c).
+     */
+    if (trace_isa == TRACE_ISA_MIPS && g_hash_table_size(ht) == 0) {
+        static const char *const mips_gpr_aliases[32] = {
+            "zero", "at",  "v0", "v1",
+            "a0",   "a1",  "a2", "a3",
+            "t0",   "t1",  "t2", "t3", "t4", "t5", "t6", "t7",
+            "s0",   "s1",  "s2", "s3", "s4", "s5", "s6", "s7",
+            "t8",   "t9",  "k0", "k1",
+            "gp",   "sp",  "fp", "ra",
+        };
+        auto add = [&](const char *name, int reg_num) {
+            if (!name || !*name) {
+                return;
+            }
+            char *key = g_ascii_strdown(name, -1);
+            gpointer handle = GINT_TO_POINTER(reg_num + 1);
+            if (!g_hash_table_contains(ht, key)) {
+                g_hash_table_insert(ht, key, handle);
+            } else {
+                g_free(key);
+            }
+        };
+        for (int i = 0; i < 32; i++) {
+            add(mips_gpr_aliases[i], i);
+            char dollar[8];
+            g_snprintf(dollar, sizeof(dollar), "$%d", i);
+            add(dollar, i);
+            char rname[8];
+            g_snprintf(rname, sizeof(rname), "r%d", i);
+            add(rname, i);
+        }
+        /* fp ($30) is also called s8 in MIPS calling convention. */
+        add("s8", 30);
+        /* CP0/special regs per target/mips/gdbstub.c. */
+        add("status", 32);
+        add("lo",     33);
+        add("hi",     34);
+        add("badvaddr", 35);
+        add("cause",  36);
+        add("pc",     37);
+    }
+
+    return ht;
+}
+
+static GHashTable *vcpu_get_reg_handles(unsigned int cpu_index)
+{
+    g_mutex_lock(&vcpu_reg_handles_lock);
+    if (cpu_index >= vcpu_reg_handles_n) {
+        unsigned new_n = cpu_index + 1;
+        vcpu_reg_handles = (GHashTable **)g_realloc(
+            vcpu_reg_handles, new_n * sizeof(GHashTable *));
+        for (unsigned i = vcpu_reg_handles_n; i < new_n; i++) {
+            vcpu_reg_handles[i] = NULL;
+        }
+        vcpu_reg_handles_n = new_n;
+    }
+    GHashTable *ht = vcpu_reg_handles[cpu_index];
+    if (!ht) {
+        ht = build_reg_name_to_handle();
+        vcpu_reg_handles[cpu_index] = ht;
+    }
+    g_mutex_unlock(&vcpu_reg_handles_lock);
+    return ht;
+}
+
+static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
+{
+    (void)id;
+    if (!enable_reg_data) {
+        return;
+    }
+    /*
+     * qemu_plugin_get_registers() must be called from a vCPU context,
+     * which vcpu_init_cb provides; pre-populate the map here so the
+     * later exec-callback fast-path is lock-free against new CPUs.
+     *
+     * Some QEMU targets (notably MIPS user-mode) expose no registers
+     * to plugins, so every snap will read back as zero.  Warn once so
+     * downstream tools can recognize that EA recompute will be a
+     * no-op on this target.  We deliberately keep enable_reg_data on
+     * and emit zero-valued snaps: by the time vcpu_init_cb fires the
+     * file header (with the reg-data flag bit) has typically already
+     * been written, so flipping the flag now would leave the on-disk
+     * flag and section presence out of sync.
+     */
+    GHashTable *ht = vcpu_get_reg_handles(cpu_index);
+    if (!ht || g_hash_table_size(ht) == 0) {
+        static bool warned;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr,
+                    "champsim_tracer: regdata=1 requested but target "
+                    "exposes no plugin registers; reg snaps will read "
+                    "back as zero\n");
+        }
+    }
+}
+
+/*
+ * Look up a register handle for @cpu_index by Capstone-style register
+ * name (case-insensitive).  Returns NULL when the name is empty or
+ * unknown to QEMU on this target.
+ */
+struct qemu_plugin_register *
+lookup_reg_handle(unsigned int cpu_index, const char *cap_reg_name)
+{
+    if (!cap_reg_name || !*cap_reg_name) {
+        return NULL;
+    }
+    GHashTable *ht = vcpu_get_reg_handles(cpu_index);
+    if (!ht) {
+        return NULL;
+    }
+    g_autofree char *key = g_ascii_strdown(cap_reg_name, -1);
+    return (struct qemu_plugin_register *)g_hash_table_lookup(ht, key);
+}
+
 enum PluginOptId {
     OPT_DEPTH = 1,
     OPT_OUTFILE,
@@ -111,6 +278,7 @@ enum PluginOptId {
     OPT_SPINTERVAL,
     OPT_COMMENT,
     OPT_MEMDATA,
+    OPT_REGDATA,
 };
 
 /* ========================= Global state ========================= */
@@ -147,6 +315,16 @@ __thread uint64_t wp_saved_prev_bb_ends_in_branch = 0;
 
 static __thread GArray *cp_mem_accesses = NULL;
 
+/*
+ * Pending register snapshots produced by the per-insn reg-snap
+ * callback for the currently-executing BB.  Each insn append its src
+ * snaps then its dst snaps, in InsnFields.src_regs[]/dst_regs[]
+ * order.  The buffer is drained into BodyEntry.reg_snaps at
+ * BB-finalize time, and discarded on flush.  Active only when
+ * enable_reg_data is true.
+ */
+static __thread GArray *pending_reg_snaps = NULL;
+
 /* Statistics */
 static uint64_t stat_blocks_translated;
 static uint64_t stat_branches_observed;
@@ -176,11 +354,17 @@ static void dyn_param_array_free(GArray *arr)
 static void wp_bb_entry_clear(WPBBEntry *entry)
 {
     dyn_param_array_free(entry->dyn_params);
+    if (entry->reg_snaps) {
+        g_array_unref(entry->reg_snaps);
+    }
 }
 
 static void body_entry_clear(BodyEntry *entry)
 {
     dyn_param_array_free(entry->dyn_params);
+    if (entry->reg_snaps) {
+        g_array_unref(entry->reg_snaps);
+    }
     if (entry->wp_entries) {
         for (guint i = 0; i < entry->wp_entries->len; i++) {
             wp_bb_entry_clear(&g_array_index(entry->wp_entries, WPBBEntry, i));
@@ -197,6 +381,8 @@ static void bb_template_free(gpointer data)
     g_free(tmpl->symbol_name);
     g_free(tmpl->insn_sizes);
     g_free(tmpl->insn_bytes);
+    g_free(tmpl->insn_reg_names);
+    g_free(tmpl->insn_snap_refs);
     g_free(tmpl);
 }
 
@@ -280,6 +466,9 @@ BBTemplate *get_or_create_bb_template(uint64_t entry_pc,
     tmpl->insn_sizes = g_new0(uint8_t, total_insns);
     tmpl->insn_bytes = g_new0(uint8_t, (size_t)total_insns * MAX_INSN_BYTES);
     tmpl->insn_fields = g_new0(InsnFields, total_insns);
+    if (enable_reg_data) {
+        tmpl->insn_reg_names = g_new0(InsnRegNames, total_insns);
+    }
 
     uint32_t off = 0;
     for (guint f = 0; f < n_fragments; f++) {
@@ -294,6 +483,9 @@ BBTemplate *get_or_create_bb_template(uint64_t entry_pc,
                    &frag->insn_bytes[(size_t)i * MAX_INSN_BYTES],
                    MAX_INSN_BYTES);
             tmpl->insn_fields[off + i] = frag->insn_fields[i];
+            if (tmpl->insn_reg_names && frag->insn_reg_names) {
+                tmpl->insn_reg_names[off + i] = frag->insn_reg_names[i];
+            }
         }
         off += frag->n_insns;
     }
@@ -367,10 +559,15 @@ static BBTemplate *get_or_create_template(uint64_t start_pc,
     }
 
     tmpl->insn_fields = g_new0(InsnFields, n_insns);
+    if (enable_reg_data) {
+        tmpl->insn_reg_names = g_new0(InsnRegNames, n_insns);
+    }
     for (uint32_t i = 0; i < n_insns; i++) {
         if (insn_info && insn_info[i].mnemonic[0]) {
-            decode_detail_to_generic(tmpl->insn_pcs[i], &insn_info[i],
-                                     &tmpl->insn_fields[i]);
+            decode_detail_to_generic(
+                tmpl->insn_pcs[i], &insn_info[i],
+                &tmpl->insn_fields[i],
+                tmpl->insn_reg_names ? &tmpl->insn_reg_names[i] : NULL);
         }
     }
 
@@ -403,12 +600,238 @@ static BBTemplate *get_or_create_template(uint64_t start_pc,
             InsnFields tmp_fld = tmpl->insn_fields[br];
             tmpl->insn_fields[br] = tmpl->insn_fields[ds];
             tmpl->insn_fields[ds] = tmp_fld;
+            if (tmpl->insn_reg_names) {
+                InsnRegNames tmp_n = tmpl->insn_reg_names[br];
+                tmpl->insn_reg_names[br] = tmpl->insn_reg_names[ds];
+                tmpl->insn_reg_names[ds] = tmp_n;
+            }
         }
     }
 
     g_hash_table_replace(tb_map, &tmpl->start_pc, tmpl);
     stat_blocks_translated++;
     return tmpl;
+}
+
+/* ========================= Reg-data snapshot capture ========================= */
+
+/*
+ * Read a register by Capstone-style runtime name.  Empty/unknown
+ * names yield a zero 4B snap (size_code=0, lo=hi=0); the writer's
+ * delta state thus stays at the previous value, so subsequent zero
+ * snaps emit 0-byte deltas.  Only meaningful when enable_reg_data
+ * is true.
+ */
+static void read_reg_into_snap(unsigned int cpu_index,
+                               const char *name, RegSnap *out)
+{
+    out->size_code = 0;
+    out->lo = 0;
+    out->hi = 0;
+    if (!name || !*name) {
+        return;
+    }
+    struct qemu_plugin_register *h = lookup_reg_handle(cpu_index, name);
+    if (!h) {
+        return;
+    }
+    g_autoptr(GByteArray) buf = g_byte_array_new();
+    int n = qemu_plugin_read_register(h, buf);
+    if (n <= 0) {
+        return;
+    }
+    uint8_t size_code;
+    if (n <= 4) {
+        size_code = 0;
+    } else if (n <= 8) {
+        size_code = 1;
+    } else if (n <= 16) {
+        size_code = 2;
+    } else {
+        /* Larger registers (e.g. SIMD) are not useful for
+         * address-recompute use; downgrade to 16B truncation. */
+        size_code = 2;
+    }
+    uint8_t bytes[16] = {0};
+    int copy_n = MIN(n, 16);
+    memcpy(bytes, buf->data, copy_n);
+    uint64_t lo = 0, hi = 0;
+    for (int b = 0; b < 8; b++) {
+        lo |= (uint64_t)bytes[b] << (b * 8);
+    }
+    for (int b = 0; b < 8; b++) {
+        hi |= (uint64_t)bytes[8 + b] << (b * 8);
+    }
+    out->size_code = size_code;
+    out->lo = lo;
+    out->hi = hi;
+}
+
+/*
+ * Per-insn callback: snapshot every src and dst register (in
+ * InsnFields ordering) into pending_reg_snaps.  udata encodes
+ * (BBTemplate*, insn_index_in_template).  The buffer is drained
+ * into BodyEntry.reg_snaps when the BB finalizes.
+ */
+typedef struct {
+    BBTemplate *tb_tmpl;
+    uint32_t    insn_index;
+} RegSnapInsnRef;
+
+static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
+{
+    if (!enable_reg_data || wp_in_progress) {
+        return;
+    }
+    if (!g_atomic_int_get(&trace_active_atomic)) {
+        return;
+    }
+    const RegSnapInsnRef *ref = (const RegSnapInsnRef *)udata;
+    if (!ref || !ref->tb_tmpl ||
+        ref->insn_index >= ref->tb_tmpl->n_insns ||
+        !ref->tb_tmpl->insn_reg_names) {
+        return;
+    }
+    const InsnFields *f = &ref->tb_tmpl->insn_fields[ref->insn_index];
+    const InsnRegNames *names = &ref->tb_tmpl->insn_reg_names[ref->insn_index];
+
+    if (!pending_reg_snaps) {
+        pending_reg_snaps = g_array_new(false, false, sizeof(RegSnap));
+    }
+    for (uint8_t i = 0; i < f->n_src_regs; i++) {
+        RegSnap s;
+        read_reg_into_snap(cpu_index, names->src[i], &s);
+        g_array_append_val(pending_reg_snaps, s);
+    }
+    for (uint8_t i = 0; i < f->n_dst_regs; i++) {
+        RegSnap s;
+        read_reg_into_snap(cpu_index, names->dst[i], &s);
+        g_array_append_val(pending_reg_snaps, s);
+    }
+}
+
+/* ========================= Wide regfile snapshot (WP path) =========================
+ *
+ * In wrong-path execution under qemu_plugin_spec_mode_begin(),
+ * cpu_plugin_exec_tb() forces CF_MEMI_ONLY which silently drops any
+ * subsequent qemu_plugin_register_vcpu_insn_exec_cb() registration.
+ * So our normal per-insn snap callback never fires for WP fragments
+ * even though the regfile is genuinely modified by speculative
+ * execution.  To recover per-insn snapshots, the WP loop calls
+ * wide_reg_snap_capture() *before* each cpu_plugin_exec_tb() and
+ * later attributes the captured values to the per-insn slots of
+ * the just-translated template via wp_capture_insn_snaps().  Spec
+ * mode also forces CF_SINGLE_STEP|1 (one guest insn per fragment),
+ * so a pre-fragment wide snap is semantically equivalent to a
+ * pre-insn snap.
+ */
+
+struct _WideRegSnap {
+    GHashTable *map;  /* lowercase name (g_strdup) -> RegSnap* (g_new0) */
+};
+
+WideRegSnap *wide_reg_snap_capture(unsigned int cpu_index)
+{
+    if (!enable_reg_data) {
+        return NULL;
+    }
+    GHashTable *names_to_handles = vcpu_get_reg_handles(cpu_index);
+    if (!names_to_handles) {
+        return NULL;
+    }
+    WideRegSnap *w = g_new0(WideRegSnap, 1);
+    w->map = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                   g_free, g_free);
+
+    GHashTableIter it;
+    gpointer key, val;
+    g_hash_table_iter_init(&it, names_to_handles);
+    while (g_hash_table_iter_next(&it, &key, &val)) {
+        const char *name = (const char *)key;
+        struct qemu_plugin_register *h = (struct qemu_plugin_register *)val;
+        if (!name || !*name || !h) {
+            continue;
+        }
+        RegSnap snap = {0, 0, 0};
+        /* Inline read since read_reg_into_snap takes a name and
+         * re-resolves the handle, redundantly. */
+        g_autoptr(GByteArray) buf = g_byte_array_new();
+        int n = qemu_plugin_read_register(h, buf);
+        if (n <= 0) {
+            continue;
+        }
+        if (n <= 4) {
+            snap.size_code = 0;
+        } else if (n <= 8) {
+            snap.size_code = 1;
+        } else {
+            snap.size_code = 2;
+        }
+        uint8_t bytes[16] = {0};
+        int copy_n = MIN(n, 16);
+        memcpy(bytes, buf->data, copy_n);
+        for (int b = 0; b < 8; b++) {
+            snap.lo |= (uint64_t)bytes[b] << (b * 8);
+        }
+        for (int b = 0; b < 8; b++) {
+            snap.hi |= (uint64_t)bytes[8 + b] << (b * 8);
+        }
+
+        RegSnap *heap = g_new(RegSnap, 1);
+        *heap = snap;
+        g_hash_table_insert(w->map, g_strdup(name), heap);
+    }
+    return w;
+}
+
+void wide_reg_snap_free(WideRegSnap *w)
+{
+    if (!w) {
+        return;
+    }
+    if (w->map) {
+        g_hash_table_destroy(w->map);
+    }
+    g_free(w);
+}
+
+static void wide_reg_snap_lookup(const WideRegSnap *w, const char *name,
+                                 RegSnap *out)
+{
+    out->size_code = 0;
+    out->lo = 0;
+    out->hi = 0;
+    if (!w || !w->map || !name || !*name) {
+        return;
+    }
+    g_autofree char *key = g_ascii_strdown(name, -1);
+    RegSnap *s = (RegSnap *)g_hash_table_lookup(w->map, key);
+    if (s) {
+        *out = *s;
+    }
+}
+
+void wp_capture_insn_snaps(const WideRegSnap *wide,
+                           const BBTemplate *tmpl,
+                           uint32_t insn_idx,
+                           GArray *out_snaps)
+{
+    if (!enable_reg_data || !tmpl || !out_snaps ||
+        !tmpl->insn_reg_names || insn_idx >= tmpl->n_insns) {
+        return;
+    }
+    const InsnFields *f = &tmpl->insn_fields[insn_idx];
+    const InsnRegNames *names = &tmpl->insn_reg_names[insn_idx];
+    for (uint8_t i = 0; i < f->n_src_regs; i++) {
+        RegSnap s;
+        wide_reg_snap_lookup(wide, names->src[i], &s);
+        g_array_append_val(out_snaps, s);
+    }
+    for (uint8_t i = 0; i < f->n_dst_regs; i++) {
+        RegSnap s;
+        wide_reg_snap_lookup(wide, names->dst[i], &s);
+        g_array_append_val(out_snaps, s);
+    }
 }
 
 /* ========================= Memory access callback ========================= */
@@ -709,10 +1132,15 @@ static void flush_pending_final_body_entry(void)
             .template_id = bb_tmpl ? bb_tmpl->template_id : 0,
             .dyn_params = g_array_sized_new(false, false, sizeof(DynParam),
                               cp_mem_accesses ? cp_mem_accesses->len : 0),
+            .reg_snaps = NULL,
             .wp_entries = NULL,
             .tmpl = bb_tmpl,
         };
         drain_cp_mem_into_dyn_params(entry.dyn_params, bb_tmpl);
+        if (enable_reg_data && pending_reg_snaps) {
+            entry.reg_snaps = g_array_ref(pending_reg_snaps);
+            pending_reg_snaps = g_array_new(false, false, sizeof(RegSnap));
+        }
 
         body_stream_write_entry(seg->bin_stream, &entry);
         body_entry_clear(&entry);
@@ -914,10 +1342,15 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         entry.template_id = bb_tmpl ? bb_tmpl->template_id : 0;
         entry.dyn_params = g_array_sized_new(false, false,
                              sizeof(DynParam), cp_mem_len);
+        entry.reg_snaps = NULL;
         entry.wp_entries = NULL;
         entry.tmpl = bb_tmpl;
 
         drain_cp_mem_into_dyn_params(entry.dyn_params, bb_tmpl);
+        if (enable_reg_data && pending_reg_snaps) {
+            entry.reg_snaps = g_array_ref(pending_reg_snaps);
+            pending_reg_snaps = g_array_new(false, false, sizeof(RegSnap));
+        }
 
         g_mutex_lock(&data_lock);
         cp_chain_reset();
@@ -1004,30 +1437,47 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         }
 
         g_mutex_lock(&data_lock);
+        BBTemplate *new_tmpl = NULL;
         {
-            BBTemplate *tmpl = get_or_create_template(pc,
-                                                      (uint32_t)n_insns,
-                                                      insn_pcs,
-                                                      insn_info,
-                                                      insn_sizes,
-                                                      insn_bytes,
-                                                      symbol_name, fall_through);
-            if (tmpl && tmpl->n_insns > 0) {
-                int br_idx = template_branch_index(tmpl);
+            new_tmpl = get_or_create_template(pc,
+                                              (uint32_t)n_insns,
+                                              insn_pcs,
+                                              insn_info,
+                                              insn_sizes,
+                                              insn_bytes,
+                                              symbol_name, fall_through);
+            if (new_tmpl && new_tmpl->n_insns > 0) {
+                int br_idx = template_branch_index(new_tmpl);
                 bb_ends_in_branch = (br_idx >= 0) ? 1 : 0;
                 if (br_idx >= 0) {
-                    effective_last_pc = tmpl->insn_pcs[br_idx];
+                    effective_last_pc = new_tmpl->insn_pcs[br_idx];
                 }
             }
         }
         g_mutex_unlock(&data_lock);
+
+        if (enable_reg_data && new_tmpl && new_tmpl->insn_reg_names) {
+            RegSnapInsnRef *refs = g_new0(RegSnapInsnRef, n_insns);
+            new_tmpl->insn_snap_refs = refs;
+            for (size_t i = 0; i < n_insns; i++) {
+                refs[i].tb_tmpl = new_tmpl;
+                refs[i].insn_index = (uint32_t)i;
+                struct qemu_plugin_insn *insn =
+                    qemu_plugin_tb_get_insn(tb, i);
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, vcpu_insn_reg_snap_cb,
+                    QEMU_PLUGIN_CB_R_REGS, &refs[i]);
+            }
+        }
 
         g_free(insn_pcs);
         g_free(insn_info);
         g_free(insn_sizes);
         g_free(insn_bytes);
     } else {
-        /* Re-translation of known BB: only dynamic memory callbacks needed. */
+        /* Re-translation of known BB: re-arm dynamic callbacks. */
+        RegSnapInsnRef *refs =
+            (RegSnapInsnRef *)existing_tmpl->insn_snap_refs;
         for (size_t i = 0; i < n_insns; i++) {
             struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
             uint64_t insn_pc = qemu_plugin_insn_vaddr(insn);
@@ -1035,6 +1485,12 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             qemu_plugin_register_vcpu_mem_cb(
                 insn, vcpu_mem_cb, QEMU_PLUGIN_CB_NO_REGS,
                 QEMU_PLUGIN_MEM_RW, (void *)(uintptr_t)insn_pc);
+
+            if (enable_reg_data && refs) {
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, vcpu_insn_reg_snap_cb,
+                    QEMU_PLUGIN_CB_R_REGS, &refs[i]);
+            }
         }
     }
 
@@ -1099,6 +1555,9 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
     cp_chain_reset();
     if (cp_mem_accesses) {
         g_array_set_size(cp_mem_accesses, 0);
+    }
+    if (pending_reg_snaps) {
+        g_array_set_size(pending_reg_snaps, 0);
     }
     g_mutex_unlock(&data_lock);
 
@@ -1247,30 +1706,14 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     }
 
     /* Map ISA to Capstone arch/mode for qemu_plugin_cap_decode(). */
-    cst_cap_arch = (trace_isa != TRACE_ISA_UNKNOWN)
-                   ? isa_properties[trace_isa].cap_arch : -1;
-    switch (trace_isa) {
-    case TRACE_ISA_X86:
-        cst_cap_mode = QEMU_PLUGIN_CAP_MODE_64;
-        break;
-    case TRACE_ISA_AARCH64:
-        cst_cap_mode = QEMU_PLUGIN_CAP_MODE_LITTLE_ENDIAN;
-        break;
-    case TRACE_ISA_RISCV:
-        cst_cap_mode = (g_str_has_prefix(target_name, "riscv32")
-                        ? QEMU_PLUGIN_CAP_MODE_RISCV32
-                        : QEMU_PLUGIN_CAP_MODE_RISCV64)
-                       | QEMU_PLUGIN_CAP_MODE_RISCVC;
-        break;
-    case TRACE_ISA_MIPS:
-        cst_cap_mode = QEMU_PLUGIN_CAP_MODE_32
-                      | (g_str_has_suffix(target_name, "el")
-                         ? QEMU_PLUGIN_CAP_MODE_LITTLE_ENDIAN
-                         : QEMU_PLUGIN_CAP_MODE_BIG_ENDIAN);
-        break;
-    default:
+    if (trace_isa != TRACE_ISA_UNKNOWN) {
+        const IsaProperties *p = &isa_properties[trace_isa];
+        cst_cap_arch = p->cap_arch;
+        cst_cap_mode = p->cap_mode_for_target
+                       ? p->cap_mode_for_target(target_name) : 0;
+    } else {
+        cst_cap_arch = -1;
         cst_cap_mode = 0;
-        break;
     }
 
     /* Best-effort capture of the full QEMU command line. */
@@ -1303,6 +1746,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             {"program", OPT_PROGRAM}, {"spfile",  OPT_SPFILE},
             {"spinterval", OPT_SPINTERVAL},
             {"comment", OPT_COMMENT}, {"memdata", OPT_MEMDATA},
+            {"regdata", OPT_REGDATA},
             {NULL, 0}
         };
         for (int i = 0; opt_entries[i].name; i++) {
@@ -1362,6 +1806,9 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         case OPT_MEMDATA:
             enable_mem_data = (atoi(tokens[1]) != 0);
             break;
+        case OPT_REGDATA:
+            enable_reg_data = (atoi(tokens[1]) != 0);
+            break;
         }
     }
 
@@ -1399,6 +1846,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     g_mutex_init(&data_lock);
     g_mutex_init(&exec_lock);
     g_mutex_init(&unknown_warn_lock);
+    g_mutex_init(&vcpu_reg_handles_lock);
     tb_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
                                    NULL, bb_template_free);
     bb_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
@@ -1434,6 +1882,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
 
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
     qemu_plugin_register_flush_cb(id, vcpu_tb_flush);
+    qemu_plugin_register_vcpu_init_cb(id, vcpu_init_cb);
     qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
 
     return 0;

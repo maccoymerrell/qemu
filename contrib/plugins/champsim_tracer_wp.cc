@@ -84,6 +84,8 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
 
     GArray *wp_frags = g_array_new(false, false, sizeof(BBTemplate *));
     GArray *wp_chain_mems = g_array_new(false, false, sizeof(DynParam));
+    GArray *wp_chain_reg_snaps = enable_reg_data
+        ? g_array_new(false, false, sizeof(RegSnap)) : NULL;
     uint64_t wp_chain_entry_pc = 0;
     uint32_t wp_chain_insns = 0;
 
@@ -102,6 +104,10 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             wp_chain_entry_pc = pre_pc;
         }
 
+        /* Capture pre-fragment wide regfile snapshot.  Spec mode forces
+         * CF_SINGLE_STEP|1 so this is also a pre-insn snapshot. */
+        WideRegSnap *wide = wide_reg_snap_capture(cpu_index);
+
         tb_ok = qemu_plugin_exec_tb();
 
         g_mutex_lock(&data_lock);
@@ -109,8 +115,12 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         g_mutex_unlock(&data_lock);
 
         if (!tmpl) {
+            wide_reg_snap_free(wide);
             g_array_set_size(wp_frags, 0);
             g_array_set_size(wp_chain_mems, 0);
+            if (wp_chain_reg_snaps) {
+                g_array_set_size(wp_chain_reg_snaps, 0);
+            }
             wp_chain_entry_pc = 0;
             wp_chain_insns = 0;
             early_exit = true;
@@ -145,6 +155,17 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                 stat_wp_total_mem_accesses++;
             }
         }
+
+        /* Drain wide snapshot into per-insn slots of this fragment.
+         * Under CF_SINGLE_STEP|1 each fragment is one guest insn, but
+         * walk all insns for robustness. */
+        if (wp_chain_reg_snaps) {
+            for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+                wp_capture_insn_snaps(wide, tmpl, i, wp_chain_reg_snaps);
+            }
+        }
+        wide_reg_snap_free(wide);
+        wide = NULL;
 
         if (!tb_ok) {
             /* Fault: finalize accumulated chain as a faulting BB. */
@@ -183,11 +204,17 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                 .fault_insn_index = (wp_chain_insns > 0)
                                     ? (wp_chain_insns - 1) : 0,
                 .tmpl = bb_tmpl,
+                .reg_snaps = NULL,
             };
 
             for (guint m = 0; m < wp_chain_mems->len; m++) {
                 DynParam dp = g_array_index(wp_chain_mems, DynParam, m);
                 g_array_append_val(fault_wp.dyn_params, dp);
+            }
+            if (wp_chain_reg_snaps) {
+                fault_wp.reg_snaps = wp_chain_reg_snaps;
+                wp_chain_reg_snaps = g_array_new(
+                    false, false, sizeof(RegSnap));
             }
 
             bool has_syscall = false;
@@ -273,10 +300,16 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         wp_bb.translation_unavailable = false;
         wp_bb.fault_insn_index = 0;  /* undefined when !fault */
         wp_bb.tmpl = bb_tmpl;
+        wp_bb.reg_snaps = NULL;
         wp_bb.dyn_params = g_array_new(false, false, sizeof(DynParam));
         for (guint m = 0; m < wp_chain_mems->len; m++) {
             DynParam dp = g_array_index(wp_chain_mems, DynParam, m);
             g_array_append_val(wp_bb.dyn_params, dp);
+        }
+        if (wp_chain_reg_snaps) {
+            wp_bb.reg_snaps = wp_chain_reg_snaps;
+            wp_chain_reg_snaps = g_array_new(
+                false, false, sizeof(RegSnap));
         }
 
         uint64_t chosen_target = post_pc;
@@ -300,6 +333,9 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
 
     g_array_unref(wp_frags);
     g_array_unref(wp_chain_mems);
+    if (wp_chain_reg_snaps) {
+        g_array_unref(wp_chain_reg_snaps);
+    }
 
     wp_in_progress = false;
 

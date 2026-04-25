@@ -100,6 +100,10 @@ def _parse_args() -> argparse.Namespace:
     g.add_argument("--diamonds", type=int, default=8)
     g.add_argument("--side-len-min", type=int, default=2)
     g.add_argument("--side-len-max", type=int, default=4)
+    g.add_argument("--coverage", action="store_true",
+                   help="Prepend one of every probe block (per ISA) so a "
+                        "single trace exercises 100%% of the reachable "
+                        "GenericOpcode classifications.")
 
     # build
     b = sub.add_parser("build", help="Cross-compile .cpp for an ISA")
@@ -115,6 +119,8 @@ def _parse_args() -> argparse.Namespace:
     t.add_argument("--depth", type=int, default=64,
                    help="wrong-path depth (plugin option)")
     t.add_argument("--stop", type=int, default=200_000)
+    t.add_argument("--regdata", action="store_true",
+                   help="Enable per-insn register-value capture (regdata=1)")
 
     # analyze
     a = sub.add_parser("analyze",
@@ -140,6 +146,10 @@ def _parse_args() -> argparse.Namespace:
     al.add_argument("--side-len-max", type=int, default=4)
     al.add_argument("--depth", type=int, default=64)
     al.add_argument("--stop", type=int, default=200_000)
+    al.add_argument("--regdata", action="store_true",
+                    help="Enable per-insn register-value capture (regdata=1)")
+    al.add_argument("--coverage", action="store_true",
+                    help="See `generate --coverage`.")
 
     return p.parse_args()
 
@@ -181,6 +191,7 @@ def cmd_generate(args, isa: str | None = None) -> None:
         num_diamonds=args.diamonds,
         side_len_min=args.side_len_min,
         side_len_max=args.side_len_max,
+        coverage=getattr(args, "coverage", False),
     )
     # Emit per-ISA metadata (since exit syscall differs) but share cpp
     # by appending the isa suffix to the meta and a per-ISA cpp.
@@ -242,6 +253,8 @@ def cmd_trace(args, isa: str | None = None) -> int:
         f"outfile={out_base},"
         f"depth={args.depth},stop={args.stop},memdata=1"
     )
+    if getattr(args, "regdata", False):
+        plugin_opts += ",regdata=1"
     cmd = [
         str(qemu), "-plugin", f"{plugin},{plugin_opts}", str(bin_path),
     ]

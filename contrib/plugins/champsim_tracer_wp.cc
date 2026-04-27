@@ -82,14 +82,29 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     qemu_plugin_spec_mode_begin(saved_state);
     qemu_plugin_set_pc(wrong_target);
 
-    GArray *wp_frags = g_array_new(false, false, sizeof(BBTemplate *));
-    GArray *wp_chain_mems = g_array_new(false, false, sizeof(DynParam));
-    GArray *wp_chain_reg_snaps = enable_reg_data
+    /*
+     * v1.6: per-insn accumulator for the BB currently being built.
+     * Spec mode forces CF_SINGLE_STEP|1 at EXECUTION time, but the
+     * template returned by find_template(pre_pc) may be a multi-insn
+     * cached translation from CP (translated under different cflags).
+     * Only insn[0] of that template actually executed.  We therefore
+     * accumulate per-step (1 insn each) into raw arrays and commit a
+     * true BB at each branch fire via commit_true_bb().
+     */
+    GArray *bb_pcs   = g_array_new(false, false, sizeof(uint64_t));
+    GArray *bb_sizes = g_array_new(false, false, sizeof(uint8_t));
+    GByteArray *bb_bytes = g_byte_array_new();
+    GArray *bb_fields = g_array_new(false, false, sizeof(InsnFields));
+    GArray *bb_regnames = enable_reg_data
+        ? g_array_new(false, false, sizeof(InsnRegNames)) : NULL;
+    GArray *bb_dyn_params = g_array_new(false, false, sizeof(DynParam));
+    GArray *bb_reg_snaps = enable_reg_data
         ? g_array_new(false, false, sizeof(RegSnap)) : NULL;
-    uint64_t wp_chain_entry_pc = 0;
-    uint32_t wp_chain_insns = 0;
+    uint64_t bb_start_pc = 0;
+    const char *bb_symbol_name = NULL;
 
-    while (sim_insns < (uint64_t)max_wrong_path_depth) {
+    while (sim_insns < (uint64_t)max_wrong_path_depth ||
+           bb_pcs->len > 0) {
         uint64_t pre_pc = qemu_plugin_get_pc();
         guint mem_start_idx = wp_mem_accesses->len;
         BBTemplate *tmpl = NULL;
@@ -100,12 +115,10 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             break;
         }
 
-        if (wp_chain_entry_pc == 0) {
-            wp_chain_entry_pc = pre_pc;
+        if (bb_pcs->len == 0) {
+            bb_start_pc = pre_pc;
         }
 
-        /* Capture pre-fragment wide regfile snapshot.  Spec mode forces
-         * CF_SINGLE_STEP|1 so this is also a pre-insn snapshot. */
         WideRegSnap *wide = wide_reg_snap_capture(cpu_index);
 
         tb_ok = qemu_plugin_exec_tb();
@@ -114,61 +127,116 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         tmpl = find_template(pre_pc);
         g_mutex_unlock(&data_lock);
 
-        if (!tmpl) {
+        /*
+         * Detect non-advancing TB: spec-mode exec returned ok but PC
+         * did not move.  This happens when the cached translation at
+         * pre_pc is invalid for current architectural state (e.g. we
+         * jumped into the middle of a previously-translated insn).
+         * Treat it as a soft fault and bail out of WP.
+         */
+        if (tb_ok && qemu_plugin_get_pc() == pre_pc) {
             wide_reg_snap_free(wide);
-            g_array_set_size(wp_frags, 0);
-            g_array_set_size(wp_chain_mems, 0);
-            if (wp_chain_reg_snaps) {
-                g_array_set_size(wp_chain_reg_snaps, 0);
-            }
-            wp_chain_entry_pc = 0;
-            wp_chain_insns = 0;
+            wp_poison_target(poisoned_targets, pre_pc);
+            g_array_set_size(bb_pcs, 0);
+            g_array_set_size(bb_sizes, 0);
+            g_byte_array_set_size(bb_bytes, 0);
+            g_array_set_size(bb_fields, 0);
+            if (bb_regnames) g_array_set_size(bb_regnames, 0);
+            g_array_set_size(bb_dyn_params, 0);
+            if (bb_reg_snaps) g_array_set_size(bb_reg_snaps, 0);
+            bb_start_pc = 0;
+            bb_symbol_name = NULL;
             early_exit = true;
             break;
         }
 
-        g_array_append_val(wp_frags, tmpl);
-        uint32_t fragment_offset = wp_chain_insns;
-        wp_chain_insns += tmpl->n_insns;
-        sim_insns += tmpl->n_insns;
-
-        {
-            guint local_idx = 0;
-            for (guint m = mem_start_idx; m < wp_mem_accesses->len; m++) {
-                WPMemAccess *acc = &g_array_index(wp_mem_accesses,
-                                                  WPMemAccess, m);
-                while (local_idx < tmpl->n_insns &&
-                       tmpl->insn_pcs[local_idx] != acc->insn_pc) {
-                    local_idx++;
-                }
-                DynParam dp = {
-                    .type = (uint8_t)(acc->is_store ? DYN_STORE_ADDR
-                                                    : DYN_LOAD_ADDR),
-                    .insn_index = (uint16_t)(fragment_offset +
-                        (local_idx < tmpl->n_insns ? local_idx : 0)),
-                    .value = acc->mem_vaddr,
-                    .data_size = acc->data_size,
-                    .data_lo = acc->data_lo,
-                    .data_hi = acc->data_hi,
-                };
-                g_array_append_val(wp_chain_mems, dp);
-                stat_wp_total_mem_accesses++;
-            }
+        if (!tmpl) {
+            wide_reg_snap_free(wide);
+            g_array_set_size(bb_pcs, 0);
+            g_array_set_size(bb_sizes, 0);
+            g_byte_array_set_size(bb_bytes, 0);
+            g_array_set_size(bb_fields, 0);
+            if (bb_regnames) g_array_set_size(bb_regnames, 0);
+            g_array_set_size(bb_dyn_params, 0);
+            if (bb_reg_snaps) g_array_set_size(bb_reg_snaps, 0);
+            bb_start_pc = 0;
+            bb_symbol_name = NULL;
+            early_exit = true;
+            break;
         }
 
-        /* Drain wide snapshot into per-insn slots of this fragment.
-         * Under CF_SINGLE_STEP|1 each fragment is one guest insn, but
-         * walk all insns for robustness. */
-        if (wp_chain_reg_snaps) {
+        /*
+         * exec_tb may run multiple insns of a CP-cached translation
+         * (CF_SINGLE_STEP only affects new translations).  Append the
+         * full template so the BB we build matches what actually
+         * executed.  The BB ends architecturally when the TB ends in
+         * a branch; otherwise the next iteration's pre_pc will equal
+         * post_pc and continue accumulating.
+         */
+        uint32_t bb_idx_base = bb_pcs->len;
+        if (bb_pcs->len == 0 && tmpl->symbol_name) {
+            bb_symbol_name = tmpl->symbol_name;
+        }
+        for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+            uint64_t insn_pc = tmpl->insn_pcs[i];
+            uint8_t isz = tmpl->insn_sizes[i];
+            g_array_append_val(bb_pcs, insn_pc);
+            g_array_append_val(bb_sizes, isz);
+            g_byte_array_append(bb_bytes,
+                                &tmpl->insn_bytes[i * MAX_INSN_BYTES],
+                                MAX_INSN_BYTES);
+            g_array_append_val(bb_fields, tmpl->insn_fields[i]);
+            if (bb_regnames && tmpl->insn_reg_names) {
+                g_array_append_val(bb_regnames, tmpl->insn_reg_names[i]);
+            } else if (bb_regnames) {
+                InsnRegNames empty = {0};
+                g_array_append_val(bb_regnames, empty);
+            }
+        }
+        uint8_t last_insn_size = tmpl->insn_sizes[tmpl->n_insns - 1];
+
+        sim_insns += tmpl->n_insns;
+
+        /* Attribute mem accesses to insns within the just-appended
+         * fragment by matching the recorded insn_pc. */
+        for (guint m = mem_start_idx; m < wp_mem_accesses->len; m++) {
+            WPMemAccess *acc = &g_array_index(wp_mem_accesses,
+                                              WPMemAccess, m);
+            uint16_t insn_idx = (uint16_t)bb_idx_base;
             for (uint32_t i = 0; i < tmpl->n_insns; i++) {
-                wp_capture_insn_snaps(wide, tmpl, i, wp_chain_reg_snaps);
+                if (tmpl->insn_pcs[i] == acc->insn_pc) {
+                    insn_idx = (uint16_t)(bb_idx_base + i);
+                    break;
+                }
+            }
+            DynParam dp = {
+                .type = (uint8_t)(acc->is_store ? DYN_STORE_ADDR
+                                                : DYN_LOAD_ADDR),
+                .insn_index = insn_idx,
+                .value = acc->mem_vaddr,
+                .data_size = acc->data_size,
+                .data_lo = acc->data_lo,
+                .data_hi = acc->data_hi,
+            };
+            g_array_append_val(bb_dyn_params, dp);
+            stat_wp_total_mem_accesses++;
+        }
+
+        if (bb_reg_snaps) {
+            for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+                wp_capture_insn_snaps(wide, tmpl, i, bb_reg_snaps);
             }
         }
         wide_reg_snap_free(wide);
         wide = NULL;
 
+        uint32_t last_local = bb_pcs->len - 1;
+        bool ends_in_branch =
+            (g_array_index(bb_fields, InsnFields, last_local).branch_type
+             != BRANCH_NONE);
+
         if (!tb_ok) {
-            /* Fault: finalize accumulated chain as a faulting BB. */
+            /* Fault: commit current BB with fault flag. */
             uint64_t recovery_pc = qemu_plugin_get_pc();
 
             if (pre_pc == last_fault_pc) {
@@ -178,56 +246,31 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                 last_fault_pc = pre_pc;
             }
 
+            uint64_t fall_through = pre_pc + last_insn_size;
+
             g_mutex_lock(&data_lock);
-            BBTemplate *bb_tmpl = get_or_create_bb_template(
-                wp_chain_entry_pc,
-                (BBTemplate **)wp_frags->data, wp_frags->len);
+            BBTemplate *bb_tmpl = commit_true_bb(
+                bb_start_pc, bb_pcs->len,
+                (uint64_t *)bb_pcs->data,
+                (InsnFields *)bb_fields->data,
+                (uint8_t *)bb_sizes->data,
+                bb_bytes->data,
+                bb_regnames ? (InsnRegNames *)bb_regnames->data : NULL,
+                bb_symbol_name, fall_through);
             g_mutex_unlock(&data_lock);
 
-            WPBBEntry fault_wp = {
-                .template_id = bb_tmpl ? bb_tmpl->template_id : 0,
-                .start_pc = wp_chain_entry_pc,
-                .dyn_params = g_array_new(false, false, sizeof(DynParam)),
-                .n_insns_executed = wp_chain_insns,
-                .fault = true,
-                .translation_unavailable = false,
-                /*
-                 * Default: the insn at the end of the merged chain took
-                 * the exception. Each speculative TB is forced to a
-                 * single guest insn via CF_SINGLE_STEP in
-                 * cpu_plugin_exec_tb(), so the faulting architectural PC
-                 * is exactly `pre_pc`, which is the last insn appended
-                 * to the chain => index wp_chain_insns - 1. Overridden
-                 * below if we detect a SYSCALL in the template (WP
-                 * syscalls are treated like faults).
-                 */
-                .fault_insn_index = (wp_chain_insns > 0)
-                                    ? (wp_chain_insns - 1) : 0,
-                .tmpl = bb_tmpl,
-                .reg_snaps = NULL,
-            };
-
-            for (guint m = 0; m < wp_chain_mems->len; m++) {
-                DynParam dp = g_array_index(wp_chain_mems, DynParam, m);
-                g_array_append_val(fault_wp.dyn_params, dp);
-            }
-            if (wp_chain_reg_snaps) {
-                fault_wp.reg_snaps = wp_chain_reg_snaps;
-                wp_chain_reg_snaps = g_array_new(
-                    false, false, sizeof(RegSnap));
-            }
-
+            uint32_t fault_idx = bb_pcs->len > 0
+                ? (uint32_t)(bb_pcs->len - 1) : 0;
             bool has_syscall = false;
-            if (bb_tmpl && bb_tmpl->n_insns > 0) {
-                uint32_t fault_idx = bb_tmpl->n_insns - 1;
+            if (bb_tmpl) {
                 for (uint32_t i = 0; i < bb_tmpl->n_insns; i++) {
-                    if (bb_tmpl->insn_fields[i].opcode == GEN_OP_SYSCALL) {
+                    if (bb_tmpl->insn_fields[i].opcode
+                        == GEN_OP_SYSCALL) {
                         fault_idx = i;
                         has_syscall = true;
                         break;
                     }
                 }
-                fault_wp.fault_insn_index = fault_idx;
                 if (fault_idx + 1 < bb_tmpl->n_insns) {
                     recovery_pc = bb_tmpl->insn_pcs[fault_idx]
                                 + bb_tmpl->insn_sizes[fault_idx];
@@ -236,12 +279,35 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                 }
             }
 
+            WPBBEntry fault_wp = {
+                .template_id = bb_tmpl ? bb_tmpl->template_id : 0,
+                .start_pc = bb_start_pc,
+                .dyn_params = g_array_new(false, false, sizeof(DynParam)),
+                .n_insns_executed = (uint32_t)bb_pcs->len,
+                .fault = true,
+                .translation_unavailable = false,
+                .fault_insn_index = fault_idx,
+                .tmpl = bb_tmpl,
+                .reg_snaps = NULL,
+            };
+            for (guint m = 0; m < bb_dyn_params->len; m++) {
+                DynParam dp = g_array_index(bb_dyn_params, DynParam, m);
+                g_array_append_val(fault_wp.dyn_params, dp);
+            }
+            if (bb_reg_snaps) {
+                fault_wp.reg_snaps = bb_reg_snaps;
+                bb_reg_snaps = g_array_new(false, false, sizeof(RegSnap));
+            }
             g_array_append_val(wp_chain, fault_wp);
 
-            g_array_set_size(wp_frags, 0);
-            g_array_set_size(wp_chain_mems, 0);
-            wp_chain_entry_pc = 0;
-            wp_chain_insns = 0;
+            g_array_set_size(bb_pcs, 0);
+            g_array_set_size(bb_sizes, 0);
+            g_byte_array_set_size(bb_bytes, 0);
+            g_array_set_size(bb_fields, 0);
+            if (bb_regnames) g_array_set_size(bb_regnames, 0);
+            g_array_set_size(bb_dyn_params, 0);
+            bb_start_pc = 0;
+            bb_symbol_name = NULL;
 
             if (has_syscall) {
                 early_exit = true;
@@ -272,70 +338,75 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             break;
         }
 
-        /* TB executed normally: branch-terminated? */
-        uint64_t post_pc = qemu_plugin_get_pc();
-        repeated_fault_pc = 0;
-        last_fault_pc = UINT64_MAX;
-
-        int br_idx = template_branch_index(tmpl);
-        uint8_t last_br = (br_idx >= 0)
-            ? tmpl->insn_fields[br_idx].branch_type : BRANCH_NONE;
-        bool ends_in_branch = (br_idx >= 0 && last_br != BRANCH_NONE);
-
         if (!ends_in_branch) {
             continue;
         }
 
+        /* Branch fired: commit completed BB. */
+        uint64_t post_pc = qemu_plugin_get_pc();
+        repeated_fault_pc = 0;
+        last_fault_pc = UINT64_MAX;
+
+        uint64_t fall_through = pre_pc + last_insn_size;
+
         g_mutex_lock(&data_lock);
-        BBTemplate *bb_tmpl = get_or_create_bb_template(
-            wp_chain_entry_pc,
-            (BBTemplate **)wp_frags->data, wp_frags->len);
+        BBTemplate *bb_tmpl = commit_true_bb(
+            bb_start_pc, bb_pcs->len,
+            (uint64_t *)bb_pcs->data,
+            (InsnFields *)bb_fields->data,
+            (uint8_t *)bb_sizes->data,
+            bb_bytes->data,
+            bb_regnames ? (InsnRegNames *)bb_regnames->data : NULL,
+            bb_symbol_name, fall_through);
         g_mutex_unlock(&data_lock);
 
-        WPBBEntry wp_bb;
-        wp_bb.start_pc = wp_chain_entry_pc;
-        wp_bb.template_id = bb_tmpl ? bb_tmpl->template_id : 0;
-        wp_bb.n_insns_executed = wp_chain_insns;
-        wp_bb.fault = false;
-        wp_bb.translation_unavailable = false;
-        wp_bb.fault_insn_index = 0;  /* undefined when !fault */
-        wp_bb.tmpl = bb_tmpl;
-        wp_bb.reg_snaps = NULL;
-        wp_bb.dyn_params = g_array_new(false, false, sizeof(DynParam));
-        for (guint m = 0; m < wp_chain_mems->len; m++) {
-            DynParam dp = g_array_index(wp_chain_mems, DynParam, m);
+        WPBBEntry wp_bb = {
+            .template_id = bb_tmpl ? bb_tmpl->template_id : 0,
+            .start_pc = bb_start_pc,
+            .dyn_params = g_array_new(false, false, sizeof(DynParam)),
+            .n_insns_executed = (uint32_t)bb_pcs->len,
+            .fault = false,
+            .translation_unavailable = false,
+            .fault_insn_index = 0,
+            .tmpl = bb_tmpl,
+            .reg_snaps = NULL,
+        };
+        for (guint m = 0; m < bb_dyn_params->len; m++) {
+            DynParam dp = g_array_index(bb_dyn_params, DynParam, m);
             g_array_append_val(wp_bb.dyn_params, dp);
         }
-        if (wp_chain_reg_snaps) {
-            wp_bb.reg_snaps = wp_chain_reg_snaps;
-            wp_chain_reg_snaps = g_array_new(
-                false, false, sizeof(RegSnap));
+        if (bb_reg_snaps) {
+            wp_bb.reg_snaps = bb_reg_snaps;
+            bb_reg_snaps = g_array_new(false, false, sizeof(RegSnap));
         }
-
-        uint64_t chosen_target = post_pc;
-
         g_array_append_val(wp_chain, wp_bb);
 
-        g_array_set_size(wp_frags, 0);
-        g_array_set_size(wp_chain_mems, 0);
-        wp_chain_entry_pc = 0;
-        wp_chain_insns = 0;
+        g_array_set_size(bb_pcs, 0);
+        g_array_set_size(bb_sizes, 0);
+        g_byte_array_set_size(bb_bytes, 0);
+        g_array_set_size(bb_fields, 0);
+        if (bb_regnames) g_array_set_size(bb_regnames, 0);
+        g_array_set_size(bb_dyn_params, 0);
+        bb_start_pc = 0;
+        bb_symbol_name = NULL;
 
+        uint64_t chosen_target = post_pc;
         if (wp_target_is_poisoned(poisoned_targets, chosen_target)) {
             early_exit = true;
             break;
         }
-
         if (chosen_target != post_pc) {
             qemu_plugin_set_pc(chosen_target);
         }
     }
 
-    g_array_unref(wp_frags);
-    g_array_unref(wp_chain_mems);
-    if (wp_chain_reg_snaps) {
-        g_array_unref(wp_chain_reg_snaps);
-    }
+    g_array_unref(bb_pcs);
+    g_array_unref(bb_sizes);
+    g_byte_array_unref(bb_bytes);
+    g_array_unref(bb_fields);
+    if (bb_regnames) g_array_unref(bb_regnames);
+    g_array_unref(bb_dyn_params);
+    if (bb_reg_snaps) g_array_unref(bb_reg_snaps);
 
     wp_in_progress = false;
 

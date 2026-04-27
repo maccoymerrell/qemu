@@ -1,18 +1,180 @@
-# champsim_tracer Binary Format — v1.2 Specification
+# champsim_tracer Binary Format — v1.7 Specification
 
 Status: current. Matches the on-disk output of
 [champsim_tracer_output.cc](champsim_tracer_output.cc) and the reference
 decoder in [champsim_tracer_decode.py](champsim_tracer_decode.py).
 
-File extension: `.wpt`.
+File extension: `.cst`.
 
-### Changes from v1.1
+### Changes from v1.6
 
-v1.2 is an **incompatible bump**. The magic number changes from
-`0x11545343` (`"CST\x11"`) to `0x12545343` (`"CST\x12"`); readers must
+v1.7 is an **incompatible bump**.  Magic changes from `0x16545343`
+(`"CST\x16"`) to `0x17545343` (`"CST\x17"`); the trailer magic moves
+in lock-step.  Readers must refuse files with the old magic.
+
+The three independent dynamic-parameter sub-sections of v1.6 — the
+variable-memop preamble (§4.1), dyn-patch (§4.2), mem-data (§5), and
+reg-data (§5.2) — are replaced by **one unified delta_section** per
+basic-block entry.  Each emitted record carries an explicit field-id,
+so the wire format itself describes which dynamic field changed
+rather than relying on positional schema ordering.
+
+Wire layout per BB entry (CP and each WP entry, identical shape):
+
+```
+delta_section := length-prefixed sub-section (ULEB128 byte count)
+  body :=
+    n_records  : ULEB128
+    record*    : { ins_pos_gap : ULEB128
+                   field_id    : u8
+                   delta       : SLEB128 (interpreted mod 2**128) }
+```
+
+Records are emitted in non-descending `(ins_pos, field_id)` order;
+`ins_pos_gap` is the gap from the previous record's `ins_pos` (0 for
+records on the same insn).  An absent `(template_id, ins_pos,
+field_id)` triple means *unchanged from the most-recent correct-path
+emission, or equal to the template default if never seen*.  The delta
+is the unsigned 128-bit value `(cur − baseline) mod 2**128` interpreted
+as signed; readers reconstruct `cur = (baseline + delta) mod 2**128`.
+
+Decoder state: per-stream `cp_field_state` and `wp_field_state` maps
+keyed by `(template_id, ins_pos, field_id) → u128`.  CP state persists
+across the whole body.  At each CP entry, `wp_field_state` is forked
+from the current CP state (snapshot copy) and used for that entry's WP
+chain only; the next chain re-forks from CP, preserving the
+"speculative state rolled back at chain end" invariant.
+
+Field-ID space (mirrors `CST_FID_*` in
+[champsim_tracer.h](champsim_tracer.h)):
+
+| Range / FID  | Family            | Slots | Gated by         | Default              |
+|--------------|-------------------|-------|------------------|----------------------|
+| `0x00`       | `MEMOP_COUNT`     | 1     | —                | template static count |
+| `0x01..0x10` | `LOAD_ADDR`       | 16    | —                | 0 |
+| `0x11..0x20` | `STORE_ADDR`      | 16    | —                | 0 |
+| `0x21..0x30` | `LOAD_DATA`       | 16    | `MEM_DATA`       | 0 |
+| `0x31..0x40` | `STORE_DATA`      | 16    | `MEM_DATA`       | 0 |
+| `0x41..0x50` | `SRC_REG`         | 16    | `REG_DATA`       | 0 |
+| `0x51..0x60` | `DST_REG`         | 16    | `REG_DATA`       | 0 |
+| `0x70`       | `INSN_BYTES_LO`   | 1     | `INSN_MUT`       | template low 8 bytes |
+| `0x71`       | `INSN_BYTES_HI`   | 1     | `INSN_MUT`       | template high bytes |
+| `0x72`       | `INSN_OPCODE`     | 1     | `INSN_MUT`       | template opcode |
+| `0x73`       | `INSN_BRANCH_TYPE`| 1     | `INSN_MUT`       | template branch_type |
+| `0x74`       | `INSN_FLAGS`      | 1     | `INSN_MUT`       | template flags byte |
+| `0x75`       | `INSN_IMMEDIATE`  | 1     | `INSN_MUT`       | template immediate |
+| `0x76`       | `INSN_SIZE`       | 1     | `INSN_MUT`       | template size |
+| `0xFF`       | `EXTENDED`        | —     | reserved         | reader reads `ULEB(ext_id), SLEB(delta)` and skips |
+
+`MEMOP_COUNT` is emitted only for variable-memop mnemonics (its
+default is the template's static `(n_loads, n_stores)`, packed as
+`(n_loads<<8) | n_stores`); fixed-memop mnemonics produce no record.
+`INSN_*` records are reserved for a future SMC observer and are not
+emitted by the current writer (no `CST_FLAG_INSN_MUT` set).
+
+The record-emission rule is mechanical: walk the template
+insn-by-insn; for each insn walk the descriptor table in ascending
+field-id order; for each descriptor slot, if `extract()` returns true
+and the value differs from the per-`(template_id, ins_pos, field_id)`
+baseline, emit one record and update the baseline.  Adding a new
+dynamic field is exactly one entry in `field_descriptors[]` plus one
+`CST_FID_*` constant.
+
+Header feature flags (§1.2) gain `CST_FLAG_INSN_MUT (1<<2)`, set when
+the writer emits `INSN_*` records.  `CST_DYN_FLAG_UNCHANGED` (the
+v1.6 dyn-patch shorthand bit) is removed: a same-template entry with
+no observable changes naturally produces a zero-record delta_section
+(`n_records = 0`, single ULEB byte).
+
+§4 (Dyn-param encoding), §4.1 (preamble), §4.2 (dyn-patch), §5
+(mem-data) and §5.2 (reg-data) below are **superseded** for v1.7;
+they are retained only as historical reference.  The structural
+sections (§1 file layout, §2 header — modulo magic and flags, §3
+body framing — modulo the per-entry delta_section replacing the
+four old sub-sections, §6 templates, §7 trailer) remain unchanged.
+
+---
+
+# champsim_tracer Binary Format — v1.5 Specification (historical)
+
+The remainder of this document describes the v1.5 wire format.  For
+v1.7 see the section above.
+
+### Changes from v1.4
+
+v1.5 is an **incompatible bump**.  The magic number changes from
+`0x14545343` (`"CST\x14"`) to `0x15545343` (`"CST\x15"`); readers must
 refuse files with the old magic.
 
 Summary of on-disk changes:
+
+1. New per-insn template flag bit `CST_INSN_FLAG_VARIABLE_MEMOP`
+   (bit 6 of the template insn flags byte).  Set by the writer for
+   mnemonics whose load/store count varies at runtime (e.g. x86
+   REP MOVS/STOS/CMPS/SCAS, ARM LDM/STM, RISC-V Zcmp `cm.push/pop`,
+   RVV / SVE gather/scatter).  The bit is sourced from the per-ISA
+   mnemonic table at trace time — it is **not** inferred from
+   observed runtime counts — which makes the variability decision
+   stable, declarative, and auditable.
+
+2. The per-entry memop count preamble (§4.1) is now emitted **only**
+   for template insns with `variable_memop = true`.  Non-variable
+   insns rely on the template's static `(n_loads, n_stores)` for
+   their per-execution count and contribute zero preamble bytes.
+   For non-variable insns the writer asserts that every observed
+   (n_loads, n_stores) tuple equals the template's static count;
+   any divergence is a misclassification bug — the mnemonic must
+   be marked `MF_VARIABLE_MEMOP` in its ISA classification table.
+
+   In typical workloads (no string-prefix or RVV/SVE insns) the
+   preamble shrinks to **zero bytes per entry**, eliminating the
+   v1.4 §4.1 overhead entirely.
+
+### Changes from v1.3
+
+v1.4 was an **incompatible bump** from v1.3 (same wire layout, but a
+redundant per-insn `CST_INSN_FLAG_DYNAMIC_MEMOP` bit removed and the
+source-only `RegSnap.size_code` field deleted).  See git history.
+
+### Changes from v1.2
+
+v1.3 is an **incompatible bump**. The magic number changes from
+`0x12545343` (`"CST\x12"`) to `0x13545343` (`"CST\x13"`); readers must
+refuse files with the old magic.
+
+Summary of on-disk changes:
+
+1. The mem-data section (§5) now encodes per-memop values as a
+   single **SLEB128 delta** of the unsigned 128-bit value
+   `(hi << 64) | lo` against the prior value at the same
+   `(template_id, memop slot index)` position, rather than raw
+   little-endian bytes.  This captures the locality typical of
+   stores to loop variables, struct fields, and stack scribbles,
+   where most values change by small integer increments.  A single
+   SLEB byte covers a delta in `[-64, 63]`.  State is initialised to
+   zero on the first appearance of each `(template_id, slot)` pair.
+
+   The per-record `size_code` byte from earlier drafts is **gone**:
+   SLEB is self-delimiting, so the value's encoded width is implicit;
+   the *access* width (1B vs 8B etc.) is not carried on the wire and
+   must be recovered from the template (§6) or the dynamic-memop
+   preamble (§4.1) by any consumer that needs it.  CP and WP states
+   are tracked independently because their memop slots map to
+   different vaddrs.
+
+2. The reg-data section (§5.2) likewise emits a single SLEB128
+   delta per snapshot, against the unsigned 128-bit prior value
+   `(hi << 64) | lo`.  No per-snap size byte is written; register
+   width is implicit in `reg_id` (architecturally fixed per
+   `GenericRegId`).
+
+### Changes from v1.1
+
+v1.2 was an **incompatible bump**. The magic number changed from
+`0x11545343` (`"CST\x11"`) to `0x12545343` (`"CST\x12"`); readers must
+refuse files with the old magic.
+
+Summary of on-disk changes in v1.2:
 
 1. WP event records carry a chain-relative **faulting-insn index**
    when `CST_WP_EVENT_FAULT` is set. See §3.1.2. This lets consumers
@@ -38,13 +200,11 @@ Summary of on-disk changes in v1.1:
    `n_stores` counts (both `u8`). These describe how many load and
    store dyn-params the insn owns on a "normal" execution of the
    template.
-4. A new per-insn flag bit `CST_INSN_FLAG_DYNAMIC_MEMOP` (bit 6 of the
-   insn flags byte) marks an insn whose runtime `(n_loads, n_stores)`
-   may differ entry-to-entry.
-5. Each body entry carries a **dynamic-memop preamble** before its
-   dyn-patch: for every template insn flagged `DYNAMIC_MEMOP`, a ULEB
-   pair `(actual_n_loads, actual_n_stores)` in template-insn order.
-   Non-dynamic insns use the template's static counts unchanged.
+5. Each body entry carries a **per-insn memop count preamble** before
+   its dyn-patch: for every template insn with
+   `n_loads + n_stores > 0`, a ULEB pair
+   `(actual_n_loads, actual_n_stores)` in template-insn order.
+   Insns that never have memops contribute no bytes.
 6. Dyn-params within an entry are ordered by `(insn_index, type)` with
    loads before stores per insn. There is no longer a separate
    `n_loads` field in the dyn-patch record: load/store classification
@@ -78,8 +238,8 @@ are LEB128 per DWARF §7.6.
 
 | Symbol              | Value                | Purpose                       |
 |---------------------|----------------------|-------------------------------|
-| `CST_MAGIC`         | `0x12545343`         | File magic `"CST\x12"` (LE u32) |
-| `CST_TRAILER_MAGIC` | `0x12545343FFFFFFFF` | Trailer sentinel              |
+| `CST_MAGIC`         | `0x15545343`         | File magic `"CST\x15"` (LE u32) |
+| `CST_TRAILER_MAGIC` | `0x15545343FFFFFFFF` | Trailer sentinel              |
 | `CST_TRAILER_SIZE`  | `64` bytes           | Fixed trailer size            |
 
 ### 1.2 Header feature flags (`u8`)
@@ -105,7 +265,7 @@ Byte-aligned, written once at the beginning of the file.
 
 ```
  ┌────────┬────────┬────────┬────────┐
- │ magic[0..3]  (u32 LE = 0x12545343) │   'C'  'S'  'T'  0x12
+ │ magic[0..3]  (u32 LE = 0x15545343) │   'C'  'S'  'T'  0x15
  ├────────┼────────────────────────────┤
  │ isa(u8)│ flags(u8)                  │   trace_isa (TraceISA), §1.2
  ├────────┴────────────────────────────┤
@@ -153,7 +313,8 @@ the body.
  │                                                             previous ENTRY
  ├──────────────────────────────────────────────────────────┤
  │ cp_dynamic_memop_preamble    (§4.1, only if CP template    │
- │                                has any DYNAMIC_MEMOP insns) │
+ │                                has any insn with             │
+ │                                variable_memop = true)        │
  ├──────────────────────────────────────────────────────────┤
  │ cp_dyn_patch                 (§4.2)                        │
  ├──────────────────────────────────────────────────────────┤
@@ -183,7 +344,7 @@ A "length-prefixed section" is:
     num_wp                : ULEB
     for i in 0..num_wp:
       wp_tid_delta                 : SLEB   (delta from running prev, init 0)
-      wp_dynamic_memop_preamble    : §4.1   (only if wp template has DYN insns)
+      wp_dynamic_memop_preamble    : §4.1   (only if wp template has variable_memop insns)
       wp_dyn_patch                 : §4.2
       if CST_FLAG_MEM_DATA:
         wp_mem_data_section : §5
@@ -245,24 +406,34 @@ On disk they are ordered by `(insn_index, type)` — for each
 instruction, all loads precede all stores; instructions appear in
 template order. Load/store classification is **not** written
 explicitly; the consumer reconstructs it positionally using the
-template's per-insn `(n_loads, n_stores)` schema, with the
-dynamic-memop preamble overriding the schema for flagged insns.
+template's per-insn `(n_loads, n_stores)` schema (the static count
+for non-variable insns, the per-entry preamble §4.1 for
+`variable_memop` insns).
 
-### 4.1 Dynamic-memop preamble
+### 4.1 Per-insn memop count preamble
 
-For every template instruction flagged `CST_INSN_FLAG_DYNAMIC_MEMOP`,
-in template-insn order, the entry carries a ULEB pair:
+For every template instruction with `variable_memop = true` (bit 6
+of the template insn flags byte), in template-insn order, the
+entry carries a ULEB pair giving the actual per-execution memop
+count:
 
 ```
     for i in 0..num_insns:
-      if insn[i].flags & CST_INSN_FLAG_DYNAMIC_MEMOP:
+      if insn[i].variable_memop:
         actual_n_loads   : ULEB
         actual_n_stores  : ULEB
 ```
 
-The preamble is emitted even when the entry's dyn-patch is UNCHANGED.
-If the template has no dynamic-memop insns the preamble is empty
-(zero bytes).
+Insns with `variable_memop = false` contribute no bytes; their
+load/store count for every entry equals the template's static
+`(n_loads, n_stores)` exactly.  If the template has no
+`variable_memop` insns at all, the preamble is empty (zero bytes).
+
+The writer asserts that observed runtime counts for non-variable
+insns match the template's static count; a mismatch indicates a
+mnemonic-table misclassification bug.  Variable insns may emit any
+`(actual_n_loads, actual_n_stores)` consistent with the entry's
+total dyn-param count.
 
 ### 4.2 Dyn-patch record
 
@@ -289,9 +460,9 @@ and is keyed on `template_id`. On first sighting of a template
 `prev_dyn` is empty, so every position appears in `changed_len` with
 `delta = cur.value`.
 
-`cur_len` must equal the sum over template insns of
-`insn.n_loads + insn.n_stores`, where dynamic-memop insns' counts come
-from the preamble and other insns' counts come from the template.
+`cur_len` must equal the sum over template insns of the per-entry
+preamble's `actual_n_loads + actual_n_stores` (with insns absent
+from the preamble contributing zero).
 
 ---
 
@@ -305,10 +476,34 @@ Payload = one record per dyn-param, **in the same order** as the
 dyn-param array from §4:
 
 ```
-    size_code : u8            0=1B  1=2B  2=4B  3=8B  4=16B
-    value_lo  : bytes[min(sz,8)]      little-endian
-    value_hi  : bytes[max(sz-8,0)]    little-endian (16-byte only)
+    delta : SLEB128       cur128 − prev128 of the unsigned 128-bit
+                          value (hi << 64) | lo (zero baseline on
+                          first appearance of (template_id, slot))
 ```
+
+The value is treated as an unsigned 128-bit little-endian integer
+(`lo` = low 8 bytes, `hi` = high 8 bytes; for accesses ≤ 8 B `hi` is
+implicitly 0).  The delta is encoded as a single SLEB128 of
+`(cur128 - prev128) mod 2**128`; the decoder recovers
+`cur128 = (prev128 + delta) mod 2**128` and splits it back into
+`cur_lo`/`cur_hi`.
+
+The wire format carries **no per-record access-width byte**.  SLEB is
+self-delimiting, so the value width is implicit.  The semantic access
+width (1B vs 8B vs 16B, used by cache-line-split modeling and similar
+consumers) is recovered from the template (§6) — the per-insn opcode
+tells consumers the architectural memop width.  Consumers that do
+not need width (e.g. ChampSim's address-recompute path) ignore this
+distinction entirely.
+
+The writer masks sub-8-byte stores to their low `data_size`-byte
+window before computing the delta, so a `u8` store of `0xFF` is
+treated as the integer `255` and not as `-1`.  State is tracked
+separately for CP and WP per `(template_id, memop slot)`; both
+states persist for the lifetime of the body stream.  Wrong-path
+memory operations don't mutate guest memory, so WP delta encoding
+compresses repeated speculative reads of the same vaddr to single
+zero-deltas.
 
 A 0 `data_size` from the plugin is remapped to 1 byte (defensive).
 
@@ -336,15 +531,21 @@ The section contains, in template walk order:
 Per-snap record:
 
 ```
-    size_code : u8                0=4B  1=8B  2=16B
-    delta_lo  : SLEB128            value_lo - state_lo[reg_id]
-    delta_hi  : SLEB128            present iff size_code == 2
-                                   value_hi - state_hi[reg_id]
+    delta : SLEB128       cur128 − prev128 of the unsigned 128-bit
+                          register value (hi << 64) | lo (zero
+                          baseline on first capture of reg_id)
 ```
 
 Values are 64-bit little-endian halves of the register value
-(`lo` = bytes 0..7, `hi` = bytes 8..15).  Records are byte-aligned;
-no padding bits are introduced anywhere in the section.
+(`lo` = bytes 0..7, `hi` = bytes 8..15).  For 4B/8B regs `hi` is
+implicitly 0; the prior `hi` half stays 0 across the whole stream
+for those regs, so the delta naturally encodes only the low half.
+For 16B regs the value is the unsigned 128-bit integer
+`(hi << 64) | lo` and the delta is the single SLEB128 of
+`(cur128 - prev128) mod 2**128`.  No size byte is carried on the
+wire; register width is implicit in `reg_id` (each `GenericRegId`
+is architecturally fixed in width).  Records are byte-aligned; no
+padding bits are introduced anywhere in the section.
 
 ### Decoder state
 
@@ -355,10 +556,10 @@ The decoder maintains two parallel arrays
 * Both arrays are initialised to **all zeros** at the start of the
   body stream (immediately after the header / before the first
   `BODY_TAG_ENTRY`).
-* After reading `delta_lo` for `reg_id != REG_NONE`, the decoder
-  updates `state_lo[reg_id] += delta_lo` (mod 2⁶⁴) and reports the
-  updated value as the snap's absolute `lo`.  Likewise for
-  `delta_hi` when `size_code == 2`.
+* After reading `delta` for `reg_id != REG_NONE`, the decoder
+  reconstructs `cur128 = (prev128 + delta) mod 2**128` from the
+  current state, splits it into `lo`/`hi` halves, and updates both
+  `state_lo[reg_id]` and `state_hi[reg_id]`.
 * When `reg_id == REG_NONE` (an unbound operand slot, e.g. the
   index register of a base-only addressing mode), the decoder
   treats the deltas as raw values against a zero baseline and does
@@ -395,11 +596,11 @@ their first capture.
   forces `CF_SINGLE_STEP|1` (one guest insn per fragment), this is
   semantically equivalent to a per-insn pre-execution snapshot.
 * If the runtime register name is empty or unresolvable on the
-  target, the writer emits a zero snap (`size_code=0`, `delta_lo=0`)
+  target, the writer emits a zero-baseline snap (`delta=0`)
   which leaves the state slot unchanged.  Such cases are also
   logged to `unknown_regs.log` next to the trace.
 * Hardware registers wider than 16 B (e.g. 32 B AVX, 64 B AVX-512)
-  are truncated to their low 16 B and emitted with `size_code=2`.
+  are truncated to their low 16 B before being encoded.
 
 ### Validator usage
 
@@ -442,7 +643,7 @@ Mandatory in v1.1. Written after `BODY_TAG_END`, at file offset
  │     bit 0         CST_INSN_FLAG_BRANCH_COND             │
  │     bit 1         CST_INSN_FLAG_HAS_IMM                 │
  │     bits 2..5     sync_hint (4-bit SyncEventType)       │
- │     bit 6         CST_INSN_FLAG_DYNAMIC_MEMOP           │
+ │     bit 6         CST_INSN_FLAG_VARIABLE_MEMOP          │
  │     bit 7         reserved, 0                           │
  │   n_src           (u8)                                  │
  │   n_dst           (u8)                                  │
@@ -460,13 +661,11 @@ Mandatory in v1.1. Written after `BODY_TAG_END`, at file offset
 After delay-slot reordering performed by the writer, the branch (if
 any) is always the last instruction of a template.
 
-`n_loads` and `n_stores` are the per-insn default (most-common)
-dyn-param counts. If the writer ever observes a different count for a
-given insn, it sets `CST_INSN_FLAG_DYNAMIC_MEMOP` on that insn and
-the runtime counts are carried in each entry's preamble (§4.1). The
-template's `n_loads`/`n_stores` are the maximum observed across all
-entries when `DYNAMIC_MEMOP` is set; they may exceed the per-entry
-preamble values but never contradict them.
+`n_loads` and `n_stores` are the per-insn observed-max dyn-param
+counts across the entire body stream.  When non-zero, every body
+entry's preamble (§4.1) carries the per-entry actual counts for
+this insn.  The per-entry counts may be zero or any value up to the
+template maximum.
 
 ---
 
@@ -482,7 +681,7 @@ the body and/or templates offsets.
  │ body_off           (u64 LE)   offset of first body record│
  │ body_byte_count    (u64 LE)   bytes from body_off to end │
  │                                of BODY_TAG_END record    │
- │ trailer_magic      (u64 LE)   0x12545343FFFFFFFF         │
+ │ trailer_magic      (u64 LE)   0x14545343FFFFFFFF         │
  │ zero padding to 64 bytes                                 │
  └─────────────────────────────────────────────────────────┘
 ```

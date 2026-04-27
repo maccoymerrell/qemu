@@ -34,7 +34,7 @@ exercises the plugin across:
                +-----------+
                      |
                      v
-                <prog>.wpt
+                <prog>.cst
                      |
                      v
              +---------------+         +------------------+
@@ -59,7 +59,7 @@ exercises the plugin across:
    Missing toolchains are skipped, not errors.
 
 3. **`genval trace`** runs each `out/<prog>_<isa>` under `qemu-<isa>` with
-   `libchampsim_tracer.so`, producing `out/<prog>_<isa>.wpt` / `.txt`.
+   `libchampsim_tracer.so`, producing `out/<prog>_<isa>.cst` / `.txt`.
 
 4. **`genval analyze`** disassembles the compiled binary with Capstone
    (reusing the mnemonic → `GenericOpcode` mapping from
@@ -67,7 +67,7 @@ exercises the plugin across:
    *per-block expected opcode sequences* — the ground truth for template
    validation.
 
-5. **`genval validate`** decodes the `.wpt` file (via
+5. **`genval validate`** decodes the `.cst` file (via
    `champsim_tracer_decode.decode_champsim_tracer`) and checks, for every assertion in
    the metadata:
      * correct-path BB execution order matches `metadata.correct_path`,

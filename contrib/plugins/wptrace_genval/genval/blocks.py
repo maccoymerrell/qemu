@@ -547,6 +547,114 @@ class FpArith(CodeBlock):
 
 
 # ---------------------------------------------------------------------------
+# Block: HOT_LOOP — counted register-only loop that re-executes its body
+# many times.  Used to drive long-running traces ("trace a large program
+# in its entirety") from a small CFG.
+#
+# Layout produced by the C++ compiler at -O1:
+#
+#     <prologue>            ; load n  (s0)  and acc  (s1)
+#     <loop body>:          ; pure-register multiply-add, no memops
+#         acc = acc * M + A
+#         n  -= 1
+#         bnez n, <loop body>
+#     <epilogue>            ; store acc (s2)
+#
+# The plugin observes (typically) one TB for the loop body that
+# re-executes `iters` times — a single template with `iters` runtime
+# entries.  All loads/stores live outside the loop body so the validator
+# `cp_memops` multiset (1 load(n) + 1 load(seed) + 1 store(acc))
+# matches independently of how many iterations the loop ran.
+#
+# The iteration count is read from arena[s0] (planted at init), not a
+# compile-time constant, which prevents the compiler from unrolling or
+# constant-folding the loop.  An additional `asm volatile` clobber on
+# `acc` inside the loop body forbids vectorization / loop-invariant
+# motion.
+# ---------------------------------------------------------------------------
+
+@register
+class HotLoop(CodeBlock):
+    name = "hot_loop"
+    num_successors = 1
+    scratch_slots = 4
+
+    # Iteration count.  Set by the generator (via the CLI's --hot-iters
+    # flag) before planning so plan() can compute the deterministic
+    # final accumulator value.  Default is conservative so accidental
+    # inclusion in a small trace doesn't blow past --stop.
+    iters: ClassVar[int] = 64
+
+    # Loop-body constants.  Chosen so the recurrence is bijective and
+    # produces a non-trivial value spectrum across iterations.
+    _MULT: ClassVar[int] = 0x100000001B3        # FNV-1a 64-bit prime
+    _ADD:  ClassVar[int] = 0x9E3779B97F4A7C15   # 2^64 / phi
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        s0, s1, s2, _s3 = ctx.scratch_slots
+        n = int(cls.iters)
+        if n <= 0:
+            n = 1
+        seed = ctx.rng.randrange(1, 1 << 48) | 1
+        # Closed-form for the linear recurrence acc_{i+1} = M*acc_i + A
+        # (mod 2^64). Computes (M^n, sum_{i<n} M^i) by fast doubling in
+        # O(log n) instead of O(n) — necessary at hot_iters in the
+        # tens of millions.
+        MASK = (1 << 64) - 1
+        M = cls._MULT
+        A = cls._ADD
+        def power_and_sum(k: int) -> tuple[int, int]:
+            if k == 0:
+                return (1, 0)
+            if k == 1:
+                return (M & MASK, 1)
+            half, rem = divmod(k, 2)
+            ph, sh = power_and_sum(half)
+            p_full = (ph * ph) & MASK
+            s_full = (sh * (1 + ph)) & MASK
+            if rem:
+                p_full = (p_full * M) & MASK
+                s_full = (1 + M * s_full) & MASK
+            return (p_full, s_full)
+        Mn, Sn = power_and_sum(n)
+        acc = ((Mn * seed) + (A * Sn)) & MASK
+        return BlockPlan(
+            block_id=ctx.block_id, name=cls.name,
+            memops=[
+                ExpectedMemOp("load", s0, 8, n),
+                ExpectedMemOp("load", s1, 8, seed),
+                ExpectedMemOp("store", s2, 8, acc),
+            ],
+            coarse_opcodes={
+                "LOAD": 1, "STORE": 1,
+                "INT_MUL": 1, "INT_ADD": 1, "INT_SUB": 1,
+                "BRANCH": 1,
+            },
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        s0 = plan.memops[0].arena_u64_index   # iteration count
+        s1 = plan.memops[1].arena_u64_index   # accumulator seed
+        s2 = plan.memops[2].arena_u64_index   # final accumulator
+        return (
+            f"{_emit_label(ctx.block_id)}"
+            f"{{\n"
+            f"  uint64_t n   = {_volatile_load_u64(s0)};\n"
+            f"  uint64_t acc = {_volatile_load_u64(s1)};\n"
+            f"  do {{\n"
+            f"    acc = acc * 0x{cls._MULT:X}ULL + 0x{cls._ADD:X}ULL;\n"
+            f"    asm volatile(\"\" : \"+r\"(acc) : : \"memory\");\n"
+            f"    n -= 1;\n"
+            f"  }} while (n != 0);\n"
+            f"  {_volatile_store_u64(s2, 'acc')}\n"
+            f"  {_goto_successor(ctx, 0)}\n"
+            f"}}\n"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Block: EXIT — terminal block, performs a direct exit(0) syscall
 # ---------------------------------------------------------------------------
 
@@ -2232,12 +2340,16 @@ asm_probe_block(
     name="probe_arm_shift",
     per_isa={
         "aarch64": {
+            # Register-form shifts have dedicated AArch64 opcodes
+            # (LSLV/LSRV/ASRV, mnemonics LSL/LSR/ASR with reg operand).
+            # Immediate-form shifts encode as UBFM/SBFM and are
+            # exercised by probe_arm_sxt_uxt instead.
             "asm":      (
-                '"lsl x0, x1, #3\\n\\t"\n'
-                '    "lsr x2, x3, #2\\n\\t"\n'
-                '    "asr x4, x5, #1"'
+                '"lsl x0, x1, x2\\n\\t"\n'
+                '    "lsr x3, x4, x5\\n\\t"\n'
+                '    "asr x6, x7, x0"'
             ),
-            "clobbers": '"x0","x2","x4"',
+            "clobbers": '"x0","x3","x6"',
             "opcodes":  ["SHL", "SHR", "SAR"],
         },
     },
@@ -2651,18 +2763,11 @@ asm_probe_block(
     name="probe_mips_fp_arith",
     per_isa={
         "mipsel": {
-            # NOTE on classification: Capstone defines distinct insn-ids
-            # for FP arith (MIPS_INS_FADD=266, FSUB=312, FMUL=298,
-            # FDIV=279) and the champsim_tracer MIPS mnemonic table DOES map
-            # them to FP_ADD/FP_SUB/FP_MUL/FP_DIV.  However this build
-            # of Capstone's MIPS classifier does not emit those ids:
-            # `add.d/sub.d/mul.d/div.d` decode with the integer ids
-            # MIPS_INS_ADD/SUB/MUL/DIV (verified empirically) which the
-            # table maps to INT_ADD/SUB/MUL/DIV.  The id->opcode table
-            # alone cannot disambiguate the integer and FP forms; doing
-            # so would require operand-class inspection in the plugin.
-            # Until that is added, the probe asserts what the trace
-            # actually contains.
+            # Capstone 6 emits distinct FP instruction IDs for `add.d`/`sub.d`/
+            # `mul.d`/`div.d` (MIPS_INS_ADD_D, SUB_D, MUL_D, DIV_D), which the
+            # mips classification table maps to FP_ADD/FP_SUB/FP_MUL/FP_DIV.
+            # (Capstone 5 emitted the integer-form IDs and we asserted INT_*
+            # here as a workaround — no longer needed under cs6.)
             "asm":      (
                 '"add.d $f0, $f2, $f4\\n\\t"\n'
                 '    "sub.d $f6, $f8, $f10\\n\\t"\n'
@@ -2670,7 +2775,7 @@ asm_probe_block(
                 '    "div.d $f0, $f4, $f6"'
             ),
             "clobbers": '"$f0","$f6","$f12"',
-            "opcodes":  ["INT_ADD", "INT_SUB", "INT_MUL", "INT_DIV"],
+            "opcodes":  ["FP_ADD", "FP_SUB", "FP_MUL", "FP_DIV"],
         },
     },
 )
@@ -2708,9 +2813,11 @@ asm_probe_block(
     per_isa={
         "mipsel": {
             # `nop` on MIPS is an alias for `sll $zero, $zero, 0`.
+            # Capstone 6 reports MIPS_INS_SLL (mapped to GEN_OP_SHL),
+            # not a synthetic MIPS_INS_NOP.
             "asm":      '"nop\\n\\t"\n    "nop"',
             "clobbers": '"memory"',
-            "opcodes":  ["NOP"],
+            "opcodes":  ["SHL"],
         },
     },
 )
@@ -2755,16 +2862,18 @@ asm_probe_block(
     name="probe_arm_mov_not_neg",
     per_isa={
         "aarch64": {
-            # MOV xn, xm                 → GEN_OP_MOV
-            # MVN xn, xm                 → GEN_OP_NOT
-            # NEG xn, xm                 → GEN_OP_NEG
+            # On AArch64 these are not distinct opcodes in silicon:
+            #   mov xn, xm   -> ORR  xn, xzr, xm     (GEN_OP_OR)
+            #   mvn xn, xm   -> ORN  xn, xzr, xm     (GEN_OP_OR)
+            #   neg xn, xm   -> SUB  xn, xzr, xm     (GEN_OP_INT_SUB)
+            # Capstone 6 emits the underlying ORR/ORN/SUB ids.
             "asm":      (
                 '"mov x0, x1\\n\\t"\n'
                 '    "mvn x2, x3\\n\\t"\n'
                 '    "neg x4, x5"'
             ),
             "clobbers": '"x0","x2","x4"',
-            "opcodes":  ["MOV", "NOT", "NEG"],
+            "opcodes":  ["OR", "INT_SUB"],
         },
     },
 )
@@ -2773,14 +2882,15 @@ asm_probe_block(
     name="probe_arm_cmp_test",
     per_isa={
         "aarch64": {
-            # CMP xn, xm  (alias of SUBS xzr, xn, xm) → GEN_OP_CMP
-            # TST xn, xm  (alias of ANDS xzr, xn, xm) → GEN_OP_TEST
+            # AArch64 has no dedicated CMP/TEST opcode.
+            #   cmp xn, xm  -> SUBS xzr, xn, xm  (GEN_OP_INT_SUB, writes NZCV)
+            #   tst xn, xm  -> ANDS xzr, xn, xm  (GEN_OP_AND,     writes NZCV)
             "asm":      (
                 '"cmp x0, x1\\n\\t"\n'
                 '    "tst x2, x3"'
             ),
             "clobbers": '"cc"',
-            "opcodes":  ["CMP", "TEST"],
+            "opcodes":  ["INT_SUB", "AND"],
         },
     },
 )
@@ -2789,9 +2899,13 @@ asm_probe_block(
     name="probe_arm_cmov_setcc",
     per_isa={
         "aarch64": {
-            # CSEL xd, xn, xm, cond  → GEN_OP_CMOV
-            # CSET xd, cond          → GEN_OP_SETCC
-            # CSINC xd, xn, xm, cond → GEN_OP_CMOV (covers a second CMOV id)
+            # AArch64 has no SETCC opcode.  cset xd, cond is encoded as
+            # csinc xd, xzr, xzr, !cond, so it classifies as GEN_OP_CMOV
+            # (the same family as CSEL/CSINC/CSINV/CSNEG).
+            #   cmp   -> SUBS  (GEN_OP_INT_SUB, writes NZCV)
+            #   csel  -> CSEL  (GEN_OP_CMOV)
+            #   cset  -> CSINC (GEN_OP_CMOV)
+            #   csinc -> CSINC (GEN_OP_CMOV)
             "asm":      (
                 '"cmp x0, x1\\n\\t"\n'
                 '    "csel x2, x3, x4, eq\\n\\t"\n'
@@ -2799,7 +2913,7 @@ asm_probe_block(
                 '    "csinc x6, x7, x0, gt"'
             ),
             "clobbers": '"x2","x5","x6","cc"',
-            "opcodes":  ["CMOV", "SETCC"],
+            "opcodes":  ["CMOV", "INT_SUB"],
         },
     },
 )
@@ -3010,13 +3124,15 @@ asm_probe_block(
     name="probe_mips_mov",
     per_isa={
         "mipsel": {
-            # MIPS has no dedicated reg-to-reg MOV instruction; the
-            # canonical idiom is `move $rd, $rs` which is an alias for
-            # `addu $rd, $zero, $rs`.  Capstone reports it as
-            # MIPS_INS_MOVE which the mnemonic table maps to GEN_OP_MOV.
+            # MIPS has no dedicated reg-to-reg MOV instruction.  The
+            # canonical idiom `move $rd, $rs` assembles to either
+            # `addu $rd, $zero, $rs` or `or $rd, $zero, $rs`.  Capstone 6
+            # reports the underlying real opcode (MIPS_INS_OR for the
+            # GAS default) rather than a synthetic MIPS_INS_MOVE pseudo,
+            # so the hardware-honest expectation here is OR.
             "asm":      '"move $t0, $t1"',
             "clobbers": '"$t0"',
-            "opcodes":  ["MOV"],
+            "opcodes":  ["OR"],
         },
     },
 )
@@ -3025,18 +3141,18 @@ asm_probe_block(
     name="probe_mips_neg_not",
     per_isa={
         "mipsel": {
-            # NEGU is an alias for SUBU rd, $zero, rs → MIPS_INS_NEGU
-            #   → GEN_OP_NEG (per the mnemonic table; if that id is
-            #     unmapped on this Capstone build it will fall back to
-            #     SUBU/INT_SUB and the assertion below will flag it).
-            # NOT  is an alias for NOR  rd, $zero, rs → MIPS_INS_NOT
-            #   → GEN_OP_NOT.
+            # NEGU is the GAS alias for `subu $rd, $zero, $rs`, NOT for
+            # `nor $rd, $zero, $rs`.  Capstone 6 reports the underlying
+            # real opcodes (MIPS_INS_SUBU and MIPS_INS_NOR) rather than
+            # MIPS_INS_NEGU/MIPS_INS_NOT pseudos, so the hardware-honest
+            # expectations are INT_SUB and OR (NOR maps to GEN_OP_OR in
+            # the classification table).
             "asm":      (
                 '"negu $t0, $t1\\n\\t"\n'
                 '    "not  $t2, $t3"'
             ),
             "clobbers": '"$t0","$t2"',
-            "opcodes":  ["NEG", "NOT"],
+            "opcodes":  ["INT_SUB", "OR"],
         },
     },
 )

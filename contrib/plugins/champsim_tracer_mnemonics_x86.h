@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include <capstone/capstone.h>
 #include <capstone/x86.h>
 
 static unsigned int cap_mode_x86(const char *target_name)
@@ -17,7 +18,7 @@ static unsigned int cap_mode_x86(const char *target_name)
      * the same encodings; we don't currently distinguish 32-vs-64-bit
      * instruction streams here.
      */
-    return QEMU_PLUGIN_CAP_MODE_64;
+    return CS_MODE_64;
 }
 
 /* X86: 191/245 classified, 54 REG_NONE */
@@ -215,6 +216,99 @@ static const RegClassification x86_reg_class[X86_REG_ENDING] = {
     [X86_REG_R15W] = { REG_GPR13 },  /* r15w */
 };
 
+/*
+ * Implicit stack memops on x86_64.
+ *
+ * Capstone exposes the destination/source register operand of
+ * push/pop/call/ret as the syntactic operand but does NOT emit an
+ * OP_MEM for the implicit (rsp) stack access.  At runtime QEMU's
+ * vcpu_mem_cb still fires for that stack store/load, so the static
+ * schema (n_loads/n_stores) and the runtime dyn_param multiset
+ * disagree by one per insn.  These refiners patch the static count
+ * to match architectural reality.
+ *
+ *   push family (push, pushf/pushfq, call): 1 implicit stack store
+ *   pop  family (pop,  leave, ret):         1 implicit stack load
+ *
+ * INT/SYSCALL/SYSENTER are intentionally excluded — Linux x86_64
+ * uses sysret-style register-save (rcx, r11), not the stack.
+ */
+static void refine_x86_implicit_stack_store(
+    const struct qemu_plugin_insn_info *info, InsnFields *f)
+{
+    (void)info;
+    if (f->n_stores < 0xFF) f->n_stores++;
+}
+
+static void refine_x86_implicit_stack_load(
+    const struct qemu_plugin_insn_info *info, InsnFields *f)
+{
+    (void)info;
+    if (f->n_loads < 0xFF) f->n_loads++;
+}
+
+/*
+ * Capstone (≤ v5.0) reports incorrect operand-access flags for the
+ * memory operand of a few SSE move-to-memory mnemonics: MOVQ
+ * (66 0F D6) and MOVUPS (0F 11) tag the destination memory operand
+ * as CS_AC_READ instead of CS_AC_WRITE.  Without a fix-up the static
+ * schema thinks these stores are loads, runtime emits a real STORE
+ * dyn_param, and the consumer mis-classifies it.
+ *
+ * The refiner overrides n_loads/n_stores by inspecting operand
+ * positions (Intel syntax: op[0] = destination).  Counts at most one
+ * OP_MEM in either direction, which matches every form of these
+ * mnemonics.
+ */
+/*
+ * Capstone (≤ v5.0) reports incorrect operand-access flags for the
+ * memory operand of a few SSE move-to-memory mnemonics: MOVQ
+ * (66 0F D6) and MOVUPS (0F 11) tag the destination memory operand
+ * as CS_AC_READ instead of CS_AC_WRITE.  Without a fix-up the static
+ * schema thinks these stores are loads, runtime emits a real STORE
+ * dyn_param, and the consumer mis-classifies it.
+ *
+ * The fix uses the access flag of the *register* operand (which is
+ * reliable in all observed Capstone versions) to decide direction:
+ *   reg has READ  -> reg is the source -> mem is the destination = STORE
+ *   reg has WRITE -> reg is the destination -> mem is the source  = LOAD
+ *
+ * Counts at most one OP_MEM in either direction, which matches every
+ * form of these mnemonics (no reg/reg form contains an OP_MEM, so
+ * the loop simply leaves n_loads = n_stores = 0).
+ */
+static void refine_x86_sse_mov_access(
+    const struct qemu_plugin_insn_info *info, InsnFields *f)
+{
+    f->n_loads = 0;
+    f->n_stores = 0;
+
+    bool has_mem = false;
+    bool reg_is_src = false;
+    bool reg_is_dst = false;
+    for (uint8_t i = 0; i < info->n_operands; i++) {
+        const qemu_plugin_operand *op = &info->operands[i];
+        if (op->type == QEMU_PLUGIN_OP_MEM) {
+            has_mem = true;
+        } else if (op->type == QEMU_PLUGIN_OP_REG) {
+            if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
+                reg_is_src = true;
+            }
+            if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
+                reg_is_dst = true;
+            }
+        }
+    }
+    if (!has_mem) {
+        return;
+    }
+    if (reg_is_dst && !reg_is_src) {
+        f->n_loads = 1;
+    } else if (reg_is_src && !reg_is_dst) {
+        f->n_stores = 1;
+    }
+}
+
 /* X86: 440/1524 classified, 1084 unknown */
 static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
     [X86_INS_ADC]                   = { GEN_OP_INT_ADC,   BRANCH_NONE,          MF_NONE },
@@ -234,7 +328,8 @@ static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
     [X86_INS_BTC]                   = { GEN_OP_TEST,      BRANCH_NONE,          MF_NONE },
     [X86_INS_BTR]                   = { GEN_OP_TEST,      BRANCH_NONE,          MF_NONE },
     [X86_INS_BTS]                   = { GEN_OP_TEST,      BRANCH_NONE,          MF_NONE },
-    [X86_INS_CALL]                  = { GEN_OP_CALL,      BRANCH_DIRECT_CALL,   MF_NONE },
+    [X86_INS_CALL]                  = { GEN_OP_CALL,      BRANCH_DIRECT_CALL,   MF_NONE,
+                                        .refine = refine_x86_implicit_stack_store },
     [X86_INS_CBW]                   = { GEN_OP_MOVSX,     BRANCH_NONE,          MF_NONE },
     [X86_INS_CDQ]                   = { GEN_OP_MOVSX,     BRANCH_NONE,          MF_NONE },
     [X86_INS_CDQE]                  = { GEN_OP_MOVSX,     BRANCH_NONE,          MF_NONE },
@@ -325,7 +420,8 @@ static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
     [X86_INS_FLD1]                  = { GEN_OP_FP_MOV,    BRANCH_NONE,          MF_NONE },
     [X86_INS_FLD]                   = { GEN_OP_FP_MOV,    BRANCH_NONE,          MF_NONE },
     [X86_INS_LEA]                   = { GEN_OP_LEA,       BRANCH_NONE,          MF_NONE },
-    [X86_INS_LEAVE]                 = { GEN_OP_POP,       BRANCH_NONE,          MF_NONE },
+    [X86_INS_LEAVE]                 = { GEN_OP_POP,       BRANCH_NONE,          MF_NONE,
+                                        .refine = refine_x86_implicit_stack_load },
     [X86_INS_LFENCE]                = { GEN_OP_FENCE,     BRANCH_NONE,          MF_ATOMIC },
     [X86_INS_LOOPNE]                = { GEN_OP_BRANCH,    BRANCH_COND_DIRECT,   MF_NONE },
     [X86_INS_LZCNT]                 = { GEN_OP_AND,       BRANCH_NONE,          MF_NONE },
@@ -337,7 +433,8 @@ static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
     [X86_INS_CVTTPD2PI]             = { GEN_OP_FP_CVT,    BRANCH_NONE,          MF_NONE },
     [X86_INS_CVTTPS2PI]             = { GEN_OP_FP_CVT,    BRANCH_NONE,          MF_NONE },
     [X86_INS_MOVD]                  = { GEN_OP_VEC_MOV,   BRANCH_NONE,          MF_NONE },
-    [X86_INS_MOVQ]                  = { GEN_OP_MOV,       BRANCH_NONE,          MF_NONE },
+    [X86_INS_MOVQ]                  = { GEN_OP_MOV,       BRANCH_NONE,          MF_NONE,
+                                        .refine = refine_x86_sse_mov_access },
     [X86_INS_PADDB]                 = { GEN_OP_VEC_ADD,   BRANCH_NONE,          MF_NONE },
     [X86_INS_PADDD]                 = { GEN_OP_VEC_ADD,   BRANCH_NONE,          MF_NONE },
     [X86_INS_PADDQ]                 = { GEN_OP_VEC_ADD,   BRANCH_NONE,          MF_NONE },
@@ -373,16 +470,17 @@ static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
     [X86_INS_MOVHPS]                = { GEN_OP_VEC_MOV,   BRANCH_NONE,          MF_NONE },
     [X86_INS_MOVLPD]                = { GEN_OP_VEC_MOV,   BRANCH_NONE,          MF_NONE },
     [X86_INS_MOVLPS]                = { GEN_OP_VEC_MOV,   BRANCH_NONE,          MF_NONE },
-    [X86_INS_MOVSB]                 = { GEN_OP_MOVSX,     BRANCH_NONE,          MF_NONE },
+    [X86_INS_MOVSB]                 = { GEN_OP_MOVSX,     BRANCH_NONE,          MF_VARIABLE_MEMOP },
     [X86_INS_MOVSD]                 = { GEN_OP_FP_MOV,    BRANCH_NONE,          MF_NONE },
     [X86_INS_MOVSLDUP]              = { GEN_OP_MOVSX,     BRANCH_NONE,          MF_NONE },
-    [X86_INS_MOVSQ]                 = { GEN_OP_MOVSX,     BRANCH_NONE,          MF_NONE },
+    [X86_INS_MOVSQ]                 = { GEN_OP_MOVSX,     BRANCH_NONE,          MF_VARIABLE_MEMOP },
     [X86_INS_MOVSS]                 = { GEN_OP_FP_MOV,    BRANCH_NONE,          MF_NONE },
-    [X86_INS_MOVSW]                 = { GEN_OP_MOVSX,     BRANCH_NONE,          MF_NONE },
+    [X86_INS_MOVSW]                 = { GEN_OP_MOVSX,     BRANCH_NONE,          MF_VARIABLE_MEMOP },
     [X86_INS_MOVSX]                 = { GEN_OP_MOVSX,     BRANCH_NONE,          MF_NONE },
     [X86_INS_MOVSXD]                = { GEN_OP_MOVSX,     BRANCH_NONE,          MF_NONE },
     [X86_INS_MOVUPD]                = { GEN_OP_VEC_MOV,   BRANCH_NONE,          MF_NONE },
-    [X86_INS_MOVUPS]                = { GEN_OP_VEC_MOV,   BRANCH_NONE,          MF_NONE },
+    [X86_INS_MOVUPS]                = { GEN_OP_VEC_MOV,   BRANCH_NONE,          MF_NONE,
+                                        .refine = refine_x86_sse_mov_access },
     [X86_INS_MOVZX]                 = { GEN_OP_MOVZX,     BRANCH_NONE,          MF_NONE },
     [X86_INS_MUL]                   = { GEN_OP_INT_MUL,   BRANCH_NONE,          MF_NONE },
     [X86_INS_MULPD]                 = { GEN_OP_FP_MUL,    BRANCH_NONE,          MF_NONE },
@@ -403,18 +501,23 @@ static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
     [X86_INS_PCMPISTRI]             = { GEN_OP_VEC_LOGIC, BRANCH_NONE,          MF_NONE },
     [X86_INS_PMULLD]                = { GEN_OP_VEC_MUL,   BRANCH_NONE,          MF_NONE },
     [X86_INS_POPCNT]                = { GEN_OP_AND,       BRANCH_NONE,          MF_NONE },
-    [X86_INS_POP]                   = { GEN_OP_POP,       BRANCH_NONE,          MF_NONE },
+    [X86_INS_POP]                   = { GEN_OP_POP,       BRANCH_NONE,          MF_NONE,
+                                        .refine = refine_x86_implicit_stack_load },
     [X86_INS_PSHUFD]                = { GEN_OP_VEC_SHUF,  BRANCH_NONE,          MF_NONE },
     [X86_INS_PSLLDQ]                = { GEN_OP_VEC_SHUF,  BRANCH_NONE,          MF_NONE },
     [X86_INS_PSRLDQ]                = { GEN_OP_VEC_SHUF,  BRANCH_NONE,          MF_NONE },
     [X86_INS_PUNPCKLQDQ]            = { GEN_OP_VEC_SHUF,  BRANCH_NONE,          MF_NONE },
-    [X86_INS_PUSH]                  = { GEN_OP_PUSH,      BRANCH_NONE,          MF_NONE },
-    [X86_INS_PUSHF]                 = { GEN_OP_PUSH,      BRANCH_NONE,          MF_NONE },
-    [X86_INS_PUSHFQ]                = { GEN_OP_PUSH,      BRANCH_NONE,          MF_NONE },
+    [X86_INS_PUSH]                  = { GEN_OP_PUSH,      BRANCH_NONE,          MF_NONE,
+                                        .refine = refine_x86_implicit_stack_store },
+    [X86_INS_PUSHF]                 = { GEN_OP_PUSH,      BRANCH_NONE,          MF_NONE,
+                                        .refine = refine_x86_implicit_stack_store },
+    [X86_INS_PUSHFQ]                = { GEN_OP_PUSH,      BRANCH_NONE,          MF_NONE,
+                                        .refine = refine_x86_implicit_stack_store },
     [X86_INS_RDSSPQ]                = { GEN_OP_NOP,       BRANCH_NONE,          MF_NONE },
     [X86_INS_RDTSC]                 = { GEN_OP_NOP,       BRANCH_NONE,          MF_NONE },
     [X86_INS_RCL]                   = { GEN_OP_ROL,       BRANCH_NONE,          MF_NONE },
-    [X86_INS_RET]                   = { GEN_OP_RET,       BRANCH_RETURN,        MF_NONE },
+    [X86_INS_RET]                   = { GEN_OP_RET,       BRANCH_RETURN,        MF_NONE,
+                                        .refine = refine_x86_implicit_stack_load },
     [X86_INS_RCR]                   = { GEN_OP_ROR,       BRANCH_NONE,          MF_NONE },
     [X86_INS_ROL]                   = { GEN_OP_ROL,       BRANCH_NONE,          MF_NONE },
     [X86_INS_ROR]                   = { GEN_OP_ROR,       BRANCH_NONE,          MF_NONE },
@@ -448,9 +551,9 @@ static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
     [X86_INS_SQRTSD]                = { GEN_OP_FP_SQRT,   BRANCH_NONE,          MF_NONE },
     [X86_INS_SQRTSS]                = { GEN_OP_FP_SQRT,   BRANCH_NONE,          MF_NONE },
     [X86_INS_STMXCSR]               = { GEN_OP_STORE,     BRANCH_NONE,          MF_NONE },
-    [X86_INS_STOSB]                 = { GEN_OP_STORE,     BRANCH_NONE,          MF_NONE },
-    [X86_INS_STOSQ]                 = { GEN_OP_STORE,     BRANCH_NONE,          MF_NONE },
-    [X86_INS_STOSW]                 = { GEN_OP_STORE,     BRANCH_NONE,          MF_NONE },
+    [X86_INS_STOSB]                 = { GEN_OP_STORE,     BRANCH_NONE,          MF_VARIABLE_MEMOP },
+    [X86_INS_STOSQ]                 = { GEN_OP_STORE,     BRANCH_NONE,          MF_VARIABLE_MEMOP },
+    [X86_INS_STOSW]                 = { GEN_OP_STORE,     BRANCH_NONE,          MF_VARIABLE_MEMOP },
     [X86_INS_FST]                   = { GEN_OP_FP_MOV,    BRANCH_NONE,          MF_NONE },
     [X86_INS_FSTP]                  = { GEN_OP_FP_MOV,    BRANCH_NONE,          MF_NONE },
     [X86_INS_SUB]                   = { GEN_OP_INT_SUB,   BRANCH_NONE,          MF_NONE },
@@ -695,7 +798,7 @@ static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
     [X86_INS_SARX]                        = { GEN_OP_SAR,    BRANCH_NONE,           MF_NONE },
     [X86_INS_SHLX]                        = { GEN_OP_SHL,    BRANCH_NONE,           MF_NONE },
     [X86_INS_SHRX]                        = { GEN_OP_SHR,    BRANCH_NONE,           MF_NONE },
-    [X86_INS_STOSD]                       = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },
+    [X86_INS_STOSD]                       = { GEN_OP_STORE,  BRANCH_NONE,           MF_VARIABLE_MEMOP },
     [X86_INS_UD2]                         = { GEN_OP_NOP,    BRANCH_NONE,           MF_NONE },
     [X86_INS_VADDSUBPD]                   = { GEN_OP_FP_ADD, BRANCH_NONE,           MF_NONE },
     [X86_INS_VADDSUBPS]                   = { GEN_OP_FP_ADD, BRANCH_NONE,           MF_NONE },

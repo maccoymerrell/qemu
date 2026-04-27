@@ -31,15 +31,37 @@ extern "C" {
  * compiled in the C tables TU can manipulate InsnFields directly. */
 
 /*
- * Binary format magic/version 1.2.
- * Bytes in file order: 'C','S','T',0x12 → u32 LE 0x12545343.
+ * Binary format magic/version 1.7.
+ * Bytes in file order: 'C','S','T',0x17 → u32 LE 0x17545343.
  * ASCII: C=0x43 S=0x53 T=0x54.  "CST" = ChampSimTracer.
  *
- * v1.2 adds a ULEB fault_insn_index to WP event records when
- * CST_WP_EVENT_FAULT is set (see format spec §3.1.2).
+ * v1.7 replaces the per-entry dyn-patch / mem-data / reg-data
+ * sub-sections (and the variable-memop preamble) with a single
+ * unified field-typed delta stream.  Each BB entry carries:
+ *
+ *   n_records : ULEB
+ *   { ins_pos_gap : ULEB,  field_id : u8,  delta : SLEB128 }*
+ *
+ * Records are emitted in non-descending (ins_pos, field_id) order;
+ * unchanged fields contribute zero bytes.  Field IDs identify what
+ * changed about an instruction (memop count/addr/data, src/dst reg
+ * value, opcode/encoding/immediate etc. — see the FID_* constants
+ * below).  The delta is `(cur128 − baseline128) mod 2**128`,
+ * written as one SLEB128 of any width.  Baseline = the most-recent
+ * correct-path observation for (template_id, ins_pos, field_id),
+ * or the field's template-default on first appearance.  WP state
+ * is forked from CP at chain start and discarded at chain end so
+ * speculative effects never leak forward.
+ *
+ * v1.6 changed the basic-block model to track TRUE basic blocks
+ * (start_pc → first branch, immutable, unique by start_pc) and added
+ * an optional chain table for shorthand encoding of frequently-seen
+ * BB sequences on the wrong path.
+ *
+ * v1.5 added per-insn flag CST_INSN_FLAG_VARIABLE_MEMOP.
  */
-#define CST_MAGIC          0x12545343u
-#define CST_TRAILER_MAGIC  0x12545343FFFFFFFFull
+#define CST_MAGIC          0x17545343u
+#define CST_TRAILER_MAGIC  0x17545343FFFFFFFFull
 #define CST_TRAILER_SIZE   64
 
 /* Body entry tags (1 byte) */
@@ -51,25 +73,65 @@ extern "C" {
 #define CST_INSN_FLAG_HAS_IMM       (1u << 1)
 #define CST_INSN_FLAG_SYNC_SHIFT    2
 #define CST_INSN_FLAG_SYNC_MASK     0x3Cu
-/*
- * Dynamic-memop: the instruction's (n_loads, n_stores) vary at runtime
- * (e.g. REP-prefixed string ops).  Per-entry dyn-params for this insn
- * are prefixed with ULEB actual_n_loads, ULEB actual_n_stores; the
- * template's n_loads/n_stores are observed-max and only advisory.
- */
-#define CST_INSN_FLAG_DYNAMIC_MEMOP (1u << 6)
+#define CST_INSN_FLAG_VARIABLE_MEMOP (1u << 6)
+/* bit 7 reserved */
 
 /* WP event flags byte */
 #define CST_WP_EVENT_TRANSLATION_UNAVAIL (1u << 0)
 #define CST_WP_EVENT_FAULT               (1u << 1)
 
-/* Dyn-patch flags byte */
-#define CST_DYN_FLAG_UNCHANGED (1u << 0)
+/* WP-invocation envelope flags byte (v1.6) */
+#define CST_WP_INV_CHAIN_REF      (1u << 0)
+/* bits 1..7 reserved */
 
-/* Header feature flags (templates are always present since v1.1) */
-#define CST_FLAG_MEM_DATA      (1 << 0)
-#define CST_FLAG_REG_DATA      (1 << 1)
-/* bits 2..7 reserved */
+/* Header feature flags (templates always present, deltas always present).
+ *
+ * These bits are advisory hints to consumers about which families of
+ * field-delta records this trace contains.  The wire format itself is
+ * uniform — a reader that sees an unexpected field_id MUST tolerate
+ * it (see champsim_tracer_format.md §4 and the CST_FID_* constants
+ * below).  A clear bit guarantees the writer emitted no records in
+ * that family. */
+#define CST_FLAG_MEM_DATA      (1 << 0)  /* CST_FID_LOAD_DATA / STORE_DATA */
+#define CST_FLAG_REG_DATA      (1 << 1)  /* CST_FID_SRC_REG / DST_REG     */
+#define CST_FLAG_INSN_MUT      (1 << 2)  /* CST_FID_INSN_* (SMC/patching) */
+/* bits 3..7 reserved */
+
+/* ===== Field-ID space (v1.7 unified delta stream) =====
+ *
+ * Every per-entry observation (memop addresses, memop data, register
+ * values, instruction-encoding mutations) is encoded as one
+ * (ins_pos, field_id, delta) record.  Slotted families occupy
+ * contiguous 16-wide ranges to leave room for SVE / RVV / wide-AVX
+ * memop counts.  Adding a new dynamic field is a one-line addition
+ * to FieldDescriptor table in champsim_tracer_output.cc; the wire
+ * format does not need to change as long as the new field gets a
+ * fresh FID_* constant from the reserved space below.
+ */
+#define CST_FID_SLOT_COUNT       16    /* slots per slotted family */
+
+#define CST_FID_MEMOP_COUNT      0x00  /* (n_loads<<8) | n_stores; absent ⇒ template default */
+
+#define CST_FID_LOAD_ADDR_BASE   0x01  /* +k for load slot k ∈ 0..15 */
+#define CST_FID_STORE_ADDR_BASE  0x11
+#define CST_FID_LOAD_DATA_BASE   0x21  /* gated by CST_FLAG_MEM_DATA  */
+#define CST_FID_STORE_DATA_BASE  0x31
+#define CST_FID_SRC_REG_BASE     0x41  /* gated by CST_FLAG_REG_DATA  */
+#define CST_FID_DST_REG_BASE     0x51
+/* 0x61..0x6F reserved for future slotted memop metadata             */
+
+/* Insn-encoding-mutable fields.  Gated by CST_FLAG_INSN_MUT.
+ * Baseline = template's static value, so unchanged-from-template
+ * fields cost zero record bytes. */
+#define CST_FID_INSN_BYTES_LO    0x70  /* low  8 bytes of insn_bytes, LE u64  */
+#define CST_FID_INSN_BYTES_HI    0x71  /* high 8 bytes (only x86 long enc.)   */
+#define CST_FID_INSN_OPCODE      0x72  /* GenericOpcode (u8)                  */
+#define CST_FID_INSN_BRANCH_TYPE 0x73  /* BranchType (u8)                     */
+#define CST_FID_INSN_FLAGS       0x74  /* template flags byte                 */
+#define CST_FID_INSN_IMMEDIATE   0x75  /* signed immediate                    */
+#define CST_FID_INSN_SIZE        0x76  /* u8 insn_size                        */
+/* 0x77..0xFE reserved for future fields                                       */
+#define CST_FID_EXTENDED         0xFF  /* reserved escape; not used in v1.7   */
 
 /* ===== Types ===== */
 
@@ -77,16 +139,13 @@ extern "C" {
 
 /*
  * Per-register snapshot, captured immediately before the issuing
- * instruction executes.  size_code values:
- *   0 = 4 bytes,  1 = 8 bytes,  2 = 16 bytes.
- * `lo` carries the low 8 bytes (LE); `hi` carries the high 8 bytes
- * for 16-byte registers and is 0 otherwise.  Registers the plugin
- * could not resolve to a runtime handle on this target are emitted
- * as size_code=0 lo=0 hi=0 (and do not advance the per-reg delta
- * state).
+ * instruction executes.  `lo` carries the low 8 bytes (LE); `hi`
+ * carries the high 8 bytes for registers larger than 8 bytes and is
+ * 0 otherwise.  Registers the plugin could not resolve to a runtime
+ * handle on this target are emitted as lo=hi=0 (and do not advance
+ * the per-reg delta state).
  */
 typedef struct {
-    uint8_t  size_code;
     uint64_t lo;
     uint64_t hi;
 } RegSnap;
@@ -123,6 +182,19 @@ typedef struct {
     void *insn_snap_refs;
 } BBTemplate;
 
+/*
+ * Chain template: an ordered sequence of true-BB template_ids that
+ * occurs as a wrong-path or correct-path sequence.  Used as a
+ * shorthand to compress the per-WP-invocation BB-id list.  Built
+ * lazily on first sight of a multi-BB sequence; keyed in chain_map
+ * by an internal hash of the bb_ids[] tuple.
+ */
+typedef struct {
+    uint32_t chain_id;
+    uint32_t n_bbs;
+    uint32_t *bb_ids;
+} ChainTemplate;
+
 enum DynParamType {
     DYN_LOAD_ADDR  = 0,
     DYN_STORE_ADDR = 1,
@@ -153,23 +225,23 @@ typedef struct {
 } DynParam;
 
 typedef struct {
-    uint32_t template_id;
+    uint32_t template_id;       /* TRUE BB id (start_pc → first branch) */
     uint64_t start_pc;
-    GArray *dyn_params;
-    uint32_t n_insns_executed;
+    GArray *dyn_params;         /* dyn_params for THIS BB only */
+    uint32_t n_insns_executed;  /* BB length when complete; partial on fault */
     bool fault;
     bool translation_unavailable;
     /*
-     * Index (within the merged BB template, i.e. chain-relative) of the
-     * instruction that raised the synchronous exception when `fault`
-     * is true. Undefined otherwise. Consumers (e.g. ChampSim) use this
-     * to flag the specific uop as non-completing so its dependent
-     * slice is naturally squashed.
+     * Index (within THIS basic block) of the instruction that raised
+     * the synchronous exception when `fault` is true.  Undefined
+     * otherwise.  Consumers (e.g. ChampSim) use this to flag the
+     * specific uop as non-completing so its dependent slice is
+     * naturally squashed.
      */
     uint32_t fault_insn_index;
     BBTemplate *tmpl;  /* Non-owning; for per-insn schema access */
-    /* RegSnap array, ordered: for each insn in the merged WP
-     * template, n_src snaps then n_dst snaps.  Captured pre-insn via
+    /* RegSnap array, ordered: for each insn in this BB, n_src snaps
+     * then n_dst snaps.  Captured pre-insn via
      * a per-fragment wide regfile dump (see wp_capture_insn_snaps).
      * NULL when reg-data is disabled. */
     GArray *reg_snaps;
@@ -199,8 +271,19 @@ typedef struct {
 typedef struct {
     uint64_t pc;
     uint64_t fall_through;
+    /* Two-entry LRU of distinct taken targets observed at this branch
+     * PC.  `taken_target` is the most-recently-taken target;
+     * `prev_taken_target` is the most-recently-taken target that
+     * differed from it (or 0 if only one target has ever been seen).
+     * `has_taken_target` gates `taken_target`; `has_prev_taken_target`
+     * gates `prev_taken_target`.  Used by indirect-branch wrong-path
+     * derivation: when CP fell through (rare conditional indirect) or
+     * when CP took an indirect to a known target, WP picks the *other*
+     * LRU slot if available, otherwise falls through. */
     uint64_t taken_target;
+    uint64_t prev_taken_target;
     bool has_taken_target;
+    bool has_prev_taken_target;
 } BranchRecord;
 
 typedef struct {
@@ -213,12 +296,15 @@ typedef struct {
 } WPMemAccess;
 
 typedef struct BodyStreamState BodyStreamState;
+typedef struct WriterCtx WriterCtx;
 
 typedef struct {
     uint64_t start_insn;
     uint64_t stop_insn;
     char *label;
     FILE *bin_file;
+    bool bin_file_is_pipe;   /* true if opened with popen() */
+    WriterCtx *writer;       /* async writer thread feeding bin_file */
     BodyStreamState *bin_stream;
     uint32_t thread_id;
     uint32_t body_seq_num;
@@ -236,6 +322,7 @@ typedef struct {
 typedef struct {
     FILE *f;
     GByteArray *buf;
+    WriterCtx *w;          /* async writer; mutually exclusive with f/buf */
     uint64_t total_bytes;
 } BitWriter;
 
@@ -251,8 +338,10 @@ extern FILE *unknown_warn_file;
 
 extern GHashTable *tb_map;
 extern GHashTable *bb_map;
+extern GHashTable *chain_map;
 extern GHashTable *branch_map;
 extern uint32_t next_template_id;
+extern uint32_t next_chain_id;
 
 extern struct qemu_plugin_scoreboard *vcpu_sb;
 extern qemu_plugin_u64 sb_current_pc;
@@ -312,6 +401,36 @@ BBTemplate *get_or_create_bb_template(uint64_t entry_pc,
 int template_branch_index(const BBTemplate *tmpl);
 
 /*
+ * v1.6: commit a TRUE basic block by start_pc.  The BB is identified
+ * by start_pc; if an entry exists in bb_map at start_pc with the same
+ * insn_pcs[] sequence, return it.  If start_pc is new, build a new
+ * BBTemplate by copying the provided per-insn metadata.  If start_pc
+ * exists with a different insn_pcs[] (impossible without
+ * self-modifying code or a tracer bug), log a warning and return the
+ * existing template unchanged — BBs are immutable once committed.
+ *
+ * insn_bytes[] is a flat array sized n_insns * MAX_INSN_BYTES.
+ * insn_reg_names may be NULL when reg-data capture is disabled.
+ * Caller must hold data_lock.
+ */
+BBTemplate *commit_true_bb(uint64_t start_pc,
+                           uint32_t n_insns,
+                           const uint64_t *insn_pcs,
+                           const InsnFields *insn_fields,
+                           const uint8_t *insn_sizes,
+                           const uint8_t *insn_bytes,
+                           const InsnRegNames *insn_reg_names,
+                           const char *symbol_name,
+                           uint64_t fall_through_pc);
+
+/*
+ * v1.6: look up or create a chain template for a given ordered list
+ * of bb_ids.  Returns NULL if n_bbs < 2 (no shorthand benefit).
+ * Caller must hold data_lock.
+ */
+ChainTemplate *commit_chain(const uint32_t *bb_ids, uint32_t n_bbs);
+
+/*
  * Look up a register handle by Capstone-style register name
  * (case-insensitive) for @cpu_index.  Returns NULL when @name is
  * empty or not exposed by qemu_plugin_get_registers() on this
@@ -353,7 +472,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                                 unsigned int cpu_index);
 
 /* Defined in champsim_tracer_output.cc */
-BodyStreamState *body_stream_new(FILE *f, uint32_t thread_id,
+BodyStreamState *body_stream_new(WriterCtx *w, uint32_t thread_id,
                                  const char *seg_datetime);
 void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry);
 void body_stream_finish(BodyStreamState *st);

@@ -5,7 +5,7 @@
 
 #define CAPSTONE_AARCH64_COMPAT_HEADER
 #define CAPSTONE_SYSTEMZ_COMPAT_HEADER
-#include <capstone.h>
+#include <capstone/capstone.h>
 
 #else
 

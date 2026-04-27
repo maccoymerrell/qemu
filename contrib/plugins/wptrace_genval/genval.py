@@ -104,6 +104,10 @@ def _parse_args() -> argparse.Namespace:
                    help="Prepend one of every probe block (per ISA) so a "
                         "single trace exercises 100%% of the reachable "
                         "GenericOpcode classifications.")
+    g.add_argument("--hot-iters", type=int, default=0,
+                   help="If > 0, place one `hot_loop` block on the CP side "
+                        "of every diamond and have each loop iterate this "
+                        "many times.  Used to produce long-running traces.")
 
     # build
     b = sub.add_parser("build", help="Cross-compile .cpp for an ISA")
@@ -121,6 +125,16 @@ def _parse_args() -> argparse.Namespace:
     t.add_argument("--stop", type=int, default=200_000)
     t.add_argument("--regdata", action="store_true",
                    help="Enable per-insn register-value capture (regdata=1)")
+    t.add_argument("--compress", choices=("none", "xz", "zstd", "gzip"),
+                   default="none",
+                   help="Stream the .cst through a compressor via the "
+                        "plugin's outpipe= option. Output file is "
+                        "<out_base>.cst.<ext>.")
+    t.add_argument("--outpipe", type=str, default=None,
+                   help="Override --compress with a literal shell command "
+                        "passed to outpipe=. Plugin args use ',' as a "
+                        "separator so commas inside the command are not "
+                        "supported.")
 
     # analyze
     a = sub.add_parser("analyze",
@@ -132,6 +146,9 @@ def _parse_args() -> argparse.Namespace:
     v = sub.add_parser("validate", help="Compare trace to metadata")
     common(v)
     v.add_argument("--isa", choices=ISA_CHOICES, required=True)
+    v.add_argument("--depth", type=int, default=64,
+                   help="plugin's WP instruction budget; must match "
+                        "the value passed to `trace --depth`")
 
     # all
     al = sub.add_parser("all", help="generate+build+trace+analyze+validate")
@@ -150,6 +167,12 @@ def _parse_args() -> argparse.Namespace:
                     help="Enable per-insn register-value capture (regdata=1)")
     al.add_argument("--coverage", action="store_true",
                     help="See `generate --coverage`.")
+    al.add_argument("--hot-iters", type=int, default=0,
+                    help="See `generate --hot-iters`.")
+    al.add_argument("--compress", choices=("none", "xz", "zstd", "gzip"),
+                    default="none", help="See `trace --compress`.")
+    al.add_argument("--outpipe", type=str, default=None,
+                    help="See `trace --outpipe`.")
 
     return p.parse_args()
 
@@ -192,6 +215,7 @@ def cmd_generate(args, isa: str | None = None) -> None:
         side_len_min=args.side_len_min,
         side_len_max=args.side_len_max,
         coverage=getattr(args, "coverage", False),
+        hot_iters=getattr(args, "hot_iters", 0),
     )
     # Emit per-ISA metadata (since exit syscall differs) but share cpp
     # by appending the isa suffix to the meta and a per-ISA cpp.
@@ -249,10 +273,36 @@ def cmd_trace(args, isa: str | None = None) -> int:
         return 0
 
     out_base = _trace_base(args.out_dir, prog, isa)
-    plugin_opts = (
-        f"outfile={out_base},"
-        f"depth={args.depth},stop={args.stop},memdata=1"
-    )
+
+    # Resolve output destination: explicit --outpipe wins, then --compress,
+    # else default outfile= path.
+    compress = getattr(args, "compress", "none")
+    outpipe = getattr(args, "outpipe", None)
+    compress_ext = {"xz": "xz", "zstd": "zst", "gzip": "gz"}
+    compress_cmd = {
+        "xz":   "xz -T0 -2 -c",
+        "zstd": "zstd -T0 -3 -q -c",
+        "gzip": "gzip -c",
+    }
+    if outpipe is None and compress != "none":
+        ext = compress_ext[compress]
+        outpipe = f"{compress_cmd[compress]} > {out_base}.cst.{ext}"
+
+    if outpipe is not None:
+        if "," in outpipe:
+            raise SystemExit(
+                "trace[--outpipe]: plugin arg parser uses ',' as a "
+                "separator. Wrap your command in a script and reference "
+                "it instead.")
+        plugin_opts = (
+            f"outpipe={outpipe},"
+            f"depth={args.depth},stop={args.stop},memdata=1"
+        )
+    else:
+        plugin_opts = (
+            f"outfile={out_base},"
+            f"depth={args.depth},stop={args.stop},memdata=1"
+        )
     if getattr(args, "regdata", False):
         plugin_opts += ",regdata=1"
     cmd = [
@@ -260,11 +310,17 @@ def cmd_trace(args, isa: str | None = None) -> int:
     ]
     print(f"trace[{isa}]: {' '.join(cmd)}")
     rc = subprocess.call(cmd)
-    wpt = Path(f"{out_base}.wpt")
-    if rc != 0 or not wpt.is_file():
+    if outpipe is not None:
+        if rc != 0:
+            print(f"trace[{isa}]: FAIL rc={rc}")
+            return rc
+        print(f"trace[{isa}]: streamed via outpipe ({outpipe})")
+        return 0
+    cst = Path(f"{out_base}.cst")
+    if rc != 0 or not cst.is_file():
         print(f"trace[{isa}]: FAIL rc={rc}")
         return rc or 1
-    print(f"trace[{isa}]: wrote {wpt.name}")
+    print(f"trace[{isa}]: wrote {cst.name}")
     return 0
 
 
@@ -286,18 +342,21 @@ def cmd_validate(args, isa: str | None = None) -> int:
     prog = _prog_base(args.out_dir, args.prog)
     bin_path = _bin_path(args.out_dir, prog, isa)
     meta = _meta_path(args.out_dir, prog, isa)
-    trace = Path(f"{_trace_base(args.out_dir, prog, isa)}.wpt")
+    trace = Path(f"{_trace_base(args.out_dir, prog, isa)}.cst")
     if not trace.is_file() or not meta.is_file():
         print(f"validate[{isa}]: SKIP  missing inputs "
               f"(trace={trace.is_file()}, meta={meta.is_file()})")
         return 0
-    report = V.validate(meta, trace, bin_path)
+    report = V.validate(meta, trace, bin_path,
+                        wp_insn_budget=getattr(args, "depth", 64))
     print(report.summary())
     return 1 if report.errors() else 0
 
 
 def cmd_all(args) -> int:
     rc_total = 0
+    skip_validate = (getattr(args, "compress", "none") != "none"
+                     or getattr(args, "outpipe", None) is not None)
     for isa in args.isa:
         print(f"\n==== {isa} ====")
         cmd_generate(args, isa)
@@ -306,6 +365,9 @@ def cmd_all(args) -> int:
             continue
         if cmd_trace(args, isa) != 0:
             rc_total = 1
+            continue
+        if skip_validate:
+            print(f"validate[{isa}]: SKIP  (output is piped/compressed)")
             continue
         cmd_analyze(args, isa)
         if cmd_validate(args, isa) != 0:

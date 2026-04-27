@@ -31,6 +31,7 @@ if get_option('plugins')
       'champsim_tracer_decode.cc',
       'champsim_tracer_wp.cc',
       'champsim_tracer_output.cc',
+      'champsim_tracer_writer.cc',
       'champsim_tracer_mnemonic_tables.c',
     )
   champsim_tracer_cpp_args = ['-std=gnu++17',
@@ -43,13 +44,13 @@ if get_option('plugins')
                        cpp_args: champsim_tracer_cpp_args,
                        link_depends: [win32_qemu_plugin_api_lib],
                        link_args: win32_qemu_plugin_api_link_flags,
-                       dependencies: glib)
+                       dependencies: [glib, capstone])
   else
     t += shared_module('champsim_tracer',
                        champsim_tracer_sources,
                        include_directories: '../../include/qemu',
                        cpp_args: champsim_tracer_cpp_args,
-                       dependencies: glib)
+                       dependencies: [glib, capstone])
   endif
   endif
 endif

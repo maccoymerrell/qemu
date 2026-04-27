@@ -1914,16 +1914,25 @@ endif
 
 capstone = not_found
 if not get_option('capstone').auto() or have_system or have_user
-  capstone = dependency('capstone', version: '>=3.0.5',
-                        method: 'pkg-config',
-                        required: get_option('capstone'))
+  # Capstone 6.0 (currently in alpha) is required for the AArch64
+  # namespace rename and the refreshed RISC-V/MIPS detail tables that
+  # the champsim_tracer plugin relies on.  If the system pkg-config
+  # cannot satisfy that constraint, fall back to the bundled subproject
+  # (subprojects/capstone.wrap), which builds Capstone 6.0-Alpha via
+  # its upstream CMakeLists.txt.
+  capstone = dependency('capstone', version: '>=6.0',
+                        required: get_option('capstone'),
+                        fallback: ['capstone', 'capstone_dep'])
 
   # Some versions of capstone have broken pkg-config file
   # that reports a wrong -I path, causing the #include to
   # fail later. If the system has such a broken version
-  # do not use it.
-  if capstone.found() and not cc.compiles('#include <capstone.h>',
-                                          dependencies: [capstone])
+  # do not use it.  (The check only applies to system
+  # pkg-config dependencies; subproject builds expose an
+  # internal dep that cc.compiles() cannot consume.)
+  if capstone.found() and capstone.type_name() == 'pkgconfig' \
+      and not cc.compiles('#include <capstone.h>',
+                          dependencies: [capstone])
     capstone = not_found
     if get_option('capstone').enabled()
       error('capstone requested, but it does not appear to work')

@@ -3,21 +3,32 @@
  *
  * BitWriter primitives, template dictionary serializer, dyn-param
  * patch emitter, body entry streamer, and trailer writer for the
- * packed binary (.wpt) format.
+ * packed binary (.cst) format.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include <inttypes.h>
 #include <string.h>
 
 #include "champsim_tracer.h"
+#include "champsim_tracer_writer.h"
 
 /* ========================= BitWriter primitives ========================= */
+
+static inline void bw_init_writer(BitWriter *bw, WriterCtx *w)
+{
+    bw->f = NULL;
+    bw->buf = NULL;
+    bw->w = w;
+    bw->total_bytes = 0;
+}
 
 static inline void bw_init_file(BitWriter *bw, FILE *f)
 {
     bw->f = f;
     bw->buf = NULL;
+    bw->w = NULL;
     bw->total_bytes = 0;
 }
 
@@ -25,6 +36,7 @@ static inline void bw_init_buf(BitWriter *bw)
 {
     bw->f = NULL;
     bw->buf = g_byte_array_new();
+    bw->w = NULL;
     bw->total_bytes = 0;
 }
 
@@ -46,7 +58,9 @@ static inline void bw_raw(BitWriter *bw, const uint8_t *buf, size_t len)
     if (len == 0) {
         return;
     }
-    if (bw->f) {
+    if (bw->w) {
+        writer_submit(bw->w, buf, len);
+    } else if (bw->f) {
         fwrite(buf, 1, len, bw->f);
     } else {
         g_byte_array_append(bw->buf, buf, (guint)len);
@@ -65,6 +79,7 @@ static inline void bw_flush(BitWriter *bw)
     if (bw->f) {
         fflush(bw->f);
     }
+    /* WriterCtx flushes on writer_finish; nothing to do mid-stream. */
 }
 
 static inline void bw_write_u8(BitWriter *bw, uint8_t v)
@@ -129,6 +144,30 @@ static void bw_write_sleb128(BitWriter *bw, int64_t v)
 }
 
 /*
+ * Same as bw_write_sleb128 but accepts a signed 128-bit value.
+ * Used for reg-data and mem-data deltas, where 16-byte snapshots
+ * (XMM-class regs, 16-byte memops) require >64 bits of dynamic
+ * range.  Max encoded length is 19 bytes (⌈128/7⌉).
+ */
+static void bw_write_sleb128_i128(BitWriter *bw, __int128 v)
+{
+    uint8_t buf[19];
+    size_t n = 0;
+    bool more = true;
+    while (more) {
+        uint8_t byte = (uint8_t)((unsigned __int128)v & 0x7F);
+        bool sign = (byte & 0x40) != 0;
+        v >>= 7;
+        more = !((v == 0 && !sign) || (v == -1 && sign));
+        if (more) {
+            byte |= 0x80;
+        }
+        buf[n++] = byte;
+    }
+    bw_raw(bw, buf, n);
+}
+
+/*
  * Emit a length-prefixed sub-section (ULEB byte length + buffer bytes).
  * Takes ownership of @data and frees it.
  */
@@ -142,23 +181,17 @@ static void bw_write_section(BitWriter *main_bw, GByteArray *data)
 struct BodyStreamState {
     BitWriter bw;
     int64_t prev_entry_template;
-    GHashTable *cp_dyn_state;
-    GHashTable *wp_dyn_state;
-    /* Per-GenericRegId last-seen value, for SLEB-delta encoding of
-     * the §5.2 reg-data section.  Indexed 0..255; REG_NONE (0) is
-     * unused.  Reset to zero at body_stream_new. */
-    int64_t cp_reg_state_lo[256];
-    int64_t cp_reg_state_hi[256];
-    /* Same, but for the WP sub-section.  Re-seeded from cp state at
-     * the start of each CP entry's WP chain (since wrong-path
-     * execution begins from the CP register state and is rolled back
-     * when the chain ends, so cross-WP-chain accumulation would be
-     * incorrect). */
-    int64_t wp_reg_state_lo[256];
-    int64_t wp_reg_state_hi[256];
+    /* v1.7 unified field-state tables: keyed by (template_id, ins_pos,
+     * field_id) → most-recent observed u128 value.  CP state persists
+     * across the body.  WP state is overwritten by a snapshot of CP
+     * state at the start of each CP entry's WP chain and discarded
+     * implicitly at chain end (the next chain re-forks from CP). */
+    GHashTable *cp_field_state;
+    GHashTable *wp_field_state;
     uint64_t num_entries;
     uint32_t thread_id;
     uint64_t body_off;
+    uint8_t  header_flags;   /* CST_FLAG_* bits emitted in header */
 };
 
 /* ========================= Template dictionary ========================= */
@@ -185,7 +218,7 @@ struct BodyStreamState {
  *   branch_type : u8
  *   flags       : u8       bit0=branch_conditional, bit1=has_immediate,
  *                          bits 2..5 = sync_hint (4 bits),
- *                          bit6 = dynamic_memop (runtime > static count)
+ *                          bits 6..7 = reserved
  *   n_src       : u8
  *   n_dst       : u8
  *   src_regs[n_src] : u8 each
@@ -240,8 +273,8 @@ static void write_bin_templates(BitWriter *bw)
             }
             flags |= (uint8_t)((fld->sync_hint & 0x0F)
                                << CST_INSN_FLAG_SYNC_SHIFT);
-            if (fld->dynamic_memop) {
-                flags |= CST_INSN_FLAG_DYNAMIC_MEMOP;
+            if (fld->variable_memop) {
+                flags |= CST_INSN_FLAG_VARIABLE_MEMOP;
             }
             bw_write_u8(&sub, flags);
 
@@ -270,327 +303,583 @@ static void write_bin_templates(BitWriter *bw)
     }
 }
 
-/* ========================= Dyn param patching ========================= */
+/* ========================= Dyn param helpers ========================= */
 
-static gboolean dyn_param_array_equal(const GArray *a, const GArray *b)
-{
-    if (a == b) {
-        return true;
-    }
-    if (!a || !b || a->len != b->len) {
-        return false;
-    }
+/* ============== v1.7 unified field-typed delta stream ==============
+ *
+ * Replaces the v1.6 dyn-patch / mem-data / reg-data sub-sections and
+ * the variable-memop preamble.  Each BB entry carries a single
+ * length-prefixed `delta_section`:
+ *
+ *     n_records : ULEB
+ *     for r in 0..n_records:
+ *       ins_pos_gap : ULEB        (cur_ins_pos − prev_ins_pos)
+ *       field_id    : u8          (CST_FID_*)
+ *       delta       : SLEB128     (i128 modular cur − baseline)
+ *
+ * Records are emitted in non-descending (ins_pos, field_id) order;
+ * unchanged fields contribute zero bytes.  Per-(template_id, ins_pos,
+ * field_id) state tables track the most-recent observed value and
+ * supply the baseline.  CP state advances on every CP entry; WP
+ * state is forked from CP at chain start and discarded at chain end.
+ *
+ * Adding a new dynamic field is a single FieldDescriptor table entry
+ * (and a fresh FID_* in champsim_tracer.h).  The wire format does
+ * not change.
+ */
 
-    for (guint i = 0; i < a->len; i++) {
-        const DynParam *da = &g_array_index(a, DynParam, i);
-        const DynParam *db = &g_array_index(b, DynParam, i);
-        if (da->type != db->type ||
-            da->insn_index != db->insn_index ||
-            da->value != db->value) {
-            return false;
-        }
-    }
+/* Composite key for the per-field state table. */
+typedef struct {
+    uint32_t template_id;
+    uint16_t ins_pos;
+    uint8_t  field_id;
+    uint8_t  _pad;
+} FieldStateKey;
 
-    return true;
+typedef struct {
+    uint64_t lo;
+    uint64_t hi;
+} U128;
+
+static inline unsigned __int128 u128_pack(U128 v) {
+    return ((unsigned __int128)v.hi << 64) | v.lo;
+}
+static inline U128 u128_unpack(unsigned __int128 v) {
+    U128 r = { (uint64_t)v, (uint64_t)(v >> 64) };
+    return r;
 }
 
-static GArray *dyn_param_array_clone(const GArray *src)
-{
-    GArray *dst = g_array_sized_new(false, false, sizeof(DynParam),
-                                    src ? src->len : 0);
-
-    if (!src) {
-        return dst;
-    }
-
-    for (guint i = 0; i < src->len; i++) {
-        const DynParam *d = &g_array_index(src, DynParam, i);
-        DynParam copy = {
-            .type = d->type,
-            .insn_index = d->insn_index,
-            .value = d->value,
-        };
-        g_array_append_val(dst, copy);
-    }
-
-    return dst;
+static guint field_key_hash(gconstpointer kv) {
+    const FieldStateKey *k = (const FieldStateKey *)kv;
+    /* fold to 32 bits */
+    uint32_t h = k->template_id * 2654435761u;
+    h ^= ((uint32_t)k->ins_pos << 8) ^ (uint32_t)k->field_id;
+    return (guint)h;
+}
+static gboolean field_key_equal(gconstpointer aa, gconstpointer bb) {
+    const FieldStateKey *a = (const FieldStateKey *)aa;
+    const FieldStateKey *b = (const FieldStateKey *)bb;
+    return a->template_id == b->template_id
+        && a->ins_pos == b->ins_pos
+        && a->field_id == b->field_id;
 }
 
-static void dyn_param_array_unref_value(gpointer value)
-{
-    if (value) {
-        g_array_unref((GArray *)value);
-    }
+/* Mask `lo` to its low @sz bytes (sz ≤ 8) so a u8 store of 0xFF is
+ * encoded as 255, not −1.  Keeps deltas well-defined. */
+static inline uint64_t mem_data_mask_lo(uint64_t lo, uint8_t sz) {
+    if (sz >= 8) return lo;
+    uint64_t mask = (sz == 0) ? 0xFFu : ((uint64_t)1 << (sz * 8)) - 1;
+    return lo & mask;
 }
 
 /*
- * Stable-sort dyn_params so that entries are ordered by (insn_index,
- * type): for each instruction, all loads precede all stores.  v1.1
- * consumers determine load/store attribution positionally using the
- * template's per-insn (n_loads, n_stores) schema.
+ * A FieldDescriptor describes one *family* of related field IDs.
+ * The emitter walks the descriptor table once per instruction and
+ * lets each family produce zero or more (slot, value) observations;
+ * every observation that differs from its prior state (or template
+ * default) becomes one record on the wire.
+ *
+ * Adding a new dynamic field family means: add a fresh CST_FID_*
+ * constant in champsim_tracer.h, plus one entry in field_descriptors[]
+ * with `extract` (writer-side current value) and `template_default`
+ * (baseline for first sighting).  The decoder dispatch table in
+ * champsim_tracer_decode.py mirrors this 1:1.
  */
+struct EntryView {
+    const BBTemplate *tmpl;
+    const GArray *dyn_params;   /* DynParam[]; sorted (insn_index,type)  */
+    const GArray *reg_snaps;    /* RegSnap[]; template-walk order        */
+    /* Pre-walked per-insn (n_loads, n_stores) actual counts (length =
+     * tmpl->n_insns).  Computed once per entry by walk_dyn_params(). */
+    const uint8_t *actual_n_loads;
+    const uint8_t *actual_n_stores;
+    /* Pre-walked dyn_param index of the first load slot for insn i
+     * (length = tmpl->n_insns + 1, last entry = total dyn_params). */
+    const uint32_t *insn_dp_off;
+    /* Pre-walked reg_snap index of the first src snap for insn i
+     * (length = tmpl->n_insns + 1, last entry = total reg_snaps). */
+    const uint32_t *insn_rs_off;
+};
+
+typedef struct EntryView EntryView;
+
+typedef struct {
+    uint8_t base_field_id;
+    uint8_t slot_count;        /* 1 for non-slotted families */
+    bool gated_by_mem_data;
+    bool gated_by_reg_data;
+    bool gated_by_insn_mut;
+    /* extract: returns true and writes *out_val if (ins_pos, slot)
+     * has an observable value in this entry; returns false to skip
+     * (e.g. unused memop slot). */
+    bool (*extract)(const EntryView *ev, uint32_t ins_pos, uint8_t slot,
+                    unsigned __int128 *out_val);
+    /* template_default: baseline used on first sighting of
+     * (template_id, ins_pos, field_id).  For dynamic-runtime fields
+     * (addresses, data, reg values) this is 0; for insn-encoding
+     * fields it's the template's static value, so unchanged-from-
+     * template fields cost zero record bytes. */
+    unsigned __int128 (*template_default)(const BBTemplate *tmpl,
+                                          uint32_t ins_pos, uint8_t slot);
+    const char *name;          /* debug only */
+} FieldDescriptor;
+
+/* ---------- Per-family extract/default callbacks ---------- */
+
+static bool extr_memop_count(const EntryView *ev, uint32_t i, uint8_t slot,
+                             unsigned __int128 *out)
+{
+    (void)slot;
+    if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
+    const InsnFields *f = &ev->tmpl->insn_fields[i];
+    /* Only emit MEMOP_COUNT for variable-memop insns; otherwise the
+     * count is statically known and the field would always equal its
+     * default (no record needed). */
+    if (!f->variable_memop) return false;
+    uint64_t v = ((uint64_t)ev->actual_n_loads[i] << 8)
+               | (uint64_t)ev->actual_n_stores[i];
+    *out = (unsigned __int128)v;
+    return true;
+}
+static unsigned __int128 deflt_memop_count(const BBTemplate *t, uint32_t i,
+                                           uint8_t slot)
+{
+    (void)slot;
+    if (!t || i >= t->n_insns) return 0;
+    const InsnFields *f = &t->insn_fields[i];
+    return ((unsigned __int128)f->n_loads << 8) | (unsigned __int128)f->n_stores;
+}
+
+/* Locate the @slot-th memop of @insn matching @want_type
+ * (DYN_LOAD_ADDR or DYN_STORE_ADDR).  Returns NULL if absent. */
+static const DynParam *find_memop_slot(const EntryView *ev, uint32_t i,
+                                       uint8_t slot, uint8_t want_type)
+{
+    if (!ev->dyn_params) return NULL;
+    uint32_t lo = ev->insn_dp_off[i];
+    uint32_t hi = ev->insn_dp_off[i + 1];
+    uint8_t seen = 0;
+    for (uint32_t k = lo; k < hi; k++) {
+        const DynParam *dp = &g_array_index(ev->dyn_params, DynParam, k);
+        if (dp->type != want_type) continue;
+        if (seen == slot) return dp;
+        seen++;
+    }
+    return NULL;
+}
+
+static bool extr_load_addr(const EntryView *ev, uint32_t i, uint8_t slot,
+                           unsigned __int128 *out)
+{
+    const DynParam *dp = find_memop_slot(ev, i, slot, DYN_LOAD_ADDR);
+    if (!dp) return false;
+    *out = (unsigned __int128)dp->value;
+    return true;
+}
+static bool extr_store_addr(const EntryView *ev, uint32_t i, uint8_t slot,
+                            unsigned __int128 *out)
+{
+    const DynParam *dp = find_memop_slot(ev, i, slot, DYN_STORE_ADDR);
+    if (!dp) return false;
+    *out = (unsigned __int128)dp->value;
+    return true;
+}
+static unsigned __int128 deflt_zero(const BBTemplate *t, uint32_t i,
+                                    uint8_t slot)
+{ (void)t; (void)i; (void)slot; return 0; }
+
+static bool extr_load_data(const EntryView *ev, uint32_t i, uint8_t slot,
+                           unsigned __int128 *out)
+{
+    const DynParam *dp = find_memop_slot(ev, i, slot, DYN_LOAD_ADDR);
+    if (!dp) return false;
+    uint8_t sz = dp->data_size ? dp->data_size : 1;
+    uint64_t lo = mem_data_mask_lo(dp->data_lo, sz);
+    uint64_t hi = (sz > 8) ? dp->data_hi : 0;
+    *out = ((unsigned __int128)hi << 64) | lo;
+    return true;
+}
+static bool extr_store_data(const EntryView *ev, uint32_t i, uint8_t slot,
+                            unsigned __int128 *out)
+{
+    const DynParam *dp = find_memop_slot(ev, i, slot, DYN_STORE_ADDR);
+    if (!dp) return false;
+    uint8_t sz = dp->data_size ? dp->data_size : 1;
+    uint64_t lo = mem_data_mask_lo(dp->data_lo, sz);
+    uint64_t hi = (sz > 8) ? dp->data_hi : 0;
+    *out = ((unsigned __int128)hi << 64) | lo;
+    return true;
+}
+
+/* Reg-snap families: the captured reg_snaps array is laid out per-insn
+ * src-then-dst in template-walk order.  Slot index here corresponds to
+ * the operand index within the insn's src or dst register array. */
+static bool extr_src_reg(const EntryView *ev, uint32_t i, uint8_t slot,
+                         unsigned __int128 *out)
+{
+    if (!ev->reg_snaps || !ev->tmpl) return false;
+    const InsnFields *f = &ev->tmpl->insn_fields[i];
+    if (slot >= f->n_src_regs) return false;
+    uint32_t pos = ev->insn_rs_off[i] + slot;
+    if (pos >= ev->reg_snaps->len) return false;
+    const RegSnap *s = &g_array_index(ev->reg_snaps, RegSnap, pos);
+    *out = ((unsigned __int128)s->hi << 64) | s->lo;
+    return true;
+}
+static bool extr_dst_reg(const EntryView *ev, uint32_t i, uint8_t slot,
+                         unsigned __int128 *out)
+{
+    if (!ev->reg_snaps || !ev->tmpl) return false;
+    const InsnFields *f = &ev->tmpl->insn_fields[i];
+    if (slot >= f->n_dst_regs) return false;
+    uint32_t pos = ev->insn_rs_off[i] + f->n_src_regs + slot;
+    if (pos >= ev->reg_snaps->len) return false;
+    const RegSnap *s = &g_array_index(ev->reg_snaps, RegSnap, pos);
+    *out = ((unsigned __int128)s->hi << 64) | s->lo;
+    return true;
+}
+
+/* Insn-encoding-mutable families.  The plugin's capture path does not
+ * yet observe these (no SMC detector wired up) — extract returns the
+ * template's static value, so the delta is always zero and no record
+ * is emitted.  When an SMC observer is added later, point extract at
+ * the runtime value and keep template_default unchanged. */
+static unsigned __int128 deflt_insn_bytes_lo(const BBTemplate *t,
+                                             uint32_t i, uint8_t slot)
+{
+    (void)slot;
+    if (!t || i >= t->n_insns) return 0;
+    uint64_t v = 0;
+    uint8_t sz = t->insn_sizes[i];
+    if (sz > 8) sz = 8;
+    const uint8_t *p = &t->insn_bytes[(size_t)i * MAX_INSN_BYTES];
+    for (int b = 0; b < sz; b++) v |= ((uint64_t)p[b]) << (b * 8);
+    return (unsigned __int128)v;
+}
+static bool extr_insn_bytes_lo(const EntryView *ev, uint32_t i, uint8_t slot,
+                               unsigned __int128 *out)
+{ *out = deflt_insn_bytes_lo(ev->tmpl, i, slot); return true; }
+
+static unsigned __int128 deflt_insn_bytes_hi(const BBTemplate *t,
+                                             uint32_t i, uint8_t slot)
+{
+    (void)slot;
+    if (!t || i >= t->n_insns) return 0;
+    uint8_t sz = t->insn_sizes[i];
+    if (sz <= 8) return 0;
+    uint64_t v = 0;
+    const uint8_t *p = &t->insn_bytes[(size_t)i * MAX_INSN_BYTES + 8];
+    int extra = sz - 8;
+    if (extra > 8) extra = 8;
+    for (int b = 0; b < extra; b++) v |= ((uint64_t)p[b]) << (b * 8);
+    return (unsigned __int128)v;
+}
+static bool extr_insn_bytes_hi(const EntryView *ev, uint32_t i, uint8_t slot,
+                               unsigned __int128 *out)
+{ *out = deflt_insn_bytes_hi(ev->tmpl, i, slot); return true; }
+
+static unsigned __int128 deflt_insn_opcode(const BBTemplate *t,
+                                           uint32_t i, uint8_t slot)
+{
+    (void)slot;
+    if (!t || i >= t->n_insns) return 0;
+    return (unsigned __int128)(uint8_t)t->insn_fields[i].opcode;
+}
+static bool extr_insn_opcode(const EntryView *ev, uint32_t i, uint8_t slot,
+                             unsigned __int128 *out)
+{ *out = deflt_insn_opcode(ev->tmpl, i, slot); return true; }
+
+static unsigned __int128 deflt_insn_branch_type(const BBTemplate *t,
+                                                uint32_t i, uint8_t slot)
+{
+    (void)slot;
+    if (!t || i >= t->n_insns) return 0;
+    return (unsigned __int128)(uint8_t)t->insn_fields[i].branch_type;
+}
+static bool extr_insn_branch_type(const EntryView *ev, uint32_t i, uint8_t slot,
+                                  unsigned __int128 *out)
+{ *out = deflt_insn_branch_type(ev->tmpl, i, slot); return true; }
+
+static unsigned __int128 deflt_insn_flags(const BBTemplate *t,
+                                          uint32_t i, uint8_t slot)
+{
+    (void)slot;
+    if (!t || i >= t->n_insns) return 0;
+    const InsnFields *f = &t->insn_fields[i];
+    uint8_t flags = 0;
+    if (f->branch_conditional) flags |= CST_INSN_FLAG_BRANCH_COND;
+    if (f->has_immediate)      flags |= CST_INSN_FLAG_HAS_IMM;
+    flags |= (uint8_t)((f->sync_hint & 0x0F) << CST_INSN_FLAG_SYNC_SHIFT);
+    if (f->variable_memop)     flags |= CST_INSN_FLAG_VARIABLE_MEMOP;
+    return (unsigned __int128)flags;
+}
+static bool extr_insn_flags(const EntryView *ev, uint32_t i, uint8_t slot,
+                            unsigned __int128 *out)
+{ *out = deflt_insn_flags(ev->tmpl, i, slot); return true; }
+
+static unsigned __int128 deflt_insn_imm(const BBTemplate *t,
+                                        uint32_t i, uint8_t slot)
+{
+    (void)slot;
+    if (!t || i >= t->n_insns) return 0;
+    const InsnFields *f = &t->insn_fields[i];
+    if (!f->has_immediate) return 0;
+    return (unsigned __int128)(int64_t)f->immediate;
+}
+static bool extr_insn_imm(const EntryView *ev, uint32_t i, uint8_t slot,
+                          unsigned __int128 *out)
+{ *out = deflt_insn_imm(ev->tmpl, i, slot); return true; }
+
+static unsigned __int128 deflt_insn_size(const BBTemplate *t,
+                                         uint32_t i, uint8_t slot)
+{
+    (void)slot;
+    if (!t || i >= t->n_insns) return 0;
+    return (unsigned __int128)t->insn_sizes[i];
+}
+static bool extr_insn_size(const EntryView *ev, uint32_t i, uint8_t slot,
+                           unsigned __int128 *out)
+{ *out = deflt_insn_size(ev->tmpl, i, slot); return true; }
+
+/* Field family registry.  Order MUST be ascending by base_field_id so
+ * the emitter walks records in (ins_pos, field_id) order. */
+static const FieldDescriptor field_descriptors[] = {
+    { CST_FID_MEMOP_COUNT,      1,  false, false, false,
+      extr_memop_count,    deflt_memop_count,    "MEMOP_COUNT" },
+    { CST_FID_LOAD_ADDR_BASE,   CST_FID_SLOT_COUNT, false, false, false,
+      extr_load_addr,      deflt_zero,           "LOAD_ADDR" },
+    { CST_FID_STORE_ADDR_BASE,  CST_FID_SLOT_COUNT, false, false, false,
+      extr_store_addr,     deflt_zero,           "STORE_ADDR" },
+    { CST_FID_LOAD_DATA_BASE,   CST_FID_SLOT_COUNT, true,  false, false,
+      extr_load_data,      deflt_zero,           "LOAD_DATA" },
+    { CST_FID_STORE_DATA_BASE,  CST_FID_SLOT_COUNT, true,  false, false,
+      extr_store_data,     deflt_zero,           "STORE_DATA" },
+    { CST_FID_SRC_REG_BASE,     CST_FID_SLOT_COUNT, false, true,  false,
+      extr_src_reg,        deflt_zero,           "SRC_REG" },
+    { CST_FID_DST_REG_BASE,     CST_FID_SLOT_COUNT, false, true,  false,
+      extr_dst_reg,        deflt_zero,           "DST_REG" },
+    { CST_FID_INSN_BYTES_LO,    1,  false, false, true,
+      extr_insn_bytes_lo,  deflt_insn_bytes_lo,  "INSN_BYTES_LO" },
+    { CST_FID_INSN_BYTES_HI,    1,  false, false, true,
+      extr_insn_bytes_hi,  deflt_insn_bytes_hi,  "INSN_BYTES_HI" },
+    { CST_FID_INSN_OPCODE,      1,  false, false, true,
+      extr_insn_opcode,    deflt_insn_opcode,    "OPCODE" },
+    { CST_FID_INSN_BRANCH_TYPE, 1,  false, false, true,
+      extr_insn_branch_type, deflt_insn_branch_type, "BRANCH_TYPE" },
+    { CST_FID_INSN_FLAGS,       1,  false, false, true,
+      extr_insn_flags,     deflt_insn_flags,     "INSN_FLAGS" },
+    { CST_FID_INSN_IMMEDIATE,   1,  false, false, true,
+      extr_insn_imm,       deflt_insn_imm,       "IMMEDIATE" },
+    { CST_FID_INSN_SIZE,        1,  false, false, true,
+      extr_insn_size,      deflt_insn_size,      "INSN_SIZE" },
+};
+
+#define N_FIELD_DESCRIPTORS (sizeof(field_descriptors) / sizeof(field_descriptors[0]))
+
+/* Sort dyn_params so each insn's loads precede its stores, matching
+ * the slot indexing used by find_memop_slot(). */
 static gint dyn_param_cmp(gconstpointer aa, gconstpointer bb)
 {
     const DynParam *a = (const DynParam *)aa;
     const DynParam *b = (const DynParam *)bb;
-    if (a->insn_index != b->insn_index) {
+    if (a->insn_index != b->insn_index)
         return (a->insn_index < b->insn_index) ? -1 : 1;
-    }
-    if (a->type != b->type) {
+    if (a->type != b->type)
         return (a->type < b->type) ? -1 : 1;
-    }
     return 0;
 }
-
 static void dyn_params_sort_template_order(GArray *dyn_params)
 {
-    if (!dyn_params || dyn_params->len < 2) {
-        return;
-    }
+    if (!dyn_params || dyn_params->len < 2) return;
     g_array_sort(dyn_params, dyn_param_cmp);
 }
 
-static void dyn_param_collect_changed_positions(const GArray *prev_dyn,
-                                                const GArray *cur_dyn,
-                                                GArray *changed_positions)
+/* Build per-insn offset arrays into dyn_params and reg_snaps so
+ * descriptor extracts run in O(1) per slot. */
+static void build_entry_view(EntryView *ev, const BBTemplate *tmpl,
+                             const GArray *dyn_params,
+                             const GArray *reg_snaps,
+                             uint8_t *actual_n_loads,
+                             uint8_t *actual_n_stores,
+                             uint32_t *insn_dp_off,
+                             uint32_t *insn_rs_off)
 {
-    guint prev_len = prev_dyn ? prev_dyn->len : 0;
-    guint cur_len = cur_dyn ? cur_dyn->len : 0;
-    guint common = MIN(prev_len, cur_len);
+    ev->tmpl = tmpl;
+    ev->dyn_params = dyn_params;
+    ev->reg_snaps = reg_snaps;
+    ev->actual_n_loads = actual_n_loads;
+    ev->actual_n_stores = actual_n_stores;
+    ev->insn_dp_off = insn_dp_off;
+    ev->insn_rs_off = insn_rs_off;
 
-    for (guint i = 0; i < common; i++) {
-        const DynParam *prev = &g_array_index(prev_dyn, DynParam, i);
-        const DynParam *cur = &g_array_index(cur_dyn, DynParam, i);
+    if (!tmpl) return;
 
-        if (prev->type != cur->type || prev->value != cur->value) {
-            g_array_append_val(changed_positions, i);
+    uint32_t n = tmpl->n_insns;
+    for (uint32_t i = 0; i < n; i++) {
+        actual_n_loads[i] = 0;
+        actual_n_stores[i] = 0;
+    }
+
+    /* Walk dyn_params (already sorted by insn_index, type) once. */
+    uint32_t k = 0;
+    uint32_t total_dp = dyn_params ? dyn_params->len : 0;
+    for (uint32_t i = 0; i < n; i++) {
+        insn_dp_off[i] = k;
+        while (k < total_dp) {
+            const DynParam *dp = &g_array_index(dyn_params, DynParam, k);
+            if (dp->insn_index != i) break;
+            if (dp->type == DYN_LOAD_ADDR) actual_n_loads[i]++;
+            else                            actual_n_stores[i]++;
+            k++;
         }
     }
+    insn_dp_off[n] = k;
 
-    for (guint i = common; i < cur_len; i++) {
-        g_array_append_val(changed_positions, i);
+    /* Reg_snaps: per-insn n_src + n_dst, in template-walk order. */
+    uint32_t r = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        insn_rs_off[i] = r;
+        const InsnFields *f = &tmpl->insn_fields[i];
+        r += f->n_src_regs + f->n_dst_regs;
     }
+    insn_rs_off[n] = r;
+}
+
+/* Look up baseline value for (template_id, ins_pos, field_id).  Falls
+ * back to the descriptor's template_default if no prior observation. */
+static unsigned __int128 field_state_get(GHashTable *state,
+                                         uint32_t template_id,
+                                         uint32_t ins_pos,
+                                         uint8_t field_id,
+                                         const FieldDescriptor *fd,
+                                         const BBTemplate *tmpl,
+                                         uint8_t slot)
+{
+    FieldStateKey k = { template_id, (uint16_t)ins_pos, field_id, 0 };
+    U128 *cur = (U128 *)g_hash_table_lookup(state, &k);
+    if (cur) return u128_pack(*cur);
+    return fd->template_default(tmpl, ins_pos, slot);
+}
+
+static void field_state_put(GHashTable *state,
+                            uint32_t template_id,
+                            uint32_t ins_pos,
+                            uint8_t field_id,
+                            unsigned __int128 v)
+{
+    FieldStateKey *k = g_new(FieldStateKey, 1);
+    k->template_id = template_id;
+    k->ins_pos = (uint16_t)ins_pos;
+    k->field_id = field_id;
+    k->_pad = 0;
+    U128 *val = g_new(U128, 1);
+    *val = u128_unpack(v);
+    g_hash_table_replace(state, k, val);
 }
 
 /*
- * Write a dyn-param patch record.
+ * The single emitter.  Walks the template insn-by-insn; for each insn,
+ * walks the descriptor table; for each (descriptor, slot), pulls the
+ * current value and emits a record iff it differs from the prior
+ * observation (or template default on first sighting).
  *
- *   flags        : u8   bit0 = CST_DYN_FLAG_UNCHANGED
- *   (if not unchanged)
- *     cur_len     : ULEB128
- *     changed_len : ULEB128
- *     { pos_gap : ULEB128 , delta : SLEB128 } *
+ * The (ins_pos, field_id) wire ordering is a natural consequence of
+ * the loop nesting (insn outer, descriptor table inner ascending,
+ * slot inner ascending) — no sort needed.
  */
-static void write_dyn_param_patch(BitWriter *bw,
-                                  const GArray *prev_dyn,
-                                  const GArray *cur_dyn,
-                                  const GArray *changed_positions,
-                                  bool is_wp)
+static void emit_field_delta_section(BitWriter *main_bw,
+                                     GHashTable *state,
+                                     uint32_t template_id,
+                                     const EntryView *ev,
+                                     bool is_wp,
+                                     uint8_t header_flags)
 {
-    int64_t prev_pos = -1;
-    uint64_t patch_start = bw_tell_bytes(bw);
+    BitWriter rec_bw;
+    bw_init_buf(&rec_bw);
 
-    bw_write_u8(bw, 0 /* flags: not unchanged */);
-    bw_write_uleb128(bw, cur_dyn->len);
-    bw_write_uleb128(bw, changed_positions->len);
+    /* Two-pass: pass 1 buffers records into a small staging vec to
+     * count them, pass 2 writes the count + records.  Cheaper would
+     * be to lazily fix up the count, but ULEB-sized count can grow,
+     * so we pre-count.  Records are typically small. */
+    typedef struct { uint32_t pos; uint8_t fid; __int128 delta; } StageRec;
+    g_autoptr(GArray) stage =
+        g_array_sized_new(false, false, sizeof(StageRec), 16);
 
-    for (guint c = 0; c < changed_positions->len; c++) {
-        guint pos = g_array_index(changed_positions, guint, c);
-        const DynParam *cur = &g_array_index(cur_dyn, DynParam, pos);
-        uint64_t pos_gap = (uint64_t)(pos - (guint)(prev_pos + 1));
-        int64_t base_value = 0;
-        int64_t delta;
+    uint32_t prev_pos = 0;
+    if (ev->tmpl) {
+        for (uint32_t i = 0; i < ev->tmpl->n_insns; i++) {
+            for (size_t d = 0; d < N_FIELD_DESCRIPTORS; d++) {
+                const FieldDescriptor *fd = &field_descriptors[d];
+                if (fd->gated_by_mem_data && !(header_flags & CST_FLAG_MEM_DATA))
+                    continue;
+                if (fd->gated_by_reg_data && !(header_flags & CST_FLAG_REG_DATA))
+                    continue;
+                if (fd->gated_by_insn_mut && !(header_flags & CST_FLAG_INSN_MUT))
+                    continue;
 
-        if (prev_dyn && pos < prev_dyn->len) {
-            const DynParam *prev = &g_array_index(prev_dyn, DynParam, pos);
-            base_value = prev->value;
-        }
-        delta = (int64_t)cur->value - base_value;
-
-        bw_write_uleb128(bw, pos_gap);
-        bw_write_sleb128(bw, delta);
-
-        prev_pos = pos;
-    }
-
-    uint64_t written = (bw_tell_bytes(bw) - patch_start) * 8;
-    if (is_wp) {
-        stat_bin_dyn_wp_bits += written;
-    } else {
-        stat_bin_dyn_cp_bits += written;
-    }
-}
-
-static bool body_stream_emit_dyn_patch(BitWriter *bw,
-                                       GHashTable *dyn_state,
-                                       uint32_t template_id,
-                                       const GArray *cur_dyn,
-                                       bool is_wp)
-{
-    GArray *prev_dyn = (GArray *)g_hash_table_lookup(dyn_state, &template_id);
-    bool unchanged = prev_dyn && dyn_param_array_equal(prev_dyn, cur_dyn);
-
-    if (unchanged) {
-        bw_write_u8(bw, CST_DYN_FLAG_UNCHANGED);
-        return true;
-    }
-
-    g_autoptr(GArray) changed_positions = g_array_new(false, false,
-                                                      sizeof(guint));
-    uint32_t *key = g_new(uint32_t, 1);
-
-    dyn_param_collect_changed_positions(prev_dyn, cur_dyn, changed_positions);
-    write_dyn_param_patch(bw, prev_dyn, cur_dyn, changed_positions, is_wp);
-
-    *key = template_id;
-    g_hash_table_replace(dyn_state, key, dyn_param_array_clone(cur_dyn));
-    return false;
-}
-
-/* ========================= Mem-data values ========================= */
-
-/* Encode data_size into 3-bit code: 0=1B, 1=2B, 2=4B, 3=8B, 4=16B */
-static inline uint8_t mem_data_size_code(uint8_t data_size)
-{
-    switch (data_size) {
-    case 1:  return 0;
-    case 2:  return 1;
-    case 4:  return 2;
-    case 8:  return 3;
-    case 16: return 4;
-    default: return 0;
-    }
-}
-
-static void write_mem_data_values(BitWriter *bw, const GArray *dyn_params)
-{
-    guint count = dyn_params ? dyn_params->len : 0;
-    for (guint i = 0; i < count; i++) {
-        const DynParam *dp = &g_array_index(dyn_params, DynParam, i);
-        uint8_t sz = dp->data_size;
-        if (sz == 0) {
-            sz = 1;
-        }
-        bw_write_u8(bw, mem_data_size_code(sz));
-        for (uint8_t b = 0; b < sz && b < 8; b++) {
-            bw_write_u8(bw, (uint8_t)((dp->data_lo >> (b * 8)) & 0xFF));
-        }
-        if (sz > 8) {
-            for (uint8_t b = 0; b < sz - 8; b++) {
-                bw_write_u8(bw, (uint8_t)((dp->data_hi >> (b * 8)) & 0xFF));
-            }
-        }
-    }
-}
-
-static void emit_mem_data_section(BitWriter *main_bw, const GArray *dyn_params)
-{
-    BitWriter sub;
-    bw_init_buf(&sub);
-    write_mem_data_values(&sub, dyn_params);
-    bw_byte_align(&sub);
-    bw_write_section(main_bw, bw_finish_buf(&sub));
-}
-
-/* ========================= Reg-data values =========================
- *
- * Emit per-instruction src then dst register snapshots.  Each snap:
- *   u8 size_code   (0=4B, 1=8B, 2=16B)
- *   SLEB128 delta_lo  (snap.lo - state[reg_id].lo)
- *   SLEB128 delta_hi  (only when size_code==2)
- *
- * Per-reg-id state is carried across entries on BodyStreamState so
- * static / loop-invariant register values cost a single 0-byte SLEB
- * after the first capture.  REG_NONE (id 0) is skipped entirely.
- *
- * Snap ordering inside reg_snaps mirrors the template walk:
- *   for each insn i in template:
- *     for r in 0..n_src_regs[i]: one snap
- *     for r in 0..n_dst_regs[i]: one snap
- */
-
-static void write_one_reg_snap(BitWriter *bw,
-                               const RegSnap *s,
-                               uint8_t reg_id,
-                               int64_t *state_lo,
-                               int64_t *state_hi)
-{
-    bw_write_u8(bw, s->size_code);
-    if (reg_id == REG_NONE) {
-        /* No state slot; emit raw value as zero-baseline delta. */
-        bw_write_sleb128(bw, (int64_t)s->lo);
-        if (s->size_code == 2) {
-            bw_write_sleb128(bw, (int64_t)s->hi);
-        }
-        return;
-    }
-    int64_t cur_lo = (int64_t)s->lo;
-    int64_t delta_lo = cur_lo - state_lo[reg_id];
-    bw_write_sleb128(bw, delta_lo);
-    state_lo[reg_id] = cur_lo;
-    if (s->size_code == 2) {
-        int64_t cur_hi = (int64_t)s->hi;
-        int64_t delta_hi = cur_hi - state_hi[reg_id];
-        bw_write_sleb128(bw, delta_hi);
-        state_hi[reg_id] = cur_hi;
-    }
-}
-
-static void emit_reg_data_section(BitWriter *main_bw,
-                                  int64_t *state_lo,
-                                  int64_t *state_hi,
-                                  const BBTemplate *tmpl,
-                                  const GArray *reg_snaps)
-{
-    BitWriter sub;
-    bw_init_buf(&sub);
-
-    if (tmpl) {
-        /*
-         * Always emit one snap per template src/dst slot.  If the
-         * captured `reg_snaps` array is short — e.g. because a
-         * per-insn callback didn't fire for some reason — pad missing
-         * entries with a zero-baseline 4B snap (size_code=0,
-         * delta_lo=0) so the decoder's per-reg-id state stays
-         * unchanged.  Otherwise the decoder would read fewer bytes
-         * than we wrote (or vice versa) and lose stream sync.
-         */
-        const RegSnap zero_snap = { 0, 0, 0 };
-        guint pos = 0;
-        guint avail = reg_snaps ? reg_snaps->len : 0;
-        for (uint32_t i = 0; i < tmpl->n_insns; i++) {
-            const InsnFields *f = &tmpl->insn_fields[i];
-            for (uint8_t r = 0; r < f->n_src_regs; r++) {
-                const RegSnap *s = (pos < avail)
-                    ? &g_array_index(reg_snaps, RegSnap, pos)
-                    : &zero_snap;
-                pos++;
-                write_one_reg_snap(&sub, s, f->src_regs[r],
-                                   state_lo, state_hi);
-            }
-            for (uint8_t r = 0; r < f->n_dst_regs; r++) {
-                const RegSnap *s = (pos < avail)
-                    ? &g_array_index(reg_snaps, RegSnap, pos)
-                    : &zero_snap;
-                pos++;
-                write_one_reg_snap(&sub, s, f->dst_regs[r],
-                                   state_lo, state_hi);
+                for (uint8_t slot = 0; slot < fd->slot_count; slot++) {
+                    unsigned __int128 cur;
+                    if (!fd->extract(ev, i, slot, &cur)) continue;
+                    uint8_t fid = fd->base_field_id + slot;
+                    unsigned __int128 base =
+                        field_state_get(state, template_id, i, fid,
+                                        fd, ev->tmpl, slot);
+                    if (cur == base) continue;
+                    StageRec rec = { i, fid, (__int128)(cur - base) };
+                    g_array_append_val(stage, rec);
+                    field_state_put(state, template_id, i, fid, cur);
+                }
             }
         }
     }
 
-    bw_byte_align(&sub);
-    bw_write_section(main_bw, bw_finish_buf(&sub));
+    uint64_t section_start = bw_tell_bytes(main_bw);
+
+    /* Build payload in rec_bw, then emit as length-prefixed section. */
+    bw_write_uleb128(&rec_bw, stage->len);
+    for (guint r = 0; r < stage->len; r++) {
+        StageRec *s = &g_array_index(stage, StageRec, r);
+        uint64_t gap = (uint64_t)(s->pos - prev_pos);
+        bw_write_uleb128(&rec_bw, gap);
+        bw_write_u8(&rec_bw, s->fid);
+        bw_write_sleb128_i128(&rec_bw, s->delta);
+        prev_pos = s->pos;
+    }
+    bw_byte_align(&rec_bw);
+    bw_write_section(main_bw, bw_finish_buf(&rec_bw));
+
+    uint64_t bits = (bw_tell_bytes(main_bw) - section_start) * 8;
+    if (is_wp) stat_bin_dyn_wp_bits += bits;
+    else       stat_bin_dyn_cp_bits += bits;
+}
+
+/* Snapshot CP field-state into WP field-state at the start of a WP
+ * chain.  WP entries delta against this fork; the fork is discarded
+ * at chain end (via wp state hashtable rebuild) so wrong-path effects
+ * never leak into subsequent CP entries. */
+static void field_state_fork_wp(GHashTable *cp_state, GHashTable *wp_state)
+{
+    g_hash_table_remove_all(wp_state);
+    GHashTableIter it;
+    gpointer pk, pv;
+    g_hash_table_iter_init(&it, cp_state);
+    while (g_hash_table_iter_next(&it, &pk, &pv)) {
+        FieldStateKey *k = g_new(FieldStateKey, 1);
+        *k = *(FieldStateKey *)pk;
+        U128 *v = g_new(U128, 1);
+        *v = *(U128 *)pv;
+        g_hash_table_insert(wp_state, k, v);
+    }
 }
 
 /* ========================= Body stream ========================= */
 
-BodyStreamState *body_stream_new(FILE *f, uint32_t thread_id,
+BodyStreamState *body_stream_new(WriterCtx *w, uint32_t thread_id,
                                  const char *seg_datetime)
 {
     BodyStreamState *st = g_new0(BodyStreamState, 1);
 
-    bw_init_file(&st->bw, f);
+    bw_init_writer(&st->bw, w);
 
     bw_write_u32_le(&st->bw, CST_MAGIC);
     bw_write_u8(&st->bw, (uint8_t)trace_isa);
@@ -602,7 +891,11 @@ BodyStreamState *body_stream_new(FILE *f, uint32_t thread_id,
     if (enable_reg_data) {
         flags |= CST_FLAG_REG_DATA;
     }
+    /* CST_FLAG_INSN_MUT is left clear: no SMC observer is wired up
+     * yet, so the writer never produces CST_FID_INSN_* records.  When
+     * an SMC capture path is added, set this bit here. */
     bw_write_u8(&st->bw, flags);
+    st->header_flags = flags;
 
     {
         const char *cmd = qemu_command_line ? qemu_command_line : "";
@@ -633,99 +926,46 @@ BodyStreamState *body_stream_new(FILE *f, uint32_t thread_id,
 
     bw_byte_align(&st->bw);
     bw_flush(&st->bw);
-    st->body_off = (uint64_t)ftello(f);
+    /* Use BitWriter's running byte count rather than ftello() so the
+     * writer works on non-seekable streams (e.g. popen() pipes used
+     * for streaming compression). */
+    st->body_off = bw_tell_bytes(&st->bw);
 
     st->thread_id = thread_id;
 
-    st->cp_dyn_state = g_hash_table_new_full(g_int_hash, g_int_equal,
-                                             g_free,
-                                             dyn_param_array_unref_value);
-    st->wp_dyn_state = g_hash_table_new_full(g_int_hash, g_int_equal,
-                                             g_free,
-                                             dyn_param_array_unref_value);
+    st->cp_field_state = g_hash_table_new_full(field_key_hash,
+                                               field_key_equal,
+                                               g_free, g_free);
+    st->wp_field_state = g_hash_table_new_full(field_key_hash,
+                                               field_key_equal,
+                                               g_free, g_free);
 
     return st;
 }
 
 /*
- * Update the template's observed-max (n_loads, n_stores) per insn from
- * this entry's dyn_params (which must already be sorted by insn_index).
- * If any insn's observed count exceeds its current static count, bump
- * the count and set the DYNAMIC_MEMOP flag so the consumer knows this
- * insn's entries carry a per-entry count preamble.
+ * v1.7: build an EntryView wrapping the captured per-entry data and
+ * emit one length-prefixed delta_section.  The descriptor table in
+ * field_descriptors[] is the single source of truth for which fields
+ * exist on the wire and how each is reconstructed.
  */
-static void update_template_observed_max(BBTemplate *tmpl,
-                                         const GArray *dyn_params)
+static void emit_one_bb_delta(BitWriter *bw, BodyStreamState *st,
+                              GHashTable *state, uint32_t template_id,
+                              const BBTemplate *tmpl,
+                              const GArray *dyn_params,
+                              const GArray *reg_snaps,
+                              bool is_wp)
 {
-    if (!tmpl) {
-        return;
-    }
-    /*
-     * Build per-insn observed (n_loads, n_stores) for this entry.
-     * dyn_params must be sorted by (insn_index, type).  Insns not
-     * appearing in dyn_params have observed counts (0, 0).
-     */
-    uint32_t n_insns = tmpl->n_insns;
-    g_autofree uint32_t *obs_l = g_new0(uint32_t, n_insns);
-    g_autofree uint32_t *obs_s = g_new0(uint32_t, n_insns);
-    if (dyn_params) {
-        for (guint i = 0; i < dyn_params->len; i++) {
-            const DynParam *dp = &g_array_index(dyn_params, DynParam, i);
-            if (dp->insn_index >= n_insns) continue;
-            if (dp->type == DYN_LOAD_ADDR) obs_l[dp->insn_index]++;
-            else obs_s[dp->insn_index]++;
-        }
-    }
-    /*
-     * For each insn, compare observed (n_l, n_s) against the template's
-     * current values.  Bump UP if observed exceeds current; mark
-     * DYNAMIC_MEMOP whenever observed differs from current (in either
-     * direction) so the per-entry preamble carries the actual counts.
-     */
-    for (uint32_t ii = 0; ii < n_insns; ii++) {
-        InsnFields *fld = &tmpl->insn_fields[ii];
-        uint32_t n_l = obs_l[ii];
-        uint32_t n_s = obs_s[ii];
-        if (n_l > fld->n_loads) {
-            fld->n_loads = (n_l > 255 ? 255 : (uint8_t)n_l);
-        }
-        if (n_s > fld->n_stores) {
-            fld->n_stores = (n_s > 255 ? 255 : (uint8_t)n_s);
-        }
-        if (n_l != fld->n_loads || n_s != fld->n_stores) {
-            fld->dynamic_memop = true;
-        }
-    }
-}
-
-/*
- * Emit the dynamic-memop preamble for this entry: for each template
- * insn with DYNAMIC_MEMOP flag, write (actual_n_loads, actual_n_stores)
- * as ULEB pair, in template-insn order.  dyn_params must be sorted.
- */
-static void emit_dynamic_memop_preamble(BitWriter *bw,
-                                        const BBTemplate *tmpl,
-                                        const GArray *dyn_params)
-{
-    if (!tmpl) {
-        return;
-    }
-    for (uint32_t i = 0; i < tmpl->n_insns; i++) {
-        if (!tmpl->insn_fields[i].dynamic_memop) {
-            continue;
-        }
-        uint32_t n_l = 0, n_s = 0;
-        if (dyn_params) {
-            for (guint k = 0; k < dyn_params->len; k++) {
-                const DynParam *dp = &g_array_index(dyn_params, DynParam, k);
-                if (dp->insn_index != i) continue;
-                if (dp->type == DYN_LOAD_ADDR) n_l++;
-                else n_s++;
-            }
-        }
-        bw_write_uleb128(bw, n_l);
-        bw_write_uleb128(bw, n_s);
-    }
+    EntryView ev;
+    uint32_t n = tmpl ? tmpl->n_insns : 0;
+    g_autofree uint8_t *anl = g_new0(uint8_t, n ? n : 1);
+    g_autofree uint8_t *ans = g_new0(uint8_t, n ? n : 1);
+    g_autofree uint32_t *dpoff = g_new0(uint32_t, (n ? n : 0) + 1);
+    g_autofree uint32_t *rsoff = g_new0(uint32_t, (n ? n : 0) + 1);
+    build_entry_view(&ev, tmpl, dyn_params, reg_snaps,
+                     anl, ans, dpoff, rsoff);
+    emit_field_delta_section(bw, state, template_id, &ev, is_wp,
+                             st->header_flags);
 }
 
 void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
@@ -735,29 +975,18 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
     uint64_t body_start = bw_tell_bytes(&st->bw);
 
     dyn_params_sort_template_order(entry->dyn_params);
-    update_template_observed_max(entry->tmpl, entry->dyn_params);
     for (uint32_t w = 0; w < num_wp; w++) {
         WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
         dyn_params_sort_template_order(wp->dyn_params);
-        update_template_observed_max(wp->tmpl, wp->dyn_params);
     }
 
     bw_write_u8(&st->bw, BODY_TAG_ENTRY);
     bw_write_sleb128(&st->bw, entry_tmpl - st->prev_entry_template);
     st->prev_entry_template = entry_tmpl;
 
-    emit_dynamic_memop_preamble(&st->bw, entry->tmpl, entry->dyn_params);
-    body_stream_emit_dyn_patch(&st->bw, st->cp_dyn_state,
-                               entry->template_id, entry->dyn_params,
-                               false);
-    if (enable_mem_data) {
-        emit_mem_data_section(&st->bw, entry->dyn_params);
-    }
-    if (enable_reg_data) {
-        emit_reg_data_section(&st->bw,
-                              st->cp_reg_state_lo, st->cp_reg_state_hi,
-                              entry->tmpl, entry->reg_snaps);
-    }
+    emit_one_bb_delta(&st->bw, st, st->cp_field_state, entry->template_id,
+                      entry->tmpl, entry->dyn_params, entry->reg_snaps,
+                      false);
 
     /* WP chain sub-section */
     {
@@ -765,14 +994,11 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
         bw_init_buf(&sub);
         bw_write_uleb128(&sub, num_wp);
         int64_t prev_wp_tid = 0;
-        if (enable_reg_data) {
-            /* Seed WP reg-state from CP reg-state: WP execution starts
-             * from the CP architectural state and is rolled back at
-             * the end of the chain. */
-            memcpy(st->wp_reg_state_lo, st->cp_reg_state_lo,
-                   sizeof(st->wp_reg_state_lo));
-            memcpy(st->wp_reg_state_hi, st->cp_reg_state_hi,
-                   sizeof(st->wp_reg_state_hi));
+        if (num_wp > 0) {
+            /* Seed WP field-state from CP: speculative execution
+             * starts at the CP architectural state and is rolled
+             * back at chain end. */
+            field_state_fork_wp(st->cp_field_state, st->wp_field_state);
         }
         for (uint32_t w = 0; w < num_wp; w++) {
             const WPBBEntry *wp = &g_array_index(entry->wp_entries,
@@ -780,18 +1006,9 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
             uint32_t wp_tmpl = wp->template_id;
             bw_write_sleb128(&sub, (int64_t)wp_tmpl - prev_wp_tid);
             prev_wp_tid = wp_tmpl;
-            emit_dynamic_memop_preamble(&sub, wp->tmpl, wp->dyn_params);
-            body_stream_emit_dyn_patch(&sub, st->wp_dyn_state, wp_tmpl,
-                                       wp->dyn_params, true);
-            if (enable_mem_data) {
-                emit_mem_data_section(&sub, wp->dyn_params);
-            }
-            if (enable_reg_data) {
-                emit_reg_data_section(&sub,
-                                      st->wp_reg_state_lo,
-                                      st->wp_reg_state_hi,
-                                      wp->tmpl, wp->reg_snaps);
-            }
+            emit_one_bb_delta(&sub, st, st->wp_field_state, wp_tmpl,
+                              wp->tmpl, wp->dyn_params, wp->reg_snaps,
+                              true);
         }
         bw_byte_align(&sub);
         bw_write_section(&st->bw, bw_finish_buf(&sub));
@@ -866,7 +1083,6 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
  */
 void body_stream_finish(BodyStreamState *st)
 {
-    FILE *f = st->bw.f;
     uint64_t stats_start = bw_tell_bytes(&st->bw);
 
     bw_write_u8(&st->bw, BODY_TAG_END);
@@ -874,7 +1090,9 @@ void body_stream_finish(BodyStreamState *st)
     bw_byte_align(&st->bw);
     bw_flush(&st->bw);
 
-    uint64_t body_end = (uint64_t)ftello(f);
+    /* Pipe-friendly: trust the BitWriter's running counter rather than
+     * calling ftello() (which fails on non-seekable streams). */
+    uint64_t body_end = bw_tell_bytes(&st->bw);
     uint64_t body_byte_count = body_end - st->body_off;
 
     uint64_t templates_off = body_end;
@@ -906,6 +1124,6 @@ void body_stream_finish(BodyStreamState *st)
     stat_bin_header_bits += (end_bytes - stats_start) * 8;
     stat_bin_total_bits += end_bytes * 8;
 
-    g_hash_table_unref(st->cp_dyn_state);
-    g_hash_table_unref(st->wp_dyn_state);
+    g_hash_table_unref(st->cp_field_state);
+    g_hash_table_unref(st->wp_field_state);
 }

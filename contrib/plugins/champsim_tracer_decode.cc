@@ -166,6 +166,10 @@ void decode_detail_to_generic(uint64_t pc,
         out->sync_hint = SYNC_ATOMIC;
     }
 
+    if (flags & MF_VARIABLE_MEMOP) {
+        out->variable_memop = true;
+    }
+
     if (out->opcode == GEN_OP_UNKNOWN) {
         char disas_buf[256];
         g_snprintf(disas_buf, sizeof(disas_buf), "%s %s",
@@ -227,6 +231,7 @@ void decode_detail_to_generic(uint64_t pc,
 
     bool first_is_dst = opcode_first_is_dst[out->opcode];
     bool seen_first_reg = false;
+    bool saw_mem_op = false;
 
     for (uint8_t i = 0; i < info->n_operands; i++) {
         const qemu_plugin_operand *op = &info->operands[i];
@@ -261,6 +266,7 @@ void decode_detail_to_generic(uint64_t pc,
             }
             break;
         case QEMU_PLUGIN_OP_MEM: {
+            saw_mem_op = true;
             uint8_t base = parse_reg_id(op->reg_id);
             if (base != REG_NONE) {
                 add_src_reg(out, base, out_names, op->reg_name);
@@ -274,12 +280,19 @@ void decode_detail_to_generic(uint64_t pc,
              * Capstone operand access flags.  Missing flag info (some
              * ISAs, or operand type without access) falls back to the
              * opcode category below.
+             *
+             * LEA has an OP_MEM operand for address computation but
+             * does not actually access memory.  Capstone may report
+             * CS_AC_READ on that operand; ignore the access flags for
+             * pure address-compute opcodes.
              */
-            if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
-                if (out->n_loads < 0xFF) out->n_loads++;
-            }
-            if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
-                if (out->n_stores < 0xFF) out->n_stores++;
+            if (out->opcode != GEN_OP_LEA) {
+                if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
+                    if (out->n_loads < 0xFF) out->n_loads++;
+                }
+                if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
+                    if (out->n_stores < 0xFF) out->n_stores++;
+                }
             }
             break;
         }
@@ -315,11 +328,40 @@ void decode_detail_to_generic(uint64_t pc,
     }
 
     /*
-     * Fallback when Capstone did not populate per-operand access flags
-     * (e.g. ISAs without access info): infer a single load/store from
-     * the opcode category.
+     * Normalize direct-branch immediate to absolute target.
+     *
+     * Capstone's convention differs by arch:
+     *   - x86, ARM64: op->imm holds the resolved absolute target for
+     *     direct (PC-relative-encoded) branches; no fixup needed.
+     *   - RISC-V, MIPS: op->imm holds the raw signed PC-relative offset
+     *     from the branch instruction; we add `pc` to produce the
+     *     absolute target.
+     *
+     * After this step, InsnFields.immediate is always an absolute
+     * branch target for direct conditional / direct unconditional /
+     * direct call branches, which lets the WP-target derivation in
+     * champsim_tracer.cc be ISA-agnostic.
      */
-    if (out->n_loads == 0 && out->n_stores == 0) {
+    if (out->has_immediate &&
+        isa_properties[trace_isa].pc_relative_branch_imm) {
+        bool is_direct_branch =
+            out->branch_type == BRANCH_COND_DIRECT ||
+            out->branch_type == BRANCH_DIRECT_JUMP ||
+            out->branch_type == BRANCH_DIRECT_CALL;
+        if (is_direct_branch) {
+            out->immediate = (int64_t)((uint64_t)pc + (uint64_t)out->immediate);
+        }
+    }
+
+    /*
+     * Fallback: when Capstone reported a memory operand but did not
+     * populate its per-operand access flags (some ISAs, or operand
+     * types without access info), infer a single load/store from the
+     * opcode category.  Only applies when an OP_MEM was actually
+     * seen — a register-only insn (e.g. "cmp %rax, %rdx") must keep
+     * n_loads = n_stores = 0.
+     */
+    if (saw_mem_op && out->n_loads == 0 && out->n_stores == 0) {
         if (out->opcode == GEN_OP_LOAD || out->opcode == GEN_OP_CMP) {
             out->n_loads = 1;
         } else if (out->opcode == GEN_OP_STORE) {

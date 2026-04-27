@@ -64,7 +64,8 @@ class CFG:
 def _build_diamond_cfg(seed: int, num_diamonds: int,
                        side_len_range: tuple[int, int],
                        isa: str = "x86_64",
-                       coverage: bool = False) -> CFG:
+                       coverage: bool = False,
+                       hot_iters: int = 0) -> CFG:
     """Build a chain of `num_diamonds` diamonds plus entry and exit.
 
     Block layout inside each diamond:
@@ -84,10 +85,15 @@ def _build_diamond_cfg(seed: int, num_diamonds: int,
     # Straight-line block menu (no terminal, no branching).  Filter to
     # blocks that claim to support this ISA so we never schedule an
     # inline-asm block on the wrong target.
+    # `hot_loop` is opt-in only: it inflates trace length by a factor
+    # of `hot_iters` per inserted instance, which would blow past a
+    # caller's --stop in normal short runs.  Enable it only when the
+    # caller has asked for a long trace.
     straight_menu = [
         cls for cls in B.all_blocks()
         if cls.num_successors == 1 and cls.name != "exit"
         and isa in cls.supported_isas
+        and (cls.name != "hot_loop" or hot_iters > 0)
     ]
 
     nodes: list[Node] = []
@@ -118,8 +124,23 @@ def _build_diamond_cfg(seed: int, num_diamonds: int,
 
         t_len = r.randint(*side_len_range)
         f_len = r.randint(*side_len_range)
-        t_ids = [add(r.choice(straight_menu).name) for _ in range(t_len)]
-        f_ids = [add(r.choice(straight_menu).name) for _ in range(f_len)]
+        # When hot_iters > 0, guarantee at least one hot_loop on EACH
+        # side of every diamond so the CP path always traverses one
+        # regardless of which way `branch_outcome` lands.  (The set of
+        # straight-line classes randomly picked above varies per ISA
+        # because `straight_menu` has different lengths, which in turn
+        # advances the shared RNG by a different amount and can flip
+        # `branch_outcome` — placing hot_loop on both sides removes
+        # that sensitivity.)
+        t_cls_names = [r.choice(straight_menu).name for _ in range(t_len)]
+        f_cls_names = [r.choice(straight_menu).name for _ in range(f_len)]
+        if hot_iters > 0:
+            if t_len > 0:
+                t_cls_names[t_len // 2] = B.HotLoop.name
+            if f_len > 0:
+                f_cls_names[f_len // 2] = B.HotLoop.name
+        t_ids = [add(name) for name in t_cls_names]
+        f_ids = [add(name) for name in f_cls_names]
         join_id = add(r.choice(straight_menu).name)
 
         # Wire T-chain
@@ -472,6 +493,10 @@ class GenerateParams:
     side_len_min: int = 2
     side_len_max: int = 4
     coverage: bool = False
+    # If > 0, force one `hot_loop` block into the CP side of every
+    # diamond and configure each loop to iterate this many times.
+    # Used to drive long-running traces.
+    hot_iters: int = 0
 
 
 def generate(params: GenerateParams, out_dir: Path, prog_name: str
@@ -482,11 +507,18 @@ def generate(params: GenerateParams, out_dir: Path, prog_name: str
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Configure HotLoop iteration count BEFORE planning runs, since
+    # plan() reads HotLoop.iters to compute the deterministic final
+    # accumulator value baked into the expected `store` memop.
+    if params.hot_iters > 0:
+        B.HotLoop.iters = int(params.hot_iters)
+
     cfg = _build_diamond_cfg(
         params.seed, params.num_diamonds,
         (params.side_len_min, params.side_len_max),
         isa=params.isa,
         coverage=params.coverage,
+        hot_iters=params.hot_iters,
     )
     arena_u64 = _assign_slots(cfg)
     plans, init_values = _plan_nodes(cfg, params.seed, params.isa)

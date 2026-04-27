@@ -1,0 +1,9 @@
+[wrap-git]
+directory = capstone
+url = https://github.com/capstone-engine/capstone.git
+revision = 6.0.0-Alpha7
+depth = 1
+method = cmake
+
+[provide]
+dependency_names = capstone

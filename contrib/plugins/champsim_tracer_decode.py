@@ -1,10 +1,22 @@
 #!/usr/bin/env python3
 """
-Reference decoder for the champsim_tracer binary trace format v1.2.
+Reference decoder for the champsim_tracer binary trace format v1.7.
 
-Format v1.2 is byte-aligned throughout: every record and sub-record
-starts on a byte boundary, and most fields are plain u8 / u32 / u64
-or ULEB128/SLEB128.  See champsim_tracer_format.md for the full spec.
+Format v1.7 replaces the v1.6 dyn-patch / mem-data / reg-data
+sub-sections (and the variable-memop preamble) with a single
+unified field-typed delta stream.  Each BB entry carries:
+
+    n_records : ULEB
+    { ins_pos_gap : ULEB,  field_id : u8,  delta : SLEB128 } *
+
+Records are sorted in non-descending (ins_pos, field_id) order; an
+absent (template_id, ins_pos, field_id) triple means "field unchanged
+since last correct-path emission, or equal to template default if
+never observed".  The delta is `(cur128 − baseline128) mod 2**128`.
+
+Field IDs are dispatched through ``FIELD_DESCRIPTORS`` below — adding
+a new dynamic field is one entry there, mirroring the FieldDescriptor
+table in champsim_tracer_output.cc.
 """
 
 import argparse
@@ -16,13 +28,14 @@ from pathlib import Path
 
 # --- Format constants ------------------------------------------------
 
-# 'C','S','T',0x11 little-endian
-CST_MAGIC = 0x12545343
-CST_TRAILER_MAGIC = 0x12545343FFFFFFFF
+# 'C','S','T',0x17 little-endian
+CST_MAGIC = 0x17545343
+CST_TRAILER_MAGIC = 0x17545343FFFFFFFF
 CST_TRAILER_SIZE = 64
 
 CST_FLAG_MEM_DATA      = 1 << 0
 CST_FLAG_REG_DATA      = 1 << 1
+CST_FLAG_INSN_MUT      = 1 << 2
 
 # Body entry tags (u8)
 BODY_TAG_END      = 0
@@ -33,14 +46,32 @@ CST_INSN_FLAG_BRANCH_COND    = 1 << 0
 CST_INSN_FLAG_HAS_IMM        = 1 << 1
 CST_INSN_FLAG_SYNC_SHIFT     = 2
 CST_INSN_FLAG_SYNC_MASK      = 0x3C
-CST_INSN_FLAG_DYNAMIC_MEMOP  = 1 << 6
+CST_INSN_FLAG_VARIABLE_MEMOP = 1 << 6
 
 # WP event flags (u8)
 CST_WP_EVENT_TRANSLATION_UNAVAIL = 1 << 0
 CST_WP_EVENT_FAULT               = 1 << 1
 
-# Dyn-patch flags (u8)
-CST_DYN_FLAG_UNCHANGED = 1 << 0
+# Field-ID space (mirrors champsim_tracer.h CST_FID_*)
+FID_SLOT_COUNT       = 16
+FID_MEMOP_COUNT      = 0x00
+FID_LOAD_ADDR_BASE   = 0x01
+FID_STORE_ADDR_BASE  = 0x11
+FID_LOAD_DATA_BASE   = 0x21
+FID_STORE_DATA_BASE  = 0x31
+FID_SRC_REG_BASE     = 0x41
+FID_DST_REG_BASE     = 0x51
+FID_INSN_BYTES_LO    = 0x70
+FID_INSN_BYTES_HI    = 0x71
+FID_INSN_OPCODE      = 0x72
+FID_INSN_BRANCH_TYPE = 0x73
+FID_INSN_FLAGS       = 0x74
+FID_INSN_IMMEDIATE   = 0x75
+FID_INSN_SIZE        = 0x76
+FID_EXTENDED         = 0xFF
+
+MASK128 = (1 << 128) - 1
+MASK64  = (1 << 64) - 1
 
 # Generic opcodes (subset needed by decoder to classify load/store)
 GEN_OP_LOAD  = 15
@@ -95,7 +126,6 @@ EXCEPTION_NAMES_DEFAULT = {
 WP_STOP_REASON_NAMES = {0: "NONE", 1: "SYSCALL_USERMODE"}
 
 # Byte sizes for 3-bit mem-data size codes
-_MEM_DATA_SIZE_TABLE = [1, 2, 4, 8, 16, 1, 1, 1]
 
 
 def build_reg_names() -> dict[int, str]:
@@ -184,10 +214,10 @@ class ByteReader:
             out |= (b & 0x7F) << shift
             shift += 7
             if not (b & 0x80):
-                if b & 0x40 and shift < 64:
+                if b & 0x40 and shift < 128:
                     out |= -(1 << shift)
                 return out
-            if shift > 70:
+            if shift > 140:
                 raise ValueError("SLEB128 too large")
 
     def string(self) -> str:
@@ -239,7 +269,7 @@ def _decode_template_record(br: ByteReader) -> dict:
         has_imm            = bool(flags & CST_INSN_FLAG_HAS_IMM)
         sync_hint          = (flags & CST_INSN_FLAG_SYNC_MASK) \
                              >> CST_INSN_FLAG_SYNC_SHIFT
-        dynamic_memop      = bool(flags & CST_INSN_FLAG_DYNAMIC_MEMOP)
+        variable_memop     = bool(flags & CST_INSN_FLAG_VARIABLE_MEMOP)
 
         imm = br.sleb() if has_imm else None
         insn_size = br.u8()
@@ -256,7 +286,7 @@ def _decode_template_record(br: ByteReader) -> dict:
             "sync_hint": sync_hint,
             "n_loads": n_loads,
             "n_stores": n_stores,
-            "dynamic_memop": dynamic_memop,
+            "variable_memop": variable_memop,
             "raw_bytes": raw_bytes,
         })
 
@@ -283,169 +313,165 @@ def _decode_templates_section(br: ByteReader,
     return templates, template_by_id
 
 
-# --- Body decoding ---------------------------------------------------
+# --- Body decoding (v1.7 unified field-typed delta stream) ----------
 
-def _classify_dyn_params_by_schema(
-        dps: list[DynParam],
+def _template_default(tmpl: dict | None, ipos: int, fid: int) -> int:
+    """Return the per-(template, insn-position, field-id) baseline used
+    when a (template_id, ins_pos, field_id) triple is observed for the
+    first time.  Mirrors deflt_* callbacks in champsim_tracer_output.cc:
+    runtime fields default to zero, encoding fields default to the
+    template's static value so that an emit-equal-to-template produces
+    no record on the wire."""
+    if tmpl is None:
+        return 0
+    insns = tmpl.get("insns", [])
+    if ipos >= len(insns):
+        return 0
+    insn = insns[ipos]
+    if FID_INSN_BYTES_LO <= fid <= FID_INSN_SIZE:
+        rb = insn.get("raw_bytes") or b""
+        rb_int = int.from_bytes(rb, "little") if rb else 0
+        if fid == FID_INSN_BYTES_LO:
+            return rb_int & MASK64
+        if fid == FID_INSN_BYTES_HI:
+            return (rb_int >> 64) & MASK64
+        if fid == FID_INSN_OPCODE:
+            return insn.get("opcode", 0) & 0xFF
+        if fid == FID_INSN_BRANCH_TYPE:
+            return insn.get("branch_type", 0) & 0xFF
+        if fid == FID_INSN_FLAGS:
+            f = 0
+            if insn.get("branch_conditional"):
+                f |= CST_INSN_FLAG_BRANCH_COND
+            if insn.get("imm") is not None:
+                f |= CST_INSN_FLAG_HAS_IMM
+            f |= ((insn.get("sync_hint", 0) << CST_INSN_FLAG_SYNC_SHIFT)
+                  & CST_INSN_FLAG_SYNC_MASK)
+            if insn.get("variable_memop"):
+                f |= CST_INSN_FLAG_VARIABLE_MEMOP
+            return f & 0xFF
+        if fid == FID_INSN_IMMEDIATE:
+            imm = insn.get("imm")
+            return (imm or 0) & MASK64
+        if fid == FID_INSN_SIZE:
+            return len(insn.get("raw_bytes") or b"") & 0xFF
+    return 0
+
+
+def _decode_field_delta_section(
+        br: ByteReader,
+        template_id: int,
         tmpl: dict | None,
-        actual_counts: list[tuple[int, int]]) -> None:
-    """Assign (type_name, insn_index) to each param by walking the
-    template's per-insn (n_loads, n_stores) schema.  For insns with
-    the DYNAMIC_MEMOP flag, use actual_counts (list of (n_l, n_s)
-    tuples in template-insn order of dynamic insns)."""
-    if not tmpl:
-        for dp in dps:
-            dp.type_name = "load"
-            dp.insn_index = -1
-        return
-    dyn_iter = iter(actual_counts)
+        state: dict[tuple[int, int, int], int],
+        flags: int,
+        ) -> tuple[list[DynParam], list[dict]]:
+    """Read one length-prefixed delta_section, apply records to the
+    per-(template_id, ins_pos, field_id) state map, and reconstruct
+    the legacy-shaped (dyn_params, reg_snaps) the validator API
+    expects.  Records are stored as ``(pos_gap, field_id, sleb_delta)``
+    triples; ins_pos is reconstructed by accumulating gaps."""
+    sec = br.sub()
+    n_records = sec.uleb()
+
+    # First pass: walk records, applying deltas to state.
     pos = 0
+    for _ in range(n_records):
+        gap = sec.uleb()
+        pos += gap
+        fid = sec.u8()
+        delta = sec.sleb()
+        if fid == FID_EXTENDED:
+            # Reserved escape: payload = ULEB(ext_field_id), SLEB(delta).
+            # No extended fields defined yet; skip silently after consuming.
+            _ext_id = sec.uleb()
+            continue
+        key = (template_id, pos, fid)
+        base = state.get(key)
+        if base is None:
+            base = _template_default(tmpl, pos, fid)
+        cur = (base + delta) & MASK128
+        state[key] = cur
+
+    # Second pass: rebuild dyn_params and reg_snaps by walking the
+    # template schema and reading current state for every relevant
+    # (ins_pos, field_id).  This preserves the consumer-facing shape:
+    # dyn_params is a flat list ordered by (insn_index, load-before-store,
+    # slot), reg_snaps is per-insn src-then-dst in operand order.
+    dyn_params: list[DynParam] = []
+    reg_snaps: list[dict] = []
+
+    if tmpl is None:
+        return dyn_params, reg_snaps
+
+    has_mem = bool(flags & CST_FLAG_MEM_DATA)
+
+    def _state_or_default(ipos: int, fid: int) -> int:
+        v = state.get((template_id, ipos, fid))
+        if v is None:
+            v = _template_default(tmpl, ipos, fid)
+        return v
+
     for i, insn in enumerate(tmpl["insns"]):
-        if insn.get("dynamic_memop"):
-            try:
-                n_l, n_s = next(dyn_iter)
-            except StopIteration:
-                n_l, n_s = insn.get("n_loads", 0), insn.get("n_stores", 0)
+        # Per-insn memop count.  Variable-memop insns carry an actual
+        # count via FID_MEMOP_COUNT (low byte = n_loads, next byte =
+        # n_stores); non-variable insns use the template's static
+        # n_loads/n_stores.
+        if insn.get("variable_memop", False):
+            mc = _state_or_default(i, FID_MEMOP_COUNT)
+            n_loads  = mc & 0xFF
+            n_stores = (mc >> 8) & 0xFF
         else:
-            n_l = insn.get("n_loads", 0)
-            n_s = insn.get("n_stores", 0)
-        for _ in range(n_l):
-            if pos >= len(dps):
-                return
-            dps[pos].type_name = "load"
-            dps[pos].insn_index = i
-            pos += 1
-        for _ in range(n_s):
-            if pos >= len(dps):
-                return
-            dps[pos].type_name = "store"
-            dps[pos].insn_index = i
-            pos += 1
+            n_loads  = insn.get("n_loads", 0)
+            n_stores = insn.get("n_stores", 0)
 
+        for slot in range(n_loads):
+            v = _state_or_default(i, FID_LOAD_ADDR_BASE + slot) & MASK64
+            dp = DynParam(type_name="load", value=v, insn_index=i)
+            if has_mem:
+                d128 = _state_or_default(i, FID_LOAD_DATA_BASE + slot)
+                dp.data_lo = d128 & MASK64
+                dp.data_hi = (d128 >> 64) & MASK64
+            dyn_params.append(dp)
 
-def _read_dynamic_memop_preamble(br: ByteReader,
-                                 tmpl: dict | None
-                                 ) -> list[tuple[int, int]]:
-    """Read per-entry (n_loads, n_stores) pairs for each template insn
-    flagged DYNAMIC_MEMOP, in template-insn order."""
-    if not tmpl:
-        return []
-    out = []
-    for insn in tmpl["insns"]:
-        if insn.get("dynamic_memop"):
-            n_l = br.uleb()
-            n_s = br.uleb()
-            out.append((n_l, n_s))
-    return out
+        for slot in range(n_stores):
+            v = _state_or_default(i, FID_STORE_ADDR_BASE + slot) & MASK64
+            dp = DynParam(type_name="store", value=v, insn_index=i)
+            if has_mem:
+                d128 = _state_or_default(i, FID_STORE_DATA_BASE + slot)
+                dp.data_lo = d128 & MASK64
+                dp.data_hi = (d128 >> 64) & MASK64
+            dyn_params.append(dp)
 
-
-def _decode_dyn_patch(br: ByteReader,
-                      prev_dyn: list[DynParam]
-                      ) -> tuple[bool, list[DynParam]]:
-    """Returns (unchanged, new_dyn).  When unchanged, caller reuses
-    the prior state verbatim."""
-    flags = br.u8()
-    if flags & CST_DYN_FLAG_UNCHANGED:
-        return True, []
-
-    new_len     = br.uleb()
-    num_changed = br.uleb()
-
-    out: list[DynParam] = []
-    for i in range(new_len):
-        if i < len(prev_dyn):
-            p = prev_dyn[i]
-            out.append(DynParam(type_name=p.type_name, value=p.value))
-        else:
-            out.append(DynParam(type_name="load", value=0))
-
-    prev_pos = -1
-    for _ in range(num_changed):
-        pos_gap = br.uleb()
-        pos = prev_pos + 1 + pos_gap
-        if pos >= new_len:
-            raise ValueError("Patch position out of range")
-        delta = br.sleb()
-        base = prev_dyn[pos].value if pos < len(prev_dyn) else 0
-        out[pos] = DynParam(type_name="load",
-                            value=_add_delta_u64(base, delta))
-        prev_pos = pos
-    return False, out
-
-
-def _read_mem_data_values(br: ByteReader, params: list[DynParam]) -> None:
-    for dp in params:
-        code = br.u8()
-        sz = _MEM_DATA_SIZE_TABLE[code]
-        dp.data_size = sz
-        lo = 0
-        for b in range(min(sz, 8)):
-            lo |= br.u8() << (b * 8)
-        dp.data_lo = lo
-        hi = 0
-        if sz > 8:
-            for b in range(sz - 8):
-                hi |= br.u8() << (b * 8)
-        dp.data_hi = hi
-
-
-_REG_NONE = 0
-
-
-def _read_reg_data_section(
-    br: "ByteReader",
-    cp_tmpl: dict | None,
-    state_lo: list[int],
-    state_hi: list[int],
-) -> list[dict]:
-    """Read \u00a75.2 reg-data section: per-insn src then dst snapshots,
-    each {size_code:u8, delta_lo:SLEB, [delta_hi:SLEB if 16B]}.
-
-    Updates `state_lo`/`state_hi` (indexed by GenericRegId 0..255) so
-    subsequent entries can recover absolute values.  Returns a list
-    of {"insn_index", "kind"("src"|"dst"), "operand_index",
-    "reg_id", "size_code", "lo", "hi"} dicts in stream order.
-    """
-    snaps: list[dict] = []
-    if cp_tmpl is None:
-        return snaps
-    insns = cp_tmpl.get("insns", [])
-    for i, insn in enumerate(insns):
-        for kind, regs in (("src", insn.get("src_regs", [])),
-                           ("dst", insn.get("dst_regs", []))):
-            for op_i, reg_id in enumerate(regs):
-                code = br.u8()
-                if code > 2:
-                    raise ValueError(f"bad reg-data size_code: {code}")
-                delta_lo = br.sleb()
-                if reg_id != _REG_NONE:
-                    state_lo[reg_id] = (state_lo[reg_id] + delta_lo) & ((1 << 64) - 1)
-                    lo = state_lo[reg_id]
-                else:
-                    lo = delta_lo & ((1 << 64) - 1)
-                hi = 0
-                if code == 2:
-                    delta_hi = br.sleb()
-                    if reg_id != _REG_NONE:
-                        state_hi[reg_id] = (state_hi[reg_id] + delta_hi) & ((1 << 64) - 1)
-                        hi = state_hi[reg_id]
-                    else:
-                        hi = delta_hi & ((1 << 64) - 1)
-                snaps.append({
+        # Register snapshots — one entry per template src/dst slot.
+        # Skip if the REG_DATA flag is clear (no records will exist).
+        if flags & CST_FLAG_REG_DATA:
+            for op_i, reg_id in enumerate(insn.get("src_regs", [])):
+                v = _state_or_default(i, FID_SRC_REG_BASE + op_i)
+                reg_snaps.append({
                     "insn_index": i,
-                    "kind": kind,
+                    "kind": "src",
                     "operand_index": op_i,
                     "reg_id": reg_id,
-                    "size_code": code,
-                    "lo": lo,
-                    "hi": hi,
+                    "lo": v & MASK64,
+                    "hi": (v >> 64) & MASK64,
                 })
-    return snaps
+            for op_i, reg_id in enumerate(insn.get("dst_regs", [])):
+                v = _state_or_default(i, FID_DST_REG_BASE + op_i)
+                reg_snaps.append({
+                    "insn_index": i,
+                    "kind": "dst",
+                    "operand_index": op_i,
+                    "reg_id": reg_id,
+                    "lo": v & MASK64,
+                    "hi": (v >> 64) & MASK64,
+                })
+
+    return dyn_params, reg_snaps
 
 
 def decode_champsim_tracer(bin_path: Path
                            ) -> tuple[dict, list[dict], list[dict]]:
-    """Decode a v1.2 trace file.  Returns (meta, templates, entries).
+    """Decode a v1.7 trace file.  Returns (meta, templates, entries).
     Public API; stable across minor revisions of the decoder."""
     data = bin_path.read_bytes()
     if len(data) < CST_TRAILER_SIZE:
@@ -482,7 +508,7 @@ def decode_champsim_tracer(bin_path: Path
     has_mem_data = bool(flags & CST_FLAG_MEM_DATA)
     has_reg_data = bool(flags & CST_FLAG_REG_DATA)
 
-    # --- Read templates first (always present since v1.1) ---
+    # --- Read templates ---
     templates: list[dict] = []
     template_by_id: dict[int, dict] = {}
     if templates_count > 0:
@@ -499,12 +525,8 @@ def decode_champsim_tracer(bin_path: Path
 
     entries: list[dict] = []
     prev_entry_template = 0
-    cp_dyn_state: dict[int, list[DynParam]] = {}
-    wp_dyn_state: dict[int, list[DynParam]] = {}
-    # Per-GenericRegId last-value state for \u00a75.2 reg-data SLEB deltas
-    # (CP only in v1).  Indexed 0..255; reset to zero at body start.
-    cp_reg_state_lo: list[int] = [0] * 256
-    cp_reg_state_hi: list[int] = [0] * 256
+    cp_field_state: dict[tuple[int, int, int], int] = {}
+    wp_field_state: dict[tuple[int, int, int], int] = {}
     footer_num_entries: int | None = None
 
     while True:
@@ -521,84 +543,25 @@ def decode_champsim_tracer(bin_path: Path
         prev_entry_template = entry_tmpl
 
         cp_tmpl = template_by_id.get(entry_tmpl)
-        cp_dynamic_counts = _read_dynamic_memop_preamble(body, cp_tmpl)
-
-        # CP dyn-patch
-        prev_cp = cp_dyn_state.get(entry_tmpl, [])
-        unchanged, cp_dyn = _decode_dyn_patch(body, prev_cp)
-        if unchanged:
-            if entry_tmpl not in cp_dyn_state:
-                raise ValueError("cp dyn_unchanged without prior state")
-            cp_dyn = [DynParam(type_name=d.type_name,
-                               value=d.value,
-                               insn_index=d.insn_index)
-                      for d in cp_dyn_state[entry_tmpl]]
-        else:
-            _classify_dyn_params_by_schema(cp_dyn, cp_tmpl, cp_dynamic_counts)
-            cp_dyn_state[entry_tmpl] = [
-                DynParam(type_name=d.type_name,
-                         value=d.value,
-                         insn_index=d.insn_index)
-                for d in cp_dyn]
-
-        # CP mem_data sub-section
-        if has_mem_data:
-            mdb = body.sub()
-            _read_mem_data_values(mdb, cp_dyn)
-
-        # CP reg_data sub-section
-        cp_reg_snaps: list[dict] = []
-        if has_reg_data:
-            rdb = body.sub()
-            cp_reg_snaps = _read_reg_data_section(
-                rdb, cp_tmpl, cp_reg_state_lo, cp_reg_state_hi)
+        cp_dyn, cp_reg_snaps = _decode_field_delta_section(
+            body, entry_tmpl, cp_tmpl, cp_field_state, flags)
 
         # WP chain sub-section
         wp_entries: list[dict] = []
         wpb = body.sub()
         num_wp = wpb.uleb()
         prev_wp_tmpl = 0
-        # Seed WP reg-state from the current CP reg-state.  Wrong-path
-        # execution begins at the CP architectural state and is rolled
-        # back at chain end, so cross-chain accumulation would be wrong.
-        wp_reg_state_lo = list(cp_reg_state_lo)
-        wp_reg_state_hi = list(cp_reg_state_hi)
+        if num_wp > 0:
+            # Fork CP→WP state at chain start; discarded at chain end
+            # (overwritten on the next chain).  Speculative execution
+            # begins at the CP architectural state.
+            wp_field_state = dict(cp_field_state)
         for w in range(num_wp):
             wp_tmpl = prev_wp_tmpl + wpb.sleb()
             prev_wp_tmpl = wp_tmpl
-
             wp_tmpl_dict = template_by_id.get(wp_tmpl)
-            wp_dynamic_counts = _read_dynamic_memop_preamble(wpb, wp_tmpl_dict)
-
-            prev_wp = wp_dyn_state.get(wp_tmpl, [])
-            wunchanged, wp_dyn = _decode_dyn_patch(wpb, prev_wp)
-            if wunchanged:
-                if wp_tmpl not in wp_dyn_state:
-                    raise ValueError("wp dyn_unchanged without prior state")
-                wp_dyn = [DynParam(type_name=d.type_name,
-                                   value=d.value,
-                                   insn_index=d.insn_index)
-                          for d in wp_dyn_state[wp_tmpl]]
-            else:
-                _classify_dyn_params_by_schema(wp_dyn, wp_tmpl_dict,
-                                               wp_dynamic_counts)
-                wp_dyn_state[wp_tmpl] = [
-                    DynParam(type_name=d.type_name,
-                             value=d.value,
-                             insn_index=d.insn_index)
-                    for d in wp_dyn]
-
-            if has_mem_data:
-                wmdb = wpb.sub()
-                _read_mem_data_values(wmdb, wp_dyn)
-
-            if has_reg_data:
-                wrdb = wpb.sub()
-                wp_reg_snaps = _read_reg_data_section(
-                    wrdb, wp_tmpl_dict, wp_reg_state_lo, wp_reg_state_hi)
-            else:
-                wp_reg_snaps = []
-
+            wp_dyn, wp_reg_snaps = _decode_field_delta_section(
+                wpb, wp_tmpl, wp_tmpl_dict, wp_field_state, flags)
             wp_entries.append({
                 "index": w,
                 "template_id": wp_tmpl,
@@ -625,7 +588,6 @@ def decode_champsim_tracer(bin_path: Path
             is_fault = bool(evf & CST_WP_EVENT_FAULT)
             wp_entries[idx]["fault"] = is_fault
             if is_fault:
-                # v1.2: chain-relative index of the faulting insn.
                 wp_entries[idx]["fault_insn_index"] = evb.uleb()
             prev_evt_idx = idx
 
@@ -671,11 +633,11 @@ def decode_champsim_tracer(bin_path: Path
 
 def _format_dyn(dp: DynParam, show_data: bool) -> str:
     s = f"{dp.type_name}=0x{dp.value:x}"
-    if show_data and dp.data_size > 0:
-        if dp.data_size <= 8:
-            s += f":data=0x{dp.data_lo:x}"
-        else:
+    if show_data and (dp.data_lo or dp.data_hi):
+        if dp.data_hi:
             s += f":data=0x{dp.data_hi:x}{dp.data_lo:016x}"
+        else:
+            s += f":data=0x{dp.data_lo:x}"
     return s
 
 
@@ -791,7 +753,7 @@ def _first_diff_line(a: str, b: str) -> tuple[int, str, str] | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Decode champsim_tracer binary (.wpt, v1.2) to text")
+        description="Decode champsim_tracer binary (.cst, v1.2) to text")
     parser.add_argument("bin", type=Path)
     parser.add_argument("-o", "--out", type=Path)
     parser.add_argument("--expect", type=Path)

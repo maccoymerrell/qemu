@@ -7,15 +7,153 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include <capstone/capstone.h>
 #include <capstone/riscv.h>
+#include "elf.h"
+#include <qemu-plugin.h>
+
+#include "champsim_tracer_elf_attrs.h"
+
+/*
+ * Map a single token of a Tag_RISCV_arch string (e.g. "c", "zba") to
+ * the corresponding CS_MODE_RISCV_* bit, or 0 if Capstone has no
+ * dedicated bit for it (decoded by the base ISA path).
+ */
+static unsigned int cs_riscv_token_to_mode(const char *tok)
+{
+    if (g_str_equal(tok, "c"))    return CS_MODE_RISCV_C;
+    if (g_str_equal(tok, "f"))    return CS_MODE_RISCV_FD;
+    if (g_str_equal(tok, "d"))    return CS_MODE_RISCV_FD;
+    if (g_str_equal(tok, "a"))    return CS_MODE_RISCV_A;
+    if (g_str_equal(tok, "v"))    return CS_MODE_RISCV_V;
+    if (g_str_equal(tok, "zba"))  return CS_MODE_RISCV_ZBA;
+    if (g_str_equal(tok, "zbb"))  return CS_MODE_RISCV_ZBB;
+    if (g_str_equal(tok, "zbc"))  return CS_MODE_RISCV_ZBC;
+    if (g_str_equal(tok, "zbkb")) return CS_MODE_RISCV_ZBKB;
+    if (g_str_equal(tok, "zbkc")) return CS_MODE_RISCV_ZBKC;
+    if (g_str_equal(tok, "zbkx")) return CS_MODE_RISCV_ZBKX;
+    if (g_str_equal(tok, "zbs"))  return CS_MODE_RISCV_ZBS;
+    /* Half-precision FP extensions imply the FD decoder path in cs6. */
+    if (g_str_equal(tok, "zfh") || g_str_equal(tok, "zfhmin")) {
+        return CS_MODE_RISCV_FD;
+    }
+    /* Tokens such as zicsr / zifencei / zicbom / ztso / zihintpause
+     * are decoded by the base ISA path; no additional mode bit. */
+    return 0;
+}
+
+/*
+ * Parse a Tag_RISCV_arch string ("rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0
+ * _zicsr2p0_zifencei2p0_zba1p0...") into a bitmask of CS_MODE_RISCV_*
+ * bits.  Single-letter base extensions are concatenated without
+ * separators in the first run; "zX..." / "sX..." tokens follow,
+ * underscore-separated.  Each token may carry a trailing "<n>p<n>"
+ * version that we strip.
+ */
+static unsigned int cs_riscv_parse_arch_string(const char *arch)
+{
+    if (!arch || !*arch) {
+        return 0;
+    }
+
+    const char *q = arch;
+    if (g_str_has_prefix(q, "rv32") || g_str_has_prefix(q, "rv64")) {
+        q += 4;
+    }
+
+    unsigned int mode = 0;
+    GString *tok = g_string_new(NULL);
+    bool first_group = true;
+
+    while (*q) {
+        if (*q == '_') {
+            if (tok->len) {
+                gchar *t = g_ascii_strdown(tok->str, tok->len);
+                gchar *vp = t;
+                while (*vp && !g_ascii_isdigit(*vp)) vp++;
+                if (vp > t) *vp = '\0';
+                mode |= cs_riscv_token_to_mode(t);
+                g_free(t);
+                g_string_set_size(tok, 0);
+            }
+            first_group = false;
+            q++;
+            continue;
+        }
+        if (first_group) {
+            if (g_ascii_isalpha(*q)) {
+                gchar letter[2] = { (gchar)g_ascii_tolower(*q), '\0' };
+                mode |= cs_riscv_token_to_mode(letter);
+            }
+            /* Digits and 'p' inside version markers are skipped. */
+            q++;
+            continue;
+        }
+        g_string_append_c(tok, *q);
+        q++;
+    }
+    if (tok->len) {
+        gchar *t = g_ascii_strdown(tok->str, tok->len);
+        gchar *vp = t;
+        while (*vp && !g_ascii_isdigit(*vp)) vp++;
+        if (vp > t) *vp = '\0';
+        mode |= cs_riscv_token_to_mode(t);
+        g_free(t);
+    }
+    g_string_free(tok, TRUE);
+    return mode;
+}
+
+static void cs_riscv_attr_cb(uint64_t tag, const void *value, bool is_string,
+                             void *user)
+{
+    unsigned int *mode = (unsigned int *)user;
+    if (tag == Tag_RISCV_arch && is_string) {
+        *mode |= cs_riscv_parse_arch_string((const char *)value);
+    }
+}
 
 static unsigned int cap_mode_riscv(const char *target_name)
 {
-    unsigned int mode = g_str_has_prefix(target_name, "riscv32")
-                      ? QEMU_PLUGIN_CAP_MODE_RISCV32
-                      : QEMU_PLUGIN_CAP_MODE_RISCV64;
-    /* RVC is on by default for both base widths in our build. */
-    return mode | QEMU_PLUGIN_CAP_MODE_RISCVC;
+    unsigned int base = g_str_has_prefix(target_name, "riscv32")
+                      ? CS_MODE_RISCV32
+                      : CS_MODE_RISCV64;
+
+    /* Try to derive extension bits from the binary's .riscv.attributes. */
+    const char *bin = qemu_plugin_path_to_binary();
+    CsElfInfo info;
+    unsigned int dyn = 0;
+    if (cs_elf_load(bin, &info)) {
+        const uint8_t *body;
+        size_t body_size;
+        if (cs_elf_find_section(&info, SHT_RISCV_ATTRIBUTES, &body,
+                                &body_size)) {
+            cs_elf_walk_attributes(body, body_size, "riscv",
+                                   cs_riscv_attr_cb, &dyn);
+        }
+        cs_elf_unload(&info);
+    }
+    if (dyn) {
+        return base | dyn;
+    }
+
+    /*
+     * Fall back to the comprehensive ratified-extension default.  Vendor
+     * extensions (XTHEAD*, XSF*, XCV*, SIFIVE, COREV) and conflicting
+     * subsets (ZFINX/ZHINX/ZDINX/E/ZCMP-ZCE) are intentionally NOT
+     * enabled — they shadow base-ISA encodings in cs6.
+     */
+    return base | CS_MODE_RISCV_C
+                | CS_MODE_RISCV_FD
+                | CS_MODE_RISCV_A
+                | CS_MODE_RISCV_V
+                | CS_MODE_RISCV_ZBA
+                | CS_MODE_RISCV_ZBB
+                | CS_MODE_RISCV_ZBC
+                | CS_MODE_RISCV_ZBKB
+                | CS_MODE_RISCV_ZBKC
+                | CS_MODE_RISCV_ZBKX
+                | CS_MODE_RISCV_ZBS;
 }
 
 /*
@@ -73,92 +211,65 @@ static const RegClassification riscv_reg_class[RISCV_REG_ENDING] = {
     [RISCV_REG_X7] = { REG_GPR7 },  /* t2 */
     [RISCV_REG_X8] = { REG_FP_REG },  /* s0 */
     [RISCV_REG_X9] = { REG_GPR9 },  /* s1 */
-    [RISCV_REG_A0] = { REG_GPR10 },  /* a0 */
-    [RISCV_REG_A1] = { REG_GPR11 },  /* a1 */
-    [RISCV_REG_A2] = { REG_GPR12 },  /* a2 */
-    [RISCV_REG_A3] = { REG_GPR13 },  /* a3 */
-    [RISCV_REG_A4] = { REG_GPR14 },  /* a4 */
-    [RISCV_REG_A5] = { REG_GPR15 },  /* a5 */
-    [RISCV_REG_A6] = { REG_GPR16 },  /* a6 */
-    [RISCV_REG_A7] = { REG_GPR17 },  /* a7 */
-    [RISCV_REG_S2] = { REG_GPR18 },  /* s2 */
-    [RISCV_REG_S3] = { REG_GPR19 },  /* s3 */
-    [RISCV_REG_S4] = { REG_GPR20 },  /* s4 */
-    [RISCV_REG_S5] = { REG_GPR21 },  /* s5 */
-    [RISCV_REG_S6] = { REG_GPR22 },  /* s6 */
-    [RISCV_REG_S7] = { REG_GPR23 },  /* s7 */
-    [RISCV_REG_S8] = { REG_GPR24 },  /* s8 */
-    [RISCV_REG_S9] = { REG_GPR25 },  /* s9 */
+    [RISCV_REG_X10] = { REG_GPR10 },  /* a0 */
+    [RISCV_REG_X11] = { REG_GPR11 },  /* a1 */
+    [RISCV_REG_X12] = { REG_GPR12 },  /* a2 */
+    [RISCV_REG_X13] = { REG_GPR13 },  /* a3 */
+    [RISCV_REG_X14] = { REG_GPR14 },  /* a4 */
+    [RISCV_REG_X15] = { REG_GPR15 },  /* a5 */
+    [RISCV_REG_X16] = { REG_GPR16 },  /* a6 */
+    [RISCV_REG_X17] = { REG_GPR17 },  /* a7 */
+    [RISCV_REG_X18] = { REG_GPR18 },  /* s2 */
+    [RISCV_REG_X19] = { REG_GPR19 },  /* s3 */
+    [RISCV_REG_X20] = { REG_GPR20 },  /* s4 */
+    [RISCV_REG_X21] = { REG_GPR21 },  /* s5 */
+    [RISCV_REG_X22] = { REG_GPR22 },  /* s6 */
+    [RISCV_REG_X23] = { REG_GPR23 },  /* s7 */
+    [RISCV_REG_X24] = { REG_GPR24 },  /* s8 */
+    [RISCV_REG_X25] = { REG_GPR25 },  /* s9 */
     [RISCV_REG_X26] = { REG_GPR26 },  /* s10 */
     [RISCV_REG_X27] = { REG_GPR27 },  /* s11 */
-    [RISCV_REG_T3] = { REG_GPR28 },  /* t3 */
-    [RISCV_REG_T4] = { REG_GPR29 },  /* t4 */
-    [RISCV_REG_T5] = { REG_GPR30 },  /* t5 */
-    [RISCV_REG_T6] = { REG_GPR31 },  /* t6 */
-    [RISCV_REG_F0_32] = { REG_FPR0 },  /* ft0 */
-    [RISCV_REG_F0_64] = { REG_FPR0 },  /* ft0 */
-    [RISCV_REG_F1_32] = { REG_FPR1 },  /* ft1 */
-    [RISCV_REG_F1_64] = { REG_FPR1 },  /* ft1 */
-    [RISCV_REG_F2_32] = { REG_FPR2 },  /* ft2 */
-    [RISCV_REG_F2_64] = { REG_FPR2 },  /* ft2 */
-    [RISCV_REG_F3_32] = { REG_FPR3 },  /* ft3 */
-    [RISCV_REG_F3_64] = { REG_FPR3 },  /* ft3 */
-    [RISCV_REG_F4_32] = { REG_FPR4 },  /* ft4 */
-    [RISCV_REG_F4_64] = { REG_FPR4 },  /* ft4 */
-    [RISCV_REG_F5_32] = { REG_FPR5 },  /* ft5 */
-    [RISCV_REG_F5_64] = { REG_FPR5 },  /* ft5 */
-    [RISCV_REG_F6_32] = { REG_FPR6 },  /* ft6 */
-    [RISCV_REG_F6_64] = { REG_FPR6 },  /* ft6 */
-    [RISCV_REG_F7_32] = { REG_FPR7 },  /* ft7 */
-    [RISCV_REG_F7_64] = { REG_FPR7 },  /* ft7 */
-    [RISCV_REG_F8_32] = { REG_FPR8 },  /* fs0 */
-    [RISCV_REG_F8_64] = { REG_FPR8 },  /* fs0 */
-    [RISCV_REG_F9_32] = { REG_FPR9 },  /* fs1 */
-    [RISCV_REG_F9_64] = { REG_FPR9 },  /* fs1 */
-    [RISCV_REG_F10_32] = { REG_FPR10 },  /* fa0 */
-    [RISCV_REG_F10_64] = { REG_FPR10 },  /* fa0 */
-    [RISCV_REG_F11_32] = { REG_FPR11 },  /* fa1 */
-    [RISCV_REG_F11_64] = { REG_FPR11 },  /* fa1 */
-    [RISCV_REG_F12_32] = { REG_FPR12 },  /* fa2 */
-    [RISCV_REG_F12_64] = { REG_FPR12 },  /* fa2 */
-    [RISCV_REG_F13_32] = { REG_FPR13 },  /* fa3 */
-    [RISCV_REG_F13_64] = { REG_FPR13 },  /* fa3 */
-    [RISCV_REG_F14_32] = { REG_FPR14 },  /* fa4 */
-    [RISCV_REG_F14_64] = { REG_FPR14 },  /* fa4 */
-    [RISCV_REG_F15_32] = { REG_FPR15 },  /* fa5 */
-    [RISCV_REG_F15_64] = { REG_FPR15 },  /* fa5 */
-    [RISCV_REG_F16_32] = { REG_FPR16 },  /* fa6 */
-    [RISCV_REG_F16_64] = { REG_FPR16 },  /* fa6 */
-    [RISCV_REG_F17_32] = { REG_FPR17 },  /* fa7 */
-    [RISCV_REG_F17_64] = { REG_FPR17 },  /* fa7 */
-    [RISCV_REG_F18_32] = { REG_FPR18 },  /* fs2 */
-    [RISCV_REG_F18_64] = { REG_FPR18 },  /* fs2 */
-    [RISCV_REG_F19_32] = { REG_FPR19 },  /* fs3 */
-    [RISCV_REG_F19_64] = { REG_FPR19 },  /* fs3 */
-    [RISCV_REG_F20_32] = { REG_FPR20 },  /* fs4 */
-    [RISCV_REG_F20_64] = { REG_FPR20 },  /* fs4 */
-    [RISCV_REG_F21_32] = { REG_FPR21 },  /* fs5 */
-    [RISCV_REG_F21_64] = { REG_FPR21 },  /* fs5 */
-    [RISCV_REG_F22_32] = { REG_FPR22 },  /* fs6 */
-    [RISCV_REG_F22_64] = { REG_FPR22 },  /* fs6 */
-    [RISCV_REG_F23_32] = { REG_FPR23 },  /* fs7 */
-    [RISCV_REG_F23_64] = { REG_FPR23 },  /* fs7 */
-    [RISCV_REG_F24_32] = { REG_FPR24 },  /* fs8 */
-    [RISCV_REG_F24_64] = { REG_FPR24 },  /* fs8 */
-    [RISCV_REG_F25_32] = { REG_FPR25 },  /* fs9 */
-    [RISCV_REG_F25_64] = { REG_FPR25 },  /* fs9 */
-    [RISCV_REG_F26_32] = { REG_FPR26 },  /* fs10 */
-    [RISCV_REG_F26_64] = { REG_FPR26 },  /* fs10 */
-    [RISCV_REG_F27_32] = { REG_FPR27 },  /* fs11 */
-    [RISCV_REG_F27_64] = { REG_FPR27 },  /* fs11 */
-    [RISCV_REG_F28_32] = { REG_FPR28 },  /* ft8 */
-    [RISCV_REG_F28_64] = { REG_FPR28 },  /* ft8 */
-    [RISCV_REG_F29_32] = { REG_FPR29 },  /* ft9 */
-    [RISCV_REG_F29_64] = { REG_FPR29 },  /* ft9 */
-    [RISCV_REG_F30_32] = { REG_FPR30 },  /* ft10 */
-    [RISCV_REG_F30_64] = { REG_FPR30 },  /* ft10 */
-    [RISCV_REG_F31_32] = { REG_FPR31 },  /* ft11 */
-    [RISCV_REG_F31_64] = { REG_FPR31 },  /* ft11 */
+    [RISCV_REG_X28] = { REG_GPR28 },  /* t3 */
+    [RISCV_REG_X29] = { REG_GPR29 },  /* t4 */
+    [RISCV_REG_X30] = { REG_GPR30 },  /* t5 */
+    [RISCV_REG_X31] = { REG_GPR31 },  /* t6 */
+    /*
+     * Capstone 6 split FP register IDs by element width
+     * (F*_F = single, F*_D = double, F*_H = half).  We classify all
+     * three width-views as the same architectural register slot.
+     */
+    [RISCV_REG_F0_F]  = { REG_FPR0  },  [RISCV_REG_F0_D]  = { REG_FPR0  },  [RISCV_REG_F0_H]  = { REG_FPR0  },
+    [RISCV_REG_F1_F]  = { REG_FPR1  },  [RISCV_REG_F1_D]  = { REG_FPR1  },  [RISCV_REG_F1_H]  = { REG_FPR1  },
+    [RISCV_REG_F2_F]  = { REG_FPR2  },  [RISCV_REG_F2_D]  = { REG_FPR2  },  [RISCV_REG_F2_H]  = { REG_FPR2  },
+    [RISCV_REG_F3_F]  = { REG_FPR3  },  [RISCV_REG_F3_D]  = { REG_FPR3  },  [RISCV_REG_F3_H]  = { REG_FPR3  },
+    [RISCV_REG_F4_F]  = { REG_FPR4  },  [RISCV_REG_F4_D]  = { REG_FPR4  },  [RISCV_REG_F4_H]  = { REG_FPR4  },
+    [RISCV_REG_F5_F]  = { REG_FPR5  },  [RISCV_REG_F5_D]  = { REG_FPR5  },  [RISCV_REG_F5_H]  = { REG_FPR5  },
+    [RISCV_REG_F6_F]  = { REG_FPR6  },  [RISCV_REG_F6_D]  = { REG_FPR6  },  [RISCV_REG_F6_H]  = { REG_FPR6  },
+    [RISCV_REG_F7_F]  = { REG_FPR7  },  [RISCV_REG_F7_D]  = { REG_FPR7  },  [RISCV_REG_F7_H]  = { REG_FPR7  },
+    [RISCV_REG_F8_F]  = { REG_FPR8  },  [RISCV_REG_F8_D]  = { REG_FPR8  },  [RISCV_REG_F8_H]  = { REG_FPR8  },
+    [RISCV_REG_F9_F]  = { REG_FPR9  },  [RISCV_REG_F9_D]  = { REG_FPR9  },  [RISCV_REG_F9_H]  = { REG_FPR9  },
+    [RISCV_REG_F10_F] = { REG_FPR10 },  [RISCV_REG_F10_D] = { REG_FPR10 },  [RISCV_REG_F10_H] = { REG_FPR10 },
+    [RISCV_REG_F11_F] = { REG_FPR11 },  [RISCV_REG_F11_D] = { REG_FPR11 },  [RISCV_REG_F11_H] = { REG_FPR11 },
+    [RISCV_REG_F12_F] = { REG_FPR12 },  [RISCV_REG_F12_D] = { REG_FPR12 },  [RISCV_REG_F12_H] = { REG_FPR12 },
+    [RISCV_REG_F13_F] = { REG_FPR13 },  [RISCV_REG_F13_D] = { REG_FPR13 },  [RISCV_REG_F13_H] = { REG_FPR13 },
+    [RISCV_REG_F14_F] = { REG_FPR14 },  [RISCV_REG_F14_D] = { REG_FPR14 },  [RISCV_REG_F14_H] = { REG_FPR14 },
+    [RISCV_REG_F15_F] = { REG_FPR15 },  [RISCV_REG_F15_D] = { REG_FPR15 },  [RISCV_REG_F15_H] = { REG_FPR15 },
+    [RISCV_REG_F16_F] = { REG_FPR16 },  [RISCV_REG_F16_D] = { REG_FPR16 },  [RISCV_REG_F16_H] = { REG_FPR16 },
+    [RISCV_REG_F17_F] = { REG_FPR17 },  [RISCV_REG_F17_D] = { REG_FPR17 },  [RISCV_REG_F17_H] = { REG_FPR17 },
+    [RISCV_REG_F18_F] = { REG_FPR18 },  [RISCV_REG_F18_D] = { REG_FPR18 },  [RISCV_REG_F18_H] = { REG_FPR18 },
+    [RISCV_REG_F19_F] = { REG_FPR19 },  [RISCV_REG_F19_D] = { REG_FPR19 },  [RISCV_REG_F19_H] = { REG_FPR19 },
+    [RISCV_REG_F20_F] = { REG_FPR20 },  [RISCV_REG_F20_D] = { REG_FPR20 },  [RISCV_REG_F20_H] = { REG_FPR20 },
+    [RISCV_REG_F21_F] = { REG_FPR21 },  [RISCV_REG_F21_D] = { REG_FPR21 },  [RISCV_REG_F21_H] = { REG_FPR21 },
+    [RISCV_REG_F22_F] = { REG_FPR22 },  [RISCV_REG_F22_D] = { REG_FPR22 },  [RISCV_REG_F22_H] = { REG_FPR22 },
+    [RISCV_REG_F23_F] = { REG_FPR23 },  [RISCV_REG_F23_D] = { REG_FPR23 },  [RISCV_REG_F23_H] = { REG_FPR23 },
+    [RISCV_REG_F24_F] = { REG_FPR24 },  [RISCV_REG_F24_D] = { REG_FPR24 },  [RISCV_REG_F24_H] = { REG_FPR24 },
+    [RISCV_REG_F25_F] = { REG_FPR25 },  [RISCV_REG_F25_D] = { REG_FPR25 },  [RISCV_REG_F25_H] = { REG_FPR25 },
+    [RISCV_REG_F26_F] = { REG_FPR26 },  [RISCV_REG_F26_D] = { REG_FPR26 },  [RISCV_REG_F26_H] = { REG_FPR26 },
+    [RISCV_REG_F27_F] = { REG_FPR27 },  [RISCV_REG_F27_D] = { REG_FPR27 },  [RISCV_REG_F27_H] = { REG_FPR27 },
+    [RISCV_REG_F28_F] = { REG_FPR28 },  [RISCV_REG_F28_D] = { REG_FPR28 },  [RISCV_REG_F28_H] = { REG_FPR28 },
+    [RISCV_REG_F29_F] = { REG_FPR29 },  [RISCV_REG_F29_D] = { REG_FPR29 },  [RISCV_REG_F29_H] = { REG_FPR29 },
+    [RISCV_REG_F30_F] = { REG_FPR30 },  [RISCV_REG_F30_D] = { REG_FPR30 },  [RISCV_REG_F30_H] = { REG_FPR30 },
+    [RISCV_REG_F31_F] = { REG_FPR31 },  [RISCV_REG_F31_D] = { REG_FPR31 },  [RISCV_REG_F31_H] = { REG_FPR31 },
 };
 
 /* RISCV: 273/273 classified (all instructions) */
@@ -245,91 +356,69 @@ static const InsnClassification riscv_insn_class[RISCV_INS_ENDING] = {
     /* RV64A atomics */
     [RISCV_INS_AMOADD_D]            = { GEN_OP_INT_ADD,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOADD_D_AQ]         = { GEN_OP_INT_ADD,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_AMOADD_D_AQ_RL]      = { GEN_OP_INT_ADD,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOADD_D_RL]         = { GEN_OP_INT_ADD,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOADD_W]            = { GEN_OP_INT_ADD,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOADD_W_AQ]         = { GEN_OP_INT_ADD,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_AMOADD_W_AQ_RL]      = { GEN_OP_INT_ADD,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOADD_W_RL]         = { GEN_OP_INT_ADD,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOAND_D]            = { GEN_OP_AND,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOAND_D_AQ]         = { GEN_OP_AND,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_AMOAND_D_AQ_RL]      = { GEN_OP_AND,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOAND_D_RL]         = { GEN_OP_AND,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOAND_W]            = { GEN_OP_AND,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOAND_W_AQ]         = { GEN_OP_AND,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_AMOAND_W_AQ_RL]      = { GEN_OP_AND,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOAND_W_RL]         = { GEN_OP_AND,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMAXU_D]           = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMAXU_D_AQ]        = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_AMOMAXU_D_AQ_RL]     = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMAXU_D_RL]        = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMAXU_W]           = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMAXU_W_AQ]        = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_AMOMAXU_W_AQ_RL]     = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMAXU_W_RL]        = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMAX_D]            = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMAX_D_AQ]         = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_AMOMAX_D_AQ_RL]      = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMAX_D_RL]         = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMAX_W]            = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMAX_W_AQ]         = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_AMOMAX_W_AQ_RL]      = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMAX_W_RL]         = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMINU_D]           = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMINU_D_AQ]        = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_AMOMINU_D_AQ_RL]     = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMINU_D_RL]        = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMINU_W]           = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMINU_W_AQ]        = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_AMOMINU_W_AQ_RL]     = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMINU_W_RL]        = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMIN_D]            = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMIN_D_AQ]         = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_AMOMIN_D_AQ_RL]      = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMIN_D_RL]         = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMIN_W]            = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMIN_W_AQ]         = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_AMOMIN_W_AQ_RL]      = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOMIN_W_RL]         = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOOR_D]             = { GEN_OP_OR,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOOR_D_AQ]          = { GEN_OP_OR,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_AMOOR_D_AQ_RL]       = { GEN_OP_OR,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOOR_D_RL]          = { GEN_OP_OR,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOOR_W]             = { GEN_OP_OR,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOOR_W_AQ]          = { GEN_OP_OR,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_AMOOR_W_AQ_RL]       = { GEN_OP_OR,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOOR_W_RL]          = { GEN_OP_OR,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOSWAP_D]           = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOSWAP_D_AQ]        = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_AMOSWAP_D_AQ_RL]     = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOSWAP_D_RL]        = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOSWAP_W]           = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOSWAP_W_AQ]        = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_AMOSWAP_W_AQ_RL]     = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOSWAP_W_RL]        = { GEN_OP_XCHG,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOXOR_D]            = { GEN_OP_XOR,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOXOR_D_AQ]         = { GEN_OP_XOR,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_AMOXOR_D_AQ_RL]      = { GEN_OP_XOR,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOXOR_D_RL]         = { GEN_OP_XOR,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOXOR_W]            = { GEN_OP_XOR,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOXOR_W_AQ]         = { GEN_OP_XOR,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_AMOXOR_W_AQ_RL]      = { GEN_OP_XOR,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_AMOXOR_W_RL]         = { GEN_OP_XOR,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_LR_D]                = { GEN_OP_LOAD,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_LR_D_AQ]             = { GEN_OP_LOAD,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_LR_D_AQ_RL]          = { GEN_OP_LOAD,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_LR_D_RL]             = { GEN_OP_LOAD,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_LR_W]                = { GEN_OP_LOAD,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_LR_W_AQ]             = { GEN_OP_LOAD,      BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_LR_W_AQ_RL]          = { GEN_OP_LOAD,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_LR_W_RL]             = { GEN_OP_LOAD,      BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_SC_D]                = { GEN_OP_STORE,     BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_SC_D_AQ]             = { GEN_OP_STORE,     BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_SC_D_AQ_RL]          = { GEN_OP_STORE,     BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_SC_D_RL]             = { GEN_OP_STORE,     BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_SC_W]                = { GEN_OP_STORE,     BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_SC_W_AQ]             = { GEN_OP_STORE,     BRANCH_NONE,          MF_ATOMIC },
-    [RISCV_INS_SC_W_AQ_RL]          = { GEN_OP_STORE,     BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_SC_W_RL]             = { GEN_OP_STORE,     BRANCH_NONE,          MF_ATOMIC },
     /* RV64F/D floating point */
     [RISCV_INS_FLD]                 = { GEN_OP_LOAD,      BRANCH_NONE,          MF_NONE },
@@ -404,7 +493,6 @@ static const InsnClassification riscv_insn_class[RISCV_INS_ENDING] = {
     /* System */
     [RISCV_INS_MRET]                = { GEN_OP_RET,       BRANCH_RETURN,        MF_NONE },
     [RISCV_INS_SRET]                = { GEN_OP_RET,       BRANCH_RETURN,        MF_NONE },
-    [RISCV_INS_URET]                = { GEN_OP_RET,       BRANCH_RETURN,        MF_NONE },
     [RISCV_INS_WFI]                 = { GEN_OP_NOP,       BRANCH_NONE,          MF_NONE },
     [RISCV_INS_SFENCE_VMA]          = { GEN_OP_FENCE,     BRANCH_NONE,          MF_ATOMIC },
     [RISCV_INS_UNIMP]               = { GEN_OP_NOP,       BRANCH_NONE,          MF_NONE },

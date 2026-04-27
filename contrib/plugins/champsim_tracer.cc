@@ -14,7 +14,7 @@
  *   - champsim_tracer_wp.cc      (wrong-path simulator)
  *   - champsim_tracer_output.cc  (binary format v1.0 writer)
  *
- * Output: packed binary (.wpt).  A reference Python decoder
+ * Output: packed binary (.cst).  A reference Python decoder
  * (champsim_tracer_decode.py) produces human-readable text.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -26,6 +26,7 @@
 #include <time.h>
 
 #include "champsim_tracer.h"
+#include "champsim_tracer_writer.h"
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
@@ -34,6 +35,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 int max_wrong_path_depth = 64;
 static bool enable_wrong_path = true;
 static char *output_base_path = NULL;
+static char *output_pipe_command = NULL;
 static char *unknown_warn_path = NULL;
 static char *program_name = NULL;
 static uint64_t trace_start_insn = 0;
@@ -218,6 +220,20 @@ static GHashTable *vcpu_get_reg_handles(unsigned int cpu_index)
 static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
 {
     (void)id;
+
+    /*
+     * Resolve cap_mode lazily on the first vCPU init.  The per-ISA
+     * mode resolvers may call qemu_plugin_path_to_binary(), which
+     * requires a live vCPU context (it dereferences current_cpu).
+     */
+    if (cst_cap_arch >= 0 && cst_cap_mode == 0
+            && trace_isa != TRACE_ISA_UNKNOWN) {
+        const IsaProperties *p = &isa_properties[trace_isa];
+        if (p->cap_mode_for_target) {
+            cst_cap_mode = p->cap_mode_for_target(target_name);
+        }
+    }
+
     if (!enable_reg_data) {
         return;
     }
@@ -270,6 +286,7 @@ lookup_reg_handle(unsigned int cpu_index, const char *cap_reg_name)
 enum PluginOptId {
     OPT_DEPTH = 1,
     OPT_OUTFILE,
+    OPT_OUTPIPE,
     OPT_WP,
     OPT_START,
     OPT_STOP,
@@ -288,8 +305,10 @@ static GMutex exec_lock;
 
 GHashTable *tb_map;
 GHashTable *bb_map;
+GHashTable *chain_map;
 GHashTable *branch_map;
 uint32_t next_template_id = 1;
+uint32_t next_chain_id = 1;
 
 struct qemu_plugin_scoreboard *vcpu_sb;
 qemu_plugin_u64 sb_current_pc;
@@ -386,6 +405,13 @@ static void bb_template_free(gpointer data)
     g_free(tmpl);
 }
 
+static void chain_template_free(gpointer data)
+{
+    ChainTemplate *ct = (ChainTemplate *)data;
+    g_free(ct->bb_ids);
+    g_free(ct);
+}
+
 static TraceSegment *trace_segment_new(const char *label,
                                        uint64_t start, uint64_t stop)
 {
@@ -404,8 +430,24 @@ static void trace_segment_free(TraceSegment *seg)
     if (seg->bin_stream) {
         g_free(seg->bin_stream);
     }
+    /* Drain async writer queue and join its thread BEFORE closing
+     * the underlying FILE*, so all enqueued bytes hit xz/disk and
+     * the writer can fflush cleanly. */
+    if (seg->writer) {
+        writer_finish(seg->writer);
+        seg->writer = NULL;
+    }
     if (seg->bin_file) {
-        fclose(seg->bin_file);
+        if (seg->bin_file_is_pipe) {
+            int rc = pclose(seg->bin_file);
+            if (rc != 0) {
+                fprintf(stderr,
+                        "champsim_tracer: output pipe child exited with status %d\n",
+                        rc);
+            }
+        } else {
+            fclose(seg->bin_file);
+        }
     }
     g_free(seg->label);
     g_free(seg);
@@ -424,6 +466,106 @@ static BBTemplate *find_bb_template(uint64_t entry_pc)
 }
 
 /*
+ * v1.6: commit a TRUE basic block by start_pc.  See header for
+ * semantics.  Caller must hold data_lock.
+ */
+BBTemplate *commit_true_bb(uint64_t start_pc,
+                           uint32_t n_insns,
+                           const uint64_t *insn_pcs,
+                           const InsnFields *insn_fields,
+                           const uint8_t *insn_sizes,
+                           const uint8_t *insn_bytes,
+                           const InsnRegNames *insn_reg_names,
+                           const char *symbol_name,
+                           uint64_t fall_through_pc)
+{
+    BBTemplate *existing = find_bb_template(start_pc);
+    if (existing) {
+        bool same = (existing->n_insns == n_insns);
+        if (same) {
+            for (uint32_t i = 0; i < n_insns; i++) {
+                if (existing->insn_pcs[i] != insn_pcs[i]) {
+                    same = false;
+                    break;
+                }
+            }
+        }
+        if (!same) {
+            static gint warned = 0;
+            if (g_atomic_int_compare_and_exchange(&warned, 0, 1)) {
+                fprintf(stderr,
+                    "champsim_tracer: WARNING true-BB at start_pc=0x%"
+                    PRIx64 " seen with differing insn sequence "
+                    "(existing n_insns=%u, new n_insns=%u). "
+                    "Keeping original; this indicates self-modifying "
+                    "code or a tracer bug.  (Further occurrences "
+                    "suppressed.)\n",
+                    start_pc, existing->n_insns, n_insns);
+            }
+        }
+        return existing;
+    }
+
+    BBTemplate *tmpl = g_new0(BBTemplate, 1);
+    tmpl->template_id = next_template_id++;
+    tmpl->start_pc = start_pc;
+    tmpl->n_insns = n_insns;
+    tmpl->fall_through_pc = fall_through_pc;
+    tmpl->symbol_name = symbol_name ? g_strdup(symbol_name) : NULL;
+    tmpl->insn_pcs = g_new0(uint64_t, n_insns);
+    tmpl->insn_sizes = g_new0(uint8_t, n_insns);
+    tmpl->insn_bytes = g_new0(uint8_t, (size_t)n_insns * MAX_INSN_BYTES);
+    tmpl->insn_fields = g_new0(InsnFields, n_insns);
+    if (insn_reg_names) {
+        tmpl->insn_reg_names = g_new0(InsnRegNames, n_insns);
+    }
+    for (uint32_t i = 0; i < n_insns; i++) {
+        tmpl->insn_pcs[i] = insn_pcs[i];
+        tmpl->insn_sizes[i] = insn_sizes[i];
+        memcpy(&tmpl->insn_bytes[(size_t)i * MAX_INSN_BYTES],
+               &insn_bytes[(size_t)i * MAX_INSN_BYTES],
+               MAX_INSN_BYTES);
+        tmpl->insn_fields[i] = insn_fields[i];
+        if (tmpl->insn_reg_names) {
+            tmpl->insn_reg_names[i] = insn_reg_names[i];
+        }
+    }
+    g_hash_table_replace(bb_map, &tmpl->start_pc, tmpl);
+    return tmpl;
+}
+
+/*
+ * v1.6: look up or create a chain by ordered bb_id sequence.
+ * Returns NULL when n_bbs < 2.  Caller holds data_lock.
+ *
+ * Keyed by an internal string-encoded form of the bb_id tuple.
+ * GHashTable owns the key (g_free) and value (chain_template_free).
+ */
+ChainTemplate *commit_chain(const uint32_t *bb_ids, uint32_t n_bbs)
+{
+    if (n_bbs < 2) {
+        return NULL;
+    }
+    GString *key = g_string_sized_new(n_bbs * 6);
+    for (uint32_t i = 0; i < n_bbs; i++) {
+        g_string_append_printf(key, "%x ", bb_ids[i]);
+    }
+    ChainTemplate *existing =
+        (ChainTemplate *)g_hash_table_lookup(chain_map, key->str);
+    if (existing) {
+        g_string_free(key, TRUE);
+        return existing;
+    }
+    ChainTemplate *ct = g_new0(ChainTemplate, 1);
+    ct->chain_id = next_chain_id++;
+    ct->n_bbs = n_bbs;
+    ct->bb_ids = g_new0(uint32_t, n_bbs);
+    memcpy(ct->bb_ids, bb_ids, sizeof(uint32_t) * n_bbs);
+    g_hash_table_replace(chain_map, g_string_free(key, FALSE), ct);
+    return ct;
+}
+
+/*
  * Per-CPU state for assembling a basic block from the stream of TB
  * fragments reported by vcpu_tb_exec.  A basic block begins at a branch
  * target (entry_pc) and continues until the executing TB ends with a
@@ -434,63 +576,73 @@ static uint64_t cp_chain_last_ft;
 static GArray *cp_chain_fragments;
 
 /*
- * Build (or reuse) a merged BB template covering @entry_pc through the
- * concatenation of the provided TB fragments.  Must be called with
- * data_lock held.
+ * Build (or reuse) a true basic-block template covering @entry_pc
+ * through the concatenation of the provided TB fragments.  Each
+ * fragment must be a per-TB BBTemplate from tb_map; this helper
+ * extracts the executed insn metadata from each fragment in order
+ * and forwards to commit_true_bb().  Must be called with data_lock
+ * held.
+ *
+ * Caller is responsible for ensuring the fragment sequence forms a
+ * true BB (start at a branch target, end at a branch instruction).
+ * v1.6 enforces BB-immutability via commit_true_bb(): a recommit at
+ * the same start_pc with a different insn_pcs[] sequence emits a
+ * one-time warning and returns the original BB.
  */
 BBTemplate *get_or_create_bb_template(uint64_t entry_pc,
                                       BBTemplate * const *fragments,
                                       guint n_fragments)
 {
-    BBTemplate *existing = find_bb_template(entry_pc);
-
     uint32_t total_insns = 0;
     for (guint i = 0; i < n_fragments; i++) {
         total_insns += fragments[i]->n_insns;
     }
-    uint64_t final_ft = n_fragments > 0
-        ? fragments[n_fragments - 1]->fall_through_pc : 0;
-
-    if (existing && existing->n_insns == total_insns &&
-        existing->fall_through_pc == final_ft &&
-        existing->start_pc == entry_pc) {
-        return existing;
+    if (total_insns == 0) {
+        return NULL;
     }
 
-    BBTemplate *tmpl = g_new0(BBTemplate, 1);
-    tmpl->template_id = next_template_id++;
-    tmpl->start_pc = entry_pc;
-    tmpl->n_insns = total_insns;
-    tmpl->fall_through_pc = final_ft;
-    tmpl->insn_pcs = g_new0(uint64_t, total_insns);
-    tmpl->insn_sizes = g_new0(uint8_t, total_insns);
-    tmpl->insn_bytes = g_new0(uint8_t, (size_t)total_insns * MAX_INSN_BYTES);
-    tmpl->insn_fields = g_new0(InsnFields, total_insns);
+    g_autofree uint64_t *insn_pcs =
+        g_new0(uint64_t, total_insns);
+    g_autofree uint8_t *insn_sizes =
+        g_new0(uint8_t, total_insns);
+    g_autofree uint8_t *insn_bytes =
+        g_new0(uint8_t, (size_t)total_insns * MAX_INSN_BYTES);
+    g_autofree InsnFields *insn_fields =
+        g_new0(InsnFields, total_insns);
+    InsnRegNames *insn_reg_names = NULL;
     if (enable_reg_data) {
-        tmpl->insn_reg_names = g_new0(InsnRegNames, total_insns);
+        insn_reg_names = g_new0(InsnRegNames, total_insns);
     }
+    const char *symbol_name = NULL;
+    uint64_t final_ft = 0;
 
     uint32_t off = 0;
     for (guint f = 0; f < n_fragments; f++) {
         BBTemplate *frag = fragments[f];
-        if (f == 0 && frag->symbol_name) {
-            tmpl->symbol_name = g_strdup(frag->symbol_name);
+        if (f == 0) {
+            symbol_name = frag->symbol_name;
         }
         for (uint32_t i = 0; i < frag->n_insns; i++) {
-            tmpl->insn_pcs[off + i] = frag->insn_pcs[i];
-            tmpl->insn_sizes[off + i] = frag->insn_sizes[i];
-            memcpy(&tmpl->insn_bytes[(size_t)(off + i) * MAX_INSN_BYTES],
+            insn_pcs[off + i] = frag->insn_pcs[i];
+            insn_sizes[off + i] = frag->insn_sizes[i];
+            memcpy(&insn_bytes[(size_t)(off + i) * MAX_INSN_BYTES],
                    &frag->insn_bytes[(size_t)i * MAX_INSN_BYTES],
                    MAX_INSN_BYTES);
-            tmpl->insn_fields[off + i] = frag->insn_fields[i];
-            if (tmpl->insn_reg_names && frag->insn_reg_names) {
-                tmpl->insn_reg_names[off + i] = frag->insn_reg_names[i];
+            insn_fields[off + i] = frag->insn_fields[i];
+            if (insn_reg_names && frag->insn_reg_names) {
+                insn_reg_names[off + i] = frag->insn_reg_names[i];
             }
         }
         off += frag->n_insns;
+        final_ft = frag->fall_through_pc;
     }
 
-    g_hash_table_replace(bb_map, &tmpl->start_pc, tmpl);
+    BBTemplate *tmpl = commit_true_bb(entry_pc, total_insns,
+                                      insn_pcs, insn_fields,
+                                      insn_sizes, insn_bytes,
+                                      insn_reg_names,
+                                      symbol_name, final_ft);
+    g_free(insn_reg_names);
     return tmpl;
 }
 
@@ -617,15 +769,13 @@ static BBTemplate *get_or_create_template(uint64_t start_pc,
 
 /*
  * Read a register by Capstone-style runtime name.  Empty/unknown
- * names yield a zero 4B snap (size_code=0, lo=hi=0); the writer's
- * delta state thus stays at the previous value, so subsequent zero
- * snaps emit 0-byte deltas.  Only meaningful when enable_reg_data
- * is true.
+ * names yield a zero snap (lo=hi=0); the writer's delta state thus
+ * stays at the previous value, so subsequent zero snaps emit 0-byte
+ * deltas.  Only meaningful when enable_reg_data is true.
  */
 static void read_reg_into_snap(unsigned int cpu_index,
                                const char *name, RegSnap *out)
 {
-    out->size_code = 0;
     out->lo = 0;
     out->hi = 0;
     if (!name || !*name) {
@@ -640,18 +790,6 @@ static void read_reg_into_snap(unsigned int cpu_index,
     if (n <= 0) {
         return;
     }
-    uint8_t size_code;
-    if (n <= 4) {
-        size_code = 0;
-    } else if (n <= 8) {
-        size_code = 1;
-    } else if (n <= 16) {
-        size_code = 2;
-    } else {
-        /* Larger registers (e.g. SIMD) are not useful for
-         * address-recompute use; downgrade to 16B truncation. */
-        size_code = 2;
-    }
     uint8_t bytes[16] = {0};
     int copy_n = MIN(n, 16);
     memcpy(bytes, buf->data, copy_n);
@@ -662,7 +800,6 @@ static void read_reg_into_snap(unsigned int cpu_index,
     for (int b = 0; b < 8; b++) {
         hi |= (uint64_t)bytes[8 + b] << (b * 8);
     }
-    out->size_code = size_code;
     out->lo = lo;
     out->hi = hi;
 }
@@ -752,20 +889,13 @@ WideRegSnap *wide_reg_snap_capture(unsigned int cpu_index)
         if (!name || !*name || !h) {
             continue;
         }
-        RegSnap snap = {0, 0, 0};
+        RegSnap snap = {0, 0};
         /* Inline read since read_reg_into_snap takes a name and
          * re-resolves the handle, redundantly. */
         g_autoptr(GByteArray) buf = g_byte_array_new();
         int n = qemu_plugin_read_register(h, buf);
         if (n <= 0) {
             continue;
-        }
-        if (n <= 4) {
-            snap.size_code = 0;
-        } else if (n <= 8) {
-            snap.size_code = 1;
-        } else {
-            snap.size_code = 2;
         }
         uint8_t bytes[16] = {0};
         int copy_n = MIN(n, 16);
@@ -798,7 +928,6 @@ void wide_reg_snap_free(WideRegSnap *w)
 static void wide_reg_snap_lookup(const WideRegSnap *w, const char *name,
                                  RegSnap *out)
 {
-    out->size_code = 0;
     out->lo = 0;
     out->hi = 0;
     if (!w || !w->map || !name || !*name) {
@@ -1020,18 +1149,52 @@ static void start_trace_segment(const char *label,
     g_autofree char *bin_path = NULL;
     if (output_base_path) {
         bin_path = simpoints_list
-            ? g_strdup_printf("%s_%s.wpt", output_base_path, label)
-            : g_strdup_printf("%s.wpt", output_base_path);
+            ? g_strdup_printf("%s_%s.cst", output_base_path, label)
+            : g_strdup_printf("%s.cst", output_base_path);
     }
 
-    if (bin_path) {
+    /*
+     * Output destination resolution:
+     *   - outpipe=CMD     -> popen(CMD, "w").  Per-segment substitution
+     *                        of "%s" in CMD is replaced with the segment
+     *                        label so simpoint runs land in distinct files.
+     *   - outfile=PATH    -> fopen(PATH[.cst|_LABEL.cst], "wb").
+     * outpipe takes precedence when both are set.
+     */
+    if (output_pipe_command) {
+        g_autofree char *cmd = NULL;
+        if (strstr(output_pipe_command, "%s")) {
+            cmd = g_strdup_printf(output_pipe_command, label);
+        } else {
+            cmd = g_strdup(output_pipe_command);
+        }
+        current_segment->bin_file = popen(cmd, "w");
+        if (!current_segment->bin_file) {
+            fprintf(stderr,
+                    "champsim_tracer: cannot open output pipe: %s\n",
+                    cmd);
+        } else {
+            current_segment->bin_file_is_pipe = true;
+            current_segment->writer =
+                writer_start(current_segment->bin_file, true);
+            current_segment->bin_stream = body_stream_new(
+                current_segment->writer, 0,
+                current_segment->start_datetime);
+            if (!current_segment->bin_stream) {
+                fprintf(stderr,
+                        "champsim_tracer: cannot initialize binary stream\n");
+            }
+        }
+    } else if (bin_path) {
         current_segment->bin_file = fopen(bin_path, "wb");
         if (!current_segment->bin_file) {
             fprintf(stderr, "champsim_tracer: cannot open binary output: %s\n",
                     bin_path);
         } else {
+            current_segment->writer =
+                writer_start(current_segment->bin_file, false);
             current_segment->bin_stream = body_stream_new(
-                current_segment->bin_file, 0,
+                current_segment->writer, 0,
                 current_segment->start_datetime);
             if (!current_segment->bin_stream) {
                 fprintf(stderr, "champsim_tracer: cannot initialize binary stream\n");
@@ -1288,8 +1451,28 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     }
 
     if (prev_is_branch && branch_taken) {
-        br->taken_target = current_pc;
-        br->has_taken_target = true;
+        /* Push current_pc into a 2-entry LRU of distinct taken
+         * targets.  If it matches the MRU slot, nothing to do.  If it
+         * matches the LRU slot, swap them (promote LRU → MRU).
+         * Otherwise demote MRU → LRU and install current_pc as the
+         * new MRU. */
+        if (!br->has_taken_target) {
+            br->taken_target = current_pc;
+            br->has_taken_target = true;
+        } else if (br->taken_target == current_pc) {
+            /* MRU hit; nothing to update. */
+        } else if (br->has_prev_taken_target &&
+                   br->prev_taken_target == current_pc) {
+            /* LRU hit; swap MRU and LRU. */
+            uint64_t tmp = br->taken_target;
+            br->taken_target = br->prev_taken_target;
+            br->prev_taken_target = tmp;
+        } else {
+            /* New target; demote MRU and install. */
+            br->prev_taken_target = br->taken_target;
+            br->has_prev_taken_target = true;
+            br->taken_target = current_pc;
+        }
     }
 
     /* Append previous TB fragment to the in-flight basic-block chain. */
@@ -1308,13 +1491,65 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     uint64_t wrong_target = 0;
     if (finalize) {
-        if (branch_taken) {
+        int br_idx = template_branch_index(prev_tb_tmpl);
+        const InsnFields *bf = (br_idx >= 0)
+            ? &prev_tb_tmpl->insn_fields[br_idx] : NULL;
+        bool is_indirect = bf && (
+            bf->branch_type == BRANCH_INDIRECT_JUMP ||
+            bf->branch_type == BRANCH_INDIRECT_CALL ||
+            bf->branch_type == BRANCH_RETURN);
+        bool direct_cond = bf && (
+            (bf->branch_type == BRANCH_COND_DIRECT) ||
+            (bf->branch_type == BRANCH_DIRECT_JUMP &&
+             bf->branch_conditional));
+
+        if (is_indirect) {
+            /* Indirect branch — choose the WP target from the
+             * 2-entry LRU of historically-taken targets, biased
+             * away from CP's current direction:
+             *   - If MRU exists and != current_pc and != prev_ft, use MRU.
+             *   - Else if LRU exists and != current_pc and != prev_ft, use LRU.
+             *   - Else if branch_taken, fall back to prev_ft (not-taken).
+             *   - Else (cold conditional indirect that fell through), 0
+             *     → suppress WP entry until history is learned.
+             *
+             * The current_pc filter prevents picking the same path CP
+             * just executed; the prev_ft filter prevents picking
+             * fall-through (which is degenerate for an unconditional
+             * indirect anyway). */
+            if (br && br->has_taken_target &&
+                br->taken_target != current_pc &&
+                br->taken_target != prev_ft) {
+                wrong_target = br->taken_target;
+            } else if (br && br->has_prev_taken_target &&
+                       br->prev_taken_target != current_pc &&
+                       br->prev_taken_target != prev_ft) {
+                wrong_target = br->prev_taken_target;
+            } else if (branch_taken) {
+                /* Unconditional indirect with no useful alternative
+                 * target known yet: WP is the byte after the branch.
+                 * This is degenerate (fall-through past a `ret` is
+                 * unmapped padding) but lets the WP simulator try and
+                 * harmlessly fault-out, which is preferable to
+                 * silently emitting no speculative trace at all. */
+                wrong_target = prev_ft;
+            } else {
+                wrong_target = 0;
+            }
+        } else if (branch_taken) {
+            /* CP took a direct branch → WP is the fall-through. */
             wrong_target = prev_ft;
-        } else if (br && br->has_taken_target) {
-            wrong_target = br->taken_target;
+        } else if (direct_cond && bf->has_immediate &&
+                   (uint64_t)bf->immediate != prev_ft) {
+            /* CP fell through a direct conditional → WP is the
+             * statically-resolved taken target.  Cache it on the
+             * BranchRecord too, for symmetry. */
+            wrong_target = (uint64_t)bf->immediate;
+            if (br && !br->has_taken_target) {
+                br->taken_target = wrong_target;
+                br->has_taken_target = true;
+            }
         } else {
-            /* No learned alternative yet; skip WP until both directions
-             * have been observed. */
             wrong_target = 0;
         }
     }
@@ -1661,6 +1896,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     }
     g_hash_table_unref(tb_map);
     g_hash_table_unref(bb_map);
+    g_hash_table_unref(chain_map);
     if (cp_chain_fragments) {
         g_array_unref(cp_chain_fragments);
     }
@@ -1705,12 +1941,19 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                 "instruction decode will be limited\n", target_name);
     }
 
-    /* Map ISA to Capstone arch/mode for qemu_plugin_cap_decode(). */
+    /*
+     * Map ISA to Capstone arch/mode for qemu_plugin_cap_decode().  The
+     * arch is fully determined by target_name and is set here.  The
+     * mode resolver may need to introspect the guest binary (for
+     * example to read .riscv.attributes or MIPS EF_* flags) which in
+     * turn calls qemu_plugin_path_to_binary() — that helper requires
+     * a live vCPU context, so the actual cap_mode_for_target() call is
+     * deferred to the first vcpu_init_cb (see vcpu_init_cb).
+     */
     if (trace_isa != TRACE_ISA_UNKNOWN) {
         const IsaProperties *p = &isa_properties[trace_isa];
         cst_cap_arch = p->cap_arch;
-        cst_cap_mode = p->cap_mode_for_target
-                       ? p->cap_mode_for_target(target_name) : 0;
+        cst_cap_mode = 0;  /* deferred — resolved in vcpu_init_cb */
     } else {
         cst_cap_arch = -1;
         cst_cap_mode = 0;
@@ -1741,6 +1984,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         static const struct { const char *name; int id; }
         opt_entries[] = {
             {"depth",   OPT_DEPTH},   {"outfile", OPT_OUTFILE},
+            {"outpipe", OPT_OUTPIPE},
             {"wp",      OPT_WP},
             {"start",   OPT_START},   {"stop",    OPT_STOP},
             {"program", OPT_PROGRAM}, {"spfile",  OPT_SPFILE},
@@ -1777,6 +2021,9 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             break;
         case OPT_OUTFILE:
             output_base_path = g_strdup(tokens[1]);
+            break;
+        case OPT_OUTPIPE:
+            output_pipe_command = g_strdup(tokens[1]);
             break;
         case OPT_WP:
             enable_wrong_path = (atoi(tokens[1]) != 0);
@@ -1851,6 +2098,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                                    NULL, bb_template_free);
     bb_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
                                    NULL, bb_template_free);
+    chain_map = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                      g_free, chain_template_free);
     cp_chain_fragments = g_array_new(false, false, sizeof(BBTemplate *));
     branch_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
                                        NULL, g_free);

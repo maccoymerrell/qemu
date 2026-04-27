@@ -388,12 +388,12 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
         const cs_x86_op *cop = &x86->operands[i];
         qemu_plugin_operand *op = &out->operands[i];
 
-        op->type = cop->type;
         op->access = cop->access;
         op->size = cop->size;
 
         switch (cop->type) {
         case X86_OP_REG:
+            op->type = QEMU_PLUGIN_OP_REG;
             cap_copy_reg_name(op->reg_name,
                               QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
                               handle, cop->reg);
@@ -403,6 +403,7 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
             op->imm = 0;
             break;
         case X86_OP_IMM:
+            op->type = QEMU_PLUGIN_OP_IMM;
             op->imm = cop->imm;
             op->reg_name[0] = '\0';
             op->reg_id     = 0;
@@ -410,6 +411,7 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
             op->index_id   = 0;
             break;
         case X86_OP_MEM:
+            op->type = QEMU_PLUGIN_OP_MEM;
             cap_copy_reg_name(op->reg_name,
                               QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
                               handle, cop->mem.base);
@@ -421,6 +423,7 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
             op->imm = cop->mem.disp;
             break;
         default:
+            op->type = QEMU_PLUGIN_OP_INVALID;
             op->reg_name[0] = '\0';
             op->reg_id     = 0;
             op->index_name[0] = '\0';
@@ -450,12 +453,12 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
         const cs_arm64_op *cop = &a64->operands[i];
         qemu_plugin_operand *op = &out->operands[i];
 
-        op->type = cop->type;
         op->access = cop->access;
         op->size = 0; /* AArch64 Capstone doesn't provide per-op size */
 
         switch (cop->type) {
         case ARM64_OP_REG:
+            op->type = QEMU_PLUGIN_OP_REG;
             cap_copy_reg_name(op->reg_name,
                               QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
                               handle, cop->reg);
@@ -465,6 +468,7 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
             op->imm = 0;
             break;
         case ARM64_OP_IMM:
+            op->type = QEMU_PLUGIN_OP_IMM;
             op->imm = cop->imm;
             op->reg_name[0] = '\0';
             op->reg_id     = 0;
@@ -472,6 +476,7 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
             op->index_id   = 0;
             break;
         case ARM64_OP_MEM:
+            op->type = QEMU_PLUGIN_OP_MEM;
             cap_copy_reg_name(op->reg_name,
                               QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
                               handle, cop->mem.base);
@@ -483,6 +488,7 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
             op->imm = cop->mem.disp;
             break;
         default:
+            op->type = QEMU_PLUGIN_OP_INVALID;
             op->reg_name[0] = '\0';
             op->reg_id     = 0;
             op->index_name[0] = '\0';
@@ -509,11 +515,11 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
         for (uint8_t i = 0; i < n; i++) {
             const cs_riscv_op *cop = &detail->riscv.operands[i];
             qemu_plugin_operand *op = &out->operands[i];
-            op->type = cop->type;
             op->access = 0; /* RISC-V Capstone lacks access info */
             op->size = 0;
             switch (cop->type) {
             case RISCV_OP_REG:
+                op->type = QEMU_PLUGIN_OP_REG;
                 cap_copy_reg_name(op->reg_name,
                                   QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
                                   handle, cop->reg);
@@ -523,6 +529,7 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 op->imm = 0;
                 break;
             case RISCV_OP_IMM:
+                op->type = QEMU_PLUGIN_OP_IMM;
                 op->imm = cop->imm;
                 op->reg_name[0] = '\0';
                 op->reg_id     = 0;
@@ -530,6 +537,7 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 op->index_id   = 0;
                 break;
             case RISCV_OP_MEM:
+                op->type = QEMU_PLUGIN_OP_MEM;
                 cap_copy_reg_name(op->reg_name,
                                   QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
                                   handle, cop->mem.base);
@@ -539,6 +547,7 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 op->imm = cop->mem.disp;
                 break;
             default:
+                op->type = QEMU_PLUGIN_OP_INVALID;
                 op->reg_name[0] = '\0';
                 op->reg_id     = 0;
                 op->index_name[0] = '\0';
@@ -553,11 +562,11 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
         for (uint8_t i = 0; i < n; i++) {
             const cs_mips_op *cop = &detail->mips.operands[i];
             qemu_plugin_operand *op = &out->operands[i];
-            op->type = cop->type;
             op->access = 0; /* MIPS Capstone lacks access info */
             op->size = 0;
             switch (cop->type) {
             case MIPS_OP_REG:
+                op->type = QEMU_PLUGIN_OP_REG;
                 cap_copy_reg_name(op->reg_name,
                                   QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
                                   handle, cop->reg);
@@ -567,6 +576,7 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 op->imm = 0;
                 break;
             case MIPS_OP_IMM:
+                op->type = QEMU_PLUGIN_OP_IMM;
                 op->imm = cop->imm;
                 op->reg_name[0] = '\0';
                 op->reg_id     = 0;
@@ -574,6 +584,7 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 op->index_id   = 0;
                 break;
             case MIPS_OP_MEM:
+                op->type = QEMU_PLUGIN_OP_MEM;
                 cap_copy_reg_name(op->reg_name,
                                   QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
                                   handle, cop->mem.base);
@@ -583,6 +594,7 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 op->imm = cop->mem.disp;
                 break;
             default:
+                op->type = QEMU_PLUGIN_OP_INVALID;
                 op->reg_name[0] = '\0';
                 op->reg_id     = 0;
                 op->index_name[0] = '\0';

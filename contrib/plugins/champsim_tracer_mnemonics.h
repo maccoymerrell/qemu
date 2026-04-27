@@ -124,9 +124,15 @@ typedef enum {
  * per-instruction flag bits are no longer needed.
  */
 enum MnemonicFlags {
-    MF_NONE         = 0,
-    MF_CONDITIONAL  = (1 << 0),  /* Branch/CMOV/SETcc is conditional        */
-    MF_ATOMIC       = (1 << 1),  /* Atomic/locked memory op → SYNC_ATOMIC   */
+    MF_NONE             = 0,
+    MF_CONDITIONAL      = (1 << 0),  /* Branch/CMOV/SETcc is conditional        */
+    MF_ATOMIC           = (1 << 1),  /* Atomic/locked memory op → SYNC_ATOMIC   */
+    MF_VARIABLE_MEMOP   = (1 << 2),  /* Insn's load/store count varies at runtime
+                                      * (e.g. x86 REP MOVS, ARM LDM/STM, RVV).
+                                      * Forces the writer to emit a per-entry
+                                      * dyn-memop preamble entry for this insn;
+                                      * non-variable insns rely on the template's
+                                      * static n_loads/n_stores instead. */
 };
 
 /*
@@ -226,7 +232,9 @@ typedef struct InsnFields {
     uint8_t sync_hint;              /* SyncEventType */
     uint8_t n_loads;                /* Observed max loads per execution  */
     uint8_t n_stores;               /* Observed max stores per execution */
-    bool    dynamic_memop;          /* Runtime observed > Capstone static */
+    bool    variable_memop;         /* True if this insn's load/store count
+                                     * varies at runtime (forces preamble
+                                     * emission per entry).               */
 } InsnFields;
 
 
@@ -273,7 +281,7 @@ typedef struct {
 const RegClassification *const isa_reg_class[] = {
     [TRACE_ISA_UNKNOWN] = NULL,
     [TRACE_ISA_X86]     = x86_reg_class,
-    [TRACE_ISA_AARCH64] = arm64_reg_class,
+    [TRACE_ISA_AARCH64] = aarch64_reg_class,
     [TRACE_ISA_RISCV]   = riscv_reg_class,
     [TRACE_ISA_MIPS]    = mips_reg_class,
 };
@@ -281,7 +289,7 @@ const RegClassification *const isa_reg_class[] = {
 const unsigned isa_reg_class_size[] = {
     [TRACE_ISA_UNKNOWN] = 0,
     [TRACE_ISA_X86]     = X86_REG_ENDING,
-    [TRACE_ISA_AARCH64] = ARM64_REG_ENDING,
+    [TRACE_ISA_AARCH64] = AARCH64_REG_ENDING,
     [TRACE_ISA_RISCV]   = RISCV_REG_ENDING,
     [TRACE_ISA_MIPS]    = MIPS_REG_ENDING,
 };
@@ -291,7 +299,7 @@ const unsigned isa_reg_class_size[] = {
 const InsnClassification *const isa_insn_class[] = {
     [TRACE_ISA_UNKNOWN] = NULL,
     [TRACE_ISA_X86]     = x86_insn_class,
-    [TRACE_ISA_AARCH64] = arm64_insn_class,
+    [TRACE_ISA_AARCH64] = aarch64_insn_class,
     [TRACE_ISA_RISCV]   = riscv_insn_class,
     [TRACE_ISA_MIPS]    = mips_insn_class,
 };
@@ -299,7 +307,7 @@ const InsnClassification *const isa_insn_class[] = {
 const unsigned isa_insn_class_size[] = {
     [TRACE_ISA_UNKNOWN] = 0,
     [TRACE_ISA_X86]     = X86_INS_ENDING,
-    [TRACE_ISA_AARCH64] = ARM64_INS_ENDING,
+    [TRACE_ISA_AARCH64] = AARCH64_INS_ENDING,
     [TRACE_ISA_RISCV]   = RISCV_INS_ENDING,
     [TRACE_ISA_MIPS]    = MIPS_INS_ENDING,
 };
@@ -330,17 +338,27 @@ extern const unsigned isa_insn_class_size[TRACE_ISA_MIPS + 1];
  *
  *   branch_delay_slots       — number of delay-slot instructions after a
  *                              branch (0 for most ISAs, 1 for MIPS)
+ *   pc_relative_branch_imm   — true if Capstone reports the immediate of
+ *                              direct branches as a *relative* offset
+ *                              from the branch PC (RISC-V, MIPS).  False
+ *                              if Capstone resolves it to an absolute
+ *                              target (x86, ARM64).  decode_detail_to_
+ *                              generic() normalizes the field so
+ *                              InsnFields.immediate is always the
+ *                              absolute target on the wire.
  *   target_prefixes          — NULL-terminated list of QEMU target_name
  *                              prefixes that map to this ISA
- *   cap_arch                 — QEMU_PLUGIN_CAP_ARCH_* or -1 if unsupported
- *   cap_mode_for_target      — derives the QEMU_PLUGIN_CAP_MODE_* bitmask
- *                              from target_name (handles e.g. RISC-V
- *                              32/64 split, MIPS endianness)
+ *   cap_arch                 — Capstone cs_arch enum value (CS_ARCH_*),
+ *                              or -1 if unsupported
+ *   cap_mode_for_target      — derives a Capstone cs_mode bitmask
+ *                              (CS_MODE_*) from target_name (handles e.g.
+ *                              RISC-V 32/64 split, MIPS endianness)
  */
 typedef unsigned int (*CapModeForTargetFn)(const char *target_name);
 
 typedef struct {
     uint8_t               branch_delay_slots;
+    bool                  pc_relative_branch_imm;
     const char *const    *target_prefixes;
     int                   cap_arch;
     CapModeForTargetFn    cap_mode_for_target;
@@ -358,23 +376,23 @@ const IsaProperties isa_properties[] = {
     [TRACE_ISA_UNKNOWN] = { 0 },
     [TRACE_ISA_X86]     = {
         .target_prefixes = isa_prefixes_x86,
-        .cap_arch = QEMU_PLUGIN_CAP_ARCH_X86,
+        .cap_arch = CS_ARCH_X86,
         .cap_mode_for_target = cap_mode_x86,
     },
     [TRACE_ISA_AARCH64] = {
         .target_prefixes = isa_prefixes_aarch64,
-        .cap_arch = QEMU_PLUGIN_CAP_ARCH_ARM64,
+        .cap_arch = CS_ARCH_AARCH64,
         .cap_mode_for_target = cap_mode_aarch64,
     },
     [TRACE_ISA_RISCV]   = {
         .target_prefixes = isa_prefixes_riscv,
-        .cap_arch = QEMU_PLUGIN_CAP_ARCH_RISCV,
+        .cap_arch = CS_ARCH_RISCV,
         .cap_mode_for_target = cap_mode_riscv,
     },
     [TRACE_ISA_MIPS]    = {
         .branch_delay_slots = 1,
         .target_prefixes = isa_prefixes_mips,
-        .cap_arch = QEMU_PLUGIN_CAP_ARCH_MIPS,
+        .cap_arch = CS_ARCH_MIPS,
         .cap_mode_for_target = cap_mode_mips,
     },
 };

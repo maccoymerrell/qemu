@@ -855,32 +855,12 @@ QEMU_PLUGIN_API
 bool qemu_plugin_insn_detail(const struct qemu_plugin_insn *insn,
                              qemu_plugin_insn_info *info);
 
-/* Capstone architecture IDs for qemu_plugin_cap_decode() */
-#define QEMU_PLUGIN_CAP_ARCH_ARM    0
-#define QEMU_PLUGIN_CAP_ARCH_ARM64  1
-#define QEMU_PLUGIN_CAP_ARCH_MIPS   2
-#define QEMU_PLUGIN_CAP_ARCH_X86    3
-#define QEMU_PLUGIN_CAP_ARCH_RISCV  15
-
-/* Capstone mode flags for qemu_plugin_cap_decode() */
-#define QEMU_PLUGIN_CAP_MODE_LITTLE_ENDIAN  0u
-#define QEMU_PLUGIN_CAP_MODE_BIG_ENDIAN     (1u << 31)
-#define QEMU_PLUGIN_CAP_MODE_16             (1u << 1)
-#define QEMU_PLUGIN_CAP_MODE_32             (1u << 2)
-#define QEMU_PLUGIN_CAP_MODE_64             (1u << 3)
-/*
- * RISC-V uses Capstone-specific mode bits that overlap with the
- * generic 16/32/64 width flags, so they're spelled explicitly here
- * to match Capstone's CS_MODE_RISCV* values exactly.
- */
-#define QEMU_PLUGIN_CAP_MODE_RISCV32        1u
-#define QEMU_PLUGIN_CAP_MODE_RISCV64        2u
-#define QEMU_PLUGIN_CAP_MODE_RISCVC         4u  /* C-extension (compressed) */
-
 /**
  * qemu_plugin_cap_decode() - decode raw instruction bytes via Capstone
- * @cap_arch: Capstone architecture (QEMU_PLUGIN_CAP_ARCH_*)
- * @cap_mode: Capstone mode flags (QEMU_PLUGIN_CAP_MODE_*)
+ * @cap_arch: Capstone architecture — pass a Capstone `cs_arch` enum value
+ *            (e.g. CS_ARCH_X86, CS_ARCH_AARCH64, CS_ARCH_RISCV, CS_ARCH_MIPS).
+ * @cap_mode: Capstone mode flags — pass a bitmask of Capstone `cs_mode`
+ *            enum values (e.g. CS_MODE_64, CS_MODE_RISCV64 | CS_MODE_RISCV_C).
  * @data: pointer to raw instruction bytes
  * @size: number of bytes available at @data
  * @pc: virtual address of the instruction
@@ -891,6 +871,11 @@ bool qemu_plugin_insn_detail(const struct qemu_plugin_insn *insn,
  * from @data.  Unlike qemu_plugin_insn_detail(), this function does
  * not depend on QEMU's per-target disassembler — it works for any
  * ISA that Capstone supports, given the correct arch/mode.
+ *
+ * The @cap_arch and @cap_mode arguments are forwarded verbatim to
+ * cs_open(), so plugins should include <capstone/capstone.h> and
+ * use the canonical Capstone enum values rather than shadow constants.
+ * This insulates plugins from any future renumbering inside Capstone.
  *
  * x86 automatically uses AT&T syntax.
  *

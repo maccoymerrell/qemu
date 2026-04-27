@@ -471,7 +471,7 @@ def _check_cp_execution_order(correct_path: list[int],
         ))
     elif len(cp_block_seq) > len(correct_path):
         issues.append(Issue(
-            "cp_execution_order", "warning",
+            "cp_execution_order", "error",
             f"trace CP has {len(cp_block_seq) - len(correct_path)} "
             f"extra blocks after predicted end",
         ))
@@ -483,7 +483,8 @@ def _check_cp_memops(entries: list[dict],
                      blocks_by_id: dict[int, dict],
                      cp_set: set[int],
                      arena_addr: int,
-                     arena_size: int | None = None) -> list[Issue]:
+                     arena_size: int | None = None,
+                     isa: str = "x86_64") -> list[Issue]:
     """Memop/value check, aggregated by (template, block) bipartite
     component.
 
@@ -557,16 +558,14 @@ def _check_cp_memops(entries: list[dict],
                     (m["kind"], int(m["arena_u64_index"]), int(m["data"]))
                 )
         actual: list[tuple[str, int, int]] = []
+        # 32-bit ISAs lower `uint64_t` arena accesses to a pair of
+        # 32-bit memops at the low and high halves of an 8-byte slot.
+        # On 64-bit ISAs the compiler issues a single 8-byte memop, so
+        # pair-merging must be skipped (otherwise two unrelated 4-byte
+        # accesses to adjacent u32 slots could be merged spuriously).
+        is_32bit_isa = isa in ("mipsel", "mips", "riscv32", "armhf", "i386")
         for tid in sorted(comp_tmpls):
             raw_dps = list(first_entry[tid].get("dyn_params", []))
-            # MIPS32 (and any 32-bit ISA) lowers `uint64_t` arena
-            # accesses to a pair of 32-bit memops at the low and high
-            # halves of an 8-byte slot.  The compiler may reorder the
-            # halves freely, so we pair every 4-byte access at offset 8k
-            # (low half) with any same-kind 4-byte access at offset 8k+4
-            # (high half) within the same template's dyn_param list,
-            # recombining them into a single 8-byte (kind, off, value)
-            # tuple matching what blocks.py emits via _volatile_*_u64.
             consumed = [False] * len(raw_dps)
 
             def _arena_off4(va: int) -> int:
@@ -578,29 +577,32 @@ def _check_cp_memops(entries: list[dict],
                     return -1
                 return rel // 4
 
-            # First pass: pair each 8-byte-aligned 4-byte access (low
-            # half) with a same-kind partner at the next 4-byte slot
-            # (high half).
-            for i, dp in enumerate(raw_dps):
-                if consumed[i] or int(dp.data_size) != 4:
-                    continue
-                off4 = _arena_off4(int(dp.value))
-                if off4 < 0 or off4 % 2 != 0:
-                    continue
-                hi_va = int(dp.value) + 4
-                for j in range(len(raw_dps)):
-                    if (j == i or consumed[j]
-                            or int(raw_dps[j].data_size) != 4
-                            or raw_dps[j].type_name != dp.type_name
-                            or int(raw_dps[j].value) != hi_va):
+            # First pass (32-bit ISAs only): pair each 8-byte-aligned
+            # access (low half) with a same-kind partner at the next
+            # 4-byte slot (high half) within the same template.  The
+            # decoder does not preserve `data_size`, so pairing is
+            # driven by offset alignment alone — which is unambiguous
+            # because on 32-bit ISAs every memop is 4 bytes wide.
+            if is_32bit_isa:
+                for i, dp in enumerate(raw_dps):
+                    if consumed[i]:
                         continue
-                    lo = int(dp.data_lo) & 0xFFFFFFFF
-                    hi = int(raw_dps[j].data_lo) & 0xFFFFFFFF
-                    actual.append(
-                        (dp.type_name, off4 // 2, (hi << 32) | lo)
-                    )
-                    consumed[i] = consumed[j] = True
-                    break
+                    off4 = _arena_off4(int(dp.value))
+                    if off4 < 0 or off4 % 2 != 0:
+                        continue
+                    hi_va = int(dp.value) + 4
+                    for j in range(len(raw_dps)):
+                        if (j == i or consumed[j]
+                                or raw_dps[j].type_name != dp.type_name
+                                or int(raw_dps[j].value) != hi_va):
+                            continue
+                        lo = int(dp.data_lo) & 0xFFFFFFFF
+                        hi = int(raw_dps[j].data_lo) & 0xFFFFFFFF
+                        actual.append(
+                            (dp.type_name, off4 // 2, (hi << 32) | lo)
+                        )
+                        consumed[i] = consumed[j] = True
+                        break
 
             # Second pass: any remaining dyn_params at u64-aligned
             # addresses are taken at face value.
@@ -633,7 +635,11 @@ def _check_cp_memops(entries: list[dict],
             f"templates {{{tmpl_label}}} ({blk_label}): "
             f"memop multiset mismatch "
             f"(exp={len(expected)} act={len(actual)} "
-            f"missing={len(missing)} extra={len(extra)})",
+            f"missing={len(missing)} extra={len(extra)})\n"
+            f"      expected: {expected}\n"
+            f"      actual  : {actual}\n"
+            f"      missing : {missing}\n"
+            f"      extra   : {extra}",
             {
                 "template_ids": sorted(comp_tmpls),
                 "cp_blocks": sorted(comp_blocks),
@@ -687,19 +693,83 @@ def _check_memop_insn_attribution(
         insns = tmpl.get("insns", [])
         n = len(insns)
 
-        for dp in e.get("dyn_params", []):
+        # v1.6 contract: BBs are immutable, and per-insn (n_loads,
+        # n_stores) is exact for non-variable_memop insns; variable
+        # insns carry per-entry counts via the §4.1 preamble.  The
+        # decoder reconstructs `insn_index` by walking that schema in
+        # template order.  An out-of-range (-1) `insn_index` therefore
+        # means the runtime emitted more dyn_params than the schema's
+        # total declared memops — a tracer bug (mnemonic
+        # misclassification or missing variable_memop flag).  Emit a
+        # one-shot full dump of the template + dyn_params so the
+        # offending insn is identifiable from the validator output.
+        dps = list(e.get("dyn_params", []))
+        sch_total = sum(int(ins.get("n_loads", 0)) +
+                        int(ins.get("n_stores", 0))
+                        for ins in insns)
+        any_variable = any(ins.get("variable_memop", False)
+                           for ins in insns)
+        out_of_range = [dp for dp in dps if int(dp.insn_index) < 0
+                        or int(dp.insn_index) >= n]
+
+        if out_of_range:
+            schema_lines = []
+            for i, ins in enumerate(insns):
+                schema_lines.append(
+                    f"    insn[{i:2d}] pc=0x{int(ins['pc']):x} "
+                    f"opcode={ins.get('opcode', '?')} "
+                    f"n_loads={int(ins.get('n_loads', 0))} "
+                    f"n_stores={int(ins.get('n_stores', 0))} "
+                    f"variable_memop={int(bool(ins.get('variable_memop', False)))}"
+                )
+            dp_lines = []
+            for j, dp in enumerate(dps):
+                dp_lines.append(
+                    f"    dp[{j:2d}] kind={dp.type_name} "
+                    f"insn_index={int(dp.insn_index)} "
+                    f"value=0x{int(dp.value):x}"
+                )
+            detail = (
+                f"template t{tid} (start_pc=0x{int(tmpl.get('start_pc', 0)):x}, "
+                f"n_insns={n}, schema_total_memops={sch_total}, "
+                f"variable_memop_present={int(any_variable)}, "
+                f"dyn_params_received={len(dps)}):\n"
+                + "\n".join(schema_lines)
+                + "\n  dyn_params:\n"
+                + "\n".join(dp_lines)
+            )
+            issues.append(Issue(
+                "memop_insn_attribution", "error",
+                f"template t{tid}: {len(out_of_range)} dyn_param(s) "
+                f"could not be attributed by schema walk "
+                f"(schema_total={sch_total}, dp_count={len(dps)}). "
+                f"Likely tracer bug: an opcode in this BB has wrong "
+                f"static (n_loads, n_stores) or is missing "
+                f"variable_memop.\n{detail}",
+                {"template_id": tid, "n_insns": n,
+                 "schema_total_memops": sch_total,
+                 "dyn_params_received": len(dps),
+                 "variable_memop_present": any_variable,
+                 "schema": [
+                     {"pc": int(ins["pc"]),
+                      "opcode": ins.get("opcode"),
+                      "n_loads": int(ins.get("n_loads", 0)),
+                      "n_stores": int(ins.get("n_stores", 0)),
+                      "variable_memop": bool(ins.get("variable_memop", False))}
+                     for ins in insns],
+                 "dyn_params": [
+                     {"kind": dp.type_name,
+                      "insn_index": int(dp.insn_index),
+                      "value": int(dp.value)}
+                     for dp in dps]},
+            ))
+            # Skip per-dp mis-attribution checks: indices are unreliable
+            # once schema walk overflowed.
+            continue
+
+        for dp in dps:
             idx = int(dp.insn_index)
             kind = dp.type_name
-            if idx < 0 or idx >= n:
-                issues.append(Issue(
-                    "memop_insn_attribution", "error",
-                    f"template t{tid}: dyn_param ({kind} @ "
-                    f"0x{int(dp.value):x}) has out-of-range insn_index "
-                    f"{idx} (template has {n} insns)",
-                    {"template_id": tid, "insn_index": idx,
-                     "n_insns": n, "kind": kind},
-                ))
-                continue
             ins = insns[idx]
             n_l = int(ins.get("n_loads", 0))
             n_s = int(ins.get("n_stores", 0))
@@ -838,11 +908,22 @@ def _make_capstone(isa: str):
         md = cs.Cs(cs.CS_ARCH_X86, cs.CS_MODE_64)
         op_mem = cs.x86.X86_OP_MEM
     elif isa == "aarch64":
-        md = cs.Cs(cs.CS_ARCH_ARM64, cs.CS_MODE_ARM)
-        op_mem = cs.arm64.ARM64_OP_MEM
+        md = cs.Cs(cs.CS_ARCH_AARCH64, cs.CS_MODE_ARM)
+        op_mem = cs.aarch64.AARCH64_OP_MEM
     elif isa == "riscv64":
         md = cs.Cs(cs.CS_ARCH_RISCV,
-                   cs.CS_MODE_RISCV64 | cs.CS_MODE_RISCVC)
+                   cs.CS_MODE_RISCV64
+                   | cs.CS_MODE_RISCV_C
+                   | cs.CS_MODE_RISCV_FD
+                   | cs.CS_MODE_RISCV_A
+                   | cs.CS_MODE_RISCV_V
+                   | cs.CS_MODE_RISCV_ZBA
+                   | cs.CS_MODE_RISCV_ZBB
+                   | cs.CS_MODE_RISCV_ZBC
+                   | cs.CS_MODE_RISCV_ZBKB
+                   | cs.CS_MODE_RISCV_ZBKC
+                   | cs.CS_MODE_RISCV_ZBKX
+                   | cs.CS_MODE_RISCV_ZBS)
         op_mem = cs.riscv.RISCV_OP_MEM
     elif isa == "mipsel":
         md = cs.Cs(cs.CS_ARCH_MIPS,
@@ -1041,9 +1122,9 @@ def _check_address_recompute(
     md, op_mem_kind = _make_capstone(isa)
     if md is None:
         issues.append(Issue(
-            "addr_recompute", "warning",
+            "addr_recompute", "error",
             "capstone python module not available; "
-            "address-recompute skipped",
+            "address-recompute check cannot run",
         ))
         return issues
 
@@ -1449,12 +1530,11 @@ def _check_wrong_path_chains(entries: list[dict],
                  "expected": exp_chain},
             ))
         elif len(actual_wp) < len(exp_chain):
-            # Plugin's WP depth budget counts ALL TBs executed (including
-            # shared prologue / indirect-call trampolines that are not in
-            # our user CFG), so the plugin commonly stops a block or two
-            # before our purely-user-graph prediction.
+            # An empty WP at any CP fork is always a bug.  Truncation by
+            # any amount is a real validation gap: the plugin's WP depth
+            # budget should match the validator's per-fork prediction.
             issues.append(Issue(
-                "wrong_path_chains", "warning",
+                "wrong_path_chains", "error",
                 f"WP at CP pos {cp_pos} (blk_{last_cp_bid}) truncated: "
                 f"plugin emitted {len(actual_wp)} blocks, "
                 f"predicted {len(exp_chain)} (plugin depth cap reached)",
@@ -1476,7 +1556,8 @@ def _meta_cp_successor(bid: int, correct_path: list[int]) -> int | None:
 # ---------------------------------------------------------------------------
 
 def validate(meta_path: Path, trace_path: Path,
-             binary_path: Path) -> Report:
+             binary_path: Path,
+             wp_insn_budget: int = 64) -> Report:
     meta = json.loads(meta_path.read_text())
     dec = _load_decoder()
     _trace_meta, templates, entries = dec.decode_champsim_tracer(trace_path)
@@ -1583,8 +1664,8 @@ def validate(meta_path: Path, trace_path: Path,
     arena_info = _find_arena_address(binary_path)
     if arena_info is None:
         issues.append(Issue(
-            "cp_memops", "warning",
-            "no `arena` symbol in binary; skipping memop/value check",
+            "cp_memops", "error",
+            "no `arena` symbol in binary; memop/value check cannot run",
         ))
     else:
         arena_addr, arena_size = arena_info
@@ -1592,7 +1673,8 @@ def validate(meta_path: Path, trace_path: Path,
         stats["arena_size"] = arena_size
         issues += _check_cp_memops(cp_entries, template_runs,
                                    blocks_by_id, cp_set, arena_addr,
-                                   arena_size)
+                                   arena_size,
+                                   meta.get("isa", "x86_64"))
 
     # Per-instruction memop attribution: ensure every dyn_param's
     # insn_index points at an instruction whose schema declares the
@@ -1616,7 +1698,8 @@ def validate(meta_path: Path, trace_path: Path,
     issues += _check_wrong_path_chains(cp_entries, template_runs,
                                        cp_block_seq, correct_path,
                                        meta["wrong_paths"],
-                                       blocks_by_id)
+                                       blocks_by_id,
+                                       wp_insn_budget=wp_insn_budget)
 
     return Report(issues=issues, stats=stats)
 

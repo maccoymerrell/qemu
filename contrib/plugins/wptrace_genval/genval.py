@@ -2,8 +2,8 @@
 """champsim_tracer_genval CLI.
 
 Subcommands:
-  generate   Build a seed-driven C++ source + metadata sidecar.
-  build      Cross-compile the source for one or more ISAs.
+    generate   Build a seed-driven assembly source + metadata sidecar.
+    build      Assemble/link the source for one or more ISAs.
   trace      Run the champsim_tracer plugin on a compiled binary.
   analyze    Disassemble the binary, annotate metadata with ground truth.
   validate   Compare the decoded trace to the metadata.
@@ -92,7 +92,7 @@ def _parse_args() -> argparse.Namespace:
                         help="Program basename (default: name of out-dir).")
 
     # generate
-    g = sub.add_parser("generate", help="Emit .cpp + .meta.json")
+    g = sub.add_parser("generate", help="Emit .S + .meta.json")
     common(g)
     g.add_argument("--seed", type=_parse_seed, required=True)
     g.add_argument("--isa", choices=ISA_CHOICES, required=True,
@@ -105,12 +105,12 @@ def _parse_args() -> argparse.Namespace:
                         "single trace exercises 100%% of the reachable "
                         "GenericOpcode classifications.")
     g.add_argument("--hot-iters", type=int, default=0,
-                   help="If > 0, place one `hot_loop` block on the CP side "
-                        "of every diamond and have each loop iterate this "
-                        "many times.  Used to produce long-running traces.")
+                   help="If > 0, place one explicit loop region on each side "
+                        "of every diamond and have the loop exit after this "
+                        "many body executions.")
 
     # build
-    b = sub.add_parser("build", help="Cross-compile .cpp for an ISA")
+    b = sub.add_parser("build", help="Assemble/link .S for an ISA")
     common(b)
     b.add_argument("--isa", choices=ISA_CHOICES, required=True)
 
@@ -185,8 +185,8 @@ def _prog_base(out_dir: Path, prog: str | None) -> str:
     return prog or out_dir.name
 
 
-def _cpp_path(out_dir: Path, prog: str) -> Path:
-    return out_dir / f"{prog}.cpp"
+def _src_path(out_dir: Path, prog: str) -> Path:
+    return out_dir / f"{prog}.S"
 
 
 def _meta_path(out_dir: Path, prog: str, isa: str) -> Path:
@@ -217,8 +217,7 @@ def cmd_generate(args, isa: str | None = None) -> None:
         coverage=getattr(args, "coverage", False),
         hot_iters=getattr(args, "hot_iters", 0),
     )
-    # Emit per-ISA metadata (since exit syscall differs) but share cpp
-    # by appending the isa suffix to the meta and a per-ISA cpp.
+    # Emit per-ISA metadata and a per-ISA assembly source.
     args.out_dir.mkdir(parents=True, exist_ok=True)
     cpp_name = f"{prog}_{isa}"
     cpp_path, meta_path = G.generate(params, args.out_dir, cpp_name)
@@ -228,9 +227,9 @@ def cmd_generate(args, isa: str | None = None) -> None:
 def cmd_build(args, isa: str | None = None) -> int:
     isa = isa or args.isa
     prog = _prog_base(args.out_dir, args.prog)
-    cpp = _cpp_path(args.out_dir, f"{prog}_{isa}")
-    if not cpp.is_file():
-        print(f"build[{isa}]: SKIP  source not found: {cpp}")
+    src = _src_path(args.out_dir, f"{prog}_{isa}")
+    if not src.is_file():
+        print(f"build[{isa}]: SKIP  source not found: {src}")
         return 0
     cc = ISA_COMPILER[isa]
     if not _have(cc):
@@ -241,8 +240,7 @@ def cmd_build(args, isa: str | None = None) -> int:
         "-O1", "-fno-asynchronous-unwind-tables",
         "-fno-stack-protector",
         "-fno-optimize-sibling-calls",
-        "-std=c++17",
-        str(cpp), "-o", str(out),
+        str(src), "-o", str(out),
     ]
     # 32-bit MIPS soft-float helpers (__floatdidf/__fixdfdi) live in
     # libgcc; -nostdlib doesn't exclude libgcc, but we still need to

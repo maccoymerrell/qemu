@@ -357,12 +357,47 @@ static uint16_t cap_group_to_plugin_bit(uint8_t grp)
 }
 
 /*
- * Copy a Capstone register name into a fixed-size buffer.
+ * Per-arch upper bound on the register-ID space used by Capstone's
+ * generated getRegisterName() asm-printer table.  Each Capstone arch
+ * has its own enum that ends in `<ARCH>_REG_ENDING`, and the auto-
+ * generated `getRegisterName()` asserts `RegNo && RegNo < N`.  When
+ * Capstone is built with CAPSTONE_DEBUG (the default for a meson
+ * `Debug` build-type) that assertion abort()s the host process —
+ * even though `cs_reg_name()` would otherwise return NULL for the
+ * same input.  In Capstone 6.0-Alpha7 the upstream RISC-V decoder
+ * occasionally produces out-of-range IDs in the implicit
+ * regs_read[] / regs_write[] arrays attached to vector pseudo-ops,
+ * which is what triggers the abort under wrong-path execution.
+ */
+static unsigned int cap_arch_reg_upper(int cap_arch)
+{
+    switch (cap_arch) {
+    case CS_ARCH_X86:      return X86_REG_ENDING;
+    case CS_ARCH_ARM64:  return AARCH64_REG_ENDING;
+    case CS_ARCH_ARM:      return ARM_REG_ENDING;
+    case CS_ARCH_RISCV:    return RISCV_REG_ENDING;
+    case CS_ARCH_MIPS:     return MIPS_REG_ENDING;
+    case CS_ARCH_PPC:      return PPC_REG_ENDING;
+    case CS_ARCH_SPARC:    return SPARC_REG_ENDING;
+    case CS_ARCH_SYSZ:  return SYSTEMZ_REG_ENDING;
+    default:               return 0;
+    }
+}
+
+/*
+ * Copy a Capstone register name into a fixed-size buffer.  See
+ * cap_arch_reg_upper() for why the bound check is necessary.
  */
 static void cap_copy_reg_name(char *dst, size_t dstsz,
-                              csh handle, unsigned int reg_id)
+                              csh handle, unsigned int reg_id,
+                              int cap_arch)
 {
     if (reg_id == 0) {
+        dst[0] = '\0';
+        return;
+    }
+    unsigned int upper = cap_arch_reg_upper(cap_arch);
+    if (upper && reg_id >= upper) {
         dst[0] = '\0';
         return;
     }
@@ -396,7 +431,7 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
             op->type = QEMU_PLUGIN_OP_REG;
             cap_copy_reg_name(op->reg_name,
                               QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
-                              handle, cop->reg);
+                              handle, cop->reg, CS_ARCH_X86);
             op->reg_id     = cop->reg;
             op->index_name[0] = '\0';
             op->index_id   = 0;
@@ -414,11 +449,11 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
             op->type = QEMU_PLUGIN_OP_MEM;
             cap_copy_reg_name(op->reg_name,
                               QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
-                              handle, cop->mem.base);
+                              handle, cop->mem.base, CS_ARCH_X86);
             op->reg_id     = cop->mem.base;
             cap_copy_reg_name(op->index_name,
                               QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
-                              handle, cop->mem.index);
+                              handle, cop->mem.index, CS_ARCH_X86);
             op->index_id   = cop->mem.index;
             op->imm = cop->mem.disp;
             break;
@@ -461,7 +496,7 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
             op->type = QEMU_PLUGIN_OP_REG;
             cap_copy_reg_name(op->reg_name,
                               QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
-                              handle, cop->reg);
+                              handle, cop->reg, CS_ARCH_ARM64);
             op->reg_id     = cop->reg;
             op->index_name[0] = '\0';
             op->index_id   = 0;
@@ -479,11 +514,11 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
             op->type = QEMU_PLUGIN_OP_MEM;
             cap_copy_reg_name(op->reg_name,
                               QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
-                              handle, cop->mem.base);
+                              handle, cop->mem.base, CS_ARCH_ARM64);
             op->reg_id     = cop->mem.base;
             cap_copy_reg_name(op->index_name,
                               QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
-                              handle, cop->mem.index);
+                              handle, cop->mem.index, CS_ARCH_ARM64);
             op->index_id   = cop->mem.index;
             op->imm = cop->mem.disp;
             break;
@@ -522,7 +557,7 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 op->type = QEMU_PLUGIN_OP_REG;
                 cap_copy_reg_name(op->reg_name,
                                   QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
-                                  handle, cop->reg);
+                                  handle, cop->reg, cap_arch);
                 op->reg_id     = cop->reg;
                 op->index_name[0] = '\0';
                 op->index_id   = 0;
@@ -540,7 +575,7 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 op->type = QEMU_PLUGIN_OP_MEM;
                 cap_copy_reg_name(op->reg_name,
                                   QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
-                                  handle, cop->mem.base);
+                                  handle, cop->mem.base, cap_arch);
                 op->reg_id     = cop->mem.base;
                 op->index_name[0] = '\0';
                 op->index_id   = 0;
@@ -569,7 +604,7 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 op->type = QEMU_PLUGIN_OP_REG;
                 cap_copy_reg_name(op->reg_name,
                                   QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
-                                  handle, cop->reg);
+                                  handle, cop->reg, cap_arch);
                 op->reg_id     = cop->reg;
                 op->index_name[0] = '\0';
                 op->index_id   = 0;
@@ -587,7 +622,7 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 op->type = QEMU_PLUGIN_OP_MEM;
                 cap_copy_reg_name(op->reg_name,
                                   QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
-                                  handle, cop->mem.base);
+                                  handle, cop->mem.base, cap_arch);
                 op->reg_id     = cop->mem.base;
                 op->index_name[0] = '\0';
                 op->index_id   = 0;
@@ -671,7 +706,8 @@ bool cap_disas_plugin_detail(disassemble_info *info, uint64_t pc, size_t size,
         for (uint8_t i = 0; i < out->n_regs_read; i++) {
             cap_copy_reg_name(out->regs_read[i],
                               QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
-                              handle, detail->regs_read[i]);
+                              handle, detail->regs_read[i],
+                              info->cap_arch);
             out->regs_read_id[i] = detail->regs_read[i];
         }
 
@@ -681,7 +717,8 @@ bool cap_disas_plugin_detail(disassemble_info *info, uint64_t pc, size_t size,
         for (uint8_t i = 0; i < out->n_regs_write; i++) {
             cap_copy_reg_name(out->regs_write[i],
                               QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
-                              handle, detail->regs_write[i]);
+                              handle, detail->regs_write[i],
+                              info->cap_arch);
             out->regs_write_id[i] = detail->regs_write[i];
         }
 
@@ -773,7 +810,7 @@ bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
         for (uint8_t i = 0; i < out->n_regs_read; i++) {
             cap_copy_reg_name(out->regs_read[i],
                               QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
-                              handle, detail->regs_read[i]);
+                              handle, detail->regs_read[i], cap_arch);
             out->regs_read_id[i] = detail->regs_read[i];
         }
 
@@ -783,7 +820,7 @@ bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
         for (uint8_t i = 0; i < out->n_regs_write; i++) {
             cap_copy_reg_name(out->regs_write[i],
                               QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
-                              handle, detail->regs_write[i]);
+                              handle, detail->regs_write[i], cap_arch);
             out->regs_write_id[i] = detail->regs_write[i];
         }
 

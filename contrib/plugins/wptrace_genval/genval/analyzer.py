@@ -26,6 +26,62 @@ from pathlib import Path
 from .classify import get_classifier
 
 
+_HEX_TARGET_RE = None
+
+
+def _detect_loop_body_n_insns(insns: list, isa: str = "") -> tuple[int, int]:
+    """Return ``(body_n, through_loop_n)`` for the inner loop of a
+    block, or ``(0, 0)`` if no backedge is present.
+
+    * ``body_n``: insns from the loop target index through the
+      backedge inclusive — one iteration's body.
+    * ``through_loop_n``: insns from block start through the backedge
+      inclusive.  Insns AFTER the backedge in the same block (e.g.
+      a post-loop store) are *not* part of any loop iteration.  The
+      QEMU plugin attributes those tail insns to a fresh TB starting
+      at the post-loop PC, which extends into the next block, so the
+      validator credits the post-loop tail to the *next* block in
+      the chain rather than to the loop block itself.
+
+    On MIPS the conditional branch has a one-insn delay slot which
+    is executed every iteration — including on the iteration that
+    falls through to the post-loop tail.  The plugin's per-BB
+    counting attributes the delay-slot insn to the loop iteration's
+    BB, so body and through are extended by one when the ISA is a
+    MIPS variant and a delay-slot insn is present.
+    """
+    import re
+    global _HEX_TARGET_RE
+    if _HEX_TARGET_RE is None:
+        _HEX_TARGET_RE = re.compile(r"0x[0-9a-fA-F]+")
+
+    has_delay_slot = isa.startswith("mips")
+    pc_to_idx = {ins.pc: i for i, ins in enumerate(insns)}
+    for j, ins in enumerate(insns):
+        if ins.branch_type not in ("BRANCH_DIRECT_JUMP",
+                                    "BRANCH_COND_DIRECT"):
+            continue
+        matches = _HEX_TARGET_RE.findall(ins.op_str)
+        if not matches:
+            continue
+        try:
+            target = int(matches[-1], 16)
+        except ValueError:
+            continue
+        if target >= ins.pc:
+            continue
+        k = pc_to_idx.get(target)
+        if k is None or k > j:
+            continue
+        body = j - k + 1
+        through = j + 1
+        if has_delay_slot and j + 1 < len(insns):
+            body += 1
+            through += 1
+        return body, through
+    return 0, 0
+
+
 @dataclass
 class InsnGT:
     pc: int
@@ -69,12 +125,14 @@ def _collect_block_symbols(binary) -> dict[str, tuple[int, int]]:
 
 def _section_for_pc(binary, pc: int):
     import lief
+    if hasattr(lief.ELF, "SECTION_FLAGS"):
+        exec_flag = int(lief.ELF.SECTION_FLAGS.EXECINSTR)
+    else:
+        exec_flag = int(lief.ELF.Section.FLAGS.EXECINSTR)
     for sec in binary.sections:
         base = int(sec.virtual_address)
         size = int(sec.size)
-        if base <= pc < base + size and (
-            int(sec.flags) & int(lief.ELF.SECTION_FLAGS.EXECINSTR)
-        ):
+        if base <= pc < base + size and (int(sec.flags) & exec_flag):
             return sec
     return None
 
@@ -177,12 +235,52 @@ def analyze(binary_path: Path, meta_path: Path) -> Path:
             n_insns=len(insns),
             insns=insns,
         )
-        node["ground_truth"] = {
+        gt_dict = {
             "start_pc": gt.start_pc,
             "end_pc": gt.end_pc,
             "n_insns": gt.n_insns,
             "insns": [asdict(i) for i in gt.insns],
         }
+        # Detect inner loop span via the first backward-targeting
+        # branch within this block.  Used by the WP-chain validator
+        # to compute the runtime-expanded instruction cost of blocks
+        # that contain loops (e.g. hot_loop), since the plugin's
+        # WP instruction budget counts each iteration's body
+        # separately while the static disassembly counts it once.
+        loop_body_n_insns, loop_through_n_insns = (
+            _detect_loop_body_n_insns(insns, isa=isa))
+        if loop_body_n_insns > 0:
+            gt_dict["loop_body_n_insns"] = loop_body_n_insns
+            gt_dict["loop_through_n_insns"] = loop_through_n_insns
+        node["ground_truth"] = gt_dict
+
+    # Record the leaf-helper insn count for ``direct_call`` /
+    # ``indirect_call`` blocks.  The DirectCall/IndirectCall block
+    # classes emit ``call wptgen_leaf`` (a small XOR/return stub
+    # defined at file scope).  The leaf's instructions are executed
+    # by QEMU and counted toward the plugin's WP instruction budget,
+    # but since the leaf has no ``blk_*`` label it would otherwise be
+    # invisible to the validator.  Recording its insn count here lets
+    # the validator add ``helper_leaf_n_insns`` to the runtime cost
+    # of each direct_call / indirect_call visit when computing the
+    # WP-budget trim point.
+    leaf_n = 0
+    for sym in binary.symbols:
+        if sym.name == "wptgen_leaf":
+            leaf_addr = int(sym.value)
+            leaf_size = int(sym.size)
+            sec = _section_for_pc(binary, leaf_addr)
+            if sec is None:
+                break
+            sec_end = int(sec.virtual_address) + int(sec.size)
+            if leaf_size <= 0:
+                leaf_size = _next_addr_after(leaf_addr, sec_end) - leaf_addr
+            sec_offset = leaf_addr - int(sec.virtual_address)
+            sec_bytes = bytes(sec.content)[sec_offset:sec_offset + leaf_size]
+            leaf_n = sum(1 for _ in md.disasm(sec_bytes, leaf_addr))
+            break
+    if leaf_n > 0:
+        meta["helper_leaf_n_insns"] = leaf_n
 
     meta_path.write_text(json.dumps(meta, indent=2))
     return meta_path

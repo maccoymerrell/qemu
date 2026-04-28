@@ -127,29 +127,6 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         tmpl = find_template(pre_pc);
         g_mutex_unlock(&data_lock);
 
-        /*
-         * Detect non-advancing TB: spec-mode exec returned ok but PC
-         * did not move.  This happens when the cached translation at
-         * pre_pc is invalid for current architectural state (e.g. we
-         * jumped into the middle of a previously-translated insn).
-         * Treat it as a soft fault and bail out of WP.
-         */
-        if (tb_ok && qemu_plugin_get_pc() == pre_pc) {
-            wide_reg_snap_free(wide);
-            wp_poison_target(poisoned_targets, pre_pc);
-            g_array_set_size(bb_pcs, 0);
-            g_array_set_size(bb_sizes, 0);
-            g_byte_array_set_size(bb_bytes, 0);
-            g_array_set_size(bb_fields, 0);
-            if (bb_regnames) g_array_set_size(bb_regnames, 0);
-            g_array_set_size(bb_dyn_params, 0);
-            if (bb_reg_snaps) g_array_set_size(bb_reg_snaps, 0);
-            bb_start_pc = 0;
-            bb_symbol_name = NULL;
-            early_exit = true;
-            break;
-        }
-
         if (!tmpl) {
             wide_reg_snap_free(wide);
             g_array_set_size(bb_pcs, 0);
@@ -195,6 +172,18 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         }
         uint8_t last_insn_size = tmpl->insn_sizes[tmpl->n_insns - 1];
 
+        /*
+         * Budget accounting: spec-mode exec_tb runs the full TB
+         * starting at pre_pc to its natural end (branch / page-cross).
+         * cpu_plugin_exec_tb sets cflags = CF_NO_GOTO_TB|CF_NO_GOTO_PTR|
+         * CF_MEMI_ONLY|CF_SINGLE_STEP — note CF_COUNT_MASK is zero, so
+         * tb_gen_code uses max_insns = TCG_MAX_INSNS.  CF_SINGLE_STEP
+         * is only about preventing rep-prefixed insns from looping
+         * internally on x86; it does NOT cap TB length to 1 insn.
+         * Each executed insn must be counted exactly once toward the
+         * wrong-path budget; this is executed-insn count, not unique
+         * insns and not unique BBs.
+         */
         sim_insns += tmpl->n_insns;
 
         /* Attribute mem accesses to insns within the just-appended
@@ -390,13 +379,9 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         bb_start_pc = 0;
         bb_symbol_name = NULL;
 
-        uint64_t chosen_target = post_pc;
-        if (wp_target_is_poisoned(poisoned_targets, chosen_target)) {
+        if (wp_target_is_poisoned(poisoned_targets, post_pc)) {
             early_exit = true;
             break;
-        }
-        if (chosen_target != post_pc) {
-            qemu_plugin_set_pc(chosen_target);
         }
     }
 

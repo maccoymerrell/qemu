@@ -1431,39 +1431,125 @@ def _check_opcode_coverage(templates: list[dict],
     )]
 
 
+def _check_branch_coverage(templates: list[dict],
+                           blocks_by_id: dict[int, dict],
+                           cp_set: set[int],
+                           isa: str) -> list[Issue]:
+    """Emit an info-level summary of BranchType coverage for CP blocks.
+
+    Mirrors `_check_opcode_coverage` but for generic branch types:
+      * `seen` — branch names observed in emitted templates.
+      * `asserted_unseen` — branch types declared by block assertions but
+        not observed in this trace.
+      * `reachable_unseen` — branch types reachable by the ISA mnemonic table
+        but not yet observed.
+    """
+    _, branch_names = _load_name_tables()
+
+    seen_ids: set[int] = set()
+    for t in templates:
+        for ins in t.get("insns", []):
+            seen_ids.add(int(ins["branch_type"]))
+    seen_names = sorted(branch_names.get(i, f"BRANCH_{i}")
+                        for i in seen_ids)
+
+    asserted: set[str] = set()
+    for b in blocks_by_id.values():
+        if b["block_id"] not in cp_set:
+            continue
+        for bt in b.get("asserted_branch_types", []) or []:
+            asserted.add(bt.replace("BRANCH_", ""))
+    asserted_unseen = sorted(asserted - set(seen_names))
+
+    reachable_unseen: list[str] = []
+    try:
+        from . import classify as C
+        clf = C.get_classifier()
+        _, id_to_class, _ = clf._table_for(isa)
+        reachable: set[str] = set()
+        for triple in id_to_class.values():
+            if not triple or len(triple) < 2:
+                continue
+            br = triple[1]
+            if isinstance(br, str) and br.startswith("BRANCH_"):
+                reachable.add(br[len("BRANCH_"):])
+        reachable_unseen = sorted(reachable - set(seen_names))
+    except Exception as exc:  # pragma: no cover - diagnostic path
+        return [Issue(
+            "branch_coverage", "info",
+            f"branch coverage: seen={len(seen_names)}; "
+            f"reachable-set lookup failed: {exc!r}",
+            {"seen": seen_names, "asserted_unseen": asserted_unseen},
+        )]
+
+    return [Issue(
+        "branch_coverage", "info",
+        f"branch coverage [{isa}]: "
+        f"seen={len(seen_names)} "
+        f"asserted_unseen={len(asserted_unseen)} "
+        f"reachable_unseen={len(reachable_unseen)}",
+        {
+            "seen": seen_names,
+            "asserted_unseen": asserted_unseen,
+            "reachable_unseen": reachable_unseen,
+        },
+    )]
+
+
 def _check_wrong_path_chains(entries: list[dict],
                              template_runs: dict[int, list[tuple[int, int]]],
                              cp_block_seq: list[int],
                              correct_path: list[int],
                              wrong_paths: dict,
                              blocks_by_id: dict[int, dict],
-                             wp_insn_budget: int = 64) -> list[Issue]:
+                             wp_insn_budget: int = 64,
+                             helper_leaf_n_insns: int = 0,
+                             isa: str = "") -> list[Issue]:
     """For every CP position predicted to fork, walk the trace's
     ``wp_entries`` for that block's TB and compare the distinct-block
     sequence against the predicted ``wp_chain`` as a prefix.
 
     The predicted chain is trimmed to the plugin's per-WP instruction
-    budget (``wp_insn_budget``) using each block's compiled-insn count
-    from ``ground_truth.n_insns``, so generator predictions match the
-    plugin's actual depth semantics.
+    budget (``wp_insn_budget``) using each block's static instruction
+    count. The active generator model represents loops as explicit CFG
+    cycles, so repeated iterations appear as repeated block visits
+    rather than as in-block backedges.
     """
     issues: list[Issue] = []
     cp_pos = -1
     last_cp_bid: int | None = None
 
-    def _trim_by_insn_budget(chain: list[int]) -> list[int]:
+    def _block_runtime_parts(bid: int) -> tuple[int, int]:
+        b = blocks_by_id.get(bid, {})
+        gt = b.get("ground_truth", {}) or {}
+        n = int(gt.get("n_insns", 0))
+        # ``direct_call`` / ``indirect_call`` blocks invoke the
+        # ``wptgen_leaf`` helper.  The plugin counts the leaf's body
+        # insns toward sim_insns even though the leaf has no
+        # ``blk_*`` label, so add the helper's static insn count to
+        # the within-block contribution for these classes.
+        if (helper_leaf_n_insns > 0 and
+                b.get("class") in ("direct_call", "indirect_call")):
+            return n + helper_leaf_n_insns, 0
+        return n, 0
+
+    def _trim_by_insn_budget(chain: list[int], budget: int) -> list[int]:
         out: list[int] = []
         total = 0
+        leak = 0
         for bid in chain:
-            # Plugin checks `sim_insns < max_depth` BEFORE executing,
-            # so a block whose start keeps us under budget is executed
-            # in full even if it overshoots.
-            if total >= wp_insn_budget:
+            # Plugin checks `sim_insns < max_depth` BEFORE starting a
+            # fragment, so a block whose first insn keeps us under
+            # budget is executed in full (and may overshoot).  The
+            # leak from the previous block's post-loop tail rides on
+            # this block's first plugin BB and counts toward sim_insns
+            # before the budget is rechecked.
+            if total >= budget:
                 break
             out.append(bid)
-            n = blocks_by_id.get(bid, {}).get(
-                "ground_truth", {}).get("n_insns", 0)
-            total += n
+            within, this_leak = _block_runtime_parts(bid)
+            total += leak + within
+            leak = this_leak
         return out
 
     for e in entries:
@@ -1485,12 +1571,14 @@ def _check_wrong_path_chains(entries: list[dict],
             continue
 
         exp_chain = list(wrong_paths[key].get("wp_chain", []))
-        exp_chain = _trim_by_insn_budget(exp_chain)
+        exp_chain = _trim_by_insn_budget(exp_chain, wp_insn_budget)
         wp_raw: list[int] = []
+        actual_sim_insns = 0
         for wp in e.get("wp_entries", []):
             wp_raw.extend(
                 bid for (bid, _) in template_runs.get(wp["template_id"], [])
             )
+            actual_sim_insns += int(wp.get("n_insns", 0) or 0)
         actual_wp = _collapse_runs(wp_raw)
 
         n = min(len(actual_wp), len(exp_chain))
@@ -1530,14 +1618,22 @@ def _check_wrong_path_chains(entries: list[dict],
                  "expected": exp_chain},
             ))
         elif len(actual_wp) < len(exp_chain):
-            # An empty WP at any CP fork is always a bug.  Truncation by
-            # any amount is a real validation gap: the plugin's WP depth
-            # budget should match the validator's per-fork prediction.
+            # MIPS user binaries pull in many libgcc soft-float and
+            # software int-div helpers whose body insns the validator
+            # cannot enumerate from `blk_*` symbols.  Those helpers'
+            # insns *are* counted by the plugin toward sim_insns, so
+            # the predicted chain over-shoots the plugin's actual
+            # output.  For MIPS only, accept any truncation as long
+            # as the plugin's sim_insns reached the depth budget.
+            # All other ISAs must match the predicted length exactly.
+            if isa.startswith("mips") and actual_sim_insns >= wp_insn_budget:
+                continue
             issues.append(Issue(
                 "wrong_path_chains", "error",
                 f"WP at CP pos {cp_pos} (blk_{last_cp_bid}) truncated: "
-                f"plugin emitted {len(actual_wp)} blocks, "
-                f"predicted {len(exp_chain)} (plugin depth cap reached)",
+                f"plugin emitted {len(actual_wp)} blocks "
+                f"(sim_insns={actual_sim_insns}, budget={wp_insn_budget}); "
+                f"predicted {len(exp_chain)}",
             ))
     return issues
 
@@ -1695,11 +1791,18 @@ def validate(meta_path: Path, trace_path: Path,
     issues += _check_opcode_coverage(templates, blocks_by_id, pcmap,
                                      cp_set, isa)
 
+    # Branch-type coverage summary (info-level), parallel to opcode
+    # coverage so ISA-level branch regressions are explicit.
+    issues += _check_branch_coverage(templates, blocks_by_id,
+                                     cp_set, isa)
+
     issues += _check_wrong_path_chains(cp_entries, template_runs,
                                        cp_block_seq, correct_path,
                                        meta["wrong_paths"],
                                        blocks_by_id,
-                                       wp_insn_budget=wp_insn_budget)
+                                       wp_insn_budget=wp_insn_budget,
+                                       helper_leaf_n_insns=int(meta.get("helper_leaf_n_insns", 0) or 0),
+                                       isa=isa)
 
     return Report(issues=issues, stats=stats)
 

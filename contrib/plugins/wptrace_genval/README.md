@@ -1,6 +1,7 @@
 # champsim_tracer_genval — procedural validation of the champsim_tracer plugin
 
-This directory contains a seed-driven generator that produces C++ programs
+This directory contains a seed-driven generator that produces freestanding
+assembly programs
 with known, deterministic control flow, load/store addresses, load/store
 data, and opcode composition.  The programs are compiled for each of the
 four ISAs supported by the champsim_tracer plugin (x86_64, aarch64, riscv64,
@@ -21,7 +22,7 @@ exercises the plugin across:
 
 ```
              +--------+     +-----------+     +---------+
-   seed ---> | genval |---> | <prog>.cpp|---> | <isa>-  |
+   seed ---> | genval |---> | <prog>.S  |---> | <isa>-  |
              | generate|    | <meta>.json     |  gcc    |
              +--------+     +-----------+     +---------+
                                                    |
@@ -48,14 +49,14 @@ exercises the plugin across:
 ```
 
 1. **`genval generate --seed S --blocks N -o out/`** walks a seed-driven
-   graph builder, assembles a reachable CFG of `~N` `CodeBlock` nodes,
-   emits a standalone, freestanding C++ source file plus a JSON metadata
+  graph builder, assembles a reachable CFG of `~N` assembly `CodeBlock` nodes,
+  emits a standalone freestanding assembly source file plus a JSON metadata
    sidecar describing the expected correct-path BB sequence, per-BB
    memory-access sets, and per-branch wrong-path targets.
 
 2. **`genval build -o out/ [ISAs...]`** invokes each available cross
    compiler (`g++`, `aarch64-linux-gnu-g++`, `riscv64-linux-gnu-g++`,
-   `mipsel-linux-gnu-g++`) to produce `out/<prog>_<isa>` binaries.
+  `mipsel-linux-gnu-g++`) to assemble and link `out/<prog>_<isa>` binaries.
    Missing toolchains are skipped, not errors.
 
 3. **`genval trace`** runs each `out/<prog>_<isa>` under `qemu-<isa>` with
@@ -111,21 +112,19 @@ us at generation time.  Whichever side CP takes, the *other* side is
 exactly the wrong-path chain the plugin will emit (up to `depth` BBs,
 then joining into the next diamond and so on).
 
-Because arena slots that drive branch decisions are written **once** at
-program start and never mutated, wrong-path execution — which runs over
-real memory but has its register state snapshotted — cannot corrupt CP
-control flow.  Any stores performed on wrong-path go to arena regions
-that are not read until the store has faded into the past; we arrange
-the CFG so that the "load arena" slots each CP BB reads are disjoint
-from the "store arena" slots any WP BB it might trigger can write.
+Because arena slots that drive branch decisions are manipulated in
+explicit basic blocks, wrong-path execution runs over the exact code the
+validator models. Long-running traces now use explicit loop
+head/body/exit regions rather than in-block hot loops, so generator
+`CodeBlock`s and guest basic blocks stay aligned by construction.
 
 ## Files
 
 | Path | Role |
 | --- | --- |
 | `genval.py` | CLI entrypoint: `generate / build / trace / analyze / validate / all` |
-| `genval/blocks.py` | `CodeBlock` library — straight-line, branching, memops, fpops, calls |
-| `genval/generator.py` | CFG builder + C++ emitter + metadata writer |
+| `genval/asm_blocks.py` | Active assembly-only `CodeBlock` library |
+| `genval/generator.py` | CFG builder + assembly emitter + metadata writer |
 | `genval/classify.py` | Capstone-backed mnemonic → `GenericOpcode` classifier |
 | `genval/analyzer.py` | Disassemble compiled ELF, annotate metadata with ground truth |
 | `genval/validator.py` | Compare decoded trace to metadata |

@@ -52,7 +52,10 @@ ISA_CFLAGS = {
                 # and no linker relaxation.
                 "-msmall-data-limit=0", "-mno-relax",
                 "-Wl,--no-relax"],
-    "mipsel":  ["-static", "-nostdlib", "-nostartfiles", "-e", "_start"],
+    "mipsel":  [
+        "-static", "-nostdlib", "-nostartfiles", "-e", "_start",
+        "-mno-abicalls", "-fno-pic",
+    ],
 }
 
 ISA_QEMU = {

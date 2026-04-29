@@ -210,6 +210,7 @@ def emit_source(cfg: CFG, plans: list[B.BlockPlan],
     lines.append(".text")
     if isa.startswith("mips"):
         lines.append(".set noreorder")
+    lines.extend(B.emit_helper_symbols(isa))
     lines.extend([
         ".globl _start",
         ".type _start, @function",

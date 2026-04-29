@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import random
+import re
 from typing import ClassVar
 
 
@@ -94,8 +95,49 @@ def emit_entry_jump(isa: str, entry_symbol: str) -> list[str]:
     if isa == "riscv64":
         return [f"  j {entry_symbol}"]
     if isa.startswith("mips"):
-        return [f"  b {entry_symbol}", "  nop"]
+        return [f"  j {entry_symbol}", "  nop"]
     raise ValueError(f"unsupported ISA: {isa}")
+
+
+def emit_helper_symbols(isa: str) -> list[str]:
+    """Emit helper leaf symbols used by call-coverage blocks."""
+    lines = [
+        ".globl wptgen_leaf",
+        ".type wptgen_leaf, @function",
+        "wptgen_leaf:",
+    ]
+    if isa == "x86_64":
+        lines += [
+            "  movabs $0xA5A5A5A5A5A5A5A5, %rcx",
+            "  xorq %rcx, %rax",
+            "  ret",
+        ]
+    elif isa == "aarch64":
+        lines += [
+            "  movz x9, #0xa5a5",
+            "  movk x9, #0xa5a5, lsl #16",
+            "  movk x9, #0xa5a5, lsl #32",
+            "  movk x9, #0xa5a5, lsl #48",
+            "  eor x0, x0, x9",
+            "  ret",
+        ]
+    elif isa == "riscv64":
+        lines += [
+            "  li t1, 0xA5A5A5A5A5A5A5A5",
+            "  xor a0, a0, t1",
+            "  ret",
+        ]
+    elif isa.startswith("mips"):
+        lines += [
+            "  lui $t0, 0xA5A5",
+            "  ori $t0, $t0, 0xA5A5",
+            "  xor $v0, $a0, $t0",
+            "  jr $ra",
+            "  nop",
+        ]
+    else:
+        raise ValueError(f"unsupported ISA: {isa}")
+    return lines
 
 
 class CodeBlock:
@@ -136,7 +178,7 @@ def _jump(isa: str, target: str) -> list[str]:
     if isa == "riscv64":
         return [f"  j {target}"]
     if isa.startswith("mips"):
-        return [f"  b {target}", "  nop"]
+        return [f"  j {target}", "  nop"]
     raise ValueError(f"unsupported ISA: {isa}")
 
 
@@ -637,3 +679,221 @@ class ExitBlock(CodeBlock):
         else:
             lines += ["  li $v0, 4001", "  move $a0, $zero", "  syscall"]
         return "\n".join(lines) + "\n"
+
+
+@register
+class DirectCall(CodeBlock):
+    name = "direct_call"
+    scratch_slots = 0
+    randomizable = False
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=[],
+            asserted_branch_types=["BRANCH_DIRECT_CALL"],
+            asserted_opcodes=["CALL"],
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        lines = _prologue(ctx.block_id)
+        if ctx.isa == "x86_64":
+            lines += ["  xor %edi, %edi", "  call wptgen_leaf"]
+        elif ctx.isa == "aarch64":
+            lines += ["  mov x0, #0", "  bl wptgen_leaf"]
+        elif ctx.isa == "riscv64":
+            lines += ["  li a0, 0", "  jal ra, wptgen_leaf"]
+        else:
+            # Keep mipsel self-contained: direct local call + return.
+            lines += [
+                "  jal 1f",
+                "  nop",
+                "  b 2f",
+                "  nop",
+                "1:",
+                "  jr $ra",
+                "  nop",
+                "2:",
+            ]
+        lines += _jump(ctx.isa, ctx.successor_labels[0])
+        return "\n".join(lines) + "\n"
+
+
+@register
+class IndirectCall(CodeBlock):
+    name = "indirect_call"
+    scratch_slots = 0
+    randomizable = False
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=[],
+            asserted_branch_types=["BRANCH_INDIRECT_CALL"],
+            asserted_opcodes=["CALL"],
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        lines = _prologue(ctx.block_id)
+        if ctx.isa == "x86_64":
+            lines += [
+                "  xor %edi, %edi",
+                "  leaq wptgen_leaf(%rip), %rax",
+                "  call *%rax",
+            ]
+        elif ctx.isa == "aarch64":
+            lines += [
+                "  mov x0, #0",
+                "  adrp x9, wptgen_leaf",
+                "  add x9, x9, :lo12:wptgen_leaf",
+                "  blr x9",
+            ]
+        elif ctx.isa == "riscv64":
+            lines += ["  li a0, 0", "  la t0, wptgen_leaf", "  jalr ra, 0(t0)"]
+        else:
+            # Keep mipsel self-contained: indirect local call + return.
+            lines += [
+                "  lui $t9, %hi(1f)",
+                "  addiu $t9, $t9, %lo(1f)",
+                "  jalr $t9",
+                "  nop",
+                "  b 2f",
+                "  nop",
+                "1:",
+                "  jr $ra",
+                "  nop",
+                "2:",
+            ]
+        lines += _jump(ctx.isa, ctx.successor_labels[0])
+        return "\n".join(lines) + "\n"
+
+
+@register
+class IndirectJump(CodeBlock):
+    name = "indirect_jump"
+    scratch_slots = 0
+    randomizable = False
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=[],
+            asserted_branch_types=["BRANCH_INDIRECT_JUMP"],
+            asserted_opcodes=["BRANCH"],
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        target = ctx.successor_labels[0]
+        lines = _prologue(ctx.block_id)
+        if ctx.isa == "x86_64":
+            lines += [f"  leaq {target}(%rip), %rax", "  jmp *%rax"]
+        elif ctx.isa == "aarch64":
+            lines += [
+                f"  adrp x9, {target}",
+                f"  add x9, x9, :lo12:{target}",
+                "  br x9",
+            ]
+        elif ctx.isa == "riscv64":
+            lines += [f"  la t0, {target}", "  jr t0"]
+        else:
+            lines += [
+                f"  lui $t9, %hi({target})",
+                f"  addiu $t9, $t9, %lo({target})",
+                "  jr $t9",
+                "  nop",
+            ]
+        return "\n".join(lines) + "\n"
+
+
+def _decode_c_asm_string(c_text: str) -> list[str]:
+    """Convert a C inline-asm literal block to plain assembly lines."""
+    parts = re.findall(r'"(?:[^"\\]|\\.)*"', c_text)
+    if not parts:
+        return []
+    decoded = ""
+    for p in parts:
+        decoded += bytes(p[1:-1], "utf-8").decode("unicode_escape")
+    decoded = decoded.replace("%%", "%")
+    return [ln.strip() for ln in decoded.splitlines() if ln.strip()]
+
+
+def _register_probe(name: str, per_isa: dict[str, dict]) -> None:
+    class _Probe(CodeBlock):
+        pass
+
+    _Probe.name = name
+    _Probe.num_successors = 1
+    _Probe.scratch_slots = 0
+    _Probe.randomizable = False
+    _Probe.coverage_probe = True
+    _Probe.supported_isas = tuple(sorted(per_isa.keys()))
+
+    asm_lines = {
+        isa: _decode_c_asm_string(spec.get("asm", ""))
+        for isa, spec in per_isa.items()
+    }
+
+    @classmethod
+    def _plan(cls, ctx: EmitCtx) -> BlockPlan:
+        spec = per_isa[ctx.isa]
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=[],
+            asserted_opcodes=list(spec.get("opcodes", [])),
+            asserted_branch_types=list(spec.get("branch_types", [])),
+        )
+
+    @classmethod
+    def _emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        lines = _prologue(ctx.block_id)
+        for insn in asm_lines[ctx.isa]:
+            lines.append(f"  {insn}")
+        lines += _jump(ctx.isa, ctx.successor_labels[0])
+        return "\n".join(lines) + "\n"
+
+    _Probe.plan = _plan
+    _Probe.emit = _emit
+    _Probe.__name__ = f"Probe_{name}"
+    register(_Probe)
+
+
+def _import_legacy_probes() -> None:
+    """Import probe specs from the legacy C++ block catalog.
+
+    We only reuse the explicit instruction strings and asserted coverage
+    tags; emitted programs remain fully assembly-only.
+    """
+    from . import blocks as legacy_blocks
+
+    for name, cls in legacy_blocks._REGISTRY.items():
+        if not cls.__name__.startswith("AsmProbe_"):
+            continue
+        plan_cm = getattr(cls, "plan", None)
+        if plan_cm is None or not hasattr(plan_cm, "__func__"):
+            continue
+        closure = plan_cm.__func__.__closure__ or ()
+        per_isa = None
+        for cell in closure:
+            val = cell.cell_contents
+            if isinstance(val, dict) and val and all(
+                isinstance(k, str) and isinstance(v, dict)
+                for k, v in val.items()
+            ) and any("asm" in spec for spec in val.values()):
+                per_isa = val
+                break
+        if per_isa is None or name in _REGISTRY:
+            continue
+        _register_probe(name, per_isa)
+
+
+_import_legacy_probes()

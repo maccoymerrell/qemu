@@ -138,3 +138,79 @@ Metadata in `*.meta.json` is tracer-agnostic: it describes the expected
 A future `validator_pin.py` could consume the same metadata and check a
 PIN-generated trace in the same way.  Cross-tracer equivalence is then
 "both validators pass on the same binary + metadata."
+
+---
+
+## Current validation status (as of 2026-04-28)
+
+### Multi-ISA seed sweep
+
+A 40-run matrix (4 ISAs × 10 seeds) and a 12-run regdata matrix
+(4 ISAs × 3 seeds with `--regdata`) both completed with **0 errors and
+0 warnings** (info-level coverage and address-recompute summaries only).
+
+### Active validator checks
+
+All of the following checks are wired into `validate()` and confirmed
+passing across all ISAs and seeds:
+
+| Check | Description |
+| --- | --- |
+| `_check_blocks_covered` | Every expected CP block ID appears in the trace |
+| `_check_cp_execution_order` | CP basic-block sequence matches `metadata.correct_path` |
+| `_check_cp_memops` | Load/store addresses and data values match planted values |
+| `_check_memop_insn_attribution` | Each mem-op in the trace is attributed to the correct instruction PC |
+| `_check_address_recompute` | Arena addresses recomputed from reg snapshots match observed addresses |
+| `_check_opcode_coverage` | Per-ISA opcode coverage across the reachable block set |
+| `_check_branch_coverage` | Per-ISA branch-type coverage across the reachable block set (added 2026-04-28) |
+| `_check_wrong_path_chains` | WP chain block IDs and order match statically-predicted wrong paths |
+
+`_check_address_recompute` with `--regdata` confirmed across all ISAs
+with `errors=0` and nonzero `ok` counts:
+
+| ISA | ok | skipped | errors |
+| --- | --- | --- | --- |
+| x86_64 | 132 | 0 | 0 |
+| aarch64 | 132 | 0 | 0 |
+| riscv64 | 172 | 0 | 0 |
+| mipsel | 264 | 0 | 0 |
+
+### Opcode coverage
+
+Coverage is reported as `seen / total_reachable` where `total_reachable =
+seen + reachable_unseen`.  Blocks whose opcode types are fully absent from
+the block library (ISA not yet implemented) appear in `reachable_unseen`;
+`asserted_unseen` is 0 for all ISAs, meaning no opcode class expected to
+be present was actually missing.
+
+| ISA | seen | total reachable | coverage |
+| --- | --- | --- | --- |
+| x86_64 | 7 | 47 | **14.9 %** |
+| aarch64 | 8 | 44 | **18.2 %** |
+| riscv64 | 8 | 30 | **26.7 %** |
+| mipsel | 9 | 36 | **25.0 %** |
+
+### Branch-type coverage
+
+| ISA | seen | total reachable | coverage |
+| --- | --- | --- | --- |
+| x86_64 | 4 | 5 | **80.0 %** |
+| aarch64 | 4 | 9 | **44.4 %** |
+| riscv64 | 4 | 8 | **50.0 %** |
+| mipsel | 3 | 9 | **33.3 %** |
+
+Branch-type coverage is capped by which branch types the assembly block
+library (`genval/asm_blocks.py`) currently emits.  Indirect
+branches, direct calls, returns, and syscalls exist in the ISA but have
+not yet been added to the block library, accounting for the `reachable_unseen`
+entries above.
+
+### Known issues resolved
+
+| Issue | Fix |
+| --- | --- |
+| `AttributeError: type object 'IntAdd' has no attribute 'terminal'` in coverage mode | Added `terminal: ClassVar[bool] = False` default to the `CodeBlock` base class in `asm_blocks.py`; `ExitBlock` keeps `terminal = True` |
+| AArch64 non-encodable immediate in `eor` / `xor` variants | Replaced non-encodable immediates with register-materialised constants in `asm_blocks.py` |
+| RISC-V 12-bit `addi`/offset constraint violations | Rewrote affected emit paths to use scratch-register addressing for large offsets and reg-to-reg arithmetic for large adds |
+| MIPSel arena-base materialisation fragility | Switched to explicit `lui`/`addiu` two-instruction address materialisation |
+| LIEF 0.17.x enum API drift (`ELF_CLASS`, `ELF_DATA`, section flags) | Added compatibility shims in `champsim_tracer_mnemonic_survey.py` |

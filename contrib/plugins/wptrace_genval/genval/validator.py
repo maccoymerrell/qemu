@@ -1446,11 +1446,16 @@ def _check_branch_coverage(templates: list[dict],
     """
     _, branch_names = _load_name_tables()
 
+    def _norm(name: str) -> str:
+        # Decoder branch table uses "SYSCALL" while classifier tables
+        # use "BRANCH_SYSCALL_TYPE" -> "SYSCALL_TYPE".
+        return "SYSCALL_TYPE" if name == "SYSCALL" else name
+
     seen_ids: set[int] = set()
     for t in templates:
         for ins in t.get("insns", []):
             seen_ids.add(int(ins["branch_type"]))
-    seen_names = sorted(branch_names.get(i, f"BRANCH_{i}")
+    seen_names = sorted(_norm(branch_names.get(i, f"BRANCH_{i}"))
                         for i in seen_ids)
 
     asserted: set[str] = set()
@@ -1458,7 +1463,7 @@ def _check_branch_coverage(templates: list[dict],
         if b["block_id"] not in cp_set:
             continue
         for bt in b.get("asserted_branch_types", []) or []:
-            asserted.add(bt.replace("BRANCH_", ""))
+            asserted.add(_norm(bt.replace("BRANCH_", "")))
     asserted_unseen = sorted(asserted - set(seen_names))
 
     reachable_unseen: list[str] = []
@@ -1472,7 +1477,7 @@ def _check_branch_coverage(templates: list[dict],
                 continue
             br = triple[1]
             if isinstance(br, str) and br.startswith("BRANCH_"):
-                reachable.add(br[len("BRANCH_"):])
+                reachable.add(_norm(br[len("BRANCH_"):]))
         reachable_unseen = sorted(reachable - set(seen_names))
     except Exception as exc:  # pragma: no cover - diagnostic path
         return [Issue(

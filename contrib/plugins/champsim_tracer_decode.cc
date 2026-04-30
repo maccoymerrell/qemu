@@ -203,8 +203,6 @@ void decode_detail_to_generic(uint64_t pc,
 
     bool first_is_dst = opcode_first_is_dst[out->opcode];
     bool seen_first_reg = false;
-    bool saw_mem_op = false;
-
     for (uint8_t i = 0; i < info->n_operands; i++) {
         const qemu_plugin_operand *op = &info->operands[i];
 
@@ -234,28 +232,8 @@ void decode_detail_to_generic(uint64_t pc,
             }
             break;
         case QEMU_PLUGIN_OP_MEM: {
-            saw_mem_op = true;
             add_src_cap_reg(out, op->reg_id, out_names, op->reg_name);
             add_src_cap_reg(out, op->index_id, out_names, op->index_name);
-            /*
-             * Populate per-insn observed-max load/store count from
-             * Capstone operand access flags.  Missing flag info (some
-             * ISAs, or operand type without access) falls back to the
-             * opcode category below.
-             *
-             * LEA has an OP_MEM operand for address computation but
-             * does not actually access memory.  Capstone may report
-             * CS_AC_READ on that operand; ignore the access flags for
-             * pure address-compute opcodes.
-             */
-            if (out->opcode != GEN_OP_LEA) {
-                if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
-                    if (out->n_loads < 0xFF) out->n_loads++;
-                }
-                if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
-                    if (out->n_stores < 0xFF) out->n_stores++;
-                }
-            }
             break;
         }
         default:
@@ -263,23 +241,23 @@ void decode_detail_to_generic(uint64_t pc,
         }
     }
 
-    /* Implicit registers from Capstone detail. */
-    for (uint8_t i = 0; i < info->n_regs_read; i++) {
-        add_src_cap_reg(out, info->regs_read_id[i], out_names,
-                        info->regs_read[i]);
-    }
-    for (uint8_t i = 0; i < info->n_regs_write; i++) {
-        add_dst_cap_reg(out, info->regs_write_id[i], out_names,
-                        info->regs_write[i]);
+    if (trace_isa != TRACE_ISA_RISCV && trace_isa != TRACE_ISA_MIPS) {
+        for (uint8_t i = 0; i < info->n_regs_read; i++) {
+            add_src_cap_reg(out, info->regs_read_id[i], out_names,
+                            info->regs_read[i]);
+        }
+        for (uint8_t i = 0; i < info->n_regs_write; i++) {
+            add_dst_cap_reg(out, info->regs_write_id[i], out_names,
+                            info->regs_write[i]);
+        }
     }
 
     /*
      * Optional ISA-specific post-classification refinement.  Each row
      * in the per-ISA mnemonic table may attach a .refine callback that
      * fixes up opcode/branch_type/etc. based on the operand-walk
-     * result above.  Used for cases where one Capstone insn_id covers
-     * multiple distinct semantics (e.g. RISC-V JALR: indirect call vs.
-     * indirect jump vs. ret).
+    * result above.  Used for cases where one Capstone insn_id covers
+    * multiple distinct operand encodings or target forms.
      */
     if (cls && cls->refine) {
         cls->refine(info, out);
@@ -296,34 +274,18 @@ void decode_detail_to_generic(uint64_t pc,
      *     absolute target.
      *
      * After this step, InsnFields.immediate is always an absolute
-     * branch target for direct conditional / direct unconditional /
-     * direct call branches, which lets the WP-target derivation in
+    * branch target for direct conditional / direct unconditional
+    * branches, which lets the WP-target derivation in
      * champsim_tracer.cc be ISA-agnostic.
      */
     if (out->has_immediate &&
         isa_properties[trace_isa].pc_relative_branch_imm) {
         bool is_direct_branch =
             out->branch_type == BRANCH_COND_DIRECT ||
-            out->branch_type == BRANCH_DIRECT_JUMP ||
-            out->branch_type == BRANCH_DIRECT_CALL;
+            out->branch_type == BRANCH_DIRECT_JUMP;
         if (is_direct_branch) {
             out->immediate = (int64_t)((uint64_t)pc + (uint64_t)out->immediate);
         }
     }
 
-    /*
-     * Fallback: when Capstone reported a memory operand but did not
-     * populate its per-operand access flags (some ISAs, or operand
-     * types without access info), infer a single load/store from the
-     * opcode category.  Only applies when an OP_MEM was actually
-     * seen — a register-only insn (e.g. "cmp %rax, %rdx") must keep
-     * n_loads = n_stores = 0.
-     */
-    if (saw_mem_op && out->n_loads == 0 && out->n_stores == 0) {
-        if (out->opcode == GEN_OP_LOAD || out->opcode == GEN_OP_CMP) {
-            out->n_loads = 1;
-        } else if (out->opcode == GEN_OP_STORE) {
-            out->n_stores = 1;
-        }
-    }
 }

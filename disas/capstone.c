@@ -679,6 +679,10 @@ bool cap_disas_plugin_detail(disassemble_info *info, uint64_t pc, size_t size,
     assert(size < sizeof(cap_buf));
     info->read_memory_func(pc, cap_buf, size, info);
 
+    if (insn->detail) {
+        memset(insn->detail, 0, sizeof(*insn->detail));
+    }
+
     if (!cs_disasm_iter(handle, &cbuf, &size, &pc, insn)) {
         cs_free(insn, 1);
         cs_close(&handle);
@@ -782,6 +786,10 @@ bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
     const uint8_t *code = data;
     size_t sz = data_size;
     uint64_t addr = pc;
+
+    if (insn->detail) {
+        memset(insn->detail, 0, sizeof(*insn->detail));
+    }
 
     if (!cs_disasm_iter(handle, &code, &sz, &addr, insn)) {
         cs_free(insn, 1);

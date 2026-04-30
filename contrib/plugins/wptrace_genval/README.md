@@ -12,8 +12,8 @@ The goal is to produce a repeatable, automatable validation harness that
 exercises the plugin across:
 
   * every `GenericOpcode` class we can coax out of GCC,
-  * every `BranchType` (direct jump, conditional direct, direct call,
-    return, syscall, indirect jump/call),
+  * every `BranchType` (direct jump, conditional direct, return,
+    syscall, indirect jump),
   * dense load/store traffic with predictable addresses + data,
   * predictable wrong-path chains (via a fully static CFG with
     compile-time-deterministic branch outcomes).

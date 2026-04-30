@@ -65,6 +65,7 @@ CST_TRAILER_SIZE   = 64
 
 BODY_TAG_END       = 0
 BODY_TAG_ENTRY     = 1
+BODY_TAG_THREAD_SWITCH = 2
 ```
 
 Header feature flags are advisory. The field IDs still determine what
@@ -72,7 +73,7 @@ is actually present in each delta section.
 
 ```
 bit 0  CST_FLAG_MEM_DATA      LOAD_DATA / STORE_DATA fields may appear
-bit 1  CST_FLAG_REG_DATA      SRC_REG / DST_REG fields may appear
+bit 1  CST_FLAG_REG_DATA      SRC_REG fields may appear
 bit 2  CST_FLAG_RESERVED_2    reserved, written as 0
 bits 3..7                    reserved, written as 0
 ```
@@ -109,7 +110,6 @@ start of the file.
 | datetime       string                            |
 | comment        string                            |
 | target_name    string                            |
-| thread_id      ULEB                              |
 +--------------------------------------------------+
 | encoding_maps_section                            |
 |   section := len:ULEB payload[len]               |
@@ -171,6 +171,9 @@ body stream:
   | tag = BODY_TAG_ENTRY    |
   | entry payload           |
   +-------------------------+
+  | tag = BODY_TAG_THREAD_SWITCH |
+  | thread switch payload   |
+  +-------------------------+
   | tag = BODY_TAG_ENTRY    |
   | entry payload           |
   +-------------------------+
@@ -181,7 +184,25 @@ body stream:
 
 `num_entries` must match the number of `BODY_TAG_ENTRY` records seen.
 
-### 4.1 BODY_TAG_ENTRY
+### 4.1 BODY_TAG_THREAD_SWITCH
+
+Thread switches are sparse records in the body stream. Normal basic
+block entries inherit the current thread ID until the next switch record,
+so traces do not pay a per-block thread field.
+
+```
++--------------------------------------------------+
+| tag = 2                         u8               |
+| thread_id_delta                 SLEB             |
+|   current_thread_id - previous_thread_id         |
++--------------------------------------------------+
+```
+
+`previous_thread_id` starts at 0. A decoder updates the current thread
+state when it sees this tag and associates that thread ID with following
+`BODY_TAG_ENTRY` records.
+
+### 4.2 BODY_TAG_ENTRY
 
 Each entry records one correct-path basic block and its optional
 wrong-path chain.
@@ -189,7 +210,7 @@ wrong-path chain.
 ```
 +--------------------------------------------------+
 | tag = 1                         u8               |
-| tid_delta                       SLEB             |
+| template_id_delta               SLEB             |
 |   current_template_id - previous_entry_template  |
 +--------------------------------------------------+
 | cp_delta_section                section          |
@@ -201,8 +222,10 @@ wrong-path chain.
 ```
 
 `previous_entry_template` starts at 0 and updates after each CP entry.
+The current thread/vCPU ID comes from the most recent
+`BODY_TAG_THREAD_SWITCH` record, or 0 if no switch record has appeared.
 
-### 4.2 Wrong-Path Chain Section
+### 4.3 Wrong-Path Chain Section
 
 The wrong-path chain is a list of speculative basic blocks following
 the CP block. Template IDs are delta-coded within the chain.
@@ -213,14 +236,14 @@ wp_chain_section payload:
   num_wp : ULEB
 
   repeat num_wp times:
-    wp_tid_delta     : SLEB
-    wp_delta_section : section
+    wp_template_id_delta : SLEB
+    wp_delta_section     : section
 ```
 
 Wrong-path field state is forked from the current correct-path state at
 the start of the chain and discarded at the end of the entry.
 
-### 4.3 Wrong-Path Events Section
+### 4.4 Wrong-Path Events Section
 
 Events identify wrong-path blocks that faulted or could not be
 translated.
@@ -303,7 +326,7 @@ Field IDs are one byte. Slotted families reserve 16 values each.
 | 0x21..0x30     | LOAD_DATA[0..15]     | load values, if MEM_DATA      |
 | 0x31..0x40     | STORE_DATA[0..15]    | store values, if MEM_DATA     |
 | 0x41..0x50     | SRC_REG[0..15]       | source register snapshots     |
-| 0x51..0x60     | DST_REG[0..15]       | destination register snaps    |
+| 0x51..0x60     | reserved             | destination-value extension    |
 | 0x61           | N_STORES             | current valid store slots     |
 | 0x70           | INSN_BYTES_LO        | low 8 bytes of instruction    |
 | 0x71           | INSN_BYTES_HI        | high 8 bytes of instruction   |
@@ -321,8 +344,10 @@ each numeric field ID.
 
 ### 5.2 Memory Counts and Addresses
 
-`N_LOADS` and `N_STORES` are ordinary sparse fields. Their template
-defaults are the template's `n_loads` and `n_stores` values.
+`N_LOADS` and `N_STORES` are ordinary sparse fields. Their baseline
+defaults are zero. The writer derives current values by counting QEMU
+memory callbacks for each instruction execution; opcode tables and
+Capstone operand flags do not define these counts.
 
 ```
 current n_loads = state(template, insn, CST_FID_N_LOADS)
@@ -355,19 +380,21 @@ their low accessed bytes before delta calculation.
 ### 5.4 Register Data
 
 When `CST_FLAG_REG_DATA` is set, register fields carry pre-execution
-snapshots for the template's source and destination register slots.
+snapshots for the template's source register slots only. Destination
+register identities remain in the template's `dst_regs` array, but
+destination values are not emitted because the capture point is before
+the instruction executes.
 
 ```
 template instruction:
 
   src_regs = [ REG_A, REG_B, ... ]
-  dst_regs = [ REG_C, ... ]
+  dst_regs = [ REG_C, ... ]    static destination identities only
 
 delta fields for this instruction:
 
   CST_FID_SRC_REG0  -> value of REG_A before execution
   CST_FID_SRC_REG1  -> value of REG_B before execution
-  CST_FID_DST_REG0  -> value of REG_C before execution
 ```
 
 Register IDs are one-byte `GenericRegId` values. The trace header's
@@ -449,8 +476,8 @@ template payload:
 |   n_dst           u8                             |
 |   src_regs        u8[n_src]                      |
 |   dst_regs        u8[n_dst]                      |
-|   n_loads         u8      default load count     |
-|   n_stores        u8      default store count    |
+|   n_loads         u8      zero; reserved default |
+|   n_stores        u8      zero; reserved default |
 |   immediate       SLEB    only if HAS_IMM        |
 |   insn_size       u8                             |
 |   insn_bytes      bytes[insn_size]               |

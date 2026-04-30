@@ -536,7 +536,7 @@ def classify_x86(m: str) -> Entry:
     if m in {"jmp", "ljmp"}:
         return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_JUMP")
     if m in {"call", "lcall"}:
-        return ent("GEN_OP_CALL", "BRANCH_DIRECT_CALL")
+        return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_JUMP")
     if m.startswith("ret") or m.startswith("iret"):
         return ent("GEN_OP_RET", "BRANCH_RETURN")
     if m in {"syscall", "sysenter", "sysexit", "int", "int1", "int3", "into", "vmcall", "vmmcall"}:
@@ -810,9 +810,9 @@ def classify_aarch64(m: str) -> Entry:
     if m in {"bc", "cbz", "cbnz", "tbz", "tbnz"}:
         return ent("GEN_OP_BRANCH", "BRANCH_COND_DIRECT")
     if m == "bl":
-        return ent("GEN_OP_CALL", "BRANCH_DIRECT_CALL")
+        return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_JUMP")
     if m.startswith("blr"):
-        return ent("GEN_OP_CALL", "BRANCH_INDIRECT_CALL")
+        return ent("GEN_OP_BRANCH", "BRANCH_INDIRECT_JUMP")
     if m in {"br", "braa", "braaz", "brab", "brabz"}:
         return ent("GEN_OP_BRANCH", "BRANCH_INDIRECT_JUMP")
     if m.startswith("ret") or m.startswith("eret"):
@@ -992,11 +992,11 @@ def classify_riscv(m: str) -> Entry:
     if m in {"beq", "bne", "blt", "bge", "bltu", "bgeu", "c_beqz", "c_bnez"}:
         return ent("GEN_OP_BRANCH", "BRANCH_COND_DIRECT")
     if m in {"jal", "c_jal"}:
-        return ent("GEN_OP_CALL", "BRANCH_DIRECT_CALL")
+        return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_JUMP")
     if m in {"c_j"}:
         return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_JUMP")
     if m in {"jalr", "c_jalr"}:
-        return ent("GEN_OP_CALL", "BRANCH_INDIRECT_CALL")
+        return ent("GEN_OP_BRANCH", "BRANCH_INDIRECT_JUMP")
     if m in {"c_jr"}:
         return ent("GEN_OP_BRANCH", "BRANCH_INDIRECT_JUMP")
     if m in {"ecall", "ebreak", "c_ebreak"}:
@@ -1008,7 +1008,7 @@ def classify_riscv(m: str) -> Entry:
     if m in {"wfi", "unimp", "c_unimp", "pause", "c_nop", "sinval_vma"} or m.startswith(("mop_", "cmop_")):
         return ent("GEN_OP_NOP")
     if m in {"call", "tail"}:
-        return ent("GEN_OP_CALL", "BRANCH_DIRECT_CALL")
+        return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_JUMP")
     if m in {"jump"}:
         return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_JUMP")
     if m in {"la", "la_tlsdesc", "la_tls_gd", "la_tls_ie", "lla", "lga", "pcrel_hi", "tlsdesc_hi", "tls_gd_hi", "tls_got_hi", "tls_ie_hi"}:
@@ -1047,7 +1047,7 @@ def classify_riscv(m: str) -> Entry:
         return ent("GEN_OP_NOP")
     if m.startswith("cm_"):
         if m.startswith("cm_jalt"):
-            return ent("GEN_OP_CALL", "BRANCH_INDIRECT_CALL")
+            return ent("GEN_OP_BRANCH", "BRANCH_INDIRECT_JUMP")
         if m.startswith("cm_jt"):
             return ent("GEN_OP_BRANCH", "BRANCH_INDIRECT_JUMP")
         if m.startswith("cm_push"):
@@ -1234,11 +1234,11 @@ def classify_mips(m: str) -> Entry:
     if m in {"jr", "jrc", "jic", "jr_hb", "jr16", "jrc16", "jrcaddiusp", "jraddiusp"}:
         return ent("GEN_OP_BRANCH", "BRANCH_INDIRECT_JUMP")
     if m in {"jal", "bal", "balc", "jalx", "jals"}:
-        return ent("GEN_OP_CALL", "BRANCH_DIRECT_CALL")
+        return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_JUMP")
     if m.startswith(("jalr", "jialc")):
-        return ent("GEN_OP_CALL", "BRANCH_INDIRECT_CALL")
+        return ent("GEN_OP_BRANCH", "BRANCH_INDIRECT_JUMP")
     if re.match(r"^b(g|l|eq|ne|lt|ge|gt|le|z|nz).*al", m) and m not in {"bal", "balc"}:
-        return ent("GEN_OP_CALL", "BRANCH_COND_DIRECT")
+        return ent("GEN_OP_BRANCH", "BRANCH_COND_DIRECT")
     if m.startswith(("bbit", "bposge", "bteqz", "btnez")):
         return ent("GEN_OP_BRANCH", "BRANCH_COND_DIRECT")
     if m.startswith(("beq", "bne", "bge", "bgt", "ble", "blt", "bc1", "bc2", "bnv", "bnz", "bz", "bovc", "bnvc")):
@@ -1382,7 +1382,7 @@ def classify_mips(m: str) -> Entry:
     if m.startswith(("seq", "sge", "sgt", "sle", "sne", "slt", "sltu", "slti", "sltiu")):
         return ent("GEN_OP_CMP")
     if m in {"balrsc"}:
-        return ent("GEN_OP_CALL", "BRANCH_DIRECT_CALL")
+        return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_JUMP")
     if m in {"brsc"}:
         return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_JUMP")
     if m.startswith(("bbeqzc", "bbnezc")):

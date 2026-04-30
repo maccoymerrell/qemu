@@ -83,8 +83,8 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     qemu_plugin_set_pc(wrong_target);
 
     /*
-     * v1.6: per-insn accumulator for the BB currently being built.
-     * Spec mode forces CF_SINGLE_STEP|1 at EXECUTION time, but the
+     * Per-insn accumulator for the BB currently being built.  Spec mode
+     * forces CF_SINGLE_STEP|1 at EXECUTION time, but the
      * template returned by find_template(pre_pc) may be a multi-insn
      * cached translation from CP (translated under different cflags).
      * Only insn[0] of that template actually executed.  We therefore

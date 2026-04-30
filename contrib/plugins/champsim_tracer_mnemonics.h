@@ -45,7 +45,7 @@ enum GenericOpcode {
     GEN_OP_CMP = 23,
     GEN_OP_TEST = 24,
     GEN_OP_BRANCH = 25,
-    GEN_OP_CALL = 26,
+    /* 26 reserved: call-shaped control flow is GEN_OP_BRANCH. */
     GEN_OP_RET = 27,
     GEN_OP_FP_ADD = 28,
     GEN_OP_FP_SUB = 29,
@@ -87,21 +87,21 @@ enum BranchType {
     BRANCH_NONE = 0,
     BRANCH_DIRECT_JUMP = 1,
     BRANCH_INDIRECT_JUMP = 2,
-    BRANCH_DIRECT_CALL = 3,
-    BRANCH_INDIRECT_CALL = 4,
-    BRANCH_RETURN = 5,
-    BRANCH_SYSCALL_TYPE = 6,
-    BRANCH_COND_DIRECT = 7,
+    BRANCH_RETURN = 3,
+    BRANCH_SYSCALL_TYPE = 4,
+    BRANCH_COND_DIRECT = 5,
     BRANCH_TYPE_COUNT,
 };
 
 /*
  * Sync event types.
- * SYNC_THREAD_SWITCH is emitted into the body stream when execution moves
- * to a different vCPU.  SYNC_ATOMIC is a template-level hint on instructions
- * that perform atomic/locked memory operations; the trace consumer uses the
- * memory addresses of those operations to build a conflict graph for
- * inter-thread scheduling.
+ * Sparse BODY_TAG_THREAD_SWITCH records identify execution movement between
+ * traced vCPUs.  SYNC_THREAD_SWITCH is retained as a named synchronization
+ * hint value for consumers that materialize such movements as instruction
+ * events.  SYNC_ATOMIC is a template-level hint on instructions that perform
+ * atomic/locked memory operations; the trace consumer uses the memory
+ * addresses of those operations to build a conflict graph for inter-thread
+ * scheduling.
  *
  * Synchronisation detection is based entirely on atomics — no syscall
  * interception is used.  Every userspace synchronisation primitive ultimately
@@ -109,7 +109,7 @@ enum BranchType {
  */
 typedef enum {
     SYNC_NONE            = 0,   /* no sync (default for InsnFields.sync_hint) */
-    SYNC_THREAD_SWITCH   = 4,   /* context switch: new cpu_index takes over */
+    SYNC_THREAD_SWITCH   = 4,   /* context switch marker */
     SYNC_ATOMIC          = 5,   /* atomic / locked memory operation */
 } SyncEventType;
 
@@ -125,7 +125,7 @@ typedef enum {
  *
  * Only flags whose semantics cannot be derived from Capstone detail
  * are retained.  Capstone now provides operand access (READ/WRITE),
- * implicit regs_read/regs_write, and group membership (CALL, RET,
+ * implicit regs_read/regs_write, and group membership (RET,
  * JUMP, BRANCH_REL, INT) for all ISAs, so most of the original
  * per-instruction flag bits are no longer needed.
  */
@@ -246,8 +246,8 @@ typedef struct InsnFields {
     bool    has_immediate;
     int64_t immediate;
     uint8_t sync_hint;              /* SyncEventType */
-    uint8_t n_loads;                /* Observed max loads per execution  */
-    uint8_t n_stores;               /* Observed max stores per execution */
+    uint8_t n_loads;                /* Template default; runtime uses QEMU mem callbacks */
+    uint8_t n_stores;               /* Template default; runtime uses QEMU mem callbacks */
 } InsnFields;
 
 
@@ -255,7 +255,7 @@ typedef struct InsnFields {
  * Optional post-classification refiner.
  *
  * Some Capstone insn_ids cover several distinct semantics that only
- * differ in operand encoding (e.g. RISC-V JALR is "indirect call",
+ * differ in operand encoding (e.g. RISC-V JALR is "indirect branch",
  * "indirect jump", or "ret" depending on rd/rs1).  A row may set
  * .refine to a function that fixes up the decoded InsnFields after
  * the generic operand-walk has populated src_regs/dst_regs/etc.

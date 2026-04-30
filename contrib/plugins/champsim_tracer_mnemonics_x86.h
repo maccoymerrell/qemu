@@ -271,96 +271,49 @@ static const RegClassification x86_reg_class[X86_REG_ENDING] = {
 };
 
 /*
- * Implicit stack memops on x86_64.
- *
- * Capstone exposes the destination/source register operand of
- * push/pop/call/ret as the syntactic operand but does NOT emit an
- * OP_MEM for the implicit (rsp) stack access.  At runtime QEMU's
- * vcpu_mem_cb still fires for that stack store/load, so the static
- * schema (n_loads/n_stores) and the runtime dyn_param multiset
- * disagree by one per insn.  These refiners patch the static count
- * to match architectural reality.
- *
- *   push family (push, pushf/pushfq, call): 1 implicit stack store
- *   pop  family (pop,  leave, ret):         1 implicit stack load
- *
- * INT/SYSCALL/SYSENTER are intentionally excluded — Linux x86_64
- * uses sysret-style register-save (rcx, r11), not the stack.
+ * Memory counts are runtime fields derived from QEMU memory callbacks,
+ * not from opcode semantics.  These helpers are retained only so table
+ * entries that reference them remain valid no-ops.
  */
 static void refine_x86_implicit_stack_store(
     const struct qemu_plugin_insn_info *info, InsnFields *f)
 {
     (void)info;
-    if (f->n_stores < 0xFF) f->n_stores++;
+    (void)f;
+}
+
+static void refine_x86_call_branch(
+    const struct qemu_plugin_insn_info *info, InsnFields *f)
+{
+    if (info && info->n_operands > 0 &&
+        info->operands[0].type != QEMU_PLUGIN_OP_IMM) {
+        f->branch_type = BRANCH_INDIRECT_JUMP;
+    }
+    f->branch_conditional = false;
+}
+
+static void refine_x86_jump_branch(
+    const struct qemu_plugin_insn_info *info, InsnFields *f)
+{
+    if (info && info->n_operands > 0 &&
+        info->operands[0].type != QEMU_PLUGIN_OP_IMM) {
+        f->branch_type = BRANCH_INDIRECT_JUMP;
+    }
+    f->branch_conditional = false;
 }
 
 static void refine_x86_implicit_stack_load(
     const struct qemu_plugin_insn_info *info, InsnFields *f)
 {
     (void)info;
-    if (f->n_loads < 0xFF) f->n_loads++;
+    (void)f;
 }
 
-/*
- * Capstone (≤ v5.0) reports incorrect operand-access flags for the
- * memory operand of a few SSE move-to-memory mnemonics: MOVQ
- * (66 0F D6) and MOVUPS (0F 11) tag the destination memory operand
- * as CS_AC_READ instead of CS_AC_WRITE.  Without a fix-up the static
- * schema thinks these stores are loads, runtime emits a real STORE
- * dyn_param, and the consumer mis-classifies it.
- *
- * The refiner overrides n_loads/n_stores by inspecting operand
- * positions (Intel syntax: op[0] = destination).  Counts at most one
- * OP_MEM in either direction, which matches every form of these
- * mnemonics.
- */
-/*
- * Capstone (≤ v5.0) reports incorrect operand-access flags for the
- * memory operand of a few SSE move-to-memory mnemonics: MOVQ
- * (66 0F D6) and MOVUPS (0F 11) tag the destination memory operand
- * as CS_AC_READ instead of CS_AC_WRITE.  Without a fix-up the static
- * schema thinks these stores are loads, runtime emits a real STORE
- * dyn_param, and the consumer mis-classifies it.
- *
- * The fix uses the access flag of the *register* operand (which is
- * reliable in all observed Capstone versions) to decide direction:
- *   reg has READ  -> reg is the source -> mem is the destination = STORE
- *   reg has WRITE -> reg is the destination -> mem is the source  = LOAD
- *
- * Counts at most one OP_MEM in either direction, which matches every
- * form of these mnemonics (no reg/reg form contains an OP_MEM, so
- * the loop simply leaves n_loads = n_stores = 0).
- */
 static void refine_x86_sse_mov_access(
     const struct qemu_plugin_insn_info *info, InsnFields *f)
 {
-    f->n_loads = 0;
-    f->n_stores = 0;
-
-    bool has_mem = false;
-    bool reg_is_src = false;
-    bool reg_is_dst = false;
-    for (uint8_t i = 0; i < info->n_operands; i++) {
-        const qemu_plugin_operand *op = &info->operands[i];
-        if (op->type == QEMU_PLUGIN_OP_MEM) {
-            has_mem = true;
-        } else if (op->type == QEMU_PLUGIN_OP_REG) {
-            if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
-                reg_is_src = true;
-            }
-            if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
-                reg_is_dst = true;
-            }
-        }
-    }
-    if (!has_mem) {
-        return;
-    }
-    if (reg_is_dst && !reg_is_src) {
-        f->n_loads = 1;
-    } else if (reg_is_src && !reg_is_dst) {
-        f->n_stores = 1;
-    }
+    (void)info;
+    (void)f;
 }
 
 static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
@@ -427,8 +380,8 @@ static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
     [X86_INS_BTR]                         = { GEN_OP_TEST,   BRANCH_NONE,           MF_NONE },
     [X86_INS_BTS]                         = { GEN_OP_TEST,   BRANCH_NONE,           MF_NONE },
     [X86_INS_BZHI]                        = { GEN_OP_AND,    BRANCH_NONE,           MF_NONE },
-    [X86_INS_CALL]                        = { GEN_OP_CALL,   BRANCH_DIRECT_CALL,    MF_NONE,
-                                        .refine = refine_x86_implicit_stack_store },
+    [X86_INS_CALL]                        = { GEN_OP_BRANCH,   BRANCH_DIRECT_JUMP,    MF_NONE,
+                                        .refine = refine_x86_call_branch },
     [X86_INS_CBW]                         = { GEN_OP_MOVSX,  BRANCH_NONE,           MF_NONE },
     [X86_INS_CDQ]                         = { GEN_OP_MOVSX,  BRANCH_NONE,           MF_NONE },
     [X86_INS_CDQE]                        = { GEN_OP_MOVSX,  BRANCH_NONE,           MF_NONE },
@@ -536,9 +489,10 @@ static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
     [X86_INS_EXTRACTPS]                   = { GEN_OP_VEC_SHUF, BRANCH_NONE,           MF_NONE },
     [X86_INS_EXTRQ]                       = { GEN_OP_VEC_SHUF, BRANCH_NONE,           MF_NONE },
     [X86_INS_F2XM1]                       = { GEN_OP_FP_MOV, BRANCH_NONE,           MF_NONE },
-    [X86_INS_LCALL]                       = { GEN_OP_CALL,   BRANCH_DIRECT_CALL,    MF_NONE },
+    [X86_INS_LCALL]                       = { GEN_OP_BRANCH,   BRANCH_DIRECT_JUMP,    MF_NONE },
     [X86_INS_LJMP]                        = { GEN_OP_BRANCH, BRANCH_DIRECT_JUMP,    MF_NONE },
-    [X86_INS_JMP]                         = { GEN_OP_BRANCH, BRANCH_DIRECT_JUMP,    MF_NONE },
+    [X86_INS_JMP]                         = { GEN_OP_BRANCH, BRANCH_DIRECT_JUMP,    MF_NONE,
+                                        .refine = refine_x86_jump_branch },
     [X86_INS_FBLD]                        = { GEN_OP_FP_CVT, BRANCH_NONE,           MF_NONE },
     [X86_INS_FBSTP]                       = { GEN_OP_FP_CVT, BRANCH_NONE,           MF_NONE },
     [X86_INS_FCOMPP]                      = { GEN_OP_FP_CMP, BRANCH_NONE,           MF_NONE },

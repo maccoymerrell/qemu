@@ -53,7 +53,6 @@ bool enable_reg_data = false;
 
 static GHashTable *cpu_to_thread_id;
 static uint32_t next_thread_id = 0;
-static uint32_t last_active_thread = UINT32_MAX;
 
 static uint32_t get_or_assign_thread_id(unsigned int cpu_index)
 {
@@ -336,11 +335,10 @@ static __thread GArray *cp_mem_accesses = NULL;
 
 /*
  * Pending register snapshots produced by the per-insn reg-snap
- * callback for the currently-executing BB.  Each insn append its src
- * snaps then its dst snaps, in InsnFields.src_regs[]/dst_regs[]
- * order.  The buffer is drained into BodyEntry.reg_snaps at
- * BB-finalize time, and discarded on flush.  Active only when
- * enable_reg_data is true.
+ * callback for the currently-executing BB.  Each insn appends its src
+ * snaps in InsnFields.src_regs[] order.  The buffer is drained into
+ * BodyEntry.reg_snaps at BB-finalize time, and discarded on flush.
+ * Active only when enable_reg_data is true.
  */
 static __thread GArray *pending_reg_snaps = NULL;
 
@@ -466,8 +464,8 @@ static BBTemplate *find_bb_template(uint64_t entry_pc)
 }
 
 /*
- * v1.6: commit a TRUE basic block by start_pc.  See header for
- * semantics.  Caller must hold data_lock.
+ * Commit a TRUE basic block by start_pc.  See header for semantics.
+ * Caller must hold data_lock.
  */
 BBTemplate *commit_true_bb(uint64_t start_pc,
                            uint32_t n_insns,
@@ -535,8 +533,8 @@ BBTemplate *commit_true_bb(uint64_t start_pc,
 }
 
 /*
- * v1.6: look up or create a chain by ordered bb_id sequence.
- * Returns NULL when n_bbs < 2.  Caller holds data_lock.
+ * Look up or create a chain by ordered bb_id sequence.  Returns NULL
+ * when n_bbs < 2.  Caller holds data_lock.
  *
  * Keyed by an internal string-encoded form of the bb_id tuple.
  * GHashTable owns the key (g_free) and value (chain_template_free).
@@ -585,9 +583,9 @@ static GArray *cp_chain_fragments;
  *
  * Caller is responsible for ensuring the fragment sequence forms a
  * true BB (start at a branch target, end at a branch instruction).
- * v1.6 enforces BB-immutability via commit_true_bb(): a recommit at
- * the same start_pc with a different insn_pcs[] sequence emits a
- * one-time warning and returns the original BB.
+ * BB immutability is enforced via commit_true_bb(): a recommit at the
+ * same start_pc with a different insn_pcs[] sequence emits a one-time
+ * warning and returns the original BB.
  */
 BBTemplate *get_or_create_bb_template(uint64_t entry_pc,
                                       BBTemplate * const *fragments,
@@ -805,10 +803,10 @@ static void read_reg_into_snap(unsigned int cpu_index,
 }
 
 /*
- * Per-insn callback: snapshot every src and dst register (in
- * InsnFields ordering) into pending_reg_snaps.  udata encodes
- * (BBTemplate*, insn_index_in_template).  The buffer is drained
- * into BodyEntry.reg_snaps when the BB finalizes.
+ * Per-insn callback: snapshot source registers before execution, in
+ * InsnFields.src_regs[] order.  Destination register identities remain
+ * in the template, but destination values are not emitted because this
+ * callback fires before the instruction executes.
  */
 typedef struct {
     BBTemplate *tb_tmpl;
@@ -838,11 +836,6 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         RegSnap s;
         read_reg_into_snap(cpu_index, names->src[i], &s);
-        g_array_append_val(pending_reg_snaps, s);
-    }
-    for (uint8_t i = 0; i < f->n_dst_regs; i++) {
-        RegSnap s;
-        read_reg_into_snap(cpu_index, names->dst[i], &s);
         g_array_append_val(pending_reg_snaps, s);
     }
 }
@@ -954,11 +947,6 @@ void wp_capture_insn_snaps(const WideRegSnap *wide,
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         RegSnap s;
         wide_reg_snap_lookup(wide, names->src[i], &s);
-        g_array_append_val(out_snaps, s);
-    }
-    for (uint8_t i = 0; i < f->n_dst_regs; i++) {
-        RegSnap s;
-        wide_reg_snap_lookup(wide, names->dst[i], &s);
         g_array_append_val(out_snaps, s);
     }
 }
@@ -1128,7 +1116,6 @@ static void start_trace_segment(const char *label,
     }
 
     current_segment = trace_segment_new(label, start, stop);
-    current_segment->thread_id = 0;
     current_segment->body_seq_num = 0;
 
     {
@@ -1144,7 +1131,6 @@ static void start_trace_segment(const char *label,
         g_hash_table_remove_all(cpu_to_thread_id);
     }
     next_thread_id = 0;
-    last_active_thread = UINT32_MAX;
 
     g_autofree char *bin_path = NULL;
     if (output_base_path) {
@@ -1178,8 +1164,7 @@ static void start_trace_segment(const char *label,
             current_segment->writer =
                 writer_start(current_segment->bin_file, true);
             current_segment->bin_stream = body_stream_new(
-                current_segment->writer, 0,
-                current_segment->start_datetime);
+                current_segment->writer, current_segment->start_datetime);
             if (!current_segment->bin_stream) {
                 fprintf(stderr,
                         "champsim_tracer: cannot initialize binary stream\n");
@@ -1194,8 +1179,7 @@ static void start_trace_segment(const char *label,
             current_segment->writer =
                 writer_start(current_segment->bin_file, false);
             current_segment->bin_stream = body_stream_new(
-                current_segment->writer, 0,
-                current_segment->start_datetime);
+                current_segment->writer, current_segment->start_datetime);
             if (!current_segment->bin_stream) {
                 fprintf(stderr, "champsim_tracer: cannot initialize binary stream\n");
             }
@@ -1496,7 +1480,6 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
             ? &prev_tb_tmpl->insn_fields[br_idx] : NULL;
         bool is_indirect = bf && (
             bf->branch_type == BRANCH_INDIRECT_JUMP ||
-            bf->branch_type == BRANCH_INDIRECT_CALL ||
             bf->branch_type == BRANCH_RETURN);
         bool direct_cond = bf && (
             (bf->branch_type == BRANCH_COND_DIRECT) ||
@@ -1580,6 +1563,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         entry.reg_snaps = NULL;
         entry.wp_entries = NULL;
         entry.tmpl = bb_tmpl;
+        entry.thread_id = cpu_to_thread_id
+            ? get_or_assign_thread_id(cpu_index) : cpu_index;
 
         drain_cp_mem_into_dyn_params(entry.dyn_params, bb_tmpl);
         if (enable_reg_data && pending_reg_snaps) {
@@ -1599,13 +1584,6 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         }
 
         BodyStreamState *out_stream = seg->bin_stream;
-
-        if (cpu_to_thread_id) {
-            uint32_t cur_tid = get_or_assign_thread_id(cpu_index);
-            if (cur_tid != last_active_thread) {
-                last_active_thread = cur_tid;
-            }
-        }
 
         if (out_stream) {
             body_stream_write_entry(out_stream, &entry);

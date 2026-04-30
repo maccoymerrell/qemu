@@ -188,7 +188,7 @@ def _load_base(isa: str) -> list[str]:
     if isa == "aarch64":
         return ["  adrp x20, arena", "  add x20, x20, :lo12:arena"]
     if isa == "riscv64":
-        return ["  la t6, arena"]
+        return ["  lla t6, arena"]
     if isa.startswith("mips"):
         return ["  lui $t8, %hi(arena)", "  addiu $t8, $t8, %lo(arena)"]
     raise ValueError(f"unsupported ISA: {isa}")
@@ -203,7 +203,14 @@ def _load_slot(isa: str, slot: int, reg: str, aux: str | None = None) -> list[st
     if isa == "riscv64":
         if -2048 <= off <= 2047:
             return [f"  ld {reg}, {off}(t6)"]
-        return [f"  li t5, {off}", "  add t5, t6, t5", f"  ld {reg}, 0(t5)"]
+        return [
+            f"  li t5, {off}",
+            "  .option push",
+            "  .option norvc",
+            "  add t5, t6, t5",
+            "  .option pop",
+            f"  ld {reg}, 0(t5)",
+        ]
     if isa.startswith("mips"):
         hi = aux or "$t7"
         return [f"  lw {reg}, {off}($t8)", f"  lw {hi}, {off + 4}($t8)"]
@@ -219,7 +226,14 @@ def _store_slot(isa: str, slot: int, reg: str) -> list[str]:
     if isa == "riscv64":
         if -2048 <= off <= 2047:
             return [f"  sd {reg}, {off}(t6)"]
-        return [f"  li t5, {off}", "  add t5, t6, t5", f"  sd {reg}, 0(t5)"]
+        return [
+            f"  li t5, {off}",
+            "  .option push",
+            "  .option norvc",
+            "  add t5, t6, t5",
+            "  .option pop",
+            f"  sd {reg}, 0(t5)",
+        ]
     if isa.startswith("mips"):
         return [f"  sw {reg}, {off}($t8)", f"  sw $zero, {off + 4}($t8)"]
     raise ValueError(f"unsupported ISA: {isa}")
@@ -517,7 +531,7 @@ class LoopHead(CodeBlock):
 
     @classmethod
     def plan(cls, ctx: EmitCtx) -> BlockPlan:
-        counter = max(1, int(ctx.loop_iterations))
+        counter = max(1, int(ctx.loop_iterations)) + 1
         slot = ctx.scratch_slots[0]
         return BlockPlan(
             block_id=ctx.block_id,
@@ -547,7 +561,8 @@ class LoopHead(CodeBlock):
             lines += _branch_zero_to(ctx.isa, "x9", exit_target)
         elif ctx.isa == "riscv64":
             lines += _load_slot(ctx.isa, slot, "t0")
-            lines += ["  snez t1, t0", "  sub t0, t0, t1"]
+            lines += ["  sltiu t1, t0, 1", "  xori t1, t1, 1",
+                      "  sub t0, t0, t1"]
             lines += _store_slot(ctx.isa, slot, "t0")
             lines += _branch_zero_to(ctx.isa, "t0", exit_target)
         else:
@@ -634,7 +649,7 @@ class LoopExit(CodeBlock):
             lines += _store_slot(ctx.isa, s1, "%r8")
         elif ctx.isa == "aarch64":
             lines += _load_slot(ctx.isa, s0, "x9")
-            lines += ["  eor x9, x9, #0x33"]
+            lines += ["  mov x10, #0x33", "  eor x9, x9, x10"]
             lines += _store_slot(ctx.isa, s1, "x9")
         elif ctx.isa == "riscv64":
             lines += _load_slot(ctx.isa, s0, "t0")
@@ -693,8 +708,8 @@ class DirectCall(CodeBlock):
             block_id=ctx.block_id,
             name=cls.name,
             memops=[],
-            asserted_branch_types=["BRANCH_DIRECT_CALL"],
-            asserted_opcodes=["CALL"],
+            asserted_branch_types=["BRANCH_DIRECT_JUMP"],
+            asserted_opcodes=["BRANCH"],
         )
 
     @classmethod
@@ -734,8 +749,8 @@ class IndirectCall(CodeBlock):
             block_id=ctx.block_id,
             name=cls.name,
             memops=[],
-            asserted_branch_types=["BRANCH_INDIRECT_CALL"],
-            asserted_opcodes=["CALL"],
+            asserted_branch_types=["BRANCH_INDIRECT_JUMP"],
+            asserted_opcodes=["BRANCH"],
         )
 
     @classmethod
@@ -811,6 +826,114 @@ class IndirectJump(CodeBlock):
                 "  jr $t9",
                 "  nop",
             ]
+        return "\n".join(lines) + "\n"
+
+
+@register
+class RegIdSweep(CodeBlock):
+    name = "regid_sweep"
+    scratch_slots = 0
+    randomizable = False
+    coverage_probe = True
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        return BlockPlan(block_id=ctx.block_id, name=cls.name, memops=[])
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        lines = _prologue(ctx.block_id)
+        if ctx.isa == "x86_64":
+            gprs = [
+                "%rax", "%rcx", "%rdx", "%rbx", "%rsi", "%rdi",
+                "%r8", "%r9", "%r10", "%r11", "%r12", "%r13",
+                "%r14", "%r15",
+            ]
+            for reg in gprs:
+                lines.append(f"  mov {reg}, {reg}")
+            lines += [
+                "  mov %rsp, %rax",
+                "  mov %rbp, %rax",
+                "  leaq 0(%rip), %rax",
+                "  cmp %rax, %rax",
+                "  mov %cs, %ax",
+                "  mov %ds, %ax",
+                "  mov %es, %ax",
+                "  mov %ss, %ax",
+                "  mov %fs, %ax",
+                "  mov %gs, %ax",
+            ]
+            for i in range(16):
+                lines.append(f"  pxor %xmm{i}, %xmm{i}")
+            lines += [
+                "  fldz", "  fld1", "  fldpi", "  fldln2",
+                "  fldl2e", "  fldl2t", "  fldlg2", "  fldz",
+                "  fxch %st(7)", "  fxch %st(6)", "  fxch %st(5)",
+                "  fxch %st(4)", "  fxch %st(3)", "  fxch %st(2)",
+                "  fxch %st(1)", "  fstp %st(0)", "  fstp %st(0)",
+                "  fstp %st(0)", "  fstp %st(0)", "  fstp %st(0)",
+                "  fstp %st(0)", "  fstp %st(0)", "  fstp %st(0)",
+            ]
+        elif ctx.isa == "aarch64":
+            for i in range(29):
+                lines.append(f"  mov x{i}, x{i}")
+            lines += [
+                "  mov x0, x29",
+                "  mov x0, x30",
+                "  mov w0, w29",
+                "  mov w0, w30",
+                "  mov x0, sp",
+                "  mov x0, xzr",
+                "  cmp x0, x0",
+            ]
+            for i in range(32):
+                lines.append(f"  orr v{i}.16b, v{i}.16b, v{i}.16b")
+            lines += [
+                "  mrs x0, fpcr",
+                "  mrs x1, fpsr",
+            ]
+        elif ctx.isa == "riscv64":
+            regs = [
+                "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
+                "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5",
+                "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7",
+                "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6",
+            ]
+            for reg in regs:
+                lines.append(f"  addi {reg}, {reg}, 0")
+            for i in range(32):
+                lines.append(f"  fsgnj.d f{i}, f{i}, f{i}")
+            lines += [
+                "  frcsr t0",
+                "  fscsr t0, t0",
+                "  .option push",
+                "  .option arch, +v",
+                "  vsetvli t0, zero, e64, m1, ta, ma",
+            ]
+            for i in range(32):
+                lines.append(f"  vmv.v.v v{i}, v{i}")
+            lines.append("  .option pop")
+        else:
+            lines += ["  .set push", "  .set noat"]
+            regs = [
+                "$zero", "$1", "$v0", "$v1", "$a0", "$a1", "$a2",
+                "$a3", "$t0", "$t1", "$t2", "$t3", "$t4", "$t5",
+                "$t6", "$t7", "$s0", "$s1", "$s2", "$s3", "$s4",
+                "$s5", "$s6", "$s7", "$t8", "$t9", "$k0", "$k1",
+                "$gp", "$sp", "$fp", "$ra",
+            ]
+            for reg in regs:
+                lines.append(f"  addu {reg}, {reg}, $zero")
+            lines += ["  .set fp=32", "  .set oddspreg"]
+            for i in range(32):
+                lines.append(f"  mov.s $f{i}, $f{i}")
+            lines += [
+                "  cfc1 $t0, $31",
+                "  mfhi $t0",
+                "  mflo $t1",
+                "  .set pop",
+            ]
+        lines += _jump(ctx.isa, ctx.successor_labels[0])
         return "\n".join(lines) + "\n"
 
 

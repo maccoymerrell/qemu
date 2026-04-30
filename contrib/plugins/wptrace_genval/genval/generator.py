@@ -249,7 +249,7 @@ class _SimState:
 
 def _initial_state(cfg: CFG) -> _SimState:
     return _SimState({
-        n.block_id: n.loop_iterations
+        n.block_id: n.loop_iterations + 1
         for n in cfg.nodes if n.cls_name == B.LoopHead.name
     })
 
@@ -260,10 +260,12 @@ def _branch_step(n: Node, state: _SimState) -> tuple[int, int, _SimState]:
         cp_idx = 0 if n.branch_outcome else 1
         return cp_idx, 1 - cp_idx, post
     if n.cls_name == B.LoopHead.name:
-        remaining = post.loop_remaining.get(n.block_id, n.loop_iterations)
-        if remaining > 0:
+        remaining = post.loop_remaining.get(n.block_id, n.loop_iterations + 1)
+        if remaining > 1:
             post.loop_remaining[n.block_id] = remaining - 1
             return 0, 1, post
+        if remaining > 0:
+            post.loop_remaining[n.block_id] = remaining - 1
         return 1, 0, post
     raise RuntimeError(f"branch step requested for non-branch block {n.cls_name}")
 

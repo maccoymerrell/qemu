@@ -53,20 +53,19 @@ extern "C" {
  * is forked from CP at chain start and discarded at chain end so
  * speculative effects never leak forward.
  *
- * v1.6 changed the basic-block model to track TRUE basic blocks
- * (start_pc → first branch, immutable, unique by start_pc) and added
- * an optional chain table for shorthand encoding of frequently-seen
- * BB sequences on the wrong path.
- *
- * v1.7 uses the template's per-insn memop counts as the slot schema.
+ * Templates track true basic blocks (start_pc to first branch,
+ * immutable, unique by start_pc).  Memory-operation counts are runtime
+ * sparse fields populated from QEMU memory callbacks; template count
+ * defaults are zero.
  */
 #define CST_MAGIC          0x17545343u
 #define CST_TRAILER_MAGIC  0x17545343FFFFFFFFull
 #define CST_TRAILER_SIZE   64
 
 /* Body entry tags (1 byte) */
-#define BODY_TAG_END      0
-#define BODY_TAG_ENTRY    1
+#define BODY_TAG_END             0
+#define BODY_TAG_ENTRY           1
+#define BODY_TAG_THREAD_SWITCH   2
 
 /* Per-insn template flags byte */
 #define CST_INSN_FLAG_BRANCH_COND   (1u << 0)
@@ -79,7 +78,7 @@ extern "C" {
 #define CST_WP_EVENT_TRANSLATION_UNAVAIL (1u << 0)
 #define CST_WP_EVENT_FAULT               (1u << 1)
 
-/* WP-invocation envelope flags byte (v1.6) */
+/* WP-invocation envelope flags byte */
 #define CST_WP_INV_CHAIN_REF      (1u << 0)
 /* bits 1..7 reserved */
 
@@ -92,7 +91,7 @@ extern "C" {
  * Sparse instruction metadata records are always allowed and do not
  * need a feature bit. */
 #define CST_FLAG_MEM_DATA      (1 << 0)  /* CST_FID_LOAD_DATA / STORE_DATA */
-#define CST_FLAG_REG_DATA      (1 << 1)  /* CST_FID_SRC_REG / DST_REG     */
+#define CST_FLAG_REG_DATA      (1 << 1)  /* CST_FID_SRC_REG values        */
 #define CST_FLAG_RESERVED_2    (1 << 2)
 /* bits 3..7 reserved */
 
@@ -116,7 +115,7 @@ extern "C" {
 #define CST_FID_LOAD_DATA_BASE   0x21  /* gated by CST_FLAG_MEM_DATA  */
 #define CST_FID_STORE_DATA_BASE  0x31
 #define CST_FID_SRC_REG_BASE     0x41  /* gated by CST_FLAG_REG_DATA  */
-#define CST_FID_DST_REG_BASE     0x51
+/* 0x51..0x60 reserved for post-exec destination register values. */
 #define CST_FID_N_STORES        0x61  /* current valid store slots */
 /* 0x62..0x6F reserved for future slotted memop metadata             */
 
@@ -152,10 +151,10 @@ typedef struct {
 /*
  * Per-insn parallel name table for InsnFields.src_regs[] and
  * InsnFields.dst_regs[].  Populated by the decoder only when
- * enable_reg_data is true at translation time; consumed by the
- * per-insn reg-snap callback to look up QEMU register handles via
- * lookup_reg_handle().  Empty string means no Capstone runtime name
- * is associated with that slot (→ emitted as a zero snap).
+ * enable_reg_data is true at translation time.  The current dynamic
+ * reg-data path consumes source names only; destination names are kept
+ * alongside template destination identities for future post-exec value
+ * capture.  Empty source names emit zero snaps.
  */
 typedef struct {
     char src[MAX_SRC_REGS][16];
@@ -206,7 +205,7 @@ enum DynParamType {
  * are writer-internal bookkeeping used to:
  *  - group memops by owning instruction (insn_index),
  *  - split each instruction's memops into loads-then-stores (type),
- *  - update the template's observed-max (n_loads, n_stores),
+ *  - update the per-entry observed counts (N_LOADS, N_STORES),
  *  - emit mem-data section values.
  *
  * The owning instruction and load/store type are *implicit* on disk —
@@ -239,9 +238,8 @@ typedef struct {
     uint32_t fault_insn_index;
     BBTemplate *tmpl;  /* Non-owning; for per-insn schema access */
     /* RegSnap array, ordered: for each insn in this BB, n_src snaps
-     * then n_dst snaps.  Captured pre-insn via
-     * a per-fragment wide regfile dump (see wp_capture_insn_snaps).
-     * NULL when reg-data is disabled. */
+    * snaps only.  Captured pre-insn via a per-fragment wide regfile
+    * dump (see wp_capture_insn_snaps).  NULL when reg-data is disabled. */
     GArray *reg_snaps;
 } WPBBEntry;
 
@@ -250,11 +248,12 @@ typedef struct {
     uint32_t template_id;
     GArray *dyn_params;
     /* RegSnap array, ordered: for each insn in the template, n_src
-     * snaps then n_dst snaps.  Only populated when enable_reg_data
-     * is true; emitted in the §5.2 reg-data section. */
+     * snaps only.  Only populated when enable_reg_data is true; emitted
+     * in the register-data section. */
     GArray *reg_snaps;
     GArray *wp_entries;
     BBTemplate *tmpl;  /* Non-owning; for per-insn schema access */
+    uint32_t thread_id;
 } BodyEntry;
 
 typedef struct {
@@ -304,7 +303,6 @@ typedef struct {
     bool bin_file_is_pipe;   /* true if opened with popen() */
     WriterCtx *writer;       /* async writer thread feeding bin_file */
     BodyStreamState *bin_stream;
-    uint32_t thread_id;
     uint32_t body_seq_num;
     char start_datetime[64];
 } TraceSegment;
@@ -399,8 +397,8 @@ BBTemplate *get_or_create_bb_template(uint64_t entry_pc,
 int template_branch_index(const BBTemplate *tmpl);
 
 /*
- * v1.6: commit a TRUE basic block by start_pc.  The BB is identified
- * by start_pc; if an entry exists in bb_map at start_pc with the same
+ * Commit a TRUE basic block by start_pc.  The BB is identified by
+ * start_pc; if an entry exists in bb_map at start_pc with the same
  * insn_pcs[] sequence, return it.  If start_pc is new, build a new
  * BBTemplate by copying the provided per-insn metadata.  If start_pc
  * exists with a different insn_pcs[] (impossible without
@@ -422,8 +420,8 @@ BBTemplate *commit_true_bb(uint64_t start_pc,
                            uint64_t fall_through_pc);
 
 /*
- * v1.6: look up or create a chain template for a given ordered list
- * of bb_ids.  Returns NULL if n_bbs < 2 (no shorthand benefit).
+ * Look up or create a chain template for a given ordered list of bb_ids.
+ * Returns NULL if n_bbs < 2 (no shorthand benefit).
  * Caller must hold data_lock.
  */
 ChainTemplate *commit_chain(const uint32_t *bb_ids, uint32_t n_bbs);
@@ -453,10 +451,9 @@ WideRegSnap *wide_reg_snap_capture(unsigned int cpu_index);
 void         wide_reg_snap_free(WideRegSnap *w);
 
 /*
- * Append per-insn (n_src + n_dst) RegSnap records sourced from a
- * wide snapshot to @out_snaps, using @tmpl->insn_reg_names[insn_idx]
- * as the lookup keys.  Missing names yield zero snaps.  No-op when
- * reg-data is disabled.
+ * Append per-insn source RegSnap records sourced from a wide snapshot to
+ * @out_snaps, using @tmpl->insn_reg_names[insn_idx].src as the lookup
+ * keys.  Missing names yield zero snaps.  No-op when reg-data is disabled.
  */
 void wp_capture_insn_snaps(const WideRegSnap *wide,
                            const BBTemplate *tmpl,
@@ -470,8 +467,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                                 unsigned int cpu_index);
 
 /* Defined in champsim_tracer_output.cc */
-BodyStreamState *body_stream_new(WriterCtx *w, uint32_t thread_id,
-                                 const char *seg_datetime);
+BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime);
 void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry);
 void body_stream_finish(BodyStreamState *st);
 

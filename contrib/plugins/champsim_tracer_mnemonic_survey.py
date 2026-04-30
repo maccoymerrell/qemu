@@ -386,7 +386,7 @@ def _classify_x86(insn_id, mnem, id_to_class, id_to_name):
     if m == 'jmp':
         return ('GEN_OP_BRANCH', 'BRANCH_DIRECT_JUMP', 'MF_NONE')
     if m.startswith('call'):
-        return ('GEN_OP_CALL', 'BRANCH_DIRECT_CALL', 'MF_NONE')
+        return ('GEN_OP_BRANCH', 'BRANCH_DIRECT_JUMP', 'MF_NONE')
     if m.startswith('ret'):
         return ('GEN_OP_RET', 'BRANCH_RETURN', 'MF_NONE')
     if m.startswith('loop'):
@@ -534,7 +534,7 @@ _GEN_OP_CATEGORY = {
     'GEN_OP_XCHG': 'data_mov',
     'GEN_OP_TEST': 'cmp', 'GEN_OP_CMP': 'cmp',
     'GEN_OP_CMOV': 'cond', 'GEN_OP_SETCC': 'cond',
-    'GEN_OP_BRANCH': 'ctrl', 'GEN_OP_CALL': 'ctrl',
+    'GEN_OP_BRANCH': 'ctrl',
     'GEN_OP_RET': 'ctrl', 'GEN_OP_NOP': 'misc',
     'GEN_OP_SYSCALL': 'misc', 'GEN_OP_FENCE': 'misc',
     'GEN_OP_FP_ADD': 'fp', 'GEN_OP_FP_SUB': 'fp',

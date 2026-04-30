@@ -102,7 +102,7 @@ class BlockPlan:
     terminal: bool = False
     # Asserted branch-type classifications we expect to observe somewhere
     # in the disassembled instructions for this block instance.  Each
-    # entry is a BranchType name (e.g. "BRANCH_DIRECT_CALL").  Used by
+    # entry is a BranchType name (e.g. "BRANCH_DIRECT_JUMP").  Used by
     # the validator to verify coverage of uncommon branch kinds.
     asserted_branch_types: list[str] = dataclasses.field(default_factory=list)
     # Asserted generic-opcode classifications: same idea, but for
@@ -1644,7 +1644,7 @@ def _xchg_pair(rng, slots):
 # Each of these introduces one or more uncommon branch-type instructions
 # INSIDE a straight-line block (num_successors=1).  From the generator's
 # CFG point of view they look identical to any other straight-line block,
-# but the plugin's trace will show CALL / RET / indirect-JMP instructions
+# but the plugin's trace will show branch / RET / indirect-JMP instructions
 # inside the template's insn list.  The validator uses
 # `asserted_branch_types` to check coverage.
 # ---------------------------------------------------------------------------
@@ -1656,7 +1656,7 @@ HELPER_LEAF_NAME = "wptgen_leaf"
 @register
 class DirectCallBlock(CodeBlock):
     """Calls a no-op leaf function defined at file scope.  Emits a
-    BRANCH_DIRECT_CALL at the call site and a BRANCH_RETURN inside
+    BRANCH_DIRECT_JUMP at the call site and a BRANCH_RETURN inside
     the leaf — both observable in the plugin's trace templates."""
     name = "direct_call"
     num_successors = 1
@@ -1671,13 +1671,8 @@ class DirectCallBlock(CodeBlock):
         return BlockPlan(
             block_id=ctx.block_id, name=cls.name,
             memops=[],
-            coarse_opcodes={"CALL": 1, "RET": 1},
-            # We assert opcode==CALL rather than branch_type==DIRECT_CALL
-            # because on RISC-V a call whose target is outside jal's
-            # +/-1 MiB range is materialized as auipc+jalr (an indirect
-            # call).  Both classify as GEN_OP_CALL, so the opcode-level
-            # check is robust to compiler/linker layout choices.
-            asserted_opcodes=["CALL"],
+            coarse_opcodes={"BRANCH": 1, "RET": 1},
+            asserted_opcodes=["BRANCH"],
         )
 
     @classmethod
@@ -1695,7 +1690,7 @@ class DirectCallBlock(CodeBlock):
 class IndirectCallBlock(CodeBlock):
     """Calls the leaf function via a function-pointer variable.  On
     every ISA this forces the compiler to materialise the address and
-    emit a register/memory-indirect call (BRANCH_INDIRECT_CALL)."""
+    emit a register/memory-indirect call (BRANCH_INDIRECT_JUMP)."""
     name = "indirect_call"
     num_successors = 1
     scratch_slots = 0
@@ -1706,8 +1701,8 @@ class IndirectCallBlock(CodeBlock):
         return BlockPlan(
             block_id=ctx.block_id, name=cls.name,
             memops=[],
-            coarse_opcodes={"CALL": 1, "RET": 1},
-            asserted_branch_types=["BRANCH_INDIRECT_CALL"],
+            coarse_opcodes={"BRANCH": 1, "RET": 1},
+            asserted_branch_types=["BRANCH_INDIRECT_JUMP"],
         )
 
     @classmethod
@@ -2272,6 +2267,31 @@ asm_probe_block(
 )
 
 asm_probe_block(
+    name="probe_x86_fma",
+    per_isa={
+        "x86_64": {
+            "asm":      (
+                '"vfmadd132sd %%xmm1, %%xmm2, %%xmm0\\n\\t"\n'
+                '    "vfmsub132sd %%xmm4, %%xmm5, %%xmm3"'
+            ),
+            "clobbers": '"xmm0","xmm3"',
+            "opcodes":  ["FP_MADD", "FP_MSUB"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_x86_vec_madd",
+    per_isa={
+        "x86_64": {
+            "asm":      '"pmaddwd %%xmm1, %%xmm0"',
+            "clobbers": '"xmm0"',
+            "opcodes":  ["VEC_MADD"],
+        },
+    },
+)
+
+asm_probe_block(
     name="probe_x86_nop",
     per_isa={
         "x86_64": {
@@ -2309,14 +2329,18 @@ asm_probe_block(
     name="probe_arm_int_mul_div",
     per_isa={
         "aarch64": {
+            # AArch64 `mul` is an alias of MADD with XZR as the addend;
+            # keep that explicit and add UMULH as a true INT_MUL-class
+            # instruction so this probe exercises both families.
             "asm":      (
                 '"mov x1, #1000\\n\\t"\n'
                 '    "mov x2, #7\\n\\t"\n'
                 '    "mul  x0, x1, x2\\n\\t"\n'
+                '    "umulh x4, x1, x2\\n\\t"\n'
                 '    "udiv x3, x1, x2"'
             ),
-            "clobbers": '"x0","x1","x2","x3"',
-            "opcodes":  ["INT_MUL", "INT_DIV"],
+            "clobbers": '"x0","x1","x2","x3","x4"',
+            "opcodes":  ["INT_MADD", "INT_MUL", "INT_DIV"],
         },
     },
 )
@@ -2407,17 +2431,17 @@ asm_probe_block(
     name="probe_arm_vec_arith",
     per_isa={
         "aarch64": {
-            # Scalar `add`/`sub`/`mul` share insn_id with vector forms
-            # in Capstone, so we use instructions whose insn_id is
-            # exclusively vector: ADDP (pairwise add), SABD (signed
-            # abs diff), MLA (multiply-accumulate).
+            # Use instructions whose insn_id is exclusively vector:
+            # ADDP (pairwise add), SABD (signed abs diff), PMUL
+            # (polynomial multiply), and MLA (multiply-accumulate).
             "asm":      (
                 '"addp v0.16b, v1.16b, v2.16b\\n\\t"\n'
                 '    "sabd v3.16b, v4.16b, v5.16b\\n\\t"\n'
-                '    "mla  v6.16b, v7.16b, v1.16b"'
+                '    "pmul v6.16b, v7.16b, v1.16b\\n\\t"\n'
+                '    "mla  v0.16b, v7.16b, v1.16b"'
             ),
             "clobbers": '"v0","v3","v6"',
-            "opcodes":  ["VEC_ADD", "VEC_SUB", "VEC_MUL"],
+            "opcodes":  ["VEC_ADD", "VEC_SUB", "VEC_MUL", "VEC_MADD"],
         },
     },
 )
@@ -3031,6 +3055,47 @@ asm_probe_block(
     },
 )
 
+asm_probe_block(
+    name="probe_arm_msub_cmp_neg_not",
+    per_isa={
+        "aarch64": {
+            "asm":      (
+                '"ccmp x0, x1, #0, eq\\n\\t"\n'
+                '    "msub x2, x3, x4, x5\\n\\t"\n'
+                '    "abs  v0.16b, v1.16b\\n\\t"\n'
+                '    "not  v2.16b, v3.16b"'
+            ),
+            "clobbers": '"x2","v0","v2","cc"',
+            "opcodes":  ["CMP", "INT_MSUB", "NEG", "NOT"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_fp_madd_msub",
+    per_isa={
+        "aarch64": {
+            "asm":      (
+                '"fmadd d0, d1, d2, d3\\n\\t"\n'
+                '    "fmsub d4, d5, d6, d7"'
+            ),
+            "clobbers": '"d0","d4"',
+            "opcodes":  ["FP_MADD", "FP_MSUB"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_arm_vec_msub",
+    per_isa={
+        "aarch64": {
+            "asm":      '"mls v0.16b, v1.16b, v2.16b"',
+            "clobbers": '"v0"',
+            "opcodes":  ["VEC_MSUB"],
+        },
+    },
+)
+
 
 # ---------------------------------------------------------------------------
 # riscv64 — completion
@@ -3115,6 +3180,41 @@ asm_probe_block(
     },
 )
 
+asm_probe_block(
+    name="probe_rv_fp_madd_msub",
+    per_isa={
+        "riscv64": {
+            "asm":      (
+                '"fmadd.d ft0, ft1, ft2, ft3\\n\\t"\n'
+                '    "fmsub.d ft4, ft5, ft6, ft7"'
+            ),
+            "clobbers": '"ft0","ft4"',
+            "opcodes":  ["FP_MADD", "FP_MSUB"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_rv_vec_arith",
+    per_isa={
+        "riscv64": {
+            "asm":      (
+                '".option push\\n\\t"\n'
+                '    ".option arch, +v\\n\\t"\n'
+                '    "vsetvli t0, zero, e64, m1, ta, ma\\n\\t"\n'
+                '    "vadd.vv  v0,  v1,  v2\\n\\t"\n'
+                '    "vsub.vv  v3,  v4,  v5\\n\\t"\n'
+                '    "vmul.vv  v6,  v7,  v8\\n\\t"\n'
+                '    "vfmadd.vv v9, v10, v11\\n\\t"\n'
+                '    "vfmsub.vv v12, v13, v14\\n\\t"\n'
+                '    ".option pop"'
+            ),
+            "clobbers": '"t0","memory"',
+            "opcodes":  ["VEC_ADD", "VEC_SUB", "VEC_MUL", "VEC_MADD", "VEC_MSUB"],
+        },
+    },
+)
+
 
 # ---------------------------------------------------------------------------
 # mipsel — completion
@@ -3144,15 +3244,14 @@ asm_probe_block(
             # NEGU is the GAS alias for `subu $rd, $zero, $rs`, NOT for
             # `nor $rd, $zero, $rs`.  Capstone 6 reports the underlying
             # real opcodes (MIPS_INS_SUBU and MIPS_INS_NOR) rather than
-            # MIPS_INS_NEGU/MIPS_INS_NOT pseudos, so the hardware-honest
-            # expectations are INT_SUB and OR (NOR maps to GEN_OP_OR in
-            # the classification table).
+            # MIPS_INS_NEGU/MIPS_INS_NOT pseudos.  NOR with $zero is the
+            # real encoding of NOT, so assert NOT rather than OR.
             "asm":      (
                 '"negu $t0, $t1\\n\\t"\n'
                 '    "not  $t2, $t3"'
             ),
             "clobbers": '"$t0","$t2"',
-            "opcodes":  ["INT_SUB", "OR"],
+            "opcodes":  ["INT_SUB", "NOT"],
         },
     },
 )
@@ -3218,6 +3317,56 @@ asm_probe_block(
     },
 )
 
+asm_probe_block(
+    name="probe_mips_madd_msub",
+    per_isa={
+        "mipsel": {
+            "asm":      (
+                '"li    $t0, 3\\n\\t"\n'
+                '    "li    $t1, 5\\n\\t"\n'
+                '    "madd  $t0, $t1\\n\\t"\n'
+                '    "msub  $t0, $t1"'
+            ),
+            "clobbers": '"$t0","$t1","hi","lo"',
+            "opcodes":  ["INT_MADD", "INT_MSUB"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_mips_fp_madd_msub",
+    per_isa={
+        "mipsel": {
+            "asm":      (
+                '"madd.d $f0, $f2, $f4, $f6\\n\\t"\n'
+                '    "msub.d $f8, $f10, $f12, $f14"'
+            ),
+            "clobbers": '"$f0","$f8"',
+            "opcodes":  ["FP_MADD", "FP_MSUB"],
+        },
+    },
+)
+
+asm_probe_block(
+    name="probe_mips_xchg_nop_neg",
+    per_isa={
+        "mipsel": {
+            "asm":      (
+                '"addiu $sp, $sp, -8\\n\\t"\n'
+                '    "sw    $zero, 0($sp)\\n\\t"\n'
+                '    "li    $t1, 1\\n\\t"\n'
+                '    "ll    $t0, 0($sp)\\n\\t"\n'
+                '    "sc    $t1, 0($sp)\\n\\t"\n'
+                '    "addiu $sp, $sp, 8\\n\\t"\n'
+                '    "ssnop\\n\\t"\n'
+                '    "abs   $t2, $t3"'
+            ),
+            "clobbers": '"$t0","$t1","$t2","memory"',
+            "opcodes":  ["XCHG", "NOP", "INT_SUB"],
+        },
+    },
+)
+
 # probe_mips_lea: intentionally omitted.
 #
 # GenericOpcode LEA on MIPS is reachable only via the MIPS32r6/MIPS64r6
@@ -3248,7 +3397,7 @@ def coverage_probes_for_isa(isa: str) -> list[str]:
     In addition to the auto-registered AsmProbe subclasses, we include
     a hand-picked set of "essential coverage" CodeBlocks whose
     classifications cannot be reproduced by inline-asm probes alone
-    (e.g. CALL/RET, INDIRECT_CALL, INDIRECT_JUMP), so a single
+    (e.g. helper-call branches, returns, and indirect jumps), so a single
     coverage trace also exercises those branch types.
     """
     out: list[str] = []
@@ -3259,7 +3408,7 @@ def coverage_probes_for_isa(isa: str) -> list[str]:
         if cls.__name__.startswith("AsmProbe_") and isa in cls.supported_isas:
             out.append(name)
 
-    # Hand-picked CALL/RET/indirect-branch coverage.  These rely on the
+    # Hand-picked helper-call/RET/indirect-branch coverage.  These rely on the
     # compiler so they live as full CodeBlocks, not asm probes.
     extras = ["direct_call", "indirect_call", "indirect_jump"]
     for nm in extras:

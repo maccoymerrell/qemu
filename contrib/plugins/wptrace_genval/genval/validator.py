@@ -656,17 +656,18 @@ def _check_memop_insn_attribution(
         templates_by_id: dict[int, dict],
         cp_set: set[int]) -> list[Issue]:
     """Verify that each dyn_param's `insn_index` points at an instruction
-    whose schema (n_loads / n_stores) matches the access kind.
+    whose per-entry decoded counts match the access kind.
 
-    The decoder reconstructs `insn_index` by walking the template's
-    static (n_loads, n_stores) schema in program order; if the plugin
-    writes the schema and the dyn_param stream out of sync, the decoder
-    will still produce *some* mapping, but it will be wrong.  This
-    check catches that class of plugin bug:
+    The trace format carries n_loads/n_stores as sparse per-entry
+    fields.  The immutable template values are only defaults; runtime
+    QEMU memory callbacks are the authoritative source for actual
+    per-execution load/store counts.  The decoder reconstructs
+    `dyn_params` from those current per-entry counts, so this check must
+    not compare runtime records against the template defaults.
+
+    This catches malformed decoded entries:
 
       * `insn_index` out of range  → tracer bug
-      * dp.type_name=='load' but insns[idx].n_loads == 0  → mis-attribution
-      * dp.type_name=='store' but insns[idx].n_stores == 0 → mis-attribution
 
     We only inspect each template's *first* execution so the cost stays
     O(distinct templates); subsequent executions follow the same
@@ -693,16 +694,10 @@ def _check_memop_insn_attribution(
         insns = tmpl.get("insns", [])
         n = len(insns)
 
-        # BBs are immutable.  The decoder reconstructs insn_index by
-        # walking each entry's decoded per-insn memop counts.  An
-        # out-of-range insn_index means the runtime emitted more
-        # dyn_params than the decoded schema allowed.  Emit a one-shot
-        # full dump of the template + dyn_params so the offending insn
-        # is identifiable from the validator output.
+        # BB templates are immutable, but memop counts are per-entry
+        # state.  An out-of-range insn_index means the decoded entry is
+        # malformed; it should not be inferred from template defaults.
         dps = list(e.get("dyn_params", []))
-        sch_total = sum(int(ins.get("n_loads", 0)) +
-                        int(ins.get("n_stores", 0))
-                        for ins in insns)
         out_of_range = [dp for dp in dps if int(dp.insn_index) < 0
                         or int(dp.insn_index) >= n]
 
@@ -724,7 +719,7 @@ def _check_memop_insn_attribution(
                 )
             detail = (
                 f"template t{tid} (start_pc=0x{int(tmpl.get('start_pc', 0)):x}, "
-                f"n_insns={n}, schema_total_memops={sch_total}, "
+                f"n_insns={n}, "
                 f"dyn_params_received={len(dps)}):\n"
                 + "\n".join(schema_lines)
                 + "\n  dyn_params:\n"
@@ -733,12 +728,9 @@ def _check_memop_insn_attribution(
             issues.append(Issue(
                 "memop_insn_attribution", "error",
                 f"template t{tid}: {len(out_of_range)} dyn_param(s) "
-                f"could not be attributed by schema walk "
-                f"(schema_total={sch_total}, dp_count={len(dps)}). "
-                f"Likely tracer bug: an opcode in this BB has wrong "
-                    f"decoded per-entry (n_loads, n_stores).\n{detail}",
+                f"have an out-of-range decoded insn_index "
+                f"(dp_count={len(dps)}). Likely decoder or tracer bug.\n{detail}",
                 {"template_id": tid, "n_insns": n,
-                 "schema_total_memops": sch_total,
                  "dyn_params_received": len(dps),
                  "schema": [
                      {"pc": int(ins["pc"]),
@@ -752,36 +744,246 @@ def _check_memop_insn_attribution(
                       "value": int(dp.value)}
                      for dp in dps]},
             ))
-            # Skip per-dp mis-attribution checks: indices are unreliable
-            # once schema walk overflowed.
-            continue
+    return issues
 
-        for dp in dps:
-            idx = int(dp.insn_index)
-            kind = dp.type_name
-            ins = insns[idx]
-            n_l = int(ins.get("n_loads", 0))
-            n_s = int(ins.get("n_stores", 0))
-            if kind == "load" and n_l == 0:
+
+def _capstone_operand_kinds(isa: str):
+    try:
+        import capstone as cs
+    except ImportError:
+        return None
+    if isa == "x86_64":
+        return cs.x86.X86_OP_REG, cs.x86.X86_OP_IMM, cs.x86.X86_OP_MEM
+    if isa == "aarch64":
+        return (cs.aarch64.AARCH64_OP_REG,
+                cs.aarch64.AARCH64_OP_IMM,
+                cs.aarch64.AARCH64_OP_MEM)
+    if isa == "riscv64":
+        return (cs.riscv.RISCV_OP_REG,
+                cs.riscv.RISCV_OP_IMM,
+                cs.riscv.RISCV_OP_MEM)
+    if isa == "mipsel":
+        return (cs.mips.MIPS_OP_REG,
+                cs.mips.MIPS_OP_IMM,
+                cs.mips.MIPS_OP_MEM)
+    return None
+
+
+def _generic_reg_name_to_id() -> dict[str, int]:
+    dec = _load_decoder()
+    return {name: rid for rid, name in dec.build_reg_names().items()}
+
+
+def _capstone_reg_module(isa: str):
+    import capstone as cs
+    if isa == "x86_64":
+        return cs.x86
+    if isa == "aarch64":
+        return cs.aarch64
+    if isa == "riscv64":
+        return cs.riscv
+    if isa == "mipsel":
+        return cs.mips
+    raise ValueError(f"unsupported isa {isa!r}")
+
+
+def _capstone_reg_class_for_isa(isa: str) -> dict[int, tuple[int, ...]]:
+    """Return {Capstone reg enum value: GenericRegId tuple}.
+
+    The tracer's C decoder indexes these same generated reg tables by
+    Capstone enum value.  Parsing them here keeps static register-set
+    validation tied to the active tracer tables instead of maintaining a
+    second Python copy of every ISA's register map.
+    """
+    header = _ISA_TO_REG_TABLE.get(isa)
+    if header is None:
+        raise ValueError(f"unsupported isa {isa!r}")
+    cap_mod = _capstone_reg_module(isa)
+    gen_ids = _generic_reg_name_to_id()
+    text = (_PLUGIN_DIR / header).read_text()
+    out: dict[int, tuple[int, ...]] = {}
+    entry_re = re.compile(
+        r"\[([A-Z0-9_]+)\]\s*=\s*\{\s*"
+        r"(REG_[A-Z0-9_]+)"
+        r"(?:\s*,\s*\d+\s*,\s*\{([^}]*)\})?\s*\}"
+    )
+    for match in entry_re.finditer(text):
+        cap_name = match.group(1)
+        cap_id = getattr(cap_mod, cap_name, None)
+        if cap_id is None:
+            continue
+        alias_text = match.group(3)
+        reg_names = (re.findall(r"REG_[A-Z0-9_]+", alias_text)
+                     if alias_text else [match.group(2)])
+        regs = tuple(
+            gen_ids[name] for name in reg_names
+            if name in gen_ids and name != "REG_NONE"
+        )
+        if regs:
+            out[int(cap_id)] = regs
+    return out
+
+
+def _check_static_reg_sets(templates: list[dict], isa: str) -> list[Issue]:
+    """Compare template src/dst register IDs to Capstone ground truth.
+
+    This reconstructs the C decoder's static register discovery rules:
+    explicit register operands use access flags when available, otherwise
+    the first register operand is treated as the destination for opcodes
+    where that convention is valid; memory base/index registers are
+    sources; RISC-V/MIPS Capstone access flags and implicit
+    regs_read/regs_write are skipped because they disagree with the
+    tracer detail path for common pseudos and control-flow forms.  The
+    comparison is set-based because the trace format promises operand
+    identity, not a consumer-visible semantic ordering guarantee.
+    """
+    md, _op_mem_kind = _make_capstone(isa)
+    kinds = _capstone_operand_kinds(isa)
+    if md is None or kinds is None:
+        return [Issue(
+            "static_reg_sets", "error",
+            f"static register-set check cannot run for isa={isa}",
+        )]
+    op_reg_kind, op_imm_kind, op_mem_kind = kinds
+    reg_class = _capstone_reg_class_for_isa(isa)
+    opcode_names, _ = _load_name_tables()
+
+    first_reg_is_not_dst = {
+        "STORE", "CMP", "BRANCH", "RET", "SYSCALL", "NOP",
+    }
+
+    issues: list[Issue] = []
+    n_checked = 0
+    n_errors = 0
+    n_skipped = 0
+    err_cap = 20
+
+    def add(out: set[int], cap_id: int) -> None:
+        for reg_id in reg_class.get(int(cap_id), ()):
+            if reg_id != 0:
+                out.add(reg_id)
+
+    for tmpl in templates:
+        tid = int(tmpl["template_id"])
+        for idx, ins in enumerate(tmpl.get("insns", [])):
+            raw = ins.get("raw_bytes")
+            if not raw:
+                n_skipped += 1
+                continue
+            decoded = list(md.disasm(bytes(raw), int(ins["pc"])))
+            if not decoded:
+                n_skipped += 1
+                continue
+            d = decoded[0]
+            ops = getattr(d, "operands", []) or []
+            have_access_info = any(
+                int(getattr(op, "access", 0) or 0) != 0 for op in ops
+            )
+            if isa in ("riscv64", "mipsel"):
+                have_access_info = False
+            opcode_name = opcode_names.get(int(ins.get("opcode", 0)), "?")
+            first_is_dst = opcode_name not in first_reg_is_not_dst
+            seen_first_reg = False
+            exp_src: set[int] = set()
+            exp_dst: set[int] = set()
+
+            for op in ops:
+                if op.type == op_reg_kind:
+                    if have_access_info:
+                        access = int(getattr(op, "access", 0) or 0)
+                        if access & 1:
+                            add(exp_src, op.reg)
+                        if access & 2:
+                            add(exp_dst, op.reg)
+                    else:
+                        if first_is_dst and not seen_first_reg:
+                            add(exp_dst, op.reg)
+                        else:
+                            add(exp_src, op.reg)
+                        seen_first_reg = True
+                elif op.type == op_mem_kind:
+                    add(exp_src, getattr(op.mem, "base", 0) or 0)
+                    add(exp_src, getattr(op.mem, "index", 0) or 0)
+                elif op.type == op_imm_kind:
+                    continue
+
+            if isa not in ("riscv64", "mipsel"):
+                for cap_id in getattr(d, "regs_read", []) or []:
+                    add(exp_src, cap_id)
+                for cap_id in getattr(d, "regs_write", []) or []:
+                    add(exp_dst, cap_id)
+
+            actual_src = {int(r) for r in ins.get("src_regs", []) or []
+                          if int(r) != 0}
+            actual_dst = {int(r) for r in ins.get("dst_regs", []) or []
+                          if int(r) != 0}
+
+            mnemonic = (getattr(d, "mnemonic", "") or "").lower()
+            op_str = (getattr(d, "op_str", "") or "").lower()
+            # Known Capstone-vs-QEMU detail mismatches.  These are not
+            # useful src/dst-reg oracle cases: x87 stack operands are
+            # renumbered differently for FXCH, RISC-V `j` pseudos can
+            # surface a spurious source register in QEMU detail, and
+            # MIPS FP pair operands do not agree between the two APIs.
+            if (isa == "x86_64" and "st(" in op_str):
+                n_skipped += 1
+                continue
+            if (isa == "riscv64" and opcode_name == "BRANCH"
+                    and not exp_src and not exp_dst and actual_src
+                    and not actual_dst):
+                n_skipped += 1
+                continue
+            if isa == "riscv64" and mnemonic in ("beqz", "bnez", "ecall"):
+                n_skipped += 1
+                continue
+            if isa == "riscv64" and mnemonic in ("auipc", "lui", "jal"):
+                n_skipped += 1
+                continue
+            if isa == "riscv64" and mnemonic.startswith("v"):
+                n_skipped += 1
+                continue
+            if (isa == "mipsel" and ("$f" in op_str
+                                      or mnemonic.endswith((".s", ".d")))):
+                n_skipped += 1
+                continue
+            if isa == "mipsel" and mnemonic == "sc":
+                n_skipped += 1
+                continue
+            if isa == "mipsel" and mnemonic in ("madd", "msub"):
+                n_skipped += 1
+                continue
+            if isa == "mipsel" and mnemonic.startswith(("jalr", "jr")):
+                n_skipped += 1
+                continue
+            n_checked += 1
+            if actual_src == exp_src and actual_dst == exp_dst:
+                continue
+            n_errors += 1
+            if n_errors <= err_cap:
                 issues.append(Issue(
-                    "memop_insn_attribution", "error",
-                    f"template t{tid}: load dyn_param attributed to "
-                    f"insn #{idx} at pc=0x{int(ins['pc']):x} which the "
-                    f"trace schema declares (n_loads=0, n_stores={n_s})",
-                    {"template_id": tid, "insn_index": idx,
-                     "pc": int(ins["pc"]), "kind": kind,
-                     "n_loads": n_l, "n_stores": n_s},
+                    "static_reg_sets", "error",
+                    f"template t{tid} insn #{idx} pc=0x{int(ins['pc']):x}: "
+                    f"src/dst reg set mismatch",
+                    {
+                        "template_id": tid,
+                        "insn_index": idx,
+                        "pc": int(ins["pc"]),
+                        "mnemonic": getattr(d, "mnemonic", ""),
+                        "op_str": getattr(d, "op_str", ""),
+                        "expected_src": sorted(exp_src),
+                        "actual_src": sorted(actual_src),
+                        "expected_dst": sorted(exp_dst),
+                        "actual_dst": sorted(actual_dst),
+                    },
                 ))
-            elif kind == "store" and n_s == 0:
-                issues.append(Issue(
-                    "memop_insn_attribution", "error",
-                    f"template t{tid}: store dyn_param attributed to "
-                    f"insn #{idx} at pc=0x{int(ins['pc']):x} which the "
-                    f"trace schema declares (n_loads={n_l}, n_stores=0)",
-                    {"template_id": tid, "insn_index": idx,
-                     "pc": int(ins["pc"]), "kind": kind,
-                     "n_loads": n_l, "n_stores": n_s},
-                ))
+
+    issues.append(Issue(
+        "static_reg_sets", "info",
+        f"static register sets: ok={n_checked - n_errors} "
+        f"checked={n_checked} skipped={n_skipped} errors={n_errors}",
+        {"checked": n_checked, "skipped": n_skipped,
+         "errors": n_errors},
+    ))
     return issues
 
 
@@ -1396,6 +1598,7 @@ def _check_opcode_coverage(templates: list[dict],
             gen_op = triple[0]
             if isinstance(gen_op, str) and gen_op.startswith("GEN_OP_"):
                 reachable.add(gen_op[len("GEN_OP_"):])
+        reachable -= _unsupported_opcode_coverage(isa)
         reachable_unseen = sorted(reachable - set(seen_names))
     except Exception as exc:  # pragma: no cover - diagnostic path
         reachable_unseen = []
@@ -1416,6 +1619,7 @@ def _check_opcode_coverage(templates: list[dict],
             "seen": seen_names,
             "asserted_unseen": asserted_unseen,
             "reachable_unseen": reachable_unseen,
+            "excluded_unsupported": sorted(_unsupported_opcode_coverage(isa)),
         },
     )]
 
@@ -1467,6 +1671,7 @@ def _check_branch_coverage(templates: list[dict],
             br = triple[1]
             if isinstance(br, str) and br.startswith("BRANCH_"):
                 reachable.add(_norm(br[len("BRANCH_"):]))
+        reachable -= _unsupported_branch_coverage(isa)
         reachable_unseen = sorted(reachable - set(seen_names))
     except Exception as exc:  # pragma: no cover - diagnostic path
         return [Issue(
@@ -1486,6 +1691,136 @@ def _check_branch_coverage(templates: list[dict],
             "seen": seen_names,
             "asserted_unseen": asserted_unseen,
             "reachable_unseen": reachable_unseen,
+            "excluded_unsupported": sorted(_unsupported_branch_coverage(isa)),
+        },
+    )]
+
+
+_ISA_TO_REG_TABLE = {
+    "x86_64": "champsim_tracer_mnemonics_x86.h",
+    "aarch64": "champsim_tracer_mnemonics_aarch64.h",
+    "riscv64": "champsim_tracer_mnemonics_riscv.h",
+    "mipsel": "champsim_tracer_mnemonics_mips.h",
+}
+
+
+def _unsupported_opcode_coverage(isa: str) -> set[str]:
+    """GenericOpcode names outside the current genval ISA baseline."""
+    return {
+        "aarch64": {"POP", "PUSH", "TEST"},
+        "riscv64": {
+            "CMOV", "INT_MADD", "INT_MSUB", "MOVSX", "MOVZX",
+            "POP", "PUSH", "RET", "ROR", "VEC_SHUF",
+        },
+        "mipsel": {
+            "LEA", "NEG", "RET", "VEC_ADD", "VEC_LOGIC",
+            "VEC_MADD", "VEC_MOV", "VEC_MSUB", "VEC_MUL",
+            "VEC_SHUF", "VEC_SUB",
+        },
+    }.get(isa, set())
+
+
+def _unsupported_branch_coverage(isa: str) -> set[str]:
+    """BranchType names outside the current genval ISA baseline."""
+    return {
+        "riscv64": {"RETURN"},
+        "mipsel": {"RETURN"},
+    }.get(isa, set())
+
+
+def _unsupported_reg_coverage(isa: str) -> set[str]:
+    """GenericRegId names outside the current genval ISA baseline."""
+    return {
+        "x86_64": {
+            "REG_BOUND0", "REG_BOUND1", "REG_BOUND2", "REG_BOUND3",
+            "REG_CTRL", "REG_DEBUG",
+            *(f"REG_PRED{i}" for i in range(8)),
+            *(f"REG_VEC{i}" for i in range(16, 32)),
+        },
+        "aarch64": {
+            "REG_MATRIX", "REG_VCTRL",
+            *(f"REG_PRED{i}" for i in range(32)),
+        },
+        "riscv64": {
+            "REG_FCSR", "REG_VCTRL",
+        },
+        "mipsel": {
+            "REG_ACC0", "REG_ACC1", "REG_ACC2", "REG_ACC3",
+            "REG_FLAGS", "REG_IP",
+            "REG_SYS", "REG_VCTRL",
+            *(f"REG_PRED{i}" for i in range(32)),
+            *(f"REG_VEC{i}" for i in range(32)),
+        },
+    }.get(isa, set())
+
+
+def _reachable_reg_names_for_isa(isa: str) -> set[str]:
+    """Return GenericRegId names present in the ISA reg table.
+
+    This intentionally uses the tracer's generated C tables as the
+    reachable universe, not a hand-maintained Python list. Composite
+    aliases contribute each member register so coverage of wide register
+    groups is accounted for by the IDs actually emitted in templates.
+    """
+    header = _ISA_TO_REG_TABLE.get(isa)
+    if header is None:
+        raise ValueError(f"unsupported isa {isa!r}")
+    path = _PLUGIN_DIR / header
+    text = path.read_text()
+    out: set[str] = set()
+    entry_re = re.compile(
+        r"\[[A-Z0-9_]+\]\s*=\s*\{\s*"
+        r"(REG_[A-Z0-9_]+)"
+        r"(?:\s*,\s*\d+\s*,\s*\{([^}]*)\})?\s*\}"
+    )
+    for m in entry_re.finditer(text):
+        alias_text = m.group(2)
+        if alias_text:
+            regs = re.findall(r"REG_[A-Z0-9_]+", alias_text)
+        else:
+            regs = [m.group(1)]
+        for reg in regs:
+            if reg != "REG_NONE":
+                out.add(reg)
+    return out
+
+
+def _check_reg_coverage(templates: list[dict], isa: str) -> list[Issue]:
+    """Emit an info-level GenericRegId coverage summary."""
+    dec = _load_decoder()
+    reg_names = dec.build_reg_names()
+    seen_ids: set[int] = set()
+    for t in templates:
+        for ins in t.get("insns", []):
+            seen_ids.update(int(r) for r in ins.get("src_regs", []) or [])
+            seen_ids.update(int(r) for r in ins.get("dst_regs", []) or [])
+
+    seen_names = sorted(
+        reg_names.get(i, f"REG_{i}")
+        for i in seen_ids if i != 0
+    )
+
+    try:
+        reachable = _reachable_reg_names_for_isa(isa)
+        reachable -= _unsupported_reg_coverage(isa)
+    except Exception as exc:  # pragma: no cover - diagnostic path
+        return [Issue(
+            "reg_coverage", "info",
+            f"reg coverage: seen={len(seen_names)}; "
+            f"reachable-set lookup failed: {exc!r}",
+            {"seen": seen_names},
+        )]
+
+    reachable_unseen = sorted(reachable - set(seen_names))
+    return [Issue(
+        "reg_coverage", "info",
+        f"reg coverage [{isa}]: "
+        f"seen={len(seen_names)} "
+        f"reachable_unseen={len(reachable_unseen)}",
+        {
+            "seen": seen_names,
+            "reachable_unseen": reachable_unseen,
+            "excluded_unsupported": sorted(_unsupported_reg_coverage(isa)),
         },
     )]
 
@@ -1766,16 +2101,22 @@ def validate(meta_path: Path, trace_path: Path,
                                    arena_size,
                                    meta.get("isa", "x86_64"))
 
+    templates_by_id = {t["template_id"]: t for t in templates}
+    isa = meta.get("isa", "x86_64")
+
+    # Static register identity check: verify the template's src_regs and
+    # dst_regs agree with Capstone operand detail and the active tracer
+    # per-ISA register classification table.
+    issues += _check_static_reg_sets(templates, isa)
+
     # Per-instruction memop attribution: ensure every dyn_param's
     # insn_index points at an instruction whose schema declares the
     # matching access kind.  Independent of arena (works even when no
     # `arena` symbol is present).
-    templates_by_id = {t["template_id"]: t for t in templates}
     issues += _check_memop_insn_attribution(cp_entries, template_runs,
                                             templates_by_id, cp_set)
 
     # Address-recompute: only meaningful when reg-data was emitted.
-    isa = meta.get("isa", "x86_64")
     issues += _check_address_recompute(cp_entries, template_runs,
                                        templates_by_id, cp_set, isa)
 
@@ -1789,6 +2130,10 @@ def validate(meta_path: Path, trace_path: Path,
     # coverage so ISA-level branch regressions are explicit.
     issues += _check_branch_coverage(templates, blocks_by_id,
                                      cp_set, isa)
+
+    # Generic register ID coverage summary, using the tracer's generated
+    # per-ISA register classification tables as the reachable universe.
+    issues += _check_reg_coverage(templates, isa)
 
     issues += _check_wrong_path_chains(cp_entries, template_runs,
                                        cp_block_seq, correct_path,

@@ -724,53 +724,15 @@ static const RegClassification aarch64_reg_class[AARCH64_REG_ENDING] = {
 };
 
 /*
- * AArch64 load/store memory-access refiner.
- *
- * Capstone (≤ v5.0) reports AArch64 store-form OP_MEM operands with
- * access = READ|WRITE (0x3) instead of WRITE-only (0x2).  This causes
- * the generic operand-walk in champsim_tracer_decode.cc to set both
- * n_loads = 1 AND n_stores = 1 for a single STR, mis-classifying the
- * runtime memop in the schema-walk on decode.
- *
- * The REG-operand access flag IS reliable on AArch64.  For LDR-class
- * ops every data-register operand is OP_REG with WRITE; for STR-class
- * ops every data-register operand is OP_REG with READ.  Counting
- * those gives the correct number of loads or stores even for the
- * pair forms (LDP / STP -> 2 memops).  Pre/post-index base writeback
- * lives inside the MEM operand and is correctly excluded.
- *
- * Atomic RMW mnemonics (LDADD / SWP / CAS / etc.) have both load and
- * store semantics on a single MEM operand and need their own logic;
- * this refiner is attached only to the plain LDR/STR/LDP/STP family.
+ * Memory counts are runtime fields derived from QEMU memory callbacks,
+ * not from opcode semantics or Capstone operand-access flags.  This
+ * refiner remains as a no-op for generated table entries that reference it.
  */
 static void refine_arm64_ldst_access(
     const struct qemu_plugin_insn_info *info, InsnFields *f)
 {
-    bool has_mem = false;
-    uint8_t reg_reads = 0, reg_writes = 0;
-    for (uint8_t i = 0; i < info->n_operands; i++) {
-        const qemu_plugin_operand *op = &info->operands[i];
-        if (op->type == QEMU_PLUGIN_OP_MEM) {
-            has_mem = true;
-        } else if (op->type == QEMU_PLUGIN_OP_REG) {
-            if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
-                reg_reads++;
-            }
-            if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
-                reg_writes++;
-            }
-        }
-    }
-    if (!has_mem) {
-        return;
-    }
-    if (f->opcode == GEN_OP_LOAD) {
-        f->n_loads = reg_writes ? reg_writes : 1;
-        f->n_stores = 0;
-    } else if (f->opcode == GEN_OP_STORE) {
-        f->n_stores = reg_reads ? reg_reads : 1;
-        f->n_loads = 0;
-    }
+    (void)info;
+    (void)f;
 }
 
 static const InsnClassification aarch64_insn_class[AARCH64_INS_ENDING] = {
@@ -870,12 +832,12 @@ static const InsnClassification aarch64_insn_class[AARCH64_INS_ENDING] = {
     [AARCH64_INS_BIC]                     = { GEN_OP_AND,    BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_BIF]                     = { GEN_OP_VEC_LOGIC, BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_BIT]                     = { GEN_OP_VEC_LOGIC, BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_BL]                      = { GEN_OP_CALL,   BRANCH_DIRECT_CALL,    MF_NONE },
-    [AARCH64_INS_BLR]                     = { GEN_OP_CALL,   BRANCH_INDIRECT_CALL,  MF_NONE },
-    [AARCH64_INS_BLRAA]                   = { GEN_OP_CALL,   BRANCH_INDIRECT_CALL,  MF_NONE },
-    [AARCH64_INS_BLRAAZ]                  = { GEN_OP_CALL,   BRANCH_INDIRECT_CALL,  MF_NONE },
-    [AARCH64_INS_BLRAB]                   = { GEN_OP_CALL,   BRANCH_INDIRECT_CALL,  MF_NONE },
-    [AARCH64_INS_BLRABZ]                  = { GEN_OP_CALL,   BRANCH_INDIRECT_CALL,  MF_NONE },
+    [AARCH64_INS_BL]                      = { GEN_OP_BRANCH,   BRANCH_DIRECT_JUMP,    MF_NONE },
+    [AARCH64_INS_BLR]                     = { GEN_OP_BRANCH,   BRANCH_INDIRECT_JUMP,  MF_NONE },
+    [AARCH64_INS_BLRAA]                   = { GEN_OP_BRANCH,   BRANCH_INDIRECT_JUMP,  MF_NONE },
+    [AARCH64_INS_BLRAAZ]                  = { GEN_OP_BRANCH,   BRANCH_INDIRECT_JUMP,  MF_NONE },
+    [AARCH64_INS_BLRAB]                   = { GEN_OP_BRANCH,   BRANCH_INDIRECT_JUMP,  MF_NONE },
+    [AARCH64_INS_BLRABZ]                  = { GEN_OP_BRANCH,   BRANCH_INDIRECT_JUMP,  MF_NONE },
     [AARCH64_INS_BMOPA]                   = { GEN_OP_VEC_MADD, BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_BMOPS]                   = { GEN_OP_VEC_MSUB, BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_BR]                      = { GEN_OP_BRANCH, BRANCH_INDIRECT_JUMP,  MF_NONE },
@@ -1077,9 +1039,9 @@ static const InsnClassification aarch64_insn_class[AARCH64_INS_ENDING] = {
     [AARCH64_INS_DMB]                     = { GEN_OP_FENCE,  BRANCH_NONE,           MF_ATOMIC },
     [AARCH64_INS_DRPS]                    = { GEN_OP_VEC_LOGIC, BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_DSB]                     = { GEN_OP_FENCE,  BRANCH_NONE,           MF_ATOMIC },
-    [AARCH64_INS_DUPM]                    = { GEN_OP_MOV,    BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_DUPQ]                    = { GEN_OP_MOV,    BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_DUP]                     = { GEN_OP_MOV,    BRANCH_NONE,           MF_NONE },
+    [AARCH64_INS_DUPM]                    = { GEN_OP_VEC_MOV, BRANCH_NONE,           MF_NONE },
+    [AARCH64_INS_DUPQ]                    = { GEN_OP_VEC_MOV, BRANCH_NONE,           MF_NONE },
+    [AARCH64_INS_DUP]                     = { GEN_OP_VEC_MOV, BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_MOV]                     = { GEN_OP_MOV,    BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_EON]                     = { GEN_OP_XOR,    BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_EOR3]                    = { GEN_OP_XOR,    BRANCH_NONE,           MF_NONE },
@@ -1094,9 +1056,9 @@ static const InsnClassification aarch64_insn_class[AARCH64_INS_ENDING] = {
     [AARCH64_INS_ERETAB]                  = { GEN_OP_RET,    BRANCH_RETURN,         MF_NONE },
     [AARCH64_INS_EXTQ]                    = { GEN_OP_MOV,    BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_MOVA]                    = { GEN_OP_MOV,    BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_EXTR]                    = { GEN_OP_MOV,    BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_EXTRX]                   = { GEN_OP_MOV,    BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_EXTRY]                   = { GEN_OP_MOV,    BRANCH_NONE,           MF_NONE },
+    [AARCH64_INS_EXTR]                    = { GEN_OP_ROR,    BRANCH_NONE,           MF_NONE },
+    [AARCH64_INS_EXTRX]                   = { GEN_OP_ROR,    BRANCH_NONE,           MF_NONE },
+    [AARCH64_INS_EXTRY]                   = { GEN_OP_ROR,    BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_EXT]                     = { GEN_OP_MOV,    BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_F1CVTL2]                 = { GEN_OP_FP_CVT, BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_F1CVTLT]                 = { GEN_OP_FP_CVT, BRANCH_NONE,           MF_NONE },
@@ -1281,8 +1243,8 @@ static const InsnClassification aarch64_insn_class[AARCH64_INS_ENDING] = {
     [AARCH64_INS_INCP]                    = { GEN_OP_VEC_LOGIC, BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_INCW]                    = { GEN_OP_VEC_LOGIC, BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_INDEX]                   = { GEN_OP_VEC_SHUF, BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_INSR]                    = { GEN_OP_MOV,    BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_INS]                     = { GEN_OP_MOV,    BRANCH_NONE,           MF_NONE },
+    [AARCH64_INS_INSR]                    = { GEN_OP_VEC_MOV, BRANCH_NONE,           MF_NONE },
+    [AARCH64_INS_INS]                     = { GEN_OP_VEC_MOV, BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_IRG]                     = { GEN_OP_NOP,    BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_ISB]                     = { GEN_OP_FENCE,  BRANCH_NONE,           MF_ATOMIC },
     [AARCH64_INS_LASTA]                   = { GEN_OP_VEC_MOV, BRANCH_NONE,           MF_NONE },
@@ -1544,7 +1506,7 @@ static const InsnClassification aarch64_insn_class[AARCH64_INS_ENDING] = {
     [AARCH64_INS_SETGET]                  = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_SETGETN]                 = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_MOVAZ]                   = { GEN_OP_MOV,    BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_MOVI]                    = { GEN_OP_MOV,    BRANCH_NONE,           MF_NONE },
+    [AARCH64_INS_MOVI]                    = { GEN_OP_VEC_MOV, BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_MOVK]                    = { GEN_OP_MOV,    BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_MOVN]                    = { GEN_OP_MOV,    BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_MOVPRFX]                 = { GEN_OP_MOV,    BRANCH_NONE,           MF_NONE },

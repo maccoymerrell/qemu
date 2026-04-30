@@ -126,6 +126,7 @@ class _Stats:
 
     cp_entry_framing: _Bucket = dataclasses.field(default_factory=_Bucket)
     cp_field_delta: _Bucket = dataclasses.field(default_factory=_Bucket)
+    thread_switch: _Bucket = dataclasses.field(default_factory=_Bucket)
 
     wp_chain_envelope: _Bucket = dataclasses.field(default_factory=_Bucket)
     wp_entry_framing: _Bucket = dataclasses.field(default_factory=_Bucket)
@@ -231,7 +232,11 @@ def audit(path: Path) -> _Stats:
     hr.string_len()          # datetime
     hr.string_len()          # comment
     hr.string_len()          # target_name
-    hr.uleb()                # thread_id
+    if hr.p < body_off:
+        _read_lp_sub(hr)     # encoding maps
+    if hr.p != body_off:
+        raise ValueError(f"header/body offset mismatch: parsed={hr.p} "
+                         f"trailer={body_off}")
     s.header = hr.p
     # Templates
     tr2 = _R(m, templates_off)
@@ -248,6 +253,10 @@ def audit(path: Path) -> _Stats:
             br.uleb()
             s.body_terminator = br.p - tag_pos
             break
+        if tag == dec.BODY_TAG_THREAD_SWITCH:
+            br.sleb()
+            s.thread_switch.add(br.p - tag_pos)
+            continue
         if tag != dec.BODY_TAG_ENTRY:
             raise ValueError(f"unknown body tag {tag} at offset {tag_pos}")
 
@@ -265,12 +274,12 @@ def audit(path: Path) -> _Stats:
         wp_sub, wp_used = _read_lp_sub(br)
         s.wp_chain_envelope.add(wp_used)
         num_wp = wp_sub.uleb()
-        prev_wp_tid = 0
+        prev_wp_template = 0
         for _w in range(num_wp):
             wfs = wp_sub.p
-            prev_wp_tid += wp_sub.sleb()
+            prev_wp_template += wp_sub.sleb()
             s.wp_entry_framing.add(wp_sub.p - wfs)
-            wp_info = tinfo.get(prev_wp_tid)
+            wp_info = tinfo.get(prev_wp_template)
             if wp_info:
                 s.wp_total_insns += wp_info["n_insns"]
             s.wp_field_delta.add(_field_delta_section_bytes(wp_sub))
@@ -328,6 +337,9 @@ def report(s: _Stats) -> str:
     out(_row("CP field-delta section",
              s.cp_field_delta.bytes, body,
              count=s.cp_entries, per="entry"))
+    out(_row("thread-switch records",
+             s.thread_switch.bytes, body,
+             count=s.thread_switch.count, per="switch"))
 
     out(_row("WP chain envelope (incl. inner)",
              s.wp_chain_envelope.bytes, body,

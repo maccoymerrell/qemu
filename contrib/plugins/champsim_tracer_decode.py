@@ -37,8 +37,9 @@ CST_FLAG_REG_DATA      = 1 << 1
 CST_FLAG_RESERVED_2    = 1 << 2
 
 # Body entry tags (u8)
-BODY_TAG_END      = 0
-BODY_TAG_ENTRY    = 1
+BODY_TAG_END             = 0
+BODY_TAG_ENTRY           = 1
+BODY_TAG_THREAD_SWITCH   = 2
 
 # Per-insn template flags (u8)
 CST_INSN_FLAG_BRANCH_COND    = 1 << 0
@@ -58,7 +59,6 @@ FID_STORE_ADDR_BASE  = 0x11
 FID_LOAD_DATA_BASE   = 0x21
 FID_STORE_DATA_BASE  = 0x31
 FID_SRC_REG_BASE     = 0x41
-FID_DST_REG_BASE     = 0x51
 FID_N_STORES         = 0x61
 FID_INSN_BYTES_LO    = 0x70
 FID_INSN_BYTES_HI    = 0x71
@@ -91,7 +91,7 @@ ISA_NAMES = {
 SYNC_NONE          = 0
 SYNC_THREAD_SWITCH = 4
 SYNC_ATOMIC        = 5
-SYNC_HINT_NAMES = {0: "NONE", 4: "THREAD_SWITCH", 5: "ATOMIC"}
+SYNC_HINT_NAMES = {0: "SYNC_NONE", 4: "SYNC_THREAD_SWITCH", 5: "SYNC_ATOMIC"}
 
 OPCODE_NAMES = {
     0: "UNKNOWN", 1: "INT_ADD", 2: "INT_SUB", 3: "INT_MUL", 4: "INT_DIV",
@@ -99,7 +99,7 @@ OPCODE_NAMES = {
     9: "SHL", 10: "SHR", 11: "SAR", 12: "ROL", 13: "ROR",
     14: "MOV", 15: "LOAD", 16: "STORE", 17: "PUSH", 18: "POP",
     19: "LEA", 20: "MOVSX", 21: "MOVZX", 22: "XCHG",
-    23: "CMP", 24: "TEST", 25: "BRANCH", 26: "CALL", 27: "RET",
+    23: "CMP", 24: "TEST", 25: "BRANCH", 27: "RET",
     28: "FP_ADD", 29: "FP_SUB", 30: "FP_MUL", 31: "FP_DIV", 32: "FP_SQRT",
     33: "FP_MOV", 34: "FP_CVT", 35: "FP_CMP",
     36: "VEC_ADD", 37: "VEC_SUB", 38: "VEC_MUL", 39: "VEC_MOV",
@@ -115,8 +115,7 @@ OPCODE_NAMES = {
 BRANCH_NAMES = {
     0: "NONE",
     1: "DIRECT_JUMP", 2: "INDIRECT_JUMP",
-    3: "DIRECT_CALL", 4: "INDIRECT_CALL",
-    5: "RETURN", 6: "SYSCALL", 7: "COND_DIRECT",
+    3: "RETURN", 4: "SYSCALL", 5: "COND_DIRECT",
 }
 
 EXCEPTION_NAMES_DEFAULT = {
@@ -169,7 +168,6 @@ def build_field_id_names() -> dict[int, str]:
         names[FID_LOAD_DATA_BASE + i] = f"CST_FID_LOAD_DATA{i}"
         names[FID_STORE_DATA_BASE + i] = f"CST_FID_STORE_DATA{i}"
         names[FID_SRC_REG_BASE + i] = f"CST_FID_SRC_REG{i}"
-        names[FID_DST_REG_BASE + i] = f"CST_FID_DST_REG{i}"
     names[FID_N_STORES] = "CST_FID_N_STORES"
     names[FID_INSN_BYTES_LO] = "CST_FID_INSN_BYTES_LO"
     names[FID_INSN_BYTES_HI] = "CST_FID_INSN_BYTES_HI"
@@ -388,9 +386,9 @@ def _template_default(tmpl: dict | None, ipos: int, fid: int) -> int:
         return 0
     insn = insns[ipos]
     if fid == FID_N_LOADS:
-        return insn.get("n_loads", 0) & 0xFF
+        return 0
     if fid == FID_N_STORES:
-        return insn.get("n_stores", 0) & 0xFF
+        return 0
     if FID_INSN_BYTES_LO <= fid <= FID_INSN_SIZE:
         rb = insn.get("raw_bytes") or b""
         rb_int = int.from_bytes(rb, "little") if rb else 0
@@ -457,7 +455,7 @@ def _decode_field_delta_section(
     # template schema and reading current state for every relevant
     # (ins_pos, field_id).  This preserves the consumer-facing shape:
     # dyn_params is a flat list ordered by (insn_index, load-before-store,
-    # slot), reg_snaps is per-insn src-then-dst in operand order.
+    # slot), reg_snaps is per-insn source operands in operand order.
     dyn_params: list[DynParam] = []
     reg_snaps: list[dict] = []
 
@@ -494,7 +492,9 @@ def _decode_field_delta_section(
                 dp.data_hi = (d128 >> 64) & MASK64
             dyn_params.append(dp)
 
-        # Register snapshots — one entry per template src/dst slot.
+        # Register snapshots: source operands only. Destination register
+        # identities remain in the template, but dynamic destination values
+        # are not emitted by the writer's pre-execution capture path.
         # Skip if the REG_DATA flag is clear (no records will exist).
         if flags & CST_FLAG_REG_DATA:
             for op_i, reg_id in enumerate(insn.get("src_regs", [])):
@@ -502,16 +502,6 @@ def _decode_field_delta_section(
                 reg_snaps.append({
                     "insn_index": i,
                     "kind": "src",
-                    "operand_index": op_i,
-                    "reg_id": reg_id,
-                    "lo": v & MASK64,
-                    "hi": (v >> 64) & MASK64,
-                })
-            for op_i, reg_id in enumerate(insn.get("dst_regs", [])):
-                v = _state_or_default(i, FID_DST_REG_BASE + op_i)
-                reg_snaps.append({
-                    "insn_index": i,
-                    "kind": "dst",
                     "operand_index": op_i,
                     "reg_id": reg_id,
                     "lo": v & MASK64,
@@ -555,7 +545,6 @@ def decode_champsim_tracer(bin_path: Path
     datetime_str = br.string()
     comment      = br.string()
     target_name  = br.string()
-    thread_id    = br.uleb()
 
     encoding_maps: dict[str, dict[int, str]] = {}
     if br.pos < body_off:
@@ -588,6 +577,8 @@ def decode_champsim_tracer(bin_path: Path
 
     entries: list[dict] = []
     prev_entry_template = 0
+    current_thread = 0
+    pending_thread_switch = False
     cp_field_state: dict[tuple[int, int, int], int] = {}
     wp_field_state: dict[tuple[int, int, int], int] = {}
     footer_num_entries: int | None = None
@@ -598,6 +589,11 @@ def decode_champsim_tracer(bin_path: Path
         if tag == BODY_TAG_END:
             footer_num_entries = body.uleb()
             break
+
+        if tag == BODY_TAG_THREAD_SWITCH:
+            current_thread += body.sleb()
+            pending_thread_switch = True
+            continue
 
         if tag != BODY_TAG_ENTRY:
             raise ValueError(f"Unknown body tag: {tag}")
@@ -657,10 +653,13 @@ def decode_champsim_tracer(bin_path: Path
         entries.append({
             "seq_num": len(entries) + 1,
             "template_id": entry_tmpl,
+            "thread_id": current_thread,
+            "thread_switched": pending_thread_switch,
             "dyn_params": cp_dyn,
             "reg_snaps": cp_reg_snaps,
             "wp_entries": wp_entries,
         })
+        pending_thread_switch = False
 
     if footer_num_entries is not None and footer_num_entries != len(entries):
         raise ValueError(
@@ -678,7 +677,6 @@ def decode_champsim_tracer(bin_path: Path
         "comment": comment,
         "has_mem_data": has_mem_data,
         "has_reg_data": has_reg_data,
-        "thread_id": thread_id,
         "templates_off": templates_off,
         "templates_count": templates_count,
         "body_off": body_off,
@@ -768,7 +766,6 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
     out.append(f"COMMAND {meta.get('command', '')}")
     out.append(f"DATETIME {meta.get('datetime', '')}")
     out.append(f"COMMENT {meta.get('comment', '')}")
-    out.append(f"THREAD {meta.get('thread_id', 0)}")
     flags_str = ""
     if has_mem_data:
         flags_str += " MEM_DATA"
@@ -834,7 +831,12 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
     out.append("BODY")
     out.append("----")
     for entry_idx, entry in enumerate(entries):
-        out.append(f"ENTRY {entry['seq_num']:04d} template=BB{entry['template_id']}")
+        switch = " switch=1" if entry.get("thread_switched") else ""
+        out.append(
+            f"ENTRY {entry['seq_num']:04d} "
+            f"thread={entry.get('thread_id', 0)}{switch} "
+            f"template=BB{entry['template_id']}"
+        )
         out.append("  cp:")
         emit_observations("    ", entry["dyn_params"],
                           entry.get("reg_snaps", []))

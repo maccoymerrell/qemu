@@ -267,7 +267,7 @@ static void write_reg_encoding_map(BitWriter *bw)
 static void write_field_id_encoding_map(BitWriter *bw)
 {
     bw_write_string(bw, "field_id");
-    bw_write_uleb128(bw, 106);
+    bw_write_uleb128(bw, 90);
     write_encoding_entry(bw, CST_FID_N_LOADS, "CST_FID_N_LOADS");
     for (uint64_t i = 0; i < CST_FID_SLOT_COUNT; i++) {
         g_autofree char *name = g_strdup_printf("CST_FID_LOAD_ADDR%" PRIu64, i);
@@ -288,10 +288,6 @@ static void write_field_id_encoding_map(BitWriter *bw)
     for (uint64_t i = 0; i < CST_FID_SLOT_COUNT; i++) {
         g_autofree char *name = g_strdup_printf("CST_FID_SRC_REG%" PRIu64, i);
         write_encoding_entry(bw, CST_FID_SRC_REG_BASE + i, name);
-    }
-    for (uint64_t i = 0; i < CST_FID_SLOT_COUNT; i++) {
-        g_autofree char *name = g_strdup_printf("CST_FID_DST_REG%" PRIu64, i);
-        write_encoding_entry(bw, CST_FID_DST_REG_BASE + i, name);
     }
     static const EncodingMapEntry insn_fields[] = {
         { CST_FID_N_STORES, "CST_FID_N_STORES" },
@@ -338,7 +334,6 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         { GEN_OP_CMP, "GEN_OP_CMP" },
         { GEN_OP_TEST, "GEN_OP_TEST" },
         { GEN_OP_BRANCH, "GEN_OP_BRANCH" },
-        { GEN_OP_CALL, "GEN_OP_CALL" },
         { GEN_OP_RET, "GEN_OP_RET" },
         { GEN_OP_FP_ADD, "GEN_OP_FP_ADD" },
         { GEN_OP_FP_SUB, "GEN_OP_FP_SUB" },
@@ -375,8 +370,6 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         { BRANCH_NONE, "BRANCH_NONE" },
         { BRANCH_DIRECT_JUMP, "BRANCH_DIRECT_JUMP" },
         { BRANCH_INDIRECT_JUMP, "BRANCH_INDIRECT_JUMP" },
-        { BRANCH_DIRECT_CALL, "BRANCH_DIRECT_CALL" },
-        { BRANCH_INDIRECT_CALL, "BRANCH_INDIRECT_CALL" },
         { BRANCH_RETURN, "BRANCH_RETURN" },
         { BRANCH_SYSCALL_TYPE, "BRANCH_SYSCALL_TYPE" },
         { BRANCH_COND_DIRECT, "BRANCH_COND_DIRECT" },
@@ -399,6 +392,7 @@ static void write_header_encoding_maps(BitWriter *main_bw)
     static const EncodingMapEntry body_tag_entries[] = {
         { BODY_TAG_END, "BODY_TAG_END" },
         { BODY_TAG_ENTRY, "BODY_TAG_ENTRY" },
+        { BODY_TAG_THREAD_SWITCH, "BODY_TAG_THREAD_SWITCH" },
     };
     static const EncodingMapEntry wp_event_flag_entries[] = {
         { CST_WP_EVENT_TRANSLATION_UNAVAIL,
@@ -431,6 +425,7 @@ static void write_header_encoding_maps(BitWriter *main_bw)
 struct BodyStreamState {
     BitWriter bw;
     int64_t prev_entry_template;
+    int64_t current_thread;
     /* v1.7 unified field-state tables: keyed by (template_id, ins_pos,
      * field_id) → most-recent observed u128 value.  CP state persists
      * across the body.  WP state is overwritten by a snapshot of CP
@@ -439,7 +434,6 @@ struct BodyStreamState {
     GHashTable *cp_field_state;
     GHashTable *wp_field_state;
     uint64_t num_entries;
-    uint32_t thread_id;
     uint64_t body_off;
     uint8_t  header_flags;   /* CST_FLAG_* bits emitted in header */
 };
@@ -473,8 +467,8 @@ struct BodyStreamState {
  *   n_dst       : u8
  *   src_regs[n_src] : u8 each
  *   dst_regs[n_dst] : u8 each
- *   n_loads     : u8       (observed-max loads per execution)
- *   n_stores    : u8       (observed-max stores per execution)
+ *   n_loads     : u8       zero; runtime count is sparse N_LOADS
+ *   n_stores    : u8       zero; runtime count is sparse N_STORES
  *   [imm]       : SLEB128  (iff has_immediate)
  *   insn_size   : u8
  *   insn_bytes[insn_size]
@@ -533,8 +527,8 @@ static void write_bin_templates(BitWriter *bw)
             for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
                 bw_write_u8(&sub, fld->dst_regs[d]);
             }
-            bw_write_u8(&sub, fld->n_loads);
-            bw_write_u8(&sub, fld->n_stores);
+            bw_write_u8(&sub, 0);
+            bw_write_u8(&sub, 0);
             if (fld->has_immediate) {
                 bw_write_sleb128(&sub, fld->immediate);
             }
@@ -680,9 +674,10 @@ static bool extr_n_loads(const EntryView *ev, uint32_t i, uint8_t slot,
 static unsigned __int128 deflt_n_loads(const BBTemplate *t, uint32_t i,
                                        uint8_t slot)
 {
+    (void)t;
+    (void)i;
     (void)slot;
-    if (!t || i >= t->n_insns) return 0;
-    return (unsigned __int128)t->insn_fields[i].n_loads;
+    return 0;
 }
 
 static bool extr_n_stores(const EntryView *ev, uint32_t i, uint8_t slot,
@@ -696,9 +691,10 @@ static bool extr_n_stores(const EntryView *ev, uint32_t i, uint8_t slot,
 static unsigned __int128 deflt_n_stores(const BBTemplate *t, uint32_t i,
                                         uint8_t slot)
 {
+    (void)t;
+    (void)i;
     (void)slot;
-    if (!t || i >= t->n_insns) return 0;
-    return (unsigned __int128)t->insn_fields[i].n_stores;
+    return 0;
 }
 
 /* Locate the @slot-th memop of @insn matching @want_type
@@ -763,8 +759,9 @@ static bool extr_store_data(const EntryView *ev, uint32_t i, uint8_t slot,
 }
 
 /* Reg-snap families: the captured reg_snaps array is laid out per-insn
- * src-then-dst in template-walk order.  Slot index here corresponds to
- * the operand index within the insn's src or dst register array. */
+ * source operands only, in template-walk order.  Destination register
+ * identities remain in the template but destination values are not emitted
+ * from the pre-exec snapshot path. */
 static bool extr_src_reg(const EntryView *ev, uint32_t i, uint8_t slot,
                          unsigned __int128 *out)
 {
@@ -772,18 +769,6 @@ static bool extr_src_reg(const EntryView *ev, uint32_t i, uint8_t slot,
     const InsnFields *f = &ev->tmpl->insn_fields[i];
     if (slot >= f->n_src_regs) return false;
     uint32_t pos = ev->insn_rs_off[i] + slot;
-    if (pos >= ev->reg_snaps->len) return false;
-    const RegSnap *s = &g_array_index(ev->reg_snaps, RegSnap, pos);
-    *out = ((unsigned __int128)s->hi << 64) | s->lo;
-    return true;
-}
-static bool extr_dst_reg(const EntryView *ev, uint32_t i, uint8_t slot,
-                         unsigned __int128 *out)
-{
-    if (!ev->reg_snaps || !ev->tmpl) return false;
-    const InsnFields *f = &ev->tmpl->insn_fields[i];
-    if (slot >= f->n_dst_regs) return false;
-    uint32_t pos = ev->insn_rs_off[i] + f->n_src_regs + slot;
     if (pos >= ev->reg_snaps->len) return false;
     const RegSnap *s = &g_array_index(ev->reg_snaps, RegSnap, pos);
     *out = ((unsigned __int128)s->hi << 64) | s->lo;
@@ -906,8 +891,6 @@ static const FieldDescriptor field_descriptors[] = {
       extr_store_data,     deflt_zero,           "STORE_DATA" },
         { CST_FID_SRC_REG_BASE,     CST_FID_SLOT_COUNT, false, true,
       extr_src_reg,        deflt_zero,           "SRC_REG" },
-        { CST_FID_DST_REG_BASE,     CST_FID_SLOT_COUNT, false, true,
-      extr_dst_reg,        deflt_zero,           "DST_REG" },
         { CST_FID_N_STORES,         1,  false, false,
             extr_n_stores,       deflt_n_stores,        "N_STORES" },
         { CST_FID_INSN_BYTES_LO,    1,  false, false,
@@ -984,12 +967,12 @@ static void build_entry_view(EntryView *ev, const BBTemplate *tmpl,
     }
     insn_dp_off[n] = k;
 
-    /* Reg_snaps: per-insn n_src + n_dst, in template-walk order. */
+    /* Reg_snaps: per-insn source operands only, in template-walk order. */
     uint32_t r = 0;
     for (uint32_t i = 0; i < n; i++) {
         insn_rs_off[i] = r;
         const InsnFields *f = &tmpl->insn_fields[i];
-        r += f->n_src_regs + f->n_dst_regs;
+        r += f->n_src_regs;
     }
     insn_rs_off[n] = r;
 }
@@ -1121,8 +1104,7 @@ static void field_state_fork_wp(GHashTable *cp_state, GHashTable *wp_state)
 
 /* ========================= Body stream ========================= */
 
-BodyStreamState *body_stream_new(WriterCtx *w, uint32_t thread_id,
-                                 const char *seg_datetime)
+BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime)
 {
     BodyStreamState *st = g_new0(BodyStreamState, 1);
 
@@ -1166,8 +1148,6 @@ BodyStreamState *body_stream_new(WriterCtx *w, uint32_t thread_id,
         bw_write_bytes(&st->bw, (const uint8_t *)tname, len);
     }
 
-    bw_write_uleb128(&st->bw, (uint64_t)thread_id);
-
     write_header_encoding_maps(&st->bw);
 
     bw_byte_align(&st->bw);
@@ -1177,7 +1157,7 @@ BodyStreamState *body_stream_new(WriterCtx *w, uint32_t thread_id,
      * for streaming compression). */
     st->body_off = bw_tell_bytes(&st->bw);
 
-    st->thread_id = thread_id;
+    st->current_thread = 0;
 
     st->cp_field_state = g_hash_table_new_full(field_key_hash,
                                                field_key_equal,
@@ -1226,6 +1206,13 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
         dyn_params_sort_template_order(wp->dyn_params);
     }
 
+    if ((int64_t)entry->thread_id != st->current_thread) {
+        bw_write_u8(&st->bw, BODY_TAG_THREAD_SWITCH);
+        bw_write_sleb128(&st->bw,
+                         (int64_t)entry->thread_id - st->current_thread);
+        st->current_thread = entry->thread_id;
+    }
+
     bw_write_u8(&st->bw, BODY_TAG_ENTRY);
     bw_write_sleb128(&st->bw, entry_tmpl - st->prev_entry_template);
     st->prev_entry_template = entry_tmpl;
@@ -1239,7 +1226,7 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
         BitWriter sub;
         bw_init_buf(&sub);
         bw_write_uleb128(&sub, num_wp);
-        int64_t prev_wp_tid = 0;
+        int64_t prev_wp_template = 0;
         if (num_wp > 0) {
             /* Seed WP field-state from CP: speculative execution
              * starts at the CP architectural state and is rolled
@@ -1250,8 +1237,8 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
             const WPBBEntry *wp = &g_array_index(entry->wp_entries,
                                                  WPBBEntry, w);
             uint32_t wp_tmpl = wp->template_id;
-            bw_write_sleb128(&sub, (int64_t)wp_tmpl - prev_wp_tid);
-            prev_wp_tid = wp_tmpl;
+            bw_write_sleb128(&sub, (int64_t)wp_tmpl - prev_wp_template);
+            prev_wp_template = wp_tmpl;
             emit_one_bb_delta(&sub, st, st->wp_field_state, wp_tmpl,
                               wp->tmpl, wp->dyn_params, wp->reg_snaps,
                               true);

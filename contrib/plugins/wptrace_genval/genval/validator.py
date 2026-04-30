@@ -693,22 +693,16 @@ def _check_memop_insn_attribution(
         insns = tmpl.get("insns", [])
         n = len(insns)
 
-        # v1.6 contract: BBs are immutable, and per-insn (n_loads,
-        # n_stores) is exact for non-variable_memop insns; variable
-        # insns carry per-entry counts via the §4.1 preamble.  The
-        # decoder reconstructs `insn_index` by walking that schema in
-        # template order.  An out-of-range (-1) `insn_index` therefore
-        # means the runtime emitted more dyn_params than the schema's
-        # total declared memops — a tracer bug (mnemonic
-        # misclassification or missing variable_memop flag).  Emit a
-        # one-shot full dump of the template + dyn_params so the
-        # offending insn is identifiable from the validator output.
+        # BBs are immutable.  The decoder reconstructs insn_index by
+        # walking each entry's decoded per-insn memop counts.  An
+        # out-of-range insn_index means the runtime emitted more
+        # dyn_params than the decoded schema allowed.  Emit a one-shot
+        # full dump of the template + dyn_params so the offending insn
+        # is identifiable from the validator output.
         dps = list(e.get("dyn_params", []))
         sch_total = sum(int(ins.get("n_loads", 0)) +
                         int(ins.get("n_stores", 0))
                         for ins in insns)
-        any_variable = any(ins.get("variable_memop", False)
-                           for ins in insns)
         out_of_range = [dp for dp in dps if int(dp.insn_index) < 0
                         or int(dp.insn_index) >= n]
 
@@ -719,8 +713,7 @@ def _check_memop_insn_attribution(
                     f"    insn[{i:2d}] pc=0x{int(ins['pc']):x} "
                     f"opcode={ins.get('opcode', '?')} "
                     f"n_loads={int(ins.get('n_loads', 0))} "
-                    f"n_stores={int(ins.get('n_stores', 0))} "
-                    f"variable_memop={int(bool(ins.get('variable_memop', False)))}"
+                    f"n_stores={int(ins.get('n_stores', 0))}"
                 )
             dp_lines = []
             for j, dp in enumerate(dps):
@@ -732,7 +725,6 @@ def _check_memop_insn_attribution(
             detail = (
                 f"template t{tid} (start_pc=0x{int(tmpl.get('start_pc', 0)):x}, "
                 f"n_insns={n}, schema_total_memops={sch_total}, "
-                f"variable_memop_present={int(any_variable)}, "
                 f"dyn_params_received={len(dps)}):\n"
                 + "\n".join(schema_lines)
                 + "\n  dyn_params:\n"
@@ -744,18 +736,15 @@ def _check_memop_insn_attribution(
                 f"could not be attributed by schema walk "
                 f"(schema_total={sch_total}, dp_count={len(dps)}). "
                 f"Likely tracer bug: an opcode in this BB has wrong "
-                f"static (n_loads, n_stores) or is missing "
-                f"variable_memop.\n{detail}",
+                    f"decoded per-entry (n_loads, n_stores).\n{detail}",
                 {"template_id": tid, "n_insns": n,
                  "schema_total_memops": sch_total,
                  "dyn_params_received": len(dps),
-                 "variable_memop_present": any_variable,
                  "schema": [
                      {"pc": int(ins["pc"]),
                       "opcode": ins.get("opcode"),
                       "n_loads": int(ins.get("n_loads", 0)),
-                      "n_stores": int(ins.get("n_stores", 0)),
-                      "variable_memop": bool(ins.get("variable_memop", False))}
+                        "n_stores": int(ins.get("n_stores", 0))}
                      for ins in insns],
                  "dyn_params": [
                      {"kind": dp.type_name,

@@ -14,12 +14,12 @@
  * Direct register ID lookup: O(1) array index into the per-ISA
  * RegClassification table.
  */
-static uint8_t parse_reg_id(uint16_t cap_id)
+static const RegClassification *lookup_reg_class(uint16_t cap_id)
 {
     if (cap_id == 0 || cap_id >= active_reg_table_size) {
-        return REG_NONE;
+        return NULL;
     }
-    return active_reg_table[cap_id].reg_id;
+    return &active_reg_table[cap_id];
 }
 
 static inline void add_src_reg(InsnFields *f, uint8_t reg_id,
@@ -58,6 +58,38 @@ static inline void add_dst_reg(InsnFields *f, uint8_t reg_id,
     f->dst_regs[f->n_dst_regs++] = reg_id;
 }
 
+static inline void add_src_cap_reg(InsnFields *f, uint16_t cap_id,
+                                   InsnRegNames *names, const char *name)
+{
+    const RegClassification *rc = lookup_reg_class(cap_id);
+    if (!rc) {
+        return;
+    }
+    if (rc->n_regs) {
+        for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
+            add_src_reg(f, rc->regs[i], names, name);
+        }
+        return;
+    }
+    add_src_reg(f, rc->reg_id, names, name);
+}
+
+static inline void add_dst_cap_reg(InsnFields *f, uint16_t cap_id,
+                                   InsnRegNames *names, const char *name)
+{
+    const RegClassification *rc = lookup_reg_class(cap_id);
+    if (!rc) {
+        return;
+    }
+    if (rc->n_regs) {
+        for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
+            add_dst_reg(f, rc->regs[i], names, name);
+        }
+        return;
+    }
+    add_dst_reg(f, rc->reg_id, names, name);
+}
+
 static void warn_unknown_instruction(uint64_t pc, const char *reason,
                                      const char *mnem, const char *disas)
 {
@@ -73,45 +105,6 @@ static void warn_unknown_instruction(uint64_t pc, const char *reason,
     fflush(unknown_warn_file);
     stat_unknown_insn_warnings++;
     g_mutex_unlock(&unknown_warn_lock);
-}
-
-/*
- * Derive BranchType from Capstone instruction groups and MNEM-table
- * flags, without any string parsing.
- */
-static uint8_t branch_type_from_groups(uint16_t groups, uint16_t mf_flags)
-{
-    bool is_jump = (groups & QEMU_PLUGIN_GRP_JUMP) != 0;
-    bool is_call = (groups & QEMU_PLUGIN_GRP_CALL) != 0;
-    bool is_ret  = (groups & QEMU_PLUGIN_GRP_RET) != 0;
-    bool is_rel  = (groups & QEMU_PLUGIN_GRP_BRANCH_REL) != 0;
-    bool is_int  = (groups & QEMU_PLUGIN_GRP_INT) != 0;
-
-    if (is_int) {
-        return BRANCH_SYSCALL_TYPE;
-    }
-
-    if (is_ret) {
-        return BRANCH_RETURN;
-    }
-
-    if (is_call) {
-        if (is_rel) {
-            return BRANCH_DIRECT_CALL;
-        }
-        return BRANCH_INDIRECT_CALL;
-    }
-
-    if (is_jump) {
-        bool type_conditional = (mf_flags & MF_CONDITIONAL) != 0;
-        if (is_rel) {
-            return type_conditional ? BRANCH_COND_DIRECT
-                                    : BRANCH_DIRECT_JUMP;
-        }
-        return BRANCH_INDIRECT_JUMP;
-    }
-
-    return BRANCH_NONE;
 }
 
 /*
@@ -141,8 +134,9 @@ static const InsnClassification *classify_insn_id(
 
 /*
  * Decode structured Capstone detail into ISA-agnostic InsnFields.
- * Operand roles, branch type, implicit registers, and prefixes all come
- * directly from Capstone's structured output — no disassembly parsing.
+ * Operand roles, implicit registers, and prefixes come directly from
+ * Capstone's structured output.  Opcode and branch type come from the
+ * mnemonic classification table.
  */
 void decode_detail_to_generic(uint64_t pc,
                               const qemu_plugin_insn_info *info,
@@ -166,10 +160,6 @@ void decode_detail_to_generic(uint64_t pc,
         out->sync_hint = SYNC_ATOMIC;
     }
 
-    if (flags & MF_VARIABLE_MEMOP) {
-        out->variable_memop = true;
-    }
-
     if (out->opcode == GEN_OP_UNKNOWN) {
         char disas_buf[256];
         g_snprintf(disas_buf, sizeof(disas_buf), "%s %s",
@@ -177,24 +167,6 @@ void decode_detail_to_generic(uint64_t pc,
         warn_unknown_instruction(pc, "unknown_mnemonic",
                                  info->mnemonic, disas_buf);
         return;
-    }
-
-    /*
-     * Prefer Capstone group-based branch classification; only keep the
-     * MNEM table's branch_type when it identifies an INDIRECT variant
-     * that Capstone would otherwise downgrade to DIRECT (some Capstone
-     * builds set BRANCH_RELATIVE on BLR/BR).
-     */
-    uint8_t cap_branch = branch_type_from_groups(info->groups, flags);
-    uint8_t mnem_branch = out->branch_type;
-    if (cap_branch != BRANCH_NONE) {
-        bool mnem_indirect = (mnem_branch == BRANCH_INDIRECT_CALL ||
-                              mnem_branch == BRANCH_INDIRECT_JUMP);
-        bool cap_direct = (cap_branch == BRANCH_DIRECT_CALL ||
-                           cap_branch == BRANCH_DIRECT_JUMP);
-        if (!(mnem_indirect && cap_direct)) {
-            out->branch_type = cap_branch;
-        }
     }
 
     if (flags & MF_CONDITIONAL) {
@@ -238,22 +210,18 @@ void decode_detail_to_generic(uint64_t pc,
 
         switch (op->type) {
         case QEMU_PLUGIN_OP_REG: {
-            uint8_t r = parse_reg_id(op->reg_id);
-            if (r == REG_NONE) {
-                break;
-            }
             if (have_access_info) {
                 if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
-                    add_src_reg(out, r, out_names, op->reg_name);
+                    add_src_cap_reg(out, op->reg_id, out_names, op->reg_name);
                 }
                 if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
-                    add_dst_reg(out, r, out_names, op->reg_name);
+                    add_dst_cap_reg(out, op->reg_id, out_names, op->reg_name);
                 }
             } else {
                 if (first_is_dst && !seen_first_reg) {
-                    add_dst_reg(out, r, out_names, op->reg_name);
+                    add_dst_cap_reg(out, op->reg_id, out_names, op->reg_name);
                 } else {
-                    add_src_reg(out, r, out_names, op->reg_name);
+                    add_src_cap_reg(out, op->reg_id, out_names, op->reg_name);
                 }
                 seen_first_reg = true;
             }
@@ -267,14 +235,8 @@ void decode_detail_to_generic(uint64_t pc,
             break;
         case QEMU_PLUGIN_OP_MEM: {
             saw_mem_op = true;
-            uint8_t base = parse_reg_id(op->reg_id);
-            if (base != REG_NONE) {
-                add_src_reg(out, base, out_names, op->reg_name);
-            }
-            uint8_t idx = parse_reg_id(op->index_id);
-            if (idx != REG_NONE) {
-                add_src_reg(out, idx, out_names, op->index_name);
-            }
+            add_src_cap_reg(out, op->reg_id, out_names, op->reg_name);
+            add_src_cap_reg(out, op->index_id, out_names, op->index_name);
             /*
              * Populate per-insn observed-max load/store count from
              * Capstone operand access flags.  Missing flag info (some
@@ -303,16 +265,12 @@ void decode_detail_to_generic(uint64_t pc,
 
     /* Implicit registers from Capstone detail. */
     for (uint8_t i = 0; i < info->n_regs_read; i++) {
-        uint8_t r = parse_reg_id(info->regs_read_id[i]);
-        if (r != REG_NONE) {
-            add_src_reg(out, r, out_names, info->regs_read[i]);
-        }
+        add_src_cap_reg(out, info->regs_read_id[i], out_names,
+                        info->regs_read[i]);
     }
     for (uint8_t i = 0; i < info->n_regs_write; i++) {
-        uint8_t r = parse_reg_id(info->regs_write_id[i]);
-        if (r != REG_NONE) {
-            add_dst_reg(out, r, out_names, info->regs_write[i]);
-        }
+        add_dst_cap_reg(out, info->regs_write_id[i], out_names,
+                        info->regs_write[i]);
     }
 
     /*

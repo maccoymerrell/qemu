@@ -1,5 +1,5 @@
 /*
- * Wrong-Path Tracing Plugin — binary format v1.2 writer.
+ * Wrong-Path Tracing Plugin - binary format v1.7 writer.
  *
  * BitWriter primitives, template dictionary serializer, dyn-param
  * patch emitter, body entry streamer, and trailer writer for the
@@ -110,6 +110,17 @@ static inline void bw_write_bytes(BitWriter *bw, const uint8_t *buf, size_t len)
     bw_raw(bw, buf, len);
 }
 
+static void bw_write_uleb128(BitWriter *bw, uint64_t v);
+
+static void bw_write_string(BitWriter *bw, const char *str)
+{
+    size_t len = str ? strlen(str) : 0;
+    bw_write_uleb128(bw, len);
+    if (len) {
+        bw_write_bytes(bw, (const uint8_t *)str, len);
+    }
+}
+
 static void bw_write_uleb128(BitWriter *bw, uint64_t v)
 {
     uint8_t buf[10];
@@ -176,6 +187,245 @@ static void bw_write_section(BitWriter *main_bw, GByteArray *data)
     bw_write_uleb128(main_bw, data->len);
     bw_raw(main_bw, data->data, data->len);
     g_byte_array_unref(data);
+}
+
+typedef struct EncodingMapEntry {
+    uint64_t value;
+    const char *name;
+} EncodingMapEntry;
+
+static void write_encoding_entry(BitWriter *bw, uint64_t value,
+                                 const char *name)
+{
+    bw_write_uleb128(bw, value);
+    bw_write_string(bw, name);
+}
+
+static void write_encoding_map(BitWriter *bw, const char *map_name,
+                               const EncodingMapEntry *entries,
+                               size_t n_entries)
+{
+    bw_write_string(bw, map_name);
+    bw_write_uleb128(bw, n_entries);
+    for (size_t i = 0; i < n_entries; i++) {
+        write_encoding_entry(bw, entries[i].value, entries[i].name);
+    }
+}
+
+static void write_reg_encoding_map(BitWriter *bw)
+{
+    bw_write_string(bw, "reg");
+    bw_write_uleb128(bw, 251);
+    write_encoding_entry(bw, REG_NONE, "REG_NONE");
+    for (uint64_t i = 0; i < 64; i++) {
+        g_autofree char *name = g_strdup_printf("REG_GPR%" PRIu64, i);
+        write_encoding_entry(bw, REG_GPR0 + i, name);
+    }
+    for (uint64_t i = 0; i < 64; i++) {
+        g_autofree char *name = g_strdup_printf("REG_FPR%" PRIu64, i);
+        write_encoding_entry(bw, REG_FPR0 + i, name);
+    }
+    for (uint64_t i = 0; i < 64; i++) {
+        g_autofree char *name = g_strdup_printf("REG_VEC%" PRIu64, i);
+        write_encoding_entry(bw, REG_VEC0 + i, name);
+    }
+    for (uint64_t i = 0; i < 32; i++) {
+        g_autofree char *name = g_strdup_printf("REG_PRED%" PRIu64, i);
+        write_encoding_entry(bw, REG_PRED0 + i, name);
+    }
+    for (uint64_t i = 0; i < 6; i++) {
+        g_autofree char *name = g_strdup_printf("REG_SEG%" PRIu64, i);
+        write_encoding_entry(bw, REG_SEG0 + i, name);
+    }
+    static const EncodingMapEntry special_regs[] = {
+        { REG_CTRL, "REG_CTRL" },
+        { REG_DEBUG, "REG_DEBUG" },
+        { REG_BOUND0, "REG_BOUND0" },
+        { REG_BOUND1, "REG_BOUND1" },
+        { REG_BOUND2, "REG_BOUND2" },
+        { REG_BOUND3, "REG_BOUND3" },
+        { REG_ACC0, "REG_ACC0" },
+        { REG_ACC1, "REG_ACC1" },
+        { REG_ACC2, "REG_ACC2" },
+        { REG_ACC3, "REG_ACC3" },
+        { REG_ZERO, "REG_ZERO" },
+        { REG_MATRIX, "REG_MATRIX" },
+        { REG_SYS, "REG_SYS" },
+        { REG_FCSR, "REG_FCSR" },
+        { REG_VCTRL, "REG_VCTRL" },
+        { REG_SP, "REG_SP" },
+        { REG_FLAGS, "REG_FLAGS" },
+        { REG_IP, "REG_IP" },
+        { REG_LR, "REG_LR" },
+        { REG_FP_REG, "REG_FP_REG" },
+    };
+    for (size_t i = 0; i < G_N_ELEMENTS(special_regs); i++) {
+        write_encoding_entry(bw, special_regs[i].value, special_regs[i].name);
+    }
+}
+
+static void write_field_id_encoding_map(BitWriter *bw)
+{
+    bw_write_string(bw, "field_id");
+    bw_write_uleb128(bw, 106);
+    write_encoding_entry(bw, CST_FID_N_LOADS, "CST_FID_N_LOADS");
+    for (uint64_t i = 0; i < CST_FID_SLOT_COUNT; i++) {
+        g_autofree char *name = g_strdup_printf("CST_FID_LOAD_ADDR%" PRIu64, i);
+        write_encoding_entry(bw, CST_FID_LOAD_ADDR_BASE + i, name);
+    }
+    for (uint64_t i = 0; i < CST_FID_SLOT_COUNT; i++) {
+        g_autofree char *name = g_strdup_printf("CST_FID_STORE_ADDR%" PRIu64, i);
+        write_encoding_entry(bw, CST_FID_STORE_ADDR_BASE + i, name);
+    }
+    for (uint64_t i = 0; i < CST_FID_SLOT_COUNT; i++) {
+        g_autofree char *name = g_strdup_printf("CST_FID_LOAD_DATA%" PRIu64, i);
+        write_encoding_entry(bw, CST_FID_LOAD_DATA_BASE + i, name);
+    }
+    for (uint64_t i = 0; i < CST_FID_SLOT_COUNT; i++) {
+        g_autofree char *name = g_strdup_printf("CST_FID_STORE_DATA%" PRIu64, i);
+        write_encoding_entry(bw, CST_FID_STORE_DATA_BASE + i, name);
+    }
+    for (uint64_t i = 0; i < CST_FID_SLOT_COUNT; i++) {
+        g_autofree char *name = g_strdup_printf("CST_FID_SRC_REG%" PRIu64, i);
+        write_encoding_entry(bw, CST_FID_SRC_REG_BASE + i, name);
+    }
+    for (uint64_t i = 0; i < CST_FID_SLOT_COUNT; i++) {
+        g_autofree char *name = g_strdup_printf("CST_FID_DST_REG%" PRIu64, i);
+        write_encoding_entry(bw, CST_FID_DST_REG_BASE + i, name);
+    }
+    static const EncodingMapEntry insn_fields[] = {
+        { CST_FID_N_STORES, "CST_FID_N_STORES" },
+        { CST_FID_INSN_BYTES_LO, "CST_FID_INSN_BYTES_LO" },
+        { CST_FID_INSN_BYTES_HI, "CST_FID_INSN_BYTES_HI" },
+        { CST_FID_INSN_OPCODE, "CST_FID_INSN_OPCODE" },
+        { CST_FID_INSN_BRANCH_TYPE, "CST_FID_INSN_BRANCH_TYPE" },
+        { CST_FID_INSN_FLAGS, "CST_FID_INSN_FLAGS" },
+        { CST_FID_INSN_IMMEDIATE, "CST_FID_INSN_IMMEDIATE" },
+        { CST_FID_INSN_SIZE, "CST_FID_INSN_SIZE" },
+        { CST_FID_EXTENDED, "CST_FID_EXTENDED" },
+    };
+    for (size_t i = 0; i < G_N_ELEMENTS(insn_fields); i++) {
+        write_encoding_entry(bw, insn_fields[i].value, insn_fields[i].name);
+    }
+}
+
+static void write_header_encoding_maps(BitWriter *main_bw)
+{
+    static const EncodingMapEntry opcode_entries[] = {
+        { GEN_OP_UNKNOWN, "GEN_OP_UNKNOWN" },
+        { GEN_OP_INT_ADD, "GEN_OP_INT_ADD" },
+        { GEN_OP_INT_SUB, "GEN_OP_INT_SUB" },
+        { GEN_OP_INT_MUL, "GEN_OP_INT_MUL" },
+        { GEN_OP_INT_DIV, "GEN_OP_INT_DIV" },
+        { GEN_OP_AND, "GEN_OP_AND" },
+        { GEN_OP_OR, "GEN_OP_OR" },
+        { GEN_OP_XOR, "GEN_OP_XOR" },
+        { GEN_OP_NOT, "GEN_OP_NOT" },
+        { GEN_OP_SHL, "GEN_OP_SHL" },
+        { GEN_OP_SHR, "GEN_OP_SHR" },
+        { GEN_OP_SAR, "GEN_OP_SAR" },
+        { GEN_OP_ROL, "GEN_OP_ROL" },
+        { GEN_OP_ROR, "GEN_OP_ROR" },
+        { GEN_OP_MOV, "GEN_OP_MOV" },
+        { GEN_OP_LOAD, "GEN_OP_LOAD" },
+        { GEN_OP_STORE, "GEN_OP_STORE" },
+        { GEN_OP_PUSH, "GEN_OP_PUSH" },
+        { GEN_OP_POP, "GEN_OP_POP" },
+        { GEN_OP_LEA, "GEN_OP_LEA" },
+        { GEN_OP_MOVSX, "GEN_OP_MOVSX" },
+        { GEN_OP_MOVZX, "GEN_OP_MOVZX" },
+        { GEN_OP_XCHG, "GEN_OP_XCHG" },
+        { GEN_OP_CMP, "GEN_OP_CMP" },
+        { GEN_OP_TEST, "GEN_OP_TEST" },
+        { GEN_OP_BRANCH, "GEN_OP_BRANCH" },
+        { GEN_OP_CALL, "GEN_OP_CALL" },
+        { GEN_OP_RET, "GEN_OP_RET" },
+        { GEN_OP_FP_ADD, "GEN_OP_FP_ADD" },
+        { GEN_OP_FP_SUB, "GEN_OP_FP_SUB" },
+        { GEN_OP_FP_MUL, "GEN_OP_FP_MUL" },
+        { GEN_OP_FP_DIV, "GEN_OP_FP_DIV" },
+        { GEN_OP_FP_SQRT, "GEN_OP_FP_SQRT" },
+        { GEN_OP_FP_MOV, "GEN_OP_FP_MOV" },
+        { GEN_OP_FP_CVT, "GEN_OP_FP_CVT" },
+        { GEN_OP_FP_CMP, "GEN_OP_FP_CMP" },
+        { GEN_OP_VEC_ADD, "GEN_OP_VEC_ADD" },
+        { GEN_OP_VEC_SUB, "GEN_OP_VEC_SUB" },
+        { GEN_OP_VEC_MUL, "GEN_OP_VEC_MUL" },
+        { GEN_OP_VEC_MOV, "GEN_OP_VEC_MOV" },
+        { GEN_OP_VEC_SHUF, "GEN_OP_VEC_SHUF" },
+        { GEN_OP_VEC_LOGIC, "GEN_OP_VEC_LOGIC" },
+        { GEN_OP_NOP, "GEN_OP_NOP" },
+        { GEN_OP_SYSCALL, "GEN_OP_SYSCALL" },
+        { GEN_OP_FENCE, "GEN_OP_FENCE" },
+        { GEN_OP_CMOV, "GEN_OP_CMOV" },
+        { GEN_OP_SETCC, "GEN_OP_SETCC" },
+        { GEN_OP_INT_ADC, "GEN_OP_INT_ADC" },
+        { GEN_OP_INT_SBB, "GEN_OP_INT_SBB" },
+        { GEN_OP_NEG, "GEN_OP_NEG" },
+        { GEN_OP_INC, "GEN_OP_INC" },
+        { GEN_OP_DEC, "GEN_OP_DEC" },
+        { GEN_OP_INT_MADD, "GEN_OP_INT_MADD" },
+        { GEN_OP_INT_MSUB, "GEN_OP_INT_MSUB" },
+        { GEN_OP_FP_MADD, "GEN_OP_FP_MADD" },
+        { GEN_OP_FP_MSUB, "GEN_OP_FP_MSUB" },
+        { GEN_OP_VEC_MADD, "GEN_OP_VEC_MADD" },
+        { GEN_OP_VEC_MSUB, "GEN_OP_VEC_MSUB" },
+    };
+    static const EncodingMapEntry branch_entries[] = {
+        { BRANCH_NONE, "BRANCH_NONE" },
+        { BRANCH_DIRECT_JUMP, "BRANCH_DIRECT_JUMP" },
+        { BRANCH_INDIRECT_JUMP, "BRANCH_INDIRECT_JUMP" },
+        { BRANCH_DIRECT_CALL, "BRANCH_DIRECT_CALL" },
+        { BRANCH_INDIRECT_CALL, "BRANCH_INDIRECT_CALL" },
+        { BRANCH_RETURN, "BRANCH_RETURN" },
+        { BRANCH_SYSCALL_TYPE, "BRANCH_SYSCALL_TYPE" },
+        { BRANCH_COND_DIRECT, "BRANCH_COND_DIRECT" },
+    };
+    static const EncodingMapEntry sync_entries[] = {
+        { SYNC_NONE, "SYNC_NONE" },
+        { SYNC_THREAD_SWITCH, "SYNC_THREAD_SWITCH" },
+        { SYNC_ATOMIC, "SYNC_ATOMIC" },
+    };
+    static const EncodingMapEntry header_flag_entries[] = {
+        { CST_FLAG_MEM_DATA, "CST_FLAG_MEM_DATA" },
+        { CST_FLAG_REG_DATA, "CST_FLAG_REG_DATA" },
+        { CST_FLAG_RESERVED_2, "CST_FLAG_RESERVED_2" },
+    };
+    static const EncodingMapEntry insn_flag_entries[] = {
+        { CST_INSN_FLAG_BRANCH_COND, "CST_INSN_FLAG_BRANCH_COND" },
+        { CST_INSN_FLAG_HAS_IMM, "CST_INSN_FLAG_HAS_IMM" },
+        { CST_INSN_FLAG_SYNC_MASK, "CST_INSN_FLAG_SYNC_MASK" },
+    };
+    static const EncodingMapEntry body_tag_entries[] = {
+        { BODY_TAG_END, "BODY_TAG_END" },
+        { BODY_TAG_ENTRY, "BODY_TAG_ENTRY" },
+    };
+    static const EncodingMapEntry wp_event_flag_entries[] = {
+        { CST_WP_EVENT_TRANSLATION_UNAVAIL,
+          "CST_WP_EVENT_TRANSLATION_UNAVAIL" },
+        { CST_WP_EVENT_FAULT, "CST_WP_EVENT_FAULT" },
+    };
+
+    BitWriter sub;
+    bw_init_buf(&sub);
+    bw_write_uleb128(&sub, 9);
+    write_encoding_map(&sub, "opcode", opcode_entries,
+                       G_N_ELEMENTS(opcode_entries));
+    write_encoding_map(&sub, "branch_type", branch_entries,
+                       G_N_ELEMENTS(branch_entries));
+    write_encoding_map(&sub, "sync_hint", sync_entries,
+                       G_N_ELEMENTS(sync_entries));
+    write_reg_encoding_map(&sub);
+    write_field_id_encoding_map(&sub);
+    write_encoding_map(&sub, "header_flag", header_flag_entries,
+                       G_N_ELEMENTS(header_flag_entries));
+    write_encoding_map(&sub, "insn_flag", insn_flag_entries,
+                       G_N_ELEMENTS(insn_flag_entries));
+    write_encoding_map(&sub, "body_tag", body_tag_entries,
+                       G_N_ELEMENTS(body_tag_entries));
+    write_encoding_map(&sub, "wp_event_flag", wp_event_flag_entries,
+                       G_N_ELEMENTS(wp_event_flag_entries));
+    bw_write_section(main_bw, bw_finish_buf(&sub));
 }
 
 struct BodyStreamState {
@@ -273,9 +523,6 @@ static void write_bin_templates(BitWriter *bw)
             }
             flags |= (uint8_t)((fld->sync_hint & 0x0F)
                                << CST_INSN_FLAG_SYNC_SHIFT);
-            if (fld->variable_memop) {
-                flags |= CST_INSN_FLAG_VARIABLE_MEMOP;
-            }
             bw_write_u8(&sub, flags);
 
             bw_write_u8(&sub, fld->n_src_regs);
@@ -305,10 +552,9 @@ static void write_bin_templates(BitWriter *bw)
 
 /* ========================= Dyn param helpers ========================= */
 
-/* ============== v1.7 unified field-typed delta stream ==============
+/* ============== Unified field-typed delta stream ==============
  *
- * Replaces the v1.6 dyn-patch / mem-data / reg-data sub-sections and
- * the variable-memop preamble.  Each BB entry carries a single
+ * Each BB entry carries a single
  * length-prefixed `delta_section`:
  *
  *     n_records : ULEB
@@ -389,8 +635,6 @@ struct EntryView {
     const BBTemplate *tmpl;
     const GArray *dyn_params;   /* DynParam[]; sorted (insn_index,type)  */
     const GArray *reg_snaps;    /* RegSnap[]; template-walk order        */
-    /* Pre-walked per-insn (n_loads, n_stores) actual counts (length =
-     * tmpl->n_insns).  Computed once per entry by walk_dyn_params(). */
     const uint8_t *actual_n_loads;
     const uint8_t *actual_n_stores;
     /* Pre-walked dyn_param index of the first load slot for insn i
@@ -408,7 +652,6 @@ typedef struct {
     uint8_t slot_count;        /* 1 for non-slotted families */
     bool gated_by_mem_data;
     bool gated_by_reg_data;
-    bool gated_by_insn_mut;
     /* extract: returns true and writes *out_val if (ins_pos, slot)
      * has an observable value in this entry; returns false to skip
      * (e.g. unused memop slot). */
@@ -426,28 +669,36 @@ typedef struct {
 
 /* ---------- Per-family extract/default callbacks ---------- */
 
-static bool extr_memop_count(const EntryView *ev, uint32_t i, uint8_t slot,
-                             unsigned __int128 *out)
+static bool extr_n_loads(const EntryView *ev, uint32_t i, uint8_t slot,
+                         unsigned __int128 *out)
 {
     (void)slot;
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
-    const InsnFields *f = &ev->tmpl->insn_fields[i];
-    /* Only emit MEMOP_COUNT for variable-memop insns; otherwise the
-     * count is statically known and the field would always equal its
-     * default (no record needed). */
-    if (!f->variable_memop) return false;
-    uint64_t v = ((uint64_t)ev->actual_n_loads[i] << 8)
-               | (uint64_t)ev->actual_n_stores[i];
-    *out = (unsigned __int128)v;
+    *out = (unsigned __int128)ev->actual_n_loads[i];
     return true;
 }
-static unsigned __int128 deflt_memop_count(const BBTemplate *t, uint32_t i,
-                                           uint8_t slot)
+static unsigned __int128 deflt_n_loads(const BBTemplate *t, uint32_t i,
+                                       uint8_t slot)
 {
     (void)slot;
     if (!t || i >= t->n_insns) return 0;
-    const InsnFields *f = &t->insn_fields[i];
-    return ((unsigned __int128)f->n_loads << 8) | (unsigned __int128)f->n_stores;
+    return (unsigned __int128)t->insn_fields[i].n_loads;
+}
+
+static bool extr_n_stores(const EntryView *ev, uint32_t i, uint8_t slot,
+                          unsigned __int128 *out)
+{
+    (void)slot;
+    if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
+    *out = (unsigned __int128)ev->actual_n_stores[i];
+    return true;
+}
+static unsigned __int128 deflt_n_stores(const BBTemplate *t, uint32_t i,
+                                        uint8_t slot)
+{
+    (void)slot;
+    if (!t || i >= t->n_insns) return 0;
+    return (unsigned __int128)t->insn_fields[i].n_stores;
 }
 
 /* Locate the @slot-th memop of @insn matching @want_type
@@ -610,7 +861,6 @@ static unsigned __int128 deflt_insn_flags(const BBTemplate *t,
     if (f->branch_conditional) flags |= CST_INSN_FLAG_BRANCH_COND;
     if (f->has_immediate)      flags |= CST_INSN_FLAG_HAS_IMM;
     flags |= (uint8_t)((f->sync_hint & 0x0F) << CST_INSN_FLAG_SYNC_SHIFT);
-    if (f->variable_memop)     flags |= CST_INSN_FLAG_VARIABLE_MEMOP;
     return (unsigned __int128)flags;
 }
 static bool extr_insn_flags(const EntryView *ev, uint32_t i, uint8_t slot,
@@ -644,33 +894,35 @@ static bool extr_insn_size(const EntryView *ev, uint32_t i, uint8_t slot,
 /* Field family registry.  Order MUST be ascending by base_field_id so
  * the emitter walks records in (ins_pos, field_id) order. */
 static const FieldDescriptor field_descriptors[] = {
-    { CST_FID_MEMOP_COUNT,      1,  false, false, false,
-      extr_memop_count,    deflt_memop_count,    "MEMOP_COUNT" },
-    { CST_FID_LOAD_ADDR_BASE,   CST_FID_SLOT_COUNT, false, false, false,
+        { CST_FID_N_LOADS,          1,  false, false,
+            extr_n_loads,        deflt_n_loads,         "N_LOADS" },
+        { CST_FID_LOAD_ADDR_BASE,   CST_FID_SLOT_COUNT, false, false,
       extr_load_addr,      deflt_zero,           "LOAD_ADDR" },
-    { CST_FID_STORE_ADDR_BASE,  CST_FID_SLOT_COUNT, false, false, false,
+        { CST_FID_STORE_ADDR_BASE,  CST_FID_SLOT_COUNT, false, false,
       extr_store_addr,     deflt_zero,           "STORE_ADDR" },
-    { CST_FID_LOAD_DATA_BASE,   CST_FID_SLOT_COUNT, true,  false, false,
+        { CST_FID_LOAD_DATA_BASE,   CST_FID_SLOT_COUNT, true,  false,
       extr_load_data,      deflt_zero,           "LOAD_DATA" },
-    { CST_FID_STORE_DATA_BASE,  CST_FID_SLOT_COUNT, true,  false, false,
+        { CST_FID_STORE_DATA_BASE,  CST_FID_SLOT_COUNT, true,  false,
       extr_store_data,     deflt_zero,           "STORE_DATA" },
-    { CST_FID_SRC_REG_BASE,     CST_FID_SLOT_COUNT, false, true,  false,
+        { CST_FID_SRC_REG_BASE,     CST_FID_SLOT_COUNT, false, true,
       extr_src_reg,        deflt_zero,           "SRC_REG" },
-    { CST_FID_DST_REG_BASE,     CST_FID_SLOT_COUNT, false, true,  false,
+        { CST_FID_DST_REG_BASE,     CST_FID_SLOT_COUNT, false, true,
       extr_dst_reg,        deflt_zero,           "DST_REG" },
-    { CST_FID_INSN_BYTES_LO,    1,  false, false, true,
+        { CST_FID_N_STORES,         1,  false, false,
+            extr_n_stores,       deflt_n_stores,        "N_STORES" },
+        { CST_FID_INSN_BYTES_LO,    1,  false, false,
       extr_insn_bytes_lo,  deflt_insn_bytes_lo,  "INSN_BYTES_LO" },
-    { CST_FID_INSN_BYTES_HI,    1,  false, false, true,
+        { CST_FID_INSN_BYTES_HI,    1,  false, false,
       extr_insn_bytes_hi,  deflt_insn_bytes_hi,  "INSN_BYTES_HI" },
-    { CST_FID_INSN_OPCODE,      1,  false, false, true,
+        { CST_FID_INSN_OPCODE,      1,  false, false,
       extr_insn_opcode,    deflt_insn_opcode,    "OPCODE" },
-    { CST_FID_INSN_BRANCH_TYPE, 1,  false, false, true,
+        { CST_FID_INSN_BRANCH_TYPE, 1,  false, false,
       extr_insn_branch_type, deflt_insn_branch_type, "BRANCH_TYPE" },
-    { CST_FID_INSN_FLAGS,       1,  false, false, true,
+        { CST_FID_INSN_FLAGS,       1,  false, false,
       extr_insn_flags,     deflt_insn_flags,     "INSN_FLAGS" },
-    { CST_FID_INSN_IMMEDIATE,   1,  false, false, true,
+        { CST_FID_INSN_IMMEDIATE,   1,  false, false,
       extr_insn_imm,       deflt_insn_imm,       "IMMEDIATE" },
-    { CST_FID_INSN_SIZE,        1,  false, false, true,
+        { CST_FID_INSN_SIZE,        1,  false, false,
       extr_insn_size,      deflt_insn_size,      "INSN_SIZE" },
 };
 
@@ -715,15 +967,12 @@ static void build_entry_view(EntryView *ev, const BBTemplate *tmpl,
     if (!tmpl) return;
 
     uint32_t n = tmpl->n_insns;
-    for (uint32_t i = 0; i < n; i++) {
-        actual_n_loads[i] = 0;
-        actual_n_stores[i] = 0;
-    }
-
     /* Walk dyn_params (already sorted by insn_index, type) once. */
     uint32_t k = 0;
     uint32_t total_dp = dyn_params ? dyn_params->len : 0;
     for (uint32_t i = 0; i < n; i++) {
+        actual_n_loads[i] = 0;
+        actual_n_stores[i] = 0;
         insn_dp_off[i] = k;
         while (k < total_dp) {
             const DynParam *dp = &g_array_index(dyn_params, DynParam, k);
@@ -814,8 +1063,6 @@ static void emit_field_delta_section(BitWriter *main_bw,
                     continue;
                 if (fd->gated_by_reg_data && !(header_flags & CST_FLAG_REG_DATA))
                     continue;
-                if (fd->gated_by_insn_mut && !(header_flags & CST_FLAG_INSN_MUT))
-                    continue;
 
                 for (uint8_t slot = 0; slot < fd->slot_count; slot++) {
                     unsigned __int128 cur;
@@ -891,9 +1138,6 @@ BodyStreamState *body_stream_new(WriterCtx *w, uint32_t thread_id,
     if (enable_reg_data) {
         flags |= CST_FLAG_REG_DATA;
     }
-    /* CST_FLAG_INSN_MUT is left clear: no SMC observer is wired up
-     * yet, so the writer never produces CST_FID_INSN_* records.  When
-     * an SMC capture path is added, set this bit here. */
     bw_write_u8(&st->bw, flags);
     st->header_flags = flags;
 
@@ -923,6 +1167,8 @@ BodyStreamState *body_stream_new(WriterCtx *w, uint32_t thread_id,
     }
 
     bw_write_uleb128(&st->bw, (uint64_t)thread_id);
+
+    write_header_encoding_maps(&st->bw);
 
     bw_byte_align(&st->bw);
     bw_flush(&st->bw);
@@ -962,8 +1208,8 @@ static void emit_one_bb_delta(BitWriter *bw, BodyStreamState *st,
     g_autofree uint8_t *ans = g_new0(uint8_t, n ? n : 1);
     g_autofree uint32_t *dpoff = g_new0(uint32_t, (n ? n : 0) + 1);
     g_autofree uint32_t *rsoff = g_new0(uint32_t, (n ? n : 0) + 1);
-    build_entry_view(&ev, tmpl, dyn_params, reg_snaps,
-                     anl, ans, dpoff, rsoff);
+    build_entry_view(&ev, tmpl, dyn_params, reg_snaps, anl, ans,
+                     dpoff, rsoff);
     emit_field_delta_section(bw, state, template_id, &ev, is_wp,
                              st->header_flags);
 }
@@ -1047,11 +1293,8 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
                 evf |= CST_WP_EVENT_FAULT;
             }
             bw_write_u8(&sub, evf);
-            /*
-             * v1.2: when CST_WP_EVENT_FAULT is set, emit the
-             * chain-relative index of the faulting instruction so
-             * consumers can flag that specific uop as non-completing.
-             */
+            /* Emit the chain-relative index of the faulting instruction so
+             * consumers can flag that specific uop as non-completing. */
             if (wp->fault) {
                 bw_write_uleb128(&sub, (uint64_t)wp->fault_insn_index);
             }

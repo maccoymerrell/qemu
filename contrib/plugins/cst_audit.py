@@ -30,7 +30,6 @@ import champsim_tracer_decode as dec  # noqa: E402
 
 # Per-insn template flag bits (subset we need to parse the body).
 _INSN_FLAG_HAS_IMM           = 0x02
-_INSN_FLAG_VARIABLE_MEMOP    = 0x40
 
 
 # ---------------------------------------------------------------------------
@@ -126,17 +125,11 @@ class _Stats:
     wp_total_insns: int = 0
 
     cp_entry_framing: _Bucket = dataclasses.field(default_factory=_Bucket)
-    cp_dyn_memop_preamble: _Bucket = dataclasses.field(default_factory=_Bucket)
-    cp_dyn_patch: _Bucket = dataclasses.field(default_factory=_Bucket)
-    cp_mem_data: _Bucket = dataclasses.field(default_factory=_Bucket)
-    cp_reg_data: _Bucket = dataclasses.field(default_factory=_Bucket)
+    cp_field_delta: _Bucket = dataclasses.field(default_factory=_Bucket)
 
     wp_chain_envelope: _Bucket = dataclasses.field(default_factory=_Bucket)
     wp_entry_framing: _Bucket = dataclasses.field(default_factory=_Bucket)
-    wp_dyn_memop_preamble: _Bucket = dataclasses.field(default_factory=_Bucket)
-    wp_dyn_patch: _Bucket = dataclasses.field(default_factory=_Bucket)
-    wp_mem_data: _Bucket = dataclasses.field(default_factory=_Bucket)
-    wp_reg_data: _Bucket = dataclasses.field(default_factory=_Bucket)
+    wp_field_delta: _Bucket = dataclasses.field(default_factory=_Bucket)
 
     wp_events: _Bucket = dataclasses.field(default_factory=_Bucket)
 
@@ -161,7 +154,6 @@ def _walk_templates(r: _R, expected: int) -> tuple[int, dict[int, dict]]:
         r.uleb()                     # fall_through
         sname = r.uleb()
         r.skip(sname)
-        n_dyn = 0
         for _i in range(n_insns):
             r.uleb()                 # pc_delta
             r.u8()                   # opcode
@@ -176,36 +168,25 @@ def _walk_templates(r: _R, expected: int) -> tuple[int, dict[int, dict]]:
                 r.sleb()
             isize = r.u8()
             r.skip(isize)
-            if iflags & _INSN_FLAG_VARIABLE_MEMOP:
-                n_dyn += 1
         if r.p != tend:
             raise ValueError(f"template {tid}: declared len {tlen} "
                              f"!= actual {r.p - (tend - tlen)}")
-        tinfo[tid] = {"n_insns": n_insns, "n_dyn_insns": n_dyn}
+        tinfo[tid] = {"n_insns": n_insns}
     return r.p - start, tinfo
 
 
-def _memop_preamble_bytes(rr: _R, info: dict | None) -> int:
-    if info is None or info["n_dyn_insns"] == 0:
-        return 0
-    st = rr.p
-    for _ in range(info["n_dyn_insns"]):
-        rr.uleb()
-        rr.uleb()
-    return rr.p - st
-
-
-def _dyn_patch_bytes(rr: _R) -> int:
-    st = rr.p
-    flags = rr.u8()
-    if flags & dec.CST_DYN_FLAG_UNCHANGED:
-        return rr.p - st
-    rr.uleb()                         # new_len
-    num_changed = rr.uleb()
-    for _ in range(num_changed):
-        rr.uleb()
-        rr.sleb()
-    return rr.p - st
+def _field_delta_section_bytes(rr: _R) -> int:
+    sub, used = _read_lp_sub(rr)
+    n_records = sub.uleb()
+    for _ in range(n_records):
+        sub.uleb()                    # ins_pos_gap
+        fid = sub.u8()
+        sub.sleb()                    # delta
+        if fid == dec.FID_EXTENDED:
+            sub.uleb()                # extended field id
+    if sub.p != sub.end:
+        raise ValueError("field-delta section had trailing bytes")
+    return used
 
 
 def _read_lp_sub(rr: _R) -> tuple[_R, int]:
@@ -245,16 +226,13 @@ def audit(path: Path) -> _Stats:
     if hr.u32_le() != dec.CST_MAGIC:
         raise ValueError("bad header magic")
     hr.u8()                  # isa
-    flags = hr.u8()
+    hr.u8()                  # flags
     hr.string_len()          # command
     hr.string_len()          # datetime
     hr.string_len()          # comment
     hr.string_len()          # target_name
     hr.uleb()                # thread_id
     s.header = hr.p
-    has_mem_data = bool(flags & dec.CST_FLAG_MEM_DATA)
-    has_reg_data = bool(flags & dec.CST_FLAG_REG_DATA)
-
     # Templates
     tr2 = _R(m, templates_off)
     s.templates_section, tinfo = _walk_templates(tr2, templates_count)
@@ -281,18 +259,7 @@ def audit(path: Path) -> _Stats:
         if cp_info:
             s.cp_total_insns += cp_info["n_insns"]
 
-        n = _memop_preamble_bytes(br, cp_info)
-        if n:
-            s.cp_dyn_memop_preamble.add(n)
-
-        s.cp_dyn_patch.add(_dyn_patch_bytes(br))
-
-        if has_mem_data:
-            _sub, used = _read_lp_sub(br)
-            s.cp_mem_data.add(used)
-        if has_reg_data:
-            _sub, used = _read_lp_sub(br)
-            s.cp_reg_data.add(used)
+        s.cp_field_delta.add(_field_delta_section_bytes(br))
 
         # WP chain
         wp_sub, wp_used = _read_lp_sub(br)
@@ -306,16 +273,7 @@ def audit(path: Path) -> _Stats:
             wp_info = tinfo.get(prev_wp_tid)
             if wp_info:
                 s.wp_total_insns += wp_info["n_insns"]
-            n = _memop_preamble_bytes(wp_sub, wp_info)
-            if n:
-                s.wp_dyn_memop_preamble.add(n)
-            s.wp_dyn_patch.add(_dyn_patch_bytes(wp_sub))
-            if has_mem_data:
-                _sub, used = _read_lp_sub(wp_sub)
-                s.wp_mem_data.add(used)
-            if has_reg_data:
-                _sub, used = _read_lp_sub(wp_sub)
-                s.wp_reg_data.add(used)
+            s.wp_field_delta.add(_field_delta_section_bytes(wp_sub))
         s.wp_entries_total += num_wp
 
         _ev_sub, ev_used = _read_lp_sub(br)
@@ -367,21 +325,9 @@ def report(s: _Stats) -> str:
     out(_row("CP entry framing",
              s.cp_entry_framing.bytes, body,
              count=s.cp_entries, per="entry"))
-    if s.cp_dyn_memop_preamble.count:
-        out(_row("CP dyn-memop preamble",
-                 s.cp_dyn_memop_preamble.bytes, body,
-                 count=s.cp_dyn_memop_preamble.count, per="entry"))
-    out(_row("CP dyn-patch",
-             s.cp_dyn_patch.bytes, body,
+    out(_row("CP field-delta section",
+             s.cp_field_delta.bytes, body,
              count=s.cp_entries, per="entry"))
-    if s.cp_mem_data.count:
-        out(_row("CP mem-data",
-                 s.cp_mem_data.bytes, body,
-                 count=s.cp_mem_data.count, per="entry"))
-    if s.cp_reg_data.count:
-        out(_row("CP reg-data",
-                 s.cp_reg_data.bytes, body,
-                 count=s.cp_reg_data.count, per="entry"))
 
     out(_row("WP chain envelope (incl. inner)",
              s.wp_chain_envelope.bytes, body,
@@ -390,21 +336,9 @@ def report(s: _Stats) -> str:
     out(_row("    WP entry framing",
              s.wp_entry_framing.bytes, body,
              count=s.wp_entry_framing.count, per="WP"))
-    if s.wp_dyn_memop_preamble.count:
-        out(_row("    WP dyn-memop preamble",
-                 s.wp_dyn_memop_preamble.bytes, body,
-                 count=s.wp_dyn_memop_preamble.count, per="WP"))
-    out(_row("    WP dyn-patch",
-             s.wp_dyn_patch.bytes, body,
+    out(_row("    WP field-delta section",
+             s.wp_field_delta.bytes, body,
              count=s.wp_entries_total, per="WP"))
-    if s.wp_mem_data.count:
-        out(_row("    WP mem-data",
-                 s.wp_mem_data.bytes, body,
-                 count=s.wp_mem_data.count, per="WP"))
-    if s.wp_reg_data.count:
-        out(_row("    WP reg-data",
-                 s.wp_reg_data.bytes, body,
-                 count=s.wp_reg_data.count, per="WP"))
 
     out(_row("WP events", s.wp_events.bytes, body,
              count=s.cp_entries, per="entry"))

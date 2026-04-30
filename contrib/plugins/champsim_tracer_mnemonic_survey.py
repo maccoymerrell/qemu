@@ -520,6 +520,7 @@ _GEN_OP_CATEGORY = {
     'GEN_OP_INT_ADD': 'int_alu', 'GEN_OP_INT_SUB': 'int_alu',
     'GEN_OP_INT_MUL': 'int_alu', 'GEN_OP_INT_DIV': 'int_alu',
     'GEN_OP_INT_ADC': 'int_alu', 'GEN_OP_INT_SBB': 'int_alu',
+    'GEN_OP_INT_MADD': 'int_alu', 'GEN_OP_INT_MSUB': 'int_alu',
     'GEN_OP_AND': 'int_alu', 'GEN_OP_OR': 'int_alu',
     'GEN_OP_XOR': 'int_alu', 'GEN_OP_NOT': 'int_alu',
     'GEN_OP_NEG': 'int_alu', 'GEN_OP_INC': 'int_alu',
@@ -538,10 +539,12 @@ _GEN_OP_CATEGORY = {
     'GEN_OP_SYSCALL': 'misc', 'GEN_OP_FENCE': 'misc',
     'GEN_OP_FP_ADD': 'fp', 'GEN_OP_FP_SUB': 'fp',
     'GEN_OP_FP_MUL': 'fp', 'GEN_OP_FP_DIV': 'fp',
+    'GEN_OP_FP_MADD': 'fp', 'GEN_OP_FP_MSUB': 'fp',
     'GEN_OP_FP_SQRT': 'fp', 'GEN_OP_FP_MOV': 'fp',
     'GEN_OP_FP_CVT': 'fp', 'GEN_OP_FP_CMP': 'fp',
     'GEN_OP_VEC_ADD': 'vec', 'GEN_OP_VEC_SUB': 'vec',
     'GEN_OP_VEC_MUL': 'vec', 'GEN_OP_VEC_MOV': 'vec',
+    'GEN_OP_VEC_MADD': 'vec', 'GEN_OP_VEC_MSUB': 'vec',
     'GEN_OP_VEC_SHUF': 'vec', 'GEN_OP_VEC_LOGIC': 'vec',
 }
 

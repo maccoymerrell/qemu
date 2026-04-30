@@ -2,9 +2,8 @@
 """
 Reference decoder for the champsim_tracer binary trace format v1.7.
 
-Format v1.7 replaces the v1.6 dyn-patch / mem-data / reg-data
-sub-sections (and the variable-memop preamble) with a single
-unified field-typed delta stream.  Each BB entry carries:
+The body uses one unified field-typed delta stream per CP or WP basic
+block.  Each BB entry carries:
 
     n_records : ULEB
     { ins_pos_gap : ULEB,  field_id : u8,  delta : SLEB128 } *
@@ -35,7 +34,7 @@ CST_TRAILER_SIZE = 64
 
 CST_FLAG_MEM_DATA      = 1 << 0
 CST_FLAG_REG_DATA      = 1 << 1
-CST_FLAG_INSN_MUT      = 1 << 2
+CST_FLAG_RESERVED_2    = 1 << 2
 
 # Body entry tags (u8)
 BODY_TAG_END      = 0
@@ -46,7 +45,6 @@ CST_INSN_FLAG_BRANCH_COND    = 1 << 0
 CST_INSN_FLAG_HAS_IMM        = 1 << 1
 CST_INSN_FLAG_SYNC_SHIFT     = 2
 CST_INSN_FLAG_SYNC_MASK      = 0x3C
-CST_INSN_FLAG_VARIABLE_MEMOP = 1 << 6
 
 # WP event flags (u8)
 CST_WP_EVENT_TRANSLATION_UNAVAIL = 1 << 0
@@ -54,13 +52,14 @@ CST_WP_EVENT_FAULT               = 1 << 1
 
 # Field-ID space (mirrors champsim_tracer.h CST_FID_*)
 FID_SLOT_COUNT       = 16
-FID_MEMOP_COUNT      = 0x00
+FID_N_LOADS          = 0x00
 FID_LOAD_ADDR_BASE   = 0x01
 FID_STORE_ADDR_BASE  = 0x11
 FID_LOAD_DATA_BASE   = 0x21
 FID_STORE_DATA_BASE  = 0x31
 FID_SRC_REG_BASE     = 0x41
 FID_DST_REG_BASE     = 0x51
+FID_N_STORES         = 0x61
 FID_INSN_BYTES_LO    = 0x70
 FID_INSN_BYTES_HI    = 0x71
 FID_INSN_OPCODE      = 0x72
@@ -108,6 +107,9 @@ OPCODE_NAMES = {
     42: "NOP", 43: "SYSCALL", 44: "FENCE",
     45: "CMOV", 46: "SETCC",
     47: "INT_ADC", 48: "INT_SBB", 49: "NEG", 50: "INC", 51: "DEC",
+    52: "INT_MADD", 53: "INT_MSUB",
+    54: "FP_MADD", 55: "FP_MSUB",
+    56: "VEC_MADD", 57: "VEC_MSUB",
 }
 
 BRANCH_NAMES = {
@@ -129,20 +131,58 @@ WP_STOP_REASON_NAMES = {0: "NONE", 1: "SYSCALL_USERMODE"}
 
 
 def build_reg_names() -> dict[int, str]:
-    names: dict[int, str] = {0: "NONE"}
+    names: dict[int, str] = {0: "REG_NONE"}
     for i in range(64):
-        names[1 + i]   = f"GPR{i}"
-        names[65 + i]  = f"FPR{i}"
-        names[129 + i] = f"VEC{i}"
-    names[250] = "SP"
-    names[251] = "FLAGS"
-    names[252] = "IP"
-    names[253] = "LR"
-    names[254] = "FP"
+        names[1 + i]   = f"REG_GPR{i}"
+        names[65 + i]  = f"REG_FPR{i}"
+        names[129 + i] = f"REG_VEC{i}"
+    for i in range(32):
+        names[193 + i] = f"REG_PRED{i}"
+    for i in range(6):
+        names[225 + i] = f"REG_SEG{i}"
+    names[231] = "REG_CTRL"
+    names[232] = "REG_DEBUG"
+    for i in range(4):
+        names[233 + i] = f"REG_BOUND{i}"
+        names[237 + i] = f"REG_ACC{i}"
+    names[241] = "REG_ZERO"
+    names[242] = "REG_MATRIX"
+    names[243] = "REG_SYS"
+    names[244] = "REG_FCSR"
+    names[245] = "REG_VCTRL"
+    names[250] = "REG_SP"
+    names[251] = "REG_FLAGS"
+    names[252] = "REG_IP"
+    names[253] = "REG_LR"
+    names[254] = "REG_FP_REG"
     return names
 
 
 REG_NAMES_DEFAULT = build_reg_names()
+
+
+def build_field_id_names() -> dict[int, str]:
+    names: dict[int, str] = {FID_N_LOADS: "CST_FID_N_LOADS"}
+    for i in range(FID_SLOT_COUNT):
+        names[FID_LOAD_ADDR_BASE + i] = f"CST_FID_LOAD_ADDR{i}"
+        names[FID_STORE_ADDR_BASE + i] = f"CST_FID_STORE_ADDR{i}"
+        names[FID_LOAD_DATA_BASE + i] = f"CST_FID_LOAD_DATA{i}"
+        names[FID_STORE_DATA_BASE + i] = f"CST_FID_STORE_DATA{i}"
+        names[FID_SRC_REG_BASE + i] = f"CST_FID_SRC_REG{i}"
+        names[FID_DST_REG_BASE + i] = f"CST_FID_DST_REG{i}"
+    names[FID_N_STORES] = "CST_FID_N_STORES"
+    names[FID_INSN_BYTES_LO] = "CST_FID_INSN_BYTES_LO"
+    names[FID_INSN_BYTES_HI] = "CST_FID_INSN_BYTES_HI"
+    names[FID_INSN_OPCODE] = "CST_FID_INSN_OPCODE"
+    names[FID_INSN_BRANCH_TYPE] = "CST_FID_INSN_BRANCH_TYPE"
+    names[FID_INSN_FLAGS] = "CST_FID_INSN_FLAGS"
+    names[FID_INSN_IMMEDIATE] = "CST_FID_INSN_IMMEDIATE"
+    names[FID_INSN_SIZE] = "CST_FID_INSN_SIZE"
+    names[FID_EXTENDED] = "CST_FID_EXTENDED"
+    return names
+
+
+FIELD_ID_NAMES_DEFAULT = build_field_id_names()
 
 
 def reg_name(reg_id: int) -> str:
@@ -239,6 +279,28 @@ def _add_delta_u64(base: int, delta: int) -> int:
     return (base + delta) & ((1 << 64) - 1)
 
 
+def _decode_encoding_maps(br: ByteReader) -> dict[str, dict[int, str]]:
+    maps: dict[str, dict[int, str]] = {}
+    n_maps = br.uleb()
+    for _ in range(n_maps):
+        map_name = br.string()
+        n_entries = br.uleb()
+        entries: dict[int, str] = {}
+        for _ in range(n_entries):
+            value = br.uleb()
+            entries[value] = br.string()
+        maps[map_name] = entries
+    return maps
+
+
+def _merge_encoding_map(defaults: dict[int, str],
+                        parsed: dict[str, dict[int, str]],
+                        name: str) -> dict[int, str]:
+    merged = dict(defaults)
+    merged.update(parsed.get(name, {}))
+    return merged
+
+
 # --- Template decoding ----------------------------------------------
 
 def _decode_template_record(br: ByteReader) -> dict:
@@ -269,8 +331,6 @@ def _decode_template_record(br: ByteReader) -> dict:
         has_imm            = bool(flags & CST_INSN_FLAG_HAS_IMM)
         sync_hint          = (flags & CST_INSN_FLAG_SYNC_MASK) \
                              >> CST_INSN_FLAG_SYNC_SHIFT
-        variable_memop     = bool(flags & CST_INSN_FLAG_VARIABLE_MEMOP)
-
         imm = br.sleb() if has_imm else None
         insn_size = br.u8()
         raw_bytes = br.raw(insn_size)
@@ -286,7 +346,6 @@ def _decode_template_record(br: ByteReader) -> dict:
             "sync_hint": sync_hint,
             "n_loads": n_loads,
             "n_stores": n_stores,
-            "variable_memop": variable_memop,
             "raw_bytes": raw_bytes,
         })
 
@@ -328,6 +387,10 @@ def _template_default(tmpl: dict | None, ipos: int, fid: int) -> int:
     if ipos >= len(insns):
         return 0
     insn = insns[ipos]
+    if fid == FID_N_LOADS:
+        return insn.get("n_loads", 0) & 0xFF
+    if fid == FID_N_STORES:
+        return insn.get("n_stores", 0) & 0xFF
     if FID_INSN_BYTES_LO <= fid <= FID_INSN_SIZE:
         rb = insn.get("raw_bytes") or b""
         rb_int = int.from_bytes(rb, "little") if rb else 0
@@ -347,8 +410,6 @@ def _template_default(tmpl: dict | None, ipos: int, fid: int) -> int:
                 f |= CST_INSN_FLAG_HAS_IMM
             f |= ((insn.get("sync_hint", 0) << CST_INSN_FLAG_SYNC_SHIFT)
                   & CST_INSN_FLAG_SYNC_MASK)
-            if insn.get("variable_memop"):
-                f |= CST_INSN_FLAG_VARIABLE_MEMOP
             return f & 0xFF
         if fid == FID_INSN_IMMEDIATE:
             imm = insn.get("imm")
@@ -367,7 +428,7 @@ def _decode_field_delta_section(
         ) -> tuple[list[DynParam], list[dict]]:
     """Read one length-prefixed delta_section, apply records to the
     per-(template_id, ins_pos, field_id) state map, and reconstruct
-    the legacy-shaped (dyn_params, reg_snaps) the validator API
+    the consumer-facing (dyn_params, reg_snaps) shape the validator API
     expects.  Records are stored as ``(pos_gap, field_id, sleb_delta)``
     triples; ins_pos is reconstructed by accumulating gaps."""
     sec = br.sub()
@@ -412,17 +473,8 @@ def _decode_field_delta_section(
         return v
 
     for i, insn in enumerate(tmpl["insns"]):
-        # Per-insn memop count.  Variable-memop insns carry an actual
-        # count via FID_MEMOP_COUNT (low byte = n_loads, next byte =
-        # n_stores); non-variable insns use the template's static
-        # n_loads/n_stores.
-        if insn.get("variable_memop", False):
-            mc = _state_or_default(i, FID_MEMOP_COUNT)
-            n_loads  = mc & 0xFF
-            n_stores = (mc >> 8) & 0xFF
-        else:
-            n_loads  = insn.get("n_loads", 0)
-            n_stores = insn.get("n_stores", 0)
+        n_loads = _state_or_default(i, FID_N_LOADS) & 0xFF
+        n_stores = _state_or_default(i, FID_N_STORES) & 0xFF
 
         for slot in range(n_loads):
             v = _state_or_default(i, FID_LOAD_ADDR_BASE + slot) & MASK64
@@ -504,6 +556,17 @@ def decode_champsim_tracer(bin_path: Path
     comment      = br.string()
     target_name  = br.string()
     thread_id    = br.uleb()
+
+    encoding_maps: dict[str, dict[int, str]] = {}
+    if br.pos < body_off:
+        maps_br = br.sub()
+        encoding_maps = _decode_encoding_maps(maps_br)
+        if not maps_br.eof():
+            raise ValueError("encoding map section has trailing bytes")
+    if br.pos != body_off:
+        raise ValueError(
+            f"header/body offset mismatch: parsed={br.pos} trailer={body_off}"
+        )
 
     has_mem_data = bool(flags & CST_FLAG_MEM_DATA)
     has_reg_data = bool(flags & CST_FLAG_REG_DATA)
@@ -620,11 +683,19 @@ def decode_champsim_tracer(bin_path: Path
         "templates_count": templates_count,
         "body_off": body_off,
         "body_byte_count": body_byte_count,
-        "opcode_names": dict(OPCODE_NAMES),
-        "branch_names": dict(BRANCH_NAMES),
+        "encoding_maps": encoding_maps,
+        "opcode_names": _merge_encoding_map(OPCODE_NAMES, encoding_maps,
+                                             "opcode"),
+        "branch_names": _merge_encoding_map(BRANCH_NAMES, encoding_maps,
+                                             "branch_type"),
+        "sync_hint_names": _merge_encoding_map(SYNC_HINT_NAMES,
+                                               encoding_maps, "sync_hint"),
+        "field_id_names": _merge_encoding_map(FIELD_ID_NAMES_DEFAULT,
+                                              encoding_maps, "field_id"),
         "stop_reason_names": dict(WP_STOP_REASON_NAMES),
         "exception_names": dict(EXCEPTION_NAMES_DEFAULT),
-        "reg_names": dict(REG_NAMES_DEFAULT),
+        "reg_names": _merge_encoding_map(REG_NAMES_DEFAULT, encoding_maps,
+                                          "reg"),
     }
     return meta, templates, entries
 
@@ -645,13 +716,48 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
     out: list[str] = []
     opcode_names = meta.get("opcode_names", OPCODE_NAMES)
     branch_names = meta.get("branch_names", BRANCH_NAMES)
+    sync_hint_names = meta.get("sync_hint_names", SYNC_HINT_NAMES)
     stop_reason_names = meta.get("stop_reason_names", WP_STOP_REASON_NAMES)
     exception_names = meta.get("exception_names", EXCEPTION_NAMES_DEFAULT)
     reg_names = meta.get("reg_names", REG_NAMES_DEFAULT)
+    encoding_maps = meta.get("encoding_maps", {})
     has_mem_data = meta.get("has_mem_data", False)
+    has_reg_data = meta.get("has_reg_data", False)
 
     def rfmt(r: int) -> str:
         return reg_names.get(r, reg_name(r))
+
+    def enum_name(names: dict[int, str], value: int, fallback: str) -> str:
+        return names.get(value, f"{fallback}_{value}")
+
+    def snap_value(snap: dict) -> str:
+        hi = snap.get("hi", 0)
+        lo = snap.get("lo", 0)
+        if hi:
+            return f"0x{hi:x}{lo:016x}"
+        return f"0x{lo:x}"
+
+    def emit_observations(prefix: str,
+                          dyn_params: list[DynParam],
+                          reg_snaps: list[dict]) -> None:
+        if not dyn_params and not reg_snaps:
+            out.append(f"{prefix}unchanged")
+            return
+        if dyn_params:
+            out.append(f"{prefix}memops:")
+            for dp in dyn_params:
+                out.append(
+                    f"{prefix}  insn[{dp.insn_index}] "
+                    f"{_format_dyn(dp, has_mem_data)}"
+                )
+        if reg_snaps:
+            out.append(f"{prefix}regs:")
+            for snap in reg_snaps:
+                out.append(
+                    f"{prefix}  insn[{snap['insn_index']}] "
+                    f"{snap['kind']}[{snap['operand_index']}] "
+                    f"{rfmt(snap['reg_id'])}={snap_value(snap)}"
+                )
 
     out.append("META")
     out.append("----")
@@ -666,30 +772,39 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
     flags_str = ""
     if has_mem_data:
         flags_str += " MEM_DATA"
+    if has_reg_data:
+        flags_str += " REG_DATA"
     out.append(f"FLAGS{flags_str}")
     out.append("")
 
-    out.append("ENUMS")
-    out.append("-----")
-    out.append(f"OPCODES {len(opcode_names)}")
-    for k in sorted(opcode_names):
-        out.append(f"O {k} {opcode_names[k]}")
-    out.append(f"BRANCHES {len(branch_names)}")
-    for k in sorted(branch_names):
-        out.append(f"B {k} {branch_names[k]}")
+    out.append("ENCODINGS")
+    out.append("---------")
+    if encoding_maps:
+        for map_name in sorted(encoding_maps):
+            map_entries = encoding_maps[map_name]
+            out.append(f"{map_name} {len(map_entries)}")
+            for k in sorted(map_entries):
+                out.append(f"  {k} {map_entries[k]}")
+    else:
+        out.append(f"opcode {len(opcode_names)}")
+        for k in sorted(opcode_names):
+            out.append(f"  {k} {opcode_names[k]}")
+        out.append(f"branch_type {len(branch_names)}")
+        for k in sorted(branch_names):
+            out.append(f"  {k} {branch_names[k]}")
+        out.append(f"reg {len(reg_names)}")
+        for k in sorted(reg_names):
+            out.append(f"  {k} {reg_names[k]}")
     out.append(f"WP_STOP_REASONS {len(stop_reason_names)}")
     for k in sorted(stop_reason_names):
-        out.append(f"S {k} {stop_reason_names[k]}")
+        out.append(f"  {k} {stop_reason_names[k]}")
     out.append(f"EXCEPTIONS {len(exception_names)}")
     for k in sorted(exception_names):
-        out.append(f"E {k} {exception_names[k]}")
-    out.append(f"REGS {len(reg_names)}")
-    for k in sorted(reg_names):
-        out.append(f"R {k} {reg_names[k]}")
+        out.append(f"  {k} {exception_names[k]}")
     out.append("")
 
-    out.append("HEADER")
-    out.append("------")
+    out.append("TEMPLATES")
+    out.append("---------")
     for tmpl in templates:
         out.append(
             f"BB{tmpl['template_id']} [pc=0x{tmpl['start_pc']:x}, "
@@ -700,9 +815,9 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
             out.append(f"  symbol={tmpl['symbol_name']}")
         for i, insn in enumerate(tmpl["insns"]):
             line = (f"  [{i}] 0x{insn['pc']:x}: "
-                    f"op={opcode_names.get(insn['opcode'], 'UNKNOWN')}")
+                    f"op={enum_name(opcode_names, insn['opcode'], 'OP')}")
             if insn["branch_type"] != BRANCH_NONE:
-                line += (f" br={branch_names.get(insn['branch_type'], 'UNKNOWN')}"
+                line += (f" br={enum_name(branch_names, insn['branch_type'], 'BR')}"
                          f" cond={1 if insn['branch_conditional'] else 0}")
             src = ",".join(rfmt(r) for r in insn["src_regs"])
             dst = ",".join(rfmt(r) for r in insn["dst_regs"])
@@ -710,7 +825,7 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
             if insn["imm"] is not None:
                 line += f" imm={insn['imm']}"
             if insn.get("sync_hint", 0) != 0:
-                line += f" sync={SYNC_HINT_NAMES.get(insn['sync_hint'], 'UNKNOWN')}"
+                line += f" sync={enum_name(sync_hint_names, insn['sync_hint'], 'SYNC')}"
             if insn.get("raw_bytes") is not None:
                 line += f" bytes={insn['raw_bytes'].hex()}"
             out.append(line)
@@ -719,23 +834,29 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
     out.append("BODY")
     out.append("----")
     for entry_idx, entry in enumerate(entries):
-        dyn_str = " ".join(_format_dyn(dp, has_mem_data)
-                           for dp in entry["dyn_params"])
-        line = f"{entry['seq_num']:04d} BB{entry['template_id']} [{dyn_str}]"
+        out.append(f"ENTRY {entry['seq_num']:04d} template=BB{entry['template_id']}")
+        out.append("  cp:")
+        emit_observations("    ", entry["dyn_params"],
+                          entry.get("reg_snaps", []))
         for wp in entry["wp_entries"]:
-            line += f" [wp{wp['index']}=BB{wp['template_id']}"
-            for dp in wp["dyn_params"]:
-                line += f" {_format_dyn(dp, has_mem_data)}"
+            out.append(
+                f"  wp[{wp['index']}] template=BB{wp['template_id']} "
+                f"n_insns={wp['n_insns']}"
+            )
+            statuses: list[str] = []
             if wp["fault"]:
                 fi = wp.get("fault_insn_index")
                 if fi is not None:
-                    line += f" FAULT@insn{fi}"
+                    statuses.append(f"FAULT@insn{fi}")
                 else:
-                    line += " FAULT"
+                    statuses.append("FAULT")
             if wp.get("translation_unavailable"):
-                line += " TRANSLATION_UNAVAILABLE"
-            line += f" n_insns={wp['n_insns']}]"
-        out.append(line)
+                statuses.append("TRANSLATION_UNAVAILABLE")
+            if statuses:
+                out.append(f"    status: {' '.join(statuses)}")
+            emit_observations("    ", wp["dyn_params"],
+                              wp.get("reg_snaps", []))
+        out.append("")
         _ = exception_names, stop_reason_names  # referenced for API parity
 
     return "\n".join(out) + "\n"
@@ -753,7 +874,7 @@ def _first_diff_line(a: str, b: str) -> tuple[int, str, str] | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Decode champsim_tracer binary (.cst, v1.2) to text")
+        description="Decode champsim_tracer binary (.cst, v1.7) to text")
     parser.add_argument("bin", type=Path)
     parser.add_argument("-o", "--out", type=Path)
     parser.add_argument("--expect", type=Path)

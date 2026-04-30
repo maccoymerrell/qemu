@@ -58,7 +58,7 @@ extern "C" {
  * an optional chain table for shorthand encoding of frequently-seen
  * BB sequences on the wrong path.
  *
- * v1.5 added per-insn flag CST_INSN_FLAG_VARIABLE_MEMOP.
+ * v1.7 uses the template's per-insn memop counts as the slot schema.
  */
 #define CST_MAGIC          0x17545343u
 #define CST_TRAILER_MAGIC  0x17545343FFFFFFFFull
@@ -73,8 +73,7 @@ extern "C" {
 #define CST_INSN_FLAG_HAS_IMM       (1u << 1)
 #define CST_INSN_FLAG_SYNC_SHIFT    2
 #define CST_INSN_FLAG_SYNC_MASK     0x3Cu
-#define CST_INSN_FLAG_VARIABLE_MEMOP (1u << 6)
-/* bit 7 reserved */
+/* bits 6..7 reserved */
 
 /* WP event flags byte */
 #define CST_WP_EVENT_TRANSLATION_UNAVAIL (1u << 0)
@@ -86,15 +85,15 @@ extern "C" {
 
 /* Header feature flags (templates always present, deltas always present).
  *
- * These bits are advisory hints to consumers about which families of
- * field-delta records this trace contains.  The wire format itself is
- * uniform — a reader that sees an unexpected field_id MUST tolerate
- * it (see champsim_tracer_format.md §4 and the CST_FID_* constants
- * below).  A clear bit guarantees the writer emitted no records in
- * that family. */
+ * These bits are advisory hints to consumers about optional payload
+ * families.  The wire format itself is uniform — a reader that sees
+ * an unexpected field_id MUST tolerate it (see
+ * champsim_tracer_format.md §4 and the CST_FID_* constants below).
+ * Sparse instruction metadata records are always allowed and do not
+ * need a feature bit. */
 #define CST_FLAG_MEM_DATA      (1 << 0)  /* CST_FID_LOAD_DATA / STORE_DATA */
 #define CST_FLAG_REG_DATA      (1 << 1)  /* CST_FID_SRC_REG / DST_REG     */
-#define CST_FLAG_INSN_MUT      (1 << 2)  /* CST_FID_INSN_* (SMC/patching) */
+#define CST_FLAG_RESERVED_2    (1 << 2)
 /* bits 3..7 reserved */
 
 /* ===== Field-ID space (v1.7 unified delta stream) =====
@@ -110,7 +109,7 @@ extern "C" {
  */
 #define CST_FID_SLOT_COUNT       16    /* slots per slotted family */
 
-#define CST_FID_MEMOP_COUNT      0x00  /* (n_loads<<8) | n_stores; absent ⇒ template default */
+#define CST_FID_N_LOADS         0x00  /* current valid load slots */
 
 #define CST_FID_LOAD_ADDR_BASE   0x01  /* +k for load slot k ∈ 0..15 */
 #define CST_FID_STORE_ADDR_BASE  0x11
@@ -118,11 +117,11 @@ extern "C" {
 #define CST_FID_STORE_DATA_BASE  0x31
 #define CST_FID_SRC_REG_BASE     0x41  /* gated by CST_FLAG_REG_DATA  */
 #define CST_FID_DST_REG_BASE     0x51
-/* 0x61..0x6F reserved for future slotted memop metadata             */
+#define CST_FID_N_STORES        0x61  /* current valid store slots */
+/* 0x62..0x6F reserved for future slotted memop metadata             */
 
-/* Insn-encoding-mutable fields.  Gated by CST_FLAG_INSN_MUT.
- * Baseline = template's static value, so unchanged-from-template
- * fields cost zero record bytes. */
+/* Insn-encoding-mutable fields. Baseline = template's static value,
+ * so unchanged-from-template fields cost zero record bytes. */
 #define CST_FID_INSN_BYTES_LO    0x70  /* low  8 bytes of insn_bytes, LE u64  */
 #define CST_FID_INSN_BYTES_HI    0x71  /* high 8 bytes (only x86 long enc.)   */
 #define CST_FID_INSN_OPCODE      0x72  /* GenericOpcode (u8)                  */
@@ -212,8 +211,7 @@ enum DynParamType {
  *
  * The owning instruction and load/store type are *implicit* on disk —
  * the consumer reconstructs them by walking the template's per-insn
- * (n_loads, n_stores) schema. For dynamic-memop insns the entry
- * carries per-occurrence ULEB (actual_n_loads, actual_n_stores).
+ * (n_loads, n_stores) schema.
  */
 typedef struct {
     uint8_t  type;         /* DynParamType (writer-internal)        */

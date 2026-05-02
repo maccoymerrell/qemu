@@ -1,7 +1,7 @@
 """Diff two decoded traces structurally."""
 import sys
 from pathlib import Path
-sys.path.insert(0, "..")
+sys.path.insert(0, "../champsim_tracer")
 import champsim_tracer_decode as dec
 
 

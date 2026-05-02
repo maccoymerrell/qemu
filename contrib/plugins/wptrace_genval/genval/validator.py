@@ -48,7 +48,8 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent.parent
-_DECODE_PATH = _PLUGIN_DIR / "champsim_tracer_decode.py"
+_PLUGIN_SOURCE_DIR = _PLUGIN_DIR / "champsim_tracer"
+_DECODE_PATH = _PLUGIN_SOURCE_DIR / "champsim_tracer_decode.py"
 
 
 def _load_decoder():
@@ -968,7 +969,7 @@ def _capstone_reg_class_for_isa(isa: str) -> dict[int, tuple[int, ...]]:
         raise ValueError(f"unsupported isa {isa!r}")
     cap_mod = _capstone_reg_module(isa)
     gen_ids = _generic_reg_name_to_id()
-    text = (_PLUGIN_DIR / header).read_text()
+    text = (_PLUGIN_SOURCE_DIR / header).read_text()
     out: dict[int, tuple[int, ...]] = {}
     entry_re = re.compile(r"\[([A-Z0-9_]+)\]\s*=\s*\{([^\n]*)\},")
     for match in entry_re.finditer(text):
@@ -1945,7 +1946,7 @@ def _reachable_reg_names_for_isa(isa: str) -> set[str]:
     header = _ISA_TO_REG_TABLE.get(isa)
     if header is None:
         raise ValueError(f"unsupported isa {isa!r}")
-    path = _PLUGIN_DIR / header
+    path = _PLUGIN_SOURCE_DIR / header
     text = path.read_text()
     out: set[str] = set()
     entry_re = re.compile(

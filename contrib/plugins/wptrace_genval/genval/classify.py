@@ -19,7 +19,8 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent.parent
-_SURVEY_PATH = _PLUGIN_DIR / "champsim_tracer_mnemonic_survey.py"
+_SURVEY_PATH = (_PLUGIN_DIR / "champsim_tracer"
+                / "champsim_tracer_mnemonic_survey.py")
 
 
 def _load_survey():

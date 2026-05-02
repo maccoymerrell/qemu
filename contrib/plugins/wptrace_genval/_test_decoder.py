@@ -1,7 +1,7 @@
 """Locate where two .cst files actually differ."""
 import sys, struct
 from pathlib import Path
-sys.path.insert(0, "..")
+sys.path.insert(0, "../champsim_tracer")
 import champsim_tracer_decode as dec
 
 

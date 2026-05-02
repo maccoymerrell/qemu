@@ -262,6 +262,43 @@ static void start_trace_segment(const char *label,
 }
 
 /*
+ * Build a BodyEntry from the calling thread's CP memop and reg-snap
+ * accumulators and write it to @out_stream.  Drains the accumulators
+ * as a side effect.  @wp_entries (may be NULL) is moved into the
+ * entry; the caller transfers ownership.
+ *
+ * Caller must hold exec_lock.  data_lock is not held; the per-thread
+ * accumulators are unsynchronised by design.
+ */
+static void emit_body_entry(BodyStreamState *out_stream,
+                            BBTemplate *bb_tmpl,
+                            unsigned int cpu_index,
+                            GArray *wp_entries)
+{
+    BodyEntry entry;
+    entry.seq_num = g_trace_segments.next_seq_num();
+    entry.template_id = bb_tmpl ? bb_tmpl->template_id : 0;
+    entry.dyn_params = g_array_sized_new(false, false, sizeof(DynParam),
+                         g_mem_recorder.cp_count());
+    entry.reg_snaps = NULL;
+    entry.wp_entries = wp_entries;
+    entry.tmpl = bb_tmpl;
+    entry.thread_id = cpu_to_thread_id
+        ? get_or_assign_thread_id(cpu_index) : cpu_index;
+
+    g_mem_recorder.drain_cp_into_dyn_params(entry.dyn_params, bb_tmpl);
+    if (enable_reg_data && pending_reg_snaps) {
+        entry.reg_snaps = g_array_ref(pending_reg_snaps);
+        pending_reg_snaps = g_array_new(false, false, sizeof(RegSnap));
+    }
+
+    if (out_stream) {
+        body_stream_write_entry(out_stream, &entry);
+    }
+    body_entry_clear(&entry);
+}
+
+/*
  * Flush the pending final-TB body entry before a segment is finished.
  *
  * BodyEntries are emitted lazily from vcpu_tb_exec(): when a TB starts,
@@ -283,47 +320,25 @@ static void flush_pending_final_body_entry(void)
     uint64_t prev_is_branch =
         qemu_plugin_u64_get(g_scoreboard.prev_bb_ends_in_branch, cpu_index);
 
-    if (!out_stream || prev_start == 0) {
-        goto reset;
-    }
-
-    {
+    BBTemplate *bb_tmpl = nullptr;
+    if (out_stream && prev_start != 0) {
         g_mutex_lock(&data_lock);
-        BBTemplate *prev_tb_tmpl = g_bb_template_cache.find_tb_template(prev_start);
+        BBTemplate *prev_tb_tmpl =
+            g_bb_template_cache.find_tb_template(prev_start);
         if (prev_tb_tmpl) {
             g_cp_chain.append_fragment(prev_start, prev_tb_tmpl, prev_ft);
         }
-
-        if (!prev_is_branch || !prev_tb_tmpl ||
-            !g_cp_chain.has_active_chain()) {
-            /* No terminating branch → not a valid basic block; discard. */
-            g_mutex_unlock(&data_lock);
-            goto reset;
+        if (prev_is_branch && prev_tb_tmpl &&
+            g_cp_chain.has_active_chain()) {
+            bb_tmpl = g_cp_chain.finalize();
         }
-
-        BBTemplate *bb_tmpl = g_cp_chain.finalize();
         g_mutex_unlock(&data_lock);
-
-        BodyEntry entry = {
-            .seq_num = g_trace_segments.next_seq_num(),
-            .template_id = bb_tmpl ? bb_tmpl->template_id : 0,
-            .dyn_params = g_array_sized_new(false, false, sizeof(DynParam),
-                              g_mem_recorder.cp_count()),
-            .reg_snaps = NULL,
-            .wp_entries = NULL,
-            .tmpl = bb_tmpl,
-        };
-        g_mem_recorder.drain_cp_into_dyn_params(entry.dyn_params, bb_tmpl);
-        if (enable_reg_data && pending_reg_snaps) {
-            entry.reg_snaps = g_array_ref(pending_reg_snaps);
-            pending_reg_snaps = g_array_new(false, false, sizeof(RegSnap));
-        }
-
-        body_stream_write_entry(out_stream, &entry);
-        body_entry_clear(&entry);
     }
 
-reset:
+    if (bb_tmpl) {
+        emit_body_entry(out_stream, bb_tmpl, cpu_index, nullptr);
+    }
+
     g_mutex_lock(&data_lock);
     g_cp_chain.reset();
     g_mem_recorder.clear_cp();
@@ -417,10 +432,10 @@ static uint64_t resolve_wrong_target(const BBTemplate *prev_tb_tmpl,
 }
 
 /*
- * Build a BodyEntry for the just-finalized BB, drain pending memops
- * and reg-snaps into it, run the WP simulator if applicable, and
- * write to @out_stream.  Caller holds exec_lock; data_lock must be
- * unheld (this function takes data_lock around the cp_chain reset).
+ * Run the WP simulator (if applicable), then build and emit the
+ * BodyEntry for the just-finalized BB via emit_body_entry().  Caller
+ * holds exec_lock; data_lock must be unheld (this function takes
+ * data_lock around the cp_chain reset).
  */
 static void emit_finalized_bb(BodyStreamState *out_stream,
                               BBTemplate *bb_tmpl,
@@ -429,38 +444,19 @@ static void emit_finalized_bb(BodyStreamState *out_stream,
                               uint64_t wrong_target,
                               unsigned int cpu_index)
 {
-    BodyEntry entry;
-    entry.seq_num = g_trace_segments.next_seq_num();
-    entry.template_id = bb_tmpl ? bb_tmpl->template_id : 0;
-    entry.dyn_params = g_array_sized_new(false, false,
-                         sizeof(DynParam), g_mem_recorder.cp_count());
-    entry.reg_snaps = NULL;
-    entry.wp_entries = NULL;
-    entry.tmpl = bb_tmpl;
-    entry.thread_id = cpu_to_thread_id
-        ? get_or_assign_thread_id(cpu_index) : cpu_index;
-
-    g_mem_recorder.drain_cp_into_dyn_params(entry.dyn_params, bb_tmpl);
-    if (enable_reg_data && pending_reg_snaps) {
-        entry.reg_snaps = g_array_ref(pending_reg_snaps);
-        pending_reg_snaps = g_array_new(false, false, sizeof(RegSnap));
-    }
-
     g_mutex_lock(&data_lock);
     g_cp_chain.reset();
     g_mutex_unlock(&data_lock);
 
+    GArray *wp_entries = nullptr;
     if (enable_wrong_path && wrong_target != 0) {
-        entry.wp_entries = simulate_wrong_path_ext(
+        wp_entries = simulate_wrong_path_ext(
             prev_last, current_pc, wrong_target, cpu_index);
     } else if (wrong_target == 0) {
         g_stats.wp_skipped++;
     }
 
-    if (out_stream) {
-        body_stream_write_entry(out_stream, &entry);
-    }
-    body_entry_clear(&entry);
+    emit_body_entry(out_stream, bb_tmpl, cpu_index, wp_entries);
 }
 
 static void vcpu_tb_exec(unsigned int cpu_index, void *udata)

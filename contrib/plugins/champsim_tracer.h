@@ -384,7 +384,6 @@ extern FILE *unknown_warn_file;
 extern GHashTable *tb_map;
 extern GHashTable *bb_map;
 extern GHashTable *chain_map;
-extern GHashTable *branch_map;
 extern uint32_t next_template_id;
 extern uint32_t next_chain_id;
 

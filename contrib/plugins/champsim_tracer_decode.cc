@@ -22,45 +22,52 @@ static const RegClassification *lookup_reg_class(uint16_t cap_id)
     return &active_reg_table[cap_id];
 }
 
+static inline bool qemu_reg_key_valid(const QemuRegKey *key)
+{
+    return key && key->name;
+}
+
 static inline void add_src_reg(InsnFields *f, InsnRegNames *refs,
-                               uint8_t reg_id, uint16_t qemu_reg)
+                               uint8_t reg_id, const QemuRegKey *qemu_reg)
 {
     if (reg_id == REG_NONE || f->n_src_regs >= MAX_SRC_REGS) {
         return;
     }
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         if (f->src_regs[i] == reg_id) {
-            if (refs && refs->src_qemu_reg[i] == 0) {
-                refs->src_qemu_reg[i] = qemu_reg;
+            if (refs && !refs->src_qemu_reg_keys[i].name &&
+                qemu_reg_key_valid(qemu_reg)) {
+                refs->src_qemu_reg_keys[i] = *qemu_reg;
             }
             return;
         }
     }
     uint8_t slot = f->n_src_regs++;
     f->src_regs[slot] = reg_id;
-    if (refs) {
-        refs->src_qemu_reg[slot] = qemu_reg;
+    if (refs && qemu_reg_key_valid(qemu_reg)) {
+        refs->src_qemu_reg_keys[slot] = *qemu_reg;
     }
 }
 
 static inline void add_dst_reg(InsnFields *f, InsnRegNames *refs,
-                               uint8_t reg_id, uint16_t qemu_reg)
+                               uint8_t reg_id, const QemuRegKey *qemu_reg)
 {
     if (reg_id == REG_NONE || f->n_dst_regs >= MAX_DST_REGS) {
         return;
     }
     for (uint8_t i = 0; i < f->n_dst_regs; i++) {
         if (f->dst_regs[i] == reg_id) {
-            if (refs && refs->dst_qemu_reg[i] == 0) {
-                refs->dst_qemu_reg[i] = qemu_reg;
+            if (refs && !refs->dst_qemu_reg_keys[i].name &&
+                qemu_reg_key_valid(qemu_reg)) {
+                refs->dst_qemu_reg_keys[i] = *qemu_reg;
             }
             return;
         }
     }
     uint8_t slot = f->n_dst_regs++;
     f->dst_regs[slot] = reg_id;
-    if (refs) {
-        refs->dst_qemu_reg[slot] = qemu_reg;
+    if (refs && qemu_reg_key_valid(qemu_reg)) {
+        refs->dst_qemu_reg_keys[slot] = *qemu_reg;
     }
 }
 
@@ -73,11 +80,11 @@ static inline void add_src_cap_reg(InsnFields *f, InsnRegNames *refs,
     }
     if (rc->n_regs) {
         for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
-            add_src_reg(f, refs, rc->regs[i], 0);
+            add_src_reg(f, refs, rc->regs[i], NULL);
         }
         return;
     }
-    add_src_reg(f, refs, rc->reg_id, rc->qemu_reg);
+    add_src_reg(f, refs, rc->reg_id, &rc->qemu_reg);
 }
 
 static inline void add_dst_cap_reg(InsnFields *f, InsnRegNames *refs,
@@ -89,11 +96,11 @@ static inline void add_dst_cap_reg(InsnFields *f, InsnRegNames *refs,
     }
     if (rc->n_regs) {
         for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
-            add_dst_reg(f, refs, rc->regs[i], 0);
+            add_dst_reg(f, refs, rc->regs[i], NULL);
         }
         return;
     }
-    add_dst_reg(f, refs, rc->reg_id, rc->qemu_reg);
+    add_dst_reg(f, refs, rc->reg_id, &rc->qemu_reg);
 }
 
 static void warn_unknown_instruction(uint64_t pc, const char *reason,

@@ -200,13 +200,13 @@ typedef struct {
 } RegSnap;
 
 /*
- * Per-insn QEMU/GDB register ids for InsnFields.src_regs[] and
- * InsnFields.dst_regs[].  Values are one-based; 0 means the corresponding
- * generic register has no single QEMU register that can be read directly.
+ * Per-insn QEMU register descriptor keys for InsnFields.src_regs[] and
+ * InsnFields.dst_regs[].  A NULL name means the corresponding generic
+ * register has no single QEMU register that can be read directly.
  */
 typedef struct {
-    uint16_t src_qemu_reg[MAX_SRC_REGS];
-    uint16_t dst_qemu_reg[MAX_DST_REGS];
+    QemuRegKey src_qemu_reg_keys[MAX_SRC_REGS];
+    QemuRegKey dst_qemu_reg_keys[MAX_DST_REGS];
 } InsnRegNames;
 
 typedef struct {
@@ -476,8 +476,8 @@ BBTemplate *commit_true_bb(uint64_t start_pc,
 ChainTemplate *commit_chain(const uint32_t *bb_ids, uint32_t n_bbs);
 
 /*
- * Wide regfile snapshot: opaque thread-local scratch keyed by the QEMU/GDB
- * register ids present in the active Capstone register table.  Used by the
+ * Wide regfile snapshot: opaque thread-local scratch keyed by the QEMU
+ * register descriptors present in the active Capstone register table.  Used by the
  * wrong-path loop to capture pre-fragment register state (since CF_MEMI_ONLY
  * in spec mode suppresses per-insn exec callbacks).
  */
@@ -494,8 +494,9 @@ void         wide_reg_snap_free(WideRegSnap *w);
 
 /*
  * Append per-insn source RegSnap records sourced from a wide snapshot to
- * @out_snaps, using @tmpl->insn_reg_names[insn_idx].src_qemu_reg as the lookup
- * keys.  Missing ids yield zero snaps.  No-op when reg-data is disabled.
+ * @out_snaps, using @tmpl->insn_reg_names[insn_idx].src_qemu_reg_keys as the
+ * lookup keys.  Missing handles yield zero snaps.  No-op when reg-data is
+ * disabled.
  */
 void wp_capture_insn_snaps(const WideRegSnap *wide,
                            const BBTemplate *tmpl,

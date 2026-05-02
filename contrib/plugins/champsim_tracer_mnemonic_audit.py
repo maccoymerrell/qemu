@@ -14,12 +14,15 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 
 ROOT = Path(__file__).resolve().parents[2]
 PLUGIN_DIR = Path(__file__).resolve().parent
 CAPSTONE_INCLUDE = ROOT / "subprojects" / "capstone" / "include" / "capstone"
+GDB_XML_DIR = ROOT / "gdb-xml"
 
 
 @dataclass(frozen=True)
@@ -102,6 +105,20 @@ class RegEntry:
     @property
     def ignored(self) -> bool:
         return self.primary == "REG_NONE" and not self.aliases
+
+
+@dataclass(frozen=True)
+class QemuRegKey:
+    feature: str
+    name: str
+
+
+@dataclass(frozen=True)
+class GdbXmlFeature:
+    feature_name: str
+    regs: dict[str, int]
+    names_by_local: tuple[str | None, ...]
+    num_regs: int
 
 
 ENTRY_RE = re.compile(
@@ -1439,129 +1456,253 @@ def format_entry(const_name: str, entry: Entry) -> str:
     return line + " },"
 
 
-def qemu_x86_gdb_reg(name: str) -> int | None:
+def xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+@lru_cache(maxsize=None)
+def gdb_xml_feature(xml_name: str) -> GdbXmlFeature:
+    path = GDB_XML_DIR / xml_name
+    try:
+        root = ET.parse(path).getroot()
+    except FileNotFoundError as exc:
+        raise SystemExit(f"could not find GDB XML feature {path}") from exc
+    except ET.ParseError as exc:
+        raise SystemExit(f"could not parse GDB XML feature {path}: {exc}") from exc
+
+    regnum = 0
+    parsed: list[tuple[str, int]] = []
+    for child in root:
+        if xml_local_name(child.tag) != "reg":
+            continue
+        if "regnum" in child.attrib:
+            regnum = int(child.attrib["regnum"], 0)
+        parsed.append((child.attrib["name"], regnum))
+        regnum += 1
+
+    if not parsed:
+        return GdbXmlFeature(root.attrib["name"], {}, (), 0)
+
+    base_reg = min(regnum for _, regnum in parsed)
+    num_regs = max(regnum for _, regnum in parsed) - base_reg + 1
+    regs: dict[str, int] = {}
+    names_by_local: list[str | None] = [None] * num_regs
+    for name, regnum in parsed:
+        local_reg = regnum - base_reg
+        regs[name] = local_reg
+        names_by_local[local_reg] = name
+    return GdbXmlFeature(root.attrib["name"], regs, tuple(names_by_local), num_regs)
+
+
+def gdb_xml_reg_name(xml_name: str, local_reg: int) -> str | None:
+    names = gdb_xml_feature(xml_name).names_by_local
+    return names[local_reg] if 0 <= local_reg < len(names) else None
+
+
+def add_qemu_reg_key(regs: dict[str, QemuRegKey], name: str,
+                     feature_name: str, qemu_name: str | None = None) -> None:
+    regs[name] = QemuRegKey(feature_name, qemu_name or name)
+
+
+def add_gdb_feature_keys(regs: dict[str, QemuRegKey],
+                         feature: GdbXmlFeature) -> None:
+    for name in feature.regs:
+        add_qemu_reg_key(regs, name, feature.feature_name)
+
+
+@lru_cache(maxsize=None)
+def gdb_xml_reg_key_map(xml_names: tuple[str, ...]) -> dict[str, QemuRegKey]:
+    regs: dict[str, QemuRegKey] = {}
+    for xml_name in xml_names:
+        add_gdb_feature_keys(regs, gdb_xml_feature(xml_name))
+    return regs
+
+
+def add_sequential_qemu_reg_keys(regs: dict[str, QemuRegKey], prefix: str,
+                                 count: int, feature_name: str) -> None:
+    for num in range(count):
+        add_qemu_reg_key(regs, f"{prefix}{num}", feature_name)
+
+
+@lru_cache(maxsize=None)
+def qemu_x86_reg_keys() -> dict[str, QemuRegKey]:
+    return gdb_xml_reg_key_map(("i386-64bit.xml",))
+
+
+@lru_cache(maxsize=None)
+def qemu_aarch64_reg_keys() -> dict[str, QemuRegKey]:
+    regs = dict(gdb_xml_reg_key_map(("aarch64-core.xml", "aarch64-fpu.xml")))
+    sve_feature = "org.gnu.gdb.aarch64.sve"
+
+    add_sequential_qemu_reg_keys(regs, "z", 32, sve_feature)
+    add_sequential_qemu_reg_keys(regs, "p", 16, sve_feature)
+    add_qemu_reg_key(regs, "ffr", sve_feature)
+    add_qemu_reg_key(regs, "vg", sve_feature)
+    return regs
+
+
+@lru_cache(maxsize=None)
+def qemu_riscv_reg_keys() -> dict[str, QemuRegKey]:
+    regs = dict(gdb_xml_reg_key_map(("riscv-64bit-cpu.xml", "riscv-64bit-fpu.xml")))
+    add_sequential_qemu_reg_keys(regs, "v", 32, "org.gnu.gdb.riscv.vector")
+    return regs
+
+
+QEMU_REG_KEYS = {
+    "x86": qemu_x86_reg_keys,
+    "aarch64": qemu_aarch64_reg_keys,
+    "riscv": qemu_riscv_reg_keys,
+}
+
+
+def qemu_reg_key_by_name(isa: str, name: str | None) -> QemuRegKey | None:
+    if name is None:
+        return None
+    return QEMU_REG_KEYS[isa]().get(name)
+
+
+def qemu_x86_reg_key(name: str) -> QemuRegKey | None:
     gpr_aliases = {
-        "A": 0, "B": 1, "C": 2, "D": 3,
-        "SI": 4, "DI": 5, "BP": 6, "SP": 7,
+        "A": "rax", "B": "rbx", "C": "rcx", "D": "rdx",
+        "SI": "rsi", "DI": "rdi", "BP": "rbp", "SP": "rsp",
     }
     if name in {"EIZ", "RIZ"}:
         return None
     if name in {"IP", "EIP", "RIP"}:
-        return 16
+        return qemu_reg_key_by_name("x86", "rip")
     if name == "EFLAGS":
-        return 17
+        return qemu_reg_key_by_name("x86", "eflags")
     if name == "FPSW":
-        return 42
-    segs = {"CS": 18, "SS": 19, "DS": 20, "ES": 21, "FS": 22, "GS": 23}
+        return qemu_reg_key_by_name("x86", "fstat")
+    segs = {"CS", "SS", "DS", "ES", "FS", "GS"}
     if name in segs:
-        return segs[name]
+        return qemu_reg_key_by_name("x86", name.lower())
     if match := re.fullmatch(r"CR(0|2|3|4|8)", name):
-        return {"0": 27, "2": 28, "3": 29, "4": 30, "8": 31}[match.group(1)]
+        return qemu_reg_key_by_name("x86", f"cr{match.group(1)}")
     if match := re.fullmatch(r"(?:FP|ST)([0-7])", name):
-        return 33 + int(match.group(1))
+        return qemu_reg_key_by_name("x86", f"st{match.group(1)}")
     if match := re.fullmatch(r"[XYZ]MM(\d+)", name):
         num = int(match.group(1))
-        return 49 + num if num < 16 else None
+        return qemu_reg_key_by_name("x86", f"xmm{num}") if num < 16 else None
     if name == "MXCSR":
-        return 65
+        return qemu_reg_key_by_name("x86", "mxcsr")
     if match := re.fullmatch(r"R(\d+)(?:[BDW])?", name):
         num = int(match.group(1))
-        return num if 8 <= num <= 15 else None
-    for base, reg in gpr_aliases.items():
+        return qemu_reg_key_by_name("x86", f"r{num}") if 8 <= num <= 15 else None
+    for base, qemu_name in gpr_aliases.items():
         if re.fullmatch(rf"[ER]?{base}[XHL]?|{base}L", name):
-            return reg
+            return qemu_reg_key_by_name("x86", qemu_name)
     return None
 
 
-def qemu_aarch64_gdb_reg(name: str) -> int | None:
+def qemu_aarch64_reg_key(name: str) -> QemuRegKey | None:
     if name in {"X_LANE", "Y_LANE", "WZR", "XZR"}:
         return None
     if name in {"SP", "WSP"}:
-        return 31
+        return qemu_reg_key_by_name("aarch64", "sp")
     if name == "LR":
-        return 30
+        return qemu_reg_key_by_name("aarch64", "x30")
     if name == "FP":
-        return 29
+        return qemu_reg_key_by_name("aarch64", "x29")
     if name == "NZCV":
-        return 33
+        return qemu_reg_key_by_name("aarch64", "cpsr")
     if name == "FPSR":
-        return 66
+        return qemu_reg_key_by_name("aarch64", "fpsr")
     if name == "FPCR":
-        return 67
+        return qemu_reg_key_by_name("aarch64", "fpcr")
     if name == "FFR":
-        return 84
+        return qemu_reg_key_by_name("aarch64", "ffr")
     if name == "VG":
-        return 85
+        return qemu_reg_key_by_name("aarch64", "vg")
     if match := re.fullmatch(r"P(\d+)", name):
         num = int(match.group(1))
-        return 68 + num if num < 16 else None
-    if match := re.fullmatch(r"[BHSQDZ](\d+)", name):
+        return qemu_reg_key_by_name("aarch64", f"p{num}") if num < 16 else None
+    if match := re.fullmatch(r"[BHSDQ](\d+)", name):
         num = int(match.group(1))
-        return 34 + num if num < 32 else None
+        return qemu_reg_key_by_name("aarch64", f"v{num}") if num < 32 else None
+    if match := re.fullmatch(r"Z(\d+)", name):
+        num = int(match.group(1))
+        return qemu_reg_key_by_name("aarch64", f"z{num}") if num < 32 else None
     if match := re.fullmatch(r"[WX](\d+)", name):
         num = int(match.group(1))
-        return num if num < 31 else None
+        return qemu_reg_key_by_name("aarch64", f"x{num}") if num < 31 else None
     return None
 
 
-def qemu_riscv_gdb_reg(name: str) -> int | None:
+def qemu_riscv_reg_key(name: str) -> QemuRegKey | None:
     if name in {"DUMMY_REG_PAIR_WITH_X0"}:
         return None
     if name == "X0_PAIR":
         return None
     if match := re.fullmatch(r"X(\d+)", name):
         num = int(match.group(1))
-        return num if num < 32 else None
+        return qemu_reg_key_by_name(
+            "riscv", gdb_xml_reg_name("riscv-64bit-cpu.xml", num)) if num < 32 else None
     if match := re.fullmatch(r"F(\d+)_[DFH]", name):
         num = int(match.group(1))
-        return 33 + num if num < 32 else None
+        return qemu_reg_key_by_name(
+            "riscv", gdb_xml_reg_name("riscv-64bit-fpu.xml", num)) if num < 32 else None
     if match := re.fullmatch(r"V(\d+)", name):
         num = int(match.group(1))
-        return 65 + num if num < 32 else None
+        return qemu_reg_key_by_name("riscv", f"v{num}") if num < 32 else None
     return None
 
 
-def qemu_mips_gdb_reg(name: str) -> int | None:
+def qemu_mips_reg_key(name: str) -> QemuRegKey | None:
+    feature = "org.gnu.gdb.mips.cpu"
+    gpr_names = (
+        "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+        "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+        "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+        "t8", "t9", "k0", "k1", "gp", "sp", "s8", "ra",
+    )
     stem = re.sub(r"(?:_NM|_64)$", "", name)
     if stem == "ZERO":
-        return 0
+        return QemuRegKey(feature, "zero")
     if stem == "PC":
-        return 37
+        return QemuRegKey(feature, "pc")
     if stem == "LO":
-        return 33
+        return QemuRegKey(feature, "lo")
     if stem == "HI":
-        return 34
+        return QemuRegKey(feature, "hi")
     if stem in MIPS_GPR_NUM:
-        return MIPS_GPR_NUM[stem]
+        return QemuRegKey(feature, gpr_names[MIPS_GPR_NUM[stem]])
     if match := re.fullmatch(r"[FD](\d+)", stem):
         num = int(match.group(1))
-        return 38 + num if num < 32 else None
+        return QemuRegKey(feature, f"f{num}") if num < 32 else None
     if stem == "FCR31":
-        return 70
+        return QemuRegKey(feature, "fcr31")
     if stem == "FCR0":
-        return 71
+        return QemuRegKey(feature, "fcr0")
     return None
 
 
-QEMU_GDB_REG_CLASSIFIERS = {
-    "x86": qemu_x86_gdb_reg,
-    "aarch64": qemu_aarch64_gdb_reg,
-    "riscv": qemu_riscv_gdb_reg,
-    "mips": qemu_mips_gdb_reg,
+QEMU_REG_CLASSIFIERS = {
+    "x86": qemu_x86_reg_key,
+    "aarch64": qemu_aarch64_reg_key,
+    "riscv": qemu_riscv_reg_key,
+    "mips": qemu_mips_reg_key,
 }
 
 
-def qemu_gdb_reg(info: IsaInfo, const_name: str) -> int | None:
+def qemu_reg_key(info: IsaInfo, const_name: str) -> QemuRegKey | None:
     name = const_name.removeprefix(info.reg_prefix)
-    return QEMU_GDB_REG_CLASSIFIERS[info.key](name)
+    return QEMU_REG_CLASSIFIERS[info.key](name)
 
 
-def format_qemu_reg(qemu_reg: int | None) -> str:
-    return f", .qemu_reg = {qemu_reg + 1}" if qemu_reg is not None else ""
+def c_string(value: str) -> str:
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def format_qemu_reg(qemu_reg: QemuRegKey | None) -> str:
+    if qemu_reg is None:
+        return ""
+    return (", .qemu_reg = { .feature = " + c_string(qemu_reg.feature) +
+            ", .name = " + c_string(qemu_reg.name) + " }")
 
 
 def format_reg_entry(const_name: str, entry: RegEntry, comment: str,
-                     qemu_reg: int | None) -> str:
+                     qemu_reg: QemuRegKey | None) -> str:
     qemu_field = format_qemu_reg(qemu_reg)
     if entry.aliases:
         aliases = ", ".join(entry.aliases)
@@ -1602,7 +1743,7 @@ def generated_reg_body(info: IsaInfo, constants: list[str]) -> str:
         mapped += 1
         comment = const_name.removeprefix(info.reg_prefix).lower()
         lines.append(format_reg_entry(const_name, entry, comment,
-                                      qemu_gdb_reg(info, const_name)))
+                                      qemu_reg_key(info, const_name)))
     lines.insert(1, f"    /* {info.key} regs: {mapped}/{len(constants) + 1} mapped, {ignored} intentionally ignored */")
     return "\n".join(lines) + "\n"
 

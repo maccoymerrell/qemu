@@ -99,8 +99,191 @@ unsigned active_insn_table_size;
 const RegClassification *active_reg_table;
 unsigned active_reg_table_size;
 
+typedef struct {
+    GHashTable *handles;
+} VCPURegHandles;
+
+static GPtrArray *vcpu_reg_handles;
+static GMutex vcpu_reg_handles_lock;
+static __thread VCPURegHandles *tls_reg_handles;
+static __thread unsigned int tls_reg_handles_cpu_index = (unsigned int)-1;
+
 static GHashTable *option_ht;
 uint64_t stat_unknown_insn_warnings;
+
+static bool qemu_reg_key_valid(const QemuRegKey *key)
+{
+    return key && key->name;
+}
+
+static guint qemu_reg_key_hash(gconstpointer data)
+{
+    const QemuRegKey *key = (const QemuRegKey *)data;
+    const char *feature = key->feature ? key->feature : "";
+    const char *name = key->name ? key->name : "";
+
+    return g_str_hash(feature) ^ (g_str_hash(name) << 1);
+}
+
+static gboolean qemu_reg_key_equal(gconstpointer lhs, gconstpointer rhs)
+{
+    const QemuRegKey *a = (const QemuRegKey *)lhs;
+    const QemuRegKey *b = (const QemuRegKey *)rhs;
+
+    return g_strcmp0(a->feature, b->feature) == 0 &&
+           g_strcmp0(a->name, b->name) == 0;
+}
+
+static void qemu_reg_key_free(gpointer data)
+{
+    QemuRegKey *key = (QemuRegKey *)data;
+
+    if (!key) {
+        return;
+    }
+    g_free((char *)key->feature);
+    g_free((char *)key->name);
+    g_free(key);
+}
+
+static void vcpu_reg_handles_free(gpointer data)
+{
+    VCPURegHandles *cache = (VCPURegHandles *)data;
+
+    if (!cache) {
+        return;
+    }
+    g_hash_table_destroy(cache->handles);
+    g_free(cache);
+}
+
+static void vcpu_reg_handles_insert(VCPURegHandles *cache,
+                                    const char *feature,
+                                    const char *name,
+                                    struct qemu_plugin_register *handle)
+{
+    QemuRegKey *key;
+
+    if (!cache || !name || !handle) {
+        return;
+    }
+
+    key = g_new(QemuRegKey, 1);
+    key->feature = g_strdup(feature);
+    key->name = g_strdup(name);
+    g_hash_table_insert(cache->handles, key, handle);
+}
+
+static bool parse_numbered_reg(const char *name, char prefix,
+                               unsigned int limit, unsigned int *num)
+{
+    char *end = NULL;
+    guint64 value;
+
+    if (!name || name[0] != prefix || !g_ascii_isdigit(name[1])) {
+        return false;
+    }
+
+    value = g_ascii_strtoull(name + 1, &end, 10);
+    if (!end || *end || value >= limit) {
+        return false;
+    }
+
+    *num = (unsigned int)value;
+    return true;
+}
+
+static void vcpu_reg_handles_insert_aarch64_aliases(
+    VCPURegHandles *cache,
+    const qemu_plugin_reg_descriptor *desc)
+{
+    static const char fpu_feature[] = "org.gnu.gdb.aarch64.fpu";
+    static const char sve_feature[] = "org.gnu.gdb.aarch64.sve";
+    unsigned int num;
+
+    if (trace_isa != TRACE_ISA_AARCH64 ||
+        g_strcmp0(desc->feature, sve_feature) != 0) {
+        return;
+    }
+
+    if (parse_numbered_reg(desc->name, 'z', 32, &num)) {
+        char alias[8];
+
+        g_snprintf(alias, sizeof(alias), "v%u", num);
+        vcpu_reg_handles_insert(cache, fpu_feature, alias, desc->handle);
+    } else if (g_strcmp0(desc->name, "fpsr") == 0 ||
+               g_strcmp0(desc->name, "fpcr") == 0) {
+        vcpu_reg_handles_insert(cache, fpu_feature, desc->name,
+                                desc->handle);
+    }
+}
+
+static VCPURegHandles *vcpu_reg_handles_new(void)
+{
+    VCPURegHandles *cache = g_new0(VCPURegHandles, 1);
+    g_autoptr(GArray) regs = qemu_plugin_get_registers();
+
+    cache->handles = g_hash_table_new_full(qemu_reg_key_hash,
+                                           qemu_reg_key_equal,
+                                           qemu_reg_key_free,
+                                           NULL);
+
+    for (guint i = 0; i < regs->len; i++) {
+        const qemu_plugin_reg_descriptor *desc =
+            &g_array_index(regs, qemu_plugin_reg_descriptor, i);
+
+        vcpu_reg_handles_insert(cache, desc->feature, desc->name,
+                                desc->handle);
+        vcpu_reg_handles_insert_aarch64_aliases(cache, desc);
+    }
+
+    return cache;
+}
+
+static VCPURegHandles *vcpu_reg_handles_for_cpu(unsigned int cpu_index)
+{
+    VCPURegHandles *cache = NULL;
+
+    if (tls_reg_handles && tls_reg_handles_cpu_index == cpu_index) {
+        return tls_reg_handles;
+    }
+
+    g_mutex_lock(&vcpu_reg_handles_lock);
+    if (!vcpu_reg_handles) {
+        vcpu_reg_handles = g_ptr_array_new_with_free_func(vcpu_reg_handles_free);
+    }
+    if (cpu_index < vcpu_reg_handles->len) {
+        cache = (VCPURegHandles *)g_ptr_array_index(vcpu_reg_handles,
+                                                    cpu_index);
+    }
+    if (!cache) {
+        cache = vcpu_reg_handles_new();
+        while (vcpu_reg_handles->len <= cpu_index) {
+            g_ptr_array_add(vcpu_reg_handles, NULL);
+        }
+        g_ptr_array_index(vcpu_reg_handles, cpu_index) = cache;
+    }
+    g_mutex_unlock(&vcpu_reg_handles_lock);
+
+    tls_reg_handles = cache;
+    tls_reg_handles_cpu_index = cpu_index;
+    return cache;
+}
+
+static struct qemu_plugin_register *lookup_qemu_reg_handle(
+    unsigned int cpu_index,
+    const QemuRegKey *key)
+{
+    VCPURegHandles *cache;
+
+    if (!qemu_reg_key_valid(key)) {
+        return NULL;
+    }
+
+    cache = vcpu_reg_handles_for_cpu(cpu_index);
+    return (struct qemu_plugin_register *)g_hash_table_lookup(cache->handles,
+                                                             key);
+}
 
 static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
 {
@@ -119,7 +302,9 @@ static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
         }
     }
 
-    (void)cpu_index;
+    if (enable_reg_data) {
+        vcpu_reg_handles_for_cpu(cpu_index);
+    }
 }
 
 enum PluginOptId {
@@ -743,9 +928,9 @@ static BBTemplate *get_or_create_template(uint64_t start_pc,
 /* ========================= Reg-data snapshot capture ========================= */
 
 /*
- * Read a register by one-based QEMU/GDB register id.  Unknown registers yield
- * a zero snap.  Only meaningful when enable_reg_data is true and the current
- * callback requested QEMU_PLUGIN_CB_R_REGS.
+ * Read a register through the QEMU plugin descriptor handle.  Unknown
+ * registers yield a zero snap.  Only meaningful when enable_reg_data is true
+ * and the current callback requested QEMU_PLUGIN_CB_R_REGS.
  */
 static __thread GByteArray *reg_read_buf;
 
@@ -759,14 +944,19 @@ static GByteArray *reg_read_scratch(void)
     return reg_read_buf;
 }
 
-static void read_qemu_reg_into_snap(uint16_t qemu_reg, RegSnap *out)
+static void read_qemu_reg_into_snap(unsigned int cpu_index,
+                                    const QemuRegKey *qemu_reg,
+                                    RegSnap *out)
 {
+    struct qemu_plugin_register *handle;
+
     cst_wide_zero(&out->value);
-    if (qemu_reg == 0) {
+    handle = lookup_qemu_reg_handle(cpu_index, qemu_reg);
+    if (!handle) {
         return;
     }
     GByteArray *buf = reg_read_scratch();
-    int n = qemu_plugin_read_register_by_id((int)qemu_reg - 1, buf);
+    int n = qemu_plugin_read_register(handle, buf);
     if (n <= 0) {
         return;
     }
@@ -781,11 +971,10 @@ static inline void reg_snap_array_append(GArray *arr, const RegSnap *snap)
 }
 
 static void read_reg_into_snap(unsigned int cpu_index,
-                               uint16_t qemu_reg,
+                               const QemuRegKey *qemu_reg,
                                RegSnap *out)
 {
-    (void)cpu_index;
-    read_qemu_reg_into_snap(qemu_reg, out);
+    read_qemu_reg_into_snap(cpu_index, qemu_reg, out);
 }
 
 /*
@@ -821,7 +1010,7 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
     }
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         RegSnap s;
-        read_reg_into_snap(cpu_index, names->src_qemu_reg[i], &s);
+        read_reg_into_snap(cpu_index, &names->src_qemu_reg_keys[i], &s);
         reg_snap_array_append(pending_reg_snaps, &s);
     }
 }
@@ -843,7 +1032,7 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
  */
 
 typedef struct {
-    uint16_t qemu_reg;
+    QemuRegKey qemu_reg;
     RegSnap snap;
 } WideRegEntry;
 
@@ -855,10 +1044,11 @@ struct _WideRegSnap {
 static __thread WideRegSnap wide_reg_scratch;
 static __thread unsigned wide_reg_scratch_cap;
 
-static bool wide_reg_snap_contains(const WideRegSnap *w, uint16_t qemu_reg)
+static bool wide_reg_snap_contains(const WideRegSnap *w,
+                                   const QemuRegKey *qemu_reg)
 {
     for (unsigned i = 0; i < w->n; i++) {
-        if (w->entries[i].qemu_reg == qemu_reg) {
+        if (qemu_reg_key_equal(&w->entries[i].qemu_reg, qemu_reg)) {
             return true;
         }
     }
@@ -867,7 +1057,6 @@ static bool wide_reg_snap_contains(const WideRegSnap *w, uint16_t qemu_reg)
 
 WideRegSnap *wide_reg_snap_capture(unsigned int cpu_index)
 {
-    (void)cpu_index;
     if (!enable_reg_data) {
         return NULL;
     }
@@ -877,9 +1066,9 @@ WideRegSnap *wide_reg_snap_capture(unsigned int cpu_index)
 
     wide_reg_scratch.n = 0;
     for (unsigned i = 0; i < active_reg_table_size; i++) {
-        uint16_t qemu_reg = active_reg_table[i].qemu_reg;
-        if (qemu_reg == 0 || wide_reg_snap_contains(&wide_reg_scratch,
-                                                    qemu_reg)) {
+        const QemuRegKey *qemu_reg = &active_reg_table[i].qemu_reg;
+        if (!qemu_reg_key_valid(qemu_reg) ||
+            wide_reg_snap_contains(&wide_reg_scratch, qemu_reg)) {
             continue;
         }
         if (wide_reg_scratch.n == wide_reg_scratch_cap) {
@@ -890,8 +1079,9 @@ WideRegSnap *wide_reg_snap_capture(unsigned int cpu_index)
                                                wide_reg_scratch_cap);
         }
         unsigned slot = wide_reg_scratch.n++;
-        wide_reg_scratch.entries[slot].qemu_reg = qemu_reg;
-        read_qemu_reg_into_snap(qemu_reg, &wide_reg_scratch.entries[slot].snap);
+        wide_reg_scratch.entries[slot].qemu_reg = *qemu_reg;
+        read_qemu_reg_into_snap(cpu_index, qemu_reg,
+                                &wide_reg_scratch.entries[slot].snap);
     }
     return wide_reg_scratch.n ? &wide_reg_scratch : NULL;
 }
@@ -901,15 +1091,15 @@ void wide_reg_snap_free(WideRegSnap *w)
     (void)w;
 }
 
-static void wide_reg_snap_lookup(WideRegSnap *w, uint16_t qemu_reg,
+static void wide_reg_snap_lookup(WideRegSnap *w, const QemuRegKey *qemu_reg,
                                  RegSnap *out)
 {
     cst_wide_zero(&out->value);
-    if (!w || qemu_reg == 0) {
+    if (!w || !qemu_reg_key_valid(qemu_reg)) {
         return;
     }
     for (unsigned i = 0; i < w->n; i++) {
-        if (w->entries[i].qemu_reg == qemu_reg) {
+        if (qemu_reg_key_equal(&w->entries[i].qemu_reg, qemu_reg)) {
             *out = w->entries[i].snap;
             return;
         }
@@ -929,7 +1119,8 @@ void wp_capture_insn_snaps(const WideRegSnap *wide,
     const InsnRegNames *names = &tmpl->insn_reg_names[insn_idx];
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         RegSnap s;
-        wide_reg_snap_lookup((WideRegSnap *)wide, names->src_qemu_reg[i], &s);
+        wide_reg_snap_lookup((WideRegSnap *)wide,
+                             &names->src_qemu_reg_keys[i], &s);
         reg_snap_array_append(out_snaps, &s);
     }
 }
@@ -947,7 +1138,7 @@ void wp_capture_insn_snaps_live(unsigned int cpu_index,
     const InsnRegNames *names = &tmpl->insn_reg_names[insn_idx];
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         RegSnap s;
-        read_reg_into_snap(cpu_index, names->src_qemu_reg[i], &s);
+        read_reg_into_snap(cpu_index, &names->src_qemu_reg_keys[i], &s);
         reg_snap_array_append(out_snaps, &s);
     }
 }
@@ -1881,6 +2072,10 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     if (reg_read_buf) {
         g_byte_array_unref(reg_read_buf);
         reg_read_buf = NULL;
+    }
+    if (vcpu_reg_handles) {
+        g_ptr_array_unref(vcpu_reg_handles);
+        vcpu_reg_handles = NULL;
     }
     g_free(wide_reg_scratch.entries);
     wide_reg_scratch.entries = NULL;

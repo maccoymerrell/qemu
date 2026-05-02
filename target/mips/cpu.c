@@ -586,6 +586,11 @@ static void mips_cpu_class_init(ObjectClass *c, void *data)
     cc->get_pc = mips_cpu_get_pc;
     cc->gdb_read_register = mips_cpu_gdb_read_register;
     cc->gdb_write_register = mips_cpu_gdb_write_register;
+#if defined(TARGET_MIPS64)
+    cc->gdb_core_xml_file = "mips64-cpu.xml";
+#else
+    cc->gdb_core_xml_file = "mips-cpu.xml";
+#endif
 #ifndef CONFIG_USER_ONLY
     cc->sysemu_ops = &mips_sysemu_ops;
 #endif

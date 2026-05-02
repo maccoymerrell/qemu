@@ -170,166 +170,166 @@ static const RegClassification riscv_reg_class[RISCV_REG_ENDING] = {
     [RISCV_REG_VXRM] = { .reg_id = REG_VCTRL },  /* vxrm */
     [RISCV_REG_VXSAT] = { .reg_id = REG_VCTRL },  /* vxsat */
     [RISCV_REG_DUMMY_REG_PAIR_WITH_X0] = { .reg_id = REG_ZERO },  /* dummy_reg_pair_with_x0 */
-    [RISCV_REG_V0] = { .reg_id = REG_VEC0, .qemu_reg = 66 },  /* v0 */
-    [RISCV_REG_V1] = { .reg_id = REG_VEC1, .qemu_reg = 67 },  /* v1 */
-    [RISCV_REG_V2] = { .reg_id = REG_VEC2, .qemu_reg = 68 },  /* v2 */
-    [RISCV_REG_V3] = { .reg_id = REG_VEC3, .qemu_reg = 69 },  /* v3 */
-    [RISCV_REG_V4] = { .reg_id = REG_VEC4, .qemu_reg = 70 },  /* v4 */
-    [RISCV_REG_V5] = { .reg_id = REG_VEC5, .qemu_reg = 71 },  /* v5 */
-    [RISCV_REG_V6] = { .reg_id = REG_VEC6, .qemu_reg = 72 },  /* v6 */
-    [RISCV_REG_V7] = { .reg_id = REG_VEC7, .qemu_reg = 73 },  /* v7 */
-    [RISCV_REG_V8] = { .reg_id = REG_VEC8, .qemu_reg = 74 },  /* v8 */
-    [RISCV_REG_V9] = { .reg_id = REG_VEC9, .qemu_reg = 75 },  /* v9 */
-    [RISCV_REG_V10] = { .reg_id = REG_VEC10, .qemu_reg = 76 },  /* v10 */
-    [RISCV_REG_V11] = { .reg_id = REG_VEC11, .qemu_reg = 77 },  /* v11 */
-    [RISCV_REG_V12] = { .reg_id = REG_VEC12, .qemu_reg = 78 },  /* v12 */
-    [RISCV_REG_V13] = { .reg_id = REG_VEC13, .qemu_reg = 79 },  /* v13 */
-    [RISCV_REG_V14] = { .reg_id = REG_VEC14, .qemu_reg = 80 },  /* v14 */
-    [RISCV_REG_V15] = { .reg_id = REG_VEC15, .qemu_reg = 81 },  /* v15 */
-    [RISCV_REG_V16] = { .reg_id = REG_VEC16, .qemu_reg = 82 },  /* v16 */
-    [RISCV_REG_V17] = { .reg_id = REG_VEC17, .qemu_reg = 83 },  /* v17 */
-    [RISCV_REG_V18] = { .reg_id = REG_VEC18, .qemu_reg = 84 },  /* v18 */
-    [RISCV_REG_V19] = { .reg_id = REG_VEC19, .qemu_reg = 85 },  /* v19 */
-    [RISCV_REG_V20] = { .reg_id = REG_VEC20, .qemu_reg = 86 },  /* v20 */
-    [RISCV_REG_V21] = { .reg_id = REG_VEC21, .qemu_reg = 87 },  /* v21 */
-    [RISCV_REG_V22] = { .reg_id = REG_VEC22, .qemu_reg = 88 },  /* v22 */
-    [RISCV_REG_V23] = { .reg_id = REG_VEC23, .qemu_reg = 89 },  /* v23 */
-    [RISCV_REG_V24] = { .reg_id = REG_VEC24, .qemu_reg = 90 },  /* v24 */
-    [RISCV_REG_V25] = { .reg_id = REG_VEC25, .qemu_reg = 91 },  /* v25 */
-    [RISCV_REG_V26] = { .reg_id = REG_VEC26, .qemu_reg = 92 },  /* v26 */
-    [RISCV_REG_V27] = { .reg_id = REG_VEC27, .qemu_reg = 93 },  /* v27 */
-    [RISCV_REG_V28] = { .reg_id = REG_VEC28, .qemu_reg = 94 },  /* v28 */
-    [RISCV_REG_V29] = { .reg_id = REG_VEC29, .qemu_reg = 95 },  /* v29 */
-    [RISCV_REG_V30] = { .reg_id = REG_VEC30, .qemu_reg = 96 },  /* v30 */
-    [RISCV_REG_V31] = { .reg_id = REG_VEC31, .qemu_reg = 97 },  /* v31 */
-    [RISCV_REG_X0] = { .reg_id = REG_ZERO, .qemu_reg = 1 },  /* x0 */
-    [RISCV_REG_X1] = { .reg_id = REG_LR, .qemu_reg = 2 },  /* x1 */
-    [RISCV_REG_X2] = { .reg_id = REG_SP, .qemu_reg = 3 },  /* x2 */
-    [RISCV_REG_X3] = { .reg_id = REG_GPR3, .qemu_reg = 4 },  /* x3 */
-    [RISCV_REG_X4] = { .reg_id = REG_GPR4, .qemu_reg = 5 },  /* x4 */
-    [RISCV_REG_X5] = { .reg_id = REG_GPR5, .qemu_reg = 6 },  /* x5 */
-    [RISCV_REG_X6] = { .reg_id = REG_GPR6, .qemu_reg = 7 },  /* x6 */
-    [RISCV_REG_X7] = { .reg_id = REG_GPR7, .qemu_reg = 8 },  /* x7 */
-    [RISCV_REG_X8] = { .reg_id = REG_FP_REG, .qemu_reg = 9 },  /* x8 */
-    [RISCV_REG_X9] = { .reg_id = REG_GPR9, .qemu_reg = 10 },  /* x9 */
-    [RISCV_REG_X10] = { .reg_id = REG_GPR10, .qemu_reg = 11 },  /* x10 */
-    [RISCV_REG_X11] = { .reg_id = REG_GPR11, .qemu_reg = 12 },  /* x11 */
-    [RISCV_REG_X12] = { .reg_id = REG_GPR12, .qemu_reg = 13 },  /* x12 */
-    [RISCV_REG_X13] = { .reg_id = REG_GPR13, .qemu_reg = 14 },  /* x13 */
-    [RISCV_REG_X14] = { .reg_id = REG_GPR14, .qemu_reg = 15 },  /* x14 */
-    [RISCV_REG_X15] = { .reg_id = REG_GPR15, .qemu_reg = 16 },  /* x15 */
-    [RISCV_REG_X16] = { .reg_id = REG_GPR16, .qemu_reg = 17 },  /* x16 */
-    [RISCV_REG_X17] = { .reg_id = REG_GPR17, .qemu_reg = 18 },  /* x17 */
-    [RISCV_REG_X18] = { .reg_id = REG_GPR18, .qemu_reg = 19 },  /* x18 */
-    [RISCV_REG_X19] = { .reg_id = REG_GPR19, .qemu_reg = 20 },  /* x19 */
-    [RISCV_REG_X20] = { .reg_id = REG_GPR20, .qemu_reg = 21 },  /* x20 */
-    [RISCV_REG_X21] = { .reg_id = REG_GPR21, .qemu_reg = 22 },  /* x21 */
-    [RISCV_REG_X22] = { .reg_id = REG_GPR22, .qemu_reg = 23 },  /* x22 */
-    [RISCV_REG_X23] = { .reg_id = REG_GPR23, .qemu_reg = 24 },  /* x23 */
-    [RISCV_REG_X24] = { .reg_id = REG_GPR24, .qemu_reg = 25 },  /* x24 */
-    [RISCV_REG_X25] = { .reg_id = REG_GPR25, .qemu_reg = 26 },  /* x25 */
-    [RISCV_REG_X26] = { .reg_id = REG_GPR26, .qemu_reg = 27 },  /* x26 */
-    [RISCV_REG_X27] = { .reg_id = REG_GPR27, .qemu_reg = 28 },  /* x27 */
-    [RISCV_REG_X28] = { .reg_id = REG_GPR28, .qemu_reg = 29 },  /* x28 */
-    [RISCV_REG_X29] = { .reg_id = REG_GPR29, .qemu_reg = 30 },  /* x29 */
-    [RISCV_REG_X30] = { .reg_id = REG_GPR30, .qemu_reg = 31 },  /* x30 */
-    [RISCV_REG_X31] = { .reg_id = REG_GPR31, .qemu_reg = 32 },  /* x31 */
-    [RISCV_REG_F0_D] = { .reg_id = REG_FPR0, .qemu_reg = 34 },  /* f0_d */
-    [RISCV_REG_F1_D] = { .reg_id = REG_FPR1, .qemu_reg = 35 },  /* f1_d */
-    [RISCV_REG_F2_D] = { .reg_id = REG_FPR2, .qemu_reg = 36 },  /* f2_d */
-    [RISCV_REG_F3_D] = { .reg_id = REG_FPR3, .qemu_reg = 37 },  /* f3_d */
-    [RISCV_REG_F4_D] = { .reg_id = REG_FPR4, .qemu_reg = 38 },  /* f4_d */
-    [RISCV_REG_F5_D] = { .reg_id = REG_FPR5, .qemu_reg = 39 },  /* f5_d */
-    [RISCV_REG_F6_D] = { .reg_id = REG_FPR6, .qemu_reg = 40 },  /* f6_d */
-    [RISCV_REG_F7_D] = { .reg_id = REG_FPR7, .qemu_reg = 41 },  /* f7_d */
-    [RISCV_REG_F8_D] = { .reg_id = REG_FPR8, .qemu_reg = 42 },  /* f8_d */
-    [RISCV_REG_F9_D] = { .reg_id = REG_FPR9, .qemu_reg = 43 },  /* f9_d */
-    [RISCV_REG_F10_D] = { .reg_id = REG_FPR10, .qemu_reg = 44 },  /* f10_d */
-    [RISCV_REG_F11_D] = { .reg_id = REG_FPR11, .qemu_reg = 45 },  /* f11_d */
-    [RISCV_REG_F12_D] = { .reg_id = REG_FPR12, .qemu_reg = 46 },  /* f12_d */
-    [RISCV_REG_F13_D] = { .reg_id = REG_FPR13, .qemu_reg = 47 },  /* f13_d */
-    [RISCV_REG_F14_D] = { .reg_id = REG_FPR14, .qemu_reg = 48 },  /* f14_d */
-    [RISCV_REG_F15_D] = { .reg_id = REG_FPR15, .qemu_reg = 49 },  /* f15_d */
-    [RISCV_REG_F16_D] = { .reg_id = REG_FPR16, .qemu_reg = 50 },  /* f16_d */
-    [RISCV_REG_F17_D] = { .reg_id = REG_FPR17, .qemu_reg = 51 },  /* f17_d */
-    [RISCV_REG_F18_D] = { .reg_id = REG_FPR18, .qemu_reg = 52 },  /* f18_d */
-    [RISCV_REG_F19_D] = { .reg_id = REG_FPR19, .qemu_reg = 53 },  /* f19_d */
-    [RISCV_REG_F20_D] = { .reg_id = REG_FPR20, .qemu_reg = 54 },  /* f20_d */
-    [RISCV_REG_F21_D] = { .reg_id = REG_FPR21, .qemu_reg = 55 },  /* f21_d */
-    [RISCV_REG_F22_D] = { .reg_id = REG_FPR22, .qemu_reg = 56 },  /* f22_d */
-    [RISCV_REG_F23_D] = { .reg_id = REG_FPR23, .qemu_reg = 57 },  /* f23_d */
-    [RISCV_REG_F24_D] = { .reg_id = REG_FPR24, .qemu_reg = 58 },  /* f24_d */
-    [RISCV_REG_F25_D] = { .reg_id = REG_FPR25, .qemu_reg = 59 },  /* f25_d */
-    [RISCV_REG_F26_D] = { .reg_id = REG_FPR26, .qemu_reg = 60 },  /* f26_d */
-    [RISCV_REG_F27_D] = { .reg_id = REG_FPR27, .qemu_reg = 61 },  /* f27_d */
-    [RISCV_REG_F28_D] = { .reg_id = REG_FPR28, .qemu_reg = 62 },  /* f28_d */
-    [RISCV_REG_F29_D] = { .reg_id = REG_FPR29, .qemu_reg = 63 },  /* f29_d */
-    [RISCV_REG_F30_D] = { .reg_id = REG_FPR30, .qemu_reg = 64 },  /* f30_d */
-    [RISCV_REG_F31_D] = { .reg_id = REG_FPR31, .qemu_reg = 65 },  /* f31_d */
-    [RISCV_REG_F0_F] = { .reg_id = REG_FPR0, .qemu_reg = 34 },  /* f0_f */
-    [RISCV_REG_F1_F] = { .reg_id = REG_FPR1, .qemu_reg = 35 },  /* f1_f */
-    [RISCV_REG_F2_F] = { .reg_id = REG_FPR2, .qemu_reg = 36 },  /* f2_f */
-    [RISCV_REG_F3_F] = { .reg_id = REG_FPR3, .qemu_reg = 37 },  /* f3_f */
-    [RISCV_REG_F4_F] = { .reg_id = REG_FPR4, .qemu_reg = 38 },  /* f4_f */
-    [RISCV_REG_F5_F] = { .reg_id = REG_FPR5, .qemu_reg = 39 },  /* f5_f */
-    [RISCV_REG_F6_F] = { .reg_id = REG_FPR6, .qemu_reg = 40 },  /* f6_f */
-    [RISCV_REG_F7_F] = { .reg_id = REG_FPR7, .qemu_reg = 41 },  /* f7_f */
-    [RISCV_REG_F8_F] = { .reg_id = REG_FPR8, .qemu_reg = 42 },  /* f8_f */
-    [RISCV_REG_F9_F] = { .reg_id = REG_FPR9, .qemu_reg = 43 },  /* f9_f */
-    [RISCV_REG_F10_F] = { .reg_id = REG_FPR10, .qemu_reg = 44 },  /* f10_f */
-    [RISCV_REG_F11_F] = { .reg_id = REG_FPR11, .qemu_reg = 45 },  /* f11_f */
-    [RISCV_REG_F12_F] = { .reg_id = REG_FPR12, .qemu_reg = 46 },  /* f12_f */
-    [RISCV_REG_F13_F] = { .reg_id = REG_FPR13, .qemu_reg = 47 },  /* f13_f */
-    [RISCV_REG_F14_F] = { .reg_id = REG_FPR14, .qemu_reg = 48 },  /* f14_f */
-    [RISCV_REG_F15_F] = { .reg_id = REG_FPR15, .qemu_reg = 49 },  /* f15_f */
-    [RISCV_REG_F16_F] = { .reg_id = REG_FPR16, .qemu_reg = 50 },  /* f16_f */
-    [RISCV_REG_F17_F] = { .reg_id = REG_FPR17, .qemu_reg = 51 },  /* f17_f */
-    [RISCV_REG_F18_F] = { .reg_id = REG_FPR18, .qemu_reg = 52 },  /* f18_f */
-    [RISCV_REG_F19_F] = { .reg_id = REG_FPR19, .qemu_reg = 53 },  /* f19_f */
-    [RISCV_REG_F20_F] = { .reg_id = REG_FPR20, .qemu_reg = 54 },  /* f20_f */
-    [RISCV_REG_F21_F] = { .reg_id = REG_FPR21, .qemu_reg = 55 },  /* f21_f */
-    [RISCV_REG_F22_F] = { .reg_id = REG_FPR22, .qemu_reg = 56 },  /* f22_f */
-    [RISCV_REG_F23_F] = { .reg_id = REG_FPR23, .qemu_reg = 57 },  /* f23_f */
-    [RISCV_REG_F24_F] = { .reg_id = REG_FPR24, .qemu_reg = 58 },  /* f24_f */
-    [RISCV_REG_F25_F] = { .reg_id = REG_FPR25, .qemu_reg = 59 },  /* f25_f */
-    [RISCV_REG_F26_F] = { .reg_id = REG_FPR26, .qemu_reg = 60 },  /* f26_f */
-    [RISCV_REG_F27_F] = { .reg_id = REG_FPR27, .qemu_reg = 61 },  /* f27_f */
-    [RISCV_REG_F28_F] = { .reg_id = REG_FPR28, .qemu_reg = 62 },  /* f28_f */
-    [RISCV_REG_F29_F] = { .reg_id = REG_FPR29, .qemu_reg = 63 },  /* f29_f */
-    [RISCV_REG_F30_F] = { .reg_id = REG_FPR30, .qemu_reg = 64 },  /* f30_f */
-    [RISCV_REG_F31_F] = { .reg_id = REG_FPR31, .qemu_reg = 65 },  /* f31_f */
-    [RISCV_REG_F0_H] = { .reg_id = REG_FPR0, .qemu_reg = 34 },  /* f0_h */
-    [RISCV_REG_F1_H] = { .reg_id = REG_FPR1, .qemu_reg = 35 },  /* f1_h */
-    [RISCV_REG_F2_H] = { .reg_id = REG_FPR2, .qemu_reg = 36 },  /* f2_h */
-    [RISCV_REG_F3_H] = { .reg_id = REG_FPR3, .qemu_reg = 37 },  /* f3_h */
-    [RISCV_REG_F4_H] = { .reg_id = REG_FPR4, .qemu_reg = 38 },  /* f4_h */
-    [RISCV_REG_F5_H] = { .reg_id = REG_FPR5, .qemu_reg = 39 },  /* f5_h */
-    [RISCV_REG_F6_H] = { .reg_id = REG_FPR6, .qemu_reg = 40 },  /* f6_h */
-    [RISCV_REG_F7_H] = { .reg_id = REG_FPR7, .qemu_reg = 41 },  /* f7_h */
-    [RISCV_REG_F8_H] = { .reg_id = REG_FPR8, .qemu_reg = 42 },  /* f8_h */
-    [RISCV_REG_F9_H] = { .reg_id = REG_FPR9, .qemu_reg = 43 },  /* f9_h */
-    [RISCV_REG_F10_H] = { .reg_id = REG_FPR10, .qemu_reg = 44 },  /* f10_h */
-    [RISCV_REG_F11_H] = { .reg_id = REG_FPR11, .qemu_reg = 45 },  /* f11_h */
-    [RISCV_REG_F12_H] = { .reg_id = REG_FPR12, .qemu_reg = 46 },  /* f12_h */
-    [RISCV_REG_F13_H] = { .reg_id = REG_FPR13, .qemu_reg = 47 },  /* f13_h */
-    [RISCV_REG_F14_H] = { .reg_id = REG_FPR14, .qemu_reg = 48 },  /* f14_h */
-    [RISCV_REG_F15_H] = { .reg_id = REG_FPR15, .qemu_reg = 49 },  /* f15_h */
-    [RISCV_REG_F16_H] = { .reg_id = REG_FPR16, .qemu_reg = 50 },  /* f16_h */
-    [RISCV_REG_F17_H] = { .reg_id = REG_FPR17, .qemu_reg = 51 },  /* f17_h */
-    [RISCV_REG_F18_H] = { .reg_id = REG_FPR18, .qemu_reg = 52 },  /* f18_h */
-    [RISCV_REG_F19_H] = { .reg_id = REG_FPR19, .qemu_reg = 53 },  /* f19_h */
-    [RISCV_REG_F20_H] = { .reg_id = REG_FPR20, .qemu_reg = 54 },  /* f20_h */
-    [RISCV_REG_F21_H] = { .reg_id = REG_FPR21, .qemu_reg = 55 },  /* f21_h */
-    [RISCV_REG_F22_H] = { .reg_id = REG_FPR22, .qemu_reg = 56 },  /* f22_h */
-    [RISCV_REG_F23_H] = { .reg_id = REG_FPR23, .qemu_reg = 57 },  /* f23_h */
-    [RISCV_REG_F24_H] = { .reg_id = REG_FPR24, .qemu_reg = 58 },  /* f24_h */
-    [RISCV_REG_F25_H] = { .reg_id = REG_FPR25, .qemu_reg = 59 },  /* f25_h */
-    [RISCV_REG_F26_H] = { .reg_id = REG_FPR26, .qemu_reg = 60 },  /* f26_h */
-    [RISCV_REG_F27_H] = { .reg_id = REG_FPR27, .qemu_reg = 61 },  /* f27_h */
-    [RISCV_REG_F28_H] = { .reg_id = REG_FPR28, .qemu_reg = 62 },  /* f28_h */
-    [RISCV_REG_F29_H] = { .reg_id = REG_FPR29, .qemu_reg = 63 },  /* f29_h */
-    [RISCV_REG_F30_H] = { .reg_id = REG_FPR30, .qemu_reg = 64 },  /* f30_h */
-    [RISCV_REG_F31_H] = { .reg_id = REG_FPR31, .qemu_reg = 65 },  /* f31_h */
+    [RISCV_REG_V0] = { .reg_id = REG_VEC0, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v0" } },  /* v0 */
+    [RISCV_REG_V1] = { .reg_id = REG_VEC1, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v1" } },  /* v1 */
+    [RISCV_REG_V2] = { .reg_id = REG_VEC2, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v2" } },  /* v2 */
+    [RISCV_REG_V3] = { .reg_id = REG_VEC3, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v3" } },  /* v3 */
+    [RISCV_REG_V4] = { .reg_id = REG_VEC4, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v4" } },  /* v4 */
+    [RISCV_REG_V5] = { .reg_id = REG_VEC5, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v5" } },  /* v5 */
+    [RISCV_REG_V6] = { .reg_id = REG_VEC6, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v6" } },  /* v6 */
+    [RISCV_REG_V7] = { .reg_id = REG_VEC7, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v7" } },  /* v7 */
+    [RISCV_REG_V8] = { .reg_id = REG_VEC8, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v8" } },  /* v8 */
+    [RISCV_REG_V9] = { .reg_id = REG_VEC9, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v9" } },  /* v9 */
+    [RISCV_REG_V10] = { .reg_id = REG_VEC10, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v10" } },  /* v10 */
+    [RISCV_REG_V11] = { .reg_id = REG_VEC11, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v11" } },  /* v11 */
+    [RISCV_REG_V12] = { .reg_id = REG_VEC12, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v12" } },  /* v12 */
+    [RISCV_REG_V13] = { .reg_id = REG_VEC13, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v13" } },  /* v13 */
+    [RISCV_REG_V14] = { .reg_id = REG_VEC14, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v14" } },  /* v14 */
+    [RISCV_REG_V15] = { .reg_id = REG_VEC15, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v15" } },  /* v15 */
+    [RISCV_REG_V16] = { .reg_id = REG_VEC16, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v16" } },  /* v16 */
+    [RISCV_REG_V17] = { .reg_id = REG_VEC17, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v17" } },  /* v17 */
+    [RISCV_REG_V18] = { .reg_id = REG_VEC18, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v18" } },  /* v18 */
+    [RISCV_REG_V19] = { .reg_id = REG_VEC19, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v19" } },  /* v19 */
+    [RISCV_REG_V20] = { .reg_id = REG_VEC20, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v20" } },  /* v20 */
+    [RISCV_REG_V21] = { .reg_id = REG_VEC21, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v21" } },  /* v21 */
+    [RISCV_REG_V22] = { .reg_id = REG_VEC22, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v22" } },  /* v22 */
+    [RISCV_REG_V23] = { .reg_id = REG_VEC23, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v23" } },  /* v23 */
+    [RISCV_REG_V24] = { .reg_id = REG_VEC24, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v24" } },  /* v24 */
+    [RISCV_REG_V25] = { .reg_id = REG_VEC25, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v25" } },  /* v25 */
+    [RISCV_REG_V26] = { .reg_id = REG_VEC26, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v26" } },  /* v26 */
+    [RISCV_REG_V27] = { .reg_id = REG_VEC27, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v27" } },  /* v27 */
+    [RISCV_REG_V28] = { .reg_id = REG_VEC28, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v28" } },  /* v28 */
+    [RISCV_REG_V29] = { .reg_id = REG_VEC29, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v29" } },  /* v29 */
+    [RISCV_REG_V30] = { .reg_id = REG_VEC30, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v30" } },  /* v30 */
+    [RISCV_REG_V31] = { .reg_id = REG_VEC31, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v31" } },  /* v31 */
+    [RISCV_REG_X0] = { .reg_id = REG_ZERO, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "zero" } },  /* x0 */
+    [RISCV_REG_X1] = { .reg_id = REG_LR, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "ra" } },  /* x1 */
+    [RISCV_REG_X2] = { .reg_id = REG_SP, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "sp" } },  /* x2 */
+    [RISCV_REG_X3] = { .reg_id = REG_GPR3, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "gp" } },  /* x3 */
+    [RISCV_REG_X4] = { .reg_id = REG_GPR4, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "tp" } },  /* x4 */
+    [RISCV_REG_X5] = { .reg_id = REG_GPR5, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "t0" } },  /* x5 */
+    [RISCV_REG_X6] = { .reg_id = REG_GPR6, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "t1" } },  /* x6 */
+    [RISCV_REG_X7] = { .reg_id = REG_GPR7, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "t2" } },  /* x7 */
+    [RISCV_REG_X8] = { .reg_id = REG_FP_REG, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "fp" } },  /* x8 */
+    [RISCV_REG_X9] = { .reg_id = REG_GPR9, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "s1" } },  /* x9 */
+    [RISCV_REG_X10] = { .reg_id = REG_GPR10, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "a0" } },  /* x10 */
+    [RISCV_REG_X11] = { .reg_id = REG_GPR11, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "a1" } },  /* x11 */
+    [RISCV_REG_X12] = { .reg_id = REG_GPR12, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "a2" } },  /* x12 */
+    [RISCV_REG_X13] = { .reg_id = REG_GPR13, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "a3" } },  /* x13 */
+    [RISCV_REG_X14] = { .reg_id = REG_GPR14, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "a4" } },  /* x14 */
+    [RISCV_REG_X15] = { .reg_id = REG_GPR15, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "a5" } },  /* x15 */
+    [RISCV_REG_X16] = { .reg_id = REG_GPR16, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "a6" } },  /* x16 */
+    [RISCV_REG_X17] = { .reg_id = REG_GPR17, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "a7" } },  /* x17 */
+    [RISCV_REG_X18] = { .reg_id = REG_GPR18, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "s2" } },  /* x18 */
+    [RISCV_REG_X19] = { .reg_id = REG_GPR19, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "s3" } },  /* x19 */
+    [RISCV_REG_X20] = { .reg_id = REG_GPR20, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "s4" } },  /* x20 */
+    [RISCV_REG_X21] = { .reg_id = REG_GPR21, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "s5" } },  /* x21 */
+    [RISCV_REG_X22] = { .reg_id = REG_GPR22, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "s6" } },  /* x22 */
+    [RISCV_REG_X23] = { .reg_id = REG_GPR23, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "s7" } },  /* x23 */
+    [RISCV_REG_X24] = { .reg_id = REG_GPR24, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "s8" } },  /* x24 */
+    [RISCV_REG_X25] = { .reg_id = REG_GPR25, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "s9" } },  /* x25 */
+    [RISCV_REG_X26] = { .reg_id = REG_GPR26, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "s10" } },  /* x26 */
+    [RISCV_REG_X27] = { .reg_id = REG_GPR27, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "s11" } },  /* x27 */
+    [RISCV_REG_X28] = { .reg_id = REG_GPR28, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "t3" } },  /* x28 */
+    [RISCV_REG_X29] = { .reg_id = REG_GPR29, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "t4" } },  /* x29 */
+    [RISCV_REG_X30] = { .reg_id = REG_GPR30, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "t5" } },  /* x30 */
+    [RISCV_REG_X31] = { .reg_id = REG_GPR31, .qemu_reg = { .feature = "org.gnu.gdb.riscv.cpu", .name = "t6" } },  /* x31 */
+    [RISCV_REG_F0_D] = { .reg_id = REG_FPR0, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft0" } },  /* f0_d */
+    [RISCV_REG_F1_D] = { .reg_id = REG_FPR1, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft1" } },  /* f1_d */
+    [RISCV_REG_F2_D] = { .reg_id = REG_FPR2, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft2" } },  /* f2_d */
+    [RISCV_REG_F3_D] = { .reg_id = REG_FPR3, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft3" } },  /* f3_d */
+    [RISCV_REG_F4_D] = { .reg_id = REG_FPR4, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft4" } },  /* f4_d */
+    [RISCV_REG_F5_D] = { .reg_id = REG_FPR5, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft5" } },  /* f5_d */
+    [RISCV_REG_F6_D] = { .reg_id = REG_FPR6, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft6" } },  /* f6_d */
+    [RISCV_REG_F7_D] = { .reg_id = REG_FPR7, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft7" } },  /* f7_d */
+    [RISCV_REG_F8_D] = { .reg_id = REG_FPR8, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs0" } },  /* f8_d */
+    [RISCV_REG_F9_D] = { .reg_id = REG_FPR9, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs1" } },  /* f9_d */
+    [RISCV_REG_F10_D] = { .reg_id = REG_FPR10, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa0" } },  /* f10_d */
+    [RISCV_REG_F11_D] = { .reg_id = REG_FPR11, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa1" } },  /* f11_d */
+    [RISCV_REG_F12_D] = { .reg_id = REG_FPR12, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa2" } },  /* f12_d */
+    [RISCV_REG_F13_D] = { .reg_id = REG_FPR13, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa3" } },  /* f13_d */
+    [RISCV_REG_F14_D] = { .reg_id = REG_FPR14, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa4" } },  /* f14_d */
+    [RISCV_REG_F15_D] = { .reg_id = REG_FPR15, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa5" } },  /* f15_d */
+    [RISCV_REG_F16_D] = { .reg_id = REG_FPR16, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa6" } },  /* f16_d */
+    [RISCV_REG_F17_D] = { .reg_id = REG_FPR17, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa7" } },  /* f17_d */
+    [RISCV_REG_F18_D] = { .reg_id = REG_FPR18, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs2" } },  /* f18_d */
+    [RISCV_REG_F19_D] = { .reg_id = REG_FPR19, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs3" } },  /* f19_d */
+    [RISCV_REG_F20_D] = { .reg_id = REG_FPR20, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs4" } },  /* f20_d */
+    [RISCV_REG_F21_D] = { .reg_id = REG_FPR21, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs5" } },  /* f21_d */
+    [RISCV_REG_F22_D] = { .reg_id = REG_FPR22, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs6" } },  /* f22_d */
+    [RISCV_REG_F23_D] = { .reg_id = REG_FPR23, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs7" } },  /* f23_d */
+    [RISCV_REG_F24_D] = { .reg_id = REG_FPR24, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs8" } },  /* f24_d */
+    [RISCV_REG_F25_D] = { .reg_id = REG_FPR25, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs9" } },  /* f25_d */
+    [RISCV_REG_F26_D] = { .reg_id = REG_FPR26, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs10" } },  /* f26_d */
+    [RISCV_REG_F27_D] = { .reg_id = REG_FPR27, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs11" } },  /* f27_d */
+    [RISCV_REG_F28_D] = { .reg_id = REG_FPR28, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft8" } },  /* f28_d */
+    [RISCV_REG_F29_D] = { .reg_id = REG_FPR29, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft9" } },  /* f29_d */
+    [RISCV_REG_F30_D] = { .reg_id = REG_FPR30, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft10" } },  /* f30_d */
+    [RISCV_REG_F31_D] = { .reg_id = REG_FPR31, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft11" } },  /* f31_d */
+    [RISCV_REG_F0_F] = { .reg_id = REG_FPR0, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft0" } },  /* f0_f */
+    [RISCV_REG_F1_F] = { .reg_id = REG_FPR1, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft1" } },  /* f1_f */
+    [RISCV_REG_F2_F] = { .reg_id = REG_FPR2, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft2" } },  /* f2_f */
+    [RISCV_REG_F3_F] = { .reg_id = REG_FPR3, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft3" } },  /* f3_f */
+    [RISCV_REG_F4_F] = { .reg_id = REG_FPR4, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft4" } },  /* f4_f */
+    [RISCV_REG_F5_F] = { .reg_id = REG_FPR5, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft5" } },  /* f5_f */
+    [RISCV_REG_F6_F] = { .reg_id = REG_FPR6, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft6" } },  /* f6_f */
+    [RISCV_REG_F7_F] = { .reg_id = REG_FPR7, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft7" } },  /* f7_f */
+    [RISCV_REG_F8_F] = { .reg_id = REG_FPR8, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs0" } },  /* f8_f */
+    [RISCV_REG_F9_F] = { .reg_id = REG_FPR9, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs1" } },  /* f9_f */
+    [RISCV_REG_F10_F] = { .reg_id = REG_FPR10, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa0" } },  /* f10_f */
+    [RISCV_REG_F11_F] = { .reg_id = REG_FPR11, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa1" } },  /* f11_f */
+    [RISCV_REG_F12_F] = { .reg_id = REG_FPR12, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa2" } },  /* f12_f */
+    [RISCV_REG_F13_F] = { .reg_id = REG_FPR13, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa3" } },  /* f13_f */
+    [RISCV_REG_F14_F] = { .reg_id = REG_FPR14, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa4" } },  /* f14_f */
+    [RISCV_REG_F15_F] = { .reg_id = REG_FPR15, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa5" } },  /* f15_f */
+    [RISCV_REG_F16_F] = { .reg_id = REG_FPR16, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa6" } },  /* f16_f */
+    [RISCV_REG_F17_F] = { .reg_id = REG_FPR17, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa7" } },  /* f17_f */
+    [RISCV_REG_F18_F] = { .reg_id = REG_FPR18, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs2" } },  /* f18_f */
+    [RISCV_REG_F19_F] = { .reg_id = REG_FPR19, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs3" } },  /* f19_f */
+    [RISCV_REG_F20_F] = { .reg_id = REG_FPR20, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs4" } },  /* f20_f */
+    [RISCV_REG_F21_F] = { .reg_id = REG_FPR21, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs5" } },  /* f21_f */
+    [RISCV_REG_F22_F] = { .reg_id = REG_FPR22, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs6" } },  /* f22_f */
+    [RISCV_REG_F23_F] = { .reg_id = REG_FPR23, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs7" } },  /* f23_f */
+    [RISCV_REG_F24_F] = { .reg_id = REG_FPR24, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs8" } },  /* f24_f */
+    [RISCV_REG_F25_F] = { .reg_id = REG_FPR25, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs9" } },  /* f25_f */
+    [RISCV_REG_F26_F] = { .reg_id = REG_FPR26, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs10" } },  /* f26_f */
+    [RISCV_REG_F27_F] = { .reg_id = REG_FPR27, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs11" } },  /* f27_f */
+    [RISCV_REG_F28_F] = { .reg_id = REG_FPR28, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft8" } },  /* f28_f */
+    [RISCV_REG_F29_F] = { .reg_id = REG_FPR29, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft9" } },  /* f29_f */
+    [RISCV_REG_F30_F] = { .reg_id = REG_FPR30, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft10" } },  /* f30_f */
+    [RISCV_REG_F31_F] = { .reg_id = REG_FPR31, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft11" } },  /* f31_f */
+    [RISCV_REG_F0_H] = { .reg_id = REG_FPR0, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft0" } },  /* f0_h */
+    [RISCV_REG_F1_H] = { .reg_id = REG_FPR1, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft1" } },  /* f1_h */
+    [RISCV_REG_F2_H] = { .reg_id = REG_FPR2, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft2" } },  /* f2_h */
+    [RISCV_REG_F3_H] = { .reg_id = REG_FPR3, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft3" } },  /* f3_h */
+    [RISCV_REG_F4_H] = { .reg_id = REG_FPR4, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft4" } },  /* f4_h */
+    [RISCV_REG_F5_H] = { .reg_id = REG_FPR5, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft5" } },  /* f5_h */
+    [RISCV_REG_F6_H] = { .reg_id = REG_FPR6, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft6" } },  /* f6_h */
+    [RISCV_REG_F7_H] = { .reg_id = REG_FPR7, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft7" } },  /* f7_h */
+    [RISCV_REG_F8_H] = { .reg_id = REG_FPR8, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs0" } },  /* f8_h */
+    [RISCV_REG_F9_H] = { .reg_id = REG_FPR9, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs1" } },  /* f9_h */
+    [RISCV_REG_F10_H] = { .reg_id = REG_FPR10, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa0" } },  /* f10_h */
+    [RISCV_REG_F11_H] = { .reg_id = REG_FPR11, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa1" } },  /* f11_h */
+    [RISCV_REG_F12_H] = { .reg_id = REG_FPR12, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa2" } },  /* f12_h */
+    [RISCV_REG_F13_H] = { .reg_id = REG_FPR13, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa3" } },  /* f13_h */
+    [RISCV_REG_F14_H] = { .reg_id = REG_FPR14, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa4" } },  /* f14_h */
+    [RISCV_REG_F15_H] = { .reg_id = REG_FPR15, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa5" } },  /* f15_h */
+    [RISCV_REG_F16_H] = { .reg_id = REG_FPR16, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa6" } },  /* f16_h */
+    [RISCV_REG_F17_H] = { .reg_id = REG_FPR17, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fa7" } },  /* f17_h */
+    [RISCV_REG_F18_H] = { .reg_id = REG_FPR18, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs2" } },  /* f18_h */
+    [RISCV_REG_F19_H] = { .reg_id = REG_FPR19, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs3" } },  /* f19_h */
+    [RISCV_REG_F20_H] = { .reg_id = REG_FPR20, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs4" } },  /* f20_h */
+    [RISCV_REG_F21_H] = { .reg_id = REG_FPR21, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs5" } },  /* f21_h */
+    [RISCV_REG_F22_H] = { .reg_id = REG_FPR22, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs6" } },  /* f22_h */
+    [RISCV_REG_F23_H] = { .reg_id = REG_FPR23, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs7" } },  /* f23_h */
+    [RISCV_REG_F24_H] = { .reg_id = REG_FPR24, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs8" } },  /* f24_h */
+    [RISCV_REG_F25_H] = { .reg_id = REG_FPR25, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs9" } },  /* f25_h */
+    [RISCV_REG_F26_H] = { .reg_id = REG_FPR26, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs10" } },  /* f26_h */
+    [RISCV_REG_F27_H] = { .reg_id = REG_FPR27, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "fs11" } },  /* f27_h */
+    [RISCV_REG_F28_H] = { .reg_id = REG_FPR28, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft8" } },  /* f28_h */
+    [RISCV_REG_F29_H] = { .reg_id = REG_FPR29, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft9" } },  /* f29_h */
+    [RISCV_REG_F30_H] = { .reg_id = REG_FPR30, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft10" } },  /* f30_h */
+    [RISCV_REG_F31_H] = { .reg_id = REG_FPR31, .qemu_reg = { .feature = "org.gnu.gdb.riscv.fpu", .name = "ft11" } },  /* f31_h */
     [RISCV_REG_X0_PAIR] = { .reg_id = REG_ZERO },  /* x0_pair */
     [RISCV_REG_V0M2] = { .reg_id = REG_VEC0, .n_regs = 2, .regs = { REG_VEC0, REG_VEC1 } },  /* v0m2 */
     [RISCV_REG_V0M4] = { .reg_id = REG_VEC0, .n_regs = 4, .regs = { REG_VEC0, REG_VEC1, REG_VEC2, REG_VEC3 } },  /* v0m4 */

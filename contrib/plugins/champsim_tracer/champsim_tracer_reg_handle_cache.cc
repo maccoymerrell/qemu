@@ -60,48 +60,41 @@ void cache_insert(GHashTable *handles,
 
 } /* namespace */
 
+RegHandleCache::VCPUCache::VCPUCache()
+    : handles(g_hash_table_new_full(key_hash, key_equal, key_free, nullptr))
+{
+}
+
+RegHandleCache::VCPUCache::~VCPUCache()
+{
+    if (handles) {
+        g_hash_table_destroy(handles);
+    }
+}
+
 RegHandleCache::RegHandleCache()
-    : vcpu_caches_(nullptr)
 {
     g_mutex_init(&lock_);
 }
 
 RegHandleCache::~RegHandleCache()
 {
-    if (vcpu_caches_) {
-        g_ptr_array_unref(vcpu_caches_);
-    }
     g_mutex_clear(&lock_);
 }
 
-void RegHandleCache::destroy_cache(gpointer data)
+void RegHandleCache::populate_cache(VCPUCache &cache)
 {
-    VCPUCache *cache = (VCPUCache *)data;
-    if (!cache) {
-        return;
-    }
-    g_hash_table_destroy(cache->handles);
-    g_free(cache);
-}
-
-RegHandleCache::VCPUCache *RegHandleCache::make_cache()
-{
-    VCPUCache *cache = g_new0(VCPUCache, 1);
-    cache->handles = g_hash_table_new_full(key_hash, key_equal,
-                                           key_free, nullptr);
-
     RegAliasInserterFn alias_inserter =
         isa_properties[trace_isa].reg_alias_inserter;
     g_autoptr(GArray) regs = qemu_plugin_get_registers();
     for (guint i = 0; i < regs->len; i++) {
         const qemu_plugin_reg_descriptor *desc =
             &g_array_index(regs, qemu_plugin_reg_descriptor, i);
-        cache_insert(cache->handles, desc->feature, desc->name, desc->handle);
+        cache_insert(cache.handles, desc->feature, desc->name, desc->handle);
         if (alias_inserter) {
-            alias_inserter(cache->handles, desc);
+            alias_inserter(cache.handles, desc);
         }
     }
-    return cache;
 }
 
 RegHandleCache::VCPUCache *RegHandleCache::get_or_create(unsigned int cpu_index)
@@ -110,21 +103,15 @@ RegHandleCache::VCPUCache *RegHandleCache::get_or_create(unsigned int cpu_index)
         return tls_cache_;
     }
 
-    VCPUCache *cache = nullptr;
     g_mutex_lock(&lock_);
-    if (!vcpu_caches_) {
-        vcpu_caches_ = g_ptr_array_new_with_free_func(&destroy_cache);
+    if (cpu_index >= vcpu_caches_.size()) {
+        vcpu_caches_.resize(cpu_index + 1);
     }
-    if (cpu_index < vcpu_caches_->len) {
-        cache = (VCPUCache *)g_ptr_array_index(vcpu_caches_, cpu_index);
+    if (!vcpu_caches_[cpu_index]) {
+        vcpu_caches_[cpu_index] = std::make_unique<VCPUCache>();
+        populate_cache(*vcpu_caches_[cpu_index]);
     }
-    if (!cache) {
-        cache = make_cache();
-        while (vcpu_caches_->len <= cpu_index) {
-            g_ptr_array_add(vcpu_caches_, nullptr);
-        }
-        g_ptr_array_index(vcpu_caches_, cpu_index) = cache;
-    }
+    VCPUCache *cache = vcpu_caches_[cpu_index].get();
     g_mutex_unlock(&lock_);
 
     tls_cache_ = cache;

@@ -22,6 +22,9 @@
 #ifndef CHAMPSIM_TRACER_REG_HANDLE_CACHE_H
 #define CHAMPSIM_TRACER_REG_HANDLE_CACHE_H
 
+#include <memory>
+#include <vector>
+
 #include "champsim_tracer.h"
 
 class RegHandleCache {
@@ -42,21 +45,32 @@ public:
     void ensure_initialized(unsigned int cpu_index);
 
 private:
+    /* The inner GHashTable maps (feature, name) -> qemu_plugin_register*
+     * via QemuRegKey-pointer keys with custom hash/equal/free callbacks
+     * defined in the .cc.  Hot path: one lookup per source register
+     * per insn during reg-data capture, so we keep glib's hash here
+     * rather than risk std::unordered_map's allocation-per-lookup
+     * without C++20 heterogeneous lookup. */
     struct VCPUCache {
-        GHashTable *handles;
+        GHashTable *handles = nullptr;
+        VCPUCache();
+        ~VCPUCache();
+        VCPUCache(const VCPUCache &) = delete;
+        VCPUCache &operator=(const VCPUCache &) = delete;
     };
 
-    /* Per-vCPU caches, indexed by cpu_index. */
-    GPtrArray *vcpu_caches_;
-    GMutex     lock_;
+    /* Per-vCPU caches indexed by cpu_index.  unique_ptr's auto cleanup
+     * replaces the GPtrArray's free_func.  Empty slots stay null until
+     * a vCPU first calls in. */
+    std::vector<std::unique_ptr<VCPUCache>> vcpu_caches_;
+    GMutex                                  lock_;
 
     /* Hot-path TLS shortcut for the most-recent (cpu_index, cache) pair. */
     static thread_local VCPUCache    *tls_cache_;
     static thread_local unsigned int  tls_cache_cpu_index_;
 
     VCPUCache *get_or_create(unsigned int cpu_index);
-    static VCPUCache *make_cache();
-    static void destroy_cache(gpointer data);
+    static void populate_cache(VCPUCache &cache);
 };
 
 extern RegHandleCache g_reg_handle_cache;

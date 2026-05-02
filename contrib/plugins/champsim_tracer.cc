@@ -36,6 +36,7 @@
 #include "champsim_tracer_simpoint_manager.h"
 #include "champsim_tracer_stats.h"
 #include "champsim_tracer_trace_segment_manager.h"
+#include "champsim_tracer_wp_thread_state.h"
 #include "champsim_tracer_writer.h"
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
@@ -147,16 +148,6 @@ enum PluginOptId {
 GMutex data_lock;
 static GMutex exec_lock;
 
-__thread bool wp_in_progress = false;
-__thread GArray *wp_mem_accesses = NULL;
-
-__thread uint64_t wp_saved_insn_count = 0;
-__thread unsigned int wp_saved_cpu_index = 0;
-__thread uint64_t wp_saved_prev_start_pc = 0;
-__thread uint64_t wp_saved_prev_last_pc = 0;
-__thread uint64_t wp_saved_prev_fall_through = 0;
-__thread uint64_t wp_saved_prev_bb_ends_in_branch = 0;
-
 /*
  * Pending register snapshots produced by the per-insn reg-snap
  * callback for the currently-executing BB.  Each insn appends its src
@@ -213,7 +204,7 @@ typedef struct {
 
 static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
 {
-    if (!enable_reg_data || wp_in_progress) {
+    if (!enable_reg_data || g_wp_state.in_progress) {
         return;
     }
     if (!g_trace_segments.is_active_atomic()) {
@@ -472,13 +463,13 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     /* Update the per-vCPU instruction counter (only on CP path; WP
      * fragments are not counted). */
-    if (!wp_in_progress) {
+    if (!g_wp_state.in_progress) {
         uint64_t icount_prev = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
         qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index, icount_prev + n_insns);
     }
     uint64_t icount = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
 
-    if (wp_in_progress) {
+    if (g_wp_state.in_progress) {
         g_mutex_unlock(&exec_lock);
         return;
     }
@@ -768,21 +759,21 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
 {
     g_mutex_lock(&exec_lock);
 
-    if (wp_in_progress) {
-        wp_in_progress = false;
-        qemu_plugin_u64_set(g_scoreboard.insn_count, wp_saved_cpu_index,
-                            wp_saved_insn_count);
-        qemu_plugin_u64_set(g_scoreboard.prev_start_pc, wp_saved_cpu_index,
-                            wp_saved_prev_start_pc);
-        qemu_plugin_u64_set(g_scoreboard.prev_last_pc, wp_saved_cpu_index,
-                            wp_saved_prev_last_pc);
-        qemu_plugin_u64_set(g_scoreboard.prev_fall_through, wp_saved_cpu_index,
-                            wp_saved_prev_fall_through);
-        qemu_plugin_u64_set(g_scoreboard.prev_bb_ends_in_branch, wp_saved_cpu_index,
-                            wp_saved_prev_bb_ends_in_branch);
-        if (wp_mem_accesses) {
-            g_array_unref(wp_mem_accesses);
-            wp_mem_accesses = NULL;
+    if (g_wp_state.in_progress) {
+        g_wp_state.in_progress = false;
+        qemu_plugin_u64_set(g_scoreboard.insn_count, g_wp_state.saved_cpu_index,
+                            g_wp_state.saved_insn_count);
+        qemu_plugin_u64_set(g_scoreboard.prev_start_pc, g_wp_state.saved_cpu_index,
+                            g_wp_state.saved_prev_start_pc);
+        qemu_plugin_u64_set(g_scoreboard.prev_last_pc, g_wp_state.saved_cpu_index,
+                            g_wp_state.saved_prev_last_pc);
+        qemu_plugin_u64_set(g_scoreboard.prev_fall_through, g_wp_state.saved_cpu_index,
+                            g_wp_state.saved_prev_fall_through);
+        qemu_plugin_u64_set(g_scoreboard.prev_bb_ends_in_branch, g_wp_state.saved_cpu_index,
+                            g_wp_state.saved_prev_bb_ends_in_branch);
+        if (g_wp_state.mem_accesses) {
+            g_array_unref(g_wp_state.mem_accesses);
+            g_wp_state.mem_accesses = NULL;
         }
     }
 

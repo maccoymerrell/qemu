@@ -8,6 +8,7 @@
 
 #include "champsim_tracer_mem_access_recorder.h"
 #include "champsim_tracer_trace_segment_manager.h"
+#include "champsim_tracer_wp_thread_state.h"
 
 MemAccessRecorder g_mem_recorder;
 
@@ -87,8 +88,8 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
         capture_mem_value(info, vaddr, &acc);
     }
 
-    if (wp_in_progress && wp_mem_accesses) {
-        g_array_append_val(wp_mem_accesses, acc);
+    if (g_wp_state.in_progress && g_wp_state.mem_accesses) {
+        g_array_append_val(g_wp_state.mem_accesses, acc);
         return;
     }
 

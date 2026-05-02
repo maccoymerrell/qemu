@@ -376,14 +376,6 @@ extern const char *target_name;
 extern char *qemu_command_line;
 extern char *trace_comment;
 
-extern __thread bool wp_in_progress;
-extern __thread GArray *wp_mem_accesses;
-extern __thread unsigned int wp_saved_cpu_index;
-extern __thread uint64_t wp_saved_insn_count;
-extern __thread uint64_t wp_saved_prev_start_pc;
-extern __thread uint64_t wp_saved_prev_last_pc;
-extern __thread uint64_t wp_saved_prev_fall_through;
-extern __thread uint64_t wp_saved_prev_bb_ends_in_branch;
 
 extern const InsnClassification *active_insn_table;
 extern unsigned active_insn_table_size;

@@ -1,0 +1,40 @@
+/*
+ * Wrong-Path Tracing Plugin — per-thread wrong-path simulator state.
+ *
+ * Each QEMU vCPU thread carries one WPThreadState.  Set during
+ * simulate_wrong_path_ext(): the in_progress flag gates plugin
+ * callbacks (mem callback routes to mem_accesses, reg-snap callback
+ * suppresses, vcpu_tb_exec early-outs), and saved_* hold a snapshot
+ * of the per-vCPU scoreboard fields the WP simulator clobbers and
+ * later restores.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#ifndef CHAMPSIM_TRACER_WP_THREAD_STATE_H
+#define CHAMPSIM_TRACER_WP_THREAD_STATE_H
+
+#include "champsim_tracer.h"
+
+struct WPThreadState {
+    /* Set by simulate_wrong_path_ext while a WP simulation is running.
+     * Read by the mem/insn-snap callbacks and the tb-exec orchestrator
+     * to gate CP-only logic. */
+    bool in_progress = false;
+
+    /* Buffer of memops captured during the in-flight WP simulation.
+     * Allocated at WP-sim entry, freed at WP-sim exit. */
+    GArray *mem_accesses = nullptr;
+
+    /* Snapshot of scoreboard state at WP-sim entry, restored at exit. */
+    unsigned int saved_cpu_index = 0;
+    uint64_t saved_insn_count = 0;
+    uint64_t saved_prev_start_pc = 0;
+    uint64_t saved_prev_last_pc = 0;
+    uint64_t saved_prev_fall_through = 0;
+    uint64_t saved_prev_bb_ends_in_branch = 0;
+};
+
+extern thread_local WPThreadState g_wp_state;
+
+#endif /* CHAMPSIM_TRACER_WP_THREAD_STATE_H */

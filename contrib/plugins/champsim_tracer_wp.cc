@@ -18,6 +18,7 @@
 #include "champsim_tracer_reg_snap_collector.h"
 #include "champsim_tracer_scoreboard.h"
 #include "champsim_tracer_stats.h"
+#include "champsim_tracer_wp_thread_state.h"
 
 /*
  * Internal scratch for a single in-progress wrong-path BB.  Six per-insn
@@ -81,17 +82,17 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         return wp_chain;
     }
 
-    wp_mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
+    g_wp_state.mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
 
-    wp_saved_cpu_index = cpu_index;
-    wp_saved_insn_count = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
-    wp_saved_prev_start_pc = qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
-    wp_saved_prev_last_pc = qemu_plugin_u64_get(g_scoreboard.prev_last_pc, cpu_index);
-    wp_saved_prev_fall_through = qemu_plugin_u64_get(g_scoreboard.prev_fall_through,
+    g_wp_state.saved_cpu_index = cpu_index;
+    g_wp_state.saved_insn_count = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
+    g_wp_state.saved_prev_start_pc = qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
+    g_wp_state.saved_prev_last_pc = qemu_plugin_u64_get(g_scoreboard.prev_last_pc, cpu_index);
+    g_wp_state.saved_prev_fall_through = qemu_plugin_u64_get(g_scoreboard.prev_fall_through,
                                                      cpu_index);
-    wp_saved_prev_bb_ends_in_branch =
+    g_wp_state.saved_prev_bb_ends_in_branch =
         qemu_plugin_u64_get(g_scoreboard.prev_bb_ends_in_branch, cpu_index);
-    wp_in_progress = true;
+    g_wp_state.in_progress = true;
 
     qemu_plugin_spec_mode_begin(saved_state);
     qemu_plugin_set_pc(wrong_target);
@@ -129,7 +130,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     while (sim_insns < (uint64_t)max_wrong_path_depth ||
            !bb_pcs.empty()) {
         uint64_t pre_pc = qemu_plugin_get_pc();
-        guint mem_start_idx = wp_mem_accesses->len;
+        guint mem_start_idx = g_wp_state.mem_accesses->len;
         BBTemplate *tmpl = NULL;
         bool tb_ok;
 
@@ -275,8 +276,8 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
 
         /* Attribute mem accesses to insns within the just-appended
          * fragment by matching the recorded insn_pc. */
-        for (guint m = mem_start_idx; m < wp_mem_accesses->len; m++) {
-            WPMemAccess *acc = &g_array_index(wp_mem_accesses,
+        for (guint m = mem_start_idx; m < g_wp_state.mem_accesses->len; m++) {
+            WPMemAccess *acc = &g_array_index(g_wp_state.mem_accesses,
                                               WPMemAccess, m);
             uint16_t insn_idx = (uint16_t)bb_idx_base;
             for (uint32_t i = 0; i < tmpl->n_insns; i++) {
@@ -465,22 +466,22 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         g_array_unref(bb_reg_snaps);
     }
 
-    wp_in_progress = false;
+    g_wp_state.in_progress = false;
 
-    qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index, wp_saved_insn_count);
-    qemu_plugin_u64_set(g_scoreboard.prev_start_pc, cpu_index, wp_saved_prev_start_pc);
-    qemu_plugin_u64_set(g_scoreboard.prev_last_pc, cpu_index, wp_saved_prev_last_pc);
+    qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index, g_wp_state.saved_insn_count);
+    qemu_plugin_u64_set(g_scoreboard.prev_start_pc, cpu_index, g_wp_state.saved_prev_start_pc);
+    qemu_plugin_u64_set(g_scoreboard.prev_last_pc, cpu_index, g_wp_state.saved_prev_last_pc);
     qemu_plugin_u64_set(g_scoreboard.prev_fall_through, cpu_index,
-                        wp_saved_prev_fall_through);
+                        g_wp_state.saved_prev_fall_through);
     qemu_plugin_u64_set(g_scoreboard.prev_bb_ends_in_branch, cpu_index,
-                        wp_saved_prev_bb_ends_in_branch);
+                        g_wp_state.saved_prev_bb_ends_in_branch);
 
     qemu_plugin_spec_mode_end();
     qemu_plugin_cpu_state_restore(saved_state);
     qemu_plugin_cpu_state_free(saved_state);
 
-    g_array_unref(wp_mem_accesses);
-    wp_mem_accesses = NULL;
+    g_array_unref(g_wp_state.mem_accesses);
+    g_wp_state.mem_accesses = NULL;
 
     g_stats.wp_simulations++;
     g_stats.wp_total_insns += sim_insns;

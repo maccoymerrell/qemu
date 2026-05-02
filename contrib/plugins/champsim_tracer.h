@@ -228,19 +228,6 @@ typedef struct {
     void *insn_snap_refs;
 } BBTemplate;
 
-/*
- * Chain template: an ordered sequence of true-BB template_ids that
- * occurs as a wrong-path or correct-path sequence.  Used as a
- * shorthand to compress the per-WP-invocation BB-id list.  Built
- * lazily on first sight of a multi-BB sequence; keyed in chain_map
- * by an internal hash of the bb_ids[] tuple.
- */
-typedef struct {
-    uint32_t chain_id;
-    uint32_t n_bbs;
-    uint32_t *bb_ids;
-} ChainTemplate;
-
 enum DynParamType {
     DYN_LOAD_ADDR  = 0,
     DYN_STORE_ADDR = 1,
@@ -383,9 +370,7 @@ extern FILE *unknown_warn_file;
 
 extern GHashTable *tb_map;
 extern GHashTable *bb_map;
-extern GHashTable *chain_map;
 extern uint32_t next_template_id;
-extern uint32_t next_chain_id;
 
 extern struct qemu_plugin_scoreboard *vcpu_sb;
 extern qemu_plugin_u64 sb_current_pc;
@@ -466,13 +451,6 @@ BBTemplate *commit_true_bb(uint64_t start_pc,
                            const InsnRegNames *insn_reg_names,
                            const char *symbol_name,
                            uint64_t fall_through_pc);
-
-/*
- * Look up or create a chain template for a given ordered list of bb_ids.
- * Returns NULL if n_bbs < 2 (no shorthand benefit).
- * Caller must hold data_lock.
- */
-ChainTemplate *commit_chain(const uint32_t *bb_ids, uint32_t n_bbs);
 
 /*
  * Wide regfile snapshot: opaque thread-local scratch keyed by the QEMU

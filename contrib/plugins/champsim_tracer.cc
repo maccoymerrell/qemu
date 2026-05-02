@@ -330,9 +330,7 @@ static GMutex exec_lock;
 
 GHashTable *tb_map;
 GHashTable *bb_map;
-GHashTable *chain_map;
 uint32_t next_template_id = 1;
-uint32_t next_chain_id = 1;
 
 struct qemu_plugin_scoreboard *vcpu_sb;
 qemu_plugin_u64 sb_current_pc;
@@ -426,13 +424,6 @@ static void bb_template_free(gpointer data)
     g_free(tmpl->insn_reg_names);
     g_free(tmpl->insn_snap_refs);
     g_free(tmpl);
-}
-
-static void chain_template_free(gpointer data)
-{
-    ChainTemplate *ct = (ChainTemplate *)data;
-    g_free(ct->bb_ids);
-    g_free(ct);
 }
 
 static TraceSegment *trace_segment_new(const char *label,
@@ -555,37 +546,6 @@ BBTemplate *commit_true_bb(uint64_t start_pc,
     }
     g_hash_table_replace(bb_map, &tmpl->start_pc, tmpl);
     return tmpl;
-}
-
-/*
- * Look up or create a chain by ordered bb_id sequence.  Returns NULL
- * when n_bbs < 2.  Caller holds data_lock.
- *
- * Keyed by an internal string-encoded form of the bb_id tuple.
- * GHashTable owns the key (g_free) and value (chain_template_free).
- */
-ChainTemplate *commit_chain(const uint32_t *bb_ids, uint32_t n_bbs)
-{
-    if (n_bbs < 2) {
-        return NULL;
-    }
-    GString *key = g_string_sized_new(n_bbs * 6);
-    for (uint32_t i = 0; i < n_bbs; i++) {
-        g_string_append_printf(key, "%x ", bb_ids[i]);
-    }
-    ChainTemplate *existing =
-        (ChainTemplate *)g_hash_table_lookup(chain_map, key->str);
-    if (existing) {
-        g_string_free(key, TRUE);
-        return existing;
-    }
-    ChainTemplate *ct = g_new0(ChainTemplate, 1);
-    ct->chain_id = next_chain_id++;
-    ct->n_bbs = n_bbs;
-    ct->bb_ids = g_new0(uint32_t, n_bbs);
-    memcpy(ct->bb_ids, bb_ids, sizeof(uint32_t) * n_bbs);
-    g_hash_table_replace(chain_map, g_string_free(key, FALSE), ct);
-    return ct;
 }
 
 /*
@@ -1963,7 +1923,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     }
     g_hash_table_unref(tb_map);
     g_hash_table_unref(bb_map);
-    g_hash_table_unref(chain_map);
     if (cp_chain_fragments) {
         g_array_unref(cp_chain_fragments);
     }
@@ -2163,8 +2122,6 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                                    NULL, bb_template_free);
     bb_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
                                    NULL, bb_template_free);
-    chain_map = g_hash_table_new_full(g_str_hash, g_str_equal,
-                                      g_free, chain_template_free);
     cp_chain_fragments = g_array_new(false, false, sizeof(BBTemplate *));
 
     active_insn_table = isa_insn_class[trace_isa];

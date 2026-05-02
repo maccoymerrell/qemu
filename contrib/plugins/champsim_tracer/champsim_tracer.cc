@@ -46,14 +46,14 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
 int max_wrong_path_depth = 64;
 static bool enable_wrong_path = true;
-static char *unknown_warn_path = NULL;
-static char *program_name = NULL;
+static char *unknown_warn_path = nullptr;
+static char *program_name = nullptr;
 const char *target_name;
 FILE *unknown_warn_file;
 GMutex unknown_warn_lock;
 
-char *qemu_command_line = NULL;
-char *trace_comment = NULL;
+char *qemu_command_line = nullptr;
+char *trace_comment = nullptr;
 bool enable_mem_data = false;
 bool enable_reg_data = false;
 
@@ -78,7 +78,7 @@ static uint32_t get_or_assign_thread_id(unsigned int cpu_index)
 
 /* ========================= SimPoints ========================= */
 
-static char *simpoints_file_path = NULL;
+static char *simpoints_file_path = nullptr;
 static uint64_t simpoint_interval_insns = 100000000ULL;
 
 /* ========================= Decode / ISA ========================= */
@@ -139,7 +139,7 @@ static GMutex exec_lock;
  * BodyEntry.reg_snaps at BB-finalize time, and discarded on flush.
  * Active only when enable_reg_data is true.
  */
-static __thread GArray *pending_reg_snaps = NULL;
+static __thread GArray *pending_reg_snaps = nullptr;
 
 /* ========================= Memory management ========================= */
 
@@ -239,7 +239,7 @@ static void start_trace_segment(const char *label,
 /*
  * Build a BodyEntry from the calling thread's CP memop and reg-snap
  * accumulators and write it to @out_stream.  Drains the accumulators
- * as a side effect.  @wp_entries (may be NULL) is moved into the
+ * as a side effect.  @wp_entries (may be nullptr) is moved into the
  * entry; the caller transfers ownership.
  *
  * Caller must hold exec_lock.  data_lock is not held; the per-thread
@@ -255,7 +255,7 @@ static void emit_body_entry(BodyStreamState *out_stream,
     entry.template_id = bb_tmpl ? bb_tmpl->template_id : 0;
     entry.dyn_params = g_array_sized_new(false, false, sizeof(DynParam),
                          g_mem_recorder.cp_count());
-    entry.reg_snaps = NULL;
+    entry.reg_snaps = nullptr;
     entry.wp_entries = wp_entries;
     entry.tmpl = bb_tmpl;
     entry.thread_id = cpu_to_thread_id
@@ -644,7 +644,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         const char *symbol_name = qemu_plugin_insn_symbol(first_insn);
 
         g_mutex_lock(&data_lock);
-        BBTemplate *new_tmpl = NULL;
+        BBTemplate *new_tmpl = nullptr;
         {
             new_tmpl = g_bb_template_cache.get_or_create_tb_template(pc,
                                               canonical_n_insns,
@@ -757,7 +757,7 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
                             g_wp_state.saved_prev_bb_ends_in_branch);
         if (g_wp_state.mem_accesses) {
             g_array_unref(g_wp_state.mem_accesses);
-            g_wp_state.mem_accesses = NULL;
+            g_wp_state.mem_accesses = nullptr;
         }
     }
 
@@ -957,9 +957,9 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     enable_reg_data      = cfg.enable_reg_data;
     simpoint_interval_insns = cfg.simpoint_interval;
 
-    program_name        = cfg.program_name;    cfg.program_name = NULL;
-    trace_comment       = cfg.comment;         cfg.comment = NULL;
-    simpoints_file_path = cfg.simpoints_file;  cfg.simpoints_file = NULL;
+    program_name        = cfg.program_name;    cfg.program_name = nullptr;
+    trace_comment       = cfg.comment;         cfg.comment = nullptr;
+    simpoints_file_path = cfg.simpoints_file;  cfg.simpoints_file = nullptr;
 
     if (!cfg.output_path) {
         cfg.output_path = g_strdup("champsim_tracer_out");
@@ -1014,7 +1014,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
     qemu_plugin_register_flush_cb(id, vcpu_tb_flush);
     qemu_plugin_register_vcpu_init_cb(id, vcpu_init_cb);
-    qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
+    qemu_plugin_register_atexit_cb(id, plugin_exit, nullptr);
 
     return 0;
 }

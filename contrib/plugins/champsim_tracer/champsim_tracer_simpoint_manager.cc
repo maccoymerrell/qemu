@@ -98,7 +98,7 @@ GArray *parse_selections(const char *path, uint64_t interval_insns)
         if (g_str_has_suffix(path, ".simpoints")) {
             g_autofree char *base =
                 g_strndup(path, strlen(path) - strlen(".simpoints"));
-            weights_path = g_strconcat(base, ".weights", NULL);
+            weights_path = g_strconcat(base, ".weights", nullptr);
         } else {
             weights_path = g_strdup_printf("%s.weights", path);
         }

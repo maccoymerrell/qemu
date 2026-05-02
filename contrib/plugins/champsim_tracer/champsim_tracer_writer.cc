@@ -61,7 +61,7 @@ struct WriterCtx {
     GAsyncQueue *free_q;
     GAsyncQueue *fill_q;
 
-    /* Producer-private cursor.  When NULL (post-finish), bw_raw
+    /* Producer-private cursor.  When nullptr (post-finish), bw_raw
      * shouldn't be called any more. */
     WriterChunk *current;
 };
@@ -91,7 +91,7 @@ static void *writer_thread_main(void *arg)
         g_async_queue_push(w->free_q, c);
     }
     fflush(w->f);
-    return NULL;
+    return nullptr;
 }
 
 /* ===== Public API ===== */
@@ -99,12 +99,12 @@ static void *writer_thread_main(void *arg)
 WriterCtx *writer_start(FILE *f, bool is_pipe)
 {
     if (!f) {
-        return NULL;
+        return nullptr;
     }
 
     /* Coalesce small fwrite() calls inside the writer thread into
      * fewer syscalls / pipe writes. */
-    setvbuf(f, NULL, _IOFBF, WRITER_FILE_BUFSZ);
+    setvbuf(f, nullptr, _IOFBF, WRITER_FILE_BUFSZ);
 
     WriterCtx *w = g_new0(WriterCtx, 1);
     w->f = f;
@@ -119,7 +119,7 @@ WriterCtx *writer_start(FILE *f, bool is_pipe)
         w->chunks[i].eof  = false;
         g_async_queue_push(w->free_q, &w->chunks[i]);
     }
-    w->sentinel.data = NULL;
+    w->sentinel.data = nullptr;
     w->sentinel.cap  = 0;
     w->sentinel.len  = 0;
     w->sentinel.eof  = true;
@@ -127,7 +127,7 @@ WriterCtx *writer_start(FILE *f, bool is_pipe)
     /* Pull the first chunk for the producer. */
     w->current = (WriterChunk *)g_async_queue_pop(w->free_q);
 
-    int rc = pthread_create(&w->thr, NULL, writer_thread_main, w);
+    int rc = pthread_create(&w->thr, nullptr, writer_thread_main, w);
     if (rc != 0) {
         fprintf(stderr,
                 "champsim_tracer: pthread_create(writer): %d\n", rc);
@@ -170,16 +170,16 @@ void writer_finish(WriterCtx *w)
     /* Flush partial last chunk, then sentinel. */
     if (w->current && w->current->len) {
         g_async_queue_push(w->fill_q, w->current);
-        w->current = NULL;
+        w->current = nullptr;
     } else if (w->current) {
         /* Empty: return it to free list rather than the consumer. */
         g_async_queue_push(w->free_q, w->current);
-        w->current = NULL;
+        w->current = nullptr;
     }
     g_async_queue_push(w->fill_q, &w->sentinel);
 
     if (w->thr_started) {
-        pthread_join(w->thr, NULL);
+        pthread_join(w->thr, nullptr);
         w->thr_started = false;
     }
 
@@ -190,7 +190,7 @@ void writer_finish(WriterCtx *w)
             g_free(w->chunks[i].data);
         }
         g_free(w->chunks);
-        w->chunks = NULL;
+        w->chunks = nullptr;
     }
     if (w->free_q) {
         g_async_queue_unref(w->free_q);

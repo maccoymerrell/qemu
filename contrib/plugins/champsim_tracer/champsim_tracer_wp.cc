@@ -34,7 +34,7 @@
 static GArray *wp_dyn_params_clone(const std::vector<DynParam> &src)
 {
     if (src.empty()) {
-        return NULL;
+        return nullptr;
     }
     GArray *dst = g_array_sized_new(false, false, sizeof(DynParam), src.size());
     g_array_set_size(dst, src.size());
@@ -123,15 +123,15 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     GArray *bb_reg_snaps = enable_reg_data
         ? g_array_sized_new(false, false, sizeof(RegSnap),
                             initial_insn_cap * MAX_SRC_REGS)
-        : NULL;
+        : nullptr;
     uint64_t bb_start_pc = 0;
-    const char *bb_symbol_name = NULL;
+    const char *bb_symbol_name = nullptr;
 
     while (sim_insns < (uint64_t)max_wrong_path_depth ||
            !bb_pcs.empty()) {
         uint64_t pre_pc = qemu_plugin_get_pc();
         guint mem_start_idx = g_wp_state.mem_accesses->len;
-        BBTemplate *tmpl = NULL;
+        BBTemplate *tmpl = nullptr;
         bool tb_ok;
 
         if (poisoned_targets.count(pre_pc)) {
@@ -147,11 +147,11 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         tmpl = g_bb_template_cache.find_tb_template(pre_pc);
         g_mutex_unlock(&data_lock);
 
-        bool tmpl_known_before_exec = (tmpl != NULL);
+        bool tmpl_known_before_exec = (tmpl != nullptr);
         if (bb_reg_snaps && tmpl_known_before_exec) {
             uint64_t last_pc = 0;
             uint8_t last_size = 0;
-            const uint8_t *last_bytes = NULL;
+            const uint8_t *last_bytes = nullptr;
             bool have_last = false;
 
             if (!bb_pcs.empty()) {
@@ -182,7 +182,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         }
 
         WideRegSnap *wide = tmpl_known_before_exec
-            ? NULL : g_reg_snaps.capture_wide(cpu_index);
+            ? nullptr : g_reg_snaps.capture_wide(cpu_index);
 
         tb_ok = qemu_plugin_exec_tb();
 
@@ -204,7 +204,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                 g_array_set_size(bb_reg_snaps, 0);
             }
             bb_start_pc = 0;
-            bb_symbol_name = NULL;
+            bb_symbol_name = nullptr;
             early_exit = true;
             break;
         }
@@ -299,7 +299,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         }
 
         RegSnapCollector::free_wide(wide);
-        wide = NULL;
+        wide = nullptr;
 
         size_t last_local = bb_pcs.size() - 1;
         bool ends_in_branch =
@@ -325,7 +325,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                 bb_fields.data(),
                 bb_sizes.data(),
                 bb_bytes.data(),
-                enable_reg_data ? bb_regnames.data() : NULL,
+                enable_reg_data ? bb_regnames.data() : nullptr,
                 bb_symbol_name, fall_through);
             g_mutex_unlock(&data_lock);
 
@@ -358,7 +358,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                 .translation_unavailable = false,
                 .fault_insn_index = fault_idx,
                 .tmpl = bb_tmpl,
-                .reg_snaps = NULL,
+                .reg_snaps = nullptr,
             };
             if (bb_reg_snaps) {
                 fault_wp.reg_snaps = bb_reg_snaps;
@@ -376,7 +376,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             bb_regnames.clear();
             bb_dyn_params.clear();
             bb_start_pc = 0;
-            bb_symbol_name = NULL;
+            bb_symbol_name = nullptr;
 
             if (has_syscall) {
                 early_exit = true;
@@ -425,7 +425,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             bb_fields.data(),
             bb_sizes.data(),
             bb_bytes.data(),
-            enable_reg_data ? bb_regnames.data() : NULL,
+            enable_reg_data ? bb_regnames.data() : nullptr,
             bb_symbol_name, fall_through);
         g_mutex_unlock(&data_lock);
 
@@ -438,7 +438,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             .translation_unavailable = false,
             .fault_insn_index = 0,
             .tmpl = bb_tmpl,
-            .reg_snaps = NULL,
+            .reg_snaps = nullptr,
         };
         if (bb_reg_snaps) {
             wp_bb.reg_snaps = bb_reg_snaps;
@@ -454,7 +454,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         bb_regnames.clear();
         bb_dyn_params.clear();
         bb_start_pc = 0;
-        bb_symbol_name = NULL;
+        bb_symbol_name = nullptr;
 
         if (poisoned_targets.count(post_pc)) {
             early_exit = true;
@@ -481,7 +481,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     qemu_plugin_cpu_state_free(saved_state);
 
     g_array_unref(g_wp_state.mem_accesses);
-    g_wp_state.mem_accesses = NULL;
+    g_wp_state.mem_accesses = nullptr;
 
     g_stats.wp_simulations++;
     g_stats.wp_total_insns += sim_insns;

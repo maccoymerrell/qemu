@@ -40,13 +40,13 @@ bool set_wp(PluginConfig *cfg, const char *v)
 
 bool set_start(PluginConfig *cfg, const char *v)
 {
-    cfg->trace_start_insn = g_ascii_strtoull(v, NULL, 10);
+    cfg->trace_start_insn = g_ascii_strtoull(v, nullptr, 10);
     return true;
 }
 
 bool set_stop(PluginConfig *cfg, const char *v)
 {
-    cfg->trace_stop_insn = g_ascii_strtoull(v, NULL, 10);
+    cfg->trace_stop_insn = g_ascii_strtoull(v, nullptr, 10);
     return true;
 }
 
@@ -66,7 +66,7 @@ bool set_spfile(PluginConfig *cfg, const char *v)
 
 bool set_spinterval(PluginConfig *cfg, const char *v)
 {
-    cfg->simpoint_interval = g_ascii_strtoull(v, NULL, 10);
+    cfg->simpoint_interval = g_ascii_strtoull(v, nullptr, 10);
     return cfg->simpoint_interval > 0;
 }
 

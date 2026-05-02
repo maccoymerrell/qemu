@@ -20,8 +20,8 @@
 
 static inline void bw_init_writer(BitWriter *bw, WriterCtx *w)
 {
-    bw->f = NULL;
-    bw->buf = NULL;
+    bw->f = nullptr;
+    bw->buf = nullptr;
     bw->w = w;
     bw->total_bytes = 0;
 }
@@ -29,23 +29,23 @@ static inline void bw_init_writer(BitWriter *bw, WriterCtx *w)
 static inline void bw_init_file(BitWriter *bw, FILE *f)
 {
     bw->f = f;
-    bw->buf = NULL;
-    bw->w = NULL;
+    bw->buf = nullptr;
+    bw->w = nullptr;
     bw->total_bytes = 0;
 }
 
 static inline void bw_init_buf(BitWriter *bw)
 {
-    bw->f = NULL;
+    bw->f = nullptr;
     bw->buf = g_byte_array_new();
-    bw->w = NULL;
+    bw->w = nullptr;
     bw->total_bytes = 0;
 }
 
 static inline GByteArray *bw_finish_buf(BitWriter *bw)
 {
     GByteArray *out = bw->buf;
-    bw->buf = NULL;
+    bw->buf = nullptr;
     bw->total_bytes = 0;
     return out;
 }
@@ -739,7 +739,7 @@ static FieldStateTable *field_state_table_new(void)
 {
     FieldStateTable *table = g_new0(FieldStateTable, 1);
     table->blocks = g_hash_table_new_full(g_direct_hash, g_direct_equal,
-                                          NULL, field_state_block_free);
+                                          nullptr, field_state_block_free);
     table->generation = 1;
     return table;
 }
@@ -877,11 +877,11 @@ static U512 deflt_n_stores(const BBTemplate *t, uint32_t i, uint8_t slot)
 }
 
 /* Locate the @slot-th memop of @insn matching @want_type
- * (DYN_LOAD_ADDR or DYN_STORE_ADDR).  Returns NULL if absent. */
+ * (DYN_LOAD_ADDR or DYN_STORE_ADDR).  Returns nullptr if absent. */
 static const DynParam *find_memop_slot(const EntryView *ev, uint32_t i,
                                        uint8_t slot, uint8_t want_type)
 {
-    if (!ev->dyn_params || slot >= CST_FID_SLOT_COUNT) return NULL;
+    if (!ev->dyn_params || slot >= CST_FID_SLOT_COUNT) return nullptr;
     size_t idx = ((size_t)i * CST_FID_SLOT_COUNT) + slot;
     if (want_type == DYN_LOAD_ADDR) {
         return ev->load_slots[idx];
@@ -1416,7 +1416,7 @@ static void emit_field_delta_section(BitWriter *main_bw,
             field_state_table_get_block(state, template_id, ev->tmpl, true);
         FieldStateBlock *base_block = base_state ?
             field_state_table_get_block(base_state, template_id, ev->tmpl,
-                                        false) : NULL;
+                                        false) : nullptr;
         uint32_t state_generation = state->generation;
         uint32_t base_generation = base_state ? base_state->generation : 0;
 
@@ -1490,7 +1490,7 @@ static void field_state_reset_wp(FieldStateTable *wp_state)
     GHashTableIter iter;
     gpointer value;
     g_hash_table_iter_init(&iter, wp_state->blocks);
-    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+    while (g_hash_table_iter_next(&iter, nullptr, &value)) {
         FieldStateBlock *block = (FieldStateBlock *)value;
         size_t n_slots = (size_t)block->n_insns * FIELD_STATE_SLOT_COUNT;
         memset(block->generations, 0, n_slots * sizeof(*block->generations));
@@ -1583,7 +1583,7 @@ static void emit_one_bb_delta(BitWriter *bw, BodyStreamState *st,
                               const GArray *reg_snaps,
                               bool is_wp)
 {
-    emit_one_bb_delta_with_base(bw, st, state, NULL, template_id,
+    emit_one_bb_delta_with_base(bw, st, state, nullptr, template_id,
                                 tmpl, dyn_params, reg_snaps, is_wp);
 }
 

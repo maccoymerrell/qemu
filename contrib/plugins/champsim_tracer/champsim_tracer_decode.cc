@@ -18,7 +18,7 @@
 static const RegClassification *lookup_reg_class(uint16_t cap_id)
 {
     if (cap_id == 0 || cap_id >= active_reg_table_size) {
-        return NULL;
+        return nullptr;
     }
     return &active_reg_table[cap_id];
 }
@@ -81,7 +81,7 @@ static inline void add_src_cap_reg(InsnFields *f, InsnRegNames *refs,
     }
     if (rc->n_regs) {
         for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
-            add_src_reg(f, refs, rc->regs[i], NULL);
+            add_src_reg(f, refs, rc->regs[i], nullptr);
         }
         return;
     }
@@ -97,7 +97,7 @@ static inline void add_dst_cap_reg(InsnFields *f, InsnRegNames *refs,
     }
     if (rc->n_regs) {
         for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
-            add_dst_reg(f, refs, rc->regs[i], NULL);
+            add_dst_reg(f, refs, rc->regs[i], nullptr);
         }
         return;
     }
@@ -123,7 +123,7 @@ static void warn_unknown_instruction(uint64_t pc, const char *reason,
 
 /*
  * Classify an instruction via direct insn_id array lookup (O(1)).
- * Returns the table row (or NULL if out of range / no table) so
+ * Returns the table row (or nullptr if out of range / no table) so
  * callers can also access the optional .refine callback.
  */
 static const InsnClassification *classify_insn_id(
@@ -143,7 +143,7 @@ static const InsnClassification *classify_insn_id(
     *opcode = GEN_OP_UNKNOWN;
     *branch_type = BRANCH_NONE;
     *flags = MF_NONE;
-    return NULL;
+    return nullptr;
 }
 
 /*

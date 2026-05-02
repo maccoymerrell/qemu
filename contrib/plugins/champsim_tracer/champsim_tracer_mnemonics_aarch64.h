@@ -32,7 +32,7 @@ static void insert_aarch64_reg_aliases(
     static const char fpu_feature[] = "org.gnu.gdb.aarch64.fpu";
     static const char sve_feature[] = "org.gnu.gdb.aarch64.sve";
 
-    if (g_strcmp0(desc->feature, sve_feature) != 0) {
+    if (!cst_str_eq(desc->feature, sve_feature)) {
         return;
     }
 
@@ -46,8 +46,8 @@ static void insert_aarch64_reg_aliases(
             g_snprintf(buf, sizeof(buf), "v%u", (unsigned)num);
             alias_name = buf;
         }
-    } else if (g_strcmp0(desc->name, "fpsr") == 0 ||
-               g_strcmp0(desc->name, "fpcr") == 0) {
+    } else if (cst_str_eq(desc->name, "fpsr") ||
+               cst_str_eq(desc->name, "fpcr")) {
         alias_name = desc->name;
     }
     if (!alias_name) {

@@ -172,7 +172,7 @@ void TraceSegmentManager::start(const char *label,
     open_output(label);
 
     active_ = true;
-    g_atomic_int_set(&active_atomic_, 1);
+    active_atomic_.store(1);
 }
 
 void TraceSegmentManager::finish(const std::function<void()> &flush_hook)
@@ -182,7 +182,7 @@ void TraceSegmentManager::finish(const std::function<void()> &flush_hook)
     }
 
     active_ = false;
-    g_atomic_int_set(&active_atomic_, 0);
+    active_atomic_.store(0);
 
     if (flush_hook) {
         flush_hook();

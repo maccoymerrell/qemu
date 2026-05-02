@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include <atomic>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
@@ -110,8 +111,9 @@ BBTemplate *BBTemplateCache::commit_true_bb(uint64_t start_pc,
             }
         }
         if (!same) {
-            static gint warned = 0;
-            if (g_atomic_int_compare_and_exchange(&warned, 0, 1)) {
+            static std::atomic<int> warned{0};
+            int expected = 0;
+            if (warned.compare_exchange_strong(expected, 1)) {
                 fprintf(stderr,
                     "champsim_tracer: WARNING true-BB at start_pc=0x%"
                     PRIx64 " seen with differing insn sequence "

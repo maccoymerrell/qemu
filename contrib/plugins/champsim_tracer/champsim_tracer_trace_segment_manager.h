@@ -24,6 +24,7 @@
 #ifndef CHAMPSIM_TRACER_TRACE_SEGMENT_MANAGER_H
 #define CHAMPSIM_TRACER_TRACE_SEGMENT_MANAGER_H
 
+#include <atomic>
 #include <functional>
 
 #include "champsim_tracer.h"
@@ -51,12 +52,12 @@ public:
     /* State queries. */
     bool is_active() const { return active_; }
     bool is_active_atomic() const {
-        return g_atomic_int_get(&active_atomic_) != 0;
+        return active_atomic_.load() != 0;
     }
     bool is_shutting_down() const {
-        return g_atomic_int_get(&shutting_down_) != 0;
+        return shutting_down_.load() != 0;
     }
-    void set_shutting_down() { g_atomic_int_set(&shutting_down_, 1); }
+    void set_shutting_down() { shutting_down_.store(1); }
     bool has_active_segment() const { return current_ != nullptr; }
 
     /* Body-emitter access points.  Both return null/0 when no segment
@@ -70,14 +71,14 @@ private:
     static void segment_free(TraceSegment *seg);
     void open_output(const char *label);
 
-    TraceSegment    *current_         = nullptr;
-    bool             active_          = false;
-    volatile gint    active_atomic_   = 0;
-    volatile gint    shutting_down_   = 0;
-    char            *output_path_     = nullptr;
-    char            *output_pipe_     = nullptr;
-    uint64_t         start_insn_      = 0;
-    uint64_t         stop_insn_       = UINT64_MAX;
+    TraceSegment        *current_       = nullptr;
+    bool                 active_        = false;
+    std::atomic<int>     active_atomic_{0};
+    std::atomic<int>     shutting_down_{0};
+    char                *output_path_   = nullptr;
+    char                *output_pipe_   = nullptr;
+    uint64_t             start_insn_    = 0;
+    uint64_t             stop_insn_     = UINT64_MAX;
 };
 
 extern TraceSegmentManager g_trace_segments;

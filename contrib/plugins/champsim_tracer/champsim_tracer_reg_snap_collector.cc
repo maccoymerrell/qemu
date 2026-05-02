@@ -21,8 +21,8 @@ bool key_valid(const QemuRegKey *key)
 
 bool key_equal(const QemuRegKey *a, const QemuRegKey *b)
 {
-    return g_strcmp0(a->feature, b->feature) == 0 &&
-           g_strcmp0(a->name, b->name) == 0;
+    return cst_str_eq(a->feature, b->feature) &&
+           cst_str_eq(a->name, b->name);
 }
 
 typedef struct {

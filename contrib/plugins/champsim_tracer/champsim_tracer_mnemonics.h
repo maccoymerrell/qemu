@@ -4,6 +4,25 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include <stdbool.h>
+#include <string.h>
+
+/* Null-safe string equality (g_strcmp0 replacement).  Defined here
+ * rather than in champsim_tracer.h because the per-ISA mnemonic
+ * headers (which call it) are pulled in directly by the C TU
+ * champsim_tracer_mnemonic_tables.c without going through
+ * champsim_tracer.h. */
+static inline bool cst_str_eq(const char *a, const char *b)
+{
+    if (a == b) {
+        return true;
+    }
+    if (!a || !b) {
+        return false;
+    }
+    return strcmp(a, b) == 0;
+}
+
 /* ISA enum: add new ISAs here and extend isa_properties[] at end of file */
 typedef enum {
     TRACE_ISA_UNKNOWN = 0,

@@ -30,8 +30,8 @@ gboolean key_equal(gconstpointer lhs, gconstpointer rhs)
 {
     const QemuRegKey *a = (const QemuRegKey *)lhs;
     const QemuRegKey *b = (const QemuRegKey *)rhs;
-    return g_strcmp0(a->feature, b->feature) == 0 &&
-           g_strcmp0(a->name, b->name) == 0;
+    return cst_str_eq(a->feature, b->feature) &&
+           cst_str_eq(a->name, b->name);
 }
 
 void key_free(gpointer data)

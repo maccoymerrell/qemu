@@ -121,7 +121,7 @@ bool parse_plugin_options(PluginConfig *cfg, int argc, char **argv)
         }
         bool found = false;
         for (int j = 0; options[j].name; j++) {
-            if (g_strcmp0(tokens[0], options[j].name) != 0) {
+            if (!cst_str_eq(tokens[0], options[j].name)) {
                 continue;
             }
             if (!options[j].setter(cfg, tokens[1])) {

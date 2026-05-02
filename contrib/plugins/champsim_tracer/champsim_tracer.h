@@ -18,6 +18,12 @@
 #ifndef CHAMPSIM_TRACER_H
 #define CHAMPSIM_TRACER_H
 
+/* <atomic> is C++-only; pull it in first so its transitive includes
+ * resolve before glib does. */
+#ifdef __cplusplus
+#include <atomic>
+#endif
+
 #include <glib.h>
 #include <inttypes.h>
 #include <stdbool.h>
@@ -385,10 +391,17 @@ extern bool enable_reg_data;
 extern char *qemu_command_line;
 extern char *trace_comment;
 
-/* Synchronization & diagnostics. */
+/* Synchronization & diagnostics.  GMutex stays (rather than
+ * std::mutex) because <mutex>'s transitive include chain pulls
+ * <cctype> -> <ctype.h>, and QEMU's include/qemu/ctype.h shadows the
+ * system header on the plugin's -I search path.  That breaks
+ * libstdc++'s `using ::isalnum;` declarations and the build fails. */
 extern GMutex data_lock;
 extern GMutex unknown_warn_lock;
 extern FILE *unknown_warn_file;
+
+/* Null-safe string equality (cst_str_eq) is defined in
+ * champsim_tracer_mnemonics.h, which this header pulls in below. */
 
 /* ===== Cross-TU functions ===== */
 

@@ -12,19 +12,6 @@ BranchHistory g_branch_history;
 
 namespace {
 
-uint32_t next_tick(BranchRecord *br)
-{
-    br->target_tick++;
-    if (br->target_tick == 0) {
-        /* Wrap-around: reset the LRU clock so comparisons stay meaningful. */
-        br->target_tick = 1;
-        for (unsigned i = 0; i < BRANCH_TARGET_HISTORY; i++) {
-            br->targets[i].last_seen = 0;
-        }
-    }
-    return br->target_tick;
-}
-
 uint64_t best_target_except(const BranchRecord *br,
                             uint64_t correct_target,
                             bool *found)
@@ -83,7 +70,16 @@ void BranchHistory::note_target(BranchRecord *br, uint64_t target)
         return;
     }
 
-    uint32_t now = next_tick(br);
+    /* Bump the LRU clock; on wrap-around, reset all last_seen so
+     * subsequent comparisons stay meaningful. */
+    br->target_tick++;
+    if (br->target_tick == 0) {
+        br->target_tick = 1;
+        for (unsigned i = 0; i < BRANCH_TARGET_HISTORY; i++) {
+            br->targets[i].last_seen = 0;
+        }
+    }
+    uint32_t now = br->target_tick;
     int free_idx = -1;
     int victim_idx = -1;
     uint32_t victim_count = UINT32_MAX;

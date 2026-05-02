@@ -143,30 +143,23 @@ static __thread GArray *pending_reg_snaps = nullptr;
 
 /* ========================= Memory management ========================= */
 
-static void dyn_param_array_free(GArray *arr)
-{
-    if (arr) {
-        g_array_unref(arr);
-    }
-}
-
-static void wp_bb_entry_clear(WPBBEntry *entry)
-{
-    dyn_param_array_free(entry->dyn_params);
-    if (entry->reg_snaps) {
-        g_array_unref(entry->reg_snaps);
-    }
-}
-
 static void body_entry_clear(BodyEntry *entry)
 {
-    dyn_param_array_free(entry->dyn_params);
+    if (entry->dyn_params) {
+        g_array_unref(entry->dyn_params);
+    }
     if (entry->reg_snaps) {
         g_array_unref(entry->reg_snaps);
     }
     if (entry->wp_entries) {
         for (guint i = 0; i < entry->wp_entries->len; i++) {
-            wp_bb_entry_clear(&g_array_index(entry->wp_entries, WPBBEntry, i));
+            WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, i);
+            if (wp->dyn_params) {
+                g_array_unref(wp->dyn_params);
+            }
+            if (wp->reg_snaps) {
+                g_array_unref(wp->reg_snaps);
+            }
         }
         g_array_unref(entry->wp_entries);
     }

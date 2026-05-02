@@ -58,43 +58,6 @@ void cache_insert(GHashTable *handles,
     g_hash_table_insert(handles, key, handle);
 }
 
-bool parse_numbered_reg(const char *name, char prefix,
-                        unsigned int limit, unsigned int *num)
-{
-    char *end = nullptr;
-    if (!name || name[0] != prefix || !g_ascii_isdigit(name[1])) {
-        return false;
-    }
-    guint64 value = g_ascii_strtoull(name + 1, &end, 10);
-    if (!end || *end || value >= limit) {
-        return false;
-    }
-    *num = (unsigned int)value;
-    return true;
-}
-
-void insert_aarch64_aliases(GHashTable *handles,
-                            const qemu_plugin_reg_descriptor *desc)
-{
-    static const char fpu_feature[] = "org.gnu.gdb.aarch64.fpu";
-    static const char sve_feature[] = "org.gnu.gdb.aarch64.sve";
-
-    if (trace_isa != TRACE_ISA_AARCH64 ||
-        g_strcmp0(desc->feature, sve_feature) != 0) {
-        return;
-    }
-
-    unsigned int num;
-    if (parse_numbered_reg(desc->name, 'z', 32, &num)) {
-        char alias[8];
-        g_snprintf(alias, sizeof(alias), "v%u", num);
-        cache_insert(handles, fpu_feature, alias, desc->handle);
-    } else if (g_strcmp0(desc->name, "fpsr") == 0 ||
-               g_strcmp0(desc->name, "fpcr") == 0) {
-        cache_insert(handles, fpu_feature, desc->name, desc->handle);
-    }
-}
-
 } /* namespace */
 
 RegHandleCache::RegHandleCache()
@@ -127,12 +90,16 @@ RegHandleCache::VCPUCache *RegHandleCache::make_cache()
     cache->handles = g_hash_table_new_full(key_hash, key_equal,
                                            key_free, nullptr);
 
+    RegAliasInserterFn alias_inserter =
+        isa_properties[trace_isa].reg_alias_inserter;
     g_autoptr(GArray) regs = qemu_plugin_get_registers();
     for (guint i = 0; i < regs->len; i++) {
         const qemu_plugin_reg_descriptor *desc =
             &g_array_index(regs, qemu_plugin_reg_descriptor, i);
         cache_insert(cache->handles, desc->feature, desc->name, desc->handle);
-        insert_aarch64_aliases(cache->handles, desc);
+        if (alias_inserter) {
+            alias_inserter(cache->handles, desc);
+        }
     }
     return cache;
 }

@@ -255,7 +255,7 @@ void decode_detail_to_generic(uint64_t pc,
         }
     }
 
-    if (trace_isa != TRACE_ISA_RISCV && trace_isa != TRACE_ISA_MIPS) {
+    if (isa_properties[trace_isa].include_implicit_regs) {
         for (uint8_t i = 0; i < info->n_regs_read; i++) {
             add_src_cap_reg(out, out_names, info->regs_read_id[i]);
         }

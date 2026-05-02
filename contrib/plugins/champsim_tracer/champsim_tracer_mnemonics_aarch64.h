@@ -17,6 +17,49 @@ static unsigned int cap_mode_aarch64(const char *target_name)
     return CS_MODE_LITTLE_ENDIAN;
 }
 
+/*
+ * AArch64 reg-alias inserter (used by RegHandleCache via
+ * IsaProperties.reg_alias_inserter).  QEMU's gdbstub registers SVE
+ * z-registers under the "sve" feature, but Capstone reports the
+ * arithmetic versions as v0..v31 in the "fpu" feature.  Alias each
+ * z<N> to v<N>, and alias fpsr/fpcr from sve into fpu, so reg-data
+ * lookups via Capstone names resolve to the SVE descriptors.
+ */
+static void insert_aarch64_reg_aliases(
+    GHashTable *handles,
+    const qemu_plugin_reg_descriptor *desc)
+{
+    static const char fpu_feature[] = "org.gnu.gdb.aarch64.fpu";
+    static const char sve_feature[] = "org.gnu.gdb.aarch64.sve";
+
+    if (g_strcmp0(desc->feature, sve_feature) != 0) {
+        return;
+    }
+
+    const char *alias_name = NULL;
+    char buf[8];
+    if (desc->name && desc->name[0] == 'z' &&
+        g_ascii_isdigit(desc->name[1])) {
+        char *end = NULL;
+        guint64 num = g_ascii_strtoull(desc->name + 1, &end, 10);
+        if (end && *end == '\0' && num < 32) {
+            g_snprintf(buf, sizeof(buf), "v%u", (unsigned)num);
+            alias_name = buf;
+        }
+    } else if (g_strcmp0(desc->name, "fpsr") == 0 ||
+               g_strcmp0(desc->name, "fpcr") == 0) {
+        alias_name = desc->name;
+    }
+    if (!alias_name) {
+        return;
+    }
+
+    QemuRegKey *key = g_new(QemuRegKey, 1);
+    key->feature = g_strdup(fpu_feature);
+    key->name = g_strdup(alias_name);
+    g_hash_table_insert(handles, key, desc->handle);
+}
+
 
 /* Register classification table. */
 static const RegClassification aarch64_reg_class[AARCH64_REG_ENDING] = {

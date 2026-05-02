@@ -366,6 +366,13 @@ extern const unsigned isa_insn_class_size[TRACE_ISA_MIPS + 1];
  *                              generic() normalizes the field so
  *                              InsnFields.immediate is always the
  *                              absolute target on the wire.
+ *   include_implicit_regs    — true to fold Capstone's implicit
+ *                              regs_read/regs_write lists into the
+ *                              decoded source/destination sets.  False
+ *                              for ISAs (RISC-V, MIPS) whose operand
+ *                              walk already covers everything the
+ *                              implicit lists would, so including them
+ *                              would double-count.
  *   target_prefixes          — NULL-terminated list of QEMU target_name
  *                              prefixes that map to this ISA
  *   cap_arch                 — Capstone cs_arch enum value (CS_ARCH_*),
@@ -376,12 +383,25 @@ extern const unsigned isa_insn_class_size[TRACE_ISA_MIPS + 1];
  */
 typedef unsigned int (*CapModeForTargetFn)(const char *target_name);
 
+/*
+ * Optional per-ISA hook called by RegHandleCache for every QEMU plugin
+ * register descriptor.  May insert one or more alias entries into
+ * @handles so reg-data lookups via Capstone names resolve to QEMU
+ * descriptors registered under different feature/name pairs (currently
+ * used for AArch64 SVE z<->v register aliasing).  May be null.
+ */
+typedef void (*RegAliasInserterFn)(
+    GHashTable *handles,
+    const qemu_plugin_reg_descriptor *desc);
+
 typedef struct {
     uint8_t               branch_delay_slots;
     bool                  pc_relative_branch_imm;
+    bool                  include_implicit_regs;
     const char *const    *target_prefixes;
     int                   cap_arch;
     CapModeForTargetFn    cap_mode_for_target;
+    RegAliasInserterFn    reg_alias_inserter;
 } IsaProperties;
 
 #ifdef CHAMPSIM_MNEMONIC_TABLES_IMPL
@@ -395,22 +415,27 @@ static const char *const isa_prefixes_mips[]    = { "mips64el", "mips64",
 const IsaProperties isa_properties[] = {
     [TRACE_ISA_UNKNOWN] = { 0 },
     [TRACE_ISA_X86]     = {
+        .include_implicit_regs = true,
         .target_prefixes = isa_prefixes_x86,
         .cap_arch = CS_ARCH_X86,
         .cap_mode_for_target = cap_mode_x86,
     },
     [TRACE_ISA_AARCH64] = {
+        .include_implicit_regs = true,
         .target_prefixes = isa_prefixes_aarch64,
         .cap_arch = CS_ARCH_AARCH64,
         .cap_mode_for_target = cap_mode_aarch64,
+        .reg_alias_inserter = insert_aarch64_reg_aliases,
     },
     [TRACE_ISA_RISCV]   = {
+        .include_implicit_regs = false,
         .target_prefixes = isa_prefixes_riscv,
         .cap_arch = CS_ARCH_RISCV,
         .cap_mode_for_target = cap_mode_riscv,
     },
     [TRACE_ISA_MIPS]    = {
         .branch_delay_slots = 1,
+        .include_implicit_regs = false,
         .target_prefixes = isa_prefixes_mips,
         .cap_arch = CS_ARCH_MIPS,
         .cap_mode_for_target = cap_mode_mips,

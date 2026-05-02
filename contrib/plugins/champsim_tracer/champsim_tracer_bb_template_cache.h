@@ -26,13 +26,21 @@
 #define CHAMPSIM_TRACER_BB_TEMPLATE_CACHE_H
 
 #include <functional>
+#include <memory>
+#include <unordered_map>
 
 #include "champsim_tracer.h"
 
+struct BBTemplateDeleter {
+    void operator()(BBTemplate *t) const noexcept;
+};
+
+using BBTemplatePtr = std::unique_ptr<BBTemplate, BBTemplateDeleter>;
+
 class BBTemplateCache {
 public:
-    BBTemplateCache();
-    ~BBTemplateCache();
+    BBTemplateCache() = default;
+    ~BBTemplateCache() = default;
 
     BBTemplateCache(const BBTemplateCache &) = delete;
     BBTemplateCache &operator=(const BBTemplateCache &) = delete;
@@ -77,11 +85,9 @@ public:
     static int template_branch_index(const BBTemplate *tmpl);
 
 private:
-    static void destroy_template(void * data);
-
-    GHashTable *tb_map_;
-    GHashTable *bb_map_;
-    uint32_t    next_template_id_;
+    std::unordered_map<uint64_t, BBTemplatePtr> tb_map_;
+    std::unordered_map<uint64_t, BBTemplatePtr> bb_map_;
+    uint32_t                                    next_template_id_ = 1;
 };
 
 extern BBTemplateCache g_bb_template_cache;

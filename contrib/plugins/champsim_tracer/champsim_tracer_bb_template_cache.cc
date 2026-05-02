@@ -4,74 +4,69 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include <algorithm>
 #include <atomic>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
+#include <vector>
 
 #include "champsim_tracer_bb_template_cache.h"
 
 BBTemplateCache g_bb_template_cache;
 
-BBTemplateCache::BBTemplateCache()
-    : tb_map_(g_hash_table_new_full(g_int64_hash, g_int64_equal,
-                                    nullptr, &BBTemplateCache::destroy_template)),
-      bb_map_(g_hash_table_new_full(g_int64_hash, g_int64_equal,
-                                    nullptr, &BBTemplateCache::destroy_template)),
-      next_template_id_(1)
+void BBTemplateDeleter::operator()(BBTemplate *t) const noexcept
 {
-}
-
-BBTemplateCache::~BBTemplateCache()
-{
-    if (tb_map_) {
-        g_hash_table_unref(tb_map_);
+    if (!t) {
+        return;
     }
-    if (bb_map_) {
-        g_hash_table_unref(bb_map_);
-    }
-}
-
-void BBTemplateCache::destroy_template(void * data)
-{
-    BBTemplate *tmpl = (BBTemplate *)data;
-    g_free(tmpl->insn_fields);
-    g_free(tmpl->insn_pcs);
-    g_free(tmpl->symbol_name);
-    g_free(tmpl->insn_sizes);
-    g_free(tmpl->insn_bytes);
-    g_free(tmpl->insn_reg_names);
-    g_free(tmpl->insn_snap_refs);
-    g_free(tmpl);
+    g_free(t->insn_fields);
+    g_free(t->insn_pcs);
+    g_free(t->symbol_name);
+    g_free(t->insn_sizes);
+    g_free(t->insn_bytes);
+    g_free(t->insn_reg_names);
+    g_free(t->insn_snap_refs);
+    g_free(t);
 }
 
 BBTemplate *BBTemplateCache::find_tb_template(uint64_t start_pc)
 {
-    return (BBTemplate *)g_hash_table_lookup(tb_map_, &start_pc);
+    auto it = tb_map_.find(start_pc);
+    return it == tb_map_.end() ? nullptr : it->second.get();
 }
 
 BBTemplate *BBTemplateCache::find_bb_template(uint64_t entry_pc)
 {
-    return (BBTemplate *)g_hash_table_lookup(bb_map_, &entry_pc);
+    auto it = bb_map_.find(entry_pc);
+    return it == bb_map_.end() ? nullptr : it->second.get();
 }
 
 size_t BBTemplateCache::tb_count() const
 {
-    return g_hash_table_size(tb_map_);
+    return tb_map_.size();
 }
 
 size_t BBTemplateCache::bb_count() const
 {
-    return g_hash_table_size(bb_map_);
+    return bb_map_.size();
 }
 
 void BBTemplateCache::for_each_bb(const std::function<void(BBTemplate &)> &fn)
 {
-    GHashTableIter iter;
-    void * value;
-    g_hash_table_iter_init(&iter, bb_map_);
-    while (g_hash_table_iter_next(&iter, nullptr, &value)) {
-        fn(*(BBTemplate *)value);
+    /* unordered_map iteration order is implementation-defined and varies
+     * with bucket count.  Walk by sorted start_pc so the templates
+     * section serialization is deterministic across runs and across
+     * libstdc++ revisions.  Called once at end-of-trace, so the sort
+     * cost is amortized over the whole run. */
+    std::vector<uint64_t> keys;
+    keys.reserve(bb_map_.size());
+    for (const auto &kv : bb_map_) {
+        keys.push_back(kv.first);
+    }
+    std::sort(keys.begin(), keys.end());
+    for (uint64_t pc : keys) {
+        fn(*bb_map_[pc]);
     }
 }
 
@@ -127,7 +122,7 @@ BBTemplate *BBTemplateCache::commit_true_bb(uint64_t start_pc,
         return existing;
     }
 
-    BBTemplate *tmpl = g_new0(BBTemplate, 1);
+    BBTemplatePtr tmpl(g_new0(BBTemplate, 1));
     tmpl->template_id = next_template_id_++;
     tmpl->start_pc = start_pc;
     tmpl->n_insns = n_insns;
@@ -151,8 +146,9 @@ BBTemplate *BBTemplateCache::commit_true_bb(uint64_t start_pc,
             tmpl->insn_reg_names[i] = insn_reg_names[i];
         }
     }
-    g_hash_table_replace(bb_map_, &tmpl->start_pc, tmpl);
-    return tmpl;
+    BBTemplate *raw = tmpl.get();
+    bb_map_[start_pc] = std::move(tmpl);
+    return raw;
 }
 
 BBTemplate *BBTemplateCache::get_or_create_bb_template(
@@ -239,12 +235,11 @@ BBTemplate *BBTemplateCache::get_or_create_tb_template(
     const char *symbol_name,
     uint64_t fall_through_pc)
 {
-    BBTemplate *tmpl = find_tb_template(start_pc);
-    if (tmpl) {
-        return tmpl;
+    if (BBTemplate *cached = find_tb_template(start_pc)) {
+        return cached;
     }
 
-    tmpl = g_new0(BBTemplate, 1);
+    BBTemplatePtr tmpl(g_new0(BBTemplate, 1));
     tmpl->template_id = next_template_id_++;
     tmpl->start_pc = start_pc;
     tmpl->n_insns = n_insns;
@@ -312,6 +307,7 @@ BBTemplate *BBTemplateCache::get_or_create_tb_template(
         }
     }
 
-    g_hash_table_replace(tb_map_, &tmpl->start_pc, tmpl);
-    return tmpl;
+    BBTemplate *raw = tmpl.get();
+    tb_map_[start_pc] = std::move(tmpl);
+    return raw;
 }

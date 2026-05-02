@@ -127,6 +127,44 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     uint64_t bb_start_pc = 0;
     const char *bb_symbol_name = nullptr;
 
+    /* Reset all per-BB accumulator state.  bb_reg_snaps is left alone
+     * (caller handles it: clear after a no-template drop, transfer +
+     * realloc after a successful commit). */
+    auto clear_accum = [&]() {
+        bb_pcs.clear();
+        bb_sizes.clear();
+        bb_bytes.clear();
+        bb_fields.clear();
+        bb_regnames.clear();
+        bb_dyn_params.clear();
+        bb_start_pc = 0;
+        bb_symbol_name = nullptr;
+    };
+
+    /* Build a WPBBEntry from the current accumulator and transfer
+     * bb_reg_snaps ownership into it (allocating a fresh buffer for
+     * the next BB). */
+    auto make_wp_entry = [&](BBTemplate *bb_tmpl, bool fault,
+                             uint32_t fault_insn_index) {
+        WPBBEntry e = {
+            .template_id = bb_tmpl ? bb_tmpl->template_id : 0,
+            .start_pc = bb_start_pc,
+            .dyn_params = wp_dyn_params_clone(bb_dyn_params),
+            .n_insns_executed = (uint32_t)bb_pcs.size(),
+            .fault = fault,
+            .translation_unavailable = false,
+            .fault_insn_index = fault_insn_index,
+            .tmpl = bb_tmpl,
+            .reg_snaps = nullptr,
+        };
+        if (bb_reg_snaps) {
+            e.reg_snaps = bb_reg_snaps;
+            bb_reg_snaps = g_array_sized_new(false, false, sizeof(RegSnap),
+                                             initial_insn_cap * MAX_SRC_REGS);
+        }
+        return e;
+    };
+
     while (sim_insns < (uint64_t)max_wrong_path_depth ||
            !bb_pcs.empty()) {
         uint64_t pre_pc = qemu_plugin_get_pc();
@@ -194,17 +232,10 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
 
         if (!tmpl) {
             RegSnapCollector::free_wide(wide);
-            bb_pcs.clear();
-            bb_sizes.clear();
-            bb_bytes.clear();
-            bb_fields.clear();
-            bb_regnames.clear();
-            bb_dyn_params.clear();
+            clear_accum();
             if (bb_reg_snaps) {
                 g_array_set_size(bb_reg_snaps, 0);
             }
-            bb_start_pc = 0;
-            bb_symbol_name = nullptr;
             early_exit = true;
             break;
         }
@@ -349,34 +380,10 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                 }
             }
 
-            WPBBEntry fault_wp = {
-                .template_id = bb_tmpl ? bb_tmpl->template_id : 0,
-                .start_pc = bb_start_pc,
-                .dyn_params = wp_dyn_params_clone(bb_dyn_params),
-                .n_insns_executed = (uint32_t)bb_pcs.size(),
-                .fault = true,
-                .translation_unavailable = false,
-                .fault_insn_index = fault_idx,
-                .tmpl = bb_tmpl,
-                .reg_snaps = nullptr,
-            };
-            if (bb_reg_snaps) {
-                fault_wp.reg_snaps = bb_reg_snaps;
-                bb_reg_snaps = g_array_sized_new(false, false,
-                                                 sizeof(RegSnap),
-                                                 initial_insn_cap *
-                                                 MAX_SRC_REGS);
-            }
+            WPBBEntry fault_wp = make_wp_entry(bb_tmpl, true, fault_idx);
             g_array_append_val(wp_chain, fault_wp);
 
-            bb_pcs.clear();
-            bb_sizes.clear();
-            bb_bytes.clear();
-            bb_fields.clear();
-            bb_regnames.clear();
-            bb_dyn_params.clear();
-            bb_start_pc = 0;
-            bb_symbol_name = nullptr;
+            clear_accum();
 
             if (has_syscall) {
                 early_exit = true;
@@ -429,32 +436,10 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             bb_symbol_name, fall_through);
         g_mutex_unlock(&data_lock);
 
-        WPBBEntry wp_bb = {
-            .template_id = bb_tmpl ? bb_tmpl->template_id : 0,
-            .start_pc = bb_start_pc,
-            .dyn_params = wp_dyn_params_clone(bb_dyn_params),
-            .n_insns_executed = (uint32_t)bb_pcs.size(),
-            .fault = false,
-            .translation_unavailable = false,
-            .fault_insn_index = 0,
-            .tmpl = bb_tmpl,
-            .reg_snaps = nullptr,
-        };
-        if (bb_reg_snaps) {
-            wp_bb.reg_snaps = bb_reg_snaps;
-            bb_reg_snaps = g_array_sized_new(false, false, sizeof(RegSnap),
-                                             initial_insn_cap * MAX_SRC_REGS);
-        }
+        WPBBEntry wp_bb = make_wp_entry(bb_tmpl, false, 0);
         g_array_append_val(wp_chain, wp_bb);
 
-        bb_pcs.clear();
-        bb_sizes.clear();
-        bb_bytes.clear();
-        bb_fields.clear();
-        bb_regnames.clear();
-        bb_dyn_params.clear();
-        bb_start_pc = 0;
-        bb_symbol_name = nullptr;
+        clear_accum();
 
         if (poisoned_targets.count(post_pc)) {
             early_exit = true;

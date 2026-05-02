@@ -15,6 +15,7 @@
 
 #include "champsim_tracer.h"
 #include "champsim_tracer_bb_template_cache.h"
+#include "champsim_tracer_scoreboard.h"
 #include "champsim_tracer_stats.h"
 
 /*
@@ -82,13 +83,13 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     wp_mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
 
     wp_saved_cpu_index = cpu_index;
-    wp_saved_insn_count = qemu_plugin_u64_get(sb_insn_count, cpu_index);
-    wp_saved_prev_start_pc = qemu_plugin_u64_get(sb_prev_start_pc, cpu_index);
-    wp_saved_prev_last_pc = qemu_plugin_u64_get(sb_prev_last_pc, cpu_index);
-    wp_saved_prev_fall_through = qemu_plugin_u64_get(sb_prev_fall_through,
+    wp_saved_insn_count = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
+    wp_saved_prev_start_pc = qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
+    wp_saved_prev_last_pc = qemu_plugin_u64_get(g_scoreboard.prev_last_pc, cpu_index);
+    wp_saved_prev_fall_through = qemu_plugin_u64_get(g_scoreboard.prev_fall_through,
                                                      cpu_index);
     wp_saved_prev_bb_ends_in_branch =
-        qemu_plugin_u64_get(sb_prev_bb_ends_in_branch, cpu_index);
+        qemu_plugin_u64_get(g_scoreboard.prev_bb_ends_in_branch, cpu_index);
     wp_in_progress = true;
 
     qemu_plugin_spec_mode_begin(saved_state);
@@ -465,12 +466,12 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
 
     wp_in_progress = false;
 
-    qemu_plugin_u64_set(sb_insn_count, cpu_index, wp_saved_insn_count);
-    qemu_plugin_u64_set(sb_prev_start_pc, cpu_index, wp_saved_prev_start_pc);
-    qemu_plugin_u64_set(sb_prev_last_pc, cpu_index, wp_saved_prev_last_pc);
-    qemu_plugin_u64_set(sb_prev_fall_through, cpu_index,
+    qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index, wp_saved_insn_count);
+    qemu_plugin_u64_set(g_scoreboard.prev_start_pc, cpu_index, wp_saved_prev_start_pc);
+    qemu_plugin_u64_set(g_scoreboard.prev_last_pc, cpu_index, wp_saved_prev_last_pc);
+    qemu_plugin_u64_set(g_scoreboard.prev_fall_through, cpu_index,
                         wp_saved_prev_fall_through);
-    qemu_plugin_u64_set(sb_prev_bb_ends_in_branch, cpu_index,
+    qemu_plugin_u64_set(g_scoreboard.prev_bb_ends_in_branch, cpu_index,
                         wp_saved_prev_bb_ends_in_branch);
 
     qemu_plugin_spec_mode_end();

@@ -369,14 +369,6 @@ extern GMutex unknown_warn_lock;
 extern FILE *unknown_warn_file;
 
 
-extern struct qemu_plugin_scoreboard *vcpu_sb;
-extern qemu_plugin_u64 sb_current_pc;
-extern qemu_plugin_u64 sb_prev_start_pc;
-extern qemu_plugin_u64 sb_prev_last_pc;
-extern qemu_plugin_u64 sb_prev_fall_through;
-extern qemu_plugin_u64 sb_prev_bb_ends_in_branch;
-extern qemu_plugin_u64 sb_insn_count;
-
 extern int max_wrong_path_depth;
 extern bool enable_mem_data;
 extern bool enable_reg_data;

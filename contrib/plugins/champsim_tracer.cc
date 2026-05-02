@@ -29,6 +29,7 @@
 #include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_branch_history.h"
 #include "champsim_tracer_reg_handle_cache.h"
+#include "champsim_tracer_scoreboard.h"
 #include "champsim_tracer_simpoint_manager.h"
 #include "champsim_tracer_stats.h"
 #include "champsim_tracer_writer.h"
@@ -145,14 +146,6 @@ enum PluginOptId {
 
 GMutex data_lock;
 static GMutex exec_lock;
-
-struct qemu_plugin_scoreboard *vcpu_sb;
-qemu_plugin_u64 sb_current_pc;
-qemu_plugin_u64 sb_prev_start_pc;
-qemu_plugin_u64 sb_prev_last_pc;
-qemu_plugin_u64 sb_prev_fall_through;
-qemu_plugin_u64 sb_prev_bb_ends_in_branch;
-qemu_plugin_u64 sb_insn_count;
 
 static bool trace_active = false;
 static volatile gint trace_active_atomic = 0;
@@ -703,11 +696,11 @@ static void flush_pending_final_body_entry(void)
     TraceSegment *seg = current_segment;
     unsigned int cpu_index = 0;
     uint64_t prev_start =
-        qemu_plugin_u64_get(sb_prev_start_pc, cpu_index);
+        qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
     uint64_t prev_ft =
-        qemu_plugin_u64_get(sb_prev_fall_through, cpu_index);
+        qemu_plugin_u64_get(g_scoreboard.prev_fall_through, cpu_index);
     uint64_t prev_is_branch =
-        qemu_plugin_u64_get(sb_prev_bb_ends_in_branch, cpu_index);
+        qemu_plugin_u64_get(g_scoreboard.prev_bb_ends_in_branch, cpu_index);
 
     if (!seg || !seg->bin_stream || prev_start == 0) {
         goto reset;
@@ -765,8 +758,8 @@ reset:
     }
     g_mutex_unlock(&data_lock);
 
-    qemu_plugin_u64_set(sb_prev_start_pc, 0, 0);
-    qemu_plugin_u64_set(sb_prev_fall_through, 0, 0);
+    qemu_plugin_u64_set(g_scoreboard.prev_start_pc, 0, 0);
+    qemu_plugin_u64_set(g_scoreboard.prev_fall_through, 0, 0);
 }
 
 /*
@@ -806,11 +799,11 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     }
 
     if (!wp_in_progress) {
-        uint64_t icount_prev = qemu_plugin_u64_get(sb_insn_count, cpu_index);
-        qemu_plugin_u64_set(sb_insn_count, cpu_index, icount_prev + n_insns);
+        uint64_t icount_prev = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
+        qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index, icount_prev + n_insns);
     }
 
-    uint64_t icount = qemu_plugin_u64_get(sb_insn_count, cpu_index);
+    uint64_t icount = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
 
     if (wp_in_progress) {
         g_mutex_unlock(&exec_lock);
@@ -861,11 +854,11 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         cp_mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
     }
 
-    uint64_t current_pc = qemu_plugin_u64_get(sb_current_pc, cpu_index);
-    uint64_t prev_start = qemu_plugin_u64_get(sb_prev_start_pc, cpu_index);
-    uint64_t prev_last = qemu_plugin_u64_get(sb_prev_last_pc, cpu_index);
-    uint64_t prev_ft = qemu_plugin_u64_get(sb_prev_fall_through, cpu_index);
-    bool prev_is_branch = qemu_plugin_u64_get(sb_prev_bb_ends_in_branch,
+    uint64_t current_pc = qemu_plugin_u64_get(g_scoreboard.current_pc, cpu_index);
+    uint64_t prev_start = qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
+    uint64_t prev_last = qemu_plugin_u64_get(g_scoreboard.prev_last_pc, cpu_index);
+    uint64_t prev_ft = qemu_plugin_u64_get(g_scoreboard.prev_fall_through, cpu_index);
+    bool prev_is_branch = qemu_plugin_u64_get(g_scoreboard.prev_bb_ends_in_branch,
                                               cpu_index);
 
     /* Skip initial block (no previous context) */
@@ -1144,7 +1137,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
     /* Instrument the block for execution tracking. */
     qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
-        tb, QEMU_PLUGIN_INLINE_STORE_U64, sb_current_pc, pc);
+        tb, QEMU_PLUGIN_INLINE_STORE_U64, g_scoreboard.current_pc, pc);
 
     qemu_plugin_register_vcpu_tb_exec_cb(
         tb, vcpu_tb_exec, QEMU_PLUGIN_CB_RW_REGS,
@@ -1152,16 +1145,16 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
     qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
         first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
-        sb_prev_start_pc, pc);
+        g_scoreboard.prev_start_pc, pc);
     qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
         first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
-        sb_prev_last_pc, effective_last_pc);
+        g_scoreboard.prev_last_pc, effective_last_pc);
     qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
         first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
-        sb_prev_fall_through, fall_through);
+        g_scoreboard.prev_fall_through, fall_through);
     qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
         first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
-        sb_prev_bb_ends_in_branch, bb_ends_in_branch);
+        g_scoreboard.prev_bb_ends_in_branch, bb_ends_in_branch);
 
     g_free(insn_pcs);
     g_free(insn_info);
@@ -1187,15 +1180,15 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
 
     if (wp_in_progress) {
         wp_in_progress = false;
-        qemu_plugin_u64_set(sb_insn_count, wp_saved_cpu_index,
+        qemu_plugin_u64_set(g_scoreboard.insn_count, wp_saved_cpu_index,
                             wp_saved_insn_count);
-        qemu_plugin_u64_set(sb_prev_start_pc, wp_saved_cpu_index,
+        qemu_plugin_u64_set(g_scoreboard.prev_start_pc, wp_saved_cpu_index,
                             wp_saved_prev_start_pc);
-        qemu_plugin_u64_set(sb_prev_last_pc, wp_saved_cpu_index,
+        qemu_plugin_u64_set(g_scoreboard.prev_last_pc, wp_saved_cpu_index,
                             wp_saved_prev_last_pc);
-        qemu_plugin_u64_set(sb_prev_fall_through, wp_saved_cpu_index,
+        qemu_plugin_u64_set(g_scoreboard.prev_fall_through, wp_saved_cpu_index,
                             wp_saved_prev_fall_through);
-        qemu_plugin_u64_set(sb_prev_bb_ends_in_branch, wp_saved_cpu_index,
+        qemu_plugin_u64_set(g_scoreboard.prev_bb_ends_in_branch, wp_saved_cpu_index,
                             wp_saved_prev_bb_ends_in_branch);
         if (wp_mem_accesses) {
             g_array_unref(wp_mem_accesses);
@@ -1324,7 +1317,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     }
 
     g_hash_table_unref(option_ht);
-    qemu_plugin_scoreboard_free(vcpu_sb);
     g_free(output_base_path);
     g_free(program_name);
     g_free(simpoints_file_path);
@@ -1517,20 +1509,6 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     active_insn_table_size = isa_insn_class_size[trace_isa];
     active_reg_table = isa_reg_class[trace_isa];
     active_reg_table_size = isa_reg_class_size[trace_isa];
-
-    vcpu_sb = qemu_plugin_scoreboard_new(sizeof(VCPUScoreBoard));
-    sb_current_pc = qemu_plugin_scoreboard_u64_in_struct(
-        vcpu_sb, VCPUScoreBoard, current_pc);
-    sb_prev_start_pc = qemu_plugin_scoreboard_u64_in_struct(
-        vcpu_sb, VCPUScoreBoard, prev_start_pc);
-    sb_prev_last_pc = qemu_plugin_scoreboard_u64_in_struct(
-        vcpu_sb, VCPUScoreBoard, prev_last_pc);
-    sb_prev_fall_through = qemu_plugin_scoreboard_u64_in_struct(
-        vcpu_sb, VCPUScoreBoard, prev_fall_through);
-    sb_prev_bb_ends_in_branch = qemu_plugin_scoreboard_u64_in_struct(
-        vcpu_sb, VCPUScoreBoard, prev_bb_ends_in_branch);
-    sb_insn_count = qemu_plugin_scoreboard_u64_in_struct(
-        vcpu_sb, VCPUScoreBoard, insn_count);
 
     cpu_to_thread_id = g_hash_table_new(g_direct_hash, g_direct_equal);
 

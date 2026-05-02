@@ -15,6 +15,7 @@
 
 #include "champsim_tracer.h"
 #include "champsim_tracer_bb_template_cache.h"
+#include "champsim_tracer_stats.h"
 
 /*
  * Internal scratch for a single in-progress wrong-path BB.  Six per-insn
@@ -73,8 +74,8 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
 
     struct qemu_plugin_cpu_state *saved_state = qemu_plugin_cpu_state_save();
     if (!saved_state) {
-        stat_wp_early_exits++;
-        stat_wp_simulations++;
+        g_stats.wp_early_exits++;
+        g_stats.wp_simulations++;
         return wp_chain;
     }
 
@@ -291,7 +292,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                 .data = acc->data,
             };
             bb_dyn_params.push_back(dp);
-            stat_wp_total_mem_accesses++;
+            g_stats.wp_total_mem_accesses++;
         }
 
         wide_reg_snap_free(wide);
@@ -479,10 +480,10 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     g_array_unref(wp_mem_accesses);
     wp_mem_accesses = NULL;
 
-    stat_wp_simulations++;
-    stat_wp_total_insns += sim_insns;
+    g_stats.wp_simulations++;
+    g_stats.wp_total_insns += sim_insns;
     if (early_exit) {
-        stat_wp_early_exits++;
+        g_stats.wp_early_exits++;
     }
 
     return wp_chain;

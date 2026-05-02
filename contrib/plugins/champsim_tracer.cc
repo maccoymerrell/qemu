@@ -30,6 +30,7 @@
 #include "champsim_tracer_branch_history.h"
 #include "champsim_tracer_reg_handle_cache.h"
 #include "champsim_tracer_simpoint_manager.h"
+#include "champsim_tracer_stats.h"
 #include "champsim_tracer_writer.h"
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
@@ -102,7 +103,6 @@ const RegClassification *active_reg_table;
 unsigned active_reg_table_size;
 
 static GHashTable *option_ht;
-uint64_t stat_unknown_insn_warnings;
 
 static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
 {
@@ -178,22 +178,6 @@ static __thread GArray *cp_mem_accesses = NULL;
  * Active only when enable_reg_data is true.
  */
 static __thread GArray *pending_reg_snaps = NULL;
-
-/* Statistics */
-static uint64_t stat_branches_observed;
-static uint64_t stat_branches_taken;
-static uint64_t stat_branches_not_taken;
-uint64_t stat_wp_simulations;
-uint64_t stat_wp_skipped;
-uint64_t stat_wp_total_insns;
-uint64_t stat_wp_early_exits;
-uint64_t stat_wp_total_mem_accesses;
-uint64_t stat_bin_total_bits;
-uint64_t stat_bin_header_bits;
-uint64_t stat_bin_body_bits;
-uint64_t stat_bin_dyn_cp_bits;
-uint64_t stat_bin_dyn_wp_bits;
-uint64_t stat_bin_wp_exception_bits;
 
 /* ========================= Memory management ========================= */
 
@@ -895,11 +879,11 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     g_mutex_lock(&data_lock);
 
     if (prev_is_branch) {
-        stat_branches_observed++;
+        g_stats.branches_observed++;
         if (branch_taken) {
-            stat_branches_taken++;
+            g_stats.branches_taken++;
         } else {
-            stat_branches_not_taken++;
+            g_stats.branches_not_taken++;
         }
     }
 
@@ -1000,7 +984,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
             entry.wp_entries = simulate_wrong_path_ext(
                 prev_last, current_pc, wrong_target, cpu_index);
         } else if (wrong_target == 0) {
-            stat_wp_skipped++;
+            g_stats.wp_skipped++;
         }
 
         BodyStreamState *out_stream = seg->bin_stream;
@@ -1252,22 +1236,22 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     g_mutex_lock(&data_lock);
 
     static const struct { const char *label; const uint64_t *value; } counters[] = {
-        { "Branch transitions observed",         &stat_branches_observed },
-        { "  Taken",                             &stat_branches_taken },
-        { "  Not-taken",                         &stat_branches_not_taken },
-        { "WP simulations performed",            &stat_wp_simulations },
-        { "WP simulations skipped",              &stat_wp_skipped },
-        { "WP total instructions",               &stat_wp_total_insns },
-        { "WP total memory accesses",            &stat_wp_total_mem_accesses },
-        { "WP early exits (fault)",              &stat_wp_early_exits },
-        { "Unknown-instruction warnings",        &stat_unknown_insn_warnings },
+        { "Branch transitions observed",         &g_stats.branches_observed },
+        { "  Taken",                             &g_stats.branches_taken },
+        { "  Not-taken",                         &g_stats.branches_not_taken },
+        { "WP simulations performed",            &g_stats.wp_simulations },
+        { "WP simulations skipped",              &g_stats.wp_skipped },
+        { "WP total instructions",               &g_stats.wp_total_insns },
+        { "WP total memory accesses",            &g_stats.wp_total_mem_accesses },
+        { "WP early exits (fault)",              &g_stats.wp_early_exits },
+        { "Unknown-instruction warnings",        &g_stats.unknown_insn_warnings },
     };
     static const struct { const char *label; const uint64_t *value; } bin_counters[] = {
-        { "  Header bits",        &stat_bin_header_bits },
-        { "  Body bits",          &stat_bin_body_bits },
-        { "  Dyn CP bits",        &stat_bin_dyn_cp_bits },
-        { "  Dyn WP bits",        &stat_bin_dyn_wp_bits },
-        { "  WP exception bits",  &stat_bin_wp_exception_bits },
+        { "  Header bits",        &g_stats.bin_header_bits },
+        { "  Body bits",          &g_stats.bin_body_bits },
+        { "  Dyn CP bits",        &g_stats.bin_dyn_cp_bits },
+        { "  Dyn WP bits",        &g_stats.bin_dyn_wp_bits },
+        { "  WP exception bits",  &g_stats.bin_wp_exception_bits },
     };
 
     g_string_append_printf(report,
@@ -1288,10 +1272,10 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
                                counters[i].label, *counters[i].value);
     }
 
-    if (stat_wp_simulations > 0) {
+    if (g_stats.wp_simulations > 0) {
         g_string_append_printf(report,
             "Average wrong-path length: %.1f instructions\n",
-            (double)stat_wp_total_insns / stat_wp_simulations);
+            (double)g_stats.wp_total_insns / g_stats.wp_simulations);
     }
 
     if (g_simpoints.is_active()) {
@@ -1300,16 +1284,16 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
             g_simpoints.size(), g_simpoints.current_index());
     }
 
-    if (stat_bin_total_bits > 0) {
+    if (g_stats.bin_total_bits > 0) {
         g_string_append_printf(report,
             "Total binary bits: %" PRIu64 " (%.2f MiB)\n",
-            stat_bin_total_bits,
-            (double)stat_bin_total_bits / 8.0 / (1024.0 * 1024.0));
+            g_stats.bin_total_bits,
+            (double)g_stats.bin_total_bits / 8.0 / (1024.0 * 1024.0));
         for (size_t i = 0; i < G_N_ELEMENTS(bin_counters); i++) {
             g_string_append_printf(report,
                 "%-40s %" PRIu64 " (%.2f%%)\n",
                 bin_counters[i].label, *bin_counters[i].value,
-                100.0 * (double)(*bin_counters[i].value) / stat_bin_total_bits);
+                100.0 * (double)(*bin_counters[i].value) / g_stats.bin_total_bits);
         }
     }
 

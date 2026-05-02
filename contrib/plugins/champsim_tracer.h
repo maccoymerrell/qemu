@@ -398,18 +398,6 @@ extern unsigned active_insn_table_size;
 extern const RegClassification *active_reg_table;
 extern unsigned active_reg_table_size;
 
-extern uint64_t stat_unknown_insn_warnings;
-extern uint64_t stat_wp_simulations;
-extern uint64_t stat_wp_skipped;
-extern uint64_t stat_wp_total_insns;
-extern uint64_t stat_wp_early_exits;
-extern uint64_t stat_wp_total_mem_accesses;
-extern uint64_t stat_bin_total_bits;
-extern uint64_t stat_bin_header_bits;
-extern uint64_t stat_bin_body_bits;
-extern uint64_t stat_bin_dyn_cp_bits;
-extern uint64_t stat_bin_dyn_wp_bits;
-extern uint64_t stat_bin_wp_exception_bits;
 
 /* ===== Cross-TU functions ===== */
 

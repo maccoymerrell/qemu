@@ -13,6 +13,7 @@
 
 #include "champsim_tracer.h"
 #include "champsim_tracer_bb_template_cache.h"
+#include "champsim_tracer_stats.h"
 #include "champsim_tracer_writer.h"
 
 /* ========================= BitWriter primitives ========================= */
@@ -1472,8 +1473,8 @@ static void emit_field_delta_section(BitWriter *main_bw,
     bw_write_section(main_bw, bw_finish_buf(&rec_bw));
 
     uint64_t bits = (bw_tell_bytes(main_bw) - section_start) * 8;
-    if (is_wp) stat_bin_dyn_wp_bits += bits;
-    else       stat_bin_dyn_cp_bits += bits;
+    if (is_wp) g_stats.bin_dyn_wp_bits += bits;
+    else       g_stats.bin_dyn_cp_bits += bits;
 }
 
 /* Reset WP overlay state at the start of a WP chain.  WP entries delta
@@ -1704,7 +1705,7 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
             }
             prev_event_idx = w;
         }
-        stat_bin_wp_exception_bits += (bw_tell_bytes(&sub) - ev_start) * 8;
+        g_stats.bin_wp_exception_bits += (bw_tell_bytes(&sub) - ev_start) * 8;
 
         bw_byte_align(&sub);
         bw_write_section(&st->bw, bw_finish_buf(&sub));
@@ -1713,7 +1714,7 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
     bw_byte_align(&st->bw);
 
     st->num_entries++;
-    stat_bin_body_bits += (bw_tell_bytes(&st->bw) - body_start) * 8;
+    g_stats.bin_body_bits += (bw_tell_bytes(&st->bw) - body_start) * 8;
 }
 
 /*
@@ -1768,8 +1769,8 @@ void body_stream_finish(BodyStreamState *st)
     bw_flush(&st->bw);
 
     uint64_t end_bytes = bw_tell_bytes(&st->bw);
-    stat_bin_header_bits += (end_bytes - stats_start) * 8;
-    stat_bin_total_bits += end_bytes * 8;
+    g_stats.bin_header_bits += (end_bytes - stats_start) * 8;
+    g_stats.bin_total_bits += end_bytes * 8;
 
     field_state_table_free(st->cp_field_state);
     field_state_table_free(st->wp_field_state);

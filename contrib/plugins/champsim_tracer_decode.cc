@@ -9,6 +9,7 @@
 #include <stdlib.h>
 
 #include "champsim_tracer.h"
+#include "champsim_tracer_stats.h"
 
 /*
  * Direct register ID lookup: O(1) array index into the per-ISA
@@ -116,7 +117,7 @@ static void warn_unknown_instruction(uint64_t pc, const char *reason,
             pc, (unsigned int)trace_isa, reason,
             mnem ? mnem : "<none>", disas ? disas : "");
     fflush(unknown_warn_file);
-    stat_unknown_insn_warnings++;
+    g_stats.unknown_insn_warnings++;
     g_mutex_unlock(&unknown_warn_lock);
 }
 

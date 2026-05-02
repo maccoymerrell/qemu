@@ -1,10 +1,16 @@
 /*
- * Wrong-Path Tracing Plugin — shared internal declarations.
+ * Wrong-Path Tracing Plugin — shared types and plugin-wide globals.
  *
- * This header is private to the plugin: it declares the types and globals
- * that are referenced across the plugin's translation units
- * (champsim_tracer.cc, champsim_tracer_decode.cc, champsim_tracer_wp.cc,
- * champsim_tracer_output.cc).
+ * Private header; included by every plugin TU.  After the C++ refactor
+ * this header carries only:
+ *   - Wire-format constants (CST_*, BODY_TAG_*, CST_FID_*).
+ *   - Shared POD types (CSTWideValue, BBTemplate, BodyEntry, ...).
+ *   - A short list of plugin-wide globals (ISA resolution, plugin
+ *     config flags, synchronization).  Subsystem-private state lives
+ *     in each subsystem's own header.
+ *   - A handful of cross-TU function declarations whose owners haven't
+ *     been wrapped in classes (decode_detail_to_generic,
+ *     simulate_wrong_path_ext, body_stream_*).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -358,30 +364,31 @@ typedef struct {
     uint64_t total_bytes;
 } BitWriter;
 
-/* ===== Globals ===== */
+/* ===== Plugin-wide globals ===== */
 
+/* ISA resolution: set once during qemu_plugin_install based on the
+ * guest target_name. */
 extern TraceISA trace_isa;
 extern int cst_cap_arch;
 extern unsigned int cst_cap_mode;
-
-extern GMutex data_lock;
-extern GMutex unknown_warn_lock;
-extern FILE *unknown_warn_file;
-
-
-extern int max_wrong_path_depth;
-extern bool enable_mem_data;
-extern bool enable_reg_data;
 extern const char *target_name;
-extern char *qemu_command_line;
-extern char *trace_comment;
-
-
 extern const InsnClassification *active_insn_table;
 extern unsigned active_insn_table_size;
 extern const RegClassification *active_reg_table;
 extern unsigned active_reg_table_size;
 
+/* Plugin configuration: parsed from -plugin args, immutable after
+ * qemu_plugin_install. */
+extern int max_wrong_path_depth;
+extern bool enable_mem_data;
+extern bool enable_reg_data;
+extern char *qemu_command_line;
+extern char *trace_comment;
+
+/* Synchronization & diagnostics. */
+extern GMutex data_lock;
+extern GMutex unknown_warn_lock;
+extern FILE *unknown_warn_file;
 
 /* ===== Cross-TU functions ===== */
 

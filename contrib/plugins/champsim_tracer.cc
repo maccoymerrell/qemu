@@ -30,6 +30,7 @@
 #include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_branch_history.h"
 #include "champsim_tracer_mem_access_recorder.h"
+#include "champsim_tracer_plugin_config.h"
 #include "champsim_tracer_reg_handle_cache.h"
 #include "champsim_tracer_reg_snap_collector.h"
 #include "champsim_tracer_scoreboard.h"
@@ -104,8 +105,6 @@ unsigned active_insn_table_size;
 const RegClassification *active_reg_table;
 unsigned active_reg_table_size;
 
-static GHashTable *option_ht;
-
 static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
 {
     (void)id;
@@ -127,21 +126,6 @@ static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
         g_reg_handle_cache.ensure_initialized(cpu_index);
     }
 }
-
-enum PluginOptId {
-    OPT_DEPTH = 1,
-    OPT_OUTFILE,
-    OPT_OUTPIPE,
-    OPT_WP,
-    OPT_START,
-    OPT_STOP,
-    OPT_PROGRAM,
-    OPT_SPFILE,
-    OPT_SPINTERVAL,
-    OPT_COMMENT,
-    OPT_MEMDATA,
-    OPT_REGDATA,
-};
 
 /* ========================= Global state ========================= */
 
@@ -884,7 +868,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     MemAccessRecorder::cleanup_current_thread();
     RegSnapCollector::cleanup_current_thread();
 
-    g_hash_table_unref(option_ht);
     g_free(program_name);
     g_free(simpoints_file_path);
 }
@@ -958,105 +941,34 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         }
     }
 
-    /* Per-install scratch for option-derived configuration; pushed to
-     * the trace segment manager once parsing + simpoint loading is
-     * done. */
-    g_autofree char *output_base_path = NULL;
-    g_autofree char *output_pipe_command = NULL;
-    uint64_t trace_start_insn = 0;
-    uint64_t trace_stop_insn = UINT64_MAX;
-
-    /* Option dispatch table */
-    option_ht = g_hash_table_new(g_str_hash, g_str_equal);
-    {
-        static const struct { const char *name; int id; }
-        opt_entries[] = {
-            {"depth",   OPT_DEPTH},   {"outfile", OPT_OUTFILE},
-            {"outpipe", OPT_OUTPIPE},
-            {"wp",      OPT_WP},
-            {"start",   OPT_START},   {"stop",    OPT_STOP},
-            {"program", OPT_PROGRAM}, {"spfile",  OPT_SPFILE},
-            {"spinterval", OPT_SPINTERVAL},
-            {"comment", OPT_COMMENT}, {"memdata", OPT_MEMDATA},
-            {"regdata", OPT_REGDATA},
-            {NULL, 0}
-        };
-        for (int i = 0; opt_entries[i].name; i++) {
-            g_hash_table_insert(option_ht,
-                                (gpointer)opt_entries[i].name,
-                                GINT_TO_POINTER(opt_entries[i].id));
-        }
+    PluginConfig cfg;
+    if (!parse_plugin_options(&cfg, argc, argv)) {
+        plugin_config_free(&cfg);
+        return -1;
     }
 
-    for (int i = 0; i < argc; i++) {
-        char *opt = argv[i];
-        g_auto(GStrv) tokens = g_strsplit(opt, "=", 2);
+    /* Apply parsed config to plugin globals + subsystem instances.
+     * String fields with long-term lifetime (program_name, comment,
+     * simpoints file) transfer out of cfg; the remaining strings are
+     * freed by plugin_config_free below. */
+    max_wrong_path_depth = cfg.depth;
+    enable_wrong_path    = cfg.enable_wp;
+    enable_mem_data      = cfg.enable_mem_data;
+    enable_reg_data      = cfg.enable_reg_data;
+    simpoint_interval_insns = cfg.simpoint_interval;
 
-        gpointer val = tokens[0] ?
-            g_hash_table_lookup(option_ht, tokens[0]) : NULL;
-        if (!val) {
-            fprintf(stderr, "champsim_tracer: unknown option: %s\n", opt);
-            return -1;
-        }
+    program_name        = cfg.program_name;    cfg.program_name = NULL;
+    trace_comment       = cfg.comment;         cfg.comment = NULL;
+    simpoints_file_path = cfg.simpoints_file;  cfg.simpoints_file = NULL;
 
-        switch (GPOINTER_TO_INT(val)) {
-        case OPT_DEPTH:
-            max_wrong_path_depth = atoi(tokens[1]);
-            if (max_wrong_path_depth <= 0) {
-                fprintf(stderr, "champsim_tracer: invalid depth: %s\n", tokens[1]);
-                return -1;
-            }
-            break;
-        case OPT_OUTFILE:
-            g_free(output_base_path);
-            output_base_path = g_strdup(tokens[1]);
-            break;
-        case OPT_OUTPIPE:
-            g_free(output_pipe_command);
-            output_pipe_command = g_strdup(tokens[1]);
-            break;
-        case OPT_WP:
-            enable_wrong_path = (atoi(tokens[1]) != 0);
-            break;
-        case OPT_START:
-            trace_start_insn = g_ascii_strtoull(tokens[1], NULL, 10);
-            break;
-        case OPT_STOP:
-            trace_stop_insn = g_ascii_strtoull(tokens[1], NULL, 10);
-            break;
-        case OPT_PROGRAM:
-            program_name = g_strdup(tokens[1]);
-            break;
-        case OPT_SPFILE:
-            simpoints_file_path = g_strdup(tokens[1]);
-            break;
-        case OPT_SPINTERVAL:
-            simpoint_interval_insns = g_ascii_strtoull(tokens[1], NULL, 10);
-            if (simpoint_interval_insns == 0) {
-                fprintf(stderr, "champsim_tracer: invalid spinterval: %s\n", tokens[1]);
-                return -1;
-            }
-            break;
-        case OPT_COMMENT:
-            trace_comment = g_strdup(tokens[1]);
-            break;
-        case OPT_MEMDATA:
-            enable_mem_data = (atoi(tokens[1]) != 0);
-            break;
-        case OPT_REGDATA:
-            enable_reg_data = (atoi(tokens[1]) != 0);
-            break;
-        }
+    if (!cfg.output_path) {
+        cfg.output_path = g_strdup("champsim_tracer_out");
     }
-
-    if (!output_base_path) {
-        output_base_path = g_strdup("champsim_tracer_out");
-    }
-    g_trace_segments.set_output_path(output_base_path);
-    g_trace_segments.set_output_pipe(output_pipe_command);
+    g_trace_segments.set_output_path(cfg.output_path);
+    g_trace_segments.set_output_pipe(cfg.output_pipe);
 
     unknown_warn_path = g_strdup_printf("%s.unknown_warnings.log",
-                                        output_base_path);
+                                        cfg.output_path);
     unknown_warn_file = fopen(unknown_warn_path, "w");
     if (!unknown_warn_file) {
         fprintf(stderr, "champsim_tracer: cannot open unknown-warning output: %s\n",
@@ -1066,19 +978,22 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         fflush(unknown_warn_file);
     }
 
+    uint64_t trace_start_insn = cfg.trace_start_insn;
+    uint64_t trace_stop_insn  = cfg.trace_stop_insn;
     if (simpoints_file_path) {
         if (!g_simpoints.load(simpoints_file_path, simpoint_interval_insns)) {
             fprintf(stderr, "champsim_tracer: no valid simpoints in: %s\n",
                     simpoints_file_path);
-            g_free(simpoints_file_path);
+            plugin_config_free(&cfg);
             return -1;
         }
         fprintf(stderr, "champsim_tracer: loaded %zu simpoints from %s\n",
                 g_simpoints.size(), simpoints_file_path);
         trace_start_insn = 0;
-        trace_stop_insn = UINT64_MAX;
+        trace_stop_insn  = UINT64_MAX;
     }
     g_trace_segments.set_window(trace_start_insn, trace_stop_insn);
+    plugin_config_free(&cfg);
 
     g_mutex_init(&data_lock);
     g_mutex_init(&exec_lock);

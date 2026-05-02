@@ -1,5 +1,5 @@
 /*
- * Wrong-Path Tracing Plugin - binary format v1.7 writer.
+ * Wrong-Path Tracing Plugin - binary format v1.8 writer.
  *
  * BitWriter primitives, template dictionary serializer, dyn-param
  * patch emitter, body entry streamer, and trailer writer for the
@@ -155,30 +155,6 @@ static void bw_write_sleb128(BitWriter *bw, int64_t v)
 }
 
 /*
- * Same as bw_write_sleb128 but accepts a signed 128-bit value.
- * Used for reg-data and mem-data deltas, where 16-byte snapshots
- * (XMM-class regs, 16-byte memops) require >64 bits of dynamic
- * range.  Max encoded length is 19 bytes (⌈128/7⌉).
- */
-static void bw_write_sleb128_i128(BitWriter *bw, __int128 v)
-{
-    uint8_t buf[19];
-    size_t n = 0;
-    bool more = true;
-    while (more) {
-        uint8_t byte = (uint8_t)((unsigned __int128)v & 0x7F);
-        bool sign = (byte & 0x40) != 0;
-        v >>= 7;
-        more = !((v == 0 && !sign) || (v == -1 && sign));
-        if (more) {
-            byte |= 0x80;
-        }
-        buf[n++] = byte;
-    }
-    bw_raw(bw, buf, n);
-}
-
-/*
  * Emit a length-prefixed sub-section (ULEB byte length + buffer bytes).
  * Takes ownership of @data and frees it.
  */
@@ -267,7 +243,7 @@ static void write_reg_encoding_map(BitWriter *bw)
 static void write_field_id_encoding_map(BitWriter *bw)
 {
     bw_write_string(bw, "field_id");
-    bw_write_uleb128(bw, 90);
+    bw_write_uleb128(bw, 94);
     write_encoding_entry(bw, CST_FID_N_LOADS, "CST_FID_N_LOADS");
     for (uint64_t i = 0; i < CST_FID_SLOT_COUNT; i++) {
         g_autofree char *name = g_strdup_printf("CST_FID_LOAD_ADDR%" PRIu64, i);
@@ -291,6 +267,10 @@ static void write_field_id_encoding_map(BitWriter *bw)
     }
     static const EncodingMapEntry insn_fields[] = {
         { CST_FID_N_STORES, "CST_FID_N_STORES" },
+        { CST_FID_EXTRA_LOAD_ADDR, "CST_FID_EXTRA_LOAD_ADDR" },
+        { CST_FID_EXTRA_STORE_ADDR, "CST_FID_EXTRA_STORE_ADDR" },
+        { CST_FID_EXTRA_LOAD_DATA, "CST_FID_EXTRA_LOAD_DATA" },
+        { CST_FID_EXTRA_STORE_DATA, "CST_FID_EXTRA_STORE_DATA" },
         { CST_FID_INSN_BYTES_LO, "CST_FID_INSN_BYTES_LO" },
         { CST_FID_INSN_BYTES_HI, "CST_FID_INSN_BYTES_HI" },
         { CST_FID_INSN_OPCODE, "CST_FID_INSN_OPCODE" },
@@ -422,17 +402,29 @@ static void write_header_encoding_maps(BitWriter *main_bw)
     bw_write_section(main_bw, bw_finish_buf(&sub));
 }
 
+typedef struct FieldStateTable FieldStateTable;
+
+typedef struct {
+    uint32_t *actual_n_loads;
+    uint32_t *actual_n_stores;
+    uint32_t *insn_dp_off;
+    uint32_t *insn_rs_off;
+    const DynParam **load_slots;
+    const DynParam **store_slots;
+    uint32_t n_cap;
+    size_t slot_cap;
+} EntryViewScratch;
+
 struct BodyStreamState {
     BitWriter bw;
     int64_t prev_entry_template;
     int64_t current_thread;
-    /* v1.7 unified field-state tables: keyed by (template_id, ins_pos,
-     * field_id) → most-recent observed u128 value.  CP state persists
-     * across the body.  WP state is overwritten by a snapshot of CP
-     * state at the start of each CP entry's WP chain and discarded
-     * implicitly at chain end (the next chain re-forks from CP). */
-    GHashTable *cp_field_state;
-    GHashTable *wp_field_state;
+    /* v1.8 unified field-state tables: keyed by template_id, then dense
+     * indexed by (ins_pos, field_id).  CP state persists across the body.
+     * WP state is a per-chain overlay that falls back to CP state. */
+    FieldStateTable *cp_field_state;
+    FieldStateTable *wp_field_state;
+    EntryViewScratch ev_scratch;
     uint64_t num_entries;
     uint64_t body_off;
     uint8_t  header_flags;   /* CST_FLAG_* bits emitted in header */
@@ -555,7 +547,7 @@ static void write_bin_templates(BitWriter *bw)
  *     for r in 0..n_records:
  *       ins_pos_gap : ULEB        (cur_ins_pos − prev_ins_pos)
  *       field_id    : u8          (CST_FID_*)
- *       delta       : SLEB128     (i128 modular cur − baseline)
+ *       payload     : scalar SLEB512 delta, or raw vector for EXTRA_*
  *
  * Records are emitted in non-descending (ins_pos, field_id) order;
  * unchanged fields contribute zero bytes.  Per-(template_id, ins_pos,
@@ -563,53 +555,242 @@ static void write_bin_templates(BitWriter *bw)
  * supply the baseline.  CP state advances on every CP entry; WP
  * state is forked from CP at chain start and discarded at chain end.
  *
- * Adding a new dynamic field is a single FieldDescriptor table entry
- * (and a fresh FID_* in champsim_tracer.h).  The wire format does
- * not change.
+ * Scalar fields are represented as modulo-2**512 little-endian values.
+ * EXTRA_* memop fields are rare raw vectors and do not update scalar
+ * state.
  */
 
-/* Composite key for the per-field state table. */
-typedef struct {
-    uint32_t template_id;
-    uint16_t ins_pos;
-    uint8_t  field_id;
-    uint8_t  _pad;
-} FieldStateKey;
+typedef CSTWideValue U512;
 
-typedef struct {
-    uint64_t lo;
-    uint64_t hi;
-} U128;
-
-static inline unsigned __int128 u128_pack(U128 v) {
-    return ((unsigned __int128)v.hi << 64) | v.lo;
+static inline bool u512_is_zero(U512 v)
+{
+    for (size_t i = 0; i < G_N_ELEMENTS(v.limb); i++) {
+        if (v.limb[i] != 0) {
+            return false;
+        }
+    }
+    return true;
 }
-static inline U128 u128_unpack(unsigned __int128 v) {
-    U128 r = { (uint64_t)v, (uint64_t)(v >> 64) };
+
+static inline bool u512_is_minus_one(U512 v)
+{
+    for (size_t i = 0; i < G_N_ELEMENTS(v.limb); i++) {
+        if (v.limb[i] != UINT64_MAX) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static inline bool u512_equal(U512 a, U512 b)
+{
+    return memcmp(&a, &b, sizeof(a)) == 0;
+}
+
+static inline U512 u512_sub(U512 a, U512 b)
+{
+    U512 r;
+    uint64_t borrow = 0;
+    for (size_t i = 0; i < G_N_ELEMENTS(r.limb); i++) {
+        unsigned __int128 sub = (unsigned __int128)b.limb[i] + borrow;
+        r.limb[i] = a.limb[i] - (uint64_t)sub;
+        borrow = ((unsigned __int128)a.limb[i] < sub) ? 1 : 0;
+    }
     return r;
 }
 
-static guint field_key_hash(gconstpointer kv) {
-    const FieldStateKey *k = (const FieldStateKey *)kv;
-    /* fold to 32 bits */
-    uint32_t h = k->template_id * 2654435761u;
-    h ^= ((uint32_t)k->ins_pos << 8) ^ (uint32_t)k->field_id;
-    return (guint)h;
-}
-static gboolean field_key_equal(gconstpointer aa, gconstpointer bb) {
-    const FieldStateKey *a = (const FieldStateKey *)aa;
-    const FieldStateKey *b = (const FieldStateKey *)bb;
-    return a->template_id == b->template_id
-        && a->ins_pos == b->ins_pos
-        && a->field_id == b->field_id;
+static inline void u512_shr7(U512 *v)
+{
+    for (size_t i = 0; i < G_N_ELEMENTS(v->limb); i++) {
+        uint64_t next = (i + 1 < G_N_ELEMENTS(v->limb)) ? v->limb[i + 1] : 0;
+        v->limb[i] = (v->limb[i] >> 7) | (next << 57);
+    }
 }
 
-/* Mask `lo` to its low @sz bytes (sz ≤ 8) so a u8 store of 0xFF is
- * encoded as 255, not −1.  Keeps deltas well-defined. */
-static inline uint64_t mem_data_mask_lo(uint64_t lo, uint8_t sz) {
-    if (sz >= 8) return lo;
-    uint64_t mask = (sz == 0) ? 0xFFu : ((uint64_t)1 << (sz * 8)) - 1;
-    return lo & mask;
+static inline void u512_sar7(U512 *v)
+{
+    bool negative = (v->limb[G_N_ELEMENTS(v->limb) - 1] >> 63) != 0;
+    for (size_t i = 0; i < G_N_ELEMENTS(v->limb); i++) {
+        uint64_t next = (i + 1 < G_N_ELEMENTS(v->limb))
+            ? v->limb[i + 1]
+            : (negative ? UINT64_MAX : 0);
+        v->limb[i] = (v->limb[i] >> 7) | (next << 57);
+    }
+}
+
+static inline void u512_mask_bytes(U512 *v, uint8_t size)
+{
+    uint8_t n = size ? size : 1;
+    if (n >= CST_MAX_WIDE_BYTES) {
+        return;
+    }
+    uint8_t full = n / 8;
+    uint8_t rem = n % 8;
+    if (rem != 0) {
+        uint64_t mask = ((uint64_t)1 << (rem * 8)) - 1;
+        v->limb[full] &= mask;
+        full++;
+    }
+    for (uint8_t i = full; i < G_N_ELEMENTS(v->limb); i++) {
+        v->limb[i] = 0;
+    }
+}
+
+static void bw_write_uleb128_u512(BitWriter *bw, U512 v)
+{
+    uint8_t buf[80];
+    size_t n = 0;
+    do {
+        uint8_t byte = (uint8_t)(v.limb[0] & 0x7F);
+        u512_shr7(&v);
+        if (!u512_is_zero(v)) {
+            byte |= 0x80;
+        }
+        buf[n++] = byte;
+    } while (!u512_is_zero(v));
+    bw_raw(bw, buf, n);
+}
+
+static void bw_write_sleb128_u512(BitWriter *bw, U512 v)
+{
+    uint8_t buf[80];
+    size_t n = 0;
+    bool more = true;
+    while (more) {
+        uint8_t byte = (uint8_t)(v.limb[0] & 0x7F);
+        bool sign = (byte & 0x40) != 0;
+        u512_sar7(&v);
+        more = !((u512_is_zero(v) && !sign) ||
+                 (u512_is_minus_one(v) && sign));
+        if (more) {
+            byte |= 0x80;
+        }
+        buf[n++] = byte;
+    }
+    bw_raw(bw, buf, n);
+}
+
+enum {
+    FIELD_STATE_SLOT_INVALID = 0xFF,
+    FIELD_STATE_SLOT_COUNT = 1 + (5 * CST_FID_SLOT_COUNT) + 1 + 7,
+};
+
+typedef struct FieldStateBlock {
+    uint32_t n_insns;
+    U512 *values;
+    uint32_t *generations;
+} FieldStateBlock;
+
+struct FieldStateTable {
+    GHashTable *blocks;
+    uint32_t generation;
+};
+
+static uint8_t field_state_slot_index(uint8_t field_id)
+{
+    if (field_id == CST_FID_N_LOADS) {
+        return 0;
+    }
+    if (field_id >= CST_FID_LOAD_ADDR_BASE &&
+        field_id < CST_FID_LOAD_ADDR_BASE + CST_FID_SLOT_COUNT) {
+        return 1 + (field_id - CST_FID_LOAD_ADDR_BASE);
+    }
+    if (field_id >= CST_FID_STORE_ADDR_BASE &&
+        field_id < CST_FID_STORE_ADDR_BASE + CST_FID_SLOT_COUNT) {
+        return 1 + CST_FID_SLOT_COUNT
+               + (field_id - CST_FID_STORE_ADDR_BASE);
+    }
+    if (field_id >= CST_FID_LOAD_DATA_BASE &&
+        field_id < CST_FID_LOAD_DATA_BASE + CST_FID_SLOT_COUNT) {
+        return 1 + (2 * CST_FID_SLOT_COUNT)
+               + (field_id - CST_FID_LOAD_DATA_BASE);
+    }
+    if (field_id >= CST_FID_STORE_DATA_BASE &&
+        field_id < CST_FID_STORE_DATA_BASE + CST_FID_SLOT_COUNT) {
+        return 1 + (3 * CST_FID_SLOT_COUNT)
+               + (field_id - CST_FID_STORE_DATA_BASE);
+    }
+    if (field_id >= CST_FID_SRC_REG_BASE &&
+        field_id < CST_FID_SRC_REG_BASE + CST_FID_SLOT_COUNT) {
+        return 1 + (4 * CST_FID_SLOT_COUNT)
+               + (field_id - CST_FID_SRC_REG_BASE);
+    }
+    if (field_id == CST_FID_N_STORES) {
+        return 1 + (5 * CST_FID_SLOT_COUNT);
+    }
+    if (field_id >= CST_FID_INSN_BYTES_LO &&
+        field_id <= CST_FID_INSN_SIZE) {
+        return 2 + (5 * CST_FID_SLOT_COUNT)
+               + (field_id - CST_FID_INSN_BYTES_LO);
+    }
+    return FIELD_STATE_SLOT_INVALID;
+}
+
+static void field_state_block_free(gpointer data)
+{
+    FieldStateBlock *block = (FieldStateBlock *)data;
+    if (!block) {
+        return;
+    }
+    g_free(block->values);
+    g_free(block->generations);
+    g_free(block);
+}
+
+static FieldStateTable *field_state_table_new(void)
+{
+    FieldStateTable *table = g_new0(FieldStateTable, 1);
+    table->blocks = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+                                          NULL, field_state_block_free);
+    table->generation = 1;
+    return table;
+}
+
+static void field_state_table_free(FieldStateTable *table)
+{
+    if (!table) {
+        return;
+    }
+    g_hash_table_unref(table->blocks);
+    g_free(table);
+}
+
+static FieldStateBlock *field_state_table_get_block(FieldStateTable *table,
+                                                    uint32_t template_id,
+                                                    const BBTemplate *tmpl,
+                                                    bool create)
+{
+    FieldStateBlock *block = (FieldStateBlock *)
+        g_hash_table_lookup(table->blocks, GUINT_TO_POINTER(template_id));
+    if (block || !create || !tmpl) {
+        return block;
+    }
+
+    block = g_new0(FieldStateBlock, 1);
+    block->n_insns = tmpl->n_insns;
+    size_t n_slots = (size_t)block->n_insns * FIELD_STATE_SLOT_COUNT;
+    block->values = g_new0(U512, n_slots ? n_slots : 1);
+    block->generations = g_new0(uint32_t, n_slots ? n_slots : 1);
+    g_hash_table_insert(table->blocks, GUINT_TO_POINTER(template_id), block);
+    return block;
+}
+
+static inline bool field_state_block_get(FieldStateBlock *block,
+                                         uint32_t table_generation,
+                                         uint32_t ins_pos,
+                                         uint8_t slot_index,
+                                         U512 *out)
+{
+    if (!block || ins_pos >= block->n_insns ||
+        slot_index == FIELD_STATE_SLOT_INVALID) {
+        return false;
+    }
+    size_t index = ((size_t)ins_pos * FIELD_STATE_SLOT_COUNT) + slot_index;
+    if (block->generations[index] != table_generation) {
+        return false;
+    }
+    *out = block->values[index];
+    return true;
 }
 
 /*
@@ -629,14 +810,16 @@ struct EntryView {
     const BBTemplate *tmpl;
     const GArray *dyn_params;   /* DynParam[]; sorted (insn_index,type)  */
     const GArray *reg_snaps;    /* RegSnap[]; template-walk order        */
-    const uint8_t *actual_n_loads;
-    const uint8_t *actual_n_stores;
+    const uint32_t *actual_n_loads;
+    const uint32_t *actual_n_stores;
     /* Pre-walked dyn_param index of the first load slot for insn i
      * (length = tmpl->n_insns + 1, last entry = total dyn_params). */
     const uint32_t *insn_dp_off;
     /* Pre-walked reg_snap index of the first src snap for insn i
      * (length = tmpl->n_insns + 1, last entry = total reg_snaps). */
     const uint32_t *insn_rs_off;
+    const DynParam **load_slots;
+    const DynParam **store_slots;
 };
 
 typedef struct EntryView EntryView;
@@ -650,51 +833,49 @@ typedef struct {
      * has an observable value in this entry; returns false to skip
      * (e.g. unused memop slot). */
     bool (*extract)(const EntryView *ev, uint32_t ins_pos, uint8_t slot,
-                    unsigned __int128 *out_val);
+                    U512 *out_val);
     /* template_default: baseline used on first sighting of
      * (template_id, ins_pos, field_id).  For dynamic-runtime fields
      * (addresses, data, reg values) this is 0; for insn-encoding
      * fields it's the template's static value, so unchanged-from-
      * template fields cost zero record bytes. */
-    unsigned __int128 (*template_default)(const BBTemplate *tmpl,
-                                          uint32_t ins_pos, uint8_t slot);
+    U512 (*template_default)(const BBTemplate *tmpl,
+                             uint32_t ins_pos, uint8_t slot);
     const char *name;          /* debug only */
 } FieldDescriptor;
 
 /* ---------- Per-family extract/default callbacks ---------- */
 
 static bool extr_n_loads(const EntryView *ev, uint32_t i, uint8_t slot,
-                         unsigned __int128 *out)
+                         U512 *out)
 {
     (void)slot;
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
-    *out = (unsigned __int128)ev->actual_n_loads[i];
+    *out = cst_wide_from_u64(ev->actual_n_loads[i]);
     return true;
 }
-static unsigned __int128 deflt_n_loads(const BBTemplate *t, uint32_t i,
-                                       uint8_t slot)
+static U512 deflt_n_loads(const BBTemplate *t, uint32_t i, uint8_t slot)
 {
     (void)t;
     (void)i;
     (void)slot;
-    return 0;
+    return cst_wide_from_u64(0);
 }
 
 static bool extr_n_stores(const EntryView *ev, uint32_t i, uint8_t slot,
-                          unsigned __int128 *out)
+                          U512 *out)
 {
     (void)slot;
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
-    *out = (unsigned __int128)ev->actual_n_stores[i];
+    *out = cst_wide_from_u64(ev->actual_n_stores[i]);
     return true;
 }
-static unsigned __int128 deflt_n_stores(const BBTemplate *t, uint32_t i,
-                                        uint8_t slot)
+static U512 deflt_n_stores(const BBTemplate *t, uint32_t i, uint8_t slot)
 {
     (void)t;
     (void)i;
     (void)slot;
-    return 0;
+    return cst_wide_from_u64(0);
 }
 
 /* Locate the @slot-th memop of @insn matching @want_type
@@ -702,59 +883,49 @@ static unsigned __int128 deflt_n_stores(const BBTemplate *t, uint32_t i,
 static const DynParam *find_memop_slot(const EntryView *ev, uint32_t i,
                                        uint8_t slot, uint8_t want_type)
 {
-    if (!ev->dyn_params) return NULL;
-    uint32_t lo = ev->insn_dp_off[i];
-    uint32_t hi = ev->insn_dp_off[i + 1];
-    uint8_t seen = 0;
-    for (uint32_t k = lo; k < hi; k++) {
-        const DynParam *dp = &g_array_index(ev->dyn_params, DynParam, k);
-        if (dp->type != want_type) continue;
-        if (seen == slot) return dp;
-        seen++;
+    if (!ev->dyn_params || slot >= CST_FID_SLOT_COUNT) return NULL;
+    size_t idx = ((size_t)i * CST_FID_SLOT_COUNT) + slot;
+    if (want_type == DYN_LOAD_ADDR) {
+        return ev->load_slots[idx];
     }
-    return NULL;
+    return ev->store_slots[idx];
 }
 
 static bool extr_load_addr(const EntryView *ev, uint32_t i, uint8_t slot,
-                           unsigned __int128 *out)
+                           U512 *out)
 {
     const DynParam *dp = find_memop_slot(ev, i, slot, DYN_LOAD_ADDR);
     if (!dp) return false;
-    *out = (unsigned __int128)dp->value;
+    *out = cst_wide_from_u64(dp->value);
     return true;
 }
 static bool extr_store_addr(const EntryView *ev, uint32_t i, uint8_t slot,
-                            unsigned __int128 *out)
+                            U512 *out)
 {
     const DynParam *dp = find_memop_slot(ev, i, slot, DYN_STORE_ADDR);
     if (!dp) return false;
-    *out = (unsigned __int128)dp->value;
+    *out = cst_wide_from_u64(dp->value);
     return true;
 }
-static unsigned __int128 deflt_zero(const BBTemplate *t, uint32_t i,
-                                    uint8_t slot)
-{ (void)t; (void)i; (void)slot; return 0; }
+static U512 deflt_zero(const BBTemplate *t, uint32_t i, uint8_t slot)
+{ (void)t; (void)i; (void)slot; return cst_wide_from_u64(0); }
 
 static bool extr_load_data(const EntryView *ev, uint32_t i, uint8_t slot,
-                           unsigned __int128 *out)
+                           U512 *out)
 {
     const DynParam *dp = find_memop_slot(ev, i, slot, DYN_LOAD_ADDR);
     if (!dp) return false;
-    uint8_t sz = dp->data_size ? dp->data_size : 1;
-    uint64_t lo = mem_data_mask_lo(dp->data_lo, sz);
-    uint64_t hi = (sz > 8) ? dp->data_hi : 0;
-    *out = ((unsigned __int128)hi << 64) | lo;
+    *out = dp->data;
+    u512_mask_bytes(out, dp->data_size);
     return true;
 }
 static bool extr_store_data(const EntryView *ev, uint32_t i, uint8_t slot,
-                            unsigned __int128 *out)
+                            U512 *out)
 {
     const DynParam *dp = find_memop_slot(ev, i, slot, DYN_STORE_ADDR);
     if (!dp) return false;
-    uint8_t sz = dp->data_size ? dp->data_size : 1;
-    uint64_t lo = mem_data_mask_lo(dp->data_lo, sz);
-    uint64_t hi = (sz > 8) ? dp->data_hi : 0;
-    *out = ((unsigned __int128)hi << 64) | lo;
+    *out = dp->data;
+    u512_mask_bytes(out, dp->data_size);
     return true;
 }
 
@@ -763,7 +934,7 @@ static bool extr_store_data(const EntryView *ev, uint32_t i, uint8_t slot,
  * identities remain in the template but destination values are not emitted
  * from the pre-exec snapshot path. */
 static bool extr_src_reg(const EntryView *ev, uint32_t i, uint8_t slot,
-                         unsigned __int128 *out)
+                         U512 *out)
 {
     if (!ev->reg_snaps || !ev->tmpl) return false;
     const InsnFields *f = &ev->tmpl->insn_fields[i];
@@ -771,7 +942,7 @@ static bool extr_src_reg(const EntryView *ev, uint32_t i, uint8_t slot,
     uint32_t pos = ev->insn_rs_off[i] + slot;
     if (pos >= ev->reg_snaps->len) return false;
     const RegSnap *s = &g_array_index(ev->reg_snaps, RegSnap, pos);
-    *out = ((unsigned __int128)s->hi << 64) | s->lo;
+    *out = s->value;
     return true;
 }
 
@@ -780,100 +951,94 @@ static bool extr_src_reg(const EntryView *ev, uint32_t i, uint8_t slot,
  * template's static value, so the delta is always zero and no record
  * is emitted.  When an SMC observer is added later, point extract at
  * the runtime value and keep template_default unchanged. */
-static unsigned __int128 deflt_insn_bytes_lo(const BBTemplate *t,
-                                             uint32_t i, uint8_t slot)
+static U512 deflt_insn_bytes_lo(const BBTemplate *t, uint32_t i, uint8_t slot)
 {
     (void)slot;
-    if (!t || i >= t->n_insns) return 0;
+    if (!t || i >= t->n_insns) return cst_wide_from_u64(0);
     uint64_t v = 0;
     uint8_t sz = t->insn_sizes[i];
     if (sz > 8) sz = 8;
     const uint8_t *p = &t->insn_bytes[(size_t)i * MAX_INSN_BYTES];
     for (int b = 0; b < sz; b++) v |= ((uint64_t)p[b]) << (b * 8);
-    return (unsigned __int128)v;
+    return cst_wide_from_u64(v);
 }
 static bool extr_insn_bytes_lo(const EntryView *ev, uint32_t i, uint8_t slot,
-                               unsigned __int128 *out)
+                               U512 *out)
 { *out = deflt_insn_bytes_lo(ev->tmpl, i, slot); return true; }
 
-static unsigned __int128 deflt_insn_bytes_hi(const BBTemplate *t,
-                                             uint32_t i, uint8_t slot)
+static U512 deflt_insn_bytes_hi(const BBTemplate *t, uint32_t i, uint8_t slot)
 {
     (void)slot;
-    if (!t || i >= t->n_insns) return 0;
+    if (!t || i >= t->n_insns) return cst_wide_from_u64(0);
     uint8_t sz = t->insn_sizes[i];
-    if (sz <= 8) return 0;
+    if (sz <= 8) return cst_wide_from_u64(0);
     uint64_t v = 0;
     const uint8_t *p = &t->insn_bytes[(size_t)i * MAX_INSN_BYTES + 8];
     int extra = sz - 8;
     if (extra > 8) extra = 8;
     for (int b = 0; b < extra; b++) v |= ((uint64_t)p[b]) << (b * 8);
-    return (unsigned __int128)v;
+    return cst_wide_from_u64(v);
 }
 static bool extr_insn_bytes_hi(const EntryView *ev, uint32_t i, uint8_t slot,
-                               unsigned __int128 *out)
+                               U512 *out)
 { *out = deflt_insn_bytes_hi(ev->tmpl, i, slot); return true; }
 
-static unsigned __int128 deflt_insn_opcode(const BBTemplate *t,
-                                           uint32_t i, uint8_t slot)
+static U512 deflt_insn_opcode(const BBTemplate *t, uint32_t i, uint8_t slot)
 {
     (void)slot;
-    if (!t || i >= t->n_insns) return 0;
-    return (unsigned __int128)(uint8_t)t->insn_fields[i].opcode;
+    if (!t || i >= t->n_insns) return cst_wide_from_u64(0);
+    return cst_wide_from_u64((uint8_t)t->insn_fields[i].opcode);
 }
 static bool extr_insn_opcode(const EntryView *ev, uint32_t i, uint8_t slot,
-                             unsigned __int128 *out)
+                             U512 *out)
 { *out = deflt_insn_opcode(ev->tmpl, i, slot); return true; }
 
-static unsigned __int128 deflt_insn_branch_type(const BBTemplate *t,
-                                                uint32_t i, uint8_t slot)
+static U512 deflt_insn_branch_type(const BBTemplate *t, uint32_t i,
+                                   uint8_t slot)
 {
     (void)slot;
-    if (!t || i >= t->n_insns) return 0;
-    return (unsigned __int128)(uint8_t)t->insn_fields[i].branch_type;
+    if (!t || i >= t->n_insns) return cst_wide_from_u64(0);
+    return cst_wide_from_u64((uint8_t)t->insn_fields[i].branch_type);
 }
 static bool extr_insn_branch_type(const EntryView *ev, uint32_t i, uint8_t slot,
-                                  unsigned __int128 *out)
+                                  U512 *out)
 { *out = deflt_insn_branch_type(ev->tmpl, i, slot); return true; }
 
-static unsigned __int128 deflt_insn_flags(const BBTemplate *t,
-                                          uint32_t i, uint8_t slot)
+static U512 deflt_insn_flags(const BBTemplate *t, uint32_t i, uint8_t slot)
 {
     (void)slot;
-    if (!t || i >= t->n_insns) return 0;
+    if (!t || i >= t->n_insns) return cst_wide_from_u64(0);
     const InsnFields *f = &t->insn_fields[i];
     uint8_t flags = 0;
     if (f->branch_conditional) flags |= CST_INSN_FLAG_BRANCH_COND;
     if (f->has_immediate)      flags |= CST_INSN_FLAG_HAS_IMM;
     flags |= (uint8_t)((f->sync_hint & 0x0F) << CST_INSN_FLAG_SYNC_SHIFT);
-    return (unsigned __int128)flags;
+    return cst_wide_from_u64(flags);
 }
 static bool extr_insn_flags(const EntryView *ev, uint32_t i, uint8_t slot,
-                            unsigned __int128 *out)
+                            U512 *out)
 { *out = deflt_insn_flags(ev->tmpl, i, slot); return true; }
 
-static unsigned __int128 deflt_insn_imm(const BBTemplate *t,
-                                        uint32_t i, uint8_t slot)
+static U512 deflt_insn_imm(const BBTemplate *t, uint32_t i, uint8_t slot)
 {
     (void)slot;
-    if (!t || i >= t->n_insns) return 0;
+    if (!t || i >= t->n_insns) return cst_wide_from_u64(0);
     const InsnFields *f = &t->insn_fields[i];
-    if (!f->has_immediate) return 0;
-    return (unsigned __int128)(int64_t)f->immediate;
+    if (!f->has_immediate) return cst_wide_from_u64(0);
+    return cst_wide_from_i64((int64_t)f->immediate);
 }
 static bool extr_insn_imm(const EntryView *ev, uint32_t i, uint8_t slot,
-                          unsigned __int128 *out)
+                          U512 *out)
 { *out = deflt_insn_imm(ev->tmpl, i, slot); return true; }
 
-static unsigned __int128 deflt_insn_size(const BBTemplate *t,
-                                         uint32_t i, uint8_t slot)
+static U512 deflt_insn_size(const BBTemplate *t, uint32_t i, uint8_t slot)
 {
     (void)slot;
-    if (!t || i >= t->n_insns) return 0;
-    return (unsigned __int128)t->insn_sizes[i];
+    if (!t || i >= t->n_insns) return cst_wide_from_u64(0);
+    return cst_wide_from_u64(t->insn_sizes[i]);
 }
 static bool extr_insn_size(const EntryView *ev, uint32_t i, uint8_t slot,
-                           unsigned __int128 *out)
+                           U512 *out)
 { *out = deflt_insn_size(ev->tmpl, i, slot); return true; }
 
 /* Field family registry.  Order MUST be ascending by base_field_id so
@@ -934,10 +1099,12 @@ static void dyn_params_sort_template_order(GArray *dyn_params)
 static void build_entry_view(EntryView *ev, const BBTemplate *tmpl,
                              const GArray *dyn_params,
                              const GArray *reg_snaps,
-                             uint8_t *actual_n_loads,
-                             uint8_t *actual_n_stores,
+                             uint32_t *actual_n_loads,
+                             uint32_t *actual_n_stores,
                              uint32_t *insn_dp_off,
-                             uint32_t *insn_rs_off)
+                             uint32_t *insn_rs_off,
+                             const DynParam **load_slots,
+                             const DynParam **store_slots)
 {
     ev->tmpl = tmpl;
     ev->dyn_params = dyn_params;
@@ -946,6 +1113,8 @@ static void build_entry_view(EntryView *ev, const BBTemplate *tmpl,
     ev->actual_n_stores = actual_n_stores;
     ev->insn_dp_off = insn_dp_off;
     ev->insn_rs_off = insn_rs_off;
+    ev->load_slots = load_slots;
+    ev->store_slots = store_slots;
 
     if (!tmpl) return;
 
@@ -960,8 +1129,17 @@ static void build_entry_view(EntryView *ev, const BBTemplate *tmpl,
         while (k < total_dp) {
             const DynParam *dp = &g_array_index(dyn_params, DynParam, k);
             if (dp->insn_index != i) break;
-            if (dp->type == DYN_LOAD_ADDR) actual_n_loads[i]++;
-            else                            actual_n_stores[i]++;
+            if (dp->type == DYN_LOAD_ADDR) {
+                uint32_t slot = actual_n_loads[i]++;
+                if (slot < CST_FID_SLOT_COUNT) {
+                    load_slots[(size_t)i * CST_FID_SLOT_COUNT + slot] = dp;
+                }
+            } else {
+                uint32_t slot = actual_n_stores[i]++;
+                if (slot < CST_FID_SLOT_COUNT) {
+                    store_slots[(size_t)i * CST_FID_SLOT_COUNT + slot] = dp;
+                }
+            }
             k++;
         }
     }
@@ -977,36 +1155,234 @@ static void build_entry_view(EntryView *ev, const BBTemplate *tmpl,
     insn_rs_off[n] = r;
 }
 
+static void entry_view_scratch_ensure(EntryViewScratch *scratch, uint32_t n)
+{
+    uint32_t need_n = n ? n : 1;
+    if (scratch->n_cap < need_n) {
+        uint32_t new_cap = scratch->n_cap ? scratch->n_cap : 16;
+        while (new_cap < need_n) {
+            new_cap *= 2;
+        }
+        scratch->actual_n_loads = g_renew(uint32_t,
+                                          scratch->actual_n_loads,
+                                          new_cap);
+        scratch->actual_n_stores = g_renew(uint32_t,
+                                           scratch->actual_n_stores,
+                                           new_cap);
+        scratch->insn_dp_off = g_renew(uint32_t,
+                                       scratch->insn_dp_off,
+                                       (size_t)new_cap + 1);
+        scratch->insn_rs_off = g_renew(uint32_t,
+                                       scratch->insn_rs_off,
+                                       (size_t)new_cap + 1);
+        scratch->n_cap = new_cap;
+    }
+
+    size_t need_slots = (size_t)need_n * CST_FID_SLOT_COUNT;
+    if (scratch->slot_cap < need_slots) {
+        size_t new_cap = scratch->slot_cap ? scratch->slot_cap :
+            (16 * CST_FID_SLOT_COUNT);
+        while (new_cap < need_slots) {
+            new_cap *= 2;
+        }
+        scratch->load_slots = g_renew(const DynParam *,
+                                      scratch->load_slots, new_cap);
+        scratch->store_slots = g_renew(const DynParam *,
+                                       scratch->store_slots, new_cap);
+        scratch->slot_cap = new_cap;
+    }
+
+    memset(scratch->load_slots, 0, need_slots *
+           sizeof(*scratch->load_slots));
+    memset(scratch->store_slots, 0, need_slots *
+           sizeof(*scratch->store_slots));
+}
+
+static void entry_view_scratch_free(EntryViewScratch *scratch)
+{
+    g_free(scratch->actual_n_loads);
+    g_free(scratch->actual_n_stores);
+    g_free(scratch->insn_dp_off);
+    g_free(scratch->insn_rs_off);
+    g_free(scratch->load_slots);
+    g_free(scratch->store_slots);
+    memset(scratch, 0, sizeof(*scratch));
+}
+
 /* Look up baseline value for (template_id, ins_pos, field_id).  Falls
  * back to the descriptor's template_default if no prior observation. */
-static unsigned __int128 field_state_get(GHashTable *state,
-                                         uint32_t template_id,
-                                         uint32_t ins_pos,
-                                         uint8_t field_id,
-                                         const FieldDescriptor *fd,
-                                         const BBTemplate *tmpl,
-                                         uint8_t slot)
+static U512 field_state_get(FieldStateBlock *state_block,
+                            uint32_t state_generation,
+                            FieldStateBlock *base_block,
+                            uint32_t base_generation,
+                            uint32_t ins_pos,
+                            uint8_t field_id,
+                            const FieldDescriptor *fd,
+                            const BBTemplate *tmpl,
+                            uint8_t slot)
 {
-    FieldStateKey k = { template_id, (uint16_t)ins_pos, field_id, 0 };
-    U128 *cur = (U128 *)g_hash_table_lookup(state, &k);
-    if (cur) return u128_pack(*cur);
+    U512 cur;
+    uint8_t slot_index = field_state_slot_index(field_id);
+    if (field_state_block_get(state_block, state_generation, ins_pos,
+                              slot_index, &cur)) {
+        return cur;
+    }
+
+    if (field_state_block_get(base_block, base_generation, ins_pos,
+                              slot_index, &cur)) {
+        return cur;
+    }
     return fd->template_default(tmpl, ins_pos, slot);
 }
 
-static void field_state_put(GHashTable *state,
-                            uint32_t template_id,
+static void field_state_put(FieldStateBlock *state_block,
+                            uint32_t state_generation,
                             uint32_t ins_pos,
                             uint8_t field_id,
-                            unsigned __int128 v)
+                            U512 v)
 {
-    FieldStateKey *k = g_new(FieldStateKey, 1);
-    k->template_id = template_id;
-    k->ins_pos = (uint16_t)ins_pos;
-    k->field_id = field_id;
-    k->_pad = 0;
-    U128 *val = g_new(U128, 1);
-    *val = u128_unpack(v);
-    g_hash_table_replace(state, k, val);
+    uint8_t slot_index = field_state_slot_index(field_id);
+    if (!state_block || ins_pos >= state_block->n_insns ||
+        slot_index == FIELD_STATE_SLOT_INVALID) {
+        return;
+    }
+    size_t index = ((size_t)ins_pos * FIELD_STATE_SLOT_COUNT) + slot_index;
+    state_block->values[index] = v;
+    state_block->generations[index] = state_generation;
+}
+
+typedef enum StageRecKind {
+    STAGE_REC_SCALAR,
+    STAGE_REC_VECTOR,
+} StageRecKind;
+
+typedef struct StageRec {
+    uint32_t pos;
+    uint8_t fid;
+    StageRecKind kind;
+    U512 delta;
+} StageRec;
+
+static void stage_rec_append(StageRec **stage, guint *stage_len,
+                             guint *stage_cap, StageRec rec)
+{
+    if (*stage_len == *stage_cap) {
+        *stage_cap *= 2;
+        *stage = (StageRec *)g_realloc_n(*stage, *stage_cap,
+                                         sizeof(**stage));
+    }
+    (*stage)[(*stage_len)++] = rec;
+}
+
+static void stage_extra_memop_vectors(StageRec **stage, guint *stage_len,
+                                      guint *stage_cap, const EntryView *ev,
+                                      uint32_t i, uint8_t header_flags)
+{
+    if (!ev->actual_n_loads || !ev->actual_n_stores) {
+        return;
+    }
+    bool has_mem_data = (header_flags & CST_FLAG_MEM_DATA) != 0;
+    if (ev->actual_n_loads[i] > CST_FID_SLOT_COUNT) {
+        StageRec rec = {};
+        rec.pos = i;
+        rec.fid = CST_FID_EXTRA_LOAD_ADDR;
+        rec.kind = STAGE_REC_VECTOR;
+        stage_rec_append(stage, stage_len, stage_cap,
+                         rec);
+    }
+    if (ev->actual_n_stores[i] > CST_FID_SLOT_COUNT) {
+        StageRec rec = {};
+        rec.pos = i;
+        rec.fid = CST_FID_EXTRA_STORE_ADDR;
+        rec.kind = STAGE_REC_VECTOR;
+        stage_rec_append(stage, stage_len, stage_cap,
+                         rec);
+    }
+    if (has_mem_data && ev->actual_n_loads[i] > CST_FID_SLOT_COUNT) {
+        StageRec rec = {};
+        rec.pos = i;
+        rec.fid = CST_FID_EXTRA_LOAD_DATA;
+        rec.kind = STAGE_REC_VECTOR;
+        stage_rec_append(stage, stage_len, stage_cap,
+                         rec);
+    }
+    if (has_mem_data && ev->actual_n_stores[i] > CST_FID_SLOT_COUNT) {
+        StageRec rec = {};
+        rec.pos = i;
+        rec.fid = CST_FID_EXTRA_STORE_DATA;
+        rec.kind = STAGE_REC_VECTOR;
+        stage_rec_append(stage, stage_len, stage_cap,
+                         rec);
+    }
+}
+
+static uint32_t extra_memop_count(const EntryView *ev, uint32_t i,
+                                  uint8_t want_type)
+{
+    uint32_t total = want_type == DYN_LOAD_ADDR
+        ? ev->actual_n_loads[i]
+        : ev->actual_n_stores[i];
+    return total > CST_FID_SLOT_COUNT ? total - CST_FID_SLOT_COUNT : 0;
+}
+
+static void bw_write_extra_memop_vector(BitWriter *bw, const EntryView *ev,
+                                        uint32_t i, uint8_t fid)
+{
+    uint8_t want_type;
+    bool want_data;
+
+    switch (fid) {
+    case CST_FID_EXTRA_LOAD_ADDR:
+        want_type = DYN_LOAD_ADDR;
+        want_data = false;
+        break;
+    case CST_FID_EXTRA_STORE_ADDR:
+        want_type = DYN_STORE_ADDR;
+        want_data = false;
+        break;
+    case CST_FID_EXTRA_LOAD_DATA:
+        want_type = DYN_LOAD_ADDR;
+        want_data = true;
+        break;
+    case CST_FID_EXTRA_STORE_DATA:
+        want_type = DYN_STORE_ADDR;
+        want_data = true;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+    uint32_t extra = extra_memop_count(ev, i, want_type);
+    bw_write_uleb128(bw, extra);
+    if (extra == 0 || !ev->dyn_params || !ev->insn_dp_off) {
+        return;
+    }
+
+    uint32_t seen = 0;
+    uint32_t written = 0;
+    uint32_t begin = ev->insn_dp_off[i];
+    uint32_t end = ev->insn_dp_off[i + 1];
+    for (uint32_t k = begin; k < end && written < extra; k++) {
+        const DynParam *dp = &g_array_index(ev->dyn_params, DynParam, k);
+        if (dp->type != want_type) {
+            continue;
+        }
+        if (seen++ < CST_FID_SLOT_COUNT) {
+            continue;
+        }
+        if (want_data) {
+            U512 data = dp->data;
+            u512_mask_bytes(&data, dp->data_size);
+            bw_write_uleb128_u512(bw, data);
+        } else {
+            bw_write_uleb128(bw, dp->value);
+        }
+        written++;
+    }
+
+    while (written++ < extra) {
+        bw_write_uleb128(bw, 0);
+    }
 }
 
 /*
@@ -1020,7 +1396,8 @@ static void field_state_put(GHashTable *state,
  * slot inner ascending) — no sort needed.
  */
 static void emit_field_delta_section(BitWriter *main_bw,
-                                     GHashTable *state,
+                                     FieldStateTable *state,
+                                     FieldStateTable *base_state,
                                      uint32_t template_id,
                                      const EntryView *ev,
                                      bool is_wp,
@@ -1029,16 +1406,22 @@ static void emit_field_delta_section(BitWriter *main_bw,
     BitWriter rec_bw;
     bw_init_buf(&rec_bw);
 
-    /* Two-pass: pass 1 buffers records into a small staging vec to
-     * count them, pass 2 writes the count + records.  Cheaper would
-     * be to lazily fix up the count, but ULEB-sized count can grow,
-     * so we pre-count.  Records are typically small. */
-    typedef struct { uint32_t pos; uint8_t fid; __int128 delta; } StageRec;
-    g_autoptr(GArray) stage =
-        g_array_sized_new(false, false, sizeof(StageRec), 16);
+    /* Buffer records into a small staging vec so the ULEB record count can
+     * precede the payload without a second descriptor walk. */
+    guint stage_len = 0;
+    guint stage_cap = 16;
+    g_autofree StageRec *stage = g_new(StageRec, stage_cap);
 
     uint32_t prev_pos = 0;
     if (ev->tmpl) {
+        FieldStateBlock *state_block =
+            field_state_table_get_block(state, template_id, ev->tmpl, true);
+        FieldStateBlock *base_block = base_state ?
+            field_state_table_get_block(base_state, template_id, ev->tmpl,
+                                        false) : NULL;
+        uint32_t state_generation = state->generation;
+        uint32_t base_generation = base_state ? base_state->generation : 0;
+
         for (uint32_t i = 0; i < ev->tmpl->n_insns; i++) {
             for (size_t d = 0; d < N_FIELD_DESCRIPTORS; d++) {
                 const FieldDescriptor *fd = &field_descriptors[d];
@@ -1048,16 +1431,25 @@ static void emit_field_delta_section(BitWriter *main_bw,
                     continue;
 
                 for (uint8_t slot = 0; slot < fd->slot_count; slot++) {
-                    unsigned __int128 cur;
+                    U512 cur;
                     if (!fd->extract(ev, i, slot, &cur)) continue;
                     uint8_t fid = fd->base_field_id + slot;
-                    unsigned __int128 base =
-                        field_state_get(state, template_id, i, fid,
-                                        fd, ev->tmpl, slot);
-                    if (cur == base) continue;
-                    StageRec rec = { i, fid, (__int128)(cur - base) };
-                    g_array_append_val(stage, rec);
-                    field_state_put(state, template_id, i, fid, cur);
+                    U512 base =
+                        field_state_get(state_block, state_generation,
+                                        base_block, base_generation,
+                                        i, fid, fd, ev->tmpl, slot);
+                    if (u512_equal(cur, base)) continue;
+                    StageRec rec = {};
+                    rec.pos = i;
+                    rec.fid = fid;
+                    rec.kind = STAGE_REC_SCALAR;
+                    rec.delta = u512_sub(cur, base);
+                    stage_rec_append(&stage, &stage_len, &stage_cap, rec);
+                    field_state_put(state_block, state_generation, i, fid, cur);
+                }
+                if (fd->base_field_id == CST_FID_N_STORES) {
+                    stage_extra_memop_vectors(&stage, &stage_len, &stage_cap,
+                                              ev, i, header_flags);
                 }
             }
         }
@@ -1066,13 +1458,17 @@ static void emit_field_delta_section(BitWriter *main_bw,
     uint64_t section_start = bw_tell_bytes(main_bw);
 
     /* Build payload in rec_bw, then emit as length-prefixed section. */
-    bw_write_uleb128(&rec_bw, stage->len);
-    for (guint r = 0; r < stage->len; r++) {
-        StageRec *s = &g_array_index(stage, StageRec, r);
+    bw_write_uleb128(&rec_bw, stage_len);
+    for (guint r = 0; r < stage_len; r++) {
+        StageRec *s = &stage[r];
         uint64_t gap = (uint64_t)(s->pos - prev_pos);
         bw_write_uleb128(&rec_bw, gap);
         bw_write_u8(&rec_bw, s->fid);
-        bw_write_sleb128_i128(&rec_bw, s->delta);
+        if (s->kind == STAGE_REC_VECTOR) {
+            bw_write_extra_memop_vector(&rec_bw, ev, s->pos, s->fid);
+        } else {
+            bw_write_sleb128_u512(&rec_bw, s->delta);
+        }
         prev_pos = s->pos;
     }
     bw_byte_align(&rec_bw);
@@ -1083,23 +1479,25 @@ static void emit_field_delta_section(BitWriter *main_bw,
     else       stat_bin_dyn_cp_bits += bits;
 }
 
-/* Snapshot CP field-state into WP field-state at the start of a WP
- * chain.  WP entries delta against this fork; the fork is discarded
- * at chain end (via wp state hashtable rebuild) so wrong-path effects
- * never leak into subsequent CP entries. */
-static void field_state_fork_wp(GHashTable *cp_state, GHashTable *wp_state)
+/* Reset WP overlay state at the start of a WP chain.  WP entries delta
+ * against CP state via fallback lookup, while wrong-path changes stay in
+ * this overlay and never leak into subsequent CP entries. */
+static void field_state_reset_wp(FieldStateTable *wp_state)
 {
-    g_hash_table_remove_all(wp_state);
-    GHashTableIter it;
-    gpointer pk, pv;
-    g_hash_table_iter_init(&it, cp_state);
-    while (g_hash_table_iter_next(&it, &pk, &pv)) {
-        FieldStateKey *k = g_new(FieldStateKey, 1);
-        *k = *(FieldStateKey *)pk;
-        U128 *v = g_new(U128, 1);
-        *v = *(U128 *)pv;
-        g_hash_table_insert(wp_state, k, v);
+    wp_state->generation++;
+    if (wp_state->generation != 0) {
+        return;
     }
+
+    GHashTableIter iter;
+    gpointer value;
+    g_hash_table_iter_init(&iter, wp_state->blocks);
+    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+        FieldStateBlock *block = (FieldStateBlock *)value;
+        size_t n_slots = (size_t)block->n_insns * FIELD_STATE_SLOT_COUNT;
+        memset(block->generations, 0, n_slots * sizeof(*block->generations));
+    }
+    wp_state->generation = 1;
 }
 
 /* ========================= Body stream ========================= */
@@ -1159,38 +1557,59 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime)
 
     st->current_thread = 0;
 
-    st->cp_field_state = g_hash_table_new_full(field_key_hash,
-                                               field_key_equal,
-                                               g_free, g_free);
-    st->wp_field_state = g_hash_table_new_full(field_key_hash,
-                                               field_key_equal,
-                                               g_free, g_free);
+    st->cp_field_state = field_state_table_new();
+    st->wp_field_state = field_state_table_new();
 
     return st;
 }
 
 /*
- * v1.7: build an EntryView wrapping the captured per-entry data and
+ * v1.8: build an EntryView wrapping the captured per-entry data and
  * emit one length-prefixed delta_section.  The descriptor table in
  * field_descriptors[] is the single source of truth for which fields
  * exist on the wire and how each is reconstructed.
  */
+static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
+                                        FieldStateTable *state,
+                                        FieldStateTable *base_state,
+                                        uint32_t template_id,
+                                        const BBTemplate *tmpl,
+                                        const GArray *dyn_params,
+                                        const GArray *reg_snaps,
+                                        bool is_wp);
+
 static void emit_one_bb_delta(BitWriter *bw, BodyStreamState *st,
-                              GHashTable *state, uint32_t template_id,
+                              FieldStateTable *state, uint32_t template_id,
                               const BBTemplate *tmpl,
                               const GArray *dyn_params,
                               const GArray *reg_snaps,
                               bool is_wp)
 {
+    emit_one_bb_delta_with_base(bw, st, state, NULL, template_id,
+                                tmpl, dyn_params, reg_snaps, is_wp);
+}
+
+static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
+                                        FieldStateTable *state,
+                                        FieldStateTable *base_state,
+                                        uint32_t template_id,
+                                        const BBTemplate *tmpl,
+                                        const GArray *dyn_params,
+                                        const GArray *reg_snaps,
+                                        bool is_wp)
+{
     EntryView ev;
     uint32_t n = tmpl ? tmpl->n_insns : 0;
-    g_autofree uint8_t *anl = g_new0(uint8_t, n ? n : 1);
-    g_autofree uint8_t *ans = g_new0(uint8_t, n ? n : 1);
-    g_autofree uint32_t *dpoff = g_new0(uint32_t, (n ? n : 0) + 1);
-    g_autofree uint32_t *rsoff = g_new0(uint32_t, (n ? n : 0) + 1);
-    build_entry_view(&ev, tmpl, dyn_params, reg_snaps, anl, ans,
-                     dpoff, rsoff);
-    emit_field_delta_section(bw, state, template_id, &ev, is_wp,
+    EntryViewScratch *scratch = &st->ev_scratch;
+    entry_view_scratch_ensure(scratch, n);
+    build_entry_view(&ev, tmpl, dyn_params, reg_snaps,
+                     scratch->actual_n_loads,
+                     scratch->actual_n_stores,
+                     scratch->insn_dp_off,
+                     scratch->insn_rs_off,
+                     scratch->load_slots,
+                     scratch->store_slots);
+    emit_field_delta_section(bw, state, base_state, template_id, &ev, is_wp,
                              st->header_flags);
 }
 
@@ -1231,7 +1650,7 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
             /* Seed WP field-state from CP: speculative execution
              * starts at the CP architectural state and is rolled
              * back at chain end. */
-            field_state_fork_wp(st->cp_field_state, st->wp_field_state);
+            field_state_reset_wp(st->wp_field_state);
         }
         for (uint32_t w = 0; w < num_wp; w++) {
             const WPBBEntry *wp = &g_array_index(entry->wp_entries,
@@ -1239,9 +1658,10 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
             uint32_t wp_tmpl = wp->template_id;
             bw_write_sleb128(&sub, (int64_t)wp_tmpl - prev_wp_template);
             prev_wp_template = wp_tmpl;
-            emit_one_bb_delta(&sub, st, st->wp_field_state, wp_tmpl,
-                              wp->tmpl, wp->dyn_params, wp->reg_snaps,
-                              true);
+            emit_one_bb_delta_with_base(&sub, st, st->wp_field_state,
+                                        st->cp_field_state, wp_tmpl,
+                                        wp->tmpl, wp->dyn_params,
+                                        wp->reg_snaps, true);
         }
         bw_byte_align(&sub);
         bw_write_section(&st->bw, bw_finish_buf(&sub));
@@ -1354,6 +1774,7 @@ void body_stream_finish(BodyStreamState *st)
     stat_bin_header_bits += (end_bytes - stats_start) * 8;
     stat_bin_total_bits += end_bytes * 8;
 
-    g_hash_table_unref(st->cp_field_state);
-    g_hash_table_unref(st->wp_field_state);
+    field_state_table_free(st->cp_field_state);
+    field_state_table_free(st->wp_field_state);
+    entry_view_scratch_free(&st->ev_scratch);
 }

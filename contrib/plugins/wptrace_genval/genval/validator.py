@@ -205,6 +205,24 @@ def _format_off(arena_addr: int, va: int, arena_size: int | None = None) -> int:
     return rel // 8
 
 
+def _dyn_data_int(dp) -> int:
+    data = getattr(dp, "data", None)
+    if data is not None:
+        return int(data)
+    return ((int(getattr(dp, "data_hi", 0)) << 64)
+            | int(getattr(dp, "data_lo", 0)))
+
+
+def _reg_snap_value(s: dict) -> int:
+    if "value" in s:
+        return int(s["value"])
+    return ((int(s.get("hi", 0)) << 64) | int(s.get("lo", 0)))
+
+
+def _bit_mask(bits: int) -> int:
+    return (1 << bits) - 1 if bits < 512 else (1 << 512) - 1
+
+
 # ---------------------------------------------------------------------------
 # Checks
 # ---------------------------------------------------------------------------
@@ -551,11 +569,12 @@ def _check_cp_memops(entries: list[dict],
         visited_tmpls |= comp_tmpls
 
         # ---- 3. Build expected and actual multisets for component. ----
-        expected: list[tuple[str, int, int]] = []
+        expected: list[tuple[str, int, int, bool]] = []
         for bid in sorted(comp_blocks):
             for m in blocks_by_id[bid].get("memops", []):
                 expected.append(
-                    (m["kind"], int(m["arena_u64_index"]), int(m["data"]))
+                    (m["kind"], int(m["arena_u64_index"]), int(m["data"]),
+                     bool(m.get("optional", False)))
                 )
         actual: list[tuple[str, int, int]] = []
         # 32-bit ISAs lower `uint64_t` arena accesses to a pair of
@@ -618,25 +637,32 @@ def _check_cp_memops(entries: list[dict],
                 actual.append((
                     dp.type_name,
                     off,
-                    int(dp.data_lo),
+                    _dyn_data_int(dp),
                 ))
 
-        exp_ctr = Counter(expected)
+        required_ctr = Counter((kind, off, data)
+                               for kind, off, data, optional in expected
+                               if not optional)
+        optional_ctr = Counter((kind, off, data)
+                               for kind, off, data, optional in expected
+                               if optional)
         act_ctr = Counter(actual)
-        if exp_ctr == act_ctr:
+        missing = list((required_ctr - act_ctr).elements())
+        extra = list((act_ctr - required_ctr - optional_ctr).elements())
+        if not missing and not extra:
             continue
 
-        missing = list((exp_ctr - act_ctr).elements())
-        extra = list((act_ctr - exp_ctr).elements())
         tmpl_label = "+".join(f"t{t}" for t in sorted(comp_tmpls))
         blk_label = "/".join(f"blk_{b}" for b in sorted(comp_blocks))
         issues.append(Issue(
             "cp_memops", "error",
             f"templates {{{tmpl_label}}} ({blk_label}): "
             f"memop multiset mismatch "
-            f"(exp={len(expected)} act={len(actual)} "
+            f"(required={sum(required_ctr.values())} "
+            f"optional={sum(optional_ctr.values())} act={len(actual)} "
             f"missing={len(missing)} extra={len(extra)})\n"
-            f"      expected: {expected}\n"
+            f"      required: {list(required_ctr.elements())}\n"
+            f"      optional: {list(optional_ctr.elements())}\n"
             f"      actual  : {actual}\n"
             f"      missing : {missing}\n"
             f"      extra   : {extra}",
@@ -747,6 +773,148 @@ def _check_memop_insn_attribution(
     return issues
 
 
+def _check_memop_count_assertions(
+        entries: list[dict],
+        templates_by_id: dict[int, dict],
+        blocks_by_id: dict[int, dict],
+        pcmap: "PcMap",
+        cp_set: set[int]) -> list[Issue]:
+    blocks = [b for b in blocks_by_id.values()
+              if b["block_id"] in cp_set
+              and b.get("memop_count_assertions")]
+    if not blocks:
+        return []
+
+    observations: dict[int, list[tuple[int, int, int, int]]] = {
+        int(b["block_id"]): [] for b in blocks
+    }
+
+    for e in entries:
+        tid = int(e["template_id"])
+        tmpl = templates_by_id.get(tid)
+        if tmpl is None:
+            continue
+        insns = tmpl.get("insns", [])
+        counts: dict[int, list[int]] = {}
+        for dp in e.get("dyn_params", []) or []:
+            idx = int(getattr(dp, "insn_index", -1))
+            if idx < 0 or idx >= len(insns):
+                continue
+            bid = pcmap.lookup(int(insns[idx]["pc"]))
+            if bid not in observations:
+                continue
+            slot = counts.setdefault(idx, [0, 0])
+            if dp.type_name == "load":
+                slot[0] += 1
+            else:
+                slot[1] += 1
+        for idx, (loads, stores) in counts.items():
+            bid = pcmap.lookup(int(insns[idx]["pc"]))
+            if bid in observations:
+                observations[bid].append((tid, idx, loads, stores))
+
+    issues: list[Issue] = []
+    for b in blocks:
+        bid = int(b["block_id"])
+        seen = observations.get(bid, [])
+        for assertion in b.get("memop_count_assertions") or []:
+            want_loads = int(assertion.get("loads", 0))
+            want_stores = int(assertion.get("stores", 0))
+            want_overflow = bool(assertion.get("overflow", False))
+            match = [obs for obs in seen
+                     if obs[2] == want_loads and obs[3] == want_stores]
+            if want_overflow:
+                match = [obs for obs in match
+                         if obs[2] > 16 or obs[3] > 16]
+            if match:
+                continue
+            issues.append(Issue(
+                "memop_count_assertion", "error",
+                f"blk_{bid} ({b['class']}): expected one instruction with "
+                f"loads={want_loads} stores={want_stores} "
+                f"overflow={want_overflow}, but saw "
+                f"{[(l, s) for _, _, l, s in seen]}",
+                {"block_id": bid, "expected": assertion,
+                 "observed": [
+                     {"template_id": tid, "insn_index": idx,
+                      "loads": loads, "stores": stores}
+                     for tid, idx, loads, stores in seen
+                 ]},
+            ))
+    return issues
+
+
+def _check_reg_value_assertions(
+        entries: list[dict],
+        templates_by_id: dict[int, dict],
+        blocks_by_id: dict[int, dict],
+        pcmap: "PcMap",
+        cp_set: set[int],
+        has_reg_data: bool) -> list[Issue]:
+    blocks = [b for b in blocks_by_id.values()
+              if b["block_id"] in cp_set and b.get("reg_value_assertions")]
+    if not blocks:
+        return []
+    if not has_reg_data:
+        return [Issue(
+            "reg_value_assertion", "info",
+            "register-value assertions skipped because trace was captured "
+            "without regdata=1",
+        )]
+
+    dec = _load_decoder()
+    reg_id_by_name = {name: rid for rid, name in dec.build_reg_names().items()}
+    observations: dict[tuple[int, int], list[dict]] = {}
+
+    for e in entries:
+        tmpl = templates_by_id.get(int(e["template_id"]))
+        if tmpl is None:
+            continue
+        insns = tmpl.get("insns", [])
+        for snap in e.get("reg_snaps") or []:
+            idx = int(snap.get("insn_index", -1))
+            if idx < 0 or idx >= len(insns):
+                continue
+            bid = pcmap.lookup(int(insns[idx]["pc"]))
+            if bid is None:
+                continue
+            rid = int(snap.get("reg_id", 0))
+            observations.setdefault((bid, rid), []).append(snap)
+
+    issues: list[Issue] = []
+    for b in blocks:
+        bid = int(b["block_id"])
+        for assertion in b.get("reg_value_assertions") or []:
+            reg_name = str(assertion["reg"])
+            rid = reg_id_by_name.get(reg_name)
+            if rid is None:
+                issues.append(Issue(
+                    "reg_value_assertion", "error",
+                    f"blk_{bid}: unknown register assertion name {reg_name}",
+                    {"block_id": bid, "assertion": assertion},
+                ))
+                continue
+            bits = int(assertion.get("bits", 512))
+            mask = _bit_mask(bits)
+            want = int(assertion["value"]) & mask
+            seen = observations.get((bid, rid), [])
+            if any((_reg_snap_value(s) & mask) == want for s in seen):
+                continue
+            if bool(assertion.get("optional", False)) and not seen:
+                continue
+            issues.append(Issue(
+                "reg_value_assertion", "error",
+                f"blk_{bid} ({b['class']}): expected {reg_name} "
+                f"low {bits} bits to equal 0x{want:x}, but saw "
+                f"{[hex(_reg_snap_value(s) & mask) for s in seen[:5]]}",
+                {"block_id": bid, "reg": reg_name, "bits": bits,
+                 "expected": want,
+                 "observed_first5": [_reg_snap_value(s) & mask
+                                     for s in seen[:5]]},
+            ))
+    return issues
+
+
 def _capstone_operand_kinds(isa: str):
     try:
         import capstone as cs
@@ -802,19 +970,22 @@ def _capstone_reg_class_for_isa(isa: str) -> dict[int, tuple[int, ...]]:
     gen_ids = _generic_reg_name_to_id()
     text = (_PLUGIN_DIR / header).read_text()
     out: dict[int, tuple[int, ...]] = {}
-    entry_re = re.compile(
-        r"\[([A-Z0-9_]+)\]\s*=\s*\{\s*"
-        r"(REG_[A-Z0-9_]+)"
-        r"(?:\s*,\s*\d+\s*,\s*\{([^}]*)\})?\s*\}"
-    )
+    entry_re = re.compile(r"\[([A-Z0-9_]+)\]\s*=\s*\{([^\n]*)\},")
     for match in entry_re.finditer(text):
         cap_name = match.group(1)
         cap_id = getattr(cap_mod, cap_name, None)
         if cap_id is None:
             continue
-        alias_text = match.group(3)
-        reg_names = (re.findall(r"REG_[A-Z0-9_]+", alias_text)
-                     if alias_text else [match.group(2)])
+        body = match.group(2)
+        alias_match = re.search(r"\.regs\s*=\s*\{([^}]*)\}", body)
+        if alias_match:
+            reg_names = re.findall(r"REG_[A-Z0-9_]+", alias_match.group(1))
+        else:
+            reg_match = re.search(
+                r"(?:\.reg_id\s*=\s*)?(REG_[A-Z0-9_]+)", body)
+            if not reg_match:
+                continue
+            reg_names = [reg_match.group(1)]
         regs = tuple(
             gen_ids[name] for name in reg_names
             if name in gen_ids and name != "REG_NONE"
@@ -1385,6 +1556,8 @@ def _check_address_recompute(
             continue
         insns = tmpl.get("insns", [])
 
+        multi_memop_seen: set[tuple[int, str]] = set()
+
         # Index reg-snaps by (insn_index, kind, reg_id) for O(1) lookup.
         snap_by_key: dict[tuple, dict] = {}
         for s in reg_snaps:
@@ -1394,6 +1567,13 @@ def _check_address_recompute(
             i = int(getattr(dp, "insn_index", -1))
             if i < 0 or i >= len(insns):
                 continue
+            multi_key = (i, dp.type_name)
+            if multi_key in multi_memop_seen:
+                _log_skip("additional_memop_same_insn", tid, i,
+                          dp.type_name)
+                n_skipped += 1
+                continue
+            multi_memop_seen.add(multi_key)
             ins = insns[i]
             raw = ins.get("raw_bytes")
             if not raw:
@@ -1967,6 +2147,140 @@ def _check_wrong_path_chains(entries: list[dict],
     return issues
 
 
+def _check_indirect_wp_assertions(
+        entries: list[dict],
+        templates_by_id: dict[int, dict],
+        blocks_by_id: dict[int, dict],
+    pcmap: "PcMap",
+    isa: str) -> list[Issue]:
+    blocks = [b for b in blocks_by_id.values()
+              if b.get("indirect_wp_assertions")]
+    if not blocks:
+        return []
+
+    _opcode_names, branch_names = _load_name_tables()
+    checked_blocks = {int(b["block_id"]): b for b in blocks}
+    issues: list[Issue] = []
+    events_by_block: dict[int, list[dict]] = {bid: [] for bid in checked_blocks}
+
+    for idx, e in enumerate(entries[:-1]):
+        tmpl = templates_by_id.get(int(e["template_id"]))
+        next_tmpl = templates_by_id.get(int(entries[idx + 1]["template_id"]))
+        if tmpl is None or next_tmpl is None:
+            continue
+        for insn_index, ins in enumerate(tmpl.get("insns", [])):
+            bid = pcmap.lookup(int(ins["pc"]))
+            if bid not in checked_blocks:
+                continue
+            if branch_names.get(int(ins.get("branch_type", 0))) != "INDIRECT_JUMP":
+                continue
+            raw_len = len(ins.get("raw_bytes") or [])
+            branch_fallthrough = int(ins["pc"]) + raw_len
+            if isa.startswith("mips") and raw_len:
+                branch_fallthrough += 4
+            wp_entries = e.get("wp_entries") or []
+            wp_start = None
+            if wp_entries:
+                wp_tmpl = templates_by_id.get(int(wp_entries[0]["template_id"]))
+                if wp_tmpl is not None:
+                    wp_start = int(wp_tmpl["start_pc"])
+            events_by_block[bid].append({
+                "entry_index": idx,
+                "template_id": int(e["template_id"]),
+                "insn_index": insn_index,
+                "branch_pc": int(ins["pc"]),
+                "fallthrough_pc": branch_fallthrough
+                if raw_len else int(tmpl.get("fall_through_pc", 0)),
+                "cp_target": int(next_tmpl["start_pc"]),
+                "wp_start": wp_start,
+            })
+            break
+
+    def _best_target_except(history: dict[int, tuple[int, int]],
+                            current: int) -> int | None:
+        best: tuple[int, int, int] | None = None
+        for target, (count, seen_tick) in history.items():
+            if target == current:
+                continue
+            cand = (count, seen_tick, target)
+            if best is None or cand > best:
+                best = cand
+        return best[2] if best is not None else None
+
+    for bid, block in checked_blocks.items():
+        assertions = block.get("indirect_wp_assertions") or []
+        events = events_by_block.get(bid, [])
+        if not events:
+            issues.append(Issue(
+                "indirect_wp_assertion", "error",
+                f"blk_{bid} ({block['class']}): no indirect branch "
+                "executions were found in the trace",
+                {"block_id": bid},
+            ))
+            continue
+        for assertion in assertions:
+            mode = assertion.get("mode")
+            history: dict[int, tuple[int, int]] = {}
+            non_fallthrough_checks = 0
+            mismatch_count = 0
+            for tick, ev in enumerate(events, 1):
+                current = int(ev["cp_target"])
+                old_count, _old_seen = history.get(current, (0, 0))
+                history[current] = (old_count + 1, tick)
+
+                fallthrough = int(ev["fallthrough_pc"])
+                if mode == "one_target_fallthrough":
+                    expected = fallthrough
+                    if len(history) > 1:
+                        issues.append(Issue(
+                            "indirect_wp_assertion", "error",
+                            f"blk_{bid} ({block['class']}): one-target "
+                            f"fixture observed {len(history)} distinct "
+                            "CP targets",
+                            {"block_id": bid, "targets": sorted(history)},
+                        ))
+                elif mode == "multi_target_most_frequent":
+                    alt = _best_target_except(history, current)
+                    if len(history) >= 2 and alt is not None:
+                        expected = alt
+                        if expected != fallthrough:
+                            non_fallthrough_checks += 1
+                    else:
+                        expected = fallthrough
+                else:
+                    issues.append(Issue(
+                        "indirect_wp_assertion", "error",
+                        f"blk_{bid}: unknown indirect WP assertion mode "
+                        f"{mode!r}",
+                        {"block_id": bid, "assertion": assertion},
+                    ))
+                    break
+
+                actual = ev["wp_start"]
+                if actual == expected:
+                    continue
+                mismatch_count += 1
+                if mismatch_count <= 5:
+                    issues.append(Issue(
+                        "indirect_wp_assertion", "error",
+                        f"blk_{bid} ({block['class']}) event "
+                        f"{ev['entry_index']}: expected WP start "
+                        f"0x{expected:x} for mode={mode}, got "
+                        f"{('none' if actual is None else hex(actual))}",
+                        {"block_id": bid, "mode": mode, "event": ev,
+                         "expected_wp_start": expected},
+                    ))
+            if mode == "multi_target_most_frequent" and non_fallthrough_checks == 0:
+                issues.append(Issue(
+                    "indirect_wp_assertion", "error",
+                    f"blk_{bid} ({block['class']}): multi-target fixture "
+                    "never reached a non-fallthrough most-frequent "
+                    "incorrect-target check",
+                    {"block_id": bid, "events": events},
+                ))
+    return issues
+
+
 def _meta_cp_successor(bid: int, correct_path: list[int]) -> int | None:
     """Return the block that follows ``bid`` on the ground-truth CP,
     or None if not found."""
@@ -1985,7 +2299,7 @@ def validate(meta_path: Path, trace_path: Path,
              wp_insn_budget: int = 64) -> Report:
     meta = json.loads(meta_path.read_text())
     dec = _load_decoder()
-    _trace_meta, templates, entries = dec.decode_champsim_tracer(trace_path)
+    trace_meta, templates, entries = dec.decode_champsim_tracer(trace_path)
 
     pcmap = PcMap(meta["blocks"])
     template_runs: dict[int, list[tuple[int, int]]] = {
@@ -2002,6 +2316,7 @@ def validate(meta_path: Path, trace_path: Path,
         "meta_blocks": len(meta["blocks"]),
         "meta_cp_length": len(correct_path),
         "pc_spans_loaded": len(pcmap._spans),
+        "trace_format_version": trace_meta.get("format_version"),
     }
 
     if not pcmap._spans:
@@ -2116,6 +2431,15 @@ def validate(meta_path: Path, trace_path: Path,
     issues += _check_memop_insn_attribution(cp_entries, template_runs,
                                             templates_by_id, cp_set)
 
+    issues += _check_memop_count_assertions(cp_entries, templates_by_id,
+                                            blocks_by_id, pcmap, cp_set)
+
+    has_reg_data = bool(int(trace_meta.get("flags", 0))
+                        & int(getattr(dec, "CST_FLAG_REG_DATA", 0)))
+    issues += _check_reg_value_assertions(cp_entries, templates_by_id,
+                                          blocks_by_id, pcmap, cp_set,
+                                          has_reg_data)
+
     # Address-recompute: only meaningful when reg-data was emitted.
     issues += _check_address_recompute(cp_entries, template_runs,
                                        templates_by_id, cp_set, isa)
@@ -2142,6 +2466,9 @@ def validate(meta_path: Path, trace_path: Path,
                                        wp_insn_budget=wp_insn_budget,
                                        helper_leaf_n_insns=int(meta.get("helper_leaf_n_insns", 0) or 0),
                                        isa=isa)
+
+    issues += _check_indirect_wp_assertions(cp_entries, templates_by_id,
+                                            blocks_by_id, pcmap, isa)
 
     return Report(issues=issues, stats=stats)
 

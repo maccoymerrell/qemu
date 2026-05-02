@@ -23,3 +23,4 @@ GTAGS
 build_wptrace/
 contrib/plugins/wptrace_tests/run_output
 contrib/plugins/wptrace_genval/out_*
+build-gprof/

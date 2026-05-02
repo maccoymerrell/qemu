@@ -22,44 +22,50 @@ static const RegClassification *lookup_reg_class(uint16_t cap_id)
     return &active_reg_table[cap_id];
 }
 
-static inline void add_src_reg(InsnFields *f, uint8_t reg_id,
-                               InsnRegNames *names, const char *name)
+static inline void add_src_reg(InsnFields *f, InsnRegNames *refs,
+                               uint8_t reg_id, uint16_t qemu_reg)
 {
     if (reg_id == REG_NONE || f->n_src_regs >= MAX_SRC_REGS) {
         return;
     }
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         if (f->src_regs[i] == reg_id) {
+            if (refs && refs->src_qemu_reg[i] == 0) {
+                refs->src_qemu_reg[i] = qemu_reg;
+            }
             return;
         }
     }
-    if (names && name) {
-        g_strlcpy(names->src[f->n_src_regs], name,
-                  sizeof(names->src[0]));
+    uint8_t slot = f->n_src_regs++;
+    f->src_regs[slot] = reg_id;
+    if (refs) {
+        refs->src_qemu_reg[slot] = qemu_reg;
     }
-    f->src_regs[f->n_src_regs++] = reg_id;
 }
 
-static inline void add_dst_reg(InsnFields *f, uint8_t reg_id,
-                               InsnRegNames *names, const char *name)
+static inline void add_dst_reg(InsnFields *f, InsnRegNames *refs,
+                               uint8_t reg_id, uint16_t qemu_reg)
 {
     if (reg_id == REG_NONE || f->n_dst_regs >= MAX_DST_REGS) {
         return;
     }
     for (uint8_t i = 0; i < f->n_dst_regs; i++) {
         if (f->dst_regs[i] == reg_id) {
+            if (refs && refs->dst_qemu_reg[i] == 0) {
+                refs->dst_qemu_reg[i] = qemu_reg;
+            }
             return;
         }
     }
-    if (names && name) {
-        g_strlcpy(names->dst[f->n_dst_regs], name,
-                  sizeof(names->dst[0]));
+    uint8_t slot = f->n_dst_regs++;
+    f->dst_regs[slot] = reg_id;
+    if (refs) {
+        refs->dst_qemu_reg[slot] = qemu_reg;
     }
-    f->dst_regs[f->n_dst_regs++] = reg_id;
 }
 
-static inline void add_src_cap_reg(InsnFields *f, uint16_t cap_id,
-                                   InsnRegNames *names, const char *name)
+static inline void add_src_cap_reg(InsnFields *f, InsnRegNames *refs,
+                                   uint16_t cap_id)
 {
     const RegClassification *rc = lookup_reg_class(cap_id);
     if (!rc) {
@@ -67,15 +73,15 @@ static inline void add_src_cap_reg(InsnFields *f, uint16_t cap_id,
     }
     if (rc->n_regs) {
         for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
-            add_src_reg(f, rc->regs[i], names, name);
+            add_src_reg(f, refs, rc->regs[i], 0);
         }
         return;
     }
-    add_src_reg(f, rc->reg_id, names, name);
+    add_src_reg(f, refs, rc->reg_id, rc->qemu_reg);
 }
 
-static inline void add_dst_cap_reg(InsnFields *f, uint16_t cap_id,
-                                   InsnRegNames *names, const char *name)
+static inline void add_dst_cap_reg(InsnFields *f, InsnRegNames *refs,
+                                   uint16_t cap_id)
 {
     const RegClassification *rc = lookup_reg_class(cap_id);
     if (!rc) {
@@ -83,11 +89,11 @@ static inline void add_dst_cap_reg(InsnFields *f, uint16_t cap_id,
     }
     if (rc->n_regs) {
         for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
-            add_dst_reg(f, rc->regs[i], names, name);
+            add_dst_reg(f, refs, rc->regs[i], 0);
         }
         return;
     }
-    add_dst_reg(f, rc->reg_id, names, name);
+    add_dst_reg(f, refs, rc->reg_id, rc->qemu_reg);
 }
 
 static void warn_unknown_instruction(uint64_t pc, const char *reason,
@@ -210,16 +216,16 @@ void decode_detail_to_generic(uint64_t pc,
         case QEMU_PLUGIN_OP_REG: {
             if (have_access_info) {
                 if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
-                    add_src_cap_reg(out, op->reg_id, out_names, op->reg_name);
+                    add_src_cap_reg(out, out_names, op->reg_id);
                 }
                 if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
-                    add_dst_cap_reg(out, op->reg_id, out_names, op->reg_name);
+                    add_dst_cap_reg(out, out_names, op->reg_id);
                 }
             } else {
                 if (first_is_dst && !seen_first_reg) {
-                    add_dst_cap_reg(out, op->reg_id, out_names, op->reg_name);
+                    add_dst_cap_reg(out, out_names, op->reg_id);
                 } else {
-                    add_src_cap_reg(out, op->reg_id, out_names, op->reg_name);
+                    add_src_cap_reg(out, out_names, op->reg_id);
                 }
                 seen_first_reg = true;
             }
@@ -232,8 +238,8 @@ void decode_detail_to_generic(uint64_t pc,
             }
             break;
         case QEMU_PLUGIN_OP_MEM: {
-            add_src_cap_reg(out, op->reg_id, out_names, op->reg_name);
-            add_src_cap_reg(out, op->index_id, out_names, op->index_name);
+            add_src_cap_reg(out, out_names, op->reg_id);
+            add_src_cap_reg(out, out_names, op->index_id);
             break;
         }
         default:
@@ -243,12 +249,10 @@ void decode_detail_to_generic(uint64_t pc,
 
     if (trace_isa != TRACE_ISA_RISCV && trace_isa != TRACE_ISA_MIPS) {
         for (uint8_t i = 0; i < info->n_regs_read; i++) {
-            add_src_cap_reg(out, info->regs_read_id[i], out_names,
-                            info->regs_read[i]);
+            add_src_cap_reg(out, out_names, info->regs_read_id[i]);
         }
         for (uint8_t i = 0; i < info->n_regs_write; i++) {
-            add_dst_cap_reg(out, info->regs_write_id[i], out_names,
-                            info->regs_write[i]);
+            add_dst_cap_reg(out, out_names, info->regs_write_id[i]);
         }
     }
 

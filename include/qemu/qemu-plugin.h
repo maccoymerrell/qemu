@@ -76,11 +76,14 @@ typedef uint64_t qemu_plugin_id_t;
  * version 6:
  * - added qemu_plugin_insn_detail (structured Capstone detail for
  *   instruction operands, groups, and implicit registers)
+ *
+ * version 7:
+ * - added qemu_plugin_read_register_by_id
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 6
+#define QEMU_PLUGIN_VERSION 7
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -1058,6 +1061,21 @@ bool qemu_plugin_read_memory_vaddr(uint64_t addr,
 QEMU_PLUGIN_API
 int qemu_plugin_read_register(struct qemu_plugin_register *handle,
                               GByteArray *buf);
+
+/**
+ * qemu_plugin_read_register_by_id() - read register for current vCPU
+ * @gdb_reg: QEMU/GDB register number for the current target
+ * @buf: A GByteArray for the data owned by the plugin
+ *
+ * This function is only available in a context that register read access is
+ * explicitly requested via the QEMU_PLUGIN_CB_R_REGS flag.  It reads the same
+ * target register namespace used by QEMU's gdbstub.
+ *
+ * Returns the size of the read register. The content of @buf is in target byte
+ * order. On failure returns -1.
+ */
+QEMU_PLUGIN_API
+int qemu_plugin_read_register_by_id(int gdb_reg, GByteArray *buf);
 
 /**
  * qemu_plugin_scoreboard_new() - alloc a new scoreboard

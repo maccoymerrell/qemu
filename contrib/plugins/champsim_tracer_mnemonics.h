@@ -213,7 +213,9 @@ enum GenericRegId {
 /*
  * Register classification: maps a Capstone register ID to one generic ID,
  * or to a small alias list when Capstone uses one enum value for a register
- * group.  Tables are indexed directly by the Capstone enum value.
+ * group.  Tables are indexed directly by the Capstone enum value.  qemu_reg
+ * is a one-based QEMU/GDB register number for register-value reads, or 0 when
+ * the Capstone register has no single readable QEMU register.
  */
 #define MAX_REG_ALIASES 8
 
@@ -221,8 +223,8 @@ typedef struct {
     uint8_t reg_id;                    /* GenericRegId */
     uint8_t n_regs;                    /* non-zero for composite aliases */
     uint8_t regs[MAX_REG_ALIASES];     /* GenericRegId[] */
+    uint16_t qemu_reg;                 /* one-based QEMU/GDB register id */
 } RegClassification;
-
 
 /*
  * Decoded per-instruction generic fields.
@@ -306,7 +308,6 @@ const unsigned isa_reg_class_size[] = {
     [TRACE_ISA_RISCV]   = RISCV_REG_ENDING,
     [TRACE_ISA_MIPS]    = MIPS_REG_ENDING,
 };
-
 
 /* Classification table selector (indexed by TraceISA) */
 const InsnClassification *const isa_insn_class[] = {

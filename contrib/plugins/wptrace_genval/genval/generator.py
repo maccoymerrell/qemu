@@ -184,10 +184,16 @@ def _plan_nodes(cfg: CFG, seed: int, isa: str
         plans[n.block_id] = plan
 
         for m in plan.memops:
+            span = max(1, (int(m.size) + 7) // 8)
             if m.kind == "load":
-                init_values.setdefault(m.arena_u64_index, m.data)
+                for i in range(span):
+                    init_values.setdefault(
+                        m.arena_u64_index + i,
+                        (int(m.data) >> (64 * i)) & ((1 << 64) - 1),
+                    )
             else:
-                init_values.setdefault(m.arena_u64_index, 0)
+                for i in range(span):
+                    init_values.setdefault(m.arena_u64_index + i, 0)
 
     return [p for p in plans if p is not None], init_values
 
@@ -354,6 +360,9 @@ def build_metadata(cfg: CFG, plans: list[B.BlockPlan],
             "sym_name": B.symbol_name(n.block_id),
             "memops": [dataclasses.asdict(m) for m in plan.memops],
             "ordered_memops": plan.ordered_memops,
+            "reg_value_assertions": list(plan.reg_value_assertions),
+            "memop_count_assertions": list(plan.memop_count_assertions),
+            "indirect_wp_assertions": list(plan.indirect_wp_assertions),
             "coarse_opcodes": plan.coarse_opcodes,
             "terminal": plan.terminal,
             "asserted_branch_types": list(plan.asserted_branch_types),

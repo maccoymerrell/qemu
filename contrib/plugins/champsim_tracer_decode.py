@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Reference decoder for the champsim_tracer binary trace format v1.7.
+Reference decoder for the champsim_tracer binary trace format v1.8.
 
 The body uses one unified field-typed delta stream per CP or WP basic
 block.  Each BB entry carries:
 
     n_records : ULEB
-    { ins_pos_gap : ULEB,  field_id : u8,  delta : SLEB128 } *
+    { ins_pos_gap : ULEB,  field_id : u8,  payload } *
 
 Records are sorted in non-descending (ins_pos, field_id) order; an
 absent (template_id, ins_pos, field_id) triple means "field unchanged
 since last correct-path emission, or equal to template default if
-never observed".  The delta is `(cur128 − baseline128) mod 2**128`.
+never observed".  Scalar payloads are SLEB deltas computed as
+`(cur512 - baseline512) mod 2**512`.  EXTRA_* memop fields carry raw
+ULEB vectors for slots beyond the first 16 and do not persist in state.
 
 Field IDs are dispatched through ``FIELD_DESCRIPTORS`` below — adding
 a new dynamic field is one entry there, mirroring the FieldDescriptor
@@ -27,9 +29,13 @@ from pathlib import Path
 
 # --- Format constants ------------------------------------------------
 
-# 'C','S','T',0x17 little-endian
-CST_MAGIC = 0x17545343
-CST_TRAILER_MAGIC = 0x17545343FFFFFFFF
+# 'C','S','T',version little-endian
+CST_MAGIC_V17 = 0x17545343
+CST_MAGIC_V18 = 0x18545343
+CST_MAGIC = CST_MAGIC_V18
+CST_TRAILER_MAGIC_V17 = 0x17545343FFFFFFFF
+CST_TRAILER_MAGIC_V18 = 0x18545343FFFFFFFF
+CST_TRAILER_MAGIC = CST_TRAILER_MAGIC_V18
 CST_TRAILER_SIZE = 64
 
 CST_FLAG_MEM_DATA      = 1 << 0
@@ -60,6 +66,10 @@ FID_LOAD_DATA_BASE   = 0x21
 FID_STORE_DATA_BASE  = 0x31
 FID_SRC_REG_BASE     = 0x41
 FID_N_STORES         = 0x61
+FID_EXTRA_LOAD_ADDR  = 0x62
+FID_EXTRA_STORE_ADDR = 0x63
+FID_EXTRA_LOAD_DATA  = 0x64
+FID_EXTRA_STORE_DATA = 0x65
 FID_INSN_BYTES_LO    = 0x70
 FID_INSN_BYTES_HI    = 0x71
 FID_INSN_OPCODE      = 0x72
@@ -69,8 +79,15 @@ FID_INSN_IMMEDIATE   = 0x75
 FID_INSN_SIZE        = 0x76
 FID_EXTENDED         = 0xFF
 
+MASK512 = (1 << 512) - 1
 MASK128 = (1 << 128) - 1
 MASK64  = (1 << 64) - 1
+EXTRA_VECTOR_FIDS = {
+    FID_EXTRA_LOAD_ADDR,
+    FID_EXTRA_STORE_ADDR,
+    FID_EXTRA_LOAD_DATA,
+    FID_EXTRA_STORE_DATA,
+}
 
 # Generic opcodes (subset needed by decoder to classify load/store)
 GEN_OP_LOAD  = 15
@@ -169,6 +186,10 @@ def build_field_id_names() -> dict[int, str]:
         names[FID_STORE_DATA_BASE + i] = f"CST_FID_STORE_DATA{i}"
         names[FID_SRC_REG_BASE + i] = f"CST_FID_SRC_REG{i}"
     names[FID_N_STORES] = "CST_FID_N_STORES"
+    names[FID_EXTRA_LOAD_ADDR] = "CST_FID_EXTRA_LOAD_ADDR"
+    names[FID_EXTRA_STORE_ADDR] = "CST_FID_EXTRA_STORE_ADDR"
+    names[FID_EXTRA_LOAD_DATA] = "CST_FID_EXTRA_LOAD_DATA"
+    names[FID_EXTRA_STORE_DATA] = "CST_FID_EXTRA_STORE_DATA"
     names[FID_INSN_BYTES_LO] = "CST_FID_INSN_BYTES_LO"
     names[FID_INSN_BYTES_HI] = "CST_FID_INSN_BYTES_HI"
     names[FID_INSN_OPCODE] = "CST_FID_INSN_OPCODE"
@@ -192,6 +213,7 @@ class DynParam:
     type_name: str         # "load" or "store"
     value: int
     data_size: int = 0
+    data: int = 0
     data_lo: int = 0
     data_hi: int = 0
     insn_index: int = -1
@@ -241,7 +263,7 @@ class ByteReader:
             if not (b & 0x80):
                 return out
             shift += 7
-            if shift > 70:
+            if shift > 600:
                 raise ValueError("ULEB128 too large")
 
     def sleb(self) -> int:
@@ -252,10 +274,10 @@ class ByteReader:
             out |= (b & 0x7F) << shift
             shift += 7
             if not (b & 0x80):
-                if b & 0x40 and shift < 128:
+                if b & 0x40:
                     out |= -(1 << shift)
                 return out
-            if shift > 140:
+            if shift > 600:
                 raise ValueError("SLEB128 too large")
 
     def string(self) -> str:
@@ -370,7 +392,7 @@ def _decode_templates_section(br: ByteReader,
     return templates, template_by_id
 
 
-# --- Body decoding (v1.7 unified field-typed delta stream) ----------
+# --- Body decoding (v1.7/v1.8 unified field-typed delta stream) -----
 
 def _template_default(tmpl: dict | None, ipos: int, fid: int) -> int:
     """Return the per-(template, insn-position, field-id) baseline used
@@ -423,21 +445,27 @@ def _decode_field_delta_section(
         tmpl: dict | None,
         state: dict[tuple[int, int, int], int],
         flags: int,
+        scalar_mask: int
         ) -> tuple[list[DynParam], list[dict]]:
     """Read one length-prefixed delta_section, apply records to the
     per-(template_id, ins_pos, field_id) state map, and reconstruct
     the consumer-facing (dyn_params, reg_snaps) shape the validator API
-    expects.  Records are stored as ``(pos_gap, field_id, sleb_delta)``
-    triples; ins_pos is reconstructed by accumulating gaps."""
+    expects.  Scalar records update persistent state; EXTRA_* records
+    provide raw overflow memop vectors for this entry only."""
     sec = br.sub()
     n_records = sec.uleb()
 
     # First pass: walk records, applying deltas to state.
     pos = 0
+    extra_vectors: dict[tuple[int, int], list[int]] = {}
     for _ in range(n_records):
         gap = sec.uleb()
         pos += gap
         fid = sec.u8()
+        if fid in EXTRA_VECTOR_FIDS:
+            n_values = sec.uleb()
+            extra_vectors[(pos, fid)] = [sec.uleb() for _ in range(n_values)]
+            continue
         delta = sec.sleb()
         if fid == FID_EXTENDED:
             # Reserved escape: payload = ULEB(ext_field_id), SLEB(delta).
@@ -448,7 +476,7 @@ def _decode_field_delta_section(
         base = state.get(key)
         if base is None:
             base = _template_default(tmpl, pos, fid)
-        cur = (base + delta) & MASK128
+        cur = (base + delta) & scalar_mask
         state[key] = cur
 
     # Second pass: rebuild dyn_params and reg_snaps by walking the
@@ -470,27 +498,67 @@ def _decode_field_delta_section(
             v = _template_default(tmpl, ipos, fid)
         return v
 
-    for i, insn in enumerate(tmpl["insns"]):
-        n_loads = _state_or_default(i, FID_N_LOADS) & 0xFF
-        n_stores = _state_or_default(i, FID_N_STORES) & 0xFF
+    def _set_dyn_data(dp: DynParam, value: int) -> None:
+        dp.data = value & scalar_mask
+        dp.data_lo = dp.data & MASK64
+        dp.data_hi = (dp.data >> 64) & MASK64
 
-        for slot in range(n_loads):
+    def _require_extra(ipos: int, fid: int, count: int) -> list[int]:
+        values = extra_vectors.get((ipos, fid), [])
+        if len(values) != count:
+            name = FIELD_ID_NAMES_DEFAULT.get(fid, f"FID_{fid:#x}")
+            raise ValueError(
+                f"{name} count mismatch at template={template_id} "
+                f"insn={ipos}: expected {count}, got {len(values)}"
+            )
+        return values
+
+    for i, insn in enumerate(tmpl["insns"]):
+        n_loads = _state_or_default(i, FID_N_LOADS)
+        n_stores = _state_or_default(i, FID_N_STORES)
+
+        fixed_loads = min(n_loads, FID_SLOT_COUNT)
+        fixed_stores = min(n_stores, FID_SLOT_COUNT)
+
+        for slot in range(fixed_loads):
             v = _state_or_default(i, FID_LOAD_ADDR_BASE + slot) & MASK64
             dp = DynParam(type_name="load", value=v, insn_index=i)
             if has_mem:
-                d128 = _state_or_default(i, FID_LOAD_DATA_BASE + slot)
-                dp.data_lo = d128 & MASK64
-                dp.data_hi = (d128 >> 64) & MASK64
+                _set_dyn_data(dp, _state_or_default(i, FID_LOAD_DATA_BASE + slot))
             dyn_params.append(dp)
 
-        for slot in range(n_stores):
+        extra_load_count = max(0, n_loads - FID_SLOT_COUNT)
+        if extra_load_count:
+            extra_addrs = _require_extra(i, FID_EXTRA_LOAD_ADDR,
+                                         extra_load_count)
+            extra_data = _require_extra(i, FID_EXTRA_LOAD_DATA,
+                                        extra_load_count) if has_mem else []
+            for j, v in enumerate(extra_addrs):
+                dp = DynParam(type_name="load", value=v & MASK64,
+                              insn_index=i)
+                if has_mem:
+                    _set_dyn_data(dp, extra_data[j])
+                dyn_params.append(dp)
+
+        for slot in range(fixed_stores):
             v = _state_or_default(i, FID_STORE_ADDR_BASE + slot) & MASK64
             dp = DynParam(type_name="store", value=v, insn_index=i)
             if has_mem:
-                d128 = _state_or_default(i, FID_STORE_DATA_BASE + slot)
-                dp.data_lo = d128 & MASK64
-                dp.data_hi = (d128 >> 64) & MASK64
+                _set_dyn_data(dp, _state_or_default(i, FID_STORE_DATA_BASE + slot))
             dyn_params.append(dp)
+
+        extra_store_count = max(0, n_stores - FID_SLOT_COUNT)
+        if extra_store_count:
+            extra_addrs = _require_extra(i, FID_EXTRA_STORE_ADDR,
+                                         extra_store_count)
+            extra_data = _require_extra(i, FID_EXTRA_STORE_DATA,
+                                        extra_store_count) if has_mem else []
+            for j, v in enumerate(extra_addrs):
+                dp = DynParam(type_name="store", value=v & MASK64,
+                              insn_index=i)
+                if has_mem:
+                    _set_dyn_data(dp, extra_data[j])
+                dyn_params.append(dp)
 
         # Register snapshots: source operands only. Destination register
         # identities remain in the template, but dynamic destination values
@@ -504,6 +572,7 @@ def _decode_field_delta_section(
                     "kind": "src",
                     "operand_index": op_i,
                     "reg_id": reg_id,
+                    "value": v & scalar_mask,
                     "lo": v & MASK64,
                     "hi": (v >> 64) & MASK64,
                 })
@@ -513,7 +582,7 @@ def _decode_field_delta_section(
 
 def decode_champsim_tracer(bin_path: Path
                            ) -> tuple[dict, list[dict], list[dict]]:
-    """Decode a v1.7 trace file.  Returns (meta, templates, entries).
+    """Decode a v1.7/v1.8 trace file.  Returns (meta, templates, entries).
     Public API; stable across minor revisions of the decoder."""
     data = bin_path.read_bytes()
     if len(data) < CST_TRAILER_SIZE:
@@ -526,19 +595,24 @@ def decode_champsim_tracer(bin_path: Path
     body_off        = trailer.u64_le()
     body_byte_count = trailer.u64_le()
     trailer_magic   = trailer.u64_le()
-    if trailer_magic != CST_TRAILER_MAGIC:
+    if trailer_magic not in (CST_TRAILER_MAGIC_V17, CST_TRAILER_MAGIC_V18):
         raise ValueError(
             f"Bad trailer magic 0x{trailer_magic:016x}, "
-            f"expected 0x{CST_TRAILER_MAGIC:016x}"
+            f"expected 0x{CST_TRAILER_MAGIC_V17:016x} or "
+            f"0x{CST_TRAILER_MAGIC_V18:016x}"
         )
 
     # --- Read header ---
     br = ByteReader(data)
     magic = br.u32_le()
-    if magic != CST_MAGIC:
+    if magic not in (CST_MAGIC_V17, CST_MAGIC_V18):
         raise ValueError(
-            f"Bad magic 0x{magic:08x}, expected 0x{CST_MAGIC:08x}"
+            f"Bad magic 0x{magic:08x}, expected 0x{CST_MAGIC_V17:08x} "
+            f"or 0x{CST_MAGIC_V18:08x}"
         )
+    if ((magic == CST_MAGIC_V18 and trailer_magic != CST_TRAILER_MAGIC_V18) or
+            (magic == CST_MAGIC_V17 and trailer_magic != CST_TRAILER_MAGIC_V17)):
+        raise ValueError("Header/trailer CST version mismatch")
     isa          = br.u8()
     flags        = br.u8()
     command      = br.string()
@@ -559,6 +633,7 @@ def decode_champsim_tracer(bin_path: Path
 
     has_mem_data = bool(flags & CST_FLAG_MEM_DATA)
     has_reg_data = bool(flags & CST_FLAG_REG_DATA)
+    scalar_mask = MASK512 if magic == CST_MAGIC_V18 else MASK128
 
     # --- Read templates ---
     templates: list[dict] = []
@@ -603,7 +678,7 @@ def decode_champsim_tracer(bin_path: Path
 
         cp_tmpl = template_by_id.get(entry_tmpl)
         cp_dyn, cp_reg_snaps = _decode_field_delta_section(
-            body, entry_tmpl, cp_tmpl, cp_field_state, flags)
+            body, entry_tmpl, cp_tmpl, cp_field_state, flags, scalar_mask)
 
         # WP chain sub-section
         wp_entries: list[dict] = []
@@ -620,7 +695,8 @@ def decode_champsim_tracer(bin_path: Path
             prev_wp_tmpl = wp_tmpl
             wp_tmpl_dict = template_by_id.get(wp_tmpl)
             wp_dyn, wp_reg_snaps = _decode_field_delta_section(
-                wpb, wp_tmpl, wp_tmpl_dict, wp_field_state, flags)
+                wpb, wp_tmpl, wp_tmpl_dict, wp_field_state, flags,
+                scalar_mask)
             wp_entries.append({
                 "index": w,
                 "template_id": wp_tmpl,
@@ -669,6 +745,7 @@ def decode_champsim_tracer(bin_path: Path
 
     meta = {
         "magic": magic,
+        "format_version": 0x18 if magic == CST_MAGIC_V18 else 0x17,
         "isa": isa,
         "target_name": target_name,
         "flags": flags,
@@ -702,11 +779,10 @@ def decode_champsim_tracer(bin_path: Path
 
 def _format_dyn(dp: DynParam, show_data: bool) -> str:
     s = f"{dp.type_name}=0x{dp.value:x}"
-    if show_data and (dp.data_lo or dp.data_hi):
-        if dp.data_hi:
-            s += f":data=0x{dp.data_hi:x}{dp.data_lo:016x}"
-        else:
-            s += f":data=0x{dp.data_lo:x}"
+    if show_data:
+        data = dp.data if dp.data else ((dp.data_hi << 64) | dp.data_lo)
+        if data:
+            s += f":data=0x{data:x}"
     return s
 
 
@@ -876,7 +952,7 @@ def _first_diff_line(a: str, b: str) -> tuple[int, str, str] | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Decode champsim_tracer binary (.cst, v1.7) to text")
+        description="Decode champsim_tracer binary (.cst, v1.7/v1.8) to text")
     parser.add_argument("bin", type=Path)
     parser.add_argument("-o", "--out", type=Path)
     parser.add_argument("--expect", type=Path)

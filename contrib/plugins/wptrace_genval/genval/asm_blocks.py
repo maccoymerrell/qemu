@@ -19,6 +19,7 @@ class ExpectedMemOp:
     arena_u64_index: int
     size: int
     data: int
+    optional: bool = False
 
 
 @dataclasses.dataclass
@@ -27,6 +28,9 @@ class BlockPlan:
     name: str
     memops: list[ExpectedMemOp]
     ordered_memops: bool = False
+    reg_value_assertions: list[dict] = dataclasses.field(default_factory=list)
+    memop_count_assertions: list[dict] = dataclasses.field(default_factory=list)
+    indirect_wp_assertions: list[dict] = dataclasses.field(default_factory=list)
     coarse_opcodes: dict[str, int] = dataclasses.field(default_factory=dict)
     successors: list[int] = dataclasses.field(default_factory=list)
     branch_pred: bool | None = None
@@ -163,6 +167,19 @@ class CodeBlock:
 
 def _u32(x: int) -> int:
     return x & 0xFFFFFFFF
+
+
+def _mask_bytes(value: int, size: int) -> int:
+    if size >= 64:
+        return value & ((1 << 512) - 1)
+    return value & ((1 << (size * 8)) - 1)
+
+
+def _byte_pattern(seed: int, size: int) -> int:
+    value = 0
+    for i in range(size):
+        value |= ((seed + i * 17) & 0xFF) << (8 * i)
+    return value
 
 
 def _prologue(block_id: int) -> list[str]:
@@ -826,6 +843,475 @@ class IndirectJump(CodeBlock):
                 "  jr $t9",
                 "  nop",
             ]
+        return "\n".join(lines) + "\n"
+
+
+@register
+class NarrowMemData(CodeBlock):
+    name = "narrow_mem_data"
+    scratch_slots = 8
+    randomizable = False
+    coverage_probe = True
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        load_slots = ctx.scratch_slots[:4]
+        store_slots = ctx.scratch_slots[4:8]
+        sizes = [1, 2, 4]
+        if ctx.isa != "mipsel":
+            sizes.append(8)
+        values = {
+            1: 0x7B,
+            2: 0x55AA,
+            4: 0x89ABCDEF,
+            8: 0x0123456789ABCDEF,
+        }
+        memops: list[ExpectedMemOp] = []
+        reg_names = {
+            "x86_64": ["REG_GPR6", "REG_GPR7", "REG_GPR8", "REG_GPR9"],
+            "aarch64": ["REG_GPR9", "REG_GPR10", "REG_GPR11", "REG_GPR12"],
+            "riscv64": ["REG_GPR5", "REG_GPR6", "REG_GPR7", "REG_GPR28"],
+            "mipsel": ["REG_GPR8", "REG_GPR9", "REG_GPR10"],
+        }[ctx.isa]
+        reg_asserts: list[dict] = []
+        for i, size in enumerate(sizes):
+            data = _mask_bytes(values[size], size)
+            memops.append(ExpectedMemOp("load", load_slots[i], size, data))
+            memops.append(ExpectedMemOp("store", store_slots[i], size, data))
+            reg_asserts.append({
+                "reg": reg_names[i],
+                "bits": size * 8,
+                "value": data,
+            })
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=memops,
+            reg_value_assertions=reg_asserts,
+            coarse_opcodes={"LOAD": len(sizes), "STORE": len(sizes)},
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        loads = [m for m in plan.memops if m.kind == "load"]
+        stores = [m for m in plan.memops if m.kind == "store"]
+        lines = _prologue(ctx.block_id) + _load_base(ctx.isa)
+        if ctx.isa == "x86_64":
+            for m, dst in zip(loads, ("%r8", "%r9", "%r10", "%r11")):
+                off = m.arena_u64_index * 8
+                if m.size == 1:
+                    lines.append(f"  movzbq {off}(%r15), {dst}")
+                elif m.size == 2:
+                    lines.append(f"  movzwq {off}(%r15), {dst}")
+                elif m.size == 4:
+                    lines.append(f"  movl {off}(%r15), {dst}d")
+                else:
+                    lines.append(f"  movq {off}(%r15), {dst}")
+            for m, src in zip(stores, ("%r8", "%r9", "%r10", "%r11")):
+                off = m.arena_u64_index * 8
+                if m.size == 1:
+                    lines.append(f"  movb {src}b, {off}(%r15)")
+                elif m.size == 2:
+                    lines.append(f"  movw {src}w, {off}(%r15)")
+                elif m.size == 4:
+                    lines.append(f"  movl {src}d, {off}(%r15)")
+                else:
+                    lines.append(f"  movq {src}, {off}(%r15)")
+        elif ctx.isa == "aarch64":
+            regs = ["w9", "w10", "w11", "x12"]
+            for m, reg in zip(loads, regs):
+                off = m.arena_u64_index * 8
+                if m.size == 1:
+                    lines.append(f"  ldrb {reg}, [x20, #{off}]")
+                elif m.size == 2:
+                    lines.append(f"  ldrh {reg}, [x20, #{off}]")
+                elif m.size == 4:
+                    lines.append(f"  ldr {reg}, [x20, #{off}]")
+                else:
+                    lines.append(f"  ldr {reg}, [x20, #{off}]")
+            for m, reg in zip(stores, regs):
+                off = m.arena_u64_index * 8
+                if m.size == 1:
+                    lines.append(f"  strb {reg}, [x20, #{off}]")
+                elif m.size == 2:
+                    lines.append(f"  strh {reg}, [x20, #{off}]")
+                elif m.size == 4:
+                    lines.append(f"  str {reg}, [x20, #{off}]")
+                else:
+                    lines.append(f"  str {reg}, [x20, #{off}]")
+        elif ctx.isa == "riscv64":
+            regs = ["t0", "t1", "t2", "t3"]
+            for m, reg in zip(loads, regs):
+                off = m.arena_u64_index * 8
+                op = {1: "lbu", 2: "lhu", 4: "lwu", 8: "ld"}[m.size]
+                lines.append(f"  {op} {reg}, {off}(t6)")
+            for m, reg in zip(stores, regs):
+                off = m.arena_u64_index * 8
+                op = {1: "sb", 2: "sh", 4: "sw", 8: "sd"}[m.size]
+                lines.append(f"  {op} {reg}, {off}(t6)")
+        else:
+            regs = ["$t0", "$t1", "$t2"]
+            for m, reg in zip(loads, regs):
+                off = m.arena_u64_index * 8
+                op = {1: "lbu", 2: "lhu", 4: "lw"}[m.size]
+                lines.append(f"  {op} {reg}, {off}($t8)")
+            for m, reg in zip(stores, regs):
+                off = m.arena_u64_index * 8
+                op = {1: "sb", 2: "sh", 4: "sw"}[m.size]
+                lines.append(f"  {op} {reg}, {off}($t8)")
+        lines += _jump(ctx.isa, ctx.successor_labels[0])
+        return "\n".join(lines) + "\n"
+
+
+@register
+class WideMemDataAarch64(CodeBlock):
+    name = "wide_mem_data_aarch64"
+    scratch_slots = 4
+    supported_isas = ("aarch64",)
+    randomizable = False
+    coverage_probe = True
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        load_slot, store_slot = ctx.scratch_slots[0], ctx.scratch_slots[2]
+        data = _byte_pattern(0x31, 16)
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=[
+                ExpectedMemOp("load", load_slot, 16, data),
+                ExpectedMemOp("store", store_slot, 16, data),
+            ],
+            reg_value_assertions=[
+                {"reg": "REG_VEC0", "bits": 128, "value": data},
+            ],
+            coarse_opcodes={"LOAD": 1, "STORE": 1, "VEC_MOV": 2},
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        src = plan.memops[0].arena_u64_index * 8
+        dst = plan.memops[1].arena_u64_index * 8
+        lines = _prologue(ctx.block_id) + _load_base(ctx.isa) + [
+            f"  add x9, x20, #{src}",
+            "  ldr q0, [x9]",
+            "  orr v1.16b, v0.16b, v0.16b",
+            f"  add x9, x20, #{dst}",
+            "  str q0, [x9]",
+        ]
+        lines += _jump(ctx.isa, ctx.successor_labels[0])
+        return "\n".join(lines) + "\n"
+
+
+@register
+class WideMemDataX86(CodeBlock):
+    name = "wide_mem_data_x86"
+    scratch_slots = 12
+    supported_isas = ("x86_64",)
+    randomizable = False
+    coverage_probe = True
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        s = ctx.scratch_slots
+        data16 = _byte_pattern(0x41, 16)
+        data32 = _byte_pattern(0x58, 32)
+        data32_lo = data32 & ((1 << 128) - 1)
+        data32_hi = data32 >> 128
+        memops: list[ExpectedMemOp] = []
+        memops.extend([
+            ExpectedMemOp("load", s[0], 16, data16),
+            ExpectedMemOp("store", s[2], 16, data16),
+            ExpectedMemOp("load", s[4], 16, data32_lo),
+            ExpectedMemOp("load", s[6], 16, data32_hi),
+            ExpectedMemOp("store", s[8], 16, data32_lo),
+            ExpectedMemOp("store", s[10], 16, data32_hi),
+        ])
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=memops,
+            reg_value_assertions=[
+                {"reg": "REG_VEC0", "bits": 128, "value": data16},
+            ],
+            coarse_opcodes={"LOAD": 3, "STORE": 3, "VEC_MOV": 4},
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        load16 = plan.memops[0]
+        store16 = plan.memops[1]
+        load32 = plan.memops[2]
+        store32 = plan.memops[4]
+        lines = _prologue(ctx.block_id) + _load_base(ctx.isa)
+        lines += [
+            f"  movdqu {load16.arena_u64_index * 8}(%r15), %xmm0",
+            "  pxor %xmm0, %xmm1",
+            f"  movdqu %xmm0, {store16.arena_u64_index * 8}(%r15)",
+        ]
+        lines += [
+            f"  vmovdqu {load32.arena_u64_index * 8}(%r15), %ymm1",
+            "  vpxor %ymm1, %ymm1, %ymm2",
+            f"  vmovdqu %ymm1, {store32.arena_u64_index * 8}(%r15)",
+        ]
+        lines += _jump(ctx.isa, ctx.successor_labels[0])
+        return "\n".join(lines) + "\n"
+
+
+@register
+class X86StringMemopOverflow(CodeBlock):
+    name = "x86_string_memop_overflow"
+    scratch_slots = 56
+    supported_isas = ("x86_64",)
+    randomizable = False
+    coverage_probe = True
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        s = ctx.scratch_slots
+        memops: list[ExpectedMemOp] = []
+        for count, src_base, dst_base, seed in ((8, s[0], s[8], 0x1111),
+                                               (20, s[16], s[36], 0x2222)):
+            for i in range(count):
+                data = (seed + i * 0x101010101010101) & ((1 << 64) - 1)
+                memops.append(ExpectedMemOp("load", src_base + i, 8, data))
+                memops.append(ExpectedMemOp("store", dst_base + i, 8, data))
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=memops,
+            ordered_memops=True,
+            memop_count_assertions=[
+                {"loads": 8, "stores": 8, "overflow": False},
+                {"loads": 20, "stores": 20, "overflow": True},
+            ],
+            coarse_opcodes={"LOAD": 28, "STORE": 28},
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        s = ctx.scratch_slots
+        lines = _prologue(ctx.block_id) + _load_base(ctx.isa) + [
+            "  cld",
+            f"  leaq {s[0] * 8}(%r15), %rsi",
+            f"  leaq {s[8] * 8}(%r15), %rdi",
+            "  mov $8, %ecx",
+            "  rep movsq",
+            f"  leaq {s[16] * 8}(%r15), %rsi",
+            f"  leaq {s[36] * 8}(%r15), %rdi",
+            "  mov $20, %ecx",
+            "  rep movsq",
+        ]
+        lines += _jump(ctx.isa, ctx.successor_labels[0])
+        return "\n".join(lines) + "\n"
+
+
+@register
+class IndirectOneTargetWP(CodeBlock):
+    name = "indirect_wp_one_target"
+    scratch_slots = 0
+    randomizable = False
+    coverage_probe = True
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=[],
+            asserted_branch_types=["BRANCH_INDIRECT_JUMP"],
+            asserted_opcodes=["BRANCH"],
+            indirect_wp_assertions=[{"mode": "one_target_fallthrough"}],
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        p = f".Liwp_one_{ctx.block_id}"
+        target = ctx.successor_labels[0]
+        lines = _prologue(ctx.block_id)
+        if ctx.isa == "x86_64":
+            lines += [
+                "  mov $0, %r8d",
+                f"{p}_dispatch:",
+                f"  leaq {p}_target(%rip), %rax",
+                f"{p}_branch:",
+                "  jmp *%rax",
+                f"{p}_fallthrough:",
+                f"  jmp {p}_done",
+                f"{p}_target:",
+                "  inc %r8d",
+                "  cmp $2, %r8d",
+                f"  jl {p}_dispatch",
+                f"{p}_done:",
+            ]
+        elif ctx.isa == "aarch64":
+            lines += [
+                "  mov x9, #0",
+                f"{p}_dispatch:",
+                f"  adr x10, {p}_target",
+                f"{p}_branch:",
+                "  br x10",
+                f"{p}_fallthrough:",
+                f"  b {p}_done",
+                f"{p}_target:",
+                "  add x9, x9, #1",
+                "  cmp x9, #2",
+                f"  b.lt {p}_dispatch",
+                f"{p}_done:",
+            ]
+        elif ctx.isa == "riscv64":
+            lines += [
+                "  li t0, 0",
+                f"{p}_dispatch:",
+                f"  lla t1, {p}_target",
+                f"{p}_branch:",
+                "  jr t1",
+                f"{p}_fallthrough:",
+                f"  j {p}_done",
+                f"{p}_target:",
+                "  addi t0, t0, 1",
+                "  li t2, 2",
+                f"  blt t0, t2, {p}_dispatch",
+                f"{p}_done:",
+            ]
+        else:
+            lines += [
+                "  li $t0, 0",
+                f"{p}_dispatch:",
+                f"  lui $t9, %hi({p}_target)",
+                f"  addiu $t9, $t9, %lo({p}_target)",
+                f"{p}_branch:",
+                "  jr $t9",
+                "  nop",
+                f"{p}_fallthrough:",
+                f"  b {p}_done",
+                "  nop",
+                f"{p}_target:",
+                "  addiu $t0, $t0, 1",
+                "  slti $t2, $t0, 2",
+                f"  bne $t2, $zero, {p}_dispatch",
+                "  nop",
+                f"{p}_done:",
+            ]
+        lines += _jump(ctx.isa, target)
+        return "\n".join(lines) + "\n"
+
+
+@register
+class IndirectMultiTargetWP(CodeBlock):
+    name = "indirect_wp_multi_target"
+    scratch_slots = 0
+    randomizable = False
+    coverage_probe = True
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=[],
+            asserted_branch_types=["BRANCH_INDIRECT_JUMP"],
+            asserted_opcodes=["BRANCH"],
+            indirect_wp_assertions=[{"mode": "multi_target_most_frequent"}],
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        p = f".Liwp_multi_{ctx.block_id}"
+        target = ctx.successor_labels[0]
+        lines = _prologue(ctx.block_id)
+        if ctx.isa == "x86_64":
+            lines += [
+                "  mov $0, %r8d",
+                f"{p}_dispatch:",
+                "  cmp $2, %r8d",
+                f"  jl {p}_choose_a",
+                f"  leaq {p}_target_b(%rip), %rax",
+                f"  jmp {p}_branch",
+                f"{p}_choose_a:",
+                f"  leaq {p}_target_a(%rip), %rax",
+                f"{p}_branch:",
+                "  jmp *%rax",
+                f"{p}_fallthrough:",
+                f"  jmp {p}_done",
+                f"{p}_target_a:",
+                "  inc %r8d",
+                f"  jmp {p}_dispatch",
+                f"{p}_target_b:",
+                "  inc %r8d",
+                f"{p}_done:",
+            ]
+        elif ctx.isa == "aarch64":
+            lines += [
+                "  mov x9, #0",
+                f"{p}_dispatch:",
+                "  cmp x9, #2",
+                f"  b.lt {p}_choose_a",
+                f"  adr x10, {p}_target_b",
+                f"  b {p}_branch",
+                f"{p}_choose_a:",
+                f"  adr x10, {p}_target_a",
+                f"{p}_branch:",
+                "  br x10",
+                f"{p}_fallthrough:",
+                f"  b {p}_done",
+                f"{p}_target_a:",
+                "  add x9, x9, #1",
+                f"  b {p}_dispatch",
+                f"{p}_target_b:",
+                "  add x9, x9, #1",
+                f"{p}_done:",
+            ]
+        elif ctx.isa == "riscv64":
+            lines += [
+                "  li t0, 0",
+                f"{p}_dispatch:",
+                "  li t2, 2",
+                f"  blt t0, t2, {p}_choose_a",
+                f"  lla t1, {p}_target_b",
+                f"  j {p}_branch",
+                f"{p}_choose_a:",
+                f"  lla t1, {p}_target_a",
+                f"{p}_branch:",
+                "  jr t1",
+                f"{p}_fallthrough:",
+                f"  j {p}_done",
+                f"{p}_target_a:",
+                "  addi t0, t0, 1",
+                f"  j {p}_dispatch",
+                f"{p}_target_b:",
+                "  addi t0, t0, 1",
+                f"{p}_done:",
+            ]
+        else:
+            lines += [
+                "  li $t0, 0",
+                f"{p}_dispatch:",
+                "  slti $t2, $t0, 2",
+                f"  bne $t2, $zero, {p}_choose_a",
+                "  nop",
+                f"  lui $t9, %hi({p}_target_b)",
+                f"  addiu $t9, $t9, %lo({p}_target_b)",
+                f"  b {p}_branch",
+                "  nop",
+                f"{p}_choose_a:",
+                f"  lui $t9, %hi({p}_target_a)",
+                f"  addiu $t9, $t9, %lo({p}_target_a)",
+                f"{p}_branch:",
+                "  jr $t9",
+                "  nop",
+                f"{p}_fallthrough:",
+                f"  b {p}_done",
+                "  nop",
+                f"{p}_target_a:",
+                "  addiu $t0, $t0, 1",
+                f"  b {p}_dispatch",
+                "  nop",
+                f"{p}_target_b:",
+                "  addiu $t0, $t0, 1",
+                f"{p}_done:",
+            ]
+        lines += _jump(ctx.isa, target)
         return "\n".join(lines) + "\n"
 
 

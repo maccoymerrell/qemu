@@ -109,6 +109,28 @@ class _Bucket:
         self.bytes += n
         self.count += 1
 
+    def add_bucket(self, other: "_Bucket") -> None:
+        self.bytes += other.bytes
+        self.count += other.count
+
+
+@dataclasses.dataclass
+class _FieldDeltaBreakdown:
+    overhead: _Bucket = dataclasses.field(default_factory=_Bucket)
+    mem_counts: _Bucket = dataclasses.field(default_factory=_Bucket)
+    load_addr: _Bucket = dataclasses.field(default_factory=_Bucket)
+    store_addr: _Bucket = dataclasses.field(default_factory=_Bucket)
+    load_data: _Bucket = dataclasses.field(default_factory=_Bucket)
+    store_data: _Bucket = dataclasses.field(default_factory=_Bucket)
+    src_reg: _Bucket = dataclasses.field(default_factory=_Bucket)
+    insn_meta: _Bucket = dataclasses.field(default_factory=_Bucket)
+    extended: _Bucket = dataclasses.field(default_factory=_Bucket)
+    other: _Bucket = dataclasses.field(default_factory=_Bucket)
+
+    def add(self, other: "_FieldDeltaBreakdown") -> None:
+        for fld in dataclasses.fields(self):
+            getattr(self, fld.name).add_bucket(getattr(other, fld.name))
+
 
 @dataclasses.dataclass
 class _Stats:
@@ -126,11 +148,15 @@ class _Stats:
 
     cp_entry_framing: _Bucket = dataclasses.field(default_factory=_Bucket)
     cp_field_delta: _Bucket = dataclasses.field(default_factory=_Bucket)
+    cp_field_delta_detail: _FieldDeltaBreakdown = dataclasses.field(
+        default_factory=_FieldDeltaBreakdown)
     thread_switch: _Bucket = dataclasses.field(default_factory=_Bucket)
 
     wp_chain_envelope: _Bucket = dataclasses.field(default_factory=_Bucket)
     wp_entry_framing: _Bucket = dataclasses.field(default_factory=_Bucket)
     wp_field_delta: _Bucket = dataclasses.field(default_factory=_Bucket)
+    wp_field_delta_detail: _FieldDeltaBreakdown = dataclasses.field(
+        default_factory=_FieldDeltaBreakdown)
 
     wp_events: _Bucket = dataclasses.field(default_factory=_Bucket)
 
@@ -176,18 +202,58 @@ def _walk_templates(r: _R, expected: int) -> tuple[int, dict[int, dict]]:
     return r.p - start, tinfo
 
 
-def _field_delta_section_bytes(rr: _R) -> int:
+def _field_delta_bucket(fid: int, detail: _FieldDeltaBreakdown) -> _Bucket:
+    if fid in (dec.FID_N_LOADS, dec.FID_N_STORES):
+        return detail.mem_counts
+    if dec.FID_LOAD_ADDR_BASE <= fid < dec.FID_LOAD_ADDR_BASE + dec.FID_SLOT_COUNT:
+        return detail.load_addr
+    if dec.FID_STORE_ADDR_BASE <= fid < dec.FID_STORE_ADDR_BASE + dec.FID_SLOT_COUNT:
+        return detail.store_addr
+    if dec.FID_LOAD_DATA_BASE <= fid < dec.FID_LOAD_DATA_BASE + dec.FID_SLOT_COUNT:
+        return detail.load_data
+    if dec.FID_STORE_DATA_BASE <= fid < dec.FID_STORE_DATA_BASE + dec.FID_SLOT_COUNT:
+        return detail.store_data
+    if fid == dec.FID_EXTRA_LOAD_ADDR:
+        return detail.load_addr
+    if fid == dec.FID_EXTRA_STORE_ADDR:
+        return detail.store_addr
+    if fid == dec.FID_EXTRA_LOAD_DATA:
+        return detail.load_data
+    if fid == dec.FID_EXTRA_STORE_DATA:
+        return detail.store_data
+    if dec.FID_SRC_REG_BASE <= fid < dec.FID_SRC_REG_BASE + dec.FID_SLOT_COUNT:
+        return detail.src_reg
+    if dec.FID_INSN_BYTES_LO <= fid <= dec.FID_INSN_SIZE:
+        return detail.insn_meta
+    if fid == dec.FID_EXTENDED:
+        return detail.extended
+    return detail.other
+
+
+def _field_delta_section_bytes(rr: _R) -> tuple[int, _FieldDeltaBreakdown]:
     sub, used = _read_lp_sub(rr)
+    section_payload_start = sub.p
+    detail = _FieldDeltaBreakdown()
+    detail.overhead.add(used - (sub.end - section_payload_start))
+    record_start = sub.p
     n_records = sub.uleb()
+    detail.overhead.add(sub.p - record_start)
     for _ in range(n_records):
+        record_start = sub.p
         sub.uleb()                    # ins_pos_gap
         fid = sub.u8()
-        sub.sleb()                    # delta
+        if fid in dec.EXTRA_VECTOR_FIDS:
+            n_values = sub.uleb()
+            for _ in range(n_values):
+                sub.uleb()            # raw value
+        else:
+            sub.sleb()                # delta
         if fid == dec.FID_EXTENDED:
             sub.uleb()                # extended field id
+        _field_delta_bucket(fid, detail).add(sub.p - record_start)
     if sub.p != sub.end:
         raise ValueError("field-delta section had trailing bytes")
-    return used
+    return used, detail
 
 
 def _read_lp_sub(rr: _R) -> tuple[_R, int]:
@@ -217,15 +283,22 @@ def audit(path: Path) -> _Stats:
     body_off        = tr.u64_le()
     body_byte_count = tr.u64_le()
     trailer_magic   = tr.u64_le()
-    if trailer_magic != dec.CST_TRAILER_MAGIC:
+    if trailer_magic not in (dec.CST_TRAILER_MAGIC_V17,
+                             dec.CST_TRAILER_MAGIC_V18):
         raise ValueError(f"bad trailer magic 0x{trailer_magic:016x}")
     s.trailer = dec.CST_TRAILER_SIZE
     s.body_total = body_byte_count
 
     # Header
     hr = _R(m, 0)
-    if hr.u32_le() != dec.CST_MAGIC:
+    magic = hr.u32_le()
+    if magic not in (dec.CST_MAGIC_V17, dec.CST_MAGIC_V18):
         raise ValueError("bad header magic")
+    if ((magic == dec.CST_MAGIC_V18 and
+         trailer_magic != dec.CST_TRAILER_MAGIC_V18) or
+            (magic == dec.CST_MAGIC_V17 and
+             trailer_magic != dec.CST_TRAILER_MAGIC_V17)):
+        raise ValueError("header/trailer CST version mismatch")
     hr.u8()                  # isa
     hr.u8()                  # flags
     hr.string_len()          # command
@@ -268,7 +341,9 @@ def audit(path: Path) -> _Stats:
         if cp_info:
             s.cp_total_insns += cp_info["n_insns"]
 
-        s.cp_field_delta.add(_field_delta_section_bytes(br))
+        fd_bytes, fd_detail = _field_delta_section_bytes(br)
+        s.cp_field_delta.add(fd_bytes)
+        s.cp_field_delta_detail.add(fd_detail)
 
         # WP chain
         wp_sub, wp_used = _read_lp_sub(br)
@@ -282,7 +357,9 @@ def audit(path: Path) -> _Stats:
             wp_info = tinfo.get(prev_wp_template)
             if wp_info:
                 s.wp_total_insns += wp_info["n_insns"]
-            s.wp_field_delta.add(_field_delta_section_bytes(wp_sub))
+            fd_bytes, fd_detail = _field_delta_section_bytes(wp_sub)
+            s.wp_field_delta.add(fd_bytes)
+            s.wp_field_delta_detail.add(fd_detail)
         s.wp_entries_total += num_wp
 
         _ev_sub, ev_used = _read_lp_sub(br)
@@ -312,6 +389,16 @@ def _row(label: str, b: int, total: int,
     if count:
         extra = f"  [{count:>10,} {per or 'evt'}, avg {b / count:6.1f} B]"
     return f"  {label:<34} {_human(b):>14}  {pct:6.2f}%{extra}"
+
+
+def _fd_row(label: str, cp: _Bucket, wp: _Bucket, total: int) -> str:
+    b = cp.bytes + wp.bytes
+    pct = (100.0 * b / total) if total else 0.0
+    count = cp.count + wp.count
+    avg = (b / count) if count else 0.0
+    return (f"  {label:<20} {_human(b):>12}  {pct:6.2f}%"
+            f"  cp={_human(cp.bytes):>10}  wp={_human(wp.bytes):>10}"
+            f"  [{count:>10,} rec, avg {avg:5.1f} B]")
 
 
 def report(s: _Stats) -> str:
@@ -355,6 +442,30 @@ def report(s: _Stats) -> str:
     out(_row("WP events", s.wp_events.bytes, body,
              count=s.cp_entries, per="entry"))
     out(_row("BODY terminator", s.body_terminator, body))
+
+    fd_total = s.cp_field_delta.bytes + s.wp_field_delta.bytes
+    out("")
+    out(f"=== FIELD-DELTA RECORD BREAKDOWN ({_human(fd_total)}) ===")
+    out(_fd_row("section overhead", s.cp_field_delta_detail.overhead,
+                s.wp_field_delta_detail.overhead, fd_total))
+    out(_fd_row("memop counts", s.cp_field_delta_detail.mem_counts,
+                s.wp_field_delta_detail.mem_counts, fd_total))
+    out(_fd_row("load addresses", s.cp_field_delta_detail.load_addr,
+                s.wp_field_delta_detail.load_addr, fd_total))
+    out(_fd_row("store addresses", s.cp_field_delta_detail.store_addr,
+                s.wp_field_delta_detail.store_addr, fd_total))
+    out(_fd_row("load data", s.cp_field_delta_detail.load_data,
+                s.wp_field_delta_detail.load_data, fd_total))
+    out(_fd_row("store data", s.cp_field_delta_detail.store_data,
+                s.wp_field_delta_detail.store_data, fd_total))
+    out(_fd_row("source registers", s.cp_field_delta_detail.src_reg,
+                s.wp_field_delta_detail.src_reg, fd_total))
+    out(_fd_row("instruction metadata", s.cp_field_delta_detail.insn_meta,
+                s.wp_field_delta_detail.insn_meta, fd_total))
+    out(_fd_row("extended", s.cp_field_delta_detail.extended,
+                s.wp_field_delta_detail.extended, fd_total))
+    out(_fd_row("other", s.cp_field_delta_detail.other,
+                s.wp_field_delta_detail.other, fd_total))
 
     out("")
     out("=== ENTRIES & INSNS ===")

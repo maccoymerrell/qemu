@@ -1,4 +1,4 @@
-# champsim_tracer Binary Format - v1.7
+# champsim_tracer Binary Format - v1.8
 
 Status: current. This document describes the on-disk `.cst` stream
 written by [champsim_tracer_output.cc](champsim_tracer_output.cc) and
@@ -59,8 +59,8 @@ state for the same field.
 ## 2. Constants
 
 ```
-CST_MAGIC          = 0x17545343          bytes: 'C' 'S' 'T' 0x17
-CST_TRAILER_MAGIC  = 0x17545343FFFFFFFF
+CST_MAGIC          = 0x18545343          bytes: 'C' 'S' 'T' 0x18
+CST_TRAILER_MAGIC  = 0x18545343FFFFFFFF
 CST_TRAILER_SIZE   = 64
 
 BODY_TAG_END       = 0
@@ -102,7 +102,7 @@ start of the file.
 
 ```
 +--------------------------------------------------+
-| magic          u32  = 0x17545343                 |
+| magic          u32  = 0x18545343                 |
 | isa            u8   TraceISA                     |
 | flags          u8   CST_FLAG_* bits              |
 +--------------------------------------------------+
@@ -277,14 +277,38 @@ delta_section payload:
   repeat n_records times:
     ins_pos_gap : ULEB       current_insn_pos - previous_insn_pos
     field_id    : u8         CST_FID_* value; resolve through "field_id" map
-    delta       : SLEB128    current_value - baseline, modulo 2**128
+    payload     : scalar_delta | raw_vector
 ```
 
 Records are emitted in non-descending `(ins_pos, field_id)` order. When
 two records describe the same instruction, the later record has
 `ins_pos_gap = 0`.
 
-State is keyed by `(template_id, ins_pos, field_id)`:
+Most records are scalar delta records:
+
+```
+scalar_delta := SLEB
+
+delta = current_value - baseline, modulo 2**512
+current_value = (baseline + delta) mod 2**512
+```
+
+Scalar values are little-endian unsigned integers with a 512-bit cap.
+The two's-complement modular delta is emitted as one signed LEB value.
+Small 32-bit and 64-bit values still encode as short LEBs; wide vector
+register and memory values can occupy up to 512 bits.
+
+`EXTRA_*` records use a raw vector payload instead of a scalar delta:
+
+```
+raw_vector:
+  n_values : ULEB
+  repeat n_values times:
+    value : ULEB       unsigned raw value, not delta-coded
+```
+
+Only scalar records update persistent field state. State is keyed by
+`(template_id, ins_pos, field_id)`:
 
 ```
 first observation:
@@ -294,7 +318,7 @@ later observations:
   baseline = last_current_value_for_same_key
 
 decode:
-  current = (baseline + delta) mod 2**128
+  current = (baseline + delta) mod 2**512
 ```
 
 Correct-path state persists for the whole body stream. Wrong-path state
@@ -328,6 +352,11 @@ Field IDs are one byte. Slotted families reserve 16 values each.
 | 0x41..0x50     | SRC_REG[0..15]       | source register snapshots     |
 | 0x51..0x60     | reserved             | destination-value extension    |
 | 0x61           | N_STORES             | current valid store slots     |
+| 0x62           | EXTRA_LOAD_ADDR      | raw load addr vector, slots 16+ |
+| 0x63           | EXTRA_STORE_ADDR     | raw store addr vector, slots 16+ |
+| 0x64           | EXTRA_LOAD_DATA      | raw load data vector, slots 16+ |
+| 0x65           | EXTRA_STORE_DATA     | raw store data vector, slots 16+ |
+| 0x66..0x6F     | reserved             | future memop metadata          |
 | 0x70           | INSN_BYTES_LO        | low 8 bytes of instruction    |
 | 0x71           | INSN_BYTES_HI        | high 8 bytes of instruction   |
 | 0x72           | INSN_OPCODE          | GenericOpcode                 |
@@ -357,8 +386,16 @@ valid load slots  = 0 .. n_loads-1
 valid store slots = 0 .. n_stores-1
 ```
 
-Address fields default to 0. If an address field is absent for a valid
-slot, the value is unchanged from that slot's current baseline.
+The first 16 slots use the scalar `LOAD_ADDR[0..15]` and
+`STORE_ADDR[0..15]` fields. If an address field is absent for one of
+these valid slots, the value is unchanged from that slot's current
+baseline.
+
+If `n_loads > 16`, the remaining load addresses are emitted in one
+`EXTRA_LOAD_ADDR` raw vector for that instruction. If `n_stores > 16`,
+the remaining store addresses are emitted in `EXTRA_STORE_ADDR`.
+These raw vectors are present on every entry that has overflow memops;
+they are not delta-coded and do not persist in field state.
 
 ### 5.3 Memory Data
 
@@ -366,16 +403,22 @@ When `CST_FLAG_MEM_DATA` is set, the data fields carry the observed
 load/store value.
 
 ```
-128-bit data value:
+512-bit data value:
 
-  +-------------------------+-------------------------+
-  | hi: u64                 | lo: u64                 |
-  +-------------------------+-------------------------+
-        bits 127..64              bits 63..0
+  little-endian unsigned scalar, up to 64 bytes
 ```
 
-Accesses of 8 bytes or less use `hi = 0`. Narrow stores are masked to
-their low accessed bytes before delta calculation.
+The first 16 memory data slots use scalar `LOAD_DATA[0..15]` and
+`STORE_DATA[0..15]` delta records. Overflow data for slots 16 and above
+is emitted in `EXTRA_LOAD_DATA` / `EXTRA_STORE_DATA` raw vectors when
+`CST_FLAG_MEM_DATA` is set. Each overflow data vector has the same
+number of values as the corresponding overflow address vector.
+
+Narrow accesses are masked to their low accessed bytes before delta or
+raw-vector emission. The current QEMU plugin mem-value API directly
+exposes values up to 128 bits; wider values are represented by the v1.8
+wire format and by register snapshots, and can be populated by capture
+paths that can provide up to 64 bytes.
 
 ### 5.4 Register Data
 
@@ -396,6 +439,10 @@ delta fields for this instruction:
   CST_FID_SRC_REG0  -> value of REG_A before execution
   CST_FID_SRC_REG1  -> value of REG_B before execution
 ```
+
+Register snapshots are scalar 512-bit values. The capture path copies
+up to the first 64 little-endian bytes returned by
+`qemu_plugin_read_register()`.
 
 Register IDs are one-byte `GenericRegId` values. The trace header's
 `reg` map gives the exact name for each value, including special values

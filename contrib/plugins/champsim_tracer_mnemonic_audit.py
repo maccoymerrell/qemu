@@ -873,6 +873,10 @@ def classify_aarch64(m: str) -> Entry:
         return ent("GEN_OP_MOVSX")
     if m.startswith(("uxt", "ubfm", "ubfiz", "ubfx")):
         return ent("GEN_OP_MOVZX")
+    if m.startswith(("dup", "ins", "movi")):
+        return ent("GEN_OP_VEC_MOV")
+    if m.startswith("extr"):
+        return ent("GEN_OP_ROR")
     if m.startswith(("mov", "movi", "movk", "movn", "movz", "dup", "ins", "ext", "cpy")):
         return ent("GEN_OP_MOV")
     if m in {"clr", "ctz", "pext"}:
@@ -1011,7 +1015,7 @@ def classify_riscv(m: str) -> Entry:
         return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_JUMP")
     if m in {"jump"}:
         return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_JUMP")
-    if m in {"la", "la_tlsdesc", "la_tls_gd", "la_tls_ie", "lla", "lga", "pcrel_hi", "tlsdesc_hi", "tls_gd_hi", "tls_got_hi", "tls_ie_hi"}:
+    if m in {"la", "la_tlsdesc", "la_tls_gd", "la_tls_ie", "lla", "lga", "pcrel_hi", "tlsdesc_hi", "tls_gd_hi", "tls_got_hi", "tls_ie_hi", "auipc"}:
         return ent("GEN_OP_LEA")
     if m in {"li"}:
         return ent("GEN_OP_MOV")
@@ -1057,7 +1061,7 @@ def classify_riscv(m: str) -> Entry:
         if m.startswith("cm_pop"):
             return ent("GEN_OP_POP")
         return ent("GEN_OP_MOV")
-    if m.startswith(("addi", "addiw", "addw", "add", "c_add", "c_addi", "auipc")):
+    if m.startswith(("addi", "addiw", "addw", "add", "c_add", "c_addi")):
         return ent("GEN_OP_INT_ADD")
     if m.startswith(("subw", "sub", "c_sub")):
         return ent("GEN_OP_INT_SUB")
@@ -1251,6 +1255,8 @@ def classify_mips(m: str) -> Entry:
         return ent("GEN_OP_FENCE", flags="MF_ATOMIC")
     if m in {"nop", "nop32", "ssnop", "ehb", "cache", "tlbp", "tlbr", "tlbwi", "tlbwr"} or m.startswith(("cachee", "dmt", "dvp", "dvpe", "emt", "evp", "evpe", "ginv", "tlbg", "tlbinv")):
         return ent("GEN_OP_NOP")
+    if m.startswith(("movn", "movz")):
+        return ent("GEN_OP_CMOV")
     if m.startswith(("ll", "sc")):
         return ent("GEN_OP_XCHG", flags="MF_ATOMIC")
     if re.match(r"^c_.*_(s|d|ps)$", m):
@@ -1269,7 +1275,7 @@ def classify_mips(m: str) -> Entry:
         return ent("GEN_OP_VEC_SHUF")
     if m in {"align", "balign", "bitrev", "bitrevw", "byterevw", "cfc1", "cfc2", "cfcmsa", "cftc1", "ctc1", "ctc2", "ctcmsa", "cttc1", "dalign", "di", "ei", "dmfc0", "dmfc2", "dmfgc0", "dmtc0", "dmtc2", "dmtgc0", "mfc0", "mfc2", "mfgc0", "mfhc0", "mfhc1", "mfhc2", "mfhgc0", "mfhi", "mfhi16", "mflo", "mflo16", "mftacx", "mftc0", "mftc1", "mftdsp", "mftgpr", "mfthc1", "mfthi", "mftlo", "mftr", "mtc0", "mtc2", "mtgc0", "mthc0", "mthc1", "mthc2", "mthgc0", "mthi", "mthlip", "mtlo", "mttacx", "mttc0", "mttc1", "mttdsp", "mttgpr", "mtthc1", "mtthi", "mttlo", "mttr", "mtm0", "mtm1", "mtm2", "mtp0", "mtp1", "mtp2", "rdpgpr", "rddsp", "rdhwr", "wrpgpr", "wrdsp"}:
         return ent("GEN_OP_MOV")
-    if m.startswith(("move", "movn", "movz", "dext", "ext", "ins", "dins", "lui")):
+    if m.startswith(("move", "dext", "ext", "ins", "dins", "lui")):
         return ent("GEN_OP_MOV")
     if m.startswith(("seb", "seh")):
         return ent("GEN_OP_MOVSX")
@@ -1377,7 +1383,7 @@ def classify_mips(m: str) -> Entry:
         return ent("GEN_OP_SAR")
     if m.startswith(("rol", "ror", "rotr", "drol", "dror", "drotr", "rotx")):
         return ent("GEN_OP_ROR")
-    if m.startswith(("movf", "movt", "seleqz", "selnez")):
+    if m.startswith(("movf", "movt", "movn", "movz", "seleqz", "selnez")):
         return ent("GEN_OP_CMOV")
     if m.startswith(("seq", "sge", "sgt", "sle", "sne", "slt", "sltu", "slti", "sltiu")):
         return ent("GEN_OP_CMP")
@@ -1433,12 +1439,137 @@ def format_entry(const_name: str, entry: Entry) -> str:
     return line + " },"
 
 
-def format_reg_entry(const_name: str, entry: RegEntry, comment: str) -> str:
+def qemu_x86_gdb_reg(name: str) -> int | None:
+    gpr_aliases = {
+        "A": 0, "B": 1, "C": 2, "D": 3,
+        "SI": 4, "DI": 5, "BP": 6, "SP": 7,
+    }
+    if name in {"EIZ", "RIZ"}:
+        return None
+    if name in {"IP", "EIP", "RIP"}:
+        return 16
+    if name == "EFLAGS":
+        return 17
+    if name == "FPSW":
+        return 42
+    segs = {"CS": 18, "SS": 19, "DS": 20, "ES": 21, "FS": 22, "GS": 23}
+    if name in segs:
+        return segs[name]
+    if match := re.fullmatch(r"CR(0|2|3|4|8)", name):
+        return {"0": 27, "2": 28, "3": 29, "4": 30, "8": 31}[match.group(1)]
+    if match := re.fullmatch(r"(?:FP|ST)([0-7])", name):
+        return 33 + int(match.group(1))
+    if match := re.fullmatch(r"[XYZ]MM(\d+)", name):
+        num = int(match.group(1))
+        return 49 + num if num < 16 else None
+    if name == "MXCSR":
+        return 65
+    if match := re.fullmatch(r"R(\d+)(?:[BDW])?", name):
+        num = int(match.group(1))
+        return num if 8 <= num <= 15 else None
+    for base, reg in gpr_aliases.items():
+        if re.fullmatch(rf"[ER]?{base}[XHL]?|{base}L", name):
+            return reg
+    return None
+
+
+def qemu_aarch64_gdb_reg(name: str) -> int | None:
+    if name in {"X_LANE", "Y_LANE", "WZR", "XZR"}:
+        return None
+    if name in {"SP", "WSP"}:
+        return 31
+    if name == "LR":
+        return 30
+    if name == "FP":
+        return 29
+    if name == "NZCV":
+        return 33
+    if name == "FPSR":
+        return 66
+    if name == "FPCR":
+        return 67
+    if name == "FFR":
+        return 84
+    if name == "VG":
+        return 85
+    if match := re.fullmatch(r"P(\d+)", name):
+        num = int(match.group(1))
+        return 68 + num if num < 16 else None
+    if match := re.fullmatch(r"[BHSQDZ](\d+)", name):
+        num = int(match.group(1))
+        return 34 + num if num < 32 else None
+    if match := re.fullmatch(r"[WX](\d+)", name):
+        num = int(match.group(1))
+        return num if num < 31 else None
+    return None
+
+
+def qemu_riscv_gdb_reg(name: str) -> int | None:
+    if name in {"DUMMY_REG_PAIR_WITH_X0"}:
+        return None
+    if name == "X0_PAIR":
+        return None
+    if match := re.fullmatch(r"X(\d+)", name):
+        num = int(match.group(1))
+        return num if num < 32 else None
+    if match := re.fullmatch(r"F(\d+)_[DFH]", name):
+        num = int(match.group(1))
+        return 33 + num if num < 32 else None
+    if match := re.fullmatch(r"V(\d+)", name):
+        num = int(match.group(1))
+        return 65 + num if num < 32 else None
+    return None
+
+
+def qemu_mips_gdb_reg(name: str) -> int | None:
+    stem = re.sub(r"(?:_NM|_64)$", "", name)
+    if stem == "ZERO":
+        return 0
+    if stem == "PC":
+        return 37
+    if stem == "LO":
+        return 33
+    if stem == "HI":
+        return 34
+    if stem in MIPS_GPR_NUM:
+        return MIPS_GPR_NUM[stem]
+    if match := re.fullmatch(r"[FD](\d+)", stem):
+        num = int(match.group(1))
+        return 38 + num if num < 32 else None
+    if stem == "FCR31":
+        return 70
+    if stem == "FCR0":
+        return 71
+    return None
+
+
+QEMU_GDB_REG_CLASSIFIERS = {
+    "x86": qemu_x86_gdb_reg,
+    "aarch64": qemu_aarch64_gdb_reg,
+    "riscv": qemu_riscv_gdb_reg,
+    "mips": qemu_mips_gdb_reg,
+}
+
+
+def qemu_gdb_reg(info: IsaInfo, const_name: str) -> int | None:
+    name = const_name.removeprefix(info.reg_prefix)
+    return QEMU_GDB_REG_CLASSIFIERS[info.key](name)
+
+
+def format_qemu_reg(qemu_reg: int | None) -> str:
+    return f", .qemu_reg = {qemu_reg + 1}" if qemu_reg is not None else ""
+
+
+def format_reg_entry(const_name: str, entry: RegEntry, comment: str,
+                     qemu_reg: int | None) -> str:
+    qemu_field = format_qemu_reg(qemu_reg)
     if entry.aliases:
         aliases = ", ".join(entry.aliases)
-        return (f"    [{const_name}] = {{ {entry.primary}, {len(entry.aliases)}, "
-                f"{{ {aliases} }} }},  /* {comment} */")
-    return f"    [{const_name}] = {{ {entry.primary} }},  /* {comment} */"
+        return (f"    [{const_name}] = {{ .reg_id = {entry.primary}, "
+                f".n_regs = {len(entry.aliases)}, .regs = {{ {aliases} }}"
+                f"{qemu_field} }},  /* {comment} */")
+    return (f"    [{const_name}] = {{ .reg_id = {entry.primary}"
+            f"{qemu_field} }},  /* {comment} */")
 
 
 def generated_body(info: IsaInfo, constants: list[str], existing: dict[str, Entry]) -> str:
@@ -1470,7 +1601,8 @@ def generated_reg_body(info: IsaInfo, constants: list[str]) -> str:
             continue
         mapped += 1
         comment = const_name.removeprefix(info.reg_prefix).lower()
-        lines.append(format_reg_entry(const_name, entry, comment))
+        lines.append(format_reg_entry(const_name, entry, comment,
+                                      qemu_gdb_reg(info, const_name)))
     lines.insert(1, f"    /* {info.key} regs: {mapped}/{len(constants) + 1} mapped, {ignored} intentionally ignored */")
     return "\n".join(lines) + "\n"
 

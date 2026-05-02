@@ -102,120 +102,6 @@ unsigned active_reg_table_size;
 static GHashTable *option_ht;
 uint64_t stat_unknown_insn_warnings;
 
-/*
- * Per-vCPU register-name -> qemu_plugin_register* map, populated
- * lazily from qemu_plugin_get_registers() the first time a given
- * vCPU executes a TB.  Used by the regdata=1 source-register capture
- * path; ignored when enable_reg_data is false.
- *
- * Keys are lowercase strdup'd register names (e.g. "rax", "x0",
- * "ra", "a0"); values are opaque handles owned by QEMU and stable
- * for the lifetime of the vCPU.  Indexed by cpu_index; any cpu we
- * have not seen yet has a NULL entry.
- */
-static GHashTable **vcpu_reg_handles;     /* GHashTable*[max_cpus] */
-static unsigned       vcpu_reg_handles_n; /* allocated length      */
-static GMutex         vcpu_reg_handles_lock;
-
-static GHashTable *build_reg_name_to_handle(void)
-{
-    GArray *regs = qemu_plugin_get_registers();
-    GHashTable *ht = g_hash_table_new_full(g_str_hash, g_str_equal,
-                                           g_free, NULL);
-    if (regs) {
-        for (guint i = 0; i < regs->len; i++) {
-            const qemu_plugin_reg_descriptor *d =
-                &g_array_index(regs, qemu_plugin_reg_descriptor, i);
-            if (!d->name || !d->handle) {
-                continue;
-            }
-            char *key = g_ascii_strdown(d->name, -1);
-            /* Some ISAs expose multiple aliases; keep the first one. */
-            if (!g_hash_table_contains(ht, key)) {
-                g_hash_table_insert(ht, key, d->handle);
-            } else {
-                g_free(key);
-            }
-        }
-        g_array_free(regs, true);
-    }
-
-    /*
-     * MIPS workaround: target/mips/cpu.c sets gdb_num_core_regs=73 and
-     * provides cc->gdb_read_register, but never registers a GDB
-     * feature (no gdb_core_xml_file, no static gdb-xml/mips*.xml).
-     * qemu_plugin_get_registers() walks cpu->gdb_regs (the feature
-     * list) so it returns 0 entries — even though gdb_read_register
-     * fully supports gpr/sp/ra/pc lookups for any reg < 73.  The
-     * plugin handle is just GINT_TO_POINTER(reg + 1), so we can
-     * synthesize the name -> handle map ourselves using the well-
-     * known MIPS GDB register numbering (see target/mips/gdbstub.c).
-     */
-    if (trace_isa == TRACE_ISA_MIPS && g_hash_table_size(ht) == 0) {
-        static const char *const mips_gpr_aliases[32] = {
-            "zero", "at",  "v0", "v1",
-            "a0",   "a1",  "a2", "a3",
-            "t0",   "t1",  "t2", "t3", "t4", "t5", "t6", "t7",
-            "s0",   "s1",  "s2", "s3", "s4", "s5", "s6", "s7",
-            "t8",   "t9",  "k0", "k1",
-            "gp",   "sp",  "fp", "ra",
-        };
-        auto add = [&](const char *name, int reg_num) {
-            if (!name || !*name) {
-                return;
-            }
-            char *key = g_ascii_strdown(name, -1);
-            gpointer handle = GINT_TO_POINTER(reg_num + 1);
-            if (!g_hash_table_contains(ht, key)) {
-                g_hash_table_insert(ht, key, handle);
-            } else {
-                g_free(key);
-            }
-        };
-        for (int i = 0; i < 32; i++) {
-            add(mips_gpr_aliases[i], i);
-            char dollar[8];
-            g_snprintf(dollar, sizeof(dollar), "$%d", i);
-            add(dollar, i);
-            char rname[8];
-            g_snprintf(rname, sizeof(rname), "r%d", i);
-            add(rname, i);
-        }
-        /* fp ($30) is also called s8 in MIPS calling convention. */
-        add("s8", 30);
-        /* CP0/special regs per target/mips/gdbstub.c. */
-        add("status", 32);
-        add("lo",     33);
-        add("hi",     34);
-        add("badvaddr", 35);
-        add("cause",  36);
-        add("pc",     37);
-    }
-
-    return ht;
-}
-
-static GHashTable *vcpu_get_reg_handles(unsigned int cpu_index)
-{
-    g_mutex_lock(&vcpu_reg_handles_lock);
-    if (cpu_index >= vcpu_reg_handles_n) {
-        unsigned new_n = cpu_index + 1;
-        vcpu_reg_handles = (GHashTable **)g_realloc(
-            vcpu_reg_handles, new_n * sizeof(GHashTable *));
-        for (unsigned i = vcpu_reg_handles_n; i < new_n; i++) {
-            vcpu_reg_handles[i] = NULL;
-        }
-        vcpu_reg_handles_n = new_n;
-    }
-    GHashTable *ht = vcpu_reg_handles[cpu_index];
-    if (!ht) {
-        ht = build_reg_name_to_handle();
-        vcpu_reg_handles[cpu_index] = ht;
-    }
-    g_mutex_unlock(&vcpu_reg_handles_lock);
-    return ht;
-}
-
 static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
 {
     (void)id;
@@ -233,53 +119,7 @@ static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
         }
     }
 
-    if (!enable_reg_data) {
-        return;
-    }
-    /*
-     * qemu_plugin_get_registers() must be called from a vCPU context,
-     * which vcpu_init_cb provides; pre-populate the map here so the
-     * later exec-callback fast-path is lock-free against new CPUs.
-     *
-     * Some QEMU targets (notably MIPS user-mode) expose no registers
-     * to plugins, so every snap will read back as zero.  Warn once so
-     * downstream tools can recognize that EA recompute will be a
-     * no-op on this target.  We deliberately keep enable_reg_data on
-     * and emit zero-valued snaps: by the time vcpu_init_cb fires the
-     * file header (with the reg-data flag bit) has typically already
-     * been written, so flipping the flag now would leave the on-disk
-     * flag and section presence out of sync.
-     */
-    GHashTable *ht = vcpu_get_reg_handles(cpu_index);
-    if (!ht || g_hash_table_size(ht) == 0) {
-        static bool warned;
-        if (!warned) {
-            warned = true;
-            fprintf(stderr,
-                    "champsim_tracer: regdata=1 requested but target "
-                    "exposes no plugin registers; reg snaps will read "
-                    "back as zero\n");
-        }
-    }
-}
-
-/*
- * Look up a register handle for @cpu_index by Capstone-style register
- * name (case-insensitive).  Returns NULL when the name is empty or
- * unknown to QEMU on this target.
- */
-struct qemu_plugin_register *
-lookup_reg_handle(unsigned int cpu_index, const char *cap_reg_name)
-{
-    if (!cap_reg_name || !*cap_reg_name) {
-        return NULL;
-    }
-    GHashTable *ht = vcpu_get_reg_handles(cpu_index);
-    if (!ht) {
-        return NULL;
-    }
-    g_autofree char *key = g_ascii_strdown(cap_reg_name, -1);
-    return (struct qemu_plugin_register *)g_hash_table_lookup(ht, key);
+    (void)cpu_index;
 }
 
 enum PluginOptId {
@@ -591,25 +431,25 @@ BBTemplate *get_or_create_bb_template(uint64_t entry_pc,
                                       BBTemplate * const *fragments,
                                       guint n_fragments)
 {
-    uint32_t total_insns = 0;
+    uint32_t max_insns = 0;
     for (guint i = 0; i < n_fragments; i++) {
-        total_insns += fragments[i]->n_insns;
+        max_insns += fragments[i]->n_insns;
     }
-    if (total_insns == 0) {
+    if (max_insns == 0) {
         return NULL;
     }
 
     g_autofree uint64_t *insn_pcs =
-        g_new0(uint64_t, total_insns);
+        g_new0(uint64_t, max_insns);
     g_autofree uint8_t *insn_sizes =
-        g_new0(uint8_t, total_insns);
+        g_new0(uint8_t, max_insns);
     g_autofree uint8_t *insn_bytes =
-        g_new0(uint8_t, (size_t)total_insns * MAX_INSN_BYTES);
+        g_new0(uint8_t, (size_t)max_insns * MAX_INSN_BYTES);
     g_autofree InsnFields *insn_fields =
-        g_new0(InsnFields, total_insns);
+        g_new0(InsnFields, max_insns);
     InsnRegNames *insn_reg_names = NULL;
     if (enable_reg_data) {
-        insn_reg_names = g_new0(InsnRegNames, total_insns);
+        insn_reg_names = g_new0(InsnRegNames, max_insns);
     }
     const char *symbol_name = NULL;
     uint64_t final_ft = 0;
@@ -621,21 +461,40 @@ BBTemplate *get_or_create_bb_template(uint64_t entry_pc,
             symbol_name = frag->symbol_name;
         }
         for (uint32_t i = 0; i < frag->n_insns; i++) {
-            insn_pcs[off + i] = frag->insn_pcs[i];
-            insn_sizes[off + i] = frag->insn_sizes[i];
-            memcpy(&insn_bytes[(size_t)(off + i) * MAX_INSN_BYTES],
+            bool duplicate = false;
+            if (off > 0) {
+                duplicate = insn_pcs[off - 1] == frag->insn_pcs[i] &&
+                            insn_sizes[off - 1] == frag->insn_sizes[i] &&
+                            memcmp(&insn_bytes[(size_t)(off - 1) *
+                                                MAX_INSN_BYTES],
+                                   &frag->insn_bytes[(size_t)i *
+                                                     MAX_INSN_BYTES],
+                                   MAX_INSN_BYTES) == 0;
+            }
+            if (duplicate) {
+                continue;
+            }
+
+            insn_pcs[off] = frag->insn_pcs[i];
+            insn_sizes[off] = frag->insn_sizes[i];
+            memcpy(&insn_bytes[(size_t)off * MAX_INSN_BYTES],
                    &frag->insn_bytes[(size_t)i * MAX_INSN_BYTES],
                    MAX_INSN_BYTES);
-            insn_fields[off + i] = frag->insn_fields[i];
+            insn_fields[off] = frag->insn_fields[i];
             if (insn_reg_names && frag->insn_reg_names) {
-                insn_reg_names[off + i] = frag->insn_reg_names[i];
+                insn_reg_names[off] = frag->insn_reg_names[i];
             }
+            off++;
         }
-        off += frag->n_insns;
         final_ft = frag->fall_through_pc;
     }
 
-    BBTemplate *tmpl = commit_true_bb(entry_pc, total_insns,
+    if (off == 0) {
+        g_free(insn_reg_names);
+        return NULL;
+    }
+
+    BBTemplate *tmpl = commit_true_bb(entry_pc, off,
                                       insn_pcs, insn_fields,
                                       insn_sizes, insn_bytes,
                                       insn_reg_names,
@@ -670,6 +529,124 @@ int template_branch_index(const BBTemplate *tmpl)
     }
 
     return -1;
+}
+
+static uint32_t branch_record_next_tick(BranchRecord *br)
+{
+    br->target_tick++;
+    if (br->target_tick == 0) {
+        br->target_tick = 1;
+        for (unsigned i = 0; i < BRANCH_TARGET_HISTORY; i++) {
+            br->targets[i].last_seen = 0;
+        }
+    }
+    return br->target_tick;
+}
+
+static void branch_record_note_target(BranchRecord *br, uint64_t target)
+{
+    if (!br) {
+        return;
+    }
+
+    uint32_t now = branch_record_next_tick(br);
+    int free_idx = -1;
+    int victim_idx = -1;
+    uint32_t victim_count = UINT32_MAX;
+    uint32_t victim_seen = UINT32_MAX;
+
+    for (unsigned i = 0; i < BRANCH_TARGET_HISTORY; i++) {
+        BranchTargetHistoryEntry *entry = &br->targets[i];
+        if (!entry->valid) {
+            if (free_idx < 0) {
+                free_idx = (int)i;
+            }
+            continue;
+        }
+
+        if (entry->target == target) {
+            if (entry->count < UINT32_MAX) {
+                entry->count++;
+            }
+            entry->last_seen = now;
+            return;
+        }
+
+        if (entry->count < victim_count ||
+            (entry->count == victim_count && entry->last_seen < victim_seen)) {
+            victim_count = entry->count;
+            victim_seen = entry->last_seen;
+            victim_idx = (int)i;
+        }
+    }
+
+    int idx = free_idx >= 0 ? free_idx : victim_idx;
+    if (idx < 0) {
+        return;
+    }
+
+    BranchTargetHistoryEntry *entry = &br->targets[idx];
+    if (!entry->valid) {
+        br->n_targets++;
+    }
+    entry->target = target;
+    entry->count = 1;
+    entry->last_seen = now;
+    entry->valid = true;
+}
+
+static uint64_t branch_record_best_target_except(const BranchRecord *br,
+                                                 uint64_t correct_target,
+                                                 bool *found)
+{
+    uint64_t best_target = 0;
+    uint32_t best_count = 0;
+    uint32_t best_seen = 0;
+    bool have_best = false;
+
+    if (!br) {
+        *found = false;
+        return 0;
+    }
+
+    for (unsigned i = 0; i < BRANCH_TARGET_HISTORY; i++) {
+        const BranchTargetHistoryEntry *entry = &br->targets[i];
+        if (!entry->valid || entry->target == correct_target) {
+            continue;
+        }
+        if (!have_best || entry->count > best_count ||
+            (entry->count == best_count && entry->last_seen > best_seen)) {
+            best_target = entry->target;
+            best_count = entry->count;
+            best_seen = entry->last_seen;
+            have_best = true;
+        }
+    }
+
+    *found = have_best;
+    return best_target;
+}
+
+static uint64_t branch_record_indirect_wrong_target(const BranchRecord *br,
+                                                    uint64_t correct_target,
+                                                    uint64_t fall_through)
+{
+    bool found = false;
+
+    if (br && br->n_targets >= 2) {
+        uint64_t target = branch_record_best_target_except(br,
+                                                           correct_target,
+                                                           &found);
+        if (found) {
+            return target;
+        }
+    }
+
+    if (fall_through != correct_target) {
+        return fall_through;
+    }
+
+    return branch_record_best_target_except(br, correct_target, &found);
 }
 
 /*
@@ -766,40 +743,49 @@ static BBTemplate *get_or_create_template(uint64_t start_pc,
 /* ========================= Reg-data snapshot capture ========================= */
 
 /*
- * Read a register by Capstone-style runtime name.  Empty/unknown
- * names yield a zero snap (lo=hi=0); the writer's delta state thus
- * stays at the previous value, so subsequent zero snaps emit 0-byte
- * deltas.  Only meaningful when enable_reg_data is true.
+ * Read a register by one-based QEMU/GDB register id.  Unknown registers yield
+ * a zero snap.  Only meaningful when enable_reg_data is true and the current
+ * callback requested QEMU_PLUGIN_CB_R_REGS.
  */
-static void read_reg_into_snap(unsigned int cpu_index,
-                               const char *name, RegSnap *out)
+static __thread GByteArray *reg_read_buf;
+
+static GByteArray *reg_read_scratch(void)
 {
-    out->lo = 0;
-    out->hi = 0;
-    if (!name || !*name) {
+    if (!reg_read_buf) {
+        reg_read_buf = g_byte_array_new();
+    } else {
+        g_byte_array_set_size(reg_read_buf, 0);
+    }
+    return reg_read_buf;
+}
+
+static void read_qemu_reg_into_snap(uint16_t qemu_reg, RegSnap *out)
+{
+    cst_wide_zero(&out->value);
+    if (qemu_reg == 0) {
         return;
     }
-    struct qemu_plugin_register *h = lookup_reg_handle(cpu_index, name);
-    if (!h) {
-        return;
-    }
-    g_autoptr(GByteArray) buf = g_byte_array_new();
-    int n = qemu_plugin_read_register(h, buf);
+    GByteArray *buf = reg_read_scratch();
+    int n = qemu_plugin_read_register_by_id((int)qemu_reg - 1, buf);
     if (n <= 0) {
         return;
     }
-    uint8_t bytes[16] = {0};
-    int copy_n = MIN(n, 16);
-    memcpy(bytes, buf->data, copy_n);
-    uint64_t lo = 0, hi = 0;
-    for (int b = 0; b < 8; b++) {
-        lo |= (uint64_t)bytes[b] << (b * 8);
-    }
-    for (int b = 0; b < 8; b++) {
-        hi |= (uint64_t)bytes[8 + b] << (b * 8);
-    }
-    out->lo = lo;
-    out->hi = hi;
+    cst_wide_from_le_bytes(&out->value, buf->data, (size_t)n);
+}
+
+static inline void reg_snap_array_append(GArray *arr, const RegSnap *snap)
+{
+    guint pos = arr->len;
+    g_array_set_size(arr, pos + 1);
+    g_array_index(arr, RegSnap, pos) = *snap;
+}
+
+static void read_reg_into_snap(unsigned int cpu_index,
+                               uint16_t qemu_reg,
+                               RegSnap *out)
+{
+    (void)cpu_index;
+    read_qemu_reg_into_snap(qemu_reg, out);
 }
 
 /*
@@ -835,8 +821,8 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
     }
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         RegSnap s;
-        read_reg_into_snap(cpu_index, names->src[i], &s);
-        g_array_append_val(pending_reg_snaps, s);
+        read_reg_into_snap(cpu_index, names->src_qemu_reg[i], &s);
+        reg_snap_array_append(pending_reg_snaps, &s);
     }
 }
 
@@ -856,80 +842,77 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
  * pre-insn snap.
  */
 
+typedef struct {
+    uint16_t qemu_reg;
+    RegSnap snap;
+} WideRegEntry;
+
 struct _WideRegSnap {
-    GHashTable *map;  /* lowercase name (g_strdup) -> RegSnap* (g_new0) */
+    WideRegEntry *entries;
+    unsigned n;
 };
+
+static __thread WideRegSnap wide_reg_scratch;
+static __thread unsigned wide_reg_scratch_cap;
+
+static bool wide_reg_snap_contains(const WideRegSnap *w, uint16_t qemu_reg)
+{
+    for (unsigned i = 0; i < w->n; i++) {
+        if (w->entries[i].qemu_reg == qemu_reg) {
+            return true;
+        }
+    }
+    return false;
+}
 
 WideRegSnap *wide_reg_snap_capture(unsigned int cpu_index)
 {
+    (void)cpu_index;
     if (!enable_reg_data) {
         return NULL;
     }
-    GHashTable *names_to_handles = vcpu_get_reg_handles(cpu_index);
-    if (!names_to_handles) {
+    if (!active_reg_table || active_reg_table_size == 0) {
         return NULL;
     }
-    WideRegSnap *w = g_new0(WideRegSnap, 1);
-    w->map = g_hash_table_new_full(g_str_hash, g_str_equal,
-                                   g_free, g_free);
 
-    GHashTableIter it;
-    gpointer key, val;
-    g_hash_table_iter_init(&it, names_to_handles);
-    while (g_hash_table_iter_next(&it, &key, &val)) {
-        const char *name = (const char *)key;
-        struct qemu_plugin_register *h = (struct qemu_plugin_register *)val;
-        if (!name || !*name || !h) {
+    wide_reg_scratch.n = 0;
+    for (unsigned i = 0; i < active_reg_table_size; i++) {
+        uint16_t qemu_reg = active_reg_table[i].qemu_reg;
+        if (qemu_reg == 0 || wide_reg_snap_contains(&wide_reg_scratch,
+                                                    qemu_reg)) {
             continue;
         }
-        RegSnap snap = {0, 0};
-        /* Inline read since read_reg_into_snap takes a name and
-         * re-resolves the handle, redundantly. */
-        g_autoptr(GByteArray) buf = g_byte_array_new();
-        int n = qemu_plugin_read_register(h, buf);
-        if (n <= 0) {
-            continue;
+        if (wide_reg_scratch.n == wide_reg_scratch_cap) {
+            wide_reg_scratch_cap = wide_reg_scratch_cap
+                ? wide_reg_scratch_cap * 2 : 64;
+            wide_reg_scratch.entries = g_renew(WideRegEntry,
+                                               wide_reg_scratch.entries,
+                                               wide_reg_scratch_cap);
         }
-        uint8_t bytes[16] = {0};
-        int copy_n = MIN(n, 16);
-        memcpy(bytes, buf->data, copy_n);
-        for (int b = 0; b < 8; b++) {
-            snap.lo |= (uint64_t)bytes[b] << (b * 8);
-        }
-        for (int b = 0; b < 8; b++) {
-            snap.hi |= (uint64_t)bytes[8 + b] << (b * 8);
-        }
-
-        RegSnap *heap = g_new(RegSnap, 1);
-        *heap = snap;
-        g_hash_table_insert(w->map, g_strdup(name), heap);
+        unsigned slot = wide_reg_scratch.n++;
+        wide_reg_scratch.entries[slot].qemu_reg = qemu_reg;
+        read_qemu_reg_into_snap(qemu_reg, &wide_reg_scratch.entries[slot].snap);
     }
-    return w;
+    return wide_reg_scratch.n ? &wide_reg_scratch : NULL;
 }
 
 void wide_reg_snap_free(WideRegSnap *w)
 {
-    if (!w) {
-        return;
-    }
-    if (w->map) {
-        g_hash_table_destroy(w->map);
-    }
-    g_free(w);
+    (void)w;
 }
 
-static void wide_reg_snap_lookup(const WideRegSnap *w, const char *name,
+static void wide_reg_snap_lookup(WideRegSnap *w, uint16_t qemu_reg,
                                  RegSnap *out)
 {
-    out->lo = 0;
-    out->hi = 0;
-    if (!w || !w->map || !name || !*name) {
+    cst_wide_zero(&out->value);
+    if (!w || qemu_reg == 0) {
         return;
     }
-    g_autofree char *key = g_ascii_strdown(name, -1);
-    RegSnap *s = (RegSnap *)g_hash_table_lookup(w->map, key);
-    if (s) {
-        *out = *s;
+    for (unsigned i = 0; i < w->n; i++) {
+        if (w->entries[i].qemu_reg == qemu_reg) {
+            *out = w->entries[i].snap;
+            return;
+        }
     }
 }
 
@@ -946,12 +929,41 @@ void wp_capture_insn_snaps(const WideRegSnap *wide,
     const InsnRegNames *names = &tmpl->insn_reg_names[insn_idx];
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         RegSnap s;
-        wide_reg_snap_lookup(wide, names->src[i], &s);
-        g_array_append_val(out_snaps, s);
+        wide_reg_snap_lookup((WideRegSnap *)wide, names->src_qemu_reg[i], &s);
+        reg_snap_array_append(out_snaps, &s);
+    }
+}
+
+void wp_capture_insn_snaps_live(unsigned int cpu_index,
+                                const BBTemplate *tmpl,
+                                uint32_t insn_idx,
+                                GArray *out_snaps)
+{
+    if (!enable_reg_data || !tmpl || !out_snaps ||
+        !tmpl->insn_reg_names || insn_idx >= tmpl->n_insns) {
+        return;
+    }
+    const InsnFields *f = &tmpl->insn_fields[insn_idx];
+    const InsnRegNames *names = &tmpl->insn_reg_names[insn_idx];
+    for (uint8_t i = 0; i < f->n_src_regs; i++) {
+        RegSnap s;
+        read_reg_into_snap(cpu_index, names->src_qemu_reg[i], &s);
+        reg_snap_array_append(out_snaps, &s);
     }
 }
 
 /* ========================= Memory access callback ========================= */
+
+static __thread GByteArray *mem_read_buf;
+
+static GByteArray *mem_read_scratch(void)
+{
+    if (!mem_read_buf) {
+        mem_read_buf = g_byte_array_sized_new(CST_MAX_WIDE_BYTES);
+    }
+    g_byte_array_set_size(mem_read_buf, 0);
+    return mem_read_buf;
+}
 
 static void vcpu_mem_cb(unsigned int cpu_index,
                         qemu_plugin_meminfo_t info,
@@ -965,34 +977,48 @@ static void vcpu_mem_cb(unsigned int cpu_index,
         .mem_vaddr = vaddr,
         .is_store = qemu_plugin_mem_is_store(info),
         .data_size = 0,
-        .data_lo = 0,
-        .data_hi = 0,
     };
+    cst_wide_zero(&acc.data);
+
+    (void)cpu_index;
 
     if (enable_mem_data) {
-        qemu_plugin_mem_value val = qemu_plugin_mem_get_value(info);
-        switch (val.type) {
-        case QEMU_PLUGIN_MEM_VALUE_U8:
-            acc.data_size = 1;
-            acc.data_lo = val.data.u8;
-            break;
-        case QEMU_PLUGIN_MEM_VALUE_U16:
-            acc.data_size = 2;
-            acc.data_lo = val.data.u16;
-            break;
-        case QEMU_PLUGIN_MEM_VALUE_U32:
-            acc.data_size = 4;
-            acc.data_lo = val.data.u32;
-            break;
-        case QEMU_PLUGIN_MEM_VALUE_U64:
-            acc.data_size = 8;
-            acc.data_lo = val.data.u64;
-            break;
-        case QEMU_PLUGIN_MEM_VALUE_U128:
-            acc.data_size = 16;
-            acc.data_lo = val.data.u128.low;
-            acc.data_hi = val.data.u128.high;
-            break;
+        unsigned shift = qemu_plugin_mem_size_shift(info);
+        size_t access_size = shift >= 6 ? CST_MAX_WIDE_BYTES
+                                        : ((size_t)1 << shift);
+        if (access_size > CST_MAX_WIDE_BYTES) {
+            access_size = CST_MAX_WIDE_BYTES;
+        }
+        acc.data_size = (uint8_t)access_size;
+
+        if (shift <= 4) {
+            qemu_plugin_mem_value val = qemu_plugin_mem_get_value(info);
+            switch (val.type) {
+            case QEMU_PLUGIN_MEM_VALUE_U8:
+                acc.data = cst_wide_from_u64(val.data.u8);
+                break;
+            case QEMU_PLUGIN_MEM_VALUE_U16:
+                acc.data = cst_wide_from_u64(val.data.u16);
+                break;
+            case QEMU_PLUGIN_MEM_VALUE_U32:
+                acc.data = cst_wide_from_u64(val.data.u32);
+                break;
+            case QEMU_PLUGIN_MEM_VALUE_U64:
+                acc.data = cst_wide_from_u64(val.data.u64);
+                break;
+            case QEMU_PLUGIN_MEM_VALUE_U128:
+                cst_wide_zero(&acc.data);
+                acc.data.limb[0] = val.data.u128.low;
+                acc.data.limb[1] = val.data.u128.high;
+                break;
+            }
+        } else {
+            GByteArray *buf = mem_read_scratch();
+            if (qemu_plugin_read_memory_vaddr(vaddr, buf, access_size)) {
+                cst_wide_from_le_bytes(&acc.data, buf->data, buf->len);
+            } else {
+                acc.data_size = 0;
+            }
         }
     }
 
@@ -1215,8 +1241,7 @@ static void drain_cp_mem_into_dyn_params(GArray *dyn_params,
             .insn_index = (uint16_t)(idx < n_insns ? idx : 0),
             .value = acc->mem_vaddr,
             .data_size = acc->data_size,
-            .data_lo = acc->data_lo,
-            .data_hi = acc->data_hi,
+            .data = acc->data,
         };
         g_array_append_val(dyn_params, dp);
     }
@@ -1432,31 +1457,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         br->pc = prev_last;
         br->fall_through = prev_ft;
         g_hash_table_replace(branch_map, &br->pc, br);
-    }
-
-    if (prev_is_branch && branch_taken) {
-        /* Push current_pc into a 2-entry LRU of distinct taken
-         * targets.  If it matches the MRU slot, nothing to do.  If it
-         * matches the LRU slot, swap them (promote LRU → MRU).
-         * Otherwise demote MRU → LRU and install current_pc as the
-         * new MRU. */
-        if (!br->has_taken_target) {
-            br->taken_target = current_pc;
-            br->has_taken_target = true;
-        } else if (br->taken_target == current_pc) {
-            /* MRU hit; nothing to update. */
-        } else if (br->has_prev_taken_target &&
-                   br->prev_taken_target == current_pc) {
-            /* LRU hit; swap MRU and LRU. */
-            uint64_t tmp = br->taken_target;
-            br->taken_target = br->prev_taken_target;
-            br->prev_taken_target = tmp;
-        } else {
-            /* New target; demote MRU and install. */
-            br->prev_taken_target = br->taken_target;
-            br->has_prev_taken_target = true;
-            br->taken_target = current_pc;
-        }
+    } else if (br) {
+        br->fall_through = prev_ft;
     }
 
     /* Append previous TB fragment to the in-flight basic-block chain. */
@@ -1487,51 +1489,20 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
              bf->branch_conditional));
 
         if (is_indirect) {
-            /* Indirect branch — choose the WP target from the
-             * 2-entry LRU of historically-taken targets, biased
-             * away from CP's current direction:
-             *   - If MRU exists and != current_pc and != prev_ft, use MRU.
-             *   - Else if LRU exists and != current_pc and != prev_ft, use LRU.
-             *   - Else if branch_taken, fall back to prev_ft (not-taken).
-             *   - Else (cold conditional indirect that fell through), 0
-             *     → suppress WP entry until history is learned.
-             *
-             * The current_pc filter prevents picking the same path CP
-             * just executed; the prev_ft filter prevents picking
-             * fall-through (which is degenerate for an unconditional
-             * indirect anyway). */
-            if (br && br->has_taken_target &&
-                br->taken_target != current_pc &&
-                br->taken_target != prev_ft) {
-                wrong_target = br->taken_target;
-            } else if (br && br->has_prev_taken_target &&
-                       br->prev_taken_target != current_pc &&
-                       br->prev_taken_target != prev_ft) {
-                wrong_target = br->prev_taken_target;
-            } else if (branch_taken) {
-                /* Unconditional indirect with no useful alternative
-                 * target known yet: WP is the byte after the branch.
-                 * This is degenerate (fall-through past a `ret` is
-                 * unmapped padding) but lets the WP simulator try and
-                 * harmlessly fault-out, which is preferable to
-                 * silently emitting no speculative trace at all. */
-                wrong_target = prev_ft;
-            } else {
-                wrong_target = 0;
+            if (branch_taken) {
+                branch_record_note_target(br, current_pc);
             }
+            wrong_target = branch_record_indirect_wrong_target(br,
+                                                               current_pc,
+                                                               prev_ft);
         } else if (branch_taken) {
             /* CP took a direct branch → WP is the fall-through. */
             wrong_target = prev_ft;
         } else if (direct_cond && bf->has_immediate &&
                    (uint64_t)bf->immediate != prev_ft) {
             /* CP fell through a direct conditional → WP is the
-             * statically-resolved taken target.  Cache it on the
-             * BranchRecord too, for symmetry. */
+             * statically-resolved taken target. */
             wrong_target = (uint64_t)bf->immediate;
-            if (br && !br->has_taken_target) {
-                br->taken_target = wrong_target;
-                br->has_taken_target = true;
-            }
         } else {
             wrong_target = 0;
         }
@@ -1599,16 +1570,73 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     uint64_t pc = qemu_plugin_tb_vaddr(tb);
-    size_t n_insns = qemu_plugin_tb_n_insns(tb);
+    size_t raw_n_insns = qemu_plugin_tb_n_insns(tb);
+    if (raw_n_insns == 0) {
+        return;
+    }
     struct qemu_plugin_insn *first_insn = qemu_plugin_tb_get_insn(tb, 0);
     struct qemu_plugin_insn *last_insn = qemu_plugin_tb_get_insn(tb,
-                                                                  n_insns - 1);
+                                                                  raw_n_insns - 1);
     uint64_t last_insn_pc = qemu_plugin_insn_vaddr(last_insn);
     size_t last_insn_size = qemu_plugin_insn_size(last_insn);
     uint64_t fall_through = last_insn_pc + last_insn_size;
     uint64_t bb_ends_in_branch = 0;
     uint64_t effective_last_pc = last_insn_pc;
     BBTemplate *existing_tmpl;
+
+    uint64_t *insn_pcs = g_new0(uint64_t, raw_n_insns);
+    qemu_plugin_insn_info *insn_info =
+        g_new0(qemu_plugin_insn_info, raw_n_insns);
+    uint8_t *insn_sizes = g_new0(uint8_t, raw_n_insns);
+    uint8_t *insn_bytes = g_new0(uint8_t,
+                                 raw_n_insns * MAX_INSN_BYTES);
+    uint32_t *canonical_index = g_new0(uint32_t, raw_n_insns);
+    bool *canonical_first = g_new0(bool, raw_n_insns);
+    uint32_t canonical_n_insns = 0;
+
+    for (size_t i = 0; i < raw_n_insns; i++) {
+        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+        uint64_t raw_pc = qemu_plugin_insn_vaddr(insn);
+        uint8_t raw_size =
+            (uint8_t)MIN(qemu_plugin_insn_size(insn), MAX_INSN_BYTES);
+        uint8_t raw_bytes[MAX_INSN_BYTES] = {0};
+
+        qemu_plugin_insn_data(insn, raw_bytes, raw_size);
+
+        bool duplicate = false;
+        if (canonical_n_insns > 0) {
+            uint32_t prev = canonical_n_insns - 1;
+            duplicate = insn_pcs[prev] == raw_pc &&
+                        insn_sizes[prev] == raw_size &&
+                        memcmp(&insn_bytes[(size_t)prev * MAX_INSN_BYTES],
+                               raw_bytes, MAX_INSN_BYTES) == 0;
+        }
+
+        if (duplicate) {
+            canonical_index[i] = canonical_n_insns - 1;
+        } else {
+            uint32_t out = canonical_n_insns++;
+            canonical_index[i] = out;
+            canonical_first[i] = true;
+            insn_pcs[out] = raw_pc;
+            insn_sizes[out] = raw_size;
+            memcpy(&insn_bytes[(size_t)out * MAX_INSN_BYTES],
+                   raw_bytes, MAX_INSN_BYTES);
+
+            if (cst_cap_arch >= 0) {
+                qemu_plugin_cap_decode(cst_cap_arch, cst_cap_mode,
+                                       &insn_bytes[(size_t)out *
+                                                   MAX_INSN_BYTES],
+                                       insn_sizes[out],
+                                       insn_pcs[out],
+                                       &insn_info[out]);
+            }
+        }
+
+        qemu_plugin_register_vcpu_mem_cb(
+            insn, vcpu_mem_cb, QEMU_PLUGIN_CB_NO_REGS,
+            QEMU_PLUGIN_MEM_RW, (void *)(uintptr_t)raw_pc);
+    }
 
     g_mutex_lock(&data_lock);
     existing_tmpl = find_template(pc);
@@ -1622,38 +1650,13 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     g_mutex_unlock(&data_lock);
 
     if (!existing_tmpl) {
-        uint64_t *insn_pcs = g_new0(uint64_t, n_insns);
-        qemu_plugin_insn_info *insn_info = g_new0(qemu_plugin_insn_info, n_insns);
-        uint8_t *insn_sizes = g_new0(uint8_t, n_insns);
-        uint8_t *insn_bytes = g_new0(uint8_t, n_insns * MAX_INSN_BYTES);
         const char *symbol_name = qemu_plugin_insn_symbol(first_insn);
-
-        for (size_t i = 0; i < n_insns; i++) {
-            struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
-            insn_pcs[i] = qemu_plugin_insn_vaddr(insn);
-            insn_sizes[i] = (uint8_t)MIN(qemu_plugin_insn_size(insn), MAX_INSN_BYTES);
-            qemu_plugin_insn_data(insn,
-                          &insn_bytes[i * MAX_INSN_BYTES],
-                          insn_sizes[i]);
-
-            if (cst_cap_arch >= 0) {
-                qemu_plugin_cap_decode(cst_cap_arch, cst_cap_mode,
-                                       &insn_bytes[i * MAX_INSN_BYTES],
-                                       insn_sizes[i],
-                                       insn_pcs[i],
-                                       &insn_info[i]);
-            }
-
-            qemu_plugin_register_vcpu_mem_cb(
-                insn, vcpu_mem_cb, QEMU_PLUGIN_CB_NO_REGS,
-                QEMU_PLUGIN_MEM_RW, (void *)(uintptr_t)insn_pcs[i]);
-        }
 
         g_mutex_lock(&data_lock);
         BBTemplate *new_tmpl = NULL;
         {
             new_tmpl = get_or_create_template(pc,
-                                              (uint32_t)n_insns,
+                                              canonical_n_insns,
                                               insn_pcs,
                                               insn_info,
                                               insn_sizes,
@@ -1670,39 +1673,38 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         g_mutex_unlock(&data_lock);
 
         if (enable_reg_data && new_tmpl && new_tmpl->insn_reg_names) {
-            RegSnapInsnRef *refs = g_new0(RegSnapInsnRef, n_insns);
+            RegSnapInsnRef *refs = g_new0(RegSnapInsnRef,
+                                          canonical_n_insns);
             new_tmpl->insn_snap_refs = refs;
-            for (size_t i = 0; i < n_insns; i++) {
+            for (uint32_t i = 0; i < canonical_n_insns; i++) {
                 refs[i].tb_tmpl = new_tmpl;
-                refs[i].insn_index = (uint32_t)i;
+                refs[i].insn_index = i;
+            }
+            for (size_t i = 0; i < raw_n_insns; i++) {
+                if (!canonical_first[i]) {
+                    continue;
+                }
                 struct qemu_plugin_insn *insn =
                     qemu_plugin_tb_get_insn(tb, i);
                 qemu_plugin_register_vcpu_insn_exec_cb(
                     insn, vcpu_insn_reg_snap_cb,
-                    QEMU_PLUGIN_CB_R_REGS, &refs[i]);
+                    QEMU_PLUGIN_CB_R_REGS,
+                    &refs[canonical_index[i]]);
             }
         }
-
-        g_free(insn_pcs);
-        g_free(insn_info);
-        g_free(insn_sizes);
-        g_free(insn_bytes);
     } else {
         /* Re-translation of known BB: re-arm dynamic callbacks. */
         RegSnapInsnRef *refs =
             (RegSnapInsnRef *)existing_tmpl->insn_snap_refs;
-        for (size_t i = 0; i < n_insns; i++) {
+        for (size_t i = 0; i < raw_n_insns; i++) {
             struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
-            uint64_t insn_pc = qemu_plugin_insn_vaddr(insn);
 
-            qemu_plugin_register_vcpu_mem_cb(
-                insn, vcpu_mem_cb, QEMU_PLUGIN_CB_NO_REGS,
-                QEMU_PLUGIN_MEM_RW, (void *)(uintptr_t)insn_pc);
-
-            if (enable_reg_data && refs) {
+            if (enable_reg_data && refs && canonical_first[i] &&
+                canonical_index[i] < existing_tmpl->n_insns) {
                 qemu_plugin_register_vcpu_insn_exec_cb(
                     insn, vcpu_insn_reg_snap_cb,
-                    QEMU_PLUGIN_CB_R_REGS, &refs[i]);
+                    QEMU_PLUGIN_CB_R_REGS,
+                    &refs[canonical_index[i]]);
             }
         }
     }
@@ -1713,7 +1715,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
     qemu_plugin_register_vcpu_tb_exec_cb(
         tb, vcpu_tb_exec, QEMU_PLUGIN_CB_RW_REGS,
-        (void *)(uintptr_t)n_insns);
+        (void *)(uintptr_t)canonical_n_insns);
 
     qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
         first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
@@ -1727,6 +1729,13 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
         first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
         sb_prev_bb_ends_in_branch, bb_ends_in_branch);
+
+    g_free(insn_pcs);
+    g_free(insn_info);
+    g_free(insn_sizes);
+    g_free(insn_bytes);
+    g_free(canonical_index);
+    g_free(canonical_first);
 }
 
 /* ========================= Flush callback ========================= */
@@ -1869,6 +1878,13 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     if (cp_mem_accesses) {
         g_array_unref(cp_mem_accesses);
     }
+    if (reg_read_buf) {
+        g_byte_array_unref(reg_read_buf);
+        reg_read_buf = NULL;
+    }
+    g_free(wide_reg_scratch.entries);
+    wide_reg_scratch.entries = NULL;
+    wide_reg_scratch_cap = 0;
     if (simpoints_list) {
         g_array_unref(simpoints_list);
     }
@@ -2071,7 +2087,6 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     g_mutex_init(&data_lock);
     g_mutex_init(&exec_lock);
     g_mutex_init(&unknown_warn_lock);
-    g_mutex_init(&vcpu_reg_handles_lock);
     tb_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
                                    NULL, bb_template_free);
     bb_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,

@@ -497,6 +497,17 @@ int qemu_plugin_read_register(struct qemu_plugin_register *reg, GByteArray *buf)
     return gdb_read_register(current_cpu, buf, GPOINTER_TO_INT(reg) - 1);
 }
 
+int qemu_plugin_read_register_by_id(int gdb_reg, GByteArray *buf)
+{
+    g_assert(current_cpu);
+
+    if (gdb_reg < 0) {
+        return -1;
+    }
+
+    return gdb_read_register(current_cpu, buf, gdb_reg);
+}
+
 int qemu_plugin_write_register(struct qemu_plugin_register *reg,
                                GByteArray *buf)
 {

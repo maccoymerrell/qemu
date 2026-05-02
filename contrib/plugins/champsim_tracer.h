@@ -17,6 +17,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 extern "C" {
 #include <qemu-plugin.h>
@@ -31,23 +32,27 @@ extern "C" {
  * compiled in the C tables TU can manipulate InsnFields directly. */
 
 /*
- * Binary format magic/version 1.7.
- * Bytes in file order: 'C','S','T',0x17 → u32 LE 0x17545343.
+ * Binary format magic/version 1.8.
+ * Bytes in file order: 'C','S','T',0x18 → u32 LE 0x18545343.
  * ASCII: C=0x43 S=0x53 T=0x54.  "CST" = ChampSimTracer.
  *
- * v1.7 replaces the per-entry dyn-patch / mem-data / reg-data
+ * v1.7 replaced the per-entry dyn-patch / mem-data / reg-data
  * sub-sections (and the variable-memop preamble) with a single
- * unified field-typed delta stream.  Each BB entry carries:
+ * unified field-typed delta stream.  v1.8 widens scalar dynamic
+ * values to 512 bits and adds raw overflow vectors for memops beyond
+ * the first 16 fixed slots.  Each BB entry carries:
  *
  *   n_records : ULEB
- *   { ins_pos_gap : ULEB,  field_id : u8,  delta : SLEB128 }*
+ *   { ins_pos_gap : ULEB,  field_id : u8,  payload }*
  *
  * Records are emitted in non-descending (ins_pos, field_id) order;
  * unchanged fields contribute zero bytes.  Field IDs identify what
  * changed about an instruction (memop count/addr/data, src/dst reg
  * value, opcode/encoding/immediate etc. — see the FID_* constants
- * below).  The delta is `(cur128 − baseline128) mod 2**128`,
- * written as one SLEB128 of any width.  Baseline = the most-recent
+ * below).  Normal scalar fields carry one signed LEB delta:
+ * `(cur512 - baseline512) mod 2**512`.  The EXTRA_* memop fields
+ * carry raw unsigned LEB vectors and have no persistent state.
+ * Baseline = the most-recent
  * correct-path observation for (template_id, ins_pos, field_id),
  * or the field's template-default on first appearance.  WP state
  * is forked from CP at chain start and discarded at chain end so
@@ -58,8 +63,8 @@ extern "C" {
  * sparse fields populated from QEMU memory callbacks; template count
  * defaults are zero.
  */
-#define CST_MAGIC          0x17545343u
-#define CST_TRAILER_MAGIC  0x17545343FFFFFFFFull
+#define CST_MAGIC          0x18545343u
+#define CST_TRAILER_MAGIC  0x18545343FFFFFFFFull
 #define CST_TRAILER_SIZE   64
 
 /* Body entry tags (1 byte) */
@@ -95,18 +100,17 @@ extern "C" {
 #define CST_FLAG_RESERVED_2    (1 << 2)
 /* bits 3..7 reserved */
 
-/* ===== Field-ID space (v1.7 unified delta stream) =====
+/* ===== Field-ID space (v1.8 unified delta stream) =====
  *
  * Every per-entry observation (memop addresses, memop data, register
- * values, instruction-encoding mutations) is encoded as one
- * (ins_pos, field_id, delta) record.  Slotted families occupy
+ * values, instruction-encoding mutations) is encoded as one record.
+ * Slotted scalar families occupy
  * contiguous 16-wide ranges to leave room for SVE / RVV / wide-AVX
- * memop counts.  Adding a new dynamic field is a one-line addition
- * to FieldDescriptor table in champsim_tracer_output.cc; the wire
- * format does not need to change as long as the new field gets a
- * fresh FID_* constant from the reserved space below.
+ * memop counts.  Memops beyond those 16 slots are emitted through
+ * EXTRA_* raw vector fields.
  */
 #define CST_FID_SLOT_COUNT       16    /* slots per slotted family */
+#define CST_MAX_WIDE_BYTES       64    /* 512-bit data/reg scalar cap */
 
 #define CST_FID_N_LOADS         0x00  /* current valid load slots */
 
@@ -117,7 +121,11 @@ extern "C" {
 #define CST_FID_SRC_REG_BASE     0x41  /* gated by CST_FLAG_REG_DATA  */
 /* 0x51..0x60 reserved for post-exec destination register values. */
 #define CST_FID_N_STORES        0x61  /* current valid store slots */
-/* 0x62..0x6F reserved for future slotted memop metadata             */
+#define CST_FID_EXTRA_LOAD_ADDR  0x62  /* raw ULEB vector, slots 16+ */
+#define CST_FID_EXTRA_STORE_ADDR 0x63
+#define CST_FID_EXTRA_LOAD_DATA  0x64  /* raw ULEB vector, slots 16+ */
+#define CST_FID_EXTRA_STORE_DATA 0x65
+/* 0x66..0x6F reserved for future slotted memop metadata             */
 
 /* Insn-encoding-mutable fields. Baseline = template's static value,
  * so unchanged-from-template fields cost zero record bytes. */
@@ -129,36 +137,76 @@ extern "C" {
 #define CST_FID_INSN_IMMEDIATE   0x75  /* signed immediate                    */
 #define CST_FID_INSN_SIZE        0x76  /* u8 insn_size                        */
 /* 0x77..0xFE reserved for future fields                                       */
-#define CST_FID_EXTENDED         0xFF  /* reserved escape; not used in v1.7   */
+#define CST_FID_EXTENDED         0xFF  /* reserved escape; not used in v1.8   */
 
 /* ===== Types ===== */
 
 /* InsnFields is defined in champsim_tracer_mnemonics.h. */
 
 /*
- * Per-register snapshot, captured immediately before the issuing
- * instruction executes.  `lo` carries the low 8 bytes (LE); `hi`
- * carries the high 8 bytes for registers larger than 8 bytes and is
- * 0 otherwise.  Registers the plugin could not resolve to a runtime
- * handle on this target are emitted as lo=hi=0 (and do not advance
- * the per-reg delta state).
+ * Little-endian unsigned scalar used for dynamic data/register values.
+ * The wire format deltas this modulo 2**512 and emits the signed LEB
+ * two's-complement result; small values still take the usual short LEB.
  */
 typedef struct {
-    uint64_t lo;
-    uint64_t hi;
+    uint64_t limb[CST_MAX_WIDE_BYTES / sizeof(uint64_t)];
+} CSTWideValue;
+
+static inline void cst_wide_zero(CSTWideValue *v)
+{
+    memset(v, 0, sizeof(*v));
+}
+
+static inline CSTWideValue cst_wide_from_u64(uint64_t x)
+{
+    CSTWideValue v;
+    cst_wide_zero(&v);
+    v.limb[0] = x;
+    return v;
+}
+
+static inline CSTWideValue cst_wide_from_i64(int64_t x)
+{
+    CSTWideValue v;
+    uint64_t fill = x < 0 ? UINT64_MAX : 0;
+    for (size_t i = 0; i < G_N_ELEMENTS(v.limb); i++) {
+        v.limb[i] = fill;
+    }
+    v.limb[0] = (uint64_t)x;
+    return v;
+}
+
+static inline void cst_wide_from_le_bytes(CSTWideValue *out,
+                                          const uint8_t *bytes,
+                                          size_t len)
+{
+    cst_wide_zero(out);
+    if (!bytes || len == 0) {
+        return;
+    }
+    if (len > CST_MAX_WIDE_BYTES) {
+        len = CST_MAX_WIDE_BYTES;
+    }
+    memcpy(out->limb, bytes, len);
+}
+
+/*
+ * Per-register snapshot, captured immediately before the issuing
+ * instruction executes.  Registers the plugin could not resolve to a
+ * runtime handle on this target are emitted as zero.
+ */
+typedef struct {
+    CSTWideValue value;
 } RegSnap;
 
 /*
- * Per-insn parallel name table for InsnFields.src_regs[] and
- * InsnFields.dst_regs[].  Populated by the decoder only when
- * enable_reg_data is true at translation time.  The current dynamic
- * reg-data path consumes source names only; destination names are kept
- * alongside template destination identities for future post-exec value
- * capture.  Empty source names emit zero snaps.
+ * Per-insn QEMU/GDB register ids for InsnFields.src_regs[] and
+ * InsnFields.dst_regs[].  Values are one-based; 0 means the corresponding
+ * generic register has no single QEMU register that can be read directly.
  */
 typedef struct {
-    char src[MAX_SRC_REGS][16];
-    char dst[MAX_DST_REGS][16];
+    uint16_t src_qemu_reg[MAX_SRC_REGS];
+    uint16_t dst_qemu_reg[MAX_DST_REGS];
 } InsnRegNames;
 
 typedef struct {
@@ -217,14 +265,13 @@ typedef struct {
     uint16_t insn_index;   /* Index in owning template's insn array */
     uint64_t value;        /* vaddr of the access                   */
     uint8_t  data_size;
-    uint64_t data_lo;
-    uint64_t data_hi;
+    CSTWideValue data;
 } DynParam;
 
 typedef struct {
     uint32_t template_id;       /* TRUE BB id (start_pc → first branch) */
     uint64_t start_pc;
-    GArray *dyn_params;         /* dyn_params for THIS BB only */
+    GArray *dyn_params;         /* dyn_params for THIS BB only; NULL if empty */
     uint32_t n_insns_executed;  /* BB length when complete; partial on fault */
     bool fault;
     bool translation_unavailable;
@@ -265,22 +312,25 @@ typedef struct {
     uint64_t insn_count;
 } VCPUScoreBoard;
 
+enum { BRANCH_TARGET_HISTORY = 16 };
+
+typedef struct {
+    uint64_t target;
+    uint32_t count;
+    uint32_t last_seen;
+    bool valid;
+} BranchTargetHistoryEntry;
+
 typedef struct {
     uint64_t pc;
     uint64_t fall_through;
-    /* Two-entry LRU of distinct taken targets observed at this branch
-     * PC.  `taken_target` is the most-recently-taken target;
-     * `prev_taken_target` is the most-recently-taken target that
-     * differed from it (or 0 if only one target has ever been seen).
-     * `has_taken_target` gates `taken_target`; `has_prev_taken_target`
-     * gates `prev_taken_target`.  Used by indirect-branch wrong-path
-     * derivation: when CP fell through (rare conditional indirect) or
-     * when CP took an indirect to a known target, WP picks the *other*
-     * LRU slot if available, otherwise falls through. */
-    uint64_t taken_target;
-    uint64_t prev_taken_target;
-    bool has_taken_target;
-    bool has_prev_taken_target;
+    /* Counted distinct taken-target history.  Indirect wrong-path
+     * selection treats one observed target as monomorphic and uses
+     * fall-through; with multiple observed targets it chooses the most
+     * frequent target that is not the CP target for this execution. */
+    BranchTargetHistoryEntry targets[BRANCH_TARGET_HISTORY];
+    uint8_t n_targets;
+    uint32_t target_tick;
 } BranchRecord;
 
 typedef struct {
@@ -288,8 +338,7 @@ typedef struct {
     uint64_t mem_vaddr;
     bool is_store;
     uint8_t data_size;
-    uint64_t data_lo;
-    uint64_t data_hi;
+    CSTWideValue data;
 } WPMemAccess;
 
 typedef struct BodyStreamState BodyStreamState;
@@ -427,38 +476,35 @@ BBTemplate *commit_true_bb(uint64_t start_pc,
 ChainTemplate *commit_chain(const uint32_t *bb_ids, uint32_t n_bbs);
 
 /*
- * Look up a register handle by Capstone-style register name
- * (case-insensitive) for @cpu_index.  Returns NULL when @name is
- * empty or not exposed by qemu_plugin_get_registers() on this
- * target.  Only meaningful when enable_reg_data is true.
- */
-struct qemu_plugin_register *
-lookup_reg_handle(unsigned int cpu_index, const char *cap_reg_name);
-
-/*
- * Wide regfile snapshot: opaque GHashTable<lowercase reg name -> RegSnap*>.
- * Used by the wrong-path loop to capture pre-fragment register state
- * (since CF_MEMI_ONLY in spec mode suppresses per-insn exec callbacks).
+ * Wide regfile snapshot: opaque thread-local scratch keyed by the QEMU/GDB
+ * register ids present in the active Capstone register table.  Used by the
+ * wrong-path loop to capture pre-fragment register state (since CF_MEMI_ONLY
+ * in spec mode suppresses per-insn exec callbacks).
  */
 typedef struct _WideRegSnap WideRegSnap;
 
 /*
- * Capture a snapshot of every register exposed by the vCPU's
- * reg-handle map.  Returns NULL when reg-data is disabled or the
- * map is unavailable.  Caller must free with wide_reg_snap_free().
+ * Capture a snapshot of every readable register referenced by the active
+ * register classification table.  Returns NULL when reg-data is disabled or
+ * no readable registers exist.  The returned pointer is thread-local scratch
+ * and remains valid until the next wide_reg_snap_capture() on the same thread.
  */
 WideRegSnap *wide_reg_snap_capture(unsigned int cpu_index);
 void         wide_reg_snap_free(WideRegSnap *w);
 
 /*
  * Append per-insn source RegSnap records sourced from a wide snapshot to
- * @out_snaps, using @tmpl->insn_reg_names[insn_idx].src as the lookup
- * keys.  Missing names yield zero snaps.  No-op when reg-data is disabled.
+ * @out_snaps, using @tmpl->insn_reg_names[insn_idx].src_qemu_reg as the lookup
+ * keys.  Missing ids yield zero snaps.  No-op when reg-data is disabled.
  */
 void wp_capture_insn_snaps(const WideRegSnap *wide,
                            const BBTemplate *tmpl,
                            uint32_t insn_idx,
                            GArray *out_snaps);
+void wp_capture_insn_snaps_live(unsigned int cpu_index,
+                                const BBTemplate *tmpl,
+                                uint32_t insn_idx,
+                                GArray *out_snaps);
 
 /* Defined in champsim_tracer_wp.cc */
 GArray *simulate_wrong_path_ext(uint64_t branch_pc,

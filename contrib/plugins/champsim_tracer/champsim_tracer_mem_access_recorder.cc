@@ -129,9 +129,9 @@ void MemAccessRecorder::drain_cp_into_dyn_params(GArray *dyn_params,
      * memops of a single entry.  Walk the template's insn_pcs[] in
      * lockstep to assign insn_index.
      */
-    guint idx = 0;
-    guint n_insns = bb_tmpl ? bb_tmpl->n_insns : 0;
-    for (guint m = 0; m < tls_cp_mem_accesses->len; m++) {
+    unsigned int idx = 0;
+    unsigned int n_insns = bb_tmpl ? bb_tmpl->n_insns : 0;
+    for (unsigned int m = 0; m < tls_cp_mem_accesses->len; m++) {
         const WPMemAccess *acc = &g_array_index(tls_cp_mem_accesses,
                                                 WPMemAccess, m);
         while (idx < n_insns && bb_tmpl->insn_pcs[idx] != acc->insn_pc) {

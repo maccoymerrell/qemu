@@ -65,8 +65,8 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     (void)branch_pc;
     (void)correct_target;
 
-    guint initial_insn_cap = max_wrong_path_depth > 16
-        ? (guint)max_wrong_path_depth : 16;
+    unsigned int initial_insn_cap = max_wrong_path_depth > 16
+        ? (unsigned int)max_wrong_path_depth : 16;
     GArray *wp_chain = g_array_sized_new(false, false, sizeof(WPBBEntry),
                                          initial_insn_cap);
     std::unordered_set<uint64_t> poisoned_targets;
@@ -168,7 +168,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     while (sim_insns < (uint64_t)max_wrong_path_depth ||
            !bb_pcs.empty()) {
         uint64_t pre_pc = qemu_plugin_get_pc();
-        guint mem_start_idx = g_wp_state.mem_accesses->len;
+        unsigned int mem_start_idx = g_wp_state.mem_accesses->len;
         BBTemplate *tmpl = nullptr;
         bool tb_ok;
 
@@ -307,7 +307,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
 
         /* Attribute mem accesses to insns within the just-appended
          * fragment by matching the recorded insn_pc. */
-        for (guint m = mem_start_idx; m < g_wp_state.mem_accesses->len; m++) {
+        for (unsigned int m = mem_start_idx; m < g_wp_state.mem_accesses->len; m++) {
             WPMemAccess *acc = &g_array_index(g_wp_state.mem_accesses,
                                               WPMemAccess, m);
             uint16_t insn_idx = (uint16_t)bb_idx_base;

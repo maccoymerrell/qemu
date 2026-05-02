@@ -28,7 +28,7 @@ BBTemplate *BBChainAssembler::finalize()
         return nullptr;
     }
     return g_bb_template_cache.get_or_create_bb_template(
-        entry_pc_, fragments_.data(), (guint)fragments_.size());
+        entry_pc_, fragments_.data(), (unsigned int)fragments_.size());
 }
 
 void BBChainAssembler::reset()

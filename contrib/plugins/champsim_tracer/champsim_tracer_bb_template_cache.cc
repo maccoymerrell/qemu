@@ -32,7 +32,7 @@ BBTemplateCache::~BBTemplateCache()
     }
 }
 
-void BBTemplateCache::destroy_template(gpointer data)
+void BBTemplateCache::destroy_template(void * data)
 {
     BBTemplate *tmpl = (BBTemplate *)data;
     g_free(tmpl->insn_fields);
@@ -68,7 +68,7 @@ size_t BBTemplateCache::bb_count() const
 void BBTemplateCache::for_each_bb(const std::function<void(BBTemplate &)> &fn)
 {
     GHashTableIter iter;
-    gpointer value;
+    void * value;
     g_hash_table_iter_init(&iter, bb_map_);
     while (g_hash_table_iter_next(&iter, nullptr, &value)) {
         fn(*(BBTemplate *)value);
@@ -158,10 +158,10 @@ BBTemplate *BBTemplateCache::commit_true_bb(uint64_t start_pc,
 BBTemplate *BBTemplateCache::get_or_create_bb_template(
     uint64_t entry_pc,
     BBTemplate *const *fragments,
-    guint n_fragments)
+    unsigned int n_fragments)
 {
     uint32_t max_insns = 0;
-    for (guint i = 0; i < n_fragments; i++) {
+    for (unsigned int i = 0; i < n_fragments; i++) {
         max_insns += fragments[i]->n_insns;
     }
     if (max_insns == 0) {
@@ -181,7 +181,7 @@ BBTemplate *BBTemplateCache::get_or_create_bb_template(
     uint64_t final_ft = 0;
 
     uint32_t off = 0;
-    for (guint f = 0; f < n_fragments; f++) {
+    for (unsigned int f = 0; f < n_fragments; f++) {
         BBTemplate *frag = fragments[f];
         if (f == 0) {
             symbol_name = frag->symbol_name;

@@ -18,7 +18,7 @@ bool key_valid(const QemuRegKey *key)
     return key && key->name;
 }
 
-guint key_hash(gconstpointer data)
+unsigned int key_hash(const void * data)
 {
     const QemuRegKey *key = (const QemuRegKey *)data;
     const char *feature = key->feature ? key->feature : "";
@@ -26,7 +26,8 @@ guint key_hash(gconstpointer data)
     return g_str_hash(feature) ^ (g_str_hash(name) << 1);
 }
 
-gboolean key_equal(gconstpointer lhs, gconstpointer rhs)
+/* GEqualFunc returns int (gboolean). */
+int key_equal(const void *lhs, const void *rhs)
 {
     const QemuRegKey *a = (const QemuRegKey *)lhs;
     const QemuRegKey *b = (const QemuRegKey *)rhs;
@@ -34,7 +35,7 @@ gboolean key_equal(gconstpointer lhs, gconstpointer rhs)
            cst_str_eq(a->name, b->name);
 }
 
-void key_free(gpointer data)
+void key_free(void * data)
 {
     QemuRegKey *key = (QemuRegKey *)data;
     if (!key) {
@@ -87,7 +88,7 @@ void RegHandleCache::populate_cache(VCPUCache &cache)
     RegAliasInserterFn alias_inserter =
         isa_properties[trace_isa].reg_alias_inserter;
     g_autoptr(GArray) regs = qemu_plugin_get_registers();
-    for (guint i = 0; i < regs->len; i++) {
+    for (unsigned int i = 0; i < regs->len; i++) {
         const qemu_plugin_reg_descriptor *desc =
             &g_array_index(regs, qemu_plugin_reg_descriptor, i);
         cache_insert(cache.handles, desc->feature, desc->name, desc->handle);

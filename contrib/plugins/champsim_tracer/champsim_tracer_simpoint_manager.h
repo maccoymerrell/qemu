@@ -57,7 +57,7 @@ public:
 
 private:
     GArray  *entries_ = nullptr;
-    guint    current_idx_ = 0;
+    unsigned int    current_idx_ = 0;
     uint64_t interval_insns_ = 0;
 };
 

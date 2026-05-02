@@ -106,7 +106,7 @@ void RegSnapCollector::read_into_snap(unsigned int cpu_index,
 
 void RegSnapCollector::append(GArray *arr, const RegSnap *snap)
 {
-    guint pos = arr->len;
+    unsigned int pos = arr->len;
     g_array_set_size(arr, pos + 1);
     g_array_index(arr, RegSnap, pos) = *snap;
 }

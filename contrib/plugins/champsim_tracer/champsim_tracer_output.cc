@@ -65,7 +65,7 @@ static inline void bw_raw(BitWriter *bw, const uint8_t *buf, size_t len)
     } else if (bw->f) {
         fwrite(buf, 1, len, bw->f);
     } else {
-        g_byte_array_append(bw->buf, buf, (guint)len);
+        g_byte_array_append(bw->buf, buf, (unsigned int)len);
     }
     bw->total_bytes += len;
 }
@@ -734,7 +734,7 @@ static uint8_t field_state_slot_index(uint8_t field_id)
     return FIELD_STATE_SLOT_INVALID;
 }
 
-static void field_state_block_free(gpointer data)
+static void field_state_block_free(void * data)
 {
     FieldStateBlock *block = (FieldStateBlock *)data;
     if (!block) {
@@ -1086,7 +1086,7 @@ static const FieldDescriptor field_descriptors[] = {
 
 /* Sort dyn_params so each insn's loads precede its stores, matching
  * the slot indexing used by find_memop_slot(). */
-static gint dyn_param_cmp(gconstpointer aa, gconstpointer bb)
+static int dyn_param_cmp(const void * aa, const void * bb)
 {
     const DynParam *a = (const DynParam *)aa;
     const DynParam *b = (const DynParam *)bb;
@@ -1271,8 +1271,8 @@ typedef struct StageRec {
     U512 delta;
 } StageRec;
 
-static void stage_rec_append(StageRec **stage, guint *stage_len,
-                             guint *stage_cap, StageRec rec)
+static void stage_rec_append(StageRec **stage, unsigned int *stage_len,
+                             unsigned int *stage_cap, StageRec rec)
 {
     if (*stage_len == *stage_cap) {
         *stage_cap *= 2;
@@ -1282,8 +1282,8 @@ static void stage_rec_append(StageRec **stage, guint *stage_len,
     (*stage)[(*stage_len)++] = rec;
 }
 
-static void stage_extra_memop_vectors(StageRec **stage, guint *stage_len,
-                                      guint *stage_cap, const EntryView *ev,
+static void stage_extra_memop_vectors(StageRec **stage, unsigned int *stage_len,
+                                      unsigned int *stage_cap, const EntryView *ev,
                                       uint32_t i, uint8_t header_flags)
 {
     if (!ev->actual_n_loads || !ev->actual_n_stores) {
@@ -1416,8 +1416,8 @@ static void emit_field_delta_section(BitWriter *main_bw,
 
     /* Buffer records into a small staging vec so the ULEB record count can
      * precede the payload without a second descriptor walk. */
-    guint stage_len = 0;
-    guint stage_cap = 16;
+    unsigned int stage_len = 0;
+    unsigned int stage_cap = 16;
     g_autofree StageRec *stage = g_new(StageRec, stage_cap);
 
     uint32_t prev_pos = 0;
@@ -1467,7 +1467,7 @@ static void emit_field_delta_section(BitWriter *main_bw,
 
     /* Build payload in rec_bw, then emit as length-prefixed section. */
     bw_write_uleb128(&rec_bw, stage_len);
-    for (guint r = 0; r < stage_len; r++) {
+    for (unsigned int r = 0; r < stage_len; r++) {
         StageRec *s = &stage[r];
         uint64_t gap = (uint64_t)(s->pos - prev_pos);
         bw_write_uleb128(&rec_bw, gap);
@@ -1498,7 +1498,7 @@ static void field_state_reset_wp(FieldStateTable *wp_state)
     }
 
     GHashTableIter iter;
-    gpointer value;
+    void * value;
     g_hash_table_iter_init(&iter, wp_state->blocks);
     while (g_hash_table_iter_next(&iter, nullptr, &value)) {
         FieldStateBlock *block = (FieldStateBlock *)value;

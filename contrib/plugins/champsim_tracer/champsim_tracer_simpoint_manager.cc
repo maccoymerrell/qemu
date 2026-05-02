@@ -14,7 +14,7 @@ SimPointManager g_simpoints;
 
 namespace {
 
-gint compare_by_start_insn(gconstpointer a, gconstpointer b)
+int compare_by_start_insn(const void * a, const void * b)
 {
     const SimPointEntry *sa = (const SimPointEntry *)a;
     const SimPointEntry *sb = (const SimPointEntry *)b;
@@ -42,7 +42,7 @@ void load_weights(const char *path, GArray *entries)
         double weight;
         int cluster;
         if (sscanf(line, "%lf %d", &weight, &cluster) == 2) {
-            for (guint i = 0; i < entries->len; i++) {
+            for (unsigned int i = 0; i < entries->len; i++) {
                 SimPointEntry *sp = &g_array_index(entries, SimPointEntry, i);
                 if (sp->cluster_id == cluster) {
                     sp->weight = weight;

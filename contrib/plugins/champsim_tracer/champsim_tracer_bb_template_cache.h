@@ -61,7 +61,7 @@ public:
                                uint64_t fall_through_pc);
     BBTemplate *get_or_create_bb_template(uint64_t entry_pc,
                                           BBTemplate *const *fragments,
-                                          guint n_fragments);
+                                          unsigned int n_fragments);
 
     size_t tb_count() const;
     size_t bb_count() const;
@@ -77,7 +77,7 @@ public:
     static int template_branch_index(const BBTemplate *tmpl);
 
 private:
-    static void destroy_template(gpointer data);
+    static void destroy_template(void * data);
 
     GHashTable *tb_map_;
     GHashTable *bb_map_;

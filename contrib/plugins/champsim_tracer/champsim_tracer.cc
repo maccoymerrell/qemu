@@ -149,7 +149,7 @@ static void body_entry_clear(BodyEntry *entry)
         g_array_unref(entry->reg_snaps);
     }
     if (entry->wp_entries) {
-        for (guint i = 0; i < entry->wp_entries->len; i++) {
+        for (unsigned int i = 0; i < entry->wp_entries->len; i++) {
             WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, i);
             if (wp->dyn_params) {
                 g_array_unref(wp->dyn_params);

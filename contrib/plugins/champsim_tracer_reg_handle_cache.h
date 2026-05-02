@@ -1,0 +1,64 @@
+/*
+ * Wrong-Path Tracing Plugin — per-vCPU register-handle cache.
+ *
+ * QEMU exposes register descriptors via qemu_plugin_get_registers(),
+ * which returns one descriptor per readable architectural register on
+ * the calling vCPU.  Reading a register through the plugin API takes a
+ * descriptor handle, so on every reg-data capture the plugin needs to
+ * map a (feature, name) key to the right handle.
+ *
+ * RegHandleCache caches that lookup, both per-vCPU (each vCPU has its
+ * own handle space) and per-thread (the most recently used per-vCPU
+ * cache is held in thread_local storage so the common case avoids the
+ * lock).  Cache entries are populated lazily on first use.
+ *
+ * AArch64 SVE z-registers are aliased to FPU v-registers in the cache,
+ * because Capstone reports v-names but QEMU may register only the SVE
+ * descriptors.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#ifndef CHAMPSIM_TRACER_REG_HANDLE_CACHE_H
+#define CHAMPSIM_TRACER_REG_HANDLE_CACHE_H
+
+#include "champsim_tracer.h"
+
+class RegHandleCache {
+public:
+    RegHandleCache();
+    ~RegHandleCache();
+
+    RegHandleCache(const RegHandleCache &) = delete;
+    RegHandleCache &operator=(const RegHandleCache &) = delete;
+
+    /* Look up the register handle for @key on @cpu_index.  Returns
+     * nullptr if @key is invalid or QEMU does not expose the named
+     * register.  Initializes the per-vCPU cache on first call. */
+    struct qemu_plugin_register *lookup(unsigned int cpu_index,
+                                        const QemuRegKey *key);
+
+    /* Pre-warm the per-vCPU cache for @cpu_index.  Idempotent. */
+    void ensure_initialized(unsigned int cpu_index);
+
+private:
+    struct VCPUCache {
+        GHashTable *handles;
+    };
+
+    /* Per-vCPU caches, indexed by cpu_index. */
+    GPtrArray *vcpu_caches_;
+    GMutex     lock_;
+
+    /* Hot-path TLS shortcut for the most-recent (cpu_index, cache) pair. */
+    static thread_local VCPUCache    *tls_cache_;
+    static thread_local unsigned int  tls_cache_cpu_index_;
+
+    VCPUCache *get_or_create(unsigned int cpu_index);
+    static VCPUCache *make_cache();
+    static void destroy_cache(gpointer data);
+};
+
+extern RegHandleCache g_reg_handle_cache;
+
+#endif /* CHAMPSIM_TRACER_REG_HANDLE_CACHE_H */

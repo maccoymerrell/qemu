@@ -28,6 +28,7 @@
 #include "champsim_tracer.h"
 #include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_branch_history.h"
+#include "champsim_tracer_reg_handle_cache.h"
 #include "champsim_tracer_writer.h"
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
@@ -101,191 +102,8 @@ unsigned active_insn_table_size;
 const RegClassification *active_reg_table;
 unsigned active_reg_table_size;
 
-typedef struct {
-    GHashTable *handles;
-} VCPURegHandles;
-
-static GPtrArray *vcpu_reg_handles;
-static GMutex vcpu_reg_handles_lock;
-static __thread VCPURegHandles *tls_reg_handles;
-static __thread unsigned int tls_reg_handles_cpu_index = (unsigned int)-1;
-
 static GHashTable *option_ht;
 uint64_t stat_unknown_insn_warnings;
-
-static bool qemu_reg_key_valid(const QemuRegKey *key)
-{
-    return key && key->name;
-}
-
-static guint qemu_reg_key_hash(gconstpointer data)
-{
-    const QemuRegKey *key = (const QemuRegKey *)data;
-    const char *feature = key->feature ? key->feature : "";
-    const char *name = key->name ? key->name : "";
-
-    return g_str_hash(feature) ^ (g_str_hash(name) << 1);
-}
-
-static gboolean qemu_reg_key_equal(gconstpointer lhs, gconstpointer rhs)
-{
-    const QemuRegKey *a = (const QemuRegKey *)lhs;
-    const QemuRegKey *b = (const QemuRegKey *)rhs;
-
-    return g_strcmp0(a->feature, b->feature) == 0 &&
-           g_strcmp0(a->name, b->name) == 0;
-}
-
-static void qemu_reg_key_free(gpointer data)
-{
-    QemuRegKey *key = (QemuRegKey *)data;
-
-    if (!key) {
-        return;
-    }
-    g_free((char *)key->feature);
-    g_free((char *)key->name);
-    g_free(key);
-}
-
-static void vcpu_reg_handles_free(gpointer data)
-{
-    VCPURegHandles *cache = (VCPURegHandles *)data;
-
-    if (!cache) {
-        return;
-    }
-    g_hash_table_destroy(cache->handles);
-    g_free(cache);
-}
-
-static void vcpu_reg_handles_insert(VCPURegHandles *cache,
-                                    const char *feature,
-                                    const char *name,
-                                    struct qemu_plugin_register *handle)
-{
-    QemuRegKey *key;
-
-    if (!cache || !name || !handle) {
-        return;
-    }
-
-    key = g_new(QemuRegKey, 1);
-    key->feature = g_strdup(feature);
-    key->name = g_strdup(name);
-    g_hash_table_insert(cache->handles, key, handle);
-}
-
-static bool parse_numbered_reg(const char *name, char prefix,
-                               unsigned int limit, unsigned int *num)
-{
-    char *end = NULL;
-    guint64 value;
-
-    if (!name || name[0] != prefix || !g_ascii_isdigit(name[1])) {
-        return false;
-    }
-
-    value = g_ascii_strtoull(name + 1, &end, 10);
-    if (!end || *end || value >= limit) {
-        return false;
-    }
-
-    *num = (unsigned int)value;
-    return true;
-}
-
-static void vcpu_reg_handles_insert_aarch64_aliases(
-    VCPURegHandles *cache,
-    const qemu_plugin_reg_descriptor *desc)
-{
-    static const char fpu_feature[] = "org.gnu.gdb.aarch64.fpu";
-    static const char sve_feature[] = "org.gnu.gdb.aarch64.sve";
-    unsigned int num;
-
-    if (trace_isa != TRACE_ISA_AARCH64 ||
-        g_strcmp0(desc->feature, sve_feature) != 0) {
-        return;
-    }
-
-    if (parse_numbered_reg(desc->name, 'z', 32, &num)) {
-        char alias[8];
-
-        g_snprintf(alias, sizeof(alias), "v%u", num);
-        vcpu_reg_handles_insert(cache, fpu_feature, alias, desc->handle);
-    } else if (g_strcmp0(desc->name, "fpsr") == 0 ||
-               g_strcmp0(desc->name, "fpcr") == 0) {
-        vcpu_reg_handles_insert(cache, fpu_feature, desc->name,
-                                desc->handle);
-    }
-}
-
-static VCPURegHandles *vcpu_reg_handles_new(void)
-{
-    VCPURegHandles *cache = g_new0(VCPURegHandles, 1);
-    g_autoptr(GArray) regs = qemu_plugin_get_registers();
-
-    cache->handles = g_hash_table_new_full(qemu_reg_key_hash,
-                                           qemu_reg_key_equal,
-                                           qemu_reg_key_free,
-                                           NULL);
-
-    for (guint i = 0; i < regs->len; i++) {
-        const qemu_plugin_reg_descriptor *desc =
-            &g_array_index(regs, qemu_plugin_reg_descriptor, i);
-
-        vcpu_reg_handles_insert(cache, desc->feature, desc->name,
-                                desc->handle);
-        vcpu_reg_handles_insert_aarch64_aliases(cache, desc);
-    }
-
-    return cache;
-}
-
-static VCPURegHandles *vcpu_reg_handles_for_cpu(unsigned int cpu_index)
-{
-    VCPURegHandles *cache = NULL;
-
-    if (tls_reg_handles && tls_reg_handles_cpu_index == cpu_index) {
-        return tls_reg_handles;
-    }
-
-    g_mutex_lock(&vcpu_reg_handles_lock);
-    if (!vcpu_reg_handles) {
-        vcpu_reg_handles = g_ptr_array_new_with_free_func(vcpu_reg_handles_free);
-    }
-    if (cpu_index < vcpu_reg_handles->len) {
-        cache = (VCPURegHandles *)g_ptr_array_index(vcpu_reg_handles,
-                                                    cpu_index);
-    }
-    if (!cache) {
-        cache = vcpu_reg_handles_new();
-        while (vcpu_reg_handles->len <= cpu_index) {
-            g_ptr_array_add(vcpu_reg_handles, NULL);
-        }
-        g_ptr_array_index(vcpu_reg_handles, cpu_index) = cache;
-    }
-    g_mutex_unlock(&vcpu_reg_handles_lock);
-
-    tls_reg_handles = cache;
-    tls_reg_handles_cpu_index = cpu_index;
-    return cache;
-}
-
-static struct qemu_plugin_register *lookup_qemu_reg_handle(
-    unsigned int cpu_index,
-    const QemuRegKey *key)
-{
-    VCPURegHandles *cache;
-
-    if (!qemu_reg_key_valid(key)) {
-        return NULL;
-    }
-
-    cache = vcpu_reg_handles_for_cpu(cpu_index);
-    return (struct qemu_plugin_register *)g_hash_table_lookup(cache->handles,
-                                                             key);
-}
 
 static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
 {
@@ -305,7 +123,7 @@ static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
     }
 
     if (enable_reg_data) {
-        vcpu_reg_handles_for_cpu(cpu_index);
+        g_reg_handle_cache.ensure_initialized(cpu_index);
     }
 }
 
@@ -488,14 +306,24 @@ static GByteArray *reg_read_scratch(void)
     return reg_read_buf;
 }
 
+static inline bool qemu_reg_key_valid(const QemuRegKey *key)
+{
+    return key && key->name;
+}
+
+static inline bool qemu_reg_key_equal(const QemuRegKey *a, const QemuRegKey *b)
+{
+    return g_strcmp0(a->feature, b->feature) == 0 &&
+           g_strcmp0(a->name, b->name) == 0;
+}
+
 static void read_qemu_reg_into_snap(unsigned int cpu_index,
                                     const QemuRegKey *qemu_reg,
                                     RegSnap *out)
 {
-    struct qemu_plugin_register *handle;
-
     cst_wide_zero(&out->value);
-    handle = lookup_qemu_reg_handle(cpu_index, qemu_reg);
+    struct qemu_plugin_register *handle =
+        g_reg_handle_cache.lookup(cpu_index, qemu_reg);
     if (!handle) {
         return;
     }
@@ -512,13 +340,6 @@ static inline void reg_snap_array_append(GArray *arr, const RegSnap *snap)
     guint pos = arr->len;
     g_array_set_size(arr, pos + 1);
     g_array_index(arr, RegSnap, pos) = *snap;
-}
-
-static void read_reg_into_snap(unsigned int cpu_index,
-                               const QemuRegKey *qemu_reg,
-                               RegSnap *out)
-{
-    read_qemu_reg_into_snap(cpu_index, qemu_reg, out);
 }
 
 /*
@@ -554,7 +375,7 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
     }
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         RegSnap s;
-        read_reg_into_snap(cpu_index, &names->src_qemu_reg_keys[i], &s);
+        read_qemu_reg_into_snap(cpu_index, &names->src_qemu_reg_keys[i], &s);
         reg_snap_array_append(pending_reg_snaps, &s);
     }
 }
@@ -682,7 +503,7 @@ void wp_capture_insn_snaps_live(unsigned int cpu_index,
     const InsnRegNames *names = &tmpl->insn_reg_names[insn_idx];
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         RegSnap s;
-        read_reg_into_snap(cpu_index, &names->src_qemu_reg_keys[i], &s);
+        read_qemu_reg_into_snap(cpu_index, &names->src_qemu_reg_keys[i], &s);
         reg_snap_array_append(out_snaps, &s);
     }
 }
@@ -1613,10 +1434,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     if (reg_read_buf) {
         g_byte_array_unref(reg_read_buf);
         reg_read_buf = NULL;
-    }
-    if (vcpu_reg_handles) {
-        g_ptr_array_unref(vcpu_reg_handles);
-        vcpu_reg_handles = NULL;
     }
     g_free(wide_reg_scratch.entries);
     wide_reg_scratch.entries = NULL;

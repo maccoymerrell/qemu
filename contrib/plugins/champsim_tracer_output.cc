@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "champsim_tracer.h"
+#include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_writer.h"
 
 /* ========================= BitWriter primitives ========================= */
@@ -467,14 +468,10 @@ struct BodyStreamState {
  */
 static void write_bin_templates(BitWriter *bw)
 {
-    GHashTableIter iter;
-    gpointer value;
+    bw_write_uleb128(bw, g_bb_template_cache.bb_count());
 
-    bw_write_uleb128(bw, g_hash_table_size(bb_map));
-
-    g_hash_table_iter_init(&iter, bb_map);
-    while (g_hash_table_iter_next(&iter, NULL, &value)) {
-        BBTemplate *tmpl = (BBTemplate *)value;
+    g_bb_template_cache.for_each_bb([bw](BBTemplate &tmpl_ref) {
+        BBTemplate *tmpl = &tmpl_ref;
         BitWriter sub;
         bw_init_buf(&sub);
 
@@ -533,7 +530,7 @@ static void write_bin_templates(BitWriter *bw)
         bw_byte_align(&sub);
         GByteArray *data = bw_finish_buf(&sub);
         bw_write_section(bw, data);
-    }
+    });
 }
 
 /* ========================= Dyn param helpers ========================= */
@@ -1749,7 +1746,7 @@ void body_stream_finish(BodyStreamState *st)
     uint64_t templates_count = 0;
 
     g_mutex_lock(&data_lock);
-    templates_count = g_hash_table_size(bb_map);
+    templates_count = g_bb_template_cache.bb_count();
     write_bin_templates(&st->bw);
     g_mutex_unlock(&data_lock);
     bw_byte_align(&st->bw);

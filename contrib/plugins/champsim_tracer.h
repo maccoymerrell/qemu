@@ -368,9 +368,6 @@ extern GMutex data_lock;
 extern GMutex unknown_warn_lock;
 extern FILE *unknown_warn_file;
 
-extern GHashTable *tb_map;
-extern GHashTable *bb_map;
-extern uint32_t next_template_id;
 
 extern struct qemu_plugin_scoreboard *vcpu_sb;
 extern qemu_plugin_u64 sb_current_pc;
@@ -421,36 +418,6 @@ void decode_detail_to_generic(uint64_t pc,
                               const qemu_plugin_insn_info *info,
                               InsnFields *out,
                               InsnRegNames *out_names);
-
-/* Defined in champsim_tracer.cc (BB template management) */
-BBTemplate *find_template(uint64_t start_pc);
-BBTemplate *get_or_create_bb_template(uint64_t entry_pc,
-                                      BBTemplate * const *fragments,
-                                      guint n_fragments);
-int template_branch_index(const BBTemplate *tmpl);
-
-/*
- * Commit a TRUE basic block by start_pc.  The BB is identified by
- * start_pc; if an entry exists in bb_map at start_pc with the same
- * insn_pcs[] sequence, return it.  If start_pc is new, build a new
- * BBTemplate by copying the provided per-insn metadata.  If start_pc
- * exists with a different insn_pcs[] (impossible without
- * self-modifying code or a tracer bug), log a warning and return the
- * existing template unchanged — BBs are immutable once committed.
- *
- * insn_bytes[] is a flat array sized n_insns * MAX_INSN_BYTES.
- * insn_reg_names may be NULL when reg-data capture is disabled.
- * Caller must hold data_lock.
- */
-BBTemplate *commit_true_bb(uint64_t start_pc,
-                           uint32_t n_insns,
-                           const uint64_t *insn_pcs,
-                           const InsnFields *insn_fields,
-                           const uint8_t *insn_sizes,
-                           const uint8_t *insn_bytes,
-                           const InsnRegNames *insn_reg_names,
-                           const char *symbol_name,
-                           uint64_t fall_through_pc);
 
 /*
  * Wide regfile snapshot: opaque thread-local scratch keyed by the QEMU

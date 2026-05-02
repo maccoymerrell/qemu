@@ -4,7 +4,7 @@
  * Main translation unit.  Responsibilities:
  *   - Plugin install, option parsing, lifecycle
  *   - Tracing window management (start/stop + simpoints)
- *   - BB template creation (tb_map + bb_map)
+ *   - BB template creation (delegated to BBTemplateCache)
  *   - vcpu_tb_trans / vcpu_tb_exec / vcpu_tb_flush callbacks
  *   - Memory-access callback (correct-path + wrong-path collection)
  *   - Exit-time statistics
@@ -26,6 +26,7 @@
 #include <time.h>
 
 #include "champsim_tracer.h"
+#include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_branch_history.h"
 #include "champsim_tracer_writer.h"
 
@@ -328,10 +329,6 @@ enum PluginOptId {
 GMutex data_lock;
 static GMutex exec_lock;
 
-GHashTable *tb_map;
-GHashTable *bb_map;
-uint32_t next_template_id = 1;
-
 struct qemu_plugin_scoreboard *vcpu_sb;
 qemu_plugin_u64 sb_current_pc;
 qemu_plugin_u64 sb_prev_start_pc;
@@ -366,7 +363,6 @@ static __thread GArray *cp_mem_accesses = NULL;
 static __thread GArray *pending_reg_snaps = NULL;
 
 /* Statistics */
-static uint64_t stat_blocks_translated;
 static uint64_t stat_branches_observed;
 static uint64_t stat_branches_taken;
 static uint64_t stat_branches_not_taken;
@@ -413,19 +409,6 @@ static void body_entry_clear(BodyEntry *entry)
     }
 }
 
-static void bb_template_free(gpointer data)
-{
-    BBTemplate *tmpl = (BBTemplate *)data;
-    g_free(tmpl->insn_fields);
-    g_free(tmpl->insn_pcs);
-    g_free(tmpl->symbol_name);
-    g_free(tmpl->insn_sizes);
-    g_free(tmpl->insn_bytes);
-    g_free(tmpl->insn_reg_names);
-    g_free(tmpl->insn_snap_refs);
-    g_free(tmpl);
-}
-
 static TraceSegment *trace_segment_new(const char *label,
                                        uint64_t start, uint64_t stop)
 {
@@ -467,87 +450,6 @@ static void trace_segment_free(TraceSegment *seg)
     g_free(seg);
 }
 
-/* ========================= BB template management ========================= */
-
-BBTemplate *find_template(uint64_t start_pc)
-{
-    return (BBTemplate *)g_hash_table_lookup(tb_map, &start_pc);
-}
-
-static BBTemplate *find_bb_template(uint64_t entry_pc)
-{
-    return (BBTemplate *)g_hash_table_lookup(bb_map, &entry_pc);
-}
-
-/*
- * Commit a TRUE basic block by start_pc.  See header for semantics.
- * Caller must hold data_lock.
- */
-BBTemplate *commit_true_bb(uint64_t start_pc,
-                           uint32_t n_insns,
-                           const uint64_t *insn_pcs,
-                           const InsnFields *insn_fields,
-                           const uint8_t *insn_sizes,
-                           const uint8_t *insn_bytes,
-                           const InsnRegNames *insn_reg_names,
-                           const char *symbol_name,
-                           uint64_t fall_through_pc)
-{
-    BBTemplate *existing = find_bb_template(start_pc);
-    if (existing) {
-        bool same = (existing->n_insns == n_insns);
-        if (same) {
-            for (uint32_t i = 0; i < n_insns; i++) {
-                if (existing->insn_pcs[i] != insn_pcs[i]) {
-                    same = false;
-                    break;
-                }
-            }
-        }
-        if (!same) {
-            static gint warned = 0;
-            if (g_atomic_int_compare_and_exchange(&warned, 0, 1)) {
-                fprintf(stderr,
-                    "champsim_tracer: WARNING true-BB at start_pc=0x%"
-                    PRIx64 " seen with differing insn sequence "
-                    "(existing n_insns=%u, new n_insns=%u). "
-                    "Keeping original; this indicates self-modifying "
-                    "code or a tracer bug.  (Further occurrences "
-                    "suppressed.)\n",
-                    start_pc, existing->n_insns, n_insns);
-            }
-        }
-        return existing;
-    }
-
-    BBTemplate *tmpl = g_new0(BBTemplate, 1);
-    tmpl->template_id = next_template_id++;
-    tmpl->start_pc = start_pc;
-    tmpl->n_insns = n_insns;
-    tmpl->fall_through_pc = fall_through_pc;
-    tmpl->symbol_name = symbol_name ? g_strdup(symbol_name) : NULL;
-    tmpl->insn_pcs = g_new0(uint64_t, n_insns);
-    tmpl->insn_sizes = g_new0(uint8_t, n_insns);
-    tmpl->insn_bytes = g_new0(uint8_t, (size_t)n_insns * MAX_INSN_BYTES);
-    tmpl->insn_fields = g_new0(InsnFields, n_insns);
-    if (insn_reg_names) {
-        tmpl->insn_reg_names = g_new0(InsnRegNames, n_insns);
-    }
-    for (uint32_t i = 0; i < n_insns; i++) {
-        tmpl->insn_pcs[i] = insn_pcs[i];
-        tmpl->insn_sizes[i] = insn_sizes[i];
-        memcpy(&tmpl->insn_bytes[(size_t)i * MAX_INSN_BYTES],
-               &insn_bytes[(size_t)i * MAX_INSN_BYTES],
-               MAX_INSN_BYTES);
-        tmpl->insn_fields[i] = insn_fields[i];
-        if (tmpl->insn_reg_names) {
-            tmpl->insn_reg_names[i] = insn_reg_names[i];
-        }
-    }
-    g_hash_table_replace(bb_map, &tmpl->start_pc, tmpl);
-    return tmpl;
-}
-
 /*
  * Per-CPU state for assembling a basic block from the stream of TB
  * fragments reported by vcpu_tb_exec.  A basic block begins at a branch
@@ -558,96 +460,6 @@ static uint64_t cp_chain_entry_pc;
 static uint64_t cp_chain_last_ft;
 static GArray *cp_chain_fragments;
 
-/*
- * Build (or reuse) a true basic-block template covering @entry_pc
- * through the concatenation of the provided TB fragments.  Each
- * fragment must be a per-TB BBTemplate from tb_map; this helper
- * extracts the executed insn metadata from each fragment in order
- * and forwards to commit_true_bb().  Must be called with data_lock
- * held.
- *
- * Caller is responsible for ensuring the fragment sequence forms a
- * true BB (start at a branch target, end at a branch instruction).
- * BB immutability is enforced via commit_true_bb(): a recommit at the
- * same start_pc with a different insn_pcs[] sequence emits a one-time
- * warning and returns the original BB.
- */
-BBTemplate *get_or_create_bb_template(uint64_t entry_pc,
-                                      BBTemplate * const *fragments,
-                                      guint n_fragments)
-{
-    uint32_t max_insns = 0;
-    for (guint i = 0; i < n_fragments; i++) {
-        max_insns += fragments[i]->n_insns;
-    }
-    if (max_insns == 0) {
-        return NULL;
-    }
-
-    g_autofree uint64_t *insn_pcs =
-        g_new0(uint64_t, max_insns);
-    g_autofree uint8_t *insn_sizes =
-        g_new0(uint8_t, max_insns);
-    g_autofree uint8_t *insn_bytes =
-        g_new0(uint8_t, (size_t)max_insns * MAX_INSN_BYTES);
-    g_autofree InsnFields *insn_fields =
-        g_new0(InsnFields, max_insns);
-    InsnRegNames *insn_reg_names = NULL;
-    if (enable_reg_data) {
-        insn_reg_names = g_new0(InsnRegNames, max_insns);
-    }
-    const char *symbol_name = NULL;
-    uint64_t final_ft = 0;
-
-    uint32_t off = 0;
-    for (guint f = 0; f < n_fragments; f++) {
-        BBTemplate *frag = fragments[f];
-        if (f == 0) {
-            symbol_name = frag->symbol_name;
-        }
-        for (uint32_t i = 0; i < frag->n_insns; i++) {
-            bool duplicate = false;
-            if (off > 0) {
-                duplicate = insn_pcs[off - 1] == frag->insn_pcs[i] &&
-                            insn_sizes[off - 1] == frag->insn_sizes[i] &&
-                            memcmp(&insn_bytes[(size_t)(off - 1) *
-                                                MAX_INSN_BYTES],
-                                   &frag->insn_bytes[(size_t)i *
-                                                     MAX_INSN_BYTES],
-                                   MAX_INSN_BYTES) == 0;
-            }
-            if (duplicate) {
-                continue;
-            }
-
-            insn_pcs[off] = frag->insn_pcs[i];
-            insn_sizes[off] = frag->insn_sizes[i];
-            memcpy(&insn_bytes[(size_t)off * MAX_INSN_BYTES],
-                   &frag->insn_bytes[(size_t)i * MAX_INSN_BYTES],
-                   MAX_INSN_BYTES);
-            insn_fields[off] = frag->insn_fields[i];
-            if (insn_reg_names && frag->insn_reg_names) {
-                insn_reg_names[off] = frag->insn_reg_names[i];
-            }
-            off++;
-        }
-        final_ft = frag->fall_through_pc;
-    }
-
-    if (off == 0) {
-        g_free(insn_reg_names);
-        return NULL;
-    }
-
-    BBTemplate *tmpl = commit_true_bb(entry_pc, off,
-                                      insn_pcs, insn_fields,
-                                      insn_sizes, insn_bytes,
-                                      insn_reg_names,
-                                      symbol_name, final_ft);
-    g_free(insn_reg_names);
-    return tmpl;
-}
-
 static void cp_chain_reset(void)
 {
     cp_chain_entry_pc = 0;
@@ -655,116 +467,6 @@ static void cp_chain_reset(void)
     if (cp_chain_fragments) {
         g_array_set_size(cp_chain_fragments, 0);
     }
-}
-
-/*
- * Return the index of the branch instruction within a BB template.
- * After template creation, delay-slot ISAs have been reordered so the
- * branch is always the last instruction.
- */
-int template_branch_index(const BBTemplate *tmpl)
-{
-    if (!tmpl || tmpl->n_insns == 0) {
-        return -1;
-    }
-
-    uint32_t last = tmpl->n_insns - 1;
-    if (tmpl->insn_fields[last].branch_type != BRANCH_NONE) {
-        return (int)last;
-    }
-
-    return -1;
-}
-
-/*
- * Find or create a per-TB fragment template.  Must be called with
- * data_lock held.
- */
-static BBTemplate *get_or_create_template(uint64_t start_pc,
-                                          uint32_t n_insns,
-                                          uint64_t *insn_pcs,
-                                          qemu_plugin_insn_info *insn_info,
-                                          uint8_t *insn_sizes,
-                                          uint8_t *insn_bytes,
-                                          const char *symbol_name,
-                                          uint64_t fall_through_pc)
-{
-    BBTemplate *tmpl = find_template(start_pc);
-    if (tmpl) {
-        return tmpl;
-    }
-
-    tmpl = g_new0(BBTemplate, 1);
-    tmpl->template_id = next_template_id++;
-    tmpl->start_pc = start_pc;
-    tmpl->n_insns = n_insns;
-    tmpl->fall_through_pc = fall_through_pc;
-    tmpl->insn_pcs = g_new0(uint64_t, n_insns);
-    tmpl->insn_sizes = g_new0(uint8_t, n_insns);
-    tmpl->insn_bytes = g_new0(uint8_t, n_insns * MAX_INSN_BYTES);
-    tmpl->symbol_name = symbol_name ? g_strdup(symbol_name) : NULL;
-
-    for (uint32_t i = 0; i < n_insns; i++) {
-        tmpl->insn_pcs[i] = insn_pcs[i];
-        tmpl->insn_sizes[i] = insn_sizes[i];
-        memcpy(&tmpl->insn_bytes[(size_t)i * MAX_INSN_BYTES],
-               &insn_bytes[(size_t)i * MAX_INSN_BYTES],
-               MAX_INSN_BYTES);
-    }
-
-    tmpl->insn_fields = g_new0(InsnFields, n_insns);
-    if (enable_reg_data) {
-        tmpl->insn_reg_names = g_new0(InsnRegNames, n_insns);
-    }
-    for (uint32_t i = 0; i < n_insns; i++) {
-        if (insn_info && insn_info[i].mnemonic[0]) {
-            decode_detail_to_generic(
-                tmpl->insn_pcs[i], &insn_info[i],
-                &tmpl->insn_fields[i],
-                tmpl->insn_reg_names ? &tmpl->insn_reg_names[i] : NULL);
-        }
-    }
-
-    /*
-     * Delay-slot reordering: swap [branch, delay] → [delay, branch] on
-     * ISAs with branch delay slots so the last instruction is always the
-     * branch.  This lets template_branch_index and WP steering be
-     * uniform across ISAs.
-     */
-    if (isa_properties[trace_isa].branch_delay_slots > 0 && n_insns >= 2) {
-        uint32_t br = n_insns - 2;
-        uint32_t ds = n_insns - 1;
-        if (tmpl->insn_fields[br].branch_type != BRANCH_NONE &&
-            tmpl->insn_fields[ds].branch_type == BRANCH_NONE) {
-            uint64_t tmp_pc = tmpl->insn_pcs[br];
-            tmpl->insn_pcs[br] = tmpl->insn_pcs[ds];
-            tmpl->insn_pcs[ds] = tmp_pc;
-            uint8_t tmp_sz = tmpl->insn_sizes[br];
-            tmpl->insn_sizes[br] = tmpl->insn_sizes[ds];
-            tmpl->insn_sizes[ds] = tmp_sz;
-            uint8_t tmp_bytes[MAX_INSN_BYTES];
-            memcpy(tmp_bytes,
-                   &tmpl->insn_bytes[(size_t)br * MAX_INSN_BYTES],
-                   MAX_INSN_BYTES);
-            memcpy(&tmpl->insn_bytes[(size_t)br * MAX_INSN_BYTES],
-                   &tmpl->insn_bytes[(size_t)ds * MAX_INSN_BYTES],
-                   MAX_INSN_BYTES);
-            memcpy(&tmpl->insn_bytes[(size_t)ds * MAX_INSN_BYTES],
-                   tmp_bytes, MAX_INSN_BYTES);
-            InsnFields tmp_fld = tmpl->insn_fields[br];
-            tmpl->insn_fields[br] = tmpl->insn_fields[ds];
-            tmpl->insn_fields[ds] = tmp_fld;
-            if (tmpl->insn_reg_names) {
-                InsnRegNames tmp_n = tmpl->insn_reg_names[br];
-                tmpl->insn_reg_names[br] = tmpl->insn_reg_names[ds];
-                tmpl->insn_reg_names[ds] = tmp_n;
-            }
-        }
-    }
-
-    g_hash_table_replace(tb_map, &tmpl->start_pc, tmpl);
-    stat_blocks_translated++;
-    return tmpl;
 }
 
 /* ========================= Reg-data snapshot capture ========================= */
@@ -1309,7 +1011,7 @@ static void flush_pending_final_body_entry(void)
 
     {
         g_mutex_lock(&data_lock);
-        BBTemplate *prev_tb_tmpl = find_template(prev_start);
+        BBTemplate *prev_tb_tmpl = g_bb_template_cache.find_tb_template(prev_start);
         if (prev_tb_tmpl) {
             if (cp_chain_entry_pc == 0 || cp_chain_last_ft != prev_start) {
                 cp_chain_reset();
@@ -1326,7 +1028,7 @@ static void flush_pending_final_body_entry(void)
             goto reset;
         }
 
-        BBTemplate *bb_tmpl = get_or_create_bb_template(
+        BBTemplate *bb_tmpl = g_bb_template_cache.get_or_create_bb_template(
             cp_chain_entry_pc,
             (BBTemplate **)cp_chain_fragments->data,
             cp_chain_fragments->len);
@@ -1491,7 +1193,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     }
 
     /* Append previous TB fragment to the in-flight basic-block chain. */
-    BBTemplate *prev_tb_tmpl = find_template(prev_start);
+    BBTemplate *prev_tb_tmpl = g_bb_template_cache.find_tb_template(prev_start);
     if (prev_tb_tmpl) {
         if (cp_chain_entry_pc == 0 || cp_chain_last_ft != prev_start) {
             /* Control-flow discontinuity: drop any partial accumulation. */
@@ -1506,7 +1208,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     uint64_t wrong_target = 0;
     if (finalize) {
-        int br_idx = template_branch_index(prev_tb_tmpl);
+        int br_idx = BBTemplateCache::template_branch_index(prev_tb_tmpl);
         const InsnFields *bf = (br_idx >= 0)
             ? &prev_tb_tmpl->insn_fields[br_idx] : NULL;
         bool is_indirect = bf && (
@@ -1539,7 +1241,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     BBTemplate *bb_tmpl = NULL;
     if (finalize && cp_chain_fragments->len > 0 && cp_chain_entry_pc != 0) {
-        bb_tmpl = get_or_create_bb_template(
+        bb_tmpl = g_bb_template_cache.get_or_create_bb_template(
             cp_chain_entry_pc,
             (BBTemplate **)cp_chain_fragments->data,
             cp_chain_fragments->len);
@@ -1668,9 +1370,9 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     }
 
     g_mutex_lock(&data_lock);
-    existing_tmpl = find_template(pc);
+    existing_tmpl = g_bb_template_cache.find_tb_template(pc);
     if (existing_tmpl && existing_tmpl->n_insns > 0) {
-        int br_idx = template_branch_index(existing_tmpl);
+        int br_idx = BBTemplateCache::template_branch_index(existing_tmpl);
         bb_ends_in_branch = (br_idx >= 0) ? 1 : 0;
         if (br_idx >= 0) {
             effective_last_pc = existing_tmpl->insn_pcs[br_idx];
@@ -1684,7 +1386,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         g_mutex_lock(&data_lock);
         BBTemplate *new_tmpl = NULL;
         {
-            new_tmpl = get_or_create_template(pc,
+            new_tmpl = g_bb_template_cache.get_or_create_tb_template(pc,
                                               canonical_n_insns,
                                               insn_pcs,
                                               insn_info,
@@ -1692,7 +1394,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                                               insn_bytes,
                                               symbol_name, fall_through);
             if (new_tmpl && new_tmpl->n_insns > 0) {
-                int br_idx = template_branch_index(new_tmpl);
+                int br_idx = BBTemplateCache::template_branch_index(new_tmpl);
                 bb_ends_in_branch = (br_idx >= 0) ? 1 : 0;
                 if (br_idx >= 0) {
                     effective_last_pc = new_tmpl->insn_pcs[br_idx];
@@ -1832,7 +1534,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     g_mutex_lock(&data_lock);
 
     static const struct { const char *label; const uint64_t *value; } counters[] = {
-        { "Basic blocks translated",             &stat_blocks_translated },
         { "Branch transitions observed",         &stat_branches_observed },
         { "  Taken",                             &stat_branches_taken },
         { "  Not-taken",                         &stat_branches_not_taken },
@@ -1855,11 +1556,13 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
         "\n=== Wrong-Path Trace Plugin Statistics ===\n"
         "Target architecture: %s\n"
         "Max wrong-path depth: %d instructions\n"
+        "TB fragments translated: %u\n"
         "BB templates created: %u\n"
         "Unique branch PCs: %u\n",
         target_name ? target_name : "unknown",
         max_wrong_path_depth,
-        g_hash_table_size(bb_map),
+        (unsigned)g_bb_template_cache.tb_count(),
+        (unsigned)g_bb_template_cache.bb_count(),
         (unsigned)g_branch_history.size());
 
     for (size_t i = 0; i < G_N_ELEMENTS(counters); i++) {
@@ -1921,8 +1624,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     if (simpoints_list) {
         g_array_unref(simpoints_list);
     }
-    g_hash_table_unref(tb_map);
-    g_hash_table_unref(bb_map);
     if (cp_chain_fragments) {
         g_array_unref(cp_chain_fragments);
     }
@@ -2118,10 +1819,6 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     g_mutex_init(&data_lock);
     g_mutex_init(&exec_lock);
     g_mutex_init(&unknown_warn_lock);
-    tb_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
-                                   NULL, bb_template_free);
-    bb_map = g_hash_table_new_full(g_int64_hash, g_int64_equal,
-                                   NULL, bb_template_free);
     cp_chain_fragments = g_array_new(false, false, sizeof(BBTemplate *));
 
     active_insn_table = isa_insn_class[trace_isa];

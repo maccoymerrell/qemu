@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "champsim_tracer.h"
+#include "champsim_tracer_bb_template_cache.h"
 
 /*
  * Internal scratch for a single in-progress wrong-path BB.  Six per-insn
@@ -139,7 +140,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         }
 
         g_mutex_lock(&data_lock);
-        tmpl = find_template(pre_pc);
+        tmpl = g_bb_template_cache.find_tb_template(pre_pc);
         g_mutex_unlock(&data_lock);
 
         bool tmpl_known_before_exec = (tmpl != NULL);
@@ -183,7 +184,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
 
         if (!tmpl) {
             g_mutex_lock(&data_lock);
-            tmpl = find_template(pre_pc);
+            tmpl = g_bb_template_cache.find_tb_template(pre_pc);
             g_mutex_unlock(&data_lock);
         }
 
@@ -314,7 +315,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             uint64_t fall_through = pre_pc + last_insn_size;
 
             g_mutex_lock(&data_lock);
-            BBTemplate *bb_tmpl = commit_true_bb(
+            BBTemplate *bb_tmpl = g_bb_template_cache.commit_true_bb(
                 bb_start_pc, (uint32_t)bb_pcs.size(),
                 bb_pcs.data(),
                 bb_fields.data(),
@@ -414,7 +415,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         uint64_t fall_through = pre_pc + last_insn_size;
 
         g_mutex_lock(&data_lock);
-        BBTemplate *bb_tmpl = commit_true_bb(
+        BBTemplate *bb_tmpl = g_bb_template_cache.commit_true_bb(
             bb_start_pc, (uint32_t)bb_pcs.size(),
             bb_pcs.data(),
             bb_fields.data(),

@@ -26,6 +26,7 @@
 #include <time.h>
 
 #include "champsim_tracer.h"
+#include "champsim_tracer_bb_chain_assembler.h"
 #include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_branch_history.h"
 #include "champsim_tracer_reg_handle_cache.h"
@@ -193,25 +194,6 @@ static void body_entry_clear(BodyEntry *entry)
             wp_bb_entry_clear(&g_array_index(entry->wp_entries, WPBBEntry, i));
         }
         g_array_unref(entry->wp_entries);
-    }
-}
-
-/*
- * Per-CPU state for assembling a basic block from the stream of TB
- * fragments reported by vcpu_tb_exec.  A basic block begins at a branch
- * target (entry_pc) and continues until the executing TB ends with a
- * branch instruction.
- */
-static uint64_t cp_chain_entry_pc;
-static uint64_t cp_chain_last_ft;
-static GArray *cp_chain_fragments;
-
-static void cp_chain_reset(void)
-{
-    cp_chain_entry_pc = 0;
-    cp_chain_last_ft = 0;
-    if (cp_chain_fragments) {
-        g_array_set_size(cp_chain_fragments, 0);
     }
 }
 
@@ -410,25 +392,17 @@ static void flush_pending_final_body_entry(void)
         g_mutex_lock(&data_lock);
         BBTemplate *prev_tb_tmpl = g_bb_template_cache.find_tb_template(prev_start);
         if (prev_tb_tmpl) {
-            if (cp_chain_entry_pc == 0 || cp_chain_last_ft != prev_start) {
-                cp_chain_reset();
-                cp_chain_entry_pc = prev_start;
-            }
-            g_array_append_val(cp_chain_fragments, prev_tb_tmpl);
-            cp_chain_last_ft = prev_ft;
+            g_cp_chain.append_fragment(prev_start, prev_tb_tmpl, prev_ft);
         }
 
         if (!prev_is_branch || !prev_tb_tmpl ||
-            cp_chain_fragments->len == 0 || cp_chain_entry_pc == 0) {
+            !g_cp_chain.has_active_chain()) {
             /* No terminating branch → not a valid basic block; discard. */
             g_mutex_unlock(&data_lock);
             goto reset;
         }
 
-        BBTemplate *bb_tmpl = g_bb_template_cache.get_or_create_bb_template(
-            cp_chain_entry_pc,
-            (BBTemplate **)cp_chain_fragments->data,
-            cp_chain_fragments->len);
+        BBTemplate *bb_tmpl = g_cp_chain.finalize();
         g_mutex_unlock(&data_lock);
 
         BodyEntry entry = {
@@ -452,7 +426,7 @@ static void flush_pending_final_body_entry(void)
 
 reset:
     g_mutex_lock(&data_lock);
-    cp_chain_reset();
+    g_cp_chain.reset();
     if (cp_mem_accesses) {
         g_array_set_size(cp_mem_accesses, 0);
     }
@@ -580,13 +554,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     /* Append previous TB fragment to the in-flight basic-block chain. */
     BBTemplate *prev_tb_tmpl = g_bb_template_cache.find_tb_template(prev_start);
     if (prev_tb_tmpl) {
-        if (cp_chain_entry_pc == 0 || cp_chain_last_ft != prev_start) {
-            /* Control-flow discontinuity: drop any partial accumulation. */
-            cp_chain_reset();
-            cp_chain_entry_pc = prev_start;
-        }
-        g_array_append_val(cp_chain_fragments, prev_tb_tmpl);
-        cp_chain_last_ft = prev_ft;
+        g_cp_chain.append_fragment(prev_start, prev_tb_tmpl, prev_ft);
     }
 
     bool finalize = prev_is_branch && prev_tb_tmpl != NULL;
@@ -625,11 +593,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     }
 
     BBTemplate *bb_tmpl = NULL;
-    if (finalize && cp_chain_fragments->len > 0 && cp_chain_entry_pc != 0) {
-        bb_tmpl = g_bb_template_cache.get_or_create_bb_template(
-            cp_chain_entry_pc,
-            (BBTemplate **)cp_chain_fragments->data,
-            cp_chain_fragments->len);
+    if (finalize && g_cp_chain.has_active_chain()) {
+        bb_tmpl = g_cp_chain.finalize();
     }
 
     g_mutex_unlock(&data_lock);
@@ -660,7 +625,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         }
 
         g_mutex_lock(&data_lock);
-        cp_chain_reset();
+        g_cp_chain.reset();
         g_mutex_unlock(&data_lock);
 
         if (enable_wrong_path && wrong_target != 0) {
@@ -888,7 +853,7 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
      * TB will resume, so preserving partial state would risk splicing
      * fragments from before and after the flush. */
     g_mutex_lock(&data_lock);
-    cp_chain_reset();
+    g_cp_chain.reset();
     if (cp_mem_accesses) {
         g_array_set_size(cp_mem_accesses, 0);
     }
@@ -994,9 +959,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
         g_array_unref(cp_mem_accesses);
     }
     RegSnapCollector::cleanup_current_thread();
-    if (cp_chain_fragments) {
-        g_array_unref(cp_chain_fragments);
-    }
 
     g_hash_table_unref(option_ht);
     g_free(program_name);
@@ -1197,7 +1159,6 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     g_mutex_init(&data_lock);
     g_mutex_init(&exec_lock);
     g_mutex_init(&unknown_warn_lock);
-    cp_chain_fragments = g_array_new(false, false, sizeof(BBTemplate *));
 
     active_insn_table = isa_insn_class[trace_isa];
     active_insn_table_size = isa_insn_class_size[trace_isa];

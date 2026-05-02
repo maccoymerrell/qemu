@@ -32,6 +32,7 @@
 #include "champsim_tracer_scoreboard.h"
 #include "champsim_tracer_simpoint_manager.h"
 #include "champsim_tracer_stats.h"
+#include "champsim_tracer_trace_segment_manager.h"
 #include "champsim_tracer_writer.h"
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
@@ -40,12 +41,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
 int max_wrong_path_depth = 64;
 static bool enable_wrong_path = true;
-static char *output_base_path = NULL;
-static char *output_pipe_command = NULL;
 static char *unknown_warn_path = NULL;
 static char *program_name = NULL;
-static uint64_t trace_start_insn = 0;
-static uint64_t trace_stop_insn = UINT64_MAX;
 const char *target_name;
 FILE *unknown_warn_file;
 GMutex unknown_warn_lock;
@@ -147,11 +144,6 @@ enum PluginOptId {
 GMutex data_lock;
 static GMutex exec_lock;
 
-static bool trace_active = false;
-static volatile gint trace_active_atomic = 0;
-static volatile gint trace_shutting_down = 0;
-static TraceSegment *current_segment = NULL;
-
 __thread bool wp_in_progress = false;
 __thread GArray *wp_mem_accesses = NULL;
 __thread uint64_t wp_saved_insn_count = 0;
@@ -201,47 +193,6 @@ static void body_entry_clear(BodyEntry *entry)
         }
         g_array_unref(entry->wp_entries);
     }
-}
-
-static TraceSegment *trace_segment_new(const char *label,
-                                       uint64_t start, uint64_t stop)
-{
-    TraceSegment *seg = g_new0(TraceSegment, 1);
-    seg->start_insn = start;
-    seg->stop_insn = stop;
-    seg->label = g_strdup(label);
-    return seg;
-}
-
-static void trace_segment_free(TraceSegment *seg)
-{
-    if (!seg) {
-        return;
-    }
-    if (seg->bin_stream) {
-        g_free(seg->bin_stream);
-    }
-    /* Drain async writer queue and join its thread BEFORE closing
-     * the underlying FILE*, so all enqueued bytes hit xz/disk and
-     * the writer can fflush cleanly. */
-    if (seg->writer) {
-        writer_finish(seg->writer);
-        seg->writer = NULL;
-    }
-    if (seg->bin_file) {
-        if (seg->bin_file_is_pipe) {
-            int rc = pclose(seg->bin_file);
-            if (rc != 0) {
-                fprintf(stderr,
-                        "champsim_tracer: output pipe child exited with status %d\n",
-                        rc);
-            }
-        } else {
-            fclose(seg->bin_file);
-        }
-    }
-    g_free(seg->label);
-    g_free(seg);
 }
 
 /*
@@ -334,7 +285,7 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
     if (!enable_reg_data || wp_in_progress) {
         return;
     }
-    if (!g_atomic_int_get(&trace_active_atomic)) {
+    if (!g_trace_segments.is_active_atomic()) {
         return;
     }
     const RegSnapInsnRef *ref = (const RegSnapInsnRef *)udata;
@@ -559,7 +510,7 @@ static void vcpu_mem_cb(unsigned int cpu_index,
         return;
     }
 
-    if (g_atomic_int_get(&trace_active_atomic) && cp_mem_accesses) {
+    if (g_trace_segments.is_active_atomic() && cp_mem_accesses) {
         g_array_append_val(cp_mem_accesses, acc);
     }
 }
@@ -569,83 +520,11 @@ static void vcpu_mem_cb(unsigned int cpu_index,
 static void start_trace_segment(const char *label,
                                 uint64_t start, uint64_t stop)
 {
-    if (current_segment) {
-        trace_segment_free(current_segment);
-    }
-
-    current_segment = trace_segment_new(label, start, stop);
-    current_segment->body_seq_num = 0;
-
-    {
-        time_t now = time(NULL);
-        struct tm tm_buf;
-        localtime_r(&now, &tm_buf);
-        strftime(current_segment->start_datetime,
-                 sizeof(current_segment->start_datetime),
-                 "%Y-%m-%d %H:%M:%S", &tm_buf);
-    }
-
+    g_trace_segments.start(label, start, stop);
     if (cpu_to_thread_id) {
         g_hash_table_remove_all(cpu_to_thread_id);
     }
     next_thread_id = 0;
-
-    g_autofree char *bin_path = NULL;
-    if (output_base_path) {
-        bin_path = g_simpoints.is_active()
-            ? g_strdup_printf("%s_%s.cst", output_base_path, label)
-            : g_strdup_printf("%s.cst", output_base_path);
-    }
-
-    /*
-     * Output destination resolution:
-     *   - outpipe=CMD     -> popen(CMD, "w").  Per-segment substitution
-     *                        of "%s" in CMD is replaced with the segment
-     *                        label so simpoint runs land in distinct files.
-     *   - outfile=PATH    -> fopen(PATH[.cst|_LABEL.cst], "wb").
-     * outpipe takes precedence when both are set.
-     */
-    if (output_pipe_command) {
-        g_autofree char *cmd = NULL;
-        if (strstr(output_pipe_command, "%s")) {
-            cmd = g_strdup_printf(output_pipe_command, label);
-        } else {
-            cmd = g_strdup(output_pipe_command);
-        }
-        current_segment->bin_file = popen(cmd, "w");
-        if (!current_segment->bin_file) {
-            fprintf(stderr,
-                    "champsim_tracer: cannot open output pipe: %s\n",
-                    cmd);
-        } else {
-            current_segment->bin_file_is_pipe = true;
-            current_segment->writer =
-                writer_start(current_segment->bin_file, true);
-            current_segment->bin_stream = body_stream_new(
-                current_segment->writer, current_segment->start_datetime);
-            if (!current_segment->bin_stream) {
-                fprintf(stderr,
-                        "champsim_tracer: cannot initialize binary stream\n");
-            }
-        }
-    } else if (bin_path) {
-        current_segment->bin_file = fopen(bin_path, "wb");
-        if (!current_segment->bin_file) {
-            fprintf(stderr, "champsim_tracer: cannot open binary output: %s\n",
-                    bin_path);
-        } else {
-            current_segment->writer =
-                writer_start(current_segment->bin_file, false);
-            current_segment->bin_stream = body_stream_new(
-                current_segment->writer, current_segment->start_datetime);
-            if (!current_segment->bin_stream) {
-                fprintf(stderr, "champsim_tracer: cannot initialize binary stream\n");
-            }
-        }
-    }
-
-    trace_active = true;
-    g_atomic_int_set(&trace_active_atomic, 1);
 }
 
 static void drain_cp_mem_into_dyn_params(GArray *dyn_params,
@@ -693,7 +572,7 @@ static void drain_cp_mem_into_dyn_params(GArray *dyn_params,
  */
 static void flush_pending_final_body_entry(void)
 {
-    TraceSegment *seg = current_segment;
+    BodyStreamState *out_stream = g_trace_segments.body_stream();
     unsigned int cpu_index = 0;
     uint64_t prev_start =
         qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
@@ -702,7 +581,7 @@ static void flush_pending_final_body_entry(void)
     uint64_t prev_is_branch =
         qemu_plugin_u64_get(g_scoreboard.prev_bb_ends_in_branch, cpu_index);
 
-    if (!seg || !seg->bin_stream || prev_start == 0) {
+    if (!out_stream || prev_start == 0) {
         goto reset;
     }
 
@@ -732,7 +611,7 @@ static void flush_pending_final_body_entry(void)
         g_mutex_unlock(&data_lock);
 
         BodyEntry entry = {
-            .seq_num = ++seg->body_seq_num,
+            .seq_num = g_trace_segments.next_seq_num(),
             .template_id = bb_tmpl ? bb_tmpl->template_id : 0,
             .dyn_params = g_array_sized_new(false, false, sizeof(DynParam),
                               cp_mem_accesses ? cp_mem_accesses->len : 0),
@@ -746,7 +625,7 @@ static void flush_pending_final_body_entry(void)
             pending_reg_snaps = g_array_new(false, false, sizeof(RegSnap));
         }
 
-        body_stream_write_entry(seg->bin_stream, &entry);
+        body_stream_write_entry(out_stream, &entry);
         body_entry_clear(&entry);
     }
 
@@ -768,21 +647,7 @@ reset:
  */
 static void finish_trace_segment(void)
 {
-    if (!current_segment) {
-        return;
-    }
-
-    trace_active = false;
-    g_atomic_int_set(&trace_active_atomic, 0);
-
-    flush_pending_final_body_entry();
-
-    if (current_segment->bin_stream) {
-        body_stream_finish(current_segment->bin_stream);
-    }
-
-    trace_segment_free(current_segment);
-    current_segment = NULL;
+    g_trace_segments.finish(flush_pending_final_body_entry);
 }
 
 /* ========================= Execution callback ========================= */
@@ -793,7 +658,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     g_mutex_lock(&exec_lock);
 
-    if (g_atomic_int_get(&trace_shutting_down)) {
+    if (g_trace_segments.is_shutting_down()) {
         g_mutex_unlock(&exec_lock);
         return;
     }
@@ -812,40 +677,44 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     /* --- Tracing window management --- */
     if (g_simpoints.is_active()) {
-        if (trace_active && icount >= trace_stop_insn) {
+        if (g_trace_segments.is_active() &&
+            icount >= g_trace_segments.window_stop()) {
             finish_trace_segment();
             g_simpoints.advance();
         }
-        if (!trace_active) {
+        if (!g_trace_segments.is_active()) {
             if (const SimPointEntry *sp = g_simpoints.current()) {
                 if (icount >= sp->start_insn && icount < sp->stop_insn) {
-                    trace_start_insn = sp->start_insn;
-                    trace_stop_insn = sp->stop_insn;
+                    g_trace_segments.set_window(sp->start_insn, sp->stop_insn);
                     g_autofree char *label = g_strdup_printf(
                         "sp%zu", g_simpoints.current_index());
                     start_trace_segment(label, sp->start_insn, sp->stop_insn);
                 }
             } else {
-                g_atomic_int_set(&trace_shutting_down, 1);
+                g_trace_segments.set_shutting_down();
                 g_mutex_unlock(&exec_lock);
                 exit(0);
             }
         }
     } else {
-        if (!trace_active && icount >= trace_start_insn &&
-            icount < trace_stop_insn) {
-            start_trace_segment("trace", trace_start_insn, trace_stop_insn);
+        if (!g_trace_segments.is_active() &&
+            icount >= g_trace_segments.window_start() &&
+            icount <  g_trace_segments.window_stop()) {
+            start_trace_segment("trace",
+                                g_trace_segments.window_start(),
+                                g_trace_segments.window_stop());
         }
-        if (trace_active && icount >= trace_stop_insn) {
+        if (g_trace_segments.is_active() &&
+            icount >= g_trace_segments.window_stop()) {
             finish_trace_segment();
-            g_atomic_int_set(&trace_shutting_down, 1);
+            g_trace_segments.set_shutting_down();
             g_mutex_unlock(&exec_lock);
             exit(0);
         }
     }
 
-    TraceSegment *seg = current_segment;
-    if (!trace_active || !seg) {
+    BodyStreamState *out_stream = g_trace_segments.body_stream();
+    if (!g_trace_segments.is_active() || !out_stream) {
         g_mutex_unlock(&exec_lock);
         return;
     }
@@ -953,7 +822,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     {
         BodyEntry entry;
         guint cp_mem_len = cp_mem_accesses ? cp_mem_accesses->len : 0;
-        entry.seq_num = ++seg->body_seq_num;
+        entry.seq_num = g_trace_segments.next_seq_num();
         entry.template_id = bb_tmpl ? bb_tmpl->template_id : 0;
         entry.dyn_params = g_array_sized_new(false, false,
                              sizeof(DynParam), cp_mem_len);
@@ -979,8 +848,6 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         } else if (wrong_target == 0) {
             g_stats.wp_skipped++;
         }
-
-        BodyStreamState *out_stream = seg->bin_stream;
 
         if (out_stream) {
             body_stream_write_entry(out_stream, &entry);
@@ -1216,11 +1083,11 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
 
 static void plugin_exit(qemu_plugin_id_t id, void *p)
 {
-    g_atomic_int_set(&trace_shutting_down, 1);
+    g_trace_segments.set_shutting_down();
 
     g_mutex_lock(&exec_lock);
 
-    if (trace_active) {
+    if (g_trace_segments.is_active()) {
         finish_trace_segment();
     }
 
@@ -1317,7 +1184,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     }
 
     g_hash_table_unref(option_ht);
-    g_free(output_base_path);
     g_free(program_name);
     g_free(simpoints_file_path);
 }
@@ -1391,6 +1257,14 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         }
     }
 
+    /* Per-install scratch for option-derived configuration; pushed to
+     * the trace segment manager once parsing + simpoint loading is
+     * done. */
+    g_autofree char *output_base_path = NULL;
+    g_autofree char *output_pipe_command = NULL;
+    uint64_t trace_start_insn = 0;
+    uint64_t trace_stop_insn = UINT64_MAX;
+
     /* Option dispatch table */
     option_ht = g_hash_table_new(g_str_hash, g_str_equal);
     {
@@ -1433,9 +1307,11 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             }
             break;
         case OPT_OUTFILE:
+            g_free(output_base_path);
             output_base_path = g_strdup(tokens[1]);
             break;
         case OPT_OUTPIPE:
+            g_free(output_pipe_command);
             output_pipe_command = g_strdup(tokens[1]);
             break;
         case OPT_WP:
@@ -1475,6 +1351,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     if (!output_base_path) {
         output_base_path = g_strdup("champsim_tracer_out");
     }
+    g_trace_segments.set_output_path(output_base_path);
+    g_trace_segments.set_output_pipe(output_pipe_command);
 
     unknown_warn_path = g_strdup_printf("%s.unknown_warnings.log",
                                         output_base_path);
@@ -1499,6 +1377,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         trace_start_insn = 0;
         trace_stop_insn = UINT64_MAX;
     }
+    g_trace_segments.set_window(trace_start_insn, trace_stop_insn);
 
     g_mutex_init(&data_lock);
     g_mutex_init(&exec_lock);
@@ -1515,6 +1394,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     if (!g_simpoints.is_active() && trace_start_insn == 0) {
         start_trace_segment("trace", 0, trace_stop_insn);
     }
+
 
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
     qemu_plugin_register_flush_cb(id, vcpu_tb_flush);

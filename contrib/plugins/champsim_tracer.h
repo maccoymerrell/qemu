@@ -407,29 +407,8 @@ void decode_detail_to_generic(uint64_t pc,
  */
 typedef struct _WideRegSnap WideRegSnap;
 
-/*
- * Capture a snapshot of every readable register referenced by the active
- * register classification table.  Returns NULL when reg-data is disabled or
- * no readable registers exist.  The returned pointer is thread-local scratch
- * and remains valid until the next wide_reg_snap_capture() on the same thread.
- */
-WideRegSnap *wide_reg_snap_capture(unsigned int cpu_index);
-void         wide_reg_snap_free(WideRegSnap *w);
-
-/*
- * Append per-insn source RegSnap records sourced from a wide snapshot to
- * @out_snaps, using @tmpl->insn_reg_names[insn_idx].src_qemu_reg_keys as the
- * lookup keys.  Missing handles yield zero snaps.  No-op when reg-data is
- * disabled.
- */
-void wp_capture_insn_snaps(const WideRegSnap *wide,
-                           const BBTemplate *tmpl,
-                           uint32_t insn_idx,
-                           GArray *out_snaps);
-void wp_capture_insn_snaps_live(unsigned int cpu_index,
-                                const BBTemplate *tmpl,
-                                uint32_t insn_idx,
-                                GArray *out_snaps);
+/* Reg-snap capture is provided by RegSnapCollector; see
+ * champsim_tracer_reg_snap_collector.h. */
 
 /* Defined in champsim_tracer_wp.cc */
 GArray *simulate_wrong_path_ext(uint64_t branch_pc,

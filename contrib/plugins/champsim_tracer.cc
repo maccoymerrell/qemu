@@ -29,6 +29,7 @@
 #include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_branch_history.h"
 #include "champsim_tracer_reg_handle_cache.h"
+#include "champsim_tracer_reg_snap_collector.h"
 #include "champsim_tracer_scoreboard.h"
 #include "champsim_tracer_simpoint_manager.h"
 #include "champsim_tracer_stats.h"
@@ -214,67 +215,15 @@ static void cp_chain_reset(void)
     }
 }
 
-/* ========================= Reg-data snapshot capture ========================= */
-
-/*
- * Read a register through the QEMU plugin descriptor handle.  Unknown
- * registers yield a zero snap.  Only meaningful when enable_reg_data is true
- * and the current callback requested QEMU_PLUGIN_CB_R_REGS.
+/* ========================= Reg-data snapshot capture =========================
+ *
+ * Reg-snap mechanics live in RegSnapCollector (see
+ * champsim_tracer_reg_snap_collector.h).  This file owns only the
+ * per-insn correct-path callback, which collects snaps into
+ * pending_reg_snaps so the body emitter can fold them into BodyEntry
+ * at finalize time.
  */
-static __thread GByteArray *reg_read_buf;
 
-static GByteArray *reg_read_scratch(void)
-{
-    if (!reg_read_buf) {
-        reg_read_buf = g_byte_array_new();
-    } else {
-        g_byte_array_set_size(reg_read_buf, 0);
-    }
-    return reg_read_buf;
-}
-
-static inline bool qemu_reg_key_valid(const QemuRegKey *key)
-{
-    return key && key->name;
-}
-
-static inline bool qemu_reg_key_equal(const QemuRegKey *a, const QemuRegKey *b)
-{
-    return g_strcmp0(a->feature, b->feature) == 0 &&
-           g_strcmp0(a->name, b->name) == 0;
-}
-
-static void read_qemu_reg_into_snap(unsigned int cpu_index,
-                                    const QemuRegKey *qemu_reg,
-                                    RegSnap *out)
-{
-    cst_wide_zero(&out->value);
-    struct qemu_plugin_register *handle =
-        g_reg_handle_cache.lookup(cpu_index, qemu_reg);
-    if (!handle) {
-        return;
-    }
-    GByteArray *buf = reg_read_scratch();
-    int n = qemu_plugin_read_register(handle, buf);
-    if (n <= 0) {
-        return;
-    }
-    cst_wide_from_le_bytes(&out->value, buf->data, (size_t)n);
-}
-
-static inline void reg_snap_array_append(GArray *arr, const RegSnap *snap)
-{
-    guint pos = arr->len;
-    g_array_set_size(arr, pos + 1);
-    g_array_index(arr, RegSnap, pos) = *snap;
-}
-
-/*
- * Per-insn callback: snapshot source registers before execution, in
- * InsnFields.src_regs[] order.  Destination register identities remain
- * in the template, but destination values are not emitted because this
- * callback fires before the instruction executes.
- */
 typedef struct {
     BBTemplate *tb_tmpl;
     uint32_t    insn_index;
@@ -302,136 +251,8 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
     }
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         RegSnap s;
-        read_qemu_reg_into_snap(cpu_index, &names->src_qemu_reg_keys[i], &s);
-        reg_snap_array_append(pending_reg_snaps, &s);
-    }
-}
-
-/* ========================= Wide regfile snapshot (WP path) =========================
- *
- * In wrong-path execution under qemu_plugin_spec_mode_begin(),
- * cpu_plugin_exec_tb() forces CF_MEMI_ONLY which silently drops any
- * subsequent qemu_plugin_register_vcpu_insn_exec_cb() registration.
- * So our normal per-insn snap callback never fires for WP fragments
- * even though the regfile is genuinely modified by speculative
- * execution.  To recover per-insn snapshots, the WP loop calls
- * wide_reg_snap_capture() *before* each cpu_plugin_exec_tb() and
- * later attributes the captured values to the per-insn slots of
- * the just-translated template via wp_capture_insn_snaps().  Spec
- * mode also forces CF_SINGLE_STEP|1 (one guest insn per fragment),
- * so a pre-fragment wide snap is semantically equivalent to a
- * pre-insn snap.
- */
-
-typedef struct {
-    QemuRegKey qemu_reg;
-    RegSnap snap;
-} WideRegEntry;
-
-struct _WideRegSnap {
-    WideRegEntry *entries;
-    unsigned n;
-};
-
-static __thread WideRegSnap wide_reg_scratch;
-static __thread unsigned wide_reg_scratch_cap;
-
-static bool wide_reg_snap_contains(const WideRegSnap *w,
-                                   const QemuRegKey *qemu_reg)
-{
-    for (unsigned i = 0; i < w->n; i++) {
-        if (qemu_reg_key_equal(&w->entries[i].qemu_reg, qemu_reg)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-WideRegSnap *wide_reg_snap_capture(unsigned int cpu_index)
-{
-    if (!enable_reg_data) {
-        return NULL;
-    }
-    if (!active_reg_table || active_reg_table_size == 0) {
-        return NULL;
-    }
-
-    wide_reg_scratch.n = 0;
-    for (unsigned i = 0; i < active_reg_table_size; i++) {
-        const QemuRegKey *qemu_reg = &active_reg_table[i].qemu_reg;
-        if (!qemu_reg_key_valid(qemu_reg) ||
-            wide_reg_snap_contains(&wide_reg_scratch, qemu_reg)) {
-            continue;
-        }
-        if (wide_reg_scratch.n == wide_reg_scratch_cap) {
-            wide_reg_scratch_cap = wide_reg_scratch_cap
-                ? wide_reg_scratch_cap * 2 : 64;
-            wide_reg_scratch.entries = g_renew(WideRegEntry,
-                                               wide_reg_scratch.entries,
-                                               wide_reg_scratch_cap);
-        }
-        unsigned slot = wide_reg_scratch.n++;
-        wide_reg_scratch.entries[slot].qemu_reg = *qemu_reg;
-        read_qemu_reg_into_snap(cpu_index, qemu_reg,
-                                &wide_reg_scratch.entries[slot].snap);
-    }
-    return wide_reg_scratch.n ? &wide_reg_scratch : NULL;
-}
-
-void wide_reg_snap_free(WideRegSnap *w)
-{
-    (void)w;
-}
-
-static void wide_reg_snap_lookup(WideRegSnap *w, const QemuRegKey *qemu_reg,
-                                 RegSnap *out)
-{
-    cst_wide_zero(&out->value);
-    if (!w || !qemu_reg_key_valid(qemu_reg)) {
-        return;
-    }
-    for (unsigned i = 0; i < w->n; i++) {
-        if (qemu_reg_key_equal(&w->entries[i].qemu_reg, qemu_reg)) {
-            *out = w->entries[i].snap;
-            return;
-        }
-    }
-}
-
-void wp_capture_insn_snaps(const WideRegSnap *wide,
-                           const BBTemplate *tmpl,
-                           uint32_t insn_idx,
-                           GArray *out_snaps)
-{
-    if (!enable_reg_data || !tmpl || !out_snaps ||
-        !tmpl->insn_reg_names || insn_idx >= tmpl->n_insns) {
-        return;
-    }
-    const InsnFields *f = &tmpl->insn_fields[insn_idx];
-    const InsnRegNames *names = &tmpl->insn_reg_names[insn_idx];
-    for (uint8_t i = 0; i < f->n_src_regs; i++) {
-        RegSnap s;
-        wide_reg_snap_lookup((WideRegSnap *)wide,
-                             &names->src_qemu_reg_keys[i], &s);
-        reg_snap_array_append(out_snaps, &s);
-    }
-}
-
-void wp_capture_insn_snaps_live(unsigned int cpu_index,
-                                const BBTemplate *tmpl,
-                                uint32_t insn_idx,
-                                GArray *out_snaps)
-{
-    if (!enable_reg_data || !tmpl || !out_snaps ||
-        !tmpl->insn_reg_names || insn_idx >= tmpl->n_insns) {
-        return;
-    }
-    const InsnFields *f = &tmpl->insn_fields[insn_idx];
-    const InsnRegNames *names = &tmpl->insn_reg_names[insn_idx];
-    for (uint8_t i = 0; i < f->n_src_regs; i++) {
-        RegSnap s;
-        read_qemu_reg_into_snap(cpu_index, &names->src_qemu_reg_keys[i], &s);
-        reg_snap_array_append(out_snaps, &s);
+        g_reg_snaps.read_into_snap(cpu_index, &names->src_qemu_reg_keys[i], &s);
+        RegSnapCollector::append(pending_reg_snaps, &s);
     }
 }
 
@@ -1172,13 +993,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     if (cp_mem_accesses) {
         g_array_unref(cp_mem_accesses);
     }
-    if (reg_read_buf) {
-        g_byte_array_unref(reg_read_buf);
-        reg_read_buf = NULL;
-    }
-    g_free(wide_reg_scratch.entries);
-    wide_reg_scratch.entries = NULL;
-    wide_reg_scratch_cap = 0;
+    RegSnapCollector::cleanup_current_thread();
     if (cp_chain_fragments) {
         g_array_unref(cp_chain_fragments);
     }

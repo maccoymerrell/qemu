@@ -15,6 +15,7 @@
 
 #include "champsim_tracer.h"
 #include "champsim_tracer_bb_template_cache.h"
+#include "champsim_tracer_reg_snap_collector.h"
 #include "champsim_tracer_scoreboard.h"
 #include "champsim_tracer_stats.h"
 
@@ -169,7 +170,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                     memcmp(last_bytes, cur_bytes, MAX_INSN_BYTES) == 0;
 
                 if (!duplicate) {
-                    wp_capture_insn_snaps_live(cpu_index, tmpl, i,
+                    g_reg_snaps.capture_insn_snaps_live(cpu_index, tmpl, i,
                                                bb_reg_snaps);
                     last_pc = tmpl->insn_pcs[i];
                     last_size = tmpl->insn_sizes[i];
@@ -180,7 +181,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         }
 
         WideRegSnap *wide = tmpl_known_before_exec
-            ? NULL : wide_reg_snap_capture(cpu_index);
+            ? NULL : g_reg_snaps.capture_wide(cpu_index);
 
         tb_ok = qemu_plugin_exec_tb();
 
@@ -191,7 +192,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         }
 
         if (!tmpl) {
-            wide_reg_snap_free(wide);
+            RegSnapCollector::free_wide(wide);
             bb_pcs.clear();
             bb_sizes.clear();
             bb_bytes.clear();
@@ -252,7 +253,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                 }
             }
             if (bb_reg_snaps && !tmpl_known_before_exec) {
-                wp_capture_insn_snaps(wide, tmpl, i, bb_reg_snaps);
+                g_reg_snaps.capture_insn_snaps(wide, tmpl, i, bb_reg_snaps);
             }
             appended_insns++;
         }
@@ -296,7 +297,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             g_stats.wp_total_mem_accesses++;
         }
 
-        wide_reg_snap_free(wide);
+        RegSnapCollector::free_wide(wide);
         wide = NULL;
 
         size_t last_local = bb_pcs.size() - 1;

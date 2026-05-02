@@ -382,6 +382,16 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         { CST_WP_EVENT_FAULT, "CST_WP_EVENT_FAULT" },
     };
 
+    /* Compile-time tripwires: when the source enum gets a new value,
+     * the matching encoding-map entries[] table must grow too.  These
+     * static_asserts catch the omission at build time.  GEN_OP_COUNT
+     * has one reserved hole (value 26, between BRANCH and RET) so the
+     * table is one shorter than the enum count. */
+    static_assert(G_N_ELEMENTS(opcode_entries) + 1 == GEN_OP_COUNT,
+                  "opcode_entries[] must be updated to match GenericOpcode");
+    static_assert(G_N_ELEMENTS(branch_entries) == BRANCH_TYPE_COUNT,
+                  "branch_entries[] must be updated to match BranchType");
+
     BitWriter sub;
     bw_init_buf(&sub);
     bw_write_uleb128(&sub, 9);

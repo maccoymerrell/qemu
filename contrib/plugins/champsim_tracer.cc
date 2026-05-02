@@ -29,6 +29,7 @@
 #include "champsim_tracer_bb_chain_assembler.h"
 #include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_branch_history.h"
+#include "champsim_tracer_mem_access_recorder.h"
 #include "champsim_tracer_reg_handle_cache.h"
 #include "champsim_tracer_reg_snap_collector.h"
 #include "champsim_tracer_scoreboard.h"
@@ -148,14 +149,13 @@ static GMutex exec_lock;
 
 __thread bool wp_in_progress = false;
 __thread GArray *wp_mem_accesses = NULL;
+
 __thread uint64_t wp_saved_insn_count = 0;
 __thread unsigned int wp_saved_cpu_index = 0;
 __thread uint64_t wp_saved_prev_start_pc = 0;
 __thread uint64_t wp_saved_prev_last_pc = 0;
 __thread uint64_t wp_saved_prev_fall_through = 0;
 __thread uint64_t wp_saved_prev_bb_ends_in_branch = 0;
-
-static __thread GArray *cp_mem_accesses = NULL;
 
 /*
  * Pending register snapshots produced by the per-insn reg-snap
@@ -240,82 +240,13 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
 
 /* ========================= Memory access callback ========================= */
 
-static __thread GByteArray *mem_read_buf;
-
-static GByteArray *mem_read_scratch(void)
-{
-    if (!mem_read_buf) {
-        mem_read_buf = g_byte_array_sized_new(CST_MAX_WIDE_BYTES);
-    }
-    g_byte_array_set_size(mem_read_buf, 0);
-    return mem_read_buf;
-}
-
 static void vcpu_mem_cb(unsigned int cpu_index,
                         qemu_plugin_meminfo_t info,
                         uint64_t vaddr,
                         void *udata)
 {
-    uint64_t insn_pc = (uint64_t)(uintptr_t)udata;
-
-    WPMemAccess acc = {
-        .insn_pc = insn_pc,
-        .mem_vaddr = vaddr,
-        .is_store = qemu_plugin_mem_is_store(info),
-        .data_size = 0,
-    };
-    cst_wide_zero(&acc.data);
-
     (void)cpu_index;
-
-    if (enable_mem_data) {
-        unsigned shift = qemu_plugin_mem_size_shift(info);
-        size_t access_size = shift >= 6 ? CST_MAX_WIDE_BYTES
-                                        : ((size_t)1 << shift);
-        if (access_size > CST_MAX_WIDE_BYTES) {
-            access_size = CST_MAX_WIDE_BYTES;
-        }
-        acc.data_size = (uint8_t)access_size;
-
-        if (shift <= 4) {
-            qemu_plugin_mem_value val = qemu_plugin_mem_get_value(info);
-            switch (val.type) {
-            case QEMU_PLUGIN_MEM_VALUE_U8:
-                acc.data = cst_wide_from_u64(val.data.u8);
-                break;
-            case QEMU_PLUGIN_MEM_VALUE_U16:
-                acc.data = cst_wide_from_u64(val.data.u16);
-                break;
-            case QEMU_PLUGIN_MEM_VALUE_U32:
-                acc.data = cst_wide_from_u64(val.data.u32);
-                break;
-            case QEMU_PLUGIN_MEM_VALUE_U64:
-                acc.data = cst_wide_from_u64(val.data.u64);
-                break;
-            case QEMU_PLUGIN_MEM_VALUE_U128:
-                cst_wide_zero(&acc.data);
-                acc.data.limb[0] = val.data.u128.low;
-                acc.data.limb[1] = val.data.u128.high;
-                break;
-            }
-        } else {
-            GByteArray *buf = mem_read_scratch();
-            if (qemu_plugin_read_memory_vaddr(vaddr, buf, access_size)) {
-                cst_wide_from_le_bytes(&acc.data, buf->data, buf->len);
-            } else {
-                acc.data_size = 0;
-            }
-        }
-    }
-
-    if (wp_in_progress && wp_mem_accesses) {
-        g_array_append_val(wp_mem_accesses, acc);
-        return;
-    }
-
-    if (g_trace_segments.is_active_atomic() && cp_mem_accesses) {
-        g_array_append_val(cp_mem_accesses, acc);
-    }
+    g_mem_recorder.record(info, vaddr, (uint64_t)(uintptr_t)udata);
 }
 
 /* ========================= Trace state management ========================= */
@@ -328,38 +259,6 @@ static void start_trace_segment(const char *label,
         g_hash_table_remove_all(cpu_to_thread_id);
     }
     next_thread_id = 0;
-}
-
-static void drain_cp_mem_into_dyn_params(GArray *dyn_params,
-                                         const BBTemplate *bb_tmpl)
-{
-    if (!cp_mem_accesses) {
-        return;
-    }
-    /*
-     * memops are recorded in execution order; insns within a BB execute
-     * sequentially, so insn_pc is monotonically non-decreasing across
-     * memops of a single entry.  Walk the template's insn_pcs[] in
-     * lockstep to assign insn_index.
-     */
-    guint idx = 0;
-    guint n_insns = bb_tmpl ? bb_tmpl->n_insns : 0;
-    for (guint m = 0; m < cp_mem_accesses->len; m++) {
-        const WPMemAccess *acc = &g_array_index(cp_mem_accesses,
-                                                WPMemAccess, m);
-        while (idx < n_insns && bb_tmpl->insn_pcs[idx] != acc->insn_pc) {
-            idx++;
-        }
-        DynParam dp = {
-            .type = (uint8_t)(acc->is_store ? DYN_STORE_ADDR : DYN_LOAD_ADDR),
-            .insn_index = (uint16_t)(idx < n_insns ? idx : 0),
-            .value = acc->mem_vaddr,
-            .data_size = acc->data_size,
-            .data = acc->data,
-        };
-        g_array_append_val(dyn_params, dp);
-    }
-    g_array_set_size(cp_mem_accesses, 0);
 }
 
 /*
@@ -409,12 +308,12 @@ static void flush_pending_final_body_entry(void)
             .seq_num = g_trace_segments.next_seq_num(),
             .template_id = bb_tmpl ? bb_tmpl->template_id : 0,
             .dyn_params = g_array_sized_new(false, false, sizeof(DynParam),
-                              cp_mem_accesses ? cp_mem_accesses->len : 0),
+                              g_mem_recorder.cp_count()),
             .reg_snaps = NULL,
             .wp_entries = NULL,
             .tmpl = bb_tmpl,
         };
-        drain_cp_mem_into_dyn_params(entry.dyn_params, bb_tmpl);
+        g_mem_recorder.drain_cp_into_dyn_params(entry.dyn_params, bb_tmpl);
         if (enable_reg_data && pending_reg_snaps) {
             entry.reg_snaps = g_array_ref(pending_reg_snaps);
             pending_reg_snaps = g_array_new(false, false, sizeof(RegSnap));
@@ -427,9 +326,7 @@ static void flush_pending_final_body_entry(void)
 reset:
     g_mutex_lock(&data_lock);
     g_cp_chain.reset();
-    if (cp_mem_accesses) {
-        g_array_set_size(cp_mem_accesses, 0);
-    }
+    g_mem_recorder.clear_cp();
     g_mutex_unlock(&data_lock);
 
     qemu_plugin_u64_set(g_scoreboard.prev_start_pc, 0, 0);
@@ -533,18 +430,17 @@ static void emit_finalized_bb(BodyStreamState *out_stream,
                               unsigned int cpu_index)
 {
     BodyEntry entry;
-    guint cp_mem_len = cp_mem_accesses ? cp_mem_accesses->len : 0;
     entry.seq_num = g_trace_segments.next_seq_num();
     entry.template_id = bb_tmpl ? bb_tmpl->template_id : 0;
     entry.dyn_params = g_array_sized_new(false, false,
-                         sizeof(DynParam), cp_mem_len);
+                         sizeof(DynParam), g_mem_recorder.cp_count());
     entry.reg_snaps = NULL;
     entry.wp_entries = NULL;
     entry.tmpl = bb_tmpl;
     entry.thread_id = cpu_to_thread_id
         ? get_or_assign_thread_id(cpu_index) : cpu_index;
 
-    drain_cp_mem_into_dyn_params(entry.dyn_params, bb_tmpl);
+    g_mem_recorder.drain_cp_into_dyn_params(entry.dyn_params, bb_tmpl);
     if (enable_reg_data && pending_reg_snaps) {
         entry.reg_snaps = g_array_ref(pending_reg_snaps);
         pending_reg_snaps = g_array_new(false, false, sizeof(RegSnap));
@@ -638,9 +534,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         return;
     }
 
-    if (!cp_mem_accesses) {
-        cp_mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
-    }
+    g_mem_recorder.ensure_cp_buffer();
 
     /* Snapshot the previous-TB scoreboard fields. */
     uint64_t current_pc = qemu_plugin_u64_get(g_scoreboard.current_pc, cpu_index);
@@ -901,9 +795,7 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
      * fragments from before and after the flush. */
     g_mutex_lock(&data_lock);
     g_cp_chain.reset();
-    if (cp_mem_accesses) {
-        g_array_set_size(cp_mem_accesses, 0);
-    }
+    g_mem_recorder.clear_cp();
     if (pending_reg_snaps) {
         g_array_set_size(pending_reg_snaps, 0);
     }
@@ -1002,9 +894,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     }
     g_free(unknown_warn_path);
 
-    if (cp_mem_accesses) {
-        g_array_unref(cp_mem_accesses);
-    }
+    MemAccessRecorder::cleanup_current_thread();
     RegSnapCollector::cleanup_current_thread();
 
     g_hash_table_unref(option_ht);

@@ -41,6 +41,7 @@ if get_option('plugins')
       'champsim_tracer_trace_segment_manager.cc',
       'champsim_tracer_reg_snap_collector.cc',
       'champsim_tracer_bb_chain_assembler.cc',
+      'champsim_tracer_mem_access_recorder.cc',
       'champsim_tracer_mnemonic_tables.c',
     )
   champsim_tracer_cpp_args = ['-std=gnu++17',

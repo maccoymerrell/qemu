@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unordered_map>
 
 #include "champsim_tracer.h"
 #include "champsim_tracer_bb_chain_assembler.h"
@@ -59,21 +60,17 @@ bool enable_reg_data = false;
 
 /* ========================= Thread ID assignment ========================= */
 
-static GHashTable *cpu_to_thread_id;
+static std::unordered_map<unsigned int, uint32_t> cpu_to_thread_id;
 static uint32_t next_thread_id = 0;
 
 static uint32_t get_or_assign_thread_id(unsigned int cpu_index)
 {
-    gpointer val = g_hash_table_lookup(cpu_to_thread_id,
-                                        GUINT_TO_POINTER(cpu_index + 1));
-    if (val) {
-        return GPOINTER_TO_UINT(val) - 1;
+    auto [it, inserted] = cpu_to_thread_id.try_emplace(cpu_index,
+                                                       next_thread_id);
+    if (inserted) {
+        next_thread_id++;
     }
-    uint32_t tid = next_thread_id++;
-    g_hash_table_insert(cpu_to_thread_id,
-                        GUINT_TO_POINTER(cpu_index + 1),
-                        GUINT_TO_POINTER(tid + 1));
-    return tid;
+    return it->second;
 }
 
 /* ========================= SimPoints ========================= */
@@ -223,9 +220,7 @@ static void start_trace_segment(const char *label,
                                 uint64_t start, uint64_t stop)
 {
     g_trace_segments.start(label, start, stop);
-    if (cpu_to_thread_id) {
-        g_hash_table_remove_all(cpu_to_thread_id);
-    }
+    cpu_to_thread_id.clear();
     next_thread_id = 0;
 }
 
@@ -251,8 +246,7 @@ static void emit_body_entry(BodyStreamState *out_stream,
     entry.reg_snaps = nullptr;
     entry.wp_entries = wp_entries;
     entry.tmpl = bb_tmpl;
-    entry.thread_id = cpu_to_thread_id
-        ? get_or_assign_thread_id(cpu_index) : cpu_index;
+    entry.thread_id = get_or_assign_thread_id(cpu_index);
 
     g_mem_recorder.drain_cp_into_dyn_params(entry.dyn_params, bb_tmpl);
     if (enable_reg_data && pending_reg_snaps) {
@@ -996,8 +990,6 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     active_insn_table_size = isa_insn_class_size[trace_isa];
     active_reg_table = isa_reg_class[trace_isa];
     active_reg_table_size = isa_reg_class_size[trace_isa];
-
-    cpu_to_thread_id = g_hash_table_new(g_direct_hash, g_direct_equal);
 
     if (!g_simpoints.is_active() && trace_start_insn == 0) {
         start_trace_segment("trace", 0, trace_stop_insn);

@@ -27,6 +27,8 @@
 #ifndef CHAMPSIM_TRACER_REG_SNAP_COLLECTOR_H
 #define CHAMPSIM_TRACER_REG_SNAP_COLLECTOR_H
 
+#include <vector>
+
 #include "champsim_tracer.h"
 
 class RegSnapCollector {
@@ -36,9 +38,6 @@ public:
     void read_into_snap(unsigned int cpu_index,
                         const QemuRegKey *key,
                         RegSnap *out);
-
-    /* Append @snap to a typed RegSnap GArray. */
-    static void append(GArray *arr, const RegSnap *snap);
 
     /* Wide-snap path used by the wrong-path simulator. */
     WideRegSnap *capture_wide(unsigned int cpu_index);
@@ -52,14 +51,14 @@ public:
     void capture_insn_snaps(const WideRegSnap *wide,
                             const BBTemplate *tmpl,
                             uint32_t insn_idx,
-                            GArray *out_snaps);
+                            std::vector<RegSnap> &out_snaps);
 
     /* Append source-reg snaps live, reading @cpu_index's registers
      * directly. */
     void capture_insn_snaps_live(unsigned int cpu_index,
                                  const BBTemplate *tmpl,
                                  uint32_t insn_idx,
-                                 GArray *out_snaps);
+                                 std::vector<RegSnap> &out_snaps);
 
     /* Release the calling thread's wide-snap and read-scratch buffers.
      * Plugin exit calls this on the main thread; other threads' state

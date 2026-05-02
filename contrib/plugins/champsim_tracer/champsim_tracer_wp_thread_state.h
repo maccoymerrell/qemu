@@ -14,6 +14,8 @@
 #ifndef CHAMPSIM_TRACER_WP_THREAD_STATE_H
 #define CHAMPSIM_TRACER_WP_THREAD_STATE_H
 
+#include <vector>
+
 #include "champsim_tracer.h"
 
 struct WPThreadState {
@@ -22,9 +24,10 @@ struct WPThreadState {
      * to gate CP-only logic. */
     bool in_progress = false;
 
-    /* Buffer of memops captured during the in-flight WP simulation.
-     * Allocated at WP-sim entry, freed at WP-sim exit. */
-    GArray *mem_accesses = nullptr;
+    /* Memops captured during the in-flight WP simulation.  Filled by
+     * MemAccessRecorder::record while in_progress is true; cleared by
+     * simulate_wrong_path_ext at end-of-sim. */
+    std::vector<WPMemAccess> mem_accesses;
 
     /* Snapshot of scoreboard state at WP-sim entry, restored at exit. */
     unsigned int saved_cpu_index = 0;

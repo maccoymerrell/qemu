@@ -11,6 +11,9 @@
 #include <inttypes.h>
 #include <string.h>
 
+#include <algorithm>
+#include <vector>
+
 #include "champsim_tracer.h"
 #include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_stats.h"
@@ -816,8 +819,8 @@ static inline bool field_state_block_get(FieldStateBlock *block,
  */
 struct EntryView {
     const BBTemplate *tmpl;
-    const GArray *dyn_params;   /* DynParam[]; sorted (insn_index,type)  */
-    const GArray *reg_snaps;    /* RegSnap[]; template-walk order        */
+    const std::vector<DynParam> *dyn_params; /* sorted (insn_index, type) */
+    const std::vector<RegSnap>  *reg_snaps;  /* template-walk order        */
     const uint32_t *actual_n_loads;
     const uint32_t *actual_n_stores;
     /* Pre-walked dyn_param index of the first load slot for insn i
@@ -948,9 +951,8 @@ static bool extr_src_reg(const EntryView *ev, uint32_t i, uint8_t slot,
     const InsnFields *f = &ev->tmpl->insn_fields[i];
     if (slot >= f->n_src_regs) return false;
     uint32_t pos = ev->insn_rs_off[i] + slot;
-    if (pos >= ev->reg_snaps->len) return false;
-    const RegSnap *s = &g_array_index(ev->reg_snaps, RegSnap, pos);
-    *out = s->value;
+    if (pos >= ev->reg_snaps->size()) return false;
+    *out = (*ev->reg_snaps)[pos].value;
     return true;
 }
 
@@ -1086,27 +1088,23 @@ static const FieldDescriptor field_descriptors[] = {
 
 /* Sort dyn_params so each insn's loads precede its stores, matching
  * the slot indexing used by find_memop_slot(). */
-static int dyn_param_cmp(const void * aa, const void * bb)
+static void dyn_params_sort_template_order(std::vector<DynParam> &dyn_params)
 {
-    const DynParam *a = (const DynParam *)aa;
-    const DynParam *b = (const DynParam *)bb;
-    if (a->insn_index != b->insn_index)
-        return (a->insn_index < b->insn_index) ? -1 : 1;
-    if (a->type != b->type)
-        return (a->type < b->type) ? -1 : 1;
-    return 0;
-}
-static void dyn_params_sort_template_order(GArray *dyn_params)
-{
-    if (!dyn_params || dyn_params->len < 2) return;
-    g_array_sort(dyn_params, dyn_param_cmp);
+    if (dyn_params.size() < 2) return;
+    std::sort(dyn_params.begin(), dyn_params.end(),
+              [](const DynParam &a, const DynParam &b) {
+                  if (a.insn_index != b.insn_index) {
+                      return a.insn_index < b.insn_index;
+                  }
+                  return a.type < b.type;
+              });
 }
 
 /* Build per-insn offset arrays into dyn_params and reg_snaps so
  * descriptor extracts run in O(1) per slot. */
 static void build_entry_view(EntryView *ev, const BBTemplate *tmpl,
-                             const GArray *dyn_params,
-                             const GArray *reg_snaps,
+                             const std::vector<DynParam> *dyn_params,
+                             const std::vector<RegSnap> *reg_snaps,
                              uint32_t *actual_n_loads,
                              uint32_t *actual_n_stores,
                              uint32_t *insn_dp_off,
@@ -1129,13 +1127,13 @@ static void build_entry_view(EntryView *ev, const BBTemplate *tmpl,
     uint32_t n = tmpl->n_insns;
     /* Walk dyn_params (already sorted by insn_index, type) once. */
     uint32_t k = 0;
-    uint32_t total_dp = dyn_params ? dyn_params->len : 0;
+    uint32_t total_dp = dyn_params ? (uint32_t)dyn_params->size() : 0;
     for (uint32_t i = 0; i < n; i++) {
         actual_n_loads[i] = 0;
         actual_n_stores[i] = 0;
         insn_dp_off[i] = k;
         while (k < total_dp) {
-            const DynParam *dp = &g_array_index(dyn_params, DynParam, k);
+            const DynParam *dp = &(*dyn_params)[k];
             if (dp->insn_index != i) break;
             if (dp->type == DYN_LOAD_ADDR) {
                 uint32_t slot = actual_n_loads[i]++;
@@ -1371,7 +1369,7 @@ static void bw_write_extra_memop_vector(BitWriter *bw, const EntryView *ev,
     uint32_t begin = ev->insn_dp_off[i];
     uint32_t end = ev->insn_dp_off[i + 1];
     for (uint32_t k = begin; k < end && written < extra; k++) {
-        const DynParam *dp = &g_array_index(ev->dyn_params, DynParam, k);
+        const DynParam *dp = &(*ev->dyn_params)[k];
         if (dp->type != want_type) {
             continue;
         }
@@ -1582,15 +1580,15 @@ static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
                                         FieldStateTable *base_state,
                                         uint32_t template_id,
                                         const BBTemplate *tmpl,
-                                        const GArray *dyn_params,
-                                        const GArray *reg_snaps,
+                                        const std::vector<DynParam> *dyn_params,
+                                        const std::vector<RegSnap> *reg_snaps,
                                         bool is_wp);
 
 static void emit_one_bb_delta(BitWriter *bw, BodyStreamState *st,
                               FieldStateTable *state, uint32_t template_id,
                               const BBTemplate *tmpl,
-                              const GArray *dyn_params,
-                              const GArray *reg_snaps,
+                              const std::vector<DynParam> *dyn_params,
+                              const std::vector<RegSnap> *reg_snaps,
                               bool is_wp)
 {
     emit_one_bb_delta_with_base(bw, st, state, nullptr, template_id,
@@ -1602,8 +1600,8 @@ static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
                                         FieldStateTable *base_state,
                                         uint32_t template_id,
                                         const BBTemplate *tmpl,
-                                        const GArray *dyn_params,
-                                        const GArray *reg_snaps,
+                                        const std::vector<DynParam> *dyn_params,
+                                        const std::vector<RegSnap> *reg_snaps,
                                         bool is_wp)
 {
     EntryView ev;
@@ -1621,16 +1619,16 @@ static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
                              st->header_flags);
 }
 
-void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
+void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
 {
     int64_t entry_tmpl = entry->template_id;
-    uint32_t num_wp = entry->wp_entries ? entry->wp_entries->len : 0;
+    uint32_t num_wp = (uint32_t)entry->wp_entries.size();
     uint64_t body_start = bw_tell_bytes(&st->bw);
 
     dyn_params_sort_template_order(entry->dyn_params);
     for (uint32_t w = 0; w < num_wp; w++) {
-        WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, w);
-        dyn_params_sort_template_order(wp->dyn_params);
+        WPBBEntry &wp = entry->wp_entries[w];
+        dyn_params_sort_template_order(wp.dyn_params);
     }
 
     if ((int64_t)entry->thread_id != st->current_thread) {
@@ -1645,7 +1643,7 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
     st->prev_entry_template = entry_tmpl;
 
     emit_one_bb_delta(&st->bw, st, st->cp_field_state, entry->template_id,
-                      entry->tmpl, entry->dyn_params, entry->reg_snaps,
+                      entry->tmpl, &entry->dyn_params, &entry->reg_snaps,
                       false);
 
     /* WP chain sub-section */
@@ -1661,15 +1659,14 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
             field_state_reset_wp(st->wp_field_state);
         }
         for (uint32_t w = 0; w < num_wp; w++) {
-            const WPBBEntry *wp = &g_array_index(entry->wp_entries,
-                                                 WPBBEntry, w);
+            const WPBBEntry *wp = &entry->wp_entries[w];
             uint32_t wp_tmpl = wp->template_id;
             bw_write_sleb128(&sub, (int64_t)wp_tmpl - prev_wp_template);
             prev_wp_template = wp_tmpl;
             emit_one_bb_delta_with_base(&sub, st, st->wp_field_state,
                                         st->cp_field_state, wp_tmpl,
-                                        wp->tmpl, wp->dyn_params,
-                                        wp->reg_snaps, true);
+                                        wp->tmpl, &wp->dyn_params,
+                                        &wp->reg_snaps, true);
         }
         bw_byte_align(&sub);
         bw_write_section(&st->bw, bw_finish_buf(&sub));
@@ -1679,8 +1676,7 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
     {
         uint32_t num_events = 0;
         for (uint32_t w = 0; w < num_wp; w++) {
-            const WPBBEntry *wp = &g_array_index(entry->wp_entries,
-                                                 WPBBEntry, w);
+            const WPBBEntry *wp = &entry->wp_entries[w];
             if (wp->fault || wp->translation_unavailable) {
                 num_events++;
             }
@@ -1693,8 +1689,7 @@ void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry)
         int64_t prev_event_idx = -1;
         uint64_t ev_start = bw_tell_bytes(&sub);
         for (uint32_t w = 0; w < num_wp; w++) {
-            const WPBBEntry *wp = &g_array_index(entry->wp_entries,
-                                                 WPBBEntry, w);
+            const WPBBEntry *wp = &entry->wp_entries[w];
             if (!wp->fault && !wp->translation_unavailable) {
                 continue;
             }

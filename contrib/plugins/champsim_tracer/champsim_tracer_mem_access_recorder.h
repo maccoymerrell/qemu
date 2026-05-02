@@ -14,6 +14,8 @@
 #ifndef CHAMPSIM_TRACER_MEM_ACCESS_RECORDER_H
 #define CHAMPSIM_TRACER_MEM_ACCESS_RECORDER_H
 
+#include <vector>
+
 #include "champsim_tracer.h"
 
 class MemAccessRecorder {
@@ -26,17 +28,16 @@ public:
                 uint64_t vaddr,
                 uint64_t insn_pc);
 
-    /* CP buffer accessors used by vcpu_tb_exec.  ensure_cp_buffer must
-     * be called from the CP path before any potential record() — the
-     * thread_local buffer is lazy-allocated. */
-    void ensure_cp_buffer();
+    /* CP buffer accessors used by vcpu_tb_exec.  The CP buffer is a
+     * thread_local std::vector that lazy-grows on first push; no
+     * explicit pre-allocation step is needed. */
     size_t cp_count() const;
     void clear_cp();
 
     /* Drain the CP accumulator into @dyn_params, attributing each
      * memop to the matching insn_pc within @bb_tmpl's insn list.
      * Empties the CP buffer on return. */
-    void drain_cp_into_dyn_params(GArray *dyn_params,
+    void drain_cp_into_dyn_params(std::vector<DynParam> &dyn_params,
                                   const BBTemplate *bb_tmpl);
 
     /* Release the calling thread's read-scratch and CP buffer.  Same

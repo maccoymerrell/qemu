@@ -14,8 +14,8 @@ MemAccessRecorder g_mem_recorder;
 
 namespace {
 
-thread_local GArray     *tls_cp_mem_accesses = nullptr;
-thread_local GByteArray *tls_mem_read_buf    = nullptr;
+thread_local std::vector<WPMemAccess> tls_cp_mem_accesses;
+thread_local GByteArray              *tls_mem_read_buf = nullptr;
 
 GByteArray *read_scratch()
 {
@@ -88,41 +88,30 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
         capture_mem_value(info, vaddr, &acc);
     }
 
-    if (g_wp_state.in_progress && g_wp_state.mem_accesses) {
-        g_array_append_val(g_wp_state.mem_accesses, acc);
+    if (g_wp_state.in_progress) {
+        g_wp_state.mem_accesses.push_back(acc);
         return;
     }
 
-    if (g_trace_segments.is_active_atomic() && tls_cp_mem_accesses) {
-        g_array_append_val(tls_cp_mem_accesses, acc);
-    }
-}
-
-void MemAccessRecorder::ensure_cp_buffer()
-{
-    if (!tls_cp_mem_accesses) {
-        tls_cp_mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
+    if (g_trace_segments.is_active_atomic()) {
+        tls_cp_mem_accesses.push_back(acc);
     }
 }
 
 size_t MemAccessRecorder::cp_count() const
 {
-    return tls_cp_mem_accesses ? tls_cp_mem_accesses->len : 0;
+    return tls_cp_mem_accesses.size();
 }
 
 void MemAccessRecorder::clear_cp()
 {
-    if (tls_cp_mem_accesses) {
-        g_array_set_size(tls_cp_mem_accesses, 0);
-    }
+    tls_cp_mem_accesses.clear();
 }
 
-void MemAccessRecorder::drain_cp_into_dyn_params(GArray *dyn_params,
-                                                 const BBTemplate *bb_tmpl)
+void MemAccessRecorder::drain_cp_into_dyn_params(
+    std::vector<DynParam> &dyn_params,
+    const BBTemplate *bb_tmpl)
 {
-    if (!tls_cp_mem_accesses) {
-        return;
-    }
     /*
      * memops are recorded in execution order; insns within a BB execute
      * sequentially, so insn_pc is monotonically non-decreasing across
@@ -131,30 +120,26 @@ void MemAccessRecorder::drain_cp_into_dyn_params(GArray *dyn_params,
      */
     unsigned int idx = 0;
     unsigned int n_insns = bb_tmpl ? bb_tmpl->n_insns : 0;
-    for (unsigned int m = 0; m < tls_cp_mem_accesses->len; m++) {
-        const WPMemAccess *acc = &g_array_index(tls_cp_mem_accesses,
-                                                WPMemAccess, m);
-        while (idx < n_insns && bb_tmpl->insn_pcs[idx] != acc->insn_pc) {
+    for (const WPMemAccess &acc : tls_cp_mem_accesses) {
+        while (idx < n_insns && bb_tmpl->insn_pcs[idx] != acc.insn_pc) {
             idx++;
         }
         DynParam dp = {
-            .type = (uint8_t)(acc->is_store ? DYN_STORE_ADDR : DYN_LOAD_ADDR),
+            .type = (uint8_t)(acc.is_store ? DYN_STORE_ADDR : DYN_LOAD_ADDR),
             .insn_index = (uint16_t)(idx < n_insns ? idx : 0),
-            .value = acc->mem_vaddr,
-            .data_size = acc->data_size,
-            .data = acc->data,
+            .value = acc.mem_vaddr,
+            .data_size = acc.data_size,
+            .data = acc.data,
         };
-        g_array_append_val(dyn_params, dp);
+        dyn_params.push_back(dp);
     }
-    g_array_set_size(tls_cp_mem_accesses, 0);
+    tls_cp_mem_accesses.clear();
 }
 
 void MemAccessRecorder::cleanup_current_thread()
 {
-    if (tls_cp_mem_accesses) {
-        g_array_unref(tls_cp_mem_accesses);
-        tls_cp_mem_accesses = nullptr;
-    }
+    tls_cp_mem_accesses.clear();
+    tls_cp_mem_accesses.shrink_to_fit();
     if (tls_mem_read_buf) {
         g_byte_array_unref(tls_mem_read_buf);
         tls_mem_read_buf = nullptr;

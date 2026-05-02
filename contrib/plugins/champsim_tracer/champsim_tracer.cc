@@ -25,6 +25,8 @@
 #include <string.h>
 #include <time.h>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "champsim_tracer.h"
 #include "champsim_tracer_bb_chain_assembler.h"
@@ -136,31 +138,7 @@ static GMutex exec_lock;
  * BodyEntry.reg_snaps at BB-finalize time, and discarded on flush.
  * Active only when enable_reg_data is true.
  */
-static __thread GArray *pending_reg_snaps = nullptr;
-
-/* ========================= Memory management ========================= */
-
-static void body_entry_clear(BodyEntry *entry)
-{
-    if (entry->dyn_params) {
-        g_array_unref(entry->dyn_params);
-    }
-    if (entry->reg_snaps) {
-        g_array_unref(entry->reg_snaps);
-    }
-    if (entry->wp_entries) {
-        for (unsigned int i = 0; i < entry->wp_entries->len; i++) {
-            WPBBEntry *wp = &g_array_index(entry->wp_entries, WPBBEntry, i);
-            if (wp->dyn_params) {
-                g_array_unref(wp->dyn_params);
-            }
-            if (wp->reg_snaps) {
-                g_array_unref(wp->reg_snaps);
-            }
-        }
-        g_array_unref(entry->wp_entries);
-    }
-}
+static thread_local std::vector<RegSnap> pending_reg_snaps;
 
 /* ========================= Reg-data snapshot capture =========================
  *
@@ -193,13 +171,10 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
     const InsnFields *f = &ref->tb_tmpl->insn_fields[ref->insn_index];
     const InsnRegNames *names = &ref->tb_tmpl->insn_reg_names[ref->insn_index];
 
-    if (!pending_reg_snaps) {
-        pending_reg_snaps = g_array_new(false, false, sizeof(RegSnap));
-    }
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         RegSnap s;
         g_reg_snaps.read_into_snap(cpu_index, &names->src_qemu_reg_keys[i], &s);
-        RegSnapCollector::append(pending_reg_snaps, &s);
+        pending_reg_snaps.push_back(s);
     }
 }
 
@@ -227,8 +202,7 @@ static void start_trace_segment(const char *label,
 /*
  * Build a BodyEntry from the calling thread's CP memop and reg-snap
  * accumulators and write it to @out_stream.  Drains the accumulators
- * as a side effect.  @wp_entries (may be nullptr) is moved into the
- * entry; the caller transfers ownership.
+ * as a side effect.  @wp_entries is moved into the entry.
  *
  * Caller must hold exec_lock.  data_lock is not held; the per-thread
  * accumulators are unsynchronised by design.
@@ -236,28 +210,25 @@ static void start_trace_segment(const char *label,
 static void emit_body_entry(BodyStreamState *out_stream,
                             BBTemplate *bb_tmpl,
                             unsigned int cpu_index,
-                            GArray *wp_entries)
+                            std::vector<WPBBEntry> wp_entries)
 {
     BodyEntry entry;
     entry.seq_num = g_trace_segments.next_seq_num();
     entry.template_id = bb_tmpl ? bb_tmpl->template_id : 0;
-    entry.dyn_params = g_array_sized_new(false, false, sizeof(DynParam),
-                         g_mem_recorder.cp_count());
-    entry.reg_snaps = nullptr;
-    entry.wp_entries = wp_entries;
+    entry.dyn_params.reserve(g_mem_recorder.cp_count());
+    entry.wp_entries = std::move(wp_entries);
     entry.tmpl = bb_tmpl;
     entry.thread_id = get_or_assign_thread_id(cpu_index);
 
     g_mem_recorder.drain_cp_into_dyn_params(entry.dyn_params, bb_tmpl);
-    if (enable_reg_data && pending_reg_snaps) {
-        entry.reg_snaps = g_array_ref(pending_reg_snaps);
-        pending_reg_snaps = g_array_new(false, false, sizeof(RegSnap));
+    if (enable_reg_data && !pending_reg_snaps.empty()) {
+        entry.reg_snaps = std::move(pending_reg_snaps);
+        pending_reg_snaps.clear();
     }
 
     if (out_stream) {
         body_stream_write_entry(out_stream, &entry);
     }
-    body_entry_clear(&entry);
 }
 
 /*
@@ -298,7 +269,7 @@ static void flush_pending_final_body_entry(void)
     }
 
     if (bb_tmpl) {
-        emit_body_entry(out_stream, bb_tmpl, cpu_index, nullptr);
+        emit_body_entry(out_stream, bb_tmpl, cpu_index, {});
     }
 
     g_mutex_lock(&data_lock);
@@ -410,7 +381,7 @@ static void emit_finalized_bb(BodyStreamState *out_stream,
     g_cp_chain.reset();
     g_mutex_unlock(&data_lock);
 
-    GArray *wp_entries = nullptr;
+    std::vector<WPBBEntry> wp_entries;
     if (enable_wrong_path && wrong_target != 0) {
         wp_entries = simulate_wrong_path_ext(
             prev_last, current_pc, wrong_target, cpu_index);
@@ -418,7 +389,7 @@ static void emit_finalized_bb(BodyStreamState *out_stream,
         g_stats.wp_skipped++;
     }
 
-    emit_body_entry(out_stream, bb_tmpl, cpu_index, wp_entries);
+    emit_body_entry(out_stream, bb_tmpl, cpu_index, std::move(wp_entries));
 }
 
 static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
@@ -491,8 +462,6 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         g_mutex_unlock(&exec_lock);
         return;
     }
-
-    g_mem_recorder.ensure_cp_buffer();
 
     /* Snapshot the previous-TB scoreboard fields. */
     uint64_t current_pc = qemu_plugin_u64_get(g_scoreboard.current_pc, cpu_index);
@@ -742,10 +711,7 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
                             g_wp_state.saved_prev_fall_through);
         qemu_plugin_u64_set(g_scoreboard.prev_bb_ends_in_branch, g_wp_state.saved_cpu_index,
                             g_wp_state.saved_prev_bb_ends_in_branch);
-        if (g_wp_state.mem_accesses) {
-            g_array_unref(g_wp_state.mem_accesses);
-            g_wp_state.mem_accesses = nullptr;
-        }
+        g_wp_state.mem_accesses.clear();
     }
 
     /* Drop partial BB being assembled — we can't know whether the flushed
@@ -754,9 +720,7 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
     g_mutex_lock(&data_lock);
     g_cp_chain.reset();
     g_mem_recorder.clear_cp();
-    if (pending_reg_snaps) {
-        g_array_set_size(pending_reg_snaps, 0);
-    }
+    pending_reg_snaps.clear();
     g_mutex_unlock(&data_lock);
 
     g_mutex_unlock(&exec_lock);

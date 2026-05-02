@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "champsim_tracer.h"
@@ -19,28 +20,6 @@
 #include "champsim_tracer_scoreboard.h"
 #include "champsim_tracer_stats.h"
 #include "champsim_tracer_wp_thread_state.h"
-
-/*
- * Internal scratch for a single in-progress wrong-path BB.  Six per-insn
- * parallel arrays accumulate template fragments as exec_tb runs them, plus
- * the dynamic memops attributed to the fragment.  All cleared at BB
- * boundaries, all destroyed when the simulation function returns.
- *
- * `bb_reg_snaps` stays a GArray because, on commit, ownership of the array
- * transfers wholesale into WPBBEntry::reg_snaps (which is a GArray field
- * across the TU boundary).
- */
-
-static GArray *wp_dyn_params_clone(const std::vector<DynParam> &src)
-{
-    if (src.empty()) {
-        return nullptr;
-    }
-    GArray *dst = g_array_sized_new(false, false, sizeof(DynParam), src.size());
-    g_array_set_size(dst, src.size());
-    memcpy(dst->data, src.data(), src.size() * sizeof(DynParam));
-    return dst;
-}
 
 /*
  * Execute wrong-path basic blocks starting from @wrong_target.
@@ -55,20 +34,21 @@ static GArray *wp_dyn_params_clone(const std::vector<DynParam> &src)
  *      execution for unconditional/call/return.
  *   5. Repeat until instruction depth reached or fault.
  *
- * Returns a GArray of WPBBEntry representing the wrong-path BB chain.
+ * Returns the WPBBEntry chain by value; callers move it into
+ * BodyEntry::wp_entries.
  */
-GArray *simulate_wrong_path_ext(uint64_t branch_pc,
-                                uint64_t correct_target,
-                                uint64_t wrong_target,
-                                unsigned int cpu_index)
+std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
+                                               uint64_t correct_target,
+                                               uint64_t wrong_target,
+                                               unsigned int cpu_index)
 {
     (void)branch_pc;
     (void)correct_target;
 
     unsigned int initial_insn_cap = max_wrong_path_depth > 16
         ? (unsigned int)max_wrong_path_depth : 16;
-    GArray *wp_chain = g_array_sized_new(false, false, sizeof(WPBBEntry),
-                                         initial_insn_cap);
+    std::vector<WPBBEntry> wp_chain;
+    wp_chain.reserve(initial_insn_cap);
     std::unordered_set<uint64_t> poisoned_targets;
     uint64_t sim_insns = 0;
     bool early_exit = false;
@@ -82,7 +62,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         return wp_chain;
     }
 
-    g_wp_state.mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
+    g_wp_state.mem_accesses.clear();
 
     g_wp_state.saved_cpu_index = cpu_index;
     g_wp_state.saved_insn_count = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
@@ -112,6 +92,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     std::vector<InsnFields>   bb_fields;
     std::vector<InsnRegNames> bb_regnames;
     std::vector<DynParam>     bb_dyn_params;
+    std::vector<RegSnap>      bb_reg_snaps;
     bb_pcs.reserve(initial_insn_cap);
     bb_sizes.reserve(initial_insn_cap);
     bb_bytes.reserve(initial_insn_cap * MAX_INSN_BYTES);
@@ -119,11 +100,8 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     bb_dyn_params.reserve(initial_insn_cap);
     if (enable_reg_data) {
         bb_regnames.reserve(initial_insn_cap);
+        bb_reg_snaps.reserve((size_t)initial_insn_cap * MAX_SRC_REGS);
     }
-    GArray *bb_reg_snaps = enable_reg_data
-        ? g_array_sized_new(false, false, sizeof(RegSnap),
-                            initial_insn_cap * MAX_SRC_REGS)
-        : nullptr;
     uint64_t bb_start_pc = 0;
     const char *bb_symbol_name = nullptr;
 
@@ -141,26 +119,23 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         bb_symbol_name = nullptr;
     };
 
-    /* Build a WPBBEntry from the current accumulator and transfer
-     * bb_reg_snaps ownership into it (allocating a fresh buffer for
-     * the next BB). */
+    /* Build a WPBBEntry from the current accumulator and move
+     * bb_reg_snaps / bb_dyn_params into it.  After this call the
+     * accumulator vectors are empty (moved-from); the caller still
+     * runs clear_accum() afterwards to reset bb_pcs/etc. */
     auto make_wp_entry = [&](BBTemplate *bb_tmpl, bool fault,
                              uint32_t fault_insn_index) {
-        WPBBEntry e = {
-            .template_id = bb_tmpl ? bb_tmpl->template_id : 0,
-            .start_pc = bb_start_pc,
-            .dyn_params = wp_dyn_params_clone(bb_dyn_params),
-            .n_insns_executed = (uint32_t)bb_pcs.size(),
-            .fault = fault,
-            .translation_unavailable = false,
-            .fault_insn_index = fault_insn_index,
-            .tmpl = bb_tmpl,
-            .reg_snaps = nullptr,
-        };
-        if (bb_reg_snaps) {
-            e.reg_snaps = bb_reg_snaps;
-            bb_reg_snaps = g_array_sized_new(false, false, sizeof(RegSnap),
-                                             initial_insn_cap * MAX_SRC_REGS);
+        WPBBEntry e;
+        e.template_id = bb_tmpl ? bb_tmpl->template_id : 0;
+        e.start_pc = bb_start_pc;
+        e.dyn_params = std::move(bb_dyn_params);
+        e.n_insns_executed = (uint32_t)bb_pcs.size();
+        e.fault = fault;
+        e.translation_unavailable = false;
+        e.fault_insn_index = fault_insn_index;
+        e.tmpl = bb_tmpl;
+        if (enable_reg_data) {
+            e.reg_snaps = std::move(bb_reg_snaps);
         }
         return e;
     };
@@ -168,7 +143,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     while (sim_insns < (uint64_t)max_wrong_path_depth ||
            !bb_pcs.empty()) {
         uint64_t pre_pc = qemu_plugin_get_pc();
-        unsigned int mem_start_idx = g_wp_state.mem_accesses->len;
+        size_t mem_start_idx = g_wp_state.mem_accesses.size();
         BBTemplate *tmpl = nullptr;
         bool tb_ok;
 
@@ -186,7 +161,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         g_mutex_unlock(&data_lock);
 
         bool tmpl_known_before_exec = (tmpl != nullptr);
-        if (bb_reg_snaps && tmpl_known_before_exec) {
+        if (enable_reg_data && tmpl_known_before_exec) {
             uint64_t last_pc = 0;
             uint8_t last_size = 0;
             const uint8_t *last_bytes = nullptr;
@@ -233,9 +208,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
         if (!tmpl) {
             RegSnapCollector::free_wide(wide);
             clear_accum();
-            if (bb_reg_snaps) {
-                g_array_set_size(bb_reg_snaps, 0);
-            }
+            bb_reg_snaps.clear();
             early_exit = true;
             break;
         }
@@ -284,7 +257,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                     bb_regnames.push_back(empty);
                 }
             }
-            if (bb_reg_snaps && !tmpl_known_before_exec) {
+            if (enable_reg_data && !tmpl_known_before_exec) {
                 g_reg_snaps.capture_insn_snaps(wide, tmpl, i, bb_reg_snaps);
             }
             appended_insns++;
@@ -307,23 +280,22 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
 
         /* Attribute mem accesses to insns within the just-appended
          * fragment by matching the recorded insn_pc. */
-        for (unsigned int m = mem_start_idx; m < g_wp_state.mem_accesses->len; m++) {
-            WPMemAccess *acc = &g_array_index(g_wp_state.mem_accesses,
-                                              WPMemAccess, m);
+        for (size_t m = mem_start_idx; m < g_wp_state.mem_accesses.size(); m++) {
+            const WPMemAccess &acc = g_wp_state.mem_accesses[m];
             uint16_t insn_idx = (uint16_t)bb_idx_base;
             for (uint32_t i = 0; i < tmpl->n_insns; i++) {
-                if (tmpl->insn_pcs[i] == acc->insn_pc) {
+                if (tmpl->insn_pcs[i] == acc.insn_pc) {
                     insn_idx = (uint16_t)(bb_idx_base + i);
                     break;
                 }
             }
             DynParam dp = {
-                .type = (uint8_t)(acc->is_store ? DYN_STORE_ADDR
+                .type = (uint8_t)(acc.is_store ? DYN_STORE_ADDR
                                                 : DYN_LOAD_ADDR),
                 .insn_index = insn_idx,
-                .value = acc->mem_vaddr,
-                .data_size = acc->data_size,
-                .data = acc->data,
+                .value = acc.mem_vaddr,
+                .data_size = acc.data_size,
+                .data = acc.data,
             };
             bb_dyn_params.push_back(dp);
             g_stats.wp_total_mem_accesses++;
@@ -380,8 +352,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
                 }
             }
 
-            WPBBEntry fault_wp = make_wp_entry(bb_tmpl, true, fault_idx);
-            g_array_append_val(wp_chain, fault_wp);
+            wp_chain.push_back(make_wp_entry(bb_tmpl, true, fault_idx));
 
             clear_accum();
 
@@ -436,8 +407,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             bb_symbol_name, fall_through);
         g_mutex_unlock(&data_lock);
 
-        WPBBEntry wp_bb = make_wp_entry(bb_tmpl, false, 0);
-        g_array_append_val(wp_chain, wp_bb);
+        wp_chain.push_back(make_wp_entry(bb_tmpl, false, 0));
 
         clear_accum();
 
@@ -445,10 +415,6 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
             early_exit = true;
             break;
         }
-    }
-
-    if (bb_reg_snaps) {
-        g_array_unref(bb_reg_snaps);
     }
 
     g_wp_state.in_progress = false;
@@ -465,8 +431,7 @@ GArray *simulate_wrong_path_ext(uint64_t branch_pc,
     qemu_plugin_cpu_state_restore(saved_state);
     qemu_plugin_cpu_state_free(saved_state);
 
-    g_array_unref(g_wp_state.mem_accesses);
-    g_wp_state.mem_accesses = nullptr;
+    g_wp_state.mem_accesses.clear();
 
     g_stats.wp_simulations++;
     g_stats.wp_total_insns += sim_insns;

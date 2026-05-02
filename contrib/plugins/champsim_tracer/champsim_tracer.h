@@ -267,10 +267,18 @@ typedef struct {
     CSTWideValue data;
 } DynParam;
 
-typedef struct {
+/*
+ * BodyEntry / WPBBEntry use std::vector for their dynamic arrays, so
+ * they are visible only to C++ TUs.  The C-only mnemonic_tables.c
+ * does not consume them.
+ */
+#ifdef __cplusplus
+#include <vector>
+
+struct WPBBEntry {
     uint32_t template_id;       /* TRUE BB id (start_pc → first branch) */
     uint64_t start_pc;
-    GArray *dyn_params;         /* dyn_params for THIS BB only; NULL if empty */
+    std::vector<DynParam> dyn_params;  /* memops captured during this WP BB */
     uint32_t n_insns_executed;  /* BB length when complete; partial on fault */
     bool fault;
     bool translation_unavailable;
@@ -283,24 +291,24 @@ typedef struct {
      */
     uint32_t fault_insn_index;
     BBTemplate *tmpl;  /* Non-owning; for per-insn schema access */
-    /* RegSnap array, ordered: for each insn in this BB, n_src snaps
-    * snaps only.  Captured pre-insn via a per-fragment wide regfile
-    * dump (see wp_capture_insn_snaps).  NULL when reg-data is disabled. */
-    GArray *reg_snaps;
-} WPBBEntry;
+    /* RegSnap vector, ordered: for each insn in this BB, n_src snaps
+     * only.  Captured pre-insn via a per-fragment wide regfile dump.
+     * Empty when reg-data is disabled. */
+    std::vector<RegSnap> reg_snaps;
+};
 
-typedef struct {
+struct BodyEntry {
     uint32_t seq_num;
     uint32_t template_id;
-    GArray *dyn_params;
-    /* RegSnap array, ordered: for each insn in the template, n_src
-     * snaps only.  Only populated when enable_reg_data is true; emitted
-     * in the register-data section. */
-    GArray *reg_snaps;
-    GArray *wp_entries;
+    std::vector<DynParam> dyn_params;
+    /* RegSnap vector, ordered: for each insn in the template, n_src
+     * snaps only.  Only populated when enable_reg_data is true. */
+    std::vector<RegSnap> reg_snaps;
+    std::vector<WPBBEntry> wp_entries;
     BBTemplate *tmpl;  /* Non-owning; for per-insn schema access */
     uint32_t thread_id;
-} BodyEntry;
+};
+#endif  /* __cplusplus */
 
 typedef struct {
     uint64_t current_pc;
@@ -422,15 +430,18 @@ typedef struct _WideRegSnap WideRegSnap;
 /* Reg-snap capture is provided by RegSnapCollector; see
  * champsim_tracer_reg_snap_collector.h. */
 
-/* Defined in champsim_tracer_wp.cc */
-GArray *simulate_wrong_path_ext(uint64_t branch_pc,
-                                uint64_t correct_target,
-                                uint64_t wrong_target,
-                                unsigned int cpu_index);
+/* Defined in champsim_tracer_wp.cc.  Returns the speculative chain by
+ * value; callers move it into BodyEntry::wp_entries. */
+#ifdef __cplusplus
+std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
+                                               uint64_t correct_target,
+                                               uint64_t wrong_target,
+                                               unsigned int cpu_index);
+#endif
 
 /* Defined in champsim_tracer_output.cc */
 BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime);
-void body_stream_write_entry(BodyStreamState *st, const BodyEntry *entry);
+void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry);
 void body_stream_finish(BodyStreamState *st);
 
 #endif /* CHAMPSIM_TRACER_H */

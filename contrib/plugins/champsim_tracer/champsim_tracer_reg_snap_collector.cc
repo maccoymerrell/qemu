@@ -104,13 +104,6 @@ void RegSnapCollector::read_into_snap(unsigned int cpu_index,
     cst_wide_from_le_bytes(&out->value, buf->data, (size_t)n);
 }
 
-void RegSnapCollector::append(GArray *arr, const RegSnap *snap)
-{
-    unsigned int pos = arr->len;
-    g_array_set_size(arr, pos + 1);
-    g_array_index(arr, RegSnap, pos) = *snap;
-}
-
 WideRegSnap *RegSnapCollector::capture_wide(unsigned int cpu_index)
 {
     if (!enable_reg_data) {
@@ -142,9 +135,9 @@ WideRegSnap *RegSnapCollector::capture_wide(unsigned int cpu_index)
 void RegSnapCollector::capture_insn_snaps(const WideRegSnap *wide,
                                           const BBTemplate *tmpl,
                                           uint32_t insn_idx,
-                                          GArray *out_snaps)
+                                          std::vector<RegSnap> &out_snaps)
 {
-    if (!enable_reg_data || !tmpl || !out_snaps ||
+    if (!enable_reg_data || !tmpl ||
         !tmpl->insn_reg_names || insn_idx >= tmpl->n_insns) {
         return;
     }
@@ -155,16 +148,16 @@ void RegSnapCollector::capture_insn_snaps(const WideRegSnap *wide,
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         RegSnap s;
         wide_lookup(&names->src_qemu_reg_keys[i], &s);
-        append(out_snaps, &s);
+        out_snaps.push_back(s);
     }
 }
 
 void RegSnapCollector::capture_insn_snaps_live(unsigned int cpu_index,
                                                const BBTemplate *tmpl,
                                                uint32_t insn_idx,
-                                               GArray *out_snaps)
+                                               std::vector<RegSnap> &out_snaps)
 {
-    if (!enable_reg_data || !tmpl || !out_snaps ||
+    if (!enable_reg_data || !tmpl ||
         !tmpl->insn_reg_names || insn_idx >= tmpl->n_insns) {
         return;
     }
@@ -173,7 +166,7 @@ void RegSnapCollector::capture_insn_snaps_live(unsigned int cpu_index,
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         RegSnap s;
         read_into_snap(cpu_index, &names->src_qemu_reg_keys[i], &s);
-        append(out_snaps, &s);
+        out_snaps.push_back(s);
     }
 }
 

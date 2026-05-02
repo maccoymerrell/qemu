@@ -447,6 +447,126 @@ static void finish_trace_segment(void)
 
 /* ========================= Execution callback ========================= */
 
+/*
+ * Update per-branch transition stats and the per-branch history record
+ * for the just-observed transition.  Returns the BranchRecord so the
+ * caller can hand it to the wrong-target resolver; null when the
+ * previous TB did not end in a branch.  Caller holds data_lock.
+ */
+static BranchRecord *observe_branch_transition(bool prev_is_branch,
+                                               bool branch_taken,
+                                               uint64_t prev_last,
+                                               uint64_t prev_ft)
+{
+    if (prev_is_branch) {
+        g_stats.branches_observed++;
+        if (branch_taken) {
+            g_stats.branches_taken++;
+        } else {
+            g_stats.branches_not_taken++;
+        }
+    }
+    BranchRecord *br = prev_is_branch
+        ? g_branch_history.get_or_create(prev_last, prev_ft)
+        : g_branch_history.find(prev_last);
+    if (br) {
+        br->fall_through = prev_ft;
+    }
+    return br;
+}
+
+/*
+ * Resolve the wrong-path target for a just-finalized basic block whose
+ * terminating branch lives in @prev_tb_tmpl.  Returns 0 when no
+ * plausible WP target exists (unconditional jump that took its sole
+ * direction; not a branch at all).  Caller holds data_lock.
+ */
+static uint64_t resolve_wrong_target(const BBTemplate *prev_tb_tmpl,
+                                     BranchRecord *br,
+                                     bool branch_taken,
+                                     uint64_t current_pc,
+                                     uint64_t prev_ft)
+{
+    int br_idx = BBTemplateCache::template_branch_index(prev_tb_tmpl);
+    const InsnFields *bf = (br_idx >= 0)
+        ? &prev_tb_tmpl->insn_fields[br_idx] : nullptr;
+    if (!bf) {
+        return 0;
+    }
+
+    bool is_indirect = bf->branch_type == BRANCH_INDIRECT_JUMP ||
+                       bf->branch_type == BRANCH_RETURN;
+    bool direct_cond = bf->branch_type == BRANCH_COND_DIRECT ||
+                       (bf->branch_type == BRANCH_DIRECT_JUMP &&
+                        bf->branch_conditional);
+
+    if (is_indirect) {
+        if (branch_taken) {
+            BranchHistory::note_target(br, current_pc);
+        }
+        return BranchHistory::indirect_wrong_target(br, current_pc, prev_ft);
+    }
+    if (branch_taken) {
+        /* CP took a direct branch → WP is the fall-through. */
+        return prev_ft;
+    }
+    if (direct_cond && bf->has_immediate &&
+        (uint64_t)bf->immediate != prev_ft) {
+        /* CP fell through a direct conditional → WP is the
+         * statically-resolved taken target. */
+        return (uint64_t)bf->immediate;
+    }
+    return 0;
+}
+
+/*
+ * Build a BodyEntry for the just-finalized BB, drain pending memops
+ * and reg-snaps into it, run the WP simulator if applicable, and
+ * write to @out_stream.  Caller holds exec_lock; data_lock must be
+ * unheld (this function takes data_lock around the cp_chain reset).
+ */
+static void emit_finalized_bb(BodyStreamState *out_stream,
+                              BBTemplate *bb_tmpl,
+                              uint64_t prev_last,
+                              uint64_t current_pc,
+                              uint64_t wrong_target,
+                              unsigned int cpu_index)
+{
+    BodyEntry entry;
+    guint cp_mem_len = cp_mem_accesses ? cp_mem_accesses->len : 0;
+    entry.seq_num = g_trace_segments.next_seq_num();
+    entry.template_id = bb_tmpl ? bb_tmpl->template_id : 0;
+    entry.dyn_params = g_array_sized_new(false, false,
+                         sizeof(DynParam), cp_mem_len);
+    entry.reg_snaps = NULL;
+    entry.wp_entries = NULL;
+    entry.tmpl = bb_tmpl;
+    entry.thread_id = cpu_to_thread_id
+        ? get_or_assign_thread_id(cpu_index) : cpu_index;
+
+    drain_cp_mem_into_dyn_params(entry.dyn_params, bb_tmpl);
+    if (enable_reg_data && pending_reg_snaps) {
+        entry.reg_snaps = g_array_ref(pending_reg_snaps);
+        pending_reg_snaps = g_array_new(false, false, sizeof(RegSnap));
+    }
+
+    g_mutex_lock(&data_lock);
+    g_cp_chain.reset();
+    g_mutex_unlock(&data_lock);
+
+    if (enable_wrong_path && wrong_target != 0) {
+        entry.wp_entries = simulate_wrong_path_ext(
+            prev_last, current_pc, wrong_target, cpu_index);
+    } else if (wrong_target == 0) {
+        g_stats.wp_skipped++;
+    }
+
+    if (out_stream) {
+        body_stream_write_entry(out_stream, &entry);
+    }
+    body_entry_clear(&entry);
+}
+
 static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 {
     uint64_t n_insns = (uint64_t)(uintptr_t)udata;
@@ -458,11 +578,12 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         return;
     }
 
+    /* Update the per-vCPU instruction counter (only on CP path; WP
+     * fragments are not counted). */
     if (!wp_in_progress) {
         uint64_t icount_prev = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
         qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index, icount_prev + n_insns);
     }
-
     uint64_t icount = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
 
     if (wp_in_progress) {
@@ -470,7 +591,10 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         return;
     }
 
-    /* --- Tracing window management --- */
+    /* --- Tracing window management.  May start/stop segments and
+     *     terminate the process on simpoint exhaustion or non-simpoint
+     *     stop.  Inline because the exit path holds exec_lock and we
+     *     must release it before exit() so plugin_exit can re-acquire. */
     if (g_simpoints.is_active()) {
         if (g_trace_segments.is_active() &&
             icount >= g_trace_segments.window_stop()) {
@@ -518,14 +642,15 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         cp_mem_accesses = g_array_new(false, false, sizeof(WPMemAccess));
     }
 
+    /* Snapshot the previous-TB scoreboard fields. */
     uint64_t current_pc = qemu_plugin_u64_get(g_scoreboard.current_pc, cpu_index);
     uint64_t prev_start = qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
-    uint64_t prev_last = qemu_plugin_u64_get(g_scoreboard.prev_last_pc, cpu_index);
-    uint64_t prev_ft = qemu_plugin_u64_get(g_scoreboard.prev_fall_through, cpu_index);
+    uint64_t prev_last  = qemu_plugin_u64_get(g_scoreboard.prev_last_pc, cpu_index);
+    uint64_t prev_ft    = qemu_plugin_u64_get(g_scoreboard.prev_fall_through, cpu_index);
     bool prev_is_branch = qemu_plugin_u64_get(g_scoreboard.prev_bb_ends_in_branch,
                                               cpu_index);
 
-    /* Skip initial block (no previous context) */
+    /* Skip initial block (no previous context). */
     if (prev_ft == 0) {
         g_mutex_unlock(&exec_lock);
         return;
@@ -533,69 +658,25 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     bool branch_taken = (current_pc != prev_ft);
 
+    /* --- Branch observation, chain assembly, and WP target resolution
+     *     all run under data_lock. */
     g_mutex_lock(&data_lock);
 
-    if (prev_is_branch) {
-        g_stats.branches_observed++;
-        if (branch_taken) {
-            g_stats.branches_taken++;
-        } else {
-            g_stats.branches_not_taken++;
-        }
-    }
+    BranchRecord *br = observe_branch_transition(
+        prev_is_branch, branch_taken, prev_last, prev_ft);
 
-    BranchRecord *br = prev_is_branch
-        ? g_branch_history.get_or_create(prev_last, prev_ft)
-        : g_branch_history.find(prev_last);
-    if (br) {
-        br->fall_through = prev_ft;
-    }
-
-    /* Append previous TB fragment to the in-flight basic-block chain. */
     BBTemplate *prev_tb_tmpl = g_bb_template_cache.find_tb_template(prev_start);
     if (prev_tb_tmpl) {
         g_cp_chain.append_fragment(prev_start, prev_tb_tmpl, prev_ft);
     }
 
-    bool finalize = prev_is_branch && prev_tb_tmpl != NULL;
-
-    uint64_t wrong_target = 0;
-    if (finalize) {
-        int br_idx = BBTemplateCache::template_branch_index(prev_tb_tmpl);
-        const InsnFields *bf = (br_idx >= 0)
-            ? &prev_tb_tmpl->insn_fields[br_idx] : NULL;
-        bool is_indirect = bf && (
-            bf->branch_type == BRANCH_INDIRECT_JUMP ||
-            bf->branch_type == BRANCH_RETURN);
-        bool direct_cond = bf && (
-            (bf->branch_type == BRANCH_COND_DIRECT) ||
-            (bf->branch_type == BRANCH_DIRECT_JUMP &&
-             bf->branch_conditional));
-
-        if (is_indirect) {
-            if (branch_taken) {
-                BranchHistory::note_target(br, current_pc);
-            }
-            wrong_target = BranchHistory::indirect_wrong_target(br,
-                                                                current_pc,
-                                                                prev_ft);
-        } else if (branch_taken) {
-            /* CP took a direct branch → WP is the fall-through. */
-            wrong_target = prev_ft;
-        } else if (direct_cond && bf->has_immediate &&
-                   (uint64_t)bf->immediate != prev_ft) {
-            /* CP fell through a direct conditional → WP is the
-             * statically-resolved taken target. */
-            wrong_target = (uint64_t)bf->immediate;
-        } else {
-            wrong_target = 0;
-        }
-    }
-
-    BBTemplate *bb_tmpl = NULL;
-    if (finalize && g_cp_chain.has_active_chain()) {
-        bb_tmpl = g_cp_chain.finalize();
-    }
+    bool finalize = prev_is_branch && prev_tb_tmpl != nullptr;
+    uint64_t wrong_target = finalize
+        ? resolve_wrong_target(prev_tb_tmpl, br, branch_taken,
+                               current_pc, prev_ft)
+        : 0;
+    BBTemplate *bb_tmpl = (finalize && g_cp_chain.has_active_chain())
+        ? g_cp_chain.finalize() : nullptr;
 
     g_mutex_unlock(&data_lock);
 
@@ -604,42 +685,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         return;
     }
 
-    /* --- Emit one body entry for the finalized basic block --- */
-    {
-        BodyEntry entry;
-        guint cp_mem_len = cp_mem_accesses ? cp_mem_accesses->len : 0;
-        entry.seq_num = g_trace_segments.next_seq_num();
-        entry.template_id = bb_tmpl ? bb_tmpl->template_id : 0;
-        entry.dyn_params = g_array_sized_new(false, false,
-                             sizeof(DynParam), cp_mem_len);
-        entry.reg_snaps = NULL;
-        entry.wp_entries = NULL;
-        entry.tmpl = bb_tmpl;
-        entry.thread_id = cpu_to_thread_id
-            ? get_or_assign_thread_id(cpu_index) : cpu_index;
-
-        drain_cp_mem_into_dyn_params(entry.dyn_params, bb_tmpl);
-        if (enable_reg_data && pending_reg_snaps) {
-            entry.reg_snaps = g_array_ref(pending_reg_snaps);
-            pending_reg_snaps = g_array_new(false, false, sizeof(RegSnap));
-        }
-
-        g_mutex_lock(&data_lock);
-        g_cp_chain.reset();
-        g_mutex_unlock(&data_lock);
-
-        if (enable_wrong_path && wrong_target != 0) {
-            entry.wp_entries = simulate_wrong_path_ext(
-                prev_last, current_pc, wrong_target, cpu_index);
-        } else if (wrong_target == 0) {
-            g_stats.wp_skipped++;
-        }
-
-        if (out_stream) {
-            body_stream_write_entry(out_stream, &entry);
-        }
-        body_entry_clear(&entry);
-    }
+    emit_finalized_bb(out_stream, bb_tmpl, prev_last, current_pc,
+                      wrong_target, cpu_index);
 
     g_mutex_unlock(&exec_lock);
 }

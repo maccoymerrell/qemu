@@ -35,6 +35,7 @@ if get_option('plugins')
       'champsim_tracer_branch_history.cc',
       'champsim_tracer_bb_template_cache.cc',
       'champsim_tracer_reg_handle_cache.cc',
+      'champsim_tracer_simpoint_manager.cc',
       'champsim_tracer_mnemonic_tables.c',
     )
   champsim_tracer_cpp_args = ['-std=gnu++17',

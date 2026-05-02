@@ -29,6 +29,7 @@
 #include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_branch_history.h"
 #include "champsim_tracer_reg_handle_cache.h"
+#include "champsim_tracer_simpoint_manager.h"
 #include "champsim_tracer_writer.h"
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
@@ -75,8 +76,6 @@ static uint32_t get_or_assign_thread_id(unsigned int cpu_index)
 
 static char *simpoints_file_path = NULL;
 static uint64_t simpoint_interval_insns = 100000000ULL;
-static GArray *simpoints_list = NULL;
-static guint simpoints_current_idx = 0;
 
 /* ========================= Decode / ISA ========================= */
 
@@ -590,106 +589,6 @@ static void vcpu_mem_cb(unsigned int cpu_index,
 
 /* ========================= Trace state management ========================= */
 
-static gint simpoint_entry_compare(gconstpointer a, gconstpointer b)
-{
-    const SimPointEntry *sa = (const SimPointEntry *)a;
-    const SimPointEntry *sb = (const SimPointEntry *)b;
-    if (sa->start_insn < sb->start_insn) {
-        return -1;
-    }
-    if (sa->start_insn > sb->start_insn) {
-        return 1;
-    }
-    return 0;
-}
-
-static void load_simpoint_weights_file(const char *path, GArray *entries)
-{
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        return;
-    }
-
-    char line[256];
-    while (fgets(line, sizeof(line), f)) {
-        double weight;
-        int cluster;
-
-        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') {
-            continue;
-        }
-
-        if (sscanf(line, "%lf %d", &weight, &cluster) == 2) {
-            for (guint i = 0; i < entries->len; i++) {
-                SimPointEntry *sp = &g_array_index(entries, SimPointEntry, i);
-                if (sp->cluster_id == cluster) {
-                    sp->weight = weight;
-                }
-            }
-        }
-    }
-
-    fclose(f);
-}
-
-/*
- * Parse native SimPoint selections.  Lines: <interval_id> <cluster_id>.
- * start/stop are derived as interval_id * simpoint_interval_insns.
- */
-static GArray *parse_simpoints_file(const char *path)
-{
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        fprintf(stderr, "champsim_tracer: cannot open simpoints file: %s\n", path);
-        return NULL;
-    }
-
-    GArray *entries = g_array_new(false, false, sizeof(SimPointEntry));
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') {
-            continue;
-        }
-
-        SimPointEntry sp = {0};
-        uint64_t interval_id;
-        int cluster_id = -1;
-        int parsed = sscanf(line, "%" SCNu64 " %d", &interval_id,
-                            &cluster_id);
-
-        if (parsed >= 1) {
-            uint64_t start = interval_id * simpoint_interval_insns;
-            uint64_t stop = (simpoint_interval_insns > UINT64_MAX - start)
-                ? UINT64_MAX
-                : start + simpoint_interval_insns;
-
-            sp.interval_id = interval_id;
-            sp.start_insn = start;
-            sp.stop_insn = stop;
-            sp.cluster_id = (parsed == 2) ? cluster_id : (int)entries->len;
-            sp.weight = 0.0;
-            g_array_append_val(entries, sp);
-        }
-    }
-
-    fclose(f);
-
-    {
-        g_autofree char *weights_path = NULL;
-        if (g_str_has_suffix(path, ".simpoints")) {
-            weights_path = g_strndup(path, strlen(path) - strlen(".simpoints"));
-            weights_path = g_strconcat(weights_path, ".weights", NULL);
-        } else {
-            weights_path = g_strdup_printf("%s.weights", path);
-        }
-        load_simpoint_weights_file(weights_path, entries);
-    }
-
-    g_array_sort(entries, simpoint_entry_compare);
-
-    return entries;
-}
-
 static void start_trace_segment(const char *label,
                                 uint64_t start, uint64_t stop)
 {
@@ -716,7 +615,7 @@ static void start_trace_segment(const char *label,
 
     g_autofree char *bin_path = NULL;
     if (output_base_path) {
-        bin_path = simpoints_list
+        bin_path = g_simpoints.is_active()
             ? g_strdup_printf("%s_%s.cst", output_base_path, label)
             : g_strdup_printf("%s.cst", output_base_path);
     }
@@ -935,27 +834,25 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     }
 
     /* --- Tracing window management --- */
-    if (simpoints_list) {
+    if (g_simpoints.is_active()) {
         if (trace_active && icount >= trace_stop_insn) {
             finish_trace_segment();
-            simpoints_current_idx++;
+            g_simpoints.advance();
         }
-        if (!trace_active && simpoints_current_idx < simpoints_list->len) {
-            SimPointEntry *sp = &g_array_index(simpoints_list,
-                                               SimPointEntry,
-                                               simpoints_current_idx);
-            if (icount >= sp->start_insn && icount < sp->stop_insn) {
-                trace_start_insn = sp->start_insn;
-                trace_stop_insn = sp->stop_insn;
-                g_autofree char *label =
-                    g_strdup_printf("sp%u", simpoints_current_idx);
-                start_trace_segment(label, sp->start_insn, sp->stop_insn);
+        if (!trace_active) {
+            if (const SimPointEntry *sp = g_simpoints.current()) {
+                if (icount >= sp->start_insn && icount < sp->stop_insn) {
+                    trace_start_insn = sp->start_insn;
+                    trace_stop_insn = sp->stop_insn;
+                    g_autofree char *label = g_strdup_printf(
+                        "sp%zu", g_simpoints.current_index());
+                    start_trace_segment(label, sp->start_insn, sp->stop_insn);
+                }
+            } else {
+                g_atomic_int_set(&trace_shutting_down, 1);
+                g_mutex_unlock(&exec_lock);
+                exit(0);
             }
-        }
-        if (!trace_active && simpoints_current_idx >= simpoints_list->len) {
-            g_atomic_int_set(&trace_shutting_down, 1);
-            g_mutex_unlock(&exec_lock);
-            exit(0);
         }
     } else {
         if (!trace_active && icount >= trace_start_insn &&
@@ -1397,10 +1294,10 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
             (double)stat_wp_total_insns / stat_wp_simulations);
     }
 
-    if (simpoints_list) {
+    if (g_simpoints.is_active()) {
         g_string_append_printf(report,
-            "SimPoints loaded/traced: %u / %u\n",
-            simpoints_list->len, simpoints_current_idx);
+            "SimPoints loaded/traced: %zu / %zu\n",
+            g_simpoints.size(), g_simpoints.current_index());
     }
 
     if (stat_bin_total_bits > 0) {
@@ -1438,9 +1335,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     g_free(wide_reg_scratch.entries);
     wide_reg_scratch.entries = NULL;
     wide_reg_scratch_cap = 0;
-    if (simpoints_list) {
-        g_array_unref(simpoints_list);
-    }
     if (cp_chain_fragments) {
         g_array_unref(cp_chain_fragments);
     }
@@ -1618,17 +1512,14 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     }
 
     if (simpoints_file_path) {
-        simpoints_list = parse_simpoints_file(simpoints_file_path);
-        if (!simpoints_list || simpoints_list->len == 0) {
+        if (!g_simpoints.load(simpoints_file_path, simpoint_interval_insns)) {
             fprintf(stderr, "champsim_tracer: no valid simpoints in: %s\n",
                     simpoints_file_path);
             g_free(simpoints_file_path);
             return -1;
         }
-        fprintf(stderr, "champsim_tracer: loaded %u simpoints from %s\n",
-                simpoints_list->len, simpoints_file_path);
-        simpoints_current_idx = 0;
-
+        fprintf(stderr, "champsim_tracer: loaded %zu simpoints from %s\n",
+                g_simpoints.size(), simpoints_file_path);
         trace_start_insn = 0;
         trace_stop_insn = UINT64_MAX;
     }
@@ -1659,7 +1550,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
 
     cpu_to_thread_id = g_hash_table_new(g_direct_hash, g_direct_equal);
 
-    if (!simpoints_list && trace_start_insn == 0) {
+    if (!g_simpoints.is_active() && trace_start_insn == 0) {
         start_trace_segment("trace", 0, trace_stop_insn);
     }
 

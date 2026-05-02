@@ -12,11 +12,17 @@
  * ------
  * Single-producer / single-consumer chunked queue.  Producer (the
  * QEMU CPU thread holding plugin data_lock) writes into a
- * preallocated chunk; when the chunk fills, it is published to a
- * GAsyncQueue and a fresh chunk is popped from the free list.  The
+ * preallocated chunk; when the chunk fills, it is published to the
+ * fill queue and a fresh chunk is popped from the free queue.  The
  * dedicated writer thread drains the fill queue, fwrite()s each
- * chunk, and recycles it onto the free list.  Total in-flight bytes
+ * chunk, and recycles it onto the free queue.  Total in-flight bytes
  * = WRITER_CHUNK_BYTES * WRITER_NUM_CHUNKS = 64 MiB.
+ *
+ * The bounded blocking queue is implemented inline with pthread
+ * mutex + condvars rather than std::mutex / std::condition_variable
+ * because libstdc++'s <mutex> transitively includes <cctype>, which
+ * pulls in QEMU's include/qemu/ctype.h shadow header on the plugin's
+ * search path and breaks the build (see champsim_tracer.h note).
  *
  * Lifecycle is per-TraceSegment: writer_start() is called after the
  * FILE* is opened (popen or fopen), writer_finish() before
@@ -26,7 +32,9 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include <errno.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "champsim_tracer.h"
@@ -37,12 +45,30 @@
 #define WRITER_NUM_CHUNKS  16u
 #define WRITER_FILE_BUFSZ  (4u * 1024u * 1024u)
 
+/* Queue capacity must hold every chunk plus the EOF sentinel.  +2 gives
+ * one slack slot so push never has to wait on a non-full queue path. */
+#define WRITER_QUEUE_CAP   (WRITER_NUM_CHUNKS + 2u)
+
 typedef struct {
     uint8_t *data;
     size_t   len;     /* bytes filled                                  */
     size_t   cap;     /* always WRITER_CHUNK_BYTES (kept for clarity)  */
     bool     eof;     /* sentinel chunk: tells consumer to exit        */
 } WriterChunk;
+
+/*
+ * Bounded blocking SPSC queue of WriterChunk*.  Uses a fixed-size
+ * circular buffer; push waits on `not_full`, pop on `not_empty`.
+ */
+typedef struct {
+    WriterChunk    *slots[WRITER_QUEUE_CAP];
+    unsigned        head;
+    unsigned        tail;
+    unsigned        count;
+    pthread_mutex_t lock;
+    pthread_cond_t  not_full;
+    pthread_cond_t  not_empty;
+} ChunkQueue;
 
 struct WriterCtx {
     FILE        *f;
@@ -58,13 +84,58 @@ struct WriterCtx {
      * separate from `chunks` so it never re-enters free_q. */
     WriterChunk  sentinel;
 
-    GAsyncQueue *free_q;
-    GAsyncQueue *fill_q;
+    ChunkQueue   free_q;
+    ChunkQueue   fill_q;
 
     /* Producer-private cursor.  When nullptr (post-finish), bw_raw
      * shouldn't be called any more. */
     WriterChunk *current;
 };
+
+/* ===== Queue primitives ===== */
+
+static void cq_init(ChunkQueue *q)
+{
+    memset(q->slots, 0, sizeof(q->slots));
+    q->head = q->tail = q->count = 0;
+    pthread_mutex_init(&q->lock, nullptr);
+    pthread_cond_init(&q->not_full, nullptr);
+    pthread_cond_init(&q->not_empty, nullptr);
+}
+
+static void cq_destroy(ChunkQueue *q)
+{
+    pthread_cond_destroy(&q->not_empty);
+    pthread_cond_destroy(&q->not_full);
+    pthread_mutex_destroy(&q->lock);
+}
+
+static void cq_push(ChunkQueue *q, WriterChunk *c)
+{
+    pthread_mutex_lock(&q->lock);
+    while (q->count == WRITER_QUEUE_CAP) {
+        pthread_cond_wait(&q->not_full, &q->lock);
+    }
+    q->slots[q->tail] = c;
+    q->tail = (q->tail + 1) % WRITER_QUEUE_CAP;
+    q->count++;
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->lock);
+}
+
+static WriterChunk *cq_pop(ChunkQueue *q)
+{
+    pthread_mutex_lock(&q->lock);
+    while (q->count == 0) {
+        pthread_cond_wait(&q->not_empty, &q->lock);
+    }
+    WriterChunk *c = q->slots[q->head];
+    q->head = (q->head + 1) % WRITER_QUEUE_CAP;
+    q->count--;
+    pthread_cond_signal(&q->not_full);
+    pthread_mutex_unlock(&q->lock);
+    return c;
+}
 
 /* ===== Internals ===== */
 
@@ -72,7 +143,7 @@ static void *writer_thread_main(void *arg)
 {
     WriterCtx *w = (WriterCtx *)arg;
     for (;;) {
-        WriterChunk *c = (WriterChunk *)g_async_queue_pop(w->fill_q);
+        WriterChunk *c = cq_pop(&w->fill_q);
         if (c->eof) {
             break;
         }
@@ -88,7 +159,7 @@ static void *writer_thread_main(void *arg)
             }
         }
         c->len = 0;
-        g_async_queue_push(w->free_q, c);
+        cq_push(&w->free_q, c);
     }
     fflush(w->f);
     return nullptr;
@@ -106,18 +177,18 @@ WriterCtx *writer_start(FILE *f, bool is_pipe)
      * fewer syscalls / pipe writes. */
     setvbuf(f, nullptr, _IOFBF, WRITER_FILE_BUFSZ);
 
-    WriterCtx *w = g_new0(WriterCtx, 1);
+    WriterCtx *w = (WriterCtx *)calloc(1, sizeof(WriterCtx));
     w->f = f;
     w->is_pipe = is_pipe;
-    w->free_q = g_async_queue_new();
-    w->fill_q = g_async_queue_new();
-    w->chunks = g_new0(WriterChunk, WRITER_NUM_CHUNKS);
+    cq_init(&w->free_q);
+    cq_init(&w->fill_q);
+    w->chunks = (WriterChunk *)calloc(WRITER_NUM_CHUNKS, sizeof(WriterChunk));
     for (unsigned i = 0; i < WRITER_NUM_CHUNKS; i++) {
-        w->chunks[i].data = (uint8_t *)g_malloc(WRITER_CHUNK_BYTES);
+        w->chunks[i].data = (uint8_t *)malloc(WRITER_CHUNK_BYTES);
         w->chunks[i].cap  = WRITER_CHUNK_BYTES;
         w->chunks[i].len  = 0;
         w->chunks[i].eof  = false;
-        g_async_queue_push(w->free_q, &w->chunks[i]);
+        cq_push(&w->free_q, &w->chunks[i]);
     }
     w->sentinel.data = nullptr;
     w->sentinel.cap  = 0;
@@ -125,7 +196,7 @@ WriterCtx *writer_start(FILE *f, bool is_pipe)
     w->sentinel.eof  = true;
 
     /* Pull the first chunk for the producer. */
-    w->current = (WriterChunk *)g_async_queue_pop(w->free_q);
+    w->current = cq_pop(&w->free_q);
 
     int rc = pthread_create(&w->thr, nullptr, writer_thread_main, w);
     if (rc != 0) {
@@ -149,8 +220,8 @@ void writer_submit(WriterCtx *w, const uint8_t *buf, size_t len)
     while (off < len) {
         size_t room = c->cap - c->len;
         if (room == 0) {
-            g_async_queue_push(w->fill_q, c);
-            c = (WriterChunk *)g_async_queue_pop(w->free_q);
+            cq_push(&w->fill_q, c);
+            c = cq_pop(&w->free_q);
             c->len = 0;
             w->current = c;
             continue;
@@ -169,14 +240,14 @@ void writer_finish(WriterCtx *w)
     }
     /* Flush partial last chunk, then sentinel. */
     if (w->current && w->current->len) {
-        g_async_queue_push(w->fill_q, w->current);
+        cq_push(&w->fill_q, w->current);
         w->current = nullptr;
     } else if (w->current) {
         /* Empty: return it to free list rather than the consumer. */
-        g_async_queue_push(w->free_q, w->current);
+        cq_push(&w->free_q, w->current);
         w->current = nullptr;
     }
-    g_async_queue_push(w->fill_q, &w->sentinel);
+    cq_push(&w->fill_q, &w->sentinel);
 
     if (w->thr_started) {
         pthread_join(w->thr, nullptr);
@@ -187,16 +258,12 @@ void writer_finish(WriterCtx *w)
      * should be empty (consumer drained or never started). */
     if (w->chunks) {
         for (unsigned i = 0; i < WRITER_NUM_CHUNKS; i++) {
-            g_free(w->chunks[i].data);
+            free(w->chunks[i].data);
         }
-        g_free(w->chunks);
+        free(w->chunks);
         w->chunks = nullptr;
     }
-    if (w->free_q) {
-        g_async_queue_unref(w->free_q);
-    }
-    if (w->fill_q) {
-        g_async_queue_unref(w->fill_q);
-    }
-    g_free(w);
+    cq_destroy(&w->free_q);
+    cq_destroy(&w->fill_q);
+    free(w);
 }

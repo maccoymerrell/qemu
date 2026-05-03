@@ -1,4 +1,4 @@
-# champsim_tracer Binary Format - v1.8
+# champsim_tracer Binary Format - v1.9
 
 Status: current. This document describes the on-disk `.cst` stream
 written by [champsim_tracer_output.cc](champsim_tracer_output.cc) and
@@ -321,20 +321,38 @@ decode:
   current = (baseline + delta) mod 2**512
 ```
 
-Correct-path state persists for the whole body stream. Wrong-path state
-is copied from CP state for one chain and then thrown away.
+CP and WP each have their own overlay of `(template_id, ins_pos, field_id)`
+→ value, both persisting for the whole body stream. WP records lookup
+the WP overlay first, fall back to the CP overlay on miss, then to
+the field's template default. Updates always write to the active
+overlay (CP overlay for CP records, WP overlay for WP records); the
+WP overlay never modifies CP state, so CP reconstruction is
+unaffected by speculative side effects.
 
 ```
 CP entry N:
 
   cp_state before ---- cp_delta_section ----> cp_state after
-                              |
-                              +-- copy --> wp_state for this chain
+  wp_state before ---- (unchanged on CP)       wp_state before
+                              |                       |
+                              +-- WP chain ---+       |
+                                              |       |
+                              wp_state(N-1) --+-------+
                                               |
                                               +-- wp block 0 deltas
+                                              |   (lookup wp first,
+                                              |    cp on miss)
                                               +-- wp block 1 deltas
-                                              +-- discarded
+                                              |
+                                              +-- wp_state(N) (kept)
 ```
+
+Note: v1.7 and v1.8 reset the WP overlay at every chain start
+(`wp_state := dict(cp_state)`). v1.9 changed this to a persistent
+WP overlay with CP fallback so that hot WP templates visited from
+many chains delta against their prior WP-observed value instead of
+paying the first-observation cost on every chain. Decoders MUST
+gate this behavior on the magic byte.
 
 ### 5.1 Field-ID Space
 

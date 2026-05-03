@@ -284,7 +284,8 @@ def audit(path: Path) -> _Stats:
     body_byte_count = tr.u64_le()
     trailer_magic   = tr.u64_le()
     if trailer_magic not in (dec.CST_TRAILER_MAGIC_V17,
-                             dec.CST_TRAILER_MAGIC_V18):
+                             dec.CST_TRAILER_MAGIC_V18,
+                             dec.CST_TRAILER_MAGIC_V19):
         raise ValueError(f"bad trailer magic 0x{trailer_magic:016x}")
     s.trailer = dec.CST_TRAILER_SIZE
     s.body_total = body_byte_count
@@ -292,12 +293,14 @@ def audit(path: Path) -> _Stats:
     # Header
     hr = _R(m, 0)
     magic = hr.u32_le()
-    if magic not in (dec.CST_MAGIC_V17, dec.CST_MAGIC_V18):
+    if magic not in (dec.CST_MAGIC_V17, dec.CST_MAGIC_V18, dec.CST_MAGIC_V19):
         raise ValueError("bad header magic")
-    if ((magic == dec.CST_MAGIC_V18 and
-         trailer_magic != dec.CST_TRAILER_MAGIC_V18) or
-            (magic == dec.CST_MAGIC_V17 and
-             trailer_magic != dec.CST_TRAILER_MAGIC_V17)):
+    expected_trailer = {
+        dec.CST_MAGIC_V17: dec.CST_TRAILER_MAGIC_V17,
+        dec.CST_MAGIC_V18: dec.CST_TRAILER_MAGIC_V18,
+        dec.CST_MAGIC_V19: dec.CST_TRAILER_MAGIC_V19,
+    }[magic]
+    if trailer_magic != expected_trailer:
         raise ValueError("header/trailer CST version mismatch")
     hr.u8()                  # isa
     hr.u8()                  # flags

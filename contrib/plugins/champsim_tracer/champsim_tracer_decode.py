@@ -32,10 +32,12 @@ from pathlib import Path
 # 'C','S','T',version little-endian
 CST_MAGIC_V17 = 0x17545343
 CST_MAGIC_V18 = 0x18545343
-CST_MAGIC = CST_MAGIC_V18
+CST_MAGIC_V19 = 0x19545343
+CST_MAGIC = CST_MAGIC_V19
 CST_TRAILER_MAGIC_V17 = 0x17545343FFFFFFFF
 CST_TRAILER_MAGIC_V18 = 0x18545343FFFFFFFF
-CST_TRAILER_MAGIC = CST_TRAILER_MAGIC_V18
+CST_TRAILER_MAGIC_V19 = 0x19545343FFFFFFFF
+CST_TRAILER_MAGIC = CST_TRAILER_MAGIC_V19
 CST_TRAILER_SIZE = 64
 
 CST_FLAG_MEM_DATA      = 1 << 0
@@ -392,7 +394,7 @@ def _decode_templates_section(br: ByteReader,
     return templates, template_by_id
 
 
-# --- Body decoding (v1.7/v1.8 unified field-typed delta stream) -----
+# --- Body decoding (v1.7-v1.9 unified field-typed delta stream) -----
 
 def _template_default(tmpl: dict | None, ipos: int, fid: int) -> int:
     """Return the per-(template, insn-position, field-id) baseline used
@@ -445,13 +447,18 @@ def _decode_field_delta_section(
         tmpl: dict | None,
         state: dict[tuple[int, int, int], int],
         flags: int,
-        scalar_mask: int
+        scalar_mask: int,
+        base_state: dict[tuple[int, int, int], int] | None = None
         ) -> tuple[list[DynParam], list[dict]]:
     """Read one length-prefixed delta_section, apply records to the
     per-(template_id, ins_pos, field_id) state map, and reconstruct
     the consumer-facing (dyn_params, reg_snaps) shape the validator API
     expects.  Scalar records update persistent state; EXTRA_* records
-    provide raw overflow memop vectors for this entry only."""
+    provide raw overflow memop vectors for this entry only.
+
+    If @base_state is provided (v1.9 WP path), keys not yet present in
+    @state fall back to it before fall through to the template default.
+    Updates always go to @state (the writable overlay)."""
     sec = br.sub()
     n_records = sec.uleb()
 
@@ -474,6 +481,8 @@ def _decode_field_delta_section(
             continue
         key = (template_id, pos, fid)
         base = state.get(key)
+        if base is None and base_state is not None:
+            base = base_state.get(key)
         if base is None:
             base = _template_default(tmpl, pos, fid)
         cur = (base + delta) & scalar_mask
@@ -493,7 +502,10 @@ def _decode_field_delta_section(
     has_mem = bool(flags & CST_FLAG_MEM_DATA)
 
     def _state_or_default(ipos: int, fid: int) -> int:
-        v = state.get((template_id, ipos, fid))
+        key = (template_id, ipos, fid)
+        v = state.get(key)
+        if v is None and base_state is not None:
+            v = base_state.get(key)
         if v is None:
             v = _template_default(tmpl, ipos, fid)
         return v
@@ -582,7 +594,7 @@ def _decode_field_delta_section(
 
 def decode_champsim_tracer(bin_path: Path
                            ) -> tuple[dict, list[dict], list[dict]]:
-    """Decode a v1.7/v1.8 trace file.  Returns (meta, templates, entries).
+    """Decode a v1.7/v1.8/v1.9 trace file.  Returns (meta, templates, entries).
     Public API; stable across minor revisions of the decoder."""
     data = bin_path.read_bytes()
     if len(data) < CST_TRAILER_SIZE:
@@ -595,23 +607,29 @@ def decode_champsim_tracer(bin_path: Path
     body_off        = trailer.u64_le()
     body_byte_count = trailer.u64_le()
     trailer_magic   = trailer.u64_le()
-    if trailer_magic not in (CST_TRAILER_MAGIC_V17, CST_TRAILER_MAGIC_V18):
+    if trailer_magic not in (CST_TRAILER_MAGIC_V17, CST_TRAILER_MAGIC_V18,
+                             CST_TRAILER_MAGIC_V19):
         raise ValueError(
             f"Bad trailer magic 0x{trailer_magic:016x}, "
-            f"expected 0x{CST_TRAILER_MAGIC_V17:016x} or "
-            f"0x{CST_TRAILER_MAGIC_V18:016x}"
+            f"expected 0x{CST_TRAILER_MAGIC_V17:016x}, "
+            f"0x{CST_TRAILER_MAGIC_V18:016x}, or "
+            f"0x{CST_TRAILER_MAGIC_V19:016x}"
         )
 
     # --- Read header ---
     br = ByteReader(data)
     magic = br.u32_le()
-    if magic not in (CST_MAGIC_V17, CST_MAGIC_V18):
+    if magic not in (CST_MAGIC_V17, CST_MAGIC_V18, CST_MAGIC_V19):
         raise ValueError(
-            f"Bad magic 0x{magic:08x}, expected 0x{CST_MAGIC_V17:08x} "
-            f"or 0x{CST_MAGIC_V18:08x}"
+            f"Bad magic 0x{magic:08x}, expected 0x{CST_MAGIC_V17:08x}, "
+            f"0x{CST_MAGIC_V18:08x}, or 0x{CST_MAGIC_V19:08x}"
         )
-    if ((magic == CST_MAGIC_V18 and trailer_magic != CST_TRAILER_MAGIC_V18) or
-            (magic == CST_MAGIC_V17 and trailer_magic != CST_TRAILER_MAGIC_V17)):
+    expected_trailer = {
+        CST_MAGIC_V17: CST_TRAILER_MAGIC_V17,
+        CST_MAGIC_V18: CST_TRAILER_MAGIC_V18,
+        CST_MAGIC_V19: CST_TRAILER_MAGIC_V19,
+    }[magic]
+    if trailer_magic != expected_trailer:
         raise ValueError("Header/trailer CST version mismatch")
     isa          = br.u8()
     flags        = br.u8()
@@ -633,7 +651,8 @@ def decode_champsim_tracer(bin_path: Path
 
     has_mem_data = bool(flags & CST_FLAG_MEM_DATA)
     has_reg_data = bool(flags & CST_FLAG_REG_DATA)
-    scalar_mask = MASK512 if magic == CST_MAGIC_V18 else MASK128
+    scalar_mask = MASK128 if magic == CST_MAGIC_V17 else MASK512
+    wp_persistent = (magic == CST_MAGIC_V19)
 
     # --- Read templates ---
     templates: list[dict] = []
@@ -685,18 +704,19 @@ def decode_champsim_tracer(bin_path: Path
         wpb = body.sub()
         num_wp = wpb.uleb()
         prev_wp_tmpl = 0
-        if num_wp > 0:
-            # Fork CP→WP state at chain start; discarded at chain end
-            # (overwritten on the next chain).  Speculative execution
-            # begins at the CP architectural state.
+        if num_wp > 0 and not wp_persistent:
+            # v1.7/v1.8: fork CP→WP state at chain start; discarded
+            # at chain end.  v1.9 keeps wp_field_state across chains
+            # and falls back to cp_field_state on miss instead.
             wp_field_state = dict(cp_field_state)
+        wp_base = cp_field_state if wp_persistent else None
         for w in range(num_wp):
             wp_tmpl = prev_wp_tmpl + wpb.sleb()
             prev_wp_tmpl = wp_tmpl
             wp_tmpl_dict = template_by_id.get(wp_tmpl)
             wp_dyn, wp_reg_snaps = _decode_field_delta_section(
                 wpb, wp_tmpl, wp_tmpl_dict, wp_field_state, flags,
-                scalar_mask)
+                scalar_mask, base_state=wp_base)
             wp_entries.append({
                 "index": w,
                 "template_id": wp_tmpl,
@@ -745,7 +765,11 @@ def decode_champsim_tracer(bin_path: Path
 
     meta = {
         "magic": magic,
-        "format_version": 0x18 if magic == CST_MAGIC_V18 else 0x17,
+        "format_version": {
+            CST_MAGIC_V17: 0x17,
+            CST_MAGIC_V18: 0x18,
+            CST_MAGIC_V19: 0x19,
+        }[magic],
         "isa": isa,
         "target_name": target_name,
         "flags": flags,
@@ -952,7 +976,7 @@ def _first_diff_line(a: str, b: str) -> tuple[int, str, str] | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Decode champsim_tracer binary (.cst, v1.7/v1.8) to text")
+        description="Decode champsim_tracer binary (.cst, v1.7/v1.8/v1.9) to text")
     parser.add_argument("bin", type=Path)
     parser.add_argument("-o", "--out", type=Path)
     parser.add_argument("--expect", type=Path)

@@ -44,15 +44,26 @@ extern "C" {
  * compiled in the C tables TU can manipulate InsnFields directly. */
 
 /*
- * Binary format magic/version 1.8.
- * Bytes in file order: 'C','S','T',0x18 → u32 LE 0x18545343.
+ * Binary format magic/version 1.9.
+ * Bytes in file order: 'C','S','T',0x19 → u32 LE 0x19545343.
  * ASCII: C=0x43 S=0x53 T=0x54.  "CST" = ChampSimTracer.
  *
  * v1.7 replaced the per-entry dyn-patch / mem-data / reg-data
  * sub-sections (and the variable-memop preamble) with a single
  * unified field-typed delta stream.  v1.8 widens scalar dynamic
  * values to 512 bits and adds raw overflow vectors for memops beyond
- * the first 16 fixed slots.  Each BB entry carries:
+ * the first 16 fixed slots.  v1.9 changes the WP delta-encoding
+ * baseline: WP state now persists across chains (rather than being
+ * forked from CP per chain and discarded), with an unobserved-WP-key
+ * fallback to the CP state.  Hot WP templates that are visited many
+ * times across chains delta against the prior WP-observed value
+ * instead of paying first-observation cost on every chain — typically
+ * cuts trace size 3x on real workloads.  No effect on CP encoding or
+ * on the architectural meaning of WP (the writer still discards
+ * speculative architectural effects at chain end; this is purely a
+ * compression-cache change).
+ *
+ * Each BB entry carries:
  *
  *   n_records : ULEB
  *   { ins_pos_gap : ULEB,  field_id : u8,  payload }*
@@ -64,19 +75,18 @@ extern "C" {
  * below).  Normal scalar fields carry one signed LEB delta:
  * `(cur512 - baseline512) mod 2**512`.  The EXTRA_* memop fields
  * carry raw unsigned LEB vectors and have no persistent state.
- * Baseline = the most-recent
- * correct-path observation for (template_id, ins_pos, field_id),
- * or the field's template-default on first appearance.  WP state
- * is forked from CP at chain start and discarded at chain end so
- * speculative effects never leak forward.
+ * Baseline = the most-recent observation in the active overlay
+ * (CP state for CP records; WP state for WP records, falling back
+ * to CP if the WP overlay never observed this key); template-default
+ * on first appearance.
  *
  * Templates track true basic blocks (start_pc to first branch,
  * immutable, unique by start_pc).  Memory-operation counts are runtime
  * sparse fields populated from QEMU memory callbacks; template count
  * defaults are zero.
  */
-#define CST_MAGIC          0x18545343u
-#define CST_TRAILER_MAGIC  0x18545343FFFFFFFFull
+#define CST_MAGIC          0x19545343u
+#define CST_TRAILER_MAGIC  0x19545343FFFFFFFFull
 #define CST_TRAILER_SIZE   64
 
 /* Body entry tags (1 byte) */

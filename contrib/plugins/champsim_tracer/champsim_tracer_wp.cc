@@ -63,6 +63,9 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     }
 
     g_wp_state.mem_accesses.clear();
+    g_wp_state.mem_overflow = false;
+    g_wp_state.cur_insn_pc = 0;
+    g_wp_state.cur_insn_count = 0;
 
     g_wp_state.saved_cpu_index = cpu_index;
     g_wp_state.saved_insn_count = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
@@ -146,6 +149,15 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         size_t mem_start_idx = g_wp_state.mem_accesses.size();
         BBTemplate *tmpl = nullptr;
         bool tb_ok;
+
+        if (g_wp_state.mem_overflow) {
+            /* A previous TB execution flooded mem_accesses past the
+             * cap (typically a REP-prefixed string instruction with
+             * junk speculative RCX).  Continuing risks heap exhaustion
+             * and a NULL deref in QEMU's plugin machinery. */
+            early_exit = true;
+            break;
+        }
 
         if (poisoned_targets.count(pre_pc)) {
             early_exit = true;

@@ -89,6 +89,26 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
     }
 
     if (g_wp_state.in_progress) {
+        /* Per-instruction cap: a single REP-prefixed string instruction
+         * (e.g. rep stosb) executed speculatively with arbitrary
+         * CP-restored RCX can fire millions of memops in a single
+         * qemu_plugin_exec_tb() call.  Recording beyond CST_FID_SLOT_COUNT
+         * accomplishes nothing for the wire format (which slots only
+         * the first 16 memops per insn into the unified delta stream
+         * and relegates the rest to extra-memop vectors that bloat the
+         * trace to no consumer benefit on a wrong path).  Cap at the
+         * slot count, drop the rest, and signal the WP loop to bail on
+         * its next iteration so we don't spin on the rest of the REP. */
+        if (insn_pc == g_wp_state.cur_insn_pc) {
+            g_wp_state.cur_insn_count++;
+        } else {
+            g_wp_state.cur_insn_pc = insn_pc;
+            g_wp_state.cur_insn_count = 1;
+        }
+        if (g_wp_state.cur_insn_count > CST_FID_SLOT_COUNT) {
+            g_wp_state.mem_overflow = true;
+            return;
+        }
         g_wp_state.mem_accesses.push_back(acc);
         return;
     }
@@ -138,8 +158,19 @@ void MemAccessRecorder::drain_cp_into_dyn_params(
 
 void MemAccessRecorder::cleanup_current_thread()
 {
+    /* tls_cp_mem_accesses is a thread_local vector.  We clear() it
+     * here for symmetry with the tls_mem_read_buf release below, but
+     * deliberately DO NOT call shrink_to_fit().  This function runs
+     * from plugin_exit (atexit) before the TLS destructors fire; on
+     * real workloads the CP buffer can be MiB-sized (e.g. one REP
+     * STOSB iterating millions of times records millions of memops),
+     * and at that size glibc backs the allocation with a direct mmap.
+     * Forcing a free at atexit-time has been observed to SIGSEGV deep
+     * in __libc_free during late process teardown, presumably because
+     * some heap-management state is already torn down.  The TLS
+     * destructor naturally walks the vector's destructor afterwards
+     * and frees the buffer cleanly. */
     tls_cp_mem_accesses.clear();
-    tls_cp_mem_accesses.shrink_to_fit();
     if (tls_mem_read_buf) {
         g_byte_array_unref(tls_mem_read_buf);
         tls_mem_read_buf = nullptr;

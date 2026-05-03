@@ -191,12 +191,42 @@ static void vcpu_mem_cb(unsigned int cpu_index,
 
 /* ========================= Trace state management ========================= */
 
+/* Heartbeat state for the active segment.  progress_step is one tenth
+ * of the segment's instruction span (clamped to >=1).  progress_next is
+ * the next icount value at which we'll print a progress line. */
+static uint64_t progress_step = 0;
+static uint64_t progress_next = 0;
+
 static void start_trace_segment(const char *label,
                                 uint64_t start, uint64_t stop)
 {
     g_trace_segments.start(label, start, stop);
     cpu_to_thread_id.clear();
     next_thread_id = 0;
+
+    uint64_t span = stop > start ? stop - start : 0;
+    progress_step = span >= 10 ? span / 10 : 1;
+    progress_next = start + progress_step;
+    fprintf(stderr,
+            "champsim_tracer: starting segment '%s' "
+            "[icount %" PRIu64 " .. %" PRIu64 "]\n",
+            label ? label : "trace", start, stop);
+}
+
+static void heartbeat_progress(uint64_t icount)
+{
+    if (!g_trace_segments.is_active() || icount < progress_next) {
+        return;
+    }
+    uint64_t start = g_trace_segments.window_start();
+    uint64_t stop  = g_trace_segments.window_stop();
+    uint64_t span  = stop > start ? stop - start : 1;
+    uint64_t pct   = ((icount - start) * 100) / span;
+    fprintf(stderr,
+            "champsim_tracer: progress %" PRIu64 "/%" PRIu64
+            " insns (%" PRIu64 "%%)\n",
+            icount, stop, pct);
+    progress_next += progress_step;
 }
 
 /*
@@ -287,6 +317,11 @@ static void flush_pending_final_body_entry(void)
  */
 static void finish_trace_segment(void)
 {
+    fprintf(stderr,
+            "champsim_tracer: finished segment [icount %" PRIu64
+            " .. %" PRIu64 "]\n",
+            g_trace_segments.window_start(),
+            g_trace_segments.window_stop());
     g_trace_segments.finish(flush_pending_final_body_entry);
 }
 
@@ -462,6 +497,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         g_mutex_unlock(&exec_lock);
         return;
     }
+
+    heartbeat_progress(icount);
 
     /* Snapshot the previous-TB scoreboard fields. */
     uint64_t current_pc = qemu_plugin_u64_get(g_scoreboard.current_pc, cpu_index);

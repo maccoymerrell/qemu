@@ -24,26 +24,17 @@ struct WPThreadState {
      * to gate CP-only logic. */
     bool in_progress = false;
 
-    /* Set by MemAccessRecorder::record when mem_accesses crosses the
-     * hard cap.  Read by simulate_wrong_path_ext on each loop iteration
-     * to bail out early.  Speculatively executing one TB containing a
-     * REP-prefixed string instruction (e.g. rep stosb / rep movsb) with
-     * arbitrary CP-restored RCX can fire millions of memops in a
-     * single qemu_plugin_exec_tb() call — without this cap the vector
-     * grows without bound and eventually exhausts the heap, manifesting
-     * as a NULL deref deep in QEMU's plugin machinery. */
-    bool mem_overflow = false;
-
     /* Memops captured during the in-flight WP simulation.  Filled by
      * MemAccessRecorder::record while in_progress is true; cleared by
      * simulate_wrong_path_ext at end-of-sim. */
     std::vector<WPMemAccess> mem_accesses;
 
-    /* Per-instruction memop counter for the cap check in
+    /* Per-instruction memop counter for the WP-side cap check in
      * MemAccessRecorder::record.  cur_insn_pc tracks the PC the last
      * memop was attributed to; cur_insn_count is the run length of
-     * consecutive same-PC memops.  Both reset whenever a memop arrives
-     * with a different insn_pc. */
+     * consecutive same-PC memops.  When cur_insn_count exceeds
+     * CST_FID_SLOT_COUNT, further memops at the same PC are dropped.
+     * Both reset whenever a memop arrives with a different insn_pc. */
     uint64_t cur_insn_pc = 0;
     uint32_t cur_insn_count = 0;
 

@@ -76,6 +76,25 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
                                uint64_t vaddr,
                                uint64_t insn_pc)
 {
+    /* Per-instruction memop cap on the wrong path.  After the
+     * CST_FID_SLOT_COUNT'th same-PC memop we have no wire-format
+     * slots left for this insn anyway, so silently drop the rest.
+     * The matching forward-progress guard in simulate_wrong_path_ext
+     * handles redirecting PC past stuck spec-mode REP iterations. */
+    if (g_wp_state.in_progress) {
+        if (insn_pc == g_wp_state.cur_insn_pc) {
+            g_wp_state.cur_insn_count++;
+        } else {
+            g_wp_state.cur_insn_pc = insn_pc;
+            g_wp_state.cur_insn_count = 1;
+        }
+        if (g_wp_state.cur_insn_count > CST_FID_SLOT_COUNT) {
+            return;
+        }
+    } else if (!g_trace_segments.is_active_atomic()) {
+        return;
+    }
+
     WPMemAccess acc = {
         .insn_pc = insn_pc,
         .mem_vaddr = vaddr,
@@ -89,31 +108,8 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
     }
 
     if (g_wp_state.in_progress) {
-        /* Per-instruction cap: a single REP-prefixed string instruction
-         * (e.g. rep stosb) executed speculatively with arbitrary
-         * CP-restored RCX can fire millions of memops in a single
-         * qemu_plugin_exec_tb() call.  Recording beyond CST_FID_SLOT_COUNT
-         * accomplishes nothing for the wire format (which slots only
-         * the first 16 memops per insn into the unified delta stream
-         * and relegates the rest to extra-memop vectors that bloat the
-         * trace to no consumer benefit on a wrong path).  Cap at the
-         * slot count, drop the rest, and signal the WP loop to bail on
-         * its next iteration so we don't spin on the rest of the REP. */
-        if (insn_pc == g_wp_state.cur_insn_pc) {
-            g_wp_state.cur_insn_count++;
-        } else {
-            g_wp_state.cur_insn_pc = insn_pc;
-            g_wp_state.cur_insn_count = 1;
-        }
-        if (g_wp_state.cur_insn_count > CST_FID_SLOT_COUNT) {
-            g_wp_state.mem_overflow = true;
-            return;
-        }
         g_wp_state.mem_accesses.push_back(acc);
-        return;
-    }
-
-    if (g_trace_segments.is_active_atomic()) {
+    } else {
         tls_cp_mem_accesses.push_back(acc);
     }
 }

@@ -63,7 +63,6 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     }
 
     g_wp_state.mem_accesses.clear();
-    g_wp_state.mem_overflow = false;
     g_wp_state.cur_insn_pc = 0;
     g_wp_state.cur_insn_count = 0;
 
@@ -143,6 +142,8 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         return e;
     };
 
+    uint64_t prev_pre_pc = UINT64_MAX;
+    uint32_t same_pre_pc_count = 0;
     while (sim_insns < (uint64_t)max_wrong_path_depth ||
            !bb_pcs.empty()) {
         uint64_t pre_pc = qemu_plugin_get_pc();
@@ -150,13 +151,33 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         BBTemplate *tmpl = nullptr;
         bool tb_ok;
 
-        if (g_wp_state.mem_overflow) {
-            /* A previous TB execution flooded mem_accesses past the
-             * cap (typically a REP-prefixed string instruction with
-             * junk speculative RCX).  Continuing risks heap exhaustion
-             * and a NULL deref in QEMU's plugin machinery. */
-            early_exit = true;
-            break;
+        /* Forward-progress guard.  In spec mode an instruction whose
+         * architectural completion writes back through speculative
+         * state (e.g. an x86 REP iter where RCX decrements but the
+         * sandboxed memory write keeps PC anchored at the same insn)
+         * can return from exec_tb without advancing PC.  When that
+         * happens the WP loop reissues exec_tb on the same pre_pc
+         * indefinitely, the dedup logic skips appending so
+         * appended_insns stays 0, sim_insns is bumped only by the
+         * "+= 1 fallback" but bb_pcs is non-empty so the OR keeps
+         * the loop alive, and we eventually NULL-deref some
+         * downstream QEMU bookkeeping.  Force PC past the offending
+         * insn after CST_FID_SLOT_COUNT same-PC iterations — same
+         * threshold as the per-insn memop cap. */
+        if (pre_pc == prev_pre_pc) {
+            same_pre_pc_count++;
+        } else {
+            prev_pre_pc = pre_pc;
+            same_pre_pc_count = 1;
+        }
+        if (same_pre_pc_count > CST_FID_SLOT_COUNT) {
+            BBTemplate *stuck = g_bb_template_cache.find_tb_template(pre_pc);
+            uint8_t isz = (stuck && stuck->n_insns > 0)
+                ? stuck->insn_sizes[0] : 1;
+            qemu_plugin_set_pc(pre_pc + isz);
+            same_pre_pc_count = 0;
+            prev_pre_pc = UINT64_MAX;
+            continue;
         }
 
         if (poisoned_targets.count(pre_pc)) {
@@ -284,11 +305,16 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
          * tb_gen_code uses max_insns = TCG_MAX_INSNS.  CF_SINGLE_STEP
          * is only about preventing rep-prefixed insns from looping
          * internally on x86; it does NOT cap TB length to 1 insn.
-         * Each executed insn must be counted exactly once toward the
-         * wrong-path budget; this is executed-insn count, not unique
-         * insns and not unique BBs.
+         *
+         * Charge AT LEAST 1 toward the budget per exec_tb call even
+         * when the appended insns were all dedup'd against the prior
+         * tail.  Without this, a self-looping single-insn TB (an x86
+         * REP instruction in spec mode advances RCX-by-one per call
+         * without advancing PC) would dedup every iteration into
+         * appended_insns=0 and the loop would spin forever — eating
+         * QEMU plugin bookkeeping until something deeper NULL-defs.
          */
-        sim_insns += appended_insns;
+        sim_insns += appended_insns ? appended_insns : 1;
 
         /* Attribute mem accesses to insns within the just-appended
          * fragment by matching the recorded insn_pc. */

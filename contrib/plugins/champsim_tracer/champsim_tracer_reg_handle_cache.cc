@@ -11,6 +11,11 @@ RegHandleCache g_reg_handle_cache;
 thread_local RegHandleCache::VCPUCache *RegHandleCache::tls_cache_ = nullptr;
 thread_local unsigned int RegHandleCache::tls_cache_cpu_index_ = (unsigned int)-1;
 
+thread_local RegHandleCache::TlsPtrEntry
+    RegHandleCache::tls_ptr_cache_[RegHandleCache::TLS_PTR_CACHE_SIZE] = {};
+thread_local unsigned int
+    RegHandleCache::tls_ptr_cache_cpu_index_ = (unsigned int)-1;
+
 namespace {
 
 bool key_valid(const QemuRegKey *key)
@@ -131,7 +136,26 @@ struct qemu_plugin_register *RegHandleCache::lookup(unsigned int cpu_index,
     if (!key_valid(key)) {
         return nullptr;
     }
+
+    /* Direct-mapped TLS cache by key-pointer identity.  The same
+     * QemuRegKey instance is re-presented every time a given template
+     * runs, so hot-loop iterations hit on first access after cache
+     * warm-up.  Invalidated on cpu_index change. */
+    if (tls_ptr_cache_cpu_index_ != cpu_index) {
+        memset(tls_ptr_cache_, 0, sizeof(tls_ptr_cache_));
+        tls_ptr_cache_cpu_index_ = cpu_index;
+    }
+    unsigned int slot = (unsigned int)(((uintptr_t)key) >> 4)
+                        & (TLS_PTR_CACHE_SIZE - 1);
+    TlsPtrEntry *e = &tls_ptr_cache_[slot];
+    if (e->key == key) {
+        return e->handle;
+    }
+
     VCPUCache *cache = get_or_create(cpu_index);
-    return (struct qemu_plugin_register *)g_hash_table_lookup(cache->handles,
-                                                              key);
+    struct qemu_plugin_register *handle =
+        (struct qemu_plugin_register *)g_hash_table_lookup(cache->handles, key);
+    e->key = key;
+    e->handle = handle;
+    return handle;
 }

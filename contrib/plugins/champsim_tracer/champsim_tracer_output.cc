@@ -852,8 +852,41 @@ typedef struct {
      * template fields cost zero record bytes. */
     U512 (*template_default)(const BBTemplate *tmpl,
                              uint32_t ins_pos, uint8_t slot);
+    /* runtime_slot_cap: optional callback that returns the actual upper
+     * bound on slots-with-content for instruction @i.  Used by the
+     * memop and SRC_REG families to skip slots that the fixed
+     * slot_count loop would visit only to have extract() return
+     * false.  Null for families whose slot_count is the real bound
+     * (or trivially 1). */
+    uint8_t (*runtime_slot_cap)(const EntryView *ev, uint32_t i);
     const char *name;          /* debug only */
 } FieldDescriptor;
+
+/* ---------- Per-family runtime slot caps ----------
+ *
+ * Memop families (LOAD_ADDR, STORE_ADDR, LOAD_DATA, STORE_DATA) and
+ * SRC_REG have CST_FID_SLOT_COUNT (16) wire slots but typical
+ * instructions use 0-2 of them.  Iterating the full 16 just to call
+ * extract() and have it return false is the dominant per-instruction
+ * cost in emit_field_delta_section (~30% of plugin runtime).  These
+ * caps let the emitter terminate the slot loop at the actual count. */
+static inline uint8_t cap_min(uint32_t v)
+{
+    return v < CST_FID_SLOT_COUNT ? (uint8_t)v : (uint8_t)CST_FID_SLOT_COUNT;
+}
+static uint8_t cap_loads(const EntryView *ev, uint32_t i)
+{
+    return ev->actual_n_loads ? cap_min(ev->actual_n_loads[i]) : 0;
+}
+static uint8_t cap_stores(const EntryView *ev, uint32_t i)
+{
+    return ev->actual_n_stores ? cap_min(ev->actual_n_stores[i]) : 0;
+}
+static uint8_t cap_src_regs(const EntryView *ev, uint32_t i)
+{
+    if (!ev->tmpl) return 0;
+    return ev->tmpl->insn_fields[i].n_src_regs;
+}
 
 /* ---------- Per-family extract/default callbacks ---------- */
 
@@ -1055,33 +1088,47 @@ static bool extr_insn_size(const EntryView *ev, uint32_t i, uint8_t slot,
  * the emitter walks records in (ins_pos, field_id) order. */
 static const FieldDescriptor field_descriptors[] = {
         { CST_FID_N_LOADS,          1,  false, false,
-            extr_n_loads,        deflt_n_loads,         "N_LOADS" },
+            extr_n_loads,        deflt_n_loads,         nullptr,
+            "N_LOADS" },
         { CST_FID_LOAD_ADDR_BASE,   CST_FID_SLOT_COUNT, false, false,
-      extr_load_addr,      deflt_zero,           "LOAD_ADDR" },
+            extr_load_addr,      deflt_zero,            cap_loads,
+            "LOAD_ADDR" },
         { CST_FID_STORE_ADDR_BASE,  CST_FID_SLOT_COUNT, false, false,
-      extr_store_addr,     deflt_zero,           "STORE_ADDR" },
+            extr_store_addr,     deflt_zero,            cap_stores,
+            "STORE_ADDR" },
         { CST_FID_LOAD_DATA_BASE,   CST_FID_SLOT_COUNT, true,  false,
-      extr_load_data,      deflt_zero,           "LOAD_DATA" },
+            extr_load_data,      deflt_zero,            cap_loads,
+            "LOAD_DATA" },
         { CST_FID_STORE_DATA_BASE,  CST_FID_SLOT_COUNT, true,  false,
-      extr_store_data,     deflt_zero,           "STORE_DATA" },
+            extr_store_data,     deflt_zero,            cap_stores,
+            "STORE_DATA" },
         { CST_FID_SRC_REG_BASE,     CST_FID_SLOT_COUNT, false, true,
-      extr_src_reg,        deflt_zero,           "SRC_REG" },
+            extr_src_reg,        deflt_zero,            cap_src_regs,
+            "SRC_REG" },
         { CST_FID_N_STORES,         1,  false, false,
-            extr_n_stores,       deflt_n_stores,        "N_STORES" },
+            extr_n_stores,       deflt_n_stores,        nullptr,
+            "N_STORES" },
         { CST_FID_INSN_BYTES_LO,    1,  false, false,
-      extr_insn_bytes_lo,  deflt_insn_bytes_lo,  "INSN_BYTES_LO" },
+            extr_insn_bytes_lo,  deflt_insn_bytes_lo,   nullptr,
+            "INSN_BYTES_LO" },
         { CST_FID_INSN_BYTES_HI,    1,  false, false,
-      extr_insn_bytes_hi,  deflt_insn_bytes_hi,  "INSN_BYTES_HI" },
+            extr_insn_bytes_hi,  deflt_insn_bytes_hi,   nullptr,
+            "INSN_BYTES_HI" },
         { CST_FID_INSN_OPCODE,      1,  false, false,
-      extr_insn_opcode,    deflt_insn_opcode,    "OPCODE" },
+            extr_insn_opcode,    deflt_insn_opcode,     nullptr,
+            "OPCODE" },
         { CST_FID_INSN_BRANCH_TYPE, 1,  false, false,
-      extr_insn_branch_type, deflt_insn_branch_type, "BRANCH_TYPE" },
+            extr_insn_branch_type, deflt_insn_branch_type, nullptr,
+            "BRANCH_TYPE" },
         { CST_FID_INSN_FLAGS,       1,  false, false,
-      extr_insn_flags,     deflt_insn_flags,     "INSN_FLAGS" },
+            extr_insn_flags,     deflt_insn_flags,      nullptr,
+            "INSN_FLAGS" },
         { CST_FID_INSN_IMMEDIATE,   1,  false, false,
-      extr_insn_imm,       deflt_insn_imm,       "IMMEDIATE" },
+            extr_insn_imm,       deflt_insn_imm,        nullptr,
+            "IMMEDIATE" },
         { CST_FID_INSN_SIZE,        1,  false, false,
-      extr_insn_size,      deflt_insn_size,      "INSN_SIZE" },
+            extr_insn_size,      deflt_insn_size,       nullptr,
+            "INSN_SIZE" },
 };
 
 #define N_FIELD_DESCRIPTORS (sizeof(field_descriptors) / sizeof(field_descriptors[0]))
@@ -1436,7 +1483,10 @@ static void emit_field_delta_section(BitWriter *main_bw,
                 if (fd->gated_by_reg_data && !(header_flags & CST_FLAG_REG_DATA))
                     continue;
 
-                for (uint8_t slot = 0; slot < fd->slot_count; slot++) {
+                uint8_t cap = fd->runtime_slot_cap
+                    ? fd->runtime_slot_cap(ev, i)
+                    : fd->slot_count;
+                for (uint8_t slot = 0; slot < cap; slot++) {
                     U512 cur;
                     if (!fd->extract(ev, i, slot, &cur)) continue;
                     uint8_t fid = fd->base_field_id + slot;

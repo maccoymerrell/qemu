@@ -69,6 +69,21 @@ private:
     static thread_local VCPUCache    *tls_cache_;
     static thread_local unsigned int  tls_cache_cpu_index_;
 
+    /* Hot-path TLS direct-mapped cache.  Keyed by const QemuRegKey *
+     * pointer identity (a single QemuRegKey instance lives in each
+     * BBTemplate's InsnRegNames, so re-running the same template — the
+     * common hot-loop case — passes the same pointer back).  Index is
+     * the low bits of the pointer.  Hits avoid the GHashTable + the
+     * g_str_hash + strcmp chain, which dominated reg-data-on profiles
+     * (~7-9% of plugin time on register-heavy workloads). */
+    enum { TLS_PTR_CACHE_SIZE = 256 };
+    struct TlsPtrEntry {
+        const QemuRegKey            *key;
+        struct qemu_plugin_register *handle;
+    };
+    static thread_local TlsPtrEntry  tls_ptr_cache_[TLS_PTR_CACHE_SIZE];
+    static thread_local unsigned int tls_ptr_cache_cpu_index_;
+
     VCPUCache *get_or_create(unsigned int cpu_index);
     static void populate_cache(VCPUCache &cache);
 };

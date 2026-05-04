@@ -1,0 +1,58 @@
+# Build the champsim_tracer Sphinx docs and deploy to GitHub Pages.
+#
+# Triggered on pushes to champsim-trace that touch the docs source or
+# the format/basic-block markdown next to the plugin.  The Pages site
+# is published from the gh-pages branch via the github-pages
+# environment, so this workflow needs Pages enabled in repository
+# settings.
+
+name: champsim_tracer docs
+
+on:
+  push:
+    branches: [champsim-trace]
+    paths:
+      - 'contrib/plugins/champsim_tracer/docs/**'
+      - 'contrib/plugins/champsim_tracer/champsim_tracer_format.md'
+      - 'contrib/plugins/champsim_tracer/basic_block.md'
+      - '.github/workflows/champsim-tracer-docs.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: champsim-tracer-docs
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Sphinx
+        run: pip install sphinx furo myst-parser
+
+      - name: Build HTML
+        run: make -C contrib/plugins/champsim_tracer/docs html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: contrib/plugins/champsim_tracer/docs/_build/html
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

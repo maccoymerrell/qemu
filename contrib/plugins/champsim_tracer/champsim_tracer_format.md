@@ -1,8 +1,8 @@
 # champsim_tracer Binary Format - v1.9
 
 Status: current. This document describes the on-disk `.cst` stream
-written by [champsim_tracer_output.cc](champsim_tracer_output.cc) and
-decoded by [champsim_tracer_decode.py](champsim_tracer_decode.py).
+written by `champsim_tracer_output.cc` and decoded by
+`champsim_tracer_decode.py`.
 
 All multi-byte fixed-width integers are little-endian. Variable-width
 integers use DWARF-style LEB128:
@@ -59,8 +59,8 @@ state for the same field.
 ## 2. Constants
 
 ```
-CST_MAGIC          = 0x18545343          bytes: 'C' 'S' 'T' 0x18
-CST_TRAILER_MAGIC  = 0x18545343FFFFFFFF
+CST_MAGIC          = 0x19545343          bytes: 'C' 'S' 'T' 0x19
+CST_TRAILER_MAGIC  = 0x19545343FFFFFFFF
 CST_TRAILER_SIZE   = 64
 
 BODY_TAG_END       = 0
@@ -102,7 +102,7 @@ start of the file.
 
 ```
 +--------------------------------------------------+
-| magic          u32  = 0x18545343                 |
+| magic          u32  = 0x19545343                 |
 | isa            u8   TraceISA                     |
 | flags          u8   CST_FLAG_* bits              |
 +--------------------------------------------------+

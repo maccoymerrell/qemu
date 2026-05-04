@@ -59,9 +59,17 @@ jobs:
       - name: Install TeX for PDF
         run: |
           sudo apt-get update
+          # texlive-xetex pulls in xelatex; texlive-latex-recommended
+          # carries the bundled Sphinx classes; latexmk drives the
+          # multi-pass build.  fonts-freefont-otf supplies FreeSerif
+          # which Sphinx's xelatex template selects as the default
+          # body face — texlive-fonts-recommended does NOT include it,
+          # and the build aborts with "fontspec Error: The font
+          # FreeSerif cannot be found" without it.
           sudo apt-get install -y --no-install-recommends \
             texlive-xetex texlive-latex-recommended \
-            texlive-fonts-recommended latexmk
+            texlive-fonts-recommended texlive-fonts-extra \
+            fonts-freefont-otf latexmk
         continue-on-error: true
 
       - name: Build PDF

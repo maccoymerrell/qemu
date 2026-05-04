@@ -274,11 +274,20 @@ PDF (offline / portable)
 
 .. code-block:: console
 
-   $ # Same Python deps as HTML, plus a TeX install:
+   $ # Same Python deps as HTML, plus a TeX install with FreeSerif:
    $ sudo apt install texlive-xetex texlive-latex-recommended \
-                      texlive-fonts-recommended latexmk
+                      texlive-fonts-recommended fonts-freefont-otf \
+                      latexmk
    $ make -C contrib/plugins/champsim_tracer/docs latexpdf
    # PDF: contrib/plugins/champsim_tracer/docs/_build/latex/champsim_tracer.pdf
+
+.. note::
+
+   ``fonts-freefont-otf`` is required separately on
+   Debian/Ubuntu — Sphinx's ``xelatex`` template selects FreeSerif
+   as the default body face, and ``texlive-fonts-recommended``
+   alone does not include it.  Without it the build aborts at
+   ``fontspec Error: The font "FreeSerif" cannot be found``.
 
 ``make pdf`` is an alias.  The build uses XeLaTeX (driven by
 ``latexmk``) so the output handles UTF-8 in code blocks and the

@@ -7,10 +7,19 @@
 #
 # Requires (all targets):  pip install sphinx furo myst-parser
 # Additionally for PDF:    a working TeX install with xelatex and
-#                          latexmk on PATH.  On Debian/Ubuntu:
-#                            sudo apt install texlive-xetex \
+#                          latexmk on PATH, plus the FreeSerif font
+#                          Sphinx's xelatex template selects as the
+#                          default body face.  On Debian/Ubuntu:
+#                            sudo apt install \
+#                                texlive-xetex \
 #                                texlive-latex-recommended \
-#                                texlive-fonts-recommended latexmk
+#                                texlive-fonts-recommended \
+#                                fonts-freefont-otf latexmk
+#                          (texlive-fonts-recommended on its own does
+#                          NOT include FreeSerif; without
+#                          fonts-freefont-otf the build aborts with
+#                          "fontspec Error: The font FreeSerif cannot
+#                          be found".)
 #
 # Note on -W escalation:  HTML uses -W --keep-going so a CI miss
 # trips the build, but latexpdf shells out to latexmk and noisy

@@ -14,10 +14,15 @@ Build a PDF for offline use (requires a TeX install):
 
 ```sh
 sudo apt install texlive-xetex texlive-latex-recommended \
-                 texlive-fonts-recommended latexmk
+                 texlive-fonts-recommended fonts-freefont-otf \
+                 latexmk
 make -C contrib/plugins/champsim_tracer/docs latexpdf
 # _build/latex/champsim_tracer.pdf
 ```
+
+(`fonts-freefont-otf` provides FreeSerif, which the xelatex template
+selects as the default body face. `texlive-fonts-recommended` alone
+doesn't include it.)
 
 `make pdf` is an alias for `make latexpdf`. `make help` lists every
 target Sphinx supports (epub, man, etc.) — those work but are

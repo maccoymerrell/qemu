@@ -442,6 +442,12 @@ void decode_detail_to_generic(uint64_t pc,
                               InsnFields *out,
                               InsnRegNames *out_names);
 
+/* Build the GenericRegId → QemuRegKey reverse index used by the
+ * multi-reg path of add_src_cap_reg / add_dst_cap_reg.  Must run
+ * after active_reg_table is set; idempotent.  Defined in
+ * champsim_tracer_decode.cc. */
+void build_qemu_reg_reverse_index(void);
+
 /*
  * Wide regfile snapshot: opaque thread-local scratch keyed by the QEMU
  * register descriptors present in the active Capstone register table.  Used by the

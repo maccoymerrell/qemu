@@ -43,3 +43,9 @@ record stream or prints a byte-budget breakdown of where bytes go.
 
    format
    reference
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Appendices
+
+   _generated/encoding_tables

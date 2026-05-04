@@ -28,6 +28,60 @@ static inline bool qemu_reg_key_valid(const QemuRegKey *key)
     return key && key->name;
 }
 
+/*
+ * Reverse index: GenericRegId → QemuRegKey for the active ISA.
+ * Built once at plugin-install time by walking active_reg_table; used
+ * to recover the per-element QemuRegKey for multi-reg encodings (RISC-V
+ * V*M* tuples, future register-group additions on other ISAs) so their
+ * source-register value snapshots can read each constituent register
+ * via the GDB feature/name pair.  Without this, multi-reg encodings
+ * would land in src_regs[]/dst_regs[] correctly but their values
+ * wouldn't be captured under regdata=1 because the multi-reg path
+ * passed nullptr for the QemuRegKey.
+ */
+static QemuRegKey g_qemu_reg_by_gen[REG_ID_COUNT];
+
+void build_qemu_reg_reverse_index(void)
+{
+    for (unsigned i = 0; i < REG_ID_COUNT; i++) {
+        g_qemu_reg_by_gen[i] = QemuRegKey{};
+    }
+    if (!active_reg_table || active_reg_table_size == 0) {
+        return;
+    }
+    for (unsigned i = 0; i < active_reg_table_size; i++) {
+        const RegClassification *rc = &active_reg_table[i];
+        if (rc->n_regs != 0) {
+            /* Multi-reg rows don't carry a singleton QemuRegKey
+             * themselves — their constituent generic IDs are
+             * supplied by other rows that have the matching
+             * .reg_id with .qemu_reg set. */
+            continue;
+        }
+        if (!qemu_reg_key_valid(&rc->qemu_reg)) {
+            continue;
+        }
+        if (rc->reg_id >= REG_ID_COUNT) {
+            continue;
+        }
+        /* First singleton row wins — multiple Capstone aliases (e.g.
+         * x86 AH/AL/AX/EAX/RAX all → REG_GPR0) share one underlying
+         * QemuRegKey, and any of them is correct for value reads. */
+        if (!qemu_reg_key_valid(&g_qemu_reg_by_gen[rc->reg_id])) {
+            g_qemu_reg_by_gen[rc->reg_id] = rc->qemu_reg;
+        }
+    }
+}
+
+static inline const QemuRegKey *qemu_reg_for_generic(uint8_t gen_id)
+{
+    if (gen_id >= REG_ID_COUNT) {
+        return nullptr;
+    }
+    const QemuRegKey *k = &g_qemu_reg_by_gen[gen_id];
+    return qemu_reg_key_valid(k) ? k : nullptr;
+}
+
 static inline void add_src_reg(InsnFields *f, InsnRegNames *refs,
                                uint8_t reg_id, const QemuRegKey *qemu_reg)
 {
@@ -81,7 +135,8 @@ static inline void add_src_cap_reg(InsnFields *f, InsnRegNames *refs,
     }
     if (rc->n_regs) {
         for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
-            add_src_reg(f, refs, rc->regs[i], nullptr);
+            uint8_t gen = rc->regs[i];
+            add_src_reg(f, refs, gen, qemu_reg_for_generic(gen));
         }
         return;
     }
@@ -97,7 +152,8 @@ static inline void add_dst_cap_reg(InsnFields *f, InsnRegNames *refs,
     }
     if (rc->n_regs) {
         for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
-            add_dst_reg(f, refs, rc->regs[i], nullptr);
+            uint8_t gen = rc->regs[i];
+            add_dst_reg(f, refs, gen, qemu_reg_for_generic(gen));
         }
         return;
     }

@@ -1385,6 +1385,14 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     active_reg_table = isa_reg_class[trace_isa];
     active_reg_table_size = isa_reg_class_size[trace_isa];
 
+    /* Build the GenericRegId → QemuRegKey reverse index now that the
+     * per-ISA reg table is wired up.  The multi-reg classification
+     * path (RISC-V V*M* tuples and any future register-group rows)
+     * uses this to recover a QemuRegKey for each constituent generic
+     * id so reg-data captures cover the whole tuple, not just its
+     * leading element. */
+    build_qemu_reg_reverse_index();
+
     if (!g_simpoints.is_active() && trace_start_insn == 0) {
         start_trace_segment("trace", 0, trace_stop_insn);
     }

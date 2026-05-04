@@ -6,6 +6,12 @@
 #
 # Output lands in contrib/plugins/champsim_tracer/docs/_build/html.
 
+import os
+import sys
+
+# Pull our local Sphinx extensions onto sys.path.
+sys.path.insert(0, os.path.abspath("_ext"))
+
 project = "ChampSim Tracer"
 author = "Maccoy Merrell"
 # Copyright assigned to the ChampSim team — the plugin's intended
@@ -15,7 +21,6 @@ copyright = "2026, ChampSim"
 # Read the trace format version from the C header so the docs and the
 # wire format never drift.  The format spec page references this.
 import re
-import os
 
 def _read_format_version() -> str:
     header = os.path.join(os.path.dirname(__file__), "..", "champsim_tracer.h")
@@ -43,6 +48,10 @@ extensions = [
     # spec while Sphinx renders it alongside the .rst pages.  Optional
     # — the format page falls back to a stub if myst isn't installed.
     "myst_parser",
+    # Local extension that parses the per-ISA classification tables
+    # in champsim_tracer_mnemonics_*.h and emits the appendix at
+    # _generated/encoding_tables.rst before sources are read.
+    "encoding_tables",
 ]
 
 # Treat both .rst and .md as primary docs.  format.md is markdown so

@@ -89,6 +89,18 @@ bool set_regdata(PluginConfig *cfg, const char *v)
     return true;
 }
 
+bool set_wp_memdata(PluginConfig *cfg, const char *v)
+{
+    cfg->wp_mem_data = atoi(v) != 0 ? 1 : 0;
+    return true;
+}
+
+bool set_wp_regdata(PluginConfig *cfg, const char *v)
+{
+    cfg->wp_reg_data = atoi(v) != 0 ? 1 : 0;
+    return true;
+}
+
 typedef bool (*OptionSetter)(PluginConfig *cfg, const char *value);
 
 const struct {
@@ -107,6 +119,8 @@ const struct {
     { "comment",    set_comment    },
     { "memdata",    set_memdata    },
     { "regdata",    set_regdata    },
+    { "wp_memdata", set_wp_memdata },
+    { "wp_regdata", set_wp_regdata },
     { nullptr, nullptr },
 };
 

@@ -406,6 +406,15 @@ extern unsigned active_reg_table_size;
 extern int max_wrong_path_depth;
 extern bool enable_mem_data;
 extern bool enable_reg_data;
+/* WP-side data toggles.  Default to the matching CP-side flag at
+ * qemu_plugin_install time when the user didn't explicitly set them.
+ * When off, the WP simulator skips its memop/reg-snap capture work
+ * entirely (no callback push, no register reads), and the resulting
+ * WPBBEntry has empty dyn_params/reg_snaps that decode to "no
+ * observation" against the template default — same semantic as a
+ * BB the WP simulator never reached. */
+extern bool enable_wp_mem_data;
+extern bool enable_wp_reg_data;
 extern char *qemu_command_line;
 extern char *trace_comment;
 

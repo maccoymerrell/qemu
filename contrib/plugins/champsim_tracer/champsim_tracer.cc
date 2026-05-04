@@ -59,6 +59,8 @@ char *qemu_command_line = nullptr;
 char *trace_comment = nullptr;
 bool enable_mem_data = false;
 bool enable_reg_data = false;
+bool enable_wp_mem_data = false;
+bool enable_wp_reg_data = false;
 
 /* ========================= Thread ID assignment ========================= */
 
@@ -1065,6 +1067,11 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     enable_wrong_path    = cfg.enable_wp;
     enable_mem_data      = cfg.enable_mem_data;
     enable_reg_data      = cfg.enable_reg_data;
+    /* Per-path toggles default to their CP siblings when unset (-1). */
+    enable_wp_mem_data   = (cfg.wp_mem_data < 0)
+        ? enable_mem_data : (cfg.wp_mem_data != 0);
+    enable_wp_reg_data   = (cfg.wp_reg_data < 0)
+        ? enable_reg_data : (cfg.wp_reg_data != 0);
     simpoint_interval_insns = cfg.simpoint_interval;
 
     program_name        = cfg.program_name;    cfg.program_name = nullptr;

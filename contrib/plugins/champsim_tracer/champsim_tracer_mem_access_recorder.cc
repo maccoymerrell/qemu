@@ -76,12 +76,19 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
                                uint64_t vaddr,
                                uint64_t insn_pc)
 {
-    /* Per-instruction memop cap on the wrong path.  After the
-     * CST_FID_SLOT_COUNT'th same-PC memop we have no wire-format
-     * slots left for this insn anyway, so silently drop the rest.
-     * The matching forward-progress guard in simulate_wrong_path_ext
-     * handles redirecting PC past stuck spec-mode REP iterations. */
+    /* WP-side opt-out.  When the user disables WP memop tracing we
+     * skip ALL work for the WP path (no per-insn cap update, no value
+     * capture, no push) — this is the dominant share of trace bytes
+     * and runtime cost on speculation-heavy workloads. */
     if (g_wp_state.in_progress) {
+        if (!enable_wp_mem_data) {
+            return;
+        }
+        /* Per-instruction memop cap on the wrong path.  After the
+         * CST_FID_SLOT_COUNT'th same-PC memop we have no wire-format
+         * slots left for this insn anyway, so silently drop the rest.
+         * The matching forward-progress guard in simulate_wrong_path_ext
+         * handles redirecting PC past stuck spec-mode REP iterations. */
         if (insn_pc == g_wp_state.cur_insn_pc) {
             g_wp_state.cur_insn_count++;
         } else {
@@ -103,7 +110,11 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
     };
     cst_wide_zero(&acc.data);
 
-    if (enable_mem_data) {
+    /* CP path uses enable_mem_data; WP path uses enable_wp_mem_data
+     * (already gated above to true if we reach here). */
+    bool capture_data = g_wp_state.in_progress
+        ? enable_wp_mem_data : enable_mem_data;
+    if (capture_data) {
         capture_mem_value(info, vaddr, &acc);
     }
 

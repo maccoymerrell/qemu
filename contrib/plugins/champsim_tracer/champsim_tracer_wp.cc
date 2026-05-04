@@ -102,6 +102,8 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     bb_dyn_params.reserve(initial_insn_cap);
     if (enable_reg_data) {
         bb_regnames.reserve(initial_insn_cap);
+    }
+    if (enable_wp_reg_data) {
         bb_reg_snaps.reserve((size_t)initial_insn_cap * MAX_SRC_REGS);
     }
     uint64_t bb_start_pc = 0;
@@ -194,7 +196,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         g_mutex_unlock(&data_lock);
 
         bool tmpl_known_before_exec = (tmpl != nullptr);
-        if (enable_reg_data && tmpl_known_before_exec) {
+        if (enable_wp_reg_data && tmpl_known_before_exec) {
             uint64_t last_pc = 0;
             uint8_t last_size = 0;
             const uint8_t *last_bytes = nullptr;
@@ -227,8 +229,8 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             }
         }
 
-        WideRegSnap *wide = tmpl_known_before_exec
-            ? nullptr : g_reg_snaps.capture_wide(cpu_index);
+        WideRegSnap *wide = (enable_wp_reg_data && !tmpl_known_before_exec)
+            ? g_reg_snaps.capture_wide(cpu_index) : nullptr;
 
         tb_ok = qemu_plugin_exec_tb();
 
@@ -308,7 +310,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                     bb_regnames.push_back(empty);
                 }
             }
-            if (enable_reg_data && !tmpl_known_before_exec) {
+            if (enable_wp_reg_data && !tmpl_known_before_exec) {
                 g_reg_snaps.capture_insn_snaps(wide, tmpl, i, bb_reg_snaps);
             }
             appended_insns++;

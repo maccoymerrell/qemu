@@ -24,6 +24,12 @@ struct PluginConfig {
     bool      enable_wp         = true;
     bool      enable_mem_data   = false;
     bool      enable_reg_data   = false;
+    /* Per-path data flags.  Tristate: -1 = unset (inherit from the
+     * matching CP flag), 0 = off, 1 = on.  Lets users keep CP data on
+     * but drop the WP-side data — typically the dominant share of
+     * trace bytes — without affecting CP capture. */
+    int       wp_mem_data       = -1;
+    int       wp_reg_data       = -1;
     uint64_t  simpoint_interval = 100000000ULL;
     uint64_t  trace_start_insn  = 0;
     uint64_t  trace_stop_insn   = UINT64_MAX;

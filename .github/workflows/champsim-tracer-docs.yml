@@ -1,10 +1,16 @@
 # Build the champsim_tracer Sphinx docs and deploy to GitHub Pages.
 #
 # Triggered on pushes to champsim-trace that touch the docs source or
-# the format/basic-block markdown next to the plugin.  The Pages site
-# is published from the gh-pages branch via the github-pages
-# environment, so this workflow needs Pages enabled in repository
-# settings.
+# the format/basic-block markdown next to the plugin.
+#
+# REQUIRED REPO SETTING: Settings -> Pages -> "Build and deployment"
+#                        -> "Source: GitHub Actions"
+#
+# If Pages is set to "Deploy from a branch", the upload-pages-artifact
+# / deploy-pages flow is silently ignored and the site instead serves
+# whatever is at the configured branch path (typically /docs at the
+# repo root, i.e. QEMU's own root docs/ directory — not this plugin's
+# contrib/plugins/champsim_tracer/docs/_build/html output).
 
 name: champsim_tracer docs
 
@@ -39,6 +45,9 @@ jobs:
 
       - name: Install Sphinx
         run: pip install sphinx furo myst-parser
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
 
       - name: Build HTML
         run: make -C contrib/plugins/champsim_tracer/docs html

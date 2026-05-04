@@ -1,15 +1,27 @@
 # champsim_tracer documentation
 
-Sphinx project for the champsim_tracer plugin. Build it locally
-with:
+Sphinx project for the champsim_tracer plugin.
+
+Build the HTML site:
 
 ```sh
 pip install sphinx furo myst-parser
 make -C contrib/plugins/champsim_tracer/docs html
+# open _build/html/index.html
 ```
 
-Output lands in `_build/html/`. Open `_build/html/index.html` in a
-browser.
+Build a PDF for offline use (requires a TeX install):
+
+```sh
+sudo apt install texlive-xetex texlive-latex-recommended \
+                 texlive-fonts-recommended latexmk
+make -C contrib/plugins/champsim_tracer/docs latexpdf
+# _build/latex/champsim_tracer.pdf
+```
+
+`make pdf` is an alias for `make latexpdf`. `make help` lists every
+target Sphinx supports (epub, man, etc.) — those work but are
+unconfigured.
 
 ## Contents
 

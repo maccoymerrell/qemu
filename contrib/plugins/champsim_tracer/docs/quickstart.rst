@@ -248,3 +248,47 @@ A byte-budget audit (helpful when tuning trace size) is one command:
    ...
 
 For the full decoder API see :doc:`decoder`.
+
+Building this documentation
+---------------------------
+
+The site you are reading is a Sphinx project under
+``contrib/plugins/champsim_tracer/docs/``.  Two output formats are
+supported.
+
+HTML (the default)
+~~~~~~~~~~~~~~~~~~
+
+.. code-block:: console
+
+   $ pip install sphinx furo myst-parser
+   $ make -C contrib/plugins/champsim_tracer/docs html
+   # open _build/html/index.html
+
+Output lands in
+``contrib/plugins/champsim_tracer/docs/_build/html/``.  No TeX
+install is required.
+
+PDF (offline / portable)
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: console
+
+   $ # Same Python deps as HTML, plus a TeX install:
+   $ sudo apt install texlive-xetex texlive-latex-recommended \
+                      texlive-fonts-recommended latexmk
+   $ make -C contrib/plugins/champsim_tracer/docs latexpdf
+   # PDF: contrib/plugins/champsim_tracer/docs/_build/latex/champsim_tracer.pdf
+
+``make pdf`` is an alias.  The build uses XeLaTeX (driven by
+``latexmk``) so the output handles UTF-8 in code blocks and the
+encoding-map names without surprise.  Paper size is letter; flip
+``latex_elements["papersize"]`` in ``conf.py`` to ``"a4paper"`` for
+A4.
+
+The GitHub Actions workflow at
+``.github/workflows/champsim-tracer-docs.yml`` builds both HTML and
+PDF on each push to ``champsim-trace`` that touches the docs;
+HTML deploys to Pages, the PDF is also attached as a downloadable
+``champsim_tracer-pdf`` workflow artifact.  PDF build failure does
+not fail the workflow — HTML still ships.

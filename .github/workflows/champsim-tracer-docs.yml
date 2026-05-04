@@ -52,9 +52,42 @@ jobs:
       - name: Build HTML
         run: make -C contrib/plugins/champsim_tracer/docs html
 
+      # PDF build is best-effort.  Failure (TeX install hiccup, font
+      # substitution, etc.) doesn't fail the workflow — HTML still
+      # ships, and the PDF artifact step is skipped via the
+      # always()/success() shortcut on the upload step.
+      - name: Install TeX for PDF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            texlive-xetex texlive-latex-recommended \
+            texlive-fonts-recommended latexmk
+        continue-on-error: true
+
+      - name: Build PDF
+        id: build_pdf
+        run: make -C contrib/plugins/champsim_tracer/docs latexpdf
+        continue-on-error: true
+
+      - name: Stage PDF alongside HTML
+        if: steps.build_pdf.outcome == 'success'
+        run: |
+          cp contrib/plugins/champsim_tracer/docs/_build/latex/champsim_tracer.pdf \
+             contrib/plugins/champsim_tracer/docs/_build/html/champsim_tracer.pdf
+
       - uses: actions/upload-pages-artifact@v3
         with:
           path: contrib/plugins/champsim_tracer/docs/_build/html
+
+      # Also publish the PDF as a standalone workflow artifact so
+      # users can download it without the full Pages site or wait
+      # for deploy.  Skipped when the PDF build failed.
+      - uses: actions/upload-artifact@v4
+        if: steps.build_pdf.outcome == 'success'
+        with:
+          name: champsim_tracer-pdf
+          path: contrib/plugins/champsim_tracer/docs/_build/latex/champsim_tracer.pdf
+          if-no-files-found: error
 
   deploy:
     needs: build

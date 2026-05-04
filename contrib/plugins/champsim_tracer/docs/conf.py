@@ -84,3 +84,39 @@ html_title = f"champsim_tracer v{release}"
 # Render Python type hints inline so the decoder reference page reads
 # like an API doc rather than a wall of prose.
 autodoc_typehints = "description"
+
+# ---------- LaTeX / PDF output ----------
+#
+# `make latexpdf` produces _build/latex/champsim_tracer.pdf for offline
+# distribution.  Requires a working TeX install (texlive-xetex,
+# texlive-latex-recommended, texlive-fonts-recommended, latexmk on
+# Debian/Ubuntu).  See the Makefile for the full apt install line.
+
+latex_engine = "xelatex"  # Better Unicode and font handling than pdflatex.
+
+# (master_doc, target_filename, title, author, theme)
+latex_documents = [
+    (
+        "index",
+        "champsim_tracer.tex",
+        f"champsim\\_tracer Documentation",
+        author,
+        "manual",
+    ),
+]
+
+latex_elements = {
+    "papersize":   "letterpaper",
+    "pointsize":   "11pt",
+    # Tighter top-of-chapter spacing and a sans-serif title block.
+    # `preamble` is raw LaTeX dropped above \begin{document}.
+    "preamble": r"""
+\usepackage{titlesec}
+\titleformat{\chapter}[hang]{\normalfont\sffamily\Huge\bfseries}{\thechapter.}{1em}{}
+\titlespacing*{\chapter}{0pt}{-30pt}{20pt}
+""",
+    # Drop the empty pages Sphinx normally inserts between chapters
+    # for a single-sided PDF; they're useful in print but waste pages
+    # on screen.
+    "extraclassoptions": "openany,oneside",
+}

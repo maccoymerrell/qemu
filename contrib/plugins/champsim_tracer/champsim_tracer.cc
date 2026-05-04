@@ -199,6 +199,19 @@ static void vcpu_mem_cb(unsigned int cpu_index,
 static uint64_t progress_step = 0;
 static uint64_t progress_next = 0;
 
+/* Stats snapshot taken at segment start.  At segment finish we compute
+ * (g_stats - segment_start_stats) and print that as the per-segment
+ * summary, while g_stats keeps accumulating across segments for the
+ * final cumulative print at plugin_exit. */
+static Stats segment_start_stats;
+static char *segment_label = nullptr;  /* g_strdup'd, freed at finish */
+
+/* Forward decl: appends a formatted summary of @stats to @report.
+ * Called from finish_trace_segment with the per-segment diff and from
+ * plugin_exit with the cumulative total. */
+static void append_stats_summary(GString *report, const char *label,
+                                 const Stats &stats);
+
 static void start_trace_segment(const char *label,
                                 uint64_t start, uint64_t stop)
 {
@@ -209,6 +222,13 @@ static void start_trace_segment(const char *label,
     uint64_t span = stop > start ? stop - start : 0;
     progress_step = span >= 10 ? span / 10 : 1;
     progress_next = start + progress_step;
+
+    /* Snapshot the cumulative stats so the matching finish_trace_segment
+     * can compute "this segment's contribution" via stats_diff(). */
+    segment_start_stats = g_stats;
+    g_free(segment_label);
+    segment_label = g_strdup(label ? label : "trace");
+
     fprintf(stderr,
             "champsim_tracer: starting segment '%s' "
             "[icount %" PRIu64 " .. %" PRIu64 "]\n",
@@ -325,6 +345,18 @@ static void finish_trace_segment(void)
             g_trace_segments.window_start(),
             g_trace_segments.window_stop());
     g_trace_segments.finish(flush_pending_final_body_entry);
+
+    /* Per-segment stats: diff against the snapshot taken at segment
+     * start, format with the segment label, hand to the plugin
+     * diagnostic stream. */
+    Stats seg_stats;
+    stats_diff(&seg_stats, g_stats, segment_start_stats);
+    g_autoptr(GString) report = g_string_new("");
+    g_autofree char *label = g_strdup_printf("Segment '%s'",
+                                             segment_label ? segment_label
+                                                           : "trace");
+    append_stats_summary(report, label, seg_stats);
+    qemu_plugin_outs(report->str);
 }
 
 /* ========================= Execution callback ========================= */
@@ -785,79 +817,68 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
 
 /* ========================= Exit / statistics ========================= */
 
-static void plugin_exit(qemu_plugin_id_t id, void *p)
+/* Render a Stats snapshot to @report.  Used for both the per-segment
+ * summary (called from finish_trace_segment with a diff Stats) and
+ * the cumulative final summary (called from plugin_exit with the
+ * accumulated g_stats). */
+static void append_stats_summary(GString *report, const char *label,
+                                 const Stats &stats)
 {
-    g_trace_segments.set_shutting_down();
-
-    g_mutex_lock(&exec_lock);
-
-    if (g_trace_segments.is_active()) {
-        finish_trace_segment();
-    }
-
-    g_autoptr(GString) report = g_string_new("");
-
-    g_mutex_lock(&data_lock);
-
-    static const struct { const char *label; const uint64_t *value; } counters[] = {
-        { "Branch transitions observed",         &g_stats.branches_observed },
-        { "  Taken",                             &g_stats.branches_taken },
-        { "  Not-taken",                         &g_stats.branches_not_taken },
-        { "WP simulations performed",            &g_stats.wp_simulations },
-        { "WP simulations skipped",              &g_stats.wp_skipped },
-        { "WP total instructions",               &g_stats.wp_total_insns },
-        { "WP total memory accesses",            &g_stats.wp_total_mem_accesses },
-        { "WP early exits (fault)",              &g_stats.wp_early_exits },
-        { "Unknown-instruction warnings",        &g_stats.unknown_insn_warnings },
+    const struct { const char *name; uint64_t value; } counters[] = {
+        { "Branch transitions observed",         stats.branches_observed },
+        { "  Taken",                             stats.branches_taken },
+        { "  Not-taken",                         stats.branches_not_taken },
+        { "WP simulations performed",            stats.wp_simulations },
+        { "WP simulations skipped",              stats.wp_skipped },
+        { "WP total instructions",               stats.wp_total_insns },
+        { "WP total memory accesses",            stats.wp_total_mem_accesses },
+        { "WP early exits (fault)",              stats.wp_early_exits },
+        { "Unknown-instruction warnings",        stats.unknown_insn_warnings },
     };
-    static const struct { const char *label; const uint64_t *value; } bin_counters[] = {
-        { "  Header bits",        &g_stats.bin_header_bits },
-        { "  Body bits",          &g_stats.bin_body_bits },
-        { "  Dyn CP bits",        &g_stats.bin_dyn_cp_bits },
-        { "  Dyn WP bits",        &g_stats.bin_dyn_wp_bits },
-        { "  WP exception bits",  &g_stats.bin_wp_exception_bits },
+    const struct { const char *name; uint64_t value; } bin_counters[] = {
+        { "  Header bits",        stats.bin_header_bits },
+        { "  Body bits",          stats.bin_body_bits },
+        { "  Dyn CP bits",        stats.bin_dyn_cp_bits },
+        { "  Dyn WP bits",        stats.bin_dyn_wp_bits },
+        { "  WP exception bits",  stats.bin_wp_exception_bits },
     };
 
     g_string_append_printf(report,
-        "\n=== Wrong-Path Trace Plugin Statistics ===\n"
+        "\n=== Wrong-Path Trace Plugin Statistics: %s ===\n"
         "Target architecture: %s\n"
         "Max wrong-path depth: %d instructions\n"
         "TB fragments translated: %" PRIu64 "\n"
         "BB templates created: %" PRIu64 "\n"
         "Unique branch PCs: %" PRIu64 "\n",
+        label,
         target_name ? target_name : "unknown",
         max_wrong_path_depth,
-        g_stats.tb_templates_created,
-        g_stats.bb_templates_created,
-        g_stats.unique_branch_pcs);
+        stats.tb_templates_created,
+        stats.bb_templates_created,
+        stats.unique_branch_pcs);
 
     for (size_t i = 0; i < G_N_ELEMENTS(counters); i++) {
         g_string_append_printf(report, "%-40s %" PRIu64 "\n",
-                               counters[i].label, *counters[i].value);
+                               counters[i].name, counters[i].value);
     }
 
-    if (g_stats.wp_simulations > 0) {
+    if (stats.wp_simulations > 0) {
         g_string_append_printf(report,
             "Average wrong-path length: %.1f instructions\n",
-            (double)g_stats.wp_total_insns / g_stats.wp_simulations);
+            (double)stats.wp_total_insns / stats.wp_simulations);
     }
 
-    if (g_simpoints.is_active()) {
-        g_string_append_printf(report,
-            "SimPoints loaded/traced: %zu / %zu\n",
-            g_simpoints.size(), g_simpoints.current_index());
-    }
-
-    if (g_stats.bin_total_bits > 0) {
+    if (stats.bin_total_bits > 0) {
         g_string_append_printf(report,
             "Total binary bits: %" PRIu64 " (%.2f MiB)\n",
-            g_stats.bin_total_bits,
-            (double)g_stats.bin_total_bits / 8.0 / (1024.0 * 1024.0));
+            stats.bin_total_bits,
+            (double)stats.bin_total_bits / 8.0 / (1024.0 * 1024.0));
         for (size_t i = 0; i < G_N_ELEMENTS(bin_counters); i++) {
             g_string_append_printf(report,
                 "%-40s %" PRIu64 " (%.2f%%)\n",
-                bin_counters[i].label, *bin_counters[i].value,
-                100.0 * (double)(*bin_counters[i].value) / g_stats.bin_total_bits);
+                bin_counters[i].name, bin_counters[i].value,
+                100.0 * (double)bin_counters[i].value /
+                       (double)stats.bin_total_bits);
         }
     }
 
@@ -866,8 +887,8 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
         uint64_t cp_total = 0, wp_total = 0;
         for (size_t i = 0; i < BRANCH_TYPE_COUNT; i++) {
             if (i == BRANCH_NONE) continue;
-            cp_total += g_stats.cp_branches_by_type[i];
-            wp_total += g_stats.wp_branches_by_type[i];
+            cp_total += stats.cp_branches_by_type[i];
+            wp_total += stats.wp_branches_by_type[i];
         }
         if (cp_total > 0 || wp_total > 0) {
             g_string_append_printf(report,
@@ -876,11 +897,13 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
                 "type", "CP count", "%CP", "WP count", "%WP");
             for (size_t i = 0; i < BRANCH_TYPE_COUNT; i++) {
                 if (i == BRANCH_NONE) continue;
-                uint64_t cv = g_stats.cp_branches_by_type[i];
-                uint64_t wv = g_stats.wp_branches_by_type[i];
+                uint64_t cv = stats.cp_branches_by_type[i];
+                uint64_t wv = stats.wp_branches_by_type[i];
                 if (cv == 0 && wv == 0) continue;
-                double cp_pct = cp_total ? 100.0 * (double)cv / (double)cp_total : 0.0;
-                double wp_pct = wp_total ? 100.0 * (double)wv / (double)wp_total : 0.0;
+                double cp_pct = cp_total
+                    ? 100.0 * (double)cv / (double)cp_total : 0.0;
+                double wp_pct = wp_total
+                    ? 100.0 * (double)wv / (double)wp_total : 0.0;
                 g_string_append_printf(report,
                     "  %-22s %14" PRIu64 " %7.2f%%   %14" PRIu64 " %7.2f%%\n",
                     branch_type_name_or_unknown((unsigned)i),
@@ -895,14 +918,14 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     {
         uint64_t cp_total = 0, wp_total = 0;
         for (size_t i = 0; i < GEN_OP_COUNT; i++) {
-            cp_total += g_stats.cp_insns_by_opcode[i];
-            wp_total += g_stats.wp_insns_by_opcode[i];
+            cp_total += stats.cp_insns_by_opcode[i];
+            wp_total += stats.wp_insns_by_opcode[i];
         }
         if (cp_total > 0 || wp_total > 0) {
             std::vector<std::tuple<uint64_t, uint8_t>> rows;
             for (size_t i = 0; i < GEN_OP_COUNT; i++) {
-                uint64_t s = g_stats.cp_insns_by_opcode[i] +
-                             g_stats.wp_insns_by_opcode[i];
+                uint64_t s = stats.cp_insns_by_opcode[i] +
+                             stats.wp_insns_by_opcode[i];
                 if (s) rows.emplace_back(s, (uint8_t)i);
             }
             std::sort(rows.begin(), rows.end(),
@@ -913,10 +936,12 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
                 rows.size(), "opcode", "CP count", "%CP", "WP count", "%WP");
             for (const auto &r : rows) {
                 uint8_t op = std::get<1>(r);
-                uint64_t cv = g_stats.cp_insns_by_opcode[op];
-                uint64_t wv = g_stats.wp_insns_by_opcode[op];
-                double cp_pct = cp_total ? 100.0 * (double)cv / (double)cp_total : 0.0;
-                double wp_pct = wp_total ? 100.0 * (double)wv / (double)wp_total : 0.0;
+                uint64_t cv = stats.cp_insns_by_opcode[op];
+                uint64_t wv = stats.wp_insns_by_opcode[op];
+                double cp_pct = cp_total
+                    ? 100.0 * (double)cv / (double)cp_total : 0.0;
+                double wp_pct = wp_total
+                    ? 100.0 * (double)wv / (double)wp_total : 0.0;
                 g_string_append_printf(report,
                     "  %-20s %14" PRIu64 " %7.2f%%   %14" PRIu64 " %7.2f%%\n",
                     generic_opcode_name_or_unknown((unsigned)op),
@@ -927,7 +952,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
 
     /* Per-register attribution, CP and WP side-by-side, src and dst
      * separately. */
-    auto print_reg_table = [&](const char *label,
+    auto print_reg_table = [&](const char *table_label,
                                const uint64_t *cp_arr,
                                const uint64_t *wp_arr) {
         uint64_t cp_total = 0, wp_total = 0;
@@ -946,14 +971,16 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
         g_string_append_printf(report,
             "%s (%zu non-zero):\n"
             "  %-12s %14s %8s   %14s %8s\n",
-            label, rows.size(),
+            table_label, rows.size(),
             "register", "CP count", "%CP", "WP count", "%WP");
         for (const auto &r : rows) {
             uint8_t reg = std::get<1>(r);
             uint64_t cv = cp_arr[reg];
             uint64_t wv = wp_arr[reg];
-            double cp_pct = cp_total ? 100.0 * (double)cv / (double)cp_total : 0.0;
-            double wp_pct = wp_total ? 100.0 * (double)wv / (double)wp_total : 0.0;
+            double cp_pct = cp_total
+                ? 100.0 * (double)cv / (double)cp_total : 0.0;
+            double wp_pct = wp_total
+                ? 100.0 * (double)wv / (double)wp_total : 0.0;
             g_string_append_printf(report,
                 "  %-12s %14" PRIu64 " %7.2f%%   %14" PRIu64 " %7.2f%%\n",
                 generic_reg_name_or_unknown((unsigned)reg),
@@ -961,13 +988,33 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
         }
     };
     print_reg_table("Src register attribution",
-                    g_stats.cp_src_reg_uses, g_stats.wp_src_reg_uses);
+                    stats.cp_src_reg_uses, stats.wp_src_reg_uses);
     print_reg_table("Dst register attribution",
-                    g_stats.cp_dst_reg_writes, g_stats.wp_dst_reg_writes);
+                    stats.cp_dst_reg_writes, stats.wp_dst_reg_writes);
 
     g_string_append_printf(report,
         "==========================================\n");
+}
 
+static void plugin_exit(qemu_plugin_id_t id, void *p)
+{
+    g_trace_segments.set_shutting_down();
+
+    g_mutex_lock(&exec_lock);
+
+    if (g_trace_segments.is_active()) {
+        finish_trace_segment();
+    }
+
+    g_autoptr(GString) report = g_string_new("");
+
+    g_mutex_lock(&data_lock);
+    append_stats_summary(report, "Cumulative", g_stats);
+    if (g_simpoints.is_active()) {
+        g_string_append_printf(report,
+            "SimPoints loaded/traced: %zu / %zu\n\n",
+            g_simpoints.size(), g_simpoints.current_index());
+    }
     g_mutex_unlock(&data_lock);
 
     qemu_plugin_outs(report->str);
@@ -976,6 +1023,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
         fclose(unknown_warn_file);
     }
     g_free(unknown_warn_path);
+    g_free(segment_label);
 
     MemAccessRecorder::cleanup_current_thread();
     RegSnapCollector::cleanup_current_thread();

@@ -69,6 +69,25 @@ struct Stats {
     uint64_t wp_dst_reg_writes[REG_ID_COUNT] = {};
 };
 
+/* Field-wise subtraction (a - b) into @out.  Since Stats is a POD
+ * aggregate with no padding holes that affect counters, we iterate
+ * the address space as uint64_t and subtract.  Used at finish-segment
+ * time to compute "this segment's contribution" given a snapshot
+ * taken at segment start. */
+static inline void stats_diff(Stats *out, const Stats &a, const Stats &b)
+{
+    static_assert(sizeof(Stats) % sizeof(uint64_t) == 0,
+                  "Stats must be exactly an array of uint64_t fields "
+                  "for the field-wise subtract to be valid");
+    const uint64_t *pa = reinterpret_cast<const uint64_t *>(&a);
+    const uint64_t *pb = reinterpret_cast<const uint64_t *>(&b);
+    uint64_t *pout = reinterpret_cast<uint64_t *>(out);
+    size_t n = sizeof(Stats) / sizeof(uint64_t);
+    for (size_t i = 0; i < n; i++) {
+        pout[i] = pa[i] - pb[i];
+    }
+}
+
 extern Stats g_stats;
 
 #endif /* CHAMPSIM_TRACER_STATS_H */

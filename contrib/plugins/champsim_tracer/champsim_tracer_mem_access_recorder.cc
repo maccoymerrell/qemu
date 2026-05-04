@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "champsim_tracer_mem_access_recorder.h"
+#include "champsim_tracer_stats.h"
 #include "champsim_tracer_trace_segment_manager.h"
 #include "champsim_tracer_wp_thread_state.h"
 
@@ -76,19 +77,17 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
                                uint64_t vaddr,
                                uint64_t insn_pc)
 {
-    /* WP-side opt-out.  When the user disables WP memop tracing we
-     * skip ALL work for the WP path (no per-insn cap update, no value
-     * capture, no push) — this is the dominant share of trace bytes
-     * and runtime cost on speculation-heavy workloads. */
+    /* WP path always records the access ADDRESS so the consumer sees
+     * the full memory footprint of the speculative path; the
+     * enable_wp_mem_data flag below gates the per-access VALUE capture
+     * only.  Addresses are typically the larger half of the
+     * compression-friendly delta stream anyway and are what most
+     * consumers (cache simulators, prefetcher studies) need.
+     *
+     * The per-instruction memop cap stays unconditional: it's a wire-
+     * format constraint (CST_FID_SLOT_COUNT slots per insn) and a
+     * loop-bound for spec-mode REP iterations that don't advance PC. */
     if (g_wp_state.in_progress) {
-        if (!enable_wp_mem_data) {
-            return;
-        }
-        /* Per-instruction memop cap on the wrong path.  After the
-         * CST_FID_SLOT_COUNT'th same-PC memop we have no wire-format
-         * slots left for this insn anyway, so silently drop the rest.
-         * The matching forward-progress guard in simulate_wrong_path_ext
-         * handles redirecting PC past stuck spec-mode REP iterations. */
         if (insn_pc == g_wp_state.cur_insn_pc) {
             g_wp_state.cur_insn_count++;
         } else {
@@ -122,6 +121,10 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
         g_wp_state.mem_accesses.push_back(acc);
     } else {
         tls_cp_mem_accesses.push_back(acc);
+        g_stats.cp_total_mem_accesses++;
+        if (g_current_hist_bucket) {
+            g_current_hist_bucket->cp_total_mem_accesses++;
+        }
     }
 }
 

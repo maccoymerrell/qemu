@@ -30,6 +30,12 @@ struct PluginConfig {
      * trace bytes — without affecting CP capture. */
     int       wp_mem_data       = -1;
     int       wp_reg_data       = -1;
+    /* Number of histogram intervals to bucket each segment into.
+     * 0 disables (default).  When non-zero, the per-segment summary
+     * is followed by per-interval breakdowns of the same attribution
+     * tables (branch type, opcode, src/dst regs) so the user can see
+     * how a long segment's instruction mix varies over time. */
+    int       histogram_intervals = 0;
     uint64_t  simpoint_interval = 100000000ULL;
     uint64_t  trace_start_insn  = 0;
     uint64_t  trace_stop_insn   = UINT64_MAX;

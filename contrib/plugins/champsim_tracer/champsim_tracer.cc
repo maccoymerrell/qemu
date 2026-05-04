@@ -20,10 +20,13 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include <algorithm>
+#include <cstddef>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -206,11 +209,36 @@ static uint64_t progress_next = 0;
 static Stats segment_start_stats;
 static char *segment_label = nullptr;  /* g_strdup'd, freed at finish */
 
+/* Histogram state.  When --histogram=N is set, every active segment
+ * gets a parallel array of N Stats buckets — one per equal-sized
+ * icount interval — that mirror the bumps made to g_stats during the
+ * segment.  At finish_trace_segment we walk the buckets to print
+ * per-interval breakdowns of the same attribution tables.
+ *
+ * g_current_hist_bucket is a pointer into g_histogram_buckets,
+ * refreshed at the top of vcpu_tb_exec from the current icount.  CP
+ * and WP attribution sites bump it when non-null.  Set to null when
+ * the segment is inactive or histograms are disabled, so the bump
+ * sites collapse to a single nullable check + branch. */
+static unsigned int g_histogram_intervals = 0;
+static std::vector<Stats> g_histogram_buckets;
+static uint64_t g_histogram_interval_size = 0;
+static uint64_t g_histogram_segment_start = 0;
+Stats *g_current_hist_bucket = nullptr;  /* extern in stats.h */
+
 /* Forward decl: appends a formatted summary of @stats to @report.
  * Called from finish_trace_segment with the per-segment diff and from
  * plugin_exit with the cumulative total. */
 static void append_stats_summary(GString *report, const char *label,
                                  const Stats &stats);
+
+/* Forward decl: appends a per-interval breakdown of @buckets to
+ * @report.  Called from finish_trace_segment after the segment-wide
+ * summary when --histogram=N is set.  No-op when @buckets is empty. */
+static void append_histogram(GString *report, const char *segment_label,
+                             const std::vector<Stats> &buckets,
+                             uint64_t segment_start,
+                             uint64_t interval_size);
 
 static void start_trace_segment(const char *label,
                                 uint64_t start, uint64_t stop)
@@ -229,10 +257,44 @@ static void start_trace_segment(const char *label,
     g_free(segment_label);
     segment_label = g_strdup(label ? label : "trace");
 
+    /* Histogram buckets: one Stats per interval, zero-init.  Interval
+     * size rounds up so the last bucket absorbs any remainder; bucket
+     * lookup clamps the index so a late icount past stop still maps
+     * into the last bucket. */
+    if (g_histogram_intervals > 0 && span > 0) {
+        g_histogram_buckets.assign(g_histogram_intervals, Stats{});
+        g_histogram_interval_size =
+            (span + g_histogram_intervals - 1) / g_histogram_intervals;
+        if (g_histogram_interval_size == 0) {
+            g_histogram_interval_size = 1;
+        }
+        g_histogram_segment_start = start;
+    } else {
+        g_histogram_buckets.clear();
+        g_histogram_interval_size = 0;
+    }
+    g_current_hist_bucket = nullptr;
+
     fprintf(stderr,
             "champsim_tracer: starting segment '%s' "
             "[icount %" PRIu64 " .. %" PRIu64 "]\n",
             label ? label : "trace", start, stop);
+}
+
+/* Pick the bucket matching @icount; null when histograms are disabled
+ * or no segment is active.  Caller holds exec_lock. */
+static Stats *select_histogram_bucket(uint64_t icount)
+{
+    if (g_histogram_buckets.empty() || g_histogram_interval_size == 0) {
+        return nullptr;
+    }
+    uint64_t off = icount > g_histogram_segment_start
+        ? icount - g_histogram_segment_start : 0;
+    size_t idx = (size_t)(off / g_histogram_interval_size);
+    if (idx >= g_histogram_buckets.size()) {
+        idx = g_histogram_buckets.size() - 1;
+    }
+    return &g_histogram_buckets[idx];
 }
 
 static void heartbeat_progress(uint64_t icount)
@@ -356,6 +418,12 @@ static void finish_trace_segment(void)
                                              segment_label ? segment_label
                                                            : "trace");
     append_stats_summary(report, label, seg_stats);
+    if (!g_histogram_buckets.empty()) {
+        append_histogram(report, label,
+                         g_histogram_buckets,
+                         g_histogram_segment_start,
+                         g_histogram_interval_size);
+    }
     qemu_plugin_outs(report->str);
 }
 
@@ -378,6 +446,14 @@ static BranchRecord *observe_branch_transition(bool prev_is_branch,
             g_stats.branches_taken++;
         } else {
             g_stats.branches_not_taken++;
+        }
+        if (Stats *h = g_current_hist_bucket) {
+            h->branches_observed++;
+            if (branch_taken) {
+                h->branches_taken++;
+            } else {
+                h->branches_not_taken++;
+            }
         }
     }
     BranchRecord *br = prev_is_branch
@@ -456,6 +532,9 @@ static void emit_finalized_bb(BodyStreamState *out_stream,
             prev_last, current_pc, wrong_target, cpu_index);
     } else if (wrong_target == 0) {
         g_stats.wp_skipped++;
+        if (g_current_hist_bucket) {
+            g_current_hist_bucket->wp_skipped++;
+        }
     }
 
     emit_body_entry(out_stream, bb_tmpl, cpu_index, std::move(wp_entries));
@@ -534,6 +613,11 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     heartbeat_progress(icount);
 
+    /* Refresh the histogram bucket pointer for this TB exec.  WP code
+     * runs synchronously below while exec_lock is still held, so its
+     * bumps land in the correct bucket too. */
+    g_current_hist_bucket = select_histogram_bucket(icount);
+
     /* Snapshot the previous-TB scoreboard fields. */
     uint64_t current_pc = qemu_plugin_u64_get(g_scoreboard.current_pc, cpu_index);
     uint64_t prev_start = qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
@@ -565,17 +649,22 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
          * insns and bump opcode / branch_type / src-reg / dst-reg
          * counters.  Cheap: <=20 insns per TB on average, all hot in
          * cache from the surrounding work. */
+        Stats *h = g_current_hist_bucket;
         for (uint32_t i = 0; i < prev_tb_tmpl->n_insns; i++) {
             const InsnFields *f = &prev_tb_tmpl->insn_fields[i];
             g_stats.cp_insns_by_opcode[f->opcode]++;
+            if (h) h->cp_insns_by_opcode[f->opcode]++;
             if (f->branch_type != BRANCH_NONE) {
                 g_stats.cp_branches_by_type[f->branch_type]++;
+                if (h) h->cp_branches_by_type[f->branch_type]++;
             }
             for (uint8_t s = 0; s < f->n_src_regs; s++) {
                 g_stats.cp_src_reg_uses[f->src_regs[s]]++;
+                if (h) h->cp_src_reg_uses[f->src_regs[s]]++;
             }
             for (uint8_t d = 0; d < f->n_dst_regs; d++) {
                 g_stats.cp_dst_reg_writes[f->dst_regs[d]]++;
+                if (h) h->cp_dst_reg_writes[f->dst_regs[d]]++;
             }
         }
     }
@@ -828,6 +917,7 @@ static void append_stats_summary(GString *report, const char *label,
         { "Branch transitions observed",         stats.branches_observed },
         { "  Taken",                             stats.branches_taken },
         { "  Not-taken",                         stats.branches_not_taken },
+        { "CP total memory accesses",            stats.cp_total_mem_accesses },
         { "WP simulations performed",            stats.wp_simulations },
         { "WP simulations skipped",              stats.wp_skipped },
         { "WP total instructions",               stats.wp_total_insns },
@@ -996,6 +1086,130 @@ static void append_stats_summary(GString *report, const char *label,
         "==========================================\n");
 }
 
+/* Per-interval breakdown of a segment's activity.  Emits:
+ *   1. A headline table — one row per interval, with totals for CP
+ *      insns / CP memops / WP insns / WP memops / branches.  Lets the
+ *      reader spot phase boundaries at a glance.
+ *   2. Transposed top-K tables for the four attribution dimensions
+ *      (opcode, branch type, src reg, dst reg).  Rows are the K most-
+ *      active items globally across the segment; columns are the
+ *      intervals.  This format makes it trivial to see "where does
+ *      RAX usage spike?" or "do branches concentrate in interval 7?"
+ *
+ * Counts in @buckets are partitioned by interval, so they sum to the
+ * segment-wide totals already printed above.  CP insn count per
+ * interval is approximated by summing cp_insns_by_opcode (which is
+ * what the bumps actually counted); same for WP. */
+static void append_histogram(GString *report, const char *segment_label,
+                             const std::vector<Stats> &buckets,
+                             uint64_t segment_start,
+                             uint64_t interval_size)
+{
+    if (buckets.empty()) {
+        return;
+    }
+    size_t n = buckets.size();
+
+    /* Row totals helper: accumulate a per-bucket scalar so the headline
+     * table can show CP/WP insns without the caller having to walk the
+     * opcode array twice.  Inline to keep the table loop tight. */
+    auto sum_arr = [](const uint64_t *arr, size_t len) {
+        uint64_t s = 0;
+        for (size_t i = 0; i < len; i++) s += arr[i];
+        return s;
+    };
+
+    g_string_append_printf(report,
+        "\n--- Histogram: %s (%zu intervals of %" PRIu64 " insns) ---\n"
+        "  %-4s %-22s %14s %14s %14s %14s %14s\n",
+        segment_label, n, interval_size,
+        "iv", "icount range",
+        "CP insns", "CP memops", "WP insns", "WP memops", "branches");
+    for (size_t i = 0; i < n; i++) {
+        const Stats &b = buckets[i];
+        uint64_t lo = segment_start + i * interval_size;
+        uint64_t hi = lo + interval_size;
+        g_autofree char *range =
+            g_strdup_printf("%" PRIu64 "..%" PRIu64, lo, hi);
+        uint64_t cp_ins = sum_arr(b.cp_insns_by_opcode, GEN_OP_COUNT);
+        uint64_t wp_ins = sum_arr(b.wp_insns_by_opcode, GEN_OP_COUNT);
+        g_string_append_printf(report,
+            "  %-4zu %-22s %14" PRIu64 " %14" PRIu64
+            " %14" PRIu64 " %14" PRIu64 " %14" PRIu64 "\n",
+            i, range, cp_ins, b.cp_total_mem_accesses,
+            wp_ins, b.wp_total_mem_accesses, b.branches_observed);
+    }
+
+    /* Transposed top-K table: one row per top item (chosen by total
+     * activity across all intervals and both CP+WP), one column per
+     * interval.  Caller-supplied accessors decide which Stats arrays
+     * feed the totals — same closure pattern as print_reg_table above
+     * so both CP and WP are summed for ranking but printed combined. */
+    auto print_top_k = [&](const char *table_label, unsigned id_count,
+                           const char *(*name_of)(unsigned),
+                           size_t cp_off, size_t wp_off,
+                           unsigned k) {
+        std::vector<std::tuple<uint64_t, unsigned>> rows;
+        for (unsigned id = 0; id < id_count; id++) {
+            uint64_t s = 0;
+            for (size_t i = 0; i < n; i++) {
+                const uint64_t *cp_arr =
+                    (const uint64_t *)((const uint8_t *)&buckets[i] + cp_off);
+                const uint64_t *wp_arr =
+                    (const uint64_t *)((const uint8_t *)&buckets[i] + wp_off);
+                s += cp_arr[id] + wp_arr[id];
+            }
+            if (s) rows.emplace_back(s, id);
+        }
+        if (rows.empty()) {
+            return;
+        }
+        std::sort(rows.begin(), rows.end(),
+                  std::greater<std::tuple<uint64_t, unsigned>>());
+        if (rows.size() > k) {
+            rows.resize(k);
+        }
+        g_string_append_printf(report,
+            "\n  %s (top %zu, CP+WP per interval):\n    %-20s",
+            table_label, rows.size(), "id");
+        for (size_t i = 0; i < n; i++) {
+            g_string_append_printf(report, " %12zu", i);
+        }
+        g_string_append_c(report, '\n');
+        for (const auto &r : rows) {
+            unsigned id = std::get<1>(r);
+            const char *name = name_of(id);
+            g_string_append_printf(report, "    %-20s",
+                                   name ? name : "?");
+            for (size_t i = 0; i < n; i++) {
+                const uint64_t *cp_arr =
+                    (const uint64_t *)((const uint8_t *)&buckets[i] + cp_off);
+                const uint64_t *wp_arr =
+                    (const uint64_t *)((const uint8_t *)&buckets[i] + wp_off);
+                g_string_append_printf(report, " %12" PRIu64,
+                                       cp_arr[id] + wp_arr[id]);
+            }
+            g_string_append_c(report, '\n');
+        }
+    };
+
+    print_top_k("Opcode", GEN_OP_COUNT, generic_opcode_name_or_unknown,
+                offsetof(Stats, cp_insns_by_opcode),
+                offsetof(Stats, wp_insns_by_opcode), 10);
+    print_top_k("Branch type", BRANCH_TYPE_COUNT, branch_type_name_or_unknown,
+                offsetof(Stats, cp_branches_by_type),
+                offsetof(Stats, wp_branches_by_type), BRANCH_TYPE_COUNT);
+    print_top_k("Src register", REG_ID_COUNT, generic_reg_name_or_unknown,
+                offsetof(Stats, cp_src_reg_uses),
+                offsetof(Stats, wp_src_reg_uses), 12);
+    print_top_k("Dst register", REG_ID_COUNT, generic_reg_name_or_unknown,
+                offsetof(Stats, cp_dst_reg_writes),
+                offsetof(Stats, wp_dst_reg_writes), 12);
+
+    g_string_append_printf(report,
+        "------------------------------------------\n");
+}
+
 static void plugin_exit(qemu_plugin_id_t id, void *p)
 {
     g_trace_segments.set_shutting_down();
@@ -1120,6 +1334,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         ? enable_mem_data : (cfg.wp_mem_data != 0);
     enable_wp_reg_data   = (cfg.wp_reg_data < 0)
         ? enable_reg_data : (cfg.wp_reg_data != 0);
+    g_histogram_intervals = cfg.histogram_intervals > 0
+        ? (unsigned int)cfg.histogram_intervals : 0;
     simpoint_interval_insns = cfg.simpoint_interval;
 
     program_name        = cfg.program_name;    cfg.program_name = nullptr;

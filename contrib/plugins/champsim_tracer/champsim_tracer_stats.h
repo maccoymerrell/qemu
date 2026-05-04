@@ -42,6 +42,10 @@ struct Stats {
     uint64_t wp_early_exits = 0;
     uint64_t wp_total_mem_accesses = 0;
 
+    /* Correct-path memops observed by the per-thread mem callback.
+     * Counted before the loads-vs-stores split, so it covers both. */
+    uint64_t cp_total_mem_accesses = 0;
+
     /* Binary writer byte-count breakdown. */
     uint64_t bin_total_bits = 0;
     uint64_t bin_header_bits = 0;
@@ -89,5 +93,13 @@ static inline void stats_diff(Stats *out, const Stats &a, const Stats &b)
 }
 
 extern Stats g_stats;
+
+/* Histogram bucket pointer for the currently-executing TB.  Refreshed
+ * at the top of vcpu_tb_exec from the current icount; null when
+ * histograms are disabled or no segment is active.  CP and WP
+ * attribution sites mirror their g_stats bumps into *g_current_hist_bucket
+ * when non-null.  See start_trace_segment / select_histogram_bucket
+ * in champsim_tracer.cc. */
+extern Stats *g_current_hist_bucket;
 
 #endif /* CHAMPSIM_TRACER_STATS_H */

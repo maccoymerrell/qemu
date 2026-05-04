@@ -408,11 +408,15 @@ extern bool enable_mem_data;
 extern bool enable_reg_data;
 /* WP-side data toggles.  Default to the matching CP-side flag at
  * qemu_plugin_install time when the user didn't explicitly set them.
- * When off, the WP simulator skips its memop/reg-snap capture work
- * entirely (no callback push, no register reads), and the resulting
- * WPBBEntry has empty dyn_params/reg_snaps that decode to "no
- * observation" against the template default — same semantic as a
- * BB the WP simulator never reached. */
+ *
+ * enable_wp_mem_data: gates the VALUE half of WP memops only.  WP
+ *   memop addresses are always recorded so the speculative path's
+ *   memory footprint is preserved (the typical use case for cache
+ *   sims / prefetcher work); the data values are dropped when off.
+ *
+ * enable_wp_reg_data: gates the per-insn register-value snapshots on
+ *   the WP path.  Register identifiers come from the template either
+ *   way; only the captured value stream is suppressed when off. */
 extern bool enable_wp_mem_data;
 extern bool enable_wp_reg_data;
 extern char *qemu_command_line;

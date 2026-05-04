@@ -75,7 +75,10 @@ try:
 except ImportError:
     html_theme = "alabaster"
 
-html_static_path = ["_static"]
+# No custom CSS / images today; leave html_static_path unset so the
+# theme's defaults apply.  Empty directories aren't preserved by git,
+# so a stub _static/ wouldn't survive checkout on CI runners anyway.
+html_static_path: list[str] = []
 html_title = f"champsim_tracer v{release}"
 
 # Render Python type hints inline so the decoder reference page reads

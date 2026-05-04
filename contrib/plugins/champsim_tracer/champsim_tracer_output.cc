@@ -195,53 +195,20 @@ static void write_encoding_map(BitWriter *bw, const char *map_name,
 
 static void write_reg_encoding_map(BitWriter *bw)
 {
+    /* Walk the full GenericRegId space.  generic_reg_name() returns
+     * NULL for unallocated holes; valid IDs (the dense banks plus all
+     * specials) get their canonical name from the shared helper. */
     bw_write_string(bw, "reg");
-    bw_write_uleb128(bw, 251);
-    write_encoding_entry(bw, REG_NONE, "REG_NONE");
-    for (uint64_t i = 0; i < 64; i++) {
-        g_autofree char *name = g_strdup_printf("REG_GPR%" PRIu64, i);
-        write_encoding_entry(bw, REG_GPR0 + i, name);
+    uint64_t n = 0;
+    for (unsigned i = 0; i < REG_ID_COUNT; i++) {
+        if (generic_reg_name(i)) n++;
     }
-    for (uint64_t i = 0; i < 64; i++) {
-        g_autofree char *name = g_strdup_printf("REG_FPR%" PRIu64, i);
-        write_encoding_entry(bw, REG_FPR0 + i, name);
-    }
-    for (uint64_t i = 0; i < 64; i++) {
-        g_autofree char *name = g_strdup_printf("REG_VEC%" PRIu64, i);
-        write_encoding_entry(bw, REG_VEC0 + i, name);
-    }
-    for (uint64_t i = 0; i < 32; i++) {
-        g_autofree char *name = g_strdup_printf("REG_PRED%" PRIu64, i);
-        write_encoding_entry(bw, REG_PRED0 + i, name);
-    }
-    for (uint64_t i = 0; i < 6; i++) {
-        g_autofree char *name = g_strdup_printf("REG_SEG%" PRIu64, i);
-        write_encoding_entry(bw, REG_SEG0 + i, name);
-    }
-    static const EncodingMapEntry special_regs[] = {
-        { REG_CTRL, "REG_CTRL" },
-        { REG_DEBUG, "REG_DEBUG" },
-        { REG_BOUND0, "REG_BOUND0" },
-        { REG_BOUND1, "REG_BOUND1" },
-        { REG_BOUND2, "REG_BOUND2" },
-        { REG_BOUND3, "REG_BOUND3" },
-        { REG_ACC0, "REG_ACC0" },
-        { REG_ACC1, "REG_ACC1" },
-        { REG_ACC2, "REG_ACC2" },
-        { REG_ACC3, "REG_ACC3" },
-        { REG_ZERO, "REG_ZERO" },
-        { REG_MATRIX, "REG_MATRIX" },
-        { REG_SYS, "REG_SYS" },
-        { REG_FCSR, "REG_FCSR" },
-        { REG_VCTRL, "REG_VCTRL" },
-        { REG_SP, "REG_SP" },
-        { REG_FLAGS, "REG_FLAGS" },
-        { REG_IP, "REG_IP" },
-        { REG_LR, "REG_LR" },
-        { REG_FP_REG, "REG_FP_REG" },
-    };
-    for (size_t i = 0; i < G_N_ELEMENTS(special_regs); i++) {
-        write_encoding_entry(bw, special_regs[i].value, special_regs[i].name);
+    bw_write_uleb128(bw, n);
+    for (unsigned i = 0; i < REG_ID_COUNT; i++) {
+        const char *name = generic_reg_name(i);
+        if (name) {
+            write_encoding_entry(bw, i, name);
+        }
     }
 }
 
@@ -290,80 +257,41 @@ static void write_field_id_encoding_map(BitWriter *bw)
     }
 }
 
+/* Write all (id, name) pairs for an enum range whose name lookup is
+ * provided by @name_of, skipping unallocated IDs (where the lookup
+ * returns NULL).  The wire format expects: string(map_name) +
+ * uleb(n_entries) + n_entries * (uleb(id), string(name)). */
+static void write_named_enum_map(BitWriter *bw, const char *map_name,
+                                 unsigned id_count,
+                                 const char *(*name_of)(unsigned))
+{
+    bw_write_string(bw, map_name);
+    uint64_t n = 0;
+    for (unsigned i = 0; i < id_count; i++) {
+        if (name_of(i)) n++;
+    }
+    bw_write_uleb128(bw, n);
+    for (unsigned i = 0; i < id_count; i++) {
+        const char *name = name_of(i);
+        if (name) {
+            write_encoding_entry(bw, i, name);
+        }
+    }
+}
+
+/* Wrapper for sync_event_name to fit the unsigned->const char* shape. */
+static const char *sync_event_name_for_map(unsigned id)
+{
+    return sync_event_name(id);
+}
+
 static void write_header_encoding_maps(BitWriter *main_bw)
 {
-    static const EncodingMapEntry opcode_entries[] = {
-        { GEN_OP_UNKNOWN, "GEN_OP_UNKNOWN" },
-        { GEN_OP_INT_ADD, "GEN_OP_INT_ADD" },
-        { GEN_OP_INT_SUB, "GEN_OP_INT_SUB" },
-        { GEN_OP_INT_MUL, "GEN_OP_INT_MUL" },
-        { GEN_OP_INT_DIV, "GEN_OP_INT_DIV" },
-        { GEN_OP_AND, "GEN_OP_AND" },
-        { GEN_OP_OR, "GEN_OP_OR" },
-        { GEN_OP_XOR, "GEN_OP_XOR" },
-        { GEN_OP_NOT, "GEN_OP_NOT" },
-        { GEN_OP_SHL, "GEN_OP_SHL" },
-        { GEN_OP_SHR, "GEN_OP_SHR" },
-        { GEN_OP_SAR, "GEN_OP_SAR" },
-        { GEN_OP_ROL, "GEN_OP_ROL" },
-        { GEN_OP_ROR, "GEN_OP_ROR" },
-        { GEN_OP_MOV, "GEN_OP_MOV" },
-        { GEN_OP_LOAD, "GEN_OP_LOAD" },
-        { GEN_OP_STORE, "GEN_OP_STORE" },
-        { GEN_OP_PUSH, "GEN_OP_PUSH" },
-        { GEN_OP_POP, "GEN_OP_POP" },
-        { GEN_OP_LEA, "GEN_OP_LEA" },
-        { GEN_OP_MOVSX, "GEN_OP_MOVSX" },
-        { GEN_OP_MOVZX, "GEN_OP_MOVZX" },
-        { GEN_OP_XCHG, "GEN_OP_XCHG" },
-        { GEN_OP_CMP, "GEN_OP_CMP" },
-        { GEN_OP_TEST, "GEN_OP_TEST" },
-        { GEN_OP_BRANCH, "GEN_OP_BRANCH" },
-        { GEN_OP_RET, "GEN_OP_RET" },
-        { GEN_OP_FP_ADD, "GEN_OP_FP_ADD" },
-        { GEN_OP_FP_SUB, "GEN_OP_FP_SUB" },
-        { GEN_OP_FP_MUL, "GEN_OP_FP_MUL" },
-        { GEN_OP_FP_DIV, "GEN_OP_FP_DIV" },
-        { GEN_OP_FP_SQRT, "GEN_OP_FP_SQRT" },
-        { GEN_OP_FP_MOV, "GEN_OP_FP_MOV" },
-        { GEN_OP_FP_CVT, "GEN_OP_FP_CVT" },
-        { GEN_OP_FP_CMP, "GEN_OP_FP_CMP" },
-        { GEN_OP_VEC_ADD, "GEN_OP_VEC_ADD" },
-        { GEN_OP_VEC_SUB, "GEN_OP_VEC_SUB" },
-        { GEN_OP_VEC_MUL, "GEN_OP_VEC_MUL" },
-        { GEN_OP_VEC_MOV, "GEN_OP_VEC_MOV" },
-        { GEN_OP_VEC_SHUF, "GEN_OP_VEC_SHUF" },
-        { GEN_OP_VEC_LOGIC, "GEN_OP_VEC_LOGIC" },
-        { GEN_OP_NOP, "GEN_OP_NOP" },
-        { GEN_OP_SYSCALL, "GEN_OP_SYSCALL" },
-        { GEN_OP_FENCE, "GEN_OP_FENCE" },
-        { GEN_OP_CMOV, "GEN_OP_CMOV" },
-        { GEN_OP_SETCC, "GEN_OP_SETCC" },
-        { GEN_OP_INT_ADC, "GEN_OP_INT_ADC" },
-        { GEN_OP_INT_SBB, "GEN_OP_INT_SBB" },
-        { GEN_OP_NEG, "GEN_OP_NEG" },
-        { GEN_OP_INC, "GEN_OP_INC" },
-        { GEN_OP_DEC, "GEN_OP_DEC" },
-        { GEN_OP_INT_MADD, "GEN_OP_INT_MADD" },
-        { GEN_OP_INT_MSUB, "GEN_OP_INT_MSUB" },
-        { GEN_OP_FP_MADD, "GEN_OP_FP_MADD" },
-        { GEN_OP_FP_MSUB, "GEN_OP_FP_MSUB" },
-        { GEN_OP_VEC_MADD, "GEN_OP_VEC_MADD" },
-        { GEN_OP_VEC_MSUB, "GEN_OP_VEC_MSUB" },
-    };
-    static const EncodingMapEntry branch_entries[] = {
-        { BRANCH_NONE, "BRANCH_NONE" },
-        { BRANCH_DIRECT_JUMP, "BRANCH_DIRECT_JUMP" },
-        { BRANCH_INDIRECT_JUMP, "BRANCH_INDIRECT_JUMP" },
-        { BRANCH_RETURN, "BRANCH_RETURN" },
-        { BRANCH_SYSCALL_TYPE, "BRANCH_SYSCALL_TYPE" },
-        { BRANCH_COND_DIRECT, "BRANCH_COND_DIRECT" },
-    };
-    static const EncodingMapEntry sync_entries[] = {
-        { SYNC_NONE, "SYNC_NONE" },
-        { SYNC_THREAD_SWITCH, "SYNC_THREAD_SWITCH" },
-        { SYNC_ATOMIC, "SYNC_ATOMIC" },
-    };
+    /* opcode / branch_type / sync_hint / reg encoding maps are now
+     * driven by the shared name helpers in champsim_tracer_generic_ids.h
+     * (write_named_enum_map + the helper) so the symbolic names live
+     * in exactly one place across the wire-format encoder and the
+     * exit-time stats printer. */
     static const EncodingMapEntry header_flag_entries[] = {
         { CST_FLAG_MEM_DATA, "CST_FLAG_MEM_DATA" },
         { CST_FLAG_REG_DATA, "CST_FLAG_REG_DATA" },
@@ -385,25 +313,16 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         { CST_WP_EVENT_FAULT, "CST_WP_EVENT_FAULT" },
     };
 
-    /* Compile-time tripwires: when the source enum gets a new value,
-     * the matching encoding-map entries[] table must grow too.  These
-     * static_asserts catch the omission at build time.  GEN_OP_COUNT
-     * has one reserved hole (value 26, between BRANCH and RET) so the
-     * table is one shorter than the enum count. */
-    static_assert(G_N_ELEMENTS(opcode_entries) + 1 == GEN_OP_COUNT,
-                  "opcode_entries[] must be updated to match GenericOpcode");
-    static_assert(G_N_ELEMENTS(branch_entries) == BRANCH_TYPE_COUNT,
-                  "branch_entries[] must be updated to match BranchType");
-
     BitWriter sub;
     bw_init_buf(&sub);
     bw_write_uleb128(&sub, 9);
-    write_encoding_map(&sub, "opcode", opcode_entries,
-                       G_N_ELEMENTS(opcode_entries));
-    write_encoding_map(&sub, "branch_type", branch_entries,
-                       G_N_ELEMENTS(branch_entries));
-    write_encoding_map(&sub, "sync_hint", sync_entries,
-                       G_N_ELEMENTS(sync_entries));
+    write_named_enum_map(&sub, "opcode", GEN_OP_COUNT, generic_opcode_name);
+    write_named_enum_map(&sub, "branch_type", BRANCH_TYPE_COUNT,
+                         branch_type_name);
+    /* SyncEventType has sparse codepoints (0, 4, 5); iterate over the
+     * defined enum range and let sync_event_name skip the holes. */
+    write_named_enum_map(&sub, "sync_hint", SYNC_EVENT_COUNT,
+                         sync_event_name_for_map);
     write_reg_encoding_map(&sub);
     write_field_id_encoding_map(&sub);
     write_encoding_map(&sub, "header_flag", header_flag_entries,

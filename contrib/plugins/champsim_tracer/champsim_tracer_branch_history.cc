@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "champsim_tracer_branch_history.h"
+#include "champsim_tracer_stats.h"
 
 BranchHistory g_branch_history;
 
@@ -54,6 +55,7 @@ BranchRecord *BranchHistory::get_or_create(uint64_t pc, uint64_t fall_through)
         memset(br, 0, sizeof(*br));
         br->pc = pc;
         br->fall_through = fall_through;
+        g_stats.unique_branch_pcs++;
     }
     return br;
 }

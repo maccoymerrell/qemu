@@ -526,6 +526,24 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     BBTemplate *prev_tb_tmpl = g_bb_template_cache.find_tb_template(prev_start);
     if (prev_tb_tmpl) {
         g_cp_chain.append_fragment(prev_start, prev_tb_tmpl, prev_ft);
+
+        /* Per-CP-execution attribution: walk the just-executed TB's
+         * insns and bump opcode / branch_type / src-reg / dst-reg
+         * counters.  Cheap: <=20 insns per TB on average, all hot in
+         * cache from the surrounding work. */
+        for (uint32_t i = 0; i < prev_tb_tmpl->n_insns; i++) {
+            const InsnFields *f = &prev_tb_tmpl->insn_fields[i];
+            g_stats.cp_insns_by_opcode[f->opcode]++;
+            if (f->branch_type != BRANCH_NONE) {
+                g_stats.cp_branches_by_type[f->branch_type]++;
+            }
+            for (uint8_t s = 0; s < f->n_src_regs; s++) {
+                g_stats.cp_src_reg_uses[f->src_regs[s]]++;
+            }
+            for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+                g_stats.cp_dst_reg_writes[f->dst_regs[d]]++;
+            }
+        }
     }
 
     bool finalize = prev_is_branch && prev_tb_tmpl != nullptr;
@@ -802,14 +820,14 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
         "\n=== Wrong-Path Trace Plugin Statistics ===\n"
         "Target architecture: %s\n"
         "Max wrong-path depth: %d instructions\n"
-        "TB fragments translated: %u\n"
-        "BB templates created: %u\n"
-        "Unique branch PCs: %u\n",
+        "TB fragments translated: %" PRIu64 "\n"
+        "BB templates created: %" PRIu64 "\n"
+        "Unique branch PCs: %" PRIu64 "\n",
         target_name ? target_name : "unknown",
         max_wrong_path_depth,
-        (unsigned)g_bb_template_cache.tb_count(),
-        (unsigned)g_bb_template_cache.bb_count(),
-        (unsigned)g_branch_history.size());
+        g_stats.tb_templates_created,
+        g_stats.bb_templates_created,
+        g_stats.unique_branch_pcs);
 
     for (size_t i = 0; i < G_N_ELEMENTS(counters); i++) {
         g_string_append_printf(report, "%-40s %" PRIu64 "\n",
@@ -840,6 +858,110 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
                 100.0 * (double)(*bin_counters[i].value) / g_stats.bin_total_bits);
         }
     }
+
+    /* Per-branch-type breakdown, CP and WP side-by-side. */
+    {
+        uint64_t cp_total = 0, wp_total = 0;
+        for (size_t i = 0; i < BRANCH_TYPE_COUNT; i++) {
+            if (i == BRANCH_NONE) continue;
+            cp_total += g_stats.cp_branches_by_type[i];
+            wp_total += g_stats.wp_branches_by_type[i];
+        }
+        if (cp_total > 0 || wp_total > 0) {
+            g_string_append_printf(report,
+                "Branch type breakdown:\n"
+                "  %-22s %14s %8s   %14s %8s\n",
+                "type", "CP count", "%CP", "WP count", "%WP");
+            for (size_t i = 0; i < BRANCH_TYPE_COUNT; i++) {
+                if (i == BRANCH_NONE) continue;
+                uint64_t cv = g_stats.cp_branches_by_type[i];
+                uint64_t wv = g_stats.wp_branches_by_type[i];
+                if (cv == 0 && wv == 0) continue;
+                double cp_pct = cp_total ? 100.0 * (double)cv / (double)cp_total : 0.0;
+                double wp_pct = wp_total ? 100.0 * (double)wv / (double)wp_total : 0.0;
+                g_string_append_printf(report,
+                    "  %-22s %14" PRIu64 " %7.2f%%   %14" PRIu64 " %7.2f%%\n",
+                    branch_type_name_or_unknown((unsigned)i),
+                    cv, cp_pct, wv, wp_pct);
+            }
+        }
+    }
+
+    /* Generic opcode breakdown, CP and WP side-by-side.  Sorted by
+     * (CP+WP) total so the busiest opcodes come first regardless of
+     * which path drives them. */
+    {
+        uint64_t cp_total = 0, wp_total = 0;
+        for (size_t i = 0; i < GEN_OP_COUNT; i++) {
+            cp_total += g_stats.cp_insns_by_opcode[i];
+            wp_total += g_stats.wp_insns_by_opcode[i];
+        }
+        if (cp_total > 0 || wp_total > 0) {
+            std::vector<std::tuple<uint64_t, uint8_t>> rows;
+            for (size_t i = 0; i < GEN_OP_COUNT; i++) {
+                uint64_t s = g_stats.cp_insns_by_opcode[i] +
+                             g_stats.wp_insns_by_opcode[i];
+                if (s) rows.emplace_back(s, (uint8_t)i);
+            }
+            std::sort(rows.begin(), rows.end(),
+                      std::greater<std::tuple<uint64_t, uint8_t>>());
+            g_string_append_printf(report,
+                "Generic opcode breakdown (%zu non-zero):\n"
+                "  %-20s %14s %8s   %14s %8s\n",
+                rows.size(), "opcode", "CP count", "%CP", "WP count", "%WP");
+            for (const auto &r : rows) {
+                uint8_t op = std::get<1>(r);
+                uint64_t cv = g_stats.cp_insns_by_opcode[op];
+                uint64_t wv = g_stats.wp_insns_by_opcode[op];
+                double cp_pct = cp_total ? 100.0 * (double)cv / (double)cp_total : 0.0;
+                double wp_pct = wp_total ? 100.0 * (double)wv / (double)wp_total : 0.0;
+                g_string_append_printf(report,
+                    "  %-20s %14" PRIu64 " %7.2f%%   %14" PRIu64 " %7.2f%%\n",
+                    generic_opcode_name_or_unknown((unsigned)op),
+                    cv, cp_pct, wv, wp_pct);
+            }
+        }
+    }
+
+    /* Per-register attribution, CP and WP side-by-side, src and dst
+     * separately. */
+    auto print_reg_table = [&](const char *label,
+                               const uint64_t *cp_arr,
+                               const uint64_t *wp_arr) {
+        uint64_t cp_total = 0, wp_total = 0;
+        for (size_t i = 0; i < REG_ID_COUNT; i++) {
+            cp_total += cp_arr[i];
+            wp_total += wp_arr[i];
+        }
+        if (cp_total == 0 && wp_total == 0) return;
+        std::vector<std::tuple<uint64_t, uint8_t>> rows;
+        for (size_t i = 0; i < REG_ID_COUNT; i++) {
+            uint64_t s = cp_arr[i] + wp_arr[i];
+            if (s) rows.emplace_back(s, (uint8_t)i);
+        }
+        std::sort(rows.begin(), rows.end(),
+                  std::greater<std::tuple<uint64_t, uint8_t>>());
+        g_string_append_printf(report,
+            "%s (%zu non-zero):\n"
+            "  %-12s %14s %8s   %14s %8s\n",
+            label, rows.size(),
+            "register", "CP count", "%CP", "WP count", "%WP");
+        for (const auto &r : rows) {
+            uint8_t reg = std::get<1>(r);
+            uint64_t cv = cp_arr[reg];
+            uint64_t wv = wp_arr[reg];
+            double cp_pct = cp_total ? 100.0 * (double)cv / (double)cp_total : 0.0;
+            double wp_pct = wp_total ? 100.0 * (double)wv / (double)wp_total : 0.0;
+            g_string_append_printf(report,
+                "  %-12s %14" PRIu64 " %7.2f%%   %14" PRIu64 " %7.2f%%\n",
+                generic_reg_name_or_unknown((unsigned)reg),
+                cv, cp_pct, wv, wp_pct);
+        }
+    };
+    print_reg_table("Src register attribution",
+                    g_stats.cp_src_reg_uses, g_stats.wp_src_reg_uses);
+    print_reg_table("Dst register attribution",
+                    g_stats.cp_dst_reg_writes, g_stats.wp_dst_reg_writes);
 
     g_string_append_printf(report,
         "==========================================\n");

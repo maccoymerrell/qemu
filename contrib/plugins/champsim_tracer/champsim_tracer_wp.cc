@@ -282,6 +282,24 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                             &tmpl->insn_bytes[i * MAX_INSN_BYTES],
                             &tmpl->insn_bytes[i * MAX_INSN_BYTES] + MAX_INSN_BYTES);
             bb_fields.push_back(tmpl->insn_fields[i]);
+
+            /* WP-side per-execution attribution: mirror the CP walk in
+             * vcpu_tb_exec, scoped to non-duplicate WP insns so the
+             * counts reflect what the WP simulator actually appended. */
+            {
+                const InsnFields *f = &tmpl->insn_fields[i];
+                g_stats.wp_insns_by_opcode[f->opcode]++;
+                if (f->branch_type != BRANCH_NONE) {
+                    g_stats.wp_branches_by_type[f->branch_type]++;
+                }
+                for (uint8_t s = 0; s < f->n_src_regs; s++) {
+                    g_stats.wp_src_reg_uses[f->src_regs[s]]++;
+                }
+                for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+                    g_stats.wp_dst_reg_writes[f->dst_regs[d]]++;
+                }
+            }
+
             if (enable_reg_data) {
                 if (tmpl->insn_reg_names) {
                     bb_regnames.push_back(tmpl->insn_reg_names[i]);

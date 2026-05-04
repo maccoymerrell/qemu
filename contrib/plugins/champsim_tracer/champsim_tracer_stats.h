@@ -15,7 +15,21 @@
 #include <inttypes.h>
 #include <stdint.h>
 
+#include "champsim_tracer_generic_ids.h"  /* GEN_OP_COUNT, BRANCH_TYPE_COUNT, REG_ID_COUNT */
+
 struct Stats {
+    /* Cache populations.  Bumped on insert, read at exit-time print.
+     * Mirroring these as POD uint64_t works around an atexit/static-
+     * destructor ordering issue: g_bb_template_cache and
+     * g_branch_history get their containers destroyed before
+     * plugin_exit runs (because QEMU dispatches plugin atexit hooks
+     * via a host atexit handler registered earlier than the .so's
+     * own __cxa_atexit destructors), so calling .size() at exit-time
+     * returns 0.  These counters survive that ordering. */
+    uint64_t tb_templates_created = 0;
+    uint64_t bb_templates_created = 0;
+    uint64_t unique_branch_pcs = 0;
+
     /* Branch transitions observed at vcpu_tb_exec time. */
     uint64_t branches_observed = 0;
     uint64_t branches_taken = 0;
@@ -38,6 +52,21 @@ struct Stats {
 
     /* Decode-side warning count. */
     uint64_t unknown_insn_warnings = 0;
+
+    /* Per-execution attribution.  cp_* are bumped at vcpu_tb_exec time
+     * when walking the previous TB's template; wp_* are bumped inside
+     * the WP simulator's per-iteration append loop.  Both are sized by
+     * the corresponding generic enum sentinels so the arrays grow in
+     * lockstep with the enum domain. */
+    uint64_t cp_insns_by_opcode[GEN_OP_COUNT] = {};
+    uint64_t cp_branches_by_type[BRANCH_TYPE_COUNT] = {};
+    uint64_t cp_src_reg_uses[REG_ID_COUNT] = {};
+    uint64_t cp_dst_reg_writes[REG_ID_COUNT] = {};
+
+    uint64_t wp_insns_by_opcode[GEN_OP_COUNT] = {};
+    uint64_t wp_branches_by_type[BRANCH_TYPE_COUNT] = {};
+    uint64_t wp_src_reg_uses[REG_ID_COUNT] = {};
+    uint64_t wp_dst_reg_writes[REG_ID_COUNT] = {};
 };
 
 extern Stats g_stats;

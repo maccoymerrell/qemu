@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "champsim_tracer_bb_template_cache.h"
+#include "champsim_tracer_stats.h"
 
 BBTemplateCache g_bb_template_cache;
 
@@ -148,6 +149,7 @@ BBTemplate *BBTemplateCache::commit_true_bb(uint64_t start_pc,
     }
     BBTemplate *raw = tmpl.get();
     bb_map_[start_pc] = std::move(tmpl);
+    g_stats.bb_templates_created++;
     return raw;
 }
 
@@ -309,5 +311,6 @@ BBTemplate *BBTemplateCache::get_or_create_tb_template(
 
     BBTemplate *raw = tmpl.get();
     tb_map_[start_pc] = std::move(tmpl);
+    g_stats.tb_templates_created++;
     return raw;
 }

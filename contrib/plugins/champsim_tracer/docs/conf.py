@@ -62,7 +62,9 @@ intersphinx_mapping = {
 }
 
 templates_path = ["_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+# README.md is for repo-browser readers; the rendered site doesn't
+# need it (its content is repeated under the appropriate sections).
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "README.md"]
 
 # Furo is a modern, mobile-friendly theme.  Falls back to alabaster
 # (Sphinx default) if furo isn't installed so a casual `make html`

@@ -85,25 +85,55 @@ records.
      - Rotate right.
    * - 14
      - ``GEN_OP_MOV``
-     - Register-to-register move (no memory access).
+     - Data movement.  The classifier maps a mnemonic to ``MOV``
+       *as a whole* — operand inspection does not split memory-form
+       and register-form variants.  On x86 this means ``mov`` is
+       always ``GEN_OP_MOV`` whether the operands are reg-reg,
+       reg-mem, mem-reg, or mem-imm; the resulting trace records
+       memory addresses for the mem-form executions via
+       ``CST_FID_LOAD_ADDR*`` / ``CST_FID_STORE_ADDR*`` and the
+       opcode stays ``MOV``.  On AArch64 / RISC-V / MIPS where load
+       and store have distinct mnemonics, ``MOV`` covers only the
+       register-transfer family.
    * - 15
      - ``GEN_OP_LOAD``
-     - Memory read.  Pairs with ``CST_FID_LOAD_ADDR*`` /
+     - Memory read.  Used heavily on AArch64 (``ldr``/``ld1``
+       families), RISC-V (``lw``, ``ld``, ``fld``), and MIPS.  On
+       x86, common ``mov`` from memory is ``GEN_OP_MOV`` instead;
+       ``LOAD`` is reserved for specialised forms — FPU control-
+       word loads (``fldcw``, ``fldenv``), state-restore
+       (``xrstor``, ``fxrstor``), gather (``vgather*``,
+       ``vpgather*``), port I/O (``in``, ``insb/d/w``), MPX
+       (``bndldx``), and segment / system loads (``lds``, ``lgdt``,
+       ``ltr``).  Pairs with ``CST_FID_LOAD_ADDR*`` /
        ``CST_FID_LOAD_DATA*``.
    * - 16
      - ``GEN_OP_STORE``
-     - Memory write.  Pairs with ``CST_FID_STORE_ADDR*`` /
+     - Memory write.  Mirror of ``LOAD``: dominant on AArch64
+       (``str``/``st1``), RISC-V (``sw``, ``sd``, ``fsd``), and
+       MIPS, marginal on x86 where ``mov`` to memory is
+       ``GEN_OP_MOV``.  x86 ``STORE`` covers FPU state-save
+       (``fxsave``, ``xsave*``, ``fnstcw``, ``fnstenv``), scatter
+       (``vscatter*``, ``maskmov*``), port I/O (``out``,
+       ``outsb/d/w``), MPX (``bndstx``), system register stores
+       (``sgdt``, ``stmxcsr``), and shadow-stack ops (``clrssbsy``,
+       ``clzero``).  Pairs with ``CST_FID_STORE_ADDR*`` /
        ``CST_FID_STORE_DATA*``.
    * - 17
      - ``GEN_OP_PUSH``
-     - Stack push (memory write + SP update).
+     - Stack push (memory write + SP update).  Almost exclusively
+       x86 (``push``, ``pusha*``, ``pushf*``, ``enter``); a few
+       AArch64 / RISC-V mnemonics for shadow-stack and zcmp
+       compressed-instruction families.
    * - 18
      - ``GEN_OP_POP``
-     - Stack pop.
+     - Stack pop.  Same distribution as ``GEN_OP_PUSH``.
    * - 19
      - ``GEN_OP_LEA``
-     - Effective-address compute, no memory access (x86 ``lea``,
-       aarch64 ``adrp``).
+     - Effective-address compute, no memory access despite the
+       memory-style operand.  x86 ``lea``, AArch64 ``adr`` /
+       ``adrp``, RISC-V ``auipc``, MIPS ``aluipc`` and similar
+       PC-relative-offset-into-register operations.
    * - 20
      - ``GEN_OP_MOVSX``
      - Sign-extending move.
@@ -112,19 +142,34 @@ records.
      - Zero-extending move.
    * - 22
      - ``GEN_OP_XCHG``
-     - Atomic or non-atomic exchange.  Atomic flavour also sets
-       ``sync_hint = SYNC_ATOMIC``.
+     - Exchange / read-modify-write.  Every classifier row that
+       maps to ``XCHG`` also sets ``MF_ATOMIC`` so the resulting
+       insn carries ``sync_hint = SYNC_ATOMIC``.  Examples: x86
+       ``xchg``, ``xadd``, ``cmpxchg`` / ``cmpxchg8b`` /
+       ``cmpxchg16b``; AArch64 ``cas`` family; RISC-V ``amoswap``
+       / ``amoadd`` / etc.; MIPS ``ll`` / ``lld``, ``saa`` / ``saad``.
    * - 23
      - ``GEN_OP_CMP``
-     - Compare (subtract-and-discard, sets flags).
+     - Compare (subtract-and-discard, sets flags).  Examples: x86
+       ``cmp`` and MPX bound-check (``bndcl`` / ``bndcu``);
+       AArch64 ``ccmp`` / ``ccmn``; RISC-V CV-extension
+       ``cv_cmp*``.
    * - 24
      - ``GEN_OP_TEST``
-     - Bitwise test (and-and-discard, sets flags).
+     - Bitwise test (and-and-discard, sets flags).  x86 ``test``
+       and bit-test family ``bt`` / ``btc`` / ``btr`` / ``bts``;
+       AArch64 ``tst*``; uncommon on RISC-V / MIPS where the
+       compare op is fused into the branch.
    * - 25
      - ``GEN_OP_BRANCH``
-     - Control flow.  Specific flavour lives in ``branch_type``;
-       ``call``, conditional/unconditional jump, and direct jump
-       all collapse into this opcode.
+     - Control flow.  Direction (taken / not-taken / fall-through)
+       lives at runtime; the static branch flavour lives in
+       ``branch_type``.  Direct jumps, indirect jumps, conditional
+       jumps, and direct/indirect ``call`` all collapse into this
+       opcode — the ``call`` vs ``jmp`` split is in ``branch_type``
+       (direct ``call`` looks like ``BRANCH_DIRECT_JUMP``; indirect
+       ``call`` is refined to ``BRANCH_INDIRECT_JUMP`` based on
+       operand kind).
    * - 26
      - *(reserved)*
      - Skipped intentionally.  An older revision used 26 for
@@ -133,7 +178,20 @@ records.
        revisions is exact.
    * - 27
      - ``GEN_OP_RET``
-     - Return from call.  ``branch_type`` is ``BRANCH_RETURN``.
+     - Return from call.  Always paired with
+       ``branch_type = BRANCH_RETURN``.  x86 ``ret`` / ``retf*`` /
+       ``iret*`` get this; AArch64 ``ret`` gets this; RISC-V
+       ``cm.popret*`` / ``dret`` and MIPS exception-return
+       ``eret`` / ``deret`` get this.  *Plain* RISC-V ``ret`` (the
+       ``jalr x0, ra, 0`` pseudo) and MIPS ``jr $ra`` are
+       classified by their canonical Capstone insn-id as
+       ``GEN_OP_BRANCH`` with ``branch_type =
+       BRANCH_INDIRECT_JUMP`` because the classifier does not
+       inspect the ``ra`` register operand to recognise them as
+       returns.  This is a deliberate trade-off: keeps the
+       classification table operand-agnostic at the cost of
+       conflating RISC-V/MIPS returns with general indirect jumps
+       in the trace.
    * - 28
      - ``GEN_OP_FP_ADD``
      - Floating-point add.
@@ -187,9 +245,14 @@ records.
        syscall ends the speculative chain.
    * - 44
      - ``GEN_OP_FENCE``
-     - Memory / instruction barrier.  Pairs with whichever
-       ``sync_hint`` value applies (atomic, thread-switch, or
-       neither).
+     - Memory / instruction barrier.  Every classifier row that
+       maps to ``FENCE`` has ``MF_ATOMIC``, so the resulting
+       insn always carries ``sync_hint = SYNC_ATOMIC``.
+       Examples: x86 ``mfence`` / ``lfence`` / ``sfence``,
+       cache-management (``clflush*``, ``clwb``, ``cldemote``),
+       TLB invalidation (``invlpg*``); AArch64 ``dmb`` / ``dsb``
+       / ``isb`` / ``clrex``; RISC-V ``fence`` / ``fence.i`` /
+       ``cbo.*``.
    * - 45
      - ``GEN_OP_CMOV``
      - Conditional move.
@@ -256,27 +319,46 @@ Branch types (``BranchType``)
        applicable).
    * - 1
      - ``BRANCH_DIRECT_JUMP``
-     - Static, PC-relative, unconditional.  WP target is the
-       fall-through.
+     - Direct target encoded in the instruction.  Covers
+       unconditional direct jumps (``jmp imm``), direct ``call``
+       (which is also a control-transfer-with-immediate-target),
+       and — when the per-ISA classifier flagged the row with
+       ``MF_CONDITIONAL`` *but* the table classified the branch as
+       ``DIRECT_JUMP`` — conditional direct branches that didn't
+       get the dedicated ``COND_DIRECT`` classification.  WP-target
+       resolution treats a taken instance as fall-through; if the
+       instance was *also* conditional and fell through, the WP
+       target becomes the static immediate.
    * - 2
      - ``BRANCH_INDIRECT_JUMP``
-     - Computed target.  WP target is chosen from the per-branch
-       indirect-target history, picking the most-frequent target
-       that isn't this execution's actual target.
+     - Computed target.  Covers indirect jumps and indirect
+       ``call`` (the x86 refine callback rewrites the table's
+       default ``DIRECT_JUMP`` to ``INDIRECT_JUMP`` when the call's
+       first operand isn't an immediate).  WP-target picking: with
+       ≥2 distinct historic targets observed, return the most-
+       frequent target other than this execution's actual one;
+       with one observed target, fall back to the fall-through PC
+       (so single-target indirect calls in shared-library trampolines
+       don't produce all-CP WP slices).
    * - 3
      - ``BRANCH_RETURN``
-     - Indirect via return address.  WP targets are picked the
-       same way as ``BRANCH_INDIRECT_JUMP``.
+     - Indirect via return address.  Grouped with
+       ``BRANCH_INDIRECT_JUMP`` in WP-target picking — same rule.
    * - 4
      - ``BRANCH_SYSCALL_TYPE``
      - System-call-style transfer (``syscall``, ``svc``,
-       ``ecall``).  WP simulation ends after seeing one because
-       speculative state past the syscall is not modelled.
+       ``ecall``).  WP simulation continues *into* the syscall as
+       any other branch, but if the syscall's TB raises a fault
+       (the architectural common case in spec mode) the natural
+       ``ends_in_branch`` test commits the BB and the post-PC
+       poisoning then breaks out of the WP chain.  Speculative
+       state past the syscall is not modelled.
    * - 5
      - ``BRANCH_COND_DIRECT``
      - PC-relative conditional.  WP target is the *not-taken*
-       static target when CP took the branch, and the static taken
-       target when CP fell through.
+       static target when CP took the branch (i.e., the
+       fall-through PC), and the static taken target (the encoded
+       immediate) when CP fell through.
 
 .. _registers:
 
@@ -299,8 +381,13 @@ register one greater.  Use the per-bank base as the entry-point.
      - Notes
    * - 0
      - ``REG_NONE``
-     - Sentinel for "no register" — used in template src/dst slots
-       that are not architectural registers (e.g., immediates).
+     - Sentinel returned by the per-ISA register classifier when
+       it can't map a Capstone register ID to a generic-domain
+       slot.  ``decode.cc::add_src_reg`` / ``add_dst_reg`` *skip*
+       any classification that yields ``REG_NONE``, so this ID is
+       never written into a template's ``src_regs`` / ``dst_regs``
+       and consumers will not see it on the wire.  The decoder
+       reserves the name purely as a debugging fallback.
    * - 1..64
      - ``REG_GPR0`` .. ``REG_GPR63``
      - General-purpose integer registers.
@@ -396,14 +483,23 @@ involve thread-level synchronisation.
        weakly-ordered hints without bit-shifting.
    * - 4
      - ``SYNC_THREAD_SWITCH``
-     - Hint: this instruction's execution may yield the vCPU.
-       Currently used only as a hint to the writer to emit a
-       ``BODY_TAG_THREAD_SWITCH`` record.
+     - Reserved.  Defined and decoded but no current code path in
+       ``decode.cc`` ever sets it on a classified instruction —
+       thread switches are recorded out-of-band via
+       ``BODY_TAG_THREAD_SWITCH`` body records, not as a per-insn
+       sync hint.  Producers writing ``.cst`` from another source
+       can use it; the QEMU plugin currently does not.
    * - 5
      - ``SYNC_ATOMIC``
-     - Atomic read-modify-write or fence with memory ordering.
-       Pairs with ``GEN_OP_XCHG``, ``GEN_OP_FENCE``, or any
-       ``LOCK``-prefixed x86 RMW.
+     - Set in ``decode.cc::decode_detail_to_generic`` when either
+       (a) Capstone reports the x86 ``LOCK`` prefix on this
+       instruction (``info->has_lock``), or (b) the per-ISA
+       classifier row has the ``MF_ATOMIC`` flag.  In practice
+       this fires on every ``GEN_OP_XCHG`` (the
+       ``cmpxchg`` / ``xadd`` / ``xchg`` / AArch64 ``cas`` / RISC-V
+       ``amo*`` / MIPS ``ll`` family) and on the cache-management
+       and TLB-invalidating ``GEN_OP_FENCE`` rows
+       (``clflush``, ``clwb``, ``invlpg``, ...).
 
 .. _field-ids:
 

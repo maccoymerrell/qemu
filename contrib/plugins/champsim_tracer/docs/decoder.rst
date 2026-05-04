@@ -42,69 +42,81 @@ suspect a bytes-on-wire difference but can't see it in ``cst_audit``.
 Library API
 ~~~~~~~~~~~
 
+The public entry point is a single function — the decoder reads the
+whole trace into memory and returns three lists in one call.  There
+is no incremental / streaming API today; if you need one, the
+function's body is a straight-line read against ``ByteReader`` and
+can be adapted.
+
 .. py:function:: decode_champsim_tracer(bin_path)
 
-   Top-level entry.  Reads the trailer, header, templates, and entire
-   body of ``bin_path`` and returns a 3-tuple ``(meta, templates,
-   entries)``.
+   Reads the trailer, header, templates, and entire body of
+   ``bin_path`` and returns a 3-tuple ``(meta, templates, entries)``.
 
-   :param bin_path: ``pathlib.Path`` (or ``str``) pointing at a ``.cst``
-       trace.
+   :param bin_path: ``pathlib.Path`` to a ``.cst`` trace.
    :returns: ``tuple[dict, list[dict], list[dict]]``
    :raises ValueError: when the trailer magic doesn't match a known
        wire-format version, or when section offsets in the trailer
        don't agree with the header / body sizes the decoder produced.
 
-   ``meta`` carries header fields plus the resolved encoding maps
-   (``opcode_names``, ``branch_names``, ``reg_names``, ``field_id_names``,
-   etc.).
+   ``meta`` carries header fields and the resolved encoding maps the
+   decoder will refer to (``opcode_names``, ``branch_names``,
+   ``reg_names``, ``field_id_names``, ``sync_hint_names``, plus
+   feature flags and identifying strings from the header).
 
-   ``templates`` is a list of dicts, each describing one BB template:
+   ``templates`` is a list of dicts shaped like
+   :py:func:`_decode_template_record` builds:
 
    .. code-block:: python
 
       {
-          "template_id": int,
-          "start_pc":    int,
-          "n_insns":     int,
+          "template_id":     int,
+          "start_pc":        int,
+          "n_insns":         int,
           "fall_through_pc": int,
-          "symbol_name": str,
+          "symbol_name":     str,
           "insns": [
               {
-                  "pc":            int,
-                  "opcode":        int,    # GenericOpcode value
-                  "branch_type":   int,
+                  "pc":                 int,
+                  "opcode":             int,   # GenericOpcode value
+                  "branch_type":        int,
                   "branch_conditional": bool,
-                  "has_immediate": bool,
-                  "sync_hint":     int,
-                  "n_src_regs":    int,
-                  "n_dst_regs":    int,
-                  "src_regs":      list[int],
-                  "dst_regs":      list[int],
-                  "immediate":     int | None,
-                  "insn_size":     int,
-                  "insn_bytes":    bytes,
+                  "src_regs":           list[int],
+                  "dst_regs":           list[int],
+                  "imm":                int | None,
+                  "sync_hint":          int,
+                  "n_loads":            int,   # template default; usually 0
+                  "n_stores":           int,
+                  "raw_bytes":          bytes,
               },
               ...
           ],
       }
 
-   ``entries`` is a list of dicts, each describing one body entry (one
-   CP basic-block instance plus its WP chain):
+   ``entries`` is a list of dicts, each describing one body entry
+   (one CP basic-block instance plus its WP chain):
 
    .. code-block:: python
 
       {
-          "thread_id":   int,
-          "template_id": int,
-          "dyn_params":  list[DynParam],   # CP-side memops / regs
+          "seq_num":         int,
+          "template_id":     int,
+          "thread_id":       int,
+          "thread_switched": bool,             # true on the first
+                                               # entry after a
+                                               # BODY_TAG_THREAD_SWITCH
+          "dyn_params":      list[DynParam],   # CP-side memops
+          "reg_snaps":       list[dict],       # CP-side reg snapshots
           "wp_entries": [
               {
-                  "template_id":     int,
-                  "fault":           bool,
+                  "index":                   int,
+                  "template_id":             int,
+                  "n_insns":                 int,    # from template
+                  "dyn_params":              list[DynParam],
+                  "reg_snaps":               list[dict],
+                  "fault":                   bool,
                   "translation_unavailable": bool,
-                  "fault_insn_index": int,
-                  "dyn_params":      list[DynParam],
+                  "fault_insn_index":        int | None,
               },
               ...
           ],
@@ -112,36 +124,35 @@ Library API
 
 .. py:class:: DynParam
 
-   Lightweight dataclass for one dynamic field record.
+   Dataclass for one decoded memop record.  Always built with
+   ``type_name`` set to either ``"load"`` or ``"store"``; register
+   snapshots are not represented as ``DynParam`` (see
+   ``reg_snaps`` below).
 
-   :ivar type_name: ``"load"``, ``"store"``, ``"src_reg"``, ``"insn"``,
-       or family-prefixed identifier for the wire field.
-   :ivar value: The decoded ``u64`` value (truncation of the up-to-512-bit
-       payload).
-   :ivar data_size: Byte width of the access (memory) or register
-       snapshot.
-   :ivar data: Wide payload as an integer; ``data_lo`` / ``data_hi``
-       split is exposed for callers that want a 128-bit view.
+   :ivar type_name: ``"load"`` or ``"store"``.
+   :ivar value:     Memory virtual address.
+   :ivar data_size: Access width in bytes (zero when value capture is
+       off).
+   :ivar data:      Full 512-bit payload masked to the trace's
+       ``MEM_DATA_BIT_MASK``.
+   :ivar data_lo:   Low 64 bits of ``data`` (convenience).
+   :ivar data_hi:   Bits 64..127 of ``data`` (convenience).
+   :ivar insn_index: Position within the BB template (0-based).
 
-.. py:function:: parse_trace_meta(bin_path)
-
-   Convenience wrapper that returns just the header and templates,
-   suitable when you want to iterate body entries lazily without
-   materialising the full ``decode_champsim_tracer`` list.
-
-.. py:function:: iter_entries(bin_path, meta)
-
-   Generator that yields body entries one at a time.  Memory
-   requirement is one entry's worth of structure.
+   The ``reg_snaps`` lists in entries / WP entries hold dicts, not
+   ``DynParam`` instances:
 
    .. code-block:: python
 
-      from champsim_tracer_decode import parse_trace_meta, iter_entries
-
-      meta = parse_trace_meta("trace.cst.cst")
-      for entry in iter_entries("trace.cst.cst", meta):
-          if entry["template_id"] == 42:
-              ...
+      {
+          "insn_index":     int,
+          "kind":           "src",      # only "src" today
+          "operand_index":  int,        # 0..n_src_regs-1 of that insn
+          "reg_id":         int,        # GenericRegId
+          "value":          int,        # masked-to-trace-width
+          "lo":             int,        # low 64
+          "hi":             int,        # bits 64..127
+      }
 
 Format-version handling
 ~~~~~~~~~~~~~~~~~~~~~~~

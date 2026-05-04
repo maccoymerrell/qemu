@@ -14,10 +14,12 @@ The tracer builds as part of QEMU's contributed plugins:
    $ ./configure --enable-plugins
    $ ninja -C build contrib/plugins/libchampsim_tracer.so
 
-Capstone (vendored under ``subprojects/capstone``) is required: the
-tracer uses its disassembler to classify generic opcodes / branch
-types / register sets.  The configure step pulls it in automatically
-for the QEMU targets that need it.
+Capstone is required: the tracer's per-ISA classifier consumes
+Capstone's instruction-id, operand, and register-id reporting to
+populate ``InsnFields`` and ``InsnRegNames``.  Capstone is wired in
+through the Meson wrap at ``subprojects/capstone.wrap``; the
+configure step downloads and builds it under
+``subprojects/capstone/`` automatically for targets that need it.
 
 Running the tracer
 ------------------
@@ -29,81 +31,182 @@ Attach the plugin to a user-mode QEMU invocation with ``-plugin``:
    $ qemu-x86_64 -plugin ./libchampsim_tracer.so,outfile=run.cst,depth=64 \
                  ./your_program
 
-The plugin name in front of the comma is followed by ``key=value`` pairs.
-Recognised options:
+The plugin name before the comma is followed by ``key=value`` pairs
+parsed by ``parse_plugin_options`` in
+``champsim_tracer_plugin_config.cc``.  Unknown keys cause the plugin
+to refuse to install (the entire QEMU run aborts before the guest
+starts).  Numeric values are parsed with ``atoi`` (decimal) for the
+small-int options and with ``g_ascii_strtoull`` (decimal,
+arbitrary-precision) for the icount-shaped options.
 
-.. list-table::
-   :header-rows: 1
-   :widths: 20 12 60
+The options are grouped by responsibility below.  Defaults come from
+the ``PluginConfig`` struct in
+``champsim_tracer_plugin_config.h``; the "applied default" line for
+each option says what the global ends up holding when you don't pass
+the flag.
 
-   * - Option
-     - Default
-     - Meaning
-   * - ``outfile``
-     - ``champsim_tracer_out``
-     - Output file basename.  ``.cst`` is appended; an
-       ``.unknown_warnings.log`` sidecar collects decode warnings.
-   * - ``outpipe``
-     - (none)
-     - Shell command to ``popen()`` instead of writing to disk.  Useful
-       for piping into a compressor (``zstd -T0 -19``) inline.
-   * - ``depth``
-     - 64
-     - Wrong-path simulation budget, in *speculative instructions* per
-       branch.  Burns more time on misprediction-heavy workloads.
-   * - ``wp``
-     - 1
-     - ``0`` disables WP simulation entirely (CP-only trace).  Cuts
-       runtime ~2-3× but loses the speculative shadow ChampSim wants.
-   * - ``memdata``
-     - 0
-     - When ``1``, capture the *value* of every CP load and store, not
-       just the address.  Adds wire bytes; needed by simulators that
-     - care about mem-data.
-   * - ``regdata``
-     - 0
-     - When ``1``, snapshot each instruction's source-register values
-       just before it executes.  Heavier than ``memdata``.
-   * - ``wp_memdata``
-     - inherits ``memdata``
-     - Override for the WP path: ``0`` keeps WP memop *addresses* (which
-       are what cache simulators need) but drops the per-access
-       *values*.  Typically the largest single trace-size knob.
-   * - ``wp_regdata``
-     - inherits ``regdata``
-     - Override for the WP path's register-snapshot capture.
-   * - ``start``
-     - 0
-     - Skip past this many guest instructions before opening a trace
-       segment.  Lets you fast-forward past startup.
-   * - ``stop``
-     - ``UINT64_MAX``
-     - Close the segment and exit when guest instruction count reaches
-       this value.  Pair with ``start`` to carve a single window.
-   * - ``spfile``
-     - (none)
-     - Path to a SimPoint file.  When present, the tracer emits one
-       segment per simpoint interval in the file instead of a single
-       window.
-   * - ``spinterval``
-     - ``100000000``
-     - Instruction count per simpoint interval (must match how the
-       simpoints were generated).
-   * - ``program``
-     - (none)
-     - Stamped into the trace header for downstream identification.
-   * - ``comment``
-     - (none)
-     - Free-form note, also stamped in the header.
-   * - ``histogram``
-     - 0
-     - When non-zero, partition each segment's icount span into N
-       equal intervals and append a per-interval breakdown of CP/WP
-       insns, memops, branches, and top-K opcode/branch/reg tables to
-       the segment summary.  See :doc:`architecture`.
+Output destination
+~~~~~~~~~~~~~~~~~~
 
-Output
-------
+``outfile=<basename>``
+   Basename for the trace files.  Default ``champsim_tracer_out``.
+   The plugin writes:
+
+   * ``<basename>.cst`` — the binary trace.  *The ``.cst`` suffix is
+     appended unconditionally even if you already included one in*
+     ``basename`` *— so* ``outfile=run.cst`` *produces*
+     ``run.cst.cst``.  Use a bare basename to avoid surprise.
+   * ``<basename>.unknown_warnings.log`` — sidecar with one line per
+     Capstone-emitted instruction the per-ISA classifier didn't
+     recognise.  Empty when the classification table covers your
+     workload.
+
+   Cannot be combined with ``outpipe`` — the segment manager checks
+   whichever is set and uses that one.
+
+``outpipe=<shell command>``
+   Shell command run via ``popen()`` to which the binary trace is
+   piped.  Default unset.  Avoids landing the trace on disk
+   uncompressed; the typical use is ``outpipe="zstd -T0 -19 -o
+   run.cst.zst"``.  Mutually exclusive with ``outfile``.
+
+Segmentation
+~~~~~~~~~~~~
+
+These options carve up the run into one or more *segments*.  Each
+segment produces an independent window of trace records inside the
+same output file (i.e., one ``.cst`` covers all segments; segments
+appear sequentially in the body stream and are demarcated by their
+icount range in the per-segment statistics summary).
+
+``start=<icount>``
+   Open the (single) segment when the guest instruction counter
+   reaches this value.  Default ``0`` — segment opens at process
+   start.  No-op when ``spfile`` is set (simpoint mode overrides the
+   single-window window).
+
+``stop=<icount>``
+   Close the (single) segment and call ``exit(0)`` from
+   ``vcpu_tb_exec`` when the guest instruction counter reaches this
+   value.  Default ``UINT64_MAX`` — never stop early; the trace runs
+   to natural process exit.  Combine with ``start`` to carve a
+   contiguous window.  No-op when ``spfile`` is set.
+
+``spfile=<path>``
+   Path to a SimPoint file.  When set, replaces the single
+   ``[start, stop)`` window with one segment per simpoint interval
+   listed in the file.  ``trace_start_insn`` is forced to 0 and
+   ``trace_stop_insn`` to ``UINT64_MAX`` so the simpoint manager has
+   full authority.  Cannot be combined with ``start`` / ``stop`` (they're
+   silently ignored, not an error).
+
+``spinterval=<insns>``
+   Instructions per simpoint interval.  Default ``100000000``
+   (100 M).  Must match the granularity used to *generate* the
+   simpoint file — a 100 M-interval simpoint file with this option
+   set to 10 M would carve windows at 1/10 the intended boundaries.
+
+Wrong-path simulation
+~~~~~~~~~~~~~~~~~~~~~
+
+``wp=0`` / ``wp=1``
+   ``1`` (default) enables wrong-path simulation: every CP branch
+   gets a speculative chain of WP basic blocks attached to its body
+   record.  ``0`` disables WP entirely — the trace records only the
+   correct path, the WP chain count is always zero, and runtime
+   drops considerably (typically 2-3×) because no
+   ``cpu_plugin_exec_tb`` calls happen.  Useful when you only want a
+   CP trace for a non-speculative simulator.
+
+``depth=<insns>``
+   Wrong-path *budget* in speculative instructions per branch.
+   Default ``64``.  The WP simulator stops the speculative chain as
+   soon as ``sim_insns >= depth`` *and* the in-flight WP basic block
+   has finished (i.e., the loop won't truncate a BB mid-flight).
+   Bigger values give a longer speculative shadow per branch but
+   linearly increase runtime on misprediction-heavy workloads —
+   doubling ``depth`` roughly doubles the WP work.  Setter rejects
+   non-positive values.
+
+Capture flags
+~~~~~~~~~~~~~
+
+These control how much *dynamic* per-execution data is captured
+beyond the static templates.  Templates are mandatory; everything
+below is opt-in because it can substantially grow the trace.
+
+``memdata=0`` / ``memdata=1``
+   ``0`` (default) records only memory access *addresses* (load and
+   store vaddrs).  ``1`` additionally captures the *value* loaded or
+   stored, up to 64 bytes per access — the wire format encodes them
+   under ``CST_FID_LOAD_DATA*`` / ``CST_FID_STORE_DATA*``.  Needed
+   by data-aware consumers (correctness simulators, value-prediction
+   research); typical cache-and-prefetcher work doesn't use it.
+
+``regdata=0`` / ``regdata=1``
+   ``0`` (default) records no register values.  ``1`` snapshots each
+   instruction's *source* register values immediately before it
+   executes, encoded under ``CST_FID_SRC_REG*``.  Destination values
+   are not captured — the snapshot point is pre-execute.  This is
+   the heaviest single capture flag: it adds one read-register
+   callback per CP source operand, plus an inline pre-fragment
+   wide-regfile dump for WP.
+
+``wp_memdata=0`` / ``wp_memdata=1``
+   WP-side override for ``memdata``.  Default *inherits* the value
+   of ``memdata`` (i.e., the wire-format flag mirrors CP).  Setting
+   this to ``0`` regardless of ``memdata`` keeps the WP memop
+   *addresses* but drops the per-access *values*; addresses are
+   typically what cache and prefetcher simulators need from WP and
+   they're an order of magnitude smaller than the values.  This is
+   usually the largest single trace-size knob on speculation-heavy
+   workloads.  Note: setting ``wp_memdata=1`` while ``memdata=0`` is
+   permitted but unusual — you'd record values on WP only.
+
+``wp_regdata=0`` / ``wp_regdata=1``
+   WP-side override for ``regdata``.  Default inherits from
+   ``regdata``.  Skips the per-fragment wide-regfile dump on WP when
+   off; in practice this saves substantial runtime on WP-heavy
+   workloads since the dump touches every architectural register
+   the ISA exposes.
+
+Observability
+~~~~~~~~~~~~~
+
+``histogram=<N>``
+   Default ``0`` — disabled.  When ``N > 0``, ``start_trace_segment``
+   allocates ``N`` zero-initialised ``Stats`` buckets and
+   ``finish_trace_segment`` walks them after printing the segment
+   summary.  Each bucket holds the same counters as ``g_stats``
+   (CP / WP opcode, branch type, register attribution, memop
+   counts) but scoped to one icount slice of width
+   ``ceil(span / N)``.  The buckets are mirrored into in
+   ``vcpu_tb_exec`` from ``g_current_hist_bucket``.
+
+   The output is a headline table with one row per interval plus
+   transposed top-K tables for opcodes / branch types / source
+   registers / destination registers (rows are top items; columns
+   are intervals).  Use to spot phase shifts within a long
+   simpoint segment.
+
+Trace metadata
+~~~~~~~~~~~~~~
+
+These don't affect what's captured; they get stamped into the trace
+header for downstream tools to identify the run.
+
+``program=<string>``
+   Free-form program identifier written into the header.  Defaults
+   to none.  The QEMU command line is also recorded automatically
+   in the header's ``command`` field — ``program`` is for friendly
+   names like ``"mcf_r refrate run0"``.
+
+``comment=<string>``
+   Free-form note recorded in the header's ``comment`` field.
+   Defaults to none.
+
+Output files and stderr
+-----------------------
 
 Three files land beside the basename:
 
@@ -122,11 +225,14 @@ The Python decoder turns the binary into structured records:
 
 .. code-block:: python
 
-   from champsim_tracer_decode import iter_entries, parse_trace_meta
+   from pathlib import Path
+   from champsim_tracer_decode import decode_champsim_tracer
 
-   meta, entries = parse_trace_meta("run.cst.cst")
-   for entry in iter_entries("run.cst.cst", meta):
-       print(entry.template_id, entry.dyn_params, len(entry.wp_entries))
+   meta, templates, entries = decode_champsim_tracer(Path("run.cst.cst"))
+   for entry in entries:
+       print(entry["template_id"],
+             entry["dyn_params"],
+             len(entry["wp_entries"]))
 
 A byte-budget audit (helpful when tuning trace size) is one command:
 

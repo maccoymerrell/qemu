@@ -1,6 +1,6 @@
 # champsim_tracer documentation
 
-Sphinx project for the [champsim_tracer plugin](..). Build it locally
+Sphinx project for the champsim_tracer plugin. Build it locally
 with:
 
 ```sh

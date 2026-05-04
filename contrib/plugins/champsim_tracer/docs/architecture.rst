@@ -99,9 +99,14 @@ Per TB executed on the correct path, ``vcpu_tb_exec`` runs:
     ``start_trace_segment``.  If we're past the segment's stop, close
     it and (for SimPoint mode) advance to the next window.
 3.  Read the previous TB's start, last-pc, fall-through, and
-    "ends-in-branch" out of the per-vCPU scoreboard.  These were
-    written by inline stores registered in ``vcpu_tb_trans`` against
-    the previous TB.
+    "ends-in-branch" out of the per-vCPU scoreboard.  Those fields
+    are populated by inline stores ``vcpu_tb_trans`` registered on
+    *this* TB's first instruction, encoding *this* TB's
+    parameters.  When the TB executes, the inline store fires
+    early enough that by the time ``vcpu_tb_exec`` runs the
+    scoreboard already describes the TB whose vcpu_tb_exec just
+    fired — which from the chain assembler's point of view *is*
+    the previous TB relative to the next one.
 4.  Branch-transition observation: bump
     ``branches_observed`` / ``branches_taken`` / ``branches_not_taken``
     on the previous branch, and update its
@@ -198,14 +203,20 @@ sequence" warnings on the next CP commit at the same start_pc; if you
 ever re-introduce mid-stream commits, the warning in
 ``commit_true_bb`` will scream.
 
-*PC-deduplicated x86 string instructions.*  An x86 ``REP MOVS`` produces
-N memops at the same insn_pc.  Within the wire-format slot count
-(``CST_FID_SLOT_COUNT == 16``) we accept all of them; beyond that we
-silently drop, because there are no more slots to encode them in.
-``MemAccessRecorder::record`` enforces the cap.  The matching
-forward-progress guard inside the WP loop catches the related case
-where spec-mode ``REP`` returns from ``exec_tb`` without advancing PC
-and would otherwise spin forever.
+*PC-deduplicated x86 string instructions.*  An x86 ``REP MOVS``
+produces N memops at the same ``insn_pc``.  The wire format itself
+handles arbitrary N — slots 0..15 use the ``CST_FID_LOAD_ADDR*`` /
+``CST_FID_STORE_ADDR*`` slotted families and slots 16+ overflow into
+the ``CST_FID_EXTRA_LOAD_ADDR`` / ``CST_FID_EXTRA_STORE_ADDR`` raw
+vectors — so the CP path captures every memop a ``REP`` issues
+regardless of count.  The WP path is more restrictive:
+``MemAccessRecorder::record`` caps WP-side memops at
+``CST_FID_SLOT_COUNT == 16`` per instruction and silently drops
+the rest, because the WP simulator's spec mode can iterate
+``REP`` arbitrarily many times against a sandboxed memory.  The
+matching forward-progress guard inside the WP loop catches the
+related case where spec-mode ``REP`` returns from ``exec_tb``
+without advancing PC and would otherwise spin forever.
 
 *atexit ordering inversion.*  QEMU registers its plugin atexit
 callback *before* the plugin shared object's own ``__cxa_atexit``
@@ -301,7 +312,10 @@ Synchronisation summary
        fully-formed binary buffers; the writer thread drains them to
        disk.
 
-The two-lock layout exists because ``data_lock`` is held briefly per
-operation while ``exec_lock`` spans an entire vcpu_tb_exec including a
-potentially-long WP simulation.  Splitting them lets WP fragments
-update the cache without re-entrancy bites.
+The two-lock layout: ``exec_lock`` serialises the per-vCPU execution
+callback (one ``vcpu_tb_exec`` at a time, including any synchronous
+WP simulation it triggers — so WP runs without needing to stack
+saved state across nested invocations).  ``data_lock`` is grabbed
+briefly inside that long window only when mutating cache state, so
+the WP simulator can drop and reacquire it across each cache write
+without holding the whole simulation under one lock.

@@ -52,50 +52,15 @@ jobs:
       - name: Build HTML
         run: make -C contrib/plugins/champsim_tracer/docs html
 
-      # PDF build is best-effort.  Failure (TeX install hiccup, font
-      # substitution, etc.) doesn't fail the workflow — HTML still
-      # ships, and the PDF artifact step is skipped via the
-      # always()/success() shortcut on the upload step.
-      - name: Install TeX for PDF
-        run: |
-          sudo apt-get update
-          # texlive-xetex pulls in xelatex; texlive-latex-recommended
-          # carries the bundled Sphinx classes; latexmk drives the
-          # multi-pass build.  fonts-freefont-otf supplies FreeSerif
-          # which Sphinx's xelatex template selects as the default
-          # body face — texlive-fonts-recommended does NOT include it,
-          # and the build aborts with "fontspec Error: The font
-          # FreeSerif cannot be found" without it.
-          sudo apt-get install -y --no-install-recommends \
-            texlive-xetex texlive-latex-recommended \
-            texlive-fonts-recommended texlive-fonts-extra \
-            fonts-freefont-otf latexmk
-        continue-on-error: true
-
-      - name: Build PDF
-        id: build_pdf
-        run: make -C contrib/plugins/champsim_tracer/docs latexpdf
-        continue-on-error: true
-
-      - name: Stage PDF alongside HTML
-        if: steps.build_pdf.outcome == 'success'
-        run: |
-          cp contrib/plugins/champsim_tracer/docs/_build/latex/champsim_tracer.pdf \
-             contrib/plugins/champsim_tracer/docs/_build/html/champsim_tracer.pdf
+      # PDF builds are supported (`make latexpdf` locally — see
+      # docs/quickstart.rst) but deliberately not wired into CI: the
+      # texlive install adds several minutes per workflow run and
+      # the offline-portable PDF only matters to a small fraction of
+      # readers.  Run `make pdf` locally if you need it.
 
       - uses: actions/upload-pages-artifact@v3
         with:
           path: contrib/plugins/champsim_tracer/docs/_build/html
-
-      # Also publish the PDF as a standalone workflow artifact so
-      # users can download it without the full Pages site or wait
-      # for deploy.  Skipped when the PDF build failed.
-      - uses: actions/upload-artifact@v4
-        if: steps.build_pdf.outcome == 'success'
-        with:
-          name: champsim_tracer-pdf
-          path: contrib/plugins/champsim_tracer/docs/_build/latex/champsim_tracer.pdf
-          if-no-files-found: error
 
   deploy:
     needs: build

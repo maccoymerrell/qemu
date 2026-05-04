@@ -296,8 +296,9 @@ encoding-map names without surprise.  Paper size is letter; flip
 A4.
 
 The GitHub Actions workflow at
-``.github/workflows/champsim-tracer-docs.yml`` builds both HTML and
-PDF on each push to ``champsim-trace`` that touches the docs;
-HTML deploys to Pages, the PDF is also attached as a downloadable
-``champsim_tracer-pdf`` workflow artifact.  PDF build failure does
-not fail the workflow — HTML still ships.
+``.github/workflows/champsim-tracer-docs.yml`` builds the HTML on
+each push to ``champsim-trace`` that touches the docs and deploys
+it to Pages.  PDF is *not* built in CI — the texlive install adds
+several minutes per run and the portable copy is only useful to a
+small fraction of readers.  Run ``make pdf`` locally when you need
+one.

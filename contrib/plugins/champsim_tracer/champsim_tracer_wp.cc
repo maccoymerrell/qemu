@@ -59,6 +59,10 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     if (!saved_state) {
         g_stats.wp_early_exits++;
         g_stats.wp_simulations++;
+        if (Stats *h = g_current_hist_bucket) {
+            h->wp_early_exits++;
+            h->wp_simulations++;
+        }
         return wp_chain;
     }
 
@@ -109,6 +113,16 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     uint64_t bb_start_pc = 0;
     const char *bb_symbol_name = nullptr;
 
+    /* Fault metadata for the in-progress BB.  Spec-mode faults inside
+     * a BB no longer terminate it: per basic_block.md a true BB
+     * always ends in a branch, so the WP simulator now skips past the
+     * faulting insn and keeps accumulating until the natural branch
+     * end fires.  bb_first_fault_idx records where the FIRST fault
+     * happened so the WPBBEntry can mark which uop speculation would
+     * actually squash on. */
+    bool bb_has_fault = false;
+    uint32_t bb_first_fault_idx = 0;
+
     /* Reset all per-BB accumulator state.  bb_reg_snaps is left alone
      * (caller handles it: clear after a no-template drop, transfer +
      * realloc after a successful commit). */
@@ -121,6 +135,8 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         bb_dyn_params.clear();
         bb_start_pc = 0;
         bb_symbol_name = nullptr;
+        bb_has_fault = false;
+        bb_first_fault_idx = 0;
     };
 
     /* Build a WPBBEntry from the current accumulator and move
@@ -250,18 +266,42 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
 
         /*
          * exec_tb may run multiple insns of a CP-cached translation
-         * (CF_SINGLE_STEP only affects new translations).  Append the
-         * full template so the BB we build matches what actually
-         * executed.  The BB ends architecturally when the TB ends in
-         * a branch; otherwise the next iteration's pre_pc will equal
-         * post_pc and continue accumulating.
+         * (CF_SINGLE_STEP only affects new translations).  When the
+         * TB ran to completion (tb_ok=true), the whole template
+         * executed; on fault, only insns up to and including the
+         * faulting one were issued by speculation, so we cap
+         * @n_executed_in_tmpl there.  The faulting insn itself is
+         * included so consumers that care about the squashed uop
+         * (its dyn_params, the fault_insn_index marker) have it.
          */
+        uint32_t n_executed_in_tmpl = tmpl->n_insns;
+        if (!tb_ok) {
+            uint64_t fault_pc = qemu_plugin_get_pc();
+            uint32_t fault_idx_in_tmpl = UINT32_MAX;
+            for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+                if (tmpl->insn_pcs[i] == fault_pc) {
+                    fault_idx_in_tmpl = i;
+                    break;
+                }
+            }
+            if (fault_idx_in_tmpl == UINT32_MAX) {
+                /* QEMU couldn't pin the fault to one of this TB's
+                 * insns — give up the chain rather than guess. */
+                RegSnapCollector::free_wide(wide);
+                clear_accum();
+                bb_reg_snaps.clear();
+                early_exit = true;
+                break;
+            }
+            n_executed_in_tmpl = fault_idx_in_tmpl + 1;
+        }
+
         uint32_t bb_idx_base = (uint32_t)bb_pcs.size();
         if (bb_pcs.empty() && tmpl->symbol_name) {
             bb_symbol_name = tmpl->symbol_name;
         }
         uint32_t appended_insns = 0;
-        for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+        for (uint32_t i = 0; i < n_executed_in_tmpl; i++) {
             uint64_t insn_pc = tmpl->insn_pcs[i];
             uint8_t isz = tmpl->insn_sizes[i];
             bool duplicate = false;
@@ -290,15 +330,20 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
              * counts reflect what the WP simulator actually appended. */
             {
                 const InsnFields *f = &tmpl->insn_fields[i];
+                Stats *h = g_current_hist_bucket;
                 g_stats.wp_insns_by_opcode[f->opcode]++;
+                if (h) h->wp_insns_by_opcode[f->opcode]++;
                 if (f->branch_type != BRANCH_NONE) {
                     g_stats.wp_branches_by_type[f->branch_type]++;
+                    if (h) h->wp_branches_by_type[f->branch_type]++;
                 }
                 for (uint8_t s = 0; s < f->n_src_regs; s++) {
                     g_stats.wp_src_reg_uses[f->src_regs[s]]++;
+                    if (h) h->wp_src_reg_uses[f->src_regs[s]]++;
                 }
                 for (uint8_t d = 0; d < f->n_dst_regs; d++) {
                     g_stats.wp_dst_reg_writes[f->dst_regs[d]]++;
+                    if (h) h->wp_dst_reg_writes[f->dst_regs[d]]++;
                 }
             }
 
@@ -315,7 +360,9 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             }
             appended_insns++;
         }
-        uint8_t last_insn_size = tmpl->insn_sizes[tmpl->n_insns - 1];
+        uint8_t last_insn_size = n_executed_in_tmpl > 0
+            ? tmpl->insn_sizes[n_executed_in_tmpl - 1]
+            : 0;
 
         /*
          * Budget accounting: spec-mode exec_tb runs the full TB
@@ -337,11 +384,14 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         sim_insns += appended_insns ? appended_insns : 1;
 
         /* Attribute mem accesses to insns within the just-appended
-         * fragment by matching the recorded insn_pc. */
+         * fragment by matching the recorded insn_pc.  Only walk the
+         * @n_executed_in_tmpl prefix — mem callbacks past the fault
+         * never fired, so attributing them to phantom insns past
+         * fault_idx would point at insns that aren't in bb_pcs. */
         for (size_t m = mem_start_idx; m < g_wp_state.mem_accesses.size(); m++) {
             const WPMemAccess &acc = g_wp_state.mem_accesses[m];
             uint16_t insn_idx = (uint16_t)bb_idx_base;
-            for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+            for (uint32_t i = 0; i < n_executed_in_tmpl; i++) {
                 if (tmpl->insn_pcs[i] == acc.insn_pc) {
                     insn_idx = (uint16_t)(bb_idx_base + i);
                     break;
@@ -357,18 +407,41 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             };
             bb_dyn_params.push_back(dp);
             g_stats.wp_total_mem_accesses++;
+            if (g_current_hist_bucket) {
+                g_current_hist_bucket->wp_total_mem_accesses++;
+            }
         }
 
         RegSnapCollector::free_wide(wide);
         wide = nullptr;
 
-        size_t last_local = bb_pcs.size() - 1;
-        bool ends_in_branch =
-            (bb_fields[last_local].branch_type != BRANCH_NONE);
+        /* Guard against an appended-nothing iteration (every insn of
+         * the just-executed TB was a dedup of the prior tail).  In
+         * that case bb_pcs is unchanged from before this iteration;
+         * if it's also empty we can't read bb_fields.back(), and
+         * there's no in-progress BB to mark anyway. */
+        bool ends_in_branch = false;
+        if (!bb_pcs.empty()) {
+            size_t last_local = bb_pcs.size() - 1;
+            ends_in_branch =
+                (bb_fields[last_local].branch_type != BRANCH_NONE);
+        }
 
         if (!tb_ok) {
-            /* Fault: commit current BB with fault flag. */
-            uint64_t recovery_pc = qemu_plugin_get_pc();
+            /* Trace past the fault.  bb_pcs already has insns 0..fault
+             * appended (the @n_executed_in_tmpl cap above stopped at
+             * the faulting insn).  Mark fault metadata for the BB
+             * we'll eventually commit at the natural branch end, then
+             * skip past the faulting insn so subsequent exec_tbs
+             * don't re-fault on the same address.
+             *
+             * If the faulting insn IS the natural BB terminator
+             * (e.g., a syscall classified as BRANCH_SYSCALL_TYPE that
+             * faulted), ends_in_branch below catches it and the
+             * normal commit path handles it — with bb_has_fault
+             * propagating to the WPBBEntry.  bb_map_ stays clean:
+             * only branch-bounded true BBs ever reach commit_true_bb. */
+            uint64_t fault_pc = qemu_plugin_get_pc();
 
             if (pre_pc == last_fault_pc) {
                 repeated_fault_pc++;
@@ -377,77 +450,51 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                 last_fault_pc = pre_pc;
             }
 
-            uint64_t fall_through = pre_pc + last_insn_size;
-
-            g_mutex_lock(&data_lock);
-            BBTemplate *bb_tmpl = g_bb_template_cache.commit_true_bb(
-                bb_start_pc, (uint32_t)bb_pcs.size(),
-                bb_pcs.data(),
-                bb_fields.data(),
-                bb_sizes.data(),
-                bb_bytes.data(),
-                enable_reg_data ? bb_regnames.data() : nullptr,
-                bb_symbol_name, fall_through);
-            g_mutex_unlock(&data_lock);
-
-            uint32_t fault_idx = !bb_pcs.empty()
-                ? (uint32_t)(bb_pcs.size() - 1) : 0;
-            bool has_syscall = false;
-            if (bb_tmpl) {
-                for (uint32_t i = 0; i < bb_tmpl->n_insns; i++) {
-                    if (bb_tmpl->insn_fields[i].opcode
-                        == GEN_OP_SYSCALL) {
-                        fault_idx = i;
-                        has_syscall = true;
-                        break;
-                    }
-                }
-                if (fault_idx + 1 < bb_tmpl->n_insns) {
-                    recovery_pc = bb_tmpl->insn_pcs[fault_idx]
-                                + bb_tmpl->insn_sizes[fault_idx];
-                } else {
-                    recovery_pc = bb_tmpl->fall_through_pc;
-                }
+            if (!bb_has_fault) {
+                bb_has_fault = true;
+                bb_first_fault_idx = bb_pcs.empty()
+                    ? 0 : (uint32_t)(bb_pcs.size() - 1);
             }
 
-            wp_chain.push_back(make_wp_entry(bb_tmpl, true, fault_idx));
+            /* Poison the faulting PC against unbounded re-faults
+             * within this WP simulation.  Subsequent iterations that
+             * jump back to this PC will early-exit the chain. */
+            poisoned_targets.insert(fault_pc);
 
-            clear_accum();
-
-            if (has_syscall) {
-                early_exit = true;
-                break;
-            }
-
-            poisoned_targets.insert(pre_pc);
-            repeated_fault_pc = 0;
-            last_fault_pc = UINT64_MAX;
-
-            if (sim_insns < (uint64_t)max_wrong_path_depth) {
+            if (ends_in_branch) {
+                /* Fault occurred on a branch-classified insn (e.g.,
+                 * syscall).  Fall through to the normal commit path
+                 * below; bb_has_fault carries the speculation-squash
+                 * marker.  This is also where the WP chain naturally
+                 * terminates after a syscall. */
+            } else {
                 if (repeated_fault_pc >= 16) {
                     early_exit = true;
                     break;
                 }
-                if (poisoned_targets.count(recovery_pc)) {
+                uint64_t skip_pc = fault_pc + last_insn_size;
+                if (poisoned_targets.count(skip_pc)) {
                     early_exit = true;
                     break;
                 }
                 qemu_plugin_spec_mode_end();
                 qemu_plugin_cpu_state_restore(saved_state);
                 qemu_plugin_spec_mode_begin(saved_state);
-                qemu_plugin_set_pc(recovery_pc);
+                qemu_plugin_set_pc(skip_pc);
                 continue;
             }
-
-            early_exit = true;
-            break;
         }
 
         if (!ends_in_branch) {
             continue;
         }
 
-        /* Branch fired: commit completed BB. */
+        /* Branch fired: commit completed BB.  bb_has_fault carries
+         * any earlier fault that happened within this BB; the BB
+         * itself is still a true branch-bounded BB in the sense of
+         * basic_block.md, so it goes into bb_map_ unconditionally.
+         * The WPBBEntry's fault flag tells the consumer that
+         * speculation would have squashed at fault_insn_index. */
         uint64_t post_pc = qemu_plugin_get_pc();
         repeated_fault_pc = 0;
         last_fault_pc = UINT64_MAX;
@@ -465,7 +512,9 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             bb_symbol_name, fall_through);
         g_mutex_unlock(&data_lock);
 
-        wp_chain.push_back(make_wp_entry(bb_tmpl, false, 0));
+        wp_chain.push_back(make_wp_entry(bb_tmpl,
+                                         bb_has_fault,
+                                         bb_first_fault_idx));
 
         clear_accum();
 
@@ -495,6 +544,13 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     g_stats.wp_total_insns += sim_insns;
     if (early_exit) {
         g_stats.wp_early_exits++;
+    }
+    if (Stats *h = g_current_hist_bucket) {
+        h->wp_simulations++;
+        h->wp_total_insns += sim_insns;
+        if (early_exit) {
+            h->wp_early_exits++;
+        }
     }
 
     return wp_chain;

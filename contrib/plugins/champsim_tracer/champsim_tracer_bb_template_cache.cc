@@ -85,6 +85,50 @@ int BBTemplateCache::template_branch_index(const BBTemplate *tmpl)
     return -1;
 }
 
+/* Allocate and populate a fresh BBTemplate with @n_insns entries
+ * copied from @insn_*.  Common to commit_true_bb and
+ * commit_truncated_bb; the template_id is assigned by the caller's
+ * map insertion path (so truncated entries don't burn IDs unless
+ * actually inserted).  Returns the heap-allocated unique_ptr; caller
+ * moves it into the appropriate map. */
+static BBTemplatePtr build_bb_template(uint32_t template_id,
+                                       uint64_t start_pc,
+                                       uint32_t n_insns,
+                                       const uint64_t *insn_pcs,
+                                       const InsnFields *insn_fields,
+                                       const uint8_t *insn_sizes,
+                                       const uint8_t *insn_bytes,
+                                       const InsnRegNames *insn_reg_names,
+                                       const char *symbol_name,
+                                       uint64_t fall_through_pc)
+{
+    BBTemplatePtr tmpl(g_new0(BBTemplate, 1));
+    tmpl->template_id = template_id;
+    tmpl->start_pc = start_pc;
+    tmpl->n_insns = n_insns;
+    tmpl->fall_through_pc = fall_through_pc;
+    tmpl->symbol_name = symbol_name ? g_strdup(symbol_name) : nullptr;
+    tmpl->insn_pcs = g_new0(uint64_t, n_insns);
+    tmpl->insn_sizes = g_new0(uint8_t, n_insns);
+    tmpl->insn_bytes = g_new0(uint8_t, (size_t)n_insns * MAX_INSN_BYTES);
+    tmpl->insn_fields = g_new0(InsnFields, n_insns);
+    if (insn_reg_names) {
+        tmpl->insn_reg_names = g_new0(InsnRegNames, n_insns);
+    }
+    for (uint32_t i = 0; i < n_insns; i++) {
+        tmpl->insn_pcs[i] = insn_pcs[i];
+        tmpl->insn_sizes[i] = insn_sizes[i];
+        memcpy(&tmpl->insn_bytes[(size_t)i * MAX_INSN_BYTES],
+               &insn_bytes[(size_t)i * MAX_INSN_BYTES],
+               MAX_INSN_BYTES);
+        tmpl->insn_fields[i] = insn_fields[i];
+        if (tmpl->insn_reg_names) {
+            tmpl->insn_reg_names[i] = insn_reg_names[i];
+        }
+    }
+    return tmpl;
+}
+
 BBTemplate *BBTemplateCache::commit_true_bb(uint64_t start_pc,
                                             uint32_t n_insns,
                                             const uint64_t *insn_pcs,
@@ -110,43 +154,43 @@ BBTemplate *BBTemplateCache::commit_true_bb(uint64_t start_pc,
             static std::atomic<int> warned{0};
             int expected = 0;
             if (warned.compare_exchange_strong(expected, 1)) {
+                /* Find first divergence so we can tell whether it's
+                 * a length-only difference (one is a prefix of the
+                 * other — likely a chain that finalized at different
+                 * lengths) or a true sequence mismatch (likely SMC). */
+                uint32_t first_diff = 0;
+                uint32_t common = existing->n_insns < n_insns
+                    ? existing->n_insns : n_insns;
+                while (first_diff < common &&
+                       existing->insn_pcs[first_diff] ==
+                           insn_pcs[first_diff]) {
+                    first_diff++;
+                }
                 fprintf(stderr,
                     "champsim_tracer: WARNING true-BB at start_pc=0x%"
                     PRIx64 " seen with differing insn sequence "
-                    "(existing n_insns=%u, new n_insns=%u). "
+                    "(existing n_insns=%u, new n_insns=%u, "
+                    "first_diff at i=%u; "
+                    "existing[i]=0x%" PRIx64 ", new[i]=0x%" PRIx64 "). "
                     "Keeping original; this indicates self-modifying "
                     "code or a tracer bug.  (Further occurrences "
                     "suppressed.)\n",
-                    start_pc, existing->n_insns, n_insns);
+                    start_pc, existing->n_insns, n_insns, first_diff,
+                    first_diff < existing->n_insns
+                        ? existing->insn_pcs[first_diff] : 0,
+                    first_diff < n_insns
+                        ? insn_pcs[first_diff] : 0);
             }
         }
         return existing;
     }
 
-    BBTemplatePtr tmpl(g_new0(BBTemplate, 1));
-    tmpl->template_id = next_template_id_++;
-    tmpl->start_pc = start_pc;
-    tmpl->n_insns = n_insns;
-    tmpl->fall_through_pc = fall_through_pc;
-    tmpl->symbol_name = symbol_name ? g_strdup(symbol_name) : nullptr;
-    tmpl->insn_pcs = g_new0(uint64_t, n_insns);
-    tmpl->insn_sizes = g_new0(uint8_t, n_insns);
-    tmpl->insn_bytes = g_new0(uint8_t, (size_t)n_insns * MAX_INSN_BYTES);
-    tmpl->insn_fields = g_new0(InsnFields, n_insns);
-    if (insn_reg_names) {
-        tmpl->insn_reg_names = g_new0(InsnRegNames, n_insns);
-    }
-    for (uint32_t i = 0; i < n_insns; i++) {
-        tmpl->insn_pcs[i] = insn_pcs[i];
-        tmpl->insn_sizes[i] = insn_sizes[i];
-        memcpy(&tmpl->insn_bytes[(size_t)i * MAX_INSN_BYTES],
-               &insn_bytes[(size_t)i * MAX_INSN_BYTES],
-               MAX_INSN_BYTES);
-        tmpl->insn_fields[i] = insn_fields[i];
-        if (tmpl->insn_reg_names) {
-            tmpl->insn_reg_names[i] = insn_reg_names[i];
-        }
-    }
+    BBTemplatePtr tmpl = build_bb_template(next_template_id_++,
+                                           start_pc, n_insns,
+                                           insn_pcs, insn_fields,
+                                           insn_sizes, insn_bytes,
+                                           insn_reg_names,
+                                           symbol_name, fall_through_pc);
     BBTemplate *raw = tmpl.get();
     bb_map_[start_pc] = std::move(tmpl);
     g_stats.bb_templates_created++;

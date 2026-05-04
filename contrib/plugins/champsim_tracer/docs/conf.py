@@ -6,9 +6,11 @@
 #
 # Output lands in contrib/plugins/champsim_tracer/docs/_build/html.
 
-project = "champsim_tracer"
-author = "QEMU champsim_tracer plugin contributors"
-copyright = "2026, " + author
+project = "ChampSim Tracer"
+author = "Maccoy Merrell"
+# Copyright assigned to the ChampSim team — the plugin's intended
+# downstream consumer.  Author is the individual contributor.
+copyright = "2026, ChampSim"
 
 # Read the trace format version from the C header so the docs and the
 # wire format never drift.  The format spec page references this.
@@ -79,7 +81,7 @@ except ImportError:
 # theme's defaults apply.  Empty directories aren't preserved by git,
 # so a stub _static/ wouldn't survive checkout on CI runners anyway.
 html_static_path: list[str] = []
-html_title = f"champsim_tracer v{release}"
+html_title = f"ChampSim Tracer v{release}"
 
 # Render Python type hints inline so the decoder reference page reads
 # like an API doc rather than a wall of prose.
@@ -94,12 +96,24 @@ autodoc_typehints = "description"
 
 latex_engine = "xelatex"  # Better Unicode and font handling than pdflatex.
 
+# Use the standard `makeindex` for the genindex page rather than
+# Sphinx's xelatex default of `xindy`.  xindy is a separate binary
+# (Debian package `xindy`, ~150 MB after pulling in clisp) that the
+# index pages of an English-only doc don't actually need; without
+# this override `make latexpdf` aborts with
+# "Can't exec 'xindy': No such file or directory" on a stock
+# texlive-xetex install.
+latex_use_xindy = False
+
 # (master_doc, target_filename, title, author, theme)
+# Use the friendly "ChampSim Tracer" form in the rendered title so
+# the cover page reads cleanly; the .tex / .pdf basename keeps the
+# underscored directory name for ergonomic file naming.
 latex_documents = [
     (
         "index",
         "champsim_tracer.tex",
-        f"champsim\\_tracer Documentation",
+        "ChampSim Tracer Documentation",
         author,
         "manual",
     ),
@@ -119,4 +133,10 @@ latex_elements = {
     # for a single-sided PDF; they're useful in print but waste pages
     # on screen.
     "extraclassoptions": "openany,oneside",
+    # Suppress the auto-emitted \printindex.  The doc adds only a
+    # handful of py:function / py:class entries, which makes for a
+    # near-empty 1-2 page genindex that's more confusing than useful.
+    # The HTML side hides it the same way (via index.rst's lack of a
+    # `* :ref:`genindex`` line) so the two outputs stay in sync.
+    "printindex": "",
 }

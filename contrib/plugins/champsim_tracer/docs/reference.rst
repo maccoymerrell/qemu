@@ -39,7 +39,7 @@ records.
    * - 0
      - ``GEN_OP_UNKNOWN``
      - Default for instructions the per-ISA classifier didn't
-       recognise.  A non-zero count in the exit-time summary's
+       recognize.  A non-zero count in the exit-time summary's
        "Generic opcode breakdown" suggests the
        ``insn_classification`` table needs a row.
    * - 1
@@ -100,7 +100,7 @@ records.
      - Memory read.  Used heavily on AArch64 (``ldr``/``ld1``
        families), RISC-V (``lw``, ``ld``, ``fld``), and MIPS.  On
        x86, common ``mov`` from memory is ``GEN_OP_MOV`` instead;
-       ``LOAD`` is reserved for specialised forms — FPU control-
+       ``LOAD`` is reserved for specialized forms — FPU control-
        word loads (``fldcw``, ``fldenv``), state-restore
        (``xrstor``, ``fxrstor``), gather (``vgather*``,
        ``vpgather*``), port I/O (``in``, ``insb/d/w``), MPX
@@ -187,7 +187,7 @@ records.
        classified by their canonical Capstone insn-id as
        ``GEN_OP_BRANCH`` with ``branch_type =
        BRANCH_INDIRECT_JUMP`` because the classifier does not
-       inspect the ``ra`` register operand to recognise them as
+       inspect the ``ra`` register operand to recognize them as
        returns.  This is a deliberate trade-off: keeps the
        classification table operand-agnostic at the cost of
        conflating RISC-V/MIPS returns with general indirect jumps
@@ -315,7 +315,7 @@ Branch types (``BranchType``)
    * - 0
      - ``BRANCH_NONE``
      - Not a branch.  Templates default to this for all but the
-       last instruction (after delay-slot normalisation, where
+       last instruction (after delay-slot normalization, where
        applicable).
    * - 1
      - ``BRANCH_DIRECT_JUMP``
@@ -352,7 +352,7 @@ Branch types (``BranchType``)
        (the architectural common case in spec mode) the natural
        ``ends_in_branch`` test commits the BB and the post-PC
        poisoning then breaks out of the WP chain.  Speculative
-       state past the syscall is not modelled.
+       state past the syscall is not modeled.
    * - 5
      - ``BRANCH_COND_DIRECT``
      - PC-relative conditional.  WP target is the *not-taken*
@@ -465,7 +465,7 @@ Sync events (``SyncEventType``)
 
 4-bit field embedded in the per-instruction template flags byte
 (``CST_INSN_FLAG_SYNC_*``).  Marks instructions whose semantics
-involve thread-level synchronisation.
+involve thread-level synchronization.
 
 .. list-table::
    :header-rows: 1
@@ -476,7 +476,7 @@ involve thread-level synchronisation.
      - Notes
    * - 0
      - ``SYNC_NONE``
-     - No synchronisation.  Default.
+     - No synchronization.  Default.
    * - 1..3
      - *(reserved)*
      - Not currently used.  ID 0 → 4 jump leaves space for future
@@ -604,7 +604,7 @@ interpret the ``insn_bytes`` payload of each template.
      - Notes
    * - 0
      - ``TRACE_ISA_UNKNOWN``
-     - Unrecognised ISA.  Decoders should still be able to read
+     - Unrecognized ISA.  Decoders should still be able to read
        opcodes / branch types / register IDs since those are
        generic; only Capstone-disassembling the raw insn_bytes
        requires knowing the ISA.

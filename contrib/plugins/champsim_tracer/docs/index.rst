@@ -1,10 +1,11 @@
-champsim_tracer
+ChampSim Tracer
 ===============
 
-A QEMU TCG plugin that records correct-path and speculative wrong-path
-basic-block traces in the ``.cst`` binary format.  The output is
-intended for cache and branch-predictor research — most directly,
-ChampSim — but the format itself is independent of any one consumer.
+ChampSim Tracer is a QEMU TCG plugin that records correct-path and
+speculative wrong-path basic-block traces in the ``.cst`` binary
+format.  The output is intended for cache and branch-predictor
+research — most directly, ChampSim — but the format itself is
+independent of any one consumer.
 
 The tracer runs against any QEMU user-mode target QEMU has Capstone
 support for (currently x86_64, aarch64, riscv64, mipsel) and writes a
@@ -42,9 +43,3 @@ record stream or prints a byte-budget breakdown of where bytes go.
 
    format
    reference
-
-Indices
--------
-
-* :ref:`genindex`
-* :ref:`search`

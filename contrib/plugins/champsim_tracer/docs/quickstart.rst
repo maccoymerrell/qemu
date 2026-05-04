@@ -58,7 +58,7 @@ Output destination
      ``run.cst.cst``.  Use a bare basename to avoid surprise.
    * ``<basename>.unknown_warnings.log`` — sidecar with one line per
      Capstone-emitted instruction the per-ISA classifier didn't
-     recognise.  Empty when the classification table covers your
+     recognize.  Empty when the classification table covers your
      workload.
 
    Cannot be combined with ``outpipe`` — the segment manager checks
@@ -175,7 +175,7 @@ Observability
 
 ``histogram=<N>``
    Default ``0`` — disabled.  When ``N > 0``, ``start_trace_segment``
-   allocates ``N`` zero-initialised ``Stats`` buckets and
+   allocates ``N`` zero-initialized ``Stats`` buckets and
    ``finish_trace_segment`` walks them after printing the segment
    summary.  Each bucket holds the same counters as ``g_stats``
    (CP / WP opcode, branch type, register attribution, memop
@@ -212,7 +212,7 @@ Three files land beside the basename:
 
 * ``<outfile>.cst`` — the binary trace.
 * ``<outfile>.unknown_warnings.log`` — Capstone-flagged instructions the
-  generic-opcode mapper didn't recognise.  Empty on a clean run.
+  generic-opcode mapper didn't recognize.  Empty on a clean run.
 * ``stderr`` — segment lifecycle (``starting segment``, 10 % progress
   ticks, ``finished segment``) plus a final statistics summary
   containing CP/WP totals, branch-type breakdown, opcode usage, and

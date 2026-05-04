@@ -1,7 +1,7 @@
 Architecture
 ============
 
-This page describes how the tracer is organised, the two main flow
+This page describes how ChampSim Tracer is organized, the two main flow
 loops (CP and WP), and the caveats every prospective modifier needs
 to know.
 
@@ -81,9 +81,9 @@ order they're touched on a hot path:
      - Plain POD aggregate of plugin-wide counters; one global
        ``g_stats`` and (when ``histogram=N``) per-interval buckets.
 
-A handful of synchronisation primitives sit at the top of
+A handful of synchronization primitives sit at the top of
 ``champsim_tracer.cc``: ``data_lock`` guards the BB caches and chain
-assembler; ``exec_lock`` serialises the per-vCPU execution callback so
+assembler; ``exec_lock`` serializes the per-vCPU execution callback so
 the WP simulator can run synchronously inside it.
 
 .. _cp-flow:
@@ -130,7 +130,7 @@ Per TB executed on the correct path, ``vcpu_tb_exec`` runs:
 
 Steps 4-7 happen under ``data_lock``; the BB cache writes plus chain
 state are mutated there.  The actual write to the body stream (step 8)
-holds only ``exec_lock`` — the writer is internally synchronised.
+holds only ``exec_lock`` — the writer is internally synchronized.
 
 .. _wp-flow:
 
@@ -183,7 +183,7 @@ operation):
     +  scoreboard restore.
 
 The chain returned to the caller is *moved* into the
-:class:`BodyEntry`'s ``wp_entries`` field and serialised inline within
+:class:`BodyEntry`'s ``wp_entries`` field and serialized inline within
 the same body record as its CP entry.
 
 .. _caveats:
@@ -288,7 +288,7 @@ At ``finish_trace_segment`` the buckets are dumped via
 transposed top-K tables for opcode / branch type / src reg / dst reg
 where columns are intervals.
 
-Synchronisation summary
+Synchronization summary
 -----------------------
 
 .. list-table::
@@ -299,20 +299,20 @@ Synchronisation summary
      - Covers
    * - ``exec_lock``
      - Held during ``vcpu_tb_exec`` so CP attribution, chain
-       assembly, and a synchronous WP simulation all serialise.  Also
+       assembly, and a synchronous WP simulation all serialize.  Also
        held during ``vcpu_tb_flush`` reset and ``plugin_exit``.
    * - ``data_lock``
      - Mutates the BB caches (``tb_map_``, ``bb_map_``), the chain
        assembler's fragment list, and ``g_branch_history``.  Acquired
        briefly inside the larger ``exec_lock`` window.
    * - ``unknown_warn_lock``
-     - Serialises writes to the ``.unknown_warnings.log`` sidecar.
+     - Serializes writes to the ``.unknown_warnings.log`` sidecar.
    * - Plugin writer thread
-     - Internally synchronised SPSC queue.  Producers (segments) push
+     - Internally synchronized SPSC queue.  Producers (segments) push
        fully-formed binary buffers; the writer thread drains them to
        disk.
 
-The two-lock layout: ``exec_lock`` serialises the per-vCPU execution
+The two-lock layout: ``exec_lock`` serializes the per-vCPU execution
 callback (one ``vcpu_tb_exec`` at a time, including any synchronous
 WP simulation it triggers — so WP runs without needing to stack
 saved state across nested invocations).  ``data_lock`` is grabbed

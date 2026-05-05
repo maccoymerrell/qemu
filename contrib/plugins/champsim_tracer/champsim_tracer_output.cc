@@ -529,6 +529,29 @@ static inline U512 u512_sub(U512 a, U512 b)
     return r;
 }
 
+/*
+ * Materialise a U512 holding (cur - base) in mod 2^512 / two's-
+ * complement form, given two u64 inputs.  Equivalent to
+ * u512_sub(cst_wide_from_u64(cur), cst_wide_from_u64(base)) but
+ * skips the round-trip through two stack-resident U512s — used by
+ * the narrow extract fast path in emit_field_delta_section so the
+ * dominant scalar-unchanged case never materialises a U512 at all
+ * and the rare staged-record case materialises one directly.
+ */
+static inline U512 u512_from_u64_diff(uint64_t cur, uint64_t base)
+{
+    U512 r;
+    r.limb[0] = cur - base;
+    /* Sign-extend the borrow.  When cur >= base the diff fits in u64
+     * and the upper limbs are 0; when cur < base the diff is
+     * negative and 2's-complement-extends to all 1s. */
+    uint64_t fill = (cur < base) ? UINT64_MAX : 0;
+    for (size_t i = 1; i < G_N_ELEMENTS(r.limb); i++) {
+        r.limb[i] = fill;
+    }
+    return r;
+}
+
 static inline void u512_shr7(U512 *v)
 {
     for (size_t i = 0; i < G_N_ELEMENTS(v->limb); i++) {
@@ -724,6 +747,35 @@ static inline bool field_state_block_get(FieldStateBlock *block,
 }
 
 /*
+ * Narrow accessors over the same FieldStateBlock storage.  Field
+ * families whose semantic value fits in u64 (memop counts /
+ * addresses, opcode, branch type, instruction flags / immediates /
+ * sizes, instruction byte words) read and write only ``limb[0]`` and
+ * skip the 56-byte zeroing that the wide get/put would do — so the
+ * dominant per-record cost of the encoder loop drops out.  Upper
+ * limbs in narrow-family storage are never inspected; the family is
+ * either narrow or wide for the lifetime of a trace, decided by
+ * ``FieldDescriptor::extract_u64`` being non-null.
+ */
+static inline bool field_state_block_get_u64(FieldStateBlock *block,
+                                             uint32_t table_generation,
+                                             uint32_t ins_pos,
+                                             uint8_t slot_index,
+                                             uint64_t *out)
+{
+    if (!block || ins_pos >= block->n_insns ||
+        slot_index == FIELD_STATE_SLOT_INVALID) {
+        return false;
+    }
+    size_t index = ((size_t)ins_pos * FIELD_STATE_SLOT_COUNT) + slot_index;
+    if (block->generations[index] != table_generation) {
+        return false;
+    }
+    *out = block->values[index].limb[0];
+    return true;
+}
+
+/*
  * A FieldDescriptor describes one *family* of related field IDs.
  * The emitter walks the descriptor table once per instruction and
  * lets each family produce zero or more (slot, value) observations;
@@ -778,6 +830,24 @@ typedef struct {
      * false.  Null for families whose slot_count is the real bound
      * (or trivially 1). */
     uint8_t (*runtime_slot_cap)(const EntryView *ev, uint32_t i);
+
+    /* Narrow (u64) fast-path siblings of extract / template_default.
+     *
+     * When non-null, the emitter takes a path that avoids
+     * materialising a 64-byte U512 on the stack, comparing two u64s
+     * by register value and only materialising a U512 at staging
+     * time (rare — only when the field actually changed).  Profile
+     * showed the U512 stack round-trip dominating the encoder hot
+     * loop on mcf-like workloads.
+     *
+     * Both must be set together; when either is null the wide
+     * extract/template_default pair is used (LOAD_DATA, STORE_DATA,
+     * SRC_REG — the families whose payload genuinely needs >64 bits). */
+    bool (*extract_u64)(const EntryView *ev, uint32_t ins_pos, uint8_t slot,
+                        uint64_t *out_val);
+    uint64_t (*template_default_u64)(const BBTemplate *tmpl,
+                                     uint32_t ins_pos, uint8_t slot);
+
     const char *name;          /* debug only */
 } FieldDescriptor;
 
@@ -1003,50 +1073,206 @@ static bool extr_insn_size(const EntryView *ev, uint32_t i, uint8_t slot,
                            U512 *out)
 { *out = deflt_insn_size(ev->tmpl, i, slot); return true; }
 
+/* ---------- Narrow (u64) extract/default callbacks ----------
+ *
+ * Mirror the wide callbacks above for every family whose semantic
+ * value fits in u64 (everything except the 512-bit-wide LOAD_DATA /
+ * STORE_DATA / SRC_REG payloads).  These are what the emitter's
+ * fast path uses; they avoid the U512 stack round-trip that
+ * dominated profiling of emit_field_delta_section on mcf.
+ */
+static bool extr_u64_n_loads(const EntryView *ev, uint32_t i, uint8_t slot,
+                             uint64_t *out)
+{
+    (void)slot;
+    if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
+    *out = ev->actual_n_loads[i];
+    return true;
+}
+static uint64_t deflt_u64_zero(const BBTemplate *t, uint32_t i, uint8_t slot)
+{ (void)t; (void)i; (void)slot; return 0; }
+
+static bool extr_u64_n_stores(const EntryView *ev, uint32_t i, uint8_t slot,
+                              uint64_t *out)
+{
+    (void)slot;
+    if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
+    *out = ev->actual_n_stores[i];
+    return true;
+}
+
+static bool extr_u64_load_addr(const EntryView *ev, uint32_t i, uint8_t slot,
+                               uint64_t *out)
+{
+    const DynParam *dp = find_memop_slot(ev, i, slot, DYN_LOAD_ADDR);
+    if (!dp) return false;
+    *out = dp->value;
+    return true;
+}
+
+static bool extr_u64_store_addr(const EntryView *ev, uint32_t i, uint8_t slot,
+                                uint64_t *out)
+{
+    const DynParam *dp = find_memop_slot(ev, i, slot, DYN_STORE_ADDR);
+    if (!dp) return false;
+    *out = dp->value;
+    return true;
+}
+
+static uint64_t deflt_u64_insn_bytes_lo(const BBTemplate *t, uint32_t i,
+                                        uint8_t slot)
+{
+    (void)slot;
+    if (!t || i >= t->n_insns) return 0;
+    uint64_t v = 0;
+    uint8_t sz = t->insn_sizes[i];
+    if (sz > 8) sz = 8;
+    const uint8_t *p = &t->insn_bytes[(size_t)i * MAX_INSN_BYTES];
+    for (int b = 0; b < sz; b++) v |= ((uint64_t)p[b]) << (b * 8);
+    return v;
+}
+static bool extr_u64_insn_bytes_lo(const EntryView *ev, uint32_t i,
+                                   uint8_t slot, uint64_t *out)
+{ *out = deflt_u64_insn_bytes_lo(ev->tmpl, i, slot); return true; }
+
+static uint64_t deflt_u64_insn_bytes_hi(const BBTemplate *t, uint32_t i,
+                                        uint8_t slot)
+{
+    (void)slot;
+    if (!t || i >= t->n_insns) return 0;
+    uint8_t sz = t->insn_sizes[i];
+    if (sz <= 8) return 0;
+    uint64_t v = 0;
+    const uint8_t *p = &t->insn_bytes[(size_t)i * MAX_INSN_BYTES + 8];
+    int extra = sz - 8;
+    if (extra > 8) extra = 8;
+    for (int b = 0; b < extra; b++) v |= ((uint64_t)p[b]) << (b * 8);
+    return v;
+}
+static bool extr_u64_insn_bytes_hi(const EntryView *ev, uint32_t i,
+                                   uint8_t slot, uint64_t *out)
+{ *out = deflt_u64_insn_bytes_hi(ev->tmpl, i, slot); return true; }
+
+static uint64_t deflt_u64_insn_opcode(const BBTemplate *t, uint32_t i,
+                                      uint8_t slot)
+{
+    (void)slot;
+    if (!t || i >= t->n_insns) return 0;
+    return (uint8_t)t->insn_fields[i].opcode;
+}
+static bool extr_u64_insn_opcode(const EntryView *ev, uint32_t i, uint8_t slot,
+                                 uint64_t *out)
+{ *out = deflt_u64_insn_opcode(ev->tmpl, i, slot); return true; }
+
+static uint64_t deflt_u64_insn_branch_type(const BBTemplate *t, uint32_t i,
+                                           uint8_t slot)
+{
+    (void)slot;
+    if (!t || i >= t->n_insns) return 0;
+    return (uint8_t)t->insn_fields[i].branch_type;
+}
+static bool extr_u64_insn_branch_type(const EntryView *ev, uint32_t i,
+                                      uint8_t slot, uint64_t *out)
+{ *out = deflt_u64_insn_branch_type(ev->tmpl, i, slot); return true; }
+
+static uint64_t deflt_u64_insn_flags(const BBTemplate *t, uint32_t i,
+                                     uint8_t slot)
+{
+    (void)slot;
+    if (!t || i >= t->n_insns) return 0;
+    const InsnFields *f = &t->insn_fields[i];
+    uint8_t flags = 0;
+    if (f->branch_conditional) flags |= CST_INSN_FLAG_BRANCH_COND;
+    if (f->has_immediate)      flags |= CST_INSN_FLAG_HAS_IMM;
+    flags |= (uint8_t)((f->sync_hint & 0x0F) << CST_INSN_FLAG_SYNC_SHIFT);
+    return flags;
+}
+static bool extr_u64_insn_flags(const EntryView *ev, uint32_t i, uint8_t slot,
+                                uint64_t *out)
+{ *out = deflt_u64_insn_flags(ev->tmpl, i, slot); return true; }
+
+static uint64_t deflt_u64_insn_imm(const BBTemplate *t, uint32_t i,
+                                   uint8_t slot)
+{
+    (void)slot;
+    if (!t || i >= t->n_insns) return 0;
+    const InsnFields *f = &t->insn_fields[i];
+    if (!f->has_immediate) return 0;
+    return (uint64_t)(int64_t)f->immediate;
+}
+static bool extr_u64_insn_imm(const EntryView *ev, uint32_t i, uint8_t slot,
+                              uint64_t *out)
+{ *out = deflt_u64_insn_imm(ev->tmpl, i, slot); return true; }
+
+static uint64_t deflt_u64_insn_size(const BBTemplate *t, uint32_t i,
+                                    uint8_t slot)
+{
+    (void)slot;
+    if (!t || i >= t->n_insns) return 0;
+    return t->insn_sizes[i];
+}
+static bool extr_u64_insn_size(const EntryView *ev, uint32_t i, uint8_t slot,
+                               uint64_t *out)
+{ *out = deflt_u64_insn_size(ev->tmpl, i, slot); return true; }
+
 /* Field family registry.  Order MUST be ascending by base_field_id so
  * the emitter walks records in (ins_pos, field_id) order. */
 static const FieldDescriptor field_descriptors[] = {
         { CST_FID_N_LOADS,          1,  false, false,
             extr_n_loads,        deflt_n_loads,         nullptr,
+            extr_u64_n_loads,    deflt_u64_zero,
             "N_LOADS" },
         { CST_FID_LOAD_ADDR_BASE,   CST_FID_SLOT_COUNT, false, false,
             extr_load_addr,      deflt_zero,            cap_loads,
+            extr_u64_load_addr,  deflt_u64_zero,
             "LOAD_ADDR" },
         { CST_FID_STORE_ADDR_BASE,  CST_FID_SLOT_COUNT, false, false,
             extr_store_addr,     deflt_zero,            cap_stores,
+            extr_u64_store_addr, deflt_u64_zero,
             "STORE_ADDR" },
         { CST_FID_LOAD_DATA_BASE,   CST_FID_SLOT_COUNT, true,  false,
             extr_load_data,      deflt_zero,            cap_loads,
+            nullptr,             nullptr,
             "LOAD_DATA" },
         { CST_FID_STORE_DATA_BASE,  CST_FID_SLOT_COUNT, true,  false,
             extr_store_data,     deflt_zero,            cap_stores,
+            nullptr,             nullptr,
             "STORE_DATA" },
         { CST_FID_SRC_REG_BASE,     CST_FID_SLOT_COUNT, false, true,
             extr_src_reg,        deflt_zero,            cap_src_regs,
+            nullptr,             nullptr,
             "SRC_REG" },
         { CST_FID_N_STORES,         1,  false, false,
             extr_n_stores,       deflt_n_stores,        nullptr,
+            extr_u64_n_stores,   deflt_u64_zero,
             "N_STORES" },
         { CST_FID_INSN_BYTES_LO,    1,  false, false,
             extr_insn_bytes_lo,  deflt_insn_bytes_lo,   nullptr,
+            extr_u64_insn_bytes_lo, deflt_u64_insn_bytes_lo,
             "INSN_BYTES_LO" },
         { CST_FID_INSN_BYTES_HI,    1,  false, false,
             extr_insn_bytes_hi,  deflt_insn_bytes_hi,   nullptr,
+            extr_u64_insn_bytes_hi, deflt_u64_insn_bytes_hi,
             "INSN_BYTES_HI" },
         { CST_FID_INSN_OPCODE,      1,  false, false,
             extr_insn_opcode,    deflt_insn_opcode,     nullptr,
+            extr_u64_insn_opcode, deflt_u64_insn_opcode,
             "OPCODE" },
         { CST_FID_INSN_BRANCH_TYPE, 1,  false, false,
             extr_insn_branch_type, deflt_insn_branch_type, nullptr,
+            extr_u64_insn_branch_type, deflt_u64_insn_branch_type,
             "BRANCH_TYPE" },
         { CST_FID_INSN_FLAGS,       1,  false, false,
             extr_insn_flags,     deflt_insn_flags,      nullptr,
+            extr_u64_insn_flags, deflt_u64_insn_flags,
             "INSN_FLAGS" },
         { CST_FID_INSN_IMMEDIATE,   1,  false, false,
             extr_insn_imm,       deflt_insn_imm,        nullptr,
+            extr_u64_insn_imm,   deflt_u64_insn_imm,
             "IMMEDIATE" },
         { CST_FID_INSN_SIZE,        1,  false, false,
             extr_insn_size,      deflt_insn_size,       nullptr,
+            extr_u64_insn_size,  deflt_u64_insn_size,
             "INSN_SIZE" },
 };
 
@@ -1405,22 +1631,67 @@ static void emit_field_delta_section(BitWriter *main_bw,
                 uint8_t cap = fd->runtime_slot_cap
                     ? fd->runtime_slot_cap(ev, i)
                     : fd->slot_count;
-                for (uint8_t slot = 0; slot < cap; slot++) {
-                    U512 cur;
-                    if (!fd->extract(ev, i, slot, &cur)) continue;
-                    uint8_t fid = fd->base_field_id + slot;
-                    U512 base =
-                        field_state_get(state_block, state_generation,
-                                        base_block, base_generation,
-                                        i, fid, fd, ev->tmpl, slot);
-                    if (u512_equal(cur, base)) continue;
-                    StageRec rec = {};
-                    rec.pos = i;
-                    rec.fid = fid;
-                    rec.kind = STAGE_REC_SCALAR;
-                    rec.delta = u512_sub(cur, base);
-                    stage_rec_append(&stage, &stage_len, &stage_cap, rec);
-                    field_state_put(state_block, state_generation, i, fid, cur);
+                if (fd->extract_u64) {
+                    /* Narrow fast path.  Compares two u64s in
+                     * registers; only materialises a U512 (via
+                     * u512_from_u64_diff) when the field actually
+                     * changed and we're staging a record.  Skips
+                     * the per-probe stack round-trip that
+                     * dominated the wide path on mcf. */
+                    for (uint8_t slot = 0; slot < cap; slot++) {
+                        uint64_t cur;
+                        if (!fd->extract_u64(ev, i, slot, &cur)) continue;
+                        uint8_t fid = fd->base_field_id + slot;
+                        uint8_t slot_index = field_state_slot_index(fid);
+                        uint64_t base;
+                        if (!field_state_block_get_u64(state_block,
+                                                       state_generation,
+                                                       i, slot_index, &base) &&
+                            !field_state_block_get_u64(base_block,
+                                                       base_generation,
+                                                       i, slot_index, &base)) {
+                            base = fd->template_default_u64(ev->tmpl, i, slot);
+                        }
+                        if (cur == base) continue;
+                        StageRec rec = {};
+                        rec.pos = i;
+                        rec.fid = fid;
+                        rec.kind = STAGE_REC_SCALAR;
+                        rec.delta = u512_from_u64_diff(cur, base);
+                        stage_rec_append(&stage, &stage_len, &stage_cap, rec);
+                        /* Update narrow state: limb[0] only.  Wide
+                         * fields use a different family so this
+                         * residue-in-upper-limbs is invisible to
+                         * any subsequent read. */
+                        if (state_block && i < state_block->n_insns &&
+                            slot_index != FIELD_STATE_SLOT_INVALID) {
+                            size_t idx = ((size_t)i * FIELD_STATE_SLOT_COUNT)
+                                         + slot_index;
+                            state_block->values[idx].limb[0] = cur;
+                            state_block->generations[idx] = state_generation;
+                        }
+                    }
+                } else {
+                    /* Wide path: 64-byte payload families
+                     * (LOAD_DATA, STORE_DATA, SRC_REG). */
+                    for (uint8_t slot = 0; slot < cap; slot++) {
+                        U512 cur;
+                        if (!fd->extract(ev, i, slot, &cur)) continue;
+                        uint8_t fid = fd->base_field_id + slot;
+                        U512 base =
+                            field_state_get(state_block, state_generation,
+                                            base_block, base_generation,
+                                            i, fid, fd, ev->tmpl, slot);
+                        if (u512_equal(cur, base)) continue;
+                        StageRec rec = {};
+                        rec.pos = i;
+                        rec.fid = fid;
+                        rec.kind = STAGE_REC_SCALAR;
+                        rec.delta = u512_sub(cur, base);
+                        stage_rec_append(&stage, &stage_len, &stage_cap, rec);
+                        field_state_put(state_block, state_generation,
+                                        i, fid, cur);
+                    }
                 }
                 if (fd->base_field_id == CST_FID_N_STORES) {
                     stage_extra_memop_vectors(&stage, &stage_len, &stage_cap,

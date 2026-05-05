@@ -23,6 +23,8 @@ VCPUScoreboard::VCPUScoreboard()
         sb_, VCPUScoreBoard, prev_bb_ends_in_branch);
     insn_count = qemu_plugin_scoreboard_u64_in_struct(
         sb_, VCPUScoreBoard, insn_count);
+    last_counted_start_pc = qemu_plugin_scoreboard_u64_in_struct(
+        sb_, VCPUScoreBoard, last_counted_start_pc);
 }
 
 VCPUScoreboard::~VCPUScoreboard()

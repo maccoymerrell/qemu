@@ -327,6 +327,16 @@ typedef struct {
     uint64_t prev_fall_through;
     uint64_t prev_bb_ends_in_branch;
     uint64_t insn_count;
+    /* Start PC of the most recent TB whose insns we counted toward
+     * insn_count.  When QEMU re-enters the same TB without
+     * architectural progress (the canonical case is x86 REP-prefixed
+     * string ops, where each iteration of the rep is exposed to the
+     * plugin as a separate exec_tb call against a single-insn TB at
+     * the same start_pc), we hold insn_count steady so it tracks
+     * *unique-PC visits* rather than dispatcher entries.  This keeps
+     * the icount aligned with PIN-style "one count per architectural
+     * insn" accounting on workloads that use REP MOVSB / STOSB / etc. */
+    uint64_t last_counted_start_pc;
 } VCPUScoreBoard;
 
 enum { BRANCH_TARGET_HISTORY = 16 };

@@ -552,10 +552,34 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     }
 
     /* Update the per-vCPU instruction counter (only on CP path; WP
-     * fragments are not counted). */
+     * fragments are not counted).
+     *
+     * REP-family dispatcher re-entry doesn't move the architectural
+     * instruction count.  QEMU's translator emits x86 REP-prefixed
+     * string ops (MOVSB, STOSB, CMPSB, ...) as a *single-insn* TB
+     * that the dispatcher re-executes once per architectural REP
+     * iteration: each re-execution fires vcpu_tb_exec with the same
+     * start_pc and adds 1 again, drifting our icount past the "one
+     * count per architectural insn" semantics that PIN-style tracers
+     * use.  Skip the increment exactly when n_insns == 1 AND
+     * start_pc matches the last counted — that signature catches
+     * REP-class single-insn dispatcher loops and nothing else.  A
+     * normal tight loop is a multi-insn TB (the loop body plus the
+     * conditional branch), so its per-iteration count is preserved. */
+    uint64_t cur_start_pc = qemu_plugin_u64_get(g_scoreboard.prev_start_pc,
+                                                cpu_index);
     if (!g_wp_state.in_progress) {
-        uint64_t icount_prev = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
-        qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index, icount_prev + n_insns);
+        uint64_t last_counted = qemu_plugin_u64_get(
+            g_scoreboard.last_counted_start_pc, cpu_index);
+        bool is_rep_reentry = (n_insns == 1 && cur_start_pc == last_counted);
+        if (!is_rep_reentry) {
+            uint64_t icount_prev = qemu_plugin_u64_get(
+                g_scoreboard.insn_count, cpu_index);
+            qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index,
+                                icount_prev + n_insns);
+            qemu_plugin_u64_set(g_scoreboard.last_counted_start_pc,
+                                cpu_index, cur_start_pc);
+        }
     }
     uint64_t icount = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
 

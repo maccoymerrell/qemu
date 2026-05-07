@@ -15,7 +15,7 @@ Everything else is sized off the COUNT sentinels.
 Adding a generic opcode
 -----------------------
 
-Use this when the existing 58-value ``GenericOpcode`` enum doesn't
+Use this when the existing 61-value ``GenericOpcode`` enum doesn't
 classify some new instruction class — for example, a new vector-fma
 variant, a cryptographic primitive, or a hardware-transactional-memory
 op.  The wire format reserves one ``u8`` per insn for the opcode, so
@@ -29,7 +29,7 @@ there's room up to 255 entries before the format itself has to change.
 
    .. code-block:: c
 
-      GEN_OP_AES_ENC = 58,
+      GEN_OP_AES_ENC = 61,
       GEN_OP_COUNT,
 
 2. **Name the ID** in the same header's ``generic_opcode_name``
@@ -60,7 +60,7 @@ there's room up to 255 entries before the format itself has to change.
 
 4. **Update the Python decoder.**  ``OPCODE_NAMES`` in
    ``champsim_tracer_decode.py`` is a flat ``int -> str`` dict; add
-   ``58: "AES_ENC"``.  This lets ``cst_audit.py`` pretty-print the new
+   ``61: "AES_ENC"``.  This lets ``cst_audit.py`` pretty-print the new
    opcode even when the trace's encoding-maps section pre-dates its
    addition.
 

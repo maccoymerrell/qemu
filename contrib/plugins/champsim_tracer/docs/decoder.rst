@@ -122,6 +122,24 @@ can be adapted.
           ],
       }
 
+IFRAME validation
+~~~~~~~~~~~~~~~~~
+
+When a trace was produced with ``iframe_rate=N`` the writer follows
+selected ``BODY_TAG_ENTRY`` records with a redundant ``BODY_TAG_IFRAME``
+record carrying the same payload encoded against template-default
+baselines (so every value is absolute).  The decoder transparently
+validates each IFRAME against the immediately-preceding ENTRY's
+reconstruction and raises ``ValueError`` on any mismatch.
+
+Decoder consumers don't need to opt in: IFRAMEs are not surfaced as
+extra entries (``len(entries)`` matches the number of regular
+``BODY_TAG_ENTRY`` records).  IFRAMEs are pure validation/resync
+redundancy; they neither advance ``previous_entry_template`` nor
+update the persistent overlays.  See section 4.5 of
+``champsim_tracer_format.md`` (rendered on the :doc:`format` page)
+for the on-wire shape.
+
 .. py:class:: DynParam
 
    Dataclass for one decoded memop record.  Always built with
@@ -146,8 +164,8 @@ can be adapted.
 
       {
           "insn_index":     int,
-          "kind":           "src",      # only "src" today
-          "operand_index":  int,        # 0..n_src_regs-1 of that insn
+          "kind":           "dst",      # only "dst" today
+          "operand_index":  int,        # 0..n_dst_regs-1 of that insn
           "reg_id":         int,        # GenericRegId
           "value":          int,        # masked-to-trace-width
           "lo":             int,        # low 64
@@ -196,6 +214,12 @@ consumed and what the largest line items inside each part are.
      CP entry framing                        71.78 KiB    0.59%  [   35,857 entry, avg    2.0 B]
      CP field-delta section                 185.99 KiB    1.52%  [   35,857 entry, avg    5.3 B]
      ...
+     IFRAME records (validation redundancy)  80.34 KiB    0.66%  [      388 iframe, avg  212.0 B]
+     ...
+
+The ``IFRAME records`` line appears only on traces produced with
+``iframe_rate>0``; those bytes are pure validation overhead and
+disappear when the feature is off.
 
 The numbers are a hard byte count — every byte produced by the writer
 is counted exactly once and the section totals add up to the file

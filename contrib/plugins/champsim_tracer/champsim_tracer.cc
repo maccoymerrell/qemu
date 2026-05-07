@@ -64,6 +64,7 @@ bool enable_mem_data = false;
 bool enable_reg_data = false;
 bool enable_wp_mem_data = false;
 bool enable_wp_reg_data = false;
+uint32_t iframe_rate = 0;
 
 /* ========================= Thread ID assignment ========================= */
 
@@ -138,10 +139,14 @@ static GMutex exec_lock;
 
 /*
  * Pending register snapshots produced by the per-insn reg-snap
- * callback for the currently-executing BB.  Each insn appends its src
- * snaps in InsnFields.src_regs[] order.  The buffer is drained into
- * BodyEntry.reg_snaps at BB-finalize time, and discarded on flush.
- * Active only when enable_reg_data is true.
+ * callback for the currently-executing BB.  Each insn appends its dst
+ * snaps in InsnFields.dst_regs[] order, captured POST-execution: the
+ * cb is registered on the next canonical insn's pre-exec hook, so it
+ * fires AFTER the previous insn's body completed but BEFORE the next
+ * begins.  The last canonical insn of every TB is captured at the
+ * NEXT TB's vcpu_tb_exec instead (see "Tail-insn dst snap" there).
+ * The buffer is drained into BodyEntry.reg_snaps at BB-finalize time
+ * and discarded on flush.  Active only when enable_reg_data is true.
  */
 static thread_local std::vector<RegSnap> pending_reg_snaps;
 
@@ -159,6 +164,18 @@ typedef struct {
     uint32_t    insn_index;
 } RegSnapInsnRef;
 
+/*
+ * Per-insn destination snap callback.  Registered on the FIRST raw
+ * insn of canonical insn (ci+1) in this TB, so when it fires
+ * pre-execution of that insn, canonical ci has just finished and its
+ * destination registers carry post-execution values.  Reads each of
+ * canonical ci's destination registers and appends the values to the
+ * thread-local pending_reg_snaps buffer, which the body emitter folds
+ * into BodyEntry.reg_snaps at finalize time.
+ *
+ * The LAST canonical insn of every TB is captured separately at the
+ * NEXT TB's vcpu_tb_exec — see the "Tail-insn dst snap" block there.
+ */
 static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
 {
     if (!enable_reg_data || g_wp_state.in_progress) {
@@ -176,9 +193,9 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
     const InsnFields *f = &ref->tb_tmpl->insn_fields[ref->insn_index];
     const InsnRegNames *names = &ref->tb_tmpl->insn_reg_names[ref->insn_index];
 
-    for (uint8_t i = 0; i < f->n_src_regs; i++) {
+    for (uint8_t i = 0; i < f->n_dst_regs; i++) {
         RegSnap s;
-        g_reg_snaps.read_into_snap(cpu_index, &names->src_qemu_reg_keys[i], &s);
+        g_reg_snaps.read_into_snap(cpu_index, &names->dst_qemu_reg_keys[i], &s);
         pending_reg_snaps.push_back(s);
     }
 }
@@ -192,6 +209,92 @@ static void vcpu_mem_cb(unsigned int cpu_index,
 {
     (void)cpu_index;
     g_mem_recorder.record(info, vaddr, (uint64_t)(uintptr_t)udata);
+}
+
+/* ========================= Synthetic-EA callback =========================
+ *
+ * Per-insn callback for prefetch / cache-flush / TLB-flush instructions
+ * whose canonical TCG translation does not emit a memop.  Reads the
+ * base/index register values, applies scale (x86) or shift (AArch64) to
+ * the index, adds the displacement, and routes the resulting EA through
+ * MemAccessRecorder so it shows up in the BodyEntry's load slots.
+ *
+ * Spec-mode WP execution (CF_MEMI_ONLY + CF_SINGLE_STEP) suppresses
+ * post-translation per-insn callbacks, so this fires only on the CP
+ * path.  That's expected: prefetch hints generate no architectural
+ * memops on either path, and the WP simulator already ignores
+ * non-memop control-flow effects.
+ */
+
+typedef struct {
+    BBTemplate *tb_tmpl;
+    uint32_t    insn_index;
+} SynthEAInsnRef;
+
+static inline uint64_t read_reg_u64(unsigned int cpu_index,
+                                    const QemuRegKey *key,
+                                    GByteArray *scratch)
+{
+    if (!key || !key->name) {
+        return 0;
+    }
+    struct qemu_plugin_register *handle =
+        g_reg_handle_cache.lookup(cpu_index, key);
+    if (!handle) {
+        return 0;
+    }
+    g_byte_array_set_size(scratch, 0);
+    int n = qemu_plugin_read_register(handle, scratch);
+    if (n <= 0) {
+        return 0;
+    }
+    uint64_t val = 0;
+    size_t copy = (size_t)n < sizeof(val) ? (size_t)n : sizeof(val);
+    memcpy(&val, scratch->data, copy);
+    return val;
+}
+
+static void vcpu_insn_synth_ea_cb(unsigned int cpu_index, void *udata)
+{
+    if (g_wp_state.in_progress) {
+        return;
+    }
+    if (!g_trace_segments.is_active_atomic()) {
+        return;
+    }
+    const SynthEAInsnRef *ref = (const SynthEAInsnRef *)udata;
+    if (!ref || !ref->tb_tmpl ||
+        ref->insn_index >= ref->tb_tmpl->n_insns ||
+        !ref->tb_tmpl->insn_synthetic_ea) {
+        return;
+    }
+    const SyntheticEAInfo *sea =
+        &ref->tb_tmpl->insn_synthetic_ea[ref->insn_index];
+    if (!sea->has_addr) {
+        return;
+    }
+
+    static thread_local GByteArray *tls_scratch = nullptr;
+    if (!tls_scratch) {
+        tls_scratch = g_byte_array_sized_new(16);
+    }
+
+    uint64_t base = read_reg_u64(cpu_index, &sea->base_key, tls_scratch);
+    uint64_t index = read_reg_u64(cpu_index, &sea->index_key, tls_scratch);
+
+    /* AArch64 register-form: index gets the shift modifier first;
+     * x86 SIB: index gets multiplied by scale.  The two are mutually
+     * exclusive (cap_fill_x86_operands always sets shift_amount == 0,
+     * cap_fill_arm64_operands always sets scale == 1). */
+    if (sea->shift_amount && sea->shift_type) {
+        index <<= sea->shift_amount;
+    } else if (sea->scale > 1) {
+        index *= sea->scale;
+    }
+
+    uint64_t ea = base + index + (uint64_t)sea->disp;
+    g_mem_recorder.record_synthetic_load(ea,
+                                         ref->tb_tmpl->insn_pcs[ref->insn_index]);
 }
 
 /* ========================= Trace state management ========================= */
@@ -373,6 +476,24 @@ static void flush_pending_final_body_entry(void)
         BBTemplate *prev_tb_tmpl =
             g_bb_template_cache.find_tb_template(prev_start);
         if (prev_tb_tmpl) {
+            /* Tail-insn dst snap: same rationale as the equivalent
+             * block in vcpu_tb_exec.  Without this we'd lose the
+             * destination values of the segment-final TB's last
+             * canonical insn, since no subsequent vcpu_tb_exec will
+             * fire after segment shutdown. */
+            if (enable_reg_data && prev_tb_tmpl->insn_reg_names &&
+                prev_tb_tmpl->n_insns > 0) {
+                uint32_t last = prev_tb_tmpl->n_insns - 1;
+                const InsnFields *fl = &prev_tb_tmpl->insn_fields[last];
+                const InsnRegNames *nl =
+                    &prev_tb_tmpl->insn_reg_names[last];
+                for (uint8_t i = 0; i < fl->n_dst_regs; i++) {
+                    RegSnap s;
+                    g_reg_snaps.read_into_snap(cpu_index,
+                                               &nl->dst_qemu_reg_keys[i], &s);
+                    pending_reg_snaps.push_back(s);
+                }
+            }
             g_cp_chain.append_fragment(prev_start, prev_tb_tmpl, prev_ft);
         }
         if (prev_is_branch && prev_tb_tmpl &&
@@ -568,20 +689,31 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
      * conditional branch), so its per-iteration count is preserved. */
     uint64_t cur_start_pc = qemu_plugin_u64_get(g_scoreboard.prev_start_pc,
                                                 cpu_index);
+    /*
+     * icount_prev is the count of architectural instructions that have
+     * actually executed (TBs 1..N-1).  icount (read after the bump
+     * below) reflects TBs 1..N — i.e. it includes THIS TB which has
+     * NOT yet run since vcpu_tb_exec fires at TB start, before the
+     * body.  Trigger logic (start/stop windows, histogram bucket
+     * selection, progress prints) uses icount_prev so the conditions
+     * key off completed work; if we used icount instead, exiting on
+     * the threshold-crossing call would leave the trace short by
+     * THIS TB's worth of insns (the canonical undershoot the user
+     * reported on `start=0,stop=N` runs).
+     */
+    uint64_t icount_prev = qemu_plugin_u64_get(g_scoreboard.insn_count,
+                                               cpu_index);
     if (!g_wp_state.in_progress) {
         uint64_t last_counted = qemu_plugin_u64_get(
             g_scoreboard.last_counted_start_pc, cpu_index);
         bool is_rep_reentry = (n_insns == 1 && cur_start_pc == last_counted);
         if (!is_rep_reentry) {
-            uint64_t icount_prev = qemu_plugin_u64_get(
-                g_scoreboard.insn_count, cpu_index);
             qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index,
                                 icount_prev + n_insns);
             qemu_plugin_u64_set(g_scoreboard.last_counted_start_pc,
                                 cpu_index, cur_start_pc);
         }
     }
-    uint64_t icount = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
 
     if (g_wp_state.in_progress) {
         g_mutex_unlock(&exec_lock);
@@ -591,16 +723,21 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     /* --- Tracing window management.  May start/stop segments and
      *     terminate the process on simpoint exhaustion or non-simpoint
      *     stop.  Inline because the exit path holds exec_lock and we
-     *     must release it before exit() so plugin_exit can re-acquire. */
+     *     must release it before exit() so plugin_exit can re-acquire.
+     *     All checks key off icount_prev (architectural insns
+     *     completed) so the trace covers AT LEAST the requested
+     *     window — overshooting by at most one TB rather than
+     *     undershooting by the threshold-crossing TB. */
     if (g_simpoints.is_active()) {
         if (g_trace_segments.is_active() &&
-            icount >= g_trace_segments.window_stop()) {
+            icount_prev >= g_trace_segments.window_stop()) {
             finish_trace_segment();
             g_simpoints.advance();
         }
         if (!g_trace_segments.is_active()) {
             if (const SimPointEntry *sp = g_simpoints.current()) {
-                if (icount >= sp->start_insn && icount < sp->stop_insn) {
+                if (icount_prev >= sp->start_insn &&
+                    icount_prev <  sp->stop_insn) {
                     g_trace_segments.set_window(sp->start_insn, sp->stop_insn);
                     g_autofree char *label = g_strdup_printf(
                         "sp%zu", g_simpoints.current_index());
@@ -614,14 +751,14 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         }
     } else {
         if (!g_trace_segments.is_active() &&
-            icount >= g_trace_segments.window_start() &&
-            icount <  g_trace_segments.window_stop()) {
+            icount_prev >= g_trace_segments.window_start() &&
+            icount_prev <  g_trace_segments.window_stop()) {
             start_trace_segment("trace",
                                 g_trace_segments.window_start(),
                                 g_trace_segments.window_stop());
         }
         if (g_trace_segments.is_active() &&
-            icount >= g_trace_segments.window_stop()) {
+            icount_prev >= g_trace_segments.window_stop()) {
             finish_trace_segment();
             g_trace_segments.set_shutting_down();
             g_mutex_unlock(&exec_lock);
@@ -635,12 +772,15 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         return;
     }
 
-    heartbeat_progress(icount);
+    heartbeat_progress(icount_prev);
 
     /* Refresh the histogram bucket pointer for this TB exec.  WP code
      * runs synchronously below while exec_lock is still held, so its
-     * bumps land in the correct bucket too. */
-    g_current_hist_bucket = select_histogram_bucket(icount);
+     * bumps land in the correct bucket too.  Bucket selection uses
+     * icount_prev so the just-executed TB's stats land in the bucket
+     * for the architectural slice it actually ran in, not the slice
+     * the next-to-run TB belongs to. */
+    g_current_hist_bucket = select_histogram_bucket(icount_prev);
 
     /* Snapshot the previous-TB scoreboard fields. */
     uint64_t current_pc = qemu_plugin_u64_get(g_scoreboard.current_pc, cpu_index);
@@ -667,6 +807,31 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     BBTemplate *prev_tb_tmpl = g_bb_template_cache.find_tb_template(prev_start);
     if (prev_tb_tmpl) {
+        /*
+         * Tail-insn dst snap for the TB that just finished.  The
+         * per-insn cb chain only captures insn[0..n-2] of each TB
+         * (each registered on insn[i+1]'s pre-exec hook); insn[n-1]'s
+         * destinations would need a hook on the *next* TB's first
+         * insn, which we can't pre-register because the branch target
+         * is unknown at translation time.  Catching it here at the
+         * next TB's vcpu_tb_exec is equivalent — registers still hold
+         * prev_tb_tmpl's last insn's post-exec values (the next TB's
+         * body has not yet run).
+         */
+        if (enable_reg_data && prev_tb_tmpl->insn_reg_names &&
+            prev_tb_tmpl->n_insns > 0 &&
+            g_trace_segments.is_active_atomic()) {
+            uint32_t last = prev_tb_tmpl->n_insns - 1;
+            const InsnFields *fl = &prev_tb_tmpl->insn_fields[last];
+            const InsnRegNames *nl = &prev_tb_tmpl->insn_reg_names[last];
+            for (uint8_t i = 0; i < fl->n_dst_regs; i++) {
+                RegSnap s;
+                g_reg_snaps.read_into_snap(cpu_index,
+                                           &nl->dst_qemu_reg_keys[i], &s);
+                pending_reg_snaps.push_back(s);
+            }
+        }
+
         g_cp_chain.append_fragment(prev_start, prev_tb_tmpl, prev_ft);
 
         /* Per-CP-execution attribution: walk the just-executed TB's
@@ -829,31 +994,103 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                 refs[i].tb_tmpl = new_tmpl;
                 refs[i].insn_index = i;
             }
+            /*
+             * Post-exec destination capture: register the snap cb on
+             * raw insn i (where canonical_first[i] && canonical_index
+             * > 0), pointing at canonical_index-1.  When the cb fires
+             * (PRE-execution of raw insn i, which is the first raw
+             * occurrence of canonical insn ci), canonical insn ci-1
+             * has just completed — its destination registers carry
+             * post-execution values.  The LAST canonical insn of the
+             * TB has no successor raw insn here; its destinations are
+             * captured at the NEXT TB's vcpu_tb_exec via the
+             * prev_tb_tmpl path (see "Tail-insn dst snap" below).
+             */
             for (size_t i = 0; i < raw_n_insns; i++) {
                 if (!canonical_first[i]) {
                     continue;
+                }
+                uint32_t ci = canonical_index[i];
+                if (ci == 0) {
+                    continue;  /* no predecessor canonical insn in this TB */
                 }
                 struct qemu_plugin_insn *insn =
                     qemu_plugin_tb_get_insn(tb, i);
                 qemu_plugin_register_vcpu_insn_exec_cb(
                     insn, vcpu_insn_reg_snap_cb,
                     QEMU_PLUGIN_CB_R_REGS,
-                    &refs[canonical_index[i]]);
+                    &refs[ci - 1]);
+            }
+        }
+
+        if (new_tmpl) {
+            SynthEAInsnRef *synth_refs = nullptr;
+            for (uint32_t i = 0; i < canonical_n_insns; i++) {
+                uint8_t op = new_tmpl->insn_fields[i].opcode;
+                if (op != GEN_OP_PREFETCH &&
+                    op != GEN_OP_CACHE_FLUSH &&
+                    op != GEN_OP_TLB_FLUSH) {
+                    continue;
+                }
+                if (!new_tmpl->insn_synthetic_ea) {
+                    new_tmpl->insn_synthetic_ea =
+                        g_new0(SyntheticEAInfo, canonical_n_insns);
+                }
+                decode_synthetic_ea(&insn_info[i], op,
+                                    new_tmpl->insn_pcs[i],
+                                    new_tmpl->insn_sizes[i],
+                                    &new_tmpl->insn_synthetic_ea[i]);
+            }
+            if (new_tmpl->insn_synthetic_ea) {
+                synth_refs = g_new0(SynthEAInsnRef, canonical_n_insns);
+                new_tmpl->insn_synth_ea_refs = synth_refs;
+                for (uint32_t i = 0; i < canonical_n_insns; i++) {
+                    synth_refs[i].tb_tmpl = new_tmpl;
+                    synth_refs[i].insn_index = i;
+                }
+                for (size_t i = 0; i < raw_n_insns; i++) {
+                    if (!canonical_first[i]) {
+                        continue;
+                    }
+                    uint32_t ci = canonical_index[i];
+                    if (!new_tmpl->insn_synthetic_ea[ci].has_addr) {
+                        continue;
+                    }
+                    struct qemu_plugin_insn *insn =
+                        qemu_plugin_tb_get_insn(tb, i);
+                    qemu_plugin_register_vcpu_insn_exec_cb(
+                        insn, vcpu_insn_synth_ea_cb,
+                        QEMU_PLUGIN_CB_R_REGS,
+                        &synth_refs[ci]);
+                }
             }
         }
     } else {
         /* Re-translation of known BB: re-arm dynamic callbacks. */
         RegSnapInsnRef *refs =
             (RegSnapInsnRef *)existing_tmpl->insn_snap_refs;
+        SynthEAInsnRef *synth_refs =
+            (SynthEAInsnRef *)existing_tmpl->insn_synth_ea_refs;
         for (size_t i = 0; i < raw_n_insns; i++) {
             struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
 
             if (enable_reg_data && refs && canonical_first[i] &&
-                canonical_index[i] < existing_tmpl->n_insns) {
+                canonical_index[i] > 0 &&
+                canonical_index[i] - 1 < existing_tmpl->n_insns) {
                 qemu_plugin_register_vcpu_insn_exec_cb(
                     insn, vcpu_insn_reg_snap_cb,
                     QEMU_PLUGIN_CB_R_REGS,
-                    &refs[canonical_index[i]]);
+                    &refs[canonical_index[i] - 1]);
+            }
+
+            if (synth_refs && canonical_first[i] &&
+                canonical_index[i] < existing_tmpl->n_insns &&
+                existing_tmpl->insn_synthetic_ea &&
+                existing_tmpl->insn_synthetic_ea[canonical_index[i]].has_addr) {
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, vcpu_insn_synth_ea_cb,
+                    QEMU_PLUGIN_CB_R_REGS,
+                    &synth_refs[canonical_index[i]]);
             }
         }
     }
@@ -1360,6 +1597,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         ? enable_reg_data : (cfg.wp_reg_data != 0);
     g_histogram_intervals = cfg.histogram_intervals > 0
         ? (unsigned int)cfg.histogram_intervals : 0;
+    iframe_rate         = cfg.iframe_rate;
     simpoint_interval_insns = cfg.simpoint_interval;
 
     program_name        = cfg.program_name;    cfg.program_name = nullptr;

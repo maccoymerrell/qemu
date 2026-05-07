@@ -211,44 +211,36 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         tmpl = g_bb_template_cache.find_tb_template(pre_pc);
         g_mutex_unlock(&data_lock);
 
+        /*
+         * Reg-data capture for WP is now post-exec (destination
+         * values).  We can't take a wide snap here yet because the
+         * spec-mode exec_tb may translate this fragment for the first
+         * time (so @tmpl might still be null), and we need the
+         * post-fragment register state anyway.  Defer to right after
+         * exec_tb returns — see the post-exec capture_wide() below.
+         */
         bool tmpl_known_before_exec = (tmpl != nullptr);
-        if (enable_wp_reg_data && tmpl_known_before_exec) {
-            uint64_t last_pc = 0;
-            uint8_t last_size = 0;
-            const uint8_t *last_bytes = nullptr;
-            bool have_last = false;
-
-            if (!bb_pcs.empty()) {
-                size_t prev = bb_pcs.size() - 1;
-                last_pc = bb_pcs[prev];
-                last_size = bb_sizes[prev];
-                last_bytes = &bb_bytes[prev * MAX_INSN_BYTES];
-                have_last = true;
-            }
-
-            for (uint32_t i = 0; i < tmpl->n_insns; i++) {
-                const uint8_t *cur_bytes =
-                    &tmpl->insn_bytes[(size_t)i * MAX_INSN_BYTES];
-                bool duplicate = have_last &&
-                    last_pc == tmpl->insn_pcs[i] &&
-                    last_size == tmpl->insn_sizes[i] &&
-                    memcmp(last_bytes, cur_bytes, MAX_INSN_BYTES) == 0;
-
-                if (!duplicate) {
-                    g_reg_snaps.capture_insn_snaps_live(cpu_index, tmpl, i,
-                                               bb_reg_snaps);
-                    last_pc = tmpl->insn_pcs[i];
-                    last_size = tmpl->insn_sizes[i];
-                    last_bytes = cur_bytes;
-                    have_last = true;
-                }
-            }
-        }
-
-        WideRegSnap *wide = (enable_wp_reg_data && !tmpl_known_before_exec)
-            ? g_reg_snaps.capture_wide(cpu_index) : nullptr;
+        (void)tmpl_known_before_exec;
 
         tb_ok = qemu_plugin_exec_tb();
+
+        /*
+         * Wide post-fragment regfile snapshot: holds the speculative
+         * register state after this WP TB completed but before the
+         * next exec_tb (which would overwrite anything this TB
+         * wrote).  We attribute per-insn destination values from it
+         * inside the appended-insns loop below.
+         *
+         * Imprecision: when CF_SINGLE_STEP doesn't reduce the
+         * fragment to one insn (cached translations) and multiple
+         * insns in the fragment write to the same architectural
+         * register, only the final value survives in the snap.
+         * Documented limitation; mirrors the equivalent imprecision
+         * the prior pre-fragment src-side capture had for sources
+         * across multi-insn cached fragments.
+         */
+        WideRegSnap *wide = enable_wp_reg_data
+            ? g_reg_snaps.capture_wide(cpu_index) : nullptr;
 
         if (!tmpl) {
             g_mutex_lock(&data_lock);
@@ -278,15 +270,39 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         if (!tb_ok) {
             uint64_t fault_pc = qemu_plugin_get_pc();
             uint32_t fault_idx_in_tmpl = UINT32_MAX;
+            /* Direct match: fault_pc IS one of the TB's architectural
+             * insn PCs (the canonical "speculation faulted on insn
+             * k before retiring it" case). */
             for (uint32_t i = 0; i < tmpl->n_insns; i++) {
                 if (tmpl->insn_pcs[i] == fault_pc) {
                     fault_idx_in_tmpl = i;
                     break;
                 }
             }
+            /* Post-completion match: fault_pc == insn_pc + insn_size
+             * for some insn k.  This happens when QEMU advances PC
+             * past insn k as part of executing it (canonical for
+             * syscall: the SVC/ECALL retires architecturally, then
+             * the syscall handler fails out of spec mode and we
+             * return with PC = SVC_PC + insn_size).  Insn k is the
+             * one that "caused" the fault — it's the syscall (or
+             * other privilege/exception-raising terminator) that
+             * triggered the spec-mode exit.  Without this fallback
+             * the chain truncates short and the exit-block tail of
+             * any wrong path becomes invisible. */
             if (fault_idx_in_tmpl == UINT32_MAX) {
-                /* QEMU couldn't pin the fault to one of this TB's
-                 * insns — give up the chain rather than guess. */
+                for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+                    uint64_t post = tmpl->insn_pcs[i] + tmpl->insn_sizes[i];
+                    if (post == fault_pc) {
+                        fault_idx_in_tmpl = i;
+                        break;
+                    }
+                }
+            }
+            if (fault_idx_in_tmpl == UINT32_MAX) {
+                /* Fault PC truly outside the TB.  Give up the chain
+                 * rather than guess; this is a real abnormal exit
+                 * (e.g. translation-unavailable cousin). */
                 RegSnapCollector::free_wide(wide);
                 clear_accum();
                 bb_reg_snaps.clear();
@@ -355,7 +371,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                     bb_regnames.push_back(empty);
                 }
             }
-            if (enable_wp_reg_data && !tmpl_known_before_exec) {
+            if (enable_wp_reg_data) {
                 g_reg_snaps.capture_insn_snaps(wide, tmpl, i, bb_reg_snaps);
             }
             appended_insns++;

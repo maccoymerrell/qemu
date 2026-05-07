@@ -806,10 +806,29 @@ typedef struct qemu_plugin_operand {
     uint8_t  type;     /* QEMU_PLUGIN_OP_* */
     uint8_t  access;   /* bitmask of QEMU_PLUGIN_OP_ACC_*, 0 if unknown */
     uint8_t  size;     /* operand size in bytes */
-    uint8_t  _pad;
+    /*
+     * x86 SIB scale: 1, 2, 4, or 8 when an index register participates;
+     * 0 or 1 means "no index scaling" (treat as effective scale 1).
+     * Always 1 for non-x86 ISAs.  Plugins that compute an effective
+     * address from the operand should use:
+     *     ea = base + index * (scale ? scale : 1) + disp
+     */
+    uint8_t  scale;
     uint16_t reg_id;   /* Capstone register ID for reg_name (0 = none) */
     uint16_t index_id; /* Capstone register ID for index_name (0 = none) */
     int64_t  imm;      /* IMM value, or MEM displacement */
+    /*
+     * AArch64 register-form addressing modifier.  shift_type matches
+     * Capstone's arm64_shifter enum (0 = none, ARM64_SFT_LSL,
+     * ARM64_SFT_LSR, ARM64_SFT_ASR, ARM64_SFT_ROR, ARM64_SFT_MSL).
+     * shift_amount is the shift count in bits.  Always zero for
+     * non-AArch64 ISAs and for unshifted operands.  Plugins computing
+     * an EA from a register-form load/store should apply the shift to
+     * the index register before adding the base.
+     */
+    uint8_t  shift_type;
+    uint8_t  shift_amount;
+    uint8_t  _pad[2];
     /* REG name (or MEM base register name); empty string if none */
     char     reg_name[QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ];
     /* MEM index register name; empty string if none or not MEM */

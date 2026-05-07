@@ -111,6 +111,16 @@ bool set_histogram(PluginConfig *cfg, const char *v)
     return true;
 }
 
+bool set_iframe_rate(PluginConfig *cfg, const char *v)
+{
+    long long n = g_ascii_strtoll(v, nullptr, 10);
+    if (n < 0 || n > UINT32_MAX) {
+        return false;
+    }
+    cfg->iframe_rate = (uint32_t)n;
+    return true;
+}
+
 typedef bool (*OptionSetter)(PluginConfig *cfg, const char *value);
 
 const struct {
@@ -132,6 +142,7 @@ const struct {
     { "wp_memdata", set_wp_memdata },
     { "wp_regdata", set_wp_regdata },
     { "histogram",  set_histogram  },
+    { "iframe_rate", set_iframe_rate },
     { nullptr, nullptr },
 };
 

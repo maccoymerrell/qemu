@@ -48,6 +48,7 @@ CST_FLAG_RESERVED_2    = 1 << 2
 BODY_TAG_END             = 0
 BODY_TAG_ENTRY           = 1
 BODY_TAG_THREAD_SWITCH   = 2
+BODY_TAG_IFRAME          = 3
 
 # Per-insn template flags (u8)
 CST_INSN_FLAG_BRANCH_COND    = 1 << 0
@@ -66,7 +67,9 @@ FID_LOAD_ADDR_BASE   = 0x01
 FID_STORE_ADDR_BASE  = 0x11
 FID_LOAD_DATA_BASE   = 0x21
 FID_STORE_DATA_BASE  = 0x31
-FID_SRC_REG_BASE     = 0x41
+# 0x41..0x50 reserved for pre-exec source register values (not currently
+# emitted; the writer captures destination values post-execution).
+FID_DST_REG_BASE     = 0x51
 FID_N_STORES         = 0x61
 FID_EXTRA_LOAD_ADDR  = 0x62
 FID_EXTRA_STORE_ADDR = 0x63
@@ -129,6 +132,7 @@ OPCODE_NAMES = {
     52: "INT_MADD", 53: "INT_MSUB",
     54: "FP_MADD", 55: "FP_MSUB",
     56: "VEC_MADD", 57: "VEC_MSUB",
+    58: "PREFETCH", 59: "CACHE_FLUSH", 60: "TLB_FLUSH",
 }
 
 BRANCH_NAMES = {
@@ -186,7 +190,7 @@ def build_field_id_names() -> dict[int, str]:
         names[FID_STORE_ADDR_BASE + i] = f"CST_FID_STORE_ADDR{i}"
         names[FID_LOAD_DATA_BASE + i] = f"CST_FID_LOAD_DATA{i}"
         names[FID_STORE_DATA_BASE + i] = f"CST_FID_STORE_DATA{i}"
-        names[FID_SRC_REG_BASE + i] = f"CST_FID_SRC_REG{i}"
+        names[FID_DST_REG_BASE + i] = f"CST_FID_DST_REG{i}"
     names[FID_N_STORES] = "CST_FID_N_STORES"
     names[FID_EXTRA_LOAD_ADDR] = "CST_FID_EXTRA_LOAD_ADDR"
     names[FID_EXTRA_STORE_ADDR] = "CST_FID_EXTRA_STORE_ADDR"
@@ -441,6 +445,49 @@ def _template_default(tmpl: dict | None, ipos: int, fid: int) -> int:
     return 0
 
 
+def _dp_key(dp) -> tuple:
+    """Comparable key for a DynParam.  Captures everything the wire
+    format actually carries, so an absolute-encoded IFRAME view can be
+    compared against the delta-encoded ENTRY view for the same entry.
+    """
+    return (dp.insn_index, dp.type_name, dp.value, dp.data, dp.data_size)
+
+
+def _validate_iframe(template_id: int,
+                     where: str,
+                     entry_dyn: list,
+                     entry_reg_snaps: list,
+                     iframe_dyn: list,
+                     iframe_reg_snaps: list) -> None:
+    """Compare an absolute-encoded IFRAME against the delta-decoded
+    regular ENTRY for the same observation point.  A mismatch indicates
+    either a writer bug or a decoder bug; raise so it surfaces in
+    consumers that decode strictly.  (cst_audit.py and similar wrap the
+    decode call and downgrade to a warning if the strictness isn't
+    desired.)
+    """
+    e_keys = sorted(_dp_key(dp) for dp in entry_dyn)
+    i_keys = sorted(_dp_key(dp) for dp in iframe_dyn)
+    if e_keys != i_keys:
+        raise ValueError(
+            f"IFRAME {where} dyn_params mismatch for template {template_id}: "
+            f"entry={e_keys!r} iframe={i_keys!r}"
+        )
+    if len(entry_reg_snaps) != len(iframe_reg_snaps):
+        raise ValueError(
+            f"IFRAME {where} reg_snap count mismatch for template "
+            f"{template_id}: entry={len(entry_reg_snaps)} "
+            f"iframe={len(iframe_reg_snaps)}"
+        )
+    for i, (a, b) in enumerate(zip(entry_reg_snaps, iframe_reg_snaps)):
+        if a.get("value") != b.get("value"):
+            raise ValueError(
+                f"IFRAME {where} reg_snap[{i}] mismatch for template "
+                f"{template_id}: entry={a.get('value')!r} "
+                f"iframe={b.get('value')!r}"
+            )
+
+
 def _decode_field_delta_section(
         br: ByteReader,
         template_id: int,
@@ -572,16 +619,19 @@ def _decode_field_delta_section(
                     _set_dyn_data(dp, extra_data[j])
                 dyn_params.append(dp)
 
-        # Register snapshots: source operands only. Destination register
-        # identities remain in the template, but dynamic destination values
-        # are not emitted by the writer's pre-execution capture path.
-        # Skip if the REG_DATA flag is clear (no records will exist).
+        # Register snapshots: destination operands only, captured
+        # post-execution.  Source register identities remain in the
+        # template; source values are not emitted on the wire (the
+        # writer's capture path is dst-only — consumers can derive any
+        # register's value at any point from the most recent post-exec
+        # destination observation).  Skip if the REG_DATA flag is
+        # clear (no records will exist).
         if flags & CST_FLAG_REG_DATA:
-            for op_i, reg_id in enumerate(insn.get("src_regs", [])):
-                v = _state_or_default(i, FID_SRC_REG_BASE + op_i)
+            for op_i, reg_id in enumerate(insn.get("dst_regs", [])):
+                v = _state_or_default(i, FID_DST_REG_BASE + op_i)
                 reg_snaps.append({
                     "insn_index": i,
-                    "kind": "src",
+                    "kind": "dst",
                     "operand_index": op_i,
                     "reg_id": reg_id,
                     "value": v & scalar_mask,
@@ -677,6 +727,60 @@ def decode_champsim_tracer(bin_path: Path
     wp_field_state: dict[tuple[int, int, int], int] = {}
     footer_num_entries: int | None = None
 
+    def _decode_body_record_payload(br, entry_tmpl, cp_state, wp_state):
+        """Decode one body-record payload (CP delta section + WP chain
+        section + WP events section) using the supplied overlays.
+        Returns (cp_dyn, cp_reg_snaps, wp_entries).  Used for both
+        BODY_TAG_ENTRY (called with the persistent cp/wp_field_state)
+        and BODY_TAG_IFRAME (called with fresh empty overlays so all
+        deltas resolve from template_default — pure absolute decode).
+        """
+        cp_tmpl = template_by_id.get(entry_tmpl)
+        cp_dyn, cp_reg_snaps = _decode_field_delta_section(
+            br, entry_tmpl, cp_tmpl, cp_state, flags, scalar_mask)
+
+        wp_entries_local: list[dict] = []
+        wpb = br.sub()
+        num_wp = wpb.uleb()
+        prev_wp_tmpl = 0
+        wp_base = cp_state if wp_persistent else None
+        for w in range(num_wp):
+            wp_tmpl = prev_wp_tmpl + wpb.sleb()
+            prev_wp_tmpl = wp_tmpl
+            wp_tmpl_dict = template_by_id.get(wp_tmpl)
+            wp_dyn, wp_reg_snaps = _decode_field_delta_section(
+                wpb, wp_tmpl, wp_tmpl_dict, wp_state, flags,
+                scalar_mask, base_state=wp_base)
+            wp_entries_local.append({
+                "index": w,
+                "template_id": wp_tmpl,
+                "dyn_params": wp_dyn,
+                "reg_snaps": wp_reg_snaps,
+                "fault": False,
+                "translation_unavailable": False,
+                "fault_insn_index": None,
+                "n_insns": template_by_id.get(wp_tmpl, {}).get("n_insns", 0),
+            })
+
+        evb = br.sub()
+        num_events = evb.uleb()
+        prev_evt_idx = -1
+        for _ in range(num_events):
+            gap = evb.uleb()
+            idx = prev_evt_idx + 1 + gap
+            if idx >= num_wp:
+                raise ValueError("wp event index out of range")
+            evf = evb.u8()
+            wp_entries_local[idx]["translation_unavailable"] = bool(
+                evf & CST_WP_EVENT_TRANSLATION_UNAVAIL)
+            is_fault = bool(evf & CST_WP_EVENT_FAULT)
+            wp_entries_local[idx]["fault"] = is_fault
+            if is_fault:
+                wp_entries_local[idx]["fault_insn_index"] = evb.uleb()
+            prev_evt_idx = idx
+
+        return cp_dyn, cp_reg_snaps, wp_entries_local
+
     while True:
         tag = body.u8()
 
@@ -689,73 +793,66 @@ def decode_champsim_tracer(bin_path: Path
             pending_thread_switch = True
             continue
 
-        if tag != BODY_TAG_ENTRY:
-            raise ValueError(f"Unknown body tag: {tag}")
+        if tag == BODY_TAG_ENTRY:
+            entry_tmpl = prev_entry_template + body.sleb()
+            prev_entry_template = entry_tmpl
 
-        entry_tmpl = prev_entry_template + body.sleb()
-        prev_entry_template = entry_tmpl
+            if not wp_persistent:
+                # v1.7/v1.8 forked CP→WP state at chain start.  Carry
+                # the latest CP state forward into a fresh WP overlay
+                # only when this body record actually starts a chain;
+                # the cheaper unconditional clone here matches the
+                # writer's pre-chain state.
+                wp_field_state = dict(cp_field_state)
 
-        cp_tmpl = template_by_id.get(entry_tmpl)
-        cp_dyn, cp_reg_snaps = _decode_field_delta_section(
-            body, entry_tmpl, cp_tmpl, cp_field_state, flags, scalar_mask)
+            cp_dyn, cp_reg_snaps, wp_entries = _decode_body_record_payload(
+                body, entry_tmpl, cp_field_state, wp_field_state)
 
-        # WP chain sub-section
-        wp_entries: list[dict] = []
-        wpb = body.sub()
-        num_wp = wpb.uleb()
-        prev_wp_tmpl = 0
-        if num_wp > 0 and not wp_persistent:
-            # v1.7/v1.8: fork CP→WP state at chain start; discarded
-            # at chain end.  v1.9 keeps wp_field_state across chains
-            # and falls back to cp_field_state on miss instead.
-            wp_field_state = dict(cp_field_state)
-        wp_base = cp_field_state if wp_persistent else None
-        for w in range(num_wp):
-            wp_tmpl = prev_wp_tmpl + wpb.sleb()
-            prev_wp_tmpl = wp_tmpl
-            wp_tmpl_dict = template_by_id.get(wp_tmpl)
-            wp_dyn, wp_reg_snaps = _decode_field_delta_section(
-                wpb, wp_tmpl, wp_tmpl_dict, wp_field_state, flags,
-                scalar_mask, base_state=wp_base)
-            wp_entries.append({
-                "index": w,
-                "template_id": wp_tmpl,
-                "dyn_params": wp_dyn,
-                "reg_snaps": wp_reg_snaps,
-                "fault": False,
-                "translation_unavailable": False,
-                "fault_insn_index": None,
-                "n_insns": template_by_id.get(wp_tmpl, {}).get("n_insns", 0),
+            entries.append({
+                "seq_num": len(entries) + 1,
+                "template_id": entry_tmpl,
+                "thread_id": current_thread,
+                "thread_switched": pending_thread_switch,
+                "dyn_params": cp_dyn,
+                "reg_snaps": cp_reg_snaps,
+                "wp_entries": wp_entries,
             })
+            pending_thread_switch = False
+            continue
 
-        # WP events sub-section
-        evb = body.sub()
-        num_events = evb.uleb()
-        prev_evt_idx = -1
-        for _ in range(num_events):
-            gap = evb.uleb()
-            idx = prev_evt_idx + 1 + gap
-            if idx >= num_wp:
-                raise ValueError("wp event index out of range")
-            evf = evb.u8()
-            wp_entries[idx]["translation_unavailable"] = bool(
-                evf & CST_WP_EVENT_TRANSLATION_UNAVAIL)
-            is_fault = bool(evf & CST_WP_EVENT_FAULT)
-            wp_entries[idx]["fault"] = is_fault
-            if is_fault:
-                wp_entries[idx]["fault_insn_index"] = evb.uleb()
-            prev_evt_idx = idx
+        if tag == BODY_TAG_IFRAME:
+            # Validates the immediately-preceding BODY_TAG_ENTRY.
+            # Decoded against fresh empty overlays so every delta
+            # record resolves to its absolute value (against
+            # template_default).  After parsing, compare the
+            # reconstructed CP and WP views against the regular
+            # ENTRY's reconstruction — any mismatch implies a bug
+            # somewhere in the writer or decoder.
+            if not entries:
+                raise ValueError("BODY_TAG_IFRAME with no preceding ENTRY")
+            prev = entries[-1]
+            iframe_cp_state: dict[tuple[int, int, int], int] = {}
+            iframe_wp_state: dict[tuple[int, int, int], int] = {}
+            i_cp_dyn, i_cp_reg, i_wp_entries = _decode_body_record_payload(
+                body, prev["template_id"],
+                iframe_cp_state, iframe_wp_state)
+            _validate_iframe(prev["template_id"], "CP",
+                             prev["dyn_params"], prev["reg_snaps"],
+                             i_cp_dyn, i_cp_reg)
+            if len(i_wp_entries) != len(prev["wp_entries"]):
+                raise ValueError(
+                    f"IFRAME WP-chain length mismatch: "
+                    f"entry={len(prev['wp_entries'])} "
+                    f"iframe={len(i_wp_entries)}"
+                )
+            for w_idx, (e_wp, i_wp) in enumerate(
+                    zip(prev["wp_entries"], i_wp_entries)):
+                _validate_iframe(e_wp["template_id"], f"WP[{w_idx}]",
+                                 e_wp["dyn_params"], e_wp["reg_snaps"],
+                                 i_wp["dyn_params"], i_wp["reg_snaps"])
+            continue
 
-        entries.append({
-            "seq_num": len(entries) + 1,
-            "template_id": entry_tmpl,
-            "thread_id": current_thread,
-            "thread_switched": pending_thread_switch,
-            "dyn_params": cp_dyn,
-            "reg_snaps": cp_reg_snaps,
-            "wp_entries": wp_entries,
-        })
-        pending_thread_switch = False
+        raise ValueError(f"Unknown body tag: {tag}")
 
     if footer_num_entries is not None and footer_num_entries != len(entries):
         raise ValueError(

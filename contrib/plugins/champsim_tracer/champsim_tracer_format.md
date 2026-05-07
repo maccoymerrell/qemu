@@ -66,6 +66,7 @@ CST_TRAILER_SIZE   = 64
 BODY_TAG_END       = 0
 BODY_TAG_ENTRY     = 1
 BODY_TAG_THREAD_SWITCH = 2
+BODY_TAG_IFRAME    = 3
 ```
 
 Header feature flags are advisory. The field IDs still determine what
@@ -73,7 +74,7 @@ is actually present in each delta section.
 
 ```
 bit 0  CST_FLAG_MEM_DATA      LOAD_DATA / STORE_DATA fields may appear
-bit 1  CST_FLAG_REG_DATA      SRC_REG fields may appear
+bit 1  CST_FLAG_REG_DATA      DST_REG fields may appear
 bit 2  CST_FLAG_RESERVED_2    reserved, written as 0
 bits 3..7                    reserved, written as 0
 ```
@@ -177,12 +178,17 @@ body stream:
   | tag = BODY_TAG_ENTRY    |
   | entry payload           |
   +-------------------------+
+  | tag = BODY_TAG_IFRAME   |   (optional, validates the preceding ENTRY)
+  | iframe payload          |
+  +-------------------------+
   | tag = BODY_TAG_END      |
   | num_entries : ULEB      |
   +-------------------------+
 ```
 
 `num_entries` must match the number of `BODY_TAG_ENTRY` records seen.
+`BODY_TAG_IFRAME` records are not counted; they are pure
+validation/resync redundancy.
 
 ### 4.1 BODY_TAG_THREAD_SWITCH
 
@@ -262,6 +268,37 @@ wp_events_section payload:
 
 `prev_index` starts at -1. `fault_insn_index` is the 0-based index of
 the faulting instruction within that wrong-path block.
+
+### 4.5 BODY_TAG_IFRAME
+
+An IFRAME is a redundant absolute-encoded copy of the immediately-
+preceding `BODY_TAG_ENTRY` body record. The writer emits it at an
+arbitrary cadence (controlled by the `iframe_rate` plugin option, but
+the wire format does not record the rate); decoders may use it to
+cross-check that their delta-replay reconstructed the same view the
+writer had, or skip it entirely.
+
+```
++--------------------------------------------------+
+| tag = 3                         u8               |
+| cp_delta_section                section          |
+| wp_chain_section                section          |
+| wp_events_section               section          |
++--------------------------------------------------+
+```
+
+The IFRAME inherits the `template_id` of the preceding ENTRY (no
+`template_id_delta` is encoded). Inside, every field-delta record is
+encoded against `template_default` rather than against the persistent
+overlay state, so the decoded value is absolute. When the CP-side
+triggers an IFRAME, the entire body record is re-emitted in IFRAME
+mode — including every WP-chain entry attached to that CP block; WP
+entries are never IFRAME'd independently of their owning CP entry.
+
+IFRAMEs MUST NOT advance `previous_entry_template` and MUST NOT update
+the persistent `cp_field_state` / `wp_field_state` overlays — they
+are pure validation/resync redundancy. The next `BODY_TAG_ENTRY`
+continues from where the preceding regular ENTRY left off.
 
 ## 5. Field-Delta Sections
 
@@ -367,8 +404,8 @@ Field IDs are one byte. Slotted families reserve 16 values each.
 | 0x11..0x20     | STORE_ADDR[0..15]    | store virtual addresses       |
 | 0x21..0x30     | LOAD_DATA[0..15]     | load values, if MEM_DATA      |
 | 0x31..0x40     | STORE_DATA[0..15]    | store values, if MEM_DATA     |
-| 0x41..0x50     | SRC_REG[0..15]       | source register snapshots     |
-| 0x51..0x60     | reserved             | destination-value extension    |
+| 0x41..0x50     | reserved             | source-register-snapshot extension |
+| 0x51..0x60     | DST_REG[0..15]       | destination register snapshots |
 | 0x61           | N_STORES             | current valid store slots     |
 | 0x62           | EXTRA_LOAD_ADDR      | raw load addr vector, slots 16+ |
 | 0x63           | EXTRA_STORE_ADDR     | raw store addr vector, slots 16+ |
@@ -395,6 +432,22 @@ each numeric field ID.
 defaults are zero. The writer derives current values by counting QEMU
 memory callbacks for each instruction execution; opcode tables and
 Capstone operand flags do not define these counts.
+
+Three opcodes — `GEN_OP_PREFETCH`, `GEN_OP_CACHE_FLUSH`, and
+`GEN_OP_TLB_FLUSH` — describe instructions that QEMU's TCG translates
+to no memory op (software prefetch hints, cache-line clean / flush /
+invalidate, TLB-entry invalidate). The writer synthesises a load
+memop for these by decoding the Capstone operand at translation time
+and reading base / index register values at execution time, computing
+`ea = base + (index << shift_amount) * scale + disp`. The synthesized
+EA appears in the same `LOAD_ADDR[0]` slot as a regular load and
+contributes to `N_LOADS`. Opcode classification (PREFETCH / CACHE_FLUSH /
+TLB_FLUSH) carries the semantic distinction; consumers that simulate
+prefetch hints, cache-line evictions, or TLB shootdowns should
+dispatch on the opcode rather than treating the EA as a normal load.
+Instructions in these classes that have no memory operand (e.g. x86
+`WBINVD`, AArch64 `IC IALLU`) emit no synthesized address and stay
+classified under `GEN_OP_FENCE`.
 
 ```
 current n_loads = state(template, insn, CST_FID_N_LOADS)
@@ -440,23 +493,32 @@ paths that can provide up to 64 bytes.
 
 ### 5.4 Register Data
 
-When `CST_FLAG_REG_DATA` is set, register fields carry pre-execution
-snapshots for the template's source register slots only. Destination
-register identities remain in the template's `dst_regs` array, but
-destination values are not emitted because the capture point is before
-the instruction executes.
+When `CST_FLAG_REG_DATA` is set, register fields carry post-execution
+snapshots for the template's destination register slots only. Source
+register identities remain in the template's `src_regs` array, but
+source values are not emitted on the wire — destination values
+strictly dominate (they cover every architectural write, so consumers
+can derive any register's value at any point from the most recent
+post-write observation, and there are typically fewer destinations
+than sources per insn so the cost is lower).
 
 ```
 template instruction:
 
-  src_regs = [ REG_A, REG_B, ... ]
-  dst_regs = [ REG_C, ... ]    static destination identities only
+  src_regs = [ REG_A, REG_B, ... ]   static source identities only
+  dst_regs = [ REG_C, ... ]
 
 delta fields for this instruction:
 
-  CST_FID_SRC_REG0  -> value of REG_A before execution
-  CST_FID_SRC_REG1  -> value of REG_B before execution
+  CST_FID_DST_REG0  -> value of REG_C after execution
 ```
+
+Capture timing: each per-insn destination snap is taken at the first
+moment after the instruction's body completes — for non-tail insns
+that's the pre-exec hook of the next canonical insn; for the tail
+insn of every TB it's the next TB's tb_exec callback. Both points
+guarantee the architectural register state reflects the just-finished
+instruction's writes and not yet the next instruction's.
 
 Register snapshots are scalar 512-bit values. The capture path copies
 up to the first 64 little-endian bytes returned by

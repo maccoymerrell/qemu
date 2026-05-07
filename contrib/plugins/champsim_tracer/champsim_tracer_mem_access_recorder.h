@@ -28,6 +28,13 @@ public:
                 uint64_t vaddr,
                 uint64_t insn_pc);
 
+    /* Called from the per-insn synthetic-EA callback for prefetch /
+     * cache-flush / TLB-flush instructions whose TCG translation does
+     * not emit a memop.  Records the computed effective address as a
+     * load-style WPMemAccess (no data, no store flag).  Same WP/CP
+     * routing as record(). */
+    void record_synthetic_load(uint64_t vaddr, uint64_t insn_pc);
+
     /* CP buffer accessors used by vcpu_tb_exec.  The CP buffer is a
      * thread_local std::vector that lazy-grows on first push; no
      * explicit pre-allocation step is needed. */

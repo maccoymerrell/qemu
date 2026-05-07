@@ -249,10 +249,12 @@ records.
        maps to ``FENCE`` has ``MF_ATOMIC``, so the resulting
        insn always carries ``sync_hint = SYNC_ATOMIC``.
        Examples: x86 ``mfence`` / ``lfence`` / ``sfence``,
-       cache-management (``clflush*``, ``clwb``, ``cldemote``),
-       TLB invalidation (``invlpg*``); AArch64 ``dmb`` / ``dsb``
-       / ``isb`` / ``clrex``; RISC-V ``fence`` / ``fence.i`` /
-       ``cbo.*``.
+       cache-wide ops without an address (``invd``, ``wbinvd``,
+       ``serialize``); AArch64 ``dmb`` / ``dsb`` / ``isb`` /
+       ``clrex``; RISC-V ``fence`` / ``fence.i``.  Cache- and
+       TLB-management opcodes that *carry an address operand* now
+       map to ``GEN_OP_CACHE_FLUSH`` / ``GEN_OP_TLB_FLUSH`` /
+       ``GEN_OP_PREFETCH`` instead — see those rows below.
    * - 45
      - ``GEN_OP_CMOV``
      - Conditional move.
@@ -292,8 +294,37 @@ records.
    * - 57
      - ``GEN_OP_VEC_MSUB``
      - Vector fused multiply-sub.
+   * - 58
+     - ``GEN_OP_PREFETCH``
+     - Software prefetch hint.  QEMU's TCG translates these to
+       no-ops, so no real memop is emitted; the tracer synthesises
+       a load memop carrying the computed effective address by
+       reading base / index registers at exec time and applying
+       ``ea = base + (index << shift_amount) * scale + disp`` from
+       the Capstone operand metadata.  Examples: x86 ``prefetch*``,
+       AArch64 ``prfm`` / ``prfum`` / ``pli``, RISC-V
+       ``prefetch.{i,r,w}``, MIPS ``pref`` / ``prefe`` / ``prefx``.
+   * - 59
+     - ``GEN_OP_CACHE_FLUSH``
+     - Cache-line clean / flush / invalidate addressed at a
+       specific line.  Same synthetic-EA capture as
+       ``GEN_OP_PREFETCH``.  Always carries
+       ``sync_hint = SYNC_ATOMIC``.  Examples: x86 ``clflush*`` /
+       ``clwb`` / ``cldemote``, AArch64 ``dc.*`` / ``ic.*``,
+       RISC-V ``cbo.{clean,flush,inval}``, MIPS ``cache`` /
+       ``cachee``.  Cache-wide forms with no address (``invd``,
+       ``wbinvd``) stay under ``GEN_OP_FENCE``.
+   * - 60
+     - ``GEN_OP_TLB_FLUSH``
+     - TLB-entry invalidation addressed at a specific page.  Same
+       synthetic-EA capture.  Always carries
+       ``sync_hint = SYNC_ATOMIC``.  Examples: x86 ``invlpg`` /
+       ``invlpga``, AArch64 ``tlbi``, RISC-V ``sfence.vma`` /
+       ``hfence.{g,v}vma`` / ``hinval.{g,v}vma`` /
+       ``sinval.vma``, MIPS ``tlbp`` / ``tlbr`` / ``tlbwi`` /
+       ``tlbwr`` / ``ginv*`` / ``tlbg*`` / ``tlbinv*``.
 
-IDs 58..255 are unallocated.  ``GEN_OP_COUNT`` is the
+IDs 61..255 are unallocated.  ``GEN_OP_COUNT`` is the
 sentinel; per-CP and per-WP attribution arrays in ``Stats`` are sized
 by it so adding a new opcode automatically extends the histograms.
 
@@ -497,9 +528,10 @@ involve thread-level synchronization.
        classifier row has the ``MF_ATOMIC`` flag.  In practice
        this fires on every ``GEN_OP_XCHG`` (the
        ``cmpxchg`` / ``xadd`` / ``xchg`` / AArch64 ``cas`` / RISC-V
-       ``amo*`` / MIPS ``ll`` family) and on the cache-management
-       and TLB-invalidating ``GEN_OP_FENCE`` rows
-       (``clflush``, ``clwb``, ``invlpg``, ...).
+       ``amo*`` / MIPS ``ll`` family) and on every
+       ``GEN_OP_CACHE_FLUSH`` / ``GEN_OP_TLB_FLUSH`` row
+       (``clflush``, ``clwb``, ``invlpg``, ``cbo.*``,
+       ``tlbi``, ``sfence.vma``, ...).
 
 .. _field-ids:
 
@@ -535,12 +567,14 @@ deltas against template defaults.  Detailed semantics are in
      - SLEB delta of the stored value (gated by
        ``CST_FLAG_MEM_DATA``).
    * - 0x41..0x50
-     - ``CST_FID_SRC_REG0`` .. ``CST_FID_SRC_REG15``
-     - SLEB delta of the source-register pre-execution snapshot
-       (gated by ``CST_FLAG_REG_DATA``).
-   * - 0x51..0x60
      - *(reserved)*
-     - Future destination-register-value extension.
+     - Future source-register-value extension.  Not currently emitted;
+       the writer captures destination values post-execution
+       (see 0x51..0x60).
+   * - 0x51..0x60
+     - ``CST_FID_DST_REG0`` .. ``CST_FID_DST_REG15``
+     - SLEB delta of the destination-register post-execution snapshot
+       (gated by ``CST_FLAG_REG_DATA``).
    * - 0x61
      - ``CST_FID_N_STORES``
      - SLEB delta — current valid store slot count.

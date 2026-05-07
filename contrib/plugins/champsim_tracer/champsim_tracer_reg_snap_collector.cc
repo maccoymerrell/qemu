@@ -145,9 +145,9 @@ void RegSnapCollector::capture_insn_snaps(const WideRegSnap *wide,
 
     const InsnFields *f = &tmpl->insn_fields[insn_idx];
     const InsnRegNames *names = &tmpl->insn_reg_names[insn_idx];
-    for (uint8_t i = 0; i < f->n_src_regs; i++) {
+    for (uint8_t i = 0; i < f->n_dst_regs; i++) {
         RegSnap s;
-        wide_lookup(&names->src_qemu_reg_keys[i], &s);
+        wide_lookup(&names->dst_qemu_reg_keys[i], &s);
         out_snaps.push_back(s);
     }
 }
@@ -163,9 +163,9 @@ void RegSnapCollector::capture_insn_snaps_live(unsigned int cpu_index,
     }
     const InsnFields *f = &tmpl->insn_fields[insn_idx];
     const InsnRegNames *names = &tmpl->insn_reg_names[insn_idx];
-    for (uint8_t i = 0; i < f->n_src_regs; i++) {
+    for (uint8_t i = 0; i < f->n_dst_regs; i++) {
         RegSnap s;
-        read_into_snap(cpu_index, &names->src_qemu_reg_keys[i], &s);
+        read_into_snap(cpu_index, &names->dst_qemu_reg_keys[i], &s);
         out_snaps.push_back(s);
     }
 }

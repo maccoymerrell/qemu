@@ -28,6 +28,8 @@ void BBTemplateDeleter::operator()(BBTemplate *t) const noexcept
     g_free(t->insn_bytes);
     g_free(t->insn_reg_names);
     g_free(t->insn_snap_refs);
+    g_free(t->insn_synthetic_ea);
+    g_free(t->insn_synth_ea_refs);
     g_free(t);
 }
 

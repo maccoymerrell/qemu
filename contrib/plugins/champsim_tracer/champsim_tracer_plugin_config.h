@@ -36,6 +36,8 @@ struct PluginConfig {
      * tables (branch type, opcode, src/dst regs) so the user can see
      * how a long segment's instruction mix varies over time. */
     int       histogram_intervals = 0;
+    /* Per-template IFRAME trigger interval.  0 disables. */
+    uint32_t  iframe_rate         = 100000;
     uint64_t  simpoint_interval = 100000000ULL;
     uint64_t  trace_start_insn  = 0;
     uint64_t  trace_stop_insn   = UINT64_MAX;

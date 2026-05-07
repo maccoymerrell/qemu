@@ -425,6 +425,9 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
 
         op->access = cop->access;
         op->size = cop->size;
+        op->scale = 1;
+        op->shift_type = 0;
+        op->shift_amount = 0;
 
         switch (cop->type) {
         case X86_OP_REG:
@@ -456,6 +459,7 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
                               handle, cop->mem.index, CS_ARCH_X86);
             op->index_id   = cop->mem.index;
             op->imm = cop->mem.disp;
+            op->scale = (uint8_t)cop->mem.scale;
             break;
         default:
             op->type = QEMU_PLUGIN_OP_INVALID;
@@ -490,6 +494,9 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
 
         op->access = cop->access;
         op->size = 0; /* AArch64 Capstone doesn't provide per-op size */
+        op->scale = 1;
+        op->shift_type = (uint8_t)cop->shift.type;
+        op->shift_amount = (uint8_t)cop->shift.value;
 
         switch (cop->type) {
         case ARM64_OP_REG:
@@ -552,6 +559,9 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             qemu_plugin_operand *op = &out->operands[i];
             op->access = 0; /* RISC-V Capstone lacks access info */
             op->size = 0;
+            op->scale = 1;
+            op->shift_type = 0;
+            op->shift_amount = 0;
             switch (cop->type) {
             case RISCV_OP_REG:
                 op->type = QEMU_PLUGIN_OP_REG;
@@ -599,6 +609,9 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             qemu_plugin_operand *op = &out->operands[i];
             op->access = 0; /* MIPS Capstone lacks access info */
             op->size = 0;
+            op->scale = 1;
+            op->shift_type = 0;
+            op->shift_amount = 0;
             switch (cop->type) {
             case MIPS_OP_REG:
                 op->type = QEMU_PLUGIN_OP_REG;

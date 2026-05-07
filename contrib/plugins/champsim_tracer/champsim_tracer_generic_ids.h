@@ -89,6 +89,22 @@ enum GenericOpcode {
     GEN_OP_FP_MSUB = 55,
     GEN_OP_VEC_MADD = 56,
     GEN_OP_VEC_MSUB = 57,
+    /*
+     * Memory-side hint / management instructions.  These do not
+     * normally generate a TCG memop in QEMU (PREFETCHh, CLFLUSH,
+     * INVLPG, AArch64 PRFM, RISC-V CBO, ...), but the tracer
+     * synthesises a load memop slot carrying the effective address by
+     * decoding the operand at translation time and reading base/index
+     * register values at exec time.  Consumers may treat:
+     *   GEN_OP_PREFETCH   — software prefetch hint (warm cache line)
+     *   GEN_OP_CACHE_FLUSH — explicit cache-line clean/flush/invalidate
+     *   GEN_OP_TLB_FLUSH  — explicit TLB-entry invalidation
+     * The address (when present) is in the load-memop slot; opcode
+     * carries the semantic distinction.
+     */
+    GEN_OP_PREFETCH = 58,
+    GEN_OP_CACHE_FLUSH = 59,
+    GEN_OP_TLB_FLUSH = 60,
     GEN_OP_COUNT
 };
 
@@ -264,6 +280,9 @@ static inline const char *generic_opcode_name(unsigned id)
     case GEN_OP_FP_MSUB:    return "GEN_OP_FP_MSUB";
     case GEN_OP_VEC_MADD:   return "GEN_OP_VEC_MADD";
     case GEN_OP_VEC_MSUB:   return "GEN_OP_VEC_MSUB";
+    case GEN_OP_PREFETCH:   return "GEN_OP_PREFETCH";
+    case GEN_OP_CACHE_FLUSH: return "GEN_OP_CACHE_FLUSH";
+    case GEN_OP_TLB_FLUSH:  return "GEN_OP_TLB_FLUSH";
     default:                return NULL;
     }
 }

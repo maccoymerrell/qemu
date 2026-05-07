@@ -93,6 +93,27 @@ extern "C" {
 #define BODY_TAG_END             0
 #define BODY_TAG_ENTRY           1
 #define BODY_TAG_THREAD_SWITCH   2
+/*
+ * BODY_TAG_IFRAME: a self-contained absolute snapshot of the
+ * immediately-preceding BODY_TAG_ENTRY.  Same payload structure as
+ * ENTRY (CP delta section + WP chain section + WP events section)
+ * minus the leading tmpl_delta — the IFRAME inherits the ENTRY's
+ * template_id.  Inside the IFRAME every field is encoded against a
+ * fresh "nothing observed yet" overlay, so all values are absolute
+ * (delta-from-template-default).  When CP triggers an IFRAME the
+ * entire body record is re-emitted in IFRAME mode, including ALL of
+ * the CP entry's WP-chain entries — i.e. flagging the CP as IFRAME
+ * implicitly flags every WP attached to it.
+ *
+ * IFRAMEs do NOT advance the writer's persistent overlays
+ * (cp_field_state / wp_field_state) and do NOT advance
+ * prev_entry_template — they are pure validation/resync records.
+ * Decoders use the IFRAME to cross-check that their delta-replay
+ * reconstructed the same view the writer had; they do not need to
+ * know the writer's emission cadence and may safely skip IFRAMEs
+ * entirely.
+ */
+#define BODY_TAG_IFRAME          3
 
 /* Per-insn template flags byte */
 #define CST_INSN_FLAG_BRANCH_COND   (1u << 0)
@@ -118,7 +139,7 @@ extern "C" {
  * Sparse instruction metadata records are always allowed and do not
  * need a feature bit. */
 #define CST_FLAG_MEM_DATA      (1 << 0)  /* CST_FID_LOAD_DATA / STORE_DATA */
-#define CST_FLAG_REG_DATA      (1 << 1)  /* CST_FID_SRC_REG values        */
+#define CST_FLAG_REG_DATA      (1 << 1)  /* CST_FID_DST_REG values        */
 #define CST_FLAG_RESERVED_2    (1 << 2)
 /* bits 3..7 reserved */
 
@@ -140,8 +161,15 @@ extern "C" {
 #define CST_FID_STORE_ADDR_BASE  0x11
 #define CST_FID_LOAD_DATA_BASE   0x21  /* gated by CST_FLAG_MEM_DATA  */
 #define CST_FID_STORE_DATA_BASE  0x31
-#define CST_FID_SRC_REG_BASE     0x41  /* gated by CST_FLAG_REG_DATA  */
-/* 0x51..0x60 reserved for post-exec destination register values. */
+/* 0x41..0x50 reserved for pre-exec source register values.  Not
+ * currently emitted: the writer captures destination values at
+ * post-execution instead — they cover every architectural write
+ * (consumers can derive any register's current value at any point
+ * from the most recent post-write observation), and there are
+ * typically fewer destinations than sources per insn so the cost is
+ * lower.  Reserving the slot range leaves room to optionally revive
+ * source capture later without renumbering. */
+#define CST_FID_DST_REG_BASE     0x51  /* gated by CST_FLAG_REG_DATA  */
 #define CST_FID_N_STORES        0x61  /* current valid store slots */
 #define CST_FID_EXTRA_LOAD_ADDR  0x62  /* raw ULEB vector, slots 16+ */
 #define CST_FID_EXTRA_STORE_ADDR 0x63
@@ -231,6 +259,29 @@ typedef struct {
     QemuRegKey dst_qemu_reg_keys[MAX_DST_REGS];
 } InsnRegNames;
 
+/*
+ * Synthetic effective-address descriptor for instructions whose
+ * canonical TCG translation does not emit a memory op (prefetch hints,
+ * cache-line clean/flush/invalidate, TLB invalidate, ...).  Filled at
+ * translation time from the Capstone memory operand; consumed at exec
+ * time by a per-insn callback that reads base / index register values
+ * and computes ea = base + (index << shift_amount) * scale + disp.
+ *
+ * has_addr is the discriminator: a zero descriptor means "no
+ * synthetic EA for this insn."  base_key.feature == NULL means the
+ * base register is implicitly zero (e.g. pure-displacement form).
+ * Likewise for index_key.
+ */
+typedef struct {
+    QemuRegKey base_key;
+    QemuRegKey index_key;
+    int64_t  disp;
+    uint8_t  scale;        /* x86 SIB; 0/1 = effective scale 1 */
+    uint8_t  shift_type;   /* AArch64 ARM64_SFT_*; 0 = none    */
+    uint8_t  shift_amount; /* AArch64 shift count              */
+    uint8_t  has_addr;     /* nonzero when descriptor is valid */
+} SyntheticEAInfo;
+
 typedef struct {
     uint32_t template_id;
     uint64_t start_pc;
@@ -248,6 +299,17 @@ typedef struct {
     /* Per-insn opaque udata for the reg-snap exec callback; lifetime
      * equals the BBTemplate's.  Allocated only when reg-data is on. */
     void *insn_snap_refs;
+    /* Optional: synthetic-EA descriptors for prefetch / cache-flush /
+     * TLB-flush instructions.  Allocated only when at least one insn
+     * in the BB requires synthetic-EA capture; entries with
+     * has_addr == 0 are skipped at exec time. */
+    SyntheticEAInfo *insn_synthetic_ea;
+    /* Per-insn opaque udata for the synthetic-EA exec callback. */
+    void *insn_synth_ea_refs;
+    /* Counts ENTRY emissions of this template (CP and WP combined).
+     * Used by the writer to drive iframe_rate-triggered IFRAME
+     * emissions on a per-template cadence. */
+    uint64_t emit_count;
 } BBTemplate;
 
 enum DynParamType {
@@ -431,6 +493,9 @@ extern bool enable_wp_mem_data;
 extern bool enable_wp_reg_data;
 extern char *qemu_command_line;
 extern char *trace_comment;
+/* I-frame trigger: emit a self-contained IFRAME after every N-th
+ * ENTRY of the same template.  0 disables the feature. */
+extern uint32_t iframe_rate;
 
 /* Synchronization & diagnostics.  GMutex stays (rather than
  * std::mutex) because <mutex>'s transitive include chain pulls
@@ -451,6 +516,13 @@ void decode_detail_to_generic(uint64_t pc,
                               const qemu_plugin_insn_info *info,
                               InsnFields *out,
                               InsnRegNames *out_names);
+
+/* Defined in champsim_tracer_decode.cc */
+bool decode_synthetic_ea(const qemu_plugin_insn_info *info,
+                         uint8_t opcode,
+                         uint64_t pc,
+                         uint8_t insn_size,
+                         SyntheticEAInfo *out);
 
 /* Build the GenericRegId → QemuRegKey reverse index used by the
  * multi-reg path of add_src_cap_reg / add_dst_cap_reg.  Must run

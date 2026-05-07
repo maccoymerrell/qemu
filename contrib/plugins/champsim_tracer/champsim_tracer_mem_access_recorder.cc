@@ -128,6 +128,41 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
     }
 }
 
+void MemAccessRecorder::record_synthetic_load(uint64_t vaddr, uint64_t insn_pc)
+{
+    if (g_wp_state.in_progress) {
+        if (insn_pc == g_wp_state.cur_insn_pc) {
+            g_wp_state.cur_insn_count++;
+        } else {
+            g_wp_state.cur_insn_pc = insn_pc;
+            g_wp_state.cur_insn_count = 1;
+        }
+        if (g_wp_state.cur_insn_count > CST_FID_SLOT_COUNT) {
+            return;
+        }
+    } else if (!g_trace_segments.is_active_atomic()) {
+        return;
+    }
+
+    WPMemAccess acc = {
+        .insn_pc = insn_pc,
+        .mem_vaddr = vaddr,
+        .is_store = false,
+        .data_size = 0,
+    };
+    cst_wide_zero(&acc.data);
+
+    if (g_wp_state.in_progress) {
+        g_wp_state.mem_accesses.push_back(acc);
+    } else {
+        tls_cp_mem_accesses.push_back(acc);
+        g_stats.cp_total_mem_accesses++;
+        if (g_current_hist_bucket) {
+            g_current_hist_bucket->cp_total_mem_accesses++;
+        }
+    }
+}
+
 size_t MemAccessRecorder::cp_count() const
 {
     return tls_cp_mem_accesses.size();

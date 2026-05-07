@@ -122,7 +122,7 @@ class _FieldDeltaBreakdown:
     store_addr: _Bucket = dataclasses.field(default_factory=_Bucket)
     load_data: _Bucket = dataclasses.field(default_factory=_Bucket)
     store_data: _Bucket = dataclasses.field(default_factory=_Bucket)
-    src_reg: _Bucket = dataclasses.field(default_factory=_Bucket)
+    dst_reg: _Bucket = dataclasses.field(default_factory=_Bucket)
     insn_meta: _Bucket = dataclasses.field(default_factory=_Bucket)
     extended: _Bucket = dataclasses.field(default_factory=_Bucket)
     other: _Bucket = dataclasses.field(default_factory=_Bucket)
@@ -159,6 +159,15 @@ class _Stats:
         default_factory=_FieldDeltaBreakdown)
 
     wp_events: _Bucket = dataclasses.field(default_factory=_Bucket)
+
+    # IFRAME redundancy.  An IFRAME is a self-contained re-emit of the
+    # immediately-preceding ENTRY (CP + WP chain + WP events), encoded
+    # against template-default baselines.  Tracked as a single bucket
+    # since the size cost of the validation feature is the most useful
+    # number to surface; per-section IFRAME breakdowns mirror the
+    # normal ENTRY breakdowns and add little signal.
+    iframe_count: int = 0
+    iframe_bytes: _Bucket = dataclasses.field(default_factory=_Bucket)
 
 
 # ---------------------------------------------------------------------------
@@ -221,8 +230,8 @@ def _field_delta_bucket(fid: int, detail: _FieldDeltaBreakdown) -> _Bucket:
         return detail.load_data
     if fid == dec.FID_EXTRA_STORE_DATA:
         return detail.store_data
-    if dec.FID_SRC_REG_BASE <= fid < dec.FID_SRC_REG_BASE + dec.FID_SLOT_COUNT:
-        return detail.src_reg
+    if dec.FID_DST_REG_BASE <= fid < dec.FID_DST_REG_BASE + dec.FID_SLOT_COUNT:
+        return detail.dst_reg
     if dec.FID_INSN_BYTES_LO <= fid <= dec.FID_INSN_SIZE:
         return detail.insn_meta
     if fid == dec.FID_EXTENDED:
@@ -332,6 +341,20 @@ def audit(path: Path) -> _Stats:
         if tag == dec.BODY_TAG_THREAD_SWITCH:
             br.sleb()
             s.thread_switch.add(br.p - tag_pos)
+            continue
+        if tag == dec.BODY_TAG_IFRAME:
+            # IFRAME payload mirrors an ENTRY's internal sections (CP
+            # field-delta + WP chain + WP events) but omits the
+            # leading template_id SLEB — the IFRAME inherits the
+            # preceding ENTRY's template.  Skip past the whole record
+            # and bill the bytes to the iframe_bytes bucket; nothing
+            # inside affects the writer's persistent overlay state, so
+            # we don't need to walk it for accounting beyond the size.
+            _fd_bytes, _fd_detail = _field_delta_section_bytes(br)
+            _wp_sub, _wp_used = _read_lp_sub(br)
+            _ev_sub, _ev_used = _read_lp_sub(br)
+            s.iframe_count += 1
+            s.iframe_bytes.add(br.p - tag_pos)
             continue
         if tag != dec.BODY_TAG_ENTRY:
             raise ValueError(f"unknown body tag {tag} at offset {tag_pos}")
@@ -444,6 +467,9 @@ def report(s: _Stats) -> str:
 
     out(_row("WP events", s.wp_events.bytes, body,
              count=s.cp_entries, per="entry"))
+    out(_row("IFRAME records (validation redundancy)",
+             s.iframe_bytes.bytes, body,
+             count=s.iframe_count, per="iframe"))
     out(_row("BODY terminator", s.body_terminator, body))
 
     fd_total = s.cp_field_delta.bytes + s.wp_field_delta.bytes
@@ -461,8 +487,8 @@ def report(s: _Stats) -> str:
                 s.wp_field_delta_detail.load_data, fd_total))
     out(_fd_row("store data", s.cp_field_delta_detail.store_data,
                 s.wp_field_delta_detail.store_data, fd_total))
-    out(_fd_row("source registers", s.cp_field_delta_detail.src_reg,
-                s.wp_field_delta_detail.src_reg, fd_total))
+    out(_fd_row("dest registers", s.cp_field_delta_detail.dst_reg,
+                s.wp_field_delta_detail.dst_reg, fd_total))
     out(_fd_row("instruction metadata", s.cp_field_delta_detail.insn_meta,
                 s.wp_field_delta_detail.insn_meta, fd_total))
     out(_fd_row("extended", s.cp_field_delta_detail.extended,

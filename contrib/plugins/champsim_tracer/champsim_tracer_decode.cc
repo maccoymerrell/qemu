@@ -357,3 +357,63 @@ void decode_detail_to_generic(uint64_t pc,
     }
 
 }
+
+/*
+ * Synthetic-EA decoder for prefetch / cache-flush / TLB-flush
+ * instructions whose canonical TCG translation does not emit a memop.
+ * Returns true (and fills @out) when @opcode is one of the new
+ * memory-hint classes AND the insn carries a Capstone memory operand
+ * we can compute an EA from.  Returns false in every other case;
+ * callers should leave @out zeroed.
+ *
+ * @pc / @insn_size carry the current instruction's PC and length so we
+ * can resolve PC-relative base registers (notably x86 RIP-relative,
+ * where Capstone reports the encoded displacement and the CPU folds in
+ * the *next*-insn PC).  In that case the base reg is dropped and the
+ * absolute next-insn-PC is folded into the displacement, which is both
+ * correct and avoids a needless register read at exec time.
+ */
+bool decode_synthetic_ea(const qemu_plugin_insn_info *info,
+                         uint8_t opcode,
+                         uint64_t pc,
+                         uint8_t insn_size,
+                         SyntheticEAInfo *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!info ||
+        (opcode != GEN_OP_PREFETCH &&
+         opcode != GEN_OP_CACHE_FLUSH &&
+         opcode != GEN_OP_TLB_FLUSH)) {
+        return false;
+    }
+    for (uint8_t i = 0; i < info->n_operands; i++) {
+        const qemu_plugin_operand *op = &info->operands[i];
+        if (op->type != QEMU_PLUGIN_OP_MEM) {
+            continue;
+        }
+        const RegClassification *base_rc = lookup_reg_class(op->reg_id);
+        const RegClassification *index_rc = lookup_reg_class(op->index_id);
+        bool base_is_pc =
+            base_rc && base_rc->n_regs == 0 && base_rc->reg_id == REG_IP;
+        if (base_is_pc) {
+            /* Fold next-insn-PC into the displacement; no base read
+             * needed at exec time.  Matches x86 RIP-relative semantics
+             * (target = next_insn_PC + disp). */
+            out->disp = (int64_t)((uint64_t)pc + insn_size + (uint64_t)op->imm);
+        } else {
+            if (base_rc && qemu_reg_key_valid(&base_rc->qemu_reg)) {
+                out->base_key = base_rc->qemu_reg;
+            }
+            out->disp = op->imm;
+        }
+        if (index_rc && qemu_reg_key_valid(&index_rc->qemu_reg)) {
+            out->index_key = index_rc->qemu_reg;
+        }
+        out->scale = op->scale;
+        out->shift_type = op->shift_type;
+        out->shift_amount = op->shift_amount;
+        out->has_addr = 1;
+        return true;
+    }
+    return false;
+}

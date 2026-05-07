@@ -145,12 +145,17 @@ below is opt-in because it can substantially grow the trace.
 
 ``regdata=0`` / ``regdata=1``
    ``0`` (default) records no register values.  ``1`` snapshots each
-   instruction's *source* register values immediately before it
-   executes, encoded under ``CST_FID_SRC_REG*``.  Destination values
-   are not captured — the snapshot point is pre-execute.  This is
-   the heaviest single capture flag: it adds one read-register
-   callback per CP source operand, plus an inline pre-fragment
-   wide-regfile dump for WP.
+   instruction's *destination* register values immediately after it
+   executes, encoded under ``CST_FID_DST_REG*``.  Source values are
+   not captured — destinations strictly dominate (they cover every
+   architectural write, so consumers can derive any register's value
+   at any point from the most recent post-write observation, and
+   there are typically fewer destinations than sources per insn).
+   The CP capture point is the pre-exec hook of the *next* canonical
+   instruction (so we observe registers between the just-finished
+   insn's writes and the next insn's reads); the tail insn of each
+   TB is captured at the next TB's tb_exec.  WP uses a wide
+   post-fragment regfile snap.
 
 ``wp_memdata=0`` / ``wp_memdata=1``
    WP-side override for ``memdata``.  Default *inherits* the value
@@ -188,6 +193,20 @@ Observability
    registers / destination registers (rows are top items; columns
    are intervals).  Use to spot phase shifts within a long
    simpoint segment.
+
+``iframe_rate=<N>``
+   Default ``0`` — disabled.  When ``N > 0``, every Nth observation
+   of a CP template is followed by a redundant ``BODY_TAG_IFRAME``
+   body record encoded against fresh template-default baselines
+   (i.e., absolute values).  Decoders use these to cross-check that
+   their delta-replay reconstructed the same view the writer had —
+   a mismatch raises ``ValueError`` in ``champsim_tracer_decode.py``.
+   The IFRAME covers the *entire* body record (CP + WP chain + WP
+   events), so flagging the CP also IFRAMEs every WP entry attached
+   to it.  Pure overhead: a v1.9 trace produced with ``iframe_rate=0``
+   is wire-bit-identical to before this option existed.  Costs
+   roughly ``trace_size / N`` in extra bytes; ``N=100`` typically
+   adds 2-3% to body size on real workloads.
 
 Trace metadata
 ~~~~~~~~~~~~~~

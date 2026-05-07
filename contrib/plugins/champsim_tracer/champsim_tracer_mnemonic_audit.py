@@ -19,7 +19,7 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 PLUGIN_DIR = Path(__file__).resolve().parent
 CAPSTONE_INCLUDE = ROOT / "subprojects" / "capstone" / "include" / "capstone"
 GDB_XML_DIR = ROOT / "gdb-xml"
@@ -560,7 +560,9 @@ def classify_x86(m: str) -> Entry:
         return ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE")
     if m in {"ud0", "ud1", "ud2", "hlt", "cpuid", "rdtsc", "rdtscp", "xgetbv", "xsetbv", "endbr32", "endbr64", "wait", "clc", "cld", "cli", "sti", "clac", "stac", "clts", "cmc", "stc", "std", "pause", "rdsspq", "clgi", "getsec", "pconfig", "rsm", "skinit", "stgi", "swapgs", "encls", "enclu", "enclv", "emms", "data16", "lock", "rep", "repne", "rex64", "xacquire", "xrelease"}:
         return ent("GEN_OP_NOP")
-    if m.startswith("nop") or m.startswith("prefetch"):
+    if m.startswith("prefetch"):
+        return ent("GEN_OP_PREFETCH")
+    if m.startswith("nop"):
         return ent("GEN_OP_NOP")
     if m.startswith(("lfence", "mfence", "sfence")):
         return ent("GEN_OP_FENCE", flags="MF_ATOMIC")
@@ -599,7 +601,11 @@ def classify_x86(m: str) -> Entry:
         return ent("GEN_OP_POP")
     if m == "leave":
         return ent("GEN_OP_POP")
-    if m.startswith("clflush") or m.startswith(("cldemote", "clwb", "invd", "invlpg", "invept", "invpcid", "invvpid", "wbinvd", "wbnoinvd", "serialize")):
+    if m.startswith("clflush") or m.startswith(("cldemote", "clwb")):
+        return ent("GEN_OP_CACHE_FLUSH", flags="MF_ATOMIC")
+    if m.startswith(("invlpg", "invlpga")):
+        return ent("GEN_OP_TLB_FLUSH", flags="MF_ATOMIC")
+    if m.startswith(("invd", "invept", "invpcid", "invvpid", "wbinvd", "wbnoinvd", "serialize")):
         return ent("GEN_OP_FENCE", flags="MF_ATOMIC")
     if m.startswith("xsave") or m.startswith("stmxcsr") or m.startswith(("clrssbsy", "clzero", "ptwrite", "sgdt", "sidt", "wrssd", "wrssq", "wrussd", "wrussq", "xstore")) or re.match(r"^out", m):
         return ent("GEN_OP_STORE")
@@ -838,12 +844,16 @@ def classify_aarch64(m: str) -> Entry:
         return ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE")
     if m in {"nop", "hint", "wfe", "wfi", "wfet", "wfit", "sev", "sevl", "yield", "xaflag", "axflag", "cfinv", "gmi", "irg", "rmif", "udf"}:
         return ent("GEN_OP_NOP")
-    if m in {"dmb", "dsb", "isb", "sb", "csdb", "psb", "tsb", "clrex", "sdsb"} or m.startswith(("dc_", "ic_", "tlbi")):
+    if m in {"dmb", "dsb", "isb", "sb", "csdb", "psb", "tsb", "clrex", "sdsb"}:
         return ent("GEN_OP_FENCE", flags="MF_ATOMIC")
+    if m.startswith(("dc_", "ic_")):
+        return ent("GEN_OP_CACHE_FLUSH", flags="MF_ATOMIC")
+    if m.startswith("tlbi"):
+        return ent("GEN_OP_TLB_FLUSH", flags="MF_ATOMIC")
     if m.startswith("at_"):
         return ent("GEN_OP_FENCE", flags="MF_ATOMIC")
     if m.startswith("prf") or m.startswith("rprf") or m.startswith("pli"):
-        return ent("GEN_OP_NOP")
+        return ent("GEN_OP_PREFETCH")
     if m.startswith(("sysp", "trcit", "wkdmc", "wkdmd", "rdsvl")):
         return ent("GEN_OP_NOP")
 
@@ -1024,9 +1034,11 @@ def classify_riscv(m: str) -> Entry:
         return ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE")
     if m in {"mret", "sret", "uret", "dret"}:
         return ent("GEN_OP_RET", "BRANCH_RETURN")
+    if m in {"sfence_vma", "hfence_gvma", "hfence_vvma", "sinval_vma"}:
+        return ent("GEN_OP_TLB_FLUSH", flags="MF_ATOMIC")
     if m.startswith(("fence", "sfence", "hfence")):
         return ent("GEN_OP_FENCE", flags="MF_ATOMIC")
-    if m in {"wfi", "unimp", "c_unimp", "pause", "c_nop", "sinval_vma"} or m.startswith(("mop_", "cmop_")):
+    if m in {"wfi", "unimp", "c_unimp", "pause", "c_nop"} or m.startswith(("mop_", "cmop_")):
         return ent("GEN_OP_NOP")
     if m in {"call", "tail"}:
         return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_JUMP")
@@ -1062,9 +1074,15 @@ def classify_riscv(m: str) -> Entry:
         return ent("GEN_OP_LOAD")
     if m.startswith("hsv"):
         return ent("GEN_OP_STORE")
-    if m.startswith(("hinval", "cbo_clean", "cbo_flush", "cbo_inval", "wrs_")):
+    if m.startswith(("cbo_clean", "cbo_flush", "cbo_inval")):
+        return ent("GEN_OP_CACHE_FLUSH", flags="MF_ATOMIC")
+    if m.startswith("hinval"):
+        return ent("GEN_OP_TLB_FLUSH", flags="MF_ATOMIC")
+    if m.startswith("wrs_"):
         return ent("GEN_OP_FENCE", flags="MF_ATOMIC")
-    if m.startswith(("cbo_zero", "prefetch_")):
+    if m.startswith("prefetch_"):
+        return ent("GEN_OP_PREFETCH")
+    if m.startswith("cbo_zero"):
         return ent("GEN_OP_NOP")
     if m.startswith("cm_"):
         if m.startswith("cm_jalt"):
@@ -1270,7 +1288,11 @@ def classify_mips(m: str) -> Entry:
         return ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE")
     if m.startswith(("sync", "synci", "pause", "wait", "yield")):
         return ent("GEN_OP_FENCE", flags="MF_ATOMIC")
-    if m in {"nop", "nop32", "ssnop", "ehb", "cache", "tlbp", "tlbr", "tlbwi", "tlbwr"} or m.startswith(("cachee", "dmt", "dvp", "dvpe", "emt", "evp", "evpe", "ginv", "tlbg", "tlbinv")):
+    if m in {"cache"} or m.startswith("cachee"):
+        return ent("GEN_OP_CACHE_FLUSH", flags="MF_ATOMIC")
+    if m in {"tlbp", "tlbr", "tlbwi", "tlbwr"} or m.startswith(("ginv", "tlbg", "tlbinv")):
+        return ent("GEN_OP_TLB_FLUSH", flags="MF_ATOMIC")
+    if m in {"nop", "nop32", "ssnop", "ehb"} or m.startswith(("dmt", "dvp", "dvpe", "emt", "evp", "evpe")):
         return ent("GEN_OP_NOP")
     if m.startswith(("movn", "movz")):
         return ent("GEN_OP_CMOV")
@@ -1284,6 +1306,8 @@ def classify_mips(m: str) -> Entry:
         return ent("GEN_OP_LEA")
     if m.startswith("s_"):
         return ent("GEN_OP_STORE")
+    if re.match(r"^pref(e|x)?$", m):
+        return ent("GEN_OP_PREFETCH")
     if re.match(r"^(lb|lbu|lh|lhu|lw|lwu|ld|lwc[0-9]*|ldc[0-9]*|lux|lwl|lwr|lld|pref|ulh|ulhu|ulw|ualh|ualw|ualwm)($|[0-9]|_|e|x|pc|r|l|m|p|c|$)", m):
         return ent("GEN_OP_LOAD")
     if re.match(r"^(sb|sbx|sh|shx|sw|swc[0-9]*|sdc[0-9]*|sd|sux|swl|swr|sdl|sdr|ush|usw|uash|uasw|uaswm)($|[0-9]|_|e|x|pc|sp|m|p|c|$)", m):

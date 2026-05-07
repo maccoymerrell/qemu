@@ -252,6 +252,36 @@ first-observation cost only once per trace.  The decoder branches on
 the magic byte to distinguish v1.8 (per-chain reset) from v1.9
 (persistent).  Don't change it without bumping the magic.
 
+*IFRAMEs are validation-only redundancy.*  When the writer is run
+with ``iframe_rate=N``, every Nth observation of a CP template is
+followed by a ``BODY_TAG_IFRAME`` body record that re-encodes the
+same body record (CP + WP chain + WP events) against fresh scratch
+overlays — every value lands as an absolute delta-from-template-
+default.  IFRAMEs MUST NOT advance ``prev_entry_template`` or update
+``cp_field_state`` / ``wp_field_state``; they exist solely so a
+decoder can cross-check that its delta-replay produced the same view
+the writer had.  Flagging the CP triggers an IFRAME; the IFRAME then
+covers every WP entry attached to that CP.  WP entries are never
+IFRAME'd independently.
+
+*Prefetch / cache / TLB EAs are synthesized.*  Software prefetches
+(x86 ``prefetch*``, AArch64 ``prfm``, RISC-V ``prefetch.*``,
+MIPS ``pref``), addressed cache-line ops (``clflush*``, ``clwb``,
+``cldemote``, ``dc.*``, ``ic.*``, ``cbo.*``, ``cache``), and
+addressed TLB invalidations (``invlpg*``, ``tlbi``, ``sfence.vma``,
+``hfence.*``, MIPS ``tlb*``) translate to TCG no-ops in QEMU, so the
+plugin's mem-callback never fires for them.  ``decode_synthetic_ea``
+captures the operand at translation time, and a per-insn exec
+callback reads the base / index registers at exec time to compute
+``ea = base + (index << shift_amount) * scale + disp``.  The result
+is funneled through ``MemAccessRecorder::record_synthetic_load`` so
+it shows up in the ``LOAD_ADDR[0]`` slot the same way a normal load
+would.  This relies on the ``scale`` (x86 SIB) and
+``shift_type`` / ``shift_amount`` (AArch64) fields the plugin added
+to ``qemu_plugin_operand`` — see :doc:`extending`.  WP-side capture
+is suppressed by ``CF_MEMI_ONLY``; that's intentional, because the
+suppressed insns generate no architectural memops to begin with.
+
 *The CP chain's first fragment uses cached template data.*  When a
 TB at start_pc=X is translated more than once (different cflags, page
 flush + retranslate, etc.), QEMU keys its TB cache by ``(pc, cs_base,

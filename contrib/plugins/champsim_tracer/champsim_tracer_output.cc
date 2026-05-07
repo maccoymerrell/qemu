@@ -234,8 +234,8 @@ static void write_field_id_encoding_map(BitWriter *bw)
         write_encoding_entry(bw, CST_FID_STORE_DATA_BASE + i, name);
     }
     for (uint64_t i = 0; i < CST_FID_SLOT_COUNT; i++) {
-        g_autofree char *name = g_strdup_printf("CST_FID_SRC_REG%" PRIu64, i);
-        write_encoding_entry(bw, CST_FID_SRC_REG_BASE + i, name);
+        g_autofree char *name = g_strdup_printf("CST_FID_DST_REG%" PRIu64, i);
+        write_encoding_entry(bw, CST_FID_DST_REG_BASE + i, name);
     }
     static const EncodingMapEntry insn_fields[] = {
         { CST_FID_N_STORES, "CST_FID_N_STORES" },
@@ -306,6 +306,7 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         { BODY_TAG_END, "BODY_TAG_END" },
         { BODY_TAG_ENTRY, "BODY_TAG_ENTRY" },
         { BODY_TAG_THREAD_SWITCH, "BODY_TAG_THREAD_SWITCH" },
+        { BODY_TAG_IFRAME, "BODY_TAG_IFRAME" },
     };
     static const EncodingMapEntry wp_event_flag_entries[] = {
         { CST_WP_EVENT_TRANSLATION_UNAVAIL,
@@ -358,6 +359,17 @@ struct BodyStreamState {
      * WP state is a per-chain overlay that falls back to CP state. */
     FieldStateTable *cp_field_state;
     FieldStateTable *wp_field_state;
+    /* Scratch overlays used to emit IFRAMEs.  An IFRAME is a full
+     * body-record dump (CP + WP chain + WP events) encoded against
+     * fresh "nothing observed yet" overlays so every record carries
+     * absolute values.  The generations are bumped before each IFRAME
+     * emission to invalidate all prior cells lazily; the IFRAME pass
+     * then writes deltas from template_default.  IFRAMEs do not
+     * affect the persistent cp/wp_field_state — the next regular
+     * ENTRY continues from where the previous ENTRY left off.
+     * Allocated lazily on first IFRAME. */
+    FieldStateTable *iframe_cp_scratch;
+    FieldStateTable *iframe_wp_scratch;
     EntryViewScratch ev_scratch;
     uint64_t num_entries;
     uint64_t body_off;
@@ -663,10 +675,10 @@ static uint8_t field_state_slot_index(uint8_t field_id)
         return 1 + (3 * CST_FID_SLOT_COUNT)
                + (field_id - CST_FID_STORE_DATA_BASE);
     }
-    if (field_id >= CST_FID_SRC_REG_BASE &&
-        field_id < CST_FID_SRC_REG_BASE + CST_FID_SLOT_COUNT) {
+    if (field_id >= CST_FID_DST_REG_BASE &&
+        field_id < CST_FID_DST_REG_BASE + CST_FID_SLOT_COUNT) {
         return 1 + (4 * CST_FID_SLOT_COUNT)
-               + (field_id - CST_FID_SRC_REG_BASE);
+               + (field_id - CST_FID_DST_REG_BASE);
     }
     if (field_id == CST_FID_N_STORES) {
         return 1 + (5 * CST_FID_SLOT_COUNT);
@@ -825,7 +837,7 @@ typedef struct {
                              uint32_t ins_pos, uint8_t slot);
     /* runtime_slot_cap: optional callback that returns the actual upper
      * bound on slots-with-content for instruction @i.  Used by the
-     * memop and SRC_REG families to skip slots that the fixed
+     * memop and DST_REG families to skip slots that the fixed
      * slot_count loop would visit only to have extract() return
      * false.  Null for families whose slot_count is the real bound
      * (or trivially 1). */
@@ -842,7 +854,7 @@ typedef struct {
      *
      * Both must be set together; when either is null the wide
      * extract/template_default pair is used (LOAD_DATA, STORE_DATA,
-     * SRC_REG — the families whose payload genuinely needs >64 bits). */
+     * DST_REG — the families whose payload genuinely needs >64 bits). */
     bool (*extract_u64)(const EntryView *ev, uint32_t ins_pos, uint8_t slot,
                         uint64_t *out_val);
     uint64_t (*template_default_u64)(const BBTemplate *tmpl,
@@ -854,7 +866,7 @@ typedef struct {
 /* ---------- Per-family runtime slot caps ----------
  *
  * Memop families (LOAD_ADDR, STORE_ADDR, LOAD_DATA, STORE_DATA) and
- * SRC_REG have CST_FID_SLOT_COUNT (16) wire slots but typical
+ * DST_REG have CST_FID_SLOT_COUNT (16) wire slots but typical
  * instructions use 0-2 of them.  Iterating the full 16 just to call
  * extract() and have it return false is the dominant per-instruction
  * cost in emit_field_delta_section (~30% of plugin runtime).  These
@@ -871,10 +883,10 @@ static uint8_t cap_stores(const EntryView *ev, uint32_t i)
 {
     return ev->actual_n_stores ? cap_min(ev->actual_n_stores[i]) : 0;
 }
-static uint8_t cap_src_regs(const EntryView *ev, uint32_t i)
+static uint8_t cap_dst_regs(const EntryView *ev, uint32_t i)
 {
     if (!ev->tmpl) return 0;
-    return ev->tmpl->insn_fields[i].n_src_regs;
+    return ev->tmpl->insn_fields[i].n_dst_regs;
 }
 
 /* ---------- Per-family extract/default callbacks ---------- */
@@ -963,15 +975,22 @@ static bool extr_store_data(const EntryView *ev, uint32_t i, uint8_t slot,
 }
 
 /* Reg-snap families: the captured reg_snaps array is laid out per-insn
- * source operands only, in template-walk order.  Destination register
- * identities remain in the template but destination values are not emitted
- * from the pre-exec snapshot path. */
-static bool extr_src_reg(const EntryView *ev, uint32_t i, uint8_t slot,
+ * destination operands only, in template-walk order.  The values are
+ * captured POST-execution (the per-insn callback is registered on the
+ * NEXT instruction, so it fires after the current insn completes;
+ * for the LAST insn of a TB the next TB's tb_exec callback handles
+ * the snap).  Source register identities remain in the template;
+ * source values are not emitted on the wire — consumers can derive
+ * any register's value at any point from the most recent post-exec
+ * destination observation, which strictly dominates the pre-exec
+ * source view (covers every architectural write, not just reads,
+ * and there are typically fewer destinations than sources per insn). */
+static bool extr_dst_reg(const EntryView *ev, uint32_t i, uint8_t slot,
                          U512 *out)
 {
     if (!ev->reg_snaps || !ev->tmpl) return false;
     const InsnFields *f = &ev->tmpl->insn_fields[i];
-    if (slot >= f->n_src_regs) return false;
+    if (slot >= f->n_dst_regs) return false;
     uint32_t pos = ev->insn_rs_off[i] + slot;
     if (pos >= ev->reg_snaps->size()) return false;
     *out = (*ev->reg_snaps)[pos].value;
@@ -1077,7 +1096,7 @@ static bool extr_insn_size(const EntryView *ev, uint32_t i, uint8_t slot,
  *
  * Mirror the wide callbacks above for every family whose semantic
  * value fits in u64 (everything except the 512-bit-wide LOAD_DATA /
- * STORE_DATA / SRC_REG payloads).  These are what the emitter's
+ * STORE_DATA / DST_REG payloads).  These are what the emitter's
  * fast path uses; they avoid the U512 stack round-trip that
  * dominated profiling of emit_field_delta_section on mcf.
  */
@@ -1238,10 +1257,10 @@ static const FieldDescriptor field_descriptors[] = {
             extr_store_data,     deflt_zero,            cap_stores,
             nullptr,             nullptr,
             "STORE_DATA" },
-        { CST_FID_SRC_REG_BASE,     CST_FID_SLOT_COUNT, false, true,
-            extr_src_reg,        deflt_zero,            cap_src_regs,
+        { CST_FID_DST_REG_BASE,     CST_FID_SLOT_COUNT, false, true,
+            extr_dst_reg,        deflt_zero,            cap_dst_regs,
             nullptr,             nullptr,
-            "SRC_REG" },
+            "DST_REG" },
         { CST_FID_N_STORES,         1,  false, false,
             extr_n_stores,       deflt_n_stores,        nullptr,
             extr_u64_n_stores,   deflt_u64_zero,
@@ -1343,12 +1362,14 @@ static void build_entry_view(EntryView *ev, const BBTemplate *tmpl,
     }
     insn_dp_off[n] = k;
 
-    /* Reg_snaps: per-insn source operands only, in template-walk order. */
+    /* Reg_snaps: per-insn destination operands only, in template-walk
+     * order.  Each entry's reg_snaps array is sized n_dst_regs per
+     * insn (post-exec destination values). */
     uint32_t r = 0;
     for (uint32_t i = 0; i < n; i++) {
         insn_rs_off[i] = r;
         const InsnFields *f = &tmpl->insn_fields[i];
-        r += f->n_src_regs;
+        r += f->n_dst_regs;
     }
     insn_rs_off[n] = r;
 }
@@ -1673,7 +1694,7 @@ static void emit_field_delta_section(BitWriter *main_bw,
                     }
                 } else {
                     /* Wide path: 64-byte payload families
-                     * (LOAD_DATA, STORE_DATA, SRC_REG). */
+                     * (LOAD_DATA, STORE_DATA, DST_REG). */
                     for (uint8_t slot = 0; slot < cap; slot++) {
                         U512 cur;
                         if (!fd->extract(ev, i, slot, &cur)) continue;
@@ -1784,6 +1805,8 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime)
 
     st->cp_field_state = field_state_table_new();
     st->wp_field_state = field_state_table_new();
+    st->iframe_cp_scratch = nullptr;  /* lazy on first IFRAME */
+    st->iframe_wp_scratch = nullptr;
 
     return st;
 }
@@ -1838,32 +1861,30 @@ static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
                              st->header_flags);
 }
 
-void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
+/*
+ * Emit one body-record payload (CP section + WP chain + WP events) using
+ * the supplied overlays.  The header tag (BODY_TAG_ENTRY/IFRAME) is the
+ * caller's responsibility, as is any tmpl_delta the record format
+ * requires (ENTRY uses one; IFRAME omits it because it always inherits
+ * the immediately-preceding ENTRY's template).
+ *
+ * cp_state / wp_state / wp_base are the FieldStateTable instances used
+ * for delta encoding.  ENTRY passes the persistent overlays (so the
+ * encoded deltas compress well and the post-record state reflects the
+ * observation).  IFRAME passes per-IFRAME scratch overlays whose
+ * generations have been bumped, so all baselines fall through to
+ * template_default and every encoded value is absolute.  The scratch
+ * overlays absorb the writes and are discarded by the next IFRAME's
+ * generation bump — the persistent overlays are untouched, which is
+ * what makes IFRAMEs validation-only redundant records.
+ */
+static void emit_body_record_payload(
+    BodyStreamState *st, BitWriter *bw, BodyEntry *entry, uint32_t num_wp,
+    FieldStateTable *cp_state, FieldStateTable *wp_state,
+    FieldStateTable *wp_base)
 {
-    int64_t entry_tmpl = entry->template_id;
-    uint32_t num_wp = (uint32_t)entry->wp_entries.size();
-    uint64_t body_start = bw_tell_bytes(&st->bw);
-
-    dyn_params_sort_template_order(entry->dyn_params);
-    for (uint32_t w = 0; w < num_wp; w++) {
-        WPBBEntry &wp = entry->wp_entries[w];
-        dyn_params_sort_template_order(wp.dyn_params);
-    }
-
-    if ((int64_t)entry->thread_id != st->current_thread) {
-        bw_write_u8(&st->bw, BODY_TAG_THREAD_SWITCH);
-        bw_write_sleb128(&st->bw,
-                         (int64_t)entry->thread_id - st->current_thread);
-        st->current_thread = entry->thread_id;
-    }
-
-    bw_write_u8(&st->bw, BODY_TAG_ENTRY);
-    bw_write_sleb128(&st->bw, entry_tmpl - st->prev_entry_template);
-    st->prev_entry_template = entry_tmpl;
-
-    emit_one_bb_delta(&st->bw, st, st->cp_field_state, entry->template_id,
-                      entry->tmpl, &entry->dyn_params, &entry->reg_snaps,
-                      false);
+    emit_one_bb_delta(bw, st, cp_state, entry->template_id, entry->tmpl,
+                      &entry->dyn_params, &entry->reg_snaps, false);
 
     /* WP chain sub-section */
     {
@@ -1871,25 +1892,18 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
         bw_init_buf(&sub);
         bw_write_uleb128(&sub, num_wp);
         int64_t prev_wp_template = 0;
-        /* v1.9: WP overlay accumulates across the whole body stream
-         * like cp_field_state.  Repeat WP visits of the same template
-         * (very common for shared library code) delta against the
-         * prior WP observation instead of falling back to CP every
-         * chain — typically 3x smaller traces on real workloads.
-         * Fallback chain is unchanged: lookup WP overlay first,
-         * then CP overlay, then template_default. */
         for (uint32_t w = 0; w < num_wp; w++) {
             const WPBBEntry *wp = &entry->wp_entries[w];
             uint32_t wp_tmpl = wp->template_id;
             bw_write_sleb128(&sub, (int64_t)wp_tmpl - prev_wp_template);
             prev_wp_template = wp_tmpl;
-            emit_one_bb_delta_with_base(&sub, st, st->wp_field_state,
-                                        st->cp_field_state, wp_tmpl,
-                                        wp->tmpl, &wp->dyn_params,
-                                        &wp->reg_snaps, true);
+            emit_one_bb_delta_with_base(&sub, st, wp_state, wp_base,
+                                        wp_tmpl, wp->tmpl,
+                                        &wp->dyn_params, &wp->reg_snaps,
+                                        true);
         }
         bw_byte_align(&sub);
-        bw_write_section(&st->bw, bw_finish_buf(&sub));
+        bw_write_section(bw, bw_finish_buf(&sub));
     }
 
     /* WP events sub-section */
@@ -1923,8 +1937,6 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
                 evf |= CST_WP_EVENT_FAULT;
             }
             bw_write_u8(&sub, evf);
-            /* Emit the chain-relative index of the faulting instruction so
-             * consumers can flag that specific uop as non-completing. */
             if (wp->fault) {
                 bw_write_uleb128(&sub, (uint64_t)wp->fault_insn_index);
             }
@@ -1933,7 +1945,65 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
         g_stats.bin_wp_exception_bits += (bw_tell_bytes(&sub) - ev_start) * 8;
 
         bw_byte_align(&sub);
-        bw_write_section(&st->bw, bw_finish_buf(&sub));
+        bw_write_section(bw, bw_finish_buf(&sub));
+    }
+}
+
+void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
+{
+    int64_t entry_tmpl = entry->template_id;
+    uint32_t num_wp = (uint32_t)entry->wp_entries.size();
+    uint64_t body_start = bw_tell_bytes(&st->bw);
+
+    dyn_params_sort_template_order(entry->dyn_params);
+    for (uint32_t w = 0; w < num_wp; w++) {
+        WPBBEntry &wp = entry->wp_entries[w];
+        dyn_params_sort_template_order(wp.dyn_params);
+    }
+
+    if ((int64_t)entry->thread_id != st->current_thread) {
+        bw_write_u8(&st->bw, BODY_TAG_THREAD_SWITCH);
+        bw_write_sleb128(&st->bw,
+                         (int64_t)entry->thread_id - st->current_thread);
+        st->current_thread = entry->thread_id;
+    }
+
+    /* Regular delta-encoded entry, against the persistent overlays. */
+    bw_write_u8(&st->bw, BODY_TAG_ENTRY);
+    bw_write_sleb128(&st->bw, entry_tmpl - st->prev_entry_template);
+    st->prev_entry_template = entry_tmpl;
+    emit_body_record_payload(st, &st->bw, entry, num_wp,
+                             st->cp_field_state, st->wp_field_state,
+                             st->cp_field_state);
+
+    /*
+     * IFRAME trigger.  When iframe_rate is set and this CP template's
+     * per-template emission counter divides evenly, emit a redundant
+     * BODY_TAG_IFRAME body record with the same payload (CP + WP chain
+     * + WP events) but encoded against fresh scratch overlays — every
+     * value lands as an absolute delta-from-template-default.  The
+     * IFRAME does NOT advance st->prev_entry_template and does NOT
+     * write a tmpl_delta (its template is implicitly the immediately-
+     * preceding ENTRY's), so it is purely a validation/resync record
+     * the decoder may cross-check against the regular ENTRY.
+     */
+    if (iframe_rate > 0 && entry->tmpl) {
+        entry->tmpl->emit_count++;
+        if ((entry->tmpl->emit_count % iframe_rate) == 0) {
+            if (!st->iframe_cp_scratch) {
+                st->iframe_cp_scratch = field_state_table_new();
+            }
+            if (!st->iframe_wp_scratch) {
+                st->iframe_wp_scratch = field_state_table_new();
+            }
+            st->iframe_cp_scratch->generation++;
+            st->iframe_wp_scratch->generation++;
+            bw_write_u8(&st->bw, BODY_TAG_IFRAME);
+            emit_body_record_payload(st, &st->bw, entry, num_wp,
+                                     st->iframe_cp_scratch,
+                                     st->iframe_wp_scratch,
+                                     st->iframe_cp_scratch);
+        }
     }
 
     bw_byte_align(&st->bw);
@@ -1999,5 +2069,11 @@ void body_stream_finish(BodyStreamState *st)
 
     field_state_table_free(st->cp_field_state);
     field_state_table_free(st->wp_field_state);
+    if (st->iframe_cp_scratch) {
+        field_state_table_free(st->iframe_cp_scratch);
+    }
+    if (st->iframe_wp_scratch) {
+        field_state_table_free(st->iframe_wp_scratch);
+    }
     entry_view_scratch_free(&st->ev_scratch);
 }

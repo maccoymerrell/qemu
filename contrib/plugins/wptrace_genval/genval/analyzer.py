@@ -163,6 +163,16 @@ def analyze(binary_path: Path, meta_path: Path) -> Path:
     for sym in binary.symbols:
         if not sym.name:
             continue
+        # Skip ELF "mapping symbols" — `$a`, `$t`, `$d` on AArch64
+        # mark instruction/data boundaries; `$x...` on RISC-V marks
+        # arch-switch points emitted by GAS for `.option arch, +ext`
+        # constructs.  Mapping symbols are not real function/data
+        # symbols and would shorten our block spans incorrectly
+        # (e.g. a `$xrv64..._zicbop...` symbol planted at the end of
+        # a Zicbop probe would cut the trailer branch out of the
+        # block's pc range).
+        if sym.name.startswith("$"):
+            continue
         a = int(sym.value)
         if a > 0:
             all_addrs.append(a)

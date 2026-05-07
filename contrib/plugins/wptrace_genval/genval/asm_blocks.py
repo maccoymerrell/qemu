@@ -38,6 +38,16 @@ class BlockPlan:
     asserted_branch_types: list[str] = dataclasses.field(default_factory=list)
     asserted_opcodes: list[str] = dataclasses.field(default_factory=list)
     asserted_cond_uncond_branch: bool = False
+    # Author-declared per-instruction register sets, parallel to the
+    # asm body.  Each entry is {"src": [...], "dst": [...]} naming
+    # GenericRegId values (e.g. "REG_GPR0", "REG_IP") OR a per-ISA
+    # canonical Capstone name we resolve at validation time.  Optional;
+    # the validator's _check_static_reg_sets already covers per-insn
+    # src/dst correctness against Capstone disassembly, so this is for
+    # author-intent vs. emitted-asm divergence — a probe whose
+    # declared sets don't match what Capstone says about the asm we
+    # actually wrote indicates a bug (typo, unintended encoding, etc.).
+    expected_reg_sets: list[dict] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -1457,9 +1467,11 @@ def _register_probe(name: str, per_isa: dict[str, dict]) -> None:
         return BlockPlan(
             block_id=ctx.block_id,
             name=cls.name,
-            memops=[],
+            memops=list(spec.get("memops", [])),
             asserted_opcodes=list(spec.get("opcodes", [])),
             asserted_branch_types=list(spec.get("branch_types", [])),
+            reg_value_assertions=list(spec.get("reg_value_assertions", [])),
+            expected_reg_sets=list(spec.get("reg_sets", [])),
         )
 
     @classmethod
@@ -1476,33 +1488,10 @@ def _register_probe(name: str, per_isa: dict[str, dict]) -> None:
     register(_Probe)
 
 
-def _import_legacy_probes() -> None:
-    """Import probe specs from the legacy C++ block catalog.
-
-    We only reuse the explicit instruction strings and asserted coverage
-    tags; emitted programs remain fully assembly-only.
-    """
-    from . import blocks as legacy_blocks
-
-    for name, cls in legacy_blocks._REGISTRY.items():
-        if not cls.__name__.startswith("AsmProbe_"):
-            continue
-        plan_cm = getattr(cls, "plan", None)
-        if plan_cm is None or not hasattr(plan_cm, "__func__"):
-            continue
-        closure = plan_cm.__func__.__closure__ or ()
-        per_isa = None
-        for cell in closure:
-            val = cell.cell_contents
-            if isinstance(val, dict) and val and all(
-                isinstance(k, str) and isinstance(v, dict)
-                for k, v in val.items()
-            ) and any("asm" in spec for spec in val.values()):
-                per_isa = val
-                break
-        if per_isa is None or name in _REGISTRY:
-            continue
-        _register_probe(name, per_isa)
-
-
-_import_legacy_probes()
+# Inline-asm coverage probes live in `_probe_specs` as a flat data file:
+# 89 single-instruction or short-sequence probes, one per uniquely-classified
+# GenericOpcode / BranchType combination across the four ISAs.  Importing
+# here registers them via _register_probe.  The split keeps this file as the
+# active CodeBlock library and the spec file as a pure data table that can
+# be regenerated mechanically when probes are added or retuned.
+from . import _probe_specs as _probe_specs  # noqa: F401

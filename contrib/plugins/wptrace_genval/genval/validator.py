@@ -845,6 +845,168 @@ def _check_memop_count_assertions(
     return issues
 
 
+_TRAILER_INSNS_BY_ISA = {
+    # The generator emits these many insns AFTER each block's
+    # user-supplied asm: a single branch on most ISAs, plus a
+    # delay-slot nop on MIPS.  Used by _check_expected_reg_sets to
+    # decide how many trailing trace insns can legitimately be
+    # generator-emitted (and therefore not described by the block's
+    # author-declared `expected_reg_sets`).
+    "x86_64":  1,
+    "aarch64": 1,
+    "riscv64": 1,
+    "mipsel":  2,
+}
+
+
+def _check_expected_reg_sets(
+        entries: list[dict],
+        templates_by_id: dict[int, dict],
+        blocks_by_id: dict[int, dict],
+        pcmap: "PcMap",
+        cp_set: set[int],
+        isa: str) -> list[Issue]:
+    """Compare author-declared per-insn src/dst register sets against
+    the trace's recorded sets.  Mirrors `_check_static_reg_sets` but
+    with the spec coming from the block's `expected_reg_sets` instead
+    of from Capstone.  An author-declared spec that disagrees with the
+    trace (and therefore with Capstone) means the asm we wrote isn't
+    what we intended — the canonical "typo / unintended encoding"
+    bug.  Skipped silently for blocks that don't declare expected
+    sets.
+    """
+    blocks = [b for b in blocks_by_id.values()
+              if b["block_id"] in cp_set and b.get("expected_reg_sets")]
+    if not blocks:
+        return [Issue(
+            "expected_reg_sets", "info",
+            "no blocks declared expected_reg_sets — author-side reg "
+            "declaration check skipped",
+        )]
+
+    dec = _load_decoder()
+    reg_names_by_id = dec.build_reg_names()
+    # Build {full-name: id, short-name: id} so authors can write either
+    # "REG_SP" or "SP" in expected_reg_sets specs.  build_reg_names()
+    # returns names without the "REG_" prefix (e.g. "SP", "GPR0").
+    reg_id_by_name: dict[str, int] = {}
+    for rid, short in reg_names_by_id.items():
+        reg_id_by_name[short] = rid
+        reg_id_by_name[f"REG_{short}"] = rid
+
+    def resolve(name: str) -> int | None:
+        return reg_id_by_name.get(name)
+
+    issues: list[Issue] = []
+    n_blocks = 0
+    n_insns_checked = 0
+    n_errors = 0
+    err_cap = 20
+
+    # Walk every CP entry once, indexing by block_id.
+    blocks_by_bid = {int(b["block_id"]): b for b in blocks}
+    for e in entries:
+        tmpl = templates_by_id.get(int(e["template_id"]))
+        if tmpl is None:
+            continue
+        insns = tmpl.get("insns", [])
+        # Group insns by block_id (a single template can span multiple
+        # author blocks if the assembler coalesces fall-through).  Each
+        # block's expected_reg_sets is matched against the contiguous
+        # run of trace insns whose pc maps to that block.
+        per_block: dict[int, list[int]] = {}
+        for idx, ins in enumerate(insns):
+            bid = pcmap.lookup(int(ins["pc"]))
+            if bid is None or bid not in blocks_by_bid:
+                continue
+            per_block.setdefault(bid, []).append(idx)
+
+        for bid, idxs in per_block.items():
+            block = blocks_by_bid[bid]
+            specs = block.get("expected_reg_sets") or []
+            if not specs:
+                continue
+            n_blocks += 1
+            # The generator wraps each block's user-supplied asm with
+            # a label prologue (no insns) and a trailing branch to the
+            # successor block; on MIPS the branch carries a
+            # delay-slot nop too.  reg_sets covers only the author's
+            # asm, so the trace must contain
+            # `len(specs) + trailer_insns` insns mapped to this block.
+            trailer = _TRAILER_INSNS_BY_ISA.get(isa, 1)
+            expected_total = len(specs) + trailer
+            if len(idxs) != expected_total:
+                if n_errors < err_cap:
+                    issues.append(Issue(
+                        "expected_reg_sets", "error",
+                        f"blk_{bid} ({block.get('class','?')}): declared "
+                        f"{len(specs)} insn reg-sets + {trailer} trailer "
+                        f"insn(s) = {expected_total}, but trace template "
+                        f"contains {len(idxs)} insns mapped to this block",
+                        {"block_id": bid, "declared": len(specs),
+                         "trailer": trailer, "trace": len(idxs)},
+                    ))
+                n_errors += 1
+                continue
+            for spec, idx in zip(specs, idxs[:len(specs)]):
+                ins = insns[idx]
+                exp_src = set()
+                exp_dst = set()
+                bad_names: list[str] = []
+                for name in spec.get("src", []):
+                    rid = resolve(name)
+                    if rid is None:
+                        bad_names.append(name)
+                    else:
+                        exp_src.add(rid)
+                for name in spec.get("dst", []):
+                    rid = resolve(name)
+                    if rid is None:
+                        bad_names.append(name)
+                    else:
+                        exp_dst.add(rid)
+                if bad_names:
+                    issues.append(Issue(
+                        "expected_reg_sets", "error",
+                        f"blk_{bid} insn #{idx}: unknown reg name(s) "
+                        f"{bad_names!r} in expected_reg_sets",
+                        {"block_id": bid, "insn_index": idx,
+                         "unknown": bad_names},
+                    ))
+                    n_errors += 1
+                    continue
+                actual_src = {int(r) for r in ins.get("src_regs", []) or []
+                              if int(r) != 0}
+                actual_dst = {int(r) for r in ins.get("dst_regs", []) or []
+                              if int(r) != 0}
+                n_insns_checked += 1
+                if actual_src == exp_src and actual_dst == exp_dst:
+                    continue
+                n_errors += 1
+                if n_errors <= err_cap:
+                    issues.append(Issue(
+                        "expected_reg_sets", "error",
+                        f"blk_{bid} ({block.get('class','?')}) insn #{idx} "
+                        f"pc=0x{int(ins['pc']):x}: declared src/dst regs "
+                        f"don't match the trace",
+                        {"block_id": bid, "insn_index": idx,
+                         "pc": int(ins["pc"]),
+                         "expected_src": sorted(exp_src),
+                         "actual_src": sorted(actual_src),
+                         "expected_dst": sorted(exp_dst),
+                         "actual_dst": sorted(actual_dst)},
+                    ))
+
+    issues.append(Issue(
+        "expected_reg_sets", "info",
+        f"author-declared reg sets: blocks={n_blocks} "
+        f"insns_checked={n_insns_checked} errors={n_errors}",
+        {"blocks": n_blocks, "insns_checked": n_insns_checked,
+         "errors": n_errors},
+    ))
+    return issues
+
+
 def _check_reg_value_assertions(
         entries: list[dict],
         templates_by_id: dict[int, dict],
@@ -2440,6 +2602,8 @@ def validate(meta_path: Path, trace_path: Path,
     issues += _check_reg_value_assertions(cp_entries, templates_by_id,
                                           blocks_by_id, pcmap, cp_set,
                                           has_reg_data)
+    issues += _check_expected_reg_sets(cp_entries, templates_by_id,
+                                       blocks_by_id, pcmap, cp_set, isa)
 
     # Address-recompute: only meaningful when reg-data was emitted.
     issues += _check_address_recompute(cp_entries, template_runs,

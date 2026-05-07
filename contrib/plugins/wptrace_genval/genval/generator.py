@@ -368,6 +368,7 @@ def build_metadata(cfg: CFG, plans: list[B.BlockPlan],
             "asserted_branch_types": list(plan.asserted_branch_types),
             "asserted_opcodes": list(plan.asserted_opcodes),
             "asserted_cond_uncond_branch": plan.asserted_cond_uncond_branch,
+            "expected_reg_sets": list(plan.expected_reg_sets),
         })
 
     return {
@@ -788,6 +789,7 @@ def build_metadata(cfg: CFG, plans: list[B.BlockPlan],
             "asserted_branch_types": list(plan.asserted_branch_types),
             "asserted_opcodes": list(plan.asserted_opcodes),
             "asserted_cond_uncond_branch": plan.asserted_cond_uncond_branch,
+            "expected_reg_sets": list(plan.expected_reg_sets),
         })
 
     return {

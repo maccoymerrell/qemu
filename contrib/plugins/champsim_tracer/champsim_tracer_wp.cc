@@ -212,35 +212,25 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         g_mutex_unlock(&data_lock);
 
         /*
-         * Reg-data capture for WP is now post-exec (destination
-         * values).  We can't take a wide snap here yet because the
-         * spec-mode exec_tb may translate this fragment for the first
-         * time (so @tmpl might still be null), and we need the
-         * post-fragment register state anyway.  Defer to right after
-         * exec_tb returns — see the post-exec capture_wide() below.
-         */
-        bool tmpl_known_before_exec = (tmpl != nullptr);
-        (void)tmpl_known_before_exec;
-
-        tb_ok = qemu_plugin_exec_tb();
-
-        /*
-         * Wide post-fragment regfile snapshot: holds the speculative
-         * register state after this WP TB completed but before the
-         * next exec_tb (which would overwrite anything this TB
-         * wrote).  We attribute per-insn destination values from it
-         * inside the appended-insns loop below.
+         * Reg-data capture for WP is post-exec (destination values).
+         * We do NOT take a wide regfile snapshot here — that would
+         * read every architectural register on every WP TB, which
+         * dominates trace time on regdata=1 + wp=1 runs.  The
+         * per-insn live path (capture_insn_snaps_live below, called
+         * AFTER exec_tb) reads only the dst regs each insn actually
+         * writes — typically 1 per insn — using the same
+         * read_into_snap calls the CP path uses.
          *
          * Imprecision: when CF_SINGLE_STEP doesn't reduce the
          * fragment to one insn (cached translations) and multiple
          * insns in the fragment write to the same architectural
-         * register, only the final value survives in the snap.
-         * Documented limitation; mirrors the equivalent imprecision
-         * the prior pre-fragment src-side capture had for sources
-         * across multi-insn cached fragments.
+         * register, only the final post-fragment value is visible at
+         * read time.  This is identical to the imprecision a
+         * post-fragment wide snap would have, so dropping the wide
+         * path costs nothing in correctness — only saves the
+         * per-WP-TB scan over the entire register file.
          */
-        WideRegSnap *wide = enable_wp_reg_data
-            ? g_reg_snaps.capture_wide(cpu_index) : nullptr;
+        tb_ok = qemu_plugin_exec_tb();
 
         if (!tmpl) {
             g_mutex_lock(&data_lock);
@@ -249,7 +239,6 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         }
 
         if (!tmpl) {
-            RegSnapCollector::free_wide(wide);
             clear_accum();
             bb_reg_snaps.clear();
             early_exit = true;
@@ -303,7 +292,6 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                 /* Fault PC truly outside the TB.  Give up the chain
                  * rather than guess; this is a real abnormal exit
                  * (e.g. translation-unavailable cousin). */
-                RegSnapCollector::free_wide(wide);
                 clear_accum();
                 bb_reg_snaps.clear();
                 early_exit = true;
@@ -372,7 +360,12 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                 }
             }
             if (enable_wp_reg_data) {
-                g_reg_snaps.capture_insn_snaps(wide, tmpl, i, bb_reg_snaps);
+                /* Per-insn live read of dst regs from the post-
+                 * fragment architectural state.  Reads only the
+                 * registers this insn actually writes (typically 1),
+                 * not the entire register file. */
+                g_reg_snaps.capture_insn_snaps_live(cpu_index, tmpl, i,
+                                                    bb_reg_snaps);
             }
             appended_insns++;
         }
@@ -427,9 +420,6 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                 g_current_hist_bucket->wp_total_mem_accesses++;
             }
         }
-
-        RegSnapCollector::free_wide(wide);
-        wide = nullptr;
 
         /* Guard against an appended-nothing iteration (every insn of
          * the just-executed TB was a dedup of the prior tail).  In

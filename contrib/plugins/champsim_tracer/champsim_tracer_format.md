@@ -1,8 +1,9 @@
-# champsim_tracer Binary Format - v1.9
+# champsim_tracer Binary Format
 
 Status: current. This document describes the on-disk `.cst` stream
-written by `champsim_tracer_output.cc` and decoded by
-`champsim_tracer_decode.py`.
+written by `champsim_tracer_output.cc` and decoded by `cst_decode`.
+The tracer is pre-release; the on-wire layout below is the only
+shape ever produced and the only shape `cst_decode` reads.
 
 All multi-byte fixed-width integers are little-endian. Variable-width
 integers use DWARF-style LEB128:
@@ -193,6 +194,19 @@ Consumers should use the maps in the trace when present. Built-in names
 are only a fallback for files produced before this section existed.
 
 ## 4. Body Stream
+
+Conceptually, every `BODY_TAG_ENTRY` record describes one *invocation*
+of one true basic block on the architectural correct path.  Each
+record carries: the template ID (which gives the static instruction
+sequence), every per-instruction load and store address that fired
+during this invocation (and value, if `MEM_DATA` is on), the
+post-execution snapshot of every destination register written
+(if `REG_DATA` is on), and the wrong-path chain — a sequence of
+speculative basic-block invocations the CPU would have run if its
+branch predictor had resolved the just-completed branch the other
+way.  Body entries appear in correct-path execution order; the
+field-delta encoding scheme below is a compression layer over
+that conceptual picture, not a different shape of data.
 
 The body stream is a sequence of tagged records ending in one footer.
 
@@ -415,12 +429,10 @@ CP entry N:
                                               +-- wp_state(N) (kept)
 ```
 
-Note: v1.7 and v1.8 reset the WP overlay at every chain start
-(`wp_state := dict(cp_state)`). v1.9 changed this to a persistent
-WP overlay with CP fallback so that hot WP templates visited from
-many chains delta against their prior WP-observed value instead of
-paying the first-observation cost on every chain. Decoders MUST
-gate this behavior on the magic byte.
+The WP overlay is persistent across chains: hot WP templates
+visited from many CP entries delta against their prior WP-observed
+value instead of paying the first-observation cost on every chain.
+The CP overlay is unaffected by speculative records.
 
 ### 5.1 Field-ID Space
 
@@ -450,7 +462,7 @@ Field IDs are one byte. Slotted families reserve 16 values each.
 | 0x74           | INSN_FLAGS           | per-insn template flags       |
 | 0x75           | INSN_IMMEDIATE       | signed immediate              |
 | 0x76           | INSN_SIZE            | instruction byte length       |
-| 0xFF           | EXTENDED             | reserved escape               |
+| 0xFF           | EXTENDED             | reserved escape; not currently used |
 +----------------+----------------------+-------------------------------+
 ```
 
@@ -518,9 +530,9 @@ number of values as the corresponding overflow address vector.
 
 Narrow accesses are masked to their low accessed bytes before delta or
 raw-vector emission. The current QEMU plugin mem-value API directly
-exposes values up to 128 bits; wider values are represented by the v1.8
-wire format and by register snapshots, and can be populated by capture
-paths that can provide up to 64 bytes.
+exposes values up to 128 bits; wider values are representable by
+the wire format and by register snapshots, and can be populated by
+capture paths that can provide up to 64 bytes.
 
 ### 5.4 Register Data
 

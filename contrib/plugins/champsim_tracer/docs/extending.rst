@@ -72,9 +72,10 @@ there's room up to 255 entries before the format itself has to change.
    appears in the exit-time summary's "Generic opcode breakdown"
    table on workloads that use it.
 
-No format-version bump is needed: existing ``u8`` opcode IDs simply
-gain a new legal value.  Old decoders that don't know the new name will
-fall back to ``GEN_OP_???`` and still decode the rest of the trace.
+Existing ``u8`` opcode IDs simply gain a new legal value.  No
+wire-format change is required because the per-trace encoding map
+in the header carries the (id, name) pair so any reader that walks
+the map picks up the new opcode without a code change.
 
 Adding a register ID
 --------------------
@@ -206,24 +207,15 @@ families.
    ``BodyEntry::reg_snaps``.  A new family typically wants a parallel
    vector with the field's payloads.
 
-4. **Bump the magic byte** at the top of ``champsim_tracer.h``.  The
-   v1.8 → v1.9 transition (persistent WP overlay) is the canonical
-   precedent — both the body-stream consumer and the trailer sentinel
-   moved from ``0x18545343`` to ``0x19545343``.  Update the
-   ``CST_MAGIC`` / ``CST_TRAILER_MAGIC`` constants and the format
-   description at the top of the header.
+4. **Mirror the field-ID handling** in
+   ``contrib/plugins/champsim_tracer/tools/cst_decode.cc``.  The
+   field-delta walker is where new FIDs need parsing logic; the
+   shared ``cst_common.h`` carries the FID_* constants.
 
-5. **Mirror the field-ID and decoder logic** in
-   ``champsim_tracer_decode.py``.  ``FID_*`` constants live near the
-   top; new dynamic-field handling typically belongs in
-   ``_decode_field_delta_section``.  The Python side already supports
-   v1.7 / v1.8 / v1.9 simultaneously by branching on the magic, so
-   keep that pattern.
-
-6. **Document the field** under :doc:`/format`.  Existing readers
-   tolerate unknown field-IDs (skip with the encoded length), so
-   forward-compatibility is OK; reverse-compatibility is what wants
-   the explicit schema in the docs.
+5. **Document the field** under :doc:`/format`.  The encoding-map
+   "field_id" entry the writer emits is enough for an external
+   reader to know the new ID exists; the byte-level layout and
+   semantics belong in the wire-format spec.
 
 Adding a SimPoint-style segmentation flag
 -----------------------------------------

@@ -7,19 +7,51 @@ reading the trace it produces.
 Building
 --------
 
-The tracer builds as part of QEMU's contributed plugins:
+Prerequisites
+~~~~~~~~~~~~~
+
+The tracer is a C++17 QEMU TCG plugin.  Tested combinations:
+
+* **OS:** Ubuntu 22.04 / 24.04, Debian 13, Fedora 40.  Other
+  Linuxes likely work; macOS is untested; Windows builds via the
+  meson plumbing but is not exercised in CI.
+* **Compiler:** gcc 11+ or clang 14+.  C++17 is required.
+* **glib:** 2.66 or newer (Ubuntu 22.04 default is fine).
+* **Capstone:** auto-downloaded by meson via
+  ``subprojects/capstone.wrap``.  The plugin uses Capstone's
+  detail mode + group classification, so the wrap version is
+  what we test against.
+* **QEMU base:** the repository is a fork of QEMU.  The plugin
+  expects the base modifications described in
+  :doc:`qemu_modifications`; building against an unmodified
+  upstream QEMU will not work because the plugin uses
+  ``qemu_plugin_insn_detail`` and ``qemu_plugin_cap_decode``,
+  which were added on this fork.
+
+Build invocation
+~~~~~~~~~~~~~~~~
+
+A reduced-target configure that builds only the user-mode targets
+the tracer supports:
 
 .. code-block:: console
 
-   $ ./configure --enable-plugins
-   $ ninja -C build contrib/plugins/libchampsim_tracer.so
+   $ ./configure --enable-plugins \
+                 --target-list=x86_64-linux-user,aarch64-linux-user,riscv64-linux-user,mipsel-linux-user
+   $ ninja -C build contrib-plugins
 
-Capstone is required: the tracer's per-ISA classifier consumes
-Capstone's instruction-id, operand, and register-id reporting to
-populate ``InsnFields`` and ``InsnRegNames``.  Capstone is wired in
-through the Meson wrap at ``subprojects/capstone.wrap``; the
-configure step downloads and builds it under
-``subprojects/capstone/`` automatically for targets that need it.
+``contrib-plugins`` is the alias target that builds the plugin
+shared object and the offline tools (``cst_decode``, ``cst_audit``)
+in one shot.  Output lands under ``build/contrib/plugins/``.
+
+A full configure (system mode included) also works; the user-mode
+restriction above just trims build time.  Capstone is downloaded
+and built automatically the first time you ``configure`` for a
+target that needs it.
+
+If your distribution ships a stale Capstone (some do), the meson
+wrap takes precedence — the plugin always builds against the wrap
+copy under ``subprojects/capstone/``.
 
 Running the tracer
 ------------------
@@ -129,14 +161,39 @@ icount range in the per-segment statistics summary).
 Wrong-path simulation
 ~~~~~~~~~~~~~~~~~~~~~
 
+**What "wrong-path" means here.**  At every CP branch the tracer
+runs an extra side-trip: it picks the *other* target the branch
+predictor might have chosen and runs basic blocks down that path
+until ``wpdepth`` instructions have been speculatively fetched.
+The simulator drives QEMU's TCG to actually execute those
+instructions, mutating registers and attempting stores, so the
+recorded WP chain reflects the architectural state a real
+mispredicting machine would have produced.  Stores route through
+a per-vCPU speculative store buffer rather than touching guest
+memory; loads see that buffer overlaid on the real address space.
+At the end of each WP chain the saved CPU state is restored — the
+correct path resumes from exactly where the branch was first
+observed, mirroring how a real machine squashes the wrong-path
+work when the misprediction is resolved.
+
+This is the right shape for cache-pollution and prefetcher-
+training research: the recorded WP entries carry the same memops
+and register snapshots a real machine's speculative window would
+generate.  It is *not* a cycle-accurate model — branch-mispredict
+penalty timing lives in the consumer simulator, not the trace —
+and it does not nest mispredicts: branches *inside* the
+speculative window follow their statically-resolved direction
+rather than spawning further wrong-path chains.
+
 ``wp=0`` / ``wp=1``
    ``1`` (default) enables wrong-path simulation: every CP branch
    gets a speculative chain of WP basic blocks attached to its body
    record.  ``0`` disables WP entirely — the trace records only the
-   correct path, the WP chain count is always zero, and runtime
-   drops considerably (typically 2-3×) because no
-   ``cpu_plugin_exec_tb`` calls happen.  Useful when you only want a
-   CP trace for a non-speculative simulator.
+   correct path, the WP chain count is always zero, and the run is
+   roughly an order of magnitude faster (measured ~16× on
+   ``mcf_r``: see :doc:`architecture` for the full table).
+   Useful when you only want a CP trace for a non-speculative
+   simulator.
 
 ``wpdepth=<insns>``
    Wrong-path *budget* in speculative instructions per branch.
@@ -182,11 +239,13 @@ below is opt-in because it can substantially grow the trace.
    of ``memdata`` (i.e., the wire-format flag mirrors CP).  Setting
    this to ``0`` regardless of ``memdata`` keeps the WP memop
    *addresses* but drops the per-access *values*; addresses are
-   typically what cache and prefetcher simulators need from WP and
-   they're an order of magnitude smaller than the values.  This is
-   usually the largest single trace-size knob on speculation-heavy
-   workloads.  Note: setting ``wp_memdata=1`` while ``memdata=0`` is
-   permitted but unusual — you'd record values on WP only.
+   typically what cache and prefetcher simulators need from WP, and
+   on speculation-heavy workloads dropping WP data values is one of
+   the larger trace-size knobs.  Measured impact on the
+   architecture page's mcf table: full data → WP-addresses-only
+   takes the trace from 548 MB to 280 MB on a 20 M-insn run.
+   Setting ``wp_memdata=1`` while ``memdata=0`` is permitted but
+   unusual — you'd record values on WP only.
 
 ``wp_regdata=0`` / ``wp_regdata=1``
    WP-side override for ``regdata``.  Default inherits from
@@ -223,10 +282,11 @@ Observability
    a mismatch raises an error in ``cst_decode``.
    The IFRAME covers the *entire* body record (CP + WP chain + WP
    events), so flagging the CP also IFRAMEs every WP entry attached
-   to it.  Pure overhead: a v1.9 trace produced with ``iframe_rate=0``
-   is wire-bit-identical to before this option existed.  Costs
-   roughly ``trace_size / N`` in extra bytes; ``N=100`` typically
-   adds 2-3% to body size on real workloads.
+   to it.  Pure overhead: a trace produced with ``iframe_rate=0``
+   contains no IFRAME records.  Each IFRAME costs roughly the
+   absolute-encoded size of the body record it's snapshotting —
+   ``cst_audit`` reports the total IFRAME byte count under "IFRAME
+   records (validation redundancy)".
 
 Trace metadata
 ~~~~~~~~~~~~~~
@@ -243,6 +303,71 @@ header for downstream tools to identify the run.
 ``comment=<string>``
    Free-form note recorded in the header's ``comment`` field.
    Defaults to none.
+
+Common configurations
+---------------------
+
+Recipes for the typical research targets.  Each line is a single
+``-plugin`` invocation; replace ``./prog`` with your workload.
+
+**Cache + prefetcher trace for ChampSim-style consumers**
+
+.. code-block:: console
+
+   $ qemu-x86_64 -plugin ./libchampsim_tracer.so,outfile=run,wp=1,memdata=0,wp_memdata=0 \
+                 ./prog
+
+Captures CP and WP load / store *addresses* (no values).  WP
+memops are kept (cache-pollution stream) but their values are
+dropped — the dominant trace-size knob on speculation-heavy code.
+
+**Branch-prediction trace**
+
+.. code-block:: console
+
+   $ qemu-x86_64 -plugin ./libchampsim_tracer.so,outfile=run,wp=1,wpdepth=128,memdata=0,regdata=0 \
+                 ./prog
+
+Smaller still: no memory data, no register data, but every branch
+in the trace has both its actual outcome and the wrong-path
+shadow used by mispredict-penalty studies.  ``wpdepth=128``
+lengthens the speculative window when you want to see further
+into the alternate path.
+
+**Value-prediction / data-aware trace**
+
+.. code-block:: console
+
+   $ qemu-x86_64 -plugin ./libchampsim_tracer.so,outfile=run,wp=1,memdata=1,regdata=1 \
+                 ./prog
+
+Most expensive configuration: every memop value and every
+destination-register write is recorded.  Trace size grows with
+the workload's data footprint; pipe through ``zstd`` (see the
+``outpipe=`` flag above) when running long workloads.
+
+**Long-workload simpoint capture**
+
+.. code-block:: console
+
+   $ qemu-x86_64 -plugin ./libchampsim_tracer.so,\
+   outfile=run,wp=1,spfile=run.simpts,spinterval=100000000,\
+   warmup=100000000,simulation=100000000 \
+                 ./prog
+
+One per-simpoint ``.cst`` file with 100 M warmup + 100 M evaluation
+instructions per segment.  Drives ChampSim-style sampled simulation
+on multi-billion-instruction workloads in tractable trace volume.
+
+**CP-only trace for a non-speculative simulator**
+
+.. code-block:: console
+
+   $ qemu-x86_64 -plugin ./libchampsim_tracer.so,outfile=run,wp=0,memdata=0 \
+                 ./prog
+
+Smallest, fastest configuration.  No WP chain, no memory data —
+just the architectural correct path with addresses.
 
 Output files and stderr
 -----------------------
@@ -292,6 +417,73 @@ A byte-budget audit (helpful when tuning trace size) is one command:
    ...
 
 For both tools' full surface see :doc:`decoder`.
+
+.. _reproducibility:
+
+Reproducibility
+---------------
+
+The trace is deterministic in the following sense: given the same
+guest binary, the same QEMU command line, the same plugin flags,
+and the same plugin build, two runs produce body streams that are
+*architecturally identical* — every basic block invoked, every
+memop, every register snapshot matches across runs.  In practice
+two ``.cst`` files from back-to-back runs typically differ in two
+places:
+
+* ``DATETIME`` and ``COMMAND`` strings inside the per-segment
+  header.  Both are recorded as-is.
+* The order of identifiers in the encoding-maps section, when
+  unordered hash-table iteration orders something — the C++
+  writer sorts the templates dictionary on serialization, so
+  template_id assignments stable across runs.
+
+Things that *can* break determinism:
+
+* **ASLR.**  Virtual addresses in the trace are guest-mode virtual
+  addresses; if the guest randomizes its layout, the body stream's
+  ``LOAD_ADDR`` / ``STORE_ADDR`` slots and the templates'
+  ``start_pc`` values will shift accordingly.  Disable ASLR via
+  ``setarch -R`` on the QEMU command for byte-stable traces.
+* **Concurrency.**  Multi-threaded guest workloads can interleave
+  vCPUs differently across runs.  See :ref:`multi-vcpu` in the
+  architecture doc.
+* **Wall-clock-dependent guest behavior.**  Workloads that
+  dispatch differently based on ``gettimeofday()`` etc.  The
+  tracer records the divergence faithfully; if you want bit-stable
+  traces, fix the workload's clock.
+
+Cross-host reproducibility holds when the above sources are
+controlled — the same guest binary produces the same trace on two
+different hosts running the same QEMU+plugin build.  Cross-QEMU-
+version reproducibility is *not* guaranteed: if the QEMU base
+moves to a different upstream commit, the TB carving heuristics
+may shift, which renumbers ``template_id`` in the dictionary.
+The body's architectural content stays the same.
+
+Feeding ChampSim
+----------------
+
+ChampSim itself doesn't yet consume the ``.cst`` format directly —
+ChampSim's stock trace path takes its own ``instr_t``-shaped binary.
+A ``.cst`` → ChampSim adapter is the consumer's responsibility for
+now: the trace exposes everything ChampSim needs (per-instruction
+PC, branch type and outcome, load/store addresses, optional values,
+wrong-path chain), but the marshalling of those fields into
+ChampSim's expected layout lives outside this repository.
+
+Until a first-party converter ships, the recommended consumer
+pattern is:
+
+1. Iterate body entries with ``cst_decode --format=disasm`` (one
+   line per architectural instruction, easy to grep) or via a
+   custom C++ consumer linked against ``libcst_tools_common`` (the
+   static library the offline tools share — header-only API in
+   ``contrib/plugins/champsim_tracer/tools/``).
+2. Convert per-record fields into the simulator's expected
+   structure on the fly.  Templates are loaded once at the start
+   of the trace and kept in memory; body entries stream past one
+   at a time so memory stays bounded regardless of trace length.
 
 Building this documentation
 ---------------------------

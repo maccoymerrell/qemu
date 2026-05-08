@@ -106,26 +106,44 @@ The ``IFRAME records`` line appears only on traces produced with
 ``iframe_rate>0``; those bytes are pure validation overhead and
 disappear when the feature is off.
 
-Format-version handling
------------------------
+Validating a trace
+------------------
 
-Both tools read v1.7, v1.8, and v1.9 traces.  They pick the right
-code path off the trailer's magic byte:
+A ``.cst`` file is well-formed if all of the following hold; the
+two C++ tools collectively check every one:
 
-.. code-block:: text
+1. **The trailer magic matches the header magic.**
+   ``cst_decode`` checks this first; mismatch is a fatal error.
+2. **The body's offset and length match the trailer's offsets and
+   the header's parsed length.**  ``cst_decode`` raises
+   ``header/body offset mismatch`` if not.
+3. **The body's footer ENTRY count matches the body walker's
+   observation.**  ``cst_decode`` raises
+   ``footer entry-count mismatch`` if not.
+4. **Every IFRAME (when present) reproduces the same per-entry
+   shape as its preceding ENTRY.**  See "IFRAME validation"
+   below.
+5. **Every section's byte budget rolls up to the file size.**
+   ``cst_audit`` verifies this — the printed top-level totals
+   (HEADER + TEMPLATES + BODY + TRAILER) sum to ``FILE`` exactly.
+   A negative line item or a non-100% rollup is a writer bug.
 
-   0x17545343 → v1.7  (legacy; per-entry sub-sections)
-   0x18545343 → v1.8  (unified delta stream; per-chain WP overlay reset)
-   0x19545343 → v1.9  (unified delta stream; persistent WP overlay)
+The recommended validation workflow:
 
-If you bump the wire format (cf. :doc:`extending`), the new magic
-needs a corresponding ``MAGIC_V*`` constant in
-``contrib/plugins/champsim_tracer/tools/cst_common.h`` and the
-parser branches need updating.  Keeping older readers compiled in
-is by design — debugging cross-version traces is a common need.
+.. code-block:: console
+
+   $ build/contrib/plugins/cst_audit trace.cst
+   FILE  ...  100.00%       # totals must sum to 100%
+
+   $ build/contrib/plugins/cst_decode trace.cst > /dev/null
+   # exit status 0 means the body walker accepted every record
+
+The combination is a cheap end-to-end correctness check: the audit
+sums all bytes, and the decoder replays the body's delta stream
+end-to-end.
 
 IFRAME validation
------------------
+~~~~~~~~~~~~~~~~~
 
 When a trace was produced with ``iframe_rate=N`` the writer follows
 selected ``BODY_TAG_ENTRY`` records with a redundant ``BODY_TAG_IFRAME``
@@ -136,6 +154,16 @@ verifies its dyn-param and reg-snap counts match the preceding ENTRY;
 mismatches raise an error.  IFRAMEs are not surfaced as separate
 ``BODY_TAG_ENTRY`` records — ``cst_decode`` reports a body-entry
 count that matches the writer's ``num_entries`` footer field.
+
+When you want maximum confidence in a fresh trace (e.g. before
+checking it into a paper's artifact repository), produce it with
+``iframe_rate=10000`` (every 10000th observation gets a
+verification record) and decode it with ``cst_decode`` — the
+decoder will fail loudly if any IFRAME's recorded view doesn't
+match its delta replay's reconstruction of the matching ENTRY.
+Drop the IFRAME flag once you've gotten a clean decode, and the
+production trace is byte-identical to one produced without IFRAME
+generation.
 
 mnemonic survey / audit
 -----------------------

@@ -619,7 +619,7 @@ deltas against template defaults.  Detailed semantics are in
      - Available for future scalar field-ID assignments.
    * - 0xFF
      - ``CST_FID_EXTENDED``
-     - Reserved escape; not used in v1.9.
+     - Reserved escape; not currently used.
 
 .. _isa-ids:
 
@@ -628,6 +628,56 @@ ISA identifiers (``TraceISA``)
 
 ``u8`` recorded in the trace header so the consumer knows how to
 interpret the ``insn_bytes`` payload of each template.
+
+ISA coverage in detail
+~~~~~~~~~~~~~~~~~~~~~~
+
+Each ISA has a per-ISA classification table in
+``contrib/plugins/champsim_tracer/champsim_tracer_mnemonics_<isa>.h``
+sized to the upstream Capstone ``<ISA>_INS_ENDING`` constant.
+Every Capstone-defined mnemonic gets a designated-initializer row
+in the table, so a build of the plugin against the in-tree
+Capstone version covers Capstone's full mnemonic surface for that
+ISA.  The practical limits on coverage are:
+
+* Capstone itself doesn't model every architectural extension at
+  the mnemonic level (notably anything that requires runtime
+  state or hard-to-statically-decode operands).
+* The per-row generic-opcode mapping was filled in pass-by-pass;
+  niche / recent extensions may be classified as ``GEN_OP_UNKNOWN``
+  if they were added after the last classification pass.  The
+  ``GEN_OP_UNKNOWN`` line of the exit-time summary plus the
+  ``.unknown_warnings.log`` sidecar is the authoritative answer
+  for any specific workload.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 14 86
+
+   * - ISA
+     - Notes
+   * - x86_64
+     - Capstone's full x86 mnemonic surface in 64-bit mode.
+       ``LOCK`` / ``REP`` prefixes are observed and surface as
+       ``sync_hint = SYNC_ATOMIC``.  Vector register snapshots are
+       512-bit-truncated; full ZMM is captured.
+   * - aarch64
+     - Capstone's full AArch64 mnemonic surface.  SVE
+       instructions appear in the mnemonic table; SVE register
+       snapshots are truncated to 512 bits, so VLEN > 512
+       configurations capture only the low 64 bytes per Z register.
+   * - riscv64
+     - Capstone's full RV64 mnemonic surface, including RVV
+       (vector extension) at the mnemonic level.  rv32 isn't
+       currently produced (no ``riscv32-linux-user`` build target
+       wired up).
+   * - mipsel
+     - Capstone's 32-bit little-endian MIPS surface.  MIPS
+       big-endian, mips64, and MIPS16e are not currently
+       supported.
+
+ISA enumeration on the wire
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. list-table::
    :header-rows: 1

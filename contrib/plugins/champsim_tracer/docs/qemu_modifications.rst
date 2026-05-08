@@ -140,9 +140,10 @@ Disassembly and target metadata
 
    Adds the generic build-attributes section type
    ``SHT_ARM_ATTRIBUTES`` / ``SHT_RISCV_ATTRIBUTES`` and matching
-   ``Tag_*`` enumerations, used by the ISA-mode resolvers in
-   ``champsim_tracer_isa.cc`` to detect RVC, RVV, and TSO from the
-   guest ELF rather than guessing.
+   ``Tag_*`` enumerations, consumed by
+   ``contrib/plugins/champsim_tracer/champsim_tracer_elf_attrs.h``
+   to detect RVC, RVV, and TSO from the guest ELF rather than
+   guessing.
 
 ``linux-user/plugin-api.c``
 

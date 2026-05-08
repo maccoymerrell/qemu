@@ -5,6 +5,201 @@ This page describes how ChampSim Tracer is organized, the two main flow
 loops (CP and WP), and the caveats every prospective modifier needs
 to know.
 
+Performance and overhead
+------------------------
+
+Where the runtime goes
+~~~~~~~~~~~~~~~~~~~~~~
+
+The tracer's hot path runs every architectural instruction through
+three layers in series:
+
+1. **TCG translation** (once per TB, on first sight).  The tracer
+   asks Capstone for instruction-detail metadata via
+   ``qemu_plugin_insn_detail`` and walks the per-ISA classification
+   table.  Cost is paid once per static basic block; on long
+   workloads this is a rounding error.
+2. **CP attribution** (every TB execute).  ``vcpu_tb_exec`` walks
+   the previous TB's instruction list, bumps stats, drains the
+   per-thread memop accumulator, and folds the just-finished
+   fragment into the in-flight chain.  Holds ``exec_lock`` and a
+   short ``data_lock`` window for the BB cache writes.
+3. **WP simulation** (when ``wp=1`` and the TB ends in a branch).
+   Saves CPU state, flips the per-vCPU
+   ``cpu->plugin_spec_mode`` flag, runs ``cpu_plugin_exec_tb`` in
+   a loop until the depth budget exhausts, then restores.  The
+   cost is roughly proportional to ``wpdepth`` instructions of
+   speculative execution per branch.
+
+Measured numbers on the SPEC CPU2017 ``mcf_r`` test workload, 20 M
+architectural instructions of capture (x86_64 host, gcc 13).  These
+are starting points; your workload will differ in both directions.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 38 12 14 14 12 10
+
+   * - Configuration
+     - Wall (s)
+     - Raw size
+     - zstd-19
+     - B/insn raw
+     - Slowdown
+   * - stoptrigger only (no recording)
+     - 0.18
+     - n/a
+     - n/a
+     - n/a
+     - 1× (baseline)
+   * - ``wp=0,memdata=0,regdata=0``
+     - 7.4
+     - 35 MB
+     - 0.18 MB
+     - 1.8
+     - 41×
+   * - ``wp=1,memdata=0,regdata=0``
+     - 116
+     - 272 MB
+     - 2.2 MB
+     - 14
+     - 644×
+   * - ``wp=1,memdata=1,regdata=0,wp_memdata=0``
+     - 122
+     - 280 MB
+     - 2.8 MB
+     - 15
+     - 679×
+   * - ``wp=1,memdata=1,regdata=1``
+     - 176
+     - 548 MB
+     - 16 MB
+     - 29
+     - 979×
+
+Reading the table:
+
+* **Slowdown vs the stoptrigger plugin** (which is roughly
+  unmodified-QEMU runtime): tracing without WP costs ~40× on this
+  workload because every TB pays a ``vcpu_tb_exec`` callback +
+  Capstone-classification + chain-assembly walk.  Enabling
+  WP simulation jumps to several-hundred× because every CP branch
+  triggers a separate TCG re-entry for the speculative side-trip.
+  Adding ``regdata=1`` is a further ~1.5× on top — every
+  instruction's destination registers are read out via
+  ``qemu_plugin_read_register``.
+* **Trace size:** heavily compression-friendly at the small end.
+  CP-only addresses produce ~2 bytes/insn raw and compress to
+  under a hundredth of a byte each — the field-delta encoding is
+  near-optimal for the steady-state inner loop.  The full
+  configuration (CP+WP, all data, all reg snaps) lands at ~30
+  bytes/insn raw, compressing to under a byte/insn.
+* **Memory footprint:** the plugin's RSS grows roughly with the
+  template-cache size (one ``BBTemplate`` per static basic block,
+  on the order of a few hundred bytes each) plus the WP simulator's
+  speculative-store buffer (bounded by ``wpdepth`` × the workload's
+  store rate).  Steady-state RSS on this 20 M run was ~140 MB
+  with ``wp=0`` and ~390 MB with full capture.
+
+Workload-dependence caveat: mcf has a tight inner loop that delta-
+encodes well.  Branch-heavy workloads (e.g. SPEC ``perlbench``)
+push more bytes per instruction; memory-bound workloads with
+diverse access patterns inflate the data-bearing configurations
+further.  Run ``cst_audit`` on a representative slice of your own
+workload before sizing storage for a long run.
+
+How to measure
+~~~~~~~~~~~~~~
+
+Three tools, each answering a different question:
+
+* ``cst_audit trace.cst`` — exact byte breakdown of where the
+  trace's bytes went.  Use to diagnose which configuration knob
+  has the biggest effect on size.  See :doc:`decoder`.
+* The exit-time stderr summary — printed by every plugin run,
+  contains CP/WP totals, branch-type breakdown, opcode usage, and
+  per-segment timing.  Useful for runtime + opcode-mix sanity.
+* ``time qemu-x86_64 -plugin ...`` — runtime vs the same QEMU
+  invocation without ``-plugin``.  The slowdown ratio is a
+  reasonable proxy for the plugin's per-instruction cost.
+
+Mitigations
+~~~~~~~~~~~
+
+If trace size or runtime is a problem:
+
+* **``simpoint`` mode** carves a long workload into representative
+  segments rather than tracing it whole.  Combine with
+  ``warmup=N,simulation=N`` to control segment length precisely.
+* **``outpipe="zstd -T0 -19 ..."``** runs zstd in-process so the
+  on-disk trace is compressed.  The wire format's delta encoding
+  leaves long runs of small bytes that ``zstd -19`` compresses
+  aggressively — measured ratios on the mcf workload above range
+  from ~34× (full data) to ~190× (CP-only addresses).  The
+  in-memory trace size is unchanged but the on-disk footprint
+  shrinks substantially.
+* **``wp_memdata=0``** keeps the WP cache-pollution stream
+  (addresses) but drops the WP data values.  This is usually the
+  biggest single trace-size knob.
+* **``wp=0``** if the consumer doesn't model speculation.
+
+.. _multi-vcpu:
+
+Multi-vCPU semantics
+--------------------
+
+QEMU's user-mode emulator handles multi-threaded guest workloads by
+giving each guest thread its own host thread; each host thread
+serves as a "vCPU" from the plugin's perspective.  The tracer is
+designed for these multi-vCPU runs but enforces a serialized view of
+the trace stream:
+
+* **One body stream per segment, interleaved across vCPUs.**  All
+  vCPUs share a single ``.cst`` file.  The body stream is a
+  serialized interleaving of the basic blocks each vCPU ran, in
+  the order ``vcpu_tb_exec`` callbacks fired across the host
+  process.  Each ENTRY record is tagged with a
+  ``thread_id`` (set by the most recent ``BODY_TAG_THREAD_SWITCH``)
+  so consumers can reconstruct per-vCPU sub-streams by filtering.
+* **``thread_id`` is a monotonic per-segment counter.**  The first
+  vCPU the segment observes is ``thread_id=0``; the second
+  distinct vCPU becomes ``thread_id=1``, and so on.  The mapping
+  resets at every segment start.  ``thread_id`` is *not* the QEMU
+  ``cpu_index`` — it's a stable trace-local label so the wire
+  format doesn't need to grow with the host's vCPU count.
+* **``icount`` is per-vCPU.**  The plugin maintains one instruction
+  counter per QEMU vCPU.  Segment-window comparisons (``start=N``
+  / ``stop=N``, simpoint windows) consult the firing vCPU's
+  counter.  This means the segment window opens / closes when
+  *any* vCPU crosses the threshold, not when the cross-vCPU sum
+  does.
+* **``exec_lock`` serializes the trace.**  Multiple vCPUs running
+  concurrently on the host serialize through the plugin's
+  ``exec_lock`` mutex inside ``vcpu_tb_exec``.  This guarantees
+  the trace's body stream is well-ordered (each ENTRY corresponds
+  to exactly one vCPU's BB execution) at the cost of removing
+  parallelism among vCPUs while in the plugin.  For multi-
+  threaded workloads this typically caps the tracer at ~1 vCPU's
+  worth of parallel throughput; the QEMU runtime itself is still
+  multi-threaded but the plugin callbacks are serialized.
+
+Practical implications:
+
+* **Lockstep guest behavior is preserved.**  Memory ordering as
+  observed by each vCPU is faithful — each load/store appears in
+  the trace with the value the running architecture would have
+  read/written.  But the *interleaving* among vCPUs may differ
+  from a native multi-core run because the plugin's lock perturbs
+  scheduling.
+* **Non-determinism across runs is normal on SMP workloads.**
+  The tracer faithfully records whichever interleaving QEMU
+  produced; pin the workload to one vCPU
+  (``-smp 1`` or ``taskset 0x1``) for byte-stable traces on
+  inherently-concurrent applications.
+* **Sub-segment thread switches are sparse.**  ``BODY_TAG_THREAD_SWITCH``
+  records are emitted only when the firing vCPU differs from the
+  previous body record's vCPU.  Single-threaded workloads pay
+  zero per-block thread-id overhead.
+
 .. _tb-vs-true-bb:
 
 Translation blocks (TBs) vs true basic blocks (true BBs)
@@ -109,7 +304,7 @@ order they're touched on a hot path:
        a wrong target, runs ``cpu_plugin_exec_tb`` until depth budget
        or natural branch end, restores state.  See :ref:`wp-flow`.
    * - ``champsim_tracer_output.cc``
-     - Wire-format encoder.  Owns the BitWriter, the v1.9 unified
+     - Wire-format encoder.  Owns the BitWriter, the unified
        field-delta state tables, and the templates / trailer writers.
    * - ``champsim_tracer_writer.{h,cc}``
      - Bounded SPSC queue + writer thread.  Decouples the per-segment
@@ -288,12 +483,13 @@ keep ``GMutex`` everywhere to avoid the build-time hazard.
 than 256 distinct architectural registers, the wire format changes —
 not just an added enum value.
 
-*WP overlay persists across chains in v1.9.*  Earlier revisions reset
-WP's delta-encoding state at every chain boundary; v1.9 keeps the WP
-overlay across chains so hot speculatively-touched templates pay
-first-observation cost only once per trace.  The decoder branches on
-the magic byte to distinguish v1.8 (per-chain reset) from v1.9
-(persistent).  Don't change it without bumping the magic.
+*WP overlay persists across chains.*  Hot speculatively-touched
+templates pay first-observation cost only once per trace.  Lookups
+hit the WP overlay first, fall back to the CP overlay, then to the
+template default.  Updates always go to the active overlay (CP for
+CP records, WP for WP records); the WP overlay never modifies CP
+state, so CP reconstruction is unaffected by speculative side
+effects.
 
 *IFRAMEs are validation-only redundancy.*  When the writer is run
 with ``iframe_rate=N``, every Nth observation of a CP template is

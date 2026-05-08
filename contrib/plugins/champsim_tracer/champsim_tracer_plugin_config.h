@@ -20,7 +20,7 @@
 #include "champsim_tracer.h"
 
 struct PluginConfig {
-    int       depth             = 64;
+    int       wp_depth          = 64;
     bool      enable_wp         = true;
     bool      enable_mem_data   = false;
     bool      enable_reg_data   = false;
@@ -41,6 +41,18 @@ struct PluginConfig {
     uint64_t  simpoint_interval = 100000000ULL;
     uint64_t  trace_start_insn  = 0;
     uint64_t  trace_stop_insn   = UINT64_MAX;
+    /* Simpoint windowing.  Only consulted when simpoints_file is set.
+     *   warmup_insns      : insns to trace BEFORE each simpoint's
+     *                       position to prime caches / branch predictors
+     *                       / etc.  Effective segment start is
+     *                       max(0, sp->start_insn - warmup_insns).
+     *   simulation_insns  : insns to trace at-and-after the simpoint
+     *                       position.  Effective segment stop is
+     *                       sp->start_insn + simulation_insns.  When 0
+     *                       (the default), the legacy behavior is kept:
+     *                       stop = sp->start + simpoint_interval. */
+    uint64_t  warmup_insns      = 0;
+    uint64_t  simulation_insns  = 0;
     char     *output_path       = nullptr;   /* g_strdup, owned */
     char     *output_pipe       = nullptr;   /* g_strdup, owned */
     char     *program_name      = nullptr;   /* g_strdup, owned */

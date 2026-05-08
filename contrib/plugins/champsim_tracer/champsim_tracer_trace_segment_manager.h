@@ -45,8 +45,19 @@ public:
     uint64_t window_start() const { return start_insn_; }
     uint64_t window_stop() const { return stop_insn_; }
 
-    /* Lifecycle. */
-    void start(const char *label, uint64_t start_insn, uint64_t stop_insn);
+    /* Lifecycle.
+     *
+     * @warmup_insns       : pre-simpoint warmup length (0 outside
+     *                       simpoint mode); copied verbatim into the
+     *                       header.
+     * @total_target_insns : the configured length of the segment;
+     *                       copied verbatim into the header.  Zero
+     *                       means "unbounded" (non-simpoint run with
+     *                       no explicit stop). */
+    void start(const char *label, uint64_t start_insn, uint64_t stop_insn,
+               uint64_t warmup_insns,
+               uint64_t total_target_insns,
+               const std::vector<InitialRegSnap> *initial_regfile);
     void finish(const std::function<void()> &flush_hook);
 
     /* State queries. */
@@ -69,7 +80,10 @@ private:
     static TraceSegment *segment_new(const char *label,
                                      uint64_t start, uint64_t stop);
     static void segment_free(TraceSegment *seg);
-    void open_output(const char *label);
+    void open_output(const char *label,
+                     uint64_t warmup_insns,
+                     uint64_t total_target_insns,
+                     const std::vector<InitialRegSnap> *regfile);
 
     TraceSegment        *current_       = nullptr;
     bool                 active_        = false;

@@ -21,10 +21,13 @@ table in champsim_tracer_output.cc.
 """
 
 import argparse
+import mmap
+import os
 import struct
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator, TextIO
 
 
 # --- Format constants ------------------------------------------------
@@ -305,8 +308,21 @@ def _add_delta_u64(base: int, delta: int) -> int:
     return (base + delta) & ((1 << 64) - 1)
 
 
-def _decode_encoding_maps(br: ByteReader) -> dict[str, dict[int, str]]:
+def _decode_encoding_maps(
+    br: ByteReader,
+) -> tuple[dict[str, dict[int, str]], dict[int, bytes]]:
+    """Read all encoding maps from the header.
+
+    The "reg" map carries an extra (width_bytes, raw_bytes) suffix per
+    entry: the architectural register's value at segment start, sourced
+    from the live vCPU at body_stream_new() time.  width_bytes == 0
+    means "no live snapshot" (unresolved register or pre-vCPU install-
+    time start).  Non-reg maps keep the legacy (id, name) layout.
+    Returns (maps, initial_regfile) where initial_regfile is keyed by
+    GenericRegId and maps to little-endian raw bytes.
+    """
     maps: dict[str, dict[int, str]] = {}
+    initial_regfile: dict[int, bytes] = {}
     n_maps = br.uleb()
     for _ in range(n_maps):
         map_name = br.string()
@@ -315,8 +331,12 @@ def _decode_encoding_maps(br: ByteReader) -> dict[str, dict[int, str]]:
         for _ in range(n_entries):
             value = br.uleb()
             entries[value] = br.string()
+            if map_name == "reg":
+                width = br.u8()
+                if width:
+                    initial_regfile[value] = br.raw(width)
         maps[map_name] = entries
-    return maps
+    return maps, initial_regfile
 
 
 def _merge_encoding_map(defaults: dict[int, str],
@@ -492,10 +512,10 @@ def _decode_field_delta_section(
         br: ByteReader,
         template_id: int,
         tmpl: dict | None,
-        state: dict[tuple[int, int, int], int],
+        state: dict[int, int],
         flags: int,
         scalar_mask: int,
-        base_state: dict[tuple[int, int, int], int] | None = None
+        base_state: dict[int, int] | None = None
         ) -> tuple[list[DynParam], list[dict]]:
     """Read one length-prefixed delta_section, apply records to the
     per-(template_id, ins_pos, field_id) state map, and reconstruct
@@ -505,41 +525,63 @@ def _decode_field_delta_section(
 
     If @base_state is provided (v1.9 WP path), keys not yet present in
     @state fall back to it before fall through to the template default.
-    Updates always go to @state (the writable overlay)."""
+    Updates always go to @state (the writable overlay).
+
+    Hot path; aggressively localized.  State is keyed by a 32-bit
+    composite int (``template_id<<24 | ipos<<8 | fid``) rather than a
+    tuple to skip per-record tuple allocation.  Pass 2 inlines what
+    used to be ``_state_or_default`` / ``_template_default``: the
+    reader fids touched there (FID_N_LOADS, FID_N_STORES, the
+    LOAD/STORE/DST_REG slot ranges) all have a template default of
+    zero, so a missed lookup just falls through to ``0`` — no need to
+    consult ``tmpl`` at all in pass 2.
+    """
     sec = br.sub()
     n_records = sec.uleb()
 
-    # First pass: walk records, applying deltas to state.
+    tid_base = template_id << 24
+
+    # Local-bind hot attribute lookups.
+    sec_uleb = sec.uleb
+    sec_sleb = sec.sleb
+    sec_u8   = sec.u8
+    state_get = state.get
+    base_get  = base_state.get if base_state is not None else None
+
+    # --- First pass: apply record deltas to state. ---
     pos = 0
     extra_vectors: dict[tuple[int, int], list[int]] = {}
+    extra_set = EXTRA_VECTOR_FIDS
+
     for _ in range(n_records):
-        gap = sec.uleb()
-        pos += gap
-        fid = sec.u8()
-        if fid in EXTRA_VECTOR_FIDS:
-            n_values = sec.uleb()
-            extra_vectors[(pos, fid)] = [sec.uleb() for _ in range(n_values)]
+        pos += sec_uleb()
+        fid = sec_u8()
+        if fid in extra_set:
+            n_values = sec_uleb()
+            extra_vectors[(pos, fid)] = [sec_uleb() for _ in range(n_values)]
             continue
-        delta = sec.sleb()
+        delta = sec_sleb()
         if fid == FID_EXTENDED:
             # Reserved escape: payload = ULEB(ext_field_id), SLEB(delta).
             # No extended fields defined yet; skip silently after consuming.
-            _ext_id = sec.uleb()
+            sec_uleb()
             continue
-        key = (template_id, pos, fid)
-        base = state.get(key)
-        if base is None and base_state is not None:
-            base = base_state.get(key)
+        key = tid_base | (pos << 8) | fid
+        base = state_get(key)
         if base is None:
-            base = _template_default(tmpl, pos, fid)
-        cur = (base + delta) & scalar_mask
-        state[key] = cur
+            if base_get is not None:
+                base = base_get(key)
+            if base is None:
+                # Most fids default to 0; only the FID_INSN_* range
+                # carries a template-derived baseline.  Skip the
+                # function-call overhead for the common case.
+                if FID_INSN_BYTES_LO <= fid <= FID_INSN_SIZE:
+                    base = _template_default(tmpl, pos, fid)
+                else:
+                    base = 0
+        state[key] = (base + delta) & scalar_mask
 
-    # Second pass: rebuild dyn_params and reg_snaps by walking the
-    # template schema and reading current state for every relevant
-    # (ins_pos, field_id).  This preserves the consumer-facing shape:
-    # dyn_params is a flat list ordered by (insn_index, load-before-store,
-    # slot), reg_snaps is per-insn source operands in operand order.
+    # --- Second pass: materialize dyn_params and reg_snaps. ---
     dyn_params: list[DynParam] = []
     reg_snaps: list[dict] = []
 
@@ -547,23 +589,28 @@ def _decode_field_delta_section(
         return dyn_params, reg_snaps
 
     has_mem = bool(flags & CST_FLAG_MEM_DATA)
+    has_reg = bool(flags & CST_FLAG_REG_DATA)
+    insns = tmpl["insns"]
 
-    def _state_or_default(ipos: int, fid: int) -> int:
-        key = (template_id, ipos, fid)
-        v = state.get(key)
-        if v is None and base_state is not None:
-            v = base_state.get(key)
-        if v is None:
-            v = _template_default(tmpl, ipos, fid)
-        return v
+    # Pass 2 only reads fids whose template_default is 0.  A missed
+    # lookup on either overlay just yields 0.
+    if base_get is None:
+        def _lookup(k: int) -> int:
+            v = state_get(k)
+            return 0 if v is None else v
+    else:
+        def _lookup(k: int) -> int:
+            v = state_get(k)
+            if v is None:
+                v = base_get(k)
+                if v is None:
+                    return 0
+            return v
 
-    def _set_dyn_data(dp: DynParam, value: int) -> None:
-        dp.data = value & scalar_mask
-        dp.data_lo = dp.data & MASK64
-        dp.data_hi = (dp.data >> 64) & MASK64
+    extra_get = extra_vectors.get
 
     def _require_extra(ipos: int, fid: int, count: int) -> list[int]:
-        values = extra_vectors.get((ipos, fid), [])
+        values = extra_get((ipos, fid), [])
         if len(values) != count:
             name = FIELD_ID_NAMES_DEFAULT.get(fid, f"FID_{fid:#x}")
             raise ValueError(
@@ -572,52 +619,66 @@ def _decode_field_delta_section(
             )
         return values
 
-    for i, insn in enumerate(tmpl["insns"]):
-        n_loads = _state_or_default(i, FID_N_LOADS)
-        n_stores = _state_or_default(i, FID_N_STORES)
+    for i, insn in enumerate(insns):
+        ipos_key = tid_base | (i << 8)
+        n_loads  = _lookup(ipos_key | FID_N_LOADS)
+        n_stores = _lookup(ipos_key | FID_N_STORES)
 
-        fixed_loads = min(n_loads, FID_SLOT_COUNT)
-        fixed_stores = min(n_stores, FID_SLOT_COUNT)
+        if n_loads or n_stores:
+            fixed_loads  = n_loads  if n_loads  < FID_SLOT_COUNT else FID_SLOT_COUNT
+            fixed_stores = n_stores if n_stores < FID_SLOT_COUNT else FID_SLOT_COUNT
 
-        for slot in range(fixed_loads):
-            v = _state_or_default(i, FID_LOAD_ADDR_BASE + slot) & MASK64
-            dp = DynParam(type_name="load", value=v, insn_index=i)
-            if has_mem:
-                _set_dyn_data(dp, _state_or_default(i, FID_LOAD_DATA_BASE + slot))
-            dyn_params.append(dp)
-
-        extra_load_count = max(0, n_loads - FID_SLOT_COUNT)
-        if extra_load_count:
-            extra_addrs = _require_extra(i, FID_EXTRA_LOAD_ADDR,
-                                         extra_load_count)
-            extra_data = _require_extra(i, FID_EXTRA_LOAD_DATA,
-                                        extra_load_count) if has_mem else []
-            for j, v in enumerate(extra_addrs):
-                dp = DynParam(type_name="load", value=v & MASK64,
-                              insn_index=i)
+            for slot in range(fixed_loads):
+                addr = _lookup(ipos_key | (FID_LOAD_ADDR_BASE + slot)) & MASK64
+                dp = DynParam(type_name="load", value=addr, insn_index=i)
                 if has_mem:
-                    _set_dyn_data(dp, extra_data[j])
+                    data = _lookup(ipos_key | (FID_LOAD_DATA_BASE + slot)) & scalar_mask
+                    dp.data = data
+                    dp.data_lo = data & MASK64
+                    dp.data_hi = (data >> 64) & MASK64
                 dyn_params.append(dp)
 
-        for slot in range(fixed_stores):
-            v = _state_or_default(i, FID_STORE_ADDR_BASE + slot) & MASK64
-            dp = DynParam(type_name="store", value=v, insn_index=i)
-            if has_mem:
-                _set_dyn_data(dp, _state_or_default(i, FID_STORE_DATA_BASE + slot))
-            dyn_params.append(dp)
+            extra_load_count = n_loads - FID_SLOT_COUNT
+            if extra_load_count > 0:
+                extra_addrs = _require_extra(i, FID_EXTRA_LOAD_ADDR,
+                                             extra_load_count)
+                extra_data = _require_extra(i, FID_EXTRA_LOAD_DATA,
+                                            extra_load_count) if has_mem else []
+                for j, v in enumerate(extra_addrs):
+                    dp = DynParam(type_name="load", value=v & MASK64,
+                                  insn_index=i)
+                    if has_mem:
+                        d = extra_data[j] & scalar_mask
+                        dp.data = d
+                        dp.data_lo = d & MASK64
+                        dp.data_hi = (d >> 64) & MASK64
+                    dyn_params.append(dp)
 
-        extra_store_count = max(0, n_stores - FID_SLOT_COUNT)
-        if extra_store_count:
-            extra_addrs = _require_extra(i, FID_EXTRA_STORE_ADDR,
-                                         extra_store_count)
-            extra_data = _require_extra(i, FID_EXTRA_STORE_DATA,
-                                        extra_store_count) if has_mem else []
-            for j, v in enumerate(extra_addrs):
-                dp = DynParam(type_name="store", value=v & MASK64,
-                              insn_index=i)
+            for slot in range(fixed_stores):
+                addr = _lookup(ipos_key | (FID_STORE_ADDR_BASE + slot)) & MASK64
+                dp = DynParam(type_name="store", value=addr, insn_index=i)
                 if has_mem:
-                    _set_dyn_data(dp, extra_data[j])
+                    data = _lookup(ipos_key | (FID_STORE_DATA_BASE + slot)) & scalar_mask
+                    dp.data = data
+                    dp.data_lo = data & MASK64
+                    dp.data_hi = (data >> 64) & MASK64
                 dyn_params.append(dp)
+
+            extra_store_count = n_stores - FID_SLOT_COUNT
+            if extra_store_count > 0:
+                extra_addrs = _require_extra(i, FID_EXTRA_STORE_ADDR,
+                                             extra_store_count)
+                extra_data = _require_extra(i, FID_EXTRA_STORE_DATA,
+                                            extra_store_count) if has_mem else []
+                for j, v in enumerate(extra_addrs):
+                    dp = DynParam(type_name="store", value=v & MASK64,
+                                  insn_index=i)
+                    if has_mem:
+                        d = extra_data[j] & scalar_mask
+                        dp.data = d
+                        dp.data_lo = d & MASK64
+                        dp.data_hi = (d >> 64) & MASK64
+                    dyn_params.append(dp)
 
         # Register snapshots: destination operands only, captured
         # post-execution.  Source register identities remain in the
@@ -626,27 +687,48 @@ def _decode_field_delta_section(
         # register's value at any point from the most recent post-exec
         # destination observation).  Skip if the REG_DATA flag is
         # clear (no records will exist).
-        if flags & CST_FLAG_REG_DATA:
-            for op_i, reg_id in enumerate(insn.get("dst_regs", [])):
-                v = _state_or_default(i, FID_DST_REG_BASE + op_i)
-                reg_snaps.append({
-                    "insn_index": i,
-                    "kind": "dst",
-                    "operand_index": op_i,
-                    "reg_id": reg_id,
-                    "value": v & scalar_mask,
-                    "lo": v & MASK64,
-                    "hi": (v >> 64) & MASK64,
-                })
+        if has_reg:
+            dst_regs = insn.get("dst_regs")
+            if dst_regs:
+                for op_i, reg_id in enumerate(dst_regs):
+                    v = _lookup(ipos_key | (FID_DST_REG_BASE + op_i))
+                    reg_snaps.append({
+                        "insn_index": i,
+                        "kind": "dst",
+                        "operand_index": op_i,
+                        "reg_id": reg_id,
+                        "value": v & scalar_mask,
+                        "lo": v & MASK64,
+                        "hi": (v >> 64) & MASK64,
+                    })
 
     return dyn_params, reg_snaps
 
 
-def decode_champsim_tracer(bin_path: Path
-                           ) -> tuple[dict, list[dict], list[dict]]:
-    """Decode a v1.7/v1.8/v1.9 trace file.  Returns (meta, templates, entries).
-    Public API; stable across minor revisions of the decoder."""
-    data = bin_path.read_bytes()
+def _open_trace(bin_path: Path):
+    """Open a trace file as a read-only mmap.  Returns the mmap object;
+    caller is responsible for releasing it (typically by letting it go
+    out of scope, or by holding it alive as long as a body iterator
+    derived from it is in use).
+    """
+    fd = os.open(bin_path, os.O_RDONLY)
+    try:
+        size = os.fstat(fd).st_size
+        if size == 0:
+            raise ValueError("Trace file is empty")
+        return mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+    finally:
+        os.close(fd)
+
+
+def _parse_header_and_templates(data) -> tuple[dict, list[dict],
+                                               dict[int, dict],
+                                               int, int, int, int, bool]:
+    """Parse the trailer, header, and templates section.  Returns
+    ``(meta, templates, template_by_id, body_off, body_end, flags,
+    scalar_mask, wp_persistent)`` — everything the body walker needs to
+    start producing entries.
+    """
     if len(data) < CST_TRAILER_SIZE:
         raise ValueError("Trace file too small to contain a trailer")
 
@@ -683,15 +765,30 @@ def decode_champsim_tracer(bin_path: Path
         raise ValueError("Header/trailer CST version mismatch")
     isa          = br.u8()
     flags        = br.u8()
+    # Per-segment instruction window descriptors.
+    #   start_insn         : architectural icount where this segment
+    #                        begins (anchors body records to a global
+    #                        timeline).
+    #   warmup_insns       : insns at the front of this trace meant
+    #                        to prime caches/predictors and not be
+    #                        evaluated; zero outside simpoint mode.
+    #   total_target_insns : configured length of the segment.  Zero
+    #                        means "unbounded" (non-simpoint with no
+    #                        explicit stop).  This is the targeted
+    #                        value, not what was observed.
+    start_insn         = br.uleb()
+    warmup_insns       = br.uleb()
+    total_target_insns = br.uleb()
     command      = br.string()
     datetime_str = br.string()
     comment      = br.string()
     target_name  = br.string()
 
     encoding_maps: dict[str, dict[int, str]] = {}
+    initial_regfile: dict[int, bytes] = {}
     if br.pos < body_off:
         maps_br = br.sub()
-        encoding_maps = _decode_encoding_maps(maps_br)
+        encoding_maps, initial_regfile = _decode_encoding_maps(maps_br)
         if not maps_br.eof():
             raise ValueError("encoding map section has trailing bytes")
     if br.pos != body_off:
@@ -716,25 +813,75 @@ def decode_champsim_tracer(bin_path: Path
             )
         templates, template_by_id = _decode_templates_section(tbr, n)
 
-    # --- Read body ---
-    body = ByteReader(data, body_off, body_off + body_byte_count)
+    meta = {
+        "magic": magic,
+        "format_version": {
+            CST_MAGIC_V17: 0x17,
+            CST_MAGIC_V18: 0x18,
+            CST_MAGIC_V19: 0x19,
+        }[magic],
+        "isa": isa,
+        "target_name": target_name,
+        "flags": flags,
+        "start_insn": start_insn,
+        "warmup_insns": warmup_insns,
+        "total_target_insns": total_target_insns,
+        "initial_regfile": initial_regfile,
+        "command": command,
+        "datetime": datetime_str,
+        "comment": comment,
+        "has_mem_data": has_mem_data,
+        "has_reg_data": has_reg_data,
+        "templates_off": templates_off,
+        "templates_count": templates_count,
+        "body_off": body_off,
+        "body_byte_count": body_byte_count,
+        "encoding_maps": encoding_maps,
+        "opcode_names": _merge_encoding_map(OPCODE_NAMES, encoding_maps,
+                                             "opcode"),
+        "branch_names": _merge_encoding_map(BRANCH_NAMES, encoding_maps,
+                                             "branch_type"),
+        "sync_hint_names": _merge_encoding_map(SYNC_HINT_NAMES,
+                                               encoding_maps, "sync_hint"),
+        "field_id_names": _merge_encoding_map(FIELD_ID_NAMES_DEFAULT,
+                                              encoding_maps, "field_id"),
+        "stop_reason_names": dict(WP_STOP_REASON_NAMES),
+        "exception_names": dict(EXCEPTION_NAMES_DEFAULT),
+        "reg_names": _merge_encoding_map(REG_NAMES_DEFAULT, encoding_maps,
+                                          "reg"),
+    }
+    return (meta, templates, template_by_id, body_off,
+            body_off + body_byte_count, flags, scalar_mask, wp_persistent)
 
-    entries: list[dict] = []
+
+_DECODER_DIAG_EVERY = int(os.environ.get("CST_DECODER_DIAG_EVERY", "0"))
+
+
+def _iter_body_entries(data, body_off: int, body_end: int,
+                       template_by_id: dict[int, dict],
+                       flags: int, scalar_mask: int,
+                       wp_persistent: bool) -> Iterator[dict]:
+    """Generator: walk the body section once, yielding one entry dict
+    per BODY_TAG_ENTRY.  IFRAME records validate against the
+    immediately preceding entry without yielding anything.
+
+    Memory: O(1) in entry count.  The persistent (template_id, ipos,
+    fid) state map grows as the trace exercises new (template, slot)
+    pairs but is bounded by the template population, not the entry
+    count.
+    """
+    body = ByteReader(data, body_off, body_end)
     prev_entry_template = 0
     current_thread = 0
     pending_thread_switch = False
-    cp_field_state: dict[tuple[int, int, int], int] = {}
-    wp_field_state: dict[tuple[int, int, int], int] = {}
+    cp_field_state: dict[int, int] = {}
+    wp_field_state: dict[int, int] = {}
+    prev_entry: dict | None = None
+    seq = 0
     footer_num_entries: int | None = None
 
     def _decode_body_record_payload(br, entry_tmpl, cp_state, wp_state):
-        """Decode one body-record payload (CP delta section + WP chain
-        section + WP events section) using the supplied overlays.
-        Returns (cp_dyn, cp_reg_snaps, wp_entries).  Used for both
-        BODY_TAG_ENTRY (called with the persistent cp/wp_field_state)
-        and BODY_TAG_IFRAME (called with fresh empty overlays so all
-        deltas resolve from template_default — pure absolute decode).
-        """
+        """See the eager decoder for the rationale; unchanged logic."""
         cp_tmpl = template_by_id.get(entry_tmpl)
         cp_dyn, cp_reg_snaps = _decode_field_delta_section(
             br, entry_tmpl, cp_tmpl, cp_state, flags, scalar_mask)
@@ -808,45 +955,58 @@ def decode_champsim_tracer(bin_path: Path
             cp_dyn, cp_reg_snaps, wp_entries = _decode_body_record_payload(
                 body, entry_tmpl, cp_field_state, wp_field_state)
 
-            entries.append({
-                "seq_num": len(entries) + 1,
+            seq += 1
+            entry = {
+                "seq_num": seq,
                 "template_id": entry_tmpl,
                 "thread_id": current_thread,
                 "thread_switched": pending_thread_switch,
                 "dyn_params": cp_dyn,
                 "reg_snaps": cp_reg_snaps,
                 "wp_entries": wp_entries,
-            })
+            }
             pending_thread_switch = False
+            prev_entry = entry
+            if _DECODER_DIAG_EVERY and (seq % _DECODER_DIAG_EVERY == 0):
+                try:
+                    import resource as _res
+                    _rss = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss
+                except Exception:
+                    _rss = -1
+                # cp_state and wp_state are kept in sync only when v1.7/v1.8
+                # forks; in v1.9 they grow independently. Show both.
+                print(
+                    f"[diag] seq={seq:>9} cp_state={len(cp_field_state):>8} "
+                    f"wp_state={len(wp_field_state):>8} "
+                    f"rss={_rss//1024 if _rss > 0 else _rss}MB",
+                    file=sys.stderr, flush=True,
+                )
+            yield entry
             continue
 
         if tag == BODY_TAG_IFRAME:
-            # Validates the immediately-preceding BODY_TAG_ENTRY.
-            # Decoded against fresh empty overlays so every delta
-            # record resolves to its absolute value (against
-            # template_default).  After parsing, compare the
-            # reconstructed CP and WP views against the regular
-            # ENTRY's reconstruction — any mismatch implies a bug
-            # somewhere in the writer or decoder.
-            if not entries:
+            # Validates the immediately-preceding BODY_TAG_ENTRY using
+            # fresh empty overlays so every delta resolves against
+            # template_default — a pure absolute decode.
+            if prev_entry is None:
                 raise ValueError("BODY_TAG_IFRAME with no preceding ENTRY")
-            prev = entries[-1]
-            iframe_cp_state: dict[tuple[int, int, int], int] = {}
-            iframe_wp_state: dict[tuple[int, int, int], int] = {}
+            iframe_cp_state: dict[int, int] = {}
+            iframe_wp_state: dict[int, int] = {}
             i_cp_dyn, i_cp_reg, i_wp_entries = _decode_body_record_payload(
-                body, prev["template_id"],
+                body, prev_entry["template_id"],
                 iframe_cp_state, iframe_wp_state)
-            _validate_iframe(prev["template_id"], "CP",
-                             prev["dyn_params"], prev["reg_snaps"],
+            _validate_iframe(prev_entry["template_id"], "CP",
+                             prev_entry["dyn_params"],
+                             prev_entry["reg_snaps"],
                              i_cp_dyn, i_cp_reg)
-            if len(i_wp_entries) != len(prev["wp_entries"]):
+            if len(i_wp_entries) != len(prev_entry["wp_entries"]):
                 raise ValueError(
                     f"IFRAME WP-chain length mismatch: "
-                    f"entry={len(prev['wp_entries'])} "
+                    f"entry={len(prev_entry['wp_entries'])} "
                     f"iframe={len(i_wp_entries)}"
                 )
             for w_idx, (e_wp, i_wp) in enumerate(
-                    zip(prev["wp_entries"], i_wp_entries)):
+                    zip(prev_entry["wp_entries"], i_wp_entries)):
                 _validate_iframe(e_wp["template_id"], f"WP[{w_idx}]",
                                  e_wp["dyn_params"], e_wp["reg_snaps"],
                                  i_wp["dyn_params"], i_wp["reg_snaps"])
@@ -854,46 +1014,52 @@ def decode_champsim_tracer(bin_path: Path
 
         raise ValueError(f"Unknown body tag: {tag}")
 
-    if footer_num_entries is not None and footer_num_entries != len(entries):
+    if footer_num_entries is not None and footer_num_entries != seq:
         raise ValueError(
             f"Footer entry count mismatch: "
-            f"{footer_num_entries} != {len(entries)}"
+            f"{footer_num_entries} != {seq}"
         )
 
-    meta = {
-        "magic": magic,
-        "format_version": {
-            CST_MAGIC_V17: 0x17,
-            CST_MAGIC_V18: 0x18,
-            CST_MAGIC_V19: 0x19,
-        }[magic],
-        "isa": isa,
-        "target_name": target_name,
-        "flags": flags,
-        "command": command,
-        "datetime": datetime_str,
-        "comment": comment,
-        "has_mem_data": has_mem_data,
-        "has_reg_data": has_reg_data,
-        "templates_off": templates_off,
-        "templates_count": templates_count,
-        "body_off": body_off,
-        "body_byte_count": body_byte_count,
-        "encoding_maps": encoding_maps,
-        "opcode_names": _merge_encoding_map(OPCODE_NAMES, encoding_maps,
-                                             "opcode"),
-        "branch_names": _merge_encoding_map(BRANCH_NAMES, encoding_maps,
-                                             "branch_type"),
-        "sync_hint_names": _merge_encoding_map(SYNC_HINT_NAMES,
-                                               encoding_maps, "sync_hint"),
-        "field_id_names": _merge_encoding_map(FIELD_ID_NAMES_DEFAULT,
-                                              encoding_maps, "field_id"),
-        "stop_reason_names": dict(WP_STOP_REASON_NAMES),
-        "exception_names": dict(EXCEPTION_NAMES_DEFAULT),
-        "reg_names": _merge_encoding_map(REG_NAMES_DEFAULT, encoding_maps,
-                                          "reg"),
-    }
-    return meta, templates, entries
+
+def iter_decode_champsim_tracer(bin_path: Path
+                                ) -> tuple[dict, list[dict],
+                                           Iterator[dict]]:
+    """Streaming decoder.  Returns ``(meta, templates, entry_iter)``
+    with the same shape as :func:`decode_champsim_tracer`, except the
+    third element is a single-pass iterator that yields one entry at a
+    time.  Memory usage stays O(1) in entry count, so this is the
+    correct API for multi-GB traces.
+
+    The returned iterator captures the underlying mmap; consume it (or
+    let it go out of scope) before the trace file is unlinked.
+    """
+    data = _open_trace(bin_path)
+    (meta, templates, template_by_id, body_off, body_end,
+     flags, scalar_mask, wp_persistent) = _parse_header_and_templates(data)
+
+    def entries_gen() -> Iterator[dict]:
+        # `data` is captured here, keeping the mmap alive for the
+        # lifetime of the iterator regardless of what the caller does
+        # with the meta / templates references.
+        yield from _iter_body_entries(
+            data, body_off, body_end, template_by_id,
+            flags, scalar_mask, wp_persistent)
+
+    return meta, templates, entries_gen()
+
+
+def decode_champsim_tracer(bin_path: Path
+                           ) -> tuple[dict, list[dict], list[dict]]:
+    """Decode a v1.7/v1.8/v1.9 trace file.  Returns
+    ``(meta, templates, entries)`` with ``entries`` materialized as a
+    list.  Public API; stable across minor revisions of the decoder.
+
+    For multi-GB traces use :func:`iter_decode_champsim_tracer`
+    instead — this function holds every decoded entry in memory and
+    will OOM on traces of even moderate size.
+    """
+    meta, templates, it = iter_decode_champsim_tracer(bin_path)
+    return meta, templates, list(it)
 
 
 # --- Text renderer ---------------------------------------------------
@@ -907,8 +1073,14 @@ def _format_dyn(dp: DynParam, show_data: bool) -> str:
     return s
 
 
-def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
-    out: list[str] = []
+def render_text_streaming(meta: dict, templates: list[dict],
+                          entries: Iterator[dict] | list[dict],
+                          out: TextIO) -> int:
+    """Stream the text rendering directly to ``out`` (a file-like
+    object).  Returns the number of entries rendered.  Output is
+    byte-identical to :func:`render_text` for the same input.
+    """
+    write = out.write
     opcode_names = meta.get("opcode_names", OPCODE_NAMES)
     branch_names = meta.get("branch_names", BRANCH_NAMES)
     sync_hint_names = meta.get("sync_hint_names", SYNC_HINT_NAMES)
@@ -936,77 +1108,79 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
                           dyn_params: list[DynParam],
                           reg_snaps: list[dict]) -> None:
         if not dyn_params and not reg_snaps:
-            out.append(f"{prefix}unchanged")
+            write(f"{prefix}unchanged\n")
             return
         if dyn_params:
-            out.append(f"{prefix}memops:")
+            write(f"{prefix}memops:\n")
             for dp in dyn_params:
-                out.append(
-                    f"{prefix}  insn[{dp.insn_index}] "
-                    f"{_format_dyn(dp, has_mem_data)}"
-                )
+                write(f"{prefix}  insn[{dp.insn_index}] "
+                      f"{_format_dyn(dp, has_mem_data)}\n")
         if reg_snaps:
-            out.append(f"{prefix}regs:")
+            write(f"{prefix}regs:\n")
             for snap in reg_snaps:
-                out.append(
-                    f"{prefix}  insn[{snap['insn_index']}] "
-                    f"{snap['kind']}[{snap['operand_index']}] "
-                    f"{rfmt(snap['reg_id'])}={snap_value(snap)}"
-                )
+                write(f"{prefix}  insn[{snap['insn_index']}] "
+                      f"{snap['kind']}[{snap['operand_index']}] "
+                      f"{rfmt(snap['reg_id'])}={snap_value(snap)}\n")
 
-    out.append("META")
-    out.append("----")
-    out.append(f"VERSION 0x{meta.get('magic', CST_MAGIC):08X}")
+    write("META\n----\n")
+    write(f"VERSION 0x{meta.get('magic', CST_MAGIC):08X}\n")
     isa_name = meta.get("target_name") or ISA_NAMES.get(meta.get("isa", 0),
                                                         "unknown")
-    out.append(f"ISA {isa_name}")
-    out.append(f"COMMAND {meta.get('command', '')}")
-    out.append(f"DATETIME {meta.get('datetime', '')}")
-    out.append(f"COMMENT {meta.get('comment', '')}")
+    write(f"ISA {isa_name}\n")
+    write(f"COMMAND {meta.get('command', '')}\n")
+    write(f"DATETIME {meta.get('datetime', '')}\n")
+    write(f"COMMENT {meta.get('comment', '')}\n")
     flags_str = ""
     if has_mem_data:
         flags_str += " MEM_DATA"
     if has_reg_data:
         flags_str += " REG_DATA"
-    out.append(f"FLAGS{flags_str}")
-    out.append("")
+    write(f"FLAGS{flags_str}\n")
+    write(f"START_INSN {meta.get('start_insn', 0)}\n")
+    write(f"WARMUP_INSNS {meta.get('warmup_insns', 0)}\n")
+    total_target = meta.get('total_target_insns', 0)
+    write(f"TOTAL_TARGET_INSNS {total_target}"
+          f"{' (unbounded)' if total_target == 0 else ''}\n")
+    initial_regfile = meta.get("initial_regfile", {})
+    if initial_regfile:
+        write(f"INITIAL_REGFILE {len(initial_regfile)}\n")
+        for k in sorted(initial_regfile):
+            v = initial_regfile[k]
+            write(f"  {rfmt(k)} {v.hex()}\n")
+    write("\n")
 
-    out.append("ENCODINGS")
-    out.append("---------")
+    write("ENCODINGS\n---------\n")
     if encoding_maps:
         for map_name in sorted(encoding_maps):
             map_entries = encoding_maps[map_name]
-            out.append(f"{map_name} {len(map_entries)}")
+            write(f"{map_name} {len(map_entries)}\n")
             for k in sorted(map_entries):
-                out.append(f"  {k} {map_entries[k]}")
+                write(f"  {k} {map_entries[k]}\n")
     else:
-        out.append(f"opcode {len(opcode_names)}")
+        write(f"opcode {len(opcode_names)}\n")
         for k in sorted(opcode_names):
-            out.append(f"  {k} {opcode_names[k]}")
-        out.append(f"branch_type {len(branch_names)}")
+            write(f"  {k} {opcode_names[k]}\n")
+        write(f"branch_type {len(branch_names)}\n")
         for k in sorted(branch_names):
-            out.append(f"  {k} {branch_names[k]}")
-        out.append(f"reg {len(reg_names)}")
+            write(f"  {k} {branch_names[k]}\n")
+        write(f"reg {len(reg_names)}\n")
         for k in sorted(reg_names):
-            out.append(f"  {k} {reg_names[k]}")
-    out.append(f"WP_STOP_REASONS {len(stop_reason_names)}")
+            write(f"  {k} {reg_names[k]}\n")
+    write(f"WP_STOP_REASONS {len(stop_reason_names)}\n")
     for k in sorted(stop_reason_names):
-        out.append(f"  {k} {stop_reason_names[k]}")
-    out.append(f"EXCEPTIONS {len(exception_names)}")
+        write(f"  {k} {stop_reason_names[k]}\n")
+    write(f"EXCEPTIONS {len(exception_names)}\n")
     for k in sorted(exception_names):
-        out.append(f"  {k} {exception_names[k]}")
-    out.append("")
+        write(f"  {k} {exception_names[k]}\n")
+    write("\n")
 
-    out.append("TEMPLATES")
-    out.append("---------")
+    write("TEMPLATES\n---------\n")
     for tmpl in templates:
-        out.append(
-            f"BB{tmpl['template_id']} [pc=0x{tmpl['start_pc']:x}, "
-            f"insns={tmpl['n_insns']}, "
-            f"fall_through=0x{tmpl['fall_through_pc']:x}]"
-        )
+        write(f"BB{tmpl['template_id']} [pc=0x{tmpl['start_pc']:x}, "
+              f"insns={tmpl['n_insns']}, "
+              f"fall_through=0x{tmpl['fall_through_pc']:x}]\n")
         if tmpl.get("symbol_name"):
-            out.append(f"  symbol={tmpl['symbol_name']}")
+            write(f"  symbol={tmpl['symbol_name']}\n")
         for i, insn in enumerate(tmpl["insns"]):
             line = (f"  [{i}] 0x{insn['pc']:x}: "
                     f"op={enum_name(opcode_names, insn['opcode'], 'OP')}")
@@ -1022,26 +1196,23 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
                 line += f" sync={enum_name(sync_hint_names, insn['sync_hint'], 'SYNC')}"
             if insn.get("raw_bytes") is not None:
                 line += f" bytes={insn['raw_bytes'].hex()}"
-            out.append(line)
-        out.append("")
+            write(line + "\n")
+        write("\n")
 
-    out.append("BODY")
-    out.append("----")
-    for entry_idx, entry in enumerate(entries):
+    write("BODY\n----\n")
+    n_entries = 0
+    for entry in entries:
+        n_entries += 1
         switch = " switch=1" if entry.get("thread_switched") else ""
-        out.append(
-            f"ENTRY {entry['seq_num']:04d} "
-            f"thread={entry.get('thread_id', 0)}{switch} "
-            f"template=BB{entry['template_id']}"
-        )
-        out.append("  cp:")
+        write(f"ENTRY {entry['seq_num']:04d} "
+              f"thread={entry.get('thread_id', 0)}{switch} "
+              f"template=BB{entry['template_id']}\n")
+        write("  cp:\n")
         emit_observations("    ", entry["dyn_params"],
                           entry.get("reg_snaps", []))
         for wp in entry["wp_entries"]:
-            out.append(
-                f"  wp[{wp['index']}] template=BB{wp['template_id']} "
-                f"n_insns={wp['n_insns']}"
-            )
+            write(f"  wp[{wp['index']}] template=BB{wp['template_id']} "
+                  f"n_insns={wp['n_insns']}\n")
             statuses: list[str] = []
             if wp["fault"]:
                 fi = wp.get("fault_insn_index")
@@ -1052,13 +1223,25 @@ def render_text(meta: dict, templates: list[dict], entries: list[dict]) -> str:
             if wp.get("translation_unavailable"):
                 statuses.append("TRANSLATION_UNAVAILABLE")
             if statuses:
-                out.append(f"    status: {' '.join(statuses)}")
+                write(f"    status: {' '.join(statuses)}\n")
             emit_observations("    ", wp["dyn_params"],
                               wp.get("reg_snaps", []))
-        out.append("")
+        write("\n")
         _ = exception_names, stop_reason_names  # referenced for API parity
 
-    return "\n".join(out) + "\n"
+    return n_entries
+
+
+def render_text(meta: dict, templates: list[dict],
+                entries: list[dict]) -> str:
+    """Render to a single string.  For very large traces use
+    :func:`render_text_streaming` directly to avoid the whole-text-in-
+    memory cost.
+    """
+    import io
+    buf = io.StringIO()
+    render_text_streaming(meta, templates, iter(entries), buf)
+    return buf.getvalue()
 
 
 def _first_diff_line(a: str, b: str) -> tuple[int, str, str] | None:
@@ -1079,14 +1262,16 @@ def main() -> int:
     parser.add_argument("--expect", type=Path)
     args = parser.parse_args()
 
-    meta, templates, entries = decode_champsim_tracer(args.bin)
-    text = render_text(meta, templates, entries)
-    if args.out:
-        args.out.write_text(text)
-    else:
-        sys.stdout.write(text)
-
     if args.expect:
+        # --expect needs the full text in memory for comparison; stay on
+        # the eager path (still mmap-backed via iter_decode_champsim_tracer
+        # internally, just materialized into a list before render).
+        meta, templates, entries = decode_champsim_tracer(args.bin)
+        text = render_text(meta, templates, entries)
+        if args.out:
+            args.out.write_text(text)
+        else:
+            sys.stdout.write(text)
         expected = args.expect.read_text()
         if text == expected:
             print("VERIFY: OK")
@@ -1100,6 +1285,15 @@ def main() -> int:
         else:
             print("VERIFY: FAIL (content differs)")
         return 2
+
+    # Streaming path: decode + render entry-by-entry, no full-trace
+    # accumulation in memory.
+    meta, templates, entry_iter = iter_decode_champsim_tracer(args.bin)
+    if args.out:
+        with args.out.open("w") as f:
+            render_text_streaming(meta, templates, entry_iter, f)
+    else:
+        render_text_streaming(meta, templates, entry_iter, sys.stdout)
     return 0
 
 

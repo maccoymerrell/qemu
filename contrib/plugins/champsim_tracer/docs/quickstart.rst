@@ -28,7 +28,7 @@ Attach the plugin to a user-mode QEMU invocation with ``-plugin``:
 
 .. code-block:: console
 
-   $ qemu-x86_64 -plugin ./libchampsim_tracer.so,outfile=run.cst,depth=64 \
+   $ qemu-x86_64 -plugin ./libchampsim_tracer.so,outfile=run,wpdepth=64 \
                  ./your_program
 
 The plugin name before the comma is followed by ``key=value`` pairs
@@ -52,10 +52,12 @@ Output destination
    Basename for the trace files.  Default ``champsim_tracer_out``.
    The plugin writes:
 
-   * ``<basename>.cst`` — the binary trace.  *The ``.cst`` suffix is
-     appended unconditionally even if you already included one in*
-     ``basename`` *— so* ``outfile=run.cst`` *produces*
-     ``run.cst.cst``.  Use a bare basename to avoid surprise.
+   * ``<basename>.cst`` — the binary trace.  A trailing ``.cst`` in
+     the user-supplied basename is stripped before the suffix is
+     appended, so ``outfile=run`` and ``outfile=run.cst`` both produce
+     ``run.cst``.  In simpoint mode the per-segment files are named
+     ``<basename>_sp<index>.cst`` (the trailing ``.cst`` on the user
+     basename is also stripped for these).
    * ``<basename>.unknown_warnings.log`` — sidecar with one line per
      Capstone-emitted instruction the per-ISA classifier didn't
      recognize.  Empty when the classification table covers your
@@ -106,6 +108,24 @@ icount range in the per-segment statistics summary).
    simpoint file — a 100 M-interval simpoint file with this option
    set to 10 M would carve windows at 1/10 the intended boundaries.
 
+``warmup=<insns>``
+   Number of instructions to trace *before* each simpoint position so
+   downstream simulators can prime their caches and branch predictors
+   on real upstream behaviour before the evaluation window opens.
+   Default ``0``.  Only consulted in simpoint mode.  The effective
+   segment start becomes ``max(0, sp->start_insn - warmup)``; the
+   header records the actual warmup-length as ``warmup_insns`` so
+   consumers can split the trace at that offset.
+
+``simulation=<insns>``
+   Number of instructions to trace *at and after* each simpoint
+   position (the evaluation window).  Default ``0``, which falls back
+   to the legacy ``simpoint_interval`` length.  When set explicitly,
+   each simpoint segment runs ``warmup + simulation`` instructions
+   total: a ``warmup=100000000,simulation=100000000`` run on a
+   simpoint at icount 100 M produces a single segment covering the
+   instruction range ``[0, 200 M)``.
+
 Wrong-path simulation
 ~~~~~~~~~~~~~~~~~~~~~
 
@@ -118,14 +138,14 @@ Wrong-path simulation
    ``cpu_plugin_exec_tb`` calls happen.  Useful when you only want a
    CP trace for a non-speculative simulator.
 
-``depth=<insns>``
+``wpdepth=<insns>``
    Wrong-path *budget* in speculative instructions per branch.
    Default ``64``.  The WP simulator stops the speculative chain as
-   soon as ``sim_insns >= depth`` *and* the in-flight WP basic block
-   has finished (i.e., the loop won't truncate a BB mid-flight).
+   soon as ``sim_insns >= wpdepth`` *and* the in-flight WP basic
+   block has finished (i.e., the loop won't truncate a BB mid-flight).
    Bigger values give a longer speculative shadow per branch but
    linearly increase runtime on misprediction-heavy workloads —
-   doubling ``depth`` roughly doubles the WP work.  Setter rejects
+   doubling ``wpdepth`` roughly doubles the WP work.  Setter rejects
    non-positive values.
 
 Capture flags

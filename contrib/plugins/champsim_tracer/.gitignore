@@ -1,0 +1,5 @@
+# cffi build cache for the cst_audit body walker (generated on first
+# run from _cst_audit_walker.c; the .so / .o vary by Python version
+# and host, so they don't belong in version control).
+__cffi_cache__/
+__pycache__/

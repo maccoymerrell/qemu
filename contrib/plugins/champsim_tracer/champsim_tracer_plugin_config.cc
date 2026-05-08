@@ -12,10 +12,10 @@
 
 namespace {
 
-bool set_depth(PluginConfig *cfg, const char *v)
+bool set_wpdepth(PluginConfig *cfg, const char *v)
 {
-    cfg->depth = atoi(v);
-    return cfg->depth > 0;
+    cfg->wp_depth = atoi(v);
+    return cfg->wp_depth > 0;
 }
 
 bool set_outfile(PluginConfig *cfg, const char *v)
@@ -121,13 +121,25 @@ bool set_iframe_rate(PluginConfig *cfg, const char *v)
     return true;
 }
 
+bool set_warmup(PluginConfig *cfg, const char *v)
+{
+    cfg->warmup_insns = g_ascii_strtoull(v, nullptr, 10);
+    return true;
+}
+
+bool set_simulation(PluginConfig *cfg, const char *v)
+{
+    cfg->simulation_insns = g_ascii_strtoull(v, nullptr, 10);
+    return true;
+}
+
 typedef bool (*OptionSetter)(PluginConfig *cfg, const char *value);
 
 const struct {
     const char  *name;
     OptionSetter setter;
 } options[] = {
-    { "depth",      set_depth      },
+    { "wpdepth",    set_wpdepth    },
     { "outfile",    set_outfile    },
     { "outpipe",    set_outpipe    },
     { "wp",         set_wp         },
@@ -143,6 +155,8 @@ const struct {
     { "wp_regdata", set_wp_regdata },
     { "histogram",  set_histogram  },
     { "iframe_rate", set_iframe_rate },
+    { "warmup",     set_warmup     },
+    { "simulation", set_simulation },
     { nullptr, nullptr },
 };
 

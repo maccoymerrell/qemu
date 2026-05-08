@@ -42,16 +42,37 @@ suspect a bytes-on-wire difference but can't see it in ``cst_audit``.
 Library API
 ~~~~~~~~~~~
 
-The public entry point is a single function — the decoder reads the
-whole trace into memory and returns three lists in one call.  There
-is no incremental / streaming API today; if you need one, the
-function's body is a straight-line read against ``ByteReader`` and
-can be adapted.
+The decoder offers two entry points with the same shape.  Use the
+streaming form for real workloads — multi-GB ``.cst`` files easily
+exceed available RAM, and the streamer's iterator yields one entry
+at a time so memory stays O(1) in entry count.  The eager form is
+provided for short fixtures and tests.
+
+.. py:function:: iter_decode_champsim_tracer(bin_path)
+
+   Streaming decoder.  Reads the trailer, header, and templates up
+   front, then returns an iterator that yields body entries one at a
+   time as it walks the body section on the fly.  This is the
+   correct API for production traces: peak memory is bounded by the
+   templates section, regardless of how many body records the trace
+   contains.
+
+   :param bin_path: ``pathlib.Path`` to a ``.cst`` trace.
+   :returns: ``tuple[dict, list[dict], Iterator[dict]]`` —
+       ``(meta, templates, entry_iter)``.  The iterator captures the
+       file's mmap; consume it (or let it go out of scope) before
+       the trace file is unlinked.
+   :raises ValueError: same trailer / offset checks as
+       :func:`decode_champsim_tracer`.
 
 .. py:function:: decode_champsim_tracer(bin_path)
 
-   Reads the trailer, header, templates, and entire body of
-   ``bin_path`` and returns a 3-tuple ``(meta, templates, entries)``.
+   Eager decoder.  Convenience wrapper that materializes every body
+   entry into a list and returns it alongside the meta + templates.
+   Holds the whole body in memory; OOMs on traces of even moderate
+   size.  Useful for unit tests against tiny fixtures and for code
+   that wants to make multiple passes over the entries without
+   re-reading the file.
 
    :param bin_path: ``pathlib.Path`` to a ``.cst`` trace.
    :returns: ``tuple[dict, list[dict], list[dict]]``

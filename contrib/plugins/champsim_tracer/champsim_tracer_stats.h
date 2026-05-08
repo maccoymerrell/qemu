@@ -2,9 +2,11 @@
  * Wrong-Path Tracing Plugin — exit-time statistics.
  *
  * Plain aggregate of plugin-wide counters.  Producers update fields
- * directly; the exit handler in tracer.cc walks them when it formats
- * the summary.  No locking — increments are racy and approximate, which
- * is the same behavior the previous loose stat_* globals had.
+ * directly via the calling thread's per-thread instance (g_stats_tls);
+ * the exit handler in tracer.cc reads stats_snapshot() to obtain a
+ * coherent process-wide aggregate by summing across every vCPU
+ * thread that has registered.  No locks on the hot bump path; the
+ * sum is computed once at exit-time under stats_registry_lock.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -92,14 +94,37 @@ static inline void stats_diff(Stats *out, const Stats &a, const Stats &b)
     }
 }
 
-extern Stats g_stats;
+/*
+ * Per-thread accumulator accessor.  Returns the calling thread's
+ * Stats slot, lazily registering it on first call.  All hot-path
+ * bumps go through here via the g_stats macro: no atomics, no locks
+ * on the bump path; only thread-local memory is touched.  The
+ * registry is acquired under a mutex exactly once per thread (at
+ * first touch) and again at thread exit (to fold the contributions
+ * into a graveyard) — both off the hot path.
+ */
+Stats &thread_stats_get();
+
+/* Hot-path callers write `g_stats.foo++` and the macro forwards to
+ * the per-thread slot.  Read-side aggregation is via stats_snapshot()
+ * below; never read `g_stats` directly when you need a process-wide
+ * total. */
+#define g_stats (::thread_stats_get())
+
+/* Read-side: returns a Stats value summing every live thread's slot
+ * plus contributions from threads that have already exited.
+ * Acquires the registry mutex briefly; the bump path is unaffected.
+ * Call from per-segment summary and at plugin_exit. */
+Stats stats_snapshot();
 
 /* Histogram bucket pointer for the currently-executing TB.  Refreshed
  * at the top of vcpu_tb_exec from the current icount; null when
  * histograms are disabled or no segment is active.  CP and WP
- * attribution sites mirror their g_stats bumps into *g_current_hist_bucket
- * when non-null.  See start_trace_segment / select_histogram_bucket
- * in champsim_tracer.cc. */
+ * attribution sites mirror their g_stats_tls bumps into
+ * *g_current_hist_bucket when non-null.  See start_trace_segment /
+ * select_histogram_bucket in champsim_tracer.cc.  Histogram bucket
+ * memory is owned by the segment, not per-thread; under exec_lock
+ * (which serializes the only writers), so no separate aggregation. */
 extern Stats *g_current_hist_bucket;
 
 #endif /* CHAMPSIM_TRACER_STATS_H */

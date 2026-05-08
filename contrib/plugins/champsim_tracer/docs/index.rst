@@ -35,6 +35,7 @@ record stream or prints a byte-budget breakdown of where bytes go.
    :caption: Internals
 
    architecture
+   qemu_modifications
    extending
 
 .. toctree::

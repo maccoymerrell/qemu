@@ -9,6 +9,7 @@
 #include <stdlib.h>
 
 #include "champsim_tracer.h"
+#include "champsim_tracer_reg_handle_cache.h"
 #include "champsim_tracer_stats.h"
 
 /*
@@ -80,6 +81,47 @@ static inline const QemuRegKey *qemu_reg_for_generic(uint8_t gen_id)
     }
     const QemuRegKey *k = &g_qemu_reg_by_gen[gen_id];
     return qemu_reg_key_valid(k) ? k : nullptr;
+}
+
+void capture_initial_regfile(unsigned int cpu_index,
+                             std::vector<InitialRegSnap> *out)
+{
+    if (!out) {
+        return;
+    }
+    out->clear();
+    g_autoptr(GByteArray) buf = g_byte_array_new();
+    for (unsigned i = 0; i < REG_ID_COUNT; i++) {
+        const QemuRegKey *key = qemu_reg_for_generic((uint8_t)i);
+        if (!key) {
+            continue;
+        }
+        InitialRegSnap snap;
+        snap.gen_id = (uint8_t)i;
+        snap.width_bytes = 0;
+        memset(snap.bytes, 0, sizeof(snap.bytes));
+
+        /* No vCPU context yet (install-time start_trace_segment): pin
+         * the generic ID without a live value.  Decoder still gets the
+         * (gen_id, name) mapping, just with width_bytes=0. */
+        if (cpu_index != (unsigned int)-1) {
+            struct qemu_plugin_register *handle =
+                g_reg_handle_cache.lookup(cpu_index, key);
+            if (handle) {
+                g_byte_array_set_size(buf, 0);
+                int n = qemu_plugin_read_register(handle, buf);
+                if (n > 0) {
+                    size_t w = (size_t)n;
+                    if (w > CST_MAX_WIDE_BYTES) {
+                        w = CST_MAX_WIDE_BYTES;
+                    }
+                    snap.width_bytes = (uint8_t)w;
+                    memcpy(snap.bytes, buf->data, w);
+                }
+            }
+        }
+        out->push_back(snap);
+    }
 }
 
 static inline void add_src_reg(InsnFields *f, InsnRegNames *refs,

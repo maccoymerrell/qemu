@@ -193,11 +193,34 @@ static void write_encoding_map(BitWriter *bw, const char *map_name,
     }
 }
 
+/* Per-segment initial register-file snapshot, indexed by GenericRegId.
+ * write_reg_encoding_map appends each entry's value to its (id, name)
+ * pair so consumers can prime register state from the header alone.
+ * Built by capture_initial_regfile() at segment start. */
+static const std::vector<InitialRegSnap> *g_initial_regfile = nullptr;
+
+static const InitialRegSnap *find_initial_snap(uint8_t gen_id)
+{
+    if (!g_initial_regfile) {
+        return nullptr;
+    }
+    for (const InitialRegSnap &s : *g_initial_regfile) {
+        if (s.gen_id == gen_id) {
+            return &s;
+        }
+    }
+    return nullptr;
+}
+
 static void write_reg_encoding_map(BitWriter *bw)
 {
     /* Walk the full GenericRegId space.  generic_reg_name() returns
      * NULL for unallocated holes; valid IDs (the dense banks plus all
-     * specials) get their canonical name from the shared helper. */
+     * specials) get their canonical name from the shared helper.  Each
+     * entry carries its initial value (width_bytes + LE bytes); a
+     * zero width means "no live snapshot for this ID at segment
+     * start" (e.g. install-time pre-vCPU start, or a register the
+     * plugin couldn't resolve via the QEMU register API). */
     bw_write_string(bw, "reg");
     uint64_t n = 0;
     for (unsigned i = 0; i < REG_ID_COUNT; i++) {
@@ -206,8 +229,15 @@ static void write_reg_encoding_map(BitWriter *bw)
     bw_write_uleb128(bw, n);
     for (unsigned i = 0; i < REG_ID_COUNT; i++) {
         const char *name = generic_reg_name(i);
-        if (name) {
-            write_encoding_entry(bw, i, name);
+        if (!name) {
+            continue;
+        }
+        write_encoding_entry(bw, i, name);
+        const InitialRegSnap *s = find_initial_snap((uint8_t)i);
+        uint8_t width = s ? s->width_bytes : 0;
+        bw_write_u8(bw, width);
+        if (width) {
+            bw_raw(bw, s->bytes, width);
         }
     }
 }
@@ -1748,7 +1778,11 @@ static void emit_field_delta_section(BitWriter *main_bw,
 
 /* ========================= Body stream ========================= */
 
-BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime)
+BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
+                                 uint64_t start_insn,
+                                 uint64_t warmup_insns,
+                                 uint64_t total_target_insns,
+                                 const std::vector<InitialRegSnap> *regfile)
 {
     BodyStreamState *st = g_new0(BodyStreamState, 1);
 
@@ -1766,6 +1800,26 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime)
     }
     bw_write_u8(&st->bw, flags);
     st->header_flags = flags;
+
+    /* Segment instruction-window descriptors:
+     *   start_insn          : architectural icount where this segment
+     *                         begins.  Lets consumers anchor body
+     *                         records to a global insn timeline.
+     *   warmup_insns        : insns at the start of this trace meant
+     *                         to prime caches/predictors and not be
+     *                         evaluated.  Zero for non-simpoint runs.
+     *   total_target_insns  : the configured length of the segment.
+     *                         simpoint mode = warmup + simulation;
+     *                         non-simpoint with explicit stop =
+     *                         stop - start; non-simpoint without an
+     *                         explicit stop = 0 (meaning unbounded:
+     *                         the trace runs until process exit).
+     *                         This is the targeted value, not the
+     *                         observed one — overshoot due to TB
+     *                         granularity is not reflected here. */
+    bw_write_uleb128(&st->bw, start_insn);
+    bw_write_uleb128(&st->bw, warmup_insns);
+    bw_write_uleb128(&st->bw, total_target_insns);
 
     {
         const char *cmd = qemu_command_line ? qemu_command_line : "";
@@ -1792,7 +1846,9 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime)
         bw_write_bytes(&st->bw, (const uint8_t *)tname, len);
     }
 
+    g_initial_regfile = regfile;
     write_header_encoding_maps(&st->bw);
+    g_initial_regfile = nullptr;
 
     bw_byte_align(&st->bw);
     bw_flush(&st->bw);

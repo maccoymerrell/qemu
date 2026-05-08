@@ -65,6 +65,8 @@ bool enable_reg_data = false;
 bool enable_wp_mem_data = false;
 bool enable_wp_reg_data = false;
 uint32_t iframe_rate = 0;
+uint64_t warmup_insns = 0;
+uint64_t simulation_insns = 0;
 
 /* ========================= Thread ID assignment ========================= */
 
@@ -343,20 +345,92 @@ static void append_histogram(GString *report, const char *segment_label,
                              uint64_t segment_start,
                              uint64_t interval_size);
 
-static void start_trace_segment(const char *label,
-                                uint64_t start, uint64_t stop)
+/*
+ * Drop every piece of plugin-side state that could leak across a
+ * segment boundary, so each per-simpoint .cst file is standalone-
+ * decodable without depending on values established in a prior
+ * segment.  Called at segment start, after the prior segment's
+ * finish_trace_segment has already drained pending CP body entries.
+ *
+ * What we reset and why:
+ *   - True-BB template cache (g_bb_template_cache.bb_map_): the
+ *     per-segment template dictionary is built from this map, so
+ *     clearing it gives each segment a clean dictionary covering
+ *     only the BBs reached after the reset.  Per-TB fragments
+ *     (tb_map_) are intentionally preserved: QEMU only fires
+ *     vcpu_tb_trans on a TB's first translation, so dropping
+ *     fragments would orphan the chain assembler the next time a
+ *     previously-translated TB executes.  True-BBs are re-assembled
+ *     at runtime by BBChainAssembler from those fragments anyway.
+ *   - Per-template IFRAME cadence (BBTemplate.emit_count) on the
+ *     surviving tb_map_ entries: drives the iframe_rate-th emission
+ *     trigger.  Without the reset a segment that begins mid-cadence
+ *     would emit IFRAMEs at positions a standalone run wouldn't.
+ *   - In-flight CP basic-block assembly (g_cp_chain): a partial
+ *     chain started before the segment boundary and finalized after
+ *     would splice fragments from before+after together.
+ *   - In-flight memops (g_mem_recorder.cp): same rationale; WP is
+ *     transient and always drained at the end of each WP simulation.
+ *   - Thread-local pending dst register snaps: captured by the per-
+ *     insn callback for the next BB; if the prior segment didn't
+ *     flush them (e.g. the segment ended on a snap-capturing TB),
+ *     they'd attach to the new segment's first body entry.
+ *   - Per-vCPU thread-id assignment counter: thread_id 0 is the
+ *     first vCPU observed in this segment, regardless of which one
+ *     the prior segment last saw.
+ *
+ * The persistent FieldStateTable overlays inside BodyStreamState are
+ * already fresh per segment (a new BodyStreamState is created in
+ * body_stream_new on every open), so delta values in segment N are
+ * encoded against a "nothing observed" baseline regardless of N-1.
+ */
+static void reset_segment_local_state(void)
 {
-    g_trace_segments.start(label, start, stop);
+    g_mutex_lock(&data_lock);
+    /* Clearing bb_map_ also drops the old BBTemplates carrying their
+     * accumulated emit_count; the next commit_true_bb rebuilds each
+     * one zero-initialized (g_new0), so the IFRAME cadence implicitly
+     * resets without a separate emit_count walk. */
+    g_bb_template_cache.clear_bb_map();
+    g_cp_chain.reset();
+    g_mem_recorder.clear_cp();
+    pending_reg_snaps.clear();
+    g_mutex_unlock(&data_lock);
+
     cpu_to_thread_id.clear();
     next_thread_id = 0;
+}
+
+static void start_trace_segment(const char *label,
+                                uint64_t start, uint64_t stop,
+                                uint64_t warmup,
+                                uint64_t total_target,
+                                unsigned int cpu_index)
+{
+    reset_segment_local_state();
+
+    /* Capture the architectural register file at segment start so the
+     * header's "reg" encoding-map carries each generic ID's initial
+     * value.  Lets consumers prime register state without depending
+     * on a prior segment's final dst-write deltas to reveal values.
+     * cpu_index == (unsigned)-1 means "no vCPU context yet" (the
+     * install-time start=0 path); the snapshot is empty in that case
+     * and the dst-write stream is the only state source. */
+    std::vector<InitialRegSnap> regfile;
+    capture_initial_regfile(cpu_index, &regfile);
+
+    g_trace_segments.start(label, start, stop, warmup, total_target, &regfile);
 
     uint64_t span = stop > start ? stop - start : 0;
     progress_step = span >= 10 ? span / 10 : 1;
     progress_next = start + progress_step;
 
     /* Snapshot the cumulative stats so the matching finish_trace_segment
-     * can compute "this segment's contribution" via stats_diff(). */
-    segment_start_stats = g_stats;
+     * can compute "this segment's contribution" via stats_diff().
+     * stats_snapshot() folds every thread's per-thread slot plus the
+     * graveyard from any thread that has exited, so the diff is a
+     * true global delta even on multi-vCPU runs. */
+    segment_start_stats = stats_snapshot();
     g_free(segment_label);
     segment_label = g_strdup(label ? label : "trace");
 
@@ -378,10 +452,17 @@ static void start_trace_segment(const char *label,
     }
     g_current_hist_bucket = nullptr;
 
-    fprintf(stderr,
-            "champsim_tracer: starting segment '%s' "
-            "[icount %" PRIu64 " .. %" PRIu64 "]\n",
-            label ? label : "trace", start, stop);
+    if (stop == UINT64_MAX) {
+        fprintf(stderr,
+                "champsim_tracer: starting segment '%s' "
+                "[icount %" PRIu64 " .. unbounded]\n",
+                label ? label : "trace", start);
+    } else {
+        fprintf(stderr,
+                "champsim_tracer: starting segment '%s' "
+                "[icount %" PRIu64 " .. %" PRIu64 "]\n",
+                label ? label : "trace", start, stop);
+    }
 }
 
 /* Pick the bucket matching @icount; null when histograms are disabled
@@ -522,18 +603,27 @@ static void flush_pending_final_body_entry(void)
  */
 static void finish_trace_segment(void)
 {
-    fprintf(stderr,
-            "champsim_tracer: finished segment [icount %" PRIu64
-            " .. %" PRIu64 "]\n",
-            g_trace_segments.window_start(),
-            g_trace_segments.window_stop());
+    {
+        uint64_t lo = g_trace_segments.window_start();
+        uint64_t hi = g_trace_segments.window_stop();
+        if (hi == UINT64_MAX) {
+            fprintf(stderr,
+                    "champsim_tracer: finished segment [icount %"
+                    PRIu64 " .. unbounded]\n", lo);
+        } else {
+            fprintf(stderr,
+                    "champsim_tracer: finished segment [icount %"
+                    PRIu64 " .. %" PRIu64 "]\n", lo, hi);
+        }
+    }
     g_trace_segments.finish(flush_pending_final_body_entry);
 
     /* Per-segment stats: diff against the snapshot taken at segment
      * start, format with the segment label, hand to the plugin
      * diagnostic stream. */
     Stats seg_stats;
-    stats_diff(&seg_stats, g_stats, segment_start_stats);
+    Stats now = stats_snapshot();
+    stats_diff(&seg_stats, now, segment_start_stats);
     g_autoptr(GString) report = g_string_new("");
     g_autofree char *label = g_strdup_printf("Segment '%s'",
                                              segment_label ? segment_label
@@ -736,12 +826,30 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         }
         if (!g_trace_segments.is_active()) {
             if (const SimPointEntry *sp = g_simpoints.current()) {
-                if (icount_prev >= sp->start_insn &&
-                    icount_prev <  sp->stop_insn) {
-                    g_trace_segments.set_window(sp->start_insn, sp->stop_insn);
+                /* Effective window: warmup before the simpoint position,
+                 * simulation_insns at-and-after.  When simulation_insns
+                 * is zero the legacy sp->stop_insn (start + interval) is
+                 * preserved for backwards-compatible runs.  warmup_insns
+                 * underflow at the head of the trace is clamped to 0. */
+                uint64_t eff_start = (sp->start_insn > warmup_insns)
+                    ? sp->start_insn - warmup_insns : 0;
+                uint64_t eff_stop = simulation_insns
+                    ? sp->start_insn + simulation_insns
+                    : sp->stop_insn;
+                if (icount_prev >= eff_start &&
+                    icount_prev <  eff_stop) {
+                    g_trace_segments.set_window(eff_start, eff_stop);
                     g_autofree char *label = g_strdup_printf(
                         "sp%zu", g_simpoints.current_index());
-                    start_trace_segment(label, sp->start_insn, sp->stop_insn);
+                    /* warmup_insns saturates against eff_start so the
+                     * header reports the actual number of pre-simpoint
+                     * insns we'll trace, not the configured budget. */
+                    uint64_t hdr_warmup = sp->start_insn > eff_start
+                        ? sp->start_insn - eff_start : 0;
+                    start_trace_segment(label, eff_start, eff_stop,
+                                        hdr_warmup,
+                                        /* total_target= */ eff_stop - eff_start,
+                                        cpu_index);
                 }
             } else {
                 g_trace_segments.set_shutting_down();
@@ -753,9 +861,15 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         if (!g_trace_segments.is_active() &&
             icount_prev >= g_trace_segments.window_start() &&
             icount_prev <  g_trace_segments.window_stop()) {
-            start_trace_segment("trace",
-                                g_trace_segments.window_start(),
-                                g_trace_segments.window_stop());
+            uint64_t lo = g_trace_segments.window_start();
+            uint64_t hi = g_trace_segments.window_stop();
+            /* Non-simpoint mode: header total is the configured
+             * (stop - start) when stop was specified, or 0 ("unbounded
+             * — runs until process exit") when stop defaulted to
+             * UINT64_MAX. */
+            uint64_t total_target = (hi == UINT64_MAX) ? 0 : hi - lo;
+            start_trace_segment("trace", lo, hi,
+                                /* warmup= */ 0, total_target, cpu_index);
         }
         if (g_trace_segments.is_active() &&
             icount_prev >= g_trace_segments.window_stop()) {
@@ -1484,7 +1598,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     g_autoptr(GString) report = g_string_new("");
 
     g_mutex_lock(&data_lock);
-    append_stats_summary(report, "Cumulative", g_stats);
+    append_stats_summary(report, "Cumulative", stats_snapshot());
     if (g_simpoints.is_active()) {
         g_string_append_printf(report,
             "SimPoints loaded/traced: %zu / %zu\n\n",
@@ -1586,7 +1700,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      * String fields with long-term lifetime (program_name, comment,
      * simpoints file) transfer out of cfg; the remaining strings are
      * freed by plugin_config_free below. */
-    max_wrong_path_depth = cfg.depth;
+    max_wrong_path_depth = cfg.wp_depth;
     enable_wrong_path    = cfg.enable_wp;
     enable_mem_data      = cfg.enable_mem_data;
     enable_reg_data      = cfg.enable_reg_data;
@@ -1599,6 +1713,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         ? (unsigned int)cfg.histogram_intervals : 0;
     iframe_rate         = cfg.iframe_rate;
     simpoint_interval_insns = cfg.simpoint_interval;
+    warmup_insns        = cfg.warmup_insns;
+    simulation_insns    = cfg.simulation_insns;
 
     program_name        = cfg.program_name;    cfg.program_name = nullptr;
     trace_comment       = cfg.comment;         cfg.comment = nullptr;
@@ -1656,7 +1772,15 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     build_qemu_reg_reverse_index();
 
     if (!g_simpoints.is_active() && trace_start_insn == 0) {
-        start_trace_segment("trace", 0, trace_stop_insn);
+        /* No vCPU context yet at install-time; capture an empty
+         * initial regfile.  The (id->name) mapping is still pinned
+         * in the header, just without live values.  Header total is
+         * 0 (unbounded) when no explicit stop was given. */
+        uint64_t total_target =
+            (trace_stop_insn == UINT64_MAX) ? 0 : trace_stop_insn;
+        start_trace_segment("trace", 0, trace_stop_insn,
+                            /* warmup= */ 0, total_target,
+                            /* cpu_index= */ (unsigned int)-1);
     }
 
 

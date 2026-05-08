@@ -84,6 +84,17 @@ public:
      * normalization the branch is always the last instruction. */
     static int template_branch_index(const BBTemplate *tmpl);
 
+    /* Drop all true-BB templates so the next segment serializes a
+     * dictionary that only covers BBs reached after this point.
+     * tb_map_ (per-TB fragments) is intentionally preserved: QEMU
+     * issues vcpu_tb_trans only on first translation of each TB, so
+     * dropping fragments would orphan the chain assembler the next
+     * time a previously-translated TB executes.  True-BBs are re-
+     * assembled at runtime by BBChainAssembler from those fragments,
+     * so clearing bb_map_ alone is safe and gives each segment a
+     * clean template dictionary. */
+    void clear_bb_map();
+
 private:
     std::unordered_map<uint64_t, BBTemplatePtr> tb_map_;
     std::unordered_map<uint64_t, BBTemplatePtr> bb_map_;

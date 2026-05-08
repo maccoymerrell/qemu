@@ -50,6 +50,11 @@ size_t BBTemplateCache::tb_count() const
     return tb_map_.size();
 }
 
+void BBTemplateCache::clear_bb_map()
+{
+    bb_map_.clear();
+}
+
 size_t BBTemplateCache::bb_count() const
 {
     return bb_map_.size();

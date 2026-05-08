@@ -250,6 +250,20 @@ typedef struct {
 } RegSnap;
 
 /*
+ * Architectural-register snapshot at segment start.  Captured once per
+ * trace segment by walking the GenericRegId reverse index and reading
+ * each resolvable register's value via the QEMU plugin API.  Emitted in
+ * the per-segment header (extending the "reg" encoding-map entries
+ * with a width-prefixed value blob).  Width 0 means "no live value
+ * captured" (unresolved register or no vCPU context yet).
+ */
+typedef struct {
+    uint8_t gen_id;
+    uint8_t width_bytes;                  /* 0..CST_MAX_WIDE_BYTES */
+    uint8_t bytes[CST_MAX_WIDE_BYTES];    /* little-endian          */
+} InitialRegSnap;
+
+/*
  * Per-insn QEMU register descriptor keys for InsnFields.src_regs[] and
  * InsnFields.dst_regs[].  A NULL name means the corresponding generic
  * register has no single QEMU register that can be read directly.
@@ -497,6 +511,14 @@ extern char *trace_comment;
  * ENTRY of the same template.  0 disables the feature. */
 extern uint32_t iframe_rate;
 
+/* Simpoint windowing.  warmup_insns is the number of instructions
+ * traced BEFORE each simpoint position; simulation_insns is the
+ * number traced AT-AND-AFTER it.  Both are zero outside simpoint mode
+ * and propagate into the per-segment header for downstream consumers
+ * that need to split warmup vs evaluation regions. */
+extern uint64_t warmup_insns;
+extern uint64_t simulation_insns;
+
 /* Synchronization & diagnostics.  GMutex stays (rather than
  * std::mutex) because <mutex>'s transitive include chain pulls
  * <cctype> -> <ctype.h>, and QEMU's include/qemu/ctype.h shadows the
@@ -550,8 +572,24 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                                unsigned int cpu_index);
 #endif
 
+/*
+ * Walk the GenericRegId reverse index and fill @out with one
+ * InitialRegSnap per resolvable architectural register, reading values
+ * from @cpu_index via the QEMU plugin API.  When @cpu_index is
+ * (unsigned int)-1 (no vCPU context yet at install-time), every entry
+ * is emitted with width_bytes=0 — the segment header still pins down
+ * which generic IDs exist on this target, just without live values.
+ * Defined in champsim_tracer_decode.cc.
+ */
+void capture_initial_regfile(unsigned int cpu_index,
+                             std::vector<InitialRegSnap> *out);
+
 /* Defined in champsim_tracer_output.cc */
-BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime);
+BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
+                                 uint64_t start_insn,
+                                 uint64_t warmup_insns,
+                                 uint64_t total_target_insns,
+                                 const std::vector<InitialRegSnap> *regfile);
 void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry);
 void body_stream_finish(BodyStreamState *st);
 

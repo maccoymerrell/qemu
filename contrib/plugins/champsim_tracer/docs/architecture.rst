@@ -5,6 +5,49 @@ This page describes how ChampSim Tracer is organized, the two main flow
 loops (CP and WP), and the caveats every prospective modifier needs
 to know.
 
+.. _tb-vs-true-bb:
+
+Translation blocks (TBs) vs true basic blocks (true BBs)
+--------------------------------------------------------
+
+Two block flavours appear throughout this codebase, and they are
+*not* interchangeable.
+
+**Translation block (TB)** is QEMU's unit of translation.  When TCG
+encounters a guest PC it hasn't translated yet, it emits a single TB
+covering the run of instructions starting there until it hits an
+artificial stop condition: a branch, an instruction-count limit, a
+page boundary, a side-exit hint, or simply a TCG ``goto_tb`` chain
+break.  TBs are *not* basic blocks — a single architectural basic
+block can be split across two or more TBs (the most common cause is
+the page-boundary check), and TBs are keyed in QEMU's translation
+cache by ``(pc, cs_base, flags, cflags)`` so the same code at the
+same PC can have multiple distinct translations alive at once.  The
+plugin sees one TB per ``vcpu_tb_trans`` callback, with one
+``vcpu_tb_exec`` per execution.  TBs we've observed are stored in
+``tb_map_`` (the *fragment* cache), keyed by TB start_pc.
+
+**True basic block (true BB)** is the program-architectural unit:
+the run of instructions from a branch target up to and including the
+next branch, with no internal control-flow joins or splits.  A true
+BB is what the trace's templates section dumps and what every body
+``ENTRY`` record references.  The plugin builds true BBs at runtime
+inside ``BBChainAssembler``: each ``vcpu_tb_exec`` appends the
+just-executed TB's fragment to the chain, and when the TB ends in a
+branch the chain is sealed via ``commit_true_bb`` into ``bb_map_``
+(the *true-BB* cache, keyed by the branch-target PC of the BB's
+entry).  This is the cache whose contents are renumbered into
+template IDs and serialized to the trace.
+
+The user-visible difference: ``tb_count`` is roughly the number of
+distinct ``(pc, flags)`` translations QEMU produced for the run,
+while ``bb_count`` (the ``BB templates created`` line in the
+exit-time summary) is the number of architectural basic blocks the
+trace describes.  Per-segment resets clear ``bb_map_`` only —
+``tb_map_`` survives because QEMU only fires ``vcpu_tb_trans`` on a
+TB's first translation, and dropping our fragment record without a
+re-translation hook would orphan the chain assembler.
+
 Subsystem map
 -------------
 
@@ -292,10 +335,20 @@ those PCs* don't change (no SMC); whether the TB extends 5 or 8 insns
 before the boundary doesn't change which PCs are part of the BB,
 because the BB is bounded by the next branch.
 
-*Stats are racy and approximate.*  ``g_stats`` increments are not
-atomic; histogram-bucket increments are not atomic.  We trade
-correctness-in-the-large for throughput.  Treat the printed numbers
-as engineering-grade, not audit-grade.
+*Stats are exact, lock-free on the bump path.*  ``g_stats`` is a macro
+that forwards to a per-thread heap-allocated ``Stats`` slot via
+``thread_stats_get()``.  Bumps touch only thread-local memory, no
+atomics, no locks.  ``stats_snapshot()`` produces a coherent
+process-wide aggregate by walking a registry of every thread's slot
+under ``stats_registry_lock`` (acquired exactly once per thread at
+first touch, again at thread exit, and from each read site —
+segment-summary points and ``plugin_exit``).  Threads that exit before
+``plugin_exit`` fold their slot into a graveyard accumulator on TLS
+destruction so their contributions still appear in the final total.
+
+Histogram bucket increments are not atomic and don't need to be:
+``g_current_hist_bucket`` is mutated and read only under
+``exec_lock``, which the CP and WP attribution paths both hold.
 
 Histogram buckets
 -----------------

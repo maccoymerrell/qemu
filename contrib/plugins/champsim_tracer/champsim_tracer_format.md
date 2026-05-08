@@ -103,19 +103,36 @@ start of the file.
 
 ```
 +--------------------------------------------------+
-| magic          u32  = 0x19545343                 |
-| isa            u8   TraceISA                     |
-| flags          u8   CST_FLAG_* bits              |
+| magic               u32  = 0x19545343            |
+| isa                 u8   TraceISA                |
+| flags               u8   CST_FLAG_* bits         |
+| start_insn          ULEB                         |
+| warmup_insns        ULEB                         |
+| total_target_insns  ULEB                         |
 +--------------------------------------------------+
-| command        string                            |
-| datetime       string                            |
-| comment        string                            |
-| target_name    string                            |
+| command             string                       |
+| datetime            string                       |
+| comment             string                       |
+| target_name         string                       |
 +--------------------------------------------------+
 | encoding_maps_section                            |
 |   section := len:ULEB payload[len]               |
 +--------------------------------------------------+  body_off
 ```
+
+`start_insn` is the architectural instruction count at which this
+segment begins, anchoring the body records to a global instruction
+timeline.  `warmup_insns` is the number of instructions at the front
+of the trace meant to prime caches and branch predictors and not be
+evaluated; it is zero outside simpoint mode and on simpoint runs with
+no warmup configured.  `total_target_insns` is the configured length
+of the segment — `warmup_insns + simulation_insns` for simpoint
+segments, or `stop - start` for non-simpoint runs with an explicit
+stop.  A value of zero means "unbounded" (non-simpoint runs with no
+explicit stop trace until the program exits, so the targeted total is
+not known at header-write time).  These three values describe the
+*targeted* window; the actually-emitted record count may overshoot by
+a single TB due to translation-block granularity.
 
 `body_off` is stored in the trailer. A decoder can therefore verify that
 it consumed the full header before starting the body stream.
@@ -138,7 +155,21 @@ encoding_maps_section payload:
     repeat n_entries times:
       value   : ULEB         numeric value stored elsewhere in the trace
       name    : string       example: "REG_ZERO"
+
+      // The "reg" map adds an initial-value suffix per entry,
+      // capturing the architectural register's value at segment
+      // start.  Other maps stop at (value, name).
+      if map_name == "reg":
+        width_bytes : u8       0..64; 0 = no live snapshot for this id
+        value_bytes : raw[width_bytes]   little-endian
 ```
+
+The `reg` map's per-entry initial-value suffix lets consumers prime
+register state from the segment header alone, without depending on
+destination-write deltas in the body stream to reveal pre-existing
+values.  `width_bytes == 0` means the plugin could not read the
+register on this target (or the segment opened before any vCPU was
+live, e.g. an install-time non-simpoint start).
 
 The writer currently emits these maps:
 

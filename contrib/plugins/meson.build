@@ -64,6 +64,36 @@ if get_option('plugins')
                        cpp_args: champsim_tracer_cpp_args,
                        dependencies: [glib, capstone])
   endif
+
+  # Offline trace tools.  cst_decode and cst_audit consume .cst files
+  # produced by the plugin; they share a small static library that
+  # parses the wire format (header / templates / body delta replay).
+  # No QEMU / glib dependency: the tools are self-contained C++17
+  # binaries built alongside the plugin so users get them in the same
+  # build directory.
+  cst_tools_common_sources = files(
+    'champsim_tracer/tools/cst_format.cc',
+    'champsim_tracer/tools/cst_decode.cc',
+  )
+  cst_tools_cpp_args = ['-std=gnu++17',
+                        '-Wno-missing-field-initializers']
+  cst_tools_common = static_library(
+    'cst_tools_common',
+    cst_tools_common_sources,
+    cpp_args: cst_tools_cpp_args,
+    install: false)
+  t += executable(
+    'cst_audit',
+    files('champsim_tracer/tools/cst_audit_main.cc'),
+    cpp_args: cst_tools_cpp_args,
+    link_with: cst_tools_common,
+    install: false)
+  t += executable(
+    'cst_decode',
+    files('champsim_tracer/tools/cst_decode_main.cc'),
+    cpp_args: cst_tools_cpp_args,
+    link_with: cst_tools_common,
+    install: false)
   endif
 endif
 if t.length() > 0

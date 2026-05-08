@@ -1,228 +1,93 @@
 Decoder and audit tools
 =======================
 
-The Python files alongside the plugin source give two ways to consume
-a ``.cst`` trace:
+Two offline consumers of a ``.cst`` trace, both C++ binaries built
+alongside the plugin.  ``ninja contrib-plugins`` produces them in
+``build/contrib/plugins/`` next to the ``.so`` itself.  Neither tool
+needs the QEMU plugin runtime — they read the wire format directly
+from the file.
 
-* :ref:`champsim_tracer_decode.py <decoder-api>` is a library + CLI
-  that yields structured records (templates, body entries, dynamic
-  fields).  Use this when you want to *do something* with the trace —
-  feed it into a simulator, validate per-instruction invariants, or
-  diff two traces.
+* :ref:`cst_decode <decoder-cc>` is the default decoder.  It emits a
+  greppable objdump-style disassembly to stdout; pass
+  ``--format=legacy`` to get the older block-formatted output that
+  diff-driven scripts (notably wptrace_genval) consume.
 
-* :ref:`cst_audit.py <audit-tool>` is a CLI that prints a byte-budget
-  breakdown of where bytes go (header, templates, CP body, WP body,
-  field-delta records, ...).  Use this when tuning trace size or
-  diagnosing where unexpected bytes accumulated.
+* :ref:`cst_audit <audit-cc>` prints a byte-budget breakdown of
+  where bytes go (header, templates, CP body, WP body, field-delta
+  records, ...).  Use it when tuning trace size or diagnosing where
+  unexpected bytes accumulated.
 
-Both scripts read directly from the canonical wire format described
-in :doc:`/format` and require no plugin build artifact.
+.. _decoder-cc:
 
-.. _decoder-api:
+cst_decode
+----------
 
-champsim_tracer_decode.py
--------------------------
-
-The decoder is a single self-contained module.  It can be imported as
-a library or run as ``python3 champsim_tracer_decode.py <trace.cst>``.
-
-CLI
-~~~
+Built by the same ``ninja contrib-plugins`` invocation that builds
+the plugin shared object.  Lands in
+``build/contrib/plugins/cst_decode``.
 
 .. code-block:: console
 
-   $ python3 champsim_tracer_decode.py trace.cst.cst > trace.txt
+   $ build/contrib/plugins/cst_decode trace.cst > trace.disasm
+   $ build/contrib/plugins/cst_decode --format=legacy trace.cst > trace.txt
 
-Renders a human-readable text dump of the trace: one line per template
-in the templates section, one block per body entry showing CP and WP
-sub-records with their dynamic field values resolved through the
-encoding maps.  Useful for diffing two traces (``diff -u``) when you
-suspect a bytes-on-wire difference but can't see it in ``cst_audit``.
+Two output formats:
 
-Library API
-~~~~~~~~~~~
+``--format=disasm`` (default)
+   objdump-style, one architectural instruction per line.  Format:
 
-The decoder offers two entry points with the same shape.  Use the
-streaming form for real workloads — multi-GB ``.cst`` files easily
-exceed available RAM, and the streamer's iterator yields one entry
-at a time so memory stays O(1) in entry count.  The eager form is
-provided for short fixtures and tests.
+   .. code-block:: text
 
-.. py:function:: iter_decode_champsim_tracer(bin_path)
+      0x7b559c7da96f: GEN_OP_LEA   REG_GPR11 <- REG_IP   ; tid=0 bb=98 REG_GPR11=0x7b559c7da8f9
+      0x7b559c7da976: GEN_OP_XOR   REG_GPR5,REG_FLAGS <- REG_GPR5   ; tid=0 bb=98 REG_GPR5=0x0 REG_FLAGS=0x0
+      0x7b559c7da978: GEN_OP_BRANCH REG_IP <- REG_IP,IMM(0x7b559c7da993)  ; tid=0 bb=98 br=BRANCH_DIRECT_JUMP REG_IP=0x0
 
-   Streaming decoder.  Reads the trailer, header, and templates up
-   front, then returns an iterator that yields body entries one at a
-   time as it walks the body section on the fly.  This is the
-   correct API for production traces: peak memory is bounded by the
-   templates section, regardless of how many body records the trace
-   contains.
+   Each line is self-contained: PC, opcode mnemonic (generic),
+   destination registers, source registers, immediate (when
+   present), and a trailing ``; metadata`` comment carrying the
+   thread id, basic-block id, branch type, sync hint, memory
+   operations (with effective addresses + optional data), and
+   destination register writes (post-execution snapshot).  Basic-
+   block boundaries are marked with a ``; ----- BB <id> entry pc=
+   ... -----`` separator; wrong-path chains use a ``; ..... wp[k]
+   BB <id> ...`` separator.
 
-   :param bin_path: ``pathlib.Path`` to a ``.cst`` trace.
-   :returns: ``tuple[dict, list[dict], Iterator[dict]]`` —
-       ``(meta, templates, entry_iter)``.  The iterator captures the
-       file's mmap; consume it (or let it go out of scope) before
-       the trace file is unlinked.
-   :raises ValueError: same trailer / offset checks as
-       :func:`decode_champsim_tracer`.
+   Designed for ``grep``: ``grep 'br=BRANCH_COND_DIRECT'``,
+   ``grep 'st@0x7fff'``, ``grep 'bb=42'`` all produce useful
+   results.
 
-.. py:function:: decode_champsim_tracer(bin_path)
+``--format=legacy``
+   Block-formatted: META / ENCODINGS / TEMPLATES / BODY sections
+   with one ENTRY block per body record.  Stable, machine-parseable;
+   wptrace_genval's validator runs ``cst_decode --format=legacy``
+   under the hood and parses its output back into Python objects.
 
-   Eager decoder.  Convenience wrapper that materializes every body
-   entry into a list and returns it alongside the meta + templates.
-   Holds the whole body in memory; OOMs on traces of even moderate
-   size.  Useful for unit tests against tiny fixtures and for code
-   that wants to make multiple passes over the entries without
-   re-reading the file.
+.. _audit-cc:
 
-   :param bin_path: ``pathlib.Path`` to a ``.cst`` trace.
-   :returns: ``tuple[dict, list[dict], list[dict]]``
-   :raises ValueError: when the trailer magic doesn't match a known
-       wire-format version, or when section offsets in the trailer
-       don't agree with the header / body sizes the decoder produced.
-
-   ``meta`` carries header fields and the resolved encoding maps the
-   decoder will refer to (``opcode_names``, ``branch_names``,
-   ``reg_names``, ``field_id_names``, ``sync_hint_names``, plus
-   feature flags and identifying strings from the header).
-
-   ``templates`` is a list of dicts shaped like
-   :py:func:`_decode_template_record` builds:
-
-   .. code-block:: python
-
-      {
-          "template_id":     int,
-          "start_pc":        int,
-          "n_insns":         int,
-          "fall_through_pc": int,
-          "symbol_name":     str,
-          "insns": [
-              {
-                  "pc":                 int,
-                  "opcode":             int,   # GenericOpcode value
-                  "branch_type":        int,
-                  "branch_conditional": bool,
-                  "src_regs":           list[int],
-                  "dst_regs":           list[int],
-                  "imm":                int | None,
-                  "sync_hint":          int,
-                  "n_loads":            int,   # template default; usually 0
-                  "n_stores":           int,
-                  "raw_bytes":          bytes,
-              },
-              ...
-          ],
-      }
-
-   ``entries`` is a list of dicts, each describing one body entry
-   (one CP basic-block instance plus its WP chain):
-
-   .. code-block:: python
-
-      {
-          "seq_num":         int,
-          "template_id":     int,
-          "thread_id":       int,
-          "thread_switched": bool,             # true on the first
-                                               # entry after a
-                                               # BODY_TAG_THREAD_SWITCH
-          "dyn_params":      list[DynParam],   # CP-side memops
-          "reg_snaps":       list[dict],       # CP-side reg snapshots
-          "wp_entries": [
-              {
-                  "index":                   int,
-                  "template_id":             int,
-                  "n_insns":                 int,    # from template
-                  "dyn_params":              list[DynParam],
-                  "reg_snaps":               list[dict],
-                  "fault":                   bool,
-                  "translation_unavailable": bool,
-                  "fault_insn_index":        int | None,
-              },
-              ...
-          ],
-      }
-
-IFRAME validation
-~~~~~~~~~~~~~~~~~
-
-When a trace was produced with ``iframe_rate=N`` the writer follows
-selected ``BODY_TAG_ENTRY`` records with a redundant ``BODY_TAG_IFRAME``
-record carrying the same payload encoded against template-default
-baselines (so every value is absolute).  The decoder transparently
-validates each IFRAME against the immediately-preceding ENTRY's
-reconstruction and raises ``ValueError`` on any mismatch.
-
-Decoder consumers don't need to opt in: IFRAMEs are not surfaced as
-extra entries (``len(entries)`` matches the number of regular
-``BODY_TAG_ENTRY`` records).  IFRAMEs are pure validation/resync
-redundancy; they neither advance ``previous_entry_template`` nor
-update the persistent overlays.  See section 4.5 of
-``champsim_tracer_format.md`` (rendered on the :doc:`format` page)
-for the on-wire shape.
-
-.. py:class:: DynParam
-
-   Dataclass for one decoded memop record.  Always built with
-   ``type_name`` set to either ``"load"`` or ``"store"``; register
-   snapshots are not represented as ``DynParam`` (see
-   ``reg_snaps`` below).
-
-   :ivar type_name: ``"load"`` or ``"store"``.
-   :ivar value:     Memory virtual address.
-   :ivar data_size: Access width in bytes (zero when value capture is
-       off).
-   :ivar data:      Full 512-bit payload masked to the trace's
-       ``MEM_DATA_BIT_MASK``.
-   :ivar data_lo:   Low 64 bits of ``data`` (convenience).
-   :ivar data_hi:   Bits 64..127 of ``data`` (convenience).
-   :ivar insn_index: Position within the BB template (0-based).
-
-   The ``reg_snaps`` lists in entries / WP entries hold dicts, not
-   ``DynParam`` instances:
-
-   .. code-block:: python
-
-      {
-          "insn_index":     int,
-          "kind":           "dst",      # only "dst" today
-          "operand_index":  int,        # 0..n_dst_regs-1 of that insn
-          "reg_id":         int,        # GenericRegId
-          "value":          int,        # masked-to-trace-width
-          "lo":             int,        # low 64
-          "hi":             int,        # bits 64..127
-      }
-
-Format-version handling
-~~~~~~~~~~~~~~~~~~~~~~~
-
-The decoder reads v1.7, v1.8, and v1.9 simultaneously.  It picks the
-right code path off the trailer's magic byte:
-
-.. code-block:: text
-
-   0x17545343 → v1.7  (legacy; per-entry sub-sections)
-   0x18545343 → v1.8  (unified delta stream; per-chain WP overlay reset)
-   0x19545343 → v1.9  (unified delta stream; persistent WP overlay)
-
-If you bump the wire format (cf. :doc:`extending`), the new magic
-needs a corresponding ``CST_MAGIC_V*`` constant near the top of
-``champsim_tracer_decode.py`` and the ``decode_champsim_tracer``
-dispatch needs the new branch.  Keeping older readers in the same
-module is by design — debugging cross-version traces is a common
-need.
-
-.. _audit-tool:
-
-cst_audit.py
-------------
-
-A focused diagnostic.  Prints how many bytes each part of the trace
-consumed and what the largest line items inside each part are.
+cst_audit
+---------
 
 .. code-block:: console
 
-   $ python3 cst_audit.py trace.cst.cst
+   $ build/contrib/plugins/cst_audit trace.cst
+
+Prints a byte-budget table covering top-level sections, body
+breakdown, field-delta record breakdown, and entry / insn totals.
+Hands you a hard byte count (every byte produced by the writer is
+counted exactly once and the section totals add up to the file
+size), so the workflow when tuning trace size is:
+
+1. Run ``cst_audit`` on a baseline trace.
+2. Toggle a writer flag (``wp_memdata=0``, ``wp_regdata=0``,
+   ``memdata=0``).
+3. Re-run.  A flag that pays off shows up as a line item shrinking
+   by an order of magnitude.
+
+Sample output:
+
+.. code-block:: console
+
+   $ build/contrib/plugins/cst_audit trace.cst
    FILE                                     12.34 MiB  100.00%
 
    === TOP-LEVEL SECTIONS ===
@@ -236,24 +101,41 @@ consumed and what the largest line items inside each part are.
      CP field-delta section                 185.99 KiB    1.52%  [   35,857 entry, avg    5.3 B]
      ...
      IFRAME records (validation redundancy)  80.34 KiB    0.66%  [      388 iframe, avg  212.0 B]
-     ...
 
 The ``IFRAME records`` line appears only on traces produced with
 ``iframe_rate>0``; those bytes are pure validation overhead and
 disappear when the feature is off.
 
-The numbers are a hard byte count — every byte produced by the writer
-is counted exactly once and the section totals add up to the file
-size.  When tuning trace size, the workflow is:
+Format-version handling
+-----------------------
 
-1. Run ``cst_audit.py`` on a baseline trace.
-2. Toggle a writer flag (``wp_memdata=0``, ``wp_regdata=0``,
-   ``memdata=0``).
-3. Re-run.  A flag that pays off shows up as a line item shrinking by
-   an order of magnitude.
+Both tools read v1.7, v1.8, and v1.9 traces.  They pick the right
+code path off the trailer's magic byte:
 
-The audit exposes its own ``audit()`` and ``report()`` functions for
-programmatic use, but the typical pattern is the CLI.
+.. code-block:: text
+
+   0x17545343 → v1.7  (legacy; per-entry sub-sections)
+   0x18545343 → v1.8  (unified delta stream; per-chain WP overlay reset)
+   0x19545343 → v1.9  (unified delta stream; persistent WP overlay)
+
+If you bump the wire format (cf. :doc:`extending`), the new magic
+needs a corresponding ``MAGIC_V*`` constant in
+``contrib/plugins/champsim_tracer/tools/cst_common.h`` and the
+parser branches need updating.  Keeping older readers compiled in
+is by design — debugging cross-version traces is a common need.
+
+IFRAME validation
+-----------------
+
+When a trace was produced with ``iframe_rate=N`` the writer follows
+selected ``BODY_TAG_ENTRY`` records with a redundant ``BODY_TAG_IFRAME``
+record carrying the same payload encoded against template-default
+baselines (so every value is absolute).  ``cst_decode`` transparently
+walks each IFRAME against fresh empty overlays and the body walker
+verifies its dyn-param and reg-snap counts match the preceding ENTRY;
+mismatches raise an error.  IFRAMEs are not surfaced as separate
+``BODY_TAG_ENTRY`` records — ``cst_decode`` reports a body-entry
+count that matches the writer's ``num_entries`` footer field.
 
 mnemonic survey / audit
 -----------------------

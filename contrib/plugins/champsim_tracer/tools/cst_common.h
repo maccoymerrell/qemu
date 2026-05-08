@@ -1,0 +1,291 @@
+/*
+ * ChampSim Tracer offline tools — shared wire-format types.
+ *
+ * Glib-free, plugin-API-free, mmap-friendly POD types describing the
+ * v1.7/v1.8/v1.9 .cst trace format.  Both cst_decode and cst_audit
+ * link against this layer; the format-specific bits (header layout,
+ * tag values, FID ranges) are duplicated here verbatim from the
+ * plugin's champsim_tracer.h so the tools build without dragging
+ * QEMU's plugin or glib headers in.
+ *
+ * The companion ../champsim_tracer_generic_ids.h header is glib-free
+ * and is included directly so the tools share a single source of
+ * truth for opcode / branch_type / sync_hint / register name lookups.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "../champsim_tracer_generic_ids.h"
+
+namespace cst {
+
+/* ===== Wire-format magic ===== */
+
+inline constexpr uint32_t MAGIC_V17 = 0x17545343u;
+inline constexpr uint32_t MAGIC_V18 = 0x18545343u;
+inline constexpr uint32_t MAGIC_V19 = 0x19545343u;
+
+inline constexpr uint64_t TRAILER_MAGIC_V17 = 0x17545343FFFFFFFFull;
+inline constexpr uint64_t TRAILER_MAGIC_V18 = 0x18545343FFFFFFFFull;
+inline constexpr uint64_t TRAILER_MAGIC_V19 = 0x19545343FFFFFFFFull;
+
+inline constexpr size_t TRAILER_SIZE = 64;
+
+/* ===== Body tags ===== */
+
+inline constexpr uint8_t BODY_TAG_END           = 0;
+inline constexpr uint8_t BODY_TAG_ENTRY         = 1;
+inline constexpr uint8_t BODY_TAG_THREAD_SWITCH = 2;
+inline constexpr uint8_t BODY_TAG_IFRAME        = 3;
+
+/* ===== Per-insn template flag bits ===== */
+
+inline constexpr uint8_t INSN_FLAG_BRANCH_COND = 1u << 0;
+inline constexpr uint8_t INSN_FLAG_HAS_IMM     = 1u << 1;
+inline constexpr uint8_t INSN_FLAG_SYNC_SHIFT  = 2;
+inline constexpr uint8_t INSN_FLAG_SYNC_MASK   = 0x3Cu;
+
+/* ===== Header feature flags ===== */
+
+inline constexpr uint8_t FLAG_MEM_DATA = 1u << 0;
+inline constexpr uint8_t FLAG_REG_DATA = 1u << 1;
+
+/* ===== WP event flags ===== */
+
+inline constexpr uint8_t WP_EVENT_TRANSLATION_UNAVAIL = 1u << 0;
+inline constexpr uint8_t WP_EVENT_FAULT               = 1u << 1;
+
+/* ===== Field IDs (unified delta stream, v1.8+) ===== */
+
+inline constexpr uint8_t FID_SLOT_COUNT       = 16;
+inline constexpr size_t  MAX_WIDE_BYTES       = 64;
+
+inline constexpr uint8_t FID_N_LOADS          = 0x00;
+inline constexpr uint8_t FID_LOAD_ADDR_BASE   = 0x01;
+inline constexpr uint8_t FID_STORE_ADDR_BASE  = 0x11;
+inline constexpr uint8_t FID_LOAD_DATA_BASE   = 0x21;
+inline constexpr uint8_t FID_STORE_DATA_BASE  = 0x31;
+inline constexpr uint8_t FID_DST_REG_BASE     = 0x51;
+inline constexpr uint8_t FID_N_STORES         = 0x61;
+inline constexpr uint8_t FID_EXTRA_LOAD_ADDR  = 0x62;
+inline constexpr uint8_t FID_EXTRA_STORE_ADDR = 0x63;
+inline constexpr uint8_t FID_EXTRA_LOAD_DATA  = 0x64;
+inline constexpr uint8_t FID_EXTRA_STORE_DATA = 0x65;
+inline constexpr uint8_t FID_INSN_BYTES_LO    = 0x70;
+inline constexpr uint8_t FID_INSN_BYTES_HI    = 0x71;
+inline constexpr uint8_t FID_INSN_OPCODE      = 0x72;
+inline constexpr uint8_t FID_INSN_BRANCH_TYPE = 0x73;
+inline constexpr uint8_t FID_INSN_FLAGS       = 0x74;
+inline constexpr uint8_t FID_INSN_IMMEDIATE   = 0x75;
+inline constexpr uint8_t FID_INSN_SIZE        = 0x76;
+inline constexpr uint8_t FID_EXTENDED         = 0xFF;
+
+inline constexpr int MAX_INSN_BYTES = 16;
+
+/* ===== 512-bit unsigned scalar ===== */
+
+struct Wide {
+    static constexpr size_t LIMBS = MAX_WIDE_BYTES / sizeof(uint64_t);
+    std::array<uint64_t, LIMBS> limb{};
+
+    constexpr Wide() = default;
+
+    static Wide from_u64(uint64_t v) {
+        Wide w;
+        w.limb[0] = v;
+        return w;
+    }
+
+    static Wide from_le_bytes(const uint8_t *bytes, size_t n) {
+        Wide w;
+        if (n > MAX_WIDE_BYTES) n = MAX_WIDE_BYTES;
+        std::memcpy(w.limb.data(), bytes, n);
+        return w;
+    }
+
+    /* Truncate to a single u64 (low limb).  Most addresses, opcodes,
+     * branch types fit here; callers fall back to the full limbs only
+     * when wider data is on the wire (data values, vector-register
+     * snaps). */
+    uint64_t low64() const { return limb[0]; }
+    uint64_t hi64()  const { return limb[1]; }
+
+    bool fits_u64() const {
+        for (size_t i = 1; i < LIMBS; i++) {
+            if (limb[i]) return false;
+        }
+        return true;
+    }
+
+    /* (a + delta) mod 2^N, where N is 128 (v1.7) or 512 (v1.8+).
+     * @delta is a fully sign-extended Wide-shaped 8-limb array (the
+     * shape produced by Reader::sleb_wide). */
+    void add_signed_mod_wide(const std::array<uint64_t, LIMBS> &add,
+                             int width_bits) {
+        uint64_t carry = 0;
+        for (size_t i = 0; i < LIMBS; i++) {
+            uint64_t s1 = limb[i] + add[i];
+            uint64_t c1 = (s1 < limb[i]) ? 1u : 0u;
+            uint64_t s2 = s1 + carry;
+            uint64_t c2 = (s2 < s1) ? 1u : 0u;
+            limb[i] = s2;
+            carry = c1 + c2;
+        }
+        size_t full_limbs = width_bits / 64;
+        size_t rem_bits = width_bits % 64;
+        for (size_t i = full_limbs; i < LIMBS; i++) {
+            if (i == full_limbs && rem_bits) {
+                limb[i] &= (1ull << rem_bits) - 1;
+            } else {
+                limb[i] = 0;
+            }
+        }
+    }
+
+    /* Convenience: 64-bit signed delta sign-extended to the full
+     * width.  Suitable for compact fields where the delta is known
+     * to fit in int64_t. */
+    void add_signed_mod(int64_t delta, int width_bits) {
+        std::array<uint64_t, LIMBS> add{};
+        add[0] = (uint64_t)delta;
+        if (delta < 0) {
+            for (size_t i = 1; i < LIMBS; i++) add[i] = ~uint64_t(0);
+        }
+        add_signed_mod_wide(add, width_bits);
+    }
+};
+
+inline bool operator==(const Wide &a, const Wide &b) {
+    return a.limb == b.limb;
+}
+inline bool operator!=(const Wide &a, const Wide &b) {
+    return a.limb != b.limb;
+}
+
+/* ===== Decoded entry shapes (consumer-facing) ===== */
+
+struct DynParam {
+    enum Type : uint8_t { Load, Store };
+    Type     type        = Load;
+    uint32_t insn_index  = 0;
+    uint64_t addr        = 0;     /* always low 64 bits */
+    Wide     data{};              /* full width when has_mem_data */
+    bool     has_data    = false;
+};
+
+struct RegSnap {
+    uint32_t insn_index    = 0;
+    uint8_t  operand_index = 0;
+    uint8_t  reg_id        = 0;
+    Wide     value{};             /* full width */
+};
+
+struct WPEntry {
+    uint32_t              index = 0;
+    uint32_t              template_id = 0;
+    std::vector<DynParam> dyn_params;
+    std::vector<RegSnap>  reg_snaps;
+    bool                  fault = false;
+    bool                  translation_unavailable = false;
+    /* Only meaningful when fault. */
+    uint32_t              fault_insn_index = 0;
+    bool                  has_fault_idx = false;
+    uint32_t              n_insns = 0;
+};
+
+struct DecodedEntry {
+    uint32_t              seq_num = 0;
+    uint32_t              template_id = 0;
+    uint32_t              thread_id = 0;
+    bool                  thread_switched = false;
+    std::vector<DynParam> dyn_params;
+    std::vector<RegSnap>  reg_snaps;
+    std::vector<WPEntry>  wp_entries;
+};
+
+/* ===== Template (parsed from the templates section) ===== */
+
+struct InsnTemplate {
+    uint64_t pc = 0;
+    uint8_t  opcode = 0;
+    uint8_t  branch_type = 0;
+    bool     branch_conditional = false;
+    bool     has_imm = false;
+    int64_t  imm = 0;
+    uint8_t  sync_hint = 0;
+    uint32_t n_loads = 0;
+    uint32_t n_stores = 0;
+    std::vector<uint8_t> src_regs;
+    std::vector<uint8_t> dst_regs;
+    std::vector<uint8_t> raw_bytes;       /* may be 0..16 bytes */
+};
+
+struct Template {
+    uint32_t                  template_id = 0;
+    uint64_t                  start_pc = 0;
+    uint64_t                  fall_through_pc = 0;
+    std::string               symbol_name;
+    std::vector<InsnTemplate> insns;
+};
+
+/* ===== Encoding maps + initial regfile (per-segment header) ===== */
+
+struct EncodingMaps {
+    /* Built-in defaults are merged with the trace-side override:
+     * trace-supplied entries win when they conflict. */
+    std::unordered_map<uint64_t, std::string> opcode;
+    std::unordered_map<uint64_t, std::string> branch_type;
+    std::unordered_map<uint64_t, std::string> sync_hint;
+    std::unordered_map<uint64_t, std::string> reg;
+    std::unordered_map<uint64_t, std::string> field_id;
+    std::unordered_map<uint64_t, std::string> header_flag;
+    std::unordered_map<uint64_t, std::string> insn_flag;
+    std::unordered_map<uint64_t, std::string> body_tag;
+    std::unordered_map<uint64_t, std::string> wp_event_flag;
+    /* "reg" map's per-entry initial-value blob: gen_id -> raw LE bytes. */
+    std::unordered_map<uint64_t, std::vector<uint8_t>> initial_regfile;
+};
+
+/* ===== Parsed header ===== */
+
+struct Header {
+    uint32_t magic = 0;
+    uint8_t  format_version = 0;          /* 0x17, 0x18, 0x19 */
+    uint8_t  isa = 0;                     /* TraceISA */
+    uint8_t  flags = 0;
+    uint64_t start_insn = 0;
+    uint64_t warmup_insns = 0;
+    uint64_t total_target_insns = 0;
+    std::string command;
+    std::string datetime;
+    std::string comment;
+    std::string target_name;
+    EncodingMaps maps;
+
+    bool has_mem_data() const { return flags & FLAG_MEM_DATA; }
+    bool has_reg_data() const { return flags & FLAG_REG_DATA; }
+    int  scalar_width_bits() const {
+        return (magic == MAGIC_V17) ? 128 : 512;
+    }
+    bool wp_persistent() const { return magic == MAGIC_V19; }
+};
+
+struct Trailer {
+    uint64_t templates_off = 0;
+    uint64_t templates_count = 0;
+    uint64_t body_off = 0;
+    uint64_t body_byte_count = 0;
+    uint64_t magic = 0;
+};
+
+}  /* namespace cst */

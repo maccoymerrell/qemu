@@ -58,11 +58,12 @@ there's room up to 255 entries before the format itself has to change.
    Capstone has emitted on a sample workload against the static table
    and prints the unclassified set.
 
-4. **Update the Python decoder.**  ``OPCODE_NAMES`` in
-   ``champsim_tracer_decode.py`` is a flat ``int -> str`` dict; add
-   ``61: "AES_ENC"``.  This lets ``cst_audit.py`` pretty-print the new
-   opcode even when the trace's encoding-maps section pre-dates its
-   addition.
+4. **Update the generic-id name lookup.**  Both the plugin's writer
+   and the offline tools share ``champsim_tracer_generic_ids.h``;
+   adding ``GEN_OP_AES_ENC`` to the ``GenericOpcode`` enum and
+   ``"AES_ENC"`` to ``generic_opcode_name()``'s switch is enough for
+   ``cst_decode`` and ``cst_audit`` to pretty-print the new opcode
+   even when the trace's encoding-maps section pre-dates its addition.
 
 5. **Build and verify.**  The C-side ``static_assert`` in
    ``champsim_tracer.cc`` (``GEN_OP_COUNT <= 256``) keeps the wire
@@ -121,13 +122,16 @@ new singleton, or extend a dense bank cleanly.
    per-Capstone-name hit counts on a workload, which is the easiest
    way to discover what name the disassembler is actually emitting.
 
-4. **Mirror the addition in the decoder.**  ``build_reg_names`` in
-   ``champsim_tracer_decode.py`` constructs the canonical
-   ``REG_NAMES_DEFAULT`` dict.  Add the new singleton or bank entries
-   alongside the existing ones.  The trace's encoding-maps section
-   carries names from the writer side, so a stale decoder still names
-   the register correctly when reading a fresh trace; updating the
-   decoder is for back-compat with traces from older plugin builds.
+4. **Mirror the addition in the generic-id table.**
+   ``generic_reg_name`` in ``champsim_tracer_generic_ids.h`` covers
+   the canonical name for each ``GenericRegId`` and is consumed by
+   both the plugin and the offline tools.  Add the new singleton or
+   bank entry alongside the existing ones.  The trace's
+   encoding-maps section carries names from the writer side too, so
+   a stale offline tool still resolves the new id when reading a
+   fresh trace; updating the table is for back-compat with traces
+   produced by older plugin builds that pre-date the encoding-map
+   suffix.
 
 Per-register attribution counters in ``g_stats`` (``cp_src_reg_uses``,
 ``cp_dst_reg_writes``, ``wp_src_reg_uses``, ``wp_dst_reg_writes``) are

@@ -220,7 +220,7 @@ Observability
    body record encoded against fresh template-default baselines
    (i.e., absolute values).  Decoders use these to cross-check that
    their delta-replay reconstructed the same view the writer had —
-   a mismatch raises ``ValueError`` in ``champsim_tracer_decode.py``.
+   a mismatch raises an error in ``cst_decode``.
    The IFRAME covers the *entire* body record (CP + WP chain + WP
    events), so flagging the CP also IFRAMEs every WP entry attached
    to it.  Pure overhead: a v1.9 trace produced with ``iframe_rate=0``
@@ -260,24 +260,29 @@ Three files land beside the basename:
 Reading the trace
 -----------------
 
-The Python decoder turns the binary into structured records:
+``cst_decode`` (built next to the plugin) emits a greppable
+disassembly-style dump:
 
-.. code-block:: python
+.. code-block:: console
 
-   from pathlib import Path
-   from champsim_tracer_decode import decode_champsim_tracer
+   $ build/contrib/plugins/cst_decode run.cst | head
+   ; cst_decode disassembly
+   ; version=0x19545343
+   ; isa=x86_64
+   ...
+   0x401a23 <main+0x83>: GEN_OP_ADD  REG_GPR1,REG_FLAGS <- REG_GPR2,REG_GPR3  ; tid=0 bb=42 REG_GPR1=0x1f
+   0x401a27 <main+0x87>: GEN_OP_ST_W REG_FLAGS <- REG_GPR1,REG_GPR15,IMM(0x8) ; tid=0 bb=42 st@0x7fff_dead_beef:0x1f
 
-   meta, templates, entries = decode_champsim_tracer(Path("run.cst.cst"))
-   for entry in entries:
-       print(entry["template_id"],
-             entry["dyn_params"],
-             len(entry["wp_entries"]))
+Each line is self-contained — pipe it through ``grep`` by PC,
+opcode, register, ``bb=`` id, ``ld@``/``st@``, branch type, etc.
+Pass ``--format=legacy`` to get the older block-formatted output
+that diff-driven scripts (notably wptrace_genval) consume.
 
 A byte-budget audit (helpful when tuning trace size) is one command:
 
 .. code-block:: console
 
-   $ python3 cst_audit.py run.cst.cst
+   $ build/contrib/plugins/cst_audit run.cst
    FILE                                     12.34 MiB  100.00%
    === TOP-LEVEL SECTIONS ===
      HEADER                                  6.18 KiB    0.05%
@@ -286,7 +291,7 @@ A byte-budget audit (helpful when tuning trace size) is one command:
      TRAILER                                      64 B    0.00%
    ...
 
-For the full decoder API see :doc:`decoder`.
+For both tools' full surface see :doc:`decoder`.
 
 Building this documentation
 ---------------------------

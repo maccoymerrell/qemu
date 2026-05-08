@@ -1,0 +1,570 @@
+"""Compat shim that wraps the C++ ``cst_decode`` binary.
+
+wptrace_genval was written against the in-process ``champsim_tracer_decode``
+Python module: ``decode_champsim_tracer(path)`` returned ``(meta,
+templates, entries)`` with rich Python objects.  After the C++ port the
+Python decoder is gone — the source of truth is the ``cst_decode``
+binary, with its ``--format=legacy`` mode emitting the byte-identical
+text that the Python renderer used to produce.
+
+This module subprocess-runs ``cst_decode --format=legacy`` and parses
+its stdout back into the same Python shapes wptrace_genval expects.
+The text format is stable (covered by the byte-identical regression
+test in the C++ tooling), so the parser only needs to handle the
+fixed prose grammar of the META / ENCODINGS / TEMPLATES / BODY
+sections.
+
+Public surface (matches the old ``champsim_tracer_decode``):
+
+    decode_champsim_tracer(path) -> (meta, templates, entries)
+    iter_decode_champsim_tracer(path) -> (meta, templates, iterator)
+    DynParam dataclass with .type_name, .value, .data_lo, .data_hi,
+        .data, .data_size, .insn_index
+    OPCODE_NAMES, BRANCH_NAMES, REG_NAMES_DEFAULT, FIELD_ID_NAMES_DEFAULT
+    build_reg_names()
+
+Locating the binary: a checked-in ``CST_DECODE`` env var, a peer in
+``$PATH``, or ``../../build/contrib/plugins/cst_decode`` relative to
+this file (the canonical in-tree build location).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Iterator
+
+_HERE = Path(__file__).resolve().parent
+
+# ---------------------------------------------------------------------------
+# Constants — duplicated verbatim from the deleted champsim_tracer_decode.py.
+# wptrace_genval uses these directly via attribute access; keeping them in
+# the shim avoids forcing a `.maps.opcode` dict lookup on every call site.
+# ---------------------------------------------------------------------------
+
+OPCODE_NAMES = {
+    0: "UNKNOWN", 1: "INT_ADD", 2: "INT_SUB", 3: "INT_MUL", 4: "INT_DIV",
+    5: "AND", 6: "OR", 7: "XOR", 8: "NOT",
+    9: "SHL", 10: "SHR", 11: "SAR", 12: "ROL", 13: "ROR",
+    14: "MOV", 15: "LOAD", 16: "STORE", 17: "PUSH", 18: "POP",
+    19: "LEA", 20: "MOVSX", 21: "MOVZX", 22: "XCHG",
+    23: "CMP", 24: "TEST", 25: "BRANCH", 27: "RET",
+    28: "FP_ADD", 29: "FP_SUB", 30: "FP_MUL", 31: "FP_DIV", 32: "FP_SQRT",
+    33: "FP_MOV", 34: "FP_CVT", 35: "FP_CMP",
+    36: "VEC_ADD", 37: "VEC_SUB", 38: "VEC_MUL", 39: "VEC_MOV",
+    40: "VEC_SHUF", 41: "VEC_LOGIC",
+    42: "NOP", 43: "SYSCALL", 44: "FENCE",
+    45: "CMOV", 46: "SETCC",
+    47: "INT_ADC", 48: "INT_SBB", 49: "NEG", 50: "INC", 51: "DEC",
+    52: "INT_MADD", 53: "INT_MSUB",
+    54: "FP_MADD", 55: "FP_MSUB",
+    56: "VEC_MADD", 57: "VEC_MSUB",
+    58: "PREFETCH", 59: "CACHE_FLUSH", 60: "TLB_FLUSH",
+}
+
+BRANCH_NAMES = {
+    0: "NONE",
+    1: "DIRECT_JUMP", 2: "INDIRECT_JUMP",
+    3: "RETURN", 4: "SYSCALL", 5: "COND_DIRECT",
+}
+
+# Field IDs mirror champsim_tracer.h.
+FID_SLOT_COUNT       = 16
+FID_N_LOADS          = 0x00
+FID_LOAD_ADDR_BASE   = 0x01
+FID_STORE_ADDR_BASE  = 0x11
+FID_LOAD_DATA_BASE   = 0x21
+FID_STORE_DATA_BASE  = 0x31
+FID_DST_REG_BASE     = 0x51
+FID_N_STORES         = 0x61
+FID_EXTRA_LOAD_ADDR  = 0x62
+FID_EXTRA_STORE_ADDR = 0x63
+FID_EXTRA_LOAD_DATA  = 0x64
+FID_EXTRA_STORE_DATA = 0x65
+FID_INSN_BYTES_LO    = 0x70
+FID_INSN_BYTES_HI    = 0x71
+FID_INSN_OPCODE      = 0x72
+FID_INSN_BRANCH_TYPE = 0x73
+FID_INSN_FLAGS       = 0x74
+FID_INSN_IMMEDIATE   = 0x75
+FID_INSN_SIZE        = 0x76
+FID_EXTENDED         = 0xFF
+
+
+def build_reg_names() -> dict[int, str]:
+    """Reproduce the static reg-name table the deleted Python decoder
+    used to assemble.  Sourced from champsim_tracer_generic_ids.h."""
+    names: dict[int, str] = {0: "REG_NONE"}
+    for i in range(64):
+        names[1 + i] = f"REG_GPR{i}"
+    for i in range(32):
+        names[64 + i] = f"REG_FPR{i}"
+    for i in range(32):
+        names[96 + i] = f"REG_VEC{i}"
+    for i in range(8):
+        names[128 + i] = f"REG_SEG{i}"
+    names[224] = "REG_CTRL"
+    names[225] = "REG_SP"
+    names[226] = "REG_FLAGS"
+    names[227] = "REG_IP"
+    names[228] = "REG_FP_REG"
+    names[229] = "REG_DEBUG"
+    names[230] = "REG_TLB"
+    names[231] = "REG_SYS"
+    names[232] = "REG_HI"
+    names[233] = "REG_LO"
+    names[234] = "REG_CR"
+    names[235] = "REG_VL"
+    names[236] = "REG_VTYPE"
+    return names
+
+
+REG_NAMES_DEFAULT = build_reg_names()
+FIELD_ID_NAMES_DEFAULT: dict[int, str] = {}
+
+
+# ---------------------------------------------------------------------------
+# DynParam — same shape the deleted decoder exposed.
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass
+class DynParam:
+    type_name: str
+    value: int
+    data: int = 0
+    data_lo: int = 0
+    data_hi: int = 0
+    data_size: int = 0
+    insn_index: int = -1
+
+
+# ---------------------------------------------------------------------------
+# Locating cst_decode.
+# ---------------------------------------------------------------------------
+
+def _find_cst_decode() -> Path:
+    explicit = os.environ.get("CST_DECODE")
+    if explicit:
+        p = Path(explicit)
+        if p.is_file():
+            return p
+        raise FileNotFoundError(
+            f"CST_DECODE={explicit!r} does not exist")
+    on_path = shutil.which("cst_decode")
+    if on_path:
+        return Path(on_path)
+    in_tree = _HERE.parent.parent.parent / "build" / "contrib" / "plugins" / "cst_decode"
+    if in_tree.is_file():
+        return in_tree.resolve()
+    raise FileNotFoundError(
+        "cst_decode binary not found; build it with "
+        "`ninja contrib/plugins/cst_decode` from the QEMU build "
+        "directory, or set CST_DECODE to its path.")
+
+
+# ---------------------------------------------------------------------------
+# Legacy-text parser.  Mirrors render_legacy() in cst_decode_main.cc.
+# ---------------------------------------------------------------------------
+
+_BB_HEAD_RE  = re.compile(
+    r"^BB(\d+) \[pc=0x([0-9a-f]+), insns=(\d+), fall_through=0x([0-9a-f]+)\]$"
+)
+_INSN_RE = re.compile(
+    r"^  \[(\d+)\] 0x([0-9a-f]+): op=(\S+)"
+    r"(?: br=(\S+) cond=(\d))?"
+    r" src=\[([^\]]*)\] dst=\[([^\]]*)\]"
+    r"(?: imm=(-?\d+))?"
+    r"(?: sync=(\S+))?"
+    r"(?: bytes=([0-9a-f]*))?$"
+)
+_ENTRY_HEAD_RE = re.compile(
+    r"^ENTRY (\d+) thread=(\d+)(?: switch=(\d))? template=BB(\d+)$"
+)
+_WP_HEAD_RE = re.compile(
+    r"^  wp\[(\d+)\] template=BB(\d+) n_insns=(\d+)$"
+)
+_LOAD_RE  = re.compile(
+    r"^( +)insn\[(\d+)\] load=0x([0-9a-f]+)(?::data=0x([0-9a-f]+))?$"
+)
+_STORE_RE = re.compile(
+    r"^( +)insn\[(\d+)\] store=0x([0-9a-f]+)(?::data=0x([0-9a-f]+))?$"
+)
+_REG_RE = re.compile(
+    r"^( +)insn\[(\d+)\] (dst|src)\[(\d+)\] (\S+)=0x([0-9a-f]+)$"
+)
+
+
+def _make_dyn(type_name: str, value: int, insn_index: int,
+              data_hex: str | None) -> DynParam:
+    dp = DynParam(type_name=type_name, value=value, insn_index=insn_index)
+    if data_hex:
+        d = int(data_hex, 16)
+        dp.data = d
+        dp.data_lo = d & ((1 << 64) - 1)
+        dp.data_hi = (d >> 64) & ((1 << 64) - 1)
+        dp.data_size = (d.bit_length() + 7) // 8
+    return dp
+
+
+def _make_reg_snap(insn_index: int, kind: str, operand_index: int,
+                   reg_id: int, hexv: str) -> dict:
+    v = int(hexv, 16)
+    return {
+        "insn_index": insn_index,
+        "kind":       kind,
+        "operand_index": operand_index,
+        "reg_id":     reg_id,
+        "value":      v,
+        "lo":         v & ((1 << 64) - 1),
+        "hi":         (v >> 64) & ((1 << 64) - 1),
+    }
+
+
+def _parse_meta_section(lines: list[str], reg_name_to_id: dict[str, int]) -> dict:
+    meta: dict = {
+        "encoding_maps": {},
+        "stop_reason_names": {},
+        "exception_names": {},
+    }
+    i = 0
+    if lines[0] != "META" or lines[1] != "----":
+        raise ValueError("expected META section header")
+    i = 2
+    while i < len(lines) and lines[i] != "":
+        line = lines[i]
+        if line.startswith("VERSION "):
+            meta["magic"] = int(line[len("VERSION "):], 16)
+        elif line.startswith("ISA "):
+            meta["target_name"] = line[len("ISA "):]
+        elif line.startswith("COMMAND "):
+            meta["command"] = line[len("COMMAND "):]
+        elif line == "COMMAND":
+            meta["command"] = ""
+        elif line.startswith("DATETIME "):
+            meta["datetime"] = line[len("DATETIME "):]
+        elif line == "DATETIME":
+            meta["datetime"] = ""
+        elif line.startswith("COMMENT "):
+            meta["comment"] = line[len("COMMENT "):]
+        elif line == "COMMENT":
+            meta["comment"] = ""
+        elif line.startswith("FLAGS"):
+            tokens = line.split()[1:]
+            meta["has_mem_data"] = "MEM_DATA" in tokens
+            meta["has_reg_data"] = "REG_DATA" in tokens
+            meta["flags"] = ((0x1 if meta["has_mem_data"] else 0) |
+                             (0x2 if meta["has_reg_data"] else 0))
+        elif line.startswith("START_INSN "):
+            meta["start_insn"] = int(line[len("START_INSN "):])
+        elif line.startswith("WARMUP_INSNS "):
+            meta["warmup_insns"] = int(line[len("WARMUP_INSNS "):])
+        elif line.startswith("TOTAL_TARGET_INSNS "):
+            payload = line[len("TOTAL_TARGET_INSNS "):]
+            meta["total_target_insns"] = int(payload.split()[0])
+        elif line.startswith("INITIAL_REGFILE "):
+            n = int(line[len("INITIAL_REGFILE "):])
+            initial: dict[int, bytes] = {}
+            for _ in range(n):
+                i += 1
+                parts = lines[i].strip().split()
+                rid = reg_name_to_id.get(parts[0])
+                if rid is None:
+                    rid = -1
+                initial[rid] = bytes.fromhex(parts[1])
+            meta["initial_regfile"] = initial
+        i += 1
+    return meta, i
+
+
+def _parse_encodings(lines: list[str], i: int,
+                     meta: dict) -> tuple[dict[str, dict[int, str]], int]:
+    if lines[i] != "" or lines[i + 1] != "ENCODINGS" or lines[i + 2] != "---------":
+        raise ValueError("expected ENCODINGS section header")
+    i += 3
+    encoding_maps: dict[str, dict[int, str]] = {}
+    while i < len(lines) and lines[i] != "":
+        head = lines[i]
+        sp = head.find(" ")
+        name = head[:sp]
+        n = int(head[sp + 1:])
+        i += 1
+        m: dict[int, str] = {}
+        for _ in range(n):
+            parts = lines[i].strip().split(" ", 1)
+            m[int(parts[0])] = parts[1] if len(parts) > 1 else ""
+            i += 1
+        if name == "WP_STOP_REASONS":
+            meta["stop_reason_names"] = m
+        elif name == "EXCEPTIONS":
+            meta["exception_names"] = m
+        else:
+            encoding_maps[name] = m
+    return encoding_maps, i
+
+
+def _parse_templates(lines: list[str], i: int,
+                     reg_name_to_id: dict[str, int],
+                     opcode_to_id: dict[str, int],
+                     branch_to_id: dict[str, int],
+                     sync_to_id: dict[str, int]) -> tuple[list[dict], int]:
+    while i < len(lines) and lines[i] == "":
+        i += 1
+    if lines[i] != "TEMPLATES" or lines[i + 1] != "---------":
+        raise ValueError("expected TEMPLATES section header")
+    i += 2
+    templates: list[dict] = []
+    while i < len(lines) and lines[i] != "BODY":
+        if lines[i] == "":
+            i += 1
+            continue
+        m = _BB_HEAD_RE.match(lines[i])
+        if not m:
+            raise ValueError(f"bad template header: {lines[i]!r}")
+        tid = int(m.group(1))
+        start_pc = int(m.group(2), 16)
+        n_insns = int(m.group(3))
+        ft_pc = int(m.group(4), 16)
+        i += 1
+        symbol = ""
+        if i < len(lines) and lines[i].startswith("  symbol="):
+            symbol = lines[i][len("  symbol="):]
+            i += 1
+        insns: list[dict] = []
+        for _ in range(n_insns):
+            mm = _INSN_RE.match(lines[i])
+            if not mm:
+                raise ValueError(f"bad insn line: {lines[i]!r}")
+            br_name = mm.group(4)
+            cond_str = mm.group(5)
+            sync_name = mm.group(9)
+            insn = {
+                "pc": int(mm.group(2), 16),
+                "opcode": opcode_to_id.get(mm.group(3), 0),
+                "branch_type": branch_to_id.get(br_name, 0) if br_name else 0,
+                "branch_conditional": (cond_str == "1") if cond_str else False,
+                "src_regs": [reg_name_to_id.get(r, 0)
+                             for r in mm.group(6).split(",") if r],
+                "dst_regs": [reg_name_to_id.get(r, 0)
+                             for r in mm.group(7).split(",") if r],
+                "imm": int(mm.group(8)) if mm.group(8) is not None else None,
+                "sync_hint": sync_to_id.get(sync_name, 0) if sync_name else 0,
+                "n_loads": 0,
+                "n_stores": 0,
+                "raw_bytes": bytes.fromhex(mm.group(10) or ""),
+            }
+            insns.append(insn)
+            i += 1
+        templates.append({
+            "template_id": tid,
+            "start_pc": start_pc,
+            "n_insns": n_insns,
+            "fall_through_pc": ft_pc,
+            "symbol_name": symbol,
+            "insns": insns,
+        })
+    return templates, i
+
+
+def _parse_observations(lines: list[str], i: int,
+                        reg_name_to_id: dict[str, int]
+                        ) -> tuple[list[DynParam], list[dict], int]:
+    """Parse a CP or WP `cp:` / sub-block observation block."""
+    dyn: list[DynParam] = []
+    snaps: list[dict] = []
+    if i >= len(lines):
+        return dyn, snaps, i
+    # `unchanged` sentinel: caller already consumed the prefix line.
+    line = lines[i].strip()
+    if line == "unchanged":
+        return dyn, snaps, i + 1
+    while i < len(lines):
+        line = lines[i]
+        if line == "memops:":
+            i += 1
+            while i < len(lines):
+                ml = _LOAD_RE.match(lines[i])
+                if ml:
+                    dyn.append(_make_dyn("load", int(ml.group(3), 16),
+                                          int(ml.group(2)), ml.group(4)))
+                    i += 1
+                    continue
+                ms = _STORE_RE.match(lines[i])
+                if ms:
+                    dyn.append(_make_dyn("store", int(ms.group(3), 16),
+                                          int(ms.group(2)), ms.group(4)))
+                    i += 1
+                    continue
+                break
+            continue
+        if line == "regs:":
+            i += 1
+            while i < len(lines):
+                mr = _REG_RE.match(lines[i])
+                if not mr:
+                    break
+                snaps.append(_make_reg_snap(
+                    int(mr.group(2)), mr.group(3),
+                    int(mr.group(4)),
+                    reg_name_to_id.get(mr.group(5), 0),
+                    mr.group(6)))
+                i += 1
+            continue
+        break
+    return dyn, snaps, i
+
+
+def _iter_body(lines: list[str], i: int,
+               reg_name_to_id: dict[str, int]) -> Iterator[dict]:
+    while i < len(lines) and lines[i] == "":
+        i += 1
+    if i >= len(lines):
+        return
+    if lines[i] != "BODY" or lines[i + 1] != "----":
+        raise ValueError("expected BODY section header")
+    i += 2
+    while i < len(lines):
+        line = lines[i]
+        if line == "":
+            i += 1
+            continue
+        m = _ENTRY_HEAD_RE.match(line)
+        if not m:
+            i += 1
+            continue
+        seq_num = int(m.group(1))
+        thread_id = int(m.group(2))
+        thread_switched = m.group(3) == "1"
+        template_id = int(m.group(4))
+        i += 1
+        # CP block: indented "cp:" header followed by observations.
+        cp_dyn: list[DynParam] = []
+        cp_snaps: list[dict] = []
+        wp_entries: list[dict] = []
+        if i < len(lines) and lines[i] == "  cp:":
+            i += 1
+            # Strip leading 4 spaces from observation lines so the
+            # generic parser reads them.
+            obs_lines: list[str] = []
+            while i < len(lines) and lines[i].startswith("    "):
+                obs_lines.append(lines[i][4:])
+                i += 1
+            j = 0
+            cp_dyn, cp_snaps, _ = _parse_observations(
+                obs_lines, j, reg_name_to_id)
+        while i < len(lines):
+            mw = _WP_HEAD_RE.match(lines[i])
+            if not mw:
+                break
+            i += 1
+            wp = {
+                "index": int(mw.group(1)),
+                "template_id": int(mw.group(2)),
+                "n_insns": int(mw.group(3)),
+                "dyn_params": [],
+                "reg_snaps": [],
+                "fault": False,
+                "translation_unavailable": False,
+                "fault_insn_index": None,
+            }
+            if i < len(lines) and lines[i].startswith("    status:"):
+                tokens = lines[i][len("    status: "):].split()
+                for t in tokens:
+                    if t == "FAULT":
+                        wp["fault"] = True
+                    elif t.startswith("FAULT@insn"):
+                        wp["fault"] = True
+                        wp["fault_insn_index"] = int(t[len("FAULT@insn"):])
+                    elif t == "TRANSLATION_UNAVAILABLE":
+                        wp["translation_unavailable"] = True
+                i += 1
+            obs_lines = []
+            while i < len(lines) and lines[i].startswith("    "):
+                obs_lines.append(lines[i][4:])
+                i += 1
+            j = 0
+            wp["dyn_params"], wp["reg_snaps"], _ = _parse_observations(
+                obs_lines, j, reg_name_to_id)
+            wp_entries.append(wp)
+        yield {
+            "seq_num": seq_num,
+            "template_id": template_id,
+            "thread_id": thread_id,
+            "thread_switched": thread_switched,
+            "dyn_params": cp_dyn,
+            "reg_snaps": cp_snaps,
+            "wp_entries": wp_entries,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def _run_cst_decode(path: str | os.PathLike) -> str:
+    binary = _find_cst_decode()
+    proc = subprocess.run(
+        [str(binary), "--format=legacy", str(path)],
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    return proc.stdout
+
+
+def _parse_full(text: str) -> tuple[dict, list[dict], list[dict]]:
+    lines = text.splitlines()
+    rid_by_name = {n: r for r, n in REG_NAMES_DEFAULT.items()}
+    op_to_id = {n: r for r, n in OPCODE_NAMES.items()}
+    br_to_id = {n: r for r, n in BRANCH_NAMES.items()}
+    sync_to_id = {"SYNC_NONE": 0, "SYNC_THREAD_SWITCH": 4, "SYNC_ATOMIC": 5}
+
+    meta, i = _parse_meta_section(lines, rid_by_name)
+    encoding_maps, i = _parse_encodings(lines, i, meta)
+    meta["encoding_maps"] = encoding_maps
+    if "reg" in encoding_maps:
+        # Trace's reg map overrides the built-in.
+        rid_by_name = {n: r for r, n in encoding_maps["reg"].items()}
+        meta["reg_names"] = encoding_maps["reg"]
+    else:
+        meta["reg_names"] = REG_NAMES_DEFAULT
+    if "opcode" in encoding_maps:
+        op_to_id = {n: r for r, n in encoding_maps["opcode"].items()}
+        meta["opcode_names"] = encoding_maps["opcode"]
+    else:
+        meta["opcode_names"] = OPCODE_NAMES
+    if "branch_type" in encoding_maps:
+        br_to_id = {n: r for r, n in encoding_maps["branch_type"].items()}
+        meta["branch_names"] = encoding_maps["branch_type"]
+    else:
+        meta["branch_names"] = BRANCH_NAMES
+    if "sync_hint" in encoding_maps:
+        sync_to_id = {n: r for r, n in encoding_maps["sync_hint"].items()}
+        meta["sync_hint_names"] = encoding_maps["sync_hint"]
+    else:
+        meta["sync_hint_names"] = {0: "SYNC_NONE", 4: "SYNC_THREAD_SWITCH",
+                                    5: "SYNC_ATOMIC"}
+
+    templates, i = _parse_templates(
+        lines, i, rid_by_name, op_to_id, br_to_id, sync_to_id)
+    entries = list(_iter_body(lines, i, rid_by_name))
+    return meta, templates, entries
+
+
+def decode_champsim_tracer(bin_path):
+    """Eager decoder.  Returns (meta, templates, entries)."""
+    text = _run_cst_decode(bin_path)
+    return _parse_full(text)
+
+
+def iter_decode_champsim_tracer(bin_path):
+    """Streaming form.  cst_decode buffers the legacy output to stdout in
+    full so this implementation eagerly collects entries; callers that
+    require true streaming should iterate the C++ binary's stdout
+    directly via subprocess.Popen and the line-grammar above.
+    """
+    meta, templates, entries = decode_champsim_tracer(bin_path)
+    return meta, templates, iter(entries)

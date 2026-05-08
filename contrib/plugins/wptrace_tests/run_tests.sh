@@ -44,7 +44,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 PLUGIN="$BUILD_DIR/contrib/plugins/libchampsim_tracer.so"
-DECODE="$QEMU_ROOT/contrib/plugins/champsim_tracer_decode.py"
+DECODE="$BUILD_DIR/contrib/plugins/cst_decode"
 
 if [[ ! -f "$PLUGIN" ]]; then
     echo "ERROR: plugin not found: $PLUGIN"

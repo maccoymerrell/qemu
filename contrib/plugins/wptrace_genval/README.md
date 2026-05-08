@@ -39,8 +39,8 @@ exercises the plugin across:
                      |
                      v
              +---------------+         +------------------+
-             | champsim_tracer_decode| ---+--> | genval validate  |
-             +---------------+    |    +------------------+
+             |  cst_decode   | ---+--> | genval validate  |
+             | --format=legacy|    |    +------------------+
                                   |
                            +------+------+
                            | objdump +  |
@@ -68,8 +68,10 @@ exercises the plugin across:
    *per-block expected opcode sequences* — the ground truth for template
    validation.
 
-5. **`genval validate`** decodes the `.cst` file (via
-   `champsim_tracer_decode.decode_champsim_tracer`) and checks, for every assertion in
+5. **`genval validate`** decodes the `.cst` file via `cst_decode
+   --format=legacy` (the `_cst_decode_runner` shim subprocesses the
+   binary and parses its textual output back into the dict / DynParam
+   shapes the validator expects) and checks, for every assertion in
    the metadata:
      * correct-path BB execution order matches `metadata.correct_path`,
      * every CP BB's dynamic load/store addresses match the planned set,

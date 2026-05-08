@@ -1,8 +1,7 @@
 """Locate where two .cst files actually differ."""
 import sys, struct
 from pathlib import Path
-sys.path.insert(0, "../champsim_tracer")
-import champsim_tracer_decode as dec
+import _cst_decode_runner as dec
 
 
 def first_diffs(a: bytes, b: bytes, n: int = 5) -> list[int]:

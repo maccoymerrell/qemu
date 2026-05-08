@@ -19,9 +19,10 @@ single binary stream describing:
 * per-instance memory operations (addresses, optional values) and
   optional per-source-register pre-instruction snapshots.
 
-The companion Python tooling (``champsim_tracer_decode.py``,
-``cst_audit.py``) reads the binary and either yields a structured
-record stream or prints a byte-budget breakdown of where bytes go.
+The companion C++ tools (``cst_decode``, ``cst_audit``, built next
+to the plugin shared object) read the binary trace and either emit a
+disassembly-style text dump or print a byte-budget breakdown of
+where bytes go.
 
 .. toctree::
    :maxdepth: 2

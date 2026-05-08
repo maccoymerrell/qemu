@@ -44,20 +44,27 @@ from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
-# Decoder import (champsim_tracer_decode.py is a sibling of this package)
+# Decoder import.  The Python decoder has been replaced by the C++
+# cst_decode binary; _cst_decode_runner is a thin sibling-package shim
+# that subprocesses cst_decode --format=legacy and parses its textual
+# output back into the dict / DynParam shapes wptrace_genval expects.
 # ---------------------------------------------------------------------------
 
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent.parent
 _PLUGIN_SOURCE_DIR = _PLUGIN_DIR / "champsim_tracer"
-_DECODE_PATH = _PLUGIN_SOURCE_DIR / "champsim_tracer_decode.py"
+_RUNNER_PATH = _PLUGIN_DIR / "wptrace_genval" / "_cst_decode_runner.py"
 
 
 def _load_decoder():
     spec = importlib.util.spec_from_file_location(
-        "champsim_tracer_decode", _DECODE_PATH
+        "_cst_decode_runner", _RUNNER_PATH
     )
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
+    # Register before exec_module so @dataclasses.dataclass can find the
+    # module in sys.modules (Python 3.12 enforces this).
+    import sys
+    sys.modules["_cst_decode_runner"] = mod
     spec.loader.exec_module(mod)
     return mod
 

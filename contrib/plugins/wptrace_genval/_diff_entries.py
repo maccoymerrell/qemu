@@ -1,8 +1,7 @@
 """Diff two decoded traces structurally."""
 import sys
 from pathlib import Path
-sys.path.insert(0, "../champsim_tracer")
-import champsim_tracer_decode as dec
+import _cst_decode_runner as dec
 
 
 def diff_lists(a, b, label, max_show=3):

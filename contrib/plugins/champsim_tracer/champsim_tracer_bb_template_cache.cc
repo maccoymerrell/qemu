@@ -53,6 +53,17 @@ size_t BBTemplateCache::tb_count() const
 void BBTemplateCache::clear_bb_map()
 {
     bb_map_.clear();
+    /*
+     * Reset the template-id counter so the next segment starts at id 1.
+     * Otherwise template ids accumulate monotonically across segments
+     * and the per-(template_id) FieldStateBlock vector inside each
+     * segment's fresh FieldStateTable is forced to grow past the
+     * unused 1..N1 slots from the previous segment on first hit.
+     * Wire format unaffected — template ids are emitted as deltas
+     * relative to the previous template id within the segment, and
+     * each segment opens a new TEMPLATES section anyway.
+     */
+    next_template_id_ = 1;
 }
 
 size_t BBTemplateCache::bb_count() const

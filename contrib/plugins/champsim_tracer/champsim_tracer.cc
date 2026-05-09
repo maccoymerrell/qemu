@@ -197,7 +197,7 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
 
     for (uint8_t i = 0; i < f->n_dst_regs; i++) {
         RegSnap s;
-        g_reg_snaps.read_into_snap(cpu_index, &names->dst_qemu_reg_keys[i], &s);
+        g_reg_snaps.read_into_snap(cpu_index, names->dst_qemu_reg_keys[i], &s);
         pending_reg_snaps.push_back(s);
     }
 }
@@ -281,8 +281,8 @@ static void vcpu_insn_synth_ea_cb(unsigned int cpu_index, void *udata)
         tls_scratch = g_byte_array_sized_new(16);
     }
 
-    uint64_t base = read_reg_u64(cpu_index, &sea->base_key, tls_scratch);
-    uint64_t index = read_reg_u64(cpu_index, &sea->index_key, tls_scratch);
+    uint64_t base = read_reg_u64(cpu_index, sea->base_key, tls_scratch);
+    uint64_t index = read_reg_u64(cpu_index, sea->index_key, tls_scratch);
 
     /* AArch64 register-form: index gets the shift modifier first;
      * x86 SIB: index gets multiplied by scale.  The two are mutually
@@ -571,7 +571,7 @@ static void flush_pending_final_body_entry(void)
                 for (uint8_t i = 0; i < fl->n_dst_regs; i++) {
                     RegSnap s;
                     g_reg_snaps.read_into_snap(cpu_index,
-                                               &nl->dst_qemu_reg_keys[i], &s);
+                                               nl->dst_qemu_reg_keys[i], &s);
                     pending_reg_snaps.push_back(s);
                 }
             }
@@ -941,7 +941,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
             for (uint8_t i = 0; i < fl->n_dst_regs; i++) {
                 RegSnap s;
                 g_reg_snaps.read_into_snap(cpu_index,
-                                           &nl->dst_qemu_reg_keys[i], &s);
+                                           nl->dst_qemu_reg_keys[i], &s);
                 pending_reg_snaps.push_back(s);
             }
         }

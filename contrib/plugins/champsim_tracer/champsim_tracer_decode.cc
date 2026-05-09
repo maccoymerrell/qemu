@@ -132,9 +132,9 @@ static inline void add_src_reg(InsnFields *f, InsnRegNames *refs,
     }
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         if (f->src_regs[i] == reg_id) {
-            if (refs && !refs->src_qemu_reg_keys[i].name &&
+            if (refs && !refs->src_qemu_reg_keys[i] &&
                 qemu_reg_key_valid(qemu_reg)) {
-                refs->src_qemu_reg_keys[i] = *qemu_reg;
+                refs->src_qemu_reg_keys[i] = qemu_reg;
             }
             return;
         }
@@ -142,7 +142,7 @@ static inline void add_src_reg(InsnFields *f, InsnRegNames *refs,
     uint8_t slot = f->n_src_regs++;
     f->src_regs[slot] = reg_id;
     if (refs && qemu_reg_key_valid(qemu_reg)) {
-        refs->src_qemu_reg_keys[slot] = *qemu_reg;
+        refs->src_qemu_reg_keys[slot] = qemu_reg;
     }
 }
 
@@ -154,9 +154,9 @@ static inline void add_dst_reg(InsnFields *f, InsnRegNames *refs,
     }
     for (uint8_t i = 0; i < f->n_dst_regs; i++) {
         if (f->dst_regs[i] == reg_id) {
-            if (refs && !refs->dst_qemu_reg_keys[i].name &&
+            if (refs && !refs->dst_qemu_reg_keys[i] &&
                 qemu_reg_key_valid(qemu_reg)) {
-                refs->dst_qemu_reg_keys[i] = *qemu_reg;
+                refs->dst_qemu_reg_keys[i] = qemu_reg;
             }
             return;
         }
@@ -164,10 +164,18 @@ static inline void add_dst_reg(InsnFields *f, InsnRegNames *refs,
     uint8_t slot = f->n_dst_regs++;
     f->dst_regs[slot] = reg_id;
     if (refs && qemu_reg_key_valid(qemu_reg)) {
-        refs->dst_qemu_reg_keys[slot] = *qemu_reg;
+        refs->dst_qemu_reg_keys[slot] = qemu_reg;
     }
 }
 
+/*
+ * For pointer-stable QemuRegKey identity per logical register, every
+ * call into add_{src,dst}_reg routes through qemu_reg_for_generic(),
+ * which returns the singleton pointer in g_qemu_reg_by_gen[].  The
+ * RegClassification's own .qemu_reg may live at a different address
+ * (active_reg_table backing) but holds an identical (feature, name)
+ * pair, since g_qemu_reg_by_gen[gen] was populated from one such row.
+ */
 static inline void add_src_cap_reg(InsnFields *f, InsnRegNames *refs,
                                    uint16_t cap_id)
 {
@@ -182,7 +190,7 @@ static inline void add_src_cap_reg(InsnFields *f, InsnRegNames *refs,
         }
         return;
     }
-    add_src_reg(f, refs, rc->reg_id, &rc->qemu_reg);
+    add_src_reg(f, refs, rc->reg_id, qemu_reg_for_generic(rc->reg_id));
 }
 
 static inline void add_dst_cap_reg(InsnFields *f, InsnRegNames *refs,
@@ -199,7 +207,7 @@ static inline void add_dst_cap_reg(InsnFields *f, InsnRegNames *refs,
         }
         return;
     }
-    add_dst_reg(f, refs, rc->reg_id, &rc->qemu_reg);
+    add_dst_reg(f, refs, rc->reg_id, qemu_reg_for_generic(rc->reg_id));
 }
 
 static void warn_unknown_instruction(uint64_t pc, const char *reason,
@@ -443,13 +451,13 @@ bool decode_synthetic_ea(const qemu_plugin_insn_info *info,
              * (target = next_insn_PC + disp). */
             out->disp = (int64_t)((uint64_t)pc + insn_size + (uint64_t)op->imm);
         } else {
-            if (base_rc && qemu_reg_key_valid(&base_rc->qemu_reg)) {
-                out->base_key = base_rc->qemu_reg;
+            if (base_rc) {
+                out->base_key = qemu_reg_for_generic(base_rc->reg_id);
             }
             out->disp = op->imm;
         }
-        if (index_rc && qemu_reg_key_valid(&index_rc->qemu_reg)) {
-            out->index_key = index_rc->qemu_reg;
+        if (index_rc) {
+            out->index_key = qemu_reg_for_generic(index_rc->reg_id);
         }
         out->scale = op->scale;
         out->shift_type = op->shift_type;

@@ -265,12 +265,16 @@ typedef struct {
 
 /*
  * Per-insn QEMU register descriptor keys for InsnFields.src_regs[] and
- * InsnFields.dst_regs[].  A NULL name means the corresponding generic
- * register has no single QEMU register that can be read directly.
+ * InsnFields.dst_regs[].  Each entry is a pointer to a stable singleton
+ * in g_qemu_reg_by_gen[] (built by build_qemu_reg_reverse_index() at
+ * install time) — pointer identity per logical register is what makes
+ * the TLS pointer-cache in RegHandleCache::lookup hit cross-instruction
+ * for the same register.  NULL means the corresponding generic register
+ * has no single QEMU register that can be read directly.
  */
 typedef struct {
-    QemuRegKey src_qemu_reg_keys[MAX_SRC_REGS];
-    QemuRegKey dst_qemu_reg_keys[MAX_DST_REGS];
+    const QemuRegKey *src_qemu_reg_keys[MAX_SRC_REGS];
+    const QemuRegKey *dst_qemu_reg_keys[MAX_DST_REGS];
 } InsnRegNames;
 
 /*
@@ -282,13 +286,14 @@ typedef struct {
  * and computes ea = base + (index << shift_amount) * scale + disp.
  *
  * has_addr is the discriminator: a zero descriptor means "no
- * synthetic EA for this insn."  base_key.feature == NULL means the
- * base register is implicitly zero (e.g. pure-displacement form).
- * Likewise for index_key.
+ * synthetic EA for this insn."  base_key == NULL means the base
+ * register is implicitly zero (e.g. pure-displacement form).
+ * Likewise for index_key.  Both are stable pointers into
+ * g_qemu_reg_by_gen[].
  */
 typedef struct {
-    QemuRegKey base_key;
-    QemuRegKey index_key;
+    const QemuRegKey *base_key;
+    const QemuRegKey *index_key;
     int64_t  disp;
     uint8_t  scale;        /* x86 SIB; 0/1 = effective scale 1 */
     uint8_t  shift_type;   /* AArch64 ARM64_SFT_*; 0 = none    */

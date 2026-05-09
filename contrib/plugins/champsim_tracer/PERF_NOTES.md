@@ -68,6 +68,77 @@ Next round candidates (not yet implemented):
 
 ---
 
+## Optimization round 2 — reg-data path
+
+`perf` had been mis-attributing the cost of the per-insn dst-reg
+snap path: under sampling at 999 Hz the work was spread across so
+many tiny call frames that no single self-time bar told the real
+story.  Differential timing (progressively short-circuiting layers
+of the path with an env-var knob) gave the actual breakdown on
+the full config (`mcf_r 20 M`, `wp=1,memdata=1,regdata=1`):
+
+| Skip level | What's bypassed (cumulative)                       | Wall    | Δ from prev |
+|------------|----------------------------------------------------|---------|-------------|
+| 0          | nothing (baseline)                                 | 163.83s | —           |
+| 1          | `qemu_plugin_read_register` itself                 | 149.14s | −14.69s     |
+| 2          | + `RegHandleCache::lookup` + scratch reset         | 134.25s | −14.89s     |
+| 3          | + `pending_reg_snaps.push_back`                    | 125.34s | −8.91s      |
+| 4          | + `capture_insn_snaps_live` wrapper entirely       | 124.54s | −0.80s      |
+
+Total reg-data cost: **~39.3 s** (≈ 24 % of `full`), split nearly
+evenly between the read API itself and the handle lookup, with a
+smaller third in vector storage.  `perf` had pegged it at ≈ 22 s.
+
+The lookup half was the actionable surprise.  Each instruction's
+`InsnRegNames` was storing `QemuRegKey` **by value** (one copy per
+slot), so the same logical register had a different key-pointer
+across instructions, and the TLS pointer-identity cache in
+`RegHandleCache::lookup` was missing ~50 % of the time and
+falling through to the glib hash + `g_str_hash` + strcmp chain.
+
+Fix: change `InsnRegNames::{src,dst}_qemu_reg_keys` and
+`SyntheticEAInfo::{base,index}_key` to **pointers** into the
+single global `g_qemu_reg_by_gen[]` table built by
+`build_qemu_reg_reverse_index()` at install time.  Every reference
+to logical register *gen_id* now uses the same pointer, so the
+TLS pointer cache hits ~100 % cross-instruction.  Trace decode is
+correct (`cst_audit` shows identical CP-entry / CP-insn / dst-reg
+counts; the < 0.01 % delta in WP-entry counts is the libc-startup
+cross-run variance noted in round 1).
+
+Measured impact on `mcf_r 20 M` (re-baselined immediately before
+the change):
+
+| Configuration  | Before  | After    | Saved        |
+|----------------|---------|----------|--------------|
+| cp_only        | 5.92 s  | 5.03 s   | 15 % (0.9 s) |
+| wp_no_data     | 102.0 s | 103.2 s  | within noise |
+| full           | 161.6 s | 146.8 s  | 9.2 % (14.9 s)|
+
+Tried and abandoned in this round:
+
+* `-D_GLIBCXX_ASSERTIONS=0`, `-O3`, `-flto` for the plugin
+  shared object: each ran inside ±3 % of baseline.  At `-O2`
+  GCC has already done what's worth doing for this control-flow
+  shape; the QEMU plugin API call boundary dominates.
+* QEMU plugin API fast-path (`qemu_plugin_read_register_value`):
+  added a per-target `gdb_read_register_value` hook that writes
+  raw bytes into a caller-supplied buffer, skipping the
+  `GByteArray + g_byte_array_append` chain.  Implemented for
+  x86 / aarch64 / riscv / mips.  On top of the stable-keys
+  change it saved a further ~5 s on `full` — not worth the
+  ~22-file change to QEMU core for a 3 % improvement.  Reverted.
+* `pending_reg_snaps` `assign`-out instead of `move`-out (to
+  preserve underlying capacity across BBs): per-BB copy cost
+  > realloc-avoidance saving.  Reverted.
+
+Remaining big-ticket lever: the encoder still dominates on `full`
+(see round 1 hot spots).  Moving `emit_body_entry` →
+`emit_field_delta_section` off the vCPU thread onto a producer-
+consumer worker pool is the next obvious round.
+
+---
+
 
 
 Run-time breakdown captured via `perf record -g --call-graph dwarf

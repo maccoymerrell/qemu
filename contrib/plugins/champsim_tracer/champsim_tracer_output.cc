@@ -924,6 +924,15 @@ typedef struct {
     uint64_t (*template_default_u64)(const BBTemplate *tmpl,
                                      uint32_t ins_pos, uint8_t slot);
 
+    /* True iff the family's extract value equals its template_default
+     * for every body entry of a given (template, ins_pos) — i.e. the
+     * field is purely a function of the template, not of the run-time
+     * entry.  Such families never produce wire records (cur == base
+     * always), so the encoder hot loop can skip them entirely.
+     * Differential timing showed these probes were ~50 % of the per-
+     * slot cost on full-config mcf despite emitting nothing. */
+    bool template_static;
+
     const char *name;          /* debug only */
 } FieldDescriptor;
 
@@ -1304,58 +1313,72 @@ static const FieldDescriptor field_descriptors[] = {
         { CST_FID_N_LOADS,          1,  false, false,
             extr_n_loads,        deflt_n_loads,         nullptr,
             extr_u64_n_loads,    deflt_u64_zero,
+            false /* dynamic: actual_n_loads[i] */,
             "N_LOADS" },
         { CST_FID_LOAD_ADDR_BASE,   CST_FID_SLOT_COUNT, false, false,
             extr_load_addr,      deflt_zero,            cap_loads,
             extr_u64_load_addr,  deflt_u64_zero,
+            false /* dynamic: dyn_param value */,
             "LOAD_ADDR" },
         { CST_FID_STORE_ADDR_BASE,  CST_FID_SLOT_COUNT, false, false,
             extr_store_addr,     deflt_zero,            cap_stores,
             extr_u64_store_addr, deflt_u64_zero,
+            false /* dynamic: dyn_param value */,
             "STORE_ADDR" },
         { CST_FID_LOAD_DATA_BASE,   CST_FID_SLOT_COUNT, true,  false,
             extr_load_data,      deflt_zero,            cap_loads,
             nullptr,             nullptr,
+            false /* dynamic: memdata payload */,
             "LOAD_DATA" },
         { CST_FID_STORE_DATA_BASE,  CST_FID_SLOT_COUNT, true,  false,
             extr_store_data,     deflt_zero,            cap_stores,
             nullptr,             nullptr,
+            false /* dynamic: memdata payload */,
             "STORE_DATA" },
         { CST_FID_DST_REG_BASE,     CST_FID_SLOT_COUNT, false, true,
             extr_dst_reg,        deflt_zero,            cap_dst_regs,
             nullptr,             nullptr,
+            false /* dynamic: post-exec reg value */,
             "DST_REG" },
         { CST_FID_N_STORES,         1,  false, false,
             extr_n_stores,       deflt_n_stores,        nullptr,
             extr_u64_n_stores,   deflt_u64_zero,
+            false /* dynamic: actual_n_stores[i] */,
             "N_STORES" },
         { CST_FID_INSN_BYTES_LO,    1,  false, false,
             extr_insn_bytes_lo,  deflt_insn_bytes_lo,   nullptr,
             extr_u64_insn_bytes_lo, deflt_u64_insn_bytes_lo,
+            true /* extract == template_default */,
             "INSN_BYTES_LO" },
         { CST_FID_INSN_BYTES_HI,    1,  false, false,
             extr_insn_bytes_hi,  deflt_insn_bytes_hi,   nullptr,
             extr_u64_insn_bytes_hi, deflt_u64_insn_bytes_hi,
+            true /* extract == template_default */,
             "INSN_BYTES_HI" },
         { CST_FID_INSN_OPCODE,      1,  false, false,
             extr_insn_opcode,    deflt_insn_opcode,     nullptr,
             extr_u64_insn_opcode, deflt_u64_insn_opcode,
+            true /* extract == template_default */,
             "OPCODE" },
         { CST_FID_INSN_BRANCH_TYPE, 1,  false, false,
             extr_insn_branch_type, deflt_insn_branch_type, nullptr,
             extr_u64_insn_branch_type, deflt_u64_insn_branch_type,
+            true /* extract == template_default */,
             "BRANCH_TYPE" },
         { CST_FID_INSN_FLAGS,       1,  false, false,
             extr_insn_flags,     deflt_insn_flags,      nullptr,
             extr_u64_insn_flags, deflt_u64_insn_flags,
+            true /* extract == template_default */,
             "INSN_FLAGS" },
         { CST_FID_INSN_IMMEDIATE,   1,  false, false,
             extr_insn_imm,       deflt_insn_imm,        nullptr,
             extr_u64_insn_imm,   deflt_u64_insn_imm,
+            true /* extract == template_default */,
             "IMMEDIATE" },
         { CST_FID_INSN_SIZE,        1,  false, false,
             extr_insn_size,      deflt_insn_size,       nullptr,
             extr_u64_insn_size,  deflt_u64_insn_size,
+            true /* extract == template_default */,
             "INSN_SIZE" },
 };
 
@@ -1718,6 +1741,16 @@ static void emit_field_delta_section(BitWriter *main_bw,
         for (uint32_t i = 0; i < ev->tmpl->n_insns; i++) {
             for (size_t d = 0; d < N_FIELD_DESCRIPTORS; d++) {
                 const FieldDescriptor *fd = &field_descriptors[d];
+                /* Template-static families (OPCODE, BRANCH_TYPE,
+                 * INSN_BYTES_*, IMMEDIATE, FLAGS, SIZE) have
+                 * extract == template_default for every body entry of
+                 * a given (template, ins_pos), so cur == base always
+                 * and they never produce a wire record.  Skip the
+                 * probe entirely — the wire output is identical to
+                 * iterating them and seeing every probe land on the
+                 * cur == base continue. */
+                if (fd->template_static)
+                    continue;
                 if (fd->gated_by_mem_data && !(header_flags & CST_FLAG_MEM_DATA))
                     continue;
                 if (fd->gated_by_reg_data && !(header_flags & CST_FLAG_REG_DATA))

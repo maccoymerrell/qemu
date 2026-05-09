@@ -139,6 +139,70 @@ consumer worker pool is the next obvious round.
 
 ---
 
+## Optimization round 3 — encoder probe elimination
+
+Same differential-timing technique applied to
+`emit_field_delta_section` itself (env-var skip levels, post-round-2
+baseline 148.3 s on `full @ 20 M`):
+
+| Skip level | What's bypassed (cumulative)                       | Wall    | Δ from prev |
+|-----------:|----------------------------------------------------|--------:|------------:|
+| 0          | nothing                                            | 148.3 s | —           |
+| 1          | + final varint write loop                          | 140.9 s | −7.4 s      |
+| 2          | + per-slot extract / compare / stage               | 108.5 s | **−32.3 s** |
+| 3          | + outer (insn × field_desc) loop iteration         | 96.3 s  | −12.3 s     |
+| 4          | + `field_state_table_get_block`                    | 95.6 s  | −0.7 s      |
+| 5          | + `emit_field_delta_section` body entirely         | 92.5 s  | −3.0 s      |
+
+Total encoder cost: **55.8 s (38 % of `full`)**.  The dominant cost
+was the **per-slot inner loop** (32 s, 58 % of encoder).
+
+Decomposing the per-slot loop further: 7 of the 11 narrow field
+families are *template-static* — their `extract_u64` is literally
+`*out = template_default_u64(...); return true;`.  For these,
+`cur == base` *always* after first sighting (and on first sighting
+the state-block fallback also hits `template_default`), so they
+never produce a wire record but pay the full probe cost on every
+body entry.  Across 64 M body entries × 7 fields × ~5 insns
+each = ~2.2 B wasted probes.
+
+Fix: add `template_static` flag to `FieldDescriptor`; set true on
+INSN_BYTES_LO/HI, OPCODE, BRANCH_TYPE, INSN_FLAGS, IMMEDIATE,
+INSN_SIZE; skip those families in the encoder hot loop.  The wire
+output is byte-identical (those families never wrote records to
+begin with — they were all `cur == base` no-ops).  Decoder gets
+the values from the template, exactly as before.
+
+Measured impact on `mcf_r 20 M`, x86_64 (re-baselined immediately
+before the change):
+
+| Configuration  | Before  | After    | Saved        |
+|----------------|---------|----------|--------------|
+| cp_only        | 5.03 s  | 4.44 s   | 12 % (0.6 s) |
+| wp_no_data     | 103.2 s | 84.85 s  | 18 % (18.4 s)|
+| full           | 146.8 s | 127.75 s | 13 % (19.0 s)|
+
+Trace round-trips correctly: `cst_audit` shows identical
+CP-entry / CP-insn / dest-register counts.  `cst_decode --format=
+legacy` runs clean and emits correct opcodes / bytes / regs / imm
+(template-static fields decode from the template, unchanged).
+
+Cumulative across rounds 1+2+3:
+
+| Configuration  | Round 1 baseline | Round 3   | Saved        |
+|----------------|------------------|-----------|--------------|
+| cp_only        | 7.41 s           | 4.44 s    | 40 % (3.0 s) |
+| wp_no_data     | 116 s            | 84.85 s   | 27 % (31 s)  |
+| full           | 176 s            | 127.75 s  | 27 % (48 s)  |
+
+Encoder per-body-entry cost dropped from ~1 µs to ~620 ns.  The
+asymmetry vs the decoder (~25 ns / entry, ~200 M ips) is now
+~25× rather than 40×, and the next big move is the encoder-on-a-
+worker-thread split — at which point the per-entry cost stops
+being on the vCPU's critical path entirely.
+
+---
+
 
 
 Run-time breakdown captured via `perf record -g --call-graph dwarf

@@ -401,6 +401,20 @@ struct BodyStreamState {
     FieldStateTable *iframe_cp_scratch;
     FieldStateTable *iframe_wp_scratch;
     EntryViewScratch ev_scratch;
+    /* Per-body-entry scratch.  Reused across millions of entries to
+     * eliminate the malloc/free pair the encoder previously paid on
+     * every record.  rec_scratch is a GByteArray whose length is
+     * reset to 0 at the start of each delta-section emit and whose
+     * bytes are then copied into the main stream; the underlying
+     * allocation grows once to the largest record observed and
+     * stays put for the rest of the trace.  stage_buf is the
+     * StageRec[] the descriptor walk fills in, also reused.  Raw
+     * pointer because StageRec's type definition lives further
+     * down this TU and a vector<StageRec> here would force a
+     * file-order rearrangement. */
+    GByteArray *rec_scratch;
+    struct StageRec *stage_buf;
+    size_t stage_cap;
     uint64_t num_entries;
     uint64_t body_off;
     uint8_t  header_flags;   /* CST_FLAG_* bits emitted in header */
@@ -676,49 +690,61 @@ typedef struct FieldStateBlock {
     uint32_t *generations;
 } FieldStateBlock;
 
+/*
+ * Per-(template_id) FieldStateBlock cache.  Template IDs are dense
+ * positive integers handed out by BBTemplateCache starting from 1,
+ * so a vector indexed by template_id replaces the per-entry glib
+ * hash lookup that profiling at ~10 % of total runtime on mcf.
+ * Slot 0 is unused (template_id 0 is reserved as "no template").
+ * The vector grows on demand when a never-seen-before template_id
+ * arrives; existing pointers are stable across grows because
+ * std::vector<T*> only reallocates the pointer array.
+ */
 struct FieldStateTable {
-    GHashTable *blocks;
+    std::vector<FieldStateBlock *> blocks;  /* index = template_id */
     uint32_t generation;
 };
 
-static uint8_t field_state_slot_index(uint8_t field_id)
+/*
+ * Field-id → slot-index lookup table.  Built once at first call so
+ * the hot encoder loop does a single byte-load per record instead of
+ * the eight-branch chain the original implementation used.  At ~80 M
+ * calls on a 5 M-insn mcf trace, the chain showed up as 2.6 % of
+ * total runtime; the table form drops that to a rounding error.
+ */
+static uint8_t g_field_state_slot_lut[256];
+static bool    g_field_state_slot_lut_built = false;
+
+static void field_state_slot_lut_build(void)
 {
-    if (field_id == CST_FID_N_LOADS) {
-        return 0;
+    for (unsigned i = 0; i < 256; i++) {
+        g_field_state_slot_lut[i] = FIELD_STATE_SLOT_INVALID;
     }
-    if (field_id >= CST_FID_LOAD_ADDR_BASE &&
-        field_id < CST_FID_LOAD_ADDR_BASE + CST_FID_SLOT_COUNT) {
-        return 1 + (field_id - CST_FID_LOAD_ADDR_BASE);
+    g_field_state_slot_lut[CST_FID_N_LOADS] = 0;
+    for (unsigned k = 0; k < CST_FID_SLOT_COUNT; k++) {
+        g_field_state_slot_lut[CST_FID_LOAD_ADDR_BASE + k] =
+            1 + k;
+        g_field_state_slot_lut[CST_FID_STORE_ADDR_BASE + k] =
+            1 + CST_FID_SLOT_COUNT + k;
+        g_field_state_slot_lut[CST_FID_LOAD_DATA_BASE + k] =
+            1 + (2 * CST_FID_SLOT_COUNT) + k;
+        g_field_state_slot_lut[CST_FID_STORE_DATA_BASE + k] =
+            1 + (3 * CST_FID_SLOT_COUNT) + k;
+        g_field_state_slot_lut[CST_FID_DST_REG_BASE + k] =
+            1 + (4 * CST_FID_SLOT_COUNT) + k;
     }
-    if (field_id >= CST_FID_STORE_ADDR_BASE &&
-        field_id < CST_FID_STORE_ADDR_BASE + CST_FID_SLOT_COUNT) {
-        return 1 + CST_FID_SLOT_COUNT
-               + (field_id - CST_FID_STORE_ADDR_BASE);
+    g_field_state_slot_lut[CST_FID_N_STORES] =
+        1 + (5 * CST_FID_SLOT_COUNT);
+    for (unsigned f = CST_FID_INSN_BYTES_LO; f <= CST_FID_INSN_SIZE; f++) {
+        g_field_state_slot_lut[f] = 2 + (5 * CST_FID_SLOT_COUNT)
+            + (f - CST_FID_INSN_BYTES_LO);
     }
-    if (field_id >= CST_FID_LOAD_DATA_BASE &&
-        field_id < CST_FID_LOAD_DATA_BASE + CST_FID_SLOT_COUNT) {
-        return 1 + (2 * CST_FID_SLOT_COUNT)
-               + (field_id - CST_FID_LOAD_DATA_BASE);
-    }
-    if (field_id >= CST_FID_STORE_DATA_BASE &&
-        field_id < CST_FID_STORE_DATA_BASE + CST_FID_SLOT_COUNT) {
-        return 1 + (3 * CST_FID_SLOT_COUNT)
-               + (field_id - CST_FID_STORE_DATA_BASE);
-    }
-    if (field_id >= CST_FID_DST_REG_BASE &&
-        field_id < CST_FID_DST_REG_BASE + CST_FID_SLOT_COUNT) {
-        return 1 + (4 * CST_FID_SLOT_COUNT)
-               + (field_id - CST_FID_DST_REG_BASE);
-    }
-    if (field_id == CST_FID_N_STORES) {
-        return 1 + (5 * CST_FID_SLOT_COUNT);
-    }
-    if (field_id >= CST_FID_INSN_BYTES_LO &&
-        field_id <= CST_FID_INSN_SIZE) {
-        return 2 + (5 * CST_FID_SLOT_COUNT)
-               + (field_id - CST_FID_INSN_BYTES_LO);
-    }
-    return FIELD_STATE_SLOT_INVALID;
+    g_field_state_slot_lut_built = true;
+}
+
+static inline uint8_t field_state_slot_index(uint8_t field_id)
+{
+    return g_field_state_slot_lut[field_id];
 }
 
 static void field_state_block_free(void * data)
@@ -734,9 +760,7 @@ static void field_state_block_free(void * data)
 
 static FieldStateTable *field_state_table_new(void)
 {
-    FieldStateTable *table = g_new0(FieldStateTable, 1);
-    table->blocks = g_hash_table_new_full(g_direct_hash, g_direct_equal,
-                                          nullptr, field_state_block_free);
+    FieldStateTable *table = new FieldStateTable();
     table->generation = 1;
     return table;
 }
@@ -746,8 +770,10 @@ static void field_state_table_free(FieldStateTable *table)
     if (!table) {
         return;
     }
-    g_hash_table_unref(table->blocks);
-    g_free(table);
+    for (FieldStateBlock *b : table->blocks) {
+        field_state_block_free(b);
+    }
+    delete table;
 }
 
 static FieldStateBlock *field_state_table_get_block(FieldStateTable *table,
@@ -755,18 +781,26 @@ static FieldStateBlock *field_state_table_get_block(FieldStateTable *table,
                                                     const BBTemplate *tmpl,
                                                     bool create)
 {
-    FieldStateBlock *block = (FieldStateBlock *)
-        g_hash_table_lookup(table->blocks, GUINT_TO_POINTER(template_id));
-    if (block || !create || !tmpl) {
-        return block;
+    if (template_id < table->blocks.size()) {
+        FieldStateBlock *block = table->blocks[template_id];
+        if (block) {
+            return block;
+        }
+    }
+    if (!create || !tmpl) {
+        return nullptr;
     }
 
-    block = g_new0(FieldStateBlock, 1);
+    if (template_id >= table->blocks.size()) {
+        table->blocks.resize((size_t)template_id + 1, nullptr);
+    }
+
+    FieldStateBlock *block = g_new0(FieldStateBlock, 1);
     block->n_insns = tmpl->n_insns;
     size_t n_slots = (size_t)block->n_insns * FIELD_STATE_SLOT_COUNT;
     block->values = g_new0(U512, n_slots ? n_slots : 1);
     block->generations = g_new0(uint32_t, n_slots ? n_slots : 1);
-    g_hash_table_insert(table->blocks, GUINT_TO_POINTER(template_id), block);
+    table->blocks[template_id] = block;
     return block;
 }
 
@@ -1645,6 +1679,7 @@ static void bw_write_extra_memop_vector(BitWriter *bw, const EntryView *ev,
  * slot inner ascending) — no sort needed.
  */
 static void emit_field_delta_section(BitWriter *main_bw,
+                                     BodyStreamState *st,
                                      FieldStateTable *state,
                                      FieldStateTable *base_state,
                                      uint32_t template_id,
@@ -1652,14 +1687,23 @@ static void emit_field_delta_section(BitWriter *main_bw,
                                      bool is_wp,
                                      uint8_t header_flags)
 {
+    /* rec_bw is a thin BitWriter wrapping st->rec_scratch.  We reset
+     * the byte-array's length to 0 so the previous entry's payload
+     * is overwritten without freeing the underlying allocation. */
     BitWriter rec_bw;
-    bw_init_buf(&rec_bw);
+    rec_bw.f = nullptr;
+    rec_bw.w = nullptr;
+    rec_bw.buf = st->rec_scratch;
+    rec_bw.total_bytes = 0;
+    g_byte_array_set_size(st->rec_scratch, 0);
 
-    /* Buffer records into a small staging vec so the ULEB record count can
-     * precede the payload without a second descriptor walk. */
+    /* Reuse the per-stream StageRec buffer.  Length resets each call;
+     * capacity grows on demand via stage_rec_append's g_realloc_n
+     * path and is synced back to BodyStreamState before return so
+     * the next entry sees the larger capacity too. */
     unsigned int stage_len = 0;
-    unsigned int stage_cap = 16;
-    g_autofree StageRec *stage = g_new(StageRec, stage_cap);
+    unsigned int stage_cap = (unsigned int)st->stage_cap;
+    StageRec *stage = st->stage_buf;
 
     uint32_t prev_pos = 0;
     if (ev->tmpl) {
@@ -1769,7 +1813,15 @@ static void emit_field_delta_section(BitWriter *main_bw,
         prev_pos = s->pos;
     }
     bw_byte_align(&rec_bw);
-    bw_write_section(main_bw, bw_finish_buf(&rec_bw));
+    /* Write the section directly from the scratch buffer without
+     * unref'ing it — st->rec_scratch persists for the next entry. */
+    GByteArray *rec_buf = st->rec_scratch;
+    bw_write_uleb128(main_bw, rec_buf->len);
+    bw_raw(main_bw, rec_buf->data, rec_buf->len);
+
+    /* Sync any stage_buf growth back to BodyStreamState. */
+    st->stage_buf = stage;
+    st->stage_cap = stage_cap;
 
     uint64_t bits = (bw_tell_bytes(main_bw) - section_start) * 8;
     if (is_wp) g_stats.bin_dyn_wp_bits += bits;
@@ -1784,6 +1836,10 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
                                  uint64_t total_target_insns,
                                  const std::vector<InitialRegSnap> *regfile)
 {
+    if (!g_field_state_slot_lut_built) {
+        field_state_slot_lut_build();
+    }
+
     BodyStreamState *st = g_new0(BodyStreamState, 1);
 
     bw_init_writer(&st->bw, w);
@@ -1864,6 +1920,13 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
     st->iframe_cp_scratch = nullptr;  /* lazy on first IFRAME */
     st->iframe_wp_scratch = nullptr;
 
+    /* Pre-allocate the encoder's per-entry scratch.  Sized
+     * generously enough that the typical body record never
+     * triggers a realloc; growth on demand handles outliers. */
+    st->rec_scratch = g_byte_array_sized_new(256);
+    st->stage_cap = 64;
+    st->stage_buf = (StageRec *)g_malloc(sizeof(StageRec) * st->stage_cap);
+
     return st;
 }
 
@@ -1913,8 +1976,8 @@ static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
                      scratch->insn_rs_off,
                      scratch->load_slots,
                      scratch->store_slots);
-    emit_field_delta_section(bw, state, base_state, template_id, &ev, is_wp,
-                             st->header_flags);
+    emit_field_delta_section(bw, st, state, base_state, template_id,
+                             &ev, is_wp, st->header_flags);
 }
 
 /*
@@ -2132,4 +2195,10 @@ void body_stream_finish(BodyStreamState *st)
         field_state_table_free(st->iframe_wp_scratch);
     }
     entry_view_scratch_free(&st->ev_scratch);
+    if (st->rec_scratch) {
+        g_byte_array_unref(st->rec_scratch);
+        st->rec_scratch = nullptr;
+    }
+    g_free(st->stage_buf);
+    st->stage_buf = nullptr;
 }

@@ -7,12 +7,28 @@
 #include "champsim_tracer_bb_chain_assembler.h"
 #include "champsim_tracer_bb_template_cache.h"
 
-BBChainAssembler g_cp_chain;
+thread_local BBChainAssembler g_cp_chain;
+std::atomic<uint32_t> g_segment_generation{1};
 
 void BBChainAssembler::append_fragment(uint64_t entry_pc,
                                        BBTemplate *frag,
                                        uint64_t fall_through)
 {
+    /*
+     * On segment switch the BBTemplate * pointers in fragments_ become
+     * dangling (BBTemplateCache::clear_bb_map() drops their owning
+     * unique_ptrs).  Each segment switch bumps g_segment_generation;
+     * we lazily drop a stale chain here on the next append.  This lets
+     * reset_segment_local_state run on one thread without touching
+     * other threads' thread_local chains directly.
+     */
+    uint32_t cur_gen = g_segment_generation.load(std::memory_order_relaxed);
+    if (my_gen_ != cur_gen) {
+        fragments_.clear();
+        entry_pc_ = 0;
+        last_ft_ = 0;
+        my_gen_ = cur_gen;
+    }
     if (entry_pc_ == 0 || last_ft_ != entry_pc) {
         /* Discontinuity: drop in-flight chain and start a new one. */
         fragments_.clear();

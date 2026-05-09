@@ -392,10 +392,27 @@ static void reset_segment_local_state(void)
      * one zero-initialized (g_new0), so the IFRAME cadence implicitly
      * resets without a separate emit_count walk. */
     g_bb_template_cache.clear_bb_map();
+    g_mutex_unlock(&data_lock);
+
+    /*
+     * Per-vCPU thread_local state (cp_chain, tls_cp_mem_accesses,
+     * pending_reg_snaps) belongs to threads other than us.  We can't
+     * touch those directly.  Bumping g_segment_generation lets each
+     * thread self-drop its stale chain on its next append_fragment;
+     * tls_cp_mem_accesses naturally drains every BB and pending_reg_
+     * snaps drains every body emit, so they don't need a generation
+     * check (their stale contents are at most one in-flight BB old,
+     * and that BB's BBTemplate * pointers were just invalidated by
+     * clear_bb_map — but vcpu_tb_exec re-validates the prev_tb_tmpl
+     * via find_tb_template before using it, returning nullptr now
+     * that bb_map_ is empty).
+     */
+    g_segment_generation.fetch_add(1, std::memory_order_release);
+
+    /* Our own thread's TLS state (we're called from vcpu_tb_exec). */
     g_cp_chain.reset();
     g_mem_recorder.clear_cp();
     pending_reg_snaps.clear();
-    g_mutex_unlock(&data_lock);
 
     cpu_to_thread_id.clear();
     next_thread_id = 0;
@@ -588,10 +605,9 @@ static void flush_pending_final_body_entry(void)
         emit_body_entry(out_stream, bb_tmpl, cpu_index, {});
     }
 
-    g_mutex_lock(&data_lock);
+    /* cp_chain and tls_cp_mem_accesses are thread_local; no lock. */
     g_cp_chain.reset();
     g_mem_recorder.clear_cp();
-    g_mutex_unlock(&data_lock);
 
     qemu_plugin_u64_set(g_scoreboard.prev_start_pc, 0, 0);
     qemu_plugin_u64_set(g_scoreboard.prev_fall_through, 0, 0);
@@ -723,8 +739,7 @@ static uint64_t resolve_wrong_target(const BBTemplate *prev_tb_tmpl,
 /*
  * Run the WP simulator (if applicable), then build and emit the
  * BodyEntry for the just-finalized BB via emit_body_entry().  Caller
- * holds exec_lock; data_lock must be unheld (this function takes
- * data_lock around the cp_chain reset).
+ * holds exec_lock.  cp_chain is thread_local; reset needs no lock.
  */
 static void emit_finalized_bb(BodyStreamState *out_stream,
                               BBTemplate *bb_tmpl,
@@ -733,9 +748,7 @@ static void emit_finalized_bb(BodyStreamState *out_stream,
                               uint64_t wrong_target,
                               unsigned int cpu_index)
 {
-    g_mutex_lock(&data_lock);
     g_cp_chain.reset();
-    g_mutex_unlock(&data_lock);
 
     std::vector<WPBBEntry> wp_entries;
     if (enable_wrong_path && wrong_target != 0) {

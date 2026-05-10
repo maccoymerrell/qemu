@@ -55,66 +55,6 @@ void parse_encoding_maps(Reader &r, EncodingMaps *out,
     }
 }
 
-void merge_builtin_opcode(EncodingMaps *m)
-{
-    for (unsigned i = 0; i < GEN_OP_COUNT; i++) {
-        const char *n = ::generic_opcode_name(i);
-        if (n && !m->opcode.count(i)) m->opcode[i] = n;
-    }
-}
-void merge_builtin_branch(EncodingMaps *m)
-{
-    for (unsigned i = 0; i < BRANCH_TYPE_COUNT; i++) {
-        const char *n = ::branch_type_name(i);
-        if (n && !m->branch_type.count(i)) m->branch_type[i] = n;
-    }
-}
-void merge_builtin_sync(EncodingMaps *m)
-{
-    for (unsigned i = 0; i < SYNC_EVENT_COUNT; i++) {
-        const char *n = ::sync_event_name(i);
-        if (n && !m->sync_hint.count(i)) m->sync_hint[i] = n;
-    }
-}
-void merge_builtin_reg(EncodingMaps *m)
-{
-    for (unsigned i = 0; i < REG_ID_COUNT; i++) {
-        const char *n = ::generic_reg_name(i);
-        if (n && !m->reg.count(i)) m->reg[i] = n;
-    }
-}
-
-void merge_builtin_field_id(EncodingMaps *m)
-{
-    /* Mirrors champsim_tracer_decode.py's FIELD_ID_NAMES_DEFAULT.
-     * Mostly informational; the body walker keys off the numeric
-     * FIDs directly. */
-    auto put = [&](uint64_t k, std::string v) {
-        if (!m->field_id.count(k)) m->field_id[k] = std::move(v);
-    };
-    put(FID_N_LOADS,  "CST_FID_N_LOADS");
-    put(FID_N_STORES, "CST_FID_N_STORES");
-    for (uint64_t i = 0; i < FID_SLOT_COUNT; i++) {
-        put(FID_LOAD_ADDR_BASE  + i, "CST_FID_LOAD_ADDR"  + std::to_string(i));
-        put(FID_STORE_ADDR_BASE + i, "CST_FID_STORE_ADDR" + std::to_string(i));
-        put(FID_LOAD_DATA_BASE  + i, "CST_FID_LOAD_DATA"  + std::to_string(i));
-        put(FID_STORE_DATA_BASE + i, "CST_FID_STORE_DATA" + std::to_string(i));
-        put(FID_DST_REG_BASE    + i, "CST_FID_DST_REG"    + std::to_string(i));
-    }
-    put(FID_EXTRA_LOAD_ADDR,  "CST_FID_EXTRA_LOAD_ADDR");
-    put(FID_EXTRA_STORE_ADDR, "CST_FID_EXTRA_STORE_ADDR");
-    put(FID_EXTRA_LOAD_DATA,  "CST_FID_EXTRA_LOAD_DATA");
-    put(FID_EXTRA_STORE_DATA, "CST_FID_EXTRA_STORE_DATA");
-    put(FID_INSN_BYTES_LO,    "CST_FID_INSN_BYTES_LO");
-    put(FID_INSN_BYTES_HI,    "CST_FID_INSN_BYTES_HI");
-    put(FID_INSN_OPCODE,      "CST_FID_INSN_OPCODE");
-    put(FID_INSN_BRANCH_TYPE, "CST_FID_INSN_BRANCH_TYPE");
-    put(FID_INSN_FLAGS,       "CST_FID_INSN_FLAGS");
-    put(FID_INSN_IMMEDIATE,   "CST_FID_INSN_IMMEDIATE");
-    put(FID_INSN_SIZE,        "CST_FID_INSN_SIZE");
-    put(FID_EXTENDED,         "CST_FID_EXTENDED");
-}
-
 }  /* namespace */
 
 Trailer parse_trailer(const uint8_t *data, size_t size)
@@ -176,16 +116,10 @@ Header parse_header(const uint8_t *data, size_t size,
     if (r.pos() != body_off) {
         throw std::runtime_error("header/body offset mismatch");
     }
-
-    /* Merge built-in defaults into every name map so renderers can
-     * fall back when a map is absent (older traces) or only carries a
-     * sparse subset. */
-    merge_builtin_opcode(&h.maps);
-    merge_builtin_branch(&h.maps);
-    merge_builtin_sync(&h.maps);
-    merge_builtin_reg(&h.maps);
-    merge_builtin_field_id(&h.maps);
-
+    /* The trace's encoding maps are the only source of truth for
+     * id->name lookups — the writer always emits the full set, so
+     * the renderers fall back to "OP_<n>" / "REG_<n>" only on
+     * malformed traces. */
     return h;
 }
 

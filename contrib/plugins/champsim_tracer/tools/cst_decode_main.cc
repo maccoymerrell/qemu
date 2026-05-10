@@ -255,6 +255,45 @@ std::string regref_from_name(const std::string &name)
     return "%" + body;
 }
 
+/*
+ * Branch-type lookup keyed off the trace's own encoding-map name
+ * rather than a compile-time enum.  The wire format pins the names
+ * (BRANCH_NONE, BRANCH_DIRECT_JUMP, ...) regardless of which numeric
+ * id the writer assigns; matching by string keeps the decoder
+ * forward-compatible with future tracers that re-number the enum or
+ * add new branch flavours.  Returns nullptr for ids the trace
+ * carries no name for (the renderer falls back to a generic "br").
+ */
+const std::string *branch_name_lookup(const cst::Header &h, uint64_t bt)
+{
+    auto it = h.maps.branch_type.find(bt);
+    if (it == h.maps.branch_type.end()) return nullptr;
+    return &it->second;
+}
+
+bool branch_is_none(const cst::Header &h, uint64_t bt)
+{
+    /* Wire-format reserves id 0 for "not a branch"; the encoding map
+     * names that slot "BRANCH_NONE" but the renderer doesn't depend on
+     * the name being present. */
+    if (bt == 0) return true;
+    const std::string *n = branch_name_lookup(h, bt);
+    return n && *n == "BRANCH_NONE";
+}
+
+/* Map encoding-map name → short objdump-style mnemonic. */
+const char *branch_mnem_from_name(const std::string *name)
+{
+    if (!name) return nullptr;
+    const std::string &n = *name;
+    if (n == "BRANCH_DIRECT_JUMP")   return "jmp";
+    if (n == "BRANCH_INDIRECT_JUMP") return "jmpr";
+    if (n == "BRANCH_COND_DIRECT")   return "jcc";
+    if (n == "BRANCH_RETURN")        return "ret";
+    if (n == "BRANCH_SYSCALL_TYPE")  return "syscall";
+    return nullptr;
+}
+
 void disasm_tables_build(DisasmTables *t, const cst::Header &h)
 {
     auto build_from_map = [&](std::vector<std::string> &dst,
@@ -542,7 +581,7 @@ void render_legacy(FILE *out, const cst::Header &h,
             line += fmt_hex_lower(I.pc);
             line += ": op=";
             line += enum_or(h.maps.opcode, I.opcode, "OP");
-            if (I.branch_type != BRANCH_NONE) {
+            if (!branch_is_none(h, I.branch_type)) {
                 line += " br=";
                 line += enum_or(h.maps.branch_type, I.branch_type, "BR");
                 line += " cond=";
@@ -760,22 +799,20 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
         line.append("| ");
     }
 
-    /* Mnemonic.  For GEN_OP_BRANCH we substitute a branch-flavoured
-     * mnemonic (jmp / jcc / jmpr / call*) so the per-line annotation
+    /* Mnemonic.  For branch opcodes we substitute a branch-flavoured
+     * mnemonic (jmp / jcc / jmpr / ret / syscall) drawn from the
+     * trace's own branch_type encoding map so the per-line annotation
      * doesn't have to repeat `br=...`.  Other opcodes use the
      * pre-built mnemonic table directly. */
     size_t mnem_start = line.size();
-    if (I.branch_type == BRANCH_NONE) {
+    if (branch_is_none(*ctx.h, I.branch_type)) {
         append_mnem(&line, ctx, I.opcode);
+    } else if (const char *m =
+                   branch_mnem_from_name(branch_name_lookup(*ctx.h,
+                                                            I.branch_type))) {
+        line.append(m);
     } else {
-        switch (I.branch_type) {
-        case BRANCH_DIRECT_JUMP:    line.append("jmp");    break;
-        case BRANCH_INDIRECT_JUMP:  line.append("jmpr");   break;
-        case BRANCH_COND_DIRECT:    line.append("jcc");    break;
-        case BRANCH_RETURN:         line.append("ret");    break;
-        case BRANCH_SYSCALL_TYPE:   line.append("syscall"); break;
-        default:                    append_mnem(&line, ctx, I.opcode); break;
-        }
+        append_mnem(&line, ctx, I.opcode);
     }
     append_pad_to(&line, mnem_start + 8);
 
@@ -831,7 +868,7 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
     }
 
     /* Branch annotations: target PC and symbol when known. */
-    if (I.branch_type != BRANCH_NONE) {
+    if (!branch_is_none(*ctx.h, I.branch_type)) {
         if (branch_target_tmpl) {
             line.append("  # 0x");
             append_hex(&line, branch_target_tmpl->start_pc);
@@ -983,19 +1020,16 @@ void render_templates_only(FILE *out, const cst::Header &h,
         /* Generic-view mnemonic + operands (no regdata in templates-
          * only; templates carry no run-time observation). */
         size_t mnem_start = line.size();
-        if (I.branch_type == BRANCH_NONE) {
+        if (branch_is_none(h, I.branch_type)) {
             const std::string *p = table_lookup(dt.opcode, I.opcode);
             if (p) line.append(*p);
             else line.append("op");
+        } else if (const char *m =
+                       branch_mnem_from_name(branch_name_lookup(h,
+                                                                I.branch_type))) {
+            line.append(m);
         } else {
-            switch (I.branch_type) {
-            case BRANCH_DIRECT_JUMP:    line.append("jmp");    break;
-            case BRANCH_INDIRECT_JUMP:  line.append("jmpr");   break;
-            case BRANCH_COND_DIRECT:    line.append("jcc");    break;
-            case BRANCH_RETURN:         line.append("ret");    break;
-            case BRANCH_SYSCALL_TYPE:   line.append("syscall"); break;
-            default: line.append("br"); break;
-            }
+            line.append("br");
         }
         append_pad_to(&line, mnem_start + 8);
 

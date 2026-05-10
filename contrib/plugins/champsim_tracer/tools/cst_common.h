@@ -2,15 +2,19 @@
  * ChampSim Tracer offline tools — shared wire-format types.
  *
  * Glib-free, plugin-API-free, mmap-friendly POD types describing the
- * v1.7/v1.8/v1.9 .cst trace format.  Both cst_decode and cst_audit
- * link against this layer; the format-specific bits (header layout,
- * tag values, FID ranges) are duplicated here verbatim from the
- * plugin's champsim_tracer.h so the tools build without dragging
- * QEMU's plugin or glib headers in.
+ * v1.7..v1.10 .cst trace format.  Both cst_decode and cst_audit link
+ * against this layer; the format-specific bits (header layout, tag
+ * values, FID ranges) are duplicated here verbatim from the plugin's
+ * champsim_tracer.h so the tools build without dragging QEMU's
+ * plugin or glib headers in.
  *
- * The companion ../champsim_tracer_generic_ids.h header is glib-free
- * and is included directly so the tools share a single source of
- * truth for opcode / branch_type / sync_hint / register name lookups.
+ * The trace is self-describing: every header carries an encoding map
+ * (opcode / branch_type / sync_hint / reg / field_id / insn_flag /
+ * body_tag / wp_event_flag) that maps the wire-format integer ids to
+ * stable string names.  The tools key off those strings rather than
+ * pulling in the plugin's compile-time enums — so a trace produced
+ * by a future tracer that adds new opcode or register ids will still
+ * decode correctly as long as its map carries them.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -24,8 +28,6 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-#include "../champsim_tracer_generic_ids.h"
 
 namespace cst {
 

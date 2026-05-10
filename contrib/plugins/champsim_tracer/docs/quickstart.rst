@@ -113,50 +113,55 @@ same output file (i.e., one ``.cst`` covers all segments; segments
 appear sequentially in the body stream and are demarcated by their
 icount range in the per-segment statistics summary).
 
-``start=<icount>``
-   Open the (single) segment when the guest instruction counter
-   reaches this value.  Default ``0`` — segment opens at process
-   start.  No-op when ``spfile`` is set (simpoint mode overrides the
-   single-window window).
+The recommended way to specify a segmentation strategy is the unified
+``trace_window=MODE:KEY=VALUE;KEY=VALUE;...`` option, which forces the
+user to pick a single mode and rejects keys that don't apply to it
+(so ``warmup=`` under ``icount`` is an error rather than a silent
+no-op).  The inner KEY=VALUE list is **semicolon-separated** because
+QEMU's plugin-argument parser splits on commas before the plugin
+sees its argv — embedding commas inside the value would scatter the
+pairs across separate argv entries.  The flat ``start=`` / ``stop=``
+/ ``spfile=`` / ``spinterval=`` / ``warmup=`` / ``simulation=`` flags
+are kept for backwards compatibility and listed below the new option.
 
-``stop=<icount>``
-   Close the (single) segment and call ``exit(0)`` from
-   ``vcpu_tb_exec`` when the guest instruction counter reaches this
-   value.  Default ``UINT64_MAX`` — never stop early; the trace runs
-   to natural process exit.  Combine with ``start`` to carve a
-   contiguous window.  No-op when ``spfile`` is set.
+``trace_window=icount:start=<lo>;stop=<hi>``
+   Single contiguous window in instruction-count space.  Equivalent
+   to ``start=<lo>,stop=<hi>`` under the legacy flat flags.  The
+   only legal keys are ``start`` and ``stop``.
 
-``spfile=<path>``
-   Path to a SimPoint file.  When set, replaces the single
-   ``[start, stop)`` window with one segment per simpoint interval
-   listed in the file.  ``trace_start_insn`` is forced to 0 and
-   ``trace_stop_insn`` to ``UINT64_MAX`` so the simpoint manager has
-   full authority.  Cannot be combined with ``start`` / ``stop`` (they're
-   silently ignored, not an error).
+``trace_window=simpoint:file=<path>;interval=<insns>;warmup=<insns>;simulation=<insns>``
+   One segment per simpoint listed in ``file``.  ``interval``
+   defaults to ``100000000`` and must match the granularity used to
+   *generate* the simpoint file.  ``warmup`` (default ``0``) traces
+   that many insns *before* each simpoint position so cache /
+   branch-predictor warm-up data is captured.  ``simulation``
+   (default ``0`` = legacy ``interval`` length) traces that many
+   insns *at and after* the simpoint position.  ``warmup`` is only
+   meaningful here (you can't warm up before an arbitrary icount or
+   symbol occurrence — see ``symbol`` mode below) and is rejected
+   under the other two modes.
 
-``spinterval=<insns>``
-   Instructions per simpoint interval.  Default ``100000000``
-   (100 M).  Must match the granularity used to *generate* the
-   simpoint file — a 100 M-interval simpoint file with this option
-   set to 10 M would carve windows at 1/10 the intended boundaries.
+``trace_window=symbol:name=<sym>;occurrence=<N>;simulation=<insns>``
+   Trace begins on the *N*-th time the named symbol appears as a
+   basic-block entry, then runs for ``simulation`` architectural
+   instructions before the process is exited (or for the rest of
+   the run when ``simulation=0``).  ``occurrence`` defaults to
+   ``1`` (the first time the symbol is hit).  No ``warmup`` —
+   we can't predict what executes before an arbitrary symbol's
+   *N*-th occurrence, so this mode opens the segment at the
+   matching TB's first instruction.  Symbol matching uses
+   ``qemu_plugin_insn_symbol`` on the TB's first instruction; the
+   symbol name must match exactly (no demangling, no fnmatch).
 
-``warmup=<insns>``
-   Number of instructions to trace *before* each simpoint position so
-   downstream simulators can prime their caches and branch predictors
-   on real upstream behaviour before the evaluation window opens.
-   Default ``0``.  Only consulted in simpoint mode.  The effective
-   segment start becomes ``max(0, sp->start_insn - warmup)``; the
-   header records the actual warmup-length as ``warmup_insns`` so
-   consumers can split the trace at that offset.
+Examples::
 
-``simulation=<insns>``
-   Number of instructions to trace *at and after* each simpoint
-   position (the evaluation window).  Default ``0``, which falls back
-   to the legacy ``simpoint_interval`` length.  When set explicitly,
-   each simpoint segment runs ``warmup + simulation`` instructions
-   total: a ``warmup=100000000,simulation=100000000`` run on a
-   simpoint at icount 100 M produces a single segment covering the
-   instruction range ``[0, 200 M)``.
+   trace_window=icount:start=0;stop=20000000
+   trace_window=simpoint:file=mcf.sp;interval=100000000;warmup=2000000;simulation=20000000
+   trace_window=symbol:name=main;occurrence=3;simulation=20000000
+
+Without ``trace_window=`` the segment opens at process start and runs
+until the guest exits — equivalent to ``trace_window=icount:start=0``
+with no upper bound.
 
 Wrong-path simulation
 ~~~~~~~~~~~~~~~~~~~~~
@@ -350,14 +355,27 @@ the workload's data footprint; pipe through ``zstd`` (see the
 
 .. code-block:: console
 
-   $ qemu-x86_64 -plugin ./libchampsim_tracer.so,\
-   outfile=run,wp=1,spfile=run.simpts,spinterval=100000000,\
+   $ qemu-x86_64 -plugin ./libchampsim_tracer.so,outfile=run,wp=1,\
+   trace_window=simpoint:file=run.simpts,interval=100000000,\
    warmup=100000000,simulation=100000000 \
                  ./prog
 
 One per-simpoint ``.cst`` file with 100 M warmup + 100 M evaluation
 instructions per segment.  Drives ChampSim-style sampled simulation
 on multi-billion-instruction workloads in tractable trace volume.
+
+**Symbol-triggered capture (skip startup, trace from main)**
+
+.. code-block:: console
+
+   $ qemu-x86_64 -plugin ./libchampsim_tracer.so,outfile=run,wp=1,\
+   trace_window=symbol:name=main,occurrence=1,simulation=20000000 \
+                 ./prog
+
+Trace opens the first time ``main`` is entered as a TB and captures
+20 M architectural instructions.  Useful when the run's startup
+icount is workload-dependent and a fixed ``start=<icount>`` would
+miss the steady-state region.
 
 **CP-only trace for a non-speculative simulator**
 

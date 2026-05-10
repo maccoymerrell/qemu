@@ -68,6 +68,16 @@ uint32_t iframe_rate = 0;
 uint64_t warmup_insns = 0;
 uint64_t simulation_insns = 0;
 
+/* Symbol-trigger state (trace_window=symbol:...).  Owned strings live
+ * for the lifetime of the plugin; symbol_match_count is the running
+ * count of TBs we've seen whose owning template names the configured
+ * start_symbol — once it reaches start_symbol_occurrence we open a
+ * trace segment of simulation_insns architectural insns. */
+static char     *start_symbol            = nullptr;
+static uint64_t  start_symbol_occurrence = 1;
+static uint64_t  start_symbol_match_count = 0;
+static int       g_window_mode           = 0; /* PluginConfig::WIN_AUTO */
+
 /* ========================= Thread ID assignment ========================= */
 
 static std::unordered_map<unsigned int, uint32_t> cpu_to_thread_id;
@@ -832,7 +842,49 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
      *     completed) so the trace covers AT LEAST the requested
      *     window — overshooting by at most one TB rather than
      *     undershooting by the threshold-crossing TB. */
-    if (g_simpoints.is_active()) {
+    if (g_window_mode == PluginConfig::WIN_SYMBOL) {
+        /* Stop when the simulation_insns budget after the trigger has
+         * been spent.  set_window stamped trace_start when the symbol
+         * fired; we inherit the stop check from window_stop(). */
+        if (g_trace_segments.is_active() &&
+            icount_prev >= g_trace_segments.window_stop()) {
+            finish_trace_segment();
+            g_trace_segments.set_shutting_down();
+            g_mutex_unlock(&exec_lock);
+            exit(0);
+        }
+        if (!g_trace_segments.is_active() && start_symbol) {
+            uint64_t cur_pc = qemu_plugin_u64_get(g_scoreboard.current_pc,
+                                                  cpu_index);
+            BBTemplate *cur_tmpl = nullptr;
+            g_mutex_lock(&data_lock);
+            cur_tmpl = g_bb_template_cache.find_tb_template(cur_pc);
+            g_mutex_unlock(&data_lock);
+            if (cur_tmpl && cur_tmpl->symbol_name &&
+                cst_str_eq(cur_tmpl->symbol_name, start_symbol)) {
+                start_symbol_match_count++;
+                if (start_symbol_match_count >= start_symbol_occurrence) {
+                    /* Open segment at the architectural insn count of
+                     * the matching TB's start.  Simulation runs for
+                     * simulation_insns more architectural insns; when
+                     * unset (==0) the segment is unbounded and ends
+                     * at process exit. */
+                    uint64_t lo = icount_prev;
+                    uint64_t hi = simulation_insns
+                        ? icount_prev + simulation_insns : UINT64_MAX;
+                    g_trace_segments.set_window(lo, hi);
+                    uint64_t total_target =
+                        (hi == UINT64_MAX) ? 0 : hi - lo;
+                    g_autofree char *label = g_strdup_printf(
+                        "sym_%s_%" PRIu64,
+                        start_symbol, start_symbol_occurrence);
+                    start_trace_segment(label, lo, hi,
+                                        /* warmup= */ 0, total_target,
+                                        cpu_index);
+                }
+            }
+        }
+    } else if (g_simpoints.is_active()) {
         if (g_trace_segments.is_active() &&
             icount_prev >= g_trace_segments.window_stop()) {
             finish_trace_segment();
@@ -1733,6 +1785,9 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     program_name        = cfg.program_name;    cfg.program_name = nullptr;
     trace_comment       = cfg.comment;         cfg.comment = nullptr;
     simpoints_file_path = cfg.simpoints_file;  cfg.simpoints_file = nullptr;
+    start_symbol        = cfg.start_symbol;    cfg.start_symbol   = nullptr;
+    start_symbol_occurrence = cfg.start_symbol_occurrence;
+    g_window_mode       = cfg.window_mode;
 
     if (!cfg.output_path) {
         cfg.output_path = g_strdup("champsim_tracer_out");
@@ -1785,7 +1840,15 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      * leading element. */
     build_qemu_reg_reverse_index();
 
-    if (!g_simpoints.is_active() && trace_start_insn == 0) {
+    if (g_window_mode == PluginConfig::WIN_SYMBOL) {
+        if (!start_symbol) {
+            fprintf(stderr,
+                    "champsim_tracer: trace_window=symbol requires name=...\n");
+            return -1;
+        }
+        /* No segment opens until the named symbol is seen
+         * start_symbol_occurrence times in vcpu_tb_exec. */
+    } else if (!g_simpoints.is_active() && trace_start_insn == 0) {
         /* No vCPU context yet at install-time; capture an empty
          * initial regfile.  The (id->name) mapping is still pinned
          * in the header, just without live values.  Header total is

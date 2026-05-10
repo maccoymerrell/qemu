@@ -7,10 +7,13 @@ alongside the plugin.  ``ninja contrib-plugins`` produces them in
 needs the QEMU plugin runtime — they read the wire format directly
 from the file.
 
-* :ref:`cst_decode <decoder-cc>` is the default decoder.  It emits a
-  greppable objdump-style disassembly to stdout; pass
-  ``--format=legacy`` to get the older block-formatted output that
-  diff-driven scripts (notably wptrace_genval) consume.
+* :ref:`cst_decode <decoder-cc>` is the default decoder.  It emits an
+  objdump-style disassembly to stdout, with one line per architectural
+  instruction.  ``--templates-only`` suppresses the body walk and emits
+  one PC-sorted line per static template entry — the analogue of
+  ``objdump -d`` over the captured templates.  ``--objdump`` adds a
+  side-by-side Capstone disassembly column so the generic-opcode line
+  can be cross-checked against ``objdump`` output.
 
 * :ref:`cst_audit <audit-cc>` prints a byte-budget breakdown of
   where bytes go (header, templates, CP body, WP body, field-delta
@@ -29,38 +32,73 @@ the plugin shared object.  Lands in
 .. code-block:: console
 
    $ build/contrib/plugins/cst_decode trace.cst > trace.disasm
-   $ build/contrib/plugins/cst_decode --format=legacy trace.cst > trace.txt
+   $ build/contrib/plugins/cst_decode --templates-only trace.cst > trace.t.disasm
+   $ build/contrib/plugins/cst_decode --objdump trace.cst > trace.objdump.disasm
 
-Two output formats:
+Output format
+^^^^^^^^^^^^^
 
-``--format=disasm`` (default)
-   objdump-style, one architectural instruction per line.  Format:
+One architectural instruction per line, modelled after ``objdump -d``:
 
-   .. code-block:: text
+.. code-block:: text
 
-      0x7b559c7da96f: GEN_OP_LEA   REG_GPR11 <- REG_IP   ; tid=0 bb=98 REG_GPR11=0x7b559c7da8f9
-      0x7b559c7da976: GEN_OP_XOR   REG_GPR5,REG_FLAGS <- REG_GPR5   ; tid=0 bb=98 REG_GPR5=0x0 REG_FLAGS=0x0
-      0x7b559c7da978: GEN_OP_BRANCH REG_IP <- REG_IP,IMM(0x7b559c7da993)  ; tid=0 bb=98 br=BRANCH_DIRECT_JUMP REG_IP=0x0
+   0x7b559c7da96f <_start+0xf>: 48 8d 1d 7d ff ff ff   lea     %ip -> %gp11[0x7b559c7da8f9]
+   0x7b559c7da976 <_start+0x16>: 31 ed                  xor     %gp5 -> %gp5[0x0], %flags[0x0]
+   0x7b559c7da978 <_start+0x18>: e9 16 00 00 00         jmp     %ip -> %ip[0x0]  # 0x7b559c7da993 <_start+0x33>
 
-   Each line is self-contained: PC, opcode mnemonic (generic),
-   destination registers, source registers, immediate (when
-   present), and a trailing ``; metadata`` comment carrying the
-   thread id, basic-block id, branch type, sync hint, memory
-   operations (with effective addresses + optional data), and
-   destination register writes (post-execution snapshot).  Basic-
-   block boundaries are marked with a ``; ----- BB <id> entry pc=
-   ... -----`` separator; wrong-path chains use a ``; ..... wp[k]
-   BB <id> ...`` separator.
+Columns are PC (12 hex digits), an optional
+``<symbol+offset>`` annotation when the captured template named the
+TB's owning symbol, the raw instruction bytes from the template, the
+generic-opcode mnemonic (``add``/``fmul``/``jmp``/...), and the
+operand list in a fake AT&T syntax: register references print as
+``%gp0`` / ``%flags`` / ``%ip``, immediates as ``$0x...``, and
+destinations are separated from sources by ``->`` so each side of a
+read-modify-write is visible at a glance.
 
-   Designed for ``grep``: ``grep 'br=BRANCH_COND_DIRECT'``,
-   ``grep 'st@0x7fff'``, ``grep 'bb=42'`` all produce useful
-   results.
+The branch-mnemonic flavour (``jmp`` / ``jcc`` / ``jmpr`` / ``ret``
+/ ``syscall``) comes from the trace's own ``branch_type`` encoding
+map — looked up by the wire-format integer id and matched against
+the stable string name — rather than a compile-time enum.  Same for
+register and opcode names: the decoder's only source of truth is
+the encoding map the writer stamped into the trace header.
 
-``--format=legacy``
-   Block-formatted: META / ENCODINGS / TEMPLATES / BODY sections
-   with one ENTRY block per body record.  Stable, machine-parseable;
-   wptrace_genval's validator runs ``cst_decode --format=legacy``
-   under the hood and parses its output back into Python objects.
+Captured per-instruction data is folded into the operand line:
+
+* ``%dst[<value>]`` — destination register post-execution snapshot
+  (when ``regdata=1`` was set during capture).
+* ``ld(<addr>)=<value>`` / ``st(<addr>)=<value>`` — memory operation
+  effective address with the loaded / stored value (when
+  ``memdata=1``) or just the address (when ``memdata=0``).
+* ``# <target> <symbol+offset>`` trailing comment — branch target
+  resolved from the captured ``REG_IP`` snapshot, with the matching
+  symbol name when known.  Conditional branches print
+  ``# taken=<target>`` so the predicted vs. actual side is visible.
+
+Basic-block boundaries are marked with a single comment line
+``# bb <id> tid=<n> [wp]`` so that grepping for a thread or for WP
+chains is one regex.  Wrong-path entries get a ``[wp]`` tag on
+their boundary marker; the per-instruction lines themselves are
+identical in shape.
+
+``--templates-only``
+   Skip the body stream entirely and emit exactly one line per
+   static template instruction, sorted by PC.  No basic-block
+   boundary markers, no per-execution dynamic values — just the
+   captured architectural shape.  This is the analogue of running
+   ``objdump -d`` over the binary, restricted to PCs that the
+   guest actually executed during the trace.
+
+``--objdump``
+   Add a side-by-side Capstone-disassembly column to each printed
+   line so the generic-opcode rendering can be cross-checked
+   against the canonical ISA mnemonic.  Combines with
+   ``--templates-only`` (templates side-by-side with Capstone) and
+   with the default body walk (per-execution lines side-by-side
+   with Capstone, but only the static template half is shown on
+   the Capstone side — ``objdump`` has no notion of the captured
+   dynamic values).  Capstone is taken from the bundled
+   ``subprojects/capstone`` so both sides come from the same
+   build the plugin links against.
 
 .. _audit-cc:
 

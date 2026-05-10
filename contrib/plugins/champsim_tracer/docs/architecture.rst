@@ -199,6 +199,22 @@ Practical implications:
   records are emitted only when the firing vCPU differs from the
   previous body record's vCPU.  Single-threaded workloads pay
   zero per-block thread-id overhead.
+* **Field-state delta encoding is per-thread (v1.10+).**  Each
+  thread maintains its own ``FieldStateTable``, so an ENTRY's
+  delta-stream values are computed against the firing thread's
+  prior emission rather than the cross-thread sequence.  Without
+  this, a thread switch between two unrelated BBs would force
+  every per-instruction field to re-encode against the other
+  thread's residual state, defeating delta compression on
+  multi-vCPU workloads.
+* **Initial register files ride with the body stream.**  Before a
+  thread's first ``BODY_TAG_ENTRY`` in a segment, the writer emits
+  a ``BODY_TAG_REGFILE`` record carrying that thread's full
+  register file as absolute values.  The header's encoding map no
+  longer carries an initial-regfile blob (that mechanism worked
+  for the install-time vCPU but couldn't represent threads that
+  came online mid-segment).  v1.9 readers see a magic mismatch and
+  refuse to decode v1.10 traces.
 
 .. _tb-vs-true-bb:
 

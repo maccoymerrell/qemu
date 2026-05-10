@@ -38,36 +38,11 @@ bool set_wp(PluginConfig *cfg, const char *v)
     return true;
 }
 
-bool set_start(PluginConfig *cfg, const char *v)
-{
-    cfg->trace_start_insn = g_ascii_strtoull(v, nullptr, 10);
-    return true;
-}
-
-bool set_stop(PluginConfig *cfg, const char *v)
-{
-    cfg->trace_stop_insn = g_ascii_strtoull(v, nullptr, 10);
-    return true;
-}
-
 bool set_program(PluginConfig *cfg, const char *v)
 {
     g_free(cfg->program_name);
     cfg->program_name = g_strdup(v);
     return true;
-}
-
-bool set_spfile(PluginConfig *cfg, const char *v)
-{
-    g_free(cfg->simpoints_file);
-    cfg->simpoints_file = g_strdup(v);
-    return true;
-}
-
-bool set_spinterval(PluginConfig *cfg, const char *v)
-{
-    cfg->simpoint_interval = g_ascii_strtoull(v, nullptr, 10);
-    return cfg->simpoint_interval > 0;
 }
 
 bool set_comment(PluginConfig *cfg, const char *v)
@@ -121,15 +96,135 @@ bool set_iframe_rate(PluginConfig *cfg, const char *v)
     return true;
 }
 
-bool set_warmup(PluginConfig *cfg, const char *v)
+/*
+ * trace_window=PREFIX:KEY=VALUE;KEY=VALUE;...
+ *
+ *   trace_window=icount:start=0;stop=20000000
+ *   trace_window=simpoint:file=mcf.sp;interval=100000000;simulation=20000000;warmup=2000000
+ *   trace_window=symbol:name=main;occurrence=3;simulation=20000000
+ *
+ * Unifies the formerly flat start=/stop=, spfile=/spinterval=/warmup=/
+ * simulation=, and the new symbol-trigger flags into one option
+ * whose first colon-delimited token names the mode.  Each mode
+ * accepts only its own keys; passing keys from a different mode
+ * (e.g. warmup= under icount) is rejected so users can't silently
+ * mix-and-match.
+ *
+ * The inner key/value list uses semicolons rather than commas: QEMU's
+ * top-level plugin-arg parser splits on commas before the plugin
+ * sees argv, so commas inside a single value would scatter the
+ * pairs across separate argv entries.
+ */
+bool parse_kv_pair(PluginConfig *cfg, const char *mode,
+                   const std::pair<const char *, const char *> &kv)
 {
-    cfg->warmup_insns = g_ascii_strtoull(v, nullptr, 10);
-    return true;
+    auto bad_key = [&](const char *legal) -> bool {
+        fprintf(stderr,
+                "champsim_tracer: trace_window=%s: unrecognised key '%s' "
+                "(legal: %s)\n", mode, kv.first, legal);
+        return false;
+    };
+    auto match = [&](const char *want) {
+        return cst_str_eq(kv.first, want);
+    };
+
+    if (cst_str_eq(mode, "icount")) {
+        if (match("start")) {
+            cfg->trace_start_insn = g_ascii_strtoull(kv.second, nullptr, 10);
+            return true;
+        }
+        if (match("stop")) {
+            cfg->trace_stop_insn = g_ascii_strtoull(kv.second, nullptr, 10);
+            return true;
+        }
+        return bad_key("start, stop");
+    }
+    if (cst_str_eq(mode, "simpoint")) {
+        if (match("file")) {
+            g_free(cfg->simpoints_file);
+            cfg->simpoints_file = g_strdup(kv.second);
+            return true;
+        }
+        if (match("interval")) {
+            cfg->simpoint_interval = g_ascii_strtoull(kv.second, nullptr, 10);
+            return cfg->simpoint_interval > 0;
+        }
+        if (match("warmup")) {
+            cfg->warmup_insns = g_ascii_strtoull(kv.second, nullptr, 10);
+            return true;
+        }
+        if (match("simulation")) {
+            cfg->simulation_insns = g_ascii_strtoull(kv.second, nullptr, 10);
+            return true;
+        }
+        return bad_key("file, interval, warmup, simulation");
+    }
+    if (cst_str_eq(mode, "symbol")) {
+        if (match("name")) {
+            g_free(cfg->start_symbol);
+            cfg->start_symbol = g_strdup(kv.second);
+            return true;
+        }
+        if (match("occurrence")) {
+            cfg->start_symbol_occurrence =
+                g_ascii_strtoull(kv.second, nullptr, 10);
+            return cfg->start_symbol_occurrence > 0;
+        }
+        if (match("simulation")) {
+            cfg->simulation_insns = g_ascii_strtoull(kv.second, nullptr, 10);
+            return true;
+        }
+        return bad_key("name, occurrence, simulation");
+    }
+    fprintf(stderr,
+            "champsim_tracer: trace_window: unknown mode '%s' "
+            "(expected: icount, simpoint, symbol)\n", mode);
+    return false;
 }
 
-bool set_simulation(PluginConfig *cfg, const char *v)
+bool set_trace_window(PluginConfig *cfg, const char *v)
 {
-    cfg->simulation_insns = g_ascii_strtoull(v, nullptr, 10);
+    if (!v || !*v) {
+        fprintf(stderr,
+                "champsim_tracer: trace_window= requires "
+                "MODE:KEY=VALUE;...  Example: "
+                "trace_window=icount:start=0;stop=20000000\n");
+        return false;
+    }
+    g_auto(GStrv) head_tail = g_strsplit(v, ":", 2);
+    if (!head_tail[0] || !head_tail[1]) {
+        fprintf(stderr,
+                "champsim_tracer: trace_window= missing ':' "
+                "between mode and arg list (got '%s')\n", v);
+        return false;
+    }
+    if (cst_str_eq(head_tail[0], "icount")) {
+        cfg->window_mode = PluginConfig::WIN_ICOUNT;
+    } else if (cst_str_eq(head_tail[0], "simpoint")) {
+        cfg->window_mode = PluginConfig::WIN_SIMPOINT;
+    } else if (cst_str_eq(head_tail[0], "symbol")) {
+        cfg->window_mode = PluginConfig::WIN_SYMBOL;
+    } else {
+        fprintf(stderr,
+                "champsim_tracer: trace_window: unknown mode '%s' "
+                "(expected: icount, simpoint, symbol)\n", head_tail[0]);
+        return false;
+    }
+    g_auto(GStrv) pairs = g_strsplit(head_tail[1], ";", -1);
+    for (int i = 0; pairs[i]; i++) {
+        if (!*pairs[i]) continue;
+        g_auto(GStrv) kv = g_strsplit(pairs[i], "=", 2);
+        if (!kv[0] || !kv[1]) {
+            fprintf(stderr,
+                    "champsim_tracer: trace_window=%s: token '%s' "
+                    "is not KEY=VALUE\n", head_tail[0], pairs[i]);
+            return false;
+        }
+        if (!parse_kv_pair(cfg, head_tail[0],
+                           {kv[0], kv[1]})) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -143,11 +238,7 @@ const struct {
     { "outfile",    set_outfile    },
     { "outpipe",    set_outpipe    },
     { "wp",         set_wp         },
-    { "start",      set_start      },
-    { "stop",       set_stop       },
     { "program",    set_program    },
-    { "spfile",     set_spfile     },
-    { "spinterval", set_spinterval },
     { "comment",    set_comment    },
     { "memdata",    set_memdata    },
     { "regdata",    set_regdata    },
@@ -155,8 +246,7 @@ const struct {
     { "wp_regdata", set_wp_regdata },
     { "histogram",  set_histogram  },
     { "iframe_rate", set_iframe_rate },
-    { "warmup",     set_warmup     },
-    { "simulation", set_simulation },
+    { "trace_window", set_trace_window },
     { nullptr, nullptr },
 };
 
@@ -199,9 +289,11 @@ void plugin_config_free(PluginConfig *cfg)
     g_free(cfg->program_name);
     g_free(cfg->simpoints_file);
     g_free(cfg->comment);
+    g_free(cfg->start_symbol);
     cfg->output_path = nullptr;
     cfg->output_pipe = nullptr;
     cfg->program_name = nullptr;
     cfg->simpoints_file = nullptr;
     cfg->comment = nullptr;
+    cfg->start_symbol = nullptr;
 }

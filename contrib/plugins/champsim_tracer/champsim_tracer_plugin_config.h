@@ -58,6 +58,31 @@ struct PluginConfig {
     char     *program_name      = nullptr;   /* g_strdup, owned */
     char     *simpoints_file    = nullptr;   /* g_strdup, owned */
     char     *comment           = nullptr;   /* g_strdup, owned */
+
+    /*
+     * Symbol-based trace start (trace_window=symbol:...).  Trace
+     * begins on the @start_symbol_occurrence-th time the named
+     * symbol appears as a BB entry; runs for @simulation_insns
+     * architectural instructions after that point.  warmup is
+     * not meaningful here — we can't predict what executes before
+     * an arbitrary symbol's Nth occurrence.
+     */
+    char     *start_symbol      = nullptr;   /* g_strdup, owned */
+    uint64_t  start_symbol_occurrence = 1;
+
+    /*
+     * Set to one of WindowMode values when trace_window= is used,
+     * so the runtime can validate that warmup= / start= / etc.
+     * fields aren't being mixed across modes.  Unset (= AUTO) means
+     * the plugin falls back to the legacy flat-flags behavior.
+     */
+    enum WindowMode {
+        WIN_AUTO     = 0,
+        WIN_ICOUNT   = 1,
+        WIN_SIMPOINT = 2,
+        WIN_SYMBOL   = 3,
+    };
+    int window_mode = WIN_AUTO;
 };
 
 /* Parse plugin args.  Returns true on success; on failure prints to

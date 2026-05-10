@@ -25,6 +25,11 @@ from the file.
 cst_decode
 ----------
 
+.. index::
+   single: cst_decode
+   single: --templates-only
+   single: --objdump
+
 Built by the same ``ninja contrib-plugins`` invocation that builds
 the plugin shared object.  Lands in
 ``build/contrib/plugins/cst_decode``.
@@ -36,7 +41,7 @@ the plugin shared object.  Lands in
    $ build/contrib/plugins/cst_decode --objdump trace.cst > trace.objdump.disasm
 
 Output format
-^^^^^^^^^^^^^
+~~~~~~~~~~~~~
 
 One architectural instruction per line, modelled after ``objdump -d``:
 
@@ -104,6 +109,10 @@ identical in shape.
 
 cst_audit
 ---------
+
+.. index::
+   single: cst_audit
+   single: byte budget
 
 .. code-block:: console
 
@@ -182,6 +191,10 @@ end-to-end.
 
 IFRAME validation
 ~~~~~~~~~~~~~~~~~
+
+.. index::
+   single: IFRAME validation
+   single: BODY_TAG_IFRAME
 
 When a trace was produced with ``iframe_rate=N`` the writer follows
 selected ``BODY_TAG_ENTRY`` records with a redundant ``BODY_TAG_IFRAME``

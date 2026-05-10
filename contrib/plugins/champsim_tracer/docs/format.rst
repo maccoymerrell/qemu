@@ -1,6 +1,19 @@
 Wire format
 ===========
 
+.. index::
+   single: wire format
+   single: BODY_TAG_ENTRY
+   single: BODY_TAG_END
+   single: BODY_TAG_THREAD_SWITCH
+   single: BODY_TAG_IFRAME
+   single: BODY_TAG_REGFILE
+   single: FieldStateTable
+   single: encoding map
+   single: trailer
+   single: header
+   single: templates section
+
 .. note::
 
    The canonical wire-format spec is the markdown file

@@ -1,6 +1,20 @@
 Architecture
 ============
 
+.. index::
+   single: architecture
+   single: CP path
+   single: WP path
+   single: BBTemplate
+   single: scoreboard
+   single: exec_lock
+   single: thread_id
+   single: per-thread FieldStateTable
+   single: BODY_TAG_REGFILE; per-thread regfile
+   single: speculative store buffer
+   single: vcpu_tb_exec
+   single: vcpu_tb_trans
+
 This page describes how ChampSim Tracer is organized, the two main flow
 loops (CP and WP), and the caveats every prospective modifier needs
 to know.

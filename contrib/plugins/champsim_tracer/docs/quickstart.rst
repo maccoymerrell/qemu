@@ -80,6 +80,10 @@ the flag.
 Output destination
 ~~~~~~~~~~~~~~~~~~
 
+.. index::
+   single: outfile
+   single: outpipe
+
 ``outfile=<basename>``
    Basename for the trace files.  Default ``champsim_tracer_out``.
    The plugin writes:
@@ -113,16 +117,25 @@ same output file (i.e., one ``.cst`` covers all segments; segments
 appear sequentially in the body stream and are demarcated by their
 icount range in the per-segment statistics summary).
 
-The recommended way to specify a segmentation strategy is the unified
-``trace_window=MODE:KEY=VALUE;KEY=VALUE;...`` option, which forces the
-user to pick a single mode and rejects keys that don't apply to it
-(so ``warmup=`` under ``icount`` is an error rather than a silent
+.. index::
+   single: trace_window
+   single: trace_window; icount mode
+   single: trace_window; simpoint mode
+   single: trace_window; symbol mode
+   single: segmentation
+   single: simpoint mode
+   single: symbol mode
+   single: warmup_insns
+   single: simulation_insns
+
+The single config option that controls segmentation is
+``trace_window=MODE:KEY=VALUE;KEY=VALUE;...``: it forces the user to
+pick exactly one mode and rejects keys that don't apply to it (so
+``warmup=`` under ``icount`` is an error rather than a silent
 no-op).  The inner KEY=VALUE list is **semicolon-separated** because
 QEMU's plugin-argument parser splits on commas before the plugin
 sees its argv — embedding commas inside the value would scatter the
-pairs across separate argv entries.  The flat ``start=`` / ``stop=``
-/ ``spfile=`` / ``spinterval=`` / ``warmup=`` / ``simulation=`` flags
-are kept for backwards compatibility and listed below the new option.
+pairs across separate argv entries.
 
 ``trace_window=icount:start=<lo>;stop=<hi>``
    Single contiguous window in instruction-count space.  Equivalent
@@ -165,6 +178,13 @@ with no upper bound.
 
 Wrong-path simulation
 ~~~~~~~~~~~~~~~~~~~~~
+
+.. index::
+   single: wrong-path simulation
+   single: wp
+   single: wpdepth
+   single: wp_memdata
+   single: wp_regdata
 
 **What "wrong-path" means here.**  At every CP branch the tracer
 runs an extra side-trip: it picks the *other* target the branch
@@ -212,6 +232,10 @@ rather than spawning further wrong-path chains.
 
 Capture flags
 ~~~~~~~~~~~~~
+
+.. index::
+   single: memdata
+   single: regdata
 
 These control how much *dynamic* per-execution data is captured
 beyond the static templates.  Templates are mandatory; everything
@@ -262,6 +286,11 @@ below is opt-in because it can substantially grow the trace.
 Observability
 ~~~~~~~~~~~~~
 
+.. index::
+   single: histogram
+   single: iframe_rate
+   single: IFRAME
+
 ``histogram=<N>``
    Default ``0`` — disabled.  When ``N > 0``, ``start_trace_segment``
    allocates ``N`` zero-initialized ``Stats`` buckets and
@@ -295,6 +324,10 @@ Observability
 
 Trace metadata
 ~~~~~~~~~~~~~~
+
+.. index::
+   single: program
+   single: comment
 
 These don't affect what's captured; they get stamped into the trace
 header for downstream tools to identify the run.

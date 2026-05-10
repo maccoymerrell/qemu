@@ -87,3 +87,10 @@ through QEMU's ``contrib/plugins`` tree.
    :caption: Appendices
 
    _generated/encoding_tables
+
+Indices and tables
+==================
+
+* :ref:`genindex` — alphabetical index of config flags, wire-format
+  tags, and other terms cross-referenced from the prose.
+* :ref:`search` — full-text search across the rendered docs.

@@ -88,11 +88,20 @@ if get_option('plugins')
     cpp_args: cst_tools_cpp_args,
     link_with: cst_tools_common,
     install: false)
+  # cst_decode uses Capstone for the --objdump-style disasm column.
+  # Pin to QEMU's bundled subprojects/capstone (built from
+  # capstone.wrap) rather than the project-default capstone variable
+  # which can resolve to a system pkg-config copy whose layout differs.
+  # Sticking with the subproject keeps cst_decode reproducible across
+  # hosts and matches the same Capstone build the plugin links against.
+  cst_capstone_dep = subproject('capstone', required: true) \
+                         .get_variable('capstone_dep')
   t += executable(
     'cst_decode',
     files('champsim_tracer/tools/cst_decode_main.cc'),
     cpp_args: cst_tools_cpp_args,
     link_with: cst_tools_common,
+    dependencies: [cst_capstone_dep],
     install: false)
   endif
 endif

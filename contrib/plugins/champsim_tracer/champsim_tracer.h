@@ -85,8 +85,14 @@ extern "C" {
  * sparse fields populated from QEMU memory callbacks; template count
  * defaults are zero.
  */
-#define CST_MAGIC          0x19545343u
-#define CST_TRAILER_MAGIC  0x19545343FFFFFFFFull
+/*
+ * Bytes in file order: 'C','S','T',0x1A → u32 LE 0x1A545343.
+ * Version byte 0x1A (v1.10): per-vCPU FieldStateTable + per-vCPU
+ * BODY_TAG_REGFILE record replacing the header-embedded initial
+ * regfile.  Format-incompatible with 0x19 readers.
+ */
+#define CST_MAGIC          0x1A545343u
+#define CST_TRAILER_MAGIC  0x1A545343FFFFFFFFull
 #define CST_TRAILER_SIZE   64
 
 /* Body entry tags (1 byte) */
@@ -114,6 +120,27 @@ extern "C" {
  * entirely.
  */
 #define BODY_TAG_IFRAME          3
+/*
+ * BODY_TAG_REGFILE: per-thread initial register-file snapshot.
+ * Emitted exactly once per (segment, thread_id) pair, before the
+ * first ENTRY contributed by that thread in the segment.  Carries
+ * absolute values so consumers can prime simulator state for each
+ * vCPU at the moment that vCPU first appears in the trace.  Unlike
+ * earlier versions where the segment header carried a single
+ * initial regfile (only meaningful for whichever vCPU triggered the
+ * segment start), this record covers each vCPU independently.
+ *
+ * Wire format:
+ *   tag                 u8  = BODY_TAG_REGFILE
+ *   thread_id           varuint  (matches body's current_thread)
+ *   n_present           varuint
+ *   { gen_id u8, width u8, bytes[width] } * n_present
+ *
+ * width=0 means "the plugin couldn't resolve a live value for this
+ * gen_id" (e.g. install-time pre-vCPU snapshot).  Decoder behaviour
+ * for such IDs: leave the per-thread regfile slot zero/uninitialised.
+ */
+#define BODY_TAG_REGFILE         4
 
 /* Per-insn template flags byte */
 #define CST_INSN_FLAG_BRANCH_COND   (1u << 0)
@@ -398,6 +425,11 @@ struct BodyEntry {
     std::vector<WPBBEntry> wp_entries;
     BBTemplate *tmpl;  /* Non-owning; for per-insn schema access */
     uint32_t thread_id;
+    /* QEMU vCPU index this entry came from.  Used by the body writer
+     * to capture this thread's BODY_TAG_REGFILE on first emit when
+     * the thread did not trigger segment open (i.e. is not the seed
+     * thread whose regfile was pre-captured at start_trace_segment). */
+    uint32_t cpu_index;
 };
 #endif  /* __cplusplus */
 

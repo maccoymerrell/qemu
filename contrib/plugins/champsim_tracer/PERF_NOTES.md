@@ -203,6 +203,93 @@ being on the vCPU's critical path entirely.
 
 ---
 
+## Optimization round 4 — multi-vCPU correctness + decoder rewrite
+
+Tracer-side changes (correctness, no perf impact on single-vCPU
+mcf):
+
+* `BBTemplateCache::clear_bb_map()` now resets `next_template_id_`
+  on segment switch — without this, the per-segment FieldStateTable
+  was forced to grow past the unused 1..N1 slots from segment N on
+  the first hit in segment N+1.
+* `g_cp_chain` moved to `thread_local`.  Cross-vCPU TBs don't form
+  CP chains anyway; the previous shared assembler was a multi-vCPU
+  correctness bug masked by `exec_lock`.  A `g_segment_generation`
+  counter lets each thread self-drop its in-flight chain on the
+  next `append_fragment` after a segment switch, so segment-switch
+  reset on one thread leaves no dangling fragment pointers in
+  others.  Several `data_lock` acquisitions around now-thread_local
+  state were dropped.
+* Wire-format bump 0x19 → 0x1A (v1.10):
+  - Per-thread FieldStateTables in the writer + decoder.  Each
+    thread's deltas are computed against its own prior emission,
+    not the cross-thread sequence — fixes cross-thread "deltas"
+    that were uncorrelated junk on multi-vCPU traces and unblocked
+    dropping the body-emit lock as a future round.
+  - New `BODY_TAG_REGFILE` body record carrying the absolute
+    initial register file for one thread.  Emitted once per
+    `(segment, thread_id)` before that thread's first ENTRY.
+    Replaces the header-embedded single regfile that only covered
+    whichever vCPU triggered segment open.
+  - Decoder enforces IFRAME validity: each IFRAME's payload is
+    decoded into a separate scratch state and compared against the
+    immediately-preceding ENTRY's `dyn_params`, `reg_snaps`, WP
+    chain, and WP events.  Mismatches now throw with a descriptive
+    message naming the first divergence.  This caught two real
+    bugs during development (the `wp_persistent` flag missed
+    v1.10, and the IFRAME wp-chain decode was missing the
+    iframe_cp fallback as wp_base — both fixed).
+
+Decoder side: the `cst_decode` tool was 200+ s on a 20 M-insn
+full-config trace.  Profile + targeted rewrite cut it to 107 s
+(–48 %).  Bottleneck breakdown went:
+
+| Hotspot                        | Before | After | Saved |
+|--------------------------------|-------:|------:|------:|
+| Hashtable<u64,Wide>::find      |  10.1% |   0%  |  ~13s |
+| `render_disasm_insn` + printf  |  35.0% |  31% |  ~30s |
+| `append_hex` push_back churn   |   —    |  11.7%* |  ~5s |
+| snprintf for PC + wide hex     |   ~5%  |   0%  |   ~7s |
+
+(*append_hex is now hot but already a tight inline; further wins
+require batching writes into a larger buffer.)
+
+Concrete changes:
+
+1. **Densified `FieldStateTable`**: replaced the
+   `unordered_map<u64, Wide>` with a `vector<unique_ptr<
+   FieldStateBlock>>` indexed by `template_id`, mirroring the
+   writer's `BodyStreamState::cp_field_state` from round 1.  Each
+   block carries `n_insns × FIELD_STATE_SLOT_COUNT` Wides in a flat
+   array; cell indexing is a multiply-add instead of a hash + walk.
+2. **Disasm formatter rewrite**:
+   - Pre-built per-trace mnemonic / register name tables at first
+     render so `enum_or` / `fmt_reg`'s per-line `unordered_map::find`
+     doesn't fire in the hot path.
+   - `GEN_OP_INT_ADD` → `add`, `GEN_OP_FP_MUL` → `fmul`, `REG_GPR0`
+     → `%gp0`, etc. — objdump-shaped short forms via a small
+     conversion pass at table-build time.
+   - Output reshaped to objdump-style: `pc <sym+off>: <bytes>
+     mnem  $imm, %src1, %src2 -> %dst1[v], %dst2[v]  ld(addr)=v
+     # branch_target`.  Regdata appears in `[v]` after dst regs;
+     memops carry `(addr)=value` inline; branches show their
+     target PC and target-BB symbol when the next BB's template
+     is known.  Trailing `; tid=N bb=B br=...` for greppers.
+   - `thread_local std::string` reused across instructions
+     eliminated the per-line `+=` realloc churn (~6 % memmove +
+     5 % alloc/free of total time on the old formatter).
+   - `append_hex` / `append_hex_padded` / `append_byte_hex` /
+     `append_wide_hex` replace `snprintf("%lx")` calls — the
+     glibc printf parser was 12 % of total decode time.
+
+Trace correctness: `cst_audit` matches across the round (6,137
+templates, 19,999,995 CP insns, 269.7 M WP insns, byte-aligned
+to libc-startup variance).  `cst_decode --format=legacy` is
+byte-identical to the prior output mode (the only behavioral
+change is the new `--format=disasm` output shape).
+
+---
+
 
 
 Run-time breakdown captured via `perf record -g --call-graph dwarf

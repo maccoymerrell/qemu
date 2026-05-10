@@ -34,10 +34,12 @@ namespace cst {
 inline constexpr uint32_t MAGIC_V17 = 0x17545343u;
 inline constexpr uint32_t MAGIC_V18 = 0x18545343u;
 inline constexpr uint32_t MAGIC_V19 = 0x19545343u;
+inline constexpr uint32_t MAGIC_V1A = 0x1A545343u;
 
 inline constexpr uint64_t TRAILER_MAGIC_V17 = 0x17545343FFFFFFFFull;
 inline constexpr uint64_t TRAILER_MAGIC_V18 = 0x18545343FFFFFFFFull;
 inline constexpr uint64_t TRAILER_MAGIC_V19 = 0x19545343FFFFFFFFull;
+inline constexpr uint64_t TRAILER_MAGIC_V1A = 0x1A545343FFFFFFFFull;
 
 inline constexpr size_t TRAILER_SIZE = 64;
 
@@ -47,6 +49,7 @@ inline constexpr uint8_t BODY_TAG_END           = 0;
 inline constexpr uint8_t BODY_TAG_ENTRY         = 1;
 inline constexpr uint8_t BODY_TAG_THREAD_SWITCH = 2;
 inline constexpr uint8_t BODY_TAG_IFRAME        = 3;
+inline constexpr uint8_t BODY_TAG_REGFILE       = 4;
 
 /* ===== Per-insn template flag bits ===== */
 
@@ -277,7 +280,16 @@ struct Header {
     int  scalar_width_bits() const {
         return (magic == MAGIC_V17) ? 128 : 512;
     }
-    bool wp_persistent() const { return magic == MAGIC_V19; }
+    /*
+     * v1.9 introduced persistent WP-overlay deltas (each ENTRY's WP
+     * chain encodes against the running wp_field_state instead of
+     * forking from cp_state at chain start).  v1.10 keeps that
+     * behaviour and additionally splits the FieldStateTables per-
+     * thread.  Both 0x19 and 0x1A read with persistent WP state.
+     */
+    bool wp_persistent() const {
+        return magic == MAGIC_V19 || magic == MAGIC_V1A;
+    }
 };
 
 struct Trailer {

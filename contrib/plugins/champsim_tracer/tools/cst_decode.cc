@@ -21,9 +21,240 @@ bool is_extra_vector_fid(uint8_t fid)
            fid == FID_EXTRA_LOAD_DATA || fid == FID_EXTRA_STORE_DATA;
 }
 
-uint64_t cell_key(uint32_t template_id, uint32_t ipos, uint8_t fid)
+/*
+ * fid -> dense slot index mapping for FieldStateBlock storage.
+ * Mirrors the writer's field_state_slot_lut (see
+ * champsim_tracer_output.cc field_state_slot_lut_build).  Built once
+ * at first call.  EXTRA_* and EXTENDED return SLOT_INVALID — those
+ * fids are handled out-of-band (per-entry vector records / extension
+ * stream) and never sit in the persistent state.
+ */
+std::array<uint8_t, 256> g_slot_lut{};
+bool g_slot_lut_built = false;
+
+void slot_lut_build()
 {
-    return ((uint64_t)template_id << 24) | ((uint64_t)ipos << 8) | fid;
+    g_slot_lut.fill(FIELD_STATE_SLOT_INVALID);
+    g_slot_lut[FID_N_LOADS] = 0;
+    for (unsigned k = 0; k < FID_SLOT_COUNT; k++) {
+        g_slot_lut[FID_LOAD_ADDR_BASE  + k] = (uint8_t)(1                + k);
+        g_slot_lut[FID_STORE_ADDR_BASE + k] = (uint8_t)(1 + 1*FID_SLOT_COUNT + k);
+        g_slot_lut[FID_LOAD_DATA_BASE  + k] = (uint8_t)(1 + 2*FID_SLOT_COUNT + k);
+        g_slot_lut[FID_STORE_DATA_BASE + k] = (uint8_t)(1 + 3*FID_SLOT_COUNT + k);
+        g_slot_lut[FID_DST_REG_BASE    + k] = (uint8_t)(1 + 4*FID_SLOT_COUNT + k);
+    }
+    g_slot_lut[FID_N_STORES] = (uint8_t)(1 + 5*FID_SLOT_COUNT);
+    for (unsigned f = FID_INSN_BYTES_LO; f <= FID_INSN_SIZE; f++) {
+        g_slot_lut[f] = (uint8_t)(2 + 5*FID_SLOT_COUNT +
+                                   (f - FID_INSN_BYTES_LO));
+    }
+    g_slot_lut_built = true;
+}
+
+uint8_t slot_index(uint8_t fid)
+{
+    return g_slot_lut[fid];
+}
+
+/* Resize/grow a block's storage to accommodate @n_insns instructions.
+ * Idempotent; never shrinks. */
+void block_ensure_capacity(FieldStateBlock *blk, uint32_t n_insns)
+{
+    if (blk->n_insns >= n_insns) return;
+    size_t new_cells = (size_t)n_insns * FIELD_STATE_SLOT_COUNT;
+    blk->values.resize(new_cells);
+    blk->gens.resize(new_cells, 0);
+    blk->n_insns = n_insns;
+}
+
+/* Deep-clone @src into @dst.  Used by the v1.7/v1.8 wp-fork behavior
+ * (wp_state = cp_state at every ENTRY's chain start); v1.9+ traces
+ * have wp_persistent_ true and never invoke this. */
+void clone_field_state_table(FieldStateTable &dst,
+                             const FieldStateTable &src)
+{
+    dst.generation = src.generation;
+    dst.blocks.clear();
+    dst.blocks.resize(src.blocks.size());
+    for (size_t i = 0; i < src.blocks.size(); i++) {
+        if (src.blocks[i]) {
+            dst.blocks[i] = std::make_unique<FieldStateBlock>(*src.blocks[i]);
+        }
+    }
+}
+
+FieldStateBlock *table_get_or_create_block(FieldStateTable &t,
+                                           uint32_t template_id,
+                                           uint32_t need_n_insns)
+{
+    if (template_id >= t.blocks.size()) {
+        t.blocks.resize((size_t)template_id + 1);
+    }
+    auto &slot = t.blocks[template_id];
+    if (!slot) {
+        slot = std::make_unique<FieldStateBlock>();
+    }
+    block_ensure_capacity(slot.get(), need_n_insns);
+    return slot.get();
+}
+
+const FieldStateBlock *table_get_block(const FieldStateTable &t,
+                                       uint32_t template_id)
+{
+    if (template_id >= t.blocks.size()) return nullptr;
+    return t.blocks[template_id].get();
+}
+
+/*
+ * Read cell (block, ipos, fid).  Falls through to base_state on miss,
+ * then to template_default; returns whether the lookup hit a real
+ * (writer-set) cell — the boolean lets the field-extender code
+ * distinguish "we have a value" from "this is the template default
+ * silently filled in."
+ */
+bool cell_read(const FieldStateBlock *blk, uint32_t table_gen,
+               uint32_t ipos, uint8_t slot, Wide *out)
+{
+    if (!blk || ipos >= blk->n_insns || slot == FIELD_STATE_SLOT_INVALID) {
+        return false;
+    }
+    size_t idx = (size_t)ipos * FIELD_STATE_SLOT_COUNT + slot;
+    if (blk->gens[idx] != table_gen) return false;
+    *out = blk->values[idx];
+    return true;
+}
+
+void cell_write(FieldStateBlock *blk, uint32_t table_gen,
+                uint32_t ipos, uint8_t slot, const Wide &val)
+{
+    if (!blk || slot == FIELD_STATE_SLOT_INVALID) return;
+    block_ensure_capacity(blk, ipos + 1);
+    size_t idx = (size_t)ipos * FIELD_STATE_SLOT_COUNT + slot;
+    blk->values[idx] = val;
+    blk->gens[idx] = table_gen;
+}
+
+/*
+ * Compare two DynParam vectors for IFRAME validation.  Order is
+ * meaningful (encoded position-then-type within a template walk),
+ * so we compare elementwise rather than as a multiset.  Returns the
+ * 1-based index of the first differing element (1..N) or 0 if all
+ * elements match through min(size).  size mismatch is reported via
+ * the count check that calls this helper.
+ */
+size_t first_dyn_param_diff(const std::vector<DynParam> &a,
+                            const std::vector<DynParam> &b)
+{
+    size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; i++) {
+        if (a[i].type != b[i].type ||
+            a[i].insn_index != b[i].insn_index ||
+            a[i].addr != b[i].addr ||
+            a[i].has_data != b[i].has_data ||
+            (a[i].has_data && a[i].data != b[i].data)) {
+            return i + 1;
+        }
+    }
+    return 0;
+}
+
+size_t first_reg_snap_diff(const std::vector<RegSnap> &a,
+                           const std::vector<RegSnap> &b)
+{
+    size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; i++) {
+        if (a[i].insn_index != b[i].insn_index ||
+            a[i].operand_index != b[i].operand_index ||
+            a[i].reg_id != b[i].reg_id ||
+            a[i].value != b[i].value) {
+            return i + 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Throw a descriptive runtime_error when the IFRAME-decoded entry
+ * disagrees with the immediately-preceding ENTRY.  Validates:
+ *   - template_id (carried over implicitly; we set it ourselves but
+ *     check anyway as a backstop against future refactors)
+ *   - dyn_params count + each (type, insn_index, addr, has_data, data)
+ *   - reg_snaps count + each (insn_index, operand_index, reg_id, value)
+ *   - WP chain: count, plus per-entry template_id + dyn_params + reg_snaps
+ *   - WP events: per-entry fault, translation_unavailable, fault_insn_index
+ */
+void validate_iframe(const DecodedEntry &prev, const DecodedEntry &iframe)
+{
+    auto fail = [&](const std::string &msg) {
+        throw std::runtime_error("IFRAME validation: " + msg +
+                                 " (seq=" +
+                                 std::to_string(prev.seq_num) + ")");
+    };
+
+    if (prev.template_id != iframe.template_id) {
+        fail("template_id mismatch: ENTRY=" +
+             std::to_string(prev.template_id) +
+             " IFRAME=" + std::to_string(iframe.template_id));
+    }
+    if (prev.dyn_params.size() != iframe.dyn_params.size()) {
+        fail("CP dyn_params count mismatch: ENTRY=" +
+             std::to_string(prev.dyn_params.size()) +
+             " IFRAME=" + std::to_string(iframe.dyn_params.size()));
+    }
+    if (size_t d = first_dyn_param_diff(prev.dyn_params, iframe.dyn_params)) {
+        fail("CP dyn_params[" + std::to_string(d - 1) + "] mismatch");
+    }
+    if (prev.reg_snaps.size() != iframe.reg_snaps.size()) {
+        fail("CP reg_snaps count mismatch: ENTRY=" +
+             std::to_string(prev.reg_snaps.size()) +
+             " IFRAME=" + std::to_string(iframe.reg_snaps.size()));
+    }
+    if (size_t d = first_reg_snap_diff(prev.reg_snaps, iframe.reg_snaps)) {
+        fail("CP reg_snaps[" + std::to_string(d - 1) + "] mismatch");
+    }
+
+    if (prev.wp_entries.size() != iframe.wp_entries.size()) {
+        fail("WP chain length mismatch: ENTRY=" +
+             std::to_string(prev.wp_entries.size()) +
+             " IFRAME=" + std::to_string(iframe.wp_entries.size()));
+    }
+    for (size_t w = 0; w < prev.wp_entries.size(); w++) {
+        const WPEntry &pe = prev.wp_entries[w];
+        const WPEntry &ie = iframe.wp_entries[w];
+        std::string ws = "wp[" + std::to_string(w) + "]";
+        if (pe.template_id != ie.template_id) {
+            fail(ws + " template_id mismatch: ENTRY=" +
+                 std::to_string(pe.template_id) +
+                 " IFRAME=" + std::to_string(ie.template_id));
+        }
+        if (pe.dyn_params.size() != ie.dyn_params.size()) {
+            fail(ws + " dyn_params count mismatch: ENTRY=" +
+                 std::to_string(pe.dyn_params.size()) +
+                 " IFRAME=" + std::to_string(ie.dyn_params.size()));
+        }
+        if (size_t d = first_dyn_param_diff(pe.dyn_params, ie.dyn_params)) {
+            fail(ws + " dyn_params[" + std::to_string(d - 1) + "] mismatch");
+        }
+        if (pe.reg_snaps.size() != ie.reg_snaps.size()) {
+            fail(ws + " reg_snaps count mismatch: ENTRY=" +
+                 std::to_string(pe.reg_snaps.size()) +
+                 " IFRAME=" + std::to_string(ie.reg_snaps.size()));
+        }
+        if (size_t d = first_reg_snap_diff(pe.reg_snaps, ie.reg_snaps)) {
+            fail(ws + " reg_snaps[" + std::to_string(d - 1) + "] mismatch");
+        }
+        if (pe.fault != ie.fault) {
+            fail(ws + " fault flag mismatch");
+        }
+        if (pe.translation_unavailable != ie.translation_unavailable) {
+            fail(ws + " translation_unavailable flag mismatch");
+        }
+        if (pe.fault && pe.fault_insn_index != ie.fault_insn_index) {
+            fail(ws + " fault_insn_index mismatch: ENTRY=" +
+                 std::to_string(pe.fault_insn_index) +
+                 " IFRAME=" + std::to_string(ie.fault_insn_index));
+        }
+    }
 }
 
 /* Compose a template-default Wide for the FID_INSN_* range, where the
@@ -87,13 +318,32 @@ BodyWalker::BodyWalker(const Header &header,
       wp_persistent_(header.wp_persistent()),
       flags_(header.flags) {}
 
-void BodyWalker::walk(const Callback &cb)
+void BodyWalker::walk(const Callback &cb,
+                      const RegfileCallback &rb)
 {
     int32_t prev_entry_template = 0;
     uint32_t current_thread = 0;
     bool pending_thread_switch = false;
-    FieldStateTable cp_state;
-    FieldStateTable wp_state;
+    /*
+     * v1.10 (0x1A): per-thread FieldStateTables.  Earlier versions
+     * shared one cp_state / wp_state across all body entries; that
+     * meant deltas crossed thread boundaries and made multi-vCPU
+     * traces inflated and self-inconsistent.  v1.10 emits each
+     * thread's deltas against its own prior emission.  We use
+     * std::vector indexed by thread_id (dense small ints handed out
+     * by the writer's get_or_assign_thread_id) — direct array access
+     * is fast enough that the per-body-entry lookup is invisible vs
+     * the field-delta replay's own cost.  v1.7..v1.9 traces always
+     * route every entry through tid 0.
+     */
+    std::vector<FieldStateTable> cp_states;
+    std::vector<FieldStateTable> wp_states;
+    bool versioned_per_thread = (header_.format_version >= 0x1A);
+    auto state_at = [&](std::vector<FieldStateTable> &v,
+                        uint32_t k) -> FieldStateTable & {
+        if (k >= v.size()) v.resize((size_t)k + 1);
+        return v[k];
+    };
     std::optional<DecodedEntry> prev_entry;
     uint32_t seq = 0;
     std::optional<uint64_t> footer_num_entries;
@@ -111,15 +361,36 @@ void BodyWalker::walk(const Callback &cb)
             pending_thread_switch = true;
             continue;
         }
+        if (tag == BODY_TAG_REGFILE) {
+            DecodedRegfile rec;
+            rec.thread_id = (uint32_t)body_.uleb();
+            uint64_t n_present = body_.uleb();
+            rec.regs.reserve(n_present);
+            for (uint64_t i = 0; i < n_present; i++) {
+                RegfileSlot s;
+                s.gen_id = body_.u8();
+                uint8_t width = body_.u8();
+                s.bytes.resize(width);
+                if (width) {
+                    body_.raw(s.bytes.data(), width);
+                }
+                rec.regs.push_back(std::move(s));
+            }
+            if (rb) rb(rec);
+            continue;
+        }
         if (tag == BODY_TAG_ENTRY) {
             int64_t tdelta = body_.sleb();
             int32_t entry_tmpl = prev_entry_template + (int32_t)tdelta;
             prev_entry_template = entry_tmpl;
 
+            uint32_t state_key = versioned_per_thread ? current_thread : 0;
+            FieldStateTable &cp_state = state_at(cp_states, state_key);
+            FieldStateTable &wp_state = state_at(wp_states, state_key);
+
             /* v1.7/v1.8: WP overlay forks from CP at chain start.
-             * Cheaper-than-conditional: clone unconditionally to mirror
-             * the writer's pre-chain state. */
-            if (!wp_persistent_) wp_state = cp_state;
+             * v1.9+ persists wp_state across entries and doesn't clone. */
+            if (!wp_persistent_) clone_field_state_table(wp_state, cp_state);
 
             DecodedEntry entry;
             entry.template_id = (uint32_t)entry_tmpl;
@@ -185,42 +456,58 @@ void BodyWalker::walk(const Callback &cb)
             continue;
         }
         if (tag == BODY_TAG_IFRAME) {
-            /* Validation record: decode against fresh empty overlays
-             * and compare against the immediately-preceding ENTRY.
-             * Per format spec we only verify the dyn_params and reg
-             * snap counts here; full deep-equality validation is
-             * costly and the writer's IFRAME emission is exercised by
-             * the plugin's own test harness. */
+            /*
+             * Validation record: decode the IFRAME against fresh empty
+             * overlays (so every value is delta-from-template-default
+             * = absolute) and assert it matches the immediately-
+             * preceding ENTRY's dyn_params, reg_snaps, WP chain, and
+             * WP events.  An IFRAME is the writer's claim that "after
+             * the prior ENTRY the per-thread state is exactly this";
+             * if the decoder's delta-replay disagrees, throw — the
+             * trace is corrupt or the encoder/decoder are out of sync.
+             */
             if (!prev_entry) {
                 throw std::runtime_error("IFRAME with no preceding ENTRY");
             }
             FieldStateTable iframe_cp;
             FieldStateTable iframe_wp;
-            DecodedEntry tmp;
-            tmp.template_id = prev_entry->template_id;
-            /* decode_entry advances the cursor and re-runs the field
-             * walker against the fresh overlays. */
+            DecodedEntry iframe_entry;
+            iframe_entry.template_id = prev_entry->template_id;
             decode_field_delta(body_, prev_entry->template_id,
                                by_id_.count(prev_entry->template_id)
                                    ? &templates_[by_id_.at(prev_entry->template_id)]
                                    : nullptr,
                                iframe_cp, nullptr,
-                               &tmp.dyn_params, &tmp.reg_snaps);
+                               &iframe_entry.dyn_params,
+                               &iframe_entry.reg_snaps);
 
-            /* WP chain. */
+            /* WP chain.  Mirror the encoder's IFRAME emission: the
+             * iframe_wp overlay falls back to iframe_cp as base
+             * (writer uses st->iframe_cp_scratch for both wp_state
+             * and wp_base in IFRAME mode), and on persistent-WP
+             * versions the wp_base parameter is the iframe_cp
+             * overlay so unset cells fall through to the same place
+             * the cp section just populated. */
             Reader wpb = body_.sub();
             uint64_t num_wp = wpb.uleb();
             int32_t prev_wp_tmpl = 0;
+            iframe_entry.wp_entries.reserve(num_wp);
+            const FieldStateTable *iframe_wp_base =
+                wp_persistent_ ? &iframe_cp : nullptr;
             for (uint64_t w = 0; w < num_wp; w++) {
                 int64_t wd = wpb.sleb();
                 int32_t wp_tmpl = prev_wp_tmpl + (int32_t)wd;
                 prev_wp_tmpl = wp_tmpl;
-                std::vector<DynParam> dyn;
-                std::vector<RegSnap>  snaps;
+                WPEntry we;
+                we.index = (uint32_t)w;
+                we.template_id = (uint32_t)wp_tmpl;
                 const Template *wtmpl = by_id_.count((uint32_t)wp_tmpl)
                     ? &templates_[by_id_.at((uint32_t)wp_tmpl)] : nullptr;
+                if (wtmpl) we.n_insns = (uint32_t)wtmpl->insns.size();
                 decode_field_delta(wpb, (uint32_t)wp_tmpl, wtmpl,
-                                   iframe_wp, nullptr, &dyn, &snaps);
+                                   iframe_wp, iframe_wp_base,
+                                   &we.dyn_params, &we.reg_snaps);
+                iframe_entry.wp_entries.push_back(std::move(we));
             }
             /* Events sub-section. */
             Reader evb = body_.sub();
@@ -233,9 +520,26 @@ void BodyWalker::walk(const Callback &cb)
                     throw std::runtime_error("IFRAME wp event index out of range");
                 }
                 uint8_t evf = evb.u8();
-                if (evf & WP_EVENT_FAULT) (void)evb.uleb();  /* fault_insn_index */
+                iframe_entry.wp_entries[idx].translation_unavailable =
+                    (evf & WP_EVENT_TRANSLATION_UNAVAIL) != 0;
+                bool is_fault = (evf & WP_EVENT_FAULT) != 0;
+                iframe_entry.wp_entries[idx].fault = is_fault;
+                if (is_fault) {
+                    iframe_entry.wp_entries[idx].fault_insn_index =
+                        (uint32_t)evb.uleb();
+                    iframe_entry.wp_entries[idx].has_fault_idx = true;
+                }
                 prev_idx = idx;
             }
+
+            /*
+             * Now validate iframe_entry against prev_entry.  Mismatch
+             * implies decoder state has diverged from the writer's —
+             * either a corrupt trace or an encoder/decoder bug.
+             * Throws on the first divergence with a descriptive
+             * message.
+             */
+            validate_iframe(*prev_entry, iframe_entry);
             continue;
         }
         throw std::runtime_error("Unknown body tag");
@@ -257,13 +561,28 @@ void BodyWalker::decode_field_delta(Reader &outer,
     Reader sec = outer.sub();
     uint64_t n_records = sec.uleb();
 
-    /* Pass 1: apply record deltas to the persistent state. */
+    if (!g_slot_lut_built) slot_lut_build();
+
+    /* Pass 1: apply record deltas to the per-template block. */
     uint32_t pos = 0;
     /* (ipos, fid) -> EXTRA_* raw vector for this entry only. */
     std::unordered_map<uint64_t, std::vector<Wide>> extras;
     auto extra_key = [](uint32_t ipos, uint8_t fid) -> uint64_t {
         return ((uint64_t)ipos << 8) | fid;
     };
+
+    /* Resolve the per-(state,base) blocks once for this entry; the
+     * record loop below indexes into them directly instead of hash-
+     * looking-up per record (the prior unordered_map<u64, Wide>
+     * design was ~10% of total decoder time on full-config mcf). */
+    uint32_t need_insns = tmpl ? (uint32_t)tmpl->insns.size() : 0;
+    FieldStateBlock *state_blk =
+        table_get_or_create_block(state, template_id,
+                                   std::max<uint32_t>(need_insns, 1));
+    const FieldStateBlock *base_blk =
+        base_state ? table_get_block(*base_state, template_id) : nullptr;
+    uint32_t state_gen = state.generation;
+    uint32_t base_gen  = base_state ? base_state->generation : 0;
 
     for (uint64_t i = 0; i < n_records; i++) {
         pos += (uint32_t)sec.uleb();
@@ -284,61 +603,50 @@ void BodyWalker::decode_field_delta(Reader &outer,
             (void)sec.uleb();
             continue;
         }
-        uint64_t k = cell_key(template_id, pos, fid);
+        uint8_t slot = slot_index(fid);
         Wide base;
-        auto it = state.cells.find(k);
-        if (it != state.cells.end()) {
-            base = it->second;
-        } else if (base_state) {
-            auto bit = base_state->cells.find(k);
-            if (bit != base_state->cells.end()) {
-                base = bit->second;
-            } else {
-                base = template_default(tmpl, pos, fid);
-            }
-        } else {
+        if (!cell_read(state_blk, state_gen, pos, slot, &base) &&
+            !cell_read(base_blk, base_gen, pos, slot, &base)) {
             base = template_default(tmpl, pos, fid);
         }
         base.add_signed_mod_wide(wd, scalar_bits_);
-        state.cells[k] = base;
+        cell_write(state_blk, state_gen, pos, slot, base);
     }
 
-    /* Pass 2: materialize dyn_params and reg_snaps from the state
-     * we just updated.  Mirrors the Python decoder's pass 2 — only
-     * fids whose template-default is zero are read here, so a missed
-     * lookup falls through to a zeroed Wide. */
+    /* Pass 2: materialize dyn_params and reg_snaps from the per-
+     * (template, ipos, fid_slot) cells we just updated.  state_blk
+     * has been ensured-sized for tmpl->insns; base_blk may be smaller
+     * or absent — cell_read tolerates both. */
     if (!tmpl) return;
     bool has_mem = (flags_ & FLAG_MEM_DATA) != 0;
     bool has_reg = (flags_ & FLAG_REG_DATA) != 0;
 
-    auto lookup = [&](uint64_t k) -> Wide {
-        auto it = state.cells.find(k);
-        if (it != state.cells.end()) return it->second;
-        if (base_state) {
-            auto bit = base_state->cells.find(k);
-            if (bit != base_state->cells.end()) return bit->second;
-        }
+    auto lookup_fid = [&](uint32_t ipos, uint8_t fid) -> Wide {
+        Wide out;
+        uint8_t slot = slot_index(fid);
+        if (cell_read(state_blk, state_gen, ipos, slot, &out)) return out;
+        if (cell_read(base_blk, base_gen, ipos, slot, &out)) return out;
         return Wide{};
     };
 
     for (size_t i = 0; i < tmpl->insns.size(); i++) {
-        uint64_t ipos_key = ((uint64_t)template_id << 24) |
-                            ((uint64_t)i << 8);
-        uint64_t n_loads  = lookup(ipos_key | FID_N_LOADS).low64();
-        uint64_t n_stores = lookup(ipos_key | FID_N_STORES).low64();
+        uint64_t n_loads  = lookup_fid((uint32_t)i, FID_N_LOADS).low64();
+        uint64_t n_stores = lookup_fid((uint32_t)i, FID_N_STORES).low64();
 
         if (n_loads || n_stores) {
             uint64_t fixed_loads  = std::min<uint64_t>(n_loads,  FID_SLOT_COUNT);
             uint64_t fixed_stores = std::min<uint64_t>(n_stores, FID_SLOT_COUNT);
 
             for (uint64_t s = 0; s < fixed_loads; s++) {
-                Wide a = lookup(ipos_key | (FID_LOAD_ADDR_BASE + s));
+                Wide a = lookup_fid((uint32_t)i,
+                                    (uint8_t)(FID_LOAD_ADDR_BASE + s));
                 DynParam dp;
                 dp.type = DynParam::Load;
                 dp.insn_index = (uint32_t)i;
                 dp.addr = a.low64();
                 if (has_mem) {
-                    dp.data = lookup(ipos_key | (FID_LOAD_DATA_BASE + s));
+                    dp.data = lookup_fid((uint32_t)i,
+                                         (uint8_t)(FID_LOAD_DATA_BASE + s));
                     dp.has_data = true;
                 }
                 dyn_params->push_back(dp);
@@ -372,13 +680,15 @@ void BodyWalker::decode_field_delta(Reader &outer,
             }
 
             for (uint64_t s = 0; s < fixed_stores; s++) {
-                Wide a = lookup(ipos_key | (FID_STORE_ADDR_BASE + s));
+                Wide a = lookup_fid((uint32_t)i,
+                                    (uint8_t)(FID_STORE_ADDR_BASE + s));
                 DynParam dp;
                 dp.type = DynParam::Store;
                 dp.insn_index = (uint32_t)i;
                 dp.addr = a.low64();
                 if (has_mem) {
-                    dp.data = lookup(ipos_key | (FID_STORE_DATA_BASE + s));
+                    dp.data = lookup_fid((uint32_t)i,
+                                         (uint8_t)(FID_STORE_DATA_BASE + s));
                     dp.has_data = true;
                 }
                 dyn_params->push_back(dp);
@@ -414,7 +724,8 @@ void BodyWalker::decode_field_delta(Reader &outer,
 
         if (has_reg) {
             for (size_t op_i = 0; op_i < tmpl->insns[i].dst_regs.size(); op_i++) {
-                Wide v = lookup(ipos_key | (FID_DST_REG_BASE + op_i));
+                Wide v = lookup_fid((uint32_t)i,
+                                    (uint8_t)(FID_DST_REG_BASE + op_i));
                 RegSnap r;
                 r.insn_index = (uint32_t)i;
                 r.operand_index = (uint8_t)op_i;

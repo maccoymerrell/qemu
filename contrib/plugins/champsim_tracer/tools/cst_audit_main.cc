@@ -100,6 +100,10 @@ struct Stats {
     Bucket wp_events;
     uint64_t iframe_count = 0;
     Bucket   iframe_bytes;
+    /* v1.10 BODY_TAG_REGFILE: per-thread initial regfile snapshot,
+     * one record per (segment, thread_id). */
+    uint64_t regfile_count = 0;
+    Bucket   regfile_bytes;
 
     /* Per-bucket detail across CP and WP field-delta streams. */
     std::array<Bucket, NUM_BUCKETS> cp_fd{};
@@ -335,6 +339,25 @@ void walk_body(const uint8_t *m, size_t body_off, size_t body_end,
             continue;
         }
 
+        if (tag == cst::BODY_TAG_REGFILE) {
+            (void)read_uleb(m, p);                /* thread_id */
+            uint64_t n_regs = read_uleb(m, p);
+            for (uint64_t i = 0; i < n_regs; i++) {
+                if (p >= body_end) {
+                    throw std::runtime_error("regfile record truncated");
+                }
+                p += 1;                            /* gen_id */
+                uint8_t width = m[p++];
+                if (p + width > body_end) {
+                    throw std::runtime_error("regfile record truncated");
+                }
+                p += width;
+            }
+            s->regfile_count++;
+            s->regfile_bytes.bytes += p - tag_pos;
+            continue;
+        }
+
         if (tag == cst::BODY_TAG_END) {
             skip_uleb(m, p);                 /* num_entries */
             s->body_terminator = p - tag_pos;
@@ -350,6 +373,7 @@ void walk_body(const uint8_t *m, size_t body_off, size_t body_end,
     s->wp_field_delta.count = s->wp_entries_total;
     s->wp_events.count = s->cp_entries;
     s->iframe_bytes.count = s->iframe_count;
+    s->regfile_bytes.count = s->regfile_count;
 }
 
 /* ===== Output formatting ===== */
@@ -463,6 +487,9 @@ void print_report(const Stats &s)
     std::printf("%s\n", row("IFRAME records (validation redundancy)",
                              s.iframe_bytes.bytes, body,
                              s.iframe_count, "iframe").c_str());
+    std::printf("%s\n", row("REGFILE records (per-thread initial state)",
+                             s.regfile_bytes.bytes, body,
+                             s.regfile_count, "regfile").c_str());
     std::printf("%s\n", row("BODY terminator", s.body_terminator, body).c_str());
 
     uint64_t fd_total = s.cp_field_delta.bytes + s.wp_field_delta.bytes;

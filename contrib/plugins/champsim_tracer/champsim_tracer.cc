@@ -534,6 +534,7 @@ static void emit_body_entry(BodyStreamState *out_stream,
     entry.wp_entries = std::move(wp_entries);
     entry.tmpl = bb_tmpl;
     entry.thread_id = get_or_assign_thread_id(cpu_index);
+    entry.cpu_index = cpu_index;
 
     g_mem_recorder.drain_cp_into_dyn_params(entry.dyn_params, bb_tmpl);
     if (enable_reg_data && !pending_reg_snaps.empty()) {

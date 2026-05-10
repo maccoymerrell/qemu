@@ -60,15 +60,36 @@ state for the same field.
 ## 2. Constants
 
 ```
-CST_MAGIC          = 0x19545343          bytes: 'C' 'S' 'T' 0x19
-CST_TRAILER_MAGIC  = 0x19545343FFFFFFFF
+CST_MAGIC          = 0x1A545343          bytes: 'C' 'S' 'T' 0x1A
+CST_TRAILER_MAGIC  = 0x1A545343FFFFFFFF
 CST_TRAILER_SIZE   = 64
 
-BODY_TAG_END       = 0
-BODY_TAG_ENTRY     = 1
+BODY_TAG_END           = 0
+BODY_TAG_ENTRY         = 1
 BODY_TAG_THREAD_SWITCH = 2
-BODY_TAG_IFRAME    = 3
+BODY_TAG_IFRAME        = 3
+BODY_TAG_REGFILE       = 4   (added v1.10)
 ```
+
+The version byte rolled from `0x19` (v1.9) to `0x1A` (v1.10).  v1.10
+introduced two related changes for multi-vCPU correctness:
+
+  - The `reg` encoding map dropped its per-entry `(width, bytes)`
+    suffix.  The header no longer carries any initial register-file
+    snapshot.
+  - A new body record `BODY_TAG_REGFILE` is emitted once per
+    `(segment, thread_id)` pair, before that thread's first
+    `BODY_TAG_ENTRY` in the segment, carrying that thread's initial
+    register file as absolute values.
+
+  - Field-state delta encoding became per-thread.  Each thread's
+    `BODY_TAG_ENTRY` deltas are computed against that thread's own
+    prior emission, not the cross-thread sequence.  Decoders maintain
+    a per-thread `FieldStateTable`.
+
+v1.9 readers will refuse v1.10 traces (magic mismatch); v1.10 readers
+still accept v1.9 traces and ignore both new behaviours
+appropriately.
 
 Header feature flags are advisory. The field IDs still determine what
 is actually present in each delta section.
@@ -104,7 +125,7 @@ start of the file.
 
 ```
 +--------------------------------------------------+
-| magic               u32  = 0x19545343            |
+| magic               u32  = 0x1A545343            |
 | isa                 u8   TraceISA                |
 | flags               u8   CST_FLAG_* bits         |
 | start_insn          ULEB                         |
@@ -156,21 +177,13 @@ encoding_maps_section payload:
     repeat n_entries times:
       value   : ULEB         numeric value stored elsewhere in the trace
       name    : string       example: "REG_ZERO"
-
-      // The "reg" map adds an initial-value suffix per entry,
-      // capturing the architectural register's value at segment
-      // start.  Other maps stop at (value, name).
-      if map_name == "reg":
-        width_bytes : u8       0..64; 0 = no live snapshot for this id
-        value_bytes : raw[width_bytes]   little-endian
 ```
 
-The `reg` map's per-entry initial-value suffix lets consumers prime
-register state from the segment header alone, without depending on
-destination-write deltas in the body stream to reveal pre-existing
-values.  `width_bytes == 0` means the plugin could not read the
-register on this target (or the segment opened before any vCPU was
-live, e.g. an install-time non-simpoint start).
+In v1.9 the `reg` map carried a `(width_bytes, value_bytes)` suffix
+per entry — a single initial register-file snapshot for the segment.
+v1.10 removed that suffix; per-thread initial register files are now
+emitted as `BODY_TAG_REGFILE` records inline in the body stream
+(see §5).
 
 The writer currently emits these maps:
 

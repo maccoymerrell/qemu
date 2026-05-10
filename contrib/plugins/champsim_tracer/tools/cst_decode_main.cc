@@ -29,6 +29,8 @@
 #include <string>
 #include <vector>
 
+#include <capstone/capstone.h>
+
 #include "cst_decode.h"
 #include "cst_format.h"
 
@@ -168,6 +170,241 @@ void format_dyn_legacy(const cst::DynParam &dp, bool show_data,
     if (show_data && !wide_is_zero(dp.data)) {
         out->append(":data=");
         out->append(fmt_wide_hex(dp.data));
+    }
+}
+
+/* ===== Disasm-format helpers =====
+ *
+ * Pre-built per-id tables built once at the first render call.  Replace
+ * the per-line unordered_map lookup in fmt_reg / enum_or — those were
+ * ~3.5 % of total decode time on full-config mcf according to perf.
+ *
+ * Mnemonic table converts GEN_OP_INT_ADD → "add", GEN_OP_FP_ADD →
+ * "fadd", GEN_OP_VEC_ADD → "vadd", etc. (objdump-style short forms).
+ *
+ * Reg table converts REG_GPR0 → "%gp0", REG_FPR3 → "%f3",
+ * REG_VEC2 → "%v2", REG_SP → "%sp", REG_FLAGS → "%flags", and so on.
+ *
+ * Both fall back to the trace's own encoding map when an id wasn't
+ * built into the lookup; that's the same path fmt_reg/enum_or used.
+ */
+struct DisasmTables {
+    std::vector<std::string> opcode;     /* indexed by GEN_OP_* */
+    std::vector<std::string> reg;        /* indexed by REG_* */
+};
+
+std::string strip_lower(const std::string &name, const char *prefix)
+{
+    size_t plen = std::strlen(prefix);
+    std::string r;
+    if (name.size() > plen && name.compare(0, plen, prefix) == 0) {
+        r = name.substr(plen);
+    } else {
+        r = name;
+    }
+    for (char &c : r) {
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+    }
+    return r;
+}
+
+/* Convert one GEN_OP_<X> name to a short mnemonic.  Drops INT_ prefix
+ * (the int variant is the default), maps FP_/VEC_ to f-/v- prefixes.
+ * For GEN_OP_BRANCH the writer didn't pin a flavour into the opcode
+ * name; the renderer overrides the mnemonic with the branch_type
+ * (jmp / jcc / jmpr / ...) at the call site. */
+std::string mnem_from_genop(const std::string &name)
+{
+    std::string body = strip_lower(name, "GEN_OP_");
+    if (body == "branch") return "jmp";  /* default; overridden by branch_type */
+    if (body == "syscall") return "syscall";
+    if (body == "ret") return "ret";
+    if (body == "nop") return "nop";
+    if (body == "fence") return "fence";
+    if (body == "load") return "ld";
+    if (body == "store") return "st";
+    if (body == "prefetch") return "prefetch";
+    if (body == "cache_flush") return "clflush";
+    if (body == "tlb_flush") return "invlpg";
+    if (body == "cmov") return "cmov";
+    if (body == "setcc") return "setcc";
+    if (body == "unknown") return "?";
+    if (body.compare(0, 4, "int_") == 0) return body.substr(4);
+    if (body.compare(0, 3, "fp_") == 0)  return "f" + body.substr(3);
+    if (body.compare(0, 4, "vec_") == 0) return "v" + body.substr(4);
+    return body;
+}
+
+/* Convert one REG_<X> name to a register reference (with leading '%').
+ * Compresses GPRn → %gpN, FPRn → %fN, VECn → %vN, PREDn → %pN; leaves
+ * specials (SP, IP, FLAGS, SEGn, CTRL, ...) as their lowercased
+ * stripped name. */
+std::string regref_from_name(const std::string &name)
+{
+    if (name == "REG_NONE") return "";
+    std::string body = strip_lower(name, "REG_");
+    if (body.compare(0, 3, "gpr") == 0)  return "%gp" + body.substr(3);
+    if (body.compare(0, 3, "fpr") == 0)  return "%f"  + body.substr(3);
+    if (body.compare(0, 3, "vec") == 0)  return "%v"  + body.substr(3);
+    if (body.compare(0, 4, "pred") == 0) return "%p"  + body.substr(4);
+    if (body.compare(0, 5, "bound") == 0) return "%b" + body.substr(5);
+    if (body.compare(0, 7, "matrix_") == 0) return "%m" + body.substr(7);
+    if (body == "fp_reg") return "%fpr";   /* legacy alias bucket */
+    if (body == "vec_reg") return "%vr";
+    if (body == "pred_reg") return "%pr";
+    return "%" + body;
+}
+
+void disasm_tables_build(DisasmTables *t, const cst::Header &h)
+{
+    auto build_from_map = [&](std::vector<std::string> &dst,
+                              const std::unordered_map<uint64_t,
+                                                       std::string> &map,
+                              auto convert) {
+        uint64_t mx = 0;
+        for (auto &kv : map) if (kv.first > mx) mx = kv.first;
+        dst.assign((size_t)mx + 1, std::string{});
+        for (auto &kv : map) {
+            dst[kv.first] = convert(kv.second);
+        }
+    };
+    build_from_map(t->opcode, h.maps.opcode,
+                   [](const std::string &n) { return mnem_from_genop(n); });
+    build_from_map(t->reg, h.maps.reg,
+                   [](const std::string &n) { return regref_from_name(n); });
+}
+
+inline const std::string *table_lookup(const std::vector<std::string> &t,
+                                       uint64_t id)
+{
+    if (id >= t.size() || t[id].empty()) return nullptr;
+    return &t[id];
+}
+
+/*
+ * Append @v as lowercase hex into @out.  Builds the digits in a stack
+ * buffer end-first and appends in one shot — single push_back per
+ * character was hot enough on a 200s decode (11.7 % of total) to
+ * justify the small overhead of computing a length first.
+ */
+inline const char *kHexDigits = "0123456789abcdef";
+
+void append_hex(std::string *out, uint64_t v)
+{
+    if (v == 0) { out->push_back('0'); return; }
+    char buf[16];
+    int n = 0;
+    while (v) { buf[15 - n] = kHexDigits[v & 0xF]; v >>= 4; n++; }
+    out->append(buf + (16 - n), (size_t)n);
+}
+
+/* Width-padded hex (zero-padded to @width chars).  Used for the PC
+ * column where we always want 12 digits. */
+void append_hex_padded(std::string *out, uint64_t v, int width)
+{
+    char buf[16];
+    for (int i = 0; i < width; i++) {
+        buf[width - 1 - i] = kHexDigits[v & 0xF];
+        v >>= 4;
+    }
+    out->append(buf, (size_t)width);
+}
+
+void append_byte_hex(std::string *out, uint8_t b)
+{
+    out->push_back(kHexDigits[(b >> 4) & 0xF]);
+    out->push_back(kHexDigits[b & 0xF]);
+}
+
+/*
+ * Capstone-backed objdump-style disassembler (--objdump flag).
+ *
+ * Holds one cs_handle per cst_decode invocation (NOT per insn) so
+ * the per-line cost is just cs_disasm_iter on the raw_bytes that
+ * the trace already carries.  Selected mode follows the trace's
+ * declared ISA (header.isa).  When the ISA is unsupported or
+ * Capstone is unavailable for a given build, render() returns
+ * false and the caller suppresses the side-by-side column.
+ */
+class ObjdumpRenderer {
+public:
+    ObjdumpRenderer() = default;
+
+    ~ObjdumpRenderer() {
+        if (open_) cs_close(&handle_);
+    }
+
+    bool open(uint8_t trace_isa) {
+        cs_arch arch;
+        cs_mode mode;
+        switch (trace_isa) {
+        case 1: arch = CS_ARCH_X86;     mode = CS_MODE_64;            break;
+        case 2: arch = CS_ARCH_AARCH64; mode = CS_MODE_LITTLE_ENDIAN; break;
+        case 3: arch = CS_ARCH_RISCV;   mode = CS_MODE_RISCV64;       break;
+        case 4: arch = CS_ARCH_MIPS;    mode = (cs_mode)(CS_MODE_MIPS64 | CS_MODE_LITTLE_ENDIAN); break;
+        default: return false;
+        }
+        if (cs_open(arch, mode, &handle_) != CS_ERR_OK) return false;
+        cs_option(handle_, CS_OPT_SYNTAX, CS_OPT_SYNTAX_ATT);
+        open_ = true;
+        return true;
+    }
+
+    /*
+     * Disassemble one instruction at @pc from @bytes (length @n_bytes).
+     * Writes "mnem  ops" into @out.  Returns true on success.  The
+     * per-call cost is dominated by cs_disasm_iter — ~2 µs per insn
+     * on x86-64 with default Capstone, comparable to a single fmt_*
+     * call on our side; cheap enough to enable per-template at decode
+     * time.
+     */
+    bool render_one(uint64_t pc, const uint8_t *bytes, size_t n_bytes,
+                    std::string *out) const {
+        if (!open_ || !bytes || n_bytes == 0) return false;
+        cs_insn *insn = cs_malloc(handle_);
+        if (!insn) return false;
+        const uint8_t *code = bytes;
+        size_t size = n_bytes;
+        uint64_t addr = pc;
+        bool ok = cs_disasm_iter(handle_, &code, &size, &addr, insn);
+        if (ok) {
+            /* Pad mnemonic to a fixed width so the operand column
+             * lines up across instructions of varying mnemonic
+             * length.  Capstone returns a separate mnemonic and
+             * op_str — joining them with a single space (rather
+             * than the tab Capstone uses internally) keeps
+             * column alignment when the caller pads-to-N-chars. */
+            const size_t mnem_col = 8;
+            size_t before = out->size();
+            out->append(insn->mnemonic);
+            while (out->size() - before < mnem_col) out->push_back(' ');
+            if (insn->op_str[0]) {
+                out->push_back(' ');
+                out->append(insn->op_str);
+            }
+        }
+        cs_free(insn, 1);
+        return ok;
+    }
+
+private:
+    csh  handle_ = 0;
+    bool open_   = false;
+};
+
+/* Append a Wide as a single hex integer (no leading zeros). */
+void append_wide_hex(std::string *out, const cst::Wide &w)
+{
+    int top = -1;
+    for (int i = (int)cst::Wide::LIMBS - 1; i >= 0; i--) {
+        if (w.limb[i]) { top = i; break; }
+    }
+    if (top < 0) { out->append("0x0"); return; }
+    out->append("0x");
+    append_hex(out, w.limb[top]);
+    /* Lower limbs are zero-padded to 16 hex chars. */
+    for (int i = top - 1; i >= 0; i--) {
+        append_hex_padded(out, w.limb[i], 16);
     }
 }
 
@@ -338,7 +575,8 @@ void render_legacy(FILE *out, const cst::Header &h,
     }
 
     std::fprintf(out, "BODY\n----\n");
-    body.walk([&](const cst::DecodedEntry &e) {
+    body.walk(
+        [&](const cst::DecodedEntry &e) {
         const char *sw = e.thread_switched ? " switch=1" : "";
         std::fprintf(out, "ENTRY %04u thread=%u%s template=BB%u\n",
                      e.seq_num, e.thread_id, sw, e.template_id);
@@ -371,6 +609,16 @@ void render_legacy(FILE *out, const cst::Header &h,
             emit_observations_legacy(out, "    ", h, wp.dyn_params, wp.reg_snaps);
         }
         std::fprintf(out, "\n");
+    },
+    [&](const cst::DecodedRegfile &rf) {
+        std::fprintf(out, "REGFILE thread=%u n=%zu\n",
+                     rf.thread_id, rf.regs.size());
+        for (const auto &s : rf.regs) {
+            std::fprintf(out, "  %s %s\n",
+                         fmt_reg(h, s.gen_id).c_str(),
+                         fmt_bytes_hex(s.bytes).c_str());
+        }
+        std::fprintf(out, "\n");
     });
 
     /* Suppress unused-variable warnings for the constant tables that
@@ -395,10 +643,62 @@ struct DisasmContext {
     const cst::Header *h;
     const std::unordered_map<uint32_t, size_t> *by_id;
     const std::vector<cst::Template> *templates;
+    const DisasmTables *t;
+    /* Optional Capstone-backed objdump-style renderer.  When non-null
+     * each insn line is emitted twice on one row: bytes column,
+     * objdump disasm in a fixed-width left field, then our generic
+     * trace view (with regdata / memdata) on the right. */
+    const ObjdumpRenderer *od;
 };
 
-/* Render one instruction line using a DecodedEntry's per-(insn_index)
- * dyn-params and reg-snaps as the metadata suffix. */
+/* Append a register reference resolved through the prebuilt table; on
+ * miss synthesizes from the trace's encoding map.  No allocation in
+ * the hot path. */
+void append_regref(std::string *out, const DisasmContext &ctx, uint64_t r)
+{
+    const std::string *p = table_lookup(ctx.t->reg, r);
+    if (p) { out->append(*p); return; }
+    auto it = ctx.h->maps.reg.find(r);
+    if (it != ctx.h->maps.reg.end()) {
+        out->append(regref_from_name(it->second));
+        return;
+    }
+    out->append("%r");
+    append_hex(out, r);
+}
+
+void append_mnem(std::string *out, const DisasmContext &ctx, uint64_t op)
+{
+    const std::string *p = table_lookup(ctx.t->opcode, op);
+    if (p) { out->append(*p); return; }
+    auto it = ctx.h->maps.opcode.find(op);
+    if (it != ctx.h->maps.opcode.end()) {
+        out->append(mnem_from_genop(it->second));
+        return;
+    }
+    out->append("op");
+    append_hex(out, op);
+}
+
+void append_pad_to(std::string *out, size_t target)
+{
+    while (out->size() < target) out->push_back(' ');
+}
+
+/* Render one objdump-style instruction line.  Layout:
+ *
+ *   <pc> <sym+off>: <bytes...>  <mnem>   <imm/srcs> -> <dsts[v]>  ; meta
+ *
+ * — bytes match objdump's per-byte hex columns
+ * — operands listed AT&T-ish: imm first, then srcs, an arrow, then dsts
+ *   with regdata appended in [v]
+ * — memops decorate the address with their data inline as (addr)=val
+ * — branch targets append <symbol> when the target's BB is known
+ * — the trailing `; ...` carries thread/bb/wp/sync flags for greppers
+ *
+ * One thread_local std::string is reused across calls; the only
+ * allocations come from short append_hex / number conversions, and
+ * those are amortised once the buffer reaches its high-water mark. */
 void render_disasm_insn(FILE *out, const DisasmContext &ctx,
                         const cst::Template &tmpl,
                         size_t insn_idx,
@@ -406,103 +706,337 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
                         const std::vector<cst::RegSnap> &snaps,
                         uint32_t thread_id, uint32_t bb_id,
                         bool is_wp,
-                        const char *wp_status)
+                        const char *wp_status,
+                        const cst::Template *branch_target_tmpl)
 {
     const cst::InsnTemplate &I = tmpl.insns[insn_idx];
 
-    std::string line;
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "0x%012" PRIx64, I.pc);
-    line += buf;
+    /* Per-thread reusable buffer to avoid the malloc/free churn the
+     * old per-line std::string + concat path created (~6 % memmove +
+     * 5 % alloc/free on full-config mcf decode). */
+    static thread_local std::string line;
+    line.clear();
 
-    /* Symbol+offset.  Templates carry a symbol_name for the BB
-     * entry; offset = pc - start_pc. */
+    /* PC + symbol prefix.  Padded to 12 hex chars so columns align. */
+    line.append("0x");
+    append_hex_padded(&line, I.pc, 12);
     if (!tmpl.symbol_name.empty()) {
-        std::snprintf(buf, sizeof(buf), " <%s+0x%" PRIx64 ">",
-                      tmpl.symbol_name.c_str(), I.pc - tmpl.start_pc);
-        line += buf;
+        line.append(" <");
+        line.append(tmpl.symbol_name);
+        line.append("+0x");
+        append_hex(&line, I.pc - tmpl.start_pc);
+        line.push_back('>');
     }
-    line += ": ";
+    line.append(": ");
 
-    /* Opcode mnemonic (generic), padded for visual alignment. */
-    std::string mnem = enum_or(ctx.h->maps.opcode, I.opcode, "OP");
-    line += mnem;
-    while (line.size() < 32 + 28) line += ' ';
-    /* Fall through with a single space if we exceeded the column. */
-    if (line.back() != ' ') line += "  ";
+    /* Bytes column — objdump prints up to ~7 bytes inline; we let it
+     * grow as needed (raw_bytes is at most 16 for x86 long encodings).
+     * Each byte is two hex chars + a space; pad to a fixed width so
+     * the mnemonic column lines up regardless of actual byte count. */
+    size_t bytes_start = line.size();
+    for (size_t b = 0; b < I.raw_bytes.size(); b++) {
+        if (b) line.push_back(' ');
+        append_byte_hex(&line, I.raw_bytes[b]);
+    }
+    /* Pad to bytes_start + 7*3 + slack, putting the mnemonic at a
+     * stable column. */
+    append_pad_to(&line, bytes_start + 7 * 3 + 4);
 
-    /* Operand encoding: dst regs first, then src regs, then imm.  We
-     * separate dst from src with a `<-` marker so a reader can tell
-     * read-from-write at a glance.  Also suppress if both are empty
-     * (e.g. NOP). */
-    bool wrote_op = false;
-    if (!I.dst_regs.empty() || !I.src_regs.empty()) {
-        wrote_op = true;
-        for (size_t k = 0; k < I.dst_regs.size(); k++) {
-            if (k) line += ",";
-            line += fmt_reg(*ctx.h, I.dst_regs[k]);
+    /* Optional --objdump column: native disasm of the raw bytes via
+     * Capstone, padded to a stable width so the generic-trace view
+     * lines up underneath.  Each per-insn cs_disasm_iter call is
+     * ~2 µs on x86-64 — cheap relative to the surrounding decode
+     * work since templates are small (5-20 insns each) and shared. */
+    if (ctx.od) {
+        size_t obj_start = line.size();
+        std::string obj;
+        if (ctx.od->render_one(I.pc, I.raw_bytes.data(),
+                               I.raw_bytes.size(), &obj)) {
+            line.append(obj);
+        } else {
+            line.append("(undecoded)");
         }
-        if (!I.dst_regs.empty() && !I.src_regs.empty()) line += " <- ";
-        for (size_t k = 0; k < I.src_regs.size(); k++) {
-            if (k) line += ",";
-            line += fmt_reg(*ctx.h, I.src_regs[k]);
+        append_pad_to(&line, obj_start + 40);
+        line.append("| ");
+    }
+
+    /* Mnemonic.  For GEN_OP_BRANCH we substitute a branch-flavoured
+     * mnemonic (jmp / jcc / jmpr / call*) so the per-line annotation
+     * doesn't have to repeat `br=...`.  Other opcodes use the
+     * pre-built mnemonic table directly. */
+    size_t mnem_start = line.size();
+    if (I.branch_type == BRANCH_NONE) {
+        append_mnem(&line, ctx, I.opcode);
+    } else {
+        switch (I.branch_type) {
+        case BRANCH_DIRECT_JUMP:    line.append("jmp");    break;
+        case BRANCH_INDIRECT_JUMP:  line.append("jmpr");   break;
+        case BRANCH_COND_DIRECT:    line.append("jcc");    break;
+        case BRANCH_RETURN:         line.append("ret");    break;
+        case BRANCH_SYSCALL_TYPE:   line.append("syscall"); break;
+        default:                    append_mnem(&line, ctx, I.opcode); break;
         }
     }
+    append_pad_to(&line, mnem_start + 8);
+
+    /* Operands.  Order: imm, srcs, '->', dsts (with regdata in []). */
+    bool first = true;
+    auto sep = [&]() {
+        if (!first) line.append(", ");
+        first = false;
+    };
     if (I.has_imm) {
-        if (wrote_op) line += ",";
-        std::snprintf(buf, sizeof(buf), "IMM(0x%" PRIx64 ")",
-                      (uint64_t)I.imm);
-        line += buf;
-        wrote_op = true;
+        sep();
+        line.append("$0x");
+        append_hex(&line, (uint64_t)I.imm);
+    }
+    for (size_t k = 0; k < I.src_regs.size(); k++) {
+        sep();
+        append_regref(&line, ctx, I.src_regs[k]);
+    }
+    /* Dst section.  Skipped entirely when there are no dst regs, so
+     * NOPs and stores stay clean. */
+    if (!I.dst_regs.empty()) {
+        if (!first) line.append(" -> ");
+        for (size_t k = 0; k < I.dst_regs.size(); k++) {
+            if (k) line.append(", ");
+            append_regref(&line, ctx, I.dst_regs[k]);
+            /* Find the matching reg_snap for this dst slot.  reg_snaps
+             * are emitted in template-walk order, so the operand_index
+             * lines up with k. */
+            for (const auto &r : snaps) {
+                if (r.insn_index == (uint32_t)insn_idx &&
+                    r.operand_index == (uint8_t)k) {
+                    line.append("[");
+                    append_wide_hex(&line, r.value);
+                    line.append("]");
+                    break;
+                }
+            }
+        }
+        first = false;
     }
 
-    /* Metadata: thread, bb, wp marker, branch type, memops, dst writes. */
-    line += "  ; tid=";
-    line += std::to_string(thread_id);
-    line += " bb=";
-    line += std::to_string(bb_id);
-    if (is_wp) line += " wp";
-    if (wp_status && *wp_status) {
-        line += " ";
-        line += wp_status;
+    /* Memory operands rendered inline as ld(addr)=val / st(addr)=val
+     * after the dst section (or after operands if no dst). */
+    for (const auto &dp : dyns) {
+        if (dp.insn_index != (uint32_t)insn_idx) continue;
+        line.append(dp.type == cst::DynParam::Load ? "  ld(0x" : "  st(0x");
+        append_hex(&line, dp.addr);
+        line.push_back(')');
+        if (ctx.h->has_mem_data() && !wide_is_zero(dp.data)) {
+            line.push_back('=');
+            append_wide_hex(&line, dp.data);
+        }
     }
+
+    /* Branch annotations: target PC and symbol when known. */
     if (I.branch_type != BRANCH_NONE) {
-        line += " br=";
-        line += enum_or(ctx.h->maps.branch_type, I.branch_type, "BR");
-        if (I.branch_conditional) line += " cond";
+        if (branch_target_tmpl) {
+            line.append("  # 0x");
+            append_hex(&line, branch_target_tmpl->start_pc);
+            if (!branch_target_tmpl->symbol_name.empty()) {
+                line.append(" <");
+                line.append(branch_target_tmpl->symbol_name);
+                line.push_back('>');
+            }
+        }
+    }
+
+    /* Trailing metadata.  thread / bb / wp markers are already on
+     * the BB header line just above this group of insns, so we don't
+     * repeat them per-instruction.  The remaining items are flavours
+     * that aren't otherwise visible from the bytes/operands: sync
+     * hints (rare) and per-WP fault / translation-unavailable status
+     * (only meaningful for the WP-side entries that carry it). */
+    bool wrote_meta = false;
+    auto begin_meta = [&]() {
+        if (!wrote_meta) { line.append("  ; "); wrote_meta = true; }
+        else             { line.push_back(' '); }
+    };
+    if (wp_status && *wp_status) {
+        begin_meta();
+        line.append(wp_status);
     }
     if (I.sync_hint != 0) {
-        line += " sync=";
-        line += enum_or(ctx.h->maps.sync_hint, I.sync_hint, "SYNC");
+        begin_meta();
+        line.append("sync=");
+        line.append(enum_or(ctx.h->maps.sync_hint, I.sync_hint, "SYNC"));
     }
-    /* Per-insn memops. */
-    for (auto &dp : dyns) {
-        if (dp.insn_index != (uint32_t)insn_idx) continue;
-        line += dp.type == cst::DynParam::Load ? " ld@0x" : " st@0x";
-        line += fmt_hex_lower(dp.addr);
-        if (ctx.h->has_mem_data() && !wide_is_zero(dp.data)) {
-            line += ":";
-            line += fmt_wide_hex(dp.data);
+    (void)thread_id; (void)bb_id; (void)is_wp;
+    line.push_back('\n');
+    std::fwrite(line.data(), 1, line.size(), out);
+}
+
+/*
+ * Templates-only renderer (--templates-only flag).  Walks every
+ * template, dedupes by PC, sorts ascending, and emits one insn line
+ * per unique PC — exactly the shape `objdump -d` produces over a
+ * binary's text section.  Symbol-rooted templates (those whose
+ * start_pc is the entry of a named function) emit a
+ * `<pc> <symbol>:` header above their first insn, mirroring
+ * objdump's section markers.  Non-symbolic BBs do not emit any
+ * synthetic delimiter.
+ *
+ * When @od is non-null the per-insn text is Capstone's native
+ * disasm of the raw bytes; otherwise it's our generic view
+ * (mnemonic, src/dst regs, branch flavour).  Templates carry no
+ * run-time observation, so no regdata / memdata appears here.
+ */
+void render_templates_only(FILE *out, const cst::Header &h,
+                           const std::vector<cst::Template> &templates,
+                           const std::unordered_map<uint32_t, size_t> &by_id,
+                           const ObjdumpRenderer *od)
+{
+    DisasmTables dt;
+    disasm_tables_build(&dt, h);
+
+    std::fprintf(out, "\n%s:     file format trace template map\n",
+                 !h.target_name.empty() ? h.target_name.c_str()
+                                        : isa_name(h.isa));
+    std::fprintf(out, "; version=0x%08X templates=%zu%s\n\n",
+                 h.magic, templates.size(),
+                 od ? " objdump_disasm=on" : "");
+
+    /* Index every distinct PC across all templates.  Different
+     * templates can cover overlapping PC ranges (a true BB and one
+     * of its prefixes both reaching the same later insn), so we
+     * dedupe on PC.  The first sighting of each PC wins, which
+     * is fine because the bytes are identical anyway. */
+    struct Entry {
+        uint64_t pc;
+        const cst::InsnTemplate *insn;
+    };
+    std::vector<Entry> entries;
+    std::unordered_map<uint64_t, std::string> symbol_at;
+    entries.reserve(templates.size() * 4);
+    for (const cst::Template &t : templates) {
+        if (!t.symbol_name.empty()) {
+            symbol_at[t.start_pc] = t.symbol_name;
+        }
+        for (const cst::InsnTemplate &I : t.insns) {
+            entries.push_back({I.pc, &I});
         }
     }
-    /* Per-insn dst register writes (post-execution snapshot). */
-    for (auto &r : snaps) {
-        if (r.insn_index != (uint32_t)insn_idx) continue;
-        line += " ";
-        line += fmt_reg(*ctx.h, r.reg_id);
-        line += "=";
-        line += fmt_wide_hex(r.value);
-    }
+    std::sort(entries.begin(), entries.end(),
+              [](const Entry &a, const Entry &b) { return a.pc < b.pc; });
+    /* Dedupe consecutive same-PC entries. */
+    entries.erase(std::unique(entries.begin(), entries.end(),
+                              [](const Entry &a, const Entry &b) {
+                                  return a.pc == b.pc;
+                              }),
+                  entries.end());
 
-    std::fprintf(out, "%s\n", line.c_str());
+    std::string line;
+    for (const Entry &e : entries) {
+        const cst::InsnTemplate &I = *e.insn;
+
+        /* Symbol header before the first insn of a named function. */
+        auto sit = symbol_at.find(I.pc);
+        if (sit != symbol_at.end()) {
+            line.clear();
+            append_hex_padded(&line, I.pc, 16);
+            line.append(" <");
+            line.append(sit->second);
+            line.append(">:\n");
+            std::fwrite(line.data(), 1, line.size(), out);
+        }
+
+        line.clear();
+        /* Address column: 2-space indent, 16-char zero-padded hex,
+         * colon, 2-space gap.  Spaces (not tab) so visual alignment
+         * is independent of terminal tab width. */
+        line.append("  ");
+        append_hex_padded(&line, I.pc, 16);
+        line.append(":  ");
+
+        /* Bytes column: each byte 2 hex chars + space, padded to a
+         * fixed width so the next column lines up regardless of
+         * how many bytes a particular insn encoded to. */
+        size_t bytes_start = line.size();
+        for (size_t b = 0; b < I.raw_bytes.size(); b++) {
+            if (b) line.push_back(' ');
+            append_byte_hex(&line, I.raw_bytes[b]);
+        }
+        append_pad_to(&line, bytes_start + 16 * 3);
+        line.append("  ");
+
+        /* When --objdump is set, emit Capstone's native disasm in the
+         * left column then a `| ` separator before our generic view.
+         * Both columns share the bytes column above; Capstone shows
+         * what objdump itself would, our view shows the generic IR
+         * the trace records.  Without --objdump only the generic
+         * view is emitted. */
+        if (od) {
+            size_t obj_start = line.size();
+            std::string obj;
+            if (od->render_one(I.pc, I.raw_bytes.data(),
+                               I.raw_bytes.size(), &obj)) {
+                line.append(obj);
+            } else {
+                line.append("(undecoded)");
+            }
+            append_pad_to(&line, obj_start + 40);
+            line.append("| ");
+        }
+
+        /* Generic-view mnemonic + operands (no regdata in templates-
+         * only; templates carry no run-time observation). */
+        size_t mnem_start = line.size();
+        if (I.branch_type == BRANCH_NONE) {
+            const std::string *p = table_lookup(dt.opcode, I.opcode);
+            if (p) line.append(*p);
+            else line.append("op");
+        } else {
+            switch (I.branch_type) {
+            case BRANCH_DIRECT_JUMP:    line.append("jmp");    break;
+            case BRANCH_INDIRECT_JUMP:  line.append("jmpr");   break;
+            case BRANCH_COND_DIRECT:    line.append("jcc");    break;
+            case BRANCH_RETURN:         line.append("ret");    break;
+            case BRANCH_SYSCALL_TYPE:   line.append("syscall"); break;
+            default: line.append("br"); break;
+            }
+        }
+        append_pad_to(&line, mnem_start + 8);
+
+        bool first = true;
+        if (I.has_imm) {
+            if (!first) line.append(", ");
+            line.append("$0x");
+            append_hex(&line, (uint64_t)I.imm);
+            first = false;
+        }
+        for (size_t k = 0; k < I.src_regs.size(); k++) {
+            if (!first) line.append(", ");
+            const std::string *p = table_lookup(dt.reg, I.src_regs[k]);
+            if (p) line.append(*p);
+            else line.append("%r?");
+            first = false;
+        }
+        if (!I.dst_regs.empty()) {
+            if (!first) line.append(" -> ");
+            for (size_t k = 0; k < I.dst_regs.size(); k++) {
+                if (k) line.append(", ");
+                const std::string *p = table_lookup(dt.reg, I.dst_regs[k]);
+                if (p) line.append(*p);
+                else line.append("%r?");
+            }
+        }
+
+        line.push_back('\n');
+        std::fwrite(line.data(), 1, line.size(), out);
+    }
 }
 
 void render_disasm(FILE *out, const cst::Header &h,
                    const std::vector<cst::Template> &templates,
                    const std::unordered_map<uint32_t, size_t> &by_id,
-                   cst::BodyWalker &body)
+                   cst::BodyWalker &body,
+                   const ObjdumpRenderer *od)
 {
-    DisasmContext ctx{&h, &by_id, &templates};
+    DisasmTables dt;
+    disasm_tables_build(&dt, h);
+    DisasmContext ctx{&h, &by_id, &templates, &dt, od};
 
     /* One-shot header summary (everything a grepper might want
      * before the per-insn lines).  Kept parseable: `; KEY=value`
@@ -556,13 +1090,27 @@ void render_disasm(FILE *out, const cst::Header &h,
                      e.seq_num, e.thread_id,
                      e.thread_switched ? " (thread_switch)" : "");
 
+        /* For the BB-final branch (if any): look up the target BB's
+         * template so render_disasm_insn can append <target+sym>.
+         * The CP chain's final fragment is at fall_through_pc; the WP
+         * chain entries below resolve their own targets via wp[w+1]. */
+        const cst::Template *cp_branch_target = nullptr;
+        if (!t.insns.empty() && t.fall_through_pc) {
+            auto fit = std::find_if(templates.begin(), templates.end(),
+                [&](const cst::Template &x) { return x.start_pc == t.fall_through_pc; });
+            if (fit != templates.end()) cp_branch_target = &*fit;
+        }
         for (size_t i = 0; i < t.insns.size(); i++) {
+            const cst::Template *bt = (i + 1 == t.insns.size())
+                ? cp_branch_target : nullptr;
             render_disasm_insn(out, ctx, t, i, e.dyn_params, e.reg_snaps,
                                e.thread_id, e.template_id,
                                /* is_wp= */ false,
-                               /* wp_status= */ nullptr);
+                               /* wp_status= */ nullptr,
+                               bt);
         }
-        for (auto &wp : e.wp_entries) {
+        for (size_t w = 0; w < e.wp_entries.size(); w++) {
+            const auto &wp = e.wp_entries[w];
             auto wit = by_id.find(wp.template_id);
             if (wit == by_id.end()) continue;
             const cst::Template &wt = templates[wit->second];
@@ -582,17 +1130,28 @@ void render_disasm(FILE *out, const cst::Header &h,
                 status += "TRANSLATION_UNAVAILABLE";
             }
             std::fprintf(out,
-                         "; ..... wp[%u] BB %u n_insns=%u%s%s -----\n",
-                         wp.index, wp.template_id, wp.n_insns,
+                         "; ..... wp[%zu] BB %u n_insns=%u%s%s -----\n",
+                         w, wp.template_id, wp.n_insns,
                          status.empty() ? "" : " status=",
                          status.c_str());
+            /* WP-side branch target = next WP entry's BB start, if any. */
+            const cst::Template *wp_branch_target = nullptr;
+            if (w + 1 < e.wp_entries.size()) {
+                auto nit = by_id.find(e.wp_entries[w + 1].template_id);
+                if (nit != by_id.end()) {
+                    wp_branch_target = &templates[nit->second];
+                }
+            }
             uint32_t wp_n = std::min<uint32_t>(wp.n_insns,
                                                (uint32_t)wt.insns.size());
             for (size_t i = 0; i < wp_n; i++) {
+                const cst::Template *bt = (i + 1 == wp_n)
+                    ? wp_branch_target : nullptr;
                 render_disasm_insn(out, ctx, wt, i, wp.dyn_params, wp.reg_snaps,
                                    e.thread_id, wp.template_id,
                                    /* is_wp= */ true,
-                                   status.empty() ? nullptr : status.c_str());
+                                   status.empty() ? nullptr : status.c_str(),
+                                   bt);
             }
         }
     });
@@ -604,25 +1163,44 @@ int main(int argc, char **argv)
 {
     const char *trace_path = nullptr;
     const char *format = "disasm";
+    bool templates_only = false;
+    bool show_objdump   = false;
+
+    auto usage = [&]() {
+        std::fprintf(stderr,
+            "usage: %s [--format=disasm|legacy] [--templates-only] "
+            "[--objdump] <trace.cst>\n"
+            "  --templates-only  print only the template dictionary,\n"
+            "                    skip the body delta-replay\n"
+            "  --objdump         emit Capstone-rendered native disasm\n"
+            "                    of each insn alongside the generic view\n",
+            argv[0]);
+    };
 
     for (int i = 1; i < argc; i++) {
         if (std::strncmp(argv[i], "--format=", 9) == 0) {
             format = argv[i] + 9;
         } else if (std::strcmp(argv[i], "--legacy") == 0) {
             format = "legacy";
+        } else if (std::strcmp(argv[i], "--templates-only") == 0) {
+            templates_only = true;
+        } else if (std::strcmp(argv[i], "--objdump") == 0) {
+            show_objdump = true;
         } else if (argv[i][0] == '-') {
-            std::fprintf(stderr,
-                         "usage: %s [--format=disasm|legacy] <trace.cst>\n",
-                         argv[0]);
+            usage();
             return 2;
         } else {
             trace_path = argv[i];
         }
     }
     if (!trace_path) {
+        usage();
+        return 2;
+    }
+    if (templates_only && std::strcmp(format, "legacy") == 0) {
         std::fprintf(stderr,
-                     "usage: %s [--format=disasm|legacy] <trace.cst>\n",
-                     argv[0]);
+            "cst_decode: --templates-only is incompatible with "
+            "--format=legacy\n");
         return 2;
     }
 
@@ -655,17 +1233,38 @@ int main(int argc, char **argv)
         std::vector<cst::Template> templates =
             cst::parse_templates(m, size, t.templates_off,
                                   t.templates_count, &by_id);
-        cst::BodyWalker walker(h, templates, by_id, m, size,
-                               t.body_off, t.body_off + t.body_byte_count);
 
-        if (std::strcmp(format, "legacy") == 0) {
-            render_legacy(stdout, h, templates, by_id, walker);
-        } else if (std::strcmp(format, "disasm") == 0) {
-            render_disasm(stdout, h, templates, by_id, walker);
+        /* Optional Capstone-backed objdump column.  Open once per
+         * invocation; the per-line render call reuses the handle. */
+        ObjdumpRenderer od;
+        ObjdumpRenderer *odp = nullptr;
+        if (show_objdump) {
+            if (od.open(h.isa)) {
+                odp = &od;
+            } else {
+                std::fprintf(stderr,
+                    "cst_decode: --objdump unsupported for ISA=%u; "
+                    "continuing without the objdump column\n",
+                    (unsigned)h.isa);
+            }
+        }
+
+        if (templates_only) {
+            render_templates_only(stdout, h, templates, by_id, odp);
         } else {
-            std::fprintf(stderr, "cst_decode: unknown format '%s'\n", format);
-            munmap(map, size);
-            return 2;
+            cst::BodyWalker walker(h, templates, by_id, m, size,
+                                   t.body_off,
+                                   t.body_off + t.body_byte_count);
+            if (std::strcmp(format, "legacy") == 0) {
+                render_legacy(stdout, h, templates, by_id, walker);
+            } else if (std::strcmp(format, "disasm") == 0) {
+                render_disasm(stdout, h, templates, by_id, walker, odp);
+            } else {
+                std::fprintf(stderr,
+                             "cst_decode: unknown format '%s'\n", format);
+                munmap(map, size);
+                return 2;
+            }
         }
     } catch (const std::exception &e) {
         std::fprintf(stderr, "cst_decode: %s\n", e.what());

@@ -193,25 +193,6 @@ static void write_encoding_map(BitWriter *bw, const char *map_name,
     }
 }
 
-/* Per-segment initial register-file snapshot, indexed by GenericRegId.
- * write_reg_encoding_map appends each entry's value to its (id, name)
- * pair so consumers can prime register state from the header alone.
- * Built by capture_initial_regfile() at segment start. */
-static const std::vector<InitialRegSnap> *g_initial_regfile = nullptr;
-
-static const InitialRegSnap *find_initial_snap(uint8_t gen_id)
-{
-    if (!g_initial_regfile) {
-        return nullptr;
-    }
-    for (const InitialRegSnap &s : *g_initial_regfile) {
-        if (s.gen_id == gen_id) {
-            return &s;
-        }
-    }
-    return nullptr;
-}
-
 static void write_reg_encoding_map(BitWriter *bw)
 {
     /* Walk the full GenericRegId space.  generic_reg_name() returns
@@ -221,6 +202,14 @@ static void write_reg_encoding_map(BitWriter *bw)
      * zero width means "no live snapshot for this ID at segment
      * start" (e.g. install-time pre-vCPU start, or a register the
      * plugin couldn't resolve via the QEMU register API). */
+    /*
+     * v1.10 (0x1A): the "reg" map carries (id, name) pairs only.  The
+     * per-segment initial register-file snapshot, formerly a (width,
+     * bytes) suffix per entry, is now emitted inline as one
+     * BODY_TAG_REGFILE record per (thread, segment).  Decoders before
+     * v1.10 expected the suffix; the magic byte bumps in lockstep so
+     * old readers refuse newer traces rather than silently misparse.
+     */
     bw_write_string(bw, "reg");
     uint64_t n = 0;
     for (unsigned i = 0; i < REG_ID_COUNT; i++) {
@@ -233,12 +222,6 @@ static void write_reg_encoding_map(BitWriter *bw)
             continue;
         }
         write_encoding_entry(bw, i, name);
-        const InitialRegSnap *s = find_initial_snap((uint8_t)i);
-        uint8_t width = s ? s->width_bytes : 0;
-        bw_write_u8(bw, width);
-        if (width) {
-            bw_raw(bw, s->bytes, width);
-        }
     }
 }
 
@@ -337,6 +320,7 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         { BODY_TAG_ENTRY, "BODY_TAG_ENTRY" },
         { BODY_TAG_THREAD_SWITCH, "BODY_TAG_THREAD_SWITCH" },
         { BODY_TAG_IFRAME, "BODY_TAG_IFRAME" },
+        { BODY_TAG_REGFILE, "BODY_TAG_REGFILE" },
     };
     static const EncodingMapEntry wp_event_flag_entries[] = {
         { CST_WP_EVENT_TRANSLATION_UNAVAIL,
@@ -384,11 +368,34 @@ struct BodyStreamState {
     BitWriter bw;
     int64_t prev_entry_template;
     int64_t current_thread;
-    /* v1.8 unified field-state tables: keyed by template_id, then dense
-     * indexed by (ins_pos, field_id).  CP state persists across the body.
-     * WP state is a per-chain overlay that falls back to CP state. */
-    FieldStateTable *cp_field_state;
-    FieldStateTable *wp_field_state;
+    /* v1.10 per-vCPU field-state tables: each thread's deltas are
+     * computed against its own prior emission, not the cross-thread
+     * sequence.  Keyed by thread_id (dense small ints handed out by
+     * get_or_assign_thread_id, starting at 0), lazy-grown on first
+     * emit.  Slot may be null until the thread first emits.  CP state
+     * persists across body entries within a thread; WP state is a
+     * per-chain overlay that falls back to that thread's CP state. */
+    std::vector<FieldStateTable *> cp_field_state;
+    std::vector<FieldStateTable *> wp_field_state;
+    /*
+     * v1.10 per-thread regfile bookkeeping.  Each entry tracks whether
+     * thread_id has emitted its BODY_TAG_REGFILE record in this
+     * segment yet.  Indexed by thread_id; resized on demand.  Cleared
+     * by reset_segment_local_state via body_stream_reset_per_thread.
+     */
+    std::vector<bool> regfile_emitted;
+    /*
+     * The segment-starting vCPU's pre-first-BB regfile.  Captured by
+     * start_trace_segment when the segment opens (before any traced
+     * BB executes on that thread); consumed when that thread emits
+     * its first body entry, then cleared.  Threads that join after
+     * segment open capture their regfile live at first emit (post-
+     * first-BB on their side) — slight asymmetry, but the segment-
+     * starting thread is the common case where pre-state is most
+     * valuable.
+     */
+    std::vector<InitialRegSnap> seed_regfile;
+    int32_t                     seed_thread = -1;  /* -1 = unset */
     /* Scratch overlays used to emit IFRAMEs.  An IFRAME is a full
      * body-record dump (CP + WP chain + WP events) encoded against
      * fresh "nothing observed yet" overlays so every record carries
@@ -1873,7 +1880,16 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
         field_state_slot_lut_build();
     }
 
-    BodyStreamState *st = g_new0(BodyStreamState, 1);
+    /*
+     * v1.10: BodyStreamState now contains std::vector members, so we
+     * use new instead of g_new0.  body_stream_finish frees inner
+     * resources (per-thread FSTs, scratch arrays) but, matching the
+     * prior pattern, does not delete the struct itself — it lives
+     * until segment-manager swap (next body_stream_new) at which
+     * point the previous one is dropped on the floor.  One-shot
+     * single-segment runs leak it to process exit either way.
+     */
+    BodyStreamState *st = new BodyStreamState();
 
     bw_init_writer(&st->bw, w);
 
@@ -1935,9 +1951,7 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
         bw_write_bytes(&st->bw, (const uint8_t *)tname, len);
     }
 
-    g_initial_regfile = regfile;
     write_header_encoding_maps(&st->bw);
-    g_initial_regfile = nullptr;
 
     bw_byte_align(&st->bw);
     bw_flush(&st->bw);
@@ -1948,10 +1962,45 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
 
     st->current_thread = 0;
 
-    st->cp_field_state = field_state_table_new();
-    st->wp_field_state = field_state_table_new();
+    /*
+     * Per-thread FieldStateTables are lazy-allocated on first emit
+     * for each thread (see get_or_create_per_thread_fst).  vectors
+     * start empty.
+     */
     st->iframe_cp_scratch = nullptr;  /* lazy on first IFRAME */
     st->iframe_wp_scratch = nullptr;
+
+    /*
+     * The segment-starting vCPU's regfile, if the caller supplied one
+     * with at least one live (width>0) value, is held until that
+     * thread's first body emit (where it's written out as
+     * BODY_TAG_REGFILE).  Threads other than the seed capture their
+     * regfile live at first emit.  Install-time segment opens
+     * (cpu_index = -1, no vCPU context yet) produce a stub regfile
+     * with all width=0; we treat those as absent and let every thread
+     * capture live, which gets meaningful values rather than the
+     * empty stub.
+     *
+     * The seed thread is whichever vCPU triggered start_trace_
+     * segment; thread_id 0 is assigned to the first vCPU observed
+     * in the segment by get_or_assign_thread_id, which is also the
+     * segment-starting vCPU in single-threaded launches.  For
+     * multi-vCPU launches where another thread races in before the
+     * seed thread's first body emit, the seed thread gets a higher
+     * thread_id and we lose the seed; the regfile for the seed vCPU
+     * is then re-captured live at its first emit (post-first-BB),
+     * same fallback as for joiners.
+     */
+    bool any_live = false;
+    if (regfile) {
+        for (const InitialRegSnap &s : *regfile) {
+            if (s.width_bytes > 0) { any_live = true; break; }
+        }
+    }
+    if (any_live) {
+        st->seed_regfile = *regfile;
+        st->seed_thread = 0;
+    }
 
     /* Pre-allocate the encoder's per-entry scratch.  Sized
      * generously enough that the typical body record never
@@ -2101,11 +2150,57 @@ static void emit_body_record_payload(
     }
 }
 
+/*
+ * Lazily allocate or fetch the per-thread FieldStateTable at @vec[tid].
+ * Resizes the vector to fit and creates a fresh table the first time
+ * @tid is seen.  Result is stable across grows because the vector
+ * holds pointers, not the table itself.
+ */
+static FieldStateTable *get_or_create_per_thread_fst(
+    std::vector<FieldStateTable *> &vec, uint32_t tid)
+{
+    if (tid >= vec.size()) {
+        vec.resize((size_t)tid + 1, nullptr);
+    }
+    if (!vec[tid]) {
+        vec[tid] = field_state_table_new();
+    }
+    return vec[tid];
+}
+
+/*
+ * Emit a BODY_TAG_REGFILE record for @thread_id carrying the absolute
+ * register file in @snaps.  Wire format: tag, thread_id (varuint),
+ * n_present (varuint), then for each present register
+ * (gen_id u8, width u8, bytes[width]).  Only entries with
+ * width_bytes > 0 are written; width=0 means "no live snapshot for
+ * this gen-id at first-emit time" and the decoder leaves its slot
+ * untouched.
+ */
+static void emit_regfile_record(BitWriter *bw, uint32_t thread_id,
+                                const std::vector<InitialRegSnap> &snaps)
+{
+    uint64_t n_present = 0;
+    for (const InitialRegSnap &s : snaps) {
+        if (s.width_bytes > 0) n_present++;
+    }
+    bw_write_u8(bw, BODY_TAG_REGFILE);
+    bw_write_uleb128(bw, thread_id);
+    bw_write_uleb128(bw, n_present);
+    for (const InitialRegSnap &s : snaps) {
+        if (s.width_bytes == 0) continue;
+        bw_write_u8(bw, s.gen_id);
+        bw_write_u8(bw, s.width_bytes);
+        bw_raw(bw, s.bytes, s.width_bytes);
+    }
+}
+
 void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
 {
     int64_t entry_tmpl = entry->template_id;
     uint32_t num_wp = (uint32_t)entry->wp_entries.size();
     uint64_t body_start = bw_tell_bytes(&st->bw);
+    uint32_t tid = entry->thread_id;
 
     dyn_params_sort_template_order(entry->dyn_params);
     for (uint32_t w = 0; w < num_wp; w++) {
@@ -2113,20 +2208,53 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
         dyn_params_sort_template_order(wp.dyn_params);
     }
 
-    if ((int64_t)entry->thread_id != st->current_thread) {
+    if ((int64_t)tid != st->current_thread) {
         bw_write_u8(&st->bw, BODY_TAG_THREAD_SWITCH);
-        bw_write_sleb128(&st->bw,
-                         (int64_t)entry->thread_id - st->current_thread);
-        st->current_thread = entry->thread_id;
+        bw_write_sleb128(&st->bw, (int64_t)tid - st->current_thread);
+        st->current_thread = tid;
     }
 
-    /* Regular delta-encoded entry, against the persistent overlays. */
+    /*
+     * v1.10 per-thread regfile emission.  The first body entry
+     * contributed by each thread in a segment is preceded by a
+     * BODY_TAG_REGFILE record so the consumer can prime that
+     * thread's simulator state with absolute register values.
+     * For the segment-starting thread we use the pre-first-BB
+     * snapshot captured by start_trace_segment (seed_regfile);
+     * threads joining later capture live registers at this point
+     * (post-first-BB on their side — slightly later than the seed
+     * thread but the best the plugin can do without a per-thread
+     * pre-execution hook).
+     */
+    if (tid >= st->regfile_emitted.size()) {
+        st->regfile_emitted.resize((size_t)tid + 1, false);
+    }
+    if (!st->regfile_emitted[tid]) {
+        if ((int32_t)tid == st->seed_thread && !st->seed_regfile.empty()) {
+            emit_regfile_record(&st->bw, tid, st->seed_regfile);
+            st->seed_regfile.clear();
+            st->seed_thread = -1;
+        } else {
+            std::vector<InitialRegSnap> snaps;
+            capture_initial_regfile(entry->cpu_index, &snaps);
+            emit_regfile_record(&st->bw, tid, snaps);
+        }
+        st->regfile_emitted[tid] = true;
+    }
+
+    /* Regular delta-encoded entry, against this thread's persistent
+     * per-vCPU overlays.  Cross-thread interleaving uses different
+     * FSTs so deltas stay within-thread (smaller, compressible). */
+    FieldStateTable *cp_fst = get_or_create_per_thread_fst(
+        st->cp_field_state, tid);
+    FieldStateTable *wp_fst = get_or_create_per_thread_fst(
+        st->wp_field_state, tid);
+
     bw_write_u8(&st->bw, BODY_TAG_ENTRY);
     bw_write_sleb128(&st->bw, entry_tmpl - st->prev_entry_template);
     st->prev_entry_template = entry_tmpl;
     emit_body_record_payload(st, &st->bw, entry, num_wp,
-                             st->cp_field_state, st->wp_field_state,
-                             st->cp_field_state);
+                             cp_fst, wp_fst, cp_fst);
 
     /*
      * IFRAME trigger.  When iframe_rate is set and this CP template's
@@ -2219,8 +2347,14 @@ void body_stream_finish(BodyStreamState *st)
     g_stats.bin_header_bits += (end_bytes - stats_start) * 8;
     g_stats.bin_total_bits += end_bytes * 8;
 
-    field_state_table_free(st->cp_field_state);
-    field_state_table_free(st->wp_field_state);
+    for (FieldStateTable *t : st->cp_field_state) {
+        if (t) field_state_table_free(t);
+    }
+    st->cp_field_state.clear();
+    for (FieldStateTable *t : st->wp_field_state) {
+        if (t) field_state_table_free(t);
+    }
+    st->wp_field_state.clear();
     if (st->iframe_cp_scratch) {
         field_state_table_free(st->iframe_cp_scratch);
     }

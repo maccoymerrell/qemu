@@ -13,6 +13,7 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 
 #include "cst_common.h"
 #include "cst_format.h"
@@ -20,22 +21,56 @@
 
 namespace cst {
 
-/* Per-(template, ipos, field-id) cell: a Wide value plus a "set" bit
- * so a missed lookup can fall through to the template default
- * cleanly.  Keyed by a 32-bit composite (template_id<<24 | ipos<<8 |
- * fid), same layout as the Python decoder. */
+/*
+ * FieldStateTable storage layout (mirrors the writer's
+ * BodyStreamState::cp_field_state, see champsim_tracer_output.cc):
+ *
+ *   FieldStateTable.blocks  : vector indexed by template_id
+ *   FieldStateBlock.values  : flat (n_insns * FIELD_STATE_SLOT_COUNT)
+ *                              Wides.  Slot index for a given fid is
+ *                              field_state_slot_index(fid); see the
+ *                              decoder .cc for the mapping table.
+ *   FieldStateBlock.gens    : per-cell generation; cells "exist" only
+ *                              when gens[idx] == table.generation.
+ *                              Letting the table bump its generation
+ *                              invalidates every cell in O(1).
+ *
+ * Replaces the prior unordered_map<u64, Wide> design (~10% of total
+ * decode time in hashtable lookups).  Direct array indexing is a
+ * load + compare per cell. */
+inline constexpr size_t FIELD_STATE_SLOT_COUNT = 89;
+inline constexpr uint8_t FIELD_STATE_SLOT_INVALID = 0xFF;
+
+struct FieldStateBlock {
+    uint32_t              n_insns = 0;
+    std::vector<Wide>     values;
+    std::vector<uint32_t> gens;
+};
+
 struct FieldStateTable {
-    /* unordered_map keyed by composite int (template_id<<24 |
-     * ipos<<8 | fid).  Trace state is inherently sparse: only
-     * (template, ipos, fid) cells the writer actually emitted are
-     * present.  Key needs at least 40 bits — uint64_t to leave room
-     * for traces with many thousands of templates. */
-    std::unordered_map<uint64_t, Wide> cells;
+    std::vector<std::unique_ptr<FieldStateBlock>> blocks; /* index = template_id */
+    uint32_t generation = 1;
+};
+
+/* One initial-regfile slot, parsed from a BODY_TAG_REGFILE record. */
+struct RegfileSlot {
+    uint8_t                   gen_id  = 0;
+    std::vector<uint8_t>      bytes;        /* target-endian raw bytes */
+};
+
+/* A BODY_TAG_REGFILE record: per-thread initial-state snapshot.
+ * Emitted once per (segment, thread_id) by the writer, before that
+ * thread's first ENTRY in the segment.  Decoder consumers may use
+ * it to seed simulator state. */
+struct DecodedRegfile {
+    uint32_t                  thread_id = 0;
+    std::vector<RegfileSlot>  regs;
 };
 
 class BodyWalker {
 public:
     using Callback = std::function<void(const DecodedEntry &)>;
+    using RegfileCallback = std::function<void(const DecodedRegfile &)>;
 
     BodyWalker(const Header &header,
                const std::vector<Template> &templates,
@@ -47,8 +82,11 @@ public:
      * BODY_TAG_ENTRY's fully-decoded entry; IFRAME records validate
      * against the immediately-preceding ENTRY and do not produce a
      * callback.  THREAD_SWITCH records flip the next entry's
-     * thread_id and set thread_switched. */
-    void walk(const Callback &cb);
+     * thread_id and set thread_switched.  @rb (optional) receives
+     * each BODY_TAG_REGFILE record (v1.10+); on v1.9 traces no
+     * REGFILE callback fires (the regfile lives on the header). */
+    void walk(const Callback &cb,
+              const RegfileCallback &rb = {});
 
 private:
     void  decode_field_delta(Reader &r, uint32_t template_id,

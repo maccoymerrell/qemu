@@ -94,10 +94,59 @@ that.
 Reproducibility caveats
 -----------------------
 
-See :ref:`reproducibility` in the quickstart for the full list of
-factors that can break byte-stability across runs.  In short:
-ASLR, multi-threaded scheduling, and clock-driven guest behavior
-are the three usual suspects.
+See :ref:`reproducibility` in the quickstart for the recommended
+invocation recipe that controls the major byte-stability
+breakers (ASLR, kernel-supplied randomness, host scheduling,
+inherited environment).  One residual non-determinism source
+deserves its own treatment here because it is fundamentally not
+fixable from the plugin side:
+
+**WP traces are not bit-deterministic.**  Even with every
+controllable randomness source pinned (``-seed N`` for
+``AT_RANDOM``, ``env -i`` for the inherited environment,
+``setarch -R`` for host ASLR, ``taskset -c 0`` for host
+scheduling), wrong-path body records vary slightly run-to-run.
+The residue manifests as a small fluctuation in load-address,
+load-data, store-data, and destination-register snapshot counts
+between two stable patterns the run can fall into.  Aggregate
+counts (entries, total instructions, address-set coverage)
+remain reproducible.
+
+**Why it happens.**  The wrong-path simulator follows branch
+directions the program would not normally take.  Correct-path
+code typically initialises memory before reading it, but the
+wrong-path can leap past the initialisation step (because its
+predicate evaluated the other way) and dereference a stack
+frame or a malloc chunk while it still holds residue from a
+prior function call.  The bytes at those addresses are
+whatever the OS, glibc, or a previously-returned function left
+behind — they are not "random" in any cryptographic sense, but
+they are not bound by the program's data-flow either.  When a
+WP load reads such an address, the value flows into the next
+instruction; if that instruction is a comparison feeding a
+conditional branch, the WP simulator follows different
+downstream paths in different runs.  The bistable pattern
+observed in practice corresponds to a single such comparison
+landing on each side of its threshold in different runs.
+
+**Why we can't fix it.**  Detecting the read of uninitialised
+data would require MSan-style shadow-memory tracking (one bit
+per byte of guest memory marking whether CP code has ever
+written it) plus a policy decision on what to substitute when
+WP reads an unwritten byte.  Neither the shadow tracking nor
+the substitution policy fits within the plugin's "record what
+QEMU executed" architecture without significant overhead and
+behavioural changes that would themselves be a research
+contribution.
+
+**What it doesn't affect.**  Aggregate WP counts (entries,
+total instructions, branch outcomes, store-address coverage)
+are reproducible.  Cache-pollution, prefetcher-training, and
+branch-predictor-training studies that aggregate over WP
+records are not perturbed.  Studies that need an exact
+byte-stable WP record stream (e.g., comparing two trace
+decoders, validating an encoder change) should diff CP-only or
+use ``wp=0``.
 
 Known issues / footguns
 -----------------------

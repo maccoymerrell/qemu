@@ -43,47 +43,80 @@ the plugin shared object.  Lands in
 Output format
 ~~~~~~~~~~~~~
 
-One architectural instruction per line, modelled after ``objdump -d``:
+The output starts with a ``;``-prefixed header banner that
+records the trace's metadata (magic, ISA, command line,
+datetime, feature flags, segment window, template count).  Body
+records follow, grouped by basic block with one architectural
+instruction per line in an ``objdump -d``-style layout.
+
+Sample, with ``wp=1,memdata=1,regdata=1`` capture flags:
 
 .. code-block:: text
 
-   0x7b559c7da96f <_start+0xf>: 48 8d 1d 7d ff ff ff   lea     %ip -> %gp11[0x7b559c7da8f9]
-   0x7b559c7da976 <_start+0x16>: 31 ed                  xor     %gp5 -> %gp5[0x0], %flags[0x0]
-   0x7b559c7da978 <_start+0x18>: e9 16 00 00 00         jmp     %ip -> %ip[0x0]  # 0x7b559c7da993 <_start+0x33>
+   ; cst_decode disassembly
+   ; version=0x1A545343
+   ; isa=x86_64
+   ; command=qemu-x86_64 -seed 42 -plugin libchampsim_tracer.so,outfile=run,...
+   ; datetime=2026-05-10 16:11:23
+   ; flags=MEM_DATA REG_DATA
+   ; start_insn=0 warmup_insns=0 total_target_insns=10000
+   ; templates=31
 
-Columns are PC (12 hex digits), an optional
-``<symbol+offset>`` annotation when the captured template named the
-TB's owning symbol, the raw instruction bytes from the template, the
-generic-opcode mnemonic (``add``/``fmul``/``jmp``/...), and the
-operand list in a fake AT&T syntax: register references print as
-``%gp0`` / ``%flags`` / ``%ip``, immediates as ``$0x...``, and
-destinations are separated from sources by ``->`` so each side of a
-read-modify-write is visible at a glance.
+   ; ----- BB 3 entry pc=0x401740 insns=12 seq=1 tid=0 -----
+   0x000000401740 <_start+0x0>: f3 0f 1e fa              nop
+   0x000000401744 <_start+0x4>: 31 ed                    xor     %fpr -> %fpr[0x0], %flags[0x202]
+   0x000000401749 <_start+0x9>: 5e                       pop     %sp -> %gp4[0x1], %sp[0x78b25adff138]  ld(0x78b25adff130)=0x1
+   0x000000401751 <_start+0x11>: 50                       push    %gp0, %sp -> %sp[0x78b25adff128]  st(0x78b25adff128)=0x0
+   0x00000040175f <_start+0x1f>: 67 e8 eb 25 00 00        jmp     $0x403d50, %sp, %ip -> %sp[0x78b25adff118], %ip[0x403d50]  st(0x78b25adff118)=0x401765
+   ; ----- BB 5 entry pc=0x403d50 insns=22 seq=2 tid=0 -----
+   ...
+   0x000000403d99 <__libc_start_main_impl+0x49>: 75 f5                    jcc     $0x403d90, %flags, %ip -> %ip[0x403d90]  # 0x403d9b <__libc_start_main_impl>
 
-The branch-mnemonic flavour (``jmp`` / ``jcc`` / ``jmpr`` / ``ret``
-/ ``syscall``) comes from the trace's own ``branch_type`` encoding
-map — looked up by the wire-format integer id and matched against
-the stable string name — rather than a compile-time enum.  Same for
-register and opcode names: the decoder's only source of truth is
-the encoding map the writer stamped into the trace header.
+Per-instruction line columns:
+
+* PC, 12 hex digits zero-padded.
+* Optional ``<symbol+offset>`` annotation when the captured
+  template named the TB's owning symbol.
+* Raw instruction bytes from the template.
+* Generic-opcode mnemonic (``add`` / ``fmul`` / ``jmp`` / …).
+* Operand list in a fake AT&T syntax: register references print
+  as ``%gp0`` / ``%flags`` / ``%ip``, immediates as ``$0x...``,
+  destinations are separated from sources by ``->`` so each
+  side of a read-modify-write is visible at a glance.
+
+The branch-mnemonic flavour (``jmp`` / ``jcc`` / ``jmpr`` /
+``ret`` / ``syscall``) comes from the trace's own
+``branch_type`` encoding map — looked up by the wire-format
+integer id and matched against the stable string name — rather
+than a compile-time enum.  Same for register and opcode names:
+the decoder's only source of truth is the encoding map the
+writer stamped into the trace header.
 
 Captured per-instruction data is folded into the operand line:
 
-* ``%dst[<value>]`` — destination register post-execution snapshot
-  (when ``regdata=1`` was set during capture).
-* ``ld(<addr>)=<value>`` / ``st(<addr>)=<value>`` — memory operation
-  effective address with the loaded / stored value (when
-  ``memdata=1``) or just the address (when ``memdata=0``).
-* ``# <target> <symbol+offset>`` trailing comment — branch target
-  resolved from the captured ``REG_IP`` snapshot, with the matching
-  symbol name when known.  Conditional branches print
-  ``# taken=<target>`` so the predicted vs. actual side is visible.
+* ``%dst[<value>]`` — destination register post-execution
+  snapshot (when ``regdata=1`` was set during capture).
+* ``ld(<addr>)=<value>`` / ``st(<addr>)=<value>`` — memory
+  operation effective address with the loaded / stored value
+  (when ``memdata=1``), or just the address ``ld(<addr>)`` /
+  ``st(<addr>)`` (when ``memdata=0``).  When ``memdata=1`` the
+  ``=<value>`` suffix is always present, including for zero
+  values, so the absence of ``=`` unambiguously means
+  ``memdata`` was not captured.
+* ``# <target> <symbol+offset>`` trailing comment — branch
+  target captured from the ``REG_IP`` snapshot post-execution,
+  with the matching symbol name when known.
 
-Basic-block boundaries are marked with a single comment line
-``# bb <id> tid=<n> [wp]`` so that grepping for a thread or for WP
-chains is one regex.  Wrong-path entries get a ``[wp]`` tag on
-their boundary marker; the per-instruction lines themselves are
-identical in shape.
+Basic-block boundaries are marked by a single
+``; ----- BB <template_id> entry pc=<pc> insns=<n> seq=<seq>
+tid=<n> -----`` separator line (note the ``;`` prefix so it
+groups with the header comments).  Wrong-path entries are
+attached to their parent CP entry's WP chain and rendered with
+the same per-instruction format under a separate
+``; ..... wp[k] BB <id> n_insns=<n> [status=...] -----``
+separator (the ``status=FAULT@insn<n>`` suffix appears when the
+WP simulator hit a fault on a non-terminating instruction
+inside that chain entry).
 
 ``--templates-only``
    Skip the body stream entirely and emit exactly one line per

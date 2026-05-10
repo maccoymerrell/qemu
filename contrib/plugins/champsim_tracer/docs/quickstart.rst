@@ -436,23 +436,29 @@ Three files land beside the basename:
 Reading the trace
 -----------------
 
-``cst_decode`` (built next to the plugin) emits a greppable
-disassembly-style dump:
+``cst_decode`` (built next to the plugin) emits a greppable,
+``objdump``-style dump:
 
 .. code-block:: console
 
    $ build/contrib/plugins/cst_decode run.cst | head
    ; cst_decode disassembly
-   ; version=0x19545343
+   ; version=0x1A545343
    ; isa=x86_64
    ...
-   0x401a23 <main+0x83>: GEN_OP_ADD  REG_GPR1,REG_FLAGS <- REG_GPR2,REG_GPR3  ; tid=0 bb=42 REG_GPR1=0x1f
-   0x401a27 <main+0x87>: GEN_OP_ST_W REG_FLAGS <- REG_GPR1,REG_GPR15,IMM(0x8) ; tid=0 bb=42 st@0x7fff_dead_beef:0x1f
+   ; ----- BB 3 entry pc=0x401740 insns=12 seq=1 tid=0 -----
+   0x000000401740 <_start+0x0>: f3 0f 1e fa              nop
+   0x000000401744 <_start+0x4>: 31 ed                    xor     %fpr -> %fpr[0x0], %flags[0x202]
+   0x000000401749 <_start+0x9>: 5e                       pop     %sp -> %gp4[0x1], %sp[0x78b25adff138]  ld(0x78b25adff130)=0x1
+   0x000000401751 <_start+0x11>: 50                       push    %gp0, %sp -> %sp[0x78b25adff128]  st(0x78b25adff128)=0x0
+   0x00000040175f <_start+0x1f>: 67 e8 eb 25 00 00        jmp     $0x403d50, %sp, %ip -> %sp[0x78b25adff118], %ip[0x403d50]  st(0x78b25adff118)=0x401765
 
 Each line is self-contained — pipe it through ``grep`` by PC,
-opcode, register, ``bb=`` id, ``ld@``/``st@``, branch type, etc.
-Pass ``--format=legacy`` to get the older block-formatted output
-that diff-driven scripts (notably wptrace_genval) consume.
+mnemonic, register reference (``%gp1`` etc.), memop pattern
+(``ld(`` / ``st(``), branch-target comment (``# 0x``), or the
+``; ----- BB`` boundary markers.  See :doc:`decoder` for the
+full column reference, the ``--templates-only`` and ``--objdump``
+flags, and the block-formatted ``--format=legacy`` output.
 
 A byte-budget audit (helpful when tuning trace size) is one command:
 
@@ -503,6 +509,31 @@ Things that *can* break determinism:
   dispatch differently based on ``gettimeofday()`` etc.  The
   tracer records the divergence faithfully; if you want bit-stable
   traces, fix the workload's clock.
+* **AT_RANDOM and other kernel-supplied randomness.**  QEMU's
+  user-mode emulator stuffs 16 random bytes into the guest's
+  auxiliary vector (``AT_RANDOM``) on every invocation; glibc reads
+  them for the stack canary, the pointer guard, and several
+  internal hash seeds.  Any guest-side computation that funnels
+  those bytes into memory (which mcf and most C programs do via
+  malloc and stack-canary bookkeeping) produces a different value
+  stream per run.  Pass ``-seed N`` to the QEMU binary to make
+  ``AT_RANDOM`` deterministic.
+* **Uninitialized data.**  The plugin doesn't scrub uninitialized
+  memory or registers; if the guest reads them (on correct *or*
+  wrong path) before writing them, the trace captures whatever
+  junk was there.  Correct-path execution typically initialises
+  before reading, but the wrong-path simulator follows branch
+  directions the program would not normally take — it can leap
+  past the initialization step and dereference a stack frame or
+  heap chunk while it still holds residue from a prior function
+  call.  When that happens the WP chain captures whatever bytes
+  the OS / glibc / prior caller happened to leave, which can
+  differ across runs even with ``-seed`` fixed.  Aggregate
+  counts (entries, total instructions, address-set coverage)
+  remain reproducible; the value bytes attached to a small
+  number of WP fragments do not.  See :doc:`limitations` for
+  the detailed mechanism and why this is fundamentally not
+  fixable from the plugin side.
 
 Cross-host reproducibility holds when the above sources are
 controlled — the same guest binary produces the same trace on two
@@ -511,6 +542,45 @@ version reproducibility is *not* guaranteed: if the QEMU base
 moves to a different upstream commit, the TB carving heuristics
 may shift, which renumbers ``template_id`` in the dictionary.
 The body's architectural content stays the same.
+
+Recommended invocation for maximum reproducibility
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For studies that need traces as close to byte-identical as the
+above-listed sources permit, wrap the QEMU invocation like this:
+
+.. code-block:: console
+
+   $ env -i HOME=/tmp PATH=/usr/bin LANG=C \
+     taskset -c 0 setarch -R \
+     qemu-x86_64 -seed 42 \
+       -plugin ./libchampsim_tracer.so,outfile=run,wp=1,memdata=1,regdata=1,\
+                trace_window=icount:start=0;stop=20000000 \
+       ./your_workload
+
+What each piece does:
+
+* ``env -i ... LANG=C`` strips inherited environment variables that
+  end up in the guest's startup stack via ``envp``.  Different
+  inherited environments leave different bytes in the stack
+  region the guest's startup code reads, which feeds back into
+  glibc-initialised data structures the workload may touch.
+* ``taskset -c 0`` pins the QEMU process to one host CPU.  Does
+  not affect the guest's view of itself; only constrains host
+  scheduling, which removes a class of TCG-translation-cache
+  timing variance.
+* ``setarch -R`` disables host-side ASLR for the QEMU process.
+  QEMU's user-mode emulator further controls guest layout
+  independently, but disabling the host's ASLR removes another
+  variable when comparing runs.
+* ``-seed 42`` seeds QEMU's guest-randomness generator so
+  ``AT_RANDOM`` (16 bytes the guest's glibc reads on startup) is
+  identical across runs.  Without this, every run is unique.
+
+With all four in place on the same host and same QEMU+plugin
+build, the CP path of a single-vCPU workload is reproducible to
+the last byte except for the unavoidable WP-on-uninitialised-
+memory residue described above.
 
 Feeding ChampSim
 ----------------

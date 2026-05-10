@@ -51,11 +51,8 @@ to the plugin shared object) read the binary trace and either emit a
 disassembly-style text dump or print a byte-budget breakdown of
 where bytes go.
 
-License: GPL-2.0-or-later, the same as upstream QEMU.  Plugin
-source headers each carry the full SPDX line.  If you use the
-tracer in published research, please cite the QEMU project and
-note that ChampSim Tracer is a contributed plugin distributed
-through QEMU's ``contrib/plugins`` tree.
+If you use the tracer in published research, please cite the QEMU project
+as well as the tracer itself (an upcoming publication).
 
 .. toctree::
    :maxdepth: 2

@@ -60,6 +60,25 @@ static void insert_aarch64_reg_aliases(
     g_hash_table_insert(handles, key, desc->handle);
 }
 
+/*
+ * AArch64 NZCV (top nibble of CPSR/PSTATE) → canonical
+ * CST_METAFLAGS layout:
+ *   bit 31 N -> CST_METAFLAGS_N
+ *   bit 30 Z -> CST_METAFLAGS_Z
+ *   bit 29 C -> CST_METAFLAGS_C
+ *   bit 28 V -> CST_METAFLAGS_V
+ * No parity bit on AArch64; CST_METAFLAGS_P stays zero.
+ */
+static uint8_t aarch64_flags_to_metaflags(uint64_t raw)
+{
+    uint8_t mf = 0;
+    if (raw & (1u << 31)) mf |= CST_METAFLAGS_N;
+    if (raw & (1u << 30)) mf |= CST_METAFLAGS_Z;
+    if (raw & (1u << 29)) mf |= CST_METAFLAGS_C;
+    if (raw & (1u << 28)) mf |= CST_METAFLAGS_V;
+    return mf;
+}
+
 
 /* Register classification table. */
 static const RegClassification aarch64_reg_class[AARCH64_REG_ENDING] = {
@@ -69,7 +88,7 @@ static const RegClassification aarch64_reg_class[AARCH64_REG_ENDING] = {
     [AARCH64_REG_FP] = { .reg_id = REG_FP_REG, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "x29" } },  /* fp */
     [AARCH64_REG_FPCR] = { .reg_id = REG_FCSR, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.fpu", .name = "fpcr" } },  /* fpcr */
     [AARCH64_REG_LR] = { .reg_id = REG_LR, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "x30" } },  /* lr */
-    [AARCH64_REG_NZCV] = { .reg_id = REG_FLAGS, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "cpsr" } },  /* nzcv */
+    [AARCH64_REG_NZCV] = { .reg_id = REG_FLAGS, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "cpsr" }, .is_int_flags = true },  /* nzcv */
     [AARCH64_REG_SP] = { .reg_id = REG_SP, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "sp" } },  /* sp */
     [AARCH64_REG_VG] = { .reg_id = REG_VCTRL, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.sve", .name = "vg" } },  /* vg */
     [AARCH64_REG_WSP] = { .reg_id = REG_SP, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "sp" } },  /* wsp */

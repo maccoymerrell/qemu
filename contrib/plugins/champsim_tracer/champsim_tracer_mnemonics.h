@@ -69,6 +69,17 @@ typedef struct {
     uint8_t n_regs;                    /* non-zero for composite aliases */
     uint8_t regs[MAX_REG_ALIASES];     /* GenericRegId[] */
     QemuRegKey qemu_reg;               /* qemu_plugin_reg_descriptor key */
+    /*
+     * Set true on the *one* row whose Capstone reg id maps to the
+     * ISA's integer-flags register (x86 EFLAGS, AArch64 NZCV).  When
+     * the generic decoder sees this flag during dst-reg classification
+     * it mirrors a REG_METAFLAGS slot alongside REG_FLAGS so consumers
+     * get a canonical Z/N/C/V/P byte without per-ISA bit math.  Stays
+     * false on every other row, including non-integer flags writers
+     * (x86 FPSW → REG_FLAGS but not the int-flags reg) and ISAs
+     * without an integer flags reg (RISC-V, MIPS).
+     */
+    bool is_int_flags;
 } RegClassification;
 
 /*
@@ -233,6 +244,17 @@ typedef void (*RegAliasInserterFn)(
     GHashTable *handles,
     const qemu_plugin_reg_descriptor *desc);
 
+/*
+ * Per-ISA integer-flags → canonical metaflags shuffle.  Takes the
+ * raw bytes of the architectural flags register (little-endian,
+ * up to 8 bytes — all current ISAs' flag regs fit in a u64) and
+ * returns the CST_METAFLAGS_* byte the snap collector ships in
+ * REG_METAFLAGS slots.  NULL on ISAs without an integer flags reg,
+ * in which case REG_METAFLAGS never lands in any template's
+ * dst-reg list and this hook is never called.
+ */
+typedef uint8_t (*MetaFlagsMapperFn)(uint64_t raw_flags);
+
 typedef struct {
     uint8_t               branch_delay_slots;
     bool                  pc_relative_branch_imm;
@@ -241,6 +263,7 @@ typedef struct {
     int                   cap_arch;
     CapModeForTargetFn    cap_mode_for_target;
     RegAliasInserterFn    reg_alias_inserter;
+    MetaFlagsMapperFn     flags_to_metaflags;
 } IsaProperties;
 
 #ifdef CHAMPSIM_MNEMONIC_TABLES_IMPL
@@ -258,6 +281,7 @@ const IsaProperties isa_properties[] = {
         .target_prefixes = isa_prefixes_x86,
         .cap_arch = CS_ARCH_X86,
         .cap_mode_for_target = cap_mode_x86,
+        .flags_to_metaflags = x86_flags_to_metaflags,
     },
     [TRACE_ISA_AARCH64] = {
         .include_implicit_regs = true,
@@ -265,6 +289,7 @@ const IsaProperties isa_properties[] = {
         .cap_arch = CS_ARCH_AARCH64,
         .cap_mode_for_target = cap_mode_aarch64,
         .reg_alias_inserter = insert_aarch64_reg_aliases,
+        .flags_to_metaflags = aarch64_flags_to_metaflags,
     },
     [TRACE_ISA_RISCV]   = {
         .include_implicit_regs = false,

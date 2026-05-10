@@ -54,7 +54,7 @@ Sample, with ``wp=1,memdata=1,regdata=1`` capture flags:
 .. code-block:: text
 
    ; cst_decode disassembly
-   ; version=0x1A545343
+   ; version=0x1B545343
    ; isa=x86_64
    ; command=qemu-x86_64 -seed 42 -plugin libchampsim_tracer.so,outfile=run,...
    ; datetime=2026-05-10 16:11:23
@@ -64,7 +64,7 @@ Sample, with ``wp=1,memdata=1,regdata=1`` capture flags:
 
    ; ----- BB 3 entry pc=0x401740 insns=12 seq=1 tid=0 -----
    0x000000401740 <_start+0x0>: f3 0f 1e fa              nop
-   0x000000401744 <_start+0x4>: 31 ed                    xor     %fpr -> %fpr[0x0], %flags[0x202]
+   0x000000401744 <_start+0x4>: 31 ed                    xor     %fpr -> %fpr[0x0], %flags[0x202], %mflags[-]
    0x000000401749 <_start+0x9>: 5e                       pop     %sp -> %gp4[0x1], %sp[0x78b25adff138]  ld(0x78b25adff130)=0x1
    0x000000401751 <_start+0x11>: 50                       push    %gp0, %sp -> %sp[0x78b25adff128]  st(0x78b25adff128)=0x0
    0x00000040175f <_start+0x1f>: 67 e8 eb 25 00 00        jmp     $0x403d50, %sp, %ip -> %sp[0x78b25adff118], %ip[0x403d50]  st(0x78b25adff118)=0x401765
@@ -96,6 +96,13 @@ Captured per-instruction data is folded into the operand line:
 
 * ``%dst[<value>]`` — destination register post-execution
   snapshot (when ``regdata=1`` was set during capture).
+* ``%mflags[<bits>]`` — synthetic canonical-flags register
+  rendered as a bit-string of set flags drawn from
+  ``Z`` / ``N`` / ``C`` / ``V`` / ``P``, in that order, or ``-``
+  when no flag is set.  Appears alongside ``%flags`` on ISAs with
+  an integer flags register (x86, AArch64); spares consumers
+  from per-ISA bit-shuffle math.  RISC-V and MIPS templates do
+  not carry this slot.
 * ``ld(<addr>)=<value>`` / ``st(<addr>)=<value>`` — memory
   operation effective address with the loaded / stored value
   (when ``memdata=1``), or just the address ``ld(<addr>)`` /

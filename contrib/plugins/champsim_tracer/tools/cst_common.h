@@ -37,13 +37,27 @@ inline constexpr uint32_t MAGIC_V17 = 0x17545343u;
 inline constexpr uint32_t MAGIC_V18 = 0x18545343u;
 inline constexpr uint32_t MAGIC_V19 = 0x19545343u;
 inline constexpr uint32_t MAGIC_V1A = 0x1A545343u;
+inline constexpr uint32_t MAGIC_V1B = 0x1B545343u;
 
 inline constexpr uint64_t TRAILER_MAGIC_V17 = 0x17545343FFFFFFFFull;
 inline constexpr uint64_t TRAILER_MAGIC_V18 = 0x18545343FFFFFFFFull;
 inline constexpr uint64_t TRAILER_MAGIC_V19 = 0x19545343FFFFFFFFull;
 inline constexpr uint64_t TRAILER_MAGIC_V1A = 0x1A545343FFFFFFFFull;
+inline constexpr uint64_t TRAILER_MAGIC_V1B = 0x1B545343FFFFFFFFull;
 
 inline constexpr size_t TRAILER_SIZE = 64;
+
+/* ===== REG_METAFLAGS bit layout (v1.11+) ===== */
+
+inline constexpr uint8_t METAFLAGS_Z = 1u << 0;
+inline constexpr uint8_t METAFLAGS_N = 1u << 1;
+inline constexpr uint8_t METAFLAGS_C = 1u << 2;
+inline constexpr uint8_t METAFLAGS_V = 1u << 3;
+inline constexpr uint8_t METAFLAGS_P = 1u << 4;
+
+/* GenericRegId for the synthetic flags register; mirrors
+ * REG_METAFLAGS = 246 in the plugin's generic_ids.h. */
+inline constexpr uint8_t REG_METAFLAGS_ID = 246;
 
 /* ===== Body tags ===== */
 
@@ -285,12 +299,14 @@ struct Header {
     /*
      * v1.9 introduced persistent WP-overlay deltas (each ENTRY's WP
      * chain encodes against the running wp_field_state instead of
-     * forking from cp_state at chain start).  v1.10 keeps that
-     * behaviour and additionally splits the FieldStateTables per-
-     * thread.  Both 0x19 and 0x1A read with persistent WP state.
+     * forking from cp_state at chain start).  v1.10 added per-thread
+     * FieldStateTables; v1.11 added the synthetic REG_METAFLAGS dst
+     * slot.  All three keep the persistent-WP property.
      */
     bool wp_persistent() const {
-        return magic == MAGIC_V19 || magic == MAGIC_V1A;
+        return magic == MAGIC_V19 ||
+               magic == MAGIC_V1A ||
+               magic == MAGIC_V1B;
     }
 };
 

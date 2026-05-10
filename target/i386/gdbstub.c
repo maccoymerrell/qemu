@@ -157,7 +157,18 @@ int x86_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
         case IDX_IP_REG:
             return gdb_get_reg(env, mem_buf, env->eip);
         case IDX_FLAGS_REG:
-            return gdb_get_reg32(mem_buf, env->eflags);
+            /*
+             * Materialise the lazily-computed CC bits (CF/PF/AF/ZF/SF/OF)
+             * via cpu_compute_eflags before publishing.  Without this,
+             * `env->eflags` carries only the bits that don't depend on
+             * the deferred CC_OP/CC_SRC/CC_DST chain — typically just
+             * IF and the reserved bit-1 — so any plugin / gdb client
+             * reading eflags between an arithmetic op and its
+             * consumer sees stale arithmetic flags.  The hot-path
+             * cost is a small switch on CC_OP plus the operand math
+             * the next consumer would have run anyway.
+             */
+            return gdb_get_reg32(mem_buf, cpu_compute_eflags(env));
 
         case IDX_SEG_REGS:
             return gdb_get_reg32(mem_buf, env->segs[R_CS].selector);

@@ -86,14 +86,27 @@ extern "C" {
  * defaults are zero.
  */
 /*
- * Bytes in file order: 'C','S','T',0x1A → u32 LE 0x1A545343.
- * Version byte 0x1A (v1.10): per-vCPU FieldStateTable + per-vCPU
- * BODY_TAG_REGFILE record replacing the header-embedded initial
- * regfile.  Format-incompatible with 0x19 readers.
+ * Bytes in file order: 'C','S','T',0x1B → u32 LE 0x1B545343.
+ * Version byte 0x1B (v1.11): adds REG_METAFLAGS, a synthetic
+ * ISA-agnostic flags register.  Insns that write the architectural
+ * REG_FLAGS (x86 RFLAGS, AArch64 NZCV) now also list REG_METAFLAGS
+ * as a destination, with a 1-byte canonical Z/N/C/V/P payload that
+ * spares trace consumers from per-ISA bit-shuffling.  Architectural
+ * REG_FLAGS continues to carry the raw bits for any consumer that
+ * needs the system-side state (DF, IF, IOPL, ...).  Format-
+ * incompatible with 0x1A readers because the affected templates'
+ * dst_regs lists now contain an extra entry.
  */
-#define CST_MAGIC          0x1A545343u
-#define CST_TRAILER_MAGIC  0x1A545343FFFFFFFFull
+#define CST_MAGIC          0x1B545343u
+#define CST_TRAILER_MAGIC  0x1B545343FFFFFFFFull
 #define CST_TRAILER_SIZE   64
+
+/*
+ * REG_METAFLAGS bit layout is defined in champsim_tracer_generic_ids.h
+ * (CST_METAFLAGS_*).  Kept there alongside the GenericRegId enum so
+ * the per-ISA mnemonic tables (C-only TU) can populate the canonical
+ * byte without depending on this header's plugin-API surface.
+ */
 
 /* Body entry tags (1 byte) */
 #define BODY_TAG_END             0

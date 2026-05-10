@@ -60,8 +60,8 @@ state for the same field.
 ## 2. Constants
 
 ```
-CST_MAGIC          = 0x1A545343          bytes: 'C' 'S' 'T' 0x1A
-CST_TRAILER_MAGIC  = 0x1A545343FFFFFFFF
+CST_MAGIC          = 0x1B545343          bytes: 'C' 'S' 'T' 0x1B
+CST_TRAILER_MAGIC  = 0x1B545343FFFFFFFF
 CST_TRAILER_SIZE   = 64
 
 BODY_TAG_END           = 0
@@ -71,25 +71,50 @@ BODY_TAG_IFRAME        = 3
 BODY_TAG_REGFILE       = 4   (added v1.10)
 ```
 
-The version byte rolled from `0x19` (v1.9) to `0x1A` (v1.10).  v1.10
-introduced two related changes for multi-vCPU correctness:
+The version byte rolled to `0x1B` (v1.11) to mark a templates-section
+format break:
 
-  - The `reg` encoding map dropped its per-entry `(width, bytes)`
-    suffix.  The header no longer carries any initial register-file
-    snapshot.
-  - A new body record `BODY_TAG_REGFILE` is emitted once per
-    `(segment, thread_id)` pair, before that thread's first
-    `BODY_TAG_ENTRY` in the segment, carrying that thread's initial
-    register file as absolute values.
+  - A new synthetic register `REG_METAFLAGS` (generic ID 246) carries
+    a canonical ISA-agnostic Z/N/C/V/P byte alongside the
+    architectural `REG_FLAGS` register on ISAs with an integer flags
+    reg (x86, AArch64).  When an insn writes the integer flags
+    register, its template's dst-reg list now includes both
+    `REG_FLAGS` (raw architectural value) and `REG_METAFLAGS` (the
+    canonical byte).  Wire-format-incompatible with `0x1A` readers
+    because the affected templates' `n_dst_regs` grew by one entry.
 
-  - Field-state delta encoding became per-thread.  Each thread's
-    `BODY_TAG_ENTRY` deltas are computed against that thread's own
-    prior emission, not the cross-thread sequence.  Decoders maintain
-    a per-thread `FieldStateTable`.
+REG_METAFLAGS bit layout (1 byte; populated by the plugin via a
+per-ISA bit shuffle, not directly readable from QEMU):
 
-v1.9 readers will refuse v1.10 traces (magic mismatch); v1.10 readers
-still accept v1.9 traces and ignore both new behaviours
-appropriately.
+```
+bit 0  CST_METAFLAGS_Z   zero / equal
+bit 1  CST_METAFLAGS_N   negative / sign
+bit 2  CST_METAFLAGS_C   unsigned carry / borrow
+bit 3  CST_METAFLAGS_V   signed overflow
+bit 4  CST_METAFLAGS_P   parity (x86 only)
+bits 5..7                reserved, written as 0
+```
+
+x86 `EFLAGS` bit map: CF→C, PF→P, ZF→Z, SF→N, OF→V.  AArch64
+`NZCV` (top nibble of CPSR) bit map: N→N, Z→Z, C→C, V→V; the P bit
+is not set.  RISC-V and MIPS have no integer flags register and
+`REG_METAFLAGS` never appears in their templates' dst-reg lists.
+
+Earlier version transitions (kept for context):
+
+  - v1.10 (`0x1A`) — added `BODY_TAG_REGFILE` and per-thread
+    `FieldStateTable`.  The `reg` encoding map dropped its per-entry
+    `(width, bytes)` suffix; per-thread initial register files are
+    now emitted inline as body records before each thread's first
+    `BODY_TAG_ENTRY`.
+
+  - v1.9 (`0x19`) — persistent WP-overlay deltas (each ENTRY's WP
+    chain encodes against the running `wp_field_state` instead of
+    forking from `cp_state` per chain).
+
+v1.x readers below the trace's version will refuse the file (magic
+mismatch).  Higher-version readers accept lower-version traces and
+ignore the missing-from-older fields appropriately.
 
 Header feature flags are advisory. The field IDs still determine what
 is actually present in each delta section.
@@ -125,7 +150,7 @@ start of the file.
 
 ```
 +--------------------------------------------------+
-| magic               u32  = 0x1A545343            |
+| magic               u32  = 0x1B545343            |
 | isa                 u8   TraceISA                |
 | flags               u8   CST_FLAG_* bits         |
 | start_insn          ULEB                         |

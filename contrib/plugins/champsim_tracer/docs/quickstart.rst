@@ -443,12 +443,12 @@ Reading the trace
 
    $ build/contrib/plugins/cst_decode run.cst | head
    ; cst_decode disassembly
-   ; version=0x1A545343
+   ; version=0x1B545343
    ; isa=x86_64
    ...
    ; ----- BB 3 entry pc=0x401740 insns=12 seq=1 tid=0 -----
    0x000000401740 <_start+0x0>: f3 0f 1e fa              nop
-   0x000000401744 <_start+0x4>: 31 ed                    xor     %fpr -> %fpr[0x0], %flags[0x202]
+   0x000000401744 <_start+0x4>: 31 ed                    xor     %fpr -> %fpr[0x0], %flags[0x202], %mflags[-]
    0x000000401749 <_start+0x9>: 5e                       pop     %sp -> %gp4[0x1], %sp[0x78b25adff138]  ld(0x78b25adff130)=0x1
    0x000000401751 <_start+0x11>: 50                       push    %gp0, %sp -> %sp[0x78b25adff128]  st(0x78b25adff128)=0x0
    0x00000040175f <_start+0x1f>: 67 e8 eb 25 00 00        jmp     $0x403d50, %sp, %ip -> %sp[0x78b25adff118], %ip[0x403d50]  st(0x78b25adff118)=0x401765

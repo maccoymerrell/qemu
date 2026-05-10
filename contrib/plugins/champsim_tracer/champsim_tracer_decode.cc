@@ -208,6 +208,20 @@ static inline void add_dst_cap_reg(InsnFields *f, InsnRegNames *refs,
         return;
     }
     add_dst_reg(f, refs, rc->reg_id, qemu_reg_for_generic(rc->reg_id));
+    /*
+     * Mirror an integer-flags write into the synthetic ISA-agnostic
+     * REG_METAFLAGS slot.  Gated on the per-ISA RegClassification's
+     * .is_int_flags marker (set on x86 EFLAGS, AArch64 NZCV; never
+     * on x86 FPSW, mips DSP-flag co-processor regs, or any ISA
+     * without an integer flags register).  REG_METAFLAGS reuses the
+     * same QemuRegKey so the snap collector can re-read the
+     * architectural flags value and apply the per-ISA shuffle via
+     * isa_properties[trace_isa].flags_to_metaflags.
+     */
+    if (rc->is_int_flags) {
+        add_dst_reg(f, refs, REG_METAFLAGS,
+                    qemu_reg_for_generic(rc->reg_id));
+    }
 }
 
 static void warn_unknown_instruction(uint64_t pc, const char *reason,

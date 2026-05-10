@@ -246,7 +246,28 @@ std::string regref_from_name(const std::string &name)
     if (body == "fp_reg") return "%fpr";   /* legacy alias bucket */
     if (body == "vec_reg") return "%vr";
     if (body == "pred_reg") return "%pr";
+    if (body == "metaflags") return "%mflags";
     return "%" + body;
+}
+
+/*
+ * Render the REG_METAFLAGS snap byte as a bit-string of set flags:
+ *   0x00         -> "-"          (no flags set)
+ *   METAFLAGS_Z  -> "Z"
+ *   Z|N|C        -> "ZNC"
+ *   Z|N|C|V|P    -> "ZNCVP"
+ * Order matches the bit-position order so the string is stable across
+ * traces.  Compact even on the busiest case (5 chars vs the
+ * 1-byte-zero-padded "0x1f" hex form).
+ */
+inline void append_metaflags_bits(std::string *out, uint8_t mf)
+{
+    if (mf == 0) { out->push_back('-'); return; }
+    if (mf & cst::METAFLAGS_Z) out->push_back('Z');
+    if (mf & cst::METAFLAGS_N) out->push_back('N');
+    if (mf & cst::METAFLAGS_C) out->push_back('C');
+    if (mf & cst::METAFLAGS_V) out->push_back('V');
+    if (mf & cst::METAFLAGS_P) out->push_back('P');
 }
 
 /*
@@ -834,12 +855,19 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
             append_regref(&line, ctx, I.dst_regs[k]);
             /* Find the matching reg_snap for this dst slot.  reg_snaps
              * are emitted in template-walk order, so the operand_index
-             * lines up with k. */
+             * lines up with k.  REG_METAFLAGS gets a bit-string
+             * rendering (e.g. [Z] / [ZNC] / [-]) for at-a-glance
+             * readability; every other reg prints its raw hex value. */
             for (const auto &r : snaps) {
                 if (r.insn_index == (uint32_t)insn_idx &&
                     r.operand_index == (uint8_t)k) {
                     line.append("[");
-                    append_wide_hex(&line, r.value);
+                    if (I.dst_regs[k] == cst::REG_METAFLAGS_ID) {
+                        append_metaflags_bits(
+                            &line, (uint8_t)(r.value.low64() & 0xff));
+                    } else {
+                        append_wide_hex(&line, r.value);
+                    }
                     line.append("]");
                     break;
                 }

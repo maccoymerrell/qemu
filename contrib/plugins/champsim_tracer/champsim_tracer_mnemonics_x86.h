@@ -21,6 +21,28 @@ static unsigned int cap_mode_x86(const char *target_name)
     return CS_MODE_64;
 }
 
+/*
+ * x86 EFLAGS → canonical CST_METAFLAGS layout.  Mapping table:
+ *   bit  0  CF -> CST_METAFLAGS_C
+ *   bit  2  PF -> CST_METAFLAGS_P
+ *   bit  6  ZF -> CST_METAFLAGS_Z
+ *   bit  7  SF -> CST_METAFLAGS_N
+ *   bit 11  OF -> CST_METAFLAGS_V
+ * System bits (TF, IF, DF, IOPL, NT, RF, VM, AC, VIF, VIP, ID) and
+ * the rest of RFLAGS are not exposed in the canonical view; consumers
+ * that need them can keep reading the architectural REG_FLAGS slot.
+ */
+static uint8_t x86_flags_to_metaflags(uint64_t raw)
+{
+    uint8_t mf = 0;
+    if (raw & (1u << 0))  mf |= CST_METAFLAGS_C;
+    if (raw & (1u << 2))  mf |= CST_METAFLAGS_P;
+    if (raw & (1u << 6))  mf |= CST_METAFLAGS_Z;
+    if (raw & (1u << 7))  mf |= CST_METAFLAGS_N;
+    if (raw & (1u << 11)) mf |= CST_METAFLAGS_V;
+    return mf;
+}
+
 
 /* Register classification table. */
 static const RegClassification x86_reg_class[X86_REG_ENDING] = {
@@ -50,7 +72,7 @@ static const RegClassification x86_reg_class[X86_REG_ENDING] = {
     [X86_REG_ECX] = { .reg_id = REG_GPR1, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rcx" } },  /* ecx */
     [X86_REG_EDI] = { .reg_id = REG_GPR5, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rdi" } },  /* edi */
     [X86_REG_EDX] = { .reg_id = REG_GPR2, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rdx" } },  /* edx */
-    [X86_REG_EFLAGS] = { .reg_id = REG_FLAGS, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "eflags" } },  /* eflags */
+    [X86_REG_EFLAGS] = { .reg_id = REG_FLAGS, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "eflags" }, .is_int_flags = true },  /* eflags */
     [X86_REG_EIP] = { .reg_id = REG_IP, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rip" } },  /* eip */
     [X86_REG_ES] = { .reg_id = REG_SEG2, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "es" } },  /* es */
     [X86_REG_ESI] = { .reg_id = REG_GPR4, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rsi" } },  /* esi */

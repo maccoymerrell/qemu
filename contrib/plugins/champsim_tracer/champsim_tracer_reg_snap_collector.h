@@ -39,6 +39,15 @@ public:
                         const QemuRegKey *key,
                         RegSnap *out);
 
+    /* Read the architectural flags register at @key and synthesize the
+     * canonical CST_METAFLAGS_* byte into @out.  Used to populate
+     * REG_METAFLAGS snaps; @key is the same QemuRegKey associated
+     * with the architectural REG_FLAGS dst that produced this slot.
+     * Returns zero in @out on ISAs without a recognised flags reg. */
+    void read_metaflags_into_snap(unsigned int cpu_index,
+                                  const QemuRegKey *key,
+                                  RegSnap *out);
+
     /* Wide-snap path used by the wrong-path simulator. */
     WideRegSnap *capture_wide(unsigned int cpu_index);
 

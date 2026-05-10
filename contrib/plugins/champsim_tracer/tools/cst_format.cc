@@ -70,7 +70,8 @@ Trailer parse_trailer(const uint8_t *data, size_t size)
     t.body_byte_count = r.u64_le();
     t.magic           = r.u64_le();
     if (t.magic != TRAILER_MAGIC_V17 && t.magic != TRAILER_MAGIC_V18 &&
-        t.magic != TRAILER_MAGIC_V19 && t.magic != TRAILER_MAGIC_V1A) {
+        t.magic != TRAILER_MAGIC_V19 && t.magic != TRAILER_MAGIC_V1A &&
+        t.magic != TRAILER_MAGIC_V1B) {
         throw std::runtime_error("Bad trailer magic");
     }
     return t;
@@ -83,7 +84,8 @@ Header parse_header(const uint8_t *data, size_t size,
     Reader r(data, 0, size);
     h.magic = r.u32_le();
     if (h.magic != MAGIC_V17 && h.magic != MAGIC_V18 &&
-        h.magic != MAGIC_V19 && h.magic != MAGIC_V1A) {
+        h.magic != MAGIC_V19 && h.magic != MAGIC_V1A &&
+        h.magic != MAGIC_V1B) {
         throw std::runtime_error("Bad header magic");
     }
     /* Trailer/header version cross-check. */
@@ -91,7 +93,8 @@ Header parse_header(const uint8_t *data, size_t size,
         (h.magic == MAGIC_V17) ? TRAILER_MAGIC_V17 :
         (h.magic == MAGIC_V18) ? TRAILER_MAGIC_V18 :
         (h.magic == MAGIC_V19) ? TRAILER_MAGIC_V19 :
-                                 TRAILER_MAGIC_V1A;
+        (h.magic == MAGIC_V1A) ? TRAILER_MAGIC_V1A :
+                                 TRAILER_MAGIC_V1B;
     if (trailer_magic != expected_trailer) {
         throw std::runtime_error("Header/trailer CST version mismatch");
     }

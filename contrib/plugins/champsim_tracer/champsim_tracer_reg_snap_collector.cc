@@ -104,6 +104,45 @@ void RegSnapCollector::read_into_snap(unsigned int cpu_index,
     cst_wide_from_le_bytes(&out->value, buf->data, (size_t)n);
 }
 
+/*
+ * Synthesize the canonical metaflags byte (CST_METAFLAGS_*) from the
+ * architectural flags register at @qemu_reg.  Reads the same register
+ * @read_into_snap would, then defers the per-ISA bit shuffle to the
+ * mapper function the active ISA's IsaProperties supplies.  When the
+ * mapper is NULL (ISA has no integer flags reg, or REG_METAFLAGS
+ * shouldn't have been added in the first place) the result is zero
+ * so the decoder still has a well-defined byte to emit.
+ *
+ * Single-byte canonical payload — fits in limb[0] of the
+ * CSTWideValue, leaving the other 56 bytes (incl. upper 7 of
+ * limb[0]) zero so the delta-encoder ships a one-byte change.
+ */
+void RegSnapCollector::read_metaflags_into_snap(unsigned int cpu_index,
+                                                const QemuRegKey *qemu_reg,
+                                                RegSnap *out)
+{
+    cst_wide_zero(&out->value);
+    MetaFlagsMapperFn mapper = isa_properties[trace_isa].flags_to_metaflags;
+    if (!mapper || !qemu_reg || !qemu_reg->name) {
+        return;
+    }
+    struct qemu_plugin_register *handle =
+        g_reg_handle_cache.lookup(cpu_index, qemu_reg);
+    if (!handle) {
+        return;
+    }
+    GByteArray *buf = read_scratch();
+    int n = qemu_plugin_read_register(handle, buf);
+    if (n <= 0) {
+        return;
+    }
+    uint64_t raw = 0;
+    for (int i = 0; i < n && i < 8; i++) {
+        raw |= ((uint64_t)buf->data[i]) << (i * 8);
+    }
+    out->value.limb[0] = mapper(raw);
+}
+
 WideRegSnap *RegSnapCollector::capture_wide(unsigned int cpu_index)
 {
     if (!enable_reg_data) {
@@ -145,9 +184,24 @@ void RegSnapCollector::capture_insn_snaps(const WideRegSnap *wide,
 
     const InsnFields *f = &tmpl->insn_fields[insn_idx];
     const InsnRegNames *names = &tmpl->insn_reg_names[insn_idx];
+    MetaFlagsMapperFn mapper = isa_properties[trace_isa].flags_to_metaflags;
     for (uint8_t i = 0; i < f->n_dst_regs; i++) {
         RegSnap s;
-        wide_lookup(names->dst_qemu_reg_keys[i], &s);
+        if (f->dst_regs[i] == REG_METAFLAGS) {
+            /* The wide snap holds the raw architectural flags value
+             * under the same QemuRegKey we routed REG_METAFLAGS
+             * through; synthesize the canonical byte via the active
+             * ISA's mapper.  Keeps the wide-path consistent with the
+             * live-path. */
+            RegSnap raw;
+            wide_lookup(names->dst_qemu_reg_keys[i], &raw);
+            cst_wide_zero(&s.value);
+            if (mapper) {
+                s.value.limb[0] = mapper(raw.value.limb[0]);
+            }
+        } else {
+            wide_lookup(names->dst_qemu_reg_keys[i], &s);
+        }
         out_snaps.push_back(s);
     }
 }
@@ -165,7 +219,12 @@ void RegSnapCollector::capture_insn_snaps_live(unsigned int cpu_index,
     const InsnRegNames *names = &tmpl->insn_reg_names[insn_idx];
     for (uint8_t i = 0; i < f->n_dst_regs; i++) {
         RegSnap s;
-        read_into_snap(cpu_index, names->dst_qemu_reg_keys[i], &s);
+        if (f->dst_regs[i] == REG_METAFLAGS) {
+            read_metaflags_into_snap(cpu_index,
+                                     names->dst_qemu_reg_keys[i], &s);
+        } else {
+            read_into_snap(cpu_index, names->dst_qemu_reg_keys[i], &s);
+        }
         out_snaps.push_back(s);
     }
 }

@@ -23,14 +23,11 @@ or any other timing artifact.  Timing models live in the consumer
 simulator (ChampSim, gem5, etc.); the tracer hands them the inputs.
 
 **Real speculative-execution semantics in detail.**  The wrong-path
-chain is bounded (``wpdepth`` instructions), single-path (no nested
-mispredicts beyond the initial one), and discards architectural
-register and memory effects at the end of each chain.  This is
-sufficient for cache-pollution and prefetcher-training research; it
-is *not* sufficient for cycle-level mispredict-penalty modeling or
-for studying transient-execution side channels (Spectre / Meltdown
-classes) where the precise sequence of speculative micro-ops
-matters.
+chain is bounded (``wpdepth`` instructions), and single-path (no nested
+mispredicts beyond the initial one). This is sufficient for cache-pollution
+and prefetcher-training research; it may not be sufficient for studying 
+transient-execution side channels (Spectre / Meltdown classes) where the 
+precise sequence of back-to-back mispredictions matters.
 
 Workload-shape limitations
 --------------------------

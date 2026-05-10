@@ -45,6 +45,16 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     (void)branch_pc;
     (void)correct_target;
 
+    /* Cache the per-thread Stats reference once.  The g_stats macro
+     * expands to thread_stats_get(), which calls __tls_get_addr —
+     * profiling showed ~1% of total time spent in TLS resolution
+     * from this function alone (10+ stats bumps per WP chain).
+     * Hold the reference in a stack slot and bump fields directly.
+     * Named "stats" rather than the conventional "s" to avoid
+     * shadowing inner `s` loop indices below. */
+    Stats &stats = thread_stats_get();
+    Stats *hist = g_current_hist_bucket;
+
     unsigned int initial_insn_cap = max_wrong_path_depth > 16
         ? (unsigned int)max_wrong_path_depth : 16;
     std::vector<WPBBEntry> wp_chain;
@@ -57,11 +67,11 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
 
     struct qemu_plugin_cpu_state *saved_state = qemu_plugin_cpu_state_save();
     if (!saved_state) {
-        g_stats.wp_early_exits++;
-        g_stats.wp_simulations++;
-        if (Stats *h = g_current_hist_bucket) {
-            h->wp_early_exits++;
-            h->wp_simulations++;
+        stats.wp_early_exits++;
+        stats.wp_simulations++;
+        if (hist) {
+            hist->wp_early_exits++;
+            hist->wp_simulations++;
         }
         return wp_chain;
     }
@@ -331,23 +341,23 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
 
             /* WP-side per-execution attribution: mirror the CP walk in
              * vcpu_tb_exec, scoped to non-duplicate WP insns so the
-             * counts reflect what the WP simulator actually appended. */
+             * counts reflect what the WP simulator actually appended.
+             * `stats` and `hist` are cached at function entry. */
             {
                 const InsnFields *f = &tmpl->insn_fields[i];
-                Stats *h = g_current_hist_bucket;
-                g_stats.wp_insns_by_opcode[f->opcode]++;
-                if (h) h->wp_insns_by_opcode[f->opcode]++;
+                stats.wp_insns_by_opcode[f->opcode]++;
+                if (hist) hist->wp_insns_by_opcode[f->opcode]++;
                 if (f->branch_type != BRANCH_NONE) {
-                    g_stats.wp_branches_by_type[f->branch_type]++;
-                    if (h) h->wp_branches_by_type[f->branch_type]++;
+                    stats.wp_branches_by_type[f->branch_type]++;
+                    if (hist) hist->wp_branches_by_type[f->branch_type]++;
                 }
-                for (uint8_t s = 0; s < f->n_src_regs; s++) {
-                    g_stats.wp_src_reg_uses[f->src_regs[s]]++;
-                    if (h) h->wp_src_reg_uses[f->src_regs[s]]++;
+                for (uint8_t k = 0; k < f->n_src_regs; k++) {
+                    stats.wp_src_reg_uses[f->src_regs[k]]++;
+                    if (hist) hist->wp_src_reg_uses[f->src_regs[k]]++;
                 }
                 for (uint8_t d = 0; d < f->n_dst_regs; d++) {
-                    g_stats.wp_dst_reg_writes[f->dst_regs[d]]++;
-                    if (h) h->wp_dst_reg_writes[f->dst_regs[d]]++;
+                    stats.wp_dst_reg_writes[f->dst_regs[d]]++;
+                    if (hist) hist->wp_dst_reg_writes[f->dst_regs[d]]++;
                 }
             }
 
@@ -415,9 +425,9 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                 .data = acc.data,
             };
             bb_dyn_params.push_back(dp);
-            g_stats.wp_total_mem_accesses++;
-            if (g_current_hist_bucket) {
-                g_current_hist_bucket->wp_total_mem_accesses++;
+            stats.wp_total_mem_accesses++;
+            if (hist) {
+                hist->wp_total_mem_accesses++;
             }
         }
 
@@ -546,16 +556,16 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
 
     g_wp_state.mem_accesses.clear();
 
-    g_stats.wp_simulations++;
-    g_stats.wp_total_insns += sim_insns;
+    stats.wp_simulations++;
+    stats.wp_total_insns += sim_insns;
     if (early_exit) {
-        g_stats.wp_early_exits++;
+        stats.wp_early_exits++;
     }
-    if (Stats *h = g_current_hist_bucket) {
-        h->wp_simulations++;
-        h->wp_total_insns += sim_insns;
+    if (hist) {
+        hist->wp_simulations++;
+        hist->wp_total_insns += sim_insns;
         if (early_exit) {
-            h->wp_early_exits++;
+            hist->wp_early_exits++;
         }
     }
 

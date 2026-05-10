@@ -679,11 +679,12 @@ static BranchRecord *observe_branch_transition(bool prev_is_branch,
                                                uint64_t prev_ft)
 {
     if (prev_is_branch) {
-        g_stats.branches_observed++;
+        Stats &s = thread_stats_get();
+        s.branches_observed++;
         if (branch_taken) {
-            g_stats.branches_taken++;
+            s.branches_taken++;
         } else {
-            g_stats.branches_not_taken++;
+            s.branches_not_taken++;
         }
         if (Stats *h = g_current_hist_bucket) {
             h->branches_observed++;
@@ -766,9 +767,9 @@ static void emit_finalized_bb(BodyStreamState *out_stream,
         wp_entries = simulate_wrong_path_ext(
             prev_last, current_pc, wrong_target, cpu_index);
     } else if (wrong_target == 0) {
-        g_stats.wp_skipped++;
-        if (g_current_hist_bucket) {
-            g_current_hist_bucket->wp_skipped++;
+        thread_stats_get().wp_skipped++;
+        if (Stats *h = g_current_hist_bucket) {
+            h->wp_skipped++;
         }
     }
 
@@ -817,7 +818,12 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
      */
     uint64_t icount_prev = qemu_plugin_u64_get(g_scoreboard.insn_count,
                                                cpu_index);
-    if (!g_wp_state.in_progress) {
+    /* Cache the WP-progress flag.  g_wp_state is thread_local, so the
+     * compiler emits __tls_get_addr per access in the dlopen'd
+     * plugin's general-dynamic TLS model; reading it twice in this
+     * critical section costs ~10 ns extra on every TB exec. */
+    bool wp_in_progress = g_wp_state.in_progress;
+    if (!wp_in_progress) {
         uint64_t last_counted = qemu_plugin_u64_get(
             g_scoreboard.last_counted_start_pc, cpu_index);
         bool is_rep_reentry = (n_insns == 1 && cur_start_pc == last_counted);
@@ -829,7 +835,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         }
     }
 
-    if (g_wp_state.in_progress) {
+    if (wp_in_progress) {
         g_mutex_unlock(&exec_lock);
         return;
     }
@@ -1017,22 +1023,28 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         /* Per-CP-execution attribution: walk the just-executed TB's
          * insns and bump opcode / branch_type / src-reg / dst-reg
          * counters.  Cheap: <=20 insns per TB on average, all hot in
-         * cache from the surrounding work. */
+         * cache from the surrounding work.
+         *
+         * Cache thread_stats_get() once before the loop — the g_stats
+         * macro re-resolves the TLS slot via __tls_get_addr on every
+         * expansion, and this loop bumps it 4×n_insns times in the
+         * worst case. */
+        Stats &s = thread_stats_get();
         Stats *h = g_current_hist_bucket;
         for (uint32_t i = 0; i < prev_tb_tmpl->n_insns; i++) {
             const InsnFields *f = &prev_tb_tmpl->insn_fields[i];
-            g_stats.cp_insns_by_opcode[f->opcode]++;
+            s.cp_insns_by_opcode[f->opcode]++;
             if (h) h->cp_insns_by_opcode[f->opcode]++;
             if (f->branch_type != BRANCH_NONE) {
-                g_stats.cp_branches_by_type[f->branch_type]++;
+                s.cp_branches_by_type[f->branch_type]++;
                 if (h) h->cp_branches_by_type[f->branch_type]++;
             }
-            for (uint8_t s = 0; s < f->n_src_regs; s++) {
-                g_stats.cp_src_reg_uses[f->src_regs[s]]++;
-                if (h) h->cp_src_reg_uses[f->src_regs[s]]++;
+            for (uint8_t k = 0; k < f->n_src_regs; k++) {
+                s.cp_src_reg_uses[f->src_regs[k]]++;
+                if (h) h->cp_src_reg_uses[f->src_regs[k]]++;
             }
             for (uint8_t d = 0; d < f->n_dst_regs; d++) {
-                g_stats.cp_dst_reg_writes[f->dst_regs[d]]++;
+                s.cp_dst_reg_writes[f->dst_regs[d]]++;
                 if (h) h->cp_dst_reg_writes[f->dst_regs[d]]++;
             }
         }

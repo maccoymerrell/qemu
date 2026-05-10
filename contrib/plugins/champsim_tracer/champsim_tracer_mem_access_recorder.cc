@@ -86,15 +86,23 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
      *
      * The per-instruction memop cap stays unconditional: it's a wire-
      * format constraint (CST_FID_SLOT_COUNT slots per insn) and a
-     * loop-bound for spec-mode REP iterations that don't advance PC. */
-    if (g_wp_state.in_progress) {
-        if (insn_pc == g_wp_state.cur_insn_pc) {
-            g_wp_state.cur_insn_count++;
+     * loop-bound for spec-mode REP iterations that don't advance PC.
+     *
+     * Cache `g_wp_state` once.  The plugin .so is dlopen'd, so the
+     * thread_local lives in the general-dynamic TLS model and each
+     * access goes through __tls_get_addr — profiling showed ~3 % of
+     * runtime in TLS resolution, much of it from this per-memop
+     * callback (called millions of times per trace).
+     */
+    WPThreadState &wp = g_wp_state;
+    if (wp.in_progress) {
+        if (insn_pc == wp.cur_insn_pc) {
+            wp.cur_insn_count++;
         } else {
-            g_wp_state.cur_insn_pc = insn_pc;
-            g_wp_state.cur_insn_count = 1;
+            wp.cur_insn_pc = insn_pc;
+            wp.cur_insn_count = 1;
         }
-        if (g_wp_state.cur_insn_count > CST_FID_SLOT_COUNT) {
+        if (wp.cur_insn_count > CST_FID_SLOT_COUNT) {
             return;
         }
     } else if (!g_trace_segments.is_active_atomic()) {
@@ -111,33 +119,36 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
 
     /* CP path uses enable_mem_data; WP path uses enable_wp_mem_data
      * (already gated above to true if we reach here). */
-    bool capture_data = g_wp_state.in_progress
+    bool capture_data = wp.in_progress
         ? enable_wp_mem_data : enable_mem_data;
     if (capture_data) {
         capture_mem_value(info, vaddr, &acc);
     }
 
-    if (g_wp_state.in_progress) {
-        g_wp_state.mem_accesses.push_back(acc);
+    if (wp.in_progress) {
+        wp.mem_accesses.push_back(acc);
     } else {
         tls_cp_mem_accesses.push_back(acc);
-        g_stats.cp_total_mem_accesses++;
-        if (g_current_hist_bucket) {
-            g_current_hist_bucket->cp_total_mem_accesses++;
+        Stats &s = thread_stats_get();
+        s.cp_total_mem_accesses++;
+        if (Stats *h = g_current_hist_bucket) {
+            h->cp_total_mem_accesses++;
         }
     }
 }
 
 void MemAccessRecorder::record_synthetic_load(uint64_t vaddr, uint64_t insn_pc)
 {
-    if (g_wp_state.in_progress) {
-        if (insn_pc == g_wp_state.cur_insn_pc) {
-            g_wp_state.cur_insn_count++;
+    /* TLS-cache rationale: see record() above. */
+    WPThreadState &wp = g_wp_state;
+    if (wp.in_progress) {
+        if (insn_pc == wp.cur_insn_pc) {
+            wp.cur_insn_count++;
         } else {
-            g_wp_state.cur_insn_pc = insn_pc;
-            g_wp_state.cur_insn_count = 1;
+            wp.cur_insn_pc = insn_pc;
+            wp.cur_insn_count = 1;
         }
-        if (g_wp_state.cur_insn_count > CST_FID_SLOT_COUNT) {
+        if (wp.cur_insn_count > CST_FID_SLOT_COUNT) {
             return;
         }
     } else if (!g_trace_segments.is_active_atomic()) {
@@ -152,13 +163,14 @@ void MemAccessRecorder::record_synthetic_load(uint64_t vaddr, uint64_t insn_pc)
     };
     cst_wide_zero(&acc.data);
 
-    if (g_wp_state.in_progress) {
-        g_wp_state.mem_accesses.push_back(acc);
+    if (wp.in_progress) {
+        wp.mem_accesses.push_back(acc);
     } else {
         tls_cp_mem_accesses.push_back(acc);
-        g_stats.cp_total_mem_accesses++;
-        if (g_current_hist_bucket) {
-            g_current_hist_bucket->cp_total_mem_accesses++;
+        Stats &s = thread_stats_get();
+        s.cp_total_mem_accesses++;
+        if (Stats *h = g_current_hist_bucket) {
+            h->cp_total_mem_accesses++;
         }
     }
 }

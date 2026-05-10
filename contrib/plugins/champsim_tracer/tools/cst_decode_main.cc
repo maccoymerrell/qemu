@@ -154,20 +154,14 @@ std::string fmt_wide_hex(const cst::Wide &w)
     return out;
 }
 
-/* Is the wide value all-zero?  Python's `if data:` checks truthiness,
- * which is false only when *every* limb is zero. */
-bool wide_is_zero(const cst::Wide &w)
-{
-    for (auto x : w.limb) if (x) return false;
-    return true;
-}
-
 void format_dyn_legacy(const cst::DynParam &dp, bool show_data,
                        std::string *out)
 {
     out->append(dp.type == cst::DynParam::Load ? "load=0x" : "store=0x");
     out->append(fmt_hex_lower(dp.addr));
-    if (show_data && !wide_is_zero(dp.data)) {
+    /* Always emit :data= when memdata was captured, even if the
+     * value is zero — see the matching disasm-format note. */
+    if (show_data) {
         out->append(":data=");
         out->append(fmt_wide_hex(dp.data));
     }
@@ -855,13 +849,17 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
     }
 
     /* Memory operands rendered inline as ld(addr)=val / st(addr)=val
-     * after the dst section (or after operands if no dst). */
+     * after the dst section (or after operands if no dst).  When
+     * memdata is enabled in the trace we ALWAYS print the =value, even
+     * when it happens to be zero — otherwise the absence of an `=` is
+     * ambiguous between "memdata wasn't captured" and "the loaded /
+     * stored value was zero". */
     for (const auto &dp : dyns) {
         if (dp.insn_index != (uint32_t)insn_idx) continue;
         line.append(dp.type == cst::DynParam::Load ? "  ld(0x" : "  st(0x");
         append_hex(&line, dp.addr);
         line.push_back(')');
-        if (ctx.h->has_mem_data() && !wide_is_zero(dp.data)) {
+        if (ctx.h->has_mem_data()) {
             line.push_back('=');
             append_wide_hex(&line, dp.data);
         }

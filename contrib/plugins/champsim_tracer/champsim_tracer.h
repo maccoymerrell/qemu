@@ -504,10 +504,28 @@ typedef struct {
     double weight;
 } SimPointEntry;
 
+/*
+ * Raw byte buffer with inlined append.  Replaces GByteArray for the
+ * encoder's per-entry scratch where g_byte_array_append showed up at
+ * 1.5 % of total runtime — a function call into glib for every uleb /
+ * sleb byte, when an inlined memcpy + length bump suffices.
+ *
+ * Owned by the holder via raw_buf_init / raw_buf_free; capacity grows
+ * 2x when full, never shrinks (matches the encoder's reuse-the-largest
+ * scratch pattern).  Not thread-safe — each holder is single-thread by
+ * construction.
+ */
+typedef struct {
+    uint8_t *data;
+    size_t   len;
+    size_t   cap;
+} RawBuf;
+
 typedef struct {
     FILE *f;
-    GByteArray *buf;
-    WriterCtx *w;          /* async writer; mutually exclusive with f/buf */
+    GByteArray *buf;       /* glib scratch (legacy mode, dynamic alloc) */
+    RawBuf *rb;            /* fast scratch (inlined append) */
+    WriterCtx *w;          /* async writer; mutually exclusive with f/buf/rb */
     uint64_t total_bytes;
 } BitWriter;
 

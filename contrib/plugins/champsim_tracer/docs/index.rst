@@ -18,8 +18,7 @@ bounded speculative chain attached at each branch.  See
 :doc:`concepts` for the qualitative picture and :doc:`format` for
 the byte-level wire format.
 
-What it's good for
-------------------
+**What it's good for:**
 
 * **Cache simulation** — drop the address stream into a cache model
   to measure miss rates, study replacement policies, evaluate
@@ -94,9 +93,16 @@ as well as the tracer itself (an upcoming publication).
 
    _generated/encoding_tables
 
-Indices and tables
-==================
+.. only:: html
 
-* :ref:`genindex` — alphabetical index of config flags, wire-format
-  tags, and other terms cross-referenced from the prose.
-* :ref:`search` — full-text search across the rendered docs.
+   Indices and tables
+   ==================
+
+   * :ref:`genindex` — alphabetical index of config flags, wire-format
+     tags, and other terms cross-referenced from the prose.
+   * :ref:`search` — full-text search across the rendered docs.
+
+.. only:: latex
+
+   The alphabetical index follows this chapter — see the back of the
+   document for it.  Full-text search is HTML-only.

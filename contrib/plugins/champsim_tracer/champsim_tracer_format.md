@@ -458,33 +458,33 @@ The CP overlay is unaffected by speculative records.
 Field IDs are one byte. Slotted families reserve 16 values each.
 
 ```
-+----------------+----------------------+-------------------------------+
-| Field IDs      | Family               | Meaning                       |
-+----------------+----------------------+-------------------------------+
-| 0x00           | N_LOADS              | current valid load slots      |
-| 0x01..0x10     | LOAD_ADDR[0..15]     | load virtual addresses        |
-| 0x11..0x20     | STORE_ADDR[0..15]    | store virtual addresses       |
-| 0x21..0x30     | LOAD_DATA[0..15]     | load values, if MEM_DATA      |
-| 0x31..0x40     | STORE_DATA[0..15]    | store values, if MEM_DATA     |
-| 0x41..0x50     | reserved             | source-register-snapshot extension |
-| 0x51..0x60     | DST_REG[0..15]       | destination register snapshots |
-| 0x61           | N_STORES             | current valid store slots     |
-| 0x62           | EXTRA_LOAD_ADDR      | raw load addr vector, slots 16+ |
-| 0x63           | EXTRA_STORE_ADDR     | raw store addr vector, slots 16+ |
-| 0x64           | EXTRA_LOAD_DATA      | raw load data vector, slots 16+ |
-| 0x65           | EXTRA_STORE_DATA     | raw store data vector, slots 16+ |
-| 0x66..0x6F     | reserved             | future memop metadata          |
-| 0x70           | INSN_BYTES_LO        | low 8 bytes of instruction    |
-| 0x71           | INSN_BYTES_HI        | high 8 bytes of instruction   |
-| 0x72           | INSN_OPCODE          | GenericOpcode                 |
-| 0x73           | INSN_BRANCH_TYPE     | BranchType                    |
-| 0x74           | INSN_FLAGS           | per-insn template flags       |
-| 0x75           | INSN_IMMEDIATE       | signed immediate              |
-| 0x76           | INSN_SIZE            | instruction byte length       |
-| 0x77           | METAFLAGS            | canonical Z/N/C/V/P byte, if REG_DATA |
-| 0x78..0xFE     | reserved             | future fields                 |
-| 0xFF           | EXTENDED             | reserved escape; not currently used |
-+----------------+----------------------+-------------------------------+
++----------------+----------------------+------------------------------------------------+
+| Field IDs      | Family               | Meaning                             | Gate     |
++----------------+----------------------+------------------------------------------------+
+| 0x00           | N_LOADS              | current valid load slots            |          |
+| 0x01..0x10     | LOAD_ADDR[0..15]     | load virtual addresses              |          |
+| 0x11..0x20     | STORE_ADDR[0..15]    | store virtual addresses             |          |
+| 0x21..0x30     | LOAD_DATA[0..15]     | load values                         | MEM_DATA |
+| 0x31..0x40     | STORE_DATA[0..15]    | store values                        | MEM_DATA |
+| 0x41..0x50     | reserved             | source-register-snapshot extension  | -------- |
+| 0x51..0x60     | DST_REG[0..15]       | destination register snapshots,     | REG_DATA |
+| 0x61           | N_STORES             | current valid store slots           |          |
+| 0x62           | EXTRA_LOAD_ADDR      | raw load addr vector, slots 16+     |          |
+| 0x63           | EXTRA_STORE_ADDR     | raw store addr vector, slots 16+    |          |
+| 0x64           | EXTRA_LOAD_DATA      | raw load data vector, slots 16+     |          |
+| 0x65           | EXTRA_STORE_DATA     | raw store data vector, slots 16+    |          |
+| 0x66..0x6F     | reserved             | future memop metadata               | -------- |
+| 0x70           | INSN_BYTES_LO        | low 8 bytes of instruction          | STATIC   |
+| 0x71           | INSN_BYTES_HI        | high 8 bytes of instruction         | STATIC   |
+| 0x72           | INSN_OPCODE          | GenericOpcode                       | STATIC   |
+| 0x73           | INSN_BRANCH_TYPE     | BranchType                          | STATIC   |
+| 0x74           | INSN_FLAGS           | per-insn template flags             | STATIC   |
+| 0x75           | INSN_IMMEDIATE       | signed immediate                    | STATIC   |
+| 0x76           | INSN_SIZE            | instruction byte length             | STATIC   |
+| 0x77           | METAFLAGS            | canonical Z/N/C/V/P byte            | REG_DATA |
+| 0x78..0xFE     | reserved             | future fields                       | -------- |
+| 0xFF           | EXTENDED             | reserved escape; not currently used | -------- |
++----------------+----------------------+------------------------------------------------+
 ```
 
 The header's `field_id` map carries the exact string associated with

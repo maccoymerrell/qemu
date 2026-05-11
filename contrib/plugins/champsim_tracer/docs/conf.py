@@ -52,6 +52,12 @@ extensions = [
     # in champsim_tracer_mnemonics_*.h and emits the appendix at
     # _generated/encoding_tables.rst before sources are read.
     "encoding_tables",
+    # Local extension that walks every parsed doctree and adds index
+    # entries for well-known symbol names (GEN_OP_*, REG_*, BRANCH_*,
+    # CST_FID_*, SYNC_*, BODY_TAG_*, validator subcommands, ...).
+    # Keeps the genindex page populous without hand-curating
+    # `.. index::` directives across every section.
+    "auto_index",
 ]
 
 # Treat both .rst and .md as primary docs.  format.md is markdown so
@@ -142,10 +148,9 @@ latex_elements = {
     # for a single-sided PDF; they're useful in print but waste pages
     # on screen.
     "extraclassoptions": "openany,oneside",
-    # Suppress the auto-emitted \printindex.  The doc adds only a
-    # handful of py:function / py:class entries, which makes for a
-    # near-empty 1-2 page genindex that's more confusing than useful.
-    # The HTML side hides it the same way (via index.rst's lack of a
-    # `* :ref:`genindex`` line) so the two outputs stay in sync.
-    "printindex": "",
+    # The auto_index extension populates the genindex with the
+    # tracer's symbol vocabulary (GEN_OP_*, REG_*, CST_FID_*, …),
+    # so leave the default \printindex emission in place.  An older
+    # near-empty index was suppressed here; the override is no longer
+    # needed.
 }

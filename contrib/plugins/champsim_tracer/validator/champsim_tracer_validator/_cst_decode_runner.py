@@ -1,14 +1,15 @@
 """Compat shim that wraps the C++ ``cst_decode`` binary.
 
-wptrace_genval was written against the in-process ``champsim_tracer_decode``
-Python module: ``decode_champsim_tracer(path)`` returned ``(meta,
-templates, entries)`` with rich Python objects.  After the C++ port the
-Python decoder is gone — the source of truth is the ``cst_decode``
-binary, with its ``--format=legacy`` mode emitting the byte-identical
-text that the Python renderer used to produce.
+The validator was originally written against an in-process
+``champsim_tracer_decode`` Python module:
+``decode_champsim_tracer(path)`` returned ``(meta, templates,
+entries)`` with rich Python objects.  After the C++ port the Python
+decoder is gone — the source of truth is the ``cst_decode`` binary,
+with its ``--format=legacy`` mode emitting the byte-identical text
+that the Python renderer used to produce.
 
 This module subprocess-runs ``cst_decode --format=legacy`` and parses
-its stdout back into the same Python shapes wptrace_genval expects.
+its stdout back into the same Python shapes the validator expects.
 The text format is stable (covered by the byte-identical regression
 test in the C++ tooling), so the parser only needs to handle the
 fixed prose grammar of the META / ENCODINGS / TEMPLATES / BODY
@@ -42,7 +43,7 @@ _HERE = Path(__file__).resolve().parent
 
 # ---------------------------------------------------------------------------
 # Constants — duplicated verbatim from the deleted champsim_tracer_decode.py.
-# wptrace_genval uses these directly via attribute access; keeping them in
+# The validator uses these directly via attribute access; keeping them in
 # the shim avoids forcing a `.maps.opcode` dict lookup on every call site.
 # ---------------------------------------------------------------------------
 
@@ -96,31 +97,17 @@ FID_EXTENDED         = 0xFF
 
 
 def build_reg_names() -> dict[int, str]:
-    """Reproduce the static reg-name table the deleted Python decoder
-    used to assemble.  Sourced from champsim_tracer_generic_ids.h."""
-    names: dict[int, str] = {0: "REG_NONE"}
-    for i in range(64):
-        names[1 + i] = f"REG_GPR{i}"
-    for i in range(32):
-        names[64 + i] = f"REG_FPR{i}"
-    for i in range(32):
-        names[96 + i] = f"REG_VEC{i}"
-    for i in range(8):
-        names[128 + i] = f"REG_SEG{i}"
-    names[224] = "REG_CTRL"
-    names[225] = "REG_SP"
-    names[226] = "REG_FLAGS"
-    names[227] = "REG_IP"
-    names[228] = "REG_FP_REG"
-    names[229] = "REG_DEBUG"
-    names[230] = "REG_TLB"
-    names[231] = "REG_SYS"
-    names[232] = "REG_HI"
-    names[233] = "REG_LO"
-    names[234] = "REG_CR"
-    names[235] = "REG_VL"
-    names[236] = "REG_VTYPE"
-    return names
+    """Minimal fallback reg-id → name table.
+
+    The authoritative GenericRegId → name mapping for any given trace
+    lives in that trace's ENCODINGS section (parsed into
+    `meta["encoding_maps"]["reg"]`).  Validator code should pull names
+    from there, not from this fallback — see the static-reg-set check
+    in `validator.py`.  This dict is kept solely so legacy call sites
+    that pre-date the per-trace encoding-map plumbing have something
+    to return; new code should reach for the trace's own map.
+    """
+    return {0: "REG_NONE"}
 
 
 REG_NAMES_DEFAULT = build_reg_names()
@@ -157,7 +144,11 @@ def _find_cst_decode() -> Path:
     on_path = shutil.which("cst_decode")
     if on_path:
         return Path(on_path)
-    in_tree = _HERE.parent.parent.parent / "build" / "contrib" / "plugins" / "cst_decode"
+    # _HERE = .../contrib/plugins/champsim_tracer/validator/champsim_tracer_validator
+    # Walk five parents up to reach the QEMU source root, then descend
+    # into the conventional build directory.
+    in_tree = (_HERE.parent.parent.parent.parent.parent
+               / "build" / "contrib" / "plugins" / "cst_decode")
     if in_tree.is_file():
         return in_tree.resolve()
     raise FileNotFoundError(
@@ -196,6 +187,9 @@ _STORE_RE = re.compile(
 _REG_RE = re.compile(
     r"^( +)insn\[(\d+)\] (dst|src)\[(\d+)\] (\S+)=0x([0-9a-f]+)$"
 )
+_MFLAGS_RE = re.compile(
+    r"^( +)insn\[(\d+)\] 0x([0-9a-fA-F]+) \[([A-Z\-]+)\]$"
+)
 
 
 def _make_dyn(type_name: str, value: int, insn_index: int,
@@ -224,7 +218,7 @@ def _make_reg_snap(insn_index: int, kind: str, operand_index: int,
     }
 
 
-def _parse_meta_section(lines: list[str], reg_name_to_id: dict[str, int]) -> dict:
+def _parse_meta_section(lines: list[str]) -> dict:
     meta: dict = {
         "encoding_maps": {},
         "stop_reason_names": {},
@@ -265,17 +259,6 @@ def _parse_meta_section(lines: list[str], reg_name_to_id: dict[str, int]) -> dic
         elif line.startswith("TOTAL_TARGET_INSNS "):
             payload = line[len("TOTAL_TARGET_INSNS "):]
             meta["total_target_insns"] = int(payload.split()[0])
-        elif line.startswith("INITIAL_REGFILE "):
-            n = int(line[len("INITIAL_REGFILE "):])
-            initial: dict[int, bytes] = {}
-            for _ in range(n):
-                i += 1
-                parts = lines[i].strip().split()
-                rid = reg_name_to_id.get(parts[0])
-                if rid is None:
-                    rid = -1
-                initial[rid] = bytes.fromhex(parts[1])
-            meta["initial_regfile"] = initial
         i += 1
     return meta, i
 
@@ -371,16 +354,23 @@ def _parse_templates(lines: list[str], i: int,
 
 def _parse_observations(lines: list[str], i: int,
                         reg_name_to_id: dict[str, int]
-                        ) -> tuple[list[DynParam], list[dict], int]:
-    """Parse a CP or WP `cp:` / sub-block observation block."""
+                        ) -> tuple[list[DynParam], list[dict],
+                                   list[dict], int]:
+    """Parse a CP or WP `cp:` / sub-block observation block.
+
+    Returns (dyn_params, reg_snaps, metaflags, next_i).  `metaflags`
+    is a list of {insn_index, byte, bits} dicts surfaced from the
+    legacy decoder's `metaflags:` section (FID_METAFLAGS side-channel).
+    """
     dyn: list[DynParam] = []
     snaps: list[dict] = []
+    mflags: list[dict] = []
     if i >= len(lines):
-        return dyn, snaps, i
+        return dyn, snaps, mflags, i
     # `unchanged` sentinel: caller already consumed the prefix line.
     line = lines[i].strip()
     if line == "unchanged":
-        return dyn, snaps, i + 1
+        return dyn, snaps, mflags, i + 1
     while i < len(lines):
         line = lines[i]
         if line == "memops:":
@@ -413,8 +403,21 @@ def _parse_observations(lines: list[str], i: int,
                     mr.group(6)))
                 i += 1
             continue
+        if line == "metaflags:":
+            i += 1
+            while i < len(lines):
+                mf = _MFLAGS_RE.match(lines[i])
+                if not mf:
+                    break
+                mflags.append({
+                    "insn_index": int(mf.group(2)),
+                    "byte":       int(mf.group(3), 16),
+                    "bits":       mf.group(4),
+                })
+                i += 1
+            continue
         break
-    return dyn, snaps, i
+    return dyn, snaps, mflags, i
 
 
 def _iter_body(lines: list[str], i: int,
@@ -443,6 +446,7 @@ def _iter_body(lines: list[str], i: int,
         # CP block: indented "cp:" header followed by observations.
         cp_dyn: list[DynParam] = []
         cp_snaps: list[dict] = []
+        cp_mflags: list[dict] = []
         wp_entries: list[dict] = []
         if i < len(lines) and lines[i] == "  cp:":
             i += 1
@@ -453,7 +457,7 @@ def _iter_body(lines: list[str], i: int,
                 obs_lines.append(lines[i][4:])
                 i += 1
             j = 0
-            cp_dyn, cp_snaps, _ = _parse_observations(
+            cp_dyn, cp_snaps, cp_mflags, _ = _parse_observations(
                 obs_lines, j, reg_name_to_id)
         while i < len(lines):
             mw = _WP_HEAD_RE.match(lines[i])
@@ -466,6 +470,7 @@ def _iter_body(lines: list[str], i: int,
                 "n_insns": int(mw.group(3)),
                 "dyn_params": [],
                 "reg_snaps": [],
+                "metaflags": [],
                 "fault": False,
                 "translation_unavailable": False,
                 "fault_insn_index": None,
@@ -486,7 +491,8 @@ def _iter_body(lines: list[str], i: int,
                 obs_lines.append(lines[i][4:])
                 i += 1
             j = 0
-            wp["dyn_params"], wp["reg_snaps"], _ = _parse_observations(
+            (wp["dyn_params"], wp["reg_snaps"],
+             wp["metaflags"], _) = _parse_observations(
                 obs_lines, j, reg_name_to_id)
             wp_entries.append(wp)
         yield {
@@ -496,6 +502,7 @@ def _iter_body(lines: list[str], i: int,
             "thread_switched": thread_switched,
             "dyn_params": cp_dyn,
             "reg_snaps": cp_snaps,
+            "metaflags": cp_mflags,
             "wp_entries": wp_entries,
         }
 
@@ -522,7 +529,7 @@ def _parse_full(text: str) -> tuple[dict, list[dict], list[dict]]:
     br_to_id = {n: r for r, n in BRANCH_NAMES.items()}
     sync_to_id = {"SYNC_NONE": 0, "SYNC_THREAD_SWITCH": 4, "SYNC_ATOMIC": 5}
 
-    meta, i = _parse_meta_section(lines, rid_by_name)
+    meta, i = _parse_meta_section(lines)
     encoding_maps, i = _parse_encodings(lines, i, meta)
     meta["encoding_maps"] = encoding_maps
     if "reg" in encoding_maps:
@@ -551,7 +558,57 @@ def _parse_full(text: str) -> tuple[dict, list[dict], list[dict]]:
     templates, i = _parse_templates(
         lines, i, rid_by_name, op_to_id, br_to_id, sync_to_id)
     entries = list(_iter_body(lines, i, rid_by_name))
+    # Trailing BODY_STATS section (cp_entries, iframe_count,
+    # regfile_count, thread_switch_count, sync_hint_counts, …).
+    # Emitted unconditionally by the legacy renderer; we scan the
+    # full output for it rather than trying to track position because
+    # the body iterator above leaves `i` mid-stream when it short-
+    # circuits.
+    meta["body_stats"] = _parse_body_stats(lines)
     return meta, templates, entries
+
+
+def _parse_body_stats(lines: list[str]) -> dict:
+    """Scan for the BODY_STATS section emitted at end of legacy output."""
+    stats: dict = {
+        "cp_entries": 0,
+        "wp_entries": 0,
+        "iframe_count": 0,
+        "regfile_count": 0,
+        "thread_switch_count": 0,
+        "fault_count": 0,
+        "translation_unavail_count": 0,
+        "sync_hint_counts": {},
+    }
+    i = 0
+    while i < len(lines) and lines[i] != "BODY_STATS":
+        i += 1
+    if i >= len(lines):
+        return stats
+    if i + 1 >= len(lines) or lines[i + 1] != "----------":
+        return stats
+    i += 2
+    while i < len(lines) and lines[i] != "":
+        line = lines[i]
+        if line.startswith("sync_hint_counts "):
+            n = int(line[len("sync_hint_counts "):])
+            for _ in range(n):
+                i += 1
+                if i >= len(lines):
+                    break
+                parts = lines[i].strip().split()
+                if len(parts) == 2:
+                    stats["sync_hint_counts"][int(parts[0])] = int(parts[1])
+            i += 1
+            continue
+        for key in ("cp_entries", "wp_entries", "iframe_count",
+                    "regfile_count", "thread_switch_count",
+                    "fault_count", "translation_unavail_count"):
+            if line.startswith(key + " "):
+                stats[key] = int(line[len(key) + 1:])
+                break
+        i += 1
+    return stats
 
 
 def decode_champsim_tracer(bin_path):

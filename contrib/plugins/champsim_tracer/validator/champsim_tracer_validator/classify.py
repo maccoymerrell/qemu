@@ -15,12 +15,15 @@ from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
-# Lazy import of the sibling survey script (hyphen-free module name).
+# Lazy import of the survey script.  Post-migration layout:
+#   contrib/plugins/champsim_tracer/                       (plugin source root)
+#       champsim_tracer_mnemonic_survey.py
+#       validator/champsim_tracer_validator/<this>.py
+# Walk two levels up to reach the plugin source root.
 # ---------------------------------------------------------------------------
 
-_PLUGIN_DIR = Path(__file__).resolve().parent.parent.parent
-_SURVEY_PATH = (_PLUGIN_DIR / "champsim_tracer"
-                / "champsim_tracer_mnemonic_survey.py")
+_PLUGIN_SOURCE_DIR = Path(__file__).resolve().parent.parent.parent
+_SURVEY_PATH = _PLUGIN_SOURCE_DIR / "champsim_tracer_mnemonic_survey.py"
 
 
 def _load_survey():

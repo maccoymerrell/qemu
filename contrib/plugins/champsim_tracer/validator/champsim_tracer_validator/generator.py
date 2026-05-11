@@ -239,7 +239,16 @@ def emit_source(cfg: CFG, plans: list[B.BlockPlan],
             branch_outcome=n.branch_outcome,
             loop_iterations=n.loop_iterations,
         )
-        lines.append(cls.emit(plan, ctx).rstrip())
+        body = cls.emit(plan, ctx).rstrip()
+        # Append `.size sym, .-sym` so the symbol's st_size is non-zero
+        # in the linked ELF.  QEMU user-mode's lookup_symbolxx() does
+        # bsearch using `addr >= st_value && addr < st_value+st_size`,
+        # so a zero-sized symbol is invisible to qemu_plugin_insn_symbol
+        # — and therefore to plugin features that rely on it (e.g.,
+        # trace_window=symbol:name=...).
+        sym = B.symbol_name(n.block_id)
+        body = f"{body}\n.size {sym}, .-{sym}"
+        lines.append(body)
     if isa.startswith("mips"):
         lines.append(".set reorder")
     return "\n".join(lines) + "\n"
@@ -665,7 +674,16 @@ def emit_source(cfg: CFG, plans: list[B.BlockPlan],
             branch_outcome=n.branch_outcome,
             loop_iterations=n.loop_iterations,
         )
-        lines.append(cls.emit(plan, ctx).rstrip())
+        body = cls.emit(plan, ctx).rstrip()
+        # Append `.size sym, .-sym` so the symbol's st_size is non-zero
+        # in the linked ELF.  QEMU user-mode's lookup_symbolxx() does
+        # bsearch using `addr >= st_value && addr < st_value+st_size`,
+        # so a zero-sized symbol is invisible to qemu_plugin_insn_symbol
+        # — and therefore to plugin features that rely on it (e.g.,
+        # trace_window=symbol:name=...).
+        sym = B.symbol_name(n.block_id)
+        body = f"{body}\n.size {sym}, .-{sym}"
+        lines.append(body)
     if isa.startswith("mips"):
         lines.append(".set reorder")
     return "\n".join(lines) + "\n"

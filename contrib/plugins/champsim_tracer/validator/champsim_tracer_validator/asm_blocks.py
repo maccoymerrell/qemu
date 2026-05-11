@@ -311,7 +311,10 @@ class IntAdd(CodeBlock):
         elif ctx.isa == "aarch64":
             lines += _load_slot(ctx.isa, s0, "x9")
             lines += _load_slot(ctx.isa, s1, "x10")
-            lines += ["  add x9, x9, x10"]
+            # Use ADDS (flag-writing) so the trace exercises NZCV
+            # capture / FID_METAFLAGS emission.  Result is identical
+            # to ADD; the only difference is that NZCV gets updated.
+            lines += ["  adds x9, x9, x10"]
             lines += _store_slot(ctx.isa, s2, "x9")
         elif ctx.isa == "riscv64":
             lines += _load_slot(ctx.isa, s0, "t0")

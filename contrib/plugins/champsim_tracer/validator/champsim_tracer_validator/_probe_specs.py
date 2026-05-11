@@ -620,3 +620,76 @@ _register_probe('probe_mips_pref', {
         ],
     },
 })
+
+
+# ===========================================================================
+# Atomic / sync-hint probes (added 2026-05).
+#
+# Exercises the writer's SYNC_ATOMIC sync_hint annotation: any insn
+# classified with MF_ATOMIC in the per-ISA mnemonic tables (or
+# x86 `lock`-prefixed) must carry sync_hint = SYNC_ATOMIC in its
+# template.  The validator's _check_sync_hints catches divergence
+# between the writer's BodyStats aggregation and a static template
+# walk; these probes ensure the SYNC_ATOMIC code path is exercised
+# at all.
+#
+# All probes work in user mode and use the stack as a non-shared
+# atomic target (single-thread; the atomic semantics are observable
+# in flags / loaded values but no actual cross-thread synchronisation
+# is required).
+# ===========================================================================
+
+_register_probe('probe_x86_lock_xadd', {
+    'x86_64': {
+        # `lock xadd src, mem` — fetch-and-add.  The plugin classifies
+        # xadd as GEN_OP_XCHG (with MF_ATOMIC).  INC/DEC under LOCK
+        # carry their own GEN_OP_INC / GEN_OP_DEC; the lock prefix
+        # alone causes sync_hint = SYNC_ATOMIC on every instruction
+        # in the sequence.
+        'asm':      '"movq $1, %%rax\\n\\t"\n'
+                    '    "lock xaddq %%rax, (%%rsp)\\n\\t"\n'
+                    '    "lock incq (%%rsp)\\n\\t"\n'
+                    '    "lock decq (%%rsp)"',
+        'clobbers': '"rax","memory","cc"',
+        'opcodes':  ['XCHG', 'INC', 'DEC'],
+    },
+})
+
+_register_probe('probe_aarch64_ldadd', {
+    'aarch64': {
+        # LSE atomics: LDADD performs *atomic* RMW.  Requires armv8.1-a
+        # +lse from the assembler; gate locally so the rest of the
+        # binary stays armv8-a.
+        'asm':      '".arch armv8.1-a\\n\\t"\n'
+                    '    "mov x9, #1\\n\\t"\n'
+                    '    "ldadd x9, x10, [sp]\\n\\t"\n'
+                    '    "ldaddal x9, x10, [sp]\\n\\t"\n'
+                    '    ".arch armv8-a"',
+        'clobbers': '"x9","x10","memory"',
+        'opcodes':  ['INT_ADD'],
+    },
+})
+
+_register_probe('probe_riscv_amoadd', {
+    'riscv64': {
+        # RV64 A-extension: AMOADD is atomic RMW.
+        'asm':      '"li t0, 1\\n\\t"\n'
+                    '    "amoadd.d t1, t0, (sp)\\n\\t"\n'
+                    '    "amoadd.d.aqrl t1, t0, (sp)"',
+        'clobbers': '"t0","t1","memory"',
+        'opcodes':  ['INT_ADD'],
+    },
+})
+
+_register_probe('probe_mips_ll_sc', {
+    'mipsel': {
+        # MIPS LL / SC — load-linked / store-conditional, both
+        # MF_ATOMIC.  The plugin classifies them as XCHG family.
+        'asm':      '"li $t0, 1\\n\\t"\n'
+                    '    "ll $t1, 0($sp)\\n\\t"\n'
+                    '    "addu $t1, $t1, $t0\\n\\t"\n'
+                    '    "sc $t1, 0($sp)"',
+        'clobbers': '"$t0","$t1","memory"',
+        'opcodes':  ['XCHG'],
+    },
+})

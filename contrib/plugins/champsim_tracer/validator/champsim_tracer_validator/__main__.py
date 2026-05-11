@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""champsim_tracer_genval CLI.
+"""champsim_tracer_validator CLI.
 
 Subcommands:
     generate   Build a seed-driven assembly source + metadata sidecar.
@@ -10,7 +10,7 @@ Subcommands:
   all        Run every step above for the requested ISAs.
 
 Example:
-  ./genval.py all --seed 0x0102 -o out/prog01 \\
+  python3 -m champsim_tracer_validator all --seed 0x0102 -o out/prog01 \\
       --build-dir ../../../build --isa x86_64
 """
 
@@ -22,12 +22,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-
-from genval import generator as G
-from genval import analyzer as A
-from genval import validator as V
+from . import generator as G
+from . import analyzer as A
+from . import validator as V
 
 
 ISA_CHOICES = ("x86_64", "aarch64", "riscv64", "mipsel")
@@ -168,6 +165,13 @@ def _parse_args() -> argparse.Namespace:
     al.add_argument("--stop", type=int, default=200_000)
     al.add_argument("--regdata", action="store_true",
                     help="Enable per-insn register-value capture (regdata=1)")
+    al.add_argument("--iframe-rate", type=int, default=None,
+                    help="Override the tracer's iframe_rate (default 100000)."
+                         " Small values exercise the IFRAME-validation path.")
+    al.add_argument("--start-symbol", type=str, default=None,
+                    help="Use trace_window=symbol:name=...;simulation=<stop>"
+                         " instead of the default icount-based window."
+                         " Exercises the plugin's symbol-resolved start path.")
     al.add_argument("--coverage", action="store_true",
                     help="See `generate --coverage`.")
     al.add_argument("--hot-iters", type=int, default=0,
@@ -176,6 +180,38 @@ def _parse_args() -> argparse.Namespace:
                     default="none", help="See `trace --compress`.")
     al.add_argument("--outpipe", type=str, default=None,
                     help="See `trace --outpipe`.")
+
+    sp = sub.add_parser(
+        "simpoint_test",
+        help="End-to-end 2-segment simpoint test: validates per-segment"
+             " decode independence")
+    common(sp)
+    sp.add_argument("--seed", type=_parse_seed, required=True)
+    sp.add_argument("--isa", choices=ISA_CHOICES, action="append",
+                    required=True)
+    sp.add_argument("--build-dir", type=Path, required=True)
+    sp.add_argument("--diamonds", type=int, default=4)
+    sp.add_argument("--side-len-min", type=int, default=2)
+    sp.add_argument("--side-len-max", type=int, default=3)
+    sp.add_argument("--depth", type=int, default=64)
+    sp.add_argument("--stop", type=int, default=40_000)
+    sp.add_argument("--regdata", action="store_true")
+    sp.add_argument("--hot-iters", type=int, default=5000,
+                    help="Default is large so the program runs past the"
+                         " second simpoint interval (typically icount > 4000).")
+    sp.add_argument("--coverage", action="store_true")
+
+    tt = sub.add_parser(
+        "thread_test",
+        help="End-to-end 2-thread test: parent+child run identical "
+             "atomic-RMW loops, validator asserts both threads visible "
+             "in the trace")
+    common(tt)
+    tt.add_argument("--isa", choices=ISA_CHOICES, action="append",
+                    required=True)
+    tt.add_argument("--build-dir", type=Path, required=True)
+    tt.add_argument("--depth", type=int, default=64)
+    tt.add_argument("--regdata", action="store_true")
 
     return p.parse_args()
 
@@ -289,6 +325,21 @@ def cmd_trace(args, isa: str | None = None) -> int:
         ext = compress_ext[compress]
         outpipe = f"{compress_cmd[compress]} > {out_base}.cst.{ext}"
 
+    # Plugin args (current ChampSim Tracer flag names, v1.11):
+    #   - wpdepth=N            (was: depth=N)
+    #   - trace_window=icount:start=0;stop=N  (was: stop=N)
+    # The 'depth'/'stop' flat flags were dropped when the unified
+    # trace_window= syntax landed; the validator must speak the new
+    # vocabulary or the plugin refuses to load.
+    start_sym = getattr(args, "start_symbol", None)
+    if start_sym:
+        # symbol-based start: tracer triggers on the first hit of
+        # `name` and runs for `simulation` insns.  Note this puts a
+        # non-zero start_insn into the trace header.
+        window_opt = (f"trace_window=symbol:name={start_sym};"
+                      f"simulation={args.stop}")
+    else:
+        window_opt = f"trace_window=icount:start=0;stop={args.stop}"
     if outpipe is not None:
         if "," in outpipe:
             raise SystemExit(
@@ -297,15 +348,17 @@ def cmd_trace(args, isa: str | None = None) -> int:
                 "it instead.")
         plugin_opts = (
             f"outpipe={outpipe},"
-            f"depth={args.depth},stop={args.stop},memdata=1"
+            f"wpdepth={args.depth},{window_opt},memdata=1"
         )
     else:
         plugin_opts = (
             f"outfile={out_base},"
-            f"depth={args.depth},stop={args.stop},memdata=1"
+            f"wpdepth={args.depth},{window_opt},memdata=1"
         )
     if getattr(args, "regdata", False):
         plugin_opts += ",regdata=1"
+    if getattr(args, "iframe_rate", None) is not None:
+        plugin_opts += f",iframe_rate={int(args.iframe_rate)}"
     cmd = [
         str(qemu), "-plugin", f"{plugin},{plugin_opts}", str(bin_path),
     ]
@@ -348,8 +401,17 @@ def cmd_validate(args, isa: str | None = None) -> int:
         print(f"validate[{isa}]: SKIP  missing inputs "
               f"(trace={trace.is_file()}, meta={meta.is_file()})")
         return 0
+    # Symbol-based start: validator can't know the exact icount the
+    # symbol resolves to, so disable the strict header_window check.
+    start_sym = getattr(args, "start_symbol", None)
+    expected_start = None if start_sym else 0
     report = V.validate(meta, trace, bin_path,
-                        wp_insn_budget=getattr(args, "depth", 64))
+                        wp_insn_budget=getattr(args, "depth", 64),
+                        expected_start=expected_start,
+                        expected_stop=getattr(args, "stop", None),
+                        expected_warmup=0,
+                        expected_threads=1,
+                        start_symbol=start_sym)
     print(report.summary())
     return 1 if report.errors() else 0
 
@@ -376,6 +438,142 @@ def cmd_all(args) -> int:
     return rc_total
 
 
+def cmd_thread_test(args) -> int:
+    """End-to-end multi-thread test.
+
+    Builds a hand-written 2-thread program for the requested ISA
+    (parent + child both run identical 1000-iteration atomic-RMW
+    loops; parent spins on the kernel-cleared child-tid slot, then
+    exit_groups), traces it, and validates that the resulting .cst
+    captures both threads:
+
+      * exactly 2 BODY_TAG_REGFILE records (one per thread),
+      * at least one BODY_TAG_THREAD_SWITCH (the threads interleaved),
+      * both thread_ids 0 and 1 contributed CP entries,
+      * sync_hints / wp_events / iframe / encoding-map invariants pass.
+    """
+    from . import _thread_test_asm as TASM
+    rc_total = 0
+    for isa in args.isa:
+        print(f"\n==== thread_test {isa} ====")
+        if isa not in TASM.THREAD_TEST_ASM:
+            print(f"thread_test[{isa}]: SKIP  no template available")
+            continue
+
+        out_dir = Path(args.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        s_path = out_dir / f"thread_test_{isa}.S"
+        bin_path = out_dir / f"thread_test_{isa}"
+        cst_path = out_dir / f"thread_test_{isa}.cst"
+        s_path.write_text(TASM.THREAD_TEST_ASM[isa])
+
+        cc_map = {
+            "x86_64":  ["g++"],
+            "aarch64": ["aarch64-linux-gnu-g++"],
+            "riscv64": ["riscv64-linux-gnu-g++", "-march=rv64gc",
+                        "-mabi=lp64d", "-mno-relax", "-Wl,--no-relax"],
+            "mipsel":  ["mipsel-linux-gnu-g++", "-mno-abicalls",
+                        "-fno-pic", "-e", "_start"],
+        }[isa]
+        build_cmd = cc_map + ["-static", "-nostdlib", "-nostartfiles",
+                              str(s_path), "-o", str(bin_path)]
+        print(f"build[{isa}]: {' '.join(build_cmd)}")
+        rc = subprocess.call(build_cmd)
+        if rc != 0:
+            print(f"thread_test[{isa}]: build FAILED rc={rc}")
+            rc_total = 1
+            continue
+
+        plugin = args.build_dir / "contrib" / "plugins" / "libchampsim_tracer.so"
+        qemu = args.build_dir / f"qemu-{isa}"
+        plugin_opts = f"outfile={bin_path},wpdepth={args.depth},memdata=1"
+        if getattr(args, "regdata", False):
+            plugin_opts += ",regdata=1"
+        cmd = [str(qemu), "-plugin", f"{plugin},{plugin_opts}", str(bin_path)]
+        print(f"trace[{isa}]: {' '.join(cmd)}")
+        rc = subprocess.call(cmd)
+        if rc != 0 or not cst_path.is_file():
+            print(f"thread_test[{isa}]: trace FAILED rc={rc}")
+            rc_total = 1
+            continue
+
+        print(f"validate[{isa}] {cst_path.name}:")
+        report = V.validate_structural(cst_path, expected_threads=2)
+        print(report.summary())
+        if report.errors():
+            rc_total = 1
+    return rc_total
+
+
+def cmd_simpoint_test(args) -> int:
+    """End-to-end segmentation test.
+
+    Generates a synthetic program with a long-running loop, writes a
+    simpoint-selection file picking two intervals, traces them via
+    `trace_window=simpoint:`, and validates each per-segment .cst file
+    independently.  Each segment must be self-decodable: its header
+    re-emits encoding maps and templates, its body starts with a
+    REGFILE record, and the decoder reaches the trailer without
+    leaking state from any other segment (we explicitly *do not*
+    decode them in order — segment N is validated as if segment N-1
+    never existed).
+    """
+    rc_total = 0
+    for isa in args.isa:
+        print(f"\n==== simpoint_test {isa} ====")
+        cmd_generate(args, isa)
+        if cmd_build(args, isa) != 0:
+            rc_total = 1
+            continue
+        prog = _prog_base(args.out_dir, args.prog)
+        bin_path = _bin_path(args.out_dir, prog, isa)
+        out_base = _trace_base(args.out_dir, prog, isa)
+
+        sp_file = Path(f"{out_base}.simpoints")
+        sp_file.write_text("0 0\n2 1\n")
+
+        plugin = args.build_dir / "contrib" / "plugins" / "libchampsim_tracer.so"
+        qemu = args.build_dir / f"qemu-{isa}"
+        interval = max(1000, args.stop // 4)
+        simulation = max(200, args.stop // 16)
+        plugin_opts = (
+            f"outfile={out_base},"
+            f"wpdepth={args.depth},"
+            f"trace_window=simpoint:file={sp_file};"
+            f"interval={interval};simulation={simulation},"
+            f"memdata=1"
+        )
+        if getattr(args, "regdata", False):
+            plugin_opts += ",regdata=1"
+        cmd = [str(qemu), "-plugin", f"{plugin},{plugin_opts}", str(bin_path)]
+        print(f"trace[{isa}]: {' '.join(cmd)}")
+        rc = subprocess.call(cmd)
+        if rc != 0:
+            print(f"trace[{isa}]: FAIL rc={rc}")
+            rc_total = 1
+            continue
+
+        seg_files = sorted(Path(args.out_dir).glob(f"{prog}_{isa}_sp*.cst"))
+        if len(seg_files) < 2:
+            print(f"simpoint_test[{isa}]: FAIL  produced only "
+                  f"{len(seg_files)} segment(s); expected 2 "
+                  f"(program may not run long enough for "
+                  f"interval={interval}; try --hot-iters)")
+            rc_total = 1
+            continue
+
+        # Decode segment 1 (sp1) FIRST and standalone, deliberately not
+        # touching sp0 — proves segment N is independently decodable
+        # without state from segment N-1.
+        for seg in reversed(seg_files):
+            print(f"validate[{isa}] segment {seg.name}:")
+            report = V.validate_structural(seg, expected_threads=1)
+            print(report.summary())
+            if report.errors():
+                rc_total = 1
+    return rc_total
+
+
 # ---------------------------------------------------------------------------
 
 def main() -> int:
@@ -392,6 +590,10 @@ def main() -> int:
         return cmd_validate(args)
     if args.cmd == "all":
         return cmd_all(args)
+    if args.cmd == "simpoint_test":
+        return cmd_simpoint_test(args)
+    if args.cmd == "thread_test":
+        return cmd_thread_test(args)
     return 2
 
 

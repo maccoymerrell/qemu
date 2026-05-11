@@ -45,14 +45,19 @@ from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Decoder import.  The Python decoder has been replaced by the C++
-# cst_decode binary; _cst_decode_runner is a thin sibling-package shim
-# that subprocesses cst_decode --format=legacy and parses its textual
-# output back into the dict / DynParam shapes wptrace_genval expects.
+# cst_decode binary; _cst_decode_runner is a sibling-module shim that
+# subprocesses cst_decode --format=legacy and parses its textual output
+# back into the dict / DynParam shapes the validator expects.
 # ---------------------------------------------------------------------------
 
-_PLUGIN_DIR = Path(__file__).resolve().parent.parent.parent
+# Path layout (post-migration):
+#   <PLUGIN_DIR>/champsim_tracer/                       (plugin source root)
+#       validator/champsim_tracer_validator/<this>.py
+# Walk three levels up to land at contrib/plugins/.
+_PLUGIN_DIR = Path(__file__).resolve().parent.parent.parent.parent
 _PLUGIN_SOURCE_DIR = _PLUGIN_DIR / "champsim_tracer"
-_RUNNER_PATH = _PLUGIN_DIR / "wptrace_genval" / "_cst_decode_runner.py"
+_RUNNER_PATH = (_PLUGIN_SOURCE_DIR / "validator" /
+                "champsim_tracer_validator" / "_cst_decode_runner.py")
 
 
 def _load_decoder():
@@ -872,7 +877,8 @@ def _check_expected_reg_sets(
         blocks_by_id: dict[int, dict],
         pcmap: "PcMap",
         cp_set: set[int],
-        isa: str) -> list[Issue]:
+        isa: str,
+        reg_id_to_name: dict[int, str]) -> list[Issue]:
     """Compare author-declared per-insn src/dst register sets against
     the trace's recorded sets.  Mirrors `_check_static_reg_sets` but
     with the spec coming from the block's `expected_reg_sets` instead
@@ -881,6 +887,10 @@ def _check_expected_reg_sets(
     what we intended — the canonical "typo / unintended encoding"
     bug.  Skipped silently for blocks that don't declare expected
     sets.
+
+    Comparison is by symbolic REG_* name.  @reg_id_to_name comes from
+    the trace's own ENCODINGS section; the validator does not carry a
+    duplicate id↔name table.
     """
     blocks = [b for b in blocks_by_id.values()
               if b["block_id"] in cp_set and b.get("expected_reg_sets")]
@@ -891,18 +901,18 @@ def _check_expected_reg_sets(
             "declaration check skipped",
         )]
 
-    dec = _load_decoder()
-    reg_names_by_id = dec.build_reg_names()
-    # Build {full-name: id, short-name: id} so authors can write either
-    # "REG_SP" or "SP" in expected_reg_sets specs.  build_reg_names()
-    # returns names without the "REG_" prefix (e.g. "SP", "GPR0").
-    reg_id_by_name: dict[str, int] = {}
-    for rid, short in reg_names_by_id.items():
-        reg_id_by_name[short] = rid
-        reg_id_by_name[f"REG_{short}"] = rid
+    # Authors can write either "REG_SP" or "SP"; build the accepted
+    # alias set from the trace's reg map so both forms resolve.
+    valid_names: set[str] = set()
+    for name in reg_id_to_name.values():
+        valid_names.add(name)
+        if name.startswith("REG_"):
+            valid_names.add(name[4:])
 
-    def resolve(name: str) -> int | None:
-        return reg_id_by_name.get(name)
+    def resolve(name: str) -> str | None:
+        if name in valid_names:
+            return name if name.startswith("REG_") else f"REG_{name}"
+        return None
 
     issues: list[Issue] = []
     n_blocks = 0
@@ -957,21 +967,21 @@ def _check_expected_reg_sets(
                 continue
             for spec, idx in zip(specs, idxs[:len(specs)]):
                 ins = insns[idx]
-                exp_src = set()
-                exp_dst = set()
+                exp_src: set[str] = set()
+                exp_dst: set[str] = set()
                 bad_names: list[str] = []
                 for name in spec.get("src", []):
-                    rid = resolve(name)
-                    if rid is None:
+                    canon = resolve(name)
+                    if canon is None:
                         bad_names.append(name)
                     else:
-                        exp_src.add(rid)
+                        exp_src.add(canon)
                 for name in spec.get("dst", []):
-                    rid = resolve(name)
-                    if rid is None:
+                    canon = resolve(name)
+                    if canon is None:
                         bad_names.append(name)
                     else:
-                        exp_dst.add(rid)
+                        exp_dst.add(canon)
                 if bad_names:
                     issues.append(Issue(
                         "expected_reg_sets", "error",
@@ -982,9 +992,14 @@ def _check_expected_reg_sets(
                     ))
                     n_errors += 1
                     continue
-                actual_src = {int(r) for r in ins.get("src_regs", []) or []
+
+                def _name(rid: int) -> str:
+                    name = reg_id_to_name.get(int(rid))
+                    return name if name else f"REG_{int(rid)}"
+
+                actual_src = {_name(r) for r in ins.get("src_regs", []) or []
                               if int(r) != 0}
-                actual_dst = {int(r) for r in ins.get("dst_regs", []) or []
+                actual_dst = {_name(r) for r in ins.get("dst_regs", []) or []
                               if int(r) != 0}
                 n_insns_checked += 1
                 if actual_src == exp_src and actual_dst == exp_dst:
@@ -1020,7 +1035,8 @@ def _check_reg_value_assertions(
         blocks_by_id: dict[int, dict],
         pcmap: "PcMap",
         cp_set: set[int],
-        has_reg_data: bool) -> list[Issue]:
+        has_reg_data: bool,
+        reg_id_to_name: dict[int, str]) -> list[Issue]:
     blocks = [b for b in blocks_by_id.values()
               if b["block_id"] in cp_set and b.get("reg_value_assertions")]
     if not blocks:
@@ -1032,8 +1048,8 @@ def _check_reg_value_assertions(
             "without regdata=1",
         )]
 
-    dec = _load_decoder()
-    reg_id_by_name = {name: rid for rid, name in dec.build_reg_names().items()}
+    # Resolve assertion names via the trace's own `reg` encoding map.
+    reg_id_by_name = {name: int(rid) for rid, name in reg_id_to_name.items()}
     observations: dict[tuple[int, int], list[dict]] = {}
 
     for e in entries:
@@ -1108,6 +1124,8 @@ def _capstone_operand_kinds(isa: str):
 
 
 def _generic_reg_name_to_id() -> dict[str, int]:
+    """Legacy reverse-map.  Use the per-trace encoding map for new code;
+    this only services callers that haven't been migrated yet."""
     dec = _load_decoder()
     return {name: rid for rid, name in dec.build_reg_names().items()}
 
@@ -1125,21 +1143,41 @@ def _capstone_reg_module(isa: str):
     raise ValueError(f"unsupported isa {isa!r}")
 
 
-def _capstone_reg_class_for_isa(isa: str) -> dict[int, tuple[int, ...]]:
-    """Return {Capstone reg enum value: GenericRegId tuple}.
+@dataclasses.dataclass
+class _RegClassEntry:
+    """Per-Capstone-reg generic-name mapping.
 
-    The tracer's C decoder indexes these same generated reg tables by
+    `names` are the GenericRegId names the tracer emits for any
+    operand-access of this Capstone register.  The integer-flags byte
+    rides a side-channel FID (CST_FID_METAFLAGS), not a synthetic
+    dst-register slot, so write-side operand walks compare the same
+    name set as the read side.
+    """
+    names: tuple[str, ...]
+
+
+def _capstone_reg_class_for_isa(isa: str) -> dict[int, _RegClassEntry]:
+    """Return {Capstone reg enum value: _RegClassEntry}.
+
+    The tracer's C decoder indexes these same per-ISA reg tables by
     Capstone enum value.  Parsing them here keeps static register-set
-    validation tied to the active tracer tables instead of maintaining a
-    second Python copy of every ISA's register map.
+    validation tied to the active tracer tables.
+
+    Values are **symbolic name strings** rather than numeric ids — the
+    trace is self-describing (every ENCODINGS section carries its own
+    {gen_id ↔ name} mapping), and a previous numeric-id version of
+    this validator silently broke when the plugin's GenericRegId
+    layout shifted (REG_FLAGS, REG_IP, etc. moved by 25 slots when
+    new register banks landed).  Comparing by name lets the validator
+    track header changes automatically and lets multiple trace
+    versions coexist with no per-version translation table.
     """
     header = _ISA_TO_REG_TABLE.get(isa)
     if header is None:
         raise ValueError(f"unsupported isa {isa!r}")
     cap_mod = _capstone_reg_module(isa)
-    gen_ids = _generic_reg_name_to_id()
     text = (_PLUGIN_SOURCE_DIR / header).read_text()
-    out: dict[int, tuple[int, ...]] = {}
+    out: dict[int, _RegClassEntry] = {}
     entry_re = re.compile(r"\[([A-Z0-9_]+)\]\s*=\s*\{([^\n]*)\},")
     for match in entry_re.finditer(text):
         cap_name = match.group(1)
@@ -1156,27 +1194,39 @@ def _capstone_reg_class_for_isa(isa: str) -> dict[int, tuple[int, ...]]:
             if not reg_match:
                 continue
             reg_names = [reg_match.group(1)]
-        regs = tuple(
-            gen_ids[name] for name in reg_names
-            if name in gen_ids and name != "REG_NONE"
-        )
-        if regs:
-            out[int(cap_id)] = regs
+        names = tuple(n for n in reg_names if n != "REG_NONE")
+        if names:
+            out[int(cap_id)] = _RegClassEntry(names=names)
     return out
 
 
-def _check_static_reg_sets(templates: list[dict], isa: str) -> list[Issue]:
+def _check_static_reg_sets(
+    templates: list[dict],
+    isa: str,
+    reg_id_to_name: dict[int, str],
+) -> list[Issue]:
     """Compare template src/dst register IDs to Capstone ground truth.
 
-    This reconstructs the C decoder's static register discovery rules:
-    explicit register operands use access flags when available, otherwise
-    the first register operand is treated as the destination for opcodes
-    where that convention is valid; memory base/index registers are
-    sources; RISC-V/MIPS Capstone access flags and implicit
-    regs_read/regs_write are skipped because they disagree with the
-    tracer detail path for common pseudos and control-flow forms.  The
-    comparison is set-based because the trace format promises operand
-    identity, not a consumer-visible semantic ordering guarantee.
+    Comparison is **by symbolic name** (REG_FLAGS, REG_IP, …) rather
+    than numeric GenericRegId.  The trace's own ENCODINGS section
+    supplies the per-trace `gen_id → name` mapping in
+    @reg_id_to_name; the validator translates the trace's numeric
+    `src_regs`/`dst_regs` into name sets and compares against the
+    name set the validator builds from Capstone + the per-ISA reg-
+    class table.  This is the design the trace's self-describing
+    format intends — numeric ids may shift as new register banks land
+    but names are stable.
+
+    The C decoder's static discovery rules are otherwise unchanged:
+    explicit register operands use access flags when available,
+    otherwise the first register operand is treated as the
+    destination for opcodes where that convention is valid; memory
+    base/index registers are sources; RISC-V/MIPS Capstone access
+    flags and implicit regs_read/regs_write are skipped because they
+    disagree with the tracer detail path for common pseudos and
+    control-flow forms.  The comparison is set-based because the
+    trace format promises operand identity, not a consumer-visible
+    semantic ordering guarantee.
     """
     md, _op_mem_kind = _make_capstone(isa)
     kinds = _capstone_operand_kinds(isa)
@@ -1199,10 +1249,13 @@ def _check_static_reg_sets(templates: list[dict], isa: str) -> list[Issue]:
     n_skipped = 0
     err_cap = 20
 
-    def add(out: set[int], cap_id: int) -> None:
-        for reg_id in reg_class.get(int(cap_id), ()):
-            if reg_id != 0:
-                out.add(reg_id)
+    def add(out: set[str], cap_id: int) -> None:
+        entry = reg_class.get(int(cap_id))
+        if entry is None:
+            return
+        for reg_name in entry.names:
+            if reg_name and reg_name != "REG_NONE":
+                out.add(reg_name)
 
     for tmpl in templates:
         tid = int(tmpl["template_id"])
@@ -1225,8 +1278,8 @@ def _check_static_reg_sets(templates: list[dict], isa: str) -> list[Issue]:
             opcode_name = opcode_names.get(int(ins.get("opcode", 0)), "?")
             first_is_dst = opcode_name not in first_reg_is_not_dst
             seen_first_reg = False
-            exp_src: set[int] = set()
-            exp_dst: set[int] = set()
+            exp_src: set[str] = set()
+            exp_dst: set[str] = set()
 
             for op in ops:
                 if op.type == op_reg_kind:
@@ -1254,9 +1307,20 @@ def _check_static_reg_sets(templates: list[dict], isa: str) -> list[Issue]:
                 for cap_id in getattr(d, "regs_write", []) or []:
                     add(exp_dst, cap_id)
 
-            actual_src = {int(r) for r in ins.get("src_regs", []) or []
+            # Translate trace's numeric reg ids → symbolic names via
+            # the trace's own ENCODINGS reg map.  Unknown ids (no entry
+            # in the map) get a "REG_<id>" placeholder so the diff is
+            # still legible — but in practice the trace always carries
+            # every id it emits.
+            def _name(rid: int) -> str:
+                name = reg_id_to_name.get(int(rid))
+                if name:
+                    return name
+                return f"REG_{int(rid)}"
+
+            actual_src = {_name(r) for r in ins.get("src_regs", []) or []
                           if int(r) != 0}
-            actual_dst = {int(r) for r in ins.get("dst_regs", []) or []
+            actual_dst = {_name(r) for r in ins.get("dst_regs", []) or []
                           if int(r) != 0}
 
             mnemonic = (getattr(d, "mnemonic", "") or "").lower()
@@ -2135,10 +2199,9 @@ def _reachable_reg_names_for_isa(isa: str) -> set[str]:
     return out
 
 
-def _check_reg_coverage(templates: list[dict], isa: str) -> list[Issue]:
+def _check_reg_coverage(templates: list[dict], isa: str,
+                        reg_id_to_name: dict[int, str]) -> list[Issue]:
     """Emit an info-level GenericRegId coverage summary."""
-    dec = _load_decoder()
-    reg_names = dec.build_reg_names()
     seen_ids: set[int] = set()
     for t in templates:
         for ins in t.get("insns", []):
@@ -2146,7 +2209,7 @@ def _check_reg_coverage(templates: list[dict], isa: str) -> list[Issue]:
             seen_ids.update(int(r) for r in ins.get("dst_regs", []) or [])
 
     seen_names = sorted(
-        reg_names.get(i, f"REG_{i}")
+        reg_id_to_name.get(i, f"REG_{i}")
         for i in seen_ids if i != 0
     )
 
@@ -2183,7 +2246,8 @@ def _check_wrong_path_chains(entries: list[dict],
                              blocks_by_id: dict[int, dict],
                              wp_insn_budget: int = 64,
                              helper_leaf_n_insns: int = 0,
-                             isa: str = "") -> list[Issue]:
+                             isa: str = "",
+                             cp_pos_offset: int = 0) -> list[Issue]:
     """For every CP position predicted to fork, walk the trace's
     ``wp_entries`` for that block's TB and compare the distinct-block
     sequence against the predicted ``wp_chain`` as a prefix.
@@ -2245,7 +2309,11 @@ def _check_wrong_path_chains(entries: list[dict],
         if not advanced:
             continue
 
-        key = str(cp_pos)
+        # `wrong_paths` is keyed by the *original* CP position
+        # (cp_exec_index from the generator).  Symbol-based start
+        # trimmed the prefix off correct_path, so add the offset to
+        # recover the original index.
+        key = str(cp_pos + cp_pos_offset)
         if key not in wrong_paths:
             continue
 
@@ -2461,12 +2529,833 @@ def _meta_cp_successor(bid: int, correct_path: list[int]) -> int | None:
 
 
 # ---------------------------------------------------------------------------
+# Structural / header / cadence checks
+# ---------------------------------------------------------------------------
+
+
+def _check_encoding_map_completeness(
+        templates: list[dict],
+        trace_meta: dict) -> list[Issue]:
+    """Every numeric id appearing in a template (reg/opcode/branch_type)
+    or referenced on the wire must carry an entry in the matching
+    encoding map.  An id without a name implies the writer emitted a
+    value its own map can't describe — a self-describing-format
+    invariant violation.
+    """
+    issues: list[Issue] = []
+    maps = trace_meta.get("encoding_maps", {})
+    reg_map = maps.get("reg", {})
+    opc_map = maps.get("opcode", {})
+    br_map  = maps.get("branch_type", {})
+
+    missing_reg: set[int] = set()
+    missing_opc: set[int] = set()
+    missing_br:  set[int] = set()
+
+    for t in templates:
+        for I in t.get("insns", []):
+            op = int(I.get("opcode", 0))
+            if op and op not in opc_map:
+                missing_opc.add(op)
+            bt = int(I.get("branch_type", 0))
+            if bt and bt not in br_map:
+                missing_br.add(bt)
+            for rid in I.get("src_regs", []):
+                rid = int(rid)
+                if rid and rid not in reg_map:
+                    missing_reg.add(rid)
+            for rid in I.get("dst_regs", []):
+                rid = int(rid)
+                if rid and rid not in reg_map:
+                    missing_reg.add(rid)
+
+    if missing_reg:
+        issues.append(Issue(
+            "encoding_map_completeness", "error",
+            f"trace emits {len(missing_reg)} register id(s) with no entry "
+            f"in the `reg` encoding map: "
+            f"{sorted(missing_reg)[:10]}",
+            {"missing_reg_ids": sorted(missing_reg)},
+        ))
+    if missing_opc:
+        issues.append(Issue(
+            "encoding_map_completeness", "error",
+            f"trace emits {len(missing_opc)} opcode id(s) with no entry "
+            f"in the `opcode` encoding map: {sorted(missing_opc)[:10]}",
+            {"missing_opcode_ids": sorted(missing_opc)},
+        ))
+    if missing_br:
+        issues.append(Issue(
+            "encoding_map_completeness", "error",
+            f"trace emits {len(missing_br)} branch_type id(s) with no "
+            f"entry in the `branch_type` encoding map: "
+            f"{sorted(missing_br)[:10]}",
+            {"missing_branch_ids": sorted(missing_br)},
+        ))
+    # Detect writer-side fallback names (the encoder fell out of its
+    # own name tables and emitted a placeholder).  Real entries are
+    # symbolic ("REG_GPR0", "GEN_OP_LOAD"); fallbacks look like
+    # "REG_<n>" / "OP_<n>" / "BR_<n>" / "FID_0x<n>" / "UNKNOWN_<n>".
+    fallback_re = re.compile(r"^(REG_|OP_|BR_|FID_0x|UNKNOWN_)\d")
+    fallback_names: dict[str, list[str]] = {}
+    for map_name in ("reg", "opcode", "branch_type", "field_id",
+                     "sync_hint", "body_tag", "header_flag",
+                     "insn_flag", "wp_event_flag", "metaflags"):
+        m = maps.get(map_name, {})
+        bad = [v for v in m.values() if fallback_re.match(v)]
+        if bad:
+            fallback_names[map_name] = bad
+    if fallback_names:
+        issues.append(Issue(
+            "encoding_map_completeness", "error",
+            f"encoding map(s) contain fallback names (writer fell out "
+            f"of its name tables): {fallback_names}",
+            {"fallback_names": fallback_names},
+        ))
+        return issues
+
+    if not (missing_reg or missing_opc or missing_br):
+        issues.append(Issue(
+            "encoding_map_completeness", "info",
+            f"encoding maps name every id observed and contain no "
+            f"writer-side fallbacks: reg={len(reg_map)}, "
+            f"opcode={len(opc_map)}, branch_type={len(br_map)}",
+        ))
+    return issues
+
+
+_IFRAME_RATE_RE = re.compile(r"iframe_rate=(\d+)")
+
+
+def _parse_iframe_rate_from_command(cmd: str) -> int:
+    """Extract iframe_rate from the trace's command string.  Returns
+    the plugin's default (100000) if not configured."""
+    m = _IFRAME_RATE_RE.search(cmd or "")
+    return int(m.group(1)) if m else 100000
+
+
+def _check_header_window(trace_meta: dict,
+                         expected_start: int | None,
+                         expected_stop: int | None,
+                         expected_warmup: int | None,
+                         start_symbol: str | None = None) -> list[Issue]:
+    """Cross-check the header's start/warmup/total_target_insns
+    against the values the caller asked the tracer to use.
+
+    When @start_symbol is set, the exact icount the symbol resolves
+    to is not predictable, so this check only asserts start_insn > 0
+    and the total/warmup invariants."""
+    issues: list[Issue] = []
+    actual_start  = int(trace_meta.get("start_insn", 0))
+    actual_warm   = int(trace_meta.get("warmup_insns", 0))
+    actual_total  = int(trace_meta.get("total_target_insns", 0))
+
+    if start_symbol is not None:
+        # Symbol-based start: just assert that the trace actually fired
+        # (start_insn > 0 means the symbol was reached).
+        if actual_start == 0:
+            issues.append(Issue(
+                "header_window", "error",
+                f"trace was launched with start-symbol={start_symbol!r} "
+                f"but start_insn=0 in header; the symbol was never hit "
+                f"(typo or weak/visibility-hidden symbol?)",
+                {"start_symbol": start_symbol,
+                 "actual_start": actual_start},
+            ))
+    elif expected_start is not None and actual_start != expected_start:
+        issues.append(Issue(
+            "header_window", "error",
+            f"header start_insn={actual_start} but trace invocation "
+            f"requested start={expected_start}",
+            {"actual": actual_start, "expected": expected_start},
+        ))
+    if expected_warmup is not None and actual_warm != expected_warmup:
+        issues.append(Issue(
+            "header_window", "error",
+            f"header warmup_insns={actual_warm} but trace invocation "
+            f"requested warmup={expected_warmup}",
+            {"actual": actual_warm, "expected": expected_warmup},
+        ))
+    if expected_stop is not None and expected_start is not None:
+        expected_total = expected_stop - expected_start
+        if actual_total != expected_total:
+            issues.append(Issue(
+                "header_window", "error",
+                f"header total_target_insns={actual_total} but trace "
+                f"invocation requested stop-start={expected_total}",
+                {"actual": actual_total, "expected": expected_total},
+            ))
+    if not issues:
+        issues.append(Issue(
+            "header_window", "info",
+            f"header window matches: start={actual_start}, "
+            f"warmup={actual_warm}, total_target={actual_total}",
+        ))
+    return issues
+
+
+def _check_iframe_cadence(body_stats: dict,
+                          cp_entries: list[dict],
+                          trace_meta: dict) -> list[Issue]:
+    """The writer emits an IFRAME per `iframe_rate` *per-template*
+    emissions (`tmpl->emit_count % iframe_rate == 0`).  So whether an
+    IFRAME should appear depends on the hottest template's hit count,
+    not the total CP entry count.
+
+    Structural validation of each IFRAME (CP dyn_params + reg_snaps +
+    metaflags + full WP chain + WP events all match the prior ENTRY)
+    happens inside cst_decode's BodyWalker via validate_iframe().
+    Any divergence throws an exception at decode time, surfacing as a
+    decode-stage failure before we ever get here — so reaching this
+    check means every IFRAME the writer emitted matched its ENTRY
+    byte-for-byte.  This function only verifies the *count*.
+
+    Required count invariants:
+      * iframe_count <= cp_entries (sanity).
+      * If any single template was emitted >= iframe_rate times, at
+        least one IFRAME must have fired.
+      * iframe_count must equal sum(per_template_hits // iframe_rate).
+    """
+    issues: list[Issue] = []
+    cp = int(body_stats.get("cp_entries", 0))
+    iframes = int(body_stats.get("iframe_count", 0))
+    rate = _parse_iframe_rate_from_command(trace_meta.get("command", ""))
+
+    if iframes > cp:
+        issues.append(Issue(
+            "iframe_cadence", "error",
+            f"iframe_count={iframes} exceeds cp_entries={cp}; "
+            f"writer can't have validated more IFRAMEs than CP entries",
+            {"iframes": iframes, "cp_entries": cp},
+        ))
+        return issues
+
+    # Per-template hit counter (the trace's actual emission distribution).
+    hits: dict[int, int] = {}
+    for e in cp_entries:
+        tid = int(e.get("template_id", 0))
+        hits[tid] = hits.get(tid, 0) + 1
+    max_hits = max(hits.values()) if hits else 0
+    expected_floor = sum(h // rate for h in hits.values()) if rate > 0 else 0
+
+    if rate > 0 and max_hits >= rate and iframes == 0:
+        issues.append(Issue(
+            "iframe_cadence", "error",
+            f"hottest template was emitted {max_hits} times with "
+            f"iframe_rate={rate}, so at least one IFRAME should have "
+            f"fired, but iframe_count=0",
+            {"max_template_hits": max_hits, "iframe_rate": rate,
+             "iframes": iframes},
+        ))
+        return issues
+    if rate > 0 and iframes != expected_floor:
+        issues.append(Issue(
+            "iframe_cadence", "error",
+            f"iframe_count={iframes} disagrees with the per-template "
+            f"hit floor sum(hits // {rate}) = {expected_floor}",
+            {"iframes": iframes, "expected": expected_floor,
+             "iframe_rate": rate, "max_template_hits": max_hits},
+        ))
+        return issues
+
+    issues.append(Issue(
+        "iframe_cadence", "info",
+        f"iframe_count={iframes} matches per-template hit distribution "
+        f"(rate={rate}, max_hits={max_hits}, cp_entries={cp}); each "
+        f"IFRAME's contents were already validated against its ENTRY "
+        f"during decode",
+        {"iframes": iframes, "cp_entries": cp, "iframe_rate": rate,
+         "max_template_hits": max_hits},
+    ))
+    return issues
+
+
+def _check_regfile_records(body_stats: dict,
+                           expected_threads: int = 1) -> list[Issue]:
+    """A BODY_TAG_REGFILE record must precede each thread's first
+    BODY_TAG_ENTRY in the segment.  Single-segment, single-thread
+    traces should therefore carry exactly one REGFILE.  Multi-thread
+    runs scale to one per (thread, segment)."""
+    actual = int(body_stats.get("regfile_count", 0))
+    if actual != expected_threads:
+        return [Issue(
+            "regfile_records", "error",
+            f"regfile_count={actual}, expected {expected_threads} "
+            f"(one per (segment, thread))",
+            {"actual": actual, "expected": expected_threads},
+        )]
+    return [Issue(
+        "regfile_records", "info",
+        f"regfile_count={actual}",
+    )]
+
+
+def _check_wp_events(body_stats: dict,
+                     cp_entries: list[dict]) -> list[Issue]:
+    """Verify the writer's BODY_STATS WP-event tallies match a walk
+    of the per-entry wp_entries lists.  These are the WP_EVENT_FAULT
+    and WP_EVENT_TRANSLATION_UNAVAIL flags surfaced when a WP-path
+    insn was about to execute something that would fault (e.g., div
+    by zero, code on an unmapped page, syscall in user-mode).
+
+    Walking ensures the writer's runtime counter agrees with the
+    per-WP-entry payload that was actually encoded.
+    """
+    walk_faults  = 0
+    walk_translu = 0
+    for e in cp_entries:
+        for wp in e.get("wp_entries") or []:
+            if wp.get("fault"):
+                walk_faults += 1
+            if wp.get("translation_unavailable"):
+                walk_translu += 1
+
+    body_faults  = int(body_stats.get("fault_count", 0))
+    body_translu = int(body_stats.get("translation_unavail_count", 0))
+    if (walk_faults, walk_translu) != (body_faults, body_translu):
+        return [Issue(
+            "wp_events", "error",
+            f"WP event counts disagree with per-entry walk: "
+            f"writer={{fault: {body_faults}, "
+            f"translation_unavail: {body_translu}}}, "
+            f"walk={{fault: {walk_faults}, "
+            f"translation_unavail: {walk_translu}}}",
+            {"body_stats": {"fault": body_faults,
+                            "translation_unavail": body_translu},
+             "walk": {"fault": walk_faults,
+                      "translation_unavail": walk_translu}},
+        )]
+    return [Issue(
+        "wp_events", "info",
+        f"WP events: fault={body_faults}, "
+        f"translation_unavail={body_translu}",
+        {"fault": body_faults, "translation_unavail": body_translu},
+    )]
+
+
+def _check_thread_switch_absent(body_stats: dict,
+                                expected_threads: int = 1) -> list[Issue]:
+    """Single-thread test programs must never produce BODY_TAG_THREAD_SWITCH
+    records.  Multi-thread traces are expected to; multi-thread runs
+    must produce at least one switch (otherwise the threads never
+    interleaved and we aren't actually testing multi-thread tracing)."""
+    actual = int(body_stats.get("thread_switch_count", 0))
+    if expected_threads == 1 and actual != 0:
+        return [Issue(
+            "thread_switch", "error",
+            f"thread_switch_count={actual} on a single-thread trace; "
+            f"writer should not emit BODY_TAG_THREAD_SWITCH when there "
+            f"is only one vCPU contributing entries",
+            {"actual": actual},
+        )]
+    if expected_threads > 1 and actual == 0:
+        return [Issue(
+            "thread_switch", "error",
+            f"expected multi-thread trace ({expected_threads} threads) "
+            f"but thread_switch_count=0; no thread interleaving was "
+            f"captured — qemu-user may have run threads serially or "
+            f"the program never spawned the second thread",
+            {"actual": actual, "expected_threads": expected_threads},
+        )]
+    return [Issue(
+        "thread_switch", "info",
+        f"thread_switch_count={actual} (expected_threads={expected_threads})",
+    )]
+
+
+def _check_thread_distribution(entries: list[dict],
+                               expected_threads: int) -> list[Issue]:
+    """Verify the trace's per-thread entry counts add up sensibly:
+    every expected thread contributed at least one entry, and every
+    observed thread_id was within range [0, expected_threads)."""
+    counts: dict[int, int] = {}
+    for e in entries:
+        tid = int(e.get("thread_id", 0))
+        counts[tid] = counts.get(tid, 0) + 1
+    if expected_threads > 1:
+        missing = [tid for tid in range(expected_threads)
+                   if counts.get(tid, 0) == 0]
+        if missing:
+            return [Issue(
+                "thread_distribution", "error",
+                f"expected_threads={expected_threads} but threads "
+                f"{missing} contributed zero entries to the trace",
+                {"observed_counts": counts, "missing": missing},
+            )]
+    extras = [tid for tid in counts if tid >= expected_threads]
+    if extras:
+        return [Issue(
+            "thread_distribution", "error",
+            f"trace contains entries from thread_id(s) >= expected_"
+            f"threads={expected_threads}: {extras}",
+            {"observed_counts": counts,
+             "expected_threads": expected_threads},
+        )]
+    return [Issue(
+        "thread_distribution", "info",
+        f"per-thread entry counts: {counts}",
+        {"counts": counts},
+    )]
+
+
+def _check_sync_hints(body_stats: dict,
+                      all_entries: list[dict],
+                      templates_by_id: dict[int, dict],
+                      trace_meta: dict) -> list[Issue]:
+    """Verify the writer's aggregated sync_hint_counts (BODY_STATS)
+    matches the per-template-insn sync_hint values rolled across
+    every CP+WP entry in the body stream (including prologue —
+    body_stats aggregates everything, not just post-cp_start).
+
+    Any divergence means the writer's runtime aggregation disagrees
+    with what its own templates declare, which would be a tracer bug
+    (template_id flag-byte vs entry-time stats counter).
+    """
+    expected: dict[int, int] = {}
+    # Match the writer's BodyStats aggregation: walk *every* insn in
+    # every template touched by CP+WP entries (writer iterates the
+    # full template even when WP truncates after a fault).
+    def _count(tmpl_id: int) -> None:
+        t = templates_by_id.get(int(tmpl_id))
+        if t is None:
+            return
+        for ins in t.get("insns") or []:
+            h = int(ins.get("sync_hint", 0))
+            expected[h] = expected.get(h, 0) + 1
+
+    for e in all_entries:
+        _count(int(e["template_id"]))
+        for wp in e.get("wp_entries") or []:
+            _count(int(wp["template_id"]))
+
+    actual = {int(k): int(v) for k, v in (
+        body_stats.get("sync_hint_counts") or {}).items()}
+    name_map = trace_meta.get("sync_hint_names") or {}
+
+    if expected != actual:
+        def named(d):
+            return {name_map.get(k, f"SYNC_{k}"): v for k, v in d.items()}
+        return [Issue(
+            "sync_hints", "error",
+            f"sync_hint_counts disagree with per-template walk: "
+            f"writer={named(actual)} static_walk={named(expected)}",
+            {"actual": actual, "expected": expected},
+        )]
+    # Surface the per-name distribution so atomic-emitting workloads
+    # are observable in the report.
+    return [Issue(
+        "sync_hints", "info",
+        f"sync_hint distribution matches static template walk: "
+        f"{ {name_map.get(k, f'SYNC_{k}'): v for k, v in actual.items()} }",
+        {"counts": actual},
+    )]
+
+
+# ---------------------------------------------------------------------------
+# Metaflags + general regdata reconstruction
+# ---------------------------------------------------------------------------
+
+
+# Opcode names whose dst-flags semantics we know how to predict.  Z and
+# N are universal (function only of the result); P is x86-only.  C/V
+# require operand history we don't always have, so they are excluded
+# from the per-insn reconstruction.  MUL/DIV/SHIFT excluded because
+# their flag behavior is either undefined (x86 MUL/DIV) or depends on
+# operand history (SHIFT with non-immediate count).
+_FLAG_WRITING_OPCODES = {
+    "GEN_OP_INT_ADD", "GEN_OP_INT_SUB",
+    "GEN_OP_AND",     "GEN_OP_OR",      "GEN_OP_XOR",
+    "GEN_OP_CMP",     "GEN_OP_TEST",
+}
+
+
+def _operand_width_bits(insn: dict, isa: str) -> int:
+    """Width of the integer-flags-relevant result for this insn.
+    Falls back to 64-bit if we can't infer from the raw bytes."""
+    raw = insn.get("raw_bytes") or b""
+    if isa == "x86_64":
+        # REX.W (0x48) prefix → 64-bit; 0x66 → 16-bit; default 32-bit.
+        # We don't try to handle the full prefix grammar; the common
+        # cases the test programs emit are REX.W-tagged or default.
+        b = bytes(raw)
+        if any((p & 0xF8) == 0x48 for p in b[:4]):
+            return 64
+        if b and b[0] == 0x66:
+            return 16
+        return 32
+    if isa == "aarch64":
+        # AArch64 NZCV cares about the destination register width; the
+        # bottom bit of the opcode word's "sf" field selects 64/32.
+        if len(raw) >= 4:
+            return 64 if (raw[3] & 0x80) else 32
+        return 64
+    return 64
+
+
+def _popcount_low_byte_parity(val: int) -> int:
+    """x86 PF bit: 1 if low byte of result has an even number of set bits."""
+    b = val & 0xFF
+    return 1 if bin(b).count("1") % 2 == 0 else 0
+
+
+def _check_metaflags(
+        cp_entries: list[dict],
+        templates_by_id: dict[int, dict],
+        opcode_names: dict[int, str],
+        isa: str,
+        reg_id_to_name: dict[int, str],
+        has_reg_data: bool) -> list[Issue]:
+    """For every insn whose template writes REG_FLAGS, the trace
+    emits a CST_FID_METAFLAGS byte under a known per-ISA bit layout.
+    Reconstruct the Z, N, and P bits from the destination register
+    snap (which is the result of the operation) and assert they match
+    the trace's metaflags byte.
+
+    C and V depend on operand history we don't always have, so the
+    check only fails on Z/N/P divergences.  An issue with Z/N/P
+    implies either:
+      * the metaflags mapper has the wrong bit shuffle for this ISA,
+      * the writer captured stale flags (CPU lazy-flags bug), or
+      * the writer attached the byte to the wrong insn.
+    """
+    if not has_reg_data:
+        return [Issue(
+            "metaflags", "info",
+            "metaflags validation skipped (no regdata=1)",
+        )]
+    # Look up REG_FLAGS' numeric id from the trace's own reg map.
+    name_to_id = {v: int(k) for k, v in reg_id_to_name.items()}
+    flags_id = name_to_id.get("REG_FLAGS")
+    if flags_id is None:
+        return [Issue(
+            "metaflags", "info",
+            "trace has no REG_FLAGS entry; metaflags not applicable",
+        )]
+
+    opc_names = {}  # rebuilt below from the trace
+    issues: list[Issue] = []
+    n_checked = 0
+    n_errors  = 0
+    err_cap   = 20
+
+    for e in cp_entries:
+        tmpl = templates_by_id.get(int(e["template_id"]))
+        if tmpl is None:
+            continue
+        mf_by_insn = {int(m["insn_index"]): int(m["byte"])
+                      for m in (e.get("metaflags") or [])}
+        if not mf_by_insn:
+            continue
+        # Build {(insn_idx, reg_id) -> snap} so we can find the dst
+        # result for each insn.
+        snap_idx: dict[tuple[int, int], dict] = {}
+        for s in (e.get("reg_snaps") or []):
+            snap_idx[(int(s["insn_index"]), int(s["reg_id"]))] = s
+
+        for ipos, I in enumerate(tmpl.get("insns") or []):
+            if ipos not in mf_by_insn:
+                continue
+            dsts = [int(r) for r in (I.get("dst_regs") or [])]
+            if flags_id not in dsts:
+                # The writer emitted metaflags for an insn that
+                # doesn't write REG_FLAGS — that's the bug we just
+                # fixed; assert it stays fixed.
+                issues.append(Issue(
+                    "metaflags", "error",
+                    f"template BB{tmpl['template_id']} insn[{ipos}]: "
+                    f"metaflags byte present but REG_FLAGS not in "
+                    f"dst_regs={[reg_id_to_name.get(r, r) for r in dsts]}",
+                    {"template_id": tmpl["template_id"], "insn": ipos},
+                ))
+                continue
+            # Only predict flags for opcodes with known arithmetic
+            # semantics whose first GPR dst IS the operation result.
+            # Skips SYSCALL (kernel-set flags), branches that just
+            # happen to also clobber flags via a side-effect, etc.
+            op_id = int(I.get("opcode", 0))
+            op_name = opcode_names.get(op_id, "")
+            if op_name not in _FLAG_WRITING_OPCODES:
+                continue
+            # Predicted Z/N/P from the *non-flags* dst result.  When
+            # an insn writes both REG_FLAGS and a GPR (the common
+            # case: add/sub/and/or/xor), the GPR snap *is* the result.
+            # CMP/TEST write only flags, so there's no GPR snap to
+            # check against — Z/N/P verification is skipped.
+            gpr_dsts = [r for r in dsts if r != flags_id]
+            if not gpr_dsts:
+                continue
+            result_reg = gpr_dsts[0]
+            snap = snap_idx.get((ipos, result_reg))
+            if snap is None:
+                continue
+            result = _reg_snap_value(snap)
+            width = _operand_width_bits(I, isa)
+            mask  = (1 << width) - 1
+            r_low = result & mask
+            sign_bit = (r_low >> (width - 1)) & 1
+
+            mf = mf_by_insn[ipos]
+            mf_z = (mf >> 0) & 1
+            mf_n = (mf >> 1) & 1
+            mf_p = (mf >> 4) & 1
+
+            exp_z = 1 if r_low == 0 else 0
+            exp_n = sign_bit
+            exp_p = _popcount_low_byte_parity(r_low) if isa == "x86_64" \
+                    else mf_p  # AArch64 has no parity bit; trust trace
+
+            n_checked += 1
+            if mf_z != exp_z or mf_n != exp_n or (
+                    isa == "x86_64" and mf_p != exp_p):
+                n_errors += 1
+                if n_errors <= err_cap:
+                    issues.append(Issue(
+                        "metaflags", "error",
+                        f"BB{tmpl['template_id']} insn[{ipos}] "
+                        f"(0x{int(I.get('pc', 0)):x}): "
+                        f"trace mflags=0x{mf:02x} "
+                        f"Z={mf_z}/N={mf_n}/P={mf_p}, expected "
+                        f"Z={exp_z}/N={exp_n}/P={exp_p} from "
+                        f"{reg_id_to_name.get(result_reg, result_reg)}="
+                        f"0x{r_low:x} ({width}-bit)",
+                        {"template_id": tmpl["template_id"], "insn": ipos,
+                         "trace_mflags": mf, "expected_znp":
+                            {"Z": exp_z, "N": exp_n, "P": exp_p},
+                         "result": r_low, "width": width},
+                    ))
+
+    if n_errors == 0:
+        issues.append(Issue(
+            "metaflags", "info",
+            f"{n_checked} flag-writing insn(s) had Z/N/P bits matching "
+            f"the trace's metaflags byte",
+        ))
+    elif n_errors > err_cap:
+        issues.append(Issue(
+            "metaflags", "info",
+            f"... {n_errors - err_cap} additional metaflags errors suppressed",
+        ))
+    return issues
+
+
+def _check_regdata_reconstruction(
+        cp_entries: list[dict],
+        templates_by_id: dict[int, dict],
+        opcode_names: dict[int, str],
+        reg_id_to_name: dict[int, str],
+        has_reg_data: bool) -> list[Issue]:
+    """For arithmetic insns whose semantics we know how to model, take
+    the *prior* dst snap of each src register as the operand value,
+    compute the expected result, and compare to the trace's dst snap.
+
+    Tracks a per-(thread, reg_id) "latest observed value" map.  Initial
+    register state is whatever the architectural ABI seeds (the
+    BODY_TAG_REGFILE record) — we don't have a clean Python view of
+    those bytes here, so the first observation of any register
+    bootstraps from the trace itself rather than reporting an error.
+
+    Limited to GEN_OP_INT_ADD / SUB / AND / OR / XOR with two GPR
+    sources.  Loads, stores, shifts with non-const counts, and
+    flag-writing ops without two named GPR sources are skipped.
+    """
+    if not has_reg_data:
+        return [Issue(
+            "regdata_reconstruction", "info",
+            "regdata reconstruction skipped (no regdata=1)",
+        )]
+
+    name_to_id = {v: int(k) for k, v in reg_id_to_name.items()}
+    flags_id = name_to_id.get("REG_FLAGS")
+
+    # Inverse opcode-name map: numeric id → name.
+    issues: list[Issue] = []
+    n_checked = 0
+    n_errors  = 0
+    err_cap   = 20
+
+    # Each handler is (compute, commutative).  Commutative ops can
+    # ignore operand order; non-commutative (SUB) need to know which
+    # src is the "minuend" — for 2-operand forms (x86 `sub src, dst`
+    # → src_regs=[src, dst_also_src]) the minuend is whichever src
+    # also appears as a dst; for 3-operand forms (aarch64
+    # `sub dst, lhs, rhs` → src_regs=[lhs, rhs]) the minuend is src[0].
+    handlers = {
+        "GEN_OP_INT_ADD": (lambda a, b, m: (a + b) & m, True),
+        "GEN_OP_INT_SUB": (lambda a, b, m: (a - b) & m, False),
+        "GEN_OP_AND":     (lambda a, b, m: (a & b) & m, True),
+        "GEN_OP_OR":      (lambda a, b, m: (a | b) & m, True),
+        "GEN_OP_XOR":     (lambda a, b, m: (a ^ b) & m, True),
+    }
+
+    # Per-thread current register state.
+    reg_state: dict[tuple[int, int], int] = {}
+
+    for e in cp_entries:
+        tid  = int(e.get("thread_id", 0))
+        tmpl = templates_by_id.get(int(e["template_id"]))
+        if tmpl is None:
+            continue
+        snap_idx: dict[tuple[int, int], dict] = {}
+        for s in (e.get("reg_snaps") or []):
+            snap_idx[(int(s["insn_index"]), int(s["reg_id"]))] = s
+
+        for ipos, I in enumerate(tmpl.get("insns") or []):
+            op_id = int(I.get("opcode", 0))
+            op_name = opcode_names.get(op_id, "")
+            srcs = [int(r) for r in (I.get("src_regs") or [])]
+            dsts = [int(r) for r in (I.get("dst_regs") or [])]
+            gpr_dsts = [r for r in dsts
+                        if flags_id is None or r != flags_id]
+            # Atomic RMW (lock xadd, ldadd, amoadd, ll/sc, …) has the
+            # dst-reg semantically loaded from memory rather than
+            # computed from src operands.  The sync_hint marker is
+            # what distinguishes these; skip reconstruction for them.
+            sync_hint = int(I.get("sync_hint", 0))
+            if sync_hint != 0:
+                for r in gpr_dsts:
+                    snap = snap_idx.get((ipos, r))
+                    if snap is not None:
+                        reg_state[(tid, r)] = _reg_snap_value(snap)
+                continue
+            # We need exactly two GPR sources and at least one GPR dst
+            # to predict the result.  Many real-world insns have
+            # implicit sources (CF as a carry-in for ADC, the
+            # multiplicand for x86 MUL, etc.) which we can't model
+            # without per-opcode semantics tables — skip those.
+            # Update reg_state for any dst snap regardless of whether
+            # we'll verify this insn — the chain that comes next still
+            # needs the current values.  Skip the rest of the loop body
+            # for any insn we don't model.
+            def _commit_dst_state() -> None:
+                for r in gpr_dsts:
+                    snap = snap_idx.get((ipos, r))
+                    if snap is not None:
+                        reg_state[(tid, r)] = _reg_snap_value(snap)
+
+            if op_name not in handlers:
+                _commit_dst_state()
+                continue
+            if len(srcs) != 2 or not gpr_dsts:
+                _commit_dst_state()
+                continue
+            compute, commutative = handlers[op_name]
+            # Reorder for non-commutative ops so `a` is the minuend.
+            # 2-op form: the dst-also-src reg is the minuend → put it
+            # first.  3-op form: src[0] is already the minuend.
+            ordered_srcs = list(srcs)
+            if not commutative:
+                if srcs[1] in dsts and srcs[0] not in dsts:
+                    ordered_srcs = [srcs[1], srcs[0]]
+            a = reg_state.get((tid, ordered_srcs[0]))
+            b = reg_state.get((tid, ordered_srcs[1]))
+            if a is None or b is None:
+                # Bootstrap: take whatever the trace says this dst is
+                # so subsequent ops can chain.
+                for r in gpr_dsts:
+                    snap = snap_idx.get((ipos, r))
+                    if snap is not None:
+                        reg_state[(tid, r)] = _reg_snap_value(snap)
+                continue
+            width = 64  # GP-default; could refine per-insn but the
+                       # GPR snap is always 64-bit-padded on the wire.
+            mask  = (1 << width) - 1
+            expected = compute(a & mask, b & mask, mask)
+            for r in gpr_dsts:
+                snap = snap_idx.get((ipos, r))
+                if snap is None:
+                    continue
+                got = _reg_snap_value(snap) & mask
+                n_checked += 1
+                if got != expected:
+                    n_errors += 1
+                    if n_errors <= err_cap:
+                        issues.append(Issue(
+                            "regdata_reconstruction", "error",
+                            f"BB{tmpl['template_id']} insn[{ipos}] "
+                            f"(0x{int(I.get('pc', 0)):x}) {op_name}: "
+                            f"trace dst="
+                            f"{reg_id_to_name.get(r, r)}=0x{got:x}, "
+                            f"expected 0x{expected:x} from "
+                            f"{reg_id_to_name.get(ordered_srcs[0], ordered_srcs[0])}"
+                            f"=0x{a & mask:x}, "
+                            f"{reg_id_to_name.get(ordered_srcs[1], ordered_srcs[1])}"
+                            f"=0x{b & mask:x}",
+                            {"template_id": tmpl["template_id"],
+                             "insn": ipos, "opcode": op_name,
+                             "got": got, "expected": expected,
+                             "a": a & mask, "b": b & mask},
+                        ))
+                # Update state regardless — the chain continues.
+                reg_state[(tid, r)] = _reg_snap_value(snap)
+
+    if n_errors == 0:
+        issues.append(Issue(
+            "regdata_reconstruction", "info",
+            f"reconstructed {n_checked} arithmetic dst value(s) "
+            f"matched the trace's regdata snaps",
+        ))
+    elif n_errors > err_cap:
+        issues.append(Issue(
+            "regdata_reconstruction", "info",
+            f"... {n_errors - err_cap} additional regdata errors suppressed",
+        ))
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# Structural-only validation (no correct_path / no meta.json needed).
+# ---------------------------------------------------------------------------
+
+
+def validate_structural(trace_path: Path,
+                        expected_threads: int = 1) -> Report:
+    """Decode @trace_path and run only the checks that don't depend on
+    the generator's meta.json (correct_path, blocks, wrong_paths).
+
+    Used by the segmentation test, where each per-simpoint .cst file
+    is a standalone trace that begins mid-program and shouldn't be
+    asked to validate the original CFG.  Asserts the trace is
+    internally consistent: encoding maps are complete, sync_hints and
+    wp_events agree between writer-aggregate and per-entry walk,
+    IFRAMEs match their ENTRYs (already enforced by the decoder),
+    REGFILE record(s) present, no unexpected thread_switch on
+    single-thread runs.
+    """
+    dec = _load_decoder()
+    trace_meta, templates, entries = dec.decode_champsim_tracer(trace_path)
+    issues: list[Issue] = []
+    stats: dict = {
+        "trace_templates": len(templates),
+        "trace_entries": len(entries),
+    }
+
+    issues += _check_encoding_map_completeness(templates, trace_meta)
+
+    body_stats = trace_meta.get("body_stats") or {}
+    stats["body_stats"] = body_stats
+    templates_by_id = {t["template_id"]: t for t in templates}
+    issues += _check_iframe_cadence(body_stats, entries, trace_meta)
+    issues += _check_regfile_records(body_stats, expected_threads)
+    issues += _check_thread_switch_absent(body_stats, expected_threads)
+    issues += _check_thread_distribution(entries, expected_threads)
+    issues += _check_wp_events(body_stats, entries)
+    issues += _check_sync_hints(body_stats, entries,
+                                 templates_by_id, trace_meta)
+    return Report(issues=issues, stats=stats)
+
+
+# ---------------------------------------------------------------------------
 # Top-level validate()
 # ---------------------------------------------------------------------------
 
 def validate(meta_path: Path, trace_path: Path,
              binary_path: Path,
-             wp_insn_budget: int = 64) -> Report:
+             wp_insn_budget: int = 64,
+             expected_start: int | None = 0,
+             expected_stop: int | None = None,
+             expected_warmup: int | None = 0,
+             expected_threads: int = 1,
+             start_symbol: str | None = None) -> Report:
     meta = json.loads(meta_path.read_text())
     dec = _load_decoder()
     trace_meta, templates, entries = dec.decode_champsim_tracer(trace_path)
@@ -2477,8 +3366,25 @@ def validate(meta_path: Path, trace_path: Path,
     }
 
     correct_path = list(meta["correct_path"])
-    cp_set = set(correct_path)
     blocks_by_id = {b["block_id"]: b for b in meta["blocks"]}
+
+    # Symbol-based start: trim correct_path to begin at the block
+    # whose label was used as the trace_window=symbol:name= target.
+    # Asm-block symbols are emitted as `blk_<N>` (see asm_blocks.
+    # symbol_name); strip that prefix to recover the block id.  Blocks
+    # the trace skipped (the prologue) are dropped from cp_set so
+    # downstream checks (cp_memops, reg_value_assertions, expected_reg
+    # _sets, etc.) don't flag them as missing.
+    cp_pos_offset = 0
+    if start_symbol and start_symbol.startswith("blk_"):
+        try:
+            start_bid = int(start_symbol[len("blk_"):])
+        except ValueError:
+            start_bid = None
+        if start_bid is not None and start_bid in correct_path:
+            cp_pos_offset = correct_path.index(start_bid)
+            correct_path = correct_path[cp_pos_offset:]
+    cp_set = set(correct_path)
 
     stats: dict = {
         "trace_templates": len(templates),
@@ -2591,8 +3497,12 @@ def validate(meta_path: Path, trace_path: Path,
 
     # Static register identity check: verify the template's src_regs and
     # dst_regs agree with Capstone operand detail and the active tracer
-    # per-ISA register classification table.
-    issues += _check_static_reg_sets(templates, isa)
+    # per-ISA register classification table.  Comparison is by REG_*
+    # symbolic name; the trace's own ENCODINGS section supplies the
+    # gen_id → name mapping so the validator tracks the plugin's
+    # GenericRegId enum automatically.
+    reg_id_to_name = dict(trace_meta.get("encoding_maps", {}).get("reg", {}))
+    issues += _check_static_reg_sets(templates, isa, reg_id_to_name)
 
     # Per-instruction memop attribution: ensure every dyn_param's
     # insn_index points at an instruction whose schema declares the
@@ -2604,13 +3514,13 @@ def validate(meta_path: Path, trace_path: Path,
     issues += _check_memop_count_assertions(cp_entries, templates_by_id,
                                             blocks_by_id, pcmap, cp_set)
 
-    has_reg_data = bool(int(trace_meta.get("flags", 0))
-                        & int(getattr(dec, "CST_FLAG_REG_DATA", 0)))
+    has_reg_data = bool(trace_meta.get("has_reg_data"))
     issues += _check_reg_value_assertions(cp_entries, templates_by_id,
                                           blocks_by_id, pcmap, cp_set,
-                                          has_reg_data)
+                                          has_reg_data, reg_id_to_name)
     issues += _check_expected_reg_sets(cp_entries, templates_by_id,
-                                       blocks_by_id, pcmap, cp_set, isa)
+                                       blocks_by_id, pcmap, cp_set, isa,
+                                       reg_id_to_name)
 
     # Address-recompute: only meaningful when reg-data was emitted.
     issues += _check_address_recompute(cp_entries, template_runs,
@@ -2629,7 +3539,7 @@ def validate(meta_path: Path, trace_path: Path,
 
     # Generic register ID coverage summary, using the tracer's generated
     # per-ISA register classification tables as the reachable universe.
-    issues += _check_reg_coverage(templates, isa)
+    issues += _check_reg_coverage(templates, isa, reg_id_to_name)
 
     issues += _check_wrong_path_chains(cp_entries, template_runs,
                                        cp_block_seq, correct_path,
@@ -2637,10 +3547,36 @@ def validate(meta_path: Path, trace_path: Path,
                                        blocks_by_id,
                                        wp_insn_budget=wp_insn_budget,
                                        helper_leaf_n_insns=int(meta.get("helper_leaf_n_insns", 0) or 0),
-                                       isa=isa)
+                                       isa=isa,
+                                       cp_pos_offset=cp_pos_offset)
 
     issues += _check_indirect_wp_assertions(cp_entries, templates_by_id,
                                             blocks_by_id, pcmap, isa)
+
+    # ---- Structural / cadence / format-invariant checks ---------------------
+    issues += _check_encoding_map_completeness(templates, trace_meta)
+    issues += _check_header_window(trace_meta, expected_start,
+                                    expected_stop, expected_warmup,
+                                    start_symbol)
+
+    body_stats = trace_meta.get("body_stats") or {}
+    stats["body_stats"] = body_stats
+    issues += _check_iframe_cadence(body_stats, cp_entries, trace_meta)
+    issues += _check_regfile_records(body_stats, expected_threads)
+    issues += _check_thread_switch_absent(body_stats, expected_threads)
+    issues += _check_thread_distribution(entries, expected_threads)
+    issues += _check_wp_events(body_stats, cp_entries)
+    issues += _check_sync_hints(body_stats, entries,
+                                 templates_by_id, trace_meta)
+
+    # ---- Per-insn regdata semantic checks ----------------------------------
+    opcode_names = dict(trace_meta.get("encoding_maps", {}).get("opcode", {}))
+    issues += _check_metaflags(cp_entries, templates_by_id,
+                                opcode_names, isa,
+                                reg_id_to_name, has_reg_data)
+    issues += _check_regdata_reconstruction(cp_entries, templates_by_id,
+                                             opcode_names, reg_id_to_name,
+                                             has_reg_data)
 
     return Report(issues=issues, stats=stats)
 

@@ -13,8 +13,7 @@ namespace cst {
 
 namespace {
 
-void parse_encoding_maps(Reader &r, EncodingMaps *out,
-                         uint8_t format_version)
+void parse_encoding_maps(Reader &r, EncodingMaps *out)
 {
     uint64_t n_maps = r.uleb();
     for (uint64_t i = 0; i < n_maps; i++) {
@@ -30,27 +29,12 @@ void parse_encoding_maps(Reader &r, EncodingMaps *out,
         else if (name == "insn_flag")     target = &out->insn_flag;
         else if (name == "body_tag")      target = &out->body_tag;
         else if (name == "wp_event_flag") target = &out->wp_event_flag;
+        else if (name == "metaflags")     target = &out->metaflags;
 
         for (uint64_t j = 0; j < n_entries; j++) {
             uint64_t value = r.uleb();
             std::string ename = r.string();
             if (target) (*target)[value] = std::move(ename);
-
-            /*
-             * In v1.9 (0x19) the "reg" map carried a (width, raw_bytes)
-             * suffix per entry — the segment-wide single initial regfile.
-             * v1.10 (0x1A) drops that: per-thread regfiles are emitted
-             * inline as BODY_TAG_REGFILE records and the encoding map
-             * is now name-only.
-             */
-            if (name == "reg" && format_version <= 0x19) {
-                uint8_t width = r.u8();
-                if (width) {
-                    std::vector<uint8_t> bytes(width);
-                    r.raw(bytes.data(), width);
-                    out->initial_regfile[value] = std::move(bytes);
-                }
-            }
         }
     }
 }
@@ -69,9 +53,7 @@ Trailer parse_trailer(const uint8_t *data, size_t size)
     t.body_off        = r.u64_le();
     t.body_byte_count = r.u64_le();
     t.magic           = r.u64_le();
-    if (t.magic != TRAILER_MAGIC_V17 && t.magic != TRAILER_MAGIC_V18 &&
-        t.magic != TRAILER_MAGIC_V19 && t.magic != TRAILER_MAGIC_V1A &&
-        t.magic != TRAILER_MAGIC_V1B) {
+    if (t.magic != CST_TRAILER_MAGIC) {
         throw std::runtime_error("Bad trailer magic");
     }
     return t;
@@ -83,19 +65,10 @@ Header parse_header(const uint8_t *data, size_t size,
     Header h;
     Reader r(data, 0, size);
     h.magic = r.u32_le();
-    if (h.magic != MAGIC_V17 && h.magic != MAGIC_V18 &&
-        h.magic != MAGIC_V19 && h.magic != MAGIC_V1A &&
-        h.magic != MAGIC_V1B) {
+    if (h.magic != CST_MAGIC) {
         throw std::runtime_error("Bad header magic");
     }
-    /* Trailer/header version cross-check. */
-    uint64_t expected_trailer =
-        (h.magic == MAGIC_V17) ? TRAILER_MAGIC_V17 :
-        (h.magic == MAGIC_V18) ? TRAILER_MAGIC_V18 :
-        (h.magic == MAGIC_V19) ? TRAILER_MAGIC_V19 :
-        (h.magic == MAGIC_V1A) ? TRAILER_MAGIC_V1A :
-                                 TRAILER_MAGIC_V1B;
-    if (trailer_magic != expected_trailer) {
+    if (trailer_magic != CST_TRAILER_MAGIC) {
         throw std::runtime_error("Header/trailer CST version mismatch");
     }
     h.format_version = (uint8_t)((h.magic >> 24) & 0xFF);
@@ -111,7 +84,7 @@ Header parse_header(const uint8_t *data, size_t size,
 
     if (r.pos() < body_off) {
         Reader sub = r.sub();
-        parse_encoding_maps(sub, &h.maps, h.format_version);
+        parse_encoding_maps(sub, &h.maps);
         if (!sub.eof()) {
             throw std::runtime_error("encoding-map section has trailing bytes");
         }

@@ -164,9 +164,23 @@ int x86_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
              * the deferred CC_OP/CC_SRC/CC_DST chain — typically just
              * IF and the reserved bit-1 — so any plugin / gdb client
              * reading eflags between an arithmetic op and its
-             * consumer sees stale arithmetic flags.  The hot-path
-             * cost is a small switch on CC_OP plus the operand math
-             * the next consumer would have run anyway.
+             * consumer sees stale arithmetic flags.
+             *
+             * KNOWN LIMITATION: when a QEMU plugin's
+             * QEMU_PLUGIN_CB_R_REGS callback fires mid-TB to read
+             * eflags, env->cc_op may still hold the value from TB
+             * entry (CC_OP_EFLAGS) because the i386 translator
+             * defers cpu_cc_op materialization (gen_update_cc_op
+             * only emits the movi when s->cc_op_dirty is true at a
+             * known sync point — helper call, branch, TB exit).  The
+             * plugin's R_REGS helper is target-agnostic, so the
+             * plugin infrastructure cannot know to call
+             * gen_update_cc_op for x86.  Cleanest fix would be a
+             * per-arch "flush translator state" hook in
+             * accel/tcg/plugin-gen.c invoked before each R_REGS
+             * callback; until then, plugin-side eflags reads can be
+             * stale for ALU insns whose flag-writes haven't yet been
+             * forced into memory by an in-TB consumer.
              */
             return gdb_get_reg32(mem_buf, cpu_compute_eflags(env));
 

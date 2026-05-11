@@ -3775,6 +3775,13 @@ static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
     DisasContext *dc = container_of(dcbase, DisasContext, base);
     target_ulong pc_arg = dc->base.pc_next;
 
+    /* Plugin R_REGS callbacks fire next; flush deferred cc_op so
+     * env->cc_op reflects the prior insn's ALU op (cpu_compute_eflags
+     * dispatches on it). */
+    if (dcbase->plugin_enabled) {
+        gen_update_cc_op(dc);
+    }
+
     dc->prev_insn_start = dc->base.insn_start;
     dc->prev_insn_end = tcg_last_op();
     if (tb_cflags(dcbase->tb) & CF_PCREL) {

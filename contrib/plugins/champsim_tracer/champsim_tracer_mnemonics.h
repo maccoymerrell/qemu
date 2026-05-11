@@ -97,6 +97,19 @@ typedef struct InsnFields {
     uint8_t opcode;                 /* GenericOpcode */
     uint8_t branch_type;            /* BranchType */
     bool    branch_conditional;
+    /*
+     * True when this insn's destination set includes the ISA's
+     * integer-flags register (x86 EFLAGS, AArch64 NZCV) — matches
+     * the RegClassification.is_int_flags marker on the per-ISA
+     * mnemonic-header row.  The wire-format encoder reads this bit
+     * and emits a side-channel CST_FID_METAFLAGS record carrying
+     * the canonical Z/N/C/V/P byte derived from the REG_FLAGS dst
+     * snap.  Consumers reasoning about architectural register sets
+     * see the unchanged REG_FLAGS dst slot; the canonical byte
+     * rides the field-delta stream as side data instead of as a
+     * phantom dst-reg slot.
+     */
+    bool    writes_int_flags;
     uint8_t n_src_regs;
     uint8_t n_dst_regs;
     uint8_t src_regs[MAX_SRC_REGS];

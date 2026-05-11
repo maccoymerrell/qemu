@@ -1,9 +1,8 @@
 /*
- * Wrong-Path Tracing Plugin - binary format v1.8 writer.
+ * ChampSim Tracer Plugin — binary (.cst) format writer.
  *
  * BitWriter primitives, template dictionary serializer, dyn-param
- * patch emitter, body entry streamer, and trailer writer for the
- * packed binary (.cst) format.
+ * patch emitter, body entry streamer, and trailer writer.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -258,15 +257,11 @@ static void write_reg_encoding_map(BitWriter *bw)
      * entry carries its initial value (width_bytes + LE bytes); a
      * zero width means "no live snapshot for this ID at segment
      * start" (e.g. install-time pre-vCPU start, or a register the
-     * plugin couldn't resolve via the QEMU register API). */
-    /*
-     * v1.10 (0x1A): the "reg" map carries (id, name) pairs only.  The
-     * per-segment initial register-file snapshot, formerly a (width,
-     * bytes) suffix per entry, is now emitted inline as one
-     * BODY_TAG_REGFILE record per (thread, segment).  Decoders before
-     * v1.10 expected the suffix; the magic byte bumps in lockstep so
-     * old readers refuse newer traces rather than silently misparse.
-     */
+     * plugin couldn't resolve via the QEMU register API).
+     *
+     * The "reg" map carries (id, name) pairs only.  Per-segment initial
+     * register-file snapshots are emitted inline as BODY_TAG_REGFILE
+     * records, one per (thread, segment). */
     bw_write_string(bw, "reg");
     uint64_t n = 0;
     for (unsigned i = 0; i < REG_ID_COUNT; i++) {
@@ -285,7 +280,7 @@ static void write_reg_encoding_map(BitWriter *bw)
 static void write_field_id_encoding_map(BitWriter *bw)
 {
     bw_write_string(bw, "field_id");
-    bw_write_uleb128(bw, 94);
+    bw_write_uleb128(bw, 95);
     write_encoding_entry(bw, CST_FID_N_LOADS, "CST_FID_N_LOADS");
     for (uint64_t i = 0; i < CST_FID_SLOT_COUNT; i++) {
         g_autofree char *name = g_strdup_printf("CST_FID_LOAD_ADDR%" PRIu64, i);
@@ -320,6 +315,7 @@ static void write_field_id_encoding_map(BitWriter *bw)
         { CST_FID_INSN_FLAGS, "CST_FID_INSN_FLAGS" },
         { CST_FID_INSN_IMMEDIATE, "CST_FID_INSN_IMMEDIATE" },
         { CST_FID_INSN_SIZE, "CST_FID_INSN_SIZE" },
+        { CST_FID_METAFLAGS, "CST_FID_METAFLAGS" },
         { CST_FID_EXTENDED, "CST_FID_EXTENDED" },
     };
     for (size_t i = 0; i < G_N_ELEMENTS(insn_fields); i++) {
@@ -384,10 +380,17 @@ static void write_header_encoding_maps(BitWriter *main_bw)
           "CST_WP_EVENT_TRANSLATION_UNAVAIL" },
         { CST_WP_EVENT_FAULT, "CST_WP_EVENT_FAULT" },
     };
+    static const EncodingMapEntry metaflags_entries[] = {
+        { CST_METAFLAGS_Z, "CST_METAFLAGS_Z" },
+        { CST_METAFLAGS_N, "CST_METAFLAGS_N" },
+        { CST_METAFLAGS_C, "CST_METAFLAGS_C" },
+        { CST_METAFLAGS_V, "CST_METAFLAGS_V" },
+        { CST_METAFLAGS_P, "CST_METAFLAGS_P" },
+    };
 
     BitWriter sub;
     bw_init_buf(&sub);
-    bw_write_uleb128(&sub, 9);
+    bw_write_uleb128(&sub, 10);
     write_named_enum_map(&sub, "opcode", GEN_OP_COUNT, generic_opcode_name);
     write_named_enum_map(&sub, "branch_type", BRANCH_TYPE_COUNT,
                          branch_type_name);
@@ -405,6 +408,8 @@ static void write_header_encoding_maps(BitWriter *main_bw)
                        G_N_ELEMENTS(body_tag_entries));
     write_encoding_map(&sub, "wp_event_flag", wp_event_flag_entries,
                        G_N_ELEMENTS(wp_event_flag_entries));
+    write_encoding_map(&sub, "metaflags", metaflags_entries,
+                       G_N_ELEMENTS(metaflags_entries));
     bw_write_section(main_bw, bw_finish_buf(&sub));
 }
 
@@ -425,9 +430,9 @@ struct BodyStreamState {
     BitWriter bw;
     int64_t prev_entry_template;
     int64_t current_thread;
-    /* v1.10 per-vCPU field-state tables: each thread's deltas are
-     * computed against its own prior emission, not the cross-thread
-     * sequence.  Keyed by thread_id (dense small ints handed out by
+    /* Per-vCPU field-state tables: each thread's deltas are computed
+     * against its own prior emission, not the cross-thread sequence.
+     * Keyed by thread_id (dense small ints handed out by
      * get_or_assign_thread_id, starting at 0), lazy-grown on first
      * emit.  Slot may be null until the thread first emits.  CP state
      * persists across body entries within a thread; WP state is a
@@ -435,7 +440,7 @@ struct BodyStreamState {
     std::vector<FieldStateTable *> cp_field_state;
     std::vector<FieldStateTable *> wp_field_state;
     /*
-     * v1.10 per-thread regfile bookkeeping.  Each entry tracks whether
+     * Per-thread regfile bookkeeping.  Each entry tracks whether
      * thread_id has emitted its BODY_TAG_REGFILE record in this
      * segment yet.  Indexed by thread_id; resized on demand.  Cleared
      * by reset_segment_local_state via body_stream_reset_per_thread.
@@ -748,7 +753,11 @@ static void bw_write_sleb128_u512(BitWriter *bw, U512 v)
 
 enum {
     FIELD_STATE_SLOT_INVALID = 0xFF,
-    FIELD_STATE_SLOT_COUNT = 1 + (5 * CST_FID_SLOT_COUNT) + 1 + 7,
+    /* Layout: 1 (N_LOADS) + 5*16 (slotted families) + 1 (N_STORES)
+     * + 7 (insn-metadata bytes_lo..size) + 1 (METAFLAGS).
+     * Keep the matching FIELD_STATE_SLOT_COUNT in tools/cst_decode.h
+     * in sync when this grows.                                       */
+    FIELD_STATE_SLOT_COUNT = 1 + (5 * CST_FID_SLOT_COUNT) + 1 + 7 + 1,
 };
 
 typedef struct FieldStateBlock {
@@ -806,6 +815,11 @@ static void field_state_slot_lut_build(void)
         g_field_state_slot_lut[f] = 2 + (5 * CST_FID_SLOT_COUNT)
             + (f - CST_FID_INSN_BYTES_LO);
     }
+    /* METAFLAGS sits right after the insn-metadata block.  One slot
+     * per insn (1-byte canonical Z/N/C/V/P byte), gated by reg_data. */
+    g_field_state_slot_lut[CST_FID_METAFLAGS] =
+        2 + (5 * CST_FID_SLOT_COUNT)
+        + (CST_FID_INSN_SIZE - CST_FID_INSN_BYTES_LO + 1);
     g_field_state_slot_lut_built = true;
 }
 
@@ -1137,6 +1151,75 @@ static bool extr_dst_reg(const EntryView *ev, uint32_t i, uint8_t slot,
     return true;
 }
 
+/* ---------- Metaflags (CST_FID_METAFLAGS) -----------------------
+ *
+ * Per-insn canonical-flags byte derived from the architectural REG_FLAGS
+ * dst snap.  The encoder finds the REG_FLAGS slot in the insn's dst_regs
+ * list, reads its captured value, and applies the per-ISA bit-shuffle
+ * via isa_properties[trace_isa].flags_to_metaflags.  Gated by both:
+ *   - CST_FLAG_REG_DATA on the trace (no flags reg means no snap)
+ *   - InsnFields.writes_int_flags (set during template build only on
+ *     insns whose dst maps to the ISA's int-flags reg row, i.e.
+ *     RegClassification.is_int_flags = true).
+ * Emitted as a side-channel FID rather than a synthetic dst-register
+ * so templates' dst_regs lists stay free of phantom architectural slots.
+ */
+static int find_flags_slot(const InsnFields *f)
+{
+    for (uint8_t k = 0; k < f->n_dst_regs; k++) {
+        if (f->dst_regs[k] == REG_FLAGS) {
+            return (int)k;
+        }
+    }
+    return -1;
+}
+
+static bool extr_metaflags(const EntryView *ev, uint32_t i, uint8_t slot,
+                           U512 *out)
+{
+    if (slot != 0 || !ev->reg_snaps || !ev->tmpl) return false;
+    const InsnFields *f = &ev->tmpl->insn_fields[i];
+    if (!f->writes_int_flags) return false;
+    int fs = find_flags_slot(f);
+    if (fs < 0) return false;
+    MetaFlagsMapperFn mapper = isa_properties[trace_isa].flags_to_metaflags;
+    if (!mapper) return false;
+    uint32_t pos = ev->insn_rs_off[i] + (uint32_t)fs;
+    if (pos >= ev->reg_snaps->size()) return false;
+    uint64_t raw = (*ev->reg_snaps)[pos].value.limb[0];
+    *out = cst_wide_from_u64(mapper(raw));
+    return true;
+}
+
+static bool extr_u64_metaflags(const EntryView *ev, uint32_t i, uint8_t slot,
+                               uint64_t *out)
+{
+    if (slot != 0 || !ev->reg_snaps || !ev->tmpl) return false;
+    const InsnFields *f = &ev->tmpl->insn_fields[i];
+    if (!f->writes_int_flags) return false;
+    int fs = find_flags_slot(f);
+    if (fs < 0) return false;
+    MetaFlagsMapperFn mapper = isa_properties[trace_isa].flags_to_metaflags;
+    if (!mapper) return false;
+    uint32_t pos = ev->insn_rs_off[i] + (uint32_t)fs;
+    if (pos >= ev->reg_snaps->size()) return false;
+    uint64_t raw = (*ev->reg_snaps)[pos].value.limb[0];
+    *out = mapper(raw);
+    return true;
+}
+
+static U512 deflt_metaflags(const BBTemplate *t, uint32_t i, uint8_t slot)
+{
+    (void)t; (void)i; (void)slot;
+    return cst_wide_from_u64(0);
+}
+static uint64_t deflt_u64_metaflags(const BBTemplate *t, uint32_t i,
+                                    uint8_t slot)
+{
+    (void)t; (void)i; (void)slot;
+    return 0;
+}
+
 /* Insn-encoding-mutable families.  The plugin's capture path does not
  * yet observe these (no SMC detector wired up) — extract returns the
  * template's static value, so the delta is always zero and no record
@@ -1447,6 +1530,11 @@ static const FieldDescriptor field_descriptors[] = {
             extr_u64_insn_size,  deflt_u64_insn_size,
             true /* extract == template_default */,
             "INSN_SIZE" },
+        { CST_FID_METAFLAGS,        1,  false, true,
+            extr_metaflags,      deflt_metaflags,       nullptr,
+            extr_u64_metaflags,  deflt_u64_metaflags,
+            false /* dynamic: derived from REG_FLAGS snap per exec */,
+            "METAFLAGS" },
 };
 
 #define N_FIELD_DESCRIPTORS (sizeof(field_descriptors) / sizeof(field_descriptors[0]))
@@ -1938,13 +2026,13 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
     }
 
     /*
-     * v1.10: BodyStreamState now contains std::vector members, so we
-     * use new instead of g_new0.  body_stream_finish frees inner
-     * resources (per-thread FSTs, scratch arrays) but, matching the
-     * prior pattern, does not delete the struct itself — it lives
-     * until segment-manager swap (next body_stream_new) at which
-     * point the previous one is dropped on the floor.  One-shot
-     * single-segment runs leak it to process exit either way.
+     * BodyStreamState contains std::vector members, so we use new
+     * instead of g_new0.  body_stream_finish frees inner resources
+     * (per-thread FSTs, scratch arrays) but does not delete the
+     * struct itself — it lives until segment-manager swap (next
+     * body_stream_new) at which point the previous one is dropped on
+     * the floor.  One-shot single-segment runs leak it to process
+     * exit either way.
      */
     BodyStreamState *st = new BodyStreamState();
 
@@ -2071,8 +2159,8 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
 }
 
 /*
- * v1.8: build an EntryView wrapping the captured per-entry data and
- * emit one length-prefixed delta_section.  The descriptor table in
+ * Build an EntryView wrapping the captured per-entry data and emit
+ * one length-prefixed delta_section.  The descriptor table in
  * field_descriptors[] is the single source of truth for which fields
  * exist on the wire and how each is reconstructed.
  */
@@ -2273,10 +2361,10 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
     }
 
     /*
-     * v1.10 per-thread regfile emission.  The first body entry
-     * contributed by each thread in a segment is preceded by a
-     * BODY_TAG_REGFILE record so the consumer can prime that
-     * thread's simulator state with absolute register values.
+     * Per-thread regfile emission.  The first body entry contributed
+     * by each thread in a segment is preceded by a BODY_TAG_REGFILE
+     * record so the consumer can prime that thread's simulator state
+     * with absolute register values.
      * For the segment-starting thread we use the pre-first-BB
      * snapshot captured by start_trace_segment (seed_regfile);
      * threads joining later capture live registers at this point

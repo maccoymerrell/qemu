@@ -48,6 +48,10 @@ void slot_lut_build()
         g_slot_lut[f] = (uint8_t)(2 + 5*FID_SLOT_COUNT +
                                    (f - FID_INSN_BYTES_LO));
     }
+    /* METAFLAGS sits immediately after the insn-metadata band.  See
+     * the matching slot assignment in champsim_tracer_output.cc.    */
+    g_slot_lut[FID_METAFLAGS] = (uint8_t)(2 + 5*FID_SLOT_COUNT +
+        (FID_INSN_SIZE - FID_INSN_BYTES_LO + 1));
     g_slot_lut_built = true;
 }
 
@@ -65,22 +69,6 @@ void block_ensure_capacity(FieldStateBlock *blk, uint32_t n_insns)
     blk->values.resize(new_cells);
     blk->gens.resize(new_cells, 0);
     blk->n_insns = n_insns;
-}
-
-/* Deep-clone @src into @dst.  Used by the v1.7/v1.8 wp-fork behavior
- * (wp_state = cp_state at every ENTRY's chain start); v1.9+ traces
- * have wp_persistent_ true and never invoke this. */
-void clone_field_state_table(FieldStateTable &dst,
-                             const FieldStateTable &src)
-{
-    dst.generation = src.generation;
-    dst.blocks.clear();
-    dst.blocks.resize(src.blocks.size());
-    for (size_t i = 0; i < src.blocks.size(); i++) {
-        if (src.blocks[i]) {
-            dst.blocks[i] = std::make_unique<FieldStateBlock>(*src.blocks[i]);
-        }
-    }
 }
 
 FieldStateBlock *table_get_or_create_block(FieldStateTable &t,
@@ -173,6 +161,19 @@ size_t first_reg_snap_diff(const std::vector<RegSnap> &a,
     return 0;
 }
 
+size_t first_metaflags_diff(const std::vector<MetaFlagsEntry> &a,
+                            const std::vector<MetaFlagsEntry> &b)
+{
+    size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; i++) {
+        if (a[i].insn_index != b[i].insn_index ||
+            a[i].byte != b[i].byte) {
+            return i + 1;
+        }
+    }
+    return 0;
+}
+
 /*
  * Throw a descriptive runtime_error when the IFRAME-decoded entry
  * disagrees with the immediately-preceding ENTRY.  Validates:
@@ -212,6 +213,14 @@ void validate_iframe(const DecodedEntry &prev, const DecodedEntry &iframe)
     if (size_t d = first_reg_snap_diff(prev.reg_snaps, iframe.reg_snaps)) {
         fail("CP reg_snaps[" + std::to_string(d - 1) + "] mismatch");
     }
+    if (prev.metaflags.size() != iframe.metaflags.size()) {
+        fail("CP metaflags count mismatch: ENTRY=" +
+             std::to_string(prev.metaflags.size()) +
+             " IFRAME=" + std::to_string(iframe.metaflags.size()));
+    }
+    if (size_t d = first_metaflags_diff(prev.metaflags, iframe.metaflags)) {
+        fail("CP metaflags[" + std::to_string(d - 1) + "] mismatch");
+    }
 
     if (prev.wp_entries.size() != iframe.wp_entries.size()) {
         fail("WP chain length mismatch: ENTRY=" +
@@ -242,6 +251,14 @@ void validate_iframe(const DecodedEntry &prev, const DecodedEntry &iframe)
         }
         if (size_t d = first_reg_snap_diff(pe.reg_snaps, ie.reg_snaps)) {
             fail(ws + " reg_snaps[" + std::to_string(d - 1) + "] mismatch");
+        }
+        if (pe.metaflags.size() != ie.metaflags.size()) {
+            fail(ws + " metaflags count mismatch: ENTRY=" +
+                 std::to_string(pe.metaflags.size()) +
+                 " IFRAME=" + std::to_string(ie.metaflags.size()));
+        }
+        if (size_t d = first_metaflags_diff(pe.metaflags, ie.metaflags)) {
+            fail(ws + " metaflags[" + std::to_string(d - 1) + "] mismatch");
         }
         if (pe.fault != ie.fault) {
             fail(ws + " fault flag mismatch");
@@ -315,8 +332,18 @@ BodyWalker::BodyWalker(const Header &header,
       by_id_(template_by_id),
       body_(data, body_off, body_end),
       scalar_bits_(header.scalar_width_bits()),
-      wp_persistent_(header.wp_persistent()),
-      flags_(header.flags) {}
+      flags_(header.flags),
+      reg_flags_id_(-1)
+{
+    /* Resolve REG_FLAGS' numeric id from the trace's own reg map.
+     * The trace is self-describing; no compile-time table lives here. */
+    for (const auto &kv : header.maps.reg) {
+        if (kv.second == "REG_FLAGS") {
+            reg_flags_id_ = (int)kv.first;
+            break;
+        }
+    }
+}
 
 void BodyWalker::walk(const Callback &cb,
                       const RegfileCallback &rb)
@@ -325,20 +352,12 @@ void BodyWalker::walk(const Callback &cb,
     uint32_t current_thread = 0;
     bool pending_thread_switch = false;
     /*
-     * v1.10 (0x1A): per-thread FieldStateTables.  Earlier versions
-     * shared one cp_state / wp_state across all body entries; that
-     * meant deltas crossed thread boundaries and made multi-vCPU
-     * traces inflated and self-inconsistent.  v1.10 emits each
-     * thread's deltas against its own prior emission.  We use
-     * std::vector indexed by thread_id (dense small ints handed out
-     * by the writer's get_or_assign_thread_id) — direct array access
-     * is fast enough that the per-body-entry lookup is invisible vs
-     * the field-delta replay's own cost.  v1.7..v1.9 traces always
-     * route every entry through tid 0.
+     * Per-thread FieldStateTables, std::vector indexed by thread_id
+     * (dense small ints handed out by the writer's
+     * get_or_assign_thread_id).
      */
     std::vector<FieldStateTable> cp_states;
     std::vector<FieldStateTable> wp_states;
-    bool versioned_per_thread = (header_.format_version >= 0x1A);
     auto state_at = [&](std::vector<FieldStateTable> &v,
                         uint32_t k) -> FieldStateTable & {
         if (k >= v.size()) v.resize((size_t)k + 1);
@@ -359,6 +378,7 @@ void BodyWalker::walk(const Callback &cb,
             int64_t d = body_.sleb();
             current_thread = (uint32_t)((int64_t)current_thread + d);
             pending_thread_switch = true;
+            stats_.thread_switch_count++;
             continue;
         }
         if (tag == BODY_TAG_REGFILE) {
@@ -377,6 +397,7 @@ void BodyWalker::walk(const Callback &cb,
                 rec.regs.push_back(std::move(s));
             }
             if (rb) rb(rec);
+            stats_.regfile_count++;
             continue;
         }
         if (tag == BODY_TAG_ENTRY) {
@@ -384,13 +405,8 @@ void BodyWalker::walk(const Callback &cb,
             int32_t entry_tmpl = prev_entry_template + (int32_t)tdelta;
             prev_entry_template = entry_tmpl;
 
-            uint32_t state_key = versioned_per_thread ? current_thread : 0;
-            FieldStateTable &cp_state = state_at(cp_states, state_key);
-            FieldStateTable &wp_state = state_at(wp_states, state_key);
-
-            /* v1.7/v1.8: WP overlay forks from CP at chain start.
-             * v1.9+ persists wp_state across entries and doesn't clone. */
-            if (!wp_persistent_) clone_field_state_table(wp_state, cp_state);
+            FieldStateTable &cp_state = state_at(cp_states, current_thread);
+            FieldStateTable &wp_state = state_at(wp_states, current_thread);
 
             DecodedEntry entry;
             entry.template_id = (uint32_t)entry_tmpl;
@@ -400,13 +416,14 @@ void BodyWalker::walk(const Callback &cb,
                 ? &templates_[by_id_.at((uint32_t)entry_tmpl)] : nullptr;
             decode_field_delta(body_, (uint32_t)entry_tmpl, cp_tmpl,
                                cp_state, nullptr,
-                               &entry.dyn_params, &entry.reg_snaps);
+                               &entry.dyn_params, &entry.reg_snaps,
+                               &entry.metaflags);
 
             /* WP chain section. */
             Reader wpb = body_.sub();
             uint64_t num_wp = wpb.uleb();
             int32_t prev_wp_tmpl = 0;
-            const FieldStateTable *wp_base = wp_persistent_ ? &cp_state : nullptr;
+            const FieldStateTable *wp_base = &cp_state;
             for (uint64_t w = 0; w < num_wp; w++) {
                 int64_t wd = wpb.sleb();
                 int32_t wp_tmpl = prev_wp_tmpl + (int32_t)wd;
@@ -419,7 +436,8 @@ void BodyWalker::walk(const Callback &cb,
                 if (wtmpl) we.n_insns = (uint32_t)wtmpl->insns.size();
                 decode_field_delta(wpb, (uint32_t)wp_tmpl, wtmpl,
                                    wp_state, wp_base,
-                                   &we.dyn_params, &we.reg_snaps);
+                                   &we.dyn_params, &we.reg_snaps,
+                                   &we.metaflags);
                 entry.wp_entries.push_back(std::move(we));
             }
 
@@ -451,6 +469,35 @@ void BodyWalker::walk(const Callback &cb,
             entry.seq_num = ++seq;
             pending_thread_switch = false;
 
+            stats_.cp_entries++;
+            stats_.wp_entries += entry.wp_entries.size();
+            for (const auto &we : entry.wp_entries) {
+                if (we.fault) stats_.fault_count++;
+                if (we.translation_unavailable) {
+                    stats_.translation_unavail_count++;
+                }
+            }
+            /* Aggregate sync_hint values: walk every insn position in
+             * every CP+WP template touched by this entry.  This counts
+             * each (template,insn) once per entry it appears in, so a
+             * hot block contributes multiple times — matches the
+             * "how many insn observations carried this hint" intent. */
+            if (auto it = by_id_.find(entry.template_id);
+                it != by_id_.end()) {
+                const Template &t = templates_[it->second];
+                for (const auto &I : t.insns) {
+                    stats_.sync_hint_counts[I.sync_hint]++;
+                }
+            }
+            for (const auto &we : entry.wp_entries) {
+                auto wit = by_id_.find(we.template_id);
+                if (wit == by_id_.end()) continue;
+                const Template &t = templates_[wit->second];
+                for (const auto &I : t.insns) {
+                    stats_.sync_hint_counts[I.sync_hint]++;
+                }
+            }
+
             cb(entry);
             prev_entry = std::move(entry);
             continue;
@@ -479,21 +526,19 @@ void BodyWalker::walk(const Callback &cb,
                                    : nullptr,
                                iframe_cp, nullptr,
                                &iframe_entry.dyn_params,
-                               &iframe_entry.reg_snaps);
+                               &iframe_entry.reg_snaps,
+                               &iframe_entry.metaflags);
 
             /* WP chain.  Mirror the encoder's IFRAME emission: the
              * iframe_wp overlay falls back to iframe_cp as base
              * (writer uses st->iframe_cp_scratch for both wp_state
-             * and wp_base in IFRAME mode), and on persistent-WP
-             * versions the wp_base parameter is the iframe_cp
-             * overlay so unset cells fall through to the same place
-             * the cp section just populated. */
+             * and wp_base in IFRAME mode) so unset cells fall through
+             * to the same place the cp section just populated. */
             Reader wpb = body_.sub();
             uint64_t num_wp = wpb.uleb();
             int32_t prev_wp_tmpl = 0;
             iframe_entry.wp_entries.reserve(num_wp);
-            const FieldStateTable *iframe_wp_base =
-                wp_persistent_ ? &iframe_cp : nullptr;
+            const FieldStateTable *iframe_wp_base = &iframe_cp;
             for (uint64_t w = 0; w < num_wp; w++) {
                 int64_t wd = wpb.sleb();
                 int32_t wp_tmpl = prev_wp_tmpl + (int32_t)wd;
@@ -506,7 +551,8 @@ void BodyWalker::walk(const Callback &cb,
                 if (wtmpl) we.n_insns = (uint32_t)wtmpl->insns.size();
                 decode_field_delta(wpb, (uint32_t)wp_tmpl, wtmpl,
                                    iframe_wp, iframe_wp_base,
-                                   &we.dyn_params, &we.reg_snaps);
+                                   &we.dyn_params, &we.reg_snaps,
+                                   &we.metaflags);
                 iframe_entry.wp_entries.push_back(std::move(we));
             }
             /* Events sub-section. */
@@ -540,6 +586,7 @@ void BodyWalker::walk(const Callback &cb,
              * message.
              */
             validate_iframe(*prev_entry, iframe_entry);
+            stats_.iframe_count++;
             continue;
         }
         throw std::runtime_error("Unknown body tag");
@@ -555,8 +602,9 @@ void BodyWalker::decode_field_delta(Reader &outer,
                                     const Template *tmpl,
                                     FieldStateTable &state,
                                     const FieldStateTable *base_state,
-                                    std::vector<DynParam> *dyn_params,
-                                    std::vector<RegSnap>  *reg_snaps)
+                                    std::vector<DynParam>       *dyn_params,
+                                    std::vector<RegSnap>        *reg_snaps,
+                                    std::vector<MetaFlagsEntry> *metaflags)
 {
     Reader sec = outer.sub();
     uint64_t n_records = sec.uleb();
@@ -732,6 +780,24 @@ void BodyWalker::decode_field_delta(Reader &outer,
                 r.reg_id = tmpl->insns[i].dst_regs[op_i];
                 r.value = v;
                 reg_snaps->push_back(r);
+            }
+            /* Surface FID_METAFLAGS for any insn whose template writes
+             * the canonical integer-flags register.  The writer emits
+             * the byte only when both regdata is enabled and the insn
+             * actually writes flags. */
+            if (metaflags && reg_flags_id_ >= 0) {
+                const auto &dsts = tmpl->insns[i].dst_regs;
+                bool writes_flags = false;
+                for (uint8_t r : dsts) {
+                    if ((int)r == reg_flags_id_) { writes_flags = true; break; }
+                }
+                if (writes_flags) {
+                    Wide v = lookup_fid((uint32_t)i, FID_METAFLAGS);
+                    MetaFlagsEntry mfe;
+                    mfe.insn_index = (uint32_t)i;
+                    mfe.byte = (uint8_t)(v.low64() & 0xFF);
+                    metaflags->push_back(mfe);
+                }
             }
         }
     }

@@ -251,7 +251,7 @@ std::string regref_from_name(const std::string &name)
 }
 
 /*
- * Render the REG_METAFLAGS snap byte as a bit-string of set flags:
+ * Render a FID_METAFLAGS byte as a bit-string of set flags:
  *   0x00         -> "-"          (no flags set)
  *   METAFLAGS_Z  -> "Z"
  *   Z|N|C        -> "ZNC"
@@ -467,9 +467,10 @@ void append_wide_hex(std::string *out, const cst::Wide &w)
 void emit_observations_legacy(FILE *out, const std::string &prefix,
                               const cst::Header &h,
                               const std::vector<cst::DynParam> &dyns,
-                              const std::vector<cst::RegSnap> &snaps)
+                              const std::vector<cst::RegSnap> &snaps,
+                              const std::vector<cst::MetaFlagsEntry> &mflags)
 {
-    if (dyns.empty() && snaps.empty()) {
+    if (dyns.empty() && snaps.empty() && mflags.empty()) {
         std::fprintf(out, "%sunchanged\n", prefix.c_str());
         return;
     }
@@ -489,6 +490,16 @@ void emit_observations_legacy(FILE *out, const std::string &prefix,
                          prefix.c_str(), r.insn_index, r.operand_index,
                          fmt_reg(h, r.reg_id).c_str(),
                          fmt_snap_value(r.value).c_str());
+        }
+    }
+    if (!mflags.empty()) {
+        std::fprintf(out, "%smetaflags:\n", prefix.c_str());
+        for (auto &m : mflags) {
+            std::string s;
+            append_metaflags_bits(&s, m.byte);
+            std::fprintf(out, "%s  insn[%u] 0x%02x [%s]\n",
+                         prefix.c_str(), m.insn_index,
+                         (unsigned)m.byte, s.c_str());
         }
     }
 }
@@ -517,19 +528,6 @@ void render_legacy(FILE *out, const cst::Header &h,
     std::fprintf(out, "TOTAL_TARGET_INSNS %llu%s\n",
                  (unsigned long long)h.total_target_insns,
                  h.total_target_insns == 0 ? " (unbounded)" : "");
-    if (!h.maps.initial_regfile.empty()) {
-        std::fprintf(out, "INITIAL_REGFILE %zu\n",
-                     h.maps.initial_regfile.size());
-        std::vector<uint64_t> keys;
-        keys.reserve(h.maps.initial_regfile.size());
-        for (auto &kv : h.maps.initial_regfile) keys.push_back(kv.first);
-        std::sort(keys.begin(), keys.end());
-        for (uint64_t k : keys) {
-            const auto &v = h.maps.initial_regfile.at(k);
-            std::fprintf(out, "  %s %s\n", fmt_reg(h, k).c_str(),
-                         fmt_bytes_hex(v).c_str());
-        }
-    }
     std::fprintf(out, "\n");
 
     std::fprintf(out, "ENCODINGS\n---------\n");
@@ -547,6 +545,7 @@ void render_legacy(FILE *out, const cst::Header &h,
         {"field_id",      &h.maps.field_id},
         {"header_flag",   &h.maps.header_flag},
         {"insn_flag",     &h.maps.insn_flag},
+        {"metaflags",     &h.maps.metaflags},
         {"opcode",        &h.maps.opcode},
         {"reg",           &h.maps.reg},
         {"sync_hint",     &h.maps.sync_hint},
@@ -635,7 +634,8 @@ void render_legacy(FILE *out, const cst::Header &h,
         std::fprintf(out, "ENTRY %04u thread=%u%s template=BB%u\n",
                      e.seq_num, e.thread_id, sw, e.template_id);
         std::fprintf(out, "  cp:\n");
-        emit_observations_legacy(out, "    ", h, e.dyn_params, e.reg_snaps);
+        emit_observations_legacy(out, "    ", h, e.dyn_params, e.reg_snaps,
+                                 e.metaflags);
         for (auto &wp : e.wp_entries) {
             std::fprintf(out,
                          "  wp[%u] template=BB%u n_insns=%u\n",
@@ -660,7 +660,8 @@ void render_legacy(FILE *out, const cst::Header &h,
                 }
                 std::fprintf(out, "    status: %s\n", s.c_str());
             }
-            emit_observations_legacy(out, "    ", h, wp.dyn_params, wp.reg_snaps);
+            emit_observations_legacy(out, "    ", h, wp.dyn_params, wp.reg_snaps,
+                                     wp.metaflags);
         }
         std::fprintf(out, "\n");
     },
@@ -674,6 +675,38 @@ void render_legacy(FILE *out, const cst::Header &h,
         }
         std::fprintf(out, "\n");
     });
+
+    /* Trailing structural-stats section so the validator can
+     * cross-check the writer's cadence (one REGFILE per thread per
+     * segment, at-least-one IFRAME per N entries, sync_hints, etc.)
+     * without re-walking the body or shelling out to cst_audit. */
+    const auto &s = body.stats();
+    std::fprintf(out, "BODY_STATS\n----------\n");
+    std::fprintf(out, "cp_entries %llu\n",
+                 (unsigned long long)s.cp_entries);
+    std::fprintf(out, "wp_entries %llu\n",
+                 (unsigned long long)s.wp_entries);
+    std::fprintf(out, "iframe_count %llu\n",
+                 (unsigned long long)s.iframe_count);
+    std::fprintf(out, "regfile_count %llu\n",
+                 (unsigned long long)s.regfile_count);
+    std::fprintf(out, "thread_switch_count %llu\n",
+                 (unsigned long long)s.thread_switch_count);
+    std::fprintf(out, "fault_count %llu\n",
+                 (unsigned long long)s.fault_count);
+    std::fprintf(out, "translation_unavail_count %llu\n",
+                 (unsigned long long)s.translation_unavail_count);
+    /* Sort sync hints by id for stable output. */
+    std::vector<uint8_t> hint_keys;
+    hint_keys.reserve(s.sync_hint_counts.size());
+    for (auto &kv : s.sync_hint_counts) hint_keys.push_back(kv.first);
+    std::sort(hint_keys.begin(), hint_keys.end());
+    std::fprintf(out, "sync_hint_counts %zu\n", hint_keys.size());
+    for (uint8_t k : hint_keys) {
+        std::fprintf(out, "  %u %llu\n", (unsigned)k,
+                     (unsigned long long)s.sync_hint_counts.at(k));
+    }
+    std::fprintf(out, "\n");
 
     /* Suppress unused-variable warnings for the constant tables that
      * the legacy renderer references but doesn't otherwise consume. */
@@ -758,6 +791,7 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
                         size_t insn_idx,
                         const std::vector<cst::DynParam> &dyns,
                         const std::vector<cst::RegSnap> &snaps,
+                        const std::vector<cst::MetaFlagsEntry> &mflags,
                         uint32_t thread_id, uint32_t bb_id,
                         bool is_wp,
                         const char *wp_status,
@@ -855,25 +889,35 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
             append_regref(&line, ctx, I.dst_regs[k]);
             /* Find the matching reg_snap for this dst slot.  reg_snaps
              * are emitted in template-walk order, so the operand_index
-             * lines up with k.  REG_METAFLAGS gets a bit-string
-             * rendering (e.g. [Z] / [ZNC] / [-]) for at-a-glance
-             * readability; every other reg prints its raw hex value. */
+             * lines up with k. */
             for (const auto &r : snaps) {
                 if (r.insn_index == (uint32_t)insn_idx &&
                     r.operand_index == (uint8_t)k) {
                     line.append("[");
-                    if (I.dst_regs[k] == cst::REG_METAFLAGS_ID) {
-                        append_metaflags_bits(
-                            &line, (uint8_t)(r.value.low64() & 0xff));
-                    } else {
-                        append_wide_hex(&line, r.value);
-                    }
+                    append_wide_hex(&line, r.value);
                     line.append("]");
                     break;
                 }
             }
         }
         first = false;
+    }
+    /* FID_METAFLAGS side-channel: rendered as %mflags[ZNCVP] after the
+     * dst section for any insn whose template writes the integer-flags
+     * register.  Pulled from the per-entry metaflags vector populated
+     * by the body walker. */
+    for (const auto &mf : mflags) {
+        if (mf.insn_index != (uint32_t)insn_idx) continue;
+        if (first) {
+            line.append(" ");
+            first = false;
+        } else {
+            line.append(", ");
+        }
+        line.append("%mflags[");
+        append_metaflags_bits(&line, mf.byte);
+        line.append("]");
+        break;
     }
 
     /* Memory operands rendered inline as ld(addr)=val / st(addr)=val
@@ -1117,18 +1161,6 @@ void render_disasm(FILE *out, const cst::Header &h,
                  (unsigned long long)h.warmup_insns,
                  (unsigned long long)h.total_target_insns);
     std::fprintf(out, "; templates=%zu\n", templates.size());
-    if (!h.maps.initial_regfile.empty()) {
-        std::fprintf(out, "; initial_regfile:\n");
-        std::vector<uint64_t> keys;
-        keys.reserve(h.maps.initial_regfile.size());
-        for (auto &kv : h.maps.initial_regfile) keys.push_back(kv.first);
-        std::sort(keys.begin(), keys.end());
-        for (uint64_t k : keys) {
-            std::fprintf(out, ";   %s=%s\n",
-                         fmt_reg(h, k).c_str(),
-                         fmt_bytes_hex(h.maps.initial_regfile.at(k)).c_str());
-        }
-    }
     std::fprintf(out, "\n");
 
     body.walk([&](const cst::DecodedEntry &e) {
@@ -1164,6 +1196,7 @@ void render_disasm(FILE *out, const cst::Header &h,
             const cst::Template *bt = (i + 1 == t.insns.size())
                 ? cp_branch_target : nullptr;
             render_disasm_insn(out, ctx, t, i, e.dyn_params, e.reg_snaps,
+                               e.metaflags,
                                e.thread_id, e.template_id,
                                /* is_wp= */ false,
                                /* wp_status= */ nullptr,
@@ -1208,6 +1241,7 @@ void render_disasm(FILE *out, const cst::Header &h,
                 const cst::Template *bt = (i + 1 == wp_n)
                     ? wp_branch_target : nullptr;
                 render_disasm_insn(out, ctx, wt, i, wp.dyn_params, wp.reg_snaps,
+                                   wp.metaflags,
                                    e.thread_id, wp.template_id,
                                    /* is_wp= */ true,
                                    status.empty() ? nullptr : status.c_str(),

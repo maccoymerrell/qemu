@@ -38,7 +38,11 @@ namespace cst {
  * Replaces the prior unordered_map<u64, Wide> design (~10% of total
  * decode time in hashtable lookups).  Direct array indexing is a
  * load + compare per cell. */
-inline constexpr size_t FIELD_STATE_SLOT_COUNT = 89;
+/* Layout matches FIELD_STATE_SLOT_COUNT in champsim_tracer_output.cc:
+ *   1 N_LOADS + 5*16 slotted (load_addr/store_addr/load_data/store_data
+ *   /dst_reg) + 1 N_STORES + 7 insn-metadata + 1 METAFLAGS = 90.
+ * Bump alongside the writer when new families are added.            */
+inline constexpr size_t FIELD_STATE_SLOT_COUNT = 90;
 inline constexpr uint8_t FIELD_STATE_SLOT_INVALID = 0xFF;
 
 struct FieldStateBlock {
@@ -67,6 +71,25 @@ struct DecodedRegfile {
     std::vector<RegfileSlot>  regs;
 };
 
+/* Structural counts surfaced after walk() completes.  Lets consumers
+ * sanity-check writer cadence (one REGFILE per (segment, thread); at
+ * least one IFRAME every N entries; no THREAD_SWITCH on single-vCPU
+ * traces; no non-NONE sync_hints on synthetic programs) without
+ * having to re-walk the body. */
+struct BodyStats {
+    uint64_t cp_entries        = 0;
+    uint64_t wp_entries        = 0;
+    uint64_t iframe_count      = 0;
+    uint64_t regfile_count     = 0;
+    uint64_t thread_switch_count = 0;
+    uint64_t fault_count       = 0;
+    uint64_t translation_unavail_count = 0;
+    /* Per-insn template sync_hint value -> count of insns observed
+     * carrying that hint.  Aggregated across both CP and WP entries
+     * by template-walk, so each (entry × insn) contributes once. */
+    std::unordered_map<uint8_t, uint64_t> sync_hint_counts;
+};
+
 class BodyWalker {
 public:
     using Callback = std::function<void(const DecodedEntry &)>;
@@ -78,13 +101,14 @@ public:
                const uint8_t *data, size_t size,
                uint64_t body_off, uint64_t body_end);
 
+    const BodyStats &stats() const { return stats_; }
+
     /* Walk every body record once.  @cb is invoked with each
      * BODY_TAG_ENTRY's fully-decoded entry; IFRAME records validate
      * against the immediately-preceding ENTRY and do not produce a
      * callback.  THREAD_SWITCH records flip the next entry's
      * thread_id and set thread_switched.  @rb (optional) receives
-     * each BODY_TAG_REGFILE record (v1.10+); on v1.9 traces no
-     * REGFILE callback fires (the regfile lives on the header). */
+     * each BODY_TAG_REGFILE record. */
     void walk(const Callback &cb,
               const RegfileCallback &rb = {});
 
@@ -93,8 +117,9 @@ private:
                              const Template *tmpl,
                              FieldStateTable &state,
                              const FieldStateTable *base_state,
-                             std::vector<DynParam> *dyn_params,
-                             std::vector<RegSnap>  *reg_snaps);
+                             std::vector<DynParam>       *dyn_params,
+                             std::vector<RegSnap>        *reg_snaps,
+                             std::vector<MetaFlagsEntry> *metaflags);
     Wide  template_default(const Template *tmpl,
                            uint32_t ipos, uint8_t fid) const;
 
@@ -104,8 +129,12 @@ private:
     Reader                                              body_;
 
     int      scalar_bits_;
-    bool     wp_persistent_;
     uint8_t  flags_;
+    /* REG_FLAGS' numeric id, resolved from the trace's "reg" encoding
+     * map at construction.  -1 if the trace doesn't name a flags
+     * register (e.g. RISC-V), in which case no metaflags are surfaced. */
+    int      reg_flags_id_;
+    BodyStats stats_;
 };
 
 }  /* namespace cst */

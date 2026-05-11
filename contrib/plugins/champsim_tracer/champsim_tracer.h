@@ -44,24 +44,9 @@ extern "C" {
  * compiled in the C tables TU can manipulate InsnFields directly. */
 
 /*
- * Binary format magic/version 1.9.
- * Bytes in file order: 'C','S','T',0x19 → u32 LE 0x19545343.
- * ASCII: C=0x43 S=0x53 T=0x54.  "CST" = ChampSimTracer.
- *
- * v1.7 replaced the per-entry dyn-patch / mem-data / reg-data
- * sub-sections (and the variable-memop preamble) with a single
- * unified field-typed delta stream.  v1.8 widens scalar dynamic
- * values to 512 bits and adds raw overflow vectors for memops beyond
- * the first 16 fixed slots.  v1.9 changes the WP delta-encoding
- * baseline: WP state now persists across chains (rather than being
- * forked from CP per chain and discarded), with an unobserved-WP-key
- * fallback to the CP state.  Hot WP templates that are visited many
- * times across chains delta against the prior WP-observed value
- * instead of paying first-observation cost on every chain — typically
- * cuts trace size 3x on real workloads.  No effect on CP encoding or
- * on the architectural meaning of WP (the writer still discards
- * speculative architectural effects at chain end; this is purely a
- * compression-cache change).
+ * Binary format magic.  Bytes in file order: 'C','S','T',0x1C
+ * → u32 LE 0x1C545343.  ASCII: C=0x43 S=0x53 T=0x54.  "CST" =
+ * ChampSimTracer.
  *
  * Each BB entry carries:
  *
@@ -71,34 +56,23 @@ extern "C" {
  * Records are emitted in non-descending (ins_pos, field_id) order;
  * unchanged fields contribute zero bytes.  Field IDs identify what
  * changed about an instruction (memop count/addr/data, src/dst reg
- * value, opcode/encoding/immediate etc. — see the FID_* constants
- * below).  Normal scalar fields carry one signed LEB delta:
- * `(cur512 - baseline512) mod 2**512`.  The EXTRA_* memop fields
- * carry raw unsigned LEB vectors and have no persistent state.
+ * value, opcode/encoding/immediate, integer-flags byte — see the
+ * FID_* constants below).  Normal scalar fields carry one signed LEB
+ * delta: `(cur512 - baseline512) mod 2**512`.  The EXTRA_* memop
+ * fields carry raw unsigned LEB vectors and have no persistent state.
  * Baseline = the most-recent observation in the active overlay
  * (CP state for CP records; WP state for WP records, falling back
  * to CP if the WP overlay never observed this key); template-default
- * on first appearance.
+ * on first appearance.  WP state persists across chains; CP state is
+ * the architectural truth.
  *
  * Templates track true basic blocks (start_pc to first branch,
  * immutable, unique by start_pc).  Memory-operation counts are runtime
  * sparse fields populated from QEMU memory callbacks; template count
  * defaults are zero.
  */
-/*
- * Bytes in file order: 'C','S','T',0x1B → u32 LE 0x1B545343.
- * Version byte 0x1B (v1.11): adds REG_METAFLAGS, a synthetic
- * ISA-agnostic flags register.  Insns that write the architectural
- * REG_FLAGS (x86 RFLAGS, AArch64 NZCV) now also list REG_METAFLAGS
- * as a destination, with a 1-byte canonical Z/N/C/V/P payload that
- * spares trace consumers from per-ISA bit-shuffling.  Architectural
- * REG_FLAGS continues to carry the raw bits for any consumer that
- * needs the system-side state (DF, IF, IOPL, ...).  Format-
- * incompatible with 0x1A readers because the affected templates'
- * dst_regs lists now contain an extra entry.
- */
-#define CST_MAGIC          0x1B545343u
-#define CST_TRAILER_MAGIC  0x1B545343FFFFFFFFull
+#define CST_MAGIC          0x1C545343u
+#define CST_TRAILER_MAGIC  0x1C545343FFFFFFFFull
 #define CST_TRAILER_SIZE   64
 
 /*
@@ -183,7 +157,7 @@ extern "C" {
 #define CST_FLAG_RESERVED_2    (1 << 2)
 /* bits 3..7 reserved */
 
-/* ===== Field-ID space (v1.8 unified delta stream) =====
+/* ===== Field-ID space (unified delta stream) =====
  *
  * Every per-entry observation (memop addresses, memop data, register
  * values, instruction-encoding mutations) is encoded as one record.
@@ -226,8 +200,17 @@ extern "C" {
 #define CST_FID_INSN_FLAGS       0x74  /* template flags byte                 */
 #define CST_FID_INSN_IMMEDIATE   0x75  /* signed immediate                    */
 #define CST_FID_INSN_SIZE        0x76  /* u8 insn_size                        */
-/* 0x77..0xFE reserved for future fields                                       */
-#define CST_FID_EXTENDED         0xFF  /* reserved escape; not used in v1.8   */
+/* Per-insn canonical-flags byte.  Gated by CST_FLAG_REG_DATA.  Emitted
+ * only on insns whose template's int-flags-writing row is marked
+ * `is_int_flags` (x86 EFLAGS-writers, AArch64 NZCV-writers).  Wire
+ * payload is one byte with bits CST_METAFLAGS_{Z,N,C,V,P}, computed
+ * by the per-ISA `flags_to_metaflags` mapper at capture time.  Stored
+ * as a side-channel rather than a synthetic dst-reg slot so the
+ * template's `dst_regs` list stays clean (consumers reasoning about
+ * architectural register sets aren't confused by a phantom slot).   */
+#define CST_FID_METAFLAGS        0x77
+/* 0x78..0xFE reserved for future fields                                       */
+#define CST_FID_EXTENDED         0xFF  /* reserved escape; not currently used  */
 
 /* ===== Types ===== */
 

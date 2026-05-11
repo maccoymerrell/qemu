@@ -100,7 +100,7 @@ struct Stats {
     Bucket wp_events;
     uint64_t iframe_count = 0;
     Bucket   iframe_bytes;
-    /* v1.10 BODY_TAG_REGFILE: per-thread initial regfile snapshot,
+    /* BODY_TAG_REGFILE: per-thread initial regfile snapshot,
      * one record per (segment, thread_id). */
     uint64_t regfile_count = 0;
     Bucket   regfile_bytes;

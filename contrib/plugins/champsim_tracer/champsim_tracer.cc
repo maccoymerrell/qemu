@@ -207,14 +207,8 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
 
     for (uint8_t i = 0; i < f->n_dst_regs; i++) {
         RegSnap s;
-        if (f->dst_regs[i] == REG_METAFLAGS) {
-            g_reg_snaps.read_metaflags_into_snap(cpu_index,
-                                                 names->dst_qemu_reg_keys[i],
-                                                 &s);
-        } else {
-            g_reg_snaps.read_into_snap(cpu_index,
-                                       names->dst_qemu_reg_keys[i], &s);
-        }
+        g_reg_snaps.read_into_snap(cpu_index,
+                                   names->dst_qemu_reg_keys[i], &s);
         pending_reg_snaps.push_back(s);
     }
 }
@@ -605,13 +599,8 @@ static void flush_pending_final_body_entry(void)
                     &prev_tb_tmpl->insn_reg_names[last];
                 for (uint8_t i = 0; i < fl->n_dst_regs; i++) {
                     RegSnap s;
-                    if (fl->dst_regs[i] == REG_METAFLAGS) {
-                        g_reg_snaps.read_metaflags_into_snap(
-                            cpu_index, nl->dst_qemu_reg_keys[i], &s);
-                    } else {
-                        g_reg_snaps.read_into_snap(
-                            cpu_index, nl->dst_qemu_reg_keys[i], &s);
-                    }
+                    g_reg_snaps.read_into_snap(
+                        cpu_index, nl->dst_qemu_reg_keys[i], &s);
                     pending_reg_snaps.push_back(s);
                 }
             }
@@ -1024,13 +1013,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
             const InsnRegNames *nl = &prev_tb_tmpl->insn_reg_names[last];
             for (uint8_t i = 0; i < fl->n_dst_regs; i++) {
                 RegSnap s;
-                if (fl->dst_regs[i] == REG_METAFLAGS) {
-                    g_reg_snaps.read_metaflags_into_snap(
-                        cpu_index, nl->dst_qemu_reg_keys[i], &s);
-                } else {
-                    g_reg_snaps.read_into_snap(
-                        cpu_index, nl->dst_qemu_reg_keys[i], &s);
-                }
+                g_reg_snaps.read_into_snap(
+                    cpu_index, nl->dst_qemu_reg_keys[i], &s);
                 pending_reg_snaps.push_back(s);
             }
         }

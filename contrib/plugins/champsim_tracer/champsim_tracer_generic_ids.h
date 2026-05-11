@@ -17,21 +17,22 @@
 #include <stdio.h>  /* snprintf in generic_reg_name */
 
 /*
- * REG_METAFLAGS bit layout.  ISA-agnostic subset of arithmetic flags
- * that trace-based simulation consumers actually care about;
- * populated by the snap collector from the architectural flags
- * register at capture time via the per-ISA shuffle in
- * isa_properties[trace_isa].flags_to_metaflags.  Bits not populated
- * by a given ISA stay zero (e.g. P is x86-only).  RISC-V and MIPS
- * have no integer flags register and REG_METAFLAGS never lands in
- * their templates' dst-reg lists.
+ * Canonical metaflags byte layout (v1.12+).  An ISA-agnostic subset
+ * of arithmetic flags that trace-based simulation consumers care
+ * about.  Carried in the wire format as a per-insn side-channel
+ * record under CST_FID_METAFLAGS (not as a synthetic register
+ * slot), populated by the encoder from the architectural REG_FLAGS
+ * dst snap via isa_properties[trace_isa].flags_to_metaflags.  Bits
+ * not populated by a given ISA stay zero (e.g. P is x86-only).
+ * RISC-V and MIPS have no integer flags register and never emit
+ * CST_FID_METAFLAGS records.
  *
  * One byte on the wire — the encoder treats it like any other
- * scalar register value, so the delta stream compresses it.
+ * scalar field, so the delta stream compresses it.
  *
  * Defined here in the lightweight header so the per-ISA mnemonic
- * tables (C-only TU) can synthesise the byte without pulling in
- * champsim_tracer.h's plugin / glib surface.
+ * tables (C-only TU) can supply the bit-shuffle helper without
+ * pulling in champsim_tracer.h's plugin / glib surface.
  */
 #define CST_METAFLAGS_Z    (1u << 0)  /* zero / equal */
 #define CST_METAFLAGS_N    (1u << 1)  /* negative / sign */
@@ -224,21 +225,7 @@ enum GenericRegId {
     REG_SYS = 243,
     REG_FCSR = 244,
     REG_VCTRL = 245,
-    /*
-     * Synthetic ISA-agnostic flags register.  Sits next to the special-
-     * purpose cluster rather than the REG_FLAGS slot because the
-     * mapping from architectural flags to metaflags isn't 1:1 — x86's
-     * DF/IF/IOPL bits and AArch64's PSTATE-only bits don't appear here
-     * — and a separate slot keeps the architectural REG_FLAGS data
-     * intact for any consumer that wants the raw view.
-     *
-     * Populated by the snap collector at REG_FLAGS-snap time on ISAs
-     * that have a flags register (x86 RFLAGS, AArch64 NZCV).  Never
-     * appears in dst-reg lists on ISAs without one (RISC-V, MIPS).
-     *
-     * Bit layout: CST_METAFLAGS_* constants in champsim_tracer.h.
-     */
-    REG_METAFLAGS = 246,
+    /* 246..249 unallocated. */
     /* Common architectural special registers: 250-254 */
     REG_SP = 250,
     REG_FLAGS = 251,
@@ -386,7 +373,6 @@ static inline const char *generic_reg_name(unsigned id)
     case REG_VCTRL:   return "REG_VCTRL";
     case REG_SP:      return "REG_SP";
     case REG_FLAGS:   return "REG_FLAGS";
-    case REG_METAFLAGS: return "REG_METAFLAGS";
     case REG_IP:      return "REG_IP";
     case REG_LR:      return "REG_LR";
     case REG_FP_REG:  return "REG_FP_REG";

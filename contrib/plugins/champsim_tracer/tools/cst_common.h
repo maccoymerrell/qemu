@@ -2,7 +2,7 @@
  * ChampSim Tracer offline tools — shared wire-format types.
  *
  * Glib-free, plugin-API-free, mmap-friendly POD types describing the
- * v1.7..v1.10 .cst trace format.  Both cst_decode and cst_audit link
+ * current .cst trace format.  Both cst_decode and cst_audit link
  * against this layer; the format-specific bits (header layout, tag
  * values, FID ranges) are duplicated here verbatim from the plugin's
  * champsim_tracer.h so the tools build without dragging QEMU's
@@ -33,31 +33,22 @@ namespace cst {
 
 /* ===== Wire-format magic ===== */
 
-inline constexpr uint32_t MAGIC_V17 = 0x17545343u;
-inline constexpr uint32_t MAGIC_V18 = 0x18545343u;
-inline constexpr uint32_t MAGIC_V19 = 0x19545343u;
-inline constexpr uint32_t MAGIC_V1A = 0x1A545343u;
-inline constexpr uint32_t MAGIC_V1B = 0x1B545343u;
-
-inline constexpr uint64_t TRAILER_MAGIC_V17 = 0x17545343FFFFFFFFull;
-inline constexpr uint64_t TRAILER_MAGIC_V18 = 0x18545343FFFFFFFFull;
-inline constexpr uint64_t TRAILER_MAGIC_V19 = 0x19545343FFFFFFFFull;
-inline constexpr uint64_t TRAILER_MAGIC_V1A = 0x1A545343FFFFFFFFull;
-inline constexpr uint64_t TRAILER_MAGIC_V1B = 0x1B545343FFFFFFFFull;
+inline constexpr uint32_t CST_MAGIC         = 0x1C545343u;
+inline constexpr uint64_t CST_TRAILER_MAGIC = 0x1C545343FFFFFFFFull;
 
 inline constexpr size_t TRAILER_SIZE = 64;
 
-/* ===== REG_METAFLAGS bit layout (v1.11+) ===== */
-
+/* ===== METAFLAGS bit layout =====
+ *
+ * Canonical Z/N/C/V/P byte carried in the field-delta stream under
+ * FID_METAFLAGS for every insn whose template writes the ISA's
+ * integer-flags register.  The numeric id of REG_FLAGS itself is
+ * resolved at parse time from the trace's "reg" encoding map. */
 inline constexpr uint8_t METAFLAGS_Z = 1u << 0;
 inline constexpr uint8_t METAFLAGS_N = 1u << 1;
 inline constexpr uint8_t METAFLAGS_C = 1u << 2;
 inline constexpr uint8_t METAFLAGS_V = 1u << 3;
 inline constexpr uint8_t METAFLAGS_P = 1u << 4;
-
-/* GenericRegId for the synthetic flags register; mirrors
- * REG_METAFLAGS = 246 in the plugin's generic_ids.h. */
-inline constexpr uint8_t REG_METAFLAGS_ID = 246;
 
 /* ===== Body tags ===== */
 
@@ -84,7 +75,7 @@ inline constexpr uint8_t FLAG_REG_DATA = 1u << 1;
 inline constexpr uint8_t WP_EVENT_TRANSLATION_UNAVAIL = 1u << 0;
 inline constexpr uint8_t WP_EVENT_FAULT               = 1u << 1;
 
-/* ===== Field IDs (unified delta stream, v1.8+) ===== */
+/* ===== Field IDs (unified delta stream) ===== */
 
 inline constexpr uint8_t FID_SLOT_COUNT       = 16;
 inline constexpr size_t  MAX_WIDE_BYTES       = 64;
@@ -107,6 +98,7 @@ inline constexpr uint8_t FID_INSN_BRANCH_TYPE = 0x73;
 inline constexpr uint8_t FID_INSN_FLAGS       = 0x74;
 inline constexpr uint8_t FID_INSN_IMMEDIATE   = 0x75;
 inline constexpr uint8_t FID_INSN_SIZE        = 0x76;
+inline constexpr uint8_t FID_METAFLAGS        = 0x77;
 inline constexpr uint8_t FID_EXTENDED         = 0xFF;
 
 inline constexpr int MAX_INSN_BYTES = 16;
@@ -146,7 +138,7 @@ struct Wide {
         return true;
     }
 
-    /* (a + delta) mod 2^N, where N is 128 (v1.7) or 512 (v1.8+).
+    /* (a + delta) mod 2^N (N=512).
      * @delta is a fully sign-extended Wide-shaped 8-limb array (the
      * shape produced by Reader::sleb_wide). */
     void add_signed_mod_wide(const std::array<uint64_t, LIMBS> &add,
@@ -209,27 +201,36 @@ struct RegSnap {
     Wide     value{};             /* full width */
 };
 
+/* Per-insn metaflags byte (FID_METAFLAGS).  Only emitted for insns
+ * whose template writes the ISA's integer-flags register. */
+struct MetaFlagsEntry {
+    uint32_t insn_index = 0;
+    uint8_t  byte       = 0;
+};
+
 struct WPEntry {
-    uint32_t              index = 0;
-    uint32_t              template_id = 0;
-    std::vector<DynParam> dyn_params;
-    std::vector<RegSnap>  reg_snaps;
-    bool                  fault = false;
-    bool                  translation_unavailable = false;
+    uint32_t                    index = 0;
+    uint32_t                    template_id = 0;
+    std::vector<DynParam>       dyn_params;
+    std::vector<RegSnap>        reg_snaps;
+    std::vector<MetaFlagsEntry> metaflags;
+    bool                        fault = false;
+    bool                        translation_unavailable = false;
     /* Only meaningful when fault. */
-    uint32_t              fault_insn_index = 0;
-    bool                  has_fault_idx = false;
-    uint32_t              n_insns = 0;
+    uint32_t                    fault_insn_index = 0;
+    bool                        has_fault_idx = false;
+    uint32_t                    n_insns = 0;
 };
 
 struct DecodedEntry {
-    uint32_t              seq_num = 0;
-    uint32_t              template_id = 0;
-    uint32_t              thread_id = 0;
-    bool                  thread_switched = false;
-    std::vector<DynParam> dyn_params;
-    std::vector<RegSnap>  reg_snaps;
-    std::vector<WPEntry>  wp_entries;
+    uint32_t                    seq_num = 0;
+    uint32_t                    template_id = 0;
+    uint32_t                    thread_id = 0;
+    bool                        thread_switched = false;
+    std::vector<DynParam>       dyn_params;
+    std::vector<RegSnap>        reg_snaps;
+    std::vector<MetaFlagsEntry> metaflags;
+    std::vector<WPEntry>        wp_entries;
 };
 
 /* ===== Template (parsed from the templates section) ===== */
@@ -271,15 +272,14 @@ struct EncodingMaps {
     std::unordered_map<uint64_t, std::string> insn_flag;
     std::unordered_map<uint64_t, std::string> body_tag;
     std::unordered_map<uint64_t, std::string> wp_event_flag;
-    /* "reg" map's per-entry initial-value blob: gen_id -> raw LE bytes. */
-    std::unordered_map<uint64_t, std::vector<uint8_t>> initial_regfile;
+    std::unordered_map<uint64_t, std::string> metaflags;
 };
 
 /* ===== Parsed header ===== */
 
 struct Header {
     uint32_t magic = 0;
-    uint8_t  format_version = 0;          /* 0x17, 0x18, 0x19 */
+    uint8_t  format_version = 0;
     uint8_t  isa = 0;                     /* TraceISA */
     uint8_t  flags = 0;
     uint64_t start_insn = 0;
@@ -293,21 +293,7 @@ struct Header {
 
     bool has_mem_data() const { return flags & FLAG_MEM_DATA; }
     bool has_reg_data() const { return flags & FLAG_REG_DATA; }
-    int  scalar_width_bits() const {
-        return (magic == MAGIC_V17) ? 128 : 512;
-    }
-    /*
-     * v1.9 introduced persistent WP-overlay deltas (each ENTRY's WP
-     * chain encodes against the running wp_field_state instead of
-     * forking from cp_state at chain start).  v1.10 added per-thread
-     * FieldStateTables; v1.11 added the synthetic REG_METAFLAGS dst
-     * slot.  All three keep the persistent-WP property.
-     */
-    bool wp_persistent() const {
-        return magic == MAGIC_V19 ||
-               magic == MAGIC_V1A ||
-               magic == MAGIC_V1B;
-    }
+    int  scalar_width_bits() const { return 512; }
 };
 
 struct Trailer {

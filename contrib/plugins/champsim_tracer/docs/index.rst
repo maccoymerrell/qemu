@@ -51,6 +51,14 @@ to the plugin shared object) read the binary trace and either emit a
 disassembly-style text dump or print a byte-budget breakdown of
 where bytes go.
 
+A Python harness, :doc:`validator`, generates self-checking
+workloads, runs them through the plugin, and validates the resulting
+trace against ~25 named correctness checks (encoding-map
+completeness, IFRAME / REGFILE / sync-hint / WP-event consistency,
+metaflags / regdata semantic reconstruction, multi-thread and
+multi-segment isolation, …).  It is the primary regression suite for
+tracer changes.
+
 If you use the tracer in published research, please cite the QEMU project
 as well as the tracer itself (an upcoming publication).
 
@@ -61,6 +69,7 @@ as well as the tracer itself (an upcoming publication).
    concepts
    quickstart
    decoder
+   validator
    troubleshooting
    limitations
 

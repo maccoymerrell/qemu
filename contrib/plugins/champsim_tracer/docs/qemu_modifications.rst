@@ -106,6 +106,73 @@ series) to give the WP simulator a usable speculative path.
    exactly when the host pointer is unavailable, the same as
    system mode.
 
+x86 lazy-flags resolution for plugin reads
+------------------------------------------
+
+QEMU's i386 target keeps the arithmetic-flag bits (CF / PF / AF / ZF /
+SF / OF) in a lazy ``CC_OP / CC_SRC / CC_DST`` shadow rather than in
+``env->eflags``, and only materialises them into ``env->eflags`` at
+specific sync points (helper calls that read flags, TB exit, signals).
+A plugin that reads ``eflags`` mid-TB via the gdbstub register path
+sees stale arithmetic-flag bits — typically the values left over from
+``cpu_exec_enter`` (CC_OP_EFLAGS plus whatever IF / reserved bits the
+prior TB ended with).
+
+Two cooperating patches are needed for plugin reads of EFLAGS to be
+correct.  Both are scoped narrowly so non-plugin builds and
+non-plugin TB execution are unchanged.
+
+``target/i386/gdbstub.c`` — ``IDX_FLAGS_REG`` read path
+
+   The ``x86_cpu_gdb_read_register`` case for ``IDX_FLAGS_REG`` now
+   returns ``cpu_compute_eflags(env)`` instead of raw ``env->eflags``.
+   ``cpu_compute_eflags`` dispatches on the current ``cc_op`` and
+   resolves the lazy CC bits via ``cpu_cc_compute_all(env)`` before
+   OR-ing them into the returned value.  Without this, the gdbstub
+   path (which is what ``qemu_plugin_read_register`` ultimately
+   reaches) emits only the non-lazy bits in ``env->eflags`` — useless
+   for tracing.
+
+``target/i386/tcg/translate.c`` — ``i386_tr_insn_start``
+
+   The patch above is necessary but not sufficient.  ``cc_op`` itself
+   is a TCG global written *lazily* by the translator via
+   ``gen_update_cc_op()`` only when ``s->cc_op_dirty`` is true at a
+   known sync point (helper call, branch, TB exit).  Plugin
+   ``QEMU_PLUGIN_CB_R_REGS`` callbacks are target-agnostic, so the
+   plugin infrastructure cannot know to flush ``cc_op`` for x86 —
+   meaning the global gets flushed to ``env->cc_op`` with whatever
+   value was last emitted as ``tcg_gen_movi_i32(cpu_cc_op, …)``,
+   typically the ``CC_OP_EFLAGS`` left over from TB entry.
+   ``cpu_compute_eflags`` then sees ``cc_op = CC_OP_EFLAGS`` and
+   ``cc_src = <last ALU op's source operand>``, interprets
+   ``cc_src`` as if it were a resolved-flags value, and returns
+   garbage.
+
+   The fix calls ``gen_update_cc_op(dc)`` at the very top of
+   ``i386_tr_insn_start`` when ``dcbase->plugin_enabled`` is set.
+   That guarantees every insn boundary materialises the prior insn's
+   ``cc_op`` into the TCG global before the next insn's plugin
+   ``PLUGIN_GEN_FROM_INSN`` placeholder is emitted — so the R_REGS
+   helper sees ``cc_op`` matching what the previous ALU op actually
+   set.  Cost is one ``movi`` per insn boundary, gated on plugin
+   active.
+
+   The same problem in principle exists for any target that defers
+   sync-point writes of shadow state across insns; the i386 patch
+   here is the only target currently affected (AArch64 NZCV is
+   updated eagerly).  A more general fix would be a per-arch
+   "flush translator state before R_REGS callbacks" hook in
+   ``accel/tcg/plugin-gen.c``; the localised i386 patch is the
+   minimal version that catches the bug today.
+
+The :doc:`validator`'s ``metaflags`` check is what surfaces this
+class of bug:  it predicts the canonical Z / N / P bits from the
+post-execution dst-register snap and asserts they match the
+FID_METAFLAGS byte the writer derived from ``REG_FLAGS``.  Before
+the two patches above were in place, every flag-writing x86
+arithmetic insn miscompared.
+
 Disassembly and target metadata
 -------------------------------
 

@@ -473,7 +473,10 @@ A byte-budget audit (helpful when tuning trace size) is one command:
      TRAILER                                      64 B    0.00%
    ...
 
-For both tools' full surface see :doc:`decoder`.
+For both tools' full surface see :doc:`decoder`.  For the
+self-checking workload harness that exercises the plugin under
+controlled inputs and verifies the resulting trace, see
+:doc:`validator`.
 
 .. _reproducibility:
 

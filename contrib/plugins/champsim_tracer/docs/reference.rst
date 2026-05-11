@@ -614,12 +614,106 @@ deltas against template defaults.  Detailed semantics are in
    * - 0x76
      - ``CST_FID_INSN_SIZE``
      - SLEB delta — instruction byte length.
-   * - 0x77..0xFE
+   * - 0x77
+     - ``CST_FID_METAFLAGS``
+     - SLEB delta — canonical Z/N/C/V/P byte for ALU insns that
+       write the ISA's integer-flags register
+       (see :ref:`metaflags`).  Gated by ``CST_FLAG_REG_DATA``;
+       emitted only when the insn's template sets
+       ``writes_int_flags`` (i.e., its dst maps to a
+       ``RegClassification`` row with ``.is_int_flags = true``).
+   * - 0x78..0xFE
      - *(reserved)*
      - Available for future scalar field-ID assignments.
    * - 0xFF
      - ``CST_FID_EXTENDED``
      - Reserved escape; not currently used.
+
+.. _metaflags:
+
+Canonical integer-flags byte (``CST_METAFLAGS_*``)
+--------------------------------------------------
+
+Different ISAs spell their condition-code bits differently — x86
+``EFLAGS`` carries CF / PF / AF / ZF / SF / OF at scattered bit
+positions, AArch64 packs N / Z / C / V into the top nibble of NZCV,
+RISC-V and MIPS have no integer-flags register at all.  Consumers
+that compute on flag semantics (branch-predictor models, value
+predictors, mis-speculation analyses) need a stable ISA-agnostic
+shape.
+
+The tracer emits one canonical byte per flag-writing instruction
+under the side-channel field ID ``CST_FID_METAFLAGS`` (``0x77``).
+The plugin derives this byte from the architectural flags-register
+snap by applying the per-ISA bit-shuffle mapper at capture time;
+consumers don't need to know the source ISA's flag-bit layout.
+
+Bit layout (``include/champsim_tracer_generic_ids.h``):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 8 18 74
+
+   * - Bit
+     - Name
+     - Meaning
+   * - 0
+     - ``CST_METAFLAGS_Z``
+     - Zero / equal (result == 0).
+   * - 1
+     - ``CST_METAFLAGS_N``
+     - Negative / sign (high bit of result).
+   * - 2
+     - ``CST_METAFLAGS_C``
+     - Unsigned carry / borrow.
+   * - 3
+     - ``CST_METAFLAGS_V``
+     - Signed overflow.
+   * - 4
+     - ``CST_METAFLAGS_P``
+     - Parity of the low byte (x86 only; always 0 on other ISAs).
+   * - 5..7
+     - *(reserved)*
+     - Written as 0; readers should mask before comparing.
+
+Per-ISA EFLAGS → metaflags mapping:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 14 86
+
+   * - ISA
+     - Mapping
+   * - x86_64
+     - ``CF→C`` (bit 0), ``PF→P`` (bit 2), ``ZF→Z`` (bit 6),
+       ``SF→N`` (bit 7), ``OF→V`` (bit 11).  AF and the system
+       bits (IF / DF / TF / IOPL / NT / …) are dropped.
+   * - aarch64
+     - NZCV top nibble of CPSR: ``N→N`` (bit 31), ``Z→Z`` (bit 30),
+       ``C→C`` (bit 29), ``V→V`` (bit 28).  No parity bit.
+   * - riscv64
+     - No architectural integer-flags register; the FID is never
+       emitted.  No insn classification row has
+       ``is_int_flags = true``.
+   * - mipsel
+     - No architectural integer-flags register; the FID is never
+       emitted.  Conditional branches read GPRs directly.
+
+The "canonical byte rides a side-channel field-ID, not a synthetic
+dst-register slot" design lets consumers reason about architectural
+register sets without filtering a phantom slot, and lets
+``writes_int_flags`` be a *static template* property rather than a
+runtime classification — the writer decides at template-build time
+(via the per-ISA ``RegClassification.is_int_flags`` marker on each
+Capstone-decoded dst register) whether to emit the FID.
+
+The encoding map carries the bit-name table under the
+``metaflags`` map (one entry per ``CST_METAFLAGS_*`` bit), so a
+consumer reading the trace can resolve ``0x05`` to ``Z|C`` without
+hard-coding the bit positions.  ``REG_FLAGS`` (generic id 251) is
+the *architectural* register name a consumer compares against to
+decide whether an insn writes flags; the metaflags byte under FID
+0x77 is the canonical-shape value.
 
 .. _isa-ids:
 

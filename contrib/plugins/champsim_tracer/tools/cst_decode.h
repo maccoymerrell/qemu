@@ -147,4 +147,23 @@ private:
     BodyStats stats_;
 };
 
+/*
+ * Fan a DecodedEntry out into a sequence of per-instance Instruction
+ * containers.  Order: every CP insn of the parent BB in template
+ * order (CP), then for each WP entry in chain order every insn of
+ * that WP's template (WP).  Per-insn dyn_params / reg_snaps /
+ * metaflags are filtered down to just the relevant insn.  Branch
+ * target templates are resolved when the trailing CP / WP insn
+ * carries a recognised direct branch immediate.
+ *
+ * Renderers and simulators that prefer "one instruction at a time"
+ * walk the returned vector; the walker-level DecodedEntry is no
+ * longer needed once the fan-out is built.
+ */
+std::vector<Instruction> instructions_from_entry(
+    const DecodedEntry &entry,
+    const Header &h,
+    const std::vector<Template> &templates,
+    const std::unordered_map<uint32_t, size_t> &template_by_id);
+
 }  /* namespace cst */

@@ -824,4 +824,160 @@ void BodyWalker::decode_field_delta(Reader &outer,
     }
 }
 
+namespace {
+
+/*
+ * Resolve a direct-branch target into the templates vector by
+ * matching the branch's static target PC against template start_pc.
+ * Returns nullptr if no template's start_pc matches — common for
+ * branches that jump outside the trace window, branches with
+ * indirect or unknown targets, or BRANCH_REP (target = self-PC,
+ * which is the same as the current BB's start_pc and surfaces via
+ * a different code path in the renderer).
+ */
+const Template *resolve_branch_target(
+    const Header &h, const InsnTemplate &I,
+    const std::vector<Template> &templates,
+    const std::unordered_map<uint32_t, size_t> &template_by_id)
+{
+    (void)template_by_id;
+    /* Only direct-target branches carry the target as an absolute
+     * immediate.  COND_DIRECT and DIRECT_JUMP qualify; INDIRECT_JUMP
+     * and RETURN do not.  REP is technically direct (target = self
+     * PC) but resolving it here would point at the parent BB, which
+     * is misleading — the renderer should annotate REP with the
+     * iteration counter, not the BB-start symbol.
+     *
+     * Match on the trace's own branch_type encoding-map names rather
+     * than compile-time enum values; the tools are intentionally
+     * decoupled from the plugin's generic_ids enum so a future
+     * tracer that re-numbers BRANCH_* stays decodable. */
+    if (!I.has_imm) return nullptr;
+    auto it = h.maps.branch_type.find(I.branch_type);
+    if (it == h.maps.branch_type.end()) return nullptr;
+    const std::string &name = it->second;
+    if (name != "BRANCH_DIRECT_JUMP" && name != "BRANCH_COND_DIRECT") {
+        return nullptr;
+    }
+    uint64_t target_pc = (uint64_t)I.imm;
+    /* Linear scan; for typical traces with <10k templates this is
+     * already cache-resident in the renderer hot path.  An indexed
+     * map keyed by start_pc would be a tiny memory win; not worth
+     * the build cost for the workloads we test on. */
+    for (const Template &t : templates) {
+        if (t.start_pc == target_pc) return &t;
+    }
+    return nullptr;
+}
+
+/* Pull every dyn_param / reg_snap / metaflags entry whose
+ * insn_index matches @idx into the destination Instruction's
+ * per-instance vectors.  Existing dyn_params / reg_snaps are
+ * already in template-walk order, so the relative ordering is
+ * preserved. */
+void filter_per_insn(Instruction &out,
+                     uint32_t idx,
+                     const std::vector<DynParam> &dyns,
+                     const std::vector<RegSnap> &snaps,
+                     const std::vector<MetaFlagsEntry> &metaflags)
+{
+    for (const DynParam &dp : dyns) {
+        if (dp.insn_index == idx) out.dyn_params.push_back(dp);
+    }
+    for (const RegSnap &rs : snaps) {
+        if (rs.insn_index == idx) out.reg_snaps.push_back(rs);
+    }
+    for (const MetaFlagsEntry &mf : metaflags) {
+        if (mf.insn_index == idx) out.metaflags.push_back(mf);
+    }
+}
+
+/* Build an Instruction for a single template insn position.  Used
+ * by both the CP and WP fan-out paths.  Caller fills wp-specific
+ * fields if applicable. */
+Instruction build_one(const Template &tmpl, uint32_t insn_idx,
+                      const DecodedEntry &entry,
+                      const Header &h,
+                      const std::vector<Template> &templates,
+                      const std::unordered_map<uint32_t, size_t> &by_id,
+                      const std::vector<DynParam> &dyns,
+                      const std::vector<RegSnap> &snaps,
+                      const std::vector<MetaFlagsEntry> &metaflags)
+{
+    Instruction insn;
+    const InsnTemplate &I = tmpl.insns[insn_idx];
+    insn.pc                 = I.pc;
+    insn.opcode             = I.opcode;
+    insn.branch_type        = I.branch_type;
+    insn.branch_conditional = I.branch_conditional;
+    insn.has_immediate      = I.has_imm;
+    insn.immediate          = I.imm;
+    insn.sync_hint          = I.sync_hint;
+    insn.src_regs           = I.src_regs;
+    insn.dst_regs           = I.dst_regs;
+    insn.raw_bytes          = I.raw_bytes;
+    insn.bb_template_id     = tmpl.template_id;
+    insn.insn_index_in_bb   = insn_idx;
+    insn.seq_num            = entry.seq_num;
+    insn.thread_id          = entry.thread_id;
+    insn.thread_switched    = entry.thread_switched;
+    insn.bb_template        = &tmpl;
+    insn.branch_target_template =
+        resolve_branch_target(h, I, templates, by_id);
+    filter_per_insn(insn, insn_idx, dyns, snaps, metaflags);
+    return insn;
+}
+
+}  /* anonymous namespace */
+
+std::vector<Instruction> instructions_from_entry(
+    const DecodedEntry &entry,
+    const Header &h,
+    const std::vector<Template> &templates,
+    const std::unordered_map<uint32_t, size_t> &template_by_id)
+{
+    std::vector<Instruction> out;
+    auto cp_it = template_by_id.find(entry.template_id);
+    if (cp_it == template_by_id.end()) return out;
+    const Template &cp_tmpl = templates[cp_it->second];
+    out.reserve(cp_tmpl.insns.size() +
+                entry.wp_entries.size() * 4);  /* rough; growth fine */
+
+    /* CP insns first, in template order. */
+    for (size_t i = 0; i < cp_tmpl.insns.size(); i++) {
+        out.push_back(build_one(cp_tmpl, (uint32_t)i, entry, h,
+                                templates, template_by_id,
+                                entry.dyn_params, entry.reg_snaps,
+                                entry.metaflags));
+    }
+
+    /* WP chain: every WP entry's insns, in chain order.  A WP entry
+     * may execute only a prefix of its template (wp.n_insns) before
+     * being cut off by a fault or translation gap — honour the wire
+     * value rather than the template's full insn count. */
+    for (const WPEntry &wp : entry.wp_entries) {
+        auto wp_it = template_by_id.find(wp.template_id);
+        if (wp_it == template_by_id.end()) continue;
+        const Template &wp_tmpl = templates[wp_it->second];
+        uint32_t wp_n = wp.n_insns < wp_tmpl.insns.size()
+                            ? wp.n_insns
+                            : (uint32_t)wp_tmpl.insns.size();
+        for (uint32_t i = 0; i < wp_n; i++) {
+            Instruction insn = build_one(wp_tmpl, i,
+                                         entry, h, templates,
+                                         template_by_id,
+                                         wp.dyn_params, wp.reg_snaps,
+                                         wp.metaflags);
+            insn.is_wp                  = true;
+            insn.wp_index               = (uint16_t)wp.index;
+            insn.wp_fault               = wp.fault;
+            insn.wp_translation_unavail = wp.translation_unavailable;
+            insn.wp_has_fault_idx       = wp.has_fault_idx;
+            insn.wp_fault_insn_index    = wp.fault_insn_index;
+            out.push_back(std::move(insn));
+        }
+    }
+    return out;
+}
+
 }  /* namespace cst */

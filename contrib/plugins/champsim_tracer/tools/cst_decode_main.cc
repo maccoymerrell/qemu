@@ -788,22 +788,18 @@ void append_pad_to(std::string *out, size_t target)
  * — branch targets append <symbol> when the target's BB is known
  * — the trailing `; ...` carries thread/bb/wp/sync flags for greppers
  *
+ * Consumes a fully-built cst::Instruction (dyn_params / reg_snaps /
+ * metaflags pre-filtered to this insn, branch_target_template
+ * already resolved).  @wp_status is the chain-level status string
+ * the caller derived once per WP run (nullptr for CP / clean WP).
+ *
  * One thread_local std::string is reused across calls; the only
  * allocations come from short append_hex / number conversions, and
  * those are amortised once the buffer reaches its high-water mark. */
 void render_disasm_insn(FILE *out, const DisasmContext &ctx,
-                        const cst::Template &tmpl,
-                        size_t insn_idx,
-                        const std::vector<cst::DynParam> &dyns,
-                        const std::vector<cst::RegSnap> &snaps,
-                        const std::vector<cst::MetaFlagsEntry> &mflags,
-                        uint32_t thread_id, uint32_t bb_id,
-                        bool is_wp,
-                        const char *wp_status,
-                        const cst::Template *branch_target_tmpl)
+                        const cst::Instruction &insn,
+                        const char *wp_status)
 {
-    const cst::InsnTemplate &I = tmpl.insns[insn_idx];
-
     /* Per-thread reusable buffer to avoid the malloc/free churn the
      * old per-line std::string + concat path created (~6 % memmove +
      * 5 % alloc/free on full-config mcf decode). */
@@ -812,12 +808,12 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
 
     /* PC + symbol prefix.  Padded to 12 hex chars so columns align. */
     line.append("0x");
-    append_hex_padded(&line, I.pc, 12);
-    if (!tmpl.symbol_name.empty()) {
+    append_hex_padded(&line, insn.pc, 12);
+    if (insn.bb_template && !insn.bb_template->symbol_name.empty()) {
         line.append(" <");
-        line.append(tmpl.symbol_name);
+        line.append(insn.bb_template->symbol_name);
         line.append("+0x");
-        append_hex(&line, I.pc - tmpl.start_pc);
+        append_hex(&line, insn.pc - insn.bb_template->start_pc);
         line.push_back('>');
     }
     line.append(": ");
@@ -827,9 +823,9 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
      * Each byte is two hex chars + a space; pad to a fixed width so
      * the mnemonic column lines up regardless of actual byte count. */
     size_t bytes_start = line.size();
-    for (size_t b = 0; b < I.raw_bytes.size(); b++) {
+    for (size_t b = 0; b < insn.raw_bytes.size(); b++) {
         if (b) line.push_back(' ');
-        append_byte_hex(&line, I.raw_bytes[b]);
+        append_byte_hex(&line, insn.raw_bytes[b]);
     }
     /* Pad to bytes_start + 7*3 + slack, putting the mnemonic at a
      * stable column. */
@@ -843,8 +839,8 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
     if (ctx.od) {
         size_t obj_start = line.size();
         std::string obj;
-        if (ctx.od->render_one(I.pc, I.raw_bytes.data(),
-                               I.raw_bytes.size(), &obj)) {
+        if (ctx.od->render_one(insn.pc, insn.raw_bytes.data(),
+                               insn.raw_bytes.size(), &obj)) {
             line.append(obj);
         } else {
             line.append("(undecoded)");
@@ -859,14 +855,14 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
      * doesn't have to repeat `br=...`.  Other opcodes use the
      * pre-built mnemonic table directly. */
     size_t mnem_start = line.size();
-    if (branch_is_none(*ctx.h, I.branch_type)) {
-        append_mnem(&line, ctx, I.opcode);
+    if (branch_is_none(*ctx.h, insn.branch_type)) {
+        append_mnem(&line, ctx, insn.opcode);
     } else if (const char *m =
                    branch_mnem_from_name(branch_name_lookup(*ctx.h,
-                                                            I.branch_type))) {
+                                                            insn.branch_type))) {
         line.append(m);
     } else {
-        append_mnem(&line, ctx, I.opcode);
+        append_mnem(&line, ctx, insn.opcode);
     }
     append_pad_to(&line, mnem_start + 8);
 
@@ -876,28 +872,27 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
         if (!first) line.append(", ");
         first = false;
     };
-    if (I.has_imm) {
+    if (insn.has_immediate) {
         sep();
         line.append("$0x");
-        append_hex(&line, (uint64_t)I.imm);
+        append_hex(&line, (uint64_t)insn.immediate);
     }
-    for (size_t k = 0; k < I.src_regs.size(); k++) {
+    for (size_t k = 0; k < insn.src_regs.size(); k++) {
         sep();
-        append_regref(&line, ctx, I.src_regs[k]);
+        append_regref(&line, ctx, insn.src_regs[k]);
     }
     /* Dst section.  Skipped entirely when there are no dst regs, so
      * NOPs and stores stay clean. */
-    if (!I.dst_regs.empty()) {
+    if (!insn.dst_regs.empty()) {
         if (!first) line.append(" -> ");
-        for (size_t k = 0; k < I.dst_regs.size(); k++) {
+        for (size_t k = 0; k < insn.dst_regs.size(); k++) {
             if (k) line.append(", ");
-            append_regref(&line, ctx, I.dst_regs[k]);
+            append_regref(&line, ctx, insn.dst_regs[k]);
             /* Find the matching reg_snap for this dst slot.  reg_snaps
-             * are emitted in template-walk order, so the operand_index
-             * lines up with k. */
-            for (const auto &r : snaps) {
-                if (r.insn_index == (uint32_t)insn_idx &&
-                    r.operand_index == (uint8_t)k) {
+             * are in template-walk order, so the operand_index lines
+             * up with k. */
+            for (const auto &r : insn.reg_snaps) {
+                if (r.operand_index == (uint8_t)k) {
                     line.append("[");
                     append_wide_hex(&line, r.value);
                     line.append("]");
@@ -911,8 +906,7 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
      * dst section for any insn whose template writes the integer-flags
      * register.  Pulled from the per-entry metaflags vector populated
      * by the body walker. */
-    for (const auto &mf : mflags) {
-        if (mf.insn_index != (uint32_t)insn_idx) continue;
+    for (const auto &mf : insn.metaflags) {
         if (first) {
             line.append(" ");
             first = false;
@@ -931,8 +925,7 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
      * when it happens to be zero — otherwise the absence of an `=` is
      * ambiguous between "memdata wasn't captured" and "the loaded /
      * stored value was zero". */
-    for (const auto &dp : dyns) {
-        if (dp.insn_index != (uint32_t)insn_idx) continue;
+    for (const auto &dp : insn.dyn_params) {
         line.append(dp.type == cst::DynParam::Load ? "  ld(0x" : "  st(0x");
         append_hex(&line, dp.addr);
         line.push_back(')');
@@ -943,13 +936,13 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
     }
 
     /* Branch annotations: target PC and symbol when known. */
-    if (!branch_is_none(*ctx.h, I.branch_type)) {
-        if (branch_target_tmpl) {
+    if (!branch_is_none(*ctx.h, insn.branch_type)) {
+        if (insn.branch_target_template) {
             line.append("  # 0x");
-            append_hex(&line, branch_target_tmpl->start_pc);
-            if (!branch_target_tmpl->symbol_name.empty()) {
+            append_hex(&line, insn.branch_target_template->start_pc);
+            if (!insn.branch_target_template->symbol_name.empty()) {
                 line.append(" <");
-                line.append(branch_target_tmpl->symbol_name);
+                line.append(insn.branch_target_template->symbol_name);
                 line.push_back('>');
             }
         }
@@ -970,13 +963,19 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
         begin_meta();
         line.append(wp_status);
     }
-    if (I.sync_hint != 0) {
+    if (insn.sync_hint != 0) {
         begin_meta();
         line.append("sync=");
-        line.append(enum_or(ctx.h->maps.sync_hint, I.sync_hint, "SYNC"));
+        line.append(enum_or(ctx.h->maps.sync_hint, insn.sync_hint, "SYNC"));
     }
-    if (ctx.show_deps && tmpl.insns[insn_idx].has_reg_deps) {
-        const cst::InsnTemplate &it = tmpl.insns[insn_idx];
+    /* Intra-instruction dependency masks live on the template (they
+     * describe the canonical insn shape, not the per-instance data).
+     * Look them up via Instruction::bb_template when --show-deps. */
+    if (ctx.show_deps && insn.bb_template &&
+        insn.insn_index_in_bb < insn.bb_template->insns.size() &&
+        insn.bb_template->insns[insn.insn_index_in_bb].has_reg_deps) {
+        const cst::InsnTemplate &it =
+            insn.bb_template->insns[insn.insn_index_in_bb];
         unsigned n_src = (unsigned)it.src_regs.size();
         /* The template's n_loads is the static load count baseline;
          * the wire format always writes 0 here so we approximate by
@@ -1035,7 +1034,6 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
             fmt_mask(&line, it.store_data_dep_mask[s]);
         }
     }
-    (void)thread_id; (void)bb_id; (void)is_wp;
     line.push_back('\n');
     std::fwrite(line.data(), 1, line.size(), out);
 }
@@ -1248,71 +1246,103 @@ void render_disasm(FILE *out, const cst::Header &h,
                      e.seq_num, e.thread_id,
                      e.thread_switched ? " (thread_switch)" : "");
 
-        /* For the BB-final branch (if any): look up the target BB's
-         * template so render_disasm_insn can append <target+sym>.
-         * The CP chain's final fragment is at fall_through_pc; the WP
-         * chain entries below resolve their own targets via wp[w+1]. */
+        /* Fan the DecodedEntry out into per-instruction containers.
+         * The builder handles CP-then-WP order, per-insn filtering of
+         * dyn_params / reg_snaps / metaflags, and resolves direct
+         * branch targets — so this loop only has to inject the
+         * per-WP-run separator line. */
+        std::vector<cst::Instruction> insns =
+            cst::instructions_from_entry(e, h, templates, by_id);
+
+        /* Override the CP-final branch target with the BB's
+         * fall_through_pc when no immediate-based target resolved.
+         * The fall-through PC carries the next BB for unconditional
+         * branches we couldn't statically resolve; mirrors the
+         * legacy renderer's behavior. */
         const cst::Template *cp_branch_target = nullptr;
         if (!t.insns.empty() && t.fall_through_pc) {
             auto fit = std::find_if(templates.begin(), templates.end(),
                 [&](const cst::Template &x) { return x.start_pc == t.fall_through_pc; });
             if (fit != templates.end()) cp_branch_target = &*fit;
         }
-        for (size_t i = 0; i < t.insns.size(); i++) {
-            const cst::Template *bt = (i + 1 == t.insns.size())
-                ? cp_branch_target : nullptr;
-            render_disasm_insn(out, ctx, t, i, e.dyn_params, e.reg_snaps,
-                               e.metaflags,
-                               e.thread_id, e.template_id,
-                               /* is_wp= */ false,
-                               /* wp_status= */ nullptr,
-                               bt);
-        }
-        for (size_t w = 0; w < e.wp_entries.size(); w++) {
-            const auto &wp = e.wp_entries[w];
-            auto wit = by_id.find(wp.template_id);
-            if (wit == by_id.end()) continue;
-            const cst::Template &wt = templates[wit->second];
-            std::string status;
-            if (wp.fault) {
-                if (wp.has_fault_idx) {
-                    char b[32];
-                    std::snprintf(b, sizeof(b), "FAULT@insn%u",
-                                  wp.fault_insn_index);
-                    status = b;
-                } else {
-                    status = "FAULT";
+
+        int  cur_wp_run = -1;     /* -1 = CP, otherwise WPEntry::index */
+        std::string wp_status;
+        for (size_t i = 0; i < insns.size(); i++) {
+            cst::Instruction &insn = insns[i];
+
+            if (!insn.is_wp) {
+                /* CP final-insn branch fallback (see comment above). */
+                bool is_cp_final =
+                    (i + 1 == insns.size() || insns[i + 1].is_wp);
+                if (is_cp_final && !insn.branch_target_template) {
+                    insn.branch_target_template = cp_branch_target;
+                }
+                render_disasm_insn(out, ctx, insn, /* wp_status= */ nullptr);
+                continue;
+            }
+
+            /* New WP run: emit the chain separator, recompute status
+             * and the run-final branch fallback (= next WP run's BB
+             * start, if any). */
+            if ((int)insn.wp_index != cur_wp_run) {
+                cur_wp_run = (int)insn.wp_index;
+                /* n_insns for this run = count of contiguous insns
+                 * sharing the same wp_index. */
+                size_t run_end = i;
+                while (run_end < insns.size() && insns[run_end].is_wp &&
+                       (int)insns[run_end].wp_index == cur_wp_run) {
+                    run_end++;
+                }
+                size_t run_n = run_end - i;
+
+                wp_status.clear();
+                if (insn.wp_fault) {
+                    if (insn.wp_has_fault_idx) {
+                        char b[32];
+                        std::snprintf(b, sizeof(b), "FAULT@insn%u",
+                                      insn.wp_fault_insn_index);
+                        wp_status = b;
+                    } else {
+                        wp_status = "FAULT";
+                    }
+                }
+                if (insn.wp_translation_unavail) {
+                    if (!wp_status.empty()) wp_status += ",";
+                    wp_status += "TRANSLATION_UNAVAILABLE";
+                }
+                std::fprintf(out,
+                             "; ..... wp[%u] BB %u n_insns=%zu%s%s -----\n",
+                             (unsigned)insn.wp_index, insn.bb_template_id,
+                             run_n,
+                             wp_status.empty() ? "" : " status=",
+                             wp_status.c_str());
+            }
+
+            /* WP-run final-insn branch fallback: next WP run's BB
+             * start, if any. */
+            bool is_run_final =
+                (i + 1 == insns.size() ||
+                 !insns[i + 1].is_wp ||
+                 (int)insns[i + 1].wp_index != cur_wp_run);
+            if (is_run_final && !insn.branch_target_template) {
+                /* Find the next WP run's first instruction. */
+                for (size_t j = i + 1; j < insns.size(); j++) {
+                    if (insns[j].is_wp &&
+                        (int)insns[j].wp_index != cur_wp_run) {
+                        auto nit = by_id.find(insns[j].bb_template_id);
+                        if (nit != by_id.end()) {
+                            insn.branch_target_template =
+                                &templates[nit->second];
+                        }
+                        break;
+                    }
                 }
             }
-            if (wp.translation_unavailable) {
-                if (!status.empty()) status += ",";
-                status += "TRANSLATION_UNAVAILABLE";
-            }
-            std::fprintf(out,
-                         "; ..... wp[%zu] BB %u n_insns=%u%s%s -----\n",
-                         w, wp.template_id, wp.n_insns,
-                         status.empty() ? "" : " status=",
-                         status.c_str());
-            /* WP-side branch target = next WP entry's BB start, if any. */
-            const cst::Template *wp_branch_target = nullptr;
-            if (w + 1 < e.wp_entries.size()) {
-                auto nit = by_id.find(e.wp_entries[w + 1].template_id);
-                if (nit != by_id.end()) {
-                    wp_branch_target = &templates[nit->second];
-                }
-            }
-            uint32_t wp_n = std::min<uint32_t>(wp.n_insns,
-                                               (uint32_t)wt.insns.size());
-            for (size_t i = 0; i < wp_n; i++) {
-                const cst::Template *bt = (i + 1 == wp_n)
-                    ? wp_branch_target : nullptr;
-                render_disasm_insn(out, ctx, wt, i, wp.dyn_params, wp.reg_snaps,
-                                   wp.metaflags,
-                                   e.thread_id, wp.template_id,
-                                   /* is_wp= */ true,
-                                   status.empty() ? nullptr : status.c_str(),
-                                   bt);
-            }
+
+            render_disasm_insn(out, ctx, insn,
+                               wp_status.empty() ? nullptr
+                                                 : wp_status.c_str());
         }
     });
 }

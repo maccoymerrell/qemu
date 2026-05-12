@@ -264,6 +264,79 @@ struct DecodedEntry {
     std::vector<WPEntry>        wp_entries;
 };
 
+/* Forward declarations so Instruction can hold non-owning pointers
+ * to template metadata defined further down in this header. */
+struct Template;
+struct InsnTemplate;
+
+/*
+ * Per-architectural-instance instruction container.
+ *
+ * One Instruction == one materialised execution of a single
+ * instruction (correct-path or wrong-path).  The body walker
+ * produces DecodedEntry objects keyed on BB visits; downstream
+ * code (renderer, simulator) usually wants to think in terms of
+ * single instructions instead.  cst::instructions_from_entry()
+ * fans a DecodedEntry out into a vector<Instruction> — one per CP
+ * insn followed by all WP insns in chain order, with the per-
+ * instance dyn_params / reg_snaps / metaflags already filtered to
+ * just that insn.  Renderers and simulators consume an
+ * Instruction without re-filtering by insn_index.
+ *
+ * Static fields (PC, opcode, src/dst lists, raw_bytes) are copies
+ * — Instructions are intended to outlive any specific
+ * DecodedEntry, so consumers can collect them into a vector and
+ * walk later.  Templates are pointers (non-owning) when present;
+ * the bb_template_id keeps the linkage symbolic for consumers
+ * that drop the pointers.
+ */
+struct Instruction {
+    /* Static template fields (copies). */
+    uint64_t              pc                  = 0;
+    uint8_t               opcode              = 0;
+    uint8_t               branch_type         = 0;
+    bool                  branch_conditional  = false;
+    bool                  has_immediate       = false;
+    int64_t               immediate           = 0;
+    uint8_t               sync_hint           = 0;
+    std::vector<uint8_t>  src_regs;
+    std::vector<uint8_t>  dst_regs;
+    std::vector<uint8_t>  raw_bytes;          /* 0..16 bytes */
+
+    /* Identifying context. */
+    uint32_t              bb_template_id      = 0;
+    uint32_t              insn_index_in_bb    = 0; /* position within bb */
+    uint32_t              seq_num             = 0; /* parent BB visit's seq */
+    uint32_t              thread_id           = 0;
+    bool                  thread_switched     = false;
+
+    /* Wrong-path metadata.  When is_wp == true, wp_index gives this
+     * instruction's position in the WP chain (0-based); the fault /
+     * translation_unavailable flags reflect any wp_event applied to
+     * the containing WP basic block. */
+    bool                  is_wp                   = false;
+    uint16_t              wp_index                = 0;
+    bool                  wp_fault                = false;
+    bool                  wp_translation_unavail  = false;
+    bool                  wp_has_fault_idx        = false;
+    uint32_t              wp_fault_insn_index     = 0;
+
+    /* Dynamic per-instance data, already filtered to this insn. */
+    std::vector<DynParam>       dyn_params;
+    std::vector<RegSnap>        reg_snaps;
+    std::vector<MetaFlagsEntry> metaflags;
+
+    /* Optional template pointers for renderer convenience.  Non-
+     * owning; valid for the lifetime of the templates vector this
+     * Instruction was built from.  bb_template carries the
+     * symbol_name / start_pc the renderer formats next to the PC;
+     * branch_target_template is the template whose start_pc equals
+     * the branch's static target (resolved by the builder when the
+     * insn carries a recognised branch and immediate). */
+    const Template       *bb_template          = nullptr;
+    const Template       *branch_target_template = nullptr;
+};
+
 /* ===== Template (parsed from the templates section) ===== */
 
 struct InsnTemplate {

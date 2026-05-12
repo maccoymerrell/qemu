@@ -607,6 +607,27 @@ def classify_x86(m: str) -> Entry:
         return ent("GEN_OP_TLB_FLUSH", flags="MF_ATOMIC")
     if m.startswith(("invd", "invept", "invpcid", "invvpid", "wbinvd", "wbnoinvd", "serialize")):
         return ent("GEN_OP_FENCE", flags="MF_ATOMIC")
+    # String / REP-prefixable instructions where the underlying
+    # classification would otherwise be the LOAD / STORE fall-through:
+    # the memory access is incidental, the defining behaviour is the
+    # implicit RSI / RDI advance by operand size on every iteration.
+    # Caught BEFORE the generic "out* -> STORE" and "in/ins* -> LOAD"
+    # rules below.  Specifically NOT included:
+    #   - MOVS{B,W,Q}: MOV is itself a specific operation (register-
+    #     /memory-data motion), not a generic fall-through; the
+    #     pointer advance is a side effect.  Falls through to the
+    #     mov* rule below.
+    #   - CMPS / SCAS: CMP is a specific operation; pointer advance
+    #     does not displace it.  CMPS reaches CMP via the generic
+    #     'cmp*' prefix rule further down; SCAS gets its own rule
+    #     below.
+    if re.match(r"^(stos|lods|ins|outs)[bwq]$", m) \
+            or m in {"lodsd", "stosd", "insd", "outsd"}:
+        return ent("GEN_OP_INT_ADD")
+    if re.match(r"^scas[bwdq]$", m):
+        return ent("GEN_OP_CMP")
+    if re.match(r"^movs[bwq]$", m):
+        return ent("GEN_OP_MOV")
     if m.startswith("xsave") or m.startswith("stmxcsr") or m.startswith(("clrssbsy", "clzero", "ptwrite", "sgdt", "sidt", "wrssd", "wrssq", "wrussd", "wrussq", "xstore")) or re.match(r"^out", m):
         return ent("GEN_OP_STORE")
     if m.startswith("xrstor") or m.startswith("ldmxcsr") or m.startswith(("lgdt", "lidt", "lldt", "llwpcb", "lmsw", "ltr", "rdmsr", "rdpmc", "rstorssp", "sldt", "slwpcb", "smsw", "str")) or re.match(r"^in(s|$)", m):
@@ -624,22 +645,20 @@ def classify_x86(m: str) -> Entry:
     if m.startswith(("monitor", "mwait", "umonitor", "umwait", "tpause", "xabort", "xbegin", "xend", "xtest")):
         return ent("GEN_OP_NOP")
 
-    if m.startswith("cmpxchg") or m.startswith("xchg") or m.startswith("xadd"):
+    if m.startswith("cmpxchg") or m.startswith("xchg"):
         return ent("GEN_OP_XCHG", flags="MF_ATOMIC")
+    # XADD atomically exchanges-and-adds.  XCHG would be the wrong
+    # classification: functionally the data-mutation is an add, the
+    # exchange is just how the result is delivered.  Match the LDADD
+    # convention on the other ISAs.
+    if m.startswith("xadd"):
+        return ent("GEN_OP_INT_ADD", flags="MF_ATOMIC")
     if m.startswith("cmov") or m.startswith("fcmov"):
         return ent("GEN_OP_CMOV")
     if re.match(r"^set[a-z0-9]+$", m):
         return ent("GEN_OP_SETCC")
     if m == "salc":
         return ent("GEN_OP_SETCC")
-    if re.match(r"^movs[bwq]$", m):
-        return ent("GEN_OP_MOV")
-    if re.match(r"^stos[bwdq]$", m):
-        return ent("GEN_OP_STORE")
-    if re.match(r"^lods[bwdq]$", m):
-        return ent("GEN_OP_LOAD")
-    if re.match(r"^scas[bwdq]$", m):
-        return ent("GEN_OP_CMP")
     if m.startswith(("movsx", "movsxd", "cbw", "cwde", "cdqe", "cwd", "cdq", "cqo")):
         return ent("GEN_OP_MOVSX")
     if m.startswith("movzx"):
@@ -885,6 +904,16 @@ def classify_aarch64(m: str) -> Entry:
         return ent("GEN_OP_OR", flags="MF_ATOMIC")
     if m.startswith(("ldsmax", "ldsmin", "ldumax", "ldumin", "stsmax", "stsmin", "stumax", "stumin")):
         return ent("GEN_OP_XCHG", flags="MF_ATOMIC")
+    # Load-exclusive / store-exclusive: single load / single store
+    # paired with an exclusive monitor.  Not RMW individually but is
+    # an atomic-access primitive in the ISA, so flag MF_ATOMIC.
+    # LDAR / LDAPR / LDLAR / STLR / STLLR are memory-ordered single
+    # ops — neither RMW nor in the atomic-access category — so they
+    # fall through to the plain LOAD / STORE clauses below.
+    if m.startswith(("ldxr", "ldaxr", "ldxp", "ldaxp")):
+        return ent("GEN_OP_LOAD", flags="MF_ATOMIC")
+    if m.startswith(("stxr", "stlxr", "stxp", "stlxp")):
+        return ent("GEN_OP_STORE", flags="MF_ATOMIC")
     if m.startswith(("ld", "ldap", "ldar")):
         return ent("GEN_OP_LOAD")
     if m.startswith("st"):
@@ -1060,8 +1089,15 @@ def classify_riscv(m: str) -> Entry:
         if m.startswith("amoxor"):
             return ent("GEN_OP_XOR", flags="MF_ATOMIC")
         return ent("GEN_OP_XCHG", flags="MF_ATOMIC")
-    if m.startswith(("lr_", "sc_")):
-        return ent("GEN_OP_XCHG", flags="MF_ATOMIC")
+    # RISC-V load-reserved / store-conditional: tagged single load /
+    # single store, not a swap.  The reservation is a monitor side
+    # effect; the pair forms an atomic RMW only when SC sees its
+    # reservation intact.  Each instruction is LOAD/STORE with
+    # MF_ATOMIC to flag the exclusive-monitor primitive.
+    if m.startswith("lr_"):
+        return ent("GEN_OP_LOAD", flags="MF_ATOMIC")
+    if m.startswith("sc_"):
+        return ent("GEN_OP_STORE", flags="MF_ATOMIC")
     if m.startswith("ssamoswap"):
         return ent("GEN_OP_XCHG", flags="MF_ATOMIC")
     if m.startswith("sspush"):
@@ -1296,8 +1332,14 @@ def classify_mips(m: str) -> Entry:
         return ent("GEN_OP_NOP")
     if m.startswith(("movn", "movz")):
         return ent("GEN_OP_CMOV")
-    if m.startswith(("ll", "sc")):
-        return ent("GEN_OP_XCHG", flags="MF_ATOMIC")
+    # MIPS load-linked / store-conditional: tagged single load / single
+    # store, not a swap.  The pair forms an atomic RMW only when the
+    # SC's monitor is still set, so each individual op is LOAD/STORE
+    # with MF_ATOMIC to flag the exclusive-monitor primitive.
+    if m in {"ll", "lld", "lle", "llwp"}:
+        return ent("GEN_OP_LOAD", flags="MF_ATOMIC")
+    if m in {"sc", "scd", "sce", "scwp"}:
+        return ent("GEN_OP_STORE", flags="MF_ATOMIC")
     if re.match(r"^c_.*_(s|d|ps)$", m):
         return ent("GEN_OP_FP_CMP")
     if m in {"li", "li16", "dli"} or m.startswith("li_"):

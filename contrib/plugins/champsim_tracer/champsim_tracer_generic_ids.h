@@ -130,6 +130,24 @@ enum GenericOpcode {
     GEN_OP_PREFETCH = 58,
     GEN_OP_CACHE_FLUSH = 59,
     GEN_OP_TLB_FLUSH = 60,
+    /*
+     * Coarse fallback latency buckets, reserved for external trace
+     * writers that lack ISA-specific opcode metadata.  The in-tree
+     * tracer never emits these IDs (every Capstone-classified insn
+     * lands in one of the specific opcodes above), but consumer code
+     * is encouraged to handle them so foreign traces remain
+     * decodable.  SHORT vs LONG is a single-bit hint that the
+     * upstream classifier knows the op's pipeline latency class:
+     * SHORT is a single-cycle ALU op; LONG is anything that occupies
+     * a long-latency unit (multi-cycle multiplier, divider, vector
+     * pipe, etc.).
+     */
+    GEN_OP_INT_ALU_SHORT = 61,
+    GEN_OP_INT_ALU_LONG  = 62,
+    GEN_OP_FP_ALU_SHORT  = 63,
+    GEN_OP_FP_ALU_LONG   = 64,
+    GEN_OP_VEC_ALU_SHORT = 65,
+    GEN_OP_VEC_ALU_LONG  = 66,
     GEN_OP_COUNT
 };
 
@@ -309,6 +327,12 @@ static inline const char *generic_opcode_name(unsigned id)
     case GEN_OP_PREFETCH:   return "GEN_OP_PREFETCH";
     case GEN_OP_CACHE_FLUSH: return "GEN_OP_CACHE_FLUSH";
     case GEN_OP_TLB_FLUSH:  return "GEN_OP_TLB_FLUSH";
+    case GEN_OP_INT_ALU_SHORT: return "GEN_OP_INT_ALU_SHORT";
+    case GEN_OP_INT_ALU_LONG:  return "GEN_OP_INT_ALU_LONG";
+    case GEN_OP_FP_ALU_SHORT:  return "GEN_OP_FP_ALU_SHORT";
+    case GEN_OP_FP_ALU_LONG:   return "GEN_OP_FP_ALU_LONG";
+    case GEN_OP_VEC_ALU_SHORT: return "GEN_OP_VEC_ALU_SHORT";
+    case GEN_OP_VEC_ALU_LONG:  return "GEN_OP_VEC_ALU_LONG";
     default:                return NULL;
     }
 }

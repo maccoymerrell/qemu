@@ -535,6 +535,59 @@ Instructions in these classes that have no memory operand (e.g. x86
 `WBINVD`, AArch64 `IC IALLU`) emit no synthesized address and stay
 classified under `GEN_OP_FENCE`.
 
+#### LOAD / STORE as fall-through classifications
+
+`GEN_OP_LOAD` and `GEN_OP_STORE` are fall-through buckets that say
+"data motion happens, nothing else does." When an instruction does
+something *more* than load-store-of-data, the opcode reflects that
+more specific operation:
+
+* **Atomic RMW where the data is mutated by an arithmetic op** —
+  AArch64 `LDADD` / `LDCLR` / `LDEOR` / `LDSET`, RISC-V `AMOADD` /
+  `AMOAND` / `AMOOR` / `AMOXOR`, x86 `XADD` — classify as the
+  arithmetic op (`INT_ADD` / `AND` / `XOR` / `OR`) with `MF_ATOMIC`.
+  The load and store are incidental to the modify.
+* **Atomic exchange** — AArch64 `SWP` / `CAS{P}`, RISC-V `AMOSWAP` /
+  `AMOCAS`, x86 `XCHG` / `CMPXCHG` — classify as `XCHG` with
+  `MF_ATOMIC`. `XCHG` is reserved for instructions whose semantic IS
+  swap.
+* **Exclusive-monitor primitives that are individually just a tagged
+  load or tagged store** — MIPS `LL` / `SC`, RISC-V `LR` / `SC`,
+  AArch64 `LDXR` / `LDAXR` / `STXR` / `STLXR` — classify as
+  `LOAD` / `STORE` with `MF_ATOMIC`. The monitor is a side effect
+  on hardware state; the data is unmodified.
+* **Loads / stores with implicit pointer arithmetic** — x86 string
+  ops `LODS` / `STOS` / `INS` / `OUTS` advance `RSI`/`RDI` by the
+  operand size on every iteration, so classify as `INT_ADD` even
+  though the data motion is still occurring. AArch64 writeback
+  `LDR` / `STR` / `LDP` / `STP` (`[Xn]!` or `[Xn], #imm`) are the
+  ARM equivalent — Capstone collapses them with the non-writeback
+  forms, so the per-ISA refiner detects the implicit base-register
+  write at translation time and reclassifies to `INT_ADD`.
+* **`MOV` / `CMP` are not fall-through** — they describe specific
+  operations (data motion, comparison) and stay even when there is
+  a side-effect pointer advance: x86 `MOVS{B,W,Q}` keeps `MOV`,
+  `CMPS{B,W,Q}` / `SCAS{B,W,D,Q}` keep `CMP`.
+* **Load-acquire / store-release** (AArch64 `LDAR` / `STLR` /
+  `LDAPR` / `LDLAR` / `STLLR`, RISC-V `.aq` / `.rl` variants when
+  paired with `LR` / `SC`) — memory ordering hints, not atomic
+  primitives in the RMW sense. Classified as plain `LOAD` /
+  `STORE` (without `MF_ATOMIC`); the ordering metadata is not
+  currently surfaced on the wire.
+
+#### Reserved fallback latency opcodes
+
+The opcode space carries six reserved IDs the in-tree tracer never
+emits: `GEN_OP_INT_ALU_SHORT` (61), `GEN_OP_INT_ALU_LONG` (62),
+`GEN_OP_FP_ALU_SHORT` (63), `GEN_OP_FP_ALU_LONG` (64),
+`GEN_OP_VEC_ALU_SHORT` (65), `GEN_OP_VEC_ALU_LONG` (66). They exist
+as a coarse fallback for external trace writers that lack ISA-specific
+opcode metadata: SHORT is a single-cycle ALU op; LONG is anything
+that occupies a long-latency unit (multi-cycle multiplier, divider,
+vector pipe, etc.). Consumer code should handle them so foreign
+traces remain decodable; in-tree traces always carry the more specific
+opcode classifications above.
+
 ```
 current n_loads = state(template, insn, CST_FID_N_LOADS)
 current n_stores = state(template, insn, CST_FID_N_STORES)

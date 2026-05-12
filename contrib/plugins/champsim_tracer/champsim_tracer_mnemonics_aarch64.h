@@ -787,15 +787,43 @@ static const RegClassification aarch64_reg_class[AARCH64_REG_ENDING] = {
 };
 
 /*
- * Memory counts are runtime fields derived from QEMU memory callbacks,
- * not from opcode semantics or Capstone operand-access flags.  This
- * refiner remains as a no-op for generated table entries that reference it.
+ * Reclassify writeback LDR / STR / LDP / STP variants as INT_ADD.
+ *
+ * Capstone uses the same instruction ID for "LDR Xd, [Xn]" and for
+ * "LDR Xd, [Xn], #imm" / "LDR Xd, [Xn, #imm]!", so the static table
+ * can only see the base mnemonic.  At runtime we can detect writeback
+ * by comparing the number of regs Capstone reports as written to the
+ * number of explicit register-operand destinations:
+ *
+ *   LDR Xd, [Xn]            — 1 reg-op write, n_regs_write = 1.
+ *   LDR Xd, [Xn]!  / , #imm — 1 reg-op write, n_regs_write = 2
+ *                             (the base Xn gets written by writeback).
+ *   STR Xs, [Xn]            — 0 reg-op writes, n_regs_write = 0.
+ *   STR Xs, [Xn]!  / , #imm — 0 reg-op writes, n_regs_write = 1.
+ *   LDP Xd1, Xd2, [Xn]      — 2 reg-op writes, n_regs_write = 2.
+ *   LDP Xd1, Xd2, [Xn]!     — 2 reg-op writes, n_regs_write = 3.
+ *
+ * When n_regs_write exceeds the explicit-destination count, the
+ * difference is the base-register writeback — semantically a pointer
+ * advance happening alongside the memory access, so the more specific
+ * operation is INT_ADD, not LOAD / STORE.  Memory counts are still
+ * runtime fields derived from QEMU memory callbacks; only opcode is
+ * touched here.
  */
 static void refine_arm64_ldst_access(
     const struct qemu_plugin_insn_info *info, InsnFields *f)
 {
-    (void)info;
-    (void)f;
+    unsigned explicit_writes = 0;
+    for (unsigned i = 0; i < info->n_operands; i++) {
+        const qemu_plugin_operand *op = &info->operands[i];
+        if (op->type == QEMU_PLUGIN_OP_REG
+            && (op->access & QEMU_PLUGIN_OP_ACC_WRITE)) {
+            explicit_writes++;
+        }
+    }
+    if (info->n_regs_write > explicit_writes) {
+        f->opcode = GEN_OP_INT_ADD;
+    }
 }
 
 static const InsnClassification aarch64_insn_class[AARCH64_INS_ENDING] = {
@@ -1379,10 +1407,10 @@ static const InsnClassification aarch64_insn_class[AARCH64_INS_ENDING] = {
                                         .refine = refine_arm64_ldst_access },
     [AARCH64_INS_LDAR]                    = { GEN_OP_LOAD,   BRANCH_NONE,           MF_NONE,
                                         .refine = refine_arm64_ldst_access },
-    [AARCH64_INS_LDAXP]                   = { GEN_OP_LOAD,   BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_LDAXRB]                  = { GEN_OP_LOAD,   BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_LDAXRH]                  = { GEN_OP_LOAD,   BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_LDAXR]                   = { GEN_OP_LOAD,   BRANCH_NONE,           MF_NONE },
+    [AARCH64_INS_LDAXP]                   = { GEN_OP_LOAD,   BRANCH_NONE,           MF_ATOMIC },
+    [AARCH64_INS_LDAXRB]                  = { GEN_OP_LOAD,   BRANCH_NONE,           MF_ATOMIC },
+    [AARCH64_INS_LDAXRH]                  = { GEN_OP_LOAD,   BRANCH_NONE,           MF_ATOMIC },
+    [AARCH64_INS_LDAXR]                   = { GEN_OP_LOAD,   BRANCH_NONE,           MF_ATOMIC },
     [AARCH64_INS_LDCLRAB]                 = { GEN_OP_AND,    BRANCH_NONE,           MF_ATOMIC },
     [AARCH64_INS_LDCLRAH]                 = { GEN_OP_AND,    BRANCH_NONE,           MF_ATOMIC },
     [AARCH64_INS_LDCLRALB]                = { GEN_OP_AND,    BRANCH_NONE,           MF_ATOMIC },
@@ -1540,10 +1568,10 @@ static const InsnClassification aarch64_insn_class[AARCH64_INS_ENDING] = {
     [AARCH64_INS_LDURSW]                  = { GEN_OP_LOAD,   BRANCH_NONE,           MF_NONE,
                                         .refine = refine_arm64_ldst_access },
     [AARCH64_INS_LDX]                     = { GEN_OP_LOAD,   BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_LDXP]                    = { GEN_OP_LOAD,   BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_LDXRB]                   = { GEN_OP_LOAD,   BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_LDXRH]                   = { GEN_OP_LOAD,   BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_LDXR]                    = { GEN_OP_LOAD,   BRANCH_NONE,           MF_NONE },
+    [AARCH64_INS_LDXP]                    = { GEN_OP_LOAD,   BRANCH_NONE,           MF_ATOMIC },
+    [AARCH64_INS_LDXRB]                   = { GEN_OP_LOAD,   BRANCH_NONE,           MF_ATOMIC },
+    [AARCH64_INS_LDXRH]                   = { GEN_OP_LOAD,   BRANCH_NONE,           MF_ATOMIC },
+    [AARCH64_INS_LDXR]                    = { GEN_OP_LOAD,   BRANCH_NONE,           MF_ATOMIC },
     [AARCH64_INS_LDY]                     = { GEN_OP_LOAD,   BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_LDZ]                     = { GEN_OP_LOAD,   BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_LDZI]                    = { GEN_OP_LOAD,   BRANCH_NONE,           MF_NONE },
@@ -1998,10 +2026,10 @@ static const InsnClassification aarch64_insn_class[AARCH64_INS_ENDING] = {
     [AARCH64_INS_STLURB]                  = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_STLURH]                  = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_STLUR]                   = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_STLXP]                   = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_STLXRB]                  = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_STLXRH]                  = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_STLXR]                   = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },
+    [AARCH64_INS_STLXP]                   = { GEN_OP_STORE,  BRANCH_NONE,           MF_ATOMIC },
+    [AARCH64_INS_STLXRB]                  = { GEN_OP_STORE,  BRANCH_NONE,           MF_ATOMIC },
+    [AARCH64_INS_STLXRH]                  = { GEN_OP_STORE,  BRANCH_NONE,           MF_ATOMIC },
+    [AARCH64_INS_STLXR]                   = { GEN_OP_STORE,  BRANCH_NONE,           MF_ATOMIC },
     [AARCH64_INS_STNP]                    = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE,
                                         .refine = refine_arm64_ldst_access },
     [AARCH64_INS_STNT1B]                  = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },
@@ -2029,10 +2057,10 @@ static const InsnClassification aarch64_insn_class[AARCH64_INS_ENDING] = {
     [AARCH64_INS_STURH]                   = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE,
                                         .refine = refine_arm64_ldst_access },
     [AARCH64_INS_STX]                     = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_STXP]                    = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_STXRB]                   = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_STXRH]                   = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },
-    [AARCH64_INS_STXR]                    = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },
+    [AARCH64_INS_STXP]                    = { GEN_OP_STORE,  BRANCH_NONE,           MF_ATOMIC },
+    [AARCH64_INS_STXRB]                   = { GEN_OP_STORE,  BRANCH_NONE,           MF_ATOMIC },
+    [AARCH64_INS_STXRH]                   = { GEN_OP_STORE,  BRANCH_NONE,           MF_ATOMIC },
+    [AARCH64_INS_STXR]                    = { GEN_OP_STORE,  BRANCH_NONE,           MF_ATOMIC },
     [AARCH64_INS_STY]                     = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_STZ]                     = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },
     [AARCH64_INS_STZ2G]                   = { GEN_OP_STORE,  BRANCH_NONE,           MF_NONE },

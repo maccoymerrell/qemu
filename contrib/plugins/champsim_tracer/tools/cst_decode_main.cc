@@ -1260,15 +1260,18 @@ int main(int argc, char **argv)
     const char *format = "disasm";
     bool templates_only = false;
     bool show_objdump   = false;
+    uint64_t max_entries = 0;            /* 0 = unbounded */
 
     auto usage = [&]() {
         std::fprintf(stderr,
             "usage: %s [--format=disasm|legacy] [--templates-only] "
-            "[--objdump] <trace.cst>\n"
+            "[--objdump] [--max N] <trace.cst>\n"
             "  --templates-only  print only the template dictionary,\n"
             "                    skip the body delta-replay\n"
             "  --objdump         emit Capstone-rendered native disasm\n"
-            "                    of each insn alongside the generic view\n",
+            "                    of each insn alongside the generic view\n"
+            "  --max N           stop after N body entries (tears the\n"
+            "                    decompressor subprocess down early)\n",
             argv[0]);
     };
 
@@ -1281,6 +1284,10 @@ int main(int argc, char **argv)
             templates_only = true;
         } else if (std::strcmp(argv[i], "--objdump") == 0) {
             show_objdump = true;
+        } else if (std::strncmp(argv[i], "--max=", 6) == 0) {
+            max_entries = std::strtoull(argv[i] + 6, nullptr, 10);
+        } else if (std::strcmp(argv[i], "--max") == 0 && i + 1 < argc) {
+            max_entries = std::strtoull(argv[++i], nullptr, 10);
         } else if (argv[i][0] == '-') {
             usage();
             return 2;
@@ -1327,16 +1334,20 @@ int main(int argc, char **argv)
         }
 
         if (templates_only) {
+            /* No body access at all — no decompressor spawned, no
+             * body bytes read off disk.  Cheap even on huge traces. */
             render_templates_only(stdout, h, templates, by_id, odp);
         } else {
-            /* Body member: leading + trailing CST_MAGIC bracket the
-             * records.  body_records_view strips both, leaving just
-             * the BODY_TAG_* stream for the walker. */
-            cst::MemberView body_records =
-                cst::body_records_view(cf->body());
+            /* Open the body as a streaming Reader.  For compressed
+             * bodies this forks the decompressor; uncompressed
+             * bodies wrap the mmap directly.  Leading CST_MAGIC is
+             * stripped at open(); trailing CST_MAGIC is verified by
+             * finalize() (skipped on --max early exit, where the
+             * subprocess is torn down by BodyStream's destructor). */
+            auto body_stream = cst::body_stream_open(*cf);
             cst::BodyWalker walker(h, templates, by_id,
-                                   body_records.data, body_records.size,
-                                   0, body_records.size);
+                                   body_stream->reader());
+            walker.set_max_entries(max_entries);
             if (std::strcmp(format, "legacy") == 0) {
                 render_legacy(stdout, h, templates, by_id, walker);
             } else if (std::strcmp(format, "disasm") == 0) {
@@ -1345,6 +1356,13 @@ int main(int argc, char **argv)
                 std::fprintf(stderr,
                              "cst_decode: unknown format '%s'\n", format);
                 return 2;
+            }
+            /* finalize() reads + verifies the trailing magic.  Skip
+             * it if we stopped early — the body wasn't fully drained
+             * and the trailing magic isn't reachable. */
+            if (max_entries == 0 ||
+                walker.stats().cp_entries < max_entries) {
+                body_stream->finalize();
             }
         }
     } catch (const std::exception &e) {

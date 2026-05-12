@@ -7,6 +7,7 @@
 #include "cst_format.h"
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -301,15 +302,6 @@ std::vector<TarMember> walk_tar(const uint8_t *data, size_t size)
     return out;
 }
 
-/* Dispatch a decompressor based on filename suffix.  Reads @src into
- * @out_buf by piping through the matching CLI (zstd / xz / gzip /
- * bzip2 / lz4).  Throws if no decompressor matches or the child
- * exits non-zero.  An uncompressed (no recognised suffix) member is
- * copied straight from @src into @out_buf.
- *
- * popen-based: yes the cost is a fork+exec but it's a few ms per
- * decompression and avoids dragging in libzstd / liblzma / etc. as
- * link dependencies of the tools. */
 std::string codec_from_suffix(const std::string &member_name)
 {
     auto ends_with = [&](const char *suf) {
@@ -325,76 +317,172 @@ std::string codec_from_suffix(const std::string &member_name)
     return "";
 }
 
-void decompress_member(const TarMember &m, std::vector<uint8_t> *out_buf)
-{
-    std::string codec = codec_from_suffix(m.name);
-    if (codec.empty()) {
-        out_buf->assign(m.data, m.data + m.size);
-        return;
-    }
-    /* Pipe: parent writes @m.data into child's stdin; child writes
-     * decompressed bytes back via stdout to a separate pipe. */
-    int in_pipe[2];
-    int out_pipe[2];
-    if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0) {
-        throw std::runtime_error("pipe failed");
-    }
-    pid_t pid = fork();
-    if (pid < 0) {
-        throw std::runtime_error("fork failed");
-    }
-    if (pid == 0) {
-        dup2(in_pipe[0], 0);
-        dup2(out_pipe[1], 1);
-        close(in_pipe[0]); close(in_pipe[1]);
-        close(out_pipe[0]); close(out_pipe[1]);
-        execlp(codec.c_str(), codec.c_str(), "-d", "-c", (char *)nullptr);
-        _exit(127);
-    }
-    close(in_pipe[0]);
-    close(out_pipe[1]);
+/* Source that pulls bytes from a subprocess decompressor's stdout.
+ *
+ * Lifecycle:
+ *   - ctor forks the decompressor child + a feeder child that writes
+ *     the compressed bytes into the decompressor's stdin.  The
+ *     decompressor's stdout is the only fd kept open in the parent.
+ *   - read() drains stdout incrementally as the consumer pulls bytes.
+ *   - dtor closes stdout (signalling EOF to anything still draining),
+ *     SIGTERM's both children if still alive (handles --max early
+ *     exit cleanly), and reaps them.
+ *
+ * The feeder is a separate process so the parent never blocks on the
+ * decompressor's input fifo — a single-thread parent doing
+ * write(in) + read(out) deadlocks the moment the decompressor's
+ * stdin buffer fills before any output has been produced.  Forking
+ * the feeder sidesteps it. */
+class ChildProcessSource : public Source {
+public:
+    ChildProcessSource(const std::string &codec,
+                       const uint8_t *data, size_t size)
+        : codec_(codec)
+    {
+        int in_pipe[2], out_pipe[2];
+        if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0) {
+            throw std::runtime_error("decompress pipe(): "
+                                     + std::string(strerror(errno)));
+        }
+        pid_ = fork();
+        if (pid_ < 0) {
+            throw std::runtime_error("decompress fork(): "
+                                     + std::string(strerror(errno)));
+        }
+        if (pid_ == 0) {
+            dup2(in_pipe[0], 0);
+            dup2(out_pipe[1], 1);
+            close(in_pipe[0]); close(in_pipe[1]);
+            close(out_pipe[0]); close(out_pipe[1]);
+            execlp(codec.c_str(), codec.c_str(), "-d", "-c",
+                   (char *)nullptr);
+            _exit(127);
+        }
+        close(in_pipe[0]);
+        close(out_pipe[1]);
 
-    /* fork+drain on a separate process for input; this thread reads
-     * output.  Use a child for input writes to avoid the deadlock
-     * where parent's stdin pipe fills before child has produced any
-     * output. */
-    pid_t feeder = fork();
-    if (feeder < 0) {
-        throw std::runtime_error("fork failed");
-    }
-    if (feeder == 0) {
-        const uint8_t *p = m.data;
-        size_t remaining = m.size;
-        while (remaining > 0) {
-            ssize_t n = write(in_pipe[1], p, remaining);
-            if (n <= 0) break;
-            p += n;
-            remaining -= (size_t)n;
+        feeder_ = fork();
+        if (feeder_ < 0) {
+            close(in_pipe[1]);
+            close(out_pipe[0]);
+            kill(pid_, SIGTERM);
+            waitpid(pid_, nullptr, 0);
+            throw std::runtime_error("decompress feeder fork(): "
+                                     + std::string(strerror(errno)));
+        }
+        if (feeder_ == 0) {
+            close(out_pipe[0]);
+            const uint8_t *p = data;
+            size_t remaining = size;
+            /* SIGPIPE: if the parent tears the decompressor down
+             * early (--max), the feeder may see EPIPE when its
+             * writes outrun the consumer.  Treat that as a normal
+             * early exit. */
+            signal(SIGPIPE, SIG_IGN);
+            while (remaining > 0) {
+                ssize_t n = write(in_pipe[1], p, remaining);
+                if (n <= 0) break;
+                p += n;
+                remaining -= (size_t)n;
+            }
+            close(in_pipe[1]);
+            _exit(0);
         }
         close(in_pipe[1]);
-        _exit(0);
+        out_fd_ = out_pipe[0];
     }
-    close(in_pipe[1]);
 
+    ~ChildProcessSource() override
+    {
+        if (out_fd_ >= 0) {
+            close(out_fd_);
+        }
+        /* Tear children down in case the consumer bailed early. */
+        if (pid_ > 0) {
+            kill(pid_, SIGTERM);
+            waitpid(pid_, nullptr, 0);
+        }
+        if (feeder_ > 0) {
+            kill(feeder_, SIGTERM);
+            waitpid(feeder_, nullptr, 0);
+        }
+    }
+
+    size_t read(uint8_t *out, size_t n) override
+    {
+        if (out_fd_ < 0) return 0;
+        for (;;) {
+            ssize_t r = ::read(out_fd_, out, n);
+            if (r > 0) return (size_t)r;
+            if (r == 0) return 0;
+            if (errno == EINTR) continue;
+            throw std::runtime_error("decompress (" + codec_ +
+                                     ") read: " +
+                                     std::string(strerror(errno)));
+        }
+    }
+
+    /* Wait for the decompressor to finish and check its exit status.
+     * Call only after the consumer has drained the stream to EOF. */
+    void finalize() override
+    {
+        if (pid_ <= 0) return;
+        int status = 0;
+        waitpid(pid_, &status, 0);
+        pid_ = 0;
+        if (feeder_ > 0) {
+            waitpid(feeder_, nullptr, 0);
+            feeder_ = 0;
+        }
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            throw std::runtime_error("decompress (" + codec_ +
+                                     ") exited with non-zero status");
+        }
+    }
+
+private:
+    std::string codec_;
+    pid_t pid_    = -1;
+    pid_t feeder_ = -1;
+    int   out_fd_ = -1;
+};
+
+/* Memory-backed Source: hands out bytes from a contiguous in-memory
+ * buffer.  Used for body_stream_open's uncompressed-body path so
+ * mem-backed and stream-backed bodies share the same Reader API. */
+class MemorySource : public Source {
+public:
+    MemorySource(const uint8_t *data, size_t size)
+        : data_(data), end_(size), pos_(0) {}
+    size_t read(uint8_t *out, size_t n) override
+    {
+        size_t take = end_ - pos_;
+        if (take > n) take = n;
+        std::memcpy(out, data_ + pos_, take);
+        pos_ += take;
+        return take;
+    }
+private:
+    const uint8_t *data_;
+    size_t end_;
+    size_t pos_;
+};
+
+/* Synchronous decompress: drain @src fully into @out_buf.  Used for
+ * the header member, which is small (KB to MB), so eager
+ * decompression avoids the streaming-Reader bookkeeping. */
+void decompress_to_buffer(const std::string &codec,
+                          const uint8_t *data, size_t size,
+                          std::vector<uint8_t> *out_buf)
+{
+    ChildProcessSource src(codec, data, size);
     uint8_t buf[64 * 1024];
     for (;;) {
-        ssize_t n = read(out_pipe[0], buf, sizeof(buf));
+        size_t n = src.read(buf, sizeof(buf));
         if (n == 0) break;
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            throw std::runtime_error("decompress read failed");
-        }
         out_buf->insert(out_buf->end(), buf, buf + n);
     }
-    close(out_pipe[0]);
-
-    int status = 0;
-    waitpid(feeder, nullptr, 0);
-    waitpid(pid, &status, 0);
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        throw std::runtime_error("decompress (" + codec +
-                                 ") exited with non-zero status");
-    }
+    src.finalize();
 }
 
 }  /* namespace */
@@ -411,14 +499,15 @@ CstFile::~CstFile()
 CstFile::CstFile(CstFile &&o) noexcept
     : path_(std::move(o.path_)),
       map_(o.map_), map_size_(o.map_size_),
-      body_buf_(std::move(o.body_buf_)),
       header_buf_(std::move(o.header_buf_)),
-      body_(o.body_), header_(o.header_)
+      header_(o.header_),
+      body_raw_(o.body_raw_),
+      body_codec_(std::move(o.body_codec_))
 {
     o.map_ = nullptr;
     o.map_size_ = 0;
-    o.body_ = {};
     o.header_ = {};
+    o.body_raw_ = {};
 }
 
 CstFile &CstFile::operator=(CstFile &&o) noexcept
@@ -428,12 +517,13 @@ CstFile &CstFile::operator=(CstFile &&o) noexcept
         path_ = std::move(o.path_);
         map_ = o.map_;
         map_size_ = o.map_size_;
-        body_buf_ = std::move(o.body_buf_);
         header_buf_ = std::move(o.header_buf_);
-        body_ = o.body_;
         header_ = o.header_;
+        body_raw_ = o.body_raw_;
+        body_codec_ = std::move(o.body_codec_);
         o.map_ = nullptr;
         o.map_size_ = 0;
+        o.body_raw_ = {};
     }
     return *this;
 }
@@ -485,26 +575,84 @@ std::unique_ptr<CstFile> cst_file_open(const std::string &path)
         throw std::runtime_error("missing required tar member(s): " + path);
     }
 
-    /* Decompress (or copy-through) each member into the owned
-     * buffers if a codec suffix is present; otherwise point body_/
-     * header_ directly into the mmap. */
-    if (codec_from_suffix(body_m->name).empty()) {
-        cf->body_.data = body_m->data;
-        cf->body_.size = body_m->size;
-    } else {
-        decompress_member(*body_m, &cf->body_buf_);
-        cf->body_.data = cf->body_buf_.data();
-        cf->body_.size = cf->body_buf_.size();
-    }
-    if (codec_from_suffix(header_m->name).empty()) {
+    /* Header: eagerly decompress (small).  Body: keep the raw byte
+     * range + codec; body_stream_open will spawn the decompressor
+     * lazily so consumers like --templates-only never pay the cost. */
+    std::string header_codec = codec_from_suffix(header_m->name);
+    if (header_codec.empty()) {
         cf->header_.data = header_m->data;
         cf->header_.size = header_m->size;
     } else {
-        decompress_member(*header_m, &cf->header_buf_);
+        decompress_to_buffer(header_codec, header_m->data, header_m->size,
+                             &cf->header_buf_);
         cf->header_.data = cf->header_buf_.data();
         cf->header_.size = cf->header_buf_.size();
     }
+
+    cf->body_raw_.data = body_m->data;
+    cf->body_raw_.size = body_m->size;
+    cf->body_codec_    = codec_from_suffix(body_m->name);
     return cf;
+}
+
+/* ===== Body streaming reader ============================================ */
+
+BodyStream::BodyStream(BodyStream &&) noexcept = default;
+BodyStream &BodyStream::operator=(BodyStream &&) noexcept = default;
+BodyStream::~BodyStream() = default;
+
+std::unique_ptr<BodyStream> body_stream_open(const CstFile &cf)
+{
+    auto bs = std::unique_ptr<BodyStream>(new BodyStream());
+    MemberView raw = cf.body_raw();
+    if (raw.size < 8) {
+        throw std::runtime_error("body member too small");
+    }
+    std::unique_ptr<Source> src;
+    if (cf.body_codec().empty()) {
+        src = std::make_unique<MemorySource>(raw.data, raw.size);
+    } else {
+        src = std::make_unique<ChildProcessSource>(
+            cf.body_codec(), raw.data, raw.size);
+    }
+    /* Keep the underlying Source alive for finalize().  The
+     * Reader takes ownership of `src` for normal pulls; we hand it
+     * back to BodyStream at finalize() time so we can call
+     * finalize_and_check() on the ChildProcessSource. */
+    Reader reader(std::move(src));
+
+    /* Verify leading magic and strip it from the consumer-visible
+     * record stream. */
+    uint32_t lead = reader.u32_le();
+    if (lead != CST_MAGIC) {
+        throw std::runtime_error("body member: bad leading magic");
+    }
+    bs->reader_ = std::move(reader);
+    return bs;
+}
+
+void BodyStream::finalize()
+{
+    /* The walker has consumed BODY_TAG_END + num_entries; the only
+     * remaining bytes should be the trailing CST_MAGIC. */
+    uint32_t trail = reader_.u32_le();
+    if (trail != CST_MAGIC) {
+        throw std::runtime_error("body member truncated "
+                                 "(bad trailing magic)");
+    }
+    /* Drain any trailing padding (mmap path won't have any; the
+     * subprocess decompressor shouldn't either, but be defensive in
+     * case a future codec emits a tiny tail buffer). */
+    uint8_t scratch[64];
+    while (!reader_.eof()) {
+        size_t take = reader_.remaining();
+        if (take == 0) break;
+        if (take > sizeof(scratch)) take = sizeof(scratch);
+        reader_.raw(scratch, take);
+    }
+    /* If the body was streamed through a subprocess decompressor,
+     * wait for it and re-throw on non-zero exit. */
+    reader_.finalize_source();
 }
 
 /* ===== Header + templates ================================================ */

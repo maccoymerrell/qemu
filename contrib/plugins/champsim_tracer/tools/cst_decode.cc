@@ -318,12 +318,11 @@ Wide BodyWalker::template_default(const Template *tmpl,
 BodyWalker::BodyWalker(const Header &header,
                        const std::vector<Template> &templates,
                        const std::unordered_map<uint32_t, size_t> &template_by_id,
-                       const uint8_t *data, size_t size,
-                       uint64_t body_off, uint64_t body_end)
+                       Reader &body)
     : header_(header),
       templates_(templates),
       by_id_(template_by_id),
-      body_(data, body_off, body_end),
+      body_(body),
       scalar_bits_(header.scalar_width_bits()),
       flags_(header.flags),
       reg_flags_id_(-1)
@@ -495,6 +494,12 @@ void BodyWalker::walk(const Callback &cb,
 
             cb(entry);
             prev_entry = std::move(entry);
+            if (max_entries_ && stats_.cp_entries >= max_entries_) {
+                /* Early stop.  Caller skips trailing-magic check; the
+                 * underlying decompressor subprocess (if any) is torn
+                 * down when the Reader's Source is destroyed. */
+                return;
+            }
             continue;
         }
         if (tag == ids.body_tag_iframe) {

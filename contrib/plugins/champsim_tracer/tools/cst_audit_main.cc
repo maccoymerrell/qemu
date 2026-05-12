@@ -108,206 +108,161 @@ struct Stats {
     std::array<Bucket, NUM_BUCKETS> wp_fd{};
 };
 
-/* Inline ULEB skip: advance past the varint without decoding it. */
-static inline void skip_uleb(const uint8_t *m, size_t &p)
+/* Tally the bytes consumed by a single field-delta record into the
+ * caller's bucket table.  Used by both the CP and WP record loops
+ * (only difference is which bucket table they're aggregating into). */
+static inline void tally_fd_record(
+    cst::Reader &sec, const FidTables &fid, const cst::ResolvedIds &ids,
+    std::array<Bucket, NUM_BUCKETS> *fd_b)
 {
-    while (m[p] & 0x80) p++;
-    p++;
-}
-
-/* Inline ULEB read: decode + advance. */
-static inline uint64_t read_uleb(const uint8_t *m, size_t &p)
-{
-    uint64_t out = 0;
-    unsigned shift = 0;
-    while (true) {
-        uint8_t b = m[p++];
-        out |= uint64_t(b & 0x7F) << shift;
-        if (!(b & 0x80)) return out;
-        shift += 7;
+    size_t before = sec.consumed();
+    sec.uleb();                              /* ipos delta */
+    uint8_t f = sec.u8();
+    if (fid.is_extra[f]) {
+        uint64_t nv = sec.uleb();
+        for (uint64_t k = 0; k < nv; k++) sec.uleb();
+    } else {
+        sec.uleb();                          /* delta */
     }
+    if (f == ids.fid_extended) sec.uleb();
+    int idx = fid.bucket[f];
+    (*fd_b)[idx].bytes += sec.consumed() - before;
+    (*fd_b)[idx].count += 1;
 }
 
-/* Inline SLEB read: decode + advance. */
-static inline int64_t read_sleb(const uint8_t *m, size_t &p)
-{
-    uint64_t out = 0;
-    unsigned shift = 0;
-    while (true) {
-        uint8_t b = m[p++];
-        out |= uint64_t(b & 0x7F) << shift;
-        shift += 7;
-        if (!(b & 0x80)) {
-            if (shift < 64 && (b & 0x40)) {
-                out |= ~uint64_t(0) << shift;
-            }
-            return (int64_t)out;
-        }
-    }
-}
-
-void skip_lp_section(const uint8_t *m, size_t &p)
-{
-    uint64_t n = read_uleb(m, p);
-    p += n;
-}
-
-void walk_body(const uint8_t *m, size_t body_off, size_t body_end,
-               const cst::ResolvedIds &ids,
+/* Walk the body record stream through a Reader.  Works identically
+ * for memory-backed (uncompressed body) and stream-backed
+ * (decompressor-piped) inputs; the Reader handles refilling. */
+void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                const std::vector<uint32_t> &insns_by_tid, Stats *s)
 {
     const FidTables fid(ids);
-    size_t p = body_off;
     int32_t prev_cp_tid = 0;
     auto &cpfd_b = s->cp_fd;
     auto &wpfd_b = s->wp_fd;
 
-    while (p < body_end) {
-        size_t tag_pos = p;
-        uint8_t tag = m[p++];
+    while (!body.eof()) {
+        size_t tag_start = body.consumed();
+        uint8_t tag = body.u8();
 
         if (tag == ids.body_tag_entry) {
-            int64_t tdelta = read_sleb(m, p);
+            int64_t tdelta = body.sleb();
             prev_cp_tid += (int32_t)tdelta;
-            s->cp_entry_framing.bytes += p - tag_pos;
+            s->cp_entry_framing.bytes += body.consumed() - tag_start;
             s->cp_entries++;
             if (prev_cp_tid >= 0 &&
                 (uint32_t)prev_cp_tid < insns_by_tid.size()) {
                 s->cp_total_insns += insns_by_tid[prev_cp_tid];
             }
 
-            /* CP field-delta section. */
-            size_t sec_st = p;
-            uint64_t paylen = read_uleb(m, p);
-            size_t payload_st = p;
-            size_t payload_end = payload_st + paylen;
-            s->cp_field_delta.bytes += payload_end - sec_st;
-            cpfd_b[BIDX_OVERHEAD].bytes += payload_st - sec_st;
+            /* CP field-delta section.  sub() consumes the ULEB
+             * payload length + payload bytes; we account for the
+             * length prefix separately by subtracting the sub's
+             * payload size from the parent's bytes-consumed delta. */
+            size_t sec_in_start = body.consumed();
+            cst::Reader sec = body.sub();
+            size_t sec_total = body.consumed() - sec_in_start;
+            s->cp_field_delta.bytes += sec_total;
+            cpfd_b[BIDX_OVERHEAD].bytes += sec_total - sec.end();
             cpfd_b[BIDX_OVERHEAD].count += 1;
 
-            size_t rec_st = p;
-            uint64_t n_records = read_uleb(m, p);
-            cpfd_b[BIDX_OVERHEAD].bytes += p - rec_st;
+            size_t rec_st = sec.consumed();
+            uint64_t n_records = sec.uleb();
+            cpfd_b[BIDX_OVERHEAD].bytes += sec.consumed() - rec_st;
             cpfd_b[BIDX_OVERHEAD].count += 1;
 
             for (uint64_t r = 0; r < n_records; r++) {
-                size_t rec_p0 = p;
-                skip_uleb(m, p);                /* ipos delta */
-                uint8_t f = m[p++];
-                if (fid.is_extra[f]) {
-                    uint64_t nv = read_uleb(m, p);
-                    for (uint64_t k = 0; k < nv; k++) skip_uleb(m, p);
-                } else {
-                    skip_uleb(m, p);             /* delta */
-                }
-                if (f == ids.fid_extended) skip_uleb(m, p);
-                int idx = fid.bucket[f];
-                cpfd_b[idx].bytes += p - rec_p0;
-                cpfd_b[idx].count += 1;
+                tally_fd_record(sec, fid, ids, &cpfd_b);
             }
-            if (p != payload_end) {
+            if (!sec.eof()) {
                 throw std::runtime_error("CP field-delta had trailing bytes");
             }
 
             /* WP chain envelope. */
-            size_t wp_st = p;
-            uint64_t wp_paylen = read_uleb(m, p);
-            size_t wp_payload_end = p + wp_paylen;
-            s->wp_chain_envelope.bytes += wp_payload_end - wp_st;
-            uint64_t num_wp = read_uleb(m, p);
+            size_t wp_in_start = body.consumed();
+            cst::Reader wpb = body.sub();
+            s->wp_chain_envelope.bytes += body.consumed() - wp_in_start;
+
+            uint64_t num_wp = wpb.uleb();
             int32_t prev_wp_tid = 0;
             for (uint64_t w = 0; w < num_wp; w++) {
-                size_t wfs = p;
-                int64_t wd = read_sleb(m, p);
+                size_t wfs = wpb.consumed();
+                int64_t wd = wpb.sleb();
                 prev_wp_tid += (int32_t)wd;
-                s->wp_entry_framing.bytes += p - wfs;
+                s->wp_entry_framing.bytes += wpb.consumed() - wfs;
                 s->wp_entry_framing.count += 1;
                 if (prev_wp_tid >= 0 &&
                     (uint32_t)prev_wp_tid < insns_by_tid.size()) {
                     s->wp_total_insns += insns_by_tid[prev_wp_tid];
                 }
 
-                size_t wp_sec_st = p;
-                uint64_t wpl = read_uleb(m, p);
-                size_t wp_payload_st = p;
-                size_t wp_payload_end_inner = wp_payload_st + wpl;
-                s->wp_field_delta.bytes += wp_payload_end_inner - wp_sec_st;
-                wpfd_b[BIDX_OVERHEAD].bytes += wp_payload_st - wp_sec_st;
+                size_t wp_sec_in = wpb.consumed();
+                cst::Reader wpsec = wpb.sub();
+                size_t wp_sec_total = wpb.consumed() - wp_sec_in;
+                s->wp_field_delta.bytes += wp_sec_total;
+                wpfd_b[BIDX_OVERHEAD].bytes += wp_sec_total - wpsec.end();
                 wpfd_b[BIDX_OVERHEAD].count += 1;
 
-                size_t wp_rec_st = p;
-                uint64_t wp_nrec = read_uleb(m, p);
-                wpfd_b[BIDX_OVERHEAD].bytes += p - wp_rec_st;
+                size_t wp_rec_st = wpsec.consumed();
+                uint64_t wp_nrec = wpsec.uleb();
+                wpfd_b[BIDX_OVERHEAD].bytes += wpsec.consumed() - wp_rec_st;
                 wpfd_b[BIDX_OVERHEAD].count += 1;
                 for (uint64_t r = 0; r < wp_nrec; r++) {
-                    size_t rec_p0 = p;
-                    skip_uleb(m, p);
-                    uint8_t f = m[p++];
-                    if (fid.is_extra[f]) {
-                        uint64_t nv = read_uleb(m, p);
-                        for (uint64_t k = 0; k < nv; k++) skip_uleb(m, p);
-                    } else {
-                        skip_uleb(m, p);
-                    }
-                    if (f == ids.fid_extended) skip_uleb(m, p);
-                    int idx = fid.bucket[f];
-                    wpfd_b[idx].bytes += p - rec_p0;
-                    wpfd_b[idx].count += 1;
+                    tally_fd_record(wpsec, fid, ids, &wpfd_b);
                 }
-                if (p != wp_payload_end_inner) {
+                if (!wpsec.eof()) {
                     throw std::runtime_error("WP field-delta had trailing bytes");
                 }
             }
             s->wp_entries_total += num_wp;
-            if (p != wp_payload_end) {
+            if (!wpb.eof()) {
                 throw std::runtime_error("WP chain had trailing bytes");
             }
 
             /* WP events sub-section: opaque to audit. */
-            size_t ev_st = p;
-            skip_lp_section(m, p);
-            s->wp_events.bytes += p - ev_st;
+            size_t ev_in = body.consumed();
+            (void)body.sub();
+            s->wp_events.bytes += body.consumed() - ev_in;
             continue;
         }
 
         if (tag == ids.body_tag_thread_switch) {
-            skip_uleb(m, p);                 /* signed delta */
-            s->thread_switch.bytes += p - tag_pos;
+            body.sleb();                 /* signed delta */
+            s->thread_switch.bytes += body.consumed() - tag_start;
             s->thread_switch.count += 1;
             continue;
         }
 
         if (tag == ids.body_tag_iframe) {
-            skip_lp_section(m, p);
-            skip_lp_section(m, p);
-            skip_lp_section(m, p);
+            (void)body.sub();
+            (void)body.sub();
+            (void)body.sub();
             s->iframe_count++;
-            s->iframe_bytes.bytes += p - tag_pos;
+            s->iframe_bytes.bytes += body.consumed() - tag_start;
             continue;
         }
 
         if (tag == ids.body_tag_regfile) {
-            (void)read_uleb(m, p);                /* thread_id */
-            uint64_t n_regs = read_uleb(m, p);
+            (void)body.uleb();                  /* thread_id */
+            uint64_t n_regs = body.uleb();
             for (uint64_t i = 0; i < n_regs; i++) {
-                if (p >= body_end) {
-                    throw std::runtime_error("regfile record truncated");
+                (void)body.u8();                /* gen_id */
+                uint8_t width = body.u8();
+                uint8_t scratch[256];
+                while (width > 0) {
+                    size_t take = std::min<size_t>(width, sizeof(scratch));
+                    body.raw(scratch, take);
+                    width = (uint8_t)(width - take);
                 }
-                p += 1;                            /* gen_id */
-                uint8_t width = m[p++];
-                if (p + width > body_end) {
-                    throw std::runtime_error("regfile record truncated");
-                }
-                p += width;
             }
             s->regfile_count++;
-            s->regfile_bytes.bytes += p - tag_pos;
+            s->regfile_bytes.bytes += body.consumed() - tag_start;
             continue;
         }
 
         if (tag == ids.body_tag_end) {
-            skip_uleb(m, p);                 /* num_entries */
-            s->body_terminator = p - tag_pos;
+            body.uleb();                     /* num_entries */
+            s->body_terminator = body.consumed() - tag_start;
             break;
         }
 
@@ -500,11 +455,17 @@ int main(int argc, char **argv)
         std::unordered_map<uint32_t, size_t> by_id;
         cst::Header h = cst::parse_header(cf->header(), &templates, &by_id);
 
-        cst::MemberView body_records = cst::body_records_view(cf->body());
+        /* Body: stream the records through a Reader.  For compressed
+         * bodies this spawns the decompressor subprocess; for
+         * uncompressed bodies the Reader is a cheap view into the
+         * mmap.  Audit walks the entire body so we don't get the
+         * "skip the body" win that --templates-only does, but
+         * streaming still avoids the 100 GB-of-decompressed-RAM
+         * problem. */
+        auto body_stream = cst::body_stream_open(*cf);
 
         Stats s;
         s.file_size = (size_t)st.st_size;
-        s.body_total = body_records.size;
         s.header_bytes = cf->header().size;
         s.templates_count = templates.size();
 
@@ -514,12 +475,20 @@ int main(int argc, char **argv)
             insns_by_tid.push_back((uint32_t)t.insns.size());
         }
 
-        /* Inline-template stats: contribution from the parsed
-         * templates section is already known via the header member's
-         * trailing bytes; the body audit only walks the body record
-         * stream itself. */
-        walk_body(body_records.data, 0, body_records.size,
-                  h.ids, insns_by_tid, &s);
+        walk_body(body_stream->reader(), h.ids, insns_by_tid, &s);
+        body_stream->finalize();
+        /* body_total is the consumed byte count for the record
+         * stream (everything between the leading and trailing
+         * CST_MAGIC), summed across all records walked.  Equivalent
+         * to body_records.size in the old code. */
+        s.body_total = s.cp_entry_framing.bytes
+                     + s.cp_field_delta.bytes
+                     + s.thread_switch.bytes
+                     + s.wp_chain_envelope.bytes
+                     + s.wp_events.bytes
+                     + s.iframe_bytes.bytes
+                     + s.regfile_bytes.bytes
+                     + s.body_terminator;
 
         print_report(s);
     } catch (const std::exception &e) {

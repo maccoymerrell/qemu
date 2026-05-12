@@ -98,8 +98,14 @@ public:
     BodyWalker(const Header &header,
                const std::vector<Template> &templates,
                const std::unordered_map<uint32_t, size_t> &template_by_id,
-               const uint8_t *data, size_t size,
-               uint64_t body_off, uint64_t body_end);
+               Reader &body);
+
+    /* Stop after @n BODY_TAG_ENTRY records; 0 = unlimited.  Set this
+     * before calling walk().  When the limit fires, walk() returns
+     * without consuming BODY_TAG_END; the caller must skip the
+     * trailing-magic check in that case (the body wasn't fully
+     * drained). */
+    void set_max_entries(uint64_t n) { max_entries_ = n; }
 
     const BodyStats &stats() const { return stats_; }
 
@@ -126,7 +132,8 @@ private:
     const Header                                       &header_;
     const std::vector<Template>                        &templates_;
     const std::unordered_map<uint32_t, size_t>         &by_id_;
-    Reader                                              body_;
+    Reader                                             &body_;
+    uint64_t                                            max_entries_ = 0;
 
     int      scalar_bits_;
     uint8_t  flags_;

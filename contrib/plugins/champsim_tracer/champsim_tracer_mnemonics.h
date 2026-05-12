@@ -92,6 +92,15 @@ typedef struct {
  */
 #define MAX_SRC_REGS 16
 #define MAX_DST_REGS 16
+/*
+ * Per-insn dst / store cap for intra-instruction dependency masks.
+ * 16 matches MAX_SRC_REGS for symmetry and lines up with the
+ * FID_SLOT_COUNT=16 store slots in the wire format; any real
+ * instruction with more stores than that is already handled via
+ * EXTRA_STORE_DATA at runtime, and its dependency pattern (if we
+ * ever model one) would compose linearly from the per-slot masks.
+ */
+#define MAX_STORES   16
 
 typedef struct InsnFields {
     uint8_t opcode;                 /* GenericOpcode */
@@ -119,6 +128,38 @@ typedef struct InsnFields {
     uint8_t sync_hint;              /* SyncEventType */
     uint8_t n_loads;                /* Template default; runtime uses QEMU mem callbacks */
     uint8_t n_stores;               /* Template default; runtime uses QEMU mem callbacks */
+    /*
+     * Intra-instruction register dataflow.  When @has_reg_deps is
+     * true, the wire-format encoder emits CST_INSN_FLAG_HAS_REG_DEPS
+     * in the template-insn flag byte and appends n_dst + n_stores
+     * ULEB-encoded masks after the insn bytes.  When false (the
+     * default), the template carries no mask and consumers fall back
+     * to the implicit all-to-all dataflow.
+     *
+     * Bit layout inside each mask:
+     *   bits [0, n_src_regs)                   src_reg[i]
+     *   bits [n_src_regs, n_src_regs+n_loads)  load_data[i - n_src_regs]
+     *   bit  n_src_regs + n_loads              immediate
+     *
+     * Populated by the per-ISA mnemonic refiner or (phase 2) the
+     * TableGen-derived extraction step.  Plugin code that doesn't
+     * understand a particular pattern leaves @has_reg_deps false.
+     */
+    bool     has_reg_deps;
+    /*
+     * Number of store_data_dep masks the refiner populated.  The
+     * wire format's templated `n_stores` byte is always emitted as
+     * 0 (runtime count rides on CST_FID_N_STORES), so the dep block
+     * carries its own count.  This is a template-time concept: how
+     * many store memops does the *static instruction* describe?
+     * Equal to n_dst for the common "stores match dst layout"
+     * pattern; can be 0 for non-store insns or 2 for AArch64 STP.
+     * Same shape for n_dep_loads when phase 2 lands HAS_ADDR.
+     */
+    uint8_t  n_dep_stores;
+    uint8_t  n_dep_loads;
+    uint32_t dst_dep_mask[MAX_DST_REGS];
+    uint32_t store_data_dep_mask[MAX_STORES];
 } InsnFields;
 
 

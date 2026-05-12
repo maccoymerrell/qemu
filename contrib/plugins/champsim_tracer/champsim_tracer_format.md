@@ -131,7 +131,17 @@ Per-instruction template flags:
 bit 0      CST_INSN_FLAG_BRANCH_COND
 bit 1      CST_INSN_FLAG_HAS_IMM
 bits 2..5  sync_hint, a 4-bit SyncEventType value
-bits 6..7  reserved, written as 0
+bit 6      CST_INSN_FLAG_HAS_DEP_BLOCK     intra-instruction dep mask
+bit 7      reserved, written as 0
+```
+
+`dep_block_flag` map (only inspected when `CST_INSN_FLAG_HAS_DEP_BLOCK`
+is set on the per-insn flag byte):
+
+```
+bit 0  CST_DEP_BLOCK_HAS_REG    dst_dep + store_data_dep present
+bit 1  CST_DEP_BLOCK_HAS_ADDR   load_addr_dep + store_addr_dep present  (phase 2)
+bits 2..7  reserved
 ```
 
 Wrong-path event flags:
@@ -225,6 +235,7 @@ The writer currently emits these maps:
 | field_id      | CST_FID_* sparse delta field IDs              |
 | header_flag   | CST_FLAG_* header bits                        |
 | insn_flag     | CST_INSN_FLAG_* template flag bits            |
+| dep_block_flag| CST_DEP_BLOCK_* dep sub-block flag bits       |
 | body_tag      | BODY_TAG_* stream record tags                 |
 | wp_event_flag | CST_WP_EVENT_* wrong-path event bits          |
 | metaflags     | CST_METAFLAGS_* canonical flag bits           |
@@ -747,8 +758,53 @@ template payload:
 |   immediate       SLEB    only if HAS_IMM        |
 |   insn_size       u8                             |
 |   insn_bytes      bytes[insn_size]               |
+|   dep_block               only if HAS_DEP_BLOCK  |
 +--------------------------------------------------+
 ```
+
+When `flags & CST_INSN_FLAG_HAS_DEP_BLOCK`, an extensible dependency
+sub-block follows the instruction bytes:
+
+```
+dep_block:
+  dep_block_flags   u8        CST_DEP_BLOCK_HAS_REG | CST_DEP_BLOCK_HAS_ADDR
+  if HAS_REG:
+    n_dep_stores    u8        template-time store-mask count
+    dst_dep[d]      ULEB      for d in 0..n_dst-1
+    store_data_dep[s] ULEB    for s in 0..n_dep_stores-1
+  if HAS_ADDR:
+    n_dep_loads     u8        template-time load-mask count
+    n_dep_stores_a  u8        template-time store-addr-mask count
+    load_addr_dep[l]  ULEB    for l in 0..n_dep_loads-1
+    store_addr_dep[s] ULEB    for s in 0..n_dep_stores_a-1
+```
+
+`n_dep_stores` / `n_dep_loads` / `n_dep_stores_a` are template-time
+mask-array lengths.  The wire format's outer `n_stores` and
+`n_loads` bytes are always zero (runtime counts ride on
+`CST_FID_N_LOADS` / `CST_FID_N_STORES`), so the dep block carries
+its own static counts to size each mask array.
+
+Bit layout inside each register/load mask:
+
+```
+bits [0, n_src)                            depends on src_reg[i]
+bits [n_src, n_src + n_loads_static)       depends on load_data[i - n_src]
+bit  n_src + n_loads_static                depends on the immediate
+```
+
+Address masks omit the load-data bits because addresses are computed
+before any load fires:
+
+```
+bits [0, n_src)                            depends on src_reg[i]
+bit  n_src                                 depends on the immediate
+```
+
+Absence of `CST_INSN_FLAG_HAS_DEP_BLOCK` is the implicit all-to-all
+over-approximation: every dst / store depends on every src / load.
+Consumers that don't model intra-instruction dataflow can ignore
+the block.
 
 `pc_delta` is relative to the previous instruction PC, with
 `previous_pc = start_pc` for the first instruction. The branch, if any,

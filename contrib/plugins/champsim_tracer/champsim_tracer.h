@@ -132,7 +132,45 @@ extern "C" {
 #define CST_INSN_FLAG_HAS_IMM       (1u << 1)
 #define CST_INSN_FLAG_SYNC_SHIFT    2
 #define CST_INSN_FLAG_SYNC_MASK     0x3Cu
-/* bits 6..7 reserved */
+/*
+ * Intra-instruction dataflow sub-block.  When set, an
+ * extensible dependency block follows insn_bytes:
+ *
+ *   dep_block_flags : u8
+ *     bit 0  DEP_BLOCK_HAS_REG   — dst_dep + store_data_dep present
+ *     bit 1  DEP_BLOCK_HAS_ADDR  — load_addr_dep + store_addr_dep present
+ *     bits 2..7 reserved
+ *
+ *   if HAS_REG:
+ *     dst_dep[d]        : ULEB   for d in 0..n_dst-1
+ *     store_data_dep[s] : ULEB   for s in 0..n_stores-1
+ *   if HAS_ADDR:
+ *     load_addr_dep[l]  : ULEB   for l in 0..n_loads-1
+ *     store_addr_dep[s] : ULEB   for s in 0..n_stores-1
+ *
+ * Bit layout inside each register/load mask:
+ *   bits [0, n_src)                       depends on src_reg[i]
+ *   bits [n_src, n_src + n_loads)         depends on load_data[i - n_src]
+ *   bit  n_src + n_loads                  depends on the immediate
+ *
+ * Address masks omit the load_data bits (addresses are computed
+ * before any load fires):
+ *   bits [0, n_src)                       depends on src_reg[i]
+ *   bit  n_src                            depends on the immediate
+ *
+ * Absence of CST_INSN_FLAG_HAS_DEP_BLOCK is the implicit all-to-all
+ * over-approximation (every dst / store depends on every src / load)
+ * that consumers have always assumed.  Phase 1 only emits the block
+ * with HAS_REG; phase 2 will add HAS_ADDR.  Future sub-flag bits
+ * stay inside the block so the per-insn flag byte does not have to
+ * grow.
+ */
+#define CST_INSN_FLAG_HAS_DEP_BLOCK (1u << 6)
+/* bit 7 reserved */
+
+/* dep_block_flags bits inside the optional dependency sub-block. */
+#define CST_DEP_BLOCK_HAS_REG       (1u << 0)
+#define CST_DEP_BLOCK_HAS_ADDR      (1u << 1)
 
 /* WP event flags byte */
 #define CST_WP_EVENT_TRANSLATION_UNAVAIL (1u << 0)

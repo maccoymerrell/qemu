@@ -367,6 +367,11 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         { CST_INSN_FLAG_BRANCH_COND, "CST_INSN_FLAG_BRANCH_COND" },
         { CST_INSN_FLAG_HAS_IMM, "CST_INSN_FLAG_HAS_IMM" },
         { CST_INSN_FLAG_SYNC_MASK, "CST_INSN_FLAG_SYNC_MASK" },
+        { CST_INSN_FLAG_HAS_DEP_BLOCK, "CST_INSN_FLAG_HAS_DEP_BLOCK" },
+    };
+    static const EncodingMapEntry dep_block_flag_entries[] = {
+        { CST_DEP_BLOCK_HAS_REG,  "CST_DEP_BLOCK_HAS_REG" },
+        { CST_DEP_BLOCK_HAS_ADDR, "CST_DEP_BLOCK_HAS_ADDR" },
     };
     static const EncodingMapEntry body_tag_entries[] = {
         { BODY_TAG_END, "BODY_TAG_END" },
@@ -390,7 +395,7 @@ static void write_header_encoding_maps(BitWriter *main_bw)
 
     BitWriter sub;
     bw_init_buf(&sub);
-    bw_write_uleb128(&sub, 10);
+    bw_write_uleb128(&sub, 11);
     write_named_enum_map(&sub, "opcode", GEN_OP_COUNT, generic_opcode_name);
     write_named_enum_map(&sub, "branch_type", BRANCH_TYPE_COUNT,
                          branch_type_name);
@@ -410,6 +415,8 @@ static void write_header_encoding_maps(BitWriter *main_bw)
                        G_N_ELEMENTS(wp_event_flag_entries));
     write_encoding_map(&sub, "metaflags", metaflags_entries,
                        G_N_ELEMENTS(metaflags_entries));
+    write_encoding_map(&sub, "dep_block_flag", dep_block_flag_entries,
+                       G_N_ELEMENTS(dep_block_flag_entries));
     bw_write_section(main_bw, bw_finish_buf(&sub));
 }
 
@@ -579,6 +586,9 @@ static void write_bin_templates(BitWriter *bw)
             }
             flags |= (uint8_t)((fld->sync_hint & 0x0F)
                                << CST_INSN_FLAG_SYNC_SHIFT);
+            if (fld->has_reg_deps) {
+                flags |= CST_INSN_FLAG_HAS_DEP_BLOCK;
+            }
             bw_write_u8(&sub, flags);
 
             bw_write_u8(&sub, fld->n_src_regs);
@@ -598,6 +608,28 @@ static void write_bin_templates(BitWriter *bw)
             bw_write_bytes(&sub,
                            &tmpl->insn_bytes[(size_t)i * MAX_INSN_BYTES],
                            tmpl->insn_sizes[i]);
+
+            /*
+             * Optional dependency sub-block.  Phase 1 only emits the
+             * register/load mask family (HAS_REG); phase 2 will add
+             * the address-only family (HAS_ADDR) without touching the
+             * per-insn flag byte.  Refiner-free instructions leave
+             * has_reg_deps false and pay zero bytes.  n_dst comes
+             * from the outer template; n_dep_stores is carried in
+             * the block header because the wire format's templated
+             * n_stores is always 0 (runtime count rides on the FID
+             * stream).
+             */
+            if (fld->has_reg_deps) {
+                bw_write_u8(&sub, CST_DEP_BLOCK_HAS_REG);
+                bw_write_u8(&sub, fld->n_dep_stores);
+                for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
+                    bw_write_uleb128(&sub, fld->dst_dep_mask[d]);
+                }
+                for (uint8_t s = 0; s < fld->n_dep_stores; s++) {
+                    bw_write_uleb128(&sub, fld->store_data_dep_mask[s]);
+                }
+            }
         }
 
         bw_byte_align(&sub);

@@ -33,16 +33,17 @@ void parse_encoding_maps(Reader &r, EncodingMaps *out)
         std::string name = r.string();
         uint64_t n_entries = r.uleb();
         std::unordered_map<uint64_t, std::string> *target = nullptr;
-        if      (name == "opcode")        target = &out->opcode;
-        else if (name == "branch_type")   target = &out->branch_type;
-        else if (name == "sync_hint")     target = &out->sync_hint;
-        else if (name == "reg")           target = &out->reg;
-        else if (name == "field_id")      target = &out->field_id;
-        else if (name == "header_flag")   target = &out->header_flag;
-        else if (name == "insn_flag")     target = &out->insn_flag;
-        else if (name == "body_tag")      target = &out->body_tag;
-        else if (name == "wp_event_flag") target = &out->wp_event_flag;
-        else if (name == "metaflags")     target = &out->metaflags;
+        if      (name == "opcode")         target = &out->opcode;
+        else if (name == "branch_type")    target = &out->branch_type;
+        else if (name == "sync_hint")      target = &out->sync_hint;
+        else if (name == "reg")            target = &out->reg;
+        else if (name == "field_id")       target = &out->field_id;
+        else if (name == "header_flag")    target = &out->header_flag;
+        else if (name == "insn_flag")      target = &out->insn_flag;
+        else if (name == "body_tag")       target = &out->body_tag;
+        else if (name == "wp_event_flag")  target = &out->wp_event_flag;
+        else if (name == "metaflags")      target = &out->metaflags;
+        else if (name == "dep_block_flag") target = &out->dep_block_flag;
 
         for (uint64_t j = 0; j < n_entries; j++) {
             uint64_t value = r.uleb();
@@ -96,6 +97,45 @@ void parse_templates_at(Reader &r,
             uint8_t insn_size = sub.u8();
             I.raw_bytes.resize(insn_size);
             sub.raw(I.raw_bytes.data(), insn_size);
+
+            /*
+             * Optional dependency sub-block.  Phase 1 only honours the
+             * HAS_REG family.  HAS_ADDR will land in phase 2; if a
+             * future writer sets it, we still need to parse over the
+             * bytes to keep the cursor aligned, even though we won't
+             * surface them yet.
+             */
+            if (flags & ids.insn_flag_has_dep_block) {
+                uint8_t dep_flags = sub.u8();
+                if (dep_flags & ids.dep_block_has_reg) {
+                    uint8_t n_dep_stores = sub.u8();
+                    I.has_reg_deps = true;
+                    I.dst_dep_mask.resize(n_dst);
+                    for (uint8_t d = 0; d < n_dst; d++) {
+                        I.dst_dep_mask[d] = (uint32_t)sub.uleb();
+                    }
+                    I.store_data_dep_mask.resize(n_dep_stores);
+                    for (uint8_t s = 0; s < n_dep_stores; s++) {
+                        I.store_data_dep_mask[s] = (uint32_t)sub.uleb();
+                    }
+                }
+                if (dep_flags & ids.dep_block_has_addr) {
+                    /* Phase 2.  Skip-parse so the cursor stays
+                     * aligned; surfacing waits on the consumer
+                     * support. */
+                    uint8_t n_dep_loads      = sub.u8();
+                    uint8_t n_dep_stores_a   = sub.u8();
+                    I.has_addr_deps = true;
+                    I.load_addr_dep_mask.resize(n_dep_loads);
+                    for (uint8_t l = 0; l < n_dep_loads; l++) {
+                        I.load_addr_dep_mask[l] = (uint32_t)sub.uleb();
+                    }
+                    I.store_addr_dep_mask.resize(n_dep_stores_a);
+                    for (uint8_t s = 0; s < n_dep_stores_a; s++) {
+                        I.store_addr_dep_mask[s] = (uint32_t)sub.uleb();
+                    }
+                }
+            }
 
             t.insns.push_back(std::move(I));
         }
@@ -185,6 +225,14 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
                 &ids->insn_flag_branch_cond);
     resolve_one(maps.insn_flag, "insn_flag", "CST_INSN_FLAG_HAS_IMM",
                 &ids->insn_flag_has_imm);
+    resolve_one(maps.insn_flag, "insn_flag", "CST_INSN_FLAG_HAS_DEP_BLOCK",
+                &ids->insn_flag_has_dep_block);
+
+    /* dep_block_flag (bit masks inside the optional dependency sub-block) */
+    resolve_one(maps.dep_block_flag, "dep_block_flag",
+                "CST_DEP_BLOCK_HAS_REG",  &ids->dep_block_has_reg);
+    resolve_one(maps.dep_block_flag, "dep_block_flag",
+                "CST_DEP_BLOCK_HAS_ADDR", &ids->dep_block_has_addr);
 
     /* header_flag (bit masks) */
     resolve_one(maps.header_flag, "header_flag", "CST_FLAG_MEM_DATA",

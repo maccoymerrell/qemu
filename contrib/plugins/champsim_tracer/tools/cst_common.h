@@ -108,8 +108,15 @@ struct ResolvedIds {
     uint8_t fid_extended         = 0;
 
     /* insn_flag map: bit masks inside the per-insn flags byte */
-    uint8_t insn_flag_branch_cond = 0;
-    uint8_t insn_flag_has_imm     = 0;
+    uint8_t insn_flag_branch_cond  = 0;
+    uint8_t insn_flag_has_imm      = 0;
+    uint8_t insn_flag_has_dep_block = 0;
+
+    /* dep_block_flag map: bit masks inside the optional dep sub-block
+     * header (only inspected when insn_flag_has_dep_block is set on
+     * the per-insn flags byte). */
+    uint8_t dep_block_has_reg  = 0;
+    uint8_t dep_block_has_addr = 0;
 
     /* header_flag map: bit masks inside Header::flags */
     uint8_t flag_mem_data = 0;
@@ -272,6 +279,28 @@ struct InsnTemplate {
     std::vector<uint8_t> src_regs;
     std::vector<uint8_t> dst_regs;
     std::vector<uint8_t> raw_bytes;       /* may be 0..16 bytes */
+
+    /*
+     * Intra-instruction dataflow sub-block (CST_INSN_FLAG_HAS_DEP_BLOCK).
+     * Empty when the wire format did not carry the block — consumers
+     * fall back to the implicit all-to-all dataflow.
+     *
+     * dst_dep_mask[d] / store_data_dep_mask[s]: bitmask of input
+     * positions this output depends on.  Bit layout:
+     *   bits [0, src_regs.size())                  src_reg[i]
+     *   bits [src_regs.size(), src_regs.size() + n_loads_at_template_time)
+     *                                              load_data[i - src.size()]
+     *   bit  src_regs.size() + n_loads_at_template_time
+     *                                              immediate
+     * load_addr_dep_mask / store_addr_dep_mask are phase-2 additions;
+     * for now they stay empty.
+     */
+    bool                  has_reg_deps  = false;
+    bool                  has_addr_deps = false;
+    std::vector<uint32_t> dst_dep_mask;
+    std::vector<uint32_t> store_data_dep_mask;
+    std::vector<uint32_t> load_addr_dep_mask;
+    std::vector<uint32_t> store_addr_dep_mask;
 };
 
 struct Template {
@@ -297,6 +326,7 @@ struct EncodingMaps {
     std::unordered_map<uint64_t, std::string> body_tag;
     std::unordered_map<uint64_t, std::string> wp_event_flag;
     std::unordered_map<uint64_t, std::string> metaflags;
+    std::unordered_map<uint64_t, std::string> dep_block_flag;
 };
 
 /* ===== Parsed header ===== */

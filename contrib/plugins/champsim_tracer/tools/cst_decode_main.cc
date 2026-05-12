@@ -737,6 +737,9 @@ struct DisasmContext {
      * objdump disasm in a fixed-width left field, then our generic
      * trace view (with regdata / memdata) on the right. */
     const ObjdumpRenderer *od;
+    /* --show-deps: append intra-instruction dependency masks as a
+     * trailing comment when the template carries them. */
+    bool                   show_deps = false;
 };
 
 /* Append a register reference resolved through the prebuilt table; on
@@ -971,6 +974,66 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
         line.append("sync=");
         line.append(enum_or(ctx.h->maps.sync_hint, I.sync_hint, "SYNC"));
     }
+    if (ctx.show_deps && tmpl.insns[insn_idx].has_reg_deps) {
+        const cst::InsnTemplate &it = tmpl.insns[insn_idx];
+        unsigned n_src = (unsigned)it.src_regs.size();
+        /* The template's n_loads is the static load count baseline;
+         * the wire format always writes 0 here so we approximate by
+         * scanning the highest "load" bit any mask sets.  Good enough
+         * for human-readable comment; the bit layout itself is
+         * unambiguous so no information is lost. */
+        unsigned n_loads = 0;
+        auto note_loads = [&](uint32_t m) {
+            for (unsigned b = n_src; b < 32; b++) {
+                if (m & (1u << b)) {
+                    unsigned k = b - n_src + 1;
+                    if (k > n_loads) n_loads = k;
+                }
+            }
+        };
+        for (auto m : it.dst_dep_mask) note_loads(m);
+        for (auto m : it.store_data_dep_mask) note_loads(m);
+        auto fmt_mask = [&](std::string *o, uint32_t m) {
+            o->push_back('[');
+            bool first = true;
+            for (unsigned i = 0; i < n_src; i++) {
+                if (m & (1u << i)) {
+                    if (!first) o->push_back(',');
+                    o->append("s");
+                    o->append(std::to_string(i));
+                    first = false;
+                }
+            }
+            for (unsigned i = 0; i < n_loads; i++) {
+                if (m & (1u << (n_src + i))) {
+                    if (!first) o->push_back(',');
+                    o->append("ld");
+                    o->append(std::to_string(i));
+                    first = false;
+                }
+            }
+            if (m & (1u << (n_src + n_loads))) {
+                if (!first) o->push_back(',');
+                o->append("imm");
+                first = false;
+            }
+            o->push_back(']');
+        };
+        begin_meta();
+        line.append("deps:");
+        for (size_t d = 0; d < it.dst_dep_mask.size(); d++) {
+            line.append(" d");
+            line.append(std::to_string(d));
+            line.append("=");
+            fmt_mask(&line, it.dst_dep_mask[d]);
+        }
+        for (size_t s = 0; s < it.store_data_dep_mask.size(); s++) {
+            line.append(" st");
+            line.append(std::to_string(s));
+            line.append("=");
+            fmt_mask(&line, it.store_data_dep_mask[s]);
+        }
+    }
     (void)thread_id; (void)bb_id; (void)is_wp;
     line.push_back('\n');
     std::fwrite(line.data(), 1, line.size(), out);
@@ -1137,11 +1200,12 @@ void render_disasm(FILE *out, const cst::Header &h,
                    const std::vector<cst::Template> &templates,
                    const std::unordered_map<uint32_t, size_t> &by_id,
                    cst::BodyWalker &body,
-                   const ObjdumpRenderer *od)
+                   const ObjdumpRenderer *od,
+                   bool show_deps)
 {
     DisasmTables dt;
     disasm_tables_build(&dt, h);
-    DisasmContext ctx{&h, &by_id, &templates, &dt, od};
+    DisasmContext ctx{&h, &by_id, &templates, &dt, od, show_deps};
 
     /* One-shot header summary (everything a grepper might want
      * before the per-insn lines).  Kept parseable: `; KEY=value`
@@ -1260,16 +1324,20 @@ int main(int argc, char **argv)
     const char *format = "disasm";
     bool templates_only = false;
     bool show_objdump   = false;
+    bool show_deps      = false;
     uint64_t max_entries = 0;            /* 0 = unbounded */
 
     auto usage = [&]() {
         std::fprintf(stderr,
             "usage: %s [--format=disasm|legacy] [--templates-only] "
-            "[--objdump] [--max N] <trace.cst>\n"
+            "[--objdump] [--show-deps] [--max N] <trace.cst>\n"
             "  --templates-only  print only the template dictionary,\n"
             "                    skip the body delta-replay\n"
             "  --objdump         emit Capstone-rendered native disasm\n"
             "                    of each insn alongside the generic view\n"
+            "  --show-deps       append intra-instruction dep masks as a\n"
+            "                    trailing `; deps: d0=[s0,ld0] ...` comment\n"
+            "                    when the template carries them\n"
             "  --max N           stop after N body entries (tears the\n"
             "                    decompressor subprocess down early)\n",
             argv[0]);
@@ -1284,6 +1352,8 @@ int main(int argc, char **argv)
             templates_only = true;
         } else if (std::strcmp(argv[i], "--objdump") == 0) {
             show_objdump = true;
+        } else if (std::strcmp(argv[i], "--show-deps") == 0) {
+            show_deps = true;
         } else if (std::strncmp(argv[i], "--max=", 6) == 0) {
             max_entries = std::strtoull(argv[i] + 6, nullptr, 10);
         } else if (std::strcmp(argv[i], "--max") == 0 && i + 1 < argc) {
@@ -1351,7 +1421,8 @@ int main(int argc, char **argv)
             if (std::strcmp(format, "legacy") == 0) {
                 render_legacy(stdout, h, templates, by_id, walker);
             } else if (std::strcmp(format, "disasm") == 0) {
-                render_disasm(stdout, h, templates, by_id, walker, odp);
+                render_disasm(stdout, h, templates, by_id, walker, odp,
+                              show_deps);
             } else {
                 std::fprintf(stderr,
                              "cst_decode: unknown format '%s'\n", format);

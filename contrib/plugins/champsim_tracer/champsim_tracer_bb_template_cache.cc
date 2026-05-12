@@ -318,6 +318,18 @@ BBTemplate *BBTemplateCache::get_or_create_bb_template(
                                       insn_sizes, insn_bytes,
                                       insn_reg_names,
                                       symbol_name, final_ft);
+    /*
+     * Propagate the REP self-loop sub-template from the last
+     * fragment (the TB whose terminator is the REP-prefixed string
+     * op) to the BB template the chain assembler just built.  The
+     * sub-template was constructed at TB-translation time and
+     * cached on its TB; here we expose it on the BB so
+     * emit_body_entry can fan iterations out without re-walking the
+     * fragment list.  No-op for non-REP BBs.
+     */
+    if (tmpl && n_fragments > 0 && fragments[n_fragments - 1]) {
+        tmpl->rep_subtmpl = fragments[n_fragments - 1]->rep_subtmpl;
+    }
     return tmpl;
 }
 
@@ -406,5 +418,36 @@ BBTemplate *BBTemplateCache::get_or_create_tb_template(
     BBTemplate *raw = tmpl.get();
     tb_map_[start_pc] = std::move(tmpl);
     g_stats.tb_templates_created++;
+
+    /*
+     * REP-prefixed string ops fan out into per-iteration body entries:
+     * iter 1 stays on the parent TB template (so the BB that *first*
+     * enters the REP loop ends with the first REP, just like a normal
+     * branch), iter 2..N each emit on a 1-insn self-loop sub-template
+     * cached here.  Built once at translation; the body emitter
+     * follows raw->rep_subtmpl when the TB's terminator carries
+     * rep_loads_per_iter + rep_stores_per_iter > 0.
+     *
+     * The sub-template is a self-contained 1-insn BB at the REP's
+     * PC, with the same InsnFields (incl. BRANCH_COND_DIRECT
+     * branch_type) so it is structurally a self-loop in the trace.
+     */
+    if (raw->n_insns > 0) {
+        uint32_t last = raw->n_insns - 1;
+        const InsnFields *lf = &raw->insn_fields[last];
+        if (lf->rep_loads_per_iter + lf->rep_stores_per_iter > 0) {
+            uint64_t  sub_pc   = raw->insn_pcs[last];
+            uint8_t   sub_size = raw->insn_sizes[last];
+            const uint8_t *sub_bytes =
+                &raw->insn_bytes[(size_t)last * MAX_INSN_BYTES];
+            const InsnRegNames *sub_regs =
+                raw->insn_reg_names ? &raw->insn_reg_names[last] : nullptr;
+            uint64_t  sub_ft   = sub_pc + sub_size;
+            raw->rep_subtmpl = commit_true_bb(sub_pc, 1, &sub_pc, lf,
+                                              &sub_size, sub_bytes,
+                                              sub_regs,
+                                              raw->symbol_name, sub_ft);
+        }
+    }
     return raw;
 }

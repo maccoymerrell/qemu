@@ -360,7 +360,8 @@ typedef struct {
     uint8_t  has_addr;     /* nonzero when descriptor is valid */
 } SyntheticEAInfo;
 
-typedef struct {
+typedef struct BBTemplate BBTemplate;
+struct BBTemplate {
     uint32_t template_id;
     uint64_t start_pc;
     uint32_t n_insns;
@@ -388,7 +389,17 @@ typedef struct {
      * Used by the writer to drive iframe_rate-triggered IFRAME
      * emissions on a per-template cadence. */
     uint64_t emit_count;
-} BBTemplate;
+    /*
+     * If this template's terminator is an x86 REP-prefixed string op
+     * (rep_loads_per_iter + rep_stores_per_iter > 0 on the last
+     * canonical insn), the body emitter fans the single TB-exec into
+     * N iteration entries: iter 1 stays on this template, iter 2..N
+     * emit on @rep_subtmpl — a 1-insn self-loop sub-template at the
+     * REP's PC, built at TB-translation time and cached separately
+     * from this parent.  NULL on non-REP TBs.
+     */
+    BBTemplate *rep_subtmpl;
+};
 
 enum DynParamType {
     DYN_LOAD_ADDR  = 0,

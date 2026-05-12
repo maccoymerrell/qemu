@@ -553,6 +553,82 @@ static void emit_body_entry(BodyStreamState *out_stream,
         pending_reg_snaps.clear();
     }
 
+    /*
+     * REP fan-out: if the BB's terminator is a REP-prefixed string op
+     * and its TB template carries a rep_subtmpl, split a single TB-
+     * exec's memop stream into N iteration entries.  Iter 1 stays on
+     * @entry (so the BB that *first* enters the REP loop ends with
+     * the first REP, exactly like an ordinary branch terminator);
+     * iter 2..N each emit a fresh 1-insn BodyEntry on rep_subtmpl
+     * with a slice of the memops.
+     *
+     * Memops arrive in execution order under the REP insn's PC, so
+     * the partition is direct: load/store callbacks fire mpi times
+     * per iteration (1 for LODS/STOS/SCAS/INS/OUTS, 2 for MOVS/CMPS),
+     * the first mpi belong to iter 1, the next mpi to iter 2, etc.
+     * WP entries (if any) stay on iter 1 — the WP simulator already
+     * sees REP as a single architectural branch, so the speculative
+     * window applies once at the loop boundary, not per iteration.
+     * reg_snaps similarly stay on iter 1; per-iteration RSI/RDI/RCX
+     * deltas ride the field-delta stream like any other repeated
+     * BB visit.
+     */
+    BBTemplate *rep_sub = bb_tmpl ? bb_tmpl->rep_subtmpl : nullptr;
+    if (rep_sub && bb_tmpl->n_insns > 0) {
+        uint32_t last = bb_tmpl->n_insns - 1;
+        const InsnFields *lf = &bb_tmpl->insn_fields[last];
+        unsigned mpi = (unsigned)lf->rep_loads_per_iter
+                     + (unsigned)lf->rep_stores_per_iter;
+        if (mpi > 0) {
+            /* Separate REP-attributed memops from the rest while
+             * preserving arrival order. */
+            std::vector<DynParam> rep_dps;
+            std::vector<DynParam> other_dps;
+            rep_dps.reserve(entry.dyn_params.size());
+            other_dps.reserve(entry.dyn_params.size());
+            for (const DynParam &dp : entry.dyn_params) {
+                if (dp.insn_index == last) {
+                    rep_dps.push_back(dp);
+                } else {
+                    other_dps.push_back(dp);
+                }
+            }
+            size_t n_iter = rep_dps.size() / mpi;
+            if (n_iter > 1) {
+                /* Iter 1: parent BB template + non-REP memops +
+                 * first mpi REP memops. */
+                entry.dyn_params = std::move(other_dps);
+                entry.dyn_params.reserve(entry.dyn_params.size() + mpi);
+                for (unsigned j = 0; j < mpi; j++) {
+                    entry.dyn_params.push_back(rep_dps[j]);
+                }
+                if (out_stream) {
+                    body_stream_write_entry(out_stream, &entry);
+                }
+                /* Iter 2..N: rep_subtmpl, mpi memops each, insn_index
+                 * remapped to 0 (sub has exactly one insn). */
+                for (size_t k = 1; k < n_iter; k++) {
+                    BodyEntry sub_e;
+                    sub_e.seq_num     = g_trace_segments.next_seq_num();
+                    sub_e.template_id = rep_sub->template_id;
+                    sub_e.tmpl        = rep_sub;
+                    sub_e.thread_id   = entry.thread_id;
+                    sub_e.cpu_index   = entry.cpu_index;
+                    sub_e.dyn_params.reserve(mpi);
+                    for (unsigned j = 0; j < mpi; j++) {
+                        DynParam dp = rep_dps[k * mpi + j];
+                        dp.insn_index = 0;
+                        sub_e.dyn_params.push_back(dp);
+                    }
+                    if (out_stream) {
+                        body_stream_write_entry(out_stream, &sub_e);
+                    }
+                }
+                return;
+            }
+        }
+    }
+
     if (out_stream) {
         body_stream_write_entry(out_stream, &entry);
     }

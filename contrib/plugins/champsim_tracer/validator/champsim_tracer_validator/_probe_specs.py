@@ -641,17 +641,20 @@ _register_probe('probe_mips_pref', {
 
 _register_probe('probe_x86_lock_xadd', {
     'x86_64': {
-        # `lock xadd src, mem` — fetch-and-add.  The plugin classifies
-        # xadd as GEN_OP_XCHG (with MF_ATOMIC).  INC/DEC under LOCK
-        # carry their own GEN_OP_INC / GEN_OP_DEC; the lock prefix
-        # alone causes sync_hint = SYNC_ATOMIC on every instruction
-        # in the sequence.
+        # `lock xadd src, mem` — atomic fetch-and-add.  The plugin
+        # classifies xadd as GEN_OP_INT_ADD (with MF_ATOMIC) —
+        # consistent with the LDADD / AMOADD convention on the other
+        # ISAs: the data-mutation operation is add, the exchange is
+        # incidental.  INC/DEC under LOCK carry their own
+        # GEN_OP_INC / GEN_OP_DEC; the lock prefix alone causes
+        # sync_hint = SYNC_ATOMIC on every instruction in the
+        # sequence.
         'asm':      '"movq $1, %%rax\\n\\t"\n'
                     '    "lock xaddq %%rax, (%%rsp)\\n\\t"\n'
                     '    "lock incq (%%rsp)\\n\\t"\n'
                     '    "lock decq (%%rsp)"',
         'clobbers': '"rax","memory","cc"',
-        'opcodes':  ['XCHG', 'INC', 'DEC'],
+        'opcodes':  ['INT_ADD', 'INC', 'DEC'],
     },
 })
 

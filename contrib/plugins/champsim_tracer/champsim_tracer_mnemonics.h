@@ -160,6 +160,18 @@ typedef struct InsnFields {
     uint8_t  n_dep_loads;
     uint32_t dst_dep_mask[MAX_DST_REGS];
     uint32_t store_data_dep_mask[MAX_STORES];
+    /*
+     * x86 REP / REPNZ string-op metadata.  Non-zero on insns whose
+     * Capstone detail carried info->has_rep; both fields capture the
+     * memops this insn issues *per iteration* (one architectural
+     * REP loop).  Used by the body emitter to fan a single TB-exec
+     * into N iteration entries: iter 1 stays on the parent BB
+     * template, iter 2..N emit on the parent's rep_subtmpl (a
+     * 1-insn self-loop sub-template built at translation time).
+     * Zero on non-REP insns.
+     */
+    uint8_t  rep_loads_per_iter;
+    uint8_t  rep_stores_per_iter;
 } InsnFields;
 
 

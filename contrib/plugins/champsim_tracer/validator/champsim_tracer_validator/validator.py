@@ -537,17 +537,27 @@ def _check_cp_memops(entries: list[dict],
     issues: list[Issue] = []
 
     # ---- 1. Build bipartite adjacency restricted to CP. ----
+    # @first_entry maps tid -> single representative entry (default
+    # for normal blocks: avoids counting the same memop pattern N
+    # times when a block sits inside a loop).
+    # @all_entries maps tid -> list of every CP entry on that
+    # template, used when at least one block in the bipartite
+    # component opts into aggregate_fanout — true today for the REP-
+    # iteration block, whose iter 2..N body entries live on
+    # subsequent executions of the 1-insn self-loop sub-template.
     tmpl_to_blocks: dict[int, set[int]] = {}
     block_to_tmpls: dict[int, set[int]] = {}
     first_entry: dict[int, dict] = {}
+    all_entries: dict[int, list[dict]] = {}
 
     for e in entries:
         tid = e["template_id"]
-        if tid in first_entry:
-            continue
         runs = template_runs.get(tid, [])
         cp_blocks = {bid for (bid, _) in runs if bid in cp_set}
         if not cp_blocks:
+            continue
+        all_entries.setdefault(tid, []).append(e)
+        if tid in first_entry:
             continue
         first_entry[tid] = e
         tmpl_to_blocks[tid] = cp_blocks
@@ -596,8 +606,25 @@ def _check_cp_memops(entries: list[dict],
         # pair-merging must be skipped (otherwise two unrelated 4-byte
         # accesses to adjacent u32 slots could be merged spuriously).
         is_32bit_isa = isa in ("mipsel", "mips", "riscv32", "armhf", "i386")
+        # If any block in the component opts into fan-out aggregation
+        # (REP-iteration test blocks), walk every CP entry on every
+        # template in the component instead of just the first.  The
+        # REP sub-template is executed N-1 times per source REP,
+        # each execution carrying one iteration's memops on a
+        # distinct body entry; the default first-entry-only mode
+        # would see iter 2 only and miss iter 3..N.
+        fanout = any(blocks_by_id[bid].get("aggregate_fanout")
+                     for bid in comp_blocks)
+        def _dps_for(tid: int) -> list:
+            if fanout:
+                out: list = []
+                for e in all_entries.get(tid, []):
+                    out.extend(e.get("dyn_params", []) or [])
+                return out
+            return list(first_entry[tid].get("dyn_params", []))
+
         for tid in sorted(comp_tmpls):
-            raw_dps = list(first_entry[tid].get("dyn_params", []))
+            raw_dps = _dps_for(tid)
             consumed = [False] * len(raw_dps)
 
             def _arena_off4(va: int) -> int:

@@ -475,7 +475,18 @@ int main(int argc, char **argv)
             insns_by_tid.push_back((uint32_t)t.insns.size());
         }
 
-        walk_body(body_stream->reader(), h.ids, insns_by_tid, &s);
+        try {
+            walk_body(body_stream->reader(), h.ids, insns_by_tid, &s);
+        } catch (const std::exception &e) {
+            std::fprintf(stderr,
+                "cst_audit: body walk failed at cp_entries=%lu wp_entries=%lu thread_switches=%lu iframes=%lu: %s\n",
+                (unsigned long)s.cp_entries,
+                (unsigned long)s.wp_entries_total,
+                (unsigned long)s.thread_switch.count,
+                (unsigned long)s.iframe_count,
+                e.what());
+            throw;
+        }
         body_stream->finalize();
         /* body_total is the consumed byte count for the record
          * stream (everything between the leading and trailing

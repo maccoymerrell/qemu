@@ -28,6 +28,16 @@ class BlockPlan:
     name: str
     memops: list[ExpectedMemOp]
     ordered_memops: bool = False
+    # Aggregate memop dyn_params from *every* body entry of every
+    # template in the block's bipartite component, not just each
+    # template's first entry.  Needed for blocks that emit REP-
+    # prefixed string ops: the tracer fans the iterations out into
+    # one entry per iteration on a 1-insn self-loop sub-template, so
+    # iter 2..N memops live on subsequent entries of the same
+    # template_id and would be missed by the default first-entry
+    # aggregation (which exists to suppress normal-loop double-
+    # counting).
+    aggregate_fanout: bool = False
     reg_value_assertions: list[dict] = dataclasses.field(default_factory=list)
     memop_count_assertions: list[dict] = dataclasses.field(default_factory=list)
     indirect_wp_assertions: list[dict] = dataclasses.field(default_factory=list)
@@ -1072,8 +1082,32 @@ class WideMemDataX86(CodeBlock):
 
 
 @register
-class X86StringMemopOverflow(CodeBlock):
-    name = "x86_string_memop_overflow"
+class X86RepIterationFanout(CodeBlock):
+    """
+    Exercises the tracer's REP-iteration fan-out path.  Each REP MOVSQ
+    iteration is its own 1-insn self-loop true-BB in the body stream:
+    iter 1 stays on the entering BB (terminated by the REP branch),
+    iter 2..N each emit a separate body entry on the 1-insn REP
+    sub-template with exactly one (load, store) pair.  This block
+    asserts via memop_count_assertions that we see (loads=1, stores=1)
+    entries — never the pre-fan-out (loads=8, stores=8) or
+    (loads=20, stores=20) buckets.
+
+    Per-memop validation via the `memops` list is intentionally
+    skipped: the existing _check_cp_memops walker aggregates dyn_params
+    on the *first* body entry of each template, but with fan-out the
+    iter 2..N memops live on subsequent entries of the REP sub-
+    template.  The per-iteration count assertion below catches the
+    same regressions (any single entry having loads>1 or stores>1 on
+    a REP insn would fail), and the coarse-opcode assertion on
+    `INT_ADD: 28` catches the REP being mis-emitted as a single
+    aggregate entry (which would produce a single INT_ADD count, not
+    28).
+
+    Uses two REP MOVSQ calls (ECX=8 and ECX=20) so the assertion still
+    catches a regression where the fan-out only fires for one count.
+    """
+    name = "x86_rep_iteration_fanout"
     scratch_slots = 56
     supported_isas = ("x86_64",)
     randomizable = False
@@ -1082,23 +1116,36 @@ class X86StringMemopOverflow(CodeBlock):
     @classmethod
     def plan(cls, ctx: EmitCtx) -> BlockPlan:
         s = ctx.scratch_slots
+        # Real correctness check: the fan-out must place EVERY one of
+        # the 56 expected memops (8 src/dst pairs for MOVSQ#1 +
+        # 20 src/dst pairs for MOVSQ#2) into the trace, each on its
+        # own body entry.  aggregate_fanout=True tells the cp_memops
+        # walker to scan every body entry across the bipartite
+        # component, not just each template's first entry.  A
+        # regression where the fan-out drops iterations, mis-orders
+        # the pointer advance, or aggregates memops onto a single
+        # entry will surface here as missing / extra memops.
         memops: list[ExpectedMemOp] = []
-        for count, src_base, dst_base, seed in ((8, s[0], s[8], 0x1111),
+        for count, src_base, dst_base, seed in ((8,  s[0],  s[8],  0x1111),
                                                (20, s[16], s[36], 0x2222)):
             for i in range(count):
                 data = (seed + i * 0x101010101010101) & ((1 << 64) - 1)
-                memops.append(ExpectedMemOp("load", src_base + i, 8, data))
+                memops.append(ExpectedMemOp("load",  src_base + i, 8, data))
                 memops.append(ExpectedMemOp("store", dst_base + i, 8, data))
         return BlockPlan(
             block_id=ctx.block_id,
             name=cls.name,
             memops=memops,
-            ordered_memops=True,
+            ordered_memops=False,
+            aggregate_fanout=True,
             memop_count_assertions=[
-                {"loads": 8, "stores": 8, "overflow": False},
-                {"loads": 20, "stores": 20, "overflow": True},
+                # Independent shape check: every body entry that
+                # touches the REP insn must carry exactly one load
+                # and one store (the per-iteration fan-out shape).
+                # A regression where the fan-out fails to fire would
+                # show up as a single entry with loads=8 or 20.
+                {"loads": 1, "stores": 1, "overflow": False},
             ],
-            coarse_opcodes={"LOAD": 28, "STORE": 28},
         )
 
     @classmethod

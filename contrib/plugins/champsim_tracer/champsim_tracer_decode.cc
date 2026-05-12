@@ -320,10 +320,36 @@ void decode_detail_to_generic(uint64_t pc,
      * false on every other ISA, so this is a no-op for those).  The
      * branch is conditional (the loop exits when ECX == 0 or when
      * the REPZ/REPNZ comparison breaks).
+     *
+     * rep_{loads,stores}_per_iter capture how many memops the insn
+     * issues per architectural REP iteration.  Derived by counting
+     * Capstone MEM operands' access flags, so the result is
+     * mnemonic-agnostic:
+     *   - MOVS  → 1 load + 1 store
+     *   - CMPS  → 2 loads
+     *   - STOS  → 1 store
+     *   - LODS  → 1 load
+     *   - SCAS  → 1 load
+     *   - INS   → 1 store (port in → mem)
+     *   - OUTS  → 1 load (mem out → port)
+     * These counts let the body emitter fan a single TB-exec's
+     * memop stream into N iteration entries.
      */
     if (info->has_rep) {
         out->branch_type        = BRANCH_COND_DIRECT;
         out->branch_conditional = true;
+        for (unsigned i = 0; i < info->n_operands; i++) {
+            const qemu_plugin_operand *op = &info->operands[i];
+            if (op->type != QEMU_PLUGIN_OP_MEM) {
+                continue;
+            }
+            if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
+                out->rep_loads_per_iter++;
+            }
+            if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
+                out->rep_stores_per_iter++;
+            }
+        }
     }
 
     /*

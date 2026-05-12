@@ -9,11 +9,19 @@ All multi-byte fixed-width integers are little-endian. Variable-width
 integers use DWARF-style LEB128:
 
 ```
-ULEB  unsigned LEB128
-SLEB  signed LEB128
-u8    one byte
-u32   four bytes, little-endian
-u64   eight bytes, little-endian
+ULEB        unsigned LEB128, value fits in u64
+SLEB        signed LEB128, value fits in i64
+ULEB_WIDE   unsigned LEB128, value fits in u512 (8 little-endian
+            limbs of u64).  Same continuation-bit format as ULEB;
+            the only difference is that decoders accumulate into
+            8 limbs, not one — used for EXTRA_*_DATA elements.
+SLEB_WIDE   signed LEB128, value fits in i512 (sign extension via
+            the high bit of the final byte's 7-bit payload).
+            Used for field-delta values in the body stream
+            (memop addresses, vector data, etc.).
+u8          one byte
+u32         four bytes, little-endian
+u64         eight bytes, little-endian
 ```
 
 Strings are length-prefixed UTF-8 byte strings:
@@ -27,6 +35,336 @@ Length-prefixed sections use the same shape:
 ```
 section := len:ULEB  payload[len]
 ```
+
+This spec is split into two parts.  **Part I** is a procedural
+recipe for a decoder author: each step is "read N bytes, decode as
+X, branch on Y."  Following the recipe in order is sufficient to
+parse any well-formed `.cst` file; values are not interpreted, just
+laid out byte-by-byte.  **Part II** is the reference for what each
+field *means* semantically (opcode enums, FID semantics, replay
+rules, etc.).  Sections in Part II are cross-referenced from the
+recipe steps that produce the relevant bytes.
+
+---
+
+# Part I: Decoder Recipe
+
+## Step 0: One-time preparation
+
+A decoder needs three working data structures, all built from the
+header member (Step 1):
+
+* `template_by_id` — map from `template_id : u32` to a parsed
+  `Template` (start_pc, num_insns, per-insn descriptors).
+* `encoding_maps` — ten maps (`opcode`, `branch_type`,
+  `sync_hint`, `reg`, `field_id`, `header_flag`, `insn_flag`,
+  `body_tag`, `wp_event_flag`, `metaflags`, `dep_block_flag`), each
+  `value : u64 → name : string`.  Built from the encoding-maps
+  section in Step 1.
+* `ids` — the well-known numeric IDs the decoder will dispatch on,
+  resolved by reverse-lookup of canonical names through
+  `encoding_maps` (e.g. `ids.body_tag_entry = encoding_maps.body_tag["BODY_TAG_ENTRY"]`).
+  Reject the trace if any required name is missing — the wire
+  format requires the writer to enumerate every name a decoder
+  will dispatch on.  The required names are listed alongside each
+  `ids.<field>` use below.
+
+After Step 1 these structures are immutable for the remainder of
+the decode.
+
+## Step 1: Open the archive and decompress members
+
+Treat the `.cst` file as an opaque POSIX ustar archive (512-byte
+header per member, zero-padded to 512-byte boundaries, two trailing
+zero blocks at end).
+
+```
+1.1  walk_tar(file):
+       loop over 512-byte header blocks until two consecutive zero
+       blocks; for each non-zero header, extract member.name and
+       member.size; collect into a list keyed by name.
+1.2  body_member  = first member whose name starts with "body.cst"
+     header_member = first member whose name starts with "header.cst"
+     both members are required; reject otherwise.
+1.3  for each member, look at the filename suffix:
+       no suffix      → uncompressed; use the bytes as-is
+       ".zst"         → run through `zstd -d -c`
+       ".xz"          → run through `xz -d -c`
+       ".gz"          → run through `gzip -d -c`
+       ".bz2"         → run through `bzip2 -d -c`
+       ".lz4"         → run through `lz4 -d -c`
+1.4  the header member is small; decompress it eagerly into RAM
+     the body member can be very large; either decompress eagerly
+     OR stream the decompressor's stdout into Step 4's body walker.
+```
+
+## Step 2: Decode the header member
+
+After Step 1.4, the (possibly decompressed) header bytes are a flat
+byte buffer.  Decode in order; the leading magic doubles as a
+sanity check.
+
+```
+2.1  magic        : u32_le   ; must equal 0x1C545343 ("CST" + 0x1C)
+2.2  isa          : u8       ; TraceISA enum (see Reference §2)
+2.3  flags        : u8       ; CST_FLAG_* bitmask (Reference §2)
+2.4  start_insn          : ULEB
+2.5  warmup_insns        : ULEB
+2.6  total_target_insns  : ULEB
+2.7  command      : string
+2.8  datetime     : string
+2.9  comment      : string
+2.10 target_name  : string
+2.11 encoding_maps_section : section    ; see Step 3 for inner shape
+2.12 templates section := raw payload to end-of-member (no outer
+     length-prefix; the templates section runs to the header
+     member's EOF).  Decode per Step 4.
+```
+
+Reject the trace if any read attempts to read past the end of the
+header member, or if @magic does not match.
+
+## Step 3: Parse the encoding maps
+
+The `encoding_maps_section` payload from Step 2.11 is itself
+self-describing.  Decode it into a fresh `encoding_maps` table.
+
+```
+3.1  n_maps : ULEB
+3.2  repeat n_maps times:
+       map_name  : string   ; "opcode" / "branch_type" / ...
+       n_entries : ULEB
+       repeat n_entries times:
+         value : ULEB
+         name  : string
+       store (value → name) into encoding_maps[map_name].
+3.3  After all maps are read, resolve the well-known names listed
+     below into a fixed-shape `ids` struct.  Every name listed is
+     mandatory; if a name is missing, reject the trace.
+       body_tag:        BODY_TAG_END, BODY_TAG_ENTRY,
+                        BODY_TAG_THREAD_SWITCH, BODY_TAG_IFRAME,
+                        BODY_TAG_REGFILE
+       field_id:        CST_FID_N_LOADS, CST_FID_N_STORES,
+                        CST_FID_LOAD_ADDR0, CST_FID_STORE_ADDR0,
+                        CST_FID_LOAD_DATA0, CST_FID_STORE_DATA0,
+                        CST_FID_DST_REG0,
+                        CST_FID_EXTRA_LOAD_ADDR, CST_FID_EXTRA_STORE_ADDR,
+                        CST_FID_EXTRA_LOAD_DATA, CST_FID_EXTRA_STORE_DATA,
+                        CST_FID_INSN_BYTES_LO, CST_FID_INSN_BYTES_HI,
+                        CST_FID_INSN_OPCODE, CST_FID_INSN_BRANCH_TYPE,
+                        CST_FID_INSN_FLAGS, CST_FID_INSN_IMMEDIATE,
+                        CST_FID_INSN_SIZE, CST_FID_METAFLAGS,
+                        CST_FID_EXTENDED
+       insn_flag:       CST_INSN_FLAG_BRANCH_COND,
+                        CST_INSN_FLAG_HAS_IMM,
+                        CST_INSN_FLAG_HAS_DEP_BLOCK
+       dep_block_flag:  CST_DEP_BLOCK_HAS_REG,
+                        CST_DEP_BLOCK_HAS_ADDR
+       header_flag:     CST_FLAG_MEM_DATA, CST_FLAG_REG_DATA
+       wp_event_flag:   CST_WP_EVENT_TRANSLATION_UNAVAIL,
+                        CST_WP_EVENT_FAULT
+       metaflags:       CST_METAFLAGS_Z/N/C/V/P
+3.4  See Reference §3 for the semantic meaning of each map and ID.
+```
+
+## Step 4: Parse the templates section
+
+The templates payload from Step 2.12 runs to end-of-member.
+Decode by repeated outer-section unwrapping.
+
+```
+4.1  num_templates : ULEB
+4.2  repeat num_templates times:
+       tmpl_section : section          ; payload is one template
+       parse tmpl_section.payload per Step 4.3.
+4.3  Template payload (consumed from tmpl_section):
+       template_id        : ULEB
+       start_pc           : ULEB
+       num_insns          : ULEB
+       fall_through_pc    : ULEB
+       symbol_name        : string     ; may be empty
+       repeat num_insns times: one insn descriptor per Step 4.4
+     After all insn descriptors are decoded, tmpl_section must be
+     empty; reject otherwise.
+4.4  Per-insn template descriptor (consumed from tmpl_section):
+       pc_delta           : ULEB       ; abs PC = prev_pc + pc_delta
+                                       ; prev_pc = start_pc for the
+                                       ; first insn of the template
+       opcode             : u8         ; resolve via encoding_maps.opcode
+       branch_type        : u8         ; resolve via encoding_maps.branch_type
+       flags              : u8         ; CST_INSN_FLAG_* bitmask
+       n_src              : u8
+       n_dst              : u8
+       src_regs[n_src]    : u8 each    ; resolve via encoding_maps.reg
+       dst_regs[n_dst]    : u8 each    ; resolve via encoding_maps.reg
+       n_loads            : u8         ; always 0 on the wire (runtime
+                                       ; count rides on CST_FID_N_LOADS)
+       n_stores           : u8         ; always 0
+       if (flags & ids.insn_flag_has_imm):
+         immediate        : SLEB
+       insn_size          : u8         ; 0..16
+       insn_bytes[insn_size] : raw bytes
+       if (flags & ids.insn_flag_has_dep_block):
+         decode the optional dependency sub-block per Step 4.5
+4.5  Dependency sub-block (only present when CST_INSN_FLAG_HAS_DEP_BLOCK):
+       dep_block_flags    : u8         ; dep_block_flag bits
+       if (dep_block_flags & ids.dep_block_has_reg):
+         n_dep_stores     : u8
+         dst_dep[0..n_dst-1]            : ULEB each
+         store_data_dep[0..n_dep_stores-1] : ULEB each
+       if (dep_block_flags & ids.dep_block_has_addr):
+         n_dep_loads      : u8
+         n_dep_stores_a   : u8
+         load_addr_dep[0..n_dep_loads-1]   : ULEB each
+         store_addr_dep[0..n_dep_stores_a-1] : ULEB each
+     See Reference §3 for the bit layout inside each mask.
+```
+
+Store every decoded template in `template_by_id` keyed by
+`template_id`.  After this step the header member is fully parsed
+and can be discarded.
+
+## Step 5: Open the body member and verify magics
+
+The body member is bracketed by two `CST_MAGIC` markers; the
+trailing one is the truncation sentinel.  Verify both.
+
+```
+5.1  open the body member's decompressed byte stream.
+5.2  lead : u32_le ; must equal 0x1C545343
+5.3  body record stream := bytes between @lead and the trailing
+     CST_MAGIC.  If you have the whole member in memory you can
+     peek the last 4 bytes here; for streaming decoders, defer the
+     trailing-magic check to Step 7.
+```
+
+## Step 6: Walk the body record stream
+
+The body stream is a flat sequence of tagged records.  Track these
+across the walk:
+
+```
+prev_entry_template_id : i32 = 0
+prev_thread_id         : u32 = 0   (the current thread for the next ENTRY)
+seq_num                : u32 = 0   (BODY_TAG_ENTRY counter)
+```
+
+Loop until a `BODY_TAG_END` is seen:
+
+```
+6.1  tag : u8
+     dispatch on tag against the ids resolved in Step 3:
+       ids.body_tag_thread_switch  → Step 6.2
+       ids.body_tag_regfile        → Step 6.3
+       ids.body_tag_entry          → Step 6.4
+       ids.body_tag_iframe         → Step 6.5
+       ids.body_tag_end            → Step 6.6 (terminates loop)
+       any other value             → malformed; reject
+6.2  THREAD_SWITCH record:
+       thread_id_delta : SLEB
+       prev_thread_id += thread_id_delta
+       (No state output; the next ENTRY inherits prev_thread_id.)
+6.3  REGFILE record:
+       thread_id : ULEB
+       n_present : ULEB
+       repeat n_present times:
+         gen_id : u8
+         width  : u8
+         bytes[width] : raw
+       Emit a per-thread initial-regfile snapshot for `thread_id`
+       (the bytes are in target-endian order).
+6.4  ENTRY record:
+       template_id_delta : SLEB
+       cur_template_id = prev_entry_template_id + template_id_delta
+       prev_entry_template_id = cur_template_id
+       cp_delta_section   : section          ; see Step 6.7
+       wp_chain_section   : section          ; see Step 6.8
+       wp_events_section  : section          ; see Step 6.9
+       seq_num += 1
+       Emit a CP body entry tagged (seq_num, cur_template_id,
+       prev_thread_id) carrying the cp_delta_section's decoded
+       dyn_params + reg_snaps, the wp_chain_section's WPEntries,
+       and the wp_events bits applied to those WPEntries.
+6.5  IFRAME record (validation-only; producers may omit it):
+       cp_delta_section   : section
+       wp_chain_section   : section
+       wp_events_section  : section
+       Decode each section against fresh "nothing observed yet"
+       overlays; the values reconstructed must match the
+       immediately-preceding ENTRY exactly (template_id, dyn_params,
+       reg_snaps, WP chain).  IFRAMEs do not advance
+       prev_entry_template_id and do not emit a body entry.
+6.6  END record:
+       num_entries : ULEB
+       must equal the total number of BODY_TAG_ENTRY records seen
+       since the start of the body stream.  Exit the loop.
+6.7  CP field-delta section payload:
+       n_records : ULEB
+       repeat n_records times: one field-delta record per Step 6.10.
+     After all records are consumed the section payload must be
+     empty.
+6.8  WP chain section payload:
+       num_wp : ULEB
+       repeat num_wp times:
+         wp_template_id_delta : SLEB
+         wp_delta_section     : section    ; decode per Step 6.7
+6.9  WP events section payload:
+       num_events : ULEB
+       prev_wp_index : i32 = -1
+       repeat num_events times:
+         pos_gap   : ULEB
+         wp_index  = prev_wp_index + 1 + pos_gap
+         ev_flags  : u8       ; wp_event_flag bits
+         if (ev_flags & ids.wp_event_fault):
+           fault_insn_index : ULEB
+         apply ev_flags + (optional) fault_insn_index to
+         wp_entries[wp_index] from Step 6.8.
+         prev_wp_index = wp_index
+6.10 One field-delta record:
+       ipos_delta : ULEB    ; running ipos += ipos_delta (sparse positions)
+       fid        : u8      ; resolve via encoding_maps.field_id
+       if fid is one of EXTRA_LOAD_ADDR / EXTRA_STORE_ADDR /
+          EXTRA_LOAD_DATA / EXTRA_STORE_DATA:
+         nv : ULEB
+         repeat nv times: one wide ULEB
+           - ADDR variants:   ULEB        (value fits in u64)
+           - DATA variants:   ULEB_WIDE   (up to 512 bits; the
+                                          writer emits via
+                                          bw_write_uleb128_u512)
+       else:
+         delta : SLEB_WIDE   (up to 512 bits, signed; same shape
+                              as ULEB_WIDE but the high bit of the
+                              last byte's payload extends the sign)
+         if fid == ids.fid_extended:
+           ext_payload : ULEB    (reserved escape; reserve only)
+       Update the per-template field-state cell at (template_id,
+       ipos, fid) by adding the decoded delta modulo 2^512.  See
+       Reference §5 for the field-state semantics.
+```
+
+A SLEB_WIDE / ULEB_WIDE primitive: like LEB128 but the value is
+read into up to 8 little-endian limbs (64 bits each, packing
+7 bits per byte across limbs).  For SLEB_WIDE, if the final byte's
+0x40 bit is set, sign-extend the remaining high bits to 1.
+
+## Step 7: Verify the trailing magic
+
+After Step 6 finishes (BODY_TAG_END was consumed), read 4 more
+bytes from the body member's stream:
+
+```
+7.1  trail : u32_le   ; must equal 0x1C545343
+7.2  the body member's stream must be exhausted at this point
+     (no further bytes).  Reject otherwise.
+```
+
+If you streamed the body through a subprocess decompressor (Step
+1.4 streaming path), this is also the right moment to call wait()
+on the child and require a zero exit status.
+
+---
+
+# Part II: Reference
 
 ## 1. File Layout
 
@@ -859,20 +1197,10 @@ is the last instruction after the writer's delay-slot normalization.
 
 ## 7. Decoder Checklist
 
-A robust decoder should follow this order:
-
-```
-1. Open the .cst as a POSIX ustar archive.
-2. Locate the body.cst[.<codec>] and header.cst[.<codec>] members.
-3. If the suffix names a codec, decompress the member's payload.
-4. Validate that the body member begins AND ends with CST_MAGIC; the
-   second magic is the truncation marker.  The body record stream is
-   the bytes between the two magics.
-5. Parse the header member: magic, isa, flags, ULEB window descriptors,
-   strings, encoding maps section, templates section.
-6. Resolve opcode, branch, register, and field names through the maps.
-7. Replay the body record stream against the parsed templates.
-```
+See **Part I (Decoder Recipe)** above for the procedural walkthrough:
+Steps 1-7 cover the same flow at byte granularity, with the well-
+known names a strict-resolution decoder must reverse-look-up in
+each encoding map.
 
 The header maps are the compatibility mechanism for custom traces. If a
 future trace adds `REG_FOO = 246` or a new generic opcode, the numeric

@@ -305,6 +305,7 @@ const char *branch_mnem_from_name(const std::string *name)
     if (n == "BRANCH_DIRECT_JUMP")   return "jmp";
     if (n == "BRANCH_INDIRECT_JUMP") return "jmpr";
     if (n == "BRANCH_COND_DIRECT")   return "jcc";
+    if (n == "BRANCH_REP")           return "rep";
     if (n == "BRANCH_RETURN")        return "ret";
     if (n == "BRANCH_SYSCALL_TYPE")  return "syscall";
     return nullptr;

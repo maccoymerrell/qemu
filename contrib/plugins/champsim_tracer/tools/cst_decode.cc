@@ -638,9 +638,31 @@ void BodyWalker::decode_field_delta(Reader &outer,
             uint64_t nv = sec.uleb();
             std::vector<Wide> v;
             v.reserve(nv);
+            /* EXTRA_*_DATA elements can carry the full 512 bits of
+             * a wide register value (vector load/store); the writer
+             * emits them through bw_write_uleb128_u512 and consumes
+             * up to ~74 wire bytes per element.  Using uleb() here
+             * would (a) silently drop the high limbs for any element
+             * whose value exceeds u64, and (b) throw "ULEB128 too
+             * large" for any element whose ULEB encoding exceeds
+             * 10 bytes.  Route the data variants through
+             * uleb_wide(); the ADDR variants stay on uleb() since
+             * addresses fit in u64. */
+            bool is_data = (fid == ids.fid_extra_load_data ||
+                            fid == ids.fid_extra_store_data);
             for (uint64_t k = 0; k < nv; k++) {
-                uint64_t low = sec.uleb();
-                v.push_back(Wide::from_u64(low));
+                Wide w;
+                if (is_data) {
+                    std::array<uint64_t, 8> limbs = sec.uleb_wide();
+                    static_assert(Wide::LIMBS == 8,
+                                  "uleb_wide returns 8 limbs");
+                    for (size_t li = 0; li < Wide::LIMBS; li++) {
+                        w.limb[li] = limbs[li];
+                    }
+                } else {
+                    w = Wide::from_u64(sec.uleb());
+                }
+                v.push_back(w);
             }
             extras[extra_key(pos, fid)] = std::move(v);
             continue;

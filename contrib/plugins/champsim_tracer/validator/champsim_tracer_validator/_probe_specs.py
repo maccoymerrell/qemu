@@ -495,7 +495,11 @@ _register_probe('probe_mips_xchg_nop_neg', {'mipsel': {'asm': '"addiu $sp, $sp, 
                    '    "ssnop\\n\\t"\n'
                    '    "abs   $t2, $t3"',
             'clobbers': '"$t0","$t1","$t2","memory"',
-            'opcodes': ['XCHG', 'NOP', 'INT_SUB']}})
+            # LL / SC are exclusive-monitor primitives, not RMW
+            # swaps: LL is a tagged load, SC is a tagged store.
+            # Reclassified as LOAD / STORE + MF_ATOMIC per the
+            # "RMW is XCHG, but LL/SC alone aren't swaps" rule.
+            'opcodes': ['LOAD', 'STORE', 'NOP', 'INT_SUB']}})
 
 
 # ===========================================================================
@@ -686,13 +690,16 @@ _register_probe('probe_riscv_amoadd', {
 
 _register_probe('probe_mips_ll_sc', {
     'mipsel': {
-        # MIPS LL / SC — load-linked / store-conditional, both
-        # MF_ATOMIC.  The plugin classifies them as XCHG family.
+        # MIPS LL / SC — load-linked / store-conditional.  Both are
+        # MF_ATOMIC exclusive-monitor primitives but individually
+        # they are just a tagged load (LL) and tagged store (SC),
+        # not a swap: the atomic RMW emerges from the pair, not
+        # from either instruction alone.  Classified accordingly.
         'asm':      '"li $t0, 1\\n\\t"\n'
                     '    "ll $t1, 0($sp)\\n\\t"\n'
                     '    "addu $t1, $t1, $t0\\n\\t"\n'
                     '    "sc $t1, 0($sp)"',
         'clobbers': '"$t0","$t1","memory"',
-        'opcodes':  ['XCHG'],
+        'opcodes':  ['LOAD', 'STORE'],
     },
 })

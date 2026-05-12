@@ -456,6 +456,21 @@ Branch types (``BranchType``)
        static target when CP took the branch (i.e., the
        fall-through PC), and the static taken target (the encoded
        immediate) when CP fell through.
+   * - 6
+     - ``BRANCH_REP``
+     - x86 REP / REPNZ self-loop terminator (string ops MOVS /
+       STOS / LODS / CMPS / SCAS / INS / OUTS with a REP prefix).
+       Conditional self-loop: target = the REP's own PC,
+       fall-through = the next PC.  The tracer fans each
+       architectural iteration of the REP loop into its own true-BB
+       visit; iter 1 stays on the BB that *enters* the REP loop,
+       iter 2..N each emit on a 1-insn self-loop sub-template at
+       the REP's PC carrying that iteration's memops (1 load + 1
+       store for MOVS, 2 loads for CMPS, etc.).  Distinguished
+       from ``BRANCH_COND_DIRECT`` so simulators that model branch
+       behaviour can skip target-diversity tracking on REP (target
+       is always self-PC) and so the fan-out shape is obvious at
+       template-parse time.
 
 .. _registers:
 

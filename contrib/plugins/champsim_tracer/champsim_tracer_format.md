@@ -599,6 +599,53 @@ vector pipe, etc.). Consumer code should handle them so foreign
 traces remain decodable; in-tree traces always carry the more specific
 opcode classifications above.
 
+#### REP-prefixed self-loop BBs (x86)
+
+`BranchType` carries a dedicated value `BRANCH_REP` (= 6) for any
+template instruction whose Capstone detail reports the REP / REPNZ
+prefix (x86 string ops MOVS / STOS / LODS / CMPS / SCAS / INS /
+OUTS).  These instructions are emitted as self-looping conditional
+branches: target = the REP's own PC, fall-through = the next PC.
+Consumers that model branch behaviour should treat `BRANCH_REP`
+distinctly from `BRANCH_COND_DIRECT`:
+
+* The taken-target is always the insn's own PC, so a predictor
+  does not need to track target diversity for these branches.
+* The not-taken path exits the architectural loop (ECX == 0 or a
+  REPZ/REPNZ comparison terminator).
+
+The body stream models each architectural iteration of a REP loop
+as its own true-BB visit:
+
+1. The BB that *enters* the REP loop ends at the first iteration's
+   REP instruction.  Its body entry carries iter 1's load and/or
+   store memops on the REP insn's slot, alongside the pre-REP
+   setup insns' regular state.
+2. Iterations 2..N each emit a separate body entry on a 1-insn
+   self-loop sub-template.  The sub-template's single instruction
+   is the REP itself with `BRANCH_REP` and `start_pc =
+   fall_through_pc - insn_size` so the BB is structurally a
+   self-loop.  Each entry's dyn_params carry exactly one
+   iteration's worth of memops:
+
+   - MOVS  → 1 load + 1 store
+   - CMPS  → 2 loads
+   - STOS  → 1 store
+   - LODS  → 1 load
+   - SCAS  → 1 load
+   - INS   → 1 store (port → memory)
+   - OUTS  → 1 load (memory → port)
+
+3. Both the parent BB template and the sub-template appear in the
+   templates section; their `template_id`s are independent and
+   delta-encoded as usual in the body stream.
+
+A regression in the fan-out (e.g. all N iterations aggregated onto
+a single entry with `N_LOADS = N`) would surface in the trace as
+the absence of the sub-template visits and a single overloaded
+body entry — and would re-introduce the `EXTRA_*` overflow path
+in the field-delta stream for high-count REPs.
+
 ```
 current n_loads = state(template, insn, CST_FID_N_LOADS)
 current n_stores = state(template, insn, CST_FID_N_STORES)

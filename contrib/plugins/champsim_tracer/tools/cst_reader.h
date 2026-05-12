@@ -193,6 +193,39 @@ public:
         }
     }
 
+    /*
+     * Unsigned wide ULEB sized to fit a 512-bit value, packed into
+     * 8 little-endian limbs.  Used for EXTRA_LOAD_DATA /
+     * EXTRA_STORE_DATA elements, which the writer emits via
+     * bw_write_uleb128_u512 — values can span the full 512-bit
+     * width when vector-register data is on the wire.  uleb() would
+     * truncate to 64 bits (silently for narrow values; throwing for
+     * anything wider).  Mirrors sleb_wide() but without the sign-
+     * extension step on terminator. */
+    std::array<uint64_t, 8> uleb_wide() {
+        std::array<uint64_t, 8> out{};
+        unsigned shift = 0;
+        while (true) {
+            uint8_t b = u8();
+            uint64_t chunk = (uint64_t)(b & 0x7F);
+            unsigned limb = shift / 64;
+            unsigned bit  = shift % 64;
+            if (limb < 8) {
+                out[limb] |= chunk << bit;
+                if (bit + 7 > 64 && limb + 1 < 8) {
+                    out[limb + 1] |= chunk >> (64 - bit);
+                }
+            }
+            shift += 7;
+            if (!(b & 0x80)) {
+                return out;
+            }
+            if (shift > 8 * 64) {
+                throw std::runtime_error("ULEB128 too large");
+            }
+        }
+    }
+
     int64_t sleb() {
         uint64_t out = 0;
         unsigned shift = 0;

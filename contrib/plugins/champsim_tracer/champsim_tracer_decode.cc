@@ -316,6 +316,14 @@ void decode_detail_to_generic(uint64_t pc,
      * structurally identifies the loop instead of treating it as one
      * BB with a variable memop count.
      *
+     * Branch type is BRANCH_REP — distinct from BRANCH_COND_DIRECT —
+     * so consumer simulators can tell at template-parse time that
+     * this is a self-loop (target=self-PC, fall-through=next-PC)
+     * rather than a generic conditional direct branch.  Predictors
+     * modelling REP don't need to bother with target diversity; the
+     * REP-specific branch type makes the self-loop semantics
+     * obvious in the trace.
+     *
      * Capstone reports the prefix via info->has_rep on x86 (returns
      * false on every other ISA, so this is a no-op for those).  The
      * branch is conditional (the loop exits when ECX == 0 or when
@@ -336,7 +344,7 @@ void decode_detail_to_generic(uint64_t pc,
      * memop stream into N iteration entries.
      */
     if (info->has_rep) {
-        out->branch_type        = BRANCH_COND_DIRECT;
+        out->branch_type        = BRANCH_REP;
         out->branch_conditional = true;
         for (unsigned i = 0; i < info->n_operands; i++) {
             const qemu_plugin_operand *op = &info->operands[i];

@@ -159,6 +159,18 @@ enum BranchType {
     BRANCH_RETURN = 3,
     BRANCH_SYSCALL_TYPE = 4,
     BRANCH_COND_DIRECT = 5,
+    /*
+     * x86 REP / REPNZ self-loop terminator.  The instruction is a
+     * conditional self-loop branch (target = self-PC, fall-through
+     * = next PC); the tracer fans architectural iterations out into
+     * per-iteration body entries on a 1-insn self-loop sub-template
+     * (see champsim_tracer_format.md §"REP-prefixed self-loop BBs").
+     * Consumer simulators that want to model REP as a hot loop
+     * should distinguish this from BRANCH_COND_DIRECT so the
+     * self-loop semantics (no predictor target diversity) are
+     * obvious in the trace.
+     */
+    BRANCH_REP = 6,
     BRANCH_TYPE_COUNT,
 };
 
@@ -352,6 +364,7 @@ static inline const char *branch_type_name(unsigned id)
     case BRANCH_RETURN:         return "BRANCH_RETURN";
     case BRANCH_SYSCALL_TYPE:   return "BRANCH_SYSCALL_TYPE";
     case BRANCH_COND_DIRECT:    return "BRANCH_COND_DIRECT";
+    case BRANCH_REP:            return "BRANCH_REP";
     default:                    return NULL;
     }
 }

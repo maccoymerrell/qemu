@@ -46,30 +46,30 @@ struct FidTables {
     std::array<uint8_t, 256> bucket{};
     std::array<bool, 256>    is_extra{};
 
-    FidTables() {
+    explicit FidTables(const cst::ResolvedIds &ids) {
         bucket.fill(BIDX_OTHER);
         is_extra.fill(false);
-        bucket[cst::FID_N_LOADS]  = BIDX_MEM_COUNTS;
-        bucket[cst::FID_N_STORES] = BIDX_MEM_COUNTS;
+        bucket[ids.fid_n_loads]  = BIDX_MEM_COUNTS;
+        bucket[ids.fid_n_stores] = BIDX_MEM_COUNTS;
         for (int i = 0; i < cst::FID_SLOT_COUNT; i++) {
-            bucket[cst::FID_LOAD_ADDR_BASE  + i] = BIDX_LOAD_ADDR;
-            bucket[cst::FID_STORE_ADDR_BASE + i] = BIDX_STORE_ADDR;
-            bucket[cst::FID_LOAD_DATA_BASE  + i] = BIDX_LOAD_DATA;
-            bucket[cst::FID_STORE_DATA_BASE + i] = BIDX_STORE_DATA;
-            bucket[cst::FID_DST_REG_BASE    + i] = BIDX_DST_REG;
+            bucket[ids.fid_load_addr_base  + i] = BIDX_LOAD_ADDR;
+            bucket[ids.fid_store_addr_base + i] = BIDX_STORE_ADDR;
+            bucket[ids.fid_load_data_base  + i] = BIDX_LOAD_DATA;
+            bucket[ids.fid_store_data_base + i] = BIDX_STORE_DATA;
+            bucket[ids.fid_dst_reg_base    + i] = BIDX_DST_REG;
         }
-        bucket[cst::FID_EXTRA_LOAD_ADDR]  = BIDX_LOAD_ADDR;
-        bucket[cst::FID_EXTRA_STORE_ADDR] = BIDX_STORE_ADDR;
-        bucket[cst::FID_EXTRA_LOAD_DATA]  = BIDX_LOAD_DATA;
-        bucket[cst::FID_EXTRA_STORE_DATA] = BIDX_STORE_DATA;
-        for (int f = cst::FID_INSN_BYTES_LO; f <= cst::FID_INSN_SIZE; f++) {
+        bucket[ids.fid_extra_load_addr]  = BIDX_LOAD_ADDR;
+        bucket[ids.fid_extra_store_addr] = BIDX_STORE_ADDR;
+        bucket[ids.fid_extra_load_data]  = BIDX_LOAD_DATA;
+        bucket[ids.fid_extra_store_data] = BIDX_STORE_DATA;
+        for (int f = ids.fid_insn_bytes_lo; f <= ids.fid_insn_size; f++) {
             bucket[f] = BIDX_INSN_META;
         }
-        bucket[cst::FID_EXTENDED] = BIDX_EXTENDED;
-        is_extra[cst::FID_EXTRA_LOAD_ADDR]  = true;
-        is_extra[cst::FID_EXTRA_STORE_ADDR] = true;
-        is_extra[cst::FID_EXTRA_LOAD_DATA]  = true;
-        is_extra[cst::FID_EXTRA_STORE_DATA] = true;
+        bucket[ids.fid_extended] = BIDX_EXTENDED;
+        is_extra[ids.fid_extra_load_addr]  = true;
+        is_extra[ids.fid_extra_store_addr] = true;
+        is_extra[ids.fid_extra_load_data]  = true;
+        is_extra[ids.fid_extra_store_data] = true;
     }
 };
 
@@ -153,9 +153,10 @@ void skip_lp_section(const uint8_t *m, size_t &p)
 }
 
 void walk_body(const uint8_t *m, size_t body_off, size_t body_end,
+               const cst::ResolvedIds &ids,
                const std::vector<uint32_t> &insns_by_tid, Stats *s)
 {
-    static const FidTables fid;
+    const FidTables fid(ids);
     size_t p = body_off;
     int32_t prev_cp_tid = 0;
     auto &cpfd_b = s->cp_fd;
@@ -165,7 +166,7 @@ void walk_body(const uint8_t *m, size_t body_off, size_t body_end,
         size_t tag_pos = p;
         uint8_t tag = m[p++];
 
-        if (tag == cst::BODY_TAG_ENTRY) {
+        if (tag == ids.body_tag_entry) {
             int64_t tdelta = read_sleb(m, p);
             prev_cp_tid += (int32_t)tdelta;
             s->cp_entry_framing.bytes += p - tag_pos;
@@ -199,7 +200,7 @@ void walk_body(const uint8_t *m, size_t body_off, size_t body_end,
                 } else {
                     skip_uleb(m, p);             /* delta */
                 }
-                if (f == cst::FID_EXTENDED) skip_uleb(m, p);
+                if (f == ids.fid_extended) skip_uleb(m, p);
                 int idx = fid.bucket[f];
                 cpfd_b[idx].bytes += p - rec_p0;
                 cpfd_b[idx].count += 1;
@@ -248,7 +249,7 @@ void walk_body(const uint8_t *m, size_t body_off, size_t body_end,
                     } else {
                         skip_uleb(m, p);
                     }
-                    if (f == cst::FID_EXTENDED) skip_uleb(m, p);
+                    if (f == ids.fid_extended) skip_uleb(m, p);
                     int idx = fid.bucket[f];
                     wpfd_b[idx].bytes += p - rec_p0;
                     wpfd_b[idx].count += 1;
@@ -269,14 +270,14 @@ void walk_body(const uint8_t *m, size_t body_off, size_t body_end,
             continue;
         }
 
-        if (tag == cst::BODY_TAG_THREAD_SWITCH) {
+        if (tag == ids.body_tag_thread_switch) {
             skip_uleb(m, p);                 /* signed delta */
             s->thread_switch.bytes += p - tag_pos;
             s->thread_switch.count += 1;
             continue;
         }
 
-        if (tag == cst::BODY_TAG_IFRAME) {
+        if (tag == ids.body_tag_iframe) {
             skip_lp_section(m, p);
             skip_lp_section(m, p);
             skip_lp_section(m, p);
@@ -285,7 +286,7 @@ void walk_body(const uint8_t *m, size_t body_off, size_t body_end,
             continue;
         }
 
-        if (tag == cst::BODY_TAG_REGFILE) {
+        if (tag == ids.body_tag_regfile) {
             (void)read_uleb(m, p);                /* thread_id */
             uint64_t n_regs = read_uleb(m, p);
             for (uint64_t i = 0; i < n_regs; i++) {
@@ -304,7 +305,7 @@ void walk_body(const uint8_t *m, size_t body_off, size_t body_end,
             continue;
         }
 
-        if (tag == cst::BODY_TAG_END) {
+        if (tag == ids.body_tag_end) {
             skip_uleb(m, p);                 /* num_entries */
             s->body_terminator = p - tag_pos;
             break;
@@ -518,7 +519,7 @@ int main(int argc, char **argv)
          * trailing bytes; the body audit only walks the body record
          * stream itself. */
         walk_body(body_records.data, 0, body_records.size,
-                  insns_by_tid, &s);
+                  h.ids, insns_by_tid, &s);
 
         print_report(s);
     } catch (const std::exception &e) {

@@ -15,49 +15,44 @@ namespace cst {
 
 namespace {
 
-bool is_extra_vector_fid(uint8_t fid)
+static bool is_extra_vector_fid(const ResolvedIds &ids, uint8_t fid)
 {
-    return fid == FID_EXTRA_LOAD_ADDR || fid == FID_EXTRA_STORE_ADDR ||
-           fid == FID_EXTRA_LOAD_DATA || fid == FID_EXTRA_STORE_DATA;
+    return fid == ids.fid_extra_load_addr ||
+           fid == ids.fid_extra_store_addr ||
+           fid == ids.fid_extra_load_data ||
+           fid == ids.fid_extra_store_data;
 }
 
 /*
- * fid -> dense slot index mapping for FieldStateBlock storage.
+ * Build the fid -> dense slot index map for FieldStateBlock storage.
  * Mirrors the writer's field_state_slot_lut (see
- * champsim_tracer_output.cc field_state_slot_lut_build).  Built once
- * at first call.  EXTRA_* and EXTENDED return SLOT_INVALID — those
- * fids are handled out-of-band (per-entry vector records / extension
- * stream) and never sit in the persistent state.
+ * champsim_tracer_output.cc field_state_slot_lut_build).  EXTRA_* and
+ * EXTENDED implicitly return SLOT_INVALID (the lut is initialised to
+ * INVALID and these fids are never assigned a slot) — those fids are
+ * handled out-of-band (per-entry vector records / extension stream)
+ * and never sit in the persistent state.
  */
-std::array<uint8_t, 256> g_slot_lut{};
-bool g_slot_lut_built = false;
-
-void slot_lut_build()
+static void slot_lut_build(const ResolvedIds &ids,
+                           std::array<uint8_t, 256> *out)
 {
-    g_slot_lut.fill(FIELD_STATE_SLOT_INVALID);
-    g_slot_lut[FID_N_LOADS] = 0;
+    out->fill(FIELD_STATE_SLOT_INVALID);
+    (*out)[ids.fid_n_loads] = 0;
     for (unsigned k = 0; k < FID_SLOT_COUNT; k++) {
-        g_slot_lut[FID_LOAD_ADDR_BASE  + k] = (uint8_t)(1                + k);
-        g_slot_lut[FID_STORE_ADDR_BASE + k] = (uint8_t)(1 + 1*FID_SLOT_COUNT + k);
-        g_slot_lut[FID_LOAD_DATA_BASE  + k] = (uint8_t)(1 + 2*FID_SLOT_COUNT + k);
-        g_slot_lut[FID_STORE_DATA_BASE + k] = (uint8_t)(1 + 3*FID_SLOT_COUNT + k);
-        g_slot_lut[FID_DST_REG_BASE    + k] = (uint8_t)(1 + 4*FID_SLOT_COUNT + k);
+        (*out)[ids.fid_load_addr_base  + k] = (uint8_t)(1                + k);
+        (*out)[ids.fid_store_addr_base + k] = (uint8_t)(1 + 1*FID_SLOT_COUNT + k);
+        (*out)[ids.fid_load_data_base  + k] = (uint8_t)(1 + 2*FID_SLOT_COUNT + k);
+        (*out)[ids.fid_store_data_base + k] = (uint8_t)(1 + 3*FID_SLOT_COUNT + k);
+        (*out)[ids.fid_dst_reg_base    + k] = (uint8_t)(1 + 4*FID_SLOT_COUNT + k);
     }
-    g_slot_lut[FID_N_STORES] = (uint8_t)(1 + 5*FID_SLOT_COUNT);
-    for (unsigned f = FID_INSN_BYTES_LO; f <= FID_INSN_SIZE; f++) {
-        g_slot_lut[f] = (uint8_t)(2 + 5*FID_SLOT_COUNT +
-                                   (f - FID_INSN_BYTES_LO));
+    (*out)[ids.fid_n_stores] = (uint8_t)(1 + 5*FID_SLOT_COUNT);
+    for (unsigned f = ids.fid_insn_bytes_lo; f <= ids.fid_insn_size; f++) {
+        (*out)[f] = (uint8_t)(2 + 5*FID_SLOT_COUNT +
+                              (f - ids.fid_insn_bytes_lo));
     }
     /* METAFLAGS sits immediately after the insn-metadata band.  See
      * the matching slot assignment in champsim_tracer_output.cc.    */
-    g_slot_lut[FID_METAFLAGS] = (uint8_t)(2 + 5*FID_SLOT_COUNT +
-        (FID_INSN_SIZE - FID_INSN_BYTES_LO + 1));
-    g_slot_lut_built = true;
-}
-
-uint8_t slot_index(uint8_t fid)
-{
-    return g_slot_lut[fid];
+    (*out)[ids.fid_metaflags] = (uint8_t)(2 + 5*FID_SLOT_COUNT +
+        (ids.fid_insn_size - ids.fid_insn_bytes_lo + 1));
 }
 
 /* Resize/grow a block's storage to accommodate @n_insns instructions.
@@ -278,11 +273,12 @@ void validate_iframe(const DecodedEntry &prev, const DecodedEntry &iframe)
  * baseline is the template's static value (so an emit-equal-to-
  * template produces no record on the wire).  Other FID ranges
  * default to zero; callers handle that path inline. */
-Wide insn_field_default(const InsnTemplate &I, uint8_t fid)
+static Wide insn_field_default(const InsnTemplate &I, uint8_t fid,
+                               const ResolvedIds &ids)
 {
     Wide w;
-    if (fid == FID_INSN_BYTES_LO || fid == FID_INSN_BYTES_HI) {
-        size_t off = (fid == FID_INSN_BYTES_LO) ? 0 : 8;
+    if (fid == ids.fid_insn_bytes_lo || fid == ids.fid_insn_bytes_hi) {
+        size_t off = (fid == ids.fid_insn_bytes_lo) ? 0 : 8;
         size_t take = std::min<size_t>(8, I.raw_bytes.size() > off
                                           ? I.raw_bytes.size() - off : 0);
         if (take) {
@@ -292,21 +288,17 @@ Wide insn_field_default(const InsnTemplate &I, uint8_t fid)
         }
         return w;
     }
-    switch (fid) {
-    case FID_INSN_OPCODE:      w.limb[0] = I.opcode; break;
-    case FID_INSN_BRANCH_TYPE: w.limb[0] = I.branch_type; break;
-    case FID_INSN_FLAGS: {
+    if (fid == ids.fid_insn_opcode)      { w.limb[0] = I.opcode; }
+    else if (fid == ids.fid_insn_branch_type) { w.limb[0] = I.branch_type; }
+    else if (fid == ids.fid_insn_flags) {
         uint64_t f = 0;
-        if (I.branch_conditional) f |= INSN_FLAG_BRANCH_COND;
-        if (I.has_imm)            f |= INSN_FLAG_HAS_IMM;
+        if (I.branch_conditional) f |= ids.insn_flag_branch_cond;
+        if (I.has_imm)            f |= ids.insn_flag_has_imm;
         f |= ((uint64_t)I.sync_hint << INSN_FLAG_SYNC_SHIFT) & INSN_FLAG_SYNC_MASK;
         w.limb[0] = f & 0xFF;
-        break;
     }
-    case FID_INSN_IMMEDIATE:   w.limb[0] = (uint64_t)I.imm; break;
-    case FID_INSN_SIZE:        w.limb[0] = I.raw_bytes.size() & 0xFF; break;
-    default: break;
-    }
+    else if (fid == ids.fid_insn_immediate) { w.limb[0] = (uint64_t)I.imm; }
+    else if (fid == ids.fid_insn_size)      { w.limb[0] = I.raw_bytes.size() & 0xFF; }
     return w;
 }
 
@@ -316,8 +308,9 @@ Wide BodyWalker::template_default(const Template *tmpl,
                                   uint32_t ipos, uint8_t fid) const
 {
     if (!tmpl || ipos >= tmpl->insns.size()) return Wide{};
-    if (fid >= FID_INSN_BYTES_LO && fid <= FID_INSN_SIZE) {
-        return insn_field_default(tmpl->insns[ipos], fid);
+    const ResolvedIds &ids = header_.ids;
+    if (fid >= ids.fid_insn_bytes_lo && fid <= ids.fid_insn_size) {
+        return insn_field_default(tmpl->insns[ipos], fid, ids);
     }
     return Wide{};
 }
@@ -343,6 +336,7 @@ BodyWalker::BodyWalker(const Header &header,
             break;
         }
     }
+    slot_lut_build(header_.ids, &slot_lut_);
 }
 
 void BodyWalker::walk(const Callback &cb,
@@ -367,21 +361,22 @@ void BodyWalker::walk(const Callback &cb,
     uint32_t seq = 0;
     std::optional<uint64_t> footer_num_entries;
 
+    const ResolvedIds &ids = header_.ids;
     while (true) {
         uint8_t tag = body_.u8();
 
-        if (tag == BODY_TAG_END) {
+        if (tag == ids.body_tag_end) {
             footer_num_entries = body_.uleb();
             break;
         }
-        if (tag == BODY_TAG_THREAD_SWITCH) {
+        if (tag == ids.body_tag_thread_switch) {
             int64_t d = body_.sleb();
             current_thread = (uint32_t)((int64_t)current_thread + d);
             pending_thread_switch = true;
             stats_.thread_switch_count++;
             continue;
         }
-        if (tag == BODY_TAG_REGFILE) {
+        if (tag == ids.body_tag_regfile) {
             DecodedRegfile rec;
             rec.thread_id = (uint32_t)body_.uleb();
             uint64_t n_present = body_.uleb();
@@ -400,7 +395,7 @@ void BodyWalker::walk(const Callback &cb,
             stats_.regfile_count++;
             continue;
         }
-        if (tag == BODY_TAG_ENTRY) {
+        if (tag == ids.body_tag_entry) {
             int64_t tdelta = body_.sleb();
             int32_t entry_tmpl = prev_entry_template + (int32_t)tdelta;
             prev_entry_template = entry_tmpl;
@@ -453,8 +448,8 @@ void BodyWalker::walk(const Callback &cb,
                 }
                 uint8_t evf = evb.u8();
                 entry.wp_entries[idx].translation_unavailable =
-                    (evf & WP_EVENT_TRANSLATION_UNAVAIL) != 0;
-                bool is_fault = (evf & WP_EVENT_FAULT) != 0;
+                    (evf & ids.wp_event_translation_unavail) != 0;
+                bool is_fault = (evf & ids.wp_event_fault) != 0;
                 entry.wp_entries[idx].fault = is_fault;
                 if (is_fault) {
                     entry.wp_entries[idx].fault_insn_index =
@@ -502,7 +497,7 @@ void BodyWalker::walk(const Callback &cb,
             prev_entry = std::move(entry);
             continue;
         }
-        if (tag == BODY_TAG_IFRAME) {
+        if (tag == ids.body_tag_iframe) {
             /*
              * Validation record: decode the IFRAME against fresh empty
              * overlays (so every value is delta-from-template-default
@@ -567,8 +562,8 @@ void BodyWalker::walk(const Callback &cb,
                 }
                 uint8_t evf = evb.u8();
                 iframe_entry.wp_entries[idx].translation_unavailable =
-                    (evf & WP_EVENT_TRANSLATION_UNAVAIL) != 0;
-                bool is_fault = (evf & WP_EVENT_FAULT) != 0;
+                    (evf & ids.wp_event_translation_unavail) != 0;
+                bool is_fault = (evf & ids.wp_event_fault) != 0;
                 iframe_entry.wp_entries[idx].fault = is_fault;
                 if (is_fault) {
                     iframe_entry.wp_entries[idx].fault_insn_index =
@@ -608,8 +603,7 @@ void BodyWalker::decode_field_delta(Reader &outer,
 {
     Reader sec = outer.sub();
     uint64_t n_records = sec.uleb();
-
-    if (!g_slot_lut_built) slot_lut_build();
+    const ResolvedIds &ids = header_.ids;
 
     /* Pass 1: apply record deltas to the per-template block. */
     uint32_t pos = 0;
@@ -635,7 +629,7 @@ void BodyWalker::decode_field_delta(Reader &outer,
     for (uint64_t i = 0; i < n_records; i++) {
         pos += (uint32_t)sec.uleb();
         uint8_t fid = sec.u8();
-        if (is_extra_vector_fid(fid)) {
+        if (is_extra_vector_fid(ids, fid)) {
             uint64_t nv = sec.uleb();
             std::vector<Wide> v;
             v.reserve(nv);
@@ -647,11 +641,11 @@ void BodyWalker::decode_field_delta(Reader &outer,
             continue;
         }
         std::array<uint64_t, Wide::LIMBS> wd = sec.sleb_wide();
-        if (fid == FID_EXTENDED) {
+        if (fid == ids.fid_extended) {
             (void)sec.uleb();
             continue;
         }
-        uint8_t slot = slot_index(fid);
+        uint8_t slot = slot_lut_[fid];
         Wide base;
         if (!cell_read(state_blk, state_gen, pos, slot, &base) &&
             !cell_read(base_blk, base_gen, pos, slot, &base)) {
@@ -666,20 +660,20 @@ void BodyWalker::decode_field_delta(Reader &outer,
      * has been ensured-sized for tmpl->insns; base_blk may be smaller
      * or absent — cell_read tolerates both. */
     if (!tmpl) return;
-    bool has_mem = (flags_ & FLAG_MEM_DATA) != 0;
-    bool has_reg = (flags_ & FLAG_REG_DATA) != 0;
+    bool has_mem = (flags_ & ids.flag_mem_data) != 0;
+    bool has_reg = (flags_ & ids.flag_reg_data) != 0;
 
     auto lookup_fid = [&](uint32_t ipos, uint8_t fid) -> Wide {
         Wide out;
-        uint8_t slot = slot_index(fid);
+        uint8_t slot = slot_lut_[fid];
         if (cell_read(state_blk, state_gen, ipos, slot, &out)) return out;
         if (cell_read(base_blk, base_gen, ipos, slot, &out)) return out;
         return Wide{};
     };
 
     for (size_t i = 0; i < tmpl->insns.size(); i++) {
-        uint64_t n_loads  = lookup_fid((uint32_t)i, FID_N_LOADS).low64();
-        uint64_t n_stores = lookup_fid((uint32_t)i, FID_N_STORES).low64();
+        uint64_t n_loads  = lookup_fid((uint32_t)i, ids.fid_n_loads).low64();
+        uint64_t n_stores = lookup_fid((uint32_t)i, ids.fid_n_stores).low64();
 
         if (n_loads || n_stores) {
             uint64_t fixed_loads  = std::min<uint64_t>(n_loads,  FID_SLOT_COUNT);
@@ -687,14 +681,14 @@ void BodyWalker::decode_field_delta(Reader &outer,
 
             for (uint64_t s = 0; s < fixed_loads; s++) {
                 Wide a = lookup_fid((uint32_t)i,
-                                    (uint8_t)(FID_LOAD_ADDR_BASE + s));
+                                    (uint8_t)(ids.fid_load_addr_base + s));
                 DynParam dp;
                 dp.type = DynParam::Load;
                 dp.insn_index = (uint32_t)i;
                 dp.addr = a.low64();
                 if (has_mem) {
                     dp.data = lookup_fid((uint32_t)i,
-                                         (uint8_t)(FID_LOAD_DATA_BASE + s));
+                                         (uint8_t)(ids.fid_load_data_base + s));
                     dp.has_data = true;
                 }
                 dyn_params->push_back(dp);
@@ -702,13 +696,13 @@ void BodyWalker::decode_field_delta(Reader &outer,
 
             uint64_t extra_loads = (n_loads > FID_SLOT_COUNT) ? n_loads - FID_SLOT_COUNT : 0;
             if (extra_loads) {
-                auto eit = extras.find(extra_key(i, FID_EXTRA_LOAD_ADDR));
+                auto eit = extras.find(extra_key(i, ids.fid_extra_load_addr));
                 if (eit == extras.end() || eit->second.size() != extra_loads) {
                     throw std::runtime_error("EXTRA_LOAD_ADDR count mismatch");
                 }
                 std::vector<Wide> *edata = nullptr;
                 if (has_mem) {
-                    auto dit = extras.find(extra_key(i, FID_EXTRA_LOAD_DATA));
+                    auto dit = extras.find(extra_key(i, ids.fid_extra_load_data));
                     if (dit == extras.end() || dit->second.size() != extra_loads) {
                         throw std::runtime_error("EXTRA_LOAD_DATA count mismatch");
                     }
@@ -729,14 +723,14 @@ void BodyWalker::decode_field_delta(Reader &outer,
 
             for (uint64_t s = 0; s < fixed_stores; s++) {
                 Wide a = lookup_fid((uint32_t)i,
-                                    (uint8_t)(FID_STORE_ADDR_BASE + s));
+                                    (uint8_t)(ids.fid_store_addr_base + s));
                 DynParam dp;
                 dp.type = DynParam::Store;
                 dp.insn_index = (uint32_t)i;
                 dp.addr = a.low64();
                 if (has_mem) {
                     dp.data = lookup_fid((uint32_t)i,
-                                         (uint8_t)(FID_STORE_DATA_BASE + s));
+                                         (uint8_t)(ids.fid_store_data_base + s));
                     dp.has_data = true;
                 }
                 dyn_params->push_back(dp);
@@ -744,13 +738,13 @@ void BodyWalker::decode_field_delta(Reader &outer,
 
             uint64_t extra_stores = (n_stores > FID_SLOT_COUNT) ? n_stores - FID_SLOT_COUNT : 0;
             if (extra_stores) {
-                auto eit = extras.find(extra_key(i, FID_EXTRA_STORE_ADDR));
+                auto eit = extras.find(extra_key(i, ids.fid_extra_store_addr));
                 if (eit == extras.end() || eit->second.size() != extra_stores) {
                     throw std::runtime_error("EXTRA_STORE_ADDR count mismatch");
                 }
                 std::vector<Wide> *edata = nullptr;
                 if (has_mem) {
-                    auto dit = extras.find(extra_key(i, FID_EXTRA_STORE_DATA));
+                    auto dit = extras.find(extra_key(i, ids.fid_extra_store_data));
                     if (dit == extras.end() || dit->second.size() != extra_stores) {
                         throw std::runtime_error("EXTRA_STORE_DATA count mismatch");
                     }
@@ -773,7 +767,7 @@ void BodyWalker::decode_field_delta(Reader &outer,
         if (has_reg) {
             for (size_t op_i = 0; op_i < tmpl->insns[i].dst_regs.size(); op_i++) {
                 Wide v = lookup_fid((uint32_t)i,
-                                    (uint8_t)(FID_DST_REG_BASE + op_i));
+                                    (uint8_t)(ids.fid_dst_reg_base + op_i));
                 RegSnap r;
                 r.insn_index = (uint32_t)i;
                 r.operand_index = (uint8_t)op_i;
@@ -792,7 +786,7 @@ void BodyWalker::decode_field_delta(Reader &outer,
                     if ((int)r == reg_flags_id_) { writes_flags = true; break; }
                 }
                 if (writes_flags) {
-                    Wide v = lookup_fid((uint32_t)i, FID_METAFLAGS);
+                    Wide v = lookup_fid((uint32_t)i, ids.fid_metaflags);
                     MetaFlagsEntry mfe;
                     mfe.insn_index = (uint32_t)i;
                     mfe.byte = (uint8_t)(v.low64() & 0xFF);

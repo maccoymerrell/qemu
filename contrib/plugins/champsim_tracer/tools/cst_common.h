@@ -42,70 +42,90 @@ namespace cst {
 
 inline constexpr uint32_t CST_MAGIC = 0x1C545343u;
 
-/* ===== METAFLAGS bit layout =====
+/* ===== Format-layout invariants =====
  *
- * Canonical Z/N/C/V/P byte carried in the field-delta stream under
- * FID_METAFLAGS for every insn whose template writes the ISA's
- * integer-flags register.  The numeric id of REG_FLAGS itself is
- * resolved at parse time from the trace's "reg" encoding map. */
-inline constexpr uint8_t METAFLAGS_Z = 1u << 0;
-inline constexpr uint8_t METAFLAGS_N = 1u << 1;
-inline constexpr uint8_t METAFLAGS_C = 1u << 2;
-inline constexpr uint8_t METAFLAGS_V = 1u << 3;
-inline constexpr uint8_t METAFLAGS_P = 1u << 4;
-
-/* ===== Body tags ===== */
-
-inline constexpr uint8_t BODY_TAG_END           = 0;
-inline constexpr uint8_t BODY_TAG_ENTRY         = 1;
-inline constexpr uint8_t BODY_TAG_THREAD_SWITCH = 2;
-inline constexpr uint8_t BODY_TAG_IFRAME        = 3;
-inline constexpr uint8_t BODY_TAG_REGFILE       = 4;
-
-/* ===== Per-insn template flag bits ===== */
-
-inline constexpr uint8_t INSN_FLAG_BRANCH_COND = 1u << 0;
-inline constexpr uint8_t INSN_FLAG_HAS_IMM     = 1u << 1;
-inline constexpr uint8_t INSN_FLAG_SYNC_SHIFT  = 2;
-inline constexpr uint8_t INSN_FLAG_SYNC_MASK   = 0x3Cu;
-
-/* ===== Header feature flags ===== */
-
-inline constexpr uint8_t FLAG_MEM_DATA = 1u << 0;
-inline constexpr uint8_t FLAG_REG_DATA = 1u << 1;
-
-/* ===== WP event flags ===== */
-
-inline constexpr uint8_t WP_EVENT_TRANSLATION_UNAVAIL = 1u << 0;
-inline constexpr uint8_t WP_EVENT_FAULT               = 1u << 1;
-
-/* ===== Field IDs (unified delta stream) ===== */
-
+ * Bit-layout constants that the encoding maps cannot describe:
+ *
+ *   INSN_FLAG_SYNC_{SHIFT,MASK}: the sync-hint field is a 4-bit
+ *     subfield at bit-offset 2 inside the per-insn flags byte.  The
+ *     map exposes CST_INSN_FLAG_SYNC_MASK so a decoder can confirm
+ *     the layout matches, but the shift amount is implied by the
+ *     mask's low bit.
+ *
+ *   FID_SLOT_COUNT: number of slot positions per memop / dst-reg
+ *     range in the field-id space.  Implied by the per-base stride
+ *     in the field_id map.
+ *
+ *   MAX_WIDE_BYTES / MAX_INSN_BYTES: largest scalar the wire format
+ *     can carry / largest insn the template section can hold.  Both
+ *     are buffer-sizing limits, not enum identities. */
+inline constexpr uint8_t INSN_FLAG_SYNC_SHIFT = 2;
+inline constexpr uint8_t INSN_FLAG_SYNC_MASK  = 0x3Cu;
 inline constexpr uint8_t FID_SLOT_COUNT       = 16;
 inline constexpr size_t  MAX_WIDE_BYTES       = 64;
+inline constexpr int     MAX_INSN_BYTES       = 16;
 
-inline constexpr uint8_t FID_N_LOADS          = 0x00;
-inline constexpr uint8_t FID_LOAD_ADDR_BASE   = 0x01;
-inline constexpr uint8_t FID_STORE_ADDR_BASE  = 0x11;
-inline constexpr uint8_t FID_LOAD_DATA_BASE   = 0x21;
-inline constexpr uint8_t FID_STORE_DATA_BASE  = 0x31;
-inline constexpr uint8_t FID_DST_REG_BASE     = 0x51;
-inline constexpr uint8_t FID_N_STORES         = 0x61;
-inline constexpr uint8_t FID_EXTRA_LOAD_ADDR  = 0x62;
-inline constexpr uint8_t FID_EXTRA_STORE_ADDR = 0x63;
-inline constexpr uint8_t FID_EXTRA_LOAD_DATA  = 0x64;
-inline constexpr uint8_t FID_EXTRA_STORE_DATA = 0x65;
-inline constexpr uint8_t FID_INSN_BYTES_LO    = 0x70;
-inline constexpr uint8_t FID_INSN_BYTES_HI    = 0x71;
-inline constexpr uint8_t FID_INSN_OPCODE      = 0x72;
-inline constexpr uint8_t FID_INSN_BRANCH_TYPE = 0x73;
-inline constexpr uint8_t FID_INSN_FLAGS       = 0x74;
-inline constexpr uint8_t FID_INSN_IMMEDIATE   = 0x75;
-inline constexpr uint8_t FID_INSN_SIZE        = 0x76;
-inline constexpr uint8_t FID_METAFLAGS        = 0x77;
-inline constexpr uint8_t FID_EXTENDED         = 0xFF;
+/* ===== Resolved IDs =====
+ *
+ * The trace's encoding maps name every dispatch-time integer ID
+ * (body tags, field IDs) and every named bit mask (header flags,
+ * per-insn flags, WP event flags, metaflags bits).  parse_header
+ * reverse-resolves the well-known names into this struct and the
+ * tools dispatch on @h.ids.<name> instead of compile-time enum
+ * values, so the wire format remains the single source of truth.
+ * parse_header throws if a well-known name is missing from a map.
+ *
+ * The names below mirror the symbols the plugin emits in the header
+ * maps (see champsim_tracer_output.cc::write_header_encoding_maps). */
+struct ResolvedIds {
+    /* body_tag map */
+    uint8_t body_tag_end           = 0;
+    uint8_t body_tag_entry         = 0;
+    uint8_t body_tag_thread_switch = 0;
+    uint8_t body_tag_iframe        = 0;
+    uint8_t body_tag_regfile       = 0;
 
-inline constexpr int MAX_INSN_BYTES = 16;
+    /* field_id map: base IDs of the per-slot ranges + singletons */
+    uint8_t fid_n_loads          = 0;
+    uint8_t fid_load_addr_base   = 0;
+    uint8_t fid_store_addr_base  = 0;
+    uint8_t fid_load_data_base   = 0;
+    uint8_t fid_store_data_base  = 0;
+    uint8_t fid_dst_reg_base     = 0;
+    uint8_t fid_n_stores         = 0;
+    uint8_t fid_extra_load_addr  = 0;
+    uint8_t fid_extra_store_addr = 0;
+    uint8_t fid_extra_load_data  = 0;
+    uint8_t fid_extra_store_data = 0;
+    uint8_t fid_insn_bytes_lo    = 0;
+    uint8_t fid_insn_bytes_hi    = 0;
+    uint8_t fid_insn_opcode      = 0;
+    uint8_t fid_insn_branch_type = 0;
+    uint8_t fid_insn_flags       = 0;
+    uint8_t fid_insn_immediate   = 0;
+    uint8_t fid_insn_size        = 0;
+    uint8_t fid_metaflags        = 0;
+    uint8_t fid_extended         = 0;
+
+    /* insn_flag map: bit masks inside the per-insn flags byte */
+    uint8_t insn_flag_branch_cond = 0;
+    uint8_t insn_flag_has_imm     = 0;
+
+    /* header_flag map: bit masks inside Header::flags */
+    uint8_t flag_mem_data = 0;
+    uint8_t flag_reg_data = 0;
+
+    /* wp_event_flag map: bit masks inside the per-WP-event flags byte */
+    uint8_t wp_event_translation_unavail = 0;
+    uint8_t wp_event_fault               = 0;
+
+    /* metaflags map: bit positions inside the FID_METAFLAGS byte */
+    uint8_t metaflags_z = 0;
+    uint8_t metaflags_n = 0;
+    uint8_t metaflags_c = 0;
+    uint8_t metaflags_v = 0;
+    uint8_t metaflags_p = 0;
+};
 
 /* ===== 512-bit unsigned scalar ===== */
 
@@ -294,9 +314,10 @@ struct Header {
     std::string comment;
     std::string target_name;
     EncodingMaps maps;
+    ResolvedIds ids{};
 
-    bool has_mem_data() const { return flags & FLAG_MEM_DATA; }
-    bool has_reg_data() const { return flags & FLAG_REG_DATA; }
+    bool has_mem_data() const { return flags & ids.flag_mem_data; }
+    bool has_reg_data() const { return flags & ids.flag_reg_data; }
     int  scalar_width_bits() const { return 512; }
 };
 

@@ -52,6 +52,7 @@ void parse_encoding_maps(Reader &r, EncodingMaps *out)
 }
 
 void parse_templates_at(Reader &r,
+                        const ResolvedIds &ids,
                         std::vector<Template> *out,
                         std::unordered_map<uint32_t, size_t> *out_by_id)
 {
@@ -86,8 +87,8 @@ void parse_templates_at(Reader &r,
             for (auto &x : I.dst_regs) x = sub.u8();
             I.n_loads  = sub.u8();
             I.n_stores = sub.u8();
-            I.branch_conditional = (flags & INSN_FLAG_BRANCH_COND) != 0;
-            I.has_imm            = (flags & INSN_FLAG_HAS_IMM) != 0;
+            I.branch_conditional = (flags & ids.insn_flag_branch_cond) != 0;
+            I.has_imm            = (flags & ids.insn_flag_has_imm) != 0;
             I.sync_hint          =
                 (flags & INSN_FLAG_SYNC_MASK) >> INSN_FLAG_SYNC_SHIFT;
             if (I.has_imm) I.imm = sub.sleb();
@@ -101,6 +102,113 @@ void parse_templates_at(Reader &r,
         if (out_by_id) (*out_by_id)[t.template_id] = out->size();
         out->push_back(std::move(t));
     }
+}
+
+/* Reverse-resolve a well-known name in @m and store its ID into @out.
+ * Throws if the name is absent. */
+static void resolve_one(const std::unordered_map<uint64_t, std::string> &m,
+                        const char *map_name, const char *want,
+                        uint8_t *out)
+{
+    for (const auto &kv : m) {
+        if (kv.second == want) {
+            *out = (uint8_t)kv.first;
+            return;
+        }
+    }
+    throw std::runtime_error(std::string("encoding map '") + map_name
+                             + "' missing well-known name '" + want + "'");
+}
+
+/* Populate @ids from the well-known names in @maps.  Throws on any
+ * missing name — the wire format is the single source of truth, so a
+ * trace that omits a name the decoder needs is malformed. */
+static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
+{
+    /* body_tag */
+    resolve_one(maps.body_tag, "body_tag", "BODY_TAG_END",
+                &ids->body_tag_end);
+    resolve_one(maps.body_tag, "body_tag", "BODY_TAG_ENTRY",
+                &ids->body_tag_entry);
+    resolve_one(maps.body_tag, "body_tag", "BODY_TAG_THREAD_SWITCH",
+                &ids->body_tag_thread_switch);
+    resolve_one(maps.body_tag, "body_tag", "BODY_TAG_IFRAME",
+                &ids->body_tag_iframe);
+    resolve_one(maps.body_tag, "body_tag", "BODY_TAG_REGFILE",
+                &ids->body_tag_regfile);
+
+    /* field_id (slot-range bases + singletons) */
+    resolve_one(maps.field_id, "field_id", "CST_FID_N_LOADS",
+                &ids->fid_n_loads);
+    resolve_one(maps.field_id, "field_id", "CST_FID_LOAD_ADDR0",
+                &ids->fid_load_addr_base);
+    resolve_one(maps.field_id, "field_id", "CST_FID_STORE_ADDR0",
+                &ids->fid_store_addr_base);
+    resolve_one(maps.field_id, "field_id", "CST_FID_LOAD_DATA0",
+                &ids->fid_load_data_base);
+    resolve_one(maps.field_id, "field_id", "CST_FID_STORE_DATA0",
+                &ids->fid_store_data_base);
+    resolve_one(maps.field_id, "field_id", "CST_FID_DST_REG0",
+                &ids->fid_dst_reg_base);
+    resolve_one(maps.field_id, "field_id", "CST_FID_N_STORES",
+                &ids->fid_n_stores);
+    resolve_one(maps.field_id, "field_id", "CST_FID_EXTRA_LOAD_ADDR",
+                &ids->fid_extra_load_addr);
+    resolve_one(maps.field_id, "field_id", "CST_FID_EXTRA_STORE_ADDR",
+                &ids->fid_extra_store_addr);
+    resolve_one(maps.field_id, "field_id", "CST_FID_EXTRA_LOAD_DATA",
+                &ids->fid_extra_load_data);
+    resolve_one(maps.field_id, "field_id", "CST_FID_EXTRA_STORE_DATA",
+                &ids->fid_extra_store_data);
+    resolve_one(maps.field_id, "field_id", "CST_FID_INSN_BYTES_LO",
+                &ids->fid_insn_bytes_lo);
+    resolve_one(maps.field_id, "field_id", "CST_FID_INSN_BYTES_HI",
+                &ids->fid_insn_bytes_hi);
+    resolve_one(maps.field_id, "field_id", "CST_FID_INSN_OPCODE",
+                &ids->fid_insn_opcode);
+    resolve_one(maps.field_id, "field_id", "CST_FID_INSN_BRANCH_TYPE",
+                &ids->fid_insn_branch_type);
+    resolve_one(maps.field_id, "field_id", "CST_FID_INSN_FLAGS",
+                &ids->fid_insn_flags);
+    resolve_one(maps.field_id, "field_id", "CST_FID_INSN_IMMEDIATE",
+                &ids->fid_insn_immediate);
+    resolve_one(maps.field_id, "field_id", "CST_FID_INSN_SIZE",
+                &ids->fid_insn_size);
+    resolve_one(maps.field_id, "field_id", "CST_FID_METAFLAGS",
+                &ids->fid_metaflags);
+    resolve_one(maps.field_id, "field_id", "CST_FID_EXTENDED",
+                &ids->fid_extended);
+
+    /* insn_flag (bit masks) */
+    resolve_one(maps.insn_flag, "insn_flag", "CST_INSN_FLAG_BRANCH_COND",
+                &ids->insn_flag_branch_cond);
+    resolve_one(maps.insn_flag, "insn_flag", "CST_INSN_FLAG_HAS_IMM",
+                &ids->insn_flag_has_imm);
+
+    /* header_flag (bit masks) */
+    resolve_one(maps.header_flag, "header_flag", "CST_FLAG_MEM_DATA",
+                &ids->flag_mem_data);
+    resolve_one(maps.header_flag, "header_flag", "CST_FLAG_REG_DATA",
+                &ids->flag_reg_data);
+
+    /* wp_event_flag (bit masks) */
+    resolve_one(maps.wp_event_flag, "wp_event_flag",
+                "CST_WP_EVENT_TRANSLATION_UNAVAIL",
+                &ids->wp_event_translation_unavail);
+    resolve_one(maps.wp_event_flag, "wp_event_flag", "CST_WP_EVENT_FAULT",
+                &ids->wp_event_fault);
+
+    /* metaflags (bit positions inside the FID_METAFLAGS byte) */
+    resolve_one(maps.metaflags, "metaflags", "CST_METAFLAGS_Z",
+                &ids->metaflags_z);
+    resolve_one(maps.metaflags, "metaflags", "CST_METAFLAGS_N",
+                &ids->metaflags_n);
+    resolve_one(maps.metaflags, "metaflags", "CST_METAFLAGS_C",
+                &ids->metaflags_c);
+    resolve_one(maps.metaflags, "metaflags", "CST_METAFLAGS_V",
+                &ids->metaflags_v);
+    resolve_one(maps.metaflags, "metaflags", "CST_METAFLAGS_P",
+                &ids->metaflags_p);
 }
 
 /* ===== POSIX-ustar reader ================================================
@@ -432,11 +540,15 @@ Header parse_header(MemberView view,
         throw std::runtime_error("encoding-map section has trailing bytes");
     }
 
+    /* Reverse-resolve every well-known name in the encoding maps to
+     * its wire-format ID.  Tools dispatch off @h.ids from here on. */
+    resolve_ids(h.maps, &h.ids);
+
     /* Templates section consumes the remainder of the header
      * member.  No length prefix on the section itself — it ends at
      * end-of-buffer. */
     if (!r.eof() && out_templates) {
-        parse_templates_at(r, out_templates, out_by_id);
+        parse_templates_at(r, h.ids, out_templates, out_by_id);
     }
     if (!r.eof()) {
         throw std::runtime_error("header member has trailing bytes after templates");

@@ -134,6 +134,9 @@ private:
      * map at construction.  -1 if the trace doesn't name a flags
      * register (e.g. RISC-V), in which case no metaflags are surfaced. */
     int      reg_flags_id_;
+    /* fid -> dense slot index, built from header_.ids at construction.
+     * EXTRA_* / EXTENDED return FIELD_STATE_SLOT_INVALID. */
+    std::array<uint8_t, 256> slot_lut_{};
     BodyStats stats_;
 };
 

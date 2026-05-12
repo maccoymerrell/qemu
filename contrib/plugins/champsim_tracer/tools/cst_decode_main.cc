@@ -260,14 +260,15 @@ std::string regref_from_name(const std::string &name)
  * traces.  Compact even on the busiest case (5 chars vs the
  * 1-byte-zero-padded "0x1f" hex form).
  */
-inline void append_metaflags_bits(std::string *out, uint8_t mf)
+inline void append_metaflags_bits(std::string *out,
+                                  const cst::ResolvedIds &ids, uint8_t mf)
 {
     if (mf == 0) { out->push_back('-'); return; }
-    if (mf & cst::METAFLAGS_Z) out->push_back('Z');
-    if (mf & cst::METAFLAGS_N) out->push_back('N');
-    if (mf & cst::METAFLAGS_C) out->push_back('C');
-    if (mf & cst::METAFLAGS_V) out->push_back('V');
-    if (mf & cst::METAFLAGS_P) out->push_back('P');
+    if (mf & ids.metaflags_z) out->push_back('Z');
+    if (mf & ids.metaflags_n) out->push_back('N');
+    if (mf & ids.metaflags_c) out->push_back('C');
+    if (mf & ids.metaflags_v) out->push_back('V');
+    if (mf & ids.metaflags_p) out->push_back('P');
 }
 
 /*
@@ -496,7 +497,7 @@ void emit_observations_legacy(FILE *out, const std::string &prefix,
         std::fprintf(out, "%smetaflags:\n", prefix.c_str());
         for (auto &m : mflags) {
             std::string s;
-            append_metaflags_bits(&s, m.byte);
+            append_metaflags_bits(&s, h.ids, m.byte);
             std::fprintf(out, "%s  insn[%u] 0x%02x [%s]\n",
                          prefix.c_str(), m.insn_index,
                          (unsigned)m.byte, s.c_str());
@@ -915,7 +916,7 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
             line.append(", ");
         }
         line.append("%mflags[");
-        append_metaflags_bits(&line, mf.byte);
+        append_metaflags_bits(&line, ctx.h->ids, mf.byte);
         line.append("]");
         break;
     }

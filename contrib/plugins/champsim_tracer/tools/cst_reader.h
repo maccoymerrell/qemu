@@ -178,6 +178,21 @@ public:
         }
     }
 
+    /*
+     * Skip a LEB128 varint without decoding it.  Reads bytes until
+     * one with the continuation bit clear; never overflows.  Safe
+     * for variable-width values where the caller doesn't care about
+     * the value itself — e.g. audit walks the field-delta stream
+     * advancing past sleb_wide-encoded deltas that may be wider
+     * than 64 bits and so trip uleb()/sleb()'s overflow guards.
+     */
+    void skip_varint() {
+        while (true) {
+            uint8_t b = u8();
+            if (!(b & 0x80)) return;
+        }
+    }
+
     int64_t sleb() {
         uint64_t out = 0;
         unsigned shift = 0;

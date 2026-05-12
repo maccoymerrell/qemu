@@ -110,21 +110,32 @@ struct Stats {
 
 /* Tally the bytes consumed by a single field-delta record into the
  * caller's bucket table.  Used by both the CP and WP record loops
- * (only difference is which bucket table they're aggregating into). */
+ * (only difference is which bucket table they're aggregating into).
+ *
+ * The field-delta wire format uses sleb_wide() for the delta value,
+ * which can span up to 8 limbs (512 bits) for wide-data fields
+ * (LOAD_DATA / STORE_DATA / DST_REG carrying vector-register
+ * snapshots).  Audit doesn't care about the decoded value — it
+ * only needs to advance the cursor — so skip_varint() walks the
+ * continuation bits without an overflow guard.  Using uleb()
+ * here would throw "ULEB128 too large" on any record whose delta
+ * exceeded 64 bits, which the original raw-byte walker tolerated
+ * because it used a per-byte skip loop.
+ */
 static inline void tally_fd_record(
     cst::Reader &sec, const FidTables &fid, const cst::ResolvedIds &ids,
     std::array<Bucket, NUM_BUCKETS> *fd_b)
 {
     size_t before = sec.consumed();
-    sec.uleb();                              /* ipos delta */
+    sec.skip_varint();                       /* ipos delta */
     uint8_t f = sec.u8();
     if (fid.is_extra[f]) {
         uint64_t nv = sec.uleb();
-        for (uint64_t k = 0; k < nv; k++) sec.uleb();
+        for (uint64_t k = 0; k < nv; k++) sec.skip_varint();
     } else {
-        sec.uleb();                          /* delta */
+        sec.skip_varint();                   /* sleb_wide delta */
     }
-    if (f == ids.fid_extended) sec.uleb();
+    if (f == ids.fid_extended) sec.skip_varint();
     int idx = fid.bucket[f];
     (*fd_b)[idx].bytes += sec.consumed() - before;
     (*fd_b)[idx].count += 1;
@@ -157,13 +168,19 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
 
             /* CP field-delta section.  sub() consumes the ULEB
              * payload length + payload bytes; we account for the
-             * length prefix separately by subtracting the sub's
-             * payload size from the parent's bytes-consumed delta. */
+             * length prefix separately by subtracting the payload
+             * size (captured before any reads via remaining()) from
+             * the parent's bytes-consumed delta.  Using sec.end()
+             * here was a long-standing bug: for mem-backed sub-
+             * Readers it's the *absolute* end offset, not the
+             * payload size, so the subtraction underflowed once the
+             * trace grew past a few hundred bytes. */
             size_t sec_in_start = body.consumed();
             cst::Reader sec = body.sub();
+            size_t sec_payload = sec.remaining();
             size_t sec_total = body.consumed() - sec_in_start;
             s->cp_field_delta.bytes += sec_total;
-            cpfd_b[BIDX_OVERHEAD].bytes += sec_total - sec.end();
+            cpfd_b[BIDX_OVERHEAD].bytes += sec_total - sec_payload;
             cpfd_b[BIDX_OVERHEAD].count += 1;
 
             size_t rec_st = sec.consumed();
@@ -198,9 +215,10 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
 
                 size_t wp_sec_in = wpb.consumed();
                 cst::Reader wpsec = wpb.sub();
+                size_t wp_sec_payload = wpsec.remaining();
                 size_t wp_sec_total = wpb.consumed() - wp_sec_in;
                 s->wp_field_delta.bytes += wp_sec_total;
-                wpfd_b[BIDX_OVERHEAD].bytes += wp_sec_total - wpsec.end();
+                wpfd_b[BIDX_OVERHEAD].bytes += wp_sec_total - wp_sec_payload;
                 wpfd_b[BIDX_OVERHEAD].count += 1;
 
                 size_t wp_rec_st = wpsec.consumed();

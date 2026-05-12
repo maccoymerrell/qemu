@@ -25,10 +25,13 @@ bool set_outfile(PluginConfig *cfg, const char *v)
     return true;
 }
 
-bool set_outpipe(PluginConfig *cfg, const char *v)
+bool set_compress(PluginConfig *cfg, const char *v)
 {
-    g_free(cfg->output_pipe);
-    cfg->output_pipe = g_strdup(v);
+    /* Per-member compression command.  Each output member (body and
+     * header) inside the outer tarball is piped through this command
+     * before landing on disk.  Empty / unset = uncompressed members. */
+    g_free(cfg->compress_cmd);
+    cfg->compress_cmd = g_strdup(v);
     return true;
 }
 
@@ -236,7 +239,7 @@ const struct {
 } options[] = {
     { "wpdepth",    set_wpdepth    },
     { "outfile",    set_outfile    },
-    { "outpipe",    set_outpipe    },
+    { "compress",   set_compress   },
     { "wp",         set_wp         },
     { "program",    set_program    },
     { "comment",    set_comment    },
@@ -285,13 +288,13 @@ bool parse_plugin_options(PluginConfig *cfg, int argc, char **argv)
 void plugin_config_free(PluginConfig *cfg)
 {
     g_free(cfg->output_path);
-    g_free(cfg->output_pipe);
+    g_free(cfg->compress_cmd);
     g_free(cfg->program_name);
     g_free(cfg->simpoints_file);
     g_free(cfg->comment);
     g_free(cfg->start_symbol);
     cfg->output_path = nullptr;
-    cfg->output_pipe = nullptr;
+    cfg->compress_cmd = nullptr;
     cfg->program_name = nullptr;
     cfg->simpoints_file = nullptr;
     cfg->comment = nullptr;

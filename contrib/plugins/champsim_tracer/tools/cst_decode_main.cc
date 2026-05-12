@@ -1298,35 +1298,17 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    int fd = ::open(trace_path, O_RDONLY);
-    if (fd < 0) {
-        std::fprintf(stderr, "cst_decode: cannot open %s: %s\n",
-                     trace_path, std::strerror(errno));
-        return 1;
-    }
-    struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
-        std::fprintf(stderr, "cst_decode: empty/unstattable trace\n");
-        ::close(fd);
-        return 1;
-    }
-    void *map = mmap(nullptr, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    ::close(fd);
-    if (map == MAP_FAILED) {
-        std::fprintf(stderr, "cst_decode: mmap failed: %s\n",
-                     std::strerror(errno));
-        return 1;
-    }
-    const uint8_t *m = (const uint8_t *)map;
-    size_t size = (size_t)st.st_size;
-
     try {
-        cst::Trailer t = cst::parse_trailer(m, size);
-        cst::Header h = cst::parse_header(m, size, t.body_off, t.magic);
+        /* Outer .cst is a ustar archive holding two members
+         * (body.cst[.<codec>] + header.cst[.<codec>]).  cst_file_
+         * open walks the tar, dispatches decompression per member
+         * suffix, and returns a CstFile carrying the two byte
+         * ranges. */
+        std::unique_ptr<cst::CstFile> cf = cst::cst_file_open(trace_path);
+
+        std::vector<cst::Template> templates;
         std::unordered_map<uint32_t, size_t> by_id;
-        std::vector<cst::Template> templates =
-            cst::parse_templates(m, size, t.templates_off,
-                                  t.templates_count, &by_id);
+        cst::Header h = cst::parse_header(cf->header(), &templates, &by_id);
 
         /* Optional Capstone-backed objdump column.  Open once per
          * invocation; the per-line render call reuses the handle. */
@@ -1346,9 +1328,14 @@ int main(int argc, char **argv)
         if (templates_only) {
             render_templates_only(stdout, h, templates, by_id, odp);
         } else {
-            cst::BodyWalker walker(h, templates, by_id, m, size,
-                                   t.body_off,
-                                   t.body_off + t.body_byte_count);
+            /* Body member: leading + trailing CST_MAGIC bracket the
+             * records.  body_records_view strips both, leaving just
+             * the BODY_TAG_* stream for the walker. */
+            cst::MemberView body_records =
+                cst::body_records_view(cf->body());
+            cst::BodyWalker walker(h, templates, by_id,
+                                   body_records.data, body_records.size,
+                                   0, body_records.size);
             if (std::strcmp(format, "legacy") == 0) {
                 render_legacy(stdout, h, templates, by_id, walker);
             } else if (std::strcmp(format, "disasm") == 0) {
@@ -1356,16 +1343,12 @@ int main(int argc, char **argv)
             } else {
                 std::fprintf(stderr,
                              "cst_decode: unknown format '%s'\n", format);
-                munmap(map, size);
                 return 2;
             }
         }
     } catch (const std::exception &e) {
         std::fprintf(stderr, "cst_decode: %s\n", e.what());
-        munmap(map, size);
         return 1;
     }
-
-    munmap(map, size);
     return 0;
 }

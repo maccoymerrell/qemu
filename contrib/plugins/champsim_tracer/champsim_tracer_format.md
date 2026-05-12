@@ -30,27 +30,41 @@ section := len:ULEB  payload[len]
 
 ## 1. File Layout
 
-The file is written in streaming order, but seek-first consumers usually
-read the fixed trailer first to find the body and template sections.
+A `.cst` file is a POSIX **ustar** archive carrying exactly two
+regular-file members.  Each member is independently byte-aligned and
+optionally compressed; the compression algorithm is encoded in the
+member's filename suffix.
 
 ```
-offset 0
-  |
-  v
-+-----------------------------+
-| Header                      |  variable length
-| - fixed metadata            |
-| - encoding maps             |
-+-----------------------------+  body_off
-| Body stream                 |  body_byte_count bytes
-| - BODY_TAG_ENTRY records    |
-| - BODY_TAG_END footer       |
-+-----------------------------+  templates_off
-| Templates section           |  templates_count records
-+-----------------------------+  EOF - 64
-| Trailer                     |  exactly 64 bytes
-+-----------------------------+  EOF
+.cst (POSIX ustar archive)
++-----------------------------------------+
+| body.cst[.<codec>]                      |  member 1 (body first)
+|   CST_MAGIC                u32          |
+|   body record stream                    |
+|   BODY_TAG_END  num_entries:ULEB        |
+|   CST_MAGIC                u32          |  trailing magic; truncation marker
++-----------------------------------------+
+| header.cst[.<codec>]                    |  member 2
+|   CST_MAGIC                u32          |
+|   isa / flags / window descriptors      |
+|   strings (command, datetime, ...)      |
+|   encoding maps section                 |
+|   templates section                     |
++-----------------------------------------+
 ```
+
+`<codec>` is one of `.zst`, `.xz`, `.gz`, `.bz2`, `.lz4`, or omitted
+entirely (uncompressed).  When the tracer is run with `compress=<cmd>`
+the writer streams each member's bytes through that command and renames
+the in-archive member to match the resulting payload (e.g.
+`body.cst.zst`).  The body is always written first so that header
+finalisation can include the final template count.
+
+Decoders should treat the archive as opaque, find both members by
+prefix match (`body.cst*` and `header.cst*`), dispatch a decompressor
+based on the trailing suffix, and parse each member as described
+below.  There is no global file trailer and no global offset table:
+each member is fully self-describing once you have its raw bytes.
 
 The body refers to template IDs, and templates describe the static
 instruction shape for each basic block. Dynamic fields in the body are
@@ -60,9 +74,7 @@ state for the same field.
 ## 2. Constants
 
 ```
-CST_MAGIC          = 0x1C545343          bytes: 'C' 'S' 'T' 0x1C
-CST_TRAILER_MAGIC  = 0x1C545343FFFFFFFF
-CST_TRAILER_SIZE   = 64
+CST_MAGIC              = 0x1C545343       bytes: 'C' 'S' 'T' 0x1C
 
 BODY_TAG_END           = 0
 BODY_TAG_ENTRY         = 1
@@ -70,6 +82,11 @@ BODY_TAG_THREAD_SWITCH = 2
 BODY_TAG_IFRAME        = 3
 BODY_TAG_REGFILE       = 4
 ```
+
+The body member begins with `CST_MAGIC` and ends with `CST_MAGIC`.  A
+file is treated as truncated if the trailing magic is missing.  The
+header member begins with `CST_MAGIC` (no trailing magic; the member
+naturally ends after its templates section).
 
 On ISAs with an integer flags register (x86, AArch64), every insn
 whose template writes that register also emits a canonical
@@ -127,8 +144,9 @@ bits 2..7  reserved, written as 0
 
 ## 3. Header
 
-The header is byte-aligned by construction and is written once at the
-start of the file.
+The header member is byte-aligned by construction.  It is written last
+(so the writer can include the final template count) but is logically
+the first thing a decoder needs.
 
 ```
 +--------------------------------------------------+
@@ -146,7 +164,9 @@ start of the file.
 +--------------------------------------------------+
 | encoding_maps_section                            |
 |   section := len:ULEB payload[len]               |
-+--------------------------------------------------+  body_off
++--------------------------------------------------+
+| templates_section                                |
++--------------------------------------------------+  member EOF
 ```
 
 `start_insn` is the architectural instruction count at which this
@@ -163,8 +183,10 @@ not known at header-write time).  These three values describe the
 *targeted* window; the actually-emitted record count may overshoot by
 a single TB due to translation-block granularity.
 
-`body_off` is stored in the trailer. A decoder can therefore verify that
-it consumed the full header before starting the body stream.
+Because the header lives in its own archive member, a decoder knows
+the header end exactly: it is the member's payload size.  The
+templates section runs from the byte immediately after the encoding
+maps section through end-of-member.
 
 ### 3.1 Encoding Maps
 
@@ -632,8 +654,8 @@ changes without forcing a new template record.
 
 ## 6. Templates Section
 
-The templates section is mandatory and starts at `templates_off` from
-the trailer.
+The templates section is mandatory and is appended at the tail of the
+header member, immediately after the encoding maps section.
 
 ```
 templates section:
@@ -679,45 +701,23 @@ template payload:
 `previous_pc = start_pc` for the first instruction. The branch, if any,
 is the last instruction after the writer's delay-slot normalization.
 
-## 7. Trailer
-
-The trailer is exactly 64 bytes and is always at EOF.
-
-```
-+--------------------------------------------------+
-| templates_off      u64  offset of templates      |
-| templates_count    u64  number of templates      |
-| body_off           u64  offset of body stream    |
-| body_byte_count    u64  bytes in body stream     |
-| trailer_magic      u64  CST_TRAILER_MAGIC        |
-| zero padding            through byte 63          |
-+--------------------------------------------------+
-```
-
-The body byte range is:
-
-```
-[ body_off, body_off + body_byte_count )
-```
-
-The templates byte range starts at `templates_off` and ends at the
-trailer.
-
-## 8. Decoder Checklist
+## 7. Decoder Checklist
 
 A robust decoder should follow this order:
 
 ```
-1. Read the 64-byte trailer from EOF.
-2. Validate trailer_magic.
-3. Read the header from offset 0.
-4. Stop header parsing exactly at body_off.
-5. Load encoding maps from the header.
-6. Decode templates at templates_off.
-7. Replay the body stream from body_off for body_byte_count bytes.
-8. Resolve opcode, branch, register, and field names through the maps.
+1. Open the .cst as a POSIX ustar archive.
+2. Locate the body.cst[.<codec>] and header.cst[.<codec>] members.
+3. If the suffix names a codec, decompress the member's payload.
+4. Validate that the body member begins AND ends with CST_MAGIC; the
+   second magic is the truncation marker.  The body record stream is
+   the bytes between the two magics.
+5. Parse the header member: magic, isa, flags, ULEB window descriptors,
+   strings, encoding maps section, templates section.
+6. Resolve opcode, branch, register, and field names through the maps.
+7. Replay the body record stream against the parsed templates.
 ```
 
 The header maps are the compatibility mechanism for custom traces. If a
 future trace adds `REG_FOO = 246` or a new generic opcode, the numeric
-value and its string name travel together in the header.
+value and its string name travel together in the header member.

@@ -1806,7 +1806,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         cfg.output_path = g_strdup("champsim_tracer_out");
     }
     g_trace_segments.set_output_path(cfg.output_path);
-    g_trace_segments.set_output_pipe(cfg.output_pipe);
+    g_trace_segments.set_compress_cmd(cfg.compress_cmd);
 
     unknown_warn_path = g_strdup_printf("%s.unknown_warnings.log",
                                         cfg.output_path);

@@ -144,12 +144,12 @@ If trace size or runtime is a problem:
 * **``simpoint`` mode** carves a long workload into representative
   segments rather than tracing it whole.  Combine with
   ``warmup=N,simulation=N`` to control segment length precisely.
-* **``outpipe="zstd -T0 -19 ..."``** runs zstd in-process so the
-  on-disk trace is compressed.  The wire format's delta encoding
-  leaves long runs of small bytes that ``zstd -19`` compresses
-  aggressively — measured ratios on the mcf workload above range
-  from ~34× (full data) to ~190× (CP-only addresses).  The
-  in-memory trace size is unchanged but the on-disk footprint
+* **``compress="zstd -T0 -19 -q -c"``** runs zstd in-process so each
+  member inside the ``.cst`` archive lands compressed.  The wire
+  format's delta encoding leaves long runs of small bytes that ``zstd
+  -19`` compresses aggressively — measured ratios on the mcf workload
+  above range from ~34× (full data) to ~190× (CP-only addresses).
+  The in-memory trace size is unchanged but the on-disk footprint
   shrinks substantially.
 * **``wp_memdata=0``** keeps the WP cache-pollution stream
   (addresses) but drops the WP data values.  This is usually the

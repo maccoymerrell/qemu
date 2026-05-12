@@ -72,8 +72,6 @@ extern "C" {
  * defaults are zero.
  */
 #define CST_MAGIC          0x1C545343u
-#define CST_TRAILER_MAGIC  0x1C545343FFFFFFFFull
-#define CST_TRAILER_SIZE   64
 
 /*
  * REG_METAFLAGS bit layout is defined in champsim_tracer_generic_ids.h
@@ -484,9 +482,28 @@ typedef struct {
     uint64_t start_insn;
     uint64_t stop_insn;
     char *label;
-    FILE *bin_file;
-    bool bin_file_is_pipe;   /* true if opened with popen() */
-    WriterCtx *writer;       /* async writer thread feeding bin_file */
+    /* Body output destination.  Streams the body member's bytes
+     * (CST_MAGIC + BODY_TAG_* records + trailing CST_MAGIC) to a
+     * temp file on disk.  When compress=<cmd> is set, the FILE* is
+     * the write end of a popen() pipe and the underlying file is
+     * the user's compression utility's stdout redirected to disk. */
+    FILE *body_file;
+    bool body_is_pipe;
+    WriterCtx *body_writer;  /* async writer thread feeding body_file */
+    char *body_temp_path;    /* on-disk path of the (possibly compressed) body bytes */
+    char *body_member_name;  /* name inside the outer tar (body.cst[.<ext>]) */
+    /* Header output destination.  Opened lazily at body_stream_
+     * finish; gets the small header buffer in one synchronous
+     * write.  Same compress=<cmd> handling as body. */
+    FILE *header_file;
+    bool header_is_pipe;
+    char *header_temp_path;
+    char *header_member_name;
+    /* Final outer-tarball path the user originally asked for.
+     * After both body+header members are flushed and closed, the
+     * segment manager assembles a ustar of them at this path and
+     * unlinks the temp files. */
+    char *outfile_path;
     BodyStreamState *bin_stream;
     uint32_t body_seq_num;
     char start_datetime[64];
@@ -642,6 +659,16 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
                                  uint64_t total_target_insns,
                                  const std::vector<InitialRegSnap> *regfile);
 void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry);
-void body_stream_finish(BodyStreamState *st);
+/* Finish the body stream and hand the accumulated header buffer
+ * back to the caller via @header_bytes (transferred ownership; the
+ * caller must g_byte_array_unref it after writing).  The body
+ * destination (the WriterCtx passed to body_stream_new) is closed
+ * by the segment manager separately after this returns. */
+void body_stream_finish(BodyStreamState *st, GByteArray **header_bytes);
+/* Free a BodyStreamState created by body_stream_new.  Mandatory
+ * because BodyStreamState carries std::vector members that need
+ * their destructors run; the forward-declared opaque pointer in
+ * this header doesn't let callers `delete` directly. */
+void body_stream_free(BodyStreamState *st);
 
 #endif /* CHAMPSIM_TRACER_H */

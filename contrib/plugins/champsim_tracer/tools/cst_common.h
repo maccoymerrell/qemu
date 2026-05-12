@@ -31,12 +31,16 @@
 
 namespace cst {
 
-/* ===== Wire-format magic ===== */
+/* ===== Wire-format magic =====
+ *
+ * The .cst file is a POSIX-ustar archive carrying two regular-file
+ * members, body.cst[.<codec>] and header.cst[.<codec>] (each
+ * optionally compressed by the codec named in the suffix).  Each
+ * member starts with CST_MAGIC; the body member additionally
+ * carries a trailing CST_MAGIC after BODY_TAG_END so truncation is
+ * detectable at either end. */
 
-inline constexpr uint32_t CST_MAGIC         = 0x1C545343u;
-inline constexpr uint64_t CST_TRAILER_MAGIC = 0x1C545343FFFFFFFFull;
-
-inline constexpr size_t TRAILER_SIZE = 64;
+inline constexpr uint32_t CST_MAGIC = 0x1C545343u;
 
 /* ===== METAFLAGS bit layout =====
  *
@@ -296,12 +300,12 @@ struct Header {
     int  scalar_width_bits() const { return 512; }
 };
 
-struct Trailer {
-    uint64_t templates_off = 0;
-    uint64_t templates_count = 0;
-    uint64_t body_off = 0;
-    uint64_t body_byte_count = 0;
-    uint64_t magic = 0;
+/* Two byte ranges extracted from the outer ustar archive, each
+ * pointing at a fully decompressed (or never-compressed) member
+ * buffer in memory.  Lifetime tied to a CstFile owner. */
+struct MemberView {
+    const uint8_t *data = nullptr;
+    size_t         size = 0;
 };
 
 }  /* namespace cst */

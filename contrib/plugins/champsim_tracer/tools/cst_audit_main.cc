@@ -81,9 +81,7 @@ struct Bucket {
 struct Stats {
     uint64_t file_size         = 0;
     uint64_t header_bytes      = 0;
-    uint64_t templates_section = 0;
     uint64_t templates_count   = 0;
-    uint64_t trailer_bytes     = 0;
     uint64_t body_total        = 0;
     uint64_t body_terminator   = 0;
     uint64_t cp_entries        = 0;
@@ -146,58 +144,6 @@ static inline int64_t read_sleb(const uint8_t *m, size_t &p)
             return (int64_t)out;
         }
     }
-}
-
-/* Walk the templates section once, collecting (template_id ->
- * n_insns) so the body walker can count CP/WP architectural
- * instructions without re-parsing template records. */
-void walk_templates(const uint8_t *m, size_t templates_off,
-                    uint64_t expected,
-                    std::vector<uint32_t> *insns_by_tid,
-                    uint64_t *out_section_bytes)
-{
-    size_t p = templates_off;
-    size_t st = p;
-    uint64_t n = read_uleb(m, p);
-    if (n != expected) {
-        throw std::runtime_error("template count mismatch (header vs trailer)");
-    }
-    uint32_t max_tid = 0;
-    /* Two-pass would be tidier; one-pass with growing vector keeps it
-     * cache-friendly and avoids re-reading. */
-    for (uint64_t i = 0; i < n; i++) {
-        uint64_t tlen = read_uleb(m, p);
-        size_t tend = p + tlen;
-        uint64_t tid = read_uleb(m, p);
-        read_uleb(m, p);                    /* start_pc */
-        uint64_t n_insns = read_uleb(m, p);
-        read_uleb(m, p);                    /* fall_through_pc */
-        uint64_t sname_len = read_uleb(m, p);
-        p += sname_len;
-        for (uint64_t k = 0; k < n_insns; k++) {
-            read_uleb(m, p);                /* pc_delta */
-            p++;                            /* opcode */
-            p++;                            /* branch_type */
-            uint8_t iflags = m[p++];
-            uint8_t n_src = m[p++];
-            uint8_t n_dst = m[p++];
-            p += n_src + n_dst;
-            p++;                            /* n_loads */
-            p++;                            /* n_stores */
-            if (iflags & cst::INSN_FLAG_HAS_IMM) read_sleb(m, p);
-            uint8_t isize = m[p++];
-            p += isize;
-        }
-        if (p != tend) {
-            throw std::runtime_error("template length mismatch");
-        }
-        if (tid >= insns_by_tid->size()) {
-            insns_by_tid->resize(tid + 1, 0);
-        }
-        (*insns_by_tid)[tid] = (uint32_t)n_insns;
-        if (tid > max_tid) max_tid = (uint32_t)tid;
-    }
-    *out_section_bytes = p - st;
 }
 
 void skip_lp_section(const uint8_t *m, size_t &p)
@@ -454,12 +400,10 @@ void print_report(const Stats &s)
     uint64_t total = s.file_size;
     std::printf("FILE                                %14s  100.00%%\n",
                 human((double)total).c_str());
-    std::printf("\n=== TOP-LEVEL SECTIONS ===\n");
-    std::printf("%s\n", row("HEADER", s.header_bytes, total).c_str());
-    std::printf("%s\n", row("TEMPLATES", s.templates_section, total,
+    std::printf("\n=== MEMBER SIZES (uncompressed) ===\n");
+    std::printf("%s\n", row("HEADER member", s.header_bytes, total,
                              s.templates_count, "tmpl").c_str());
-    std::printf("%s\n", row("BODY", s.body_total, total).c_str());
-    std::printf("%s\n", row("TRAILER", s.trailer_bytes, total).c_str());
+    std::printf("%s\n", row("BODY member (records)", s.body_total, total).c_str());
 
     uint64_t body = s.body_total;
     std::printf("\n=== BODY BREAKDOWN (%s) ===\n", human((double)body).c_str());
@@ -541,55 +485,45 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    int fd = ::open(argv[1], O_RDONLY);
-    if (fd < 0) {
-        std::fprintf(stderr, "cst_audit: cannot open %s: %s\n",
-                     argv[1], std::strerror(errno));
-        return 1;
-    }
-    struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
-        std::fprintf(stderr, "cst_audit: empty or unstattable trace\n");
-        ::close(fd);
-        return 1;
-    }
-    void *map = mmap(nullptr, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    ::close(fd);
-    if (map == MAP_FAILED) {
-        std::fprintf(stderr, "cst_audit: mmap failed: %s\n",
-                     std::strerror(errno));
-        return 1;
-    }
-    const uint8_t *m = (const uint8_t *)map;
-    size_t size = (size_t)st.st_size;
-
     try {
-        cst::Trailer t = cst::parse_trailer(m, size);
-        cst::Header h = cst::parse_header(m, size, t.body_off, t.magic);
+        /* New tar-of-(body,header) container; cst_file_open
+         * resolves both members and decompresses on the fly. */
+        std::unique_ptr<cst::CstFile> cf = cst::cst_file_open(argv[1]);
 
-        Stats s;
-        s.file_size = size;
-        s.trailer_bytes = cst::TRAILER_SIZE;
-        s.body_total = t.body_byte_count;
-        s.header_bytes = t.body_off;
-        s.templates_count = t.templates_count;
-
-        std::vector<uint32_t> insns_by_tid;
-        if (t.templates_count > 0) {
-            walk_templates(m, t.templates_off, t.templates_count,
-                           &insns_by_tid, &s.templates_section);
+        struct stat st;
+        if (::stat(argv[1], &st) != 0) {
+            throw std::runtime_error("stat failed");
         }
 
-        walk_body(m, t.body_off, t.body_off + t.body_byte_count,
+        std::vector<cst::Template> templates;
+        std::unordered_map<uint32_t, size_t> by_id;
+        cst::Header h = cst::parse_header(cf->header(), &templates, &by_id);
+
+        cst::MemberView body_records = cst::body_records_view(cf->body());
+
+        Stats s;
+        s.file_size = (size_t)st.st_size;
+        s.body_total = body_records.size;
+        s.header_bytes = cf->header().size;
+        s.templates_count = templates.size();
+
+        std::vector<uint32_t> insns_by_tid;
+        insns_by_tid.reserve(templates.size());
+        for (const auto &t : templates) {
+            insns_by_tid.push_back((uint32_t)t.insns.size());
+        }
+
+        /* Inline-template stats: contribution from the parsed
+         * templates section is already known via the header member's
+         * trailing bytes; the body audit only walks the body record
+         * stream itself. */
+        walk_body(body_records.data, 0, body_records.size,
                   insns_by_tid, &s);
 
         print_report(s);
     } catch (const std::exception &e) {
         std::fprintf(stderr, "cst_audit: %s\n", e.what());
-        munmap(map, size);
         return 1;
     }
-
-    munmap(map, size);
     return 0;
 }

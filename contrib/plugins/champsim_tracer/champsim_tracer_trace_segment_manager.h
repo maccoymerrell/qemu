@@ -39,7 +39,12 @@ public:
 
     /* Configuration: set once at plugin install time. */
     void set_output_path(const char *path);
-    void set_output_pipe(const char *cmd);
+    /* Per-member compression command.  Each member (body + header)
+     * is independently piped through this command before landing on
+     * disk.  The command should read from stdin and write to stdout
+     * (e.g., "zstd -3", "gzip -3", "xz -3 -c").  Nullptr / empty
+     * disables compression and writes the members uncompressed. */
+    void set_compress_cmd(const char *cmd);
     void set_window(uint64_t start_insn, uint64_t stop_insn);
 
     uint64_t window_start() const { return start_insn_; }
@@ -90,7 +95,10 @@ private:
     std::atomic<int>     active_atomic_{0};
     std::atomic<int>     shutting_down_{0};
     char                *output_path_   = nullptr;
-    char                *output_pipe_   = nullptr;
+    /* User-configured compression command (verbatim from
+     * compress=...); nullptr or empty means raw uncompressed
+     * members.  See set_compress_cmd. */
+    char                *compress_cmd_  = nullptr;
     uint64_t             start_insn_    = 0;
     uint64_t             stop_insn_     = UINT64_MAX;
 };

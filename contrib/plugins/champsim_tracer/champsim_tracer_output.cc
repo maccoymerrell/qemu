@@ -427,7 +427,19 @@ typedef struct {
 } EntryViewScratch;
 
 struct BodyStreamState {
+    /* Body stream — writes through @bw to the segment's body output
+     * (file or compression pipe).  Body bytes start with CST_MAGIC,
+     * stream BODY_TAG_* records as the workload runs, and end with
+     * a BODY_TAG_END + entry count + trailing CST_MAGIC marker so
+     * truncation is detectable from either end.                    */
     BitWriter bw;
+    /* Header BitWriter — backed by an in-memory GByteArray.  All
+     * header content (magic, isa, flags, window descriptors,
+     * strings, encoding maps, and the full templates section
+     * appended at body_stream_finish) goes here.  The buffer is
+     * pulled out via bw_finish_buf at finish time and handed to the
+     * segment manager for write-out to the separate header member.  */
+    BitWriter header_bw;
     int64_t prev_entry_template;
     int64_t current_thread;
     /* Per-vCPU field-state tables: each thread's deltas are computed
@@ -2036,10 +2048,23 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
      */
     BodyStreamState *st = new BodyStreamState();
 
+    /* Body destination — bw streams directly to the body member's
+     * compression pipe / file via @w.  Body contents start with
+     * CST_MAGIC (so a stripped body member is still recognisable)
+     * and end with a trailing CST_MAGIC at body_stream_finish so
+     * truncation is detectable from either end. */
     bw_init_writer(&st->bw, w);
-
     bw_write_u32_le(&st->bw, CST_MAGIC);
-    bw_write_u8(&st->bw, (uint8_t)trace_isa);
+
+    /* Header destination — buffered in memory until body_stream_
+     * finish flushes it to the segment manager's header writer.
+     * Layout: magic, isa, flags, window descriptors, strings,
+     * encoding maps, then (appended at finish) the templates
+     * section.  No trailer.  All offsets are implicit since the
+     * header is its own self-contained file in the tar. */
+    bw_init_buf(&st->header_bw);
+    bw_write_u32_le(&st->header_bw, CST_MAGIC);
+    bw_write_u8(&st->header_bw, (uint8_t)trace_isa);
 
     uint8_t flags = 0;
     if (enable_mem_data) {
@@ -2048,7 +2073,7 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
     if (enable_reg_data) {
         flags |= CST_FLAG_REG_DATA;
     }
-    bw_write_u8(&st->bw, flags);
+    bw_write_u8(&st->header_bw, flags);
     st->header_flags = flags;
 
     /* Segment instruction-window descriptors:
@@ -2067,43 +2092,43 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
      *                         This is the targeted value, not the
      *                         observed one — overshoot due to TB
      *                         granularity is not reflected here. */
-    bw_write_uleb128(&st->bw, start_insn);
-    bw_write_uleb128(&st->bw, warmup_insns);
-    bw_write_uleb128(&st->bw, total_target_insns);
+    bw_write_uleb128(&st->header_bw, start_insn);
+    bw_write_uleb128(&st->header_bw, warmup_insns);
+    bw_write_uleb128(&st->header_bw, total_target_insns);
 
     {
         const char *cmd = qemu_command_line ? qemu_command_line : "";
         size_t len = strlen(cmd);
-        bw_write_uleb128(&st->bw, len);
-        bw_write_bytes(&st->bw, (const uint8_t *)cmd, len);
+        bw_write_uleb128(&st->header_bw, len);
+        bw_write_bytes(&st->header_bw, (const uint8_t *)cmd, len);
     }
     {
         const char *dt_str = (seg_datetime && *seg_datetime) ? seg_datetime : "";
         size_t len = strlen(dt_str);
-        bw_write_uleb128(&st->bw, len);
-        bw_write_bytes(&st->bw, (const uint8_t *)dt_str, len);
+        bw_write_uleb128(&st->header_bw, len);
+        bw_write_bytes(&st->header_bw, (const uint8_t *)dt_str, len);
     }
     {
         const char *comment = trace_comment ? trace_comment : "";
         size_t len = strlen(comment);
-        bw_write_uleb128(&st->bw, len);
-        bw_write_bytes(&st->bw, (const uint8_t *)comment, len);
+        bw_write_uleb128(&st->header_bw, len);
+        bw_write_bytes(&st->header_bw, (const uint8_t *)comment, len);
     }
     {
         const char *tname = target_name ? target_name : "";
         size_t len = strlen(tname);
-        bw_write_uleb128(&st->bw, len);
-        bw_write_bytes(&st->bw, (const uint8_t *)tname, len);
+        bw_write_uleb128(&st->header_bw, len);
+        bw_write_bytes(&st->header_bw, (const uint8_t *)tname, len);
     }
 
-    write_header_encoding_maps(&st->bw);
+    write_header_encoding_maps(&st->header_bw);
+    bw_byte_align(&st->header_bw);
 
+    /* Flush the body magic prefix.  Body content (BODY_TAG_*
+     * records) starts at offset 4 in the body member; consumers
+     * verify the leading u32 against CST_MAGIC before parsing. */
     bw_byte_align(&st->bw);
     bw_flush(&st->bw);
-    /* Use BitWriter's running byte count rather than ftello() so the
-     * writer works on non-seekable streams (e.g. popen() pipes used
-     * for streaming compression). */
-    st->body_off = bw_tell_bytes(&st->bw);
 
     st->current_thread = 0;
 
@@ -2439,55 +2464,62 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
 }
 
 /*
- * Finish the body stream: end-of-body sentinel, mandatory template
- * section, and a fixed 64-byte trailer.
+ * Finish the body stream and produce the header buffer.
  *
- * Trailer layout (all u64 little-endian):
- *   templates_off    : file offset of templates section
- *   templates_count  : number of templates
- *   body_off         : file offset where body stream starts
- *   body_byte_count  : bytes from body_off up to end of last body record
- *   trailer_magic    : CST_TRAILER_MAGIC
- *   zero padding up to 64 bytes
+ * Body member layout (already in @st->bw, an open stream to the
+ * body output destination):
+ *
+ *     CST_MAGIC  (already written at body_stream_new)
+ *     BODY_TAG_* records ...
+ *     BODY_TAG_END  num_entries
+ *     CST_MAGIC   (trailing sentinel for truncation detection)
+ *
+ * Header buffer layout (in @st->header_bw, returned via the out-
+ * param @header_bytes):
+ *
+ *     CST_MAGIC  isa  flags
+ *     start_insn  warmup_insns  total_target_insns
+ *     command-string  datetime-string  comment-string  target_name-string
+ *     encoding-maps-section
+ *     templates-section
+ *
+ * No trailer.  Each member is its own self-contained file in the
+ * outer ustar archive that the segment manager assembles after
+ * this call returns.  The two-magic bracket on the body member
+ * makes truncation visible without reading the whole stream; the
+ * header is small enough to round-trip in its entirety.
+ *
+ * Caller-owned @header_bytes receives the header buffer's bytes;
+ * the BodyStreamState releases its reference to the underlying
+ * GByteArray, so the caller is responsible for freeing it via
+ * g_byte_array_unref.
  */
-void body_stream_finish(BodyStreamState *st)
+void body_stream_finish(BodyStreamState *st, GByteArray **header_bytes)
 {
     uint64_t stats_start = bw_tell_bytes(&st->bw);
 
+    /* --- Finalise the body member. --- */
     bw_write_u8(&st->bw, BODY_TAG_END);
     bw_write_uleb128(&st->bw, st->num_entries);
     bw_byte_align(&st->bw);
+    /* Trailing CST_MAGIC: a consumer who reaches end-of-stream
+     * without seeing this knows the body member was truncated.
+     * Cheaper than a checksum and sufficient for our use case
+     * (truncation is by far the most common corruption mode for
+     * pipe-compressed traces — uncaught SIGPIPE, OOM, etc.). */
+    bw_write_u32_le(&st->bw, CST_MAGIC);
     bw_flush(&st->bw);
 
-    /* Pipe-friendly: trust the BitWriter's running counter rather than
-     * calling ftello() (which fails on non-seekable streams). */
-    uint64_t body_end = bw_tell_bytes(&st->bw);
-    uint64_t body_byte_count = body_end - st->body_off;
-
-    uint64_t templates_off = body_end;
-    uint64_t templates_count = 0;
-
+    /* --- Append the templates section to the header buffer. --- */
     g_mutex_lock(&data_lock);
-    templates_count = g_bb_template_cache.bb_count();
-    write_bin_templates(&st->bw);
+    write_bin_templates(&st->header_bw);
     g_mutex_unlock(&data_lock);
-    bw_byte_align(&st->bw);
-    bw_flush(&st->bw);
+    bw_byte_align(&st->header_bw);
 
-    uint64_t tr_start = bw_tell_bytes(&st->bw);
-    bw_write_u64_le(&st->bw, templates_off);
-    bw_write_u64_le(&st->bw, templates_count);
-    bw_write_u64_le(&st->bw, st->body_off);
-    bw_write_u64_le(&st->bw, body_byte_count);
-    bw_write_u64_le(&st->bw, CST_TRAILER_MAGIC);
-    uint64_t trailer_written = bw_tell_bytes(&st->bw) - tr_start;
-    g_assert(trailer_written <= CST_TRAILER_SIZE);
-    {
-        uint8_t zero[CST_TRAILER_SIZE] = {0};
-        bw_write_bytes(&st->bw, zero,
-                       (size_t)(CST_TRAILER_SIZE - trailer_written));
-    }
-    bw_flush(&st->bw);
+    /* Hand the accumulated header buffer to the caller.  bw_finish_
+     * buf transfers ownership; we null out our pointer so subsequent
+     * operations on @st can't accidentally touch the buffer. */
+    *header_bytes = bw_finish_buf(&st->header_bw);
 
     uint64_t end_bytes = bw_tell_bytes(&st->bw);
     g_stats.bin_header_bits += (end_bytes - stats_start) * 8;
@@ -2511,4 +2543,17 @@ void body_stream_finish(BodyStreamState *st)
     raw_buf_free(&st->rec_scratch);
     g_free(st->stage_buf);
     st->stage_buf = nullptr;
+}
+
+void body_stream_free(BodyStreamState *st)
+{
+    /* BodyStreamState is allocated with `new`; its std::vector
+     * members need their destructors called.  body_stream_finish
+     * already releases owned resources (FSTs, scratch arrays, the
+     * header buffer); calling free here just tears down the C++
+     * object itself. */
+    if (!st) {
+        return;
+    }
+    delete st;
 }

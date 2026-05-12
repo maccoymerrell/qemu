@@ -39,6 +39,7 @@ if get_option('plugins')
       'champsim_tracer/champsim_tracer_stats.cc',
       'champsim_tracer/champsim_tracer_scoreboard.cc',
       'champsim_tracer/champsim_tracer_trace_segment_manager.cc',
+      'champsim_tracer/champsim_tracer_tar.cc',
       'champsim_tracer/champsim_tracer_reg_snap_collector.cc',
       'champsim_tracer/champsim_tracer_bb_chain_assembler.cc',
       'champsim_tracer/champsim_tracer_mem_access_recorder.cc',

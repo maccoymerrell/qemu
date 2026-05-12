@@ -127,14 +127,9 @@ def _parse_args() -> argparse.Namespace:
                    help="Enable per-insn register-value capture (regdata=1)")
     t.add_argument("--compress", choices=("none", "xz", "zstd", "gzip"),
                    default="none",
-                   help="Stream the .cst through a compressor via the "
-                        "plugin's outpipe= option. Output file is "
-                        "<out_base>.cst.<ext>.")
-    t.add_argument("--outpipe", type=str, default=None,
-                   help="Override --compress with a literal shell command "
-                        "passed to outpipe=. Plugin args use ',' as a "
-                        "separator so commas inside the command are not "
-                        "supported.")
+                   help="Compress each member inside the .cst tarball "
+                        "(passes compress=<cmd> to the plugin). Output "
+                        "file is always <out_base>.cst.")
 
     # analyze
     a = sub.add_parser("analyze",
@@ -178,8 +173,6 @@ def _parse_args() -> argparse.Namespace:
                     help="See `generate --hot-iters`.")
     al.add_argument("--compress", choices=("none", "xz", "zstd", "gzip"),
                     default="none", help="See `trace --compress`.")
-    al.add_argument("--outpipe", type=str, default=None,
-                    help="See `trace --outpipe`.")
 
     sp = sub.add_parser(
         "simpoint_test",
@@ -311,19 +304,16 @@ def cmd_trace(args, isa: str | None = None) -> int:
 
     out_base = _trace_base(args.out_dir, prog, isa)
 
-    # Resolve output destination: explicit --outpipe wins, then --compress,
-    # else default outfile= path.
+    # Per-member compression inside the .cst tarball.  `compress=<cmd>`
+    # tells the tracer to spawn that shell command for each member
+    # (header.cst.<ext>, body.cst.<ext>); the outer container is always
+    # a tar, so the on-disk path is always `<out_base>.cst`.
     compress = getattr(args, "compress", "none")
-    outpipe = getattr(args, "outpipe", None)
-    compress_ext = {"xz": "xz", "zstd": "zst", "gzip": "gz"}
     compress_cmd = {
         "xz":   "xz -T0 -2 -c",
         "zstd": "zstd -T0 -3 -q -c",
         "gzip": "gzip -c",
     }
-    if outpipe is None and compress != "none":
-        ext = compress_ext[compress]
-        outpipe = f"{compress_cmd[compress]} > {out_base}.cst.{ext}"
 
     # Plugin args (current ChampSim Tracer flag names, v1.11):
     #   - wpdepth=N            (was: depth=N)
@@ -340,21 +330,18 @@ def cmd_trace(args, isa: str | None = None) -> int:
                       f"simulation={args.stop}")
     else:
         window_opt = f"trace_window=icount:start=0;stop={args.stop}"
-    if outpipe is not None:
-        if "," in outpipe:
+    plugin_opts = (
+        f"outfile={out_base},"
+        f"wpdepth={args.depth},{window_opt},memdata=1"
+    )
+    if compress != "none":
+        cc = compress_cmd[compress]
+        if "," in cc:
             raise SystemExit(
-                "trace[--outpipe]: plugin arg parser uses ',' as a "
-                "separator. Wrap your command in a script and reference "
-                "it instead.")
-        plugin_opts = (
-            f"outpipe={outpipe},"
-            f"wpdepth={args.depth},{window_opt},memdata=1"
-        )
-    else:
-        plugin_opts = (
-            f"outfile={out_base},"
-            f"wpdepth={args.depth},{window_opt},memdata=1"
-        )
+                "trace[--compress]: plugin arg parser uses ',' as a "
+                "separator and the resolved compress= command contains "
+                "a comma; wrap it in a script instead.")
+        plugin_opts += f",compress={cc}"
     if getattr(args, "regdata", False):
         plugin_opts += ",regdata=1"
     if getattr(args, "iframe_rate", None) is not None:
@@ -364,12 +351,6 @@ def cmd_trace(args, isa: str | None = None) -> int:
     ]
     print(f"trace[{isa}]: {' '.join(cmd)}")
     rc = subprocess.call(cmd)
-    if outpipe is not None:
-        if rc != 0:
-            print(f"trace[{isa}]: FAIL rc={rc}")
-            return rc
-        print(f"trace[{isa}]: streamed via outpipe ({outpipe})")
-        return 0
     cst = Path(f"{out_base}.cst")
     if rc != 0 or not cst.is_file():
         print(f"trace[{isa}]: FAIL rc={rc}")
@@ -418,8 +399,6 @@ def cmd_validate(args, isa: str | None = None) -> int:
 
 def cmd_all(args) -> int:
     rc_total = 0
-    skip_validate = (getattr(args, "compress", "none") != "none"
-                     or getattr(args, "outpipe", None) is not None)
     for isa in args.isa:
         print(f"\n==== {isa} ====")
         cmd_generate(args, isa)
@@ -428,9 +407,6 @@ def cmd_all(args) -> int:
             continue
         if cmd_trace(args, isa) != 0:
             rc_total = 1
-            continue
-        if skip_validate:
-            print(f"validate[{isa}]: SKIP  (output is piped/compressed)")
             continue
         cmd_analyze(args, isa)
         if cmd_validate(args, isa) != 0:

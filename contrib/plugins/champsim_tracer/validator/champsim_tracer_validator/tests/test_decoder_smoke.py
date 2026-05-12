@@ -1,6 +1,18 @@
-"""Locate where two .cst files actually differ."""
-import sys, struct
+"""Locate where two .cst files actually differ.
+
+The .cst container is a POSIX ustar archive holding two members,
+``body.cst[.<codec>]`` and ``header.cst[.<codec>]``.  This script
+extracts both members from each file, compares them member-by-member,
+and decodes the traces structurally for an end-to-end equivalence
+check.
+"""
+import io
+import shutil
+import subprocess
+import sys
+import tarfile
 from pathlib import Path
+
 import _cst_decode_runner as dec
 
 
@@ -15,77 +27,58 @@ def first_diffs(a: bytes, b: bytes, n: int = 5) -> list[int]:
     return out
 
 
-def header_layout(buf: bytes) -> dict:
-    """Replay the header parser and return the byte offset of every field."""
-    o = 0
-    layout = {"magic@0": (0, 4)}
-    o = 4
-    layout["isa@%d" % o] = (o, 1); o += 1
-    layout["flags@%d" % o] = (o, 1); o += 1
-    def uleb(off):
-        v = 0; s = 0; i = off
-        while True:
-            b = buf[i]; v |= (b & 0x7F) << s; i += 1
-            if (b & 0x80) == 0: return v, i
-            s += 7
-    cmd_len, o2 = uleb(o); layout["cmd_len@%d" % o] = (o, o2 - o); o = o2
-    layout["cmd@%d" % o] = (o, cmd_len); o += cmd_len
-    dt_len, o2 = uleb(o); layout["dt_len@%d" % o] = (o, o2 - o); o = o2
-    layout["dt@%d" % o] = (o, dt_len); o += dt_len
-    cm_len, o2 = uleb(o); layout["cm_len@%d" % o] = (o, o2 - o); o = o2
-    layout["cm@%d" % o] = (o, cm_len); o += cm_len
-    tg_len, o2 = uleb(o); layout["tg_len@%d" % o] = (o, o2 - o); o = o2
-    layout["tg@%d" % o] = (o, tg_len); o += tg_len
-    tid, o2 = uleb(o); layout["tid@%d" % o] = (o, o2 - o); o = o2
-    layout["__body_off"] = (o, 0)
-    return layout
+CODEC_DECODE = {
+    "zst": ["zstd", "-d", "-c"],
+    "xz":  ["xz",   "-d", "-c"],
+    "gz":  ["gzip", "-d", "-c"],
+    "bz2": ["bzip2", "-d", "-c"],
+    "lz4": ["lz4",  "-d", "-c"],
+}
 
 
-def field_at(layout: dict, off: int) -> str:
-    for k, (start, ln) in layout.items():
-        if k == "__body_off":
-            continue
-        if start <= off < start + max(ln, 1):
-            return k
-    return "(after-header)"
+def _decompress(member_name: str, payload: bytes) -> bytes:
+    suffix = member_name.rsplit(".", 1)[-1]
+    if suffix in CODEC_DECODE:
+        cp = subprocess.run(CODEC_DECODE[suffix], input=payload,
+                            check=True, capture_output=True)
+        return cp.stdout
+    return payload
+
+
+def extract_members(path: Path) -> tuple[bytes, bytes]:
+    """Return (body_bytes, header_bytes) for the .cst at @path."""
+    body = header = None
+    with tarfile.open(path, mode="r") as t:
+        for m in t.getmembers():
+            if m.name.startswith("body.cst"):
+                body = _decompress(m.name, t.extractfile(m).read())
+            elif m.name.startswith("header.cst"):
+                header = _decompress(m.name, t.extractfile(m).read())
+    if body is None or header is None:
+        raise SystemExit(f"{path}: missing body.cst or header.cst member")
+    return body, header
 
 
 def main(p1: str, p2: str) -> None:
-    a = Path(p1).read_bytes()
-    b = Path(p2).read_bytes()
-    print(f"sizes: {len(a)} vs {len(b)}")
+    body_a, hdr_a = extract_members(Path(p1))
+    body_b, hdr_b = extract_members(Path(p2))
+    print(f"file_a header={len(hdr_a)} body={len(body_a)}")
+    print(f"file_b header={len(hdr_b)} body={len(body_b)}")
 
-    diffs = first_diffs(a, b, 8)
-    print(f"first {len(diffs)} differing offsets: {diffs}")
-    if not diffs:
-        print("BYTE-EQUIVALENT")
-        return
-
-    la = header_layout(a)
-    lb = header_layout(b)
-    body_off_a = la["__body_off"][0]
-    body_off_b = lb["__body_off"][0]
-    print(f"header end (body_off): file_a={body_off_a}, file_b={body_off_b}")
-
-    for off in diffs:
-        if off < body_off_a and off < body_off_b:
-            print(f"  byte {off}: in header field {field_at(la, off)} "
-                  f"(a=0x{a[off]:02x} {chr(a[off]) if 32<=a[off]<127 else '?'} | "
-                  f"b=0x{b[off]:02x} {chr(b[off]) if 32<=b[off]<127 else '?'})")
-        else:
-            print(f"  byte {off}: in body/templates region "
-                  f"(a=0x{a[off]:02x} | b=0x{b[off]:02x})")
-
-    # Compare body slice and templates slice using each file's own trailer.
-    def trailer(buf):
-        return struct.unpack("<5Q", buf[-64:][:40])
-    ta_tr = trailer(a); tb_tr = trailer(b)
-    body_a = a[ta_tr[2]:ta_tr[2] + ta_tr[3]]
-    body_b = b[tb_tr[2]:tb_tr[2] + tb_tr[3]]
-    print(f"body slice: equal={body_a == body_b}  len_a={len(body_a)} len_b={len(body_b)}")
-    tmpl_a = a[ta_tr[0]:-64]
-    tmpl_b = b[tb_tr[0]:-64]
-    print(f"tmpl slice: equal={tmpl_a == tmpl_b}  len_a={len(tmpl_a)} len_b={len(tmpl_b)}")
+    hdr_diffs = first_diffs(hdr_a, hdr_b, 8)
+    body_diffs = first_diffs(body_a, body_b, 8)
+    if not hdr_diffs and not body_diffs and len(hdr_a) == len(hdr_b) \
+            and len(body_a) == len(body_b):
+        print("BYTE-EQUIVALENT (header+body)")
+    else:
+        if hdr_diffs:
+            print(f"  header diffs at offsets: {hdr_diffs}")
+        if body_diffs:
+            print(f"  body diffs at offsets: {body_diffs}")
+        if len(hdr_a) != len(hdr_b):
+            print(f"  header size differs: {len(hdr_a)} vs {len(hdr_b)}")
+        if len(body_a) != len(body_b):
+            print(f"  body size differs: {len(body_a)} vs {len(body_b)}")
 
     # Decode and compare structurally
     ma, _, ea = dec.decode_champsim_tracer(Path(p1))

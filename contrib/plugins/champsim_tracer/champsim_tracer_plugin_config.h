@@ -54,7 +54,7 @@ struct PluginConfig {
     uint64_t  warmup_insns      = 0;
     uint64_t  simulation_insns  = 0;
     char     *output_path       = nullptr;   /* g_strdup, owned */
-    char     *output_pipe       = nullptr;   /* g_strdup, owned */
+    char     *compress_cmd      = nullptr;   /* g_strdup, owned */
     char     *program_name      = nullptr;   /* g_strdup, owned */
     char     *simpoints_file    = nullptr;   /* g_strdup, owned */
     char     *comment           = nullptr;   /* g_strdup, owned */

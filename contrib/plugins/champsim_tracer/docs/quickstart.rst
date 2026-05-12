@@ -82,15 +82,17 @@ Output destination
 
 .. index::
    single: outfile
-   single: outpipe
+   single: compress
 
 ``outfile=<basename>``
    Basename for the trace files.  Default ``champsim_tracer_out``.
    The plugin writes:
 
-   * ``<basename>.cst`` — the binary trace.  A trailing ``.cst`` in
-     the user-supplied basename is stripped before the suffix is
-     appended, so ``outfile=run`` and ``outfile=run.cst`` both produce
+   * ``<basename>.cst`` — the binary trace, a POSIX ustar archive
+     carrying a ``body.cst[.<codec>]`` member and a
+     ``header.cst[.<codec>]`` member.  A trailing ``.cst`` in the
+     user-supplied basename is stripped before the suffix is appended,
+     so ``outfile=run`` and ``outfile=run.cst`` both produce
      ``run.cst``.  In simpoint mode the per-segment files are named
      ``<basename>_sp<index>.cst`` (the trailing ``.cst`` on the user
      basename is also stripped for these).
@@ -99,14 +101,15 @@ Output destination
      recognize.  Empty when the classification table covers your
      workload.
 
-   Cannot be combined with ``outpipe`` — the segment manager checks
-   whichever is set and uses that one.
-
-``outpipe=<shell command>``
-   Shell command run via ``popen()`` to which the binary trace is
-   piped.  Default unset.  Avoids landing the trace on disk
-   uncompressed; the typical use is ``outpipe="zstd -T0 -19 -o
-   run.cst.zst"``.  Mutually exclusive with ``outfile``.
+``compress=<shell command>``
+   Per-member compressor command.  Default unset (each member is
+   written uncompressed).  The tracer spawns the command via
+   ``popen()`` once for the body member and once for the header
+   member; the resulting payload is bundled into the outer ``.cst``
+   archive under e.g. ``body.cst.zst`` / ``header.cst.zst``.  Typical
+   values: ``compress="zstd -T0 -3 -q -c"``, ``compress="xz -T0 -2
+   -c"``, ``compress="gzip -c"``.  The member suffix is inferred from
+   the first word of the command.
 
 Segmentation
 ~~~~~~~~~~~~
@@ -381,8 +384,8 @@ into the alternate path.
 
 Most expensive configuration: every memop value and every
 destination-register write is recorded.  Trace size grows with
-the workload's data footprint; pipe through ``zstd`` (see the
-``outpipe=`` flag above) when running long workloads.
+the workload's data footprint; enable per-member compression
+(see the ``compress=`` flag above) when running long workloads.
 
 **Long-workload simpoint capture**
 

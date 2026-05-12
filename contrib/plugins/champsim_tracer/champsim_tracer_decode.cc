@@ -309,6 +309,24 @@ void decode_detail_to_generic(uint64_t pc,
     }
 
     /*
+     * x86 REP/REPNZ prefix promotes the instruction to a self-looping
+     * branch.  Each iteration of the architectural REP loop is a
+     * tracer-defined true-BB: the chain assembler ends the BB here
+     * and starts the next one at the same PC, so the trace
+     * structurally identifies the loop instead of treating it as one
+     * BB with a variable memop count.
+     *
+     * Capstone reports the prefix via info->has_rep on x86 (returns
+     * false on every other ISA, so this is a no-op for those).  The
+     * branch is conditional (the loop exits when ECX == 0 or when
+     * the REPZ/REPNZ comparison breaks).
+     */
+    if (info->has_rep) {
+        out->branch_type        = BRANCH_COND_DIRECT;
+        out->branch_conditional = true;
+    }
+
+    /*
      * Operand processing: use Capstone access flags where available
      * (x86/AArch64); otherwise fall back to an opcode-indexed lookup
      * where the first register operand is the destination for most

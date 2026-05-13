@@ -1,7 +1,7 @@
 /*
  * cst_decode — textual decoder for .cst traces.
  *
- * Two output formats:
+ * Three output modes:
  *
  *   --format=disasm  (default): objdump-style, one architectural
  *     instruction per line, with memops / register writes / branch
@@ -11,6 +11,21 @@
  *   --format=legacy: byte-identical to champsim_tracer_decode.py's
  *     render_text_streaming output.  Retained for wptrace_genval
  *     scripts that diff trace dumps.
+ *
+ *   --templates-only: dump just the template dictionary (no body).
+ *
+ * File layout (top -> bottom):
+ *   §1  Trivial value formatters       (isa_name, exception_name, ...)
+ *   §2  Hex / bytes appenders          (append_hex, append_byte_hex, ...)
+ *   §3  Map-driven fmt helpers         (fmt_reg, fmt_snap_value, ...)
+ *   §4  Name -> mnemonic / regref      (mnem_from_genop, regref_from_name)
+ *   §5  Branch-type helpers            (branch_is_none, branch_mnem_from_name)
+ *   §6  Per-trace lookup tables        (DisasmTables, table_lookup)
+ *   §7  Capstone wrapper               (ObjdumpRenderer)
+ *   §8  Disasm renderer                (per-column emitters, render_disasm)
+ *   §9  Templates-only renderer
+ *   §10 Legacy renderer                (Python-compat output)
+ *   §11 CLI + dispatch                 (Options, main)
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -35,6 +50,10 @@
 #include "cst_format.h"
 
 namespace {
+
+/* ====================================================================
+ * §1  Trivial value formatters
+ * ==================================================================== */
 
 const char *isa_name(uint8_t isa)
 {
@@ -69,18 +88,76 @@ const char *wp_stop_reason_name(uint64_t v)
     }
 }
 
-/* Reg name lookup honoring the trace's encoding map (which now also
- * carries initial-regfile bytes per entry). */
-std::string fmt_reg(const cst::Header &h, uint64_t r)
+/* ISA name with target_name fallback.  Header carries target_name when
+ * the writer pinned an explicit string (e.g. "x86_64", "aarch64"); we
+ * prefer that and only synthesize from the numeric isa byte when it's
+ * blank. */
+const char *isa_display(const cst::Header &h)
 {
-    auto it = h.maps.reg.find(r);
-    if (it != h.maps.reg.end()) return it->second;
-    /* No map entry — synthesize a best-effort name; mirrors the
-     * Python decoder's reg_name() fallback. */
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "REG_%llu", (unsigned long long)r);
-    return buf;
+    return !h.target_name.empty() ? h.target_name.c_str() : isa_name(h.isa);
 }
+
+/* ====================================================================
+ * §2  Hex / bytes appenders  (perf-critical; no allocation)
+ * ==================================================================== */
+
+inline const char *kHexDigits = "0123456789abcdef";
+
+/* Lowercase hex, no leading zeros.  Builds digits in a stack buffer
+ * end-first and appends in one shot — single push_back per char was
+ * hot enough on a 200s decode (11.7% of total) to justify the small
+ * overhead of computing a length first. */
+void append_hex(std::string *out, uint64_t v)
+{
+    if (v == 0) { out->push_back('0'); return; }
+    char buf[16];
+    int n = 0;
+    while (v) { buf[15 - n] = kHexDigits[v & 0xF]; v >>= 4; n++; }
+    out->append(buf + (16 - n), (size_t)n);
+}
+
+/* Width-padded hex (zero-padded to @width chars). */
+void append_hex_padded(std::string *out, uint64_t v, int width)
+{
+    char buf[16];
+    for (int i = 0; i < width; i++) {
+        buf[width - 1 - i] = kHexDigits[v & 0xF];
+        v >>= 4;
+    }
+    out->append(buf, (size_t)width);
+}
+
+void append_byte_hex(std::string *out, uint8_t b)
+{
+    out->push_back(kHexDigits[(b >> 4) & 0xF]);
+    out->push_back(kHexDigits[b & 0xF]);
+}
+
+void append_pad_to(std::string *out, size_t target)
+{
+    while (out->size() < target) out->push_back(' ');
+}
+
+/* Append a Wide as a single hex integer (no leading zeros). */
+void append_wide_hex(std::string *out, const cst::Wide &w)
+{
+    int top = -1;
+    for (int i = (int)cst::Wide::LIMBS - 1; i >= 0; i--) {
+        if (w.limb[i]) { top = i; break; }
+    }
+    if (top < 0) { out->append("0x0"); return; }
+    out->append("0x");
+    append_hex(out, w.limb[top]);
+    /* Lower limbs are zero-padded to 16 hex chars. */
+    for (int i = top - 1; i >= 0; i--) {
+        append_hex_padded(out, w.limb[i], 16);
+    }
+}
+
+/* ====================================================================
+ * §3  Map-driven fmt helpers  (return std::string — used by legacy and
+ *     by occasional cold paths in disasm)
+ * ==================================================================== */
 
 std::string enum_or(const std::unordered_map<uint64_t, std::string> &m,
                     uint64_t v, const char *prefix)
@@ -90,6 +167,15 @@ std::string enum_or(const std::unordered_map<uint64_t, std::string> &m,
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%s_%llu", prefix,
                   (unsigned long long)v);
+    return buf;
+}
+
+std::string fmt_reg(const cst::Header &h, uint64_t r)
+{
+    auto it = h.maps.reg.find(r);
+    if (it != h.maps.reg.end()) return it->second;
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "REG_%llu", (unsigned long long)r);
     return buf;
 }
 
@@ -116,9 +202,7 @@ std::string fmt_bytes_hex(const std::vector<uint8_t> &b)
  *   if hi != 0:  0x{hi:x}{lo:016x}
  *   else:        0x{lo:x}
  * Wide register values beyond 128 bits get truncated in this view —
- * pre-existing legacy behavior.  For dyn-param data values the
- * Python code uses the *full* integer, so wide loads get all their
- * bits printed.  We mirror both. */
+ * pre-existing legacy behavior. */
 std::string fmt_snap_value(const cst::Wide &w)
 {
     uint64_t hi = w.limb[1];
@@ -132,61 +216,11 @@ std::string fmt_snap_value(const cst::Wide &w)
     return buf;
 }
 
-/* Print a Wide as a single hex integer (no leading zeros), matching
- * Python's `f"0x{n:x}"`.  For values beyond 64 bits we walk the
- * upper limbs and concatenate. */
-std::string fmt_wide_hex(const cst::Wide &w)
-{
-    /* Find the highest non-zero limb. */
-    int top = -1;
-    for (int i = (int)cst::Wide::LIMBS - 1; i >= 0; i--) {
-        if (w.limb[i]) { top = i; break; }
-    }
-    if (top < 0) return "0x0";
-    std::string out = "0x";
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%" PRIx64, w.limb[top]);
-    out += buf;
-    for (int i = top - 1; i >= 0; i--) {
-        std::snprintf(buf, sizeof(buf), "%016" PRIx64, w.limb[i]);
-        out += buf;
-    }
-    return out;
-}
+/* ====================================================================
+ * §4  Name -> mnemonic / regref converters
+ * ==================================================================== */
 
-void format_dyn_legacy(const cst::DynParam &dp, bool show_data,
-                       std::string *out)
-{
-    out->append(dp.type == cst::DynParam::Load ? "load=0x" : "store=0x");
-    out->append(fmt_hex_lower(dp.addr));
-    /* Always emit :data= when memdata was captured, even if the
-     * value is zero — see the matching disasm-format note. */
-    if (show_data) {
-        out->append(":data=");
-        out->append(fmt_wide_hex(dp.data));
-    }
-}
-
-/* ===== Disasm-format helpers =====
- *
- * Pre-built per-id tables built once at the first render call.  Replace
- * the per-line unordered_map lookup in fmt_reg / enum_or — those were
- * ~3.5 % of total decode time on full-config mcf according to perf.
- *
- * Mnemonic table converts GEN_OP_INT_ADD → "add", GEN_OP_FP_ADD →
- * "fadd", GEN_OP_VEC_ADD → "vadd", etc. (objdump-style short forms).
- *
- * Reg table converts REG_GPR0 → "%gp0", REG_FPR3 → "%f3",
- * REG_VEC2 → "%v2", REG_SP → "%sp", REG_FLAGS → "%flags", and so on.
- *
- * Both fall back to the trace's own encoding map when an id wasn't
- * built into the lookup; that's the same path fmt_reg/enum_or used.
- */
-struct DisasmTables {
-    std::vector<std::string> opcode;     /* indexed by GEN_OP_* */
-    std::vector<std::string> reg;        /* indexed by REG_* */
-};
-
+/* Strip a fixed prefix (case-insensitively) and lowercase the rest. */
 std::string strip_lower(const std::string &name, const char *prefix)
 {
     size_t plen = std::strlen(prefix);
@@ -204,13 +238,12 @@ std::string strip_lower(const std::string &name, const char *prefix)
 
 /* Convert one GEN_OP_<X> name to a short mnemonic.  Drops INT_ prefix
  * (the int variant is the default), maps FP_/VEC_ to f-/v- prefixes.
- * For GEN_OP_BRANCH the writer didn't pin a flavour into the opcode
- * name; the renderer overrides the mnemonic with the branch_type
- * (jmp / jcc / jmpr / ...) at the call site. */
+ * GEN_OP_BRANCH defaults to "jmp"; the renderer overrides it with the
+ * branch_type (jmp / jcc / jmpr / ...) at the call site. */
 std::string mnem_from_genop(const std::string &name)
 {
     std::string body = strip_lower(name, "GEN_OP_");
-    if (body == "branch") return "jmp";  /* default; overridden by branch_type */
+    if (body == "branch") return "jmp";
     if (body == "syscall") return "syscall";
     if (body == "ret") return "ret";
     if (body == "nop") return "nop";
@@ -237,14 +270,14 @@ std::string regref_from_name(const std::string &name)
 {
     if (name == "REG_NONE") return "";
     std::string body = strip_lower(name, "REG_");
-    if (body.compare(0, 3, "gpr") == 0)  return "%gp" + body.substr(3);
-    if (body.compare(0, 3, "fpr") == 0)  return "%f"  + body.substr(3);
-    if (body.compare(0, 3, "vec") == 0)  return "%v"  + body.substr(3);
-    if (body.compare(0, 4, "pred") == 0) return "%p"  + body.substr(4);
-    if (body.compare(0, 5, "bound") == 0) return "%b" + body.substr(5);
+    if (body.compare(0, 3, "gpr") == 0)   return "%gp" + body.substr(3);
+    if (body.compare(0, 3, "fpr") == 0)   return "%f"  + body.substr(3);
+    if (body.compare(0, 3, "vec") == 0)   return "%v"  + body.substr(3);
+    if (body.compare(0, 4, "pred") == 0)  return "%p"  + body.substr(4);
+    if (body.compare(0, 5, "bound") == 0) return "%b"  + body.substr(5);
     if (body.compare(0, 7, "matrix_") == 0) return "%m" + body.substr(7);
-    if (body == "fp_reg") return "%fpr";   /* legacy alias bucket */
-    if (body == "vec_reg") return "%vr";
+    if (body == "fp_reg")   return "%fpr";
+    if (body == "vec_reg")  return "%vr";
     if (body == "pred_reg") return "%pr";
     if (body == "metaflags") return "%mflags";
     return "%" + body;
@@ -257,8 +290,7 @@ std::string regref_from_name(const std::string &name)
  *   Z|N|C        -> "ZNC"
  *   Z|N|C|V|P    -> "ZNCVP"
  * Order matches the bit-position order so the string is stable across
- * traces.  Compact even on the busiest case (5 chars vs the
- * 1-byte-zero-padded "0x1f" hex form).
+ * traces.
  */
 inline void append_metaflags_bits(std::string *out,
                                   const cst::ResolvedIds &ids, uint8_t mf)
@@ -271,15 +303,11 @@ inline void append_metaflags_bits(std::string *out,
     if (mf & ids.metaflags_p) out->push_back('P');
 }
 
-/*
- * Branch-type lookup keyed off the trace's own encoding-map name
- * rather than a compile-time enum.  The wire format pins the names
- * (BRANCH_NONE, BRANCH_DIRECT_JUMP, ...) regardless of which numeric
- * id the writer assigns; matching by string keeps the decoder
- * forward-compatible with future tracers that re-number the enum or
- * add new branch flavours.  Returns nullptr for ids the trace
- * carries no name for (the renderer falls back to a generic "br").
- */
+/* ====================================================================
+ * §5  Branch-type helpers  (keyed off the trace's encoding map names
+ *     so the decoder stays forward-compatible with future numbering)
+ * ==================================================================== */
+
 const std::string *branch_name_lookup(const cst::Header &h, uint64_t bt)
 {
     auto it = h.maps.branch_type.find(bt);
@@ -289,15 +317,11 @@ const std::string *branch_name_lookup(const cst::Header &h, uint64_t bt)
 
 bool branch_is_none(const cst::Header &h, uint64_t bt)
 {
-    /* Wire-format reserves id 0 for "not a branch"; the encoding map
-     * names that slot "BRANCH_NONE" but the renderer doesn't depend on
-     * the name being present. */
     if (bt == 0) return true;
     const std::string *n = branch_name_lookup(h, bt);
     return n && *n == "BRANCH_NONE";
 }
 
-/* Map encoding-map name → short objdump-style mnemonic. */
 const char *branch_mnem_from_name(const std::string *name)
 {
     if (!name) return nullptr;
@@ -310,6 +334,17 @@ const char *branch_mnem_from_name(const std::string *name)
     if (n == "BRANCH_SYSCALL_TYPE")  return "syscall";
     return nullptr;
 }
+
+/* ====================================================================
+ * §6  Per-trace lookup tables  (vector-indexed; built once at decode
+ *     start to replace ~3.5% of total decode time spent in
+ *     unordered_map::find on the disasm hot path)
+ * ==================================================================== */
+
+struct DisasmTables {
+    std::vector<std::string> opcode; /* indexed by GEN_OP_* id */
+    std::vector<std::string> reg;    /* indexed by REG_*    id */
+};
 
 void disasm_tables_build(DisasmTables *t, const cst::Header &h)
 {
@@ -337,59 +372,19 @@ inline const std::string *table_lookup(const std::vector<std::string> &t,
     return &t[id];
 }
 
-/*
- * Append @v as lowercase hex into @out.  Builds the digits in a stack
- * buffer end-first and appends in one shot — single push_back per
- * character was hot enough on a 200s decode (11.7 % of total) to
- * justify the small overhead of computing a length first.
- */
-inline const char *kHexDigits = "0123456789abcdef";
+/* ====================================================================
+ * §7  Capstone wrapper  (one cs_handle per cst_decode invocation;
+ *     reused for every per-insn render_one call)
+ * ==================================================================== */
 
-void append_hex(std::string *out, uint64_t v)
-{
-    if (v == 0) { out->push_back('0'); return; }
-    char buf[16];
-    int n = 0;
-    while (v) { buf[15 - n] = kHexDigits[v & 0xF]; v >>= 4; n++; }
-    out->append(buf + (16 - n), (size_t)n);
-}
-
-/* Width-padded hex (zero-padded to @width chars).  Used for the PC
- * column where we always want 12 digits. */
-void append_hex_padded(std::string *out, uint64_t v, int width)
-{
-    char buf[16];
-    for (int i = 0; i < width; i++) {
-        buf[width - 1 - i] = kHexDigits[v & 0xF];
-        v >>= 4;
-    }
-    out->append(buf, (size_t)width);
-}
-
-void append_byte_hex(std::string *out, uint8_t b)
-{
-    out->push_back(kHexDigits[(b >> 4) & 0xF]);
-    out->push_back(kHexDigits[b & 0xF]);
-}
-
-/*
- * Capstone-backed objdump-style disassembler (--objdump flag).
- *
- * Holds one cs_handle per cst_decode invocation (NOT per insn) so
- * the per-line cost is just cs_disasm_iter on the raw_bytes that
- * the trace already carries.  Selected mode follows the trace's
- * declared ISA (header.isa).  When the ISA is unsupported or
- * Capstone is unavailable for a given build, render() returns
- * false and the caller suppresses the side-by-side column.
- */
 class ObjdumpRenderer {
 public:
     ObjdumpRenderer() = default;
+    ~ObjdumpRenderer() { if (open_) cs_close(&handle_); }
 
-    ~ObjdumpRenderer() {
-        if (open_) cs_close(&handle_);
-    }
-
+    /* Open Capstone for @trace_isa (1=x86_64, 2=aarch64, 3=riscv64,
+     * 4=mipsel).  Returns false for unsupported ISAs — caller suppresses
+     * the objdump column. */
     bool open(uint8_t trace_isa) {
         cs_arch arch;
         cs_mode mode;
@@ -397,7 +392,8 @@ public:
         case 1: arch = CS_ARCH_X86;     mode = CS_MODE_64;            break;
         case 2: arch = CS_ARCH_AARCH64; mode = CS_MODE_LITTLE_ENDIAN; break;
         case 3: arch = CS_ARCH_RISCV;   mode = CS_MODE_RISCV64;       break;
-        case 4: arch = CS_ARCH_MIPS;    mode = (cs_mode)(CS_MODE_MIPS64 | CS_MODE_LITTLE_ENDIAN); break;
+        case 4: arch = CS_ARCH_MIPS;
+                mode = (cs_mode)(CS_MODE_MIPS64 | CS_MODE_LITTLE_ENDIAN); break;
         default: return false;
         }
         if (cs_open(arch, mode, &handle_) != CS_ERR_OK) return false;
@@ -406,14 +402,9 @@ public:
         return true;
     }
 
-    /*
-     * Disassemble one instruction at @pc from @bytes (length @n_bytes).
-     * Writes "mnem  ops" into @out.  Returns true on success.  The
-     * per-call cost is dominated by cs_disasm_iter — ~2 µs per insn
-     * on x86-64 with default Capstone, comparable to a single fmt_*
-     * call on our side; cheap enough to enable per-template at decode
-     * time.
-     */
+    /* Disassemble one instruction at @pc from @bytes (length @n_bytes).
+     * Writes "mnem  ops" into @out.  Mnemonic padded to MNEM_COL chars
+     * so the operand column lines up across insns. */
     bool render_one(uint64_t pc, const uint8_t *bytes, size_t n_bytes,
                     std::string *out) const {
         if (!open_ || !bytes || n_bytes == 0) return false;
@@ -424,16 +415,10 @@ public:
         uint64_t addr = pc;
         bool ok = cs_disasm_iter(handle_, &code, &size, &addr, insn);
         if (ok) {
-            /* Pad mnemonic to a fixed width so the operand column
-             * lines up across instructions of varying mnemonic
-             * length.  Capstone returns a separate mnemonic and
-             * op_str — joining them with a single space (rather
-             * than the tab Capstone uses internally) keeps
-             * column alignment when the caller pads-to-N-chars. */
-            const size_t mnem_col = 8;
+            constexpr size_t MNEM_COL = 8;
             size_t before = out->size();
             out->append(insn->mnemonic);
-            while (out->size() - before < mnem_col) out->push_back(' ');
+            while (out->size() - before < MNEM_COL) out->push_back(' ');
             if (insn->op_str[0]) {
                 out->push_back(' ');
                 out->append(insn->op_str);
@@ -448,25 +433,766 @@ private:
     bool open_   = false;
 };
 
-/* Append a Wide as a single hex integer (no leading zeros). */
-void append_wide_hex(std::string *out, const cst::Wide &w)
+/* ====================================================================
+ * §8  Disasm renderer
+ *
+ * Each architectural-instance instruction renders to a single line:
+ *
+ *   0x<addr> <sym+off>: <bytes...>  <mnem>   <imm/srcs> -> <dsts[v]>  ; meta
+ *
+ * The line is composed from a sequence of per-column emit_disasm_*
+ * helpers, each appending to a shared thread_local buffer.  Layout:
+ *
+ *     pc_prefix      | bytes_column | objdump_column? | mnemonic   |
+ *     operands       | memops       | branch_target   | metadata
+ *
+ * Each helper is self-contained and only consumes the parts of the
+ * Instruction / context it needs, so the column shapes can move
+ * independently.
+ * ==================================================================== */
+
+/* Per-decode static context shared by every emit_disasm_* helper. */
+struct DisasmContext {
+    const cst::Header *h;
+    const std::unordered_map<uint32_t, size_t> *by_id;
+    const std::vector<cst::Template> *templates;
+    const DisasmTables *t;
+    /* Optional Capstone-backed objdump column. */
+    const ObjdumpRenderer *od;
+    /* --show-deps: append intra-instruction dep-mask annotation. */
+    bool show_deps = false;
+};
+
+/* Resolve register-id @r to its disasm reference (e.g. %gp3).  Hot path
+ * uses the prebuilt table; misses fall back to the trace's encoding map
+ * and then to a synthetic name. */
+void append_regref(std::string *out, const DisasmContext &ctx, uint64_t r)
 {
-    int top = -1;
-    for (int i = (int)cst::Wide::LIMBS - 1; i >= 0; i--) {
-        if (w.limb[i]) { top = i; break; }
+    if (const std::string *p = table_lookup(ctx.t->reg, r)) {
+        out->append(*p);
+        return;
     }
-    if (top < 0) { out->append("0x0"); return; }
-    out->append("0x");
-    append_hex(out, w.limb[top]);
-    /* Lower limbs are zero-padded to 16 hex chars. */
-    for (int i = top - 1; i >= 0; i--) {
-        append_hex_padded(out, w.limb[i], 16);
+    auto it = ctx.h->maps.reg.find(r);
+    if (it != ctx.h->maps.reg.end()) {
+        out->append(regref_from_name(it->second));
+        return;
+    }
+    out->append("%r");
+    append_hex(out, r);
+}
+
+/* Resolve opcode-id @op to its disasm mnemonic.  Same fallback chain as
+ * append_regref. */
+void append_mnem(std::string *out, const DisasmContext &ctx, uint64_t op)
+{
+    if (const std::string *p = table_lookup(ctx.t->opcode, op)) {
+        out->append(*p);
+        return;
+    }
+    auto it = ctx.h->maps.opcode.find(op);
+    if (it != ctx.h->maps.opcode.end()) {
+        out->append(mnem_from_genop(it->second));
+        return;
+    }
+    out->append("op");
+    append_hex(out, op);
+}
+
+/* --- §8.a Per-column emitters ------------------------------------- */
+
+constexpr int PC_COL_WIDTH       = 12;     /* hex digits */
+constexpr int BYTES_COL_BYTES    = 7;      /* objdump-style */
+constexpr int BYTES_COL_PAD      = BYTES_COL_BYTES * 3 + 4;
+constexpr int OBJDUMP_COL_WIDTH  = 40;
+constexpr int MNEM_COL_WIDTH     = 8;
+
+/* "0x<pc> [<symbol+offset>]: " */
+void emit_disasm_pc_prefix(std::string &line, const cst::Instruction &insn)
+{
+    line.append("0x");
+    append_hex_padded(&line, insn.pc, PC_COL_WIDTH);
+    if (insn.bb_template && !insn.bb_template->symbol_name.empty()) {
+        line.append(" <");
+        line.append(insn.bb_template->symbol_name);
+        line.append("+0x");
+        append_hex(&line, insn.pc - insn.bb_template->start_pc);
+        line.push_back('>');
+    }
+    line.append(": ");
+}
+
+/* "<bb bb bb ...>   " — bytes column, padded to a stable width. */
+void emit_disasm_bytes_column(std::string &line,
+                              const std::vector<uint8_t> &raw_bytes)
+{
+    size_t bytes_start = line.size();
+    for (size_t b = 0; b < raw_bytes.size(); b++) {
+        if (b) line.push_back(' ');
+        append_byte_hex(&line, raw_bytes[b]);
+    }
+    append_pad_to(&line, bytes_start + BYTES_COL_PAD);
+}
+
+/* Optional Capstone disasm column, "<text>     | ". */
+void emit_disasm_objdump_column(std::string &line,
+                                const ObjdumpRenderer &od,
+                                const cst::Instruction &insn)
+{
+    size_t obj_start = line.size();
+    std::string obj;
+    if (od.render_one(insn.pc, insn.raw_bytes.data(),
+                      insn.raw_bytes.size(), &obj)) {
+        line.append(obj);
+    } else {
+        line.append("(undecoded)");
+    }
+    append_pad_to(&line, obj_start + OBJDUMP_COL_WIDTH);
+    line.append("| ");
+}
+
+/* Branch mnemonic ("jmp"/"jcc"/...) when the insn is a branch, otherwise
+ * the opcode mnemonic.  Padded to MNEM_COL_WIDTH so operands line up. */
+void emit_disasm_mnemonic(std::string &line, const DisasmContext &ctx,
+                          const cst::Instruction &insn)
+{
+    size_t mnem_start = line.size();
+    if (branch_is_none(*ctx.h, insn.branch_type)) {
+        append_mnem(&line, ctx, insn.opcode);
+    } else if (const char *m =
+                   branch_mnem_from_name(branch_name_lookup(*ctx.h,
+                                                            insn.branch_type))) {
+        line.append(m);
+    } else {
+        append_mnem(&line, ctx, insn.opcode);
+    }
+    append_pad_to(&line, mnem_start + MNEM_COL_WIDTH);
+}
+
+/* Find the regdata snap matching dst-slot @k, if any. */
+const cst::RegSnap *find_dst_regdata(const cst::Instruction &insn, uint8_t k)
+{
+    for (const auto &r : insn.reg_snaps) {
+        if (r.operand_index == k) return &r;
+    }
+    return nullptr;
+}
+
+/* "<imm>, <src0>, <src1> -> <dst0[regdata]>, <dst1>" — returns true if
+ * the line now ends with at least one operand (so callers know whether
+ * to glue further columns with ", " or with a leading space). */
+bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
+                          const cst::Instruction &insn)
+{
+    bool any = false;
+    auto sep = [&]() {
+        if (any) line.append(", ");
+        any = true;
+    };
+    if (insn.has_immediate) {
+        sep();
+        line.append("$0x");
+        append_hex(&line, (uint64_t)insn.immediate);
+    }
+    for (uint8_t r : insn.src_regs) {
+        sep();
+        append_regref(&line, ctx, r);
+    }
+    if (!insn.dst_regs.empty()) {
+        if (any) line.append(" -> ");
+        for (size_t k = 0; k < insn.dst_regs.size(); k++) {
+            if (k) line.append(", ");
+            append_regref(&line, ctx, insn.dst_regs[k]);
+            if (const cst::RegSnap *r = find_dst_regdata(insn, (uint8_t)k)) {
+                line.push_back('[');
+                append_wide_hex(&line, r->value);
+                line.push_back(']');
+            }
+        }
+        any = true;
+    }
+    return any;
+}
+
+/* "%mflags[ZNCVP]" — at most one metaflags slot per insn. */
+void emit_disasm_metaflags(std::string &line, const DisasmContext &ctx,
+                           const cst::Instruction &insn, bool &any_operand)
+{
+    if (insn.metaflags.empty()) return;
+    line.append(any_operand ? ", " : " ");
+    any_operand = true;
+    line.append("%mflags[");
+    append_metaflags_bits(&line, ctx.h->ids, insn.metaflags.front().byte);
+    line.push_back(']');
+}
+
+/* Inline memops: "  ld(0x<addr>)=0x<data>" / "  st(0x<addr>)=0x<data>".
+ * Data half is only emitted when the trace carries MEM_DATA. */
+void emit_disasm_memops(std::string &line, const DisasmContext &ctx,
+                        const cst::Instruction &insn)
+{
+    bool with_data = ctx.h->has_mem_data();
+    for (const auto &dp : insn.dyn_params) {
+        line.append(dp.type == cst::DynParam::Load ? "  ld(0x" : "  st(0x");
+        append_hex(&line, dp.addr);
+        line.push_back(')');
+        if (with_data) {
+            line.push_back('=');
+            append_wide_hex(&line, dp.data);
+        }
     }
 }
 
-/* ===== Legacy renderer (byte-identical to champsim_tracer_decode.py) ===== */
+/* "  # 0x<pc> <symbol>" when a branch insn has a resolved target. */
+void emit_disasm_branch_target(std::string &line, const DisasmContext &ctx,
+                               const cst::Instruction &insn)
+{
+    if (branch_is_none(*ctx.h, insn.branch_type)) return;
+    if (!insn.branch_target_template) return;
+    line.append("  # 0x");
+    append_hex(&line, insn.branch_target_template->start_pc);
+    if (!insn.branch_target_template->symbol_name.empty()) {
+        line.append(" <");
+        line.append(insn.branch_target_template->symbol_name);
+        line.push_back('>');
+    }
+}
 
-void emit_observations_legacy(FILE *out, const std::string &prefix,
+/* For an intra-instruction dep mask, the bit layout is:
+ *     [0, n_src)                src_reg[i]
+ *     [n_src, n_src + n_loads)  load_data[i - n_src]
+ *     n_src + n_loads           immediate
+ * load_count_in_deps walks every mask in @it and finds the highest
+ * load-bit that's set, telling the caller how many load slots are in
+ * play (the wire format doesn't pin n_loads on the template itself). */
+unsigned load_count_in_deps(const cst::InsnTemplate &it, unsigned n_src)
+{
+    unsigned out = 0;
+    auto note = [&](uint32_t m) {
+        for (unsigned b = n_src; b < 32; b++) {
+            if (m & (1u << b)) {
+                unsigned k = b - n_src + 1;
+                if (k > out) out = k;
+            }
+        }
+    };
+    for (uint32_t m : it.dst_dep_mask) note(m);
+    for (uint32_t m : it.store_data_dep_mask) note(m);
+    return out;
+}
+
+/* "[s0,s1,ld0,imm]" — one mask rendered as a comma-separated list of
+ * its set bit names.  Bit names follow the layout from
+ * load_count_in_deps. */
+void append_dep_mask(std::string &line, uint32_t m,
+                     unsigned n_src, unsigned n_loads)
+{
+    line.push_back('[');
+    bool any = false;
+    auto add = [&](const char *prefix, unsigned idx) {
+        if (any) line.push_back(',');
+        line.append(prefix);
+        line.append(std::to_string(idx));
+        any = true;
+    };
+    for (unsigned i = 0; i < n_src; i++) {
+        if (m & (1u << i)) add("s", i);
+    }
+    for (unsigned i = 0; i < n_loads; i++) {
+        if (m & (1u << (n_src + i))) add("ld", i);
+    }
+    if (m & (1u << (n_src + n_loads))) {
+        if (any) line.push_back(',');
+        line.append("imm");
+    }
+    line.push_back(']');
+}
+
+/* "deps: d0=[s0,ld0] st0=[s1]" — appended only when --show-deps is set
+ * and the template carries a per-output dep block. */
+void emit_disasm_deps_annotation(std::string &line,
+                                 const cst::InsnTemplate &it)
+{
+    unsigned n_src = (unsigned)it.src_regs.size();
+    unsigned n_loads = load_count_in_deps(it, n_src);
+    line.append("deps:");
+    for (size_t d = 0; d < it.dst_dep_mask.size(); d++) {
+        line.append(" d");
+        line.append(std::to_string(d));
+        line.push_back('=');
+        append_dep_mask(line, it.dst_dep_mask[d], n_src, n_loads);
+    }
+    for (size_t s = 0; s < it.store_data_dep_mask.size(); s++) {
+        line.append(" st");
+        line.append(std::to_string(s));
+        line.push_back('=');
+        append_dep_mask(line, it.store_data_dep_mask[s], n_src, n_loads);
+    }
+}
+
+/* "  ; <items...>" trailing comment block.  Items are written one by
+ * one; first item gets "  ; " and subsequent items get " ". */
+void emit_disasm_trailing_meta(std::string &line, const DisasmContext &ctx,
+                               const cst::Instruction &insn,
+                               const char *wp_status)
+{
+    bool wrote = false;
+    auto begin_item = [&]() {
+        if (!wrote) { line.append("  ; "); wrote = true; }
+        else        { line.push_back(' '); }
+    };
+
+    if (wp_status && *wp_status) {
+        begin_item();
+        line.append(wp_status);
+    }
+    if (insn.sync_hint != 0) {
+        begin_item();
+        line.append("sync=");
+        line.append(enum_or(ctx.h->maps.sync_hint, insn.sync_hint, "SYNC"));
+    }
+    if (ctx.show_deps && insn.bb_template &&
+        insn.insn_index_in_bb < insn.bb_template->insns.size()) {
+        const cst::InsnTemplate &it =
+            insn.bb_template->insns[insn.insn_index_in_bb];
+        if (it.has_reg_deps) {
+            begin_item();
+            emit_disasm_deps_annotation(line, it);
+        }
+    }
+}
+
+/* --- §8.b Per-instruction renderer (sequence of column emitters) -- */
+
+void render_disasm_insn(FILE *out, const DisasmContext &ctx,
+                        const cst::Instruction &insn,
+                        const char *wp_status)
+{
+    /* One thread_local buffer is reused across calls; the only
+     * allocations come from short append_* / number conversions, and
+     * those are amortised once the buffer reaches its high-water mark. */
+    static thread_local std::string line;
+    line.clear();
+
+    emit_disasm_pc_prefix(line, insn);
+    emit_disasm_bytes_column(line, insn.raw_bytes);
+    if (ctx.od) emit_disasm_objdump_column(line, *ctx.od, insn);
+    emit_disasm_mnemonic(line, ctx, insn);
+
+    bool any_operand = emit_disasm_operands(line, ctx, insn);
+    emit_disasm_metaflags(line, ctx, insn, any_operand);
+    emit_disasm_memops(line, ctx, insn);
+    emit_disasm_branch_target(line, ctx, insn);
+    emit_disasm_trailing_meta(line, ctx, insn, wp_status);
+
+    line.push_back('\n');
+    std::fwrite(line.data(), 1, line.size(), out);
+}
+
+/* --- §8.c Entry-level helpers (BB headers, WP-run grouping) ------- */
+
+/* "; FAULT@insn3,TRANSLATION_UNAVAILABLE" / "" for clean WP runs. */
+std::string compute_wp_status(const cst::Instruction &insn)
+{
+    std::string out;
+    if (insn.wp_fault) {
+        if (insn.wp_has_fault_idx) {
+            char b[32];
+            std::snprintf(b, sizeof(b), "FAULT@insn%u",
+                          insn.wp_fault_insn_index);
+            out = b;
+        } else {
+            out = "FAULT";
+        }
+    }
+    if (insn.wp_translation_unavail) {
+        if (!out.empty()) out += ",";
+        out += "TRANSLATION_UNAVAILABLE";
+    }
+    return out;
+}
+
+/* Count contiguous WP insns sharing @first's wp_index, starting at @from
+ * (assumed to be on a wp boundary).  Used to pre-compute the n_insns
+ * field for the WP-run separator. */
+size_t count_wp_run_length(const std::vector<cst::Instruction> &insns,
+                           size_t from)
+{
+    if (from >= insns.size() || !insns[from].is_wp) return 0;
+    uint16_t idx = insns[from].wp_index;
+    size_t end = from;
+    while (end < insns.size() && insns[end].is_wp &&
+           insns[end].wp_index == idx) {
+        end++;
+    }
+    return end - from;
+}
+
+/* Linear scan for a template whose start_pc == @target_pc.  Used by the
+ * CP-final fallback that resolves unconditional branches to their
+ * fall-through BB when no immediate-based target match was found. */
+const cst::Template *find_template_by_start_pc(
+    const std::vector<cst::Template> &templates, uint64_t target_pc)
+{
+    auto it = std::find_if(templates.begin(), templates.end(),
+        [&](const cst::Template &x) { return x.start_pc == target_pc; });
+    return it == templates.end() ? nullptr : &*it;
+}
+
+/* The CP chain's final insn falls through to template @t.fall_through_pc;
+ * if that PC is the start of another template, return it for the
+ * branch-target annotation.  Returns nullptr when the fall-through
+ * PC is outside the trace window. */
+const cst::Template *find_cp_fallback_target(
+    const cst::Template &t,
+    const std::vector<cst::Template> &templates)
+{
+    if (t.insns.empty() || !t.fall_through_pc) return nullptr;
+    return find_template_by_start_pc(templates, t.fall_through_pc);
+}
+
+/* For the run-final insn of a WP entry, the branch target is the BB
+ * that starts the *next* WP entry in this chain (if any).  @from is
+ * the position of the current insn; we look forward until we find an
+ * insn with a different wp_index. */
+const cst::Template *find_next_wp_run_template(
+    const std::vector<cst::Instruction> &insns, size_t from,
+    int cur_wp_run,
+    const std::unordered_map<uint32_t, size_t> &by_id,
+    const std::vector<cst::Template> &templates)
+{
+    for (size_t j = from + 1; j < insns.size(); j++) {
+        if (!insns[j].is_wp || (int)insns[j].wp_index == cur_wp_run) {
+            continue;
+        }
+        auto nit = by_id.find(insns[j].bb_template_id);
+        return nit == by_id.end() ? nullptr : &templates[nit->second];
+    }
+    return nullptr;
+}
+
+void emit_disasm_file_header(FILE *out, const cst::Header &h,
+                             size_t n_templates)
+{
+    /* Parseable `; KEY=value` summary so simple greppers can pull the
+     * trace's identity without parsing the binary header. */
+    std::fprintf(out, "; cst_decode disassembly\n");
+    std::fprintf(out, "; version=0x%08X\n", h.magic);
+    std::fprintf(out, "; isa=%s\n", isa_display(h));
+    std::fprintf(out, "; command=%s\n", h.command.c_str());
+    std::fprintf(out, "; datetime=%s\n", h.datetime.c_str());
+    std::fprintf(out, "; flags=%s%s\n",
+                 h.has_mem_data() ? "MEM_DATA " : "",
+                 h.has_reg_data() ? "REG_DATA"  : "");
+    std::fprintf(out,
+                 "; start_insn=%llu warmup_insns=%llu total_target_insns=%llu\n",
+                 (unsigned long long)h.start_insn,
+                 (unsigned long long)h.warmup_insns,
+                 (unsigned long long)h.total_target_insns);
+    std::fprintf(out, "; templates=%zu\n\n", n_templates);
+}
+
+void emit_bb_header(FILE *out, const cst::DecodedEntry &e,
+                    const cst::Template &t)
+{
+    std::fprintf(out,
+                 "; ----- BB %u entry pc=0x%" PRIx64
+                 " insns=%zu seq=%u tid=%u%s -----\n",
+                 e.template_id, t.start_pc, t.insns.size(),
+                 e.seq_num, e.thread_id,
+                 e.thread_switched ? " (thread_switch)" : "");
+}
+
+void emit_wp_run_separator(FILE *out, const cst::Instruction &first,
+                           size_t run_n, const std::string &status)
+{
+    std::fprintf(out,
+                 "; ..... wp[%u] BB %u n_insns=%zu%s%s -----\n",
+                 (unsigned)first.wp_index, first.bb_template_id, run_n,
+                 status.empty() ? "" : " status=",
+                 status.c_str());
+}
+
+/* --- §8.d Per-entry driver ---------------------------------------- */
+
+/* Walk one DecodedEntry's instructions in CP-then-WP order, injecting
+ * WP-run separators and resolving CP/WP "final insn falls through to..."
+ * branch fallbacks for the renderer. */
+void render_entry_disasm(FILE *out, const DisasmContext &ctx,
+                         const cst::DecodedEntry &e)
+{
+    auto it = ctx.by_id->find(e.template_id);
+    if (it == ctx.by_id->end()) {
+        std::fprintf(out, "; ----- BB %u (template not found) -----\n",
+                     e.template_id);
+        return;
+    }
+    const cst::Template &t = (*ctx.templates)[it->second];
+    emit_bb_header(out, e, t);
+
+    /* Fan the entry into per-instance instructions.  The builder
+     * pre-filters dyn_params/reg_snaps/metaflags per-insn and resolves
+     * direct branch targets via immediate match. */
+    std::vector<cst::Instruction> insns =
+        cst::instructions_from_entry(e, *ctx.h, *ctx.templates, *ctx.by_id);
+
+    /* CP fallback: when the CP-final insn is a branch we couldn't
+     * statically resolve, attribute it to the fall_through_pc BB. */
+    const cst::Template *cp_fallback =
+        find_cp_fallback_target(t, *ctx.templates);
+
+    int  cur_wp_run = -1;     /* -1 = CP, otherwise WPEntry::index */
+    std::string wp_status;
+    for (size_t i = 0; i < insns.size(); i++) {
+        cst::Instruction &insn = insns[i];
+        bool is_last_of_group =
+            (i + 1 == insns.size()) ||
+            (insn.is_wp != insns[i + 1].is_wp) ||
+            (insn.is_wp && (int)insns[i + 1].wp_index != (int)insn.wp_index);
+
+        if (!insn.is_wp) {
+            if (is_last_of_group && !insn.branch_target_template) {
+                insn.branch_target_template = cp_fallback;
+            }
+            render_disasm_insn(out, ctx, insn, /*wp_status=*/nullptr);
+            continue;
+        }
+
+        /* New WP run: emit the separator before the first insn. */
+        if ((int)insn.wp_index != cur_wp_run) {
+            cur_wp_run = (int)insn.wp_index;
+            wp_status = compute_wp_status(insn);
+            emit_wp_run_separator(out, insn,
+                                  count_wp_run_length(insns, i), wp_status);
+        }
+
+        if (is_last_of_group && !insn.branch_target_template) {
+            insn.branch_target_template = find_next_wp_run_template(
+                insns, i, cur_wp_run, *ctx.by_id, *ctx.templates);
+        }
+
+        render_disasm_insn(out, ctx, insn,
+                           wp_status.empty() ? nullptr : wp_status.c_str());
+    }
+}
+
+void render_disasm(FILE *out, const cst::Header &h,
+                   const std::vector<cst::Template> &templates,
+                   const std::unordered_map<uint32_t, size_t> &by_id,
+                   cst::BodyWalker &body,
+                   const ObjdumpRenderer *od,
+                   bool show_deps)
+{
+    DisasmTables dt;
+    disasm_tables_build(&dt, h);
+    DisasmContext ctx{&h, &by_id, &templates, &dt, od, show_deps};
+
+    emit_disasm_file_header(out, h, templates.size());
+    body.walk([&](const cst::DecodedEntry &e) {
+        render_entry_disasm(out, ctx, e);
+    });
+}
+
+/* ====================================================================
+ * §9  Templates-only renderer  (--templates-only flag)
+ *
+ * Walks every template, dedupes insns by PC, and emits one line per
+ * unique PC — the shape `objdump -d` produces over a binary's text
+ * section.  Templates carry no run-time observation, so no regdata /
+ * memdata appears.
+ * ==================================================================== */
+
+struct UniqueTemplateInsn {
+    uint64_t                 pc;
+    const cst::InsnTemplate *insn;
+};
+
+/* Collect every distinct PC across all templates (first sighting wins
+ * — the bytes are identical anyway), sorted ascending. */
+std::vector<UniqueTemplateInsn> collect_unique_template_insns(
+    const std::vector<cst::Template> &templates,
+    std::unordered_map<uint64_t, std::string> *symbol_at)
+{
+    std::vector<UniqueTemplateInsn> out;
+    out.reserve(templates.size() * 4);
+    for (const cst::Template &t : templates) {
+        if (!t.symbol_name.empty()) {
+            (*symbol_at)[t.start_pc] = t.symbol_name;
+        }
+        for (const cst::InsnTemplate &I : t.insns) {
+            out.push_back({I.pc, &I});
+        }
+    }
+    std::sort(out.begin(), out.end(),
+              [](const UniqueTemplateInsn &a, const UniqueTemplateInsn &b) {
+                  return a.pc < b.pc;
+              });
+    out.erase(std::unique(out.begin(), out.end(),
+                          [](const UniqueTemplateInsn &a,
+                             const UniqueTemplateInsn &b) {
+                              return a.pc == b.pc;
+                          }),
+              out.end());
+    return out;
+}
+
+/* Mnemonic for the templates-only generic view: branch-flavour for
+ * branches, mnem table for non-branches.  Falls back to "br"/"op"
+ * when the trace's encoding maps don't carry the id. */
+void emit_template_only_mnemonic(std::string &line, const cst::Header &h,
+                                 const DisasmTables &dt,
+                                 const cst::InsnTemplate &I)
+{
+    size_t mnem_start = line.size();
+    if (branch_is_none(h, I.branch_type)) {
+        const std::string *p = table_lookup(dt.opcode, I.opcode);
+        line.append(p ? *p : std::string("op"));
+    } else if (const char *m =
+                   branch_mnem_from_name(branch_name_lookup(h, I.branch_type))) {
+        line.append(m);
+    } else {
+        line.append("br");
+    }
+    append_pad_to(&line, mnem_start + MNEM_COL_WIDTH);
+}
+
+/* "<imm>, <srcs> -> <dsts>" — static-only variant of the disasm
+ * operand emitter (no regdata since templates carry no per-instance
+ * info). */
+void emit_template_only_operands(std::string &line,
+                                 const DisasmTables &dt,
+                                 const cst::InsnTemplate &I)
+{
+    bool any = false;
+    auto reg_or_q = [&](uint8_t r) {
+        const std::string *p = table_lookup(dt.reg, r);
+        line.append(p ? *p : std::string("%r?"));
+    };
+    if (I.has_imm) {
+        line.append("$0x");
+        append_hex(&line, (uint64_t)I.imm);
+        any = true;
+    }
+    for (uint8_t r : I.src_regs) {
+        if (any) line.append(", ");
+        reg_or_q(r);
+        any = true;
+    }
+    if (!I.dst_regs.empty()) {
+        if (any) line.append(" -> ");
+        for (size_t k = 0; k < I.dst_regs.size(); k++) {
+            if (k) line.append(", ");
+            reg_or_q(I.dst_regs[k]);
+        }
+    }
+}
+
+void emit_template_only_symbol_marker(FILE *out, uint64_t pc,
+                                      const std::string &symbol)
+{
+    std::string line;
+    append_hex_padded(&line, pc, 16);
+    line.append(" <");
+    line.append(symbol);
+    line.append(">:\n");
+    std::fwrite(line.data(), 1, line.size(), out);
+}
+
+/* One templates-only line:
+ *   "  <pc>:  <bytes...>  [objdump | ] <mnem>   <operands>\n"
+ */
+void emit_template_only_line(FILE *out, const cst::Header &h,
+                             const DisasmTables &dt,
+                             const ObjdumpRenderer *od,
+                             const cst::InsnTemplate &I)
+{
+    std::string line;
+    line.append("  ");
+    append_hex_padded(&line, I.pc, 16);
+    line.append(":  ");
+
+    size_t bytes_start = line.size();
+    for (size_t b = 0; b < I.raw_bytes.size(); b++) {
+        if (b) line.push_back(' ');
+        append_byte_hex(&line, I.raw_bytes[b]);
+    }
+    append_pad_to(&line, bytes_start + 16 * 3);
+    line.append("  ");
+
+    if (od) {
+        size_t obj_start = line.size();
+        std::string obj;
+        if (od->render_one(I.pc, I.raw_bytes.data(), I.raw_bytes.size(),
+                           &obj)) {
+            line.append(obj);
+        } else {
+            line.append("(undecoded)");
+        }
+        append_pad_to(&line, obj_start + OBJDUMP_COL_WIDTH);
+        line.append("| ");
+    }
+
+    emit_template_only_mnemonic(line, h, dt, I);
+    emit_template_only_operands(line, dt, I);
+    line.push_back('\n');
+    std::fwrite(line.data(), 1, line.size(), out);
+}
+
+void emit_templates_only_file_header(FILE *out, const cst::Header &h,
+                                     size_t n_templates, bool with_objdump)
+{
+    std::fprintf(out, "\n%s:     file format trace template map\n",
+                 isa_display(h));
+    std::fprintf(out, "; version=0x%08X templates=%zu%s\n\n",
+                 h.magic, n_templates,
+                 with_objdump ? " objdump_disasm=on" : "");
+}
+
+void render_templates_only(FILE *out, const cst::Header &h,
+                           const std::vector<cst::Template> &templates,
+                           const std::unordered_map<uint32_t, size_t> &by_id,
+                           const ObjdumpRenderer *od)
+{
+    (void)by_id;
+    DisasmTables dt;
+    disasm_tables_build(&dt, h);
+    emit_templates_only_file_header(out, h, templates.size(), od != nullptr);
+
+    std::unordered_map<uint64_t, std::string> symbol_at;
+    auto unique_insns = collect_unique_template_insns(templates, &symbol_at);
+
+    for (const UniqueTemplateInsn &e : unique_insns) {
+        auto sit = symbol_at.find(e.pc);
+        if (sit != symbol_at.end()) {
+            emit_template_only_symbol_marker(out, e.pc, sit->second);
+        }
+        emit_template_only_line(out, h, dt, od, *e.insn);
+    }
+}
+
+/* ====================================================================
+ * §10  Legacy renderer  (Python-compat output; byte-identical to
+ *      champsim_tracer_decode.py's render_text_streaming)
+ *
+ * Section order: META → ENCODINGS → TEMPLATES → BODY → BODY_STATS.
+ * Each section is a self-contained emit_legacy_* function below.
+ * ==================================================================== */
+
+void format_dyn_legacy(const cst::DynParam &dp, bool show_data,
+                       std::string *out)
+{
+    out->append(dp.type == cst::DynParam::Load ? "load=0x" : "store=0x");
+    out->append(fmt_hex_lower(dp.addr));
+    if (show_data) {
+        out->append(":data=");
+        std::string w;
+        w.reserve(16);
+        append_wide_hex(&w, dp.data);
+        out->append(w);
+    }
+}
+
+/* "<prefix>memops:\n  insn[..] ...\n<prefix>regs:\n ..." */
+void emit_legacy_observations(FILE *out, const std::string &prefix,
                               const cst::Header &h,
                               const std::vector<cst::DynParam> &dyns,
                               const std::vector<cst::RegSnap> &snaps,
@@ -506,16 +1232,12 @@ void emit_observations_legacy(FILE *out, const std::string &prefix,
     }
 }
 
-void render_legacy(FILE *out, const cst::Header &h,
-                   const std::vector<cst::Template> &templates,
-                   const std::unordered_map<uint32_t, size_t> &by_id,
-                   cst::BodyWalker &body)
+/* META section. */
+void emit_legacy_meta(FILE *out, const cst::Header &h)
 {
     std::fprintf(out, "META\n----\n");
     std::fprintf(out, "VERSION 0x%08X\n", h.magic);
-    std::string isa_str = !h.target_name.empty() ? h.target_name
-                                                 : isa_name(h.isa);
-    std::fprintf(out, "ISA %s\n", isa_str.c_str());
+    std::fprintf(out, "ISA %s\n", isa_display(h));
     std::fprintf(out, "COMMAND %s\n", h.command.c_str());
     std::fprintf(out, "DATETIME %s\n", h.datetime.c_str());
     std::fprintf(out, "COMMENT %s\n", h.comment.c_str());
@@ -523,25 +1245,42 @@ void render_legacy(FILE *out, const cst::Header &h,
     if (h.has_mem_data()) flags += " MEM_DATA";
     if (h.has_reg_data()) flags += " REG_DATA";
     std::fprintf(out, "FLAGS%s\n", flags.c_str());
-    std::fprintf(out, "START_INSN %llu\n",
-                 (unsigned long long)h.start_insn);
+    std::fprintf(out, "START_INSN %llu\n", (unsigned long long)h.start_insn);
     std::fprintf(out, "WARMUP_INSNS %llu\n",
                  (unsigned long long)h.warmup_insns);
     std::fprintf(out, "TOTAL_TARGET_INSNS %llu%s\n",
                  (unsigned long long)h.total_target_insns,
                  h.total_target_insns == 0 ? " (unbounded)" : "");
     std::fprintf(out, "\n");
+}
 
+/* "<name> <count>\n  <id> <name>\n  ..." for one encoding map. */
+void emit_legacy_encoding_map(FILE *out, const char *name,
+                              const std::unordered_map<uint64_t, std::string> &m)
+{
+    if (m.empty()) return;
+    std::fprintf(out, "%s %zu\n", name, m.size());
+    std::vector<uint64_t> keys;
+    keys.reserve(m.size());
+    for (auto &kv : m) keys.push_back(kv.first);
+    std::sort(keys.begin(), keys.end());
+    for (uint64_t k : keys) {
+        std::fprintf(out, "  %llu %s\n",
+                     (unsigned long long)k, m.at(k).c_str());
+    }
+}
+
+/* ENCODINGS section.  Walks the well-known encoding maps in
+ * alphabetical order, then emits the two constant tables Python
+ * carries inline (WP_STOP_REASONS, EXCEPTIONS). */
+void emit_legacy_encodings(FILE *out, const cst::Header &h)
+{
     std::fprintf(out, "ENCODINGS\n---------\n");
-    /* The Python decoder iterates encoding_maps in sorted order if any
-     * map exists, else falls back to a built-in list.  We always have
-     * the merged maps populated, so honor sorted iteration over the
-     * maps that are non-empty. */
     struct MapRef {
         const char *name;
         const std::unordered_map<uint64_t, std::string> *m;
     };
-    MapRef refs[] = {
+    const MapRef refs[] = {
         {"body_tag",      &h.maps.body_tag},
         {"branch_type",   &h.maps.branch_type},
         {"field_id",      &h.maps.field_id},
@@ -553,20 +1292,8 @@ void render_legacy(FILE *out, const cst::Header &h,
         {"sync_hint",     &h.maps.sync_hint},
         {"wp_event_flag", &h.maps.wp_event_flag},
     };
-    /* Already alphabetical above. */
-    for (auto &mr : refs) {
-        if (mr.m->empty()) continue;
-        std::fprintf(out, "%s %zu\n", mr.name, mr.m->size());
-        std::vector<uint64_t> keys;
-        keys.reserve(mr.m->size());
-        for (auto &kv : *mr.m) keys.push_back(kv.first);
-        std::sort(keys.begin(), keys.end());
-        for (uint64_t k : keys) {
-            std::fprintf(out, "  %llu %s\n",
-                         (unsigned long long)k, mr.m->at(k).c_str());
-        }
-    }
-    /* WP_STOP_REASONS / EXCEPTIONS are constant tables in the Python. */
+    for (auto &mr : refs) emit_legacy_encoding_map(out, mr.name, *mr.m);
+
     std::fprintf(out, "WP_STOP_REASONS 2\n");
     std::fprintf(out, "  0 NONE\n");
     std::fprintf(out, "  1 SYSCALL_USERMODE\n");
@@ -577,9 +1304,53 @@ void render_legacy(FILE *out, const cst::Header &h,
     std::fprintf(out, "  3 FP_DIVIDE_BY_ZERO\n");
     std::fprintf(out, "  4 MEMORY_ACCESS\n");
     std::fprintf(out, "\n");
+}
 
+/* One template-insn line inside the legacy TEMPLATES section. */
+void emit_legacy_template_insn(FILE *out, const cst::Header &h,
+                               size_t i, const cst::InsnTemplate &I)
+{
+    std::string line = "  [";
+    line += std::to_string(i);
+    line += "] 0x";
+    line += fmt_hex_lower(I.pc);
+    line += ": op=";
+    line += enum_or(h.maps.opcode, I.opcode, "OP");
+    if (!branch_is_none(h, I.branch_type)) {
+        line += " br=";
+        line += enum_or(h.maps.branch_type, I.branch_type, "BR");
+        line += " cond=";
+        line += I.branch_conditional ? "1" : "0";
+    }
+    line += " src=[";
+    for (size_t k = 0; k < I.src_regs.size(); k++) {
+        if (k) line += ",";
+        line += fmt_reg(h, I.src_regs[k]);
+    }
+    line += "] dst=[";
+    for (size_t k = 0; k < I.dst_regs.size(); k++) {
+        if (k) line += ",";
+        line += fmt_reg(h, I.dst_regs[k]);
+    }
+    line += "]";
+    if (I.has_imm) {
+        line += " imm=";
+        line += std::to_string(I.imm);
+    }
+    if (I.sync_hint != 0) {
+        line += " sync=";
+        line += enum_or(h.maps.sync_hint, I.sync_hint, "SYNC");
+    }
+    line += " bytes=";
+    line += fmt_bytes_hex(I.raw_bytes);
+    std::fprintf(out, "%s\n", line.c_str());
+}
+
+void emit_legacy_templates(FILE *out, const cst::Header &h,
+                           const std::vector<cst::Template> &templates)
+{
     std::fprintf(out, "TEMPLATES\n---------\n");
-    for (auto &t : templates) {
+    for (const auto &t : templates) {
         std::fprintf(out,
                      "BB%u [pc=0x%llx, insns=%zu, fall_through=0x%llx]\n",
                      t.template_id,
@@ -590,115 +1361,83 @@ void render_legacy(FILE *out, const cst::Header &h,
             std::fprintf(out, "  symbol=%s\n", t.symbol_name.c_str());
         }
         for (size_t i = 0; i < t.insns.size(); i++) {
-            const auto &I = t.insns[i];
-            std::string line = "  [";
-            line += std::to_string(i);
-            line += "] 0x";
-            line += fmt_hex_lower(I.pc);
-            line += ": op=";
-            line += enum_or(h.maps.opcode, I.opcode, "OP");
-            if (!branch_is_none(h, I.branch_type)) {
-                line += " br=";
-                line += enum_or(h.maps.branch_type, I.branch_type, "BR");
-                line += " cond=";
-                line += I.branch_conditional ? "1" : "0";
-            }
-            line += " src=[";
-            for (size_t k = 0; k < I.src_regs.size(); k++) {
-                if (k) line += ",";
-                line += fmt_reg(h, I.src_regs[k]);
-            }
-            line += "] dst=[";
-            for (size_t k = 0; k < I.dst_regs.size(); k++) {
-                if (k) line += ",";
-                line += fmt_reg(h, I.dst_regs[k]);
-            }
-            line += "]";
-            if (I.has_imm) {
-                line += " imm=";
-                line += std::to_string(I.imm);
-            }
-            if (I.sync_hint != 0) {
-                line += " sync=";
-                line += enum_or(h.maps.sync_hint, I.sync_hint, "SYNC");
-            }
-            line += " bytes=";
-            line += fmt_bytes_hex(I.raw_bytes);
-            std::fprintf(out, "%s\n", line.c_str());
+            emit_legacy_template_insn(out, h, i, t.insns[i]);
         }
         std::fprintf(out, "\n");
     }
+}
 
-    std::fprintf(out, "BODY\n----\n");
-    body.walk(
-        [&](const cst::DecodedEntry &e) {
-        const char *sw = e.thread_switched ? " switch=1" : "";
-        std::fprintf(out, "ENTRY %04u thread=%u%s template=BB%u\n",
-                     e.seq_num, e.thread_id, sw, e.template_id);
-        std::fprintf(out, "  cp:\n");
-        emit_observations_legacy(out, "    ", h, e.dyn_params, e.reg_snaps,
-                                 e.metaflags);
-        for (auto &wp : e.wp_entries) {
-            std::fprintf(out,
-                         "  wp[%u] template=BB%u n_insns=%u\n",
-                         wp.index, wp.template_id, wp.n_insns);
-            std::vector<std::string> statuses;
-            if (wp.fault) {
-                if (wp.has_fault_idx) {
-                    statuses.push_back("FAULT@insn" +
-                                       std::to_string(wp.fault_insn_index));
-                } else {
-                    statuses.push_back("FAULT");
-                }
-            }
-            if (wp.translation_unavailable) {
-                statuses.push_back("TRANSLATION_UNAVAILABLE");
-            }
-            if (!statuses.empty()) {
-                std::string s;
-                for (size_t i = 0; i < statuses.size(); i++) {
-                    if (i) s += " ";
-                    s += statuses[i];
-                }
-                std::fprintf(out, "    status: %s\n", s.c_str());
-            }
-            emit_observations_legacy(out, "    ", h, wp.dyn_params, wp.reg_snaps,
-                                     wp.metaflags);
-        }
-        std::fprintf(out, "\n");
-    },
-    [&](const cst::DecodedRegfile &rf) {
-        std::fprintf(out, "REGFILE thread=%u n=%zu\n",
-                     rf.thread_id, rf.regs.size());
-        for (const auto &s : rf.regs) {
-            std::fprintf(out, "  %s %s\n",
-                         fmt_reg(h, s.gen_id).c_str(),
-                         fmt_bytes_hex(s.bytes).c_str());
-        }
-        std::fprintf(out, "\n");
-    });
+/* "FAULT@insn3 TRANSLATION_UNAVAILABLE" / "" for a single WPEntry. */
+std::string compute_legacy_wp_status(const cst::WPEntry &wp)
+{
+    std::vector<std::string> parts;
+    if (wp.fault) {
+        parts.push_back(wp.has_fault_idx
+                            ? "FAULT@insn" + std::to_string(wp.fault_insn_index)
+                            : std::string("FAULT"));
+    }
+    if (wp.translation_unavailable) {
+        parts.push_back("TRANSLATION_UNAVAILABLE");
+    }
+    std::string out;
+    for (size_t i = 0; i < parts.size(); i++) {
+        if (i) out += " ";
+        out += parts[i];
+    }
+    return out;
+}
 
-    /* Trailing structural-stats section so the validator can
-     * cross-check the writer's cadence (one REGFILE per thread per
-     * segment, at-least-one IFRAME per N entries, sync_hints, etc.)
-     * without re-walking the body or shelling out to cst_audit. */
-    const auto &s = body.stats();
+/* One BODY ENTRY block. */
+void emit_legacy_entry(FILE *out, const cst::Header &h,
+                       const cst::DecodedEntry &e)
+{
+    const char *sw = e.thread_switched ? " switch=1" : "";
+    std::fprintf(out, "ENTRY %04u thread=%u%s template=BB%u\n",
+                 e.seq_num, e.thread_id, sw, e.template_id);
+    std::fprintf(out, "  cp:\n");
+    emit_legacy_observations(out, "    ", h, e.dyn_params, e.reg_snaps,
+                             e.metaflags);
+    for (const auto &wp : e.wp_entries) {
+        std::fprintf(out, "  wp[%u] template=BB%u n_insns=%u\n",
+                     wp.index, wp.template_id, wp.n_insns);
+        std::string status = compute_legacy_wp_status(wp);
+        if (!status.empty()) {
+            std::fprintf(out, "    status: %s\n", status.c_str());
+        }
+        emit_legacy_observations(out, "    ", h, wp.dyn_params, wp.reg_snaps,
+                                 wp.metaflags);
+    }
+    std::fprintf(out, "\n");
+}
+
+/* One REGFILE record block. */
+void emit_legacy_regfile(FILE *out, const cst::Header &h,
+                         const cst::DecodedRegfile &rf)
+{
+    std::fprintf(out, "REGFILE thread=%u n=%zu\n",
+                 rf.thread_id, rf.regs.size());
+    for (const auto &s : rf.regs) {
+        std::fprintf(out, "  %s %s\n",
+                     fmt_reg(h, s.gen_id).c_str(),
+                     fmt_bytes_hex(s.bytes).c_str());
+    }
+    std::fprintf(out, "\n");
+}
+
+/* BODY_STATS section.  Trailing block so validators can cross-check
+ * writer cadence without re-walking the body. */
+void emit_legacy_body_stats(FILE *out, const cst::BodyStats &s)
+{
     std::fprintf(out, "BODY_STATS\n----------\n");
-    std::fprintf(out, "cp_entries %llu\n",
-                 (unsigned long long)s.cp_entries);
-    std::fprintf(out, "wp_entries %llu\n",
-                 (unsigned long long)s.wp_entries);
-    std::fprintf(out, "iframe_count %llu\n",
-                 (unsigned long long)s.iframe_count);
-    std::fprintf(out, "regfile_count %llu\n",
-                 (unsigned long long)s.regfile_count);
-    std::fprintf(out, "thread_switch_count %llu\n",
-                 (unsigned long long)s.thread_switch_count);
-    std::fprintf(out, "fault_count %llu\n",
-                 (unsigned long long)s.fault_count);
+    std::fprintf(out, "cp_entries %llu\n",          (unsigned long long)s.cp_entries);
+    std::fprintf(out, "wp_entries %llu\n",          (unsigned long long)s.wp_entries);
+    std::fprintf(out, "iframe_count %llu\n",        (unsigned long long)s.iframe_count);
+    std::fprintf(out, "regfile_count %llu\n",       (unsigned long long)s.regfile_count);
+    std::fprintf(out, "thread_switch_count %llu\n", (unsigned long long)s.thread_switch_count);
+    std::fprintf(out, "fault_count %llu\n",         (unsigned long long)s.fault_count);
     std::fprintf(out, "translation_unavail_count %llu\n",
                  (unsigned long long)s.translation_unavail_count);
-    /* Sort sync hints by id for stable output. */
+
     std::vector<uint8_t> hint_keys;
     hint_keys.reserve(s.sync_hint_counts.size());
     for (auto &kv : s.sync_hint_counts) hint_keys.push_back(kv.first);
@@ -709,767 +1448,182 @@ void render_legacy(FILE *out, const cst::Header &h,
                      (unsigned long long)s.sync_hint_counts.at(k));
     }
     std::fprintf(out, "\n");
+}
 
-    /* Suppress unused-variable warnings for the constant tables that
-     * the legacy renderer references but doesn't otherwise consume. */
+void render_legacy(FILE *out, const cst::Header &h,
+                   const std::vector<cst::Template> &templates,
+                   const std::unordered_map<uint32_t, size_t> &by_id,
+                   cst::BodyWalker &body)
+{
+    (void)by_id;
+    emit_legacy_meta(out, h);
+    emit_legacy_encodings(out, h);
+    emit_legacy_templates(out, h, templates);
+
+    std::fprintf(out, "BODY\n----\n");
+    body.walk(
+        [&](const cst::DecodedEntry &e)   { emit_legacy_entry(out, h, e); },
+        [&](const cst::DecodedRegfile &rf){ emit_legacy_regfile(out, h, rf); });
+
+    emit_legacy_body_stats(out, body.stats());
+
+    /* Keep constant-table helpers reachable so the compiler doesn't
+     * drop them — they're available to future callers but not used by
+     * this renderer body. */
     (void)exception_name; (void)wp_stop_reason_name;
 }
 
-/* ===== Disassembly renderer ===== */
+/* ====================================================================
+ * §11  CLI + dispatch
+ * ==================================================================== */
 
-/* Format a single canonical instruction as an objdump-style line.
- * Output:
- *
- *   0x<addr> <symbol+0xoff>: <OPCODE>  <operands>  ; tid=N bb=B [extras]
- *
- * The metadata after `;` includes per-insn dyn params (memops with
- * effective addresses, optional load/store data) and dst register
- * writes resolved to (reg=value) pairs.  Each instruction's line is
- * fully self-contained so a `grep '<name>'` or `grep 'st_addr=0x'`
- * over the dump produces a useful result.
- */
-struct DisasmContext {
-    const cst::Header *h;
-    const std::unordered_map<uint32_t, size_t> *by_id;
-    const std::vector<cst::Template> *templates;
-    const DisasmTables *t;
-    /* Optional Capstone-backed objdump-style renderer.  When non-null
-     * each insn line is emitted twice on one row: bytes column,
-     * objdump disasm in a fixed-width left field, then our generic
-     * trace view (with regdata / memdata) on the right. */
-    const ObjdumpRenderer *od;
-    /* --show-deps: append intra-instruction dependency masks as a
-     * trailing comment when the template carries them. */
-    bool                   show_deps = false;
+struct Options {
+    const char *trace_path     = nullptr;
+    const char *format         = "disasm";
+    bool        templates_only = false;
+    bool        show_objdump   = false;
+    bool        show_deps      = false;
+    uint64_t    max_entries    = 0;        /* 0 = unbounded */
 };
 
-/* Append a register reference resolved through the prebuilt table; on
- * miss synthesizes from the trace's encoding map.  No allocation in
- * the hot path. */
-void append_regref(std::string *out, const DisasmContext &ctx, uint64_t r)
+void print_usage(FILE *err, const char *argv0)
 {
-    const std::string *p = table_lookup(ctx.t->reg, r);
-    if (p) { out->append(*p); return; }
-    auto it = ctx.h->maps.reg.find(r);
-    if (it != ctx.h->maps.reg.end()) {
-        out->append(regref_from_name(it->second));
-        return;
-    }
-    out->append("%r");
-    append_hex(out, r);
+    std::fprintf(err,
+        "usage: %s [--format=disasm|legacy] [--templates-only] "
+        "[--objdump] [--show-deps] [--max N] <trace.cst>\n"
+        "  --templates-only  print only the template dictionary,\n"
+        "                    skip the body delta-replay\n"
+        "  --objdump         emit Capstone-rendered native disasm\n"
+        "                    of each insn alongside the generic view\n"
+        "  --show-deps       append intra-instruction dep masks as a\n"
+        "                    trailing `; deps: d0=[s0,ld0] ...` comment\n"
+        "                    when the template carries them\n"
+        "  --max N           stop after N body entries (tears the\n"
+        "                    decompressor subprocess down early)\n",
+        argv0);
 }
 
-void append_mnem(std::string *out, const DisasmContext &ctx, uint64_t op)
+/* Parse argv into @opts.  Returns 0 on success, 2 on usage error
+ * (with usage written to stderr by the caller).  --max accepts both
+ * "--max=N" and "--max N" forms. */
+int parse_options(int argc, char **argv, Options *opts)
 {
-    const std::string *p = table_lookup(ctx.t->opcode, op);
-    if (p) { out->append(*p); return; }
-    auto it = ctx.h->maps.opcode.find(op);
-    if (it != ctx.h->maps.opcode.end()) {
-        out->append(mnem_from_genop(it->second));
-        return;
-    }
-    out->append("op");
-    append_hex(out, op);
-}
-
-void append_pad_to(std::string *out, size_t target)
-{
-    while (out->size() < target) out->push_back(' ');
-}
-
-/* Render one objdump-style instruction line.  Layout:
- *
- *   <pc> <sym+off>: <bytes...>  <mnem>   <imm/srcs> -> <dsts[v]>  ; meta
- *
- * — bytes match objdump's per-byte hex columns
- * — operands listed AT&T-ish: imm first, then srcs, an arrow, then dsts
- *   with regdata appended in [v]
- * — memops decorate the address with their data inline as (addr)=val
- * — branch targets append <symbol> when the target's BB is known
- * — the trailing `; ...` carries thread/bb/wp/sync flags for greppers
- *
- * Consumes a fully-built cst::Instruction (dyn_params / reg_snaps /
- * metaflags pre-filtered to this insn, branch_target_template
- * already resolved).  @wp_status is the chain-level status string
- * the caller derived once per WP run (nullptr for CP / clean WP).
- *
- * One thread_local std::string is reused across calls; the only
- * allocations come from short append_hex / number conversions, and
- * those are amortised once the buffer reaches its high-water mark. */
-void render_disasm_insn(FILE *out, const DisasmContext &ctx,
-                        const cst::Instruction &insn,
-                        const char *wp_status)
-{
-    /* Per-thread reusable buffer to avoid the malloc/free churn the
-     * old per-line std::string + concat path created (~6 % memmove +
-     * 5 % alloc/free on full-config mcf decode). */
-    static thread_local std::string line;
-    line.clear();
-
-    /* PC + symbol prefix.  Padded to 12 hex chars so columns align. */
-    line.append("0x");
-    append_hex_padded(&line, insn.pc, 12);
-    if (insn.bb_template && !insn.bb_template->symbol_name.empty()) {
-        line.append(" <");
-        line.append(insn.bb_template->symbol_name);
-        line.append("+0x");
-        append_hex(&line, insn.pc - insn.bb_template->start_pc);
-        line.push_back('>');
-    }
-    line.append(": ");
-
-    /* Bytes column — objdump prints up to ~7 bytes inline; we let it
-     * grow as needed (raw_bytes is at most 16 for x86 long encodings).
-     * Each byte is two hex chars + a space; pad to a fixed width so
-     * the mnemonic column lines up regardless of actual byte count. */
-    size_t bytes_start = line.size();
-    for (size_t b = 0; b < insn.raw_bytes.size(); b++) {
-        if (b) line.push_back(' ');
-        append_byte_hex(&line, insn.raw_bytes[b]);
-    }
-    /* Pad to bytes_start + 7*3 + slack, putting the mnemonic at a
-     * stable column. */
-    append_pad_to(&line, bytes_start + 7 * 3 + 4);
-
-    /* Optional --objdump column: native disasm of the raw bytes via
-     * Capstone, padded to a stable width so the generic-trace view
-     * lines up underneath.  Each per-insn cs_disasm_iter call is
-     * ~2 µs on x86-64 — cheap relative to the surrounding decode
-     * work since templates are small (5-20 insns each) and shared. */
-    if (ctx.od) {
-        size_t obj_start = line.size();
-        std::string obj;
-        if (ctx.od->render_one(insn.pc, insn.raw_bytes.data(),
-                               insn.raw_bytes.size(), &obj)) {
-            line.append(obj);
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (std::strncmp(a, "--format=", 9) == 0) {
+            opts->format = a + 9;
+        } else if (std::strcmp(a, "--legacy") == 0) {
+            opts->format = "legacy";
+        } else if (std::strcmp(a, "--templates-only") == 0) {
+            opts->templates_only = true;
+        } else if (std::strcmp(a, "--objdump") == 0) {
+            opts->show_objdump = true;
+        } else if (std::strcmp(a, "--show-deps") == 0) {
+            opts->show_deps = true;
+        } else if (std::strncmp(a, "--max=", 6) == 0) {
+            opts->max_entries = std::strtoull(a + 6, nullptr, 10);
+        } else if (std::strcmp(a, "--max") == 0 && i + 1 < argc) {
+            opts->max_entries = std::strtoull(argv[++i], nullptr, 10);
+        } else if (a[0] == '-') {
+            return 2;
         } else {
-            line.append("(undecoded)");
+            opts->trace_path = a;
         }
-        append_pad_to(&line, obj_start + 40);
-        line.append("| ");
     }
+    if (!opts->trace_path) return 2;
+    if (opts->templates_only && std::strcmp(opts->format, "legacy") == 0) {
+        std::fprintf(stderr,
+            "cst_decode: --templates-only is incompatible with "
+            "--format=legacy\n");
+        return 2;
+    }
+    return 0;
+}
 
-    /* Mnemonic.  For branch opcodes we substitute a branch-flavoured
-     * mnemonic (jmp / jcc / jmpr / ret / syscall) drawn from the
-     * trace's own branch_type encoding map so the per-line annotation
-     * doesn't have to repeat `br=...`.  Other opcodes use the
-     * pre-built mnemonic table directly. */
-    size_t mnem_start = line.size();
-    if (branch_is_none(*ctx.h, insn.branch_type)) {
-        append_mnem(&line, ctx, insn.opcode);
-    } else if (const char *m =
-                   branch_mnem_from_name(branch_name_lookup(*ctx.h,
-                                                            insn.branch_type))) {
-        line.append(m);
+/* Open Capstone for the trace's ISA when --objdump is set; returns
+ * nullptr when objdump wasn't requested or the ISA is unsupported.
+ * @od is provided as backing storage by the caller. */
+ObjdumpRenderer *open_objdump_renderer(ObjdumpRenderer *od,
+                                       const Options &opts,
+                                       const cst::Header &h)
+{
+    if (!opts.show_objdump) return nullptr;
+    if (od->open(h.isa)) return od;
+    std::fprintf(stderr,
+        "cst_decode: --objdump unsupported for ISA=%u; "
+        "continuing without the objdump column\n", (unsigned)h.isa);
+    return nullptr;
+}
+
+/* Walk the body section of @cf and dispatch to the requested
+ * renderer.  Returns 0 on success, 2 on bad format string. */
+int run_body_render(const Options &opts, const cst::Header &h,
+                    cst::CstFile &cf,
+                    const std::vector<cst::Template> &templates,
+                    const std::unordered_map<uint32_t, size_t> &by_id,
+                    const ObjdumpRenderer *odp)
+{
+    auto body_stream = cst::body_stream_open(cf);
+    cst::BodyWalker walker(h, templates, by_id, body_stream->reader());
+    walker.set_max_entries(opts.max_entries);
+
+    if (std::strcmp(opts.format, "legacy") == 0) {
+        render_legacy(stdout, h, templates, by_id, walker);
+    } else if (std::strcmp(opts.format, "disasm") == 0) {
+        render_disasm(stdout, h, templates, by_id, walker, odp,
+                      opts.show_deps);
     } else {
-        append_mnem(&line, ctx, insn.opcode);
-    }
-    append_pad_to(&line, mnem_start + 8);
-
-    /* Operands.  Order: imm, srcs, '->', dsts (with regdata in []). */
-    bool first = true;
-    auto sep = [&]() {
-        if (!first) line.append(", ");
-        first = false;
-    };
-    if (insn.has_immediate) {
-        sep();
-        line.append("$0x");
-        append_hex(&line, (uint64_t)insn.immediate);
-    }
-    for (size_t k = 0; k < insn.src_regs.size(); k++) {
-        sep();
-        append_regref(&line, ctx, insn.src_regs[k]);
-    }
-    /* Dst section.  Skipped entirely when there are no dst regs, so
-     * NOPs and stores stay clean. */
-    if (!insn.dst_regs.empty()) {
-        if (!first) line.append(" -> ");
-        for (size_t k = 0; k < insn.dst_regs.size(); k++) {
-            if (k) line.append(", ");
-            append_regref(&line, ctx, insn.dst_regs[k]);
-            /* Find the matching reg_snap for this dst slot.  reg_snaps
-             * are in template-walk order, so the operand_index lines
-             * up with k. */
-            for (const auto &r : insn.reg_snaps) {
-                if (r.operand_index == (uint8_t)k) {
-                    line.append("[");
-                    append_wide_hex(&line, r.value);
-                    line.append("]");
-                    break;
-                }
-            }
-        }
-        first = false;
-    }
-    /* FID_METAFLAGS side-channel: rendered as %mflags[ZNCVP] after the
-     * dst section for any insn whose template writes the integer-flags
-     * register.  Pulled from the per-entry metaflags vector populated
-     * by the body walker. */
-    for (const auto &mf : insn.metaflags) {
-        if (first) {
-            line.append(" ");
-            first = false;
-        } else {
-            line.append(", ");
-        }
-        line.append("%mflags[");
-        append_metaflags_bits(&line, ctx.h->ids, mf.byte);
-        line.append("]");
-        break;
+        std::fprintf(stderr, "cst_decode: unknown format '%s'\n",
+                     opts.format);
+        return 2;
     }
 
-    /* Memory operands rendered inline as ld(addr)=val / st(addr)=val
-     * after the dst section (or after operands if no dst).  When
-     * memdata is enabled in the trace we ALWAYS print the =value, even
-     * when it happens to be zero — otherwise the absence of an `=` is
-     * ambiguous between "memdata wasn't captured" and "the loaded /
-     * stored value was zero". */
-    for (const auto &dp : insn.dyn_params) {
-        line.append(dp.type == cst::DynParam::Load ? "  ld(0x" : "  st(0x");
-        append_hex(&line, dp.addr);
-        line.push_back(')');
-        if (ctx.h->has_mem_data()) {
-            line.push_back('=');
-            append_wide_hex(&line, dp.data);
-        }
-    }
-
-    /* Branch annotations: target PC and symbol when known. */
-    if (!branch_is_none(*ctx.h, insn.branch_type)) {
-        if (insn.branch_target_template) {
-            line.append("  # 0x");
-            append_hex(&line, insn.branch_target_template->start_pc);
-            if (!insn.branch_target_template->symbol_name.empty()) {
-                line.append(" <");
-                line.append(insn.branch_target_template->symbol_name);
-                line.push_back('>');
-            }
-        }
-    }
-
-    /* Trailing metadata.  thread / bb / wp markers are already on
-     * the BB header line just above this group of insns, so we don't
-     * repeat them per-instruction.  The remaining items are flavours
-     * that aren't otherwise visible from the bytes/operands: sync
-     * hints (rare) and per-WP fault / translation-unavailable status
-     * (only meaningful for the WP-side entries that carry it). */
-    bool wrote_meta = false;
-    auto begin_meta = [&]() {
-        if (!wrote_meta) { line.append("  ; "); wrote_meta = true; }
-        else             { line.push_back(' '); }
-    };
-    if (wp_status && *wp_status) {
-        begin_meta();
-        line.append(wp_status);
-    }
-    if (insn.sync_hint != 0) {
-        begin_meta();
-        line.append("sync=");
-        line.append(enum_or(ctx.h->maps.sync_hint, insn.sync_hint, "SYNC"));
-    }
-    /* Intra-instruction dependency masks live on the template (they
-     * describe the canonical insn shape, not the per-instance data).
-     * Look them up via Instruction::bb_template when --show-deps. */
-    if (ctx.show_deps && insn.bb_template &&
-        insn.insn_index_in_bb < insn.bb_template->insns.size() &&
-        insn.bb_template->insns[insn.insn_index_in_bb].has_reg_deps) {
-        const cst::InsnTemplate &it =
-            insn.bb_template->insns[insn.insn_index_in_bb];
-        unsigned n_src = (unsigned)it.src_regs.size();
-        /* The template's n_loads is the static load count baseline;
-         * the wire format always writes 0 here so we approximate by
-         * scanning the highest "load" bit any mask sets.  Good enough
-         * for human-readable comment; the bit layout itself is
-         * unambiguous so no information is lost. */
-        unsigned n_loads = 0;
-        auto note_loads = [&](uint32_t m) {
-            for (unsigned b = n_src; b < 32; b++) {
-                if (m & (1u << b)) {
-                    unsigned k = b - n_src + 1;
-                    if (k > n_loads) n_loads = k;
-                }
-            }
-        };
-        for (auto m : it.dst_dep_mask) note_loads(m);
-        for (auto m : it.store_data_dep_mask) note_loads(m);
-        auto fmt_mask = [&](std::string *o, uint32_t m) {
-            o->push_back('[');
-            bool first = true;
-            for (unsigned i = 0; i < n_src; i++) {
-                if (m & (1u << i)) {
-                    if (!first) o->push_back(',');
-                    o->append("s");
-                    o->append(std::to_string(i));
-                    first = false;
-                }
-            }
-            for (unsigned i = 0; i < n_loads; i++) {
-                if (m & (1u << (n_src + i))) {
-                    if (!first) o->push_back(',');
-                    o->append("ld");
-                    o->append(std::to_string(i));
-                    first = false;
-                }
-            }
-            if (m & (1u << (n_src + n_loads))) {
-                if (!first) o->push_back(',');
-                o->append("imm");
-                first = false;
-            }
-            o->push_back(']');
-        };
-        begin_meta();
-        line.append("deps:");
-        for (size_t d = 0; d < it.dst_dep_mask.size(); d++) {
-            line.append(" d");
-            line.append(std::to_string(d));
-            line.append("=");
-            fmt_mask(&line, it.dst_dep_mask[d]);
-        }
-        for (size_t s = 0; s < it.store_data_dep_mask.size(); s++) {
-            line.append(" st");
-            line.append(std::to_string(s));
-            line.append("=");
-            fmt_mask(&line, it.store_data_dep_mask[s]);
-        }
-    }
-    line.push_back('\n');
-    std::fwrite(line.data(), 1, line.size(), out);
+    /* finalize() reads + verifies the trailing magic.  Skip it when
+     * --max stopped us early — the trailing magic isn't reachable. */
+    bool stopped_early =
+        opts.max_entries != 0 &&
+        walker.stats().cp_entries >= opts.max_entries;
+    if (!stopped_early) body_stream->finalize();
+    return 0;
 }
 
-/*
- * Templates-only renderer (--templates-only flag).  Walks every
- * template, dedupes by PC, sorts ascending, and emits one insn line
- * per unique PC — exactly the shape `objdump -d` produces over a
- * binary's text section.  Symbol-rooted templates (those whose
- * start_pc is the entry of a named function) emit a
- * `<pc> <symbol>:` header above their first insn, mirroring
- * objdump's section markers.  Non-symbolic BBs do not emit any
- * synthetic delimiter.
- *
- * When @od is non-null the per-insn text is Capstone's native
- * disasm of the raw bytes; otherwise it's our generic view
- * (mnemonic, src/dst regs, branch flavour).  Templates carry no
- * run-time observation, so no regdata / memdata appears here.
- */
-void render_templates_only(FILE *out, const cst::Header &h,
-                           const std::vector<cst::Template> &templates,
-                           const std::unordered_map<uint32_t, size_t> &by_id,
-                           const ObjdumpRenderer *od)
+int run(const Options &opts)
 {
-    DisasmTables dt;
-    disasm_tables_build(&dt, h);
+    /* Outer .cst is a ustar archive holding two members
+     * (body.cst[.<codec>] + header.cst[.<codec>]).  cst_file_open
+     * walks the tar, dispatches decompression per member suffix,
+     * and returns a CstFile carrying the two byte ranges. */
+    std::unique_ptr<cst::CstFile> cf = cst::cst_file_open(opts.trace_path);
 
-    std::fprintf(out, "\n%s:     file format trace template map\n",
-                 !h.target_name.empty() ? h.target_name.c_str()
-                                        : isa_name(h.isa));
-    std::fprintf(out, "; version=0x%08X templates=%zu%s\n\n",
-                 h.magic, templates.size(),
-                 od ? " objdump_disasm=on" : "");
+    std::vector<cst::Template> templates;
+    std::unordered_map<uint32_t, size_t> by_id;
+    cst::Header h = cst::parse_header(cf->header(), &templates, &by_id);
 
-    /* Index every distinct PC across all templates.  Different
-     * templates can cover overlapping PC ranges (a true BB and one
-     * of its prefixes both reaching the same later insn), so we
-     * dedupe on PC.  The first sighting of each PC wins, which
-     * is fine because the bytes are identical anyway. */
-    struct Entry {
-        uint64_t pc;
-        const cst::InsnTemplate *insn;
-    };
-    std::vector<Entry> entries;
-    std::unordered_map<uint64_t, std::string> symbol_at;
-    entries.reserve(templates.size() * 4);
-    for (const cst::Template &t : templates) {
-        if (!t.symbol_name.empty()) {
-            symbol_at[t.start_pc] = t.symbol_name;
-        }
-        for (const cst::InsnTemplate &I : t.insns) {
-            entries.push_back({I.pc, &I});
-        }
+    ObjdumpRenderer od;
+    ObjdumpRenderer *odp = open_objdump_renderer(&od, opts, h);
+
+    if (opts.templates_only) {
+        /* No body access at all — no decompressor spawned, no body
+         * bytes read off disk.  Cheap even on huge traces. */
+        render_templates_only(stdout, h, templates, by_id, odp);
+        return 0;
     }
-    std::sort(entries.begin(), entries.end(),
-              [](const Entry &a, const Entry &b) { return a.pc < b.pc; });
-    /* Dedupe consecutive same-PC entries. */
-    entries.erase(std::unique(entries.begin(), entries.end(),
-                              [](const Entry &a, const Entry &b) {
-                                  return a.pc == b.pc;
-                              }),
-                  entries.end());
-
-    std::string line;
-    for (const Entry &e : entries) {
-        const cst::InsnTemplate &I = *e.insn;
-
-        /* Symbol header before the first insn of a named function. */
-        auto sit = symbol_at.find(I.pc);
-        if (sit != symbol_at.end()) {
-            line.clear();
-            append_hex_padded(&line, I.pc, 16);
-            line.append(" <");
-            line.append(sit->second);
-            line.append(">:\n");
-            std::fwrite(line.data(), 1, line.size(), out);
-        }
-
-        line.clear();
-        /* Address column: 2-space indent, 16-char zero-padded hex,
-         * colon, 2-space gap.  Spaces (not tab) so visual alignment
-         * is independent of terminal tab width. */
-        line.append("  ");
-        append_hex_padded(&line, I.pc, 16);
-        line.append(":  ");
-
-        /* Bytes column: each byte 2 hex chars + space, padded to a
-         * fixed width so the next column lines up regardless of
-         * how many bytes a particular insn encoded to. */
-        size_t bytes_start = line.size();
-        for (size_t b = 0; b < I.raw_bytes.size(); b++) {
-            if (b) line.push_back(' ');
-            append_byte_hex(&line, I.raw_bytes[b]);
-        }
-        append_pad_to(&line, bytes_start + 16 * 3);
-        line.append("  ");
-
-        /* When --objdump is set, emit Capstone's native disasm in the
-         * left column then a `| ` separator before our generic view.
-         * Both columns share the bytes column above; Capstone shows
-         * what objdump itself would, our view shows the generic IR
-         * the trace records.  Without --objdump only the generic
-         * view is emitted. */
-        if (od) {
-            size_t obj_start = line.size();
-            std::string obj;
-            if (od->render_one(I.pc, I.raw_bytes.data(),
-                               I.raw_bytes.size(), &obj)) {
-                line.append(obj);
-            } else {
-                line.append("(undecoded)");
-            }
-            append_pad_to(&line, obj_start + 40);
-            line.append("| ");
-        }
-
-        /* Generic-view mnemonic + operands (no regdata in templates-
-         * only; templates carry no run-time observation). */
-        size_t mnem_start = line.size();
-        if (branch_is_none(h, I.branch_type)) {
-            const std::string *p = table_lookup(dt.opcode, I.opcode);
-            if (p) line.append(*p);
-            else line.append("op");
-        } else if (const char *m =
-                       branch_mnem_from_name(branch_name_lookup(h,
-                                                                I.branch_type))) {
-            line.append(m);
-        } else {
-            line.append("br");
-        }
-        append_pad_to(&line, mnem_start + 8);
-
-        bool first = true;
-        if (I.has_imm) {
-            if (!first) line.append(", ");
-            line.append("$0x");
-            append_hex(&line, (uint64_t)I.imm);
-            first = false;
-        }
-        for (size_t k = 0; k < I.src_regs.size(); k++) {
-            if (!first) line.append(", ");
-            const std::string *p = table_lookup(dt.reg, I.src_regs[k]);
-            if (p) line.append(*p);
-            else line.append("%r?");
-            first = false;
-        }
-        if (!I.dst_regs.empty()) {
-            if (!first) line.append(" -> ");
-            for (size_t k = 0; k < I.dst_regs.size(); k++) {
-                if (k) line.append(", ");
-                const std::string *p = table_lookup(dt.reg, I.dst_regs[k]);
-                if (p) line.append(*p);
-                else line.append("%r?");
-            }
-        }
-
-        line.push_back('\n');
-        std::fwrite(line.data(), 1, line.size(), out);
-    }
-}
-
-void render_disasm(FILE *out, const cst::Header &h,
-                   const std::vector<cst::Template> &templates,
-                   const std::unordered_map<uint32_t, size_t> &by_id,
-                   cst::BodyWalker &body,
-                   const ObjdumpRenderer *od,
-                   bool show_deps)
-{
-    DisasmTables dt;
-    disasm_tables_build(&dt, h);
-    DisasmContext ctx{&h, &by_id, &templates, &dt, od, show_deps};
-
-    /* One-shot header summary (everything a grepper might want
-     * before the per-insn lines).  Kept parseable: `; KEY=value`
-     * pairs.  No leading blank lines so the first `0x` line
-     * starts at the file head modulo the comment block. */
-    std::fprintf(out, "; cst_decode disassembly\n");
-    std::fprintf(out, "; version=0x%08X\n", h.magic);
-    std::fprintf(out, "; isa=%s\n",
-                 !h.target_name.empty() ? h.target_name.c_str()
-                                        : isa_name(h.isa));
-    std::fprintf(out, "; command=%s\n", h.command.c_str());
-    std::fprintf(out, "; datetime=%s\n", h.datetime.c_str());
-    std::fprintf(out, "; flags=%s%s\n",
-                 h.has_mem_data() ? "MEM_DATA " : "",
-                 h.has_reg_data() ? "REG_DATA"  : "");
-    std::fprintf(out, "; start_insn=%llu warmup_insns=%llu total_target_insns=%llu\n",
-                 (unsigned long long)h.start_insn,
-                 (unsigned long long)h.warmup_insns,
-                 (unsigned long long)h.total_target_insns);
-    std::fprintf(out, "; templates=%zu\n", templates.size());
-    std::fprintf(out, "\n");
-
-    body.walk([&](const cst::DecodedEntry &e) {
-        auto it = by_id.find(e.template_id);
-        if (it == by_id.end()) {
-            std::fprintf(out, "; ----- BB %u (template not found) -----\n",
-                         e.template_id);
-            return;
-        }
-        const cst::Template &t = templates[it->second];
-
-        /* Separator line: makes BB boundaries trivial to grep
-         * (`grep '^; ----- BB '`) and groups the per-insn lines in
-         * the file. */
-        std::fprintf(out,
-                     "; ----- BB %u entry pc=0x%" PRIx64
-                     " insns=%zu seq=%u tid=%u%s -----\n",
-                     e.template_id, t.start_pc, t.insns.size(),
-                     e.seq_num, e.thread_id,
-                     e.thread_switched ? " (thread_switch)" : "");
-
-        /* Fan the DecodedEntry out into per-instruction containers.
-         * The builder handles CP-then-WP order, per-insn filtering of
-         * dyn_params / reg_snaps / metaflags, and resolves direct
-         * branch targets — so this loop only has to inject the
-         * per-WP-run separator line. */
-        std::vector<cst::Instruction> insns =
-            cst::instructions_from_entry(e, h, templates, by_id);
-
-        /* Override the CP-final branch target with the BB's
-         * fall_through_pc when no immediate-based target resolved.
-         * The fall-through PC carries the next BB for unconditional
-         * branches we couldn't statically resolve; mirrors the
-         * legacy renderer's behavior. */
-        const cst::Template *cp_branch_target = nullptr;
-        if (!t.insns.empty() && t.fall_through_pc) {
-            auto fit = std::find_if(templates.begin(), templates.end(),
-                [&](const cst::Template &x) { return x.start_pc == t.fall_through_pc; });
-            if (fit != templates.end()) cp_branch_target = &*fit;
-        }
-
-        int  cur_wp_run = -1;     /* -1 = CP, otherwise WPEntry::index */
-        std::string wp_status;
-        for (size_t i = 0; i < insns.size(); i++) {
-            cst::Instruction &insn = insns[i];
-
-            if (!insn.is_wp) {
-                /* CP final-insn branch fallback (see comment above). */
-                bool is_cp_final =
-                    (i + 1 == insns.size() || insns[i + 1].is_wp);
-                if (is_cp_final && !insn.branch_target_template) {
-                    insn.branch_target_template = cp_branch_target;
-                }
-                render_disasm_insn(out, ctx, insn, /* wp_status= */ nullptr);
-                continue;
-            }
-
-            /* New WP run: emit the chain separator, recompute status
-             * and the run-final branch fallback (= next WP run's BB
-             * start, if any). */
-            if ((int)insn.wp_index != cur_wp_run) {
-                cur_wp_run = (int)insn.wp_index;
-                /* n_insns for this run = count of contiguous insns
-                 * sharing the same wp_index. */
-                size_t run_end = i;
-                while (run_end < insns.size() && insns[run_end].is_wp &&
-                       (int)insns[run_end].wp_index == cur_wp_run) {
-                    run_end++;
-                }
-                size_t run_n = run_end - i;
-
-                wp_status.clear();
-                if (insn.wp_fault) {
-                    if (insn.wp_has_fault_idx) {
-                        char b[32];
-                        std::snprintf(b, sizeof(b), "FAULT@insn%u",
-                                      insn.wp_fault_insn_index);
-                        wp_status = b;
-                    } else {
-                        wp_status = "FAULT";
-                    }
-                }
-                if (insn.wp_translation_unavail) {
-                    if (!wp_status.empty()) wp_status += ",";
-                    wp_status += "TRANSLATION_UNAVAILABLE";
-                }
-                std::fprintf(out,
-                             "; ..... wp[%u] BB %u n_insns=%zu%s%s -----\n",
-                             (unsigned)insn.wp_index, insn.bb_template_id,
-                             run_n,
-                             wp_status.empty() ? "" : " status=",
-                             wp_status.c_str());
-            }
-
-            /* WP-run final-insn branch fallback: next WP run's BB
-             * start, if any. */
-            bool is_run_final =
-                (i + 1 == insns.size() ||
-                 !insns[i + 1].is_wp ||
-                 (int)insns[i + 1].wp_index != cur_wp_run);
-            if (is_run_final && !insn.branch_target_template) {
-                /* Find the next WP run's first instruction. */
-                for (size_t j = i + 1; j < insns.size(); j++) {
-                    if (insns[j].is_wp &&
-                        (int)insns[j].wp_index != cur_wp_run) {
-                        auto nit = by_id.find(insns[j].bb_template_id);
-                        if (nit != by_id.end()) {
-                            insn.branch_target_template =
-                                &templates[nit->second];
-                        }
-                        break;
-                    }
-                }
-            }
-
-            render_disasm_insn(out, ctx, insn,
-                               wp_status.empty() ? nullptr
-                                                 : wp_status.c_str());
-        }
-    });
+    return run_body_render(opts, h, *cf, templates, by_id, odp);
 }
 
 }  /* namespace */
 
 int main(int argc, char **argv)
 {
-    const char *trace_path = nullptr;
-    const char *format = "disasm";
-    bool templates_only = false;
-    bool show_objdump   = false;
-    bool show_deps      = false;
-    uint64_t max_entries = 0;            /* 0 = unbounded */
-
-    auto usage = [&]() {
-        std::fprintf(stderr,
-            "usage: %s [--format=disasm|legacy] [--templates-only] "
-            "[--objdump] [--show-deps] [--max N] <trace.cst>\n"
-            "  --templates-only  print only the template dictionary,\n"
-            "                    skip the body delta-replay\n"
-            "  --objdump         emit Capstone-rendered native disasm\n"
-            "                    of each insn alongside the generic view\n"
-            "  --show-deps       append intra-instruction dep masks as a\n"
-            "                    trailing `; deps: d0=[s0,ld0] ...` comment\n"
-            "                    when the template carries them\n"
-            "  --max N           stop after N body entries (tears the\n"
-            "                    decompressor subprocess down early)\n",
-            argv[0]);
-    };
-
-    for (int i = 1; i < argc; i++) {
-        if (std::strncmp(argv[i], "--format=", 9) == 0) {
-            format = argv[i] + 9;
-        } else if (std::strcmp(argv[i], "--legacy") == 0) {
-            format = "legacy";
-        } else if (std::strcmp(argv[i], "--templates-only") == 0) {
-            templates_only = true;
-        } else if (std::strcmp(argv[i], "--objdump") == 0) {
-            show_objdump = true;
-        } else if (std::strcmp(argv[i], "--show-deps") == 0) {
-            show_deps = true;
-        } else if (std::strncmp(argv[i], "--max=", 6) == 0) {
-            max_entries = std::strtoull(argv[i] + 6, nullptr, 10);
-        } else if (std::strcmp(argv[i], "--max") == 0 && i + 1 < argc) {
-            max_entries = std::strtoull(argv[++i], nullptr, 10);
-        } else if (argv[i][0] == '-') {
-            usage();
-            return 2;
-        } else {
-            trace_path = argv[i];
-        }
-    }
-    if (!trace_path) {
-        usage();
+    Options opts;
+    if (parse_options(argc, argv, &opts) != 0) {
+        print_usage(stderr, argv[0]);
         return 2;
     }
-    if (templates_only && std::strcmp(format, "legacy") == 0) {
-        std::fprintf(stderr,
-            "cst_decode: --templates-only is incompatible with "
-            "--format=legacy\n");
-        return 2;
-    }
-
     try {
-        /* Outer .cst is a ustar archive holding two members
-         * (body.cst[.<codec>] + header.cst[.<codec>]).  cst_file_
-         * open walks the tar, dispatches decompression per member
-         * suffix, and returns a CstFile carrying the two byte
-         * ranges. */
-        std::unique_ptr<cst::CstFile> cf = cst::cst_file_open(trace_path);
-
-        std::vector<cst::Template> templates;
-        std::unordered_map<uint32_t, size_t> by_id;
-        cst::Header h = cst::parse_header(cf->header(), &templates, &by_id);
-
-        /* Optional Capstone-backed objdump column.  Open once per
-         * invocation; the per-line render call reuses the handle. */
-        ObjdumpRenderer od;
-        ObjdumpRenderer *odp = nullptr;
-        if (show_objdump) {
-            if (od.open(h.isa)) {
-                odp = &od;
-            } else {
-                std::fprintf(stderr,
-                    "cst_decode: --objdump unsupported for ISA=%u; "
-                    "continuing without the objdump column\n",
-                    (unsigned)h.isa);
-            }
-        }
-
-        if (templates_only) {
-            /* No body access at all — no decompressor spawned, no
-             * body bytes read off disk.  Cheap even on huge traces. */
-            render_templates_only(stdout, h, templates, by_id, odp);
-        } else {
-            /* Open the body as a streaming Reader.  For compressed
-             * bodies this forks the decompressor; uncompressed
-             * bodies wrap the mmap directly.  Leading CST_MAGIC is
-             * stripped at open(); trailing CST_MAGIC is verified by
-             * finalize() (skipped on --max early exit, where the
-             * subprocess is torn down by BodyStream's destructor). */
-            auto body_stream = cst::body_stream_open(*cf);
-            cst::BodyWalker walker(h, templates, by_id,
-                                   body_stream->reader());
-            walker.set_max_entries(max_entries);
-            if (std::strcmp(format, "legacy") == 0) {
-                render_legacy(stdout, h, templates, by_id, walker);
-            } else if (std::strcmp(format, "disasm") == 0) {
-                render_disasm(stdout, h, templates, by_id, walker, odp,
-                              show_deps);
-            } else {
-                std::fprintf(stderr,
-                             "cst_decode: unknown format '%s'\n", format);
-                return 2;
-            }
-            /* finalize() reads + verifies the trailing magic.  Skip
-             * it if we stopped early — the body wasn't fully drained
-             * and the trailing magic isn't reachable. */
-            if (max_entries == 0 ||
-                walker.stats().cp_entries < max_entries) {
-                body_stream->finalize();
-            }
-        }
+        return run(opts);
     } catch (const std::exception &e) {
         std::fprintf(stderr, "cst_decode: %s\n", e.what());
         return 1;
     }
-    return 0;
 }

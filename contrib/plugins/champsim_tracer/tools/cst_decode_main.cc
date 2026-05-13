@@ -44,10 +44,14 @@
 #include <string>
 #include <vector>
 
-#include <capstone/capstone.h>
-
 #include "cst_decode.h"
 #include "cst_format.h"
+#include "cst_objdump.h"
+
+/* Pull ObjdumpRenderer into the anonymous namespace below so its
+ * unqualified name works in the rest of this file — the class itself
+ * lives in cst::ObjdumpRenderer (cst_objdump.h). */
+namespace { using cst::ObjdumpRenderer; }
 
 namespace {
 
@@ -373,65 +377,15 @@ inline const std::string *table_lookup(const std::vector<std::string> &t,
 }
 
 /* ====================================================================
- * §7  Capstone wrapper  (one cs_handle per cst_decode invocation;
- *     reused for every per-insn render_one call)
+ * §7  Capstone wrapper
+ *
+ * The ObjdumpRenderer class itself lives in cst_objdump.{h,cc} — see
+ * those files for the implementation.  We pulled it out so that a
+ * downstream consumer who lifts cst_decode for their own simulator
+ * can drop cst_objdump.cc onto the build without -DCST_HAVE_CAPSTONE
+ * and skip the capstone link dependency entirely; --objdump just
+ * becomes a no-op at run time.
  * ==================================================================== */
-
-class ObjdumpRenderer {
-public:
-    ObjdumpRenderer() = default;
-    ~ObjdumpRenderer() { if (open_) cs_close(&handle_); }
-
-    /* Open Capstone for @trace_isa (1=x86_64, 2=aarch64, 3=riscv64,
-     * 4=mipsel).  Returns false for unsupported ISAs — caller suppresses
-     * the objdump column. */
-    bool open(uint8_t trace_isa) {
-        cs_arch arch;
-        cs_mode mode;
-        switch (trace_isa) {
-        case 1: arch = CS_ARCH_X86;     mode = CS_MODE_64;            break;
-        case 2: arch = CS_ARCH_AARCH64; mode = CS_MODE_LITTLE_ENDIAN; break;
-        case 3: arch = CS_ARCH_RISCV;   mode = CS_MODE_RISCV64;       break;
-        case 4: arch = CS_ARCH_MIPS;
-                mode = (cs_mode)(CS_MODE_MIPS64 | CS_MODE_LITTLE_ENDIAN); break;
-        default: return false;
-        }
-        if (cs_open(arch, mode, &handle_) != CS_ERR_OK) return false;
-        cs_option(handle_, CS_OPT_SYNTAX, CS_OPT_SYNTAX_ATT);
-        open_ = true;
-        return true;
-    }
-
-    /* Disassemble one instruction at @pc from @bytes (length @n_bytes).
-     * Writes "mnem  ops" into @out.  Mnemonic padded to MNEM_COL chars
-     * so the operand column lines up across insns. */
-    bool render_one(uint64_t pc, const uint8_t *bytes, size_t n_bytes,
-                    std::string *out) const {
-        if (!open_ || !bytes || n_bytes == 0) return false;
-        cs_insn *insn = cs_malloc(handle_);
-        if (!insn) return false;
-        const uint8_t *code = bytes;
-        size_t size = n_bytes;
-        uint64_t addr = pc;
-        bool ok = cs_disasm_iter(handle_, &code, &size, &addr, insn);
-        if (ok) {
-            constexpr size_t MNEM_COL = 8;
-            size_t before = out->size();
-            out->append(insn->mnemonic);
-            while (out->size() - before < MNEM_COL) out->push_back(' ');
-            if (insn->op_str[0]) {
-                out->push_back(' ');
-                out->append(insn->op_str);
-            }
-        }
-        cs_free(insn, 1);
-        return ok;
-    }
-
-private:
-    csh  handle_ = 0;
-    bool open_   = false;
-};
 
 /* ====================================================================
  * §8  Disasm renderer

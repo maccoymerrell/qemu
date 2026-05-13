@@ -95,12 +95,18 @@ if get_option('plugins')
   # which can resolve to a system pkg-config copy whose layout differs.
   # Sticking with the subproject keeps cst_decode reproducible across
   # hosts and matches the same Capstone build the plugin links against.
+  #
+  # The capstone integration lives in cst_objdump.cc; CST_HAVE_CAPSTONE
+  # toggles between the real backend (this build) and a no-op stub
+  # (used by downstream consumers who lift the decoder into their own
+  # tooling without a capstone dependency).
   cst_capstone_dep = subproject('capstone', required: true) \
                          .get_variable('capstone_dep')
   t += executable(
     'cst_decode',
-    files('champsim_tracer/tools/cst_decode_main.cc'),
-    cpp_args: cst_tools_cpp_args,
+    files('champsim_tracer/tools/cst_decode_main.cc',
+          'champsim_tracer/tools/cst_objdump.cc'),
+    cpp_args: cst_tools_cpp_args + ['-DCST_HAVE_CAPSTONE=1'],
     link_with: cst_tools_common,
     dependencies: [cst_capstone_dep],
     install: false)

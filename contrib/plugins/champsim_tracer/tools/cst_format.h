@@ -11,6 +11,31 @@
  * holds a decompressed copy.  The two MemberView byte ranges remain
  * valid as long as the owning CstFile does.
  *
+ * ===== Portability / embedding =====
+ *
+ * This header is part of the "rippable bundle" documented in
+ * cst_decode.h.  cst_format.cc bundles three layers:
+ *
+ *   - Pure-byte parsers (parse_header, parse_templates, ustar
+ *     walking, name lookups) — no I/O, no syscalls.  Portable.
+ *
+ *   - .cst container open (CstFile / cst_file_open) — uses POSIX
+ *     mmap to project the on-disk archive into memory.
+ *
+ *   - Decompressor subprocess (ChildProcessSource, used by
+ *     body_stream_open when the body member carries a codec suffix)
+ *     — uses fork / pipe / wait, plus an execlp() of the codec
+ *     binary on $PATH (`zstd -d -c`, `xz -d -c`, `gzip -d -c`,
+ *     `bzip2 -d -c`, `lz4 -d -c`).
+ *
+ * Downstream consumers on POSIX hosts get the entire stack
+ * (including transparent decompression of zstd/xz/gzip/bzip2/lz4
+ * bodies) by just dropping this file onto their build.  Consumers
+ * who want to provide their own I/O can construct a cst::Reader
+ * over their byte source directly and bypass cst_file_open /
+ * body_stream_open entirely; parse_header takes a MemberView (a
+ * plain (data, size) pair), and BodyWalker takes a Reader.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 

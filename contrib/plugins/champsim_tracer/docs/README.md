@@ -40,7 +40,9 @@ unconfigured.
   wire-format spec) so it reads as a Sphinx page.
 * `reference.rst` — symbolic ID tables (generic opcodes, branch
   types, registers, sync events, field IDs, ISA codes).
-* `decoder.rst` — Python decoder library and `cst_audit.py` CLI.
+* `decoder.rst` — `cst_decode` (objdump-style and legacy text dumps)
+  and `cst_audit` (byte-budget breakdown).  Both are C++ binaries
+  built alongside the plugin.
 
 ## Hosting
 

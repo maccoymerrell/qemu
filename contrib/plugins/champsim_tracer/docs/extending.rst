@@ -164,8 +164,16 @@ trap-style branch that you want to model differently from a syscall.
    this step results in WP simulation skipping branches of the new
    type (no harm, but no coverage).
 
-5. **Add the name to the decoder's ``BRANCH_NAMES`` dict** in
-   ``champsim_tracer_decode.py`` for back-compat with old traces.
+5. **Verify decoders still surface the new type.**  The writer stamps
+   the symbolic name into the trace's ``branch_type`` encoding map
+   (see :doc:`/format` *Part I, Step 3*), and the C++ ``cst_decode``
+   looks branch types up by string at decode time — so a new branch
+   id auto-flows through to the decoded view without a tools-side
+   rebuild for the wire format itself.  If the new type should also
+   render with a short objdump-style mnemonic (``jmp`` / ``jcc`` /
+   ``rep`` / ...), add a row to ``branch_mnem_from_name`` in
+   ``contrib/plugins/champsim_tracer/tools/cst_decode_main.cc`` —
+   otherwise the renderer falls back to a generic ``br`` annotation.
 
 Per-branch-type counters and the histogram tables are sized by
 ``BRANCH_TYPE_COUNT``, so they pick up the new entry automatically.
@@ -240,10 +248,10 @@ Verifying changes
 
 After any of the above, two scripts give you fast confidence:
 
-* ``cst_audit.py`` decodes a sample trace and verifies every section's
-  byte budget rolls up to the file size.  A field-format mistake shows
-  up either as a decode error or as the "section overhead" line going
-  wildly negative.
+* ``build/contrib/plugins/cst_audit`` decodes a sample trace and
+  verifies every section's byte budget rolls up to the file size.
+  A field-format mistake shows up either as a decode error or as the
+  "section overhead" line going wildly negative.
 
 * ``champsim_tracer_mnemonic_audit.py`` walks a sample workload and
   reports any Capstone mnemonic with no ``insn_classification`` row,

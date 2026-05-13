@@ -66,11 +66,14 @@ beyond the wire format's current shape.
 
 **Memory-data values are 512-bit-capped.**  Same width budget; a
 single load/store value is encoded in up to 64 bytes.  ``rep movs``
-and other multi-iteration instructions emit one architectural
-memop per iteration: the first 16 land in the slotted
-``LOAD_ADDR[0..15]`` / ``STORE_ADDR[0..15]`` (and matching ``DATA``
-families), and the rest go into one ``EXTRA_LOAD_ADDR`` /
-``EXTRA_STORE_ADDR`` raw-vector record per insn.
+and other multi-iteration instructions surface one body entry per
+iteration (see the wire-format spec's *REP-prefixed self-loop BBs*
+section), so each entry carries at most 1 load + 1 store — the
+slotted ``LOAD_ADDR[0..15]`` / ``STORE_ADDR[0..15]`` (and matching
+``DATA``) families are sufficient on the CP path.  The
+``EXTRA_LOAD_ADDR`` / ``EXTRA_STORE_ADDR`` raw-vector overflow
+records are reserved for genuinely wide single-instruction memops
+(AVX-512 gather/scatter etc.).
 
 **WP memops capped at 16 per insn.**  ``MemAccessRecorder::record``
 caps WP-side memops at ``CST_FID_SLOT_COUNT == 16`` per

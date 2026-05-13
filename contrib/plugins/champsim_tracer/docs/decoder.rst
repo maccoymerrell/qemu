@@ -54,7 +54,7 @@ Sample, with ``wp=1,memdata=1,regdata=1`` capture flags:
 .. code-block:: text
 
    ; cst_decode disassembly
-   ; version=0x1B545343
+   ; version=0x1C545343
    ; isa=x86_64
    ; command=qemu-x86_64 -seed 42 -plugin libchampsim_tracer.so,outfile=run,...
    ; datetime=2026-05-10 16:11:23

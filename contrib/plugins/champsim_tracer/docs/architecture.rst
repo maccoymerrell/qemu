@@ -471,20 +471,33 @@ sequence" warnings on the next CP commit at the same start_pc; if you
 ever re-introduce mid-stream commits, the warning in
 ``commit_true_bb`` will scream.
 
-*PC-deduplicated x86 string instructions.*  An x86 ``REP MOVS``
-produces N memops at the same ``insn_pc``.  The wire format itself
-handles arbitrary N — slots 0..15 use the ``CST_FID_LOAD_ADDR*`` /
-``CST_FID_STORE_ADDR*`` slotted families and slots 16+ overflow into
-the ``CST_FID_EXTRA_LOAD_ADDR`` / ``CST_FID_EXTRA_STORE_ADDR`` raw
-vectors — so the CP path captures every memop a ``REP`` issues
-regardless of count.  The WP path is more restrictive:
+*REP-prefixed x86 string instructions fan out per iteration.*  An x86
+``REP MOVS`` executes N times against architectural memory.  The
+tracer surfaces each iteration as its own ``BODY_TAG_ENTRY``: iter 1
+stays on the BB that *enters* the REP loop (terminating that BB at
+the REP's PC), and iters 2..N each emit a fresh body entry on a
+1-insn self-loop BB whose start_pc == fall_through_pc == the REP's
+own PC.  See *Part II §5.2 "REP-prefixed self-loop BBs (x86)"* of the
+wire-format spec for the encoding details.
+The REP-self-loop BB's terminating insn carries
+``branch_type = BRANCH_REP`` to alert consumers that the BB is a
+synthetic 1-insn self-loop rather than an ordinary direct conditional
+branch.
+
+CP-side capture is straightforward: each iteration's memops attach to
+that iteration's own body entry (1 load + 1 store on REP MOVS, 1 store
+on REP STOS, etc.), so slotted families ``CST_FID_LOAD_ADDR*`` /
+``CST_FID_STORE_ADDR*`` rarely exceed 0..15 even on long REP runs and
+the ``CST_FID_EXTRA_LOAD_ADDR`` / ``CST_FID_EXTRA_STORE_ADDR`` overflow
+vectors are reserved for genuinely wide single-instruction memops
+(AVX-512 gather/scatter etc.).  The WP path is more restrictive:
 ``MemAccessRecorder::record`` caps WP-side memops at
-``CST_FID_SLOT_COUNT == 16`` per instruction and silently drops
-the rest, because the WP simulator's spec mode can iterate
-``REP`` arbitrarily many times against a sandboxed memory.  The
-matching forward-progress guard inside the WP loop catches the
-related case where spec-mode ``REP`` returns from ``exec_tb``
-without advancing PC and would otherwise spin forever.
+``CST_FID_SLOT_COUNT == 16`` per instruction and silently drops the
+rest, because the WP simulator's spec mode can iterate ``REP``
+arbitrarily many times against a sandboxed memory.  The matching
+forward-progress guard inside the WP loop catches the related case
+where spec-mode ``REP`` returns from ``exec_tb`` without advancing
+PC and would otherwise spin forever.
 
 *atexit ordering inversion.*  QEMU registers its plugin atexit
 callback *before* the plugin shared object's own ``__cxa_atexit``

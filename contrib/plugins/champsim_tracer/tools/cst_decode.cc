@@ -30,37 +30,49 @@ namespace {
  * §1  FieldStateTable storage helpers
  * ==================================================================== */
 
-bool is_extra_vector_fid(const ResolvedIds &ids, uint8_t fid)
-{
-    return fid == ids.fid_extra_load_addr ||
-           fid == ids.fid_extra_store_addr ||
-           fid == ids.fid_extra_load_data ||
-           fid == ids.fid_extra_store_data;
-}
-
 /* Build the fid -> dense slot index map for FieldStateBlock storage.
- * Mirrors the writer's field_state_slot_lut.  EXTRA_* and EXTENDED
- * implicitly return SLOT_INVALID — those fids are handled out-of-band
- * (per-entry vector records / extension stream). */
-void slot_lut_build(const ResolvedIds &ids, std::array<uint8_t, 256> *out)
+ * Mirrors the writer's field_state_slot_lut_build:
+ *
+ *   slot 0:   N_LOADS         (singleton at fid 0..3)
+ *   slot 1:   N_STORES
+ *   slot 2:   METAFLAGS
+ *   slot (3 + 5*k + f):   family f of slot k
+ *                          (LOAD_ADDR / STORE_ADDR / LOAD_DATA /
+ *                           STORE_DATA / DST_REG)
+ *   slot (3 + 5*N + i):   INSN_BYTES_LO + i      (N = FID_SLOT_COUNT)
+ *
+ * Total = 3 + 5*N + 7 = FIELD_STATE_SLOT_COUNT.  EXTENDED has no
+ * persistent cell. */
+void slot_lut_build(const ResolvedIds &ids,
+                    std::array<uint16_t, FID_LUT_SIZE> *out)
 {
     out->fill(FIELD_STATE_SLOT_INVALID);
-    (*out)[ids.fid_n_loads] = 0;
+    (*out)[ids.fid_n_loads]   = 0;
+    (*out)[ids.fid_n_stores]  = 1;
+    (*out)[ids.fid_metaflags] = 2;
+
+    const uint16_t bases[5] = {
+        ids.fid_load_addr_base,
+        ids.fid_store_addr_base,
+        ids.fid_load_data_base,
+        ids.fid_store_data_base,
+        ids.fid_dst_reg_base,
+    };
     for (unsigned k = 0; k < FID_SLOT_COUNT; k++) {
-        (*out)[ids.fid_load_addr_base  + k] = (uint8_t)(1                + k);
-        (*out)[ids.fid_store_addr_base + k] = (uint8_t)(1 + 1*FID_SLOT_COUNT + k);
-        (*out)[ids.fid_load_data_base  + k] = (uint8_t)(1 + 2*FID_SLOT_COUNT + k);
-        (*out)[ids.fid_store_data_base + k] = (uint8_t)(1 + 3*FID_SLOT_COUNT + k);
-        (*out)[ids.fid_dst_reg_base    + k] = (uint8_t)(1 + 4*FID_SLOT_COUNT + k);
+        for (unsigned f = 0; f < 5; f++) {
+            unsigned fid = bases[f] + k * FID_SLOT_STRIDE;
+            if (fid < FID_LUT_SIZE) {
+                (*out)[fid] = (uint16_t)(3 + 5 * k + f);
+            }
+        }
     }
-    (*out)[ids.fid_n_stores] = (uint8_t)(1 + 5*FID_SLOT_COUNT);
+    unsigned slotted_dense_end = 3 + 5 * FID_SLOT_COUNT;
     for (unsigned f = ids.fid_insn_bytes_lo; f <= ids.fid_insn_size; f++) {
-        (*out)[f] = (uint8_t)(2 + 5*FID_SLOT_COUNT +
-                              (f - ids.fid_insn_bytes_lo));
+        if (f < FID_LUT_SIZE) {
+            (*out)[f] = (uint16_t)(slotted_dense_end +
+                                   (f - ids.fid_insn_bytes_lo));
+        }
     }
-    /* METAFLAGS sits immediately after the insn-metadata band. */
-    (*out)[ids.fid_metaflags] = (uint8_t)(2 + 5*FID_SLOT_COUNT +
-        (ids.fid_insn_size - ids.fid_insn_bytes_lo + 1));
 }
 
 /* Grow @blk to hold @n_insns instructions worth of cells.  Idempotent;
@@ -100,7 +112,7 @@ const FieldStateBlock *table_get_block(const FieldStateTable &t,
  * real (writer-set) cell — callers fall through to base_state /
  * template_default when this returns false. */
 bool cell_read(const FieldStateBlock *blk, uint32_t table_gen,
-               uint32_t ipos, uint8_t slot, Wide *out)
+               uint32_t ipos, uint16_t slot, Wide *out)
 {
     if (!blk || ipos >= blk->n_insns || slot == FIELD_STATE_SLOT_INVALID) {
         return false;
@@ -112,7 +124,7 @@ bool cell_read(const FieldStateBlock *blk, uint32_t table_gen,
 }
 
 void cell_write(FieldStateBlock *blk, uint32_t table_gen,
-                uint32_t ipos, uint8_t slot, const Wide &val)
+                uint32_t ipos, uint16_t slot, const Wide &val)
 {
     if (!blk || slot == FIELD_STATE_SLOT_INVALID) return;
     block_ensure_capacity(blk, ipos + 1);
@@ -126,11 +138,12 @@ void cell_write(FieldStateBlock *blk, uint32_t table_gen,
  * directly because it also needs the "was this set?" boolean. */
 Wide lookup_cell(const FieldStateBlock *state_blk, uint32_t state_gen,
                  const FieldStateBlock *base_blk, uint32_t base_gen,
-                 const std::array<uint8_t, 256> &slot_lut,
-                 uint32_t ipos, uint8_t fid)
+                 const std::array<uint16_t, FID_LUT_SIZE> &slot_lut,
+                 uint32_t ipos, uint16_t fid)
 {
     Wide out;
-    uint8_t slot = slot_lut[fid];
+    uint16_t slot = (fid < FID_LUT_SIZE) ? slot_lut[fid]
+                                         : FIELD_STATE_SLOT_INVALID;
     if (cell_read(state_blk, state_gen, ipos, slot, &out)) return out;
     if (cell_read(base_blk,  base_gen,  ipos, slot, &out)) return out;
     return Wide{};
@@ -641,142 +654,75 @@ void BodyWalker::walk(const Callback &cb, const RegfileCallback &rb)
 
 namespace {
 
-/* Per-entry overflow vectors keyed by (ipos << 8 | fid).  Lives on
- * the stack inside decode_field_delta; flushed at end of entry. */
-using ExtrasMap = std::unordered_map<uint64_t, std::vector<Wide>>;
-
-inline uint64_t extra_key(uint32_t ipos, uint8_t fid)
-{
-    return ((uint64_t)ipos << 8) | fid;
-}
-
-/* Read one EXTRA_* raw-vector record's payload.  @is_data switches
- * between uleb (for addresses, fit in u64) and uleb_wide (for data
- * values, can span the full 512 bits of a vector-register snapshot). */
-std::vector<Wide> read_extras_vector(Reader &sec, bool is_data)
-{
-    uint64_t nv = sec.uleb();
-    std::vector<Wide> v;
-    v.reserve(nv);
-    for (uint64_t k = 0; k < nv; k++) {
-        Wide w;
-        if (is_data) {
-            std::array<uint64_t, 8> limbs = sec.uleb_wide();
-            static_assert(Wide::LIMBS == 8, "uleb_wide returns 8 limbs");
-            for (size_t li = 0; li < Wide::LIMBS; li++) {
-                w.limb[li] = limbs[li];
-            }
-        } else {
-            w = Wide::from_u64(sec.uleb());
-        }
-        v.push_back(w);
-    }
-    return v;
-}
-
 /* Pass-1 record loop.  Reads @n_records records from @sec, applying
- * each non-EXTRA delta to the (state_blk, ipos, slot) cell and
- * collecting EXTRA_* vectors into @extras for pass 2. */
+ * each non-EXTENDED delta to the (state_blk, ipos, slot) cell.
+ * Format version 0x1D: fid is ULEB128 (previously u8); the
+ * EXTRA_LOAD/EXTRA_STORE raw-vector overflow path is retired. */
 void apply_record_deltas(BodyWalker &walker, Reader &sec, uint64_t n_records,
                          uint32_t template_id, const Template *tmpl,
                          const ResolvedIds &ids,
-                         const std::array<uint8_t, 256> &slot_lut,
+                         const std::array<uint16_t, FID_LUT_SIZE> &slot_lut,
                          FieldStateBlock *state_blk, uint32_t state_gen,
                          const FieldStateBlock *base_blk, uint32_t base_gen,
                          int scalar_bits,
-                         ExtrasMap *extras,
                          Wide (BodyWalker::*tmpl_default)(const Template*, uint32_t, uint8_t) const)
 {
     (void)template_id;
     uint32_t pos = 0;
     for (uint64_t i = 0; i < n_records; i++) {
         pos += (uint32_t)sec.uleb();
-        uint8_t fid = sec.u8();
-
-        if (is_extra_vector_fid(ids, fid)) {
-            bool is_data = (fid == ids.fid_extra_load_data ||
-                            fid == ids.fid_extra_store_data);
-            (*extras)[extra_key(pos, fid)] = read_extras_vector(sec, is_data);
-            continue;
-        }
+        uint16_t fid = (uint16_t)sec.uleb();
 
         std::array<uint64_t, Wide::LIMBS> wd = sec.sleb_wide();
         if (fid == ids.fid_extended) {
             (void)sec.uleb();
             continue;
         }
-        uint8_t slot = slot_lut[fid];
+        uint16_t slot = (fid < FID_LUT_SIZE) ? slot_lut[fid]
+                                             : FIELD_STATE_SLOT_INVALID;
         Wide base;
         if (!cell_read(state_blk, state_gen, pos, slot, &base) &&
             !cell_read(base_blk,  base_gen,  pos, slot, &base)) {
-            base = (walker.*tmpl_default)(tmpl, pos, fid);
+            base = (walker.*tmpl_default)(tmpl, pos, (uint8_t)fid);
         }
         base.add_signed_mod_wide(wd, scalar_bits);
         cell_write(state_blk, state_gen, pos, slot, base);
     }
 }
 
-/* Materialise the slotted (0..FID_SLOT_COUNT-1) loads or stores for
- * one insn into @out.  @type picks Load vs Store; @addr_base /
- * @data_base are the matching fid bases. */
-void materialise_fixed_memops(uint32_t insn_idx, uint64_t n_fixed,
-                              DynParam::Type type,
-                              uint8_t addr_base, uint8_t data_base,
-                              bool has_mem,
-                              const FieldStateBlock *state_blk, uint32_t state_gen,
-                              const FieldStateBlock *base_blk, uint32_t base_gen,
-                              const std::array<uint8_t, 256> &slot_lut,
-                              std::vector<DynParam> *out)
+/* Materialise the slotted loads or stores for one insn into @out.
+ * @type picks Load vs Store; @addr_base / @data_base are slot-0
+ * fids for the family.  Slot k of the family lives at fid
+ * base + k * FID_SLOT_STRIDE — see the interleaved-by-slot layout
+ * defined in champsim_tracer_format.md §5.1. */
+void materialise_slotted_memops(uint32_t insn_idx, uint64_t n_fixed,
+                                DynParam::Type type,
+                                uint16_t addr_base, uint16_t data_base,
+                                bool has_mem,
+                                const FieldStateBlock *state_blk,
+                                uint32_t state_gen,
+                                const FieldStateBlock *base_blk,
+                                uint32_t base_gen,
+                                const std::array<uint16_t, FID_LUT_SIZE> &slot_lut,
+                                std::vector<DynParam> *out)
 {
+    /* Clamp at FID_SLOT_COUNT.  Writers compliant with the 0x1D
+     * format reject overflow at emit time and log to
+     * unknown_warnings.log; a defensive clamp here protects against
+     * a malformed trace whose N_LOADS / N_STORES exceed the cap. */
+    if (n_fixed > FID_SLOT_COUNT) n_fixed = FID_SLOT_COUNT;
     for (uint64_t s = 0; s < n_fixed; s++) {
+        uint16_t addr_fid = (uint16_t)(addr_base + s * FID_SLOT_STRIDE);
+        uint16_t data_fid = (uint16_t)(data_base + s * FID_SLOT_STRIDE);
         Wide a = lookup_cell(state_blk, state_gen, base_blk, base_gen,
-                             slot_lut, insn_idx, (uint8_t)(addr_base + s));
+                             slot_lut, insn_idx, addr_fid);
         DynParam dp;
         dp.type = type;
         dp.insn_index = insn_idx;
         dp.addr = a.low64();
         if (has_mem) {
             dp.data = lookup_cell(state_blk, state_gen, base_blk, base_gen,
-                                  slot_lut, insn_idx,
-                                  (uint8_t)(data_base + s));
-            dp.has_data = true;
-        }
-        out->push_back(dp);
-    }
-}
-
-/* Materialise the overflow (slot >= FID_SLOT_COUNT) memops out of
- * the per-entry @extras vectors.  Throws if the address-vector and
- * data-vector counts disagree when memdata is enabled. */
-void materialise_extra_memops(uint32_t insn_idx, uint64_t n_overflow,
-                              DynParam::Type type,
-                              uint8_t extra_addr_fid, uint8_t extra_data_fid,
-                              const ExtrasMap &extras, bool has_mem,
-                              const char *addr_label, const char *data_label,
-                              std::vector<DynParam> *out)
-{
-    if (!n_overflow) return;
-    auto addr_it = extras.find(extra_key(insn_idx, extra_addr_fid));
-    if (addr_it == extras.end() || addr_it->second.size() != n_overflow) {
-        throw std::runtime_error(std::string(addr_label) + " count mismatch");
-    }
-    const std::vector<Wide> *data_vec = nullptr;
-    if (has_mem) {
-        auto data_it = extras.find(extra_key(insn_idx, extra_data_fid));
-        if (data_it == extras.end() ||
-            data_it->second.size() != n_overflow) {
-            throw std::runtime_error(std::string(data_label) +
-                                     " count mismatch");
-        }
-        data_vec = &data_it->second;
-    }
-    for (size_t j = 0; j < n_overflow; j++) {
-        DynParam dp;
-        dp.type = type;
-        dp.insn_index = insn_idx;
-        dp.addr = addr_it->second[j].low64();
-        if (has_mem) {
-            dp.data = (*data_vec)[j];
+                                  slot_lut, insn_idx, data_fid);
             dp.has_data = true;
         }
         out->push_back(dp);
@@ -793,14 +739,15 @@ void materialise_reg_snaps_and_metaflags(uint32_t insn_idx,
                                          uint32_t state_gen,
                                          const FieldStateBlock *base_blk,
                                          uint32_t base_gen,
-                                         const std::array<uint8_t, 256> &slot_lut,
+                                         const std::array<uint16_t, FID_LUT_SIZE> &slot_lut,
                                          std::vector<RegSnap> *snaps_out,
                                          std::vector<MetaFlagsEntry> *mflags_out)
 {
     for (size_t op_i = 0; op_i < it.dst_regs.size(); op_i++) {
+        uint16_t fid = (uint16_t)(ids.fid_dst_reg_base +
+                                  op_i * FID_SLOT_STRIDE);
         Wide v = lookup_cell(state_blk, state_gen, base_blk, base_gen,
-                             slot_lut, insn_idx,
-                             (uint8_t)(ids.fid_dst_reg_base + op_i));
+                             slot_lut, insn_idx, fid);
         RegSnap r;
         r.insn_index = insn_idx;
         r.operand_index = (uint8_t)op_i;
@@ -852,12 +799,13 @@ void BodyWalker::decode_field_delta(Reader &outer,
     uint32_t state_gen = state.generation;
     uint32_t base_gen  = base_state ? base_state->generation : 0;
 
-    /* Pass 1: apply record deltas; collect EXTRA_* overflow vectors. */
-    ExtrasMap extras;
+    /* Pass 1: apply record deltas.  Format version 0x1D — no
+     * EXTRA_* overflow vectors; all memops address through slotted
+     * fids directly. */
     apply_record_deltas(*this, sec, n_records,
                         template_id, tmpl, ids, slot_lut_,
                         state_blk, state_gen, base_blk, base_gen,
-                        scalar_bits_, &extras,
+                        scalar_bits_,
                         &BodyWalker::template_default);
 
     /* Pass 2: materialise per-insn outputs.  Skipped entirely when
@@ -878,39 +826,20 @@ void BodyWalker::decode_field_delta(Reader &outer,
                                         ids.fid_n_stores).low64();
 
         if (n_loads || n_stores) {
-            uint64_t fixed_loads  = std::min<uint64_t>(n_loads,  FID_SLOT_COUNT);
-            uint64_t extra_loads  = (n_loads > FID_SLOT_COUNT)
-                                        ? n_loads  - FID_SLOT_COUNT : 0;
-            uint64_t fixed_stores = std::min<uint64_t>(n_stores, FID_SLOT_COUNT);
-            uint64_t extra_stores = (n_stores > FID_SLOT_COUNT)
-                                        ? n_stores - FID_SLOT_COUNT : 0;
-
-            materialise_fixed_memops(idx, fixed_loads, DynParam::Load,
-                                     ids.fid_load_addr_base,
-                                     ids.fid_load_data_base,
-                                     has_mem,
-                                     state_blk, state_gen,
-                                     base_blk,  base_gen,
-                                     slot_lut_, dyn_params);
-            materialise_extra_memops(idx, extra_loads, DynParam::Load,
-                                     ids.fid_extra_load_addr,
-                                     ids.fid_extra_load_data,
-                                     extras, has_mem,
-                                     "EXTRA_LOAD_ADDR", "EXTRA_LOAD_DATA",
-                                     dyn_params);
-            materialise_fixed_memops(idx, fixed_stores, DynParam::Store,
-                                     ids.fid_store_addr_base,
-                                     ids.fid_store_data_base,
-                                     has_mem,
-                                     state_blk, state_gen,
-                                     base_blk,  base_gen,
-                                     slot_lut_, dyn_params);
-            materialise_extra_memops(idx, extra_stores, DynParam::Store,
-                                     ids.fid_extra_store_addr,
-                                     ids.fid_extra_store_data,
-                                     extras, has_mem,
-                                     "EXTRA_STORE_ADDR", "EXTRA_STORE_DATA",
-                                     dyn_params);
+            materialise_slotted_memops(idx, n_loads, DynParam::Load,
+                                       ids.fid_load_addr_base,
+                                       ids.fid_load_data_base,
+                                       has_mem,
+                                       state_blk, state_gen,
+                                       base_blk,  base_gen,
+                                       slot_lut_, dyn_params);
+            materialise_slotted_memops(idx, n_stores, DynParam::Store,
+                                       ids.fid_store_addr_base,
+                                       ids.fid_store_data_base,
+                                       has_mem,
+                                       state_blk, state_gen,
+                                       base_blk,  base_gen,
+                                       slot_lut_, dyn_params);
         }
 
         if (has_reg) {

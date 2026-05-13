@@ -71,7 +71,7 @@ extern "C" {
  * sparse fields populated from QEMU memory callbacks; template count
  * defaults are zero.
  */
-#define CST_MAGIC          0x1C545343u
+#define CST_MAGIC          0x1D545343u
 
 /*
  * REG_METAFLAGS bit layout is defined in champsim_tracer_generic_ids.h
@@ -197,56 +197,58 @@ extern "C" {
  *
  * Every per-entry observation (memop addresses, memop data, register
  * values, instruction-encoding mutations) is encoded as one record.
- * Slotted scalar families occupy
- * contiguous 16-wide ranges to leave room for SVE / RVV / wide-AVX
- * memop counts.  Memops beyond those 16 slots are emitted through
- * EXTRA_* raw vector fields.
+ * Field IDs are ULEB128 on the wire (format version 0x1D).  Slotted
+ * families occupy interleaved-by-slot ranges so slot `k`'s five
+ * family IDs are contiguous; this keeps low slots in the 1-byte
+ * ULEB range alongside the hot singletons (N_LOADS, N_STORES,
+ * METAFLAGS).  Slot 0..24 land in IDs 0..127 (1 byte); slot 25..63
+ * spill to 2 bytes.  See champsim_tracer_format.md §5.1.
  */
-#define CST_FID_SLOT_COUNT       16    /* slots per slotted family */
-#define CST_MAX_WIDE_BYTES       64    /* 512-bit data/reg scalar cap */
+#define CST_FID_SLOT_COUNT       64   /* slots per slotted family */
+#define CST_FID_SLOT_STRIDE      5    /* family IDs per slot       */
+#define CST_MAX_WIDE_BYTES       64   /* 512-bit data/reg scalar cap */
 
-#define CST_FID_N_LOADS         0x00  /* current valid load slots */
+/* Hot singletons — kept in the 0..127 1-byte ULEB range. */
+#define CST_FID_N_LOADS          0
+#define CST_FID_N_STORES         1
+#define CST_FID_METAFLAGS        2
 
-#define CST_FID_LOAD_ADDR_BASE   0x01  /* +k for load slot k ∈ 0..15 */
-#define CST_FID_STORE_ADDR_BASE  0x11
-#define CST_FID_LOAD_DATA_BASE   0x21  /* gated by CST_FLAG_MEM_DATA  */
-#define CST_FID_STORE_DATA_BASE  0x31
-/* 0x41..0x50 reserved for pre-exec source register values.  Not
- * currently emitted: the writer captures destination values at
- * post-execution instead — they cover every architectural write
- * (consumers can derive any register's current value at any point
- * from the most recent post-write observation), and there are
- * typically fewer destinations than sources per insn so the cost is
- * lower.  Reserving the slot range leaves room to optionally revive
- * source capture later without renumbering. */
-#define CST_FID_DST_REG_BASE     0x51  /* gated by CST_FLAG_REG_DATA  */
-#define CST_FID_N_STORES        0x61  /* current valid store slots */
-#define CST_FID_EXTRA_LOAD_ADDR  0x62  /* raw ULEB vector, slots 16+ */
-#define CST_FID_EXTRA_STORE_ADDR 0x63
-#define CST_FID_EXTRA_LOAD_DATA  0x64  /* raw ULEB vector, slots 16+ */
-#define CST_FID_EXTRA_STORE_DATA 0x65
-/* 0x66..0x6F reserved for future slotted memop metadata             */
+/* Slotted families.  Slot k of family f lives at
+ *   CST_FID_<FAMILY>_BASE + k * CST_FID_SLOT_STRIDE
+ * The bases are adjacent (3..7) so slot 0 of all five families plus
+ * the three hot singletons cleanly occupy IDs 0..7.
+ *
+ * Source-register pre-exec snapshots used to occupy a sixth family
+ * here; they were retired because consumers can reconstruct any
+ * register's current value from the regfile (BODY_TAG_REGFILE +
+ * accumulated DST_REG snapshots).  No source-value family exists in
+ * this format version.
+ */
+#define CST_FID_LOAD_ADDR_BASE   3    /* slot k at base + 5k     */
+#define CST_FID_STORE_ADDR_BASE  4
+#define CST_FID_LOAD_DATA_BASE   5    /* gated by CST_FLAG_MEM_DATA */
+#define CST_FID_STORE_DATA_BASE  6
+#define CST_FID_DST_REG_BASE     7    /* gated by CST_FLAG_REG_DATA */
 
-/* Insn-encoding-mutable fields. Baseline = template's static value,
- * so unchanged-from-template fields cost zero record bytes. */
-#define CST_FID_INSN_BYTES_LO    0x70  /* low  8 bytes of insn_bytes, LE u64  */
-#define CST_FID_INSN_BYTES_HI    0x71  /* high 8 bytes (only x86 long enc.)   */
-#define CST_FID_INSN_OPCODE      0x72  /* GenericOpcode (u8)                  */
-#define CST_FID_INSN_BRANCH_TYPE 0x73  /* BranchType (u8)                     */
-#define CST_FID_INSN_FLAGS       0x74  /* template flags byte                 */
-#define CST_FID_INSN_IMMEDIATE   0x75  /* signed immediate                    */
-#define CST_FID_INSN_SIZE        0x76  /* u8 insn_size                        */
-/* Per-insn canonical-flags byte.  Gated by CST_FLAG_REG_DATA.  Emitted
- * only on insns whose template's int-flags-writing row is marked
- * `is_int_flags` (x86 EFLAGS-writers, AArch64 NZCV-writers).  Wire
- * payload is one byte with bits CST_METAFLAGS_{Z,N,C,V,P}, computed
- * by the per-ISA `flags_to_metaflags` mapper at capture time.  Stored
- * as a side-channel rather than a synthetic dst-reg slot so the
- * template's `dst_regs` list stays clean (consumers reasoning about
- * architectural register sets aren't confused by a phantom slot).   */
-#define CST_FID_METAFLAGS        0x77
-/* 0x78..0xFE reserved for future fields                                       */
-#define CST_FID_EXTENDED         0xFF  /* reserved escape; not currently used  */
+/* Last slotted ID = base + (SLOT_COUNT-1) * STRIDE = base + 315.
+ * Insn-metadata + EXTENDED start immediately after the slot range. */
+#define CST_FID_SLOTTED_END      (CST_FID_DST_REG_BASE + \
+                                  (CST_FID_SLOT_COUNT - 1) * CST_FID_SLOT_STRIDE)
+
+/* Cold instruction-metadata fields.  Baseline = template's static
+ * value, so unchanged-from-template fields cost zero record bytes.
+ * Numbered past the slotted range; emit as 2-byte ULEBs.            */
+#define CST_FID_INSN_BYTES_LO    (CST_FID_SLOTTED_END + 1)  /* low 8 bytes of insn_bytes, LE u64 */
+#define CST_FID_INSN_BYTES_HI    (CST_FID_SLOTTED_END + 2)  /* high 8 bytes (x86 long enc.)      */
+#define CST_FID_INSN_OPCODE      (CST_FID_SLOTTED_END + 3)
+#define CST_FID_INSN_BRANCH_TYPE (CST_FID_SLOTTED_END + 4)
+#define CST_FID_INSN_FLAGS       (CST_FID_SLOTTED_END + 5)
+#define CST_FID_INSN_IMMEDIATE   (CST_FID_SLOTTED_END + 6)
+#define CST_FID_INSN_SIZE        (CST_FID_SLOTTED_END + 7)
+#define CST_FID_EXTENDED         (CST_FID_SLOTTED_END + 8)  /* reserved escape */
+
+/* Total well-known field-id count, for sanity / encoding-map size. */
+#define CST_FID_COUNT            (CST_FID_EXTENDED + 1)
 
 /* ===== Types ===== */
 

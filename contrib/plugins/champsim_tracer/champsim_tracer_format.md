@@ -105,7 +105,7 @@ byte buffer.  Decode in order; the leading magic doubles as a
 sanity check.
 
 ```
-2.1  magic        : u32_le   ; must equal 0x1C545343 ("CST" + 0x1C)
+2.1  magic        : u32_le   ; must equal 0x1D545343 ("CST" + 0x1D)
 2.2  isa          : u8       ; TraceISA enum (see Reference §2)
 2.3  flags        : u8       ; CST_FLAG_* bitmask (Reference §2)
 2.4  start_insn          : ULEB
@@ -148,13 +148,14 @@ self-describing.  Decode it into a fresh `encoding_maps` table.
                         CST_FID_LOAD_ADDR0, CST_FID_STORE_ADDR0,
                         CST_FID_LOAD_DATA0, CST_FID_STORE_DATA0,
                         CST_FID_DST_REG0,
-                        CST_FID_EXTRA_LOAD_ADDR, CST_FID_EXTRA_STORE_ADDR,
-                        CST_FID_EXTRA_LOAD_DATA, CST_FID_EXTRA_STORE_DATA,
                         CST_FID_INSN_BYTES_LO, CST_FID_INSN_BYTES_HI,
                         CST_FID_INSN_OPCODE, CST_FID_INSN_BRANCH_TYPE,
                         CST_FID_INSN_FLAGS, CST_FID_INSN_IMMEDIATE,
                         CST_FID_INSN_SIZE, CST_FID_METAFLAGS,
                         CST_FID_EXTENDED
+                        (no CST_FID_EXTRA_* in version 0x1D; the
+                         overflow vectors retired with the slot-cap
+                         raise — see Reference §5.2.)
        insn_flag:       CST_INSN_FLAG_BRANCH_COND,
                         CST_INSN_FLAG_HAS_IMM,
                         CST_INSN_FLAG_HAS_DEP_BLOCK
@@ -231,7 +232,7 @@ trailing one is the truncation sentinel.  Verify both.
 
 ```
 5.1  open the body member's decompressed byte stream.
-5.2  lead : u32_le ; must equal 0x1C545343
+5.2  lead : u32_le ; must equal 0x1D545343
 5.3  body record stream := bytes between @lead and the trailing
      CST_MAGIC.  If you have the whole member in memory you can
      peek the last 4 bytes here; for streaming decoders, defer the
@@ -322,25 +323,25 @@ Loop until a `BODY_TAG_END` is seen:
          prev_wp_index = wp_index
 6.10 One field-delta record:
        ipos_delta : ULEB    ; running ipos += ipos_delta (sparse positions)
-       fid        : u8      ; resolve via encoding_maps.field_id
-       if fid is one of EXTRA_LOAD_ADDR / EXTRA_STORE_ADDR /
-          EXTRA_LOAD_DATA / EXTRA_STORE_DATA:
-         nv : ULEB
-         repeat nv times: one wide ULEB
-           - ADDR variants:   ULEB        (value fits in u64)
-           - DATA variants:   ULEB_WIDE   (up to 512 bits; the
-                                          writer emits via
-                                          bw_write_uleb128_u512)
-       else:
-         delta : SLEB_WIDE   (up to 512 bits, signed; same shape
-                              as ULEB_WIDE but the high bit of the
-                              last byte's payload extends the sign)
-         if fid == ids.fid_extended:
-           ext_payload : ULEB    (reserved escape; reserve only)
+       fid        : ULEB    ; resolve via encoding_maps.field_id
+                              (writer packs hot fields into the
+                               1-byte ULEB range; cold and high-slot
+                               fields spill to 2)
+       delta      : SLEB_WIDE   (up to 512 bits, signed; same shape
+                                 as ULEB_WIDE but the high bit of the
+                                 last byte's payload extends the sign)
+       if fid == ids.fid_extended:
+         ext_payload : ULEB    (reserved escape; reserve only)
        Update the per-template field-state cell at (template_id,
        ipos, fid) by adding the decoded delta modulo 2^512.  See
        Reference §5 for the field-state semantics.
 ```
+
+`EXTRA_LOAD_ADDR` / `EXTRA_STORE_ADDR` / `EXTRA_LOAD_DATA` /
+`EXTRA_STORE_DATA` are NOT part of this format version's `field_id`
+map.  All memops are addressed through the slotted families
+(`LOAD_ADDR[0..63]` etc.); an instruction whose dynamic memop count
+exceeds `CST_FID_SLOT_COUNT` is rejected at the writer.
 
 A SLEB_WIDE / ULEB_WIDE primitive: like LEB128 but the value is
 read into up to 8 little-endian limbs (64 bits each, packing
@@ -353,7 +354,7 @@ After Step 6 finishes (BODY_TAG_END was consumed), read 4 more
 bytes from the body member's stream:
 
 ```
-7.1  trail : u32_le   ; must equal 0x1C545343
+7.1  trail : u32_le   ; must equal 0x1D545343
 7.2  the body member's stream must be exhausted at this point
      (no further bytes).  Reject otherwise.
 ```
@@ -412,19 +413,42 @@ state for the same field.
 ## 2. Constants
 
 ```
-CST_MAGIC              = 0x1C545343       bytes: 'C' 'S' 'T' 0x1C
+CST_MAGIC              = 0x1D545343       bytes: 'C' 'S' 'T' 0x1D
 
 BODY_TAG_END           = 0
 BODY_TAG_ENTRY         = 1
 BODY_TAG_THREAD_SWITCH = 2
 BODY_TAG_IFRAME        = 3
 BODY_TAG_REGFILE       = 4
+
+CST_FID_SLOT_COUNT     = 64               max memops / dst regs per insn
 ```
 
 The body member begins with `CST_MAGIC` and ends with `CST_MAGIC`.  A
 file is treated as truncated if the trailing magic is missing.  The
 header member begins with `CST_MAGIC` (no trailing magic; the member
 naturally ends after its templates section).
+
+`CST_FID_SLOT_COUNT` is the per-family slot ceiling for the
+field-delta sections (loads, stores, destination registers).  When
+an instruction's dynamic memop count would exceed this cap, the
+writer clamps the trailing memops and emits a warning to
+`unknown_warnings.log`; no `EXTRA_*` overflow path exists in this
+format version (see Reference §5.2).
+
+Version history
+:    `0x1B`: original release.
+:    `0x1C`: outer container becomes tar(body, header); 64-byte
+     trailing trailer removed.  REP-prefixed string ops fan out
+     per-iteration; `BRANCH_REP` added.
+:    `0x1D` (current): field-delta `fid` is a ULEB128 instead of a
+     fixed `u8`; `CST_FID_SLOT_COUNT` raised from 16 to 64; the
+     `EXTRA_LOAD_ADDR` / `EXTRA_STORE_ADDR` / `EXTRA_LOAD_DATA` /
+     `EXTRA_STORE_DATA` overflow fields are retired.  Numeric
+     field-IDs are non-normative — readers consume the header's
+     `field_id` encoding map.  The writer typically packs the hot
+     fields into the 1-byte ULEB range, but the layout is its
+     concern, not the format's (see Reference §5.1).
 
 On ISAs with an integer flags register (x86, AArch64), every insn
 whose template writes that register also emits a canonical
@@ -498,7 +522,7 @@ the first thing a decoder needs.
 
 ```
 +--------------------------------------------------+
-| magic               u32  = 0x1C545343            |
+| magic               u32  = 0x1D545343            |
 | isa                 u8   TraceISA                |
 | flags               u8   CST_FLAG_* bits         |
 | start_insn          ULEB                         |
@@ -826,40 +850,78 @@ The CP overlay is unaffected by speculative records.
 
 ### 5.1 Field-ID Space
 
-Field IDs are one byte. Slotted families reserve 16 values each.
+Field IDs are ULEB128 on the wire (Step 6.10).  Numeric IDs are
+**not** pinned in the format spec; the header's `field_id` encoding
+map (Reference §3.1) carries the (id → name) pair for every
+well-known field used in this trace, and decoders MUST look up
+fields by name there.  This section describes the field families
+the writer emits and the encoding-cost intent behind the writer's
+ID assignment.
 
-```
-+----------------+----------------------+------------------------------------------------+
-| Field IDs      | Family               | Meaning                             | Gate     |
-+----------------+----------------------+------------------------------------------------+
-| 0x00           | N_LOADS              | current valid load slots            |          |
-| 0x01..0x10     | LOAD_ADDR[0..15]     | load virtual addresses              |          |
-| 0x11..0x20     | STORE_ADDR[0..15]    | store virtual addresses             |          |
-| 0x21..0x30     | LOAD_DATA[0..15]     | load values                         | MEM_DATA |
-| 0x31..0x40     | STORE_DATA[0..15]    | store values                        | MEM_DATA |
-| 0x41..0x50     | reserved             | source-register-snapshot extension  | -------- |
-| 0x51..0x60     | DST_REG[0..15]       | destination register snapshots,     | REG_DATA |
-| 0x61           | N_STORES             | current valid store slots           |          |
-| 0x62           | EXTRA_LOAD_ADDR      | raw load addr vector, slots 16+     |          |
-| 0x63           | EXTRA_STORE_ADDR     | raw store addr vector, slots 16+    |          |
-| 0x64           | EXTRA_LOAD_DATA      | raw load data vector, slots 16+     |          |
-| 0x65           | EXTRA_STORE_DATA     | raw store data vector, slots 16+    |          |
-| 0x66..0x6F     | reserved             | future memop metadata               | -------- |
-| 0x70           | INSN_BYTES_LO        | low 8 bytes of instruction          | STATIC   |
-| 0x71           | INSN_BYTES_HI        | high 8 bytes of instruction         | STATIC   |
-| 0x72           | INSN_OPCODE          | GenericOpcode                       | STATIC   |
-| 0x73           | INSN_BRANCH_TYPE     | BranchType                          | STATIC   |
-| 0x74           | INSN_FLAGS           | per-insn template flags             | STATIC   |
-| 0x75           | INSN_IMMEDIATE       | signed immediate                    | STATIC   |
-| 0x76           | INSN_SIZE            | instruction byte length             | STATIC   |
-| 0x77           | METAFLAGS            | canonical Z/N/C/V/P byte            | REG_DATA |
-| 0x78..0xFE     | reserved             | future fields                       | -------- |
-| 0xFF           | EXTENDED             | reserved escape; not currently used | -------- |
-+----------------+----------------------+------------------------------------------------+
-```
+Field families (one well-known name each):
 
-The header's `field_id` map carries the exact string associated with
-each numeric field ID.
+* **`CST_FID_N_LOADS`** — count of valid load slots for this insn
+  execution.  Encoded as a non-negative scalar delta against the
+  prior observation of `(template_id, ins_pos)`; baseline default
+  is zero.  Always emitted on entries whose insn has memops.
+
+* **`CST_FID_N_STORES`** — analogous, for stores.
+
+* **`CST_FID_METAFLAGS`** — canonical Z/N/C/V/P byte (see §2).
+  Gated on `CST_FLAG_REG_DATA`; only emitted for insns whose
+  template writes the ISA's integer-flags register, and only on
+  ISAs that have one (x86, AArch64).
+
+* **`CST_FID_LOAD_ADDR{k}`** for `k ∈ [0, CST_FID_SLOT_COUNT)` —
+  load virtual addresses, indexed by memop slot.  Names are
+  `CST_FID_LOAD_ADDR0`, `CST_FID_LOAD_ADDR1`, ... — the encoding
+  map carries one entry per slot, and decoders look each up by
+  name.  Address bits beyond u64 are silently truncated; address
+  values are emitted as scalar deltas.
+
+* **`CST_FID_STORE_ADDR{k}`** — analogous, for store addresses.
+
+* **`CST_FID_LOAD_DATA{k}`** — load values, gated on
+  `CST_FLAG_MEM_DATA`.  Up to 512 bits per slot (vector-register
+  loads), emitted via the `SLEB_WIDE` scalar-delta path.
+
+* **`CST_FID_STORE_DATA{k}`** — analogous, for store values.
+
+* **`CST_FID_DST_REG{k}`** — destination-register post-execution
+  snapshots, indexed by the template's `dst_regs` array position.
+  Gated on `CST_FLAG_REG_DATA`.  Source-register values are not
+  emitted on the wire — consumers reconstruct them from a regfile
+  that the wp_event_flag stream + initial-state REGFILE records
+  + DST_REG snapshots collectively define.
+
+* **Instruction-metadata singletons** (cold; emitted only when
+  the dynamic execution differs from the template baseline):
+  `CST_FID_INSN_BYTES_LO`, `CST_FID_INSN_BYTES_HI`,
+  `CST_FID_INSN_OPCODE`, `CST_FID_INSN_BRANCH_TYPE`,
+  `CST_FID_INSN_FLAGS`, `CST_FID_INSN_IMMEDIATE`,
+  `CST_FID_INSN_SIZE`.
+
+* **`CST_FID_EXTENDED`** — reserved escape; reserve only.  The
+  scalar-delta byte after this field-id's record is followed by
+  one extra ULEB whose value is reserved.
+
+**Layout intent (non-normative).**  The writer assigns numeric
+IDs so the hot fields — slot counts, metaflags, and low-slot
+memops + destination snapshots — collectively occupy IDs `< 128`
+and therefore emit as a single ULEB byte.  High-slot families
+and the cold instruction-metadata singletons fall into the
+2-byte ULEB range (IDs 128..16383).  A future writer may
+re-shuffle within these constraints (e.g., promote a different
+hot field into the 1-byte range based on observed frequency)
+without bumping `CST_MAGIC`; readers consume the per-trace
+encoding map and stay correct.
+
+The slot-family layout is **interleaved by slot** (slot `k` of
+every family is co-located in the ID space) rather than
+**family-then-slot** (all of one family before the next).  This
+keeps low slots of every family in 1-byte territory and yields
+strictly fewer total bytes than the alternative on every
+realistic workload — see §5.2.
 
 ### 5.2 Memory Counts and Addresses
 
@@ -992,16 +1054,27 @@ valid load slots  = 0 .. n_loads-1
 valid store slots = 0 .. n_stores-1
 ```
 
-The first 16 slots use the scalar `LOAD_ADDR[0..15]` and
-`STORE_ADDR[0..15]` fields. If an address field is absent for one of
-these valid slots, the value is unchanged from that slot's current
-baseline.
+The scalar `LOAD_ADDR[k]` and `STORE_ADDR[k]` fields address slots
+`k ∈ [0, CST_FID_SLOT_COUNT)` directly.  If an address field is
+absent for one of these valid slots, the value is unchanged from
+that slot's current baseline.
 
-If `n_loads > 16`, the remaining load addresses are emitted in one
-`EXTRA_LOAD_ADDR` raw vector for that instruction. If `n_stores > 16`,
-the remaining store addresses are emitted in `EXTRA_STORE_ADDR`.
-These raw vectors are present on every entry that has overflow memops;
-they are not delta-coded and do not persist in field state.
+If an instruction's dynamic `n_loads` or `n_stores` would exceed
+`CST_FID_SLOT_COUNT = 64`, the writer is permitted to elide the
+trailing memops past the cap and emit a warning to
+`unknown_warnings.log` identifying the PC, opcode, and dropped-memop
+count.  Consumers see only the first `CST_FID_SLOT_COUNT` memops in
+that case; the elision is observable as the dynamic count being
+clamped to the cap.  The wire format reserves no overflow path —
+there is no equivalent of the `EXTRA_*` raw-vector escape used in
+format versions `0x1B` / `0x1C`.
+
+The 64-slot ceiling covers AVX-512 gather/scatter (≤ 16 lanes),
+ARM SVE2 at VLEN ≤ 4096 (≤ 64 element loads), and RISC-V V at
+LMUL × VLEN/SEW ≤ 64.  Workloads that genuinely need more either
+fan the instruction out into multiple body entries (analogous to
+the REP-prefixed self-loop fan-out for x86 string ops; see §5.2
+below) or accept the writer-side clamp.
 
 ### 5.3 Memory Data
 
@@ -1014,11 +1087,12 @@ load/store value.
   little-endian unsigned scalar, up to 64 bytes
 ```
 
-The first 16 memory data slots use scalar `LOAD_DATA[0..15]` and
-`STORE_DATA[0..15]` delta records. Overflow data for slots 16 and above
-is emitted in `EXTRA_LOAD_DATA` / `EXTRA_STORE_DATA` raw vectors when
-`CST_FLAG_MEM_DATA` is set. Each overflow data vector has the same
-number of values as the corresponding overflow address vector.
+Memory data values use the scalar `LOAD_DATA[k]` / `STORE_DATA[k]`
+delta records, indexed identically to `LOAD_ADDR[k]` /
+`STORE_ADDR[k]` (one data slot per memop slot, for
+`k ∈ [0, CST_FID_SLOT_COUNT)`).  There is no separate overflow
+path; the slot ceiling and overflow handling described in §5.2
+apply uniformly to addresses and data.
 
 Narrow accesses are masked to their low accessed bytes before delta or
 raw-vector emission. The current QEMU plugin mem-value API directly

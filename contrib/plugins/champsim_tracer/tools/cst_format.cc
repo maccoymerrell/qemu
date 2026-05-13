@@ -148,7 +148,9 @@ void parse_templates_at(Reader &r,
 }
 
 /* Reverse-resolve a well-known name in @m and store its ID into @out.
- * Throws if the name is absent. */
+ * Throws if the name is absent.  Two overloads: u8 for the flag /
+ * bit-mask maps (header_flag / insn_flag / wp_event_flag / metaflags),
+ * uint16_t for field_id where the ULEB-encoded space reaches ~330. */
 static void resolve_one(const std::unordered_map<uint64_t, std::string> &m,
                         const char *map_name, const char *want,
                         uint8_t *out)
@@ -156,6 +158,20 @@ static void resolve_one(const std::unordered_map<uint64_t, std::string> &m,
     for (const auto &kv : m) {
         if (kv.second == want) {
             *out = (uint8_t)kv.first;
+            return;
+        }
+    }
+    throw std::runtime_error(std::string("encoding map '") + map_name
+                             + "' missing well-known name '" + want + "'");
+}
+
+static void resolve_one(const std::unordered_map<uint64_t, std::string> &m,
+                        const char *map_name, const char *want,
+                        uint16_t *out)
+{
+    for (const auto &kv : m) {
+        if (kv.second == want) {
+            *out = (uint16_t)kv.first;
             return;
         }
     }
@@ -180,9 +196,17 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
     resolve_one(maps.body_tag, "body_tag", "BODY_TAG_REGFILE",
                 &ids->body_tag_regfile);
 
-    /* field_id (slot-range bases + singletons) */
+    /* field_id (slot-range bases + singletons).  EXTRA_* retired in
+     * format version 0x1D; slot k of family <F> resolves to the
+     * uint16_t value at name "CST_FID_<F>0" plus k * FID_SLOT_STRIDE,
+     * but decoders look up each slot by full name through the
+     * encoding map. */
     resolve_one(maps.field_id, "field_id", "CST_FID_N_LOADS",
                 &ids->fid_n_loads);
+    resolve_one(maps.field_id, "field_id", "CST_FID_N_STORES",
+                &ids->fid_n_stores);
+    resolve_one(maps.field_id, "field_id", "CST_FID_METAFLAGS",
+                &ids->fid_metaflags);
     resolve_one(maps.field_id, "field_id", "CST_FID_LOAD_ADDR0",
                 &ids->fid_load_addr_base);
     resolve_one(maps.field_id, "field_id", "CST_FID_STORE_ADDR0",
@@ -193,16 +217,6 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
                 &ids->fid_store_data_base);
     resolve_one(maps.field_id, "field_id", "CST_FID_DST_REG0",
                 &ids->fid_dst_reg_base);
-    resolve_one(maps.field_id, "field_id", "CST_FID_N_STORES",
-                &ids->fid_n_stores);
-    resolve_one(maps.field_id, "field_id", "CST_FID_EXTRA_LOAD_ADDR",
-                &ids->fid_extra_load_addr);
-    resolve_one(maps.field_id, "field_id", "CST_FID_EXTRA_STORE_ADDR",
-                &ids->fid_extra_store_addr);
-    resolve_one(maps.field_id, "field_id", "CST_FID_EXTRA_LOAD_DATA",
-                &ids->fid_extra_load_data);
-    resolve_one(maps.field_id, "field_id", "CST_FID_EXTRA_STORE_DATA",
-                &ids->fid_extra_store_data);
     resolve_one(maps.field_id, "field_id", "CST_FID_INSN_BYTES_LO",
                 &ids->fid_insn_bytes_lo);
     resolve_one(maps.field_id, "field_id", "CST_FID_INSN_BYTES_HI",
@@ -217,8 +231,6 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
                 &ids->fid_insn_immediate);
     resolve_one(maps.field_id, "field_id", "CST_FID_INSN_SIZE",
                 &ids->fid_insn_size);
-    resolve_one(maps.field_id, "field_id", "CST_FID_METAFLAGS",
-                &ids->fid_metaflags);
     resolve_one(maps.field_id, "field_id", "CST_FID_EXTENDED",
                 &ids->fid_extended);
 

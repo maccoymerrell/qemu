@@ -42,34 +42,40 @@ enum : int {
     NUM_BUCKETS     = 10,
 };
 
+/* FID -> bucket lookup.  Sized for the ULEB-encoded FID space
+ * (format version 0x1D); slotted families' slot k lives at
+ * base + k * FID_SLOT_STRIDE — see the interleaved-by-slot layout. */
 struct FidTables {
-    std::array<uint8_t, 256> bucket{};
-    std::array<bool, 256>    is_extra{};
+    static constexpr size_t LUT_SIZE = 512;
+    std::array<uint8_t, LUT_SIZE> bucket{};
 
     explicit FidTables(const cst::ResolvedIds &ids) {
         bucket.fill(BIDX_OTHER);
-        is_extra.fill(false);
-        bucket[ids.fid_n_loads]  = BIDX_MEM_COUNTS;
-        bucket[ids.fid_n_stores] = BIDX_MEM_COUNTS;
-        for (int i = 0; i < cst::FID_SLOT_COUNT; i++) {
-            bucket[ids.fid_load_addr_base  + i] = BIDX_LOAD_ADDR;
-            bucket[ids.fid_store_addr_base + i] = BIDX_STORE_ADDR;
-            bucket[ids.fid_load_data_base  + i] = BIDX_LOAD_DATA;
-            bucket[ids.fid_store_data_base + i] = BIDX_STORE_DATA;
-            bucket[ids.fid_dst_reg_base    + i] = BIDX_DST_REG;
+        if (ids.fid_n_loads   < LUT_SIZE) bucket[ids.fid_n_loads]   = BIDX_MEM_COUNTS;
+        if (ids.fid_n_stores  < LUT_SIZE) bucket[ids.fid_n_stores]  = BIDX_MEM_COUNTS;
+        if (ids.fid_metaflags < LUT_SIZE) bucket[ids.fid_metaflags] = BIDX_INSN_META;
+
+        const struct { uint16_t base; uint8_t bucket_id; } fam[5] = {
+            { ids.fid_load_addr_base,  (uint8_t)BIDX_LOAD_ADDR  },
+            { ids.fid_store_addr_base, (uint8_t)BIDX_STORE_ADDR },
+            { ids.fid_load_data_base,  (uint8_t)BIDX_LOAD_DATA  },
+            { ids.fid_store_data_base, (uint8_t)BIDX_STORE_DATA },
+            { ids.fid_dst_reg_base,    (uint8_t)BIDX_DST_REG    },
+        };
+        for (int k = 0; k < cst::FID_SLOT_COUNT; k++) {
+            for (auto &fa : fam) {
+                unsigned fid = fa.base + (unsigned)k * cst::FID_SLOT_STRIDE;
+                if (fid < LUT_SIZE) bucket[fid] = fa.bucket_id;
+            }
         }
-        bucket[ids.fid_extra_load_addr]  = BIDX_LOAD_ADDR;
-        bucket[ids.fid_extra_store_addr] = BIDX_STORE_ADDR;
-        bucket[ids.fid_extra_load_data]  = BIDX_LOAD_DATA;
-        bucket[ids.fid_extra_store_data] = BIDX_STORE_DATA;
-        for (int f = ids.fid_insn_bytes_lo; f <= ids.fid_insn_size; f++) {
-            bucket[f] = BIDX_INSN_META;
+        for (unsigned f = ids.fid_insn_bytes_lo; f <= ids.fid_insn_size; f++) {
+            if (f < LUT_SIZE) bucket[f] = BIDX_INSN_META;
         }
-        bucket[ids.fid_extended] = BIDX_EXTENDED;
-        is_extra[ids.fid_extra_load_addr]  = true;
-        is_extra[ids.fid_extra_store_addr] = true;
-        is_extra[ids.fid_extra_load_data]  = true;
-        is_extra[ids.fid_extra_store_data] = true;
+        if (ids.fid_extended < LUT_SIZE) bucket[ids.fid_extended] = BIDX_EXTENDED;
+    }
+
+    uint8_t bucket_for(unsigned fid) const {
+        return fid < LUT_SIZE ? bucket[fid] : (uint8_t)BIDX_OTHER;
     }
 };
 
@@ -112,15 +118,11 @@ struct Stats {
  * caller's bucket table.  Used by both the CP and WP record loops
  * (only difference is which bucket table they're aggregating into).
  *
- * The field-delta wire format uses sleb_wide() for the delta value,
- * which can span up to 8 limbs (512 bits) for wide-data fields
- * (LOAD_DATA / STORE_DATA / DST_REG carrying vector-register
- * snapshots).  Audit doesn't care about the decoded value — it
- * only needs to advance the cursor — so skip_varint() walks the
- * continuation bits without an overflow guard.  Using uleb()
- * here would throw "ULEB128 too large" on any record whose delta
- * exceeded 64 bits, which the original raw-byte walker tolerated
- * because it used a per-byte skip loop.
+ * Format version 0x1D: fid is ULEB128 (previously u8); the
+ * EXTRA_* raw-vector overflow path is retired, so every record
+ * carries a single SLEB_WIDE delta (up to 512 bits).  Audit doesn't
+ * care about the decoded value — skip_varint walks the
+ * continuation bits without an overflow guard.
  */
 static inline void tally_fd_record(
     cst::Reader &sec, const FidTables &fid, const cst::ResolvedIds &ids,
@@ -128,15 +130,10 @@ static inline void tally_fd_record(
 {
     size_t before = sec.consumed();
     sec.skip_varint();                       /* ipos delta */
-    uint8_t f = sec.u8();
-    if (fid.is_extra[f]) {
-        uint64_t nv = sec.uleb();
-        for (uint64_t k = 0; k < nv; k++) sec.skip_varint();
-    } else {
-        sec.skip_varint();                   /* sleb_wide delta */
-    }
+    uint64_t f = sec.uleb();                 /* fid (ULEB128) */
+    sec.skip_varint();                       /* sleb_wide delta */
     if (f == ids.fid_extended) sec.skip_varint();
-    int idx = fid.bucket[f];
+    int idx = fid.bucket_for((unsigned)f);
     (*fd_b)[idx].bytes += sec.consumed() - before;
     (*fd_b)[idx].count += 1;
 }

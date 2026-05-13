@@ -40,7 +40,7 @@ namespace cst {
  * carries a trailing CST_MAGIC after BODY_TAG_END so truncation is
  * detectable at either end. */
 
-inline constexpr uint32_t CST_MAGIC = 0x1C545343u;
+inline constexpr uint32_t CST_MAGIC = 0x1D545343u;
 
 /* ===== Format-layout invariants =====
  *
@@ -61,7 +61,8 @@ inline constexpr uint32_t CST_MAGIC = 0x1C545343u;
  *     are buffer-sizing limits, not enum identities. */
 inline constexpr uint8_t INSN_FLAG_SYNC_SHIFT = 2;
 inline constexpr uint8_t INSN_FLAG_SYNC_MASK  = 0x3Cu;
-inline constexpr uint8_t FID_SLOT_COUNT       = 16;
+inline constexpr uint16_t FID_SLOT_COUNT      = 64;
+inline constexpr uint8_t  FID_SLOT_STRIDE     = 5;
 inline constexpr size_t  MAX_WIDE_BYTES       = 64;
 inline constexpr int     MAX_INSN_BYTES       = 16;
 
@@ -85,27 +86,27 @@ struct ResolvedIds {
     uint8_t body_tag_iframe        = 0;
     uint8_t body_tag_regfile       = 0;
 
-    /* field_id map: base IDs of the per-slot ranges + singletons */
-    uint8_t fid_n_loads          = 0;
-    uint8_t fid_load_addr_base   = 0;
-    uint8_t fid_store_addr_base  = 0;
-    uint8_t fid_load_data_base   = 0;
-    uint8_t fid_store_data_base  = 0;
-    uint8_t fid_dst_reg_base     = 0;
-    uint8_t fid_n_stores         = 0;
-    uint8_t fid_extra_load_addr  = 0;
-    uint8_t fid_extra_store_addr = 0;
-    uint8_t fid_extra_load_data  = 0;
-    uint8_t fid_extra_store_data = 0;
-    uint8_t fid_insn_bytes_lo    = 0;
-    uint8_t fid_insn_bytes_hi    = 0;
-    uint8_t fid_insn_opcode      = 0;
-    uint8_t fid_insn_branch_type = 0;
-    uint8_t fid_insn_flags       = 0;
-    uint8_t fid_insn_immediate   = 0;
-    uint8_t fid_insn_size        = 0;
-    uint8_t fid_metaflags        = 0;
-    uint8_t fid_extended         = 0;
+    /* field_id map: base IDs of the per-slot ranges + singletons.
+     * FIDs are ULEB128 on the wire (format version 0x1D); the
+     * uint16_t storage covers the 0x1D layout's max slotted ID of
+     * ~322 with headroom for future renumberings.  Slot k of family
+     * <F> sits at fid_<f>_base + k * FID_SLOT_STRIDE. */
+    uint16_t fid_n_loads          = 0;
+    uint16_t fid_n_stores         = 0;
+    uint16_t fid_metaflags        = 0;
+    uint16_t fid_load_addr_base   = 0;
+    uint16_t fid_store_addr_base  = 0;
+    uint16_t fid_load_data_base   = 0;
+    uint16_t fid_store_data_base  = 0;
+    uint16_t fid_dst_reg_base     = 0;
+    uint16_t fid_insn_bytes_lo    = 0;
+    uint16_t fid_insn_bytes_hi    = 0;
+    uint16_t fid_insn_opcode      = 0;
+    uint16_t fid_insn_branch_type = 0;
+    uint16_t fid_insn_flags       = 0;
+    uint16_t fid_insn_immediate   = 0;
+    uint16_t fid_insn_size        = 0;
+    uint16_t fid_extended         = 0;
 
     /* insn_flag map: bit masks inside the per-insn flags byte */
     uint8_t insn_flag_branch_cond  = 0;

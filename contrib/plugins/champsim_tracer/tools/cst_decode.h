@@ -64,11 +64,15 @@ namespace cst {
  * decode time in hashtable lookups).  Direct array indexing is a
  * load + compare per cell. */
 /* Layout matches FIELD_STATE_SLOT_COUNT in champsim_tracer_output.cc:
- *   1 N_LOADS + 5*16 slotted (load_addr/store_addr/load_data/store_data
- *   /dst_reg) + 1 N_STORES + 7 insn-metadata + 1 METAFLAGS = 90.
+ *   3 singletons (N_LOADS, N_STORES, METAFLAGS) + 5 * FID_SLOT_COUNT
+ *   (slotted families: load_addr/store_addr/load_data/store_data/
+ *   dst_reg) + 7 insn-metadata.  EXTENDED has no persistent cell.
  * Bump alongside the writer when new families are added.            */
-inline constexpr size_t FIELD_STATE_SLOT_COUNT = 90;
-inline constexpr uint8_t FIELD_STATE_SLOT_INVALID = 0xFF;
+inline constexpr size_t  FIELD_STATE_SLOT_COUNT   = 3 + 5 * FID_SLOT_COUNT + 7;
+inline constexpr uint16_t FIELD_STATE_SLOT_INVALID = 0xFFFFu;
+/* fid space is ULEB-encoded; the highest slotted FID at slot 63 is
+ * ~322.  Round to next power-of-two for a single-load slot lookup. */
+inline constexpr size_t  FID_LUT_SIZE             = 512;
 
 struct FieldStateBlock {
     uint32_t              n_insns = 0;
@@ -203,8 +207,9 @@ private:
      * register (e.g. RISC-V), in which case no metaflags are surfaced. */
     int      reg_flags_id_;
     /* fid -> dense slot index, built from header_.ids at construction.
-     * EXTRA_* / EXTENDED return FIELD_STATE_SLOT_INVALID. */
-    std::array<uint8_t, 256> slot_lut_{};
+     * EXTENDED returns FIELD_STATE_SLOT_INVALID.  Sized by
+     * FID_LUT_SIZE (covers the ULEB-encoded fid space). */
+    std::array<uint16_t, FID_LUT_SIZE> slot_lut_{};
     BodyStats stats_;
 };
 

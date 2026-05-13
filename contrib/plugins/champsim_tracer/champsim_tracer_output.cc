@@ -279,44 +279,48 @@ static void write_reg_encoding_map(BitWriter *bw)
 
 static void write_field_id_encoding_map(BitWriter *bw)
 {
+    /* Count: 3 hot singletons + 5 slotted families × CST_FID_SLOT_COUNT
+     * + 7 insn-metadata + 1 EXTENDED. */
+    const uint64_t n_entries =
+        3 + (uint64_t)5 * CST_FID_SLOT_COUNT + 7 + 1;
     bw_write_string(bw, "field_id");
-    bw_write_uleb128(bw, 95);
-    write_encoding_entry(bw, CST_FID_N_LOADS, "CST_FID_N_LOADS");
-    for (uint64_t i = 0; i < CST_FID_SLOT_COUNT; i++) {
-        g_autofree char *name = g_strdup_printf("CST_FID_LOAD_ADDR%" PRIu64, i);
-        write_encoding_entry(bw, CST_FID_LOAD_ADDR_BASE + i, name);
+    bw_write_uleb128(bw, n_entries);
+
+    /* Hot singletons. */
+    write_encoding_entry(bw, CST_FID_N_LOADS,   "CST_FID_N_LOADS");
+    write_encoding_entry(bw, CST_FID_N_STORES,  "CST_FID_N_STORES");
+    write_encoding_entry(bw, CST_FID_METAFLAGS, "CST_FID_METAFLAGS");
+
+    /* Slotted families.  Slot k of family <F> sits at
+     * CST_FID_<F>_BASE + k * CST_FID_SLOT_STRIDE; the encoding map
+     * emits one (id → name) pair per slot so decoders can look up
+     * by name without needing to know the stride. */
+    static const struct { uint8_t base; const char *prefix; } fam[] = {
+        { CST_FID_LOAD_ADDR_BASE,   "CST_FID_LOAD_ADDR"   },
+        { CST_FID_STORE_ADDR_BASE,  "CST_FID_STORE_ADDR"  },
+        { CST_FID_LOAD_DATA_BASE,   "CST_FID_LOAD_DATA"   },
+        { CST_FID_STORE_DATA_BASE,  "CST_FID_STORE_DATA"  },
+        { CST_FID_DST_REG_BASE,     "CST_FID_DST_REG"     },
+    };
+    for (uint64_t k = 0; k < CST_FID_SLOT_COUNT; k++) {
+        for (size_t f = 0; f < G_N_ELEMENTS(fam); f++) {
+            unsigned id = fam[f].base + (unsigned)k * CST_FID_SLOT_STRIDE;
+            g_autofree char *name = g_strdup_printf("%s%" PRIu64,
+                                                    fam[f].prefix, k);
+            write_encoding_entry(bw, id, name);
+        }
     }
-    for (uint64_t i = 0; i < CST_FID_SLOT_COUNT; i++) {
-        g_autofree char *name = g_strdup_printf("CST_FID_STORE_ADDR%" PRIu64, i);
-        write_encoding_entry(bw, CST_FID_STORE_ADDR_BASE + i, name);
-    }
-    for (uint64_t i = 0; i < CST_FID_SLOT_COUNT; i++) {
-        g_autofree char *name = g_strdup_printf("CST_FID_LOAD_DATA%" PRIu64, i);
-        write_encoding_entry(bw, CST_FID_LOAD_DATA_BASE + i, name);
-    }
-    for (uint64_t i = 0; i < CST_FID_SLOT_COUNT; i++) {
-        g_autofree char *name = g_strdup_printf("CST_FID_STORE_DATA%" PRIu64, i);
-        write_encoding_entry(bw, CST_FID_STORE_DATA_BASE + i, name);
-    }
-    for (uint64_t i = 0; i < CST_FID_SLOT_COUNT; i++) {
-        g_autofree char *name = g_strdup_printf("CST_FID_DST_REG%" PRIu64, i);
-        write_encoding_entry(bw, CST_FID_DST_REG_BASE + i, name);
-    }
+
+    /* Cold insn-metadata singletons + EXTENDED. */
     static const EncodingMapEntry insn_fields[] = {
-        { CST_FID_N_STORES, "CST_FID_N_STORES" },
-        { CST_FID_EXTRA_LOAD_ADDR, "CST_FID_EXTRA_LOAD_ADDR" },
-        { CST_FID_EXTRA_STORE_ADDR, "CST_FID_EXTRA_STORE_ADDR" },
-        { CST_FID_EXTRA_LOAD_DATA, "CST_FID_EXTRA_LOAD_DATA" },
-        { CST_FID_EXTRA_STORE_DATA, "CST_FID_EXTRA_STORE_DATA" },
-        { CST_FID_INSN_BYTES_LO, "CST_FID_INSN_BYTES_LO" },
-        { CST_FID_INSN_BYTES_HI, "CST_FID_INSN_BYTES_HI" },
-        { CST_FID_INSN_OPCODE, "CST_FID_INSN_OPCODE" },
+        { CST_FID_INSN_BYTES_LO,    "CST_FID_INSN_BYTES_LO" },
+        { CST_FID_INSN_BYTES_HI,    "CST_FID_INSN_BYTES_HI" },
+        { CST_FID_INSN_OPCODE,      "CST_FID_INSN_OPCODE" },
         { CST_FID_INSN_BRANCH_TYPE, "CST_FID_INSN_BRANCH_TYPE" },
-        { CST_FID_INSN_FLAGS, "CST_FID_INSN_FLAGS" },
-        { CST_FID_INSN_IMMEDIATE, "CST_FID_INSN_IMMEDIATE" },
-        { CST_FID_INSN_SIZE, "CST_FID_INSN_SIZE" },
-        { CST_FID_METAFLAGS, "CST_FID_METAFLAGS" },
-        { CST_FID_EXTENDED, "CST_FID_EXTENDED" },
+        { CST_FID_INSN_FLAGS,       "CST_FID_INSN_FLAGS" },
+        { CST_FID_INSN_IMMEDIATE,   "CST_FID_INSN_IMMEDIATE" },
+        { CST_FID_INSN_SIZE,        "CST_FID_INSN_SIZE" },
+        { CST_FID_EXTENDED,         "CST_FID_EXTENDED" },
     };
     for (size_t i = 0; i < G_N_ELEMENTS(insn_fields); i++) {
         write_encoding_entry(bw, insn_fields[i].value, insn_fields[i].name);
@@ -761,21 +765,6 @@ static inline void u512_mask_bytes(U512 *v, uint8_t size)
     }
 }
 
-static void bw_write_uleb128_u512(BitWriter *bw, U512 v)
-{
-    uint8_t buf[80];
-    size_t n = 0;
-    do {
-        uint8_t byte = (uint8_t)(v.limb[0] & 0x7F);
-        u512_shr7(&v);
-        if (!u512_is_zero(v)) {
-            byte |= 0x80;
-        }
-        buf[n++] = byte;
-    } while (!u512_is_zero(v));
-    bw_raw(bw, buf, n);
-}
-
 static void bw_write_sleb128_u512(BitWriter *bw, U512 v)
 {
     uint8_t buf[80];
@@ -796,12 +785,17 @@ static void bw_write_sleb128_u512(BitWriter *bw, U512 v)
 }
 
 enum {
-    FIELD_STATE_SLOT_INVALID = 0xFF,
-    /* Layout: 1 (N_LOADS) + 5*16 (slotted families) + 1 (N_STORES)
-     * + 7 (insn-metadata bytes_lo..size) + 1 (METAFLAGS).
+    FIELD_STATE_SLOT_INVALID = 0xFFFFu,
+    /* Layout: 1 (N_LOADS) + 1 (N_STORES) + 1 (METAFLAGS) + 5
+     * (slotted families) × CST_FID_SLOT_COUNT + 7 (insn-metadata
+     * bytes_lo..size).  EXTENDED has no persistent state cell.
      * Keep the matching FIELD_STATE_SLOT_COUNT in tools/cst_decode.h
      * in sync when this grows.                                       */
-    FIELD_STATE_SLOT_COUNT = 1 + (5 * CST_FID_SLOT_COUNT) + 1 + 7 + 1,
+    FIELD_STATE_SLOT_COUNT = 3 + (5 * CST_FID_SLOT_COUNT) + 7,
+    /* Field-ID space is now ULEB128 — FIDs reach ~330 for slot 63 of
+     * the last family.  Round up to the next power of two so the
+     * fid -> slot lookup stays a single load with no bounds dance. */
+    FIELD_STATE_LUT_SIZE   = 512,
 };
 
 typedef struct FieldStateBlock {
@@ -832,43 +826,53 @@ struct FieldStateTable {
  * calls on a 5 M-insn mcf trace, the chain showed up as 2.6 % of
  * total runtime; the table form drops that to a rounding error.
  */
-static uint8_t g_field_state_slot_lut[256];
-static bool    g_field_state_slot_lut_built = false;
+static uint16_t g_field_state_slot_lut[FIELD_STATE_LUT_SIZE];
+static bool     g_field_state_slot_lut_built = false;
 
+/* FIELD_STATE_SLOT_COUNT layout (matches the LUT below):
+ *   slot 0:   N_LOADS
+ *   slot 1:   N_STORES
+ *   slot 2:   METAFLAGS
+ *   slot 3:   LOAD_ADDR[0]      ... slot (3 + 5*k):     LOAD_ADDR[k]
+ *   slot 4:   STORE_ADDR[0]     ... slot (3 + 5*k + 1): STORE_ADDR[k]
+ *   slot 5:   LOAD_DATA[0]      ... slot (3 + 5*k + 2): LOAD_DATA[k]
+ *   slot 6:   STORE_DATA[0]     ... slot (3 + 5*k + 3): STORE_DATA[k]
+ *   slot 7:   DST_REG[0]        ... slot (3 + 5*k + 4): DST_REG[k]
+ *   slot (3 + 5*N): INSN_BYTES_LO ... INSN_SIZE  (N = CST_FID_SLOT_COUNT)
+ * Total = 3 + 5*N + 7 = FIELD_STATE_SLOT_COUNT. */
 static void field_state_slot_lut_build(void)
 {
-    for (unsigned i = 0; i < 256; i++) {
+    for (unsigned i = 0; i < FIELD_STATE_LUT_SIZE; i++) {
         g_field_state_slot_lut[i] = FIELD_STATE_SLOT_INVALID;
     }
-    g_field_state_slot_lut[CST_FID_N_LOADS] = 0;
+    g_field_state_slot_lut[CST_FID_N_LOADS]   = 0;
+    g_field_state_slot_lut[CST_FID_N_STORES]  = 1;
+    g_field_state_slot_lut[CST_FID_METAFLAGS] = 2;
+
+    static const uint8_t fam_base[5] = {
+        CST_FID_LOAD_ADDR_BASE,
+        CST_FID_STORE_ADDR_BASE,
+        CST_FID_LOAD_DATA_BASE,
+        CST_FID_STORE_DATA_BASE,
+        CST_FID_DST_REG_BASE,
+    };
     for (unsigned k = 0; k < CST_FID_SLOT_COUNT; k++) {
-        g_field_state_slot_lut[CST_FID_LOAD_ADDR_BASE + k] =
-            1 + k;
-        g_field_state_slot_lut[CST_FID_STORE_ADDR_BASE + k] =
-            1 + CST_FID_SLOT_COUNT + k;
-        g_field_state_slot_lut[CST_FID_LOAD_DATA_BASE + k] =
-            1 + (2 * CST_FID_SLOT_COUNT) + k;
-        g_field_state_slot_lut[CST_FID_STORE_DATA_BASE + k] =
-            1 + (3 * CST_FID_SLOT_COUNT) + k;
-        g_field_state_slot_lut[CST_FID_DST_REG_BASE + k] =
-            1 + (4 * CST_FID_SLOT_COUNT) + k;
+        for (unsigned f = 0; f < G_N_ELEMENTS(fam_base); f++) {
+            unsigned fid = fam_base[f] + k * CST_FID_SLOT_STRIDE;
+            g_field_state_slot_lut[fid] = (uint16_t)(3 + 5 * k + f);
+        }
     }
-    g_field_state_slot_lut[CST_FID_N_STORES] =
-        1 + (5 * CST_FID_SLOT_COUNT);
+    unsigned slotted_dense_end = 3 + 5 * CST_FID_SLOT_COUNT;
     for (unsigned f = CST_FID_INSN_BYTES_LO; f <= CST_FID_INSN_SIZE; f++) {
-        g_field_state_slot_lut[f] = 2 + (5 * CST_FID_SLOT_COUNT)
-            + (f - CST_FID_INSN_BYTES_LO);
+        g_field_state_slot_lut[f] =
+            (uint16_t)(slotted_dense_end + (f - CST_FID_INSN_BYTES_LO));
     }
-    /* METAFLAGS sits right after the insn-metadata block.  One slot
-     * per insn (1-byte canonical Z/N/C/V/P byte), gated by reg_data. */
-    g_field_state_slot_lut[CST_FID_METAFLAGS] =
-        2 + (5 * CST_FID_SLOT_COUNT)
-        + (CST_FID_INSN_SIZE - CST_FID_INSN_BYTES_LO + 1);
     g_field_state_slot_lut_built = true;
 }
 
-static inline uint8_t field_state_slot_index(uint8_t field_id)
+static inline uint16_t field_state_slot_index(unsigned field_id)
 {
+    if (field_id >= FIELD_STATE_LUT_SIZE) return FIELD_STATE_SLOT_INVALID;
     return g_field_state_slot_lut[field_id];
 }
 
@@ -932,7 +936,7 @@ static FieldStateBlock *field_state_table_get_block(FieldStateTable *table,
 static inline bool field_state_block_get(FieldStateBlock *block,
                                          uint32_t table_generation,
                                          uint32_t ins_pos,
-                                         uint8_t slot_index,
+                                         uint16_t slot_index,
                                          U512 *out)
 {
     if (!block || ins_pos >= block->n_insns ||
@@ -961,7 +965,7 @@ static inline bool field_state_block_get(FieldStateBlock *block,
 static inline bool field_state_block_get_u64(FieldStateBlock *block,
                                              uint32_t table_generation,
                                              uint32_t ins_pos,
-                                             uint8_t slot_index,
+                                             uint16_t slot_index,
                                              uint64_t *out)
 {
     if (!block || ins_pos >= block->n_insns ||
@@ -1008,8 +1012,15 @@ struct EntryView {
 typedef struct EntryView EntryView;
 
 typedef struct {
-    uint8_t base_field_id;
-    uint8_t slot_count;        /* 1 for non-slotted families */
+    /* Base field ID for slot 0 of this family.  Wide enough to hold
+     * the ULEB128 wire encoding's full range; values up to ~330
+     * appear in practice for high-slot DST_REG entries. */
+    uint16_t base_field_id;
+    /* Distance in the FID space between slot k and slot k+1 of this
+     * family.  1 for non-slotted singletons; CST_FID_SLOT_STRIDE for
+     * the slotted families that share an interleaved range. */
+    uint8_t  slot_stride;
+    uint8_t  slot_count;        /* 1 for non-slotted families */
     bool gated_by_mem_data;
     bool gated_by_reg_data;
     /* extract: returns true and writes *out_val if (ins_pos, slot)
@@ -1501,84 +1512,112 @@ static bool extr_u64_insn_size(const EntryView *ev, uint32_t i, uint8_t slot,
                                uint64_t *out)
 { *out = deflt_u64_insn_size(ev->tmpl, i, slot); return true; }
 
-/* Field family registry.  Order MUST be ascending by base_field_id so
- * the emitter walks records in (ins_pos, field_id) order. */
+/* Field family registry.
+ *
+ * Order matters for two reasons:
+ *
+ *  1. The per-insn emitter walks this table left-to-right and emits
+ *     records in (ins_pos, descriptor-order) order.  The on-wire
+ *     order is enforced as non-descending (ins_pos, field_id);
+ *     within a single insn, the descriptor order must match the
+ *     ascending field_id order the wire expects.  With the new
+ *     interleaved-by-slot layout the bases are 0..7 (singletons +
+ *     slot 0 of every family), so a table order of
+ *
+ *         N_LOADS, N_STORES, METAFLAGS,
+ *         LOAD_ADDR, STORE_ADDR, LOAD_DATA, STORE_DATA, DST_REG,
+ *         INSN_BYTES_LO, INSN_BYTES_HI, INSN_OPCODE, INSN_BRANCH_TYPE,
+ *         INSN_FLAGS, INSN_IMMEDIATE, INSN_SIZE
+ *
+ *     matches what a decoder that resorted by field_id would expect.
+ *
+ *  2. The five slotted families share the same stride-5 ID space.
+ *     Each slot k contributes one record per family that has an
+ *     observation; the emitter visits descriptors in family order
+ *     for slot k=0, then k=1, ... which produces ascending fids
+ *     thanks to the interleave.  See the slot-stride note on
+ *     FieldDescriptor.slot_stride. */
 static const FieldDescriptor field_descriptors[] = {
-        { CST_FID_N_LOADS,          1,  false, false,
+        { CST_FID_N_LOADS,          1, 1,  false, false,
             extr_n_loads,        deflt_n_loads,         nullptr,
             extr_u64_n_loads,    deflt_u64_zero,
             false /* dynamic: actual_n_loads[i] */,
             "N_LOADS" },
-        { CST_FID_LOAD_ADDR_BASE,   CST_FID_SLOT_COUNT, false, false,
-            extr_load_addr,      deflt_zero,            cap_loads,
-            extr_u64_load_addr,  deflt_u64_zero,
-            false /* dynamic: dyn_param value */,
-            "LOAD_ADDR" },
-        { CST_FID_STORE_ADDR_BASE,  CST_FID_SLOT_COUNT, false, false,
-            extr_store_addr,     deflt_zero,            cap_stores,
-            extr_u64_store_addr, deflt_u64_zero,
-            false /* dynamic: dyn_param value */,
-            "STORE_ADDR" },
-        { CST_FID_LOAD_DATA_BASE,   CST_FID_SLOT_COUNT, true,  false,
-            extr_load_data,      deflt_zero,            cap_loads,
-            nullptr,             nullptr,
-            false /* dynamic: memdata payload */,
-            "LOAD_DATA" },
-        { CST_FID_STORE_DATA_BASE,  CST_FID_SLOT_COUNT, true,  false,
-            extr_store_data,     deflt_zero,            cap_stores,
-            nullptr,             nullptr,
-            false /* dynamic: memdata payload */,
-            "STORE_DATA" },
-        { CST_FID_DST_REG_BASE,     CST_FID_SLOT_COUNT, false, true,
-            extr_dst_reg,        deflt_zero,            cap_dst_regs,
-            nullptr,             nullptr,
-            false /* dynamic: post-exec reg value */,
-            "DST_REG" },
-        { CST_FID_N_STORES,         1,  false, false,
+        { CST_FID_N_STORES,         1, 1,  false, false,
             extr_n_stores,       deflt_n_stores,        nullptr,
             extr_u64_n_stores,   deflt_u64_zero,
             false /* dynamic: actual_n_stores[i] */,
             "N_STORES" },
-        { CST_FID_INSN_BYTES_LO,    1,  false, false,
-            extr_insn_bytes_lo,  deflt_insn_bytes_lo,   nullptr,
-            extr_u64_insn_bytes_lo, deflt_u64_insn_bytes_lo,
-            true /* extract == template_default */,
-            "INSN_BYTES_LO" },
-        { CST_FID_INSN_BYTES_HI,    1,  false, false,
-            extr_insn_bytes_hi,  deflt_insn_bytes_hi,   nullptr,
-            extr_u64_insn_bytes_hi, deflt_u64_insn_bytes_hi,
-            true /* extract == template_default */,
-            "INSN_BYTES_HI" },
-        { CST_FID_INSN_OPCODE,      1,  false, false,
-            extr_insn_opcode,    deflt_insn_opcode,     nullptr,
-            extr_u64_insn_opcode, deflt_u64_insn_opcode,
-            true /* extract == template_default */,
-            "OPCODE" },
-        { CST_FID_INSN_BRANCH_TYPE, 1,  false, false,
-            extr_insn_branch_type, deflt_insn_branch_type, nullptr,
-            extr_u64_insn_branch_type, deflt_u64_insn_branch_type,
-            true /* extract == template_default */,
-            "BRANCH_TYPE" },
-        { CST_FID_INSN_FLAGS,       1,  false, false,
-            extr_insn_flags,     deflt_insn_flags,      nullptr,
-            extr_u64_insn_flags, deflt_u64_insn_flags,
-            true /* extract == template_default */,
-            "INSN_FLAGS" },
-        { CST_FID_INSN_IMMEDIATE,   1,  false, false,
-            extr_insn_imm,       deflt_insn_imm,        nullptr,
-            extr_u64_insn_imm,   deflt_u64_insn_imm,
-            true /* extract == template_default */,
-            "IMMEDIATE" },
-        { CST_FID_INSN_SIZE,        1,  false, false,
-            extr_insn_size,      deflt_insn_size,       nullptr,
-            extr_u64_insn_size,  deflt_u64_insn_size,
-            true /* extract == template_default */,
-            "INSN_SIZE" },
-        { CST_FID_METAFLAGS,        1,  false, true,
+        { CST_FID_METAFLAGS,        1, 1,  false, true,
             extr_metaflags,      deflt_metaflags,       nullptr,
             extr_u64_metaflags,  deflt_u64_metaflags,
             false /* dynamic: derived from REG_FLAGS snap per exec */,
             "METAFLAGS" },
+        { CST_FID_LOAD_ADDR_BASE,   CST_FID_SLOT_STRIDE, CST_FID_SLOT_COUNT,
+            false, false,
+            extr_load_addr,      deflt_zero,            cap_loads,
+            extr_u64_load_addr,  deflt_u64_zero,
+            false /* dynamic: dyn_param value */,
+            "LOAD_ADDR" },
+        { CST_FID_STORE_ADDR_BASE,  CST_FID_SLOT_STRIDE, CST_FID_SLOT_COUNT,
+            false, false,
+            extr_store_addr,     deflt_zero,            cap_stores,
+            extr_u64_store_addr, deflt_u64_zero,
+            false /* dynamic: dyn_param value */,
+            "STORE_ADDR" },
+        { CST_FID_LOAD_DATA_BASE,   CST_FID_SLOT_STRIDE, CST_FID_SLOT_COUNT,
+            true,  false,
+            extr_load_data,      deflt_zero,            cap_loads,
+            nullptr,             nullptr,
+            false /* dynamic: memdata payload */,
+            "LOAD_DATA" },
+        { CST_FID_STORE_DATA_BASE,  CST_FID_SLOT_STRIDE, CST_FID_SLOT_COUNT,
+            true,  false,
+            extr_store_data,     deflt_zero,            cap_stores,
+            nullptr,             nullptr,
+            false /* dynamic: memdata payload */,
+            "STORE_DATA" },
+        { CST_FID_DST_REG_BASE,     CST_FID_SLOT_STRIDE, CST_FID_SLOT_COUNT,
+            false, true,
+            extr_dst_reg,        deflt_zero,            cap_dst_regs,
+            nullptr,             nullptr,
+            false /* dynamic: post-exec reg value */,
+            "DST_REG" },
+        { CST_FID_INSN_BYTES_LO,    1, 1,  false, false,
+            extr_insn_bytes_lo,  deflt_insn_bytes_lo,   nullptr,
+            extr_u64_insn_bytes_lo, deflt_u64_insn_bytes_lo,
+            true /* extract == template_default */,
+            "INSN_BYTES_LO" },
+        { CST_FID_INSN_BYTES_HI,    1, 1,  false, false,
+            extr_insn_bytes_hi,  deflt_insn_bytes_hi,   nullptr,
+            extr_u64_insn_bytes_hi, deflt_u64_insn_bytes_hi,
+            true /* extract == template_default */,
+            "INSN_BYTES_HI" },
+        { CST_FID_INSN_OPCODE,      1, 1,  false, false,
+            extr_insn_opcode,    deflt_insn_opcode,     nullptr,
+            extr_u64_insn_opcode, deflt_u64_insn_opcode,
+            true /* extract == template_default */,
+            "OPCODE" },
+        { CST_FID_INSN_BRANCH_TYPE, 1, 1,  false, false,
+            extr_insn_branch_type, deflt_insn_branch_type, nullptr,
+            extr_u64_insn_branch_type, deflt_u64_insn_branch_type,
+            true /* extract == template_default */,
+            "BRANCH_TYPE" },
+        { CST_FID_INSN_FLAGS,       1, 1,  false, false,
+            extr_insn_flags,     deflt_insn_flags,      nullptr,
+            extr_u64_insn_flags, deflt_u64_insn_flags,
+            true /* extract == template_default */,
+            "INSN_FLAGS" },
+        { CST_FID_INSN_IMMEDIATE,   1, 1,  false, false,
+            extr_insn_imm,       deflt_insn_imm,        nullptr,
+            extr_u64_insn_imm,   deflt_u64_insn_imm,
+            true /* extract == template_default */,
+            "IMMEDIATE" },
+        { CST_FID_INSN_SIZE,        1, 1,  false, false,
+            extr_insn_size,      deflt_insn_size,       nullptr,
+            extr_u64_insn_size,  deflt_u64_insn_size,
+            true /* extract == template_default */,
+            "INSN_SIZE" },
 };
 
 #define N_FIELD_DESCRIPTORS (sizeof(field_descriptors) / sizeof(field_descriptors[0]))
@@ -1721,13 +1760,13 @@ static U512 field_state_get(FieldStateBlock *state_block,
                             FieldStateBlock *base_block,
                             uint32_t base_generation,
                             uint32_t ins_pos,
-                            uint8_t field_id,
+                            uint16_t field_id,
                             const FieldDescriptor *fd,
                             const BBTemplate *tmpl,
                             uint8_t slot)
 {
     U512 cur;
-    uint8_t slot_index = field_state_slot_index(field_id);
+    uint16_t slot_index = field_state_slot_index(field_id);
     if (field_state_block_get(state_block, state_generation, ins_pos,
                               slot_index, &cur)) {
         return cur;
@@ -1743,10 +1782,10 @@ static U512 field_state_get(FieldStateBlock *state_block,
 static void field_state_put(FieldStateBlock *state_block,
                             uint32_t state_generation,
                             uint32_t ins_pos,
-                            uint8_t field_id,
+                            uint16_t field_id,
                             U512 v)
 {
-    uint8_t slot_index = field_state_slot_index(field_id);
+    uint16_t slot_index = field_state_slot_index(field_id);
     if (!state_block || ins_pos >= state_block->n_insns ||
         slot_index == FIELD_STATE_SLOT_INVALID) {
         return;
@@ -1756,16 +1795,12 @@ static void field_state_put(FieldStateBlock *state_block,
     state_block->generations[index] = state_generation;
 }
 
-typedef enum StageRecKind {
-    STAGE_REC_SCALAR,
-    STAGE_REC_VECTOR,
-} StageRecKind;
-
 typedef struct StageRec {
     uint32_t pos;
-    uint8_t fid;
-    StageRecKind kind;
-    U512 delta;
+    /* Wire-format FID, widened from u8 since 0x1D — slot 63 of the
+     * last slotted family reaches ID 322. */
+    uint16_t fid;
+    U512     delta;
 } StageRec;
 
 static void stage_rec_append(StageRec **stage, unsigned int *stage_len,
@@ -1779,115 +1814,30 @@ static void stage_rec_append(StageRec **stage, unsigned int *stage_len,
     (*stage)[(*stage_len)++] = rec;
 }
 
-static void stage_extra_memop_vectors(StageRec **stage, unsigned int *stage_len,
-                                      unsigned int *stage_cap, const EntryView *ev,
-                                      uint32_t i, uint8_t header_flags)
+/* CP memop overflow warning.  When an instruction's dynamic
+ * memop count would exceed CST_FID_SLOT_COUNT, the slot loop
+ * silently clamps and we emit one line to unknown_warnings.log
+ * per entry — the cap is set well above realistic ISA ceilings
+ * (AVX-512 ≤ 16, max-VLEN SVE ≤ 64), so any overflow is worth
+ * a per-occurrence breadcrumb. */
+static void warn_memop_overflow(const BBTemplate *tmpl, uint32_t insn_i,
+                                uint32_t n_loads, uint32_t n_stores)
 {
-    if (!ev->actual_n_loads || !ev->actual_n_stores) {
+    if (!unknown_warn_file || !tmpl || insn_i >= tmpl->n_insns) return;
+    if (n_loads <= CST_FID_SLOT_COUNT && n_stores <= CST_FID_SLOT_COUNT) {
         return;
     }
-    bool has_mem_data = (header_flags & CST_FLAG_MEM_DATA) != 0;
-    if (ev->actual_n_loads[i] > CST_FID_SLOT_COUNT) {
-        StageRec rec = {};
-        rec.pos = i;
-        rec.fid = CST_FID_EXTRA_LOAD_ADDR;
-        rec.kind = STAGE_REC_VECTOR;
-        stage_rec_append(stage, stage_len, stage_cap,
-                         rec);
-    }
-    if (ev->actual_n_stores[i] > CST_FID_SLOT_COUNT) {
-        StageRec rec = {};
-        rec.pos = i;
-        rec.fid = CST_FID_EXTRA_STORE_ADDR;
-        rec.kind = STAGE_REC_VECTOR;
-        stage_rec_append(stage, stage_len, stage_cap,
-                         rec);
-    }
-    if (has_mem_data && ev->actual_n_loads[i] > CST_FID_SLOT_COUNT) {
-        StageRec rec = {};
-        rec.pos = i;
-        rec.fid = CST_FID_EXTRA_LOAD_DATA;
-        rec.kind = STAGE_REC_VECTOR;
-        stage_rec_append(stage, stage_len, stage_cap,
-                         rec);
-    }
-    if (has_mem_data && ev->actual_n_stores[i] > CST_FID_SLOT_COUNT) {
-        StageRec rec = {};
-        rec.pos = i;
-        rec.fid = CST_FID_EXTRA_STORE_DATA;
-        rec.kind = STAGE_REC_VECTOR;
-        stage_rec_append(stage, stage_len, stage_cap,
-                         rec);
-    }
-}
-
-static uint32_t extra_memop_count(const EntryView *ev, uint32_t i,
-                                  uint8_t want_type)
-{
-    uint32_t total = want_type == DYN_LOAD_ADDR
-        ? ev->actual_n_loads[i]
-        : ev->actual_n_stores[i];
-    return total > CST_FID_SLOT_COUNT ? total - CST_FID_SLOT_COUNT : 0;
-}
-
-static void bw_write_extra_memop_vector(BitWriter *bw, const EntryView *ev,
-                                        uint32_t i, uint8_t fid)
-{
-    uint8_t want_type;
-    bool want_data;
-
-    switch (fid) {
-    case CST_FID_EXTRA_LOAD_ADDR:
-        want_type = DYN_LOAD_ADDR;
-        want_data = false;
-        break;
-    case CST_FID_EXTRA_STORE_ADDR:
-        want_type = DYN_STORE_ADDR;
-        want_data = false;
-        break;
-    case CST_FID_EXTRA_LOAD_DATA:
-        want_type = DYN_LOAD_ADDR;
-        want_data = true;
-        break;
-    case CST_FID_EXTRA_STORE_DATA:
-        want_type = DYN_STORE_ADDR;
-        want_data = true;
-        break;
-    default:
-        g_assert_not_reached();
-    }
-
-    uint32_t extra = extra_memop_count(ev, i, want_type);
-    bw_write_uleb128(bw, extra);
-    if (extra == 0 || !ev->dyn_params || !ev->insn_dp_off) {
-        return;
-    }
-
-    uint32_t seen = 0;
-    uint32_t written = 0;
-    uint32_t begin = ev->insn_dp_off[i];
-    uint32_t end = ev->insn_dp_off[i + 1];
-    for (uint32_t k = begin; k < end && written < extra; k++) {
-        const DynParam *dp = &(*ev->dyn_params)[k];
-        if (dp->type != want_type) {
-            continue;
-        }
-        if (seen++ < CST_FID_SLOT_COUNT) {
-            continue;
-        }
-        if (want_data) {
-            U512 data = dp->data;
-            u512_mask_bytes(&data, dp->data_size);
-            bw_write_uleb128_u512(bw, data);
-        } else {
-            bw_write_uleb128(bw, dp->value);
-        }
-        written++;
-    }
-
-    while (written++ < extra) {
-        bw_write_uleb128(bw, 0);
-    }
+    const InsnFields *f = &tmpl->insn_fields[insn_i];
+    uint64_t pc = tmpl->insn_pcs ? tmpl->insn_pcs[insn_i] : 0;
+    g_mutex_lock(&unknown_warn_lock);
+    fprintf(unknown_warn_file,
+            "pc=0x%" PRIx64 " isa=%u reason=memop_overflow "
+            "n_loads=%u n_stores=%u cap=%u opcode=%u\n",
+            pc, (unsigned)trace_isa,
+            n_loads, n_stores, (unsigned)CST_FID_SLOT_COUNT,
+            (unsigned)f->opcode);
+    fflush(unknown_warn_file);
+    g_mutex_unlock(&unknown_warn_lock);
 }
 
 /*
@@ -1936,6 +1886,16 @@ static void emit_field_delta_section(BitWriter *main_bw,
         uint32_t base_generation = base_state ? base_state->generation : 0;
 
         for (uint32_t i = 0; i < ev->tmpl->n_insns; i++) {
+            /* Diagnostic: warn when the dynamic memop count would
+             * exceed CST_FID_SLOT_COUNT.  The slot loop below will
+             * silently clamp to the cap; this log line surfaces the
+             * truncation so it doesn't get lost. */
+            uint32_t insn_n_loads  = ev->actual_n_loads
+                ? ev->actual_n_loads[i]  : 0;
+            uint32_t insn_n_stores = ev->actual_n_stores
+                ? ev->actual_n_stores[i] : 0;
+            warn_memop_overflow(ev->tmpl, i, insn_n_loads, insn_n_stores);
+
             for (size_t d = 0; d < N_FIELD_DESCRIPTORS; d++) {
                 const FieldDescriptor *fd = &field_descriptors[d];
                 /* Template-static families (OPCODE, BRANCH_TYPE,
@@ -1966,8 +1926,9 @@ static void emit_field_delta_section(BitWriter *main_bw,
                     for (uint8_t slot = 0; slot < cap; slot++) {
                         uint64_t cur;
                         if (!fd->extract_u64(ev, i, slot, &cur)) continue;
-                        uint8_t fid = fd->base_field_id + slot;
-                        uint8_t slot_index = field_state_slot_index(fid);
+                        uint16_t fid = (uint16_t)(fd->base_field_id +
+                                                  slot * fd->slot_stride);
+                        uint16_t slot_index = field_state_slot_index(fid);
                         uint64_t base;
                         if (!field_state_block_get_u64(state_block,
                                                        state_generation,
@@ -1981,7 +1942,6 @@ static void emit_field_delta_section(BitWriter *main_bw,
                         StageRec rec = {};
                         rec.pos = i;
                         rec.fid = fid;
-                        rec.kind = STAGE_REC_SCALAR;
                         rec.delta = u512_from_u64_diff(cur, base);
                         stage_rec_append(&stage, &stage_len, &stage_cap, rec);
                         /* Update narrow state: limb[0] only.  Wide
@@ -2002,7 +1962,8 @@ static void emit_field_delta_section(BitWriter *main_bw,
                     for (uint8_t slot = 0; slot < cap; slot++) {
                         U512 cur;
                         if (!fd->extract(ev, i, slot, &cur)) continue;
-                        uint8_t fid = fd->base_field_id + slot;
+                        uint16_t fid = (uint16_t)(fd->base_field_id +
+                                                  slot * fd->slot_stride);
                         U512 base =
                             field_state_get(state_block, state_generation,
                                             base_block, base_generation,
@@ -2011,35 +1972,41 @@ static void emit_field_delta_section(BitWriter *main_bw,
                         StageRec rec = {};
                         rec.pos = i;
                         rec.fid = fid;
-                        rec.kind = STAGE_REC_SCALAR;
                         rec.delta = u512_sub(cur, base);
                         stage_rec_append(&stage, &stage_len, &stage_cap, rec);
                         field_state_put(state_block, state_generation,
                                         i, fid, cur);
                     }
                 }
-                if (fd->base_field_id == CST_FID_N_STORES) {
-                    stage_extra_memop_vectors(&stage, &stage_len, &stage_cap,
-                                              ev, i, header_flags);
-                }
             }
         }
     }
 
+    /* Wire format requires non-descending (ins_pos, fid) order.  The
+     * collection loop above visits descriptors in family-major order,
+     * which produces ascending fids per-insn EXCEPT for the slotted
+     * families' interleaved layout (slot k of LOAD_ADDR is at the
+     * same FID range as slot 0 of STORE_ADDR + stride, etc.).  Sort
+     * by (pos, fid) here so the wire emit can rely on monotonicity. */
+    if (stage_len > 1) {
+        std::stable_sort(stage, stage + stage_len,
+            [](const StageRec &a, const StageRec &b) {
+                if (a.pos != b.pos) return a.pos < b.pos;
+                return a.fid < b.fid;
+            });
+    }
+
     uint64_t section_start = bw_tell_bytes(main_bw);
 
-    /* Build payload in rec_bw, then emit as length-prefixed section. */
+    /* Build payload in rec_bw, then emit as length-prefixed section.
+     * Format version 0x1D: fid is ULEB128 (was u8 through 0x1C). */
     bw_write_uleb128(&rec_bw, stage_len);
     for (unsigned int r = 0; r < stage_len; r++) {
         StageRec *s = &stage[r];
         uint64_t gap = (uint64_t)(s->pos - prev_pos);
         bw_write_uleb128(&rec_bw, gap);
-        bw_write_u8(&rec_bw, s->fid);
-        if (s->kind == STAGE_REC_VECTOR) {
-            bw_write_extra_memop_vector(&rec_bw, ev, s->pos, s->fid);
-        } else {
-            bw_write_sleb128_u512(&rec_bw, s->delta);
-        }
+        bw_write_uleb128(&rec_bw, s->fid);
+        bw_write_sleb128_u512(&rec_bw, s->delta);
         prev_pos = s->pos;
     }
     bw_byte_align(&rec_bw);

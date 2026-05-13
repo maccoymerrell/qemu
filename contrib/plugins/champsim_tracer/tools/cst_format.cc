@@ -14,6 +14,8 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -262,12 +264,21 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
 
 /* ===== POSIX-ustar reader ================================================
  *
- * Walks @data scanning for the two known member names; once both are
- * located, returns their byte ranges as views into @data.  Pure-
- * memory: no I/O, no temp files.  Handles regular files at typeflag
- * '0' or '\0' (some tar implementations leave it nul).  Long
- * filenames (>100 bytes) aren't supported — our member names are
- * short and stable. */
+ * Walks @data scanning for tar members; returns the byte range of
+ * each as a view into @data.  Pure-memory: no I/O, no temp files.
+ *
+ * Compatibility goals — accepts:
+ *   - Our own writer's output (POSIX ustar, magic "ustar\0", "00")
+ *   - GNU tar's default format (magic "ustar ", version " \0")
+ *   - PAX archives (typeflag 'x' / 'g' extended headers; payloads
+ *     are skipped, file members in between still surface)
+ *   - GNU base-256 size encoding (>8 GiB members)
+ *
+ * The intent is that a user can `tar -xf foo.cst && tar -cf bar.cst
+ * body.cst* header.cst*` with any standard tar and bar.cst still
+ * reads cleanly.  Long-filename extensions ('L', PAX path=) are not
+ * supported — our member names are short and stable.
+ */
 struct UstarHeader {
     char name[100];
     char mode[8];
@@ -303,6 +314,57 @@ uint64_t parse_octal(const char *field, size_t n)
     return v;
 }
 
+/* Decode the @size field, transparently handling either standard
+ * octal (POSIX-ustar's 11-digit + NUL form, capped at 8 GiB) or the
+ * GNU base-256 extension used for larger members.  The marker is
+ * the high bit of the first byte: 0x80 for unsigned positive,
+ * 0xFF for two's-complement negative (we treat the remaining 7 bits
+ * of either as a positive value since sizes are unsigned). */
+uint64_t parse_size_field(const char *field, size_t n)
+{
+    auto leading = (unsigned char)field[0];
+    if (leading & 0x80) {
+        uint64_t v = (uint64_t)(leading & 0x7F);
+        for (size_t i = 1; i < n; i++) {
+            v = (v << 8) | (uint64_t)(unsigned char)field[i];
+        }
+        return v;
+    }
+    return parse_octal(field, n);
+}
+
+/* Verify the ustar header checksum.  Sum of all 512 bytes, with the
+ * checksum field itself treated as eight spaces during the sum.
+ * Older tars wrote the checksum as a signed sum; we accept either
+ * to stay compatible with archives produced by historical tools. */
+bool verify_ustar_checksum(const UstarHeader *h)
+{
+    constexpr size_t checksum_off  = offsetof(UstarHeader, checksum);
+    constexpr size_t checksum_size = sizeof(((UstarHeader *)0)->checksum);
+
+    uint32_t unsigned_sum = 0;
+    int32_t  signed_sum   = 0;
+    const unsigned char *p = (const unsigned char *)h;
+    for (size_t i = 0; i < sizeof(*h); i++) {
+        unsigned char v =
+            (i >= checksum_off && i < checksum_off + checksum_size)
+                ? (unsigned char)' '
+                : p[i];
+        unsigned_sum += v;
+        signed_sum   += (int32_t)(int8_t)v;
+    }
+    uint64_t want = parse_octal(h->checksum, checksum_size);
+    return want == unsigned_sum || want == (uint32_t)signed_sum;
+}
+
+/* True if @h's magic field identifies it as ustar.  Accepts both the
+ * POSIX form ("ustar\0", version "00") and the GNU form ("ustar ",
+ * version " \0") by matching on the 5-byte "ustar" prefix only. */
+bool ustar_magic_ok(const UstarHeader *h)
+{
+    return std::memcmp(h->magic, "ustar", 5) == 0;
+}
+
 struct TarMember {
     std::string name;
     const uint8_t *data;
@@ -315,27 +377,42 @@ std::vector<TarMember> walk_tar(const uint8_t *data, size_t size)
     size_t off = 0;
     while (off + 512 <= size) {
         const UstarHeader *h = (const UstarHeader *)(data + off);
+
         /* Two consecutive zero blocks = end-of-archive. */
         bool all_zero = true;
         for (size_t i = 0; i < 512; i++) {
             if (((const uint8_t *)h)[i] != 0) { all_zero = false; break; }
         }
-        if (all_zero) {
-            break;
+        if (all_zero) break;
+
+        if (!ustar_magic_ok(h)) {
+            throw std::runtime_error("tar: header missing 'ustar' magic");
         }
-        /* ustar magic check — be lenient: some writers omit the
-         * "ustar\0" magic.  We require either "ustar" magic OR a
-         * plausible name + size combination. */
+        if (!verify_ustar_checksum(h)) {
+            throw std::runtime_error("tar: header checksum mismatch");
+        }
+
         size_t name_len = strnlen(h->name, sizeof(h->name));
         if (name_len == 0) {
             throw std::runtime_error("tar: header with empty name");
         }
-        uint64_t member_size = parse_octal(h->size, sizeof(h->size));
+        uint64_t member_size = parse_size_field(h->size, sizeof(h->size));
         off += 512;
         if (off + member_size > size) {
             throw std::runtime_error("tar: member extends past EOF");
         }
+        size_t padded = (member_size + 511) & ~(size_t)511;
+
         char tf = h->typeflag;
+        if (tf == 'x' || tf == 'g') {
+            /* PAX per-file ('x') or global ('g') extended header.
+             * Skip the payload; we don't currently surface PAX
+             * extended attributes.  This lets a user re-tar a .cst
+             * through `tar --format=pax` and have the result still
+             * read cleanly. */
+            off += padded;
+            continue;
+        }
         if (tf == '\0' || tf == '0') {
             TarMember m;
             m.name = std::string(h->name, name_len);
@@ -343,8 +420,9 @@ std::vector<TarMember> walk_tar(const uint8_t *data, size_t size)
             m.size = (size_t)member_size;
             out.push_back(std::move(m));
         }
-        /* Pad member data to 512-byte boundary. */
-        size_t padded = (member_size + 511) & ~(size_t)511;
+        /* Other typeflags (symlinks, dirs, devices, GNU 'L' long-
+         * names, ...) are silently skipped — our two members are
+         * the only file types we know how to consume. */
         off += padded;
     }
     return out;

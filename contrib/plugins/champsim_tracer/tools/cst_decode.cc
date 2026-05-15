@@ -941,6 +941,9 @@ Instruction build_one(const Template &tmpl, uint32_t insn_idx,
     insn.store_data_dep_mask = I.store_data_dep_mask;
     insn.load_addr_dep_mask  = I.load_addr_dep_mask;
     insn.store_addr_dep_mask = I.store_addr_dep_mask;
+    insn.lane_parallel       = I.lane_parallel;
+    insn.src_lane_mask       = I.src_lane_mask;
+    insn.dst_lane_mask       = I.dst_lane_mask;
     insn.bb_template_id     = tmpl.template_id;
     insn.insn_index_in_bb   = insn_idx;
     insn.seq_num            = entry.seq_num;

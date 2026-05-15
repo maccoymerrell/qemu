@@ -210,6 +210,45 @@ typedef struct InsnFields {
     uint64_t load_addr_dep_mask[MAX_LOADS];
     uint64_t store_addr_dep_mask[MAX_STORES];
     /*
+     * Intra-register lane participation (CST_INSN_FLAG_VEC sub-block).
+     * Per-slot bitmaps describing *which lanes* of each vector reg
+     * participate in this insn.  Bit k of src_lane_mask[i] is set iff
+     * lane k of src_regs[i] is consumed; bit k of dst_lane_mask[d] is
+     * set iff lane k of dst_regs[d] is produced.
+     *
+     * Set by the row's `.dep_refine` callback when the insn is a
+     * vector op (alongside the dst_dep_mask / store_data_dep_mask the
+     * same refiner sets).  Refiners that leave these zero implicitly
+     * tell the wire encoder "no lane info to emit" — has_vec_lanes is
+     * the gate.
+     *
+     * Consumer interpretation depends on CST_INSN_FLAG_LANE_PARALLEL:
+     *   - LANE_PARALLEL set: bit k of dst_lane_mask[d] depends *only*
+     *     on bit k of every src in dst's dep mask.  Independent per-
+     *     lane chains; consumer can model lane-grain rename / OoO.
+     *   - LANE_PARALLEL clear: lanes participate but don't line up by
+     *     index (shuffles, broadcasts, horizontal reductions).
+     *     Consumer must fall back to per-slot all-to-all *across*
+     *     lanes within the mask.
+     *
+     * Mask width is uint64_t — enough for AVX-512 ZMM at 8-bit lane
+     * granularity (64 lanes).  On the wire each mask ULEB-encodes,
+     * so common 4/8/16-lane cases stay 1 byte.
+     */
+    bool     has_vec_lanes;
+    uint64_t src_lane_mask[MAX_SRC_REGS];
+    uint64_t dst_lane_mask[MAX_DST_REGS];
+    /*
+     * Set on lane-parallel arith (VADDPS, VPADDD, VMULPS, VANDPS,
+     * VFMA family etc.) to flip CST_INSN_FLAG_LANE_PARALLEL on the
+     * wire.  Implies has_vec_lanes; refiners that set this must also
+     * populate the lane masks.  Cleared on cross-lane ops (VPSHUFB,
+     * VBROADCAST, VPERMD, VHADDPS) where the masks still describe
+     * which lanes are touched but consumers can't assume per-lane
+     * independence.
+     */
+    bool     lane_parallel;
+    /*
      * x86 REP / REPNZ string-op metadata.  Non-zero on insns whose
      * Capstone detail carried info->has_rep; both fields capture the
      * memops this insn issues *per iteration* (one architectural

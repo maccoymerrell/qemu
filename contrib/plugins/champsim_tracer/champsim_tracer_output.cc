@@ -280,9 +280,11 @@ static void write_reg_encoding_map(BitWriter *bw)
 static void write_field_id_encoding_map(BitWriter *bw)
 {
     /* Count: 3 hot singletons + 5 slotted families × CST_FID_SLOT_COUNT
-     * + 7 insn-metadata + 1 EXTENDED. */
+     * + 2 lane-mask families × CST_FID_SLOT_COUNT + 7 insn-metadata
+     * + 1 EXTENDED. */
     const uint64_t n_entries =
-        3 + (uint64_t)5 * CST_FID_SLOT_COUNT + 7 + 1;
+        3 + (uint64_t)5 * CST_FID_SLOT_COUNT
+          + (uint64_t)2 * CST_FID_SLOT_COUNT + 7 + 1;
     bw_write_string(bw, "field_id");
     bw_write_uleb128(bw, n_entries);
 
@@ -307,6 +309,22 @@ static void write_field_id_encoding_map(BitWriter *bw)
             unsigned id = fam[f].base + (unsigned)k * CST_FID_SLOT_STRIDE;
             g_autofree char *name = g_strdup_printf("%s%" PRIu64,
                                                     fam[f].prefix, k);
+            write_encoding_entry(bw, id, name);
+        }
+    }
+
+    /* Lane-mask block (separate from the hot slotted block so it
+     * doesn't shift the cheaper 1-byte ULEB range). */
+    static const struct { uint16_t base; const char *prefix; } lane_fam[] = {
+        { CST_FID_SRC_LANE_MASK_BASE, "CST_FID_SRC_LANE_MASK" },
+        { CST_FID_DST_LANE_MASK_BASE, "CST_FID_DST_LANE_MASK" },
+    };
+    for (uint64_t k = 0; k < CST_FID_SLOT_COUNT; k++) {
+        for (size_t f = 0; f < G_N_ELEMENTS(lane_fam); f++) {
+            unsigned id = lane_fam[f].base
+                + (unsigned)k * CST_FID_LANE_BLOCK_STRIDE;
+            g_autofree char *name = g_strdup_printf("%s%" PRIu64,
+                                                    lane_fam[f].prefix, k);
             write_encoding_entry(bw, id, name);
         }
     }
@@ -806,14 +824,18 @@ static void bw_write_sleb128_u512(BitWriter *bw, U512 v)
 enum {
     FIELD_STATE_SLOT_INVALID = 0xFFFFu,
     /* Layout: 1 (N_LOADS) + 1 (N_STORES) + 1 (METAFLAGS) + 5
-     * (slotted families) × CST_FID_SLOT_COUNT + 7 (insn-metadata
+     * (slotted families) × CST_FID_SLOT_COUNT + 2 (lane-mask
+     * families) × CST_FID_SLOT_COUNT + 7 (insn-metadata
      * bytes_lo..size).  EXTENDED has no persistent state cell.
      * Keep the matching FIELD_STATE_SLOT_COUNT in tools/cst_decode.h
      * in sync when this grows.                                       */
-    FIELD_STATE_SLOT_COUNT = 3 + (5 * CST_FID_SLOT_COUNT) + 7,
-    /* Field-ID space is now ULEB128 — FIDs reach ~330 for slot 63 of
-     * the last family.  Round up to the next power of two so the
-     * fid -> slot lookup stays a single load with no bounds dance. */
+    FIELD_STATE_SLOT_COUNT = 3 + (5 * CST_FID_SLOT_COUNT)
+                               + (2 * CST_FID_SLOT_COUNT) + 7,
+    /* Field-ID space is ULEB128 — FIDs reach CST_FID_EXTENDED.
+     * Round up to the next power of two so the fid -> slot lookup
+     * stays a single load with no bounds dance.  At slot count 64
+     * the largest FID is the EXTENDED escape just past the lane
+     * block (~460), so 512 suffices. */
     FIELD_STATE_LUT_SIZE   = 512,
 };
 
@@ -857,8 +879,11 @@ static bool     g_field_state_slot_lut_built = false;
  *   slot 5:   LOAD_DATA[0]      ... slot (3 + 5*k + 2): LOAD_DATA[k]
  *   slot 6:   STORE_DATA[0]     ... slot (3 + 5*k + 3): STORE_DATA[k]
  *   slot 7:   DST_REG[0]        ... slot (3 + 5*k + 4): DST_REG[k]
- *   slot (3 + 5*N): INSN_BYTES_LO ... INSN_SIZE  (N = CST_FID_SLOT_COUNT)
- * Total = 3 + 5*N + 7 = FIELD_STATE_SLOT_COUNT. */
+ *   slot (3 + 5*N) + 2*k:     SRC_LANE_MASK[k]   (k in 0..N-1)
+ *   slot (3 + 5*N) + 2*k + 1: DST_LANE_MASK[k]
+ *   slot (3 + 5*N + 2*N): INSN_BYTES_LO ... INSN_SIZE
+ *     (N = CST_FID_SLOT_COUNT)
+ * Total = 3 + 5*N + 2*N + 7 = FIELD_STATE_SLOT_COUNT. */
 static void field_state_slot_lut_build(void)
 {
     for (unsigned i = 0; i < FIELD_STATE_LUT_SIZE; i++) {
@@ -881,7 +906,19 @@ static void field_state_slot_lut_build(void)
             g_field_state_slot_lut[fid] = (uint16_t)(3 + 5 * k + f);
         }
     }
-    unsigned slotted_dense_end = 3 + 5 * CST_FID_SLOT_COUNT;
+    unsigned lane_dense_base = 3 + 5 * CST_FID_SLOT_COUNT;
+    static const uint16_t lane_fam_base[2] = {
+        CST_FID_SRC_LANE_MASK_BASE,
+        CST_FID_DST_LANE_MASK_BASE,
+    };
+    for (unsigned k = 0; k < CST_FID_SLOT_COUNT; k++) {
+        for (unsigned f = 0; f < G_N_ELEMENTS(lane_fam_base); f++) {
+            unsigned fid = lane_fam_base[f] + k * CST_FID_LANE_BLOCK_STRIDE;
+            g_field_state_slot_lut[fid] =
+                (uint16_t)(lane_dense_base + 2 * k + f);
+        }
+    }
+    unsigned slotted_dense_end = lane_dense_base + 2 * CST_FID_SLOT_COUNT;
     for (unsigned f = CST_FID_INSN_BYTES_LO; f <= CST_FID_INSN_SIZE; f++) {
         g_field_state_slot_lut[f] =
             (uint16_t)(slotted_dense_end + (f - CST_FID_INSN_BYTES_LO));

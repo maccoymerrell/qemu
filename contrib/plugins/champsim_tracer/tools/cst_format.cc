@@ -214,6 +214,10 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
                 &ids->fid_store_data_base);
     resolve_one(maps.field_id, "field_id", "CST_FID_DST_REG0",
                 &ids->fid_dst_reg_base);
+    resolve_one(maps.field_id, "field_id", "CST_FID_SRC_LANE_MASK0",
+                &ids->fid_src_lane_mask_base);
+    resolve_one(maps.field_id, "field_id", "CST_FID_DST_LANE_MASK0",
+                &ids->fid_dst_lane_mask_base);
     resolve_one(maps.field_id, "field_id", "CST_FID_INSN_BYTES_LO",
                 &ids->fid_insn_bytes_lo);
     resolve_one(maps.field_id, "field_id", "CST_FID_INSN_BYTES_HI",

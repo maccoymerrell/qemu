@@ -262,21 +262,41 @@ extern "C" {
 #define CST_FID_DST_REG_BASE     7    /* gated by CST_FLAG_REG_DATA */
 
 /* Last slotted ID = base + (SLOT_COUNT-1) * STRIDE = base + 315.
- * Insn-metadata + EXTENDED start immediately after the slot range. */
+ * Lane-mask block + insn-metadata start immediately after. */
 #define CST_FID_SLOTTED_END      (CST_FID_DST_REG_BASE + \
                                   (CST_FID_SLOT_COUNT - 1) * CST_FID_SLOT_STRIDE)
 
+/* Lane-mask block.  Separate from the hot slotted block above so the
+ * cheaper 1-byte ULEB range stays reserved for memop / dst-reg FIDs
+ * that fire every entry; lane masks for the common (static) case
+ * cost zero record bytes anyway thanks to the field-delta encoding.
+ *
+ * SRC_LANE_MASK / DST_LANE_MASK are per-slot lane participation
+ * bitmaps for vector ops (CST_INSN_FLAG_VEC).  Bit k of each mask
+ * marks lane k of the corresponding src/dst reg as participating.
+ * Refiner-set template baseline; FID deltas override at runtime when
+ * the active mask differs (x86 EVEX k1 predicates, RISC-V V
+ * vtype.VL, AArch64 SVE predicates).
+ */
+#define CST_FID_LANE_BLOCK_BASE     (CST_FID_SLOTTED_END + 1)
+#define CST_FID_LANE_BLOCK_STRIDE   2
+#define CST_FID_SRC_LANE_MASK_BASE  (CST_FID_LANE_BLOCK_BASE + 0)
+#define CST_FID_DST_LANE_MASK_BASE  (CST_FID_LANE_BLOCK_BASE + 1)
+#define CST_FID_LANE_BLOCK_END      (CST_FID_DST_LANE_MASK_BASE + \
+                                     (CST_FID_SLOT_COUNT - 1) * \
+                                     CST_FID_LANE_BLOCK_STRIDE)
+
 /* Cold instruction-metadata fields.  Baseline = template's static
  * value, so unchanged-from-template fields cost zero record bytes.
- * Numbered past the slotted range; emit as 2-byte ULEBs.            */
-#define CST_FID_INSN_BYTES_LO    (CST_FID_SLOTTED_END + 1)  /* low 8 bytes of insn_bytes, LE u64 */
-#define CST_FID_INSN_BYTES_HI    (CST_FID_SLOTTED_END + 2)  /* high 8 bytes (x86 long enc.)      */
-#define CST_FID_INSN_OPCODE      (CST_FID_SLOTTED_END + 3)
-#define CST_FID_INSN_BRANCH_TYPE (CST_FID_SLOTTED_END + 4)
-#define CST_FID_INSN_FLAGS       (CST_FID_SLOTTED_END + 5)
-#define CST_FID_INSN_IMMEDIATE   (CST_FID_SLOTTED_END + 6)
-#define CST_FID_INSN_SIZE        (CST_FID_SLOTTED_END + 7)
-#define CST_FID_EXTENDED         (CST_FID_SLOTTED_END + 8)  /* reserved escape */
+ * Numbered past the lane block; emit as 2-byte ULEBs.               */
+#define CST_FID_INSN_BYTES_LO    (CST_FID_LANE_BLOCK_END + 1)  /* low 8 bytes of insn_bytes, LE u64 */
+#define CST_FID_INSN_BYTES_HI    (CST_FID_LANE_BLOCK_END + 2)  /* high 8 bytes (x86 long enc.)      */
+#define CST_FID_INSN_OPCODE      (CST_FID_LANE_BLOCK_END + 3)
+#define CST_FID_INSN_BRANCH_TYPE (CST_FID_LANE_BLOCK_END + 4)
+#define CST_FID_INSN_FLAGS       (CST_FID_LANE_BLOCK_END + 5)
+#define CST_FID_INSN_IMMEDIATE   (CST_FID_LANE_BLOCK_END + 6)
+#define CST_FID_INSN_SIZE        (CST_FID_LANE_BLOCK_END + 7)
+#define CST_FID_EXTENDED         (CST_FID_LANE_BLOCK_END + 8)  /* reserved escape */
 
 /* Total well-known field-id count, for sanity / encoding-map size. */
 #define CST_FID_COUNT            (CST_FID_EXTENDED + 1)

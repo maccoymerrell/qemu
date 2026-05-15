@@ -57,8 +57,9 @@ inline constexpr uint32_t CST_MAGIC = 0x1D545343u;
  * field_id assignments) ARE derivable from the encoding-map entries
  * the trace header carries — consumers should always pull them
  * through resolve_ids() rather than hardcoding numeric values. */
-inline constexpr uint16_t FID_SLOT_COUNT      = 64;
-inline constexpr uint8_t  FID_SLOT_STRIDE     = 5;
+inline constexpr uint16_t FID_SLOT_COUNT       = 64;
+inline constexpr uint8_t  FID_SLOT_STRIDE      = 5;
+inline constexpr uint8_t  FID_LANE_BLOCK_STRIDE = 2;
 inline constexpr size_t  MAX_WIDE_BYTES       = 64;
 inline constexpr int     MAX_INSN_BYTES       = 16;
 
@@ -95,6 +96,12 @@ struct ResolvedIds {
     uint16_t fid_load_data_base   = 0;
     uint16_t fid_store_data_base  = 0;
     uint16_t fid_dst_reg_base     = 0;
+    /* Lane-mask block — separate from the main slotted block to keep
+     * the cheaper 1-byte ULEB range reserved for memop / dst-reg FIDs.
+     * Slot k of family <f> in the lane block sits at
+     * fid_<f>_lane_mask_base + k * FID_LANE_BLOCK_STRIDE.            */
+    uint16_t fid_src_lane_mask_base = 0;
+    uint16_t fid_dst_lane_mask_base = 0;
     uint16_t fid_insn_bytes_lo    = 0;
     uint16_t fid_insn_bytes_hi    = 0;
     uint16_t fid_insn_opcode      = 0;

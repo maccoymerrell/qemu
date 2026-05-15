@@ -2735,6 +2735,7 @@ def audit_one(info: IsaInfo, *, max_lines: int) -> int:
     dep_fallback_rows: list[tuple[str, str]] = []   # (const_name, op)
     dep_missing_refiner: list[tuple[str, str]] = []  # (const, refiner)
     dep_unknown_refiner: list[tuple[str, str]] = []  # (const, refiner)
+    dep_all_degenerate_rows: list[tuple[str, str]] = []  # (const_name, op)
     for const_name in constants:
         new = classify(info, const_name)
         old = existing.get(const_name)
@@ -2747,11 +2748,9 @@ def audit_one(info: IsaInfo, *, max_lines: int) -> int:
             continue
         if old.without_refine() != new:
             mismatched.append((const_name, old, new))
-        # Dep-coverage tally.  Rows assigned the catch-all
-        # dep_all_to_all FALL into one of two buckets — the
-        # classifier's affirmative all-to-all decision (covered) or
-        # the fallback after every classifier missed (the precision
-        # gap, grouped by GenericOpcode below).
+        # Dep-coverage tally.  Rows are assigned a refiner and
+        # accounted as either affirmative (classifier had positive
+        # evidence) or fallback (every classifier missed).
         if old.dep_refine is None:
             dep_missing_refiner.append((const_name, "(missing)"))
             continue
@@ -2764,6 +2763,14 @@ def audit_one(info: IsaInfo, *, max_lines: int) -> int:
             dep_affirmative_count += 1
         else:
             dep_fallback_rows.append((const_name, old.op))
+        # Flag canonicals where Capstone's source tables systematically
+        # under-tag every variant (only "degenerate" access lists with
+        # no dst).  These get an affirmative dep_all_to_all assignment
+        # as a conservative-correct workaround, but the underlying
+        # Capstone-side gap is upstream worth reporting.
+        cap_vs = _variants_by_canonical(info.key).get(const_name)
+        if cap_vs and all(_is_degenerate_variant(v) for v in cap_vs):
+            dep_all_degenerate_rows.append((const_name, old.op))
 
     classified = len({name for name in constants if classify(info, name).op != "GEN_OP_UNKNOWN"})
     print(f"{info.key}: constants={len(constants) + 1} classified_by_rules={classified} existing={len(existing)} missing={len(missing)} mismatched={len(mismatched)} stale={len(stale)}")
@@ -2818,6 +2825,22 @@ def audit_one(info: IsaInfo, *, max_lines: int) -> int:
         for const_name, op in dep_fallback_rows:
             by_op.setdefault(op, []).append(const_name)
         print(f"  precision gap — rows the classifier couldn't place (by op):")
+        for op in sorted(by_op, key=lambda k: (-len(by_op[k]), k)):
+            sample = ", ".join(by_op[op][:4])
+            more = "" if len(by_op[op]) <= 4 else f", ... +{len(by_op[op]) - 4}"
+            print(f"    {op}: {len(by_op[op])}  [{sample}{more}]")
+    if dep_all_degenerate_rows and max_lines > 0:
+        # Visibility into upstream Capstone tagging: canonicals whose
+        # every variant has a degenerate access list (1-entry, no dst).
+        # The audit classifier promotes them to affirmative
+        # dep_all_to_all as a conservative-correct workaround; the
+        # underlying tagging is incomplete in Capstone's source
+        # tables and worth reporting upstream when patching them up.
+        by_op = {}
+        for const_name, op in dep_all_degenerate_rows:
+            by_op.setdefault(op, []).append(const_name)
+        print(f"  upstream-Capstone gap — canonicals with only "
+              f"degenerate variants ({len(dep_all_degenerate_rows)}):")
         for op in sorted(by_op, key=lambda k: (-len(by_op[k]), k)):
             sample = ", ".join(by_op[op][:4])
             more = "" if len(by_op[op]) <= 4 else f", ... +{len(by_op[op]) - 4}"

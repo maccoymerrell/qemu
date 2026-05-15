@@ -1126,11 +1126,25 @@ def classify_x86_lane(const_name: str,
     return ("LANE_MASK_KIND_STATIC", True)
 
 
-# aarch64: NEON canonicals carry no obvious width marker in the
-# variant.internal name (Capstone names follow the encoding spec —
-# ADDv8i8 / ADDv4i16 / ADDv16i8 / etc.).  The marker pattern is
-# "v<count>i<bits>" or trailing arrangement letters.
-AARCH64_VEC_VARIANT_RE = re.compile(r"v\d+[ifu]\d+|v\d+[BHSD]|[BHSD]\d+")
+# aarch64 — Capstone variant-name vector markers, anchored against
+# false positives from the "AARCH64_" prefix (which contains "H64").
+#   - NEON: lowercase v<count>i<width> / v<count>f<width> (e.g.
+#     ADDv8i8, FADDv4f32), the `v` token always lowercase and
+#     preceded by a non-letter.
+#   - SVE / SME: variant ends in _<B|H|S|D> (lane element width).
+#   - SVE Z-register / predicate references: tokens like _ZZ_,
+#     _ZZZ_, _ZPmZ_, _ZZZ?I_ in the middle of the variant name.
+# The combination filters out all GPR forms (ADDWri, ADCXr, ...)
+# whose names contain neither pattern.
+AARCH64_VEC_VARIANT_RES = (
+    re.compile(r"(?:^|[^A-Za-z])v\d+[ifuBHSD]"),
+    re.compile(r"_[BHSD]$"),
+    re.compile(r"_Z[ZP]"),
+)
+
+
+def _aarch64_variant_is_vec(internal: str) -> bool:
+    return any(r.search(internal) for r in AARCH64_VEC_VARIANT_RES)
 
 AARCH64_CROSS_LANE_PREFIXES: tuple[str, ...] = (
     "TBL", "TBX",
@@ -1149,7 +1163,7 @@ AARCH64_CROSS_LANE_PREFIXES: tuple[str, ...] = (
 def classify_aarch64_lane(const_name: str,
                           variants: tuple) -> tuple[str, bool] | None:
     name = const_name.removeprefix("AARCH64_INS_")
-    if not any(AARCH64_VEC_VARIANT_RE.search(v.internal) for v in variants):
+    if not any(_aarch64_variant_is_vec(v.internal) for v in variants):
         return None
     for p in AARCH64_CROSS_LANE_PREFIXES:
         if name.startswith(p):
@@ -1189,17 +1203,33 @@ def classify_riscv_lane(const_name: str,
     return ("LANE_MASK_KIND_RISCV_VTYPE", True)
 
 
-# MIPS MSA — canonical insn names end in _B / _H / _W / _D for the
-# lane width.  Variants of MSA insns reference W<n> regs.
-MIPS_MSA_VARIANT_RE = re.compile(r"\bW\d+\b|MSA")
+# MIPS MSA — canonical names end in _B / _H / _W / _D and the
+# variants stay "clean" (no microMIPS / nanoMIPS / DSP suffix).
+# MIPS DSP canonicals also use _W / _PH / _QB suffixes but their
+# variants have _MM / _MMR2 / _NM siblings; FP-scalar canonicals
+# expand to F-prefix variants (FABS_S, FABS_D32, ...).
 MSA_LANE_SUFFIXES = ("_B", "_H", "_W", "_D")
-
+MIPS_NON_MSA_VARIANT_SUFFIXES = ("_MM", "_MMR2", "_NM", "_R6", "_NMR6",
+                                  "_D32", "_D64", "_D64_R6")
 MIPS_MSA_CROSS_LANE_PREFIXES: tuple[str, ...] = (
     "SHF_", "PCKEV_", "PCKOD_", "ILVL_", "ILVR_", "ILVEV_", "ILVOD_",
-    "VSHF_", "SPLATI_", "INSERT_", "INSVE_",
+    "VSHF_", "SPLATI_", "INSERT_", "INSVE_", "COPY_",
     "FEXDO_", "FEXUPL_", "FEXUPR_",
     "HADD_", "HSUB_",
 )
+
+
+def _mips_variant_is_msa(internal: str) -> bool:
+    # MSA variants have clean names that don't carry the
+    # microMIPS / nanoMIPS / DSP-format suffixes, and never start
+    # with "MIPS_F" (which marks scalar FP).
+    stem = internal.removeprefix("MIPS_")
+    if stem.startswith("F"):
+        return False
+    for suf in MIPS_NON_MSA_VARIANT_SUFFIXES:
+        if stem.endswith(suf):
+            return False
+    return True
 
 
 def classify_mips_lane(const_name: str,
@@ -1207,10 +1237,12 @@ def classify_mips_lane(const_name: str,
     name = const_name.removeprefix("MIPS_INS_")
     if not any(name.endswith(s) for s in MSA_LANE_SUFFIXES):
         return None
-    # Confirm with Capstone variant info — MSA insns reference
-    # W<n> registers in their internal name.
-    if variants and not any(MIPS_MSA_VARIANT_RE.search(v.internal)
-                            for v in variants):
+    # All variants must look MSA-clean.  DSP / FP-scalar / microMIPS
+    # canonicals share the _B/_H/_W/_D suffixes but their variants
+    # carry distinctive markers (_MM, _MMR2, F prefix) that knock
+    # them out.
+    if not variants or not all(_mips_variant_is_msa(v.internal)
+                                for v in variants):
         return None
     for p in MIPS_MSA_CROSS_LANE_PREFIXES:
         if name.startswith(p):

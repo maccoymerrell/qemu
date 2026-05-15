@@ -175,26 +175,6 @@ enum BranchType {
 };
 
 /*
- * Sync event types.  See mnemonics.h for full commentary on use.
- *
- * Dense-encoded so the per-insn flag byte can carry the value in
- * just 2 bits (CST_INSN_FLAG_SYNC_MASK), freeing the previously
- * SYNC-reserved bits for other per-insn flags.  Wire-format
- * encoding map is self-describing — consumers read the
- * name→value mapping from the trace header, so re-encoding here
- * propagates automatically without a separate version bump.
- */
-typedef enum {
-    SYNC_NONE            = 0,
-    SYNC_THREAD_SWITCH   = 1,
-    SYNC_ATOMIC          = 2,
-    /* Sentinel: one past the highest defined sync event ID.  When
-     * more sync types are needed, either add a 4th codepoint here
-     * (still fits in 2 bits) or widen CST_INSN_FLAG_SYNC_MASK back. */
-    SYNC_EVENT_COUNT,
-} SyncEventType;
-
-/*
  * ISA-agnostic register IDs.
  * Consistent numbering across ISAs with reserved special register IDs.
  */
@@ -379,16 +359,6 @@ static inline const char *branch_type_name_or_unknown(unsigned id)
 {
     const char *n = branch_type_name(id);
     return n ? n : "BRANCH_???";
-}
-
-static inline const char *sync_event_name(unsigned id)
-{
-    switch (id) {
-    case SYNC_NONE:           return "SYNC_NONE";
-    case SYNC_THREAD_SWITCH:  return "SYNC_THREAD_SWITCH";
-    case SYNC_ATOMIC:         return "SYNC_ATOMIC";
-    default:                  return NULL;
-    }
 }
 
 /*

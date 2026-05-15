@@ -57,8 +57,8 @@ header member (Step 1):
 * `template_by_id` — map from `template_id : u32` to a parsed
   `Template` (start_pc, num_insns, per-insn descriptors).
 * `encoding_maps` — ten maps (`opcode`, `branch_type`,
-  `sync_hint`, `reg`, `field_id`, `header_flag`, `insn_flag`,
-  `body_tag`, `wp_event_flag`, `metaflags`, `dep_block_flag`), each
+  `reg`, `field_id`, `header_flag`, `insn_flag`, `body_tag`,
+  `wp_event_flag`, `metaflags`, `dep_block_flag`), each
   `value : u64 → name : string`.  Built from the encoding-maps
   section in Step 1.
 * `ids` — the well-known numeric IDs the decoder will dispatch on,
@@ -496,11 +496,14 @@ bits 3..7                    reserved, written as 0
 Per-instruction template flags:
 
 ```
-bit 0      CST_INSN_FLAG_BRANCH_COND
-bit 1      CST_INSN_FLAG_HAS_IMM
-bits 2..5  sync_hint, a 4-bit SyncEventType value
-bit 6      CST_INSN_FLAG_HAS_DEP_BLOCK     intra-instruction dep mask
-bit 7      reserved, written as 0
+bit 0  CST_INSN_FLAG_BRANCH_COND
+bit 1  CST_INSN_FLAG_HAS_IMM
+bit 2  CST_INSN_FLAG_ATOMIC          atomic / locked memory op
+bit 3  reserved, written as 0
+bit 4  CST_INSN_FLAG_VEC             per-slot lane bitmaps present
+bit 5  CST_INSN_FLAG_LANE_PARALLEL   lane bitmaps line up by lane idx
+bit 6  CST_INSN_FLAG_HAS_DEP_BLOCK   intra-instruction dep mask
+bit 7  reserved, written as 0
 ```
 
 `dep_block_flag` map (only inspected when `CST_INSN_FLAG_HAS_DEP_BLOCK`
@@ -598,7 +601,6 @@ The writer currently emits these maps:
 +---------------+-----------------------------------------------+
 | opcode        | GenericOpcode values, GEN_OP_*                |
 | branch_type   | BranchType values, BRANCH_*                   |
-| sync_hint     | SyncEventType values, SYNC_*                  |
 | reg           | GenericRegId values, REG_*                    |
 | field_id      | CST_FID_* sparse delta field IDs              |
 | header_flag   | CST_FLAG_* header bits                        |

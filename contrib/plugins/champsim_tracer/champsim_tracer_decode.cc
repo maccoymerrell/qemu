@@ -314,7 +314,7 @@ void decode_detail_to_generic(uint64_t pc,
         classify_insn_id(info, &out->opcode, &out->branch_type, &flags);
 
     if (info->has_lock || (flags & MF_ATOMIC)) {
-        out->sync_hint = SYNC_ATOMIC;
+        out->is_atomic = true;
     }
 
     if (out->opcode == GEN_OP_UNKNOWN) {

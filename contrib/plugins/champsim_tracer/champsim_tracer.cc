@@ -114,8 +114,6 @@ static_assert(MAX_SRC_REGS <= 255,
               "MAX_SRC_REGS no longer fits in u8");
 static_assert(MAX_DST_REGS <= 255,
               "MAX_DST_REGS no longer fits in u8");
-static_assert(SYNC_EVENT_COUNT <= 4,
-              "SyncEventType no longer fits in 2 bits of CST_INSN_FLAG_SYNC_MASK");
 
 const InsnClassification *active_insn_table;
 unsigned active_insn_table_size;

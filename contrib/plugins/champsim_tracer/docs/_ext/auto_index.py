@@ -44,13 +44,12 @@ _PATTERNS: list[tuple[re.Pattern, str, str]] = [
     (re.compile(r"^CST_WP_EVENT_([A-Z0-9_]+)$"),    "CST_WP_EVENT_",    "CST_WP_EVENT_*"),
     (re.compile(r"^CST_INSN_FLAG_([A-Z0-9_]+)$"),   "CST_INSN_FLAG_",   "CST_INSN_FLAG_*"),
     (re.compile(r"^CST_FLAG_([A-Z0-9_]+)$"),        "CST_FLAG_",        "CST_FLAG_*"),
-    (re.compile(r"^SYNC_([A-Z0-9_]+)$"),            "SYNC_",            "SYNC_*"),
     (re.compile(r"^BODY_TAG_([A-Z0-9_]+)$"),        "BODY_TAG_",        "BODY_TAG_*"),
     (re.compile(r"^CST_MAGIC$"), "", "CST trace magic"),
     (re.compile(r"^(simpoint_test|thread_test|"
                 r"encoding_map_completeness|iframe_cadence|"
                 r"regfile_records|thread_switch|thread_distribution|"
-                r"wp_events|sync_hints|metaflags|"
+                r"wp_events|atomic_count|metaflags|"
                 r"regdata_reconstruction|header_window|"
                 r"validate_structural)$"), "", "validator term"),
     (re.compile(r"^(cpu_compute_eflags|gen_update_cc_op|"

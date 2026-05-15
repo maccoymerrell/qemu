@@ -301,11 +301,10 @@ order they're touched on a hot path:
    * - ``champsim_tracer_mnemonics.h``,
        ``champsim_tracer_mnemonic_tables.c``
      - Static tables: per-ISA insn classification (generic opcode,
-       branch type, sync hint), per-ISA register classification, and
+       branch type, atomic flag), per-ISA register classification, and
        per-ISA architectural properties (delay slots, etc.).
    * - ``champsim_tracer_generic_ids.h``
-     - The portable enum domains:
-       ``GenericOpcode``, ``BranchType``, ``SyncEventType``,
+     - The portable enum domains: ``GenericOpcode``, ``BranchType``,
        ``GenericRegId``.  Everything in the plugin and the decoder
        agrees on these IDs.
    * - ``champsim_tracer_bb_template_cache.{h,cc}``

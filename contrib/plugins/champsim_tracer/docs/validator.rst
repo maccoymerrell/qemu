@@ -187,9 +187,9 @@ These don't need a generator ``meta.json`` and run on any ``.cst``.
    ``translation_unavail_count`` match a per-entry walk of each
    ENTRY's ``wp_entries`` payloads.
 
-``sync_hints``
-   The writer's aggregate ``sync_hint_counts`` matches a static
-   walk of every CP+WP template's per-insn ``sync_hint`` field.
+``atomic_count``
+   The writer's aggregate ``atomic_count`` matches a static walk
+   of every CP+WP template's per-insn ``is_atomic`` field.
 
 CP execution invariants
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -339,7 +339,7 @@ simpoints intentionally start mid-program where the CFG anchor
 isn't available).  Asserted invariants:
 
 * segment is internally consistent (encoding-map completeness,
-  iframe-cadence, sync_hints / wp_events writer-vs-walk),
+  iframe-cadence, atomic_count / wp_events writer-vs-walk),
 * exactly one REGFILE record (single-thread),
 * zero THREAD_SWITCH records,
 * every template/encoding id observed has a non-fallback name.
@@ -376,8 +376,8 @@ What it does:
    * **thread_switch_count > 0** (threads interleaved at least once),
    * **thread_distribution**: both ``thread_id=0`` and ``thread_id=1``
      contributed CP entries; no entry references an out-of-range id,
-   * **sync_hints** picks up ``SYNC_ATOMIC`` for every atomic-RMW
-     instruction (lock xadd / ldadd / amoadd / ll-sc, per ISA).
+   * **atomic_count** picks up every atomic-RMW instruction (lock
+     xadd / ldadd / amoadd / ll-sc, per ISA) via ``is_atomic``.
 
 Run-to-completion is reliable because the parent's
 ``exit_group`` only fires after the child has set ``child_tid`` to

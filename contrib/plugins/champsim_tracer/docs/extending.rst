@@ -50,7 +50,8 @@ there's room up to 255 entries before the format itself has to change.
 
    .. code-block:: c
 
-      { "aesenc",  GEN_OP_AES_ENC, BRANCH_NONE, SYNC_NONE, false, false },
+      { "aesenc",  GEN_OP_AES_ENC, BRANCH_NONE, MF_NONE,
+        /*.refine=*/NULL, /*.dep_refine=*/dep_all_to_all },
 
    ``champsim_tracer_mnemonic_audit.py`` is the easiest way to verify
    no ISA's ``insn_classification`` table is missing a Capstone

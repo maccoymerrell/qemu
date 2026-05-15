@@ -103,7 +103,7 @@ struct DecodedRegfile {
 /* Structural counts surfaced after walk() completes.  Lets consumers
  * sanity-check writer cadence (one REGFILE per (segment, thread); at
  * least one IFRAME every N entries; no THREAD_SWITCH on single-vCPU
- * traces; no non-NONE sync_hints on synthetic programs) without
+ * traces; no atomics on synthetic non-atomic programs) without
  * having to re-walk the body. */
 struct BodyStats {
     uint64_t cp_entries        = 0;
@@ -113,10 +113,10 @@ struct BodyStats {
     uint64_t thread_switch_count = 0;
     uint64_t fault_count       = 0;
     uint64_t translation_unavail_count = 0;
-    /* Per-insn template sync_hint value -> count of insns observed
-     * carrying that hint.  Aggregated across both CP and WP entries
-     * by template-walk, so each (entry × insn) contributes once. */
-    std::unordered_map<uint8_t, uint64_t> sync_hint_counts;
+    /* Count of insns observed carrying CST_INSN_FLAG_ATOMIC.
+     * Aggregated across both CP and WP entries by template-walk, so
+     * each (entry × insn) contributes once. */
+    uint64_t atomic_count      = 0;
 };
 
 class BodyWalker {

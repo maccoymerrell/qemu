@@ -174,7 +174,7 @@ records.
      - Exchange.  Reserved for instructions whose semantic IS a
        swap (register ↔ memory).  Every classifier row that maps to
        ``XCHG`` also sets ``MF_ATOMIC`` so the resulting insn
-       carries ``sync_hint = SYNC_ATOMIC``.  Examples: x86 ``xchg``
+       carries ``the ``CST_INSN_FLAG_ATOMIC`` bit``.  Examples: x86 ``xchg``
        / ``cmpxchg`` / ``cmpxchg8b`` / ``cmpxchg16b``; AArch64
        ``cas{p}`` / ``swp`` / ``ldsmax`` / ``ldsmin`` / ``ldumax``
        / ``ldumin``; RISC-V ``amoswap`` / ``amocas`` /
@@ -285,7 +285,7 @@ records.
      - ``GEN_OP_FENCE``
      - Memory / instruction barrier.  Every classifier row that
        maps to ``FENCE`` has ``MF_ATOMIC``, so the resulting
-       insn always carries ``sync_hint = SYNC_ATOMIC``.
+       insn always carries ``the ``CST_INSN_FLAG_ATOMIC`` bit``.
        Examples: x86 ``mfence`` / ``lfence`` / ``sfence``,
        cache-wide ops without an address (``invd``, ``wbinvd``,
        ``serialize``); AArch64 ``dmb`` / ``dsb`` / ``isb`` /
@@ -347,7 +347,7 @@ records.
      - Cache-line clean / flush / invalidate addressed at a
        specific line.  Same synthetic-EA capture as
        ``GEN_OP_PREFETCH``.  Always carries
-       ``sync_hint = SYNC_ATOMIC``.  Examples: x86 ``clflush*`` /
+       ``the ``CST_INSN_FLAG_ATOMIC`` bit``.  Examples: x86 ``clflush*`` /
        ``clwb`` / ``cldemote``, AArch64 ``dc.*`` / ``ic.*``,
        RISC-V ``cbo.{clean,flush,inval}``, MIPS ``cache`` /
        ``cachee``.  Cache-wide forms with no address (``invd``,
@@ -356,7 +356,7 @@ records.
      - ``GEN_OP_TLB_FLUSH``
      - TLB-entry invalidation addressed at a specific page.  Same
        synthetic-EA capture.  Always carries
-       ``sync_hint = SYNC_ATOMIC``.  Examples: x86 ``invlpg`` /
+       ``the ``CST_INSN_FLAG_ATOMIC`` bit``.  Examples: x86 ``invlpg`` /
        ``invlpga``, AArch64 ``tlbi``, RISC-V ``sfence.vma`` /
        ``hfence.{g,v}vma`` / ``hinval.{g,v}vma`` /
        ``sinval.vma``, MIPS ``tlbp`` / ``tlbr`` / ``tlbwi`` /
@@ -570,49 +570,22 @@ register one greater.  Use the per-bank base as the entry-point.
      - ``REG_FP_REG``
      - Frame pointer (rbp / x29 / ``s0``).
 
-.. _sync-events:
+.. _atomic-flag:
 
-Sync events (``SyncEventType``)
--------------------------------
+Atomic flag (``CST_INSN_FLAG_ATOMIC``)
+--------------------------------------
 
-4-bit field embedded in the per-instruction template flags byte
-(``CST_INSN_FLAG_SYNC_*``).  Marks instructions whose semantics
-involve thread-level synchronization.
-
-.. list-table::
-   :header-rows: 1
-   :widths: 6 28 66
-
-   * - ID
-     - Name
-     - Notes
-   * - 0
-     - ``SYNC_NONE``
-     - No synchronization.  Default.
-   * - 1..3
-     - *(reserved)*
-     - Not currently used.  ID 0 → 4 jump leaves space for future
-       weakly-ordered hints without bit-shifting.
-   * - 4
-     - ``SYNC_THREAD_SWITCH``
-     - Reserved.  Defined and decoded but no current code path in
-       ``decode.cc`` ever sets it on a classified instruction —
-       thread switches are recorded out-of-band via
-       ``BODY_TAG_THREAD_SWITCH`` body records, not as a per-insn
-       sync hint.  Producers writing ``.cst`` from another source
-       can use it; the QEMU plugin currently does not.
-   * - 5
-     - ``SYNC_ATOMIC``
-     - Set in ``decode.cc::decode_detail_to_generic`` when either
-       (a) Capstone reports the x86 ``LOCK`` prefix on this
-       instruction (``info->has_lock``), or (b) the per-ISA
-       classifier row has the ``MF_ATOMIC`` flag.  In practice
-       this fires on every ``GEN_OP_XCHG`` (the
-       ``cmpxchg`` / ``xadd`` / ``xchg`` / AArch64 ``cas`` / RISC-V
-       ``amo*`` / MIPS ``ll`` family) and on every
-       ``GEN_OP_CACHE_FLUSH`` / ``GEN_OP_TLB_FLUSH`` row
-       (``clflush``, ``clwb``, ``invlpg``, ``cbo.*``,
-       ``tlbi``, ``sfence.vma``, ...).
+Single bit in the per-instruction template flags byte.  Set in
+``decode.cc::decode_detail_to_generic`` when either (a) Capstone
+reports the x86 ``LOCK`` prefix on this instruction
+(``info->has_lock``), or (b) the per-ISA classifier row has the
+``MF_ATOMIC`` flag.  In practice this fires on every
+``GEN_OP_XCHG`` (the ``cmpxchg`` / ``xadd`` / ``xchg`` / AArch64
+``cas`` / RISC-V ``amo*`` / MIPS ``ll`` family) and on every
+``GEN_OP_CACHE_FLUSH`` / ``GEN_OP_TLB_FLUSH`` row (``clflush``,
+``clwb``, ``invlpg``, ``cbo.*``, ``tlbi``, ``sfence.vma``, ...).
+Thread switches are recorded out-of-band via
+``BODY_TAG_THREAD_SWITCH`` body records, not as a per-insn flag.
 
 .. _field-ids:
 
@@ -834,7 +807,7 @@ ISA.  The practical limits on coverage are:
    * - x86_64
      - Capstone's full x86 mnemonic surface in 64-bit mode.
        ``LOCK`` / ``REP`` prefixes are observed and surface as
-       ``sync_hint = SYNC_ATOMIC``.  Vector register snapshots are
+       ``the ``CST_INSN_FLAG_ATOMIC`` bit``.  Vector register snapshots are
        512-bit-truncated; full ZMM is captured.
    * - aarch64
      - Capstone's full AArch64 mnemonic surface.  SVE

@@ -169,7 +169,6 @@ Header parse_header(MemberView view,
  * renderers. */
 std::string opcode_name(const Header &h, uint64_t id);
 std::string branch_type_name(const Header &h, uint64_t id);
-std::string sync_hint_name(const Header &h, uint64_t id);
 std::string reg_name_or_unknown(const Header &h, uint64_t id);
 std::string field_id_name(const Header &h, uint64_t id);
 

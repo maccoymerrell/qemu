@@ -169,7 +169,7 @@ _INSN_RE = re.compile(
     r"(?: br=(\S+) cond=(\d))?"
     r" src=\[([^\]]*)\] dst=\[([^\]]*)\]"
     r"(?: imm=(-?\d+))?"
-    r"(?: sync=(\S+))?"
+    r"( atomic)?"
     r"(?: bytes=([0-9a-f]*))?$"
 )
 _ENTRY_HEAD_RE = re.compile(
@@ -292,8 +292,7 @@ def _parse_encodings(lines: list[str], i: int,
 def _parse_templates(lines: list[str], i: int,
                      reg_name_to_id: dict[str, int],
                      opcode_to_id: dict[str, int],
-                     branch_to_id: dict[str, int],
-                     sync_to_id: dict[str, int]) -> tuple[list[dict], int]:
+                     branch_to_id: dict[str, int]) -> tuple[list[dict], int]:
     while i < len(lines) and lines[i] == "":
         i += 1
     if lines[i] != "TEMPLATES" or lines[i + 1] != "---------":
@@ -323,7 +322,6 @@ def _parse_templates(lines: list[str], i: int,
                 raise ValueError(f"bad insn line: {lines[i]!r}")
             br_name = mm.group(4)
             cond_str = mm.group(5)
-            sync_name = mm.group(9)
             insn = {
                 "pc": int(mm.group(2), 16),
                 "opcode": opcode_to_id.get(mm.group(3), 0),
@@ -334,7 +332,7 @@ def _parse_templates(lines: list[str], i: int,
                 "dst_regs": [reg_name_to_id.get(r, 0)
                              for r in mm.group(7).split(",") if r],
                 "imm": int(mm.group(8)) if mm.group(8) is not None else None,
-                "sync_hint": sync_to_id.get(sync_name, 0) if sync_name else 0,
+                "is_atomic": mm.group(9) is not None,
                 "n_loads": 0,
                 "n_stores": 0,
                 "raw_bytes": bytes.fromhex(mm.group(10) or ""),
@@ -527,7 +525,6 @@ def _parse_full(text: str) -> tuple[dict, list[dict], list[dict]]:
     rid_by_name = {n: r for r, n in REG_NAMES_DEFAULT.items()}
     op_to_id = {n: r for r, n in OPCODE_NAMES.items()}
     br_to_id = {n: r for r, n in BRANCH_NAMES.items()}
-    sync_to_id = {"SYNC_NONE": 0, "SYNC_THREAD_SWITCH": 4, "SYNC_ATOMIC": 5}
 
     meta, i = _parse_meta_section(lines)
     encoding_maps, i = _parse_encodings(lines, i, meta)
@@ -548,22 +545,14 @@ def _parse_full(text: str) -> tuple[dict, list[dict], list[dict]]:
         meta["branch_names"] = encoding_maps["branch_type"]
     else:
         meta["branch_names"] = BRANCH_NAMES
-    if "sync_hint" in encoding_maps:
-        sync_to_id = {n: r for r, n in encoding_maps["sync_hint"].items()}
-        meta["sync_hint_names"] = encoding_maps["sync_hint"]
-    else:
-        meta["sync_hint_names"] = {0: "SYNC_NONE", 4: "SYNC_THREAD_SWITCH",
-                                    5: "SYNC_ATOMIC"}
 
     templates, i = _parse_templates(
-        lines, i, rid_by_name, op_to_id, br_to_id, sync_to_id)
+        lines, i, rid_by_name, op_to_id, br_to_id)
     entries = list(_iter_body(lines, i, rid_by_name))
-    # Trailing BODY_STATS section (cp_entries, iframe_count,
-    # regfile_count, thread_switch_count, sync_hint_counts, …).
-    # Emitted unconditionally by the legacy renderer; we scan the
-    # full output for it rather than trying to track position because
-    # the body iterator above leaves `i` mid-stream when it short-
-    # circuits.
+    # Trailing BODY_STATS section.  Emitted unconditionally by the
+    # legacy renderer; we scan the full output for it rather than
+    # tracking position because the body iterator above leaves `i`
+    # mid-stream when it short-circuits.
     meta["body_stats"] = _parse_body_stats(lines)
     return meta, templates, entries
 
@@ -578,7 +567,7 @@ def _parse_body_stats(lines: list[str]) -> dict:
         "thread_switch_count": 0,
         "fault_count": 0,
         "translation_unavail_count": 0,
-        "sync_hint_counts": {},
+        "atomic_count": 0,
     }
     i = 0
     while i < len(lines) and lines[i] != "BODY_STATS":
@@ -590,20 +579,10 @@ def _parse_body_stats(lines: list[str]) -> dict:
     i += 2
     while i < len(lines) and lines[i] != "":
         line = lines[i]
-        if line.startswith("sync_hint_counts "):
-            n = int(line[len("sync_hint_counts "):])
-            for _ in range(n):
-                i += 1
-                if i >= len(lines):
-                    break
-                parts = lines[i].strip().split()
-                if len(parts) == 2:
-                    stats["sync_hint_counts"][int(parts[0])] = int(parts[1])
-            i += 1
-            continue
         for key in ("cp_entries", "wp_entries", "iframe_count",
                     "regfile_count", "thread_switch_count",
-                    "fault_count", "translation_unavail_count"):
+                    "fault_count", "translation_unavail_count",
+                    "atomic_count"):
             if line.startswith(key + " "):
                 stats[key] = int(line[len(key) + 1:])
                 break

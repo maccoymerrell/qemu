@@ -1057,10 +1057,9 @@ void emit_disasm_trailing_meta(std::string &line, const DisasmContext &ctx,
         begin_item();
         line.append(wp_status);
     }
-    if (insn.sync_hint != 0) {
+    if (insn.is_atomic) {
         begin_item();
-        line.append("sync=");
-        line.append(enum_or(ctx.h->maps.sync_hint, insn.sync_hint, "SYNC"));
+        line.append("atomic");
     }
     if (ctx.show_deps && insn.bb_template &&
         insn.insn_index_in_bb < insn.bb_template->insns.size()) {
@@ -1601,7 +1600,6 @@ void emit_legacy_encodings(FILE *out, const cst::Header &h)
         {"metaflags",     &h.maps.metaflags},
         {"opcode",        &h.maps.opcode},
         {"reg",           &h.maps.reg},
-        {"sync_hint",     &h.maps.sync_hint},
         {"wp_event_flag", &h.maps.wp_event_flag},
     };
     for (auto &mr : refs) emit_legacy_encoding_map(out, mr.name, *mr.m);
@@ -1649,9 +1647,8 @@ void emit_legacy_template_insn(FILE *out, const cst::Header &h,
         line += " imm=";
         line += std::to_string(I.imm);
     }
-    if (I.sync_hint != 0) {
-        line += " sync=";
-        line += enum_or(h.maps.sync_hint, I.sync_hint, "SYNC");
+    if (I.is_atomic) {
+        line += " atomic";
     }
     line += " bytes=";
     line += fmt_bytes_hex(I.raw_bytes);
@@ -1749,16 +1746,8 @@ void emit_legacy_body_stats(FILE *out, const cst::BodyStats &s)
     std::fprintf(out, "fault_count %llu\n",         (unsigned long long)s.fault_count);
     std::fprintf(out, "translation_unavail_count %llu\n",
                  (unsigned long long)s.translation_unavail_count);
-
-    std::vector<uint8_t> hint_keys;
-    hint_keys.reserve(s.sync_hint_counts.size());
-    for (auto &kv : s.sync_hint_counts) hint_keys.push_back(kv.first);
-    std::sort(hint_keys.begin(), hint_keys.end());
-    std::fprintf(out, "sync_hint_counts %zu\n", hint_keys.size());
-    for (uint8_t k : hint_keys) {
-        std::fprintf(out, "  %u %llu\n", (unsigned)k,
-                     (unsigned long long)s.sync_hint_counts.at(k));
-    }
+    std::fprintf(out, "atomic_count %llu\n",
+                 (unsigned long long)s.atomic_count);
     std::fprintf(out, "\n");
 }
 

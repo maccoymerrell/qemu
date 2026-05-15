@@ -46,7 +46,10 @@ static inline bool cst_str_eq(const char *a, const char *b)
 enum MnemonicFlags {
     MF_NONE             = 0,
     MF_CONDITIONAL      = (1 << 0),  /* x86: direct branch may be conditional */
-    MF_ATOMIC           = (1 << 1),  /* Atomic/locked memory op → SYNC_ATOMIC   */
+    MF_ATOMIC           = (1 << 1),  /* Atomic/locked memory op (LOCK prefix,
+                                      * x86 XCHG, AArch64 LDXR/STXR, RISC-V A
+                                      * extension, MIPS LL/SC) — sets the
+                                      * CST_INSN_FLAG_ATOMIC bit on the wire. */
 };
 
 /*
@@ -138,7 +141,15 @@ typedef struct InsnFields {
     uint8_t dst_regs[MAX_DST_REGS];
     bool    has_immediate;
     int64_t immediate;
-    uint8_t sync_hint;              /* SyncEventType */
+    /*
+     * True when this insn is an architectural atomic / synchronizing
+     * memory op (x86 LOCK-prefixed RMW or XCHG, AArch64 LDXR/STXR and
+     * LDADD/SWP families, RISC-V A extension, MIPS LL/SC).  Drives the
+     * CST_INSN_FLAG_ATOMIC bit on the wire so consumers can model
+     * pipeline serialization without re-deriving it from mnemonic
+     * strings.
+     */
+    bool    is_atomic;
     /*
      * Template-static MAX counts.  These are the upper bounds on how
      * many memory reads and writes the static instruction can issue

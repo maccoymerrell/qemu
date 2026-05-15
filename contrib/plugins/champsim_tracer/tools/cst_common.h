@@ -9,7 +9,7 @@
  * plugin or glib headers in.
  *
  * The trace is self-describing: every header carries an encoding map
- * (opcode / branch_type / sync_hint / reg / field_id / insn_flag /
+ * (opcode / branch_type / reg / field_id / insn_flag /
  * body_tag / wp_event_flag) that maps the wire-format integer ids to
  * stable string names.  The tools key off those strings rather than
  * pulling in the plugin's compile-time enums — so a trace produced
@@ -44,23 +44,19 @@ inline constexpr uint32_t CST_MAGIC = 0x1D545343u;
 
 /* ===== Format-layout invariants =====
  *
- * Bit-layout constants that the encoding maps cannot describe:
- *
- *   INSN_FLAG_SYNC_{SHIFT,MASK}: the sync-hint field is a 4-bit
- *     subfield at bit-offset 2 inside the per-insn flags byte.  The
- *     map exposes CST_INSN_FLAG_SYNC_MASK so a decoder can confirm
- *     the layout matches, but the shift amount is implied by the
- *     mask's low bit.
+ * Constants the encoding maps cannot describe (buffer-size limits,
+ * not enum identities):
  *
  *   FID_SLOT_COUNT: number of slot positions per memop / dst-reg
  *     range in the field-id space.  Implied by the per-base stride
  *     in the field_id map.
- *
  *   MAX_WIDE_BYTES / MAX_INSN_BYTES: largest scalar the wire format
- *     can carry / largest insn the template section can hold.  Both
- *     are buffer-sizing limits, not enum identities. */
-inline constexpr uint8_t INSN_FLAG_SYNC_SHIFT = 2;
-inline constexpr uint8_t INSN_FLAG_SYNC_MASK  = 0x3Cu;
+ *     can carry / largest insn the template section can hold.
+ *
+ * Other layout details (sync-hint mask + shift, all flag bits,
+ * field_id assignments) ARE derivable from the encoding-map entries
+ * the trace header carries — consumers should always pull them
+ * through resolve_ids() rather than hardcoding numeric values. */
 inline constexpr uint16_t FID_SLOT_COUNT      = 64;
 inline constexpr uint8_t  FID_SLOT_STRIDE     = 5;
 inline constexpr size_t  MAX_WIDE_BYTES       = 64;
@@ -109,11 +105,12 @@ struct ResolvedIds {
     uint16_t fid_extended         = 0;
 
     /* insn_flag map: bit masks inside the per-insn flags byte */
-    uint8_t insn_flag_branch_cond  = 0;
-    uint8_t insn_flag_has_imm      = 0;
-    uint8_t insn_flag_has_dep_block = 0;
+    uint8_t insn_flag_branch_cond   = 0;
+    uint8_t insn_flag_has_imm       = 0;
+    uint8_t insn_flag_atomic        = 0;
     uint8_t insn_flag_vec           = 0;
     uint8_t insn_flag_lane_parallel = 0;
+    uint8_t insn_flag_has_dep_block = 0;
 
     /* dep_block_flag map: bit masks inside the optional dep sub-block
      * header (only inspected when insn_flag_has_dep_block is set on
@@ -301,7 +298,7 @@ struct Instruction {
     bool                  branch_conditional  = false;
     bool                  has_immediate       = false;
     int64_t               immediate           = 0;
-    uint8_t               sync_hint           = 0;
+    bool                  is_atomic           = false;
     std::vector<uint8_t>  src_regs;
     std::vector<uint8_t>  dst_regs;
     std::vector<uint8_t>  raw_bytes;          /* 0..16 bytes */
@@ -366,7 +363,7 @@ struct InsnTemplate {
     bool     branch_conditional = false;
     bool     has_imm = false;
     int64_t  imm = 0;
-    uint8_t  sync_hint = 0;
+    bool     is_atomic = false;
     /*
      * Template-static MAX counts for the instruction's memory ops.
      * Runtime per-iteration counts arrive separately via
@@ -426,7 +423,6 @@ struct EncodingMaps {
      * trace-supplied entries win when they conflict. */
     std::unordered_map<uint64_t, std::string> opcode;
     std::unordered_map<uint64_t, std::string> branch_type;
-    std::unordered_map<uint64_t, std::string> sync_hint;
     std::unordered_map<uint64_t, std::string> reg;
     std::unordered_map<uint64_t, std::string> field_id;
     std::unordered_map<uint64_t, std::string> header_flag;

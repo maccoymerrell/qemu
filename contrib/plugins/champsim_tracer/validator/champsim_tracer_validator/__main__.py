@@ -426,7 +426,7 @@ def cmd_thread_test(args) -> int:
       * exactly 2 BODY_TAG_REGFILE records (one per thread),
       * at least one BODY_TAG_THREAD_SWITCH (the threads interleaved),
       * both thread_ids 0 and 1 contributed CP entries,
-      * sync_hints / wp_events / iframe / encoding-map invariants pass.
+      * atomic_count / wp_events / iframe / encoding-map invariants pass.
     """
     from . import _thread_test_asm as TASM
     rc_total = 0

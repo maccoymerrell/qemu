@@ -627,15 +627,14 @@ _register_probe('probe_mips_pref', {
 
 
 # ===========================================================================
-# Atomic / sync-hint probes (added 2026-05).
+# Atomic-flag probes.
 #
-# Exercises the writer's SYNC_ATOMIC sync_hint annotation: any insn
+# Exercises the writer's CST_INSN_FLAG_ATOMIC annotation: any insn
 # classified with MF_ATOMIC in the per-ISA mnemonic tables (or
-# x86 `lock`-prefixed) must carry sync_hint = SYNC_ATOMIC in its
-# template.  The validator's _check_sync_hints catches divergence
-# between the writer's BodyStats aggregation and a static template
-# walk; these probes ensure the SYNC_ATOMIC code path is exercised
-# at all.
+# x86 `lock`-prefixed) must carry is_atomic=true in its template.
+# The validator's _check_atomic_count catches divergence between
+# the writer's BodyStats aggregation and a static template walk;
+# these probes ensure the atomic code path is exercised at all.
 #
 # All probes work in user mode and use the stack as a non-shared
 # atomic target (single-thread; the atomic semantics are observable
@@ -651,8 +650,7 @@ _register_probe('probe_x86_lock_xadd', {
         # ISAs: the data-mutation operation is add, the exchange is
         # incidental.  INC/DEC under LOCK carry their own
         # GEN_OP_INC / GEN_OP_DEC; the lock prefix alone causes
-        # sync_hint = SYNC_ATOMIC on every instruction in the
-        # sequence.
+        # CST_INSN_FLAG_ATOMIC on every instruction in the sequence.
         'asm':      '"movq $1, %%rax\\n\\t"\n'
                     '    "lock xaddq %%rax, (%%rsp)\\n\\t"\n'
                     '    "lock incq (%%rsp)\\n\\t"\n'

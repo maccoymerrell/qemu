@@ -20,7 +20,7 @@ The validator's `thread_test` command uses these strings as the asm
 source.  Each ISA's body is written so the trace produces:
   * 2 BODY_TAG_REGFILE records (one per thread),
   * at least one BODY_TAG_THREAD_SWITCH record (thread interleaving),
-  * matching sync_hint / wp_events / iframe / encoding-map invariants
+  * matching atomic_count / wp_events / iframe / encoding-map invariants
     that `validate_structural` checks.
 """
 

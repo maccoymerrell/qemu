@@ -349,16 +349,10 @@ static void write_named_enum_map(BitWriter *bw, const char *map_name,
     }
 }
 
-/* Wrapper for sync_event_name to fit the unsigned->const char* shape. */
-static const char *sync_event_name_for_map(unsigned id)
-{
-    return sync_event_name(id);
-}
-
 static void write_header_encoding_maps(BitWriter *main_bw)
 {
-    /* opcode / branch_type / sync_hint / reg encoding maps are now
-     * driven by the shared name helpers in champsim_tracer_generic_ids.h
+    /* opcode / branch_type / reg encoding maps are now driven by the
+     * shared name helpers in champsim_tracer_generic_ids.h
      * (write_named_enum_map + the helper) so the symbolic names live
      * in exactly one place across the wire-format encoder and the
      * exit-time stats printer. */
@@ -370,7 +364,7 @@ static void write_header_encoding_maps(BitWriter *main_bw)
     static const EncodingMapEntry insn_flag_entries[] = {
         { CST_INSN_FLAG_BRANCH_COND, "CST_INSN_FLAG_BRANCH_COND" },
         { CST_INSN_FLAG_HAS_IMM, "CST_INSN_FLAG_HAS_IMM" },
-        { CST_INSN_FLAG_SYNC_MASK, "CST_INSN_FLAG_SYNC_MASK" },
+        { CST_INSN_FLAG_ATOMIC, "CST_INSN_FLAG_ATOMIC" },
         { CST_INSN_FLAG_VEC, "CST_INSN_FLAG_VEC" },
         { CST_INSN_FLAG_LANE_PARALLEL, "CST_INSN_FLAG_LANE_PARALLEL" },
         { CST_INSN_FLAG_HAS_DEP_BLOCK, "CST_INSN_FLAG_HAS_DEP_BLOCK" },
@@ -401,14 +395,10 @@ static void write_header_encoding_maps(BitWriter *main_bw)
 
     BitWriter sub;
     bw_init_buf(&sub);
-    bw_write_uleb128(&sub, 11);
+    bw_write_uleb128(&sub, 10);
     write_named_enum_map(&sub, "opcode", GEN_OP_COUNT, generic_opcode_name);
     write_named_enum_map(&sub, "branch_type", BRANCH_TYPE_COUNT,
                          branch_type_name);
-    /* SyncEventType has sparse codepoints (0, 4, 5); iterate over the
-     * defined enum range and let sync_event_name skip the holes. */
-    write_named_enum_map(&sub, "sync_hint", SYNC_EVENT_COUNT,
-                         sync_event_name_for_map);
     write_reg_encoding_map(&sub);
     write_field_id_encoding_map(&sub);
     write_encoding_map(&sub, "header_flag", header_flag_entries,
@@ -540,8 +530,8 @@ struct BodyStreamState {
  *   opcode      : u8
  *   branch_type : u8
  *   flags       : u8       bit0=branch_conditional, bit1=has_immediate,
- *                          bits 2..5 = sync_hint (4 bits),
- *                          bits 6..7 = reserved
+ *                          bit2=is_atomic, bit4=vec, bit5=lane_parallel,
+ *                          bit6=has_dep_block
  *   n_src       : u8
  *   n_dst       : u8
  *   src_regs[n_src] : u8 each
@@ -597,8 +587,9 @@ static void write_bin_templates(BitWriter *bw)
             if (fld->has_immediate) {
                 flags |= CST_INSN_FLAG_HAS_IMM;
             }
-            flags |= (uint8_t)((fld->sync_hint & 0x3)
-                               << CST_INSN_FLAG_SYNC_SHIFT);
+            if (fld->is_atomic) {
+                flags |= CST_INSN_FLAG_ATOMIC;
+            }
             if (fld->has_reg_deps || fld->has_addr_deps) {
                 flags |= CST_INSN_FLAG_HAS_DEP_BLOCK;
             }
@@ -1369,7 +1360,7 @@ static U512 deflt_insn_flags(const BBTemplate *t, uint32_t i, uint8_t slot)
     uint8_t flags = 0;
     if (f->branch_conditional) flags |= CST_INSN_FLAG_BRANCH_COND;
     if (f->has_immediate)      flags |= CST_INSN_FLAG_HAS_IMM;
-    flags |= (uint8_t)((f->sync_hint & 0x3) << CST_INSN_FLAG_SYNC_SHIFT);
+    if (f->is_atomic)          flags |= CST_INSN_FLAG_ATOMIC;
     return cst_wide_from_u64(flags);
 }
 static bool extr_insn_flags(const EntryView *ev, uint32_t i, uint8_t slot,
@@ -1509,7 +1500,7 @@ static uint64_t deflt_u64_insn_flags(const BBTemplate *t, uint32_t i,
     uint8_t flags = 0;
     if (f->branch_conditional) flags |= CST_INSN_FLAG_BRANCH_COND;
     if (f->has_immediate)      flags |= CST_INSN_FLAG_HAS_IMM;
-    flags |= (uint8_t)((f->sync_hint & 0x3) << CST_INSN_FLAG_SYNC_SHIFT);
+    if (f->is_atomic)          flags |= CST_INSN_FLAG_ATOMIC;
     return flags;
 }
 static bool extr_u64_insn_flags(const EntryView *ev, uint32_t i, uint8_t slot,

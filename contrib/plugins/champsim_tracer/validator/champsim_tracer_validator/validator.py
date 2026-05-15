@@ -2626,7 +2626,7 @@ def _check_encoding_map_completeness(
     fallback_re = re.compile(r"^(REG_|OP_|BR_|FID_0x|UNKNOWN_)\d")
     fallback_names: dict[str, list[str]] = {}
     for map_name in ("reg", "opcode", "branch_type", "field_id",
-                     "sync_hint", "body_tag", "header_flag",
+                     "body_tag", "header_flag",
                      "insn_flag", "wp_event_flag", "metaflags"):
         m = maps.get(map_name, {})
         bad = [v for v in m.values() if fallback_re.match(v)]
@@ -2925,56 +2925,47 @@ def _check_thread_distribution(entries: list[dict],
     )]
 
 
-def _check_sync_hints(body_stats: dict,
-                      all_entries: list[dict],
-                      templates_by_id: dict[int, dict],
-                      trace_meta: dict) -> list[Issue]:
-    """Verify the writer's aggregated sync_hint_counts (BODY_STATS)
-    matches the per-template-insn sync_hint values rolled across
-    every CP+WP entry in the body stream (including prologue —
-    body_stats aggregates everything, not just post-cp_start).
+def _check_atomic_count(body_stats: dict,
+                        all_entries: list[dict],
+                        templates_by_id: dict[int, dict]) -> list[Issue]:
+    """Verify the writer's aggregated atomic_count (BODY_STATS) matches
+    the per-template-insn is_atomic values rolled across every CP+WP
+    entry in the body stream (including prologue — body_stats
+    aggregates everything, not just post-cp_start).
 
     Any divergence means the writer's runtime aggregation disagrees
     with what its own templates declare, which would be a tracer bug
     (template_id flag-byte vs entry-time stats counter).
     """
-    expected: dict[int, int] = {}
+    expected = 0
     # Match the writer's BodyStats aggregation: walk *every* insn in
     # every template touched by CP+WP entries (writer iterates the
     # full template even when WP truncates after a fault).
-    def _count(tmpl_id: int) -> None:
+    def _count(tmpl_id: int) -> int:
         t = templates_by_id.get(int(tmpl_id))
         if t is None:
-            return
-        for ins in t.get("insns") or []:
-            h = int(ins.get("sync_hint", 0))
-            expected[h] = expected.get(h, 0) + 1
+            return 0
+        return sum(1 for ins in (t.get("insns") or [])
+                   if ins.get("is_atomic"))
 
     for e in all_entries:
-        _count(int(e["template_id"]))
+        expected += _count(int(e["template_id"]))
         for wp in e.get("wp_entries") or []:
-            _count(int(wp["template_id"]))
+            expected += _count(int(wp["template_id"]))
 
-    actual = {int(k): int(v) for k, v in (
-        body_stats.get("sync_hint_counts") or {}).items()}
-    name_map = trace_meta.get("sync_hint_names") or {}
+    actual = int(body_stats.get("atomic_count") or 0)
 
     if expected != actual:
-        def named(d):
-            return {name_map.get(k, f"SYNC_{k}"): v for k, v in d.items()}
         return [Issue(
-            "sync_hints", "error",
-            f"sync_hint_counts disagree with per-template walk: "
-            f"writer={named(actual)} static_walk={named(expected)}",
+            "atomic_count", "error",
+            f"atomic_count disagrees with per-template walk: "
+            f"writer={actual} static_walk={expected}",
             {"actual": actual, "expected": expected},
         )]
-    # Surface the per-name distribution so atomic-emitting workloads
-    # are observable in the report.
     return [Issue(
-        "sync_hints", "info",
-        f"sync_hint distribution matches static template walk: "
-        f"{ {name_map.get(k, f'SYNC_{k}'): v for k, v in actual.items()} }",
-        {"counts": actual},
+        "atomic_count", "info",
+        f"atomic_count matches static template walk: {actual}",
+        {"count": actual},
     )]
 
 
@@ -3235,10 +3226,9 @@ def _check_regdata_reconstruction(
                         if flags_id is None or r != flags_id]
             # Atomic RMW (lock xadd, ldadd, amoadd, ll/sc, …) has the
             # dst-reg semantically loaded from memory rather than
-            # computed from src operands.  The sync_hint marker is
+            # computed from src operands.  The is_atomic marker is
             # what distinguishes these; skip reconstruction for them.
-            sync_hint = int(I.get("sync_hint", 0))
-            if sync_hint != 0:
+            if I.get("is_atomic"):
                 for r in gpr_dsts:
                     snap = snap_idx.get((ipos, r))
                     if snap is not None:
@@ -3342,8 +3332,8 @@ def validate_structural(trace_path: Path,
     Used by the segmentation test, where each per-simpoint .cst file
     is a standalone trace that begins mid-program and shouldn't be
     asked to validate the original CFG.  Asserts the trace is
-    internally consistent: encoding maps are complete, sync_hints and
-    wp_events agree between writer-aggregate and per-entry walk,
+    internally consistent: encoding maps are complete, atomic_count
+    and wp_events agree between writer-aggregate and per-entry walk,
     IFRAMEs match their ENTRYs (already enforced by the decoder),
     REGFILE record(s) present, no unexpected thread_switch on
     single-thread runs.
@@ -3366,8 +3356,7 @@ def validate_structural(trace_path: Path,
     issues += _check_thread_switch_absent(body_stats, expected_threads)
     issues += _check_thread_distribution(entries, expected_threads)
     issues += _check_wp_events(body_stats, entries)
-    issues += _check_sync_hints(body_stats, entries,
-                                 templates_by_id, trace_meta)
+    issues += _check_atomic_count(body_stats, entries, templates_by_id)
     return Report(issues=issues, stats=stats)
 
 
@@ -3593,8 +3582,7 @@ def validate(meta_path: Path, trace_path: Path,
     issues += _check_thread_switch_absent(body_stats, expected_threads)
     issues += _check_thread_distribution(entries, expected_threads)
     issues += _check_wp_events(body_stats, cp_entries)
-    issues += _check_sync_hints(body_stats, entries,
-                                 templates_by_id, trace_meta)
+    issues += _check_atomic_count(body_stats, entries, templates_by_id)
 
     # ---- Per-insn regdata semantic checks ----------------------------------
     opcode_names = dict(trace_meta.get("encoding_maps", {}).get("opcode", {}))

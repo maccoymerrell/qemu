@@ -37,7 +37,6 @@ void parse_encoding_maps(Reader &r, EncodingMaps *out)
         std::unordered_map<uint64_t, std::string> *target = nullptr;
         if      (name == "opcode")         target = &out->opcode;
         else if (name == "branch_type")    target = &out->branch_type;
-        else if (name == "sync_hint")      target = &out->sync_hint;
         else if (name == "reg")            target = &out->reg;
         else if (name == "field_id")       target = &out->field_id;
         else if (name == "header_flag")    target = &out->header_flag;
@@ -93,8 +92,7 @@ void parse_templates_at(Reader &r,
             I.max_dep_stores = sub.u8();
             I.branch_conditional = (flags & ids.insn_flag_branch_cond) != 0;
             I.has_imm            = (flags & ids.insn_flag_has_imm) != 0;
-            I.sync_hint          =
-                (flags & INSN_FLAG_SYNC_MASK) >> INSN_FLAG_SYNC_SHIFT;
+            I.is_atomic          = (flags & ids.insn_flag_atomic) != 0;
             if (I.has_imm) I.imm = sub.sleb();
             uint8_t insn_size = sub.u8();
             I.raw_bytes.resize(insn_size);
@@ -178,23 +176,6 @@ static void resolve_one(const std::unordered_map<uint64_t, std::string> &m,
                              + "' missing well-known name '" + want + "'");
 }
 
-/* Lenient resolver: leaves @out at zero (no bit) when the wire format
- * doesn't define the well-known name.  Use for fields added after a
- * wire-format extension when older traces (lacking the entry) must
- * still parse — the consumer simply treats the absent bit as
- * never-set on those traces. */
-static void resolve_one_lenient(
-        const std::unordered_map<uint64_t, std::string> &m,
-        const char *want, uint8_t *out)
-{
-    for (const auto &kv : m) {
-        if (kv.second == want) {
-            *out = (uint8_t)kv.first;
-            return;
-        }
-    }
-}
-
 /* Populate @ids from the well-known names in @maps.  Throws on any
  * missing name — the wire format is the single source of truth, so a
  * trace that omits a name the decoder needs is malformed. */
@@ -255,18 +236,14 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
                 &ids->insn_flag_branch_cond);
     resolve_one(maps.insn_flag, "insn_flag", "CST_INSN_FLAG_HAS_IMM",
                 &ids->insn_flag_has_imm);
+    resolve_one(maps.insn_flag, "insn_flag", "CST_INSN_FLAG_ATOMIC",
+                &ids->insn_flag_atomic);
+    resolve_one(maps.insn_flag, "insn_flag", "CST_INSN_FLAG_VEC",
+                &ids->insn_flag_vec);
+    resolve_one(maps.insn_flag, "insn_flag", "CST_INSN_FLAG_LANE_PARALLEL",
+                &ids->insn_flag_lane_parallel);
     resolve_one(maps.insn_flag, "insn_flag", "CST_INSN_FLAG_HAS_DEP_BLOCK",
                 &ids->insn_flag_has_dep_block);
-    /* Lenient: VEC and LANE_PARALLEL postdate the original wire
-     * format, so traces written before they were defined won't carry
-     * them in their encoding map.  Leaving the resolved bit at 0
-     * makes the consumer-side check `(flags & vec_bit)` always false
-     * on those traces — exactly the "no lane info present" behavior
-     * the consumer should default to. */
-    resolve_one_lenient(maps.insn_flag, "CST_INSN_FLAG_VEC",
-                        &ids->insn_flag_vec);
-    resolve_one_lenient(maps.insn_flag, "CST_INSN_FLAG_LANE_PARALLEL",
-                        &ids->insn_flag_lane_parallel);
 
     /* dep_block_flag (bit masks inside the optional dependency sub-block) */
     resolve_one(maps.dep_block_flag, "dep_block_flag",
@@ -914,10 +891,6 @@ std::string opcode_name(const Header &h, uint64_t id)
 std::string branch_type_name(const Header &h, uint64_t id)
 {
     return lookup_or(h.maps.branch_type, id, "BR_" + std::to_string(id));
-}
-std::string sync_hint_name(const Header &h, uint64_t id)
-{
-    return lookup_or(h.maps.sync_hint, id, "SYNC_" + std::to_string(id));
 }
 std::string reg_name_or_unknown(const Header &h, uint64_t id)
 {

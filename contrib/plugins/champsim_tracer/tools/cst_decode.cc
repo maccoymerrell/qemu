@@ -322,7 +322,7 @@ Wide insn_field_default(const InsnTemplate &I, uint8_t fid,
         uint64_t f = 0;
         if (I.branch_conditional) f |= ids.insn_flag_branch_cond;
         if (I.has_imm)            f |= ids.insn_flag_has_imm;
-        f |= ((uint64_t)I.sync_hint << INSN_FLAG_SYNC_SHIFT) & INSN_FLAG_SYNC_MASK;
+        if (I.is_atomic)          f |= ids.insn_flag_atomic;
         w.limb[0] = f & 0xFF;
     }
     else if (fid == ids.fid_insn_immediate) { w.limb[0] = (uint64_t)I.imm; }
@@ -483,17 +483,16 @@ void BodyWalker::decode_wp_events(Reader &evb,
     }
 }
 
-/* Tally each (template, insn) sync_hint into stats_.  Counts every
- * (entry × insn) once, so a hot block contributes its hint vector
- * multiple times — matches the "how many insn observations carried
- * this hint" intent rather than the dedupe count. */
+/* Tally each (template, insn) is_atomic into stats_.  Counts every
+ * (entry × insn) once, so a hot block contributes its atomic-bit
+ * vector multiple times — matches the "how many insn observations
+ * were atomic" intent rather than the dedupe count. */
 namespace {
-void tally_sync_hints(const Template *tmpl,
-                      std::unordered_map<uint8_t, uint64_t> &out)
+void tally_atomic_count(const Template *tmpl, uint64_t &out)
 {
     if (!tmpl) return;
     for (const auto &I : tmpl->insns) {
-        out[I.sync_hint]++;
+        if (I.is_atomic) out++;
     }
 }
 }  /* namespace */
@@ -537,13 +536,13 @@ void BodyWalker::handle_entry(WalkState &ws, const Callback &cb)
         if (we.translation_unavailable) stats_.translation_unavail_count++;
     }
     if (auto it = by_id_.find(entry.template_id); it != by_id_.end()) {
-        tally_sync_hints(&templates_[it->second], stats_.sync_hint_counts);
+        tally_atomic_count(&templates_[it->second], stats_.atomic_count);
     }
     for (const auto &we : entry.wp_entries) {
         auto wit = by_id_.find(we.template_id);
         if (wit != by_id_.end()) {
-            tally_sync_hints(&templates_[wit->second],
-                             stats_.sync_hint_counts);
+            tally_atomic_count(&templates_[wit->second],
+                               stats_.atomic_count);
         }
     }
 
@@ -930,7 +929,7 @@ Instruction build_one(const Template &tmpl, uint32_t insn_idx,
     insn.branch_conditional = I.branch_conditional;
     insn.has_immediate      = I.has_imm;
     insn.immediate          = I.imm;
-    insn.sync_hint          = I.sync_hint;
+    insn.is_atomic          = I.is_atomic;
     insn.src_regs            = I.src_regs;
     insn.dst_regs            = I.dst_regs;
     insn.raw_bytes           = I.raw_bytes;

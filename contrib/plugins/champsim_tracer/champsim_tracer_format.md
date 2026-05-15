@@ -198,9 +198,10 @@ Decode by repeated outer-section unwrapping.
        n_dst              : u8
        src_regs[n_src]    : u8 each    ; resolve via encoding_maps.reg
        dst_regs[n_dst]    : u8 each    ; resolve via encoding_maps.reg
-       n_loads            : u8         ; always 0 on the wire (runtime
-                                       ; count rides on CST_FID_N_LOADS)
-       n_stores           : u8         ; always 0
+       max_dep_loads      : u8         ; template-static MAX load count
+                                       ; (runtime per-iter count rides on
+                                       ; CST_FID_N_LOADS and can be smaller)
+       max_dep_stores     : u8         ; template-static MAX store count
        if (flags & ids.insn_flag_has_imm):
          immediate        : SLEB
        insn_size          : u8         ; 0..16
@@ -210,15 +211,20 @@ Decode by repeated outer-section unwrapping.
 4.5  Dependency sub-block (only present when CST_INSN_FLAG_HAS_DEP_BLOCK):
        dep_block_flags    : u8         ; dep_block_flag bits
        if (dep_block_flags & ids.dep_block_has_reg):
-         n_dep_stores     : u8
-         dst_dep[0..n_dst-1]            : ULEB each
-         store_data_dep[0..n_dep_stores-1] : ULEB each
+         dst_dep[0..n_dst-1]                  : ULEB each
+         store_data_dep[0..max_dep_stores-1]  : ULEB each
        if (dep_block_flags & ids.dep_block_has_addr):
-         n_dep_loads      : u8
-         n_dep_stores_a   : u8
-         load_addr_dep[0..n_dep_loads-1]   : ULEB each
-         store_addr_dep[0..n_dep_stores_a-1] : ULEB each
-     See Reference §3 for the bit layout inside each mask.
+         load_addr_dep[0..max_dep_loads-1]    : ULEB each
+         store_addr_dep[0..max_dep_stores-1]  : ULEB each
+     Mask array sizes all come from the outer template header
+     (n_dst, max_dep_loads, max_dep_stores) — the dep block itself
+     carries only dep_block_flags + the masks.  HAS_REG and HAS_ADDR
+     are independent: HAS_REG carries refiner-produced output deps
+     (per-dst-reg, per-store-data), HAS_ADDR carries walker-produced
+     per-memop address deps (which src_regs feed the load/store
+     address — so the consumer can fire each memop without waiting
+     on inputs irrelevant to its address).  See Reference §3 for
+     the bit layout inside each mask.
 ```
 
 Store every decoded template in `template_by_id` keyed by
@@ -1212,8 +1218,8 @@ template payload:
 |   n_dst           u8                             |
 |   src_regs        u8[n_src]                      |
 |   dst_regs        u8[n_dst]                      |
-|   n_loads         u8      zero; reserved default |
-|   n_stores        u8      zero; reserved default |
+|   max_dep_loads   u8      template-static MAX     |
+|   max_dep_stores  u8      template-static MAX     |
 |   immediate       SLEB    only if HAS_IMM        |
 |   insn_size       u8                             |
 |   insn_bytes      bytes[insn_size]               |
@@ -1228,28 +1234,26 @@ sub-block follows the instruction bytes:
 dep_block:
   dep_block_flags   u8        CST_DEP_BLOCK_HAS_REG | CST_DEP_BLOCK_HAS_ADDR
   if HAS_REG:
-    n_dep_stores    u8        template-time store-mask count
-    dst_dep[d]      ULEB      for d in 0..n_dst-1
-    store_data_dep[s] ULEB    for s in 0..n_dep_stores-1
+    dst_dep[d]            ULEB    for d in 0..n_dst-1
+    store_data_dep[s]     ULEB    for s in 0..max_dep_stores-1
   if HAS_ADDR:
-    n_dep_loads     u8        template-time load-mask count
-    n_dep_stores_a  u8        template-time store-addr-mask count
-    load_addr_dep[l]  ULEB    for l in 0..n_dep_loads-1
-    store_addr_dep[s] ULEB    for s in 0..n_dep_stores_a-1
+    load_addr_dep[l]      ULEB    for l in 0..max_dep_loads-1
+    store_addr_dep[s]     ULEB    for s in 0..max_dep_stores-1
 ```
 
-`n_dep_stores` / `n_dep_loads` / `n_dep_stores_a` are template-time
-mask-array lengths.  The wire format's outer `n_stores` and
-`n_loads` bytes are always zero (runtime counts ride on
-`CST_FID_N_LOADS` / `CST_FID_N_STORES`), so the dep block carries
-its own static counts to size each mask array.
+Mask array sizes (`n_dst`, `max_dep_loads`, `max_dep_stores`) all
+come from the outer template header — the dep block itself carries
+only the masks.  `max_dep_loads` / `max_dep_stores` are the
+template-static MAX counts; the runtime per-iteration mem-op counts
+ride on `CST_FID_N_LOADS` / `CST_FID_N_STORES` and can be smaller
+(e.g. a conditional load that didn't fire) but never larger.
 
 Bit layout inside each register/load mask:
 
 ```
 bits [0, n_src)                            depends on src_reg[i]
-bits [n_src, n_src + n_loads_static)       depends on load_data[i - n_src]
-bit  n_src + n_loads_static                depends on the immediate
+bits [n_src, n_src + max_dep_loads)        depends on load_data[i - n_src]
+bit  n_src + max_dep_loads                 depends on the immediate
 ```
 
 Address masks omit the load-data bits because addresses are computed

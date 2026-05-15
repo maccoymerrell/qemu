@@ -304,6 +304,23 @@ struct Instruction {
     std::vector<uint8_t>  dst_regs;
     std::vector<uint8_t>  raw_bytes;          /* 0..16 bytes */
 
+    /*
+     * Template-static MAX counts and intra-instruction dep masks.
+     * Forwarded from InsnTemplate so the renderer can show precise
+     * per-dst / per-store / per-memop dependency chains instead of
+     * the over-approximating "every src → every dst" arrow.  When
+     * the trace did not carry the corresponding sub-block, the
+     * vectors stay empty and the renderer falls back to all-to-all.
+     */
+    uint32_t              max_dep_loads       = 0;
+    uint32_t              max_dep_stores      = 0;
+    bool                  has_reg_deps        = false;
+    bool                  has_addr_deps       = false;
+    std::vector<uint64_t> dst_dep_mask;
+    std::vector<uint64_t> store_data_dep_mask;
+    std::vector<uint64_t> load_addr_dep_mask;
+    std::vector<uint64_t> store_addr_dep_mask;
+
     /* Identifying context. */
     uint32_t              bb_template_id      = 0;
     uint32_t              insn_index_in_bb    = 0; /* position within bb */
@@ -348,33 +365,48 @@ struct InsnTemplate {
     bool     has_imm = false;
     int64_t  imm = 0;
     uint8_t  sync_hint = 0;
-    uint32_t n_loads = 0;
-    uint32_t n_stores = 0;
+    /*
+     * Template-static MAX counts for the instruction's memory ops.
+     * Runtime per-iteration counts arrive separately via
+     * CST_FID_N_LOADS / CST_FID_N_STORES and may be smaller (e.g. a
+     * conditional load that didn't fire) but never larger.
+     *
+     * These also fix the dep-mask bit layout: load slots occupy
+     * mask bits [n_src, n_src + max_dep_loads), the imm bit sits at
+     * n_src + max_dep_loads, and store_data_dep_mask is an array of
+     * length max_dep_stores.
+     */
+    uint32_t max_dep_loads = 0;
+    uint32_t max_dep_stores = 0;
     std::vector<uint8_t> src_regs;
     std::vector<uint8_t> dst_regs;
     std::vector<uint8_t> raw_bytes;       /* may be 0..16 bytes */
 
     /*
      * Intra-instruction dataflow sub-block (CST_INSN_FLAG_HAS_DEP_BLOCK).
-     * Empty when the wire format did not carry the block — consumers
-     * fall back to the implicit all-to-all dataflow.
+     * Empty when the wire format did not carry the corresponding
+     * family — consumers fall back to the implicit all-to-all
+     * dataflow for the absent family.
      *
-     * dst_dep_mask[d] / store_data_dep_mask[s]: bitmask of input
-     * positions this output depends on.  Bit layout:
-     *   bits [0, src_regs.size())                  src_reg[i]
-     *   bits [src_regs.size(), src_regs.size() + n_loads_at_template_time)
-     *                                              load_data[i - src.size()]
-     *   bit  src_regs.size() + n_loads_at_template_time
-     *                                              immediate
-     * load_addr_dep_mask / store_addr_dep_mask are phase-2 additions;
-     * for now they stay empty.
+     * HAS_REG masks (refiner-produced).  Bit layout:
+     *   bits [0, src_regs.size())                          src_reg[i]
+     *   bits [src_regs.size(), src_regs.size() + max_dep_loads)
+     *                                                       load_data[i - src.size()]
+     *   bit  src_regs.size() + max_dep_loads                immediate
+     *
+     * HAS_ADDR masks (walker-produced, structural — describes which
+     * src_regs feed each memop's address so the consumer can fire
+     * loads/stores precisely).  Bit layout omits the load_data slots
+     * because addresses are computed before any load fires:
+     *   bits [0, src_regs.size())                          src_reg[i]
+     *   bit  src_regs.size()                                immediate
      */
     bool                  has_reg_deps  = false;
     bool                  has_addr_deps = false;
-    std::vector<uint32_t> dst_dep_mask;
-    std::vector<uint32_t> store_data_dep_mask;
-    std::vector<uint32_t> load_addr_dep_mask;
-    std::vector<uint32_t> store_addr_dep_mask;
+    std::vector<uint64_t> dst_dep_mask;
+    std::vector<uint64_t> store_data_dep_mask;
+    std::vector<uint64_t> load_addr_dep_mask;
+    std::vector<uint64_t> store_addr_dep_mask;
 };
 
 struct Template {

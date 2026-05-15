@@ -143,27 +143,32 @@ extern "C" {
  *
  *   if HAS_REG:
  *     dst_dep[d]        : ULEB   for d in 0..n_dst-1
- *     store_data_dep[s] : ULEB   for s in 0..n_stores-1
+ *     store_data_dep[s] : ULEB   for s in 0..max_dep_stores-1
  *   if HAS_ADDR:
- *     load_addr_dep[l]  : ULEB   for l in 0..n_loads-1
- *     store_addr_dep[s] : ULEB   for s in 0..n_stores-1
+ *     load_addr_dep[l]  : ULEB   for l in 0..max_dep_loads-1
+ *     store_addr_dep[s] : ULEB   for s in 0..max_dep_stores-1
+ *
+ * Mask array sizes (n_dst, max_dep_loads, max_dep_stores) all come
+ * from the outer template header — the dep block itself carries no
+ * size bytes.
  *
  * Bit layout inside each register/load mask:
- *   bits [0, n_src)                       depends on src_reg[i]
- *   bits [n_src, n_src + n_loads)         depends on load_data[i - n_src]
- *   bit  n_src + n_loads                  depends on the immediate
+ *   bits [0, n_src)                            depends on src_reg[i]
+ *   bits [n_src, n_src + max_dep_loads)        depends on load_data[i - n_src]
+ *   bit  n_src + max_dep_loads                 depends on the immediate
  *
  * Address masks omit the load_data bits (addresses are computed
  * before any load fires):
  *   bits [0, n_src)                       depends on src_reg[i]
  *   bit  n_src                            depends on the immediate
  *
- * Absence of CST_INSN_FLAG_HAS_DEP_BLOCK is the implicit all-to-all
- * over-approximation (every dst / store depends on every src / load)
- * that consumers have always assumed.  Phase 1 only emits the block
- * with HAS_REG; phase 2 will add HAS_ADDR.  Future sub-flag bits
- * stay inside the block so the per-insn flag byte does not have to
- * grow.
+ * Absence of CST_INSN_FLAG_HAS_DEP_BLOCK (or absence of a particular
+ * sub-family within it) is the implicit all-to-all over-approximation
+ * (every dst / store / mem-op depends on every input) that consumers
+ * have always assumed.  HAS_REG carries refiner-produced output deps
+ * (dst, store_data); HAS_ADDR carries walker-produced per-memop
+ * address deps (when each load/store can fire).  Future sub-flag
+ * bits stay inside the block so the per-insn flag byte doesn't grow.
  */
 #define CST_INSN_FLAG_HAS_DEP_BLOCK (1u << 6)
 /* bit 7 reserved */

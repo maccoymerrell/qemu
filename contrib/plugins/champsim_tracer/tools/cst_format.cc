@@ -89,8 +89,8 @@ void parse_templates_at(Reader &r,
             for (auto &x : I.src_regs) x = sub.u8();
             I.dst_regs.resize(n_dst);
             for (auto &x : I.dst_regs) x = sub.u8();
-            I.n_loads  = sub.u8();
-            I.n_stores = sub.u8();
+            I.max_dep_loads  = sub.u8();
+            I.max_dep_stores = sub.u8();
             I.branch_conditional = (flags & ids.insn_flag_branch_cond) != 0;
             I.has_imm            = (flags & ids.insn_flag_has_imm) != 0;
             I.sync_hint          =
@@ -109,32 +109,31 @@ void parse_templates_at(Reader &r,
              */
             if (flags & ids.insn_flag_has_dep_block) {
                 uint8_t dep_flags = sub.u8();
+                /* Mask array sizes come from the outer header
+                 * (n_dst, max_dep_loads, max_dep_stores).  Masks
+                 * themselves are uint64_t ULEBs since the bit
+                 * layout addresses up to MAX_SRC_REGS + MAX_LOADS
+                 * input positions plus the imm bit. */
                 if (dep_flags & ids.dep_block_has_reg) {
-                    uint8_t n_dep_stores = sub.u8();
                     I.has_reg_deps = true;
                     I.dst_dep_mask.resize(n_dst);
                     for (uint8_t d = 0; d < n_dst; d++) {
-                        I.dst_dep_mask[d] = (uint32_t)sub.uleb();
+                        I.dst_dep_mask[d] = (uint64_t)sub.uleb();
                     }
-                    I.store_data_dep_mask.resize(n_dep_stores);
-                    for (uint8_t s = 0; s < n_dep_stores; s++) {
-                        I.store_data_dep_mask[s] = (uint32_t)sub.uleb();
+                    I.store_data_dep_mask.resize(I.max_dep_stores);
+                    for (uint32_t s = 0; s < I.max_dep_stores; s++) {
+                        I.store_data_dep_mask[s] = (uint64_t)sub.uleb();
                     }
                 }
                 if (dep_flags & ids.dep_block_has_addr) {
-                    /* Phase 2.  Skip-parse so the cursor stays
-                     * aligned; surfacing waits on the consumer
-                     * support. */
-                    uint8_t n_dep_loads      = sub.u8();
-                    uint8_t n_dep_stores_a   = sub.u8();
                     I.has_addr_deps = true;
-                    I.load_addr_dep_mask.resize(n_dep_loads);
-                    for (uint8_t l = 0; l < n_dep_loads; l++) {
-                        I.load_addr_dep_mask[l] = (uint32_t)sub.uleb();
+                    I.load_addr_dep_mask.resize(I.max_dep_loads);
+                    for (uint32_t l = 0; l < I.max_dep_loads; l++) {
+                        I.load_addr_dep_mask[l] = (uint64_t)sub.uleb();
                     }
-                    I.store_addr_dep_mask.resize(n_dep_stores_a);
-                    for (uint8_t s = 0; s < n_dep_stores_a; s++) {
-                        I.store_addr_dep_mask[s] = (uint32_t)sub.uleb();
+                    I.store_addr_dep_mask.resize(I.max_dep_stores);
+                    for (uint32_t s = 0; s < I.max_dep_stores; s++) {
+                        I.store_addr_dep_mask[s] = (uint64_t)sub.uleb();
                     }
                 }
             }

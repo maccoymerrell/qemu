@@ -124,11 +124,18 @@ void capture_initial_regfile(unsigned int cpu_index,
     }
 }
 
-static inline void add_src_reg(InsnFields *f, InsnRegNames *refs,
-                               uint8_t reg_id, const QemuRegKey *qemu_reg)
+/*
+ * Returns the src_regs[] slot that ends up holding @reg_id (either
+ * the existing slot if the reg was already present — dedup — or the
+ * newly-allocated slot), or UINT8_MAX when the reg was skipped
+ * (REG_NONE / table full).  The slot index lets callers feed
+ * structural bookkeeping like HAS_ADDR address-dep masks.
+ */
+static inline uint8_t add_src_reg(InsnFields *f, InsnRegNames *refs,
+                                  uint8_t reg_id, const QemuRegKey *qemu_reg)
 {
     if (reg_id == REG_NONE || f->n_src_regs >= MAX_SRC_REGS) {
-        return;
+        return UINT8_MAX;
     }
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         if (f->src_regs[i] == reg_id) {
@@ -136,7 +143,7 @@ static inline void add_src_reg(InsnFields *f, InsnRegNames *refs,
                 qemu_reg_key_valid(qemu_reg)) {
                 refs->src_qemu_reg_keys[i] = qemu_reg;
             }
-            return;
+            return i;
         }
     }
     uint8_t slot = f->n_src_regs++;
@@ -144,6 +151,7 @@ static inline void add_src_reg(InsnFields *f, InsnRegNames *refs,
     if (refs && qemu_reg_key_valid(qemu_reg)) {
         refs->src_qemu_reg_keys[slot] = qemu_reg;
     }
+    return slot;
 }
 
 static inline void add_dst_reg(InsnFields *f, InsnRegNames *refs,
@@ -176,21 +184,38 @@ static inline void add_dst_reg(InsnFields *f, InsnRegNames *refs,
  * (active_reg_table backing) but holds an identical (feature, name)
  * pair, since g_qemu_reg_by_gen[gen] was populated from one such row.
  */
-static inline void add_src_cap_reg(InsnFields *f, InsnRegNames *refs,
-                                   uint16_t cap_id)
+/*
+ * Returns a mask of src_regs[] slots that ended up holding the
+ * registers behind @cap_id.  A single Capstone reg id can expand
+ * into multiple aliases (rc->n_regs > 0), each landing in its own
+ * slot; the caller may need any/all of those slots when building
+ * structural address-dep masks for HAS_ADDR.
+ */
+static inline uint64_t add_src_cap_reg(InsnFields *f, InsnRegNames *refs,
+                                       uint16_t cap_id)
 {
     const RegClassification *rc = lookup_reg_class(cap_id);
     if (!rc) {
-        return;
+        return 0;
     }
+    uint64_t mask = 0;
     if (rc->n_regs) {
         for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
             uint8_t gen = rc->regs[i];
-            add_src_reg(f, refs, gen, qemu_reg_for_generic(gen));
+            uint8_t slot = add_src_reg(f, refs, gen,
+                                       qemu_reg_for_generic(gen));
+            if (slot < MAX_SRC_REGS) {
+                mask |= (uint64_t)1 << slot;
+            }
         }
-        return;
+        return mask;
     }
-    add_src_reg(f, refs, rc->reg_id, qemu_reg_for_generic(rc->reg_id));
+    uint8_t slot = add_src_reg(f, refs, rc->reg_id,
+                               qemu_reg_for_generic(rc->reg_id));
+    if (slot < MAX_SRC_REGS) {
+        mask |= (uint64_t)1 << slot;
+    }
+    return mask;
 }
 
 static inline void add_dst_cap_reg(InsnFields *f, InsnRegNames *refs,
@@ -416,8 +441,51 @@ void decode_detail_to_generic(uint64_t pc,
             }
             break;
         case QEMU_PLUGIN_OP_MEM: {
-            add_src_cap_reg(out, out_names, op->reg_id);
-            add_src_cap_reg(out, out_names, op->index_id);
+            /*
+             * Track which src_regs[] slots this MEM operand's
+             * addressing-mode regs (base + index) land in.  The
+             * resulting mask is used to populate
+             * load_addr_dep_mask[k] / store_addr_dep_mask[k] —
+             * structural per-memop "when can this fire?" data the
+             * consumer needs to schedule loads/stores precisely
+             * (avoid waiting on dst-as-src for RMW forms, etc.).
+             *
+             * add_src_cap_reg returns a mask of slots taken (after
+             * dedup), which we OR together across base + index.
+             */
+            uint64_t addr_mask = 0;
+            addr_mask |= add_src_cap_reg(out, out_names, op->reg_id);
+            addr_mask |= add_src_cap_reg(out, out_names, op->index_id);
+
+            /*
+             * Count this mem-op against the template-static MAX
+             * load/store totals.  These bound the dep-mask bit
+             * layout: loads occupy mask bits [n_src_regs,
+             * n_src_regs + max_dep_loads) and stores feed into the
+             * store_data_dep_mask[] array of length max_dep_stores.
+             *
+             * Runtime per-iteration counts can be smaller (e.g. a
+             * conditional load that didn't fire) and ride on
+             * CST_FID_N_LOADS / CST_FID_N_STORES, but never larger.
+             *
+             * Some ops (LEA, prefetch hints) carry a MEM operand
+             * whose access flags lack both READ and WRITE — those
+             * never issue a real memop and don't count.
+             */
+            if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
+                if (out->max_dep_loads < MAX_LOADS) {
+                    out->load_addr_dep_mask[out->max_dep_loads] = addr_mask;
+                    out->max_dep_loads++;
+                    out->has_addr_deps = true;
+                }
+            }
+            if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
+                if (out->max_dep_stores < MAX_STORES) {
+                    out->store_addr_dep_mask[out->max_dep_stores] = addr_mask;
+                    out->max_dep_stores++;
+                    out->has_addr_deps = true;
+                }
+            }
             break;
         }
         default:
@@ -443,6 +511,17 @@ void decode_detail_to_generic(uint64_t pc,
      */
     if (cls && cls->refine) {
         cls->refine(info, out);
+    }
+
+    /*
+     * Optional dependency refinement.  Reads the refined InsnFields
+     * and writes dst_dep_mask[] / store_data_dep_mask[].  Rows that
+     * leave .dep_refine NULL emit no HAS_REG block — the consumer
+     * falls back to all-to-all.  See champsim_tracer_mnemonic_tables.c
+     * for the shared refiner library.
+     */
+    if (cls && cls->dep_refine) {
+        cls->dep_refine(out);
     }
 
     /*

@@ -531,40 +531,282 @@ const cst::RegSnap *find_dst_regdata(const cst::Instruction &insn, uint8_t k)
     return nullptr;
 }
 
-/* "<imm>, <src0>, <src1> -> <dst0[regdata]>, <dst1>" — returns true if
- * the line now ends with at least one operand (so callers know whether
- * to glue further columns with ", " or with a leading space). */
+/*
+ * Pre-render the input pool (src_regs + load_data + imm) into strings
+ * keyed by their mask-bit position.  Loads render with their address
+ * inputs inline ("ld[%base,%index](0x...)") when HAS_ADDR data is
+ * available; otherwise fall back to "ld<k>(0x...)" or just "ld<k>".
+ *
+ * Bit layout matches the HAS_REG mask spec:
+ *   bits [0, n_src)                          src_reg[i]
+ *   bits [n_src, n_src + max_dep_loads)      load_data[k]
+ *   bit  n_src + max_dep_loads               immediate
+ */
+void render_input_pool(std::vector<std::string> &out,
+                       const DisasmContext &ctx,
+                       const cst::Instruction &insn,
+                       const std::vector<uint64_t> &load_addrs,
+                       bool have_load_addrs)
+{
+    auto reg_str = [&](uint8_t r) {
+        std::string s;
+        append_regref(&s, ctx, r);
+        return s;
+    };
+    auto imm_str = [&]() {
+        std::string s = "$0x";
+        append_hex(&s, (uint64_t)insn.immediate);
+        return s;
+    };
+    /* src_reg slots */
+    for (uint8_t r : insn.src_regs) {
+        out.push_back(reg_str(r));
+    }
+    /* load_data slots — each renders as "ld[<addr_inputs>](addr)" using
+     * the matching HAS_ADDR mask + dynamic address.  An address mask
+     * in HAS_ADDR has the layout bits [0, n_src) src, bit n_src imm
+     * (no load_data — addresses are computed before any load fires). */
+    unsigned n_src = (unsigned)insn.src_regs.size();
+    for (unsigned k = 0; k < insn.max_dep_loads; k++) {
+        std::string s = "ld";
+        if (k < insn.load_addr_dep_mask.size()) {
+            uint64_t am = insn.load_addr_dep_mask[k];
+            std::string addr_inputs;
+            bool any = false;
+            for (unsigned i = 0; i < n_src; i++) {
+                if (am & ((uint64_t)1 << i)) {
+                    if (any) addr_inputs.push_back('+');
+                    addr_inputs.append(reg_str(insn.src_regs[i]));
+                    any = true;
+                }
+            }
+            if (am & ((uint64_t)1 << n_src)) {
+                if (any) addr_inputs.push_back('+');
+                addr_inputs.append(imm_str());
+                any = true;
+            }
+            s.push_back('[');
+            s.append(addr_inputs);
+            s.push_back(']');
+        }
+        if (have_load_addrs && k < load_addrs.size()) {
+            s.append("(0x");
+            append_hex(&s, load_addrs[k]);
+            s.push_back(')');
+        }
+        out.push_back(std::move(s));
+    }
+    /* imm slot — only when has_immediate; the bit position is fixed
+     * by the wire layout even if we don't push a name when absent. */
+    if (insn.has_immediate) {
+        out.push_back(imm_str());
+    }
+}
+
+/* Render the names of inputs flagged by @mask, comma-separated. */
+void render_input_set(std::string &line, uint64_t mask,
+                      const std::vector<std::string> &input_names)
+{
+    bool any = false;
+    for (size_t i = 0; i < input_names.size(); i++) {
+        if (mask & ((uint64_t)1 << i)) {
+            if (any) line.append(", ");
+            line.append(input_names[i]);
+            any = true;
+        }
+    }
+}
+
+/* Render a store sink: "st[<addr_inputs>](addr)" sized off HAS_ADDR
+ * for the addr inputs and the dynamic address (when available). */
+std::string render_store_sink(const DisasmContext &ctx,
+                              const cst::Instruction &insn,
+                              unsigned s,
+                              const std::vector<uint64_t> &store_addrs,
+                              bool have_store_addrs)
+{
+    auto reg_str = [&](uint8_t r) {
+        std::string sx;
+        append_regref(&sx, ctx, r);
+        return sx;
+    };
+    std::string out = "st";
+    unsigned n_src = (unsigned)insn.src_regs.size();
+    if (s < insn.store_addr_dep_mask.size()) {
+        uint64_t am = insn.store_addr_dep_mask[s];
+        std::string addr_inputs;
+        bool any = false;
+        for (unsigned i = 0; i < n_src; i++) {
+            if (am & ((uint64_t)1 << i)) {
+                if (any) addr_inputs.push_back('+');
+                addr_inputs.append(reg_str(insn.src_regs[i]));
+                any = true;
+            }
+        }
+        if (am & ((uint64_t)1 << n_src)) {
+            if (any) addr_inputs.push_back('+');
+            addr_inputs.append("$0x");
+            append_hex(&addr_inputs, (uint64_t)insn.immediate);
+            any = true;
+        }
+        out.push_back('[');
+        out.append(addr_inputs);
+        out.push_back(']');
+    }
+    if (have_store_addrs && s < store_addrs.size()) {
+        out.append("(0x");
+        append_hex(&out, store_addrs[s]);
+        out.push_back(')');
+    }
+    return out;
+}
+
+/*
+ * "<inputs> -> <dst[regdata]>" arrow, possibly multiple arrows
+ * separated by " ; " when dsts/store-data sinks have distinct dep
+ * masks.  Returns true when the line ends with at least one operand.
+ *
+ * Always takes the dep-aware path: when HAS_REG is absent on the
+ * wire, the renderer synthesizes a default "all inputs" mask for
+ * every dst and store-data slot (matching the consumer's implicit
+ * all-to-all fallback).  This gives symmetric output across
+ * classified and unclassified rows — dst arrows track HAS_REG
+ * precision when available and fall back to over-approximation
+ * otherwise, while load/store memops always render with their
+ * walker-derived address inputs inline.
+ *
+ * For purely register-flat instructions (no memops, no immediate)
+ * the default-mask path collapses to "<srcs> -> <dsts>" — identical
+ * to the legacy flat layout.
+ */
 bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
                           const cst::Instruction &insn)
 {
-    bool any = false;
-    auto sep = [&]() {
-        if (any) line.append(", ");
-        any = true;
+    std::vector<uint64_t> load_addrs, store_addrs;
+    for (const auto &dp : insn.dyn_params) {
+        if (dp.type == cst::DynParam::Load)  load_addrs.push_back(dp.addr);
+        else if (dp.type == cst::DynParam::Store) store_addrs.push_back(dp.addr);
+    }
+    bool have_load_addrs  = !load_addrs.empty();
+    bool have_store_addrs = !store_addrs.empty();
+
+    std::vector<std::string> inputs;
+    render_input_pool(inputs, ctx, insn, load_addrs, have_load_addrs);
+
+    /*
+     * Default mask used when HAS_REG is absent on the wire.  Filters
+     * out src_reg slots that the walker recorded as exclusively
+     * addressing-mode (they appear in some load/store_addr mask but
+     * the instruction has no other use for them): those srcs flow
+     * into the dst transitively through the load/store address
+     * placeholder, not directly.  Each load_data slot stays in the
+     * default, since loads produce values consumed downstream by
+     * default.
+     *
+     * Caveat — Capstone marks LEA's mem operand as CS_AC_READ even
+     * though no real load fires, so the walker counts a "load" that
+     * never happens.  The default mask for LEA then incorrectly
+     * shows the dst depending on that phantom load.  A dedicated
+     * LEA refiner overrides this with the precise "dst depends on
+     * addressing-mode srcs + imm, no load" mask.
+     */
+    unsigned n_src = (unsigned)insn.src_regs.size();
+    uint64_t addr_only_srcs = 0;
+    for (uint64_t m : insn.load_addr_dep_mask)  addr_only_srcs |= m;
+    for (uint64_t m : insn.store_addr_dep_mask) addr_only_srcs |= m;
+    /* Confine to src_reg bit range and drop the imm bit (which sits
+     * at bit n_src in HAS_ADDR layout) so we don't accidentally
+     * filter out the immediate from the default. */
+    uint64_t src_bits_mask = (n_src == 64) ? ~(uint64_t)0
+                                           : (((uint64_t)1 << n_src) - 1);
+    addr_only_srcs &= src_bits_mask;
+
+    uint64_t default_mask = 0;
+    for (size_t i = 0; i < inputs.size(); i++) {
+        default_mask |= ((uint64_t)1 << i);
+    }
+    default_mask &= ~addr_only_srcs;
+
+    auto dst_mask = [&](size_t d) {
+        return d < insn.dst_dep_mask.size() ? insn.dst_dep_mask[d]
+                                            : default_mask;
     };
-    if (insn.has_immediate) {
-        sep();
-        line.append("$0x");
-        append_hex(&line, (uint64_t)insn.immediate);
-    }
-    for (uint8_t r : insn.src_regs) {
-        sep();
-        append_regref(&line, ctx, r);
-    }
-    if (!insn.dst_regs.empty()) {
-        if (any) line.append(" -> ");
-        for (size_t k = 0; k < insn.dst_regs.size(); k++) {
-            if (k) line.append(", ");
+    auto store_mask = [&](size_t s) {
+        return s < insn.store_data_dep_mask.size()
+                   ? insn.store_data_dep_mask[s]
+                   : default_mask;
+    };
+
+    bool any_group = false;
+    auto open_group = [&]() {
+        if (any_group) line.append("  ;  ");
+        any_group = true;
+    };
+
+    /* Dst groups: walk in order, merging consecutive dsts with
+     * identical masks into one arrow.  Preserving source order keeps
+     * the rendering close to the instruction's natural reading. */
+    size_t d = 0;
+    while (d < insn.dst_regs.size()) {
+        uint64_t mask = dst_mask(d);
+        size_t end = d + 1;
+        while (end < insn.dst_regs.size() && dst_mask(end) == mask) {
+            end++;
+        }
+        open_group();
+        render_input_set(line, mask, inputs);
+        line.append(" -> ");
+        for (size_t k = d; k < end; k++) {
+            if (k > d) line.append(", ");
             append_regref(&line, ctx, insn.dst_regs[k]);
-            if (const cst::RegSnap *r = find_dst_regdata(insn, (uint8_t)k)) {
+            if (const cst::RegSnap *r =
+                    find_dst_regdata(insn, (uint8_t)k)) {
                 line.push_back('[');
                 append_wide_hex(&line, r->value);
                 line.push_back(']');
             }
         }
-        any = true;
+        d = end;
     }
-    return any;
+
+    /* Store-data groups: same pattern, sinks render as st[...](addr).
+     * Iterate up to max_dep_stores so unclassified stores still get
+     * rendered (using the default mask). */
+    size_t s = 0;
+    while (s < insn.max_dep_stores) {
+        uint64_t mask = store_mask(s);
+        size_t end = s + 1;
+        while (end < insn.max_dep_stores && store_mask(end) == mask) {
+            end++;
+        }
+        open_group();
+        render_input_set(line, mask, inputs);
+        line.append(" -> ");
+        for (size_t k = s; k < end; k++) {
+            if (k > s) line.append(", ");
+            line.append(render_store_sink(ctx, insn, (unsigned)k,
+                                          store_addrs, have_store_addrs));
+        }
+        s = end;
+    }
+
+    /* No dsts and no stores: render a "pure-input" line (e.g. a CMP
+     * that only writes to implicit flags we don't track, or a NOP
+     * with operands).  Fall through to the legacy flat form so we
+     * still surface the operands. */
+    if (!any_group) {
+        bool any = false;
+        auto sep = [&]() {
+            if (any) line.append(", ");
+            any = true;
+        };
+        for (size_t i = 0; i < inputs.size(); i++) {
+            sep();
+            line.append(inputs[i]);
+        }
+        return any;
+    }
+    return true;
 }
 
 /* "%mflags[ZNCVP]" — at most one metaflags slot per insn. */
@@ -579,20 +821,44 @@ void emit_disasm_metaflags(std::string &line, const DisasmContext &ctx,
     line.push_back(']');
 }
 
-/* Inline memops: "  ld(0x<addr>)=0x<data>" / "  st(0x<addr>)=0x<data>".
- * Data half is only emitted when the trace carries MEM_DATA. */
+/*
+ * Memops the dep-aware operand renderer covered inline are skipped
+ * here (their ld[...]/st[...] placeholders already carry the address
+ * plus its address-input set).  Anything left — typically implicit
+ * stack memops on CALL/PUSH/POP/RET that Capstone doesn't enumerate
+ * as an explicit MEM operand, so the walker never bumped
+ * max_dep_loads/stores for them — falls through to a trailing
+ * "  ld(0x<addr>)" / "  st(0x<addr>)" column so the runtime address
+ * stays visible.
+ *
+ * When the trace carries MEM_DATA, every dp (covered or not) gets a
+ * "  ld=0x<data>" / "  st=0x<data>" column matched in order to its
+ * placeholder/trailing form so the loaded/stored value isn't lost.
+ */
 void emit_disasm_memops(std::string &line, const DisasmContext &ctx,
                         const cst::Instruction &insn)
 {
     bool with_data = ctx.h->has_mem_data();
+    unsigned load_idx = 0, store_idx = 0;
     for (const auto &dp : insn.dyn_params) {
-        line.append(dp.type == cst::DynParam::Load ? "  ld(0x" : "  st(0x");
-        append_hex(&line, dp.addr);
-        line.push_back(')');
+        bool is_load = dp.type == cst::DynParam::Load;
+        bool covered = is_load
+                           ? load_idx  < insn.max_dep_loads
+                           : store_idx < insn.max_dep_stores;
+        if (!covered) {
+            /* Untracked memop — surface its address so the row isn't
+             * silently missing a runtime side effect.  No address-
+             * input set here: the walker has no info on it. */
+            line.append(is_load ? "  ld(0x" : "  st(0x");
+            append_hex(&line, dp.addr);
+            line.push_back(')');
+        }
         if (with_data) {
-            line.push_back('=');
+            line.append(is_load ? "  ld=0x" : "  st=0x");
             append_wide_hex(&line, dp.data);
         }
+        if (is_load) load_idx++;
+        else         store_idx++;
     }
 }
 
@@ -611,75 +877,167 @@ void emit_disasm_branch_target(std::string &line, const DisasmContext &ctx,
     }
 }
 
-/* For an intra-instruction dep mask, the bit layout is:
- *     [0, n_src)                src_reg[i]
- *     [n_src, n_src + n_loads)  load_data[i - n_src]
- *     n_src + n_loads           immediate
- * load_count_in_deps walks every mask in @it and finds the highest
- * load-bit that's set, telling the caller how many load slots are in
- * play (the wire format doesn't pin n_loads on the template itself). */
-unsigned load_count_in_deps(const cst::InsnTemplate &it, unsigned n_src)
-{
-    unsigned out = 0;
-    auto note = [&](uint32_t m) {
-        for (unsigned b = n_src; b < 32; b++) {
-            if (m & (1u << b)) {
-                unsigned k = b - n_src + 1;
-                if (k > out) out = k;
-            }
-        }
-    };
-    for (uint32_t m : it.dst_dep_mask) note(m);
-    for (uint32_t m : it.store_data_dep_mask) note(m);
-    return out;
-}
-
-/* "[s0,s1,ld0,imm]" — one mask rendered as a comma-separated list of
- * its set bit names.  Bit names follow the layout from
- * load_count_in_deps. */
-void append_dep_mask(std::string &line, uint32_t m,
-                     unsigned n_src, unsigned n_loads)
+/*
+ * "[%ip,ld0,imm]" — one HAS_REG mask rendered as a comma-separated
+ * list of its set bit names.  Bit layout:
+ *   bits [0, n_src)                          src_reg[i]
+ *   bits [n_src, n_src + max_dep_loads)      load_data[i - n_src]
+ *   bit  n_src + max_dep_loads               immediate
+ *
+ * src_reg bits use the actual reg name (looked up via @ctx) so the
+ * annotation reads like the inline arrow rendering; load bits stay
+ * positional ("ld<k>") since each load slot's own address is reported
+ * separately as a load_addr mask.
+ */
+void append_dep_mask(std::string &line, uint64_t m,
+                     const std::vector<uint8_t> &src_regs,
+                     unsigned n_loads,
+                     const DisasmContext &ctx)
 {
     line.push_back('[');
     bool any = false;
-    auto add = [&](const char *prefix, unsigned idx) {
+    auto sep = [&]() {
         if (any) line.push_back(',');
-        line.append(prefix);
-        line.append(std::to_string(idx));
         any = true;
     };
+    unsigned n_src = (unsigned)src_regs.size();
     for (unsigned i = 0; i < n_src; i++) {
-        if (m & (1u << i)) add("s", i);
+        if (m & ((uint64_t)1 << i)) {
+            sep();
+            append_regref(&line, ctx, src_regs[i]);
+        }
     }
     for (unsigned i = 0; i < n_loads; i++) {
-        if (m & (1u << (n_src + i))) add("ld", i);
+        if (m & ((uint64_t)1 << (n_src + i))) {
+            sep();
+            line.append("ld");
+            line.append(std::to_string(i));
+        }
     }
-    if (m & (1u << (n_src + n_loads))) {
-        if (any) line.push_back(',');
+    if (m & ((uint64_t)1 << (n_src + n_loads))) {
+        sep();
         line.append("imm");
     }
     line.push_back(']');
 }
 
-/* "deps: d0=[s0,ld0] st0=[s1]" — appended only when --show-deps is set
- * and the template carries a per-output dep block. */
+/* "[%ip,imm]" — one HAS_ADDR mask rendered.  Bit layout has no load
+ * slots (addresses are computed before any load fires): bits
+ * [0, n_src) are src_regs, bit n_src is the immediate. */
+void append_addr_mask(std::string &line, uint64_t m,
+                      const std::vector<uint8_t> &src_regs,
+                      const DisasmContext &ctx)
+{
+    line.push_back('[');
+    bool any = false;
+    auto sep = [&]() {
+        if (any) line.push_back(',');
+        any = true;
+    };
+    unsigned n_src = (unsigned)src_regs.size();
+    for (unsigned i = 0; i < n_src; i++) {
+        if (m & ((uint64_t)1 << i)) {
+            sep();
+            append_regref(&line, ctx, src_regs[i]);
+        }
+    }
+    if (m & ((uint64_t)1 << n_src)) {
+        sep();
+        line.append("imm");
+    }
+    line.push_back(']');
+}
+
+/*
+ * "deps: %gp2=[ld0] sdata0=[%gp2] | laddr0=[%ip] saddr0=[%ip]"
+ * — appended only when --show-deps is set and the template carries
+ * a dep block or any memops (max_dep_loads/max_dep_stores > 0).
+ *
+ * When HAS_REG is absent on the wire, the annotation synthesizes
+ * dst / store_data masks the same way emit_disasm_operands does
+ * (non-address-only srcs + all loads + imm), so the deps line
+ * mirrors the inline arrows.  Dst-reg slots use their actual reg
+ * name; store/load slots stay positional since they don't have a
+ * direct reg-name analog.
+ */
 void emit_disasm_deps_annotation(std::string &line,
-                                 const cst::InsnTemplate &it)
+                                 const cst::InsnTemplate &it,
+                                 const DisasmContext &ctx)
 {
     unsigned n_src = (unsigned)it.src_regs.size();
-    unsigned n_loads = load_count_in_deps(it, n_src);
-    line.append("deps:");
-    for (size_t d = 0; d < it.dst_dep_mask.size(); d++) {
-        line.append(" d");
-        line.append(std::to_string(d));
-        line.push_back('=');
-        append_dep_mask(line, it.dst_dep_mask[d], n_src, n_loads);
+    unsigned n_loads = it.max_dep_loads;
+    unsigned imm_bit = n_src + n_loads;
+
+    /* Default mask, computed identically to the inline renderer's
+     * fallback so the annotation can't disagree with the arrows. */
+    uint64_t addr_only_srcs = 0;
+    for (uint64_t m : it.load_addr_dep_mask)  addr_only_srcs |= m;
+    for (uint64_t m : it.store_addr_dep_mask) addr_only_srcs |= m;
+    uint64_t src_bits = (n_src == 64) ? ~(uint64_t)0
+                                       : (((uint64_t)1 << n_src) - 1);
+    addr_only_srcs &= src_bits;
+
+    uint64_t default_mask = 0;
+    /* every src */
+    default_mask |= src_bits;
+    /* every load_data slot */
+    for (unsigned k = 0; k < n_loads; k++) {
+        default_mask |= ((uint64_t)1 << (n_src + k));
     }
-    for (size_t s = 0; s < it.store_data_dep_mask.size(); s++) {
-        line.append(" st");
+    /* imm bit only when the template actually carries an immediate
+     * — otherwise the annotation would falsely advertise "imm" as
+     * an input on rows without one. */
+    if (it.has_imm) {
+        default_mask |= ((uint64_t)1 << imm_bit);
+    }
+    default_mask &= ~addr_only_srcs;
+
+    bool wrote_reg = false;
+    line.append("deps:");
+
+    /* Dst masks: prefer wire HAS_REG; fall back to default. */
+    size_t n_dst = it.dst_regs.size();
+    for (size_t d = 0; d < n_dst; d++) {
+        uint64_t m = d < it.dst_dep_mask.size() ? it.dst_dep_mask[d]
+                                                : default_mask;
+        line.push_back(' ');
+        append_regref(&line, ctx, it.dst_regs[d]);
+        line.push_back('=');
+        append_dep_mask(line, m, it.src_regs, n_loads, ctx);
+        wrote_reg = true;
+    }
+    /* Store-data masks: prefer wire; fall back to default per slot
+     * up to max_dep_stores so unclassified stores surface too. */
+    for (size_t s = 0; s < it.max_dep_stores; s++) {
+        uint64_t m = s < it.store_data_dep_mask.size()
+                         ? it.store_data_dep_mask[s]
+                         : default_mask;
+        line.append(" sdata");
         line.append(std::to_string(s));
         line.push_back('=');
-        append_dep_mask(line, it.store_data_dep_mask[s], n_src, n_loads);
+        append_dep_mask(line, m, it.src_regs, n_loads, ctx);
+        wrote_reg = true;
+    }
+    /* HAS_ADDR masks — these are wire-emitted whenever the walker
+     * saw a MEM operand; no synthesis needed. */
+    if (it.has_addr_deps) {
+        bool wrote_addr = !it.load_addr_dep_mask.empty() ||
+                          !it.store_addr_dep_mask.empty();
+        if (wrote_addr && wrote_reg) line.append(" |");
+        for (size_t k = 0; k < it.load_addr_dep_mask.size(); k++) {
+            line.append(" laddr");
+            line.append(std::to_string(k));
+            line.push_back('=');
+            append_addr_mask(line, it.load_addr_dep_mask[k],
+                             it.src_regs, ctx);
+        }
+        for (size_t k = 0; k < it.store_addr_dep_mask.size(); k++) {
+            line.append(" saddr");
+            line.append(std::to_string(k));
+            line.push_back('=');
+            append_addr_mask(line, it.store_addr_dep_mask[k],
+                             it.src_regs, ctx);
+        }
     }
 }
 
@@ -708,9 +1066,9 @@ void emit_disasm_trailing_meta(std::string &line, const DisasmContext &ctx,
         insn.insn_index_in_bb < insn.bb_template->insns.size()) {
         const cst::InsnTemplate &it =
             insn.bb_template->insns[insn.insn_index_in_bb];
-        if (it.has_reg_deps) {
+        if (it.has_reg_deps || it.has_addr_deps) {
             begin_item();
-            emit_disasm_deps_annotation(line, it);
+            emit_disasm_deps_annotation(line, it, ctx);
         }
     }
 }

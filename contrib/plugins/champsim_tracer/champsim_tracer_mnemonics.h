@@ -90,17 +90,30 @@ typedef struct {
  * mutate fields directly without needing the rest of the tracer
  * internals.
  */
-#define MAX_SRC_REGS 16
-#define MAX_DST_REGS 16
 /*
- * Per-insn dst / store cap for intra-instruction dependency masks.
- * 16 matches MAX_SRC_REGS for symmetry and lines up with the
- * FID_SLOT_COUNT=16 store slots in the wire format; any real
- * instruction with more stores than that is already handled via
- * EXTRA_STORE_DATA at runtime, and its dependency pattern (if we
- * ever model one) would compose linearly from the per-slot masks.
+ * Per-insn template-static caps.  These bound the static InsnFields
+ * arrays and the dep-mask bit-position layout; they must match the
+ * wire format's per-family FID slot ceiling (CST_FID_SLOT_COUNT) so
+ * a template can carry a slot for every dst/load/store the static
+ * instruction can produce.  Bumped to 64 alongside the FID widening
+ * in commit 3f9ea8bf12.
+ *
+ * Source regs aren't FID-slotted (sources are template-fixed; the
+ * runtime varies only outputs and addresses) but the dep-mask bit
+ * layout uses MAX_SRC_REGS as the lower-band boundary, so it grows
+ * in lockstep.
  */
-#define MAX_STORES   16
+#define MAX_SRC_REGS 64
+#define MAX_DST_REGS 64
+/*
+ * Per-insn template-static memop caps.  Match CST_FID_SLOT_COUNT so
+ * any static insn that fits the FID load/store ranges also fits its
+ * template-time dep-mask arrays.  Real static instructions stay well
+ * below these (ARM LD4/ST4 maxes at 4); the cap is generous because
+ * the storage cost is per InsnFields slot, not per emitted byte.
+ */
+#define MAX_STORES   64
+#define MAX_LOADS    64
 
 typedef struct InsnFields {
     uint8_t opcode;                 /* GenericOpcode */
@@ -126,40 +139,65 @@ typedef struct InsnFields {
     bool    has_immediate;
     int64_t immediate;
     uint8_t sync_hint;              /* SyncEventType */
-    uint8_t n_loads;                /* Template default; runtime uses QEMU mem callbacks */
-    uint8_t n_stores;               /* Template default; runtime uses QEMU mem callbacks */
     /*
-     * Intra-instruction register dataflow.  When @has_reg_deps is
-     * true, the wire-format encoder emits CST_INSN_FLAG_HAS_REG_DEPS
-     * in the template-insn flag byte and appends n_dst + n_stores
-     * ULEB-encoded masks after the insn bytes.  When false (the
-     * default), the template carries no mask and consumers fall back
-     * to the implicit all-to-all dataflow.
+     * Template-static MAX counts.  These are the upper bounds on how
+     * many memory reads and writes the static instruction can issue
+     * *per execution*; the dynamic per-iteration count is conveyed
+     * runtime-side via CST_FID_N_LOADS / CST_FID_N_STORES deltas.
      *
-     * Bit layout inside each mask:
-     *   bits [0, n_src_regs)                   src_reg[i]
-     *   bits [n_src_regs, n_src_regs+n_loads)  load_data[i - n_src_regs]
-     *   bit  n_src_regs + n_loads              immediate
+     * They also fix the bit layout inside dep masks (see below) so
+     * the consumer can map mask bits to input slots unambiguously.
      *
-     * Populated by the per-ISA mnemonic refiner or (phase 2) the
-     * TableGen-derived extraction step.  Plugin code that doesn't
-     * understand a particular pattern leaves @has_reg_deps false.
+     * Populated by the operand walker at template-build time from
+     * MEM operand access flags.  Carried on the wire in the outer
+     * template header.
+     */
+    uint8_t  max_dep_loads;
+    uint8_t  max_dep_stores;
+    /*
+     * Intra-instruction register dataflow (HAS_REG sub-block).
+     * When @has_reg_deps is true, the wire-format encoder emits
+     * CST_INSN_FLAG_HAS_DEP_BLOCK in the template-insn flag byte and
+     * appends n_dst + max_dep_stores ULEB-encoded masks after the
+     * insn bytes.  When false (the default), the template carries
+     * no register-side masks and consumers fall back to the implicit
+     * all-to-all dataflow for that family.
+     *
+     * Populated by the row's optional .dep_refine callback.
+     *
+     * Bit layout inside each register/load mask:
+     *   bits [0, n_src_regs)                          src_reg[i]
+     *   bits [n_src_regs, n_src_regs + max_dep_loads) load_data[i - n_src_regs]
+     *   bit  n_src_regs + max_dep_loads               immediate
+     *
+     * Mask type is uint64_t so the imm bit fits when both src_regs
+     * and load slots stack up; real instructions don't push close
+     * to that ceiling but the storage cost is template-only.
      */
     bool     has_reg_deps;
+    uint64_t dst_dep_mask[MAX_DST_REGS];
+    uint64_t store_data_dep_mask[MAX_STORES];
     /*
-     * Number of store_data_dep masks the refiner populated.  The
-     * wire format's templated `n_stores` byte is always emitted as
-     * 0 (runtime count rides on CST_FID_N_STORES), so the dep block
-     * carries its own count.  This is a template-time concept: how
-     * many store memops does the *static instruction* describe?
-     * Equal to n_dst for the common "stores match dst layout"
-     * pattern; can be 0 for non-store insns or 2 for AArch64 STP.
-     * Same shape for n_dep_loads when phase 2 lands HAS_ADDR.
+     * Intra-instruction address dataflow (HAS_ADDR sub-block).
+     * Per-memop "when can this load/store fire" mask: which template
+     * inputs feed its address computation.  Populated structurally
+     * by the operand walker (NOT by .dep_refine) — every MEM operand
+     * the walker encounters contributes a mask saying which src_reg
+     * slots its addressing-mode regs landed in.  Addresses are
+     * computed before any load fires, so the bit layout omits the
+     * load_data slots:
+     *
+     *   bits [0, n_src_regs)        src_reg[i]
+     *   bit  n_src_regs             immediate
+     *
+     * Consumers use these to schedule load/store firing precisely
+     * (avoid waiting on dst-as-src for RMW forms, etc.); refiners
+     * leave them alone.  has_addr_deps trips when at least one MEM
+     * operand was seen.
      */
-    uint8_t  n_dep_stores;
-    uint8_t  n_dep_loads;
-    uint32_t dst_dep_mask[MAX_DST_REGS];
-    uint32_t store_data_dep_mask[MAX_STORES];
+    bool     has_addr_deps;
+    uint64_t load_addr_dep_mask[MAX_LOADS];
+    uint64_t store_addr_dep_mask[MAX_STORES];
     /*
      * x86 REP / REPNZ string-op metadata.  Non-zero on insns whose
      * Capstone detail carried info->has_rep; both fields capture the
@@ -192,18 +230,61 @@ typedef void (*InsnRefineFn)(const struct qemu_plugin_insn_info *info,
                              InsnFields *fields);
 
 /*
+ * Optional dependency refiner.
+ *
+ * Reads what the generic operand-walk and any `.refine` callback have
+ * already populated in @fields, then writes dst_dep_mask[] and
+ * store_data_dep_mask[], sets n_dep_stores, and flips has_reg_deps.
+ *
+ * The refiner library is small and shared across ISAs (defined in
+ * champsim_tracer_mnemonic_tables.c).  A row may point at one of the
+ * shared refiners or supply its own one-off (rare; the typical case
+ * picks a shape from the library).  Rows that leave .dep_refine NULL
+ * emit no HAS_REG block, which the consumer interprets as the legacy
+ * "implicit all-to-all" fallback; the audit script's coverage report
+ * flags these so unintentional fallbacks can be promoted to explicit
+ * classifications over time.
+ *
+ * Runs once at template-construction time (per unique PC), not on the
+ * hot path during tracing.
+ */
+typedef void (*InsnDepRefineFn)(InsnFields *fields);
+
+/*
+ * Shared refiners (defined in champsim_tracer_mnemonic_tables.c).
+ * Per-ISA mnemonic tables reference these directly in row
+ * initialisers via `.dep_refine = dep_<name>`.
+ *
+ * Each refiner targets a *dataflow behavior group* — wide coverage
+ * across the operand-shape variants Capstone groups under a single
+ * insn id (rr / rm / mr / ri / mi / ...).  A small complementary
+ * set of refiners covers the full classification surface; the audit
+ * script's classifier picks one refiner per Capstone id that
+ * correctly handles every variant of that id.
+ */
+void dep_all_to_all(InsnFields *fields);
+void dep_passthrough(InsnFields *fields);
+void dep_lea(InsnFields *fields);
+void dep_x86_stack_push(InsnFields *fields);
+void dep_x86_stack_pop(InsnFields *fields);
+
+/*
  * Instruction classification entry: maps a Capstone insn_id directly
  * to GenericOpcode + BranchType + MnemonicFlags via designated-initializer
  * arrays indexed by the Capstone enum value.  Eliminates all string-based
  * mnemonic matching (hash tables, regex, prefix stripping, caches).
  *
- * `.refine` is optional (NULL by default); see InsnRefineFn above.
+ * `.refine` and `.dep_refine` are independent optional callbacks.
+ * When both are set, `.refine` runs first (it may rewrite
+ * src_regs/dst_regs/has_immediate etc.), then `.dep_refine` reads the
+ * refined fields to produce dep masks.
  */
 typedef struct {
-    uint8_t      opcode;      /* GenericOpcode */
-    uint8_t      branch_type; /* BranchType */
-    uint16_t     flags;       /* MnemonicFlags */
-    InsnRefineFn refine;      /* optional, NULL if unused */
+    uint8_t         opcode;      /* GenericOpcode */
+    uint8_t         branch_type; /* BranchType */
+    uint16_t        flags;       /* MnemonicFlags */
+    InsnRefineFn    refine;      /* optional, NULL if unused */
+    InsnDepRefineFn dep_refine;  /* optional, NULL → emit no HAS_REG block */
 } InsnClassification;
 
 

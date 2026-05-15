@@ -544,8 +544,15 @@ struct BodyStreamState {
  *   n_dst       : u8
  *   src_regs[n_src] : u8 each
  *   dst_regs[n_dst] : u8 each
- *   n_loads     : u8       zero; runtime count is sparse N_LOADS
- *   n_stores    : u8       zero; runtime count is sparse N_STORES
+ *   max_dep_loads  : u8    template-static MAX load count.  Bounds
+ *                          the dep-mask bit layout: load slots
+ *                          occupy bits [n_src, n_src+max_dep_loads).
+ *                          Runtime per-iter count rides on
+ *                          CST_FID_N_LOADS and may be smaller.
+ *   max_dep_stores : u8    template-static MAX store count.  Sizes
+ *                          the store_data_dep_mask[] array in the
+ *                          HAS_REG sub-block.  Runtime per-iter
+ *                          count rides on CST_FID_N_STORES.
  *   [imm]       : SLEB128  (iff has_immediate)
  *   insn_size   : u8
  *   insn_bytes[insn_size]
@@ -590,7 +597,7 @@ static void write_bin_templates(BitWriter *bw)
             }
             flags |= (uint8_t)((fld->sync_hint & 0x0F)
                                << CST_INSN_FLAG_SYNC_SHIFT);
-            if (fld->has_reg_deps) {
+            if (fld->has_reg_deps || fld->has_addr_deps) {
                 flags |= CST_INSN_FLAG_HAS_DEP_BLOCK;
             }
             bw_write_u8(&sub, flags);
@@ -603,8 +610,8 @@ static void write_bin_templates(BitWriter *bw)
             for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
                 bw_write_u8(&sub, fld->dst_regs[d]);
             }
-            bw_write_u8(&sub, 0);
-            bw_write_u8(&sub, 0);
+            bw_write_u8(&sub, fld->max_dep_loads);
+            bw_write_u8(&sub, fld->max_dep_stores);
             if (fld->has_immediate) {
                 bw_write_sleb128(&sub, fld->immediate);
             }
@@ -614,24 +621,43 @@ static void write_bin_templates(BitWriter *bw)
                            tmpl->insn_sizes[i]);
 
             /*
-             * Optional dependency sub-block.  Phase 1 only emits the
-             * register/load mask family (HAS_REG); phase 2 will add
-             * the address-only family (HAS_ADDR) without touching the
-             * per-insn flag byte.  Refiner-free instructions leave
-             * has_reg_deps false and pay zero bytes.  n_dst comes
-             * from the outer template; n_dep_stores is carried in
-             * the block header because the wire format's templated
-             * n_stores is always 0 (runtime count rides on the FID
-             * stream).
+             * Optional dependency sub-block.  Two independent
+             * families inside one block, controlled by dep_block_flags:
+             *
+             *   HAS_REG  — refiner-produced: which inputs feed each
+             *              dst reg / each store's data
+             *   HAS_ADDR — walker-produced: which src_regs feed each
+             *              load/store ADDRESS (so the consumer knows
+             *              when each memop can fire)
+             *
+             * Mask array sizes all come from the outer template
+             * header (n_dst, max_dep_loads, max_dep_stores); the
+             * block carries only the dep_block_flags byte + masks.
+             * Bit layouts diverge: HAS_REG masks address the full
+             * input pool (src_regs + load_data + imm); HAS_ADDR
+             * masks omit the load_data band because addresses are
+             * computed before any load fires.
              */
-            if (fld->has_reg_deps) {
-                bw_write_u8(&sub, CST_DEP_BLOCK_HAS_REG);
-                bw_write_u8(&sub, fld->n_dep_stores);
-                for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
-                    bw_write_uleb128(&sub, fld->dst_dep_mask[d]);
+            if (fld->has_reg_deps || fld->has_addr_deps) {
+                uint8_t dep_flags = 0;
+                if (fld->has_reg_deps)  dep_flags |= CST_DEP_BLOCK_HAS_REG;
+                if (fld->has_addr_deps) dep_flags |= CST_DEP_BLOCK_HAS_ADDR;
+                bw_write_u8(&sub, dep_flags);
+                if (fld->has_reg_deps) {
+                    for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
+                        bw_write_uleb128(&sub, fld->dst_dep_mask[d]);
+                    }
+                    for (uint8_t s = 0; s < fld->max_dep_stores; s++) {
+                        bw_write_uleb128(&sub, fld->store_data_dep_mask[s]);
+                    }
                 }
-                for (uint8_t s = 0; s < fld->n_dep_stores; s++) {
-                    bw_write_uleb128(&sub, fld->store_data_dep_mask[s]);
+                if (fld->has_addr_deps) {
+                    for (uint8_t l = 0; l < fld->max_dep_loads; l++) {
+                        bw_write_uleb128(&sub, fld->load_addr_dep_mask[l]);
+                    }
+                    for (uint8_t s = 0; s < fld->max_dep_stores; s++) {
+                        bw_write_uleb128(&sub, fld->store_addr_dep_mask[s]);
+                    }
                 }
             }
         }

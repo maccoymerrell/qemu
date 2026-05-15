@@ -193,31 +193,34 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
     resolve_one(maps.body_tag, "body_tag", "BODY_TAG_REGFILE",
                 &ids->body_tag_regfile);
 
-    /* field_id (slot-range bases + singletons).  EXTRA_* retired in
-     * format version 0x1D; slot k of family <F> resolves to the
-     * uint16_t value at name "CST_FID_<F>0" plus k * FID_SLOT_STRIDE,
-     * but decoders look up each slot by full name through the
-     * encoding map. */
+    /* field_id (per-slot families + singletons).  The wire format
+     * defines arbitrary slot-to-FID mapping via the encoding map's
+     * CST_FID_<family><k> entries; we look each up by full name
+     * with no stride / ordering assumption. */
     resolve_one(maps.field_id, "field_id", "CST_FID_N_LOADS",
                 &ids->fid_n_loads);
     resolve_one(maps.field_id, "field_id", "CST_FID_N_STORES",
                 &ids->fid_n_stores);
     resolve_one(maps.field_id, "field_id", "CST_FID_METAFLAGS",
                 &ids->fid_metaflags);
-    resolve_one(maps.field_id, "field_id", "CST_FID_LOAD_ADDR0",
-                &ids->fid_load_addr_base);
-    resolve_one(maps.field_id, "field_id", "CST_FID_STORE_ADDR0",
-                &ids->fid_store_addr_base);
-    resolve_one(maps.field_id, "field_id", "CST_FID_LOAD_DATA0",
-                &ids->fid_load_data_base);
-    resolve_one(maps.field_id, "field_id", "CST_FID_STORE_DATA0",
-                &ids->fid_store_data_base);
-    resolve_one(maps.field_id, "field_id", "CST_FID_DST_REG0",
-                &ids->fid_dst_reg_base);
-    resolve_one(maps.field_id, "field_id", "CST_FID_SRC_LANE_MASK0",
-                &ids->fid_src_lane_mask_base);
-    resolve_one(maps.field_id, "field_id", "CST_FID_DST_LANE_MASK0",
-                &ids->fid_dst_lane_mask_base);
+    /* Slotted families: resolve every (family, slot) by name. */
+    static const struct { const char *prefix;
+                          std::array<uint16_t, 64> ResolvedIds::*arr; } fam[] = {
+        { "CST_FID_LOAD_ADDR",     &ResolvedIds::fid_load_addr     },
+        { "CST_FID_STORE_ADDR",    &ResolvedIds::fid_store_addr    },
+        { "CST_FID_LOAD_DATA",     &ResolvedIds::fid_load_data     },
+        { "CST_FID_STORE_DATA",    &ResolvedIds::fid_store_data    },
+        { "CST_FID_DST_REG",       &ResolvedIds::fid_dst_reg       },
+        { "CST_FID_SRC_LANE_MASK", &ResolvedIds::fid_src_lane_mask },
+        { "CST_FID_DST_LANE_MASK", &ResolvedIds::fid_dst_lane_mask },
+    };
+    for (const auto &f : fam) {
+        for (uint16_t k = 0; k < FID_SLOT_COUNT; k++) {
+            std::string name = std::string(f.prefix) + std::to_string(k);
+            resolve_one(maps.field_id, "field_id", name.c_str(),
+                        &(ids->*f.arr)[k]);
+        }
+    }
     resolve_one(maps.field_id, "field_id", "CST_FID_INSN_BYTES_LO",
                 &ids->fid_insn_bytes_lo);
     resolve_one(maps.field_id, "field_id", "CST_FID_INSN_BYTES_HI",

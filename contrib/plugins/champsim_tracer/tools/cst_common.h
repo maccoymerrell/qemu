@@ -58,8 +58,12 @@ inline constexpr uint32_t CST_MAGIC = 0x1D545343u;
  * the trace header carries — consumers should always pull them
  * through resolve_ids() rather than hardcoding numeric values. */
 inline constexpr uint16_t FID_SLOT_COUNT       = 64;
-inline constexpr uint8_t  FID_SLOT_STRIDE      = 5;
-inline constexpr uint8_t  FID_LANE_BLOCK_STRIDE = 2;
+/* Note: there is intentionally no FID_SLOT_STRIDE / FID_LANE_BLOCK_STRIDE
+ * constant here.  The wire format defines slot-to-FID mapping
+ * entirely through the encoding map (CST_FID_<family><k> entries);
+ * consumers MUST look each slot's FID up by name and never compute
+ * from a hardcoded stride.  See ResolvedIds below for the per-slot
+ * arrays. */
 inline constexpr size_t  MAX_WIDE_BYTES       = 64;
 inline constexpr int     MAX_INSN_BYTES       = 16;
 
@@ -83,25 +87,22 @@ struct ResolvedIds {
     uint8_t body_tag_iframe        = 0;
     uint8_t body_tag_regfile       = 0;
 
-    /* field_id map: base IDs of the per-slot ranges + singletons.
-     * FIDs are ULEB128 on the wire (format version 0x1D); the
-     * uint16_t storage covers the 0x1D layout's max slotted ID of
-     * ~322 with headroom for future renumberings.  Slot k of family
-     * <F> sits at fid_<f>_base + k * FID_SLOT_STRIDE. */
+    /* field_id map: per-slot FID arrays + singletons.  FIDs are
+     * ULEB128 on the wire; the uint16_t storage handles current
+     * layouts comfortably.  Per-slot arrays are populated by
+     * looking up CST_FID_<family><k> by name in the encoding map
+     * for each k — the writer's slot-to-FID layout is opaque to
+     * consumers (no stride assumption). */
     uint16_t fid_n_loads          = 0;
     uint16_t fid_n_stores         = 0;
     uint16_t fid_metaflags        = 0;
-    uint16_t fid_load_addr_base   = 0;
-    uint16_t fid_store_addr_base  = 0;
-    uint16_t fid_load_data_base   = 0;
-    uint16_t fid_store_data_base  = 0;
-    uint16_t fid_dst_reg_base     = 0;
-    /* Lane-mask block — separate from the main slotted block to keep
-     * the cheaper 1-byte ULEB range reserved for memop / dst-reg FIDs.
-     * Slot k of family <f> in the lane block sits at
-     * fid_<f>_lane_mask_base + k * FID_LANE_BLOCK_STRIDE.            */
-    uint16_t fid_src_lane_mask_base = 0;
-    uint16_t fid_dst_lane_mask_base = 0;
+    std::array<uint16_t, 64> fid_load_addr     {};
+    std::array<uint16_t, 64> fid_store_addr    {};
+    std::array<uint16_t, 64> fid_load_data     {};
+    std::array<uint16_t, 64> fid_store_data    {};
+    std::array<uint16_t, 64> fid_dst_reg       {};
+    std::array<uint16_t, 64> fid_src_lane_mask {};
+    std::array<uint16_t, 64> fid_dst_lane_mask {};
     uint16_t fid_insn_bytes_lo    = 0;
     uint16_t fid_insn_bytes_hi    = 0;
     uint16_t fid_insn_opcode      = 0;

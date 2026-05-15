@@ -51,40 +51,43 @@ void slot_lut_build(const ResolvedIds &ids,
     (*out)[ids.fid_n_stores]  = 1;
     (*out)[ids.fid_metaflags] = 2;
 
-    const uint16_t bases[5] = {
-        ids.fid_load_addr_base,
-        ids.fid_store_addr_base,
-        ids.fid_load_data_base,
-        ids.fid_store_data_base,
-        ids.fid_dst_reg_base,
+    /* Dense slot order is a consumer-side internal mapping; the FID
+     * each (family, k) pair takes on the wire comes from
+     * ResolvedIds' per-slot arrays (resolved by name) and is not
+     * assumed to follow any stride. */
+    const std::array<uint16_t, FID_SLOT_COUNT> *const slotted_fams[] = {
+        &ids.fid_load_addr,
+        &ids.fid_store_addr,
+        &ids.fid_load_data,
+        &ids.fid_store_data,
+        &ids.fid_dst_reg,
+        &ids.fid_src_lane_mask,
+        &ids.fid_dst_lane_mask,
     };
+    constexpr size_t N_FAM = sizeof(slotted_fams) / sizeof(slotted_fams[0]);
+
+    unsigned dense_idx = 3;
     for (unsigned k = 0; k < FID_SLOT_COUNT; k++) {
-        for (unsigned f = 0; f < 5; f++) {
-            unsigned fid = bases[f] + k * FID_SLOT_STRIDE;
-            if (fid < FID_LUT_SIZE) {
-                (*out)[fid] = (uint16_t)(3 + 5 * k + f);
+        for (size_t f = 0; f < N_FAM; f++) {
+            uint16_t fid = (*slotted_fams[f])[k];
+            if (fid != 0 && fid < FID_LUT_SIZE) {
+                (*out)[fid] = (uint16_t)dense_idx;
             }
+            dense_idx++;
         }
     }
-    /* Lane-mask block (separate stride). */
-    unsigned lane_dense_base = 3 + 5 * FID_SLOT_COUNT;
-    const uint16_t lane_bases[2] = {
-        ids.fid_src_lane_mask_base,
-        ids.fid_dst_lane_mask_base,
+
+    /* Cold insn-metadata singletons.  Each FID is resolved by name in
+     * ResolvedIds; map each into its own dense slot. */
+    const uint16_t cold_fids[] = {
+        ids.fid_insn_bytes_lo, ids.fid_insn_bytes_hi,
+        ids.fid_insn_opcode,   ids.fid_insn_branch_type,
+        ids.fid_insn_flags,    ids.fid_insn_immediate,
+        ids.fid_insn_size,
     };
-    for (unsigned k = 0; k < FID_SLOT_COUNT; k++) {
-        for (unsigned f = 0; f < 2; f++) {
-            unsigned fid = lane_bases[f] + k * FID_LANE_BLOCK_STRIDE;
-            if (fid < FID_LUT_SIZE) {
-                (*out)[fid] = (uint16_t)(lane_dense_base + 2 * k + f);
-            }
-        }
-    }
-    unsigned slotted_dense_end = lane_dense_base + 2 * FID_SLOT_COUNT;
-    for (unsigned f = ids.fid_insn_bytes_lo; f <= ids.fid_insn_size; f++) {
-        if (f < FID_LUT_SIZE) {
-            (*out)[f] = (uint16_t)(slotted_dense_end +
-                                   (f - ids.fid_insn_bytes_lo));
+    for (size_t i = 0; i < sizeof(cold_fids) / sizeof(cold_fids[0]); i++) {
+        if (cold_fids[i] < FID_LUT_SIZE) {
+            (*out)[cold_fids[i]] = (uint16_t)(dense_idx + i);
         }
     }
 }
@@ -704,13 +707,14 @@ void apply_record_deltas(BodyWalker &walker, Reader &sec, uint64_t n_records,
 }
 
 /* Materialise the slotted loads or stores for one insn into @out.
- * @type picks Load vs Store; @addr_base / @data_base are slot-0
- * fids for the family.  Slot k of the family lives at fid
- * base + k * FID_SLOT_STRIDE — see the interleaved-by-slot layout
- * defined in champsim_tracer_format.md §5.1. */
+ * @type picks Load vs Store; @addr_fids / @data_fids are the
+ * per-slot FID arrays for this family, name-resolved out of the
+ * encoding map (no stride assumption — the writer chooses the
+ * slot-to-FID mapping freely). */
 void materialise_slotted_memops(uint32_t insn_idx, uint64_t n_fixed,
                                 DynParam::Type type,
-                                uint16_t addr_base, uint16_t data_base,
+                                const std::array<uint16_t, FID_SLOT_COUNT> &addr_fids,
+                                const std::array<uint16_t, FID_SLOT_COUNT> &data_fids,
                                 bool has_mem,
                                 const FieldStateBlock *state_blk,
                                 uint32_t state_gen,
@@ -725,8 +729,8 @@ void materialise_slotted_memops(uint32_t insn_idx, uint64_t n_fixed,
      * a malformed trace whose N_LOADS / N_STORES exceed the cap. */
     if (n_fixed > FID_SLOT_COUNT) n_fixed = FID_SLOT_COUNT;
     for (uint64_t s = 0; s < n_fixed; s++) {
-        uint16_t addr_fid = (uint16_t)(addr_base + s * FID_SLOT_STRIDE);
-        uint16_t data_fid = (uint16_t)(data_base + s * FID_SLOT_STRIDE);
+        uint16_t addr_fid = addr_fids[s];
+        uint16_t data_fid = data_fids[s];
         Wide a = lookup_cell(state_blk, state_gen, base_blk, base_gen,
                              slot_lut, insn_idx, addr_fid);
         DynParam dp;
@@ -757,8 +761,8 @@ void materialise_reg_snaps_and_metaflags(uint32_t insn_idx,
                                          std::vector<MetaFlagsEntry> *mflags_out)
 {
     for (size_t op_i = 0; op_i < it.dst_regs.size(); op_i++) {
-        uint16_t fid = (uint16_t)(ids.fid_dst_reg_base +
-                                  op_i * FID_SLOT_STRIDE);
+        if (op_i >= FID_SLOT_COUNT) break;
+        uint16_t fid = ids.fid_dst_reg[op_i];
         Wide v = lookup_cell(state_blk, state_gen, base_blk, base_gen,
                              slot_lut, insn_idx, fid);
         RegSnap r;
@@ -840,15 +844,15 @@ void BodyWalker::decode_field_delta(Reader &outer,
 
         if (n_loads || n_stores) {
             materialise_slotted_memops(idx, n_loads, DynParam::Load,
-                                       ids.fid_load_addr_base,
-                                       ids.fid_load_data_base,
+                                       ids.fid_load_addr,
+                                       ids.fid_load_data,
                                        has_mem,
                                        state_blk, state_gen,
                                        base_blk,  base_gen,
                                        slot_lut_, dyn_params);
             materialise_slotted_memops(idx, n_stores, DynParam::Store,
-                                       ids.fid_store_addr_base,
-                                       ids.fid_store_data_base,
+                                       ids.fid_store_addr,
+                                       ids.fid_store_data,
                                        has_mem,
                                        state_blk, state_gen,
                                        base_blk,  base_gen,

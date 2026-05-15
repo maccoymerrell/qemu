@@ -42,9 +42,10 @@ enum : int {
     NUM_BUCKETS     = 10,
 };
 
-/* FID -> bucket lookup.  Sized for the ULEB-encoded FID space
- * (format version 0x1D); slotted families' slot k lives at
- * base + k * FID_SLOT_STRIDE — see the interleaved-by-slot layout. */
+/* FID -> bucket lookup.  Sized for the ULEB-encoded FID space.
+ * Slotted families are read from the per-slot FID arrays in
+ * ResolvedIds (name-resolved out of the encoding map — no stride
+ * assumption); each slot's actual FID is whatever the writer chose. */
 struct FidTables {
     static constexpr size_t LUT_SIZE = 512;
     std::array<uint8_t, LUT_SIZE> bucket{};
@@ -55,20 +56,32 @@ struct FidTables {
         if (ids.fid_n_stores  < LUT_SIZE) bucket[ids.fid_n_stores]  = BIDX_MEM_COUNTS;
         if (ids.fid_metaflags < LUT_SIZE) bucket[ids.fid_metaflags] = BIDX_INSN_META;
 
-        const struct { uint16_t base; uint8_t bucket_id; } fam[5] = {
-            { ids.fid_load_addr_base,  (uint8_t)BIDX_LOAD_ADDR  },
-            { ids.fid_store_addr_base, (uint8_t)BIDX_STORE_ADDR },
-            { ids.fid_load_data_base,  (uint8_t)BIDX_LOAD_DATA  },
-            { ids.fid_store_data_base, (uint8_t)BIDX_STORE_DATA },
-            { ids.fid_dst_reg_base,    (uint8_t)BIDX_DST_REG    },
+        const struct {
+            const std::array<uint16_t, cst::FID_SLOT_COUNT> *fids;
+            uint8_t bucket_id;
+        } fam[5] = {
+            { &ids.fid_load_addr,   (uint8_t)BIDX_LOAD_ADDR  },
+            { &ids.fid_store_addr,  (uint8_t)BIDX_STORE_ADDR },
+            { &ids.fid_load_data,   (uint8_t)BIDX_LOAD_DATA  },
+            { &ids.fid_store_data,  (uint8_t)BIDX_STORE_DATA },
+            { &ids.fid_dst_reg,     (uint8_t)BIDX_DST_REG    },
         };
         for (int k = 0; k < cst::FID_SLOT_COUNT; k++) {
             for (auto &fa : fam) {
-                unsigned fid = fa.base + (unsigned)k * cst::FID_SLOT_STRIDE;
-                if (fid < LUT_SIZE) bucket[fid] = fa.bucket_id;
+                uint16_t fid = (*fa.fids)[k];
+                if (fid != 0 && fid < LUT_SIZE) bucket[fid] = fa.bucket_id;
             }
         }
-        for (unsigned f = ids.fid_insn_bytes_lo; f <= ids.fid_insn_size; f++) {
+        /* Cold insn-metadata singletons.  Iterate the named singletons
+         * explicitly rather than scanning [fid_insn_bytes_lo, fid_insn_size]
+         * — the wire format doesn't promise they're contiguous. */
+        const uint16_t cold_fids[] = {
+            ids.fid_insn_bytes_lo, ids.fid_insn_bytes_hi,
+            ids.fid_insn_opcode,   ids.fid_insn_branch_type,
+            ids.fid_insn_flags,    ids.fid_insn_immediate,
+            ids.fid_insn_size,
+        };
+        for (uint16_t f : cold_fids) {
             if (f < LUT_SIZE) bucket[f] = BIDX_INSN_META;
         }
         if (ids.fid_extended < LUT_SIZE) bucket[ids.fid_extended] = BIDX_EXTENDED;

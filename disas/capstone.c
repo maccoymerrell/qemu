@@ -409,6 +409,14 @@ static void cap_copy_reg_name(char *dst, size_t dstsz,
     }
 }
 
+/* Forward decls — definitions live just past cap_fill_x86_operands so
+ * the AArch64 helper (which is what they're nearest to) lands grouped
+ * with its primary consumer. */
+static bool cap_decode_aarch64_vas(unsigned vas,
+                                   uint8_t *lane_bytes,
+                                   uint8_t *total_bytes);
+static uint8_t cap_lane_bytes_from_mnemonic(const char *mnem);
+
 /*
  * Extract per-operand detail for x86 into the plugin operand struct.
  */
@@ -419,12 +427,17 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
     uint8_t n = MIN(x86->op_count, QEMU_PLUGIN_INSN_DETAIL_MAX_OPS);
     out->n_operands = n;
 
+    /* x86 SIMD: lane width is encoded in the mnemonic suffix and
+     * applies uniformly across all operands of the insn. */
+    uint8_t insn_lane_bytes = cap_lane_bytes_from_mnemonic(insn->mnemonic);
+
     for (uint8_t i = 0; i < n; i++) {
         const cs_x86_op *cop = &x86->operands[i];
         qemu_plugin_operand *op = &out->operands[i];
 
         op->access = cop->access;
         op->size = cop->size;
+        op->lane_bytes = insn_lane_bytes;
         op->scale = 1;
         op->shift_type = 0;
         op->shift_amount = 0;
@@ -479,6 +492,66 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
 }
 
 /*
+ * Lane-width helpers — see qemu_plugin_operand.lane_bytes.  Tracer-
+ * internal metadata derived from whatever Capstone surfaces per ISA:
+ *   AArch64: per-operand vector arrangement specifier (vas) — gives
+ *            both lane bytes and total operand size.
+ *   x86 / MIPS MSA: mnemonic suffix (PS=4, PD=8, PH=2, single-letter
+ *            integer suffix B/W/D/Q = 1/2/4/8).
+ *   RISC-V V: SEW is a runtime CSR, not derivable from disassembly;
+ *            stays at 0 here, runtime path handles via FID deltas.
+ */
+static bool cap_decode_aarch64_vas(unsigned vas,
+                                   uint8_t *lane_bytes,
+                                   uint8_t *total_bytes)
+{
+    if (vas == AARCH64LAYOUT_INVALID) return false;
+    /* vas low byte encodes lane bit-width (B=8/H=16/S=32/D=64/Q=128);
+     * high byte encodes lane count (0 = bare arrangement, 1 lane). */
+    unsigned lane_bits = vas & 0xff;
+    if (lane_bits != 8 && lane_bits != 16 &&
+        lane_bits != 32 && lane_bits != 64 && lane_bits != 128) {
+        return false;
+    }
+    unsigned count = (vas >> 8) & 0xff;
+    if (count == 0) count = 1;
+    unsigned lb = lane_bits / 8;
+    unsigned tb = lb * count;
+    if (tb > 255) return false; /* SVE matrix tile (COMPLETE). */
+    *lane_bytes  = (uint8_t)lb;
+    *total_bytes = (uint8_t)tb;
+    return true;
+}
+
+static uint8_t cap_lane_bytes_from_mnemonic(const char *mnem)
+{
+    if (!mnem || !mnem[0]) return 0;
+    size_t n = strlen(mnem);
+    if (n < 3) return 0;
+    if (mnem[n - 2] == 'p') {
+        char c = mnem[n - 1];
+        if (c == 's') return 4;
+        if (c == 'd') return 8;
+        if (c == 'h') return 2;
+    }
+    if (n >= 4) {
+        char prev = mnem[n - 2];
+        char c    = mnem[n - 1];
+        bool dot_form    = (prev == '.');
+        bool simd_prefix = (mnem[0] == 'v' || (mnem[0] == 'p' && n >= 5));
+        if (dot_form || simd_prefix) {
+            switch (c) {
+            case 'b': return 1;
+            case 'w': return 2;
+            case 'd': return 4;
+            case 'q': return 8;
+            }
+        }
+    }
+    return 0;
+}
+
+/*
  * Extract per-operand detail for AArch64 into the plugin operand struct.
  */
 static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
@@ -493,7 +566,18 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
         qemu_plugin_operand *op = &out->operands[i];
 
         op->access = cop->access;
-        op->size = 0; /* AArch64 Capstone doesn't provide per-op size */
+        op->size = 0;
+        op->lane_bytes = 0;
+        /* AArch64 Capstone surfaces vector arrangement (vas) per
+         * operand; decode it into (size, lane_bytes) when present.
+         * Non-vector operands stay zero. */
+        {
+            uint8_t lb = 0, tb = 0;
+            if (cap_decode_aarch64_vas(cop->vas, &lb, &tb)) {
+                op->size       = tb;
+                op->lane_bytes = lb;
+            }
+        }
         op->scale = 1;
         op->shift_type = (uint8_t)cop->shift.type;
         op->shift_amount = (uint8_t)cop->shift.value;
@@ -559,6 +643,8 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             qemu_plugin_operand *op = &out->operands[i];
             op->access = 0; /* RISC-V Capstone lacks access info */
             op->size = 0;
+            /* V-extension SEW is a runtime CSR; not derivable here. */
+            op->lane_bytes = 0;
             op->scale = 1;
             op->shift_type = 0;
             op->shift_amount = 0;
@@ -604,11 +690,15 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
     } else if (cap_arch == CS_ARCH_MIPS) {
         n = MIN(detail->mips.op_count, QEMU_PLUGIN_INSN_DETAIL_MAX_OPS);
         out->n_operands = n;
+        /* MIPS MSA encodes lane width in the mnemonic dot-form
+         * suffix (addv.b / mulv.w / etc.); shared across operands. */
+        uint8_t insn_lane_bytes = cap_lane_bytes_from_mnemonic(insn->mnemonic);
         for (uint8_t i = 0; i < n; i++) {
             const cs_mips_op *cop = &detail->mips.operands[i];
             qemu_plugin_operand *op = &out->operands[i];
             op->access = 0; /* MIPS Capstone lacks access info */
             op->size = 0;
+            op->lane_bytes = insn_lane_bytes;
             op->scale = 1;
             op->shift_type = 0;
             op->shift_amount = 0;

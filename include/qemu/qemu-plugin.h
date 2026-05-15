@@ -807,6 +807,26 @@ typedef struct qemu_plugin_operand {
     uint8_t  access;   /* bitmask of QEMU_PLUGIN_OP_ACC_*, 0 if unknown */
     uint8_t  size;     /* operand size in bytes */
     /*
+     * Per-operand vector lane width in bytes.  Plugin-internal
+     * metadata derived from Capstone's per-ISA structured detail:
+     *   AArch64: decoded from the operand's vector arrangement
+     *            specifier (vas) — .4S = 4, .2D = 8, .8H = 2, etc.
+     *   x86    : derived from the canonical insn mnemonic suffix
+     *            (PS = 4, PD = 8, B = 1, W = 2, D = 4, Q = 8).
+     *   RISC-V : the V-extension SEW is a runtime CSR and isn't
+     *            derivable from disassembly alone — left at 0.
+     *
+     * Plugins use this for tracer-side bookkeeping such as mapping
+     * vector memops to the dst-reg lanes they fill, or computing the
+     * baseline lane bitmap for a refiner.  This field is NOT part
+     * of any externally visible trace format — the wire encoding of
+     * lane participation is left to higher layers (the champsim
+     * tracer surfaces it via dynamic FID deltas).  Zero means
+     * "scalar / not derivable for this ISA"; consumers that don't
+     * need it can ignore it.
+     */
+    uint8_t  lane_bytes;
+    /*
      * x86 SIB scale: 1, 2, 4, or 8 when an index register participates;
      * 0 or 1 means "no index scaling" (treat as effective scale 1).
      * Always 1 for non-x86 ISAs.  Plugins that compute an effective
@@ -828,7 +848,7 @@ typedef struct qemu_plugin_operand {
      */
     uint8_t  shift_type;
     uint8_t  shift_amount;
-    uint8_t  _pad[2];
+    uint8_t  _pad[1];
     /* REG name (or MEM base register name); empty string if none */
     char     reg_name[QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ];
     /* MEM index register name; empty string if none or not MEM */

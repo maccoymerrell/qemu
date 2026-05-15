@@ -66,7 +66,21 @@ void slot_lut_build(const ResolvedIds &ids,
             }
         }
     }
-    unsigned slotted_dense_end = 3 + 5 * FID_SLOT_COUNT;
+    /* Lane-mask block (separate stride). */
+    unsigned lane_dense_base = 3 + 5 * FID_SLOT_COUNT;
+    const uint16_t lane_bases[2] = {
+        ids.fid_src_lane_mask_base,
+        ids.fid_dst_lane_mask_base,
+    };
+    for (unsigned k = 0; k < FID_SLOT_COUNT; k++) {
+        for (unsigned f = 0; f < 2; f++) {
+            unsigned fid = lane_bases[f] + k * FID_LANE_BLOCK_STRIDE;
+            if (fid < FID_LUT_SIZE) {
+                (*out)[fid] = (uint16_t)(lane_dense_base + 2 * k + f);
+            }
+        }
+    }
+    unsigned slotted_dense_end = lane_dense_base + 2 * FID_SLOT_COUNT;
     for (unsigned f = ids.fid_insn_bytes_lo; f <= ids.fid_insn_size; f++) {
         if (f < FID_LUT_SIZE) {
             (*out)[f] = (uint16_t)(slotted_dense_end +

@@ -158,9 +158,6 @@ self-describing.  Decode it into a fresh `encoding_maps` table.
                          raise — see Reference §5.2.)
        insn_flag:       CST_INSN_FLAG_BRANCH_COND,
                         CST_INSN_FLAG_HAS_IMM,
-                        CST_INSN_FLAG_ATOMIC,
-                        CST_INSN_FLAG_VEC,
-                        CST_INSN_FLAG_LANE_PARALLEL,
                         CST_INSN_FLAG_HAS_DEP_BLOCK
        dep_block_flag:  CST_DEP_BLOCK_HAS_REG,
                         CST_DEP_BLOCK_HAS_ADDR
@@ -211,8 +208,6 @@ Decode by repeated outer-section unwrapping.
        insn_bytes[insn_size] : raw bytes
        if (flags & ids.insn_flag_has_dep_block):
          decode the optional dependency sub-block per Step 4.5
-       if (flags & ids.insn_flag_vec):
-         decode the optional vector lane sub-block per Step 4.6
 4.5  Dependency sub-block (only present when CST_INSN_FLAG_HAS_DEP_BLOCK):
        dep_block_flags    : u8         ; dep_block_flag bits
        if (dep_block_flags & ids.dep_block_has_reg):
@@ -230,31 +225,6 @@ Decode by repeated outer-section unwrapping.
      address — so the consumer can fire each memop without waiting
      on inputs irrelevant to its address).  See Reference §3 for
      the bit layout inside each mask.
-4.6  Vector lane sub-block (only present when CST_INSN_FLAG_VEC):
-       src_lane_mask[0..n_src-1] : ULEB each   ; bit k set iff lane k
-                                              ; of src_regs[i] is
-                                              ; consumed by this insn
-       dst_lane_mask[0..n_dst-1] : ULEB each   ; bit k set iff lane k
-                                              ; of dst_regs[d] is
-                                              ; produced by this insn
-     Sizes come from the outer template (n_src, n_dst) — no length
-     prefix.  Masks are uint64_t so AVX-512 ZMM at 8-bit lane
-     granularity (64 lanes) fits; common 4/8/16-lane cases stay in
-     one ULEB byte.  CST_INSN_FLAG_LANE_PARALLEL on the same flag
-     byte indicates the masks line up across slots by lane index:
-       - LANE_PARALLEL set:  lane k of each dst depends only on
-                             lane k of its src masks (independent
-                             per-lane chains; consumer can model
-                             lane-grain rename / OoO).
-       - LANE_PARALLEL clear: lanes participate but don't line up
-                             by index (shuffles, broadcasts,
-                             horizontal reductions); consumer must
-                             treat all masked lanes as cross-
-                             coupled.
-     LANE_PARALLEL implies VEC; LANE_PARALLEL with VEC clear is
-     malformed.  Insns with VEC clear carry no lane masks and the
-     consumer treats every lane as participating (scalar / legacy
-     fallback).
 ```
 
 Store every decoded template in `template_by_id` keyed by
@@ -1256,7 +1226,6 @@ template payload:
 |   insn_size       u8                             |
 |   insn_bytes      bytes[insn_size]               |
 |   dep_block               only if HAS_DEP_BLOCK  |
-|   vec_block               only if VEC            |
 +--------------------------------------------------+
 ```
 
@@ -1273,26 +1242,6 @@ dep_block:
     load_addr_dep[l]      ULEB    for l in 0..max_dep_loads-1
     store_addr_dep[s]     ULEB    for s in 0..max_dep_stores-1
 ```
-
-When `flags & CST_INSN_FLAG_VEC`, a per-slot lane-participation
-sub-block follows (after `dep_block` if both are present):
-
-```
-vec_block:
-  src_lane_mask[i]    ULEB    for i in 0..n_src-1
-                              bit k set iff lane k of src_regs[i]
-                              is consumed by this insn
-  dst_lane_mask[d]    ULEB    for d in 0..n_dst-1
-                              bit k set iff lane k of dst_regs[d]
-                              is produced by this insn
-```
-
-`CST_INSN_FLAG_LANE_PARALLEL` (set alongside `VEC` on the same flag
-byte) says the masks line up by lane index: lane k of each dst
-depends only on lane k of its src masks.  When `LANE_PARALLEL` is
-clear, the masks describe which lanes participate but the consumer
-must treat them as cross-coupled within each slot (shuffles,
-broadcasts, horizontal reductions).  `LANE_PARALLEL` implies `VEC`.
 
 Mask array sizes (`n_dst`, `max_dep_loads`, `max_dep_stores`) all
 come from the outer template header — the dep block itself carries

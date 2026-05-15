@@ -93,7 +93,6 @@ void parse_templates_at(Reader &r,
             I.branch_conditional = (flags & ids.insn_flag_branch_cond) != 0;
             I.has_imm            = (flags & ids.insn_flag_has_imm) != 0;
             I.is_atomic          = (flags & ids.insn_flag_atomic) != 0;
-            I.lane_parallel      = (flags & ids.insn_flag_lane_parallel) != 0;
             if (I.has_imm) I.imm = sub.sleb();
             uint8_t insn_size = sub.u8();
             I.raw_bytes.resize(insn_size);
@@ -134,21 +133,6 @@ void parse_templates_at(Reader &r,
                     for (uint32_t s = 0; s < I.max_dep_stores; s++) {
                         I.store_addr_dep_mask[s] = (uint64_t)sub.uleb();
                     }
-                }
-            }
-
-            /* Optional vector lane sub-block (CST_INSN_FLAG_VEC).
-             * One ULEB per src reg then one per dst reg; bit k of
-             * each mask marks lane k as participating. */
-            if (flags & ids.insn_flag_vec) {
-                I.has_vec_lanes = true;
-                I.src_lane_mask.resize(n_src);
-                for (uint8_t s = 0; s < n_src; s++) {
-                    I.src_lane_mask[s] = (uint64_t)sub.uleb();
-                }
-                I.dst_lane_mask.resize(n_dst);
-                for (uint8_t d = 0; d < n_dst; d++) {
-                    I.dst_lane_mask[d] = (uint64_t)sub.uleb();
                 }
             }
 

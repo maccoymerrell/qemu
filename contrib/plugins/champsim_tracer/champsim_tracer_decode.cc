@@ -521,7 +521,7 @@ void decode_detail_to_generic(uint64_t pc,
      * for the shared refiner library.
      */
     if (cls && cls->dep_refine) {
-        cls->dep_refine(out);
+        cls->dep_refine(info, out);
     }
 
     /*

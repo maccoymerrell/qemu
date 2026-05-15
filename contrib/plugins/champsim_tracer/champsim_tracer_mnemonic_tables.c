@@ -71,8 +71,9 @@ static uint64_t all_inputs_mask(const InsnFields *f)
  * everything-touches-everything (CPUID, RDTSC fan-out, arithmetic
  * with implicit-flags writers we don't model yet).
  */
-void dep_all_to_all(InsnFields *f)
+void dep_all_to_all(const struct qemu_plugin_insn_info *info, InsnFields *f)
 {
+    (void)info;
     if (f->n_dst_regs == 0 && f->max_dep_stores == 0) {
         /* No architectural register/memory writes — nothing to
          * express on the wire.  Skip the HAS_REG block; the consumer
@@ -146,8 +147,9 @@ void dep_all_to_all(InsnFields *f)
  * and gp1 retires) rather than pinned alive waiting on a load that
  * never returns.
  */
-void dep_lea(InsnFields *f)
+void dep_lea(const struct qemu_plugin_insn_info *info, InsnFields *f)
 {
+    (void)info;
     /* Reverse the walker's phantom load(s).  We use max_dep_loads
      * as the bound, then zero it so the wire and the bit layout
      * agree on "no load slots." */
@@ -245,11 +247,12 @@ static int find_dst_slot(const InsnFields *f, uint8_t reg_id)
  *
  * If no stack-pointer candidate is found, bail to dep_all_to_all.
  */
-void dep_x86_stack_push(InsnFields *f)
+void dep_x86_stack_push(const struct qemu_plugin_insn_info *info,
+                        InsnFields *f)
 {
     int sp_src = find_stack_ptr_src(f);
     if (sp_src < 0) {
-        dep_all_to_all(f);
+        dep_all_to_all(info, f);
         return;
     }
     const uint64_t sp_bit = (uint64_t)1 << sp_src;
@@ -323,11 +326,12 @@ void dep_x86_stack_push(InsnFields *f)
  * by 1 per iteration.  We compute dst masks AFTER all loads are
  * registered so the imm bit lands in its final position.
  */
-void dep_x86_stack_pop(InsnFields *f)
+void dep_x86_stack_pop(const struct qemu_plugin_insn_info *info,
+                       InsnFields *f)
 {
     int sp_src = find_stack_ptr_src(f);
     if (sp_src < 0) {
-        dep_all_to_all(f);
+        dep_all_to_all(info, f);
         return;
     }
     const uint64_t sp_bit = (uint64_t)1 << sp_src;
@@ -380,8 +384,9 @@ void dep_x86_stack_pop(InsnFields *f)
     f->has_reg_deps = true;
 }
 
-void dep_passthrough(InsnFields *f)
+void dep_passthrough(const struct qemu_plugin_insn_info *info, InsnFields *f)
 {
+    (void)info;
     if (f->n_dst_regs == 1 && f->max_dep_stores == 0) {
         uint64_t m = 0;
         if (f->max_dep_loads > 0) {

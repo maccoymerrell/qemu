@@ -298,7 +298,8 @@ typedef void (*InsnRefineFn)(const struct qemu_plugin_insn_info *info,
  * Runs once at template-construction time (per unique PC), not on the
  * hot path during tracing.
  */
-typedef void (*InsnDepRefineFn)(InsnFields *fields);
+typedef void (*InsnDepRefineFn)(const struct qemu_plugin_insn_info *info,
+                                InsnFields *fields);
 
 /*
  * Shared refiners (defined in champsim_tracer_mnemonic_tables.c).
@@ -312,11 +313,16 @@ typedef void (*InsnDepRefineFn)(InsnFields *fields);
  * script's classifier picks one refiner per Capstone id that
  * correctly handles every variant of that id.
  */
-void dep_all_to_all(InsnFields *fields);
-void dep_passthrough(InsnFields *fields);
-void dep_lea(InsnFields *fields);
-void dep_x86_stack_push(InsnFields *fields);
-void dep_x86_stack_pop(InsnFields *fields);
+void dep_all_to_all(const struct qemu_plugin_insn_info *info,
+                    InsnFields *fields);
+void dep_passthrough(const struct qemu_plugin_insn_info *info,
+                     InsnFields *fields);
+void dep_lea(const struct qemu_plugin_insn_info *info,
+             InsnFields *fields);
+void dep_x86_stack_push(const struct qemu_plugin_insn_info *info,
+                        InsnFields *fields);
+void dep_x86_stack_pop(const struct qemu_plugin_insn_info *info,
+                       InsnFields *fields);
 
 /*
  * Instruction classification entry: maps a Capstone insn_id directly

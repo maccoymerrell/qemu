@@ -807,6 +807,28 @@ typedef struct qemu_plugin_operand {
     uint8_t  access;   /* bitmask of QEMU_PLUGIN_OP_ACC_*, 0 if unknown */
     uint8_t  size;     /* operand size in bytes */
     /*
+     * Vector lane width in bytes.  Non-zero only when this operand is
+     * a vector register or vector-memory operand whose semantics
+     * partition into equal-width elements.  Encodes Capstone's
+     * arrangement / element-size info that the per-ISA marshalling
+     * layer in disas/capstone.c surfaces uniformly:
+     *
+     *   AArch64: derived from the operand's vector-arrangement
+     *            specifier (vas) — e.g. .4S → 4, .2D → 8, .8H → 2.
+     *   x86    : derived from the canonical insn_id (lane width is
+     *            implicit in the opcode — PS=4, PD=8, B=1, W=2, D=4,
+     *            Q=8) combined with @size to determine lane *count*.
+     *   RISC-V : derived from the active vtype.SEW where applicable
+     *            (currently unset; placeholder for vector extension).
+     *
+     * Zero means "not a vector operand", "lane width not derivable
+     * for this ISA/insn yet", or "operand carries a scalar value".
+     * Plugins computing lane participation should treat 0 as
+     * "every lane participates / unknown".  Lane *count* is
+     * @size / @lane_bytes when both are non-zero.
+     */
+    uint8_t  lane_bytes;
+    /*
      * x86 SIB scale: 1, 2, 4, or 8 when an index register participates;
      * 0 or 1 means "no index scaling" (treat as effective scale 1).
      * Always 1 for non-x86 ISAs.  Plugins that compute an effective
@@ -828,7 +850,7 @@ typedef struct qemu_plugin_operand {
      */
     uint8_t  shift_type;
     uint8_t  shift_amount;
-    uint8_t  _pad[2];
+    uint8_t  _pad[1];
     /* REG name (or MEM base register name); empty string if none */
     char     reg_name[QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ];
     /* MEM index register name; empty string if none or not MEM */

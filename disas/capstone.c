@@ -425,6 +425,7 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
 
         op->access = cop->access;
         op->size = cop->size;
+        op->lane_bytes = 0; /* Filled per insn_id below */
         op->scale = 1;
         op->shift_type = 0;
         op->shift_amount = 0;
@@ -479,6 +480,48 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
 }
 
 /*
+ * Decode Capstone's AArch64 Vector Arrangement Specifier into the
+ * (lane_bytes, total_bytes) pair we surface via qemu_plugin_operand.
+ *
+ * The vas enum encodes lane width in the low byte (B/H/S/D/Q = 1/2/
+ * 4/8/16 bytes) and lane count in bits 8..15 (e.g. 4S = 4 × .S
+ * lanes).  AARCH64LAYOUT_VL_<W> with no count is the bare scalar
+ * arrangement (one lane of that width).
+ *
+ * Returns true and fills *lane_bytes / *total_bytes when @vas
+ * is a recognised vector layout; returns false and leaves outputs
+ * unchanged otherwise (Capstone marks non-vector operands with
+ * AARCH64LAYOUT_INVALID).
+ */
+static bool cap_decode_aarch64_vas(unsigned vas,
+                                   uint8_t *lane_bytes,
+                                   uint8_t *total_bytes)
+{
+    if (vas == AARCH64LAYOUT_INVALID) {
+        return false;
+    }
+    /* Low byte holds the lane element width (in BITS in Capstone's
+     * encoding — B=8, H=16, S=32, D=64, Q=128). */
+    unsigned lane_bits = vas & 0xff;
+    if (lane_bits != 8 && lane_bits != 16 &&
+        lane_bits != 32 && lane_bits != 64 && lane_bits != 128) {
+        return false;
+    }
+    unsigned count = (vas >> 8) & 0xff;
+    if (count == 0) {
+        count = 1; /* Bare-layout: one lane of the given width. */
+    }
+    unsigned lb = lane_bits / 8;
+    unsigned tb = lb * count;
+    if (tb > 255) {
+        return false; /* AARCH64LAYOUT_VL_COMPLETE — SVE matrix tile. */
+    }
+    *lane_bytes  = (uint8_t)lb;
+    *total_bytes = (uint8_t)tb;
+    return true;
+}
+
+/*
  * Extract per-operand detail for AArch64 into the plugin operand struct.
  */
 static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
@@ -493,7 +536,19 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
         qemu_plugin_operand *op = &out->operands[i];
 
         op->access = cop->access;
-        op->size = 0; /* AArch64 Capstone doesn't provide per-op size */
+        op->size = 0;
+        op->lane_bytes = 0;
+        /* Capstone's AArch64 detail surfaces vector arrangement
+         * (vas) per operand — decode it into our uniform
+         * (size, lane_bytes) pair when present.  Non-vector
+         * operands stay at zero. */
+        {
+            uint8_t lb = 0, tb = 0;
+            if (cap_decode_aarch64_vas(cop->vas, &lb, &tb)) {
+                op->size       = tb;
+                op->lane_bytes = lb;
+            }
+        }
         op->scale = 1;
         op->shift_type = (uint8_t)cop->shift.type;
         op->shift_amount = (uint8_t)cop->shift.value;
@@ -559,6 +614,7 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             qemu_plugin_operand *op = &out->operands[i];
             op->access = 0; /* RISC-V Capstone lacks access info */
             op->size = 0;
+            op->lane_bytes = 0;
             op->scale = 1;
             op->shift_type = 0;
             op->shift_amount = 0;
@@ -609,6 +665,7 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             qemu_plugin_operand *op = &out->operands[i];
             op->access = 0; /* MIPS Capstone lacks access info */
             op->size = 0;
+            op->lane_bytes = 0;
             op->scale = 1;
             op->shift_type = 0;
             op->shift_amount = 0;

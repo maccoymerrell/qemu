@@ -595,7 +595,7 @@ static void write_bin_templates(BitWriter *bw)
             if (fld->has_immediate) {
                 flags |= CST_INSN_FLAG_HAS_IMM;
             }
-            flags |= (uint8_t)((fld->sync_hint & 0x0F)
+            flags |= (uint8_t)((fld->sync_hint & 0x3)
                                << CST_INSN_FLAG_SYNC_SHIFT);
             if (fld->has_reg_deps || fld->has_addr_deps) {
                 flags |= CST_INSN_FLAG_HAS_DEP_BLOCK;
@@ -1367,7 +1367,7 @@ static U512 deflt_insn_flags(const BBTemplate *t, uint32_t i, uint8_t slot)
     uint8_t flags = 0;
     if (f->branch_conditional) flags |= CST_INSN_FLAG_BRANCH_COND;
     if (f->has_immediate)      flags |= CST_INSN_FLAG_HAS_IMM;
-    flags |= (uint8_t)((f->sync_hint & 0x0F) << CST_INSN_FLAG_SYNC_SHIFT);
+    flags |= (uint8_t)((f->sync_hint & 0x3) << CST_INSN_FLAG_SYNC_SHIFT);
     return cst_wide_from_u64(flags);
 }
 static bool extr_insn_flags(const EntryView *ev, uint32_t i, uint8_t slot,
@@ -1507,7 +1507,7 @@ static uint64_t deflt_u64_insn_flags(const BBTemplate *t, uint32_t i,
     uint8_t flags = 0;
     if (f->branch_conditional) flags |= CST_INSN_FLAG_BRANCH_COND;
     if (f->has_immediate)      flags |= CST_INSN_FLAG_HAS_IMM;
-    flags |= (uint8_t)((f->sync_hint & 0x0F) << CST_INSN_FLAG_SYNC_SHIFT);
+    flags |= (uint8_t)((f->sync_hint & 0x3) << CST_INSN_FLAG_SYNC_SHIFT);
     return flags;
 }
 static bool extr_u64_insn_flags(const EntryView *ev, uint32_t i, uint8_t slot,

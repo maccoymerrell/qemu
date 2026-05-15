@@ -127,11 +127,26 @@ extern "C" {
  */
 #define BODY_TAG_REGFILE         4
 
-/* Per-insn template flags byte */
+/*
+ * Per-insn template flags byte
+ *
+ *   bit 0    BRANCH_COND
+ *   bit 1    HAS_IMM
+ *   bits 2-3 SYNC (2-bit dense encoding of SyncEventType)
+ *   bit 4    (reserved — was sync bit 2, freed when sync was densified)
+ *   bit 5    (reserved — was sync bit 3, freed when sync was densified)
+ *   bit 6    HAS_DEP_BLOCK
+ *   bit 7    (reserved)
+ *
+ * Sync was previously a 4-bit field (bits 2-5).  SyncEventType only
+ * defines 3 values (NONE/THREAD_SWITCH/ATOMIC) and the wire encoding
+ * map is self-describing, so it was re-encoded densely into 2 bits
+ * to free up bits 4-5 for future per-insn metadata.
+ */
 #define CST_INSN_FLAG_BRANCH_COND   (1u << 0)
 #define CST_INSN_FLAG_HAS_IMM       (1u << 1)
 #define CST_INSN_FLAG_SYNC_SHIFT    2
-#define CST_INSN_FLAG_SYNC_MASK     0x3Cu
+#define CST_INSN_FLAG_SYNC_MASK     0x0Cu
 /*
  * Intra-instruction dataflow sub-block.  When set, an
  * extensible dependency block follows insn_bytes:

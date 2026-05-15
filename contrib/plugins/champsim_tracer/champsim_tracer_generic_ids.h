@@ -176,15 +176,21 @@ enum BranchType {
 
 /*
  * Sync event types.  See mnemonics.h for full commentary on use.
+ *
+ * Dense-encoded so the per-insn flag byte can carry the value in
+ * just 2 bits (CST_INSN_FLAG_SYNC_MASK), freeing the previously
+ * SYNC-reserved bits for other per-insn flags.  Wire-format
+ * encoding map is self-describing — consumers read the
+ * name→value mapping from the trace header, so re-encoding here
+ * propagates automatically without a separate version bump.
  */
 typedef enum {
     SYNC_NONE            = 0,
-    SYNC_THREAD_SWITCH   = 4,
-    SYNC_ATOMIC          = 5,
-    /* Sentinel: one past the highest defined sync event ID.  Sized so
-     * a dense-domain iteration over the sync-hint enum covers every
-     * defined value (with sync_event_name() returning NULL for the
-     * holes 1..3 between SYNC_NONE and SYNC_THREAD_SWITCH). */
+    SYNC_THREAD_SWITCH   = 1,
+    SYNC_ATOMIC          = 2,
+    /* Sentinel: one past the highest defined sync event ID.  When
+     * more sync types are needed, either add a 4th codepoint here
+     * (still fits in 2 bits) or widen CST_INSN_FLAG_SYNC_MASK back. */
     SYNC_EVENT_COUNT,
 } SyncEventType;
 

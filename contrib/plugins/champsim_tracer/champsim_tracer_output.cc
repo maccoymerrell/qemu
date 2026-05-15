@@ -1568,6 +1568,74 @@ static bool extr_u64_insn_size(const EntryView *ev, uint32_t i, uint8_t slot,
                                uint64_t *out)
 { *out = deflt_u64_insn_size(ev->tmpl, i, slot); return true; }
 
+/* ---------- Lane-mask families ---------- */
+
+/* Lane-mask slot caps.  Returns 0 when the insn has no lane info
+ * (most non-vec insns), suppressing emission entirely.  When the
+ * refiner has set has_vec_lanes, only the actual reg slots get
+ * walked. */
+static uint8_t cap_src_lane_masks(const EntryView *ev, uint32_t i)
+{
+    if (!ev->tmpl || i >= ev->tmpl->n_insns) return 0;
+    const InsnFields *f = &ev->tmpl->insn_fields[i];
+    if (!f->has_vec_lanes) return 0;
+    return f->n_src_regs;
+}
+static uint8_t cap_dst_lane_masks(const EntryView *ev, uint32_t i)
+{
+    if (!ev->tmpl || i >= ev->tmpl->n_insns) return 0;
+    const InsnFields *f = &ev->tmpl->insn_fields[i];
+    if (!f->has_vec_lanes) return 0;
+    return f->n_dst_regs;
+}
+
+/* Extractors return the refiner-set baseline today.  When the runtime
+ * mask-register read lands (future commit), unmasked ops still return
+ * the baseline (no emit); masked variants return the read-back live
+ * mask, producing a delta record. */
+static bool extr_u64_src_lane_mask(const EntryView *ev, uint32_t i,
+                                   uint8_t slot, uint64_t *out)
+{
+    if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
+    const InsnFields *f = &ev->tmpl->insn_fields[i];
+    if (!f->has_vec_lanes || slot >= f->n_src_regs) return false;
+    *out = f->src_lane_mask[slot];
+    return true;
+}
+static bool extr_u64_dst_lane_mask(const EntryView *ev, uint32_t i,
+                                   uint8_t slot, uint64_t *out)
+{
+    if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
+    const InsnFields *f = &ev->tmpl->insn_fields[i];
+    if (!f->has_vec_lanes || slot >= f->n_dst_regs) return false;
+    *out = f->dst_lane_mask[slot];
+    return true;
+}
+
+/* template_default = 0 — the consumer's initial baseline.  Refiner-set
+ * baselines flow on the wire as the first observation's delta-from-zero;
+ * subsequent observations with the same value cost zero bytes. */
+static U512 deflt_lane_mask_zero(const BBTemplate *t, uint32_t i,
+                                 uint8_t slot)
+{ (void)t; (void)i; (void)slot; return cst_wide_from_u64(0); }
+
+static bool extr_src_lane_mask(const EntryView *ev, uint32_t i, uint8_t slot,
+                               U512 *out)
+{
+    uint64_t v;
+    if (!extr_u64_src_lane_mask(ev, i, slot, &v)) return false;
+    *out = cst_wide_from_u64(v);
+    return true;
+}
+static bool extr_dst_lane_mask(const EntryView *ev, uint32_t i, uint8_t slot,
+                               U512 *out)
+{
+    uint64_t v;
+    if (!extr_u64_dst_lane_mask(ev, i, slot, &v)) return false;
+    *out = cst_wide_from_u64(v);
+    return true;
+}
+
 /* Field family registry.
  *
  * Order matters for two reasons:
@@ -1639,6 +1707,23 @@ static const FieldDescriptor field_descriptors[] = {
             nullptr,             nullptr,
             false /* dynamic: post-exec reg value */,
             "DST_REG" },
+        /* Lane-mask block.  cap_*_lane_masks gates per-insn so non-vec
+         * insns iterate zero slots.  template_default = 0; refiner's
+         * baseline rides the wire as the first emission's delta. */
+        { CST_FID_SRC_LANE_MASK_BASE, CST_FID_LANE_BLOCK_STRIDE,
+            CST_FID_SLOT_COUNT,
+            false, false,
+            extr_src_lane_mask,  deflt_lane_mask_zero,  cap_src_lane_masks,
+            extr_u64_src_lane_mask, deflt_u64_zero,
+            false /* dynamic: runtime mask register read (future) */,
+            "SRC_LANE_MASK" },
+        { CST_FID_DST_LANE_MASK_BASE, CST_FID_LANE_BLOCK_STRIDE,
+            CST_FID_SLOT_COUNT,
+            false, false,
+            extr_dst_lane_mask,  deflt_lane_mask_zero,  cap_dst_lane_masks,
+            extr_u64_dst_lane_mask, deflt_u64_zero,
+            false /* dynamic: runtime mask register read (future) */,
+            "DST_LANE_MASK" },
         { CST_FID_INSN_BYTES_LO,    1, 1,  false, false,
             extr_insn_bytes_lo,  deflt_insn_bytes_lo,   nullptr,
             extr_u64_insn_bytes_lo, deflt_u64_insn_bytes_lo,

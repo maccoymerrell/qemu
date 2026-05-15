@@ -323,6 +323,8 @@ Wide insn_field_default(const InsnTemplate &I, uint8_t fid,
         if (I.branch_conditional) f |= ids.insn_flag_branch_cond;
         if (I.has_imm)            f |= ids.insn_flag_has_imm;
         if (I.is_atomic)          f |= ids.insn_flag_atomic;
+        if (I.has_vec_lanes)      f |= ids.insn_flag_vec;
+        if (I.lane_parallel)      f |= ids.insn_flag_lane_parallel;
         w.limb[0] = f & 0xFF;
     }
     else if (fid == ids.fid_insn_immediate) { w.limb[0] = (uint64_t)I.imm; }
@@ -941,6 +943,7 @@ Instruction build_one(const Template &tmpl, uint32_t insn_idx,
     insn.store_data_dep_mask = I.store_data_dep_mask;
     insn.load_addr_dep_mask  = I.load_addr_dep_mask;
     insn.store_addr_dep_mask = I.store_addr_dep_mask;
+    insn.has_vec_lanes       = I.has_vec_lanes;
     insn.lane_parallel       = I.lane_parallel;
     insn.src_lane_mask       = I.src_lane_mask;
     insn.dst_lane_mask       = I.dst_lane_mask;

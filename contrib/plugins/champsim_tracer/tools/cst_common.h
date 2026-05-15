@@ -322,6 +322,7 @@ struct Instruction {
 
     /* Per-slot lane participation (CST_INSN_FLAG_VEC sub-block).
      * Empty on scalar / non-vec insns or on traces predating VEC. */
+    bool                  has_vec_lanes       = false;
     bool                  lane_parallel       = false;
     std::vector<uint64_t> src_lane_mask;
     std::vector<uint64_t> dst_lane_mask;
@@ -417,14 +418,16 @@ struct InsnTemplate {
      * Intra-register lane participation (CST_INSN_FLAG_VEC sub-block).
      * Bit k of src_lane_mask[i] / dst_lane_mask[d] is set iff lane k
      * of the corresponding reg participates in this insn.  When VEC
-     * is clear on the wire these vectors stay empty and the consumer
-     * treats every lane as participating (legacy / scalar fallback).
+     * is clear on the wire has_vec_lanes is false and the mask vectors
+     * stay empty; consumers treat every lane as participating in that
+     * case (scalar / legacy fallback).
      *
      * lane_parallel mirrors CST_INSN_FLAG_LANE_PARALLEL: when set,
      * lane k of each dst depends only on lane k of its src masks; when
      * clear, the lanes participate but don't line up by index
      * (shuffles / broadcasts / horizontal reductions).
      */
+    bool                  has_vec_lanes = false;
     bool                  lane_parallel = false;
     std::vector<uint64_t> src_lane_mask;
     std::vector<uint64_t> dst_lane_mask;

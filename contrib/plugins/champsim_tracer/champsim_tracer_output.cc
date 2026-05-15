@@ -548,6 +548,12 @@ struct BodyStreamState {
  *   [imm]       : SLEB128  (iff has_immediate)
  *   insn_size   : u8
  *   insn_bytes[insn_size]
+ *   [dep_block] : optional   (iff CST_INSN_FLAG_HAS_DEP_BLOCK)
+ *   [vec_block] : optional   (iff CST_INSN_FLAG_VEC) —
+ *                            n_src ULEB src_lane_masks then n_dst
+ *                            ULEB dst_lane_masks; bit k of each
+ *                            mask says lane k of the corresponding
+ *                            reg participates.
  */
 static void write_bin_templates(BitWriter *bw)
 {
@@ -589,6 +595,12 @@ static void write_bin_templates(BitWriter *bw)
             }
             if (fld->is_atomic) {
                 flags |= CST_INSN_FLAG_ATOMIC;
+            }
+            if (fld->has_vec_lanes) {
+                flags |= CST_INSN_FLAG_VEC;
+            }
+            if (fld->lane_parallel) {
+                flags |= CST_INSN_FLAG_LANE_PARALLEL;
             }
             if (fld->has_reg_deps || fld->has_addr_deps) {
                 flags |= CST_INSN_FLAG_HAS_DEP_BLOCK;
@@ -651,6 +663,30 @@ static void write_bin_templates(BitWriter *bw)
                     for (uint8_t s = 0; s < fld->max_dep_stores; s++) {
                         bw_write_uleb128(&sub, fld->store_addr_dep_mask[s]);
                     }
+                }
+            }
+            /*
+             * Optional vector lane sub-block (CST_INSN_FLAG_VEC).
+             * Per-slot lane bitmaps describing which lanes of each
+             * reg participate in the insn.  Independent of the dep
+             * sub-block; consumers seeing only VEC (no DEP_BLOCK)
+             * still get lane info, and consumers seeing only the
+             * dep block fall back to "all lanes participate".
+             *
+             *   src_lane_mask[s] : ULEB  bit k set iff lane k of
+             *                            src_regs[s] is consumed
+             *   dst_lane_mask[d] : ULEB  bit k set iff lane k of
+             *                            dst_regs[d] is produced
+             *
+             * Array sizes come from the outer template header
+             * (n_src_regs, n_dst_regs) — no length prefix needed.
+             */
+            if (fld->has_vec_lanes) {
+                for (uint8_t s = 0; s < fld->n_src_regs; s++) {
+                    bw_write_uleb128(&sub, fld->src_lane_mask[s]);
+                }
+                for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
+                    bw_write_uleb128(&sub, fld->dst_lane_mask[d]);
                 }
             }
         }
@@ -1361,6 +1397,8 @@ static U512 deflt_insn_flags(const BBTemplate *t, uint32_t i, uint8_t slot)
     if (f->branch_conditional) flags |= CST_INSN_FLAG_BRANCH_COND;
     if (f->has_immediate)      flags |= CST_INSN_FLAG_HAS_IMM;
     if (f->is_atomic)          flags |= CST_INSN_FLAG_ATOMIC;
+    if (f->has_vec_lanes)      flags |= CST_INSN_FLAG_VEC;
+    if (f->lane_parallel)      flags |= CST_INSN_FLAG_LANE_PARALLEL;
     return cst_wide_from_u64(flags);
 }
 static bool extr_insn_flags(const EntryView *ev, uint32_t i, uint8_t slot,
@@ -1501,6 +1539,8 @@ static uint64_t deflt_u64_insn_flags(const BBTemplate *t, uint32_t i,
     if (f->branch_conditional) flags |= CST_INSN_FLAG_BRANCH_COND;
     if (f->has_immediate)      flags |= CST_INSN_FLAG_HAS_IMM;
     if (f->is_atomic)          flags |= CST_INSN_FLAG_ATOMIC;
+    if (f->has_vec_lanes)      flags |= CST_INSN_FLAG_VEC;
+    if (f->lane_parallel)      flags |= CST_INSN_FLAG_LANE_PARALLEL;
     return flags;
 }
 static bool extr_u64_insn_flags(const EntryView *ev, uint32_t i, uint8_t slot,

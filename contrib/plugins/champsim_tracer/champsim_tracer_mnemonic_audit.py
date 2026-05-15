@@ -38,6 +38,12 @@ class Entry:
                                      # consumer falls back to implicit
                                      # all-to-all; the audit reports
                                      # these as unclassified).
+    # Vector lane info.  Orthogonal to .dep_refine — these classify
+    # whether the insn produces lane-mask FID records and whether the
+    # lanes line up by index.  See InsnClassification in
+    # champsim_tracer_mnemonics.h.
+    lane_mask_kind: str = "LANE_MASK_KIND_NONE"
+    lane_parallel: bool = False
 
     def without_refine(self) -> "Entry":
         """Strip preserved-across-runs annotations (.refine and
@@ -153,6 +159,10 @@ ENTRY_RE = re.compile(
     r"(?:,\s*\.refine\s*=\s*(?P<refine>[A-Za-z_][A-Za-z0-9_]*))"
     r"|"
     r"(?:,\s*\.dep_refine\s*=\s*(?P<dep_refine>[A-Za-z_][A-Za-z0-9_]*))"
+    r"|"
+    r"(?:,\s*\.lane_mask_kind\s*=\s*(?P<lane_mask_kind>LANE_MASK_KIND_[A-Z_]+))"
+    r"|"
+    r"(?:,\s*\.lane_parallel\s*=\s*(?P<lane_parallel>true|false))"
     r")*"
     r"\s*\}",
     re.DOTALL,
@@ -995,6 +1005,241 @@ def classify_dep_refine(info: IsaInfo, const_name: str,
     discarding the affirmative-vs-fallback flag.  generated_body uses
     this; audit_one calls the explicit variant for accounting."""
     return classify_dep_refine_explicit(info, const_name, entry)[0]
+
+
+# ----- Per-ISA lane classification --------------------------------
+#
+# Lane info is per-Capstone-insn-id (not per-GenericOpcode) so we can
+# distinguish element-wise VADDPS from horizontal VHADDPS — the
+# generic category lumps both as VEC_*.  The classifier combines two
+# signals:
+#
+#   (a) Capstone-derived "is this a vec op at all?": variant.internal
+#       names carry reg-width markers (Y for YMM, Z for ZMM on x86,
+#       arrangement specifiers on aarch64, V-reg references on
+#       RISC-V V, .b/.h/.w/.d suffixes on MIPS MSA).  If no variant
+#       uses a vector reg, the canonical isn't a vec op.
+#
+#   (b) Name-pattern match for the parallel-vs-cross axis: Capstone
+#       doesn't structurally distinguish element-wise arith from
+#       shuffles / broadcasts / horizontal reductions, so we match
+#       canonical-name prefixes against curated cross-lane sets.
+#       Anything not in the cross set defaults to parallel.
+
+# X86 Capstone variant tokens that signal a vector-context insn.
+# Multiple sources:
+#   - AVX widths embedded in variant.internal:  YMM/ZMM/Z128/Z256
+#     (legacy VEX YMM forms also appear as bare "Y<suffix>")
+#   - MMX prefix on the variant.internal:        "MMX_"
+#   - SSE legacy forms have no width marker in the variant name
+#     (XMM is implied), so we also accept variants whose canonical
+#     mnemonic starts with one of the SSE/SSE2/SSE3/SSSE3/SSE4 vec
+#     opcode prefixes.  Each prefix below uniquely names a vector
+#     family — none of them shadow a scalar-int insn.
+X86_VARIANT_VEC_MARKERS: tuple[str, ...] = (
+    "YMM", "ZMM", "Z128", "Z256",
+    "MMX_",
+)
+X86_SSE_LEGACY_MNEM_PREFIXES: tuple[str, ...] = (
+    # Legacy SSE/SSE2 packed FP/int — operand class is XMM by definition.
+    "ADDPS", "ADDPD", "ADDSS", "ADDSD",
+    "SUBPS", "SUBPD", "SUBSS", "SUBSD",
+    "MULPS", "MULPD", "MULSS", "MULSD",
+    "DIVPS", "DIVPD", "DIVSS", "DIVSD",
+    "SQRTPS", "SQRTPD", "SQRTSS", "SQRTSD",
+    "RSQRTPS", "RSQRTSS", "RCPPS", "RCPSS",
+    "MAXPS", "MAXPD", "MINPS", "MINPD",
+    "MAXSS", "MAXSD", "MINSS", "MINSD",
+    "ANDPS", "ANDPD", "ANDNPS", "ANDNPD",
+    "ORPS",  "ORPD",  "XORPS", "XORPD",
+    "MOVAPS", "MOVAPD", "MOVUPS", "MOVUPD",
+    "MOVSS",  "MOVSD",
+    "MOVLPS", "MOVLPD", "MOVHPS", "MOVHPD",
+    "MOVLHPS", "MOVHLPS",
+    "MOVDQA", "MOVDQU",
+    "MOVNTPS", "MOVNTPD", "MOVNTDQ",
+    "CMPPS", "CMPPD", "CMPSS", "CMPSD",
+    "SHUFPS", "SHUFPD",
+    "UNPCKLPS", "UNPCKLPD", "UNPCKHPS", "UNPCKHPD",
+    "CVT",            # CVTPS2PD, CVTPD2DQ, etc. — many subforms
+    "BLENDPS", "BLENDPD", "BLENDVPS", "BLENDVPD",
+    "DPPS", "DPPD",
+    "INSERTPS", "EXTRACTPS",
+    "HADDPS", "HADDPD", "HSUBPS", "HSUBPD",
+    "ROUNDPS", "ROUNDPD", "ROUNDSS", "ROUNDSD",
+    # SSE/SSE2 packed integer — the "P*" family.  These ALL operate
+    # on XMM (or MMX); none of them shadow GPR ops.
+    "PADD", "PSUB", "PMUL", "PCMPEQ", "PCMPGT", "PCMPESTR", "PCMPISTR",
+    "PMIN", "PMAX", "PABS", "PSIGN", "PAVG", "PSAD",
+    "PAND", "POR", "PXOR", "PANDN",
+    "PSLL", "PSRL", "PSRA",
+    "PSHUF", "PSHUFB", "PSHUFLW", "PSHUFHW", "PSHUFD",
+    "PALIGNR", "PSLLDQ", "PSRLDQ",
+    "PBLEND", "PINSR", "PEXTR", "PMOV",
+    "PUNPCK", "PACKS", "PACKU",
+    "PMADDWD", "PMADDUBSW",
+    "PCLMUL",
+    "AES",
+)
+
+X86_CROSS_LANE_PREFIXES: tuple[str, ...] = (
+    "VPSHUF", "PSHUF",
+    "VBROADCAST", "VPBROADCAST",
+    "VPERM", "VPERMI2", "VPERMT2",
+    "VHADD", "VHSUB", "HADD", "HSUB",
+    "VPHADD", "VPHSUB", "PHADD", "PHSUB",
+    "VEXTRACT", "VINSERT",
+    "VPEXTR", "VPINSR", "PEXTR", "PINSR",
+    "VPMOVSX", "VPMOVZX", "PMOVSX", "PMOVZX",
+    "VPACKS", "VPACKU", "PACKS", "PACKU",
+    "VUNPCK", "PUNPCK", "VPUNPCK",
+    "VPSADBW", "PSADBW",
+    "VDPPS", "VDPPD", "DPPS", "DPPD",
+    "VPMADDWD", "PMADDWD",
+    "VPMADDUBSW", "PMADDUBSW",
+)
+
+
+def classify_x86_lane(const_name: str,
+                      variants: tuple) -> tuple[str, bool] | None:
+    name = const_name.removeprefix("X86_INS_")
+    # (a) Capstone variant gate: AVX/EVEX width markers,
+    #     MMX_ prefix, or AVX V<mnemonic>...  (canonical names
+    #     starting with "V" cover the entire AVX/EVEX family).
+    has_variant_vec_marker = any(
+        any(m in v.internal for m in X86_VARIANT_VEC_MARKERS) or
+        v.internal.startswith("X86_V")
+        for v in variants
+    )
+    # (b) Legacy SSE/MMX fallback: variants carry no width marker
+    #     (XMM is implied) but the canonical mnemonic itself
+    #     uniquely names a vector family.
+    has_legacy_sse_mnem = any(
+        name.startswith(p) for p in X86_SSE_LEGACY_MNEM_PREFIXES
+    )
+    if not (has_variant_vec_marker or has_legacy_sse_mnem):
+        return None
+    # (c) parallel-vs-cross axis from canonical-name prefixes.
+    for p in X86_CROSS_LANE_PREFIXES:
+        if name.startswith(p):
+            return ("LANE_MASK_KIND_STATIC", False)
+    return ("LANE_MASK_KIND_STATIC", True)
+
+
+# aarch64: NEON canonicals carry no obvious width marker in the
+# variant.internal name (Capstone names follow the encoding spec —
+# ADDv8i8 / ADDv4i16 / ADDv16i8 / etc.).  The marker pattern is
+# "v<count>i<bits>" or trailing arrangement letters.
+AARCH64_VEC_VARIANT_RE = re.compile(r"v\d+[ifu]\d+|v\d+[BHSD]|[BHSD]\d+")
+
+AARCH64_CROSS_LANE_PREFIXES: tuple[str, ...] = (
+    "TBL", "TBX",
+    "DUP", "EXT", "INS",
+    "UMOV", "SMOV",
+    "XTN", "ZIP", "UZP", "TRN", "REV",
+    "ADDP", "FADDP", "SMAXP", "UMAXP", "SMINP", "UMINP",
+    "FMAXP", "FMINP",
+    "SADDLP", "UADDLP", "SADALP", "UADALP",
+    "ADDV", "SMAXV", "UMAXV", "SMINV", "UMINV",
+    "FMAXV", "FMINV",
+    "SQXTN", "UQXTN",
+)
+
+
+def classify_aarch64_lane(const_name: str,
+                          variants: tuple) -> tuple[str, bool] | None:
+    name = const_name.removeprefix("AARCH64_INS_")
+    if not any(AARCH64_VEC_VARIANT_RE.search(v.internal) for v in variants):
+        return None
+    for p in AARCH64_CROSS_LANE_PREFIXES:
+        if name.startswith(p):
+            return ("LANE_MASK_KIND_STATIC", False)
+    return ("LANE_MASK_KIND_STATIC", True)
+
+
+# RISC-V V — variants for V-extension insns reference V-reg
+# operands (V0..V31).  Capstone's variant.internal carries the
+# V<n> tokens in the name.
+RISCV_V_VARIANT_RE = re.compile(r"\bV\d+\b|V_VV|V_VX|V_VI|V_VS")
+
+RISCV_V_CROSS_LANE_PREFIXES: tuple[str, ...] = (
+    "VRGATHER", "VSLIDE",
+    "VCOMPRESS",
+    "VREDSUM", "VREDMAXU", "VREDMAX", "VREDMINU", "VREDMIN",
+    "VREDAND", "VREDOR", "VREDXOR",
+    "VFREDOSUM", "VFREDUSUM", "VFREDMAX", "VFREDMIN",
+    "VMV_X", "VMV_S", "VFMV",
+)
+
+
+def classify_riscv_lane(const_name: str,
+                        variants: tuple) -> tuple[str, bool] | None:
+    name = const_name.removeprefix("RISCV_INS_")
+    # vset* are config insns, not vec data ops.
+    if name.startswith("VSET"):
+        return None
+    if not name.startswith("V"):
+        return None
+    if variants and not any(RISCV_V_VARIANT_RE.search(v.internal)
+                            for v in variants):
+        return None
+    for p in RISCV_V_CROSS_LANE_PREFIXES:
+        if name.startswith(p):
+            return ("LANE_MASK_KIND_RISCV_VTYPE", False)
+    return ("LANE_MASK_KIND_RISCV_VTYPE", True)
+
+
+# MIPS MSA — canonical insn names end in _B / _H / _W / _D for the
+# lane width.  Variants of MSA insns reference W<n> regs.
+MIPS_MSA_VARIANT_RE = re.compile(r"\bW\d+\b|MSA")
+MSA_LANE_SUFFIXES = ("_B", "_H", "_W", "_D")
+
+MIPS_MSA_CROSS_LANE_PREFIXES: tuple[str, ...] = (
+    "SHF_", "PCKEV_", "PCKOD_", "ILVL_", "ILVR_", "ILVEV_", "ILVOD_",
+    "VSHF_", "SPLATI_", "INSERT_", "INSVE_",
+    "FEXDO_", "FEXUPL_", "FEXUPR_",
+    "HADD_", "HSUB_",
+)
+
+
+def classify_mips_lane(const_name: str,
+                       variants: tuple) -> tuple[str, bool] | None:
+    name = const_name.removeprefix("MIPS_INS_")
+    if not any(name.endswith(s) for s in MSA_LANE_SUFFIXES):
+        return None
+    # Confirm with Capstone variant info — MSA insns reference
+    # W<n> registers in their internal name.
+    if variants and not any(MIPS_MSA_VARIANT_RE.search(v.internal)
+                            for v in variants):
+        return None
+    for p in MIPS_MSA_CROSS_LANE_PREFIXES:
+        if name.startswith(p):
+            return ("LANE_MASK_KIND_STATIC", False)
+    return ("LANE_MASK_KIND_STATIC", True)
+
+
+_LANE_CLASSIFIERS = {
+    "x86":     classify_x86_lane,
+    "aarch64": classify_aarch64_lane,
+    "riscv":   classify_riscv_lane,
+    "mips":    classify_mips_lane,
+}
+
+
+def classify_lane_info(info: IsaInfo,
+                       const_name: str) -> tuple[str, bool]:
+    """Decide whether @const_name is a vector op (per Capstone
+    variant detail) and which lane-mask kind + lane_parallel value
+    to assign.  Returns (lane_mask_kind, lane_parallel).
+    """
+    fn = _LANE_CLASSIFIERS.get(info.key)
+    if fn is None:
+        return ("LANE_MASK_KIND_NONE", False)
+    variants = _variants_by_canonical(info.key).get(const_name, ())
+    result = fn(const_name, variants)
+    if result is None:
+        return ("LANE_MASK_KIND_NONE", False)
+    return result
 
 
 def norm_flags(flags: str) -> str:
@@ -2410,6 +2655,13 @@ def format_entry(const_name: str, entry: Entry) -> str:
         extras.append(f".refine = {entry.refine}")
     if entry.dep_refine:
         extras.append(f".dep_refine = {entry.dep_refine}")
+    if entry.lane_mask_kind != "LANE_MASK_KIND_NONE":
+        extras.append(f".lane_mask_kind = {entry.lane_mask_kind}")
+        # Emit lane_parallel explicitly (true or false) on vec rows so
+        # the cross-lane classification is greppable / scannable.
+        # The struct default is false, but readers shouldn't have to
+        # infer cross-lane from absence.
+        extras.append(f".lane_parallel = {'true' if entry.lane_parallel else 'false'}")
     if not extras:
         return head + " },"
     indent = " " * 40
@@ -2719,7 +2971,9 @@ def generated_body(info: IsaInfo, constants: list[str], existing: dict[str, Entr
             new = old.without_refine()
         refine = old.refine if old and old.refine else None
         dep_refine = classify_dep_refine(info, const_name, new)
-        new = Entry(new.op, new.branch, new.flags, refine, dep_refine)
+        lane_kind, lane_par = classify_lane_info(info, const_name)
+        new = Entry(new.op, new.branch, new.flags, refine, dep_refine,
+                    lane_kind, lane_par)
         if dep_refine:
             dep_assigned += 1
         lines.append(format_entry(const_name, new))

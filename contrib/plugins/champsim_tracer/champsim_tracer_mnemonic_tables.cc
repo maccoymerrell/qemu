@@ -418,135 +418,26 @@ void dep_passthrough(const struct qemu_plugin_insn_info *info, InsnFields *f)
     /* Shape outside this behavior group — bail. */
 }
 
-/* ====================================================================
- * Vector lane refiners
- *
- * Two families, distinguished only by lane_parallel:
- *
- *   dep_vec_lane_parallel — element-wise SIMD arith (VADDPS, VPADDD,
- *       VMULPS, VFMA*, NEON FADD .4S, RISC-V vadd.vv when SEW known,
- *       etc.).  Lane k of each dst depends only on lane k of its
- *       src masks; consumer can model independent per-lane chains.
- *
- *   dep_vec_lane_cross    — vec ops that touch lanes but cross-couple
- *       (VPSHUFB, VBROADCAST, VPERMD, VHADDPS, horizontal reductions).
- *       The masks describe which lanes participate, but the consumer
- *       must treat them as cross-coupled within the active set.
- *
- * Both refiners derive the baseline lane bitmap from Capstone-
- * surfaced info->operands[i].size and lane_bytes:
- *   lanes    = op->size / op->lane_bytes
- *   baseline = (1 << lanes) - 1
- *
- * For the common case (one memop per vec op feeds all lanes of the
- * matching reg), the per-memop lane masks just mirror the per-reg
- * baseline — both load_data_lane_mask[k] and store_data_lane_mask[s]
- * are set to the same value.  Gather/scatter (one memop per lane)
- * needs its own refiner that sets load_data_lane_mask[k] = (1<<k).
- *
- * Bails (leaves has_vec_lanes=false) when no operand carries a
- * recognisable lane width — RISC-V V (where SEW is a runtime CSR
- * not derivable from disassembly), or an unrecognised mnemonic
- * suffix.  decode.cc audits these silent fallbacks and logs them
- * via the existing unknown_warn pipe.
+/*
+ * Lane-mask baseline derivation — called from decode.cc when an
+ * InsnClassification row carries LANE_MASK_KIND_STATIC.  Returns the
+ * (1 << lanes) - 1 mask derived from the first vector REG operand's
+ * (size, lane_bytes); 0 if no vector operand is recognisable (caller
+ * leaves has_vec_lanes false in that case).  Kept here so the
+ * Capstone-derived lane plumbing stays close to the dep refiners.
  */
-
-static uint64_t lane_baseline_from_operand(
-    const struct qemu_plugin_operand *op)
+uint64_t lane_baseline_from_operands(
+    const struct qemu_plugin_insn_info *info)
 {
-    if (!op || op->size == 0 || op->lane_bytes == 0) {
-        return 0;
-    }
-    unsigned lanes = (unsigned)op->size / (unsigned)op->lane_bytes;
-    if (lanes == 0 || lanes > 64) {
-        return 0;
-    }
-    return (lanes == 64) ? ~(uint64_t)0
-                         : (((uint64_t)1 << lanes) - 1);
-}
-
-/* Generic-statically-derivable shape: lane baseline comes from a
- * Capstone-surfaced REG operand's (size, lane_bytes).  Used by
- * dep_vec_lane_parallel / dep_vec_lane_cross — the shared library
- * refiners pointed at by audit rows on ISAs where the lane count
- * is fixed by the encoding (x86, aarch64 NEON, MIPS MSA). */
-static void dep_vec_lane_common_static(
-    const struct qemu_plugin_insn_info *info,
-    InsnFields *f, bool lane_parallel)
-{
-    dep_all_to_all(info, f);
-
-    if (!info) {
-        return;
-    }
-
-    uint64_t baseline = 0;
+    if (!info) return 0;
     for (uint8_t i = 0; i < info->n_operands; i++) {
         const struct qemu_plugin_operand *op = &info->operands[i];
-        if (op->type == QEMU_PLUGIN_OP_REG) {
-            uint64_t m = lane_baseline_from_operand(op);
-            if (m) {
-                baseline = m;
-                break;
-            }
-        }
+        if (op->type != QEMU_PLUGIN_OP_REG) continue;
+        if (op->size == 0 || op->lane_bytes == 0) continue;
+        unsigned lanes = (unsigned)op->size / (unsigned)op->lane_bytes;
+        if (lanes == 0 || lanes > 64) continue;
+        return (lanes == 64) ? ~(uint64_t)0
+                             : (((uint64_t)1 << lanes) - 1);
     }
-    if (!baseline) {
-        /* Capstone didn't surface lane info for this ISA / variant.
-         * Leave has_vec_lanes false; the audit script is responsible
-         * for not pointing this row at a static-shape refiner when
-         * lane info isn't statically derivable. */
-        return;
-    }
-    f->lane_mask_kind = LANE_MASK_KIND_STATIC;
-    f->lane_mask_base = baseline;
-    f->has_vec_lanes  = true;
-    f->lane_parallel  = lane_parallel;
+    return 0;
 }
-
-void dep_vec_lane_parallel(const struct qemu_plugin_insn_info *info,
-                           InsnFields *f)
-{
-    dep_vec_lane_common_static(info, f, /*lane_parallel=*/true);
-}
-
-void dep_vec_lane_cross(const struct qemu_plugin_insn_info *info,
-                        InsnFields *f)
-{
-    dep_vec_lane_common_static(info, f, /*lane_parallel=*/false);
-}
-
-/*
- * RISC-V V refiner shape.  SEW + VL live in the runtime vtype CSR
- * (mutated by vsetvli / vsetvl / vsetivli), so lane info isn't
- * statically derivable from disassembly.  The refiner sets
- * LANE_MASK_KIND_RISCV_VTYPE and the source key for "vl"; the exec-
- * time dispatch reads vl and computes (1 << vl) - 1.  Covers both
- * vsetvli-immediate and vsetvl-register variants uniformly since
- * the CSR is read at body-emit time after any preceding vset* in
- * the same TB has run.
- */
-static void dep_riscv_v_lane_common(const struct qemu_plugin_insn_info *info,
-                                    InsnFields *f, bool lane_parallel)
-{
-    dep_all_to_all(info, f);
-    f->lane_mask_kind = LANE_MASK_KIND_RISCV_VTYPE;
-    f->lane_mask_base = 0;
-    f->lane_mask_source_reg.feature = "org.gnu.gdb.riscv.csr";
-    f->lane_mask_source_reg.name    = "vl";
-    f->has_vec_lanes = true;
-    f->lane_parallel = lane_parallel;
-}
-
-void dep_riscv_v_lane_parallel(const struct qemu_plugin_insn_info *info,
-                               InsnFields *f)
-{
-    dep_riscv_v_lane_common(info, f, /*lane_parallel=*/true);
-}
-
-void dep_riscv_v_lane_cross(const struct qemu_plugin_insn_info *info,
-                            InsnFields *f)
-{
-    dep_riscv_v_lane_common(info, f, /*lane_parallel=*/false);
-}
-

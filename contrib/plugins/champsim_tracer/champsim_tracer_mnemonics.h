@@ -350,18 +350,13 @@ void dep_x86_stack_push(const struct qemu_plugin_insn_info *info,
                         InsnFields *fields);
 void dep_x86_stack_pop(const struct qemu_plugin_insn_info *info,
                        InsnFields *fields);
-void dep_vec_lane_parallel(const struct qemu_plugin_insn_info *info,
-                           InsnFields *fields);
-void dep_vec_lane_cross(const struct qemu_plugin_insn_info *info,
-                        InsnFields *fields);
-/* RISC-V V variants — same shape as dep_vec_lane_{parallel,cross}
- * but pick LANE_MASK_KIND_RISCV_VTYPE so the exec-time dispatch
- * reads vl at runtime.  Referenced only from the RISC-V mnemonic
- * table — generic library code stays ISA-agnostic. */
-void dep_riscv_v_lane_parallel(const struct qemu_plugin_insn_info *info,
-                               InsnFields *fields);
-void dep_riscv_v_lane_cross(const struct qemu_plugin_insn_info *info,
-                            InsnFields *fields);
+
+/* Capstone-derived lane baseline.  Used by decode.cc when populating
+ * lane info for rows tagged LANE_MASK_KIND_STATIC: returns
+ * (1 << lanes) - 1 from the first vector REG operand's
+ * (size, lane_bytes); 0 if no usable vector operand. */
+uint64_t lane_baseline_from_operands(
+    const struct qemu_plugin_insn_info *info);
 
 /*
  * Instruction classification entry: maps a Capstone insn_id directly
@@ -380,6 +375,32 @@ typedef struct {
     uint16_t        flags;       /* MnemonicFlags */
     InsnRefineFn    refine;      /* optional, NULL if unused */
     InsnDepRefineFn dep_refine;  /* optional, NULL → emit no HAS_REG block */
+    /*
+     * Vector lane info.  Orthogonal to .dep_refine — the dep maps
+     * (dst_dep_mask, store_data_dep_mask, etc.) are static and the
+     * existing refiners (dep_all_to_all, dep_passthrough, ...) work
+     * for vector ops just as they do for scalar.  These fields drive
+     * the dynamic lane-mask FID stream and the static
+     * CST_INSN_FLAG_LANE_PARALLEL wire bit:
+     *
+     *   lane_mask_kind   — LaneMaskKind value.  NONE on non-vec rows;
+     *                      STATIC for x86 / aarch64 NEON / MIPS MSA
+     *                      where Capstone surfaces the lane count
+     *                      statically; RISCV_VTYPE for RISC-V V where
+     *                      the dispatch reads vl at exec time.
+     *   lane_parallel    — sets CST_INSN_FLAG_LANE_PARALLEL on the
+     *                      wire.  True for element-wise vec arith
+     *                      (VADDPS, VPADDD, NEON FADD.4S, ...);
+     *                      false for cross-lane ops (shuffles,
+     *                      broadcasts, reductions).
+     *
+     * decode.cc populates InsnFields.lane_mask_* from these rows
+     * after .dep_refine runs.  For LANE_MASK_KIND_STATIC the
+     * baseline is derived from the first vector REG operand's
+     * (size, lane_bytes) at template-build time.
+     */
+    uint8_t         lane_mask_kind;
+    bool            lane_parallel;
 } InsnClassification;
 
 

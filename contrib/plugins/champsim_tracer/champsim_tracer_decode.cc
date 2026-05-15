@@ -525,6 +525,37 @@ void decode_detail_to_generic(uint64_t pc,
     }
 
     /*
+     * Lane info — orthogonal to .dep_refine.  Row carries the static
+     * (lane_mask_kind, lane_parallel) classification; we resolve the
+     * baseline mask / source reg from Capstone detail here so the
+     * dep refiners stay focused on dst→src dataflow.
+     */
+    if (cls && cls->lane_mask_kind != LANE_MASK_KIND_NONE) {
+        out->lane_mask_kind = cls->lane_mask_kind;
+        out->lane_parallel  = cls->lane_parallel;
+        switch (cls->lane_mask_kind) {
+        case LANE_MASK_KIND_STATIC:
+            out->lane_mask_base = lane_baseline_from_operands(info);
+            /* If Capstone didn't surface usable lane info for this
+             * variant, leave has_vec_lanes false — consumer falls
+             * back to all-to-all over the masked set.  The audit
+             * script is responsible for only tagging rows whose
+             * Capstone shape gives a derivable baseline. */
+            if (out->lane_mask_base) {
+                out->has_vec_lanes = true;
+            }
+            break;
+        case LANE_MASK_KIND_RISCV_VTYPE:
+            out->lane_mask_source_reg.feature = "org.gnu.gdb.riscv.csr";
+            out->lane_mask_source_reg.name    = "vl";
+            out->has_vec_lanes = true;
+            break;
+        default:
+            break;
+        }
+    }
+
+    /*
      * Normalize direct-branch immediate to absolute target.
      *
      * Capstone's convention differs by arch:

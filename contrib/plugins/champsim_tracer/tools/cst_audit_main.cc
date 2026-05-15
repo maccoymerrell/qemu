@@ -38,8 +38,9 @@ enum : int {
     BIDX_DST_REG    = 6,
     BIDX_INSN_META  = 7,
     BIDX_EXTENDED   = 8,
-    BIDX_OTHER      = 9,
-    NUM_BUCKETS     = 10,
+    BIDX_LANE_MASK  = 9,
+    BIDX_OTHER      = 10,
+    NUM_BUCKETS     = 11,
 };
 
 /* FID -> bucket lookup.  Sized for the ULEB-encoded FID space.
@@ -59,12 +60,16 @@ struct FidTables {
         const struct {
             const std::array<uint16_t, cst::FID_SLOT_COUNT> *fids;
             uint8_t bucket_id;
-        } fam[5] = {
-            { &ids.fid_load_addr,   (uint8_t)BIDX_LOAD_ADDR  },
-            { &ids.fid_store_addr,  (uint8_t)BIDX_STORE_ADDR },
-            { &ids.fid_load_data,   (uint8_t)BIDX_LOAD_DATA  },
-            { &ids.fid_store_data,  (uint8_t)BIDX_STORE_DATA },
-            { &ids.fid_dst_reg,     (uint8_t)BIDX_DST_REG    },
+        } fam[9] = {
+            { &ids.fid_load_addr,             (uint8_t)BIDX_LOAD_ADDR  },
+            { &ids.fid_store_addr,            (uint8_t)BIDX_STORE_ADDR },
+            { &ids.fid_load_data,             (uint8_t)BIDX_LOAD_DATA  },
+            { &ids.fid_store_data,            (uint8_t)BIDX_STORE_DATA },
+            { &ids.fid_dst_reg,               (uint8_t)BIDX_DST_REG    },
+            { &ids.fid_src_lane_mask,         (uint8_t)BIDX_LANE_MASK  },
+            { &ids.fid_dst_lane_mask,         (uint8_t)BIDX_LANE_MASK  },
+            { &ids.fid_load_data_lane_mask,   (uint8_t)BIDX_LANE_MASK  },
+            { &ids.fid_store_data_lane_mask,  (uint8_t)BIDX_LANE_MASK  },
         };
         for (int k = 0; k < cst::FID_SLOT_COUNT; k++) {
             for (auto &fa : fam) {
@@ -433,6 +438,7 @@ void print_report(const Stats &s)
         {"dest registers",       BIDX_DST_REG},
         {"instruction metadata", BIDX_INSN_META},
         {"extended",             BIDX_EXTENDED},
+        {"lane masks",           BIDX_LANE_MASK},
         {"other",                BIDX_OTHER},
     };
     for (auto &r : rows) {

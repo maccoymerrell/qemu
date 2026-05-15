@@ -371,6 +371,8 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         { CST_INSN_FLAG_BRANCH_COND, "CST_INSN_FLAG_BRANCH_COND" },
         { CST_INSN_FLAG_HAS_IMM, "CST_INSN_FLAG_HAS_IMM" },
         { CST_INSN_FLAG_SYNC_MASK, "CST_INSN_FLAG_SYNC_MASK" },
+        { CST_INSN_FLAG_VEC, "CST_INSN_FLAG_VEC" },
+        { CST_INSN_FLAG_LANE_PARALLEL, "CST_INSN_FLAG_LANE_PARALLEL" },
         { CST_INSN_FLAG_HAS_DEP_BLOCK, "CST_INSN_FLAG_HAS_DEP_BLOCK" },
     };
     static const EncodingMapEntry dep_block_flag_entries[] = {

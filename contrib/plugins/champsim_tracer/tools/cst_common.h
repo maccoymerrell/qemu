@@ -112,6 +112,8 @@ struct ResolvedIds {
     uint8_t insn_flag_branch_cond  = 0;
     uint8_t insn_flag_has_imm      = 0;
     uint8_t insn_flag_has_dep_block = 0;
+    uint8_t insn_flag_vec           = 0;
+    uint8_t insn_flag_lane_parallel = 0;
 
     /* dep_block_flag map: bit masks inside the optional dep sub-block
      * header (only inspected when insn_flag_has_dep_block is set on

@@ -133,20 +133,36 @@ extern "C" {
  *   bit 0    BRANCH_COND
  *   bit 1    HAS_IMM
  *   bits 2-3 SYNC (2-bit dense encoding of SyncEventType)
- *   bit 4    (reserved — was sync bit 2, freed when sync was densified)
- *   bit 5    (reserved — was sync bit 3, freed when sync was densified)
+ *   bit 4    VEC           — per-slot lane bitmaps present
+ *   bit 5    LANE_PARALLEL — lane bitmaps line up by lane index
+ *                            (consumer can model per-lane chains).
+ *                            LANE_PARALLEL implies VEC.
  *   bit 6    HAS_DEP_BLOCK
  *   bit 7    (reserved)
  *
  * Sync was previously a 4-bit field (bits 2-5).  SyncEventType only
  * defines 3 values (NONE/THREAD_SWITCH/ATOMIC) and the wire encoding
  * map is self-describing, so it was re-encoded densely into 2 bits
- * to free up bits 4-5 for future per-insn metadata.
+ * to free up bits 4-5 for the lane-parallelism flags.
+ *
+ * VEC and LANE_PARALLEL split the orthogonal concerns:
+ *   - VEC says "per-slot lane bitmaps are present on the wire" — the
+ *     template carries src_lane_mask[i] / dst_lane_mask[d] after the
+ *     reg arrays, describing which lanes of each reg participate.
+ *     Useful even for cross-lane ops (shuffles, broadcasts, gathers)
+ *     because rename-slot allocation cares about lane participation
+ *     regardless of parallelism.
+ *   - LANE_PARALLEL says "the lane bitmaps line up by lane index"
+ *     so the consumer can model independent per-lane dependency
+ *     chains.  Set on element-wise vec arithmetic (VADDPS, VPADDD,
+ *     etc.); cleared on shuffles / cross-lane / reductions.
  */
 #define CST_INSN_FLAG_BRANCH_COND   (1u << 0)
 #define CST_INSN_FLAG_HAS_IMM       (1u << 1)
 #define CST_INSN_FLAG_SYNC_SHIFT    2
 #define CST_INSN_FLAG_SYNC_MASK     0x0Cu
+#define CST_INSN_FLAG_VEC           (1u << 4)
+#define CST_INSN_FLAG_LANE_PARALLEL (1u << 5)
 /*
  * Intra-instruction dataflow sub-block.  When set, an
  * extensible dependency block follows insn_bytes:

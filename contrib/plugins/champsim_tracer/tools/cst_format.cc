@@ -178,6 +178,23 @@ static void resolve_one(const std::unordered_map<uint64_t, std::string> &m,
                              + "' missing well-known name '" + want + "'");
 }
 
+/* Lenient resolver: leaves @out at zero (no bit) when the wire format
+ * doesn't define the well-known name.  Use for fields added after a
+ * wire-format extension when older traces (lacking the entry) must
+ * still parse — the consumer simply treats the absent bit as
+ * never-set on those traces. */
+static void resolve_one_lenient(
+        const std::unordered_map<uint64_t, std::string> &m,
+        const char *want, uint8_t *out)
+{
+    for (const auto &kv : m) {
+        if (kv.second == want) {
+            *out = (uint8_t)kv.first;
+            return;
+        }
+    }
+}
+
 /* Populate @ids from the well-known names in @maps.  Throws on any
  * missing name — the wire format is the single source of truth, so a
  * trace that omits a name the decoder needs is malformed. */
@@ -240,6 +257,16 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
                 &ids->insn_flag_has_imm);
     resolve_one(maps.insn_flag, "insn_flag", "CST_INSN_FLAG_HAS_DEP_BLOCK",
                 &ids->insn_flag_has_dep_block);
+    /* Lenient: VEC and LANE_PARALLEL postdate the original wire
+     * format, so traces written before they were defined won't carry
+     * them in their encoding map.  Leaving the resolved bit at 0
+     * makes the consumer-side check `(flags & vec_bit)` always false
+     * on those traces — exactly the "no lane info present" behavior
+     * the consumer should default to. */
+    resolve_one_lenient(maps.insn_flag, "CST_INSN_FLAG_VEC",
+                        &ids->insn_flag_vec);
+    resolve_one_lenient(maps.insn_flag, "CST_INSN_FLAG_LANE_PARALLEL",
+                        &ids->insn_flag_lane_parallel);
 
     /* dep_block_flag (bit masks inside the optional dependency sub-block) */
     resolve_one(maps.dep_block_flag, "dep_block_flag",

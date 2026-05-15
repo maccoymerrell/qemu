@@ -271,20 +271,34 @@ extern "C" {
  * that fire every entry; lane masks for the common (static) case
  * cost zero record bytes anyway thanks to the field-delta encoding.
  *
- * SRC_LANE_MASK / DST_LANE_MASK are per-slot lane participation
- * bitmaps for vector ops (CST_INSN_FLAG_VEC).  Bit k of each mask
- * marks lane k of the corresponding src/dst reg as participating.
+ * Four lane-mask families, all with the same per-slot bitmap shape
+ * (bit k = lane k participates):
+ *
+ *   SRC_LANE_MASK / DST_LANE_MASK  — per-reg-slot lane participation
+ *                                    for src_regs[i] / dst_regs[d].
+ *   LOAD_DATA_LANE_MASK            — per-memop lane participation,
+ *                                    i.e. which lanes of the
+ *                                    consuming reg this load fills.
+ *   STORE_DATA_LANE_MASK           — per-memop lane participation,
+ *                                    i.e. which lanes of the source
+ *                                    reg this store drains.
+ *
  * Refiner-set template baseline; FID deltas override at runtime when
  * the active mask differs (x86 EVEX k1 predicates, RISC-V V
- * vtype.VL, AArch64 SVE predicates).
+ * vtype.VL, AArch64 SVE predicates).  Consumers combine, e.g.,
+ * dst_lane_mask[d] ∩ load_data_lane_mask[k] to know which lanes of
+ * dst[d] depend on memop[k] — gather/scatter (one memop per lane)
+ * is the case that drove adding the memop-side masks.
  */
-#define CST_FID_LANE_BLOCK_BASE     (CST_FID_SLOTTED_END + 1)
-#define CST_FID_LANE_BLOCK_STRIDE   2
-#define CST_FID_SRC_LANE_MASK_BASE  (CST_FID_LANE_BLOCK_BASE + 0)
-#define CST_FID_DST_LANE_MASK_BASE  (CST_FID_LANE_BLOCK_BASE + 1)
-#define CST_FID_LANE_BLOCK_END      (CST_FID_DST_LANE_MASK_BASE + \
-                                     (CST_FID_SLOT_COUNT - 1) * \
-                                     CST_FID_LANE_BLOCK_STRIDE)
+#define CST_FID_LANE_BLOCK_BASE          (CST_FID_SLOTTED_END + 1)
+#define CST_FID_LANE_BLOCK_STRIDE        4
+#define CST_FID_SRC_LANE_MASK_BASE       (CST_FID_LANE_BLOCK_BASE + 0)
+#define CST_FID_DST_LANE_MASK_BASE       (CST_FID_LANE_BLOCK_BASE + 1)
+#define CST_FID_LOAD_DATA_LANE_MASK_BASE (CST_FID_LANE_BLOCK_BASE + 2)
+#define CST_FID_STORE_DATA_LANE_MASK_BASE (CST_FID_LANE_BLOCK_BASE + 3)
+#define CST_FID_LANE_BLOCK_END           (CST_FID_STORE_DATA_LANE_MASK_BASE + \
+                                          (CST_FID_SLOT_COUNT - 1) * \
+                                          CST_FID_LANE_BLOCK_STRIDE)
 
 /* Cold instruction-metadata fields.  Baseline = template's static
  * value, so unchanged-from-template fields cost zero record bytes.

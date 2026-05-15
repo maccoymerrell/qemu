@@ -47,7 +47,7 @@ enum : int {
  * ResolvedIds (name-resolved out of the encoding map — no stride
  * assumption); each slot's actual FID is whatever the writer chose. */
 struct FidTables {
-    static constexpr size_t LUT_SIZE = 512;
+    static constexpr size_t LUT_SIZE = 1024;
     std::array<uint8_t, LUT_SIZE> bucket{};
 
     explicit FidTables(const cst::ResolvedIds &ids) {

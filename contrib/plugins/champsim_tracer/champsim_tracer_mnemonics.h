@@ -239,6 +239,18 @@ typedef struct InsnFields {
     uint64_t src_lane_mask[MAX_SRC_REGS];
     uint64_t dst_lane_mask[MAX_DST_REGS];
     /*
+     * Per-memop lane participation — which lanes of the consuming /
+     * producing reg this memop feeds / drains.  Consumers combine
+     * dst_lane_mask[d] ∩ load_data_lane_mask[k] to know which lanes
+     * of dst[d] depend on memop[k]; this is the case that makes
+     * gather/scatter and partial-fill ops (VMOVHPD / VPINSRB) work
+     * without a per-(memop, dst-reg) 2D mask.  For most vector
+     * load/store insns the refiner just mirrors src/dst masks here
+     * (one memop fills all the lanes).
+     */
+    uint64_t load_data_lane_mask[MAX_LOADS];
+    uint64_t store_data_lane_mask[MAX_STORES];
+    /*
      * Set on lane-parallel arith (VADDPS, VPADDD, VMULPS, VANDPS,
      * VFMA family etc.) to flip CST_INSN_FLAG_LANE_PARALLEL on the
      * wire.  Implies has_vec_lanes; refiners that set this must also

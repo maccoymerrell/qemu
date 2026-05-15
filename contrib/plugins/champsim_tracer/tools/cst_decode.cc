@@ -63,6 +63,8 @@ void slot_lut_build(const ResolvedIds &ids,
         &ids.fid_dst_reg,
         &ids.fid_src_lane_mask,
         &ids.fid_dst_lane_mask,
+        &ids.fid_load_data_lane_mask,
+        &ids.fid_store_data_lane_mask,
     };
     constexpr size_t N_FAM = sizeof(slotted_fams) / sizeof(slotted_fams[0]);
 

@@ -66,16 +66,16 @@ namespace cst {
 /* Layout matches FIELD_STATE_SLOT_COUNT in champsim_tracer_output.cc:
  *   3 singletons (N_LOADS, N_STORES, METAFLAGS) + 5 * FID_SLOT_COUNT
  *   (slotted families: load_addr/store_addr/load_data/store_data/
- *   dst_reg) + 2 * FID_SLOT_COUNT (lane-mask block:
- *   src_lane_mask/dst_lane_mask) + 7 insn-metadata.  EXTENDED has no
- *   persistent cell.  Bump alongside the writer when new families
- *   are added. */
+ *   dst_reg) + 4 * FID_SLOT_COUNT (lane-mask block: SRC_LANE_MASK
+ *   / DST_LANE_MASK / LOAD_DATA_LANE_MASK / STORE_DATA_LANE_MASK) +
+ *   7 insn-metadata.  EXTENDED has no persistent cell.  Bump
+ *   alongside the writer when new families are added. */
 inline constexpr size_t  FIELD_STATE_SLOT_COUNT   =
-    3 + 5 * FID_SLOT_COUNT + 2 * FID_SLOT_COUNT + 7;
+    3 + 5 * FID_SLOT_COUNT + 4 * FID_SLOT_COUNT + 7;
 inline constexpr uint16_t FIELD_STATE_SLOT_INVALID = 0xFFFFu;
 /* fid space is ULEB-encoded; the highest slotted FID at slot 63 is
  * ~322.  Round to next power-of-two for a single-load slot lookup. */
-inline constexpr size_t  FID_LUT_SIZE             = 512;
+inline constexpr size_t  FID_LUT_SIZE             = 1024;
 
 struct FieldStateBlock {
     uint32_t              n_insns = 0;

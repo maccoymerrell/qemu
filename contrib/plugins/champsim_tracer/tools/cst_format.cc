@@ -206,13 +206,15 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
     /* Slotted families: resolve every (family, slot) by name. */
     static const struct { const char *prefix;
                           std::array<uint16_t, 64> ResolvedIds::*arr; } fam[] = {
-        { "CST_FID_LOAD_ADDR",     &ResolvedIds::fid_load_addr     },
-        { "CST_FID_STORE_ADDR",    &ResolvedIds::fid_store_addr    },
-        { "CST_FID_LOAD_DATA",     &ResolvedIds::fid_load_data     },
-        { "CST_FID_STORE_DATA",    &ResolvedIds::fid_store_data    },
-        { "CST_FID_DST_REG",       &ResolvedIds::fid_dst_reg       },
-        { "CST_FID_SRC_LANE_MASK", &ResolvedIds::fid_src_lane_mask },
-        { "CST_FID_DST_LANE_MASK", &ResolvedIds::fid_dst_lane_mask },
+        { "CST_FID_LOAD_ADDR",            &ResolvedIds::fid_load_addr            },
+        { "CST_FID_STORE_ADDR",           &ResolvedIds::fid_store_addr           },
+        { "CST_FID_LOAD_DATA",            &ResolvedIds::fid_load_data            },
+        { "CST_FID_STORE_DATA",           &ResolvedIds::fid_store_data           },
+        { "CST_FID_DST_REG",              &ResolvedIds::fid_dst_reg              },
+        { "CST_FID_SRC_LANE_MASK",        &ResolvedIds::fid_src_lane_mask        },
+        { "CST_FID_DST_LANE_MASK",        &ResolvedIds::fid_dst_lane_mask        },
+        { "CST_FID_LOAD_DATA_LANE_MASK",  &ResolvedIds::fid_load_data_lane_mask  },
+        { "CST_FID_STORE_DATA_LANE_MASK", &ResolvedIds::fid_store_data_lane_mask },
     };
     for (const auto &f : fam) {
         for (uint16_t k = 0; k < FID_SLOT_COUNT; k++) {

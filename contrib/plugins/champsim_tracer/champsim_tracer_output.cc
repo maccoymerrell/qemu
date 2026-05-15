@@ -280,11 +280,11 @@ static void write_reg_encoding_map(BitWriter *bw)
 static void write_field_id_encoding_map(BitWriter *bw)
 {
     /* Count: 3 hot singletons + 5 slotted families × CST_FID_SLOT_COUNT
-     * + 2 lane-mask families × CST_FID_SLOT_COUNT + 7 insn-metadata
+     * + 4 lane-mask families × CST_FID_SLOT_COUNT + 7 insn-metadata
      * + 1 EXTENDED. */
     const uint64_t n_entries =
         3 + (uint64_t)5 * CST_FID_SLOT_COUNT
-          + (uint64_t)2 * CST_FID_SLOT_COUNT + 7 + 1;
+          + (uint64_t)4 * CST_FID_SLOT_COUNT + 7 + 1;
     bw_write_string(bw, "field_id");
     bw_write_uleb128(bw, n_entries);
 
@@ -316,8 +316,10 @@ static void write_field_id_encoding_map(BitWriter *bw)
     /* Lane-mask block (separate from the hot slotted block so it
      * doesn't shift the cheaper 1-byte ULEB range). */
     static const struct { uint16_t base; const char *prefix; } lane_fam[] = {
-        { CST_FID_SRC_LANE_MASK_BASE, "CST_FID_SRC_LANE_MASK" },
-        { CST_FID_DST_LANE_MASK_BASE, "CST_FID_DST_LANE_MASK" },
+        { CST_FID_SRC_LANE_MASK_BASE,        "CST_FID_SRC_LANE_MASK"        },
+        { CST_FID_DST_LANE_MASK_BASE,        "CST_FID_DST_LANE_MASK"        },
+        { CST_FID_LOAD_DATA_LANE_MASK_BASE,  "CST_FID_LOAD_DATA_LANE_MASK"  },
+        { CST_FID_STORE_DATA_LANE_MASK_BASE, "CST_FID_STORE_DATA_LANE_MASK" },
     };
     for (uint64_t k = 0; k < CST_FID_SLOT_COUNT; k++) {
         for (size_t f = 0; f < G_N_ELEMENTS(lane_fam); f++) {
@@ -824,19 +826,20 @@ static void bw_write_sleb128_u512(BitWriter *bw, U512 v)
 enum {
     FIELD_STATE_SLOT_INVALID = 0xFFFFu,
     /* Layout: 1 (N_LOADS) + 1 (N_STORES) + 1 (METAFLAGS) + 5
-     * (slotted families) × CST_FID_SLOT_COUNT + 2 (lane-mask
-     * families) × CST_FID_SLOT_COUNT + 7 (insn-metadata
-     * bytes_lo..size).  EXTENDED has no persistent state cell.
-     * Keep the matching FIELD_STATE_SLOT_COUNT in tools/cst_decode.h
-     * in sync when this grows.                                       */
+     * (slotted families) × CST_FID_SLOT_COUNT + 4 (lane-mask
+     * families: SRC / DST / LOAD_DATA / STORE_DATA) ×
+     * CST_FID_SLOT_COUNT + 7 (insn-metadata bytes_lo..size).
+     * EXTENDED has no persistent state cell.  Keep the matching
+     * FIELD_STATE_SLOT_COUNT in tools/cst_decode.h in sync when
+     * this grows.                                                    */
     FIELD_STATE_SLOT_COUNT = 3 + (5 * CST_FID_SLOT_COUNT)
-                               + (2 * CST_FID_SLOT_COUNT) + 7,
+                               + (4 * CST_FID_SLOT_COUNT) + 7,
     /* Field-ID space is ULEB128 — FIDs reach CST_FID_EXTENDED.
      * Round up to the next power of two so the fid -> slot lookup
      * stays a single load with no bounds dance.  At slot count 64
-     * the largest FID is the EXTENDED escape just past the lane
-     * block (~460), so 512 suffices. */
-    FIELD_STATE_LUT_SIZE   = 512,
+     * and stride-4 lane block the largest FID lands near 590, so
+     * 1024 covers it with headroom for further families. */
+    FIELD_STATE_LUT_SIZE   = 1024,
 };
 
 typedef struct FieldStateBlock {
@@ -879,11 +882,13 @@ static bool     g_field_state_slot_lut_built = false;
  *   slot 5:   LOAD_DATA[0]      ... slot (3 + 5*k + 2): LOAD_DATA[k]
  *   slot 6:   STORE_DATA[0]     ... slot (3 + 5*k + 3): STORE_DATA[k]
  *   slot 7:   DST_REG[0]        ... slot (3 + 5*k + 4): DST_REG[k]
- *   slot (3 + 5*N) + 2*k:     SRC_LANE_MASK[k]   (k in 0..N-1)
- *   slot (3 + 5*N) + 2*k + 1: DST_LANE_MASK[k]
- *   slot (3 + 5*N + 2*N): INSN_BYTES_LO ... INSN_SIZE
+ *   slot (3 + 5*N) + 4*k:     SRC_LANE_MASK[k]   (k in 0..N-1)
+ *   slot (3 + 5*N) + 4*k + 1: DST_LANE_MASK[k]
+ *   slot (3 + 5*N) + 4*k + 2: LOAD_DATA_LANE_MASK[k]
+ *   slot (3 + 5*N) + 4*k + 3: STORE_DATA_LANE_MASK[k]
+ *   slot (3 + 5*N + 4*N): INSN_BYTES_LO ... INSN_SIZE
  *     (N = CST_FID_SLOT_COUNT)
- * Total = 3 + 5*N + 2*N + 7 = FIELD_STATE_SLOT_COUNT. */
+ * Total = 3 + 5*N + 4*N + 7 = FIELD_STATE_SLOT_COUNT. */
 static void field_state_slot_lut_build(void)
 {
     for (unsigned i = 0; i < FIELD_STATE_LUT_SIZE; i++) {
@@ -907,18 +912,20 @@ static void field_state_slot_lut_build(void)
         }
     }
     unsigned lane_dense_base = 3 + 5 * CST_FID_SLOT_COUNT;
-    static const uint16_t lane_fam_base[2] = {
+    static const uint16_t lane_fam_base[4] = {
         CST_FID_SRC_LANE_MASK_BASE,
         CST_FID_DST_LANE_MASK_BASE,
+        CST_FID_LOAD_DATA_LANE_MASK_BASE,
+        CST_FID_STORE_DATA_LANE_MASK_BASE,
     };
     for (unsigned k = 0; k < CST_FID_SLOT_COUNT; k++) {
         for (unsigned f = 0; f < G_N_ELEMENTS(lane_fam_base); f++) {
             unsigned fid = lane_fam_base[f] + k * CST_FID_LANE_BLOCK_STRIDE;
             g_field_state_slot_lut[fid] =
-                (uint16_t)(lane_dense_base + 2 * k + f);
+                (uint16_t)(lane_dense_base + 4 * k + f);
         }
     }
-    unsigned slotted_dense_end = lane_dense_base + 2 * CST_FID_SLOT_COUNT;
+    unsigned slotted_dense_end = lane_dense_base + 4 * CST_FID_SLOT_COUNT;
     for (unsigned f = CST_FID_INSN_BYTES_LO; f <= CST_FID_INSN_SIZE; f++) {
         g_field_state_slot_lut[f] =
             (uint16_t)(slotted_dense_end + (f - CST_FID_INSN_BYTES_LO));
@@ -1572,8 +1579,8 @@ static bool extr_u64_insn_size(const EntryView *ev, uint32_t i, uint8_t slot,
 
 /* Lane-mask slot caps.  Returns 0 when the insn has no lane info
  * (most non-vec insns), suppressing emission entirely.  When the
- * refiner has set has_vec_lanes, only the actual reg slots get
- * walked. */
+ * refiner has set has_vec_lanes, only the actual reg / memop slots
+ * get walked. */
 static uint8_t cap_src_lane_masks(const EntryView *ev, uint32_t i)
 {
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return 0;
@@ -1587,6 +1594,20 @@ static uint8_t cap_dst_lane_masks(const EntryView *ev, uint32_t i)
     const InsnFields *f = &ev->tmpl->insn_fields[i];
     if (!f->has_vec_lanes) return 0;
     return f->n_dst_regs;
+}
+static uint8_t cap_load_data_lane_masks(const EntryView *ev, uint32_t i)
+{
+    if (!ev->tmpl || i >= ev->tmpl->n_insns) return 0;
+    const InsnFields *f = &ev->tmpl->insn_fields[i];
+    if (!f->has_vec_lanes) return 0;
+    return f->max_dep_loads;
+}
+static uint8_t cap_store_data_lane_masks(const EntryView *ev, uint32_t i)
+{
+    if (!ev->tmpl || i >= ev->tmpl->n_insns) return 0;
+    const InsnFields *f = &ev->tmpl->insn_fields[i];
+    if (!f->has_vec_lanes) return 0;
+    return f->max_dep_stores;
 }
 
 /* Extractors return the refiner-set baseline today.  When the runtime
@@ -1611,6 +1632,24 @@ static bool extr_u64_dst_lane_mask(const EntryView *ev, uint32_t i,
     *out = f->dst_lane_mask[slot];
     return true;
 }
+static bool extr_u64_load_data_lane_mask(const EntryView *ev, uint32_t i,
+                                         uint8_t slot, uint64_t *out)
+{
+    if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
+    const InsnFields *f = &ev->tmpl->insn_fields[i];
+    if (!f->has_vec_lanes || slot >= f->max_dep_loads) return false;
+    *out = f->load_data_lane_mask[slot];
+    return true;
+}
+static bool extr_u64_store_data_lane_mask(const EntryView *ev, uint32_t i,
+                                          uint8_t slot, uint64_t *out)
+{
+    if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
+    const InsnFields *f = &ev->tmpl->insn_fields[i];
+    if (!f->has_vec_lanes || slot >= f->max_dep_stores) return false;
+    *out = f->store_data_lane_mask[slot];
+    return true;
+}
 
 /* template_default = 0 — the consumer's initial baseline.  Refiner-set
  * baselines flow on the wire as the first observation's delta-from-zero;
@@ -1632,6 +1671,22 @@ static bool extr_dst_lane_mask(const EntryView *ev, uint32_t i, uint8_t slot,
 {
     uint64_t v;
     if (!extr_u64_dst_lane_mask(ev, i, slot, &v)) return false;
+    *out = cst_wide_from_u64(v);
+    return true;
+}
+static bool extr_load_data_lane_mask(const EntryView *ev, uint32_t i,
+                                     uint8_t slot, U512 *out)
+{
+    uint64_t v;
+    if (!extr_u64_load_data_lane_mask(ev, i, slot, &v)) return false;
+    *out = cst_wide_from_u64(v);
+    return true;
+}
+static bool extr_store_data_lane_mask(const EntryView *ev, uint32_t i,
+                                      uint8_t slot, U512 *out)
+{
+    uint64_t v;
+    if (!extr_u64_store_data_lane_mask(ev, i, slot, &v)) return false;
     *out = cst_wide_from_u64(v);
     return true;
 }
@@ -1724,6 +1779,22 @@ static const FieldDescriptor field_descriptors[] = {
             extr_u64_dst_lane_mask, deflt_u64_zero,
             false /* dynamic: runtime mask register read (future) */,
             "DST_LANE_MASK" },
+        { CST_FID_LOAD_DATA_LANE_MASK_BASE, CST_FID_LANE_BLOCK_STRIDE,
+            CST_FID_SLOT_COUNT,
+            false, false,
+            extr_load_data_lane_mask, deflt_lane_mask_zero,
+            cap_load_data_lane_masks,
+            extr_u64_load_data_lane_mask, deflt_u64_zero,
+            false /* dynamic: gather/scatter may vary per-iter */,
+            "LOAD_DATA_LANE_MASK" },
+        { CST_FID_STORE_DATA_LANE_MASK_BASE, CST_FID_LANE_BLOCK_STRIDE,
+            CST_FID_SLOT_COUNT,
+            false, false,
+            extr_store_data_lane_mask, deflt_lane_mask_zero,
+            cap_store_data_lane_masks,
+            extr_u64_store_data_lane_mask, deflt_u64_zero,
+            false /* dynamic: scatter may vary per-iter */,
+            "STORE_DATA_LANE_MASK" },
         { CST_FID_INSN_BYTES_LO,    1, 1,  false, false,
             extr_insn_bytes_lo,  deflt_insn_bytes_lo,   nullptr,
             extr_u64_insn_bytes_lo, deflt_u64_insn_bytes_lo,

@@ -184,17 +184,33 @@ ISA_ADDRESS_COMPUTE_INSNS: dict[str, set[str]] = {
 # instructions push or pop to/from the stack via an implicit memop
 # that Capstone doesn't enumerate as an explicit MEM operand — the
 # refiner reconstructs the memop and points its address at the
-# walker-discovered RSP src slot.
+# walker-discovered stack-pointer slot (RSP for most, RBP for LEAVE).
 #
-# Limited to single-memop variants for now.  Multi-memop ops
-# (PUSHA/POPA fan out N pushes, IRET pops IP+CS+EFLAGS) need their
-# own refiners — they fall back to dep_all_to_all today.
+# Refiners are multi-memop-aware: PUSHA / POPA fan out 8 implicit
+# memops, IRET pops IP+CS+EFLAGS, ENTER pushes a saved-frame chain.
+# The refiner emits one implicit memop per non-stack-pointer reg in
+# src_regs (push side) or dst_regs (pop side).
 ISA_STACK_PUSH_INSNS: dict[str, set[str]] = {
-    "x86":  {"X86_INS_PUSH", "X86_INS_CALL", "X86_INS_LCALL"},
+    "x86":  {
+        # Single-memop pushes
+        "X86_INS_PUSH", "X86_INS_PUSHF", "X86_INS_PUSHFD", "X86_INS_PUSHFQ",
+        "X86_INS_CALL", "X86_INS_LCALL",
+        # Multi-memop fan-outs
+        "X86_INS_PUSHAW", "X86_INS_PUSHAL", "X86_INS_ENTER",
+    },
 }
 ISA_STACK_POP_INSNS: dict[str, set[str]] = {
-    "x86":  {"X86_INS_POP",
-             "X86_INS_RET", "X86_INS_RETF", "X86_INS_RETFQ"},
+    "x86":  {
+        # Single-memop pops
+        "X86_INS_POP", "X86_INS_POPF", "X86_INS_POPFD", "X86_INS_POPFQ",
+        "X86_INS_RET", "X86_INS_RETF", "X86_INS_RETFQ",
+        # LEAVE: stack pointer is RBP, not RSP — the intersection
+        # heuristic in dep_x86_stack_pop catches that.
+        "X86_INS_LEAVE",
+        # Multi-memop fan-outs
+        "X86_INS_POPAW", "X86_INS_POPAL",
+        "X86_INS_IRET", "X86_INS_IRETD", "X86_INS_IRETQ",
+    },
 }
 
 # ----------------------------------------------------------------------

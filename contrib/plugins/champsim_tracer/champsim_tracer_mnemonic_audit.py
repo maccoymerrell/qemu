@@ -113,6 +113,11 @@ ISAS = {
 class RegEntry:
     primary: str
     aliases: tuple[str, ...] = ()
+    # True iff this is the ISA's integer-flags register (x86 EFLAGS,
+    # aarch64 NZCV).  Drives REG_METAFLAGS canonicalisation in the
+    # plugin; emitted as `.is_int_flags = true` in the reg-class
+    # table when set.
+    is_int_flags: bool = False
 
     @property
     def ignored(self) -> bool:
@@ -134,12 +139,16 @@ class GdbXmlFeature:
 
 
 ENTRY_RE = re.compile(
-    r"\[\s*(?P<const>[A-Z0-9_]+)\s*\]\s*=\s*\{\s*"
-    r"(?P<op>GEN_OP_[A-Z0-9_]+)\s*,\s*"
-    r"(?P<branch>BRANCH_[A-Z0-9_]+)\s*,\s*"
-    r"(?P<flags>(?:MF_[A-Z0-9_]+|0)(?:\s*\|\s*MF_[A-Z0-9_]+)*)\s*"
-    # Optional .refine and .dep_refine designated initialisers, either
-    # order, either or both may appear.
+    # Match the dense designated array init format emitted by
+    # format_entry: [CONST] = { .opcode = OP, .branch_type = BR,
+    # .flags = F [, .refine=...] [, .dep_refine=...] }.  Accepts
+    # the historical positional shape too (without member designators
+    # on the struct fields) so the script can read pre-conversion
+    # tables when preserving manual .refine overrides.
+    r"\[\s*(?P<const>[A-Z][A-Z0-9_]+)\s*\]\s*=\s*\{\s*"
+    r"(?:\.opcode\s*=\s*)?(?P<op>GEN_OP_[A-Z0-9_]+)\s*,\s*"
+    r"(?:\.branch_type\s*=\s*)?(?P<branch>BRANCH_[A-Z0-9_]+)\s*,\s*"
+    r"(?:\.flags\s*=\s*)?(?P<flags>(?:MF_[A-Z0-9_]+|0)(?:\s*\|\s*MF_[A-Z0-9_]+)*)\s*"
     r"(?:"
     r"(?:,\s*\.refine\s*=\s*(?P<refine>[A-Za-z_][A-Za-z0-9_]*))"
     r"|"
@@ -1021,6 +1030,10 @@ def enum_constants(info: IsaInfo) -> list[str]:
     enum_text = text[start:end]
     seen: set[str] = set()
     names: list[str] = []
+    # INVALID stays out — generated_body prepends a {} placeholder
+    # for it explicitly so the dense positional list lines up with
+    # the enum starting at index 0 without trying to classify
+    # the INVALID name.
     for match in re.finditer(r"\b" + re.escape(info.prefix) + r"[A-Z0-9_]+\b", enum_text):
         name = match.group(0)
         if name.endswith("INVALID") or name.endswith("ENDING") or name in seen:
@@ -1040,6 +1053,11 @@ def enum_reg_constants(info: IsaInfo) -> list[str]:
     enum_text = text[start:end]
     seen: set[str] = set()
     names: list[str] = []
+    # The leading INVALID slot is filled with a {} placeholder in
+    # generated_reg_body so the dense positional list aligns with the
+    # enum starting at index 0.  The classifier path below would
+    # recurse on the INVALID name (the riscv reg classifier doesn't
+    # special-case it), so we keep it out of the constants list.
     for match in re.finditer(r"\b" + re.escape(info.reg_prefix) + r"[A-Z0-9_]+\b", enum_text):
         name = match.group(0)
         if name.endswith("INVALID") or name.endswith("ENDING") or name in seen:
@@ -1215,7 +1233,9 @@ def classify_x86_reg(name: str) -> RegEntry:
         return reg_none()
     if name in {"IP", "EIP", "RIP"}:
         return reg_ent("REG_IP")
-    if name in {"EFLAGS", "FPSW"}:
+    if name == "EFLAGS":
+        return RegEntry("REG_FLAGS", is_int_flags=True)
+    if name == "FPSW":
         return reg_ent("REG_FLAGS")
     segs = {"CS": 0, "DS": 1, "ES": 2, "FS": 3, "GS": 4, "SS": 5}
     if name in segs:
@@ -1260,7 +1280,7 @@ def classify_aarch64_reg(name: str) -> RegEntry:
     if name == "FP":
         return reg_ent("REG_FP_REG")
     if name == "NZCV":
-        return reg_ent("REG_FLAGS")
+        return RegEntry("REG_FLAGS", is_int_flags=True)
     if name == "FPCR":
         return reg_ent("REG_FCSR")
     if name in {"FFR", "VG"}:
@@ -2370,21 +2390,38 @@ def classify(info: IsaInfo, const_name: str) -> Entry:
 
 
 def format_entry(const_name: str, entry: Entry) -> str:
+    # Dense designated array init: [CONST] = { .field = ..., ... }
+    # for every enum value, with empty {} placeholders for the
+    # unclassified slots (see format_empty_entry).  Dense means
+    # g++ accepts the table; the array designator means the table
+    # stays robust against Capstone enum-value shifts (a new insn
+    # inserted in the middle of the enum re-aligns automatically
+    # instead of silently mis-mapping every subsequent slot).
     left = f"    [{const_name}]"
     pad1 = " " * max(1, 36 - len(const_name))
     pad2 = " " * max(1, 14 - len(entry.op))
     pad3 = " " * max(1, 22 - len(entry.branch))
-    line = f"{left}{pad1}= {{ {entry.op},{pad2}{entry.branch},{pad3}{entry.flags}"
+    head = (f"{left}{pad1}= {{ "
+            f".opcode = {entry.op},{pad2}"
+            f".branch_type = {entry.branch},{pad3}"
+            f".flags = {entry.flags}")
     extras: list[str] = []
     if entry.refine:
         extras.append(f".refine = {entry.refine}")
     if entry.dep_refine:
         extras.append(f".dep_refine = {entry.dep_refine}")
     if not extras:
-        return line + " },"
+        return head + " },"
     indent = " " * 40
     suffix = "".join(f",\n{indent}{e}" for e in extras)
-    return line + suffix + " },"
+    return head + suffix + " },"
+
+
+def format_empty_entry(const_name: str) -> str:
+    # Placeholder slot for an enum value we don't classify.  Carries
+    # the array designator so the surrounding entries stay enum-
+    # indexed; dense + designated keeps g++ happy. */
+    return f"    [{const_name}]{' ' * max(1, 36 - len(const_name))}= {{}},"
 
 
 def xml_local_name(tag: str) -> str:
@@ -2634,14 +2671,20 @@ def format_qemu_reg(qemu_reg: QemuRegKey | None) -> str:
 
 def format_reg_entry(const_name: str, entry: RegEntry, comment: str,
                      qemu_reg: QemuRegKey | None) -> str:
+    # Dense designated array init — see format_entry's comment.
     qemu_field = format_qemu_reg(qemu_reg)
+    flags_field = ", .is_int_flags = true" if entry.is_int_flags else ""
     if entry.aliases:
         aliases = ", ".join(entry.aliases)
         return (f"    [{const_name}] = {{ .reg_id = {entry.primary}, "
                 f".n_regs = {len(entry.aliases)}, .regs = {{ {aliases} }}"
-                f"{qemu_field} }},  /* {comment} */")
+                f"{qemu_field}{flags_field} }},  /* {comment} */")
     return (f"    [{const_name}] = {{ .reg_id = {entry.primary}"
-            f"{qemu_field} }},  /* {comment} */")
+            f"{qemu_field}{flags_field} }},  /* {comment} */")
+
+
+def format_empty_reg_entry(const_name: str) -> str:
+    return f"    [{const_name}] = {{}},"
 
 
 def generated_body(info: IsaInfo, constants: list[str], existing: dict[str, Entry]) -> str:
@@ -2660,10 +2703,17 @@ def generated_body(info: IsaInfo, constants: list[str], existing: dict[str, Entr
     lines = [f"    /* Auto-generated by {Path(__file__).name}. */"]
     emitted = 0
     dep_assigned = 0
+    # Emit one entry per enum value in declaration order, dense (no
+    # gaps).  Unclassified slots get a {} placeholder so g++ accepts
+    # the array init.  enum_constants excludes INVALID; the leading
+    # placeholder makes slot 0 explicit so g++ sees the table fully
+    # initialised. */
+    lines.append(format_empty_entry(info.prefix + "INVALID"))
     for const_name in constants:
         new = classify(info, const_name)
         old = existing.get(const_name)
         if new.op == "GEN_OP_UNKNOWN" and old is None:
+            lines.append(format_empty_entry(const_name))
             continue
         if new.op == "GEN_OP_UNKNOWN" and old is not None:
             new = old.without_refine()
@@ -2684,10 +2734,17 @@ def generated_reg_body(info: IsaInfo, constants: list[str]) -> str:
     lines = [f"    /* Auto-generated by {Path(__file__).name}. */"]
     mapped = 0
     ignored = 0
+    # Dense positional list (no array designators) so g++ accepts
+    # the table when compiled as C++.  Unmapped/ignored slots emit
+    # a {} placeholder to keep the list aligned with the enum.
+    # The leading INVALID slot lands at index 0 explicitly since
+    # enum_reg_constants excludes it (its classifier path recurses).
+    lines.append(format_empty_reg_entry(info.reg_prefix + "INVALID"))
     for const_name in constants:
         entry = classify_reg(info, const_name)
         if entry.ignored:
             ignored += 1
+            lines.append(format_empty_reg_entry(const_name))
             continue
         mapped += 1
         comment = const_name.removeprefix(info.reg_prefix).lower()

@@ -118,6 +118,19 @@ typedef struct {
 #define MAX_STORES   64
 #define MAX_LOADS    64
 
+/*
+ * Lane-mask dispatch kinds.  Stored in InsnFields.lane_mask_kind so
+ * the exec-time FID extractor (champsim_tracer_output.cc) can compute
+ * the current lane bitmap with no ISA branching in the hot path —
+ * just a small switch.  ISA-specific selection lives in the refiner.
+ */
+enum LaneMaskKind {
+    LANE_MASK_KIND_NONE        = 0,
+    LANE_MASK_KIND_STATIC      = 1,
+    LANE_MASK_KIND_RISCV_VTYPE = 2,
+    /* future: LANE_MASK_KIND_X86_MASKED_K1, LANE_MASK_KIND_AARCH64_SVE_PRED */
+};
+
 typedef struct InsnFields {
     uint8_t opcode;                 /* GenericOpcode */
     uint8_t branch_type;            /* BranchType */
@@ -210,56 +223,58 @@ typedef struct InsnFields {
     uint64_t load_addr_dep_mask[MAX_LOADS];
     uint64_t store_addr_dep_mask[MAX_STORES];
     /*
-     * Intra-register lane participation (CST_INSN_FLAG_VEC sub-block).
-     * Per-slot bitmaps describing *which lanes* of each vector reg
-     * participate in this insn.  Bit k of src_lane_mask[i] is set iff
-     * lane k of src_regs[i] is consumed; bit k of dst_lane_mask[d] is
-     * set iff lane k of dst_regs[d] is produced.
+     * Lane participation (CST_INSN_FLAG_VEC).  Unified runtime path:
+     * the refiner picks a lane_mask_kind and stashes any data it
+     * needs (baseline AND mask, optional source reg).  The exec-time
+     * FID extractor dispatches on lane_mask_kind to compute the
+     * current lane bitmap, then replicates the same value across
+     * every (src/dst/load_data/store_data) lane-mask FID slot for
+     * this insn.
      *
-     * Set by the row's `.dep_refine` callback when the insn is a
-     * vector op (alongside the dst_dep_mask / store_data_dep_mask the
-     * same refiner sets).  Refiners that leave these zero implicitly
-     * tell the wire encoder "no lane info to emit" — has_vec_lanes is
-     * the gate.
-     *
-     * Consumer interpretation depends on CST_INSN_FLAG_LANE_PARALLEL:
-     *   - LANE_PARALLEL set: bit k of dst_lane_mask[d] depends *only*
-     *     on bit k of every src in dst's dep mask.  Independent per-
-     *     lane chains; consumer can model lane-grain rename / OoO.
-     *   - LANE_PARALLEL clear: lanes participate but don't line up by
-     *     index (shuffles, broadcasts, horizontal reductions).
-     *     Consumer must fall back to per-slot all-to-all *across*
-     *     lanes within the mask.
+     * Treating lane mask as runtime-evaluated for ALL ISAs is the
+     * point — for static-mask ISAs (x86 / aarch64 NEON / MIPS MSA)
+     * the dispatch returns the same value every call, so the field-
+     * delta stream emits one record per (template, insn-pos, slot)
+     * at first observation and zero bytes thereafter.  For dynamic
+     * ISAs (RISC-V V SEW changes, x86 EVEX masked variants, AArch64
+     * SVE predicates) the dispatch reads the runtime CSR / mask reg
+     * each call and the stream emits deltas as the value moves.
      *
      * Mask width is uint64_t — enough for AVX-512 ZMM at 8-bit lane
      * granularity (64 lanes).  On the wire each mask ULEB-encodes,
-     * so common 4/8/16-lane cases stay 1 byte.
+     * so common 4/8/16-lane cases stay one byte per slot.
+     *
+     * lane_parallel mirrors CST_INSN_FLAG_LANE_PARALLEL on the wire:
+     *   - set: bit k of dst lanes depends only on bit k of src lanes.
+     *   - clear: lanes touch but cross-couple (shuffles / broadcasts
+     *     / horizontal reductions).
+     *
+     * lane_mask_kind values:
+     *   LANE_MASK_KIND_NONE        — non-vec insn (has_vec_lanes off).
+     *   LANE_MASK_KIND_STATIC      — return lane_mask_base unchanged.
+     *                                Used by x86 / aarch64 NEON / MIPS
+     *                                MSA where Capstone surfaces the
+     *                                static lane count.
+     *   LANE_MASK_KIND_RISCV_VTYPE — read RISC-V vtype CSR, compute
+     *                                (1 << VL_FIELD) - 1.  Covers
+     *                                both vsetvli (immediate) and
+     *                                vsetvl (register) since the CSR
+     *                                read is at exec time.
+     *   (room for LANE_MASK_KIND_X86_MASKED_K1 and
+     *    LANE_MASK_KIND_AARCH64_SVE_PRED in future commits.)
      */
-    bool     has_vec_lanes;
-    uint64_t src_lane_mask[MAX_SRC_REGS];
-    uint64_t dst_lane_mask[MAX_DST_REGS];
-    /*
-     * Per-memop lane participation — which lanes of the consuming /
-     * producing reg this memop feeds / drains.  Consumers combine
-     * dst_lane_mask[d] ∩ load_data_lane_mask[k] to know which lanes
-     * of dst[d] depend on memop[k]; this is the case that makes
-     * gather/scatter and partial-fill ops (VMOVHPD / VPINSRB) work
-     * without a per-(memop, dst-reg) 2D mask.  For most vector
-     * load/store insns the refiner just mirrors src/dst masks here
-     * (one memop fills all the lanes).
-     */
-    uint64_t load_data_lane_mask[MAX_LOADS];
-    uint64_t store_data_lane_mask[MAX_STORES];
-    /*
-     * Set on lane-parallel arith (VADDPS, VPADDD, VMULPS, VANDPS,
-     * VFMA family etc.) to flip CST_INSN_FLAG_LANE_PARALLEL on the
-     * wire.  Implies has_vec_lanes; refiners that set this must also
-     * populate the lane masks.  Cleared on cross-lane ops (VPSHUFB,
-     * VBROADCAST, VPERMD, VHADDPS) where the masks still describe
-     * which lanes are touched but consumers can't assume per-lane
-     * independence.
-     */
-    bool     lane_parallel;
+    bool                  has_vec_lanes;
+    bool                  lane_parallel;
+    uint8_t               lane_mask_kind; /* LaneMaskKind */
+    /* Refiner-set baseline AND mask.  STATIC dispatch returns this
+     * directly; dynamic dispatches AND it with the read register
+     * value (e.g. predicate AND lane-count mask). */
+    uint64_t              lane_mask_base;
+    /* Capstone-side (feature, name) for the register the dynamic
+     * dispatch should read at exec time — vtype CSR on RISC-V V,
+     * k1 on x86 EVEX masked, predicate reg on AArch64 SVE.  Empty
+     * key on STATIC rows. */
+    QemuRegKey            lane_mask_source_reg;
     /*
      * x86 REP / REPNZ string-op metadata.  Non-zero on insns whose
      * Capstone detail carried info->has_rep; both fields capture the
@@ -335,6 +350,18 @@ void dep_x86_stack_push(const struct qemu_plugin_insn_info *info,
                         InsnFields *fields);
 void dep_x86_stack_pop(const struct qemu_plugin_insn_info *info,
                        InsnFields *fields);
+void dep_vec_lane_parallel(const struct qemu_plugin_insn_info *info,
+                           InsnFields *fields);
+void dep_vec_lane_cross(const struct qemu_plugin_insn_info *info,
+                        InsnFields *fields);
+/* RISC-V V variants — same shape as dep_vec_lane_{parallel,cross}
+ * but pick LANE_MASK_KIND_RISCV_VTYPE so the exec-time dispatch
+ * reads vl at runtime.  Referenced only from the RISC-V mnemonic
+ * table — generic library code stays ISA-agnostic. */
+void dep_riscv_v_lane_parallel(const struct qemu_plugin_insn_info *info,
+                               InsnFields *fields);
+void dep_riscv_v_lane_cross(const struct qemu_plugin_insn_info *info,
+                            InsnFields *fields);
 
 /*
  * Instruction classification entry: maps a Capstone insn_id directly
@@ -363,7 +390,11 @@ typedef struct {
 #include "champsim_tracer_mnemonics_riscv.h"
 #include "champsim_tracer_mnemonics_mips.h"
 
-/* Classification table selectors (indexed by TraceISA) */
+/* Classification table selectors (indexed by TraceISA).  Explicit
+ * `extern` so the const namespace-scope arrays get external linkage
+ * under C++ (default would be internal).  The matching declarations
+ * in the consumer #else branch use the same `extern`. */
+extern const RegClassification *const isa_reg_class[];
 const RegClassification *const isa_reg_class[] = {
     [TRACE_ISA_UNKNOWN] = NULL,
     [TRACE_ISA_X86]     = x86_reg_class,
@@ -372,6 +403,7 @@ const RegClassification *const isa_reg_class[] = {
     [TRACE_ISA_MIPS]    = mips_reg_class,
 };
 
+extern const unsigned isa_reg_class_size[];
 const unsigned isa_reg_class_size[] = {
     [TRACE_ISA_UNKNOWN] = 0,
     [TRACE_ISA_X86]     = X86_REG_ENDING,
@@ -380,7 +412,7 @@ const unsigned isa_reg_class_size[] = {
     [TRACE_ISA_MIPS]    = MIPS_REG_ENDING,
 };
 
-/* Classification table selector (indexed by TraceISA) */
+extern const InsnClassification *const isa_insn_class[];
 const InsnClassification *const isa_insn_class[] = {
     [TRACE_ISA_UNKNOWN] = NULL,
     [TRACE_ISA_X86]     = x86_insn_class,
@@ -389,6 +421,7 @@ const InsnClassification *const isa_insn_class[] = {
     [TRACE_ISA_MIPS]    = mips_insn_class,
 };
 
+extern const unsigned isa_insn_class_size[];
 const unsigned isa_insn_class_size[] = {
     [TRACE_ISA_UNKNOWN] = 0,
     [TRACE_ISA_X86]     = X86_INS_ENDING,
@@ -399,18 +432,10 @@ const unsigned isa_insn_class_size[] = {
 
 #else /* CHAMPSIM_MNEMONIC_TABLES_IMPL */
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 extern const RegClassification *const isa_reg_class[TRACE_ISA_MIPS + 1];
 extern const unsigned isa_reg_class_size[TRACE_ISA_MIPS + 1];
 extern const InsnClassification *const isa_insn_class[TRACE_ISA_MIPS + 1];
 extern const unsigned isa_insn_class_size[TRACE_ISA_MIPS + 1];
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* CHAMPSIM_MNEMONIC_TABLES_IMPL */
 
@@ -489,6 +514,7 @@ static const char *const isa_prefixes_riscv[]   = { "riscv64", "riscv32", NULL }
 static const char *const isa_prefixes_mips[]    = { "mips64el", "mips64",
                                                     "mipsel", "mips", NULL };
 
+extern const IsaProperties isa_properties[];
 const IsaProperties isa_properties[] = {
     [TRACE_ISA_UNKNOWN] = { 0 },
     [TRACE_ISA_X86]     = {
@@ -523,15 +549,7 @@ const IsaProperties isa_properties[] = {
 
 #else /* CHAMPSIM_MNEMONIC_TABLES_IMPL */
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 extern const IsaProperties isa_properties[TRACE_ISA_MIPS + 1];
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* CHAMPSIM_MNEMONIC_TABLES_IMPL */
 

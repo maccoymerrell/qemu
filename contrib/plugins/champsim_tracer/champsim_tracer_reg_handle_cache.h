@@ -90,4 +90,12 @@ private:
 
 extern RegHandleCache g_reg_handle_cache;
 
+/* Read the low 8 bytes of the named register on @cpu_index, host-
+ * endian.  Returns true and writes *out on success; false on lookup
+ * or read failure.  Used by the lane_mask runtime dispatch in
+ * champsim_tracer_output.cc to read CSRs like RISC-V vtype.VL or
+ * x86 EVEX k-registers at field-delta emit time. */
+bool cst_reg_read_u64(unsigned cpu_index, const QemuRegKey *key,
+                      uint64_t *out);
+
 #endif /* CHAMPSIM_TRACER_REG_HANDLE_CACHE_H */

@@ -15,6 +15,7 @@
 
 #include "champsim_tracer.h"
 #include "champsim_tracer_bb_template_cache.h"
+#include "champsim_tracer_reg_handle_cache.h"
 #include "champsim_tracer_stats.h"
 #include "champsim_tracer_writer.h"
 
@@ -1070,6 +1071,10 @@ struct EntryView {
     const uint32_t *insn_rs_off;
     const DynParam **load_slots;
     const DynParam **store_slots;
+    /* vCPU the entry executed on.  Used by lane-mask extractors when
+     * the InsnFields lane_mask_kind is dynamic (reads a runtime CSR
+     * via cst_reg_read_u64). */
+    unsigned int cpu_index;
 };
 
 typedef struct EntryView EntryView;
@@ -1610,17 +1615,46 @@ static uint8_t cap_store_data_lane_masks(const EntryView *ev, uint32_t i)
     return f->max_dep_stores;
 }
 
-/* Extractors return the refiner-set baseline today.  When the runtime
- * mask-register read lands (future commit), unmasked ops still return
- * the baseline (no emit); masked variants return the read-back live
- * mask, producing a delta record. */
+/*
+ * Lane-mask dispatch: compute the current per-insn lane bitmap from
+ * the refiner-picked lane_mask_kind.  Result is replicated across
+ * every (src/dst/load_data/store_data) lane-mask FID slot for this
+ * insn — there is no per-slot variation in this iteration.  Future
+ * extension (gather/scatter, masked variants with differing src vs
+ * dst masks) gets its own LaneMaskKind value and dispatch case.
+ */
+static uint64_t compute_current_lane_mask(const InsnFields *f,
+                                          unsigned cpu_index)
+{
+    if (!f) return 0;
+    switch ((enum LaneMaskKind)f->lane_mask_kind) {
+    case LANE_MASK_KIND_STATIC:
+        return f->lane_mask_base;
+    case LANE_MASK_KIND_RISCV_VTYPE: {
+        /* RISC-V V: vl CSR holds the active element count; lane mask
+         * is (1 << vl) - 1.  vl > 64 (long VLEN, narrow SEW) saturates
+         * the u64 — common workloads keep vl <= 64. */
+        uint64_t vl = 0;
+        if (!cst_reg_read_u64(cpu_index, &f->lane_mask_source_reg, &vl)) {
+            return 0;
+        }
+        if (vl == 0) return 0;
+        if (vl >= 64) return ~(uint64_t)0;
+        return ((uint64_t)1 << vl) - 1;
+    }
+    case LANE_MASK_KIND_NONE:
+    default:
+        return 0;
+    }
+}
+
 static bool extr_u64_src_lane_mask(const EntryView *ev, uint32_t i,
                                    uint8_t slot, uint64_t *out)
 {
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
     const InsnFields *f = &ev->tmpl->insn_fields[i];
     if (!f->has_vec_lanes || slot >= f->n_src_regs) return false;
-    *out = f->src_lane_mask[slot];
+    *out = compute_current_lane_mask(f, ev->cpu_index);
     return true;
 }
 static bool extr_u64_dst_lane_mask(const EntryView *ev, uint32_t i,
@@ -1629,7 +1663,7 @@ static bool extr_u64_dst_lane_mask(const EntryView *ev, uint32_t i,
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
     const InsnFields *f = &ev->tmpl->insn_fields[i];
     if (!f->has_vec_lanes || slot >= f->n_dst_regs) return false;
-    *out = f->dst_lane_mask[slot];
+    *out = compute_current_lane_mask(f, ev->cpu_index);
     return true;
 }
 static bool extr_u64_load_data_lane_mask(const EntryView *ev, uint32_t i,
@@ -1638,7 +1672,7 @@ static bool extr_u64_load_data_lane_mask(const EntryView *ev, uint32_t i,
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
     const InsnFields *f = &ev->tmpl->insn_fields[i];
     if (!f->has_vec_lanes || slot >= f->max_dep_loads) return false;
-    *out = f->load_data_lane_mask[slot];
+    *out = compute_current_lane_mask(f, ev->cpu_index);
     return true;
 }
 static bool extr_u64_store_data_lane_mask(const EntryView *ev, uint32_t i,
@@ -1647,7 +1681,7 @@ static bool extr_u64_store_data_lane_mask(const EntryView *ev, uint32_t i,
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
     const InsnFields *f = &ev->tmpl->insn_fields[i];
     if (!f->has_vec_lanes || slot >= f->max_dep_stores) return false;
-    *out = f->store_data_lane_mask[slot];
+    *out = compute_current_lane_mask(f, ev->cpu_index);
     return true;
 }
 
@@ -2407,17 +2441,20 @@ static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
                                         const BBTemplate *tmpl,
                                         const std::vector<DynParam> *dyn_params,
                                         const std::vector<RegSnap> *reg_snaps,
-                                        bool is_wp);
+                                        bool is_wp,
+                                        unsigned int cpu_index);
 
 static void emit_one_bb_delta(BitWriter *bw, BodyStreamState *st,
                               FieldStateTable *state, uint32_t template_id,
                               const BBTemplate *tmpl,
                               const std::vector<DynParam> *dyn_params,
                               const std::vector<RegSnap> *reg_snaps,
-                              bool is_wp)
+                              bool is_wp,
+                              unsigned int cpu_index)
 {
     emit_one_bb_delta_with_base(bw, st, state, nullptr, template_id,
-                                tmpl, dyn_params, reg_snaps, is_wp);
+                                tmpl, dyn_params, reg_snaps, is_wp,
+                                cpu_index);
 }
 
 static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
@@ -2427,7 +2464,8 @@ static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
                                         const BBTemplate *tmpl,
                                         const std::vector<DynParam> *dyn_params,
                                         const std::vector<RegSnap> *reg_snaps,
-                                        bool is_wp)
+                                        bool is_wp,
+                                        unsigned int cpu_index)
 {
     EntryView ev;
     uint32_t n = tmpl ? tmpl->n_insns : 0;
@@ -2440,6 +2478,7 @@ static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
                      scratch->insn_rs_off,
                      scratch->load_slots,
                      scratch->store_slots);
+    ev.cpu_index = cpu_index;
     emit_field_delta_section(bw, st, state, base_state, template_id,
                              &ev, is_wp, st->header_flags);
 }
@@ -2467,7 +2506,8 @@ static void emit_body_record_payload(
     FieldStateTable *wp_base)
 {
     emit_one_bb_delta(bw, st, cp_state, entry->template_id, entry->tmpl,
-                      &entry->dyn_params, &entry->reg_snaps, false);
+                      &entry->dyn_params, &entry->reg_snaps, false,
+                      entry->cpu_index);
 
     /* WP chain sub-section */
     {
@@ -2483,7 +2523,7 @@ static void emit_body_record_payload(
             emit_one_bb_delta_with_base(&sub, st, wp_state, wp_base,
                                         wp_tmpl, wp->tmpl,
                                         &wp->dyn_params, &wp->reg_snaps,
-                                        true);
+                                        true, entry->cpu_index);
         }
         bw_byte_align(&sub);
         bw_write_section(bw, bw_finish_buf(&sub));

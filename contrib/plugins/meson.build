@@ -45,7 +45,7 @@ if get_option('plugins')
       'champsim_tracer/champsim_tracer_mem_access_recorder.cc',
       'champsim_tracer/champsim_tracer_wp_thread_state.cc',
       'champsim_tracer/champsim_tracer_plugin_config.cc',
-      'champsim_tracer/champsim_tracer_mnemonic_tables.c',
+      'champsim_tracer/champsim_tracer_mnemonic_tables.cc',
     )
   champsim_tracer_cpp_args = ['-std=gnu++17',
                               '-Wno-missing-field-initializers',
@@ -53,7 +53,7 @@ if get_option('plugins')
   if host_os == 'windows'
     t += shared_module('champsim_tracer',
                        champsim_tracer_sources + files('win32_linker.c'),
-                       include_directories: '../../include/qemu',
+                       include_directories: ['../../include/qemu', '../../include'],
                        cpp_args: champsim_tracer_cpp_args,
                        link_depends: [win32_qemu_plugin_api_lib],
                        link_args: win32_qemu_plugin_api_link_flags,
@@ -61,7 +61,7 @@ if get_option('plugins')
   else
     t += shared_module('champsim_tracer',
                        champsim_tracer_sources,
-                       include_directories: '../../include/qemu',
+                       include_directories: ['../../include/qemu', '../../include'],
                        cpp_args: champsim_tracer_cpp_args,
                        dependencies: [glib, capstone])
   endif

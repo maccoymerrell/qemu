@@ -159,3 +159,23 @@ struct qemu_plugin_register *RegHandleCache::lookup(unsigned int cpu_index,
     e->handle = handle;
     return handle;
 }
+
+bool cst_reg_read_u64(unsigned cpu_index, const QemuRegKey *key, uint64_t *out)
+{
+    if (!key || !out || !key->feature || !key->name) return false;
+    struct qemu_plugin_register *handle =
+        g_reg_handle_cache.lookup(cpu_index, key);
+    if (!handle) return false;
+    GByteArray *buf = g_byte_array_new();
+    int n = qemu_plugin_read_register(handle, buf);
+    bool ok = false;
+    if (n > 0) {
+        uint64_t v = 0;
+        size_t take = (size_t)n < sizeof(v) ? (size_t)n : sizeof(v);
+        memcpy(&v, buf->data, take);
+        *out = v;
+        ok = true;
+    }
+    g_byte_array_unref(buf);
+    return ok;
+}

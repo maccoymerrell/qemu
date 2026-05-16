@@ -247,6 +247,45 @@ static inline void add_dst_cap_reg(InsnFields *f, InsnRegNames *refs,
     }
 }
 
+/* OR @lane into every src_regs[] slot the Capstone reg @cap_id maps
+ * to.  Used by the per-operand vector lane-mask assignment so a
+ * scalar (non-vec) operand never gets a lane mask (its slots stay
+ * 0) — only the vec-register operands the caller iterates. */
+static void assign_src_lane(InsnFields *f, uint16_t cap_id, uint64_t lane)
+{
+    const RegClassification *rc = lookup_reg_class(cap_id);
+    if (!rc) return;
+    auto apply = [&](uint8_t gen) {
+        for (uint8_t i = 0; i < f->n_src_regs; i++) {
+            if (f->src_regs[i] == gen) f->src_lane_mask[i] |= lane;
+        }
+    };
+    if (rc->n_regs) {
+        for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
+            apply(rc->regs[i]);
+        }
+    } else {
+        apply(rc->reg_id);
+    }
+}
+static void assign_dst_lane(InsnFields *f, uint16_t cap_id, uint64_t lane)
+{
+    const RegClassification *rc = lookup_reg_class(cap_id);
+    if (!rc) return;
+    auto apply = [&](uint8_t gen) {
+        for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+            if (f->dst_regs[d] == gen) f->dst_lane_mask[d] |= lane;
+        }
+    };
+    if (rc->n_regs) {
+        for (uint8_t i = 0; i < rc->n_regs && i < MAX_REG_ALIASES; i++) {
+            apply(rc->regs[i]);
+        }
+    } else {
+        apply(rc->reg_id);
+    }
+}
+
 static void warn_unknown_instruction(uint64_t pc, const char *reason,
                                      const char *mnem, const char *disas)
 {
@@ -531,27 +570,53 @@ void decode_detail_to_generic(uint64_t pc,
      * dep refiners stay focused on dst→src dataflow.
      */
     if (cls && cls->lane_mask_kind != LANE_MASK_KIND_NONE) {
-        out->lane_mask_kind = cls->lane_mask_kind;
-        out->lane_parallel  = cls->lane_parallel;
-        switch (cls->lane_mask_kind) {
-        case LANE_MASK_KIND_STATIC:
-            out->lane_mask_base = lane_baseline_from_operands(info);
-            /* If Capstone didn't surface usable lane info for this
-             * variant, leave has_vec_lanes false — consumer falls
-             * back to all-to-all over the masked set.  The audit
-             * script is responsible for only tagging rows whose
-             * Capstone shape gives a derivable baseline. */
-            if (out->lane_mask_base) {
+        /* Instruction-level shape (slot-agnostic); we own the
+         * operand->slot mapping so we apply it per vec-reg operand. */
+        LaneShape sh = lane_shape_from_operands(info, cls->lane_mask_kind);
+        if (sh.kind != LANE_SHAPE_NONE) {
+            out->lane_mask_kind = cls->lane_mask_kind;
+            out->lane_parallel  = cls->lane_parallel;
+            out->lane_bytes     = sh.lane_bytes;
+            /* The kind decides ONLY where the active-lane value is
+             * read from; register-sourced kinds record their reg. */
+            if (cls->lane_mask_kind == LANE_MASK_KIND_RISCV_VTYPE) {
+                out->lane_mask_source_reg.feature = "org.gnu.gdb.riscv.csr";
+                out->lane_mask_source_reg.name    = "vl";
+            }
+            uint64_t sel = (sh.lane_sel >= 0 && sh.lane_sel < 64)
+                               ? ((uint64_t)1 << sh.lane_sel) : 0;
+            for (uint8_t k = 0; k < info->n_operands; k++) {
+                const qemu_plugin_operand *op = &info->operands[k];
+                if (op->type != QEMU_PLUGIN_OP_REG) continue;
+                /* Scalar (address / GPR) operands carry no lanes —
+                 * leave their slots at 0; only vec regs participate. */
+                if (op->lane_bytes == 0) continue;
+                bool rd = (op->access & QEMU_PLUGIN_OP_ACC_READ)  != 0;
+                bool wr = (op->access & QEMU_PLUGIN_OP_ACC_WRITE) != 0;
+                if (!rd && !wr) { rd = wr = true; }  /* no flags: both */
+                uint64_t src_lane = 0, dst_lane = 0;
+                switch (sh.kind) {
+                case LANE_SHAPE_UNIFORM:
+                    src_lane = dst_lane = sh.full_mask;
+                    break;
+                case LANE_SHAPE_INSERT:
+                    /* Only the inserted lane is produced; the same
+                     * reg read supplies the untouched pass-through
+                     * lanes (everything but the selected lane). */
+                    dst_lane = sel;
+                    src_lane = sh.full_mask & ~sel;
+                    break;
+                case LANE_SHAPE_EXTRACT:
+                    /* Only the selected lane is read; the extract
+                     * sink is a scalar (no vec dst). */
+                    src_lane = sel;
+                    dst_lane = sel;
+                    break;
+                }
+                if (rd) assign_src_lane(out, op->reg_id, src_lane);
+                if (wr) assign_dst_lane(out, op->reg_id, dst_lane);
                 out->has_vec_lanes = true;
             }
-            break;
-        case LANE_MASK_KIND_RISCV_VTYPE:
-            out->lane_mask_source_reg.feature = "org.gnu.gdb.riscv.csr";
-            out->lane_mask_source_reg.name    = "vl";
-            out->has_vec_lanes = true;
-            break;
-        default:
-            break;
         }
     }
 

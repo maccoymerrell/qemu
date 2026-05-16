@@ -170,6 +170,7 @@ _INSN_RE = re.compile(
     r" src=\[([^\]]*)\] dst=\[([^\]]*)\]"
     r"(?: imm=(-?\d+))?"
     r"( atomic)?"
+    r"( lane_parallel)?"
     r"(?: bytes=([0-9a-f]*))?$"
 )
 _ENTRY_HEAD_RE = re.compile(
@@ -189,6 +190,14 @@ _REG_RE = re.compile(
 )
 _MFLAGS_RE = re.compile(
     r"^( +)insn\[(\d+)\] 0x([0-9a-fA-F]+) \[([A-Z\-]+)\]$"
+)
+_LANE_RE = re.compile(
+    r"^( +)insn\[(\d+)\] (src|dst|load|store)\[(\d+)\] 0x([0-9a-fA-F]+)$"
+)
+# Per-insn dep-mask continuation line under each template insn entry.
+# Each "dst=" / "sd=" / "la=" / "sa=" group is independently optional.
+_DEP_FAMILY_RE = re.compile(
+    r"\b(dst|sd|la|sa)=((?:0x[0-9a-fA-F]+(?:,0x[0-9a-fA-F]+)*))"
 )
 
 
@@ -333,12 +342,36 @@ def _parse_templates(lines: list[str], i: int,
                              for r in mm.group(7).split(",") if r],
                 "imm": int(mm.group(8)) if mm.group(8) is not None else None,
                 "is_atomic": mm.group(9) is not None,
+                "lane_parallel": mm.group(10) is not None,
                 "n_loads": 0,
                 "n_stores": 0,
-                "raw_bytes": bytes.fromhex(mm.group(10) or ""),
+                "raw_bytes": bytes.fromhex(mm.group(11) or ""),
+                "dst_dep_mask": [],
+                "store_data_dep_mask": [],
+                "load_addr_dep_mask": [],
+                "store_addr_dep_mask": [],
             }
             insns.append(insn)
             i += 1
+            # Optional dep-mask continuation line.  Lives at the
+            # next index; only consume it when the prefix matches.
+            # n_loads / n_stores aren't carried on the legacy
+            # template line — derive them from the address-mask
+            # vector lengths (load_addr_dep_mask sized by
+            # max_dep_loads, store_*_dep_mask by max_dep_stores).
+            if (i < len(lines)
+                    and lines[i].lstrip().startswith("deps:")):
+                body = lines[i].split("deps:", 1)[1]
+                fams = {"dst": "dst_dep_mask",
+                        "sd":  "store_data_dep_mask",
+                        "la":  "load_addr_dep_mask",
+                        "sa":  "store_addr_dep_mask"}
+                for key, vals in _DEP_FAMILY_RE.findall(body):
+                    insn[fams[key]] = [int(v, 16) for v in vals.split(",")]
+                insn["n_loads"]  = len(insn["load_addr_dep_mask"])
+                insn["n_stores"] = max(len(insn["store_addr_dep_mask"]),
+                                       len(insn["store_data_dep_mask"]))
+                i += 1
         templates.append({
             "template_id": tid,
             "start_pc": start_pc,
@@ -353,22 +386,24 @@ def _parse_templates(lines: list[str], i: int,
 def _parse_observations(lines: list[str], i: int,
                         reg_name_to_id: dict[str, int]
                         ) -> tuple[list[DynParam], list[dict],
-                                   list[dict], int]:
+                                   list[dict], list[dict], int]:
     """Parse a CP or WP `cp:` / sub-block observation block.
 
-    Returns (dyn_params, reg_snaps, metaflags, next_i).  `metaflags`
-    is a list of {insn_index, byte, bits} dicts surfaced from the
-    legacy decoder's `metaflags:` section (FID_METAFLAGS side-channel).
+    Returns (dyn_params, reg_snaps, metaflags, lane_masks, next_i).
+    `lane_masks` is a list of
+    ``{insn_index, family, slot_index, mask}`` dicts surfaced from
+    the legacy decoder's `lanes:` section (per-execution lane FIDs).
     """
     dyn: list[DynParam] = []
     snaps: list[dict] = []
     mflags: list[dict] = []
+    lanes: list[dict] = []
     if i >= len(lines):
-        return dyn, snaps, mflags, i
+        return dyn, snaps, mflags, lanes, i
     # `unchanged` sentinel: caller already consumed the prefix line.
     line = lines[i].strip()
     if line == "unchanged":
-        return dyn, snaps, mflags, i + 1
+        return dyn, snaps, mflags, lanes, i + 1
     while i < len(lines):
         line = lines[i]
         if line == "memops:":
@@ -414,8 +449,22 @@ def _parse_observations(lines: list[str], i: int,
                 })
                 i += 1
             continue
+        if line == "lanes:":
+            i += 1
+            while i < len(lines):
+                ml = _LANE_RE.match(lines[i])
+                if not ml:
+                    break
+                lanes.append({
+                    "insn_index": int(ml.group(2)),
+                    "family":     ml.group(3),
+                    "slot_index": int(ml.group(4)),
+                    "mask":       int(ml.group(5), 16),
+                })
+                i += 1
+            continue
         break
-    return dyn, snaps, mflags, i
+    return dyn, snaps, mflags, lanes, i
 
 
 def _iter_body(lines: list[str], i: int,
@@ -445,6 +494,7 @@ def _iter_body(lines: list[str], i: int,
         cp_dyn: list[DynParam] = []
         cp_snaps: list[dict] = []
         cp_mflags: list[dict] = []
+        cp_lanes: list[dict] = []
         wp_entries: list[dict] = []
         if i < len(lines) and lines[i] == "  cp:":
             i += 1
@@ -455,7 +505,7 @@ def _iter_body(lines: list[str], i: int,
                 obs_lines.append(lines[i][4:])
                 i += 1
             j = 0
-            cp_dyn, cp_snaps, cp_mflags, _ = _parse_observations(
+            cp_dyn, cp_snaps, cp_mflags, cp_lanes, _ = _parse_observations(
                 obs_lines, j, reg_name_to_id)
         while i < len(lines):
             mw = _WP_HEAD_RE.match(lines[i])
@@ -469,6 +519,7 @@ def _iter_body(lines: list[str], i: int,
                 "dyn_params": [],
                 "reg_snaps": [],
                 "metaflags": [],
+                "lane_masks": [],
                 "fault": False,
                 "translation_unavailable": False,
                 "fault_insn_index": None,
@@ -490,7 +541,7 @@ def _iter_body(lines: list[str], i: int,
                 i += 1
             j = 0
             (wp["dyn_params"], wp["reg_snaps"],
-             wp["metaflags"], _) = _parse_observations(
+             wp["metaflags"], wp["lane_masks"], _) = _parse_observations(
                 obs_lines, j, reg_name_to_id)
             wp_entries.append(wp)
         yield {
@@ -501,6 +552,7 @@ def _iter_body(lines: list[str], i: int,
             "dyn_params": cp_dyn,
             "reg_snaps": cp_snaps,
             "metaflags": cp_mflags,
+            "lane_masks": cp_lanes,
             "wp_entries": wp_entries,
         }
 

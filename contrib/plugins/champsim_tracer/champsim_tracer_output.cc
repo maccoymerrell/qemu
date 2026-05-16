@@ -611,6 +611,12 @@ static void write_bin_templates(BitWriter *bw)
             if (fld->is_atomic) {
                 flags |= CST_INSN_FLAG_ATOMIC;
             }
+            if (fld->has_vec_lanes) {
+                flags |= CST_INSN_FLAG_VEC;
+            }
+            if (fld->lane_parallel) {
+                flags |= CST_INSN_FLAG_LANE_PARALLEL;
+            }
             if (fld->has_reg_deps || fld->has_addr_deps) {
                 flags |= CST_INSN_FLAG_HAS_DEP_BLOCK;
             }
@@ -1616,24 +1622,22 @@ static uint8_t cap_store_data_lane_masks(const EntryView *ev, uint32_t i)
 }
 
 /*
- * Lane-mask dispatch: compute the current per-insn lane bitmap from
- * the refiner-picked lane_mask_kind.  Result is replicated across
- * every (src/dst/load_data/store_data) lane-mask FID slot for this
- * insn — there is no per-slot variation in this iteration.  Future
- * extension (gather/scatter, masked variants with differing src vs
- * dst masks) gets its own LaneMaskKind value and dispatch case.
+ * Active-lane gate.  lane_mask_kind decides ONLY where the live-lane
+ * value comes from — nothing else:
+ *   STATIC      — the count is fixed by the instruction; the gate is
+ *                 all-ones and the per-operand structural reg masks
+ *                 are the final values.
+ *   RISCV_VTYPE — the count is read from the vl CSR at exec; gate is
+ *                 (1 << vl) - 1, AND-ed into every per-slot mask.
+ * (future EVEX-k / SVE-pred kinds: same shape, read their reg.)
  */
-static uint64_t compute_current_lane_mask(const InsnFields *f,
-                                          unsigned cpu_index)
+static uint64_t lane_active_gate(const InsnFields *f, unsigned cpu_index)
 {
     if (!f) return 0;
     switch ((enum LaneMaskKind)f->lane_mask_kind) {
     case LANE_MASK_KIND_STATIC:
-        return f->lane_mask_base;
+        return ~(uint64_t)0;
     case LANE_MASK_KIND_RISCV_VTYPE: {
-        /* RISC-V V: vl CSR holds the active element count; lane mask
-         * is (1 << vl) - 1.  vl > 64 (long VLEN, narrow SEW) saturates
-         * the u64 — common workloads keep vl <= 64. */
         uint64_t vl = 0;
         if (!cst_reg_read_u64(cpu_index, &f->lane_mask_source_reg, &vl)) {
             return 0;
@@ -1648,13 +1652,85 @@ static uint64_t compute_current_lane_mask(const InsnFields *f,
     }
 }
 
+/*
+ * Per-memop data lane mask.  Computed dynamically from the actual
+ * memop: which lanes of the associated vector register take their
+ * value from (load) / drain to (store) this specific access.  Uses
+ * the memop's byte range relative to the instruction's access base
+ * and the vector element width:
+ *
+ *   lane_start = (memop_vaddr - access_base) / lane_bytes
+ *   lane_count =  memop_size              / lane_bytes
+ *   mask       = ((1 << lane_count) - 1) << lane_start
+ *
+ * access_base is the lowest vaddr among this insn's memops of the
+ * same direction (lane 0 of a contiguous vector access).  When
+ * lane_bytes is 0 (RISC-V V — element width is the runtime SEW, not
+ * statically known) we fall back to one-lane-per-memop in slot order
+ * (slot k -> lane k), which the exec gate then narrows by vl.
+ *
+ * Exception: element insert/extract (PINSR*, PEXTR*, INSERTPS, etc.).
+ * Such ops move ONE element to/from memory and the target register
+ * lane is the instruction immediate, not the memop address (a
+ * register has no address; the lone memop IS the access base so the
+ * offset rule degenerates to lane 0).  Detected at emit from existing
+ * fields: exactly one same-direction memop, element-sized (data_size
+ * == lane_bytes), and the insn carries an immediate.  Then the lane
+ * is f->immediate.  No persisted state - the immediate is already in
+ * InsnFields from the operand walk.
+ */
+static uint64_t memop_data_lane_mask(const EntryView *ev, uint32_t i,
+                                     uint8_t slot, uint8_t want_type,
+                                     const InsnFields *f)
+{
+    const DynParam *dp = find_memop_slot(ev, i, slot, want_type);
+    if (!dp) return 0;
+
+    uint8_t lane_bytes = f->lane_bytes;
+    if (lane_bytes == 0) {
+        /* Runtime-SEW ISA: associate by memop order. */
+        return (slot < 64) ? ((uint64_t)1 << slot) : 0;
+    }
+
+    /* Element insert/extract: one element-sized memop whose target
+     * lane is the instruction immediate (PINSR, PEXTR, INSERTPS,
+     * etc.).  The immediate is already a valid in-range lane index
+     * for these ops, so the memop feeds/drains exactly that lane,
+     * matching the decode-time INSERT/EXTRACT reg-mask narrowing. */
+    if (f->has_immediate && dp->data_size == lane_bytes
+        && find_memop_slot(ev, i, 1, want_type) == nullptr) {
+        uint64_t lane = (uint64_t)f->immediate;
+        return (lane < 64) ? ((uint64_t)1 << lane) : 0;
+    }
+
+    /* access_base = min vaddr over this insn's same-direction memops. */
+    uint64_t base = dp->value;
+    for (uint8_t s = 0;; s++) {
+        const DynParam *o = find_memop_slot(ev, i, s, want_type);
+        if (!o) break;
+        if (o->value < base) base = o->value;
+    }
+
+    if (dp->value < base) return 0;            /* defensive */
+    uint64_t off   = dp->value - base;
+    uint64_t start = off / lane_bytes;
+    uint64_t size  = dp->data_size ? dp->data_size : lane_bytes;
+    uint64_t count = size / lane_bytes;
+    if (count == 0) count = 1;
+    if (start >= 64) return 0;
+    if (start + count > 64) count = 64 - start;
+    uint64_t span = (count >= 64) ? ~(uint64_t)0
+                                  : (((uint64_t)1 << count) - 1);
+    return span << start;
+}
+
 static bool extr_u64_src_lane_mask(const EntryView *ev, uint32_t i,
                                    uint8_t slot, uint64_t *out)
 {
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
     const InsnFields *f = &ev->tmpl->insn_fields[i];
     if (!f->has_vec_lanes || slot >= f->n_src_regs) return false;
-    *out = compute_current_lane_mask(f, ev->cpu_index);
+    *out = f->src_lane_mask[slot] & lane_active_gate(f, ev->cpu_index);
     return true;
 }
 static bool extr_u64_dst_lane_mask(const EntryView *ev, uint32_t i,
@@ -1663,7 +1739,7 @@ static bool extr_u64_dst_lane_mask(const EntryView *ev, uint32_t i,
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
     const InsnFields *f = &ev->tmpl->insn_fields[i];
     if (!f->has_vec_lanes || slot >= f->n_dst_regs) return false;
-    *out = compute_current_lane_mask(f, ev->cpu_index);
+    *out = f->dst_lane_mask[slot] & lane_active_gate(f, ev->cpu_index);
     return true;
 }
 static bool extr_u64_load_data_lane_mask(const EntryView *ev, uint32_t i,
@@ -1672,7 +1748,8 @@ static bool extr_u64_load_data_lane_mask(const EntryView *ev, uint32_t i,
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
     const InsnFields *f = &ev->tmpl->insn_fields[i];
     if (!f->has_vec_lanes || slot >= f->max_dep_loads) return false;
-    *out = compute_current_lane_mask(f, ev->cpu_index);
+    *out = memop_data_lane_mask(ev, i, slot, DYN_LOAD_ADDR, f)
+           & lane_active_gate(f, ev->cpu_index);
     return true;
 }
 static bool extr_u64_store_data_lane_mask(const EntryView *ev, uint32_t i,
@@ -1681,7 +1758,8 @@ static bool extr_u64_store_data_lane_mask(const EntryView *ev, uint32_t i,
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
     const InsnFields *f = &ev->tmpl->insn_fields[i];
     if (!f->has_vec_lanes || slot >= f->max_dep_stores) return false;
-    *out = compute_current_lane_mask(f, ev->cpu_index);
+    *out = memop_data_lane_mask(ev, i, slot, DYN_STORE_ADDR, f)
+           & lane_active_gate(f, ev->cpu_index);
     return true;
 }
 

@@ -58,6 +58,13 @@ class BlockPlan:
     # declared sets don't match what Capstone says about the asm we
     # actually wrote indicates a bug (typo, unintended encoding, etc.).
     expected_reg_sets: list[dict] = dataclasses.field(default_factory=list)
+    # Author-declared dep-refiner bucket names exercised by this block
+    # (e.g. "DEP_LEA", "DEP_PASSTHROUGH", "DEP_X86_STACK_PUSH").  The
+    # validator's _check_dep_refine_coverage uses this to flag probes
+    # whose stated dep-bucket coverage never actually shows up in the
+    # trace (typo in spec, classifier change, or instruction selection
+    # bug).  Names come from validator.py's _DEP_REFINE_BUCKETS tuple.
+    asserted_dep_refines: list[str] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -1522,6 +1529,7 @@ def _register_probe(name: str, per_isa: dict[str, dict]) -> None:
             asserted_branch_types=list(spec.get("branch_types", [])),
             reg_value_assertions=list(spec.get("reg_value_assertions", [])),
             expected_reg_sets=list(spec.get("reg_sets", [])),
+            asserted_dep_refines=list(spec.get("dep_refines", [])),
         )
 
     @classmethod

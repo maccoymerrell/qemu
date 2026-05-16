@@ -249,12 +249,25 @@ struct MetaFlagsEntry {
     uint8_t  byte       = 0;
 };
 
+/* Per-(insn, slot) lane-mask record materialised from the dynamic
+ * CST_FID_*_LANE_MASK FID cells.  Family identifies which operand
+ * family the slot indexes into, and the mask carries the lane bits
+ * the slot participated in for this instance (bit k = lane k). */
+struct LaneMaskEntry {
+    enum Family : uint8_t { Src = 0, Dst = 1, LoadData = 2, StoreData = 3 };
+    uint32_t insn_index  = 0;
+    Family   family      = Src;
+    uint8_t  slot_index  = 0;
+    uint64_t mask        = 0;
+};
+
 struct WPEntry {
     uint32_t                    index = 0;
     uint32_t                    template_id = 0;
     std::vector<DynParam>       dyn_params;
     std::vector<RegSnap>        reg_snaps;
     std::vector<MetaFlagsEntry> metaflags;
+    std::vector<LaneMaskEntry>  lane_masks;
     bool                        fault = false;
     bool                        translation_unavailable = false;
     /* Only meaningful when fault. */
@@ -271,6 +284,7 @@ struct DecodedEntry {
     std::vector<DynParam>       dyn_params;
     std::vector<RegSnap>        reg_snaps;
     std::vector<MetaFlagsEntry> metaflags;
+    std::vector<LaneMaskEntry>  lane_masks;
     std::vector<WPEntry>        wp_entries;
 };
 
@@ -330,11 +344,21 @@ struct Instruction {
     std::vector<uint64_t> load_addr_dep_mask;
     std::vector<uint64_t> store_addr_dep_mask;
 
-    /* Per-slot lane participation (CST_INSN_FLAG_VEC sub-block).
-     * Empty on scalar / non-vec insns or on traces predating VEC. */
+    /* Per-slot lane participation, read from the dynamic lane-mask FID
+     * cells (CST_FID_SRC_LANE_MASK / DST_LANE_MASK / LOAD_DATA_LANE_MASK
+     * / STORE_DATA_LANE_MASK).  Bit k of mask[i] is set iff lane k of
+     * slot i participates in this instance.  Empty / all-zero on scalar
+     * instances and on traces predating the lane-mask FID block.
+     *
+     * lane_parallel mirrors CST_INSN_FLAG_LANE_PARALLEL (template-static):
+     * when set, lane k of each dst depends only on lane k of every src;
+     * when clear, lanes participate but don't line up by index (shuffles,
+     * broadcasts, horizontal reductions). */
     bool                  lane_parallel       = false;
     std::vector<uint64_t> src_lane_mask;
     std::vector<uint64_t> dst_lane_mask;
+    std::vector<uint64_t> load_data_lane_mask;
+    std::vector<uint64_t> store_data_lane_mask;
 
     /* Identifying context. */
     uint32_t              bb_template_id      = 0;
@@ -424,20 +448,14 @@ struct InsnTemplate {
     std::vector<uint64_t> store_addr_dep_mask;
 
     /*
-     * Intra-register lane participation (CST_INSN_FLAG_VEC sub-block).
-     * Bit k of src_lane_mask[i] / dst_lane_mask[d] is set iff lane k
-     * of the corresponding reg participates in this insn.  When VEC
-     * is clear on the wire these vectors stay empty and the consumer
-     * treats every lane as participating (legacy / scalar fallback).
-     *
-     * lane_parallel mirrors CST_INSN_FLAG_LANE_PARALLEL: when set,
-     * lane k of each dst depends only on lane k of its src masks; when
-     * clear, the lanes participate but don't line up by index
-     * (shuffles / broadcasts / horizontal reductions).
+     * Lane-parallel bit (CST_INSN_FLAG_LANE_PARALLEL): static per
+     * instruction.  When set, lane k of each dst depends only on lane k
+     * of every src; when clear, lanes participate but don't line up by
+     * index (shuffles / broadcasts / horizontal reductions).  Per-slot
+     * lane masks themselves are dynamic — emitted as FID deltas, not
+     * here — see Instruction::src_lane_mask et al.
      */
     bool                  lane_parallel = false;
-    std::vector<uint64_t> src_lane_mask;
-    std::vector<uint64_t> dst_lane_mask;
 };
 
 struct Template {

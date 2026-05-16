@@ -142,6 +142,32 @@ void append_pad_to(std::string *out, size_t target)
     while (out->size() < target) out->push_back(' ');
 }
 
+/* Append a lane-mask as "{0..3,6}" — set bits coalesced into ascending
+ * ranges, comma-separated.  Renders nothing (no braces) when @mask is
+ * zero so callers can unconditionally invoke for every operand without
+ * having to gate beforehand. */
+void append_lane_set(std::string *out, uint64_t mask)
+{
+    if (!mask) return;
+    out->push_back('{');
+    bool first = true;
+    int i = 0;
+    while (i < 64) {
+        if (!(mask & ((uint64_t)1 << i))) { i++; continue; }
+        int lo = i;
+        while (i < 64 && (mask & ((uint64_t)1 << i))) i++;
+        int hi = i - 1;
+        if (!first) out->push_back(',');
+        first = false;
+        out->append(std::to_string(lo));
+        if (hi != lo) {
+            out->append("..");
+            out->append(std::to_string(hi));
+        }
+    }
+    out->push_back('}');
+}
+
 /* Append a Wide as a single hex integer (no leading zeros). */
 void append_wide_hex(std::string *out, const cst::Wide &w)
 {
@@ -415,6 +441,9 @@ struct DisasmContext {
     const ObjdumpRenderer *od;
     /* --show-deps: append intra-instruction dep-mask annotation. */
     bool show_deps = false;
+    /* --show-lanes: annotate vec operands with their lane sets and
+     * split memop -> dst arrows by per-source lane contribution. */
+    bool show_lanes = false;
 };
 
 /* Resolve register-id @r to its disasm reference (e.g. %gp3).  Hot path
@@ -542,6 +571,14 @@ const cst::RegSnap *find_dst_regdata(const cst::Instruction &insn, uint8_t k)
  *   bits [n_src, n_src + max_dep_loads)      load_data[k]
  *   bit  n_src + max_dep_loads               immediate
  */
+/* Lookup helpers: zero-default when the per-slot vector is shorter
+ * than the requested index, so callers can probe every slot without
+ * length guards. */
+inline uint64_t lane_at(const std::vector<uint64_t> &v, size_t i)
+{
+    return i < v.size() ? v[i] : 0;
+}
+
 void render_input_pool(std::vector<std::string> &out,
                        const DisasmContext &ctx,
                        const cst::Instruction &insn,
@@ -558,14 +595,22 @@ void render_input_pool(std::vector<std::string> &out,
         append_hex(&s, (uint64_t)insn.immediate);
         return s;
     };
-    /* src_reg slots */
-    for (uint8_t r : insn.src_regs) {
-        out.push_back(reg_str(r));
+    /* src_reg slots — with --show-lanes, suffix each name with its
+     * participating lane set ("{0..3,6}").  Empty mask = no suffix
+     * so scalar srcs render unchanged. */
+    for (size_t i = 0; i < insn.src_regs.size(); i++) {
+        std::string s = reg_str(insn.src_regs[i]);
+        if (ctx.show_lanes) {
+            append_lane_set(&s, lane_at(insn.src_lane_mask, i));
+        }
+        out.push_back(std::move(s));
     }
     /* load_data slots — each renders as "ld[<addr_inputs>](addr)" using
      * the matching HAS_ADDR mask + dynamic address.  An address mask
      * in HAS_ADDR has the layout bits [0, n_src) src, bit n_src imm
-     * (no load_data — addresses are computed before any load fires). */
+     * (no load_data — addresses are computed before any load fires).
+     * With --show-lanes, append the load_data lane set ("{0..1}") so
+     * vector loads show which lanes they populated. */
     unsigned n_src = (unsigned)insn.src_regs.size();
     for (unsigned k = 0; k < insn.max_dep_loads; k++) {
         std::string s = "ld";
@@ -594,6 +639,9 @@ void render_input_pool(std::vector<std::string> &out,
             append_hex(&s, load_addrs[k]);
             s.push_back(')');
         }
+        if (ctx.show_lanes) {
+            append_lane_set(&s, lane_at(insn.load_data_lane_mask, k));
+        }
         out.push_back(std::move(s));
     }
     /* imm slot — only when has_immediate; the bit position is fixed
@@ -603,22 +651,40 @@ void render_input_pool(std::vector<std::string> &out,
     }
 }
 
-/* Render the names of inputs flagged by @mask, comma-separated. */
-void render_input_set(std::string &line, uint64_t mask,
-                      const std::vector<std::string> &input_names)
+/*
+ * Render the names of inputs flagged by @mask, comma-separated, with
+ * lane-granularity refinement.  The coarse
+ * dep mask says "this sink depends on input i"; the per-operand lane
+ * masks say *which lanes* each side touches.  A lane-structured
+ * input (its own lane mask non-zero) actually feeds the sink only on
+ * the lanes they share — so when the intersection with @sink_lanes is
+ * empty, the input does not feed this sink at all and is dropped
+ * (e.g. PINSRD $3's pass-through src %v0{0..2} does NOT feed the
+ * written lane %v0{3}).  Inputs with no lane mask (immediate, scalar
+ * address regs) are not lane-structured and pass through unchanged.
+ * @in_lane(i) returns input i's lane mask. */
+template <typename LaneFn>
+void render_input_set_laned(std::string &line, uint64_t mask,
+                            const std::vector<std::string> &input_names,
+                            bool show_lanes, uint64_t sink_lanes,
+                            LaneFn in_lane)
 {
     bool any = false;
     for (size_t i = 0; i < input_names.size(); i++) {
-        if (mask & ((uint64_t)1 << i)) {
-            if (any) line.append(", ");
-            line.append(input_names[i]);
-            any = true;
+        if (!(mask & ((uint64_t)1 << i))) continue;
+        if (show_lanes && sink_lanes) {
+            uint64_t il = in_lane(i);
+            if (il && !(il & sink_lanes)) continue;  /* no shared lanes */
         }
+        if (any) line.append(", ");
+        line.append(input_names[i]);
+        any = true;
     }
 }
 
-/* Render a store sink: "st[<addr_inputs>](addr)" sized off HAS_ADDR
- * for the addr inputs and the dynamic address (when available). */
+/* Render a store sink: "st[<addr_inputs>](addr){lanes}" sized off
+ * HAS_ADDR for the addr inputs, the dynamic address (when available),
+ * and the store-data lane set (when --show-lanes). */
 std::string render_store_sink(const DisasmContext &ctx,
                               const cst::Instruction &insn,
                               unsigned s,
@@ -657,6 +723,9 @@ std::string render_store_sink(const DisasmContext &ctx,
         out.append("(0x");
         append_hex(&out, store_addrs[s]);
         out.push_back(')');
+    }
+    if (ctx.show_lanes) {
+        append_lane_set(&out, lane_at(insn.store_data_lane_mask, s));
     }
     return out;
 }
@@ -743,28 +812,107 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
         any_group = true;
     };
 
+    /* Per-input lane participation: bit at input-pool index `i` is set
+     * iff lane k of that input is `mask_for_input(i, lane_k)`.  Returns
+     * the per-input lane mask used when --show-lanes is set, indexed
+     * the same way as @inputs (src_regs first, then load_data slots,
+     * then imm).  Imm carries no lanes; addr-only loads carry the
+     * load_data lane mask. */
+    auto input_lane_mask = [&](size_t i) -> uint64_t {
+        if (i < n_src)                   return lane_at(insn.src_lane_mask, i);
+        size_t k = i - n_src;
+        if (k < insn.max_dep_loads)      return lane_at(insn.load_data_lane_mask, k);
+        return 0;  /* imm slot */
+    };
+
+    /* Emit a single dst register name with optional dst-data hex and
+     * (when --show-lanes) the dst lane set. */
+    auto emit_dst_name = [&](size_t k, uint64_t lane_override) {
+        append_regref(&line, ctx, insn.dst_regs[k]);
+        if (const cst::RegSnap *r =
+                find_dst_regdata(insn, (uint8_t)k)) {
+            line.push_back('[');
+            append_wide_hex(&line, r->value);
+            line.push_back(']');
+        }
+        if (ctx.show_lanes) {
+            uint64_t lm = lane_override ? lane_override
+                                        : lane_at(insn.dst_lane_mask, k);
+            append_lane_set(&line, lm);
+        }
+    };
+
+    /* Per-source lane split: when --show-lanes is set, a dst has a
+     * non-empty lane mask, and the dst's contributing inputs each
+     * carry a non-empty, pairwise-disjoint lane mask that exactly
+     * partitions the dst lane mask, emit one arrow per source.  This
+     * is the "ld[0] -> v0{0..1}  ;  ld[1] -> v0{2..3}" shape for vec
+     * loads that fan into a single register.  Returns true when the
+     * split was applied (caller skips the merged path). */
+    auto try_split_dst = [&](size_t k) -> bool {
+        if (!ctx.show_lanes) return false;
+        uint64_t dst_lanes = lane_at(insn.dst_lane_mask, k);
+        if (!dst_lanes) return false;
+        uint64_t m = dst_mask(k);
+        std::vector<size_t> contributors;
+        uint64_t covered = 0;
+        bool overlap = false;
+        for (size_t i = 0; i < inputs.size(); i++) {
+            if (!(m & ((uint64_t)1 << i))) continue;
+            uint64_t lm = input_lane_mask(i);
+            if (!lm) return false;          /* imm or scalar — bail */
+            if ((lm & dst_lanes) != lm) return false; /* extends past dst */
+            if (covered & lm) { overlap = true; break; }
+            covered |= lm;
+            contributors.push_back(i);
+        }
+        if (overlap || covered != dst_lanes || contributors.size() < 2) {
+            return false;
+        }
+        for (size_t i : contributors) {
+            open_group();
+            line.append(inputs[i]);
+            line.append(" -> ");
+            emit_dst_name(k, input_lane_mask(i));
+        }
+        return true;
+    };
+
     /* Dst groups: walk in order, merging consecutive dsts with
      * identical masks into one arrow.  Preserving source order keeps
-     * the rendering close to the instruction's natural reading. */
+     * the rendering close to the instruction's natural reading.  With
+     * --show-lanes, a dst whose sources partition its lane set is
+     * split out into per-source arrows instead. */
     size_t d = 0;
     while (d < insn.dst_regs.size()) {
+        if (try_split_dst(d)) {
+            d++;
+            continue;
+        }
         uint64_t mask = dst_mask(d);
         size_t end = d + 1;
-        while (end < insn.dst_regs.size() && dst_mask(end) == mask) {
+        while (end < insn.dst_regs.size() && dst_mask(end) == mask
+               && !(ctx.show_lanes && lane_at(insn.dst_lane_mask, end))) {
             end++;
         }
         open_group();
-        render_input_set(line, mask, inputs);
+        /* Address-only srcs feed the dst only transitively through the
+         * memop (the dst depends on the load; the load's address
+         * depends on those srcs, shown separately as laddr/saddr).
+         * Drop them from the direct data-dependency set whether the
+         * mask came from the wire or the default — otherwise an
+         * all-to-all dst_dep_mask makes e.g. %v0{3} look directly
+         * dependent on the stack pointer.  When --show-lanes broke the
+         * merge, also filter inputs to those that feed this dst's
+         * lanes. */
+        render_input_set_laned(line, mask & ~addr_only_srcs, inputs,
+                               ctx.show_lanes,
+                               lane_at(insn.dst_lane_mask, d),
+                               input_lane_mask);
         line.append(" -> ");
         for (size_t k = d; k < end; k++) {
             if (k > d) line.append(", ");
-            append_regref(&line, ctx, insn.dst_regs[k]);
-            if (const cst::RegSnap *r =
-                    find_dst_regdata(insn, (uint8_t)k)) {
-                line.push_back('[');
-                append_wide_hex(&line, r->value);
-                line.push_back(']');
-            }
+            emit_dst_name(k, 0);
         }
         d = end;
     }
@@ -780,7 +928,13 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
             end++;
         }
         open_group();
-        render_input_set(line, mask, inputs);
+        /* Same address-only-src exclusion as the dst path: a store's
+         * data depends on the value srcs, not the addressing regs
+         * (those feed the store address, shown as saddr). */
+        render_input_set_laned(line, mask & ~addr_only_srcs, inputs,
+                               ctx.show_lanes,
+                               lane_at(insn.store_data_lane_mask, s),
+                               input_lane_mask);
         line.append(" -> ");
         for (size_t k = s; k < end; k++) {
             if (k > s) line.append(", ");
@@ -888,11 +1042,17 @@ void emit_disasm_branch_target(std::string &line, const DisasmContext &ctx,
  * annotation reads like the inline arrow rendering; load bits stay
  * positional ("ld<k>") since each load slot's own address is reported
  * separately as a load_addr mask.
+ *
+ * When @insn is non-null and --show-lanes is set, each entry gets a
+ * per-input lane set suffix ("%v0{0..3}", "ld0{0..1}") drawn from the
+ * per-Instance lane masks so the deps line mirrors the inline arrows.
  */
 void append_dep_mask(std::string &line, uint64_t m,
                      const std::vector<uint8_t> &src_regs,
                      unsigned n_loads,
-                     const DisasmContext &ctx)
+                     const DisasmContext &ctx,
+                     const cst::Instruction *insn = nullptr,
+                     uint64_t sink_lanes = 0)
 {
     line.push_back('[');
     bool any = false;
@@ -901,17 +1061,39 @@ void append_dep_mask(std::string &line, uint64_t m,
         any = true;
     };
     unsigned n_src = (unsigned)src_regs.size();
+    const bool annotate_lanes = ctx.show_lanes && insn != nullptr;
+    /* Lane-granularity refinement: when the sink has a lane mask, a
+     * lane-structured input is listed only where its lanes intersect
+     * the sink's (PINSRD $3's pass-through src %v0{0..2} does not
+     * feed the written lane %v0{3}). */
+    auto feeds = [&](uint64_t in_lane) -> bool {
+        if (!annotate_lanes || !sink_lanes) return true;
+        if (!in_lane) return true;            /* scalar / imm: unfiltered */
+        return (in_lane & sink_lanes) != 0;
+    };
     for (unsigned i = 0; i < n_src; i++) {
         if (m & ((uint64_t)1 << i)) {
+            uint64_t il = annotate_lanes
+                              ? lane_at(insn->src_lane_mask, i) : 0;
+            if (!feeds(il)) continue;
             sep();
             append_regref(&line, ctx, src_regs[i]);
+            if (annotate_lanes) {
+                append_lane_set(&line, il);
+            }
         }
     }
     for (unsigned i = 0; i < n_loads; i++) {
         if (m & ((uint64_t)1 << (n_src + i))) {
+            uint64_t il = annotate_lanes
+                              ? lane_at(insn->load_data_lane_mask, i) : 0;
+            if (!feeds(il)) continue;
             sep();
             line.append("ld");
             line.append(std::to_string(i));
+            if (annotate_lanes) {
+                append_lane_set(&line, il);
+            }
         }
     }
     if (m & ((uint64_t)1 << (n_src + n_loads))) {
@@ -962,6 +1144,7 @@ void append_addr_mask(std::string &line, uint64_t m,
  */
 void emit_disasm_deps_annotation(std::string &line,
                                  const cst::InsnTemplate &it,
+                                 const cst::Instruction &insn,
                                  const DisasmContext &ctx)
 {
     unsigned n_src = (unsigned)it.src_regs.size();
@@ -1000,10 +1183,17 @@ void emit_disasm_deps_annotation(std::string &line,
     for (size_t d = 0; d < n_dst; d++) {
         uint64_t m = d < it.dst_dep_mask.size() ? it.dst_dep_mask[d]
                                                 : default_mask;
+        /* Address-only srcs reach the dst transitively via the memop
+         * (rendered as laddr/saddr), not as a direct data dep. */
+        m &= ~addr_only_srcs;
         line.push_back(' ');
         append_regref(&line, ctx, it.dst_regs[d]);
+        if (ctx.show_lanes) {
+            append_lane_set(&line, lane_at(insn.dst_lane_mask, d));
+        }
         line.push_back('=');
-        append_dep_mask(line, m, it.src_regs, n_loads, ctx);
+        append_dep_mask(line, m, it.src_regs, n_loads, ctx, &insn,
+                        ctx.show_lanes ? lane_at(insn.dst_lane_mask, d) : 0);
         wrote_reg = true;
     }
     /* Store-data masks: prefer wire; fall back to default per slot
@@ -1012,10 +1202,16 @@ void emit_disasm_deps_annotation(std::string &line,
         uint64_t m = s < it.store_data_dep_mask.size()
                          ? it.store_data_dep_mask[s]
                          : default_mask;
+        m &= ~addr_only_srcs;   /* store data != addressing srcs */
         line.append(" sdata");
         line.append(std::to_string(s));
+        if (ctx.show_lanes) {
+            append_lane_set(&line, lane_at(insn.store_data_lane_mask, s));
+        }
         line.push_back('=');
-        append_dep_mask(line, m, it.src_regs, n_loads, ctx);
+        append_dep_mask(line, m, it.src_regs, n_loads, ctx, &insn,
+                        ctx.show_lanes
+                            ? lane_at(insn.store_data_lane_mask, s) : 0);
         wrote_reg = true;
     }
     /* HAS_ADDR masks — these are wire-emitted whenever the walker
@@ -1067,7 +1263,7 @@ void emit_disasm_trailing_meta(std::string &line, const DisasmContext &ctx,
             insn.bb_template->insns[insn.insn_index_in_bb];
         if (it.has_reg_deps || it.has_addr_deps) {
             begin_item();
-            emit_disasm_deps_annotation(line, it, ctx);
+            emit_disasm_deps_annotation(line, it, insn, ctx);
         }
     }
 }
@@ -1291,11 +1487,11 @@ void render_disasm(FILE *out, const cst::Header &h,
                    const std::unordered_map<uint32_t, size_t> &by_id,
                    cst::BodyWalker &body,
                    const ObjdumpRenderer *od,
-                   bool show_deps)
+                   bool show_deps, bool show_lanes)
 {
     DisasmTables dt;
     disasm_tables_build(&dt, h);
-    DisasmContext ctx{&h, &by_id, &templates, &dt, od, show_deps};
+    DisasmContext ctx{&h, &by_id, &templates, &dt, od, show_deps, show_lanes};
 
     emit_disasm_file_header(out, h, templates.size());
     body.walk([&](const cst::DecodedEntry &e) {
@@ -1502,14 +1698,27 @@ void format_dyn_legacy(const cst::DynParam &dp, bool show_data,
     }
 }
 
+/* Map a LaneMaskEntry::Family to its legacy section row name. */
+const char *legacy_lane_family_name(cst::LaneMaskEntry::Family f)
+{
+    switch (f) {
+    case cst::LaneMaskEntry::Src:       return "src";
+    case cst::LaneMaskEntry::Dst:       return "dst";
+    case cst::LaneMaskEntry::LoadData:  return "load";
+    case cst::LaneMaskEntry::StoreData: return "store";
+    }
+    return "?";
+}
+
 /* "<prefix>memops:\n  insn[..] ...\n<prefix>regs:\n ..." */
 void emit_legacy_observations(FILE *out, const std::string &prefix,
                               const cst::Header &h,
                               const std::vector<cst::DynParam> &dyns,
                               const std::vector<cst::RegSnap> &snaps,
-                              const std::vector<cst::MetaFlagsEntry> &mflags)
+                              const std::vector<cst::MetaFlagsEntry> &mflags,
+                              const std::vector<cst::LaneMaskEntry> &lmasks)
 {
-    if (dyns.empty() && snaps.empty() && mflags.empty()) {
+    if (dyns.empty() && snaps.empty() && mflags.empty() && lmasks.empty()) {
         std::fprintf(out, "%sunchanged\n", prefix.c_str());
         return;
     }
@@ -1539,6 +1748,16 @@ void emit_legacy_observations(FILE *out, const std::string &prefix,
             std::fprintf(out, "%s  insn[%u] 0x%02x [%s]\n",
                          prefix.c_str(), m.insn_index,
                          (unsigned)m.byte, s.c_str());
+        }
+    }
+    if (!lmasks.empty()) {
+        std::fprintf(out, "%slanes:\n", prefix.c_str());
+        for (auto &lm : lmasks) {
+            std::fprintf(out, "%s  insn[%u] %s[%u] 0x%llx\n",
+                         prefix.c_str(), lm.insn_index,
+                         legacy_lane_family_name(lm.family),
+                         (unsigned)lm.slot_index,
+                         (unsigned long long)lm.mask);
         }
     }
 }
@@ -1650,9 +1869,43 @@ void emit_legacy_template_insn(FILE *out, const cst::Header &h,
     if (I.is_atomic) {
         line += " atomic";
     }
+    if (I.lane_parallel) {
+        line += " lane_parallel";
+    }
     line += " bytes=";
     line += fmt_bytes_hex(I.raw_bytes);
     std::fprintf(out, "%s\n", line.c_str());
+
+    /* Optional dep-mask continuation line — emitted when the template
+     * carries HAS_REG and/or HAS_ADDR.  Format:
+     *     deps: [dst=0x..,0x..] [sd=0x..,...] [la=0x..,...] [sa=0x..,...]
+     * Empty per-family vectors are omitted entirely so a scalar
+     * arith insn that only has dst_dep_mask renders as
+     *     deps: dst=0x3,0x3
+     * Aligned to match the indented insn-line style above. */
+    if (!I.dst_dep_mask.empty() ||
+        !I.store_data_dep_mask.empty() ||
+        !I.load_addr_dep_mask.empty() ||
+        !I.store_addr_dep_mask.empty()) {
+        auto fmt_vec = [](const std::vector<uint64_t> &v,
+                          const char *name, std::string *out) {
+            if (v.empty()) return;
+            if (!out->empty()) out->push_back(' ');
+            out->append(name);
+            out->push_back('=');
+            for (size_t k = 0; k < v.size(); k++) {
+                if (k) out->push_back(',');
+                out->append("0x");
+                append_hex(out, v[k]);
+            }
+        };
+        std::string body;
+        fmt_vec(I.dst_dep_mask,        "dst", &body);
+        fmt_vec(I.store_data_dep_mask, "sd",  &body);
+        fmt_vec(I.load_addr_dep_mask,  "la",  &body);
+        fmt_vec(I.store_addr_dep_mask, "sa",  &body);
+        std::fprintf(out, "    deps: %s\n", body.c_str());
+    }
 }
 
 void emit_legacy_templates(FILE *out, const cst::Header &h,
@@ -1705,7 +1958,7 @@ void emit_legacy_entry(FILE *out, const cst::Header &h,
                  e.seq_num, e.thread_id, sw, e.template_id);
     std::fprintf(out, "  cp:\n");
     emit_legacy_observations(out, "    ", h, e.dyn_params, e.reg_snaps,
-                             e.metaflags);
+                             e.metaflags, e.lane_masks);
     for (const auto &wp : e.wp_entries) {
         std::fprintf(out, "  wp[%u] template=BB%u n_insns=%u\n",
                      wp.index, wp.template_id, wp.n_insns);
@@ -1714,7 +1967,7 @@ void emit_legacy_entry(FILE *out, const cst::Header &h,
             std::fprintf(out, "    status: %s\n", status.c_str());
         }
         emit_legacy_observations(out, "    ", h, wp.dyn_params, wp.reg_snaps,
-                                 wp.metaflags);
+                                 wp.metaflags, wp.lane_masks);
     }
     std::fprintf(out, "\n");
 }
@@ -1784,6 +2037,7 @@ struct Options {
     bool        templates_only = false;
     bool        show_objdump   = false;
     bool        show_deps      = false;
+    bool        show_lanes     = false;
     uint64_t    max_entries    = 0;        /* 0 = unbounded */
 };
 
@@ -1791,7 +2045,7 @@ void print_usage(FILE *err, const char *argv0)
 {
     std::fprintf(err,
         "usage: %s [--format=disasm|legacy] [--templates-only] "
-        "[--objdump] [--show-deps] [--max N] <trace.cst>\n"
+        "[--objdump] [--show-deps] [--show-lanes] [--max N] <trace.cst>\n"
         "  --templates-only  print only the template dictionary,\n"
         "                    skip the body delta-replay\n"
         "  --objdump         emit Capstone-rendered native disasm\n"
@@ -1799,6 +2053,9 @@ void print_usage(FILE *err, const char *argv0)
         "  --show-deps       append intra-instruction dep masks as a\n"
         "                    trailing `; deps: d0=[s0,ld0] ...` comment\n"
         "                    when the template carries them\n"
+        "  --show-lanes      annotate each vec operand with its lane set\n"
+        "                    ({0..3,6}), split memop -> dst arrows by\n"
+        "                    per-source lane contribution when disjoint\n"
         "  --max N           stop after N body entries (tears the\n"
         "                    decompressor subprocess down early)\n",
         argv0);
@@ -1821,6 +2078,8 @@ int parse_options(int argc, char **argv, Options *opts)
             opts->show_objdump = true;
         } else if (std::strcmp(a, "--show-deps") == 0) {
             opts->show_deps = true;
+        } else if (std::strcmp(a, "--show-lanes") == 0) {
+            opts->show_lanes = true;
         } else if (std::strncmp(a, "--max=", 6) == 0) {
             opts->max_entries = std::strtoull(a + 6, nullptr, 10);
         } else if (std::strcmp(a, "--max") == 0 && i + 1 < argc) {
@@ -1872,7 +2131,7 @@ int run_body_render(const Options &opts, const cst::Header &h,
         render_legacy(stdout, h, templates, by_id, walker);
     } else if (std::strcmp(opts.format, "disasm") == 0) {
         render_disasm(stdout, h, templates, by_id, walker, odp,
-                      opts.show_deps);
+                      opts.show_deps, opts.show_lanes);
     } else {
         std::fprintf(stderr, "cst_decode: unknown format '%s'\n",
                      opts.format);

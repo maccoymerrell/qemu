@@ -419,25 +419,98 @@ void dep_passthrough(const struct qemu_plugin_insn_info *info, InsnFields *f)
 }
 
 /*
- * Lane-mask baseline derivation — called from decode.cc when an
- * InsnClassification row carries LANE_MASK_KIND_STATIC.  Returns the
- * (1 << lanes) - 1 mask derived from the first vector REG operand's
- * (size, lane_bytes); 0 if no vector operand is recognisable (caller
- * leaves has_vec_lanes false in that case).  Kept here so the
- * Capstone-derived lane plumbing stays close to the dep refiners.
+ * Instruction vector lane shape.  Slot-agnostic — decode.cc owns the
+ * operand->slot mapping and applies this per operand.  Determines
+ * lane element width + total lane set, and whether the op is a
+ * uniform packed op or an element insert/extract whose touched lane
+ * is the instruction immediate.
+ *
+ * Insert/extract detection (purely structural, no per-mnemonic
+ * table): the op is vec-lane-classified, has an immediate, has
+ * exactly ONE vec-register operand (lane_bytes != 0), and a non-vec
+ * element-sized data operand (a MEM or GPR whose size == lane_bytes).
+ * This matches PINSR{B,W,D,Q}/PEXTR{B,W,D,Q}/INSERTPS/EXTRACTPS (mem
+ * and reg forms) while excluding shuffles (two vec-reg operands) and
+ * scalar SS/SD ops (lane_bytes == 0 by the Capstone width helper).
+ * INSERT vs EXTRACT is decided by the vec reg's access: a WRITE-
+ * containing vec reg is the insert destination; a READ-only vec reg
+ * is the extract source.  lane_sel = immediate mod total_lanes.
+ *
+ * Runtime-SEW kinds (RISC-V V, lane_bytes 0): full_mask = ~0,
+ * UNIFORM; the exec gate (vl) narrows it.
  */
-uint64_t lane_baseline_from_operands(
-    const struct qemu_plugin_insn_info *info)
+LaneShape lane_shape_from_operands(
+    const struct qemu_plugin_insn_info *info, uint8_t lane_mask_kind)
 {
-    if (!info) return 0;
+    LaneShape sh = { LANE_SHAPE_NONE, 0, 0, -1 };
+    if (!info) return sh;
+
+    /* Element width + lane count from the first vec REG operand,
+     * plus a census for the insert/extract structural test. */
+    uint8_t  lane_bytes  = 0;
+    unsigned total_lanes = 0;
+    uint64_t full_mask   = 0;
+    unsigned vec_reg_ops  = 0;
+    const struct qemu_plugin_operand *vec_reg = nullptr;
+    bool     have_imm     = false;
+    int64_t  imm_val      = 0;
+
     for (uint8_t i = 0; i < info->n_operands; i++) {
         const struct qemu_plugin_operand *op = &info->operands[i];
+        if (op->type == QEMU_PLUGIN_OP_IMM) {
+            if (!have_imm) { have_imm = true; imm_val = op->imm; }
+            continue;
+        }
         if (op->type != QEMU_PLUGIN_OP_REG) continue;
-        if (op->size == 0 || op->lane_bytes == 0) continue;
+        if (op->lane_bytes == 0 || op->size == 0) continue;
         unsigned lanes = (unsigned)op->size / (unsigned)op->lane_bytes;
         if (lanes == 0 || lanes > 64) continue;
-        return (lanes == 64) ? ~(uint64_t)0
-                             : (((uint64_t)1 << lanes) - 1);
+        vec_reg_ops++;
+        if (!lane_bytes) {
+            lane_bytes  = op->lane_bytes;
+            total_lanes = lanes;
+            full_mask   = (lanes == 64) ? ~(uint64_t)0
+                                        : (((uint64_t)1 << lanes) - 1);
+            vec_reg     = op;
+        }
     }
-    return 0;
+
+    if (!full_mask) {
+        if (lane_mask_kind != LANE_MASK_KIND_STATIC) {
+            /* Runtime-SEW (RISC-V V): all-ones structural, vl-gated. */
+            sh.kind = LANE_SHAPE_UNIFORM;
+            sh.lane_bytes = 0;
+            sh.full_mask  = ~(uint64_t)0;
+            sh.lane_sel   = -1;
+        }
+        return sh;   /* STATIC w/o usable width -> NONE */
+    }
+
+    sh.lane_bytes = lane_bytes;
+    sh.full_mask  = full_mask;
+
+    /* Element-sized non-vec data operand (mem or gpr) present? */
+    bool elem_data = false;
+    for (uint8_t i = 0; i < info->n_operands; i++) {
+        const struct qemu_plugin_operand *op = &info->operands[i];
+        if (op == vec_reg) continue;
+        if (op->type == QEMU_PLUGIN_OP_MEM && op->size == lane_bytes) {
+            elem_data = true; break;
+        }
+        if (op->type == QEMU_PLUGIN_OP_REG && op->lane_bytes == 0
+            && op->size == lane_bytes) {
+            elem_data = true; break;
+        }
+    }
+
+    if (have_imm && vec_reg_ops == 1 && elem_data && total_lanes) {
+        int16_t sel = (int16_t)((uint64_t)imm_val % total_lanes);
+        bool vec_write = (vec_reg->access & QEMU_PLUGIN_OP_ACC_WRITE) != 0;
+        sh.kind     = vec_write ? LANE_SHAPE_INSERT : LANE_SHAPE_EXTRACT;
+        sh.lane_sel = sel;
+        return sh;
+    }
+
+    sh.kind = LANE_SHAPE_UNIFORM;
+    return sh;
 }

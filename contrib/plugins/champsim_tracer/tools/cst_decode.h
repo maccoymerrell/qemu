@@ -182,14 +182,16 @@ private:
     /* Field-delta record decoder.  Splits into two passes: pass 1
      * applies record deltas to the per-template state block and
      * collects per-entry EXTRA_* vectors; pass 2 walks the template
-     * insns and materialises dyn_params / reg_snaps / metaflags. */
+     * insns and materialises dyn_params / reg_snaps / metaflags /
+     * lane_masks. */
     void decode_field_delta(Reader &outer, uint32_t template_id,
                             const Template *tmpl,
                             FieldStateTable &state,
                             const FieldStateTable *base_state,
                             std::vector<DynParam>       *dyn_params,
                             std::vector<RegSnap>        *reg_snaps,
-                            std::vector<MetaFlagsEntry> *metaflags);
+                            std::vector<MetaFlagsEntry> *metaflags,
+                            std::vector<LaneMaskEntry>  *lane_masks);
 
     /* Compute the template-default for FID_INSN_* fields (those whose
      * baseline is the template's static value).  Returns Wide{} for

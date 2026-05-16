@@ -12,17 +12,20 @@ from .asm_blocks import _register_probe
 
 _register_probe('probe_x86_lea', {'x86_64': {'asm': '"leaq 3(%%rax,%%rax,4), %%rax"',
             'clobbers': '"rax"',
-            'opcodes': ['LEA']}})
+            'opcodes': ['LEA'],
+            'dep_refines': ['DEP_LEA']}})
 
 _register_probe('probe_x86_push_pop', {'x86_64': {'asm': '"pushq $0x1234\\n\\t"\n    "popq %%rax"',
             'clobbers': '"rax","cc"',
-            'opcodes': ['PUSH', 'POP']}})
+            'opcodes': ['PUSH', 'POP'],
+            'dep_refines': ['DEP_X86_STACK_PUSH', 'DEP_X86_STACK_POP']}})
 
 _register_probe('probe_x86_movsx_movzx', {'x86_64': {'asm': '"movb $-1, %%al\\n\\t"\n'
                    '    "movsx %%al, %%ebx\\n\\t"\n'
                    '    "movzx %%al, %%ecx"',
             'clobbers': '"rax","rbx","rcx"',
-            'opcodes': ['MOVSX', 'MOVZX']}})
+            'opcodes': ['MOVSX', 'MOVZX'],
+            'dep_refines': ['DEP_PASSTHROUGH']}})
 
 _register_probe('probe_x86_xchg', {'x86_64': {'asm': '"xchg %%rax, %%rbx"',
             'clobbers': '"rax","rbx"',
@@ -114,6 +117,62 @@ _register_probe('probe_x86_vec_logic', {'x86_64': {'asm': '"pand %%xmm1, %%xmm0\
                    '    "pxor %%xmm1, %%xmm3"',
             'clobbers': '"xmm0","xmm2","xmm3"',
             'opcodes': ['VEC_LOGIC']}})
+
+# Multi-memop multi-lane LOAD: PINSRD inserts one 32-bit dword from
+# memory into a specific lane of xmm.  Four PINSRD instructions, each
+# feeding a different lane (0..3) of %xmm0 from a different memory
+# slot.  Each insn is its own memop -> single-lane case; the
+# four-instruction sequence as a whole exercises the "different
+# memops feed different lanes of one register" pattern at the
+# basic-block level, even though no SINGLE x86 instruction in the
+# legacy SSE space gets to do that.  The eventual gather/scatter
+# refiner work (LANE_MASK_KIND_GATHER) will lift this into a
+# single-instruction probe — when the plugin gains that path, the
+# inline arrows / deps lines will show the per-source lane split
+# automatically.
+_register_probe('probe_x86_vec_load_multi_lane', {'x86_64': {'asm':
+                   '"pinsrd $0, (%%rsp), %%xmm0\\n\\t"\n'
+                   '    "pinsrd $1, 4(%%rsp), %%xmm0\\n\\t"\n'
+                   '    "pinsrd $2, 8(%%rsp), %%xmm0\\n\\t"\n'
+                   '    "pinsrd $3, 12(%%rsp), %%xmm0"',
+            'clobbers': '"xmm0"',
+            'opcodes': ['VEC_SHUF']}})
+
+# Multi-memop multi-lane STORE: PEXTRD extracts one 32-bit dword
+# from a specific xmm lane to memory.  Four PEXTRD instructions
+# scatter the four lanes of %xmm0 into four memory slots.
+_register_probe('probe_x86_vec_store_multi_lane', {'x86_64': {'asm':
+                   '"pextrd $0, %%xmm0, (%%rsp)\\n\\t"\n'
+                   '    "pextrd $1, %%xmm0, 4(%%rsp)\\n\\t"\n'
+                   '    "pextrd $2, %%xmm0, 8(%%rsp)\\n\\t"\n'
+                   '    "pextrd $3, %%xmm0, 12(%%rsp)"',
+            'clobbers': '"memory"',
+            'opcodes': ['VEC_SHUF']}})
+
+# AArch64 LD2/LD3/LD4 multi-structure loads — one instruction with
+# multiple memops where each memop targets a different destination
+# register, but at the lane level each dst register's lanes come
+# from interleaved positions in memory.  QEMU's plugin operand
+# walker typically reports these as several memops (one per element
+# pair/triplet/quadruplet).
+_register_probe('probe_arm_vec_load_multi_lane', {'aarch64': {'asm':
+                    '"mov  x9, sp\\n\\t"\n'
+                    '    "ld2 {v0.4s, v1.4s}, [x9]\\n\\t"\n'
+                    '    "ld3 {v2.4h, v3.4h, v4.4h}, [x9]\\n\\t"\n'
+                    '    "ld4 {v5.16b, v6.16b, v7.16b, v8.16b}, [x9]"',
+            'clobbers': '"x9","v0","v1","v2","v3","v4","v5","v6","v7","v8"',
+            'opcodes': ['VEC_MOV']}})
+
+# AArch64 ST2/ST3/ST4 multi-structure stores — companion to the
+# load probe.  Each instruction has multiple memops, each draining
+# a different lane subset of the source register set.
+_register_probe('probe_arm_vec_store_multi_lane', {'aarch64': {'asm':
+                    '"mov  x9, sp\\n\\t"\n'
+                    '    "st2 {v0.4s, v1.4s}, [x9]\\n\\t"\n'
+                    '    "st3 {v2.4h, v3.4h, v4.4h}, [x9]\\n\\t"\n'
+                    '    "st4 {v5.16b, v6.16b, v7.16b, v8.16b}, [x9]"',
+            'clobbers': '"x9","memory"',
+            'opcodes': ['VEC_MOV']}})
 
 _register_probe('probe_x86_fp_arith', {'x86_64': {'asm': '"addsd %%xmm1, %%xmm0\\n\\t"\n'
                    '    "subsd %%xmm1, %%xmm2\\n\\t"\n'

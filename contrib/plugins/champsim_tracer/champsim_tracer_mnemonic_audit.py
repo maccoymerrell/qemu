@@ -1057,6 +1057,7 @@ X86_SSE_LEGACY_MNEM_PREFIXES: tuple[str, ...] = (
     "MOVLPS", "MOVLPD", "MOVHPS", "MOVHPD",
     "MOVLHPS", "MOVHLPS",
     "MOVDQA", "MOVDQU",
+    "MOVDDUP", "MOVSHDUP", "MOVSLDUP",
     "MOVNTPS", "MOVNTPD", "MOVNTDQ",
     "CMPPS", "CMPPD", "CMPSS", "CMPSD",
     "SHUFPS", "SHUFPD",
@@ -1126,20 +1127,46 @@ def classify_x86_lane(const_name: str,
     return ("LANE_MASK_KIND_STATIC", True)
 
 
-# aarch64 — Capstone variant-name vector markers, anchored against
-# false positives from the "AARCH64_" prefix (which contains "H64").
-#   - NEON: lowercase v<count>i<width> / v<count>f<width> (e.g.
-#     ADDv8i8, FADDv4f32), the `v` token always lowercase and
-#     preceded by a non-letter.
+# aarch64 — Capstone variant-name vector markers.  Tokens are
+# anchored so they cannot be confused with the constant "H64" inside
+# the "AARCH64_" prefix.
+#   - NEON shape: lowercase v<count><lane-letter><width>, e.g.
+#     ADDv8i8, FADDv4f32, PMULLv1i64.  Capstone never emits a
+#     lowercase v inside a non-NEON mnemonic, so no leading anchor
+#     is needed (verified across the AArch64 canonical-variant set).
+#   - NEON lane-indexed access: vi<width>, e.g. INSvi16gpr,
+#     UMOVvi16, SHLv16i8_shift (the latter is also caught by the
+#     v\d+i token above).
 #   - SVE / SME: variant ends in _<B|H|S|D> (lane element width).
-#   - SVE Z-register / predicate references: tokens like _ZZ_,
-#     _ZZZ_, _ZPmZ_, _ZZZ?I_ in the middle of the variant name.
-# The combination filters out all GPR forms (ADDWri, ADCXr, ...)
-# whose names contain neither pattern.
+#   - SVE Z/P register references: tokens _ZZ, _ZP, _PP in the
+#     variant name.
 AARCH64_VEC_VARIANT_RES = (
-    re.compile(r"(?:^|[^A-Za-z])v\d+[ifuBHSD]"),
+    re.compile(r"v\d+[ifu]"),
+    re.compile(r"vi\d+"),
     re.compile(r"_[BHSD]$"),
-    re.compile(r"_Z[ZP]"),
+    re.compile(r"_(ZZ|ZP|PP)"),
+)
+
+
+# Canonical-name fallback: instructions whose Capstone variant.internal
+# doesn't carry a NEON shape token but which the AArch64 manual
+# defines as vector-class (writes Z/P/V or operates on V/Z/P operands).
+# Each prefix here uniquely names a vector mnemonic family — none
+# shadows a scalar-int op.
+AARCH64_VEC_NAME_PREFIXES: tuple[str, ...] = (
+    # ARMv8 crypto (SHA/SM/AES base forms with `rr`/`rrr` variants)
+    "SHA1H", "SHA1C", "SHA1M", "SHA1P", "SHA1SU0", "SHA1SU1",
+    "SHA256H", "SHA256SU0", "SHA256SU1",
+    "SHA512H", "SHA512SU0", "SHA512SU1",
+    "SM3PARTW1", "SM3PARTW2", "SM3SS1", "SM3TT1A", "SM3TT1B",
+    "SM3TT2A", "SM3TT2B", "SM4E", "SM4EKEY",
+    "BCAX", "EOR3", "RAX1", "XAR",
+    # SVE/SME ops whose variants encode dest/src purely in suffix
+    # tokens that miss the per-element shape regex.
+    "PFALSE", "RDFFR",
+    "LD1RB", "LD1RH", "LD1RW", "LD1RD", "LD1RSB", "LD1RSH", "LD1RSW",
+    "LD1ROB", "LD1ROH", "LD1ROW", "LD1ROD",
+    "LD1RQB", "LD1RQH", "LD1RQW", "LD1RQD",
 )
 
 
@@ -1163,7 +1190,10 @@ AARCH64_CROSS_LANE_PREFIXES: tuple[str, ...] = (
 def classify_aarch64_lane(const_name: str,
                           variants: tuple) -> tuple[str, bool] | None:
     name = const_name.removeprefix("AARCH64_INS_")
-    if not any(_aarch64_variant_is_vec(v.internal) for v in variants):
+    by_variant = any(_aarch64_variant_is_vec(v.internal) for v in variants)
+    by_name = any(name == p or name.startswith(p)
+                  for p in AARCH64_VEC_NAME_PREFIXES)
+    if not (by_variant or by_name):
         return None
     for p in AARCH64_CROSS_LANE_PREFIXES:
         if name.startswith(p):
@@ -1171,18 +1201,29 @@ def classify_aarch64_lane(const_name: str,
     return ("LANE_MASK_KIND_STATIC", True)
 
 
-# RISC-V V — variants for V-extension insns reference V-reg
-# operands (V0..V31).  Capstone's variant.internal carries the
-# V<n> tokens in the name.
-RISCV_V_VARIANT_RE = re.compile(r"\bV\d+\b|V_VV|V_VX|V_VI|V_VS")
-
+# RISC-V V — every V*-prefixed Capstone canonical that isn't VSET*
+# is a V-extension data-path instruction.  The variant.internal name
+# is just "RISCV_<mnemonic>" with no extra operand-class tokens, so
+# no variant-side gate is needed (and the previous gate misfired on
+# spurious literal patterns at the RISCV_/canonical-name boundary).
 RISCV_V_CROSS_LANE_PREFIXES: tuple[str, ...] = (
-    "VRGATHER", "VSLIDE",
+    # Permutations across lanes
+    "VRGATHER", "VSLIDE", "VFSLIDE",
     "VCOMPRESS",
+    # Integer reductions
     "VREDSUM", "VREDMAXU", "VREDMAX", "VREDMINU", "VREDMIN",
     "VREDAND", "VREDOR", "VREDXOR",
+    "VWREDSUMU", "VWREDSUM",
+    # FP reductions
     "VFREDOSUM", "VFREDUSUM", "VFREDMAX", "VFREDMIN",
-    "VMV_X", "VMV_S", "VFMV",
+    "VFWREDOSUM", "VFWREDUSUM",
+    # Mask reductions (popcount / find-first)
+    "VPOPC", "VCPOP", "VFIRST",
+    # Mask scans / prefix-sum
+    "VMSBF", "VMSIF", "VMSOF", "VIOTA",
+    # Element <-> scalar bridges
+    "VMV_X", "VMV_S",
+    "VFMV_F", "VFMV_S",
 )
 
 
@@ -1194,21 +1235,22 @@ def classify_riscv_lane(const_name: str,
         return None
     if not name.startswith("V"):
         return None
-    if variants and not any(RISCV_V_VARIANT_RE.search(v.internal)
-                            for v in variants):
-        return None
     for p in RISCV_V_CROSS_LANE_PREFIXES:
         if name.startswith(p):
             return ("LANE_MASK_KIND_RISCV_VTYPE", False)
     return ("LANE_MASK_KIND_RISCV_VTYPE", True)
 
 
-# MIPS MSA — canonical names end in _B / _H / _W / _D and the
-# variants stay "clean" (no microMIPS / nanoMIPS / DSP suffix).
-# MIPS DSP canonicals also use _W / _PH / _QB suffixes but their
-# variants have _MM / _MMR2 / _NM siblings; FP-scalar canonicals
-# expand to F-prefix variants (FABS_S, FABS_D32, ...).
-MSA_LANE_SUFFIXES = ("_B", "_H", "_W", "_D")
+# MIPS MSA — canonical names end in _B / _H / _W / _D (per-lane
+# element ops) or _V (whole-register bitwise ops).  Variant names
+# stay "clean" (no microMIPS / nanoMIPS / DSP suffix).
+#
+# MSA FP variants legitimately start with F (FADD_W, FCEQ_W,
+# FFINT_S_W, ...) — those are *not* scalar FPU.  Scalar FPU
+# canonicals either lack the MSA lane suffix (ABS_S, NEG_D) or have
+# variants tagged with format / micro-arch suffixes (_S, _D32, _D64,
+# _MM*, _R6) that distinguish them from MSA.
+MSA_LANE_SUFFIXES = ("_B", "_H", "_W", "_D", "_V")
 MIPS_NON_MSA_VARIANT_SUFFIXES = ("_MM", "_MMR2", "_NM", "_R6", "_NMR6",
                                   "_D32", "_D64", "_D64_R6")
 MIPS_MSA_CROSS_LANE_PREFIXES: tuple[str, ...] = (
@@ -1221,11 +1263,10 @@ MIPS_MSA_CROSS_LANE_PREFIXES: tuple[str, ...] = (
 
 def _mips_variant_is_msa(internal: str) -> bool:
     # MSA variants have clean names that don't carry the
-    # microMIPS / nanoMIPS / DSP-format suffixes, and never start
-    # with "MIPS_F" (which marks scalar FP).
+    # microMIPS / nanoMIPS / DSP-format suffixes.  MSA FP ops do
+    # start with F (FADD_W etc.) — only the scalar-FPU format
+    # suffixes (_S/_D32/_D64/_MM*) distinguish non-MSA F* variants.
     stem = internal.removeprefix("MIPS_")
-    if stem.startswith("F"):
-        return False
     for suf in MIPS_NON_MSA_VARIANT_SUFFIXES:
         if stem.endswith(suf):
             return False
@@ -1239,8 +1280,8 @@ def classify_mips_lane(const_name: str,
         return None
     # All variants must look MSA-clean.  DSP / FP-scalar / microMIPS
     # canonicals share the _B/_H/_W/_D suffixes but their variants
-    # carry distinctive markers (_MM, _MMR2, F prefix) that knock
-    # them out.
+    # carry distinctive markers (_MM, _MMR2, _D32, _D64, _R6) that
+    # knock them out.
     if not variants or not all(_mips_variant_is_msa(v.internal)
                                 for v in variants):
         return None
@@ -1858,7 +1899,13 @@ def classify_x86(m: str) -> Entry:
         return ent("GEN_OP_INT_MUL")
     if m.startswith(("idiv", "div")):
         return ent("GEN_OP_INT_DIV")
-    if m.startswith(("and", "andn", "bextr", "blc", "bls", "t1mskc", "tzmsk", "bextr", "blsi", "blsmsk", "blsr", "bzhi", "pdep", "pext", "popcnt", "lzcnt", "tzcnt", "bsf", "bsr")):
+    # BMI2 `pext` is a 4-letter mnemonic and must be matched exactly
+    # — `m.startswith("pext")` swallowed SSE4 PEXTRB/PEXTRW/PEXTRD/PEXTRQ
+    # (and their VEX/EVEX VPEXTR* equivalents), routing them to GEN_OP_AND
+    # instead of the GEN_OP_VEC_SHUF clause that owns element-extract ops.
+    if m == "pext":
+        return ent("GEN_OP_AND")
+    if m.startswith(("and", "andn", "bextr", "blc", "bls", "t1mskc", "tzmsk", "bextr", "blsi", "blsmsk", "blsr", "bzhi", "pdep", "popcnt", "lzcnt", "tzcnt", "bsf", "bsr")):
         return ent("GEN_OP_AND")
     if re.match(r"^or", m):
         return ent("GEN_OP_OR")
@@ -2069,6 +2116,21 @@ def classify_aarch64(m: str) -> Entry:
         return ent("GEN_OP_LOAD", flags="MF_ATOMIC")
     if m.startswith(("stxr", "stlxr", "stxp", "stlxp")):
         return ent("GEN_OP_STORE", flags="MF_ATOMIC")
+    # NEON / SVE vec loads + stores — by the same convention x86 uses
+    # for MOVDQA/MOVAPS (mem<->xmm classifies as GEN_OP_VEC_MOV), any
+    # ARM load/store that targets / drains a NEON or SVE vector
+    # register is a vector data movement, not a scalar mem op.
+    # Covers NEON LD1/LD2/LD3/LD4 (and rep / range variants
+    # LD[1-4]R*, LD[1-4]RO*, LD[1-4]RQ*), SVE LD1<elem> / ST1<elem>
+    # / LD[2-4]<elem> / ST[2-4]<elem>, and the fault-tolerant /
+    # non-temporal forms (LDFF1*, LDNF1*, LDNT1*).
+    if re.match(r"^(ld|st)([1-4]|ff1|nf1|nt1)\b|"
+                r"^(ld|st)([1-4])[bdhqw]|"
+                r"^(ld|st)([1-4])r[bdhqw]?|"
+                r"^(ld|st)([1-4])s[bhw]|"
+                r"^(ld|st)([1-4])ro?[bdhqw]?|"
+                r"^(ld|st)([1-4])rq?[bdhqw]?", m):
+        return ent("GEN_OP_VEC_MOV")
     if m.startswith(("ld", "ldap", "ldar")):
         return ent("GEN_OP_LOAD")
     if m.startswith("st"):

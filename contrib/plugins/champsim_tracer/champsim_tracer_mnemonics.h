@@ -249,31 +249,54 @@ typedef struct InsnFields {
      *   - clear: lanes touch but cross-couple (shuffles / broadcasts
      *     / horizontal reductions).
      *
-     * lane_mask_kind values:
+     * Four per-operand mask classes, each its own slotted FID family,
+     * all dynamically emitted (delta-encoded, only on value change):
+     *
+     *   src_lane_mask[i]        — lanes of src_regs[i] active as a
+     *                             source this execution.
+     *   dst_lane_mask[d]        — lanes of dst_regs[d] active as a
+     *                             destination (may differ from src).
+     *   load_data lane mask     — per load memop, NOT stored here:
+     *                             computed at emit time from the
+     *                             memop's address+size vs the access
+     *                             base and lane_bytes (which lanes
+     *                             take their value from that load).
+     *   store_data lane mask    — per store memop, same, emit-time
+     *                             (which lanes that store drains).
+     *
+     * `lane_mask_kind` decides ONLY where the active-lane value is
+     * read from — nothing else:
      *   LANE_MASK_KIND_NONE        — non-vec insn (has_vec_lanes off).
-     *   LANE_MASK_KIND_STATIC      — return lane_mask_base unchanged.
-     *                                Used by x86 / aarch64 NEON / MIPS
-     *                                MSA where Capstone surfaces the
-     *                                static lane count.
-     *   LANE_MASK_KIND_RISCV_VTYPE — read RISC-V vtype CSR, compute
-     *                                (1 << VL_FIELD) - 1.  Covers
-     *                                both vsetvli (immediate) and
-     *                                vsetvl (register) since the CSR
-     *                                read is at exec time.
-     *   (room for LANE_MASK_KIND_X86_MASKED_K1 and
-     *    LANE_MASK_KIND_AARCH64_SVE_PRED in future commits.)
+     *   LANE_MASK_KIND_STATIC      — value comes from the instruction
+     *                                (operand layout / lane-selecting
+     *                                immediate).  src/dst masks below
+     *                                are the final per-slot values.
+     *   LANE_MASK_KIND_RISCV_VTYPE — value comes from a register: the
+     *                                RISC-V vl CSR, read at exec.  The
+     *                                src/dst masks here are the
+     *                                structural pattern; the exec gate
+     *                                ANDs in (1 << vl) - 1.
+     *   (room for LANE_MASK_KIND_X86_MASKED_K1 / _AARCH64_SVE_PRED —
+     *    same model, gate read from the EVEX k-mask / SVE predicate.)
      */
     bool                  has_vec_lanes;
     bool                  lane_parallel;
     uint8_t               lane_mask_kind; /* LaneMaskKind */
-    /* Refiner-set baseline AND mask.  STATIC dispatch returns this
-     * directly; dynamic dispatches AND it with the read register
-     * value (e.g. predicate AND lane-count mask). */
-    uint64_t              lane_mask_base;
-    /* Capstone-side (feature, name) for the register the dynamic
-     * dispatch should read at exec time — vtype CSR on RISC-V V,
-     * k1 on x86 EVEX masked, predicate reg on AArch64 SVE.  Empty
-     * key on STATIC rows. */
+    /* Vector element width in bytes (Capstone-derived).  Needed at
+     * emit time to map each memop's byte range onto destination /
+     * source lanes for the load/store data lane masks.  0 when the
+     * width is data-dependent (RISC-V V SEW) — emit-time falls back
+     * to one-memop-per-active-lane ordering. */
+    uint8_t               lane_bytes;
+    /* Per-operand STRUCTURAL lane participation, indexed parallel to
+     * src_regs[] / dst_regs[].  STATIC: these are the final values.
+     * Register-sourced kinds: structural pattern AND-ed at exec with
+     * the gate read from lane_mask_source_reg. */
+    uint64_t              src_lane_mask[MAX_SRC_REGS];
+    uint64_t              dst_lane_mask[MAX_DST_REGS];
+    /* Capstone-side (feature, name) of the register the dynamic gate
+     * reads at exec — vl CSR on RISC-V V, k1 on x86 EVEX masked,
+     * predicate reg on AArch64 SVE.  Empty key on STATIC rows. */
     QemuRegKey            lane_mask_source_reg;
     /*
      * x86 REP / REPNZ string-op metadata.  Non-zero on insns whose
@@ -351,12 +374,41 @@ void dep_x86_stack_push(const struct qemu_plugin_insn_info *info,
 void dep_x86_stack_pop(const struct qemu_plugin_insn_info *info,
                        InsnFields *fields);
 
-/* Capstone-derived lane baseline.  Used by decode.cc when populating
- * lane info for rows tagged LANE_MASK_KIND_STATIC: returns
- * (1 << lanes) - 1 from the first vector REG operand's
- * (size, lane_bytes); 0 if no usable vector operand. */
-uint64_t lane_baseline_from_operands(
-    const struct qemu_plugin_insn_info *info);
+/*
+ * Instruction-level vector lane shape, derived from the Capstone
+ * operand layout + any lane-selecting immediate.  Slot-agnostic: the
+ * caller (decode.cc, which owns the operand->slot mapping) applies
+ * this per operand.
+ *
+ *   kind == LANE_SHAPE_NONE     no usable lane width (consumer falls
+ *                               back to all-to-all).
+ *   kind == LANE_SHAPE_UNIFORM  packed op (PADDD, NEON ADD, RISC-V
+ *                               vadd.vv): every vec reg lane is live.
+ *   kind == LANE_SHAPE_INSERT   element insert (PINSR/INSERTPS): the
+ *                               vec reg WRITE touches only lane_sel;
+ *                               the same reg READ supplies the
+ *                               pass-through lanes (all but lane_sel).
+ *   kind == LANE_SHAPE_EXTRACT  element extract (PEXTR/EXTRACTPS):
+ *                               the vec reg READ touches only lane_sel.
+ *
+ * full_mask is (1<<total_lanes)-1 (or ~0 when the element width is a
+ * runtime CSR, RISC-V V, gated later by lane_active_gate).
+ */
+enum LaneShapeKind {
+    LANE_SHAPE_NONE = 0,
+    LANE_SHAPE_UNIFORM,
+    LANE_SHAPE_INSERT,
+    LANE_SHAPE_EXTRACT,
+};
+typedef struct {
+    uint8_t  kind;        /* LaneShapeKind */
+    uint8_t  lane_bytes;  /* vec element width; 0 = runtime SEW */
+    uint64_t full_mask;   /* all participating lanes */
+    int16_t  lane_sel;    /* INSERT/EXTRACT selected lane; else -1 */
+} LaneShape;
+
+LaneShape lane_shape_from_operands(
+    const struct qemu_plugin_insn_info *info, uint8_t lane_mask_kind);
 
 /*
  * Instruction classification entry: maps a Capstone insn_id directly

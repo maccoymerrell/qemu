@@ -416,6 +416,7 @@ static bool cap_decode_aarch64_vas(unsigned vas,
                                    uint8_t *lane_bytes,
                                    uint8_t *total_bytes);
 static uint8_t cap_lane_bytes_from_mnemonic(const char *mnem);
+static bool cap_x86_is_extract_store(const char *mnem);
 
 /*
  * Extract per-operand detail for x86 into the plugin operand struct.
@@ -430,6 +431,10 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
     /* x86 SIMD: lane width is encoded in the mnemonic suffix and
      * applies uniformly across all operands of the insn. */
     uint8_t insn_lane_bytes = cap_lane_bytes_from_mnemonic(insn->mnemonic);
+    /* Capstone-6.0.0-Alpha7 bug: store-form extract (PEXTR / EXTRACTPS
+     * family) reports its r/m destination READ-only.  Force WRITE on
+     * the MEM operand below. */
+    bool extract_store = cap_x86_is_extract_store(insn->mnemonic);
 
     for (uint8_t i = 0; i < n; i++) {
         const cs_x86_op *cop = &x86->operands[i];
@@ -473,6 +478,11 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
             op->index_id   = cop->mem.index;
             op->imm = cop->mem.disp;
             op->scale = (uint8_t)cop->mem.scale;
+            /* Capstone-6.0.0-Alpha7 bug: the r/m destination of a
+             * store-form extract is the write target, not a read. */
+            if (extract_store) {
+                op->access = QEMU_PLUGIN_OP_ACC_WRITE;
+            }
             break;
         default:
             op->type = QEMU_PLUGIN_OP_INVALID;
@@ -523,11 +533,46 @@ static bool cap_decode_aarch64_vas(unsigned vas,
     return true;
 }
 
+/*
+ * Capstone 6.0.0-Alpha7 x86 access-flag bug workaround.
+ *
+ * Store-form extract instructions write their r/m operand
+ * (PEXTRD r/m32, xmm, imm8 -- Intel SDM: "store the result in
+ * r/m32"), but this Capstone version reports that memory operand as
+ * READ-only (CS_AC_WRITE missing).  Load-form PINSRD is reported
+ * correctly, so the defect is specific to the extract-to-memory
+ * family: PEXTR{B,W,D,Q}, EXTRACTPS, and the VEX/EVEX VPEXTR* /
+ * VEXTRACTPS forms.  Without correction the operand walker treats
+ * the store destination as a phantom load and never emits the
+ * store-data dependency on the source vector register.
+ *
+ * Detect by mnemonic and, for the MEM operand, force WRITE access.
+ * Revisit / remove when Capstone is bumped past Alpha7.
+ */
+static bool cap_x86_is_extract_store(const char *mnem)
+{
+    if (!mnem || !mnem[0]) return false;
+    if (mnem[0] == 'v') mnem++;            /* VEX/EVEX prefix */
+    return g_str_has_prefix(mnem, "pextr") ||
+           g_str_equal(mnem, "extractps");
+}
+
 static uint8_t cap_lane_bytes_from_mnemonic(const char *mnem)
 {
     if (!mnem || !mnem[0]) return 0;
     size_t n = strlen(mnem);
     if (n < 3) return 0;
+    /* Scalar-FP forms (…ss / …sd, e.g. ADDSS, VFMADD132SD): only the
+     * low element is computed, the rest of the register passes
+     * through.  These are not lane-parallel SIMD ops — report no
+     * lane width so the tracer treats them as scalar (consistent with
+     * the non-VEX ADDSS/ADDSD path, which also returns 0 here).  Must
+     * precede the generic single-letter suffix check below, otherwise
+     * the trailing 'd' of "sd" on a v-prefixed mnemonic is mistaken
+     * for the 4-byte integer-dword suffix. */
+    if (mnem[n - 2] == 's' && (mnem[n - 1] == 's' || mnem[n - 1] == 'd')) {
+        return 0;
+    }
     if (mnem[n - 2] == 'p') {
         char c = mnem[n - 1];
         if (c == 's') return 4;

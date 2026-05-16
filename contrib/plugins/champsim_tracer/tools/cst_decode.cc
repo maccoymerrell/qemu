@@ -471,7 +471,8 @@ std::vector<WPEntry> BodyWalker::decode_wp_chain(
         if (wtmpl) we.n_insns = (uint32_t)wtmpl->insns.size();
         decode_field_delta(wpb, (uint32_t)wp_tmpl, wtmpl,
                            state, base_state,
-                           &we.dyn_params, &we.reg_snaps, &we.metaflags);
+                           &we.dyn_params, &we.reg_snaps, &we.metaflags,
+                           &we.lane_masks);
         out.push_back(std::move(we));
     }
     return out;
@@ -533,7 +534,8 @@ void BodyWalker::handle_entry(WalkState &ws, const Callback &cb)
         ? &templates_[by_id_.at((uint32_t)entry_tmpl)] : nullptr;
     decode_field_delta(body_, (uint32_t)entry_tmpl, cp_tmpl,
                        cp_state, nullptr,
-                       &entry.dyn_params, &entry.reg_snaps, &entry.metaflags);
+                       &entry.dyn_params, &entry.reg_snaps, &entry.metaflags,
+                       &entry.lane_masks);
 
     /* WP chain + events.  Both live in their own length-prefixed
      * sub-sections of body_. */
@@ -594,7 +596,8 @@ void BodyWalker::handle_iframe(WalkState &ws)
                        iframe_cp, nullptr,
                        &iframe_entry.dyn_params,
                        &iframe_entry.reg_snaps,
-                       &iframe_entry.metaflags);
+                       &iframe_entry.metaflags,
+                       &iframe_entry.lane_masks);
 
     /* WP chain + events.  Mirror the writer's IFRAME emission: the
      * iframe_wp overlay falls back to iframe_cp as base, matching
@@ -800,7 +803,8 @@ void BodyWalker::decode_field_delta(Reader &outer,
                                     const FieldStateTable *base_state,
                                     std::vector<DynParam>       *dyn_params,
                                     std::vector<RegSnap>        *reg_snaps,
-                                    std::vector<MetaFlagsEntry> *metaflags)
+                                    std::vector<MetaFlagsEntry> *metaflags,
+                                    std::vector<LaneMaskEntry>  *lane_masks)
 {
     Reader sec = outer.sub();
     uint64_t n_records = sec.uleb();
@@ -869,6 +873,42 @@ void BodyWalker::decode_field_delta(Reader &outer,
                                                 slot_lut_,
                                                 reg_snaps, metaflags);
         }
+        /* Lane masks: per-family per-slot dynamic FIDs.  Each non-zero
+         * cell becomes one LaneMaskEntry; zero-valued cells are skipped
+         * so scalar (lane_mask_kind=NONE) instances stay empty. */
+        if (lane_masks) {
+            const InsnTemplate &it = tmpl->insns[i];
+            auto emit_fam = [&](LaneMaskEntry::Family fam,
+                                const std::array<uint16_t, FID_SLOT_COUNT> &fids,
+                                uint8_t n_slots) {
+                if (n_slots > FID_SLOT_COUNT) n_slots = FID_SLOT_COUNT;
+                for (uint8_t s = 0; s < n_slots; s++) {
+                    uint16_t fid = fids[s];
+                    if (fid == 0) continue;
+                    Wide v = lookup_cell(state_blk, state_gen,
+                                         base_blk,  base_gen,
+                                         slot_lut_, idx, fid);
+                    uint64_t mask = v.low64();
+                    if (!mask) continue;
+                    LaneMaskEntry e;
+                    e.insn_index = idx;
+                    e.family     = fam;
+                    e.slot_index = s;
+                    e.mask       = mask;
+                    lane_masks->push_back(e);
+                }
+            };
+            emit_fam(LaneMaskEntry::Src,       ids.fid_src_lane_mask,
+                     (uint8_t)it.src_regs.size());
+            emit_fam(LaneMaskEntry::Dst,       ids.fid_dst_lane_mask,
+                     (uint8_t)it.dst_regs.size());
+            emit_fam(LaneMaskEntry::LoadData,  ids.fid_load_data_lane_mask,
+                     (uint8_t)std::min<uint32_t>(it.max_dep_loads,
+                                                 (uint32_t)n_loads));
+            emit_fam(LaneMaskEntry::StoreData, ids.fid_store_data_lane_mask,
+                     (uint8_t)std::min<uint32_t>(it.max_dep_stores,
+                                                 (uint32_t)n_stores));
+        }
     }
 }
 
@@ -911,13 +951,24 @@ const Template *resolve_branch_target(
     return nullptr;
 }
 
-/* Pull every dyn_param / reg_snap / metaflags entry whose insn_index
- * matches @idx into @out's per-instance vectors.  Existing vectors
- * are in template-walk order, so relative ordering is preserved. */
+/* Resize @v to cover slot_index and write @mask there. */
+void place_lane_mask(std::vector<uint64_t> &v,
+                     uint8_t slot_index, uint64_t mask)
+{
+    if (v.size() <= slot_index) v.resize((size_t)slot_index + 1, 0);
+    v[slot_index] = mask;
+}
+
+/* Pull every dyn_param / reg_snap / metaflags / lane_mask entry whose
+ * insn_index matches @idx into @out's per-instance vectors.  Existing
+ * vectors are in template-walk order, so relative ordering is
+ * preserved.  Lane masks fan out into the four per-slot vectors keyed
+ * by family + slot index. */
 void filter_per_insn(Instruction &out, uint32_t idx,
                      const std::vector<DynParam> &dyns,
                      const std::vector<RegSnap> &snaps,
-                     const std::vector<MetaFlagsEntry> &metaflags)
+                     const std::vector<MetaFlagsEntry> &metaflags,
+                     const std::vector<LaneMaskEntry> &lane_masks)
 {
     for (const DynParam &dp : dyns) {
         if (dp.insn_index == idx) out.dyn_params.push_back(dp);
@@ -927,6 +978,23 @@ void filter_per_insn(Instruction &out, uint32_t idx,
     }
     for (const MetaFlagsEntry &mf : metaflags) {
         if (mf.insn_index == idx) out.metaflags.push_back(mf);
+    }
+    for (const LaneMaskEntry &lm : lane_masks) {
+        if (lm.insn_index != idx) continue;
+        switch (lm.family) {
+        case LaneMaskEntry::Src:
+            place_lane_mask(out.src_lane_mask,        lm.slot_index, lm.mask);
+            break;
+        case LaneMaskEntry::Dst:
+            place_lane_mask(out.dst_lane_mask,        lm.slot_index, lm.mask);
+            break;
+        case LaneMaskEntry::LoadData:
+            place_lane_mask(out.load_data_lane_mask,  lm.slot_index, lm.mask);
+            break;
+        case LaneMaskEntry::StoreData:
+            place_lane_mask(out.store_data_lane_mask, lm.slot_index, lm.mask);
+            break;
+        }
     }
 }
 
@@ -939,7 +1007,8 @@ Instruction build_one(const Template &tmpl, uint32_t insn_idx,
                       const std::vector<Template> &templates,
                       const std::vector<DynParam> &dyns,
                       const std::vector<RegSnap> &snaps,
-                      const std::vector<MetaFlagsEntry> &metaflags)
+                      const std::vector<MetaFlagsEntry> &metaflags,
+                      const std::vector<LaneMaskEntry> &lane_masks)
 {
     Instruction insn;
     const InsnTemplate &I = tmpl.insns[insn_idx];
@@ -962,8 +1031,6 @@ Instruction build_one(const Template &tmpl, uint32_t insn_idx,
     insn.load_addr_dep_mask  = I.load_addr_dep_mask;
     insn.store_addr_dep_mask = I.store_addr_dep_mask;
     insn.lane_parallel       = I.lane_parallel;
-    insn.src_lane_mask       = I.src_lane_mask;
-    insn.dst_lane_mask       = I.dst_lane_mask;
     insn.bb_template_id     = tmpl.template_id;
     insn.insn_index_in_bb   = insn_idx;
     insn.seq_num            = entry.seq_num;
@@ -971,7 +1038,7 @@ Instruction build_one(const Template &tmpl, uint32_t insn_idx,
     insn.thread_switched    = entry.thread_switched;
     insn.bb_template        = &tmpl;
     insn.branch_target_template = resolve_branch_target(h, I, templates);
-    filter_per_insn(insn, insn_idx, dyns, snaps, metaflags);
+    filter_per_insn(insn, insn_idx, dyns, snaps, metaflags, lane_masks);
     return insn;
 }
 
@@ -994,7 +1061,7 @@ std::vector<Instruction> instructions_from_entry(
     for (size_t i = 0; i < cp_tmpl.insns.size(); i++) {
         out.push_back(build_one(cp_tmpl, (uint32_t)i, entry, h, templates,
                                 entry.dyn_params, entry.reg_snaps,
-                                entry.metaflags));
+                                entry.metaflags, entry.lane_masks));
     }
 
     /* WP chain: every WP entry's insns in chain order.  A WP entry
@@ -1011,7 +1078,7 @@ std::vector<Instruction> instructions_from_entry(
         for (uint32_t i = 0; i < wp_n; i++) {
             Instruction insn = build_one(wp_tmpl, i, entry, h, templates,
                                          wp.dyn_params, wp.reg_snaps,
-                                         wp.metaflags);
+                                         wp.metaflags, wp.lane_masks);
             insn.is_wp                  = true;
             insn.wp_index               = (uint16_t)wp.index;
             insn.wp_fault               = wp.fault;

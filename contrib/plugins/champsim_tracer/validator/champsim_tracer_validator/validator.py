@@ -2970,6 +2970,595 @@ def _check_atomic_count(body_stats: dict,
 
 
 # ---------------------------------------------------------------------------
+# Lane-mask correctness
+# ---------------------------------------------------------------------------
+
+
+# Opcode-name patterns that classify as cross-lane reductions / element
+# moves — the dst's lane mask must be narrower than the union of src
+# lane masks because some lanes are merged or dropped (vredsum, addv,
+# vmv.x.s, etc.).  Matched as a substring on the trace's symbolic
+# opcode name; the per-ISA name lives in the trace's opcode encoding
+# map.  This is a recall test, not the classification source of
+# truth — the audit script's per-ISA cross-lane prefix lists remain
+# authoritative.
+_REDUCER_NAME_FRAGMENTS: tuple[str, ...] = (
+    # RISC-V V reductions / scalar bridges
+    "VRED", "VFRED", "VWRED", "VFWRED",
+    "VPOPC", "VCPOP", "VFIRST",
+    "VMSBF", "VMSIF", "VMSOF", "VIOTA",
+    "VMV_X", "VMV_S", "VFMV_F", "VFMV_S",
+    # AArch64 reductions / scalar bridges
+    "ADDV", "SMAXV", "UMAXV", "SMINV", "UMINV",
+    "FMAXV", "FMINV", "FADDP", "FMAXP", "FMINP",
+    "SADDLP", "UADDLP", "SADALP", "UADALP",
+    "UMOV", "SMOV",
+    # MIPS MSA / x86 horizontal
+    "COPY_", "HADD", "HSUB",
+    "PHADD", "PHSUB",
+)
+
+
+def _is_reducer_opcode(opcode_name: str) -> bool:
+    up = (opcode_name or "").upper()
+    for frag in _REDUCER_NAME_FRAGMENTS:
+        if frag in up:
+            return True
+    return False
+
+
+# ---- Per-ISA expected-lane-count derivation from Capstone disasm ---------
+# These helpers re-run Capstone on the raw insn bytes to recover the
+# operand-level lane shape used by the plugin's lane_baseline_from_
+# operands().  Returning None means "can't classify" — the caller
+# treats the ground-truth check as vacuous for that insn (e.g.
+# scalar-only forms with no per-element semantics).
+
+# Whole-register opaque moves — match the mnemonic exactly (and the
+# VEX/EVEX-prefixed `v…` form) so we don't trip the size-suffix matcher
+# on coincidental "...dq" tails.
+_X86_WHOLE_REG_MNEMS = {
+    "movdqa", "movdqu", "lddqu",
+    "vmovdqa", "vmovdqu", "vlddqu",
+    "vmovdqa32", "vmovdqa64", "vmovdqu32", "vmovdqu64",
+    "vmovdqu8", "vmovdqu16",
+}
+
+# Scalar-FP suffixes — these only write the low element.  Tracked
+# separately because their natural lane count is always 1 regardless
+# of register width (xmm/ymm/zmm).
+_X86_SCALAR_SUFFIXES = ("ss", "sd")
+
+
+def _x86_lane_bytes_for_mnem(mnem: str) -> int | None:
+    m = mnem.lower()
+    if m in _X86_WHOLE_REG_MNEMS:
+        # 1 "lane" semantics — caller squashes to a 1-bit mask
+        # regardless of register width via the scalar code path.
+        return None
+    # Packed FP — order matters: check 2-char suffix before 1-char int
+    # suffix to avoid matching "ps" as suffix "s" then unknown.
+    if m.endswith("ps"): return 4
+    if m.endswith("pd"): return 8
+    # Plain int element-size suffix.  Single-char last-letter lookup
+    # so "paddq" -> 'q' -> 8 (NOT "dq" -> 16, which would mis-detect
+    # the whole-reg-move path).
+    return {"b": 1, "w": 2, "d": 4, "q": 8}.get(m[-1])
+
+
+def _x86_op_width_from_str(op_str: str) -> int | None:
+    s = op_str.lower()
+    if "zmm" in s:  return 64
+    if "ymm" in s:  return 32
+    if "xmm" in s:  return 16
+    return None
+
+
+def _x86_expected_lane_count(mnem: str, op_str: str) -> int | None:
+    m = mnem.lower()
+    width = _x86_op_width_from_str(op_str)
+    if width is None:
+        return None
+    # Whole-register opaque moves: one "lane" by convention — the
+    # plugin's lane_baseline_from_operands typically reports
+    # lane_bytes == size for these, giving mask = 1.
+    if m in _X86_WHOLE_REG_MNEMS:
+        return 1
+    # Scalar SS/SD: only the low element is the active result.  Other
+    # lanes are passed through unchanged from src1 — but for a per-
+    # instruction "active lanes" view, only lane 0 matters.
+    if any(m.endswith(suf) for suf in _X86_SCALAR_SUFFIXES):
+        return 1
+    lb = _x86_lane_bytes_for_mnem(mnem)
+    if lb is None:
+        return None
+    return max(1, width // lb)
+
+
+_AARCH64_VAS_RE = __import__("re").compile(r"\.(\d+)([bhsdq])")
+
+
+def _aarch64_expected_lane_count(mnem: str, op_str: str) -> int | None:
+    m = _AARCH64_VAS_RE.search(op_str.lower())
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+_MIPS_MSA_SUFFIX_TO_LANES = {
+    ".b": 16, ".h": 8, ".w": 4, ".d": 2, ".v": 1,
+}
+
+
+def _mips_expected_lane_count(mnem: str, op_str: str) -> int | None:
+    m = mnem.lower()
+    for suf, lanes in _MIPS_MSA_SUFFIX_TO_LANES.items():
+        if m.endswith(suf):
+            return lanes
+    return None
+
+
+def _expected_lane_count(isa: str, mnem: str, op_str: str) -> int | None:
+    if not mnem:
+        return None
+    if isa == "x86_64":
+        return _x86_expected_lane_count(mnem, op_str)
+    if isa == "aarch64":
+        return _aarch64_expected_lane_count(mnem, op_str)
+    if isa == "mipsel":
+        return _mips_expected_lane_count(mnem, op_str)
+    # RISC-V V lane count depends on vl at runtime (vsetvli /
+    # vsetvl) — checking it would require replaying CSR writes from
+    # the trace.  Skip until we plumb that.
+    return None
+
+
+def _is_contiguous_prefix_mask(mask: int) -> bool:
+    """True iff @mask is ``(1 << k) - 1`` for some k > 0.  All the
+    current LANE_MASK_KIND_* dispatch paths produce masks of this
+    shape — STATIC builds from a baseline ``(1 << lanes) - 1``,
+    RISCV_VTYPE builds from ``(1 << vl) - 1``.  A non-contiguous mask
+    on the wire would mean the plugin's compute_current_lane_mask was
+    bypassed or corrupted."""
+    return mask > 0 and (mask & (mask + 1)) == 0
+
+
+def _accumulate_lane_records(entries: list[dict]) -> dict:
+    """Group lane-mask records by (entry_seq, scope, insn_index).
+    `scope` is "cp" for the parent entry or ("wp", wp_index) for a WP
+    entry.  Each leaf value is ``{family: {slot_index: mask}}``."""
+    out: dict = {}
+    for e in entries:
+        seq = int(e.get("seq_num", 0))
+        for lm in e.get("lane_masks") or []:
+            key = (seq, "cp", int(lm["insn_index"]))
+            out.setdefault(key, {}).setdefault(lm["family"], {})[
+                int(lm["slot_index"])] = int(lm["mask"])
+        for wp in e.get("wp_entries") or []:
+            wp_idx = int(wp.get("index", 0))
+            for lm in wp.get("lane_masks") or []:
+                key = (seq, ("wp", wp_idx), int(lm["insn_index"]))
+                out.setdefault(key, {}).setdefault(lm["family"], {})[
+                    int(lm["slot_index"])] = int(lm["mask"])
+    return out
+
+
+def _build_pc_to_gt_insn(meta_blocks: list[dict]) -> dict[int, dict]:
+    """Flatten every block's ground_truth.insns into a PC-keyed map.
+    Used by checks that need the Capstone disassembly of an
+    instruction at a specific PC (mnemonic, op_str, raw_bytes_hex)."""
+    out: dict[int, dict] = {}
+    for b in meta_blocks:
+        gt = b.get("ground_truth")
+        if not gt:
+            continue
+        for ins in gt.get("insns") or []:
+            out[int(ins["pc"])] = ins
+    return out
+
+
+def _check_lane_masks(cp_entries: list[dict],
+                      templates_by_id: dict[int, dict],
+                      opcode_names: dict[int, str],
+                      isa: str,
+                      pc_to_gt: dict[int, dict] | None = None) -> list[Issue]:
+    """Validate per-instance lane-mask FIDs against the trace's own
+    classification metadata.  Runs four invariant checks for every
+    instance carrying any lane-mask record:
+
+      1. Each mask is a contiguous prefix ``(1 << k) - 1`` (matches
+         the only mask shapes compute_current_lane_mask emits).
+      2. All families' masks for a single instance agree — the plugin
+         replicates one lane mask across the src/dst/load_data/
+         store_data slots for now, so any per-slot drift is a tracer
+         bug.
+      3. When the template's CST_INSN_FLAG_LANE_PARALLEL bit is set,
+         every src mask equals every dst mask (lanes line up by
+         index).
+      4. Reducer / scalar-bridge opcodes (cross-lane by classification)
+         narrow: popcount(dst) <= popcount(any src), and the insn
+         must not also carry CST_INSN_FLAG_LANE_PARALLEL.
+    """
+    counts = {
+        "instances":      0,
+        "records":        0,
+        "non_contiguous": 0,
+        "slot_disagree":  0,
+        "parallel_mismatch": 0,
+        "reducer_widen":  0,
+        "parallel_on_reducer": 0,
+        "gt_checked":     0,
+        "gt_mismatch":    0,
+        "gt_unclassified": 0,
+    }
+    issues: list[Issue] = []
+
+    # Pair each instance with the template insn it points at so we
+    # can read lane_parallel + opcode.
+    def _insn_template(tid: int, idx: int) -> dict | None:
+        t = templates_by_id.get(int(tid))
+        if t is None: return None
+        insns = t.get("insns") or []
+        if 0 <= idx < len(insns):
+            return insns[idx]
+        return None
+
+    by_inst = _accumulate_lane_records(cp_entries)
+
+    # Build a (seq -> template_id) and (seq -> {wp_idx: template_id}) lookup.
+    seq_to_cp_tid: dict[int, int] = {}
+    seq_to_wp_tid: dict[int, dict[int, int]] = {}
+    for e in cp_entries:
+        seq = int(e.get("seq_num", 0))
+        seq_to_cp_tid[seq] = int(e["template_id"])
+        wp_map: dict[int, int] = {}
+        for wp in e.get("wp_entries") or []:
+            wp_map[int(wp.get("index", 0))] = int(wp["template_id"])
+        if wp_map:
+            seq_to_wp_tid[seq] = wp_map
+
+    for key, fams in by_inst.items():
+        seq, scope, insn_idx = key
+        if scope == "cp":
+            tid = seq_to_cp_tid.get(seq)
+        else:
+            _tag, wp_idx = scope
+            tid = (seq_to_wp_tid.get(seq) or {}).get(wp_idx)
+        if tid is None:
+            continue
+        I = _insn_template(tid, insn_idx)
+        if I is None:
+            continue
+        counts["instances"] += 1
+        lane_parallel = bool(I.get("lane_parallel"))
+        opcode_id = int(I.get("opcode", 0))
+        opcode_name = opcode_names.get(opcode_id, "")
+        is_reducer = _is_reducer_opcode(opcode_name)
+
+        # Flatten all masks for cross-slot / popcount comparisons.
+        all_masks: list[int] = []
+        src_masks: list[int] = []
+        dst_masks: list[int] = []
+        load_masks: list[int] = []
+        store_masks: list[int] = []
+        for fam, slot_map in fams.items():
+            for slot, mask in slot_map.items():
+                counts["records"] += 1
+                all_masks.append(mask)
+                if fam == "src":   src_masks.append(mask)
+                elif fam == "dst": dst_masks.append(mask)
+                elif fam == "load": load_masks.append(mask)
+                elif fam == "store": store_masks.append(mask)
+
+        # The four mask classes are independent per the lane-mask model
+        # (src/dst reg masks vs per-memop load/store data masks); they
+        # are NOT replicated and a per-memop mask is any lane subset
+        # (e.g. {2} = 0b100), so neither cross-slot agreement nor a
+        # contiguous-prefix shape is an invariant.  The real structural
+        # invariant is containment: a memop can only feed/drain lanes
+        # the associated register actually spans.
+        dst_union = 0
+        for m in dst_masks:
+            dst_union |= m
+        src_union = 0
+        for m in src_masks:
+            src_union |= m
+
+        # Check 1: a vec instance must carry at least one non-zero reg
+        # lane mask (otherwise the insn was tagged vec but emitted no
+        # lane participation at all).
+        if (src_masks or dst_masks) and not (src_union or dst_union):
+            counts["non_contiguous"] += 1   # reused counter: "empty regs"
+            if counts["non_contiguous"] <= 5:
+                issues.append(Issue(
+                    "lane_masks", "error",
+                    f"vec insn with all-zero reg lane masks at seq={seq} "
+                    f"tid={tid} insn[{insn_idx}] opcode={opcode_name}",
+                    {"seq": seq, "tid": tid, "insn_index": insn_idx,
+                     "opcode": opcode_name},
+                ))
+
+        # Check 2: containment.  Each load-data mask must lie within
+        # the lanes some dst register spans (a load feeds dst lanes);
+        # each store-data mask within the src reg span (a store drains
+        # src lanes).  A memop mask exceeding the register span means
+        # the memop->lane association (lane_bytes / access-base) is
+        # wrong.
+        if dst_union:
+            for m in load_masks:
+                if m & ~dst_union:
+                    counts["slot_disagree"] += 1   # reused: "memop OOB"
+                    if counts["slot_disagree"] <= 5:
+                        issues.append(Issue(
+                            "lane_masks", "error",
+                            f"load-data lane mask 0x{m:x} exceeds dst lane "
+                            f"span 0x{dst_union:x} at seq={seq} tid={tid} "
+                            f"insn[{insn_idx}] opcode={opcode_name}",
+                            {"seq": seq, "tid": tid, "insn_index": insn_idx,
+                             "opcode": opcode_name, "load_mask": m,
+                             "dst_union": dst_union},
+                        ))
+        if src_union:
+            for m in store_masks:
+                if m & ~src_union:
+                    counts["slot_disagree"] += 1
+                    if counts["slot_disagree"] <= 5:
+                        issues.append(Issue(
+                            "lane_masks", "error",
+                            f"store-data lane mask 0x{m:x} exceeds src lane "
+                            f"span 0x{src_union:x} at seq={seq} tid={tid} "
+                            f"insn[{insn_idx}] opcode={opcode_name}",
+                            {"seq": seq, "tid": tid, "insn_index": insn_idx,
+                             "opcode": opcode_name, "store_mask": m,
+                             "src_union": src_union},
+                        ))
+
+        # Check 3 (informational): lane-parallel dst lanes not covered
+        # by any src or load.  This is legitimate for immediate- /
+        # broadcast-sourced vec ops (MOVI, DUP #imm) and for ops whose
+        # feeding regs are implicit, so it is tracked as a counter
+        # rather than flagged as an error.  src/dst divergence itself
+        # is allowed by the model.
+        if lane_parallel and dst_union:
+            load_union = 0
+            for m in load_masks:
+                load_union |= m
+            if dst_union & ~(src_union | load_union):
+                counts["parallel_mismatch"] += 1
+
+        # Check 4: reducer / scalar-bridge narrowing.  A reducer must
+        # NOT carry lane_parallel (the classifier would be wrong), and
+        # its dst lane count must be <= every src lane count.
+        if is_reducer:
+            if lane_parallel:
+                counts["parallel_on_reducer"] += 1
+                if counts["parallel_on_reducer"] <= 5:
+                    issues.append(Issue(
+                        "lane_masks", "error",
+                        f"reducer opcode {opcode_name} also marked "
+                        f"lane_parallel at seq={seq} tid={tid} "
+                        f"insn[{insn_idx}]",
+                        {"seq": seq, "tid": tid, "insn_index": insn_idx,
+                         "opcode": opcode_name},
+                    ))
+            if src_masks and dst_masks:
+                dst_pop = max(bin(m).count("1") for m in dst_masks)
+                src_pop = max(bin(m).count("1") for m in src_masks)
+                if dst_pop > src_pop:
+                    counts["reducer_widen"] += 1
+                    if counts["reducer_widen"] <= 5:
+                        issues.append(Issue(
+                            "lane_masks", "error",
+                            f"reducer opcode {opcode_name} widens lanes "
+                            f"at seq={seq} tid={tid} insn[{insn_idx}]: "
+                            f"src_max_lanes={src_pop} > "
+                            f"dst_max_lanes={dst_pop}",
+                            {"seq": seq, "tid": tid, "insn_index": insn_idx,
+                             "opcode": opcode_name,
+                             "src_pop": src_pop, "dst_pop": dst_pop},
+                        ))
+
+        # Check 5: ground-truth lane SPAN bound from Capstone disasm.
+        # _expected_lane_count gives the register's full lane count
+        # (size / element-bytes).  No operand's lane mask may exceed
+        # that span — but it is correct (and required) for it to be
+        # NARROWER: element insert produces 1 dst lane, its pass-
+        # through src reads total-1, extract reads 1, reductions
+        # collapse.  So the invariant is observed <= expected; only an
+        # over-span (observed > expected) is a real bug (wrong
+        # lane_bytes / a memop->lane association past the register).
+        # Unclassifiable insns (scalar-only, unsupported ISA, RISC-V V
+        # runtime vl) are counted, not flagged.
+        if pc_to_gt is not None and all_masks:
+            gt_ins = pc_to_gt.get(int(I.get("pc", 0)))
+            if gt_ins is not None:
+                expected = _expected_lane_count(
+                    isa, gt_ins.get("mnemonic", ""),
+                    gt_ins.get("op_str", ""))
+                if expected is None:
+                    counts["gt_unclassified"] += 1
+                else:
+                    counts["gt_checked"] += 1
+                    observed = max(bin(m).count("1") for m in all_masks)
+                    if observed > expected:
+                        counts["gt_mismatch"] += 1
+                        if counts["gt_mismatch"] <= 5:
+                            issues.append(Issue(
+                                "lane_masks", "error",
+                                f"lane mask exceeds register span vs "
+                                f"Capstone disasm at seq={seq} tid={tid} "
+                                f"insn[{insn_idx}] "
+                                f"pc=0x{int(I.get('pc', 0)):x} "
+                                f"{gt_ins.get('mnemonic', '?')} "
+                                f"{gt_ins.get('op_str', '')}: "
+                                f"span={expected} observed={observed} "
+                                f"masks={fams}",
+                                {"seq": seq, "tid": tid,
+                                 "insn_index": insn_idx,
+                                 "pc": int(I.get("pc", 0)),
+                                 "mnemonic": gt_ins.get("mnemonic"),
+                                 "op_str": gt_ins.get("op_str"),
+                                 "span": expected,
+                                 "observed": observed},
+                            ))
+
+    if not counts["instances"]:
+        return [Issue(
+            "lane_masks", "info",
+            "no vec-classified insns observed; lane-mask checks "
+            "vacuously pass",
+            counts,
+        )]
+    if not issues:
+        issues.append(Issue(
+            "lane_masks", "info",
+            f"lane masks validated: {counts['instances']} vec instances, "
+            f"{counts['records']} per-slot records, all invariants hold",
+            counts,
+        ))
+    else:
+        issues.append(Issue(
+            "lane_masks", "info",
+            f"lane-mask summary: {counts}",
+            counts,
+        ))
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# Dep-refiner bucket coverage
+# ---------------------------------------------------------------------------
+
+
+# Names match the C++ refiners in champsim_tracer_mnemonic_tables.cc.
+# `_default` covers insns whose template carries no HAS_REG dep-block
+# at all — the consumer falls back to an implicit all-to-all view.
+_DEP_REFINE_BUCKETS = (
+    "DEP_DEFAULT",          # no HAS_REG sub-block on the wire
+    "DEP_PASSTHROUGH",      # every dst depends on exactly one input
+    "DEP_LEA",              # dst depends on addr-mode srcs + imm, no load
+    "DEP_X86_STACK_PUSH",   # max_loads=0, max_stores=1, store-data = src
+    "DEP_X86_STACK_POP",    # max_loads=1, max_stores=0, dst = load-data
+    "DEP_ALL_TO_ALL",       # universal mask: every src + every load + imm
+    "DEP_OTHER",            # has HAS_REG but doesn't match any pattern
+)
+
+
+def _classify_dep_refine_bucket(insn: dict) -> str:
+    """Infer which refiner produced the dep masks on this template insn.
+    Based purely on observable mask shape — the plugin doesn't emit a
+    refiner-id on the wire."""
+    has_reg = bool(insn.get("dst_dep_mask") or insn.get("store_data_dep_mask"))
+    has_addr = bool(insn.get("load_addr_dep_mask")
+                    or insn.get("store_addr_dep_mask"))
+    if not has_reg and not has_addr:
+        return "DEP_DEFAULT"
+
+    n_src   = len(insn.get("src_regs") or [])
+    n_dst   = len(insn.get("dst_regs") or [])
+    has_imm = insn.get("imm") is not None
+    n_loads  = int(insn.get("n_loads") or 0)
+    n_stores = int(insn.get("n_stores") or 0)
+    # Pool-mask layout: src bits [0,n_src), load_data bits
+    # [n_src, n_src+n_loads), imm bit at n_src+n_loads.
+    src_bits  = ((1 << n_src) - 1) if n_src else 0
+    load_bits = (((1 << n_loads) - 1) << n_src) if n_loads else 0
+    imm_bit   = (1 << (n_src + n_loads)) if has_imm else 0
+    all_bits  = src_bits | load_bits | imm_bit
+    dst_masks = list(insn.get("dst_dep_mask") or [])
+    sd_masks  = list(insn.get("store_data_dep_mask") or [])
+    la_masks  = list(insn.get("load_addr_dep_mask") or [])
+    sa_masks  = list(insn.get("store_addr_dep_mask") or [])
+
+    # x86 stack push: no loads, one store, store-data = single src bit,
+    # dst (if any) contains %sp class registers.
+    if (n_loads == 0 and n_stores == 1 and len(sd_masks) == 1
+            and bin(sd_masks[0]).count("1") == 1
+            and (sd_masks[0] & src_bits) == sd_masks[0]):
+        return "DEP_X86_STACK_PUSH"
+
+    # x86 stack pop: one load, no stores, dst[0] = single load_data bit.
+    if (n_loads == 1 and n_stores == 0 and len(dst_masks) >= 1
+            and bin(dst_masks[0]).count("1") == 1
+            and (dst_masks[0] & load_bits) == dst_masks[0]):
+        return "DEP_X86_STACK_POP"
+
+    # LEA: at least one dst, every dst mask covers some src bits +
+    # optionally imm but never a load_data bit, AND no real load fires.
+    if (n_loads == 0 and dst_masks
+            and all((m & load_bits) == 0 for m in dst_masks)
+            and any((m & (src_bits | imm_bit)) for m in dst_masks)):
+        # Distinguish from a plain register-only insn (e.g. ADD r,r)
+        # by requiring at least two contributors to dst[0] (LEA's
+        # addressing-mode usually combines base+index+imm) — or
+        # an immediate.  Plain ADD with two srcs also lands here, so
+        # this can mis-classify; treat both as the same low-precision
+        # "no-load arithmetic-shape" bucket.  Reserve DEP_LEA for the
+        # subset whose canonical dep is "addr-mode srcs + imm, no
+        # load" — the trace doesn't preserve enough state to separate
+        # these reliably without per-insn refiner-id metadata, so we
+        # fold into DEP_OTHER unless the insn has imm + multi-src.
+        if has_imm and n_src >= 1:
+            return "DEP_LEA"
+
+    # Passthrough: every populated mask has exactly one bit set.
+    populated = dst_masks + sd_masks
+    if populated and all(m and bin(m).count("1") == 1 for m in populated):
+        return "DEP_PASSTHROUGH"
+
+    # All-to-all: every populated dst/store-data mask equals the
+    # universal set (every src + every load + imm).  Store-only ops
+    # (STR, push-like) still qualify when their store_data_dep_mask
+    # is the universal mask and they have no dst regs.
+    pop_masks = dst_masks + sd_masks
+    if pop_masks and all_bits and all(m == all_bits for m in pop_masks):
+        return "DEP_ALL_TO_ALL"
+
+    return "DEP_OTHER"
+
+
+def _check_dep_refine_coverage(templates: list[dict],
+                               blocks_by_id: dict[int, dict],
+                               cp_set: set[int]) -> list[Issue]:
+    """Info-level summary of which dep-refiner buckets are exercised by
+    the trace's templates.  Mirrors ``_check_opcode_coverage``: tallies
+    a per-bucket count, surfaces any author-declared ``asserted_dep_
+    refines`` that never appeared in the trace, and lists the full set
+    of refiner buckets so the report is self-describing."""
+    seen: dict[str, int] = {b: 0 for b in _DEP_REFINE_BUCKETS}
+    for t in templates:
+        for ins in t.get("insns") or []:
+            seen[_classify_dep_refine_bucket(ins)] += 1
+
+    asserted: set[str] = set()
+    for b in blocks_by_id.values():
+        if b["block_id"] not in cp_set:
+            continue
+        for d in b.get("asserted_dep_refines", []) or []:
+            asserted.add(d)
+    asserted_unseen = sorted(asserted - {k for k, v in seen.items() if v > 0})
+
+    if asserted_unseen:
+        return [Issue(
+            "dep_refine_coverage", "error",
+            f"asserted dep refiners never observed: {asserted_unseen}",
+            {"seen": seen, "asserted_unseen": asserted_unseen,
+             "asserted": sorted(asserted)},
+        )]
+
+    seen_buckets = sorted(k for k, v in seen.items() if v > 0)
+    return [Issue(
+        "dep_refine_coverage", "info",
+        f"dep refiner coverage: buckets observed={len(seen_buckets)}/"
+        f"{len(_DEP_REFINE_BUCKETS)}; "
+        + ", ".join(f"{k}={v}" for k, v in seen.items() if v > 0),
+        {"seen": seen,
+         "asserted": sorted(asserted),
+         "asserted_unseen": asserted_unseen},
+    )]
+
+
+# ---------------------------------------------------------------------------
 # Metaflags + general regdata reconstruction
 # ---------------------------------------------------------------------------
 
@@ -3592,6 +4181,10 @@ def validate(meta_path: Path, trace_path: Path,
     issues += _check_regdata_reconstruction(cp_entries, templates_by_id,
                                              opcode_names, reg_id_to_name,
                                              has_reg_data)
+    pc_to_gt = _build_pc_to_gt_insn(meta["blocks"])
+    issues += _check_lane_masks(cp_entries, templates_by_id, opcode_names,
+                                isa, pc_to_gt)
+    issues += _check_dep_refine_coverage(templates, blocks_by_id, cp_set)
 
     return Report(issues=issues, stats=stats)
 

@@ -143,6 +143,19 @@ latex_elements = {
 \usepackage{titlesec}
 \titleformat{\chapter}[hang]{\normalfont\sffamily\Huge\bfseries}{\thechapter.}{1em}{}
 \titlespacing*{\chapter}{0pt}{-30pt}{20pt}
+% Sphinx's inlineliteralwraps already breaks inline literals at
+% . , ; ? ! / and backslash, but NOT at underscore.  Almost every
+% identifier in this manual is snake_case (CST_FID_* FID names,
+% GEN_OP_* opcodes, champsim_tracer_*.{h,cc} filenames), so without
+% an underscore break point those tokens overflow the narrow columns
+% of the generated encoding tables and the architecture component
+% table.  Make \_ a discretionary break: when the line breaks the
+% underscore stays at the end of the broken line (matching Sphinx's
+% verbatim "_ stays at end of line" convention); when it does not
+% break it renders normally.  Harmless in prose, where underscores
+% only ever appear inside the same identifiers.
+\let\spxorigunderscore\_
+\protected\def\_{\discretionary{\spxorigunderscore}{}{\spxorigunderscore}}
 """,
     # Drop the empty pages Sphinx normally inserts between chapters
     # for a single-sided PDF; they're useful in print but waste pages

@@ -493,6 +493,9 @@ struct Header {
     uint64_t start_insn = 0;
     uint64_t warmup_insns = 0;
     uint64_t total_target_insns = 0;
+    /* SimPoint weight: fraction of whole-program execution this
+     * segment represents (0.0 for non-simpoint segments). */
+    double   weight = 0.0;
     std::string command;
     std::string datetime;
     std::string comment;

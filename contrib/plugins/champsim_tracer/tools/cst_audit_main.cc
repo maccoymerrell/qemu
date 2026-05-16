@@ -20,6 +20,7 @@
 #include <array>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "cst_format.h"
@@ -103,7 +104,14 @@ struct Bucket {
 };
 
 struct Stats {
+    /* On-disk size of the whole .cst container (tar of header +
+     * possibly-compressed body).  Informational only: it is NOT a
+     * valid denominator for the uncompressed member sizes below. */
     uint64_t file_size         = 0;
+    /* Raw size of the body member as it sits in the tar (compressed
+     * bytes when body_codec is non-empty, else == body_total). */
+    uint64_t body_compressed   = 0;
+    std::string body_codec;
     uint64_t header_bytes      = 0;
     uint64_t templates_count   = 0;
     uint64_t body_total        = 0;
@@ -160,7 +168,8 @@ static inline void tally_fd_record(
  * for memory-backed (uncompressed body) and stream-backed
  * (decompressor-piped) inputs; the Reader handles refilling. */
 void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
-               const std::vector<uint32_t> &insns_by_tid, Stats *s)
+               const std::unordered_map<uint32_t, uint32_t> &insns_by_tid,
+               Stats *s)
 {
     const FidTables fid(ids);
     int32_t prev_cp_tid = 0;
@@ -176,9 +185,11 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
             prev_cp_tid += (int32_t)tdelta;
             s->cp_entry_framing.bytes += body.consumed() - tag_start;
             s->cp_entries++;
-            if (prev_cp_tid >= 0 &&
-                (uint32_t)prev_cp_tid < insns_by_tid.size()) {
-                s->cp_total_insns += insns_by_tid[prev_cp_tid];
+            if (prev_cp_tid >= 0) {
+                auto it = insns_by_tid.find((uint32_t)prev_cp_tid);
+                if (it != insns_by_tid.end()) {
+                    s->cp_total_insns += it->second;
+                }
             }
 
             /* CP field-delta section.  sub() consumes the ULEB
@@ -223,9 +234,11 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                 prev_wp_tid += (int32_t)wd;
                 s->wp_entry_framing.bytes += wpb.consumed() - wfs;
                 s->wp_entry_framing.count += 1;
-                if (prev_wp_tid >= 0 &&
-                    (uint32_t)prev_wp_tid < insns_by_tid.size()) {
-                    s->wp_total_insns += insns_by_tid[prev_wp_tid];
+                if (prev_wp_tid >= 0) {
+                    auto it = insns_by_tid.find((uint32_t)prev_wp_tid);
+                    if (it != insns_by_tid.end()) {
+                        s->wp_total_insns += it->second;
+                    }
                 }
 
                 size_t wp_sec_in = wpb.consumed();
@@ -343,13 +356,21 @@ std::string fmt_n(uint64_t v)
     return out;
 }
 
+/* Shared left-justified label column width for the ON DISK / MEMBER
+ * SIZES / BODY BREAKDOWN sections.  Must be >= the longest label
+ * ("REGFILE records (per-thread initial state)", 42 chars) so every
+ * value/percent column lines up; the previous hard-coded 34 let the
+ * IFRAME/REGFILE rows overflow and shoved their columns right, and
+ * the TOTAL line used a different width again. */
+static constexpr int LABEL_W = 42;
+
 std::string row(const std::string &label, uint64_t b, uint64_t total,
                 uint64_t count = 0, const char *per = nullptr)
 {
     double pct = total ? 100.0 * b / total : 0.0;
     char buf[256];
     std::string lbl = label;
-    if (lbl.size() < 34) lbl.resize(34, ' ');
+    if (lbl.size() < (size_t)LABEL_W) lbl.resize(LABEL_W, ' ');
     std::string hb = human((double)b);
     if (count) {
         std::snprintf(buf, sizeof(buf),
@@ -386,10 +407,32 @@ std::string fd_row(const std::string &label, const Bucket &cp,
 
 void print_report(const Stats &s)
 {
-    uint64_t total = s.file_size;
-    std::printf("FILE                                %14s  100.00%%\n",
-                human((double)total).c_str());
+    /* The member sizes below are measured uncompressed (the header
+     * is decompressed eagerly; the body is walked through the
+     * decompressor), so the 100% anchor MUST be the uncompressed
+     * total, not the on-disk container size.  Dividing uncompressed
+     * member bytes by the compressed container size produced bogus
+     * percentages well over 100% for codec'd traces. */
+    uint64_t total = s.header_bytes + s.body_total;
+
+    std::printf("=== ON DISK ===\n");
+    std::printf("  %-*s %14s\n", LABEL_W, "container (.cst)",
+                human((double)s.file_size).c_str());
+    if (!s.body_codec.empty()) {
+        double ratio = s.body_compressed
+                     ? (double)s.body_total / (double)s.body_compressed
+                     : 0.0;
+        char note[64];
+        std::snprintf(note, sizeof(note), "body member (%s)",
+                      s.body_codec.c_str());
+        std::printf("  %-*s %14s  %.2fx vs uncompressed body\n",
+                    LABEL_W, note,
+                    human((double)s.body_compressed).c_str(), ratio);
+    }
+
     std::printf("\n=== MEMBER SIZES (uncompressed) ===\n");
+    std::printf("  %-*s %14s  100.00%%\n", LABEL_W, "TOTAL uncompressed",
+                human((double)total).c_str());
     std::printf("%s\n", row("HEADER member", s.header_bytes, total,
                              s.templates_count, "tmpl").c_str());
     std::printf("%s\n", row("BODY member (records)", s.body_total, total).c_str());
@@ -500,13 +543,24 @@ int main(int argc, char **argv)
 
         Stats s;
         s.file_size = (size_t)st.st_size;
+        s.body_compressed = cf->body_raw().size;
+        s.body_codec = cf->body_codec();
         s.header_bytes = cf->header().size;
         s.templates_count = templates.size();
 
-        std::vector<uint32_t> insns_by_tid;
+        /* Key by the producer-assigned template_id, NOT by position
+         * in the templates vector: template ids are read verbatim
+         * from the header stream (cst_format parse_templates_at) and
+         * are not guaranteed dense or in insertion order, exactly as
+         * the decoder resolves them via its by_id map.  The old
+         * vector-by-position lookup mis-mapped every entry once ids
+         * diverged from indices, and the "id < size()" bound silently
+         * dropped any entry whose id exceeded the template count --
+         * the source of the "way off" instruction totals. */
+        std::unordered_map<uint32_t, uint32_t> insns_by_tid;
         insns_by_tid.reserve(templates.size());
         for (const auto &t : templates) {
-            insns_by_tid.push_back((uint32_t)t.insns.size());
+            insns_by_tid[t.template_id] = (uint32_t)t.insns.size();
         }
 
         try {

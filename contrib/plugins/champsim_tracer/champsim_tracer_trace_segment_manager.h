@@ -62,6 +62,8 @@ public:
     void start(const char *label, uint64_t start_insn, uint64_t stop_insn,
                uint64_t warmup_insns,
                uint64_t total_target_insns,
+               uint32_t seed_thread_id,
+               double simpoint_weight,
                const std::vector<InitialRegSnap> *initial_regfile);
     void finish(const std::function<void()> &flush_hook);
 
@@ -88,6 +90,8 @@ private:
     void open_output(const char *label,
                      uint64_t warmup_insns,
                      uint64_t total_target_insns,
+                     uint32_t seed_thread_id,
+                     double simpoint_weight,
                      const std::vector<InitialRegSnap> *regfile);
 
     TraceSegment        *current_       = nullptr;

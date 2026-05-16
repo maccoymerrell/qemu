@@ -289,17 +289,36 @@ static void assign_dst_lane(InsnFields *f, uint16_t cap_id, uint64_t lane)
 static void warn_unknown_instruction(uint64_t pc, const char *reason,
                                      const char *mnem, const char *disas)
 {
-    if (!unknown_warn_file) {
-        return;
+    g_mutex_lock(&unknown_warn_lock);
+    g_stats.unknown_insn_warnings++;
+
+    /* Surface the first unknown instruction on stderr so the run
+     * isn't silently missing classifications, then go quiet (the
+     * per-insn detail keeps flowing to the .unknown_warnings.log
+     * file, and the exit summary's "Unknown-instruction warnings"
+     * line is the running total). */
+    static bool warned_once = false;
+    if (!warned_once) {
+        warned_once = true;
+        fprintf(stderr,
+                "champsim_tracer: unknown instruction at pc=0x%" PRIx64
+                " (mnemonic=%s) — traced with opcode=GEN_OP_UNKNOWN.\n"
+                "  Further occurrences are silent; see the exit-summary "
+                "count and %s for the full list.  Run "
+                "champsim_tracer_mnemonic_audit.py on a sample trace to "
+                "find mnemonics needing classification rows.\n",
+                pc, mnem ? mnem : "<none>",
+                unknown_warn_file ? "the .unknown_warnings.log file"
+                                  : "(no warn-log file open)");
     }
 
-    g_mutex_lock(&unknown_warn_lock);
-    fprintf(unknown_warn_file,
-            "pc=0x%" PRIx64 " isa=%u reason=%s mnemonic=%s disas=\"%s\"\n",
-            pc, (unsigned int)trace_isa, reason,
-            mnem ? mnem : "<none>", disas ? disas : "");
-    fflush(unknown_warn_file);
-    g_stats.unknown_insn_warnings++;
+    if (unknown_warn_file) {
+        fprintf(unknown_warn_file,
+                "pc=0x%" PRIx64 " isa=%u reason=%s mnemonic=%s disas=\"%s\"\n",
+                pc, (unsigned int)trace_isa, reason,
+                mnem ? mnem : "<none>", disas ? disas : "");
+        fflush(unknown_warn_file);
+    }
     g_mutex_unlock(&unknown_warn_lock);
 }
 

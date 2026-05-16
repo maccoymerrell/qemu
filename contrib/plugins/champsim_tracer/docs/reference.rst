@@ -266,10 +266,13 @@ records.
      - SIMD / vector multiply.
    * - 39
      - ``GEN_OP_VEC_MOV``
-     - SIMD / vector move (also covers ``vmovdqa`` / ``vmovups``).
+     - SIMD / vector move, incl. vector loads/stores (``vmovdqa`` /
+       ``vmovups``, AArch64 NEON/SVE ``ld1``/``ld2``/``ld3``/``ld4``
+       and ``st1``..``st4`` structure loads/stores).
    * - 40
      - ``GEN_OP_VEC_SHUF``
-     - SIMD permute / shuffle / blend.
+     - SIMD permute / shuffle / blend, incl. element insert/extract
+       (``pinsr*`` / ``pextr*`` / ``insertps`` / ``extractps``).
    * - 41
      - ``GEN_OP_VEC_LOGIC``
      - Bitwise operations on vector registers.
@@ -594,94 +597,75 @@ Field-ID space (``CST_FID_*``)
 
 Per-instruction dynamic observations the body stream encodes as
 deltas against template defaults.  Detailed semantics are in
-:doc:`/format`; the table below is the at-a-glance mapping.
+:doc:`/format` (Reference §5.1); the table below is the at-a-glance
+mapping.
+
+.. note::
+
+   **Numeric field-IDs are non-normative.**  They are ULEB128 on
+   the wire and the writer chooses the (id → name) assignment to
+   keep hot fields in the 1-byte range; decoders MUST resolve every
+   field by *name* via the header's ``field_id`` encoding map, never
+   by a hard-coded number.  The slotted families are *interleaved by
+   slot* (slot ``k`` of every family co-located) rather than
+   family-then-slot.  ``CST_FID_SLOT_COUNT`` is **64** (raised from
+   16); the old ``CST_FID_EXTRA_*`` overflow vectors were retired
+   with that raise and do not exist in format ``0x1D``.
 
 .. list-table::
    :header-rows: 1
-   :widths: 18 28 54
+   :widths: 34 66
 
-   * - ID
-     - Name
-     - Payload
-   * - 0x00
-     - ``CST_FID_N_LOADS``
-     - SLEB delta — current valid load slot count.
-   * - 0x01..0x10
-     - ``CST_FID_LOAD_ADDR0`` .. ``CST_FID_LOAD_ADDR15``
-     - SLEB delta of the access vaddr modulo 2^512.
-   * - 0x11..0x20
-     - ``CST_FID_STORE_ADDR0`` .. ``CST_FID_STORE_ADDR15``
-     - SLEB delta of the store vaddr.
-   * - 0x21..0x30
-     - ``CST_FID_LOAD_DATA0`` .. ``CST_FID_LOAD_DATA15``
-     - SLEB delta of the loaded value (gated by
-       ``CST_FLAG_MEM_DATA``).
-   * - 0x31..0x40
-     - ``CST_FID_STORE_DATA0`` .. ``CST_FID_STORE_DATA15``
-     - SLEB delta of the stored value (gated by
-       ``CST_FLAG_MEM_DATA``).
-   * - 0x41..0x50
-     - *(reserved)*
-     - Future source-register-value extension.  Not currently emitted;
-       the writer captures destination values post-execution
-       (see 0x51..0x60).
-   * - 0x51..0x60
-     - ``CST_FID_DST_REG0`` .. ``CST_FID_DST_REG15``
-     - SLEB delta of the destination-register post-execution snapshot
-       (gated by ``CST_FLAG_REG_DATA``).
-   * - 0x61
-     - ``CST_FID_N_STORES``
-     - SLEB delta — current valid store slot count.
-   * - 0x62
-     - ``CST_FID_EXTRA_LOAD_ADDR``
-     - Raw ULEB vector — load addresses for slots 16+.
-   * - 0x63
-     - ``CST_FID_EXTRA_STORE_ADDR``
-     - Raw ULEB vector — store addresses for slots 16+.
-   * - 0x64
-     - ``CST_FID_EXTRA_LOAD_DATA``
-     - Raw ULEB vector — load values for slots 16+.
-   * - 0x65
-     - ``CST_FID_EXTRA_STORE_DATA``
-     - Raw ULEB vector — store values for slots 16+.
-   * - 0x66..0x6F
-     - *(reserved)*
-     - Future memop metadata.
-   * - 0x70
-     - ``CST_FID_INSN_BYTES_LO``
-     - SLEB delta — low 8 bytes of instruction encoding.
-   * - 0x71
-     - ``CST_FID_INSN_BYTES_HI``
-     - SLEB delta — high 8 bytes (only x86 / wide encodings).
-   * - 0x72
-     - ``CST_FID_INSN_OPCODE``
-     - SLEB delta — generic opcode override.
-   * - 0x73
-     - ``CST_FID_INSN_BRANCH_TYPE``
-     - SLEB delta — branch-type override.
-   * - 0x74
-     - ``CST_FID_INSN_FLAGS``
-     - SLEB delta — per-insn flag byte (cond + has_imm + sync).
-   * - 0x75
-     - ``CST_FID_INSN_IMMEDIATE``
-     - SLEB delta — signed immediate.
-   * - 0x76
-     - ``CST_FID_INSN_SIZE``
-     - SLEB delta — instruction byte length.
-   * - 0x77
-     - ``CST_FID_METAFLAGS``
-     - SLEB delta — canonical Z/N/C/V/P byte for ALU insns that
-       write the ISA's integer-flags register
-       (see :ref:`metaflags`).  Gated by ``CST_FLAG_REG_DATA``;
-       emitted only when the insn's template sets
-       ``writes_int_flags`` (i.e., its dst maps to a
+   * - Family (well-known name)
+     - Payload / gating
+   * - ``CST_FID_N_LOADS`` / ``CST_FID_N_STORES``
+     - Scalar delta — current valid load / store slot count for
+       this execution; baseline default zero.
+   * - ``CST_FID_METAFLAGS``
+     - Canonical Z/N/C/V/P byte for ALU insns that write the ISA's
+       integer-flags register (see :ref:`metaflags`).  Gated by
+       ``CST_FLAG_REG_DATA``; emitted only when the insn's template
+       sets ``writes_int_flags`` (its dst maps to a
        ``RegClassification`` row with ``.is_int_flags = true``).
-   * - 0x78..0xFE
-     - *(reserved)*
-     - Available for future scalar field-ID assignments.
-   * - 0xFF
-     - ``CST_FID_EXTENDED``
-     - Reserved escape; not currently used.
+   * - ``CST_FID_LOAD_ADDR{k}`` / ``CST_FID_STORE_ADDR{k}``,
+       ``k ∈ [0, 64)``
+     - Scalar delta of the load / store access vaddr for memop
+       slot ``k``.
+   * - ``CST_FID_LOAD_DATA{k}`` / ``CST_FID_STORE_DATA{k}``,
+       ``k ∈ [0, 64)``
+     - Scalar delta of the loaded / stored value for memop slot
+       ``k`` (up to 512 bits, ``SLEB_WIDE``).  Gated by
+       ``CST_FLAG_MEM_DATA``.
+   * - ``CST_FID_DST_REG{k}``, ``k ∈ [0, 64)``
+     - Scalar delta of the destination-register post-execution
+       snapshot for ``dst_regs[k]``.  Gated by
+       ``CST_FLAG_REG_DATA``.  Source-register values are not
+       emitted — consumers reconstruct them from the regfile.
+   * - ``CST_FID_SRC_LANE_MASK{k}`` /
+       ``CST_FID_DST_LANE_MASK{k}``, ``k ∈ [0, 64)``
+     - Scalar delta — per-source / per-destination vector lane
+       participation bitmap (bit ``j`` = lane ``j`` active).
+       Emitted only when the insn's ``CST_INSN_FLAG_VEC`` bit is
+       set; src and dst masks are independent.
+   * - ``CST_FID_LOAD_DATA_LANE_MASK{k}`` /
+       ``CST_FID_STORE_DATA_LANE_MASK{k}``, ``k ∈ [0, 64)``
+     - Scalar delta — which lanes take their value from / are
+       drained by memop slot ``k``, computed per memop from its
+       address + size vs the access base and element width.  Gated
+       by ``CST_INSN_FLAG_VEC``.
+   * - ``CST_FID_INSN_BYTES_LO`` / ``CST_FID_INSN_BYTES_HI``
+     - Scalar delta — low / high 8 bytes of the instruction
+       encoding (HI only for x86 / wide encodings).
+   * - ``CST_FID_INSN_OPCODE`` / ``CST_FID_INSN_BRANCH_TYPE`` /
+       ``CST_FID_INSN_FLAGS``
+     - Scalar delta — generic-opcode / branch-type / per-insn
+       flag-byte override vs the template baseline.  The flag byte
+       packs ``BRANCH_COND`` | ``HAS_IMM`` | ``ATOMIC`` | ``VEC`` |
+       ``LANE_PARALLEL`` | ``HAS_DEP_BLOCK``.
+   * - ``CST_FID_INSN_IMMEDIATE`` / ``CST_FID_INSN_SIZE``
+     - Scalar delta — signed immediate / instruction byte length.
+   * - ``CST_FID_EXTENDED``
+     - Reserved escape; reserve only, not currently emitted.
 
 .. _metaflags:
 

@@ -273,6 +273,17 @@ Regdata semantics (when ``--regdata`` is in effect)
    Atomic RMW (lock xadd / ldadd / amoadd / ll-sc) is skipped because
    the dst is loaded from memory rather than computed from srcs.
 
+``lane_masks``
+   Per vec-classified instance, validates the four lane-mask
+   families against the lane model: every load/store-data mask is
+   contained within the register-lane span it feeds/drains; for
+   lane-parallel insns every dst lane is reachable from a src or a
+   feeding load; reducer / scalar-bridge ops narrow; and the
+   max-popcount across an insn's masks never exceeds the register
+   lane count derived from the Capstone ground-truth disassembly
+   (a narrower mask is correct for insert/extract/reductions, only
+   an over-span is flagged).  Vacuous on scalar-only traces.
+
 Coverage / WP
 ~~~~~~~~~~~~~
 
@@ -281,6 +292,14 @@ Coverage / WP
    reachable-on-this-ISA universes.  Helpful when a new generic
    opcode lands and you want to know whether the asm-block library
    exercises it yet.
+
+``dep_refine_coverage``
+   Info-level summary tallying each instance into a dep-refiner
+   bucket inferred from its emitted dep-mask shape
+   (``DEP_PASSTHROUGH`` / ``DEP_LEA`` / ``DEP_X86_STACK_PUSH`` /
+   ``DEP_X86_STACK_POP`` / ``DEP_ALL_TO_ALL`` / ``DEP_DEFAULT`` /
+   ``DEP_OTHER``).  Errors only if a probe's declared
+   ``dep_refines`` bucket never appears in the trace.
 
 ``wrong_path_chains``
    Every CP-side branch with a predicted ``wp_chain`` in

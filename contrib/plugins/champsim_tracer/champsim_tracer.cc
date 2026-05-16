@@ -78,20 +78,14 @@ static uint64_t  start_symbol_occurrence = 1;
 static uint64_t  start_symbol_match_count = 0;
 static int       g_window_mode           = 0; /* PluginConfig::WIN_AUTO */
 
-/* ========================= Thread ID assignment ========================= */
-
-static std::unordered_map<unsigned int, uint32_t> cpu_to_thread_id;
-static uint32_t next_thread_id = 0;
-
-static uint32_t get_or_assign_thread_id(unsigned int cpu_index)
-{
-    auto [it, inserted] = cpu_to_thread_id.try_emplace(cpu_index,
-                                                       next_thread_id);
-    if (inserted) {
-        next_thread_id++;
-    }
-    return it->second;
-}
+/* ========================= Thread ID assignment =========================
+ *
+ * thread_id on the wire IS the guest vCPU index, verbatim.  No
+ * remapping table: the vCPU index is already stable for the whole
+ * run, so a thread is the same vCPU across every segment, and each
+ * segment's body opens with an explicit BODY_TAG_THREAD_SWITCH that
+ * states the starting thread (no implicit "starts at 0" convention).
+ */
 
 /* ========================= SimPoints ========================= */
 
@@ -384,9 +378,10 @@ static void append_histogram(GString *report, const char *segment_label,
  *     insn callback for the next BB; if the prior segment didn't
  *     flush them (e.g. the segment ended on a snap-capturing TB),
  *     they'd attach to the new segment's first body entry.
- *   - Per-vCPU thread-id assignment counter: thread_id 0 is the
- *     first vCPU observed in this segment, regardless of which one
- *     the prior segment last saw.
+ *
+ * thread_id is the guest vCPU index, so there is no per-segment
+ * thread state to reset; each segment's body opens with an explicit
+ * BODY_TAG_THREAD_SWITCH naming the starting thread.
  *
  * The persistent FieldStateTable overlays inside BodyStreamState are
  * already fresh per segment (a new BodyStreamState is created in
@@ -423,15 +418,17 @@ static void reset_segment_local_state(void)
     g_mem_recorder.clear_cp();
     pending_reg_snaps.clear();
 
-    cpu_to_thread_id.clear();
-    next_thread_id = 0;
+    /* No thread-id state to reset: thread_id is the guest vCPU index
+     * (stable for the whole run), and each segment's body opens with
+     * an explicit BODY_TAG_THREAD_SWITCH naming the starting vCPU. */
 }
 
 static void start_trace_segment(const char *label,
                                 uint64_t start, uint64_t stop,
                                 uint64_t warmup,
                                 uint64_t total_target,
-                                unsigned int cpu_index)
+                                unsigned int cpu_index,
+                                double simpoint_weight)
 {
     reset_segment_local_state();
 
@@ -445,7 +442,8 @@ static void start_trace_segment(const char *label,
     std::vector<InitialRegSnap> regfile;
     capture_initial_regfile(cpu_index, &regfile);
 
-    g_trace_segments.start(label, start, stop, warmup, total_target, &regfile);
+    g_trace_segments.start(label, start, stop, warmup, total_target,
+                           (uint32_t)cpu_index, simpoint_weight, &regfile);
 
     uint64_t span = stop > start ? stop - start : 0;
     progress_step = span >= 10 ? span / 10 : 1;
@@ -542,7 +540,7 @@ static void emit_body_entry(BodyStreamState *out_stream,
     entry.dyn_params.reserve(g_mem_recorder.cp_count());
     entry.wp_entries = std::move(wp_entries);
     entry.tmpl = bb_tmpl;
-    entry.thread_id = get_or_assign_thread_id(cpu_index);
+    entry.thread_id = (uint32_t)cpu_index;
     entry.cpu_index = cpu_index;
 
     g_mem_recorder.drain_cp_into_dyn_params(entry.dyn_params, bb_tmpl);
@@ -961,7 +959,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
                         start_symbol, start_symbol_occurrence);
                     start_trace_segment(label, lo, hi,
                                         /* warmup= */ 0, total_target,
-                                        cpu_index);
+                                        cpu_index,
+                                        /* simpoint_weight= */ 0.0);
                 }
             }
         }
@@ -986,8 +985,38 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
                 if (icount_prev >= eff_start &&
                     icount_prev <  eff_stop) {
                     g_trace_segments.set_window(eff_start, eff_stop);
-                    g_autofree char *label = g_strdup_printf(
-                        "sp%zu", g_simpoints.current_index());
+                    /* Name the segment by the simpoint position in
+                     * billions of instructions (the canonical
+                     * interval start = interval_id * interval), per
+                     * the established workload-NNNB convention.  This
+                     * is a stable ID that maps straight back to the
+                     * line in the simpoints/weights file, unlike the
+                     * opaque sorted segment ordinal.
+                     *
+                     * Exact integer arithmetic, not a double: avoids
+                     * scientific notation (whose 'e-05' minus sign
+                     * would corrupt the '-'-separated filename) and
+                     * any rounding.  A fractional billion renders
+                     * with '_' for the point ("73_4B"), so the only
+                     * '.' in the filename is the .cst extension. */
+                    uint64_t pos   = sp->start_insn;
+                    uint64_t whole = pos / 1000000000ULL;
+                    uint64_t frac  = pos % 1000000000ULL;
+                    g_autofree char *label = nullptr;
+                    if (frac == 0) {
+                        label = g_strdup_printf("%" PRIu64 "B", whole);
+                    } else {
+                        char fbuf[10];
+                        g_snprintf(fbuf, sizeof(fbuf),
+                                   "%09" PRIu64, frac);
+                        int fn = 9;
+                        while (fn > 1 && fbuf[fn - 1] == '0') {
+                            fn--;
+                        }
+                        fbuf[fn] = '\0';
+                        label = g_strdup_printf("%" PRIu64 "_%sB",
+                                                whole, fbuf);
+                    }
                     /* warmup_insns saturates against eff_start so the
                      * header reports the actual number of pre-simpoint
                      * insns we'll trace, not the configured budget. */
@@ -996,7 +1025,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
                     start_trace_segment(label, eff_start, eff_stop,
                                         hdr_warmup,
                                         /* total_target= */ eff_stop - eff_start,
-                                        cpu_index);
+                                        cpu_index, sp->weight);
                 }
             } else {
                 g_trace_segments.set_shutting_down();
@@ -1016,7 +1045,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
              * UINT64_MAX. */
             uint64_t total_target = (hi == UINT64_MAX) ? 0 : hi - lo;
             start_trace_segment("trace", lo, hi,
-                                /* warmup= */ 0, total_target, cpu_index);
+                                /* warmup= */ 0, total_target, cpu_index,
+                                /* simpoint_weight= */ 0.0);
         }
         if (g_trace_segments.is_active() &&
             icount_prev >= g_trace_segments.window_stop()) {
@@ -1944,7 +1974,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             (trace_stop_insn == UINT64_MAX) ? 0 : trace_stop_insn;
         start_trace_segment("trace", 0, trace_stop_insn,
                             /* warmup= */ 0, total_target,
-                            /* cpu_index= */ (unsigned int)-1);
+                            /* cpu_index= */ (unsigned int)-1,
+                            /* simpoint_weight= */ 0.0);
     }
 
 

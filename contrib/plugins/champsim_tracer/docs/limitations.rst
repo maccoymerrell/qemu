@@ -150,21 +150,3 @@ records are not perturbed.  Studies that need an exact
 byte-stable WP record stream (e.g., comparing two trace
 decoders, validating an encoder change) should diff CP-only or
 use ``wp=0``.
-
-Known issues / footguns
------------------------
-
-* **The simpoints file format isn't standardized in the docs.**
-  The plugin parses ``<interval_id> <cluster_id>`` whitespace-
-  separated lines (one per simpoint) plus an optional sibling
-  ``.weights`` file.  See :doc:`quickstart` for the format.
-* **``GEN_OP_UNKNOWN`` count > 0 in the exit summary is silent.**
-  The plugin keeps tracing — the affected instructions appear in
-  the trace with opcode = 0, but their classification is missing.
-  Run ``champsim_tracer_mnemonic_audit.py`` against a sample trace
-  to discover which mnemonics need rows in the per-ISA
-  classification table.
-* **``thread_id`` resets across segments.**  ``thread_id=0`` in
-  segment N is not necessarily the same vCPU as ``thread_id=0`` in
-  segment N+1.  Cross-segment vCPU tracking requires correlating
-  the per-segment summaries' icount ranges manually.

@@ -790,11 +790,26 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
                                            : (((uint64_t)1 << n_src) - 1);
     addr_only_srcs &= src_bits_mask;
 
-    uint64_t default_mask = 0;
+    uint64_t all_inputs = 0;
     for (size_t i = 0; i < inputs.size(); i++) {
-        default_mask |= ((uint64_t)1 << i);
+        all_inputs |= ((uint64_t)1 << i);
     }
-    default_mask &= ~addr_only_srcs;
+    uint64_t default_mask = all_inputs & ~addr_only_srcs;
+
+    /* Apply the addressing-mode-src cleanup ONLY to a fully-saturated
+     * mask.  A mask with every input bit set is the over-
+     * approximation produced by dep_all_to_all (or the synthesized
+     * default when HAS_REG is absent): there an addressing reg is a
+     * false direct data dep and must be stripped (it reaches the
+     * sink transitively via the memop, shown as laddr/saddr).  A
+     * strict subset is the deliberate output of a precise refiner --
+     * e.g. dep_x86_stack_push sets the SP-dst's mask to exactly the
+     * SP src because sp_new = sp_old - 8, even though SP is also the
+     * store-address base.  Filtering that explicit bit produced the
+     * orphaned "-> %sp[...]" arrows.  Render precise masks verbatim. */
+    auto effective = [&](uint64_t m) -> uint64_t {
+        return (m == all_inputs) ? (m & ~addr_only_srcs) : m;
+    };
 
     auto dst_mask = [&](size_t d) {
         return d < insn.dst_dep_mask.size() ? insn.dst_dep_mask[d]
@@ -896,16 +911,12 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
             end++;
         }
         open_group();
-        /* Address-only srcs feed the dst only transitively through the
-         * memop (the dst depends on the load; the load's address
-         * depends on those srcs, shown separately as laddr/saddr).
-         * Drop them from the direct data-dependency set whether the
-         * mask came from the wire or the default — otherwise an
-         * all-to-all dst_dep_mask makes e.g. %v0{3} look directly
-         * dependent on the stack pointer.  When --show-lanes broke the
-         * merge, also filter inputs to those that feed this dst's
-         * lanes. */
-        render_input_set_laned(line, mask & ~addr_only_srcs, inputs,
+        /* Strip addressing-mode srcs only from a fully-saturated
+         * (all-to-all / default) mask; a precise refiner's explicit
+         * subset is rendered verbatim (see `effective`).  When
+         * --show-lanes broke the merge, also filter inputs to those
+         * that feed this dst's lanes. */
+        render_input_set_laned(line, effective(mask), inputs,
                                ctx.show_lanes,
                                lane_at(insn.dst_lane_mask, d),
                                input_lane_mask);
@@ -928,10 +939,12 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
             end++;
         }
         open_group();
-        /* Same address-only-src exclusion as the dst path: a store's
-         * data depends on the value srcs, not the addressing regs
-         * (those feed the store address, shown as saddr). */
-        render_input_set_laned(line, mask & ~addr_only_srcs, inputs,
+        /* Same saturated-only exclusion as the dst path: an
+         * over-approximating store-data mask drops addressing regs
+         * (they feed the store address, shown as saddr); a precise
+         * refiner mask (e.g. dep_x86_stack_push's per-src store data)
+         * renders verbatim. */
+        render_input_set_laned(line, effective(mask), inputs,
                                ctx.show_lanes,
                                lane_at(insn.store_data_lane_mask, s),
                                input_lane_mask);
@@ -1008,7 +1021,10 @@ void emit_disasm_memops(std::string &line, const DisasmContext &ctx,
             line.push_back(')');
         }
         if (with_data) {
-            line.append(is_load ? "  ld=0x" : "  st=0x");
+            /* append_wide_hex already emits the "0x" prefix (and
+             * "0x0" for a zero value); a literal "0x" here as well
+             * produced "st=0x0x0" / "ld=0x0x<data>". */
+            line.append(is_load ? "  ld=" : "  st=");
             append_wide_hex(&line, dp.data);
         }
         if (is_load) load_idx++;
@@ -1160,20 +1176,27 @@ void emit_disasm_deps_annotation(std::string &line,
                                        : (((uint64_t)1 << n_src) - 1);
     addr_only_srcs &= src_bits;
 
-    uint64_t default_mask = 0;
-    /* every src */
-    default_mask |= src_bits;
+    uint64_t all_inputs = src_bits;
     /* every load_data slot */
     for (unsigned k = 0; k < n_loads; k++) {
-        default_mask |= ((uint64_t)1 << (n_src + k));
+        all_inputs |= ((uint64_t)1 << (n_src + k));
     }
     /* imm bit only when the template actually carries an immediate
      * — otherwise the annotation would falsely advertise "imm" as
      * an input on rows without one. */
     if (it.has_imm) {
-        default_mask |= ((uint64_t)1 << imm_bit);
+        all_inputs |= ((uint64_t)1 << imm_bit);
     }
-    default_mask &= ~addr_only_srcs;
+    uint64_t default_mask = all_inputs & ~addr_only_srcs;
+
+    /* Same saturated-only rule as emit_disasm_operands' `effective`
+     * so the annotation can't disagree with the inline arrows: only
+     * a fully-saturated (dep_all_to_all / default) mask gets the
+     * addressing-src cleanup; a precise refiner's explicit subset
+     * (e.g. dep_x86_stack_push's SP-dst = SP-src) is shown verbatim. */
+    auto effective = [&](uint64_t m) -> uint64_t {
+        return (m == all_inputs) ? (m & ~addr_only_srcs) : m;
+    };
 
     bool wrote_reg = false;
     line.append("deps:");
@@ -1183,9 +1206,7 @@ void emit_disasm_deps_annotation(std::string &line,
     for (size_t d = 0; d < n_dst; d++) {
         uint64_t m = d < it.dst_dep_mask.size() ? it.dst_dep_mask[d]
                                                 : default_mask;
-        /* Address-only srcs reach the dst transitively via the memop
-         * (rendered as laddr/saddr), not as a direct data dep. */
-        m &= ~addr_only_srcs;
+        m = effective(m);
         line.push_back(' ');
         append_regref(&line, ctx, it.dst_regs[d]);
         if (ctx.show_lanes) {
@@ -1202,7 +1223,7 @@ void emit_disasm_deps_annotation(std::string &line,
         uint64_t m = s < it.store_data_dep_mask.size()
                          ? it.store_data_dep_mask[s]
                          : default_mask;
-        m &= ~addr_only_srcs;   /* store data != addressing srcs */
+        m = effective(m);   /* saturated-only addressing-src cleanup */
         line.append(" sdata");
         line.append(std::to_string(s));
         if (ctx.show_lanes) {
@@ -1395,6 +1416,7 @@ void emit_disasm_file_header(FILE *out, const cst::Header &h,
                  (unsigned long long)h.start_insn,
                  (unsigned long long)h.warmup_insns,
                  (unsigned long long)h.total_target_insns);
+    std::fprintf(out, "; simpoint_weight=%.17g\n", h.weight);
     std::fprintf(out, "; templates=%zu\n\n", n_templates);
 }
 
@@ -1781,6 +1803,7 @@ void emit_legacy_meta(FILE *out, const cst::Header &h)
     std::fprintf(out, "TOTAL_TARGET_INSNS %llu%s\n",
                  (unsigned long long)h.total_target_insns,
                  h.total_target_insns == 0 ? " (unbounded)" : "");
+    std::fprintf(out, "SIMPOINT_WEIGHT %.17g\n", h.weight);
     std::fprintf(out, "\n");
 }
 

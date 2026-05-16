@@ -827,6 +827,10 @@ Header parse_header(MemberView view,
     h.start_insn         = r.uleb();
     h.warmup_insns       = r.uleb();
     h.total_target_insns = r.uleb();
+    {
+        uint64_t bits = r.u64_le();
+        std::memcpy(&h.weight, &bits, sizeof(h.weight));
+    }
     h.command     = r.string();
     h.datetime    = r.string();
     h.comment     = r.string();

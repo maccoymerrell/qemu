@@ -529,7 +529,12 @@ def cmd_simpoint_test(args) -> int:
             rc_total = 1
             continue
 
-        seg_files = sorted(Path(args.out_dir).glob(f"{prog}_{isa}_sp*.cst"))
+        # Per-simpoint files are named <base>-<positionB>.cst (the
+        # simpoint position in billions of instructions), e.g.
+        # mcf_x86_64-0B.cst, mcf_x86_64-0_000025B.cst — not the old
+        # _sp<idx> ordinal.  The '-' separator distinguishes them
+        # from the single-segment <base>.cst form.
+        seg_files = sorted(Path(args.out_dir).glob(f"{prog}_{isa}-*.cst"))
         if len(seg_files) < 2:
             print(f"simpoint_test[{isa}]: FAIL  produced only "
                   f"{len(seg_files)} segment(s); expected 2 "
@@ -538,9 +543,9 @@ def cmd_simpoint_test(args) -> int:
             rc_total = 1
             continue
 
-        # Decode segment 1 (sp1) FIRST and standalone, deliberately not
-        # touching sp0 — proves segment N is independently decodable
-        # without state from segment N-1.
+        # Decode the segments standalone, in reverse order, deliberately
+        # not in trace order — proves segment N is independently
+        # decodable without state from any other segment.
         for seg in reversed(seg_files):
             print(f"validate[{isa}] segment {seg.name}:")
             report = V.validate_structural(seg, expected_threads=1)

@@ -111,12 +111,18 @@ sanity check.
 2.4  start_insn          : ULEB
 2.5  warmup_insns        : ULEB
 2.6  total_target_insns  : ULEB
-2.7  command      : string
-2.8  datetime     : string
-2.9  comment      : string
-2.10 target_name  : string
-2.11 encoding_maps_section : section    ; see Step 3 for inner shape
-2.12 templates section := raw payload to end-of-member (no outer
+2.7  simpoint_weight     : f64_le  ; raw little-endian IEEE-754
+     double (fixed 8 bytes, NOT a varint).  The fraction of
+     whole-program execution this segment represents, so a consumer
+     can rebuild a whole-program metric as the weighted sum over the
+     per-simpoint traces.  0.0 for non-simpoint segments (no
+     weighting applies).
+2.8  command      : string
+2.9  datetime     : string
+2.10 comment      : string
+2.11 target_name  : string
+2.12 encoding_maps_section : section    ; see Step 3 for inner shape
+2.13 templates section := raw payload to end-of-member (no outer
      length-prefix; the templates section runs to the header
      member's EOF).  Decode per Step 4.
 ```
@@ -148,6 +154,10 @@ self-describing.  Decode it into a fresh `encoding_maps` table.
                         CST_FID_LOAD_ADDR0, CST_FID_STORE_ADDR0,
                         CST_FID_LOAD_DATA0, CST_FID_STORE_DATA0,
                         CST_FID_DST_REG0,
+                        CST_FID_SRC_LANE_MASK0,
+                        CST_FID_DST_LANE_MASK0,
+                        CST_FID_LOAD_DATA_LANE_MASK0,
+                        CST_FID_STORE_DATA_LANE_MASK0,
                         CST_FID_INSN_BYTES_LO, CST_FID_INSN_BYTES_HI,
                         CST_FID_INSN_OPCODE, CST_FID_INSN_BRANCH_TYPE,
                         CST_FID_INSN_FLAGS, CST_FID_INSN_IMMEDIATE,
@@ -255,6 +265,15 @@ prev_entry_template_id : i32 = 0
 prev_thread_id         : u32 = 0   (the current thread for the next ENTRY)
 seq_num                : u32 = 0   (BODY_TAG_ENTRY counter)
 ```
+
+The body's first record is always a `BODY_TAG_THREAD_SWITCH`, so the
+starting thread is stated explicitly rather than assumed.  It is an
+ordinary delta from `prev_thread_id = 0` (no special-case base): a
+reader that just applies thread-switch deltas from 0, like every
+other delta in the format, gets the correct starting thread with no
+extra knowledge.  `thread_id` is the guest vCPU index and is stable
+for the whole run — the same vCPU keeps the same `thread_id` across
+every segment.
 
 Loop until a `BODY_TAG_END` is seen:
 
@@ -500,8 +519,9 @@ bit 0  CST_INSN_FLAG_BRANCH_COND
 bit 1  CST_INSN_FLAG_HAS_IMM
 bit 2  CST_INSN_FLAG_ATOMIC          atomic / locked memory op
 bit 3  reserved, written as 0
-bit 4  CST_INSN_FLAG_VEC             per-slot lane bitmaps present
-bit 5  CST_INSN_FLAG_LANE_PARALLEL   lane bitmaps line up by lane idx
+bit 4  CST_INSN_FLAG_VEC             per-operand lane masks emitted
+bit 5  CST_INSN_FLAG_LANE_PARALLEL   lane k of each dst depends only
+                                     on lane k of every src
 bit 6  CST_INSN_FLAG_HAS_DEP_BLOCK   intra-instruction dep mask
 bit 7  reserved, written as 0
 ```
@@ -902,6 +922,31 @@ Field families (one well-known name each):
   that the wp_event_flag stream + initial-state REGFILE records
   + DST_REG snapshots collectively define.
 
+* **Vector lane-mask families** (four, one slot per operand, gated on
+  the per-insn `CST_INSN_FLAG_VEC` bit — see §6 *Vector lane masks*):
+
+  * **`CST_FID_SRC_LANE_MASK{k}`** — for source-register slot `k`
+    (parallel to the template `src_regs` array): bit `j` set iff lane
+    `j` of that source register participates as an input this
+    execution.
+  * **`CST_FID_DST_LANE_MASK{k}`** — for destination-register slot
+    `k`: bit `j` set iff lane `j` of that destination is produced
+    this execution.  Need not equal the src masks.
+  * **`CST_FID_LOAD_DATA_LANE_MASK{k}`** — for load memop slot `k`:
+    bit `j` set iff lane `j` of the value-receiving vector register
+    takes its value from this particular load.
+  * **`CST_FID_STORE_DATA_LANE_MASK{k}`** — for store memop slot `k`:
+    bit `j` set iff lane `j` of the source vector register is drained
+    by this particular store.
+
+  Each is a per-`(template_id, ins_pos, slot)` sparse field whose
+  baseline default is zero, emitted as a scalar delta exactly like
+  the other slotted families — so a uniform mask costs one record at
+  first observation and zero bytes thereafter, while a mask that
+  moves per execution (RISC-V V `vl`, gather/scatter memop fan-out)
+  emits a delta only when it changes.  Mask width is up to 64 lanes
+  (ULEB on the wire; the common 2/4/8/16-lane cases stay one byte).
+
 * **Instruction-metadata singletons** (cold; emitted only when
   the dynamic execution differs from the template baseline):
   `CST_FID_INSN_BYTES_LO`, `CST_FID_INSN_BYTES_HI`,
@@ -1270,6 +1315,75 @@ Absence of `CST_INSN_FLAG_HAS_DEP_BLOCK` is the implicit all-to-all
 over-approximation: every dst / store depends on every src / load.
 Consumers that don't model intra-instruction dataflow can ignore
 the block.
+
+### Vector lane masks
+
+When `CST_INSN_FLAG_VEC` is set the writer emits the four
+lane-mask field families (Reference §5.1).  They are **per
+operand**, not a single replicated value, and **dynamic** —
+delta-encoded like every other slotted field, so they cost bytes
+only when they change:
+
+* `SRC_LANE_MASK{k}` / `DST_LANE_MASK{k}` — which lanes of source
+  slot `k` / destination slot `k` participate this execution.  The
+  src and dst masks are independent (an element insert writes one
+  dst lane while reading the rest as pass-through).
+* `LOAD_DATA_LANE_MASK{k}` / `STORE_DATA_LANE_MASK{k}` — which lanes
+  take their value from / are drained by memop slot `k`.  These are
+  computed at run time from the memop's address and size relative to
+  the access base and the vector element width, so a structure load
+  that fans into several lanes via several memops, or an
+  immediate-selected single-element insert/extract, produces the
+  correct per-memop lane partition.
+
+The active-lane count can be fixed by the instruction encoding
+(x86/NEON/MSA — derivable statically) or read from a register at
+execution time (RISC-V V `vl`; future x86 EVEX k-mask / AArch64 SVE
+predicate).  This distinction is **writer-internal**: it only
+decides where the writer reads the live-lane value from.  On the
+wire there is no "static vs dynamic" kind — every family is just a
+dynamic delta-encoded mask, and a consumer treats them uniformly.
+A trace without `CST_INSN_FLAG_VEC` (scalar insns, or a writer
+predating the lane block) carries no lane masks; consumers then
+treat every lane as participating.
+
+`CST_INSN_FLAG_LANE_PARALLEL` records that lane `j` of each dst
+depends only on lane `j` of every src (true SIMD lanes); when clear
+the lanes still participate but cross-couple (shuffles, broadcasts,
+horizontal reductions).
+
+### Lane-granularity dependency resolution
+
+The dep block above is **coarse** — when an instruction has no
+precise refiner its `dst_dep` / `store_data_dep` masks are the
+all-to-all over-approximation.  A consumer recovers the precise
+*per-lane* dependency by intersecting the coarse dep masks with the
+per-operand lane masks and the address masks, all of which are on
+the wire:
+
+1. An input listed in `dst_dep[d]` that is a vector operand feeds
+   destination `d` only on the lanes where its `SRC_LANE_MASK` (or
+   `LOAD_DATA_LANE_MASK`) intersects `DST_LANE_MASK[d]`.  Zero
+   intersection ⇒ that input does not feed that destination at all.
+2. A src that appears only in a `load_addr_dep` / `store_addr_dep`
+   mask feeds the destination only transitively through the memop
+   (the destination depends on the load; the load address depends
+   on that src) — it is not a direct data dependency.
+
+Worked example — `pinsrd $3, 0xc(%rsp), %xmm0` (insert one dword
+from memory into lane 3 of xmm0):
+
+* `DST_LANE_MASK` for xmm0 = `{3}`; `SRC_LANE_MASK` for the
+  pass-through read of xmm0 = `{0,1,2}`; `LOAD_DATA_LANE_MASK` for
+  the load = `{3}`.
+* Coarse `dst_dep` is all-to-all (rsp, xmm0, load, imm).
+* Resolved: lane 3 of xmm0 depends only on the load (`{3}∩{3}`);
+  the pass-through xmm0 read (`{0,1,2}∩{3}=∅`) does **not** feed
+  lane 3; rsp feeds the load address only (shown via
+  `load_addr_dep`), so xmm0 lane 3 ← load, load addr ← rsp.
+
+The `cst_decode --show-lanes` / `--show-deps` renderer implements
+exactly this reconstruction and is the reference for it.
 
 `pc_delta` is relative to the previous instruction PC, with
 `previous_pc = start_pc` for the first instruction. The branch, if any,

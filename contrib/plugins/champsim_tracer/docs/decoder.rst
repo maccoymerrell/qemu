@@ -29,6 +29,8 @@ cst_decode
    single: cst_decode
    single: --templates-only
    single: --objdump
+   single: --show-deps
+   single: --show-lanes
 
 Built by the same ``ninja contrib-plugins`` invocation that builds
 the plugin shared object.  Lands in
@@ -144,6 +146,30 @@ inside that chain entry).
    dynamic values).  Capstone is taken from the bundled
    ``subprojects/capstone`` so both sides come from the same
    build the plugin links against.
+
+``--show-deps``
+   Append a trailing ``; deps:`` annotation giving the
+   intra-instruction dependency edges: per destination register and
+   per store-data slot, the set of inputs (source regs, load slots,
+   immediate) it depends on, plus the ``laddr``/``saddr``
+   address-input sets for each memop.  Coarse all-to-all dep masks
+   are refined to the precise edges by excluding address-only srcs
+   (they reach the dst transitively through the memop, already shown
+   as ``laddr``/``saddr``).
+
+``--show-lanes``
+   Annotate every vector operand with its participating lane set,
+   collapsing consecutive lanes into ranges (``%v0{0..3,6}``).
+   Applies to source/destination registers, load and store memop
+   slots, and — together with ``--show-deps`` — the dependency
+   annotation, where an input is shown feeding a destination only on
+   the lanes their masks share.  This is the reference
+   implementation of the wire format's lane-granularity dependency
+   resolution (see :doc:`format`, *Vector lane masks*): e.g.
+   ``pinsrd $3`` renders ``ld[%sp](...){3}, $0x3 -> %v0{3}`` with
+   ``deps: %v0{3}=[ld0{3},imm]`` — lane 3 from the load only, the
+   pass-through ``%v0{0..2}`` correctly excluded.  Scalar traces are
+   byte-identical with and without the flag.
 
 .. _audit-cc:
 

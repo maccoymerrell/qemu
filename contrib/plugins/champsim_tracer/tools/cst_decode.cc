@@ -403,12 +403,16 @@ BodyWalker::BodyWalker(const Header &header,
  * stack inside walk(); each handler takes it by reference. */
 struct BodyWalker::WalkState {
     int32_t  prev_entry_template   = 0;
+    /* Base 0, same as every other delta in the format.  The body's
+     * first record is always a BODY_TAG_THREAD_SWITCH, so the
+     * starting thread arrives as an ordinary delta from 0 (no
+     * special-case base) — a consumer applying the universal delta
+     * rule gets the right thread without knowing anything extra. */
     uint32_t current_thread        = 0;
     bool     pending_thread_switch = false;
 
-    /* Per-thread FieldStateTables, indexed by thread_id.  The writer
-     * hands out dense small ints via get_or_assign_thread_id, so the
-     * vectors stay short. */
+    /* Per-thread FieldStateTables, indexed by thread_id (== guest
+     * vCPU index); vectors stay short (one slot per vCPU). */
     std::vector<FieldStateTable> cp_states;
     std::vector<FieldStateTable> wp_states;
 

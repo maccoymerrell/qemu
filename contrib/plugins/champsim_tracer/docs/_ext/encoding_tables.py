@@ -49,16 +49,26 @@ ISA_FILES: list[tuple[str, str, str, str]] = [
 ]
 
 
-# Match `[ISA_INS_FOO] = { GEN_OP_X, BRANCH_Y, MF_Z[ | MF_W ...] [, .refine ...] },`
-# tolerating arbitrary whitespace and line breaks inside the brace block.
-INSN_RE = re.compile(
+# Match the whole `[ISA_INS_FOO] = { ... }` designated-initializer
+# block (multi-line, no nested braces in an insn row) so the
+# individual fields can be picked out order-independently from the
+# body.  Empty placeholder rows ``[ISA_INS_FOO] = {}`` (unclassified
+# slots) have no .opcode and are skipped.
+INSN_BLOCK_RE = re.compile(
     r"\[\s*(?P<insn>[A-Z][A-Z0-9_]*_INS_[A-Z0-9_]+)\s*\]"
-    r"\s*=\s*\{\s*"
-    r"(?P<op>GEN_OP_[A-Z0-9_]+)\s*,\s*"
-    r"(?P<branch>BRANCH_[A-Z0-9_]+)\s*,\s*"
-    r"(?P<flags>MF_[A-Z0-9_]+(?:\s*\|\s*MF_[A-Z0-9_]+)*)",
-    re.MULTILINE,
+    r"\s*=\s*\{(?P<body>[^{}]*)\}",
+    re.MULTILINE | re.DOTALL,
 )
+
+# Within the body: the three always-present designated fields plus
+# the optional dep / lane classification fields.
+_OP_RE       = re.compile(r"\.opcode\s*=\s*(GEN_OP_[A-Z0-9_]+)")
+_BRANCH_RE   = re.compile(r"\.branch_type\s*=\s*(BRANCH_[A-Z0-9_]+)")
+_FLAGS_RE    = re.compile(
+    r"\.flags\s*=\s*(MF_[A-Z0-9_]+(?:\s*\|\s*MF_[A-Z0-9_]+)*)")
+_DEPREF_RE   = re.compile(r"\.dep_refine\s*=\s*([A-Za-z_][A-Za-z0-9_]*)")
+_LANEKIND_RE = re.compile(r"\.lane_mask_kind\s*=\s*(LANE_MASK_KIND_[A-Z_]+)")
+_LANEPAR_RE  = re.compile(r"\.lane_parallel\s*=\s*(true|false)")
 
 
 # Match the whole `[ISA_REG_FOO] = { ... }` initialiser so we can
@@ -166,25 +176,88 @@ def short_flags(f: str) -> str:
     return ", ".join(pretty) if pretty else "—"
 
 
+# Human-readable label for each dependency refiner.  The raw C
+# function name (``dep_all_to_all`` ...) is the source of truth in
+# the header; this is the reader-facing summary.  An absent
+# ``.dep_refine`` means the row emits no HAS_REG block and the
+# consumer falls back to the implicit all-to-all dataflow.
+_REFINE_SHORT = {
+    "":                  "all-to-all (default)",
+    "dep_all_to_all":    "all-to-all",
+    "dep_passthrough":   "passthrough",
+    "dep_lea":           "lea (addr-mode srcs + imm, no load)",
+    "dep_x86_stack_push": "x86 stack push",
+    "dep_x86_stack_pop":  "x86 stack pop",
+}
+
+
+def short_refine(r: str) -> str:
+    return _REFINE_SHORT.get(r, r)
+
+
+# Dynamic lane-mask source.  The kind only says *where* the
+# active-lane value is read from; everything else about the lane
+# masks is uniform.
+_LANEKIND_SHORT = {
+    "":                          "—",
+    "LANE_MASK_KIND_NONE":       "—",
+    "LANE_MASK_KIND_STATIC":     "static (from insn)",
+    "LANE_MASK_KIND_RISCV_VTYPE": "dynamic (vl CSR)",
+}
+
+
+def short_lanekind(k: str) -> str:
+    return _LANEKIND_SHORT.get(k, k.removeprefix("LANE_MASK_KIND_").lower())
+
+
+def short_laneparallel(vec: bool, parallel: str) -> str:
+    """`parallel` is the captured "true"/"false" string, or "" when the
+    row carries no lane info (scalar / non-vec)."""
+    if not vec:
+        return "—"
+    return "lane-parallel" if parallel == "true" else "cross-lane"
+
+
 # ---------------------------------------------------------------------------
 # Parsing.
 # ---------------------------------------------------------------------------
 
 def parse_insn_rows(text: str, prefix: str
-                    ) -> list[tuple[str, str, str, str]]:
-    """Return [(insn, gen_op, branch_type, flags)] sorted by insn."""
-    rows: list[tuple[str, str, str, str]] = []
+                    ) -> list[tuple[str, str, str, str, str, str, str]]:
+    """Return rows sorted by insn, each:
+
+        (insn, gen_op, branch_type, flags,
+         dep_refine, lane_mask_kind, lane_parallel)
+
+    The last three are "" when the row doesn't carry them (no
+    HAS_REG block / scalar non-vec insn).  Unclassified placeholder
+    slots (empty ``{}``) are skipped — they have no ``.opcode``.
+    """
+    rows: list[tuple[str, str, str, str, str, str, str]] = []
     seen: set[str] = set()
-    for m in INSN_RE.finditer(text):
+    for m in INSN_BLOCK_RE.finditer(text):
         insn = m.group("insn")
-        if not insn.startswith(prefix):
+        if not insn.startswith(prefix) or insn in seen:
             continue
-        if insn in seen:
-            continue
+        body = m.group("body")
+        op_m = _OP_RE.search(body)
+        if not op_m:
+            continue  # empty placeholder / unclassified slot
+        br_m = _BRANCH_RE.search(body)
+        fl_m = _FLAGS_RE.search(body)
+        dep_m = _DEPREF_RE.search(body)
+        lk_m = _LANEKIND_RE.search(body)
+        lp_m = _LANEPAR_RE.search(body)
         seen.add(insn)
-        rows.append(
-            (insn, m.group("op"), m.group("branch"), m.group("flags"))
-        )
+        rows.append((
+            insn,
+            op_m.group(1),
+            br_m.group(1) if br_m else "BRANCH_NONE",
+            fl_m.group(1) if fl_m else "MF_NONE",
+            dep_m.group(1) if dep_m else "",
+            lk_m.group(1) if lk_m else "",
+            lp_m.group(1) if lp_m else "",
+        ))
     rows.sort(key=lambda r: r[0])
     return rows
 
@@ -251,7 +324,8 @@ def _rst_table(headers: list[str], rows: Iterable[Iterable[str]],
 
 
 def emit_per_isa_section(name: str, insn_prefix: str, reg_prefix: str,
-                         insn_rows: list[tuple[str, str, str, str]],
+                         insn_rows: list[tuple[str, str, str, str,
+                                               str, str, str]],
                          reg_rows: list[tuple[str, list[str]]]
                          ) -> list[str]:
     out: list[str] = []
@@ -270,7 +344,14 @@ def emit_per_isa_section(name: str, insn_prefix: str, reg_prefix: str,
         f"{len(insn_rows)} Capstone instruction-ids classified.  "
         f"The ``{insn_prefix}`` prefix is dropped from the *Insn* "
         "column, and the ``GEN_OP_`` / ``BRANCH_`` / ``MF_`` prefixes "
-        "from the value columns, for compactness."
+        "from the value columns, for compactness.  *Dep refiner* is "
+        "the human-readable name of the intra-instruction dependency "
+        "refiner (``—`` = no HAS_REG block, consumer uses the "
+        "implicit all-to-all).  *Lanes* / *Mask src* are populated "
+        "only for vector-classified rows: *Lanes* is lane-parallel "
+        "vs cross-lane; *Mask src* is where the active-lane value is "
+        "read from (the instruction encoding, or a runtime register "
+        "such as the RISC-V ``vl`` CSR)."
     )
     out.append("")
     table = (
@@ -279,13 +360,26 @@ def emit_per_isa_section(name: str, insn_prefix: str, reg_prefix: str,
             f"``{short_op(op)}``",
             short_branch(branch),
             short_flags(flags),
+            short_refine(dep_refine),
+            short_laneparallel(bool(lane_kind
+                                    and lane_kind != "LANE_MASK_KIND_NONE"),
+                               lane_par),
+            short_lanekind(lane_kind),
         )
-        for insn, op, branch, flags in insn_rows
+        for (insn, op, branch, flags,
+             dep_refine, lane_kind, lane_par) in insn_rows
     )
     out.extend(_rst_table(
-        ["Insn", "Generic op", "Branch type", "Flags"],
+        ["Insn", "Generic op", "Branch type", "Flags",
+         "Dep refiner", "Lanes", "Mask src"],
         table,
-        widths=[28, 22, 14, 18],
+        # Insn gets the widest share: the longest x86 mnemonics
+        # (VGF2P8AFFINEINVQB, 17 chars) have no underscore to break
+        # at, so the column must hold them whole.  The value columns
+        # all break (snake_case identifiers) or wrap at spaces
+        # ("lea (addr-mode srcs + imm, no load)"), so they can be
+        # tighter.  Sums to 106.
+        widths=[27, 15, 11, 12, 16, 11, 14],
     ))
 
     # ---- Registers ----
@@ -302,12 +396,26 @@ def emit_per_isa_section(name: str, insn_prefix: str, reg_prefix: str,
             "consecutive ``REG_VEC*`` entries); those rows render the "
             "full range like ``VEC0..VEC7``."
         )
+    fp_note = ""
+    if name == "AArch64":
+        fp_note = (
+            "  AArch64 has a *unified SIMD&FP register file*: there is "
+            "no separate scalar-FP bank.  ``Bn`` / ``Hn`` / ``Sn`` / "
+            "``Dn`` / ``Qn`` are the 8/16/32/64/128-bit views of the "
+            "same physical ``Vn``, and SVE ``Zn`` is its scalable "
+            "extension — so all of them for index *n* alias the one "
+            "``REG_VEC<n>``.  The absence of distinct ``REG_FP*`` "
+            "entries (which x86 has for the separate x87 ``ST0–7`` "
+            "stack) is therefore correct, not a missing mapping; "
+            "scalar-FP semantics are conveyed by the ``GEN_OP_FP_*`` "
+            "opcode plus a lane-0 mask, not by the register identity."
+        )
     out.append(
         f"{len(reg_rows)} Capstone register-ids classified.  Multiple "
         "Capstone names typically map to the same generic-domain ID — "
         "for example x86 ``AH``, ``AL``, ``AX``, ``EAX``, ``RAX`` "
         f"all alias to ``REG_GPR0``.  The ``{reg_prefix}`` and "
-        "``REG_`` prefixes are stripped." + multi_note
+        "``REG_`` prefixes are stripped." + fp_note + multi_note
     )
     out.append("")
     table = (
@@ -332,7 +440,7 @@ def emit_by_genop_section(per_isa_rows) -> list[str]:
     )
     for isa_name, (insn_prefix, _reg_prefix, insn_rows, _reg_rows) in (
             per_isa_rows.items()):
-        for insn, op, _branch, _flags in insn_rows:
+        for insn, op, *_rest in insn_rows:
             by_op[op][isa_name].append(short_with_prefix(insn, insn_prefix))
 
     out: list[str] = []
@@ -402,7 +510,7 @@ def emit_by_branch_section(per_isa_rows) -> list[str]:
     )
     for isa_name, (insn_prefix, _reg_prefix, insn_rows, _reg_rows) in (
             per_isa_rows.items()):
-        for insn, _op, branch, _flags in insn_rows:
+        for insn, _op, branch, *_rest in insn_rows:
             if branch == "BRANCH_NONE":
                 continue
             by_branch[branch][isa_name].append(
@@ -447,7 +555,8 @@ def write_appendix(app: Sphinx) -> None:
     out_path = os.path.join(out_dir, "encoding_tables.rst")
 
     per_isa: dict[str, tuple[str, str,
-                              list[tuple[str, str, str, str]],
+                              list[tuple[str, str, str, str,
+                                         str, str, str]],
                               list[tuple[str, str]]]] = {}
     missing: list[str] = []
     for isa_name, filename, insn_prefix, reg_prefix in ISA_FILES:

@@ -773,6 +773,8 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
                                  uint64_t start_insn,
                                  uint64_t warmup_insns,
                                  uint64_t total_target_insns,
+                                 uint32_t seed_thread_id,
+                                 double simpoint_weight,
                                  const std::vector<InitialRegSnap> *regfile);
 void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry);
 /* Finish the body stream and hand the accumulated header buffer

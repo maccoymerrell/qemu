@@ -466,10 +466,14 @@ struct BodyStreamState {
     BitWriter header_bw;
     int64_t prev_entry_template;
     int64_t current_thread;
+    /* False until the segment's first BODY_TAG_THREAD_SWITCH is
+     * emitted.  Forces that first record so the body always states
+     * its starting thread explicitly (as a normal delta from 0)
+     * instead of relying on an implicit "starts at 0" assumption. */
+    bool    thread_announced;
     /* Per-vCPU field-state tables: each thread's deltas are computed
      * against its own prior emission, not the cross-thread sequence.
-     * Keyed by thread_id (dense small ints handed out by
-     * get_or_assign_thread_id, starting at 0), lazy-grown on first
+     * Keyed by thread_id (== guest vCPU index), lazy-grown on first
      * emit.  Slot may be null until the thread first emits.  CP state
      * persists across body entries within a thread; WP state is a
      * per-chain overlay that falls back to that thread's CP state. */
@@ -2354,6 +2358,8 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
                                  uint64_t start_insn,
                                  uint64_t warmup_insns,
                                  uint64_t total_target_insns,
+                                 uint32_t seed_thread_id,
+                                 double simpoint_weight,
                                  const std::vector<InitialRegSnap> *regfile)
 {
     if (!g_field_state_slot_lut_built) {
@@ -2419,6 +2425,20 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
     bw_write_uleb128(&st->header_bw, warmup_insns);
     bw_write_uleb128(&st->header_bw, total_target_insns);
 
+    /* SimPoint weight: the fraction of whole-program execution this
+     * segment represents, so a consumer can reconstruct a
+     * whole-program metric as the weighted sum over per-simpoint
+     * traces without going back to the original .weights file.  0.0
+     * for non-simpoint segments (no weighting applies).  Encoded as
+     * a raw little-endian IEEE-754 double (fixed 8 bytes) rather than
+     * a varint — it isn't an integer and there's exactly one per
+     * header. */
+    {
+        uint64_t bits;
+        memcpy(&bits, &simpoint_weight, sizeof(bits));
+        bw_write_u64_le(&st->header_bw, bits);
+    }
+
     {
         const char *cmd = qemu_command_line ? qemu_command_line : "";
         size_t len = strlen(cmd);
@@ -2453,7 +2473,13 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
     bw_byte_align(&st->bw);
     bw_flush(&st->bw);
 
+    /* Base 0, like every other delta in the format.  The first body
+     * record is forced to be a THREAD_SWITCH regardless (see
+     * thread_announced in body_stream_write_entry), so the starting
+     * thread is stated explicitly as an ordinary delta from 0 — no
+     * special-case base a consumer would have to know about. */
     st->current_thread = 0;
+    st->thread_announced = false;
 
     /*
      * Per-thread FieldStateTables are lazy-allocated on first emit
@@ -2474,15 +2500,13 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
      * capture live, which gets meaningful values rather than the
      * empty stub.
      *
-     * The seed thread is whichever vCPU triggered start_trace_
-     * segment; thread_id 0 is assigned to the first vCPU observed
-     * in the segment by get_or_assign_thread_id, which is also the
-     * segment-starting vCPU in single-threaded launches.  For
-     * multi-vCPU launches where another thread races in before the
-     * seed thread's first body emit, the seed thread gets a higher
-     * thread_id and we lose the seed; the regfile for the seed vCPU
-     * is then re-captured live at its first emit (post-first-BB),
-     * same fallback as for joiners.
+     * @seed_thread_id is the vCPU index that triggered start_trace_
+     * segment (thread_id == guest vCPU index, stable for the whole
+     * run).  If another thread races in before the seed thread's
+     * first body emit, that joiner just captures its own regfile
+     * live at first emit; the seed regfile stays pinned to
+     * @seed_thread_id and is emitted when that vCPU first emits
+     * (post-first-BB worst case, same fallback as before).
      */
     bool any_live = false;
     if (regfile) {
@@ -2492,7 +2516,7 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
     }
     if (any_live) {
         st->seed_regfile = *regfile;
-        st->seed_thread = 0;
+        st->seed_thread = (int32_t)seed_thread_id;
     }
 
     /* Pre-allocate the encoder's per-entry scratch.  Sized
@@ -2708,10 +2732,11 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
         dyn_params_sort_template_order(wp.dyn_params);
     }
 
-    if ((int64_t)tid != st->current_thread) {
+    if (!st->thread_announced || (int64_t)tid != st->current_thread) {
         bw_write_u8(&st->bw, BODY_TAG_THREAD_SWITCH);
         bw_write_sleb128(&st->bw, (int64_t)tid - st->current_thread);
         st->current_thread = tid;
+        st->thread_announced = true;
     }
 
     /*

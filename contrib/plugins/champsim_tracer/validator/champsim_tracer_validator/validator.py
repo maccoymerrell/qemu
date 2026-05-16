@@ -2860,33 +2860,50 @@ def _check_wp_events(body_stats: dict,
     )]
 
 
-def _check_thread_switch_absent(body_stats: dict,
-                                expected_threads: int = 1) -> list[Issue]:
-    """Single-thread test programs must never produce BODY_TAG_THREAD_SWITCH
-    records.  Multi-thread traces are expected to; multi-thread runs
-    must produce at least one switch (otherwise the threads never
-    interleaved and we aren't actually testing multi-thread tracing)."""
+def _check_thread_switch(body_stats: dict,
+                         expected_threads: int = 1) -> list[Issue]:
+    """Every segment body's first record is a mandatory
+    BODY_TAG_THREAD_SWITCH stating the starting thread (an ordinary
+    delta from 0), so the count is never 0.  For a single-thread
+    trace that mandatory opener is the *only* switch per segment and
+    there is no interleaving, so the count matches the regfile
+    cadence exactly (REGFILE is likewise one-per-segment when
+    single-thread).  Multi-thread runs add real interleaving
+    switches, so the count must be at least ``expected_threads``
+    (otherwise the threads never interleaved and we aren't actually
+    exercising multi-thread tracing)."""
     actual = int(body_stats.get("thread_switch_count", 0))
-    if expected_threads == 1 and actual != 0:
+    regfiles = int(body_stats.get("regfile_count", 0))
+    if actual == 0:
         return [Issue(
             "thread_switch", "error",
-            f"thread_switch_count={actual} on a single-thread trace; "
-            f"writer should not emit BODY_TAG_THREAD_SWITCH when there "
-            f"is only one vCPU contributing entries",
+            "thread_switch_count=0; every segment body must open with a "
+            "mandatory BODY_TAG_THREAD_SWITCH stating the start thread",
             {"actual": actual},
         )]
-    if expected_threads > 1 and actual == 0:
+    if expected_threads == 1:
+        if actual != regfiles:
+            return [Issue(
+                "thread_switch", "error",
+                f"thread_switch_count={actual} on a single-thread trace; "
+                f"expected exactly one mandatory opener per segment "
+                f"(== regfile_count={regfiles}) with no interleaving "
+                f"switches",
+                {"actual": actual, "expected": regfiles},
+            )]
+    elif actual < expected_threads:
         return [Issue(
             "thread_switch", "error",
             f"expected multi-thread trace ({expected_threads} threads) "
-            f"but thread_switch_count=0; no thread interleaving was "
-            f"captured — qemu-user may have run threads serially or "
+            f"but thread_switch_count={actual}; threads never "
+            f"interleaved — qemu-user may have run them serially or "
             f"the program never spawned the second thread",
             {"actual": actual, "expected_threads": expected_threads},
         )]
     return [Issue(
         "thread_switch", "info",
-        f"thread_switch_count={actual} (expected_threads={expected_threads})",
+        f"thread_switch_count={actual} (expected_threads="
+        f"{expected_threads}, regfile_count={regfiles})",
     )]
 
 
@@ -3942,7 +3959,7 @@ def validate_structural(trace_path: Path,
     templates_by_id = {t["template_id"]: t for t in templates}
     issues += _check_iframe_cadence(body_stats, entries, trace_meta)
     issues += _check_regfile_records(body_stats, expected_threads)
-    issues += _check_thread_switch_absent(body_stats, expected_threads)
+    issues += _check_thread_switch(body_stats, expected_threads)
     issues += _check_thread_distribution(entries, expected_threads)
     issues += _check_wp_events(body_stats, entries)
     issues += _check_atomic_count(body_stats, entries, templates_by_id)
@@ -4168,7 +4185,7 @@ def validate(meta_path: Path, trace_path: Path,
     stats["body_stats"] = body_stats
     issues += _check_iframe_cadence(body_stats, cp_entries, trace_meta)
     issues += _check_regfile_records(body_stats, expected_threads)
-    issues += _check_thread_switch_absent(body_stats, expected_threads)
+    issues += _check_thread_switch(body_stats, expected_threads)
     issues += _check_thread_distribution(entries, expected_threads)
     issues += _check_wp_events(body_stats, cp_entries)
     issues += _check_atomic_count(body_stats, entries, templates_by_id)

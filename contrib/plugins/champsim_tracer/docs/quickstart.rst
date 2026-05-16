@@ -157,6 +157,36 @@ pairs across separate argv entries.
    symbol occurrence — see ``symbol`` mode below) and is rejected
    under the other two modes.
 
+   **Simpoints file format.**  ``file`` is consumed verbatim in the
+   `SimPoint <https://cseweb.ucsd.edu/~calder/simpoint/>`_ tool's own
+   output format, so the file ``SimPoint`` writes with
+   ``-saveSimpoints`` can be passed straight through:
+
+   * Each non-empty line is ``<interval_id> [<cluster_id>]``,
+     whitespace-separated, one line per selected simpoint.
+     ``interval_id`` is the 0-based interval index; the chosen
+     interval covers instructions
+     ``[interval_id * interval, interval_id * interval + interval)``.
+     ``cluster_id`` (the phase id ``SimPoint`` assigns) is optional;
+     when omitted, the line's ordinal is used.
+   * Lines beginning with ``#`` and blank lines are ignored.  Line
+     order does not matter — segments are emitted in ascending
+     instruction-count order.
+   * An optional sibling weights file (``SimPoint``'s
+     ``-saveSimpointWeights`` output) is loaded automatically if
+     present: it is the path with a trailing ``.simpoints`` replaced
+     by ``.weights`` (or, for any other name, ``<file>.weights``).
+     Each line is ``<weight> <cluster_id>``; the weight is recorded
+     on the matching simpoint for downstream aggregation and does not
+     affect what is traced.
+
+   Example ``mcf.simpoints`` / ``mcf.weights`` pair::
+
+      # mcf.simpoints          # mcf.weights
+      42 0                     0.5123 0
+      178 1                    0.3001 1
+      933 2                    0.1876 2
+
 ``trace_window=symbol:name=<sym>;occurrence=<N>;simulation=<insns>``
    Trace begins on the *N*-th time the named symbol appears as a
    basic-block entry, then runs for ``simulation`` architectural

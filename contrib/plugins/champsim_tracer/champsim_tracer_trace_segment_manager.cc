@@ -195,6 +195,8 @@ static FILE *open_member_sink(const char *temp_path,
 void TraceSegmentManager::open_output(const char *label,
                                       uint64_t warmup_insns,
                                       uint64_t total_target_insns,
+                                      uint32_t seed_thread_id,
+                                      double simpoint_weight,
                                       const std::vector<InitialRegSnap> *regfile)
 {
     /*
@@ -215,10 +217,10 @@ void TraceSegmentManager::open_output(const char *label,
     }
 
     /* Strip a trailing ".cst" before appending segment labels and
-     * the extension, so a user passing ``outfile=trace.cst`` gets
-     * ``trace.cst`` (single segment) or ``trace_sp0.cst`` (per-
-     * simpoint) rather than ``trace.cst.cst`` /
-     * ``trace.cst_sp0.cst``. */
+     * the extension, so a user passing ``outfile=mcf.cst`` gets
+     * ``mcf.cst`` (single segment) or ``mcf-734B.cst`` (per-simpoint,
+     * label = simpoint position in billions of insns) rather than
+     * ``mcf.cst.cst`` / ``mcf.cst-734B.cst``. */
     size_t base_len = strlen(output_path_);
     if (base_len >= 4 &&
         strcmp(output_path_ + base_len - 4, ".cst") == 0) {
@@ -226,7 +228,7 @@ void TraceSegmentManager::open_output(const char *label,
     }
     g_autofree char *base = g_strndup(output_path_, base_len);
     g_autofree char *outfile_path = g_simpoints.is_active()
-        ? g_strdup_printf("%s_%s.cst", base, label)
+        ? g_strdup_printf("%s-%s.cst", base, label)
         : g_strdup_printf("%s.cst", base);
     const char *ext = compress_suffix(compress_cmd_);
 
@@ -253,7 +255,8 @@ void TraceSegmentManager::open_output(const char *label,
     current_->bin_stream =
         body_stream_new(current_->body_writer, current_->start_datetime,
                         current_->start_insn, warmup_insns,
-                        total_target_insns, regfile);
+                        total_target_insns, seed_thread_id,
+                        simpoint_weight, regfile);
     if (!current_->bin_stream) {
         fprintf(stderr,
                 "champsim_tracer: cannot initialize binary stream\n");
@@ -264,6 +267,8 @@ void TraceSegmentManager::start(const char *label,
                                 uint64_t start, uint64_t stop,
                                 uint64_t warmup_insns,
                                 uint64_t total_target_insns,
+                                uint32_t seed_thread_id,
+                                double simpoint_weight,
                                 const std::vector<InitialRegSnap> *regfile)
 {
     if (current_) {
@@ -280,7 +285,8 @@ void TraceSegmentManager::start(const char *label,
                  "%Y-%m-%d %H:%M:%S", &tm_buf);
     }
 
-    open_output(label, warmup_insns, total_target_insns, regfile);
+    open_output(label, warmup_insns, total_target_insns,
+                seed_thread_id, simpoint_weight, regfile);
 
     active_ = true;
     active_atomic_.store(1);

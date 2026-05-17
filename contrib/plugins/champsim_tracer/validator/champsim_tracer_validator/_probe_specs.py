@@ -63,7 +63,7 @@ _register_probe('probe_x86_shift', {'x86_64': {'asm': '"shl $3, %%rax\\n\\t"\n'
                    '    "shr $2, %%rbx\\n\\t"\n'
                    '    "sar $1, %%rcx"',
             'clobbers': '"rax","rbx","rcx","cc"',
-            'opcodes': ['SHL', 'SHR', 'SAR']}})
+            'opcodes': ['SHL', 'SHR']}})
 
 _register_probe('probe_x86_int_mul', {'x86_64': {'asm': '"imul %%rbx, %%rax"',
             'clobbers': '"rax","cc"',
@@ -80,7 +80,7 @@ _register_probe('probe_x86_int_adc_sbb', {'x86_64': {'asm': '"clc\\n\\t"\n'
                    '    "adc %%rbx, %%rax\\n\\t"\n'
                    '    "sbb %%rdx, %%rcx"',
             'clobbers': '"rax","rcx","cc"',
-            'opcodes': ['INT_ADC', 'INT_SBB']}})
+            'opcodes': ['INT_ADD', 'INT_SUB']}})
 
 _register_probe('probe_x86_logic', {'x86_64': {'asm': '"and %%rbx, %%rax\\n\\t"\n'
                    '    "or %%rdx, %%rcx\\n\\t"\n'
@@ -161,7 +161,7 @@ _register_probe('probe_arm_vec_load_multi_lane', {'aarch64': {'asm':
                     '    "ld3 {v2.4h, v3.4h, v4.4h}, [x9]\\n\\t"\n'
                     '    "ld4 {v5.16b, v6.16b, v7.16b, v8.16b}, [x9]"',
             'clobbers': '"x9","v0","v1","v2","v3","v4","v5","v6","v7","v8"',
-            'opcodes': ['VEC_MOV']}})
+            'opcodes': ['VEC_LOAD']}})
 
 # AArch64 ST2/ST3/ST4 multi-structure stores — companion to the
 # load probe.  Each instruction has multiple memops, each draining
@@ -172,7 +172,7 @@ _register_probe('probe_arm_vec_store_multi_lane', {'aarch64': {'asm':
                     '    "st3 {v2.4h, v3.4h, v4.4h}, [x9]\\n\\t"\n'
                     '    "st4 {v5.16b, v6.16b, v7.16b, v8.16b}, [x9]"',
             'clobbers': '"x9","memory"',
-            'opcodes': ['VEC_MOV']}})
+            'opcodes': ['VEC_STORE']}})
 
 _register_probe('probe_x86_fp_arith', {'x86_64': {'asm': '"addsd %%xmm1, %%xmm0\\n\\t"\n'
                    '    "subsd %%xmm1, %%xmm2\\n\\t"\n'
@@ -226,7 +226,7 @@ _register_probe('probe_arm_shift', {'aarch64': {'asm': '"lsl x0, x1, x2\\n\\t"\n
                     '    "lsr x3, x4, x5\\n\\t"\n'
                     '    "asr x6, x7, x0"',
              'clobbers': '"x0","x3","x6"',
-             'opcodes': ['SHL', 'SHR', 'SAR']}})
+             'opcodes': ['SHL', 'SHR']}})
 
 _register_probe('probe_arm_sxt_uxt', {'aarch64': {'asm': '"sxtb x0, w1\\n\\t"\n'
                     '    "uxtb x2, w3\\n\\t"\n'
@@ -240,7 +240,7 @@ _register_probe('probe_arm_adc_sbc', {'aarch64': {'asm': '"cmp x0, x0\\n\\t"    
                     '    "adc x1, x2, x3\\n\\t"\n'
                     '    "sbc x4, x5, x6"',
              'clobbers': '"x1","x4","cc"',
-             'opcodes': ['INT_ADC', 'INT_SBB']}})
+             'opcodes': ['INT_ADD', 'INT_SUB']}})
 
 _register_probe('probe_arm_load_store', {'aarch64': {'asm': '"sub sp, sp, #16\\n\\t"\n'
                     '    "stp x0, x1, [sp]\\n\\t"\n'
@@ -277,6 +277,24 @@ _register_probe('probe_arm_fp_mov_cvt', {'aarch64': {'asm': '"fmov d0, d1\\n\\t"
              'clobbers': '"d0","d2"',
              'opcodes': ['FP_MOV', 'FP_CVT']}})
 
+# Same FADD/FSUB/FMUL/FDIV mnemonics as probe_arm_fp_arith, but the
+# packed-vector forms (Vd.<arr>): refine_arm64_fp_vec must promote the
+# statically-classified scalar FP_* op to its VEC_* twin from the
+# decoded operand arrangement.
+_register_probe('probe_arm_fp_vec_promote', {'aarch64': {'asm':
+                    '"fadd v0.2d, v1.2d, v2.2d\\n\\t"\n'
+                    '    "fsub v3.4s, v4.4s, v5.4s\\n\\t"\n'
+                    '    "fmul v6.4s, v7.4s, v1.4s\\n\\t"\n'
+                    '    "fdiv v0.2d, v2.2d, v3.2d"',
+             'clobbers': '"v0","v3","v6"',
+             'opcodes': ['VEC_ADD', 'VEC_SUB', 'VEC_MUL', 'VEC_DIV']}})
+
+_register_probe('probe_arm_fp_vec_sqrt', {'aarch64': {'asm':
+                    '"fsqrt v0.2d, v1.2d\\n\\t"\n'
+                    '    "fmla v2.4s, v3.4s, v4.4s"',
+             'clobbers': '"v0","v2"',
+             'opcodes': ['VEC_SQRT', 'VEC_MADD']}})
+
 _register_probe('probe_arm_nop', {'aarch64': {'asm': '"nop\\n\\t"\n    "nop"',
              'clobbers': '"memory"',
              'opcodes': ['NOP']}})
@@ -302,7 +320,7 @@ _register_probe('probe_rv_shift', {'riscv64': {'asm': '"slli t0, t1, 3\\n\\t"\n'
                     '    "srli t2, t3, 2\\n\\t"\n'
                     '    "srai t4, t5, 1"',
              'clobbers': '"t0","t2","t4"',
-             'opcodes': ['SHL', 'SHR', 'SAR']}})
+             'opcodes': ['SHL', 'SHR']}})
 
 _register_probe('probe_rv_sxt_uxt', {'riscv64': {'asm': '"sext.w t0, t1\\n\\t"\n    "andi  t2, t3, 0xff"',
              'clobbers': '"t0","t2"',
@@ -358,7 +376,7 @@ _register_probe('probe_mips_shift', {'mipsel': {'asm': '"sll $t0, $t1, 3\\n\\t"\
                    '    "srl $t2, $t3, 2\\n\\t"\n'
                    '    "sra $t4, $t5, 1"',
             'clobbers': '"$t0","$t2","$t4"',
-            'opcodes': ['SHL', 'SHR', 'SAR']}})
+            'opcodes': ['SHL', 'SHR']}})
 
 _register_probe('probe_mips_sxt_uxt', {'mipsel': {'asm': '"seb  $t0, $t1\\n\\t"\n'
                    '    "seh  $t2, $t3\\n\\t"\n'
@@ -433,9 +451,12 @@ _register_probe('probe_arm_xchg', {'aarch64': {'asm': '".arch armv8.1-a\\n\\t"\n
              'clobbers': '"x0","x1","x2","memory"',
              'opcodes': ['XCHG']}})
 
-_register_probe('probe_arm_rotate', {'aarch64': {'asm': '"ror  x0, x1, #5\\n\\t"\n    "extr x2, x3, x3, #7"',
+# ROR by immediate is an alias of EXTR (Capstone disassembles it as
+# extr -> GEN_OP_BITMANIP); only the register form (RORV) stays a
+# real ROR.  EXTR itself is bit-field extract -> BITMANIP.
+_register_probe('probe_arm_rotate', {'aarch64': {'asm': '"ror  x0, x1, x4\\n\\t"\n    "extr x2, x3, x3, #7"',
              'clobbers': '"x0","x2"',
-             'opcodes': ['ROR']}})
+             'opcodes': ['ROR', 'BITMANIP']}})
 
 _register_probe('probe_arm_vec_mov', {'aarch64': {'asm': '"dup  v0.16b, w1\\n\\t"\n'
                     '    "ins  v2.b[0], w3\\n\\t"\n'

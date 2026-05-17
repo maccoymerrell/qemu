@@ -328,9 +328,9 @@ def _classify_x86(insn_id, mnem, id_to_class, id_to_name):
     if re.match(r'^i?div', m):
         return ('GEN_OP_INT_DIV', 'BRANCH_NONE', 'MF_NONE')
     if re.match(r'^adc', m):
-        return ('GEN_OP_INT_ADC', 'BRANCH_NONE', 'MF_NONE')
+        return ('GEN_OP_INT_ADD', 'BRANCH_NONE', 'MF_NONE')
     if re.match(r'^sbb', m):
-        return ('GEN_OP_INT_SBB', 'BRANCH_NONE', 'MF_NONE')
+        return ('GEN_OP_INT_SUB', 'BRANCH_NONE', 'MF_NONE')
     if re.match(r'^and', m):
         return ('GEN_OP_AND', 'BRANCH_NONE', 'MF_NONE')
     if re.match(r'^or[blwq]?$', m):
@@ -356,7 +356,7 @@ def _classify_x86(insn_id, mnem, id_to_class, id_to_name):
             return ('GEN_OP_SHL', 'BRANCH_NONE', 'MF_NONE')
         return ('GEN_OP_SHR', 'BRANCH_NONE', 'MF_NONE')
     if re.match(r'^sar', m):
-        return ('GEN_OP_SAR', 'BRANCH_NONE', 'MF_NONE')
+        return ('GEN_OP_SHR', 'BRANCH_NONE', 'MF_NONE')
     if re.match(r'^ro[lr]', m):
         if 'l' in m[2:3]:
             return ('GEN_OP_ROL', 'BRANCH_NONE', 'MF_NONE')
@@ -376,7 +376,7 @@ def _classify_x86(insn_id, mnem, id_to_class, id_to_name):
     if m.startswith('shlx'):
         return ('GEN_OP_SHL', 'BRANCH_NONE', 'MF_NONE')
     if m.startswith('sarx'):
-        return ('GEN_OP_SAR', 'BRANCH_NONE', 'MF_NONE')
+        return ('GEN_OP_SHR', 'BRANCH_NONE', 'MF_NONE')
     if re.match(r'^(andn|blsr|blsi|blsmsk|bzhi)', m):
         return ('GEN_OP_AND', 'BRANCH_NONE', 'MF_NONE')
 
@@ -519,14 +519,14 @@ def classify_insn(insn_id, mnem, isa, id_to_class, id_to_name):
 _GEN_OP_CATEGORY = {
     'GEN_OP_INT_ADD': 'int_alu', 'GEN_OP_INT_SUB': 'int_alu',
     'GEN_OP_INT_MUL': 'int_alu', 'GEN_OP_INT_DIV': 'int_alu',
-    'GEN_OP_INT_ADC': 'int_alu', 'GEN_OP_INT_SBB': 'int_alu',
+    'GEN_OP_INT_ADD': 'int_alu', 'GEN_OP_INT_SUB': 'int_alu',
     'GEN_OP_INT_MADD': 'int_alu', 'GEN_OP_INT_MSUB': 'int_alu',
     'GEN_OP_AND': 'int_alu', 'GEN_OP_OR': 'int_alu',
     'GEN_OP_XOR': 'int_alu', 'GEN_OP_NOT': 'int_alu',
     'GEN_OP_NEG': 'int_alu', 'GEN_OP_INC': 'int_alu',
     'GEN_OP_DEC': 'int_alu',
     'GEN_OP_SHL': 'shift', 'GEN_OP_SHR': 'shift',
-    'GEN_OP_SAR': 'shift', 'GEN_OP_ROL': 'shift', 'GEN_OP_ROR': 'shift',
+    'GEN_OP_SHR': 'shift', 'GEN_OP_ROL': 'shift', 'GEN_OP_ROR': 'shift',
     'GEN_OP_MOV': 'data_mov', 'GEN_OP_MOVSX': 'data_mov',
     'GEN_OP_MOVZX': 'data_mov', 'GEN_OP_LEA': 'data_mov',
     'GEN_OP_LOAD': 'data_mov', 'GEN_OP_STORE': 'data_mov',

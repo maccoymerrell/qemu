@@ -1735,6 +1735,23 @@ MADD_OPS = {
     "GEN_OP_VEC_MADD", "GEN_OP_VEC_MSUB",
 }
 
+# Scalar-FP opcodes with a faithful packed-vector twin.  Rows the
+# classifier puts here get .refine = refine_arm64_fp_vec (AArch64),
+# which promotes FP_* -> VEC_* at decode when the operands show a
+# real vector arrangement.  FP_CMP / FP_CVT are intentionally absent:
+# the enum has no VEC_CMP / VEC_CVT and the project keeps vector
+# FCMEQ / FCVTZS as FP_CMP / FP_CVT by convention.
+FP_VEC_PROMOTE_OPS = {
+    "GEN_OP_FP_ADD":  "GEN_OP_VEC_ADD",
+    "GEN_OP_FP_SUB":  "GEN_OP_VEC_SUB",
+    "GEN_OP_FP_MUL":  "GEN_OP_VEC_MUL",
+    "GEN_OP_FP_DIV":  "GEN_OP_VEC_DIV",
+    "GEN_OP_FP_SQRT": "GEN_OP_VEC_SQRT",
+    "GEN_OP_FP_MADD": "GEN_OP_VEC_MADD",
+    "GEN_OP_FP_MSUB": "GEN_OP_VEC_MSUB",
+    "GEN_OP_FP_MOV":  "GEN_OP_VEC_MOV",
+}
+
 
 def classify_x86(m: str) -> Entry:
     jcc = {
@@ -1764,11 +1781,11 @@ def classify_x86(m: str) -> Entry:
         return ent("GEN_OP_FENCE", flags="MF_ATOMIC")
 
     if re.match(r"^(lzcnt|tzcnt|popcnt)", m):
-        return ent("GEN_OP_AND")
+        return ent("GEN_OP_BITMANIP")
     if m in {"aaa", "aad", "aam", "aas", "daa", "das"}:
         return ent("GEN_OP_INT_ADD")
     if m.startswith("adox"):
-        return ent("GEN_OP_INT_ADC")
+        return ent("GEN_OP_INT_ADD")
     if m.startswith(("aes", "sha", "xcrypt", "xsha")):
         return ent("GEN_OP_VEC_LOGIC")
     if m.startswith(("gf2p8mul", "pclmul")):
@@ -1824,9 +1841,15 @@ def classify_x86(m: str) -> Entry:
         return ent("GEN_OP_CMP")
     if re.match(r"^movs[bwq]$", m):
         return ent("GEN_OP_MOV")
-    if m.startswith("xsave") or m.startswith("stmxcsr") or m.startswith(("clrssbsy", "clzero", "ptwrite", "sgdt", "sidt", "wrssd", "wrssq", "wrussd", "wrussq", "xstore")) or re.match(r"^out", m):
+    # Port I/O: exact-match only.  `^out`/`^in(s|$)` regexes were a
+    # principle-#1 violation -- "^in(s|$)" greedily matched INSERTPS
+    # / INSERTQ ("in" + "s" ...) and mis-filed those SIMD inserts as
+    # GEN_OP_LOAD.  The string INS*/OUTS* forms are already handled
+    # above (pointer-advance -> INT_ADD); only the bare port ops
+    # remain here.
+    if m.startswith("xsave") or m.startswith("stmxcsr") or m.startswith(("clrssbsy", "clzero", "ptwrite", "sgdt", "sidt", "wrssd", "wrssq", "wrussd", "wrussq", "xstore")) or m == "out":
         return ent("GEN_OP_STORE")
-    if m.startswith("xrstor") or m.startswith("ldmxcsr") or m.startswith(("lgdt", "lidt", "lldt", "llwpcb", "lmsw", "ltr", "rdmsr", "rdpmc", "rstorssp", "sldt", "slwpcb", "smsw", "str")) or re.match(r"^in(s|$)", m):
+    if m.startswith("xrstor") or m.startswith("ldmxcsr") or m.startswith(("lgdt", "lidt", "lldt", "llwpcb", "lmsw", "ltr", "rdmsr", "rdpmc", "rstorssp", "sldt", "slwpcb", "smsw", "str")) or m == "in":
         return ent("GEN_OP_LOAD")
     if m.startswith("maskmov"):
         return ent("GEN_OP_STORE")
@@ -1888,9 +1911,9 @@ def classify_x86(m: str) -> Entry:
         return ent("GEN_OP_VEC_LOGIC")
 
     if m.startswith("adc"):
-        return ent("GEN_OP_INT_ADC")
+        return ent("GEN_OP_INT_ADD")
     if m.startswith("sbb"):
-        return ent("GEN_OP_INT_SBB")
+        return ent("GEN_OP_INT_SUB")
     if m.startswith("add"):
         return ent("GEN_OP_INT_ADD")
     if m.startswith("sub"):
@@ -1903,9 +1926,18 @@ def classify_x86(m: str) -> Entry:
     # — `m.startswith("pext")` swallowed SSE4 PEXTRB/PEXTRW/PEXTRD/PEXTRQ
     # (and their VEX/EVEX VPEXTR* equivalents), routing them to GEN_OP_AND
     # instead of the GEN_OP_VEC_SHUF clause that owns element-extract ops.
+    # BMI2 PEXT (exact match: m.startswith("pext") would swallow the
+    # SSE4 PEXTR* element-extract ops, owned by the VEC_SHUF clause).
     if m == "pext":
-        return ent("GEN_OP_AND")
-    if m.startswith(("and", "andn", "bextr", "blc", "bls", "t1mskc", "tzmsk", "bextr", "blsi", "blsmsk", "blsr", "bzhi", "pdep", "popcnt", "lzcnt", "tzcnt", "bsf", "bsr")):
+        return ent("GEN_OP_BITMANIP")
+    # Scalar bit-field / bit-count: extract/deposit/isolate/count
+    # bits.  Distinct from the boolean AND/OR/... class (own port,
+    # multi-cycle).  AND/ANDN stay boolean.
+    if m.startswith(("bextr", "blc", "bls", "t1mskc", "tzmsk",
+                      "blsi", "blsmsk", "blsr", "bzhi", "pdep",
+                      "popcnt", "lzcnt", "tzcnt", "bsf", "bsr")):
+        return ent("GEN_OP_BITMANIP")
+    if m.startswith(("and", "andn")):
         return ent("GEN_OP_AND")
     if re.match(r"^or", m):
         return ent("GEN_OP_OR")
@@ -1928,7 +1960,7 @@ def classify_x86(m: str) -> Entry:
     if m.startswith(("shr", "shrx")):
         return ent("GEN_OP_SHR")
     if m.startswith(("sar", "sarx")):
-        return ent("GEN_OP_SAR")
+        return ent("GEN_OP_SHR")
     if m.startswith(("rol", "rcl")):
         return ent("GEN_OP_ROL")
     if m.startswith(("ror", "rcr")):
@@ -1957,20 +1989,29 @@ def classify_x86(m: str) -> Entry:
 
     if m.startswith("v"):
         core = m[1:]
+        # VEX aliases of the scalar MXCSR load/store (no SIMD compute).
+        if core in {"stmxcsr"}:
+            return ent("GEN_OP_STORE")
+        if core in {"ldmxcsr"}:
+            return ent("GEN_OP_LOAD")
         fma_core = core[1:] if core[:1].isdigit() else core
         if core.startswith("p"):
             p = core[1:]
             if p.startswith("gather"):
-                return ent("GEN_OP_LOAD")
+                return ent("GEN_OP_VEC_LOAD")
             if p.startswith("scatter"):
-                return ent("GEN_OP_STORE")
+                return ent("GEN_OP_VEC_STORE")
             if p.startswith("add"):
                 return ent("GEN_OP_VEC_ADD")
             if p.startswith("sub"):
                 return ent("GEN_OP_VEC_SUB")
-            if p.startswith("madd"):
+            # VNNI dot-products (VPDPBUSD/VPDPWSSD, VP4DPWSSD with a
+            # leading lane-count digit) are multiply-accumulate.
+            if p.startswith(("madd", "dp", "4dp")):
                 return ent("GEN_OP_VEC_MADD")
-            if p.startswith("mul"):
+            # Carry-less / Galois-field multiply are multiplies, not
+            # the VEC_LOGIC fall-through.
+            if p.startswith(("clmul", "mul")):
                 return ent("GEN_OP_VEC_MUL")
             if p.startswith(("shuf", "blend", "perm", "unpck", "pack", "align", "insert", "extract", "insr", "extr")):
                 return ent("GEN_OP_VEC_SHUF")
@@ -1997,12 +2038,28 @@ def classify_x86(m: str) -> Entry:
             return ent("GEN_OP_FP_CMP")
         if core.startswith(("cvt", "round")):
             return ent("GEN_OP_FP_CVT")
+        # Reciprocal / reciprocal-sqrt approximations (VRCP14*,
+        # VRCP28*, VRCPP*, VRSQRT14*, ...): divide- / sqrt-class.
+        # Packed (..pd/..ps) -> VEC_*, scalar (..sd/..ss) -> FP_*.
+        if core.startswith("rcp"):
+            return ent("GEN_OP_FP_DIV" if m.endswith(("sd", "ss"))
+                       else "GEN_OP_VEC_DIV")
+        if core.startswith("rsqrt"):
+            return ent("GEN_OP_FP_SQRT" if m.endswith(("sd", "ss"))
+                       else "GEN_OP_VEC_SQRT")
+        # Galois-field multiply is a multiply (affine map stays in
+        # the VEC_LOGIC fall-through).
+        if core.startswith("gf2p8mul"):
+            return ent("GEN_OP_VEC_MUL")
+        # Gather/scatter: SIMD-indexed memory.  No substantial
+        # compute -> the SIMD load/store IS the classification.  The
+        # *pf forms only warm cache lines (SIMD prefetch hint).
         if core.startswith(("gatherpf", "scatterpf")):
-            return ent("GEN_OP_NOP")
+            return ent("GEN_OP_VEC_PREFETCH")
         if core.startswith("gather"):
-            return ent("GEN_OP_LOAD")
+            return ent("GEN_OP_VEC_LOAD")
         if core.startswith("scatter"):
-            return ent("GEN_OP_STORE")
+            return ent("GEN_OP_VEC_STORE")
         if core.startswith(("mov", "broadcast", "maskmov")):
             return ent("GEN_OP_VEC_MOV")
         if core.startswith(("shuf", "blend", "perm", "unpck", "insert", "extract")):
@@ -2041,8 +2098,15 @@ def classify_x86(m: str) -> Entry:
         return ent("GEN_OP_VEC_LOGIC")
     if m.startswith(("pf2i", "pi2f")):
         return ent("GEN_OP_FP_CVT")
-    if m.startswith(("pfrcp", "pfrsq", "rcp", "rsqrt")):
-        return ent("GEN_OP_FP_SQRT")
+    # Reciprocal -> divide-class; reciprocal-sqrt -> sqrt-class.
+    # Packed (..ps/..pd, 3DNow PFRCP/PFRSQ operate on packed) ->
+    # VEC_*; scalar (RCPSS/RSQRTSS) -> FP_*.
+    if m.startswith(("pfrsq", "rsqrt")):
+        return ent("GEN_OP_FP_SQRT" if m.endswith(("ss", "sd"))
+                   else "GEN_OP_VEC_SQRT")
+    if m.startswith(("pfrcp", "rcp")):
+        return ent("GEN_OP_FP_DIV" if m.endswith(("ss", "sd"))
+                   else "GEN_OP_VEC_DIV")
     if m in {"sysexitq", "sysret", "sysretq"}:
         return ent("GEN_OP_RET", "BRANCH_RETURN")
     return ent("GEN_OP_UNKNOWN")
@@ -2124,13 +2188,17 @@ def classify_aarch64(m: str) -> Entry:
     # LD[1-4]R*, LD[1-4]RO*, LD[1-4]RQ*), SVE LD1<elem> / ST1<elem>
     # / LD[2-4]<elem> / ST[2-4]<elem>, and the fault-tolerant /
     # non-temporal forms (LDFF1*, LDNF1*, LDNT1*).
-    if re.match(r"^(ld|st)([1-4]|ff1|nf1|nt1)\b|"
-                r"^(ld|st)([1-4])[bdhqw]|"
-                r"^(ld|st)([1-4])r[bdhqw]?|"
-                r"^(ld|st)([1-4])s[bhw]|"
-                r"^(ld|st)([1-4])ro?[bdhqw]?|"
-                r"^(ld|st)([1-4])rq?[bdhqw]?", m):
-        return ent("GEN_OP_VEC_MOV")
+    # NEON structure (LD1..LD4 / ST1..ST4) and SVE contiguous /
+    # gather / first-fault / non-fault / non-temporal vector
+    # memory.  The SIMD-width memory access IS the defining
+    # behaviour and these mnemonics have no scalar form, so they
+    # are unambiguously GEN_OP_VEC_LOAD / GEN_OP_VEC_STORE (matches
+    # the RVV vle*/vse* convention).  Prefix match (no \b) so the
+    # size suffixes (LDFF1SW, LD1RQB, ...) are covered too.
+    mv = re.match(r"^(ld|st)(?:[1-4]|ff1|nf1|nt1)", m)
+    if mv:
+        return ent("GEN_OP_VEC_LOAD" if mv.group(1) == "ld"
+                   else "GEN_OP_VEC_STORE")
     if m.startswith(("ld", "ldap", "ldar")):
         return ent("GEN_OP_LOAD")
     if m.startswith("st"):
@@ -2146,10 +2214,22 @@ def classify_aarch64(m: str) -> Entry:
         return ent("GEN_OP_MOVSX")
     if m.startswith(("uxt", "ubfm", "ubfiz", "ubfx")):
         return ent("GEN_OP_MOVZX")
+    # EXT = SIMD "extract from a pair of vectors" (a permute), not a
+    # data move; MVNI = vector move-inverted-immediate (a vector
+    # set, not bitwise NOT); NEG/NEGS = two's-complement negate.
+    # All NEON-only / unambiguous by mnemonic.
+    if m in {"ext", "extq"}:
+        return ent("GEN_OP_VEC_SHUF")
+    if m == "mvni":
+        return ent("GEN_OP_VEC_MOV")
+    if m in {"neg", "negs"}:
+        return ent("GEN_OP_NEG")
     if m.startswith(("dup", "ins", "movi")):
         return ent("GEN_OP_VEC_MOV")
     if m.startswith("extr"):
-        return ent("GEN_OP_ROR")
+        # EXTR = scalar bit-field / funnel extract (no NEON form);
+        # bit-manipulation class, consistent with x86/MIPS/RISC-V.
+        return ent("GEN_OP_BITMANIP")
     if m.startswith(("mov", "movi", "movk", "movn", "movz", "dup", "ins", "ext", "cpy")):
         return ent("GEN_OP_MOV")
     if m in {"clr", "ctz", "pext"}:
@@ -2165,7 +2245,7 @@ def classify_aarch64(m: str) -> Entry:
     if m == "abs":
         return ent("GEN_OP_NEG")
     if m.startswith("adc"):
-        return ent("GEN_OP_INT_ADC")
+        return ent("GEN_OP_INT_ADD")
     if re.match(r"^(sadd|uadd|addv|addqv|addp|saba|uaba|sabal|uabal)", m):
         return ent("GEN_OP_VEC_ADD")
     if m.startswith(("madd", "smadd", "umadd")):
@@ -2177,7 +2257,7 @@ def classify_aarch64(m: str) -> Entry:
     if re.match(r"^(ssub|usub|subv|sabd|uabd)", m):
         return ent("GEN_OP_VEC_SUB")
     if m.startswith("sbc"):
-        return ent("GEN_OP_INT_SBB")
+        return ent("GEN_OP_INT_SUB")
     if m.startswith("sub"):
         return ent("GEN_OP_INT_SUB")
     if m.startswith(("mul", "smul", "umul", "mneg")):
@@ -2199,7 +2279,7 @@ def classify_aarch64(m: str) -> Entry:
     if m.startswith(("lsr", "lsrrv")):
         return ent("GEN_OP_SHR")
     if m.startswith(("asr", "asrrv")):
-        return ent("GEN_OP_SAR")
+        return ent("GEN_OP_SHR")
     if m.startswith(("ror", "rorv", "extr")):
         return ent("GEN_OP_ROR")
     if m.startswith(("cmp", "ccmp")):
@@ -2242,10 +2322,20 @@ def classify_aarch64(m: str) -> Entry:
     if m.startswith(("fcsel", "fdup", "fexpa", "flogb", "fscale", "ftmad", "ftssel", "ftsmul", "fmov", "fabs", "fneg", "frint", "frsqr", "frecp")):
         return ent("GEN_OP_FP_MOV")
 
-    if re.match(r"^(cadd|raddhn|shadd|suqadd|uhadd|usqadd)", m):
+    # Saturating / rounding / halving / pairwise-accumulate vector
+    # add & subtract, and the NEON unsigned reciprocal estimates --
+    # all NEON-only mnemonics, were falling into the VEC_LOGIC
+    # catch-all below.
+    if re.match(r"^(cadd|raddhn|shadd|suqadd|uhadd|usqadd|sqadd"
+                r"|uqadd|srhadd|urhadd|sadalp|uadalp|saddlp"
+                r"|uaddlp)", m):
         return ent("GEN_OP_VEC_ADD")
-    if re.match(r"^(rsubhn|shsub|uhsub)", m):
+    if re.match(r"^(rsubhn|shsub|uhsub|sqsub|uqsub|sqneg)", m):
         return ent("GEN_OP_VEC_SUB")
+    if m == "urecpe":
+        return ent("GEN_OP_VEC_DIV")
+    if m == "ursqrte":
+        return ent("GEN_OP_VEC_SQRT")
     if re.match(r"^(bmopa|cmla|mac16|matfp|matint|mla|smlal|umlal|sqdmlal|sqrdmlah|sqrdcmlah|sdot|udot|usdot|sudot|svdot|uvdot|suvdot|usvdot|sumlall|usmlall|mopa|smopa|sumopa|umopa|usmopa|smmla|ummla|usmmla|bfmopa)", m):
         return ent("GEN_OP_VEC_MADD")
     if re.match(r"^(bmops|mls|smlsl|umlsl|sqdmlsl|sqrdmlsh|mops|smops|sumops|umops|usmops|bfmops)", m):
@@ -2353,12 +2443,17 @@ def classify_riscv(m: str) -> Entry:
         return ent("GEN_OP_INT_ADD")
     if m.startswith(("subw", "sub", "c_sub")):
         return ent("GEN_OP_INT_SUB")
-    if m.startswith(("sll", "slli", "c_slli", "sh1", "sh2", "sh3")):
+    # Zba shift-add (sh1add/sh2add/sh3add[.uw]) is a scaled-index
+    # address calc (rs1<<n)+rs2 -- the defining op is the add, like
+    # x86 LEA, not a bare shift.
+    if m.startswith(("sh1add", "sh2add", "sh3add")):
+        return ent("GEN_OP_LEA")
+    if m.startswith(("sll", "slli", "c_slli")):
         return ent("GEN_OP_SHL")
     if m.startswith(("srl", "srli", "c_srli")):
         return ent("GEN_OP_SHR")
     if m.startswith(("sra", "srai", "c_srai")):
-        return ent("GEN_OP_SAR")
+        return ent("GEN_OP_SHR")
     if m.startswith(("lui", "c_li", "c_lui", "c_mv", "mv")):
         return ent("GEN_OP_MOV")
     if m.startswith(("aes", "brev8", "pack", "unzip", "xperm", "zip")):
@@ -2411,7 +2506,19 @@ def classify_riscv(m: str) -> Entry:
         return ent("GEN_OP_INT_MUL")
     if m.startswith(("div", "rem")):
         return ent("GEN_OP_INT_DIV")
-    if m.startswith(("and", "andi", "c_and", "bclr", "bext", "binv", "bset", "clmul", "clz", "ctz", "cpop", "orc", "rev", "rol", "ror", "xnor", "sext", "zext")):
+    # Zbb rotates are rotate ops, not AND (the coarse Zb* bucket
+    # below would otherwise mis-file them).
+    if m.startswith(("rol",)):
+        return ent("GEN_OP_ROL")
+    if m.startswith(("ror", "rori")):
+        return ent("GEN_OP_ROR")
+    # Zbc carry-less multiply / Zbb bit-count & friends are bit-
+    # manipulation, not boolean AND.
+    if m.startswith(("clmul", "clz", "ctz", "cpop", "brev", "bclr",
+                     "bext", "binv", "bset", "orc", "rev")):
+        return ent("GEN_OP_BITMANIP")
+    if m.startswith(("and", "andi", "c_and", "xnor", "sext",
+                     "zext")):
         return ent("GEN_OP_AND")
     if m.startswith(("or", "ori", "c_or")):
         return ent("GEN_OP_OR")
@@ -2420,30 +2527,38 @@ def classify_riscv(m: str) -> Entry:
     if m.startswith(("slt", "sltu", "slti", "sltiu", "min", "max")):
         return ent("GEN_OP_CMP")
     if m.startswith("v"):
+        # All RVV loads start "vl" (vle/vlse/vluxei/vloxei/vlseg/
+        # vl<n>re/vlm); they move a SIMD-width value -> VEC_LOAD,
+        # not the scalar GEN_OP_LOAD.
         if m.startswith("vl"):
-            return ent("GEN_OP_LOAD")
+            return ent("GEN_OP_VEC_LOAD")
         if m.startswith(("vfcvt", "vfncvt", "vfwcvt")):
             return ent("GEN_OP_FP_CVT")
         if m.startswith(("vset", "vsext")):
             return ent("GEN_OP_VEC_LOGIC")
         if m.startswith(("vadd", "vaadd", "vaaddu", "vadc", "vsadd", "vsaddu", "vwadd", "vfadd", "vfwadd", "vfred", "vwred", "vfwred")):
             return ent("GEN_OP_VEC_ADD")
-        if m.startswith(("vsub", "vasub", "vasubu", "vsbc", "vssub", "vssubu", "vwsub", "vfsub", "vfwsub")):
+        if m.startswith(("vsub", "vrsub", "vfrsub", "vasub", "vasubu", "vsbc", "vssub", "vssubu", "vwsub", "vfsub", "vfwsub")):
             return ent("GEN_OP_VEC_SUB")
         if m.startswith(("vmacc", "vmadd", "vwmacc", "vfmacc", "vfnmacc", "vfmadd", "vfnmadd", "vfwmacc", "vfwnmacc")):
             return ent("GEN_OP_VEC_MADD")
         if m.startswith(("vmsac", "vnmsac", "vnmsub", "vfmsac", "vfnmsac", "vfmsub", "vfnmsub", "vfwmsac", "vfwnmsac")):
             return ent("GEN_OP_VEC_MSUB")
-        if m.startswith(("vmul", "vsmul", "vwmul", "vfmul", "vfwmul")):
+        if m.startswith(("vmul", "vsmul", "vwmul", "vfmul", "vfwmul", "vclmul")):
             return ent("GEN_OP_VEC_MUL")
-        if m.startswith(("vfdiv", "vfrdiv")):
-            return ent("GEN_OP_FP_DIV")
-        if m.startswith("vfsqrt"):
-            return ent("GEN_OP_FP_SQRT")
+        # Vector divide / modulo / reciprocal: integer (vdiv/vrem),
+        # FP (vfdiv/vfrdiv), and the reciprocal estimates
+        # (vfrec7 ~ divide-class, vfrsqrt7 ~ sqrt-class).  Were
+        # FP_DIV / FP_SQRT (scalar) or the VEC_LOGIC catch-all.
+        if m.startswith(("vdivu", "vdiv", "vremu", "vrem",
+                         "vfdiv", "vfrdiv", "vfrec")):
+            return ent("GEN_OP_VEC_DIV")
+        if m.startswith(("vfsqrt", "vfrsqrt")):
+            return ent("GEN_OP_VEC_SQRT")
         if m.startswith(("vmerge", "vmv", "vslide", "vrgather", "vcompress", "vfirst", "viota", "vid", "vfmerge", "vfmv")):
             return ent("GEN_OP_VEC_MOV")
         if re.match(r"^vs(e|se|seg|sseg|ox|oxseg|ux|uxseg|[1248]r|m_)", m):
-            return ent("GEN_OP_STORE")
+            return ent("GEN_OP_VEC_STORE")
         if m.startswith(("vsha", "vsm3", "vsm4", "vset", "vsext", "vzext", "vsll", "vsra", "vsrl", "vssra", "vssrl", "vcpop", "vms", "vmn", "vmx", "vfmin", "vfmax", "vmseq", "vmsne", "vmslt", "vmsle", "vmsgt", "vmsge", "vmfeq", "vmfne", "vmflt", "vmfle", "vmfgt", "vmfge")):
             return ent("GEN_OP_VEC_LOGIC")
         return ent("GEN_OP_VEC_LOGIC")
@@ -2453,6 +2568,10 @@ def classify_riscv(m: str) -> Entry:
             return ent("GEN_OP_BRANCH", "BRANCH_COND_DIRECT")
         if c.startswith(("lb", "lbu", "lh", "lhu", "lw", "elw")):
             return ent("GEN_OP_LOAD")
+        # shuffle/pack/insert/extract BEFORE the store rule: cv.shuffle*
+        # otherwise hits the "sh" store-halfword prefix.
+        if c.startswith(("pack", "shuffle", "insert", "extract")):
+            return ent("GEN_OP_VEC_SHUF")
         if c.startswith(("sb", "sh", "sw")):
             return ent("GEN_OP_STORE")
         if c.startswith(("mac", "mach", "dot", "sdot")):
@@ -2478,11 +2597,9 @@ def classify_riscv(m: str) -> Entry:
         if c.startswith("srl"):
             return ent("GEN_OP_SHR")
         if c.startswith("sra"):
-            return ent("GEN_OP_SAR")
+            return ent("GEN_OP_SHR")
         if c.startswith("ror"):
             return ent("GEN_OP_ROR")
-        if c.startswith(("pack", "shuffle", "insert", "extract")):
-            return ent("GEN_OP_VEC_SHUF")
         return ent("GEN_OP_VEC_LOGIC")
     if m.startswith("th_"):
         t = m[3:]
@@ -2521,6 +2638,12 @@ def classify_riscv(m: str) -> Entry:
 
 
 def classify_mips(m: str) -> Entry:
+    # MSA per-element bit ops (BCLR/BNEG/BSET/BINSL/BINSR + i/_df
+    # forms) are vector bitwise, NOT branches -- they must beat the
+    # "bne"/"b*" branch-prefix rules below (bneg_b -> "bne...").
+    # BZ/BNZ (MSA branch-if-(non)zero) are deliberately excluded.
+    if m.startswith(("bclr", "bneg", "bset", "binsl", "binsr")):
+        return ent("GEN_OP_VEC_LOGIC")
     if m in {"j", "b", "bc", "b16"}:
         return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_JUMP")
     if m in {"jr", "jrc", "jic", "jr_hb", "jr16", "jrc16", "jrcaddiusp", "jraddiusp"}:
@@ -2573,14 +2696,31 @@ def classify_mips(m: str) -> Entry:
         return ent("GEN_OP_STORE")
     if m.startswith("insert_"):
         return ent("GEN_OP_VEC_SHUF")
-    if m in {"align", "balign", "bitrev", "bitrevw", "byterevw", "cfc1", "cfc2", "cfcmsa", "cftc1", "ctc1", "ctc2", "ctcmsa", "cttc1", "dalign", "di", "ei", "dmfc0", "dmfc2", "dmfgc0", "dmtc0", "dmtc2", "dmtgc0", "mfc0", "mfc2", "mfgc0", "mfhc0", "mfhc1", "mfhc2", "mfhgc0", "mfhi", "mfhi16", "mflo", "mflo16", "mftacx", "mftc0", "mftc1", "mftdsp", "mftgpr", "mfthc1", "mfthi", "mftlo", "mftr", "mtc0", "mtc2", "mtgc0", "mthc0", "mthc1", "mthc2", "mthgc0", "mthi", "mthlip", "mtlo", "mttacx", "mttc0", "mttc1", "mttdsp", "mttgpr", "mtthc1", "mtthi", "mttlo", "mttr", "mtm0", "mtm1", "mtm2", "mtp0", "mtp1", "mtp2", "rdpgpr", "rddsp", "rdhwr", "wrpgpr", "wrdsp"}:
+    # Scalar bit-field / bit-count / byte-reverse manipulation ->
+    # GEN_OP_BITMANIP (own port, multi-cycle; distinct from boolean
+    # AND/OR and from plain MOV).  Matched here so it wins over the
+    # GPR-move set and the AND fall-through below.  Exact / anchored
+    # so MSA insert_/ext_ vector forms (handled elsewhere) are not
+    # swallowed.
+    if m in {"align", "dalign", "balign", "bitrev", "bitrevw",
+             "bitrevh", "byterevw", "wsbh", "dsbh", "dshd",
+             "bitswap", "dbitswap", "clz", "clo", "dclz", "dclo",
+             "pop", "dpop", "cins", "cins32"} \
+            or re.match(r"^d?ext[mu]?$", m) \
+            or re.match(r"^d?ins[mu]?$", m) \
+            or m.startswith(("extp", "extr", "exts", "append",
+                             "prepend")):
+        return ent("GEN_OP_BITMANIP")
+    if m in {"cfc1", "cfc2", "cfcmsa", "cftc1", "ctc1", "ctc2", "ctcmsa", "cttc1", "di", "ei", "dmfc0", "dmfc2", "dmfgc0", "dmtc0", "dmtc2", "dmtgc0", "mfc0", "mfc2", "mfgc0", "mfhc0", "mfhc1", "mfhc2", "mfhgc0", "mfhi", "mfhi16", "mflo", "mflo16", "mftacx", "mftc0", "mftc1", "mftdsp", "mftgpr", "mfthc1", "mfthi", "mftlo", "mftr", "mtc0", "mtc2", "mtgc0", "mthc0", "mthc1", "mthc2", "mthgc0", "mthi", "mthlip", "mtlo", "mttacx", "mttc0", "mttc1", "mttdsp", "mttgpr", "mtthc1", "mtthi", "mttlo", "mttr", "mtm0", "mtm1", "mtm2", "mtp0", "mtp1", "mtp2", "rdpgpr", "rddsp", "rdhwr", "wrpgpr", "wrdsp"}:
         return ent("GEN_OP_MOV")
+    # MSA INSVE (element insert element) is a vector shuffle, not a
+    # scalar move -- intercept before the "ins"-prefix MOV rule.
+    if m.startswith("insve"):
+        return ent("GEN_OP_VEC_SHUF")
     if m.startswith(("move", "dext", "ext", "ins", "dins", "lui")):
         return ent("GEN_OP_MOV")
     if m.startswith(("seb", "seh")):
         return ent("GEN_OP_MOVSX")
-    if m.startswith(("clo", "clz", "dclo", "dclz", "cins", "dpop", "pop", "dbitswap")):
-        return ent("GEN_OP_AND")
     if re.match(r"^(ceil|floor|round|trunc)_(w|l)_(s|d)$", m) or re.match(r"^f(tint|trunc)_(s|u)_(d|w)$", m) or re.match(r"^rint_(s|d|w|l)$", m) or re.match(r"^cvt_(s|d|w|l|ps|pw)_(s|d|w|l|ps|pl|pu|pw)$", m):
         return ent("GEN_OP_FP_CVT")
     fp = re.match(r"^(f?abs|f?add|ceil|c|class|f?div|floor|fmadd|fmsub|f?trunc|maddf|madd|mfc|mov|msubf|msub|f?mul|mulr|f?neg|nmadd|nmsub|recip|round|rsqrt|f?sqrt|f?sub|trunc)_(s|d|w|l|ps|h)$", m)
@@ -2598,9 +2738,9 @@ def classify_mips(m: str) -> Entry:
             return ent("GEN_OP_FP_MSUB")
         if stem in {"mul", "mulr"}:
             return ent("GEN_OP_FP_MUL")
-        if stem == "div":
+        if stem in {"div", "recip"}:
             return ent("GEN_OP_FP_DIV")
-        if stem in {"sqrt", "rsqrt", "recip"}:
+        if stem in {"sqrt", "rsqrt"}:
             return ent("GEN_OP_FP_SQRT")
         if stem in {"c", "class"}:
             return ent("GEN_OP_FP_CMP")
@@ -2625,7 +2765,8 @@ def classify_mips(m: str) -> Entry:
         return ent("GEN_OP_VEC_MSUB")
     if m.startswith(("preceq", "preceu", "precequ")):
         return ent("GEN_OP_VEC_SHUF")
-    if m.startswith(("bmnz", "bmz", "bsel")):
+    if m.startswith(("bmnz", "bmz", "bsel", "seleqz", "selnez",
+                      "sel")):
         return ent("GEN_OP_CMOV")
     if re.search(r"_(b|h|w|d|ph|qb|v)$", m) or m.startswith(("v", "msa", "copy_", "insert_", "splati", "splat_", "ldi_")):
         if m.startswith("dpadd"):
@@ -2648,7 +2789,12 @@ def classify_mips(m: str) -> Entry:
             return ent("GEN_OP_VEC_MSUB")
         if m.startswith(("mul", "dp")):
             return ent("GEN_OP_VEC_MUL")
-        if m.startswith("insert"):
+        # MSA vector divide / modulo / reciprocal-(sqrt).
+        if m.startswith(("div", "mod", "fdiv", "frcp")):
+            return ent("GEN_OP_VEC_DIV")
+        if m.startswith(("fsqrt", "frsqrt")):
+            return ent("GEN_OP_VEC_SQRT")
+        if m.startswith(("insert", "insve")):
             return ent("GEN_OP_VEC_SHUF")
         if m.startswith(("copy", "ldi", "splat", "splati", "move")):
             return ent("GEN_OP_VEC_MOV")
@@ -2667,9 +2813,9 @@ def classify_mips(m: str) -> Entry:
         return ent("GEN_OP_INT_MUL")
     if m.startswith(("div", "ddiv", "rem", "drem", "mod", "dmod")):
         return ent("GEN_OP_INT_DIV")
-    if m.startswith(("and", "andi", "bitswap", "crc32", "wsbh", "dsbh", "dshd")):
+    if m.startswith(("and", "andi", "crc32")):
         return ent("GEN_OP_AND")
-    if m.startswith(("append", "prepend", "or", "ori")):
+    if m.startswith(("or", "ori")):
         return ent("GEN_OP_OR")
     if m.startswith(("xor", "xori")):
         return ent("GEN_OP_XOR")
@@ -2680,7 +2826,7 @@ def classify_mips(m: str) -> Entry:
     if m.startswith(("srl", "dsrl")):
         return ent("GEN_OP_SHR")
     if m.startswith(("sra", "dsra")):
-        return ent("GEN_OP_SAR")
+        return ent("GEN_OP_SHR")
     if m.startswith(("rol", "ror", "rotr", "drol", "dror", "drotr", "rotx")):
         return ent("GEN_OP_ROR")
     if m.startswith(("movf", "movt", "movn", "movz", "seleqz", "selnez")):
@@ -3064,6 +3210,15 @@ def generated_body(info: IsaInfo, constants: list[str], existing: dict[str, Entr
         if new.op == "GEN_OP_UNKNOWN" and old is not None:
             new = old.without_refine()
         refine = old.refine if old and old.refine else None
+        # Classifier-driven .refine: AArch64 has one Capstone insn id
+        # per mnemonic for both the scalar-FP and packed-vector forms
+        # (FDIV Dd vs FDIV Vd.2D).  The static table classifies the
+        # scalar FP_* op; refine_arm64_fp_vec promotes it to the VEC_*
+        # twin at decode when the operands show a vector arrangement.
+        # Only fills an otherwise-empty .refine (manual fixups win).
+        if (refine is None and info.key == "aarch64"
+                and new.op in FP_VEC_PROMOTE_OPS):
+            refine = "refine_arm64_fp_vec"
         dep_refine = classify_dep_refine(info, const_name, new)
         lane_kind, lane_par = classify_lane_info(info, const_name)
         new = Entry(new.op, new.branch, new.flags, refine, dep_refine,

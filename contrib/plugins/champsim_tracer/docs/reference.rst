@@ -31,371 +31,323 @@ records.
 
 .. list-table::
    :header-rows: 1
-   :widths: 6 25 69
+   :widths: 26 74
 
-   * - ID
-     - Name
+   * - Name
      - Notes
-   * - 0
-     - ``GEN_OP_UNKNOWN``
-     - Default for instructions the per-ISA classifier didn't
-       recognize.  A non-zero count in the exit-time summary's
-       "Generic opcode breakdown" suggests the
-       ``insn_classification`` table needs a row.
-   * - 1
-     - ``GEN_OP_INT_ADD``
+   * - ``GEN_OP_UNKNOWN``
+     - Default for instructions the per-ISA classifier didn't recognize.
+       A non-zero count in the exit-time summary's "Generic opcode
+       breakdown" suggests the ``insn_classification`` table needs a row.
+   * - ``GEN_OP_INT_ADD``
      - Integer addition.
-   * - 2
-     - ``GEN_OP_INT_SUB``
+   * - ``GEN_OP_INT_SUB``
      - Integer subtraction.
-   * - 3
-     - ``GEN_OP_INT_MUL``
+   * - ``GEN_OP_INT_MUL``
      - Integer multiplication.
-   * - 4
-     - ``GEN_OP_INT_DIV``
+   * - ``GEN_OP_INT_DIV``
      - Integer division / modulus.
-   * - 5
-     - ``GEN_OP_AND``
+   * - ``GEN_OP_AND``
      - Bitwise AND (integer).
-   * - 6
-     - ``GEN_OP_OR``
+   * - ``GEN_OP_OR``
      - Bitwise OR.
-   * - 7
-     - ``GEN_OP_XOR``
-     - Bitwise XOR.  ``xor reg,reg`` is an idiomatic zero-clear and
-       still classifies as XOR; the destination value is whatever
-       semantic the consumer chooses.
-   * - 8
-     - ``GEN_OP_NOT``
+   * - ``GEN_OP_XOR``
+     - Bitwise XOR. ``xor reg,reg`` is an idiomatic zero-clear and still
+       classifies as XOR; the destination value is whatever semantic the
+       consumer chooses.
+   * - ``GEN_OP_NOT``
      - Bitwise complement.
-   * - 9
-     - ``GEN_OP_SHL``
+   * - ``GEN_OP_SHL``
      - Logical shift left.
-   * - 10
-     - ``GEN_OP_SHR``
-     - Logical shift right.
-   * - 11
-     - ``GEN_OP_SAR``
-     - Arithmetic shift right.
-   * - 12
-     - ``GEN_OP_ROL``
+   * - ``GEN_OP_SHR``
+     - Logical shift right. Arithmetic shift right (SAR) folds here — the
+       sign behaviour is a value distinction, not a latency / dataflow
+       one the consumer models.
+   * - ``GEN_OP_ROL``
      - Rotate left.
-   * - 13
-     - ``GEN_OP_ROR``
+   * - ``GEN_OP_ROR``
      - Rotate right.
-   * - 14
-     - ``GEN_OP_MOV``
-     - Data movement.  The classifier maps a mnemonic to ``MOV``
-       *as a whole* — operand inspection does not split memory-form
-       and register-form variants.  On x86 this means ``mov`` is
-       always ``GEN_OP_MOV`` whether the operands are reg-reg,
-       reg-mem, mem-reg, or mem-imm; the resulting trace records
-       memory addresses for the mem-form executions via
-       ``CST_FID_LOAD_ADDR*`` / ``CST_FID_STORE_ADDR*`` and the
-       opcode stays ``MOV``.  On AArch64 / RISC-V / MIPS where load
-       and store have distinct mnemonics, ``MOV`` covers only the
-       register-transfer family.
-   * - 15
-     - ``GEN_OP_LOAD``
-     - Memory read.  Fall-through classification: used when nothing
-       *else* happens beyond fetching data.  Heavy on AArch64
-       (``ldr``/``ld1`` families), RISC-V (``lw``, ``ld``, ``fld``),
-       and MIPS.  On x86, common ``mov`` from memory is
-       ``GEN_OP_MOV`` instead; ``LOAD`` is reserved for specialized
-       forms — FPU control-word loads (``fldcw``, ``fldenv``),
-       state-restore (``xrstor``, ``fxrstor``), gather
-       (``vgather*``, ``vpgather*``), MPX (``bndldx``), and segment /
-       system loads (``lds``, ``lgdt``, ``ltr``).  Pairs with
+   * - ``GEN_OP_BITMANIP``
+     - Scalar bit-field / bit-count manipulation: BMI/BMI2 (``bextr``,
+       ``blsi`` / ``blsmsk`` / ``blsr``, ``bzhi``, ``pdep``, ``pext``),
+       ``popcnt``, ``lzcnt`` / ``tzcnt``, ``bsf`` / ``bsr``. Distinct
+       from the boolean ``GEN_OP_AND`` / ``OR`` / ... class: these
+       rearrange / extract / count bits and on real cores occupy a
+       separate port with multi-cycle latency.
+   * - ``GEN_OP_MOV``
+     - Data movement. The classifier maps a mnemonic to ``MOV`` *as a
+       whole* — operand inspection does not split memory-form and
+       register-form variants. On x86 this means ``mov`` is always
+       ``GEN_OP_MOV`` whether the operands are reg-reg, reg-mem, mem-reg,
+       or mem-imm; the resulting trace records memory addresses for the
+       mem-form executions via ``CST_FID_LOAD_ADDR*`` /
+       ``CST_FID_STORE_ADDR*`` and the opcode stays ``MOV``. On AArch64 /
+       RISC-V / MIPS where load and store have distinct mnemonics,
+       ``MOV`` covers only the register-transfer family.
+   * - ``GEN_OP_LOAD``
+     - Memory read. Fall-through classification: used when nothing *else*
+       happens beyond fetching data. Heavy on AArch64 (``ldr``/``ld1``
+       families), RISC-V (``lw``, ``ld``, ``fld``), and MIPS. On x86,
+       common ``mov`` from memory is ``GEN_OP_MOV`` instead; ``LOAD`` is
+       reserved for specialized forms — FPU control-word loads
+       (``fldcw``, ``fldenv``), state-restore (``xrstor``, ``fxrstor``),
+       gather (``vgather*``, ``vpgather*``), MPX (``bndldx``), and
+       segment / system loads (``lds``, ``lgdt``, ``ltr``). Pairs with
        ``CST_FID_LOAD_ADDR*`` / ``CST_FID_LOAD_DATA*``.
 
-       Exclusive-monitor primitives — MIPS ``ll`` / ``lld`` /
-       ``lle`` / ``llwp``, RISC-V ``lr.{w,d}.*``, AArch64 ``ldxr``
-       / ``ldaxr`` / ``ldxp`` / ``ldaxp`` and their byte / halfword
-       variants — are individually just tagged loads, so they
-       classify as ``LOAD`` *with* ``MF_ATOMIC``.  Load-acquire
-       (AArch64 ``ldar`` / ``ldapr`` / ``ldlar``, RISC-V ``.aq``
-       hints) are memory-ordered single loads and stay plain
-       ``LOAD`` without ``MF_ATOMIC``.
-   * - 16
-     - ``GEN_OP_STORE``
-     - Memory write.  Fall-through classification; mirror of
-       ``LOAD``.  Dominant on AArch64 (``str``/``st1``), RISC-V
-       (``sw``, ``sd``, ``fsd``), and MIPS, marginal on x86 where
-       ``mov`` to memory is ``GEN_OP_MOV``.  x86 ``STORE`` covers
-       FPU state-save (``fxsave``, ``xsave*``, ``fnstcw``,
-       ``fnstenv``), scatter (``vscatter*``, ``maskmov*``), MPX
-       (``bndstx``), system register stores (``sgdt``,
-       ``stmxcsr``), and shadow-stack ops (``clrssbsy``,
-       ``clzero``).  Pairs with ``CST_FID_STORE_ADDR*`` /
-       ``CST_FID_STORE_DATA*``.
+       Exclusive-monitor primitives — MIPS ``ll`` / ``lld`` / ``lle`` /
+       ``llwp``, RISC-V ``lr.{w,d}.*``, AArch64 ``ldxr`` / ``ldaxr`` /
+       ``ldxp`` / ``ldaxp`` and their byte / halfword variants — are
+       individually just tagged loads, so they classify as ``LOAD``
+       *with* ``MF_ATOMIC``. Load-acquire (AArch64 ``ldar`` / ``ldapr`` /
+       ``ldlar``, RISC-V ``.aq`` hints) are memory-ordered single loads
+       and stay plain ``LOAD`` without ``MF_ATOMIC``.
 
-       Exclusive-monitor primitives — MIPS ``sc`` / ``scd`` /
-       ``sce`` / ``scwp``, RISC-V ``sc.{w,d}.*``, AArch64 ``stxr``
-       / ``stlxr`` / ``stxp`` / ``stlxp`` and their byte /
-       halfword variants — are individually just tagged stores, so
-       they classify as ``STORE`` *with* ``MF_ATOMIC``.  Store-
-       release (AArch64 ``stlr`` / ``stllr``, RISC-V ``.rl``
-       hints) are memory-ordered single stores and stay plain
-       ``STORE`` without ``MF_ATOMIC``.
+       x86 gather (``vgather*`` / ``vpgather*``) now classifies as
+       ``GEN_OP_VEC_LOAD`` (SIMD-indexed load), not plain ``LOAD``.
+   * - ``GEN_OP_STORE``
+     - Memory write. Fall-through classification; mirror of ``LOAD``.
+       Dominant on AArch64 (``str``/``st1``), RISC-V (``sw``, ``sd``,
+       ``fsd``), and MIPS, marginal on x86 where ``mov`` to memory is
+       ``GEN_OP_MOV``. x86 ``STORE`` covers FPU state-save (``fxsave``,
+       ``xsave*``, ``fnstcw``, ``fnstenv``), scatter (``vscatter*``,
+       ``maskmov*``), MPX (``bndstx``), system register stores (``sgdt``,
+       ``stmxcsr``), and shadow-stack ops (``clrssbsy``, ``clzero``).
+       Pairs with ``CST_FID_STORE_ADDR*`` / ``CST_FID_STORE_DATA*``.
 
-       x86 string ops with implicit pointer arithmetic
-       (``lodsb/w/d/q``, ``stosb/w/d/q``, ``insb/w/d``,
-       ``outsb/w/d``) are *not* classified as ``LOAD`` / ``STORE``
-       — the implicit ``RSI`` / ``RDI ± op_size`` advance is more
-       specific than the data motion, so those instructions
-       classify as ``GEN_OP_INT_ADD``.  AArch64 ``ldr`` / ``str``
-       / ``ldp`` / ``stp`` with writeback addressing modes
-       (``[Xn]!`` / ``[Xn], #imm``) take the same path: the
-       runtime refiner detects the implicit base-register write
-       and reclassifies to ``INT_ADD``.
-   * - 17
-     - ``GEN_OP_PUSH``
-     - Stack push (memory write + SP update).  Almost exclusively
-       x86 (``push``, ``pusha*``, ``pushf*``, ``enter``); a few
-       AArch64 / RISC-V mnemonics for shadow-stack and zcmp
-       compressed-instruction families.
-   * - 18
-     - ``GEN_OP_POP``
-     - Stack pop.  Same distribution as ``GEN_OP_PUSH``.
-   * - 19
-     - ``GEN_OP_LEA``
+       Exclusive-monitor primitives — MIPS ``sc`` / ``scd`` / ``sce`` /
+       ``scwp``, RISC-V ``sc.{w,d}.*``, AArch64 ``stxr`` / ``stlxr`` /
+       ``stxp`` / ``stlxp`` and their byte / halfword variants — are
+       individually just tagged stores, so they classify as ``STORE``
+       *with* ``MF_ATOMIC``. Store- release (AArch64 ``stlr`` /
+       ``stllr``, RISC-V ``.rl`` hints) are memory-ordered single stores
+       and stay plain ``STORE`` without ``MF_ATOMIC``.
+
+       x86 string ops with implicit pointer arithmetic (``lodsb/w/d/q``,
+       ``stosb/w/d/q``, ``insb/w/d``, ``outsb/w/d``) are *not* classified
+       as ``LOAD`` / ``STORE`` — the implicit ``RSI`` / ``RDI ± op_size``
+       advance is more specific than the data motion, so those
+       instructions classify as ``GEN_OP_INT_ADD``. AArch64 ``ldr`` /
+       ``str`` / ``ldp`` / ``stp`` with writeback addressing modes
+       (``[Xn]!`` / ``[Xn], #imm``) take the same path: the runtime
+       refiner detects the implicit base-register write and reclassifies
+       to ``INT_ADD``.
+
+       x86 scatter (``vscatter*`` / ``vpscatter*``) now classifies as
+       ``GEN_OP_VEC_STORE``; ``maskmov*`` stays ``STORE``.
+   * - ``GEN_OP_PUSH``
+     - Stack push (memory write + SP update). Almost exclusively x86
+       (``push``, ``pusha*``, ``pushf*``, ``enter``); a few AArch64 /
+       RISC-V mnemonics for shadow-stack and zcmp compressed-instruction
+       families.
+   * - ``GEN_OP_POP``
+     - Stack pop. Same distribution as ``GEN_OP_PUSH``.
+   * - ``GEN_OP_LEA``
      - Effective-address compute, no memory access despite the
-       memory-style operand.  x86 ``lea``, AArch64 ``adr`` /
-       ``adrp``, RISC-V ``auipc``, MIPS ``aluipc`` and similar
+       memory-style operand. x86 ``lea``, AArch64 ``adr`` / ``adrp``,
+       RISC-V ``auipc``, MIPS ``aluipc`` and similar
        PC-relative-offset-into-register operations.
-   * - 20
-     - ``GEN_OP_MOVSX``
+   * - ``GEN_OP_MOVSX``
      - Sign-extending move.
-   * - 21
-     - ``GEN_OP_MOVZX``
+   * - ``GEN_OP_MOVZX``
      - Zero-extending move.
-   * - 22
-     - ``GEN_OP_XCHG``
-     - Exchange.  Reserved for instructions whose semantic IS a
-       swap (register ↔ memory).  Every classifier row that maps to
-       ``XCHG`` also sets ``MF_ATOMIC`` so the resulting insn
-       carries ``the ``CST_INSN_FLAG_ATOMIC`` bit``.  Examples: x86 ``xchg``
-       / ``cmpxchg`` / ``cmpxchg8b`` / ``cmpxchg16b``; AArch64
-       ``cas{p}`` / ``swp`` / ``ldsmax`` / ``ldsmin`` / ``ldumax``
-       / ``ldumin``; RISC-V ``amoswap`` / ``amocas`` /
-       ``amomax{u}`` / ``amomin{u}``; MIPS ``saa`` / ``saad``.
+   * - ``GEN_OP_XCHG``
+     - Exchange. Reserved for instructions whose semantic IS a swap
+       (register ↔ memory). Every classifier row that maps to ``XCHG``
+       also sets ``MF_ATOMIC`` so the resulting insn carries ``the
+       ``CST_INSN_FLAG_ATOMIC`` bit``. Examples: x86 ``xchg`` /
+       ``cmpxchg`` / ``cmpxchg8b`` / ``cmpxchg16b``; AArch64 ``cas{p}`` /
+       ``swp`` / ``ldsmax`` / ``ldsmin`` / ``ldumax`` / ``ldumin``;
+       RISC-V ``amoswap`` / ``amocas`` / ``amomax{u}`` / ``amomin{u}``;
+       MIPS ``saa`` / ``saad``.
 
-       Atomic RMW with a *specific* arithmetic op on the loaded
-       data (AArch64 ``ldadd`` / ``ldclr`` / ``ldeor`` / ``ldset``,
-       RISC-V ``amoadd`` / ``amoand`` / ``amoor`` / ``amoxor``,
-       x86 ``xadd``) classifies as the arithmetic op with
-       ``MF_ATOMIC``, *not* as ``XCHG`` — the swap is incidental to
-       the modify.
-   * - 23
-     - ``GEN_OP_CMP``
-     - Compare (subtract-and-discard, sets flags).  Examples: x86
-       ``cmp`` and MPX bound-check (``bndcl`` / ``bndcu``);
-       AArch64 ``ccmp`` / ``ccmn``; RISC-V CV-extension
-       ``cv_cmp*``.
-   * - 24
-     - ``GEN_OP_TEST``
-     - Bitwise test (and-and-discard, sets flags).  x86 ``test``
-       and bit-test family ``bt`` / ``btc`` / ``btr`` / ``bts``;
-       AArch64 ``tst*``; uncommon on RISC-V / MIPS where the
-       compare op is fused into the branch.
-   * - 25
-     - ``GEN_OP_BRANCH``
-     - Control flow.  Direction (taken / not-taken / fall-through)
-       lives at runtime; the static branch flavour lives in
-       ``branch_type``.  Direct jumps, indirect jumps, conditional
-       jumps, and direct/indirect ``call`` all collapse into this
-       opcode — the ``call`` vs ``jmp`` split is in ``branch_type``
-       (direct ``call`` looks like ``BRANCH_DIRECT_JUMP``; indirect
-       ``call`` is refined to ``BRANCH_INDIRECT_JUMP`` based on
-       operand kind).
-   * - 26
-     - *(reserved)*
-     - Skipped intentionally.  An older revision used 26 for
-       call-shaped control flow before everything collapsed into
-       ``GEN_OP_BRANCH``; left unused so ID stability across
-       revisions is exact.
-   * - 27
-     - ``GEN_OP_RET``
-     - Return from call.  Always paired with
-       ``branch_type = BRANCH_RETURN``.  x86 ``ret`` / ``retf*`` /
-       ``iret*`` get this; AArch64 ``ret`` gets this; RISC-V
-       ``cm.popret*`` / ``dret`` and MIPS exception-return
-       ``eret`` / ``deret`` get this.  *Plain* RISC-V ``ret`` (the
-       ``jalr x0, ra, 0`` pseudo) and MIPS ``jr $ra`` are
-       classified by their canonical Capstone insn-id as
-       ``GEN_OP_BRANCH`` with ``branch_type =
-       BRANCH_INDIRECT_JUMP`` because the classifier does not
-       inspect the ``ra`` register operand to recognize them as
-       returns.  This is a deliberate trade-off: keeps the
-       classification table operand-agnostic at the cost of
-       conflating RISC-V/MIPS returns with general indirect jumps
+       Atomic RMW with a *specific* arithmetic op on the loaded data
+       (AArch64 ``ldadd`` / ``ldclr`` / ``ldeor`` / ``ldset``, RISC-V
+       ``amoadd`` / ``amoand`` / ``amoor`` / ``amoxor``, x86 ``xadd``)
+       classifies as the arithmetic op with ``MF_ATOMIC``, *not* as
+       ``XCHG`` — the swap is incidental to the modify.
+   * - ``GEN_OP_CMP``
+     - Compare (subtract-and-discard, sets flags). Examples: x86 ``cmp``
+       and MPX bound-check (``bndcl`` / ``bndcu``); AArch64 ``ccmp`` /
+       ``ccmn``; RISC-V CV-extension ``cv_cmp*``.
+   * - ``GEN_OP_TEST``
+     - Bitwise test (and-and-discard, sets flags). x86 ``test`` and
+       bit-test family ``bt`` / ``btc`` / ``btr`` / ``bts``; AArch64
+       ``tst*``; uncommon on RISC-V / MIPS where the compare op is fused
+       into the branch.
+   * - ``GEN_OP_BRANCH``
+     - Control flow. Direction (taken / not-taken / fall-through) lives
+       at runtime; the static branch flavour lives in ``branch_type``.
+       Direct jumps, indirect jumps, conditional jumps, and
+       direct/indirect ``call`` all collapse into this opcode — the
+       ``call`` vs ``jmp`` split is in ``branch_type`` (direct ``call``
+       looks like ``BRANCH_DIRECT_JUMP``; indirect ``call`` is refined to
+       ``BRANCH_INDIRECT_JUMP`` based on operand kind).
+   * - ``GEN_OP_RET``
+     - Return from call. Always paired with ``branch_type =
+       BRANCH_RETURN``. x86 ``ret`` / ``retf*`` / ``iret*`` get this;
+       AArch64 ``ret`` gets this; RISC-V ``cm.popret*`` / ``dret`` and
+       MIPS exception-return ``eret`` / ``deret`` get this. *Plain*
+       RISC-V ``ret`` (the ``jalr x0, ra, 0`` pseudo) and MIPS ``jr $ra``
+       are classified by their canonical Capstone insn-id as
+       ``GEN_OP_BRANCH`` with ``branch_type = BRANCH_INDIRECT_JUMP``
+       because the classifier does not inspect the ``ra`` register
+       operand to recognize them as returns. This is a deliberate
+       trade-off: keeps the classification table operand-agnostic at the
+       cost of conflating RISC-V/MIPS returns with general indirect jumps
        in the trace.
-   * - 28
-     - ``GEN_OP_FP_ADD``
+   * - ``GEN_OP_FP_ADD``
      - Floating-point add.
-   * - 29
-     - ``GEN_OP_FP_SUB``
+   * - ``GEN_OP_FP_SUB``
      - Floating-point sub.
-   * - 30
-     - ``GEN_OP_FP_MUL``
+   * - ``GEN_OP_FP_MUL``
      - Floating-point mul.
-   * - 31
-     - ``GEN_OP_FP_DIV``
+   * - ``GEN_OP_FP_DIV``
      - Floating-point divide.
-   * - 32
-     - ``GEN_OP_FP_SQRT``
+   * - ``GEN_OP_FP_SQRT``
      - Floating-point square root.
-   * - 33
-     - ``GEN_OP_FP_MOV``
+   * - ``GEN_OP_FP_MOV``
      - Floating-point move.
-   * - 34
-     - ``GEN_OP_FP_CVT``
-     - Floating-point conversion (between FP formats or to/from
-       integer).
-   * - 35
-     - ``GEN_OP_FP_CMP``
+   * - ``GEN_OP_FP_CVT``
+     - Floating-point conversion (between FP formats or to/from integer).
+   * - ``GEN_OP_FP_CMP``
      - Floating-point compare.
-   * - 36
-     - ``GEN_OP_VEC_ADD``
+   * - ``GEN_OP_VEC_ADD``
      - SIMD / vector add.
-   * - 37
-     - ``GEN_OP_VEC_SUB``
+   * - ``GEN_OP_VEC_SUB``
      - SIMD / vector sub.
-   * - 38
-     - ``GEN_OP_VEC_MUL``
+   * - ``GEN_OP_VEC_MUL``
      - SIMD / vector multiply.
-   * - 39
-     - ``GEN_OP_VEC_MOV``
+   * - ``GEN_OP_VEC_DIV``
+     - Packed FP / integer divide and reciprocal approximation
+       (``rcpps``, ``vrcp14p*``, ``vrcp28*``).
+   * - ``GEN_OP_VEC_SQRT``
+     - Packed square root and reciprocal-sqrt approximation (``sqrtps``,
+       ``rsqrtps``, ``vrsqrt14p*``).
+   * - ``GEN_OP_VEC_MOV``
      - SIMD / vector move, incl. vector loads/stores (``vmovdqa`` /
-       ``vmovups``, AArch64 NEON/SVE ``ld1``/``ld2``/``ld3``/``ld4``
-       and ``st1``..``st4`` structure loads/stores).
-   * - 40
-     - ``GEN_OP_VEC_SHUF``
+       ``vmovups``, AArch64 NEON/SVE ``ld1``/``ld2``/``ld3``/``ld4`` and
+       ``st1``..``st4`` structure loads/stores).
+
+       A pure SIMD-width load/store with no compute may instead be
+       ``GEN_OP_VEC_LOAD`` / ``GEN_OP_VEC_STORE`` (currently x86
+       gather/scatter; the AArch64/RISC-V/MIPS vector-memory families
+       still map here).
+   * - ``GEN_OP_VEC_LOAD``
+     - SIMD-width or SIMD-indexed (gather) load with no substantial
+       compute — worth distinguishing from scalar ``GEN_OP_LOAD``. Per
+       the load/store-yield rule, an instruction doing real compute is
+       classified by that compute instead. x86 ``vgather*`` /
+       ``vpgather*``.
+   * - ``GEN_OP_VEC_STORE``
+     - SIMD-width or SIMD-indexed (scatter) store; vector-store
+       counterpart of ``GEN_OP_VEC_LOAD``. x86 ``vscatter*`` /
+       ``vpscatter*``.
+   * - ``GEN_OP_VEC_SHUF``
      - SIMD permute / shuffle / blend, incl. element insert/extract
        (``pinsr*`` / ``pextr*`` / ``insertps`` / ``extractps``).
-   * - 41
-     - ``GEN_OP_VEC_LOGIC``
+   * - ``GEN_OP_VEC_LOGIC``
      - Bitwise operations on vector registers.
-   * - 42
-     - ``GEN_OP_NOP``
+   * - ``GEN_OP_NOP``
      - No-op (architectural or padding).
-   * - 43
-     - ``GEN_OP_SYSCALL``
-     - System call.  Pairs with
-       ``branch_type = BRANCH_SYSCALL_TYPE``.  In WP simulation, a
-       syscall ends the speculative chain.
-   * - 44
-     - ``GEN_OP_FENCE``
-     - Memory / instruction barrier.  Every classifier row that
-       maps to ``FENCE`` has ``MF_ATOMIC``, so the resulting
-       insn always carries ``the ``CST_INSN_FLAG_ATOMIC`` bit``.
-       Examples: x86 ``mfence`` / ``lfence`` / ``sfence``,
-       cache-wide ops without an address (``invd``, ``wbinvd``,
-       ``serialize``); AArch64 ``dmb`` / ``dsb`` / ``isb`` /
-       ``clrex``; RISC-V ``fence`` / ``fence.i``.  Cache- and
-       TLB-management opcodes that *carry an address operand* now
-       map to ``GEN_OP_CACHE_FLUSH`` / ``GEN_OP_TLB_FLUSH`` /
+   * - ``GEN_OP_SYSCALL``
+     - System call. Pairs with ``branch_type = BRANCH_SYSCALL_TYPE``. In
+       WP simulation, a syscall ends the speculative chain.
+   * - ``GEN_OP_FENCE``
+     - Memory / instruction barrier. Every classifier row that maps to
+       ``FENCE`` has ``MF_ATOMIC``, so the resulting insn always carries
+       ``the ``CST_INSN_FLAG_ATOMIC`` bit``. Examples: x86 ``mfence`` /
+       ``lfence`` / ``sfence``, cache-wide ops without an address
+       (``invd``, ``wbinvd``, ``serialize``); AArch64 ``dmb`` / ``dsb`` /
+       ``isb`` / ``clrex``; RISC-V ``fence`` / ``fence.i``. Cache- and
+       TLB-management opcodes that *carry an address operand* now map to
+       ``GEN_OP_CACHE_FLUSH`` / ``GEN_OP_TLB_FLUSH`` /
        ``GEN_OP_PREFETCH`` instead — see those rows below.
-   * - 45
-     - ``GEN_OP_CMOV``
+   * - ``GEN_OP_CMOV``
      - Conditional move.
-   * - 46
-     - ``GEN_OP_SETCC``
+   * - ``GEN_OP_SETCC``
      - Set-on-condition (writes 0 or 1 to a destination register).
-   * - 47
-     - ``GEN_OP_INT_ADC``
-     - Integer add-with-carry.
-   * - 48
-     - ``GEN_OP_INT_SBB``
-     - Integer subtract-with-borrow.
-   * - 49
-     - ``GEN_OP_NEG``
+   * - ``GEN_OP_NEG``
      - Two's-complement negate.
-   * - 50
-     - ``GEN_OP_INC``
+   * - ``GEN_OP_INC``
      - Integer increment-by-one (idiomatic ``inc reg``).
-   * - 51
-     - ``GEN_OP_DEC``
+   * - ``GEN_OP_DEC``
      - Integer decrement-by-one.
-   * - 52
-     - ``GEN_OP_INT_MADD``
+   * - ``GEN_OP_INT_MADD``
      - Integer multiply-and-add.
-   * - 53
-     - ``GEN_OP_INT_MSUB``
+   * - ``GEN_OP_INT_MSUB``
      - Integer multiply-and-sub.
-   * - 54
-     - ``GEN_OP_FP_MADD``
+   * - ``GEN_OP_FP_MADD``
      - Floating-point fused multiply-add.
-   * - 55
-     - ``GEN_OP_FP_MSUB``
+   * - ``GEN_OP_FP_MSUB``
      - Floating-point fused multiply-sub.
-   * - 56
-     - ``GEN_OP_VEC_MADD``
+   * - ``GEN_OP_VEC_MADD``
      - Vector fused multiply-add.
-   * - 57
-     - ``GEN_OP_VEC_MSUB``
+   * - ``GEN_OP_VEC_MSUB``
      - Vector fused multiply-sub.
-   * - 58
-     - ``GEN_OP_PREFETCH``
-     - Software prefetch hint.  QEMU's TCG translates these to
-       no-ops, so no real memop is emitted; the tracer synthesises
-       a load memop carrying the computed effective address by
-       reading base / index registers at exec time and applying
-       ``ea = base + (index << shift_amount) * scale + disp`` from
-       the Capstone operand metadata.  Examples: x86 ``prefetch*``,
-       AArch64 ``prfm`` / ``prfum`` / ``pli``, RISC-V
-       ``prefetch.{i,r,w}``, MIPS ``pref`` / ``prefe`` / ``prefx``.
-   * - 59
-     - ``GEN_OP_CACHE_FLUSH``
-     - Cache-line clean / flush / invalidate addressed at a
-       specific line.  Same synthetic-EA capture as
-       ``GEN_OP_PREFETCH``.  Always carries
-       ``the ``CST_INSN_FLAG_ATOMIC`` bit``.  Examples: x86 ``clflush*`` /
-       ``clwb`` / ``cldemote``, AArch64 ``dc.*`` / ``ic.*``,
-       RISC-V ``cbo.{clean,flush,inval}``, MIPS ``cache`` /
-       ``cachee``.  Cache-wide forms with no address (``invd``,
+   * - ``GEN_OP_PREFETCH``
+     - Software prefetch hint. QEMU's TCG translates these to no-ops, so
+       no real memop is emitted; the tracer synthesises a load memop
+       carrying the computed effective address by reading base / index
+       registers at exec time and applying ``ea = base + (index <<
+       shift_amount) * scale + disp`` from the Capstone operand metadata.
+       Examples: x86 ``prefetch*``, AArch64 ``prfm`` / ``prfum`` /
+       ``pli``, RISC-V ``prefetch.{i,r,w}``, MIPS ``pref`` / ``prefe`` /
+       ``prefx``.
+   * - ``GEN_OP_CACHE_FLUSH``
+     - Cache-line clean / flush / invalidate addressed at a specific
+       line. Same synthetic-EA capture as ``GEN_OP_PREFETCH``. Always
+       carries ``the ``CST_INSN_FLAG_ATOMIC`` bit``. Examples: x86
+       ``clflush*`` / ``clwb`` / ``cldemote``, AArch64 ``dc.*`` /
+       ``ic.*``, RISC-V ``cbo.{clean,flush,inval}``, MIPS ``cache`` /
+       ``cachee``. Cache-wide forms with no address (``invd``,
        ``wbinvd``) stay under ``GEN_OP_FENCE``.
-   * - 60
-     - ``GEN_OP_TLB_FLUSH``
-     - TLB-entry invalidation addressed at a specific page.  Same
-       synthetic-EA capture.  Always carries
-       ``the ``CST_INSN_FLAG_ATOMIC`` bit``.  Examples: x86 ``invlpg`` /
+   * - ``GEN_OP_TLB_FLUSH``
+     - TLB-entry invalidation addressed at a specific page. Same
+       synthetic-EA capture. Always carries ``the
+       ``CST_INSN_FLAG_ATOMIC`` bit``. Examples: x86 ``invlpg`` /
        ``invlpga``, AArch64 ``tlbi``, RISC-V ``sfence.vma`` /
-       ``hfence.{g,v}vma`` / ``hinval.{g,v}vma`` /
-       ``sinval.vma``, MIPS ``tlbp`` / ``tlbr`` / ``tlbwi`` /
-       ``tlbwr`` / ``ginv*`` / ``tlbg*`` / ``tlbinv*``.
-   * - 61
-     - ``GEN_OP_INT_ALU_SHORT``
-     - *Reserved fallback.*  Coarse "single-cycle integer ALU op"
-       bucket for external trace writers that lack ISA-specific
-       opcode metadata.  Never emitted by the in-tree tracer.
-       Consumers should accept it so foreign traces decode.
-   * - 62
-     - ``GEN_OP_INT_ALU_LONG``
-     - *Reserved fallback.*  Coarse "long-latency integer op"
-       bucket (multi-cycle multiplier, divider, etc.).  Never
+       ``hfence.{g,v}vma`` / ``hinval.{g,v}vma`` / ``sinval.vma``, MIPS
+       ``tlbp`` / ``tlbr`` / ``tlbwi`` / ``tlbwr`` / ``ginv*`` /
+       ``tlbg*`` / ``tlbinv*``.
+   * - ``GEN_OP_VEC_PREFETCH``
+     - SIMD / gather-prefetch hint — one or more SIMD-indexed cache-line
+       warms (x86 ``vgatherpf*`` / ``vscatterpf*``). Same synthetic-EA
+       capture as ``GEN_OP_PREFETCH``; the address(es) ride the
+       load-memop slot.
+   * - ``GEN_OP_INT_ALU_SHORT``
+     - *Reserved fallback.* Coarse "single-cycle integer ALU op" bucket
+       for external trace writers that lack ISA-specific opcode metadata.
+       Never emitted by the in-tree tracer. Consumers should accept it so
+       foreign traces decode.
+   * - ``GEN_OP_INT_ALU_LONG``
+     - *Reserved fallback.* Coarse "long-latency integer op" bucket
+       (multi-cycle multiplier, divider, etc.). Never emitted by the
+       in-tree tracer.
+   * - ``GEN_OP_FP_ALU_SHORT``
+     - *Reserved fallback.* Single-cycle floating-point op bucket. Never
        emitted by the in-tree tracer.
-   * - 63
-     - ``GEN_OP_FP_ALU_SHORT``
-     - *Reserved fallback.*  Single-cycle floating-point op
-       bucket.  Never emitted by the in-tree tracer.
-   * - 64
-     - ``GEN_OP_FP_ALU_LONG``
-     - *Reserved fallback.*  Long-latency floating-point op
-       bucket (FDIV, FSQRT, transcendentals, etc.).  Never
+   * - ``GEN_OP_FP_ALU_LONG``
+     - *Reserved fallback.* Long-latency floating-point op bucket (FDIV,
+       FSQRT, transcendentals, etc.). Never emitted by the in-tree
+       tracer.
+   * - ``GEN_OP_VEC_ALU_SHORT``
+     - *Reserved fallback.* Single-cycle vector / SIMD op bucket. Never
        emitted by the in-tree tracer.
-   * - 65
-     - ``GEN_OP_VEC_ALU_SHORT``
-     - *Reserved fallback.*  Single-cycle vector / SIMD op
-       bucket.  Never emitted by the in-tree tracer.
-   * - 66
-     - ``GEN_OP_VEC_ALU_LONG``
-     - *Reserved fallback.*  Long-latency vector / SIMD op
-       bucket.  Never emitted by the in-tree tracer.
+   * - ``GEN_OP_VEC_ALU_LONG``
+     - *Reserved fallback.* Long-latency vector / SIMD op bucket. Never
+       emitted by the in-tree tracer.
 
-IDs 67..255 are unallocated.  ``GEN_OP_COUNT`` is the
-sentinel; per-CP and per-WP attribution arrays in ``Stats`` are sized
-by it so adding a new opcode automatically extends the histograms.
+       IDs 67..255 are unallocated. ``GEN_OP_COUNT`` is the sentinel;
+       per-CP and per-WP attribution arrays in ``Stats`` are sized by it
+       so adding a new opcode automatically extends the histograms.
+
+Numeric IDs are the current in-tree enum assignment, **not** a wire
+contract: every trace embeds an opcode encoding map (Step 3 of
+:doc:`format`) and consumers resolve names through it.  ``GEN_OP_COUNT``
+is the enum sentinel; the per-CP / per-WP attribution arrays in
+``Stats`` are sized by it so adding an opcode extends the
+histograms automatically.
 
 .. _branch-types:
 

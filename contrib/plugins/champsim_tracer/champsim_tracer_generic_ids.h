@@ -66,10 +66,17 @@ enum GenericOpcode {
     GEN_OP_XOR = 7,
     GEN_OP_NOT = 8,
     GEN_OP_SHL = 9,
-    GEN_OP_SHR = 10,
-    GEN_OP_SAR = 11,
-    GEN_OP_ROL = 12,
-    GEN_OP_ROR = 13,
+    GEN_OP_SHR = 10,   /* SAR folds here: arith vs logical shift is a
+                        * value distinction, not latency/dataflow. */
+    GEN_OP_ROL = 11,
+    GEN_OP_ROR = 12,
+    /* Scalar bit-field / bit-count manipulation: BMI/BMI2 (BEXTR,
+     * BLSI/BLSMSK/BLSR, BZHI, PDEP, PEXT), POPCNT, LZCNT/TZCNT,
+     * BSF/BSR.  Distinct from the boolean GEN_OP_AND/OR/... class:
+     * these rearrange/extract/count bits rather than apply a
+     * bitwise boolean, and on real cores sit on a different port
+     * with multi-cycle latency. */
+    GEN_OP_BITMANIP = 13,
     GEN_OP_MOV = 14,
     GEN_OP_LOAD = 15,
     GEN_OP_STORE = 16,
@@ -81,39 +88,49 @@ enum GenericOpcode {
     GEN_OP_XCHG = 22,
     GEN_OP_CMP = 23,
     GEN_OP_TEST = 24,
-    GEN_OP_BRANCH = 25,
-    /* 26 reserved: call-shaped control flow is GEN_OP_BRANCH. */
-    GEN_OP_RET = 27,
-    GEN_OP_FP_ADD = 28,
-    GEN_OP_FP_SUB = 29,
-    GEN_OP_FP_MUL = 30,
-    GEN_OP_FP_DIV = 31,
-    GEN_OP_FP_SQRT = 32,
-    GEN_OP_FP_MOV = 33,
-    GEN_OP_FP_CVT = 34,
-    GEN_OP_FP_CMP = 35,
-    GEN_OP_VEC_ADD = 36,
-    GEN_OP_VEC_SUB = 37,
-    GEN_OP_VEC_MUL = 38,
-    GEN_OP_VEC_MOV = 39,
-    GEN_OP_VEC_SHUF = 40,
-    GEN_OP_VEC_LOGIC = 41,
-    GEN_OP_NOP = 42,
-    GEN_OP_SYSCALL = 43,
-    GEN_OP_FENCE = 44,
-    GEN_OP_CMOV = 45,
-    GEN_OP_SETCC = 46,
-    GEN_OP_INT_ADC = 47,
-    GEN_OP_INT_SBB = 48,
-    GEN_OP_NEG = 49,
-    GEN_OP_INC = 50,
-    GEN_OP_DEC = 51,
-    GEN_OP_INT_MADD = 52,
-    GEN_OP_INT_MSUB = 53,
-    GEN_OP_FP_MADD = 54,
-    GEN_OP_FP_MSUB = 55,
-    GEN_OP_VEC_MADD = 56,
-    GEN_OP_VEC_MSUB = 57,
+    GEN_OP_BRANCH = 25,   /* call-shaped control flow uses this too;
+                           * there is no separate call opcode. */
+    GEN_OP_RET = 26,
+    GEN_OP_FP_ADD = 27,
+    GEN_OP_FP_SUB = 28,
+    GEN_OP_FP_MUL = 29,
+    GEN_OP_FP_DIV = 30,
+    GEN_OP_FP_SQRT = 31,
+    GEN_OP_FP_MOV = 32,
+    GEN_OP_FP_CVT = 33,
+    GEN_OP_FP_CMP = 34,
+    GEN_OP_VEC_ADD = 35,
+    GEN_OP_VEC_SUB = 36,
+    GEN_OP_VEC_MUL = 37,
+    GEN_OP_VEC_DIV = 38,    /* packed FP/int divide & reciprocal
+                             * approximation (RCPPS, VRCP14P*). */
+    GEN_OP_VEC_SQRT = 39,   /* packed sqrt & rsqrt approximation
+                             * (SQRTPS, RSQRTPS, VRSQRT14P*). */
+    GEN_OP_VEC_MOV = 40,
+    /* Vector load/store: the memory access is the defining behaviour
+     * (no substantial ALU/compute op), but it moves a SIMD-width
+     * value or uses a SIMD indexed (gather/scatter) addressing mode,
+     * so it is worth distinguishing from scalar GEN_OP_LOAD/STORE.
+     * Per the load/store-yield rule, any instruction doing real
+     * compute is classified by that compute, not as VEC_LOAD/STORE. */
+    GEN_OP_VEC_LOAD = 41,
+    GEN_OP_VEC_STORE = 42,
+    GEN_OP_VEC_SHUF = 43,
+    GEN_OP_VEC_LOGIC = 44,
+    GEN_OP_NOP = 45,
+    GEN_OP_SYSCALL = 46,
+    GEN_OP_FENCE = 47,
+    GEN_OP_CMOV = 48,
+    GEN_OP_SETCC = 49,
+    GEN_OP_NEG = 50,
+    GEN_OP_INC = 51,
+    GEN_OP_DEC = 52,
+    GEN_OP_INT_MADD = 53,
+    GEN_OP_INT_MSUB = 54,
+    GEN_OP_FP_MADD = 55,
+    GEN_OP_FP_MSUB = 56,
+    GEN_OP_VEC_MADD = 57,
+    GEN_OP_VEC_MSUB = 58,
     /*
      * Memory-side hint / management instructions.  These do not
      * normally generate a TCG memop in QEMU (PREFETCHh, CLFLUSH,
@@ -121,15 +138,18 @@ enum GenericOpcode {
      * synthesises a load memop slot carrying the effective address by
      * decoding the operand at translation time and reading base/index
      * register values at exec time.  Consumers may treat:
-     *   GEN_OP_PREFETCH   — software prefetch hint (warm cache line)
-     *   GEN_OP_CACHE_FLUSH — explicit cache-line clean/flush/invalidate
-     *   GEN_OP_TLB_FLUSH  — explicit TLB-entry invalidation
+     *   GEN_OP_PREFETCH      — software prefetch hint (warm cache line)
+     *   GEN_OP_CACHE_FLUSH   — explicit cache-line clean/flush/invalidate
+     *   GEN_OP_TLB_FLUSH     — explicit TLB-entry invalidation
+     *   GEN_OP_VEC_PREFETCH  — SIMD / gather-prefetch hint (one or
+     *                          more SIMD-indexed cache-line warms)
      * The address (when present) is in the load-memop slot; opcode
      * carries the semantic distinction.
      */
-    GEN_OP_PREFETCH = 58,
-    GEN_OP_CACHE_FLUSH = 59,
-    GEN_OP_TLB_FLUSH = 60,
+    GEN_OP_PREFETCH = 59,
+    GEN_OP_CACHE_FLUSH = 60,
+    GEN_OP_TLB_FLUSH = 61,
+    GEN_OP_VEC_PREFETCH = 62,
     /*
      * Coarse fallback latency buckets, reserved for external trace
      * writers that lack ISA-specific opcode metadata.  The in-tree
@@ -142,12 +162,12 @@ enum GenericOpcode {
      * a long-latency unit (multi-cycle multiplier, divider, vector
      * pipe, etc.).
      */
-    GEN_OP_INT_ALU_SHORT = 61,
-    GEN_OP_INT_ALU_LONG  = 62,
-    GEN_OP_FP_ALU_SHORT  = 63,
-    GEN_OP_FP_ALU_LONG   = 64,
-    GEN_OP_VEC_ALU_SHORT = 65,
-    GEN_OP_VEC_ALU_LONG  = 66,
+    GEN_OP_INT_ALU_SHORT = 63,
+    GEN_OP_INT_ALU_LONG  = 64,
+    GEN_OP_FP_ALU_SHORT  = 65,
+    GEN_OP_FP_ALU_LONG   = 66,
+    GEN_OP_VEC_ALU_SHORT = 67,
+    GEN_OP_VEC_ALU_LONG  = 68,
     GEN_OP_COUNT
 };
 
@@ -276,9 +296,9 @@ static inline const char *generic_opcode_name(unsigned id)
     case GEN_OP_NOT:        return "GEN_OP_NOT";
     case GEN_OP_SHL:        return "GEN_OP_SHL";
     case GEN_OP_SHR:        return "GEN_OP_SHR";
-    case GEN_OP_SAR:        return "GEN_OP_SAR";
     case GEN_OP_ROL:        return "GEN_OP_ROL";
     case GEN_OP_ROR:        return "GEN_OP_ROR";
+    case GEN_OP_BITMANIP:   return "GEN_OP_BITMANIP";
     case GEN_OP_MOV:        return "GEN_OP_MOV";
     case GEN_OP_LOAD:       return "GEN_OP_LOAD";
     case GEN_OP_STORE:      return "GEN_OP_STORE";
@@ -303,7 +323,11 @@ static inline const char *generic_opcode_name(unsigned id)
     case GEN_OP_VEC_ADD:    return "GEN_OP_VEC_ADD";
     case GEN_OP_VEC_SUB:    return "GEN_OP_VEC_SUB";
     case GEN_OP_VEC_MUL:    return "GEN_OP_VEC_MUL";
+    case GEN_OP_VEC_DIV:    return "GEN_OP_VEC_DIV";
+    case GEN_OP_VEC_SQRT:   return "GEN_OP_VEC_SQRT";
     case GEN_OP_VEC_MOV:    return "GEN_OP_VEC_MOV";
+    case GEN_OP_VEC_LOAD:   return "GEN_OP_VEC_LOAD";
+    case GEN_OP_VEC_STORE:  return "GEN_OP_VEC_STORE";
     case GEN_OP_VEC_SHUF:   return "GEN_OP_VEC_SHUF";
     case GEN_OP_VEC_LOGIC:  return "GEN_OP_VEC_LOGIC";
     case GEN_OP_NOP:        return "GEN_OP_NOP";
@@ -311,8 +335,6 @@ static inline const char *generic_opcode_name(unsigned id)
     case GEN_OP_FENCE:      return "GEN_OP_FENCE";
     case GEN_OP_CMOV:       return "GEN_OP_CMOV";
     case GEN_OP_SETCC:      return "GEN_OP_SETCC";
-    case GEN_OP_INT_ADC:    return "GEN_OP_INT_ADC";
-    case GEN_OP_INT_SBB:    return "GEN_OP_INT_SBB";
     case GEN_OP_NEG:        return "GEN_OP_NEG";
     case GEN_OP_INC:        return "GEN_OP_INC";
     case GEN_OP_DEC:        return "GEN_OP_DEC";
@@ -325,6 +347,7 @@ static inline const char *generic_opcode_name(unsigned id)
     case GEN_OP_PREFETCH:   return "GEN_OP_PREFETCH";
     case GEN_OP_CACHE_FLUSH: return "GEN_OP_CACHE_FLUSH";
     case GEN_OP_TLB_FLUSH:  return "GEN_OP_TLB_FLUSH";
+    case GEN_OP_VEC_PREFETCH: return "GEN_OP_VEC_PREFETCH";
     case GEN_OP_INT_ALU_SHORT: return "GEN_OP_INT_ALU_SHORT";
     case GEN_OP_INT_ALU_LONG:  return "GEN_OP_INT_ALU_LONG";
     case GEN_OP_FP_ALU_SHORT:  return "GEN_OP_FP_ALU_SHORT";

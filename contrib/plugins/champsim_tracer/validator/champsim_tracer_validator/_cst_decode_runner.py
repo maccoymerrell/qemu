@@ -21,7 +21,7 @@ Public surface (matches the old ``champsim_tracer_decode``):
     iter_decode_champsim_tracer(path) -> (meta, templates, iterator)
     DynParam dataclass with .type_name, .value, .data_lo, .data_hi,
         .data, .data_size, .insn_index
-    OPCODE_NAMES, BRANCH_NAMES, REG_NAMES_DEFAULT, FIELD_ID_NAMES_DEFAULT
+    OPCODE_NAMES, BRANCH_NAMES, REG_NAMES_DEFAULT
     build_reg_names()
 
 Locating the binary: a checked-in ``CST_DECODE`` env var, a peer in
@@ -42,29 +42,36 @@ from typing import Iterator
 _HERE = Path(__file__).resolve().parent
 
 # ---------------------------------------------------------------------------
-# Constants — duplicated verbatim from the deleted champsim_tracer_decode.py.
-# The validator uses these directly via attribute access; keeping them in
-# the shim avoids forcing a `.maps.opcode` dict lookup on every call site.
+# Validator-side id -> name vocabulary.  NOT a decode fallback: a
+# trace is self-describing and _parse_full reads its embedded
+# encoding maps unconditionally.  These tables are only the
+# validator's own knowledge of the id space, used to phrase report
+# strings / build expected sets when no trace is in hand.  They must
+# mirror enum GenericOpcode / BranchType in
+# champsim_tracer_generic_ids.h (GEN_OP_/BRANCH_ prefix stripped).
 # ---------------------------------------------------------------------------
 
 OPCODE_NAMES = {
     0: "UNKNOWN", 1: "INT_ADD", 2: "INT_SUB", 3: "INT_MUL", 4: "INT_DIV",
     5: "AND", 6: "OR", 7: "XOR", 8: "NOT",
-    9: "SHL", 10: "SHR", 11: "SAR", 12: "ROL", 13: "ROR",
+    9: "SHL", 10: "SHR", 11: "ROL", 12: "ROR", 13: "BITMANIP",
     14: "MOV", 15: "LOAD", 16: "STORE", 17: "PUSH", 18: "POP",
     19: "LEA", 20: "MOVSX", 21: "MOVZX", 22: "XCHG",
-    23: "CMP", 24: "TEST", 25: "BRANCH", 27: "RET",
-    28: "FP_ADD", 29: "FP_SUB", 30: "FP_MUL", 31: "FP_DIV", 32: "FP_SQRT",
-    33: "FP_MOV", 34: "FP_CVT", 35: "FP_CMP",
-    36: "VEC_ADD", 37: "VEC_SUB", 38: "VEC_MUL", 39: "VEC_MOV",
-    40: "VEC_SHUF", 41: "VEC_LOGIC",
-    42: "NOP", 43: "SYSCALL", 44: "FENCE",
-    45: "CMOV", 46: "SETCC",
-    47: "INT_ADC", 48: "INT_SBB", 49: "NEG", 50: "INC", 51: "DEC",
-    52: "INT_MADD", 53: "INT_MSUB",
-    54: "FP_MADD", 55: "FP_MSUB",
-    56: "VEC_MADD", 57: "VEC_MSUB",
-    58: "PREFETCH", 59: "CACHE_FLUSH", 60: "TLB_FLUSH",
+    23: "CMP", 24: "TEST", 25: "BRANCH", 26: "RET",
+    27: "FP_ADD", 28: "FP_SUB", 29: "FP_MUL", 30: "FP_DIV", 31: "FP_SQRT",
+    32: "FP_MOV", 33: "FP_CVT", 34: "FP_CMP",
+    35: "VEC_ADD", 36: "VEC_SUB", 37: "VEC_MUL", 38: "VEC_DIV",
+    39: "VEC_SQRT", 40: "VEC_MOV", 41: "VEC_LOAD", 42: "VEC_STORE",
+    43: "VEC_SHUF", 44: "VEC_LOGIC",
+    45: "NOP", 46: "SYSCALL", 47: "FENCE",
+    48: "CMOV", 49: "SETCC", 50: "NEG", 51: "INC", 52: "DEC",
+    53: "INT_MADD", 54: "INT_MSUB",
+    55: "FP_MADD", 56: "FP_MSUB",
+    57: "VEC_MADD", 58: "VEC_MSUB",
+    59: "PREFETCH", 60: "CACHE_FLUSH", 61: "TLB_FLUSH",
+    62: "VEC_PREFETCH",
+    63: "INT_ALU_SHORT", 64: "INT_ALU_LONG", 65: "FP_ALU_SHORT",
+    66: "FP_ALU_LONG", 67: "VEC_ALU_SHORT", 68: "VEC_ALU_LONG",
 }
 
 BRANCH_NAMES = {
@@ -111,7 +118,6 @@ def build_reg_names() -> dict[int, str]:
 
 
 REG_NAMES_DEFAULT = build_reg_names()
-FIELD_ID_NAMES_DEFAULT: dict[int, str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -574,29 +580,24 @@ def _run_cst_decode(path: str | os.PathLike) -> str:
 
 def _parse_full(text: str) -> tuple[dict, list[dict], list[dict]]:
     lines = text.splitlines()
-    rid_by_name = {n: r for r, n in REG_NAMES_DEFAULT.items()}
-    op_to_id = {n: r for r, n in OPCODE_NAMES.items()}
-    br_to_id = {n: r for r, n in BRANCH_NAMES.items()}
 
     meta, i = _parse_meta_section(lines)
     encoding_maps, i = _parse_encodings(lines, i, meta)
     meta["encoding_maps"] = encoding_maps
-    if "reg" in encoding_maps:
-        # Trace's reg map overrides the built-in.
-        rid_by_name = {n: r for r, n in encoding_maps["reg"].items()}
-        meta["reg_names"] = encoding_maps["reg"]
-    else:
-        meta["reg_names"] = REG_NAMES_DEFAULT
-    if "opcode" in encoding_maps:
-        op_to_id = {n: r for r, n in encoding_maps["opcode"].items()}
-        meta["opcode_names"] = encoding_maps["opcode"]
-    else:
-        meta["opcode_names"] = OPCODE_NAMES
-    if "branch_type" in encoding_maps:
-        br_to_id = {n: r for r, n in encoding_maps["branch_type"].items()}
-        meta["branch_names"] = encoding_maps["branch_type"]
-    else:
-        meta["branch_names"] = BRANCH_NAMES
+    # The trace is self-describing: every map is embedded in the
+    # header by the plugin.  No built-in fallback -- a missing map is
+    # a corrupt/truncated trace, not a compatibility case.
+    for need in ("reg", "opcode", "branch_type"):
+        if need not in encoding_maps:
+            raise ValueError(
+                f"trace header missing '{need}' encoding map "
+                f"(corrupt or truncated .cst)")
+    rid_by_name = {n: r for r, n in encoding_maps["reg"].items()}
+    op_to_id = {n: r for r, n in encoding_maps["opcode"].items()}
+    br_to_id = {n: r for r, n in encoding_maps["branch_type"].items()}
+    meta["reg_names"] = encoding_maps["reg"]
+    meta["opcode_names"] = encoding_maps["opcode"]
+    meta["branch_names"] = encoding_maps["branch_type"]
 
     templates, i = _parse_templates(
         lines, i, rid_by_name, op_to_id, br_to_id)

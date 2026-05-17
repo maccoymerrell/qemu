@@ -15,12 +15,11 @@ void BBChainAssembler::append_fragment(uint64_t entry_pc,
                                        uint64_t fall_through)
 {
     /*
-     * On segment switch the BBTemplate * pointers in fragments_ become
-     * dangling (BBTemplateCache::clear_bb_map() drops their owning
-     * unique_ptrs).  Each segment switch bumps g_segment_generation;
-     * we lazily drop a stale chain here on the next append.  This lets
+     * On segment switch clear_bb_map() drops the unique_ptrs owning
+     * fragments_'s BBTemplate*s, so a generation mismatch (bumped per
+     * switch) means lazily drop the now-stale chain here — lets
      * reset_segment_local_state run on one thread without touching
-     * other threads' thread_local chains directly.
+     * other threads' thread_local chains.
      */
     uint32_t cur_gen = g_segment_generation.load(std::memory_order_relaxed);
     if (my_gen_ != cur_gen) {

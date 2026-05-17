@@ -1,15 +1,12 @@
 /*
  * Wrong-Path Tracing Plugin — option parser.
  *
- * Plugin args arrive as `key=value` strings.  PluginConfig holds the
- * parsed values; parse_plugin_options() fills it from argc/argv via a
- * typed setter table.  The caller (qemu_plugin_install) then applies
- * each field to its final destination — a global, a class instance,
- * or a per-segment configuration.
+ * Plugin args arrive as `key=value`.  parse_plugin_options() fills
+ * PluginConfig from argc/argv via a typed setter table; the caller
+ * then applies each field to its final destination.
  *
- * String fields are g_strdup'd into the struct; plugin_config_free()
- * releases them.  Owners that take long-term possession should
- * transfer (assign + null) rather than copy.
+ * String fields are g_strdup'd; plugin_config_free() releases them.
+ * Long-term owners should transfer (assign + null) rather than copy.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -30,27 +27,22 @@ struct PluginConfig {
      * trace bytes — without affecting CP capture. */
     int       wp_mem_data       = -1;
     int       wp_reg_data       = -1;
-    /* Number of histogram intervals to bucket each segment into.
-     * 0 disables (default).  When non-zero, the per-segment summary
-     * is followed by per-interval breakdowns of the same attribution
-     * tables (branch type, opcode, src/dst regs) so the user can see
-     * how a long segment's instruction mix varies over time. */
+    /* Histogram intervals per segment; 0 disables (default).  Non-zero
+     * adds per-interval breakdowns of the attribution tables to the
+     * per-segment summary. */
     int       histogram_intervals = 0;
     /* Per-template IFRAME trigger interval.  0 disables. */
     uint32_t  iframe_rate         = 100000;
     uint64_t  simpoint_interval = 100000000ULL;
     uint64_t  trace_start_insn  = 0;
     uint64_t  trace_stop_insn   = UINT64_MAX;
-    /* Simpoint windowing.  Only consulted when simpoints_file is set.
-     *   warmup_insns      : insns to trace BEFORE each simpoint's
-     *                       position to prime caches / branch predictors
-     *                       / etc.  Effective segment start is
-     *                       max(0, sp->start_insn - warmup_insns).
-     *   simulation_insns  : insns to trace at-and-after the simpoint
-     *                       position.  Effective segment stop is
-     *                       sp->start_insn + simulation_insns.  When 0
-     *                       (the default), the legacy behavior is kept:
-     *                       stop = sp->start + simpoint_interval. */
+    /* Simpoint windowing (only when simpoints_file is set).
+     *   warmup_insns     : prime length before each simpoint;
+     *                       start = max(0, sp->start_insn - warmup).
+     *   simulation_insns : length at-and-after the simpoint;
+     *                       stop = sp->start_insn + simulation.  0
+     *                       (default) keeps legacy stop = sp->start +
+     *                       simpoint_interval. */
     uint64_t  warmup_insns      = 0;
     uint64_t  simulation_insns  = 0;
     char     *output_path       = nullptr;   /* g_strdup, owned */
@@ -61,20 +53,17 @@ struct PluginConfig {
 
     /*
      * Symbol-based trace start (trace_window=symbol:...).  Trace
-     * begins on the @start_symbol_occurrence-th time the named
-     * symbol appears as a BB entry; runs for @simulation_insns
-     * architectural instructions after that point.  warmup is
-     * not meaningful here — we can't predict what executes before
-     * an arbitrary symbol's Nth occurrence.
+     * begins on the @start_symbol_occurrence-th time the symbol
+     * appears as a BB entry; runs @simulation_insns insns after.
+     * warmup is not meaningful here.
      */
     char     *start_symbol      = nullptr;   /* g_strdup, owned */
     uint64_t  start_symbol_occurrence = 1;
 
     /*
-     * Set to one of WindowMode values when trace_window= is used,
-     * so the runtime can validate that warmup= / start= / etc.
-     * fields aren't being mixed across modes.  Unset (= AUTO) means
-     * the plugin falls back to the legacy flat-flags behavior.
+     * Set from trace_window=; lets the runtime validate that
+     * warmup=/start=/etc. aren't mixed across modes.  AUTO (unset)
+     * falls back to the legacy flat-flags behavior.
      */
     enum WindowMode {
         WIN_AUTO     = 0,

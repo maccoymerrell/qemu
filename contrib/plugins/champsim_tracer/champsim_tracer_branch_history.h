@@ -1,15 +1,11 @@
 /*
  * Wrong-Path Tracing Plugin — branch history.
  *
- * Per-PC observed-target history for branches.  Used to:
- *  - record the targets a CP indirect branch has taken,
- *  - choose a wrong-path target when the CP took an indirect branch,
- *  - count distinct branch PCs for the exit-time stats line.
+ * Per-PC observed-target history for branches: records CP indirect
+ * targets, picks a wrong-path target, counts distinct branch PCs.
  *
- * Storage is a typed map keyed by branch PC.  Records are plain structs
- * (BranchRecord, defined in champsim_tracer.h) so the WP simulator and
- * any future consumer can read fields directly without going through
- * the map.
+ * Map keyed by branch PC; values are plain BranchRecord structs
+ * (champsim_tracer.h) readable directly without going through the map.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */

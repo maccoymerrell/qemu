@@ -1,16 +1,12 @@
 /*
  * Wrong-Path Tracing Plugin — per-thread stats accumulator and registry.
  *
- * Each vCPU/translator thread bumps its own thread-local Stats slot
- * via the `g_stats` macro, which forwards to thread_stats_get().  The
- * first call on a given thread allocates a Stats slot off the heap,
- * pushes a pointer into the live registry under stats_registry_lock,
- * and stashes the pointer in the thread's TLS.  Hot-path bumps after
- * registration are unsynchronized stores into thread-local memory.
+ * Each thread bumps its own thread-local Stats slot via the `g_stats`
+ * macro.  First touch heap-allocates the slot and registers it under
+ * stats_registry_lock; later bumps are unsynchronized TLS stores.
  *
- * stats_snapshot() walks the live registry plus a graveyard
- * accumulator (which receives the contributions of any thread that
- * exited cleanly) and returns a coherent process-wide aggregate.
+ * stats_snapshot() sums the live registry plus a graveyard
+ * accumulator (contributions of cleanly-exited threads).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -38,11 +34,10 @@ void stats_add(Stats *dst, const Stats &src)
     }
 }
 
-/* Per-thread owner: ctor allocates the heap Stats slot and registers
- * it; dtor folds the slot into the graveyard, removes it from the
- * live registry, and frees it.  Heap allocation (rather than a
- * thread_local Stats object) keeps the registry pointer stable
- * across compiler optimizations of the TLS layout. */
+/* Per-thread owner: ctor heap-allocates + registers the Stats slot;
+ * dtor folds it into the graveyard, unregisters, frees.  Heap (not a
+ * thread_local Stats) keeps the registry pointer stable across
+ * compiler TLS-layout optimizations. */
 struct ThreadStats {
     Stats *slot;
 

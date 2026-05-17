@@ -163,9 +163,9 @@ self-describing.  Decode it into a fresh `encoding_maps` table.
                         CST_FID_INSN_FLAGS, CST_FID_INSN_IMMEDIATE,
                         CST_FID_INSN_SIZE, CST_FID_METAFLAGS,
                         CST_FID_EXTENDED
-                        (no CST_FID_EXTRA_* in version 0x1D; the
-                         overflow vectors retired with the slot-cap
-                         raise — see Reference §5.2.)
+                        (there are no CST_FID_EXTRA_* fields; all
+                         memops are addressed through the slotted
+                         families — see Reference §5.2.)
        insn_flag:       CST_INSN_FLAG_BRANCH_COND,
                         CST_INSN_FLAG_HAS_IMM,
                         CST_INSN_FLAG_HAS_DEP_BLOCK
@@ -192,10 +192,30 @@ Decode by repeated outer-section unwrapping.
        template_id        : ULEB
        start_pc           : ULEB
        num_insns          : ULEB
-       fall_through_pc    : ULEB
+       fall_through_pc    : ULEB       ; not-taken / next-PC edge.
+                                       ; Single source of truth — the
+                                       ; profile block does NOT repeat
+                                       ; it.  0 if last insn isn't a
+                                       ; branch.
+       n_targets          : ULEB       ; terminal-branch taken-edge
+                                       ; targets.  Uniform layout:
+                                       ;   0  last insn is not a branch
+                                       ;   1  non-indirect branch —
+                                       ;      target[0] is the observed
+                                       ;      taken edge (0 if the edge
+                                       ;      was never resolved)
+                                       ;   k  indirect / return —
+                                       ;      distinct correct-path-
+                                       ;      observed targets, k <=
+                                       ;      BRANCH_TARGET_HISTORY (16)
+       repeat n_targets times:
+         target_pc        : ULEB       ; per-target taken/not-taken
+                                       ; counts ride in the profile
+                                       ; block, same order & length
        symbol_name        : string     ; may be empty
        repeat num_insns times: one insn descriptor per Step 4.4
-     After all insn descriptors are decoded, tmpl_section must be
+       profile_block                   ; per Step 4.6 (always present)
+     After the profile block is decoded, tmpl_section must be
      empty; reject otherwise.
 4.4  Per-insn template descriptor (consumed from tmpl_section):
        pc_delta           : ULEB       ; abs PC = prev_pc + pc_delta
@@ -235,6 +255,78 @@ Decode by repeated outer-section unwrapping.
      address — so the consumer can fire each memop without waiting
      on inputs irrelevant to its address).  See Reference §3 for
      the bit layout inside each mask.
+4.6  Template profile block (consumed from tmpl_section, always
+     present, immediately after the last insn descriptor).  This is
+     run-aggregated PGO-style metadata; it does not affect replay
+     and a consumer that does not model it may skip the bytes.
+       exec_cp            : ULEB   ; #times this BB ran, correct path
+       exec_wp            : ULEB   ; #times this BB ran, wrong path
+       ;     exec_cp == exec_wp == 0 is VALID: a pre-declared REP
+       ;     self-loop sub-template is materialized at translation
+       ;     but only emitted when the REP runs >= 2 iterations, so a
+       ;     REP never reached / outside the window / run once leaves
+       ;     a 0/0 template.  It is never referenced by any body
+       ;     entry — treat as an unexercised pre-declared self-loop.
+       ; --- terminal-branch per-target taken/not-taken counts,
+       ;     consumed 1:1 with the template header's n_targets list
+       ;     (same order & length; n_targets is NOT repeated here).
+       ;     The not-taken edge is the header's fall_through_pc, which
+       ;     this block does NOT repeat.  "Terminal branch" = the BB's
+       ;     LAST insn (its first and only branch by the true-BB
+       ;     definition; NOT the branch that entered the BB).  Empty
+       ;     when the last insn is not a branch. ---
+       repeat n_targets times:           ; n_targets from the header
+         taken_cp         : ULEB   ; CP execs that took this target
+         nottaken_cp      : ULEB   ; CP execs that did NOT (fell
+                                   ; through, or — indirect — chose a
+                                   ; different target)
+         taken_wp         : ULEB
+         nottaken_wp      : ULEB
+       ;     The header target_pc list is CORRECT-PATH ONLY:
+       ;     note_target() is never called during wrong-path
+       ;     simulation (the pool feeds the WP target resolver, so a
+       ;     speculative entry would be self-defeating).  For a
+       ;     non-indirect branch n_targets == 1 and these counts are
+       ;     the terminal branch's aggregate CP/WP taken vs fall-
+       ;     through.  For an indirect branch the WP taken/not-taken
+       ;     aggregate is attributed to target[0] (no per-target WP
+       ;     distribution is tracked); CP counts are per target.
+       ; --- per-insn, template insn order, num_insns records ---
+       repeat num_insns times:
+         memops_cp        : ULEB   ; total mem-ops this insn issued, CP
+         memops_wp        : ULEB   ; total mem-ops this insn issued, WP
+         pat_flags        : u8     ; bit[1:0] cp access pattern
+                                   ; bit[3:2] wp access pattern
+                                   ;   Classified on the SECOND-order
+                                   ;   difference of effective
+                                   ;   addresses — the change in step
+                                   ;   size between consecutive
+                                   ;   accesses (ddelta = delta_n −
+                                   ;   delta_{n-1}), NOT the raw step
+                                   ;   size:
+                                   ;   0 none     no mem access seen
+                                   ;   1 regular  constant stride
+                                   ;     (every ddelta == 0; incl.
+                                   ;     stride 0)
+                                   ;   2 irregular stride varies but
+                                   ;     every |ddelta| ≤ 4096 (e.g.
+                                   ;     a smoothly walking stride
+                                   ;     1,2,3,… → ddelta == 1)
+                                   ;   3 random   some |ddelta| > 4096
+                                   ;     (step size jumped by > a
+                                   ;     page between two accesses)
+                                   ;   reports the strongest class
+                                   ;   observed
+                                   ; bit[4] cp data-is-address
+                                   ; bit[5] wp data-is-address
+                                   ;   (loaded/stored value fell in
+                                   ;   the run's observed addr window)
+         if memops_cp > 0:
+           lo_addr_cp     : ULEB   ; lowest effective addr, CP
+           hi_addr_cp     : ULEB   ; (highest − lowest), CP
+         if memops_wp > 0:
+           lo_addr_wp     : ULEB
+           hi_addr_wp     : ULEB   ; (highest − lowest), WP
 ```
 
 Store every decoded template in `template_by_id` keyed by
@@ -362,11 +454,11 @@ Loop until a `BODY_TAG_END` is seen:
        Reference §5 for the field-state semantics.
 ```
 
-`EXTRA_LOAD_ADDR` / `EXTRA_STORE_ADDR` / `EXTRA_LOAD_DATA` /
-`EXTRA_STORE_DATA` are NOT part of this format version's `field_id`
-map.  All memops are addressed through the slotted families
-(`LOAD_ADDR[0..63]` etc.); an instruction whose dynamic memop count
-exceeds `CST_FID_SLOT_COUNT` is rejected at the writer.
+All memops are addressed through the slotted families
+(`LOAD_ADDR[0..63]` / `STORE_ADDR[0..63]` and their `DATA`
+counterparts); there is no overflow vector.  An instruction whose
+dynamic memop count exceeds `CST_FID_SLOT_COUNT` (64) has the
+excess dropped at the writer.
 
 A SLEB_WIDE / ULEB_WIDE primitive: like LEB128 but the value is
 read into up to 8 little-endian limbs (64 bits each, packing
@@ -456,24 +548,16 @@ naturally ends after its templates section).
 
 `CST_FID_SLOT_COUNT` is the per-family slot ceiling for the
 field-delta sections (loads, stores, destination registers).  When
-an instruction's dynamic memop count would exceed this cap, the
+an instruction's dynamic memop count exceeds this cap, the
 writer clamps the trailing memops and emits a warning to
-`unknown_warnings.log`; no `EXTRA_*` overflow path exists in this
-format version (see Reference §5.2).
+`unknown_warnings.log`; there is no `EXTRA_*` overflow path (see
+Reference §5.2).
 
-Version history
-:    `0x1B`: original release.
-:    `0x1C`: outer container becomes tar(body, header); 64-byte
-     trailing trailer removed.  REP-prefixed string ops fan out
-     per-iteration; `BRANCH_REP` added.
-:    `0x1D` (current): field-delta `fid` is a ULEB128 instead of a
-     fixed `u8`; `CST_FID_SLOT_COUNT` raised from 16 to 64; the
-     `EXTRA_LOAD_ADDR` / `EXTRA_STORE_ADDR` / `EXTRA_LOAD_DATA` /
-     `EXTRA_STORE_DATA` overflow fields are retired.  Numeric
-     field-IDs are non-normative — readers consume the header's
-     `field_id` encoding map.  The writer typically packs the hot
-     fields into the 1-byte ULEB range, but the layout is its
-     concern, not the format's (see Reference §5.1).
+Field-delta `fid` is a ULEB128.  Numeric field-IDs are
+non-normative — readers consume the header's `field_id` encoding
+map.  The writer typically packs the hot fields into the 1-byte
+ULEB range, but the layout is its concern, not the format's (see
+Reference §5.1).
 
 On ISAs with an integer flags register (x86, AArch64), every insn
 whose template writes that register also emits a canonical
@@ -498,9 +582,8 @@ x86 `EFLAGS` bit map: CF→C, PF→P, ZF→Z, SF→N, OF→V.  AArch64
 `NZCV` (top nibble of CPSR) bit map: N→N, Z→Z, C→C, V→V; the P bit
 is not set.
 
-Readers reject any file whose magic disagrees with `CST_MAGIC`.  The
-format is pre-release: there is one shape, and the tools support
-exactly that shape.
+Readers reject any file whose magic disagrees with `CST_MAGIC`.
+There is one shape, and the tools support exactly that shape.
 
 Header feature flags are advisory. The field IDs still determine what
 is actually present in each delta section.
@@ -613,7 +696,7 @@ Per-thread initial register files are emitted as `BODY_TAG_REGFILE`
 records inline in the body stream (see §5), not as part of the `reg`
 encoding map.
 
-The writer currently emits these maps:
+The writer emits these maps:
 
 ```
 +---------------+-----------------------------------------------+
@@ -629,11 +712,17 @@ The writer currently emits these maps:
 | body_tag      | BODY_TAG_* stream record tags                 |
 | wp_event_flag | CST_WP_EVENT_* wrong-path event bits          |
 | metaflags     | CST_METAFLAGS_* canonical flag bits           |
+| mem_access_pattern | CST_PAT_* template-profile access classes|
+| profile_flag  | CST_PROFILE_* template-profile pat_flags bits |
 +---------------+-----------------------------------------------+
 ```
 
-Consumers should use the maps in the trace when present. Built-in names
-are only a fallback for files produced before this section existed.
+The template profile block (§6) is self-describing through these
+last two maps: resolve `pat_flags` bits[1:0]/[3:2] via
+`mem_access_pattern` and bits[4]/[5] via `profile_flag` rather than
+hard-coding the class meanings.
+
+Consumers resolve numeric IDs through the maps in the trace.
 
 ## 4. Body Stream
 
@@ -1093,11 +1182,10 @@ as its own true-BB visit:
    templates section; their `template_id`s are independent and
    delta-encoded as usual in the body stream.
 
-A regression in the fan-out (e.g. all N iterations aggregated onto
-a single entry with `N_LOADS = N`) would surface in the trace as
-the absence of the sub-template visits and a single overloaded
-body entry — and would re-introduce the `EXTRA_*` overflow path
-in the field-delta stream for high-count REPs.
+Each architectural REP iteration is its own body entry; the
+iterations are never aggregated onto a single entry with
+`N_LOADS = N`.  This keeps each REP insn's per-iteration memop
+count within `CST_FID_SLOT_COUNT` for high-count REPs.
 
 ```
 current n_loads = state(template, insn, CST_FID_N_LOADS)
@@ -1119,8 +1207,7 @@ trailing memops past the cap and emit a warning to
 count.  Consumers see only the first `CST_FID_SLOT_COUNT` memops in
 that case; the elision is observable as the dynamic count being
 clamped to the cap.  The wire format reserves no overflow path —
-there is no equivalent of the `EXTRA_*` raw-vector escape used in
-format versions `0x1B` / `0x1C`.
+there is no `EXTRA_*` raw-vector escape.
 
 The 64-slot ceiling covers AVX-512 gather/scatter (≤ 16 lanes),
 ARM SVE2 at VLEN ≤ 4096 (≤ 64 element loads), and RISC-V V at
@@ -1253,7 +1340,9 @@ template payload:
 | template_id      ULEB                            |
 | start_pc         ULEB                            |
 | num_insns        ULEB                            |
-| fall_through_pc  ULEB                            |
+| fall_through_pc  ULEB    not-taken edge          |
+| n_targets        ULEB    0/1/k (see Step 4.3)    |
+|   target_pc      ULEB  x n_targets  taken edges  |
 | symbol_name      string                          |
 +--------------------------------------------------+
 | repeated num_insns times:                        |
@@ -1343,9 +1432,8 @@ predicate).  This distinction is **writer-internal**: it only
 decides where the writer reads the live-lane value from.  On the
 wire there is no "static vs dynamic" kind — every family is just a
 dynamic delta-encoded mask, and a consumer treats them uniformly.
-A trace without `CST_INSN_FLAG_VEC` (scalar insns, or a writer
-predating the lane block) carries no lane masks; consumers then
-treat every lane as participating.
+A trace without `CST_INSN_FLAG_VEC` (scalar insns) carries no lane
+masks; consumers then treat every lane as participating.
 
 `CST_INSN_FLAG_LANE_PARALLEL` records that lane `j` of each dst
 depends only on lane `j` of every src (true SIMD lanes); when clear
@@ -1388,6 +1476,106 @@ exactly this reconstruction and is the reference for it.
 `pc_delta` is relative to the previous instruction PC, with
 `previous_pc = start_pc` for the first instruction. The branch, if any,
 is the last instruction after the writer's delay-slot normalization.
+
+### Template profile block
+
+Appended to every template payload immediately after the last
+per-insn descriptor (always present — there is no opt-in flag).
+It is run-aggregated, PGO-style profiling metadata: it never
+affects deterministic replay, and a consumer that does not model
+it simply skips the bytes.  Because the templates section is
+serialized at segment finish (after all execution), these are
+final run totals, not running snapshots.
+
+```
+profile_block:
+  exec_cp            ULEB   correct-path executions of this BB
+  exec_wp            ULEB   wrong-path executions of this BB
+  # exec_cp == exec_wp == 0 is valid: a pre-declared REP self-loop
+  # sub-template, materialized at translation but emitted only when
+  # the REP runs >= 2 iterations.  Never referenced by a body entry.
+
+  # Terminal-branch per-target taken/not-taken counts.  Consumed
+  # 1:1 with the template header's n_targets / target_pc list (same
+  # order & length; n_targets is NOT repeated here, and the
+  # not-taken edge is the header's fall_through_pc, also not
+  # repeated).  "Terminal branch" = the BB's LAST insn (its first
+  # and only branch by the true-BB definition; NOT the branch that
+  # entered the BB).  Empty when the last insn is not a branch.
+  #
+  # The header target_pc list is CORRECT-PATH ONLY: note_target()
+  # is never called during wrong-path simulation — that pool is
+  # what the wrong-path resolver mines to choose a speculative
+  # target, so folding speculative targets in would defeat it.  For
+  # a non-indirect branch n_targets == 1 and the counts are the
+  # terminal branch's aggregate CP/WP taken vs fall-through.  For an
+  # indirect branch CP counts are per target; the WP taken/not-taken
+  # aggregate is attributed to target[0] (no per-target WP
+  # distribution is tracked).
+  repeat n_targets:
+    taken_cp         ULEB   CP execs that took this target
+    nottaken_cp      ULEB   CP execs that did not (fell through, or
+                            indirect: chose a different target)
+    taken_wp         ULEB
+    nottaken_wp      ULEB
+
+  # Per-insn, template insn order, exactly num_insns records.
+  repeat num_insns:
+    memops_cp        ULEB   total mem-ops this insn issued (CP)
+    memops_wp        ULEB   total mem-ops this insn issued (WP)
+    pat_flags        u8     bit[1:0] CP access-pattern class
+                            bit[3:2] WP access-pattern class
+                              resolve via encoding map
+                              "mem_access_pattern" (CST_PAT_*).
+                              Classified on the SECOND-order
+                              difference of effective addresses —
+                              the change in step size between
+                              consecutive accesses (ddelta =
+                              delta_n − delta_{n-1}), NOT the raw
+                              step size:
+                              0 none      no memory access seen
+                              1 regular   constant stride: every
+                                          ddelta == 0 (incl. stride 0)
+                              2 irregular stride varies but every
+                                          |ddelta| ≤ 4096 (e.g. a
+                                          walking stride 1,2,3,… →
+                                          ddelta == 1)
+                              3 random    some |ddelta| > 4096 (step
+                                          size jumped by > a page
+                                          between two accesses)
+                            (the strongest class observed wins;
+                             the |ddelta| threshold is the writer's
+                             CST_PROFILE_RAND_DELTA, 4096)
+                            bit[4]/bit[5] CP/WP data-is-address —
+                              resolve via encoding map
+                              "profile_flag" (CST_PROFILE_ADDR_*);
+                              set when a loaded/stored value's 4 KiB
+                              page is one that a real CORRECT-PATH
+                              mem-op touched (page-set membership,
+                              not a min/max span; the page set is
+                              never populated from wrong-path
+                              mem-ops, even for the WP flag)
+    if memops_cp > 0:
+      lo_addr_cp     ULEB   lowest effective addr touched (CP)
+      hi_addr_cp     ULEB   highest − lowest (CP)
+    if memops_wp > 0:
+      lo_addr_wp     ULEB   lowest effective addr touched (WP)
+      hi_addr_wp     ULEB   highest − lowest (WP)
+```
+
+A branch BB exposes **both** of its terminal edges regardless of
+what the correct path did: the template header's `fall_through_pc`
+(the not-taken / next-PC edge) and its `target_pc` list (the taken
+edges).  Both are filled even when the correct path never took the
+branch — the wrong-path resolver supplies the edge the correct path
+didn't.  A non-indirect branch has exactly one `target_pc` (its
+single taken edge); an indirect/return branch enumerates its
+distinct correct-path-observed targets.  The profile block's
+per-target `{taken,nottaken}_{cp,wp}` counts are the authoritative
+CP/WP totals: for a single-target (non-indirect) branch they are
+the terminal branch's taken-vs-fall-through split; for an indirect
+branch the CP counts are per target and the WP aggregate sits on
+`target[0]`.
 
 ## 7. Decoder Checklist
 

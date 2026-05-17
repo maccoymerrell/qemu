@@ -21,6 +21,11 @@ PC sequence, generic opcode, branch type, source / destination
 register IDs, immediate, raw instruction bytes.  Templates are
 shared across every dynamic invocation of that BB; if a hot loop
 runs a million times the template is in the trace exactly once.
+Each template also carries a small **run-aggregated profile block**
+— PGO-style metadata accumulated over the whole run (execution
+counts, terminal-branch behaviour, per-instruction memory-access
+shape).  It is pure annotation: a consumer that does not model it
+skips the bytes, and it never affects deterministic replay.
 
 **Body** (the timeline).  One record per dynamic invocation of a
 basic block.  Each record points at a template by ID and adds the
@@ -93,6 +98,63 @@ correct path.  Each body entry combines:
 Body entries are emitted in *correct-path execution order*.  The
 trace is a faithful step-by-step record of the architectural
 correct path, with speculative side-trips attached at every branch.
+
+Run-aggregated profile (PGO metadata)
+-------------------------------------
+
+Every template carries a profile block summarising what happened
+across the *whole* run — final totals, serialized at segment
+finish, never running snapshots.  It is the trace's built-in
+profile-guided-optimisation layer: a consumer can size structures
+or pick policies from it without a separate profiling pass.  Pure
+metadata — skipping it changes nothing about replay.
+
+Per basic block:
+
+* **Execution counts** — ``exec_cp`` / ``exec_wp``: how many times
+  the BB ran on the correct and wrong paths.  ``0`` / ``0`` is
+  valid: a REP string-op self-loop sub-template is pre-declared at
+  translation but only emitted once the REP iterates twice or more,
+  so a REP that never iterated leaves an unexercised 0/0 template.
+
+* **Terminal-branch edges.**  Both edges of the BB's terminating
+  branch are always known — the correct path supplies whichever it
+  took, the wrong-path resolver supplies the other — so they are
+  recorded even if the correct path never took the branch.  The
+  not-taken edge is the template's ``fall_through_pc``.  The taken
+  edge(s) are a per-BB target list: exactly one entry for a
+  non-indirect branch (its single taken target, valid even on the
+  wrong path since it is architecturally fixed); for an
+  indirect / return branch, the set of distinct **correct-path**
+  targets observed (wrong-path indirect targets depend on
+  speculative register state and are deliberately excluded — they
+  would poison the very pool the wrong-path resolver mines).
+
+* **Per-target taken / not-taken counts** (CP and WP).  For a
+  non-indirect branch this is the conditional's taken-vs-fall-
+  through split; for an indirect branch the CP counts are per
+  target.
+
+* **Per-instruction memory shape.**  For each instruction:
+  correct- and wrong-path mem-op counts, the effective-address
+  range touched, a *data-is-address* flag (a loaded / stored value
+  whose page a real correct-path mem-op also touched — a pointer-
+  chasing signal), and an **access-pattern class**:
+
+  - ``regular`` — constant stride (including stride 0);
+  - ``irregular`` — stride varies but smoothly;
+  - ``random`` — the stride itself jumps by more than a page
+    between consecutive accesses.
+
+  The class is computed on the *second-order* difference of
+  effective addresses (how much the step size itself changed),
+  not the raw step size, so a linearly-accelerating walk reads as
+  irregular rather than random.  The strongest class observed
+  wins.
+
+The exact byte layout is in :doc:`format` (Step 4.6 / §6); the
+:doc:`decoder` renders it inline per BB and ``cst_audit`` shows
+how many trace bytes it costs.
 
 Research questions the trace is designed to answer
 --------------------------------------------------

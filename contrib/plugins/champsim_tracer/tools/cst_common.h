@@ -1,20 +1,13 @@
 /*
  * ChampSim Tracer offline tools — shared wire-format types.
  *
- * Glib-free, plugin-API-free, mmap-friendly POD types describing the
- * current .cst trace format.  Both cst_decode and cst_audit link
- * against this layer; the format-specific bits (header layout, tag
- * values, FID ranges) are duplicated here verbatim from the plugin's
- * champsim_tracer.h so the tools build without dragging QEMU's
- * plugin or glib headers in.
+ * Glib-free, plugin-API-free, mmap-friendly POD types for the .cst
+ * trace format, so the tools build without QEMU plugin/glib headers.
  *
- * The trace is self-describing: every header carries an encoding map
- * (opcode / branch_type / reg / field_id / insn_flag /
- * body_tag / wp_event_flag) that maps the wire-format integer ids to
- * stable string names.  The tools key off those strings rather than
- * pulling in the plugin's compile-time enums — so a trace produced
- * by a future tracer that adds new opcode or register ids will still
- * decode correctly as long as its map carries them.
+ * The trace is self-describing: every header carries encoding maps
+ * mapping wire ids to stable names.  The tools key off those names,
+ * not the plugin's compile-time enums, so a future tracer that adds
+ * new ids still decodes as long as its maps carry them.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -33,52 +26,33 @@ namespace cst {
 
 /* ===== Wire-format magic =====
  *
- * The .cst file is a POSIX-ustar archive carrying two regular-file
- * members, body.cst[.<codec>] and header.cst[.<codec>] (each
- * optionally compressed by the codec named in the suffix).  Each
- * member starts with CST_MAGIC; the body member additionally
- * carries a trailing CST_MAGIC after BODY_TAG_END so truncation is
- * detectable at either end. */
+ * .cst is a POSIX-ustar archive of body.cst[.<codec>] +
+ * header.cst[.<codec>].  Each member starts with CST_MAGIC; the body
+ * also carries a trailing CST_MAGIC after BODY_TAG_END so truncation
+ * is detectable at either end. */
 
 inline constexpr uint32_t CST_MAGIC = 0x1D545343u;
 
 /* ===== Format-layout invariants =====
  *
- * Constants the encoding maps cannot describe (buffer-size limits,
- * not enum identities):
- *
- *   FID_SLOT_COUNT: number of slot positions per memop / dst-reg
- *     range in the field-id space.  Implied by the per-base stride
- *     in the field_id map.
- *   MAX_WIDE_BYTES / MAX_INSN_BYTES: largest scalar the wire format
- *     can carry / largest insn the template section can hold.
- *
- * Other layout details (sync-hint mask + shift, all flag bits,
- * field_id assignments) ARE derivable from the encoding-map entries
- * the trace header carries — consumers should always pull them
- * through resolve_ids() rather than hardcoding numeric values. */
+ * Buffer-size limits the encoding maps cannot describe.  Everything
+ * else (flag bits, field_id assignments) IS derivable from the
+ * header's maps via resolve_ids(); never hardcode those. */
 inline constexpr uint16_t FID_SLOT_COUNT       = 64;
-/* Note: there is intentionally no FID_SLOT_STRIDE / FID_LANE_BLOCK_STRIDE
- * constant here.  The wire format defines slot-to-FID mapping
- * entirely through the encoding map (CST_FID_<family><k> entries);
- * consumers MUST look each slot's FID up by name and never compute
- * from a hardcoded stride.  See ResolvedIds below for the per-slot
- * arrays. */
+/* Intentionally no FID_SLOT_STRIDE / FID_LANE_BLOCK_STRIDE: slot->FID
+ * is defined entirely by the CST_FID_<family><k> map entries;
+ * consumers MUST look each slot's FID up by name, never by stride.
+ * See ResolvedIds for the per-slot arrays. */
 inline constexpr size_t  MAX_WIDE_BYTES       = 64;
 inline constexpr int     MAX_INSN_BYTES       = 16;
 
 /* ===== Resolved IDs =====
  *
- * The trace's encoding maps name every dispatch-time integer ID
- * (body tags, field IDs) and every named bit mask (header flags,
- * per-insn flags, WP event flags, metaflags bits).  parse_header
- * reverse-resolves the well-known names into this struct and the
- * tools dispatch on @h.ids.<name> instead of compile-time enum
- * values, so the wire format remains the single source of truth.
- * parse_header throws if a well-known name is missing from a map.
- *
- * The names below mirror the symbols the plugin emits in the header
- * maps (see champsim_tracer_output.cc::write_header_encoding_maps). */
+ * parse_header reverse-resolves the well-known names in the trace's
+ * encoding maps into this struct (throwing on any missing name); the
+ * tools dispatch on @h.ids.<name> so the wire format stays the single
+ * source of truth.  Names mirror the symbols the plugin emits (see
+ * champsim_tracer_output.cc::write_header_encoding_maps). */
 struct ResolvedIds {
     /* body_tag map */
     uint8_t body_tag_end           = 0;
@@ -88,11 +62,8 @@ struct ResolvedIds {
     uint8_t body_tag_regfile       = 0;
 
     /* field_id map: per-slot FID arrays + singletons.  FIDs are
-     * ULEB128 on the wire; the uint16_t storage handles current
-     * layouts comfortably.  Per-slot arrays are populated by
-     * looking up CST_FID_<family><k> by name in the encoding map
-     * for each k — the writer's slot-to-FID layout is opaque to
-     * consumers (no stride assumption). */
+     * ULEB128 on the wire; per-slot arrays are filled by name lookup
+     * of CST_FID_<family><k> per k (no stride assumption). */
     uint16_t fid_n_loads          = 0;
     uint16_t fid_n_stores         = 0;
     uint16_t fid_metaflags        = 0;
@@ -294,25 +265,13 @@ struct Template;
 struct InsnTemplate;
 
 /*
- * Per-architectural-instance instruction container.
- *
- * One Instruction == one materialised execution of a single
- * instruction (correct-path or wrong-path).  The body walker
- * produces DecodedEntry objects keyed on BB visits; downstream
- * code (renderer, simulator) usually wants to think in terms of
- * single instructions instead.  cst::instructions_from_entry()
- * fans a DecodedEntry out into a vector<Instruction> — one per CP
- * insn followed by all WP insns in chain order, with the per-
- * instance dyn_params / reg_snaps / metaflags already filtered to
- * just that insn.  Renderers and simulators consume an
- * Instruction without re-filtering by insn_index.
- *
- * Static fields (PC, opcode, src/dst lists, raw_bytes) are copies
- * — Instructions are intended to outlive any specific
- * DecodedEntry, so consumers can collect them into a vector and
- * walk later.  Templates are pointers (non-owning) when present;
- * the bb_template_id keeps the linkage symbolic for consumers
- * that drop the pointers.
+ * Per-architectural-instance instruction container: one materialised
+ * execution (correct- or wrong-path).  cst::instructions_from_entry()
+ * fans a DecodedEntry into these (CP insns then WP insns in chain
+ * order) with dyn_params/reg_snaps/metaflags pre-filtered per insn.
+ * Static fields are copies so an Instruction outlives its
+ * DecodedEntry; Templates are non-owning pointers, bb_template_id
+ * keeps the linkage symbolic for consumers that drop them.
  */
 struct Instruction {
     /* Static template fields (copies). */
@@ -344,16 +303,13 @@ struct Instruction {
     std::vector<uint64_t> load_addr_dep_mask;
     std::vector<uint64_t> store_addr_dep_mask;
 
-    /* Per-slot lane participation, read from the dynamic lane-mask FID
-     * cells (CST_FID_SRC_LANE_MASK / DST_LANE_MASK / LOAD_DATA_LANE_MASK
-     * / STORE_DATA_LANE_MASK).  Bit k of mask[i] is set iff lane k of
-     * slot i participates in this instance.  Empty / all-zero on scalar
-     * instances and on traces predating the lane-mask FID block.
-     *
-     * lane_parallel mirrors CST_INSN_FLAG_LANE_PARALLEL (template-static):
-     * when set, lane k of each dst depends only on lane k of every src;
-     * when clear, lanes participate but don't line up by index (shuffles,
-     * broadcasts, horizontal reductions). */
+    /* Per-slot lane participation from the dynamic lane-mask FID
+     * cells.  Bit k of mask[i] set iff lane k of slot i participates.
+     * Empty/zero on scalar instances and pre-lane-mask traces.
+     * lane_parallel (template-static, CST_INSN_FLAG_LANE_PARALLEL):
+     * set => lane k of each dst depends only on lane k of every src;
+     * clear => lanes don't line up by index (shuffles/broadcasts/
+     * horizontal reductions). */
     bool                  lane_parallel       = false;
     std::vector<uint64_t> src_lane_mask;
     std::vector<uint64_t> dst_lane_mask;
@@ -405,15 +361,11 @@ struct InsnTemplate {
     int64_t  imm = 0;
     bool     is_atomic = false;
     /*
-     * Template-static MAX counts for the instruction's memory ops.
-     * Runtime per-iteration counts arrive separately via
-     * CST_FID_N_LOADS / CST_FID_N_STORES and may be smaller (e.g. a
-     * conditional load that didn't fire) but never larger.
-     *
-     * These also fix the dep-mask bit layout: load slots occupy
-     * mask bits [n_src, n_src + max_dep_loads), the imm bit sits at
-     * n_src + max_dep_loads, and store_data_dep_mask is an array of
-     * length max_dep_stores.
+     * Template-static MAX memop counts.  Runtime counts arrive via
+     * CST_FID_N_LOADS/N_STORES and may be smaller but never larger.
+     * Also fix the dep-mask bit layout: load slots at mask bits
+     * [n_src, n_src+max_dep_loads), imm bit at n_src+max_dep_loads,
+     * store_data_dep_mask length max_dep_stores.
      */
     uint32_t max_dep_loads = 0;
     uint32_t max_dep_stores = 0;
@@ -458,12 +410,51 @@ struct InsnTemplate {
     bool                  lane_parallel = false;
 };
 
+/*
+ * Decoded template profile block (format §6).  Run-aggregated,
+ * PGO-style metadata; pure annotation, never required for replay.
+ */
+struct InsnProfileInfo {
+    uint64_t memops_cp = 0, memops_wp = 0;        /* item 3 */
+    uint8_t  pat_cp = 0, pat_wp = 0;              /* item 4: CST_PAT_* */
+    bool     addr_cp = false, addr_wp = false;    /* item 5 */
+    bool     has_cp_bounds = false;               /* item 6 */
+    bool     has_wp_bounds = false;
+    uint64_t lo_cp = 0, hi_cp = 0;
+    uint64_t lo_wp = 0, hi_wp = 0;
+};
+
+/* Per terminal-branch-target taken/not-taken counts, parsed 1:1 with
+ * Template::target_pcs (the target identities live in the template
+ * header, the counts here in the profile block). */
+struct BranchTargetCount {
+    uint64_t taken_cp = 0,  nottaken_cp = 0;
+    uint64_t taken_wp = 0,  nottaken_wp = 0;
+};
+
+struct TemplateProfileInfo {
+    uint64_t exec_cp = 0, exec_wp = 0;            /* item 1 */
+    /* item 2 — per-target counts for the BB's terminal branch,
+     * aligned with Template::target_pcs.  fall_through_pc is NOT
+     * here; it is the template header's. */
+    std::vector<BranchTargetCount> targets;
+    std::vector<InsnProfileInfo>   insns;         /* size == insns */
+};
+
 struct Template {
     uint32_t                  template_id = 0;
     uint64_t                  start_pc = 0;
-    uint64_t                  fall_through_pc = 0;
+    uint64_t                  fall_through_pc = 0; /* not-taken edge   */
+    /* Terminal-branch target identities (header).  Uniform layout:
+     *   empty            -> last insn is not a branch
+     *   size 1           -> non-indirect branch; [0] is the taken edge
+     *   size k           -> indirect/return: distinct CP-observed
+     *                       targets.  Per-target counts are in
+     *                       profile.targets, same order/length. */
+    std::vector<uint64_t>     target_pcs;
     std::string               symbol_name;
     std::vector<InsnTemplate> insns;
+    TemplateProfileInfo       profile;
 };
 
 /* ===== Encoding maps + initial regfile (per-segment header) ===== */
@@ -481,6 +472,9 @@ struct EncodingMaps {
     std::unordered_map<uint64_t, std::string> wp_event_flag;
     std::unordered_map<uint64_t, std::string> metaflags;
     std::unordered_map<uint64_t, std::string> dep_block_flag;
+    /* Template-profile self-description (format §6). */
+    std::unordered_map<uint64_t, std::string> mem_access_pattern;
+    std::unordered_map<uint64_t, std::string> profile_flag;
 };
 
 /* ===== Parsed header ===== */

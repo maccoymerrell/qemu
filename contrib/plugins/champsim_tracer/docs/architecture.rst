@@ -156,6 +156,46 @@ If trace size or runtime is a problem:
   biggest single trace-size knob.
 * **``wp=0``** if the consumer doesn't model speculation.
 
+Hot-path micro-optimisations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The encoder and per-callback paths carry several non-obvious
+optimisations.  Each replaced a profiled hot spot; the "obvious"
+simpler form measurably regresses, so treat these as load-bearing:
+
+* **TLS is expensive here.**  The plugin is ``dlopen``'d, so every
+  ``thread_local`` access (``g_wp_state``, the ``g_stats`` macro)
+  goes through ``__tls_get_addr`` under the general-dynamic TLS
+  model (~10 ns each; ~3 % of runtime, dominated by the per-memop
+  callback).  Hot paths cache the TLS slot in a local once before
+  loops / critical sections instead of re-touching it.
+* **``RawBuf`` not ``GByteArray``.**  The per-entry encoder scratch
+  uses an inlined-append ``RawBuf``; ``g_byte_array_append`` was
+  ~1.5 % of total runtime (a glib call per ULEB byte).  Capacity
+  grows 2× and never shrinks (reuse-the-largest-scratch).
+* **Field-state cache indexed by ``template_id``.**  A flat vector
+  keyed by the dense ``template_id`` replaced a per-entry glib hash
+  lookup that profiled at ~10 % on mcf.
+* **``field_id`` → slot via a 1024-entry LUT**, replacing an
+  eight-branch chain that was ~2.6 % at ~80 M calls.
+* **``template_static`` skip.**  Instruction-encoding families
+  (opcode, branch type, insn bytes, flags, immediate, size) equal
+  their template default for every entry, so they never emit a
+  record; probing them anyway was ~50 % of per-slot cost on
+  full-config mcf.
+* **Narrow vs wide value paths.**  Families whose value fits in
+  ``u64`` (counts, addresses, encoding fields, lane masks) compare
+  two ``u64`` s in registers and only materialise a 512-bit value
+  when the field actually changed; only ``LOAD_DATA`` /
+  ``STORE_DATA`` / ``DST_REG`` take the genuinely-wide path.
+* **Reg-handle pointer cache.**  A direct-mapped TLS cache keyed by
+  ``QemuRegKey*`` identity (one stable instance per template
+  reg-name) skips the glib-hash + ``strcmp`` chain that was ~7–9 %
+  on register-heavy workloads with ``regdata=1``.
+
+These are the canonical examples of code that looks like dead
+weight but is not: profile before "simplifying" any of them.
+
 .. _multi-vcpu:
 
 Multi-vCPU semantics
@@ -174,12 +214,12 @@ the trace stream:
   process.  Each ENTRY record is tagged with a
   ``thread_id`` (set by the most recent ``BODY_TAG_THREAD_SWITCH``)
   so consumers can reconstruct per-vCPU sub-streams by filtering.
-* **``thread_id`` is a monotonic per-segment counter.**  The first
-  vCPU the segment observes is ``thread_id=0``; the second
-  distinct vCPU becomes ``thread_id=1``, and so on.  The mapping
-  resets at every segment start.  ``thread_id`` is *not* the QEMU
-  ``cpu_index`` — it's a stable trace-local label so the wire
-  format doesn't need to grow with the host's vCPU count.
+* **``thread_id`` is the guest vCPU index, verbatim.**  Each ENTRY
+  records ``cpu_index`` directly as its ``thread_id`` — there is no
+  remapping table and no per-segment renumbering, so the value is
+  stable for the whole run.  Each segment's body opens with an
+  explicit ``BODY_TAG_THREAD_SWITCH`` naming the starting thread;
+  there is no per-segment thread state to reset.
 * **``icount`` is per-vCPU.**  The plugin maintains one instruction
   counter per QEMU vCPU.  Segment-window comparisons (``start=N``
   / ``stop=N``, simpoint windows) consult the firing vCPU's
@@ -213,22 +253,21 @@ Practical implications:
   records are emitted only when the firing vCPU differs from the
   previous body record's vCPU.  Single-threaded workloads pay
   zero per-block thread-id overhead.
-* **Field-state delta encoding is per-thread (v1.10+).**  Each
+* **Field-state delta encoding is per-thread.**  Each
   thread maintains its own ``FieldStateTable``, so an ENTRY's
   delta-stream values are computed against the firing thread's
-  prior emission rather than the cross-thread sequence.  Without
-  this, a thread switch between two unrelated BBs would force
-  every per-instruction field to re-encode against the other
-  thread's residual state, defeating delta compression on
-  multi-vCPU workloads.
+  prior emission rather than the cross-thread sequence.  This
+  keeps delta compression effective on multi-vCPU workloads: a
+  thread switch between two unrelated BBs does not force every
+  per-instruction field to re-encode against the other thread's
+  residual state.
 * **Initial register files ride with the body stream.**  Before a
   thread's first ``BODY_TAG_ENTRY`` in a segment, the writer emits
   a ``BODY_TAG_REGFILE`` record carrying that thread's full
-  register file as absolute values.  The header's encoding map no
-  longer carries an initial-regfile blob (that mechanism worked
-  for the install-time vCPU but couldn't represent threads that
-  came online mid-segment).  v1.9 readers see a magic mismatch and
-  refuse to decode v1.10 traces.
+  register file as absolute values.  The header's encoding map
+  carries no initial-regfile blob; the body-stream record
+  represents threads that come online mid-segment, which a
+  header-resident blob bound to the install-time vCPU cannot.
 
 .. _tb-vs-true-bb:
 
@@ -249,7 +288,7 @@ the page-boundary check), and TBs are keyed in QEMU's translation
 cache by ``(pc, cs_base, flags, cflags)`` so the same code at the
 same PC can have multiple distinct translations alive at once.  The
 plugin sees one TB per ``vcpu_tb_trans`` callback, with one
-``vcpu_tb_exec`` per execution.  TBs we've observed are stored in
+``vcpu_tb_exec`` per execution.  Observed TBs are stored in
 ``tb_map_`` (the *fragment* cache), keyed by TB start_pc.
 
 **True basic block (true BB)** is the program-architectural unit:
@@ -463,12 +502,12 @@ because the answer is "we deliberately do this and here's why":
 
 *BBs always end in a branch.*  Per :doc:`/format`, ``bb_map_`` only
 holds true basic blocks: the run from a branch target up to the next
-branch.  The WP simulator now traces *past* in-flight faults precisely
-to preserve this invariant — see step 2g above.  Earlier revisions
-committed truncated faulted BBs and triggered "differing insn
-sequence" warnings on the next CP commit at the same start_pc; if you
-ever re-introduce mid-stream commits, the warning in
-``commit_true_bb`` will scream.
+branch.  The WP simulator traces *past* in-flight faults precisely
+to preserve this invariant — see step 2g above.  Committing a
+truncated faulted BB would trigger a "differing insn sequence"
+warning on the next CP commit at the same start_pc; if you ever
+introduce mid-stream commits, the warning in ``commit_true_bb``
+will scream.
 
 *REP-prefixed x86 string instructions fan out per iteration.*  An x86
 ``REP MOVS`` executes N times against architectural memory.  The
@@ -485,15 +524,13 @@ branch.
 
 CP-side capture is straightforward: each iteration's memops attach to
 that iteration's own body entry (1 load + 1 store on REP MOVS, 1 store
-on REP STOS, etc.), so slotted families ``CST_FID_LOAD_ADDR*`` /
-``CST_FID_STORE_ADDR*`` rarely exceed 0..15 even on long REP runs and
-the ``CST_FID_EXTRA_LOAD_ADDR`` / ``CST_FID_EXTRA_STORE_ADDR`` overflow
-vectors are reserved for genuinely wide single-instruction memops
-(AVX-512 gather/scatter etc.).  The WP path is more restrictive:
-``MemAccessRecorder::record`` caps WP-side memops at
-``CST_FID_SLOT_COUNT == 16`` per instruction and silently drops the
-rest, because the WP simulator's spec mode can iterate ``REP``
-arbitrarily many times against a sandboxed memory.  The matching
+on REP STOS, etc.), so the slotted families ``CST_FID_LOAD_ADDR*`` /
+``CST_FID_STORE_ADDR*`` stay well within their 0..63 range even on
+long REP runs.  ``MemAccessRecorder::record`` caps per-instruction
+memops at ``CST_FID_SLOT_COUNT`` = 64 and drops the rest — there is
+no overflow vector — which also bounds the WP simulator's spec mode,
+where ``REP`` can iterate arbitrarily many times against a sandboxed
+memory.  The matching
 forward-progress guard inside the WP loop catches the related case
 where spec-mode ``REP`` returns from ``exec_tb`` without advancing
 PC and would otherwise spin forever.
@@ -519,6 +556,37 @@ afterwards.
 pulls ``<cctype>``, which goes through QEMU's ``include/qemu/ctype.h``
 shadow that breaks libstdc++'s ``using ::isalnum;`` declarations.  We
 keep ``GMutex`` everywhere to avoid the build-time hazard.
+
+*TB-flush longjmp hazard.*  During WP execution
+``tb_gen_code()`` may call ``tb_flush()`` on a full code buffer,
+which ``longjmp`` s past ``simulate_wrong_path_ext``'s cleanup.
+The ``vcpu_tb_flush`` callback must reset the ``g_wp_state``
+fields itself or ``vcpu_tb_exec`` stays permanently suppressed
+(``in_progress`` never clears); it also drops the partial CP chain,
+since splicing pre- and post-flush fragments would fabricate a BB.
+
+*Segment-generation stale-fragment guard.*  Switching segments
+calls ``clear_bb_map()``, which drops the owning ``unique_ptr`` s
+so any ``BBTemplate*`` held in another thread's in-flight chain
+dangles.  ``reset_segment_local_state`` bumps a monotonic
+``g_segment_generation``; every chain stamps the generation on each
+``append_fragment`` and self-resets on mismatch, so one thread can
+reset segment-local state without reaching into other threads'
+``thread_local`` chains.  ``vcpu_tb_exec`` independently
+re-validates ``prev_tb_tmpl`` via ``find_tb_template``.
+
+*The async writer exists to protect guest timing.*  Without it the
+~64 KiB kernel pipe buffer is the only slack between the QEMU CPU
+thread and a ``popen``'d compressor (``xz -T0`` etc.); every
+compressor stall would block the CPU thread and deform the guest
+workload's timing.  It is an SPSC chunked queue (~64 MiB in
+flight), one per ``TraceSegment``.
+
+*cap_mode is resolved lazily.*  The Capstone architecture is fixed
+at install from ``target_name``, but the mode may introspect the
+guest binary via ``qemu_plugin_path_to_binary()``, which needs a
+live vCPU context — so it is resolved on the first
+``vcpu_init_cb``, not at install.
 
 *Register IDs are 8-bit.*  ``GenericRegId`` reserves the full
 0..254 range and 255 is the count sentinel.  If your ISA needs more
@@ -558,8 +626,8 @@ callback reads the base / index registers at exec time to compute
 is funneled through ``MemAccessRecorder::record_synthetic_load`` so
 it shows up in the ``LOAD_ADDR[0]`` slot the same way a normal load
 would.  This relies on the ``scale`` (x86 SIB) and
-``shift_type`` / ``shift_amount`` (AArch64) fields the plugin added
-to ``qemu_plugin_operand`` — see :doc:`extending`.  WP-side capture
+``shift_type`` / ``shift_amount`` (AArch64) fields the plugin's
+QEMU base adds to ``qemu_plugin_operand`` — see :doc:`extending`.  WP-side capture
 is suppressed by ``CF_MEMI_ONLY``; that's intentional, because the
 suppressed insns generate no architectural memops to begin with.
 

@@ -1,36 +1,18 @@
 /*
  * ChampSim Tracer offline tools — body walker / delta replay.
  *
- * Streams cst::DecodedEntry values out of a memory-mapped trace's
- * body section by walking the unified delta stream and rebuilding
- * the per-(template, insn-position, field-id) state across entries.
+ * Streams cst::DecodedEntry values out of a trace's body section by
+ * walking the unified delta stream and rebuilding the per-(template,
+ * insn-position, field-id) state across entries.
  *
- * ===== Embedding in a downstream simulator =====
- *
- * The "rippable bundle" needed to consume .cst traces in another
- * project is:
- *
- *     cst_common.h       — wire-format types (Header, Template,
- *                          DecodedEntry, Wide, ...)
- *     cst_reader.h       — pull-mode byte reader + Source interface
- *     cst_format.h/.cc   — .cst container open (POSIX mmap + ustar
- *                          + optional decompressor subprocess) plus
- *                          parse_header / parse_templates
- *     cst_decode.h/.cc   — this file: BodyWalker + decode_field_delta
- *                          + instructions_from_entry
- *     cst_objdump.h/.cc  — OPTIONAL.  Capstone-backed --objdump
- *                          column.  Builds as a no-op stub without
- *                          -DCST_HAVE_CAPSTONE, so dropping it onto
- *                          a build that doesn't link capstone still
- *                          compiles + links cleanly.
- *
- * The entire bundle is plain C++17 + (for cst_format.cc) a small set
- * of POSIX entry points (mmap/fork/wait/pipe).  No QEMU plugin API,
- * no glib, no project headers beyond the listed files.  Consumers
- * who want to feed the walker from their own byte source (e.g. an
- * in-memory buffer pre-fetched by a job harness) can construct
- * Reader directly via Reader(const uint8_t *, size_t, size_t) and
- * skip cst_format.cc's subprocess decompressor.
+ * Rippable bundle for consuming .cst traces elsewhere: cst_common.h
+ * (wire types), cst_reader.h (pull reader + Source), cst_format.h/.cc
+ * (container open + parse_header), cst_decode.h/.cc (this file:
+ * BodyWalker + instructions_from_entry), cst_objdump.h/.cc (OPTIONAL
+ * --objdump; no-op stub without -DCST_HAVE_CAPSTONE).  Plain C++17 +
+ * a small POSIX set for cst_format.cc; no QEMU/glib.  Consumers can
+ * feed the walker from their own byte source via Reader(const
+ * uint8_t *, size_t, size_t) and skip the subprocess decompressor.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -47,22 +29,13 @@
 namespace cst {
 
 /*
- * FieldStateTable storage layout (mirrors the writer's
- * BodyStreamState::cp_field_state, see champsim_tracer_output.cc):
- *
- *   FieldStateTable.blocks  : vector indexed by template_id
- *   FieldStateBlock.values  : flat (n_insns * FIELD_STATE_SLOT_COUNT)
- *                              Wides.  Slot index for a given fid is
- *                              field_state_slot_index(fid); see the
- *                              decoder .cc for the mapping table.
- *   FieldStateBlock.gens    : per-cell generation; cells "exist" only
- *                              when gens[idx] == table.generation.
- *                              Letting the table bump its generation
- *                              invalidates every cell in O(1).
- *
- * Replaces the prior unordered_map<u64, Wide> design (~10% of total
- * decode time in hashtable lookups).  Direct array indexing is a
- * load + compare per cell. */
+ * FieldStateTable storage (mirrors the writer's
+ * BodyStreamState::cp_field_state in champsim_tracer_output.cc):
+ * blocks indexed by template_id; values is a flat
+ * (n_insns * FIELD_STATE_SLOT_COUNT) Wide array; gens is per-cell
+ * generation — a cell "exists" only when gens[idx]==table.generation,
+ * so bumping the generation invalidates every cell in O(1).  Replaces
+ * an unordered_map<u64,Wide> (~10% of decode time in hash lookups). */
 /* Layout matches FIELD_STATE_SLOT_COUNT in champsim_tracer_output.cc:
  *   3 singletons (N_LOADS, N_STORES, METAFLAGS) + 5 * FID_SLOT_COUNT
  *   (slotted families: load_addr/store_addr/load_data/store_data/
@@ -103,11 +76,8 @@ struct DecodedRegfile {
     std::vector<RegfileSlot>  regs;
 };
 
-/* Structural counts surfaced after walk() completes.  Lets consumers
- * sanity-check writer cadence (one REGFILE per (segment, thread); at
- * least one IFRAME every N entries; no THREAD_SWITCH on single-vCPU
- * traces; no atomics on synthetic non-atomic programs) without
- * having to re-walk the body. */
+/* Structural counts surfaced after walk(), so consumers can
+ * sanity-check writer cadence without re-walking the body. */
 struct BodyStats {
     uint64_t cp_entries        = 0;
     uint64_t wp_entries        = 0;
@@ -219,17 +189,11 @@ private:
 };
 
 /*
- * Fan a DecodedEntry out into a sequence of per-instance Instruction
- * containers.  Order: every CP insn of the parent BB in template
- * order (CP), then for each WP entry in chain order every insn of
- * that WP's template (WP).  Per-insn dyn_params / reg_snaps /
- * metaflags are filtered down to just the relevant insn.  Branch
- * target templates are resolved when the trailing CP / WP insn
- * carries a recognised direct branch immediate.
- *
- * Renderers and simulators that prefer "one instruction at a time"
- * walk the returned vector; the walker-level DecodedEntry is no
- * longer needed once the fan-out is built.
+ * Fan a DecodedEntry into per-instance Instructions: CP insns in
+ * template order, then each WP entry's insns in chain order.  Per-insn
+ * dyn_params / reg_snaps / metaflags are filtered to that insn; branch
+ * targets resolved when the trailing insn carries a recognised direct
+ * branch immediate.
  */
 std::vector<Instruction> instructions_from_entry(
     const DecodedEntry &entry,

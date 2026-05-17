@@ -329,8 +329,23 @@ static inline void *tlb_vaddr_to_host(CPUArchState *env, abi_ptr addr,
                                       MMUAccessType access_type, int mmu_idx)
 {
 #ifdef CONFIG_PLUGIN
-    if (access_type == MMU_DATA_STORE &&
-        unlikely(env_cpu(env)->plugin_spec_mode)) {
+    /*
+     * During plugin speculative (wrong-path) execution, refuse the
+     * trapless host-pointer fast path for *every* access type.  In
+     * linux-user g2h() is just guest_base + addr with no mapping
+     * check, so on the wrong path — where address registers hold
+     * speculative garbage — a caller would otherwise (stores) write
+     * real guest memory, escaping the per-vCPU spec-store sandbox,
+     * or (loads) dereference an unmapped host pointer and SIGSEGV
+     * the emulator instead of taking a guest fault.  Returning NULL
+     * forces the slow cpu_{ld,st}*_mmuidx_ra path: stores land in
+     * the sandbox, loads fault as guest exceptions the wrong-path
+     * simulator already handles.  ISA-generic — covers every
+     * target's bulk/host-pointer helpers (ARM FEAT_MOPS, x86 string
+     * ops, vector gather/scatter, ...), not just the one that
+     * exposed it.
+     */
+    if (unlikely(env_cpu(env)->plugin_spec_mode)) {
         return NULL;
     }
 #endif

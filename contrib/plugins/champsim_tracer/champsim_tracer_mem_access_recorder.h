@@ -1,12 +1,9 @@
 /*
  * Wrong-Path Tracing Plugin — memory access recorder.
  *
- * Holds the per-vCPU correct-path memop accumulator (cp_mem_accesses)
- * and the read scratch used to capture mem-data values via
- * qemu_plugin_read_memory_vaddr.  The QEMU mem callback funnels into
- * this recorder; routing between the CP buffer and the WP buffer
- * (owned by wp.cc, lifetime spans one wrong-path simulation) happens
- * inside record() based on wp_in_progress.
+ * Holds the per-vCPU correct-path memop accumulator and the mem-data
+ * read scratch.  The QEMU mem callback funnels here; record() routes
+ * to the CP buffer or the WP buffer (owned by wp.cc) by wp_in_progress.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -36,8 +33,7 @@ public:
     void record_synthetic_load(uint64_t vaddr, uint64_t insn_pc);
 
     /* CP buffer accessors used by vcpu_tb_exec.  The CP buffer is a
-     * thread_local std::vector that lazy-grows on first push; no
-     * explicit pre-allocation step is needed. */
+     * thread_local std::vector that lazy-grows on first push. */
     size_t cp_count() const;
     void clear_cp();
 

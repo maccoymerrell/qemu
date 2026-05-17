@@ -77,23 +77,17 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
                                uint64_t vaddr,
                                uint64_t insn_pc)
 {
-    /* WP path always records the access ADDRESS so the consumer sees
-     * the full memory footprint of the speculative path; the
-     * enable_wp_mem_data flag below gates the per-access VALUE capture
-     * only.  Addresses are typically the larger half of the
-     * compression-friendly delta stream anyway and are what most
-     * consumers (cache simulators, prefetcher studies) need.
+    /* WP path always records the access ADDRESS (full speculative
+     * footprint); enable_wp_mem_data gates only the VALUE capture.
      *
-     * The per-instruction memop cap stays unconditional: it's a wire-
-     * format constraint (CST_FID_SLOT_COUNT slots per insn) and a
-     * loop-bound for spec-mode REP iterations that don't advance PC.
+     * The per-insn memop cap is unconditional: a wire-format
+     * constraint (CST_FID_SLOT_COUNT slots/insn) and a loop bound for
+     * spec-mode REP iterations that don't advance PC.
      *
-     * Cache `g_wp_state` once.  The plugin .so is dlopen'd, so the
-     * thread_local lives in the general-dynamic TLS model and each
-     * access goes through __tls_get_addr — profiling showed ~3 % of
-     * runtime in TLS resolution, much of it from this per-memop
-     * callback (called millions of times per trace).
-     */
+     * Cache g_wp_state once: the dlopen'd .so puts the thread_local in
+     * the general-dynamic TLS model, so each access otherwise goes
+     * through __tls_get_addr (~3% of runtime, mostly this per-memop
+     * callback). */
     WPThreadState &wp = g_wp_state;
     if (wp.in_progress) {
         if (insn_pc == wp.cur_insn_pc) {
@@ -189,12 +183,9 @@ void MemAccessRecorder::drain_cp_into_dyn_params(
     std::vector<DynParam> &dyn_params,
     const BBTemplate *bb_tmpl)
 {
-    /*
-     * memops are recorded in execution order; insns within a BB execute
-     * sequentially, so insn_pc is monotonically non-decreasing across
-     * memops of a single entry.  Walk the template's insn_pcs[] in
-     * lockstep to assign insn_index.
-     */
+    /* memops are in execution order and insn_pc is monotonically
+     * non-decreasing across an entry's memops, so walk the template's
+     * insn_pcs[] in lockstep to assign insn_index. */
     unsigned int idx = 0;
     unsigned int n_insns = bb_tmpl ? bb_tmpl->n_insns : 0;
     for (const WPMemAccess &acc : tls_cp_mem_accesses) {
@@ -215,18 +206,11 @@ void MemAccessRecorder::drain_cp_into_dyn_params(
 
 void MemAccessRecorder::cleanup_current_thread()
 {
-    /* tls_cp_mem_accesses is a thread_local vector.  We clear() it
-     * here for symmetry with the tls_mem_read_buf release below, but
-     * deliberately DO NOT call shrink_to_fit().  This function runs
-     * from plugin_exit (atexit) before the TLS destructors fire; on
-     * real workloads the CP buffer can be MiB-sized (e.g. one REP
-     * STOSB iterating millions of times records millions of memops),
-     * and at that size glibc backs the allocation with a direct mmap.
-     * Forcing a free at atexit-time has been observed to SIGSEGV deep
-     * in __libc_free during late process teardown, presumably because
-     * some heap-management state is already torn down.  The TLS
-     * destructor naturally walks the vector's destructor afterwards
-     * and frees the buffer cleanly. */
+    /* clear() only — deliberately NOT shrink_to_fit().  Runs from
+     * plugin_exit (atexit) before TLS destructors fire.  The CP buffer
+     * can be MiB-sized (mmap-backed by glibc); forcing a free here has
+     * been seen to SIGSEGV in __libc_free during late teardown.  The
+     * TLS destructor frees it cleanly afterwards. */
     tls_cp_mem_accesses.clear();
     if (tls_mem_read_buf) {
         g_byte_array_unref(tls_mem_read_buf);

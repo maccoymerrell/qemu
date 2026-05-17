@@ -24,18 +24,11 @@
 /*
  * Execute wrong-path basic blocks starting from @wrong_target.
  *
- * Flow per iteration:
- *   1. Execute one full TB at current PC via qemu_plugin_exec_tb().
- *      This triggers vcpu_tb_trans (template creation) and vcpu_mem_cb
- *      (memory access recording), but NOT vcpu_tb_exec or inline stores.
- *   2. Look up the template created by vcpu_tb_trans.
- *   3. Build a WPBBEntry from the template and collected memory accesses.
- *   4. Decide the next PC: not-taken for conditional branches, natural
- *      execution for unconditional/call/return.
- *   5. Repeat until instruction depth reached or fault.
- *
- * Returns the WPBBEntry chain by value; callers move it into
- * BodyEntry::wp_entries.
+ * Per iteration: exec one TB via qemu_plugin_exec_tb() (triggers
+ * vcpu_tb_trans + vcpu_mem_cb, not vcpu_tb_exec/inline stores), look up
+ * its template, build a WPBBEntry, pick next PC, repeat until depth or
+ * fault.  Returns the WPBBEntry chain by value (callers move it into
+ * BodyEntry::wp_entries).
  */
 std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                                uint64_t correct_target,
@@ -45,13 +38,10 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     (void)branch_pc;
     (void)correct_target;
 
-    /* Cache the per-thread Stats reference once.  The g_stats macro
-     * expands to thread_stats_get(), which calls __tls_get_addr —
-     * profiling showed ~1% of total time spent in TLS resolution
-     * from this function alone (10+ stats bumps per WP chain).
-     * Hold the reference in a stack slot and bump fields directly.
-     * Named "stats" rather than the conventional "s" to avoid
-     * shadowing inner `s` loop indices below. */
+    /* Cache the per-thread Stats ref once: g_stats expands to a
+     * thread_stats_get()/__tls_get_addr call, ~1% of total time from
+     * this function alone (10+ bumps per WP chain).  Named "stats" to
+     * avoid shadowing inner `s` loop indices. */
     Stats &stats = thread_stats_get();
     Stats *hist = g_current_hist_bucket;
 
@@ -94,13 +84,11 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     qemu_plugin_set_pc(wrong_target);
 
     /*
-     * Per-insn accumulator for the BB currently being built.  Spec mode
-     * forces CF_SINGLE_STEP|1 at EXECUTION time, but the
-     * template returned by find_template(pre_pc) may be a multi-insn
-     * cached translation from CP (translated under different cflags).
-     * Only insn[0] of that template actually executed.  We therefore
-     * accumulate per-step (1 insn each) into raw arrays and commit a
-     * true BB at each branch fire via commit_true_bb().
+     * Per-insn accumulator for the BB being built.  Spec mode forces
+     * CF_SINGLE_STEP|1 at execution time, but find_template(pre_pc) may
+     * return a multi-insn CP-cached translation (different cflags) where
+     * only insn[0] executed.  Accumulate per-step (1 insn each) into raw
+     * arrays and commit a true BB at each branch fire via commit_true_bb().
      */
     std::vector<uint64_t>     bb_pcs;
     std::vector<uint8_t>      bb_sizes;
@@ -123,13 +111,11 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     uint64_t bb_start_pc = 0;
     const char *bb_symbol_name = nullptr;
 
-    /* Fault metadata for the in-progress BB.  Spec-mode faults inside
-     * a BB no longer terminate it: per basic_block.md a true BB
-     * always ends in a branch, so the WP simulator now skips past the
-     * faulting insn and keeps accumulating until the natural branch
-     * end fires.  bb_first_fault_idx records where the FIRST fault
-     * happened so the WPBBEntry can mark which uop speculation would
-     * actually squash on. */
+    /* Fault metadata for the in-progress BB.  A true BB always ends in
+     * a branch (basic_block.md), so a spec-mode fault inside a BB does
+     * not terminate it: WP skips past the faulting insn and accumulates
+     * until the natural branch end.  bb_first_fault_idx marks the uop
+     * speculation would actually squash on. */
     bool bb_has_fault = false;
     uint32_t bb_first_fault_idx = 0;
 
@@ -179,19 +165,12 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         BBTemplate *tmpl = nullptr;
         bool tb_ok;
 
-        /* Forward-progress guard.  In spec mode an instruction whose
-         * architectural completion writes back through speculative
-         * state (e.g. an x86 REP iter where RCX decrements but the
-         * sandboxed memory write keeps PC anchored at the same insn)
-         * can return from exec_tb without advancing PC.  When that
-         * happens the WP loop reissues exec_tb on the same pre_pc
-         * indefinitely, the dedup logic skips appending so
-         * appended_insns stays 0, sim_insns is bumped only by the
-         * "+= 1 fallback" but bb_pcs is non-empty so the OR keeps
-         * the loop alive, and we eventually NULL-deref some
-         * downstream QEMU bookkeeping.  Force PC past the offending
-         * insn after CST_FID_SLOT_COUNT same-PC iterations — same
-         * threshold as the per-insn memop cap. */
+        /* Forward-progress guard.  An x86 REP iter in spec mode can
+         * decrement RCX while the sandboxed write keeps PC anchored, so
+         * exec_tb returns without advancing PC; dedup skips appending
+         * and the loop spins forever until a downstream NULL-deref.
+         * Force PC past the offending insn after CST_FID_SLOT_COUNT
+         * same-PC iterations (same threshold as the per-insn memop cap). */
         if (pre_pc == prev_pre_pc) {
             same_pre_pc_count++;
         } else {
@@ -222,23 +201,14 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         g_mutex_unlock(&data_lock);
 
         /*
-         * Reg-data capture for WP is post-exec (destination values).
-         * We do NOT take a wide regfile snapshot here — that would
-         * read every architectural register on every WP TB, which
-         * dominates trace time on regdata=1 + wp=1 runs.  The
-         * per-insn live path (capture_insn_snaps_live below, called
-         * AFTER exec_tb) reads only the dst regs each insn actually
-         * writes — typically 1 per insn — using the same
-         * read_into_snap calls the CP path uses.
-         *
-         * Imprecision: when CF_SINGLE_STEP doesn't reduce the
-         * fragment to one insn (cached translations) and multiple
-         * insns in the fragment write to the same architectural
-         * register, only the final post-fragment value is visible at
-         * read time.  This is identical to the imprecision a
-         * post-fragment wide snap would have, so dropping the wide
-         * path costs nothing in correctness — only saves the
-         * per-WP-TB scan over the entire register file.
+         * WP reg-data capture is post-exec, per-insn live: no wide
+         * regfile snapshot here (would read every arch reg on every WP
+         * TB, dominating regdata=1+wp=1 runs).  capture_insn_snaps_live
+         * below (after exec_tb) reads only the dst regs each insn writes.
+         * When CF_SINGLE_STEP doesn't reduce to 1 insn and multiple
+         * insns write the same reg, only the final post-fragment value
+         * is visible — identical to a wide post-fragment snap, so
+         * dropping the wide path costs no correctness.
          */
         tb_ok = qemu_plugin_exec_tb();
 
@@ -257,21 +227,18 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
 
         /*
          * exec_tb may run multiple insns of a CP-cached translation
-         * (CF_SINGLE_STEP only affects new translations).  When the
-         * TB ran to completion (tb_ok=true), the whole template
-         * executed; on fault, only insns up to and including the
-         * faulting one were issued by speculation, so we cap
-         * @n_executed_in_tmpl there.  The faulting insn itself is
-         * included so consumers that care about the squashed uop
-         * (its dyn_params, the fault_insn_index marker) have it.
+         * (CF_SINGLE_STEP only affects new translations).  tb_ok means
+         * the whole template executed; on fault only insns up to and
+         * including the faulting one were issued, so cap
+         * @n_executed_in_tmpl there.  The faulting insn is included so
+         * consumers see the squashed uop (dyn_params, fault_insn_index).
          */
         uint32_t n_executed_in_tmpl = tmpl->n_insns;
         if (!tb_ok) {
             uint64_t fault_pc = qemu_plugin_get_pc();
             uint32_t fault_idx_in_tmpl = UINT32_MAX;
-            /* Direct match: fault_pc IS one of the TB's architectural
-             * insn PCs (the canonical "speculation faulted on insn
-             * k before retiring it" case). */
+            /* Direct match: fault_pc IS one of the TB's insn PCs
+             * (speculation faulted on insn k before retiring it). */
             for (uint32_t i = 0; i < tmpl->n_insns; i++) {
                 if (tmpl->insn_pcs[i] == fault_pc) {
                     fault_idx_in_tmpl = i;
@@ -279,16 +246,11 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                 }
             }
             /* Post-completion match: fault_pc == insn_pc + insn_size
-             * for some insn k.  This happens when QEMU advances PC
-             * past insn k as part of executing it (canonical for
-             * syscall: the SVC/ECALL retires architecturally, then
-             * the syscall handler fails out of spec mode and we
-             * return with PC = SVC_PC + insn_size).  Insn k is the
-             * one that "caused" the fault — it's the syscall (or
-             * other privilege/exception-raising terminator) that
-             * triggered the spec-mode exit.  Without this fallback
-             * the chain truncates short and the exit-block tail of
-             * any wrong path becomes invisible. */
+             * for some insn k (QEMU advanced PC past insn k as part of
+             * executing it — canonical for syscall: SVC/ECALL retires,
+             * the handler fails out of spec mode, PC = SVC_PC + size).
+             * Without this fallback the chain truncates and every wrong
+             * path's exit-block tail is invisible. */
             if (fault_idx_in_tmpl == UINT32_MAX) {
                 for (uint32_t i = 0; i < tmpl->n_insns; i++) {
                     uint64_t post = tmpl->insn_pcs[i] + tmpl->insn_sizes[i];
@@ -339,10 +301,8 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                             &tmpl->insn_bytes[i * MAX_INSN_BYTES] + MAX_INSN_BYTES);
             bb_fields.push_back(tmpl->insn_fields[i]);
 
-            /* WP-side per-execution attribution: mirror the CP walk in
-             * vcpu_tb_exec, scoped to non-duplicate WP insns so the
-             * counts reflect what the WP simulator actually appended.
-             * `stats` and `hist` are cached at function entry. */
+            /* WP-side per-execution attribution: mirrors the CP walk in
+             * vcpu_tb_exec, scoped to non-duplicate WP insns. */
             {
                 const InsnFields *f = &tmpl->insn_fields[i];
                 stats.wp_insns_by_opcode[f->opcode]++;
@@ -370,10 +330,8 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                 }
             }
             if (enable_wp_reg_data) {
-                /* Per-insn live read of dst regs from the post-
-                 * fragment architectural state.  Reads only the
-                 * registers this insn actually writes (typically 1),
-                 * not the entire register file. */
+                /* Per-insn live read of only the dst regs this insn
+                 * writes from post-fragment state, not the whole file. */
                 g_reg_snaps.capture_insn_snaps_live(cpu_index, tmpl, i,
                                                     bb_reg_snaps);
             }
@@ -384,29 +342,19 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             : 0;
 
         /*
-         * Budget accounting: spec-mode exec_tb runs the full TB
-         * starting at pre_pc to its natural end (branch / page-cross).
-         * cpu_plugin_exec_tb sets cflags = CF_NO_GOTO_TB|CF_NO_GOTO_PTR|
-         * CF_MEMI_ONLY|CF_SINGLE_STEP — note CF_COUNT_MASK is zero, so
-         * tb_gen_code uses max_insns = TCG_MAX_INSNS.  CF_SINGLE_STEP
-         * is only about preventing rep-prefixed insns from looping
-         * internally on x86; it does NOT cap TB length to 1 insn.
-         *
-         * Charge AT LEAST 1 toward the budget per exec_tb call even
-         * when the appended insns were all dedup'd against the prior
-         * tail.  Without this, a self-looping single-insn TB (an x86
-         * REP instruction in spec mode advances RCX-by-one per call
-         * without advancing PC) would dedup every iteration into
-         * appended_insns=0 and the loop would spin forever — eating
-         * QEMU plugin bookkeeping until something deeper NULL-defs.
+         * Budget accounting.  CF_SINGLE_STEP only stops rep-prefixed
+         * insns from looping internally on x86; it does NOT cap TB
+         * length to 1 insn (CF_COUNT_MASK is zero, so tb_gen_code uses
+         * max_insns = TCG_MAX_INSNS).  Charge AT LEAST 1 per exec_tb
+         * even when every appended insn dedup'd against the prior tail,
+         * else a self-looping single-insn REP TB spins forever (see the
+         * forward-progress guard above).
          */
         sim_insns += appended_insns ? appended_insns : 1;
 
-        /* Attribute mem accesses to insns within the just-appended
-         * fragment by matching the recorded insn_pc.  Only walk the
-         * @n_executed_in_tmpl prefix — mem callbacks past the fault
-         * never fired, so attributing them to phantom insns past
-         * fault_idx would point at insns that aren't in bb_pcs. */
+        /* Attribute mem accesses to fragment insns by matching insn_pc.
+         * Only walk the @n_executed_in_tmpl prefix — mem callbacks past
+         * the fault never fired and those insns aren't in bb_pcs. */
         for (size_t m = mem_start_idx; m < g_wp_state.mem_accesses.size(); m++) {
             const WPMemAccess &acc = g_wp_state.mem_accesses[m];
             uint16_t insn_idx = (uint16_t)bb_idx_base;
@@ -431,11 +379,9 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             }
         }
 
-        /* Guard against an appended-nothing iteration (every insn of
-         * the just-executed TB was a dedup of the prior tail).  In
-         * that case bb_pcs is unchanged from before this iteration;
-         * if it's also empty we can't read bb_fields.back(), and
-         * there's no in-progress BB to mark anyway. */
+        /* Guard against an appended-nothing iteration (every insn
+         * dedup'd against the prior tail): bb_pcs may be empty, so
+         * don't read bb_fields.back(). */
         bool ends_in_branch = false;
         if (!bb_pcs.empty()) {
             size_t last_local = bb_pcs.size() - 1;
@@ -444,18 +390,14 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         }
 
         if (!tb_ok) {
-            /* Trace past the fault.  bb_pcs already has insns 0..fault
-             * appended (the @n_executed_in_tmpl cap above stopped at
-             * the faulting insn).  Mark fault metadata for the BB
-             * we'll eventually commit at the natural branch end, then
-             * skip past the faulting insn so subsequent exec_tbs
-             * don't re-fault on the same address.
-             *
-             * If the faulting insn IS the natural BB terminator
-             * (e.g., a syscall classified as BRANCH_SYSCALL_TYPE that
-             * faulted), ends_in_branch below catches it and the
-             * normal commit path handles it — with bb_has_fault
-             * propagating to the WPBBEntry.  bb_map_ stays clean:
+            /* Trace past the fault.  bb_pcs has insns 0..fault (the
+             * @n_executed_in_tmpl cap stopped at the faulting insn).
+             * Mark fault metadata for the BB committed at the natural
+             * branch end, then skip past the faulting insn so later
+             * exec_tbs don't re-fault.  If the faulting insn IS the
+             * branch terminator (e.g. a faulting BRANCH_SYSCALL_TYPE
+             * syscall) ends_in_branch below catches it and the normal
+             * commit path handles it with bb_has_fault propagating;
              * only branch-bounded true BBs ever reach commit_true_bb. */
             uint64_t fault_pc = qemu_plugin_get_pc();
 
@@ -472,17 +414,15 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                     ? 0 : (uint32_t)(bb_pcs.size() - 1);
             }
 
-            /* Poison the faulting PC against unbounded re-faults
-             * within this WP simulation.  Subsequent iterations that
-             * jump back to this PC will early-exit the chain. */
+            /* Poison the faulting PC: later iterations that jump back
+             * to it early-exit the chain. */
             poisoned_targets.insert(fault_pc);
 
             if (ends_in_branch) {
-                /* Fault occurred on a branch-classified insn (e.g.,
-                 * syscall).  Fall through to the normal commit path
-                 * below; bb_has_fault carries the speculation-squash
-                 * marker.  This is also where the WP chain naturally
-                 * terminates after a syscall. */
+                /* Fault on a branch-classified insn (e.g. syscall):
+                 * fall through to the normal commit path; bb_has_fault
+                 * carries the squash marker.  WP chain naturally
+                 * terminates here after a syscall. */
             } else {
                 if (repeated_fault_pc >= 16) {
                     early_exit = true;
@@ -505,12 +445,11 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             continue;
         }
 
-        /* Branch fired: commit completed BB.  bb_has_fault carries
-         * any earlier fault that happened within this BB; the BB
-         * itself is still a true branch-bounded BB in the sense of
-         * basic_block.md, so it goes into bb_map_ unconditionally.
-         * The WPBBEntry's fault flag tells the consumer that
-         * speculation would have squashed at fault_insn_index. */
+        /* Branch fired: commit completed BB.  Still a true
+         * branch-bounded BB (basic_block.md) so it goes into bb_map_
+         * unconditionally; bb_has_fault carries any earlier in-BB fault
+         * and the WPBBEntry's fault flag tells the consumer speculation
+         * would have squashed at fault_insn_index. */
         uint64_t post_pc = qemu_plugin_get_pc();
         repeated_fault_pc = 0;
         last_fault_pc = UINT64_MAX;
@@ -527,6 +466,44 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             enable_reg_data ? bb_regnames.data() : nullptr,
             bb_symbol_name, fall_through);
         g_mutex_unlock(&data_lock);
+
+        /*
+         * Record the terminal-branch taken edge for NON-indirect
+         * branches found on the wrong path.  Direct/conditional/
+         * unconditional taken targets are architecturally pre-defined,
+         * so legitimate even observed speculatively (@post_pc is the
+         * actual successor).  Indirect/return targets depend on
+         * speculative register state and are NOT legitimate on the
+         * wrong path — left to the CP-only BranchRecord pool.  Only
+         * fill when CP hasn't resolved it (CP stays authoritative;
+         * value identical anyway).
+         */
+        if (bb_tmpl && bb_tmpl->taken_pc == 0 && !bb_fields.empty()) {
+            const InsnFields *lf = &bb_fields.back();
+            bool indirect =
+                lf->branch_type == BRANCH_INDIRECT_JUMP ||
+                lf->branch_type == BRANCH_RETURN;
+            if (!indirect) {
+                bool cond = lf->branch_type == BRANCH_COND_DIRECT ||
+                            (lf->branch_type == BRANCH_DIRECT_JUMP &&
+                             lf->branch_conditional);
+                uint64_t taken;
+                if (post_pc != fall_through) {
+                    taken = post_pc;            /* WP took the branch */
+                } else if (cond && lf->has_immediate &&
+                           (uint64_t)lf->immediate != fall_through) {
+                    /* Fell through a conditional → taken side is the
+                     * resolved target (same value the CP resolver
+                     * uses), not the raw-relative immediate. */
+                    taken = (uint64_t)lf->immediate;
+                } else {
+                    taken = post_pc;            /* uncond → fall_through */
+                }
+                if (taken != 0) {
+                    bb_tmpl->taken_pc = taken;
+                }
+            }
+        }
 
         wp_chain.push_back(make_wp_entry(bb_tmpl,
                                          bb_has_fault,

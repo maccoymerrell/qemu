@@ -2,17 +2,8 @@
  * ChampSim Tracer offline tools — Capstone-backed objdump-style disasm
  * (impl).
  *
- * Two builds:
- *
- *   -DCST_HAVE_CAPSTONE  real backend; this TU includes
- *                        <capstone/capstone.h> and emits cs_disasm_iter
- *                        per insn.
- *   (undefined)          stub backend; the methods compile to a small
- *                        constant return-false, no capstone include
- *                        and no link dependency.  Lets downstream
- *                        re-users compile this file unchanged in
- *                        environments without capstone — the --objdump
- *                        column is silently disabled at run time.
+ * -DCST_HAVE_CAPSTONE: real backend (cs_disasm_iter per insn).
+ * Undefined: stub returning false, no capstone include or link dep.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */

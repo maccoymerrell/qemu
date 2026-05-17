@@ -12,10 +12,7 @@
 #include "champsim_tracer_reg_handle_cache.h"
 #include "champsim_tracer_stats.h"
 
-/*
- * Direct register ID lookup: O(1) array index into the per-ISA
- * RegClassification table.
- */
+/* O(1) array index into the per-ISA RegClassification table. */
 static const RegClassification *lookup_reg_class(uint16_t cap_id)
 {
     if (cap_id == 0 || cap_id >= active_reg_table_size) {
@@ -30,15 +27,12 @@ static inline bool qemu_reg_key_valid(const QemuRegKey *key)
 }
 
 /*
- * Reverse index: GenericRegId → QemuRegKey for the active ISA.
- * Built once at plugin-install time by walking active_reg_table; used
- * to recover the per-element QemuRegKey for multi-reg encodings (RISC-V
- * V*M* tuples, future register-group additions on other ISAs) so their
- * source-register value snapshots can read each constituent register
- * via the GDB feature/name pair.  Without this, multi-reg encodings
- * would land in src_regs[]/dst_regs[] correctly but their values
- * wouldn't be captured under regdata=1 because the multi-reg path
- * passed nullptr for the QemuRegKey.
+ * Reverse index GenericRegId → QemuRegKey, built once at install by
+ * walking active_reg_table.  Recovers the per-element QemuRegKey for
+ * multi-reg encodings (RISC-V V*M* tuples) so each constituent reg's
+ * value is captured under regdata=1 — without it multi-reg operands
+ * land in src/dst correctly but their values aren't read (the multi-reg
+ * path passed nullptr for the QemuRegKey).
  */
 static QemuRegKey g_qemu_reg_by_gen[REG_ID_COUNT];
 
@@ -65,9 +59,9 @@ void build_qemu_reg_reverse_index(void)
         if (rc->reg_id >= REG_ID_COUNT) {
             continue;
         }
-        /* First singleton row wins — multiple Capstone aliases (e.g.
-         * x86 AH/AL/AX/EAX/RAX all → REG_GPR0) share one underlying
-         * QemuRegKey, and any of them is correct for value reads. */
+        /* First singleton row wins — Capstone aliases (x86
+         * AH/AL/AX/EAX/RAX → REG_GPR0) share one QemuRegKey; any is
+         * correct for value reads. */
         if (!qemu_reg_key_valid(&g_qemu_reg_by_gen[rc->reg_id])) {
             g_qemu_reg_by_gen[rc->reg_id] = rc->qemu_reg;
         }
@@ -102,8 +96,7 @@ void capture_initial_regfile(unsigned int cpu_index,
         memset(snap.bytes, 0, sizeof(snap.bytes));
 
         /* No vCPU context yet (install-time start_trace_segment): pin
-         * the generic ID without a live value.  Decoder still gets the
-         * (gen_id, name) mapping, just with width_bytes=0. */
+         * the generic ID with width_bytes=0 (no live value). */
         if (cpu_index != (unsigned int)-1) {
             struct qemu_plugin_register *handle =
                 g_reg_handle_cache.lookup(cpu_index, key);
@@ -125,11 +118,9 @@ void capture_initial_regfile(unsigned int cpu_index,
 }
 
 /*
- * Returns the src_regs[] slot that ends up holding @reg_id (either
- * the existing slot if the reg was already present — dedup — or the
- * newly-allocated slot), or UINT8_MAX when the reg was skipped
- * (REG_NONE / table full).  The slot index lets callers feed
- * structural bookkeeping like HAS_ADDR address-dep masks.
+ * Returns the src_regs[] slot holding @reg_id (existing on dedup, else
+ * newly allocated), or UINT8_MAX when skipped (REG_NONE / table full).
+ * The slot index feeds HAS_ADDR address-dep masks.
  */
 static inline uint8_t add_src_reg(InsnFields *f, InsnRegNames *refs,
                                   uint8_t reg_id, const QemuRegKey *qemu_reg)
@@ -177,19 +168,15 @@ static inline void add_dst_reg(InsnFields *f, InsnRegNames *refs,
 }
 
 /*
- * For pointer-stable QemuRegKey identity per logical register, every
- * call into add_{src,dst}_reg routes through qemu_reg_for_generic(),
- * which returns the singleton pointer in g_qemu_reg_by_gen[].  The
- * RegClassification's own .qemu_reg may live at a different address
- * (active_reg_table backing) but holds an identical (feature, name)
- * pair, since g_qemu_reg_by_gen[gen] was populated from one such row.
- */
-/*
- * Returns a mask of src_regs[] slots that ended up holding the
- * registers behind @cap_id.  A single Capstone reg id can expand
- * into multiple aliases (rc->n_regs > 0), each landing in its own
- * slot; the caller may need any/all of those slots when building
- * structural address-dep masks for HAS_ADDR.
+ * Pointer-stable QemuRegKey identity: add_{src,dst}_reg routes through
+ * qemu_reg_for_generic(), returning the g_qemu_reg_by_gen[] singleton
+ * (RegClassification's own .qemu_reg may differ in address but holds an
+ * identical (feature, name) pair).
+ *
+ * Returns a mask of src_regs[] slots holding the registers behind
+ * @cap_id.  One Capstone reg id can expand into multiple aliases
+ * (rc->n_regs > 0), each in its own slot; the caller needs them for
+ * HAS_ADDR address-dep masks.
  */
 static inline uint64_t add_src_cap_reg(InsnFields *f, InsnRegNames *refs,
                                        uint16_t cap_id)
@@ -234,23 +221,19 @@ static inline void add_dst_cap_reg(InsnFields *f, InsnRegNames *refs,
     }
     add_dst_reg(f, refs, rc->reg_id, qemu_reg_for_generic(rc->reg_id));
     /*
-     * Mark this insn as an integer-flags writer so the wire-format
-     * encoder can emit a side-channel CST_FID_METAFLAGS record with
-     * the canonical Z/N/C/V/P byte derived from the architectural
-     * REG_FLAGS dst snap.  Gated on the per-ISA RegClassification's
-     * .is_int_flags marker — set only on x86 EFLAGS / AArch64 NZCV
-     * rows; never on x86 FPSW, mips DSP-flag co-processor regs, or
-     * any ISA without an integer flags reg.
+     * Mark integer-flags writer so the encoder emits a CST_FID_METAFLAGS
+     * record (Z/N/C/V/P from the REG_FLAGS dst snap).  Gated on the
+     * per-ISA .is_int_flags marker — set only on x86 EFLAGS / AArch64
+     * NZCV, never x86 FPSW / mips DSP-flag / flagless ISAs.
      */
     if (rc->is_int_flags) {
         f->writes_int_flags = true;
     }
 }
 
-/* OR @lane into every src_regs[] slot the Capstone reg @cap_id maps
- * to.  Used by the per-operand vector lane-mask assignment so a
- * scalar (non-vec) operand never gets a lane mask (its slots stay
- * 0) — only the vec-register operands the caller iterates. */
+/* OR @lane into every src_regs[] slot @cap_id maps to.  Per-operand
+ * lane-mask assignment: scalar operands keep slot mask 0, only the
+ * vec-register operands the caller iterates get lanes. */
 static void assign_src_lane(InsnFields *f, uint16_t cap_id, uint64_t lane)
 {
     const RegClassification *rc = lookup_reg_class(cap_id);
@@ -292,11 +275,9 @@ static void warn_unknown_instruction(uint64_t pc, const char *reason,
     g_mutex_lock(&unknown_warn_lock);
     g_stats.unknown_insn_warnings++;
 
-    /* Surface the first unknown instruction on stderr so the run
-     * isn't silently missing classifications, then go quiet (the
-     * per-insn detail keeps flowing to the .unknown_warnings.log
-     * file, and the exit summary's "Unknown-instruction warnings"
-     * line is the running total). */
+    /* Surface the first unknown instruction on stderr, then go quiet
+     * (per-insn detail still goes to .unknown_warnings.log; the exit
+     * summary carries the running total). */
     static bool warned_once = false;
     if (!warned_once) {
         warned_once = true;
@@ -323,9 +304,8 @@ static void warn_unknown_instruction(uint64_t pc, const char *reason,
 }
 
 /*
- * Classify an instruction via direct insn_id array lookup (O(1)).
- * Returns the table row (or nullptr if out of range / no table) so
- * callers can also access the optional .refine callback.
+ * Classify via direct insn_id array lookup (O(1)).  Returns the table
+ * row (nullptr if out of range / no table) for the .refine callback.
  */
 static const InsnClassification *classify_insn_id(
     const qemu_plugin_insn_info *info,
@@ -392,39 +372,20 @@ void decode_detail_to_generic(uint64_t pc,
     }
 
     /*
-     * x86 REP/REPNZ prefix promotes the instruction to a self-looping
-     * branch.  Each iteration of the architectural REP loop is a
-     * tracer-defined true-BB: the chain assembler ends the BB here
-     * and starts the next one at the same PC, so the trace
-     * structurally identifies the loop instead of treating it as one
-     * BB with a variable memop count.
+     * x86 REP/REPNZ promotes the insn to a self-looping branch.  Each
+     * architectural REP iteration is a tracer-defined true-BB (chain
+     * assembler ends the BB and restarts at the same PC) so the trace
+     * structurally identifies the loop instead of one BB with a
+     * variable memop count.  Branch type is BRANCH_REP (distinct from
+     * BRANCH_COND_DIRECT) so consumers see self-loop semantics
+     * (target=self-PC, fall-through=next-PC) at template-parse time.
+     * Conditional: the loop exits when ECX==0 or the REPZ/REPNZ compare
+     * breaks.  info->has_rep is x86-only (false elsewhere → no-op).
      *
-     * Branch type is BRANCH_REP — distinct from BRANCH_COND_DIRECT —
-     * so consumer simulators can tell at template-parse time that
-     * this is a self-loop (target=self-PC, fall-through=next-PC)
-     * rather than a generic conditional direct branch.  Predictors
-     * modelling REP don't need to bother with target diversity; the
-     * REP-specific branch type makes the self-loop semantics
-     * obvious in the trace.
-     *
-     * Capstone reports the prefix via info->has_rep on x86 (returns
-     * false on every other ISA, so this is a no-op for those).  The
-     * branch is conditional (the loop exits when ECX == 0 or when
-     * the REPZ/REPNZ comparison breaks).
-     *
-     * rep_{loads,stores}_per_iter capture how many memops the insn
-     * issues per architectural REP iteration.  Derived by counting
-     * Capstone MEM operands' access flags, so the result is
-     * mnemonic-agnostic:
-     *   - MOVS  → 1 load + 1 store
-     *   - CMPS  → 2 loads
-     *   - STOS  → 1 store
-     *   - LODS  → 1 load
-     *   - SCAS  → 1 load
-     *   - INS   → 1 store (port in → mem)
-     *   - OUTS  → 1 load (mem out → port)
-     * These counts let the body emitter fan a single TB-exec's
-     * memop stream into N iteration entries.
+     * rep_{loads,stores}_per_iter = memops per REP iteration, counted
+     * from Capstone MEM operand access flags (mnemonic-agnostic: MOVS
+     * 1L+1S, CMPS 2L, STOS 1S, LODS/SCAS 1L, INS 1S, OUTS 1L).  Lets
+     * the body emitter fan one TB-exec's memop stream into N entries.
      */
     if (info->has_rep) {
         out->branch_type        = BRANCH_REP;
@@ -500,35 +461,25 @@ void decode_detail_to_generic(uint64_t pc,
             break;
         case QEMU_PLUGIN_OP_MEM: {
             /*
-             * Track which src_regs[] slots this MEM operand's
-             * addressing-mode regs (base + index) land in.  The
-             * resulting mask is used to populate
-             * load_addr_dep_mask[k] / store_addr_dep_mask[k] —
-             * structural per-memop "when can this fire?" data the
-             * consumer needs to schedule loads/stores precisely
+             * Track which src_regs[] slots this MEM operand's base +
+             * index addressing regs land in, OR'd together, to populate
+             * load/store_addr_dep_mask[k] — structural per-memop "when
+             * can this fire?" data for precise load/store scheduling
              * (avoid waiting on dst-as-src for RMW forms, etc.).
-             *
-             * add_src_cap_reg returns a mask of slots taken (after
-             * dedup), which we OR together across base + index.
              */
             uint64_t addr_mask = 0;
             addr_mask |= add_src_cap_reg(out, out_names, op->reg_id);
             addr_mask |= add_src_cap_reg(out, out_names, op->index_id);
 
             /*
-             * Count this mem-op against the template-static MAX
-             * load/store totals.  These bound the dep-mask bit
-             * layout: loads occupy mask bits [n_src_regs,
-             * n_src_regs + max_dep_loads) and stores feed into the
-             * store_data_dep_mask[] array of length max_dep_stores.
-             *
-             * Runtime per-iteration counts can be smaller (e.g. a
-             * conditional load that didn't fire) and ride on
-             * CST_FID_N_LOADS / CST_FID_N_STORES, but never larger.
-             *
-             * Some ops (LEA, prefetch hints) carry a MEM operand
-             * whose access flags lack both READ and WRITE — those
-             * never issue a real memop and don't count.
+             * Count against the template-static MAX load/store totals,
+             * which bound the dep-mask layout (loads at bits
+             * [n_src_regs, n_src_regs+max_dep_loads); stores feed
+             * store_data_dep_mask[max_dep_stores]).  Runtime
+             * per-iteration counts can be smaller (conditional load
+             * that didn't fire) via CST_FID_N_LOADS/N_STORES, never
+             * larger.  LEA / prefetch-hint MEM operands lack both
+             * READ and WRITE — no real memop, don't count.
              */
             if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
                 if (out->max_dep_loads < MAX_LOADS) {
@@ -561,32 +512,28 @@ void decode_detail_to_generic(uint64_t pc,
     }
 
     /*
-     * Optional ISA-specific post-classification refinement.  Each row
-     * in the per-ISA mnemonic table may attach a .refine callback that
-     * fixes up opcode/branch_type/etc. based on the operand-walk
-    * result above.  Used for cases where one Capstone insn_id covers
-    * multiple distinct operand encodings or target forms.
+     * Optional ISA-specific post-classification .refine: fixes up
+     * opcode/branch_type/etc. from the operand walk, for when one
+     * Capstone insn_id covers multiple operand encodings / target forms.
      */
     if (cls && cls->refine) {
         cls->refine(info, out);
     }
 
     /*
-     * Optional dependency refinement.  Reads the refined InsnFields
-     * and writes dst_dep_mask[] / store_data_dep_mask[].  Rows that
-     * leave .dep_refine NULL emit no HAS_REG block — the consumer
-     * falls back to all-to-all.  See champsim_tracer_mnemonic_tables.c
-     * for the shared refiner library.
+     * Optional .dep_refine: reads refined InsnFields, writes
+     * dst_dep_mask[] / store_data_dep_mask[].  NULL → no HAS_REG block
+     * (consumer falls back to all-to-all).  Refiner library in
+     * champsim_tracer_mnemonic_tables.c.
      */
     if (cls && cls->dep_refine) {
         cls->dep_refine(info, out);
     }
 
     /*
-     * Lane info — orthogonal to .dep_refine.  Row carries the static
-     * (lane_mask_kind, lane_parallel) classification; we resolve the
-     * baseline mask / source reg from Capstone detail here so the
-     * dep refiners stay focused on dst→src dataflow.
+     * Lane info — orthogonal to .dep_refine.  Row carries static
+     * (lane_mask_kind, lane_parallel); resolve baseline mask / source
+     * reg from Capstone detail here so dep refiners stay dataflow-only.
      */
     if (cls && cls->lane_mask_kind != LANE_MASK_KIND_NONE) {
         /* Instruction-level shape (slot-agnostic); we own the
@@ -640,19 +587,10 @@ void decode_detail_to_generic(uint64_t pc,
     }
 
     /*
-     * Normalize direct-branch immediate to absolute target.
-     *
-     * Capstone's convention differs by arch:
-     *   - x86, ARM64: op->imm holds the resolved absolute target for
-     *     direct (PC-relative-encoded) branches; no fixup needed.
-     *   - RISC-V, MIPS: op->imm holds the raw signed PC-relative offset
-     *     from the branch instruction; we add `pc` to produce the
-     *     absolute target.
-     *
-     * After this step, InsnFields.immediate is always an absolute
-    * branch target for direct conditional / direct unconditional
-    * branches, which lets the WP-target derivation in
-     * champsim_tracer.cc be ISA-agnostic.
+     * Normalize direct-branch immediate to an absolute target so the
+     * WP-target derivation in champsim_tracer.cc is ISA-agnostic.
+     * Capstone convention: x86/ARM64 op->imm is already absolute;
+     * RISC-V/MIPS op->imm is a raw signed PC-relative offset (add pc).
      */
     if (out->has_immediate &&
         isa_properties[trace_isa].pc_relative_branch_imm) {
@@ -667,19 +605,13 @@ void decode_detail_to_generic(uint64_t pc,
 }
 
 /*
- * Synthetic-EA decoder for prefetch / cache-flush / TLB-flush
- * instructions whose canonical TCG translation does not emit a memop.
- * Returns true (and fills @out) when @opcode is one of the new
- * memory-hint classes AND the insn carries a Capstone memory operand
- * we can compute an EA from.  Returns false in every other case;
- * callers should leave @out zeroed.
- *
- * @pc / @insn_size carry the current instruction's PC and length so we
- * can resolve PC-relative base registers (notably x86 RIP-relative,
- * where Capstone reports the encoded displacement and the CPU folds in
- * the *next*-insn PC).  In that case the base reg is dropped and the
- * absolute next-insn-PC is folded into the displacement, which is both
- * correct and avoids a needless register read at exec time.
+ * Synthetic-EA decoder for prefetch / cache-flush / TLB-flush insns
+ * whose TCG translation emits no memop.  Returns true (fills @out) when
+ * @opcode is a memory-hint class AND the insn carries a Capstone MEM
+ * operand we can compute an EA from; false otherwise (@out zeroed).
+ * For x86 RIP-relative (PC-relative base) the base reg is dropped and
+ * the absolute next-insn-PC folded into the displacement — correct and
+ * avoids a needless register read at exec time.
  */
 bool decode_synthetic_ea(const qemu_plugin_insn_info *info,
                          uint8_t opcode,

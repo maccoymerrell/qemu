@@ -11,11 +11,9 @@
 
 #include "champsim_tracer_generic_ids.h"
 
-/* Null-safe string equality (g_strcmp0 replacement).  Defined here
- * rather than in champsim_tracer.h because the per-ISA mnemonic
- * headers (which call it) are pulled in directly by the C TU
- * champsim_tracer_mnemonic_tables.c without going through
- * champsim_tracer.h. */
+/* Null-safe string equality (g_strcmp0 replacement).  Defined here,
+ * not in champsim_tracer.h, because the per-ISA mnemonic headers are
+ * pulled into the C tables TU without it. */
 static inline bool cst_str_eq(const char *a, const char *b)
 {
     if (a == b) {
@@ -28,20 +26,9 @@ static inline bool cst_str_eq(const char *a, const char *b)
 }
 
 /*
- * (OperandCaptureKind removed — Capstone structured operand detail
- *  now provides operand type (REG/IMM/MEM) and access (READ/WRITE)
- *  directly, eliminating the need for per-instruction regex capture
- *  semantic tags.)
- */
-
-/*
- * Mnemonic entry flags.
- *
- * Only flags whose semantics cannot be derived from Capstone detail
- * are retained.  Capstone now provides operand access (READ/WRITE),
- * implicit regs_read/regs_write, and group membership (RET,
- * JUMP, BRANCH_REL, INT) for all ISAs, so most of the original
- * per-instruction flag bits are no longer needed.
+ * Mnemonic entry flags.  Only flags whose semantics Capstone detail
+ * cannot supply are kept (Capstone provides operand access, implicit
+ * regs, and group membership for all ISAs).
  */
 enum MnemonicFlags {
     MF_NONE             = 0,
@@ -53,12 +40,11 @@ enum MnemonicFlags {
 };
 
 /*
- * Register classification: maps a Capstone register ID to one generic ID,
- * or to a small alias list when Capstone uses one enum value for a register
- * group.  Tables are indexed directly by the Capstone enum value.  qemu_reg
- * is the QEMU plugin register descriptor key for register-value reads, or
- * { NULL, NULL } when the Capstone register has no single readable QEMU
- * register.
+ * Register classification: Capstone register ID -> one generic ID (or
+ * a small alias list when Capstone groups regs under one enum value).
+ * Indexed by the Capstone enum value.  qemu_reg is the QEMU register
+ * descriptor key, or { NULL, NULL } when there's no single readable
+ * QEMU register.
  */
 #define MAX_REG_ALIASES 8
 
@@ -73,56 +59,41 @@ typedef struct {
     uint8_t regs[MAX_REG_ALIASES];     /* GenericRegId[] */
     QemuRegKey qemu_reg;               /* qemu_plugin_reg_descriptor key */
     /*
-     * Set true on the *one* row whose Capstone reg id maps to the
-     * ISA's integer-flags register (x86 EFLAGS, AArch64 NZCV).  When
-     * the generic decoder sees this flag during dst-reg classification
-     * it mirrors a REG_METAFLAGS slot alongside REG_FLAGS so consumers
-     * get a canonical Z/N/C/V/P byte without per-ISA bit math.  Stays
-     * false on every other row, including non-integer flags writers
-     * (x86 FPSW → REG_FLAGS but not the int-flags reg) and ISAs
-     * without an integer flags reg (RISC-V, MIPS).
+     * True on the *one* row whose Capstone reg id is the ISA's
+     * integer-flags register (x86 EFLAGS, AArch64 NZCV); drives the
+     * REG_METAFLAGS mirror (see generic_ids.h metaflags note).  False
+     * on all other rows, including non-integer flags writers (x86
+     * FPSW) and ISAs without an integer flags reg.
      */
     bool is_int_flags;
 } RegClassification;
 
 /*
- * Decoded per-instruction generic fields.
- *
- * Lives in this header (rather than champsim_tracer.h) so per-ISA
- * mnemonic refiners — compiled in the C tables TU — can read and
- * mutate fields directly without needing the rest of the tracer
- * internals.
+ * Decoded per-instruction generic fields.  In this header (not
+ * champsim_tracer.h) so the C tables-TU refiners can mutate fields
+ * without the rest of the tracer internals.
  */
 /*
- * Per-insn template-static caps.  These bound the static InsnFields
- * arrays and the dep-mask bit-position layout; they must match the
- * wire format's per-family FID slot ceiling (CST_FID_SLOT_COUNT) so
- * a template can carry a slot for every dst/load/store the static
- * instruction can produce.  Bumped to 64 alongside the FID widening
- * in commit 3f9ea8bf12.
- *
- * Source regs aren't FID-slotted (sources are template-fixed; the
- * runtime varies only outputs and addresses) but the dep-mask bit
- * layout uses MAX_SRC_REGS as the lower-band boundary, so it grows
- * in lockstep.
+ * Per-insn template-static caps.  Bound the static InsnFields arrays
+ * and the dep-mask bit layout; must match the wire format's per-family
+ * FID slot ceiling (CST_FID_SLOT_COUNT).  Source regs aren't
+ * FID-slotted but the dep-mask layout uses MAX_SRC_REGS as the
+ * lower-band boundary, so it grows in lockstep.
  */
 #define MAX_SRC_REGS 64
 #define MAX_DST_REGS 64
 /*
- * Per-insn template-static memop caps.  Match CST_FID_SLOT_COUNT so
- * any static insn that fits the FID load/store ranges also fits its
- * template-time dep-mask arrays.  Real static instructions stay well
- * below these (ARM LD4/ST4 maxes at 4); the cap is generous because
- * the storage cost is per InsnFields slot, not per emitted byte.
+ * Per-insn template-static memop caps.  Match CST_FID_SLOT_COUNT.
+ * Real insns stay well below (ARM LD4/ST4 maxes at 4); the cap is
+ * generous since cost is per InsnFields slot, not per emitted byte.
  */
 #define MAX_STORES   64
 #define MAX_LOADS    64
 
 /*
- * Lane-mask dispatch kinds.  Stored in InsnFields.lane_mask_kind so
- * the exec-time FID extractor (champsim_tracer_output.cc) can compute
- * the current lane bitmap with no ISA branching in the hot path —
- * just a small switch.  ISA-specific selection lives in the refiner.
+ * Lane-mask dispatch kinds (InsnFields.lane_mask_kind).  Let the
+ * exec-time FID extractor compute the lane bitmap via a small switch,
+ * no ISA branching in the hot path.  Selection lives in the refiner.
  */
 enum LaneMaskKind {
     LANE_MASK_KIND_NONE        = 0,
@@ -136,16 +107,10 @@ typedef struct InsnFields {
     uint8_t branch_type;            /* BranchType */
     bool    branch_conditional;
     /*
-     * True when this insn's destination set includes the ISA's
-     * integer-flags register (x86 EFLAGS, AArch64 NZCV) — matches
-     * the RegClassification.is_int_flags marker on the per-ISA
-     * mnemonic-header row.  The wire-format encoder reads this bit
-     * and emits a side-channel CST_FID_METAFLAGS record carrying
-     * the canonical Z/N/C/V/P byte derived from the REG_FLAGS dst
-     * snap.  Consumers reasoning about architectural register sets
-     * see the unchanged REG_FLAGS dst slot; the canonical byte
-     * rides the field-delta stream as side data instead of as a
-     * phantom dst-reg slot.
+     * True when this insn writes the ISA's integer-flags register
+     * (matches RegClassification.is_int_flags).  The encoder then
+     * emits a CST_FID_METAFLAGS side-channel record from the REG_FLAGS
+     * dst snap; the REG_FLAGS dst slot itself is unchanged.
      */
     bool    writes_int_flags;
     uint8_t n_src_regs;
@@ -155,129 +120,81 @@ typedef struct InsnFields {
     bool    has_immediate;
     int64_t immediate;
     /*
-     * True when this insn is an architectural atomic / synchronizing
-     * memory op (x86 LOCK-prefixed RMW or XCHG, AArch64 LDXR/STXR and
-     * LDADD/SWP families, RISC-V A extension, MIPS LL/SC).  Drives the
-     * CST_INSN_FLAG_ATOMIC bit on the wire so consumers can model
-     * pipeline serialization without re-deriving it from mnemonic
-     * strings.
+     * True for architectural atomic / synchronizing memory ops (x86
+     * LOCK RMW/XCHG, AArch64 LDXR/STXR & LDADD/SWP, RISC-V A, MIPS
+     * LL/SC).  Drives the CST_INSN_FLAG_ATOMIC wire bit.
      */
     bool    is_atomic;
     /*
-     * Template-static MAX counts.  These are the upper bounds on how
-     * many memory reads and writes the static instruction can issue
-     * *per execution*; the dynamic per-iteration count is conveyed
-     * runtime-side via CST_FID_N_LOADS / CST_FID_N_STORES deltas.
-     *
-     * They also fix the bit layout inside dep masks (see below) so
-     * the consumer can map mask bits to input slots unambiguously.
-     *
-     * Populated by the operand walker at template-build time from
-     * MEM operand access flags.  Carried on the wire in the outer
-     * template header.
+     * Template-static MAX memory read/write counts per execution
+     * (dynamic per-iteration counts ride CST_FID_N_LOADS /
+     * CST_FID_N_STORES deltas).  Also fix the dep-mask bit layout
+     * below.  Populated by the operand walker at template-build time;
+     * carried in the outer template header.
      */
     uint8_t  max_dep_loads;
     uint8_t  max_dep_stores;
     /*
      * Intra-instruction register dataflow (HAS_REG sub-block).
-     * When @has_reg_deps is true, the wire-format encoder emits
-     * CST_INSN_FLAG_HAS_DEP_BLOCK in the template-insn flag byte and
-     * appends n_dst + max_dep_stores ULEB-encoded masks after the
-     * insn bytes.  When false (the default), the template carries
-     * no register-side masks and consumers fall back to the implicit
-     * all-to-all dataflow for that family.
-     *
-     * Populated by the row's optional .dep_refine callback.
+     * @has_reg_deps true -> encoder sets CST_INSN_FLAG_HAS_DEP_BLOCK
+     * and appends n_dst + max_dep_stores ULEB masks; false (default)
+     * -> consumers fall back to implicit all-to-all dataflow.
+     * Populated by the row's optional .dep_refine.
      *
      * Bit layout inside each register/load mask:
      *   bits [0, n_src_regs)                          src_reg[i]
      *   bits [n_src_regs, n_src_regs + max_dep_loads) load_data[i - n_src_regs]
      *   bit  n_src_regs + max_dep_loads               immediate
      *
-     * Mask type is uint64_t so the imm bit fits when both src_regs
-     * and load slots stack up; real instructions don't push close
-     * to that ceiling but the storage cost is template-only.
+     * uint64_t so the imm bit fits when src + load slots stack up.
      */
     bool     has_reg_deps;
     uint64_t dst_dep_mask[MAX_DST_REGS];
     uint64_t store_data_dep_mask[MAX_STORES];
     /*
      * Intra-instruction address dataflow (HAS_ADDR sub-block).
-     * Per-memop "when can this load/store fire" mask: which template
-     * inputs feed its address computation.  Populated structurally
-     * by the operand walker (NOT by .dep_refine) — every MEM operand
-     * the walker encounters contributes a mask saying which src_reg
-     * slots its addressing-mode regs landed in.  Addresses are
-     * computed before any load fires, so the bit layout omits the
-     * load_data slots:
+     * Per-memop mask of which template inputs feed its address
+     * computation.  Populated structurally by the operand walker (NOT
+     * .dep_refine).  Addresses compute before any load fires, so the
+     * layout omits load_data slots:
      *
      *   bits [0, n_src_regs)        src_reg[i]
      *   bit  n_src_regs             immediate
      *
-     * Consumers use these to schedule load/store firing precisely
-     * (avoid waiting on dst-as-src for RMW forms, etc.); refiners
-     * leave them alone.  has_addr_deps trips when at least one MEM
-     * operand was seen.
+     * has_addr_deps trips when at least one MEM operand was seen.
      */
     bool     has_addr_deps;
     uint64_t load_addr_dep_mask[MAX_LOADS];
     uint64_t store_addr_dep_mask[MAX_STORES];
     /*
      * Lane participation (CST_INSN_FLAG_VEC).  Unified runtime path:
-     * the refiner picks a lane_mask_kind and stashes any data it
-     * needs (baseline AND mask, optional source reg).  The exec-time
-     * FID extractor dispatches on lane_mask_kind to compute the
-     * current lane bitmap, then replicates the same value across
-     * every (src/dst/load_data/store_data) lane-mask FID slot for
-     * this insn.
+     * the refiner picks lane_mask_kind + baseline data; the exec-time
+     * FID extractor dispatches on it to compute the lane bitmap and
+     * replicates the value across every (src/dst/load_data/store_data)
+     * lane-mask FID slot.  Runtime-evaluated for ALL ISAs: static-mask
+     * ISAs (x86 / NEON / MSA) return a constant so the delta stream
+     * emits one record then zero bytes; dynamic ISAs (RISC-V V SEW,
+     * x86 EVEX k, AArch64 SVE) emit deltas as the CSR/mask reg moves.
      *
-     * Treating lane mask as runtime-evaluated for ALL ISAs is the
-     * point — for static-mask ISAs (x86 / aarch64 NEON / MIPS MSA)
-     * the dispatch returns the same value every call, so the field-
-     * delta stream emits one record per (template, insn-pos, slot)
-     * at first observation and zero bytes thereafter.  For dynamic
-     * ISAs (RISC-V V SEW changes, x86 EVEX masked variants, AArch64
-     * SVE predicates) the dispatch reads the runtime CSR / mask reg
-     * each call and the stream emits deltas as the value moves.
+     * uint64_t mask = AVX-512 ZMM at 8-bit lanes (64); ULEB on the
+     * wire so common 4/8/16-lane cases stay one byte per slot.
      *
-     * Mask width is uint64_t — enough for AVX-512 ZMM at 8-bit lane
-     * granularity (64 lanes).  On the wire each mask ULEB-encodes,
-     * so common 4/8/16-lane cases stay one byte per slot.
-     *
-     * lane_parallel mirrors CST_INSN_FLAG_LANE_PARALLEL on the wire:
-     *   - set: bit k of dst lanes depends only on bit k of src lanes.
-     *   - clear: lanes touch but cross-couple (shuffles / broadcasts
-     *     / horizontal reductions).
+     * lane_parallel mirrors CST_INSN_FLAG_LANE_PARALLEL: set = dst
+     * lane k depends only on src lane k; clear = cross-coupled
+     * (shuffles / broadcasts / reductions).
      *
      * Four per-operand mask classes, each its own slotted FID family,
-     * all dynamically emitted (delta-encoded, only on value change):
+     * delta-emitted on value change.  src_lane_mask[i] / dst_lane_mask[d]
+     * are stored here; load/store-data lane masks are computed at emit
+     * time from each memop's addr+size vs the access base and
+     * lane_bytes (not stored).
      *
-     *   src_lane_mask[i]        — lanes of src_regs[i] active as a
-     *                             source this execution.
-     *   dst_lane_mask[d]        — lanes of dst_regs[d] active as a
-     *                             destination (may differ from src).
-     *   load_data lane mask     — per load memop, NOT stored here:
-     *                             computed at emit time from the
-     *                             memop's address+size vs the access
-     *                             base and lane_bytes (which lanes
-     *                             take their value from that load).
-     *   store_data lane mask    — per store memop, same, emit-time
-     *                             (which lanes that store drains).
-     *
-     * `lane_mask_kind` decides ONLY where the active-lane value is
-     * read from — nothing else:
-     *   LANE_MASK_KIND_NONE        — non-vec insn (has_vec_lanes off).
-     *   LANE_MASK_KIND_STATIC      — value comes from the instruction
-     *                                (operand layout / lane-selecting
-     *                                immediate).  src/dst masks below
-     *                                are the final per-slot values.
-     *   LANE_MASK_KIND_RISCV_VTYPE — value comes from a register: the
-     *                                RISC-V vl CSR, read at exec.  The
-     *                                src/dst masks here are the
-     *                                structural pattern; the exec gate
-     *                                ANDs in (1 << vl) - 1.
-     *   (room for LANE_MASK_KIND_X86_MASKED_K1 / _AARCH64_SVE_PRED —
-     *    same model, gate read from the EVEX k-mask / SVE predicate.)
+     * lane_mask_kind decides ONLY where the active-lane value reads
+     * from: NONE (non-vec); STATIC (from the instruction — src/dst
+     * masks below are final); RISCV_VTYPE (from the vl CSR at exec —
+     * masks are the structural pattern, gate ANDs in (1<<vl)-1).
+     * Room for X86_MASKED_K1 / AARCH64_SVE_PRED (same model, gate from
+     * EVEX k-mask / SVE predicate).
      */
     bool                  has_vec_lanes;
     bool                  lane_parallel;
@@ -299,14 +216,10 @@ typedef struct InsnFields {
      * predicate reg on AArch64 SVE.  Empty key on STATIC rows. */
     QemuRegKey            lane_mask_source_reg;
     /*
-     * x86 REP / REPNZ string-op metadata.  Non-zero on insns whose
-     * Capstone detail carried info->has_rep; both fields capture the
-     * memops this insn issues *per iteration* (one architectural
-     * REP loop).  Used by the body emitter to fan a single TB-exec
-     * into N iteration entries: iter 1 stays on the parent BB
-     * template, iter 2..N emit on the parent's rep_subtmpl (a
-     * 1-insn self-loop sub-template built at translation time).
-     * Zero on non-REP insns.
+     * x86 REP / REPNZ string-op metadata: memops issued per iteration.
+     * The body emitter fans one TB-exec into N iteration entries (iter
+     * 1 on the parent BB template, 2..N on its rep_subtmpl 1-insn
+     * self-loop sub-template).  Zero on non-REP insns.
      */
     uint8_t  rep_loads_per_iter;
     uint8_t  rep_stores_per_iter;
@@ -314,54 +227,35 @@ typedef struct InsnFields {
 
 
 /*
- * Optional post-classification refiner.
- *
- * Some Capstone insn_ids cover several distinct semantics that only
- * differ in operand encoding (e.g. RISC-V JALR is "indirect branch",
- * "indirect jump", or "ret" depending on rd/rs1).  A row may set
- * .refine to a function that fixes up the decoded InsnFields after
- * the generic operand-walk has populated src_regs/dst_regs/etc.
- *
- * The refiner is ISA-local: it is defined in the per-ISA mnemonic
- * table file and never referenced from the ISA-agnostic decoder.
+ * Optional post-classification refiner.  Some Capstone insn_ids cover
+ * several semantics differing only in operand encoding (e.g. RISC-V
+ * JALR = indirect branch / jump / ret by rd/rs1).  .refine fixes up
+ * the decoded InsnFields after the generic operand-walk.  ISA-local:
+ * defined in the per-ISA table, never referenced by the decoder.
  */
 struct qemu_plugin_insn_info; /* fwd-decl: full type from <qemu-plugin.h> */
 typedef void (*InsnRefineFn)(const struct qemu_plugin_insn_info *info,
                              InsnFields *fields);
 
 /*
- * Optional dependency refiner.
- *
- * Reads what the generic operand-walk and any `.refine` callback have
- * already populated in @fields, then writes dst_dep_mask[] and
- * store_data_dep_mask[], sets n_dep_stores, and flips has_reg_deps.
- *
- * The refiner library is small and shared across ISAs (defined in
- * champsim_tracer_mnemonic_tables.c).  A row may point at one of the
- * shared refiners or supply its own one-off (rare; the typical case
- * picks a shape from the library).  Rows that leave .dep_refine NULL
- * emit no HAS_REG block, which the consumer interprets as the legacy
- * "implicit all-to-all" fallback; the audit script's coverage report
- * flags these so unintentional fallbacks can be promoted to explicit
- * classifications over time.
- *
- * Runs once at template-construction time (per unique PC), not on the
- * hot path during tracing.
+ * Optional dependency refiner.  Reads what the operand-walk and
+ * `.refine` populated, then writes dst_dep_mask[] /
+ * store_data_dep_mask[], sets n_dep_stores, flips has_reg_deps.
+ * Refiner library is small and shared (champsim_tracer_mnemonic_
+ * tables.c).  .dep_refine NULL -> no HAS_REG block -> consumer uses
+ * the legacy implicit all-to-all fallback (the audit coverage report
+ * flags these).  Runs once per unique PC at template build, not hot.
  */
 typedef void (*InsnDepRefineFn)(const struct qemu_plugin_insn_info *info,
                                 InsnFields *fields);
 
 /*
- * Shared refiners (defined in champsim_tracer_mnemonic_tables.c).
- * Per-ISA mnemonic tables reference these directly in row
- * initialisers via `.dep_refine = dep_<name>`.
- *
- * Each refiner targets a *dataflow behavior group* — wide coverage
- * across the operand-shape variants Capstone groups under a single
- * insn id (rr / rm / mr / ri / mi / ...).  A small complementary
- * set of refiners covers the full classification surface; the audit
- * script's classifier picks one refiner per Capstone id that
- * correctly handles every variant of that id.
+ * Shared refiners (champsim_tracer_mnemonic_tables.c), referenced in
+ * rows via `.dep_refine = dep_<name>`.  Each targets a *dataflow
+ * behavior group* — wide coverage across the operand-shape variants
+ * (rr / rm / mr / ri / mi / ...) Capstone groups under one insn id.
+ * A small complementary set covers the full surface; the audit
+ * classifier picks one refiner per Capstone id handling all variants.
  */
 void dep_all_to_all(const struct qemu_plugin_insn_info *info,
                     InsnFields *fields);
@@ -375,24 +269,19 @@ void dep_x86_stack_pop(const struct qemu_plugin_insn_info *info,
                        InsnFields *fields);
 
 /*
- * Instruction-level vector lane shape, derived from the Capstone
- * operand layout + any lane-selecting immediate.  Slot-agnostic: the
- * caller (decode.cc, which owns the operand->slot mapping) applies
- * this per operand.
+ * Instruction-level vector lane shape from the Capstone operand
+ * layout + lane-selecting immediate.  Slot-agnostic; the caller
+ * (decode.cc) applies it per operand.
  *
- *   kind == LANE_SHAPE_NONE     no usable lane width (consumer falls
- *                               back to all-to-all).
- *   kind == LANE_SHAPE_UNIFORM  packed op (PADDD, NEON ADD, RISC-V
- *                               vadd.vv): every vec reg lane is live.
- *   kind == LANE_SHAPE_INSERT   element insert (PINSR/INSERTPS): the
- *                               vec reg WRITE touches only lane_sel;
- *                               the same reg READ supplies the
- *                               pass-through lanes (all but lane_sel).
- *   kind == LANE_SHAPE_EXTRACT  element extract (PEXTR/EXTRACTPS):
- *                               the vec reg READ touches only lane_sel.
+ *   NONE     no usable lane width (consumer falls back to all-to-all).
+ *   UNIFORM  packed op (PADDD, NEON ADD, vadd.vv): all lanes live.
+ *   INSERT   element insert (PINSR/INSERTPS): WRITE touches only
+ *            lane_sel; same-reg READ supplies the other lanes.
+ *   EXTRACT  element extract (PEXTR/EXTRACTPS): READ touches only
+ *            lane_sel.
  *
- * full_mask is (1<<total_lanes)-1 (or ~0 when the element width is a
- * runtime CSR, RISC-V V, gated later by lane_active_gate).
+ * full_mask = (1<<total_lanes)-1 (~0 for runtime-CSR widths, gated
+ * later).
  */
 enum LaneShapeKind {
     LANE_SHAPE_NONE = 0,
@@ -411,15 +300,11 @@ LaneShape lane_shape_from_operands(
     const struct qemu_plugin_insn_info *info, uint8_t lane_mask_kind);
 
 /*
- * Instruction classification entry: maps a Capstone insn_id directly
- * to GenericOpcode + BranchType + MnemonicFlags via designated-initializer
- * arrays indexed by the Capstone enum value.  Eliminates all string-based
- * mnemonic matching (hash tables, regex, prefix stripping, caches).
- *
- * `.refine` and `.dep_refine` are independent optional callbacks.
- * When both are set, `.refine` runs first (it may rewrite
- * src_regs/dst_regs/has_immediate etc.), then `.dep_refine` reads the
- * refined fields to produce dep masks.
+ * Instruction classification entry: Capstone insn_id ->
+ * GenericOpcode + BranchType + MnemonicFlags via arrays indexed by
+ * the Capstone enum value.  No string-based mnemonic matching.
+ * .refine and .dep_refine are independent; when both set, .refine
+ * runs first then .dep_refine reads the refined fields.
  */
 typedef struct {
     uint8_t         opcode;      /* GenericOpcode */
@@ -428,28 +313,19 @@ typedef struct {
     InsnRefineFn    refine;      /* optional, NULL if unused */
     InsnDepRefineFn dep_refine;  /* optional, NULL → emit no HAS_REG block */
     /*
-     * Vector lane info.  Orthogonal to .dep_refine — the dep maps
-     * (dst_dep_mask, store_data_dep_mask, etc.) are static and the
-     * existing refiners (dep_all_to_all, dep_passthrough, ...) work
-     * for vector ops just as they do for scalar.  These fields drive
-     * the dynamic lane-mask FID stream and the static
-     * CST_INSN_FLAG_LANE_PARALLEL wire bit:
+     * Vector lane info, orthogonal to .dep_refine (dep maps are
+     * static; existing refiners work for vec ops too).  Drives the
+     * dynamic lane-mask FID stream and CST_INSN_FLAG_LANE_PARALLEL:
      *
-     *   lane_mask_kind   — LaneMaskKind value.  NONE on non-vec rows;
-     *                      STATIC for x86 / aarch64 NEON / MIPS MSA
-     *                      where Capstone surfaces the lane count
-     *                      statically; RISCV_VTYPE for RISC-V V where
-     *                      the dispatch reads vl at exec time.
-     *   lane_parallel    — sets CST_INSN_FLAG_LANE_PARALLEL on the
-     *                      wire.  True for element-wise vec arith
-     *                      (VADDPS, VPADDD, NEON FADD.4S, ...);
-     *                      false for cross-lane ops (shuffles,
-     *                      broadcasts, reductions).
+     *   lane_mask_kind  — NONE (non-vec); STATIC (x86 / NEON / MSA,
+     *                     Capstone surfaces the lane count); RISCV_
+     *                     VTYPE (RISC-V V, dispatch reads vl at exec).
+     *   lane_parallel   — sets the wire bit.  True for element-wise
+     *                     vec arith; false for cross-lane ops.
      *
-     * decode.cc populates InsnFields.lane_mask_* from these rows
-     * after .dep_refine runs.  For LANE_MASK_KIND_STATIC the
-     * baseline is derived from the first vector REG operand's
-     * (size, lane_bytes) at template-build time.
+     * decode.cc populates InsnFields.lane_mask_* after .dep_refine;
+     * STATIC baseline from the first vec REG operand's (size,
+     * lane_bytes) at template build.
      */
     uint8_t         lane_mask_kind;
     bool            lane_parallel;
@@ -465,8 +341,7 @@ typedef struct {
 
 /* Classification table selectors (indexed by TraceISA).  Explicit
  * `extern` so the const namespace-scope arrays get external linkage
- * under C++ (default would be internal).  The matching declarations
- * in the consumer #else branch use the same `extern`. */
+ * under C++ (default is internal); the #else declarations match. */
 extern const RegClassification *const isa_reg_class[];
 const RegClassification *const isa_reg_class[] = {
     [TRACE_ISA_UNKNOWN] = NULL,
@@ -514,57 +389,43 @@ extern const unsigned isa_insn_class_size[TRACE_ISA_MIPS + 1];
 
 
 /*
- * Static ISA property table.
+ * Static ISA property table.  One row per ISA; adding an ISA needs
+ * only a new row.
  *
- * Concentrates every ISA-specific knob into one place so that adding a
- * new ISA requires only a new row rather than scattered switch arms.
- *
- *   branch_delay_slots       — number of delay-slot instructions after a
- *                              branch (0 for most ISAs, 1 for MIPS)
- *   pc_relative_branch_imm   — true if Capstone reports the immediate of
- *                              direct branches as a *relative* offset
- *                              from the branch PC (RISC-V, MIPS).  False
- *                              if Capstone resolves it to an absolute
- *                              target (x86, ARM64).  decode_detail_to_
- *                              generic() normalizes the field so
- *                              InsnFields.immediate is always the
- *                              absolute target on the wire.
- *   include_implicit_regs    — true to fold Capstone's implicit
- *                              regs_read/regs_write lists into the
- *                              decoded source/destination sets.  False
- *                              for ISAs (RISC-V, MIPS) whose operand
- *                              walk already covers everything the
- *                              implicit lists would, so including them
- *                              would double-count.
- *   target_prefixes          — NULL-terminated list of QEMU target_name
- *                              prefixes that map to this ISA
- *   cap_arch                 — Capstone cs_arch enum value (CS_ARCH_*),
- *                              or -1 if unsupported
- *   cap_mode_for_target      — derives a Capstone cs_mode bitmask
- *                              (CS_MODE_*) from target_name (handles e.g.
- *                              RISC-V 32/64 split, MIPS endianness)
+ *   branch_delay_slots     — delay-slot insns after a branch (1 MIPS,
+ *                            else 0)
+ *   pc_relative_branch_imm — Capstone reports direct-branch imm
+ *                            relative to the branch PC (RISC-V, MIPS)
+ *                            vs absolute (x86, ARM64); the decoder
+ *                            normalizes so the wire imm is always
+ *                            absolute.
+ *   include_implicit_regs  — fold Capstone implicit regs_read/write
+ *                            into src/dst.  False where the operand
+ *                            walk already covers them (RISC-V, MIPS;
+ *                            else double-count).
+ *   target_prefixes        — QEMU target_name prefixes for this ISA
+ *   cap_arch               — Capstone CS_ARCH_*, or -1 if unsupported
+ *   cap_mode_for_target    — derives the Capstone cs_mode bitmask
+ *                            from target_name (RISC-V 32/64, MIPS
+ *                            endianness)
  */
 typedef unsigned int (*CapModeForTargetFn)(const char *target_name);
 
 /*
- * Optional per-ISA hook called by RegHandleCache for every QEMU plugin
- * register descriptor.  May insert one or more alias entries into
- * @handles so reg-data lookups via Capstone names resolve to QEMU
- * descriptors registered under different feature/name pairs (currently
- * used for AArch64 SVE z<->v register aliasing).  May be null.
+ * Optional per-ISA hook called by RegHandleCache for every QEMU
+ * register descriptor.  May insert alias entries into @handles so
+ * Capstone-name lookups resolve to differently-registered descriptors
+ * (currently AArch64 SVE z<->v aliasing).  May be null.
  */
 typedef void (*RegAliasInserterFn)(
     GHashTable *handles,
     const qemu_plugin_reg_descriptor *desc);
 
 /*
- * Per-ISA integer-flags → canonical metaflags shuffle.  Takes the
- * raw bytes of the architectural flags register (little-endian,
- * up to 8 bytes — all current ISAs' flag regs fit in a u64) and
- * returns the CST_METAFLAGS_* byte the snap collector ships in
- * REG_METAFLAGS slots.  NULL on ISAs without an integer flags reg,
- * in which case REG_METAFLAGS never lands in any template's
- * dst-reg list and this hook is never called.
+ * Per-ISA integer-flags -> canonical metaflags shuffle.  Takes the
+ * raw flags-register value (little-endian u64) and returns the
+ * CST_METAFLAGS_* byte.  NULL on ISAs without an integer flags reg
+ * (then never called).
  */
 typedef uint8_t (*MetaFlagsMapperFn)(uint64_t raw_flags);
 

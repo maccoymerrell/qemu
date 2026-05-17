@@ -65,9 +65,11 @@ Sample, with ``wp=1,memdata=1,regdata=1`` capture flags:
    ; templates=31
 
    ; ----- BB 3 entry pc=0x401740 insns=12 seq=1 tid=0 -----
+   ; profile: exec_cp=1 exec_wp=0
+   ; target[0]: pc=0x403d50 taken_cp=1 nottaken_cp=0 taken_wp=0 nottaken_wp=0
    0x000000401740 <_start+0x0>: f3 0f 1e fa              nop
    0x000000401744 <_start+0x4>: 31 ed                    xor     %fpr -> %fpr[0x0], %flags[0x202], %mflags[-]
-   0x000000401749 <_start+0x9>: 5e                       pop     %sp -> %gp4[0x1], %sp[0x78b25adff138]  ld(0x78b25adff130)=0x1
+   0x000000401749 <_start+0x9>: 5e                       pop     %sp -> %gp4[0x1], %sp[0x78b25adff138]  ld(0x78b25adff130)=0x1  prof: memops_cp=1 pat_cp=CST_PAT_REGULAR cp=[0x78b25adff130-0x78b25adff130]
    0x000000401751 <_start+0x11>: 50                       push    %gp0, %sp -> %sp[0x78b25adff128]  st(0x78b25adff128)=0x0
    0x00000040175f <_start+0x1f>: 67 e8 eb 25 00 00        jmp     $0x403d50, %sp, %ip -> %sp[0x78b25adff118], %ip[0x403d50]  st(0x78b25adff118)=0x401765
    ; ----- BB 5 entry pc=0x403d50 insns=22 seq=2 tid=0 -----
@@ -127,13 +129,38 @@ separator (the ``status=FAULT@insn<n>`` suffix appears when the
 WP simulator hit a fault on a non-terminating instruction
 inside that chain entry).
 
+The run-aggregated profile block (see :doc:`concepts`,
+*Run-aggregated profile*) is rendered **as part of the BB it
+belongs to**, never as a separate dump.  Two BB-level lines follow
+each ``; ----- BB ... -----`` separator:
+
+* ``; profile: exec_cp=<n> exec_wp=<n>`` — the BB's run totals.
+* ``; target[<k>]: pc=<edge> taken_cp=<n> nottaken_cp=<n>
+  taken_wp=<n> nottaken_wp=<n>`` — one line per terminal-branch
+  taken edge (``k`` indexes the template's target list; the
+  not-taken edge is the BB's ``fall_through``).
+
+Per-instruction profile rides **inline on the instruction's own
+line** as a trailing ``prof: <k>=<v> …`` tag — never clustered at
+the block header.  Only the meaningful fields appear (``memops_cp``
+/ ``memops_wp``, ``pat_cp`` / ``pat_wp`` access-pattern class,
+``addr_cp`` / ``addr_wp`` data-is-address, ``cp=[lo-hi]`` /
+``wp=[lo-hi]`` effective-address bounds); an instruction with no
+mem-ops and a ``NONE`` pattern carries no tag at all.  The
+``; ``-comment prefix on the BB-level lines keeps them grouping
+with the header in greppable output; the same data appears in the
+``--format=legacy`` and ``--templates-only`` views without the
+comment prefix.
+
 ``--templates-only``
-   Skip the body stream entirely and emit exactly one line per
-   static template instruction, sorted by PC.  No basic-block
-   boundary markers, no per-execution dynamic values — just the
-   captured architectural shape.  This is the analogue of running
-   ``objdump -d`` over the binary, restricted to PCs that the
-   guest actually executed during the trace.
+   Skip the body stream and emit the static template dictionary,
+   one block per true basic block: a ``BB<id> <pc> <symbol>``
+   header, the BB-level profile / target lines, then one line per
+   template instruction (PC-ordered) with its inline ``prof:`` tag.
+   No per-execution dynamic values — just the captured
+   architectural shape plus the run-aggregated profile.  The
+   analogue of ``objdump -d`` over the binary, restricted to PCs
+   the guest actually executed.
 
 ``--objdump``
    Add a side-by-side Capstone-disassembly column to each printed
@@ -184,11 +211,11 @@ cst_audit
 
    $ build/contrib/plugins/cst_audit trace.cst
 
-Prints a byte-budget table covering top-level sections, body
-breakdown, field-delta record breakdown, and entry / insn totals.
-Hands you a hard byte count (every byte produced by the writer is
-counted exactly once and the section totals add up to the file
-size), so the workflow when tuning trace size is:
+Prints a byte-budget table: member sizes, a **header breakdown**, a
+body breakdown, the field-delta record breakdown, and entry / insn
+totals.  Every byte the writer produced is counted exactly once and
+each section sums to its parent (a ``[rollup 100.00%]`` line asserts
+the header reconciles), so the workflow when tuning trace size is:
 
 1. Run ``cst_audit`` on a baseline trace.
 2. Toggle a writer flag (``wp_memdata=0``, ``wp_regdata=0``,
@@ -196,25 +223,37 @@ size), so the workflow when tuning trace size is:
 3. Re-run.  A flag that pays off shows up as a line item shrinking
    by an order of magnitude.
 
-Sample output:
+Sample output (abridged):
 
 .. code-block:: console
 
    $ build/contrib/plugins/cst_audit trace.cst
-   FILE                                     12.34 MiB  100.00%
+   === MEMBER SIZES (uncompressed) ===
+     TOTAL uncompressed                       28.68 KiB  100.00%
+     HEADER member                            25.93 KiB   90.41%  [   31 tmpl, avg  856.4 B]
+     BODY member (records)                     2.75 KiB    9.59%
 
-   === TOP-LEVEL SECTIONS ===
-     HEADER                                  6.18 KiB    0.05%
-     TEMPLATES                              412.30 KiB    3.27%  [    3,405 tmpl, avg  104.6 B]
-     BODY                                    11.94 MiB   96.66%
-     TRAILER                                      64 B    0.00%
+   === HEADER BREAKDOWN (25.93 KiB) ===
+     preamble + encoding maps                 19.15 KiB   73.87%
+     section framing (counts+lengths)              61 B    0.23%
+     BB info (id/pc/n/ft/targets/sym)             666 B    2.51%  [   31 tmpl, avg  21.5 B]
+     instruction descriptors                   3.94 KiB   15.19%  [   31 tmpl, avg 130.1 B]
+     dependency sub-blocks                        595 B    2.24%  [   31 tmpl, avg  19.2 B]
+     template profile block                    1.54 KiB    5.96%  [   31 tmpl, avg  51.0 B]
+       sum                                    25.93 KiB  100.00%  [rollup 100.00%]
 
-   === BODY BREAKDOWN (11.94 MiB) ===
-     CP entry framing                        71.78 KiB    0.59%  [   35,857 entry, avg    2.0 B]
-     CP field-delta section                 185.99 KiB    1.52%  [   35,857 entry, avg    5.3 B]
+   === BODY BREAKDOWN (2.75 KiB) ===
+     CP entry framing                              42 B    1.49%  [   21 entry, avg   2.0 B]
+     CP field-delta section                       892 B   31.68%  [   21 entry, avg  42.5 B]
      ...
-     IFRAME records (validation redundancy)  80.34 KiB    0.66%  [      388 iframe, avg  212.0 B]
+     IFRAME records (validation redundancy)         0 B    0.00%
 
+The **HEADER BREAKDOWN** attributes every header byte to a
+template-block group, so the cost of each piece of static metadata
+is visible: ``BB info`` (the per-BB header — id, start PC, insn
+count, ``fall_through``, the terminal-branch ``n_targets`` / target
+list, symbol), ``instruction descriptors``, optional ``dependency
+sub-blocks``, and the run-aggregated ``template profile block``.
 The ``IFRAME records`` line appears only on traces produced with
 ``iframe_rate>0``; those bytes are pure validation overhead and
 disappear when the feature is off.
@@ -236,10 +275,11 @@ two C++ tools collectively check every one:
 4. **Every IFRAME (when present) reproduces the same per-entry
    shape as its preceding ENTRY.**  See "IFRAME validation"
    below.
-5. **Every section's byte budget rolls up to the file size.**
-   ``cst_audit`` verifies this — the printed top-level totals
-   (HEADER + TEMPLATES + BODY + TRAILER) sum to ``FILE`` exactly.
-   A negative line item or a non-100% rollup is a writer bug.
+5. **Every byte budget rolls up exactly.**  ``cst_audit`` verifies
+   this — the HEADER + BODY member sizes sum to the uncompressed
+   total, and the HEADER BREAKDOWN sub-groups sum back to the
+   HEADER member (a ``[rollup 100.00%]`` line asserts it).  A
+   non-100 % rollup or an ``UNACCOUNTED`` line is a writer bug.
 
 The recommended validation workflow:
 
@@ -278,7 +318,7 @@ checking it into a paper's artifact repository), produce it with
 verification record) and decode it with ``cst_decode`` — the
 decoder will fail loudly if any IFRAME's recorded view doesn't
 match its delta replay's reconstruction of the matching ENTRY.
-Drop the IFRAME flag once you've gotten a clean decode, and the
+Drop the IFRAME flag once you have a clean decode; the
 production trace is byte-identical to one produced without IFRAME
 generation.
 
@@ -300,3 +340,51 @@ the wire format:
 
 Both run against an existing trace and don't require a fresh QEMU
 invocation.
+
+Reusing the decoder library
+---------------------------
+
+.. index::
+   single: decoder library
+   single: self-describing trace
+
+The decoder bundle (``cst_common`` / ``cst_reader`` / ``cst_format``
+/ ``cst_decode``, plus optional ``cst_objdump``) is plain C++17 over
+a small POSIX set (``mmap`` / ``fork`` / ``pipe``) and is meant to
+be lifted into your own consumer wholesale.  The design rules a
+re-user must respect:
+
+* **Strictly self-describing — no compile-time enum dependency.**
+  Every header carries encoding maps (opcode, branch_type, reg,
+  field_id, body_tag, insn_flag, wp_event_flag, metaflags,
+  dep_block_flag, mem_access_pattern, profile_flag).  The tools
+  reverse-resolve well-known *names* into IDs at load time and
+  dispatch off those; a future writer that renumbers IDs stays
+  decodable as long as its maps carry the names.  A trace missing a
+  well-known name is malformed (load throws).
+* **Slot families resolve by full name, never by arithmetic.**
+  There is deliberately no exposed ``SLOT_STRIDE``: per-slot
+  families (``LOAD_ADDR``/``STORE_ADDR``/``LOAD_DATA``/
+  ``STORE_DATA``/``DST_REG`` and the four lane-mask families) are
+  looked up as ``CST_FID_<family><k>`` for each ``k``.  The
+  decoder's internal dense slot order is unrelated to the wire ID;
+  both ends resolve by name.
+* **Capstone is optional.**  Without ``-DCST_HAVE_CAPSTONE``
+  ``cst_objdump`` compiles to a stub and ``--objdump`` simply
+  disables — downstream re-users link cleanly without bundling
+  Capstone.
+* **Bring your own byte source.**  A ``Reader`` can wrap any byte
+  source; consumers may bypass ``cst_file_open`` / the ustar +
+  decompressor machinery entirely.  Streaming readers pull through
+  a sliding buffer so a 100 GB body never has to be resident, and
+  the bundled decompressor uses a separate feeder child so a
+  single-threaded parent doing ``write(in)`` + ``read(out)`` cannot
+  deadlock when the codec's stdin buffer fills before it produces
+  output.
+
+Internally the field-delta replay is two passes (apply every wire
+record to its ``(insn, slot)`` state cell, then materialise one row
+per template instruction).  State cells use a per-table generation
+counter so a segment boundary invalidates every cell in O(1); the
+slot-count constant must be bumped in lockstep with the writer when
+a new field family is added.

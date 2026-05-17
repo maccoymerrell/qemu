@@ -170,6 +170,15 @@ def _find_cst_decode() -> Path:
 _BB_HEAD_RE  = re.compile(
     r"^BB(\d+) \[pc=0x([0-9a-f]+), insns=(\d+), fall_through=0x([0-9a-f]+)\]$"
 )
+# Run-aggregated profile block (format §6), emitted as part of each BB.
+_PROF_EXEC_RE = re.compile(
+    r"^  profile: exec_cp=(\d+) exec_wp=(\d+)$"
+)
+_PROF_TGT_RE = re.compile(
+    r"^  target\[(\d+)\]: pc=0x([0-9a-f]+) taken_cp=(\d+) nottaken_cp=(\d+) "
+    r"taken_wp=(\d+) nottaken_wp=(\d+)$"
+)
+_PROF_INSN_RE = re.compile(r"^  insn\[(\d+)\] prof: (.*)$")
 _INSN_RE = re.compile(
     r"^  \[(\d+)\] 0x([0-9a-f]+): op=(\S+)"
     r"(?: br=(\S+) cond=(\d))?"
@@ -177,7 +186,8 @@ _INSN_RE = re.compile(
     r"(?: imm=(-?\d+))?"
     r"( atomic)?"
     r"( lane_parallel)?"
-    r"(?: bytes=([0-9a-f]*))?$"
+    r"(?: bytes=([0-9a-f]*))?"
+    r"(?:  prof: (.*))?$"
 )
 _ENTRY_HEAD_RE = re.compile(
     r"^ENTRY (\d+) thread=(\d+)(?: switch=(\d))? template=BB(\d+)$"
@@ -326,17 +336,67 @@ def _parse_templates(lines: list[str], i: int,
         n_insns = int(m.group(3))
         ft_pc = int(m.group(4), 16)
         i += 1
+        # Optional terminal-branch target list (header): "  targets:
+        # 0x.. 0x..".  n_targets is implicit in the count of pcs.
+        target_pcs: list[int] = []
+        if i < len(lines) and lines[i].startswith("  targets:"):
+            target_pcs = [int(x, 16)
+                          for x in lines[i].split("targets:", 1)[1].split()]
+            i += 1
         symbol = ""
         if i < len(lines) and lines[i].startswith("  symbol="):
             symbol = lines[i][len("  symbol="):]
             i += 1
+        # Run-aggregated template profile block (format §6), emitted
+        # as part of this BB.  Parse it so the validator can assert
+        # the stats against the metadata (overlapping coverage).
+        profile = {"exec_cp": 0, "exec_wp": 0,
+                   "targets": [], "insns": {}}
+        while i < len(lines):
+            pe = _PROF_EXEC_RE.match(lines[i])
+            if pe:
+                profile["exec_cp"] = int(pe.group(1))
+                profile["exec_wp"] = int(pe.group(2))
+                i += 1
+                continue
+            pt = _PROF_TGT_RE.match(lines[i])
+            if pt:
+                profile["targets"].append({
+                    "pc":          int(pt.group(2), 16),
+                    "taken_cp":    int(pt.group(3)),
+                    "nottaken_cp": int(pt.group(4)),
+                    "taken_wp":    int(pt.group(5)),
+                    "nottaken_wp": int(pt.group(6)),
+                })
+                i += 1
+                continue
+            pi = _PROF_INSN_RE.match(lines[i])
+            if pi:
+                fields: dict = {}
+                for tok in pi.group(2).split():
+                    if "=" in tok:
+                        k, v = tok.split("=", 1)
+                        fields[k] = v
+                profile["insns"][int(pi.group(1))] = fields
+                i += 1
+                continue
+            break
         insns: list[dict] = []
-        for _ in range(n_insns):
+        for _insn_idx in range(n_insns):
             mm = _INSN_RE.match(lines[i])
             if not mm:
                 raise ValueError(f"bad insn line: {lines[i]!r}")
             br_name = mm.group(4)
             cond_str = mm.group(5)
+            # Inline per-instruction profile (format §6) now rides on
+            # the instruction's own line as `  prof: k=v k=v ...`.
+            if mm.group(12):
+                pf: dict = {}
+                for tok in mm.group(12).split():
+                    if "=" in tok:
+                        k, v = tok.split("=", 1)
+                        pf[k] = v
+                profile["insns"][_insn_idx] = pf
             insn = {
                 "pc": int(mm.group(2), 16),
                 "opcode": opcode_to_id.get(mm.group(3), 0),
@@ -383,8 +443,10 @@ def _parse_templates(lines: list[str], i: int,
             "start_pc": start_pc,
             "n_insns": n_insns,
             "fall_through_pc": ft_pc,
+            "target_pcs": target_pcs,
             "symbol_name": symbol,
             "insns": insns,
+            "profile": profile,
         })
     return templates, i
 

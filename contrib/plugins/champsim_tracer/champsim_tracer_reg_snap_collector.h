@@ -1,25 +1,21 @@
 /*
  * Wrong-Path Tracing Plugin — register-value snapshot collector.
  *
- * Reads architectural register values via the QEMU plugin API and
- * marshals them into RegSnap records for the trace's reg-data section.
- * Two paths:
+ * Reads architectural register values via the QEMU plugin API into
+ * RegSnap records for the trace's reg-data section.  Two paths:
  *
- *   - LIVE capture: read each named register on demand on the calling
- *     thread.  Used by the per-insn correct-path snap callback and by
- *     the wrong-path simulator's "live" path (when the WP TB
- *     translation already exists, so we know the source-reg list before
- *     exec_tb).
+ *   - LIVE: read each named register on demand on the calling thread.
+ *     Used by the per-insn CP snap callback and the WP simulator's
+ *     "live" path (WP TB already translated, source-reg list known).
  *
- *   - WIDE pre-fragment capture: snapshot every readable register once
- *     before exec_tb under spec mode (which forces CF_MEMI_ONLY +
+ *   - WIDE pre-fragment: snapshot every readable register once before
+ *     exec_tb under spec mode (which forces CF_MEMI_ONLY +
  *     CF_SINGLE_STEP and silently drops post-translation per-insn
- *     callbacks).  After exec_tb the wrong-path simulator looks up the
+ *     callbacks, so the live path can't run).  WP looks up the
  *     just-translated template's source registers in the wide snap.
  *
- * The wide snap and the read scratch buffer are thread_local; one of
- * each per QEMU vCPU thread.  cleanup_current_thread() releases them
- * at plugin exit.
+ * Wide snap + read scratch are thread_local (one per vCPU thread);
+ * cleanup_current_thread() releases them at plugin exit.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */

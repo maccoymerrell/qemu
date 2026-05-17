@@ -45,6 +45,9 @@ void parse_encoding_maps(Reader &r, EncodingMaps *out)
         else if (name == "wp_event_flag")  target = &out->wp_event_flag;
         else if (name == "metaflags")      target = &out->metaflags;
         else if (name == "dep_block_flag") target = &out->dep_block_flag;
+        else if (name == "mem_access_pattern")
+            target = &out->mem_access_pattern;
+        else if (name == "profile_flag")   target = &out->profile_flag;
 
         for (uint64_t j = 0; j < n_entries; j++) {
             uint64_t value = r.uleb();
@@ -68,6 +71,11 @@ void parse_templates_at(Reader &r,
         t.start_pc        = sub.uleb();
         uint64_t n_insns  = sub.uleb();
         t.fall_through_pc = sub.uleb();
+        uint64_t n_targets = sub.uleb();
+        t.target_pcs.resize(n_targets);
+        for (auto &tp : t.target_pcs) {
+            tp = sub.uleb();
+        }
         t.symbol_name     = sub.string();
 
         uint64_t prev_pc = t.start_pc;
@@ -99,20 +107,13 @@ void parse_templates_at(Reader &r,
             I.raw_bytes.resize(insn_size);
             sub.raw(I.raw_bytes.data(), insn_size);
 
-            /*
-             * Optional dependency sub-block.  Phase 1 only honours the
-             * HAS_REG family.  HAS_ADDR will land in phase 2; if a
-             * future writer sets it, we still need to parse over the
-             * bytes to keep the cursor aligned, even though we won't
-             * surface them yet.
-             */
+            /* Optional dependency sub-block (HAS_REG / HAS_ADDR
+             * families).  Both are parsed to keep the cursor
+             * aligned. */
             if (flags & ids.insn_flag_has_dep_block) {
                 uint8_t dep_flags = sub.u8();
-                /* Mask array sizes come from the outer header
-                 * (n_dst, max_dep_loads, max_dep_stores).  Masks
-                 * themselves are uint64_t ULEBs since the bit
-                 * layout addresses up to MAX_SRC_REGS + MAX_LOADS
-                 * input positions plus the imm bit. */
+                /* Mask array sizes come from the outer header (n_dst,
+                 * max_dep_loads, max_dep_stores); masks are ULEBs. */
                 if (dep_flags & ids.dep_block_has_reg) {
                     I.has_reg_deps = true;
                     I.dst_dep_mask.resize(n_dst);
@@ -140,15 +141,53 @@ void parse_templates_at(Reader &r,
             t.insns.push_back(std::move(I));
         }
 
+        /* Template profile block (format §6), always present after
+         * the last insn.  pat_flags bit layout is fixed; value names
+         * resolve via the mem_access_pattern / profile_flag maps. */
+        {
+            TemplateProfileInfo &P = t.profile;
+            P.exec_cp          = sub.uleb();
+            P.exec_wp          = sub.uleb();
+            /* Per-target taken/not-taken counts, 1:1 with the header
+             * target list (count comes from there, not re-encoded). */
+            P.targets.resize(t.target_pcs.size());
+            for (auto &tc : P.targets) {
+                tc.taken_cp    = sub.uleb();
+                tc.nottaken_cp = sub.uleb();
+                tc.taken_wp    = sub.uleb();
+                tc.nottaken_wp = sub.uleb();
+            }
+            P.insns.resize(n_insns);
+            for (uint64_t k = 0; k < n_insns; k++) {
+                InsnProfileInfo &ip = P.insns[k];
+                ip.memops_cp = sub.uleb();
+                ip.memops_wp = sub.uleb();
+                uint8_t pf   = sub.u8();
+                ip.pat_cp  = (uint8_t)(pf & 0x3);
+                ip.pat_wp  = (uint8_t)((pf >> 2) & 0x3);
+                ip.addr_cp = (pf & 0x10) != 0;
+                ip.addr_wp = (pf & 0x20) != 0;
+                if (ip.memops_cp > 0) {
+                    ip.has_cp_bounds = true;
+                    ip.lo_cp = sub.uleb();
+                    ip.hi_cp = ip.lo_cp + sub.uleb();
+                }
+                if (ip.memops_wp > 0) {
+                    ip.has_wp_bounds = true;
+                    ip.lo_wp = sub.uleb();
+                    ip.hi_wp = ip.lo_wp + sub.uleb();
+                }
+            }
+        }
+
         if (out_by_id) (*out_by_id)[t.template_id] = out->size();
         out->push_back(std::move(t));
     }
 }
 
-/* Reverse-resolve a well-known name in @m and store its ID into @out.
- * Throws if the name is absent.  Two overloads: u8 for the flag /
- * bit-mask maps (header_flag / insn_flag / wp_event_flag / metaflags),
- * uint16_t for field_id where the ULEB-encoded space reaches ~330. */
+/* Reverse-resolve a well-known name in @m into @out; throws if
+ * absent.  u8 overload for bit-mask maps, uint16_t for field_id
+ * (ULEB space reaches ~330). */
 static void resolve_one(const std::unordered_map<uint64_t, std::string> &m,
                         const char *map_name, const char *want,
                         uint8_t *out)
@@ -194,10 +233,8 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
     resolve_one(maps.body_tag, "body_tag", "BODY_TAG_REGFILE",
                 &ids->body_tag_regfile);
 
-    /* field_id (per-slot families + singletons).  The wire format
-     * defines arbitrary slot-to-FID mapping via the encoding map's
-     * CST_FID_<family><k> entries; we look each up by full name
-     * with no stride / ordering assumption. */
+    /* field_id (per-slot families + singletons): each looked up by
+     * full CST_FID_<family><k> name, no stride/ordering assumption. */
     resolve_one(maps.field_id, "field_id", "CST_FID_N_LOADS",
                 &ids->fid_n_loads);
     resolve_one(maps.field_id, "field_id", "CST_FID_N_STORES",
@@ -289,20 +326,11 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
 
 /* ===== POSIX-ustar reader ================================================
  *
- * Walks @data scanning for tar members; returns the byte range of
- * each as a view into @data.  Pure-memory: no I/O, no temp files.
- *
- * Compatibility goals — accepts:
- *   - Our own writer's output (POSIX ustar, magic "ustar\0", "00")
- *   - GNU tar's default format (magic "ustar ", version " \0")
- *   - PAX archives (typeflag 'x' / 'g' extended headers; payloads
- *     are skipped, file members in between still surface)
- *   - GNU base-256 size encoding (>8 GiB members)
- *
- * The intent is that a user can `tar -xf foo.cst && tar -cf bar.cst
- * body.cst* header.cst*` with any standard tar and bar.cst still
- * reads cleanly.  Long-filename extensions ('L', PAX path=) are not
- * supported — our member names are short and stable.
+ * Pure-memory scan of @data for tar members.  Accepts POSIX ustar
+ * ("ustar\0"/"00"), GNU ("ustar "/" \0"), PAX 'x'/'g' extended
+ * headers (payload skipped), and GNU base-256 sizes (>8 GiB), so a
+ * .cst re-tarred by any standard tar still reads.  Long-filename
+ * extensions ('L', PAX path=) unsupported — our names are short.
  */
 struct UstarHeader {
     char name[100];
@@ -339,12 +367,9 @@ uint64_t parse_octal(const char *field, size_t n)
     return v;
 }
 
-/* Decode the @size field, transparently handling either standard
- * octal (POSIX-ustar's 11-digit + NUL form, capped at 8 GiB) or the
- * GNU base-256 extension used for larger members.  The marker is
- * the high bit of the first byte: 0x80 for unsigned positive,
- * 0xFF for two's-complement negative (we treat the remaining 7 bits
- * of either as a positive value since sizes are unsigned). */
+/* Decode the @size field: standard octal, or GNU base-256 for large
+ * members (high bit of byte 0 set; remaining 7 bits treated as
+ * positive since sizes are unsigned). */
 uint64_t parse_size_field(const char *field, size_t n)
 {
     auto leading = (unsigned char)field[0];
@@ -358,10 +383,9 @@ uint64_t parse_size_field(const char *field, size_t n)
     return parse_octal(field, n);
 }
 
-/* Verify the ustar header checksum.  Sum of all 512 bytes, with the
- * checksum field itself treated as eight spaces during the sum.
- * Older tars wrote the checksum as a signed sum; we accept either
- * to stay compatible with archives produced by historical tools. */
+/* Verify the ustar checksum: sum of all 512 bytes with the checksum
+ * field counted as spaces.  Accept both unsigned and signed sums
+ * (older tars wrote signed). */
 bool verify_ustar_checksum(const UstarHeader *h)
 {
     constexpr size_t checksum_off  = offsetof(UstarHeader, checksum);
@@ -430,11 +454,9 @@ std::vector<TarMember> walk_tar(const uint8_t *data, size_t size)
 
         char tf = h->typeflag;
         if (tf == 'x' || tf == 'g') {
-            /* PAX per-file ('x') or global ('g') extended header.
-             * Skip the payload; we don't currently surface PAX
-             * extended attributes.  This lets a user re-tar a .cst
-             * through `tar --format=pax` and have the result still
-             * read cleanly. */
+            /* PAX extended header ('x' per-file / 'g' global): skip
+             * the payload so a `tar --format=pax` re-tar still
+             * reads. */
             off += padded;
             continue;
         }
@@ -445,9 +467,7 @@ std::vector<TarMember> walk_tar(const uint8_t *data, size_t size)
             m.size = (size_t)member_size;
             out.push_back(std::move(m));
         }
-        /* Other typeflags (symlinks, dirs, devices, GNU 'L' long-
-         * names, ...) are silently skipped — our two members are
-         * the only file types we know how to consume. */
+        /* Other typeflags (symlinks, dirs, GNU 'L', ...) skipped. */
         off += padded;
     }
     return out;
@@ -468,22 +488,14 @@ std::string codec_from_suffix(const std::string &member_name)
     return "";
 }
 
-/* Source that pulls bytes from a subprocess decompressor's stdout.
+/* Source pulling bytes from a subprocess decompressor's stdout.
+ * ctor forks the decompressor + a feeder child (writes compressed
+ * bytes to its stdin); dtor closes stdout, SIGTERMs + reaps both
+ * (handles --max early exit).
  *
- * Lifecycle:
- *   - ctor forks the decompressor child + a feeder child that writes
- *     the compressed bytes into the decompressor's stdin.  The
- *     decompressor's stdout is the only fd kept open in the parent.
- *   - read() drains stdout incrementally as the consumer pulls bytes.
- *   - dtor closes stdout (signalling EOF to anything still draining),
- *     SIGTERM's both children if still alive (handles --max early
- *     exit cleanly), and reaps them.
- *
- * The feeder is a separate process so the parent never blocks on the
- * decompressor's input fifo — a single-thread parent doing
- * write(in) + read(out) deadlocks the moment the decompressor's
- * stdin buffer fills before any output has been produced.  Forking
- * the feeder sidesteps it. */
+ * The feeder is a separate process because a single-thread parent
+ * doing write(in)+read(out) deadlocks the moment the decompressor's
+ * stdin buffer fills before any output is produced. */
 class ChildProcessSource : public Source {
 public:
     ChildProcessSource(const std::string &codec,
@@ -525,10 +537,8 @@ public:
             close(out_pipe[0]);
             const uint8_t *p = data;
             size_t remaining = size;
-            /* SIGPIPE: if the parent tears the decompressor down
-             * early (--max), the feeder may see EPIPE when its
-             * writes outrun the consumer.  Treat that as a normal
-             * early exit. */
+            /* On --max early teardown the feeder may see EPIPE;
+             * treat as a normal early exit. */
             signal(SIGPIPE, SIG_IGN);
             while (remaining > 0) {
                 ssize_t n = write(in_pipe[1], p, remaining);
@@ -619,9 +629,8 @@ private:
     size_t pos_;
 };
 
-/* Synchronous decompress: drain @src fully into @out_buf.  Used for
- * the header member, which is small (KB to MB), so eager
- * decompression avoids the streaming-Reader bookkeeping. */
+/* Synchronous decompress into @out_buf.  Used for the small header
+ * member so eager decompression avoids streaming bookkeeping. */
 void decompress_to_buffer(const std::string &codec,
                           const uint8_t *data, size_t size,
                           std::vector<uint8_t> *out_buf)
@@ -766,10 +775,8 @@ std::unique_ptr<BodyStream> body_stream_open(const CstFile &cf)
         src = std::make_unique<ChildProcessSource>(
             cf.body_codec(), raw.data, raw.size);
     }
-    /* Keep the underlying Source alive for finalize().  The
-     * Reader takes ownership of `src` for normal pulls; we hand it
-     * back to BodyStream at finalize() time so we can call
-     * finalize_and_check() on the ChildProcessSource. */
+    /* Reader owns `src` for normal pulls; finalize() routes through
+     * it to wait+check the ChildProcessSource. */
     Reader reader(std::move(src));
 
     /* Verify leading magic and strip it from the consumer-visible
@@ -791,9 +798,7 @@ void BodyStream::finalize()
         throw std::runtime_error("body member truncated "
                                  "(bad trailing magic)");
     }
-    /* Drain any trailing padding (mmap path won't have any; the
-     * subprocess decompressor shouldn't either, but be defensive in
-     * case a future codec emits a tiny tail buffer). */
+    /* Drain any trailing padding (defensive; normally none). */
     uint8_t scratch[64];
     while (!reader_.eof()) {
         size_t take = reader_.remaining();
@@ -869,9 +874,7 @@ MemberView body_records_view(MemberView body_member)
     if (lead != CST_MAGIC) {
         throw std::runtime_error("Bad body leading magic");
     }
-    /* Trailing magic check: the writer emits BODY_TAG_END +
-     * num_entries + CST_MAGIC at end-of-body.  Verify the last 4
-     * bytes match CST_MAGIC. */
+    /* Trailing-magic check: last 4 bytes must be CST_MAGIC. */
     if (body_member.size < 8) {
         throw std::runtime_error("body member truncated (no trailing magic)");
     }

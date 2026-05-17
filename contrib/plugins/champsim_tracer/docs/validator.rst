@@ -191,6 +191,21 @@ These don't need a generator ``meta.json`` and run on any ``.cst``.
    The writer's aggregate ``atomic_count`` matches a static walk
    of every CP+WP template's per-insn ``is_atomic`` field.
 
+``profile_consistency``
+   Cross-validates the run-aggregated template profile block
+   (:doc:`format` §6) against the decoded body — overlapping
+   coverage that exercises the profiling machinery independently of
+   the behavioural metadata checks.  Asserts: ``exec_cp`` /
+   ``exec_wp`` coverage agrees with which template IDs actually
+   appear as CP entries / WP-chain BBs; ``sum(exec_wp)`` equals the
+   total WP BBs in the body, and ``sum(exec_cp)`` equals the CP
+   entry count when no IFRAMEs are present; for a non-indirect
+   branch BB the single target's ``taken_cp + nottaken_cp`` is
+   ``exec_cp`` (or ``exec_cp - 1`` — the one trailing execution
+   whose successor the trace window never observed; anything else
+   is mis-attribution or wrong-path contamination); and a per-insn
+   mem-op count implies the matching path executed.
+
 CP execution invariants
 ~~~~~~~~~~~~~~~~~~~~~~~
 

@@ -1,19 +1,13 @@
 /*
  * ChampSim Tracer offline tools — byte stream reader.
  *
- * Stateful reader over either an in-memory buffer (typically an
- * mmap'd .cst file) or a Source-backed byte stream (typically a
- * decompressor subprocess pipe).  Mirrors champsim_tracer_decode.py's
- * ByteReader: ULEB / SLEB walkers, length-prefixed string reader, and
- * a sub() helper that carves a length-prefixed sub-section into its
- * own bounded reader so the parent's cursor advances past it cleanly.
- *
- * Streaming mode: when constructed with a Source, the Reader owns a
- * refillable buffer and pulls bytes on demand.  sub() materialises
- * the section into a fresh memory-backed sub-Reader; this preserves
- * the existing semantics (carve a length-prefixed slice, return a
- * scoped Reader) without dragging the streaming Source through every
- * level of recursion.  Sections are typically a few kilobytes.
+ * Stateful reader over an in-memory buffer (mmap'd .cst) or a
+ * Source-backed stream (decompressor pipe).  ULEB/SLEB walkers,
+ * length-prefixed string reader, and sub() which carves a
+ * length-prefixed sub-section into a bounded reader, advancing the
+ * parent cursor past it.  Streaming mode owns a refillable buffer and
+ * pulls on demand; sub() materialises the (few-KB) section into a
+ * fresh memory-backed sub so the Source stays out of recursion.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -30,39 +24,30 @@
 
 namespace cst {
 
-/*
- * Pull-mode byte source.  ChildProcessSource (decompressor) and
- * FdSource (raw fd) implement this in cst_format.cc.  The Reader
- * stays interface-agnostic.
- */
+/* Pull-mode byte source (implementations in cst_format.cc). */
 class Source {
 public:
     virtual ~Source() = default;
-    /* Read up to @n bytes into @out, return actual count.  Returns 0
-     * exactly at end-of-stream.  Throws on I/O error.  Sources are
-     * expected to drain to EOF cleanly — partial reads in the middle
-     * of a stream are fine, but a 0-return must mean EOF, not "not
-     * ready yet". */
+    /* Read up to @n bytes into @out, return count.  0 means EOF
+     * (never "not ready yet"); partial reads mid-stream are fine.
+     * Throws on I/O error. */
     virtual size_t read(uint8_t *out, size_t n) = 0;
-    /* Optional: called by the consumer when it has drained the
-     * stream cleanly to EOF.  Sources that wrap a subprocess use it
-     * to wait() on the child and re-throw if the child exited non-
-     * zero.  Default is a no-op. */
+    /* Called once the consumer has drained to EOF; subprocess sources
+     * wait() on the child and re-throw on non-zero exit.  No-op by
+     * default. */
     virtual void finalize() {}
 };
 
 class Reader {
 public:
     Reader() = default;
-    /* Read from @data over [@begin, @end).  When constructing a
-     * top-of-file reader pass begin=0; when carving a subrange via
-     * sub() the helper passes the slice's bounds explicitly. */
+    /* Read from @data over [@begin, @end).  Top-of-file: begin=0;
+     * sub() passes the slice bounds explicitly. */
     Reader(const uint8_t *data, size_t begin, size_t end)
         : data_(data), end_(end), pos_(begin) {}
 
-    /* Streaming constructor: pulls bytes from @src on demand.  The
-     * Reader owns a refillable buffer; sub() on a streaming reader
-     * materialises the section into a fresh memory-backed sub. */
+    /* Streaming constructor: pulls from @src on demand into an owned
+     * refillable buffer. */
     explicit Reader(std::unique_ptr<Source> src)
         : src_(std::move(src))
     {
@@ -106,11 +91,9 @@ public:
     size_t end() const { return end_; }
     size_t remaining() const { return end_ - pos_; }
     const uint8_t *data() const { return data_; }
-    /* Bytes consumed since this Reader was constructed.  For
-     * memory-backed sub-Readers, this is pos_ - begin (captured at
-     * construction).  For streaming readers, includes bytes that
-     * have been shifted out of the sliding buffer.  Suitable for
-     * size accounting (audit's per-section byte counts). */
+    /* Bytes consumed since construction (includes bytes shifted out
+     * of a streaming reader's sliding buffer).  Valid for audit
+     * per-section byte accounting. */
     size_t consumed() const { return consumed_total_ + pos_; }
 
     void seek(size_t p) {
@@ -119,9 +102,8 @@ public:
         pos_ = p;
     }
 
-    /* Finalize the underlying Source if any (e.g. wait+check on a
-     * subprocess decompressor).  Safe to call on memory-backed
-     * Readers (no-op). */
+    /* Finalize the Source if any (subprocess wait+check); no-op on
+     * memory-backed Readers. */
     void finalize_source() {
         if (src_) src_->finalize();
     }
@@ -179,12 +161,9 @@ public:
     }
 
     /*
-     * Skip a LEB128 varint without decoding it.  Reads bytes until
-     * one with the continuation bit clear; never overflows.  Safe
-     * for variable-width values where the caller doesn't care about
-     * the value itself — e.g. audit walks the field-delta stream
-     * advancing past sleb_wide-encoded deltas that may be wider
-     * than 64 bits and so trip uleb()/sleb()'s overflow guards.
+     * Skip a LEB128 varint without decoding (no overflow guard).
+     * Used by audit to advance past sleb_wide deltas that may exceed
+     * 64 bits and would trip uleb()/sleb()'s overflow checks.
      */
     void skip_varint() {
         while (true) {
@@ -194,14 +173,10 @@ public:
     }
 
     /*
-     * Unsigned wide ULEB sized to fit a 512-bit value, packed into
-     * 8 little-endian limbs.  Used for EXTRA_LOAD_DATA /
-     * EXTRA_STORE_DATA elements, which the writer emits via
-     * bw_write_uleb128_u512 — values can span the full 512-bit
-     * width when vector-register data is on the wire.  uleb() would
-     * truncate to 64 bits (silently for narrow values; throwing for
-     * anything wider).  Mirrors sleb_wide() but without the sign-
-     * extension step on terminator. */
+     * Unsigned wide ULEB packed into 8 LE limbs (512-bit).  Used for
+     * EXTRA_LOAD_DATA / EXTRA_STORE_DATA, which can span the full
+     * vector-register width; uleb() would truncate/throw.  Like
+     * sleb_wide() without terminator sign-extension. */
     std::array<uint64_t, 8> uleb_wide() {
         std::array<uint64_t, 8> out{};
         unsigned shift = 0;
@@ -282,9 +257,8 @@ public:
     }
 
     /* Read a ULEB length + that many bytes; return a Reader scoped to
-     * the slice and advance the parent cursor past it.  For memory-
-     * backed parents this is a zero-copy view.  For streaming
-     * parents we pull the section into a fresh owned buffer. */
+     * the slice and advance the parent past it.  Zero-copy view for
+     * memory-backed parents; a fresh owned buffer for streaming. */
     Reader sub() {
         uint64_t n = uleb();
         if (src_) {

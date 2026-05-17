@@ -1,16 +1,9 @@
 /*
  * Wrong-Path Tracing Plugin — shared types and plugin-wide globals.
  *
- * Private header; included by every plugin TU.  After the C++ refactor
- * this header carries only:
- *   - Wire-format constants (CST_*, BODY_TAG_*, CST_FID_*).
- *   - Shared POD types (CSTWideValue, BBTemplate, BodyEntry, ...).
- *   - A short list of plugin-wide globals (ISA resolution, plugin
- *     config flags, synchronization).  Subsystem-private state lives
- *     in each subsystem's own header.
- *   - A handful of cross-TU function declarations whose owners haven't
- *     been wrapped in classes (decode_detail_to_generic,
- *     simulate_wrong_path_ext, body_stream_*).
+ * Private header: wire-format constants (CST_*, BODY_TAG_*, CST_FID_*),
+ * shared POD types, plugin-wide globals, and cross-TU declarations.
+ * Subsystem-private state lives in each subsystem's own header.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -44,32 +37,13 @@ extern "C" {
  * compiled in the C tables TU can manipulate InsnFields directly. */
 
 /*
- * Binary format magic.  Bytes in file order: 'C','S','T',0x1C
- * → u32 LE 0x1C545343.  ASCII: C=0x43 S=0x53 T=0x54.  "CST" =
- * ChampSimTracer.
- *
- * Each BB entry carries:
- *
- *   n_records : ULEB
- *   { ins_pos_gap : ULEB,  field_id : u8,  payload }*
- *
- * Records are emitted in non-descending (ins_pos, field_id) order;
- * unchanged fields contribute zero bytes.  Field IDs identify what
- * changed about an instruction (memop count/addr/data, src/dst reg
- * value, opcode/encoding/immediate, integer-flags byte — see the
- * FID_* constants below).  Normal scalar fields carry one signed LEB
- * delta: `(cur512 - baseline512) mod 2**512`.  The EXTRA_* memop
- * fields carry raw unsigned LEB vectors and have no persistent state.
- * Baseline = the most-recent observation in the active overlay
- * (CP state for CP records; WP state for WP records, falling back
- * to CP if the WP overlay never observed this key); template-default
- * on first appearance.  WP state persists across chains; CP state is
- * the architectural truth.
- *
- * Templates track true basic blocks (start_pc to first branch,
- * immutable, unique by start_pc).  Memory-operation counts are runtime
- * sparse fields populated from QEMU memory callbacks; template count
- * defaults are zero.
+ * Binary format magic ("CST" + version 0x1D, u32 LE).  Wire format
+ * fully specified in champsim_tracer_format.md.  Key invariants:
+ * scalar fields carry a signed LEB delta against the active overlay's
+ * most-recent observation (WP falls back to CP; template-default on
+ * first appearance); WP state persists across chains, CP is the
+ * architectural truth.  Templates track true BBs (start_pc to first
+ * branch, immutable, unique by start_pc).
  */
 #define CST_MAGIC          0x1D545343u
 
@@ -85,45 +59,21 @@ extern "C" {
 #define BODY_TAG_ENTRY           1
 #define BODY_TAG_THREAD_SWITCH   2
 /*
- * BODY_TAG_IFRAME: a self-contained absolute snapshot of the
- * immediately-preceding BODY_TAG_ENTRY.  Same payload structure as
- * ENTRY (CP delta section + WP chain section + WP events section)
- * minus the leading tmpl_delta — the IFRAME inherits the ENTRY's
- * template_id.  Inside the IFRAME every field is encoded against a
- * fresh "nothing observed yet" overlay, so all values are absolute
- * (delta-from-template-default).  When CP triggers an IFRAME the
- * entire body record is re-emitted in IFRAME mode, including ALL of
- * the CP entry's WP-chain entries — i.e. flagging the CP as IFRAME
- * implicitly flags every WP attached to it.
- *
- * IFRAMEs do NOT advance the writer's persistent overlays
- * (cp_field_state / wp_field_state) and do NOT advance
- * prev_entry_template — they are pure validation/resync records.
- * Decoders use the IFRAME to cross-check that their delta-replay
- * reconstructed the same view the writer had; they do not need to
- * know the writer's emission cadence and may safely skip IFRAMEs
- * entirely.
+ * BODY_TAG_IFRAME: self-contained absolute snapshot of the preceding
+ * ENTRY (same payload minus tmpl_delta; inherits the ENTRY's
+ * template_id), every field encoded against a fresh "nothing observed"
+ * overlay.  Re-emits ALL of the CP entry's WP-chain entries too.
+ * Pure validation/resync: does NOT advance the writer's persistent
+ * overlays or prev_entry_template; decoders may safely skip IFRAMEs.
  */
 #define BODY_TAG_IFRAME          3
 /*
- * BODY_TAG_REGFILE: per-thread initial register-file snapshot.
- * Emitted exactly once per (segment, thread_id) pair, before the
- * first ENTRY contributed by that thread in the segment.  Carries
- * absolute values so consumers can prime simulator state for each
- * vCPU at the moment that vCPU first appears in the trace.  Unlike
- * earlier versions where the segment header carried a single
- * initial regfile (only meaningful for whichever vCPU triggered the
- * segment start), this record covers each vCPU independently.
- *
- * Wire format:
- *   tag                 u8  = BODY_TAG_REGFILE
- *   thread_id           varuint  (matches body's current_thread)
- *   n_present           varuint
- *   { gen_id u8, width u8, bytes[width] } * n_present
- *
- * width=0 means "the plugin couldn't resolve a live value for this
- * gen_id" (e.g. install-time pre-vCPU snapshot).  Decoder behaviour
- * for such IDs: leave the per-thread regfile slot zero/uninitialised.
+ * BODY_TAG_REGFILE: per-thread initial register-file snapshot, emitted
+ * once per (segment, thread_id) before that thread's first ENTRY, so
+ * consumers can prime each vCPU's state independently.  Absolute
+ * values.  width=0 means the plugin couldn't resolve a live value
+ * (e.g. install-time pre-vCPU snapshot): leave that slot uninitialised.
+ * Wire format spec'd in champsim_tracer_format.md.
  */
 #define BODY_TAG_REGFILE         4
 
@@ -141,17 +91,14 @@ extern "C" {
  *   bit 6    HAS_DEP_BLOCK
  *   bit 7    (reserved)
  *
- * VEC and LANE_PARALLEL split the orthogonal vector-op concerns:
- *   - VEC says "per-slot lane bitmaps are present on the wire" — the
- *     template carries src_lane_mask[i] / dst_lane_mask[d] after the
- *     reg arrays, describing which lanes of each reg participate.
- *     Useful even for cross-lane ops (shuffles, broadcasts, gathers)
- *     because rename-slot allocation cares about lane participation
- *     regardless of parallelism.
- *   - LANE_PARALLEL says "the lane bitmaps line up by lane index"
- *     so the consumer can model independent per-lane dependency
- *     chains.  Set on element-wise vec arithmetic (VADDPS, VPADDD,
- *     etc.); cleared on shuffles / cross-lane / reductions.
+ * VEC and LANE_PARALLEL are orthogonal:
+ *   - VEC: per-slot lane bitmaps present on the wire (useful even for
+ *     cross-lane ops since rename-slot allocation cares about lane
+ *     participation regardless of parallelism).
+ *   - LANE_PARALLEL: lane bitmaps line up by lane index so the
+ *     consumer can model independent per-lane chains.  Set on
+ *     element-wise vec arithmetic; cleared on shuffle/cross-lane/
+ *     reduction.  Implies VEC.
  */
 #define CST_INSN_FLAG_BRANCH_COND   (1u << 0)
 #define CST_INSN_FLAG_HAS_IMM       (1u << 1)
@@ -188,13 +135,12 @@ extern "C" {
  *   bits [0, n_src)                       depends on src_reg[i]
  *   bit  n_src                            depends on the immediate
  *
- * Absence of CST_INSN_FLAG_HAS_DEP_BLOCK (or absence of a particular
- * sub-family within it) is the implicit all-to-all over-approximation
- * (every dst / store / mem-op depends on every input) that consumers
- * have always assumed.  HAS_REG carries refiner-produced output deps
- * (dst, store_data); HAS_ADDR carries walker-produced per-memop
- * address deps (when each load/store can fire).  Future sub-flag
- * bits stay inside the block so the per-insn flag byte doesn't grow.
+ * Absence of CST_INSN_FLAG_HAS_DEP_BLOCK (or of a sub-family within
+ * it) means the implicit all-to-all over-approximation (every dst /
+ * store / mem-op depends on every input).  HAS_REG carries
+ * refiner-produced output deps; HAS_ADDR carries walker-produced
+ * per-memop address deps.  Future sub-flags stay inside the block so
+ * the per-insn flag byte doesn't grow.
  */
 #define CST_INSN_FLAG_HAS_DEP_BLOCK (1u << 6)
 /* bit 7 reserved */
@@ -211,14 +157,10 @@ extern "C" {
 #define CST_WP_INV_CHAIN_REF      (1u << 0)
 /* bits 1..7 reserved */
 
-/* Header feature flags (templates always present, deltas always present).
- *
- * These bits are advisory hints to consumers about optional payload
- * families.  The wire format itself is uniform — a reader that sees
- * an unexpected field_id MUST tolerate it (see
- * champsim_tracer_format.md §4 and the CST_FID_* constants below).
- * Sparse instruction metadata records are always allowed and do not
- * need a feature bit. */
+/* Header feature flags: advisory hints about optional payload
+ * families.  The wire format is uniform — a reader seeing an
+ * unexpected field_id MUST tolerate it (champsim_tracer_format.md §4).
+ * Sparse insn metadata records need no feature bit. */
 #define CST_FLAG_MEM_DATA      (1 << 0)  /* CST_FID_LOAD_DATA / STORE_DATA */
 #define CST_FLAG_REG_DATA      (1 << 1)  /* CST_FID_DST_REG values        */
 #define CST_FLAG_RESERVED_2    (1 << 2)
@@ -226,14 +168,11 @@ extern "C" {
 
 /* ===== Field-ID space (unified delta stream) =====
  *
- * Every per-entry observation (memop addresses, memop data, register
- * values, instruction-encoding mutations) is encoded as one record.
- * Field IDs are ULEB128 on the wire (format version 0x1D).  Slotted
- * families occupy interleaved-by-slot ranges so slot `k`'s five
- * family IDs are contiguous; this keeps low slots in the 1-byte
- * ULEB range alongside the hot singletons (N_LOADS, N_STORES,
- * METAFLAGS).  Slot 0..24 land in IDs 0..127 (1 byte); slot 25..63
- * spill to 2 bytes.  See champsim_tracer_format.md §5.1.
+ * Each per-entry observation is one record; field IDs are ULEB128.
+ * Slotted families are interleaved-by-slot so slot k's five family
+ * IDs are contiguous, keeping low slots in the 1-byte ULEB range
+ * alongside the hot singletons (slot 0..24 → 1 byte, 25..63 → 2).
+ * See champsim_tracer_format.md §5.1.
  */
 #define CST_FID_SLOT_COUNT       64   /* slots per slotted family */
 #define CST_FID_SLOT_STRIDE      5    /* family IDs per slot       */
@@ -246,14 +185,10 @@ extern "C" {
 
 /* Slotted families.  Slot k of family f lives at
  *   CST_FID_<FAMILY>_BASE + k * CST_FID_SLOT_STRIDE
- * The bases are adjacent (3..7) so slot 0 of all five families plus
- * the three hot singletons cleanly occupy IDs 0..7.
- *
- * Source-register pre-exec snapshots used to occupy a sixth family
- * here; they were retired because consumers can reconstruct any
- * register's current value from the regfile (BODY_TAG_REGFILE +
- * accumulated DST_REG snapshots).  No source-value family exists in
- * this format version.
+ * Bases are adjacent (3..7) so slot 0 of all five families plus the
+ * three hot singletons occupy IDs 0..7.  No source-value family
+ * exists: consumers reconstruct any register's current value from
+ * the regfile + accumulated DST_REG snapshots.
  */
 #define CST_FID_LOAD_ADDR_BASE   3    /* slot k at base + 5k     */
 #define CST_FID_STORE_ADDR_BASE  4
@@ -266,29 +201,16 @@ extern "C" {
 #define CST_FID_SLOTTED_END      (CST_FID_DST_REG_BASE + \
                                   (CST_FID_SLOT_COUNT - 1) * CST_FID_SLOT_STRIDE)
 
-/* Lane-mask block.  Separate from the hot slotted block above so the
- * cheaper 1-byte ULEB range stays reserved for memop / dst-reg FIDs
- * that fire every entry; lane masks for the common (static) case
- * cost zero record bytes anyway thanks to the field-delta encoding.
- *
- * Four lane-mask families, all with the same per-slot bitmap shape
- * (bit k = lane k participates):
- *
- *   SRC_LANE_MASK / DST_LANE_MASK  — per-reg-slot lane participation
- *                                    for src_regs[i] / dst_regs[d].
- *   LOAD_DATA_LANE_MASK            — per-memop lane participation,
- *                                    i.e. which lanes of the
- *                                    consuming reg this load fills.
- *   STORE_DATA_LANE_MASK           — per-memop lane participation,
- *                                    i.e. which lanes of the source
- *                                    reg this store drains.
- *
- * Refiner-set template baseline; FID deltas override at runtime when
- * the active mask differs (x86 EVEX k1 predicates, RISC-V V
- * vtype.VL, AArch64 SVE predicates).  Consumers combine, e.g.,
- * dst_lane_mask[d] ∩ load_data_lane_mask[k] to know which lanes of
- * dst[d] depend on memop[k] — gather/scatter (one memop per lane)
- * is the case that drove adding the memop-side masks.
+/* Lane-mask block.  Kept out of the hot slotted block so the cheap
+ * 1-byte ULEB range stays reserved for per-entry memop/dst-reg FIDs;
+ * static-case lane masks cost zero record bytes via field-delta
+ * encoding anyway.  Four families, same per-slot bitmap shape (bit k
+ * = lane k participates): SRC/DST per reg slot; LOAD_DATA/STORE_DATA
+ * per memop (which lanes of the consuming/source reg the memop
+ * fills/drains).  Refiner-set template baseline; FID deltas override
+ * at runtime for predicated forms (EVEX k1, RVV vtype.VL, SVE).
+ * Consumers combine e.g. dst_lane_mask[d] ∩ load_data_lane_mask[k];
+ * gather/scatter (one memop per lane) drove the memop-side masks.
  */
 #define CST_FID_LANE_BLOCK_BASE          (CST_FID_SLOTTED_END + 1)
 #define CST_FID_LANE_BLOCK_STRIDE        4
@@ -301,8 +223,7 @@ extern "C" {
                                           CST_FID_LANE_BLOCK_STRIDE)
 
 /* Cold instruction-metadata fields.  Baseline = template's static
- * value, so unchanged-from-template fields cost zero record bytes.
- * Numbered past the lane block; emit as 2-byte ULEBs.               */
+ * value (unchanged fields cost zero bytes).  2-byte ULEBs.          */
 #define CST_FID_INSN_BYTES_LO    (CST_FID_LANE_BLOCK_END + 1)  /* low 8 bytes of insn_bytes, LE u64 */
 #define CST_FID_INSN_BYTES_HI    (CST_FID_LANE_BLOCK_END + 2)  /* high 8 bytes (x86 long enc.)      */
 #define CST_FID_INSN_OPCODE      (CST_FID_LANE_BLOCK_END + 3)
@@ -390,13 +311,11 @@ typedef struct {
 } InitialRegSnap;
 
 /*
- * Per-insn QEMU register descriptor keys for InsnFields.src_regs[] and
- * InsnFields.dst_regs[].  Each entry is a pointer to a stable singleton
- * in g_qemu_reg_by_gen[] (built by build_qemu_reg_reverse_index() at
- * install time) — pointer identity per logical register is what makes
- * the TLS pointer-cache in RegHandleCache::lookup hit cross-instruction
- * for the same register.  NULL means the corresponding generic register
- * has no single QEMU register that can be read directly.
+ * Per-insn QEMU register descriptor keys for InsnFields.src_regs[] /
+ * dst_regs[].  Each entry is a stable singleton pointer into
+ * g_qemu_reg_by_gen[]; pointer identity per logical register is what
+ * makes RegHandleCache::lookup's TLS pointer-cache hit cross-insn.
+ * NULL: generic reg has no single directly-readable QEMU register.
  */
 typedef struct {
     const QemuRegKey *src_qemu_reg_keys[MAX_SRC_REGS];
@@ -427,6 +346,69 @@ typedef struct {
     uint8_t  has_addr;     /* nonzero when descriptor is valid */
 } SyntheticEAInfo;
 
+/*
+ * Run-aggregated PGO-style profiling per template instruction
+ * (champsim_tracer_format.md §6).  Pure metadata, never affects
+ * deterministic replay; POD for the BBTemplate g_new0/g_free
+ * lifecycle.  On-disk values are final run totals.
+ *
+ * Access-pattern class (pat_*) is classified on the SECOND-order
+ * difference of effective addresses (ddelta = delta_n - delta_{n-1}),
+ * not the raw step size: 0 none, 1 regular (every ddelta == 0), 2
+ * irregular (every |ddelta| ≤ 4096), 3 random (some |ddelta| > 4096,
+ * i.e. step jumped > a page).  Strongest class observed wins.
+ */
+enum {
+    CST_PAT_NONE = 0, CST_PAT_REGULAR = 1,
+    CST_PAT_IRREGULAR = 2, CST_PAT_RANDOM = 3,
+};
+/* |ddelta| threshold separating IRREGULAR from RANDOM: a step-size
+ * change larger than one 4 KiB page is treated as random. */
+enum { CST_PROFILE_RAND_DELTA = 4096 };
+/*
+ * profile pat_flags byte layout (self-described on the wire by the
+ * "mem_access_pattern" and "profile_flag" encoding maps):
+ *   bits[1:0]  CP access-pattern class (CST_PAT_*)
+ *   bits[3:2]  WP access-pattern class (CST_PAT_*)
+ *   bit[4]     CP data-is-address
+ *   bit[5]     WP data-is-address
+ */
+enum {
+    CST_PROFILE_PAT_CP_SHIFT = 0,
+    CST_PROFILE_PAT_WP_SHIFT = 2,
+    CST_PROFILE_PAT_MASK     = 0x3,
+    CST_PROFILE_ADDR_CP      = 0x10,
+    CST_PROFILE_ADDR_WP      = 0x20,
+};
+
+typedef struct {
+    uint64_t memops_cp, memops_wp;     /* total mem-ops issued     */
+    uint64_t lo_cp, hi_cp;             /* effective-addr bounds, CP */
+    uint64_t lo_wp, hi_wp;             /*                        WP */
+    uint64_t prev_addr_cp, prev_addr_wp;   /* last effective addr      */
+    int64_t  stride_cp, stride_wp;         /* PREVIOUS delta (rolling) */
+    uint8_t  have_prev_cp, have_prev_wp;   /* prev_addr valid          */
+    uint8_t  have_stride_cp, have_stride_wp; /* prev delta valid       */
+    uint8_t  pat_cp, pat_wp;           /* CST_PAT_*                */
+    uint8_t  addr_cp, addr_wp;         /* data-is-address seen     */
+} InsnProfile;
+
+typedef struct {
+    uint64_t exec_cp, exec_wp;
+    uint64_t br_taken_cp, br_nottaken_cp;
+    uint64_t br_taken_wp, br_nottaken_wp;
+    InsnProfile *insns;                /* g_new0 array, n_insns    */
+} TemplateProfile;
+
+/*
+ * "Data is an address" heuristic: the set of 4 KiB pages a real
+ * CORRECT-PATH mem-op touched (never wrong-path — WP is speculative
+ * and must not define the address space).  A value counts as an
+ * address when its page is in that CP-only set (sparse page-granular
+ * membership, not a min/max span).  Page = vaddr >> PAGE_SHIFT.
+ */
+enum { CST_PROFILE_PAGE_SHIFT = 12 };
+
 typedef struct BBTemplate BBTemplate;
 struct BBTemplate {
     uint32_t template_id;
@@ -434,6 +416,16 @@ struct BBTemplate {
     uint32_t n_insns;
     uint64_t *insn_pcs;
     uint64_t fall_through_pc;
+    /*
+     * Terminal branch's observed taken-edge target.  Both edges are
+     * always known per finalized BB (CP supplies the edge it took, the
+     * WP resolver the other), so this is filled even if CP never took
+     * the branch.  0 until resolved / non-branch BB.  Internal only,
+     * NOT a wire field: at serialization it becomes target_pc[0] of a
+     * non-indirect branch's 1-entry header list (indirect branches
+     * enumerate the per-PC BranchRecord set and ignore this).
+     */
+    uint64_t taken_pc;
     char *symbol_name;
     uint8_t *insn_sizes;
     uint8_t *insn_bytes;
@@ -457,15 +449,21 @@ struct BBTemplate {
      * emissions on a per-template cadence. */
     uint64_t emit_count;
     /*
-     * If this template's terminator is an x86 REP-prefixed string op
-     * (rep_loads_per_iter + rep_stores_per_iter > 0 on the last
-     * canonical insn), the body emitter fans the single TB-exec into
-     * N iteration entries: iter 1 stays on this template, iter 2..N
-     * emit on @rep_subtmpl — a 1-insn self-loop sub-template at the
-     * REP's PC, built at TB-translation time and cached separately
-     * from this parent.  NULL on non-REP TBs.
+     * Set when this template's terminator is an x86 REP-prefixed
+     * string op (rep_loads_per_iter + rep_stores_per_iter > 0 on the
+     * last canonical insn): a 1-insn self-loop sub-template at the
+     * REP's PC, built at translation time.  Body emitter fans a single
+     * TB-exec into N entries (iter 1 on this template, iter 2..N on
+     * rep_subtmpl).  NULL on non-REP TBs.  Materialized at translation
+     * but only emitted at >= 2 iters, so an unexercised REP leaves a
+     * 0/0-exec template in the dictionary — expected and benign;
+     * consumers treat it as a pre-declared, unreferenced self-loop.
      */
     BBTemplate *rep_subtmpl;
+    /* Run-aggregated profiling (champsim_tracer_format.md §6).
+     * Lazily allocated on first accumulation; freed with the
+     * template.  NULL until this BB executes at least once. */
+    TemplateProfile *profile;
 };
 
 enum DynParamType {
@@ -474,18 +472,12 @@ enum DynParamType {
 };
 
 /*
- * Runtime memory-access record emitted as a dyn-param.
- *
- * Only `value` is written to disk; `type`, `insn_index`, and data_*
- * are writer-internal bookkeeping used to:
- *  - group memops by owning instruction (insn_index),
- *  - split each instruction's memops into loads-then-stores (type),
- *  - update the per-entry observed counts (N_LOADS, N_STORES),
- *  - emit mem-data section values.
- *
- * The owning instruction and load/store type are *implicit* on disk —
- * the consumer reconstructs them by walking the template's per-insn
- * (n_loads, n_stores) schema.
+ * Runtime memory-access record emitted as a dyn-param.  Only `value`
+ * reaches disk; type / insn_index / data_* are writer-internal
+ * (group by owning insn, split loads-then-stores, update N_LOADS/
+ * N_STORES, emit mem-data).  Owning insn and load/store type are
+ * implicit on disk: the consumer reconstructs them by walking the
+ * template's per-insn (n_loads, n_stores) schema.
  */
 typedef struct {
     uint8_t  type;         /* DynParamType (writer-internal)        */
@@ -511,11 +503,9 @@ struct WPBBEntry {
     bool fault;
     bool translation_unavailable;
     /*
-     * Index (within THIS basic block) of the instruction that raised
-     * the synchronous exception when `fault` is true.  Undefined
-     * otherwise.  Consumers (e.g. ChampSim) use this to flag the
-     * specific uop as non-completing so its dependent slice is
-     * naturally squashed.
+     * Index within THIS BB of the insn that raised the synchronous
+     * exception when `fault`; undefined otherwise.  Consumers flag
+     * that uop non-completing so its dependent slice is squashed.
      */
     uint32_t fault_insn_index;
     BBTemplate *tmpl;  /* Non-owning; for per-insn schema access */
@@ -550,15 +540,12 @@ typedef struct {
     uint64_t prev_fall_through;
     uint64_t prev_bb_ends_in_branch;
     uint64_t insn_count;
-    /* Start PC of the most recent TB whose insns we counted toward
-     * insn_count.  When QEMU re-enters the same TB without
-     * architectural progress (the canonical case is x86 REP-prefixed
-     * string ops, where each iteration of the rep is exposed to the
-     * plugin as a separate exec_tb call against a single-insn TB at
-     * the same start_pc), we hold insn_count steady so it tracks
-     * *unique-PC visits* rather than dispatcher entries.  This keeps
-     * the icount aligned with PIN-style "one count per architectural
-     * insn" accounting on workloads that use REP MOVSB / STOSB / etc. */
+    /* Start PC of the most recent TB counted toward insn_count.  When
+     * QEMU re-enters the same single-insn TB without architectural
+     * progress (x86 REP string ops: each iteration is a separate
+     * exec_tb at the same start_pc), insn_count is held steady so it
+     * tracks unique-PC visits, keeping icount aligned with PIN-style
+     * one-count-per-architectural-insn accounting. */
     uint64_t last_counted_start_pc;
 } VCPUScoreBoard;
 
@@ -574,10 +561,12 @@ typedef struct {
 typedef struct {
     uint64_t pc;
     uint64_t fall_through;
-    /* Counted distinct taken-target history.  Indirect wrong-path
-     * selection treats one observed target as monomorphic and uses
-     * fall-through; with multiple observed targets it chooses the most
-     * frequent target that is not the CP target for this execution. */
+    /* Distinct taken-target history.  CORRECT-PATH ONLY: note_target()
+     * is never called during WP sim, so this pool stays unpolluted by
+     * speculative targets — essential because indirect WP selection
+     * mines this very pool (one observed target → monomorphic, use
+     * fall-through; multiple → most frequent that isn't the CP
+     * target). */
     BranchTargetHistoryEntry targets[BRANCH_TARGET_HISTORY];
     uint8_t n_targets;
     uint32_t target_tick;
@@ -598,27 +587,23 @@ typedef struct {
     uint64_t start_insn;
     uint64_t stop_insn;
     char *label;
-    /* Body output destination.  Streams the body member's bytes
-     * (CST_MAGIC + BODY_TAG_* records + trailing CST_MAGIC) to a
-     * temp file on disk.  When compress=<cmd> is set, the FILE* is
-     * the write end of a popen() pipe and the underlying file is
-     * the user's compression utility's stdout redirected to disk. */
+    /* Body output destination: streams body bytes to a temp file.
+     * With compress=<cmd> the FILE* is a popen() write end whose
+     * compressor stdout is redirected to disk. */
     FILE *body_file;
     bool body_is_pipe;
     WriterCtx *body_writer;  /* async writer thread feeding body_file */
     char *body_temp_path;    /* on-disk path of the (possibly compressed) body bytes */
     char *body_member_name;  /* name inside the outer tar (body.cst[.<ext>]) */
-    /* Header output destination.  Opened lazily at body_stream_
-     * finish; gets the small header buffer in one synchronous
-     * write.  Same compress=<cmd> handling as body. */
+    /* Header output destination.  Opened lazily at body_stream_finish;
+     * one synchronous write.  Same compress=<cmd> handling as body. */
     FILE *header_file;
     bool header_is_pipe;
     char *header_temp_path;
     char *header_member_name;
-    /* Final outer-tarball path the user originally asked for.
-     * After both body+header members are flushed and closed, the
-     * segment manager assembles a ustar of them at this path and
-     * unlinks the temp files. */
+    /* Final outer-tarball path.  After body+header members are
+     * flushed and closed, the segment manager assembles a ustar of
+     * them here and unlinks the temp files. */
     char *outfile_path;
     BodyStreamState *bin_stream;
     uint32_t body_seq_num;
@@ -635,14 +620,10 @@ typedef struct {
 
 /*
  * Raw byte buffer with inlined append.  Replaces GByteArray for the
- * encoder's per-entry scratch where g_byte_array_append showed up at
- * 1.5 % of total runtime — a function call into glib for every uleb /
- * sleb byte, when an inlined memcpy + length bump suffices.
- *
- * Owned by the holder via raw_buf_init / raw_buf_free; capacity grows
- * 2x when full, never shrinks (matches the encoder's reuse-the-largest
- * scratch pattern).  Not thread-safe — each holder is single-thread by
- * construction.
+ * encoder's per-entry scratch (g_byte_array_append was 1.5% of
+ * runtime — a glib call per uleb byte).  Capacity grows 2x, never
+ * shrinks (matches the reuse-the-largest-scratch pattern).  Not
+ * thread-safe; each holder is single-thread by construction.
  */
 typedef struct {
     uint8_t *data;
@@ -676,17 +657,14 @@ extern unsigned active_reg_table_size;
 extern int max_wrong_path_depth;
 extern bool enable_mem_data;
 extern bool enable_reg_data;
-/* WP-side data toggles.  Default to the matching CP-side flag at
- * qemu_plugin_install time when the user didn't explicitly set them.
+/* WP-side data toggles.  Default to the matching CP-side flag when
+ * unset at install time.
  *
- * enable_wp_mem_data: gates the VALUE half of WP memops only.  WP
- *   memop addresses are always recorded so the speculative path's
- *   memory footprint is preserved (the typical use case for cache
- *   sims / prefetcher work); the data values are dropped when off.
- *
- * enable_wp_reg_data: gates the per-insn register-value snapshots on
- *   the WP path.  Register identifiers come from the template either
- *   way; only the captured value stream is suppressed when off. */
+ * enable_wp_mem_data: gates only the VALUE half of WP memops; WP
+ *   addresses are always recorded (preserves the speculative memory
+ *   footprint for cache/prefetcher sims).
+ * enable_wp_reg_data: gates WP per-insn register-value snapshots;
+ *   register identifiers still come from the template. */
 extern bool enable_wp_mem_data;
 extern bool enable_wp_reg_data;
 extern char *qemu_command_line;
@@ -703,11 +681,9 @@ extern uint32_t iframe_rate;
 extern uint64_t warmup_insns;
 extern uint64_t simulation_insns;
 
-/* Synchronization & diagnostics.  GMutex stays (rather than
- * std::mutex) because <mutex>'s transitive include chain pulls
- * <cctype> -> <ctype.h>, and QEMU's include/qemu/ctype.h shadows the
- * system header on the plugin's -I search path.  That breaks
- * libstdc++'s `using ::isalnum;` declarations and the build fails. */
+/* Synchronization & diagnostics.  Must stay GMutex, not std::mutex:
+ * <mutex> pulls <ctype.h>, which QEMU's include/qemu/ctype.h shadows
+ * on the plugin -I path, breaking libstdc++'s `using ::isalnum;`. */
 extern GMutex data_lock;
 extern GMutex unknown_warn_lock;
 extern FILE *unknown_warn_file;
@@ -737,10 +713,10 @@ bool decode_synthetic_ea(const qemu_plugin_insn_info *info,
 void build_qemu_reg_reverse_index(void);
 
 /*
- * Wide regfile snapshot: opaque thread-local scratch keyed by the QEMU
- * register descriptors present in the active Capstone register table.  Used by the
- * wrong-path loop to capture pre-fragment register state (since CF_MEMI_ONLY
- * in spec mode suppresses per-insn exec callbacks).
+ * Wide regfile snapshot: opaque TLS scratch keyed by the active reg
+ * table's QEMU descriptors.  Used by the WP loop to capture
+ * pre-fragment register state (spec-mode CF_MEMI_ONLY suppresses
+ * per-insn exec callbacks).
  */
 typedef struct _WideRegSnap WideRegSnap;
 
@@ -757,13 +733,11 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
 #endif
 
 /*
- * Walk the GenericRegId reverse index and fill @out with one
- * InitialRegSnap per resolvable architectural register, reading values
- * from @cpu_index via the QEMU plugin API.  When @cpu_index is
- * (unsigned int)-1 (no vCPU context yet at install-time), every entry
- * is emitted with width_bytes=0 — the segment header still pins down
- * which generic IDs exist on this target, just without live values.
- * Defined in champsim_tracer_decode.cc.
+ * Fill @out with one InitialRegSnap per resolvable architectural
+ * register, read from @cpu_index.  @cpu_index == (unsigned)-1 (no
+ * vCPU context at install time) → all entries width_bytes=0 (header
+ * still pins which generic IDs exist, just no live values).  Defined
+ * in champsim_tracer_decode.cc.
  */
 void capture_initial_regfile(unsigned int cpu_index,
                              std::vector<InitialRegSnap> *out);
@@ -783,10 +757,9 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry);
  * destination (the WriterCtx passed to body_stream_new) is closed
  * by the segment manager separately after this returns. */
 void body_stream_finish(BodyStreamState *st, GByteArray **header_bytes);
-/* Free a BodyStreamState created by body_stream_new.  Mandatory
- * because BodyStreamState carries std::vector members that need
- * their destructors run; the forward-declared opaque pointer in
- * this header doesn't let callers `delete` directly. */
+/* Free a BodyStreamState.  Required (not free()): it carries
+ * std::vector members needing destructors, and the opaque forward
+ * decl here doesn't let callers `delete` directly. */
 void body_stream_free(BodyStreamState *st);
 
 #endif /* CHAMPSIM_TRACER_H */

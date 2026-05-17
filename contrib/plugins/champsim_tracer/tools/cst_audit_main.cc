@@ -1,10 +1,8 @@
 /*
  * cst_audit — byte-composition auditor for .cst traces.
  *
- * C++ port of cst_audit.py.  Mirrors that script's report layout and
- * field-delta bucket categorization byte-for-byte; the body walker is
- * a single tight loop over the mmap'd file with no per-record
- * allocations on the hot path.
+ * C++ port of cst_audit.py; mirrors that script's report layout and
+ * field-delta bucket categorization byte-for-byte.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -44,10 +42,8 @@ enum : int {
     NUM_BUCKETS     = 11,
 };
 
-/* FID -> bucket lookup.  Sized for the ULEB-encoded FID space.
- * Slotted families are read from the per-slot FID arrays in
- * ResolvedIds (name-resolved out of the encoding map — no stride
- * assumption); each slot's actual FID is whatever the writer chose. */
+/* FID -> bucket lookup over the ULEB FID space.  Slotted families
+ * come from ResolvedIds' name-resolved per-slot arrays (no stride). */
 struct FidTables {
     static constexpr size_t LUT_SIZE = 1024;
     std::array<uint8_t, LUT_SIZE> bucket{};
@@ -78,9 +74,8 @@ struct FidTables {
                 if (fid != 0 && fid < LUT_SIZE) bucket[fid] = fa.bucket_id;
             }
         }
-        /* Cold insn-metadata singletons.  Iterate the named singletons
-         * explicitly rather than scanning [fid_insn_bytes_lo, fid_insn_size]
-         * — the wire format doesn't promise they're contiguous. */
+        /* Cold insn-metadata singletons, named explicitly (the wire
+         * format doesn't promise they're contiguous). */
         const uint16_t cold_fids[] = {
             ids.fid_insn_bytes_lo, ids.fid_insn_bytes_hi,
             ids.fid_insn_opcode,   ids.fid_insn_branch_type,
@@ -104,12 +99,11 @@ struct Bucket {
 };
 
 struct Stats {
-    /* On-disk size of the whole .cst container (tar of header +
-     * possibly-compressed body).  Informational only: it is NOT a
-     * valid denominator for the uncompressed member sizes below. */
+    /* On-disk .cst container size.  Informational only — NOT a valid
+     * denominator for the uncompressed member sizes below. */
     uint64_t file_size         = 0;
-    /* Raw size of the body member as it sits in the tar (compressed
-     * bytes when body_codec is non-empty, else == body_total). */
+    /* Body member size in the tar (compressed when codec'd, else
+     * == body_total). */
     uint64_t body_compressed   = 0;
     std::string body_codec;
     uint64_t header_bytes      = 0;
@@ -138,18 +132,114 @@ struct Stats {
     /* Per-bucket detail across CP and WP field-delta streams. */
     std::array<Bucket, NUM_BUCKETS> cp_fd{};
     std::array<Bucket, NUM_BUCKETS> wp_fd{};
+
+    /* HEADER member byte breakdown (templates section + preamble). */
+    struct HeaderBreakdown {
+        uint64_t preamble  = 0;  /* meta fields + encoding-map section */
+        uint64_t framing   = 0;  /* tmpl count + per-tmpl length prefix */
+        uint64_t bb_info   = 0;  /* id/pc/n_insns/ft/n_targets/targets/sym */
+        uint64_t insn_desc = 0;  /* per-insn descriptors (excl. dep block) */
+        uint64_t dep_block = 0;  /* optional dependency sub-blocks */
+        uint64_t profile   = 0;  /* template profile block (format §6) */
+        uint64_t other     = 0;  /* unaccounted residue (should be 0) */
+    } hdr;
 };
 
-/* Tally the bytes consumed by a single field-delta record into the
- * caller's bucket table.  Used by both the CP and WP record loops
- * (only difference is which bucket table they're aggregating into).
- *
- * Format version 0x1D: fid is ULEB128 (previously u8); the
- * EXTRA_* raw-vector overflow path is retired, so every record
- * carries a single SLEB_WIDE delta (up to 512 bits).  Audit doesn't
- * care about the decoded value — skip_varint walks the
- * continuation bits without an overflow guard.
+/*
+ * Re-walk the header member attributing every byte to a group.
+ * Mirrors cst::parse_templates_at field-for-field so the sum
+ * reconciles exactly with the HEADER member size (rollup assert in
+ * print_report).
  */
+void account_header(cst::MemberView hv, const cst::ResolvedIds &ids,
+                    Stats::HeaderBreakdown *b)
+{
+    cst::Reader r(hv.data, 0, hv.size);
+    r.u32_le();                       /* magic                       */
+    r.u8();                           /* isa                         */
+    r.u8();                           /* flags                       */
+    r.uleb(); r.uleb(); r.uleb();     /* start / warmup / total      */
+    r.u64_le();                       /* simpoint weight             */
+    r.string(); r.string();           /* command / datetime          */
+    r.string(); r.string();           /* comment / target_name       */
+    { cst::Reader maps = r.sub(); (void)maps; }   /* encoding maps    */
+    b->preamble = r.pos();
+    if (r.eof()) {
+        return;
+    }
+
+    size_t cnt0 = r.pos();
+    uint64_t ntmpl = r.uleb();
+    b->framing += r.pos() - cnt0;
+
+    for (uint64_t i = 0; i < ntmpl; i++) {
+        size_t before = r.pos();
+        cst::Reader s = r.sub();
+        size_t payload = s.remaining();
+        b->framing += (r.pos() - before) - payload;
+
+        size_t p = s.pos();
+        s.uleb();                     /* template_id                 */
+        s.uleb();                     /* start_pc                    */
+        uint64_t n_insns = s.uleb();
+        s.uleb();                     /* fall_through_pc             */
+        uint64_t n_tgt = s.uleb();
+        for (uint64_t k = 0; k < n_tgt; k++) s.uleb();   /* target_pc */
+        s.string();                   /* symbol_name                 */
+        b->bb_info += s.pos() - p;
+
+        for (uint64_t k = 0; k < n_insns; k++) {
+            p = s.pos();
+            s.uleb();                 /* pc_delta                    */
+            s.u8();                   /* opcode                      */
+            s.u8();                   /* branch_type                 */
+            uint8_t flags = s.u8();
+            uint8_t n_src = s.u8();
+            uint8_t n_dst = s.u8();
+            for (uint8_t x = 0; x < n_src; x++) s.u8();
+            for (uint8_t x = 0; x < n_dst; x++) s.u8();
+            uint8_t mdl = s.u8();     /* max_dep_loads               */
+            uint8_t mds = s.u8();     /* max_dep_stores              */
+            if (flags & ids.insn_flag_has_imm) s.sleb();
+            uint8_t isz = s.u8();
+            if (isz) { std::vector<uint8_t> t(isz); s.raw(t.data(), isz); }
+            b->insn_desc += s.pos() - p;
+
+            if (flags & ids.insn_flag_has_dep_block) {
+                p = s.pos();
+                uint8_t df = s.u8();
+                if (df & ids.dep_block_has_reg) {
+                    for (uint8_t d = 0; d < n_dst; d++) s.uleb();
+                    for (uint8_t st = 0; st < mds; st++) s.uleb();
+                }
+                if (df & ids.dep_block_has_addr) {
+                    for (uint8_t l = 0; l < mdl; l++) s.uleb();
+                    for (uint8_t st = 0; st < mds; st++) s.uleb();
+                }
+                b->dep_block += s.pos() - p;
+            }
+        }
+
+        p = s.pos();
+        s.uleb(); s.uleb();           /* exec_cp / exec_wp           */
+        for (uint64_t k = 0; k < n_tgt; k++) {
+            s.uleb(); s.uleb(); s.uleb(); s.uleb();   /* per-target  */
+        }
+        for (uint64_t k = 0; k < n_insns; k++) {
+            uint64_t mcp = s.uleb();
+            uint64_t mwp = s.uleb();
+            s.u8();                   /* pat_flags                   */
+            if (mcp > 0) { s.uleb(); s.uleb(); }
+            if (mwp > 0) { s.uleb(); s.uleb(); }
+        }
+        b->profile += s.pos() - p;
+        b->other += s.remaining();    /* should be 0                 */
+    }
+}
+
+/* Tally one field-delta record's bytes into @fd_b.  Format 0x1D:
+ * fid is ULEB128, every record carries a single SLEB_WIDE delta (up
+ * to 512 bits) walked by skip_varint (no overflow guard). */
 static inline void tally_fd_record(
     cst::Reader &sec, const FidTables &fid, const cst::ResolvedIds &ids,
     std::array<Bucket, NUM_BUCKETS> *fd_b)
@@ -192,15 +282,12 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                 }
             }
 
-            /* CP field-delta section.  sub() consumes the ULEB
-             * payload length + payload bytes; we account for the
-             * length prefix separately by subtracting the payload
-             * size (captured before any reads via remaining()) from
-             * the parent's bytes-consumed delta.  Using sec.end()
-             * here was a long-standing bug: for mem-backed sub-
-             * Readers it's the *absolute* end offset, not the
-             * payload size, so the subtraction underflowed once the
-             * trace grew past a few hundred bytes. */
+            /* CP field-delta section.  Account the length prefix by
+             * subtracting payload size (captured via remaining()
+             * before any read) from the parent's consumed delta.
+             * NOTE: must use remaining(), not sec.end() — for
+             * mem-backed subs end() is the absolute offset, not
+             * payload size, and the subtraction underflows. */
             size_t sec_in_start = body.consumed();
             cst::Reader sec = body.sub();
             size_t sec_payload = sec.remaining();
@@ -356,12 +443,8 @@ std::string fmt_n(uint64_t v)
     return out;
 }
 
-/* Shared left-justified label column width for the ON DISK / MEMBER
- * SIZES / BODY BREAKDOWN sections.  Must be >= the longest label
- * ("REGFILE records (per-thread initial state)", 42 chars) so every
- * value/percent column lines up; the previous hard-coded 34 let the
- * IFRAME/REGFILE rows overflow and shoved their columns right, and
- * the TOTAL line used a different width again. */
+/* Shared label column width; must be >= the longest label (42 chars)
+ * so every value/percent column lines up. */
 static constexpr int LABEL_W = 42;
 
 std::string row(const std::string &label, uint64_t b, uint64_t total,
@@ -407,12 +490,9 @@ std::string fd_row(const std::string &label, const Bucket &cp,
 
 void print_report(const Stats &s)
 {
-    /* The member sizes below are measured uncompressed (the header
-     * is decompressed eagerly; the body is walked through the
-     * decompressor), so the 100% anchor MUST be the uncompressed
-     * total, not the on-disk container size.  Dividing uncompressed
-     * member bytes by the compressed container size produced bogus
-     * percentages well over 100% for codec'd traces. */
+    /* Member sizes are uncompressed, so the 100% anchor MUST be the
+     * uncompressed total, not the on-disk container size (else
+     * codec'd traces show >100%). */
     uint64_t total = s.header_bytes + s.body_total;
 
     std::printf("=== ON DISK ===\n");
@@ -436,6 +516,35 @@ void print_report(const Stats &s)
     std::printf("%s\n", row("HEADER member", s.header_bytes, total,
                              s.templates_count, "tmpl").c_str());
     std::printf("%s\n", row("BODY member (records)", s.body_total, total).c_str());
+
+    const Stats::HeaderBreakdown &hb = s.hdr;
+    uint64_t hb_sum = hb.preamble + hb.framing + hb.bb_info +
+                      hb.insn_desc + hb.dep_block + hb.profile + hb.other;
+    std::printf("\n=== HEADER BREAKDOWN (%s) ===\n",
+                human((double)s.header_bytes).c_str());
+    std::printf("%s\n", row("preamble + encoding maps",
+                             hb.preamble, s.header_bytes).c_str());
+    std::printf("%s\n", row("section framing (counts+lengths)",
+                             hb.framing, s.header_bytes).c_str());
+    std::printf("%s\n", row("BB info (id/pc/n/ft/targets/sym)",
+                             hb.bb_info, s.header_bytes,
+                             s.templates_count, "tmpl").c_str());
+    std::printf("%s\n", row("instruction descriptors",
+                             hb.insn_desc, s.header_bytes,
+                             s.templates_count, "tmpl").c_str());
+    std::printf("%s\n", row("dependency sub-blocks",
+                             hb.dep_block, s.header_bytes,
+                             s.templates_count, "tmpl").c_str());
+    std::printf("%s\n", row("template profile block",
+                             hb.profile, s.header_bytes,
+                             s.templates_count, "tmpl").c_str());
+    if (hb.other) {
+        std::printf("%s\n", row("UNACCOUNTED (should be 0)",
+                                 hb.other, s.header_bytes).c_str());
+    }
+    std::printf("%s  [rollup %.2f%%]\n",
+                row("  sum", hb_sum, s.header_bytes).c_str(),
+                s.header_bytes ? 100.0 * hb_sum / s.header_bytes : 0.0);
 
     uint64_t body = s.body_total;
     std::printf("\n=== BODY BREAKDOWN (%s) ===\n", human((double)body).c_str());
@@ -519,8 +628,7 @@ int main(int argc, char **argv)
     }
 
     try {
-        /* New tar-of-(body,header) container; cst_file_open
-         * resolves both members and decompresses on the fly. */
+        /* cst_file_open resolves both tar members + decompresses. */
         std::unique_ptr<cst::CstFile> cf = cst::cst_file_open(argv[1]);
 
         struct stat st;
@@ -532,13 +640,10 @@ int main(int argc, char **argv)
         std::unordered_map<uint32_t, size_t> by_id;
         cst::Header h = cst::parse_header(cf->header(), &templates, &by_id);
 
-        /* Body: stream the records through a Reader.  For compressed
-         * bodies this spawns the decompressor subprocess; for
-         * uncompressed bodies the Reader is a cheap view into the
-         * mmap.  Audit walks the entire body so we don't get the
-         * "skip the body" win that --templates-only does, but
-         * streaming still avoids the 100 GB-of-decompressed-RAM
-         * problem. */
+        /* Stream the body records through a Reader (decompressor
+         * subprocess for codec'd bodies, mmap view otherwise).
+         * Streaming avoids materialising the whole decompressed
+         * body in RAM. */
         auto body_stream = cst::body_stream_open(*cf);
 
         Stats s;
@@ -547,21 +652,38 @@ int main(int argc, char **argv)
         s.body_codec = cf->body_codec();
         s.header_bytes = cf->header().size;
         s.templates_count = templates.size();
+        account_header(cf->header(), h.ids, &s.hdr);
 
-        /* Key by the producer-assigned template_id, NOT by position
-         * in the templates vector: template ids are read verbatim
-         * from the header stream (cst_format parse_templates_at) and
-         * are not guaranteed dense or in insertion order, exactly as
-         * the decoder resolves them via its by_id map.  The old
-         * vector-by-position lookup mis-mapped every entry once ids
-         * diverged from indices, and the "id < size()" bound silently
-         * dropped any entry whose id exceeded the template count --
-         * the source of the "way off" instruction totals. */
+        /* Key by the producer-assigned template_id, NOT vector
+         * position: ids are read verbatim and aren't dense/ordered
+         * (matches the decoder's by_id resolution).  A by-position
+         * lookup mis-maps entries and drops any id past the count. */
         std::unordered_map<uint32_t, uint32_t> insns_by_tid;
         insns_by_tid.reserve(templates.size());
+        uint64_t prof_exec_cp = 0, prof_exec_wp = 0;
+        uint64_t prof_memop_insns = 0, prof_addr_insns = 0;
+        uint64_t prof_pat[4] = {0, 0, 0, 0};
         for (const auto &t : templates) {
             insns_by_tid[t.template_id] = (uint32_t)t.insns.size();
+            prof_exec_cp += t.profile.exec_cp;
+            prof_exec_wp += t.profile.exec_wp;
+            for (const auto &ip : t.profile.insns) {
+                if (ip.memops_cp || ip.memops_wp) prof_memop_insns++;
+                if (ip.addr_cp || ip.addr_wp) prof_addr_insns++;
+                prof_pat[ip.pat_cp & 0x3]++;
+            }
         }
+        std::printf("  profile: exec_cp=%llu exec_wp=%llu  "
+                    "mem-insns=%llu addr-insns=%llu  "
+                    "pat[none/reg/irr/rand]=%llu/%llu/%llu/%llu\n",
+                    (unsigned long long)prof_exec_cp,
+                    (unsigned long long)prof_exec_wp,
+                    (unsigned long long)prof_memop_insns,
+                    (unsigned long long)prof_addr_insns,
+                    (unsigned long long)prof_pat[0],
+                    (unsigned long long)prof_pat[1],
+                    (unsigned long long)prof_pat[2],
+                    (unsigned long long)prof_pat[3]);
 
         try {
             walk_body(body_stream->reader(), h.ids, insns_by_tid, &s);
@@ -576,10 +698,8 @@ int main(int argc, char **argv)
             throw;
         }
         body_stream->finalize();
-        /* body_total is the consumed byte count for the record
-         * stream (everything between the leading and trailing
-         * CST_MAGIC), summed across all records walked.  Equivalent
-         * to body_records.size in the old code. */
+        /* body_total: consumed bytes for the record stream (between
+         * leading and trailing CST_MAGIC). */
         s.body_total = s.cp_entry_framing.bytes
                      + s.cp_field_delta.bytes
                      + s.thread_switch.bytes

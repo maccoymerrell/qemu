@@ -1087,6 +1087,7 @@ X86_CROSS_LANE_PREFIXES: tuple[str, ...] = (
     "VPSHUF", "PSHUF",
     "VBROADCAST", "VPBROADCAST",
     "VPERM", "VPERMI2", "VPERMT2",
+    "VPPERM",          # XOP 2-source byte permute (not a VPERM* form)
     "VHADD", "VHSUB", "HADD", "HSUB",
     "VPHADD", "VPHSUB", "PHADD", "PHSUB",
     "VEXTRACT", "VINSERT",
@@ -1299,20 +1300,57 @@ _LANE_CLASSIFIERS = {
 }
 
 
+# Default lane-mask kind per ISA when an op is known-vector by its
+# GEN_OP family but the Capstone-variant / name heuristics didn't
+# recognise it (newer/extension SIMD: AVX-512 w/o width markers,
+# 3DNow!/XOP, MIPS MSA/DSP, RISC-V CORE-V P-ext, ...).  RISC-V uses
+# the vtype CSR; everyone else has a static per-instruction lane
+# count.
+_ISA_DEFAULT_LANE_KIND = {
+    "riscv": "LANE_MASK_KIND_RISCV_VTYPE",
+}
+
+# Vector GEN_OP families whose dataflow is element-wise (lane k of
+# the dst depends only on lane k of the srcs) — lane_parallel=True
+# by default.  Everything else vector (shuffle/move/broadcast,
+# loads/stores incl. gather/scatter, latency buckets) is treated
+# cross-lane (False) when the heuristic couldn't decide: a wrong
+# True wrongly licenses per-lane chain modelling, so the safe
+# default is False.
+_VEC_PARALLEL_FAMILIES = {
+    "GEN_OP_VEC_ADD", "GEN_OP_VEC_SUB", "GEN_OP_VEC_MUL",
+    "GEN_OP_VEC_DIV", "GEN_OP_VEC_SQRT", "GEN_OP_VEC_MADD",
+    "GEN_OP_VEC_MSUB", "GEN_OP_VEC_LOGIC",
+}
+
+
 def classify_lane_info(info: IsaInfo,
-                       const_name: str) -> tuple[str, bool]:
-    """Decide whether @const_name is a vector op (per Capstone
-    variant detail) and which lane-mask kind + lane_parallel value
-    to assign.  Returns (lane_mask_kind, lane_parallel).
+                       const_name: str,
+                       gen_op: str) -> tuple[str, bool]:
+    """Decide the lane-mask kind + lane_parallel for @const_name.
+
+    Primary signal is the per-ISA Capstone-variant/name classifier.
+    But a lane-mask kind drives how decode.cc captures the per-lane
+    masks, so it MUST be present on every vector/SIMD instruction —
+    a vector op left at LANE_MASK_KIND_NONE silently disables
+    per-lane capture for that instruction.  So when the heuristic
+    can't recognise an op the opcode classifier already placed in a
+    GEN_OP_VEC_* family, fall back to the ISA's default kind with a
+    family-derived lane_parallel.  Returns (lane_mask_kind,
+    lane_parallel).
     """
     fn = _LANE_CLASSIFIERS.get(info.key)
-    if fn is None:
-        return ("LANE_MASK_KIND_NONE", False)
-    variants = _variants_by_canonical(info.key).get(const_name, ())
-    result = fn(const_name, variants)
-    if result is None:
-        return ("LANE_MASK_KIND_NONE", False)
-    return result
+    result = None
+    if fn is not None:
+        variants = _variants_by_canonical(info.key).get(const_name, ())
+        result = fn(const_name, variants)
+    if result is not None:
+        return result
+    if gen_op.startswith("GEN_OP_VEC_"):
+        kind = _ISA_DEFAULT_LANE_KIND.get(info.key,
+                                          "LANE_MASK_KIND_STATIC")
+        return (kind, gen_op in _VEC_PARALLEL_FAMILIES)
+    return ("LANE_MASK_KIND_NONE", False)
 
 
 def norm_flags(flags: str) -> str:
@@ -3220,7 +3258,8 @@ def generated_body(info: IsaInfo, constants: list[str], existing: dict[str, Entr
                 and new.op in FP_VEC_PROMOTE_OPS):
             refine = "refine_arm64_fp_vec"
         dep_refine = classify_dep_refine(info, const_name, new)
-        lane_kind, lane_par = classify_lane_info(info, const_name)
+        lane_kind, lane_par = classify_lane_info(info, const_name,
+                                                 new.op)
         new = Entry(new.op, new.branch, new.flags, refine, dep_refine,
                     lane_kind, lane_par)
         if dep_refine:

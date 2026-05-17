@@ -4,11 +4,10 @@ Reference: symbolic IDs
 The wire format encodes opcodes, branch types, register IDs, and
 field IDs as ``u8`` integers.  The trace's encoding-maps section
 (see :doc:`/format`) carries the canonical name for each value
-inside the file itself, so a decoder reading a fresh trace never
+inside the file itself, so a decoder reading a trace never
 needs to consult these tables.  This page exists for two cases:
 
-* Decoding a trace produced by an older plugin build whose
-  encoding maps are missing or stale.
+* Decoding a trace whose encoding maps are missing or stale.
 * Producing a ``.cst`` trace from a non-QEMU source: a static
   binary translator, a different simulator, an ISA the QEMU plugin
   doesn't yet support.
@@ -103,7 +102,7 @@ records.
        ``ldlar``, RISC-V ``.aq`` hints) are memory-ordered single loads
        and stay plain ``LOAD`` without ``MF_ATOMIC``.
 
-       x86 gather (``vgather*`` / ``vpgather*``) now classifies as
+       x86 gather (``vgather*`` / ``vpgather*``) classifies as
        ``GEN_OP_VEC_LOAD`` (SIMD-indexed load), not plain ``LOAD``.
    * - ``GEN_OP_STORE``
      - Memory write. Fall-through classification; mirror of ``LOAD``.
@@ -133,7 +132,7 @@ records.
        refiner detects the implicit base-register write and reclassifies
        to ``INT_ADD``.
 
-       x86 scatter (``vscatter*`` / ``vpscatter*``) now classifies as
+       x86 scatter (``vscatter*`` / ``vpscatter*``) classifies as
        ``GEN_OP_VEC_STORE``; ``maskmov*`` stays ``STORE``.
    * - ``GEN_OP_PUSH``
      - Stack push (memory write + SP update). Almost exclusively x86
@@ -260,7 +259,7 @@ records.
        ``lfence`` / ``sfence``, cache-wide ops without an address
        (``invd``, ``wbinvd``, ``serialize``); AArch64 ``dmb`` / ``dsb`` /
        ``isb`` / ``clrex``; RISC-V ``fence`` / ``fence.i``. Cache- and
-       TLB-management opcodes that *carry an address operand* now map to
+       TLB-management opcodes that *carry an address operand* map to
        ``GEN_OP_CACHE_FLUSH`` / ``GEN_OP_TLB_FLUSH`` /
        ``GEN_OP_PREFETCH`` instead — see those rows below.
    * - ``GEN_OP_CMOV``
@@ -560,9 +559,9 @@ mapping.
    field by *name* via the header's ``field_id`` encoding map, never
    by a hard-coded number.  The slotted families are *interleaved by
    slot* (slot ``k`` of every family co-located) rather than
-   family-then-slot.  ``CST_FID_SLOT_COUNT`` is **64** (raised from
-   16); the old ``CST_FID_EXTRA_*`` overflow vectors were retired
-   with that raise and do not exist in format ``0x1D``.
+   family-then-slot.  ``CST_FID_SLOT_COUNT`` is **64**;
+   there are no ``CST_FID_EXTRA_*`` overflow vectors in format
+   ``0x1D``.
 
 .. list-table::
    :header-rows: 1
@@ -704,6 +703,55 @@ hard-coding the bit positions.  ``REG_FLAGS`` (generic id 251) is
 the *architectural* register name a consumer compares against to
 decide whether an insn writes flags; the metaflags byte under FID
 0x77 is the canonical-shape value.
+
+.. _mem-access-pattern:
+
+Memory access-pattern classes (``CST_PAT_*``)
+---------------------------------------------
+
+Each template-profile per-instruction record carries a 2-bit
+access-pattern class for the correct path and another for the
+wrong path (see :doc:`concepts`, *Run-aggregated profile*, and
+:doc:`format` §6).  The classifier looks at the **second-order**
+difference of effective addresses — how much the *step size*
+changed between consecutive accesses (``ddelta = delta_n -
+delta_{n-1}``), not the raw step — so a smoothly accelerating walk
+is *irregular*, not *random*.  The strongest class observed over
+the run wins; the page threshold separating irregular from random
+is ``CST_PROFILE_RAND_DELTA`` (4096).  The value names resolve via
+the trace's own ``mem_access_pattern`` encoding map.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 12 24 64
+
+   * - Value
+     - Name
+     - Meaning
+   * - ``0``
+     - ``CST_PAT_NONE``
+     - No memory access observed for this instruction.
+   * - ``1``
+     - ``CST_PAT_REGULAR``
+     - Constant stride, including stride 0 (same address
+       re-touched).  Every ``ddelta`` is 0.
+   * - ``2``
+     - ``CST_PAT_IRREGULAR``
+     - Stride varies but every ``|ddelta|`` ≤ 4096 — a smoothly
+       changing stride (e.g. an address walk ``1, 2, 3, …`` whose
+       step grows by 1 each time).
+   * - ``3``
+     - ``CST_PAT_RANDOM``
+     - Some ``|ddelta|`` > 4096 — the step size itself jumped by
+       more than a page between two consecutive accesses.
+
+A companion *data-is-address* bit (``CST_PROFILE_ADDR_CP`` /
+``CST_PROFILE_ADDR_WP`` in the profile ``pat_flags`` byte) flags
+instructions whose loaded / stored value falls on a 4 KiB page
+some real **correct-path** mem-op also touched — a pointer-chasing
+signal.  The page set is never populated from wrong-path mem-ops
+(WP is speculative and must not define the legitimate address
+space), even for the WP flag.
 
 .. _isa-ids:
 

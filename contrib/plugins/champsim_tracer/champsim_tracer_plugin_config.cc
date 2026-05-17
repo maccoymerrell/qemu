@@ -106,17 +106,12 @@ bool set_iframe_rate(PluginConfig *cfg, const char *v)
  *   trace_window=simpoint:file=mcf.sp;interval=100000000;simulation=20000000;warmup=2000000
  *   trace_window=symbol:name=main;occurrence=3;simulation=20000000
  *
- * Unifies the formerly flat start=/stop=, spfile=/spinterval=/warmup=/
- * simulation=, and the new symbol-trigger flags into one option
- * whose first colon-delimited token names the mode.  Each mode
- * accepts only its own keys; passing keys from a different mode
- * (e.g. warmup= under icount) is rejected so users can't silently
- * mix-and-match.
+ * First colon-delimited token names the mode; each mode accepts only
+ * its own keys (cross-mode keys are rejected, no silent mixing).
  *
- * The inner key/value list uses semicolons rather than commas: QEMU's
- * top-level plugin-arg parser splits on commas before the plugin
- * sees argv, so commas inside a single value would scatter the
- * pairs across separate argv entries.
+ * The inner k/v list uses ';' not ',': QEMU's plugin-arg parser
+ * splits argv on commas before the plugin sees it, so commas inside a
+ * value would scatter pairs across separate argv entries.
  */
 bool parse_kv_pair(PluginConfig *cfg, const char *mode,
                    const std::pair<const char *, const char *> &kv)

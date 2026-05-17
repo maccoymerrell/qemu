@@ -48,9 +48,87 @@ using the *first* observed template — newer instructions at that
 PC are ignored.  Workloads that genuinely modify their own code
 (JIT compilers replacing trace fragments, dynamic patchers) will
 produce traces that under-describe their later behavior.  No
-graceful workaround exists today; if your workload SMCs heavily,
-the trace's templates section will be a snapshot of an early
-version of the program text.
+graceful workaround exists; if your workload SMCs heavily,
+the trace's templates section is a snapshot of the first-seen
+program text at each ``start_pc``.
+
+Hard bounds at a glance
+-----------------------
+
+The wire format and the speculative simulator carry a small set of
+fixed numeric ceilings.  Most workloads never approach them, but
+programs with unusual shape (very wide vector memops, register-sized
+bulk memory instructions, deep wrong-path divergence) can.  Each row
+links to the prose that explains the consequence of hitting it.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 18 52
+
+   * - Quantity
+     - Bound
+     - Notes
+   * - Instructions per basic block
+     - effectively unbounded
+     - A true BB runs from a branch target to the next branch; no
+       fixed cap.  Templates grow with BB length.
+   * - Instructions per trace
+     - effectively unbounded
+     - ``total_target_insns = 0`` in the header means "unbounded";
+       count body entries via the trailer's ``num_entries`` instead.
+   * - Slotted load addresses / data per instruction
+     - ``CST_FID_SLOT_COUNT`` = 64
+     - ``LOAD_ADDR``/``LOAD_DATA`` slots 0..63.  There is no
+       overflow vector; a single instruction issuing more than 64
+       loads is not representable (no supported ISA instruction
+       does — AVX-512 gather is 16-wide).
+   * - Slotted store addresses / data per instruction
+     - ``CST_FID_SLOT_COUNT`` = 64
+     - ``STORE_ADDR``/``STORE_DATA`` slots 0..63; likewise no
+       overflow vector.
+   * - WP-side memops captured per instruction
+     - ``CST_FID_SLOT_COUNT`` = 64
+     - ``MemAccessRecorder::record`` drops memops past this on the
+       wrong path (no overflow vector on WP).
+   * - Load/store data value width
+     - ``CST_MAX_WIDE_BYTES`` = 64 bytes (512 bit)
+     - A single memory value is encoded in at most 64 bytes.
+   * - Register snapshot width
+     - ``CST_MAX_WIDE_BYTES`` = 64 bytes (512 bit)
+     - ``regdata=1`` copies at most 64 bytes per architectural
+       register; wider state is truncated to the low 512 bits.
+   * - Distinct architectural register IDs
+     - 255 (``GenericRegId`` 0..254)
+     - 255 (``REG_ID_COUNT``) is the count sentinel; an ISA needing
+       more than 255 register IDs requires a wire-format change.
+   * - WP speculative store buffer
+     - ``PLUGIN_SPEC_STORE_BUF_MAX`` = 64 MiB of byte entries
+     - The per-CPU speculative store buffer (QEMU's
+       ``qemu_plugin_spec_mode_begin`` / ``_end`` API) holds every
+       wrong-path write for store-to-load forwarding and discards
+       them all at chain end.  Past the cap no new keys are added
+       (existing keys still update); excess speculative stores are
+       not forwarded.  Far above any real wrong-path store set.
+   * - AArch64 FEAT_MOPS speculative set/copy
+     - ``MOPS_SPEC_MAX_BYTES`` = 256 bytes per instruction
+     - ``SETP/SETM/SETE`` and ``CPYP/CPYM/CPYE`` loop a
+       register-sized memory op inside one TCG helper.  On the
+       wrong path the size register is speculative garbage, so the
+       operation is clamped to a sub-page bound (wrong-path memory
+       is discarded, so a bounded set/copy is indistinguishable).
+   * - Stuck-PC speculative-loop guard
+     - ``CST_FID_SLOT_COUNT`` = 64 same-PC iterations
+     - A wrong-path instruction that never advances PC (e.g. an x86
+       ``rep`` whose sandboxed write keeps PC anchored) is forced
+       past after this many same-PC iterations, preventing an
+       infinite speculative loop.
+   * - Wrong-path chain depth
+     - ``wpdepth`` instructions (configurable)
+     - The speculative side-trip after each correct-path branch is
+       bounded by the ``wpdepth`` plugin argument.
+
+The rows below expand the consequences that are not self-evident
+from the table.
 
 Trace-content limitations
 -------------------------
@@ -69,18 +147,17 @@ single load/store value is encoded in up to 64 bytes.  ``rep movs``
 and other multi-iteration instructions surface one body entry per
 iteration (see the wire-format spec's *REP-prefixed self-loop BBs*
 section), so each entry carries at most 1 load + 1 store — the
-slotted ``LOAD_ADDR[0..15]`` / ``STORE_ADDR[0..15]`` (and matching
-``DATA``) families are sufficient on the CP path.  The
-``EXTRA_LOAD_ADDR`` / ``EXTRA_STORE_ADDR`` raw-vector overflow
-records are reserved for genuinely wide single-instruction memops
-(AVX-512 gather/scatter etc.).
+slotted ``LOAD_ADDR[0..63]`` / ``STORE_ADDR[0..63]`` (and matching
+``DATA``) families cover every supported instruction; there is no
+overflow vector, and the widest single-instruction memops (AVX-512
+gather/scatter, 16-wide) sit well inside the 64 slots.
 
-**WP memops capped at 16 per insn.**  ``MemAccessRecorder::record``
-caps WP-side memops at ``CST_FID_SLOT_COUNT == 16`` per
-instruction and silently drops the rest.  Real workloads almost
-never hit this; pathological cases involve x86 ``rep`` opcodes on
-the wrong path, where speculative iteration is bounded by the WP
-depth budget anyway.
+**Memops capped at 64 per insn.**  ``MemAccessRecorder::record``
+caps per-instruction memops at ``CST_FID_SLOT_COUNT`` = 64 and
+drops the rest.  Real workloads almost never hit this;
+pathological cases involve x86 ``rep`` opcodes on the wrong path,
+where speculative iteration is bounded by the WP depth budget
+anyway.
 
 **Sub-instruction WP coverage past faults is limited.**  The WP
 simulator continues *past* in-flight faults on non-branch

@@ -1,13 +1,11 @@
 /*
  * Wrong-Path Tracing Plugin — generic ID enums.
  *
- * Glib-free subset of champsim_tracer_mnemonics.h: just the
- * ISA-agnostic enum domains and their COUNT sentinels.  Carved out
- * so champsim_tracer_stats.h (a lightweight POD header) can size its
- * per-CP-execution attribution arrays in lockstep with the enums
- * without dragging mnemonics.h's glib dependency through every TU.
- *
- * mnemonics.h includes this header; both stay in lockstep.
+ * Glib-free subset of champsim_tracer_mnemonics.h: the ISA-agnostic
+ * enum domains and their COUNT sentinels.  Carved out so the
+ * lightweight POD champsim_tracer_stats.h can size its attribution
+ * arrays without mnemonics.h's glib dependency.  mnemonics.h includes
+ * this header; both stay in lockstep.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -17,22 +15,14 @@
 #include <stdio.h>  /* snprintf in generic_reg_name */
 
 /*
- * Canonical metaflags byte layout (v1.12+).  An ISA-agnostic subset
- * of arithmetic flags that trace-based simulation consumers care
- * about.  Carried in the wire format as a per-insn side-channel
- * record under CST_FID_METAFLAGS (not as a synthetic register
- * slot), populated by the encoder from the architectural REG_FLAGS
- * dst snap via isa_properties[trace_isa].flags_to_metaflags.  Bits
- * not populated by a given ISA stay zero (e.g. P is x86-only).
- * RISC-V and MIPS have no integer flags register and never emit
- * CST_FID_METAFLAGS records.
- *
- * One byte on the wire — the encoder treats it like any other
- * scalar field, so the delta stream compresses it.
- *
- * Defined here in the lightweight header so the per-ISA mnemonic
- * tables (C-only TU) can supply the bit-shuffle helper without
- * pulling in champsim_tracer.h's plugin / glib surface.
+ * Canonical metaflags byte (v1.12+): an ISA-agnostic subset of
+ * arithmetic flags.  Carried on the wire as a per-insn
+ * CST_FID_METAFLAGS side-channel record (not a synthetic reg slot),
+ * populated from the REG_FLAGS dst snap via
+ * isa_properties[trace_isa].flags_to_metaflags.  Bits unset by an ISA
+ * stay zero (P is x86-only); RISC-V/MIPS have no flags reg and never
+ * emit this record.  Defined here so the C-only mnemonic-tables TU
+ * can supply the bit-shuffle helper without champsim_tracer.h.
  */
 #define CST_METAFLAGS_Z    (1u << 0)  /* zero / equal */
 #define CST_METAFLAGS_N    (1u << 1)  /* negative / sign */
@@ -70,12 +60,10 @@ enum GenericOpcode {
                         * value distinction, not latency/dataflow. */
     GEN_OP_ROL = 11,
     GEN_OP_ROR = 12,
-    /* Scalar bit-field / bit-count manipulation: BMI/BMI2 (BEXTR,
-     * BLSI/BLSMSK/BLSR, BZHI, PDEP, PEXT), POPCNT, LZCNT/TZCNT,
-     * BSF/BSR.  Distinct from the boolean GEN_OP_AND/OR/... class:
-     * these rearrange/extract/count bits rather than apply a
-     * bitwise boolean, and on real cores sit on a different port
-     * with multi-cycle latency. */
+    /* Scalar bit-field / bit-count manip: BMI/BMI2, POPCNT,
+     * LZCNT/TZCNT, BSF/BSR.  Distinct from boolean AND/OR/...: these
+     * rearrange/extract/count bits and sit on a different port with
+     * multi-cycle latency on real cores. */
     GEN_OP_BITMANIP = 13,
     GEN_OP_MOV = 14,
     GEN_OP_LOAD = 15,
@@ -107,12 +95,10 @@ enum GenericOpcode {
     GEN_OP_VEC_SQRT = 39,   /* packed sqrt & rsqrt approximation
                              * (SQRTPS, RSQRTPS, VRSQRT14P*). */
     GEN_OP_VEC_MOV = 40,
-    /* Vector load/store: the memory access is the defining behaviour
-     * (no substantial ALU/compute op), but it moves a SIMD-width
-     * value or uses a SIMD indexed (gather/scatter) addressing mode,
-     * so it is worth distinguishing from scalar GEN_OP_LOAD/STORE.
-     * Per the load/store-yield rule, any instruction doing real
-     * compute is classified by that compute, not as VEC_LOAD/STORE. */
+    /* Vector load/store: memory access is the defining behaviour but
+     * moves a SIMD-width value or uses SIMD gather/scatter, so it is
+     * distinguished from scalar LOAD/STORE.  Per the load/store-yield
+     * rule, real-compute insns classify by the compute instead. */
     GEN_OP_VEC_LOAD = 41,
     GEN_OP_VEC_STORE = 42,
     GEN_OP_VEC_SHUF = 43,
@@ -132,35 +118,25 @@ enum GenericOpcode {
     GEN_OP_VEC_MADD = 57,
     GEN_OP_VEC_MSUB = 58,
     /*
-     * Memory-side hint / management instructions.  These do not
-     * normally generate a TCG memop in QEMU (PREFETCHh, CLFLUSH,
-     * INVLPG, AArch64 PRFM, RISC-V CBO, ...), but the tracer
-     * synthesises a load memop slot carrying the effective address by
-     * decoding the operand at translation time and reading base/index
-     * register values at exec time.  Consumers may treat:
-     *   GEN_OP_PREFETCH      — software prefetch hint (warm cache line)
-     *   GEN_OP_CACHE_FLUSH   — explicit cache-line clean/flush/invalidate
-     *   GEN_OP_TLB_FLUSH     — explicit TLB-entry invalidation
-     *   GEN_OP_VEC_PREFETCH  — SIMD / gather-prefetch hint (one or
-     *                          more SIMD-indexed cache-line warms)
-     * The address (when present) is in the load-memop slot; opcode
-     * carries the semantic distinction.
+     * Memory-side hint/management insns (PREFETCHh, CLFLUSH, INVLPG,
+     * AArch64 PRFM, RISC-V CBO, ...).  These emit no TCG memop, so the
+     * tracer synthesises a load memop slot carrying the effective
+     * address (operand decoded at translation, base/index read at
+     * exec).  Address rides the load slot; opcode carries the
+     * semantic distinction (prefetch / cache-flush / TLB-flush /
+     * vec-prefetch).
      */
     GEN_OP_PREFETCH = 59,
     GEN_OP_CACHE_FLUSH = 60,
     GEN_OP_TLB_FLUSH = 61,
     GEN_OP_VEC_PREFETCH = 62,
     /*
-     * Coarse fallback latency buckets, reserved for external trace
-     * writers that lack ISA-specific opcode metadata.  The in-tree
-     * tracer never emits these IDs (every Capstone-classified insn
-     * lands in one of the specific opcodes above), but consumer code
-     * is encouraged to handle them so foreign traces remain
-     * decodable.  SHORT vs LONG is a single-bit hint that the
-     * upstream classifier knows the op's pipeline latency class:
-     * SHORT is a single-cycle ALU op; LONG is anything that occupies
-     * a long-latency unit (multi-cycle multiplier, divider, vector
-     * pipe, etc.).
+     * Coarse fallback latency buckets for external trace writers
+     * lacking ISA-specific opcode metadata.  The in-tree tracer never
+     * emits these (every Capstone-classified insn gets a specific
+     * opcode above), but consumers should handle them so foreign
+     * traces decode.  SHORT = single-cycle ALU; LONG = long-latency
+     * unit (multiplier, divider, vector pipe, ...).
      */
     GEN_OP_INT_ALU_SHORT = 63,
     GEN_OP_INT_ALU_LONG  = 64,
@@ -180,15 +156,13 @@ enum BranchType {
     BRANCH_SYSCALL_TYPE = 4,
     BRANCH_COND_DIRECT = 5,
     /*
-     * x86 REP / REPNZ self-loop terminator.  The instruction is a
-     * conditional self-loop branch (target = self-PC, fall-through
-     * = next PC); the tracer fans architectural iterations out into
-     * per-iteration body entries on a 1-insn self-loop sub-template
-     * (see champsim_tracer_format.md §"REP-prefixed self-loop BBs").
-     * Consumer simulators that want to model REP as a hot loop
-     * should distinguish this from BRANCH_COND_DIRECT so the
-     * self-loop semantics (no predictor target diversity) are
-     * obvious in the trace.
+     * x86 REP / REPNZ self-loop terminator: a conditional self-loop
+     * branch (target = self-PC, fall-through = next PC).  The tracer
+     * fans iterations into per-iteration entries on a 1-insn
+     * self-loop sub-template (see champsim_tracer_format.md
+     * §"REP-prefixed self-loop BBs").  Kept distinct from
+     * BRANCH_COND_DIRECT so consumers see the no-target-diversity
+     * self-loop semantics.
      */
     BRANCH_REP = 6,
     BRANCH_TYPE_COUNT,
@@ -276,12 +250,10 @@ enum GenericRegId {
 };
 
 /*
- * Symbolic name lookups.  Inline helpers — both the output-side
- * encoding-map writer (wire format) and the exit-time stats printer
- * (human-facing) call these so names live in exactly one place per
- * enum.  Return NULL for unallocated IDs (reserved holes, future
- * codepoints).  Use the *_or_unknown wrappers below when callers
- * need a guaranteed non-NULL printable string. */
+ * Symbolic name lookups.  Single source of truth per enum, used by
+ * both the wire-format encoding-map writer and the stats printer.
+ * Return NULL for unallocated IDs; use the *_or_unknown wrappers when
+ * a non-NULL string is required. */
 static inline const char *generic_opcode_name(unsigned id)
 {
     switch (id) {
@@ -385,15 +357,11 @@ static inline const char *branch_type_name_or_unknown(unsigned id)
 }
 
 /*
- * Symbolic register name.  Returns one of the well-known special-
- * purpose names (REG_SP, REG_FLAGS, REG_IP, REG_LR, REG_FP_REG,
- * REG_NONE, REG_ZERO, REG_MATRIX, REG_SYS, REG_FCSR, REG_VCTRL),
- * a class+index name for the dense banks (REG_GPR<N>, REG_FPR<N>,
- * REG_VEC<N>, REG_PRED<N>, REG_SEG<N>, REG_BOUND<N>, REG_ACC<N>),
- * or REG_CTRL/REG_DEBUG for those singletons.  Returns NULL for IDs
- * in the unallocated holes (246..249).  Result for the dense-bank
- * case lives in a thread_local buffer so callers must not retain
- * the pointer beyond the next call.
+ * Symbolic register name: a well-known special name, a class+index
+ * name for the dense banks (REG_GPR<N>, REG_FPR<N>, ...), or
+ * REG_CTRL/REG_DEBUG.  NULL for unallocated holes (246..249).  The
+ * dense-bank result lives in a thread_local buffer; don't retain the
+ * pointer past the next call.
  */
 static inline const char *generic_reg_name(unsigned id)
 {

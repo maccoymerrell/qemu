@@ -141,8 +141,7 @@ sees its argv — embedding commas inside the value would scatter the
 pairs across separate argv entries.
 
 ``trace_window=icount:start=<lo>;stop=<hi>``
-   Single contiguous window in instruction-count space.  Equivalent
-   to ``start=<lo>,stop=<hi>`` under the legacy flat flags.  The
+   Single contiguous window in instruction-count space.  The
    only legal keys are ``start`` and ``stop``.
 
 ``trace_window=simpoint:file=<path>;interval=<insns>;warmup=<insns>;simulation=<insns>``
@@ -151,7 +150,7 @@ pairs across separate argv entries.
    *generate* the simpoint file.  ``warmup`` (default ``0``) traces
    that many insns *before* each simpoint position so cache /
    branch-predictor warm-up data is captured.  ``simulation``
-   (default ``0`` = legacy ``interval`` length) traces that many
+   (default ``0`` traces one ``interval`` length) traces that many
    insns *at and after* the simpoint position.  ``warmup`` is only
    meaningful here (you can't warm up before an arbitrary icount or
    symbol occurrence — see ``symbol`` mode below) and is rejected
@@ -621,16 +620,15 @@ memory residue described above.
 Feeding ChampSim
 ----------------
 
-ChampSim itself doesn't yet consume the ``.cst`` format directly —
+ChampSim does not consume the ``.cst`` format directly —
 ChampSim's stock trace path takes its own ``instr_t``-shaped binary.
-A ``.cst`` → ChampSim adapter is the consumer's responsibility for
-now: the trace exposes everything ChampSim needs (per-instruction
+A ``.cst`` → ChampSim adapter is the consumer's responsibility:
+the trace exposes everything ChampSim needs (per-instruction
 PC, branch type and outcome, load/store addresses, optional values,
 wrong-path chain), but the marshalling of those fields into
 ChampSim's expected layout lives outside this repository.
 
-Until a first-party converter ships, the recommended consumer
-pattern is:
+The recommended consumer pattern is:
 
 1. Iterate body entries with ``cst_decode --format=disasm`` (one
    line per architectural instruction, easy to grep) or via a

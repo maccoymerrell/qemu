@@ -1,21 +1,11 @@
 /*
  * Wrong-Path Tracing Plugin for QEMU
  *
- * Main translation unit.  Responsibilities:
- *   - Plugin install, option parsing, lifecycle
- *   - Tracing window management (start/stop + simpoints)
- *   - BB template creation (delegated to BBTemplateCache)
- *   - vcpu_tb_trans / vcpu_tb_exec / vcpu_tb_flush callbacks
- *   - Memory-access callback (correct-path + wrong-path collection)
- *   - Exit-time statistics
- *
- * Peer TUs:
- *   - champsim_tracer_decode.cc  (Capstone → InsnFields)
- *   - champsim_tracer_wp.cc      (wrong-path simulator)
- *   - champsim_tracer_output.cc  (binary format v1.0 writer)
- *
- * Output: packed binary (.cst).  A reference Python decoder
- * (champsim_tracer_decode.py) produces human-readable text.
+ * Main translation unit: plugin install/lifecycle, tracing-window
+ * management (windows + simpoints), the tb_trans/tb_exec/tb_flush
+ * and memory-access callbacks, and exit-time statistics.  Peer TUs:
+ * champsim_tracer_decode.cc, champsim_tracer_wp.cc,
+ * champsim_tracer_output.cc.  Output: packed binary (.cst).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -68,11 +58,9 @@ uint32_t iframe_rate = 0;
 uint64_t warmup_insns = 0;
 uint64_t simulation_insns = 0;
 
-/* Symbol-trigger state (trace_window=symbol:...).  Owned strings live
- * for the lifetime of the plugin; symbol_match_count is the running
- * count of TBs we've seen whose owning template names the configured
- * start_symbol — once it reaches start_symbol_occurrence we open a
- * trace segment of simulation_insns architectural insns. */
+/* Symbol-trigger state (trace_window=symbol:...).  start_symbol_match
+ * _count counts TBs whose template names start_symbol; on reaching
+ * start_symbol_occurrence we open a segment of simulation_insns. */
 static char     *start_symbol            = nullptr;
 static uint64_t  start_symbol_occurrence = 1;
 static uint64_t  start_symbol_match_count = 0;
@@ -80,11 +68,9 @@ static int       g_window_mode           = 0; /* PluginConfig::WIN_AUTO */
 
 /* ========================= Thread ID assignment =========================
  *
- * thread_id on the wire IS the guest vCPU index, verbatim.  No
- * remapping table: the vCPU index is already stable for the whole
- * run, so a thread is the same vCPU across every segment, and each
- * segment's body opens with an explicit BODY_TAG_THREAD_SWITCH that
- * states the starting thread (no implicit "starts at 0" convention).
+ * thread_id on the wire IS the guest vCPU index, verbatim (stable for
+ * the whole run, no remapping).  Each segment's body opens with an
+ * explicit BODY_TAG_THREAD_SWITCH naming the starting thread.
  */
 
 /* ========================= SimPoints ========================= */
@@ -119,9 +105,9 @@ static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
     (void)id;
 
     /*
-     * Resolve cap_mode lazily on the first vCPU init.  The per-ISA
-     * mode resolvers may call qemu_plugin_path_to_binary(), which
-     * requires a live vCPU context (it dereferences current_cpu).
+     * Resolve cap_mode lazily on first vCPU init: the per-ISA mode
+     * resolvers may call qemu_plugin_path_to_binary(), which needs a
+     * live vCPU context.
      */
     if (cst_cap_arch >= 0 && cst_cap_mode == 0
             && trace_isa != TRACE_ISA_UNKNOWN) {
@@ -142,25 +128,20 @@ GMutex data_lock;
 static GMutex exec_lock;
 
 /*
- * Pending register snapshots produced by the per-insn reg-snap
- * callback for the currently-executing BB.  Each insn appends its dst
- * snaps in InsnFields.dst_regs[] order, captured POST-execution: the
- * cb is registered on the next canonical insn's pre-exec hook, so it
- * fires AFTER the previous insn's body completed but BEFORE the next
- * begins.  The last canonical insn of every TB is captured at the
- * NEXT TB's vcpu_tb_exec instead (see "Tail-insn dst snap" there).
- * The buffer is drained into BodyEntry.reg_snaps at BB-finalize time
- * and discarded on flush.  Active only when enable_reg_data is true.
+ * Pending dst register snapshots for the currently-executing BB.
+ * Each insn appends its dst snaps in dst_regs[] order, captured
+ * POST-execution (the cb is on the next canonical insn's pre-exec
+ * hook).  Last canonical insn of a TB is captured at the NEXT TB's
+ * vcpu_tb_exec ("Tail-insn dst snap").  Drained into
+ * BodyEntry.reg_snaps at finalize, discarded on flush.  Active only
+ * when enable_reg_data.
  */
 static thread_local std::vector<RegSnap> pending_reg_snaps;
 
 /* ========================= Reg-data snapshot capture =========================
  *
- * Reg-snap mechanics live in RegSnapCollector (see
- * champsim_tracer_reg_snap_collector.h).  This file owns only the
- * per-insn correct-path callback, which collects snaps into
- * pending_reg_snaps so the body emitter can fold them into BodyEntry
- * at finalize time.
+ * Snap mechanics live in RegSnapCollector; this file owns only the
+ * per-insn correct-path callback feeding pending_reg_snaps.
  */
 
 typedef struct {
@@ -169,16 +150,11 @@ typedef struct {
 } RegSnapInsnRef;
 
 /*
- * Per-insn destination snap callback.  Registered on the FIRST raw
- * insn of canonical insn (ci+1) in this TB, so when it fires
- * pre-execution of that insn, canonical ci has just finished and its
- * destination registers carry post-execution values.  Reads each of
- * canonical ci's destination registers and appends the values to the
- * thread-local pending_reg_snaps buffer, which the body emitter folds
- * into BodyEntry.reg_snaps at finalize time.
- *
- * The LAST canonical insn of every TB is captured separately at the
- * NEXT TB's vcpu_tb_exec — see the "Tail-insn dst snap" block there.
+ * Per-insn destination snap callback.  Registered on the first raw
+ * insn of canonical (ci+1), so when it fires pre-exec, canonical ci
+ * has just finished and its dst registers hold post-exec values;
+ * appends them to pending_reg_snaps.  The TB's last canonical insn
+ * is captured at the NEXT TB's vcpu_tb_exec ("Tail-insn dst snap").
  */
 static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
 {
@@ -218,17 +194,12 @@ static void vcpu_mem_cb(unsigned int cpu_index,
 
 /* ========================= Synthetic-EA callback =========================
  *
- * Per-insn callback for prefetch / cache-flush / TLB-flush instructions
- * whose canonical TCG translation does not emit a memop.  Reads the
- * base/index register values, applies scale (x86) or shift (AArch64) to
- * the index, adds the displacement, and routes the resulting EA through
- * MemAccessRecorder so it shows up in the BodyEntry's load slots.
- *
- * Spec-mode WP execution (CF_MEMI_ONLY + CF_SINGLE_STEP) suppresses
- * post-translation per-insn callbacks, so this fires only on the CP
- * path.  That's expected: prefetch hints generate no architectural
- * memops on either path, and the WP simulator already ignores
- * non-memop control-flow effects.
+ * Per-insn callback for prefetch / cache-flush / TLB-flush insns
+ * whose canonical TCG translation emits no memop.  Computes
+ * ea = base + scaled/shifted index + disp and routes it through
+ * MemAccessRecorder into the BodyEntry's load slots.  CP-path only
+ * (spec-mode CF_MEMI_ONLY suppresses per-insn cbs); fine, since these
+ * generate no architectural memops on either path anyway.
  */
 
 typedef struct {
@@ -287,10 +258,9 @@ static void vcpu_insn_synth_ea_cb(unsigned int cpu_index, void *udata)
     uint64_t base = read_reg_u64(cpu_index, sea->base_key, tls_scratch);
     uint64_t index = read_reg_u64(cpu_index, sea->index_key, tls_scratch);
 
-    /* AArch64 register-form: index gets the shift modifier first;
-     * x86 SIB: index gets multiplied by scale.  The two are mutually
-     * exclusive (cap_fill_x86_operands always sets shift_amount == 0,
-     * cap_fill_arm64_operands always sets scale == 1). */
+    /* AArch64 reg-form shifts the index; x86 SIB scales it.  Mutually
+     * exclusive: x86 fill always sets shift_amount==0, arm64 fill
+     * always sets scale==1. */
     if (sea->shift_amount && sea->shift_type) {
         index <<= sea->shift_amount;
     } else if (sea->scale > 1) {
@@ -304,112 +274,81 @@ static void vcpu_insn_synth_ea_cb(unsigned int cpu_index, void *udata)
 
 /* ========================= Trace state management ========================= */
 
-/* Heartbeat state for the active segment.  progress_step is one tenth
- * of the segment's instruction span (clamped to >=1).  progress_next is
- * the next icount value at which we'll print a progress line. */
+/* Heartbeat state: progress_step is 1/10 of the segment span
+ * (clamped >=1); progress_next is the next icount to print at. */
 static uint64_t progress_step = 0;
 static uint64_t progress_next = 0;
 
-/* Stats snapshot taken at segment start.  At segment finish we compute
- * (g_stats - segment_start_stats) and print that as the per-segment
- * summary, while g_stats keeps accumulating across segments for the
- * final cumulative print at plugin_exit. */
+/* Stats snapshot at segment start; finish prints
+ * (g_stats - segment_start_stats) while g_stats keeps accumulating
+ * for the cumulative print at plugin_exit. */
 static Stats segment_start_stats;
 static char *segment_label = nullptr;  /* g_strdup'd, freed at finish */
 
-/* Histogram state.  When --histogram=N is set, every active segment
- * gets a parallel array of N Stats buckets — one per equal-sized
- * icount interval — that mirror the bumps made to g_stats during the
- * segment.  At finish_trace_segment we walk the buckets to print
- * per-interval breakdowns of the same attribution tables.
+/* Histogram state.  --histogram=N gives each segment N Stats buckets
+ * (one per equal icount interval) mirroring g_stats bumps, walked at
+ * finish for per-interval breakdowns.
  *
- * g_current_hist_bucket is a pointer into g_histogram_buckets,
- * refreshed at the top of vcpu_tb_exec from the current icount.  CP
- * and WP attribution sites bump it when non-null.  Set to null when
- * the segment is inactive or histograms are disabled, so the bump
- * sites collapse to a single nullable check + branch. */
+ * g_current_hist_bucket points into g_histogram_buckets, refreshed at
+ * the top of vcpu_tb_exec; null when inactive/disabled so attribution
+ * sites collapse to one nullable check. */
 static unsigned int g_histogram_intervals = 0;
 static std::vector<Stats> g_histogram_buckets;
 static uint64_t g_histogram_interval_size = 0;
 static uint64_t g_histogram_segment_start = 0;
 Stats *g_current_hist_bucket = nullptr;  /* extern in stats.h */
 
-/* Forward decl: appends a formatted summary of @stats to @report.
- * Called from finish_trace_segment with the per-segment diff and from
- * plugin_exit with the cumulative total. */
+/* Appends a formatted summary of @stats to @report. */
 static void append_stats_summary(GString *report, const char *label,
                                  const Stats &stats);
 
-/* Forward decl: appends a per-interval breakdown of @buckets to
- * @report.  Called from finish_trace_segment after the segment-wide
- * summary when --histogram=N is set.  No-op when @buckets is empty. */
+/* Appends a per-interval breakdown of @buckets to @report.  No-op
+ * when @buckets is empty. */
 static void append_histogram(GString *report, const char *segment_label,
                              const std::vector<Stats> &buckets,
                              uint64_t segment_start,
                              uint64_t interval_size);
 
 /*
- * Drop every piece of plugin-side state that could leak across a
- * segment boundary, so each per-simpoint .cst file is standalone-
- * decodable without depending on values established in a prior
- * segment.  Called at segment start, after the prior segment's
- * finish_trace_segment has already drained pending CP body entries.
+ * Drop plugin-side state that could leak across a segment boundary so
+ * each .cst is standalone-decodable.  Called at segment start, after
+ * the prior finish_trace_segment drained pending CP body entries.
  *
- * What we reset and why:
- *   - True-BB template cache (g_bb_template_cache.bb_map_): the
- *     per-segment template dictionary is built from this map, so
- *     clearing it gives each segment a clean dictionary covering
- *     only the BBs reached after the reset.  Per-TB fragments
- *     (tb_map_) are intentionally preserved: QEMU only fires
- *     vcpu_tb_trans on a TB's first translation, so dropping
- *     fragments would orphan the chain assembler the next time a
- *     previously-translated TB executes.  True-BBs are re-assembled
- *     at runtime by BBChainAssembler from those fragments anyway.
- *   - Per-template IFRAME cadence (BBTemplate.emit_count) on the
- *     surviving tb_map_ entries: drives the iframe_rate-th emission
- *     trigger.  Without the reset a segment that begins mid-cadence
- *     would emit IFRAMEs at positions a standalone run wouldn't.
- *   - In-flight CP basic-block assembly (g_cp_chain): a partial
- *     chain started before the segment boundary and finalized after
- *     would splice fragments from before+after together.
- *   - In-flight memops (g_mem_recorder.cp): same rationale; WP is
- *     transient and always drained at the end of each WP simulation.
- *   - Thread-local pending dst register snaps: captured by the per-
- *     insn callback for the next BB; if the prior segment didn't
- *     flush them (e.g. the segment ended on a snap-capturing TB),
- *     they'd attach to the new segment's first body entry.
+ *   - bb_map_ (true-BB template dictionary source): cleared so each
+ *     segment's dictionary covers only post-reset BBs.  tb_map_
+ *     fragments are preserved — QEMU fires vcpu_tb_trans only on
+ *     first translation, so dropping them would orphan the chain
+ *     assembler (true-BBs are re-assembled from fragments anyway).
+ *   - Per-template IFRAME cadence (BBTemplate.emit_count): without
+ *     reset a mid-cadence segment would emit IFRAMEs at positions a
+ *     standalone run wouldn't.
+ *   - In-flight g_cp_chain / g_mem_recorder.cp: a partial chain
+ *     spanning the boundary would splice before+after fragments.  WP
+ *     is transient (drained per WP sim).
+ *   - pending_reg_snaps: would otherwise attach to the new segment's
+ *     first body entry.
  *
- * thread_id is the guest vCPU index, so there is no per-segment
- * thread state to reset; each segment's body opens with an explicit
- * BODY_TAG_THREAD_SWITCH naming the starting thread.
- *
- * The persistent FieldStateTable overlays inside BodyStreamState are
- * already fresh per segment (a new BodyStreamState is created in
- * body_stream_new on every open), so delta values in segment N are
- * encoded against a "nothing observed" baseline regardless of N-1.
+ * No per-segment thread state (thread_id == vCPU index).  Persistent
+ * FieldStateTable overlays are already fresh per segment (new
+ * BodyStreamState per open).
  */
 static void reset_segment_local_state(void)
 {
     g_mutex_lock(&data_lock);
-    /* Clearing bb_map_ also drops the old BBTemplates carrying their
+    /* Clearing bb_map_ drops the old BBTemplates and their
      * accumulated emit_count; the next commit_true_bb rebuilds each
-     * one zero-initialized (g_new0), so the IFRAME cadence implicitly
-     * resets without a separate emit_count walk. */
+     * zero-initialized, so the IFRAME cadence resets implicitly. */
     g_bb_template_cache.clear_bb_map();
     g_mutex_unlock(&data_lock);
 
     /*
-     * Per-vCPU thread_local state (cp_chain, tls_cp_mem_accesses,
-     * pending_reg_snaps) belongs to threads other than us.  We can't
-     * touch those directly.  Bumping g_segment_generation lets each
-     * thread self-drop its stale chain on its next append_fragment;
-     * tls_cp_mem_accesses naturally drains every BB and pending_reg_
-     * snaps drains every body emit, so they don't need a generation
-     * check (their stale contents are at most one in-flight BB old,
-     * and that BB's BBTemplate * pointers were just invalidated by
-     * clear_bb_map — but vcpu_tb_exec re-validates the prev_tb_tmpl
-     * via find_tb_template before using it, returning nullptr now
-     * that bb_map_ is empty).
+     * Other threads' TLS state (cp_chain, tls_cp_mem_accesses,
+     * pending_reg_snaps) can't be touched directly.  Bumping
+     * g_segment_generation makes each thread self-drop its stale
+     * chain on its next append_fragment; the other two drain every
+     * BB / body emit, and any stale BBTemplate* they hold was just
+     * invalidated by clear_bb_map (vcpu_tb_exec re-validates
+     * prev_tb_tmpl via find_tb_template, now returning nullptr).
      */
     g_segment_generation.fetch_add(1, std::memory_order_release);
 
@@ -417,10 +356,6 @@ static void reset_segment_local_state(void)
     g_cp_chain.reset();
     g_mem_recorder.clear_cp();
     pending_reg_snaps.clear();
-
-    /* No thread-id state to reset: thread_id is the guest vCPU index
-     * (stable for the whole run), and each segment's body opens with
-     * an explicit BODY_TAG_THREAD_SWITCH naming the starting vCPU. */
 }
 
 static void start_trace_segment(const char *label,
@@ -432,13 +367,11 @@ static void start_trace_segment(const char *label,
 {
     reset_segment_local_state();
 
-    /* Capture the architectural register file at segment start so the
-     * header's "reg" encoding-map carries each generic ID's initial
-     * value.  Lets consumers prime register state without depending
-     * on a prior segment's final dst-write deltas to reveal values.
-     * cpu_index == (unsigned)-1 means "no vCPU context yet" (the
-     * install-time start=0 path); the snapshot is empty in that case
-     * and the dst-write stream is the only state source. */
+    /* Capture the architectural register file so consumers can prime
+     * register state without replaying a prior segment's dst-write
+     * deltas.  cpu_index == (unsigned)-1 (install-time start=0, no
+     * vCPU yet) → empty snapshot; dst-write stream is then the only
+     * state source. */
     std::vector<InitialRegSnap> regfile;
     capture_initial_regfile(cpu_index, &regfile);
 
@@ -449,19 +382,17 @@ static void start_trace_segment(const char *label,
     progress_step = span >= 10 ? span / 10 : 1;
     progress_next = start + progress_step;
 
-    /* Snapshot the cumulative stats so the matching finish_trace_segment
-     * can compute "this segment's contribution" via stats_diff().
-     * stats_snapshot() folds every thread's per-thread slot plus the
-     * graveyard from any thread that has exited, so the diff is a
-     * true global delta even on multi-vCPU runs. */
+    /* Snapshot cumulative stats for finish_trace_segment's diff.
+     * stats_snapshot() folds every thread's slot plus the exited-
+     * thread graveyard, so the diff is a true global delta on
+     * multi-vCPU runs. */
     segment_start_stats = stats_snapshot();
     g_free(segment_label);
     segment_label = g_strdup(label ? label : "trace");
 
-    /* Histogram buckets: one Stats per interval, zero-init.  Interval
-     * size rounds up so the last bucket absorbs any remainder; bucket
-     * lookup clamps the index so a late icount past stop still maps
-     * into the last bucket. */
+    /* One Stats per interval, zero-init.  Interval size rounds up so
+     * the last bucket absorbs the remainder; lookup clamps so a late
+     * icount past stop still maps into it. */
     if (g_histogram_intervals > 0 && span > 0) {
         g_histogram_buckets.assign(g_histogram_intervals, Stats{});
         g_histogram_interval_size =
@@ -522,12 +453,10 @@ static void heartbeat_progress(uint64_t icount)
 }
 
 /*
- * Build a BodyEntry from the calling thread's CP memop and reg-snap
- * accumulators and write it to @out_stream.  Drains the accumulators
- * as a side effect.  @wp_entries is moved into the entry.
- *
- * Caller must hold exec_lock.  data_lock is not held; the per-thread
- * accumulators are unsynchronised by design.
+ * Build a BodyEntry from the calling thread's CP memop/reg-snap
+ * accumulators (draining them) and write it to @out_stream.
+ * @wp_entries is moved in.  Caller holds exec_lock; data_lock is NOT
+ * held — the per-thread accumulators are unsynchronised by design.
  */
 static void emit_body_entry(BodyStreamState *out_stream,
                             BBTemplate *bb_tmpl,
@@ -550,24 +479,14 @@ static void emit_body_entry(BodyStreamState *out_stream,
     }
 
     /*
-     * REP fan-out: if the BB's terminator is a REP-prefixed string op
-     * and its TB template carries a rep_subtmpl, split a single TB-
-     * exec's memop stream into N iteration entries.  Iter 1 stays on
-     * @entry (so the BB that *first* enters the REP loop ends with
-     * the first REP, exactly like an ordinary branch terminator);
-     * iter 2..N each emit a fresh 1-insn BodyEntry on rep_subtmpl
-     * with a slice of the memops.
-     *
-     * Memops arrive in execution order under the REP insn's PC, so
-     * the partition is direct: load/store callbacks fire mpi times
-     * per iteration (1 for LODS/STOS/SCAS/INS/OUTS, 2 for MOVS/CMPS),
-     * the first mpi belong to iter 1, the next mpi to iter 2, etc.
-     * WP entries (if any) stay on iter 1 — the WP simulator already
-     * sees REP as a single architectural branch, so the speculative
-     * window applies once at the loop boundary, not per iteration.
-     * reg_snaps similarly stay on iter 1; per-iteration RSI/RDI/RCX
-     * deltas ride the field-delta stream like any other repeated
-     * BB visit.
+     * REP fan-out: split a single REP TB-exec's memop stream into N
+     * iteration entries (iter 1 on @entry, iter 2..N on rep_subtmpl).
+     * Memops arrive in execution order under the REP PC, mpi per
+     * iteration (1 for LODS/STOS/SCAS/INS/OUTS, 2 for MOVS/CMPS), so
+     * the partition is a direct slice.  WP entries and reg_snaps stay
+     * on iter 1: the WP simulator sees REP as one architectural
+     * branch, and per-iter RSI/RDI/RCX deltas ride the field-delta
+     * stream like any repeated BB visit.
      */
     BBTemplate *rep_sub = bb_tmpl ? bb_tmpl->rep_subtmpl : nullptr;
     if (rep_sub && bb_tmpl->n_insns > 0) {
@@ -576,8 +495,7 @@ static void emit_body_entry(BodyStreamState *out_stream,
         unsigned mpi = (unsigned)lf->rep_loads_per_iter
                      + (unsigned)lf->rep_stores_per_iter;
         if (mpi > 0) {
-            /* Separate REP-attributed memops from the rest while
-             * preserving arrival order. */
+            /* Split REP-attributed memops out, preserving order. */
             std::vector<DynParam> rep_dps;
             std::vector<DynParam> other_dps;
             rep_dps.reserve(entry.dyn_params.size());
@@ -631,15 +549,12 @@ static void emit_body_entry(BodyStreamState *out_stream,
 }
 
 /*
- * Flush the pending final-TB body entry before a segment is finished.
- *
- * BodyEntries are emitted lazily from vcpu_tb_exec(): when a TB starts,
- * we emit the entry for the *previous* TB because only then do we know
- * whether that TB's branch was taken.  A TB terminated by a
- * process-exiting syscall never has a "next" TB to trigger the flush,
- * so its memops would silently disappear.  This helper emits that
- * pending entry (no wrong-path: WP is undefined after process exit).
- * Must be called with exec_lock held.
+ * Flush the pending final-TB body entry before a segment finishes.
+ * BodyEntries are emitted lazily: vcpu_tb_exec emits the *previous*
+ * TB's entry once its branch direction is known.  A TB ended by a
+ * process-exiting syscall has no "next" TB, so without this its
+ * memops would vanish.  No wrong-path (WP undefined after exit).
+ * Caller holds exec_lock.
  */
 static void flush_pending_final_body_entry(void)
 {
@@ -658,11 +573,9 @@ static void flush_pending_final_body_entry(void)
         BBTemplate *prev_tb_tmpl =
             g_bb_template_cache.find_tb_template(prev_start);
         if (prev_tb_tmpl) {
-            /* Tail-insn dst snap: same rationale as the equivalent
-             * block in vcpu_tb_exec.  Without this we'd lose the
-             * destination values of the segment-final TB's last
-             * canonical insn, since no subsequent vcpu_tb_exec will
-             * fire after segment shutdown. */
+            /* Tail-insn dst snap (see vcpu_tb_exec): no later
+             * vcpu_tb_exec fires after shutdown, so capture the
+             * segment-final TB's last insn's dst values here. */
             if (enable_reg_data && prev_tb_tmpl->insn_reg_names &&
                 prev_tb_tmpl->n_insns > 0) {
                 uint32_t last = prev_tb_tmpl->n_insns - 1;
@@ -718,9 +631,7 @@ static void finish_trace_segment(void)
     }
     g_trace_segments.finish(flush_pending_final_body_entry);
 
-    /* Per-segment stats: diff against the snapshot taken at segment
-     * start, format with the segment label, hand to the plugin
-     * diagnostic stream. */
+    /* Per-segment stats: diff against the segment-start snapshot. */
     Stats seg_stats;
     Stats now = stats_snapshot();
     stats_diff(&seg_stats, now, segment_start_stats);
@@ -741,10 +652,9 @@ static void finish_trace_segment(void)
 /* ========================= Execution callback ========================= */
 
 /*
- * Update per-branch transition stats and the per-branch history record
- * for the just-observed transition.  Returns the BranchRecord so the
- * caller can hand it to the wrong-target resolver; null when the
- * previous TB did not end in a branch.  Caller holds data_lock.
+ * Update per-branch transition stats and history for the observed
+ * transition.  Returns the BranchRecord (null if the previous TB
+ * wasn't branch-terminated).  Caller holds data_lock.
  */
 static BranchRecord *observe_branch_transition(bool prev_is_branch,
                                                bool branch_taken,
@@ -778,17 +688,25 @@ static BranchRecord *observe_branch_transition(bool prev_is_branch,
 }
 
 /*
- * Resolve the wrong-path target for a just-finalized basic block whose
+ * Resolve the wrong-path target for a just-finalized BB whose
  * terminating branch lives in @prev_tb_tmpl.  Returns 0 when no
- * plausible WP target exists (unconditional jump that took its sole
- * direction; not a branch at all).  Caller holds data_lock.
+ * plausible WP target exists.  Caller holds data_lock.
+ *
+ * @taken_out receives the TAKEN-edge target, derived from the same
+ * observations the resolver uses — never the raw (often PC-relative)
+ * immediate.  It is current_pc (where CP transferred) in every case
+ * except "CP fell through a resolvable direct conditional", where it
+ * is the side CP did NOT run (the same value used for the wrong
+ * path).  0 only when the BB has no branch.
  */
 static uint64_t resolve_wrong_target(const BBTemplate *prev_tb_tmpl,
                                      BranchRecord *br,
                                      bool branch_taken,
                                      uint64_t current_pc,
-                                     uint64_t prev_ft)
+                                     uint64_t prev_ft,
+                                     uint64_t *taken_out)
 {
+    *taken_out = 0;
     int br_idx = BBTemplateCache::template_branch_index(prev_tb_tmpl);
     const InsnFields *bf = (br_idx >= 0)
         ? &prev_tb_tmpl->insn_fields[br_idx] : nullptr;
@@ -803,28 +721,47 @@ static uint64_t resolve_wrong_target(const BBTemplate *prev_tb_tmpl,
                         bf->branch_conditional);
 
     if (is_indirect) {
-        if (branch_taken) {
+        /*
+         * The observed-target pool drives indirect_wrong_target, so
+         * it MUST stay correct-path-only: folding a speculative target
+         * back in would poison the very decision that picks the next
+         * speculative target.  vcpu_tb_exec already early-returns when
+         * g_wp_state.in_progress; the explicit guard hard-enforces the
+         * invariant for any future caller.
+         */
+        if (branch_taken && !g_wp_state.in_progress) {
             BranchHistory::note_target(br, current_pc);
         }
+        /* Indirect/return: CP transferred to current_pc — that IS
+         * the observed taken edge. */
+        *taken_out = current_pc;
         return BranchHistory::indirect_wrong_target(br, current_pc, prev_ft);
     }
     if (branch_taken) {
-        /* CP took a direct branch → WP is the fall-through. */
+        /* CP took the branch → taken edge = where it went;
+         * WP = the fall-through. */
+        *taken_out = current_pc;
         return prev_ft;
     }
     if (direct_cond && bf->has_immediate &&
         (uint64_t)bf->immediate != prev_ft) {
-        /* CP fell through a direct conditional → WP is the
-         * statically-resolved taken target. */
+        /* CP fell through a direct conditional → the taken edge is
+         * the side CP did NOT run, which the resolver also uses as
+         * the wrong path. */
+        *taken_out = (uint64_t)bf->immediate;
         return (uint64_t)bf->immediate;
     }
+    /* Unconditional jump whose sole direction is its fall-through
+     * (current_pc == prev_ft, e.g. `jmp .+2`), or an unresolved
+     * terminator: CP still transferred to current_pc — that is the
+     * taken edge.  No distinct wrong path. */
+    *taken_out = current_pc;
     return 0;
 }
 
 /*
- * Run the WP simulator (if applicable), then build and emit the
- * BodyEntry for the just-finalized BB via emit_body_entry().  Caller
- * holds exec_lock.  cp_chain is thread_local; reset needs no lock.
+ * Run the WP simulator (if applicable), then emit the just-finalized
+ * BB's BodyEntry.  Caller holds exec_lock; cp_chain is thread_local.
  */
 static void emit_finalized_bb(BodyStreamState *out_stream,
                               BBTemplate *bb_tmpl,
@@ -860,41 +797,27 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         return;
     }
 
-    /* Update the per-vCPU instruction counter (only on CP path; WP
-     * fragments are not counted).
+    /* Update the per-vCPU instruction counter (CP path only).
      *
-     * REP-family dispatcher re-entry doesn't move the architectural
-     * instruction count.  QEMU's translator emits x86 REP-prefixed
-     * string ops (MOVSB, STOSB, CMPSB, ...) as a *single-insn* TB
-     * that the dispatcher re-executes once per architectural REP
-     * iteration: each re-execution fires vcpu_tb_exec with the same
-     * start_pc and adds 1 again, drifting our icount past the "one
-     * count per architectural insn" semantics that PIN-style tracers
-     * use.  Skip the increment exactly when n_insns == 1 AND
-     * start_pc matches the last counted — that signature catches
-     * REP-class single-insn dispatcher loops and nothing else.  A
-     * normal tight loop is a multi-insn TB (the loop body plus the
-     * conditional branch), so its per-iteration count is preserved. */
+     * QEMU emits x86 REP string ops as a single-insn TB re-executed
+     * once per REP iteration, each re-exec firing vcpu_tb_exec with
+     * the same start_pc.  Skipping the increment when n_insns == 1 &&
+     * start_pc == last_counted suppresses that drift; a normal tight
+     * loop is a multi-insn TB so its per-iteration count is kept. */
     uint64_t cur_start_pc = qemu_plugin_u64_get(g_scoreboard.prev_start_pc,
                                                 cpu_index);
     /*
-     * icount_prev is the count of architectural instructions that have
-     * actually executed (TBs 1..N-1).  icount (read after the bump
-     * below) reflects TBs 1..N — i.e. it includes THIS TB which has
-     * NOT yet run since vcpu_tb_exec fires at TB start, before the
-     * body.  Trigger logic (start/stop windows, histogram bucket
-     * selection, progress prints) uses icount_prev so the conditions
-     * key off completed work; if we used icount instead, exiting on
-     * the threshold-crossing call would leave the trace short by
-     * THIS TB's worth of insns (the canonical undershoot the user
-     * reported on `start=0,stop=N` runs).
+     * icount_prev = architectural insns actually executed (TBs
+     * 1..N-1); THIS TB has NOT run yet (vcpu_tb_exec fires at TB
+     * start).  All trigger logic keys off icount_prev so conditions
+     * track completed work — using the post-bump count would
+     * undershoot by this TB on threshold-crossing exits.
      */
     uint64_t icount_prev = qemu_plugin_u64_get(g_scoreboard.insn_count,
                                                cpu_index);
-    /* Cache the WP-progress flag.  g_wp_state is thread_local, so the
-     * compiler emits __tls_get_addr per access in the dlopen'd
-     * plugin's general-dynamic TLS model; reading it twice in this
-     * critical section costs ~10 ns extra on every TB exec. */
+    /* Cache the WP-progress flag: g_wp_state is thread_local and the
+     * dlopen'd plugin's general-dynamic TLS model emits
+     * __tls_get_addr per access (~10 ns each on every TB exec). */
     bool wp_in_progress = g_wp_state.in_progress;
     if (!wp_in_progress) {
         uint64_t last_counted = qemu_plugin_u64_get(
@@ -914,17 +837,12 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     }
 
     /* --- Tracing window management.  May start/stop segments and
-     *     terminate the process on simpoint exhaustion or non-simpoint
-     *     stop.  Inline because the exit path holds exec_lock and we
-     *     must release it before exit() so plugin_exit can re-acquire.
-     *     All checks key off icount_prev (architectural insns
-     *     completed) so the trace covers AT LEAST the requested
-     *     window — overshooting by at most one TB rather than
-     *     undershooting by the threshold-crossing TB. */
+     *     exit() the process.  Must release exec_lock before exit()
+     *     so plugin_exit can re-acquire.  Checks key off icount_prev
+     *     so the trace covers AT LEAST the requested window. */
     if (g_window_mode == PluginConfig::WIN_SYMBOL) {
-        /* Stop when the simulation_insns budget after the trigger has
-         * been spent.  set_window stamped trace_start when the symbol
-         * fired; we inherit the stop check from window_stop(). */
+        /* Stop once the post-trigger simulation_insns budget is
+         * spent (window_stop set when the symbol fired). */
         if (g_trace_segments.is_active() &&
             icount_prev >= g_trace_segments.window_stop()) {
             finish_trace_segment();
@@ -943,11 +861,9 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
                 cst_str_eq(cur_tmpl->symbol_name, start_symbol)) {
                 start_symbol_match_count++;
                 if (start_symbol_match_count >= start_symbol_occurrence) {
-                    /* Open segment at the architectural insn count of
-                     * the matching TB's start.  Simulation runs for
-                     * simulation_insns more architectural insns; when
-                     * unset (==0) the segment is unbounded and ends
-                     * at process exit. */
+                    /* Open at the matching TB's icount; run for
+                     * simulation_insns more (0 = unbounded, ends at
+                     * process exit). */
                     uint64_t lo = icount_prev;
                     uint64_t hi = simulation_insns
                         ? icount_prev + simulation_insns : UINT64_MAX;
@@ -972,11 +888,9 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         }
         if (!g_trace_segments.is_active()) {
             if (const SimPointEntry *sp = g_simpoints.current()) {
-                /* Effective window: warmup before the simpoint position,
-                 * simulation_insns at-and-after.  When simulation_insns
-                 * is zero the legacy sp->stop_insn (start + interval) is
-                 * preserved for backwards-compatible runs.  warmup_insns
-                 * underflow at the head of the trace is clamped to 0. */
+                /* Effective window: warmup before the simpoint,
+                 * simulation_insns at-and-after (0 → legacy
+                 * sp->stop_insn).  warmup underflow clamps to 0. */
                 uint64_t eff_start = (sp->start_insn > warmup_insns)
                     ? sp->start_insn - warmup_insns : 0;
                 uint64_t eff_stop = simulation_insns
@@ -985,20 +899,13 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
                 if (icount_prev >= eff_start &&
                     icount_prev <  eff_stop) {
                     g_trace_segments.set_window(eff_start, eff_stop);
-                    /* Name the segment by the simpoint position in
-                     * billions of instructions (the canonical
-                     * interval start = interval_id * interval), per
-                     * the established workload-NNNB convention.  This
-                     * is a stable ID that maps straight back to the
-                     * line in the simpoints/weights file, unlike the
-                     * opaque sorted segment ordinal.
-                     *
-                     * Exact integer arithmetic, not a double: avoids
-                     * scientific notation (whose 'e-05' minus sign
-                     * would corrupt the '-'-separated filename) and
-                     * any rounding.  A fractional billion renders
-                     * with '_' for the point ("73_4B"), so the only
-                     * '.' in the filename is the .cst extension. */
+                    /* Name the segment by simpoint position in
+                     * billions of insns (workload-NNNB convention) so
+                     * it maps back to the simpoints/weights line.
+                     * Integer arithmetic, not a double: scientific
+                     * notation's 'e-05' minus would corrupt the
+                     * '-'-separated filename.  Fractional billions use
+                     * '_' ("73_4B") so the only '.' is the .cst ext. */
                     uint64_t pos   = sp->start_insn;
                     uint64_t whole = pos / 1000000000ULL;
                     uint64_t frac  = pos % 1000000000ULL;
@@ -1017,9 +924,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
                         label = g_strdup_printf("%" PRIu64 "_%sB",
                                                 whole, fbuf);
                     }
-                    /* warmup_insns saturates against eff_start so the
-                     * header reports the actual number of pre-simpoint
-                     * insns we'll trace, not the configured budget. */
+                    /* Report actual pre-simpoint insns traced, not
+                     * the configured warmup budget. */
                     uint64_t hdr_warmup = sp->start_insn > eff_start
                         ? sp->start_insn - eff_start : 0;
                     start_trace_segment(label, eff_start, eff_stop,
@@ -1039,10 +945,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
             icount_prev <  g_trace_segments.window_stop()) {
             uint64_t lo = g_trace_segments.window_start();
             uint64_t hi = g_trace_segments.window_stop();
-            /* Non-simpoint mode: header total is the configured
-             * (stop - start) when stop was specified, or 0 ("unbounded
-             * — runs until process exit") when stop defaulted to
-             * UINT64_MAX. */
+            /* Header total: (stop - start), or 0 (unbounded) when
+             * stop defaulted to UINT64_MAX. */
             uint64_t total_target = (hi == UINT64_MAX) ? 0 : hi - lo;
             start_trace_segment("trace", lo, hi,
                                 /* warmup= */ 0, total_target, cpu_index,
@@ -1065,12 +969,10 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     heartbeat_progress(icount_prev);
 
-    /* Refresh the histogram bucket pointer for this TB exec.  WP code
-     * runs synchronously below while exec_lock is still held, so its
-     * bumps land in the correct bucket too.  Bucket selection uses
-     * icount_prev so the just-executed TB's stats land in the bucket
-     * for the architectural slice it actually ran in, not the slice
-     * the next-to-run TB belongs to. */
+    /* Refresh the histogram bucket for this TB exec.  WP runs
+     * synchronously below under exec_lock so its bumps land here too.
+     * Selection uses icount_prev so stats land in the slice the TB
+     * actually ran in. */
     g_current_hist_bucket = select_histogram_bucket(icount_prev);
 
     /* Snapshot the previous-TB scoreboard fields. */
@@ -1099,15 +1001,12 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     BBTemplate *prev_tb_tmpl = g_bb_template_cache.find_tb_template(prev_start);
     if (prev_tb_tmpl) {
         /*
-         * Tail-insn dst snap for the TB that just finished.  The
-         * per-insn cb chain only captures insn[0..n-2] of each TB
-         * (each registered on insn[i+1]'s pre-exec hook); insn[n-1]'s
-         * destinations would need a hook on the *next* TB's first
-         * insn, which we can't pre-register because the branch target
-         * is unknown at translation time.  Catching it here at the
-         * next TB's vcpu_tb_exec is equivalent — registers still hold
-         * prev_tb_tmpl's last insn's post-exec values (the next TB's
-         * body has not yet run).
+         * Tail-insn dst snap.  The per-insn cb chain captures only
+         * insn[0..n-2] (each on insn[i+1]'s pre-exec hook); insn[n-1]
+         * would need a hook on the next TB's first insn, unknowable at
+         * translation.  Capturing here at the next TB's vcpu_tb_exec
+         * is equivalent: registers still hold prev_tb's last insn's
+         * post-exec values (this TB's body hasn't run yet).
          */
         if (enable_reg_data && prev_tb_tmpl->insn_reg_names &&
             prev_tb_tmpl->n_insns > 0 &&
@@ -1125,15 +1024,10 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
         g_cp_chain.append_fragment(prev_start, prev_tb_tmpl, prev_ft);
 
-        /* Per-CP-execution attribution: walk the just-executed TB's
-         * insns and bump opcode / branch_type / src-reg / dst-reg
-         * counters.  Cheap: <=20 insns per TB on average, all hot in
-         * cache from the surrounding work.
-         *
-         * Cache thread_stats_get() once before the loop — the g_stats
-         * macro re-resolves the TLS slot via __tls_get_addr on every
-         * expansion, and this loop bumps it 4×n_insns times in the
-         * worst case. */
+        /* Per-CP attribution: bump opcode / branch_type / src / dst
+         * counters per insn.  Cache thread_stats_get() once — the
+         * g_stats macro re-resolves the TLS slot via __tls_get_addr
+         * each expansion, and this loop bumps it up to 4×n_insns. */
         Stats &s = thread_stats_get();
         Stats *h = g_current_hist_bucket;
         for (uint32_t i = 0; i < prev_tb_tmpl->n_insns; i++) {
@@ -1156,12 +1050,21 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     }
 
     bool finalize = prev_is_branch && prev_tb_tmpl != nullptr;
+    uint64_t taken_target = 0;
     uint64_t wrong_target = finalize
         ? resolve_wrong_target(prev_tb_tmpl, br, branch_taken,
-                               current_pc, prev_ft)
+                               current_pc, prev_ft, &taken_target)
         : 0;
     BBTemplate *bb_tmpl = (finalize && g_cp_chain.has_active_chain())
         ? g_cp_chain.finalize() : nullptr;
+
+    /*
+     * Record the terminal-branch taken-edge target (derived by
+     * resolve_wrong_target; see its @taken_out contract).
+     */
+    if (bb_tmpl && taken_target != 0) {
+        bb_tmpl->taken_pc = taken_target;
+    }
 
     g_mutex_unlock(&data_lock);
 
@@ -1292,16 +1195,12 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                 refs[i].insn_index = i;
             }
             /*
-             * Post-exec destination capture: register the snap cb on
-             * raw insn i (where canonical_first[i] && canonical_index
-             * > 0), pointing at canonical_index-1.  When the cb fires
-             * (PRE-execution of raw insn i, which is the first raw
-             * occurrence of canonical insn ci), canonical insn ci-1
-             * has just completed — its destination registers carry
-             * post-execution values.  The LAST canonical insn of the
-             * TB has no successor raw insn here; its destinations are
-             * captured at the NEXT TB's vcpu_tb_exec via the
-             * prev_tb_tmpl path (see "Tail-insn dst snap" below).
+             * Post-exec dst capture: register the snap cb on raw insn
+             * i (canonical_first && ci > 0) pointing at ci-1.  Firing
+             * pre-exec of ci means ci-1 just completed, so its dst
+             * registers hold post-exec values.  The TB's last
+             * canonical insn is captured at the next TB's
+             * vcpu_tb_exec ("Tail-insn dst snap").
              */
             for (size_t i = 0; i < raw_n_insns; i++) {
                 if (!canonical_first[i]) {
@@ -1424,12 +1323,10 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 /* ========================= Flush callback ========================= */
 
 /*
- * Called when the TB cache is flushed.
- *
- * During wrong-path execution, tb_gen_code() may trigger tb_flush() when
- * the code buffer is full, longjmping past simulate_wrong_path_ext()'s
- * cleanup code.  Reset wp_* state here so vcpu_tb_exec is not
- * permanently suppressed.
+ * TB-cache flush callback.  During WP execution tb_gen_code() may
+ * tb_flush() on a full code buffer, longjmping past
+ * simulate_wrong_path_ext()'s cleanup; reset wp_* state here so
+ * vcpu_tb_exec isn't permanently suppressed.
  */
 static void vcpu_tb_flush(qemu_plugin_id_t id)
 {
@@ -1450,9 +1347,8 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
         g_wp_state.mem_accesses.clear();
     }
 
-    /* Drop partial BB being assembled — we can't know whether the flushed
-     * TB will resume, so preserving partial state would risk splicing
-     * fragments from before and after the flush. */
+    /* Drop the partial BB: preserving it across a flush would risk
+     * splicing pre- and post-flush fragments. */
     g_mutex_lock(&data_lock);
     g_cp_chain.reset();
     g_mem_recorder.clear_cp();
@@ -1464,10 +1360,8 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
 
 /* ========================= Exit / statistics ========================= */
 
-/* Render a Stats snapshot to @report.  Used for both the per-segment
- * summary (called from finish_trace_segment with a diff Stats) and
- * the cumulative final summary (called from plugin_exit with the
- * accumulated g_stats). */
+/* Render a Stats snapshot to @report (per-segment diff or cumulative
+ * total). */
 static void append_stats_summary(GString *report, const char *label,
                                  const Stats &stats)
 {
@@ -1644,20 +1538,11 @@ static void append_stats_summary(GString *report, const char *label,
         "==========================================\n");
 }
 
-/* Per-interval breakdown of a segment's activity.  Emits:
- *   1. A headline table — one row per interval, with totals for CP
- *      insns / CP memops / WP insns / WP memops / branches.  Lets the
- *      reader spot phase boundaries at a glance.
- *   2. Transposed top-K tables for the four attribution dimensions
- *      (opcode, branch type, src reg, dst reg).  Rows are the K most-
- *      active items globally across the segment; columns are the
- *      intervals.  This format makes it trivial to see "where does
- *      RAX usage spike?" or "do branches concentrate in interval 7?"
- *
- * Counts in @buckets are partitioned by interval, so they sum to the
- * segment-wide totals already printed above.  CP insn count per
- * interval is approximated by summing cp_insns_by_opcode (which is
- * what the bumps actually counted); same for WP. */
+/* Per-interval breakdown: a headline table (CP/WP insns+memops,
+ * branches per interval) then transposed top-K tables for opcode /
+ * branch type / src reg / dst reg.  @buckets is partitioned by
+ * interval and sums to the segment totals; per-interval insn counts
+ * are approximated by summing *_insns_by_opcode. */
 static void append_histogram(GString *report, const char *segment_label,
                              const std::vector<Stats> &buckets,
                              uint64_t segment_start,
@@ -1668,9 +1553,7 @@ static void append_histogram(GString *report, const char *segment_label,
     }
     size_t n = buckets.size();
 
-    /* Row totals helper: accumulate a per-bucket scalar so the headline
-     * table can show CP/WP insns without the caller having to walk the
-     * opcode array twice.  Inline to keep the table loop tight. */
+    /* Per-bucket array sum, for the headline CP/WP insn columns. */
     auto sum_arr = [](const uint64_t *arr, size_t len) {
         uint64_t s = 0;
         for (size_t i = 0; i < len; i++) s += arr[i];
@@ -1698,11 +1581,9 @@ static void append_histogram(GString *report, const char *segment_label,
             wp_ins, b.wp_total_mem_accesses, b.branches_observed);
     }
 
-    /* Transposed top-K table: one row per top item (chosen by total
-     * activity across all intervals and both CP+WP), one column per
-     * interval.  Caller-supplied accessors decide which Stats arrays
-     * feed the totals — same closure pattern as print_reg_table above
-     * so both CP and WP are summed for ranking but printed combined. */
+    /* Transposed top-K: rows = top items by total CP+WP activity
+     * across all intervals, columns = intervals.  cp_off/wp_off pick
+     * the Stats arrays; CP+WP summed for ranking and printed combined. */
     auto print_top_k = [&](const char *table_label, unsigned id_count,
                            const char *(*name_of)(unsigned),
                            size_t cp_off, size_t wp_off,
@@ -1837,13 +1718,10 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     }
 
     /*
-     * Map ISA to Capstone arch/mode for qemu_plugin_cap_decode().  The
-     * arch is fully determined by target_name and is set here.  The
-     * mode resolver may need to introspect the guest binary (for
-     * example to read .riscv.attributes or MIPS EF_* flags) which in
-     * turn calls qemu_plugin_path_to_binary() — that helper requires
-     * a live vCPU context, so the actual cap_mode_for_target() call is
-     * deferred to the first vcpu_init_cb (see vcpu_init_cb).
+     * Map ISA to Capstone arch/mode.  arch is determined by
+     * target_name and set here; the mode resolver may introspect the
+     * guest binary via qemu_plugin_path_to_binary() (live-vCPU only),
+     * so cap_mode is deferred to the first vcpu_init_cb.
      */
     if (trace_isa != TRACE_ISA_UNKNOWN) {
         const IsaProperties *p = &isa_properties[trace_isa];
@@ -1879,10 +1757,9 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         return -1;
     }
 
-    /* Apply parsed config to plugin globals + subsystem instances.
-     * String fields with long-term lifetime (program_name, comment,
-     * simpoints file) transfer out of cfg; the remaining strings are
-     * freed by plugin_config_free below. */
+    /* Apply parsed config.  Long-lived string fields transfer out of
+     * cfg (ownership moved); the rest are freed by
+     * plugin_config_free below. */
     max_wrong_path_depth = cfg.wp_depth;
     enable_wrong_path    = cfg.enable_wp;
     enable_mem_data      = cfg.enable_mem_data;
@@ -1949,12 +1826,10 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     active_reg_table = isa_reg_class[trace_isa];
     active_reg_table_size = isa_reg_class_size[trace_isa];
 
-    /* Build the GenericRegId → QemuRegKey reverse index now that the
-     * per-ISA reg table is wired up.  The multi-reg classification
-     * path (RISC-V V*M* tuples and any future register-group rows)
-     * uses this to recover a QemuRegKey for each constituent generic
-     * id so reg-data captures cover the whole tuple, not just its
-     * leading element. */
+    /* Build the GenericRegId → QemuRegKey reverse index (needs the
+     * per-ISA reg table).  The multi-reg path (RISC-V V*M* tuples,
+     * future register groups) uses it to cover every constituent
+     * generic id, not just the leading one. */
     build_qemu_reg_reverse_index();
 
     if (g_window_mode == PluginConfig::WIN_SYMBOL) {
@@ -1966,10 +1841,9 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         /* No segment opens until the named symbol is seen
          * start_symbol_occurrence times in vcpu_tb_exec. */
     } else if (!g_simpoints.is_active() && trace_start_insn == 0) {
-        /* No vCPU context yet at install-time; capture an empty
-         * initial regfile.  The (id->name) mapping is still pinned
-         * in the header, just without live values.  Header total is
-         * 0 (unbounded) when no explicit stop was given. */
+        /* No vCPU at install time: empty initial regfile (id→name
+         * still pinned, no live values).  Header total 0 = unbounded
+         * when no explicit stop. */
         uint64_t total_target =
             (trace_stop_insn == UINT64_MAX) ? 0 : trace_stop_insn;
         start_trace_segment("trace", 0, trace_stop_insn,

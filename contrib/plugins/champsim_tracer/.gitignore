@@ -3,3 +3,6 @@
 # and host, so they don't belong in version control).
 __cffi_cache__/
 __pycache__/
+*.pdf
+validator/out/*
+

@@ -146,8 +146,8 @@ Plugin runtime
 
 **Plugin aborts with a SIGSEGV in glibc near process exit**
 
-Pre-existing issue with TLS destructor ordering vs the plugin's
-per-thread accumulator on some glibc versions.  Workaround: the
+A TLS destructor ordering issue vs the plugin's per-thread
+accumulator on some glibc versions.  Workaround: the
 plugin avoids ``shrink_to_fit`` in atexit precisely to dodge this
 crash; if you've added new atexit-time cleanup, look at
 ``cleanup_current_thread`` in the source.  See the "Thread-locals

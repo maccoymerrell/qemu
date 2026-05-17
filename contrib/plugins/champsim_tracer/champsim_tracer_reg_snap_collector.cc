@@ -73,14 +73,12 @@ void wide_lookup(const QemuRegKey *qemu_reg, RegSnap *out)
 } /* namespace */
 
 /*
- * Opaque struct exposed via forward-decl in champsim_tracer.h.  Not used
- * directly by the WP simulator — callers only hold an opaque pointer
- * and pass it back to capture_insn_snaps / free_wide.
+ * Opaque handle (forward-declared in champsim_tracer.h).  The wide snap
+ * actually lives in tls_wide_* above; capture_wide() returns a pointer
+ * to a thread_local sentinel of this type so the caller has something
+ * opaque to null-check and pass back.
  */
 struct _WideRegSnap {
-    /* Empty; the wide snap lives in tls_wide_* above.  capture_wide()
-     * returns a pointer to a thread_local sentinel of this type so the
-     * caller has something opaque to test against null. */
     char unused;
 };
 

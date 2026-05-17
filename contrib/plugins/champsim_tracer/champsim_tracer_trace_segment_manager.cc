@@ -38,11 +38,8 @@ void TraceSegmentManager::set_compress_cmd(const char *cmd)
     compress_cmd_ = (cmd && *cmd) ? g_strdup(cmd) : nullptr;
 }
 
-/* Map a compression command to the file-extension suffix the
- * resulting bytes should carry inside the tar.  Recognises zstd,
- * xz, gzip; otherwise returns "" and the member is named without a
- * codec suffix (the consumer would have to know how to decompress
- * by other means — strongly discouraged for unknown codecs). */
+/* Map a compression command to the file-extension suffix its bytes
+ * carry inside the tar.  Unknown utilities return "" (no suffix). */
 static const char *compress_suffix(const char *cmd)
 {
     if (!cmd || !*cmd) {
@@ -130,9 +127,8 @@ void TraceSegmentManager::segment_free(TraceSegment *seg)
         body_stream_free(seg->bin_stream);
         seg->bin_stream = nullptr;
     }
-    /* Body writer: drain the async queue and join the thread BEFORE
-     * closing the underlying FILE*, so enqueued bytes hit the
-     * compression pipe / disk cleanly. */
+    /* Drain + join the async body writer BEFORE closing its FILE*, so
+     * enqueued bytes hit the pipe/disk cleanly. */
     if (seg->body_writer) {
         writer_finish(seg->body_writer);
         seg->body_writer = nullptr;
@@ -142,9 +138,8 @@ void TraceSegmentManager::segment_free(TraceSegment *seg)
     /* Header writer is synchronous; finish() already closed it. */
     close_member_file(seg->header_file, seg->header_is_pipe, "header");
     seg->header_file = nullptr;
-    /* Leave the temp files in place if they exist — finish() unlinks
-     * them only on the success path so a partial / abandoned segment
-     * leaves the debris on disk for postmortem. */
+    /* Temp files are unlinked only on finish()'s success path; an
+     * abandoned segment leaves them for postmortem. */
     g_free(seg->body_temp_path);
     g_free(seg->body_member_name);
     g_free(seg->header_temp_path);
@@ -154,15 +149,11 @@ void TraceSegmentManager::segment_free(TraceSegment *seg)
     g_free(seg);
 }
 
-/* Open a per-member output sink.  If @compress_cmd is non-null,
- * spawn a popen pipe whose stdout is redirected (by the shell into
- * the parent command line) to write @temp_path; otherwise just
- * fopen(@temp_path).  Returns the FILE* (caller closes via
- * close_member_file with the matching @*is_pipe flag).
- *
- * The popen recipe is `<compress_cmd> > <temp_path>` — we let the
- * shell handle the redirect so any flags / options inside
- * compress_cmd (like "-3 -T0") flow through verbatim. */
+/* Open a per-member output sink.  With @compress_cmd, popen the
+ * recipe `<compress_cmd> > <temp_path>` (shell handles the redirect
+ * so flags like "-3 -T0" pass through verbatim); otherwise fopen
+ * @temp_path.  Caller closes via close_member_file with the matching
+ * @*is_pipe flag. */
 static FILE *open_member_sink(const char *temp_path,
                               const char *compress_cmd,
                               bool *out_is_pipe,
@@ -200,27 +191,20 @@ void TraceSegmentManager::open_output(const char *label,
                                       const std::vector<InitialRegSnap> *regfile)
 {
     /*
-     * Output destination: each segment becomes a single outer .cst
-     * tarball.  Inside that ustar archive sit two regular-file
-     * members:
-     *
-     *     body.cst[.<codec>]    streamed body bytes
-     *     header.cst[.<codec>]  buffered header + templates
-     *
-     * Each member is independently piped through compress_cmd_ (if
-     * set) into a temp file alongside the user's outfile.  At
-     * finish() we close both temp files and assemble them into the
-     * final tarball via cst_tar_pack, then unlink the temp files.
+     * Each segment is one outer .cst ustar tarball with two members:
+     *   body.cst[.<codec>]    streamed body bytes
+     *   header.cst[.<codec>]  buffered header + templates
+     * Each member is independently piped through compress_cmd_ into a
+     * temp file; finish() assembles them via cst_tar_pack then unlinks
+     * the temps.
      */
     if (!output_path_) {
         return;
     }
 
-    /* Strip a trailing ".cst" before appending segment labels and
-     * the extension, so a user passing ``outfile=mcf.cst`` gets
-     * ``mcf.cst`` (single segment) or ``mcf-734B.cst`` (per-simpoint,
-     * label = simpoint position in billions of insns) rather than
-     * ``mcf.cst.cst`` / ``mcf.cst-734B.cst``. */
+    /* Strip a trailing ".cst" before re-appending label + extension,
+     * so outfile=mcf.cst yields mcf.cst (single) or mcf-734B.cst
+     * (per-simpoint) rather than mcf.cst.cst. */
     size_t base_len = strlen(output_path_);
     if (base_len >= 4 &&
         strcmp(output_path_ + base_len - 4, ".cst") == 0) {

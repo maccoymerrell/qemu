@@ -10,9 +10,8 @@
 #include <string.h>
 #include <sys/stat.h>
 
-/* The 512-byte ustar header (POSIX.1-1988 / IEEE 1003.1-1988).
- * Field offsets are fixed; widths cover the historical ustar
- * conventions.  We only use the regular-file subset. */
+/* The 512-byte ustar header (POSIX.1-1988).  Regular-file subset
+ * only; field offsets/widths are the fixed ustar conventions. */
 struct UstarHeader {
     char name[100];
     char mode[8];
@@ -35,9 +34,8 @@ struct UstarHeader {
 static_assert(sizeof(UstarHeader) == 512,
               "ustar header must be exactly 512 bytes");
 
-/* Right-justified zero-padded octal into a fixed-width field, with a
- * trailing NUL.  ustar canonical formatting; @field_len includes
- * room for the NUL. */
+/* Right-justified zero-padded octal + trailing NUL (ustar canonical).
+ * @field_len includes the NUL. */
 static void write_octal(char *field, size_t field_len, uint64_t value)
 {
     size_t digits = field_len - 1;
@@ -48,25 +46,20 @@ static void write_octal(char *field, size_t field_len, uint64_t value)
     field[field_len - 1] = '\0';
 }
 
-/* Member-size field: 11 octal digits + NUL gives an 8 GiB cap.  For
- * larger values, switch to the GNU base-256 encoding — high bit of
- * the first byte set to 1, remaining bytes big-endian binary, no
- * trailing NUL.  GNU tar / BSD tar / libarchive / Python tarfile all
- * accept this; strict pre-POSIX tar does not, but the field is only
- * read by tools that walk modern .cst files. */
+/* Member-size field: 11 octal digits + NUL caps at 8 GiB.  Larger
+ * values use GNU base-256 (first byte 0x80, rest big-endian binary,
+ * no NUL).  GNU/BSD tar, libarchive, Python tarfile accept it; strict
+ * pre-POSIX tar does not. */
 static void write_size(char *field, size_t field_len, uint64_t value)
 {
-    /* 8^(field_len-1) is the smallest value that doesn't fit in
-     * (field_len-1) octal digits.  For field_len=12 that's 2^33 =
-     * 8 GiB. */
+    /* Smallest value that won't fit in (field_len-1) octal digits;
+     * 2^33 = 8 GiB for field_len=12. */
     uint64_t max_octal = (uint64_t)1 << (3 * (field_len - 1));
     if (value < max_octal) {
         write_octal(field, field_len, value);
         return;
     }
-    /* base-256: 1 marker byte + (field_len-1) big-endian bytes.  The
-     * marker is 0x80 for unsigned values; the field's full @field_len
-     * holds binary data (no trailing NUL). */
+    /* base-256: marker 0x80 + (field_len-1) big-endian bytes, no NUL. */
     field[0] = (char)0x80;
     for (size_t i = field_len; i-- > 1; ) {
         field[i] = (char)(value & 0xFF);
@@ -88,10 +81,8 @@ static void write_string(char *field, size_t field_len, const char *s)
 
 static void compute_checksum(UstarHeader *h)
 {
-    /* ustar checksum is the simple sum of all header bytes, with the
-     * checksum field itself treated as eight spaces during the sum.
-     * The 6-octal-digits + space + NUL formatting matches the
-     * reference implementations. */
+    /* ustar checksum: sum of all header bytes with the checksum field
+     * counted as 8 spaces.  Format is 6 octal digits + NUL + space. */
     memset(h->checksum, ' ', sizeof(h->checksum));
     uint32_t sum = 0;
     const unsigned char *p = (const unsigned char *)h;
@@ -191,11 +182,8 @@ bool cst_tar_pack(const char *out_path,
                 out_path, strerror(errno));
         return false;
     }
-    /* Members in writer-natural order: body first (it's what streams
-     * during execution; its size determines the tar's bulk), header
-     * second (small, written after the segment finishes).  Readers
-     * walk both regardless of order, but matching the writer keeps
-     * any future streaming-tar work simpler. */
+    /* Writer-natural order: body first (streamed during execution),
+     * header second (small, written at segment finish). */
     if (!append_member(out, body_src_path, body_member_name)) {
         fclose(out);
         return false;

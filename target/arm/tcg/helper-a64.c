@@ -1096,6 +1096,40 @@ static uint64_t arm_reg_or_xzr(CPUARMState *env, int reg)
 }
 
 /*
+ * Wrong-path speculation size bound for the FEAT_MOPS bulk set/copy
+ * helpers (SETP/SETM/SETE, CPYP/CPYM/CPYE).  On the plugin's
+ * speculative wrong path the size register holds garbage left by the
+ * mispredicted flow, so the page-at-a-time loop in do_setm()/
+ * do_cpym() would iterate for billions of bytes entirely inside one
+ * TCG helper — the plugin never regains control to bound it, unlike
+ * x86 REP which QEMU single-steps.  (Sandboxing of the individual
+ * byte accesses is handled generically by tlb_vaddr_to_host()
+ * returning NULL in spec mode; this only bounds the *iteration
+ * count*, which is MOPS-specific because no other ISA has a single
+ * instruction looping a 64-bit register-sized memory op.)  Wrong-
+ * path memory state is discarded on rollback, so a bounded set/copy
+ * is indistinguishable to any consumer: clamp to a small sub-page
+ * size so the helper terminates promptly (sub-page also keeps
+ * do_sete()/do_cpye()'s "< page" epilogue invariant intact).  No
+ * effect on the correct path.
+ */
+#ifdef CONFIG_PLUGIN
+#define MOPS_SPEC_MAX_BYTES 256
+static inline uint64_t mops_spec_clamp(CPUARMState *env, uint64_t size)
+{
+    if (unlikely(env_cpu(env)->plugin_spec_mode)) {
+        return MIN(size, (uint64_t)MOPS_SPEC_MAX_BYTES);
+    }
+    return size;
+}
+#else
+static inline uint64_t mops_spec_clamp(CPUARMState *env, uint64_t size)
+{
+    return size;
+}
+#endif
+
+/*
  * For the Memory Set operation, our implementation chooses
  * always to use "option A", where we update Xd to the final
  * address in the SETP insn, and set Xn to be -(bytes remaining).
@@ -1129,6 +1163,7 @@ static void do_setp(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc,
             setsize &= ~0xf;
         }
     }
+    setsize = mops_spec_clamp(env, setsize);
 
     if (unlikely(is_setg)) {
         check_setg_alignment(env, toaddr, setsize, memidx, ra);
@@ -1190,6 +1225,8 @@ static void do_setm(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc,
     if (env->xregs[rn] == 0) {
         return;
     }
+
+    setsize = mops_spec_clamp(env, setsize);
 
     check_mops_wrong_option(env, syndrome, ra);
 
@@ -1253,6 +1290,8 @@ static void do_sete(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc,
     if (setsize == 0) {
         return;
     }
+
+    setsize = mops_spec_clamp(env, setsize);
 
     check_mops_wrong_option(env, syndrome, ra);
 
@@ -1493,6 +1532,7 @@ static void do_cpyp(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
             copysize = INT64_MAX;
         }
     }
+    copysize = mops_spec_clamp(env, copysize);
 
     if (!mte_checks_needed(fromaddr, rdesc)) {
         rdesc = 0;
@@ -1610,6 +1650,7 @@ static void do_cpym(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
     }
 
     /* Our implementation has no particular parameter requirements for CPYM */
+    copysize = mops_spec_clamp(env, copysize);
 
     /* Do the actual memmove */
     if (forwards) {
@@ -1695,6 +1736,8 @@ static void do_cpye(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
     if (!mte_checks_needed(toaddr, wdesc)) {
         wdesc = 0;
     }
+
+    copysize = mops_spec_clamp(env, copysize);
 
     /* Check the size; we don't want to have do a check-for-interrupts */
     if (copysize >= TARGET_PAGE_SIZE) {

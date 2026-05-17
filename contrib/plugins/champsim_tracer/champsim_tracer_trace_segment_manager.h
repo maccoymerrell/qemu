@@ -1,22 +1,18 @@
 /*
  * Wrong-Path Tracing Plugin — trace segment lifecycle.
  *
- * Owns one in-flight TraceSegment at a time plus the start/stop window
- * and the active-flag pair (a regular bool for use under exec_lock and
- * an atomic int for callbacks that run lock-free).  Handles output-
- * destination resolution (file vs popen pipe) when a segment starts
- * and the writer/body-stream teardown when one finishes.
+ * Owns one in-flight TraceSegment plus the start/stop window and the
+ * active-flag pair (a bool for use under exec_lock, an atomic int for
+ * lock-free callbacks).  Resolves the output sink (file vs popen
+ * pipe) on start and tears down writer/body-stream on finish.
  *
- * The body emitter calls body_stream() and next_seq_num() on the
- * currently-active segment.  Lifecycle:
- *
- *   start("trace", lo, hi)          -> opens output, marks active
+ * Lifecycle:
+ *   start("trace", lo, hi)  -> opens output, marks active
  *   ... emit body entries ...
- *   finish(flush_hook)              -> deactivates, runs hook, seals
+ *   finish(flush_hook)      -> deactivates, runs hook, seals
  *
- * The hook fires between deactivating the segment and closing the
- * binary stream so it can flush a pending final entry while the stream
- * is still writable.
+ * The hook fires after deactivation but before the stream closes, so
+ * it can flush a pending final entry while still writable.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */

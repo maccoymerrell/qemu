@@ -64,7 +64,7 @@ there's room up to 255 entries before the format itself has to change.
    adding ``GEN_OP_AES_ENC`` to the ``GenericOpcode`` enum and
    ``"AES_ENC"`` to ``generic_opcode_name()``'s switch is enough for
    ``cst_decode`` and ``cst_audit`` to pretty-print the new opcode
-   even when the trace's encoding-maps section pre-dates its addition.
+   even when the trace's encoding-maps section does not list it.
 
 5. **Build and verify.**  The C-side ``static_assert`` in
    ``champsim_tracer.cc`` (``GEN_OP_COUNT <= 256``) keeps the wire
@@ -130,10 +130,9 @@ new singleton, or extend a dense bank cleanly.
    both the plugin and the offline tools.  Add the new singleton or
    bank entry alongside the existing ones.  The trace's
    encoding-maps section carries names from the writer side too, so
-   a stale offline tool still resolves the new id when reading a
-   fresh trace; updating the table is for back-compat with traces
-   produced by older plugin builds that pre-date the encoding-map
-   suffix.
+   an offline tool whose table lacks the new id still resolves it
+   when reading a trace that lists it; updating the table covers
+   traces whose encoding-maps section does not carry the name.
 
 Per-register attribution counters in ``g_stats`` (``cp_src_reg_uses``,
 ``cp_dst_reg_writes``, ``wp_src_reg_uses``, ``wp_dst_reg_writes``) are
@@ -241,8 +240,7 @@ hint.
    (``current() -> SegmentEntry *``, ``advance()``, ``is_active()``).
 3. In ``champsim_tracer.cc::vcpu_tb_exec``'s window-management block,
    add a branch that consults the new manager when its option was
-   set.  Cf. how SimPoint mode and stop-only mode coexist there
-   already.
+   set.  Cf. how SimPoint mode and stop-only mode coexist there.
 
 Verifying changes
 -----------------

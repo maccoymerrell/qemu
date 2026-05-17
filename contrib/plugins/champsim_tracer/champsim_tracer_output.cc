@@ -12,9 +12,11 @@
 
 #include <algorithm>
 #include <vector>
+#include <unordered_set>
 
 #include "champsim_tracer.h"
 #include "champsim_tracer_bb_template_cache.h"
+#include "champsim_tracer_branch_history.h"
 #include "champsim_tracer_reg_handle_cache.h"
 #include "champsim_tracer_stats.h"
 #include "champsim_tracer_writer.h"
@@ -109,12 +111,9 @@ static inline void bw_raw(BitWriter *bw, const uint8_t *buf, size_t len)
         return;
     }
     if (bw->rb) {
-        /* Hot path for the per-entry encoder scratch.  Inlined so the
-         * uleb / sleb hot loops bottom out in a memcpy + length bump
-         * with no function call.  Profiling showed ~1.5 % of total
-         * runtime in g_byte_array_append before this; the inlined
-         * version trades that for a branch-free fast path with an
-         * out-of-line grow when capacity runs out. */
+        /* Hot path: per-entry encoder scratch.  Inlined memcpy + length
+         * bump with out-of-line grow (was ~1.5% of runtime in
+         * g_byte_array_append). */
         if (bw->rb->len + len > bw->rb->cap) {
             raw_buf_reserve(bw->rb, bw->rb->len + len);
         }
@@ -252,17 +251,10 @@ static void write_encoding_map(BitWriter *bw, const char *map_name,
 
 static void write_reg_encoding_map(BitWriter *bw)
 {
-    /* Walk the full GenericRegId space.  generic_reg_name() returns
-     * NULL for unallocated holes; valid IDs (the dense banks plus all
-     * specials) get their canonical name from the shared helper.  Each
-     * entry carries its initial value (width_bytes + LE bytes); a
-     * zero width means "no live snapshot for this ID at segment
-     * start" (e.g. install-time pre-vCPU start, or a register the
-     * plugin couldn't resolve via the QEMU register API).
-     *
-     * The "reg" map carries (id, name) pairs only.  Per-segment initial
-     * register-file snapshots are emitted inline as BODY_TAG_REGFILE
-     * records, one per (thread, segment). */
+    /* "reg" map carries (id, name) pairs only; generic_reg_name()
+     * returns NULL for unallocated holes.  Per-segment initial
+     * register-file snapshots ride inline as BODY_TAG_REGFILE records,
+     * one per (thread, segment). */
     bw_write_string(bw, "reg");
     uint64_t n = 0;
     for (unsigned i = 0; i < REG_ID_COUNT; i++) {
@@ -294,10 +286,9 @@ static void write_field_id_encoding_map(BitWriter *bw)
     write_encoding_entry(bw, CST_FID_N_STORES,  "CST_FID_N_STORES");
     write_encoding_entry(bw, CST_FID_METAFLAGS, "CST_FID_METAFLAGS");
 
-    /* Slotted families.  Slot k of family <F> sits at
-     * CST_FID_<F>_BASE + k * CST_FID_SLOT_STRIDE; the encoding map
-     * emits one (id → name) pair per slot so decoders can look up
-     * by name without needing to know the stride. */
+    /* Slotted families.  Slot k of <F> is at CST_FID_<F>_BASE +
+     * k*CST_FID_SLOT_STRIDE; one (id, name) pair per slot so decoders
+     * need not know the stride. */
     static const struct { uint8_t base; const char *prefix; } fam[] = {
         { CST_FID_LOAD_ADDR_BASE,   "CST_FID_LOAD_ADDR"   },
         { CST_FID_STORE_ADDR_BASE,  "CST_FID_STORE_ADDR"  },
@@ -372,11 +363,9 @@ static void write_named_enum_map(BitWriter *bw, const char *map_name,
 
 static void write_header_encoding_maps(BitWriter *main_bw)
 {
-    /* opcode / branch_type / reg encoding maps are now driven by the
-     * shared name helpers in champsim_tracer_generic_ids.h
-     * (write_named_enum_map + the helper) so the symbolic names live
-     * in exactly one place across the wire-format encoder and the
-     * exit-time stats printer. */
+    /* opcode / branch_type / reg maps are driven by the shared name
+     * helpers in champsim_tracer_generic_ids.h so symbolic names live
+     * in one place across the encoder and the stats printer. */
     static const EncodingMapEntry header_flag_entries[] = {
         { CST_FLAG_MEM_DATA, "CST_FLAG_MEM_DATA" },
         { CST_FLAG_REG_DATA, "CST_FLAG_REG_DATA" },
@@ -393,6 +382,17 @@ static void write_header_encoding_maps(BitWriter *main_bw)
     static const EncodingMapEntry dep_block_flag_entries[] = {
         { CST_DEP_BLOCK_HAS_REG,  "CST_DEP_BLOCK_HAS_REG" },
         { CST_DEP_BLOCK_HAS_ADDR, "CST_DEP_BLOCK_HAS_ADDR" },
+    };
+    /* Template-profile-block self-description (format §6). */
+    static const EncodingMapEntry mem_access_pattern_entries[] = {
+        { CST_PAT_NONE,      "CST_PAT_NONE" },
+        { CST_PAT_REGULAR,   "CST_PAT_REGULAR" },
+        { CST_PAT_IRREGULAR, "CST_PAT_IRREGULAR" },
+        { CST_PAT_RANDOM,    "CST_PAT_RANDOM" },
+    };
+    static const EncodingMapEntry profile_flag_entries[] = {
+        { CST_PROFILE_ADDR_CP, "CST_PROFILE_ADDR_CP" },
+        { CST_PROFILE_ADDR_WP, "CST_PROFILE_ADDR_WP" },
     };
     static const EncodingMapEntry body_tag_entries[] = {
         { BODY_TAG_END, "BODY_TAG_END" },
@@ -416,7 +416,7 @@ static void write_header_encoding_maps(BitWriter *main_bw)
 
     BitWriter sub;
     bw_init_buf(&sub);
-    bw_write_uleb128(&sub, 10);
+    bw_write_uleb128(&sub, 12);
     write_named_enum_map(&sub, "opcode", GEN_OP_COUNT, generic_opcode_name);
     write_named_enum_map(&sub, "branch_type", BRANCH_TYPE_COUNT,
                          branch_type_name);
@@ -434,6 +434,11 @@ static void write_header_encoding_maps(BitWriter *main_bw)
                        G_N_ELEMENTS(metaflags_entries));
     write_encoding_map(&sub, "dep_block_flag", dep_block_flag_entries,
                        G_N_ELEMENTS(dep_block_flag_entries));
+    write_encoding_map(&sub, "mem_access_pattern",
+                       mem_access_pattern_entries,
+                       G_N_ELEMENTS(mem_access_pattern_entries));
+    write_encoding_map(&sub, "profile_flag", profile_flag_entries,
+                       G_N_ELEMENTS(profile_flag_entries));
     bw_write_section(main_bw, bw_finish_buf(&sub));
 }
 
@@ -451,79 +456,54 @@ typedef struct {
 } EntryViewScratch;
 
 struct BodyStreamState {
-    /* Body stream — writes through @bw to the segment's body output
-     * (file or compression pipe).  Body bytes start with CST_MAGIC,
-     * stream BODY_TAG_* records as the workload runs, and end with
-     * a BODY_TAG_END + entry count + trailing CST_MAGIC marker so
-     * truncation is detectable from either end.                    */
+    /* Body stream — writes through @bw to the segment body output.
+     * CST_MAGIC + BODY_TAG_* records + BODY_TAG_END/count/trailing
+     * CST_MAGIC (truncation detectable from either end). */
     BitWriter bw;
-    /* Header BitWriter — backed by an in-memory GByteArray.  All
-     * header content (magic, isa, flags, window descriptors,
-     * strings, encoding maps, and the full templates section
-     * appended at body_stream_finish) goes here.  The buffer is
-     * pulled out via bw_finish_buf at finish time and handed to the
-     * segment manager for write-out to the separate header member.  */
+    /* Header — in-memory GByteArray; templates section appended at
+     * body_stream_finish, then handed to the segment manager. */
     BitWriter header_bw;
     int64_t prev_entry_template;
     int64_t current_thread;
-    /* False until the segment's first BODY_TAG_THREAD_SWITCH is
-     * emitted.  Forces that first record so the body always states
-     * its starting thread explicitly (as a normal delta from 0)
-     * instead of relying on an implicit "starts at 0" assumption. */
+    /* Previous CP entry's template, so the *next* CP entry can
+     * classify the prior BB's terminal-branch outcome for §6. */
+    BBTemplate *prev_cp_tmpl;
+    /* False until the first BODY_TAG_THREAD_SWITCH; forces it so the
+     * starting thread is an explicit delta-from-0, no implicit base. */
     bool    thread_announced;
-    /* Per-vCPU field-state tables: each thread's deltas are computed
-     * against its own prior emission, not the cross-thread sequence.
-     * Keyed by thread_id (== guest vCPU index), lazy-grown on first
-     * emit.  Slot may be null until the thread first emits.  CP state
-     * persists across body entries within a thread; WP state is a
-     * per-chain overlay that falls back to that thread's CP state. */
+    /* Per-vCPU field-state tables, keyed by thread_id (== guest vCPU
+     * index), lazy-grown on first emit (slot null until then).  Deltas
+     * stay within-thread, not cross-thread.  CP state persists across
+     * a thread's entries; WP state is a per-chain overlay falling back
+     * to that thread's CP state. */
     std::vector<FieldStateTable *> cp_field_state;
     std::vector<FieldStateTable *> wp_field_state;
-    /*
-     * Per-thread regfile bookkeeping.  Each entry tracks whether
-     * thread_id has emitted its BODY_TAG_REGFILE record in this
-     * segment yet.  Indexed by thread_id; resized on demand.  Cleared
-     * by reset_segment_local_state via body_stream_reset_per_thread.
-     */
+    /* Whether thread_id has emitted its BODY_TAG_REGFILE this segment.
+     * Indexed by thread_id; resized on demand. */
     std::vector<bool> regfile_emitted;
-    /*
-     * The segment-starting vCPU's pre-first-BB regfile.  Captured by
-     * start_trace_segment when the segment opens (before any traced
-     * BB executes on that thread); consumed when that thread emits
-     * its first body entry, then cleared.  Threads that join after
-     * segment open capture their regfile live at first emit (post-
-     * first-BB on their side) — slight asymmetry, but the segment-
-     * starting thread is the common case where pre-state is most
-     * valuable.
-     */
+    /* Segment-starting vCPU's pre-first-BB regfile (captured by
+     * start_trace_segment before any traced BB on that thread),
+     * consumed at that thread's first emit then cleared.  Threads
+     * joining later capture live at first emit (post-first-BB on
+     * their side) — slight asymmetry; the seed thread is the common
+     * case where pre-state matters most. */
     std::vector<InitialRegSnap> seed_regfile;
     int32_t                     seed_thread = -1;  /* -1 = unset */
-    /* Scratch overlays used to emit IFRAMEs.  An IFRAME is a full
-     * body-record dump (CP + WP chain + WP events) encoded against
-     * fresh "nothing observed yet" overlays so every record carries
-     * absolute values.  The generations are bumped before each IFRAME
-     * emission to invalidate all prior cells lazily; the IFRAME pass
-     * then writes deltas from template_default.  IFRAMEs do not
-     * affect the persistent cp/wp_field_state — the next regular
-     * ENTRY continues from where the previous ENTRY left off.
-     * Allocated lazily on first IFRAME. */
+    /* IFRAME scratch overlays: an IFRAME is a full body-record dump
+     * encoded against fresh "nothing observed" overlays so every
+     * record is absolute (generations bumped per IFRAME to invalidate
+     * lazily).  Persistent cp/wp_field_state is untouched — the next
+     * ENTRY continues uninterrupted.  Lazy on first IFRAME. */
     FieldStateTable *iframe_cp_scratch;
     FieldStateTable *iframe_wp_scratch;
     EntryViewScratch ev_scratch;
-    /* Per-body-entry scratch.  Reused across millions of entries to
-     * eliminate the malloc/free pair the encoder previously paid on
-     * every record.  rec_scratch is a RawBuf whose length is reset
-     * to 0 at the start of each delta-section emit and whose bytes
-     * are then copied into the main stream; the underlying
-     * allocation grows once to the largest record observed and
-     * stays put for the rest of the trace.  Switched from GByteArray
-     * to RawBuf so the per-byte append in the encoder hot loop
-     * bottoms out in an inlined memcpy instead of a glib function
-     * call (saved ~1.5 % of total runtime).  stage_buf is the
-     * StageRec[] the descriptor walk fills in, also reused.  Raw
-     * pointer because StageRec's type definition lives further
-     * down this TU and a vector<StageRec> here would force a
-     * file-order rearrangement. */
+    /* Per-body-entry scratch reused across all entries (no per-record
+     * malloc/free).  rec_scratch: RawBuf reset to len 0 per emit, then
+     * copied into the main stream; allocation grows once to the
+     * largest record (RawBuf not GByteArray so the encoder hot loop
+     * bottoms out in an inlined memcpy — ~1.5% of runtime).  stage_buf:
+     * reused StageRec[] the descriptor walk fills; raw pointer because
+     * StageRec is defined further down this TU. */
     RawBuf rec_scratch;
     struct StageRec *stage_buf;
     size_t stage_cap;
@@ -535,44 +515,15 @@ struct BodyStreamState {
 /* ========================= Template dictionary ========================= */
 
 /*
- * Write the template dictionary section.
+ * Write the template dictionary section.  Wire layout (template and
+ * per-insn record fields) is specified in champsim_tracer_format.md.
  *
- * Layout:
- *   num_templates : ULEB128
- *   { tmpl_len : ULEB128 , tmpl_bytes[tmpl_len] } *
- *
- * Each template record (buffered separately so its length is known):
- *   template_id      : ULEB128
- *   start_pc         : ULEB128
- *   num_insns        : ULEB128
- *   fall_through_pc  : ULEB128
- *   symbol_name      : string (ULEB128 len + UTF-8 bytes)
- *   { insn_record } *
- *
- * Per-insn record (byte-aligned):
- *   pc_delta    : ULEB128  (delta from previous insn PC within template;
- *                           first insn uses delta from start_pc)
- *   opcode      : u8
- *   branch_type : u8
- *   flags       : u8       bit0=branch_conditional, bit1=has_immediate,
- *                          bit2=is_atomic, bit4=vec, bit5=lane_parallel,
- *                          bit6=has_dep_block
- *   n_src       : u8
- *   n_dst       : u8
- *   src_regs[n_src] : u8 each
- *   dst_regs[n_dst] : u8 each
- *   max_dep_loads  : u8    template-static MAX load count.  Bounds
- *                          the dep-mask bit layout: load slots
- *                          occupy bits [n_src, n_src+max_dep_loads).
- *                          Runtime per-iter count rides on
- *                          CST_FID_N_LOADS and may be smaller.
- *   max_dep_stores : u8    template-static MAX store count.  Sizes
- *                          the store_data_dep_mask[] array in the
- *                          HAS_REG sub-block.  Runtime per-iter
- *                          count rides on CST_FID_N_STORES.
- *   [imm]       : SLEB128  (iff has_immediate)
- *   insn_size   : u8
- *   insn_bytes[insn_size]
+ * Encoding gotcha: max_dep_loads / max_dep_stores are template-static
+ * MAX counts, not per-iter.  max_dep_loads bounds the dep-mask bit
+ * layout (load slots occupy bits [n_src, n_src+max_dep_loads));
+ * max_dep_stores sizes store_data_dep_mask[] in the HAS_REG sub-block.
+ * The runtime per-iter counts ride separately on CST_FID_N_LOADS /
+ * CST_FID_N_STORES and may be smaller.
  */
 static void write_bin_templates(BitWriter *bw)
 {
@@ -587,6 +538,79 @@ static void write_bin_templates(BitWriter *bw)
         bw_write_uleb128(&sub, tmpl->start_pc);
         bw_write_uleb128(&sub, tmpl->n_insns);
         bw_write_uleb128(&sub, tmpl->fall_through_pc);
+
+        /*
+         * Terminal-branch target table (header).  Target history is a
+         * per-PC property: BranchRecord is a per-PC pool shared by
+         * every template whose last insn sits at that PC, so a
+         * WP-discovered template may surface a co-located branch's CP
+         * history (accepted, not a violation).  Uniform layout:
+         *   - not a branch        -> n_targets = 0
+         *   - non-indirect branch -> n_targets = 1, target[0] = taken
+         *                            edge (tmpl->taken_pc; 0 if never
+         *                            resolved)
+         *   - indirect / return   -> n_targets = #distinct CP-observed
+         *                            targets (<= BRANCH_TARGET_HISTORY)
+         * fall_through_pc (above) is the not-taken edge and its single
+         * source of truth — never repeated here.  note_target() never
+         * runs during WP, so the indirect set is CP-only; the WP
+         * indirect aggregate (no per-target WP distribution) is
+         * attributed to target[0] so it is not lost.
+         */
+        struct ProfTgt {
+            uint64_t pc, t_cp, nt_cp, t_wp, nt_wp;
+        };
+        std::vector<ProfTgt> prof_tgts;
+        {
+            const TemplateProfile *pp = tmpl->profile;
+            const InsnFields *last = tmpl->n_insns > 0
+                ? &tmpl->insn_fields[tmpl->n_insns - 1] : nullptr;
+            uint64_t bt_cp = pp ? pp->br_taken_cp : 0;
+            uint64_t bnt_cp = pp ? pp->br_nottaken_cp : 0;
+            uint64_t bt_wp = pp ? pp->br_taken_wp : 0;
+            uint64_t bnt_wp = pp ? pp->br_nottaken_wp : 0;
+            if (last && last->branch_type != BRANCH_NONE) {
+                bool indirect =
+                    last->branch_type == BRANCH_INDIRECT_JUMP ||
+                    last->branch_type == BRANCH_RETURN;
+                if (indirect) {
+                    const BranchRecord *br = g_branch_history.find(
+                        tmpl->insn_pcs[tmpl->n_insns - 1]);
+                    if (br) {
+                        uint64_t tot_cp = 0;
+                        for (uint8_t k = 0; k < BRANCH_TARGET_HISTORY;
+                             k++) {
+                            if (br->targets[k].valid) {
+                                tot_cp += br->targets[k].count;
+                            }
+                        }
+                        for (uint8_t k = 0; k < BRANCH_TARGET_HISTORY;
+                             k++) {
+                            if (!br->targets[k].valid) continue;
+                            uint64_t c = br->targets[k].count;
+                            bool first = prof_tgts.empty();
+                            prof_tgts.push_back({
+                                br->targets[k].target,
+                                c, tot_cp - c,
+                                first ? bt_wp : 0,
+                                first ? bnt_wp : 0,
+                            });
+                        }
+                    }
+                } else {
+                    /* Non-indirect: one taken edge; its split IS the
+                     * terminal branch's aggregate outcome. */
+                    prof_tgts.push_back({
+                        tmpl->taken_pc,
+                        bt_cp, bnt_cp, bt_wp, bnt_wp,
+                    });
+                }
+            }
+        }
+        bw_write_uleb128(&sub, prof_tgts.size());
+        for (const ProfTgt &tg : prof_tgts) {
+            bw_write_uleb128(&sub, tg.pc);
+        }
         {
             const char *sym = tmpl->symbol_name ? tmpl->symbol_name : "";
             size_t sym_len = strlen(sym);
@@ -645,22 +669,17 @@ static void write_bin_templates(BitWriter *bw)
                            tmpl->insn_sizes[i]);
 
             /*
-             * Optional dependency sub-block.  Two independent
-             * families inside one block, controlled by dep_block_flags:
-             *
-             *   HAS_REG  — refiner-produced: which inputs feed each
-             *              dst reg / each store's data
-             *   HAS_ADDR — walker-produced: which src_regs feed each
-             *              load/store ADDRESS (so the consumer knows
-             *              when each memop can fire)
-             *
-             * Mask array sizes all come from the outer template
-             * header (n_dst, max_dep_loads, max_dep_stores); the
-             * block carries only the dep_block_flags byte + masks.
-             * Bit layouts diverge: HAS_REG masks address the full
-             * input pool (src_regs + load_data + imm); HAS_ADDR
-             * masks omit the load_data band because addresses are
-             * computed before any load fires.
+             * Optional dependency sub-block, dep_block_flags-gated:
+             *   HAS_REG  — refiner: inputs feeding each dst reg / each
+             *              store's data
+             *   HAS_ADDR — walker: src_regs feeding each load/store
+             *              ADDRESS (when each memop can fire)
+             * Mask array sizes come from the template header (n_dst,
+             * max_dep_loads, max_dep_stores); only the flags byte +
+             * masks are on the wire.  Bit layouts diverge: HAS_REG
+             * masks address the full input pool (src_regs + load_data
+             * + imm); HAS_ADDR omits the load_data band (addresses are
+             * computed before any load fires).
              */
             if (fld->has_reg_deps || fld->has_addr_deps) {
                 uint8_t dep_flags = 0;
@@ -686,6 +705,53 @@ static void write_bin_templates(BitWriter *bw)
             }
         }
 
+        /*
+         * Template profile block (format §6) — always present, after
+         * the last per-insn descriptor.  Run-aggregated PGO metadata;
+         * final totals (templates serialized at segment finish).
+         */
+        {
+            static const TemplateProfile EMPTY_PROFILE = {};
+            const TemplateProfile *p =
+                tmpl->profile ? tmpl->profile : &EMPTY_PROFILE;
+
+            bw_write_uleb128(&sub, p->exec_cp);
+            bw_write_uleb128(&sub, p->exec_wp);
+
+            /* Per-target taken/not-taken counts, 1:1 with the header
+             * target list (n_targets not repeated). */
+            for (const ProfTgt &tg : prof_tgts) {
+                bw_write_uleb128(&sub, tg.t_cp);
+                bw_write_uleb128(&sub, tg.nt_cp);
+                bw_write_uleb128(&sub, tg.t_wp);
+                bw_write_uleb128(&sub, tg.nt_wp);
+            }
+
+            for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+                const InsnProfile zero = {};
+                const InsnProfile *ip =
+                    tmpl->profile ? &p->insns[i] : &zero;
+                bw_write_uleb128(&sub, ip->memops_cp);
+                bw_write_uleb128(&sub, ip->memops_wp);
+                uint8_t pf = 0;
+                pf |= (ip->pat_cp & CST_PROFILE_PAT_MASK)
+                      << CST_PROFILE_PAT_CP_SHIFT;
+                pf |= (ip->pat_wp & CST_PROFILE_PAT_MASK)
+                      << CST_PROFILE_PAT_WP_SHIFT;
+                if (ip->addr_cp) pf |= CST_PROFILE_ADDR_CP;
+                if (ip->addr_wp) pf |= CST_PROFILE_ADDR_WP;
+                bw_write_u8(&sub, pf);
+                if (ip->memops_cp > 0) {
+                    bw_write_uleb128(&sub, ip->lo_cp);
+                    bw_write_uleb128(&sub, ip->hi_cp - ip->lo_cp);
+                }
+                if (ip->memops_wp > 0) {
+                    bw_write_uleb128(&sub, ip->lo_wp);
+                    bw_write_uleb128(&sub, ip->hi_wp - ip->lo_wp);
+                }
+            }
+        }
+
         bw_byte_align(&sub);
         GByteArray *data = bw_finish_buf(&sub);
         bw_write_section(bw, data);
@@ -696,24 +762,14 @@ static void write_bin_templates(BitWriter *bw)
 
 /* ============== Unified field-typed delta stream ==============
  *
- * Each BB entry carries a single
- * length-prefixed `delta_section`:
- *
- *     n_records : ULEB
- *     for r in 0..n_records:
- *       ins_pos_gap : ULEB        (cur_ins_pos − prev_ins_pos)
- *       field_id    : u8          (CST_FID_*)
- *       payload     : scalar SLEB512 delta, or raw vector for EXTRA_*
- *
- * Records are emitted in non-descending (ins_pos, field_id) order;
- * unchanged fields contribute zero bytes.  Per-(template_id, ins_pos,
- * field_id) state tables track the most-recent observed value and
- * supply the baseline.  CP state advances on every CP entry; WP
- * state is forked from CP at chain start and discarded at chain end.
- *
- * Scalar fields are represented as modulo-2**512 little-endian values.
- * EXTRA_* memop fields are rare raw vectors and do not update scalar
- * state.
+ * Wire layout of the per-entry delta_section: see
+ * champsim_tracer_format.md.  Records are non-descending
+ * (ins_pos, field_id); unchanged fields cost zero bytes.
+ * Per-(template_id, ins_pos, field_id) state tables hold the
+ * most-recent value as the baseline.  CP state advances on every CP
+ * entry; WP state forks from CP at chain start, discarded at chain
+ * end.  Scalars are mod-2^512 little-endian; EXTRA_* memop fields are
+ * rare raw vectors that do not update scalar state.
  */
 
 typedef CSTWideValue U512;
@@ -756,13 +812,10 @@ static inline U512 u512_sub(U512 a, U512 b)
 }
 
 /*
- * Materialise a U512 holding (cur - base) in mod 2^512 / two's-
- * complement form, given two u64 inputs.  Equivalent to
- * u512_sub(cst_wide_from_u64(cur), cst_wide_from_u64(base)) but
- * skips the round-trip through two stack-resident U512s — used by
- * the narrow extract fast path in emit_field_delta_section so the
- * dominant scalar-unchanged case never materialises a U512 at all
- * and the rare staged-record case materialises one directly.
+ * U512 holding (cur - base) mod 2^512, from two u64s.  Equivalent to
+ * u512_sub(cst_wide_from_u64(cur), cst_wide_from_u64(base)) without
+ * the two-stack-U512 round-trip; used by the narrow fast path so the
+ * scalar-unchanged case never materialises a U512.
  */
 static inline U512 u512_from_u64_diff(uint64_t cur, uint64_t base)
 {
@@ -845,11 +898,8 @@ enum {
      * this grows.                                                    */
     FIELD_STATE_SLOT_COUNT = 3 + (5 * CST_FID_SLOT_COUNT)
                                + (4 * CST_FID_SLOT_COUNT) + 7,
-    /* Field-ID space is ULEB128 — FIDs reach CST_FID_EXTENDED.
-     * Round up to the next power of two so the fid -> slot lookup
-     * stays a single load with no bounds dance.  At slot count 64
-     * and stride-4 lane block the largest FID lands near 590, so
-     * 1024 covers it with headroom for further families. */
+    /* Power-of-two so fid -> slot is a single load.  Largest FID
+     * ~590 at slot count 64 / stride-4 lane block; 1024 has headroom. */
     FIELD_STATE_LUT_SIZE   = 1024,
 };
 
@@ -860,14 +910,11 @@ typedef struct FieldStateBlock {
 } FieldStateBlock;
 
 /*
- * Per-(template_id) FieldStateBlock cache.  Template IDs are dense
- * positive integers handed out by BBTemplateCache starting from 1,
- * so a vector indexed by template_id replaces the per-entry glib
- * hash lookup that profiling at ~10 % of total runtime on mcf.
- * Slot 0 is unused (template_id 0 is reserved as "no template").
- * The vector grows on demand when a never-seen-before template_id
- * arrives; existing pointers are stable across grows because
- * std::vector<T*> only reallocates the pointer array.
+ * Per-(template_id) FieldStateBlock cache, vector indexed by
+ * template_id (dense ints from 1; slot 0 = "no template").  Replaced
+ * a per-entry glib hash lookup that was ~10% of runtime on mcf.
+ * Pointers stable across grows (vector<T*> only reallocs the pointer
+ * array).
  */
 struct FieldStateTable {
     std::vector<FieldStateBlock *> blocks;  /* index = template_id */
@@ -875,11 +922,8 @@ struct FieldStateTable {
 };
 
 /*
- * Field-id → slot-index lookup table.  Built once at first call so
- * the hot encoder loop does a single byte-load per record instead of
- * the eight-branch chain the original implementation used.  At ~80 M
- * calls on a 5 M-insn mcf trace, the chain showed up as 2.6 % of
- * total runtime; the table form drops that to a rounding error.
+ * Field-id -> slot-index LUT, built once.  Replaces an eight-branch
+ * chain that was 2.6% of runtime (~80M calls on a 5M-insn mcf trace).
  */
 static uint16_t g_field_state_slot_lut[FIELD_STATE_LUT_SIZE];
 static bool     g_field_state_slot_lut_built = false;
@@ -1026,15 +1070,11 @@ static inline bool field_state_block_get(FieldStateBlock *block,
 }
 
 /*
- * Narrow accessors over the same FieldStateBlock storage.  Field
- * families whose semantic value fits in u64 (memop counts /
- * addresses, opcode, branch type, instruction flags / immediates /
- * sizes, instruction byte words) read and write only ``limb[0]`` and
- * skip the 56-byte zeroing that the wide get/put would do — so the
- * dominant per-record cost of the encoder loop drops out.  Upper
- * limbs in narrow-family storage are never inspected; the family is
- * either narrow or wide for the lifetime of a trace, decided by
- * ``FieldDescriptor::extract_u64`` being non-null.
+ * Narrow accessors over FieldStateBlock storage: u64-fitting families
+ * read/write only limb[0], skipping the wide get/put's 56-byte
+ * zeroing.  Upper limbs are never inspected; a family is narrow or
+ * wide for the whole trace, decided by FieldDescriptor::extract_u64
+ * being non-null.
  */
 static inline bool field_state_block_get_u64(FieldStateBlock *block,
                                              uint32_t table_generation,
@@ -1122,29 +1162,20 @@ typedef struct {
     uint8_t (*runtime_slot_cap)(const EntryView *ev, uint32_t i);
 
     /* Narrow (u64) fast-path siblings of extract / template_default.
-     *
-     * When non-null, the emitter takes a path that avoids
-     * materialising a 64-byte U512 on the stack, comparing two u64s
-     * by register value and only materialising a U512 at staging
-     * time (rare — only when the field actually changed).  Profile
-     * showed the U512 stack round-trip dominating the encoder hot
-     * loop on mcf-like workloads.
-     *
-     * Both must be set together; when either is null the wide
-     * extract/template_default pair is used (LOAD_DATA, STORE_DATA,
-     * DST_REG — the families whose payload genuinely needs >64 bits). */
+     * When non-null the emitter compares two u64s in registers and
+     * only materialises a U512 when the field changed (the U512 stack
+     * round-trip dominated the encoder hot loop on mcf).  Both set
+     * together; either null -> wide pair (LOAD_DATA, STORE_DATA,
+     * DST_REG genuinely need >64 bits). */
     bool (*extract_u64)(const EntryView *ev, uint32_t ins_pos, uint8_t slot,
                         uint64_t *out_val);
     uint64_t (*template_default_u64)(const BBTemplate *tmpl,
                                      uint32_t ins_pos, uint8_t slot);
 
-    /* True iff the family's extract value equals its template_default
-     * for every body entry of a given (template, ins_pos) — i.e. the
-     * field is purely a function of the template, not of the run-time
-     * entry.  Such families never produce wire records (cur == base
-     * always), so the encoder hot loop can skip them entirely.
-     * Differential timing showed these probes were ~50 % of the per-
-     * slot cost on full-config mcf despite emitting nothing. */
+    /* True iff extract == template_default for every entry of a
+     * (template, ins_pos) — purely template-derived, never produces a
+     * wire record, so the hot loop skips it (these probes were ~50% of
+     * per-slot cost on full-config mcf despite emitting nothing). */
     bool template_static;
 
     const char *name;          /* debug only */
@@ -1152,12 +1183,10 @@ typedef struct {
 
 /* ---------- Per-family runtime slot caps ----------
  *
- * Memop families (LOAD_ADDR, STORE_ADDR, LOAD_DATA, STORE_DATA) and
- * DST_REG have CST_FID_SLOT_COUNT (16) wire slots but typical
- * instructions use 0-2 of them.  Iterating the full 16 just to call
- * extract() and have it return false is the dominant per-instruction
- * cost in emit_field_delta_section (~30% of plugin runtime).  These
- * caps let the emitter terminate the slot loop at the actual count. */
+ * Memop families and DST_REG have CST_FID_SLOT_COUNT wire slots but
+ * typical insns use 0-2.  Iterating all of them just to have extract()
+ * return false was ~30% of plugin runtime; these caps terminate the
+ * slot loop at the actual count. */
 static inline uint8_t cap_min(uint32_t v)
 {
     return v < CST_FID_SLOT_COUNT ? (uint8_t)v : (uint8_t)CST_FID_SLOT_COUNT;
@@ -1261,17 +1290,13 @@ static bool extr_store_data(const EntryView *ev, uint32_t i, uint8_t slot,
     return true;
 }
 
-/* Reg-snap families: the captured reg_snaps array is laid out per-insn
- * destination operands only, in template-walk order.  The values are
- * captured POST-execution (the per-insn callback is registered on the
- * NEXT instruction, so it fires after the current insn completes;
- * for the LAST insn of a TB the next TB's tb_exec callback handles
- * the snap).  Source register identities remain in the template;
- * source values are not emitted on the wire — consumers can derive
- * any register's value at any point from the most recent post-exec
- * destination observation, which strictly dominates the pre-exec
- * source view (covers every architectural write, not just reads,
- * and there are typically fewer destinations than sources per insn). */
+/* Reg-snap families: reg_snaps holds per-insn destination operands
+ * only, template-walk order, captured POST-execution (per-insn
+ * callback registered on the NEXT insn; last TB insn snapped by the
+ * next TB's tb_exec).  Source values are never on the wire — a
+ * consumer derives any reg's value from the most recent post-exec dst
+ * observation, which dominates the pre-exec source view (every
+ * architectural write, fewer dsts than srcs per insn). */
 static bool extr_dst_reg(const EntryView *ev, uint32_t i, uint8_t slot,
                          U512 *out)
 {
@@ -1286,16 +1311,11 @@ static bool extr_dst_reg(const EntryView *ev, uint32_t i, uint8_t slot,
 
 /* ---------- Metaflags (CST_FID_METAFLAGS) -----------------------
  *
- * Per-insn canonical-flags byte derived from the architectural REG_FLAGS
- * dst snap.  The encoder finds the REG_FLAGS slot in the insn's dst_regs
- * list, reads its captured value, and applies the per-ISA bit-shuffle
- * via isa_properties[trace_isa].flags_to_metaflags.  Gated by both:
- *   - CST_FLAG_REG_DATA on the trace (no flags reg means no snap)
- *   - InsnFields.writes_int_flags (set during template build only on
- *     insns whose dst maps to the ISA's int-flags reg row, i.e.
- *     RegClassification.is_int_flags = true).
- * Emitted as a side-channel FID rather than a synthetic dst-register
- * so templates' dst_regs lists stay free of phantom architectural slots.
+ * Per-insn canonical-flags byte from the REG_FLAGS dst snap, via
+ * isa_properties[trace_isa].flags_to_metaflags.  Gated by both
+ * CST_FLAG_REG_DATA and InsnFields.writes_int_flags.  A side-channel
+ * FID, not a synthetic dst-register, so dst_regs lists stay free of
+ * phantom architectural slots.
  */
 static int find_flags_slot(const InsnFields *f)
 {
@@ -1353,11 +1373,10 @@ static uint64_t deflt_u64_metaflags(const BBTemplate *t, uint32_t i,
     return 0;
 }
 
-/* Insn-encoding-mutable families.  The plugin's capture path does not
- * yet observe these (no SMC detector wired up) — extract returns the
- * template's static value, so the delta is always zero and no record
- * is emitted.  When an SMC observer is added later, point extract at
- * the runtime value and keep template_default unchanged. */
+/* Insn-encoding-mutable families.  No SMC observer wired up — extract
+ * returns the template's static value (delta always zero, no record).
+ * If SMC is added, point extract at the runtime value; keep
+ * template_default. */
 static U512 deflt_insn_bytes_lo(const BBTemplate *t, uint32_t i, uint8_t slot)
 {
     (void)slot;
@@ -1450,11 +1469,9 @@ static bool extr_insn_size(const EntryView *ev, uint32_t i, uint8_t slot,
 
 /* ---------- Narrow (u64) extract/default callbacks ----------
  *
- * Mirror the wide callbacks above for every family whose semantic
- * value fits in u64 (everything except the 512-bit-wide LOAD_DATA /
- * STORE_DATA / DST_REG payloads).  These are what the emitter's
- * fast path uses; they avoid the U512 stack round-trip that
- * dominated profiling of emit_field_delta_section on mcf.
+ * Mirror the wide callbacks for every u64-fitting family (all except
+ * LOAD_DATA / STORE_DATA / DST_REG).  The emitter's fast path uses
+ * these to avoid the U512 stack round-trip.
  */
 static bool extr_u64_n_loads(const EntryView *ev, uint32_t i, uint8_t slot,
                              uint64_t *out)
@@ -1592,10 +1609,9 @@ static bool extr_u64_insn_size(const EntryView *ev, uint32_t i, uint8_t slot,
 
 /* ---------- Lane-mask families ---------- */
 
-/* Lane-mask slot caps.  Returns 0 when the insn has no lane info
- * (most non-vec insns), suppressing emission entirely.  When the
- * refiner has set has_vec_lanes, only the actual reg / memop slots
- * get walked. */
+/* Lane-mask slot caps.  0 when the insn has no lane info (most
+ * non-vec insns), suppressing emission; else only the actual
+ * reg/memop slots are walked. */
 static uint8_t cap_src_lane_masks(const EntryView *ev, uint32_t i)
 {
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return 0;
@@ -1627,13 +1643,12 @@ static uint8_t cap_store_data_lane_masks(const EntryView *ev, uint32_t i)
 
 /*
  * Active-lane gate.  lane_mask_kind decides ONLY where the live-lane
- * value comes from — nothing else:
- *   STATIC      — the count is fixed by the instruction; the gate is
- *                 all-ones and the per-operand structural reg masks
- *                 are the final values.
- *   RISCV_VTYPE — the count is read from the vl CSR at exec; gate is
- *                 (1 << vl) - 1, AND-ed into every per-slot mask.
- * (future EVEX-k / SVE-pred kinds: same shape, read their reg.)
+ * count comes from:
+ *   STATIC      — fixed by the insn; gate all-ones (structural masks
+ *                 are final).
+ *   RISCV_VTYPE — vl read from CSR at exec; gate (1<<vl)-1, AND-ed
+ *                 into every per-slot mask.
+ * (future EVEX-k / SVE-pred: same shape, read their reg.)
  */
 static uint64_t lane_active_gate(const InsnFields *f, unsigned cpu_index)
 {
@@ -1657,31 +1672,23 @@ static uint64_t lane_active_gate(const InsnFields *f, unsigned cpu_index)
 }
 
 /*
- * Per-memop data lane mask.  Computed dynamically from the actual
- * memop: which lanes of the associated vector register take their
- * value from (load) / drain to (store) this specific access.  Uses
- * the memop's byte range relative to the instruction's access base
- * and the vector element width:
+ * Per-memop data lane mask: which lanes of the associated vector reg
+ * this access feeds (load) / drains (store).  From the memop byte
+ * range vs the insn's same-direction access base and element width:
  *
  *   lane_start = (memop_vaddr - access_base) / lane_bytes
- *   lane_count =  memop_size              / lane_bytes
+ *   lane_count =  memop_size                 / lane_bytes
  *   mask       = ((1 << lane_count) - 1) << lane_start
  *
- * access_base is the lowest vaddr among this insn's memops of the
- * same direction (lane 0 of a contiguous vector access).  When
- * lane_bytes is 0 (RISC-V V — element width is the runtime SEW, not
- * statically known) we fall back to one-lane-per-memop in slot order
- * (slot k -> lane k), which the exec gate then narrows by vl.
+ * access_base = lowest vaddr among the insn's same-direction memops
+ * (lane 0 of a contiguous access).  lane_bytes==0 (runtime-SEW, e.g.
+ * RISC-V V) falls back to one-lane-per-memop in slot order, narrowed
+ * by the exec gate.
  *
- * Exception: element insert/extract (PINSR*, PEXTR*, INSERTPS, etc.).
- * Such ops move ONE element to/from memory and the target register
- * lane is the instruction immediate, not the memop address (a
- * register has no address; the lone memop IS the access base so the
- * offset rule degenerates to lane 0).  Detected at emit from existing
- * fields: exactly one same-direction memop, element-sized (data_size
- * == lane_bytes), and the insn carries an immediate.  Then the lane
- * is f->immediate.  No persisted state - the immediate is already in
- * InsnFields from the operand walk.
+ * Exception: element insert/extract (PINSR/PEXTR/INSERTPS) move ONE
+ * element; the target lane is the insn immediate, not the address.
+ * Detected as: exactly one same-direction memop, element-sized
+ * (data_size == lane_bytes), insn has an immediate.
  */
 static uint64_t memop_data_lane_mask(const EntryView *ev, uint32_t i,
                                      uint8_t slot, uint8_t want_type,
@@ -1807,31 +1814,13 @@ static bool extr_store_data_lane_mask(const EntryView *ev, uint32_t i,
     return true;
 }
 
-/* Field family registry.
- *
- * Order matters for two reasons:
- *
- *  1. The per-insn emitter walks this table left-to-right and emits
- *     records in (ins_pos, descriptor-order) order.  The on-wire
- *     order is enforced as non-descending (ins_pos, field_id);
- *     within a single insn, the descriptor order must match the
- *     ascending field_id order the wire expects.  With the new
- *     interleaved-by-slot layout the bases are 0..7 (singletons +
- *     slot 0 of every family), so a table order of
- *
- *         N_LOADS, N_STORES, METAFLAGS,
- *         LOAD_ADDR, STORE_ADDR, LOAD_DATA, STORE_DATA, DST_REG,
- *         INSN_BYTES_LO, INSN_BYTES_HI, INSN_OPCODE, INSN_BRANCH_TYPE,
- *         INSN_FLAGS, INSN_IMMEDIATE, INSN_SIZE
- *
- *     matches what a decoder that resorted by field_id would expect.
- *
- *  2. The five slotted families share the same stride-5 ID space.
- *     Each slot k contributes one record per family that has an
- *     observation; the emitter visits descriptors in family order
- *     for slot k=0, then k=1, ... which produces ascending fids
- *     thanks to the interleave.  See the slot-stride note on
- *     FieldDescriptor.slot_stride. */
+/* Field family registry.  Order is load-bearing: the emitter walks
+ * this table left-to-right per insn and the wire requires
+ * non-descending (ins_pos, field_id).  Table order must match
+ * ascending field_id; the slotted families share an interleaved
+ * stride-N ID space so the family-major / slot-minor walk produces
+ * ascending fids (a final (pos,fid) sort backstops the interleave).
+ * See FieldDescriptor.slot_stride. */
 static const FieldDescriptor field_descriptors[] = {
         { CST_FID_N_LOADS,          1, 1,  false, false,
             extr_n_loads,        deflt_n_loads,         nullptr,
@@ -2142,12 +2131,10 @@ static void stage_rec_append(StageRec **stage, unsigned int *stage_len,
     (*stage)[(*stage_len)++] = rec;
 }
 
-/* CP memop overflow warning.  When an instruction's dynamic
- * memop count would exceed CST_FID_SLOT_COUNT, the slot loop
- * silently clamps and we emit one line to unknown_warnings.log
- * per entry — the cap is set well above realistic ISA ceilings
- * (AVX-512 ≤ 16, max-VLEN SVE ≤ 64), so any overflow is worth
- * a per-occurrence breadcrumb. */
+/* CP memop overflow warning.  The slot loop silently clamps a
+ * dynamic memop count exceeding CST_FID_SLOT_COUNT; the cap is well
+ * above realistic ISA ceilings (AVX-512 <=16, max-VLEN SVE <=64) so
+ * any overflow gets a per-occurrence breadcrumb. */
 static void warn_memop_overflow(const BBTemplate *tmpl, uint32_t insn_i,
                                 uint32_t n_loads, uint32_t n_stores)
 {
@@ -2169,14 +2156,11 @@ static void warn_memop_overflow(const BBTemplate *tmpl, uint32_t insn_i,
 }
 
 /*
- * The single emitter.  Walks the template insn-by-insn; for each insn,
- * walks the descriptor table; for each (descriptor, slot), pulls the
- * current value and emits a record iff it differs from the prior
- * observation (or template default on first sighting).
- *
- * The (ins_pos, field_id) wire ordering is a natural consequence of
- * the loop nesting (insn outer, descriptor table inner ascending,
- * slot inner ascending) — no sort needed.
+ * The single emitter.  Per insn, per (descriptor, slot): emit a
+ * record iff the current value differs from the prior observation
+ * (or template default on first sighting).  The loop nesting (insn /
+ * descriptor / slot, all ascending) yields the (ins_pos, field_id)
+ * wire order, with a final sort backstopping the slotted interleave.
  */
 static void emit_field_delta_section(BitWriter *main_bw,
                                      BodyStreamState *st,
@@ -2187,18 +2171,14 @@ static void emit_field_delta_section(BitWriter *main_bw,
                                      bool is_wp,
                                      uint8_t header_flags)
 {
-    /* rec_bw is a thin BitWriter wrapping st->rec_scratch (now a
-     * RawBuf, not a GByteArray).  Reset the buffer's length to 0 so
-     * the previous entry's payload is overwritten without freeing
-     * the underlying allocation. */
+    /* rec_bw wraps st->rec_scratch (RawBuf); reset len to 0 to
+     * overwrite the previous payload without freeing the allocation. */
     BitWriter rec_bw;
     bw_init_rb(&rec_bw, &st->rec_scratch);
     raw_buf_clear(&st->rec_scratch);
 
-    /* Reuse the per-stream StageRec buffer.  Length resets each call;
-     * capacity grows on demand via stage_rec_append's g_realloc_n
-     * path and is synced back to BodyStreamState before return so
-     * the next entry sees the larger capacity too. */
+    /* Reuse the per-stream StageRec buffer; capacity grows on demand
+     * and is synced back to BodyStreamState before return. */
     unsigned int stage_len = 0;
     unsigned int stage_cap = (unsigned int)st->stage_cap;
     StageRec *stage = st->stage_buf;
@@ -2214,10 +2194,7 @@ static void emit_field_delta_section(BitWriter *main_bw,
         uint32_t base_generation = base_state ? base_state->generation : 0;
 
         for (uint32_t i = 0; i < ev->tmpl->n_insns; i++) {
-            /* Diagnostic: warn when the dynamic memop count would
-             * exceed CST_FID_SLOT_COUNT.  The slot loop below will
-             * silently clamp to the cap; this log line surfaces the
-             * truncation so it doesn't get lost. */
+            /* Surface memop-count overflow before the slot loop clamps. */
             uint32_t insn_n_loads  = ev->actual_n_loads
                 ? ev->actual_n_loads[i]  : 0;
             uint32_t insn_n_stores = ev->actual_n_stores
@@ -2226,14 +2203,9 @@ static void emit_field_delta_section(BitWriter *main_bw,
 
             for (size_t d = 0; d < N_FIELD_DESCRIPTORS; d++) {
                 const FieldDescriptor *fd = &field_descriptors[d];
-                /* Template-static families (OPCODE, BRANCH_TYPE,
-                 * INSN_BYTES_*, IMMEDIATE, FLAGS, SIZE) have
-                 * extract == template_default for every body entry of
-                 * a given (template, ins_pos), so cur == base always
-                 * and they never produce a wire record.  Skip the
-                 * probe entirely — the wire output is identical to
-                 * iterating them and seeing every probe land on the
-                 * cur == base continue. */
+                /* Template-static families never produce a record
+                 * (cur == base always); skipping them is wire-
+                 * identical to probing and hitting the continue. */
                 if (fd->template_static)
                     continue;
                 if (fd->gated_by_mem_data && !(header_flags & CST_FLAG_MEM_DATA))
@@ -2245,12 +2217,8 @@ static void emit_field_delta_section(BitWriter *main_bw,
                     ? fd->runtime_slot_cap(ev, i)
                     : fd->slot_count;
                 if (fd->extract_u64) {
-                    /* Narrow fast path.  Compares two u64s in
-                     * registers; only materialises a U512 (via
-                     * u512_from_u64_diff) when the field actually
-                     * changed and we're staging a record.  Skips
-                     * the per-probe stack round-trip that
-                     * dominated the wide path on mcf. */
+                    /* Narrow fast path: compare two u64s in registers;
+                     * materialise a U512 only when staging a record. */
                     for (uint8_t slot = 0; slot < cap; slot++) {
                         uint64_t cur;
                         if (!fd->extract_u64(ev, i, slot, &cur)) continue;
@@ -2272,10 +2240,8 @@ static void emit_field_delta_section(BitWriter *main_bw,
                         rec.fid = fid;
                         rec.delta = u512_from_u64_diff(cur, base);
                         stage_rec_append(&stage, &stage_len, &stage_cap, rec);
-                        /* Update narrow state: limb[0] only.  Wide
-                         * fields use a different family so this
-                         * residue-in-upper-limbs is invisible to
-                         * any subsequent read. */
+                        /* Update narrow state: limb[0] only (upper-
+                         * limb residue is never read for this family). */
                         if (state_block && i < state_block->n_insns &&
                             slot_index != FIELD_STATE_SLOT_INVALID) {
                             size_t idx = ((size_t)i * FIELD_STATE_SLOT_COUNT)
@@ -2310,12 +2276,9 @@ static void emit_field_delta_section(BitWriter *main_bw,
         }
     }
 
-    /* Wire format requires non-descending (ins_pos, fid) order.  The
-     * collection loop above visits descriptors in family-major order,
-     * which produces ascending fids per-insn EXCEPT for the slotted
-     * families' interleaved layout (slot k of LOAD_ADDR is at the
-     * same FID range as slot 0 of STORE_ADDR + stride, etc.).  Sort
-     * by (pos, fid) here so the wire emit can rely on monotonicity. */
+    /* Wire requires non-descending (ins_pos, fid).  The family-major
+     * collection loop is ascending per-insn except for the slotted
+     * families' interleave, so sort by (pos, fid) here. */
     if (stage_len > 1) {
         std::stable_sort(stage, stage + stage_len,
             [](const StageRec &a, const StageRec &b) {
@@ -2338,8 +2301,7 @@ static void emit_field_delta_section(BitWriter *main_bw,
         prev_pos = s->pos;
     }
     bw_byte_align(&rec_bw);
-    /* Write the section directly from the scratch buffer without
-     * freeing it — st->rec_scratch persists for the next entry. */
+    /* Emit from the scratch buffer without freeing it. */
     bw_write_uleb128(main_bw, st->rec_scratch.len);
     bw_raw(main_bw, st->rec_scratch.data, st->rec_scratch.len);
 
@@ -2367,30 +2329,21 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
     }
 
     /*
-     * BodyStreamState contains std::vector members, so we use new
-     * instead of g_new0.  body_stream_finish frees inner resources
-     * (per-thread FSTs, scratch arrays) but does not delete the
-     * struct itself — it lives until segment-manager swap (next
-     * body_stream_new) at which point the previous one is dropped on
-     * the floor.  One-shot single-segment runs leak it to process
-     * exit either way.
+     * new (not g_new0) — BodyStreamState has std::vector members.
+     * body_stream_finish frees inner resources but not the struct;
+     * body_stream_free deletes it.
      */
     BodyStreamState *st = new BodyStreamState();
 
-    /* Body destination — bw streams directly to the body member's
-     * compression pipe / file via @w.  Body contents start with
-     * CST_MAGIC (so a stripped body member is still recognisable)
-     * and end with a trailing CST_MAGIC at body_stream_finish so
-     * truncation is detectable from either end. */
+    /* Body destination — streams via @w; leading + trailing CST_MAGIC
+     * make truncation detectable from either end. */
     bw_init_writer(&st->bw, w);
     bw_write_u32_le(&st->bw, CST_MAGIC);
 
-    /* Header destination — buffered in memory until body_stream_
-     * finish flushes it to the segment manager's header writer.
-     * Layout: magic, isa, flags, window descriptors, strings,
-     * encoding maps, then (appended at finish) the templates
-     * section.  No trailer.  All offsets are implicit since the
-     * header is its own self-contained file in the tar. */
+    /* Header — buffered in memory until body_stream_finish flushes it.
+     * Layout: magic, isa, flags, window descriptors, strings, encoding
+     * maps, templates section (appended at finish).  Own tar member,
+     * no trailer, implicit offsets. */
     bw_init_buf(&st->header_bw);
     bw_write_u32_le(&st->header_bw, CST_MAGIC);
     bw_write_u8(&st->header_bw, (uint8_t)trace_isa);
@@ -2406,33 +2359,22 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
     st->header_flags = flags;
 
     /* Segment instruction-window descriptors:
-     *   start_insn          : architectural icount where this segment
-     *                         begins.  Lets consumers anchor body
-     *                         records to a global insn timeline.
-     *   warmup_insns        : insns at the start of this trace meant
-     *                         to prime caches/predictors and not be
-     *                         evaluated.  Zero for non-simpoint runs.
-     *   total_target_insns  : the configured length of the segment.
-     *                         simpoint mode = warmup + simulation;
-     *                         non-simpoint with explicit stop =
-     *                         stop - start; non-simpoint without an
-     *                         explicit stop = 0 (meaning unbounded:
-     *                         the trace runs until process exit).
-     *                         This is the targeted value, not the
-     *                         observed one — overshoot due to TB
-     *                         granularity is not reflected here. */
+     *   start_insn         : global icount anchor for body records.
+     *   warmup_insns       : cache/predictor priming, not evaluated;
+     *                        0 for non-simpoint.
+     *   total_target_insns : configured (targeted, not observed —
+     *                        TB-granularity overshoot not reflected)
+     *                        length.  simpoint = warmup+sim;
+     *                        non-simpoint w/ stop = stop-start;
+     *                        unbounded = 0. */
     bw_write_uleb128(&st->header_bw, start_insn);
     bw_write_uleb128(&st->header_bw, warmup_insns);
     bw_write_uleb128(&st->header_bw, total_target_insns);
 
-    /* SimPoint weight: the fraction of whole-program execution this
-     * segment represents, so a consumer can reconstruct a
-     * whole-program metric as the weighted sum over per-simpoint
-     * traces without going back to the original .weights file.  0.0
-     * for non-simpoint segments (no weighting applies).  Encoded as
-     * a raw little-endian IEEE-754 double (fixed 8 bytes) rather than
-     * a varint — it isn't an integer and there's exactly one per
-     * header. */
+    /* SimPoint weight: whole-program execution fraction this segment
+     * represents (weighted-sum reconstruction without the .weights
+     * file).  0.0 for non-simpoint.  Raw LE IEEE-754 double, not a
+     * varint (non-integer, one per header). */
     {
         uint64_t bits;
         memcpy(&bits, &simpoint_weight, sizeof(bits));
@@ -2467,46 +2409,29 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
     write_header_encoding_maps(&st->header_bw);
     bw_byte_align(&st->header_bw);
 
-    /* Flush the body magic prefix.  Body content (BODY_TAG_*
-     * records) starts at offset 4 in the body member; consumers
-     * verify the leading u32 against CST_MAGIC before parsing. */
+    /* Flush the body magic prefix; BODY_TAG_* records start at
+     * offset 4. */
     bw_byte_align(&st->bw);
     bw_flush(&st->bw);
 
-    /* Base 0, like every other delta in the format.  The first body
-     * record is forced to be a THREAD_SWITCH regardless (see
-     * thread_announced in body_stream_write_entry), so the starting
-     * thread is stated explicitly as an ordinary delta from 0 — no
-     * special-case base a consumer would have to know about. */
+    /* Base 0.  The first body record is forced to be a THREAD_SWITCH
+     * (see thread_announced), so the starting thread is an ordinary
+     * delta-from-0 with no special-case base. */
     st->current_thread = 0;
     st->thread_announced = false;
 
-    /*
-     * Per-thread FieldStateTables are lazy-allocated on first emit
-     * for each thread (see get_or_create_per_thread_fst).  vectors
-     * start empty.
-     */
+    /* Per-thread FieldStateTables lazy-allocate on first emit. */
     st->iframe_cp_scratch = nullptr;  /* lazy on first IFRAME */
     st->iframe_wp_scratch = nullptr;
 
     /*
-     * The segment-starting vCPU's regfile, if the caller supplied one
-     * with at least one live (width>0) value, is held until that
-     * thread's first body emit (where it's written out as
-     * BODY_TAG_REGFILE).  Threads other than the seed capture their
-     * regfile live at first emit.  Install-time segment opens
-     * (cpu_index = -1, no vCPU context yet) produce a stub regfile
-     * with all width=0; we treat those as absent and let every thread
-     * capture live, which gets meaningful values rather than the
-     * empty stub.
-     *
-     * @seed_thread_id is the vCPU index that triggered start_trace_
-     * segment (thread_id == guest vCPU index, stable for the whole
-     * run).  If another thread races in before the seed thread's
-     * first body emit, that joiner just captures its own regfile
-     * live at first emit; the seed regfile stays pinned to
-     * @seed_thread_id and is emitted when that vCPU first emits
-     * (post-first-BB worst case, same fallback as before).
+     * Seed regfile: held until @seed_thread_id's first body emit
+     * (written as BODY_TAG_REGFILE) iff the caller supplied one with
+     * a live (width>0) value.  Other threads capture live at first
+     * emit.  Install-time opens (cpu_index=-1) yield an all-width-0
+     * stub treated as absent so every thread captures live.  A joiner
+     * racing in before the seed's first emit just captures its own;
+     * the seed regfile stays pinned to @seed_thread_id.
      */
     bool any_live = false;
     if (regfile) {
@@ -2519,9 +2444,7 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
         st->seed_thread = (int32_t)seed_thread_id;
     }
 
-    /* Pre-allocate the encoder's per-entry scratch.  Sized
-     * generously enough that the typical body record never
-     * triggers a realloc; growth on demand handles outliers. */
+    /* Pre-allocate the per-entry scratch; growth on demand. */
     raw_buf_init(&st->rec_scratch);
     raw_buf_reserve(&st->rec_scratch, 256);
     st->stage_cap = 64;
@@ -2531,10 +2454,9 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
 }
 
 /*
- * Build an EntryView wrapping the captured per-entry data and emit
- * one length-prefixed delta_section.  The descriptor table in
- * field_descriptors[] is the single source of truth for which fields
- * exist on the wire and how each is reconstructed.
+ * Build an EntryView and emit one length-prefixed delta_section.
+ * field_descriptors[] is the single source of truth for the wire
+ * fields.
  */
 static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
                                         FieldStateTable *state,
@@ -2586,21 +2508,16 @@ static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
 }
 
 /*
- * Emit one body-record payload (CP section + WP chain + WP events) using
- * the supplied overlays.  The header tag (BODY_TAG_ENTRY/IFRAME) is the
- * caller's responsibility, as is any tmpl_delta the record format
- * requires (ENTRY uses one; IFRAME omits it because it always inherits
- * the immediately-preceding ENTRY's template).
+ * Emit one body-record payload (CP section + WP chain + WP events)
+ * using the supplied overlays.  The header tag and any tmpl_delta are
+ * the caller's responsibility (ENTRY has a tmpl_delta; IFRAME omits
+ * it, inheriting the preceding ENTRY's template).
  *
- * cp_state / wp_state / wp_base are the FieldStateTable instances used
- * for delta encoding.  ENTRY passes the persistent overlays (so the
- * encoded deltas compress well and the post-record state reflects the
- * observation).  IFRAME passes per-IFRAME scratch overlays whose
- * generations have been bumped, so all baselines fall through to
- * template_default and every encoded value is absolute.  The scratch
- * overlays absorb the writes and are discarded by the next IFRAME's
- * generation bump — the persistent overlays are untouched, which is
- * what makes IFRAMEs validation-only redundant records.
+ * ENTRY passes the persistent overlays (deltas compress, post-record
+ * state reflects the observation).  IFRAME passes generation-bumped
+ * scratch overlays so all baselines fall to template_default (every
+ * value absolute); the persistent overlays are untouched, which is
+ * what makes IFRAMEs validation-only.
  */
 static void emit_body_record_payload(
     BodyStreamState *st, BitWriter *bw, BodyEntry *entry, uint32_t num_wp,
@@ -2675,10 +2592,8 @@ static void emit_body_record_payload(
 }
 
 /*
- * Lazily allocate or fetch the per-thread FieldStateTable at @vec[tid].
- * Resizes the vector to fit and creates a fresh table the first time
- * @tid is seen.  Result is stable across grows because the vector
- * holds pointers, not the table itself.
+ * Lazily fetch/allocate the per-thread FieldStateTable at @vec[tid].
+ * Result stable across grows (vector holds pointers).
  */
 static FieldStateTable *get_or_create_per_thread_fst(
     std::vector<FieldStateTable *> &vec, uint32_t tid)
@@ -2693,13 +2608,10 @@ static FieldStateTable *get_or_create_per_thread_fst(
 }
 
 /*
- * Emit a BODY_TAG_REGFILE record for @thread_id carrying the absolute
- * register file in @snaps.  Wire format: tag, thread_id (varuint),
- * n_present (varuint), then for each present register
- * (gen_id u8, width u8, bytes[width]).  Only entries with
- * width_bytes > 0 are written; width=0 means "no live snapshot for
- * this gen-id at first-emit time" and the decoder leaves its slot
- * untouched.
+ * Emit a BODY_TAG_REGFILE record for @thread_id (absolute reg file).
+ * Wire: tag, thread_id, n_present, then (gen_id, width, bytes[width])
+ * per present register.  Only width>0 entries are written; width=0
+ * means "no live snapshot", decoder leaves its slot untouched.
  */
 static void emit_regfile_record(BitWriter *bw, uint32_t thread_id,
                                 const std::vector<InitialRegSnap> &snaps)
@@ -2719,6 +2631,132 @@ static void emit_regfile_record(BitWriter *bw, uint32_t thread_id,
     }
 }
 
+/* ===================== Template profile (§6) ===================== */
+
+static TemplateProfile *profile_get(BBTemplate *t)
+{
+    if (!t->profile) {
+        t->profile = g_new0(TemplateProfile, 1);
+        uint32_t n = t->n_insns ? t->n_insns : 1;
+        t->profile->insns = g_new0(InsnProfile, n);
+        for (uint32_t i = 0; i < t->n_insns; i++) {
+            t->profile->insns[i].lo_cp = UINT64_MAX;
+            t->profile->insns[i].lo_wp = UINT64_MAX;
+        }
+    }
+    return t->profile;
+}
+
+/* Pages touched by a real CORRECT-PATH mem-op.  NEVER from WP — WP is
+ * speculative and must not define the legitimate address space.  The
+ * data-is-address flag (CP and WP) resolves against this CP-only set. */
+static std::unordered_set<uint64_t> g_obs_pages;
+
+static inline void profile_note_page(uint64_t ea)
+{
+    g_obs_pages.insert(ea >> CST_PROFILE_PAGE_SHIFT);
+}
+
+/* item 5: a loaded/stored value is an "address" when its page is one
+ * a real mem-op accessed. */
+static bool profile_value_is_addr(const DynParam &dp)
+{
+    if (dp.data_size == 0) {
+        return false;                       /* no data captured */
+    }
+    uint64_t v = dp.data.limb[0];           /* low 64 bits, LE */
+    if (dp.data_size < 8) {
+        v &= (~(uint64_t)0) >> (8 * (8 - dp.data_size));
+    }
+    return g_obs_pages.count(v >> CST_PROFILE_PAGE_SHIFT) != 0;
+}
+
+/* Per-insn memop step of the stride classifier (items 3/4/6).
+ * Escalates monotonically (once RANDOM, stays RANDOM).  Classifies on
+ * the SECOND-order difference, not raw stride:
+ *
+ *   delta_n  = ea_n   - ea_{n-1}     (this step)
+ *   ddelta_n = delta_n - delta_{n-1} (change in step size)
+ *
+ *   REGULAR    constant stride, ddelta == 0 (incl. stride 0).
+ *   IRREGULAR  varies but every |ddelta| <= 4096 (smoothly walking).
+ *   RANDOM     some |ddelta| > 4096 (step jumped >1 page).
+ *
+ * `strd` = rolling PREVIOUS delta; `hs` = a prev delta exists. */
+static void profile_step(InsnProfile *ip, uint64_t ea, bool wp,
+                         bool is_addr)
+{
+    uint64_t *lo   = wp ? &ip->lo_wp : &ip->lo_cp;
+    uint64_t *hi   = wp ? &ip->hi_wp : &ip->hi_cp;
+    uint64_t *mc   = wp ? &ip->memops_wp : &ip->memops_cp;
+    uint64_t *prev = wp ? &ip->prev_addr_wp : &ip->prev_addr_cp;
+    int64_t  *strd = wp ? &ip->stride_wp : &ip->stride_cp;
+    uint8_t  *hp   = wp ? &ip->have_prev_wp : &ip->have_prev_cp;
+    uint8_t  *hs   = wp ? &ip->have_stride_wp : &ip->have_stride_cp;
+    uint8_t  *pat  = wp ? &ip->pat_wp : &ip->pat_cp;
+    uint8_t  *adr  = wp ? &ip->addr_wp : &ip->addr_cp;
+
+    (*mc)++;
+    if (ea < *lo) *lo = ea;
+    if (ea > *hi) *hi = ea;
+    uint8_t cls = CST_PAT_REGULAR;             /* lone/constant = regular */
+    if (*hp) {
+        int64_t d = (int64_t)(ea - *prev);     /* this step (delta_n) */
+        if (!*hs) {
+            /* First delta: nothing to difference against yet — a
+             * lone step is still a (trivially) constant stride. */
+            *hs = 1;
+            *strd = d;
+        } else if (d != *strd) {
+            /* Step size changed: classify on the difference of
+             * deltas, not on the delta's magnitude. */
+            int64_t dd = d - *strd;            /* ddelta_n */
+            uint64_t add = dd < 0 ? (uint64_t)(-dd) : (uint64_t)dd;
+            cls = add > CST_PROFILE_RAND_DELTA ? CST_PAT_RANDOM
+                                               : CST_PAT_IRREGULAR;
+            *strd = d;                         /* roll: prev delta */
+        }
+    }
+    if (cls > *pat) *pat = cls;
+    *prev = ea;
+    *hp = 1;
+    if (is_addr) *adr = 1;
+}
+
+static void profile_accumulate(BBTemplate *t,
+                               const std::vector<DynParam> &dps,
+                               bool wp)
+{
+    if (!t) return;
+    TemplateProfile *p = profile_get(t);
+    if (wp) p->exec_wp++; else p->exec_cp++;
+    for (const DynParam &dp : dps) {
+        if (dp.insn_index >= t->n_insns) continue;
+        if (!wp) profile_note_page(dp.value);   /* CP defines pages */
+        profile_step(&p->insns[dp.insn_index], dp.value, wp,
+                     profile_value_is_addr(dp));
+    }
+}
+
+/* Terminal-branch outcome (item 2) for the BB whose template is
+ * @t, given the next executed PC @next_pc.  taken == control did
+ * NOT fall through.  Unconditional/call/ret terminators are always
+ * "taken".  No-op when the BB does not end in a branch. */
+static void profile_branch(BBTemplate *t, uint64_t next_pc, bool wp)
+{
+    if (!t || t->n_insns == 0) return;
+    const InsnFields *last = &t->insn_fields[t->n_insns - 1];
+    if (last->branch_type == BRANCH_NONE) return;
+    TemplateProfile *p = profile_get(t);
+    bool taken = (next_pc != t->fall_through_pc);
+    if (!last->branch_conditional) taken = true;
+    if (wp) {
+        if (taken) p->br_taken_wp++; else p->br_nottaken_wp++;
+    } else {
+        if (taken) p->br_taken_cp++; else p->br_nottaken_cp++;
+    }
+}
+
 void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
 {
     int64_t entry_tmpl = entry->template_id;
@@ -2732,6 +2770,29 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
         dyn_params_sort_template_order(wp.dyn_params);
     }
 
+    /*
+     * Template profile accumulation (§6).  Pure metadata, serialized
+     * later in write_bin_templates.
+     *   - CP: the prev CP BB's terminal branch is now resolvable (its
+     *     successor is this BB's start_pc); classify and remember.
+     *   - WP: chain order gives each non-final WP BB's successor.
+     */
+    profile_accumulate(entry->tmpl, entry->dyn_params, false);
+    if (st->prev_cp_tmpl && entry->tmpl) {
+        profile_branch(st->prev_cp_tmpl, entry->tmpl->start_pc, false);
+    }
+    if (entry->tmpl) {
+        st->prev_cp_tmpl = entry->tmpl;
+    }
+    for (uint32_t w = 0; w < num_wp; w++) {
+        WPBBEntry &wp = entry->wp_entries[w];
+        profile_accumulate(wp.tmpl, wp.dyn_params, true);
+        if (!wp.fault && w + 1 < num_wp) {
+            profile_branch(wp.tmpl, entry->wp_entries[w + 1].start_pc,
+                           true);
+        }
+    }
+
     if (!st->thread_announced || (int64_t)tid != st->current_thread) {
         bw_write_u8(&st->bw, BODY_TAG_THREAD_SWITCH);
         bw_write_sleb128(&st->bw, (int64_t)tid - st->current_thread);
@@ -2740,16 +2801,11 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
     }
 
     /*
-     * Per-thread regfile emission.  The first body entry contributed
-     * by each thread in a segment is preceded by a BODY_TAG_REGFILE
-     * record so the consumer can prime that thread's simulator state
-     * with absolute register values.
-     * For the segment-starting thread we use the pre-first-BB
-     * snapshot captured by start_trace_segment (seed_regfile);
-     * threads joining later capture live registers at this point
-     * (post-first-BB on their side — slightly later than the seed
-     * thread but the best the plugin can do without a per-thread
-     * pre-execution hook).
+     * Per-thread regfile emission: each thread's first body entry is
+     * preceded by a BODY_TAG_REGFILE so the consumer can prime that
+     * thread's simulator state.  Seed thread uses the pre-first-BB
+     * snapshot (seed_regfile); joiners capture live here (post-first-BB
+     * on their side — best without a per-thread pre-exec hook).
      */
     if (tid >= st->regfile_emitted.size()) {
         st->regfile_emitted.resize((size_t)tid + 1, false);
@@ -2767,9 +2823,8 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
         st->regfile_emitted[tid] = true;
     }
 
-    /* Regular delta-encoded entry, against this thread's persistent
-     * per-vCPU overlays.  Cross-thread interleaving uses different
-     * FSTs so deltas stay within-thread (smaller, compressible). */
+    /* Regular delta-encoded entry against this thread's persistent
+     * per-vCPU overlays (deltas stay within-thread, compressible). */
     FieldStateTable *cp_fst = get_or_create_per_thread_fst(
         st->cp_field_state, tid);
     FieldStateTable *wp_fst = get_or_create_per_thread_fst(
@@ -2782,15 +2837,12 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
                              cp_fst, wp_fst, cp_fst);
 
     /*
-     * IFRAME trigger.  When iframe_rate is set and this CP template's
-     * per-template emission counter divides evenly, emit a redundant
-     * BODY_TAG_IFRAME body record with the same payload (CP + WP chain
-     * + WP events) but encoded against fresh scratch overlays — every
-     * value lands as an absolute delta-from-template-default.  The
-     * IFRAME does NOT advance st->prev_entry_template and does NOT
-     * write a tmpl_delta (its template is implicitly the immediately-
-     * preceding ENTRY's), so it is purely a validation/resync record
-     * the decoder may cross-check against the regular ENTRY.
+     * IFRAME trigger.  Every iframe_rate emissions of this CP
+     * template, emit a redundant BODY_TAG_IFRAME with the same payload
+     * but encoded against fresh scratch overlays (all values
+     * absolute).  It neither advances prev_entry_template nor writes a
+     * tmpl_delta (template = the preceding ENTRY's) — a pure
+     * validation/resync record.
      */
     if (iframe_rate > 0 && entry->tmpl) {
         entry->tmpl->emit_count++;
@@ -2818,35 +2870,14 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
 }
 
 /*
- * Finish the body stream and produce the header buffer.
+ * Finish the body stream and produce the header buffer.  Member
+ * layouts are specified in champsim_tracer_format.md; each is its
+ * own self-contained ustar member (no trailer) assembled by the
+ * segment manager after this returns.  The body's two-magic bracket
+ * makes truncation visible without reading the whole stream.
  *
- * Body member layout (already in @st->bw, an open stream to the
- * body output destination):
- *
- *     CST_MAGIC  (already written at body_stream_new)
- *     BODY_TAG_* records ...
- *     BODY_TAG_END  num_entries
- *     CST_MAGIC   (trailing sentinel for truncation detection)
- *
- * Header buffer layout (in @st->header_bw, returned via the out-
- * param @header_bytes):
- *
- *     CST_MAGIC  isa  flags
- *     start_insn  warmup_insns  total_target_insns
- *     command-string  datetime-string  comment-string  target_name-string
- *     encoding-maps-section
- *     templates-section
- *
- * No trailer.  Each member is its own self-contained file in the
- * outer ustar archive that the segment manager assembles after
- * this call returns.  The two-magic bracket on the body member
- * makes truncation visible without reading the whole stream; the
- * header is small enough to round-trip in its entirety.
- *
- * Caller-owned @header_bytes receives the header buffer's bytes;
- * the BodyStreamState releases its reference to the underlying
- * GByteArray, so the caller is responsible for freeing it via
- * g_byte_array_unref.
+ * @header_bytes receives the header buffer (ownership transferred);
+ * caller frees it via g_byte_array_unref.
  */
 void body_stream_finish(BodyStreamState *st, GByteArray **header_bytes)
 {
@@ -2856,11 +2887,9 @@ void body_stream_finish(BodyStreamState *st, GByteArray **header_bytes)
     bw_write_u8(&st->bw, BODY_TAG_END);
     bw_write_uleb128(&st->bw, st->num_entries);
     bw_byte_align(&st->bw);
-    /* Trailing CST_MAGIC: a consumer who reaches end-of-stream
-     * without seeing this knows the body member was truncated.
-     * Cheaper than a checksum and sufficient for our use case
-     * (truncation is by far the most common corruption mode for
-     * pipe-compressed traces — uncaught SIGPIPE, OOM, etc.). */
+    /* Trailing CST_MAGIC: absence at end-of-stream means the body
+     * was truncated.  Cheaper than a checksum; truncation is the
+     * dominant corruption mode for pipe-compressed traces. */
     bw_write_u32_le(&st->bw, CST_MAGIC);
     bw_flush(&st->bw);
 
@@ -2870,9 +2899,7 @@ void body_stream_finish(BodyStreamState *st, GByteArray **header_bytes)
     g_mutex_unlock(&data_lock);
     bw_byte_align(&st->header_bw);
 
-    /* Hand the accumulated header buffer to the caller.  bw_finish_
-     * buf transfers ownership; we null out our pointer so subsequent
-     * operations on @st can't accidentally touch the buffer. */
+    /* Transfer header buffer ownership to the caller (pointer nulled). */
     *header_bytes = bw_finish_buf(&st->header_bw);
 
     uint64_t end_bytes = bw_tell_bytes(&st->bw);
@@ -2901,11 +2928,8 @@ void body_stream_finish(BodyStreamState *st, GByteArray **header_bytes)
 
 void body_stream_free(BodyStreamState *st)
 {
-    /* BodyStreamState is allocated with `new`; its std::vector
-     * members need their destructors called.  body_stream_finish
-     * already releases owned resources (FSTs, scratch arrays, the
-     * header buffer); calling free here just tears down the C++
-     * object itself. */
+    /* `new`-allocated; body_stream_finish already released owned
+     * resources, so this just runs the C++ destructors. */
     if (!st) {
         return;
     }

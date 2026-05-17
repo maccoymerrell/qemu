@@ -1,12 +1,10 @@
 /*
  * Wrong-Path Tracing Plugin — exit-time statistics.
  *
- * Plain aggregate of plugin-wide counters.  Producers update fields
- * directly via the calling thread's per-thread instance (g_stats_tls);
- * the exit handler in tracer.cc reads stats_snapshot() to obtain a
- * coherent process-wide aggregate by summing across every vCPU
- * thread that has registered.  No locks on the hot bump path; the
- * sum is computed once at exit-time under stats_registry_lock.
+ * Plain aggregate of plugin-wide counters.  Producers bump fields on
+ * the calling thread's per-thread instance (no locks on the hot
+ * path); stats_snapshot() sums every registered thread's slot once at
+ * exit under stats_registry_lock.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -20,14 +18,11 @@
 #include "champsim_tracer_generic_ids.h"  /* GEN_OP_COUNT, BRANCH_TYPE_COUNT, REG_ID_COUNT */
 
 struct Stats {
-    /* Cache populations.  Bumped on insert, read at exit-time print.
-     * Mirroring these as POD uint64_t works around an atexit/static-
-     * destructor ordering issue: g_bb_template_cache and
-     * g_branch_history get their containers destroyed before
-     * plugin_exit runs (because QEMU dispatches plugin atexit hooks
-     * via a host atexit handler registered earlier than the .so's
-     * own __cxa_atexit destructors), so calling .size() at exit-time
-     * returns 0.  These counters survive that ordering. */
+    /* Cache populations, bumped on insert.  Mirrored as POD counters
+     * because g_bb_template_cache / g_branch_history containers are
+     * destroyed before plugin_exit runs (QEMU's atexit hook fires
+     * before the .so's __cxa_atexit dtors), so .size() returns 0 at
+     * exit-time; these survive that ordering. */
     uint64_t tb_templates_created = 0;
     uint64_t bb_templates_created = 0;
     uint64_t unique_branch_pcs = 0;
@@ -59,11 +54,9 @@ struct Stats {
     /* Decode-side warning count. */
     uint64_t unknown_insn_warnings = 0;
 
-    /* Per-execution attribution.  cp_* are bumped at vcpu_tb_exec time
-     * when walking the previous TB's template; wp_* are bumped inside
-     * the WP simulator's per-iteration append loop.  Both are sized by
-     * the corresponding generic enum sentinels so the arrays grow in
-     * lockstep with the enum domain. */
+    /* Per-execution attribution.  cp_* bumped at vcpu_tb_exec walking
+     * the prev TB's template; wp_* inside the WP per-iteration loop.
+     * Sized by the generic enum sentinels to stay in lockstep. */
     uint64_t cp_insns_by_opcode[GEN_OP_COUNT] = {};
     uint64_t cp_branches_by_type[BRANCH_TYPE_COUNT] = {};
     uint64_t cp_src_reg_uses[REG_ID_COUNT] = {};
@@ -75,11 +68,9 @@ struct Stats {
     uint64_t wp_dst_reg_writes[REG_ID_COUNT] = {};
 };
 
-/* Field-wise subtraction (a - b) into @out.  Since Stats is a POD
- * aggregate with no padding holes that affect counters, we iterate
- * the address space as uint64_t and subtract.  Used at finish-segment
- * time to compute "this segment's contribution" given a snapshot
- * taken at segment start. */
+/* Field-wise subtraction (a - b) into @out, iterating Stats as a
+ * uint64_t array.  Used at finish-segment to compute the segment's
+ * contribution given a snapshot taken at its start. */
 static inline void stats_diff(Stats *out, const Stats &a, const Stats &b)
 {
     static_assert(sizeof(Stats) % sizeof(uint64_t) == 0,
@@ -96,12 +87,10 @@ static inline void stats_diff(Stats *out, const Stats &a, const Stats &b)
 
 /*
  * Per-thread accumulator accessor.  Returns the calling thread's
- * Stats slot, lazily registering it on first call.  All hot-path
- * bumps go through here via the g_stats macro: no atomics, no locks
- * on the bump path; only thread-local memory is touched.  The
- * registry is acquired under a mutex exactly once per thread (at
- * first touch) and again at thread exit (to fold the contributions
- * into a graveyard) — both off the hot path.
+ * Stats slot, lazily registering it on first call.  Hot-path bumps
+ * touch only thread-local memory; the registry mutex is taken once
+ * per thread at first touch and again at thread exit (folding into a
+ * graveyard) — both off the hot path.
  */
 Stats &thread_stats_get();
 
@@ -117,14 +106,12 @@ Stats &thread_stats_get();
  * Call from per-segment summary and at plugin_exit. */
 Stats stats_snapshot();
 
-/* Histogram bucket pointer for the currently-executing TB.  Refreshed
- * at the top of vcpu_tb_exec from the current icount; null when
- * histograms are disabled or no segment is active.  CP and WP
- * attribution sites mirror their g_stats_tls bumps into
- * *g_current_hist_bucket when non-null.  See start_trace_segment /
- * select_histogram_bucket in champsim_tracer.cc.  Histogram bucket
- * memory is owned by the segment, not per-thread; under exec_lock
- * (which serializes the only writers), so no separate aggregation. */
+/* Histogram bucket for the currently-executing TB.  Refreshed atop
+ * vcpu_tb_exec from icount; null when histograms are off or no
+ * segment active.  CP/WP attribution sites mirror their bumps here
+ * when non-null.  Memory is segment-owned (not per-thread) and
+ * written only under exec_lock, so no separate aggregation.  See
+ * select_histogram_bucket in champsim_tracer.cc. */
 extern Stats *g_current_hist_bucket;
 
 #endif /* CHAMPSIM_TRACER_STATS_H */

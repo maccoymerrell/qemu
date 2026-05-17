@@ -2,19 +2,17 @@
 #define CHAMPSIM_TRACER_ELF_ATTRS_H
 
 /*
- * Generic ELF inspection helpers used by the per-ISA cap_mode_*()
- * resolvers.  Two pieces of information are surfaced:
+ * Generic ELF inspection helpers for the per-ISA cap_mode_*()
+ * resolvers.  Surfaces:
  *
- *   1. The ELF header summary (e_machine, e_flags, EI_CLASS).  Used by
- *      ISAs whose decoder mode is fully determined by ELF flags (MIPS).
+ *   1. ELF header summary (e_machine, e_flags, EI_CLASS) — for ISAs
+ *      whose decoder mode is determined by ELF flags (MIPS).
  *
- *   2. A walker over a build-attributes section (SHT_RISCV_ATTRIBUTES /
- *      SHT_ARM_ATTRIBUTES, both numerically SHT_LOPROC + 3).  Used by
- *      ISAs whose decoder mode is determined by Tag_<vendor>_<name>
- *      attribute strings (RISC-V).
+ *   2. A build-attributes section walker (SHT_RISCV_ATTRIBUTES /
+ *      SHT_ARM_ATTRIBUTES, both = SHT_LOPROC + 3) — for ISAs decided
+ *      by Tag_<vendor>_<name> strings (RISC-V).
  *
- * All ELF and build-attribute constants come from <elf.h> (QEMU's
- * canonical copy in include/elf.h).  Nothing is hard-coded here.
+ * All constants come from <elf.h>; nothing is hard-coded here.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -182,16 +180,13 @@ static inline bool cs_uleb128(const uint8_t **p, const uint8_t *end,
 
 /*
  * Walk a build-attribute section (RISC-V psABI / ARM EABI format).
- * For every Tag_File-scope tag/value pair belonging to a subsection
- * whose vendor name matches `want_vendor`, invoke `cb(tag, value_ptr,
- * is_string, user)`.  When `is_string` is true `value_ptr` is a
- * NUL-terminated string; otherwise it points at a uint64_t holding the
- * decoded ULEB128 value.
+ * For each Tag_File-scope tag/value pair in a subsection whose vendor
+ * matches `want_vendor`, call cb(tag, value_ptr, is_string, user):
+ * is_string -> value_ptr is a NUL-terminated string, else a uint64_t*.
  *
- * The convention used (by both the RISC-V psABI and the ARM EABI) is
- * that even-numbered tags carry ULEB128 values and odd-numbered tags
- * carry NUL-terminated strings.  Tag 32 (Tag_compatibility) is a
- * documented exception (tag+string pair) that we treat as a string.
+ * Convention (both psABI and EABI): even tags carry ULEB128 values,
+ * odd tags carry strings.  Tag 32 (Tag_compatibility) is a documented
+ * exception treated as a string.
  */
 typedef void (*CsAttrTagCb)(uint64_t tag, const void *value, bool is_string,
                             void *user);

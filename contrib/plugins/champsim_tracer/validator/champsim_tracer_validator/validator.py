@@ -463,6 +463,123 @@ def _check_block_assertions(templates: list[dict],
     return issues
 
 
+def _check_profile_consistency(templates: list[dict],
+                               entries: list[dict],
+                               body_stats: dict) -> list[Issue]:
+    """Cross-validate the run-aggregated template profile block
+    (format §6) against the decoded body — overlapping coverage that
+    asserts the profiling machinery itself, independent of the
+    behavioural metadata checks.
+
+    Invariants asserted:
+      * exec_cp / exec_wp coverage agrees with which template_ids
+        actually appear as CP entries / WP chain BBs;
+      * sum(exec_wp) == total WP BBs in the body; sum(exec_cp) ==
+        total CP entries when no IFRAMEs are present (IFRAMEs are
+        re-emissions the writer does not profile-accumulate);
+      * for a non-indirect branch BB (exactly one header target),
+        target[0].taken_cp + target[0].nottaken_cp == exec_cp — its
+        terminal branch is resolved exactly once per CP execution;
+      * a per-insn memop count implies the matching path executed.
+    """
+    issues: list[Issue] = []
+
+    cp_count: dict[int, int] = {}
+    wp_count: dict[int, int] = {}
+    total_wp = 0
+    for e in entries:
+        cp_count[e["template_id"]] = cp_count.get(e["template_id"], 0) + 1
+        for wp in e.get("wp_entries", []):
+            tid = wp["template_id"]
+            wp_count[tid] = wp_count.get(tid, 0) + 1
+            total_wp += 1
+
+    sum_cp = 0
+    sum_wp = 0
+    for t in templates:
+        p = t.get("profile") or {}
+        tid = t["template_id"]
+        exec_cp = int(p.get("exec_cp", 0))
+        exec_wp = int(p.get("exec_wp", 0))
+        sum_cp += exec_cp
+        sum_wp += exec_wp
+
+        if exec_cp > 0 and tid not in cp_count:
+            issues.append(Issue(
+                "profile_consistency", "error",
+                f"tmpl {tid}: profile exec_cp={exec_cp} but template "
+                f"never appears as a CP entry", {"template_id": tid}))
+        if tid in cp_count and exec_cp == 0:
+            issues.append(Issue(
+                "profile_consistency", "error",
+                f"tmpl {tid}: appears as {cp_count[tid]} CP entries but "
+                f"profile exec_cp=0", {"template_id": tid}))
+        if exec_wp > 0 and tid not in wp_count:
+            issues.append(Issue(
+                "profile_consistency", "error",
+                f"tmpl {tid}: profile exec_wp={exec_wp} but template "
+                f"never appears in a WP chain", {"template_id": tid}))
+
+        # Terminal-branch invariant: a non-indirect branch BB has
+        # exactly one header target whose taken+nottaken CP counts
+        # account for every CP execution of the BB.
+        insns = t.get("insns") or []
+        tgts = p.get("targets") or []
+        # The terminal-branch outcome is counted when the *successor*
+        # entry is observed, so the BB that ends the trace/segment
+        # has exactly its last outcome unrecorded: got == exec_cp, or
+        # exec_cp - 1 for the single trailing execution.  Any larger
+        # deficit (or got > exec_cp) means mis-attribution / WP
+        # contamination — the bug class this asserts.
+        if exec_cp > 0 and len(tgts) == 1 and insns and \
+                insns[-1].get("branch_type", 0) != 0:
+            t0 = tgts[0]
+            got = int(t0["taken_cp"]) + int(t0["nottaken_cp"])
+            if not (exec_cp - 1 <= got <= exec_cp):
+                issues.append(Issue(
+                    "profile_consistency", "error",
+                    f"tmpl {tid}: terminal-branch CP taken+nottaken="
+                    f"{got}, expected exec_cp={exec_cp} or "
+                    f"exec_cp-1 (one trailing entry)",
+                    {"template_id": tid, "got": got,
+                     "exec_cp": exec_cp}))
+
+        for idx, fields in (p.get("insns") or {}).items():
+            mcp = int(fields.get("memops_cp", 0))
+            mwp = int(fields.get("memops_wp", 0))
+            if mcp > 0 and exec_cp == 0:
+                issues.append(Issue(
+                    "profile_consistency", "error",
+                    f"tmpl {tid} insn[{idx}]: memops_cp={mcp} but "
+                    f"exec_cp=0", {"template_id": tid}))
+            if mwp > 0 and exec_wp == 0:
+                issues.append(Issue(
+                    "profile_consistency", "error",
+                    f"tmpl {tid} insn[{idx}]: memops_wp={mwp} but "
+                    f"exec_wp=0", {"template_id": tid}))
+
+    if sum_wp != total_wp:
+        issues.append(Issue(
+            "profile_consistency", "error",
+            f"sum(exec_wp)={sum_wp} != total WP BBs in body={total_wp}",
+            {"sum_exec_wp": sum_wp, "body_wp": total_wp}))
+
+    iframes = int(body_stats.get("iframe_count", 0) or 0)
+    if iframes == 0 and sum_cp != len(entries):
+        issues.append(Issue(
+            "profile_consistency", "error",
+            f"sum(exec_cp)={sum_cp} != CP entries={len(entries)} "
+            f"(no IFRAMEs present)",
+            {"sum_exec_cp": sum_cp, "cp_entries": len(entries)}))
+
+    if not issues:
+        issues.append(Issue(
+            "profile_consistency", "info",
+            f"profile block consistent: {len(templates)} templates, "
+            f"sum exec_cp={sum_cp} exec_wp={sum_wp}, WP BBs={total_wp}"))
+    return issues
+
+
 # ---------------------------------------------------------------------------
 # Legacy checks
 # ---------------------------------------------------------------------------
@@ -4098,6 +4215,8 @@ def validate(meta_path: Path, trace_path: Path,
                                        cp_set)
     issues += _check_block_assertions(templates, blocks_by_id, pcmap,
                                       cp_set)
+    issues += _check_profile_consistency(
+        templates, entries, trace_meta.get("body_stats") or {})
 
     arena_info = _find_arena_address(binary_path)
     if arena_info is None:

@@ -1,16 +1,14 @@
 /*
  * Wrong-Path Tracing Plugin — per-vCPU scoreboard wrapper.
  *
- * QEMU's plugin scoreboard mechanism gives the plugin a typed slab of
- * per-vCPU storage with O(1) handle-based access from both regular C
- * callbacks (qemu_plugin_u64_get/set) and inline TCG ops
- * (qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu).
+ * QEMU's plugin scoreboard gives typed per-vCPU storage with O(1)
+ * handle access from both C callbacks (qemu_plugin_u64_get/set) and
+ * inline TCG ops (qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu).
  *
- * The handle fields here MUST remain plain qemu_plugin_u64 values: the
- * inline-TCG registration calls take the handle by value, not through
- * a method.  The wrapper class exists only to RAII-own the scoreboard
- * allocation and to give the handles a single typed home instead of
- * six top-level externs.
+ * The handle fields MUST stay plain qemu_plugin_u64: the inline-TCG
+ * registration takes the handle by value, not through a method.  The
+ * wrapper only RAII-owns the scoreboard allocation and gives the
+ * handles one typed home instead of six externs.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */

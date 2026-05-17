@@ -137,10 +137,9 @@ struct qemu_plugin_register *RegHandleCache::lookup(unsigned int cpu_index,
         return nullptr;
     }
 
-    /* Direct-mapped TLS cache by key-pointer identity.  The same
-     * QemuRegKey instance is re-presented every time a given template
-     * runs, so hot-loop iterations hit on first access after cache
-     * warm-up.  Invalidated on cpu_index change. */
+    /* Direct-mapped TLS cache by key-pointer identity: the same
+     * QemuRegKey instance recurs per template run, so hot loops hit
+     * after warm-up.  Invalidated on cpu_index change. */
     if (tls_ptr_cache_cpu_index_ != cpu_index) {
         memset(tls_ptr_cache_, 0, sizeof(tls_ptr_cache_));
         tls_ptr_cache_cpu_index_ = cpu_index;

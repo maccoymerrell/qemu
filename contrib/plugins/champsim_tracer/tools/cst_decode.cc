@@ -30,19 +30,10 @@ namespace {
  * §1  FieldStateTable storage helpers
  * ==================================================================== */
 
-/* Build the fid -> dense slot index map for FieldStateBlock storage.
- * Mirrors the writer's field_state_slot_lut_build:
- *
- *   slot 0:   N_LOADS         (singleton at fid 0..3)
- *   slot 1:   N_STORES
- *   slot 2:   METAFLAGS
- *   slot (3 + 5*k + f):   family f of slot k
- *                          (LOAD_ADDR / STORE_ADDR / LOAD_DATA /
- *                           STORE_DATA / DST_REG)
- *   slot (3 + 5*N + i):   INSN_BYTES_LO + i      (N = FID_SLOT_COUNT)
- *
- * Total = 3 + 5*N + 7 = FIELD_STATE_SLOT_COUNT.  EXTENDED has no
- * persistent cell. */
+/* Build the fid -> dense slot index map for FieldStateBlock storage,
+ * mirroring the writer's field_state_slot_lut_build (slots 0..2 =
+ * N_LOADS/N_STORES/METAFLAGS, then slotted families, then cold
+ * insn-metadata singletons; EXTENDED has no persistent cell). */
 void slot_lut_build(const ResolvedIds &ids,
                     std::array<uint16_t, FID_LUT_SIZE> *out)
 {
@@ -316,10 +307,9 @@ void validate_iframe(const DecodedEntry &prev, const DecodedEntry &iframe)
  * §3  Template-default field values
  * ==================================================================== */
 
-/* Compose a template-default Wide for the FID_INSN_* range, where the
- * baseline is the template's static value (so an emit-equal-to-
- * template produces no record on the wire).  Other FID ranges default
- * to zero — those are handled by the caller's Wide{} fallback. */
+/* Template-default Wide for the FID_INSN_* range: the baseline is the
+ * template's static value (so emit-equal-to-template writes no
+ * record).  Other ranges default to zero via the caller's Wide{}. */
 Wide insn_field_default(const InsnTemplate &I, uint8_t fid,
                         const ResolvedIds &ids)
 {
@@ -378,8 +368,7 @@ BodyWalker::BodyWalker(const Header &header,
       flags_(header.flags),
       reg_flags_id_(-1)
 {
-    /* Resolve REG_FLAGS' numeric id from the trace's own reg map.
-     * The trace is self-describing; no compile-time table lives here. */
+    /* Resolve REG_FLAGS' id from the trace's own reg map. */
     for (const auto &kv : header.maps.reg) {
         if (kv.second == "REG_FLAGS") {
             reg_flags_id_ = (int)kv.first;
@@ -392,22 +381,18 @@ BodyWalker::BodyWalker(const Header &header,
 /* ====================================================================
  * §5  walk() + per-tag handlers
  *
- * walk() is a small dispatch loop: read the leading tag byte and
- * dispatch to handle_thread_switch / handle_regfile / handle_entry /
- * handle_iframe / handle_end based on the trace's body_tag encoding
- * map.  Each handler consumes that tag's payload from body_, updates
- * stats_, and (for ENTRY / REGFILE) invokes the consumer callback.
+ * walk() dispatches on the body_tag-mapped leading byte; each handler
+ * consumes its payload, updates stats_, and (ENTRY/REGFILE) invokes
+ * the callback.
  * ==================================================================== */
 
 /* Transient state carried across one walk() invocation.  Lives on the
  * stack inside walk(); each handler takes it by reference. */
 struct BodyWalker::WalkState {
     int32_t  prev_entry_template   = 0;
-    /* Base 0, same as every other delta in the format.  The body's
-     * first record is always a BODY_TAG_THREAD_SWITCH, so the
-     * starting thread arrives as an ordinary delta from 0 (no
-     * special-case base) — a consumer applying the universal delta
-     * rule gets the right thread without knowing anything extra. */
+    /* Base 0: the body's first record is always a THREAD_SWITCH, so
+     * the starting thread arrives as an ordinary delta from 0 (no
+     * special-case base). */
     uint32_t current_thread        = 0;
     bool     pending_thread_switch = false;
 
@@ -507,10 +492,8 @@ void BodyWalker::decode_wp_events(Reader &evb,
     }
 }
 
-/* Tally each (template, insn) is_atomic into stats_.  Counts every
- * (entry × insn) once, so a hot block contributes its atomic-bit
- * vector multiple times — matches the "how many insn observations
- * were atomic" intent rather than the dedupe count. */
+/* Tally is_atomic per (entry × insn) — counts observations, not
+ * deduped templates. */
 namespace {
 void tally_atomic_count(const Template *tmpl, uint64_t &out)
 {
@@ -577,12 +560,10 @@ void BodyWalker::handle_entry(WalkState &ws, const Callback &cb)
 
 void BodyWalker::handle_iframe(WalkState &ws)
 {
-    /* Validation record: decode the IFRAME against fresh empty
-     * overlays (so every value is delta-from-template-default =
-     * absolute) and assert it matches the immediately-preceding
-     * ENTRY's dyn_params, reg_snaps, WP chain, and WP events.  If
-     * the decoder's delta-replay disagrees, throw — the trace is
-     * corrupt or the encoder/decoder are out of sync. */
+    /* Decode the IFRAME against fresh empty overlays (every value =
+     * delta-from-template-default = absolute) and assert it matches
+     * the preceding ENTRY; divergence => corrupt trace or out-of-sync
+     * encoder/decoder, so throw. */
     if (!ws.prev_entry) {
         throw std::runtime_error("IFRAME with no preceding ENTRY");
     }
@@ -666,23 +647,16 @@ void BodyWalker::walk(const Callback &cb, const RegfileCallback &rb)
 /* ====================================================================
  * §6  decode_field_delta — pass1 apply + pass2 materialise
  *
- * Pass 1: walk the wire records, apply each delta to the matching
- *         (state_blk, ipos, slot) cell.  Records on EXTRA_* fids
- *         carry per-entry variable-length vectors (memops overflow
- *         past the 16 slotted families) — those are collected into
- *         the @extras map indexed by (ipos, fid).
- *
- * Pass 2: walk every insn in @tmpl, reading the per-(template, ipos,
- *         fid) cells back out and materialising DynParam / RegSnap /
- *         MetaFlagsEntry rows into the entry's output vectors.
+ * Pass 1 applies each wire record's delta to its (state_blk, ipos,
+ * slot) cell.  Pass 2 walks @tmpl's insns, reads the cells back, and
+ * materialises DynParam / RegSnap / MetaFlagsEntry / LaneMask rows.
  * ==================================================================== */
 
 namespace {
 
-/* Pass-1 record loop.  Reads @n_records records from @sec, applying
- * each non-EXTENDED delta to the (state_blk, ipos, slot) cell.
- * Format version 0x1D: fid is ULEB128 (previously u8); the
- * EXTRA_LOAD/EXTRA_STORE raw-vector overflow path is retired. */
+/* Pass-1 record loop: apply each non-EXTENDED delta to its
+ * (state_blk, ipos, slot) cell.  Format 0x1D: fid is ULEB128, no
+ * EXTRA_* overflow path. */
 void apply_record_deltas(BodyWalker &walker, Reader &sec, uint64_t n_records,
                          uint32_t template_id, const Template *tmpl,
                          const ResolvedIds &ids,
@@ -715,11 +689,9 @@ void apply_record_deltas(BodyWalker &walker, Reader &sec, uint64_t n_records,
     }
 }
 
-/* Materialise the slotted loads or stores for one insn into @out.
- * @type picks Load vs Store; @addr_fids / @data_fids are the
- * per-slot FID arrays for this family, name-resolved out of the
- * encoding map (no stride assumption — the writer chooses the
- * slot-to-FID mapping freely). */
+/* Materialise the slotted loads/stores for one insn into @out.
+ * @addr_fids / @data_fids are name-resolved per-slot FID arrays (no
+ * stride assumption). */
 void materialise_slotted_memops(uint32_t insn_idx, uint64_t n_fixed,
                                 DynParam::Type type,
                                 const std::array<uint16_t, FID_SLOT_COUNT> &addr_fids,
@@ -732,10 +704,8 @@ void materialise_slotted_memops(uint32_t insn_idx, uint64_t n_fixed,
                                 const std::array<uint16_t, FID_LUT_SIZE> &slot_lut,
                                 std::vector<DynParam> *out)
 {
-    /* Clamp at FID_SLOT_COUNT.  Writers compliant with the 0x1D
-     * format reject overflow at emit time and log to
-     * unknown_warnings.log; a defensive clamp here protects against
-     * a malformed trace whose N_LOADS / N_STORES exceed the cap. */
+    /* Defensive clamp: a malformed trace whose N_LOADS/N_STORES
+     * exceed FID_SLOT_COUNT must not index past the slot arrays. */
     if (n_fixed > FID_SLOT_COUNT) n_fixed = FID_SLOT_COUNT;
     for (uint64_t s = 0; s < n_fixed; s++) {
         uint16_t addr_fid = addr_fids[s];
@@ -814,9 +784,8 @@ void BodyWalker::decode_field_delta(Reader &outer,
     uint64_t n_records = sec.uleb();
     const ResolvedIds &ids = header_.ids;
 
-    /* Resolve the per-(state,base) blocks once for this entry.  The
-     * record loop indexes into them directly instead of hash-looking
-     * up per record. */
+    /* Resolve the per-(state,base) blocks once; the record loop
+     * indexes directly rather than hashing per record. */
     uint32_t need_insns = tmpl ? (uint32_t)tmpl->insns.size() : 0;
     FieldStateBlock *state_blk =
         table_get_or_create_block(state, template_id,
@@ -826,9 +795,7 @@ void BodyWalker::decode_field_delta(Reader &outer,
     uint32_t state_gen = state.generation;
     uint32_t base_gen  = base_state ? base_state->generation : 0;
 
-    /* Pass 1: apply record deltas.  Format version 0x1D — no
-     * EXTRA_* overflow vectors; all memops address through slotted
-     * fids directly. */
+    /* Pass 1: apply record deltas. */
     apply_record_deltas(*this, sec, n_records,
                         template_id, tmpl, ids, slot_lut_,
                         state_blk, state_gen, base_blk, base_gen,
@@ -926,15 +893,10 @@ void BodyWalker::decode_field_delta(Reader &outer,
 
 namespace {
 
-/* Resolve a direct-branch target into the templates vector by
- * matching the branch's static target PC against template start_pc.
- * Returns nullptr for indirect / return / REP branches and for
- * direct branches whose target is outside the trace window.
- *
- * Matches on the trace's own branch_type encoding-map names rather
- * than compile-time enum values; the tools are intentionally
- * decoupled from the plugin's generic_ids enum so a future tracer
- * that re-numbers BRANCH_* stays decodable. */
+/* Resolve a direct-branch target by matching its static target PC
+ * against template start_pc.  nullptr for indirect/return/REP or
+ * out-of-window targets.  Keyed on branch_type map names (not
+ * compile-time enums) so a renumbered BRANCH_* stays decodable. */
 const Template *resolve_branch_target(
     const Header &h, const InsnTemplate &I,
     const std::vector<Template> &templates)

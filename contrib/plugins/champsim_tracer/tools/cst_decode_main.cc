@@ -107,10 +107,8 @@ const char *isa_display(const cst::Header &h)
 
 inline const char *kHexDigits = "0123456789abcdef";
 
-/* Lowercase hex, no leading zeros.  Builds digits in a stack buffer
- * end-first and appends in one shot — single push_back per char was
- * hot enough on a 200s decode (11.7% of total) to justify the small
- * overhead of computing a length first. */
+/* Lowercase hex, no leading zeros.  Builds end-first in a stack
+ * buffer and appends in one shot (hot path). */
 void append_hex(std::string *out, uint64_t v)
 {
     if (v == 0) { out->push_back('0'); return; }
@@ -142,10 +140,8 @@ void append_pad_to(std::string *out, size_t target)
     while (out->size() < target) out->push_back(' ');
 }
 
-/* Append a lane-mask as "{0..3,6}" — set bits coalesced into ascending
- * ranges, comma-separated.  Renders nothing (no braces) when @mask is
- * zero so callers can unconditionally invoke for every operand without
- * having to gate beforehand. */
+/* Append a lane-mask as "{0..3,6}" (set bits coalesced into ranges).
+ * Renders nothing when @mask is zero so callers needn't gate. */
 void append_lane_set(std::string *out, uint64_t mask)
 {
     if (!mask) return;
@@ -366,8 +362,7 @@ const char *branch_mnem_from_name(const std::string *name)
 }
 
 /* ====================================================================
- * §6  Per-trace lookup tables  (vector-indexed; built once at decode
- *     start to replace ~3.5% of total decode time spent in
+ * §6  Per-trace lookup tables  (vector-indexed; built once to avoid
  *     unordered_map::find on the disasm hot path)
  * ==================================================================== */
 
@@ -403,14 +398,7 @@ inline const std::string *table_lookup(const std::vector<std::string> &t,
 }
 
 /* ====================================================================
- * §7  Capstone wrapper
- *
- * The ObjdumpRenderer class itself lives in cst_objdump.{h,cc} — see
- * those files for the implementation.  We pulled it out so that a
- * downstream consumer who lifts cst_decode for their own simulator
- * can drop cst_objdump.cc onto the build without -DCST_HAVE_CAPSTONE
- * and skip the capstone link dependency entirely; --objdump just
- * becomes a no-op at run time.
+ * §7  Capstone wrapper — ObjdumpRenderer lives in cst_objdump.{h,cc}.
  * ==================================================================== */
 
 /* ====================================================================
@@ -560,25 +548,16 @@ const cst::RegSnap *find_dst_regdata(const cst::Instruction &insn, uint8_t k)
     return nullptr;
 }
 
-/*
- * Pre-render the input pool (src_regs + load_data + imm) into strings
- * keyed by their mask-bit position.  Loads render with their address
- * inputs inline ("ld[%base,%index](0x...)") when HAS_ADDR data is
- * available; otherwise fall back to "ld<k>(0x...)" or just "ld<k>".
- *
- * Bit layout matches the HAS_REG mask spec:
- *   bits [0, n_src)                          src_reg[i]
- *   bits [n_src, n_src + max_dep_loads)      load_data[k]
- *   bit  n_src + max_dep_loads               immediate
- */
-/* Lookup helpers: zero-default when the per-slot vector is shorter
- * than the requested index, so callers can probe every slot without
- * length guards. */
+/* Zero-default lookup so callers can probe every slot without length
+ * guards. */
 inline uint64_t lane_at(const std::vector<uint64_t> &v, size_t i)
 {
     return i < v.size() ? v[i] : 0;
 }
 
+/* Pre-render the input pool (src_regs + load_data + imm) into strings
+ * keyed by HAS_REG mask-bit position (layout in cst_common.h).  Loads
+ * render with address inputs inline when HAS_ADDR is available. */
 void render_input_pool(std::vector<std::string> &out,
                        const DisasmContext &ctx,
                        const cst::Instruction &insn,
@@ -652,16 +631,11 @@ void render_input_pool(std::vector<std::string> &out,
 }
 
 /*
- * Render the names of inputs flagged by @mask, comma-separated, with
- * lane-granularity refinement.  The coarse
- * dep mask says "this sink depends on input i"; the per-operand lane
- * masks say *which lanes* each side touches.  A lane-structured
- * input (its own lane mask non-zero) actually feeds the sink only on
- * the lanes they share — so when the intersection with @sink_lanes is
- * empty, the input does not feed this sink at all and is dropped
- * (e.g. PINSRD $3's pass-through src %v0{0..2} does NOT feed the
- * written lane %v0{3}).  Inputs with no lane mask (immediate, scalar
- * address regs) are not lane-structured and pass through unchanged.
+ * Render @mask's flagged input names, comma-separated, with lane
+ * refinement: a lane-structured input (own lane mask non-zero) feeds
+ * the sink only where its lanes intersect @sink_lanes — if empty it's
+ * dropped (PINSRD $3's pass-through %v0{0..2} does not feed written
+ * lane %v0{3}).  Inputs with no lane mask pass through unchanged.
  * @in_lane(i) returns input i's lane mask. */
 template <typename LaneFn>
 void render_input_set_laned(std::string &line, uint64_t mask,
@@ -731,22 +705,12 @@ std::string render_store_sink(const DisasmContext &ctx,
 }
 
 /*
- * "<inputs> -> <dst[regdata]>" arrow, possibly multiple arrows
- * separated by " ; " when dsts/store-data sinks have distinct dep
- * masks.  Returns true when the line ends with at least one operand.
- *
- * Always takes the dep-aware path: when HAS_REG is absent on the
- * wire, the renderer synthesizes a default "all inputs" mask for
- * every dst and store-data slot (matching the consumer's implicit
- * all-to-all fallback).  This gives symmetric output across
- * classified and unclassified rows — dst arrows track HAS_REG
- * precision when available and fall back to over-approximation
- * otherwise, while load/store memops always render with their
- * walker-derived address inputs inline.
- *
- * For purely register-flat instructions (no memops, no immediate)
- * the default-mask path collapses to "<srcs> -> <dsts>" — identical
- * to the legacy flat layout.
+ * "<inputs> -> <dst[regdata]>" arrows, multiple separated by " ; "
+ * when sinks have distinct dep masks.  Returns true when the line
+ * ends with >=1 operand.  Always dep-aware: when HAS_REG is absent,
+ * synthesizes a default "all inputs" mask per sink (matching the
+ * consumer's all-to-all fallback).  Register-flat insns collapse to
+ * "<srcs> -> <dsts>" (legacy flat layout).
  */
 bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
                           const cst::Instruction &insn)
@@ -763,21 +727,12 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
     render_input_pool(inputs, ctx, insn, load_addrs, have_load_addrs);
 
     /*
-     * Default mask used when HAS_REG is absent on the wire.  Filters
-     * out src_reg slots that the walker recorded as exclusively
-     * addressing-mode (they appear in some load/store_addr mask but
-     * the instruction has no other use for them): those srcs flow
-     * into the dst transitively through the load/store address
-     * placeholder, not directly.  Each load_data slot stays in the
-     * default, since loads produce values consumed downstream by
-     * default.
-     *
-     * Caveat — Capstone marks LEA's mem operand as CS_AC_READ even
-     * though no real load fires, so the walker counts a "load" that
-     * never happens.  The default mask for LEA then incorrectly
-     * shows the dst depending on that phantom load.  A dedicated
-     * LEA refiner overrides this with the precise "dst depends on
-     * addressing-mode srcs + imm, no load" mask.
+     * Default mask when HAS_REG is absent: drop src_reg slots the
+     * walker recorded as exclusively addressing-mode (they reach the
+     * dst transitively via the memop placeholder, not directly);
+     * load_data slots stay.  Caveat: Capstone marks LEA's mem operand
+     * READ so the walker counts a phantom load; a dedicated LEA
+     * refiner overrides with the precise no-load mask.
      */
     unsigned n_src = (unsigned)insn.src_regs.size();
     uint64_t addr_only_srcs = 0;
@@ -796,17 +751,11 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
     }
     uint64_t default_mask = all_inputs & ~addr_only_srcs;
 
-    /* Apply the addressing-mode-src cleanup ONLY to a fully-saturated
-     * mask.  A mask with every input bit set is the over-
-     * approximation produced by dep_all_to_all (or the synthesized
-     * default when HAS_REG is absent): there an addressing reg is a
-     * false direct data dep and must be stripped (it reaches the
-     * sink transitively via the memop, shown as laddr/saddr).  A
-     * strict subset is the deliberate output of a precise refiner --
-     * e.g. dep_x86_stack_push sets the SP-dst's mask to exactly the
-     * SP src because sp_new = sp_old - 8, even though SP is also the
-     * store-address base.  Filtering that explicit bit produced the
-     * orphaned "-> %sp[...]" arrows.  Render precise masks verbatim. */
+    /* Addressing-src cleanup applies ONLY to a fully-saturated mask
+     * (dep_all_to_all / synthesized default): there an addressing reg
+     * is a false direct dep (it reaches the sink via the memop).  A
+     * strict subset is a precise refiner's deliberate output (e.g.
+     * dep_x86_stack_push's SP-dst = SP-src) and renders verbatim. */
     auto effective = [&](uint64_t m) -> uint64_t {
         return (m == all_inputs) ? (m & ~addr_only_srcs) : m;
     };
@@ -827,12 +776,8 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
         any_group = true;
     };
 
-    /* Per-input lane participation: bit at input-pool index `i` is set
-     * iff lane k of that input is `mask_for_input(i, lane_k)`.  Returns
-     * the per-input lane mask used when --show-lanes is set, indexed
-     * the same way as @inputs (src_regs first, then load_data slots,
-     * then imm).  Imm carries no lanes; addr-only loads carry the
-     * load_data lane mask. */
+    /* Per-input lane mask, indexed like @inputs (src_regs, then
+     * load_data slots, then imm).  Imm carries no lanes. */
     auto input_lane_mask = [&](size_t i) -> uint64_t {
         if (i < n_src)                   return lane_at(insn.src_lane_mask, i);
         size_t k = i - n_src;
@@ -857,13 +802,11 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
         }
     };
 
-    /* Per-source lane split: when --show-lanes is set, a dst has a
-     * non-empty lane mask, and the dst's contributing inputs each
-     * carry a non-empty, pairwise-disjoint lane mask that exactly
-     * partitions the dst lane mask, emit one arrow per source.  This
-     * is the "ld[0] -> v0{0..1}  ;  ld[1] -> v0{2..3}" shape for vec
-     * loads that fan into a single register.  Returns true when the
-     * split was applied (caller skips the merged path). */
+    /* Per-source lane split: with --show-lanes, when a dst's
+     * contributing inputs carry pairwise-disjoint lane masks that
+     * exactly partition the dst's, emit one arrow per source
+     * ("ld[0] -> v0{0..1}  ;  ld[1] -> v0{2..3}").  Returns true when
+     * applied. */
     auto try_split_dst = [&](size_t k) -> bool {
         if (!ctx.show_lanes) return false;
         uint64_t dst_lanes = lane_at(insn.dst_lane_mask, k);
@@ -893,11 +836,10 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
         return true;
     };
 
-    /* Dst groups: walk in order, merging consecutive dsts with
-     * identical masks into one arrow.  Preserving source order keeps
-     * the rendering close to the instruction's natural reading.  With
-     * --show-lanes, a dst whose sources partition its lane set is
-     * split out into per-source arrows instead. */
+    /* Dst groups: merge consecutive dsts with identical masks into
+     * one arrow (preserving source order).  --show-lanes may split a
+     * dst whose sources partition its lane set into per-source
+     * arrows. */
     size_t d = 0;
     while (d < insn.dst_regs.size()) {
         if (try_split_dst(d)) {
@@ -911,11 +853,8 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
             end++;
         }
         open_group();
-        /* Strip addressing-mode srcs only from a fully-saturated
-         * (all-to-all / default) mask; a precise refiner's explicit
-         * subset is rendered verbatim (see `effective`).  When
-         * --show-lanes broke the merge, also filter inputs to those
-         * that feed this dst's lanes. */
+        /* effective(): saturated-only addressing-src cleanup.
+         * --show-lanes also filters inputs to this dst's lanes. */
         render_input_set_laned(line, effective(mask), inputs,
                                ctx.show_lanes,
                                lane_at(insn.dst_lane_mask, d),
@@ -939,11 +878,7 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
             end++;
         }
         open_group();
-        /* Same saturated-only exclusion as the dst path: an
-         * over-approximating store-data mask drops addressing regs
-         * (they feed the store address, shown as saddr); a precise
-         * refiner mask (e.g. dep_x86_stack_push's per-src store data)
-         * renders verbatim. */
+        /* Same saturated-only addressing-src exclusion as dsts. */
         render_input_set_laned(line, effective(mask), inputs,
                                ctx.show_lanes,
                                lane_at(insn.store_data_lane_mask, s),
@@ -957,10 +892,8 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
         s = end;
     }
 
-    /* No dsts and no stores: render a "pure-input" line (e.g. a CMP
-     * that only writes to implicit flags we don't track, or a NOP
-     * with operands).  Fall through to the legacy flat form so we
-     * still surface the operands. */
+    /* No dsts/stores: render a pure-input line (e.g. CMP into
+     * untracked implicit flags) in legacy flat form. */
     if (!any_group) {
         bool any = false;
         auto sep = [&]() {
@@ -989,18 +922,11 @@ void emit_disasm_metaflags(std::string &line, const DisasmContext &ctx,
 }
 
 /*
- * Memops the dep-aware operand renderer covered inline are skipped
- * here (their ld[...]/st[...] placeholders already carry the address
- * plus its address-input set).  Anything left — typically implicit
- * stack memops on CALL/PUSH/POP/RET that Capstone doesn't enumerate
- * as an explicit MEM operand, so the walker never bumped
- * max_dep_loads/stores for them — falls through to a trailing
- * "  ld(0x<addr>)" / "  st(0x<addr>)" column so the runtime address
- * stays visible.
- *
- * When the trace carries MEM_DATA, every dp (covered or not) gets a
- * "  ld=0x<data>" / "  st=0x<data>" column matched in order to its
- * placeholder/trailing form so the loaded/stored value isn't lost.
+ * Memops covered inline by the operand renderer are skipped here.
+ * Uncovered ones — typically implicit stack memops on CALL/PUSH/POP/
+ * RET that Capstone doesn't enumerate, so the walker never bumped
+ * max_dep_loads/stores — get a trailing "  ld(0x..)"/"  st(0x..)".
+ * With MEM_DATA every dp also gets a "  ld=0x.."/"  st=0x.." column.
  */
 void emit_disasm_memops(std::string &line, const DisasmContext &ctx,
                         const cst::Instruction &insn)
@@ -1013,17 +939,15 @@ void emit_disasm_memops(std::string &line, const DisasmContext &ctx,
                            ? load_idx  < insn.max_dep_loads
                            : store_idx < insn.max_dep_stores;
         if (!covered) {
-            /* Untracked memop — surface its address so the row isn't
-             * silently missing a runtime side effect.  No address-
-             * input set here: the walker has no info on it. */
+            /* Untracked memop — surface its address (no
+             * address-input set; the walker has no info). */
             line.append(is_load ? "  ld(0x" : "  st(0x");
             append_hex(&line, dp.addr);
             line.push_back(')');
         }
         if (with_data) {
-            /* append_wide_hex already emits the "0x" prefix (and
-             * "0x0" for a zero value); a literal "0x" here as well
-             * produced "st=0x0x0" / "ld=0x0x<data>". */
+            /* append_wide_hex emits its own "0x"; no literal "0x"
+             * here (would produce "st=0x0x.."). */
             line.append(is_load ? "  ld=" : "  st=");
             append_wide_hex(&line, dp.data);
         }
@@ -1048,20 +972,11 @@ void emit_disasm_branch_target(std::string &line, const DisasmContext &ctx,
 }
 
 /*
- * "[%ip,ld0,imm]" — one HAS_REG mask rendered as a comma-separated
- * list of its set bit names.  Bit layout:
- *   bits [0, n_src)                          src_reg[i]
- *   bits [n_src, n_src + max_dep_loads)      load_data[i - n_src]
- *   bit  n_src + max_dep_loads               immediate
- *
- * src_reg bits use the actual reg name (looked up via @ctx) so the
- * annotation reads like the inline arrow rendering; load bits stay
- * positional ("ld<k>") since each load slot's own address is reported
- * separately as a load_addr mask.
- *
- * When @insn is non-null and --show-lanes is set, each entry gets a
- * per-input lane set suffix ("%v0{0..3}", "ld0{0..1}") drawn from the
- * per-Instance lane masks so the deps line mirrors the inline arrows.
+ * "[%ip,ld0,imm]" — one HAS_REG mask as a comma-separated bit-name
+ * list (layout in cst_common.h).  src bits use the reg name; load
+ * bits stay positional ("ld<k>").  With @insn + --show-lanes each
+ * entry gets a per-input lane suffix so the deps line mirrors the
+ * inline arrows.
  */
 void append_dep_mask(std::string &line, uint64_t m,
                      const std::vector<uint8_t> &src_regs,
@@ -1078,10 +993,8 @@ void append_dep_mask(std::string &line, uint64_t m,
     };
     unsigned n_src = (unsigned)src_regs.size();
     const bool annotate_lanes = ctx.show_lanes && insn != nullptr;
-    /* Lane-granularity refinement: when the sink has a lane mask, a
-     * lane-structured input is listed only where its lanes intersect
-     * the sink's (PINSRD $3's pass-through src %v0{0..2} does not
-     * feed the written lane %v0{3}). */
+    /* Lane refinement: a lane-structured input is listed only where
+     * its lanes intersect the sink's. */
     auto feeds = [&](uint64_t in_lane) -> bool {
         if (!annotate_lanes || !sink_lanes) return true;
         if (!in_lane) return true;            /* scalar / imm: unfiltered */
@@ -1119,9 +1032,8 @@ void append_dep_mask(std::string &line, uint64_t m,
     line.push_back(']');
 }
 
-/* "[%ip,imm]" — one HAS_ADDR mask rendered.  Bit layout has no load
- * slots (addresses are computed before any load fires): bits
- * [0, n_src) are src_regs, bit n_src is the immediate. */
+/* "[%ip,imm]" — one HAS_ADDR mask (no load slots; layout in
+ * cst_common.h). */
 void append_addr_mask(std::string &line, uint64_t m,
                       const std::vector<uint8_t> &src_regs,
                       const DisasmContext &ctx)
@@ -1147,16 +1059,10 @@ void append_addr_mask(std::string &line, uint64_t m,
 }
 
 /*
- * "deps: %gp2=[ld0] sdata0=[%gp2] | laddr0=[%ip] saddr0=[%ip]"
- * — appended only when --show-deps is set and the template carries
- * a dep block or any memops (max_dep_loads/max_dep_stores > 0).
- *
- * When HAS_REG is absent on the wire, the annotation synthesizes
- * dst / store_data masks the same way emit_disasm_operands does
- * (non-address-only srcs + all loads + imm), so the deps line
- * mirrors the inline arrows.  Dst-reg slots use their actual reg
- * name; store/load slots stay positional since they don't have a
- * direct reg-name analog.
+ * "deps: %gp2=[ld0] sdata0=[%gp2] | laddr0=[%ip] saddr0=[%ip]" —
+ * --show-deps only.  When HAS_REG is absent, synthesizes the same
+ * default masks as emit_disasm_operands so the deps line mirrors the
+ * inline arrows.
  */
 void emit_disasm_deps_annotation(std::string &line,
                                  const cst::InsnTemplate &it,
@@ -1181,19 +1087,14 @@ void emit_disasm_deps_annotation(std::string &line,
     for (unsigned k = 0; k < n_loads; k++) {
         all_inputs |= ((uint64_t)1 << (n_src + k));
     }
-    /* imm bit only when the template actually carries an immediate
-     * — otherwise the annotation would falsely advertise "imm" as
-     * an input on rows without one. */
+    /* imm bit only when the template carries an immediate. */
     if (it.has_imm) {
         all_inputs |= ((uint64_t)1 << imm_bit);
     }
     uint64_t default_mask = all_inputs & ~addr_only_srcs;
 
-    /* Same saturated-only rule as emit_disasm_operands' `effective`
-     * so the annotation can't disagree with the inline arrows: only
-     * a fully-saturated (dep_all_to_all / default) mask gets the
-     * addressing-src cleanup; a precise refiner's explicit subset
-     * (e.g. dep_x86_stack_push's SP-dst = SP-src) is shown verbatim. */
+    /* Same saturated-only `effective` rule as emit_disasm_operands
+     * so the annotation can't disagree with the arrows. */
     auto effective = [&](uint64_t m) -> uint64_t {
         return (m == all_inputs) ? (m & ~addr_only_srcs) : m;
     };
@@ -1291,13 +1192,18 @@ void emit_disasm_trailing_meta(std::string &line, const DisasmContext &ctx,
 
 /* --- §8.b Per-instruction renderer (sequence of column emitters) -- */
 
+/* Inline per-instruction profile tag ("prof: ..." / "").  Defined
+ * after profile_pat_name (§ legacy templates). */
+std::string insn_prof_text(const cst::Header &h,
+                           const cst::InsnProfileInfo &ip);
+std::string insn_prof_text_for(const DisasmContext &ctx,
+                               const cst::Instruction &insn);
+
 void render_disasm_insn(FILE *out, const DisasmContext &ctx,
                         const cst::Instruction &insn,
                         const char *wp_status)
 {
-    /* One thread_local buffer is reused across calls; the only
-     * allocations come from short append_* / number conversions, and
-     * those are amortised once the buffer reaches its high-water mark. */
+    /* Reused thread_local buffer (amortised once at high-water). */
     static thread_local std::string line;
     line.clear();
 
@@ -1311,6 +1217,13 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
     emit_disasm_memops(line, ctx, insn);
     emit_disasm_branch_target(line, ctx, insn);
     emit_disasm_trailing_meta(line, ctx, insn, wp_status);
+
+    /* Run-aggregated per-insn profile, inline (NONE/0 omitted). */
+    std::string pt = insn_prof_text_for(ctx, insn);
+    if (!pt.empty()) {
+        line += "  ";
+        line += pt;
+    }
 
     line.push_back('\n');
     std::fwrite(line.data(), 1, line.size(), out);
@@ -1401,8 +1314,7 @@ const cst::Template *find_next_wp_run_template(
 void emit_disasm_file_header(FILE *out, const cst::Header &h,
                              size_t n_templates)
 {
-    /* Parseable `; KEY=value` summary so simple greppers can pull the
-     * trace's identity without parsing the binary header. */
+    /* Greppable `; KEY=value` trace-identity summary. */
     std::fprintf(out, "; cst_decode disassembly\n");
     std::fprintf(out, "; version=0x%08X\n", h.magic);
     std::fprintf(out, "; isa=%s\n", isa_display(h));
@@ -1443,6 +1355,12 @@ void emit_wp_run_separator(FILE *out, const cst::Instruction &first,
 
 /* --- §8.d Per-entry driver ---------------------------------------- */
 
+/* One template's run-aggregated profile (format §6) emitted as a
+ * block at its BB.  Defined after profile_pat_name (§ legacy
+ * templates); see the fuller contract there. */
+void emit_bb_profile_lines(FILE *out, const cst::Header &h,
+                           const cst::Template &t, const char *pfx);
+
 /* Walk one DecodedEntry's instructions in CP-then-WP order, injecting
  * WP-run separators and resolving CP/WP "final insn falls through to..."
  * branch fallbacks for the renderer. */
@@ -1457,6 +1375,9 @@ void render_entry_disasm(FILE *out, const DisasmContext &ctx,
     }
     const cst::Template &t = (*ctx.templates)[it->second];
     emit_bb_header(out, e, t);
+    /* Run-aggregated profile for this BB, at its entry header (it is
+     * a per-template total, identical for every entry of this id). */
+    emit_bb_profile_lines(out, *ctx.h, t, "; ");
 
     /* Fan the entry into per-instance instructions.  The builder
      * pre-filters dyn_params/reg_snaps/metaflags per-insn and resolves
@@ -1504,6 +1425,15 @@ void render_entry_disasm(FILE *out, const DisasmContext &ctx,
     }
 }
 
+/* One template's run-aggregated profile (format §6), emitted as a
+ * block at the BB it belongs to.  @pfx prefixes every line ("; " for
+ * disasm comments, "  " for legacy/templates).  Per-insn rows use a
+ * `prof:` tag and are omitted entirely when nothing is meaningful
+ * (no memops, pattern NONE, not addr, no bounds).  Defined after
+ * profile_pat_name (§ legacy templates). */
+void emit_bb_profile_lines(FILE *out, const cst::Header &h,
+                           const cst::Template &t, const char *pfx);
+
 void render_disasm(FILE *out, const cst::Header &h,
                    const std::vector<cst::Template> &templates,
                    const std::unordered_map<uint32_t, size_t> &by_id,
@@ -1529,40 +1459,6 @@ void render_disasm(FILE *out, const cst::Header &h,
  * section.  Templates carry no run-time observation, so no regdata /
  * memdata appears.
  * ==================================================================== */
-
-struct UniqueTemplateInsn {
-    uint64_t                 pc;
-    const cst::InsnTemplate *insn;
-};
-
-/* Collect every distinct PC across all templates (first sighting wins
- * — the bytes are identical anyway), sorted ascending. */
-std::vector<UniqueTemplateInsn> collect_unique_template_insns(
-    const std::vector<cst::Template> &templates,
-    std::unordered_map<uint64_t, std::string> *symbol_at)
-{
-    std::vector<UniqueTemplateInsn> out;
-    out.reserve(templates.size() * 4);
-    for (const cst::Template &t : templates) {
-        if (!t.symbol_name.empty()) {
-            (*symbol_at)[t.start_pc] = t.symbol_name;
-        }
-        for (const cst::InsnTemplate &I : t.insns) {
-            out.push_back({I.pc, &I});
-        }
-    }
-    std::sort(out.begin(), out.end(),
-              [](const UniqueTemplateInsn &a, const UniqueTemplateInsn &b) {
-                  return a.pc < b.pc;
-              });
-    out.erase(std::unique(out.begin(), out.end(),
-                          [](const UniqueTemplateInsn &a,
-                             const UniqueTemplateInsn &b) {
-                              return a.pc == b.pc;
-                          }),
-              out.end());
-    return out;
-}
 
 /* Mnemonic for the templates-only generic view: branch-flavour for
  * branches, mnem table for non-branches.  Falls back to "br"/"op"
@@ -1615,16 +1511,6 @@ void emit_template_only_operands(std::string &line,
     }
 }
 
-void emit_template_only_symbol_marker(FILE *out, uint64_t pc,
-                                      const std::string &symbol)
-{
-    std::string line;
-    append_hex_padded(&line, pc, 16);
-    line.append(" <");
-    line.append(symbol);
-    line.append(">:\n");
-    std::fwrite(line.data(), 1, line.size(), out);
-}
 
 /* One templates-only line:
  *   "  <pc>:  <bytes...>  [objdump | ] <mnem>   <operands>\n"
@@ -1632,7 +1518,8 @@ void emit_template_only_symbol_marker(FILE *out, uint64_t pc,
 void emit_template_only_line(FILE *out, const cst::Header &h,
                              const DisasmTables &dt,
                              const ObjdumpRenderer *od,
-                             const cst::InsnTemplate &I)
+                             const cst::InsnTemplate &I,
+                             const cst::InsnProfileInfo *ip)
 {
     std::string line;
     line.append("  ");
@@ -1662,6 +1549,13 @@ void emit_template_only_line(FILE *out, const cst::Header &h,
 
     emit_template_only_mnemonic(line, h, dt, I);
     emit_template_only_operands(line, dt, I);
+    if (ip) {
+        std::string pt = insn_prof_text(h, *ip);
+        if (!pt.empty()) {
+            line.append("  ");
+            line.append(pt);
+        }
+    }
     line.push_back('\n');
     std::fwrite(line.data(), 1, line.size(), out);
 }
@@ -1686,15 +1580,23 @@ void render_templates_only(FILE *out, const cst::Header &h,
     disasm_tables_build(&dt, h);
     emit_templates_only_file_header(out, h, templates.size(), od != nullptr);
 
-    std::unordered_map<uint64_t, std::string> symbol_at;
-    auto unique_insns = collect_unique_template_insns(templates, &symbol_at);
-
-    for (const UniqueTemplateInsn &e : unique_insns) {
-        auto sit = symbol_at.find(e.pc);
-        if (sit != symbol_at.end()) {
-            emit_template_only_symbol_marker(out, e.pc, sit->second);
+    /* Per-BB so the run-aggregated profile can be annotated as part
+     * of each block (a flat dedup'd PC dump has nowhere to hang it). */
+    for (const cst::Template &t : templates) {
+        std::fprintf(out, "BB%u 0x%llx", t.template_id,
+                     (unsigned long long)t.start_pc);
+        if (!t.symbol_name.empty()) {
+            std::fprintf(out, " <%s>", t.symbol_name.c_str());
         }
-        emit_template_only_line(out, h, dt, od, *e.insn);
+        std::fprintf(out, " (insns=%zu fall_through=0x%llx)\n",
+                     t.insns.size(),
+                     (unsigned long long)t.fall_through_pc);
+        emit_bb_profile_lines(out, h, t, "  ");
+        for (size_t k = 0; k < t.insns.size(); k++) {
+            const cst::InsnProfileInfo *ip =
+                k < t.profile.insns.size() ? &t.profile.insns[k] : nullptr;
+            emit_template_only_line(out, h, dt, od, t.insns[k], ip);
+        }
     }
 }
 
@@ -1840,7 +1742,9 @@ void emit_legacy_encodings(FILE *out, const cst::Header &h)
         {"header_flag",   &h.maps.header_flag},
         {"insn_flag",     &h.maps.insn_flag},
         {"metaflags",     &h.maps.metaflags},
+        {"mem_access_pattern", &h.maps.mem_access_pattern},
         {"opcode",        &h.maps.opcode},
+        {"profile_flag",  &h.maps.profile_flag},
         {"reg",           &h.maps.reg},
         {"wp_event_flag", &h.maps.wp_event_flag},
     };
@@ -1860,7 +1764,8 @@ void emit_legacy_encodings(FILE *out, const cst::Header &h)
 
 /* One template-insn line inside the legacy TEMPLATES section. */
 void emit_legacy_template_insn(FILE *out, const cst::Header &h,
-                               size_t i, const cst::InsnTemplate &I)
+                               size_t i, const cst::InsnTemplate &I,
+                               const cst::InsnProfileInfo *ip)
 {
     std::string line = "  [";
     line += std::to_string(i);
@@ -1897,15 +1802,18 @@ void emit_legacy_template_insn(FILE *out, const cst::Header &h,
     }
     line += " bytes=";
     line += fmt_bytes_hex(I.raw_bytes);
+    if (ip) {
+        std::string pt = insn_prof_text(h, *ip);
+        if (!pt.empty()) {
+            line += "  ";
+            line += pt;
+        }
+    }
     std::fprintf(out, "%s\n", line.c_str());
 
-    /* Optional dep-mask continuation line — emitted when the template
-     * carries HAS_REG and/or HAS_ADDR.  Format:
-     *     deps: [dst=0x..,0x..] [sd=0x..,...] [la=0x..,...] [sa=0x..,...]
-     * Empty per-family vectors are omitted entirely so a scalar
-     * arith insn that only has dst_dep_mask renders as
-     *     deps: dst=0x3,0x3
-     * Aligned to match the indented insn-line style above. */
+    /* Optional dep-mask continuation line (HAS_REG/HAS_ADDR):
+     *   deps: [dst=..] [sd=..] [la=..] [sa=..]
+     * Empty per-family vectors omitted. */
     if (!I.dst_dep_mask.empty() ||
         !I.store_data_dep_mask.empty() ||
         !I.load_addr_dep_mask.empty() ||
@@ -1931,6 +1839,15 @@ void emit_legacy_template_insn(FILE *out, const cst::Header &h,
     }
 }
 
+/* Resolve a profile pattern class id to its self-described name
+ * ("CST_PAT_REGULAR"), falling back to the numeric value. */
+static std::string profile_pat_name(const cst::Header &h, uint8_t v)
+{
+    auto it = h.maps.mem_access_pattern.find(v);
+    if (it != h.maps.mem_access_pattern.end()) return it->second;
+    return "CST_PAT_" + std::to_string((unsigned)v);
+}
+
 void emit_legacy_templates(FILE *out, const cst::Header &h,
                            const std::vector<cst::Template> &templates)
 {
@@ -1942,13 +1859,124 @@ void emit_legacy_templates(FILE *out, const cst::Header &h,
                      (unsigned long long)t.start_pc,
                      t.insns.size(),
                      (unsigned long long)t.fall_through_pc);
+        if (!t.target_pcs.empty()) {
+            std::fprintf(out, "  targets:");
+            for (uint64_t tp : t.target_pcs) {
+                std::fprintf(out, " 0x%llx", (unsigned long long)tp);
+            }
+            std::fprintf(out, "\n");
+        }
         if (!t.symbol_name.empty()) {
             std::fprintf(out, "  symbol=%s\n", t.symbol_name.c_str());
         }
+
+        /* BB-level profile (format §6): exec counts + per-target
+         * taken/not-taken.  Per-insn profile rides inline on each
+         * instruction's own line below (NONE/0 omitted). */
+        emit_bb_profile_lines(out, h, t, "  ");
+
         for (size_t i = 0; i < t.insns.size(); i++) {
-            emit_legacy_template_insn(out, h, i, t.insns[i]);
+            const cst::InsnProfileInfo *ip =
+                i < t.profile.insns.size() ? &t.profile.insns[i] : nullptr;
+            emit_legacy_template_insn(out, h, i, t.insns[i], ip);
         }
         std::fprintf(out, "\n");
+    }
+}
+
+/* Per-instruction profile rendered as an inline `prof: ...` tag to
+ * sit on the instruction's own line.  Returns "" when nothing is
+ * meaningful (no memops either path, pattern NONE, not address-like,
+ * no effective-address bounds) so callers can omit it entirely. */
+std::string insn_prof_text(const cst::Header &h,
+                           const cst::InsnProfileInfo &ip)
+{
+    std::string s;
+    char buf[160];
+    auto add = [&](const char *frag) {
+        if (!s.empty()) s.push_back(' ');
+        s += frag;
+    };
+    if (ip.memops_cp) {
+        std::snprintf(buf, sizeof(buf), "memops_cp=%llu",
+                      (unsigned long long)ip.memops_cp);
+        add(buf);
+    }
+    if (ip.memops_wp) {
+        std::snprintf(buf, sizeof(buf), "memops_wp=%llu",
+                      (unsigned long long)ip.memops_wp);
+        add(buf);
+    }
+    if (ip.pat_cp) {
+        std::snprintf(buf, sizeof(buf), "pat_cp=%s",
+                      profile_pat_name(h, ip.pat_cp).c_str());
+        add(buf);
+    }
+    if (ip.pat_wp) {
+        std::snprintf(buf, sizeof(buf), "pat_wp=%s",
+                      profile_pat_name(h, ip.pat_wp).c_str());
+        add(buf);
+    }
+    if (ip.addr_cp) add("addr_cp=1");
+    if (ip.addr_wp) add("addr_wp=1");
+    if (ip.has_cp_bounds) {
+        std::snprintf(buf, sizeof(buf), "cp=[0x%llx-0x%llx]",
+                      (unsigned long long)ip.lo_cp,
+                      (unsigned long long)ip.hi_cp);
+        add(buf);
+    }
+    if (ip.has_wp_bounds) {
+        std::snprintf(buf, sizeof(buf), "wp=[0x%llx-0x%llx]",
+                      (unsigned long long)ip.lo_wp,
+                      (unsigned long long)ip.hi_wp);
+        add(buf);
+    }
+    if (s.empty()) {
+        return s;
+    }
+    return "prof: " + s;
+}
+
+/* Look up the run-aggregated per-insn profile for an instruction by
+ * its (bb_template_id, insn_index_in_bb), returning the inline tag or
+ * "" — used by the disasm body renderer so the profile rides on each
+ * dynamic instruction line rather than a header cluster. */
+std::string insn_prof_text_for(const DisasmContext &ctx,
+                               const cst::Instruction &insn)
+{
+    auto it = ctx.by_id->find(insn.bb_template_id);
+    if (it == ctx.by_id->end()) {
+        return {};
+    }
+    const cst::Template &t = (*ctx.templates)[it->second];
+    if (insn.insn_index_in_bb >= t.profile.insns.size()) {
+        return {};
+    }
+    return insn_prof_text(*ctx.h, t.profile.insns[insn.insn_index_in_bb]);
+}
+
+/* BB-level profile only (exec counts + per-target taken/not-taken).
+ * Per-instruction profile is NOT emitted here — it rides inline on
+ * each instruction line (see insn_prof_text). */
+void emit_bb_profile_lines(FILE *out, const cst::Header & /*h*/,
+                           const cst::Template &t, const char *pfx)
+{
+    const cst::TemplateProfileInfo &P = t.profile;
+    std::fprintf(out, "%sprofile: exec_cp=%llu exec_wp=%llu\n",
+                 pfx,
+                 (unsigned long long)P.exec_cp,
+                 (unsigned long long)P.exec_wp);
+    for (size_t k = 0; k < P.targets.size(); k++) {
+        const cst::BranchTargetCount &tc = P.targets[k];
+        uint64_t tp = k < t.target_pcs.size() ? t.target_pcs[k] : 0;
+        std::fprintf(out,
+                     "%starget[%zu]: pc=0x%llx taken_cp=%llu "
+                     "nottaken_cp=%llu taken_wp=%llu nottaken_wp=%llu\n",
+                     pfx, k, (unsigned long long)tp,
+                     (unsigned long long)tc.taken_cp,
+                     (unsigned long long)tc.nottaken_cp,
+                     (unsigned long long)tc.taken_wp,
+                     (unsigned long long)tc.nottaken_wp);
     }
 }
 
@@ -2044,9 +2072,7 @@ void render_legacy(FILE *out, const cst::Header &h,
 
     emit_legacy_body_stats(out, body.stats());
 
-    /* Keep constant-table helpers reachable so the compiler doesn't
-     * drop them — they're available to future callers but not used by
-     * this renderer body. */
+    /* Keep constant-table helpers reachable (unused here). */
     (void)exception_name; (void)wp_stop_reason_name;
 }
 

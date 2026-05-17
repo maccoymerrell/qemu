@@ -1,33 +1,27 @@
 /*
  * Wrong-Path Tracing Plugin — async output writer thread.
  *
- * Decouples the QEMU CPU thread that produces trace bytes (via bw_raw)
- * from the FILE* sink (which is typically popen()'d to xz -T0 and
- * therefore subject to compressor stalls).  Without this the kernel
- * pipe buffer (~64 KiB) is the only absorber: every time xz falls
- * behind, fwrite() blocks the QEMU thread and the guest workload's
- * timing is deformed.
+ * Decouples the QEMU CPU thread producing trace bytes from the FILE*
+ * sink (typically popen'd to xz -T0).  Without it the ~64 KiB kernel
+ * pipe buffer is the only absorber, so every compressor stall blocks
+ * the QEMU thread and deforms the guest workload's timing.
  *
  * Design
  * ------
- * Single-producer / single-consumer chunked queue.  Producer (the
- * QEMU CPU thread holding plugin data_lock) writes into a
- * preallocated chunk; when the chunk fills, it is published to the
- * fill queue and a fresh chunk is popped from the free queue.  The
- * dedicated writer thread drains the fill queue, fwrite()s each
- * chunk, and recycles it onto the free queue.  Total in-flight bytes
- * = WRITER_CHUNK_BYTES * WRITER_NUM_CHUNKS = 64 MiB.
+ * SPSC chunked queue.  Producer (QEMU CPU thread holding data_lock)
+ * fills a chunk, publishes it to the fill queue, pops a fresh one
+ * from the free queue.  The writer thread drains fill, fwrite()s,
+ * recycles onto free.  In-flight = WRITER_CHUNK_BYTES *
+ * WRITER_NUM_CHUNKS = 64 MiB.
  *
- * The bounded blocking queue is implemented inline with pthread
- * mutex + condvars rather than std::mutex / std::condition_variable
- * because libstdc++'s <mutex> transitively includes <cctype>, which
- * pulls in QEMU's include/qemu/ctype.h shadow header on the plugin's
- * search path and breaks the build (see champsim_tracer.h note).
+ * The queue uses pthread mutex + condvars, not std::mutex /
+ * std::condition_variable: libstdc++'s <mutex> transitively includes
+ * <cctype>, which pulls QEMU's include/qemu/ctype.h shadow header on
+ * the plugin's search path and breaks the build (see
+ * champsim_tracer.h note).
  *
- * Lifecycle is per-TraceSegment: writer_start() is called after the
- * FILE* is opened (popen or fopen), writer_finish() before
- * pclose/fclose.  Simpoint mode creates one writer thread per
- * segment, exactly mirroring today's per-segment popen().
+ * Lifecycle is per-TraceSegment: writer_start() after the FILE* is
+ * opened, writer_finish() before pclose/fclose.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */

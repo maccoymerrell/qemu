@@ -1,19 +1,13 @@
 /*
  * Wrong-Path Tracing Plugin — per-vCPU register-handle cache.
  *
- * QEMU exposes register descriptors via qemu_plugin_get_registers(),
- * which returns one descriptor per readable architectural register on
- * the calling vCPU.  Reading a register through the plugin API takes a
- * descriptor handle, so on every reg-data capture the plugin needs to
- * map a (feature, name) key to the right handle.
+ * Caches the (feature, name) -> qemu_plugin_register* lookup needed on
+ * every reg-data capture.  Cached per-vCPU (each vCPU has its own
+ * handle space) and per-thread (MRU per-vCPU cache in TLS so the
+ * common case avoids the lock).  Entries populated lazily.
  *
- * RegHandleCache caches that lookup, both per-vCPU (each vCPU has its
- * own handle space) and per-thread (the most recently used per-vCPU
- * cache is held in thread_local storage so the common case avoids the
- * lock).  Cache entries are populated lazily on first use.
- *
- * AArch64 SVE z-registers are aliased to FPU v-registers in the cache,
- * because Capstone reports v-names but QEMU may register only the SVE
+ * AArch64 SVE z-registers are aliased to FPU v-registers because
+ * Capstone reports v-names but QEMU may register only the SVE
  * descriptors.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -45,12 +39,10 @@ public:
     void ensure_initialized(unsigned int cpu_index);
 
 private:
-    /* The inner GHashTable maps (feature, name) -> qemu_plugin_register*
-     * via QemuRegKey-pointer keys with custom hash/equal/free callbacks
-     * defined in the .cc.  Hot path: one lookup per source register
-     * per insn during reg-data capture, so we keep glib's hash here
-     * rather than risk std::unordered_map's allocation-per-lookup
-     * without C++20 heterogeneous lookup. */
+    /* Inner GHashTable maps (feature, name) -> qemu_plugin_register*
+     * via QemuRegKey keys (hash/equal/free in the .cc).  glib hash
+     * kept over std::unordered_map to avoid allocation-per-lookup
+     * absent C++20 heterogeneous lookup. */
     struct VCPUCache {
         GHashTable *handles = nullptr;
         VCPUCache();
@@ -59,9 +51,8 @@ private:
         VCPUCache &operator=(const VCPUCache &) = delete;
     };
 
-    /* Per-vCPU caches indexed by cpu_index.  unique_ptr's auto cleanup
-     * replaces the GPtrArray's free_func.  Empty slots stay null until
-     * a vCPU first calls in. */
+    /* Per-vCPU caches indexed by cpu_index; empty slots stay null
+     * until a vCPU first calls in. */
     std::vector<std::unique_ptr<VCPUCache>> vcpu_caches_;
     GMutex                                  lock_;
 
@@ -69,13 +60,12 @@ private:
     static thread_local VCPUCache    *tls_cache_;
     static thread_local unsigned int  tls_cache_cpu_index_;
 
-    /* Hot-path TLS direct-mapped cache.  Keyed by const QemuRegKey *
-     * pointer identity (a single QemuRegKey instance lives in each
-     * BBTemplate's InsnRegNames, so re-running the same template — the
-     * common hot-loop case — passes the same pointer back).  Index is
-     * the low bits of the pointer.  Hits avoid the GHashTable + the
-     * g_str_hash + strcmp chain, which dominated reg-data-on profiles
-     * (~7-9% of plugin time on register-heavy workloads). */
+    /* Hot-path TLS direct-mapped cache, keyed by const QemuRegKey *
+     * pointer identity (one instance per BBTemplate InsnRegNames, so
+     * re-running a template passes the same pointer).  Index = low
+     * bits of the pointer.  Hits skip the GHashTable + g_str_hash +
+     * strcmp chain (~7-9% of plugin time on register-heavy workloads
+     * with reg-data on). */
     enum { TLS_PTR_CACHE_SIZE = 256 };
     struct TlsPtrEntry {
         const QemuRegKey            *key;

@@ -1,23 +1,19 @@
 /*
  * Wrong-Path Tracing Plugin — BB template cache.
  *
- * Owns the two hash tables that index BBTemplate records:
- *   - tb_map: per-TB fragment templates, keyed by TB start_pc.  These
- *     are the unit returned from QEMU's vcpu_tb_trans callback and
- *     looked up later from vcpu_tb_exec / wp.cc.
- *   - bb_map: true-basic-block templates, keyed by BB start_pc.  These
- *     are assembled from one or more TB fragments and are what the
- *     trace's templates section serializes.
+ * Owns two hash tables of BBTemplate records:
+ *   - tb_map: per-TB fragment templates keyed by TB start_pc (the unit
+ *     from vcpu_tb_trans; looked up from vcpu_tb_exec / wp.cc).
+ *   - bb_map: true-BB templates keyed by BB start_pc, assembled from
+ *     TB fragments; what the trace's templates section serializes.
  *
- * Templates are immutable once committed.  Every map entry is heap-
- * allocated; the cache owns the records and frees their inner arrays
- * via a custom unique_ptr deleter when it shuts down.
+ * Templates are immutable once committed.  The cache owns the heap
+ * records and frees their inner arrays via a custom unique_ptr deleter.
  *
- * The cache itself is unsynchronised; callers must hold data_lock
- * around any method that mutates state (commit_true_bb,
- * get_or_create_*).  Read-only methods (find_*, *_count, for_each_bb,
- * template_branch_index) need the same lock if a concurrent mutator
- * could be running.
+ * Unsynchronised: callers hold data_lock around mutators
+ * (commit_true_bb, get_or_create_*) and around read-only methods
+ * (find_*, *_count, for_each_bb, template_branch_index) if a concurrent
+ * mutator could be running.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -74,9 +70,8 @@ public:
     size_t tb_count() const;
     size_t bb_count() const;
 
-    /* Iterate true-BB templates.  Invoked once at end-of-trace by the
-     * binary writer; ordering matches the underlying GHashTable's
-     * iteration order, which the format does not constrain. */
+    /* Iterate true-BB templates in sorted start_pc order (deterministic
+     * serialization).  Invoked once at end-of-trace by the writer. */
     void for_each_bb(const std::function<void(BBTemplate &)> &fn);
 
     /* Pure: return the index of the (last) branch instruction within
@@ -84,15 +79,12 @@ public:
      * normalization the branch is always the last instruction. */
     static int template_branch_index(const BBTemplate *tmpl);
 
-    /* Drop all true-BB templates so the next segment serializes a
-     * dictionary that only covers BBs reached after this point.
-     * tb_map_ (per-TB fragments) is intentionally preserved: QEMU
-     * issues vcpu_tb_trans only on first translation of each TB, so
-     * dropping fragments would orphan the chain assembler the next
-     * time a previously-translated TB executes.  True-BBs are re-
-     * assembled at runtime by BBChainAssembler from those fragments,
-     * so clearing bb_map_ alone is safe and gives each segment a
-     * clean template dictionary. */
+    /* Drop all true-BB templates so the next segment serializes only
+     * BBs reached after this point.  tb_map_ is preserved: QEMU issues
+     * vcpu_tb_trans only on first translation, so dropping fragments
+     * would orphan the chain assembler on re-execution of a translated
+     * TB.  True-BBs are re-assembled at runtime from those fragments,
+     * so clearing bb_map_ alone is safe. */
     void clear_bb_map();
 
 private:

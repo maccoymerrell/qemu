@@ -30,6 +30,10 @@ void BBTemplateDeleter::operator()(BBTemplate *t) const noexcept
     g_free(t->insn_snap_refs);
     g_free(t->insn_synthetic_ea);
     g_free(t->insn_synth_ea_refs);
+    if (t->profile) {
+        g_free(t->profile->insns);
+        g_free(t->profile);
+    }
     g_free(t);
 }
 
@@ -54,14 +58,11 @@ void BBTemplateCache::clear_bb_map()
 {
     bb_map_.clear();
     /*
-     * Reset the template-id counter so the next segment starts at id 1.
-     * Otherwise template ids accumulate monotonically across segments
-     * and the per-(template_id) FieldStateBlock vector inside each
-     * segment's fresh FieldStateTable is forced to grow past the
-     * unused 1..N1 slots from the previous segment on first hit.
-     * Wire format unaffected — template ids are emitted as deltas
-     * relative to the previous template id within the segment, and
-     * each segment opens a new TEMPLATES section anyway.
+     * Reset template-id counter so each segment starts at id 1; else
+     * ids accumulate across segments and the fresh FieldStateTable's
+     * per-id vector grows past unused prior-segment slots on first hit.
+     * Wire format unaffected — ids are intra-segment deltas and each
+     * segment opens a new TEMPLATES section.
      */
     next_template_id_ = 1;
 }
@@ -73,11 +74,9 @@ size_t BBTemplateCache::bb_count() const
 
 void BBTemplateCache::for_each_bb(const std::function<void(BBTemplate &)> &fn)
 {
-    /* unordered_map iteration order is implementation-defined and varies
-     * with bucket count.  Walk by sorted start_pc so the templates
-     * section serialization is deterministic across runs and across
-     * libstdc++ revisions.  Called once at end-of-trace, so the sort
-     * cost is amortized over the whole run. */
+    /* Walk by sorted start_pc so templates-section serialization is
+     * deterministic (unordered_map order is implementation-defined).
+     * Called once at end-of-trace; sort cost amortized over the run. */
     std::vector<uint64_t> keys;
     keys.reserve(bb_map_.size());
     for (const auto &kv : bb_map_) {
@@ -103,12 +102,9 @@ int BBTemplateCache::template_branch_index(const BBTemplate *tmpl)
     return -1;
 }
 
-/* Allocate and populate a fresh BBTemplate with @n_insns entries
- * copied from @insn_*.  Common to commit_true_bb and
- * commit_truncated_bb; the template_id is assigned by the caller's
- * map insertion path (so truncated entries don't burn IDs unless
- * actually inserted).  Returns the heap-allocated unique_ptr; caller
- * moves it into the appropriate map. */
+/* Allocate and populate a fresh BBTemplate with @n_insns entries from
+ * @insn_*.  template_id assigned by the caller's map-insertion path.
+ * Returns the unique_ptr; caller moves it into the appropriate map. */
 static BBTemplatePtr build_bb_template(uint32_t template_id,
                                        uint64_t start_pc,
                                        uint32_t n_insns,
@@ -172,10 +168,9 @@ BBTemplate *BBTemplateCache::commit_true_bb(uint64_t start_pc,
             static std::atomic<int> warned{0};
             int expected = 0;
             if (warned.compare_exchange_strong(expected, 1)) {
-                /* Find first divergence so we can tell whether it's
-                 * a length-only difference (one is a prefix of the
-                 * other — likely a chain that finalized at different
-                 * lengths) or a true sequence mismatch (likely SMC). */
+                /* First divergence distinguishes a length-only prefix
+                 * difference (chain finalized at different lengths)
+                 * from a true sequence mismatch (likely SMC). */
                 uint32_t first_diff = 0;
                 uint32_t common = existing->n_insns < n_insns
                     ? existing->n_insns : n_insns;
@@ -228,16 +223,10 @@ BBTemplate *BBTemplateCache::get_or_create_bb_template(
         return nullptr;
     }
 
-    /* Thread-local scratch for the fragment-walk staging area.
-     * Profiling on mcf showed these per-call g_new0 allocations
-     * accounting for ~3% of total tracer runtime; making them
-     * per-thread reusable buffers eliminates the malloc/free pair
-     * on every BB finalization.  Capacity grows to the largest
-     * BB seen and stays put for the run.
-     *
-     * thread_local because get_or_create_bb_template is called
-     * exclusively from vcpu_tb_exec on the per-vCPU host thread;
-     * each vCPU thread owns its own scratch. */
+    /* Thread-local fragment-walk scratch.  Per-call g_new0 here was
+     * ~3% of tracer runtime on mcf; reusable per-thread buffers drop
+     * the per-finalization malloc/free.  thread_local: this is called
+     * only from vcpu_tb_exec on the per-vCPU host thread. */
     thread_local std::vector<uint64_t>   tls_insn_pcs;
     thread_local std::vector<uint8_t>    tls_insn_sizes;
     thread_local std::vector<uint8_t>    tls_insn_bytes;
@@ -319,13 +308,10 @@ BBTemplate *BBTemplateCache::get_or_create_bb_template(
                                       insn_reg_names,
                                       symbol_name, final_ft);
     /*
-     * Propagate the REP self-loop sub-template from the last
-     * fragment (the TB whose terminator is the REP-prefixed string
-     * op) to the BB template the chain assembler just built.  The
-     * sub-template was constructed at TB-translation time and
-     * cached on its TB; here we expose it on the BB so
-     * emit_body_entry can fan iterations out without re-walking the
-     * fragment list.  No-op for non-REP BBs.
+     * Propagate the REP self-loop sub-template from the last fragment
+     * (the TB ending in the REP string op, built at TB-translation
+     * time) onto the assembled BB so emit_body_entry can fan iterations
+     * without re-walking fragments.  No-op for non-REP BBs.
      */
     if (tmpl && n_fragments > 0 && fragments[n_fragments - 1]) {
         tmpl->rep_subtmpl = fragments[n_fragments - 1]->rep_subtmpl;
@@ -379,10 +365,9 @@ BBTemplate *BBTemplateCache::get_or_create_tb_template(
     }
 
     /*
-     * Delay-slot reordering: swap [branch, delay] -> [delay, branch] on
-     * ISAs with branch delay slots so the last instruction is always the
-     * branch.  This lets template_branch_index and WP steering be
-     * uniform across ISAs.
+     * Delay-slot reordering: swap [branch, delay] -> [delay, branch] so
+     * the branch is always last, making template_branch_index and WP
+     * steering ISA-uniform.
      */
     if (isa_properties[trace_isa].branch_delay_slots > 0 && n_insns >= 2) {
         uint32_t br = n_insns - 2;
@@ -420,17 +405,14 @@ BBTemplate *BBTemplateCache::get_or_create_tb_template(
     g_stats.tb_templates_created++;
 
     /*
-     * REP-prefixed string ops fan out into per-iteration body entries:
-     * iter 1 stays on the parent TB template (so the BB that *first*
-     * enters the REP loop ends with the first REP, just like a normal
-     * branch), iter 2..N each emit on a 1-insn self-loop sub-template
-     * cached here.  Built once at translation; the body emitter
-     * follows raw->rep_subtmpl when the TB's terminator carries
-     * rep_loads_per_iter + rep_stores_per_iter > 0.
-     *
-     * The sub-template is a self-contained 1-insn BB at the REP's
-     * PC, with the same InsnFields (incl. BRANCH_COND_DIRECT
-     * branch_type) so it is structurally a self-loop in the trace.
+     * REP string ops fan into per-iteration body entries: iter 1 stays
+     * on the parent TB template (the BB first entering the loop ends
+     * with the first REP, like a normal branch); iter 2..N emit on a
+     * 1-insn self-loop sub-template built here.  The body emitter
+     * follows raw->rep_subtmpl when the terminator has
+     * rep_loads_per_iter + rep_stores_per_iter > 0.  The sub-template
+     * is a 1-insn BB at the REP PC with the same InsnFields (incl.
+     * BRANCH_COND_DIRECT) so it is structurally a self-loop.
      */
     if (raw->n_insns > 0) {
         uint32_t last = raw->n_insns - 1;

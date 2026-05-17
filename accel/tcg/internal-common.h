@@ -84,6 +84,25 @@ void tb_check_watchpoint(CPUState *cpu, uintptr_t retaddr);
  * back to real memory for bytes not in the buffer.
  */
 #ifdef CONFIG_PLUGIN
+/*
+ * Hard cap on the per-byte speculative store buffer.  Wrong-path
+ * execution is bounded by the plugin's speculation depth, so a
+ * legitimate spec-mode store set is small (tens to thousands of
+ * bytes).  A single instruction that loops a register-sized memory
+ * set/copy entirely inside one TCG helper — e.g. an AArch64
+ * FEAT_MOPS SETM/CPYM reached on the wrong path with a speculative
+ * (garbage) size register — would otherwise insert unboundedly here
+ * (one node per byte) and exhaust memory / crash inside glib before
+ * the plugin ever regains control to bound it.  Past the cap we stop
+ * *growing* the buffer (existing keys still update, so forwarding
+ * stays correct for the already-tracked working set); further
+ * speculative stores simply aren't forwarded — acceptable for a
+ * speculative wrong path, and vastly preferable to an OOM.  64 MiB
+ * worth of byte entries is orders of magnitude above any real
+ * wrong-path store set.
+ */
+#define PLUGIN_SPEC_STORE_BUF_MAX (64u << 20)
+
 static inline bool cpu_plugin_spec_active(CPUState *cpu)
 {
     return unlikely(cpu->plugin_spec_mode && cpu->plugin_spec_store_buf);
@@ -91,6 +110,15 @@ static inline bool cpu_plugin_spec_active(CPUState *cpu)
 
 static inline void spec_store_byte(CPUState *cpu, vaddr addr, uint8_t val)
 {
+    if (unlikely(g_hash_table_size(cpu->plugin_spec_store_buf)
+                 >= PLUGIN_SPEC_STORE_BUF_MAX)
+        && !g_hash_table_contains(cpu->plugin_spec_store_buf,
+                                  GUINT_TO_POINTER((guintptr)addr))) {
+        /* Buffer full: drop this speculative byte rather than grow
+         * unboundedly.  A runaway wrong-path bulk memset/memcpy is
+         * itself a sign speculation has run into garbage. */
+        return;
+    }
     g_hash_table_insert(cpu->plugin_spec_store_buf,
                         GUINT_TO_POINTER((guintptr)addr),
                         GUINT_TO_POINTER((guint)val));

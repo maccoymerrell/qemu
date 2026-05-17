@@ -29,12 +29,10 @@ struct WPThreadState {
      * simulate_wrong_path_ext at end-of-sim. */
     std::vector<WPMemAccess> mem_accesses;
 
-    /* Per-instruction memop counter for the WP-side cap check in
-     * MemAccessRecorder::record.  cur_insn_pc tracks the PC the last
-     * memop was attributed to; cur_insn_count is the run length of
-     * consecutive same-PC memops.  When cur_insn_count exceeds
-     * CST_FID_SLOT_COUNT, further memops at the same PC are dropped.
-     * Both reset whenever a memop arrives with a different insn_pc. */
+    /* WP-side per-insn memop cap (MemAccessRecorder::record).
+     * cur_insn_pc = PC of the last memop; cur_insn_count = run length
+     * of consecutive same-PC memops.  Past CST_FID_SLOT_COUNT, further
+     * same-PC memops are dropped; both reset on a different insn_pc. */
     uint64_t cur_insn_pc = 0;
     uint32_t cur_insn_count = 0;
 

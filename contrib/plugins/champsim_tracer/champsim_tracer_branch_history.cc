@@ -72,8 +72,7 @@ void BranchHistory::note_target(BranchRecord *br, uint64_t target)
         return;
     }
 
-    /* Bump the LRU clock; on wrap-around, reset all last_seen so
-     * subsequent comparisons stay meaningful. */
+    /* Bump LRU clock; on wrap reset all last_seen so comparisons stay valid. */
     br->target_tick++;
     if (br->target_tick == 0) {
         br->target_tick = 1;

@@ -686,7 +686,15 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
         for (uint8_t i = 0; i < n; i++) {
             const cs_riscv_op *cop = &detail->riscv.operands[i];
             qemu_plugin_operand *op = &out->operands[i];
-            op->access = 0; /* RISC-V Capstone lacks access info */
+            /* CS_AC_READ/WRITE == QEMU_PLUGIN_OP_ACC_READ/WRITE (1/2);
+             * forward Capstone's per-operand access verbatim, same as
+             * the x86/arm64 fillers.  Crucial for memory operands:
+             * the plugin's HAS_ADDR address-dependency block (and the
+             * dst<-load-slot wiring) is gated on a MEM operand
+             * reporting READ/WRITE, so without this every RISC-V load
+             * collapses to the all-to-all fallback and a consumer
+             * sees a load result as a 1-cycle register move. */
+            op->access = cop->access;
             op->size = 0;
             /* V-extension SEW is a runtime CSR; not derivable here. */
             op->lane_bytes = 0;
@@ -741,7 +749,11 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
         for (uint8_t i = 0; i < n; i++) {
             const cs_mips_op *cop = &detail->mips.operands[i];
             qemu_plugin_operand *op = &out->operands[i];
-            op->access = 0; /* MIPS Capstone lacks access info */
+            /* See the RISC-V branch: forward Capstone's per-operand
+             * access (CS_AC_* == QEMU_PLUGIN_OP_ACC_*) so memory
+             * operands gate the HAS_ADDR address-dependency block
+             * instead of collapsing to the all-to-all fallback. */
+            op->access = cop->access;
             op->size = 0;
             op->lane_bytes = insn_lane_bytes;
             op->scale = 1;

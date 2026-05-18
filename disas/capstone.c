@@ -584,7 +584,20 @@ static uint8_t cap_lane_bytes_from_mnemonic(const char *mnem)
         char c    = mnem[n - 1];
         bool dot_form    = (prev == '.');
         bool simd_prefix = (mnem[0] == 'v' || (mnem[0] == 'p' && n >= 5));
-        if (dot_form || simd_prefix) {
+        if (dot_form) {
+            /* MIPS MSA element suffix: B/H/W/D = byte/half/word/
+             * double = 1/2/4/8 bytes (W is a 32-bit word here, not
+             * the x86 16-bit "word").  The dot-form is MSA-exclusive
+             * — x86 never uses a '.'-separated element suffix. */
+            switch (c) {
+            case 'b': return 1;
+            case 'h': return 2;
+            case 'w': return 4;
+            case 'd': return 8;
+            }
+        } else if (simd_prefix) {
+            /* x86 integer-suffix convention: B/W/D/Q = byte/word/
+             * dword/qword = 1/2/4/8 bytes (PEXTRW etc.). */
             switch (c) {
             case 'b': return 1;
             case 'w': return 2;
@@ -795,6 +808,57 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 op->index_name[0] = '\0';
                 op->index_id   = 0;
                 op->imm = 0;
+                break;
+            }
+            /* Capstone exposes no operand size for MIPS, but MSA
+             * vector registers (MIPS_REG_W0..W31) are a fixed
+             * 128-bit width and an MSA load/store moves the whole
+             * 16-byte vector; the per-element width is the
+             * .b/.h/.w/.d suffix already in insn_lane_bytes.  Derive
+             * op->size so the lane-mask refiner computes the exact
+             * lane count (lanes = 16 / lane_bytes) instead of
+             * skipping on size==0.  GPR operands of MSA insns
+             * (insert/copy/ctcmsa) keep size 0 — they are scalar. */
+            if (op->type == QEMU_PLUGIN_OP_REG
+                && op->reg_id >= MIPS_REG_W0
+                && op->reg_id <= MIPS_REG_W31) {
+                op->size = 16;
+            } else if (op->type == QEMU_PLUGIN_OP_MEM
+                       && insn_lane_bytes) {
+                op->size = 16;
+            }
+        }
+        /*
+         * Capstone 6.0.0 MIPS MSA access-flag bug workaround.
+         *
+         * Scalar MIPS loads/stores get a correct CS_AC_READ/WRITE on
+         * their MEM operand, but the MSA vector load/store family
+         * (LD.{B,H,W,D} / ST.{B,H,W,D}) reports the MEM operand with
+         * access == 0.  Uncorrected, the operand walker never gates
+         * the HAS_ADDR address-dependency block, so an MSA load is
+         * modelled as a bare base-register move (no ld slot / laddr
+         * group) — the same dropped-load-latency footgun the scalar
+         * access forwarding fixed.  Infer the missing direction from
+         * the W-register operand: an MSA load writes the W reg (MEM
+         * is READ); an MSA store reads it (MEM is WRITTEN).  Revisit
+         * when Capstone is bumped past 6.0.0.
+         */
+        for (uint8_t i = 0; i < n; i++) {
+            qemu_plugin_operand *mem = &out->operands[i];
+            if (mem->type != QEMU_PLUGIN_OP_MEM || mem->access != 0
+                || !insn_lane_bytes) {
+                continue;
+            }
+            for (uint8_t j = 0; j < n; j++) {
+                const qemu_plugin_operand *wreg = &out->operands[j];
+                if (wreg->type != QEMU_PLUGIN_OP_REG
+                    || wreg->reg_id < MIPS_REG_W0
+                    || wreg->reg_id > MIPS_REG_W31) {
+                    continue;
+                }
+                mem->access = (wreg->access & QEMU_PLUGIN_OP_ACC_WRITE)
+                    ? QEMU_PLUGIN_OP_ACC_READ
+                    : QEMU_PLUGIN_OP_ACC_WRITE;
                 break;
             }
         }

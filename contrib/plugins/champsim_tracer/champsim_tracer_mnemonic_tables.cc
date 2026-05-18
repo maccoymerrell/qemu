@@ -387,6 +387,39 @@ void dep_x86_stack_pop(const struct qemu_plugin_insn_info *info,
 void dep_passthrough(const struct qemu_plugin_insn_info *info, InsnFields *f)
 {
     (void)info;
+    /*
+     * Multi-destination pure load.  Two real shapes land here with
+     * n_dst_regs > 1:
+     *   - SVE LD1* whose Capstone Z-register destination and the
+     *     QEMU-side V-register alias are counted as two distinct
+     *     generic dst slots (the z<->v aliasing);
+     *   - NEON structure loads LD2/LD3/LD4 { vN..vN+k } with a
+     *     register-list destination.
+     * Both are "every destination register is produced by the load
+     * data" — the same pass-through dataflow as the single-dst form,
+     * just wider.  The strict n_dst_regs == 1 guard below would bail
+     * and emit no HAS_REG block, which the consumer renders as a
+     * dst that depends on nothing — i.e. a load with no load
+     * latency (the register-move footgun).  Bind every dst to the
+     * load-data slot(s).  OR-ing all load slots into each dst is a
+     * sound over-approximation for the multi-load structure forms
+     * (per-element precision would need structure metadata); the
+     * correctness property that matters — the dst waits on memory,
+     * not on a 1-cycle register move — is preserved.
+     */
+    if (f->max_dep_stores == 0 && f->max_dep_loads > 0
+        && f->n_dst_regs > 1) {
+        uint64_t m = 0;
+        for (uint8_t l = 0; l < f->max_dep_loads; l++) {
+            m |= ((uint64_t)1 << (f->n_src_regs + l));
+        }
+        for (uint8_t d = 0; d < f->n_dst_regs && d < MAX_DST_REGS;
+             d++) {
+            f->dst_dep_mask[d] = m;
+        }
+        f->has_reg_deps = true;
+        return;
+    }
     if (f->n_dst_regs == 1 && f->max_dep_stores == 0) {
         uint64_t m = 0;
         if (f->max_dep_loads > 0) {

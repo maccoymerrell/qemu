@@ -985,50 +985,71 @@ void append_dep_mask(std::string &line, uint64_t m,
                      const cst::Instruction *insn = nullptr,
                      uint64_t sink_lanes = 0)
 {
-    line.push_back('[');
-    bool any = false;
-    auto sep = [&]() {
-        if (any) line.push_back(',');
-        any = true;
-    };
     unsigned n_src = (unsigned)src_regs.size();
     const bool annotate_lanes = ctx.show_lanes && insn != nullptr;
-    /* Lane refinement: a lane-structured input is listed only where
-     * its lanes intersect the sink's. */
-    auto feeds = [&](uint64_t in_lane) -> bool {
-        if (!annotate_lanes || !sink_lanes) return true;
-        if (!in_lane) return true;            /* scalar / imm: unfiltered */
-        return (in_lane & sink_lanes) != 0;
+
+    /* Build the comma-separated input list into @inner.  @filter
+     * applies the per-lane refinement (a lane-structured input is
+     * listed only where its lanes intersect the sink's); when false
+     * the raw mask is rendered with no lane gating. */
+    auto build = [&](bool filter) -> std::string {
+        std::string inner;
+        bool any = false;
+        auto sep = [&]() {
+            if (any) inner.push_back(',');
+            any = true;
+        };
+        auto feeds = [&](uint64_t in_lane) -> bool {
+            if (!filter || !sink_lanes) return true;
+            if (!in_lane) return true;        /* scalar / imm: unfiltered */
+            return (in_lane & sink_lanes) != 0;
+        };
+        for (unsigned i = 0; i < n_src; i++) {
+            if (m & ((uint64_t)1 << i)) {
+                uint64_t il = annotate_lanes
+                                  ? lane_at(insn->src_lane_mask, i) : 0;
+                if (!feeds(il)) continue;
+                sep();
+                append_regref(&inner, ctx, src_regs[i]);
+                if (annotate_lanes) {
+                    append_lane_set(&inner, il);
+                }
+            }
+        }
+        for (unsigned i = 0; i < n_loads; i++) {
+            if (m & ((uint64_t)1 << (n_src + i))) {
+                uint64_t il = annotate_lanes
+                                  ? lane_at(insn->load_data_lane_mask, i)
+                                  : 0;
+                if (!feeds(il)) continue;
+                sep();
+                inner.append("ld");
+                inner.append(std::to_string(i));
+                if (annotate_lanes) {
+                    append_lane_set(&inner, il);
+                }
+            }
+        }
+        if (m & ((uint64_t)1 << (n_src + n_loads))) {
+            sep();
+            inner.append("imm");
+        }
+        return inner;
     };
-    for (unsigned i = 0; i < n_src; i++) {
-        if (m & ((uint64_t)1 << i)) {
-            uint64_t il = annotate_lanes
-                              ? lane_at(insn->src_lane_mask, i) : 0;
-            if (!feeds(il)) continue;
-            sep();
-            append_regref(&line, ctx, src_regs[i]);
-            if (annotate_lanes) {
-                append_lane_set(&line, il);
-            }
-        }
+
+    std::string inner = build(annotate_lanes);
+    /* Lane refinement narrows per-lane attribution; it must never
+     * make a real dependency vanish.  If filtering dropped every
+     * input but the mask is non-empty (seen with SVE scalable-vector
+     * loads, whose static dst lane set degenerates to {0} while the
+     * dynamic load-data lane mask spans the real byte lanes — they
+     * don't intersect), fall back to the unfiltered list so the
+     * dependency stays visible and matches the no-lanes rendering. */
+    if (inner.empty() && annotate_lanes && m != 0) {
+        inner = build(false);
     }
-    for (unsigned i = 0; i < n_loads; i++) {
-        if (m & ((uint64_t)1 << (n_src + i))) {
-            uint64_t il = annotate_lanes
-                              ? lane_at(insn->load_data_lane_mask, i) : 0;
-            if (!feeds(il)) continue;
-            sep();
-            line.append("ld");
-            line.append(std::to_string(i));
-            if (annotate_lanes) {
-                append_lane_set(&line, il);
-            }
-        }
-    }
-    if (m & ((uint64_t)1 << (n_src + n_loads))) {
-        sep();
-        line.append("imm");
-    }
+    line.push_back('[');
+    line.append(inner);
     line.push_back(']');
 }
 

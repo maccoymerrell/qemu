@@ -417,6 +417,7 @@ static bool cap_decode_aarch64_vas(unsigned vas,
                                    uint8_t *total_bytes);
 static uint8_t cap_lane_bytes_from_mnemonic(const char *mnem);
 static bool cap_x86_is_extract_store(const char *mnem);
+static bool cap_x86_is_move_family(const char *mnem);
 
 /*
  * Extract per-operand detail for x86 into the plugin operand struct.
@@ -435,6 +436,35 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
      * family) reports its r/m destination READ-only.  Force WRITE on
      * the MEM operand below. */
     bool extract_store = cap_x86_is_extract_store(insn->mnemonic);
+    /* Capstone-6.0.0 bug: some store-form data moves (VMOVDQA /
+     * MOVUPS / VMOVUPS ...) report the MEM destination READ-only and
+     * also report no register written, so the whole insn looks
+     * read-only.  Operand order cannot disambiguate — QEMU runs
+     * Capstone in AT&T syntax, which reverses the detail operand
+     * array, so a load's MEM operand is also operand 0.  Use the
+     * access pattern instead: a move-family insn that has both a MEM
+     * and a register operand yet no operand carries WRITE access is
+     * a store whose MEM target lost its WRITE flag (a real load
+     * always has its destination register marked WRITE).  Correctly
+     * reported stores (MOVAPS / MOVDQU, MEM already WRITE) and all
+     * loads keep an operand with WRITE and are left untouched. */
+    bool mv_fam = cap_x86_is_move_family(insn->mnemonic);
+    bool mv_has_mem = false, mv_has_reg = false, mv_any_write = false;
+    if (mv_fam) {
+        for (uint8_t k = 0; k < n; k++) {
+            const cs_x86_op *o = &x86->operands[k];
+            if (o->type == X86_OP_MEM) {
+                mv_has_mem = true;
+            } else if (o->type == X86_OP_REG) {
+                mv_has_reg = true;
+            }
+            if (o->access & QEMU_PLUGIN_OP_ACC_WRITE) {
+                mv_any_write = true;
+            }
+        }
+    }
+    bool move_store = mv_fam && mv_has_mem && mv_has_reg
+        && !mv_any_write;
 
     for (uint8_t i = 0; i < n; i++) {
         const cs_x86_op *cop = &x86->operands[i];
@@ -480,7 +510,7 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
             op->scale = (uint8_t)cop->mem.scale;
             /* Capstone-6.0.0-Alpha7 bug: the r/m destination of a
              * store-form extract is the write target, not a read. */
-            if (extract_store) {
+            if (extract_store || move_store) {
                 op->access = QEMU_PLUGIN_OP_ACC_WRITE;
             }
             break;
@@ -555,6 +585,39 @@ static bool cap_x86_is_extract_store(const char *mnem)
     if (mnem[0] == 'v') mnem++;            /* VEX/EVEX prefix */
     return g_str_has_prefix(mnem, "pextr") ||
            g_str_equal(mnem, "extractps");
+}
+
+/*
+ * Capstone 6.0.0 x86 store-move access-flag bug workaround.
+ *
+ * The pure data-move family (MOV{APS,UPS,APD,UPD,DQA,DQU},
+ * MOVNT{PS,PD,DQ}, MOVSS/MOVSD, MOVLPS/HPS/LPD/HPD and their VEX
+ * forms) can be either a load ("mov xmm, [mem]") or a store
+ * ("mov [mem], xmm").  This Capstone version is inconsistent on the
+ * store form: VMOVDQA / MOVUPS / VMOVUPS report the MEM destination
+ * READ-only (and no register written) while MOVAPS / MOVDQU report
+ * it WRITE.  This predicate only identifies family membership; the
+ * load/store disambiguation is done by the caller from the operand
+ * access pattern (operand order is unusable — QEMU drives Capstone
+ * in AT&T syntax, which reverses the detail operand array).  Without
+ * the correction the operand walker models a vector store as a
+ * phantom load (laddr/ld block instead of sdata/saddr) — the
+ * dropped-store / wrong-latency footgun.  Revisit when Capstone is
+ * bumped past 6.0.0.
+ */
+static bool cap_x86_is_move_family(const char *mnem)
+{
+    if (!mnem || !mnem[0]) return false;
+    if (mnem[0] == 'v') mnem++;            /* VEX/EVEX prefix */
+    if (!g_str_has_prefix(mnem, "mov")) return false;
+    /* Sign/zero-extending and string moves never take a MEM
+     * operand 0 (their destination is a register); excluding them
+     * keeps the rule "MEM op0 of a move ⇒ store target" exact. */
+    return !g_str_has_prefix(mnem, "movsx") &&
+           !g_str_has_prefix(mnem, "movzx") &&
+           !g_str_has_prefix(mnem, "movsxd") &&
+           !g_str_has_prefix(mnem, "movbe") &&
+           !g_str_has_prefix(mnem, "movmsk");
 }
 
 static uint8_t cap_lane_bytes_from_mnemonic(const char *mnem)
@@ -829,34 +892,37 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             }
         }
         /*
-         * Capstone 6.0.0 MIPS MSA access-flag bug workaround.
+         * Capstone 6.0.0 MIPS access-flag bug workaround.
          *
-         * Scalar MIPS loads/stores get a correct CS_AC_READ/WRITE on
-         * their MEM operand, but the MSA vector load/store family
-         * (LD.{B,H,W,D} / ST.{B,H,W,D}) reports the MEM operand with
-         * access == 0.  Uncorrected, the operand walker never gates
-         * the HAS_ADDR address-dependency block, so an MSA load is
-         * modelled as a bare base-register move (no ld slot / laddr
-         * group) — the same dropped-load-latency footgun the scalar
-         * access forwarding fixed.  Infer the missing direction from
-         * the W-register operand: an MSA load writes the W reg (MEM
-         * is READ); an MSA store reads it (MEM is WRITTEN).  Revisit
-         * when Capstone is bumped past 6.0.0.
+         * Scalar aligned MIPS loads/stores get a correct
+         * CS_AC_READ/WRITE on their MEM operand, but two families
+         * report the MEM operand with access == 0:
+         *   - MSA vector LD/ST (LD.{B,H,W,D} / ST.{B,H,W,D});
+         *   - unaligned scalar LWL/LWR/LDL/LDR/SWL/SWR/SDL/SDR.
+         * Uncorrected, the operand walker never gates the HAS_ADDR
+         * address-dependency block, so the load is modelled as a
+         * bare base-register move (no ld slot / laddr group) — the
+         * dropped-load-latency footgun the scalar access forwarding
+         * fixed for the aligned forms.  MIPS has no address-only
+         * MEM-operand form (no LEA equivalent — addresses are
+         * computed with ADDIU), so a 0-access MIPS MEM operand is
+         * always this defect and the direction can be inferred from
+         * the data register operand: a load writes it (MEM is READ),
+         * a store reads it (MEM is WRITTEN).  Revisit when Capstone
+         * is bumped past 6.0.0.
          */
         for (uint8_t i = 0; i < n; i++) {
             qemu_plugin_operand *mem = &out->operands[i];
-            if (mem->type != QEMU_PLUGIN_OP_MEM || mem->access != 0
-                || !insn_lane_bytes) {
+            if (mem->type != QEMU_PLUGIN_OP_MEM || mem->access != 0) {
                 continue;
             }
             for (uint8_t j = 0; j < n; j++) {
-                const qemu_plugin_operand *wreg = &out->operands[j];
-                if (wreg->type != QEMU_PLUGIN_OP_REG
-                    || wreg->reg_id < MIPS_REG_W0
-                    || wreg->reg_id > MIPS_REG_W31) {
+                const qemu_plugin_operand *reg = &out->operands[j];
+                if (reg->type != QEMU_PLUGIN_OP_REG
+                    || reg->access == 0) {
                     continue;
                 }
-                mem->access = (wreg->access & QEMU_PLUGIN_OP_ACC_WRITE)
+                mem->access = (reg->access & QEMU_PLUGIN_OP_ACC_WRITE)
                     ? QEMU_PLUGIN_OP_ACC_READ
                     : QEMU_PLUGIN_OP_ACC_WRITE;
                 break;

@@ -389,5 +389,6 @@ counter so a segment boundary invalidates every cell in O(1).  The
 state-cell layout (``FIELD_STATE_SLOT_COUNT``) is a compile-time
 constant shared by this decoder and the writer; adding a new field
 family changes it in both.  This is a source-level coupling of the
-offline tools, not a wire-format version — the trace stays
-self-describing through its ``field_id`` map.
+offline tools, independent of the wire format's ``CST_MAGIC``
+epoch; the trace stays self-describing through its ``field_id``
+map.

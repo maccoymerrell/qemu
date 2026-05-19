@@ -1,9 +1,12 @@
 # champsim_tracer Binary Format
 
-Status: current. This document describes the on-disk `.cst` stream
-written by `champsim_tracer_output.cc` and decoded by `cst_decode`.
-The tracer is pre-release; the on-wire layout below is the only
-shape ever produced and the only shape `cst_decode` reads.
+Status: **pre-release v0.9, frozen.** This document describes the
+on-disk `.cst` stream written by `champsim_tracer_output.cc` and
+decoded by `cst_decode`.  The layout below is the only shape ever
+produced and the only shape `cst_decode` reads.  See *Format
+Stability and Conformance* (below) for the freeze contract, the
+minimum a conformant trace must carry, and the forward-
+compatibility rules.
 
 All multi-byte fixed-width integers are little-endian. Variable-width
 integers use DWARF-style LEB128:
@@ -11,18 +14,25 @@ integers use DWARF-style LEB128:
 ```
 ULEB        unsigned LEB128, value fits in u64
 SLEB        signed LEB128, value fits in i64
-ULEB_WIDE   unsigned LEB128, value fits in u512 (8 little-endian
-            limbs of u64).  Same continuation-bit format as ULEB;
-            the only difference is that decoders accumulate into
-            8 limbs, not one — used for EXTRA_*_DATA elements.
+ULEB_WIDE   unsigned LEB128 whose value fits in u512 (8
+            little-endian u64 limbs).  Same continuation-bit
+            format as ULEB; decoders accumulate into 8 limbs
+            instead of one.  Defines the wide-LEB shape that
+            SLEB_WIDE is the signed form of.
 SLEB_WIDE   signed LEB128, value fits in i512 (sign extension via
             the high bit of the final byte's 7-bit payload).
-            Used for field-delta values in the body stream
-            (memop addresses, vector data, etc.).
+            The wide field-delta value in the body stream (memop
+            addresses, vector / register data, etc.).
 u8          one byte
 u32         four bytes, little-endian
 u64         eight bytes, little-endian
+f64         eight bytes, little-endian IEEE-754 binary64
 ```
+
+Every fixed-width integer/float in this format is little-endian;
+the recipe sometimes writes the explicit suffix form (`u32_le`,
+`f64_le`) at a field for emphasis — it denotes exactly the same
+encoding as the unsuffixed token above.
 
 Strings are length-prefixed UTF-8 byte strings:
 
@@ -47,6 +57,93 @@ recipe steps that produce the relevant bytes.
 
 ---
 
+# Format Stability and Conformance
+
+## Freeze and the magic epoch
+
+This wire format is frozen as pre-release **v0.9**.  `CST_MAGIC`
+(`0x1D545343`) is the format-epoch identifier.  It stays fixed for
+the whole pre-release; iteration during pre-release changes the
+layout freely *without* touching the magic.  When formal releases
+begin, a structurally breaking change (a different record shape,
+step order, or mandatory-field set) bumps `CST_MAGIC` — that is the
+intended signal for "not the same format", not a forbidden act.
+Within one epoch, only *additive* evolution is allowed, and it
+needs no magic change because every numeric domain resolves through
+the per-trace encoding maps and body records are self-delimiting.
+
+## Forward compatibility (normative)
+
+* **Encoding maps are open.**  A reader MUST build maps generically
+  (Step 3) and MUST tolerate maps, and map entries, it does not
+  recognise — extra ones are not an error.  A reader MUST resolve
+  every value it acts on through the maps, never by a hard-coded
+  number.
+* **Reserved bits are reserved.**  Writers MUST write every
+  reserved flag/field bit as 0.  Readers MUST consider only the
+  bits they recognise; an unrecognised bit being set is not by
+  itself an error.
+* **Field-delta records are self-delimiting and skippable.**  Each
+  body field-delta record is `ipos_delta:ULEB, fid:ULEB,
+  delta:SLEB_WIDE` (plus, only for `CST_FID_EXTENDED`, a trailing
+  `ext_payload:ULEB`).  A reader that does not recognise `fid` MUST
+  still consume the whole record — the LEB framing fixes its length
+  unambiguously — and continue.  This is the format's per-record
+  extension point: new per-instruction observations are added as
+  new field-IDs that older readers skip.
+* **The body-tag space is closed.**  Top-level `BODY_TAG_*` records
+  are not self-delimiting without knowing the tag, so a reader MUST
+  reject an unknown `body_tag`.  A new record *kind* is therefore
+  not an additive change; it requires a new epoch (a formal-release
+  magic bump).  Extend per record via field-IDs, not new tags.
+
+## Minimum conformant trace (normative)
+
+A producer that lacks the optional information can still emit a
+valid `.cst`.  The irreducible content a conformant trace MUST
+carry:
+
+* **Container:** a tar with one `header.cst*` and one `body.cst*`
+  member; the body bracketed by the two `CST_MAGIC` markers.
+* **Header:** magic; isa; flags; the four window ULEBs;
+  `simpoint_weight` (`0.0` when not a simpoint); the four header
+  strings (any may be empty); an encoding-maps section that
+  enumerates every well-known name Step 3.3 lists; and the
+  templates section.
+* **Per template:** `template_id`, `start_pc`, `num_insns`,
+  `fall_through_pc` (0 if the last insn is not a branch),
+  `n_targets` (0 if not a branch), `symbol_name` (may be empty),
+  and `num_insns` per-insn descriptors.
+* **Per insn:** `pc_delta`, `opcode`, `branch_type`, `flags`,
+  `n_src`, `n_dst`, `src_regs[]`, `dst_regs[]`, `max_dep_loads`,
+  `max_dep_stores`, `insn_size`, `insn_bytes[insn_size]`.
+* **Body:** a leading `BODY_TAG_THREAD_SWITCH`; one
+  `BODY_TAG_ENTRY` per correct-path BB invocation; and for every
+  memop an instruction issues, that memop's effective address
+  (`CST_FID_LOAD_ADDR{k}` / `CST_FID_STORE_ADDR{k}`) together with
+  the `CST_FID_N_LOADS` / `CST_FID_N_STORES` counts; a terminating
+  `BODY_TAG_END` carrying the `BODY_TAG_ENTRY` count.
+
+Everything else is optional and its absence is signalled in-band —
+a producer omits it by clearing the gate, and a reader detects the
+absence by the same gate:
+
+| Optional content | Absent when |
+|---|---|
+| Load/store data *values* | `CST_FLAG_MEM_DATA` clear |
+| Destination-register snapshots | `CST_FLAG_REG_DATA` clear |
+| Per-template profile block (§6) | `CST_FLAG_PROFILE` clear |
+| Per-insn dependency sub-block | insn's `CST_INSN_FLAG_HAS_DEP_BLOCK` clear |
+| Immediate value | insn's `CST_INSN_FLAG_HAS_IMM` clear |
+| Raw instruction bytes | `insn_size == 0` (disasm unavailable; opcode/regs still define semantics) |
+| Vector lane masks | insn's `CST_INSN_FLAG_VEC` clear |
+| Branch-target history | `n_targets == 0` |
+| Symbol name | empty `symbol_name` |
+| Wrong-path chain | `num_wp == 0` |
+| Validation IFRAMEs | record simply absent (pure redundancy) |
+
+---
+
 # Part I: Decoder Recipe
 
 ## Step 0: One-time preparation
@@ -56,11 +153,14 @@ header member (Step 1):
 
 * `template_by_id` — map from `template_id : u32` to a parsed
   `Template` (start_pc, num_insns, per-insn descriptors).
-* `encoding_maps` — ten maps (`opcode`, `branch_type`,
+* `encoding_maps` — twelve maps (`opcode`, `branch_type`,
   `reg`, `field_id`, `header_flag`, `insn_flag`, `body_tag`,
-  `wp_event_flag`, `metaflags`, `dep_block_flag`), each
+  `wp_event_flag`, `metaflags`, `dep_block_flag`,
+  `mem_access_pattern`, `profile_flag`), each
   `value : u64 → name : string`.  Built from the encoding-maps
-  section in Step 1.
+  section in Step 1.  (Parsing is generic — Step 3 reads whatever
+  maps the section lists — so this enumeration is the set the
+  writer emits, not a closed set a decoder must hard-expect.)
 * `ids` — the well-known numeric IDs the decoder will dispatch on,
   resolved by reverse-lookup of canonical names through
   `encoding_maps` (e.g. `ids.body_tag_entry = encoding_maps.body_tag["BODY_TAG_ENTRY"]`).
@@ -168,10 +268,14 @@ self-describing.  Decode it into a fresh `encoding_maps` table.
                          families — see Reference §5.2.)
        insn_flag:       CST_INSN_FLAG_BRANCH_COND,
                         CST_INSN_FLAG_HAS_IMM,
+                        CST_INSN_FLAG_ATOMIC,
+                        CST_INSN_FLAG_VEC,
+                        CST_INSN_FLAG_LANE_PARALLEL,
                         CST_INSN_FLAG_HAS_DEP_BLOCK
        dep_block_flag:  CST_DEP_BLOCK_HAS_REG,
                         CST_DEP_BLOCK_HAS_ADDR
-       header_flag:     CST_FLAG_MEM_DATA, CST_FLAG_REG_DATA
+       header_flag:     CST_FLAG_MEM_DATA, CST_FLAG_REG_DATA,
+                        CST_FLAG_PROFILE
        wp_event_flag:   CST_WP_EVENT_TRANSLATION_UNAVAIL,
                         CST_WP_EVENT_FAULT
        metaflags:       CST_METAFLAGS_Z/N/C/V/P
@@ -918,18 +1022,11 @@ current_value = (baseline + delta) mod 2**512
 Scalar values are little-endian unsigned integers with a 512-bit cap.
 The two's-complement modular delta is emitted as one signed LEB value.
 Small 32-bit and 64-bit values still encode as short LEBs; wide vector
-register and memory values can occupy up to 512 bits.
+register and memory values can occupy up to 512 bits.  Every body
+record is a scalar delta — there is no raw-vector / `EXTRA_*` record
+shape; all memops are addressed through the slotted families.
 
-`EXTRA_*` records use a raw vector payload instead of a scalar delta:
-
-```
-raw_vector:
-  n_values : ULEB
-  repeat n_values times:
-    value : ULEB       unsigned raw value, not delta-coded
-```
-
-Only scalar records update persistent field state. State is keyed by
+Scalar delta records update persistent field state. State is keyed by
 `(template_id, ins_pos, field_id)`:
 
 ```

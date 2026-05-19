@@ -327,8 +327,15 @@ def _cmp_entry(key: str, ref: dict, cur: dict) -> list[str]:
                          f"cur={str(cur.get('disasm_sha'))[:12]}")
         keys = ref["audit"].keys()
     else:
-        # wp1 (WP-on-uninitialised-memory residue) and all mcf:
-        # only the run-stable aggregate subset is a valid oracle.
+        # wp1 and all mcf: aggregate subset only.  Note the wp1
+        # template *set* is itself run-to-run nondeterministic (which
+        # BBs the wrong path discovers depends on speculative branch
+        # directions, i.e. WP residue — even for a static-CFG genval
+        # program), so neither the body stream nor the template
+        # dictionary is byte-checkable here; only the run-stable
+        # aggregate counts are.  WP-path correctness is covered by
+        # the genval validator's WP assertions plus the CP-side
+        # byte oracle (CP shares the template/commit machinery).
         keys = _WP_STABLE_KEYS
     for k in keys:
         rv = ref["audit"].get(k)

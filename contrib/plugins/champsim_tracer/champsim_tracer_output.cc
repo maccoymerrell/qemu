@@ -515,6 +515,213 @@ struct BodyStreamState {
 /* ========================= Template dictionary ========================= */
 
 /*
+ * Terminal-branch target table entry (header target list + the §6
+ * per-target taken/not-taken counts share this).
+ */
+struct ProfTgt {
+    uint64_t pc, t_cp, nt_cp, t_wp, nt_wp;
+};
+
+/*
+ * Build the terminal-branch target table.  Target history is a
+ * per-PC property: BranchRecord is a per-PC pool shared by every
+ * template whose last insn sits at that PC, so a WP-discovered
+ * template may surface a co-located branch's CP history (accepted,
+ * not a violation).  Uniform layout:
+ *   - not a branch        -> empty
+ *   - non-indirect branch -> 1 entry, taken edge (tmpl->taken_pc;
+ *                            0 if never resolved)
+ *   - indirect / return   -> #distinct CP-observed targets
+ *                            (<= BRANCH_TARGET_HISTORY)
+ * fall_through_pc is the not-taken edge and its single source of
+ * truth — never repeated here.  note_target() never runs during WP,
+ * so the indirect set is CP-only; the WP indirect aggregate (no
+ * per-target WP distribution) is attributed to target[0].
+ */
+static std::vector<ProfTgt> build_prof_targets(const BBTemplate *tmpl)
+{
+    std::vector<ProfTgt> prof_tgts;
+    const TemplateProfile *pp = tmpl->profile;
+    const InsnFields *last = tmpl->n_insns > 0
+        ? &tmpl->insn_fields[tmpl->n_insns - 1] : nullptr;
+    uint64_t bt_cp = pp ? pp->br_taken_cp : 0;
+    uint64_t bnt_cp = pp ? pp->br_nottaken_cp : 0;
+    uint64_t bt_wp = pp ? pp->br_taken_wp : 0;
+    uint64_t bnt_wp = pp ? pp->br_nottaken_wp : 0;
+    if (last && last->branch_type != BRANCH_NONE) {
+        bool indirect =
+            last->branch_type == BRANCH_INDIRECT_JUMP ||
+            last->branch_type == BRANCH_RETURN;
+        if (indirect) {
+            const BranchRecord *br = g_branch_history.find(
+                tmpl->insn_pcs[tmpl->n_insns - 1]);
+            if (br) {
+                uint64_t tot_cp = 0;
+                for (uint8_t k = 0; k < BRANCH_TARGET_HISTORY; k++) {
+                    if (br->targets[k].valid) {
+                        tot_cp += br->targets[k].count;
+                    }
+                }
+                for (uint8_t k = 0; k < BRANCH_TARGET_HISTORY; k++) {
+                    if (!br->targets[k].valid) continue;
+                    uint64_t c = br->targets[k].count;
+                    bool first = prof_tgts.empty();
+                    prof_tgts.push_back({
+                        br->targets[k].target,
+                        c, tot_cp - c,
+                        first ? bt_wp : 0,
+                        first ? bnt_wp : 0,
+                    });
+                }
+            }
+        } else {
+            /* Non-indirect: one taken edge; its split IS the
+             * terminal branch's aggregate outcome. */
+            prof_tgts.push_back({
+                tmpl->taken_pc,
+                bt_cp, bnt_cp, bt_wp, bnt_wp,
+            });
+        }
+    }
+    return prof_tgts;
+}
+
+/*
+ * Per-insn descriptor records.  Optional dependency sub-block is
+ * dep_block_flags-gated: HAS_REG (refiner inputs feeding each dst /
+ * each store's data) and HAS_ADDR (walker src_regs feeding each
+ * load/store address).  Mask array sizes come from the template
+ * header; bit layouts diverge — HAS_REG addresses the full input
+ * pool (src + load_data + imm), HAS_ADDR omits the load_data band.
+ */
+static void write_insn_descriptors(BitWriter *sub, const BBTemplate *tmpl)
+{
+    uint64_t prev_pc = tmpl->start_pc;
+    for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+        const InsnFields *fld = &tmpl->insn_fields[i];
+        uint64_t pc = tmpl->insn_pcs[i];
+        uint64_t delta = pc - prev_pc;
+        prev_pc = pc;
+
+        bw_write_uleb128(sub, delta);
+        bw_write_u8(sub, fld->opcode);
+        bw_write_u8(sub, fld->branch_type);
+
+        uint8_t flags = 0;
+        if (fld->branch_conditional) {
+            flags |= CST_INSN_FLAG_BRANCH_COND;
+        }
+        if (fld->has_immediate) {
+            flags |= CST_INSN_FLAG_HAS_IMM;
+        }
+        if (fld->is_atomic) {
+            flags |= CST_INSN_FLAG_ATOMIC;
+        }
+        if (fld->has_vec_lanes) {
+            flags |= CST_INSN_FLAG_VEC;
+        }
+        if (fld->lane_parallel) {
+            flags |= CST_INSN_FLAG_LANE_PARALLEL;
+        }
+        if (fld->has_reg_deps || fld->has_addr_deps) {
+            flags |= CST_INSN_FLAG_HAS_DEP_BLOCK;
+        }
+        bw_write_u8(sub, flags);
+
+        bw_write_u8(sub, fld->n_src_regs);
+        bw_write_u8(sub, fld->n_dst_regs);
+        for (uint8_t s = 0; s < fld->n_src_regs; s++) {
+            bw_write_u8(sub, fld->src_regs[s]);
+        }
+        for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
+            bw_write_u8(sub, fld->dst_regs[d]);
+        }
+        bw_write_u8(sub, fld->max_dep_loads);
+        bw_write_u8(sub, fld->max_dep_stores);
+        if (fld->has_immediate) {
+            bw_write_sleb128(sub, fld->immediate);
+        }
+        bw_write_u8(sub, tmpl->insn_sizes[i]);
+        bw_write_bytes(sub,
+                       &tmpl->insn_bytes[(size_t)i * MAX_INSN_BYTES],
+                       tmpl->insn_sizes[i]);
+
+        if (fld->has_reg_deps || fld->has_addr_deps) {
+            uint8_t dep_flags = 0;
+            if (fld->has_reg_deps)  dep_flags |= CST_DEP_BLOCK_HAS_REG;
+            if (fld->has_addr_deps) dep_flags |= CST_DEP_BLOCK_HAS_ADDR;
+            bw_write_u8(sub, dep_flags);
+            if (fld->has_reg_deps) {
+                for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
+                    bw_write_uleb128(sub, fld->dst_dep_mask[d]);
+                }
+                for (uint8_t s = 0; s < fld->max_dep_stores; s++) {
+                    bw_write_uleb128(sub, fld->store_data_dep_mask[s]);
+                }
+            }
+            if (fld->has_addr_deps) {
+                for (uint8_t l = 0; l < fld->max_dep_loads; l++) {
+                    bw_write_uleb128(sub, fld->load_addr_dep_mask[l]);
+                }
+                for (uint8_t s = 0; s < fld->max_dep_stores; s++) {
+                    bw_write_uleb128(sub, fld->store_addr_dep_mask[s]);
+                }
+            }
+        }
+    }
+}
+
+/*
+ * Template profile block (format §6) — always present, after the
+ * last per-insn descriptor.  Run-aggregated PGO metadata; final
+ * totals (templates serialized at segment finish).  Per-target
+ * counts are 1:1 with the header target list (n_targets not
+ * repeated).
+ */
+static void write_template_profile(BitWriter *sub,
+                                   const BBTemplate *tmpl,
+                                   const std::vector<ProfTgt> &prof_tgts)
+{
+    static const TemplateProfile EMPTY_PROFILE = {};
+    const TemplateProfile *p =
+        tmpl->profile ? tmpl->profile : &EMPTY_PROFILE;
+
+    bw_write_uleb128(sub, p->exec_cp);
+    bw_write_uleb128(sub, p->exec_wp);
+
+    for (const ProfTgt &tg : prof_tgts) {
+        bw_write_uleb128(sub, tg.t_cp);
+        bw_write_uleb128(sub, tg.nt_cp);
+        bw_write_uleb128(sub, tg.t_wp);
+        bw_write_uleb128(sub, tg.nt_wp);
+    }
+
+    for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+        const InsnProfile zero = {};
+        const InsnProfile *ip =
+            tmpl->profile ? &p->insns[i] : &zero;
+        bw_write_uleb128(sub, ip->memops_cp);
+        bw_write_uleb128(sub, ip->memops_wp);
+        uint8_t pf = 0;
+        pf |= (ip->pat_cp & CST_PROFILE_PAT_MASK)
+              << CST_PROFILE_PAT_CP_SHIFT;
+        pf |= (ip->pat_wp & CST_PROFILE_PAT_MASK)
+              << CST_PROFILE_PAT_WP_SHIFT;
+        if (ip->addr_cp) pf |= CST_PROFILE_ADDR_CP;
+        if (ip->addr_wp) pf |= CST_PROFILE_ADDR_WP;
+        bw_write_u8(sub, pf);
+        if (ip->memops_cp > 0) {
+            bw_write_uleb128(sub, ip->lo_cp);
+            bw_write_uleb128(sub, ip->hi_cp - ip->lo_cp);
+        }
+        if (ip->memops_wp > 0) {
+            bw_write_uleb128(sub, ip->lo_wp);
+            bw_write_uleb128(sub, ip->hi_wp - ip->lo_wp);
+        }
+    }
+}
+
+/*
  * Write the template dictionary section.  Wire layout (template and
  * per-insn record fields) is specified in champsim_tracer_format.md.
  *
@@ -539,74 +746,7 @@ static void write_bin_templates(BitWriter *bw)
         bw_write_uleb128(&sub, tmpl->n_insns);
         bw_write_uleb128(&sub, tmpl->fall_through_pc);
 
-        /*
-         * Terminal-branch target table (header).  Target history is a
-         * per-PC property: BranchRecord is a per-PC pool shared by
-         * every template whose last insn sits at that PC, so a
-         * WP-discovered template may surface a co-located branch's CP
-         * history (accepted, not a violation).  Uniform layout:
-         *   - not a branch        -> n_targets = 0
-         *   - non-indirect branch -> n_targets = 1, target[0] = taken
-         *                            edge (tmpl->taken_pc; 0 if never
-         *                            resolved)
-         *   - indirect / return   -> n_targets = #distinct CP-observed
-         *                            targets (<= BRANCH_TARGET_HISTORY)
-         * fall_through_pc (above) is the not-taken edge and its single
-         * source of truth — never repeated here.  note_target() never
-         * runs during WP, so the indirect set is CP-only; the WP
-         * indirect aggregate (no per-target WP distribution) is
-         * attributed to target[0] so it is not lost.
-         */
-        struct ProfTgt {
-            uint64_t pc, t_cp, nt_cp, t_wp, nt_wp;
-        };
-        std::vector<ProfTgt> prof_tgts;
-        {
-            const TemplateProfile *pp = tmpl->profile;
-            const InsnFields *last = tmpl->n_insns > 0
-                ? &tmpl->insn_fields[tmpl->n_insns - 1] : nullptr;
-            uint64_t bt_cp = pp ? pp->br_taken_cp : 0;
-            uint64_t bnt_cp = pp ? pp->br_nottaken_cp : 0;
-            uint64_t bt_wp = pp ? pp->br_taken_wp : 0;
-            uint64_t bnt_wp = pp ? pp->br_nottaken_wp : 0;
-            if (last && last->branch_type != BRANCH_NONE) {
-                bool indirect =
-                    last->branch_type == BRANCH_INDIRECT_JUMP ||
-                    last->branch_type == BRANCH_RETURN;
-                if (indirect) {
-                    const BranchRecord *br = g_branch_history.find(
-                        tmpl->insn_pcs[tmpl->n_insns - 1]);
-                    if (br) {
-                        uint64_t tot_cp = 0;
-                        for (uint8_t k = 0; k < BRANCH_TARGET_HISTORY;
-                             k++) {
-                            if (br->targets[k].valid) {
-                                tot_cp += br->targets[k].count;
-                            }
-                        }
-                        for (uint8_t k = 0; k < BRANCH_TARGET_HISTORY;
-                             k++) {
-                            if (!br->targets[k].valid) continue;
-                            uint64_t c = br->targets[k].count;
-                            bool first = prof_tgts.empty();
-                            prof_tgts.push_back({
-                                br->targets[k].target,
-                                c, tot_cp - c,
-                                first ? bt_wp : 0,
-                                first ? bnt_wp : 0,
-                            });
-                        }
-                    }
-                } else {
-                    /* Non-indirect: one taken edge; its split IS the
-                     * terminal branch's aggregate outcome. */
-                    prof_tgts.push_back({
-                        tmpl->taken_pc,
-                        bt_cp, bnt_cp, bt_wp, bnt_wp,
-                    });
-                }
-            }
-        }
+        std::vector<ProfTgt> prof_tgts = build_prof_targets(tmpl);
         bw_write_uleb128(&sub, prof_tgts.size());
         for (const ProfTgt &tg : prof_tgts) {
             bw_write_uleb128(&sub, tg.pc);
@@ -618,139 +758,9 @@ static void write_bin_templates(BitWriter *bw)
             bw_write_bytes(&sub, (const uint8_t *)sym, sym_len);
         }
 
-        uint64_t prev_pc = tmpl->start_pc;
-        for (uint32_t i = 0; i < tmpl->n_insns; i++) {
-            InsnFields *fld = &tmpl->insn_fields[i];
-            uint64_t pc = tmpl->insn_pcs[i];
-            uint64_t delta = pc - prev_pc;
-            prev_pc = pc;
+        write_insn_descriptors(&sub, tmpl);
 
-            bw_write_uleb128(&sub, delta);
-            bw_write_u8(&sub, fld->opcode);
-            bw_write_u8(&sub, fld->branch_type);
-
-            uint8_t flags = 0;
-            if (fld->branch_conditional) {
-                flags |= CST_INSN_FLAG_BRANCH_COND;
-            }
-            if (fld->has_immediate) {
-                flags |= CST_INSN_FLAG_HAS_IMM;
-            }
-            if (fld->is_atomic) {
-                flags |= CST_INSN_FLAG_ATOMIC;
-            }
-            if (fld->has_vec_lanes) {
-                flags |= CST_INSN_FLAG_VEC;
-            }
-            if (fld->lane_parallel) {
-                flags |= CST_INSN_FLAG_LANE_PARALLEL;
-            }
-            if (fld->has_reg_deps || fld->has_addr_deps) {
-                flags |= CST_INSN_FLAG_HAS_DEP_BLOCK;
-            }
-            bw_write_u8(&sub, flags);
-
-            bw_write_u8(&sub, fld->n_src_regs);
-            bw_write_u8(&sub, fld->n_dst_regs);
-            for (uint8_t s = 0; s < fld->n_src_regs; s++) {
-                bw_write_u8(&sub, fld->src_regs[s]);
-            }
-            for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
-                bw_write_u8(&sub, fld->dst_regs[d]);
-            }
-            bw_write_u8(&sub, fld->max_dep_loads);
-            bw_write_u8(&sub, fld->max_dep_stores);
-            if (fld->has_immediate) {
-                bw_write_sleb128(&sub, fld->immediate);
-            }
-            bw_write_u8(&sub, tmpl->insn_sizes[i]);
-            bw_write_bytes(&sub,
-                           &tmpl->insn_bytes[(size_t)i * MAX_INSN_BYTES],
-                           tmpl->insn_sizes[i]);
-
-            /*
-             * Optional dependency sub-block, dep_block_flags-gated:
-             *   HAS_REG  — refiner: inputs feeding each dst reg / each
-             *              store's data
-             *   HAS_ADDR — walker: src_regs feeding each load/store
-             *              ADDRESS (when each memop can fire)
-             * Mask array sizes come from the template header (n_dst,
-             * max_dep_loads, max_dep_stores); only the flags byte +
-             * masks are on the wire.  Bit layouts diverge: HAS_REG
-             * masks address the full input pool (src_regs + load_data
-             * + imm); HAS_ADDR omits the load_data band (addresses are
-             * computed before any load fires).
-             */
-            if (fld->has_reg_deps || fld->has_addr_deps) {
-                uint8_t dep_flags = 0;
-                if (fld->has_reg_deps)  dep_flags |= CST_DEP_BLOCK_HAS_REG;
-                if (fld->has_addr_deps) dep_flags |= CST_DEP_BLOCK_HAS_ADDR;
-                bw_write_u8(&sub, dep_flags);
-                if (fld->has_reg_deps) {
-                    for (uint8_t d = 0; d < fld->n_dst_regs; d++) {
-                        bw_write_uleb128(&sub, fld->dst_dep_mask[d]);
-                    }
-                    for (uint8_t s = 0; s < fld->max_dep_stores; s++) {
-                        bw_write_uleb128(&sub, fld->store_data_dep_mask[s]);
-                    }
-                }
-                if (fld->has_addr_deps) {
-                    for (uint8_t l = 0; l < fld->max_dep_loads; l++) {
-                        bw_write_uleb128(&sub, fld->load_addr_dep_mask[l]);
-                    }
-                    for (uint8_t s = 0; s < fld->max_dep_stores; s++) {
-                        bw_write_uleb128(&sub, fld->store_addr_dep_mask[s]);
-                    }
-                }
-            }
-        }
-
-        /*
-         * Template profile block (format §6) — always present, after
-         * the last per-insn descriptor.  Run-aggregated PGO metadata;
-         * final totals (templates serialized at segment finish).
-         */
-        {
-            static const TemplateProfile EMPTY_PROFILE = {};
-            const TemplateProfile *p =
-                tmpl->profile ? tmpl->profile : &EMPTY_PROFILE;
-
-            bw_write_uleb128(&sub, p->exec_cp);
-            bw_write_uleb128(&sub, p->exec_wp);
-
-            /* Per-target taken/not-taken counts, 1:1 with the header
-             * target list (n_targets not repeated). */
-            for (const ProfTgt &tg : prof_tgts) {
-                bw_write_uleb128(&sub, tg.t_cp);
-                bw_write_uleb128(&sub, tg.nt_cp);
-                bw_write_uleb128(&sub, tg.t_wp);
-                bw_write_uleb128(&sub, tg.nt_wp);
-            }
-
-            for (uint32_t i = 0; i < tmpl->n_insns; i++) {
-                const InsnProfile zero = {};
-                const InsnProfile *ip =
-                    tmpl->profile ? &p->insns[i] : &zero;
-                bw_write_uleb128(&sub, ip->memops_cp);
-                bw_write_uleb128(&sub, ip->memops_wp);
-                uint8_t pf = 0;
-                pf |= (ip->pat_cp & CST_PROFILE_PAT_MASK)
-                      << CST_PROFILE_PAT_CP_SHIFT;
-                pf |= (ip->pat_wp & CST_PROFILE_PAT_MASK)
-                      << CST_PROFILE_PAT_WP_SHIFT;
-                if (ip->addr_cp) pf |= CST_PROFILE_ADDR_CP;
-                if (ip->addr_wp) pf |= CST_PROFILE_ADDR_WP;
-                bw_write_u8(&sub, pf);
-                if (ip->memops_cp > 0) {
-                    bw_write_uleb128(&sub, ip->lo_cp);
-                    bw_write_uleb128(&sub, ip->hi_cp - ip->lo_cp);
-                }
-                if (ip->memops_wp > 0) {
-                    bw_write_uleb128(&sub, ip->lo_wp);
-                    bw_write_uleb128(&sub, ip->hi_wp - ip->lo_wp);
-                }
-            }
-        }
+        write_template_profile(&sub, tmpl, prof_tgts);
 
         bw_byte_align(&sub);
         GByteArray *data = bw_finish_buf(&sub);

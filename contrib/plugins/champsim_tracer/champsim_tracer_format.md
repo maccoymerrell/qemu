@@ -139,7 +139,7 @@ absence by the same gate:
 | Vector lane masks | insn's `CST_INSN_FLAG_VEC` clear |
 | Branch-target history | `n_targets == 0` |
 | Symbol name | empty `symbol_name` |
-| Wrong-path chain | `num_wp == 0` |
+| Wrong-path chain + events (per entry) | `CST_FLAG_WP` clear (both sections omitted from every ENTRY/IFRAME); with the flag set, an individual entry may still carry `num_wp == 0` |
 | Validation IFRAMEs | record simply absent (pure redundancy) |
 
 ---
@@ -275,7 +275,7 @@ self-describing.  Decode it into a fresh `encoding_maps` table.
        dep_block_flag:  CST_DEP_BLOCK_HAS_REG,
                         CST_DEP_BLOCK_HAS_ADDR
        header_flag:     CST_FLAG_MEM_DATA, CST_FLAG_REG_DATA,
-                        CST_FLAG_PROFILE
+                        CST_FLAG_PROFILE, CST_FLAG_WP
        wp_event_flag:   CST_WP_EVENT_TRANSLATION_UNAVAIL,
                         CST_WP_EVENT_FAULT
        metaflags:       CST_METAFLAGS_Z/N/C/V/P
@@ -505,8 +505,11 @@ Loop until a `BODY_TAG_END` is seen:
        cur_template_id = prev_entry_template_id + template_id_delta
        prev_entry_template_id = cur_template_id
        cp_delta_section   : section          ; see Step 6.7
-       wp_chain_section   : section          ; see Step 6.8
-       wp_events_section  : section          ; see Step 6.9
+       if (header.flags & header_flag.CST_FLAG_WP):
+         wp_chain_section  : section          ; see Step 6.8
+         wp_events_section : section          ; see Step 6.9
+       ; when CST_FLAG_WP is clear both sections are absent and the
+       ; entry has no wrong-path chain (num_wp treated as 0).
        seq_num += 1
        Emit a CP body entry tagged (seq_num, cur_template_id,
        prev_thread_id) carrying the cp_delta_section's decoded
@@ -514,8 +517,9 @@ Loop until a `BODY_TAG_END` is seen:
        and the wp_events bits applied to those WPEntries.
 6.5  IFRAME record (validation-only; producers may omit it):
        cp_delta_section   : section
-       wp_chain_section   : section
-       wp_events_section  : section
+       if (header.flags & header_flag.CST_FLAG_WP):
+         wp_chain_section  : section
+         wp_events_section : section
        Decode each section against fresh "nothing observed yet"
        overlays; the values reconstructed must match the
        immediately-preceding ENTRY exactly (template_id, dyn_params,
@@ -696,16 +700,19 @@ There is one shape, and the tools support exactly that shape.
 
 The MEM_DATA / REG_DATA bits are advisory hints about field
 families — the field IDs still determine what actually appears in
-each delta section.  CST_FLAG_PROFILE is structural: it
-gates the presence of the per-template profile block (§4.6 / §6),
-exactly as the per-insn CST_INSN_FLAG_HAS_DEP_BLOCK gates the dep
-sub-block.  Resolve every bit through the `header_flag` map.
+each delta section.  CST_FLAG_PROFILE and CST_FLAG_WP are
+structural: they gate the presence of whole blocks (the
+per-template profile block §4.6/§6, and the per-entry wrong-path
+chain + events sections §6.4/6.5), exactly as the per-insn
+CST_INSN_FLAG_HAS_DEP_BLOCK gates the dep sub-block.  Resolve every
+bit through the `header_flag` map.
 
 ```
-bit 0  CST_FLAG_MEM_DATA          LOAD_DATA / STORE_DATA may appear
-bit 1  CST_FLAG_REG_DATA          DST_REG fields may appear
-bit 2  CST_FLAG_PROFILE  per-template profile block present
-bits 3..7                        reserved, written as 0
+bit 0  CST_FLAG_MEM_DATA   LOAD_DATA / STORE_DATA may appear
+bit 1  CST_FLAG_REG_DATA   DST_REG fields may appear
+bit 2  CST_FLAG_PROFILE    per-template §6 profile block present
+bit 3  CST_FLAG_WP         per-entry wrong-path chain + events present
+bits 4..7                  reserved, written as 0
 ```
 
 Per-instruction template flags:
@@ -910,9 +917,9 @@ wrong-path chain.
 +--------------------------------------------------+
 | cp_delta_section                section          |
 +--------------------------------------------------+
-| wp_chain_section                section          |
+| wp_chain_section                section          |  only if CST_FLAG_WP
 +--------------------------------------------------+
-| wp_events_section               section          |
+| wp_events_section               section          |  only if CST_FLAG_WP
 +--------------------------------------------------+
 ```
 
@@ -971,8 +978,8 @@ writer had, or skip it entirely.
 +--------------------------------------------------+
 | tag = 3                         u8               |
 | cp_delta_section                section          |
-| wp_chain_section                section          |
-| wp_events_section               section          |
+| wp_chain_section                section          |  only if CST_FLAG_WP
+| wp_events_section               section          |  only if CST_FLAG_WP
 +--------------------------------------------------+
 ```
 

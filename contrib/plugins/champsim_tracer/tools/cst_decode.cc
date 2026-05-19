@@ -524,12 +524,15 @@ void BodyWalker::handle_entry(WalkState &ws, const Callback &cb)
                        &entry.dyn_params, &entry.reg_snaps, &entry.metaflags,
                        &entry.lane_masks);
 
-    /* WP chain + events.  Both live in their own length-prefixed
-     * sub-sections of body_. */
-    Reader wpb = body_.sub();
-    entry.wp_entries = decode_wp_chain(wpb, wp_state, &cp_state);
-    Reader evb = body_.sub();
-    decode_wp_events(evb, &entry.wp_entries);
+    /* WP chain + events.  Each is its own length-prefixed
+     * sub-section, present only when the CST_FLAG_WP header bit is
+     * set; otherwise the entry is just its CP delta. */
+    if (flags_ & header_.ids.flag_wp) {
+        Reader wpb = body_.sub();
+        entry.wp_entries = decode_wp_chain(wpb, wp_state, &cp_state);
+        Reader evb = body_.sub();
+        decode_wp_events(evb, &entry.wp_entries);
+    }
 
     entry.thread_id       = ws.current_thread;
     entry.thread_switched = ws.pending_thread_switch;
@@ -584,13 +587,17 @@ void BodyWalker::handle_iframe(WalkState &ws)
                        &iframe_entry.metaflags,
                        &iframe_entry.lane_masks);
 
-    /* WP chain + events.  Mirror the writer's IFRAME emission: the
-     * iframe_wp overlay falls back to iframe_cp as base, matching
+    /* WP chain + events, gated by CST_FLAG_WP exactly as the ENTRY
+     * path.  Mirror the writer's IFRAME emission: the iframe_wp
+     * overlay falls back to iframe_cp as base, matching
      * st->iframe_cp_scratch shared between wp_state and wp_base. */
-    Reader wpb = body_.sub();
-    iframe_entry.wp_entries = decode_wp_chain(wpb, iframe_wp, &iframe_cp);
-    Reader evb = body_.sub();
-    decode_wp_events(evb, &iframe_entry.wp_entries);
+    if (flags_ & header_.ids.flag_wp) {
+        Reader wpb = body_.sub();
+        iframe_entry.wp_entries = decode_wp_chain(wpb, iframe_wp,
+                                                  &iframe_cp);
+        Reader evb = body_.sub();
+        decode_wp_events(evb, &iframe_entry.wp_entries);
+    }
 
     validate_iframe(*ws.prev_entry, iframe_entry);
     stats_.iframe_count++;

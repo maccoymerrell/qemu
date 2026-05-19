@@ -41,7 +41,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 /* ========================= Configuration ========================= */
 
 int max_wrong_path_depth = 64;
-static bool enable_wrong_path = true;
+bool enable_wrong_path = true;
 static char *unknown_warn_path = nullptr;
 static char *program_name = nullptr;
 const char *target_name;

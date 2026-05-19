@@ -157,14 +157,17 @@ extern "C" {
 #define CST_WP_INV_CHAIN_REF      (1u << 0)
 /* bits 1..7 reserved */
 
-/* Header feature flags: advisory hints about optional payload
- * families.  The wire format is uniform — a reader seeing an
- * unexpected field_id MUST tolerate it (champsim_tracer_format.md §4).
- * Sparse insn metadata records need no feature bit. */
+/* Header feature flags.  MEM_DATA / REG_DATA advise which optional
+ * field-ID families may appear (the field IDs still determine actual
+ * presence).  PROFILE / WP are structural gates: they decide whether
+ * a whole block is present (the §6 template profile block, and the
+ * per-entry wrong-path chain + events sections respectively).  See
+ * champsim_tracer_format.md "Format Stability and Conformance". */
 #define CST_FLAG_MEM_DATA      (1 << 0)  /* CST_FID_LOAD_DATA / STORE_DATA */
 #define CST_FLAG_REG_DATA      (1 << 1)  /* CST_FID_DST_REG values        */
-#define CST_FLAG_PROFILE (1 << 2) /* §6 profile block present per template */
-/* bits 3..7 reserved */
+#define CST_FLAG_PROFILE       (1 << 2)  /* §6 profile block per template  */
+#define CST_FLAG_WP            (1 << 3)  /* per-entry WP chain + events    */
+/* bits 4..7 reserved */
 
 /* ===== Field-ID space (unified delta stream) =====
  *
@@ -655,6 +658,7 @@ extern unsigned active_reg_table_size;
 /* Plugin configuration: parsed from -plugin args, immutable after
  * qemu_plugin_install. */
 extern int max_wrong_path_depth;
+extern bool enable_wrong_path;
 extern bool enable_mem_data;
 extern bool enable_reg_data;
 /* WP-side data toggles.  Default to the matching CP-side flag when

@@ -258,9 +258,11 @@ static inline void tally_fd_record(
  * for memory-backed (uncompressed body) and stream-backed
  * (decompressor-piped) inputs; the Reader handles refilling. */
 void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
+               uint8_t header_flags,
                const std::unordered_map<uint32_t, uint32_t> &insns_by_tid,
                Stats *s)
 {
+    const bool have_wp = (header_flags & ids.flag_wp) != 0;
     const FidTables fid(ids);
     int32_t prev_cp_tid = 0;
     auto &cpfd_b = s->cp_fd;
@@ -306,6 +308,11 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
             }
             if (!sec.eof()) {
                 throw std::runtime_error("CP field-delta had trailing bytes");
+            }
+
+            /* WP chain + events present only under CST_FLAG_WP. */
+            if (!have_wp) {
+                continue;
             }
 
             /* WP chain envelope. */
@@ -367,9 +374,11 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
         }
 
         if (tag == ids.body_tag_iframe) {
-            (void)body.sub();
-            (void)body.sub();
-            (void)body.sub();
+            (void)body.sub();                 /* cp delta section */
+            if (have_wp) {
+                (void)body.sub();             /* wp chain section */
+                (void)body.sub();             /* wp events section */
+            }
             s->iframe_count++;
             s->iframe_bytes.bytes += body.consumed() - tag_start;
             continue;
@@ -686,7 +695,8 @@ int main(int argc, char **argv)
                     (unsigned long long)prof_pat[3]);
 
         try {
-            walk_body(body_stream->reader(), h.ids, insns_by_tid, &s);
+            walk_body(body_stream->reader(), h.ids, h.flags,
+                      insns_by_tid, &s);
         } catch (const std::exception &e) {
             std::fprintf(stderr,
                 "cst_audit: body walk failed at cp_entries=%lu wp_entries=%lu thread_switches=%lu iframes=%lu: %s\n",

@@ -312,6 +312,8 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
     resolve_one(maps.header_flag, "header_flag",
                 "CST_FLAG_PROFILE",
                 &ids->flag_profile);
+    resolve_one(maps.header_flag, "header_flag", "CST_FLAG_WP",
+                &ids->flag_wp);
 
     /* wp_event_flag (bit masks) */
     resolve_one(maps.wp_event_flag, "wp_event_flag",

@@ -370,6 +370,7 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         { CST_FLAG_MEM_DATA, "CST_FLAG_MEM_DATA" },
         { CST_FLAG_REG_DATA, "CST_FLAG_REG_DATA" },
         { CST_FLAG_PROFILE, "CST_FLAG_PROFILE" },
+        { CST_FLAG_WP, "CST_FLAG_WP" },
     };
     static const EncodingMapEntry insn_flag_entries[] = {
         { CST_INSN_FLAG_BRANCH_COND, "CST_INSN_FLAG_BRANCH_COND" },
@@ -2376,6 +2377,12 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
     /* Set when each template carries the §6 profile block; clear
      * when the block is omitted. */
     flags |= CST_FLAG_PROFILE;
+    /* Set when entries carry the wrong-path chain + events
+     * sections; clear when wrong-path simulation is off, so a
+     * no-WP trace pays no per-entry WP framing. */
+    if (enable_wrong_path) {
+        flags |= CST_FLAG_WP;
+    }
     bw_write_u8(&st->header_bw, flags);
     st->header_flags = flags;
 
@@ -2548,6 +2555,13 @@ static void emit_body_record_payload(
     emit_one_bb_delta(bw, st, cp_state, entry->template_id, entry->tmpl,
                       &entry->dyn_params, &entry->reg_snaps, false,
                       entry->cpu_index);
+
+    /* The wrong-path chain + events sections follow only when
+     * CST_FLAG_WP is set.  With wrong-path simulation off the entry
+     * is just its CP delta — no per-entry WP framing. */
+    if (!(st->header_flags & CST_FLAG_WP)) {
+        return;
+    }
 
     /* WP chain sub-section */
     {

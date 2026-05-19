@@ -2203,6 +2203,25 @@ static void emit_field_delta_section(BitWriter *main_bw,
         uint32_t state_generation = state->generation;
         uint32_t base_generation = base_state ? base_state->generation : 0;
 
+        /* The descriptor filter (template_static / mem-data /
+         * reg-data gating) depends only on header_flags, which is
+         * constant for this call.  Hoist it out of the per-insn loop
+         * so the hot path iterates only the active descriptors
+         * instead of re-deciding N_FIELD_DESCRIPTORS times per insn.
+         * Wire-identical: same (fd, i, slot) set is processed. */
+        const FieldDescriptor *active[N_FIELD_DESCRIPTORS];
+        size_t n_active = 0;
+        for (size_t d = 0; d < N_FIELD_DESCRIPTORS; d++) {
+            const FieldDescriptor *fd = &field_descriptors[d];
+            if (fd->template_static)
+                continue;
+            if (fd->gated_by_mem_data && !(header_flags & CST_FLAG_MEM_DATA))
+                continue;
+            if (fd->gated_by_reg_data && !(header_flags & CST_FLAG_REG_DATA))
+                continue;
+            active[n_active++] = fd;
+        }
+
         for (uint32_t i = 0; i < ev->tmpl->n_insns; i++) {
             /* Surface memop-count overflow before the slot loop clamps. */
             uint32_t insn_n_loads  = ev->actual_n_loads
@@ -2211,17 +2230,8 @@ static void emit_field_delta_section(BitWriter *main_bw,
                 ? ev->actual_n_stores[i] : 0;
             warn_memop_overflow(ev->tmpl, i, insn_n_loads, insn_n_stores);
 
-            for (size_t d = 0; d < N_FIELD_DESCRIPTORS; d++) {
-                const FieldDescriptor *fd = &field_descriptors[d];
-                /* Template-static families never produce a record
-                 * (cur == base always); skipping them is wire-
-                 * identical to probing and hitting the continue. */
-                if (fd->template_static)
-                    continue;
-                if (fd->gated_by_mem_data && !(header_flags & CST_FLAG_MEM_DATA))
-                    continue;
-                if (fd->gated_by_reg_data && !(header_flags & CST_FLAG_REG_DATA))
-                    continue;
+            for (size_t a = 0; a < n_active; a++) {
+                const FieldDescriptor *fd = active[a];
 
                 uint8_t cap = fd->runtime_slot_cap
                     ? fd->runtime_slot_cap(ev, i)

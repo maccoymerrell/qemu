@@ -143,6 +143,56 @@ static BBTemplatePtr build_bb_template(uint32_t template_id,
     return tmpl;
 }
 
+BBTemplate *BBTemplateCache::find_existing_true_bb(
+    uint64_t start_pc, uint32_t n_insns, const uint64_t *insn_pcs)
+{
+    BBTemplate *existing = find_bb_template(start_pc);
+    if (!existing) {
+        return nullptr;
+    }
+    bool same = (existing->n_insns == n_insns);
+    if (same) {
+        for (uint32_t i = 0; i < n_insns; i++) {
+            if (existing->insn_pcs[i] != insn_pcs[i]) {
+                same = false;
+                break;
+            }
+        }
+    }
+    if (!same) {
+        static std::atomic<int> warned{0};
+        int expected = 0;
+        if (warned.compare_exchange_strong(expected, 1)) {
+            /* First divergence distinguishes a length-only prefix
+             * difference (chain finalized at different lengths)
+             * from a true sequence mismatch (likely SMC). */
+            uint32_t first_diff = 0;
+            uint32_t common = existing->n_insns < n_insns
+                ? existing->n_insns : n_insns;
+            while (first_diff < common &&
+                   existing->insn_pcs[first_diff] ==
+                       insn_pcs[first_diff]) {
+                first_diff++;
+            }
+            fprintf(stderr,
+                "champsim_tracer: WARNING true-BB at start_pc=0x%"
+                PRIx64 " seen with differing insn sequence "
+                "(existing n_insns=%u, new n_insns=%u, "
+                "first_diff at i=%u; "
+                "existing[i]=0x%" PRIx64 ", new[i]=0x%" PRIx64 "). "
+                "Keeping original; this indicates self-modifying "
+                "code or a tracer bug.  (Further occurrences "
+                "suppressed.)\n",
+                start_pc, existing->n_insns, n_insns, first_diff,
+                first_diff < existing->n_insns
+                    ? existing->insn_pcs[first_diff] : 0,
+                first_diff < n_insns
+                    ? insn_pcs[first_diff] : 0);
+        }
+    }
+    return existing;
+}
+
 BBTemplate *BBTemplateCache::commit_true_bb(uint64_t start_pc,
                                             uint32_t n_insns,
                                             const uint64_t *insn_pcs,
@@ -153,48 +203,8 @@ BBTemplate *BBTemplateCache::commit_true_bb(uint64_t start_pc,
                                             const char *symbol_name,
                                             uint64_t fall_through_pc)
 {
-    BBTemplate *existing = find_bb_template(start_pc);
-    if (existing) {
-        bool same = (existing->n_insns == n_insns);
-        if (same) {
-            for (uint32_t i = 0; i < n_insns; i++) {
-                if (existing->insn_pcs[i] != insn_pcs[i]) {
-                    same = false;
-                    break;
-                }
-            }
-        }
-        if (!same) {
-            static std::atomic<int> warned{0};
-            int expected = 0;
-            if (warned.compare_exchange_strong(expected, 1)) {
-                /* First divergence distinguishes a length-only prefix
-                 * difference (chain finalized at different lengths)
-                 * from a true sequence mismatch (likely SMC). */
-                uint32_t first_diff = 0;
-                uint32_t common = existing->n_insns < n_insns
-                    ? existing->n_insns : n_insns;
-                while (first_diff < common &&
-                       existing->insn_pcs[first_diff] ==
-                           insn_pcs[first_diff]) {
-                    first_diff++;
-                }
-                fprintf(stderr,
-                    "champsim_tracer: WARNING true-BB at start_pc=0x%"
-                    PRIx64 " seen with differing insn sequence "
-                    "(existing n_insns=%u, new n_insns=%u, "
-                    "first_diff at i=%u; "
-                    "existing[i]=0x%" PRIx64 ", new[i]=0x%" PRIx64 "). "
-                    "Keeping original; this indicates self-modifying "
-                    "code or a tracer bug.  (Further occurrences "
-                    "suppressed.)\n",
-                    start_pc, existing->n_insns, n_insns, first_diff,
-                    first_diff < existing->n_insns
-                        ? existing->insn_pcs[first_diff] : 0,
-                    first_diff < n_insns
-                        ? insn_pcs[first_diff] : 0);
-            }
-        }
+    if (BBTemplate *existing =
+            find_existing_true_bb(start_pc, n_insns, insn_pcs)) {
         return existing;
     }
 
@@ -203,6 +213,56 @@ BBTemplate *BBTemplateCache::commit_true_bb(uint64_t start_pc,
                                            insn_pcs, insn_fields,
                                            insn_sizes, insn_bytes,
                                            insn_reg_names,
+                                           symbol_name, fall_through_pc);
+    BBTemplate *raw = tmpl.get();
+    bb_map_[start_pc] = std::move(tmpl);
+    g_stats.bb_templates_created++;
+    return raw;
+}
+
+BBTemplate *BBTemplateCache::commit_true_bb_refs(
+    uint64_t start_pc, uint32_t n_insns,
+    const uint64_t *insn_pcs,
+    const InsnFields *const *insn_fields,
+    const uint8_t *insn_sizes, const uint8_t *insn_bytes,
+    const InsnRegNames *const *insn_reg_names,
+    const char *symbol_name, uint64_t fall_through_pc)
+{
+    /* Hot path: BB already templated -> no field payload touched,
+     * the per-WP-visit struct copy is gone entirely. */
+    if (BBTemplate *existing =
+            find_existing_true_bb(start_pc, n_insns, insn_pcs)) {
+        return existing;
+    }
+
+    /* Cold path (first sighting of this BB only): gather the
+     * pointed-to records into a thread-local contiguous scratch
+     * once, then build exactly as the array form does.  O(unique
+     * BBs), not O(WP visits). */
+    thread_local std::vector<InsnFields>   gather_fields;
+    thread_local std::vector<InsnRegNames> gather_regs;
+    if (gather_fields.size() < n_insns) {
+        gather_fields.resize(n_insns);
+    }
+    for (uint32_t i = 0; i < n_insns; i++) {
+        gather_fields[i] = *insn_fields[i];
+    }
+    const InsnRegNames *reg_src = nullptr;
+    if (insn_reg_names) {
+        if (gather_regs.size() < n_insns) {
+            gather_regs.resize(n_insns);
+        }
+        for (uint32_t i = 0; i < n_insns; i++) {
+            gather_regs[i] = *insn_reg_names[i];
+        }
+        reg_src = gather_regs.data();
+    }
+
+    BBTemplatePtr tmpl = build_bb_template(next_template_id_++,
+                                           start_pc, n_insns,
+                                           insn_pcs, gather_fields.data(),
+                                           insn_sizes, insn_bytes,
+                                           reg_src,
                                            symbol_name, fall_through_pc);
     BBTemplate *raw = tmpl.get();
     bb_map_[start_pc] = std::move(tmpl);

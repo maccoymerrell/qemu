@@ -63,6 +63,26 @@ public:
                                const InsnRegNames *insn_reg_names,
                                const char *symbol_name,
                                uint64_t fall_through_pc);
+    /*
+     * Reference variant of commit_true_bb for the wrong-path walker.
+     * @insn_fields / @insn_reg_names are arrays of *pointers* into
+     * stable per-TB-template storage rather than contiguous copies.
+     * The hot path is a BB already templated (commit just returns the
+     * existing record): this variant touches no field payload at all
+     * there — eliminating the per-WP-visit InsnFields/InsnRegNames
+     * struct copy the array form forced.  Only a genuine cache miss
+     * (first sighting of a BB) materialises a contiguous copy, once.
+     * @insn_reg_names may be nullptr (reg-data disabled).
+     */
+    BBTemplate *commit_true_bb_refs(uint64_t start_pc,
+                                    uint32_t n_insns,
+                                    const uint64_t *insn_pcs,
+                                    const InsnFields *const *insn_fields,
+                                    const uint8_t *insn_sizes,
+                                    const uint8_t *insn_bytes,
+                                    const InsnRegNames *const *insn_reg_names,
+                                    const char *symbol_name,
+                                    uint64_t fall_through_pc);
     BBTemplate *get_or_create_bb_template(uint64_t entry_pc,
                                           BBTemplate *const *fragments,
                                           unsigned int n_fragments);
@@ -88,6 +108,14 @@ public:
     void clear_bb_map();
 
 private:
+    /* Shared existing-true-BB handling for commit_true_bb and its
+     * reference variant: returns the cached template (logging a
+     * one-shot SMC/divergence warning if the insn-pc sequence
+     * differs) or nullptr on a true miss.  Uses only insn_pcs. */
+    BBTemplate *find_existing_true_bb(uint64_t start_pc,
+                                      uint32_t n_insns,
+                                      const uint64_t *insn_pcs);
+
     std::unordered_map<uint64_t, BBTemplatePtr> tb_map_;
     std::unordered_map<uint64_t, BBTemplatePtr> bb_map_;
     uint32_t                                    next_template_id_ = 1;

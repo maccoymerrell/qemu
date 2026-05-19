@@ -93,8 +93,17 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     std::vector<uint64_t>     bb_pcs;
     std::vector<uint8_t>      bb_sizes;
     std::vector<uint8_t>      bb_bytes;
-    std::vector<InsnFields>   bb_fields;
-    std::vector<InsnRegNames> bb_regnames;
+    /* Non-owning pointers into stable per-TB-template storage: the
+     * accumulated WP BB is committed by reference, so no InsnFields
+     * / InsnRegNames struct is copied per WP-visited insn (the copy
+     * was wasted entirely whenever the BB was already templated —
+     * the hot case).  A genuine first-sighting commit gathers once,
+     * inside commit_true_bb_refs. */
+    std::vector<const InsnFields *>   bb_fields;
+    std::vector<const InsnRegNames *> bb_regnames;
+    /* Stable zeroed sentinel for the rare reg-data-on-but-template-
+     * has-no-regnames case (keeps a valid pointer to push). */
+    static const InsnRegNames kEmptyRegNames{};
     std::vector<DynParam>     bb_dyn_params;
     std::vector<RegSnap>      bb_reg_snaps;
     bb_pcs.reserve(initial_insn_cap);
@@ -299,7 +308,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             bb_bytes.insert(bb_bytes.end(),
                             &tmpl->insn_bytes[i * MAX_INSN_BYTES],
                             &tmpl->insn_bytes[i * MAX_INSN_BYTES] + MAX_INSN_BYTES);
-            bb_fields.push_back(tmpl->insn_fields[i]);
+            bb_fields.push_back(&tmpl->insn_fields[i]);
 
             /* WP-side per-execution attribution: mirrors the CP walk in
              * vcpu_tb_exec, scoped to non-duplicate WP insns. */
@@ -322,12 +331,9 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             }
 
             if (enable_reg_data) {
-                if (tmpl->insn_reg_names) {
-                    bb_regnames.push_back(tmpl->insn_reg_names[i]);
-                } else {
-                    InsnRegNames empty = {};
-                    bb_regnames.push_back(empty);
-                }
+                bb_regnames.push_back(tmpl->insn_reg_names
+                                      ? &tmpl->insn_reg_names[i]
+                                      : &kEmptyRegNames);
             }
             if (enable_wp_reg_data) {
                 /* Per-insn live read of only the dst regs this insn
@@ -386,7 +392,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         if (!bb_pcs.empty()) {
             size_t last_local = bb_pcs.size() - 1;
             ends_in_branch =
-                (bb_fields[last_local].branch_type != BRANCH_NONE);
+                (bb_fields[last_local]->branch_type != BRANCH_NONE);
         }
 
         if (!tb_ok) {
@@ -457,7 +463,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         uint64_t fall_through = pre_pc + last_insn_size;
 
         g_mutex_lock(&data_lock);
-        BBTemplate *bb_tmpl = g_bb_template_cache.commit_true_bb(
+        BBTemplate *bb_tmpl = g_bb_template_cache.commit_true_bb_refs(
             bb_start_pc, (uint32_t)bb_pcs.size(),
             bb_pcs.data(),
             bb_fields.data(),
@@ -479,7 +485,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
          * value identical anyway).
          */
         if (bb_tmpl && bb_tmpl->taken_pc == 0 && !bb_fields.empty()) {
-            const InsnFields *lf = &bb_fields.back();
+            const InsnFields *lf = bb_fields.back();
             bool indirect =
                 lf->branch_type == BRANCH_INDIRECT_JUMP ||
                 lf->branch_type == BRANCH_RETURN;

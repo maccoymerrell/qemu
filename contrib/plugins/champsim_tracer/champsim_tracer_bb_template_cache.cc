@@ -16,6 +16,11 @@
 
 BBTemplateCache g_bb_template_cache;
 
+/* Stable zeroed sentinel: a fragment may lack insn_reg_names while
+ * reg-data is enabled; the by-reference commit needs a valid pointer
+ * whose pointee is all-zero (matching the old zero-filled scratch). */
+static const InsnRegNames kCacheEmptyRegNames{};
+
 void BBTemplateDeleter::operator()(BBTemplate *t) const noexcept
 {
     if (!t) {
@@ -287,38 +292,42 @@ BBTemplate *BBTemplateCache::get_or_create_bb_template(
      * ~3% of tracer runtime on mcf; reusable per-thread buffers drop
      * the per-finalization malloc/free.  thread_local: this is called
      * only from vcpu_tb_exec on the per-vCPU host thread. */
-    thread_local std::vector<uint64_t>   tls_insn_pcs;
-    thread_local std::vector<uint8_t>    tls_insn_sizes;
-    thread_local std::vector<uint8_t>    tls_insn_bytes;
-    thread_local std::vector<InsnFields> tls_insn_fields;
-    thread_local std::vector<InsnRegNames> tls_insn_reg_names;
+    /* Scratch.  pcs/sizes/bytes stay contiguous (cheap, passed
+     * through to the builder); the InsnFields / InsnRegNames per-insn
+     * structs are NOT copied here — like the WP path, fragment-insn
+     * pointers are gathered and committed by reference, so a BB that
+     * is already templated (the hot case for the re-finalized CP
+     * chain) copies no field payload at all. */
+    thread_local std::vector<uint64_t> tls_insn_pcs;
+    thread_local std::vector<uint8_t>  tls_insn_sizes;
+    thread_local std::vector<uint8_t>  tls_insn_bytes;
+    thread_local std::vector<const InsnFields *>   tls_field_ptrs;
+    thread_local std::vector<const InsnRegNames *> tls_regname_ptrs;
 
     if (tls_insn_pcs.size() < max_insns) {
         tls_insn_pcs.assign(max_insns, 0);
         tls_insn_sizes.assign(max_insns, 0);
         tls_insn_bytes.assign((size_t)max_insns * MAX_INSN_BYTES, 0);
-        tls_insn_fields.assign(max_insns, InsnFields{});
     } else {
         std::fill_n(tls_insn_pcs.begin(),    max_insns, 0);
         std::fill_n(tls_insn_sizes.begin(),  max_insns, 0);
         std::fill_n(tls_insn_bytes.begin(),
                     (size_t)max_insns * MAX_INSN_BYTES, 0);
-        std::fill_n(tls_insn_fields.begin(), max_insns, InsnFields{});
     }
-    uint64_t   *insn_pcs    = tls_insn_pcs.data();
-    uint8_t    *insn_sizes  = tls_insn_sizes.data();
-    uint8_t    *insn_bytes  = tls_insn_bytes.data();
-    InsnFields *insn_fields = tls_insn_fields.data();
+    if (tls_field_ptrs.size() < max_insns) {
+        tls_field_ptrs.resize(max_insns);
+    }
+    uint64_t   *insn_pcs   = tls_insn_pcs.data();
+    uint8_t    *insn_sizes = tls_insn_sizes.data();
+    uint8_t    *insn_bytes = tls_insn_bytes.data();
+    const InsnFields **field_ptrs = tls_field_ptrs.data();
 
-    InsnRegNames *insn_reg_names = nullptr;
+    const InsnRegNames **regname_ptrs = nullptr;
     if (enable_reg_data) {
-        if (tls_insn_reg_names.size() < max_insns) {
-            tls_insn_reg_names.assign(max_insns, InsnRegNames{});
-        } else {
-            std::fill_n(tls_insn_reg_names.begin(),
-                        max_insns, InsnRegNames{});
+        if (tls_regname_ptrs.size() < max_insns) {
+            tls_regname_ptrs.resize(max_insns);
         }
-        insn_reg_names = tls_insn_reg_names.data();
+        regname_ptrs = tls_regname_ptrs.data();
     }
     const char *symbol_name = nullptr;
     uint64_t final_ft = 0;
@@ -349,9 +358,11 @@ BBTemplate *BBTemplateCache::get_or_create_bb_template(
             memcpy(&insn_bytes[(size_t)off * MAX_INSN_BYTES],
                    &frag->insn_bytes[(size_t)i * MAX_INSN_BYTES],
                    MAX_INSN_BYTES);
-            insn_fields[off] = frag->insn_fields[i];
-            if (insn_reg_names && frag->insn_reg_names) {
-                insn_reg_names[off] = frag->insn_reg_names[i];
+            field_ptrs[off] = &frag->insn_fields[i];
+            if (regname_ptrs) {
+                regname_ptrs[off] = frag->insn_reg_names
+                    ? &frag->insn_reg_names[i]
+                    : &kCacheEmptyRegNames;
             }
             off++;
         }
@@ -362,11 +373,11 @@ BBTemplate *BBTemplateCache::get_or_create_bb_template(
         return nullptr;
     }
 
-    BBTemplate *tmpl = commit_true_bb(entry_pc, off,
-                                      insn_pcs, insn_fields,
-                                      insn_sizes, insn_bytes,
-                                      insn_reg_names,
-                                      symbol_name, final_ft);
+    BBTemplate *tmpl = commit_true_bb_refs(entry_pc, off,
+                                           insn_pcs, field_ptrs,
+                                           insn_sizes, insn_bytes,
+                                           regname_ptrs,
+                                           symbol_name, final_ft);
     /*
      * Propagate the REP self-loop sub-template from the last fragment
      * (the TB ending in the REP string op, built at TB-translation

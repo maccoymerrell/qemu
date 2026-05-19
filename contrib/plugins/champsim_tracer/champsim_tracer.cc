@@ -786,60 +786,73 @@ static void emit_finalized_bb(BodyStreamState *out_stream,
     emit_body_entry(out_stream, bb_tmpl, cpu_index, std::move(wp_entries));
 }
 
-static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
+/*
+ * Capture post-exec dst-register values of the just-finished TB's
+ * last instruction.  The per-insn cb chain captures only insn[0..n-2]
+ * (each on insn[i+1]'s pre-exec hook); insn[n-1] would need a hook on
+ * the next TB's first insn, unknowable at translation.  Capturing
+ * here at the next TB's vcpu_tb_exec is equivalent: registers still
+ * hold prev_tb's last insn's post-exec values (this TB's body hasn't
+ * run yet).
+ */
+static void snap_prev_tail_dsts(unsigned int cpu_index,
+                                const BBTemplate *tmpl)
 {
-    uint64_t n_insns = (uint64_t)(uintptr_t)udata;
-
-    g_mutex_lock(&exec_lock);
-
-    if (g_trace_segments.is_shutting_down()) {
-        g_mutex_unlock(&exec_lock);
-        return;
-    }
-
-    /* Update the per-vCPU instruction counter (CP path only).
-     *
-     * QEMU emits x86 REP string ops as a single-insn TB re-executed
-     * once per REP iteration, each re-exec firing vcpu_tb_exec with
-     * the same start_pc.  Skipping the increment when n_insns == 1 &&
-     * start_pc == last_counted suppresses that drift; a normal tight
-     * loop is a multi-insn TB so its per-iteration count is kept. */
-    uint64_t cur_start_pc = qemu_plugin_u64_get(g_scoreboard.prev_start_pc,
-                                                cpu_index);
-    /*
-     * icount_prev = architectural insns actually executed (TBs
-     * 1..N-1); THIS TB has NOT run yet (vcpu_tb_exec fires at TB
-     * start).  All trigger logic keys off icount_prev so conditions
-     * track completed work — using the post-bump count would
-     * undershoot by this TB on threshold-crossing exits.
-     */
-    uint64_t icount_prev = qemu_plugin_u64_get(g_scoreboard.insn_count,
-                                               cpu_index);
-    /* Cache the WP-progress flag: g_wp_state is thread_local and the
-     * dlopen'd plugin's general-dynamic TLS model emits
-     * __tls_get_addr per access (~10 ns each on every TB exec). */
-    bool wp_in_progress = g_wp_state.in_progress;
-    if (!wp_in_progress) {
-        uint64_t last_counted = qemu_plugin_u64_get(
-            g_scoreboard.last_counted_start_pc, cpu_index);
-        bool is_rep_reentry = (n_insns == 1 && cur_start_pc == last_counted);
-        if (!is_rep_reentry) {
-            qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index,
-                                icount_prev + n_insns);
-            qemu_plugin_u64_set(g_scoreboard.last_counted_start_pc,
-                                cpu_index, cur_start_pc);
+    if (enable_reg_data && tmpl->insn_reg_names &&
+        tmpl->n_insns > 0 &&
+        g_trace_segments.is_active_atomic()) {
+        uint32_t last = tmpl->n_insns - 1;
+        const InsnFields *fl = &tmpl->insn_fields[last];
+        const InsnRegNames *nl = &tmpl->insn_reg_names[last];
+        for (uint8_t i = 0; i < fl->n_dst_regs; i++) {
+            RegSnap s;
+            g_reg_snaps.read_into_snap(
+                cpu_index, nl->dst_qemu_reg_keys[i], &s);
+            pending_reg_snaps.push_back(s);
         }
     }
+}
 
-    if (wp_in_progress) {
-        g_mutex_unlock(&exec_lock);
-        return;
+/*
+ * Per-CP attribution: bump opcode / branch_type / src / dst counters
+ * per insn of the just-committed CP fragment.  Cache thread_stats_get()
+ * once — the g_stats macro re-resolves the TLS slot via __tls_get_addr
+ * each expansion, and this loop bumps it up to 4×n_insns.
+ */
+static void attribute_cp_insns(const BBTemplate *tmpl)
+{
+    Stats &s = thread_stats_get();
+    Stats *h = g_current_hist_bucket;
+    for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+        const InsnFields *f = &tmpl->insn_fields[i];
+        s.cp_insns_by_opcode[f->opcode]++;
+        if (h) h->cp_insns_by_opcode[f->opcode]++;
+        if (f->branch_type != BRANCH_NONE) {
+            s.cp_branches_by_type[f->branch_type]++;
+            if (h) h->cp_branches_by_type[f->branch_type]++;
+        }
+        for (uint8_t k = 0; k < f->n_src_regs; k++) {
+            s.cp_src_reg_uses[f->src_regs[k]]++;
+            if (h) h->cp_src_reg_uses[f->src_regs[k]]++;
+        }
+        for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+            s.cp_dst_reg_writes[f->dst_regs[d]]++;
+            if (h) h->cp_dst_reg_writes[f->dst_regs[d]]++;
+        }
     }
+}
 
-    /* --- Tracing window management.  May start/stop segments and
-     *     exit() the process.  Must release exec_lock before exit()
-     *     so plugin_exit can re-acquire.  Checks key off icount_prev
-     *     so the trace covers AT LEAST the requested window. */
+/*
+ * Tracing-window management.  May start/stop trace segments and
+ * exit() the process.  Must release exec_lock before exit() so
+ * plugin_exit can re-acquire.  All early-out paths are exit(0)
+ * (process death); on a normal return the caller still holds
+ * exec_lock and proceeds to the body-stream check.  Checks key off
+ * icount_prev so the trace covers AT LEAST the requested window.
+ */
+static void tw_manage_window(unsigned int cpu_index,
+                             uint64_t icount_prev)
+{
     if (g_window_mode == PluginConfig::WIN_SYMBOL) {
         /* Stop once the post-trigger simulation_insns budget is
          * spent (window_stop set when the symbol fired). */
@@ -960,6 +973,59 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
             exit(0);
         }
     }
+}
+
+static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
+{
+    uint64_t n_insns = (uint64_t)(uintptr_t)udata;
+
+    g_mutex_lock(&exec_lock);
+
+    if (g_trace_segments.is_shutting_down()) {
+        g_mutex_unlock(&exec_lock);
+        return;
+    }
+
+    /* Update the per-vCPU instruction counter (CP path only).
+     *
+     * QEMU emits x86 REP string ops as a single-insn TB re-executed
+     * once per REP iteration, each re-exec firing vcpu_tb_exec with
+     * the same start_pc.  Skipping the increment when n_insns == 1 &&
+     * start_pc == last_counted suppresses that drift; a normal tight
+     * loop is a multi-insn TB so its per-iteration count is kept. */
+    uint64_t cur_start_pc = qemu_plugin_u64_get(g_scoreboard.prev_start_pc,
+                                                cpu_index);
+    /*
+     * icount_prev = architectural insns actually executed (TBs
+     * 1..N-1); THIS TB has NOT run yet (vcpu_tb_exec fires at TB
+     * start).  All trigger logic keys off icount_prev so conditions
+     * track completed work — using the post-bump count would
+     * undershoot by this TB on threshold-crossing exits.
+     */
+    uint64_t icount_prev = qemu_plugin_u64_get(g_scoreboard.insn_count,
+                                               cpu_index);
+    /* Cache the WP-progress flag: g_wp_state is thread_local and the
+     * dlopen'd plugin's general-dynamic TLS model emits
+     * __tls_get_addr per access (~10 ns each on every TB exec). */
+    bool wp_in_progress = g_wp_state.in_progress;
+    if (!wp_in_progress) {
+        uint64_t last_counted = qemu_plugin_u64_get(
+            g_scoreboard.last_counted_start_pc, cpu_index);
+        bool is_rep_reentry = (n_insns == 1 && cur_start_pc == last_counted);
+        if (!is_rep_reentry) {
+            qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index,
+                                icount_prev + n_insns);
+            qemu_plugin_u64_set(g_scoreboard.last_counted_start_pc,
+                                cpu_index, cur_start_pc);
+        }
+    }
+
+    if (wp_in_progress) {
+        g_mutex_unlock(&exec_lock);
+        return;
+    }
+
+    tw_manage_window(cpu_index, icount_prev);
 
     BodyStreamState *out_stream = g_trace_segments.body_stream();
     if (!g_trace_segments.is_active() || !out_stream) {
@@ -1000,53 +1066,9 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     BBTemplate *prev_tb_tmpl = g_bb_template_cache.find_tb_template(prev_start);
     if (prev_tb_tmpl) {
-        /*
-         * Tail-insn dst snap.  The per-insn cb chain captures only
-         * insn[0..n-2] (each on insn[i+1]'s pre-exec hook); insn[n-1]
-         * would need a hook on the next TB's first insn, unknowable at
-         * translation.  Capturing here at the next TB's vcpu_tb_exec
-         * is equivalent: registers still hold prev_tb's last insn's
-         * post-exec values (this TB's body hasn't run yet).
-         */
-        if (enable_reg_data && prev_tb_tmpl->insn_reg_names &&
-            prev_tb_tmpl->n_insns > 0 &&
-            g_trace_segments.is_active_atomic()) {
-            uint32_t last = prev_tb_tmpl->n_insns - 1;
-            const InsnFields *fl = &prev_tb_tmpl->insn_fields[last];
-            const InsnRegNames *nl = &prev_tb_tmpl->insn_reg_names[last];
-            for (uint8_t i = 0; i < fl->n_dst_regs; i++) {
-                RegSnap s;
-                g_reg_snaps.read_into_snap(
-                    cpu_index, nl->dst_qemu_reg_keys[i], &s);
-                pending_reg_snaps.push_back(s);
-            }
-        }
-
+        snap_prev_tail_dsts(cpu_index, prev_tb_tmpl);
         g_cp_chain.append_fragment(prev_start, prev_tb_tmpl, prev_ft);
-
-        /* Per-CP attribution: bump opcode / branch_type / src / dst
-         * counters per insn.  Cache thread_stats_get() once — the
-         * g_stats macro re-resolves the TLS slot via __tls_get_addr
-         * each expansion, and this loop bumps it up to 4×n_insns. */
-        Stats &s = thread_stats_get();
-        Stats *h = g_current_hist_bucket;
-        for (uint32_t i = 0; i < prev_tb_tmpl->n_insns; i++) {
-            const InsnFields *f = &prev_tb_tmpl->insn_fields[i];
-            s.cp_insns_by_opcode[f->opcode]++;
-            if (h) h->cp_insns_by_opcode[f->opcode]++;
-            if (f->branch_type != BRANCH_NONE) {
-                s.cp_branches_by_type[f->branch_type]++;
-                if (h) h->cp_branches_by_type[f->branch_type]++;
-            }
-            for (uint8_t k = 0; k < f->n_src_regs; k++) {
-                s.cp_src_reg_uses[f->src_regs[k]]++;
-                if (h) h->cp_src_reg_uses[f->src_regs[k]]++;
-            }
-            for (uint8_t d = 0; d < f->n_dst_regs; d++) {
-                s.cp_dst_reg_writes[f->dst_regs[d]]++;
-                if (h) h->cp_dst_reg_writes[f->dst_regs[d]]++;
-            }
-        }
+        attribute_cp_insns(prev_tb_tmpl);
     }
 
     bool finalize = prev_is_branch && prev_tb_tmpl != nullptr;
@@ -1080,6 +1102,135 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 }
 
 /* ========================= Translation callback ========================= */
+
+/*
+ * Arm the per-insn dynamic callbacks for a freshly created template:
+ * post-exec dst-register snapshots and synthetic-EA capture for
+ * memory-hint opcodes.  See the inline comments for the
+ * canonical-first / ci-1 timing rationale.
+ */
+static void tb_arm_new_template_cbs(struct qemu_plugin_tb *tb,
+                                    BBTemplate *new_tmpl,
+                                    const qemu_plugin_insn_info *insn_info,
+                                    size_t raw_n_insns,
+                                    const uint32_t *canonical_index,
+                                    const bool *canonical_first,
+                                    uint32_t canonical_n_insns)
+{
+    if (enable_reg_data && new_tmpl && new_tmpl->insn_reg_names) {
+        RegSnapInsnRef *refs = g_new0(RegSnapInsnRef,
+                                      canonical_n_insns);
+        new_tmpl->insn_snap_refs = refs;
+        for (uint32_t i = 0; i < canonical_n_insns; i++) {
+            refs[i].tb_tmpl = new_tmpl;
+            refs[i].insn_index = i;
+        }
+        /*
+         * Post-exec dst capture: register the snap cb on raw insn
+         * i (canonical_first && ci > 0) pointing at ci-1.  Firing
+         * pre-exec of ci means ci-1 just completed, so its dst
+         * registers hold post-exec values.  The TB's last
+         * canonical insn is captured at the next TB's
+         * vcpu_tb_exec ("Tail-insn dst snap").
+         */
+        for (size_t i = 0; i < raw_n_insns; i++) {
+            if (!canonical_first[i]) {
+                continue;
+            }
+            uint32_t ci = canonical_index[i];
+            if (ci == 0) {
+                continue;  /* no predecessor canonical insn in this TB */
+            }
+            struct qemu_plugin_insn *insn =
+                qemu_plugin_tb_get_insn(tb, i);
+            qemu_plugin_register_vcpu_insn_exec_cb(
+                insn, vcpu_insn_reg_snap_cb,
+                QEMU_PLUGIN_CB_R_REGS,
+                &refs[ci - 1]);
+        }
+    }
+
+    if (new_tmpl) {
+        SynthEAInsnRef *synth_refs = nullptr;
+        for (uint32_t i = 0; i < canonical_n_insns; i++) {
+            uint8_t op = new_tmpl->insn_fields[i].opcode;
+            if (op != GEN_OP_PREFETCH &&
+                op != GEN_OP_CACHE_FLUSH &&
+                op != GEN_OP_TLB_FLUSH) {
+                continue;
+            }
+            if (!new_tmpl->insn_synthetic_ea) {
+                new_tmpl->insn_synthetic_ea =
+                    g_new0(SyntheticEAInfo, canonical_n_insns);
+            }
+            decode_synthetic_ea(&insn_info[i], op,
+                                new_tmpl->insn_pcs[i],
+                                new_tmpl->insn_sizes[i],
+                                &new_tmpl->insn_synthetic_ea[i]);
+        }
+        if (new_tmpl->insn_synthetic_ea) {
+            synth_refs = g_new0(SynthEAInsnRef, canonical_n_insns);
+            new_tmpl->insn_synth_ea_refs = synth_refs;
+            for (uint32_t i = 0; i < canonical_n_insns; i++) {
+                synth_refs[i].tb_tmpl = new_tmpl;
+                synth_refs[i].insn_index = i;
+            }
+            for (size_t i = 0; i < raw_n_insns; i++) {
+                if (!canonical_first[i]) {
+                    continue;
+                }
+                uint32_t ci = canonical_index[i];
+                if (!new_tmpl->insn_synthetic_ea[ci].has_addr) {
+                    continue;
+                }
+                struct qemu_plugin_insn *insn =
+                    qemu_plugin_tb_get_insn(tb, i);
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, vcpu_insn_synth_ea_cb,
+                    QEMU_PLUGIN_CB_R_REGS,
+                    &synth_refs[ci]);
+            }
+        }
+    }
+}
+
+/*
+ * Re-translation of a known BB: re-arm the same per-insn dynamic
+ * callbacks against the cached template's existing ref arrays.
+ */
+static void tb_rearm_known_template_cbs(struct qemu_plugin_tb *tb,
+                                        BBTemplate *existing_tmpl,
+                                        size_t raw_n_insns,
+                                        const uint32_t *canonical_index,
+                                        const bool *canonical_first)
+{
+    RegSnapInsnRef *refs =
+        (RegSnapInsnRef *)existing_tmpl->insn_snap_refs;
+    SynthEAInsnRef *synth_refs =
+        (SynthEAInsnRef *)existing_tmpl->insn_synth_ea_refs;
+    for (size_t i = 0; i < raw_n_insns; i++) {
+        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+
+        if (enable_reg_data && refs && canonical_first[i] &&
+            canonical_index[i] > 0 &&
+            canonical_index[i] - 1 < existing_tmpl->n_insns) {
+            qemu_plugin_register_vcpu_insn_exec_cb(
+                insn, vcpu_insn_reg_snap_cb,
+                QEMU_PLUGIN_CB_R_REGS,
+                &refs[canonical_index[i] - 1]);
+        }
+
+        if (synth_refs && canonical_first[i] &&
+            canonical_index[i] < existing_tmpl->n_insns &&
+            existing_tmpl->insn_synthetic_ea &&
+            existing_tmpl->insn_synthetic_ea[canonical_index[i]].has_addr) {
+            qemu_plugin_register_vcpu_insn_exec_cb(
+                insn, vcpu_insn_synth_ea_cb,
+                QEMU_PLUGIN_CB_R_REGS,
+                &synth_refs[canonical_index[i]]);
+        }
+    }
+}
 
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
@@ -1186,109 +1337,12 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         }
         g_mutex_unlock(&data_lock);
 
-        if (enable_reg_data && new_tmpl && new_tmpl->insn_reg_names) {
-            RegSnapInsnRef *refs = g_new0(RegSnapInsnRef,
-                                          canonical_n_insns);
-            new_tmpl->insn_snap_refs = refs;
-            for (uint32_t i = 0; i < canonical_n_insns; i++) {
-                refs[i].tb_tmpl = new_tmpl;
-                refs[i].insn_index = i;
-            }
-            /*
-             * Post-exec dst capture: register the snap cb on raw insn
-             * i (canonical_first && ci > 0) pointing at ci-1.  Firing
-             * pre-exec of ci means ci-1 just completed, so its dst
-             * registers hold post-exec values.  The TB's last
-             * canonical insn is captured at the next TB's
-             * vcpu_tb_exec ("Tail-insn dst snap").
-             */
-            for (size_t i = 0; i < raw_n_insns; i++) {
-                if (!canonical_first[i]) {
-                    continue;
-                }
-                uint32_t ci = canonical_index[i];
-                if (ci == 0) {
-                    continue;  /* no predecessor canonical insn in this TB */
-                }
-                struct qemu_plugin_insn *insn =
-                    qemu_plugin_tb_get_insn(tb, i);
-                qemu_plugin_register_vcpu_insn_exec_cb(
-                    insn, vcpu_insn_reg_snap_cb,
-                    QEMU_PLUGIN_CB_R_REGS,
-                    &refs[ci - 1]);
-            }
-        }
-
-        if (new_tmpl) {
-            SynthEAInsnRef *synth_refs = nullptr;
-            for (uint32_t i = 0; i < canonical_n_insns; i++) {
-                uint8_t op = new_tmpl->insn_fields[i].opcode;
-                if (op != GEN_OP_PREFETCH &&
-                    op != GEN_OP_CACHE_FLUSH &&
-                    op != GEN_OP_TLB_FLUSH) {
-                    continue;
-                }
-                if (!new_tmpl->insn_synthetic_ea) {
-                    new_tmpl->insn_synthetic_ea =
-                        g_new0(SyntheticEAInfo, canonical_n_insns);
-                }
-                decode_synthetic_ea(&insn_info[i], op,
-                                    new_tmpl->insn_pcs[i],
-                                    new_tmpl->insn_sizes[i],
-                                    &new_tmpl->insn_synthetic_ea[i]);
-            }
-            if (new_tmpl->insn_synthetic_ea) {
-                synth_refs = g_new0(SynthEAInsnRef, canonical_n_insns);
-                new_tmpl->insn_synth_ea_refs = synth_refs;
-                for (uint32_t i = 0; i < canonical_n_insns; i++) {
-                    synth_refs[i].tb_tmpl = new_tmpl;
-                    synth_refs[i].insn_index = i;
-                }
-                for (size_t i = 0; i < raw_n_insns; i++) {
-                    if (!canonical_first[i]) {
-                        continue;
-                    }
-                    uint32_t ci = canonical_index[i];
-                    if (!new_tmpl->insn_synthetic_ea[ci].has_addr) {
-                        continue;
-                    }
-                    struct qemu_plugin_insn *insn =
-                        qemu_plugin_tb_get_insn(tb, i);
-                    qemu_plugin_register_vcpu_insn_exec_cb(
-                        insn, vcpu_insn_synth_ea_cb,
-                        QEMU_PLUGIN_CB_R_REGS,
-                        &synth_refs[ci]);
-                }
-            }
-        }
+        tb_arm_new_template_cbs(tb, new_tmpl, insn_info, raw_n_insns,
+                                canonical_index, canonical_first,
+                                canonical_n_insns);
     } else {
-        /* Re-translation of known BB: re-arm dynamic callbacks. */
-        RegSnapInsnRef *refs =
-            (RegSnapInsnRef *)existing_tmpl->insn_snap_refs;
-        SynthEAInsnRef *synth_refs =
-            (SynthEAInsnRef *)existing_tmpl->insn_synth_ea_refs;
-        for (size_t i = 0; i < raw_n_insns; i++) {
-            struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
-
-            if (enable_reg_data && refs && canonical_first[i] &&
-                canonical_index[i] > 0 &&
-                canonical_index[i] - 1 < existing_tmpl->n_insns) {
-                qemu_plugin_register_vcpu_insn_exec_cb(
-                    insn, vcpu_insn_reg_snap_cb,
-                    QEMU_PLUGIN_CB_R_REGS,
-                    &refs[canonical_index[i] - 1]);
-            }
-
-            if (synth_refs && canonical_first[i] &&
-                canonical_index[i] < existing_tmpl->n_insns &&
-                existing_tmpl->insn_synthetic_ea &&
-                existing_tmpl->insn_synthetic_ea[canonical_index[i]].has_addr) {
-                qemu_plugin_register_vcpu_insn_exec_cb(
-                    insn, vcpu_insn_synth_ea_cb,
-                    QEMU_PLUGIN_CB_R_REGS,
-                    &synth_refs[canonical_index[i]]);
-            }
-        }
+        tb_rearm_known_template_cbs(tb, existing_tmpl, raw_n_insns,
+                                    canonical_index, canonical_first);
     }
 
     /* Instrument the block for execution tracking. */
@@ -1362,6 +1416,74 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
 
 /* Render a Stats snapshot to @report (per-segment diff or cumulative
  * total). */
+/* Per-branch-type breakdown, CP and WP side-by-side. */
+static void append_branch_breakdown(GString *report, const Stats &stats)
+{
+    uint64_t cp_total = 0, wp_total = 0;
+    for (size_t i = 0; i < BRANCH_TYPE_COUNT; i++) {
+        if (i == BRANCH_NONE) continue;
+        cp_total += stats.cp_branches_by_type[i];
+        wp_total += stats.wp_branches_by_type[i];
+    }
+    if (cp_total == 0 && wp_total == 0) return;
+    g_string_append_printf(report,
+        "Branch type breakdown:\n"
+        "  %-22s %14s %8s   %14s %8s\n",
+        "type", "CP count", "%CP", "WP count", "%WP");
+    for (size_t i = 0; i < BRANCH_TYPE_COUNT; i++) {
+        if (i == BRANCH_NONE) continue;
+        uint64_t cv = stats.cp_branches_by_type[i];
+        uint64_t wv = stats.wp_branches_by_type[i];
+        if (cv == 0 && wv == 0) continue;
+        double cp_pct = cp_total
+            ? 100.0 * (double)cv / (double)cp_total : 0.0;
+        double wp_pct = wp_total
+            ? 100.0 * (double)wv / (double)wp_total : 0.0;
+        g_string_append_printf(report,
+            "  %-22s %14" PRIu64 " %7.2f%%   %14" PRIu64 " %7.2f%%\n",
+            branch_type_name_or_unknown((unsigned)i),
+            cv, cp_pct, wv, wp_pct);
+    }
+}
+
+/* Generic opcode breakdown, CP and WP side-by-side.  Sorted by
+ * (CP+WP) total so the busiest opcodes come first regardless of
+ * which path drives them. */
+static void append_opcode_breakdown(GString *report, const Stats &stats)
+{
+    uint64_t cp_total = 0, wp_total = 0;
+    for (size_t i = 0; i < GEN_OP_COUNT; i++) {
+        cp_total += stats.cp_insns_by_opcode[i];
+        wp_total += stats.wp_insns_by_opcode[i];
+    }
+    if (cp_total == 0 && wp_total == 0) return;
+    std::vector<std::tuple<uint64_t, uint8_t>> rows;
+    for (size_t i = 0; i < GEN_OP_COUNT; i++) {
+        uint64_t s = stats.cp_insns_by_opcode[i] +
+                     stats.wp_insns_by_opcode[i];
+        if (s) rows.emplace_back(s, (uint8_t)i);
+    }
+    std::sort(rows.begin(), rows.end(),
+              std::greater<std::tuple<uint64_t, uint8_t>>());
+    g_string_append_printf(report,
+        "Generic opcode breakdown (%zu non-zero):\n"
+        "  %-20s %14s %8s   %14s %8s\n",
+        rows.size(), "opcode", "CP count", "%CP", "WP count", "%WP");
+    for (const auto &r : rows) {
+        uint8_t op = std::get<1>(r);
+        uint64_t cv = stats.cp_insns_by_opcode[op];
+        uint64_t wv = stats.wp_insns_by_opcode[op];
+        double cp_pct = cp_total
+            ? 100.0 * (double)cv / (double)cp_total : 0.0;
+        double wp_pct = wp_total
+            ? 100.0 * (double)wv / (double)wp_total : 0.0;
+        g_string_append_printf(report,
+            "  %-20s %14" PRIu64 " %7.2f%%   %14" PRIu64 " %7.2f%%\n",
+            generic_opcode_name_or_unknown((unsigned)op),
+            cv, cp_pct, wv, wp_pct);
+    }
+}
+
 static void append_stats_summary(GString *report, const char *label,
                                  const Stats &stats)
 {
@@ -1424,73 +1546,8 @@ static void append_stats_summary(GString *report, const char *label,
         }
     }
 
-    /* Per-branch-type breakdown, CP and WP side-by-side. */
-    {
-        uint64_t cp_total = 0, wp_total = 0;
-        for (size_t i = 0; i < BRANCH_TYPE_COUNT; i++) {
-            if (i == BRANCH_NONE) continue;
-            cp_total += stats.cp_branches_by_type[i];
-            wp_total += stats.wp_branches_by_type[i];
-        }
-        if (cp_total > 0 || wp_total > 0) {
-            g_string_append_printf(report,
-                "Branch type breakdown:\n"
-                "  %-22s %14s %8s   %14s %8s\n",
-                "type", "CP count", "%CP", "WP count", "%WP");
-            for (size_t i = 0; i < BRANCH_TYPE_COUNT; i++) {
-                if (i == BRANCH_NONE) continue;
-                uint64_t cv = stats.cp_branches_by_type[i];
-                uint64_t wv = stats.wp_branches_by_type[i];
-                if (cv == 0 && wv == 0) continue;
-                double cp_pct = cp_total
-                    ? 100.0 * (double)cv / (double)cp_total : 0.0;
-                double wp_pct = wp_total
-                    ? 100.0 * (double)wv / (double)wp_total : 0.0;
-                g_string_append_printf(report,
-                    "  %-22s %14" PRIu64 " %7.2f%%   %14" PRIu64 " %7.2f%%\n",
-                    branch_type_name_or_unknown((unsigned)i),
-                    cv, cp_pct, wv, wp_pct);
-            }
-        }
-    }
-
-    /* Generic opcode breakdown, CP and WP side-by-side.  Sorted by
-     * (CP+WP) total so the busiest opcodes come first regardless of
-     * which path drives them. */
-    {
-        uint64_t cp_total = 0, wp_total = 0;
-        for (size_t i = 0; i < GEN_OP_COUNT; i++) {
-            cp_total += stats.cp_insns_by_opcode[i];
-            wp_total += stats.wp_insns_by_opcode[i];
-        }
-        if (cp_total > 0 || wp_total > 0) {
-            std::vector<std::tuple<uint64_t, uint8_t>> rows;
-            for (size_t i = 0; i < GEN_OP_COUNT; i++) {
-                uint64_t s = stats.cp_insns_by_opcode[i] +
-                             stats.wp_insns_by_opcode[i];
-                if (s) rows.emplace_back(s, (uint8_t)i);
-            }
-            std::sort(rows.begin(), rows.end(),
-                      std::greater<std::tuple<uint64_t, uint8_t>>());
-            g_string_append_printf(report,
-                "Generic opcode breakdown (%zu non-zero):\n"
-                "  %-20s %14s %8s   %14s %8s\n",
-                rows.size(), "opcode", "CP count", "%CP", "WP count", "%WP");
-            for (const auto &r : rows) {
-                uint8_t op = std::get<1>(r);
-                uint64_t cv = stats.cp_insns_by_opcode[op];
-                uint64_t wv = stats.wp_insns_by_opcode[op];
-                double cp_pct = cp_total
-                    ? 100.0 * (double)cv / (double)cp_total : 0.0;
-                double wp_pct = wp_total
-                    ? 100.0 * (double)wv / (double)wp_total : 0.0;
-                g_string_append_printf(report,
-                    "  %-20s %14" PRIu64 " %7.2f%%   %14" PRIu64 " %7.2f%%\n",
-                    generic_opcode_name_or_unknown((unsigned)op),
-                    cv, cp_pct, wv, wp_pct);
-            }
-        }
-    }
+    append_branch_breakdown(report, stats);
+    append_opcode_breakdown(report, stats);
 
     /* Per-register attribution, CP and WP side-by-side, src and dst
      * separately. */

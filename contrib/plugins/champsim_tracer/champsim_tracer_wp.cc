@@ -93,12 +93,10 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     std::vector<uint64_t>     bb_pcs;
     std::vector<uint8_t>      bb_sizes;
     std::vector<uint8_t>      bb_bytes;
-    /* Non-owning pointers into stable per-TB-template storage: the
-     * accumulated WP BB is committed by reference, so no InsnFields
-     * / InsnRegNames struct is copied per WP-visited insn (the copy
-     * was wasted entirely whenever the BB was already templated —
-     * the hot case).  A genuine first-sighting commit gathers once,
-     * inside commit_true_bb_refs. */
+    /* Per-insn fields/regnames of the accumulating WP BB, held as
+     * non-owning pointers into the source TB template's stable
+     * storage.  commit_true_bb_refs takes them by reference and only
+     * a first-sighting commit copies (gathers) them. */
     std::vector<const InsnFields *>   bb_fields;
     std::vector<const InsnRegNames *> bb_regnames;
     /* Stable zeroed sentinel for the rare reg-data-on-but-template-

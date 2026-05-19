@@ -163,7 +163,7 @@ extern "C" {
  * Sparse insn metadata records need no feature bit. */
 #define CST_FLAG_MEM_DATA      (1 << 0)  /* CST_FID_LOAD_DATA / STORE_DATA */
 #define CST_FLAG_REG_DATA      (1 << 1)  /* CST_FID_DST_REG values        */
-#define CST_FLAG_RESERVED_2    (1 << 2)
+#define CST_FLAG_PROFILE (1 << 2) /* §6 profile block present per template */
 /* bits 3..7 reserved */
 
 /* ===== Field-ID space (unified delta stream) =====

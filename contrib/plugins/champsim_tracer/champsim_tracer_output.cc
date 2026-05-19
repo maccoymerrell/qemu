@@ -369,7 +369,7 @@ static void write_header_encoding_maps(BitWriter *main_bw)
     static const EncodingMapEntry header_flag_entries[] = {
         { CST_FLAG_MEM_DATA, "CST_FLAG_MEM_DATA" },
         { CST_FLAG_REG_DATA, "CST_FLAG_REG_DATA" },
-        { CST_FLAG_RESERVED_2, "CST_FLAG_RESERVED_2" },
+        { CST_FLAG_PROFILE, "CST_FLAG_PROFILE" },
     };
     static const EncodingMapEntry insn_flag_entries[] = {
         { CST_INSN_FLAG_BRANCH_COND, "CST_INSN_FLAG_BRANCH_COND" },
@@ -2203,12 +2203,10 @@ static void emit_field_delta_section(BitWriter *main_bw,
         uint32_t state_generation = state->generation;
         uint32_t base_generation = base_state ? base_state->generation : 0;
 
-        /* The descriptor filter (template_static / mem-data /
-         * reg-data gating) depends only on header_flags, which is
-         * constant for this call.  Hoist it out of the per-insn loop
-         * so the hot path iterates only the active descriptors
-         * instead of re-deciding N_FIELD_DESCRIPTORS times per insn.
-         * Wire-identical: same (fd, i, slot) set is processed. */
+        /* Descriptors that can produce a record for this call.  The
+         * filter (template_static / mem-data / reg-data gating)
+         * depends only on header_flags, so it is evaluated once here
+         * and the per-insn loop iterates this list directly. */
         const FieldDescriptor *active[N_FIELD_DESCRIPTORS];
         size_t n_active = 0;
         for (size_t d = 0; d < N_FIELD_DESCRIPTORS; d++) {
@@ -2375,6 +2373,9 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
     if (enable_reg_data) {
         flags |= CST_FLAG_REG_DATA;
     }
+    /* Set when each template carries the §6 profile block; clear
+     * when the block is omitted. */
+    flags |= CST_FLAG_PROFILE;
     bw_write_u8(&st->header_bw, flags);
     st->header_flags = flags;
 

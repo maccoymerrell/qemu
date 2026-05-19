@@ -475,7 +475,7 @@ Reading the trace
 
    $ build/contrib/plugins/cst_decode run.cst | head
    ; cst_decode disassembly
-   ; version=0x1C545343
+   ; version=0x1D545343
    ; isa=x86_64
    ...
    ; ----- BB 3 entry pc=0x401740 insns=12 seq=1 tid=0 -----

@@ -17,8 +17,8 @@
 BBTemplateCache g_bb_template_cache;
 
 /* Stable zeroed sentinel: a fragment may lack insn_reg_names while
- * reg-data is enabled; the by-reference commit needs a valid pointer
- * whose pointee is all-zero (matching the old zero-filled scratch). */
+ * reg-data is enabled; the by-reference commit points such slots
+ * here so every regnames pointer is valid and reads as all-zero. */
 static const InsnRegNames kCacheEmptyRegNames{};
 
 void BBTemplateDeleter::operator()(BBTemplate *t) const noexcept
@@ -233,8 +233,8 @@ BBTemplate *BBTemplateCache::commit_true_bb_refs(
     const InsnRegNames *const *insn_reg_names,
     const char *symbol_name, uint64_t fall_through_pc)
 {
-    /* Hot path: BB already templated -> no field payload touched,
-     * the per-WP-visit struct copy is gone entirely. */
+    /* Already-templated BB: return the cached record without
+     * touching the field/regnames payload at all. */
     if (BBTemplate *existing =
             find_existing_true_bb(start_pc, n_insns, insn_pcs)) {
         return existing;

@@ -93,8 +93,10 @@ new singleton, or extend a dense bank cleanly.
 
 1. **Pick an ID** in ``champsim_tracer_generic_ids.h``.  Stay below
    255 so it still fits in a ``uint8_t``.  ``REG_ID_COUNT`` (255) is
-   the sentinel — bump it only if you exhaust the space, which forces
-   a wire-format bump.
+   the count sentinel; the wire stays self-describing through the
+   ``reg`` map regardless of which ids are used, so adding ids is not
+   a versioned change.  Needing more than 255 ids is the one
+   structural limit (it no longer fits ``uint8_t``).
 
    .. code-block:: c
 

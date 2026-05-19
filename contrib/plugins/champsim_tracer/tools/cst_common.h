@@ -102,6 +102,9 @@ struct ResolvedIds {
     /* header_flag map: bit masks inside Header::flags */
     uint8_t flag_mem_data = 0;
     uint8_t flag_reg_data = 0;
+    /* Bit mask within Header::flags marking the per-template
+     * profile block present. */
+    uint8_t flag_profile = 0;
 
     /* wp_event_flag map: bit masks inside the per-WP-event flags byte */
     uint8_t wp_event_translation_unavail = 0;

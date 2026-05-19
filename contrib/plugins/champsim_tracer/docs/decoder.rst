@@ -56,7 +56,7 @@ Sample, with ``wp=1,memdata=1,regdata=1`` capture flags:
 .. code-block:: text
 
    ; cst_decode disassembly
-   ; version=0x1C545343
+   ; version=0x1D545343
    ; isa=x86_64
    ; command=qemu-x86_64 -seed 42 -plugin libchampsim_tracer.so,outfile=run,...
    ; datetime=2026-05-10 16:11:23
@@ -385,6 +385,9 @@ re-user must respect:
 Internally the field-delta replay is two passes (apply every wire
 record to its ``(insn, slot)`` state cell, then materialise one row
 per template instruction).  State cells use a per-table generation
-counter so a segment boundary invalidates every cell in O(1); the
-slot-count constant must be bumped in lockstep with the writer when
-a new field family is added.
+counter so a segment boundary invalidates every cell in O(1).  The
+state-cell layout (``FIELD_STATE_SLOT_COUNT``) is a compile-time
+constant shared by this decoder and the writer; adding a new field
+family changes it in both.  This is a source-level coupling of the
+offline tools, not a wire-format version — the trace stays
+self-describing through its ``field_id`` map.

@@ -1,21 +1,21 @@
 Reference: symbolic IDs
 =======================
 
-The wire format encodes opcodes, branch types, register IDs, and
-field IDs as ``u8`` integers.  The trace's encoding-maps section
-(see :doc:`/format`) carries the canonical name for each value
-inside the file itself, so a decoder reading a trace never
-needs to consult these tables.  This page exists for two cases:
+Opcodes, branch types, register IDs, and field IDs travel on the
+wire as integers, but the integers are **not** part of the contract:
+every trace's encoding-maps section (see :doc:`/format`) carries the
+name for each value inside the file, and a decoder resolves every
+value through that map.  A producer is free to assign whatever
+numbers it likes as long as it lists them in the maps.
 
-* Decoding a trace whose encoding maps are missing or stale.
-* Producing a ``.cst`` trace from a non-QEMU source: a static
-  binary translator, a different simulator, an ISA the QEMU plugin
-  doesn't yet support.
-
-Anyone in the second camp should treat the table below as the
-authoritative list of *generally supported* IDs.  Producers may emit
-values outside this set, but consumers (most importantly ChampSim's
-decoder) do not have to handle them.
+This page is the reference for the *symbolic* side of that contract
+— the set of well-known names and what each one means.  It assigns
+no numeric values on purpose: hard-coding a number here would invite
+consumers to bypass the per-trace map and is exactly the kind of
+mistake the self-describing format exists to prevent.  Treat the
+names below as the generally supported set; a producer may emit
+additional names, but consumers (most importantly ChampSim's
+decoder) are not required to handle names outside it.
 
 .. _generic-opcodes:
 
@@ -337,9 +337,9 @@ records.
      - *Reserved fallback.* Long-latency vector / SIMD op bucket. Never
        emitted by the in-tree tracer.
 
-       IDs 67..255 are unallocated. ``GEN_OP_COUNT`` is the sentinel;
-       per-CP and per-WP attribution arrays in ``Stats`` are sized by it
-       so adding a new opcode automatically extends the histograms.
+       ``GEN_OP_COUNT`` is the in-tree enum sentinel; per-CP and
+       per-WP attribution arrays in ``Stats`` are sized by it so
+       adding a new opcode automatically extends the histograms.
 
 Numeric IDs are the current in-tree enum assignment, **not** a wire
 contract: every trace embeds an opcode encoding map (Step 3 of
@@ -358,18 +358,15 @@ Branch types (``BranchType``)
 
 .. list-table::
    :header-rows: 1
-   :widths: 6 28 66
+   :widths: 28 72
 
-   * - ID
-     - Name
+   * - Name
      - Notes
-   * - 0
-     - ``BRANCH_NONE``
+   * - ``BRANCH_NONE``
      - Not a branch.  Templates default to this for all but the
        last instruction (after delay-slot normalization, where
        applicable).
-   * - 1
-     - ``BRANCH_DIRECT_JUMP``
+   * - ``BRANCH_DIRECT_JUMP``
      - Direct target encoded in the instruction.  Covers
        unconditional direct jumps (``jmp imm``), direct ``call``
        (which is also a control-transfer-with-immediate-target),
@@ -380,8 +377,7 @@ Branch types (``BranchType``)
        resolution treats a taken instance as fall-through; if the
        instance was *also* conditional and fell through, the WP
        target becomes the static immediate.
-   * - 2
-     - ``BRANCH_INDIRECT_JUMP``
+   * - ``BRANCH_INDIRECT_JUMP``
      - Computed target.  Covers indirect jumps and indirect
        ``call`` (the x86 refine callback rewrites the table's
        default ``DIRECT_JUMP`` to ``INDIRECT_JUMP`` when the call's
@@ -391,12 +387,10 @@ Branch types (``BranchType``)
        with one observed target, fall back to the fall-through PC
        (so single-target indirect calls in shared-library trampolines
        don't produce all-CP WP slices).
-   * - 3
-     - ``BRANCH_RETURN``
+   * - ``BRANCH_RETURN``
      - Indirect via return address.  Grouped with
        ``BRANCH_INDIRECT_JUMP`` in WP-target picking — same rule.
-   * - 4
-     - ``BRANCH_SYSCALL_TYPE``
+   * - ``BRANCH_SYSCALL_TYPE``
      - System-call-style transfer (``syscall``, ``svc``,
        ``ecall``).  WP simulation continues *into* the syscall as
        any other branch, but if the syscall's TB raises a fault
@@ -404,14 +398,12 @@ Branch types (``BranchType``)
        ``ends_in_branch`` test commits the BB and the post-PC
        poisoning then breaks out of the WP chain.  Speculative
        state past the syscall is not modeled.
-   * - 5
-     - ``BRANCH_COND_DIRECT``
+   * - ``BRANCH_COND_DIRECT``
      - PC-relative conditional.  WP target is the *not-taken*
        static target when CP took the branch (i.e., the
        fall-through PC), and the static taken target (the encoded
        immediate) when CP fell through.
-   * - 6
-     - ``BRANCH_REP``
+   * - ``BRANCH_REP``
      - x86 REP / REPNZ self-loop terminator (string ops MOVS /
        STOS / LODS / CMPS / SCAS / INS / OUTS with a REP prefix).
        Conditional self-loop: target = the REP's own PC,
@@ -432,96 +424,72 @@ Register IDs (``GenericRegId``)
 -------------------------------
 
 Each architectural register the per-ISA classification table maps to
-a generic-domain ID.  IDs 0..254 are valid; ``REG_ID_COUNT = 255``
-is the sentinel.  Wire-format encoding is a single ``u8``.
-
-The dense banks below number from a base value with each subsequent
-register one greater.  Use the per-bank base as the entry-point.
+a generic-domain register.  A register travels on the wire as one
+integer whose name comes from the trace's ``reg`` map; the names
+below are the contract.  The banked names (``REG_GPR0`` and friends)
+denote a contiguous family — index ``n`` within the bank — without
+implying any particular numeric base.
 
 .. list-table::
    :header-rows: 1
-   :widths: 18 18 64
+   :widths: 26 74
 
-   * - Range
-     - Class
+   * - Register / bank
      - Notes
-   * - 0
-     - ``REG_NONE``
-     - Sentinel returned by the per-ISA register classifier when
-       it can't map a Capstone register ID to a generic-domain
-       slot.  ``decode.cc::add_src_reg`` / ``add_dst_reg`` *skip*
-       any classification that yields ``REG_NONE``, so this ID is
-       never written into a template's ``src_regs`` / ``dst_regs``
-       and consumers will not see it on the wire.  The decoder
-       reserves the name purely as a debugging fallback.
-   * - 1..64
-     - ``REG_GPR0`` .. ``REG_GPR63``
+   * - ``REG_NONE``
+     - Sentinel the per-ISA register classifier returns when it
+       can't map a Capstone register to a generic-domain register.
+       ``decode.cc::add_src_reg`` / ``add_dst_reg`` *skip* any
+       classification that yields ``REG_NONE``, so it is never
+       written into a template's ``src_regs`` / ``dst_regs`` and
+       consumers will not see it on the wire.  The decoder reserves
+       the name purely as a debugging fallback.
+   * - ``REG_GPR0`` .. ``REG_GPR63``
      - General-purpose integer registers.
-   * - 65..128
-     - ``REG_FPR0`` .. ``REG_FPR63``
+   * - ``REG_FPR0`` .. ``REG_FPR63``
      - Scalar floating-point registers.
-   * - 129..192
-     - ``REG_VEC0`` .. ``REG_VEC63``
+   * - ``REG_VEC0`` .. ``REG_VEC63``
      - Vector / SIMD registers.  The full width is whatever the
        guest ISA exposes (XMM, YMM, ZMM on x86; Q on aarch64;
        V on RISC-V).  Snapshot capture truncates to 512 bits.
-   * - 193..224
-     - ``REG_PRED0`` .. ``REG_PRED31``
+   * - ``REG_PRED0`` .. ``REG_PRED31``
      - Predicate / mask registers (SVE, AVX-512 ``k`` regs,
        RVV mask).
-   * - 225..230
-     - ``REG_SEG0`` .. ``REG_SEG5``
+   * - ``REG_SEG0`` .. ``REG_SEG5``
      - x86 segment registers (``cs`` / ``ds`` / ... ).  Other ISAs
-       leave this range empty.
-   * - 231
-     - ``REG_CTRL``
+       leave this family empty.
+   * - ``REG_CTRL``
      - Architectural control register family (CR0..N on x86,
        SCTLR on aarch64).
-   * - 232
-     - ``REG_DEBUG``
+   * - ``REG_DEBUG``
      - Debug-control register family (DR0..N, MDSCR).
-   * - 233..236
-     - ``REG_BOUND0`` .. ``REG_BOUND3``
+   * - ``REG_BOUND0`` .. ``REG_BOUND3``
      - x86 MPX bound registers.
-   * - 237..240
-     - ``REG_ACC0`` .. ``REG_ACC3``
+   * - ``REG_ACC0`` .. ``REG_ACC3``
      - Accumulator-style architectural registers (MIPS HI/LO,
        AArch64 SME accumulators).
-   * - 241
-     - ``REG_ZERO``
+   * - ``REG_ZERO``
      - Hardwired-zero register (RISC-V ``x0``, MIPS ``$zero``,
        aarch64 ``xzr``).
-   * - 242
-     - ``REG_MATRIX``
+   * - ``REG_MATRIX``
      - Tile/matrix register family (AMX TMM, SME ZA).
-   * - 243
-     - ``REG_SYS``
+   * - ``REG_SYS``
      - Generic system register (per-arch MSR / MRS / CSR space).
-   * - 244
-     - ``REG_FCSR``
+   * - ``REG_FCSR``
      - Floating-point control / status register.
-   * - 245
-     - ``REG_VCTRL``
+   * - ``REG_VCTRL``
      - Vector control register (RVV ``vtype`` / ``vl``,
        SVE ``ZCR``).
-   * - 246..249
-     - *(unallocated)*
-     - Available for future singleton additions.
-   * - 250
-     - ``REG_SP``
+   * - ``REG_SP``
      - Stack pointer.
-   * - 251
-     - ``REG_FLAGS``
+   * - ``REG_FLAGS``
      - Flags / condition-code register (RFLAGS, NZCV, ``mstatus``).
-   * - 252
-     - ``REG_IP``
+   * - ``REG_IP``
      - Instruction / program counter.
-   * - 253
-     - ``REG_LR``
+   * - ``REG_LR``
      - Link register (return address) on architectures that have
        one architecturally.
-   * - 254
-     - ``REG_FP_REG``
+   * - ``REG_FP_REG``
      - Frame pointer (rbp / x29 / ``s0``).
 
 .. _atomic-flag:
@@ -560,8 +528,7 @@ mapping.
    by a hard-coded number.  The slotted families are *interleaved by
    slot* (slot ``k`` of every family co-located) rather than
    family-then-slot.  ``CST_FID_SLOT_COUNT`` is **64**;
-   there are no ``CST_FID_EXTRA_*`` overflow vectors in format
-   ``0x1D``.
+   there are no ``CST_FID_EXTRA_*`` overflow vectors.
 
 .. list-table::
    :header-rows: 1
@@ -632,38 +599,35 @@ predictors, mis-speculation analyses) need a stable ISA-agnostic
 shape.
 
 The tracer emits one canonical byte per flag-writing instruction
-under the side-channel field ID ``CST_FID_METAFLAGS`` (``0x77``).
+under the side-channel field ID ``CST_FID_METAFLAGS`` (resolve its
+number through the ``field_id`` map, like every field).
 The plugin derives this byte from the architectural flags-register
 snap by applying the per-ISA bit-shuffle mapper at capture time;
 consumers don't need to know the source ISA's flag-bit layout.
 
-Bit layout (``include/champsim_tracer_generic_ids.h``):
+Each bit's position resolves through the trace's ``metaflags``
+map (one entry per ``CST_METAFLAGS_*`` name); a consumer never
+hard-codes a bit number.  The canonical bits:
 
 .. list-table::
    :header-rows: 1
-   :widths: 8 18 74
+   :widths: 22 78
 
-   * - Bit
-     - Name
+   * - Name
      - Meaning
-   * - 0
-     - ``CST_METAFLAGS_Z``
+   * - ``CST_METAFLAGS_Z``
      - Zero / equal (result == 0).
-   * - 1
-     - ``CST_METAFLAGS_N``
+   * - ``CST_METAFLAGS_N``
      - Negative / sign (high bit of result).
-   * - 2
-     - ``CST_METAFLAGS_C``
+   * - ``CST_METAFLAGS_C``
      - Unsigned carry / borrow.
-   * - 3
-     - ``CST_METAFLAGS_V``
+   * - ``CST_METAFLAGS_V``
      - Signed overflow.
-   * - 4
-     - ``CST_METAFLAGS_P``
+   * - ``CST_METAFLAGS_P``
      - Parity of the low byte (x86 only; always 0 on other ISAs).
-   * - 5..7
-     - *(reserved)*
-     - Written as 0; readers should mask before comparing.
+
+   Any bit without a ``metaflags`` map entry is reserved, written
+   as 0; readers mask before comparing.
 
 Per-ISA EFLAGS → metaflags mapping:
 
@@ -698,11 +662,13 @@ Capstone-decoded dst register) whether to emit the FID.
 
 The encoding map carries the bit-name table under the
 ``metaflags`` map (one entry per ``CST_METAFLAGS_*`` bit), so a
-consumer reading the trace can resolve ``0x05`` to ``Z|C`` without
-hard-coding the bit positions.  ``REG_FLAGS`` (generic id 251) is
-the *architectural* register name a consumer compares against to
-decide whether an insn writes flags; the metaflags byte under FID
-0x77 is the canonical-shape value.
+consumer reading the trace can resolve the metaflags byte to, say,
+``Z|C`` without hard-coding the bit positions.  ``REG_FLAGS`` is the
+*architectural* flags-register name (resolve its numeric id through
+the ``reg`` map, never a literal) that a consumer compares against
+to decide whether an insn writes flags; the metaflags byte (its FID
+resolved through the ``field_id`` map, like every field) is the
+canonical-shape value.
 
 .. _mem-access-pattern:
 

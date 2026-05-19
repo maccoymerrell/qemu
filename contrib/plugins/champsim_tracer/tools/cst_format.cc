@@ -59,9 +59,15 @@ void parse_encoding_maps(Reader &r, EncodingMaps *out)
 
 void parse_templates_at(Reader &r,
                         const ResolvedIds &ids,
+                        uint8_t header_flags,
                         std::vector<Template> *out,
                         std::unordered_map<uint32_t, size_t> *out_by_id)
 {
+    /* The §6 profile block follows each template's insn descriptors
+     * only when the CST_FLAG_PROFILE header bit is set;
+     * otherwise t.profile is left default-constructed. */
+    const bool have_profile =
+        (header_flags & ids.flag_profile) != 0;
     uint64_t n = r.uleb();
     out->reserve(n);
     for (uint64_t i = 0; i < n; i++) {
@@ -141,10 +147,10 @@ void parse_templates_at(Reader &r,
             t.insns.push_back(std::move(I));
         }
 
-        /* Template profile block (format §6), always present after
-         * the last insn.  pat_flags bit layout is fixed; value names
-         * resolve via the mem_access_pattern / profile_flag maps. */
-        {
+        /* Template profile block (format §6).  pat_flags bit layout
+         * is fixed; class/flag values resolve via the
+         * mem_access_pattern / profile_flag maps. */
+        if (have_profile) {
             TemplateProfileInfo &P = t.profile;
             P.exec_cp          = sub.uleb();
             P.exec_wp          = sub.uleb();
@@ -303,6 +309,9 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
                 &ids->flag_mem_data);
     resolve_one(maps.header_flag, "header_flag", "CST_FLAG_REG_DATA",
                 &ids->flag_reg_data);
+    resolve_one(maps.header_flag, "header_flag",
+                "CST_FLAG_PROFILE",
+                &ids->flag_profile);
 
     /* wp_event_flag (bit masks) */
     resolve_one(maps.wp_event_flag, "wp_event_flag",
@@ -856,7 +865,7 @@ Header parse_header(MemberView view,
      * member.  No length prefix on the section itself — it ends at
      * end-of-buffer. */
     if (!r.eof() && out_templates) {
-        parse_templates_at(r, h.ids, out_templates, out_by_id);
+        parse_templates_at(r, h.ids, h.flags, out_templates, out_by_id);
     }
     if (!r.eof()) {
         throw std::runtime_error("header member has trailing bytes after templates");

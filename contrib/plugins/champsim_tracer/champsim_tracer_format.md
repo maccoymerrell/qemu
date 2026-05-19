@@ -214,9 +214,10 @@ Decode by repeated outer-section unwrapping.
                                        ; block, same order & length
        symbol_name        : string     ; may be empty
        repeat num_insns times: one insn descriptor per Step 4.4
-       profile_block                   ; per Step 4.6 (always present)
-     After the profile block is decoded, tmpl_section must be
-     empty; reject otherwise.
+       if (header.flags & header_flag.CST_FLAG_PROFILE):
+         profile_block                 ; per Step 4.6 (optional)
+     After the per-insn descriptors and the optional profile block,
+     tmpl_section must be empty; reject otherwise.
 4.4  Per-insn template descriptor (consumed from tmpl_section):
        pc_delta           : ULEB       ; abs PC = prev_pc + pc_delta
                                        ; prev_pc = start_pc for the
@@ -255,10 +256,14 @@ Decode by repeated outer-section unwrapping.
      address — so the consumer can fire each memop without waiting
      on inputs irrelevant to its address).  See Reference §3 for
      the bit layout inside each mask.
-4.6  Template profile block (consumed from tmpl_section, always
-     present, immediately after the last insn descriptor).  This is
-     run-aggregated PGO-style metadata; it does not affect replay
-     and a consumer that does not model it may skip the bytes.
+4.6  Template profile block (consumed from tmpl_section,
+     immediately after the last insn descriptor, present only when
+     the `CST_FLAG_PROFILE` header bit is set — resolve the
+     bit via the `header_flag` map).  This is run-aggregated
+     PGO-style metadata; it does not affect replay, and a constructor
+     without it omits the block and clears the flag (same optional
+     contract as the dep sub-block).  A consumer that does not model
+     it may skip the bytes.
        exec_cp            : ULEB   ; #times this BB ran, correct path
        exec_wp            : ULEB   ; #times this BB ran, wrong path
        ;     exec_cp == exec_wp == 0 is VALID: a pre-declared REP
@@ -295,32 +300,32 @@ Decode by repeated outer-section unwrapping.
        repeat num_insns times:
          memops_cp        : ULEB   ; total mem-ops this insn issued, CP
          memops_wp        : ULEB   ; total mem-ops this insn issued, WP
-         pat_flags        : u8     ; bit[1:0] cp access pattern
-                                   ; bit[3:2] wp access pattern
-                                   ;   Classified on the SECOND-order
-                                   ;   difference of effective
-                                   ;   addresses — the change in step
-                                   ;   size between consecutive
-                                   ;   accesses (ddelta = delta_n −
-                                   ;   delta_{n-1}), NOT the raw step
-                                   ;   size:
-                                   ;   0 none     no mem access seen
-                                   ;   1 regular  constant stride
-                                   ;     (every ddelta == 0; incl.
-                                   ;     stride 0)
-                                   ;   2 irregular stride varies but
-                                   ;     every |ddelta| ≤ 4096 (e.g.
-                                   ;     a smoothly walking stride
-                                   ;     1,2,3,… → ddelta == 1)
-                                   ;   3 random   some |ddelta| > 4096
-                                   ;     (step size jumped by > a
-                                   ;     page between two accesses)
-                                   ;   reports the strongest class
-                                   ;   observed
+         pat_flags        : u8     ; bit[1:0] cp access-pattern class
+                                   ; bit[3:2] wp access-pattern class
+                                   ;   Resolve the 2-bit class value
+                                   ;   through the `mem_access_pattern`
+                                   ;   map (CST_PAT_*) — do NOT assume
+                                   ;   fixed numbers.  Classes, by
+                                   ;   meaning: no memory access; a
+                                   ;   regular access (constant
+                                   ;   stride); an irregular access
+                                   ;   (stride varies but each change
+                                   ;   in stride stays within a page);
+                                   ;   a random access (some stride
+                                   ;   change exceeds a page).  The
+                                   ;   writer classifies on the
+                                   ;   second-order address difference
+                                   ;   and reports the strongest class
+                                   ;   observed; the exact heuristic
+                                   ;   is a writer-side detail, not a
+                                   ;   wire contract.
                                    ; bit[4] cp data-is-address
                                    ; bit[5] wp data-is-address
-                                   ;   (loaded/stored value fell in
-                                   ;   the run's observed addr window)
+                                   ;   Resolve bits[4]/[5] through the
+                                   ;   `profile_flag` map (CST_PROFILE_*);
+                                   ;   set when a loaded/stored value
+                                   ;   fell in the run's observed addr
+                                   ;   window.
          if memops_cp > 0:
            lo_addr_cp     : ULEB   ; lowest effective addr, CP
            hi_addr_cp     : ULEB   ; (highest − lowest), CP
@@ -585,14 +590,18 @@ is not set.
 Readers reject any file whose magic disagrees with `CST_MAGIC`.
 There is one shape, and the tools support exactly that shape.
 
-Header feature flags are advisory. The field IDs still determine what
-is actually present in each delta section.
+The MEM_DATA / REG_DATA bits are advisory hints about field
+families — the field IDs still determine what actually appears in
+each delta section.  CST_FLAG_PROFILE is structural: it
+gates the presence of the per-template profile block (§4.6 / §6),
+exactly as the per-insn CST_INSN_FLAG_HAS_DEP_BLOCK gates the dep
+sub-block.  Resolve every bit through the `header_flag` map.
 
 ```
-bit 0  CST_FLAG_MEM_DATA      LOAD_DATA / STORE_DATA fields may appear
-bit 1  CST_FLAG_REG_DATA      DST_REG fields may appear
-bit 2  CST_FLAG_RESERVED_2    reserved, written as 0
-bits 3..7                    reserved, written as 0
+bit 0  CST_FLAG_MEM_DATA          LOAD_DATA / STORE_DATA may appear
+bit 1  CST_FLAG_REG_DATA          DST_REG fields may appear
+bit 2  CST_FLAG_PROFILE  per-template profile block present
+bits 3..7                        reserved, written as 0
 ```
 
 Per-instruction template flags:

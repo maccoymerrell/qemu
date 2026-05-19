@@ -554,21 +554,21 @@ static std::vector<ProfTgt> build_prof_targets(const BBTemplate *tmpl)
             last->branch_type == BRANCH_INDIRECT_JUMP ||
             last->branch_type == BRANCH_RETURN;
         if (indirect) {
-            const BranchRecord *br = g_branch_history.find(
-                tmpl->insn_pcs[tmpl->n_insns - 1]);
-            if (br) {
-                uint64_t tot_cp = 0;
-                for (uint8_t k = 0; k < BRANCH_TARGET_HISTORY; k++) {
-                    if (br->targets[k].valid) {
-                        tot_cp += br->targets[k].count;
-                    }
-                }
-                for (uint8_t k = 0; k < BRANCH_TARGET_HISTORY; k++) {
-                    if (!br->targets[k].valid) continue;
-                    uint64_t c = br->targets[k].count;
+            /* Per-template indirect target distribution.  Overlapping
+             * BBs sharing a terminal branch PC each maintain their own
+             * tally (TemplateProfile::indirect_targets) so the per-PC
+             * g_branch_history aggregate is never over-attributed.  WP
+             * aggregate (not per-target-tracked) attaches to target[0]
+             * per the format contract.  Total visits = taken + not-
+             * taken so a conditional-indirect form's fall-throughs
+             * land in each target's nottaken_cp split. */
+            uint64_t tot_cp = bt_cp + bnt_cp;
+            if (pp) {
+                for (uint8_t k = 0; k < pp->n_indirect_targets; k++) {
+                    uint64_t c = pp->indirect_targets[k].count_cp;
                     bool first = prof_tgts.empty();
                     prof_tgts.push_back({
-                        br->targets[k].target,
+                        pp->indirect_targets[k].target,
                         c, tot_cp - c,
                         first ? bt_wp : 0,
                         first ? bnt_wp : 0,
@@ -2789,6 +2789,31 @@ static void profile_branch(BBTemplate *t, uint64_t next_pc, bool wp)
         if (taken) p->br_taken_wp++; else p->br_nottaken_wp++;
     } else {
         if (taken) p->br_taken_cp++; else p->br_nottaken_cp++;
+        /* Indirect terminator: keep a per-template target tally so
+         * overlapping BBs sharing the same terminal branch PC don't
+         * over-attribute the per-PC g_branch_history aggregate.  The
+         * tally is only built for indirect/return (multi-target) BBs;
+         * non-indirect BBs have exactly one taken edge captured by
+         * br_taken_cp / br_nottaken_cp. */
+        bool indirect =
+            last->branch_type == BRANCH_INDIRECT_JUMP ||
+            last->branch_type == BRANCH_RETURN;
+        if (indirect && taken) {
+            for (uint8_t k = 0; k < p->n_indirect_targets; k++) {
+                if (p->indirect_targets[k].target == next_pc) {
+                    p->indirect_targets[k].count_cp++;
+                    return;
+                }
+            }
+            if (p->n_indirect_targets < CST_PROFILE_INDIRECT_TARGETS_CAP) {
+                p->indirect_targets[p->n_indirect_targets].target = next_pc;
+                p->indirect_targets[p->n_indirect_targets].count_cp = 1;
+                p->n_indirect_targets++;
+            }
+            /* Capacity exhausted: silently drop.  Matches BranchRecord's
+             * LRU behaviour at the per-PC layer; the profile block is
+             * advisory metadata, not replay state. */
+        }
     }
 }
 

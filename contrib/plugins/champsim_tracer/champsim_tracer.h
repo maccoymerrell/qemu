@@ -396,11 +396,31 @@ typedef struct {
     uint8_t  addr_cp, addr_wp;         /* data-is-address seen     */
 } InsnProfile;
 
+/*
+ * Per-(target_pc, CP count) tally for an indirect terminator.  When
+ * multiple BBTemplates share a terminal branch PC (overlapping BBs
+ * entered at different points), each template's own observed taken
+ * targets must be attributed PER-TEMPLATE — the per-PC
+ * g_branch_history aggregates across templates and would over-
+ * attribute its full count to every template that shares the PC.
+ * Filled by profile_branch CP for indirect terminators.  Fixed cap at
+ * BRANCH_TARGET_HISTORY (== g_branch_history's per-PC cap).
+ */
+typedef struct {
+    uint64_t target;
+    uint64_t count_cp;
+} TemplateProfTarget;
+#define CST_PROFILE_INDIRECT_TARGETS_CAP 16  /* == BRANCH_TARGET_HISTORY */
+
 typedef struct {
     uint64_t exec_cp, exec_wp;
     uint64_t br_taken_cp, br_nottaken_cp;
     uint64_t br_taken_wp, br_nottaken_wp;
     InsnProfile *insns;                /* g_new0 array, n_insns    */
+    /* Indirect-only per-template target distribution; empty
+     * (n_indirect_targets == 0) for non-indirect BBs. */
+    TemplateProfTarget indirect_targets[CST_PROFILE_INDIRECT_TARGETS_CAP];
+    uint8_t  n_indirect_targets;
 } TemplateProfile;
 
 /*

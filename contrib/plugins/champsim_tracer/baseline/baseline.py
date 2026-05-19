@@ -100,6 +100,24 @@ def _tmpl_sha(cst: pathlib.Path) -> str:
     return hashlib.sha256(r.stdout.encode()).hexdigest()
 
 
+def _disasm_sha(cst: pathlib.Path) -> str:
+    """sha256 of the full decoded body disassembly (deps + lanes).
+    body_sha covers the raw body.cst member (tracer output); this
+    covers the *decoder's* body rendering, which a decoder refactor
+    can change without touching the tracer.  Only meaningful where
+    the body stream is deterministic (genval wp0), so callers gate
+    it the same way as body_sha."""
+    r = _sh([str(_DECODE), "--format=disasm", "--show-deps",
+             "--show-lanes", str(cst)])
+    # Drop the two volatile header lines (embedded QEMU command line
+    # incl. outfile/work paths, and the wall-clock datetime); every
+    # other line is content and stays in the hash.
+    body = "\n".join(ln for ln in r.stdout.splitlines()
+                     if not ln.startswith("; command=")
+                     and not ln.startswith("; datetime="))
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
 _AUDIT_PROF = re.compile(
     r"exec_cp=(\d+)\s+exec_wp=(\d+)\s+mem-insns=(\d+)\s+"
     r"addr-insns=(\d+)\s+pat\[[^\]]*\]=(\d+)/(\d+)/(\d+)/(\d+)")
@@ -223,6 +241,9 @@ def _produce(dest: pathlib.Path, work: pathlib.Path,
                 manifest[key] = {
                     "body_sha": _body_sha(cst),
                     "tmpl_sha": _tmpl_sha(cst),
+                    # decoder body rendering — only deterministic
+                    # (hence compared) for genval wp0.
+                    "disasm_sha": _disasm_sha(cst) if wp == 0 else "",
                     "size": cst.stat().st_size,
                     "audit": _audit(cst),
                     "wp": wp,
@@ -300,6 +321,10 @@ def _cmp_entry(key: str, ref: dict, cur: dict) -> list[str]:
             diffs.append(f"{key}: template-dict mismatch "
                          f"ref={ref['tmpl_sha'][:12]} "
                          f"cur={cur['tmpl_sha'][:12]}")
+        if ref.get("disasm_sha") != cur.get("disasm_sha"):
+            diffs.append(f"{key}: decoded-disasm mismatch "
+                         f"ref={str(ref.get('disasm_sha'))[:12]} "
+                         f"cur={str(cur.get('disasm_sha'))[:12]}")
         keys = ref["audit"].keys()
     else:
         # wp1 (WP-on-uninitialised-memory residue) and all mcf:

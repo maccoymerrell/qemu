@@ -267,6 +267,14 @@ void dep_x86_stack_push(const struct qemu_plugin_insn_info *info,
                         InsnFields *fields);
 void dep_x86_stack_pop(const struct qemu_plugin_insn_info *info,
                        InsnFields *fields);
+void dep_vec_struct_load(const struct qemu_plugin_insn_info *info,
+                         InsnFields *fields);
+void dep_vec_struct_store(const struct qemu_plugin_insn_info *info,
+                          InsnFields *fields);
+void dep_vec_struct_load_interleaved(
+    const struct qemu_plugin_insn_info *info, InsnFields *fields);
+void dep_vec_struct_store_interleaved(
+    const struct qemu_plugin_insn_info *info, InsnFields *fields);
 
 /*
  * Instruction-level vector lane shape from the Capstone operand

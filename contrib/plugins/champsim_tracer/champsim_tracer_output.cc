@@ -1685,21 +1685,32 @@ static uint64_t lane_active_gate(const InsnFields *f, unsigned cpu_index)
 /*
  * Per-memop data lane mask: which lanes of the associated vector reg
  * this access feeds (load) / drains (store).  From the memop byte
- * range vs the insn's same-direction access base and element width:
+ * Lane mask attribution flow:
  *
- *   lane_start = (memop_vaddr - access_base) / lane_bytes
- *   lane_count =  memop_size                 / lane_bytes
- *   mask       = ((1 << lane_count) - 1) << lane_start
+ *   1. The dep refiner (template-build time, per-mnemonic) records on
+ *      each dst's dst_dep / each store's store_data_dep which load /
+ *      store slots feed that operand — the ACTUAL ISA semantics, e.g.
+ *      AArch64 LD1 multi-reg → first lanes_per_reg slots feed dst[0],
+ *      next lanes_per_reg feed dst[1], etc.  Without a precise refiner
+ *      the bits collapse to all-to-all and we have no per-memop
+ *      attribution.
+ *   2. At emit time, this routine looks up memop slot k in the
+ *      dep masks to find its OWNING operand-side register r, then
+ *      assigns it the rank-th set bit (or contiguous span of bits)
+ *      of side_lane_mask[r], where rank is k's position among r's
+ *      memop slots sorted in slot order (== address order for the
+ *      sequential layouts the partitioning refiners model).
+ *   3. Element insert/extract (PINSR/PEXTR/INSERTPS) is a structural
+ *      exception: one element-sized memop targeting the immediate-
+ *      selected lane.
+ *   4. lane_bytes == 0 (runtime-SEW, e.g. RISC-V V) gives no static
+ *      lane width, so we fall back to one-lane-per-memop in slot
+ *      order — narrowed by the exec gate.
  *
- * access_base = lowest vaddr among the insn's same-direction memops
- * (lane 0 of a contiguous access).  lane_bytes==0 (runtime-SEW, e.g.
- * RISC-V V) falls back to one-lane-per-memop in slot order, narrowed
- * by the exec gate.
- *
- * Exception: element insert/extract (PINSR/PEXTR/INSERTPS) move ONE
- * element; the target lane is the insn immediate, not the address.
- * Detected as: exactly one same-direction memop, element-sized
- * (data_size == lane_bytes), insn has an immediate.
+ * When the dep masks are all-to-all (no precise refiner bound), no
+ * per-memop attribution is recoverable: we emit an empty mask
+ * (consumer's "no lane info") rather than guessing, since the wrong
+ * guess would lie about the dataflow.
  */
 static uint64_t memop_data_lane_mask(const EntryView *ev, uint32_t i,
                                      uint8_t slot, uint8_t want_type,
@@ -1725,25 +1736,73 @@ static uint64_t memop_data_lane_mask(const EntryView *ev, uint32_t i,
         return (lane < 64) ? ((uint64_t)1 << lane) : 0;
     }
 
-    /* access_base = min vaddr over this insn's same-direction memops. */
-    uint64_t base = dp->value;
-    for (uint8_t s = 0;; s++) {
-        const DynParam *o = find_memop_slot(ev, i, s, want_type);
-        if (!o) break;
-        if (o->value < base) base = o->value;
+    /* Find this memop's host register by reading the dep masks the
+     * refiner produced.  Loads land in dst_dep[]; stores in
+     * store_data_dep[].  Each mask's bits in [n_src, n_src + max_loads)
+     * point to load slots; for store_data_dep[s], one of its src_reg
+     * bits points to the vec-value src.  The host register is the one
+     * whose dep mask includes this memop's slot index. */
+    uint8_t host_reg_idx = 0xFF;
+    uint64_t host_lane_mask = 0;
+    unsigned slots_before = 0;   /* count of earlier memop slots that
+                                  * also feed the same host register */
+    if (!f->has_reg_deps) {
+        /* No precise refiner bound for this mnemonic; can't recover
+         * the per-memop -> per-register attribution.  Empty mask. */
+        return 0;
     }
+    if (want_type == DYN_LOAD_ADDR) {
+        const uint64_t load_bit_k = (uint64_t)1 <<
+            ((uint64_t)f->n_src_regs + (uint64_t)slot);
+        for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+            if (!(f->dst_dep_mask[d] & load_bit_k)) continue;
+            host_reg_idx = d;
+            host_lane_mask = f->dst_lane_mask[d];
+            /* Rank among d's load slots: count earlier slots also in
+             * dst_dep[d]'s load-bit range. */
+            uint64_t load_range = f->dst_dep_mask[d]
+                >> (uint64_t)f->n_src_regs;
+            uint64_t earlier = load_range & (((uint64_t)1 << slot) - 1);
+            slots_before = (unsigned)__builtin_popcountll(earlier);
+            break;
+        }
+    } else {
+        /* Stores: store_data_dep[slot] points to the value src_reg.
+         * Among same-slot-mask stores in store_data_dep[], rank by
+         * how many earlier slots reference the same src. */
+        const uint64_t this_slot_mask = f->store_data_dep_mask[slot]
+            & ((((uint64_t)1 << f->n_src_regs) - 1));
+        if (!this_slot_mask) return 0;
+        /* Lowest set bit selects the vec-value src for this store. */
+        uint8_t which = (uint8_t)__builtin_ctzll(this_slot_mask);
+        host_reg_idx = which;
+        host_lane_mask = f->src_lane_mask[which];
+        for (uint8_t s = 0; s < slot && s < MAX_STORES; s++) {
+            if (f->store_data_dep_mask[s] & this_slot_mask) {
+                slots_before++;
+            }
+        }
+    }
+    if (host_reg_idx == 0xFF || host_lane_mask == 0) return 0;
 
-    if (dp->value < base) return 0;            /* defensive */
-    uint64_t off   = dp->value - base;
-    uint64_t start = off / lane_bytes;
     uint64_t size  = dp->data_size ? dp->data_size : lane_bytes;
-    uint64_t count = size / lane_bytes;
-    if (count == 0) count = 1;
-    if (start >= 64) return 0;
-    if (start + count > 64) count = 64 - start;
-    uint64_t span = (count >= 64) ? ~(uint64_t)0
-                                  : (((uint64_t)1 << count) - 1);
-    return span << start;
+    uint64_t span  = size / lane_bytes;
+    if (span == 0) span = 1;
+
+    /* slots_before-th set bit of host_lane_mask is the first lane
+     * this memop fills; extend by `span` consecutive set bits for
+     * wide memops (data_size > lane_bytes). */
+    uint64_t result = 0;
+    unsigned seen = 0, taken = 0;
+    for (unsigned b = 0; b < 64 && taken < span; b++) {
+        if (!(host_lane_mask & ((uint64_t)1 << b))) continue;
+        if (seen >= slots_before) {
+            result |= (uint64_t)1 << b;
+            taken++;
+        }
+        seen++;
+    }
+    return result;
 }
 
 static bool extr_u64_src_lane_mask(const EntryView *ev, uint32_t i,

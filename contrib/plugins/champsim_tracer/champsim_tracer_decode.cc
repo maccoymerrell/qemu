@@ -521,19 +521,11 @@ void decode_detail_to_generic(uint64_t pc,
     }
 
     /*
-     * Optional .dep_refine: reads refined InsnFields, writes
-     * dst_dep_mask[] / store_data_dep_mask[].  NULL → no HAS_REG block
-     * (consumer falls back to all-to-all).  Refiner library in
-     * champsim_tracer_mnemonic_tables.c.
-     */
-    if (cls && cls->dep_refine) {
-        cls->dep_refine(info, out);
-    }
-
-    /*
-     * Lane info — orthogonal to .dep_refine.  Row carries static
-     * (lane_mask_kind, lane_parallel); resolve baseline mask / source
-     * reg from Capstone detail here so dep refiners stay dataflow-only.
+     * Lane info populated BEFORE .dep_refine so structured-vec dep
+     * refiners (e.g. dep_vec_struct_store) can identify vec-value
+     * operands by src/dst_lane_mask[i] != 0 rather than reconstruct
+     * that classification from Capstone again.  Lane population only
+     * reads operand-walk outputs; it doesn't depend on dep masks.
      */
     if (cls && cls->lane_mask_kind != LANE_MASK_KIND_NONE) {
         /* Instruction-level shape (slot-agnostic); we own the
@@ -584,6 +576,17 @@ void decode_detail_to_generic(uint64_t pc,
                 out->has_vec_lanes = true;
             }
         }
+    }
+
+    /*
+     * Optional .dep_refine: reads refined InsnFields (including the
+     * just-populated lane masks), writes dst_dep_mask[] /
+     * store_data_dep_mask[].  NULL → no HAS_REG block (consumer
+     * falls back to all-to-all).  Refiner library in
+     * champsim_tracer_mnemonic_tables.c.
+     */
+    if (cls && cls->dep_refine) {
+        cls->dep_refine(info, out);
     }
 
     /*

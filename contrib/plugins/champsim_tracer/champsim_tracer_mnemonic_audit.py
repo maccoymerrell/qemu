@@ -178,6 +178,10 @@ DEP_REFINERS: set[str] = {
     "dep_lea",
     "dep_x86_stack_push",
     "dep_x86_stack_pop",
+    "dep_vec_struct_load",
+    "dep_vec_struct_store",
+    "dep_vec_struct_load_interleaved",
+    "dep_vec_struct_store_interleaved",
 }
 
 
@@ -229,6 +233,122 @@ ISA_STACK_POP_INSNS: dict[str, set[str]] = {
         # Multi-memop fan-outs
         "X86_INS_POPAW", "X86_INS_POPAL",
         "X86_INS_IRET", "X86_INS_IRETD", "X86_INS_IRETQ",
+    },
+}
+
+
+# Multi-register structured vector loads/stores whose dependency is
+# precisely expressible by dep_vec_struct_* refiners (dep mask
+# encodes which memops feed which dst register, rather than the
+# pessimistic dep_all_to_all over-approximation).
+#
+# SEQUENTIAL: memops partition contiguously across the dst regs —
+# slots [0, lanes_per_reg) → dst[0], [lanes_per_reg, 2*lanes_per_reg)
+# → dst[1], etc.  AArch64 NEON LD1/ST1 with N>1 register list,
+# AArch64 SVE single-Z LD1B/D/H/W/Q/SB/SH/SW (and fault-tolerant
+# variants).  Single-reg cases also fit (they collapse to
+# all-to-all on one dst, equivalent to the existing dep_all_to_all).
+#
+# INTERLEAVED: structure-deinterleave layout — slot k → dst (k %
+# n_dst_regs).  AArch64 NEON LD2/LD3/LD4, SVE LD2B/3B/4B etc.,
+# RISC-V V VLSEG2..VLSEG8 segment loads (and their strided /
+# indexed / fault-first siblings).
+#
+# Replicate (LD1R / LD2R / LD3R / LD4R, SVE LD1R*) and broadcast
+# variants are deliberately omitted — they fan ONE memop to MANY
+# lanes (or replicate the same loaded value across dsts), a shape
+# the dep_vec_struct refiners don't model.  They stay on
+# dep_passthrough / dep_all_to_all, where a load → all-dst-lanes
+# attribution is the best we have.
+ISA_VEC_STRUCT_SEQUENTIAL_LOAD_INSNS: dict[str, set[str]] = {
+    "aarch64": {
+        # NEON multi-structure / SVE single-Z loads — sequential layout.
+        "AARCH64_INS_LD1",
+        "AARCH64_INS_LD1B", "AARCH64_INS_LD1D", "AARCH64_INS_LD1H",
+        "AARCH64_INS_LD1Q", "AARCH64_INS_LD1W",
+        "AARCH64_INS_LD1SB", "AARCH64_INS_LD1SH", "AARCH64_INS_LD1SW",
+        "AARCH64_INS_LDFF1B", "AARCH64_INS_LDFF1D", "AARCH64_INS_LDFF1H",
+        "AARCH64_INS_LDFF1W",
+        "AARCH64_INS_LDFF1SB", "AARCH64_INS_LDFF1SH", "AARCH64_INS_LDFF1SW",
+        "AARCH64_INS_LDNF1B", "AARCH64_INS_LDNF1D", "AARCH64_INS_LDNF1H",
+        "AARCH64_INS_LDNF1W",
+        "AARCH64_INS_LDNF1SB", "AARCH64_INS_LDNF1SH", "AARCH64_INS_LDNF1SW",
+        # Multi-register GPR loads — same sequential partitioning
+        # shape (each memop feeds one dst); the dep refiner doesn't
+        # care that the dsts are scalar GPRs vs vector regs.  When
+        # max_dep_loads doesn't divide evenly across n_dst_regs (e.g.
+        # Capstone reports a single MEM operand) the refiner falls
+        # back to dep_all_to_all internally — safe to bind broadly.
+        "AARCH64_INS_LDP", "AARCH64_INS_LDPSW", "AARCH64_INS_LDNP",
+        "AARCH64_INS_LDIAPP",
+        "AARCH64_INS_LD64B",
+    },
+}
+ISA_VEC_STRUCT_INTERLEAVED_LOAD_INSNS: dict[str, set[str]] = {
+    "aarch64": {
+        "AARCH64_INS_LD2",
+        "AARCH64_INS_LD2B", "AARCH64_INS_LD2D", "AARCH64_INS_LD2H",
+        "AARCH64_INS_LD2Q", "AARCH64_INS_LD2W",
+        "AARCH64_INS_LD3",
+        "AARCH64_INS_LD3B", "AARCH64_INS_LD3D", "AARCH64_INS_LD3H",
+        "AARCH64_INS_LD3Q", "AARCH64_INS_LD3W",
+        "AARCH64_INS_LD4",
+        "AARCH64_INS_LD4B", "AARCH64_INS_LD4D", "AARCH64_INS_LD4H",
+        "AARCH64_INS_LD4Q", "AARCH64_INS_LD4W",
+    },
+    "riscv": {
+        # VLSEG2..VLSEG8 unit-stride, strided, indexed-ordered,
+        # indexed-unordered, and their fault-first siblings — all
+        # interleave by the segment factor.
+        f"RISCV_INS_{prefix}{nf}E{ew}{ff}_V"
+        for prefix in ("VLSEG", "VLSSEG")
+        for nf in range(2, 9)
+        for ew in (8, 16, 32, 64)
+        for ff in ("", "FF")
+        if not (prefix == "VLSSEG" and ff == "FF")
+    } | {
+        f"RISCV_INS_{prefix}{nf}EI{ew}_V"
+        for prefix in ("VLOXSEG", "VLUXSEG")
+        for nf in range(2, 9)
+        for ew in (8, 16, 32, 64)
+    },
+}
+ISA_VEC_STRUCT_SEQUENTIAL_STORE_INSNS: dict[str, set[str]] = {
+    "aarch64": {
+        # NEON / SVE multi-register stores — sequential layout.
+        "AARCH64_INS_ST1",
+        "AARCH64_INS_ST1B", "AARCH64_INS_ST1D", "AARCH64_INS_ST1H",
+        "AARCH64_INS_ST1Q", "AARCH64_INS_ST1W",
+        # Multi-register GPR stores (mirror of the LDP/STP family
+        # above).  ST64BV / ST64BV0 are MTE-tagged variants with an
+        # extra implicit-reg side effect and stay on dep_all_to_all
+        # for now; ST64B fits the partitioning shape.
+        "AARCH64_INS_STP", "AARCH64_INS_STNP", "AARCH64_INS_STILP",
+        "AARCH64_INS_ST64B",
+    },
+}
+ISA_VEC_STRUCT_INTERLEAVED_STORE_INSNS: dict[str, set[str]] = {
+    "aarch64": {
+        "AARCH64_INS_ST2",
+        "AARCH64_INS_ST2B", "AARCH64_INS_ST2D", "AARCH64_INS_ST2H",
+        "AARCH64_INS_ST2Q", "AARCH64_INS_ST2W",
+        "AARCH64_INS_ST3",
+        "AARCH64_INS_ST3B", "AARCH64_INS_ST3D", "AARCH64_INS_ST3H",
+        "AARCH64_INS_ST3Q", "AARCH64_INS_ST3W",
+        "AARCH64_INS_ST4",
+        "AARCH64_INS_ST4B", "AARCH64_INS_ST4D", "AARCH64_INS_ST4H",
+        "AARCH64_INS_ST4Q", "AARCH64_INS_ST4W",
+    },
+    "riscv": {
+        f"RISCV_INS_{prefix}{nf}E{ew}_V"
+        for prefix in ("VSSEG", "VSSSEG")
+        for nf in range(2, 9)
+        for ew in (8, 16, 32, 64)
+    } | {
+        f"RISCV_INS_{prefix}{nf}EI{ew}_V"
+        for prefix in ("VSOXSEG", "VSUXSEG")
+        for nf in range(2, 9)
+        for ew in (8, 16, 32, 64)
     },
 }
 
@@ -949,6 +1069,18 @@ def classify_dep_refine_explicit(info: IsaInfo, const_name: str,
         return ("dep_x86_stack_push", True)
     if const_name in ISA_STACK_POP_INSNS.get(info.key, set()):
         return ("dep_x86_stack_pop", True)
+    if const_name in ISA_VEC_STRUCT_SEQUENTIAL_LOAD_INSNS.get(info.key,
+                                                              set()):
+        return ("dep_vec_struct_load", True)
+    if const_name in ISA_VEC_STRUCT_INTERLEAVED_LOAD_INSNS.get(info.key,
+                                                                set()):
+        return ("dep_vec_struct_load_interleaved", True)
+    if const_name in ISA_VEC_STRUCT_SEQUENTIAL_STORE_INSNS.get(info.key,
+                                                                set()):
+        return ("dep_vec_struct_store", True)
+    if const_name in ISA_VEC_STRUCT_INTERLEAVED_STORE_INSNS.get(info.key,
+                                                                  set()):
+        return ("dep_vec_struct_store_interleaved", True)
 
     variants = _variants_by_canonical(info.key).get(const_name)
     if not variants:

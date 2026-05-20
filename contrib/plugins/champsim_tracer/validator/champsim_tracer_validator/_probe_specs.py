@@ -163,6 +163,19 @@ _register_probe('probe_arm_vec_load_multi_lane', {'aarch64': {'asm':
             'clobbers': '"x9","v0","v1","v2","v3","v4","v5","v6","v7","v8"',
             'opcodes': ['VEC_LOAD']}})
 
+# AArch64 LD1 multi-register form — distinct ISA semantics from
+# LD2/LD3/LD4: this loads contiguous bytes into N adjacent vector
+# regs sequentially (no element interleave).  Exercises the
+# `dep_vec_struct_load` sequential refiner separately from the
+# `dep_vec_struct_load_interleaved` refiner bound to LD2/LD3/LD4.
+_register_probe('probe_arm_vec_load_multi_reg', {'aarch64': {'asm':
+                    '"mov  x9, sp\\n\\t"\n'
+                    '    "ld1 {v9.4s, v10.4s}, [x9]\\n\\t"\n'
+                    '    "ld1 {v11.4s, v12.4s, v13.4s}, [x9]\\n\\t"\n'
+                    '    "ld1 {v14.16b, v15.16b, v16.16b, v17.16b}, [x9]"',
+            'clobbers': '"x9","v9","v10","v11","v12","v13","v14","v15","v16","v17"',
+            'opcodes': ['VEC_LOAD']}})
+
 # AArch64 ST2/ST3/ST4 multi-structure stores — companion to the
 # load probe.  Each instruction has multiple memops, each draining
 # a different lane subset of the source register set.
@@ -171,6 +184,17 @@ _register_probe('probe_arm_vec_store_multi_lane', {'aarch64': {'asm':
                     '    "st2 {v0.4s, v1.4s}, [x9]\\n\\t"\n'
                     '    "st3 {v2.4h, v3.4h, v4.4h}, [x9]\\n\\t"\n'
                     '    "st4 {v5.16b, v6.16b, v7.16b, v8.16b}, [x9]"',
+            'clobbers': '"x9","memory"',
+            'opcodes': ['VEC_STORE']}})
+
+# AArch64 ST1 multi-register form — sequential mirror of the LD1
+# multi-reg probe; exercises `dep_vec_struct_store` distinctly from
+# the `dep_vec_struct_store_interleaved` refiner bound to ST2/ST3/ST4.
+_register_probe('probe_arm_vec_store_multi_reg', {'aarch64': {'asm':
+                    '"mov  x9, sp\\n\\t"\n'
+                    '    "st1 {v9.4s, v10.4s}, [x9]\\n\\t"\n'
+                    '    "st1 {v11.4s, v12.4s, v13.4s}, [x9]\\n\\t"\n'
+                    '    "st1 {v14.16b, v15.16b, v16.16b, v17.16b}, [x9]"',
             'clobbers': '"x9","memory"',
             'opcodes': ['VEC_STORE']}})
 

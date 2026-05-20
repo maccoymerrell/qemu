@@ -805,3 +805,350 @@ _register_probe('probe_mips_ll_sc', {
         'opcodes':  ['LOAD', 'STORE'],
     },
 })
+
+
+# ====================================================================
+# EXACT-CHECK PROBES
+# --------------------------------------------------------------------
+# Each probe below carries an `insns` key holding a list parallel to
+# its asm body — every entry exact-matched by validator.py's
+# _check_expected_insns against the decoded trace.  The helper
+# `_insn(opcode, src=..., dst=..., ...)` from asm_blocks.py compresses
+# the per-entry dict; see BlockPlan.expected_insns for the full set
+# of fields.
+#
+# These probes exist independently of the legacy `opcodes` /
+# `reg_sets` keys so authors can add exact checks incrementally.  The
+# validator's existing static_reg_sets / opcode_coverage probes still
+# run against the same templates.
+# ====================================================================
+
+from .asm_blocks import _insn
+
+# Plain integer ADD reg, reg → reg.  One-instruction probe.  Spans all
+# four ISAs with the same shape: two GPRs read, one GPR (and on x86 /
+# AArch64 the integer flags reg) written.
+_register_probe('probe_exact_int_add_rr', {
+    'x86_64': {
+        # `addq %rbx, %rax` (ATT: dst-last; RAX is read+written, RBX read).
+        'asm':      '"addq %%rbx, %%rax"',
+        'clobbers': '"rax","cc"',
+        'opcodes':  ['INT_ADD'],
+        'insns': [
+            _insn("GEN_OP_INT_ADD",
+                  branch_type="BRANCH_NONE",
+                  src=["REG_GPR0", "REG_GPR3"],
+                  dst=["REG_GPR0", "REG_FLAGS"],
+                  insn_flags_clear=[
+                      "CST_INSN_FLAG_HAS_IMM",
+                      "CST_INSN_FLAG_ATOMIC",
+                      "CST_INSN_FLAG_BRANCH_COND",
+                      "CST_INSN_FLAG_VEC",
+                      "CST_INSN_FLAG_LANE_PARALLEL",
+                  ]),
+        ],
+    },
+    'aarch64': {
+        # `add x0, x0, x1` (no flag write — ADD vs ADDS).
+        'asm':      '"add x0, x0, x1"',
+        'clobbers': '"x0"',
+        'opcodes':  ['INT_ADD'],
+        'insns': [
+            _insn("GEN_OP_INT_ADD",
+                  branch_type="BRANCH_NONE",
+                  src=["REG_GPR0", "REG_GPR1"],
+                  dst=["REG_GPR0"],
+                  insn_flags_clear=[
+                      "CST_INSN_FLAG_HAS_IMM",
+                      "CST_INSN_FLAG_ATOMIC",
+                      "CST_INSN_FLAG_BRANCH_COND",
+                      "CST_INSN_FLAG_VEC",
+                      "CST_INSN_FLAG_LANE_PARALLEL",
+                  ]),
+        ],
+    },
+    'riscv64': {
+        # `add t0, t0, t1` (RV64 R-type; no flags register).
+        'asm':      '"add t0, t0, t1"',
+        'clobbers': '"t0"',
+        'opcodes':  ['INT_ADD'],
+        'insns': [
+            _insn("GEN_OP_INT_ADD",
+                  branch_type="BRANCH_NONE",
+                  src=["REG_GPR5", "REG_GPR6"],
+                  dst=["REG_GPR5"],
+                  insn_flags_clear=[
+                      "CST_INSN_FLAG_HAS_IMM",
+                      "CST_INSN_FLAG_ATOMIC",
+                      "CST_INSN_FLAG_BRANCH_COND",
+                      "CST_INSN_FLAG_VEC",
+                      "CST_INSN_FLAG_LANE_PARALLEL",
+                  ]),
+        ],
+    },
+    'mipsel': {
+        # `addu $t0, $t1, $t2` (MIPS unsigned add; no implicit flag).
+        'asm':      '"addu $t0, $t1, $t2"',
+        'clobbers': '"$t0"',
+        'opcodes':  ['INT_ADD'],
+        'insns': [
+            _insn("GEN_OP_INT_ADD",
+                  branch_type="BRANCH_NONE",
+                  src=["REG_GPR9", "REG_GPR10"],
+                  dst=["REG_GPR8"],
+                  insn_flags_clear=[
+                      "CST_INSN_FLAG_HAS_IMM",
+                      "CST_INSN_FLAG_ATOMIC",
+                      "CST_INSN_FLAG_BRANCH_COND",
+                      "CST_INSN_FLAG_VEC",
+                      "CST_INSN_FLAG_LANE_PARALLEL",
+                  ]),
+        ],
+    },
+})
+
+
+# Integer SUB reg, reg → reg.
+_register_probe('probe_exact_int_sub_rr', {
+    'x86_64':  {'asm': '"subq %%rbx, %%rax"', 'clobbers': '"rax","cc"',
+                'opcodes': ['INT_SUB'],
+                'insns': [_insn("INT_SUB", branch_type="NONE",
+                                src=["REG_GPR0", "REG_GPR3"],
+                                dst=["REG_GPR0", "REG_FLAGS"])]},
+    'aarch64': {'asm': '"sub x0, x0, x1"', 'clobbers': '"x0"',
+                'opcodes': ['INT_SUB'],
+                'insns': [_insn("INT_SUB", branch_type="NONE",
+                                src=["REG_GPR0", "REG_GPR1"],
+                                dst=["REG_GPR0"])]},
+    'riscv64': {'asm': '"sub t0, t0, t1"', 'clobbers': '"t0"',
+                'opcodes': ['INT_SUB'],
+                'insns': [_insn("INT_SUB", branch_type="NONE",
+                                src=["REG_GPR5", "REG_GPR6"],
+                                dst=["REG_GPR5"])]},
+    'mipsel':  {'asm': '"subu $t0, $t1, $t2"', 'clobbers': '"$t0"',
+                'opcodes': ['INT_SUB'],
+                'insns': [_insn("INT_SUB", branch_type="NONE",
+                                src=["REG_GPR9", "REG_GPR10"],
+                                dst=["REG_GPR8"])]},
+})
+
+# Bitwise AND reg, reg → reg.
+_register_probe('probe_exact_and_rr', {
+    'x86_64':  {'asm': '"andq %%rbx, %%rax"', 'clobbers': '"rax","cc"',
+                'opcodes': ['AND'],
+                'insns': [_insn("AND", branch_type="NONE",
+                                src=["REG_GPR0", "REG_GPR3"],
+                                dst=["REG_GPR0", "REG_FLAGS"])]},
+    'aarch64': {'asm': '"and x0, x0, x1"', 'clobbers': '"x0"',
+                'opcodes': ['AND'],
+                'insns': [_insn("AND", branch_type="NONE",
+                                src=["REG_GPR0", "REG_GPR1"],
+                                dst=["REG_GPR0"])]},
+    'riscv64': {'asm': '"and t0, t0, t1"', 'clobbers': '"t0"',
+                'opcodes': ['AND'],
+                'insns': [_insn("AND", branch_type="NONE",
+                                src=["REG_GPR5", "REG_GPR6"],
+                                dst=["REG_GPR5"])]},
+    'mipsel':  {'asm': '"and $t0, $t1, $t2"', 'clobbers': '"$t0"',
+                'opcodes': ['AND'],
+                'insns': [_insn("AND", branch_type="NONE",
+                                src=["REG_GPR9", "REG_GPR10"],
+                                dst=["REG_GPR8"])]},
+})
+
+# Bitwise OR reg, reg → reg.
+_register_probe('probe_exact_or_rr', {
+    'x86_64':  {'asm': '"orq %%rbx, %%rax"', 'clobbers': '"rax","cc"',
+                'opcodes': ['OR'],
+                'insns': [_insn("OR", branch_type="NONE",
+                                src=["REG_GPR0", "REG_GPR3"],
+                                dst=["REG_GPR0", "REG_FLAGS"])]},
+    'aarch64': {'asm': '"orr x0, x0, x1"', 'clobbers': '"x0"',
+                'opcodes': ['OR'],
+                'insns': [_insn("OR", branch_type="NONE",
+                                src=["REG_GPR0", "REG_GPR1"],
+                                dst=["REG_GPR0"])]},
+    'riscv64': {'asm': '"or t0, t0, t1"', 'clobbers': '"t0"',
+                'opcodes': ['OR'],
+                'insns': [_insn("OR", branch_type="NONE",
+                                src=["REG_GPR5", "REG_GPR6"],
+                                dst=["REG_GPR5"])]},
+    'mipsel':  {'asm': '"or $t0, $t1, $t2"', 'clobbers': '"$t0"',
+                'opcodes': ['OR'],
+                'insns': [_insn("OR", branch_type="NONE",
+                                src=["REG_GPR9", "REG_GPR10"],
+                                dst=["REG_GPR8"])]},
+})
+
+# Bitwise XOR reg, reg → reg.
+_register_probe('probe_exact_xor_rr', {
+    'x86_64':  {'asm': '"xorq %%rbx, %%rax"', 'clobbers': '"rax","cc"',
+                'opcodes': ['XOR'],
+                'insns': [_insn("XOR", branch_type="NONE",
+                                src=["REG_GPR0", "REG_GPR3"],
+                                dst=["REG_GPR0", "REG_FLAGS"])]},
+    'aarch64': {'asm': '"eor x0, x0, x1"', 'clobbers': '"x0"',
+                'opcodes': ['XOR'],
+                'insns': [_insn("XOR", branch_type="NONE",
+                                src=["REG_GPR0", "REG_GPR1"],
+                                dst=["REG_GPR0"])]},
+    'riscv64': {'asm': '"xor t0, t0, t1"', 'clobbers': '"t0"',
+                'opcodes': ['XOR'],
+                'insns': [_insn("XOR", branch_type="NONE",
+                                src=["REG_GPR5", "REG_GPR6"],
+                                dst=["REG_GPR5"])]},
+    'mipsel':  {'asm': '"xor $t0, $t1, $t2"', 'clobbers': '"$t0"',
+                'opcodes': ['XOR'],
+                'insns': [_insn("XOR", branch_type="NONE",
+                                src=["REG_GPR9", "REG_GPR10"],
+                                dst=["REG_GPR8"])]},
+})
+
+# Logical shift-left reg, imm → reg.  AArch64 omitted intentionally:
+# `lsl reg, reg, #imm` encodes as UBFM (the LSL alias is just a
+# disasm hint), so Capstone returns AARCH64_INS_UBFM → GEN_OP_MOVZX
+# rather than GEN_OP_SHL.  That divergence is locked in by the
+# dedicated probe_exact_aarch64_ubfm probe below.
+_register_probe('probe_exact_shl_ri', {
+    'x86_64':  {'asm': '"shlq $3, %%rax"', 'clobbers': '"rax","cc"',
+                'opcodes': ['SHL'],
+                'insns': [_insn("SHL", branch_type="NONE",
+                                src=["REG_GPR0"],
+                                dst=["REG_GPR0", "REG_FLAGS"],
+                                insn_flags=["CST_INSN_FLAG_HAS_IMM"])]},
+    'riscv64': {'asm': '"slli t0, t0, 3"', 'clobbers': '"t0"',
+                'opcodes': ['SHL'],
+                'insns': [_insn("SHL", branch_type="NONE",
+                                src=["REG_GPR5"],
+                                dst=["REG_GPR5"],
+                                insn_flags=["CST_INSN_FLAG_HAS_IMM"])]},
+    'mipsel':  {'asm': '"sll $t0, $t1, 3"', 'clobbers': '"$t0"',
+                'opcodes': ['SHL'],
+                'insns': [_insn("SHL", branch_type="NONE",
+                                src=["REG_GPR9"],
+                                dst=["REG_GPR8"],
+                                insn_flags=["CST_INSN_FLAG_HAS_IMM"])]},
+})
+
+# AArch64 UBFM — the encoding LSL #imm / LSR #imm / UBFIZ / UBFX
+# all alias to.  Tracer classifies AARCH64_INS_UBFM → MOVZX (which is
+# arguably a misclassification of LSL #imm but matches the current
+# table; that classification is a separate fix).  HAS_IMM is asserted
+# SET because the source instruction does carry an immediate (the
+# shift amount); if the tracer's operand walker doesn't currently
+# expose UBFM's immr/imms as QEMU_PLUGIN_OP_IMM the probe will fail
+# here — which is the intent: a probe surfaces the gap so the tracer
+# learns to report it.
+_register_probe('probe_exact_aarch64_ubfm', {
+    'aarch64': {'asm': '"lsl x0, x0, #3"', 'clobbers': '"x0"',
+                'opcodes': ['MOVZX'],
+                'insns': [_insn("MOVZX", branch_type="NONE",
+                                src=["REG_GPR0"],
+                                dst=["REG_GPR0"],
+                                insn_flags=["CST_INSN_FLAG_HAS_IMM"])]},
+})
+
+
+# Compare reg, reg.  x86 / aarch64 CMP writes flags only; RISC-V SLT
+# and MIPS SLT write rd alongside reading rs1/rs2 — both classify as
+# GEN_OP_CMP in the tracer but have different reg-set shapes, so the
+# probe declares ISA-specific specs.
+_register_probe('probe_exact_cmp_rr', {
+    'x86_64':  {'asm': '"cmpq %%rbx, %%rax"', 'clobbers': '"cc"',
+                'opcodes': ['CMP'],
+                'insns': [_insn("CMP", branch_type="NONE",
+                                src=["REG_GPR0", "REG_GPR3"],
+                                dst=["REG_FLAGS"])]},
+    'aarch64': {'asm': '"cmp x0, x1"', 'clobbers': '"cc"',
+                'opcodes': ['CMP'],
+                'insns': [_insn("CMP", branch_type="NONE",
+                                src=["REG_GPR0", "REG_GPR1"],
+                                dst=["REG_FLAGS"])]},
+    'riscv64': {'asm': '"slt t0, t1, t2"', 'clobbers': '"t0"',
+                'opcodes': ['CMP'],
+                'insns': [_insn("CMP", branch_type="NONE",
+                                src=["REG_GPR6", "REG_GPR7"],
+                                dst=["REG_GPR5"])]},
+    'mipsel':  {'asm': '"slt $t0, $t1, $t2"', 'clobbers': '"$t0"',
+                'opcodes': ['CMP'],
+                'insns': [_insn("CMP", branch_type="NONE",
+                                src=["REG_GPR9", "REG_GPR10"],
+                                dst=["REG_GPR8"])]},
+})
+
+# Plain register-base + zero-offset load.  x86 mov-from-memory is the
+# more-specific GEN_OP_MOV classification per the format spec (LOAD is
+# the fall-through bucket); aarch64 LDR / riscv64 LD / mipsel LW each
+# remain the load-specific mnemonic and classify as GEN_OP_LOAD.
+#
+# dst_deps=[["load_data[0]"]] asserts the precise "the dst depends
+# only on the loaded value, not on the address-mode reg" shape that
+# dep_passthrough produces.  Today riscv64 LD / mipsel LW bind
+# dep_all_to_all, so the dep mask comes out as 0x3 (both bits set)
+# and the probe correctly flags the precision gap until those rows
+# get reclassified to dep_passthrough.
+_register_probe('probe_exact_load_rm', {
+    'x86_64':  {'asm': '"movq (%%rsp), %%rax"', 'clobbers': '"rax"',
+                'opcodes': ['MOV'],
+                'insns': [_insn("MOV", branch_type="NONE",
+                                src=["REG_SP"],
+                                dst=["REG_GPR0"],
+                                load_addr_deps=[["src_reg[0]"]],
+                                dst_deps=[["load_data[0]"]])]},
+    'aarch64': {'asm': '"ldr x0, [sp]"', 'clobbers': '"x0"',
+                'opcodes': ['LOAD'],
+                'insns': [_insn("LOAD", branch_type="NONE",
+                                src=["REG_SP"],
+                                dst=["REG_GPR0"],
+                                load_addr_deps=[["src_reg[0]"]],
+                                dst_deps=[["load_data[0]"]])]},
+    'riscv64': {'asm': '"ld t0, 0(sp)"', 'clobbers': '"t0"',
+                'opcodes': ['LOAD'],
+                'insns': [_insn("LOAD", branch_type="NONE",
+                                src=["REG_SP"],
+                                dst=["REG_GPR5"],
+                                load_addr_deps=[["src_reg[0]"]],
+                                dst_deps=[["load_data[0]"]])]},
+    'mipsel':  {'asm': '"lw $t0, 0($sp)"', 'clobbers': '"$t0"',
+                'opcodes': ['LOAD'],
+                'insns': [_insn("LOAD", branch_type="NONE",
+                                src=["REG_SP"],
+                                dst=["REG_GPR8"],
+                                load_addr_deps=[["src_reg[0]"]],
+                                dst_deps=[["load_data[0]"]])]},
+})
+
+# Plain register-base + zero-offset store.  Walker operand order
+# across all four ISAs is REG-src first, MEM-base added second, so
+# src_regs[] = [VALUE, BASE].  store_addr_deps points at index 1
+# (the base); store_data_deps points at index 0 (the value).
+_register_probe('probe_exact_store_rm', {
+    'x86_64':  {'asm': '"movq %%rax, (%%rsp)"', 'clobbers': '"memory"',
+                'opcodes': ['MOV'],
+                'insns': [_insn("MOV", branch_type="NONE",
+                                src=["REG_GPR0", "REG_SP"],
+                                dst=[],
+                                store_addr_deps=[["src_reg[1]"]],
+                                store_data_deps=[["src_reg[0]"]])]},
+    'aarch64': {'asm': '"str x0, [sp]"', 'clobbers': '"memory"',
+                'opcodes': ['STORE'],
+                'insns': [_insn("STORE", branch_type="NONE",
+                                src=["REG_GPR0", "REG_SP"],
+                                dst=[],
+                                store_addr_deps=[["src_reg[1]"]],
+                                store_data_deps=[["src_reg[0]"]])]},
+    'riscv64': {'asm': '"sd t0, 0(sp)"', 'clobbers': '"memory"',
+                'opcodes': ['STORE'],
+                'insns': [_insn("STORE", branch_type="NONE",
+                                src=["REG_GPR5", "REG_SP"],
+                                dst=[],
+                                store_addr_deps=[["src_reg[1]"]],
+                                store_data_deps=[["src_reg[0]"]])]},
+    'mipsel':  {'asm': '"sw $t0, 0($sp)"', 'clobbers': '"memory"',
+                'opcodes': ['STORE'],
+                'insns': [_insn("STORE", branch_type="NONE",
+                                src=["REG_GPR8", "REG_SP"],
+                                dst=[],
+                                store_addr_deps=[["src_reg[1]"]],
+                                store_data_deps=[["src_reg[0]"]])]},
+})

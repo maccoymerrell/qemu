@@ -65,6 +65,49 @@ class BlockPlan:
     # trace (typo in spec, classifier change, or instruction selection
     # bug).  Names come from validator.py's _DEP_REFINE_BUCKETS tuple.
     asserted_dep_refines: list[str] = dataclasses.field(default_factory=list)
+    # Author-declared per-instruction EXACT check vectors, parallel to
+    # the asm body (same indexing as expected_reg_sets).  Each entry is
+    # a dict with any subset of the following keys; missing keys aren't
+    # checked, so authors fill in only what they want exact-matched:
+    #
+    #   "src":      list[str] of GenericRegId names — same as
+    #               expected_reg_sets["src"].
+    #   "dst":      list[str] of GenericRegId names.
+    #   "opcode":   GEN_OP_* name (the trace's generic opcode).
+    #   "branch_type": BRANCH_* name.
+    #   "insn_flags": list of CST_INSN_FLAG_* names that MUST be set
+    #               (the per-insn flag byte).  Names not listed need
+    #               not be clear — extra flags are tolerated unless
+    #               also listed in "insn_flags_clear".
+    #   "insn_flags_clear": list of CST_INSN_FLAG_* names that MUST be
+    #               clear.
+    #   "dst_deps":   list parallel to dst[]; each entry is a list of
+    #               input-name strings selecting bits of dst_dep_mask.
+    #               Input names: "src_reg[i]" (i in 0..n_src-1),
+    #               "load_data[k]" (k in 0..max_dep_loads-1), "imm".
+    #   "store_data_deps": list parallel to the insn's store-data slots;
+    #               same shape as dst_deps.
+    #   "load_addr_deps":  list parallel to the insn's load slots; each
+    #               entry uses input-name strings (src_reg[i] and imm).
+    #   "store_addr_deps": same shape for store-address dep masks.
+    #   "src_lane_masks":  list[int] parallel to src_regs[]; each int is
+    #               the per-(insn,src-slot) lane bitmap.  Bit j set iff
+    #               lane j participates as input.
+    #   "dst_lane_masks":  list[int] parallel to dst_regs[].
+    #   "load_data_lane_masks":  list[int] parallel to the insn's load
+    #               slots — per-memop lane bitmap (which lane(s) of the
+    #               consuming dst register THIS memop fills).
+    #   "store_data_lane_masks": same shape for stores.
+    #
+    # The validator's `_check_expected_insns` resolves the symbolic
+    # references against the trace's per-template insn data (which
+    # carries dst_dep_mask / store_data_dep_mask / load_addr_dep_mask /
+    # store_addr_dep_mask exactly) and the per-entry observation
+    # records (which carry lane masks as runtime FID deltas).  An
+    # absent dep-mask family on the wire (no HAS_REG sub-block) maps
+    # to the implicit all-to-all approximation — authors who want to
+    # assert that absence write the field as an empty list.
+    expected_insns: list[dict] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -190,6 +233,45 @@ class CodeBlock:
     @classmethod
     def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
         raise NotImplementedError
+
+
+def _insn(opcode: str, *,
+          src: list[str] | None = None,
+          dst: list[str] | None = None,
+          branch_type: str | None = None,
+          insn_flags: list[str] | None = None,
+          insn_flags_clear: list[str] | None = None,
+          dst_deps: list[list[str]] | None = None,
+          store_data_deps: list[list[str]] | None = None,
+          load_addr_deps: list[list[str]] | None = None,
+          store_addr_deps: list[list[str]] | None = None,
+          src_lane_masks: list[int] | None = None,
+          dst_lane_masks: list[int] | None = None,
+          load_data_lane_masks: list[int] | None = None,
+          store_data_lane_masks: list[int] | None = None,
+          ) -> dict:
+    """Author helper for a single entry of BlockPlan.expected_insns.
+
+    Only the fields actually provided are filled into the dict, so the
+    validator's per-field "missing key = don't check" behavior
+    extends to every check vector — authors can spec just the opcode
+    and reg sets on cold paths and add deps / lane masks where
+    precision matters."""
+    d: dict = {"opcode": opcode}
+    if src is not None:                    d["src"] = src
+    if dst is not None:                    d["dst"] = dst
+    if branch_type is not None:            d["branch_type"] = branch_type
+    if insn_flags is not None:             d["insn_flags"] = insn_flags
+    if insn_flags_clear is not None:       d["insn_flags_clear"] = insn_flags_clear
+    if dst_deps is not None:               d["dst_deps"] = dst_deps
+    if store_data_deps is not None:        d["store_data_deps"] = store_data_deps
+    if load_addr_deps is not None:         d["load_addr_deps"] = load_addr_deps
+    if store_addr_deps is not None:        d["store_addr_deps"] = store_addr_deps
+    if src_lane_masks is not None:         d["src_lane_masks"] = src_lane_masks
+    if dst_lane_masks is not None:         d["dst_lane_masks"] = dst_lane_masks
+    if load_data_lane_masks is not None:   d["load_data_lane_masks"] = load_data_lane_masks
+    if store_data_lane_masks is not None:  d["store_data_lane_masks"] = store_data_lane_masks
+    return d
 
 
 def _u32(x: int) -> int:
@@ -1530,6 +1612,13 @@ def _register_probe(name: str, per_isa: dict[str, dict]) -> None:
             reg_value_assertions=list(spec.get("reg_value_assertions", [])),
             expected_reg_sets=list(spec.get("reg_sets", [])),
             asserted_dep_refines=list(spec.get("dep_refines", [])),
+            # Optional per-insn EXACT check vectors (opcode + branch +
+            # insn_flags + per-(dst/store/load_addr/store_addr) dep
+            # masks + per-operand-slot lane masks).  See
+            # `BlockPlan.expected_insns` for the field layout and the
+            # `_insn()` helper for spec authoring.  Resolved against
+            # the decoded trace by `_check_expected_insns`.
+            expected_insns=list(spec.get("insns", [])),
         )
 
     @classmethod

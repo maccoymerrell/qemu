@@ -1173,6 +1173,423 @@ def _check_expected_reg_sets(
     return issues
 
 
+# CST_INSN_FLAG_* bit definitions, mirroring champsim_tracer.h.  Not
+# read off the trace because the decoded insn dict exposes the booleans
+# (branch_conditional / is_atomic / lane_parallel) and the imm-presence
+# / dep-block-presence directly rather than the raw byte.
+_INSN_FLAG_BITS = {
+    "CST_INSN_FLAG_BRANCH_COND":   1 << 0,
+    "CST_INSN_FLAG_HAS_IMM":       1 << 1,
+    "CST_INSN_FLAG_ATOMIC":        1 << 2,
+    "CST_INSN_FLAG_VEC":           1 << 4,
+    "CST_INSN_FLAG_LANE_PARALLEL": 1 << 5,
+    "CST_INSN_FLAG_HAS_DEP_BLOCK": 1 << 6,
+}
+
+
+def _reconstruct_insn_flags(ins: dict,
+                            entry_lane_masks_for_insn: list[dict]) -> int:
+    """Rebuild the CST_INSN_FLAG_* byte from the decoded insn dict +
+    its accumulated runtime lane-mask observations.  VEC turns on when
+    any operand-side lane mask was observed non-zero across CP entries
+    of the parent template; HAS_DEP_BLOCK turns on when any dep-mask
+    family is non-empty (the decoder leaves them as `[]` when the
+    HAS_REG sub-block is absent).  The other flags are direct
+    one-to-one with the decoded booleans."""
+    flags = 0
+    if ins.get("branch_conditional"):
+        flags |= _INSN_FLAG_BITS["CST_INSN_FLAG_BRANCH_COND"]
+    if ins.get("imm") is not None:
+        flags |= _INSN_FLAG_BITS["CST_INSN_FLAG_HAS_IMM"]
+    if ins.get("is_atomic"):
+        flags |= _INSN_FLAG_BITS["CST_INSN_FLAG_ATOMIC"]
+    if ins.get("lane_parallel"):
+        flags |= _INSN_FLAG_BITS["CST_INSN_FLAG_LANE_PARALLEL"]
+    if any(ins.get(k)
+           for k in ("dst_dep_mask", "store_data_dep_mask",
+                     "load_addr_dep_mask", "store_addr_dep_mask")):
+        flags |= _INSN_FLAG_BITS["CST_INSN_FLAG_HAS_DEP_BLOCK"]
+    if any(int(lm.get("mask", 0)) for lm in entry_lane_masks_for_insn):
+        flags |= _INSN_FLAG_BITS["CST_INSN_FLAG_VEC"]
+    return flags
+
+
+def _resolve_dep_input_bit(name: str, n_src: int,
+                           max_dep_loads: int,
+                           layout: str) -> int | None:
+    """Map an author dep-input name (\"src_reg[i]\", \"load_data[k]\",
+    \"imm\") to its bit position inside a dep mask.  @layout selects
+    the bit shape — REG-mask layouts (dst_dep / store_data_dep)
+    include the load_data range; ADDR-mask layouts (load_addr_dep /
+    store_addr_dep) omit it because addresses compute before any
+    load fires.  Returns None on unknown names so the caller can
+    surface a "typo in spec" error."""
+    if name == "imm":
+        if layout == "reg":
+            return n_src + max_dep_loads
+        return n_src
+    if name.startswith("src_reg[") and name.endswith("]"):
+        idx = int(name[len("src_reg["):-1])
+        if 0 <= idx < n_src:
+            return idx
+        return None
+    if layout == "reg" and name.startswith("load_data[") and name.endswith("]"):
+        idx = int(name[len("load_data["):-1])
+        if 0 <= idx < max_dep_loads:
+            return n_src + idx
+        return None
+    return None
+
+
+def _names_to_dep_mask(names: list[str], n_src: int,
+                       max_dep_loads: int, layout: str
+                       ) -> tuple[int, list[str]]:
+    """Build a dep-mask integer from a list of input-name strings.
+    Returns (mask, unknown_names).  Unknown names are surfaced so the
+    validator can report a spec typo cleanly."""
+    mask = 0
+    unknown: list[str] = []
+    for n in names:
+        bit = _resolve_dep_input_bit(n, n_src, max_dep_loads, layout)
+        if bit is None:
+            unknown.append(n)
+        else:
+            mask |= 1 << bit
+    return mask, unknown
+
+
+def _check_expected_insns(
+        entries: list[dict],
+        templates_by_id: dict[int, dict],
+        blocks_by_id: dict[int, dict],
+        pcmap: "PcMap",
+        cp_set: set[int],
+        isa: str,
+        reg_id_to_name: dict[int, str]) -> list[Issue]:
+    """Compare author-declared per-instruction EXACT check vectors
+    (BlockPlan.expected_insns) against the decoded trace.  Each field
+    in an entry is optional; the validator only checks what's declared.
+
+    Fields covered:
+      * src / dst    — same shape as expected_reg_sets (REG_* names).
+      * opcode       — GEN_OP_* string vs the trace's per-insn opcode.
+      * branch_type  — BRANCH_* string vs the trace's per-insn type.
+      * insn_flags   — list of CST_INSN_FLAG_* names that must be set.
+      * insn_flags_clear — list of CST_INSN_FLAG_* names that must NOT
+                       be set (the per-insn flag byte is rebuilt from
+                       the decoded booleans + dep-mask / lane-mask
+                       observations).
+      * dst_deps / store_data_deps / load_addr_deps / store_addr_deps —
+                       per-output input-name lists resolved against
+                       the dep-mask bit layout from champsim_tracer_
+                       format.md §6.
+      * src_lane_masks / dst_lane_masks / load_data_lane_masks /
+        store_data_lane_masks — per-operand-slot lane bitmaps,
+                       compared against the OR of every CP entry's
+                       observation for this insn.
+
+    Author intent vs. trace divergence is reported.  The trace-vs-
+    Capstone check (_check_static_reg_sets) is still the orthogonal
+    "did the assembler produce what we asked" oracle.
+    """
+    blocks = [b for b in blocks_by_id.values()
+              if b["block_id"] in cp_set and b.get("expected_insns")]
+    if not blocks:
+        return [Issue(
+            "expected_insns", "info",
+            "no blocks declared expected_insns — exact-check oracle "
+            "skipped",
+        )]
+
+    opcode_names, branch_names = _load_name_tables()
+    opcode_by_name = {v: k for k, v in opcode_names.items()}
+    branch_by_name = {v: k for k, v in branch_names.items()}
+
+    def _norm_op(name: str) -> str:
+        return name[len("GEN_OP_"):] if name.startswith("GEN_OP_") else name
+
+    def _norm_br(name: str) -> str:
+        return name[len("BRANCH_"):] if name.startswith("BRANCH_") else name
+
+    valid_names: set[str] = set()
+    for name in reg_id_to_name.values():
+        valid_names.add(name)
+        if name.startswith("REG_"):
+            valid_names.add(name[4:])
+
+    def resolve_reg(name: str) -> str | None:
+        if name in valid_names:
+            return name if name.startswith("REG_") else f"REG_{name}"
+        return None
+
+    # Pre-aggregate lane masks per (template_id, insn_index, family,
+    # slot_index) → OR of every CP entry's observation.  For STATIC
+    # lane masks the OR is the structural pattern; for dynamic kinds
+    # (SVE pred, RVV vl) it is the strongest mask any active execution
+    # exposed — that's the strongest check the structural author-side
+    # assertion can make.
+    agg_lane: dict[tuple[int, int, str, int], int] = {}
+    for e in entries:
+        tid = int(e["template_id"])
+        for lm in e.get("lane_masks") or []:
+            key = (tid, int(lm["insn_index"]), str(lm["family"]),
+                   int(lm["slot_index"]))
+            agg_lane[key] = agg_lane.get(key, 0) | int(lm.get("mask", 0))
+
+    issues: list[Issue] = []
+    n_blocks = 0
+    n_insns_checked = 0
+    n_errors = 0
+    err_cap = 30
+
+    def err(cat: str, msg: str, meta: dict) -> None:
+        nonlocal n_errors
+        n_errors += 1
+        if n_errors <= err_cap:
+            issues.append(Issue("expected_insns", "error",
+                                f"[{cat}] {msg}", meta))
+
+    blocks_by_bid = {int(b["block_id"]): b for b in blocks}
+    trailer = _TRAILER_INSNS_BY_ISA.get(isa, 1)
+
+    # Tracks which (block_id) we've already counted against n_blocks —
+    # an insn-mapping run can fire across multiple CP entries of the
+    # same template, but we want one block per declared spec.
+    counted_blocks: set[int] = set()
+
+    for e in entries:
+        tmpl = templates_by_id.get(int(e["template_id"]))
+        if tmpl is None:
+            continue
+        tid = int(e["template_id"])
+        insns = tmpl.get("insns", [])
+        per_block: dict[int, list[int]] = {}
+        for idx, ins in enumerate(insns):
+            bid = pcmap.lookup(int(ins["pc"]))
+            if bid is None or bid not in blocks_by_bid:
+                continue
+            per_block.setdefault(bid, []).append(idx)
+
+        for bid, idxs in per_block.items():
+            block = blocks_by_bid[bid]
+            specs = block.get("expected_insns") or []
+            if not specs:
+                continue
+            if bid not in counted_blocks:
+                counted_blocks.add(bid)
+                n_blocks += 1
+            expected_total = len(specs) + trailer
+            if len(idxs) != expected_total:
+                err("count",
+                    f"blk_{bid} ({block.get('class','?')}): declared "
+                    f"{len(specs)} insn specs + {trailer} trailer = "
+                    f"{expected_total}, trace template has {len(idxs)}",
+                    {"block_id": bid, "declared": len(specs),
+                     "trailer": trailer, "trace": len(idxs)})
+                continue
+
+            for spec, idx in zip(specs, idxs[:len(specs)]):
+                ins = insns[idx]
+                ctx = {"block_id": bid, "insn_index": idx,
+                       "pc": int(ins["pc"]),
+                       "class": block.get("class", "?")}
+                n_insns_checked += 1
+
+                # --- src/dst register sets ---
+                if "src" in spec or "dst" in spec:
+                    bad: list[str] = []
+                    exp_src = set()
+                    exp_dst = set()
+                    for n in spec.get("src", []) or []:
+                        r = resolve_reg(n)
+                        (exp_src.add(r) if r else bad.append(n))
+                    for n in spec.get("dst", []) or []:
+                        r = resolve_reg(n)
+                        (exp_dst.add(r) if r else bad.append(n))
+                    if bad:
+                        err("reg_name",
+                            f"blk_{bid} insn #{idx}: unknown REG names "
+                            f"{bad!r}", {**ctx, "unknown": bad})
+                    else:
+                        def _name(rid: int) -> str:
+                            n = reg_id_to_name.get(int(rid))
+                            return n if n else f"REG_{int(rid)}"
+                        actual_src = {_name(r) for r in ins.get("src_regs") or []
+                                      if int(r) != 0}
+                        actual_dst = {_name(r) for r in ins.get("dst_regs") or []
+                                      if int(r) != 0}
+                        if "src" in spec and actual_src != exp_src:
+                            err("src_regs",
+                                f"blk_{bid} insn #{idx} pc=0x{ctx['pc']:x}: "
+                                f"src mismatch",
+                                {**ctx, "expected": sorted(exp_src),
+                                 "actual": sorted(actual_src)})
+                        if "dst" in spec and actual_dst != exp_dst:
+                            err("dst_regs",
+                                f"blk_{bid} insn #{idx} pc=0x{ctx['pc']:x}: "
+                                f"dst mismatch",
+                                {**ctx, "expected": sorted(exp_dst),
+                                 "actual": sorted(actual_dst)})
+
+                # --- opcode ---
+                if "opcode" in spec:
+                    want = _norm_op(spec["opcode"])
+                    got = opcode_names.get(int(ins.get("opcode", 0)), "?")
+                    if want not in opcode_by_name:
+                        err("opcode_name",
+                            f"blk_{bid} insn #{idx}: unknown opcode "
+                            f"name {spec['opcode']!r}",
+                            {**ctx, "opcode": spec["opcode"]})
+                    elif got != want:
+                        err("opcode",
+                            f"blk_{bid} insn #{idx} pc=0x{ctx['pc']:x}: "
+                            f"opcode {got!r}, expected {want!r}",
+                            {**ctx, "expected": want, "actual": got})
+
+                # --- branch_type ---
+                if "branch_type" in spec:
+                    want = _norm_br(spec["branch_type"])
+                    got = branch_names.get(int(ins.get("branch_type", 0)),
+                                           "?")
+                    if want not in branch_by_name:
+                        err("branch_type_name",
+                            f"blk_{bid} insn #{idx}: unknown branch "
+                            f"type {spec['branch_type']!r}",
+                            {**ctx, "branch": spec["branch_type"]})
+                    elif got != want:
+                        err("branch_type",
+                            f"blk_{bid} insn #{idx} pc=0x{ctx['pc']:x}: "
+                            f"branch_type {got!r}, expected {want!r}",
+                            {**ctx, "expected": want, "actual": got})
+
+                # --- insn_flags (set + clear) ---
+                if "insn_flags" in spec or "insn_flags_clear" in spec:
+                    insn_lanes = [lm for lm in e.get("lane_masks") or []
+                                  if int(lm["insn_index"]) == idx]
+                    flags = _reconstruct_insn_flags(ins, insn_lanes)
+                    for name in spec.get("insn_flags") or []:
+                        bit = _INSN_FLAG_BITS.get(name)
+                        if bit is None:
+                            err("flag_name",
+                                f"blk_{bid} insn #{idx}: unknown insn "
+                                f"flag {name!r}", {**ctx, "flag": name})
+                        elif not (flags & bit):
+                            err("insn_flag_missing",
+                                f"blk_{bid} insn #{idx} pc=0x{ctx['pc']:x}: "
+                                f"{name} not set (flags=0x{flags:x})",
+                                {**ctx, "missing_flag": name,
+                                 "flags": flags})
+                    for name in spec.get("insn_flags_clear") or []:
+                        bit = _INSN_FLAG_BITS.get(name)
+                        if bit is None:
+                            err("flag_name",
+                                f"blk_{bid} insn #{idx}: unknown insn "
+                                f"flag {name!r}", {**ctx, "flag": name})
+                        elif (flags & bit):
+                            err("insn_flag_unexpected",
+                                f"blk_{bid} insn #{idx} pc=0x{ctx['pc']:x}: "
+                                f"{name} set but expected clear "
+                                f"(flags=0x{flags:x})",
+                                {**ctx, "unexpected_flag": name,
+                                 "flags": flags})
+
+                # --- dependency masks ---
+                n_src = len(ins.get("src_regs") or [])
+                n_dst = len(ins.get("dst_regs") or [])
+                mdl   = int(ins.get("n_loads", 0))
+                for field, wire_field, per_count, layout in (
+                    ("dst_deps", "dst_dep_mask", n_dst, "reg"),
+                    ("store_data_deps", "store_data_dep_mask",
+                        int(ins.get("n_stores", 0)), "reg"),
+                    ("load_addr_deps", "load_addr_dep_mask",
+                        mdl, "addr"),
+                    ("store_addr_deps", "store_addr_dep_mask",
+                        int(ins.get("n_stores", 0)), "addr"),
+                ):
+                    if field not in spec:
+                        continue
+                    declared = spec[field]
+                    if not isinstance(declared, list):
+                        err("dep_shape",
+                            f"blk_{bid} insn #{idx}: {field} must be a "
+                            f"list[list[str]]", {**ctx, "field": field})
+                        continue
+                    actual = ins.get(wire_field) or []
+                    if len(declared) != per_count:
+                        err("dep_count",
+                            f"blk_{bid} insn #{idx}: {field} declared "
+                            f"{len(declared)} entries, expected "
+                            f"{per_count} (n_dst={n_dst} "
+                            f"n_stores={ins.get('n_stores',0)} "
+                            f"n_loads={mdl})",
+                            {**ctx, "field": field,
+                             "declared": len(declared),
+                             "expected": per_count})
+                        continue
+                    if not actual and declared:
+                        # Trace carries no HAS_REG sub-block but author
+                        # declared non-empty deps — the over-approxima-
+                        # tion fallback masked them.
+                        if any(declared):
+                            err("dep_missing",
+                                f"blk_{bid} insn #{idx} pc=0x{ctx['pc']:x}: "
+                                f"{field} declared but trace has no "
+                                f"HAS_REG/HAS_ADDR sub-block (fell back "
+                                f"to all-to-all)",
+                                {**ctx, "field": field})
+                            continue
+                    for j, names in enumerate(declared):
+                        exp_mask, unknown = _names_to_dep_mask(
+                            names or [], n_src, mdl, layout)
+                        if unknown:
+                            err("dep_input_name",
+                                f"blk_{bid} insn #{idx}: {field}[{j}] "
+                                f"has unknown input(s) {unknown!r}",
+                                {**ctx, "field": field, "j": j,
+                                 "unknown": unknown})
+                            continue
+                        got_mask = (int(actual[j])
+                                    if j < len(actual) else 0)
+                        if got_mask != exp_mask:
+                            err("dep_mask",
+                                f"blk_{bid} insn #{idx} pc=0x{ctx['pc']:x}: "
+                                f"{field}[{j}] got=0x{got_mask:x} "
+                                f"expected=0x{exp_mask:x}",
+                                {**ctx, "field": field, "j": j,
+                                 "expected": exp_mask,
+                                 "actual": got_mask})
+
+                # --- lane masks ---
+                for field, family in (
+                    ("src_lane_masks",       "src"),
+                    ("dst_lane_masks",       "dst"),
+                    ("load_data_lane_masks", "load"),
+                    ("store_data_lane_masks","store"),
+                ):
+                    if field not in spec:
+                        continue
+                    declared = spec[field]
+                    for slot, exp_mask in enumerate(declared):
+                        got = agg_lane.get((tid, idx, family, slot), 0)
+                        if int(exp_mask) != got:
+                            err("lane_mask",
+                                f"blk_{bid} insn #{idx} pc=0x{ctx['pc']:x}: "
+                                f"{family}_lane_mask[{slot}] "
+                                f"got=0x{got:x} expected=0x{int(exp_mask):x}",
+                                {**ctx, "field": field, "slot": slot,
+                                 "expected": int(exp_mask),
+                                 "actual": got})
+
+    issues.append(Issue(
+        "expected_insns", "info" if not n_errors else "error",
+        f"author-declared exact-insn checks: blocks={n_blocks} "
+        f"insns_checked={n_insns_checked} errors={n_errors}",
+        {"blocks": n_blocks, "insns_checked": n_insns_checked,
+         "errors": n_errors},
+    ))
+    return issues
+
+
 def _check_reg_value_assertions(
         entries: list[dict],
         templates_by_id: dict[int, dict],
@@ -4272,6 +4689,9 @@ def validate(meta_path: Path, trace_path: Path,
     issues += _check_expected_reg_sets(cp_entries, templates_by_id,
                                        blocks_by_id, pcmap, cp_set, isa,
                                        reg_id_to_name)
+    issues += _check_expected_insns(cp_entries, templates_by_id,
+                                    blocks_by_id, pcmap, cp_set, isa,
+                                    reg_id_to_name)
 
     # Address-recompute: only meaningful when reg-data was emitted.
     issues += _check_address_recompute(cp_entries, template_runs,

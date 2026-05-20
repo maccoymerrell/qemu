@@ -1030,14 +1030,37 @@ def _is_degenerate_variant(variant: CapVariant) -> bool:
     (W, R, R) operand list.  These under-tagged entries don't reflect
     runtime semantics (QEMU sees the actual decoded operand list at
     trace time) and would otherwise force the whole canonical into
-    the fallback bucket.  Detect them as 'no apparent output AND no
-    implicit write AND ≤1 access entry' so the classifier can ignore
-    them while still respecting their sibling variants."""
+    the fallback bucket.  Detect them so the classifier can ignore
+    them while still respecting their well-formed sibling variants.
+
+    Two shapes count as degenerate:
+
+      * Store-side under-tagging: a single CS_AC_READ entry with
+        n_dst == 0, no immediate, no implicit writes — the
+        "underspecified store" pattern (RISC-V SB/SD base variants,
+        MIPS SD/SW Macro siblings).
+      * Load-side under-tagging: a single CS_AC_WRITE entry with
+        n_src == 0, no immediate, no implicit reads — the
+        "underspecified load" pattern (RISC-V LD/SW base variants
+        where the well-formed Pseudo* sibling carries the MEM read
+        operand).  A real "writes a register, reads nothing"
+        instruction (CPUID, RDTSC) would have implicit reads, so
+        gating on n_implicit_reads == 0 keeps those classified.
+    """
     n_src, n_dst, has_imm = _count_access(variant, False)
-    return (n_dst == 0 and not has_imm and
-            variant.n_implicit_writes == 0 and
-            len(variant.accesses) <= 1 and
-            n_src > 0)
+    if len(variant.accesses) > 1:
+        return False
+    if has_imm:
+        return False
+    # Store-side under-tagging.
+    if (n_dst == 0 and n_src > 0
+            and variant.n_implicit_writes == 0):
+        return True
+    # Load-side under-tagging.
+    if (n_src == 0 and n_dst > 0
+            and variant.n_implicit_reads == 0):
+        return True
+    return False
 
 
 def classify_dep_refine_explicit(info: IsaInfo, const_name: str,

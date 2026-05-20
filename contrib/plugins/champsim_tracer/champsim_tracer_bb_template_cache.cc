@@ -395,6 +395,7 @@ BBTemplate *BBTemplateCache::get_or_create_tb_template(
     uint32_t n_insns,
     uint64_t *insn_pcs,
     qemu_plugin_insn_info *insn_info,
+    const uint64_t *insn_branch_target_pcs,
     uint8_t *insn_sizes,
     uint8_t *insn_bytes,
     const char *symbol_name,
@@ -432,6 +433,16 @@ BBTemplate *BBTemplateCache::get_or_create_tb_template(
                 tmpl->insn_pcs[i], &insn_info[i],
                 &tmpl->insn_fields[i],
                 tmpl->insn_reg_names ? &tmpl->insn_reg_names[i] : nullptr);
+        }
+        /*
+         * Static branch target as resolved by the per-ISA translator,
+         * not Capstone.  See InsnFields::taken_target_pc.  0 means
+         * "no static target" — non-branch or indirect; WP-resolution
+         * routes those through the observed-target history instead.
+         */
+        if (insn_branch_target_pcs) {
+            tmpl->insn_fields[i].taken_target_pc =
+                insn_branch_target_pcs[i];
         }
     }
 

@@ -47,6 +47,7 @@ public:
                                           uint32_t n_insns,
                                           uint64_t *insn_pcs,
                                           qemu_plugin_insn_info *insn_info,
+                                          const uint64_t *insn_branch_target_pcs,
                                           uint8_t *insn_sizes,
                                           uint8_t *insn_bytes,
                                           const char *symbol_name,

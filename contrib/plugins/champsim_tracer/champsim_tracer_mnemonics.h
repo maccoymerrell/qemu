@@ -120,6 +120,23 @@ typedef struct InsnFields {
     bool    has_immediate;
     int64_t immediate;
     /*
+     * Static control-transfer target the per-ISA translator resolved
+     * for this instruction (the same value handed to gen_goto_tb).
+     * Sourced from QEMU's translator via
+     * qemu_plugin_insn_branch_target_pc() — NOT from Capstone's
+     * immediate operand, since per-ISA encoding (PC-relative vs
+     * absolute, sign extension, MIPS delay-slot accounting, ARM
+     * Thumb interworking) varies and is already correctly resolved
+     * inside the translator.
+     *
+     * 0 means "no static target": either this insn is not a control
+     * transfer, or it's an indirect branch whose target is only known
+     * at runtime (the WP resolver falls back to BranchHistory for
+     * those).  Wrong-path target selection on direct branches MUST
+     * consume this field, not `immediate`.
+     */
+    uint64_t taken_target_pc;
+    /*
      * True for architectural atomic / synchronizing memory ops (x86
      * LOCK RMW/XCHG, AArch64 LDXR/STXR & LDADD/SWP, RISC-V A, MIPS
      * LL/SC).  Drives the CST_INSN_FLAG_ATOMIC wire bit.

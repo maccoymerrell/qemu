@@ -743,13 +743,19 @@ static uint64_t resolve_wrong_target(const BBTemplate *prev_tb_tmpl,
         *taken_out = current_pc;
         return prev_ft;
     }
-    if (direct_cond && bf->has_immediate &&
-        (uint64_t)bf->immediate != prev_ft) {
-        /* CP fell through a direct conditional → the taken edge is
+    if (direct_cond && bf->taken_target_pc != 0 &&
+        bf->taken_target_pc != prev_ft) {
+        /*
+         * CP fell through a direct conditional → the taken edge is
          * the side CP did NOT run, which the resolver also uses as
-         * the wrong path. */
-        *taken_out = (uint64_t)bf->immediate;
-        return (uint64_t)bf->immediate;
+         * the wrong path.  taken_target_pc comes from QEMU's
+         * translator (the same value handed to gen_goto_tb), NOT
+         * Capstone's immediate — per-ISA encoding (PC-relative vs
+         * absolute, sign extension, MIPS delay-slot accounting, ARM
+         * Thumb interworking) is already correctly resolved there.
+         */
+        *taken_out = bf->taken_target_pc;
+        return bf->taken_target_pc;
     }
     /* Unconditional jump whose sole direction is its fall-through
      * (current_pc == prev_ft, e.g. `jmp .+2`), or an unresolved
@@ -1252,6 +1258,13 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     uint64_t *insn_pcs = g_new0(uint64_t, raw_n_insns);
     qemu_plugin_insn_info *insn_info =
         g_new0(qemu_plugin_insn_info, raw_n_insns);
+    /*
+     * Per-canonical-insn static branch target the translator resolved
+     * for this instruction (via qemu_plugin_insn_branch_target_pc()).
+     * Parallel to insn_info[] / insn_pcs[].  Zero on non-branches and
+     * on indirect branches (which fall back to BranchHistory).
+     */
+    uint64_t *insn_branch_target_pcs = g_new0(uint64_t, raw_n_insns);
     uint8_t *insn_sizes = g_new0(uint8_t, raw_n_insns);
     uint8_t *insn_bytes = g_new0(uint8_t,
                                  raw_n_insns * MAX_INSN_BYTES);
@@ -1285,6 +1298,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             canonical_first[i] = true;
             insn_pcs[out] = raw_pc;
             insn_sizes[out] = raw_size;
+            insn_branch_target_pcs[out] =
+                qemu_plugin_insn_branch_target_pc(insn);
             memcpy(&insn_bytes[(size_t)out * MAX_INSN_BYTES],
                    raw_bytes, MAX_INSN_BYTES);
 
@@ -1341,6 +1356,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                                           canonical_n_insns,
                                           insn_pcs,
                                           insn_info,
+                                          insn_branch_target_pcs,
                                           insn_sizes,
                                           insn_bytes,
                                           symbol_name, fall_through);
@@ -1396,6 +1412,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
     g_free(insn_pcs);
     g_free(insn_info);
+    g_free(insn_branch_target_pcs);
     g_free(insn_sizes);
     g_free(insn_bytes);
     g_free(canonical_index);

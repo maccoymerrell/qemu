@@ -673,6 +673,26 @@ static uint8_t cap_lane_bytes_from_mnemonic(const char *mnem)
 }
 
 /*
+ * Capstone-6.0.0 bug: when UBFM/SBFM/EXTR resolves to one of the
+ * three-operand alias mnemonics whose printed form is `Rd, Rn, #imm`
+ * (LSL #imm, LSR #imm, ASR #imm, ROR #imm), the disassembler emits the
+ * shift count in op_str but DROPS the IMM operand from the structured
+ * operand array — so HAS_IMM never gets surfaced to plugins.  The
+ * 4-operand aliases (UBFX/SBFX/BFI/BFXIL) and the register-form ROR
+ * (RORV) are unaffected because they print as `Rd, Rn, #imm, #imm` or
+ * `Rd, Rn, Rm` and keep the operands.
+ *
+ * Capstone still parks the shift count in operands[1].shift.value when
+ * this happens, so the fix is to detect the broken alias by mnemonic +
+ * op_count==2 and synthesise the missing IMM from operands[1].shift.
+ */
+static bool cap_aarch64_is_buggy_shift_imm_alias(const char *mnem)
+{
+    return !strcmp(mnem, "lsl") || !strcmp(mnem, "lsr") ||
+           !strcmp(mnem, "asr") || !strcmp(mnem, "ror");
+}
+
+/*
  * Extract per-operand detail for AArch64 into the plugin operand struct.
  */
 static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
@@ -743,6 +763,26 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
             op->imm = 0;
             break;
         }
+    }
+
+    /*
+     * Capstone-6.0.0 LSL/LSR/ASR/ROR-#imm alias bug workaround
+     * (see cap_aarch64_is_buggy_shift_imm_alias).  When the shape
+     * matches, synthesise the dropped IMM from operands[1].shift.value
+     * so plugins see HAS_IMM and the correct shift count.
+     */
+    if (out->n_operands == 2 &&
+        out->n_operands < QEMU_PLUGIN_INSN_DETAIL_MAX_OPS &&
+        cap_aarch64_is_buggy_shift_imm_alias(insn->mnemonic) &&
+        a64->op_count >= 2 &&
+        a64->operands[1].shift.type != AARCH64_SFT_INVALID) {
+        uint8_t k = out->n_operands;
+        qemu_plugin_operand *op = &out->operands[k];
+        memset(op, 0, sizeof(*op));
+        op->type = QEMU_PLUGIN_OP_IMM;
+        op->scale = 1;
+        op->imm = (int64_t)a64->operands[1].shift.value;
+        out->n_operands = k + 1;
     }
 }
 

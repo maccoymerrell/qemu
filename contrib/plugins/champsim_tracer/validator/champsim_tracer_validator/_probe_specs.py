@@ -448,14 +448,14 @@ _register_probe('probe_arm_mov_not_neg', {'aarch64': {'asm': '"mov x0, x1\\n\\t"
 
 _register_probe('probe_arm_cmp_test', {'aarch64': {'asm': '"cmp x0, x1\\n\\t"\n    "tst x2, x3"',
              'clobbers': '"cc"',
-             'opcodes': ['INT_SUB', 'AND']}})
+             'opcodes': ['CMP', 'TEST']}})
 
 _register_probe('probe_arm_cmov_setcc', {'aarch64': {'asm': '"cmp x0, x1\\n\\t"\n'
                     '    "csel x2, x3, x4, eq\\n\\t"\n'
                     '    "cset x5, ne\\n\\t"\n'
                     '    "csinc x6, x7, x0, gt"',
              'clobbers': '"x2","x5","x6","cc"',
-             'opcodes': ['CMOV', 'INT_SUB']}})
+             'opcodes': ['CMOV', 'CMP']}})
 
 _register_probe('probe_arm_fence', {'aarch64': {'asm': '"dmb ish\\n\\t"\n    "dsb ish\\n\\t"\n    "isb"',
              'clobbers': '"memory"',

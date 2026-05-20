@@ -1305,7 +1305,25 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
     g_mutex_lock(&data_lock);
     existing_tmpl = g_bb_template_cache.find_tb_template(pc);
-    if (existing_tmpl && existing_tmpl->n_insns > 0) {
+    /*
+     * Only honour the cached template's branch index when the cached
+     * template actually represents THIS TB's content.  QEMU can
+     * translate two distinct TBs at the same start_pc (e.g. a small
+     * chaining fragment alongside a full-block translation) and the
+     * cache key is start_pc alone, so the first to land sticks.  If
+     * the executing TB is the smaller fragment, reading effective_
+     * last_pc from the cached larger template hands the scoreboard a
+     * branch PC this TB doesn't actually contain — and the next
+     * vcpu_tb_exec then thinks a branch just finalised and
+     * resolve_wrong_target emits a bogus WP that mirrors CP.
+     * fall_through_pc is the cheapest unique-enough fingerprint
+     * (start_pc + architectural end past the delay slot).
+     */
+    bool cached_matches_tb =
+        existing_tmpl && existing_tmpl->n_insns > 0 &&
+        existing_tmpl->fall_through_pc == fall_through &&
+        existing_tmpl->n_insns == canonical_n_insns;
+    if (cached_matches_tb) {
         int br_idx = BBTemplateCache::template_branch_index(existing_tmpl);
         bb_ends_in_branch = (br_idx >= 0) ? 1 : 0;
         if (br_idx >= 0) {
@@ -1318,21 +1336,19 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         const char *symbol_name = qemu_plugin_insn_symbol(first_insn);
 
         g_mutex_lock(&data_lock);
-        BBTemplate *new_tmpl = nullptr;
-        {
-            new_tmpl = g_bb_template_cache.get_or_create_tb_template(pc,
-                                              canonical_n_insns,
-                                              insn_pcs,
-                                              insn_info,
-                                              insn_sizes,
-                                              insn_bytes,
-                                              symbol_name, fall_through);
-            if (new_tmpl && new_tmpl->n_insns > 0) {
-                int br_idx = BBTemplateCache::template_branch_index(new_tmpl);
-                bb_ends_in_branch = (br_idx >= 0) ? 1 : 0;
-                if (br_idx >= 0) {
-                    effective_last_pc = new_tmpl->insn_pcs[br_idx];
-                }
+        BBTemplate *new_tmpl = g_bb_template_cache.get_or_create_tb_template(
+                                          pc,
+                                          canonical_n_insns,
+                                          insn_pcs,
+                                          insn_info,
+                                          insn_sizes,
+                                          insn_bytes,
+                                          symbol_name, fall_through);
+        if (new_tmpl && new_tmpl->n_insns > 0) {
+            int br_idx = BBTemplateCache::template_branch_index(new_tmpl);
+            bb_ends_in_branch = (br_idx >= 0) ? 1 : 0;
+            if (br_idx >= 0) {
+                effective_last_pc = new_tmpl->insn_pcs[br_idx];
             }
         }
         g_mutex_unlock(&data_lock);
@@ -1340,7 +1356,19 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         tb_arm_new_template_cbs(tb, new_tmpl, insn_info, raw_n_insns,
                                 canonical_index, canonical_first,
                                 canonical_n_insns);
+    } else if (cached_matches_tb) {
+        tb_rearm_known_template_cbs(tb, existing_tmpl, raw_n_insns,
+                                    canonical_index, canonical_first);
     } else {
+        /*
+         * Cached template's content doesn't match this TB (different
+         * fragment at the same start_pc) — rearm the per-insn cbs
+         * using the cached template as a structural skeleton so the
+         * exec callbacks still fire, but DON'T claim this TB ends in
+         * the cached template's branch.  bb_ends_in_branch and
+         * effective_last_pc stay at their pre-template defaults
+         * (no-branch, QEMU's raw last_insn_pc).
+         */
         tb_rearm_known_template_cbs(tb, existing_tmpl, raw_n_insns,
                                     canonical_index, canonical_first);
     }

@@ -393,8 +393,41 @@ class CapVariant:
     internal: str       # e.g. "X86_ADD16rr"
     canonical: str      # e.g. "X86_INS_ADD"
     accesses: tuple[str, ...]  # per-operand CS_AC_* expression strings
+    # Per-operand CS_OP_* type strings, parallel to `accesses`.  Carried
+    # so the classifier can distinguish identical access patterns where
+    # the operand TYPES differ — most importantly mr-form stores
+    # (CS_OP_MEM-WRITE + N CS_OP_REG-READ) from rrr arithmetic
+    # (CS_OP_REG-WRITE + N CS_OP_REG-READ) which share (W, R, R).
+    # Empty for ISAs whose Capstone tables don't expose per-operand
+    # types (currently x86 — its operand types come from the variant
+    # name suffix via parse_suffix_tokens instead).
+    operand_types: tuple[str, ...]
     n_implicit_reads: int
     n_implicit_writes: int
+
+
+# Capstone CS_OP_* type strings (or short tokens) that name memory
+# operands.  The classifier consults these to tell an mr-form store
+# apart from an rrr arithmetic insn whose access pattern is otherwise
+# identical.  Both the "modern" Capstone style (full CS_OP_MEM
+# string from the InsnOp tables) and the x86 suffix-token style
+# ("m") are accepted so the audit can use the same comparison
+# uniformly across ISAs.
+_MEM_OPERAND_TYPES: frozenset[str] = frozenset({
+    "CS_OP_MEM", "m",
+})
+
+# Operand-type tokens that name a register OR a memory ref — i.e.
+# something a load/store under-tagging fallback could plausibly be
+# narrowing.  Used to gate the all-degenerate fallback so a pure-IMM
+# variant (a branch like MIPS `b target`, whose only operand is the
+# CS_AC_READ immediate target) doesn't get reclassified to
+# dep_passthrough.  Includes both "modern" CS_OP_* strings and the
+# x86 suffix tokens used by parse_suffix_tokens.
+_REG_OR_MEM_OPERAND_TYPES: frozenset[str] = frozenset({
+    "CS_OP_REG", "CS_OP_MEM",
+    "r", "m",
+})
 
 
 # Runtime shape we expect the operand walker to produce for one
@@ -536,7 +569,7 @@ def _parse_modern_mapping_insn_op(
     # Operand entry inside the body: { CS_OP_X, CS_AC_X[ | CS_AC_X]*, { ... } }
     op_re = re.compile(
         r"\{\s*"
-        r"CS_OP_[A-Z_]+\s*,\s*"
+        r"(?P<type>CS_OP_[A-Z_]+)\s*,\s*"
         r"(?P<access>(?:CS_AC_[A-Z_]+(?:\s*\|\s*CS_AC_[A-Z_]+)*)|0)\s*,\s*"
         r"\{[^}]*\}\s*\}",
     )
@@ -548,18 +581,22 @@ def _parse_modern_mapping_insn_op(
         body_start = m.end()
         body_end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
         body = text[body_start:body_end]
-        accesses = tuple(om.group("access") for om in op_re.finditer(body))
+        ops_data = [(om.group("type"), om.group("access"))
+                    for om in op_re.finditer(body)]
         # CS_OP entries with "0" as the access slot are Capstone's
         # placeholder for "ignore this operand"; the walker will ignore
         # them too.  Normalise to CS_AC_IGNORE so downstream tests
         # treat them as immediates / pads.
-        accesses = tuple("CS_AC_IGNORE" if a == "0" else a for a in accesses)
+        accesses = tuple("CS_AC_IGNORE" if a == "0" else a
+                         for (_t, a) in ops_data)
+        operand_types = tuple(t for (t, _a) in ops_data)
         internal = m.group("internal")
         ir, iw = implicit.get(internal, (0, 0))
         variants.append(CapVariant(
             internal=internal,
             canonical=m.group("canonical"),
             accesses=accesses,
+            operand_types=operand_types,
             n_implicit_reads=ir,
             n_implicit_writes=iw,
         ))
@@ -598,11 +635,28 @@ def parse_x86_mapping_insn_op(text: str,
         if parts and parts[-1] == "0":
             parts.pop()
         internal = m.group("internal")
+        # Derive per-operand types from the variant name suffix.  The
+        # x86 mapping file doesn't store CS_OP_* per operand (only
+        # CS_AC_*), but LLVM/Capstone encode the operand-type pattern
+        # in the variant name (the "rr" / "rm" / "mr" / "ri" / "mi"
+        # tail).  parse_suffix_tokens returns a sequence aligned with
+        # the access list when the shape is recognised; if not, we
+        # leave operand_types empty and the classifier will not be
+        # able to disambiguate W+R+R-style stores from W+R+R
+        # arithmetic — same as before this field was added.
+        suffix = _suffix_after_mnemonic(internal, m.group("canonical"))
+        tokens = parse_suffix_tokens(suffix)
+        operand_types = tuple(tokens) if tokens else ()
+        if len(operand_types) != len(parts):
+            # Suffix and access lists disagree on operand count —
+            # leave the types empty rather than mis-pair them.
+            operand_types = ()
         ir, iw = implicit.get(internal, (0, 0))
         variants.append(CapVariant(
             internal=internal,
             canonical=m.group("canonical"),
             accesses=tuple(parts),
+            operand_types=operand_types,
             n_implicit_reads=ir,
             n_implicit_writes=iw,
         ))
@@ -951,30 +1005,54 @@ def access_fits_dep_passthrough(variant: CapVariant,
 
     dep_passthrough's runtime invariant is "exactly one output (reg
     dst OR mem store) consuming at most one value input (reg src,
-    load_data, or immediate)."  We don't care which r/m/i the
-    operand types end up being — the refiner's internal dispatch
-    handles every combination.  So at audit time, we just count:
-      - total writes  = #explicit-W + #explicit-RMW + #implicit-W
-      - total reads   = #explicit-R + #explicit-RMW + #implicit-R
-      - has_imm       = any explicit-IGNORE (Capstone convention
-                        for immediate operands)
-    and accept the variant iff exactly one write and at most one
-    read (with the imm acting as the input when read count is 0).
+    load_data, or immediate), with zero or more address-mode regs
+    when the output is a memory store."  We don't care which r/m/i
+    the operand types are — the refiner's internal dispatch handles
+    every combination — but the audit DOES need to distinguish mr
+    forms (1W on a MEM operand + 1R on a REG + optional address-mode
+    REGs as CS_AC_READ) from rrr arithmetic (1W on a REG + 2R on
+    REGs); they share access pattern (W, R, R) so a count-only test
+    can't separate them.  CapVariant.operand_types carries the
+    per-operand CS_OP_* kinds from Capstone's source tables exactly
+    for this purpose; consult them whenever the access count would
+    otherwise be ambiguous.
 
-    RMW operands count toward both — a unary RMW like BSWAP / NOT
-    correctly tallies as 1 write + 1 read.  Implicit regs the
-    walker folds in (FPU ST(0), branch IP, x86 EFLAGS in some ops)
-    also count: FABS's implicit-read + implicit-write on ST(0)
-    tally to 1+1, fitting passthrough; CMOV's explicit-W + explicit-
-    R + implicit-flag-read tallies to 1+2, correctly rejected.
+    Accepted shapes:
+      - (1W, 1R) no RMW / no imm:   rr / rm form, write on REG or MEM.
+      - (1W, 0R) + imm:             ri / mi form.
+      - (1W, 1R) RMW:               legacy unary RMW (BSWAP/NOT).
+      - (1W, 2R) no imm, write-op is MEM, no RMW:
+          mr-form store — the WRITE goes to memory and at most one of
+          the READs is the value, the rest are addressing-mode regs.
+      - (1W, 3R) no imm, write-op is MEM, no RMW:
+          mr-form store with base + index addressing.
+
+    Implicit regs folded by include_implicit count toward n_src /
+    n_dst exactly as before.
     """
+    has_rmw = any(("READ" in a) and ("WRITE" in a)
+                  for a in variant.accesses)
     n_src, n_dst, has_imm = _count_access(variant, include_implicit)
     if n_dst != 1:
+        return False
+    if has_rmw:
+        if n_src == 1 and not has_imm:
+            return True  # unary RMW (BSWAP / NOT / etc.).
         return False
     if n_src == 1 and not has_imm:
         return True
     if n_src == 0 and has_imm:
         return True
+    if 1 <= n_src <= 3 and not has_imm:
+        # Disambiguate mr-form store from rrr arithmetic by the
+        # operand types: the WRITE must be on a MEM operand for mr
+        # to apply.
+        write_idx = next((i for i, a in enumerate(variant.accesses)
+                          if "WRITE" in a), -1)
+        if write_idx < 0 or write_idx >= len(variant.operand_types):
+            return False
+        if variant.operand_types[write_idx] in _MEM_OPERAND_TYPES:
+            return True
     return False
 
 
@@ -1104,6 +1182,10 @@ def classify_dep_refine_explicit(info: IsaInfo, const_name: str,
     if const_name in ISA_VEC_STRUCT_INTERLEAVED_STORE_INSNS.get(info.key,
                                                                   set()):
         return ("dep_vec_struct_store_interleaved", True)
+    if const_name in ISA_DEP_PASSTHROUGH_LOAD_INSNS.get(info.key, set()):
+        return ("dep_passthrough", True)
+    if const_name in ISA_DEP_PASSTHROUGH_STORE_INSNS.get(info.key, set()):
+        return ("dep_passthrough", True)
 
     variants = _variants_by_canonical(info.key).get(const_name)
     if not variants:
@@ -1115,17 +1197,41 @@ def classify_dep_refine_explicit(info: IsaInfo, const_name: str,
     # ignored by the CPU) and Pseudo-* siblings whose access list is
     # missing operands.  Their well-formed sibling variants carry the
     # real semantics; the classifier follows those.
-    #
-    # When *every* variant is degenerate the canonical is uniformly
-    # under-tagged by Capstone — there's no sibling to follow — but
-    # dep_all_to_all is still the conservative-correct refiner at
-    # runtime (the walker uses QEMU's per-execution access info, not
-    # Capstone's source tables, and dep_all_to_all bails harmlessly
-    # when there are no outputs).  Mark these affirmative so the
-    # audit treats the systematic Capstone tagging gap as a
-    # categorical signal rather than per-row noise.
     informative = [v for v in variants if not _is_degenerate_variant(v)]
     if not informative:
+        # All variants are degenerate single-access shapes — Capstone
+        # under-tags the canonical uniformly (MIPS LW / SW and their
+        # microMIPS / DSP siblings are the canonical example).  The
+        # runtime walker still sees the actual operand list from
+        # QEMU's per-execution detail, so dep_passthrough applies
+        # precisely when the access direction is uniform:
+        #
+        #   every variant is single CS_AC_WRITE → rm-form load
+        #     (one mem-read produces one reg-write; dst depends on
+        #     load_data[0]).
+        #   every variant is single CS_AC_READ  → mr-form store
+        #     (one reg-read drives one mem-write; store_data depends
+        #     on the value src).
+        #
+        # When the access direction is mixed across variants we keep
+        # dep_all_to_all as the conservative-correct fallback.
+        only_write = all(set(v.accesses) == {"CS_AC_WRITE"}
+                         for v in variants)
+        only_read = all(set(v.accesses) == {"CS_AC_READ"}
+                        for v in variants)
+        # Gate on operand types: the under-tagged load/store shape
+        # this fallback exists for always carries at least one
+        # register or memory operand (the data reg + the [base+disp]
+        # MEM that Capstone happens to drop the access tag on).
+        # Without that gate, single-CS_AC_READ branch insns whose
+        # only operand is an IMM target (MIPS `b target`, `bc`,
+        # `bposge32`, ...) get mis-promoted to dep_passthrough.
+        has_reg_or_mem_operand = any(
+            t in _REG_OR_MEM_OPERAND_TYPES
+            for v in variants for t in v.operand_types
+        )
+        if (only_write or only_read) and has_reg_or_mem_operand:
+            return ("dep_passthrough", True)
         return (DEFAULT_DEP_REFINE, True)
 
     # 3. NOP-class: every (informative) variant has zero inputs AND
@@ -1943,6 +2049,79 @@ FP_VEC_PROMOTE_OPS = {
     "GEN_OP_FP_MADD": "GEN_OP_VEC_MADD",
     "GEN_OP_FP_MSUB": "GEN_OP_VEC_MSUB",
     "GEN_OP_FP_MOV":  "GEN_OP_VEC_MOV",
+}
+
+
+# AArch64 flag-writing arithmetic mnemonics whose XZR-dst form is
+# the assembler alias for CMP / CMN / TST.  Rows on this list get
+# .refine = refine_arm64_cmp_alias, which detects the flag-only
+# shape at decode and promotes the opcode.  Other flag-writing
+# variants (ADCS, SBCS, BICS, ...) don't have CMP-style aliases in
+# the AArch64 assembler grammar, so they stay on their canonical
+# arithmetic opcode even when written with an XZR destination.
+CMP_ALIAS_PROMOTE_INSNS = {
+    "AARCH64_INS_SUBS",
+    "AARCH64_INS_ADDS",
+    "AARCH64_INS_ANDS",
+}
+
+
+# Per-ISA mnemonics that the access-pattern classifier mis-classifies
+# as dep_all_to_all because Capstone's source-table operand list is
+# either uniformly under-tagged (single CS_AC_WRITE or CS_AC_READ
+# entry, no MEM operand recorded) or has a writeback variant whose
+# (W, W, R) shape doesn't fit passthrough's single-output rule.  At
+# runtime, QEMU's plugin operand walker reads the actual operand
+# list from per-execution detail — the simple non-writeback shape
+# is the regular passthrough rm-form (load) or mr-form (store),
+# both of which dep_passthrough's internal dispatch handles
+# precisely.  Writeback variants get the multi-dst shape that the
+# refiner's defensive bail-out path leaves on dep_all_to_all, so
+# binding the canonical to dep_passthrough is strictly an
+# improvement: no regression on writeback, real precision win on
+# the simple forms used by 99% of real code and exact-check probes.
+ISA_DEP_PASSTHROUGH_LOAD_INSNS: dict[str, set[str]] = {
+    "aarch64": {
+        "AARCH64_INS_LDR",
+        "AARCH64_INS_LDRB",  "AARCH64_INS_LDRH",
+        "AARCH64_INS_LDRSB", "AARCH64_INS_LDRSH", "AARCH64_INS_LDRSW",
+        "AARCH64_INS_LDUR",
+        "AARCH64_INS_LDURB", "AARCH64_INS_LDURH",
+        "AARCH64_INS_LDURSB","AARCH64_INS_LDURSH","AARCH64_INS_LDURSW",
+        "AARCH64_INS_LDAR",  "AARCH64_INS_LDAXR",
+        "AARCH64_INS_LDXR",
+    },
+    "riscv": {
+        "RISCV_INS_LB", "RISCV_INS_LH", "RISCV_INS_LW", "RISCV_INS_LD",
+        "RISCV_INS_LBU", "RISCV_INS_LHU", "RISCV_INS_LWU",
+        "RISCV_INS_FLW", "RISCV_INS_FLD",
+        "RISCV_INS_FLH",
+    },
+    "mips": {
+        "MIPS_INS_LB",  "MIPS_INS_LBU",
+        "MIPS_INS_LH",  "MIPS_INS_LHU",
+        "MIPS_INS_LW",  "MIPS_INS_LWU",
+        "MIPS_INS_LD",
+        "MIPS_INS_LWC1", "MIPS_INS_LDC1",
+    },
+}
+ISA_DEP_PASSTHROUGH_STORE_INSNS: dict[str, set[str]] = {
+    "aarch64": {
+        "AARCH64_INS_STR",
+        "AARCH64_INS_STRB", "AARCH64_INS_STRH",
+        "AARCH64_INS_STUR",
+        "AARCH64_INS_STURB", "AARCH64_INS_STURH",
+        "AARCH64_INS_STLR", "AARCH64_INS_STLXR",
+        "AARCH64_INS_STXR",
+    },
+    "riscv": {
+        "RISCV_INS_SB", "RISCV_INS_SH", "RISCV_INS_SW", "RISCV_INS_SD",
+        "RISCV_INS_FSW", "RISCV_INS_FSD", "RISCV_INS_FSH",
+    },
+    "mips": {
+        "MIPS_INS_SB",  "MIPS_INS_SH",  "MIPS_INS_SW",  "MIPS_INS_SD",
+        "MIPS_INS_SWC1", "MIPS_INS_SDC1",
+    },
 }
 
 
@@ -3412,6 +3591,16 @@ def generated_body(info: IsaInfo, constants: list[str], existing: dict[str, Entr
         if (refine is None and info.key == "aarch64"
                 and new.op in FP_VEC_PROMOTE_OPS):
             refine = "refine_arm64_fp_vec"
+        # AArch64 CMP / CMN / TST are aliases for the flag-writing
+        # SUBS / ADDS / ANDS forms with the destination register set
+        # to XZR / WZR.  Capstone returns the underlying SUBS/ADDS/ANDS
+        # insn id, so the static table picks GEN_OP_INT_SUB /
+        # GEN_OP_INT_ADD / GEN_OP_AND.  refine_arm64_cmp_alias detects
+        # the flag-only shape (REG_ZERO is the only register dst) and
+        # promotes opcode to CMP / TEST.  Only fills empty .refine.
+        if (refine is None and info.key == "aarch64"
+                and const_name in CMP_ALIAS_PROMOTE_INSNS):
+            refine = "refine_arm64_cmp_alias"
         dep_refine = classify_dep_refine(info, const_name, new)
         lane_kind, lane_par = classify_lane_info(info, const_name,
                                                  new.op)

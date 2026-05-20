@@ -440,7 +440,36 @@ void dep_passthrough(const struct qemu_plugin_insn_info *info, InsnFields *f)
         if (f->has_immediate) {
             m = ((uint64_t)1 << (f->n_src_regs + f->max_dep_loads));   /* imm */
         } else if (f->n_src_regs > 0) {
-            m = ((uint64_t)1 << (f->n_src_regs - 1));                  /* last = value */
+            /*
+             * Value-src is whatever is in src_regs[] that the walker
+             * did NOT mark as part of the store's address-mode regs
+             * (store_addr_dep_mask[0]).  Works uniformly regardless of
+             * the Capstone operand order:
+             *
+             *   x86 ATT mov-store: ops = [MEM, REG] → src_regs =
+             *     [BASE, VALUE], store_addr_dep[0] = bit 0 (BASE),
+             *     value_mask = bit 1 (VALUE).
+             *
+             *   AArch64 STR / RISC-V SD / MIPS SW: ops = [REG, MEM]
+             *     → src_regs = [VALUE, BASE], store_addr_dep[0] =
+             *     bit 1 (BASE), value_mask = bit 0 (VALUE).
+             *
+             * The original "last src is value" heuristic only matched
+             * the x86 case and silently mis-attributed the dep on the
+             * other three ISAs; the exact-check probe
+             * probe_exact_store_rm flags this directly.
+             */
+            uint64_t addr_mask = f->store_addr_dep_mask[0];
+            uint64_t all_src = ((uint64_t)1 << f->n_src_regs) - 1;
+            uint64_t value_mask = all_src & ~addr_mask;
+            if (!value_mask) {
+                /* Can't isolate a value src — fall back to the
+                 * conservative-correct all-to-all rather than emit a
+                 * wrong dep. */
+                dep_all_to_all(info, f);
+                return;
+            }
+            m = value_mask;
         } else {
             return;
         }

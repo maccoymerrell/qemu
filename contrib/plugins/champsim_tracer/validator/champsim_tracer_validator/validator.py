@@ -1417,8 +1417,14 @@ def _check_static_reg_sets(
             have_access_info = any(
                 int(getattr(op, "access", 0) or 0) != 0 for op in ops
             )
-            if isa in ("riscv64", "mipsel"):
-                have_access_info = False
+            # Match the tracer's behavior: use Capstone's per-operand
+            # access flags when present, falling back to the
+            # opcode-indexed first_reg_is_not_dst heuristic only when
+            # the disasm carries no access info.  Previously the
+            # validator blanket-disabled access info for RISC-V / MIPS
+            # because of disagreements on pseudos and control-flow
+            # forms; those specific cases are now caught by the
+            # per-mnemonic skip block further down.
             opcode_name = opcode_names.get(int(ins.get("opcode", 0)), "?")
             first_is_dst = opcode_name not in first_reg_is_not_dst
             seen_first_reg = False
@@ -1445,6 +1451,10 @@ def _check_static_reg_sets(
                 elif op.type == op_imm_kind:
                     continue
 
+            # Implicit regs (regs_read[]/regs_write[]) fold in only
+            # where the tracer's ISA properties say so — matches
+            # decode.cc's `isa_properties[..].include_implicit_regs`
+            # gate (true for x86 + AArch64, false for RISC-V + MIPS).
             if isa not in ("riscv64", "mipsel"):
                 for cap_id in getattr(d, "regs_read", []) or []:
                     add(exp_src, cap_id)

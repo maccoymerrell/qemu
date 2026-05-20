@@ -2304,6 +2304,11 @@ static void gen_JCXZ(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_JMP(DisasContext *s, X86DecodedInsn *decode)
 {
+    /* Direct unconditional JMP (and its CALL-decorated form via
+     * gen_CALL) — surface the static target to plugins.  Indirect
+     * forms (JMP_m, CALL_m) take a separate path. */
+    plugin_gen_record_branch_target(
+        (uint64_t)(s->pc + decode->immediate));
     gen_update_cc_op(s);
     gen_jmp_rel(s, s->dflag, decode->immediate, 0);
 }

@@ -551,6 +551,28 @@ QEMU_PLUGIN_API
 void *qemu_plugin_insn_haddr(const struct qemu_plugin_insn *insn);
 
 /**
+ * qemu_plugin_insn_branch_target_pc() - resolved static branch target
+ * @insn: opaque instruction handle from qemu_plugin_tb_get_insn()
+ *
+ * Returns the static control-transfer target the per-ISA translator
+ * resolved for this instruction during translation — the same value
+ * fed to gen_goto_tb / equivalents.  Returns 0 when no static target
+ * exists: either the instruction is not a control transfer, or it is
+ * an indirect / register-form branch whose target is only known at
+ * runtime (plugins should fall back to their own observed-target
+ * history for those).
+ *
+ * Wrong-path tracers should consume this rather than re-decoding the
+ * branch immediate themselves — per-ISA encoding (PC-relative vs.
+ * absolute, sign extension, MIPS delay-slot accounting, ARM Thumb
+ * interworking) is already correctly resolved by the translator.
+ *
+ * Returns: target PC, or 0 if no static target.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_insn_branch_target_pc(const struct qemu_plugin_insn *insn);
+
+/**
  * typedef qemu_plugin_meminfo_t - opaque memory transaction handle
  *
  * This can be further queried using the qemu_plugin_mem_* query

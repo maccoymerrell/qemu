@@ -274,6 +274,11 @@ uint64_t qemu_plugin_insn_vaddr(const struct qemu_plugin_insn *insn)
     return insn->vaddr;
 }
 
+uint64_t qemu_plugin_insn_branch_target_pc(const struct qemu_plugin_insn *insn)
+{
+    return insn->branch_target_pc;
+}
+
 void *qemu_plugin_insn_haddr(const struct qemu_plugin_insn *insn)
 {
     const DisasContextBase *db = tcg_ctx->plugin_db;

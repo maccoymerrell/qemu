@@ -21,6 +21,7 @@
 #include "qemu/host-utils.h"
 #include "cpu.h"
 #include "exec/exec-all.h"
+#include "exec/plugin-gen.h"
 #include "exec/translation-block.h"
 #include "tcg/tcg-op.h"
 #include "tcg/tcg-op-gvec.h"
@@ -1961,6 +1962,13 @@ static target_long insn_get_signed(CPUX86State *env, DisasContext *s, MemOp ot)
 static void gen_conditional_jump_labels(DisasContext *s, target_long diff,
                                         TCGLabel *not_taken, TCGLabel *taken)
 {
+    /*
+     * Static taken-edge target for direct conditional jumps (Jcc /
+     * JCXZ / LOOPcc).  Surfaced to plugins for wrong-path tracing —
+     * see plugin_gen_record_branch_target() docs.  Indirect branches
+     * (JMP_m / CALL_m) take a different path and never reach here.
+     */
+    plugin_gen_record_branch_target((uint64_t)(s->pc + diff));
     if (not_taken) {
         gen_set_label(not_taken);
     }

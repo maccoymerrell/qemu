@@ -273,6 +273,13 @@ static bool gen_branch(DisasContext *ctx, arg_b *a, TCGCond cond)
     TCGv src2 = get_gpr(ctx, a->rs2, EXT_SIGN);
     target_ulong orig_pc_save = ctx->pc_save;
 
+    /*
+     * Direct conditional branch (BEQ/BNE/BLT/BGE/...).  Surface the
+     * static taken-edge target to plugins for wrong-path tracing.
+     */
+    plugin_gen_record_branch_target(
+        (uint64_t)(ctx->base.pc_next + a->imm));
+
     if (get_xl(ctx) == MXL_RV128) {
         TCGv src1h = get_gprh(ctx, a->rs1);
         TCGv src2h = get_gprh(ctx, a->rs2);

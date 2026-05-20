@@ -113,6 +113,16 @@ struct qemu_plugin_dyn_cb {
 /* Internal context for instrumenting an instruction */
 struct qemu_plugin_insn {
     uint64_t vaddr;
+    /*
+     * Static control-transfer target the target translator resolved
+     * for this instruction (the same value handed to gen_goto_tb).
+     * Populated by per-ISA translators via
+     * plugin_gen_record_branch_target() at branch-decode time.  0
+     * means "no static target": either this insn is not a branch, or
+     * it's an indirect branch whose target is only known at runtime
+     * (those route through the plugin's BranchHistory instead).
+     */
+    uint64_t branch_target_pc;
     GArray *insn_cbs;
     GArray *mem_cbs;
     uint8_t len;

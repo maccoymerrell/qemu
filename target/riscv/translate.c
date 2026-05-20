@@ -23,6 +23,7 @@
 #include "exec/exec-all.h"
 #include "exec/helper-proto.h"
 #include "exec/helper-gen.h"
+#include "exec/plugin-gen.h"
 
 #include "exec/translator.h"
 #include "exec/cpu_ldst.h"
@@ -605,6 +606,15 @@ static void gen_ctr_jal(DisasContext *ctx, int rd, target_ulong imm)
 static void gen_jal(DisasContext *ctx, int rd, target_ulong imm)
 {
     TCGv succ_pc = dest_gpr(ctx, rd);
+
+    /*
+     * Direct unconditional jump (JAL); surface the static target to
+     * plugins for wrong-path tracing.  JALR (indirect) does not go
+     * through this path and leaves branch_target_pc at 0 so the
+     * plugin's observed-target history handles it.
+     */
+    plugin_gen_record_branch_target(
+        (uint64_t)(ctx->base.pc_next + imm));
 
     /* check misaligned: */
     if (!riscv_cpu_allow_16bit_insn(ctx->cfg_ptr,

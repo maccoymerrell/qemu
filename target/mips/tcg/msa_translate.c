@@ -11,6 +11,7 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
 #include "qemu/osdep.h"
+#include "exec/plugin-gen.h"
 #include "translate.h"
 #include "fpu_helper.h"
 
@@ -234,6 +235,7 @@ static bool gen_msa_BxZ_V(DisasContext *ctx, int wt, int sa, TCGCond cond)
     tcg_gen_trunc_i64_tl(bcond, t0);
 
     ctx->btarget = ctx->base.pc_next + (sa << 2) + 4;
+    plugin_gen_record_branch_target((uint64_t)ctx->btarget);
 
     ctx->hflags |= MIPS_HFLAG_BC;
     ctx->hflags |= MIPS_HFLAG_BDS32;
@@ -265,6 +267,7 @@ static bool gen_msa_BxZ(DisasContext *ctx, int df, int wt, int sa, bool if_not)
     gen_check_zero_element(bcond, df, wt, if_not ? TCG_COND_EQ : TCG_COND_NE);
 
     ctx->btarget = ctx->base.pc_next + (sa << 2) + 4;
+    plugin_gen_record_branch_target((uint64_t)ctx->btarget);
     ctx->hflags |= MIPS_HFLAG_BC;
     ctx->hflags |= MIPS_HFLAG_BDS32;
 

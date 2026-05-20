@@ -19,6 +19,7 @@
 #include "qemu/osdep.h"
 
 #include "exec/exec-all.h"
+#include "exec/plugin-gen.h"
 #include "translate.h"
 #include "translate-a64.h"
 #include "qemu/log.h"
@@ -1646,6 +1647,7 @@ static inline void gen_check_sp_alignment(DisasContext *s)
 
 static bool trans_B(DisasContext *s, arg_i *a)
 {
+    plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     reset_btype(s);
     gen_goto_tb(s, 0, a->imm);
     return true;
@@ -1653,6 +1655,7 @@ static bool trans_B(DisasContext *s, arg_i *a)
 
 static bool trans_BL(DisasContext *s, arg_i *a)
 {
+    plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     gen_pc_plus_diff(s, cpu_reg(s, 30), curr_insn_len(s));
     reset_btype(s);
     gen_goto_tb(s, 0, a->imm);
@@ -1665,6 +1668,7 @@ static bool trans_CBZ(DisasContext *s, arg_cbz *a)
     DisasLabel match;
     TCGv_i64 tcg_cmp;
 
+    plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     tcg_cmp = read_cpu_reg(s, a->rt, a->sf);
     reset_btype(s);
 
@@ -1682,6 +1686,7 @@ static bool trans_TBZ(DisasContext *s, arg_tbz *a)
     DisasLabel match;
     TCGv_i64 tcg_cmp;
 
+    plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     tcg_cmp = tcg_temp_new_i64();
     tcg_gen_andi_i64(tcg_cmp, cpu_reg(s, a->rt), 1ULL << a->bitpos);
 
@@ -1702,6 +1707,7 @@ static bool trans_B_cond(DisasContext *s, arg_B_cond *a)
     if (a->c && !dc_isar_feature(aa64_hbc, s)) {
         return false;
     }
+    plugin_gen_record_branch_target((uint64_t)(s->pc_curr + a->imm));
     reset_btype(s);
     if (a->cond < 0x0e) {
         /* genuinely conditional branches */

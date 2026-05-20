@@ -443,8 +443,24 @@ void plugin_gen_insn_start(CPUState *cpu, const DisasContextBase *db)
 
     pc = db->pc_next;
     insn->vaddr = pc;
+    /*
+     * Cleared per-insn — set by plugin_gen_record_branch_target() if
+     * the target translator resolves a static branch target while
+     * decoding this instruction.  Insn structs are reused across
+     * translations, so failing to reset would leak a stale target
+     * onto a later, unrelated insn.
+     */
+    insn->branch_target_pc = 0;
 
     tcg_gen_plugin_cb(PLUGIN_GEN_FROM_INSN);
+}
+
+void plugin_gen_record_branch_target(uint64_t target_pc)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+    if (insn) {
+        insn->branch_target_pc = target_pc;
+    }
 }
 
 void plugin_gen_insn_end(void)

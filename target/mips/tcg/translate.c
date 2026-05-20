@@ -26,6 +26,7 @@
 #include "translate.h"
 #include "internal.h"
 #include "exec/helper-proto.h"
+#include "exec/plugin-gen.h"
 #include "exec/translation-block.h"
 #include "semihosting/semihost.h"
 #include "trace.h"
@@ -4590,6 +4591,15 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
     }
 
     ctx->btarget = btgt;
+    /*
+     * Surface the resolved static target to plugins for wrong-path
+     * tracing.  Indirect branches (OPC_JR/OPC_JALR) leave btgt at
+     * its -1 sentinel above — those rely on the plugin's observed-
+     * target history instead, signalled by branch_target_pc == 0.
+     */
+    if (btgt != (target_ulong)-1) {
+        plugin_gen_record_branch_target((uint64_t)btgt);
+    }
 
     switch (delayslot_size) {
     case 2:
@@ -8768,6 +8778,7 @@ static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
         return;
     }
     ctx->btarget = btarget;
+    plugin_gen_record_branch_target((uint64_t)btarget);
     ctx->hflags |= MIPS_HFLAG_BDS32;
 }
 
@@ -8811,6 +8822,7 @@ static void gen_compute_branch1_r6(DisasContext *ctx, uint32_t op,
     tcg_gen_trunc_i64_tl(bcond, t0);
 
     ctx->btarget = btarget;
+    plugin_gen_record_branch_target((uint64_t)btarget);
 
     switch (delayslot_size) {
     case 2:
@@ -11010,6 +11022,7 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
         gen_load_gpr(t1, rt);
         bcond_compute = 1;
         ctx->btarget = addr_add(ctx, ctx->base.pc_next + 4, offset);
+        plugin_gen_record_branch_target((uint64_t)ctx->btarget);
         if (rs <= rt && rs == 0) {
             /* OPC_BEQZALC, OPC_BNEZALC */
             tcg_gen_movi_tl(cpu_gpr[31], ctx->base.pc_next + 4 + m16_lowbit);
@@ -11021,6 +11034,7 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
         gen_load_gpr(t1, rt);
         bcond_compute = 1;
         ctx->btarget = addr_add(ctx, ctx->base.pc_next + 4, offset);
+        plugin_gen_record_branch_target((uint64_t)ctx->btarget);
         break;
     case OPC_BLEZALC: /* OPC_BGEZALC, OPC_BGEUC */
     case OPC_BGTZALC: /* OPC_BLTZALC, OPC_BLTUC */
@@ -11033,10 +11047,12 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
         gen_load_gpr(t1, rt);
         bcond_compute = 1;
         ctx->btarget = addr_add(ctx, ctx->base.pc_next + 4, offset);
+        plugin_gen_record_branch_target((uint64_t)ctx->btarget);
         break;
     case OPC_BC:
     case OPC_BALC:
         ctx->btarget = addr_add(ctx, ctx->base.pc_next + 4, offset);
+        plugin_gen_record_branch_target((uint64_t)ctx->btarget);
         break;
     case OPC_BEQZC:
     case OPC_BNEZC:
@@ -11045,6 +11061,7 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
             gen_load_gpr(t0, rs);
             bcond_compute = 1;
             ctx->btarget = addr_add(ctx, ctx->base.pc_next + 4, offset);
+            plugin_gen_record_branch_target((uint64_t)ctx->btarget);
         } else {
             /* OPC_JIC, OPC_JIALC */
             TCGv tbase = tcg_temp_new();

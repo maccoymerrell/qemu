@@ -43,6 +43,20 @@ static uint8_t x86_flags_to_metaflags(uint64_t raw)
     return mf;
 }
 
+/*
+ * x86-64 address canonicalization.  A valid virtual address is in
+ * 48-bit canonical form: bits [63:48] replicate bit 47.  The MMU
+ * faults a non-canonical address, so a genuine stored pointer and
+ * the effective address that dereferences it are both already
+ * canonical; sign-extending bit 47 normalises either form to the
+ * same value and is the natural home for a future Linear Address
+ * Masking (LAM) tag strip.  x86 carries no address tagging today.
+ */
+static uint64_t x86_canonicalize_addr(uint64_t a)
+{
+    return (uint64_t)(((int64_t)(a << 16)) >> 16);
+}
+
 
 /* Register classification table. */
 static const RegClassification x86_reg_class[X86_REG_ENDING] = {

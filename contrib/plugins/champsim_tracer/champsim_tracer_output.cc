@@ -2743,26 +2743,41 @@ static TemplateProfile *profile_get(BBTemplate *t)
 
 /* Pages touched by a real CORRECT-PATH mem-op.  NEVER from WP — WP is
  * speculative and must not define the legitimate address space.  The
- * data-is-address flag (CP and WP) resolves against this CP-only set. */
+ * data-is-address flag (CP and WP) resolves against this CP-only set.
+ * Page numbers are taken after ISA canonicalization, so a tagged or
+ * signed pointer is keyed against the address space its access
+ * actually defined (see AddrCanonicalizeFn). */
 static std::unordered_set<uint64_t> g_obs_pages;
+
+/* Canonicalize @addr for the current ISA, then reduce it to a page
+ * number.  Both g_obs_pages inserts and the data-is-address lookup go
+ * through this so the two sides share one address form. */
+static inline uint64_t profile_canon_page(uint64_t addr)
+{
+    AddrCanonicalizeFn fn = isa_properties[trace_isa].canonicalize_addr;
+    uint64_t canon = fn ? fn(addr) : addr;
+    return canon >> CST_PROFILE_PAGE_SHIFT;
+}
 
 static inline void profile_note_page(uint64_t ea)
 {
-    g_obs_pages.insert(ea >> CST_PROFILE_PAGE_SHIFT);
+    g_obs_pages.insert(profile_canon_page(ea));
 }
 
-/* item 5: a loaded/stored value is an "address" when its page is one
- * a real mem-op accessed. */
+/* item 5: a loaded/stored value is an "address" when — interpreted in
+ * the ISA's canonical address form — its page is one a real CP mem-op
+ * touched.  Accesses narrower than 4 bytes cannot hold an address and
+ * are never classified as one. */
 static bool profile_value_is_addr(const DynParam &dp)
 {
-    if (dp.data_size == 0) {
-        return false;                       /* no data captured */
+    if (dp.data_size < 4) {
+        return false;            /* no data, or too narrow for an addr */
     }
     uint64_t v = dp.data.limb[0];           /* low 64 bits, LE */
     if (dp.data_size < 8) {
         v &= (~(uint64_t)0) >> (8 * (8 - dp.data_size));
     }
-    return g_obs_pages.count(v >> CST_PROFILE_PAGE_SHIFT) != 0;
+    return g_obs_pages.count(profile_canon_page(v)) != 0;
 }
 
 /* Per-insn memop step of the stride classifier (items 3/4/6).

@@ -85,6 +85,20 @@ static unsigned int cap_mode_mips(const char *target_name)
     return mode;
 }
 
+/*
+ * MIPS address canonicalization.  MIPS defines no address tagging;
+ * a stored pointer and the effective address dereferencing it share
+ * one form (a MIPS32 address sign-extended into the 64-bit register
+ * file, or a flat MIPS64 address).  No transform is needed —
+ * identity.  The profiler's data-is-address test already masks a
+ * sub-8-byte access to its captured width, which covers the MIPS32
+ * pointer case.
+ */
+static uint64_t mips_canonicalize_addr(uint64_t a)
+{
+    return a;
+}
+
 
 /* Register classification table. */
 static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {

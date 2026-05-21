@@ -454,6 +454,21 @@ typedef void (*RegAliasInserterFn)(
  */
 typedef uint8_t (*MetaFlagsMapperFn)(uint64_t raw_flags);
 
+/*
+ * Per-ISA address canonicalization.  Maps a raw 64-bit value to the
+ * form in which a stored pointer and the effective address that
+ * dereferences it compare equal: stripping the bits the MMU ignores
+ * (AArch64 top-byte tags under TBI, pointer-authentication signature
+ * bits) and applying the ISA's canonical sign extension.  The
+ * profiler's data-is-address page test (champsim_tracer_output.cc)
+ * runs both the observed effective address and the candidate value
+ * through this, so a tagged or signed pointer is page-matched against
+ * the canonical address space rather than missed.  Never NULL: an
+ * ISA that needs no transform supplies an identity function, so the
+ * call site is unconditional.
+ */
+typedef uint64_t (*AddrCanonicalizeFn)(uint64_t addr);
+
 typedef struct {
     uint8_t               branch_delay_slots;
     bool                  pc_relative_branch_imm;
@@ -463,6 +478,7 @@ typedef struct {
     CapModeForTargetFn    cap_mode_for_target;
     RegAliasInserterFn    reg_alias_inserter;
     MetaFlagsMapperFn     flags_to_metaflags;
+    AddrCanonicalizeFn    canonicalize_addr;
 } IsaProperties;
 
 #ifdef CHAMPSIM_MNEMONIC_TABLES_IMPL
@@ -482,6 +498,7 @@ const IsaProperties isa_properties[] = {
         .cap_arch = CS_ARCH_X86,
         .cap_mode_for_target = cap_mode_x86,
         .flags_to_metaflags = x86_flags_to_metaflags,
+        .canonicalize_addr = x86_canonicalize_addr,
     },
     [TRACE_ISA_AARCH64] = {
         .include_implicit_regs = true,
@@ -490,12 +507,14 @@ const IsaProperties isa_properties[] = {
         .cap_mode_for_target = cap_mode_aarch64,
         .reg_alias_inserter = insert_aarch64_reg_aliases,
         .flags_to_metaflags = aarch64_flags_to_metaflags,
+        .canonicalize_addr = aarch64_canonicalize_addr,
     },
     [TRACE_ISA_RISCV]   = {
         .include_implicit_regs = false,
         .target_prefixes = isa_prefixes_riscv,
         .cap_arch = CS_ARCH_RISCV,
         .cap_mode_for_target = cap_mode_riscv,
+        .canonicalize_addr = riscv_canonicalize_addr,
     },
     [TRACE_ISA_MIPS]    = {
         .branch_delay_slots = 1,
@@ -503,6 +522,7 @@ const IsaProperties isa_properties[] = {
         .target_prefixes = isa_prefixes_mips,
         .cap_arch = CS_ARCH_MIPS,
         .cap_mode_for_target = cap_mode_mips,
+        .canonicalize_addr = mips_canonicalize_addr,
     },
 };
 

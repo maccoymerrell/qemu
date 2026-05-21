@@ -79,6 +79,23 @@ static uint8_t aarch64_flags_to_metaflags(uint64_t raw)
     return mf;
 }
 
+/*
+ * AArch64 address canonicalization.  A user virtual address is
+ * 48-bit; bits [63:48] are not part of the translated address.  The
+ * top byte [63:56] holds a software tag the MMU ignores under Top
+ * Byte Ignore (the basis of MTE and HWASAN), and bits [55:48] hold
+ * the pointer-authentication signature when PAC is in use.  A pointer
+ * sitting in memory therefore carries tag / PAC bits that the
+ * effective address dereferencing it does not.  Masking to bits
+ * [47:0] recovers the address both forms share, so the profiler's
+ * page test matches a tagged or signed pointer against the address
+ * space its accesses actually defined.
+ */
+static uint64_t aarch64_canonicalize_addr(uint64_t a)
+{
+    return a & ((UINT64_C(1) << 48) - 1);
+}
+
 
 /* Register classification table. */
 static const RegClassification aarch64_reg_class[AARCH64_REG_ENDING] = {

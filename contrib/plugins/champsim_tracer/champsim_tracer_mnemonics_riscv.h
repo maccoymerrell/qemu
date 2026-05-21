@@ -156,6 +156,20 @@ static unsigned int cap_mode_riscv(const char *target_name)
                 | CS_MODE_RISCV_ZBS;
 }
 
+/*
+ * RISC-V address canonicalization.  The base ISA defines no address
+ * tagging; Sv39 / Sv48 / Sv57 virtual addresses are already in
+ * canonical form (bits above the translated width replicate the top
+ * translated bit), and the same form is seen for both a stored
+ * pointer and the effective address dereferencing it.  No transform
+ * is needed — identity.  If a pointer-masking extension is ever
+ * traced, its tag strip belongs here.
+ */
+static uint64_t riscv_canonicalize_addr(uint64_t a)
+{
+    return a;
+}
+
 
 /* Register classification table. */
 static const RegClassification riscv_reg_class[RISCV_REG_ENDING] = {

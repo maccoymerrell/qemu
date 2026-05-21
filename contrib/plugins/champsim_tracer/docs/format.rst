@@ -16,11 +16,9 @@ Wire format
 
 .. note::
 
-   The canonical wire-format spec is the markdown file
-   ``champsim_tracer_format.md`` next to ``champsim_tracer_output.cc``.
-   It is rendered below verbatim.  When the writer changes, that file
-   is the one that needs updating; this page just embeds it so the
-   site has one document per topic.
+   The canonical wire-format specification is the markdown file
+   ``champsim_tracer_format.md``, alongside
+   ``champsim_tracer_output.cc``; it is rendered verbatim below.
 
    The spec is split into two parts: **Part I — Decoder Recipe** is a
    procedural Step 0 .. Step 7 walkthrough for writing a decoder from

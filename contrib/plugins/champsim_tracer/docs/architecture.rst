@@ -31,8 +31,8 @@ three layers in series:
 1. **TCG translation** (once per TB, on first sight).  The tracer
    asks Capstone for instruction-detail metadata via
    ``qemu_plugin_insn_detail`` and walks the per-ISA classification
-   table.  Cost is paid once per static basic block; on long
-   workloads this is a rounding error.
+   table.  Cost is paid once per static basic block, so it amortises
+   to a negligible fraction of total runtime on long workloads.
 2. **CP attribution** (every TB execute).  ``vcpu_tb_exec`` walks
    the previous TB's instruction list, bumps stats, drains the
    per-thread memop accumulator, and folds the just-finished
@@ -45,9 +45,10 @@ three layers in series:
    cost is roughly proportional to ``wpdepth`` instructions of
    speculative execution per branch.
 
-Measured numbers on the SPEC CPU2017 ``mcf_r`` test workload, 20 M
-architectural instructions of capture (x86_64 host, gcc 13).  These
-are starting points; your workload will differ in both directions.
+The numbers below are measured on the SPEC CPU2017 ``mcf_r`` test
+workload, 20 M architectural instructions of capture (x86_64 host,
+gcc 13).  They are representative of this workload only; other
+workloads vary in both runtime and trace size.
 
 .. list-table::
    :header-rows: 1
@@ -160,29 +161,31 @@ Hot-path micro-optimisations
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The encoder and per-callback paths carry several non-obvious
-optimisations.  Each replaced a profiled hot spot; the "obvious"
-simpler form measurably regresses, so treat these as load-bearing:
+optimisations.  Each addresses a profiled hot spot, and the simpler
+form it replaces measurably regresses; the entries below are
+load-bearing:
 
-* **TLS is expensive here.**  The plugin is ``dlopen``'d, so every
+* **TLS access cost.**  The plugin is ``dlopen``'d, so every
   ``thread_local`` access (``g_wp_state``, the ``g_stats`` macro)
-  goes through ``__tls_get_addr`` under the general-dynamic TLS
-  model (~10 ns each; ~3 % of runtime, dominated by the per-memop
-  callback).  Hot paths cache the TLS slot in a local once before
-  loops / critical sections instead of re-touching it.
-* **``RawBuf`` not ``GByteArray``.**  The per-entry encoder scratch
-  uses an inlined-append ``RawBuf``; ``g_byte_array_append`` was
-  ~1.5 % of total runtime (a glib call per ULEB byte).  Capacity
-  grows 2× and never shrinks (reuse-the-largest-scratch).
+  resolves through ``__tls_get_addr`` under the general-dynamic TLS
+  model — a measured ~10 ns each, ~3 % of runtime, dominated by the
+  per-memop callback.  Hot paths cache the TLS slot in a local once
+  before loops / critical sections rather than re-touching it.
+* **``RawBuf`` instead of ``GByteArray``.**  The per-entry encoder
+  scratch uses an inlined-append ``RawBuf``.  ``g_byte_array_append``
+  costs a glib call per ULEB byte, a measured ~1.5 % of total
+  runtime.  ``RawBuf`` capacity grows 2× and never shrinks, so the
+  scratch settles at the largest size any entry needed.
 * **Field-state cache indexed by ``template_id``.**  A flat vector
-  keyed by the dense ``template_id`` replaced a per-entry glib hash
-  lookup that profiled at ~10 % on mcf.
-* **``field_id`` → slot via a 1024-entry LUT**, replacing an
-  eight-branch chain that was ~2.6 % at ~80 M calls.
+  keyed by the dense ``template_id`` replaces a per-entry glib hash
+  lookup; the hash lookup measures ~10 % on mcf.
+* **``field_id`` to slot via a 1024-entry LUT.**  The LUT replaces an
+  eight-branch chain that measures ~2.6 % at ~80 M calls.
 * **``template_static`` skip.**  Instruction-encoding families
   (opcode, branch type, insn bytes, flags, immediate, size) equal
   their template default for every entry, so they never emit a
-  record; probing them anyway was ~50 % of per-slot cost on
-  full-config mcf.
+  record.  Skipping the probe entirely removes a cost that measures
+  ~50 % of per-slot work on full-config mcf.
 * **Narrow vs wide value paths.**  Families whose value fits in
   ``u64`` (counts, addresses, encoding fields, lane masks) compare
   two ``u64`` s in registers and only materialise a 512-bit value
@@ -190,11 +193,12 @@ simpler form measurably regresses, so treat these as load-bearing:
   ``STORE_DATA`` / ``DST_REG`` take the genuinely-wide path.
 * **Reg-handle pointer cache.**  A direct-mapped TLS cache keyed by
   ``QemuRegKey*`` identity (one stable instance per template
-  reg-name) skips the glib-hash + ``strcmp`` chain that was ~7–9 %
+  reg-name) skips a glib-hash + ``strcmp`` chain that measures ~7–9 %
   on register-heavy workloads with ``regdata=1``.
 
-These are the canonical examples of code that looks like dead
-weight but is not: profile before "simplifying" any of them.
+Each entry is code whose simpler form costs the percentage stated; a
+change to any of them is sound only when re-profiling shows the cost
+has moved.
 
 .. _multi-vcpu:
 
@@ -246,8 +250,8 @@ Practical implications:
   scheduling.
 * **Non-determinism across runs is normal on SMP workloads.**
   The tracer faithfully records whichever interleaving QEMU
-  produced; pin the workload to one vCPU
-  (``-smp 1`` or ``taskset 0x1``) for byte-stable traces on
+  produced; pin the workload to a single host CPU
+  (``taskset -c 0``) to reduce the variability of
   inherently-concurrent applications.
 * **Sub-segment thread switches are sparse.**  ``BODY_TAG_THREAD_SWITCH``
   records are emitted only when the firing vCPU differs from the
@@ -351,11 +355,25 @@ order they're touched on a hot path:
      - Maps Capstone's per-ISA mnemonics to ``GenericOpcode`` /
        ``BranchType`` / ``GenericRegId``.  This is the only place that
        knows how a particular ISA spells "add."
-   * - ``champsim_tracer_mnemonics.h``,
-       ``champsim_tracer_mnemonic_tables.c``
-     - Static tables: per-ISA insn classification (generic opcode,
-       branch type, atomic flag), per-ISA register classification, and
-       per-ISA architectural properties (delay slots, etc.).
+   * - ``champsim_tracer_mnemonics.h``
+     - Declares the classification table types
+       (``InsnClassification``, ``RegClassification``) and the shared
+       per-ISA architectural-property surface (delay slots, etc.).
+   * - ``champsim_tracer_mnemonics_<isa>.h``
+       (``x86`` / ``aarch64`` / ``mips`` / ``riscv``)
+     - The per-ISA classification tables themselves: ``<isa>_insn_class[]``
+       (generic opcode, branch type, atomic flag, dependency refiner)
+       and ``<isa>_reg_class[]`` (Capstone register ID to
+       ``GenericRegId`` plus GDB-stub feature/name).  Auto-generated by
+       ``champsim_tracer_mnemonic_audit.py``.
+   * - ``champsim_tracer_mnemonic_tables.cc``
+     - The shared dependency-refiner functions (``dep_all_to_all`` and
+       the per-behaviour-group refiners) the classification tables'
+       ``.dep_refine`` slots point at.
+   * - ``champsim_tracer_scoreboard.{h,cc}``
+     - The per-vCPU scoreboard.  Inline stores registered on a TB's
+       first instruction publish that TB's start PC, fall-through PC,
+       and ``TbTerminus`` here for ``vcpu_tb_exec`` to read.
    * - ``champsim_tracer_generic_ids.h``
      - The portable enum domains: ``GenericOpcode``, ``BranchType``,
        ``GenericRegId``.  Everything in the plugin and the decoder
@@ -445,15 +463,18 @@ Per TB executed on the correct path, ``vcpu_tb_exec`` runs:
     target (the fall-through for a taken direct branch, the
     translator-resolved static target for a not-taken direct
     branch, the most-frequent-non-CP indirect target for an
-    indirect branch).  Then either invoke the WP simulator or skip
-    it.
-7.  Build a :class:`BodyEntry` from the just-finalized BB plus the
-    drained per-thread memop / reg-snap accumulators, and stream it
-    through the writer.
+    indirect branch).
+7.  Release ``data_lock``, then call ``emit_finalized_bb``: it
+    optionally invokes the WP simulator for the resolved wrong
+    target, builds a :class:`BodyEntry` from the just-finalized BB
+    plus the drained per-thread memop / reg-snap accumulators, and
+    streams it through the writer.
 
 Steps 4-6 happen under ``data_lock``; the BB cache writes plus chain
-state are mutated there.  The actual write to the body stream (step 7)
-holds only ``exec_lock`` — the writer is internally synchronized.
+state and the WP-target resolution are mutated there.  ``data_lock``
+is released before step 7 — the WP simulator and the body-stream
+write run under ``exec_lock`` only.  The writer is internally
+synchronized.
 
 .. _wp-flow:
 
@@ -514,17 +535,16 @@ the same body record as its CP entry.
 Caveats
 -------
 
-These are the places where reading the source would not be enough,
-because the answer is "we deliberately do this and here's why":
+These are deliberate design decisions whose rationale is not
+apparent from the source alone:
 
 *BBs always end in a branch.*  Per :doc:`/format`, ``bb_map_`` only
 holds true basic blocks: the run from a branch target up to the next
 branch.  The WP simulator traces *past* in-flight faults precisely
 to preserve this invariant — see step 2g above.  Committing a
-truncated faulted BB would trigger a "differing insn sequence"
-warning on the next CP commit at the same start_pc; if you ever
-introduce mid-stream commits, the warning in ``commit_true_bb``
-will scream.
+truncated faulted BB triggers a "differing insn sequence" warning on
+the next CP commit at the same start_pc; ``commit_true_bb`` emits
+that warning, which surfaces any mid-stream-commit regression.
 
 *REP-prefixed x86 string instructions fan out per iteration.*  An x86
 ``REP MOVS`` executes N times against architectural memory.  The
@@ -532,8 +552,9 @@ tracer surfaces each iteration as its own ``BODY_TAG_ENTRY``: iter 1
 stays on the BB that *enters* the REP loop (terminating that BB at
 the REP's PC), and iters 2..N each emit a fresh body entry on a
 1-insn self-loop BB whose start_pc == fall_through_pc == the REP's
-own PC.  See *Part II §5.2 "REP-prefixed self-loop BBs (x86)"* of the
-wire-format spec for the encoding details.
+own PC.  See the *"REP-prefixed self-loop BBs (x86)"* subsection of
+*Part II §5.2 "Memory Counts and Addresses"* of the wire-format spec
+for the encoding details.
 The REP-self-loop BB's terminating insn carries
 ``branch_type = BRANCH_REP`` to alert consumers that the BB is a
 synthetic 1-insn self-loop rather than an ordinary direct conditional
@@ -556,23 +577,22 @@ PC and would otherwise spin forever.
 callback *before* the plugin shared object's own ``__cxa_atexit``
 destructors run.  By the time ``plugin_exit`` fires, the C++
 containers in ``g_bb_template_cache`` and ``g_branch_history`` have
-already been destroyed and their ``size()`` returns 0.  We mirror the
-relevant cardinality counts as raw ``uint64_t`` in ``g_stats``
-(``tb_templates_created`` etc.) and bump them at insertion time so the
-exit-time summary still reports useful numbers.
+already been destroyed and their ``size()`` returns 0.  The plugin
+therefore mirrors the relevant cardinality counts as raw ``uint64_t``
+in ``g_stats`` (``tb_templates_created`` etc.) and bumps them at
+insertion time, so the exit-time summary still reports useful numbers.
 
 *Thread-locals at exit.*  The CP memop accumulator is a TLS vector.
 On REP-heavy workloads it can be MiB-sized and backed by a direct
-``mmap``.  Forcing ``shrink_to_fit`` from atexit was observed to
-SIGSEGV deep in ``__libc_free`` because some glibc heap state has
-already been torn down.  ``cleanup_current_thread`` therefore only
-``clear()`` s; the TLS destructor runs the natural vector destructor
-afterwards.
+``mmap``.  Forcing ``shrink_to_fit`` from atexit SIGSEGVs deep in
+``__libc_free`` because some glibc heap state is already torn down by
+that point.  ``cleanup_current_thread`` therefore only ``clear()`` s;
+the TLS destructor runs the natural vector destructor afterwards.
 
 *GMutex, not std::mutex.*  ``<mutex>``'s transitive include chain
 pulls ``<cctype>``, which goes through QEMU's ``include/qemu/ctype.h``
-shadow that breaks libstdc++'s ``using ::isalnum;`` declarations.  We
-keep ``GMutex`` everywhere to avoid the build-time hazard.
+shadow that breaks libstdc++'s ``using ::isalnum;`` declarations.  The
+plugin uses ``GMutex`` everywhere to avoid that build-time hazard.
 
 *TB-flush longjmp hazard.*  During WP execution
 ``tb_gen_code()`` may call ``tb_flush()`` on a full code buffer,
@@ -606,9 +626,9 @@ live vCPU context — so it is resolved on the first
 ``vcpu_init_cb``, not at install.
 
 *Register IDs are 8-bit.*  ``GenericRegId`` reserves the full
-0..254 range and 255 is the count sentinel.  If your ISA needs more
-than 256 distinct architectural registers, the wire format changes —
-not just an added enum value.
+0..254 range and 255 is the count sentinel.  An ISA that needs more
+than 256 distinct architectural registers requires a wire-format
+change — not just an added enum value.
 
 *WP overlay persists across chains.*  Hot speculatively-touched
 templates pay first-observation cost only once per trace.  Lookups

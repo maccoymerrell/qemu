@@ -17,8 +17,9 @@ from the file.
 
 * :ref:`cst_audit <audit-cc>` prints a byte-budget breakdown of
   where bytes go (header, templates, CP body, WP body, field-delta
-  records, ...).  Use it when tuning trace size or diagnosing where
-  unexpected bytes accumulated.
+  records, thread-switch records, per-thread REGFILE records, ...).
+  Use it when tuning trace size or diagnosing where unexpected bytes
+  accumulated.
 
 .. _decoder-cc:
 
@@ -27,6 +28,7 @@ cst_decode
 
 .. index::
    single: cst_decode
+   single: --format
    single: --templates-only
    single: --objdump
    single: --show-deps
@@ -47,9 +49,10 @@ Output format
 
 The output starts with a ``;``-prefixed header banner that
 records the trace's metadata (magic, ISA, command line,
-datetime, feature flags, segment window, template count).  Body
-records follow, grouped by basic block with one architectural
-instruction per line in an ``objdump -d``-style layout.
+datetime, feature flags, segment window, SimPoint weight,
+template count).  Body records follow, grouped by basic block
+with one architectural instruction per line in an
+``objdump -d``-style layout.
 
 Sample, with ``wp=1,memdata=1,regdata=1`` capture flags:
 
@@ -62,6 +65,7 @@ Sample, with ``wp=1,memdata=1,regdata=1`` capture flags:
    ; datetime=2026-05-10 16:11:23
    ; flags=MEM_DATA REG_DATA
    ; start_insn=0 warmup_insns=0 total_target_insns=10000
+   ; simpoint_weight=1
    ; templates=31
 
    ; ----- BB 3 entry pc=0x401740 insns=12 seq=1 tid=0 -----
@@ -152,6 +156,18 @@ with the header in greppable output; the same data appears in the
 ``--format=legacy`` and ``--templates-only`` views without the
 comment prefix.
 
+``--format=disasm`` / ``--format=legacy``
+   Select the output mode; ``disasm`` is the default and produces
+   the ``objdump -d``-style layout described above.
+   ``--format=legacy`` (also spelled ``--legacy``) emits the older
+   line-oriented dump — a flat ``<srcs> -> <dsts>`` per-instruction
+   layout with the encoding maps, templates, and body observations
+   printed without the ``; ``-comment prefix.  It is byte-identical
+   to ``champsim_tracer_decode.py``'s ``render_text_streaming``
+   output, retained so trace-diffing scripts that predate the C++
+   decoder keep working.  ``--format=legacy`` is incompatible with
+   ``--templates-only``.
+
 ``--templates-only``
    Skip the body stream and emit the static template dictionary,
    one block per true basic block: a ``BB<id> <pc> <symbol>``
@@ -211,11 +227,14 @@ cst_audit
 
    $ build/contrib/plugins/cst_audit trace.cst
 
-Prints a byte-budget table: member sizes, a **header breakdown**, a
-body breakdown, the field-delta record breakdown, and entry / insn
-totals.  Every byte the writer produced is counted exactly once and
-each section sums to its parent (a ``[rollup 100.00%]`` line asserts
-the header reconciles), so the workflow when tuning trace size is:
+Prints a byte-budget table: an **on-disk** line (the container's
+actual ``.cst`` size, plus the compressed body member's size and
+codec ratio when the body is compressed), member sizes, a **header
+breakdown**, a body breakdown, the field-delta record breakdown,
+and entry / insn totals.  Every byte the writer produced is counted
+exactly once and each section sums to its parent (a
+``[rollup 100.00%]`` line asserts the header reconciles), so the
+workflow when tuning trace size is:
 
 1. Run ``cst_audit`` on a baseline trace.
 2. Toggle a writer flag (``wp_memdata=0``, ``wp_regdata=0``,
@@ -228,6 +247,9 @@ Sample output (abridged):
 .. code-block:: console
 
    $ build/contrib/plugins/cst_audit trace.cst
+   === ON DISK ===
+     container (.cst)                          12.04 KiB
+
    === MEMBER SIZES (uncompressed) ===
      TOTAL uncompressed                       28.68 KiB  100.00%
      HEADER member                            25.93 KiB   90.41%  [   31 tmpl, avg  856.4 B]
@@ -245,8 +267,10 @@ Sample output (abridged):
    === BODY BREAKDOWN (2.75 KiB) ===
      CP entry framing                              42 B    1.49%  [   21 entry, avg   2.0 B]
      CP field-delta section                       892 B   31.68%  [   21 entry, avg  42.5 B]
+     thread-switch records                          0 B    0.00%  [    0 switch]
      ...
      IFRAME records (validation redundancy)         0 B    0.00%
+     REGFILE records (per-thread initial state)    96 B    3.41%  [    1 regfile]
 
 The **HEADER BREAKDOWN** attributes every header byte to a
 template-block group, so the cost of each piece of static metadata
@@ -254,24 +278,36 @@ is visible: ``BB info`` (the per-BB header — id, start PC, insn
 count, ``fall_through``, the terminal-branch ``n_targets`` / target
 list, symbol), ``instruction descriptors``, optional ``dependency
 sub-blocks``, and the run-aggregated ``template profile block``.
-The ``IFRAME records`` line appears only on traces produced with
-``iframe_rate>0``; those bytes are pure validation overhead and
-disappear when the feature is off.
+The **BODY BREAKDOWN** likewise covers every body record kind: CP
+and WP entry framing and field-delta sections, WP events,
+``thread-switch records`` (one per ``BODY_TAG_THREAD_SWITCH``) and
+``REGFILE records`` (one ``BODY_TAG_REGFILE`` per thread, carrying
+that thread's initial regfile snapshot), the ``IFRAME records``
+line, and the body terminator.  The ``IFRAME records`` line appears
+only on traces produced with ``iframe_rate>0``; those bytes are
+pure validation overhead and disappear when the feature is off.
 
 Validating a trace
 ------------------
 
-A ``.cst`` file is well-formed if all of the following hold; the
-two C++ tools collectively check every one:
+A ``.cst`` file is a ustar archive with two members — a
+magic-bracketed header member and a magic-bracketed body member.
+It is well-formed if all of the following hold; the two C++ tools
+collectively check every one:
 
-1. **The trailer magic matches the header magic.**
-   ``cst_decode`` checks this first; mismatch is a fatal error.
-2. **The body's offset and length match the trailer's offsets and
-   the header's parsed length.**  ``cst_decode`` raises
-   ``header/body offset mismatch`` if not.
+1. **The header member begins with ``CST_MAGIC``.**  Opening the
+   trace parses the header member and raises ``Bad header magic``
+   if the leading ``u32`` does not equal ``CST_MAGIC``.
+2. **The body member is bracketed by ``CST_MAGIC``.**  The leading
+   ``u32`` of the body member must equal ``CST_MAGIC`` — opening it
+   raises ``Bad body leading magic`` otherwise — and its trailing
+   ``u32`` must equal ``CST_MAGIC``, raising
+   ``body member truncated (bad trailing magic)`` otherwise.
 3. **The body's footer ENTRY count matches the body walker's
    observation.**  ``cst_decode`` raises
-   ``footer entry-count mismatch`` if not.
+   ``Footer entry-count mismatch`` if the ``BODY_TAG_END`` footer's
+   recorded entry count does not equal the number of entries the
+   walker consumed.
 4. **Every IFRAME (when present) reproduces the same per-entry
    shape as its preceding ENTRY.**  See "IFRAME validation"
    below.
@@ -328,18 +364,24 @@ mnemonic survey / audit
 Two helpers tied to the disassembly classification step rather than
 the wire format:
 
-* ``champsim_tracer_mnemonic_survey.py`` walks a workload, records
-  every Capstone mnemonic it sees, and prints frequency counts.
-  Useful when adding ISA support: it tells you which mnemonics need
-  rows in ``champsim_tracer_mnemonic_tables.c``.
+* ``champsim_tracer_mnemonic_survey.py`` is a static mnemonic-coverage
+  analyzer.  It parses ``champsim_tracer_mnemonics.h`` to build the set
+  of known instruction IDs per ISA, disassembles one or more input ELF
+  binaries with Capstone, and reports any instruction IDs the
+  classification tables do not cover.  Useful when adding ISA support:
+  it tells you which mnemonics need rows in
+  ``champsim_tracer_mnemonic_tables.cc``.
 
-* ``champsim_tracer_mnemonic_audit.py`` diffs the union of seen
-  mnemonics against the static classification table and reports any
-  unclassified ones.  Run after adding a new opcode or ISA to confirm
-  the table covers the workload.
+* ``champsim_tracer_mnemonic_audit.py`` audits *and regenerates* the
+  classification tables.  It derives the mnemonic universe from the
+  in-tree Capstone C enum headers (not from mnemonics observed in any
+  run), checks each against the static classification table, and
+  reports any unclassified ones.  Run after adding a new opcode or ISA
+  to confirm the table covers the full Capstone surface.
 
-Both run against an existing trace and don't require a fresh QEMU
-invocation.
+Neither tool reads a ``.cst`` trace: the survey works from ELF
+binaries and the Capstone tables, and the audit works from the
+Capstone C enum headers and the tables.
 
 Reusing the decoder library
 ---------------------------
@@ -355,20 +397,30 @@ be lifted into your own consumer wholesale.  The design rules a
 re-user must respect:
 
 * **Strictly self-describing — no compile-time enum dependency.**
-  Every header carries encoding maps (opcode, branch_type, reg,
-  field_id, body_tag, insn_flag, wp_event_flag, metaflags,
-  dep_block_flag, mem_access_pattern, profile_flag).  The tools
-  reverse-resolve well-known *names* into IDs at load time and
-  dispatch off those; a future writer that renumbers IDs stays
-  decodable as long as its maps carry the names.  A trace missing a
-  well-known name is malformed (load throws).
+  Every header carries twelve encoding maps (opcode, branch_type,
+  reg, field_id, header_flag, insn_flag, body_tag, wp_event_flag,
+  metaflags, dep_block_flag, mem_access_pattern, profile_flag).  The
+  tools reverse-resolve *names* into IDs at load time and dispatch
+  off those; a future writer that renumbers IDs stays decodable as
+  long as its maps carry the names.  A conforming decoder requires
+  only a small structural set of names plus an entry for every value
+  the trace actually uses (see :doc:`/format`, Step 3.3); a trace
+  missing a *required* name is malformed (load throws).  The
+  in-tree writer emits the full canonical name set in every map by
+  convention, not by format requirement.
 * **Slot families resolve by full name, never by arithmetic.**
   There is deliberately no exposed ``SLOT_STRIDE``: per-slot
   families (``LOAD_ADDR``/``STORE_ADDR``/``LOAD_DATA``/
   ``STORE_DATA``/``DST_REG`` and the four lane-mask families) are
-  looked up as ``CST_FID_<family><k>`` for each ``k``.  The
-  decoder's internal dense slot order is unrelated to the wire ID;
-  both ends resolve by name.
+  looked up as ``CST_FID_<family><k>`` for each ``k`` the trace
+  uses.  The decoder's internal dense slot order is unrelated to the
+  wire ID; both ends resolve by name, and the decoder's dispatch
+  depends on resolving the names it needs — the structural set it
+  always requires plus the family/slot names for values the trace
+  carries.  A trace need only name the structural set plus the
+  entries for values it actually uses; the in-tree writer
+  enumerates the full canonical set as a convenience, not because
+  the format demands it.
 * **Capstone is optional.**  Without ``-DCST_HAVE_CAPSTONE``
   ``cst_objdump`` compiles to a stub and ``--objdump`` simply
   disables — downstream re-users link cleanly without bundling

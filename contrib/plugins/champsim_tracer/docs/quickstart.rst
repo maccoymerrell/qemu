@@ -19,8 +19,9 @@ The tracer is a C++17 QEMU TCG plugin.  Tested combinations:
 * **glib:** 2.66 or newer (Ubuntu 22.04 default is fine).
 * **Capstone:** auto-downloaded by meson via
   ``subprojects/capstone.wrap``.  The plugin uses Capstone's
-  detail mode + group classification, so the wrap version is
-  what we test against.
+  detail mode and requires the revision pinned in that wrap
+  file (currently ``6.0.0-Alpha7``); the build always links
+  against that pinned copy.
 * **QEMU base:** the repository is a fork of QEMU.  The plugin
   expects the base modifications described in
   :doc:`qemu_modifications`; building against an unmodified
@@ -95,8 +96,13 @@ Output destination
      user-supplied basename is stripped before the suffix is appended,
      so ``outfile=run`` and ``outfile=run.cst`` both produce
      ``run.cst``.  In simpoint mode the per-segment files are named
-     ``<basename>_sp<index>.cst`` (the trailing ``.cst`` on the user
-     basename is also stripped for these).
+     ``<basename>-<positionB>.cst``, where ``<positionB>`` is the
+     simpoint position expressed in billions of instructions with the
+     decimal point rendered as ``_`` (so the only ``.`` is the ``.cst``
+     extension).  For example, ``outfile=mcf`` yields ``mcf-42B.cst``
+     for a simpoint at 42 billion instructions and ``mcf-73_4B.cst``
+     for one at 73.4 billion.  The trailing ``.cst`` on the user
+     basename is also stripped for these.
    * ``<basename>.unknown_warnings.log`` — sidecar with one line per
      Capstone-emitted instruction the per-ISA classifier didn't
      recognize.  Empty when the classification table covers your
@@ -341,16 +347,17 @@ Observability
    simpoint segment.
 
 ``iframe_rate=<N>``
-   Default ``0`` — disabled.  When ``N > 0``, every Nth observation
-   of a CP template is followed by a redundant ``BODY_TAG_IFRAME``
-   body record encoded against fresh template-default baselines
-   (i.e., absolute values).  Decoders use these to cross-check that
-   their delta-replay reconstructed the same view the writer had —
-   a mismatch raises an error in ``cst_decode``.
+   Default ``100000`` — IFRAMEs are emitted by default.  When
+   ``N > 0``, every Nth observation of a CP template is followed by a
+   redundant ``BODY_TAG_IFRAME`` body record encoded against fresh
+   template-default baselines (i.e., absolute values).  Decoders use
+   these to cross-check that their delta-replay reconstructed the same
+   view the writer had — a mismatch raises an error in ``cst_decode``.
    The IFRAME covers the *entire* body record (CP + WP chain + WP
    events), so flagging the CP also IFRAMEs every WP entry attached
-   to it.  Pure overhead: a trace produced with ``iframe_rate=0``
-   contains no IFRAME records.  Each IFRAME costs roughly the
+   to it.  Setting ``iframe_rate=0`` disables IFRAMEs entirely: the
+   resulting trace contains no IFRAME records and loses the
+   delta-replay self-check.  Each IFRAME costs roughly the
    absolute-encoded size of the body record it's snapshotting —
    ``cst_audit`` reports the total IFRAME byte count under "IFRAME
    records (validation redundancy)".
@@ -422,8 +429,8 @@ the workload's data footprint; enable per-member compression
 .. code-block:: console
 
    $ qemu-x86_64 -plugin ./libchampsim_tracer.so,outfile=run,wp=1,\
-   trace_window=simpoint:file=run.simpts,interval=100000000,\
-   warmup=100000000,simulation=100000000 \
+   trace_window=simpoint:file=run.simpts;interval=100000000;\
+   warmup=100000000;simulation=100000000 \
                  ./prog
 
 One per-simpoint ``.cst`` file with 100 M warmup + 100 M evaluation
@@ -435,7 +442,7 @@ on multi-billion-instruction workloads in tractable trace volume.
 .. code-block:: console
 
    $ qemu-x86_64 -plugin ./libchampsim_tracer.so,outfile=run,wp=1,\
-   trace_window=symbol:name=main,occurrence=1,simulation=20000000 \
+   trace_window=symbol:name=main;occurrence=1;simulation=20000000 \
                  ./prog
 
 Trace opens the first time ``main`` is entered as a TB and captures
@@ -521,15 +528,12 @@ guest binary, the same QEMU command line, the same plugin flags,
 and the same plugin build, two runs produce body streams that are
 *architecturally identical* — every basic block invoked, every
 memop, every register snapshot matches across runs.  In practice
-two ``.cst`` files from back-to-back runs typically differ in two
-places:
-
-* ``DATETIME`` and ``COMMAND`` strings inside the per-segment
-  header.  Both are recorded as-is.
-* The order of identifiers in the encoding-maps section, when
-  unordered hash-table iteration orders something — the C++
-  writer sorts the templates dictionary on serialization, so
-  template_id assignments stable across runs.
+two ``.cst`` files from back-to-back runs differ only in the
+per-segment header's ``DATETIME`` and ``COMMAND`` strings, which
+are recorded as-is.  The encoding-maps section is deterministic:
+the C++ writer sorts the templates dictionary on serialization, so
+``template_id`` assignments are stable across runs and the section
+does not vary with hash-table iteration order.
 
 Things that *can* break determinism:
 
@@ -633,9 +637,10 @@ The recommended consumer pattern is:
 
 1. Iterate body entries with ``cst_decode --format=disasm`` (one
    line per architectural instruction, easy to grep) or via a
-   custom C++ consumer linked against ``libcst_tools_common`` (the
-   static library the offline tools share — header-only API in
-   ``contrib/plugins/champsim_tracer/tools/``).
+   custom C++ consumer linked against ``libcst_tools_common`` — the
+   compiled static library the offline tools share, built from
+   ``cst_format.cc`` and ``cst_decode.cc`` with its headers in
+   ``contrib/plugins/champsim_tracer/tools/``.
 2. Convert per-record fields into the simulator's expected
    structure on the fly.  Templates are loaded once at the start
    of the trace and kept in memory; body entries stream past one
@@ -690,7 +695,5 @@ A4.
 The GitHub Actions workflow at
 ``.github/workflows/champsim-tracer-docs.yml`` builds the HTML on
 each push to ``champsim-trace`` that touches the docs and deploys
-it to Pages.  PDF is *not* built in CI — the texlive install adds
-several minutes per run and the portable copy is only useful to a
-small fraction of readers.  Run ``make pdf`` locally when you need
-one.
+it to Pages.  PDF is *not* built in CI; run ``make pdf`` locally
+when a PDF is needed.

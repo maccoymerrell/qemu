@@ -11,12 +11,13 @@ Build and install
 
 **``configure`` complains about Capstone**
 
-The plugin requires Capstone with detail-mode + group classification
-support.  The QEMU meson wrap at ``subprojects/capstone.wrap``
-auto-downloads a known-good version; make sure
-``--enable-plugins`` was passed and that the wrap was allowed to
-fetch (some CI environments disable wrap downloads — pass
-``--with-capstone`` or pre-populate ``subprojects/capstone/``).
+The plugin requires Capstone built with detail mode and links
+against the revision pinned in the QEMU meson wrap at
+``subprojects/capstone.wrap`` (currently ``6.0.0-Alpha7``).  The
+wrap auto-downloads that revision; make sure ``--enable-plugins``
+was passed and that the wrap was allowed to fetch (some CI
+environments disable wrap downloads — pass ``--with-capstone`` or
+pre-populate ``subprojects/capstone/``).
 
 **``ninja contrib/plugins/libchampsim_tracer.so`` fails with
 "unknown type qemu_plugin_insn_info"**
@@ -59,18 +60,19 @@ usual culprits, in order:
 **``GEN_OP_UNKNOWN`` appears in the exit summary**
 
 Capstone returned an instruction-id the tracer couldn't classify.
-Each per-ISA classification table is sized to ``CAPSTONE_INS_ENDING``
-and has a designated initializer for every Capstone-defined
-mnemonic, so this almost never reflects a missing table row in
-practice.  The two real causes:
+Each per-ISA classification table is sized to that ISA's
+Capstone ``*_INS_ENDING`` count (``X86_INS_ENDING``,
+``AARCH64_INS_ENDING``, ``RISCV_INS_ENDING``, ``MIPS_INS_ENDING``)
+and carries a designated initializer for every Capstone-defined
+mnemonic.  The two causes are:
 
-* Capstone returned an invalid insn-id (often because the bytes it
-  was handed are not a valid instruction encoding — most often
-  uninitialized memory the program executed by mistake or a
-  privileged instruction Capstone doesn't fully model).
-* The Capstone version the tracer was built against is older than
-  the Capstone version emitting the insn-id (newer Capstone added
-  a mnemonic the table doesn't yet cover).
+* Capstone returned an invalid insn-id, because the bytes it was
+  handed are not a valid instruction encoding — most often
+  uninitialized memory the program executed by mistake, or a
+  privileged instruction Capstone does not fully model.
+* The Capstone the tracer was built against is older than the
+  Capstone that emitted the insn-id — a newer Capstone added a
+  mnemonic the table does not yet cover.
 
 Either way, the per-PC details are in the
 ``<basename>.unknown_warnings.log`` sidecar — ``pc=``, ``mnemonic=``,
@@ -96,17 +98,21 @@ simpoint per line:
 
    <interval_id> <cluster_id>
 
-Where ``interval_id`` is the simpoint position in units of
-``spinterval`` instructions.  An optional sibling ``.weights``
-file (``<weight> <cluster_id>`` per line) is loaded if present.
+Where ``interval_id`` is the simpoint position in units of the
+``interval`` instructions passed in ``trace_window=simpoint:``.
+An optional sibling ``.weights`` file (``<weight> <cluster_id>``
+per line) is loaded if present.
 If your file is empty, has comments-only, or all entries are
 malformed, the plugin reports this error and refuses to install.
 
-**``cannot open binary output: <path>``**
+**``champsim_tracer: cannot open <member> output: ...``** (or
+**``... cannot open <member> compression pipe: ...``**)
 
 The directory for the ``outfile=`` path doesn't exist or isn't
-writable.  The plugin doesn't ``mkdir -p`` for you; create the
-target directory before invoking QEMU.
+writable, so the plugin could not open a trace-archive member (or,
+with ``compress=`` set, could not start its compression pipe).  The
+plugin doesn't ``mkdir -p`` for you; create the target directory
+before invoking QEMU.
 
 Trace decode
 ------------
@@ -117,7 +123,7 @@ The trace's body stream starts with an IFRAME record before any
 ENTRY.  This is a writer bug or a corrupt trace; if it reproduces,
 file an issue with the offending ``.cst`` file.
 
-**``cst_decode`` errors with ``footer entry-count mismatch``**
+**``cst_decode`` errors with ``Footer entry-count mismatch``**
 
 The number of ENTRY records the body-walker observed doesn't match
 the count in the body footer.  Indicates either a truncated trace
@@ -135,11 +141,14 @@ fixed-load-address ELF.  Cross-reference the ``start_pc`` /
 **Two back-to-back runs produce different traces**
 
 See :ref:`reproducibility`.  Common causes: ASLR, multi-threaded
-scheduling, clock-driven guest behavior.  Pin ``-smp 1``, disable
-ASLR, fix any ``gettimeofday()``-driven dispatch in the workload,
-and the body streams should be byte-stable across runs (the
-``DATETIME`` and ``COMMAND`` strings in the header still differ —
-those just record metadata).
+scheduling, clock-driven guest behavior, and kernel-supplied
+randomness.  Apply the quickstart's recommended invocation
+(``taskset -c 0`` to pin host scheduling, ``setarch -R`` to disable
+ASLR, ``-seed N`` to fix ``AT_RANDOM``, ``env -i`` to strip the
+inherited environment) and fix any ``gettimeofday()``-driven
+dispatch in the workload; the body streams should then be
+byte-stable across runs (the ``DATETIME`` and ``COMMAND`` strings
+in the header still differ — those just record metadata).
 
 Plugin runtime
 --------------
@@ -153,8 +162,8 @@ crash; if you've added new atexit-time cleanup, look at
 ``cleanup_current_thread`` in the source.  See the "Thread-locals
 at exit" caveat in :doc:`architecture`.
 
-**Per-segment summary shows ``branches_observed = 0`` for a segment
-that clearly has branches**
+**Per-segment summary shows ``Branch transitions observed = 0`` for
+a segment that clearly has branches**
 
 Indicates a segment that opened but never saw a branch instruction
 finish (e.g. a segment 1 instruction wide that opens between

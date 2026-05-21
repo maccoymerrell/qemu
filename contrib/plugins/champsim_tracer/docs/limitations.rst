@@ -35,10 +35,9 @@ Workload-shape limitations
 **Forking and multi-process workloads.**  Untested.  ``fork()``
 under user-mode QEMU produces a host child process; whether and
 how the plugin loads in the child depends on QEMU's plugin-API
-internals and we haven't validated the resulting traces.  If your
-workload forks, treat the trace from that run as best-effort
-until you've confirmed the body stream covers the path you care
-about.
+internals, and the resulting traces have not been validated.  A
+trace from a forking workload should be treated as best-effort
+until the body stream is confirmed to cover the path of interest.
 
 **Self-modifying code (SMC).**  The plugin emits a one-shot
 "differing insn sequence" warning to stderr when ``commit_true_bb``
@@ -69,13 +68,16 @@ links to the prose that explains the consequence of hitting it.
      - Bound
      - Notes
    * - Instructions per basic block
-     - effectively unbounded
-     - A true BB runs from a branch target to the next branch; no
-       fixed cap.  Templates grow with BB length.
+     - no fixed cap
+     - A true BB runs from a branch target to the next branch; the
+       only limit is host memory for the template.  Templates grow
+       with BB length.
    * - Instructions per trace
-     - effectively unbounded
-     - ``total_target_insns = 0`` in the header means "unbounded";
-       count body entries via the trailer's ``num_entries`` instead.
+     - no fixed cap
+     - Bounded only by the 64-bit body-entry counter and available
+       trace storage.  ``total_target_insns = 0`` in the header means
+       "no preset length"; count body entries via the trailer's
+       ``num_entries`` instead.
    * - Slotted load addresses / data per instruction
      - ``CST_FID_SLOT_COUNT`` = 64
      - ``LOAD_ADDR``/``LOAD_DATA`` slots 0..63.  There is no
@@ -101,27 +103,13 @@ links to the prose that explains the consequence of hitting it.
      - 255 (``GenericRegId`` 0..254)
      - 255 (``REG_ID_COUNT``) is the count sentinel; an ISA needing
        more than 255 register IDs requires a wire-format change.
-   * - WP speculative store buffer
-     - ``PLUGIN_SPEC_STORE_BUF_MAX`` = 64 MiB of byte entries
-     - The per-CPU speculative store buffer (QEMU's
-       ``qemu_plugin_spec_mode_begin`` / ``_end`` API) holds every
-       wrong-path write for store-to-load forwarding and discards
-       them all at chain end.  Past the cap no new keys are added
-       (existing keys still update); excess speculative stores are
-       not forwarded.  Far above any real wrong-path store set.
-   * - AArch64 FEAT_MOPS speculative set/copy
-     - ``MOPS_SPEC_MAX_BYTES`` = 256 bytes per instruction
-     - ``SETP/SETM/SETE`` and ``CPYP/CPYM/CPYE`` loop a
-       register-sized memory op inside one TCG helper.  On the
-       wrong path the size register is speculative garbage, so the
-       operation is clamped to a sub-page bound (wrong-path memory
-       is discarded, so a bounded set/copy is indistinguishable).
    * - Stuck-PC speculative-loop guard
-     - ``CST_FID_SLOT_COUNT`` = 64 same-PC iterations
+     - 64 same-PC iterations (reuses ``CST_FID_SLOT_COUNT``)
      - A wrong-path instruction that never advances PC (e.g. an x86
        ``rep`` whose sandboxed write keeps PC anchored) is forced
-       past after this many same-PC iterations, preventing an
-       infinite speculative loop.
+       past once the same-PC iteration count *exceeds* 64.  The 64
+       threshold is a reuse of ``CST_FID_SLOT_COUNT`` for
+       convenience, not an independently tuned bound.
    * - Wrong-path chain depth
      - ``wpdepth`` instructions (configurable)
      - The speculative side-trip after each correct-path branch is
@@ -129,6 +117,44 @@ links to the prose that explains the consequence of hitting it.
 
 The rows below expand the consequences that are not self-evident
 from the table.
+
+QEMU base bounds
+----------------
+
+Two ceilings the wrong-path simulator inherits are not tracer
+constants — they live in this repository's modified QEMU base, not in
+the plugin.  They are listed here because they shape what the WP chain
+can record, but fixing or tuning them is a QEMU-fork change, not a
+plugin change.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 18 52
+
+   * - Quantity
+     - Bound
+     - Notes
+   * - WP speculative store buffer
+     - ``PLUGIN_SPEC_STORE_BUF_MAX`` = 64 MiB of byte entries
+     - The per-CPU speculative store buffer (QEMU's
+       ``qemu_plugin_spec_mode_begin`` / ``_end`` API) holds every
+       wrong-path write for store-to-load forwarding and discards
+       them all at chain end.  Past the cap no new keys are added
+       (existing keys still update); excess speculative stores are
+       not forwarded.  Far above any real wrong-path store set.  The
+       constant is defined in the modified QEMU base at
+       ``accel/tcg/internal-common.h``.
+   * - AArch64 FEAT_MOPS speculative set/copy
+     - ``MOPS_SPEC_MAX_BYTES`` = 256 bytes per instruction
+     - ``SETP/SETM/SETE`` and ``CPYP/CPYM/CPYE`` loop a
+       register-sized memory op inside one TCG helper.  On the wrong
+       path the size register is speculative garbage, so the QEMU
+       fork clamps the operation to a sub-page speculative-execution
+       bound (wrong-path memory is discarded, so a bounded set/copy
+       is indistinguishable).  Both the constant and the clamp logic
+       live in the modified QEMU base at
+       ``target/arm/tcg/helper-a64.c``; the plugin contains no MOPS
+       handling of its own.
 
 Trace-content limitations
 -------------------------
@@ -209,15 +235,15 @@ downstream paths in different runs.  The bistable pattern
 observed in practice corresponds to a single such comparison
 landing on each side of its threshold in different runs.
 
-**Why we can't fix it.**  Detecting the read of uninitialised
-data would require MSan-style shadow-memory tracking (one bit
-per byte of guest memory marking whether CP code has ever
-written it) plus a policy decision on what to substitute when
-WP reads an unwritten byte.  Neither the shadow tracking nor
-the substitution policy fits within the plugin's "record what
-QEMU executed" architecture without significant overhead and
-behavioural changes that would themselves be a research
-contribution.
+**Why it is not fixable plugin-side.**  Detecting the read of
+uninitialised data would require MSan-style shadow-memory
+tracking (one bit per byte of guest memory marking whether CP
+code has ever written it) plus a policy decision on what to
+substitute when WP reads an unwritten byte.  Neither the shadow
+tracking nor the substitution policy fits within the plugin's
+"record what QEMU executed" architecture: both would add
+significant overhead and behavioural changes, and are out of
+scope for the tracer.
 
 **What it doesn't affect.**  Aggregate WP counts (entries,
 total instructions, branch outcomes, store-address coverage)

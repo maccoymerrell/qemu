@@ -45,7 +45,8 @@ Plugin API additions
 
 ``plugins/api.c`` and ``disas/disas-target.c``
 
-   Glue.  ``qemu_plugin_insn_detail`` forwards to a new
+   The dispatch layer between the plugin API and the disassemblers.
+   ``qemu_plugin_insn_detail`` forwards to a new
    ``plugin_disas_detail()`` which delegates to
    ``cap_disas_plugin_detail()`` when Capstone is available for the
    target ISA, and falls back to the builtin disassembler with a
@@ -222,12 +223,12 @@ speculative path.
    The per-vCPU spec store buffer holds one ``g_hash_table`` node
    per speculative byte, so an unbounded wrong-path bulk store
    would exhaust memory and crash inside glib.  ``spec_store_byte``
-   bounds the table at ``PLUGIN_SPEC_STORE_BUF_MAX`` (64 MiB of
-   byte entries, far above any real wrong-path store set): beyond
-   the limit no new keys are added, but existing keys still update
-   so store-to-load forwarding stays correct for the tracked
-   working set, and excess speculative stores are not forwarded.
-   ISA-generic defence in depth.
+   bounds the table at ``PLUGIN_SPEC_STORE_BUF_MAX`` (64 MiB of byte
+   entries): beyond the limit no new keys are added, but existing
+   keys still update so store-to-load forwarding stays correct for
+   the tracked working set, and excess speculative stores are not
+   forwarded.  The bound is ISA-generic — it applies to every target
+   that routes stores through the buffer.
 
 x86 lazy-flags resolution for plugin reads
 ------------------------------------------
@@ -282,12 +283,8 @@ non-plugin TB execution are unchanged.
    active.
 
    The same problem in principle exists for any target that defers
-   sync-point writes of shadow state across insns; i386
-   is the only target affected (AArch64 NZCV is
-   updated eagerly).  A more general approach would be a per-arch
-   "flush translator state before R_REGS callbacks" hook in
-   ``accel/tcg/plugin-gen.c``; the localised i386 handling is the
-   minimal version that covers the affected target.
+   sync-point writes of shadow state across insns; i386 is the only
+   target affected (AArch64 NZCV is updated eagerly).
 
 The :doc:`validator`'s ``metaflags`` check is what surfaces this
 class of bug:  it predicts the canonical Z / N / P bits from the
@@ -299,7 +296,7 @@ arithmetic insn miscompares.
 Disassembly and target metadata
 -------------------------------
 
-``disas/capstone.c`` (the larger half of the diff)
+``disas/capstone.c``
 
    In addition to the plugin entry points above, this file carries a
    per-arch register-ID map.  Capstone's auto-generated
@@ -355,10 +352,25 @@ Disassembly and target metadata
 
 ``target/riscv/cpu.h``
 
-   Inserts the ``end_reset_fields`` marker into ``CPUArchState`` so
-   ``cpu_reset()`` clears the right region.  Required for
-   ``regdata=1`` on RISC-V, where without the marker the plugin's
-   snapshot scratch is left in an undefined state across reset.
+   Inserts the ``end_reset_fields`` boundary marker into
+   ``CPUArchState``, immediately after the architectural register
+   state and CSRs (``gpr``, ``fpr``, ``vreg``, ``pc``, ``vl`` /
+   ``vtype`` and the rest) and before the externally-managed pointers
+   and timers (S/VS-mode interrupt timers, KVM/HVF state).  The marker
+   delimits the rollback-eligible region: ``cpu_plugin_arch_state_size()``
+   returns ``offsetof(CPUArchState, end_reset_fields)`` as the byte
+   count the wrong-path simulator's ``qemu_plugin_cpu_state_save`` /
+   ``qemu_plugin_cpu_state_restore`` snapshot copies.  RISC-V's
+   ``CPUArchState`` had no such marker upstream, so
+   ``cpu_plugin_arch_state_size()`` does not compile for the RISC-V
+   target without it.  The placement matters for ``regdata=1`` on
+   RISC-V: every architectural register the plugin reads back through
+   ``qemu_plugin_read_register`` for destination-register snapshots
+   falls before the marker, so the WP simulator's speculative writes
+   to those registers are rolled back on restore.  A marker placed
+   before any register field would leave that field on the preserved
+   side, and the post-WP correct-path snapshot would observe a
+   speculatively-corrupted value instead of the architectural one.
 
 ``include/elf.h``
 

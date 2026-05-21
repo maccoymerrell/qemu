@@ -1,12 +1,13 @@
 # champsim_tracer Binary Format
 
-Status: **pre-release v0.9, frozen.** This document describes the
-on-disk `.cst` stream written by `champsim_tracer_output.cc` and
-decoded by `cst_decode`.  The layout below is the only shape ever
-produced and the only shape `cst_decode` reads.  See *Format
-Stability and Conformance* (below) for the freeze contract, the
-minimum a conformant trace must carry, and the forward-
-compatibility rules.
+This document specifies the on-disk `.cst` stream written by
+`champsim_tracer_output.cc` and decoded by `cst_decode`, and is the
+canonical reference for both the format and the tracer's use of it.
+The format is in its pre-release epoch, identified by `CST_MAGIC`
+(`0x1D545343`).  See *Format Stability and Conformance* (below) for
+what the epoch identifier fixes, the minimum a conformant trace must
+carry, and the forward-compatibility rules that govern additive
+evolution within the epoch.
 
 All multi-byte fixed-width integers are little-endian. Variable-width
 integers use DWARF-style LEB128:
@@ -59,26 +60,29 @@ recipe steps that produce the relevant bytes.
 
 # Format Stability and Conformance
 
-## Freeze and the magic epoch
+## The magic epoch
 
-This wire format is frozen as pre-release **v0.9**.  `CST_MAGIC`
-(`0x1D545343`) is the format-epoch identifier.  It stays fixed for
-the whole pre-release; iteration during pre-release changes the
-layout freely *without* touching the magic.  When formal releases
-begin, a structurally breaking change (a different record shape,
-step order, or mandatory-field set) bumps `CST_MAGIC` — that is the
-intended signal for "not the same format", not a forbidden act.
-Within one epoch, only *additive* evolution is allowed, and it
-needs no magic change because every numeric domain resolves through
-the per-trace encoding maps and body records are self-delimiting.
+`CST_MAGIC` (`0x1D545343`) identifies the format epoch.  It is fixed
+for the whole pre-release: the layout evolves within the epoch, but
+every change is *additive* and leaves the magic untouched.  Additive
+evolution needs no magic change because every numeric domain
+resolves through the per-trace encoding maps and body records are
+self-delimiting, so a reader built to this specification stays
+correct across additive changes.  A structurally breaking change — a
+different record shape, step order, or structurally-required field
+set — bumps `CST_MAGIC`: the magic is the format-epoch identifier and
+that bump is the signal for "not the same format".  A change of that
+kind is expected only at a formal release.
 
 ## Forward compatibility (normative)
 
-* **Encoding maps are open.**  A reader MUST build maps generically
-  (Step 3) and MUST tolerate maps, and map entries, it does not
-  recognise — extra ones are not an error.  A reader MUST resolve
-  every value it acts on through the maps, never by a hard-coded
-  number.
+* **Encoding maps are open.**  A writer MUST emit a map entry for
+  every numeric value that appears anywhere in the trace; a value
+  with no entry is malformed.  Beyond that the maps are open — a
+  reader MUST build them generically (Step 3) and MUST tolerate
+  maps, and map entries, it does not recognise (extra ones are not
+  an error).  A reader MUST resolve every value it acts on through
+  the maps, never by a hard-coded number.
 * **Reserved bits are reserved.**  Writers MUST write every
   reserved flag/field bit as 0.  Readers MUST consider only the
   bits they recognise; an unrecognised bit being set is not by
@@ -105,10 +109,11 @@ carry:
 
 * **Container:** a tar with one `header.cst*` and one `body.cst*`
   member; the body bracketed by the two `CST_MAGIC` markers.
-* **Header:** magic; isa; flags; the four window ULEBs;
+* **Header:** magic; isa; flags; the three window ULEBs;
   `simpoint_weight` (`0.0` when not a simpoint); the four header
-  strings (any may be empty); an encoding-maps section that
-  enumerates every well-known name Step 3.3 lists; and the
+  strings (any may be empty); an encoding-maps section carrying at
+  least the structurally-required names of Step 3.3 plus an
+  (id → name) entry for every numeric value the trace uses; and the
   templates section.
 * **Per template:** `template_id`, `start_pc`, `num_insns`,
   `fall_through_pc` (0 if the last insn is not a branch),
@@ -161,13 +166,13 @@ header member (Step 1):
   section in Step 1.  (Parsing is generic — Step 3 reads whatever
   maps the section lists — so this enumeration is the set the
   writer emits, not a closed set a decoder must hard-expect.)
-* `ids` — the well-known numeric IDs the decoder will dispatch on,
-  resolved by reverse-lookup of canonical names through
-  `encoding_maps` (e.g. `ids.body_tag_entry = encoding_maps.body_tag["BODY_TAG_ENTRY"]`).
-  Reject the trace if any required name is missing — the wire
-  format requires the writer to enumerate every name a decoder
-  will dispatch on.  The required names are listed alongside each
-  `ids.<field>` use below.
+* `ids` — the numeric IDs the recipe branches on, resolved by
+  reverse-lookup of canonical names through `encoding_maps` (e.g.
+  `ids.body_tag_entry = encoding_maps.body_tag["BODY_TAG_ENTRY"]`).
+  These are the names the byte-level parse depends on; Step 3.3
+  enumerates them and states which must always be present and which
+  are required only when the construct they tag appears.  Each is
+  also named alongside its `ids.<field>` use below.
 
 After Step 1 these structures are immutable for the remainder of
 the decode.
@@ -232,7 +237,7 @@ header member, or if @magic does not match.
 
 ## Step 3: Parse the encoding maps
 
-The `encoding_maps_section` payload from Step 2.11 is itself
+The `encoding_maps_section` payload from Step 2.12 is itself
 self-describing.  Decode it into a fresh `encoding_maps` table.
 
 ```
@@ -244,47 +249,60 @@ self-describing.  Decode it into a fresh `encoding_maps` table.
          value : ULEB
          name  : string
        store (value → name) into encoding_maps[map_name].
-3.3  After all maps are read, resolve the well-known names listed
-     below into a fixed-shape `ids` struct.  Every name listed is
-     mandatory; if a name is missing, reject the trace.
-       body_tag:        BODY_TAG_END, BODY_TAG_ENTRY,
-                        BODY_TAG_THREAD_SWITCH, BODY_TAG_IFRAME,
-                        BODY_TAG_REGFILE
-       field_id:        CST_FID_N_LOADS, CST_FID_N_STORES,
-                        CST_FID_LOAD_ADDR0, CST_FID_STORE_ADDR0,
-                        CST_FID_LOAD_DATA0, CST_FID_STORE_DATA0,
-                        CST_FID_DST_REG0,
-                        CST_FID_SRC_LANE_MASK0,
-                        CST_FID_DST_LANE_MASK0,
-                        CST_FID_LOAD_DATA_LANE_MASK0,
-                        CST_FID_STORE_DATA_LANE_MASK0,
-                        CST_FID_INSN_BYTES_LO, CST_FID_INSN_BYTES_HI,
-                        CST_FID_INSN_OPCODE, CST_FID_INSN_BRANCH_TYPE,
-                        CST_FID_INSN_FLAGS, CST_FID_INSN_IMMEDIATE,
-                        CST_FID_INSN_SIZE, CST_FID_METAFLAGS,
-                        CST_FID_EXTENDED
-                        (there are no CST_FID_EXTRA_* fields; all
-                         memops are addressed through the slotted
-                         families — see Reference §5.2.)
-       insn_flag:       CST_INSN_FLAG_BRANCH_COND,
-                        CST_INSN_FLAG_HAS_IMM,
-                        CST_INSN_FLAG_ATOMIC,
-                        CST_INSN_FLAG_VEC,
-                        CST_INSN_FLAG_LANE_PARALLEL,
+3.3  After all maps are read, resolve the names the recipe branches
+     on into a fixed-shape `ids` struct by reverse-lookup.  The
+     names fall into two groups, by when each must be present:
+
+     (a) Structural, always required.  Every conformant trace
+         exercises the constructs these tag, so a trace whose maps
+         omit one is rejected here:
+           body_tag:    BODY_TAG_END, BODY_TAG_ENTRY,
+                        BODY_TAG_THREAD_SWITCH
+           header_flag: CST_FLAG_PROFILE, CST_FLAG_WP
+           insn_flag:   CST_INSN_FLAG_HAS_IMM,
                         CST_INSN_FLAG_HAS_DEP_BLOCK
-       dep_block_flag:  CST_DEP_BLOCK_HAS_REG,
-                        CST_DEP_BLOCK_HAS_ADDR
-       header_flag:     CST_FLAG_MEM_DATA, CST_FLAG_REG_DATA,
-                        CST_FLAG_PROFILE, CST_FLAG_WP
-       wp_event_flag:   CST_WP_EVENT_TRANSLATION_UNAVAIL,
-                        CST_WP_EVENT_FAULT
-       metaflags:       CST_METAFLAGS_Z/N/C/V/P
+
+     (b) Structural, required only when the tagged construct
+         appears.  Resolve each if present; its absence is an error
+         only if the corresponding record or sub-block occurs:
+           body_tag:       BODY_TAG_IFRAME    (iff an IFRAME record
+                                               appears)
+           body_tag:       BODY_TAG_REGFILE   (iff a REGFILE record
+                                               appears)
+           dep_block_flag: CST_DEP_BLOCK_HAS_REG,
+                           CST_DEP_BLOCK_HAS_ADDR
+                                              (iff a dependency
+                                               sub-block appears)
+           wp_event_flag:  CST_WP_EVENT_FAULT (iff a wrong-path
+                                               event record appears)
+           field_id:       CST_FID_EXTENDED   (iff an extended
+                                               field-delta record
+                                               appears)
+
+     Every other name — all `opcode`, `branch_type`, `reg`,
+     `metaflags`, `mem_access_pattern`, and `profile_flag` values,
+     the remaining `header_flag` / `insn_flag` / `wp_event_flag`
+     bits, and every `field_id` family/slot name — is resolved
+     purely as the recipe encounters its numeric value, under the
+     open-map rule: every value that appears has an entry, and a
+     value with no entry is malformed.  None of these names is
+     required in the abstract — a trace that never uses a construct
+     need not name it.
+
+     The tracer, by convention, emits the complete canonical name
+     set in every trace — every field-id slot, every flag bit, every
+     enum value — so a strict decoder can resolve all IDs up front.
+     That is a writer convenience, not a format requirement: neither
+     the format nor a conforming decoder depends on any name beyond
+     the structural set in (a)–(b) and whatever the trace uses.
+     (There are no CST_FID_EXTRA_* fields — all memops are addressed
+     through the slotted families; see Reference §5.2.)
 3.4  See Reference §3 for the semantic meaning of each map and ID.
 ```
 
 ## Step 4: Parse the templates section
 
-The templates payload from Step 2.12 runs to end-of-member.
+The templates payload from Step 2.13 runs to end-of-member.
 Decode by repeated outer-section unwrapping.
 
 ```
@@ -644,15 +662,19 @@ state for the same field.
 
 ```
 CST_MAGIC              = 0x1D545343       bytes: 'C' 'S' 'T' 0x1D
-
-BODY_TAG_END           = 0
-BODY_TAG_ENTRY         = 1
-BODY_TAG_THREAD_SWITCH = 2
-BODY_TAG_IFRAME        = 3
-BODY_TAG_REGFILE       = 4
-
 CST_FID_SLOT_COUNT     = 64               max memops / dst regs per insn
 ```
+
+`CST_MAGIC` and `CST_FID_SLOT_COUNT` are the only numerically-fixed
+constants in the format: a reader compares the magic literally, and
+`CST_FID_SLOT_COUNT` is the per-family slot ceiling.  Every other
+numeric ID — body tags, opcodes, branch types, register IDs, field
+IDs, flag-bit positions — is resolved through the per-trace encoding
+maps (§3.1) and is not pinned by this specification.  The body-tag
+values the writer currently assigns are `BODY_TAG_END = 0`,
+`BODY_TAG_ENTRY = 1`, `BODY_TAG_THREAD_SWITCH = 2`,
+`BODY_TAG_IFRAME = 3`, and `BODY_TAG_REGFILE = 4`; a decoder obtains
+them from the `body_tag` map, not from these numbers.
 
 The body member begins with `CST_MAGIC` and ends with `CST_MAGIC`.  A
 file is treated as truncated if the trailing magic is missing.  The
@@ -696,16 +718,15 @@ x86 `EFLAGS` bit map: CF→C, PF→P, ZF→Z, SF→N, OF→V.  AArch64
 is not set.
 
 Readers reject any file whose magic disagrees with `CST_MAGIC`.
-There is one shape, and the tools support exactly that shape.
 
 The MEM_DATA / REG_DATA bits are advisory hints about field
 families — the field IDs still determine what actually appears in
 each delta section.  CST_FLAG_PROFILE and CST_FLAG_WP are
 structural: they gate the presence of whole blocks (the
-per-template profile block §4.6/§6, and the per-entry wrong-path
-chain + events sections §6.4/6.5), exactly as the per-insn
-CST_INSN_FLAG_HAS_DEP_BLOCK gates the dep sub-block.  Resolve every
-bit through the `header_flag` map.
+per-template profile block — Step 4.6 / §6, and the per-entry
+wrong-path chain + events sections — Steps 6.4–6.5), exactly as the
+per-insn CST_INSN_FLAG_HAS_DEP_BLOCK gates the dep sub-block.
+Resolve every bit through the `header_flag` map.
 
 ```
 bit 0  CST_FLAG_MEM_DATA   LOAD_DATA / STORE_DATA may appear
@@ -734,7 +755,7 @@ is set on the per-insn flag byte):
 
 ```
 bit 0  CST_DEP_BLOCK_HAS_REG    dst_dep + store_data_dep present
-bit 1  CST_DEP_BLOCK_HAS_ADDR   load_addr_dep + store_addr_dep present  (phase 2)
+bit 1  CST_DEP_BLOCK_HAS_ADDR   load_addr_dep + store_addr_dep present
 bits 2..7  reserved
 ```
 
@@ -760,6 +781,7 @@ the first thing a decoder needs.
 | start_insn          ULEB                         |
 | warmup_insns        ULEB                         |
 | total_target_insns  ULEB                         |
+| simpoint_weight     f64   little-endian binary64  |
 +--------------------------------------------------+
 | command             string                       |
 | datetime            string                       |
@@ -785,7 +807,11 @@ stop.  A value of zero means "unbounded" (non-simpoint runs with no
 explicit stop trace until the program exits, so the targeted total is
 not known at header-write time).  These three values describe the
 *targeted* window; the actually-emitted record count may overshoot by
-a single TB due to translation-block granularity.
+a single TB due to translation-block granularity.  `simpoint_weight`
+is the fraction of whole-program execution this segment represents
+(`0.0` for a non-simpoint segment); a consumer rebuilds a
+whole-program metric as the weighted sum over the per-simpoint
+traces.
 
 Because the header lives in its own archive member, a decoder knows
 the header end exactly: it is the member's payload size.  The
@@ -813,8 +839,8 @@ encoding_maps_section payload:
 ```
 
 Per-thread initial register files are emitted as `BODY_TAG_REGFILE`
-records inline in the body stream (see §5), not as part of the `reg`
-encoding map.
+records inline in the body stream (see §4.6), not as part of the
+`reg` encoding map.
 
 The writer emits these maps:
 
@@ -842,7 +868,9 @@ last two maps: resolve `pat_flags` bits[1:0]/[3:2] via
 `mem_access_pattern` and bits[4]/[5] via `profile_flag` rather than
 hard-coding the class meanings.
 
-Consumers resolve numeric IDs through the maps in the trace.
+Consumers resolve numeric IDs through the maps in the trace.  The
+writer populates each map with its full canonical name set; Step 3.3
+states which names a conformant trace is actually required to carry.
 
 ## 4. Body Stream
 
@@ -860,26 +888,28 @@ field-delta encoding scheme below is a compression layer over
 that conceptual picture, not a different shape of data.
 
 The body stream is a sequence of tagged records ending in one footer.
+Its first record is always a `BODY_TAG_THREAD_SWITCH` (§4.1), so the
+starting thread is stated explicitly.
 
 ```
 body stream:
 
-  +-------------------------+
-  | tag = BODY_TAG_ENTRY    |
-  | entry payload           |
-  +-------------------------+
-  | tag = BODY_TAG_THREAD_SWITCH |
-  | thread switch payload   |
-  +-------------------------+
-  | tag = BODY_TAG_ENTRY    |
-  | entry payload           |
-  +-------------------------+
-  | tag = BODY_TAG_IFRAME   |   (optional, validates the preceding ENTRY)
-  | iframe payload          |
-  +-------------------------+
-  | tag = BODY_TAG_END      |
-  | num_entries : ULEB      |
-  +-------------------------+
+  +------------------------------+
+  | tag = BODY_TAG_THREAD_SWITCH |   always the first record
+  | thread switch payload        |
+  +------------------------------+
+  | tag = BODY_TAG_REGFILE       |   (optional, per-thread initial
+  | regfile payload              |    register state — §4.6)
+  +------------------------------+
+  | tag = BODY_TAG_ENTRY         |
+  | entry payload                |
+  +------------------------------+
+  | tag = BODY_TAG_IFRAME        |   (optional, validates the
+  | iframe payload               |    preceding ENTRY)
+  +------------------------------+
+  | tag = BODY_TAG_END           |
+  | num_entries : ULEB           |
+  +------------------------------+
 ```
 
 `num_entries` must match the number of `BODY_TAG_ENTRY` records seen.
@@ -925,7 +955,8 @@ wrong-path chain.
 
 `previous_entry_template` starts at 0 and updates after each CP entry.
 The current thread/vCPU ID comes from the most recent
-`BODY_TAG_THREAD_SWITCH` record, or 0 if no switch record has appeared.
+`BODY_TAG_THREAD_SWITCH` record; because the body's first record is
+always a thread switch (§4.1), an ENTRY is always preceded by one.
 
 ### 4.3 Wrong-Path Chain Section
 
@@ -996,6 +1027,31 @@ the persistent `cp_field_state` / `wp_field_state` overlays — they
 are pure validation/resync redundancy. The next `BODY_TAG_ENTRY`
 continues from where the preceding regular ENTRY left off.
 
+### 4.6 BODY_TAG_REGFILE
+
+A `BODY_TAG_REGFILE` record carries a per-thread initial register-file
+snapshot: the architectural register values for one thread at the
+point its execution in this segment begins. It seeds a consumer's
+register model so that destination-register snapshots (§5.4) and
+metaflags reconstruct absolute values. It is not counted in
+`num_entries` and does not advance any body counter.
+
+```
++--------------------------------------------------+
+| tag = 4                          u8              |
+| thread_id                        ULEB            |
+| n_present                        ULEB            |
+| repeat n_present times:                          |
+|   gen_id       u8     GenericRegId; resolve via   |
+|                       the `reg` map               |
+|   width        u8     snapshot byte count          |
+|   bytes[width]        raw, target-endian order     |
++--------------------------------------------------+
+```
+
+A producer that does not capture initial register state emits no
+`BODY_TAG_REGFILE` records; their absence is not an error.
+
 ## 5. Field-Delta Sections
 
 Every CP block and every WP block has one field-delta section. This is
@@ -1008,19 +1064,21 @@ delta_section payload:
   n_records : ULEB
 
   repeat n_records times:
-    ins_pos_gap : ULEB       current_insn_pos - previous_insn_pos
-    field_id    : u8         CST_FID_* value; resolve through "field_id" map
-    payload     : scalar_delta | raw_vector
+    ipos_delta : ULEB        running ipos += ipos_delta
+    fid        : ULEB        resolve through the "field_id" map
+    delta      : SLEB_WIDE   scalar delta; plus a trailing
+                             ext_payload:ULEB only when fid resolves
+                             to CST_FID_EXTENDED
 ```
 
-Records are emitted in non-descending `(ins_pos, field_id)` order. When
-two records describe the same instruction, the later record has
-`ins_pos_gap = 0`.
+Records are emitted in non-descending `(ipos, fid)` order. When two
+records describe the same instruction, the later record has
+`ipos_delta = 0`.
 
-Most records are scalar delta records:
+Every record is a scalar delta record:
 
 ```
-scalar_delta := SLEB
+scalar_delta := SLEB_WIDE
 
 delta = current_value - baseline, modulo 2**512
 current_value = (baseline + delta) mod 2**512
@@ -1082,13 +1140,12 @@ The CP overlay is unaffected by speculative records.
 
 Field IDs are ULEB128 on the wire (Step 6.10).  Numeric IDs are
 **not** pinned in the format spec; the header's `field_id` encoding
-map (Reference §3.1) carries the (id → name) pair for every
-well-known field used in this trace, and decoders MUST look up
-fields by name there.  This section describes the field families
-the writer emits and the encoding-cost intent behind the writer's
-ID assignment.
+map (Reference §3.1) carries the (id → name) pair for every field
+the trace uses, and decoders MUST look up fields by name there.
+This section describes the field families the writer emits and the
+encoding-cost intent behind the writer's ID assignment.
 
-Field families (one well-known name each):
+Field families (one canonical name each):
 
 * **`CST_FID_N_LOADS`** — count of valid load slots for this insn
   execution.  Encoded as a non-negative scalar delta against the
@@ -1191,7 +1248,10 @@ to no memory op (software prefetch hints, cache-line clean / flush /
 invalidate, TLB-entry invalidate). The writer synthesises a load
 memop for these by decoding the Capstone operand at translation time
 and reading base / index register values at execution time, computing
-`ea = base + (index << shift_amount) * scale + disp`. The synthesized
+`ea = base + index_term + disp`, where `index_term` is
+`index << shift_amount` for an addressing form that shifts the index
+(the AArch64 register form) or `index * scale` for one that scales it
+(the x86 SIB form) — the two are mutually exclusive. The synthesized
 EA appears in the same `LOAD_ADDR[0]` slot as a regular load and
 contributes to `N_LOADS`. Opcode classification (PREFETCH / CACHE_FLUSH /
 TLB_FLUSH) carries the semantic distinction; consumers that simulate
@@ -1244,9 +1304,9 @@ more specific operation:
 #### Reserved fallback latency opcodes
 
 The opcode space carries six reserved IDs the in-tree tracer never
-emits: `GEN_OP_INT_ALU_SHORT` (61), `GEN_OP_INT_ALU_LONG` (62),
-`GEN_OP_FP_ALU_SHORT` (63), `GEN_OP_FP_ALU_LONG` (64),
-`GEN_OP_VEC_ALU_SHORT` (65), `GEN_OP_VEC_ALU_LONG` (66). They exist
+emits: `GEN_OP_INT_ALU_SHORT`, `GEN_OP_INT_ALU_LONG`,
+`GEN_OP_FP_ALU_SHORT`, `GEN_OP_FP_ALU_LONG`, `GEN_OP_VEC_ALU_SHORT`,
+and `GEN_OP_VEC_ALU_LONG`. They exist
 as a coarse fallback for external trace writers that lack ISA-specific
 opcode metadata: SHORT is a single-cycle ALU op; LONG is anything
 that occupies a long-latency unit (multi-cycle multiplier, divider,
@@ -1256,8 +1316,9 @@ opcode classifications above.
 
 #### REP-prefixed self-loop BBs (x86)
 
-`BranchType` carries a dedicated value `BRANCH_REP` (= 6) for any
-template instruction whose Capstone detail reports the REP / REPNZ
+`BranchType` carries a dedicated value `BRANCH_REP` (resolved through
+the `branch_type` map) for any template instruction whose Capstone
+detail reports the REP / REPNZ
 prefix (x86 string ops MOVS / STOS / LODS / CMPS / SCAS / INS /
 OUTS).  These instructions are emitted as self-looping conditional
 branches: target = the REP's own PC, fall-through = the next PC.
@@ -1347,8 +1408,8 @@ delta records, indexed identically to `LOAD_ADDR[k]` /
 path; the slot ceiling and overflow handling described in §5.2
 apply uniformly to addresses and data.
 
-Narrow accesses are masked to their low accessed bytes before delta or
-raw-vector emission. The current QEMU plugin mem-value API directly
+Narrow accesses are masked to their low accessed bytes before
+emission as a scalar delta. The current QEMU plugin mem-value API directly
 exposes values up to 128 bits; wider values are representable by
 the wire format and by register snapshots, and can be populated by
 capture paths that can provide up to 64 bytes.
@@ -1645,17 +1706,24 @@ profile_block:
                               the change in step size between
                               consecutive accesses (ddelta =
                               delta_n − delta_{n-1}), NOT the raw
-                              step size:
-                              0 none      no memory access seen
-                              1 regular   constant stride: every
-                                          ddelta == 0 (incl. stride 0)
-                              2 irregular stride varies but every
-                                          |ddelta| ≤ 4096 (e.g. a
-                                          walking stride 1,2,3,… →
-                                          ddelta == 1)
-                              3 random    some |ddelta| > 4096 (step
-                                          size jumped by > a page
-                                          between two accesses)
+                              step size.  The four classes (numeric
+                              values resolved through the
+                              `mem_access_pattern` map, not pinned
+                              here):
+                              CST_PAT_NONE       no memory access
+                                                 seen
+                              CST_PAT_REGULAR    constant stride:
+                                                 every ddelta == 0
+                                                 (incl. stride 0)
+                              CST_PAT_IRREGULAR  stride varies but
+                                                 every |ddelta| ≤ 4096
+                                                 (e.g. a walking
+                                                 stride 1,2,3,… →
+                                                 ddelta == 1)
+                              CST_PAT_RANDOM     some |ddelta| > 4096
+                                                 (step size jumped by
+                                                 > a page between two
+                                                 accesses)
                             (the strongest class observed wins;
                              the |ddelta| threshold is the writer's
                              CST_PROFILE_RAND_DELTA, 4096)
@@ -1693,9 +1761,8 @@ branch the CP counts are per target and the WP aggregate sits on
 ## 7. Decoder Checklist
 
 See **Part I (Decoder Recipe)** above for the procedural walkthrough:
-Steps 1-7 cover the same flow at byte granularity, with the well-
-known names a strict-resolution decoder must reverse-look-up in
-each encoding map.
+Steps 1-7 cover the same flow at byte granularity, with the names a
+decoder reverse-looks-up in each encoding map (Step 3.3).
 
 The header maps are the compatibility mechanism for custom traces. If a
 future trace adds `REG_FOO = 246` or a new generic opcode, the numeric

@@ -9,13 +9,18 @@ value through that map.  A producer is free to assign whatever
 numbers it likes as long as it lists them in the maps.
 
 This page is the reference for the *symbolic* side of that contract
-— the set of well-known names and what each one means.  It assigns
+— the canonical names and what each one means.  It assigns
 no numeric values on purpose: hard-coding a number here would invite
 consumers to bypass the per-trace map and is exactly the kind of
-mistake the self-describing format exists to prevent.  Treat the
-names below as the generally supported set; a producer may emit
-additional names, but consumers (most importantly ChampSim's
-decoder) are not required to handle names outside it.
+mistake the self-describing format exists to prevent.  The names
+below are the set a conforming decoder must recognize; a producer
+may emit additional names, but consumers (most importantly
+ChampSim's decoder) are not required to handle names outside it.
+A conforming decoder is required to resolve only a small structural
+name set plus an entry for every value a given trace actually uses
+(see :doc:`format`, Step 3.3); the in-tree writer emits the full
+canonical set in every trace by convention, not because the format
+demands it.
 
 .. _generic-opcodes:
 
@@ -142,10 +147,11 @@ records.
    * - ``GEN_OP_POP``
      - Stack pop. Same distribution as ``GEN_OP_PUSH``.
    * - ``GEN_OP_LEA``
-     - Effective-address compute, no memory access despite the
-       memory-style operand. x86 ``lea``, AArch64 ``adr`` / ``adrp``,
-       RISC-V ``auipc``, MIPS ``aluipc`` and similar
-       PC-relative-offset-into-register operations.
+     - Address computation: the instruction computes an
+       address-shaped value into a register and performs no memory
+       access. x86 ``lea``, AArch64 ``adr`` / ``adrp``, RISC-V
+       ``auipc`` / ``la`` / ``sh{1,2,3}add``, MIPS ``aluipc`` /
+       ``auipc`` / ``la`` / ``dla``.
    * - ``GEN_OP_MOVSX``
      - Sign-extending move.
    * - ``GEN_OP_MOVZX``
@@ -153,8 +159,8 @@ records.
    * - ``GEN_OP_XCHG``
      - Exchange. Reserved for instructions whose semantic IS a swap
        (register ↔ memory). Every classifier row that maps to ``XCHG``
-       also sets ``MF_ATOMIC`` so the resulting insn carries ``the
-       ``CST_INSN_FLAG_ATOMIC`` bit``. Examples: x86 ``xchg`` /
+       also sets ``MF_ATOMIC`` so the resulting insn sets the
+       ``CST_INSN_FLAG_ATOMIC`` bit. Examples: x86 ``xchg`` /
        ``cmpxchg`` / ``cmpxchg8b`` / ``cmpxchg16b``; AArch64 ``cas{p}`` /
        ``swp`` / ``ldsmax`` / ``ldsmin`` / ``ldumax`` / ``ldumin``;
        RISC-V ``amoswap`` / ``amocas`` / ``amomax{u}`` / ``amomin{u}``;
@@ -254,8 +260,8 @@ records.
        WP simulation, a syscall ends the speculative chain.
    * - ``GEN_OP_FENCE``
      - Memory / instruction barrier. Every classifier row that maps to
-       ``FENCE`` has ``MF_ATOMIC``, so the resulting insn always carries
-       ``the ``CST_INSN_FLAG_ATOMIC`` bit``. Examples: x86 ``mfence`` /
+       ``FENCE`` has ``MF_ATOMIC``, so the resulting insn always sets
+       the ``CST_INSN_FLAG_ATOMIC`` bit. Examples: x86 ``mfence`` /
        ``lfence`` / ``sfence``, cache-wide ops without an address
        (``invd``, ``wbinvd``, ``serialize``); AArch64 ``dmb`` / ``dsb`` /
        ``isb`` / ``clrex``; RISC-V ``fence`` / ``fence.i``. Cache- and
@@ -296,15 +302,15 @@ records.
    * - ``GEN_OP_CACHE_FLUSH``
      - Cache-line clean / flush / invalidate addressed at a specific
        line. Same synthetic-EA capture as ``GEN_OP_PREFETCH``. Always
-       carries ``the ``CST_INSN_FLAG_ATOMIC`` bit``. Examples: x86
+       sets the ``CST_INSN_FLAG_ATOMIC`` bit. Examples: x86
        ``clflush*`` / ``clwb`` / ``cldemote``, AArch64 ``dc.*`` /
        ``ic.*``, RISC-V ``cbo.{clean,flush,inval}``, MIPS ``cache`` /
        ``cachee``. Cache-wide forms with no address (``invd``,
        ``wbinvd``) stay under ``GEN_OP_FENCE``.
    * - ``GEN_OP_TLB_FLUSH``
      - TLB-entry invalidation addressed at a specific page. Same
-       synthetic-EA capture. Always carries ``the
-       ``CST_INSN_FLAG_ATOMIC`` bit``. Examples: x86 ``invlpg`` /
+       synthetic-EA capture. Always sets the
+       ``CST_INSN_FLAG_ATOMIC`` bit. Examples: x86 ``invlpg`` /
        ``invlpga``, AArch64 ``tlbi``, RISC-V ``sfence.vma`` /
        ``hfence.{g,v}vma`` / ``hinval.{g,v}vma`` / ``sinval.vma``, MIPS
        ``tlbp`` / ``tlbr`` / ``tlbwi`` / ``tlbwr`` / ``ginv*`` /
@@ -430,9 +436,10 @@ Register IDs (``GenericRegId``)
 Each architectural register the per-ISA classification table maps to
 a generic-domain register.  A register travels on the wire as one
 integer whose name comes from the trace's ``reg`` map; the names
-below are the contract.  The banked names (``REG_GPR0`` and friends)
-denote a contiguous family — index ``n`` within the bank — without
-implying any particular numeric base.
+below are the contract.  A banked name such as ``REG_GPR0`` denotes
+slot 0 of a contiguous family — for the GPR bank the names run
+``REG_GPR0`` .. ``REG_GPR63``, index ``n`` selecting slot ``n`` —
+without implying any particular numeric base.
 
 .. list-table::
    :header-rows: 1
@@ -529,16 +536,20 @@ mapping.
    the wire and the writer chooses the (id → name) assignment to
    keep hot fields in the 1-byte range; decoders MUST resolve every
    field by *name* via the header's ``field_id`` encoding map, never
-   by a hard-coded number.  The slotted families are *interleaved by
-   slot* (slot ``k`` of every family co-located) rather than
-   family-then-slot.  ``CST_FID_SLOT_COUNT`` is **64**;
-   there are no ``CST_FID_EXTRA_*`` overflow vectors.
+   by a hard-coded number.  The five memop / register slotted
+   families are *interleaved by slot* (slot ``k`` of every family
+   co-located) with a stride of 5 — ``CST_FID_SLOT_STRIDE`` —
+   rather than family-then-slot; the four lane-mask families form a
+   separate block after them, interleaved by slot with a stride of
+   4 (``CST_FID_LANE_BLOCK_STRIDE``).  Each slotted family has
+   exactly 64 slots — ``CST_FID_SLOT_COUNT`` — so the slot index
+   ``k`` runs over ``[0, 64)``.
 
 .. list-table::
    :header-rows: 1
    :widths: 34 66
 
-   * - Family (well-known name)
+   * - Family (canonical name)
      - Payload / gating
    * - ``CST_FID_N_LOADS`` / ``CST_FID_N_STORES``
      - Scalar delta — current valid load / store slot count for
@@ -587,7 +598,7 @@ mapping.
    * - ``CST_FID_INSN_IMMEDIATE`` / ``CST_FID_INSN_SIZE``
      - Scalar delta — signed immediate / instruction byte length.
    * - ``CST_FID_EXTENDED``
-     - Reserved escape; reserve only, not currently emitted.
+     - Reserved escape; no defined payload.
 
 .. _metaflags:
 
@@ -630,8 +641,8 @@ hard-codes a bit number.  The canonical bits:
    * - ``CST_METAFLAGS_P``
      - Parity of the low byte (x86 only; always 0 on other ISAs).
 
-   Any bit without a ``metaflags`` map entry is reserved, written
-   as 0; readers mask before comparing.
+Any bit without a ``metaflags`` map entry is reserved, written
+as 0; readers mask before comparing.
 
 Per-ISA EFLAGS → metaflags mapping:
 
@@ -688,30 +699,27 @@ changed between consecutive accesses (``ddelta = delta_n -
 delta_{n-1}``), not the raw step — so a smoothly accelerating walk
 is *irregular*, not *random*.  The strongest class observed over
 the run wins; the page threshold separating irregular from random
-is ``CST_PROFILE_RAND_DELTA`` (4096).  The value names resolve via
-the trace's own ``mem_access_pattern`` encoding map.
+is ``CST_PROFILE_RAND_DELTA`` (4096).  A class is a value resolved
+through the trace's own ``mem_access_pattern`` encoding map; the
+numeric values are the writer's assignment and are not pinned by
+this reference.
 
 .. list-table::
    :header-rows: 1
-   :widths: 12 24 64
+   :widths: 24 76
 
-   * - Value
-     - Name
+   * - Name
      - Meaning
-   * - ``0``
-     - ``CST_PAT_NONE``
+   * - ``CST_PAT_NONE``
      - No memory access observed for this instruction.
-   * - ``1``
-     - ``CST_PAT_REGULAR``
+   * - ``CST_PAT_REGULAR``
      - Constant stride, including stride 0 (same address
        re-touched).  Every ``ddelta`` is 0.
-   * - ``2``
-     - ``CST_PAT_IRREGULAR``
+   * - ``CST_PAT_IRREGULAR``
      - Stride varies but every ``|ddelta|`` ≤ 4096 — a smoothly
        changing stride (e.g. an address walk ``1, 2, 3, …`` whose
        step grows by 1 each time).
-   * - ``3``
-     - ``CST_PAT_RANDOM``
+   * - ``CST_PAT_RANDOM``
      - Some ``|ddelta|`` > 4096 — the step size itself jumped by
        more than a page between two consecutive accesses.
 
@@ -745,12 +753,11 @@ ISA.  The practical limits on coverage are:
 * Capstone itself doesn't model every architectural extension at
   the mnemonic level (notably anything that requires runtime
   state or hard-to-statically-decode operands).
-* The per-row generic-opcode mapping was filled in pass-by-pass;
-  niche / recent extensions may be classified as ``GEN_OP_UNKNOWN``
-  if they were added after the last classification pass.  The
-  ``GEN_OP_UNKNOWN`` line of the exit-time summary plus the
-  ``.unknown_warnings.log`` sidecar is the authoritative answer
-  for any specific workload.
+* Some niche or recent Capstone mnemonics map to ``GEN_OP_UNKNOWN``
+  in the per-row generic-opcode table.  For any specific workload
+  the authoritative answer is the ``GEN_OP_UNKNOWN`` line of the
+  exit-time summary together with the ``.unknown_warnings.log``
+  sidecar file.
 
 .. list-table::
    :header-rows: 1
@@ -761,7 +768,7 @@ ISA.  The practical limits on coverage are:
    * - x86_64
      - Capstone's full x86 mnemonic surface in 64-bit mode.
        ``LOCK`` / ``REP`` prefixes are observed and surface as
-       ``the ``CST_INSN_FLAG_ATOMIC`` bit``.  Vector register snapshots are
+       the ``CST_INSN_FLAG_ATOMIC`` bit.  Vector register snapshots are
        512-bit-truncated; full ZMM is captured.
    * - aarch64
      - Capstone's full AArch64 mnemonic surface.  SVE
@@ -780,6 +787,11 @@ ISA.  The practical limits on coverage are:
 
 ISA enumeration on the wire
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Unlike the encoding-map-resolved ID spaces above, ``TraceISA`` has
+no encoding map: the header ``isa`` byte is a bare enum a decoder
+interprets directly, so these numeric values are fixed and a
+consumer may rely on them.
 
 .. list-table::
    :header-rows: 1

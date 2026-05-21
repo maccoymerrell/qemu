@@ -630,8 +630,8 @@ hard-codes a bit number.  The canonical bits:
    * - ``CST_METAFLAGS_P``
      - Parity of the low byte (x86 only; always 0 on other ISAs).
 
-   Any bit without a ``metaflags`` map entry is reserved, written
-   as 0; readers mask before comparing.
+Any bit without a ``metaflags`` map entry is reserved, written
+as 0; readers mask before comparing.
 
 Per-ISA EFLAGS → metaflags mapping:
 

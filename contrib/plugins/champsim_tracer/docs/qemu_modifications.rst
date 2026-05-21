@@ -13,7 +13,7 @@ matching code.
 Plugin API additions
 --------------------
 
-``include/qemu/qemu-plugin.h`` (``QEMU_PLUGIN_VERSION = 6``)
+``include/qemu/qemu-plugin.h`` (``QEMU_PLUGIN_VERSION = 7``)
 
    * ``qemu_plugin_insn_detail`` — Capstone-detail accessor that
      returns a structured ``qemu_plugin_insn_info`` for an
@@ -27,7 +27,20 @@ Plugin API additions
      instructions of speculative basic blocks, which need the
      same Capstone view of bytes that the in-flight TCG translator
      does not otherwise expose.
-   * ``QEMU_PLUGIN_VERSION = 6`` advertises these entry
+   * ``qemu_plugin_insn_branch_target_pc`` — returns the static
+     control-transfer target the per-ISA translator resolved for a
+     branch instruction, or 0 for a non-branch or an indirect
+     branch (whose target is not statically knowable).  This is the
+     authoritative branch target: Capstone's branch-immediate
+     operand is *not* a safe substitute, because per-ISA encoding
+     (PC-relative vs. absolute, sign extension, MIPS delay-slot
+     accounting, the ARM Thumb interworking bit, RISC-V immediate
+     splits) is already resolved inside the translator, which must
+     produce the value anyway to chain translation blocks.  The
+     wrong-path simulator consumes this so a not-taken branch's
+     alternate edge can be traced even when the program never
+     executes it.
+   * ``QEMU_PLUGIN_VERSION = 7`` advertises these entry
      points to plugin loaders.
 
 ``plugins/api.c`` and ``disas/disas-target.c``
@@ -50,6 +63,66 @@ Plugin API additions
    group enum to ``QEMU_PLUGIN_GRP_*`` bits, copies operand and
    register-name strings into the public buffers, and recovers x86
    ``LOCK`` / ``REP`` prefix flags from the Capstone detail block.
+
+Static branch-target plumbing
+-----------------------------
+
+``qemu_plugin_insn_branch_target_pc`` (above) reports a value that
+originates inside the per-ISA TCG translators.  Surfacing it requires
+a small recording path plus a call at every direct-branch decode
+site, since the translator otherwise discards the resolved target
+once it has emitted the block-chaining code.
+
+``include/qemu/plugin.h`` — ``struct qemu_plugin_insn``
+
+   Carries a ``uint64_t branch_target_pc`` field.  ``plugin_gen_
+   insn_start`` clears it for every instruction (the insn structs
+   are pooled and reused across translations, so a stale target
+   must never leak onto a later insn).
+
+``include/exec/plugin-gen.h`` and ``accel/tcg/plugin-gen.c`` —
+``plugin_gen_record_branch_target``
+
+   The translator-facing entry point.  A per-ISA translator calls
+   it while decoding a direct branch, passing the resolved absolute
+   target; the implementation writes that into the current
+   instruction's ``branch_target_pc``.  It is a no-op inline stub
+   when ``CONFIG_PLUGIN`` is unset, so the per-target call sites add
+   nothing to a non-plugin build.
+
+``plugins/api.c`` — ``qemu_plugin_insn_branch_target_pc``
+
+   Reads the field back out for plugins.
+
+Per-ISA translator call sites
+   Each translator calls ``plugin_gen_record_branch_target`` at its
+   direct-branch decode sites, with the same target value it feeds
+   to ``gen_goto_tb`` (or the architecture's equivalent).  Indirect
+   and register-form branches deliberately do not call it — their
+   target is not statically known — so ``branch_target_pc`` stays 0
+   and consumers fall back to observed-target history.
+
+   * ``target/arm/tcg/translate-a64.c`` — ``trans_B``, ``trans_BL``,
+     ``trans_CBZ``, ``trans_TBZ``, ``trans_B_cond``
+     (``s->pc_curr + a->imm``).
+   * ``target/i386/tcg/translate.c`` and
+     ``target/i386/tcg/emit.c.inc`` —
+     ``gen_conditional_jump_labels`` (the ``Jcc`` / ``JCXZ`` /
+     ``LOOPcc`` family) and ``gen_JMP`` (which ``gen_CALL`` reuses),
+     using ``s->pc + immediate``.
+   * ``target/mips/tcg/translate.c``,
+     ``target/mips/tcg/nanomips_translate.c.inc``,
+     ``target/mips/tcg/msa_translate.c``,
+     ``target/mips/tcg/octeon_translate.c`` — paired with each
+     static ``ctx->btarget`` assignment.  The general branch
+     decoder's ``btgt = -1`` sentinel keeps the indirect
+     ``JR`` / ``JALR`` forms out, leaving their
+     ``branch_target_pc`` at 0.
+   * ``target/riscv/translate.c`` and
+     ``target/riscv/insn_trans/trans_rvi.c.inc`` — ``gen_jal``
+     (the unconditional ``JAL``) and ``gen_branch`` (the B-type
+     conditionals), using ``ctx->base.pc_next + imm``.  ``JALR``
+     (indirect) is unaffected.
 
 Speculative-execution support
 -----------------------------
@@ -236,6 +309,40 @@ Disassembly and target metadata
    (e.g. ``X86_REG_ENDING``) so the plugin can probe register IDs
    that appear in operand metadata without tripping the assert when
    Capstone exposes a sparse range.
+
+``disas/capstone.c`` — Capstone-6.0.0 decode-bug workarounds
+
+   The operand metadata feeding ``qemu_plugin_insn_info`` is only as
+   sound as Capstone's structured detail.  Capstone 6.0.0 mis-decodes
+   a handful of instruction shapes; ``cap_fill_*_operands`` correct
+   each at the boundary, so the rest of QEMU and every plugin see a
+   consistent operand view.  Each is scoped to the exact mis-decoded
+   shape and is keyed to revisit when Capstone is bumped past 6.0.0.
+
+   * AArch64 ``LSL`` / ``LSR`` / ``ASR`` / ``ROR`` by immediate.
+     These are alias mnemonics of ``UBFM`` / ``SBFM`` / ``EXTR``;
+     Capstone prints the shift count in ``op_str`` but drops the
+     immediate from the structured operand array, so the immediate
+     would be invisible to the plugin.  The shift count is still
+     parked in ``operands[1].shift``, and
+     ``cap_fill_arm64_operands`` synthesises the missing ``IMM``
+     operand from it (see ``cap_aarch64_is_buggy_shift_imm_alias``).
+   * x86 store-form extract (``PEXTR`` / ``EXTRACTPS`` family).
+     Capstone marks the ``r/m`` destination ``READ``-only;
+     ``cap_fill_x86_operands`` forces ``WRITE`` on the memory
+     operand.
+   * x86 store-form data moves (``VMOVDQA`` / ``MOVUPS`` /
+     ``VMOVUPS`` and kin writing memory).  Capstone marks the
+     memory destination ``READ``-only; the same filler forces
+     ``WRITE``.
+   * MIPS memory access flags.  MSA vector loads/stores and the
+     unaligned scalar family (``LWL`` / ``LWR`` / ``LDL`` / ``LDR``
+     / ``SWL`` / ``SWR`` / ``SDL`` / ``SDR``) report their memory
+     operand with ``access == 0``.  MIPS has no address-only
+     memory-operand form, so a zero-access MIPS memory operand is
+     always this defect; ``cap_fill_generic_operands`` infers the
+     direction from the data register operand (a written data
+     register implies a load, a read one implies a store).
 
 ``target/mips/cpu.c`` and ``configs/targets/mips*.mak`` plus
 ``gdb-xml/mips-cpu.xml`` / ``mips64-cpu.xml``

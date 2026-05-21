@@ -376,7 +376,9 @@ Branch types (``BranchType``)
        get the dedicated ``COND_DIRECT`` classification.  WP-target
        resolution treats a taken instance as fall-through; if the
        instance was *also* conditional and fell through, the WP
-       target becomes the static immediate.
+       target is the translator-resolved static target reported by
+       ``qemu_plugin_insn_branch_target_pc`` (not Capstone's branch
+       immediate, whose encoding is ISA-specific).
    * - ``BRANCH_INDIRECT_JUMP``
      - Computed target.  Covers indirect jumps and indirect
        ``call`` (the x86 refine callback rewrites the table's
@@ -401,8 +403,10 @@ Branch types (``BranchType``)
    * - ``BRANCH_COND_DIRECT``
      - PC-relative conditional.  WP target is the *not-taken*
        static target when CP took the branch (i.e., the
-       fall-through PC), and the static taken target (the encoded
-       immediate) when CP fell through.
+       fall-through PC), and the static taken target — the
+       translator-resolved value from
+       ``qemu_plugin_insn_branch_target_pc``, not the raw encoded
+       immediate — when CP fell through.
    * - ``BRANCH_REP``
      - x86 REP / REPNZ self-loop terminator (string ops MOVS /
        STOS / LODS / CMPS / SCAS / INS / OUTS with a REP prefix).

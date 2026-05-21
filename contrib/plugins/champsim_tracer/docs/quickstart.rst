@@ -25,8 +25,9 @@ The tracer is a C++17 QEMU TCG plugin.  Tested combinations:
   expects the base modifications described in
   :doc:`qemu_modifications`; building against an unmodified
   upstream QEMU will not work because the plugin uses
-  ``qemu_plugin_insn_detail`` and ``qemu_plugin_cap_decode``,
-  which were added on this fork.
+  ``qemu_plugin_insn_detail``, ``qemu_plugin_cap_decode``, and
+  ``qemu_plugin_insn_branch_target_pc``, which were added on this
+  fork.
 
 Build invocation
 ~~~~~~~~~~~~~~~~

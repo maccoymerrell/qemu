@@ -297,11 +297,25 @@ next branch, with no internal control-flow joins or splits.  A true
 BB is what the trace's templates section dumps and what every body
 ``ENTRY`` record references.  The plugin builds true BBs at runtime
 inside ``BBChainAssembler``: each ``vcpu_tb_exec`` appends the
-just-executed TB's fragment to the chain, and when the TB ends in a
-branch the chain is sealed via ``commit_true_bb`` into ``bb_map_``
-(the *true-BB* cache, keyed by the branch-target PC of the BB's
-entry).  This is the cache whose contents are renumbered into
-template IDs and serialized to the trace.
+just-executed TB's fragment to the chain.  Every TB is classified
+— from its own decoded instructions, never a cached template — as
+one of ``TbTerminus``: completing a true BB, ending in a bare
+branch whose delay slot QEMU placed in the *next* TB, or merely
+continuing one.  When the chain forms a complete true BB the
+assembler seals it via ``commit_true_bb`` into ``bb_map_`` (the
+*true-BB* cache, keyed by the branch-target PC of the BB's entry).
+This is the cache whose contents are renumbered into template IDs
+and serialized to the trace.
+
+On a delay-slot ISA a branch and its delay slot can land in
+*separate* TBs — QEMU never lets a TB cross a page boundary, so a
+branch sitting on a page's last instruction is split from the delay
+slot that follows it.  The assembler folds both TBs into the one
+true BB: a bare-branch TB leaves the chain pending until the next
+TB (carrying the delay slot) completes it.  Reasoning about true-BB
+boundaries per-TB — "this TB ends in a branch, therefore seal" —
+is unsound for exactly this reason; ``TbTerminus`` plus the
+assembler's pending-delay-slot state is the sound replacement.
 
 The user-visible difference: ``tb_count`` is roughly the number of
 distinct ``(pc, flags)`` translations QEMU produced for the run,
@@ -404,8 +418,8 @@ Per TB executed on the correct path, ``vcpu_tb_exec`` runs:
     crossed the next configured window, open a new segment via
     ``start_trace_segment``.  If we're past the segment's stop, close
     it and (for SimPoint mode) advance to the next window.
-3.  Read the previous TB's start, last-pc, fall-through, and
-    "ends-in-branch" out of the per-vCPU scoreboard.  Those fields
+3.  Read the previous TB's start PC, fall-through PC, and
+    ``TbTerminus`` out of the per-vCPU scoreboard.  Those fields
     are populated by inline stores ``vcpu_tb_trans`` registered on
     *this* TB's first instruction, encoding *this* TB's
     parameters.  When the TB executes, the inline store fires
@@ -413,29 +427,32 @@ Per TB executed on the correct path, ``vcpu_tb_exec`` runs:
     scoreboard already describes the TB whose vcpu_tb_exec just
     fired — which from the chain assembler's point of view *is*
     the previous TB relative to the next one.
-4.  Branch-transition observation: bump
-    ``branches_observed`` / ``branches_taken`` / ``branches_not_taken``
-    on the previous branch, and update its
-    :class:`BranchHistory` record so the WP simulator has indirect
-    targets to pick from later.
-5.  Append the previous TB's template to the in-flight CP chain.
-    The :class:`BBChainAssembler` glues consecutive fragments together
-    until a TB ending in a branch completes a true basic block.
-6.  Per-instruction attribution.  Walk the previous TB's
+4.  Append the previous TB's template to the in-flight CP chain,
+    passing its ``TbTerminus``.  The :class:`BBChainAssembler`
+    glues consecutive fragments together and reports
+    ``bb_complete()`` once they form a whole true BB — including
+    folding a page-split branch and its delay slot across two TBs.
+5.  Per-instruction attribution.  Walk the previous TB's
     ``insn_fields`` and bump the per-CP opcode / branch-type / src-reg
     / dst-reg counters in ``g_stats``.  Mirror the bumps into the
     histogram bucket if one is active.
-7.  If the previous TB ended in a branch, finalize the chain into a
-    true-BB template.  Resolve the wrong-path target (fall-through for
-    a taken direct branch, the static target for a not-taken direct
-    branch, the most-frequent-non-CP indirect target for an indirect
-    branch).  Then either invoke the WP simulator or skip it.
-8.  Build a :class:`BodyEntry` from the just-finalized BB plus the
+6.  If the chain assembler reports a complete true BB, finalize it
+    into a true-BB template.  Every branch decision then derives
+    from that finalized true BB's terminating branch — never a
+    single TB fragment: bump the branch-transition counters and
+    update the :class:`BranchHistory` record (so the WP simulator
+    has indirect targets to mine later), and resolve the wrong-path
+    target (the fall-through for a taken direct branch, the
+    translator-resolved static target for a not-taken direct
+    branch, the most-frequent-non-CP indirect target for an
+    indirect branch).  Then either invoke the WP simulator or skip
+    it.
+7.  Build a :class:`BodyEntry` from the just-finalized BB plus the
     drained per-thread memop / reg-snap accumulators, and stream it
     through the writer.
 
-Steps 4-7 happen under ``data_lock``; the BB cache writes plus chain
-state are mutated there.  The actual write to the body stream (step 8)
+Steps 4-6 happen under ``data_lock``; the BB cache writes plus chain
+state are mutated there.  The actual write to the body stream (step 7)
 holds only ``exec_lock`` — the writer is internally synchronized.
 
 .. _wp-flow:
@@ -631,15 +648,23 @@ QEMU base adds to ``qemu_plugin_operand`` — see :doc:`extending`.  WP-side cap
 is suppressed by ``CF_MEMI_ONLY``; that's intentional, because the
 suppressed insns generate no architectural memops to begin with.
 
-*The CP chain's first fragment uses cached template data.*  When a
-TB at start_pc=X is translated more than once (different cflags, page
-flush + retranslate, etc.), QEMU keys its TB cache by ``(pc, cs_base,
-flags, cflags)`` so distinct translations get distinct ``vcpu_tb_trans``
-calls — but our BB cache keys by start_pc only and the *first*
-translation wins.  This is fine in practice because the *insns at
-those PCs* don't change (no SMC); whether the TB extends 5 or 8 insns
-before the boundary doesn't change which PCs are part of the BB,
-because the BB is bounded by the next branch.
+*The TB-fragment cache collides on start_pc, and that is handled,
+not avoided.*  When a TB at start_pc=X is translated more than once
+(different cflags — notably the wrong-path simulator's
+``CF_NO_GOTO_TB`` / ``CF_SINGLE_STEP`` translations — or a page
+flush + retranslate), QEMU keys its own TB cache by
+``(pc, cs_base, flags, cflags)`` so distinct translations get
+distinct ``vcpu_tb_trans`` calls — but ``tb_map_`` keys by start_pc
+only, and the *first* translation wins.  Two collided TBs can have
+different lengths and so different terminating-instruction shapes.
+The plugin therefore never reads true-BB structure off a cached
+fragment: ``vcpu_tb_trans`` classifies each TB's ``TbTerminus``
+from the instructions of the TB *being translated*, and the
+wrong-path simulator iterates the true-BB cache (``find_bb_template``),
+falling back to the fragment cache only on a genuine first sighting.
+The *insns at those PCs* never change (no SMC), so the assembled
+true BB is identical regardless of which collided fragment the
+cache happens to hold.
 
 *Stats are exact, lock-free on the bump path.*  ``g_stats`` is a macro
 that forwards to a per-thread heap-allocated ``Stats`` slot via

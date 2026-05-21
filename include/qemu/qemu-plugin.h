@@ -76,11 +76,15 @@ typedef uint64_t qemu_plugin_id_t;
  * version 6:
  * - added qemu_plugin_insn_detail (structured Capstone detail for
  *   instruction operands, groups, and implicit registers)
+ *
+ * version 7:
+ * - added qemu_plugin_insn_branch_target_pc (the translator-resolved
+ *   static control-transfer target of a branch instruction)
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 6
+#define QEMU_PLUGIN_VERSION 7
 
 /**
  * struct qemu_info_t - system information for plugins

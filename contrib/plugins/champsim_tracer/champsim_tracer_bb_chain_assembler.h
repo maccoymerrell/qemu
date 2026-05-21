@@ -44,11 +44,20 @@ public:
      * chain.  If @entry_pc != the chain's last fall-through (no chain,
      * or discontinuity), reset and start a new chain at @entry_pc.
      * @fall_through (PC right after the TB) validates the next fragment.
+     * @terminus is how this TB contributes to true-BB assembly (see
+     * TbTerminus): it drives whether bb_complete() now reports true.
      * Self-resets on a bumped segment generation so stale fragment
      * pointers are never followed. */
     void append_fragment(uint64_t entry_pc,
                          BBTemplate *frag,
-                         uint64_t fall_through);
+                         uint64_t fall_through,
+                         TbTerminus terminus);
+
+    /* True once the accumulated chain forms a complete true BB — i.e.
+     * the last appended TB completed the BB's terminating branch (and,
+     * on delay-slot ISAs, its delay slot).  The caller finalizes only
+     * when this is set. */
+    bool bb_complete() const { return bb_complete_; }
 
     /* Finalize the in-flight chain into a true-BB template via the
      * cache.  nullptr if no chain in progress.  Does NOT reset (caller
@@ -66,6 +75,12 @@ private:
     uint64_t entry_pc_ = 0;
     uint64_t last_ft_  = 0;
     uint32_t my_gen_   = 0;
+    /* Set when the previous TB ended in a bare branch (TB_TERMINUS_
+     * BARE_BRANCH): the delay slot is the next TB's first insn, so the
+     * BB is not complete until that next TB is appended. */
+    bool     awaiting_delay_slot_ = false;
+    /* True once the chain forms a complete true BB; see bb_complete(). */
+    bool     bb_complete_ = false;
     std::vector<BBTemplate *> fragments_;
 };
 

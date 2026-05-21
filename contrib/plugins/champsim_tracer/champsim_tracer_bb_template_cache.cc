@@ -107,6 +107,54 @@ int BBTemplateCache::template_branch_index(const BBTemplate *tmpl)
     return -1;
 }
 
+/*
+ * Delay-slot reordering: swap a trailing [branch, delay-slot] pair to
+ * [delay-slot, branch] so the terminating branch is always the last
+ * insn — template_branch_index and WP steering then stay ISA-uniform.
+ *
+ * Idempotent: the swap condition (insn[n-2] is a branch, insn[n-1] is
+ * not) is false for an already-normalised [delay-slot, branch] tail,
+ * so calling this on a template built from already-swapped fragments
+ * is a no-op.  That matters for assembled true-BBs: a single-TB BB
+ * inherits the TB fragment's already-swapped order, while a page-split
+ * BB ([..,branch] TB + [delay-slot] TB) arrives unswapped and needs
+ * this pass.
+ */
+static void apply_delay_slot_swap(BBTemplate *tmpl)
+{
+    uint32_t n_insns = tmpl->n_insns;
+    if (isa_properties[trace_isa].branch_delay_slots == 0 || n_insns < 2) {
+        return;
+    }
+    uint32_t br = n_insns - 2;
+    uint32_t ds = n_insns - 1;
+    if (tmpl->insn_fields[br].branch_type == BRANCH_NONE ||
+        tmpl->insn_fields[ds].branch_type != BRANCH_NONE) {
+        return;
+    }
+    uint64_t tmp_pc = tmpl->insn_pcs[br];
+    tmpl->insn_pcs[br] = tmpl->insn_pcs[ds];
+    tmpl->insn_pcs[ds] = tmp_pc;
+    uint8_t tmp_sz = tmpl->insn_sizes[br];
+    tmpl->insn_sizes[br] = tmpl->insn_sizes[ds];
+    tmpl->insn_sizes[ds] = tmp_sz;
+    uint8_t tmp_bytes[MAX_INSN_BYTES];
+    memcpy(tmp_bytes, &tmpl->insn_bytes[(size_t)br * MAX_INSN_BYTES],
+           MAX_INSN_BYTES);
+    memcpy(&tmpl->insn_bytes[(size_t)br * MAX_INSN_BYTES],
+           &tmpl->insn_bytes[(size_t)ds * MAX_INSN_BYTES], MAX_INSN_BYTES);
+    memcpy(&tmpl->insn_bytes[(size_t)ds * MAX_INSN_BYTES],
+           tmp_bytes, MAX_INSN_BYTES);
+    InsnFields tmp_fld = tmpl->insn_fields[br];
+    tmpl->insn_fields[br] = tmpl->insn_fields[ds];
+    tmpl->insn_fields[ds] = tmp_fld;
+    if (tmpl->insn_reg_names) {
+        InsnRegNames tmp_n = tmpl->insn_reg_names[br];
+        tmpl->insn_reg_names[br] = tmpl->insn_reg_names[ds];
+        tmpl->insn_reg_names[ds] = tmp_n;
+    }
+}
+
 /* Allocate and populate a fresh BBTemplate with @n_insns entries from
  * @insn_*.  template_id assigned by the caller's map-insertion path.
  * Returns the unique_ptr; caller moves it into the appropriate map. */
@@ -145,6 +193,13 @@ static BBTemplatePtr build_bb_template(uint32_t template_id,
             tmpl->insn_reg_names[i] = insn_reg_names[i];
         }
     }
+    /*
+     * Normalise the terminating branch to the last slot.  A page-split
+     * true BB is assembled as [.., branch][delay-slot] across two TB
+     * fragments and arrives here unswapped; without this its branch
+     * sits at n-2 and template_branch_index would miss it.
+     */
+    apply_delay_slot_swap(tmpl.get());
     return tmpl;
 }
 
@@ -446,41 +501,9 @@ BBTemplate *BBTemplateCache::get_or_create_tb_template(
         }
     }
 
-    /*
-     * Delay-slot reordering: swap [branch, delay] -> [delay, branch] so
-     * the branch is always last, making template_branch_index and WP
-     * steering ISA-uniform.
-     */
-    if (isa_properties[trace_isa].branch_delay_slots > 0 && n_insns >= 2) {
-        uint32_t br = n_insns - 2;
-        uint32_t ds = n_insns - 1;
-        if (tmpl->insn_fields[br].branch_type != BRANCH_NONE &&
-            tmpl->insn_fields[ds].branch_type == BRANCH_NONE) {
-            uint64_t tmp_pc = tmpl->insn_pcs[br];
-            tmpl->insn_pcs[br] = tmpl->insn_pcs[ds];
-            tmpl->insn_pcs[ds] = tmp_pc;
-            uint8_t tmp_sz = tmpl->insn_sizes[br];
-            tmpl->insn_sizes[br] = tmpl->insn_sizes[ds];
-            tmpl->insn_sizes[ds] = tmp_sz;
-            uint8_t tmp_bytes[MAX_INSN_BYTES];
-            memcpy(tmp_bytes,
-                   &tmpl->insn_bytes[(size_t)br * MAX_INSN_BYTES],
-                   MAX_INSN_BYTES);
-            memcpy(&tmpl->insn_bytes[(size_t)br * MAX_INSN_BYTES],
-                   &tmpl->insn_bytes[(size_t)ds * MAX_INSN_BYTES],
-                   MAX_INSN_BYTES);
-            memcpy(&tmpl->insn_bytes[(size_t)ds * MAX_INSN_BYTES],
-                   tmp_bytes, MAX_INSN_BYTES);
-            InsnFields tmp_fld = tmpl->insn_fields[br];
-            tmpl->insn_fields[br] = tmpl->insn_fields[ds];
-            tmpl->insn_fields[ds] = tmp_fld;
-            if (tmpl->insn_reg_names) {
-                InsnRegNames tmp_n = tmpl->insn_reg_names[br];
-                tmpl->insn_reg_names[br] = tmpl->insn_reg_names[ds];
-                tmpl->insn_reg_names[ds] = tmp_n;
-            }
-        }
-    }
+    /* Normalise the terminating branch to the last slot (delay-slot
+     * ISAs); see apply_delay_slot_swap. */
+    apply_delay_slot_swap(tmpl.get());
 
     BBTemplate *raw = tmpl.get();
     tb_map_[start_pc] = std::move(tmpl);

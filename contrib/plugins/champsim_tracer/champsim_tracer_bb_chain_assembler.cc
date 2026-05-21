@@ -12,7 +12,8 @@ std::atomic<uint32_t> g_segment_generation{1};
 
 void BBChainAssembler::append_fragment(uint64_t entry_pc,
                                        BBTemplate *frag,
-                                       uint64_t fall_through)
+                                       uint64_t fall_through,
+                                       TbTerminus terminus)
 {
     /*
      * On segment switch clear_bb_map() drops the unique_ptrs owning
@@ -26,15 +27,47 @@ void BBChainAssembler::append_fragment(uint64_t entry_pc,
         fragments_.clear();
         entry_pc_ = 0;
         last_ft_ = 0;
+        awaiting_delay_slot_ = false;
         my_gen_ = cur_gen;
     }
     if (entry_pc_ == 0 || last_ft_ != entry_pc) {
-        /* Discontinuity: drop in-flight chain and start a new one. */
+        /* Discontinuity: drop in-flight chain and start a new one.
+         * A pending delay slot is abandoned with it — a discontinuity
+         * means the delay slot never contiguously followed (abnormal:
+         * interrupt / segment edge). */
         fragments_.clear();
         entry_pc_ = entry_pc;
+        awaiting_delay_slot_ = false;
     }
     fragments_.push_back(frag);
     last_ft_ = fall_through;
+
+    /*
+     * Decide whether the chain now forms a complete true BB.
+     *
+     * Normal case: a TB_TERMINUS_COMPLETE TB ends a true BB on its
+     * own — a branch (non-delay-slot ISA), or [branch, delay-slot]
+     * with both insns in this TB (delay-slot ISA).
+     *
+     * Page-split case: a TB_TERMINUS_BARE_BRANCH TB ends with a
+     * branch whose delay slot QEMU placed in the NEXT TB (a branch
+     * landing on the last insn of a page).  The BB is not done — set
+     * awaiting_delay_slot_; the next appended TB begins with that
+     * delay slot, and appending it completes the BB.
+     */
+    if (awaiting_delay_slot_) {
+        /* This fragment carries the pending branch's delay slot as
+         * its first insn — the delay slot is the BB's final insn. */
+        awaiting_delay_slot_ = false;
+        bb_complete_ = true;
+    } else if (terminus == TB_TERMINUS_COMPLETE) {
+        bb_complete_ = true;
+    } else if (terminus == TB_TERMINUS_BARE_BRANCH) {
+        awaiting_delay_slot_ = true;
+        bb_complete_ = false;
+    } else {
+        bb_complete_ = false;
+    }
 }
 
 BBTemplate *BBChainAssembler::finalize()
@@ -50,5 +83,7 @@ void BBChainAssembler::reset()
 {
     entry_pc_ = 0;
     last_ft_ = 0;
+    awaiting_delay_slot_ = false;
+    bb_complete_ = false;
     fragments_.clear();
 }

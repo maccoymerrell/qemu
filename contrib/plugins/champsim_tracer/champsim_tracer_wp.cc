@@ -76,8 +76,8 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     g_wp_state.saved_prev_last_pc = qemu_plugin_u64_get(g_scoreboard.prev_last_pc, cpu_index);
     g_wp_state.saved_prev_fall_through = qemu_plugin_u64_get(g_scoreboard.prev_fall_through,
                                                      cpu_index);
-    g_wp_state.saved_prev_bb_ends_in_branch =
-        qemu_plugin_u64_get(g_scoreboard.prev_bb_ends_in_branch, cpu_index);
+    g_wp_state.saved_prev_bb_terminus =
+        qemu_plugin_u64_get(g_scoreboard.prev_bb_terminus, cpu_index);
     g_wp_state.in_progress = true;
 
     qemu_plugin_spec_mode_begin(saved_state);
@@ -203,8 +203,36 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             bb_start_pc = pre_pc;
         }
 
+        /*
+         * Drive iteration from the true-BB template, not the per-
+         * translation TB template.  QEMU translates with different
+         * cflags for CP (chained, normal) vs qemu_plugin_exec_tb
+         * (CF_NO_GOTO_TB + CF_SINGLE_STEP + CF_FORCE_SLOW), producing
+         * DIFFERENT TBs at the same start_pc.  Our tb_map_ is keyed
+         * by start_pc alone, so whichever translation landed first
+         * sticks — and it's not necessarily the one that just ran.
+         * The result is bb_pcs missing insns (when the cached TB is
+         * a fragment of what just executed) or carrying stale ones
+         * (when the cached TB has trailing insns that didn't run),
+         * which then spill into the next BB's accumulator and the
+         * WP chain skips a block.
+         *
+         * The true-BB cache (bb_map_) is the canonical unit — it's a
+         * branch-terminated assembly of one or more TB fragments,
+         * committed by cp_chain.finalize on CP runs and by this WP
+         * simulator below via commit_true_bb_refs.  By the time WP
+         * simulates from a previously-executed entry, bb_map_ already
+         * has the full BB.  Use it.
+         *
+         * Fall back to tb_tmpl only when bb_map_ misses — first time
+         * any path (CP or WP) sees this entry.  After the first WP
+         * commit_true_bb_refs below, future iterations hit bb_map_.
+         */
         g_mutex_lock(&data_lock);
-        tmpl = g_bb_template_cache.find_tb_template(pre_pc);
+        tmpl = g_bb_template_cache.find_bb_template(pre_pc);
+        if (!tmpl) {
+            tmpl = g_bb_template_cache.find_tb_template(pre_pc);
+        }
         g_mutex_unlock(&data_lock);
 
         /*
@@ -221,7 +249,10 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
 
         if (!tmpl) {
             g_mutex_lock(&data_lock);
-            tmpl = g_bb_template_cache.find_tb_template(pre_pc);
+            tmpl = g_bb_template_cache.find_bb_template(pre_pc);
+            if (!tmpl) {
+                tmpl = g_bb_template_cache.find_tb_template(pre_pc);
+            }
             g_mutex_unlock(&data_lock);
         }
 
@@ -233,14 +264,45 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         }
 
         /*
-         * exec_tb may run multiple insns of a CP-cached translation
-         * (CF_SINGLE_STEP only affects new translations).  tb_ok means
-         * the whole template executed; on fault only insns up to and
-         * including the faulting one were issued, so cap
-         * @n_executed_in_tmpl there.  The faulting insn is included so
-         * consumers see the squashed uop (dyn_params, fault_insn_index).
+         * Determine how many insns of @tmpl actually ran in this
+         * exec_tb call.  @tmpl is the true-BB (or, on a true-BB
+         * miss, a TB fragment); @post_pc is where execution landed.
+         *
+         * QEMU may translate a true-BB as several TBs, so one
+         * exec_tb can run only a PREFIX of @tmpl.  Discriminate:
+         *
+         *   - @post_pc lands ON one of @tmpl's own insn PCs (past
+         *     the entry): exec_tb stopped inside the BB — a fragment
+         *     exit, with more of the BB still to run.  Insns before
+         *     that PC ran; n_executed = that insn's index.
+         *
+         *   - @post_pc is anything else: the BB's terminator branch
+         *     fired and PC left the BB.  This covers BOTH a taken
+         *     branch (post_pc = target) AND a not-taken branch
+         *     (post_pc = the NEXT BB's start — never one of THIS
+         *     BB's PCs).  The whole BB ran; n_executed = n_insns.
+         *
+         * Matching post_pc against the *sequential* next-PC would be
+         * wrong: a not-taken MIPS branch's fall-through equals the
+         * delay slot's sequential next-PC, which would truncate the
+         * count by one and drop the branch terminator.  Matching the
+         * BB's own insn PCs avoids that — the fall-through target is
+         * outside the BB.  i starts at 1 so a loop-back-to-entry
+         * (post_pc == insn_pcs[0]) reads as a full run, not zero.
+         *
+         * On fault (tb_ok=false), the fault-PC matching below caps
+         * n_executed to fault_idx + 1 instead.
          */
+        uint64_t post_pc_now = qemu_plugin_get_pc();
         uint32_t n_executed_in_tmpl = tmpl->n_insns;
+        if (tb_ok) {
+            for (uint32_t i = 1; i < tmpl->n_insns; i++) {
+                if (tmpl->insn_pcs[i] == post_pc_now) {
+                    n_executed_in_tmpl = i;
+                    break;
+                }
+            }
+        }
         if (!tb_ok) {
             uint64_t fault_pc = qemu_plugin_get_pc();
             uint32_t fault_idx_in_tmpl = UINT32_MAX;
@@ -528,8 +590,8 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     qemu_plugin_u64_set(g_scoreboard.prev_last_pc, cpu_index, g_wp_state.saved_prev_last_pc);
     qemu_plugin_u64_set(g_scoreboard.prev_fall_through, cpu_index,
                         g_wp_state.saved_prev_fall_through);
-    qemu_plugin_u64_set(g_scoreboard.prev_bb_ends_in_branch, cpu_index,
-                        g_wp_state.saved_prev_bb_ends_in_branch);
+    qemu_plugin_u64_set(g_scoreboard.prev_bb_terminus, cpu_index,
+                        g_wp_state.saved_prev_bb_terminus);
 
     qemu_plugin_spec_mode_end();
     qemu_plugin_cpu_state_restore(saved_state);

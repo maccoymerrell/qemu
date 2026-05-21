@@ -556,12 +556,34 @@ struct BodyEntry {
 };
 #endif  /* __cplusplus */
 
+/*
+ * How a translation block contributes to true-BB assembly.  QEMU TBs
+ * do NOT align with true basic blocks: a TB ends at a branch, a page
+ * boundary, or a length limit, and on delay-slot ISAs a branch and
+ * its delay slot can land in separate TBs (page split).  The chain
+ * assembler folds TBs into true BBs using this per-TB classification.
+ */
+enum TbTerminus {
+    /* Continuation fragment: no terminating branch.  Also the lone
+     * delay-slot TB of a page-split branch (a bare insn — the chain
+     * assembler recognises it from the pending-delay-slot state). */
+    TB_TERMINUS_NONE = 0,
+    /* TB completes a true BB: ends in a branch (non-delay-slot ISA),
+     * or in [branch, delay-slot] (delay-slot ISA, both in this TB). */
+    TB_TERMINUS_COMPLETE = 1,
+    /* TB ends with a branch as its literal last insn on a delay-slot
+     * ISA — the delay slot is the first insn of the NEXT TB.  The BB
+     * is not complete until that delay slot is appended. */
+    TB_TERMINUS_BARE_BRANCH = 2,
+};
+
 typedef struct {
     uint64_t current_pc;
     uint64_t prev_start_pc;
     uint64_t prev_last_pc;
     uint64_t prev_fall_through;
-    uint64_t prev_bb_ends_in_branch;
+    /* TbTerminus for the previous TB — drives true-BB finalization. */
+    uint64_t prev_bb_terminus;
     uint64_t insn_count;
     /* Start PC of the most recent TB counted toward insn_count.  When
      * QEMU re-enters the same single-insn TB without architectural

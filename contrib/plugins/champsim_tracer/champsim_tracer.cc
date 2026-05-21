@@ -564,8 +564,8 @@ static void flush_pending_final_body_entry(void)
         qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
     uint64_t prev_ft =
         qemu_plugin_u64_get(g_scoreboard.prev_fall_through, cpu_index);
-    uint64_t prev_is_branch =
-        qemu_plugin_u64_get(g_scoreboard.prev_bb_ends_in_branch, cpu_index);
+    TbTerminus prev_terminus = (TbTerminus)
+        qemu_plugin_u64_get(g_scoreboard.prev_bb_terminus, cpu_index);
 
     BBTemplate *bb_tmpl = nullptr;
     if (out_stream && prev_start != 0) {
@@ -589,9 +589,10 @@ static void flush_pending_final_body_entry(void)
                     pending_reg_snaps.push_back(s);
                 }
             }
-            g_cp_chain.append_fragment(prev_start, prev_tb_tmpl, prev_ft);
+            g_cp_chain.append_fragment(prev_start, prev_tb_tmpl, prev_ft,
+                                       prev_terminus);
         }
-        if (prev_is_branch && prev_tb_tmpl &&
+        if (prev_tb_tmpl && g_cp_chain.bb_complete() &&
             g_cp_chain.has_active_chain()) {
             bb_tmpl = g_cp_chain.finalize();
         }
@@ -652,44 +653,42 @@ static void finish_trace_segment(void)
 /* ========================= Execution callback ========================= */
 
 /*
- * Update per-branch transition stats and history for the observed
- * transition.  Returns the BranchRecord (null if the previous TB
- * wasn't branch-terminated).  Caller holds data_lock.
+ * Update per-branch transition stats and history for a just-completed
+ * true BB's terminating branch.  @branch_pc is that branch's PC (from
+ * the finalized true-BB template), @bb_fall_through the BB's
+ * architectural fall-through.  Returns the BranchRecord.  Called only
+ * when a true BB finalized; caller holds data_lock.
  */
-static BranchRecord *observe_branch_transition(bool prev_is_branch,
-                                               bool branch_taken,
-                                               uint64_t prev_last,
-                                               uint64_t prev_ft)
+static BranchRecord *observe_branch_transition(bool branch_taken,
+                                               uint64_t branch_pc,
+                                               uint64_t bb_fall_through)
 {
-    if (prev_is_branch) {
-        Stats &s = thread_stats_get();
-        s.branches_observed++;
+    Stats &s = thread_stats_get();
+    s.branches_observed++;
+    if (branch_taken) {
+        s.branches_taken++;
+    } else {
+        s.branches_not_taken++;
+    }
+    if (Stats *h = g_current_hist_bucket) {
+        h->branches_observed++;
         if (branch_taken) {
-            s.branches_taken++;
+            h->branches_taken++;
         } else {
-            s.branches_not_taken++;
-        }
-        if (Stats *h = g_current_hist_bucket) {
-            h->branches_observed++;
-            if (branch_taken) {
-                h->branches_taken++;
-            } else {
-                h->branches_not_taken++;
-            }
+            h->branches_not_taken++;
         }
     }
-    BranchRecord *br = prev_is_branch
-        ? g_branch_history.get_or_create(prev_last, prev_ft)
-        : g_branch_history.find(prev_last);
+    BranchRecord *br =
+        g_branch_history.get_or_create(branch_pc, bb_fall_through);
     if (br) {
-        br->fall_through = prev_ft;
+        br->fall_through = bb_fall_through;
     }
     return br;
 }
 
 /*
- * Resolve the wrong-path target for a just-finalized BB whose
- * terminating branch lives in @prev_tb_tmpl.  Returns 0 when no
+ * Resolve the wrong-path target for a just-finalized true BB whose
+ * terminating branch is the last insn of @bb_tmpl.  Returns 0 when no
  * plausible WP target exists.  Caller holds data_lock.
  *
  * @taken_out receives the TAKEN-edge target, derived from the same
@@ -699,7 +698,7 @@ static BranchRecord *observe_branch_transition(bool prev_is_branch,
  * is the side CP did NOT run (the same value used for the wrong
  * path).  0 only when the BB has no branch.
  */
-static uint64_t resolve_wrong_target(const BBTemplate *prev_tb_tmpl,
+static uint64_t resolve_wrong_target(const BBTemplate *bb_tmpl,
                                      BranchRecord *br,
                                      bool branch_taken,
                                      uint64_t current_pc,
@@ -707,9 +706,9 @@ static uint64_t resolve_wrong_target(const BBTemplate *prev_tb_tmpl,
                                      uint64_t *taken_out)
 {
     *taken_out = 0;
-    int br_idx = BBTemplateCache::template_branch_index(prev_tb_tmpl);
+    int br_idx = BBTemplateCache::template_branch_index(bb_tmpl);
     const InsnFields *bf = (br_idx >= 0)
-        ? &prev_tb_tmpl->insn_fields[br_idx] : nullptr;
+        ? &bb_tmpl->insn_fields[br_idx] : nullptr;
     if (!bf) {
         return 0;
     }
@@ -1050,10 +1049,9 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     /* Snapshot the previous-TB scoreboard fields. */
     uint64_t current_pc = qemu_plugin_u64_get(g_scoreboard.current_pc, cpu_index);
     uint64_t prev_start = qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
-    uint64_t prev_last  = qemu_plugin_u64_get(g_scoreboard.prev_last_pc, cpu_index);
     uint64_t prev_ft    = qemu_plugin_u64_get(g_scoreboard.prev_fall_through, cpu_index);
-    bool prev_is_branch = qemu_plugin_u64_get(g_scoreboard.prev_bb_ends_in_branch,
-                                              cpu_index);
+    TbTerminus prev_terminus = (TbTerminus)
+        qemu_plugin_u64_get(g_scoreboard.prev_bb_terminus, cpu_index);
 
     /* Skip initial block (no previous context). */
     if (prev_ft == 0) {
@@ -1061,37 +1059,57 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         return;
     }
 
+    /*
+     * current_pc is where execution went after the just-finished true
+     * BB; prev_ft is that BB's architectural fall-through (the last
+     * TB's fall-through).  They differ iff the BB's branch was taken.
+     */
     bool branch_taken = (current_pc != prev_ft);
 
-    /* --- Branch observation, chain assembly, and WP target resolution
+    /* --- Chain assembly, branch observation, and WP target resolution
      *     all run under data_lock. */
     g_mutex_lock(&data_lock);
 
-    BranchRecord *br = observe_branch_transition(
-        prev_is_branch, branch_taken, prev_last, prev_ft);
-
+    /*
+     * Fold the previous TB into the in-flight true-BB chain.  The
+     * chain assembler — NOT a per-TB flag — decides when a true BB is
+     * complete; it folds page-split branch/delay-slot TBs into one BB
+     * via the TbTerminus classification.
+     */
     BBTemplate *prev_tb_tmpl = g_bb_template_cache.find_tb_template(prev_start);
     if (prev_tb_tmpl) {
         snap_prev_tail_dsts(cpu_index, prev_tb_tmpl);
-        g_cp_chain.append_fragment(prev_start, prev_tb_tmpl, prev_ft);
+        g_cp_chain.append_fragment(prev_start, prev_tb_tmpl, prev_ft,
+                                   prev_terminus);
         attribute_cp_insns(prev_tb_tmpl);
     }
 
-    bool finalize = prev_is_branch && prev_tb_tmpl != nullptr;
-    uint64_t taken_target = 0;
-    uint64_t wrong_target = finalize
-        ? resolve_wrong_target(prev_tb_tmpl, br, branch_taken,
-                               current_pc, prev_ft, &taken_target)
-        : 0;
-    BBTemplate *bb_tmpl = (finalize && g_cp_chain.has_active_chain())
-        ? g_cp_chain.finalize() : nullptr;
+    bool finalize = prev_tb_tmpl != nullptr && g_cp_chain.bb_complete() &&
+                    g_cp_chain.has_active_chain();
+    BBTemplate *bb_tmpl = finalize ? g_cp_chain.finalize() : nullptr;
 
     /*
-     * Record the terminal-branch taken-edge target (derived by
-     * resolve_wrong_target; see its @taken_out contract).
+     * Every branch decision derives from the finalized true BB — its
+     * terminating branch instruction — never from a single TB
+     * fragment.  template_branch_index lands on the BB's branch
+     * (normalised to the last slot, including page-split BBs).
      */
-    if (bb_tmpl && taken_target != 0) {
-        bb_tmpl->taken_pc = taken_target;
+    uint64_t branch_pc = 0;
+    uint64_t wrong_target = 0;
+    if (bb_tmpl) {
+        int br_idx = BBTemplateCache::template_branch_index(bb_tmpl);
+        if (br_idx >= 0) {
+            branch_pc = bb_tmpl->insn_pcs[br_idx];
+            BranchRecord *br = observe_branch_transition(branch_taken,
+                                                         branch_pc, prev_ft);
+            uint64_t taken_target = 0;
+            wrong_target = resolve_wrong_target(bb_tmpl, br, branch_taken,
+                                                current_pc, prev_ft,
+                                                &taken_target);
+            if (taken_target != 0) {
+                bb_tmpl->taken_pc = taken_target;
+            }
+        }
     }
 
     g_mutex_unlock(&data_lock);
@@ -1101,7 +1119,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         return;
     }
 
-    emit_finalized_bb(out_stream, bb_tmpl, prev_last, current_pc,
+    emit_finalized_bb(out_stream, bb_tmpl, branch_pc, current_pc,
                       wrong_target, cpu_index);
 
     g_mutex_unlock(&exec_lock);
@@ -1238,6 +1256,85 @@ static void tb_rearm_known_template_cbs(struct qemu_plugin_tb *tb,
     }
 }
 
+/*
+ * Classify how a freshly translated TB contributes to true-BB
+ * assembly (see TbTerminus, BBChainAssembler).  This is per-TB input
+ * to the chain assembler, computed straight from THIS TB's decoded
+ * insns — never a cached template, since tb_map_ is keyed by start_pc
+ * alone and two TBs at one start_pc can carry different content.
+ *
+ * @insn_info / @insn_pcs are the canonical (deduped) insn arrays of
+ * the TB, @n_insns their length.  Sets *branch_pc_out to the
+ * terminating branch's PC, or 0 when the TB has no branch.
+ */
+static TbTerminus classify_tb_terminus(const qemu_plugin_insn_info *insn_info,
+                                       const uint64_t *insn_pcs,
+                                       uint32_t n_insns,
+                                       uint64_t *branch_pc_out)
+{
+    *branch_pc_out = 0;
+    if (!insn_info || n_insns == 0) {
+        return TB_TERMINUS_NONE;
+    }
+    auto insn_branch_type = [](const qemu_plugin_insn_info *info,
+                               uint64_t pc) -> uint8_t {
+        if (!info->mnemonic[0]) {
+            return BRANCH_NONE;
+        }
+        InsnFields f;
+        decode_detail_to_generic(pc, info, &f, nullptr);
+        return f.branch_type;
+    };
+    /*
+     * Branch families that carry an architectural delay slot — the
+     * insn right after the branch always executes (MIPS j / jal /
+     * jr / b*).  syscall- and trap-type "branches" do NOT have a
+     * delay slot and so end their TB cleanly.
+     */
+    auto has_delay_slot = [](uint8_t bt) -> bool {
+        return bt == BRANCH_DIRECT_JUMP || bt == BRANCH_INDIRECT_JUMP ||
+               bt == BRANCH_RETURN || bt == BRANCH_COND_DIRECT;
+    };
+
+    uint8_t last_bt = insn_branch_type(&insn_info[n_insns - 1],
+                                       insn_pcs[n_insns - 1]);
+
+    if (isa_properties[trace_isa].branch_delay_slots > 0) {
+        if (last_bt != BRANCH_NONE) {
+            *branch_pc_out = insn_pcs[n_insns - 1];
+            if (has_delay_slot(last_bt)) {
+                /*
+                 * The branch is the literal last insn of the TB and
+                 * has a delay slot — QEMU placed that delay slot as
+                 * the first insn of the NEXT TB (the branch landed on
+                 * a page's last insn).  The true BB is not complete
+                 * until that delay slot is appended.
+                 */
+                return TB_TERMINUS_BARE_BRANCH;
+            }
+            /* syscall / trap: no delay slot — ends the BB here. */
+            return TB_TERMINUS_COMPLETE;
+        }
+        if (n_insns >= 2) {
+            uint8_t prev_bt = insn_branch_type(&insn_info[n_insns - 2],
+                                               insn_pcs[n_insns - 2]);
+            if (has_delay_slot(prev_bt)) {
+                /* [.., branch, delay-slot] — both in this TB. */
+                *branch_pc_out = insn_pcs[n_insns - 2];
+                return TB_TERMINUS_COMPLETE;
+            }
+        }
+        return TB_TERMINUS_NONE;
+    }
+
+    /* Non-delay-slot ISA: a branch as the last insn ends the BB. */
+    if (last_bt != BRANCH_NONE) {
+        *branch_pc_out = insn_pcs[n_insns - 1];
+        return TB_TERMINUS_COMPLETE;
+    }
+    return TB_TERMINUS_NONE;
+}
+
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     uint64_t pc = qemu_plugin_tb_vaddr(tb);
@@ -1251,7 +1348,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     uint64_t last_insn_pc = qemu_plugin_insn_vaddr(last_insn);
     size_t last_insn_size = qemu_plugin_insn_size(last_insn);
     uint64_t fall_through = last_insn_pc + last_insn_size;
-    uint64_t bb_ends_in_branch = 0;
+    uint64_t tb_terminus = TB_TERMINUS_NONE;
     uint64_t effective_last_pc = last_insn_pc;
     BBTemplate *existing_tmpl;
 
@@ -1318,33 +1415,26 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             QEMU_PLUGIN_MEM_RW, (void *)(uintptr_t)raw_pc);
     }
 
-    g_mutex_lock(&data_lock);
-    existing_tmpl = g_bb_template_cache.find_tb_template(pc);
     /*
-     * Only honour the cached template's branch index when the cached
-     * template actually represents THIS TB's content.  QEMU can
-     * translate two distinct TBs at the same start_pc (e.g. a small
-     * chaining fragment alongside a full-block translation) and the
-     * cache key is start_pc alone, so the first to land sticks.  If
-     * the executing TB is the smaller fragment, reading effective_
-     * last_pc from the cached larger template hands the scoreboard a
-     * branch PC this TB doesn't actually contain — and the next
-     * vcpu_tb_exec then thinks a branch just finalised and
-     * resolve_wrong_target emits a bogus WP that mirrors CP.
-     * fall_through_pc is the cheapest unique-enough fingerprint
-     * (start_pc + architectural end past the delay slot).
+     * Classify how THIS TB contributes to true-BB assembly, straight
+     * from its own decoded insns.  NEVER read this off a cached
+     * template: tb_map_ is keyed by start_pc alone, two TBs at one
+     * start_pc can have different content, and the cache returns
+     * whichever landed first — not necessarily the one being
+     * translated now.  The chain assembler folds the per-TB terminus
+     * into true BBs (see classify_tb_terminus / BBChainAssembler).
      */
-    bool cached_matches_tb =
-        existing_tmpl && existing_tmpl->n_insns > 0 &&
-        existing_tmpl->fall_through_pc == fall_through &&
-        existing_tmpl->n_insns == canonical_n_insns;
-    if (cached_matches_tb) {
-        int br_idx = BBTemplateCache::template_branch_index(existing_tmpl);
-        bb_ends_in_branch = (br_idx >= 0) ? 1 : 0;
-        if (br_idx >= 0) {
-            effective_last_pc = existing_tmpl->insn_pcs[br_idx];
+    {
+        uint64_t branch_pc = 0;
+        tb_terminus = (uint64_t)classify_tb_terminus(
+            insn_info, insn_pcs, canonical_n_insns, &branch_pc);
+        if (branch_pc != 0) {
+            effective_last_pc = branch_pc;
         }
     }
+
+    g_mutex_lock(&data_lock);
+    existing_tmpl = g_bb_template_cache.find_tb_template(pc);
     g_mutex_unlock(&data_lock);
 
     if (!existing_tmpl) {
@@ -1360,31 +1450,12 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                                           insn_sizes,
                                           insn_bytes,
                                           symbol_name, fall_through);
-        if (new_tmpl && new_tmpl->n_insns > 0) {
-            int br_idx = BBTemplateCache::template_branch_index(new_tmpl);
-            bb_ends_in_branch = (br_idx >= 0) ? 1 : 0;
-            if (br_idx >= 0) {
-                effective_last_pc = new_tmpl->insn_pcs[br_idx];
-            }
-        }
         g_mutex_unlock(&data_lock);
 
         tb_arm_new_template_cbs(tb, new_tmpl, insn_info, raw_n_insns,
                                 canonical_index, canonical_first,
                                 canonical_n_insns);
-    } else if (cached_matches_tb) {
-        tb_rearm_known_template_cbs(tb, existing_tmpl, raw_n_insns,
-                                    canonical_index, canonical_first);
     } else {
-        /*
-         * Cached template's content doesn't match this TB (different
-         * fragment at the same start_pc) — rearm the per-insn cbs
-         * using the cached template as a structural skeleton so the
-         * exec callbacks still fire, but DON'T claim this TB ends in
-         * the cached template's branch.  bb_ends_in_branch and
-         * effective_last_pc stay at their pre-template defaults
-         * (no-branch, QEMU's raw last_insn_pc).
-         */
         tb_rearm_known_template_cbs(tb, existing_tmpl, raw_n_insns,
                                     canonical_index, canonical_first);
     }
@@ -1408,7 +1479,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         g_scoreboard.prev_fall_through, fall_through);
     qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
         first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
-        g_scoreboard.prev_bb_ends_in_branch, bb_ends_in_branch);
+        g_scoreboard.prev_bb_terminus, tb_terminus);
 
     g_free(insn_pcs);
     g_free(insn_info);
@@ -1441,8 +1512,8 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
                             g_wp_state.saved_prev_last_pc);
         qemu_plugin_u64_set(g_scoreboard.prev_fall_through, g_wp_state.saved_cpu_index,
                             g_wp_state.saved_prev_fall_through);
-        qemu_plugin_u64_set(g_scoreboard.prev_bb_ends_in_branch, g_wp_state.saved_cpu_index,
-                            g_wp_state.saved_prev_bb_ends_in_branch);
+        qemu_plugin_u64_set(g_scoreboard.prev_bb_terminus, g_wp_state.saved_cpu_index,
+                            g_wp_state.saved_prev_bb_terminus);
         g_wp_state.mem_accesses.clear();
     }
 

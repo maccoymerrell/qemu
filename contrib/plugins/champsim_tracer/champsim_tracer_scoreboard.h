@@ -31,7 +31,7 @@ public:
     qemu_plugin_u64 prev_start_pc;
     qemu_plugin_u64 prev_last_pc;
     qemu_plugin_u64 prev_fall_through;
-    qemu_plugin_u64 prev_bb_ends_in_branch;
+    qemu_plugin_u64 prev_bb_terminus;
     qemu_plugin_u64 insn_count;
     qemu_plugin_u64 last_counted_start_pc;
 

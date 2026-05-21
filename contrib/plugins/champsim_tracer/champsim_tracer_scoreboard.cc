@@ -19,8 +19,8 @@ VCPUScoreboard::VCPUScoreboard()
         sb_, VCPUScoreBoard, prev_last_pc);
     prev_fall_through = qemu_plugin_scoreboard_u64_in_struct(
         sb_, VCPUScoreBoard, prev_fall_through);
-    prev_bb_ends_in_branch = qemu_plugin_scoreboard_u64_in_struct(
-        sb_, VCPUScoreBoard, prev_bb_ends_in_branch);
+    prev_bb_terminus = qemu_plugin_scoreboard_u64_in_struct(
+        sb_, VCPUScoreBoard, prev_bb_terminus);
     insn_count = qemu_plugin_scoreboard_u64_in_struct(
         sb_, VCPUScoreBoard, insn_count);
     last_counted_start_pc = qemu_plugin_scoreboard_u64_in_struct(

@@ -42,7 +42,7 @@ struct WPThreadState {
     uint64_t saved_prev_start_pc = 0;
     uint64_t saved_prev_last_pc = 0;
     uint64_t saved_prev_fall_through = 0;
-    uint64_t saved_prev_bb_ends_in_branch = 0;
+    uint64_t saved_prev_bb_terminus = 0;
 };
 
 extern thread_local WPThreadState g_wp_state;

@@ -580,7 +580,6 @@ enum TbTerminus {
 typedef struct {
     uint64_t current_pc;
     uint64_t prev_start_pc;
-    uint64_t prev_last_pc;
     uint64_t prev_fall_through;
     /* TbTerminus for the previous TB — drives true-BB finalization. */
     uint64_t prev_bb_terminus;

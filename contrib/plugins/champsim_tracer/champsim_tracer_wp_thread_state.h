@@ -40,7 +40,6 @@ struct WPThreadState {
     unsigned int saved_cpu_index = 0;
     uint64_t saved_insn_count = 0;
     uint64_t saved_prev_start_pc = 0;
-    uint64_t saved_prev_last_pc = 0;
     uint64_t saved_prev_fall_through = 0;
     uint64_t saved_prev_bb_terminus = 0;
 };

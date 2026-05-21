@@ -29,7 +29,6 @@ public:
     /* Public so inline-TCG ops can take the handle by value. */
     qemu_plugin_u64 current_pc;
     qemu_plugin_u64 prev_start_pc;
-    qemu_plugin_u64 prev_last_pc;
     qemu_plugin_u64 prev_fall_through;
     qemu_plugin_u64 prev_bb_terminus;
     qemu_plugin_u64 insn_count;

@@ -1263,26 +1263,23 @@ static void tb_rearm_known_template_cbs(struct qemu_plugin_tb *tb,
  * insns — never a cached template, since tb_map_ is keyed by start_pc
  * alone and two TBs at one start_pc can carry different content.
  *
- * @insn_info / @insn_pcs are the canonical (deduped) insn arrays of
- * the TB, @n_insns their length.  Sets *branch_pc_out to the
- * terminating branch's PC, or 0 when the TB has no branch.
+ * @insn_info is the canonical (deduped) insn array of the TB,
+ * @n_insns its length.  The terminating branch's PC itself is not
+ * returned: every consumer derives branch PCs from the finalized
+ * true BB, not from a TB fragment.
  */
 static TbTerminus classify_tb_terminus(const qemu_plugin_insn_info *insn_info,
-                                       const uint64_t *insn_pcs,
-                                       uint32_t n_insns,
-                                       uint64_t *branch_pc_out)
+                                       uint32_t n_insns)
 {
-    *branch_pc_out = 0;
     if (!insn_info || n_insns == 0) {
         return TB_TERMINUS_NONE;
     }
-    auto insn_branch_type = [](const qemu_plugin_insn_info *info,
-                               uint64_t pc) -> uint8_t {
+    auto insn_branch_type = [](const qemu_plugin_insn_info *info) -> uint8_t {
         if (!info->mnemonic[0]) {
             return BRANCH_NONE;
         }
         InsnFields f;
-        decode_detail_to_generic(pc, info, &f, nullptr);
+        decode_detail_to_generic(0, info, &f, nullptr);
         return f.branch_type;
     };
     /*
@@ -1296,12 +1293,10 @@ static TbTerminus classify_tb_terminus(const qemu_plugin_insn_info *insn_info,
                bt == BRANCH_RETURN || bt == BRANCH_COND_DIRECT;
     };
 
-    uint8_t last_bt = insn_branch_type(&insn_info[n_insns - 1],
-                                       insn_pcs[n_insns - 1]);
+    uint8_t last_bt = insn_branch_type(&insn_info[n_insns - 1]);
 
     if (isa_properties[trace_isa].branch_delay_slots > 0) {
         if (last_bt != BRANCH_NONE) {
-            *branch_pc_out = insn_pcs[n_insns - 1];
             if (has_delay_slot(last_bt)) {
                 /*
                  * The branch is the literal last insn of the TB and
@@ -1315,21 +1310,16 @@ static TbTerminus classify_tb_terminus(const qemu_plugin_insn_info *insn_info,
             /* syscall / trap: no delay slot — ends the BB here. */
             return TB_TERMINUS_COMPLETE;
         }
-        if (n_insns >= 2) {
-            uint8_t prev_bt = insn_branch_type(&insn_info[n_insns - 2],
-                                               insn_pcs[n_insns - 2]);
-            if (has_delay_slot(prev_bt)) {
-                /* [.., branch, delay-slot] — both in this TB. */
-                *branch_pc_out = insn_pcs[n_insns - 2];
-                return TB_TERMINUS_COMPLETE;
-            }
+        if (n_insns >= 2 &&
+            has_delay_slot(insn_branch_type(&insn_info[n_insns - 2]))) {
+            /* [.., branch, delay-slot] — both in this TB. */
+            return TB_TERMINUS_COMPLETE;
         }
         return TB_TERMINUS_NONE;
     }
 
     /* Non-delay-slot ISA: a branch as the last insn ends the BB. */
     if (last_bt != BRANCH_NONE) {
-        *branch_pc_out = insn_pcs[n_insns - 1];
         return TB_TERMINUS_COMPLETE;
     }
     return TB_TERMINUS_NONE;
@@ -1349,7 +1339,6 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     size_t last_insn_size = qemu_plugin_insn_size(last_insn);
     uint64_t fall_through = last_insn_pc + last_insn_size;
     uint64_t tb_terminus = TB_TERMINUS_NONE;
-    uint64_t effective_last_pc = last_insn_pc;
     BBTemplate *existing_tmpl;
 
     uint64_t *insn_pcs = g_new0(uint64_t, raw_n_insns);
@@ -1424,14 +1413,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * translated now.  The chain assembler folds the per-TB terminus
      * into true BBs (see classify_tb_terminus / BBChainAssembler).
      */
-    {
-        uint64_t branch_pc = 0;
-        tb_terminus = (uint64_t)classify_tb_terminus(
-            insn_info, insn_pcs, canonical_n_insns, &branch_pc);
-        if (branch_pc != 0) {
-            effective_last_pc = branch_pc;
-        }
-    }
+    tb_terminus = (uint64_t)classify_tb_terminus(insn_info,
+                                                 canonical_n_insns);
 
     g_mutex_lock(&data_lock);
     existing_tmpl = g_bb_template_cache.find_tb_template(pc);
@@ -1473,9 +1456,6 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         g_scoreboard.prev_start_pc, pc);
     qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
         first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
-        g_scoreboard.prev_last_pc, effective_last_pc);
-    qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
-        first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
         g_scoreboard.prev_fall_through, fall_through);
     qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
         first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
@@ -1508,8 +1488,6 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
                             g_wp_state.saved_insn_count);
         qemu_plugin_u64_set(g_scoreboard.prev_start_pc, g_wp_state.saved_cpu_index,
                             g_wp_state.saved_prev_start_pc);
-        qemu_plugin_u64_set(g_scoreboard.prev_last_pc, g_wp_state.saved_cpu_index,
-                            g_wp_state.saved_prev_last_pc);
         qemu_plugin_u64_set(g_scoreboard.prev_fall_through, g_wp_state.saved_cpu_index,
                             g_wp_state.saved_prev_fall_through);
         qemu_plugin_u64_set(g_scoreboard.prev_bb_terminus, g_wp_state.saved_cpu_index,

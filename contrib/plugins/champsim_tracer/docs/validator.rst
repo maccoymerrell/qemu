@@ -11,18 +11,21 @@ they ship.
 Layout::
 
   contrib/plugins/champsim_tracer/validator/
-    └── champsim_tracer_validator/
-        ├── __main__.py            # CLI entry point
-        ├── generator.py           # diamond-CFG / probe-coverage emitter
-        ├── analyzer.py            # ELF post-processor (PC spans, helper leaf)
-        ├── asm_blocks.py          # CodeBlock library + _register_probe
-        ├── _probe_specs.py        # inline-asm coverage probes
-        ├── _thread_test_asm.py    # hand-written 2-thread programs
-        ├── validator.py           # the ~25 named checks
-        ├── classify.py            # per-ISA reg classification scanning
-        ├── _cst_decode_runner.py  # parses cst_decode's legacy output
-        ├── _diff_entries.py       # entry-level diff helper
-        └── tests/run_roundtrip.sh # default smoke shell-out
+    ├── champsim_tracer_validator/      # the Python package
+    │   ├── __main__.py            # CLI entry point
+    │   ├── generator.py           # diamond-CFG / probe-coverage emitter
+    │   ├── analyzer.py            # ELF post-processor (PC spans, helper leaf)
+    │   ├── asm_blocks.py          # CodeBlock library + _register_probe
+    │   ├── _probe_specs.py        # inline-asm coverage probes
+    │   ├── _thread_test_asm.py    # hand-written 2-thread programs
+    │   ├── validator.py           # the named checks
+    │   ├── classify.py            # per-ISA reg classification scanning
+    │   ├── _cst_decode_runner.py  # parses cst_decode's legacy output
+    │   ├── _diff_entries.py       # entry-level diff helper
+    │   └── tests/
+    │       └── test_decoder_smoke.py  # package unit test
+    └── tests/                          # sibling shell-out harnesses
+        └── run_roundtrip.sh       # default smoke shell-out
 
 What it does
 ------------
@@ -104,10 +107,18 @@ Flags worth knowing:
    ``correct_path`` to start at ``NAME``'s block, so symbol-based
    traces still get full CP / WP validation.
 
+``--depth N``
+   Wrong-path budget passed through to the plugin as ``wpdepth=N``.
+   Default ``64``.  The ``wrong_path_chains`` check trims its expected
+   WP block sequence to this same instruction budget.
+
 ``--hot-iters N``
    Inject a loop region into one of the diamond sides, running for N
    iterations.  Useful for pushing the trace past short-program
-   icount budgets when testing simpoint mode.
+   icount budgets when testing simpoint mode.  The default depends on
+   the sub-command: ``0`` (no injected loop) for ``generate`` and
+   ``all``, and ``5000`` for ``simpoint_test`` (so the synthetic
+   program runs past the second simpoint interval).
 
 Sub-commands
 ~~~~~~~~~~~~
@@ -232,6 +243,17 @@ to anchor expectations.
    Per-block static assertions (sync flags, branch outcomes,
    asserted opcodes) hold.
 
+``expected_insns``
+   Author-declared per-instruction exact-check vectors
+   (``BlockPlan.expected_insns``) match the decoded trace.  Each
+   declared field is optional and checked only when present: per-insn
+   ``src`` / ``dst`` register names, ``opcode``, ``branch_type``,
+   ``insn_flags`` (and ``insn_flags_clear``), the per-output dependency
+   lists (``dst_deps`` / ``load_addr_deps`` / ``store_addr_deps`` /
+   ``store_data_deps``), and the per-operand lane-mask bitmaps.
+   Reports author-intent-vs-trace divergence; emits an info-level
+   "skipped" entry when no block declares ``expected_insns``.
+
 ``cp_memops``
    Every block's expected memop multiset (``kind``,
    ``arena_u64_index``, ``data``) is observed in the trace,
@@ -325,7 +347,7 @@ Coverage / WP
    prologue so the per-CP-position lookups index against the
    original CFG.
 
-``indirect_wp_assertions``
+``indirect_wp_assertion``
    Validates the specific ``indirect_wp_one_target`` /
    ``indirect_wp_multi_target`` probe blocks' expected WP-target
    patterns.
@@ -363,7 +385,11 @@ What it does:
    id 0 and interval id 2).
 #. Runs ``trace_window=simpoint:file=...;interval=N;simulation=M``
    under the plugin.  The plugin writes each segment to its own
-   file: ``<prog>_<isa>_sp0.cst``, ``<prog>_<isa>_sp1.cst``.
+   file named ``<prog>_<isa>-<positionB>.cst``, where
+   ``<positionB>`` is the simpoint position in billions of
+   instructions (e.g. ``mcf_x86_64-0B.cst``,
+   ``mcf_x86_64-0_000025B.cst``); the validator collects them with a
+   ``<prog>_<isa>-*.cst`` glob.
 #. Validates each segment file *in reverse order* — explicitly
    touches segment 1 before segment 0 — to prove segment N is
    fully self-decodable without any prior knowledge of segment N-1.

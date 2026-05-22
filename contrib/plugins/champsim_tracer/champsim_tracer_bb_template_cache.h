@@ -112,10 +112,15 @@ private:
     /* Shared existing-true-BB handling for commit_true_bb and its
      * reference variant: returns the cached template (logging a
      * one-shot SMC/divergence warning if the insn-pc sequence
-     * differs) or nullptr on a true miss.  Uses only insn_pcs. */
+     * differs) or nullptr on a true miss.  Compares only insn_pcs.
+     * @candidate_tail_swapped is set when the candidate is an
+     * unnormalised page-split delay-slot BB ([.., branch,
+     * delay-slot]); the trailing pair is then compared against the
+     * stored branch-last template with the two indices exchanged. */
     BBTemplate *find_existing_true_bb(uint64_t start_pc,
                                       uint32_t n_insns,
-                                      const uint64_t *insn_pcs);
+                                      const uint64_t *insn_pcs,
+                                      bool candidate_tail_swapped);
 
     std::unordered_map<uint64_t, BBTemplatePtr> tb_map_;
     std::unordered_map<uint64_t, BBTemplatePtr> bb_map_;

@@ -204,7 +204,8 @@ static BBTemplatePtr build_bb_template(uint32_t template_id,
 }
 
 BBTemplate *BBTemplateCache::find_existing_true_bb(
-    uint64_t start_pc, uint32_t n_insns, const uint64_t *insn_pcs)
+    uint64_t start_pc, uint32_t n_insns, const uint64_t *insn_pcs,
+    bool candidate_tail_swapped)
 {
     BBTemplate *existing = find_bb_template(start_pc);
     if (!existing) {
@@ -212,8 +213,25 @@ BBTemplate *BBTemplateCache::find_existing_true_bb(
     }
     bool same = (existing->n_insns == n_insns);
     if (same) {
+        /*
+         * Stored templates are delay-slot-normalised (terminating
+         * branch last) by build_bb_template.  A page-split delay-slot
+         * BB reaches commit unnormalised — [.., branch, delay-slot] —
+         * which the caller signals via @candidate_tail_swapped; its
+         * trailing pair is then matched against the stored
+         * [.., delay-slot, branch] with the two indices exchanged, so
+         * the identical BB is not misreported as a sequence mismatch.
+         */
         for (uint32_t i = 0; i < n_insns; i++) {
-            if (existing->insn_pcs[i] != insn_pcs[i]) {
+            uint32_t ci = i;
+            if (candidate_tail_swapped && n_insns >= 2) {
+                if (i == n_insns - 2) {
+                    ci = n_insns - 1;
+                } else if (i == n_insns - 1) {
+                    ci = n_insns - 2;
+                }
+            }
+            if (existing->insn_pcs[i] != insn_pcs[ci]) {
                 same = false;
                 break;
             }
@@ -263,8 +281,17 @@ BBTemplate *BBTemplateCache::commit_true_bb(uint64_t start_pc,
                                             const char *symbol_name,
                                             uint64_t fall_through_pc)
 {
+    /* A page-split delay-slot BB reaches commit as
+     * [.., branch, delay-slot] (build_bb_template normalises it to
+     * branch-last); flag that so the cache lookup compares the
+     * trailing pair in the stored, normalised order. */
+    bool tail_swapped =
+        isa_properties[trace_isa].branch_delay_slots > 0 && n_insns >= 2 &&
+        insn_fields[n_insns - 2].branch_type != BRANCH_NONE &&
+        insn_fields[n_insns - 1].branch_type == BRANCH_NONE;
     if (BBTemplate *existing =
-            find_existing_true_bb(start_pc, n_insns, insn_pcs)) {
+            find_existing_true_bb(start_pc, n_insns, insn_pcs,
+                                  tail_swapped)) {
         return existing;
     }
 
@@ -289,9 +316,17 @@ BBTemplate *BBTemplateCache::commit_true_bb_refs(
     const char *symbol_name, uint64_t fall_through_pc)
 {
     /* Already-templated BB: return the cached record without
-     * touching the field/regnames payload at all. */
+     * touching the field/regnames payload at all.  A page-split
+     * delay-slot BB arrives as [.., branch, delay-slot]; flag that so
+     * the lookup compares the trailing pair in the stored,
+     * branch-last normalised order. */
+    bool tail_swapped =
+        isa_properties[trace_isa].branch_delay_slots > 0 && n_insns >= 2 &&
+        insn_fields[n_insns - 2]->branch_type != BRANCH_NONE &&
+        insn_fields[n_insns - 1]->branch_type == BRANCH_NONE;
     if (BBTemplate *existing =
-            find_existing_true_bb(start_pc, n_insns, insn_pcs)) {
+            find_existing_true_bb(start_pc, n_insns, insn_pcs,
+                                  tail_swapped)) {
         return existing;
     }
 

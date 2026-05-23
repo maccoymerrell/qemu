@@ -881,6 +881,28 @@ static inline void u512_mask_bytes(U512 *v, uint8_t size)
 
 static void bw_write_sleb128_u512(BitWriter *bw, U512 v)
 {
+    /* Narrow fast path: u512_from_u64_diff() produces a U512 whose
+     * upper 7 limbs are all-0 (positive) or all-1s (negative) — those
+     * are the deltas for every u64 family (N_LOADS, N_STORES,
+     * METAFLAGS, LOAD/STORE_ADDR, lane masks).  In that case the wide
+     * sleb128 loop reduces to a single int64 sleb128 encode: each of
+     * its iterations does an 8-limb arithmetic shift and an 8-limb
+     * zero/minus-one check, which is wasted work above limb[0] when
+     * the upper limbs are uniform.
+     *
+     * The wide path is still needed for LOAD_DATA / STORE_DATA /
+     * DST_REG where the delta legitimately fills multiple limbs. */
+    if ((v.limb[1] == 0 && v.limb[2] == 0 && v.limb[3] == 0 &&
+         v.limb[4] == 0 && v.limb[5] == 0 && v.limb[6] == 0 &&
+         v.limb[7] == 0 && (int64_t)v.limb[0] >= 0) ||
+        (v.limb[1] == ~(uint64_t)0 && v.limb[2] == ~(uint64_t)0 &&
+         v.limb[3] == ~(uint64_t)0 && v.limb[4] == ~(uint64_t)0 &&
+         v.limb[5] == ~(uint64_t)0 && v.limb[6] == ~(uint64_t)0 &&
+         v.limb[7] == ~(uint64_t)0 && (int64_t)v.limb[0] < 0)) {
+        bw_write_sleb128(bw, (int64_t)v.limb[0]);
+        return;
+    }
+
     uint8_t buf[80];
     size_t n = 0;
     bool more = true;

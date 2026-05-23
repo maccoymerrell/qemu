@@ -42,6 +42,7 @@
 #include "tcg/tcg.h"
 #include "hw/core/cpu.h"
 #include "exec/gdbstub.h"
+#include "exec/plugin-spec.h"
 #include "exec/target_page.h"
 #include "exec/translation-block.h"
 #include "exec/translator.h"
@@ -481,14 +482,28 @@ bool qemu_plugin_read_memory_vaddr(uint64_t addr, GByteArray *data, size_t len)
      */
     if (current_cpu->plugin_spec_mode &&
         current_cpu->plugin_spec_store_buf) {
-        for (size_t i = 0; i < len; i++) {
-            gpointer v;
-            if (g_hash_table_lookup_extended(
-                    current_cpu->plugin_spec_store_buf,
-                    GUINT_TO_POINTER((guintptr)(addr + i)),
-                    NULL, &v)) {
-                data->data[i] = (uint8_t)GPOINTER_TO_UINT(v);
+        /* Overlay speculative bytes; walk by cache line to amortise
+         * the hash lookup across (up to 64) bytes within each line. */
+        size_t off = 0;
+        while (off < len) {
+            vaddr cur = addr + off;
+            vaddr  line_addr = cur & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
+            unsigned idx     = (unsigned)(cur & PLUGIN_SPEC_LINE_MASK);
+            unsigned remain  = PLUGIN_SPEC_LINE_SIZE - idx;
+            unsigned chunk   = (unsigned)(len - off) < remain
+                ? (unsigned)(len - off) : remain;
+            PluginSpecLine *line = (PluginSpecLine *)g_hash_table_lookup(
+                current_cpu->plugin_spec_store_buf,
+                GUINT_TO_POINTER((guintptr)line_addr));
+            if (line) {
+                uint64_t mask = line->valid_mask >> idx;
+                for (unsigned k = 0; k < chunk; k++) {
+                    if (mask & ((uint64_t)1 << k)) {
+                        data->data[off + k] = line->bytes[idx + k];
+                    }
+                }
             }
+            off += chunk;
         }
     }
 
@@ -583,6 +598,40 @@ bool qemu_plugin_exec_tb(void)
     return cpu_plugin_exec_tb(current_cpu);
 }
 
+/*
+ * Bump-allocate (or reuse) the PluginSpecLine for @line_addr.  The
+ * pool is a flat PluginSpecLine[] that grows on demand and is reset
+ * (used = 0) at spec_mode_end — entries from prior simulations are
+ * never freed, just overwritten on reuse.  Returns NULL when the
+ * sandbox line cap is reached and the line isn't already tracked.
+ */
+PluginSpecLine *spec_line_get_or_alloc(CPUState *cpu, vaddr line_addr)
+{
+    PluginSpecLine *line = (PluginSpecLine *)g_hash_table_lookup(
+        cpu->plugin_spec_store_buf, GUINT_TO_POINTER((guintptr)line_addr));
+    if (line) {
+        return line;
+    }
+    if (cpu->plugin_spec_store_pool_used >= PLUGIN_SPEC_STORE_LINE_MAX) {
+        return NULL;
+    }
+    if (cpu->plugin_spec_store_pool_used >= cpu->plugin_spec_store_pool_cap) {
+        size_t new_cap = cpu->plugin_spec_store_pool_cap
+            ? cpu->plugin_spec_store_pool_cap * 2 : 256;
+        cpu->plugin_spec_store_pool = g_realloc_n(
+            cpu->plugin_spec_store_pool, new_cap, sizeof(PluginSpecLine));
+        cpu->plugin_spec_store_pool_cap = new_cap;
+    }
+    PluginSpecLine *pool = (PluginSpecLine *)cpu->plugin_spec_store_pool;
+    line = &pool[cpu->plugin_spec_store_pool_used++];
+    line->valid_mask = 0;
+    /* bytes[] left uninitialised; valid_mask gates reads, so unused
+     * bytes are never observed. */
+    g_hash_table_insert(cpu->plugin_spec_store_buf,
+                        GUINT_TO_POINTER((guintptr)line_addr), line);
+    return line;
+}
+
 void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
 {
     g_assert(current_cpu);
@@ -611,10 +660,13 @@ void qemu_plugin_spec_mode_end(void)
     current_cpu->plugin_spec_mode = false;
     current_cpu->plugin_spec_saved_state = NULL;
 
-    /* Flush store buffer data but retain the hash table for reuse */
+    /* Flush sandbox: clear the line index and reset the pool's
+     * high-water mark.  The pool buffer itself stays allocated for
+     * reuse on the next spec-mode entry. */
     if (current_cpu->plugin_spec_store_buf) {
         g_hash_table_remove_all(current_cpu->plugin_spec_store_buf);
     }
+    current_cpu->plugin_spec_store_pool_used = 0;
 
     /* Flush stale TLB entries from wrong-path execution */
     cpu_plugin_flush_tlb(current_cpu);

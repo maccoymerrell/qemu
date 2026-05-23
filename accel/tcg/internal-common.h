@@ -78,70 +78,97 @@ void tb_check_watchpoint(CPUState *cpu, uintptr_t retaddr);
  * Speculative store buffer helpers for wrong-path execution.
  *
  * When a plugin enters speculative mode (cpu->plugin_spec_mode == true),
- * all guest memory writes are redirected to a per-byte hash table
+ * all guest memory writes are redirected to a per-cache-line buffer
  * (cpu->plugin_spec_store_buf) instead of modifying real guest memory.
  * Loads check the buffer first for store-to-load forwarding, falling
  * back to real memory for bytes not in the buffer.
+ *
+ * The buffer is a GHashTable keyed by line_addr = addr & ~63, with
+ * value = PluginSpecLine* containing a 64-byte payload plus a 64-bit
+ * valid_mask (bit k = byte k of this line has a speculative value).
+ * Lines are bump-allocated from cpu->plugin_spec_store_pool to avoid
+ * per-line g_malloc traffic; spec_mode_end clears the hash table and
+ * resets pool_used = 0, retaining the underlying storage for reuse.
+ *
+ * Prior implementation keyed the hash table by individual byte
+ * address, costing one g_hash_table_insert per byte stored and one
+ * lookup per byte loaded.  On mcf with wp=1 wpdepth=64 memdata=1 the
+ * per-byte hash ops were ~6% of total runtime.  The cache-line layout
+ * makes a 64-byte vector store one map op + one memcpy, an 8-byte
+ * store one map op + an 8-byte memcpy, and a load within a hit line
+ * one map op + a single byte read with a bit test.
  */
 #ifdef CONFIG_PLUGIN
-/*
- * Hard cap on the per-byte speculative store buffer.  Wrong-path
- * execution is bounded by the plugin's speculation depth, so a
- * legitimate spec-mode store set is small (tens to thousands of
- * bytes).  A single instruction that loops a register-sized memory
- * set/copy entirely inside one TCG helper — e.g. an AArch64
- * FEAT_MOPS SETM/CPYM reached on the wrong path with a speculative
- * (garbage) size register — would otherwise insert unboundedly here
- * (one node per byte) and exhaust memory / crash inside glib before
- * the plugin ever regains control to bound it.  Past the cap we stop
- * *growing* the buffer (existing keys still update, so forwarding
- * stays correct for the already-tracked working set); further
- * speculative stores simply aren't forwarded — acceptable for a
- * speculative wrong path, and vastly preferable to an OOM.  64 MiB
- * worth of byte entries is orders of magnitude above any real
- * wrong-path store set.
- */
-#define PLUGIN_SPEC_STORE_BUF_MAX (64u << 20)
+
+#include "exec/plugin-spec.h"
 
 static inline bool cpu_plugin_spec_active(CPUState *cpu)
 {
     return unlikely(cpu->plugin_spec_mode && cpu->plugin_spec_store_buf);
 }
 
+/* spec_line_get_or_alloc is declared in include/exec/plugin-spec.h. */
+
+static inline PluginSpecLine *spec_line_lookup(CPUState *cpu, vaddr line_addr)
+{
+    return (PluginSpecLine *)g_hash_table_lookup(
+        cpu->plugin_spec_store_buf, GUINT_TO_POINTER((guintptr)line_addr));
+}
+
 static inline void spec_store_byte(CPUState *cpu, vaddr addr, uint8_t val)
 {
-    if (unlikely(g_hash_table_size(cpu->plugin_spec_store_buf)
-                 >= PLUGIN_SPEC_STORE_BUF_MAX)
-        && !g_hash_table_contains(cpu->plugin_spec_store_buf,
-                                  GUINT_TO_POINTER((guintptr)addr))) {
-        /* Buffer full: drop this speculative byte rather than grow
-         * unboundedly.  A runaway wrong-path bulk memset/memcpy is
-         * itself a sign speculation has run into garbage. */
+    vaddr  line_addr = addr & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
+    unsigned idx     = (unsigned)(addr & PLUGIN_SPEC_LINE_MASK);
+    PluginSpecLine *line = spec_line_get_or_alloc(cpu, line_addr);
+    if (!line) {
         return;
     }
-    g_hash_table_insert(cpu->plugin_spec_store_buf,
-                        GUINT_TO_POINTER((guintptr)addr),
-                        GUINT_TO_POINTER((guint)val));
+    line->bytes[idx] = val;
+    line->valid_mask |= (uint64_t)1 << idx;
 }
 
 static inline bool spec_load_byte(CPUState *cpu, vaddr addr, uint8_t *val)
 {
-    gpointer v;
-    if (g_hash_table_lookup_extended(cpu->plugin_spec_store_buf,
-                                     GUINT_TO_POINTER((guintptr)addr),
-                                     NULL, &v)) {
-        *val = (uint8_t)GPOINTER_TO_UINT(v);
-        return true;
+    vaddr  line_addr = addr & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
+    unsigned idx     = (unsigned)(addr & PLUGIN_SPEC_LINE_MASK);
+    PluginSpecLine *line = spec_line_lookup(cpu, line_addr);
+    if (!line || !(line->valid_mask & ((uint64_t)1 << idx))) {
+        return false;
     }
-    return false;
+    *val = line->bytes[idx];
+    return true;
 }
 
+/* Bulk store: stays within a single cache line in the common case
+ * (size <= 16 for SIMD, naturally aligned).  Cross-line stores fall
+ * back to per-line chunks; that path is rare on real workloads but
+ * still O(size / 64) hash ops, not O(size) as before. */
 static inline void spec_store_bytes(CPUState *cpu, vaddr addr,
                                     const void *buf, int size)
 {
     const uint8_t *p = buf;
-    for (int i = 0; i < size; i++) {
-        spec_store_byte(cpu, addr + i, p[i]);
+    while (size > 0) {
+        vaddr  line_addr = addr & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
+        unsigned idx     = (unsigned)(addr & PLUGIN_SPEC_LINE_MASK);
+        unsigned remain  = PLUGIN_SPEC_LINE_SIZE - idx;
+        unsigned chunk   = (unsigned)size < remain ? (unsigned)size : remain;
+
+        PluginSpecLine *line = spec_line_get_or_alloc(cpu, line_addr);
+        if (!line) {
+            /* Sandbox capped — drop remaining bytes.  See header
+             * comment on PLUGIN_SPEC_STORE_LINE_MAX. */
+            return;
+        }
+        memcpy(&line->bytes[idx], p, chunk);
+        /* Set bits [idx, idx+chunk).  chunk is 1..64 inclusive so the
+         * shift is well-defined when normalised through uint64_t. */
+        uint64_t mask = chunk >= 64
+            ? ~(uint64_t)0
+            : ((((uint64_t)1 << chunk) - 1) << idx);
+        line->valid_mask |= mask;
+        addr += chunk;
+        p    += chunk;
+        size -= chunk;
     }
 }
 #endif /* CONFIG_PLUGIN */

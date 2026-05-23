@@ -1001,6 +1001,277 @@ def _check_memop_count_assertions(
     return issues
 
 
+def _check_per_execution_memop_data(
+        entries: list[dict],
+        template_runs: dict[int, list[tuple[int, int]]],
+        blocks_by_id: dict[int, dict],
+        cp_set: set[int],
+        arena_addr: int,
+        arena_size: int | None,
+        isa: str) -> list[Issue]:
+    """For blocks that declare ``per_iteration_memops``, verify that the
+    k-th CP entry on the block's template carries the k-th expected
+    sub-list as its dyn_params (multiset compare, same as
+    _check_cp_memops).
+
+    This is the only place the validator exercises the *per-execution
+    data* path: invariant-data probes verify nothing about data delta on
+    iter 2+, but a block whose loaded/stored values legitimately change
+    every iteration (LoopHead's decrementing counter is the canonical
+    example) makes a regression in the state-delta encoder
+    observable as a stale value on iter k.
+
+    Restrictions: a per-iter block must map 1:1 to its template (i.e.
+    the template covers exactly this block — no bipartite-component
+    merging).  Mixed components are reported as "skipped" info-level so
+    the cause is visible if a future probe ends up coalesced into a
+    multi-block template by the compiler.
+    """
+    issues: list[Issue] = []
+
+    # Map block_id -> per_iteration_memops list (only for blocks that
+    # opted in).  We resolve to the *unique* template that covers each
+    # such block; if more than one template covers it, or the template
+    # covers other blocks too, we skip (with an info-level note).
+    per_iter_blocks: dict[int, list[list[dict]]] = {}
+    for bid, blk in blocks_by_id.items():
+        if bid not in cp_set:
+            continue
+        seq = blk.get("per_iteration_memops") or []
+        if seq:
+            per_iter_blocks[bid] = seq
+    if not per_iter_blocks:
+        return issues
+
+    # Build block -> unique-template mapping; reject ambiguous mappings.
+    block_to_tmpls: dict[int, set[int]] = {}
+    tmpl_to_blocks: dict[int, set[int]] = {}
+    for tid, runs in template_runs.items():
+        for bid, _ in runs:
+            if bid in cp_set:
+                block_to_tmpls.setdefault(bid, set()).add(tid)
+                tmpl_to_blocks.setdefault(tid, set()).add(bid)
+
+    is_32bit_isa = isa in ("mipsel", "mips", "riscv32", "armhf", "i386")
+
+    def _actual_multiset(e: dict) -> list[tuple[str, int, int]]:
+        raw_dps = list(e.get("dyn_params", []) or [])
+        consumed = [False] * len(raw_dps)
+        actual: list[tuple[str, int, int]] = []
+
+        def _arena_off4(va: int) -> int:
+            rel = va - arena_addr
+            if rel < 0 or rel % 4 != 0:
+                return -1
+            if arena_size is not None and rel >= arena_size:
+                return -1
+            return rel // 4
+
+        if is_32bit_isa:
+            for i, dp in enumerate(raw_dps):
+                if consumed[i]:
+                    continue
+                off4 = _arena_off4(int(dp.value))
+                if off4 < 0 or off4 % 2 != 0:
+                    continue
+                hi_va = int(dp.value) + 4
+                for j in range(len(raw_dps)):
+                    if (j == i or consumed[j]
+                            or raw_dps[j].type_name != dp.type_name
+                            or int(raw_dps[j].value) != hi_va):
+                        continue
+                    lo = int(dp.data_lo) & 0xFFFFFFFF
+                    hi = int(raw_dps[j].data_lo) & 0xFFFFFFFF
+                    actual.append((dp.type_name, off4 // 2, (hi << 32) | lo))
+                    consumed[i] = consumed[j] = True
+                    break
+        for i, dp in enumerate(raw_dps):
+            if consumed[i]:
+                continue
+            off = _format_off(arena_addr, int(dp.value), arena_size)
+            if off < 0:
+                continue
+            actual.append((dp.type_name, off, _dyn_data_int(dp)))
+        return actual
+
+    for bid, per_iter in per_iter_blocks.items():
+        tids = block_to_tmpls.get(bid, set())
+        if not tids:
+            issues.append(Issue(
+                "per_execution_memop_data", "info",
+                f"blk_{bid}: skipped per-iteration data check; no covering "
+                f"template",
+                {"block_id": bid},
+            ))
+            continue
+        # Find the iteration boundary: for a CFG self-loop block, an
+        # iteration consists of one entry on EVERY template in the
+        # bipartite component (e.g. body fragment + tail-jmp fragment
+        # produced by the mid-TB splitter).  We group entries into
+        # iterations by template_id: the first appearance of each tid
+        # starts iter 1, the second appearance of any tid bumps us into
+        # iter 2, etc.  Within an iter, aggregate dyn_params across all
+        # templates (the jmp fragment carries zero memops).
+        cov_tids = set(tids)
+        # Walk trace entries (already filtered to CP) in order; group
+        # by iter when a template_id repeats.
+        iter_entries: list[list[dict]] = [[]]
+        seen_in_iter: set[int] = set()
+        for e in entries:
+            tid = int(e["template_id"])
+            if tid not in cov_tids:
+                continue
+            if tid in seen_in_iter:
+                iter_entries.append([])
+                seen_in_iter = set()
+            iter_entries[-1].append(e)
+            seen_in_iter.add(tid)
+        # Drop a trailing partial iteration if it didn't see all the
+        # templates we expect — those are spurious in self-loop tail.
+        if iter_entries and not iter_entries[-1]:
+            iter_entries.pop()
+
+        n_check = min(len(iter_entries), len(per_iter))
+        for k in range(n_check):
+            expected_list = per_iter[k]
+            expected = Counter(
+                (m["kind"], int(m["arena_u64_index"]), int(m["data"]))
+                for m in expected_list
+            )
+            actual_acc: list = []
+            for e in iter_entries[k]:
+                actual_acc.extend(_actual_multiset(e))
+            actual = Counter(actual_acc)
+            if expected == actual:
+                continue
+            missing = list((expected - actual).elements())
+            extra = list((actual - expected).elements())
+            tid_label = "+".join(f"t{t}" for t in sorted(cov_tids))
+            issues.append(Issue(
+                "per_execution_memop_data", "error",
+                f"blk_{bid} ({tid_label}) iter {k + 1}: dyn_params multiset "
+                f"diverges from per_iteration_memops[{k}]\n"
+                f"      expected: {list(expected.elements())}\n"
+                f"      actual  : {list(actual.elements())}\n"
+                f"      missing : {missing}\n"
+                f"      extra   : {extra}",
+                {"block_id": bid, "template_ids": sorted(cov_tids),
+                 "iter": k + 1,
+                 "missing": missing, "extra": extra},
+            ))
+    return issues
+
+
+def _check_per_execution_memop_shape(
+        entries: list[dict],
+        template_runs: dict[int, list[tuple[int, int]]],
+        templates_by_id: dict[int, dict],
+        blocks_by_id: dict[int, dict],
+        cp_set: set[int]) -> list[Issue]:
+    """For every CP body entry, verify that the per-insn (loads, stores)
+    count tuple matches the *first* execution's tuple for that template.
+
+    The wire format encodes memop counts as sparse state-delta fields:
+    the decoder reads the previous value if no record arrives for this
+    entry.  An encoder bug that fails to (a) re-emit a load_addr slot on
+    a subsequent execution, or (b) refresh N_LOADS/N_STORES when the
+    runtime count changes, manifests as the decoded `dyn_params` having
+    a different (loads, stores) shape on iteration k than iteration 1.
+
+    Existing memop checks (_check_cp_memops, _check_memop_insn_attribution)
+    only inspect the first execution per template "by construction";
+    this check explicitly tests the construction.
+
+    Templates whose blocks opt into aggregate_fanout (REP probes) are
+    skipped: their per-execution shape is checked by
+    _check_memop_count_assertions instead, and the per-iteration memop
+    counts are intentionally non-uniform (one (1, 1) entry per iter).
+    """
+    issues: list[Issue] = []
+
+    fanout_tids: set[int] = set()
+    cp_tids: set[int] = set()
+    for tid, runs in template_runs.items():
+        cp_blocks = {bid for (bid, _) in runs if bid in cp_set}
+        if not cp_blocks:
+            continue
+        cp_tids.add(tid)
+        if any(blocks_by_id[bid].get("aggregate_fanout") for bid in cp_blocks):
+            fanout_tids.add(tid)
+
+    # Build per-template (loads, stores) baseline from the first CP
+    # entry, then compare every subsequent entry's per-insn tuple.
+    # `baseline[tid][insn_idx] = (loads, stores)`.
+    baseline: dict[int, dict[int, tuple[int, int]]] = {}
+    mismatches_per_tid: dict[int, int] = {}
+
+    def _shape_for_entry(e: dict, tmpl: dict) -> dict[int, tuple[int, int]]:
+        insns = tmpl.get("insns", [])
+        shape: dict[int, list[int]] = {}
+        for dp in e.get("dyn_params", []) or []:
+            idx = int(getattr(dp, "insn_index", -1))
+            if idx < 0 or idx >= len(insns):
+                continue
+            slot = shape.setdefault(idx, [0, 0])
+            if dp.type_name == "load":
+                slot[0] += 1
+            else:
+                slot[1] += 1
+        return {idx: (ls, ss) for idx, (ls, ss) in shape.items()}
+
+    for e in entries:
+        tid = int(e["template_id"])
+        if tid not in cp_tids or tid in fanout_tids:
+            continue
+        tmpl = templates_by_id.get(tid)
+        if tmpl is None:
+            continue
+        shape = _shape_for_entry(e, tmpl)
+        if tid not in baseline:
+            baseline[tid] = shape
+            continue
+        if shape == baseline[tid]:
+            continue
+        mismatches_per_tid[tid] = mismatches_per_tid.get(tid, 0) + 1
+        # Surface only the first two divergent entries per template
+        # to keep the report tractable; the count is reported below.
+        if mismatches_per_tid[tid] > 2:
+            continue
+        base = baseline[tid]
+        all_idx = sorted(set(base.keys()) | set(shape.keys()))
+        diff_lines = []
+        for idx in all_idx:
+            b = base.get(idx, (0, 0))
+            s = shape.get(idx, (0, 0))
+            if b == s:
+                continue
+            insns = tmpl.get("insns", [])
+            pc = (int(insns[idx]["pc"])
+                  if 0 <= idx < len(insns) else 0)
+            diff_lines.append(
+                f"    insn[{idx:2d}] pc=0x{pc:x}: "
+                f"first_exec=(L{b[0]},S{b[1]}) "
+                f"this_exec=(L{s[0]},S{s[1]})"
+            )
+        issues.append(Issue(
+            "per_execution_memop_shape", "error",
+            f"template t{tid}: per-execution memop shape diverged from "
+            f"first execution\n" + "\n".join(diff_lines),
+            {"template_id": tid,
+             "baseline": {idx: list(v) for idx, v in base.items()},
+             "this_exec": {idx: list(v) for idx, v in shape.items()}},
+        ))
+    for tid, n in mismatches_per_tid.items():
+        if n > 2:
+            issues.append(Issue(
+                "per_execution_memop_shape", "info",
+                f"template t{tid}: {n} entries diverged from first-exec "
+                f"shape (showed first 2 above)",
+                {"template_id": tid, "n_diverged": n},
+            ))
+    return issues
+
+
 _TRAILER_INSNS_BY_ISA = {
     # The generator emits these many insns AFTER each block's
     # user-supplied asm: a single branch on most ISAs, plus a
@@ -4597,11 +4868,13 @@ def validate(meta_path: Path, trace_path: Path,
     # the *next* TB starts, so a TB terminated by a process-exiting
     # syscall currently disappears from CP.  We detect this pattern
     # structurally: if the distinct CP blocks visited are a strict
-    # prefix of `correct_path`, the missing suffix is the dropped tail.
+    # prefix of `correct_path` (run-length-collapsed to handle CFG-level
+    # self-loops), the missing suffix is the dropped tail.
     plugin_drop_tail: list[int] = []
-    if cp_block_seq and len(cp_block_seq) < len(correct_path):
-        if cp_block_seq == correct_path[:len(cp_block_seq)]:
-            plugin_drop_tail = correct_path[len(cp_block_seq):]
+    _correct_collapsed = _collapse_runs(correct_path)
+    if cp_block_seq and len(cp_block_seq) < len(_correct_collapsed):
+        if cp_block_seq == _correct_collapsed[:len(cp_block_seq)]:
+            plugin_drop_tail = _correct_collapsed[len(cp_block_seq):]
 
     stats["cp_start_index"] = cp_start
     stats["cp_entries_after_prologue"] = len(cp_entries)
@@ -4634,7 +4907,13 @@ def validate(meta_path: Path, trace_path: Path,
         cp_block_seq_effective = cp_block_seq
 
     issues += _check_blocks_covered(correct_path, cp_distinct)
-    issues += _check_cp_execution_order(correct_path, cp_block_seq_effective)
+    # cp_block_seq is run-length-collapsed; for CFG-level self-loop
+    # blocks (StrideLoopHead) the correct_path has the same block_id
+    # repeated for each iteration, so collapse it here too — for
+    # LoopHead↔LoopBody loops the alternation makes this a no-op.
+    correct_path_collapsed = _collapse_runs(correct_path)
+    issues += _check_cp_execution_order(correct_path_collapsed,
+                                        cp_block_seq_effective)
 
     # Disassembly-driven first-order sanity checks.
     issues += _check_template_raw_bytes(templates, blocks_by_id)
@@ -4659,6 +4938,10 @@ def validate(meta_path: Path, trace_path: Path,
                                    blocks_by_id, cp_set, arena_addr,
                                    arena_size,
                                    meta.get("isa", "x86_64"))
+        issues += _check_per_execution_memop_data(
+            cp_entries, template_runs, blocks_by_id,
+            cp_set, arena_addr, arena_size,
+            meta.get("isa", "x86_64"))
 
     templates_by_id = {t["template_id"]: t for t in templates}
     isa = meta.get("isa", "x86_64")
@@ -4681,6 +4964,9 @@ def validate(meta_path: Path, trace_path: Path,
 
     issues += _check_memop_count_assertions(cp_entries, templates_by_id,
                                             blocks_by_id, pcmap, cp_set)
+
+    issues += _check_per_execution_memop_shape(
+        cp_entries, template_runs, templates_by_id, blocks_by_id, cp_set)
 
     has_reg_data = bool(trace_meta.get("has_reg_data"))
     issues += _check_reg_value_assertions(cp_entries, templates_by_id,

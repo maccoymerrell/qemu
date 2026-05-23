@@ -56,8 +56,12 @@ def _build_diamond_cfg(seed: int, num_diamonds: int,
                        side_len_range: tuple[int, int],
                        isa: str = "x86_64",
                        coverage: bool = False,
-                       hot_iters: int = 0) -> CFG:
+                       hot_iters: int = 0,
+                       stride_loops: bool = False) -> CFG:
     r = random.Random(hashlib.sha256(f"{seed}:cfg".encode()).digest())
+
+    # StrideLoopHead is x86_64-only; ignore the request on other ISAs.
+    use_stride = stride_loops and isa in B.StrideLoopHead.supported_isas
 
     straight_menu = [
         cls for cls in B.all_blocks()
@@ -75,6 +79,17 @@ def _build_diamond_cfg(seed: int, num_diamonds: int,
         if hot_iters > 0 and names:
             names[length // 2] = "__loop_region__"
         return names
+
+    # Stride-loop mode: dedicated minimal CFG so the StrideLoopHead's
+    # two-successor self-loop doesn't tangle with the diamond chaining.
+    if use_stride:
+        entry_id = add(B.StrideLoopHead.name)
+        # Pin loop_iterations to the static stride table depth.
+        nodes[entry_id].loop_iterations = max(
+            1, min(int(hot_iters), B.StrideLoopHead.STRIDE_DEPTH))
+        exit_id = add(B.ExitBlock.name)
+        nodes[entry_id].successors = [entry_id, exit_id]
+        return CFG(nodes=nodes, entry=entry_id, exit=exit_id)
 
     def expand_side(descs: list[str]) -> tuple[int | None, int | None]:
         first_id: int | None = None
@@ -183,7 +198,14 @@ def _plan_nodes(cfg: CFG, seed: int, isa: str
         plan.branch_pred = n.branch_outcome
         plans[n.block_id] = plan
 
-        for m in plan.memops:
+        # Initialize arena slots from `memops` (the first-iter view)
+        # and from every iteration of `per_iteration_memops` if set —
+        # the latter is what stride probes use to populate slots that
+        # are only read on later iterations.
+        memop_iter = list(plan.memops)
+        for iter_ops in plan.per_iteration_memops:
+            memop_iter.extend(iter_ops)
+        for m in memop_iter:
             span = max(1, (int(m.size) + 7) // 8)
             if m.kind == "load":
                 for i in range(span):
@@ -262,11 +284,23 @@ class _SimState:
         return _SimState(dict(self.loop_remaining))
 
 
+_LOOP_HEAD_CLASS_NAMES = (B.LoopHead.name, B.StrideLoopHead.name)
+
+
 def _initial_state(cfg: CFG) -> _SimState:
-    return _SimState({
-        n.block_id: n.loop_iterations + 1
-        for n in cfg.nodes if n.cls_name == B.LoopHead.name
-    })
+    init: dict[int, int] = {}
+    for n in cfg.nodes:
+        if n.cls_name not in _LOOP_HEAD_CLASS_NAMES:
+            continue
+        # StrideLoopHead exits when its counter reaches 0 (== fires the
+        # `je exit` branch on the iter that decrements the counter from
+        # 1 to 0).  Without LoopBody as a separate node, the head runs
+        # exactly loop_iterations times, so loop_remaining starts at
+        # loop_iterations (no +1).  Plain LoopHead uses +1 because the
+        # head fires once more than the body executes.
+        bump = 0 if n.cls_name == B.StrideLoopHead.name else 1
+        init[n.block_id] = n.loop_iterations + bump
+    return _SimState(init)
 
 
 def _branch_step(n: Node, state: _SimState) -> tuple[int, int, _SimState]:
@@ -274,8 +308,15 @@ def _branch_step(n: Node, state: _SimState) -> tuple[int, int, _SimState]:
     if n.cls_name == B.CondBranch.name:
         cp_idx = 0 if n.branch_outcome else 1
         return cp_idx, 1 - cp_idx, post
-    if n.cls_name == B.LoopHead.name:
-        remaining = post.loop_remaining.get(n.block_id, n.loop_iterations + 1)
+    if n.cls_name in _LOOP_HEAD_CLASS_NAMES:
+        # StrideLoopHead does its full body+counter+branch in ONE
+        # execution per iter, so its loop_iterations matches the
+        # number of times the template fires (no +1 needed for an
+        # entering setup iter).  LoopHead uses +1 because its loop
+        # body lives in a separate LoopBody block.
+        bump = 0 if n.cls_name == B.StrideLoopHead.name else 1
+        remaining = post.loop_remaining.get(
+            n.block_id, n.loop_iterations + bump)
         if remaining > 1:
             post.loop_remaining[n.block_id] = remaining - 1
             return 0, 1, post
@@ -301,13 +342,20 @@ def _walk_correct_path(cfg: CFG, max_steps: int = 100_000
             cur = n.successors[0]
             continue
         cp_idx, wp_idx, post = _branch_step(n, state)
-        branches.append({
-            "cp_exec_index": len(path) - 1,
-            "cp_block_id": cur,
-            "wp_start_block": n.successors[wp_idx],
-            "branch_outcome": (cp_idx == 0),
-            "post_state": post.copy(),
-        })
+        # CFG-level self-loop branches (CP target == source block) have
+        # no observable WP from the validator's POV: cp_pos in the
+        # wp_chains check only advances when the block_id changes,
+        # never within a run of the same block.  Skip emitting a
+        # wrong_paths entry for these so the check can't fire on a
+        # cp_pos that never reaches the corresponding cp_exec_index.
+        if n.successors[cp_idx] != cur:
+            branches.append({
+                "cp_exec_index": len(path) - 1,
+                "cp_block_id": cur,
+                "wp_start_block": n.successors[wp_idx],
+                "branch_outcome": (cp_idx == 0),
+                "post_state": post.copy(),
+            })
         cur = n.successors[cp_idx]
         state = post
     raise RuntimeError("CP walk did not terminate")
@@ -370,6 +418,10 @@ def build_metadata(cfg: CFG, plans: list[B.BlockPlan],
             "memops": [dataclasses.asdict(m) for m in plan.memops],
             "ordered_memops": plan.ordered_memops,
             "aggregate_fanout": plan.aggregate_fanout,
+            "per_iteration_memops": [
+                [dataclasses.asdict(m) for m in iter_ops]
+                for iter_ops in plan.per_iteration_memops
+            ],
             "reg_value_assertions": list(plan.reg_value_assertions),
             "memop_count_assertions": list(plan.memop_count_assertions),
             "indirect_wp_assertions": list(plan.indirect_wp_assertions),
@@ -413,6 +465,7 @@ class GenerateParams:
     side_len_max: int = 4
     coverage: bool = False
     hot_iters: int = 0
+    stride_loops: bool = False
 
 
 def generate(params: GenerateParams, out_dir: Path, prog_name: str
@@ -428,6 +481,7 @@ def generate(params: GenerateParams, out_dir: Path, prog_name: str
         isa=params.isa,
         coverage=params.coverage,
         hot_iters=params.hot_iters,
+        stride_loops=params.stride_loops,
     )
     arena_u64 = _assign_slots(cfg)
     plans, init_values = _plan_nodes(cfg, params.seed, params.isa)
@@ -501,8 +555,12 @@ def _build_diamond_cfg(seed: int, num_diamonds: int,
                        side_len_range: tuple[int, int],
                        isa: str = "x86_64",
                        coverage: bool = False,
-                       hot_iters: int = 0) -> CFG:
+                       hot_iters: int = 0,
+                       stride_loops: bool = False) -> CFG:
     r = random.Random(hashlib.sha256(f"{seed}:cfg".encode()).digest())
+
+    # StrideLoopHead is x86_64-only; ignore the request on other ISAs.
+    use_stride = stride_loops and isa in B.StrideLoopHead.supported_isas
 
     straight_menu = [
         cls for cls in B.all_blocks()
@@ -520,6 +578,17 @@ def _build_diamond_cfg(seed: int, num_diamonds: int,
         if hot_iters > 0 and names:
             names[length // 2] = "__loop_region__"
         return names
+
+    # Stride-loop mode: dedicated minimal CFG so the StrideLoopHead's
+    # two-successor self-loop doesn't tangle with the diamond chaining.
+    if use_stride:
+        entry_id = add(B.StrideLoopHead.name)
+        # Pin loop_iterations to the static stride table depth.
+        nodes[entry_id].loop_iterations = max(
+            1, min(int(hot_iters), B.StrideLoopHead.STRIDE_DEPTH))
+        exit_id = add(B.ExitBlock.name)
+        nodes[entry_id].successors = [entry_id, exit_id]
+        return CFG(nodes=nodes, entry=entry_id, exit=exit_id)
 
     def expand_side(descs: list[str]) -> tuple[int | None, int | None]:
         first_id: int | None = None
@@ -737,13 +806,20 @@ def _walk_correct_path(cfg: CFG, max_steps: int = 100_000
             cur = n.successors[0]
             continue
         cp_idx, wp_idx, post = _branch_step(n, state)
-        branches.append({
-            "cp_exec_index": len(path) - 1,
-            "cp_block_id": cur,
-            "wp_start_block": n.successors[wp_idx],
-            "branch_outcome": (cp_idx == 0),
-            "post_state": post.copy(),
-        })
+        # CFG-level self-loop branches (CP target == source block) have
+        # no observable WP from the validator's POV: cp_pos in the
+        # wp_chains check only advances when the block_id changes,
+        # never within a run of the same block.  Skip emitting a
+        # wrong_paths entry for these so the check can't fire on a
+        # cp_pos that never reaches the corresponding cp_exec_index.
+        if n.successors[cp_idx] != cur:
+            branches.append({
+                "cp_exec_index": len(path) - 1,
+                "cp_block_id": cur,
+                "wp_start_block": n.successors[wp_idx],
+                "branch_outcome": (cp_idx == 0),
+                "post_state": post.copy(),
+            })
         cur = n.successors[cp_idx]
         state = post
     raise RuntimeError("CP walk did not terminate")
@@ -806,6 +882,10 @@ def build_metadata(cfg: CFG, plans: list[B.BlockPlan],
             "memops": [dataclasses.asdict(m) for m in plan.memops],
             "ordered_memops": plan.ordered_memops,
             "aggregate_fanout": plan.aggregate_fanout,
+            "per_iteration_memops": [
+                [dataclasses.asdict(m) for m in iter_ops]
+                for iter_ops in plan.per_iteration_memops
+            ],
             "coarse_opcodes": plan.coarse_opcodes,
             "terminal": plan.terminal,
             "asserted_branch_types": list(plan.asserted_branch_types),
@@ -846,6 +926,7 @@ class GenerateParams:
     side_len_max: int = 4
     coverage: bool = False
     hot_iters: int = 0
+    stride_loops: bool = False
 
 
 def generate(params: GenerateParams, out_dir: Path, prog_name: str
@@ -861,6 +942,7 @@ def generate(params: GenerateParams, out_dir: Path, prog_name: str
         isa=params.isa,
         coverage=params.coverage,
         hot_iters=params.hot_iters,
+        stride_loops=params.stride_loops,
     )
     arena_u64 = _assign_slots(cfg)
     plans, init_values = _plan_nodes(cfg, params.seed, params.isa)

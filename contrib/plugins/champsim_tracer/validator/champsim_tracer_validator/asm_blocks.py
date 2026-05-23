@@ -38,6 +38,15 @@ class BlockPlan:
     # aggregation (which exists to suppress normal-loop double-
     # counting).
     aggregate_fanout: bool = False
+    # Per-execution expected memops: if set, the validator checks that the
+    # k-th CP entry on this block's template has the k-th sub-list as its
+    # dyn_params (in the same multiset sense as `memops`).  Used for
+    # known-deterministic loop bodies whose data varies across iterations
+    # (e.g. LoopHead: counter decrements each iter) so the per-execution
+    # data check can catch stale/wrong delta regressions that the
+    # first-execution-only `_check_cp_memops` misses.
+    per_iteration_memops: list[list["ExpectedMemOp"]] = \
+        dataclasses.field(default_factory=list)
     reg_value_assertions: list[dict] = dataclasses.field(default_factory=list)
     memop_count_assertions: list[dict] = dataclasses.field(default_factory=list)
     indirect_wp_assertions: list[dict] = dataclasses.field(default_factory=list)
@@ -662,6 +671,19 @@ class LoopHead(CodeBlock):
     def plan(cls, ctx: EmitCtx) -> BlockPlan:
         counter = max(1, int(ctx.loop_iterations)) + 1
         slot = ctx.scratch_slots[0]
+        # Per-iteration memops: counter decrements from `counter` to 1
+        # across this block's CP executions (the iter that produces
+        # store=0 takes the exit branch and ends the loop).  This is the
+        # data trajectory the encoder must reproduce on every execution
+        # of this template; a regression that fails to refresh
+        # load_data/store_data on subsequent iterations would show up as
+        # stale (counter, counter-1) values on iter 2+.
+        per_iter: list[list[ExpectedMemOp]] = []
+        for c in range(counter, 0, -1):
+            per_iter.append([
+                ExpectedMemOp("load", slot, 8, c),
+                ExpectedMemOp("store", slot, 8, c - 1),
+            ])
         return BlockPlan(
             block_id=ctx.block_id,
             name=cls.name,
@@ -669,6 +691,7 @@ class LoopHead(CodeBlock):
                 ExpectedMemOp("load", slot, 8, counter),
                 ExpectedMemOp("store", slot, 8, counter - 1),
             ],
+            per_iteration_memops=per_iter,
             coarse_opcodes={"LOAD": 1, "STORE": 1, "INT_SUB": 1, "BRANCH": 1},
         )
 
@@ -789,6 +812,107 @@ class LoopExit(CodeBlock):
             lines += ["  xori $t0, $t0, 51"]
             lines += _store_slot(ctx.isa, s1, "$t0")
         lines += _jump(ctx.isa, ctx.successor_labels[0])
+        return "\n".join(lines) + "\n"
+
+
+@register
+class StrideLoopHead(CodeBlock):
+    """CFG self-looping block that varies the LOAD/STORE address every
+    iteration of the same template — stresses the state-delta encoder's
+    per-execution address path that no other deterministic-asm probe
+    touches.
+
+    On every execution this template runs ONE iteration's worth of asm:
+    load counter, strided load at slot[counter], add, strided store
+    back, decrement counter, store counter back, branch.  The CFG wires
+    successors[0] = self (back-edge) and successors[1] = exit, with the
+    branch test choosing.  Branch step semantics mirror LoopHead's
+    loop_remaining machinery (added to _branch_step / _initial_state in
+    generator.py).
+
+    Same template runs `loop_iterations` times; load_addr/store_addr
+    differ across executions because the base register varies.  Per-iter
+    expected memops are declared so the per-execution data check
+    surfaces any stale-address or stale-data delta as a multiset
+    mismatch on the diverging iteration.
+    """
+    name = "stride_loop_head"
+    num_successors = 2
+    # 1 counter slot + STRIDE_DEPTH stride slots.  The generator pins
+    # loop_iterations to STRIDE_DEPTH at most; smaller loop_iterations
+    # uses a prefix of the stride table.
+    STRIDE_DEPTH: ClassVar[int] = 16
+    scratch_slots = 17
+    supported_isas = ("x86_64",)
+    randomizable = False
+    coverage_probe = False
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        n_iters = max(1, int(ctx.loop_iterations))
+        if len(ctx.scratch_slots) < n_iters + 1:
+            raise ValueError(
+                f"StrideLoopHead needs scratch_slots = loop_iterations+1; "
+                f"got {len(ctx.scratch_slots)} for n_iters={n_iters}"
+            )
+        ctr_slot = ctx.scratch_slots[0]
+        stride_slots = ctx.scratch_slots[1:1 + n_iters]
+        # Counter starts at n_iters and decrements to 0; the branch
+        # exits when counter reaches 0.  On iter j (1-indexed, j=1
+        # being the first execution), the counter loaded is
+        # n_iters - j + 1, the strided slot is stride_slots[counter-1].
+        # We declare the per-iter expected memops in execution order.
+        per_iter: list[list[ExpectedMemOp]] = []
+        for j in range(1, n_iters + 1):
+            counter_pre = n_iters - j + 1
+            slot = stride_slots[counter_pre - 1]
+            seed = 0x100 * counter_pre
+            iter_ops = [
+                ExpectedMemOp("load", ctr_slot, 8, counter_pre),
+                ExpectedMemOp("load", slot, 8, seed),
+                ExpectedMemOp("store", slot, 8, seed + 7),
+                ExpectedMemOp("store", ctr_slot, 8, counter_pre - 1),
+            ]
+            per_iter.append(iter_ops)
+        # `memops` lists iter-1's pair (used by the first-exec check);
+        # init_values takes the load .data on each, which pre-populates
+        # ctr_slot to n_iters and stride_slots[k] to 0x100*(k+1).
+        memops = list(per_iter[0])
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=memops,
+            per_iteration_memops=per_iter,
+            coarse_opcodes={"LOAD": 2, "STORE": 2, "INT_SUB": 1, "BRANCH": 1},
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        n_iters = max(1, int(ctx.loop_iterations))
+        ctr_slot = ctx.scratch_slots[0]
+        stride_base = ctx.scratch_slots[1]
+        for k in range(n_iters):
+            if ctx.scratch_slots[1 + k] != stride_base + k:
+                raise ValueError(
+                    "StrideLoopHead requires contiguous stride scratch slots"
+                )
+        # successor[0] = self (back-edge); successor[1] = exit.  Both
+        # are emitted as explicit jumps so this block's layout is
+        # independent of physical adjacency.
+        back_target = ctx.successor_labels[0]
+        exit_target = ctx.successor_labels[1]
+        stride_off = (stride_base - 1) * 8  # so (r15, r8, 8) hits slot[counter-1]
+        lines = _prologue(ctx.block_id) + _load_base(ctx.isa) + [
+            f"  movq {ctr_slot * 8}(%r15), %r8",
+            f"  movq {stride_off}(%r15, %r8, 8), %r9",
+            "  addq $7, %r9",
+            f"  movq %r9, {stride_off}(%r15, %r8, 8)",
+            "  subq $1, %r8",
+            f"  movq %r8, {ctr_slot * 8}(%r15)",
+            "  testq %r8, %r8",
+            f"  je {exit_target}",
+            f"  jmp {back_target}",
+        ]
         return "\n".join(lines) + "\n"
 
 

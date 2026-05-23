@@ -108,6 +108,11 @@ def _parse_args() -> argparse.Namespace:
                    help="If > 0, place one explicit loop region on each side "
                         "of every diamond and have the loop exit after this "
                         "many body executions.")
+    g.add_argument("--stride-loops", action="store_true",
+                   help="Generate a dedicated stride-loop CFG (x86_64 only) "
+                        "that exercises varying load/store ADDRESSES across "
+                        "executions of the same template; intended for "
+                        "stressing the per-execution memop encoder.")
 
     # build
     b = sub.add_parser("build", help="Assemble/link .S for an ISA")
@@ -171,6 +176,8 @@ def _parse_args() -> argparse.Namespace:
                     help="See `generate --coverage`.")
     al.add_argument("--hot-iters", type=int, default=0,
                     help="See `generate --hot-iters`.")
+    al.add_argument("--stride-loops", action="store_true",
+                    help="See `generate --stride-loops`.")
     al.add_argument("--compress", choices=("none", "xz", "zstd", "gzip"),
                     default="none", help="See `trace --compress`.")
 
@@ -248,6 +255,7 @@ def cmd_generate(args, isa: str | None = None) -> None:
         side_len_max=args.side_len_max,
         coverage=getattr(args, "coverage", False),
         hot_iters=getattr(args, "hot_iters", 0),
+        stride_loops=getattr(args, "stride_loops", False),
     )
     # Emit per-ISA metadata and a per-ISA assembly source.
     args.out_dir.mkdir(parents=True, exist_ok=True)

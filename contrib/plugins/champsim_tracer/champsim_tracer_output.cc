@@ -2009,6 +2009,28 @@ static const FieldDescriptor field_descriptors[] = {
 
 #define N_FIELD_DESCRIPTORS (sizeof(field_descriptors) / sizeof(field_descriptors[0]))
 
+/* Named indices into field_descriptors[].  The sparse emit_field_delta
+ * walker visits each family directly via these (rather than scanning
+ * all descriptors per insn and falling back on per-call cap == 0 to
+ * skip non-applicable families), so the order here is load-bearing
+ * for that walker — must match field_descriptors[] above. */
+enum FieldDescIndex {
+    FD_IDX_N_LOADS = 0,
+    FD_IDX_N_STORES,
+    FD_IDX_METAFLAGS,
+    FD_IDX_LOAD_ADDR,
+    FD_IDX_STORE_ADDR,
+    FD_IDX_LOAD_DATA,
+    FD_IDX_STORE_DATA,
+    FD_IDX_DST_REG,
+    FD_IDX_SRC_LANE_MASK,
+    FD_IDX_DST_LANE_MASK,
+    FD_IDX_LOAD_DATA_LANE_MASK,
+    FD_IDX_STORE_DATA_LANE_MASK,
+    /* remaining entries are template_static; never iterated by the
+     * sparse walker */
+};
+
 /* Sort dyn_params so each insn's loads precede its stores, matching
  * the slot indexing used by find_memop_slot(). */
 static void dyn_params_sort_template_order(std::vector<DynParam> &dyn_params)
@@ -2225,12 +2247,83 @@ static void warn_memop_overflow(const BBTemplate *tmpl, uint32_t insn_i,
     g_mutex_unlock(&unknown_warn_lock);
 }
 
+/* Per-tuple processors.  Inlined into the sparse walker — single
+ * call site per family — so the call shape disappears at -O.  Both
+ * helpers replicate the previous extract/compare/stage body verbatim;
+ * the refactor is in *which* (i, fd, slot) tuples we visit, not how
+ * each tuple gets emitted. */
+static inline void emit_one_u64(StageRec **stage_p, unsigned int *stage_len,
+                                unsigned int *stage_cap,
+                                FieldStateBlock *state_block,
+                                uint32_t state_generation,
+                                FieldStateBlock *base_block,
+                                uint32_t base_generation,
+                                const EntryView *ev, uint32_t i,
+                                const FieldDescriptor *fd, uint8_t slot)
+{
+    uint64_t cur;
+    if (!fd->extract_u64(ev, i, slot, &cur)) return;
+    uint16_t fid = (uint16_t)(fd->base_field_id + slot * fd->slot_stride);
+    uint16_t slot_index = field_state_slot_index(fid);
+    uint64_t base;
+    if (!field_state_block_get_u64(state_block, state_generation,
+                                   i, slot_index, &base) &&
+        !field_state_block_get_u64(base_block, base_generation,
+                                   i, slot_index, &base)) {
+        base = fd->template_default_u64(ev->tmpl, i, slot);
+    }
+    if (cur == base) return;
+    StageRec rec = {};
+    rec.pos = i;
+    rec.fid = fid;
+    rec.delta = u512_from_u64_diff(cur, base);
+    stage_rec_append(stage_p, stage_len, stage_cap, rec);
+    if (state_block && i < state_block->n_insns &&
+        slot_index != FIELD_STATE_SLOT_INVALID) {
+        size_t idx = ((size_t)i * FIELD_STATE_SLOT_COUNT) + slot_index;
+        state_block->values[idx].limb[0] = cur;
+        state_block->generations[idx] = state_generation;
+    }
+}
+
+static inline void emit_one_wide(StageRec **stage_p, unsigned int *stage_len,
+                                 unsigned int *stage_cap,
+                                 FieldStateBlock *state_block,
+                                 uint32_t state_generation,
+                                 FieldStateBlock *base_block,
+                                 uint32_t base_generation,
+                                 const EntryView *ev, uint32_t i,
+                                 const FieldDescriptor *fd, uint8_t slot)
+{
+    U512 cur;
+    if (!fd->extract(ev, i, slot, &cur)) return;
+    uint16_t fid = (uint16_t)(fd->base_field_id + slot * fd->slot_stride);
+    U512 base = field_state_get(state_block, state_generation,
+                                base_block, base_generation,
+                                i, fid, fd, ev->tmpl, slot);
+    if (u512_equal(cur, base)) return;
+    StageRec rec = {};
+    rec.pos = i;
+    rec.fid = fid;
+    rec.delta = u512_sub(cur, base);
+    stage_rec_append(stage_p, stage_len, stage_cap, rec);
+    field_state_put(state_block, state_generation, i, fid, cur);
+}
+
 /*
- * The single emitter.  Per insn, per (descriptor, slot): emit a
- * record iff the current value differs from the prior observation
- * (or template default on first sighting).  The loop nesting (insn /
- * descriptor / slot, all ascending) yields the (ins_pos, field_id)
- * wire order, with a final sort backstopping the slotted interleave.
+ * The single emitter.  Sparse per-insn walk: for each insn, visit
+ * exactly the descriptor/slot tuples that have observable content
+ * (per-insn N_LOADS/N_STORES; memop slots gated by actual_n_loads /
+ * actual_n_stores; DST_REG / METAFLAGS / lane-masks gated by the
+ * immutable per-insn schema in InsnFields).  Skips entire families
+ * for insns where the template schema or runtime count guarantees
+ * extract() would return false — the prior dense walker called
+ * runtime_slot_cap() N_INSNS * N_DESCRIPTORS times per call regardless,
+ * and that dispatch overhead dominated on scalar-heavy traces (mcf).
+ *
+ * A final (pos, fid) sort produces the wire's required non-descending
+ * order, since the per-insn sub-walks emit family-major within each
+ * insn but the slotted families share interleaved FID ranges.
  */
 static void emit_field_delta_section(BitWriter *main_bw,
                                      BodyStreamState *st,
@@ -2263,95 +2356,90 @@ static void emit_field_delta_section(BitWriter *main_bw,
         uint32_t state_generation = state->generation;
         uint32_t base_generation = base_state ? base_state->generation : 0;
 
-        /* Descriptors that can produce a record for this call.  The
-         * filter (template_static / mem-data / reg-data gating)
-         * depends only on header_flags, so it is evaluated once here
-         * and the per-insn loop iterates this list directly. */
-        const FieldDescriptor *active[N_FIELD_DESCRIPTORS];
-        size_t n_active = 0;
-        for (size_t d = 0; d < N_FIELD_DESCRIPTORS; d++) {
-            const FieldDescriptor *fd = &field_descriptors[d];
-            if (fd->template_static)
-                continue;
-            if (fd->gated_by_mem_data && !(header_flags & CST_FLAG_MEM_DATA))
-                continue;
-            if (fd->gated_by_reg_data && !(header_flags & CST_FLAG_REG_DATA))
-                continue;
-            active[n_active++] = fd;
-        }
+        const bool want_memdata = (header_flags & CST_FLAG_MEM_DATA) != 0;
+        const bool want_regdata = (header_flags & CST_FLAG_REG_DATA) != 0;
+
+        /* Locked-in descriptor pointers — one constant per family. */
+        const FieldDescriptor *fd_n_loads     = &field_descriptors[FD_IDX_N_LOADS];
+        const FieldDescriptor *fd_n_stores    = &field_descriptors[FD_IDX_N_STORES];
+        const FieldDescriptor *fd_metaflags   = &field_descriptors[FD_IDX_METAFLAGS];
+        const FieldDescriptor *fd_load_addr   = &field_descriptors[FD_IDX_LOAD_ADDR];
+        const FieldDescriptor *fd_store_addr  = &field_descriptors[FD_IDX_STORE_ADDR];
+        const FieldDescriptor *fd_load_data   = &field_descriptors[FD_IDX_LOAD_DATA];
+        const FieldDescriptor *fd_store_data  = &field_descriptors[FD_IDX_STORE_DATA];
+        const FieldDescriptor *fd_dst_reg     = &field_descriptors[FD_IDX_DST_REG];
+        const FieldDescriptor *fd_src_lm      = &field_descriptors[FD_IDX_SRC_LANE_MASK];
+        const FieldDescriptor *fd_dst_lm      = &field_descriptors[FD_IDX_DST_LANE_MASK];
+        const FieldDescriptor *fd_load_lm     = &field_descriptors[FD_IDX_LOAD_DATA_LANE_MASK];
+        const FieldDescriptor *fd_store_lm    = &field_descriptors[FD_IDX_STORE_DATA_LANE_MASK];
+
+#define U64(I, FD, SLOT)  emit_one_u64(&stage, &stage_len, &stage_cap, \
+                                       state_block, state_generation, \
+                                       base_block, base_generation, \
+                                       ev, (I), (FD), (SLOT))
+#define WIDE(I, FD, SLOT) emit_one_wide(&stage, &stage_len, &stage_cap, \
+                                        state_block, state_generation, \
+                                        base_block, base_generation, \
+                                        ev, (I), (FD), (SLOT))
 
         for (uint32_t i = 0; i < ev->tmpl->n_insns; i++) {
-            /* Surface memop-count overflow before the slot loop clamps. */
+            const InsnFields *f = &ev->tmpl->insn_fields[i];
             uint32_t insn_n_loads  = ev->actual_n_loads
                 ? ev->actual_n_loads[i]  : 0;
             uint32_t insn_n_stores = ev->actual_n_stores
                 ? ev->actual_n_stores[i] : 0;
             warn_memop_overflow(ev->tmpl, i, insn_n_loads, insn_n_stores);
 
-            for (size_t a = 0; a < n_active; a++) {
-                const FieldDescriptor *fd = active[a];
+            /* Hot singletons: N_LOADS / N_STORES always visited (they
+             * are per-iter counts whose default is the template's
+             * declared value; refreshing is the only way the decoder
+             * learns this iter's runtime count differs). */
+            U64(i, fd_n_loads,  0);
+            U64(i, fd_n_stores, 0);
 
-                uint8_t cap = fd->runtime_slot_cap
-                    ? fd->runtime_slot_cap(ev, i)
-                    : fd->slot_count;
-                if (fd->extract_u64) {
-                    /* Narrow fast path: compare two u64s in registers;
-                     * materialise a U512 only when staging a record. */
-                    for (uint8_t slot = 0; slot < cap; slot++) {
-                        uint64_t cur;
-                        if (!fd->extract_u64(ev, i, slot, &cur)) continue;
-                        uint16_t fid = (uint16_t)(fd->base_field_id +
-                                                  slot * fd->slot_stride);
-                        uint16_t slot_index = field_state_slot_index(fid);
-                        uint64_t base;
-                        if (!field_state_block_get_u64(state_block,
-                                                       state_generation,
-                                                       i, slot_index, &base) &&
-                            !field_state_block_get_u64(base_block,
-                                                       base_generation,
-                                                       i, slot_index, &base)) {
-                            base = fd->template_default_u64(ev->tmpl, i, slot);
-                        }
-                        if (cur == base) continue;
-                        StageRec rec = {};
-                        rec.pos = i;
-                        rec.fid = fid;
-                        rec.delta = u512_from_u64_diff(cur, base);
-                        stage_rec_append(&stage, &stage_len, &stage_cap, rec);
-                        /* Update narrow state: limb[0] only (upper-
-                         * limb residue is never read for this family). */
-                        if (state_block && i < state_block->n_insns &&
-                            slot_index != FIELD_STATE_SLOT_INVALID) {
-                            size_t idx = ((size_t)i * FIELD_STATE_SLOT_COUNT)
-                                         + slot_index;
-                            state_block->values[idx].limb[0] = cur;
-                            state_block->generations[idx] = state_generation;
-                        }
-                    }
-                } else {
-                    /* Wide path: 64-byte payload families
-                     * (LOAD_DATA, STORE_DATA, DST_REG). */
-                    for (uint8_t slot = 0; slot < cap; slot++) {
-                        U512 cur;
-                        if (!fd->extract(ev, i, slot, &cur)) continue;
-                        uint16_t fid = (uint16_t)(fd->base_field_id +
-                                                  slot * fd->slot_stride);
-                        U512 base =
-                            field_state_get(state_block, state_generation,
-                                            base_block, base_generation,
-                                            i, fid, fd, ev->tmpl, slot);
-                        if (u512_equal(cur, base)) continue;
-                        StageRec rec = {};
-                        rec.pos = i;
-                        rec.fid = fid;
-                        rec.delta = u512_sub(cur, base);
-                        stage_rec_append(&stage, &stage_len, &stage_cap, rec);
-                        field_state_put(state_block, state_generation,
-                                        i, fid, cur);
-                    }
+            /* METAFLAGS gated by regdata + writes_int_flags. */
+            if (want_regdata && f->writes_int_flags) {
+                U64(i, fd_metaflags, 0);
+            }
+
+            /* Memop families — sparse over actual_n_loads / n_stores.
+             * cap_min collapses overflowing counts to the wire slot
+             * count, matching the previous cap_loads/cap_stores. */
+            uint8_t n_loads_cap  = cap_min(insn_n_loads);
+            uint8_t n_stores_cap = cap_min(insn_n_stores);
+            for (uint8_t s = 0; s < n_loads_cap; s++) {
+                U64(i, fd_load_addr, s);
+                if (want_memdata) WIDE(i, fd_load_data, s);
+            }
+            for (uint8_t s = 0; s < n_stores_cap; s++) {
+                U64(i, fd_store_addr, s);
+                if (want_memdata) WIDE(i, fd_store_data, s);
+            }
+
+            /* DST_REG gated by regdata + per-insn n_dst_regs. */
+            if (want_regdata) {
+                uint8_t n_dsts = f->n_dst_regs;
+                for (uint8_t s = 0; s < n_dsts; s++) {
+                    WIDE(i, fd_dst_reg, s);
                 }
             }
+
+            /* Lane masks visited only for vec insns (the vast majority
+             * of scalar-pipeline traces have has_vec_lanes==false and
+             * skip all four families entirely). */
+            if (f->has_vec_lanes) {
+                uint8_t n_src = f->n_src_regs;
+                uint8_t n_dst = f->n_dst_regs;
+                uint8_t n_ml  = f->max_dep_loads;
+                uint8_t n_ms  = f->max_dep_stores;
+                for (uint8_t s = 0; s < n_src; s++) U64(i, fd_src_lm,    s);
+                for (uint8_t s = 0; s < n_dst; s++) U64(i, fd_dst_lm,    s);
+                for (uint8_t s = 0; s < n_ml;  s++) U64(i, fd_load_lm,   s);
+                for (uint8_t s = 0; s < n_ms;  s++) U64(i, fd_store_lm,  s);
+            }
         }
+#undef U64
+#undef WIDE
     }
 
     /* Wire requires non-descending (ins_pos, fid).  The family-major

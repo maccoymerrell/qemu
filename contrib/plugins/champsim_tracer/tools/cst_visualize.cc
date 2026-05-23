@@ -74,7 +74,10 @@ enum class Metric {
     GenReg,
     BtbMiss,
     WpDivergence,
+    CacheMiss,
 };
+
+enum class CachePolicy { LRU, MRU, Random };
 
 struct Options {
     const char *input        = nullptr;
@@ -99,6 +102,16 @@ struct Options {
     /* BTB entry counts to compare (analogous to gshare histories).
      * Power-of-two friendly defaults span typical front-end sizes. */
     std::vector<int> btb_entries = {64, 128, 256, 512, 1024};
+
+    /* cache_miss: a single set-associative cache.  block_size /
+     * sets / policy are scalars; @cache_assocs is the varied axis —
+     * one chart line per associativity value.  Total cache size for
+     * a given line is (block_size * sets * assoc) bytes; the
+     * default sweep walks 4 KiB ... 64 KiB at block=64, sets=64. */
+    int                 cache_block_size = 64;
+    int                 cache_sets       = 64;
+    std::vector<int>    cache_assocs     = {1, 2, 4, 8, 16};
+    CachePolicy         cache_policy     = CachePolicy::LRU;
 };
 
 [[noreturn]] static void usage(int rc)
@@ -111,6 +124,8 @@ struct Options {
 "  -m wp_insns      Wasted WP insns/1k under gshare (lines per --history)\n"
 "  -m wp_memops     Wasted WP memops/1k under gshare (lines per --history)\n"
 "  -m btb_miss      BTB miss rate (lines per --btb-entries)\n"
+"  -m cache_miss    CP-side cache miss rate (lines per --cache-assoc),\n"
+"                   CP-only top vs WP-polluted bottom\n"
 "  -m wp_divergence Fraction of WP branches whose predicted next-PC\n"
 "                   differs from the recorded WP chain target (i.e.\n"
 "                   the speculative path a real predictor would take\n"
@@ -124,6 +139,10 @@ struct Options {
 "  -H, --history=L,L,...   Gshare history lengths (default 4,8,12,16,24)\n"
 "      --pht-bits=B        PHT log2 entries (default 14)\n"
 "      --btb-entries=N,... BTB sizes for btb_miss (default 64,128,256,512,1024)\n"
+"      --cache-block-size=N  Cache line size in bytes (default 64)\n"
+"      --cache-sets=N      Cache sets (default 64)\n"
+"      --cache-assoc=A,... Cache associativities (default 1,2,4,8,16)\n"
+"      --cache-policy=P    Replacement: lru | mru | random (default lru)\n"
 "      --warmup-bins=N     Bins excluded from y_max scaling (default 5)\n"
 "  -b, --bins=N            Number of bins (default 200)\n"
 "  -w, --width=PX          SVG width  (default 1280)\n"
@@ -186,8 +205,28 @@ static Metric parse_metric(const char *s)
     if (!std::strcmp(s, "gen_reg"))     return Metric::GenReg;
     if (!std::strcmp(s, "btb_miss"))    return Metric::BtbMiss;
     if (!std::strcmp(s, "wp_divergence")) return Metric::WpDivergence;
+    if (!std::strcmp(s, "cache_miss"))  return Metric::CacheMiss;
     std::fprintf(stderr, "cst_visualize: unknown metric '%s'\n", s);
     std::exit(2);
+}
+
+static CachePolicy parse_cache_policy(const char *s)
+{
+    if (!std::strcmp(s, "lru"))    return CachePolicy::LRU;
+    if (!std::strcmp(s, "mru"))    return CachePolicy::MRU;
+    if (!std::strcmp(s, "random")) return CachePolicy::Random;
+    std::fprintf(stderr, "cst_visualize: bad cache policy '%s'\n", s);
+    std::exit(2);
+}
+
+static const char *cache_policy_name(CachePolicy p)
+{
+    switch (p) {
+        case CachePolicy::LRU:    return "lru";
+        case CachePolicy::MRU:    return "mru";
+        case CachePolicy::Random: return "random";
+    }
+    return "?";
 }
 
 /* Predictor histories / BTB sizes can both grow large enough to make
@@ -248,6 +287,14 @@ static Options parse_args(int argc, char **argv)
             o.pht_bits = parse_int(a + 11, "--pht-bits");
         } else if (!std::strncmp(a, "--btb-entries=", 14)) {
             o.btb_entries = parse_int_list_unbounded(a + 14, "--btb-entries");
+        } else if (!std::strncmp(a, "--cache-block-size=", 19)) {
+            o.cache_block_size = parse_int(a + 19, "--cache-block-size");
+        } else if (!std::strncmp(a, "--cache-sets=", 13)) {
+            o.cache_sets = parse_int(a + 13, "--cache-sets");
+        } else if (!std::strncmp(a, "--cache-assoc=", 14)) {
+            o.cache_assocs = parse_int_list_unbounded(a + 14, "--cache-assoc");
+        } else if (!std::strncmp(a, "--cache-policy=", 15)) {
+            o.cache_policy = parse_cache_policy(a + 15);
         } else if (!std::strncmp(a, "--warmup-bins=", 14)) {
             o.warmup_bins = parse_int(a + 14, "--warmup-bins");
         } else if (!std::strcmp(a, "-b") || !std::strcmp(a, "--bins")) {
@@ -297,6 +344,83 @@ static Options parse_args(int argc, char **argv)
 /* ===================================================================
  *                               gshare
  * =================================================================== */
+
+/* Set-associative cache with LRU / MRU / random replacement.  A
+ * single Cache instance is exactly one cache configuration; the
+ * cache_miss metric instantiates one Cache per --cache-assoc value
+ * and feeds all of them the same access stream so the lines on the
+ * chart compare apples-to-apples.  No cache hierarchy is modelled. */
+struct Cache {
+    int block_log2;     /* log2(block_size_bytes) */
+    int n_sets;
+    int assoc;
+    CachePolicy policy;
+    /* sets x assoc, row-major.  tag == UINT64_MAX marks an invalid
+     * (cold) way.  rank counts: a way's recency within its set,
+     * 0 = LRU, assoc-1 = MRU.  Random policy ignores rank. */
+    std::vector<uint64_t> tags;
+    std::vector<int>      rank;
+    uint64_t              rng_state = 0x9E3779B97F4A7C15ULL;
+
+    Cache(int block_size, int sets, int a, CachePolicy p)
+        : n_sets(sets), assoc(a), policy(p),
+          tags((size_t)sets * a, ~uint64_t(0)),
+          rank((size_t)sets * a, 0)
+    {
+        block_log2 = 0;
+        while ((1 << block_log2) < block_size) block_log2++;
+    }
+
+    uint64_t set_of(uint64_t addr) const {
+        return (addr >> block_log2) % (uint64_t)n_sets;
+    }
+    uint64_t tag_of(uint64_t addr) const {
+        return (addr >> block_log2) / (uint64_t)n_sets;
+    }
+
+    /* Single access; returns true on hit, false on miss.  In either
+     * case the touched way becomes MRU (rank=assoc-1) so the recency
+     * order tracks usage.  Misses install the new tag, evicting the
+     * per-policy victim. */
+    bool access(uint64_t addr) {
+        uint64_t s = set_of(addr);
+        uint64_t t = tag_of(addr);
+        size_t base = (size_t)s * (size_t)assoc;
+        for (int w = 0; w < assoc; w++) {
+            if (tags[base + w] == t) {
+                /* hit: promote */
+                int old = rank[base + w];
+                for (int w2 = 0; w2 < assoc; w2++) {
+                    if (rank[base + w2] > old) rank[base + w2]--;
+                }
+                rank[base + w] = assoc - 1;
+                return true;
+            }
+        }
+        /* miss: evict and install */
+        int victim = 0;
+        if (policy == CachePolicy::LRU) {
+            for (int w = 1; w < assoc; w++) {
+                if (rank[base + w] < rank[base + victim]) victim = w;
+            }
+        } else if (policy == CachePolicy::MRU) {
+            for (int w = 1; w < assoc; w++) {
+                if (rank[base + w] > rank[base + victim]) victim = w;
+            }
+        } else {
+            rng_state = rng_state * 6364136223846793005ULL
+                      + 1442695040888963407ULL;
+            victim = (int)(rng_state % (uint64_t)assoc);
+        }
+        int old = rank[base + victim];
+        for (int w2 = 0; w2 < assoc; w2++) {
+            if (rank[base + w2] > old) rank[base + w2]--;
+        }
+        tags[base + victim] = t;
+        rank[base + victim] = assoc - 1;
+        return false;
+    }
+};
 
 /* Branch Target Buffer — LRU map from branch PC to last-seen target.
  * Hit = PC present AND target matches the just-observed actual target.
@@ -798,6 +922,14 @@ struct WalkCtx {
      * them so distinct sizes see identical access streams. */
     std::vector<BTB>    btbs;
     std::vector<BTB>    btbs_corrupted;
+    /* Caches (only populated for cache_miss).  caches[] are
+     * CP-only; caches_corrupted[] are also walked by WP memops.
+     * Both ALWAYS measure CP miss rate — the WP accesses to the
+     * corrupted set only pollute LRU / tag occupancy. */
+    std::vector<Cache>  caches;
+    std::vector<Cache>  caches_corrupted;
+    /* Per-bin CP memop count, denominator for cache miss rate. */
+    std::vector<uint64_t> cp_memops_per_bin;
     /* Per-bin total branches observed by BTB, used to convert raw
      * miss counters to miss-rate (misses/branch). */
     std::vector<uint64_t> btb_branches_per_bin;
@@ -1091,6 +1223,46 @@ static void handle_btb_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
     }
 
     ctx.cp_insns_so_far += n_insns;
+}
+
+/* cache_miss: drive a set-associative cache per --cache-assoc value
+ * with this CP entry's memops, counting CP misses.  WP memops of
+ * the same entry get fed into the corrupted-variant caches only —
+ * those caches measure CP miss rate but their tag/LRU state is
+ * polluted by every speculative access the WP chain recorded. */
+static void handle_cache_miss_entry(WalkCtx &ctx,
+                                     const cst::DecodedEntry &e)
+{
+    const cst::Template &t = (*ctx.templates)[ctx.by_id->at(e.template_id)];
+    int bin = bin_of(ctx, ctx.cp_insns_so_far);
+
+    /* CP memops drive BOTH cache variants, counted only in their
+     * respective bin matrices for CP miss-rate computation. */
+    uint64_t n_cp_memops = 0;
+    for (const auto &dp : e.dyn_params) {
+        n_cp_memops++;
+        for (size_t ci = 0; ci < ctx.caches.size(); ci++) {
+            bool hit = ctx.caches[ci].access(dp.addr);
+            if (!hit) ctx.bins.at((int)ci, bin) += 1.0;
+        }
+        for (size_t ci = 0; ci < ctx.caches_corrupted.size(); ci++) {
+            bool hit = ctx.caches_corrupted[ci].access(dp.addr);
+            if (!hit) ctx.bins_wp.at((int)ci, bin) += 1.0;
+        }
+    }
+    if ((int)ctx.cp_memops_per_bin.size() <= bin) {
+        ctx.cp_memops_per_bin.resize(bin + 1, 0);
+    }
+    ctx.cp_memops_per_bin[bin] += n_cp_memops;
+
+    /* WP memops pollute the corrupted variant only, no counting. */
+    for (const auto &wp : e.wp_entries) {
+        for (const auto &dp : wp.dyn_params) {
+            for (auto &c : ctx.caches_corrupted) (void)c.access(dp.addr);
+        }
+    }
+
+    ctx.cp_insns_so_far += t.insns.size();
 }
 
 static void handle_mem_pat_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
@@ -1439,6 +1611,24 @@ int main(int argc, char **argv)
             std::snprintf(b, sizeof(b), "%d entries", n);
             ctx.add_label(b);
         }
+    } else if (opts.metric == Metric::CacheMiss) {
+        ctx.caches.reserve(opts.cache_assocs.size());
+        ctx.caches_corrupted.reserve(opts.cache_assocs.size());
+        for (int a : opts.cache_assocs) {
+            ctx.caches.emplace_back(opts.cache_block_size,
+                                     opts.cache_sets, a,
+                                     opts.cache_policy);
+            ctx.caches_corrupted.emplace_back(opts.cache_block_size,
+                                               opts.cache_sets, a,
+                                               opts.cache_policy);
+            uint64_t kib = (uint64_t)opts.cache_block_size *
+                           (uint64_t)opts.cache_sets *
+                           (uint64_t)a / 1024;
+            char b[64];
+            std::snprintf(b, sizeof(b), "assoc=%d (%" PRIu64 " KiB)",
+                          a, kib);
+            ctx.add_label(b);
+        }
     } else if (opts.metric == Metric::WpDivergence) {
         /* BP variants: one line per history.  A single BTB (the
          * largest configured size) plays the role of an oracle
@@ -1483,6 +1673,8 @@ int main(int argc, char **argv)
             fn = handle_btb_entry; break;
         case Metric::WpDivergence:
             fn = handle_wp_divergence_entry; break;
+        case Metric::CacheMiss:
+            fn = handle_cache_miss_entry; break;
     }
 
     walker.walk([&](const cst::DecodedEntry &e) { fn(ctx, e); });
@@ -1516,6 +1708,14 @@ int main(int argc, char **argv)
                 return "BTB miss rate";
             case Metric::WpDivergence:
                 return "Wrong-path divergence vs trace's recorded WP";
+            case Metric::CacheMiss: {
+                char b[96];
+                std::snprintf(b, sizeof(b),
+                    "Cache miss rate (block=%d sets=%d policy=%s)",
+                    opts.cache_block_size, opts.cache_sets,
+                    cache_policy_name(opts.cache_policy));
+                return b;
+            }
             case Metric::MemPat:
                 return "Memory-access pattern breakdown";
             case Metric::BranchDir:
@@ -1616,6 +1816,25 @@ int main(int argc, char **argv)
                                           miss_rate, "Miss rate", true);
             double m2 = build_lines_plan(plan2, ctx.bins_wp,
                                           opts.btb_entries,
+                                          miss_rate, "Miss rate", true);
+            double yshared = std::max(m1, m2);
+            plan.y_max = plan2.y_max = yshared;
+            plan.percent = plan2.percent = true;
+            plan.title  = std::string(pick_title()) + " (CP-only)";
+            plan2.title = std::string(pick_title()) + " (CP + WP-polluted)";
+            has_second_pane = true;
+            break;
+        }
+        case Metric::CacheMiss: {
+            auto miss_rate = [&](double v, int b) {
+                uint64_t d = b < (int)ctx.cp_memops_per_bin.size()
+                                ? ctx.cp_memops_per_bin[b] : 0;
+                return d == 0 ? 0.0 : v / (double)d;
+            };
+            double m1 = build_lines_plan(plan, ctx.bins, opts.cache_assocs,
+                                          miss_rate, "Miss rate", true);
+            double m2 = build_lines_plan(plan2, ctx.bins_wp,
+                                          opts.cache_assocs,
                                           miss_rate, "Miss rate", true);
             double yshared = std::max(m1, m2);
             plan.y_max = plan2.y_max = yshared;

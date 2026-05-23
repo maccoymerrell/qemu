@@ -110,6 +110,16 @@ if get_option('plugins')
     link_with: cst_tools_common,
     dependencies: [cst_capstone_dep],
     install: false)
+  # cst_visualize: streams the same shared cst_decode walker and
+  # accumulates a chosen metric into instruction-window bins, then
+  # writes an SVG.  No Capstone dependency — its only inputs are the
+  # numeric ids in the trace and the trace's own encoding maps.
+  t += executable(
+    'cst_visualize',
+    files('champsim_tracer/tools/cst_visualize.cc'),
+    cpp_args: cst_tools_cpp_args,
+    link_with: cst_tools_common,
+    install: false)
   endif
 endif
 if t.length() > 0

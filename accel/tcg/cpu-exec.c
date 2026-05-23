@@ -715,12 +715,16 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
 }
 
 /*
- * Execute one full translation block at the current PC from a plugin callback.
- * Non-memory plugin callbacks (tb_exec, insn_exec, inline ops) are suppressed
- * via CF_MEMI_ONLY, so the plugin's scoreboard is not corrupted.  Translation
- * callbacks (vcpu_tb_trans) and memory callbacks (vcpu_mem_cb) still fire.
- * CF_SINGLE_STEP prevents rep-prefixed instructions from looping internally.
- * Returns true on success, false on failure (e.g. unmapped PC, exception).
+ * Execute one full translation block at the current PC from a plugin
+ * callback.  All plugin callbacks fire — tb_exec, insn_exec, inline ops,
+ * and mem — so the plugin sees the speculative TB the same way it sees a
+ * normal CP TB and can deliver its instructions through the per-TB
+ * exec-cb udata.  The plugin is responsible for keeping its own state
+ * separated (e.g. early-out for spec-mode invocations of CP-only state
+ * mutations, and saving/restoring scoreboard slots clobbered by inline
+ * stores around spec-mode entry).  CF_SINGLE_STEP prevents rep-prefixed
+ * instructions from looping internally.  Returns true on success, false
+ * on failure (e.g. unmapped PC, exception).
  */
 bool cpu_plugin_exec_tb(CPUState *cpu)
 {
@@ -736,8 +740,7 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
 
     cflags = curr_cflags(cpu);
     cflags &= ~CF_PARALLEL;
-    cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR | CF_MEMI_ONLY
-            | CF_SINGLE_STEP;
+    cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR | CF_SINGLE_STEP;
 
     if (cpu->plugin_spec_mode) {
         cflags |= CF_FORCE_SLOW;

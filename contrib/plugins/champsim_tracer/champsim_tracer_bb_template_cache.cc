@@ -42,12 +42,6 @@ void BBTemplateDeleter::operator()(BBTemplate *t) const noexcept
     g_free(t);
 }
 
-BBTemplate *BBTemplateCache::find_tb_template(uint64_t start_pc)
-{
-    auto it = tb_map_.find(start_pc);
-    return it == tb_map_.end() ? nullptr : it->second.get();
-}
-
 BBTemplate *BBTemplateCache::find_bb_template(uint64_t entry_pc)
 {
     auto it = bb_map_.find(entry_pc);
@@ -56,12 +50,21 @@ BBTemplate *BBTemplateCache::find_bb_template(uint64_t entry_pc)
 
 size_t BBTemplateCache::tb_count() const
 {
-    return tb_map_.size();
+    return tb_templates_.size();
 }
 
 void BBTemplateCache::clear_bb_map()
 {
     bb_map_.clear();
+    /* parent_true_bb on every TB template points into the bb_map_ we
+     * just wiped, so the back-edges must be invalidated.  Walking
+     * tb_templates_ is O(distinct translations) and only runs on
+     * segment switches, not per-exec. */
+    for (auto &p : tb_templates_) {
+        if (p) {
+            p->parent_true_bb = nullptr;
+        }
+    }
     /*
      * Reset template-id counter so each segment starts at id 1; else
      * ids accumulate across segments and the fresh FieldStateTable's
@@ -70,6 +73,11 @@ void BBTemplateCache::clear_bb_map()
      * segment opens a new TEMPLATES section.
      */
     next_template_id_ = 1;
+}
+
+void BBTemplateCache::clear_tb_templates()
+{
+    tb_templates_.clear();
 }
 
 size_t BBTemplateCache::bb_count() const
@@ -378,6 +386,30 @@ BBTemplate *BBTemplateCache::get_or_create_bb_template(
         return nullptr;
     }
 
+    /*
+     * Fast path: every fragment of this chain has already been folded
+     * into the same true-BB whose start_pc matches @entry_pc.  Skip
+     * the per-fragment concat + dedup + find_existing_true_bb dance
+     * and return the cached BB directly.  parent_true_bb is cleared
+     * across segment switches (clear_bb_map drops bb_map_'s
+     * ownership), so a non-NULL value here is always live.
+     */
+    if (n_fragments > 0) {
+        BBTemplate *cand = fragments[0]->parent_true_bb;
+        if (cand && cand->start_pc == entry_pc) {
+            bool all_match = true;
+            for (unsigned int f = 1; f < n_fragments; f++) {
+                if (fragments[f]->parent_true_bb != cand) {
+                    all_match = false;
+                    break;
+                }
+            }
+            if (all_match) {
+                return cand;
+            }
+        }
+    }
+
     /* Thread-local fragment-walk scratch.  Per-call g_new0 here was
      * ~3% of tracer runtime on mcf; reusable per-thread buffers drop
      * the per-finalization malloc/free.  thread_local: this is called
@@ -477,10 +509,20 @@ BBTemplate *BBTemplateCache::get_or_create_bb_template(
     if (tmpl && n_fragments > 0 && fragments[n_fragments - 1]) {
         tmpl->rep_subtmpl = fragments[n_fragments - 1]->rep_subtmpl;
     }
+
+    /* Arm the fast-path back-edges: every fragment of this chain now
+     * resolves to @tmpl, so a future re-finalization with the same
+     * fragment set takes the fast-path at the top of this function
+     * without walking the fragments. */
+    if (tmpl) {
+        for (unsigned int f = 0; f < n_fragments; f++) {
+            fragments[f]->parent_true_bb = tmpl;
+        }
+    }
     return tmpl;
 }
 
-BBTemplate *BBTemplateCache::get_or_create_tb_template(
+BBTemplate *BBTemplateCache::create_tb_template(
     uint64_t start_pc,
     uint32_t n_insns,
     uint64_t *insn_pcs,
@@ -491,10 +533,10 @@ BBTemplate *BBTemplateCache::get_or_create_tb_template(
     const char *symbol_name,
     uint64_t fall_through_pc)
 {
-    if (BBTemplate *cached = find_tb_template(start_pc)) {
-        return cached;
-    }
-
+    /* Always fresh: one template per QEMU translation, attached to
+     * that TB via udata.  Distinct CP-mode and WP-mode translations
+     * at the same start_pc therefore each get their own template and
+     * cannot collide. */
     BBTemplatePtr tmpl(g_new0(BBTemplate, 1));
     tmpl->template_id = next_template_id_++;
     tmpl->start_pc = start_pc;
@@ -541,7 +583,7 @@ BBTemplate *BBTemplateCache::get_or_create_tb_template(
     apply_delay_slot_swap(tmpl.get());
 
     BBTemplate *raw = tmpl.get();
-    tb_map_[start_pc] = std::move(tmpl);
+    tb_templates_.push_back(std::move(tmpl));
     g_stats.tb_templates_created++;
 
     /*

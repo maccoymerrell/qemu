@@ -18,6 +18,7 @@
 #include <time.h>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -57,6 +58,68 @@ bool enable_wp_reg_data = false;
 uint32_t iframe_rate = 0;
 uint64_t warmup_insns = 0;
 uint64_t simulation_insns = 0;
+
+/* Executable code region of the main binary, captured at plugin install
+ * from qemu_plugin_start_code() / qemu_plugin_end_code().  Used to gate
+ * fragment-template creation and WP speculation: a PC outside this range
+ * is dynamic memory (stack/heap/data) whose contents are not stable
+ * "instructions", and any "BB" the tracer would build there is
+ * non-deterministic (the bytes change as the program runs).  CP never
+ * leaves the executable range (that would crash the guest), so the gate
+ * only ever rejects WP wrong-path divergences.  Statically-linked
+ * binaries have all real code inside [start, end); for
+ * dynamically-linked binaries this would need extending to track loaded
+ * library text segments (TODO). */
+uint64_t g_code_start = 0;
+uint64_t g_code_end   = 0;
+
+/* First-seen 4-byte instruction word per VA.  Populated at every
+ * vcpu_tb_trans and consulted at subsequent translations to detect
+ * bytes-changed-since-last-time at the same VA — a sure sign that the
+ * "code" being translated is actually dynamic memory (stack / heap /
+ * data the program is writing to) and not real instructions.  Stored
+ * as plain uint32 to avoid endianness ambiguity; we only compare for
+ * equality, never decode. */
+std::unordered_map<uint64_t, uint32_t> g_first_insn_word;
+
+/* TB start_pcs that have been detected as carrying non-stable
+ * instruction bytes (decode failure OR byte change since first
+ * sighting).  WP speculation refuses to enter these; subsequent
+ * translation re-attempts at the same start_pc skip fragment
+ * materialization.  Persistent across WP simulations; cleared with
+ * tb_flush. */
+std::unordered_set<uint64_t> g_poisoned_pcs;
+
+/* Both maps above are accessed from vcpu_tb_trans (translation time,
+ * no lock currently held) and from the WP walker (under exec_lock).
+ * Protected by data_lock — already held by vcpu_tb_trans's
+ * fragment-creation critical section and acquired here briefly for
+ * lookups during translation. */
+bool cst_pc_is_poisoned(uint64_t pc)
+{
+    g_mutex_lock(&data_lock);
+    bool poisoned = g_poisoned_pcs.count(pc) > 0;
+    g_mutex_unlock(&data_lock);
+    return poisoned;
+}
+
+/* Thread-local cursor of the last CP TB this vCPU executed, set by
+ * vcpu_tb_exec from its own per-TB udata.  The CP chain assembler
+ * folds this snapshot at the next exec — an exact-shape pointer that
+ * cannot collide with a sibling translation (CP vs WP) of the same
+ * start_pc, and that needs no start_pc lookup. */
+thread_local BBTemplate *g_cp_prev_tb_template = nullptr;
+
+/* Window-stop is reached optimistically at TB-start (icount_prev >=
+ * window_stop), but the in-flight chain may still hold fragments
+ * waiting for a branch terminator — exiting immediately would drop
+ * those insns from the trace and put the recorded count *under* the
+ * requested stop.  The design guarantee is "trace covers AT LEAST
+ * the requested window," so on first crossing we set this flag and
+ * defer the actual exit; vcpu_tb_exec checks it after the per-iter
+ * chain commits and only finalizes once the chain assembler reports
+ * no active in-flight chain. */
+thread_local bool g_icount_shutdown_pending = false;
 
 /* Symbol-trigger state (trace_window=symbol:...).  start_symbol_match
  * _count counts TBs whose template names start_symbol; on reaching
@@ -119,6 +182,23 @@ static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
 
     if (enable_reg_data) {
         g_reg_handle_cache.ensure_initialized(cpu_index);
+    }
+
+    /* Snapshot the main binary's text-segment range on first vCPU
+     * init.  qemu_plugin_start_code() / end_code() dereference the
+     * TaskState, which is not initialized at plugin_install time but
+     * is by the first vcpu_init.  The bytes-change / decode-failure
+     * detector in vcpu_tb_trans uses this range to decide whether to
+     * warn (in-text → SMC suspect) vs silent-kill (out-of-text → WP
+     * wrong-path into data). */
+    if (g_code_start == 0 && g_code_end == 0) {
+        g_code_start = qemu_plugin_start_code();
+        g_code_end   = qemu_plugin_end_code();
+        fprintf(stderr,
+                "champsim_tracer: text segment [0x%" PRIx64
+                " .. 0x%" PRIx64 ") (%" PRIu64 " bytes)\n",
+                g_code_start, g_code_end,
+                g_code_end - g_code_start);
     }
 }
 
@@ -562,44 +642,60 @@ static void flush_pending_final_body_entry(void)
     unsigned int cpu_index = 0;
     uint64_t prev_start =
         qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
-    uint64_t prev_ft =
-        qemu_plugin_u64_get(g_scoreboard.prev_fall_through, cpu_index);
-    TbTerminus prev_terminus = (TbTerminus)
-        qemu_plugin_u64_get(g_scoreboard.prev_bb_terminus, cpu_index);
 
-    BBTemplate *bb_tmpl = nullptr;
+    std::vector<BBTemplate *> finalized;
     if (out_stream && prev_start != 0) {
         g_mutex_lock(&data_lock);
-        BBTemplate *prev_tb_tmpl =
-            g_bb_template_cache.find_tb_template(prev_start);
-        if (prev_tb_tmpl) {
-            /* Tail-insn dst snap (see vcpu_tb_exec): no later
-             * vcpu_tb_exec fires after shutdown, so capture the
-             * segment-final TB's last insn's dst values here. */
-            if (enable_reg_data && prev_tb_tmpl->insn_reg_names &&
-                prev_tb_tmpl->n_insns > 0) {
-                uint32_t last = prev_tb_tmpl->n_insns - 1;
-                const InsnFields *fl = &prev_tb_tmpl->insn_fields[last];
-                const InsnRegNames *nl =
-                    &prev_tb_tmpl->insn_reg_names[last];
-                for (uint8_t i = 0; i < fl->n_dst_regs; i++) {
-                    RegSnap s;
-                    g_reg_snaps.read_into_snap(
-                        cpu_index, nl->dst_qemu_reg_keys[i], &s);
-                    pending_reg_snaps.push_back(s);
+        /* Head fragment of the segment-final QEMU TB.  Walk its
+         * fragment list up to the last-executed one (matched by
+         * scoreboard's @prev_start), same as the per-exec walk in
+         * vcpu_tb_exec.  No later vcpu_tb_exec will fire after
+         * shutdown so this is the only chance to flush the trailing
+         * chain. */
+        BBTemplate *prev_tb_head = g_cp_prev_tb_template;
+        for (BBTemplate *frag = prev_tb_head; frag != nullptr;
+             frag = frag->next_tb_fragment) {
+            bool is_last_executed = (frag->start_pc == prev_start);
+
+            if (is_last_executed) {
+                /* Tail-insn dst snap (see vcpu_tb_exec): the
+                 * last-executed fragment's tail registers still
+                 * hold post-exec values. */
+                if (enable_reg_data && frag->insn_reg_names &&
+                    frag->n_insns > 0) {
+                    uint32_t last = frag->n_insns - 1;
+                    const InsnFields *fl = &frag->insn_fields[last];
+                    const InsnRegNames *nl = &frag->insn_reg_names[last];
+                    for (uint8_t i = 0; i < fl->n_dst_regs; i++) {
+                        RegSnap s;
+                        g_reg_snaps.read_into_snap(
+                            cpu_index, nl->dst_qemu_reg_keys[i], &s);
+                        pending_reg_snaps.push_back(s);
+                    }
                 }
             }
-            g_cp_chain.append_fragment(prev_start, prev_tb_tmpl, prev_ft,
-                                       prev_terminus);
-        }
-        if (prev_tb_tmpl && g_cp_chain.bb_complete() &&
-            g_cp_chain.has_active_chain()) {
-            bb_tmpl = g_cp_chain.finalize();
+
+            g_cp_chain.append_fragment(frag->start_pc, frag,
+                                       frag->fall_through_pc,
+                                       (TbTerminus)frag->terminus);
+
+            if (g_cp_chain.bb_complete() &&
+                g_cp_chain.has_active_chain()) {
+                BBTemplate *bb_tmpl = g_cp_chain.finalize();
+                g_cp_chain.reset();
+                if (bb_tmpl) {
+                    finalized.push_back(bb_tmpl);
+                }
+            }
+
+            if (is_last_executed) {
+                break;
+            }
         }
         g_mutex_unlock(&data_lock);
     }
 
-    if (bb_tmpl) {
+    for (BBTemplate *bb_tmpl : finalized) {
         emit_body_entry(out_stream, bb_tmpl, cpu_index, {});
     }
 
@@ -856,7 +952,8 @@ static void attribute_cp_insns(const BBTemplate *tmpl)
  * icount_prev so the trace covers AT LEAST the requested window.
  */
 static void tw_manage_window(unsigned int cpu_index,
-                             uint64_t icount_prev)
+                             uint64_t icount_prev,
+                             BBTemplate *cur_tb_tmpl)
 {
     if (g_window_mode == PluginConfig::WIN_SYMBOL) {
         /* Stop once the post-trigger simulation_insns budget is
@@ -869,12 +966,10 @@ static void tw_manage_window(unsigned int cpu_index,
             exit(0);
         }
         if (!g_trace_segments.is_active() && start_symbol) {
-            uint64_t cur_pc = qemu_plugin_u64_get(g_scoreboard.current_pc,
-                                                  cpu_index);
-            BBTemplate *cur_tmpl = nullptr;
-            g_mutex_lock(&data_lock);
-            cur_tmpl = g_bb_template_cache.find_tb_template(cur_pc);
-            g_mutex_unlock(&data_lock);
+            /* cur_tb_tmpl IS the executing TB's template (passed
+             * straight from the caller's per-TB udata); no start_pc
+             * lookup needed. */
+            BBTemplate *cur_tmpl = cur_tb_tmpl;
             if (cur_tmpl && cur_tmpl->symbol_name &&
                 cst_str_eq(cur_tmpl->symbol_name, start_symbol)) {
                 start_symbol_match_count++;
@@ -972,17 +1067,49 @@ static void tw_manage_window(unsigned int cpu_index,
         }
         if (g_trace_segments.is_active() &&
             icount_prev >= g_trace_segments.window_stop()) {
-            finish_trace_segment();
-            g_trace_segments.set_shutting_down();
-            g_mutex_unlock(&exec_lock);
-            exit(0);
+            /* Stop is reached optimistically (bumped count past
+             * window_stop), but the CP chain assembler may still
+             * have in-flight fragments awaiting a branch terminator.
+             * Defer the actual finalize+exit until vcpu_tb_exec
+             * observes the chain has no active in-flight; that way
+             * every bumped insn either ends up committed to a BB in
+             * the trace or never triggered the bump in the first
+             * place. */
+            g_icount_shutdown_pending = true;
         }
     }
 }
 
 static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 {
-    uint64_t n_insns = (uint64_t)(uintptr_t)udata;
+    /* udata = the head fragment of this TB's per-translation fragment
+     * list, set when the translation was armed in vcpu_tb_trans.
+     * Both CP-mode and WP-mode (qemu_plugin_exec_tb) invocations
+     * deliver the executing TB through the same pointer — no start_pc
+     * lookup, no shape ambiguity between sibling translations of the
+     * same address.  Sum across the linked fragment list so n_insns
+     * reflects the whole QEMU TB's instruction count; counting only
+     * the head would under-bump insn_count on multi-fragment TBs
+     * (mid-TB branch present) and let the trace overshoot its
+     * configured stop. */
+    BBTemplate *cur_tb_tmpl = (BBTemplate *)udata;
+    uint64_t n_insns = 0;
+    for (BBTemplate *f = cur_tb_tmpl; f != nullptr;
+         f = f->next_tb_fragment) {
+        n_insns += f->n_insns;
+    }
+
+    /* WP-mode early-out runs BEFORE exec_lock acquisition.  The CP
+     * thread that triggered this WP simulation already holds
+     * exec_lock from emit_finalized_bb's caller; vcpu_tb_exec fires
+     * synchronously inside qemu_plugin_exec_tb on the same thread, so
+     * acquiring exec_lock here would self-deadlock (it is a
+     * non-recursive GMutex).  The WP-mode branch only touches
+     * thread-local state, so it can skip the lock cleanly. */
+    if (g_wp_state.in_progress) {
+        g_wp_state.last_executed_tb = cur_tb_tmpl;
+        return;
+    }
 
     g_mutex_lock(&exec_lock);
 
@@ -991,7 +1118,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         return;
     }
 
-    /* Update the per-vCPU instruction counter (CP path only).
+    /* Update the per-vCPU instruction counter (CP path only — the
+     * WP-mode early-out above already returned).
      *
      * QEMU emits x86 REP string ops as a single-insn TB re-executed
      * once per REP iteration, each re-exec firing vcpu_tb_exec with
@@ -1009,28 +1137,24 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
      */
     uint64_t icount_prev = qemu_plugin_u64_get(g_scoreboard.insn_count,
                                                cpu_index);
-    /* Cache the WP-progress flag: g_wp_state is thread_local and the
-     * dlopen'd plugin's general-dynamic TLS model emits
-     * __tls_get_addr per access (~10 ns each on every TB exec). */
-    bool wp_in_progress = g_wp_state.in_progress;
-    if (!wp_in_progress) {
-        uint64_t last_counted = qemu_plugin_u64_get(
-            g_scoreboard.last_counted_start_pc, cpu_index);
-        bool is_rep_reentry = (n_insns == 1 && cur_start_pc == last_counted);
-        if (!is_rep_reentry) {
-            qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index,
-                                icount_prev + n_insns);
-            qemu_plugin_u64_set(g_scoreboard.last_counted_start_pc,
-                                cpu_index, cur_start_pc);
-        }
+    uint64_t last_counted = qemu_plugin_u64_get(
+        g_scoreboard.last_counted_start_pc, cpu_index);
+    bool is_rep_reentry = (n_insns == 1 && cur_start_pc == last_counted);
+    if (!is_rep_reentry) {
+        qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index,
+                            icount_prev + n_insns);
+        qemu_plugin_u64_set(g_scoreboard.last_counted_start_pc,
+                            cpu_index, cur_start_pc);
     }
 
-    if (wp_in_progress) {
-        g_mutex_unlock(&exec_lock);
-        return;
-    }
+    /* Snapshot the CP previous-TB cursor and advance it to the current
+     * TB before any other exit path: the chain assembler folds the
+     * snapshot below, and the next CP vcpu_tb_exec must see this TB as
+     * "previous" no matter which branch returns. */
+    BBTemplate *prev_cp_tb_tmpl = g_cp_prev_tb_template;
+    g_cp_prev_tb_template = cur_tb_tmpl;
 
-    tw_manage_window(cpu_index, icount_prev);
+    tw_manage_window(cpu_index, icount_prev, cur_tb_tmpl);
 
     BodyStreamState *out_stream = g_trace_segments.body_stream();
     if (!g_trace_segments.is_active() || !out_stream) {
@@ -1046,12 +1170,15 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
      * actually ran in. */
     g_current_hist_bucket = select_histogram_bucket(icount_prev);
 
-    /* Snapshot the previous-TB scoreboard fields. */
+    /* Snapshot the previous-TB scoreboard fields.  @prev_start is the
+     * last-executed fragment's start_pc — set by that fragment's
+     * first-raw-insn inline store; @prev_ft is its fall_through.  The
+     * per-TB terminus is no longer read from the scoreboard: each
+     * fragment's terminus is stored on its BBTemplate and consumed by
+     * the per-fragment walk below. */
     uint64_t current_pc = qemu_plugin_u64_get(g_scoreboard.current_pc, cpu_index);
     uint64_t prev_start = qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
     uint64_t prev_ft    = qemu_plugin_u64_get(g_scoreboard.prev_fall_through, cpu_index);
-    TbTerminus prev_terminus = (TbTerminus)
-        qemu_plugin_u64_get(g_scoreboard.prev_bb_terminus, cpu_index);
 
     /* Skip initial block (no previous context). */
     if (prev_ft == 0) {
@@ -1060,67 +1187,134 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     }
 
     /*
-     * current_pc is where execution went after the just-finished true
-     * BB; prev_ft is that BB's architectural fall-through (the last
-     * TB's fall-through).  They differ iff the BB's branch was taken.
+     * Walk the previous TB's fragment list up to the LAST EXECUTED
+     * fragment.  The scoreboard's @prev_start identifies that
+     * fragment (each fragment's first raw insn fires an inline store
+     * with its own start_pc; a trap mid-TB stops later fragments'
+     * stores from firing).  For each fragment that ran:
+     *
+     *   - intermediate fragments: by definition their branch did NOT
+     *     take (a later fragment in the same TB executed), so their
+     *     "next PC" is the next fragment's start_pc.
+     *   - last-executed fragment: its current_pc / prev_ft come from
+     *     the scoreboard (= where execution went after the entire
+     *     prev TB ran).
+     *
+     * The chain assembler folds fragments into true BBs; each
+     * completion is finalized + emitted independently.  Trap-fires
+     * cases naturally truncate the walk at the trapping fragment, so
+     * post-trap fragments never enter the chain.
      */
-    bool branch_taken = (current_pc != prev_ft);
-
-    /* --- Chain assembly, branch observation, and WP target resolution
-     *     all run under data_lock. */
     g_mutex_lock(&data_lock);
 
-    /*
-     * Fold the previous TB into the in-flight true-BB chain.  The
-     * chain assembler — NOT a per-TB flag — decides when a true BB is
-     * complete; it folds page-split branch/delay-slot TBs into one BB
-     * via the TbTerminus classification.
-     */
-    BBTemplate *prev_tb_tmpl = g_bb_template_cache.find_tb_template(prev_start);
-    if (prev_tb_tmpl) {
-        snap_prev_tail_dsts(cpu_index, prev_tb_tmpl);
-        g_cp_chain.append_fragment(prev_start, prev_tb_tmpl, prev_ft,
-                                   prev_terminus);
-        attribute_cp_insns(prev_tb_tmpl);
-    }
+    BBTemplate *prev_tb_head = prev_cp_tb_tmpl;
+    bool any_finalize = false;
 
-    bool finalize = prev_tb_tmpl != nullptr && g_cp_chain.bb_complete() &&
-                    g_cp_chain.has_active_chain();
-    BBTemplate *bb_tmpl = finalize ? g_cp_chain.finalize() : nullptr;
+    struct PendingEmit {
+        BBTemplate *bb_tmpl;
+        uint64_t    branch_pc;
+        uint64_t    emit_current_pc;
+        uint64_t    wrong_target;
+    };
+    std::vector<PendingEmit> pending_emits;
 
-    /*
-     * Every branch decision derives from the finalized true BB — its
-     * terminating branch instruction — never from a single TB
-     * fragment.  template_branch_index lands on the BB's branch
-     * (normalised to the last slot, including page-split BBs).
-     */
-    uint64_t branch_pc = 0;
-    uint64_t wrong_target = 0;
-    if (bb_tmpl) {
-        int br_idx = BBTemplateCache::template_branch_index(bb_tmpl);
-        if (br_idx >= 0) {
-            branch_pc = bb_tmpl->insn_pcs[br_idx];
-            BranchRecord *br = observe_branch_transition(branch_taken,
-                                                         branch_pc, prev_ft);
-            uint64_t taken_target = 0;
-            wrong_target = resolve_wrong_target(bb_tmpl, br, branch_taken,
-                                                current_pc, prev_ft,
-                                                &taken_target);
-            if (taken_target != 0) {
-                bb_tmpl->taken_pc = taken_target;
+    for (BBTemplate *frag = prev_tb_head; frag != nullptr;
+         frag = frag->next_tb_fragment) {
+        bool is_last_executed = (frag->start_pc == prev_start);
+
+        /* Per-fragment current_pc / prev_ft.  For intermediate
+         * fragments we know they fell through, so the "next PC" is
+         * the next fragment's start_pc (= this fragment's
+         * fall_through, by construction). */
+        uint64_t frag_current_pc;
+        uint64_t frag_prev_ft = frag->fall_through_pc;
+        if (is_last_executed) {
+            frag_current_pc = current_pc;
+        } else if (frag->next_tb_fragment) {
+            frag_current_pc = frag->next_tb_fragment->start_pc;
+        } else {
+            /* Should not happen: a fragment with no successor must be
+             * the last executed (or scoreboard hasn't been touched on
+             * this TB, e.g. first TB of the trace).  Conservatively
+             * use the scoreboard value. */
+            frag_current_pc = current_pc;
+        }
+        bool frag_branch_taken = (frag_current_pc != frag_prev_ft);
+
+        if (is_last_executed) {
+            snap_prev_tail_dsts(cpu_index, frag);
+        }
+        g_cp_chain.append_fragment(frag->start_pc, frag,
+                                   frag->fall_through_pc,
+                                   (TbTerminus)frag->terminus);
+        attribute_cp_insns(frag);
+
+        if (g_cp_chain.bb_complete() && g_cp_chain.has_active_chain()) {
+            BBTemplate *bb_tmpl = g_cp_chain.finalize();
+            /* Reset the chain now so a subsequent fragment in the
+             * same walk (no-trap path between mid-TB branches) starts
+             * a fresh chain at its own entry_pc instead of getting
+             * appended onto the just-committed fragments.  Today's
+             * fall-through reset lives inside emit_finalized_bb, but
+             * we accumulate emits to fire after the data_lock
+             * section, so the reset has to happen here. */
+            g_cp_chain.reset();
+            if (bb_tmpl) {
+                PendingEmit pe = {bb_tmpl, 0, frag_current_pc, 0};
+                int br_idx =
+                    BBTemplateCache::template_branch_index(bb_tmpl);
+                if (br_idx >= 0) {
+                    pe.branch_pc = bb_tmpl->insn_pcs[br_idx];
+                    BranchRecord *br = observe_branch_transition(
+                        frag_branch_taken, pe.branch_pc, frag_prev_ft);
+                    uint64_t taken_target = 0;
+                    pe.wrong_target = resolve_wrong_target(
+                        bb_tmpl, br, frag_branch_taken,
+                        frag_current_pc, frag_prev_ft, &taken_target);
+                    if (taken_target != 0) {
+                        bb_tmpl->taken_pc = taken_target;
+                    }
+                }
+                pending_emits.push_back(pe);
+                any_finalize = true;
             }
+        }
+
+        if (is_last_executed) {
+            break;
         }
     }
 
     g_mutex_unlock(&data_lock);
 
-    if (!finalize) {
+    if (!any_finalize) {
         g_mutex_unlock(&exec_lock);
         return;
     }
 
-    emit_finalized_bb(out_stream, bb_tmpl, branch_pc, current_pc,
-                      wrong_target, cpu_index);
+    for (const PendingEmit &pe : pending_emits) {
+        emit_finalized_bb(out_stream, pe.bb_tmpl, pe.branch_pc,
+                          pe.emit_current_pc, pe.wrong_target, cpu_index);
+    }
+
+    /* Deferred-exit on icount window-stop.  The trigger was set in
+     * tw_manage_window when icount_prev first crossed window_stop;
+     * exiting then would have left in-flight chain fragments
+     * uncommitted (= recorded count below the requested stop, which
+     * violates the "trace covers AT LEAST the requested window"
+     * guarantee).  Wait until a vcpu_tb_exec ends with no active
+     * in-flight chain — i.e. at a true-BB boundary — so every bumped
+     * insn has either been committed to a BB in the trace or never
+     * triggered the bump in the first place. */
+    if (g_icount_shutdown_pending &&
+        !g_cp_chain.has_active_chain() &&
+        g_trace_segments.is_active()) {
+        finish_trace_segment();
+        g_trace_segments.set_shutting_down();
+        g_icount_shutdown_pending = false;
+        g_mutex_unlock(&exec_lock);
+        exit(0);
+    }
 
     g_mutex_unlock(&exec_lock);
 }
@@ -1219,60 +1413,46 @@ static void tb_arm_new_template_cbs(struct qemu_plugin_tb *tb,
 }
 
 /*
- * Re-translation of a known BB: re-arm the same per-insn dynamic
- * callbacks against the cached template's existing ref arrays.
+ * One per-fragment record produced by split_tb_into_fragments.  The
+ * fragment covers canonical insns [start, start + n_insns) of the
+ * source QEMU TB.
  */
-static void tb_rearm_known_template_cbs(struct qemu_plugin_tb *tb,
-                                        BBTemplate *existing_tmpl,
-                                        size_t raw_n_insns,
-                                        const uint32_t *canonical_index,
-                                        const bool *canonical_first)
-{
-    RegSnapInsnRef *refs =
-        (RegSnapInsnRef *)existing_tmpl->insn_snap_refs;
-    SynthEAInsnRef *synth_refs =
-        (SynthEAInsnRef *)existing_tmpl->insn_synth_ea_refs;
-    for (size_t i = 0; i < raw_n_insns; i++) {
-        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
-
-        if (enable_reg_data && refs && canonical_first[i] &&
-            canonical_index[i] > 0 &&
-            canonical_index[i] - 1 < existing_tmpl->n_insns) {
-            qemu_plugin_register_vcpu_insn_exec_cb(
-                insn, vcpu_insn_reg_snap_cb,
-                QEMU_PLUGIN_CB_R_REGS,
-                &refs[canonical_index[i] - 1]);
-        }
-
-        if (synth_refs && canonical_first[i] &&
-            canonical_index[i] < existing_tmpl->n_insns &&
-            existing_tmpl->insn_synthetic_ea &&
-            existing_tmpl->insn_synthetic_ea[canonical_index[i]].has_addr) {
-            qemu_plugin_register_vcpu_insn_exec_cb(
-                insn, vcpu_insn_synth_ea_cb,
-                QEMU_PLUGIN_CB_R_REGS,
-                &synth_refs[canonical_index[i]]);
-        }
-    }
-}
+struct TbFragmentSpec {
+    uint32_t   start_canonical;
+    uint32_t   n_insns;
+    TbTerminus terminus;
+};
 
 /*
- * Classify how a freshly translated TB contributes to true-BB
- * assembly (see TbTerminus, BBChainAssembler).  This is per-TB input
- * to the chain assembler, computed straight from THIS TB's decoded
- * insns — never a cached template, since tb_map_ is keyed by start_pc
- * alone and two TBs at one start_pc can carry different content.
+ * Split a QEMU TB's canonical insn stream at any non-final branch
+ * terminator.  A TB may contain multiple control-flow terminators
+ * (e.g. a conditional trap mid-TB followed by code TCG kept
+ * translating past), and each one ends a true BB at that point.  This
+ * walker emits one TbFragmentSpec per resulting fragment; the chain
+ * assembler then folds fragments into true BBs.
  *
- * @insn_info is the canonical (deduped) insn array of the TB,
- * @n_insns its length.  The terminating branch's PC itself is not
- * returned: every consumer derives branch PCs from the finalized
- * true BB, not from a TB fragment.
+ * - On every branch-classified insn @i < n - 1, emit a fragment
+ *   [prev_start..i] (or [prev_start..i+1] for delay-slot ISA branches
+ *   whose slot is at i+1 in this TB) terminating in COMPLETE.
+ * - A delay-slot ISA branch as the literal last insn yields a
+ *   trailing BARE_BRANCH fragment (the slot lands in the next TB).
+ * - Trailing insns after the last branch (or a TB with no branches
+ *   at all) form a final NONE fragment that continues into the next
+ *   TB via the chain assembler.
+ *
+ * The tracer makes no assertion that a QEMU TB ends in a branch or
+ * that branches only appear at the end — TCG and Capstone can
+ * disagree about which insns terminate control flow (e.g. MIPS
+ * conditional traps), and the splitter is what reconciles that
+ * disagreement at the true-BB layer.
  */
-static TbTerminus classify_tb_terminus(const qemu_plugin_insn_info *insn_info,
-                                       uint32_t n_insns)
+static void split_tb_into_fragments(const qemu_plugin_insn_info *insn_info,
+                                    uint32_t n_insns,
+                                    std::vector<TbFragmentSpec> &out)
 {
+    out.clear();
     if (!insn_info || n_insns == 0) {
-        return TB_TERMINUS_NONE;
+        return;
     }
     auto insn_branch_type = [](const qemu_plugin_insn_info *info) -> uint8_t {
         if (!info->mnemonic[0]) {
@@ -1286,43 +1466,55 @@ static TbTerminus classify_tb_terminus(const qemu_plugin_insn_info *insn_info,
      * Branch families that carry an architectural delay slot — the
      * insn right after the branch always executes (MIPS j / jal /
      * jr / b*).  syscall- and trap-type "branches" do NOT have a
-     * delay slot and so end their TB cleanly.
+     * delay slot and so end their fragment on the branch insn itself.
      */
     auto has_delay_slot = [](uint8_t bt) -> bool {
         return bt == BRANCH_DIRECT_JUMP || bt == BRANCH_INDIRECT_JUMP ||
                bt == BRANCH_RETURN || bt == BRANCH_COND_DIRECT;
     };
+    bool delay_isa = isa_properties[trace_isa].branch_delay_slots > 0;
 
-    uint8_t last_bt = insn_branch_type(&insn_info[n_insns - 1]);
-
-    if (isa_properties[trace_isa].branch_delay_slots > 0) {
-        if (last_bt != BRANCH_NONE) {
-            if (has_delay_slot(last_bt)) {
-                /*
-                 * The branch is the literal last insn of the TB and
-                 * has a delay slot — QEMU placed that delay slot as
-                 * the first insn of the NEXT TB (the branch landed on
-                 * a page's last insn).  The true BB is not complete
-                 * until that delay slot is appended.
-                 */
-                return TB_TERMINUS_BARE_BRANCH;
+    uint32_t frag_start = 0;
+    uint32_t i = 0;
+    while (i < n_insns) {
+        uint8_t bt = insn_branch_type(&insn_info[i]);
+        if (bt == BRANCH_NONE) {
+            i++;
+            continue;
+        }
+        if (delay_isa && has_delay_slot(bt)) {
+            if (i + 1 < n_insns) {
+                /* Branch + delay slot both in this TB: fragment runs
+                 * through the delay slot (canonical index i+1). */
+                out.push_back({frag_start, (i + 2) - frag_start,
+                               TB_TERMINUS_COMPLETE});
+                frag_start = i + 2;
+                i = i + 2;
+            } else {
+                /* Bare branch as the literal last insn: delay slot
+                 * lives in the next QEMU TB. */
+                out.push_back({frag_start, (i + 1) - frag_start,
+                               TB_TERMINUS_BARE_BRANCH});
+                frag_start = i + 1;
+                i = i + 1;
             }
-            /* syscall / trap: no delay slot — ends the BB here. */
-            return TB_TERMINUS_COMPLETE;
+        } else {
+            /* Non-delay-slot branch (syscall / trap / non-delay-slot
+             * ISA conditional or unconditional branch): fragment ends
+             * on the branch insn itself. */
+            out.push_back({frag_start, (i + 1) - frag_start,
+                           TB_TERMINUS_COMPLETE});
+            frag_start = i + 1;
+            i = i + 1;
         }
-        if (n_insns >= 2 &&
-            has_delay_slot(insn_branch_type(&insn_info[n_insns - 2]))) {
-            /* [.., branch, delay-slot] — both in this TB. */
-            return TB_TERMINUS_COMPLETE;
-        }
-        return TB_TERMINUS_NONE;
     }
 
-    /* Non-delay-slot ISA: a branch as the last insn ends the BB. */
-    if (last_bt != BRANCH_NONE) {
-        return TB_TERMINUS_COMPLETE;
+    /* Trailing tail with no terminator: continues into the next
+     * QEMU TB via the chain assembler. */
+    if (frag_start < n_insns) {
+        out.push_back({frag_start, n_insns - frag_start,
+                       TB_TERMINUS_NONE});
     }
-    return TB_TERMINUS_NONE;
 }
 
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
@@ -1333,13 +1525,6 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         return;
     }
     struct qemu_plugin_insn *first_insn = qemu_plugin_tb_get_insn(tb, 0);
-    struct qemu_plugin_insn *last_insn = qemu_plugin_tb_get_insn(tb,
-                                                                  raw_n_insns - 1);
-    uint64_t last_insn_pc = qemu_plugin_insn_vaddr(last_insn);
-    size_t last_insn_size = qemu_plugin_insn_size(last_insn);
-    uint64_t fall_through = last_insn_pc + last_insn_size;
-    uint64_t tb_terminus = TB_TERMINUS_NONE;
-    BBTemplate *existing_tmpl;
 
     uint64_t *insn_pcs = g_new0(uint64_t, raw_n_insns);
     qemu_plugin_insn_info *insn_info =
@@ -1405,61 +1590,220 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     }
 
     /*
-     * Classify how THIS TB contributes to true-BB assembly, straight
-     * from its own decoded insns.  NEVER read this off a cached
-     * template: tb_map_ is keyed by start_pc alone, two TBs at one
-     * start_pc can have different content, and the cache returns
-     * whichever landed first — not necessarily the one being
-     * translated now.  The chain assembler folds the per-TB terminus
-     * into true BBs (see classify_tb_terminus / BBChainAssembler).
+     * Detect non-stable "instruction" memory before committing this TB
+     * as a fragment.  Two independent signals:
+     *
+     *   1. Capstone decode failure on any canonical insn (empty
+     *      mnemonic): the bytes don't parse as a valid instruction of
+     *      this ISA.  Cannot be real code.
+     *
+     *   2. Byte change since the first sighting of this VA: the same
+     *      address now reads different bytes than the last time the
+     *      tracer saw it.  Real code does not change (no
+     *      self-modification in this workload); writable memory
+     *      (stack, heap, .bss) does.
+     *
+     * Either signal poisons the TB's start_pc — the WP walker bails
+     * before re-entering, and subsequent translations short-circuit
+     * fragment creation here.  If the poisoning fires inside the main
+     * binary's text segment [g_code_start, g_code_end), warn once: that
+     * is a real SMC suspect, not WP wrong-pathing into data.
      */
-    tb_terminus = (uint64_t)classify_tb_terminus(insn_info,
-                                                 canonical_n_insns);
+    bool poison_tb = false;
+    uint64_t poison_pc = 0;
+    const char *poison_reason = nullptr;
+    bool poison_is_smc_signal = false;
 
     g_mutex_lock(&data_lock);
-    existing_tmpl = g_bb_template_cache.find_tb_template(pc);
+    if (g_poisoned_pcs.count(pc)) {
+        poison_tb = true;
+        poison_pc = pc;
+        poison_reason = "previously poisoned";
+    } else {
+        for (uint32_t ci = 0; ci < canonical_n_insns && !poison_tb; ci++) {
+            uint64_t ipc = insn_pcs[ci];
+            uint32_t word = 0;
+            memcpy(&word, &insn_bytes[(size_t)ci * MAX_INSN_BYTES],
+                   sizeof(word));
+            auto it = g_first_insn_word.find(ipc);
+            if (it != g_first_insn_word.end()) {
+                if (it->second != word) {
+                    poison_tb = true;
+                    poison_pc = ipc;
+                    poison_reason = "bytes changed since first sighting";
+                    /* Byte change at a stable VA is the only signal
+                     * that points specifically at self-modifying code.
+                     * Capstone decode failure on the other hand fires
+                     * on perfectly stable .rodata that the R-E LOAD
+                     * segment happens to cover (typical static
+                     * binaries place .text and .rodata in the same
+                     * R-E LOAD, so qemu_plugin_start_code/end_code
+                     * spans both) — that's WP wrong-pathing into
+                     * data, not SMC. */
+                    poison_is_smc_signal = true;
+                }
+            } else {
+                g_first_insn_word.emplace(ipc, word);
+            }
+            if (!poison_tb &&
+                cst_cap_arch >= 0 && !insn_info[ci].mnemonic[0]) {
+                poison_tb = true;
+                poison_pc = ipc;
+                poison_reason = "Capstone decode failure";
+            }
+        }
+        if (poison_tb) {
+            g_poisoned_pcs.insert(pc);
+        }
+    }
     g_mutex_unlock(&data_lock);
 
-    if (!existing_tmpl) {
-        const char *symbol_name = qemu_plugin_insn_symbol(first_insn);
-
-        g_mutex_lock(&data_lock);
-        BBTemplate *new_tmpl = g_bb_template_cache.get_or_create_tb_template(
-                                          pc,
-                                          canonical_n_insns,
-                                          insn_pcs,
-                                          insn_info,
-                                          insn_branch_target_pcs,
-                                          insn_sizes,
-                                          insn_bytes,
-                                          symbol_name, fall_through);
-        g_mutex_unlock(&data_lock);
-
-        tb_arm_new_template_cbs(tb, new_tmpl, insn_info, raw_n_insns,
-                                canonical_index, canonical_first,
-                                canonical_n_insns);
-    } else {
-        tb_rearm_known_template_cbs(tb, existing_tmpl, raw_n_insns,
-                                    canonical_index, canonical_first);
+    if (poison_tb) {
+        if (poison_is_smc_signal && cst_pc_in_code(poison_pc)) {
+            static std::atomic<int> warned{0};
+            int expected = 0;
+            if (warned.compare_exchange_strong(expected, 1)) {
+                fprintf(stderr,
+                    "champsim_tracer: WARNING in-text-segment "
+                    "instruction at 0x%" PRIx64 " %s — possible "
+                    "self-modifying code; suppressing fragment "
+                    "creation for TB at 0x%" PRIx64 ".  "
+                    "(Further occurrences suppressed.)\n",
+                    poison_pc, poison_reason, pc);
+            }
+        }
+        /* Drop all per-TB scratch; do not create fragments, do not arm
+         * callbacks.  vcpu_tb_exec gets no udata for this TB. */
+        g_free(insn_pcs);
+        g_free(insn_info);
+        g_free(insn_branch_target_pcs);
+        g_free(insn_sizes);
+        g_free(insn_bytes);
+        g_free(canonical_index);
+        g_free(canonical_first);
+        return;
     }
 
-    /* Instrument the block for execution tracking. */
+    /* Partition the TB's canonical insn stream at every non-final
+     * branch terminator.  TCG and Capstone don't always agree on
+     * which insns end control flow (e.g. MIPS conditional traps:
+     * TCG keeps translating past, Capstone classifies as a branch);
+     * the splitter is what reconciles that at the true-BB layer.
+     * Singleton TBs (no mid-TB branch) produce one spec, matching
+     * the pre-splitter behavior. */
+    std::vector<TbFragmentSpec> fragment_specs;
+    split_tb_into_fragments(insn_info, canonical_n_insns, fragment_specs);
+
+    /* Per-raw-insn local mapping into the current fragment's canonical
+     * index space.  Allocated once and reused per fragment.  For raw
+     * insns not in the current fragment, local_canonical_first is set
+     * to false so tb_arm_new_template_cbs skips them. */
+    uint32_t *local_canonical_index = g_new0(uint32_t, raw_n_insns);
+    bool     *local_canonical_first = g_new0(bool, raw_n_insns);
+
+    const char *tb_symbol_name = qemu_plugin_insn_symbol(first_insn);
+    BBTemplate *head_fragment = nullptr;
+    BBTemplate *prev_fragment = nullptr;
+
+    for (size_t f = 0; f < fragment_specs.size(); f++) {
+        const TbFragmentSpec &spec = fragment_specs[f];
+        uint32_t f_first_ci = spec.start_canonical;
+        uint32_t f_last_ci  = spec.start_canonical + spec.n_insns - 1;
+        uint64_t f_start_pc = insn_pcs[f_first_ci];
+        uint64_t f_fall_through =
+            insn_pcs[f_last_ci] + insn_sizes[f_last_ci];
+
+        /* Symbol-trigger matching keys off symbol_name on the head
+         * fragment only (matches the pre-splitter point of comparison
+         * against a TB start_pc). */
+        const char *frag_symbol =
+            (f == 0) ? tb_symbol_name : nullptr;
+
+        /* Every QEMU translation gets its own fresh template stream —
+         * no start_pc dedup.  Per fragment, an exact-shape template
+         * is attached to the QEMU TB via udata so vcpu_tb_exec walks
+         * the list and feeds the chain assembler only the fragments
+         * that actually executed, on both CP and WP paths. */
+        g_mutex_lock(&data_lock);
+        BBTemplate *frag_tmpl = g_bb_template_cache.create_tb_template(
+                                f_start_pc,
+                                spec.n_insns,
+                                &insn_pcs[f_first_ci],
+                                &insn_info[f_first_ci],
+                                &insn_branch_target_pcs[f_first_ci],
+                                &insn_sizes[f_first_ci],
+                                &insn_bytes[(size_t)f_first_ci *
+                                            MAX_INSN_BYTES],
+                                frag_symbol,
+                                f_fall_through);
+        frag_tmpl->terminus = (uint8_t)spec.terminus;
+        g_mutex_unlock(&data_lock);
+
+        if (!head_fragment) {
+            head_fragment = frag_tmpl;
+        }
+        if (prev_fragment) {
+            prev_fragment->next_tb_fragment = frag_tmpl;
+        }
+        prev_fragment = frag_tmpl;
+
+        /* Build the fragment-local canonical_index/first mask: raw
+         * insns inside [f_first_ci, f_last_ci] map to local canonical
+         * (ci - f_first_ci); raw insns outside have canonical_first
+         * cleared so tb_arm_new_template_cbs skips them entirely. */
+        size_t frag_first_raw = SIZE_MAX;
+        for (size_t i = 0; i < raw_n_insns; i++) {
+            uint32_t ci = canonical_index[i];
+            if (ci >= f_first_ci && ci <= f_last_ci) {
+                local_canonical_index[i] = ci - f_first_ci;
+                local_canonical_first[i] = canonical_first[i];
+                if (canonical_first[i] && ci == f_first_ci &&
+                    frag_first_raw == SIZE_MAX) {
+                    frag_first_raw = i;
+                }
+            } else {
+                local_canonical_index[i] = 0;
+                local_canonical_first[i] = false;
+            }
+        }
+
+        tb_arm_new_template_cbs(tb, frag_tmpl, &insn_info[f_first_ci],
+                                raw_n_insns, local_canonical_index,
+                                local_canonical_first, spec.n_insns);
+
+        /* Per-fragment scoreboard inline stores at the fragment's
+         * first raw insn.  The LAST fragment whose store fires before
+         * the next QEMU TB's vcpu_tb_exec wins — that is exactly the
+         * last-executed fragment, since a trap mid-TB prevents later
+         * fragments' first-insn stores from firing. */
+        if (frag_first_raw != SIZE_MAX) {
+            struct qemu_plugin_insn *frag_first_insn =
+                qemu_plugin_tb_get_insn(tb, frag_first_raw);
+            qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
+                frag_first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
+                g_scoreboard.prev_start_pc, f_start_pc);
+            qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
+                frag_first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
+                g_scoreboard.prev_fall_through, f_fall_through);
+            qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
+                frag_first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
+                g_scoreboard.prev_bb_terminus,
+                (uint64_t)spec.terminus);
+        }
+    }
+
+    g_free(local_canonical_index);
+    g_free(local_canonical_first);
+
+    /* Instrument the block for execution tracking.  current_pc is set
+     * per-TB-exec to the TB's start_pc (== head fragment's start_pc).
+     * udata = head fragment; vcpu_tb_exec walks the list. */
     qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
         tb, QEMU_PLUGIN_INLINE_STORE_U64, g_scoreboard.current_pc, pc);
 
     qemu_plugin_register_vcpu_tb_exec_cb(
         tb, vcpu_tb_exec, QEMU_PLUGIN_CB_RW_REGS,
-        (void *)(uintptr_t)canonical_n_insns);
-
-    qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
-        first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
-        g_scoreboard.prev_start_pc, pc);
-    qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
-        first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
-        g_scoreboard.prev_fall_through, fall_through);
-    qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
-        first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
-        g_scoreboard.prev_bb_terminus, tb_terminus);
+        (void *)head_fragment);
 
     g_free(insn_pcs);
     g_free(insn_info);
@@ -1496,11 +1840,24 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
     }
 
     /* Drop the partial BB: preserving it across a flush would risk
-     * splicing pre- and post-flush fragments. */
+     * splicing pre- and post-flush fragments.  The chain and any in-
+     * flight WP walker hold raw BBTemplate* into tb_templates_, so
+     * reset them first; then it is safe to drop the TB-template
+     * ownership (QEMU has invalidated the TBs that hold these
+     * templates via per-TB udata). */
     g_mutex_lock(&data_lock);
     g_cp_chain.reset();
     g_mem_recorder.clear_cp();
     pending_reg_snaps.clear();
+    g_cp_prev_tb_template = nullptr;
+    g_wp_state.last_executed_tb = nullptr;
+    g_bb_template_cache.clear_tb_templates();
+    /* Drop the bytes/poison caches with the rest of per-translation
+     * state: after a tb_flush QEMU re-translates every TB, and we want
+     * the bytes-changed-since check to start fresh (otherwise a
+     * legitimate flush+retranslate would falsely poison every PC). */
+    g_first_insn_word.clear();
+    g_poisoned_pcs.clear();
     g_mutex_unlock(&data_lock);
 
     g_mutex_unlock(&exec_lock);

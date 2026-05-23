@@ -54,6 +54,11 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     bool early_exit = false;
     uint64_t last_fault_pc = UINT64_MAX;
     unsigned int repeated_fault_pc = 0;
+    /* Set when the previously appended TB ended with a bare delay-
+     * slot branch (TB_TERMINUS_BARE_BRANCH): its delay slot lives in
+     * the NEXT TB, so the BB is not yet complete.  Cleared when the
+     * next TB is appended, signalling the BB-complete commit. */
+    bool awaiting_delay_slot = false;
 
     struct qemu_plugin_cpu_state *saved_state = qemu_plugin_cpu_state_save();
     if (!saved_state) {
@@ -171,6 +176,21 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         BBTemplate *tmpl = nullptr;
         bool tb_ok;
 
+        /* Refuse to speculate into a previously-poisoned PC.  A PC
+         * gets poisoned when vcpu_tb_trans detects either a Capstone
+         * decode failure or a bytes-changed-since-first-sighting at
+         * any of the TB's canonical insns — both signals that the
+         * region is dynamic data, not real code.  Drop the in-flight
+         * accumulator and end this WP simulation; chain so far is
+         * preserved. */
+        if (cst_pc_is_poisoned(pre_pc)) {
+            clear_accum();
+            bb_reg_snaps.clear();
+            poisoned_targets.insert(pre_pc);
+            early_exit = true;
+            break;
+        }
+
         /* Forward-progress guard.  An x86 REP iter in spec mode can
          * decrement RCX while the sandboxed write keeps PC anchored, so
          * exec_tb returns without advancing PC; dedup skips appending
@@ -184,7 +204,11 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             same_pre_pc_count = 1;
         }
         if (same_pre_pc_count > CST_FID_SLOT_COUNT) {
-            BBTemplate *stuck = g_bb_template_cache.find_tb_template(pre_pc);
+            /* Stuck on the same pre_pc: the previous iteration's
+             * exec_tb ran a TB starting at pre_pc, so its first
+             * insn's size is what we need to step past.  Fall back
+             * to 1 if no exec_tb has happened on this WP sim yet. */
+            BBTemplate *stuck = g_wp_state.last_executed_tb;
             uint8_t isz = (stuck && stuck->n_insns > 0)
                 ? stuck->insn_sizes[0] : 1;
             qemu_plugin_set_pc(pre_pc + isz);
@@ -203,35 +227,18 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         }
 
         /*
-         * Drive iteration from the true-BB template, not the per-
-         * translation TB template.  QEMU translates with different
-         * cflags for CP (chained, normal) vs qemu_plugin_exec_tb
-         * (CF_NO_GOTO_TB + CF_SINGLE_STEP + CF_FORCE_SLOW), producing
-         * DIFFERENT TBs at the same start_pc.  Our tb_map_ is keyed
-         * by start_pc alone, so whichever translation landed first
-         * sticks — and it's not necessarily the one that just ran.
-         * The result is bb_pcs missing insns (when the cached TB is
-         * a fragment of what just executed) or carrying stale ones
-         * (when the cached TB has trailing insns that didn't run),
-         * which then spill into the next BB's accumulator and the
-         * WP chain skips a block.
-         *
-         * The true-BB cache (bb_map_) is the canonical unit — it's a
-         * branch-terminated assembly of one or more TB fragments,
-         * committed by cp_chain.finalize on CP runs and by this WP
-         * simulator below via commit_true_bb_refs.  By the time WP
-         * simulates from a previously-executed entry, bb_map_ already
-         * has the full BB.  Use it.
-         *
-         * Fall back to tb_tmpl only when bb_map_ misses — first time
-         * any path (CP or WP) sees this entry.  After the first WP
-         * commit_true_bb_refs below, future iterations hit bb_map_.
+         * Drive iteration from the true-BB cache when bb_map_ has the
+         * canonical, branch-terminated assembly at pre_pc.  Otherwise
+         * fall through to qemu_plugin_exec_tb and pick up the exact-
+         * shape template of the TB that just ran from
+         * g_wp_state.last_executed_tb — set by vcpu_tb_exec from its
+         * own per-TB udata, symmetric with how the CP path picks up
+         * its current TB.  No start_pc lookup is involved: the WP-mode
+         * and CP-mode QEMU translations of the same start_pc each
+         * carry their own template and cannot conflate.
          */
         g_mutex_lock(&data_lock);
         tmpl = g_bb_template_cache.find_bb_template(pre_pc);
-        if (!tmpl) {
-            tmpl = g_bb_template_cache.find_tb_template(pre_pc);
-        }
         g_mutex_unlock(&data_lock);
 
         /*
@@ -244,15 +251,11 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
          * is visible — identical to a wide post-fragment snap, so
          * dropping the wide path costs no correctness.
          */
+        g_wp_state.last_executed_tb = nullptr;
         tb_ok = qemu_plugin_exec_tb();
 
         if (!tmpl) {
-            g_mutex_lock(&data_lock);
-            tmpl = g_bb_template_cache.find_bb_template(pre_pc);
-            if (!tmpl) {
-                tmpl = g_bb_template_cache.find_tb_template(pre_pc);
-            }
-            g_mutex_unlock(&data_lock);
+            tmpl = g_wp_state.last_executed_tb;
         }
 
         if (!tmpl) {
@@ -263,321 +266,413 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         }
 
         /*
-         * Determine how many insns of @tmpl actually ran in this
-         * exec_tb call.  @tmpl is the true-BB (or, on a true-BB
-         * miss, a TB fragment); @post_pc is where execution landed.
+         * Walk the fragment list produced by the mid-TB-branch
+         * splitter (see split_tb_into_fragments).  A single
+         * exec_tb may execute multiple fragments (no trap, control
+         * flows through), or only a prefix (trap fires mid-TB, or a
+         * fragment's branch terminator fires).  We process each
+         * fragment that ran, appending its insns and checking
+         * bb_complete after each one — multiple BB commits per
+         * exec_tb call are possible when one TB contains multiple
+         * branch terminators.
          *
-         * QEMU may translate a true-BB as several TBs, so one
-         * exec_tb can run only a PREFIX of @tmpl.  Discriminate:
+         * For singleton TBs (no mid-TB branch) and true-BB cache
+         * hits, next_tb_fragment is nullptr so the loop runs once
+         * with identical behavior to the pre-splitter walker.
          *
-         *   - @post_pc lands ON one of @tmpl's own insn PCs (past
-         *     the entry): exec_tb stopped inside the BB — a fragment
-         *     exit, with more of the BB still to run.  Insns before
-         *     that PC ran; n_executed = that insn's index.
-         *
-         *   - @post_pc is anything else: the BB's terminator branch
-         *     fired and PC left the BB.  This covers BOTH a taken
-         *     branch (post_pc = target) AND a not-taken branch
-         *     (post_pc = the NEXT BB's start — never one of THIS
-         *     BB's PCs).  The whole BB ran; n_executed = n_insns.
-         *
-         * Matching post_pc against the *sequential* next-PC would be
-         * wrong: a not-taken MIPS branch's fall-through equals the
-         * delay slot's sequential next-PC, which would truncate the
-         * count by one and drop the branch terminator.  Matching the
-         * BB's own insn PCs avoids that — the fall-through target is
-         * outside the BB.  i starts at 1 so a loop-back-to-entry
-         * (post_pc == insn_pcs[0]) reads as a full run, not zero.
-         *
-         * On fault (tb_ok=false), the fault-PC matching below caps
-         * n_executed to fault_idx + 1 instead.
+         * @post_pc_now is where execution actually landed; the
+         * matching logic below identifies which fragment that PC
+         * sits inside.  Fragments fully past @post_pc_now in the
+         * chain ran completely; the fragment containing @post_pc_now
+         * partially ran and ends the walk.  On fault (!tb_ok), the
+         * fault_pc match plays the same role.
          */
         uint64_t post_pc_now = qemu_plugin_get_pc();
-        uint32_t n_executed_in_tmpl = tmpl->n_insns;
-        if (tb_ok) {
-            for (uint32_t i = 1; i < tmpl->n_insns; i++) {
-                if (tmpl->insn_pcs[i] == post_pc_now) {
-                    n_executed_in_tmpl = i;
-                    break;
-                }
-            }
-        }
-        if (!tb_ok) {
-            uint64_t fault_pc = qemu_plugin_get_pc();
-            uint32_t fault_idx_in_tmpl = UINT32_MAX;
-            /* Direct match: fault_pc IS one of the TB's insn PCs
-             * (speculation faulted on insn k before retiring it). */
-            for (uint32_t i = 0; i < tmpl->n_insns; i++) {
-                if (tmpl->insn_pcs[i] == fault_pc) {
-                    fault_idx_in_tmpl = i;
-                    break;
-                }
-            }
-            /* Post-completion match: fault_pc == insn_pc + insn_size
-             * for some insn k (QEMU advanced PC past insn k as part of
-             * executing it — canonical for syscall: SVC/ECALL retires,
-             * the handler fails out of spec mode, PC = SVC_PC + size).
-             * Without this fallback the chain truncates and every wrong
-             * path's exit-block tail is invisible. */
-            if (fault_idx_in_tmpl == UINT32_MAX) {
-                for (uint32_t i = 0; i < tmpl->n_insns; i++) {
-                    uint64_t post = tmpl->insn_pcs[i] + tmpl->insn_sizes[i];
-                    if (post == fault_pc) {
-                        fault_idx_in_tmpl = i;
+        bool fault_consumed = false;
+        bool walk_done = false;
+
+        for (BBTemplate *cur = tmpl; cur != nullptr && !walk_done;
+             cur = cur->next_tb_fragment) {
+            uint32_t n_executed_in_cur = cur->n_insns;
+            bool stop_after_this = false;
+            bool cur_is_fault_fragment = false;
+
+            if (tb_ok) {
+                /* Identify the fragment containing post_pc.  Match at
+                 * insn_pcs[i] for i >= 1 means execution stopped INSIDE
+                 * this fragment at insn i.  post_pc == insn_pcs[0] reads
+                 * as a full run (loop-back-to-entry), consistent with
+                 * the pre-splitter behavior.  No match means this
+                 * fragment ran fully and execution either continued
+                 * into the next fragment or left the TB. */
+                for (uint32_t i = 1; i < cur->n_insns; i++) {
+                    if (cur->insn_pcs[i] == post_pc_now) {
+                        n_executed_in_cur = i;
+                        stop_after_this = true;
                         break;
                     }
                 }
+            } else {
+                /* Fault path: locate fault_pc in this fragment.
+                 * Direct match (faulted before retiring insn k) or
+                 * post-completion match (faulted after retiring insn k:
+                 * e.g. SVC/ECALL retires then handler fails out of spec
+                 * mode, PC = SVC_PC + size).  If neither matches, the
+                 * fault is past this fragment — fragment ran fully,
+                 * keep walking. */
+                uint64_t fault_pc = post_pc_now;
+                uint32_t fault_idx = UINT32_MAX;
+                for (uint32_t i = 0; i < cur->n_insns; i++) {
+                    if (cur->insn_pcs[i] == fault_pc) {
+                        fault_idx = i;
+                        break;
+                    }
+                }
+                if (fault_idx == UINT32_MAX) {
+                    for (uint32_t i = 0; i < cur->n_insns; i++) {
+                        uint64_t post = cur->insn_pcs[i] +
+                                        cur->insn_sizes[i];
+                        if (post == fault_pc) {
+                            fault_idx = i;
+                            break;
+                        }
+                    }
+                }
+                if (fault_idx != UINT32_MAX) {
+                    n_executed_in_cur = fault_idx + 1;
+                    stop_after_this = true;
+                    cur_is_fault_fragment = true;
+                    fault_consumed = true;
+                }
             }
-            if (fault_idx_in_tmpl == UINT32_MAX) {
-                /* Fault PC truly outside the TB.  Give up the chain
-                 * rather than guess; this is a real abnormal exit
-                 * (e.g. translation-unavailable cousin). */
-                clear_accum();
-                bb_reg_snaps.clear();
+
+            uint32_t bb_idx_base = (uint32_t)bb_pcs.size();
+            if (bb_pcs.empty()) {
+                /* New WP BB accumulator starts at THIS fragment's
+                 * start_pc.  Resetting here (not just at outer-iter
+                 * top) lets mid-iter commits — when one exec_tb's
+                 * fragments include multiple branch terminators —
+                 * each anchor their accumulated BB at the correct
+                 * fragment entry, instead of mis-attributing the
+                 * second fragment's BB to the outer iter's pre_pc. */
+                bb_start_pc = cur->start_pc;
+                if (cur->symbol_name) {
+                    bb_symbol_name = cur->symbol_name;
+                }
+            }
+            uint32_t appended_insns = 0;
+            for (uint32_t i = 0; i < n_executed_in_cur; i++) {
+                uint64_t insn_pc = cur->insn_pcs[i];
+                uint8_t isz = cur->insn_sizes[i];
+                bool duplicate = false;
+                if (!bb_pcs.empty()) {
+                    size_t prev = bb_pcs.size() - 1;
+                    duplicate = bb_pcs[prev] == insn_pc &&
+                                bb_sizes[prev] == isz &&
+                                memcmp(&bb_bytes[prev * MAX_INSN_BYTES],
+                                       &cur->insn_bytes[(size_t)i *
+                                                        MAX_INSN_BYTES],
+                                       MAX_INSN_BYTES) == 0;
+                }
+                if (duplicate) {
+                    continue;
+                }
+
+                bb_pcs.push_back(insn_pc);
+                bb_sizes.push_back(isz);
+                bb_bytes.insert(bb_bytes.end(),
+                                &cur->insn_bytes[i * MAX_INSN_BYTES],
+                                &cur->insn_bytes[i * MAX_INSN_BYTES] +
+                                MAX_INSN_BYTES);
+                bb_fields.push_back(&cur->insn_fields[i]);
+
+                /* WP-side per-execution attribution: mirrors the CP
+                 * walk in vcpu_tb_exec, scoped to non-duplicate WP
+                 * insns. */
+                {
+                    const InsnFields *f = &cur->insn_fields[i];
+                    stats.wp_insns_by_opcode[f->opcode]++;
+                    if (hist) hist->wp_insns_by_opcode[f->opcode]++;
+                    if (f->branch_type != BRANCH_NONE) {
+                        stats.wp_branches_by_type[f->branch_type]++;
+                        if (hist) hist->wp_branches_by_type[f->branch_type]++;
+                    }
+                    for (uint8_t k = 0; k < f->n_src_regs; k++) {
+                        stats.wp_src_reg_uses[f->src_regs[k]]++;
+                        if (hist) hist->wp_src_reg_uses[f->src_regs[k]]++;
+                    }
+                    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+                        stats.wp_dst_reg_writes[f->dst_regs[d]]++;
+                        if (hist) hist->wp_dst_reg_writes[f->dst_regs[d]]++;
+                    }
+                }
+
+                if (enable_reg_data) {
+                    bb_regnames.push_back(cur->insn_reg_names
+                                          ? &cur->insn_reg_names[i]
+                                          : &kEmptyRegNames);
+                }
+                if (enable_wp_reg_data) {
+                    /* Per-insn live read of only the dst regs this
+                     * insn writes from post-fragment state, not the
+                     * whole file. */
+                    g_reg_snaps.capture_insn_snaps_live(cpu_index, cur, i,
+                                                        bb_reg_snaps);
+                }
+                appended_insns++;
+            }
+            uint8_t last_insn_size = n_executed_in_cur > 0
+                ? cur->insn_sizes[n_executed_in_cur - 1]
+                : 0;
+
+            /*
+             * Budget accounting.  Charge AT LEAST 1 per exec_tb even
+             * when every appended insn dedup'd against the prior tail,
+             * else a self-looping single-insn REP TB spins forever
+             * (see the forward-progress guard above).  Only counted
+             * once per outer iter — first fragment to actually contribute.
+             */
+            if (cur == tmpl) {
+                sim_insns += appended_insns ? appended_insns : 1;
+            } else {
+                sim_insns += appended_insns;
+            }
+
+            /* Attribute mem accesses to this fragment's insns by
+             * matching insn_pc.  Only walk the @n_executed_in_cur
+             * prefix — mem callbacks past the fault / partial-exec
+             * boundary never fired. */
+            for (size_t m = mem_start_idx;
+                 m < g_wp_state.mem_accesses.size(); m++) {
+                const WPMemAccess &acc = g_wp_state.mem_accesses[m];
+                uint16_t insn_idx = (uint16_t)bb_idx_base;
+                bool matched = false;
+                for (uint32_t i = 0; i < n_executed_in_cur; i++) {
+                    if (cur->insn_pcs[i] == acc.insn_pc) {
+                        insn_idx = (uint16_t)(bb_idx_base + i);
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) {
+                    /* Memop belongs to a different fragment in this
+                     * exec_tb; the loop iteration for THAT fragment
+                     * will pick it up. */
+                    continue;
+                }
+                DynParam dp = {
+                    .type = (uint8_t)(acc.is_store ? DYN_STORE_ADDR
+                                                    : DYN_LOAD_ADDR),
+                    .insn_index = insn_idx,
+                    .value = acc.mem_vaddr,
+                    .data_size = acc.data_size,
+                    .data = acc.data,
+                };
+                bb_dyn_params.push_back(dp);
+                stats.wp_total_mem_accesses++;
+                if (hist) {
+                    hist->wp_total_mem_accesses++;
+                }
+            }
+
+            /* Per-fragment bb_complete computation.  Each fragment's
+             * terminus drives whether the in-flight WP BB completes
+             * now.  Mid-TB branch fragments (e.g. conditional traps
+             * with terminus=COMPLETE) commit their own BB here even
+             * though more fragments in this exec_tb may follow.
+             *
+             * branch_fired: the just-appended slice ended on a
+             *   branch-classified insn (used by the fault path to
+             *   distinguish "fault on a branch terminator" from
+             *   "fault on a middle insn").
+             * bb_complete: the in-flight WP BB is now complete and
+             *   ready to commit.  TB_TERMINUS_BARE_BRANCH (delay-slot
+             *   ISA, slot in next TB) defers completion until that
+             *   next-TB's first fragment lands here. */
+            bool branch_fired = false;
+            if (!bb_pcs.empty()) {
+                size_t last_local = bb_pcs.size() - 1;
+                branch_fired =
+                    (bb_fields[last_local]->branch_type != BRANCH_NONE);
+            }
+            bool bb_complete = false;
+            if (awaiting_delay_slot) {
+                awaiting_delay_slot = false;
+                bb_complete = true;
+            } else if (branch_fired) {
+                if (cur->terminus == TB_TERMINUS_BARE_BRANCH) {
+                    awaiting_delay_slot = true;
+                } else {
+                    bb_complete = true;
+                }
+            }
+
+            if (cur_is_fault_fragment) {
+                /* Trace past the fault.  bb_pcs has insns 0..fault for
+                 * this fragment.  Mark fault metadata for the BB
+                 * committed at the natural branch end; if the faulting
+                 * insn IS the branch terminator (e.g. faulting
+                 * BRANCH_SYSCALL_TYPE), branch_fired catches it and
+                 * the normal commit path handles bb_has_fault. */
+                uint64_t fault_pc = post_pc_now;
+
+                if (pre_pc == last_fault_pc) {
+                    repeated_fault_pc++;
+                } else {
+                    repeated_fault_pc = 0;
+                    last_fault_pc = pre_pc;
+                }
+
+                if (!bb_has_fault) {
+                    bb_has_fault = true;
+                    bb_first_fault_idx = bb_pcs.empty()
+                        ? 0 : (uint32_t)(bb_pcs.size() - 1);
+                }
+
+                poisoned_targets.insert(fault_pc);
+
+                /* Don't force-commit a BARE_BRANCH fragment that
+                 * faulted: its delay slot is in the next QEMU TB and
+                 * never landed here, so a commit now would write the
+                 * wrong (n-1 insns, no delay slot) shape into bb_map_
+                 * and collide with the natural full-BB shape from the
+                 * non-fault path.  Fall through to the skip-past-fault
+                 * branch so the next iter can re-attempt landing the
+                 * delay slot from skip_pc. */
+                bool bare_branch_pending = branch_fired &&
+                    cur->terminus == TB_TERMINUS_BARE_BRANCH;
+
+                if ((branch_fired || bb_complete) && !bare_branch_pending) {
+                    /* Force bb_complete so the post-fault commit fires
+                     * even when only the branch (no delay slot) ran. */
+                    bb_complete = true;
+                    awaiting_delay_slot = false;
+                } else {
+                    if (repeated_fault_pc >= 16) {
+                        early_exit = true;
+                        walk_done = true;
+                        break;
+                    }
+                    uint64_t skip_pc = fault_pc + last_insn_size;
+                    if (poisoned_targets.count(skip_pc)) {
+                        early_exit = true;
+                        walk_done = true;
+                        break;
+                    }
+                    qemu_plugin_spec_mode_end();
+                    qemu_plugin_cpu_state_restore(saved_state);
+                    qemu_plugin_spec_mode_begin(saved_state);
+                    qemu_plugin_set_pc(skip_pc);
+                    /* Skip the rest of this exec_tb's fragments and
+                     * resume the outer iter from skip_pc. */
+                    walk_done = true;
+                    /* `continue` would go to the next fragment; we
+                     * want to break out of the fragment loop and let
+                     * the outer iter `continue` semantic apply.  The
+                     * outer loop's per-iter setup re-reads pre_pc. */
+                    break;
+                }
+            }
+
+            if (!bb_complete) {
+                if (stop_after_this) {
+                    walk_done = true;
+                }
+                continue;
+            }
+
+            /* Branch fired: commit completed BB.  Still a true
+             * branch-bounded BB (basic_block.md), so it goes into
+             * bb_map_ unconditionally; bb_has_fault carries any
+             * earlier in-BB fault and the WPBBEntry's fault flag
+             * tells the consumer speculation would have squashed at
+             * fault_insn_index. */
+            uint64_t commit_post_pc;
+            if (cur->next_tb_fragment) {
+                /* Mid-TB fragment whose branch we just classified as
+                 * fired: by construction (only the trap-fires path
+                 * stops the walk via fault_consumed) we never reach
+                 * here for a no-trap intermediate; if execution did
+                 * continue past this fragment, branch_fired wouldn't
+                 * really have fired and we'd not be on this code
+                 * path.  Use the next fragment's start_pc as the
+                 * landing point. */
+                commit_post_pc = cur->next_tb_fragment->start_pc;
+            } else {
+                commit_post_pc = post_pc_now;
+            }
+            repeated_fault_pc = 0;
+            last_fault_pc = UINT64_MAX;
+
+            uint64_t fall_through = pre_pc + last_insn_size;
+
+            g_mutex_lock(&data_lock);
+            BBTemplate *bb_tmpl = g_bb_template_cache.commit_true_bb_refs(
+                bb_start_pc, (uint32_t)bb_pcs.size(),
+                bb_pcs.data(),
+                bb_fields.data(),
+                bb_sizes.data(),
+                bb_bytes.data(),
+                enable_reg_data ? bb_regnames.data() : nullptr,
+                bb_symbol_name, fall_through);
+            g_mutex_unlock(&data_lock);
+
+            /*
+             * Record the terminal-branch taken edge for NON-indirect
+             * branches found on the wrong path (see the pre-splitter
+             * comment).
+             */
+            if (bb_tmpl && bb_tmpl->taken_pc == 0 && !bb_fields.empty()) {
+                const InsnFields *lf = bb_fields.back();
+                bool indirect =
+                    lf->branch_type == BRANCH_INDIRECT_JUMP ||
+                    lf->branch_type == BRANCH_RETURN;
+                if (!indirect) {
+                    bool cond = lf->branch_type == BRANCH_COND_DIRECT ||
+                                (lf->branch_type == BRANCH_DIRECT_JUMP &&
+                                 lf->branch_conditional);
+                    uint64_t taken;
+                    if (commit_post_pc != fall_through) {
+                        taken = commit_post_pc;
+                    } else if (cond && lf->has_immediate &&
+                               (uint64_t)lf->immediate != fall_through) {
+                        taken = (uint64_t)lf->immediate;
+                    } else {
+                        taken = commit_post_pc;
+                    }
+                    if (taken != 0) {
+                        bb_tmpl->taken_pc = taken;
+                    }
+                }
+            }
+
+            wp_chain.push_back(make_wp_entry(bb_tmpl,
+                                             bb_has_fault,
+                                             bb_first_fault_idx));
+
+            clear_accum();
+
+            if (poisoned_targets.count(commit_post_pc)) {
                 early_exit = true;
+                walk_done = true;
                 break;
             }
-            n_executed_in_tmpl = fault_idx_in_tmpl + 1;
-        }
 
-        uint32_t bb_idx_base = (uint32_t)bb_pcs.size();
-        if (bb_pcs.empty() && tmpl->symbol_name) {
-            bb_symbol_name = tmpl->symbol_name;
-        }
-        uint32_t appended_insns = 0;
-        for (uint32_t i = 0; i < n_executed_in_tmpl; i++) {
-            uint64_t insn_pc = tmpl->insn_pcs[i];
-            uint8_t isz = tmpl->insn_sizes[i];
-            bool duplicate = false;
-            if (!bb_pcs.empty()) {
-                size_t prev = bb_pcs.size() - 1;
-                duplicate = bb_pcs[prev] == insn_pc &&
-                            bb_sizes[prev] == isz &&
-                            memcmp(&bb_bytes[prev * MAX_INSN_BYTES],
-                                   &tmpl->insn_bytes[(size_t)i *
-                                                     MAX_INSN_BYTES],
-                                   MAX_INSN_BYTES) == 0;
-            }
-            if (duplicate) {
-                continue;
-            }
-
-            bb_pcs.push_back(insn_pc);
-            bb_sizes.push_back(isz);
-            bb_bytes.insert(bb_bytes.end(),
-                            &tmpl->insn_bytes[i * MAX_INSN_BYTES],
-                            &tmpl->insn_bytes[i * MAX_INSN_BYTES] + MAX_INSN_BYTES);
-            bb_fields.push_back(&tmpl->insn_fields[i]);
-
-            /* WP-side per-execution attribution: mirrors the CP walk in
-             * vcpu_tb_exec, scoped to non-duplicate WP insns. */
-            {
-                const InsnFields *f = &tmpl->insn_fields[i];
-                stats.wp_insns_by_opcode[f->opcode]++;
-                if (hist) hist->wp_insns_by_opcode[f->opcode]++;
-                if (f->branch_type != BRANCH_NONE) {
-                    stats.wp_branches_by_type[f->branch_type]++;
-                    if (hist) hist->wp_branches_by_type[f->branch_type]++;
-                }
-                for (uint8_t k = 0; k < f->n_src_regs; k++) {
-                    stats.wp_src_reg_uses[f->src_regs[k]]++;
-                    if (hist) hist->wp_src_reg_uses[f->src_regs[k]]++;
-                }
-                for (uint8_t d = 0; d < f->n_dst_regs; d++) {
-                    stats.wp_dst_reg_writes[f->dst_regs[d]]++;
-                    if (hist) hist->wp_dst_reg_writes[f->dst_regs[d]]++;
-                }
-            }
-
-            if (enable_reg_data) {
-                bb_regnames.push_back(tmpl->insn_reg_names
-                                      ? &tmpl->insn_reg_names[i]
-                                      : &kEmptyRegNames);
-            }
-            if (enable_wp_reg_data) {
-                /* Per-insn live read of only the dst regs this insn
-                 * writes from post-fragment state, not the whole file. */
-                g_reg_snaps.capture_insn_snaps_live(cpu_index, tmpl, i,
-                                                    bb_reg_snaps);
-            }
-            appended_insns++;
-        }
-        uint8_t last_insn_size = n_executed_in_tmpl > 0
-            ? tmpl->insn_sizes[n_executed_in_tmpl - 1]
-            : 0;
-
-        /*
-         * Budget accounting.  CF_SINGLE_STEP only stops rep-prefixed
-         * insns from looping internally on x86; it does NOT cap TB
-         * length to 1 insn (CF_COUNT_MASK is zero, so tb_gen_code uses
-         * max_insns = TCG_MAX_INSNS).  Charge AT LEAST 1 per exec_tb
-         * even when every appended insn dedup'd against the prior tail,
-         * else a self-looping single-insn REP TB spins forever (see the
-         * forward-progress guard above).
-         */
-        sim_insns += appended_insns ? appended_insns : 1;
-
-        /* Attribute mem accesses to fragment insns by matching insn_pc.
-         * Only walk the @n_executed_in_tmpl prefix — mem callbacks past
-         * the fault never fired and those insns aren't in bb_pcs. */
-        for (size_t m = mem_start_idx; m < g_wp_state.mem_accesses.size(); m++) {
-            const WPMemAccess &acc = g_wp_state.mem_accesses[m];
-            uint16_t insn_idx = (uint16_t)bb_idx_base;
-            for (uint32_t i = 0; i < n_executed_in_tmpl; i++) {
-                if (tmpl->insn_pcs[i] == acc.insn_pc) {
-                    insn_idx = (uint16_t)(bb_idx_base + i);
-                    break;
-                }
-            }
-            DynParam dp = {
-                .type = (uint8_t)(acc.is_store ? DYN_STORE_ADDR
-                                                : DYN_LOAD_ADDR),
-                .insn_index = insn_idx,
-                .value = acc.mem_vaddr,
-                .data_size = acc.data_size,
-                .data = acc.data,
-            };
-            bb_dyn_params.push_back(dp);
-            stats.wp_total_mem_accesses++;
-            if (hist) {
-                hist->wp_total_mem_accesses++;
+            if (stop_after_this) {
+                walk_done = true;
             }
         }
 
-        /* Guard against an appended-nothing iteration (every insn
-         * dedup'd against the prior tail): bb_pcs may be empty, so
-         * don't read bb_fields.back(). */
-        bool ends_in_branch = false;
-        if (!bb_pcs.empty()) {
-            size_t last_local = bb_pcs.size() - 1;
-            ends_in_branch =
-                (bb_fields[last_local]->branch_type != BRANCH_NONE);
-        }
-
-        if (!tb_ok) {
-            /* Trace past the fault.  bb_pcs has insns 0..fault (the
-             * @n_executed_in_tmpl cap stopped at the faulting insn).
-             * Mark fault metadata for the BB committed at the natural
-             * branch end, then skip past the faulting insn so later
-             * exec_tbs don't re-fault.  If the faulting insn IS the
-             * branch terminator (e.g. a faulting BRANCH_SYSCALL_TYPE
-             * syscall) ends_in_branch below catches it and the normal
-             * commit path handles it with bb_has_fault propagating;
-             * only branch-bounded true BBs ever reach commit_true_bb. */
-            uint64_t fault_pc = qemu_plugin_get_pc();
-
-            if (pre_pc == last_fault_pc) {
-                repeated_fault_pc++;
-            } else {
-                repeated_fault_pc = 0;
-                last_fault_pc = pre_pc;
-            }
-
-            if (!bb_has_fault) {
-                bb_has_fault = true;
-                bb_first_fault_idx = bb_pcs.empty()
-                    ? 0 : (uint32_t)(bb_pcs.size() - 1);
-            }
-
-            /* Poison the faulting PC: later iterations that jump back
-             * to it early-exit the chain. */
-            poisoned_targets.insert(fault_pc);
-
-            if (ends_in_branch) {
-                /* Fault on a branch-classified insn (e.g. syscall):
-                 * fall through to the normal commit path; bb_has_fault
-                 * carries the squash marker.  WP chain naturally
-                 * terminates here after a syscall. */
-            } else {
-                if (repeated_fault_pc >= 16) {
-                    early_exit = true;
-                    break;
-                }
-                uint64_t skip_pc = fault_pc + last_insn_size;
-                if (poisoned_targets.count(skip_pc)) {
-                    early_exit = true;
-                    break;
-                }
-                qemu_plugin_spec_mode_end();
-                qemu_plugin_cpu_state_restore(saved_state);
-                qemu_plugin_spec_mode_begin(saved_state);
-                qemu_plugin_set_pc(skip_pc);
-                continue;
-            }
-        }
-
-        if (!ends_in_branch) {
-            continue;
-        }
-
-        /* Branch fired: commit completed BB.  Still a true
-         * branch-bounded BB (basic_block.md) so it goes into bb_map_
-         * unconditionally; bb_has_fault carries any earlier in-BB fault
-         * and the WPBBEntry's fault flag tells the consumer speculation
-         * would have squashed at fault_insn_index. */
-        uint64_t post_pc = qemu_plugin_get_pc();
-        repeated_fault_pc = 0;
-        last_fault_pc = UINT64_MAX;
-
-        uint64_t fall_through = pre_pc + last_insn_size;
-
-        g_mutex_lock(&data_lock);
-        BBTemplate *bb_tmpl = g_bb_template_cache.commit_true_bb_refs(
-            bb_start_pc, (uint32_t)bb_pcs.size(),
-            bb_pcs.data(),
-            bb_fields.data(),
-            bb_sizes.data(),
-            bb_bytes.data(),
-            enable_reg_data ? bb_regnames.data() : nullptr,
-            bb_symbol_name, fall_through);
-        g_mutex_unlock(&data_lock);
-
-        /*
-         * Record the terminal-branch taken edge for NON-indirect
-         * branches found on the wrong path.  Direct/conditional/
-         * unconditional taken targets are architecturally pre-defined,
-         * so legitimate even observed speculatively (@post_pc is the
-         * actual successor).  Indirect/return targets depend on
-         * speculative register state and are NOT legitimate on the
-         * wrong path — left to the CP-only BranchRecord pool.  Only
-         * fill when CP hasn't resolved it (CP stays authoritative;
-         * value identical anyway).
-         */
-        if (bb_tmpl && bb_tmpl->taken_pc == 0 && !bb_fields.empty()) {
-            const InsnFields *lf = bb_fields.back();
-            bool indirect =
-                lf->branch_type == BRANCH_INDIRECT_JUMP ||
-                lf->branch_type == BRANCH_RETURN;
-            if (!indirect) {
-                bool cond = lf->branch_type == BRANCH_COND_DIRECT ||
-                            (lf->branch_type == BRANCH_DIRECT_JUMP &&
-                             lf->branch_conditional);
-                uint64_t taken;
-                if (post_pc != fall_through) {
-                    taken = post_pc;            /* WP took the branch */
-                } else if (cond && lf->has_immediate &&
-                           (uint64_t)lf->immediate != fall_through) {
-                    /* Fell through a conditional → taken side is the
-                     * resolved target (same value the CP resolver
-                     * uses), not the raw-relative immediate. */
-                    taken = (uint64_t)lf->immediate;
-                } else {
-                    taken = post_pc;            /* uncond → fall_through */
-                }
-                if (taken != 0) {
-                    bb_tmpl->taken_pc = taken;
-                }
-            }
-        }
-
-        wp_chain.push_back(make_wp_entry(bb_tmpl,
-                                         bb_has_fault,
-                                         bb_first_fault_idx));
-
-        clear_accum();
-
-        if (poisoned_targets.count(post_pc)) {
+        if (!tb_ok && !fault_consumed && !walk_done) {
+            /* Fault PC truly outside the TB.  Give up the chain
+             * rather than guess; this is a real abnormal exit
+             * (e.g. translation-unavailable cousin). */
+            clear_accum();
+            bb_reg_snaps.clear();
             early_exit = true;
+            break;
+        }
+        if (early_exit) {
             break;
         }
     }

@@ -1,19 +1,24 @@
 /*
  * Wrong-Path Tracing Plugin — BB template cache.
  *
- * Owns two hash tables of BBTemplate records:
- *   - tb_map: per-TB fragment templates keyed by TB start_pc (the unit
- *     from vcpu_tb_trans; looked up from vcpu_tb_exec / wp.cc).
- *   - bb_map: true-BB templates keyed by BB start_pc, assembled from
+ * Owns two distinct stores of BBTemplate records:
+ *   - tb_templates_: per-translation TB templates, pure ownership (no
+ *     start_pc lookup).  Each QEMU translation creates a fresh entry
+ *     and the template pointer is handed to that QEMU TB as its
+ *     per-TB exec-cb udata.  vcpu_tb_exec reads it back directly on
+ *     both CP and WP paths, so distinct CP-mode and WP-mode QEMU
+ *     translations of the same start_pc cannot conflate.  Cleared
+ *     together on tb_flush, when QEMU drops the TBs themselves.
+ *   - bb_map_: true-BB templates keyed by BB start_pc, assembled from
  *     TB fragments; what the trace's templates section serializes.
  *
  * Templates are immutable once committed.  The cache owns the heap
  * records and frees their inner arrays via a custom unique_ptr deleter.
  *
  * Unsynchronised: callers hold data_lock around mutators
- * (commit_true_bb, get_or_create_*) and around read-only methods
- * (find_*, *_count, for_each_bb, template_branch_index) if a concurrent
- * mutator could be running.
+ * (commit_true_bb, create_tb_template) and around read-only methods
+ * (find_bb_template, *_count, for_each_bb, template_branch_index) if a
+ * concurrent mutator could be running.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -41,17 +46,21 @@ public:
     BBTemplateCache(const BBTemplateCache &) = delete;
     BBTemplateCache &operator=(const BBTemplateCache &) = delete;
 
-    /* Per-TB fragment templates. */
-    BBTemplate *find_tb_template(uint64_t start_pc);
-    BBTemplate *get_or_create_tb_template(uint64_t start_pc,
-                                          uint32_t n_insns,
-                                          uint64_t *insn_pcs,
-                                          qemu_plugin_insn_info *insn_info,
-                                          const uint64_t *insn_branch_target_pcs,
-                                          uint8_t *insn_sizes,
-                                          uint8_t *insn_bytes,
-                                          const char *symbol_name,
-                                          uint64_t fall_through_pc);
+    /* Create a fresh per-translation TB template.  Always allocates
+     * (no start_pc dedup) and stores the BBTemplatePtr in
+     * tb_templates_ for the QEMU TB's lifetime.  The returned raw
+     * pointer is what vcpu_tb_trans attaches to the QEMU TB as its
+     * per-TB exec-cb udata; vcpu_tb_exec reads it back as the current
+     * TB's exact-shape template on both CP and WP paths. */
+    BBTemplate *create_tb_template(uint64_t start_pc,
+                                   uint32_t n_insns,
+                                   uint64_t *insn_pcs,
+                                   qemu_plugin_insn_info *insn_info,
+                                   const uint64_t *insn_branch_target_pcs,
+                                   uint8_t *insn_sizes,
+                                   uint8_t *insn_bytes,
+                                   const char *symbol_name,
+                                   uint64_t fall_through_pc);
 
     /* True basic blocks. */
     BBTemplate *find_bb_template(uint64_t entry_pc);
@@ -101,12 +110,20 @@ public:
     static int template_branch_index(const BBTemplate *tmpl);
 
     /* Drop all true-BB templates so the next segment serializes only
-     * BBs reached after this point.  tb_map_ is preserved: QEMU issues
-     * vcpu_tb_trans only on first translation, so dropping fragments
-     * would orphan the chain assembler on re-execution of a translated
-     * TB.  True-BBs are re-assembled at runtime from those fragments,
-     * so clearing bb_map_ alone is safe. */
+     * BBs reached after this point.  tb_templates_ is preserved
+     * across segment switches: each QEMU TB carries its template via
+     * the per-TB exec-cb udata for the QEMU TB's lifetime, and
+     * clearing the ownership list would leave that udata dangling.
+     * Cleared by clear_tb_templates() on tb_flush, when QEMU drops
+     * the TBs themselves. */
     void clear_bb_map();
+
+    /* Drop ownership of every TB template.  Called from the tb_flush
+     * callback after QEMU has invalidated the TBs that hold these
+     * templates via per-TB udata; any in-flight CP chain or WP
+     * walker holding raw BBTemplate* into tb_templates_ must be
+     * reset first. */
+    void clear_tb_templates();
 
 private:
     /* Shared existing-true-BB handling for commit_true_bb and its
@@ -122,7 +139,7 @@ private:
                                       const uint64_t *insn_pcs,
                                       bool candidate_tail_swapped);
 
-    std::unordered_map<uint64_t, BBTemplatePtr> tb_map_;
+    std::vector<BBTemplatePtr>                  tb_templates_;
     std::unordered_map<uint64_t, BBTemplatePtr> bb_map_;
     uint32_t                                    next_template_id_ = 1;
 };

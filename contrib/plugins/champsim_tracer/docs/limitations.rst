@@ -39,17 +39,24 @@ internals, and the resulting traces have not been validated.  A
 trace from a forking workload should be treated as best-effort
 until the body stream is confirmed to cover the path of interest.
 
-**Self-modifying code (SMC).**  The plugin emits a one-shot
-"differing insn sequence" warning to stderr when ``commit_true_bb``
-sees a true BB at a known ``start_pc`` whose instruction sequence
-no longer matches the cache.  After the warning, the plugin keeps
-using the *first* observed template — newer instructions at that
-PC are ignored.  Workloads that genuinely modify their own code
-(JIT compilers replacing trace fragments, dynamic patchers) will
-produce traces that under-describe their later behavior.  No
-graceful workaround exists; if your workload SMCs heavily,
-the trace's templates section is a snapshot of the first-seen
-program text at each ``start_pc``.
+**Self-modifying code (SMC).**  Translation-time poison detection
+(see :ref:`poison-detection` in the architecture doc) catches both
+the *real* SMC case and the *wrong-path-into-data* case at the
+fragment-creation boundary.  Two stability signals are checked on
+every canonical insn before the splitter materializes a fragment:
+a Capstone decode failure, and a 4-byte-instruction-word change
+against the first sighting at that PC.  Either signal poisons the
+TB's ``start_pc``; the fragment is not created, the WP walker
+refuses to re-enter that PC, and (only when the poisoned PC is
+inside the main binary's text segment) the plugin emits a one-shot
+SMC-suspect warning to stderr.  Workloads that genuinely modify
+their own code (JIT compilers replacing trace fragments, dynamic
+patchers) will surface that warning and lose later behaviour at the
+modified addresses — the templates section snapshots the first-seen
+program text at each ``start_pc``.  Out-of-text-segment poisoning
+fires silently because the symptom is "WP wrong-pathed into data,"
+which is normal speculative behaviour the tracer just refuses to
+record.
 
 Hard bounds at a glance
 -----------------------
@@ -253,3 +260,17 @@ records are not perturbed.  Studies that need an exact
 byte-stable WP record stream (e.g., comparing two trace
 decoders, validating an encoder change) should diff CP-only or
 use ``wp=0``.
+
+**Adjacent invariant: true-BB SHAPES *are* deterministic.**  A
+separate flavour of WP non-determinism — multiple distinct
+"true-BB" shapes committed at the same ``start_pc`` because the
+speculator wandered into stack / heap / data and decoded *bytes*
+as "instructions" — has been eliminated.  The translation-time
+poison detector (see :ref:`poison-detection` in the architecture
+doc) catches both Capstone decode failures and
+bytes-changed-since-first-sighting before any divergent fragment
+can reach the chain assembler, so the BB cache stays canonical
+regardless of which WP path discovers a given ``start_pc``.  The
+residual byte-level non-determinism above is data-only (load
+values, store values, register snapshots) and operates over
+*real, decoded code* — the BB shapes themselves are stable.

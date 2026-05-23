@@ -42,6 +42,14 @@ struct WPThreadState {
     uint64_t saved_prev_start_pc = 0;
     uint64_t saved_prev_fall_through = 0;
     uint64_t saved_prev_bb_terminus = 0;
+
+    /* Template of the TB the WP simulator most recently ran via
+     * qemu_plugin_exec_tb.  Set by vcpu_tb_exec from its own per-TB
+     * udata in the WP-mode early-out.  The WP walker reads this
+     * after each exec_tb to get the exact-shape template that
+     * actually executed — symmetric with how the CP path picks up
+     * its current TB. */
+    BBTemplate *last_executed_tb = nullptr;
 };
 
 extern thread_local WPThreadState g_wp_state;

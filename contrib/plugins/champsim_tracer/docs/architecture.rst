@@ -288,47 +288,75 @@ artificial stop condition: a branch, an instruction-count limit, a
 page boundary, a side-exit hint, or simply a TCG ``goto_tb`` chain
 break.  TBs are *not* basic blocks — a single architectural basic
 block can be split across two or more TBs (the most common cause is
-the page-boundary check), and TBs are keyed in QEMU's translation
-cache by ``(pc, cs_base, flags, cflags)`` so the same code at the
-same PC can have multiple distinct translations alive at once.  The
-plugin sees one TB per ``vcpu_tb_trans`` callback, with one
-``vcpu_tb_exec`` per execution.  Observed TBs are stored in
-``tb_map_`` (the *fragment* cache), keyed by TB start_pc.
+the page-boundary check), and the same QEMU TB can also contain
+*more than one* basic block when TCG keeps translating past an
+instruction the plugin classifies as a branch terminator (the
+canonical example is a MIPS conditional trap such as ``teq`` /
+``tgeu``: TCG treats it as a conditional fall-through and continues,
+while the trace must terminate a true BB at that instruction).
+TBs are keyed in QEMU's translation cache by
+``(pc, cs_base, flags, cflags)`` so the same code at the same PC can
+have multiple distinct translations alive at once.  The plugin sees
+one TB per ``vcpu_tb_trans`` callback, with one ``vcpu_tb_exec`` per
+execution.
+
+The translation-time **fragment splitter**
+(``split_tb_into_fragments``) reconciles the TCG-vs-tracer
+disagreement by partitioning the TB's canonical instruction stream at
+every non-final branch terminator.  A TB containing no mid-TB branch
+yields one fragment; a TB containing N mid-TB branches yields N+1
+fragments.  Each fragment is its own ``BBTemplate`` with its own
+``start_pc`` and one of three ``TbTerminus`` classes: ``COMPLETE``
+(self-contained, branch + delay-slot pair entirely in this fragment),
+``BARE_BRANCH`` (delay-slot ISA branch as the literal last
+instruction; its slot lives in the next QEMU TB), or ``NONE``
+(continuation fragment with no terminator).  Fragments produced from
+one QEMU TB are linked into a singly-linked list via
+``next_tb_fragment``; the per-TB exec-cb ``udata`` points at the head
+of the list, and both the correct-path walker
+(``vcpu_tb_exec``) and the wrong-path walker (``simulate_wrong_path_ext``)
+iterate the list to find the fragments that actually executed in
+this TB exec.  Templates produced by the splitter are owned by
+``tb_templates_`` (a vector — *not* a start_pc-keyed map; sibling
+translations of the same start_pc each get their own list and never
+conflate).
 
 **True basic block (true BB)** is the program-architectural unit:
 the run of instructions from a branch target up to and including the
 next branch, with no internal control-flow joins or splits.  A true
 BB is what the trace's templates section dumps and what every body
 ``ENTRY`` record references.  The plugin builds true BBs at runtime
-inside ``BBChainAssembler``: each ``vcpu_tb_exec`` appends the
-just-executed TB's fragment to the chain.  Every TB is classified
-— from its own decoded instructions, never a cached template — as
-one of ``TbTerminus``: completing a true BB, ending in a bare
-branch whose delay slot QEMU placed in the *next* TB, or merely
-continuing one.  When the chain forms a complete true BB the
-assembler seals it via ``commit_true_bb`` into ``bb_map_`` (the
-*true-BB* cache, keyed by the branch-target PC of the BB's entry).
-This is the cache whose contents are renumbered into template IDs
-and serialized to the trace.
+inside ``BBChainAssembler``: each ``vcpu_tb_exec`` walks the
+fragment list of the previously-executed QEMU TB up to the last-
+executed fragment (identified by the scoreboard's ``prev_start_pc``
+slot, which each fragment's first raw instruction writes via an
+inline store) and feeds those fragments to the chain.  When the
+chain forms a complete true BB the assembler seals it via
+``commit_true_bb`` into ``bb_map_`` (the *true-BB* cache, keyed by
+the branch-target PC of the BB's entry).  This is the cache whose
+contents are renumbered into template IDs and serialized to the trace.
 
 On a delay-slot ISA a branch and its delay slot can land in
 *separate* TBs — QEMU never lets a TB cross a page boundary, so a
 branch sitting on a page's last instruction is split from the delay
 slot that follows it.  The assembler folds both TBs into the one
-true BB: a bare-branch TB leaves the chain pending until the next
-TB (carrying the delay slot) completes it.  Reasoning about true-BB
-boundaries per-TB — "this TB ends in a branch, therefore seal" —
-is unsound for exactly this reason; ``TbTerminus`` plus the
+true BB: a ``BARE_BRANCH`` fragment leaves the chain pending until
+the next TB (carrying the delay slot) completes it.  Reasoning about
+true-BB boundaries per-TB — "this TB ends in a branch, therefore
+seal" — is unsound for exactly this reason; ``TbTerminus`` plus the
 assembler's pending-delay-slot state is the sound replacement.
 
-The user-visible difference: ``tb_count`` is roughly the number of
-distinct ``(pc, flags)`` translations QEMU produced for the run,
-while ``bb_count`` (the ``BB templates created`` line in the
-exit-time summary) is the number of architectural basic blocks the
-trace describes.  Per-segment resets clear ``bb_map_`` only —
-``tb_map_`` survives because QEMU only fires ``vcpu_tb_trans`` on a
-TB's first translation, and dropping our fragment record without a
-re-translation hook would orphan the chain assembler.
+The user-visible difference: ``tb_count`` is the number of fragments
+the splitter produced across all QEMU translations, while
+``bb_count`` (the ``BB templates created`` line in the exit-time
+summary) is the number of architectural basic blocks the trace
+describes.  Per-segment resets clear ``bb_map_`` only;
+``tb_templates_`` survives across segment boundaries because each
+QEMU TB carries its fragment list via the per-TB exec-cb ``udata``
+for the QEMU TB's lifetime.  ``tb_templates_`` is dropped wholesale
+by the ``vcpu_tb_flush`` callback, when QEMU has just invalidated
+all of its own TBs (and therefore the udata pointing at our list
+entries).
 
 Subsystem map
 -------------
@@ -371,20 +399,25 @@ order they're touched on a hot path:
        the per-behaviour-group refiners) the classification tables'
        ``.dep_refine`` slots point at.
    * - ``champsim_tracer_scoreboard.{h,cc}``
-     - The per-vCPU scoreboard.  Inline stores registered on a TB's
-       first instruction publish that TB's start PC, fall-through PC,
-       and ``TbTerminus`` here for ``vcpu_tb_exec`` to read.
+     - The per-vCPU scoreboard.  Inline stores registered on each
+       *fragment's* first raw instruction publish that fragment's
+       start PC, fall-through PC, and ``TbTerminus`` here for the
+       next ``vcpu_tb_exec`` to read.  The last fragment to actually
+       execute is the one whose stores fired last, so the scoreboard
+       always describes the executed tail — even when a mid-TB
+       branch diverted control past later fragments in the same TB.
    * - ``champsim_tracer_generic_ids.h``
      - The portable enum domains: ``GenericOpcode``, ``BranchType``,
        ``GenericRegId``.  Everything in the plugin and the decoder
        agrees on these IDs.
    * - ``champsim_tracer_bb_template_cache.{h,cc}``
-     - Two ``unordered_map`` caches.  ``tb_map_`` keyed by TB start_pc
-       holds the per-fragment templates QEMU hands us; ``bb_map_``
-       keyed by branch-target start_pc holds the *true* basic-block
-       templates assembled from contiguous TBs.  Per
-       :doc:`reference`, ``bb_map_`` is the templates section of the
-       trace.
+     - Owns ``tb_templates_`` (a vector of per-fragment templates,
+       one entry per fragment produced by the splitter; cleared
+       wholesale on ``vcpu_tb_flush``) and ``bb_map_`` (an
+       ``unordered_map`` keyed by branch-target start_pc holding the
+       *true* basic-block templates assembled from contiguous
+       fragments).  Per :doc:`reference`, ``bb_map_`` is the
+       templates section of the trace.
    * - ``champsim_tracer_bb_chain_assembler.{h,cc}``
      - Walks a chain of TB fragments and finalizes them into a true BB
        at the next branch.  See :ref:`cp-flow`.
@@ -431,48 +464,50 @@ Correct-path flow
 
 Per TB executed on the correct path, ``vcpu_tb_exec`` runs:
 
-1.  Bump ``insn_count`` by ``n_insns`` of the TB.
+1.  Bump ``insn_count`` by ``n_insns`` of the TB's head fragment.
 2.  Window check.  If we're outside an open segment but the icount has
     crossed the next configured window, open a new segment via
     ``start_trace_segment``.  If we're past the segment's stop, close
     it and (for SimPoint mode) advance to the next window.
-3.  Read the previous TB's start PC, fall-through PC, and
-    ``TbTerminus`` out of the per-vCPU scoreboard.  Those fields
-    are populated by inline stores ``vcpu_tb_trans`` registered on
-    *this* TB's first instruction, encoding *this* TB's
-    parameters.  When the TB executes, the inline store fires
-    early enough that by the time ``vcpu_tb_exec`` runs the
-    scoreboard already describes the TB whose vcpu_tb_exec just
-    fired — which from the chain assembler's point of view *is*
-    the previous TB relative to the next one.
-4.  Append the previous TB's template to the in-flight CP chain,
-    passing its ``TbTerminus``.  The :class:`BBChainAssembler`
-    glues consecutive fragments together and reports
-    ``bb_complete()`` once they form a whole true BB — including
-    folding a page-split branch and its delay slot across two TBs.
-5.  Per-instruction attribution.  Walk the previous TB's
-    ``insn_fields`` and bump the per-CP opcode / branch-type / src-reg
-    / dst-reg counters in ``g_stats``.  Mirror the bumps into the
-    histogram bucket if one is active.
-6.  If the chain assembler reports a complete true BB, finalize it
-    into a true-BB template.  Every branch decision then derives
-    from that finalized true BB's terminating branch — never a
-    single TB fragment: bump the branch-transition counters and
-    update the :class:`BranchHistory` record (so the WP simulator
-    has indirect targets to mine later), and resolve the wrong-path
+3.  Read the previous TB's last-executed fragment's start PC, fall-
+    through PC, and the current PC from the per-vCPU scoreboard.
+    Those fields are populated by inline stores
+    ``vcpu_tb_trans`` registered on the *first raw instruction of
+    each fragment*, encoding that fragment's parameters.  A
+    fragment that never executes (e.g. its predecessor's mid-TB
+    branch took, diverting control past this fragment) never fires
+    its store; the last fragment to actually execute therefore
+    leaves its own values in the scoreboard, which is exactly what
+    the chain assembler needs to fold.
+4.  Walk the previously-executed QEMU TB's fragment list from the
+    head fragment (stashed in ``g_cp_prev_tb_template`` by the
+    *prior* ``vcpu_tb_exec``) up to the fragment whose ``start_pc``
+    matches the scoreboard's ``prev_start_pc``.  For each fragment
+    in the walk: append it to the in-flight CP chain (passing its
+    ``TbTerminus``), bump per-instruction attribution
+    (opcode / branch-type / src-reg / dst-reg counters in
+    ``g_stats``, mirrored into the active histogram bucket), and if
+    the chain assembler reports ``bb_complete()`` queue a finalize.
+    The assembler is ``reset()`` between finalizes so consecutive
+    fragments in the same walk don't get appended onto a just-
+    committed chain.
+5.  For every queued finalize, derive the branch decision from the
+    finalized true BB's terminating branch — never a single fragment.
+    Update the :class:`BranchHistory` record (so the WP simulator
+    has indirect targets to mine later) and resolve the wrong-path
     target (the fall-through for a taken direct branch, the
     translator-resolved static target for a not-taken direct
     branch, the most-frequent-non-CP indirect target for an
     indirect branch).
-7.  Release ``data_lock``, then call ``emit_finalized_bb``: it
-    optionally invokes the WP simulator for the resolved wrong
-    target, builds a :class:`BodyEntry` from the just-finalized BB
-    plus the drained per-thread memop / reg-snap accumulators, and
-    streams it through the writer.
+6.  Release ``data_lock``, then call ``emit_finalized_bb`` on each
+    queued finalize: it optionally invokes the WP simulator for the
+    resolved wrong target, builds a :class:`BodyEntry` from the
+    just-finalized BB plus the drained per-thread memop / reg-snap
+    accumulators, and streams it through the writer.
 
-Steps 4-6 happen under ``data_lock``; the BB cache writes plus chain
+Steps 4-5 happen under ``data_lock``; the BB cache writes plus chain
 state and the WP-target resolution are mutated there.  ``data_lock``
-is released before step 7 — the WP simulator and the body-stream
+is released before step 6 — the WP simulator and the body-stream
 write run under ``exec_lock`` only.  The writer is internally
 synchronized.
 
@@ -495,33 +530,47 @@ operation):
 2.  Loop until the depth budget is exhausted *and* the in-flight BB is
     empty:
 
-    a.  Look up the cached TB template at ``pre_pc``.  If absent, the
-        template will exist after exec_tb has translated it.
-    b.  Capture pre-fragment register values into a per-fragment wide
+    a.  Early-out if ``pre_pc`` is in ``g_poisoned_pcs`` (see
+        :ref:`poison-detection`): the speculator has tried to enter
+        this PC before and the translation-time detector flagged it
+        as non-stable bytes.  Drop the in-flight accumulator and end
+        the WP chain.
+    b.  Look up the cached *true-BB* at ``pre_pc``.  If absent, the
+        fragment template the next ``exec_tb`` produces becomes the
+        driver via ``g_wp_state.last_executed_tb``.
+    c.  Capture pre-fragment register values into a per-fragment wide
         snapshot if reg-data is enabled.
-    c.  ``cpu_plugin_exec_tb()`` runs the TB.  Its memory callbacks
-        fire and append to ``g_wp_state.mem_accesses``.  Other plugin
-        callbacks (insn-exec, inline stores, vcpu_tb_exec) are
-        suppressed by ``CF_MEMI_ONLY`` so the scoreboard stays clean.
-    d.  Determine ``n_executed_in_tmpl``.  If exec_tb succeeded, the
-        whole template ran; on a fault, find the faulting PC in
-        ``tmpl->insn_pcs`` and cap there.
-    e.  Append the executed-prefix's insns to ``bb_pcs`` /
-        ``bb_fields`` / ``bb_bytes`` / ``bb_sizes`` and the matching
-        bumps to per-WP attribution counters and the histogram bucket.
-    f.  Attribute the just-captured memops to insn indexes by walking
-        the executed prefix.
-    g.  If the TB faulted on a non-branch insn, mark
+    d.  ``cpu_plugin_exec_tb()`` runs the TB.  Memory, instruction-
+        exec, inline-store, and ``vcpu_tb_exec`` callbacks all fire —
+        ``CF_MEMI_ONLY`` was removed so that the plugin's per-fragment
+        ``vcpu_tb_exec`` can stash the just-executed template into
+        ``g_wp_state.last_executed_tb`` via the same per-TB-udata path
+        the CP walker uses.  The plugin distinguishes WP-mode
+        invocations from CP-mode via the thread-local
+        ``g_wp_state.in_progress`` flag and short-circuits CP-only
+        state mutations on the WP path.
+    e.  Walk the fragment list of the just-executed QEMU TB.  For
+        each fragment determine ``n_executed_in_cur`` via ``post_pc``
+        matching against the fragment's own ``insn_pcs`` (on success)
+        or fault-PC matching (on a fault).  Append the executed
+        prefix's insns to ``bb_pcs`` / ``bb_fields`` / ``bb_bytes`` /
+        ``bb_sizes``, bump per-WP attribution counters, and attribute
+        the just-captured memops to insn indexes.
+    f.  After each fragment, check ``bb_complete``: a ``COMPLETE``
+        terminus or a delay-slot landing for a previously-pending
+        ``BARE_BRANCH`` seals the in-flight WP BB.  Commit the
+        accumulator to the BB cache via ``commit_true_bb_refs``,
+        push a :class:`WPBBEntry`, ``clear_accum``, and start the
+        next BB with the next fragment's ``start_pc``.  A single
+        ``exec_tb`` can therefore commit multiple BBs (one per
+        mid-TB branch the splitter found).
+    g.  If a fragment faulted on a non-branch insn, mark
         ``bb_has_fault`` / ``bb_first_fault_idx`` (first fault wins),
-        poison the faulting PC against re-faults, set the next PC to
-        ``fault_pc + last_insn_size``, and continue the loop into the
-        same BB.
-    h.  If the TB ended in a branch (ordinary completion *or* a
-        syscall-style faulting branch), commit the accumulator to the
-        BB cache via ``commit_true_bb``.  Push a
-        :class:`WPBBEntry` carrying ``bb_has_fault`` /
-        ``bb_first_fault_idx`` and ``clear_accum``.  If the post-PC
-        is poisoned, end the chain.
+        poison the faulting PC against re-faults, set the next PC
+        to ``fault_pc + last_insn_size``, and continue the outer
+        iteration.  Faults on a ``BARE_BRANCH`` fragment do *not*
+        force-commit (the delay slot is in a different TB and
+        never landed) — they take the skip-past-and-retry branch.
 
 3.  ``qemu_plugin_spec_mode_end`` + ``qemu_plugin_cpu_state_restore``
     +  scoreboard restore.
@@ -541,10 +590,46 @@ apparent from the source alone:
 *BBs always end in a branch.*  Per :doc:`/format`, ``bb_map_`` only
 holds true basic blocks: the run from a branch target up to the next
 branch.  The WP simulator traces *past* in-flight faults precisely
-to preserve this invariant — see step 2g above.  Committing a
-truncated faulted BB triggers a "differing insn sequence" warning on
-the next CP commit at the same start_pc; ``commit_true_bb`` emits
-that warning, which surfaces any mid-stream-commit regression.
+to preserve this invariant — see step 2g above.  True-BB shapes are
+*deterministic* by construction: at a given ``start_pc`` the
+sequence of instructions up to the terminating branch is a function
+of static binary content alone.  Any commit attempt whose shape
+disagrees with the cached BB indicates either real self-modifying
+code or that the trace is reading dynamic memory as if it were code
+— the poison detector below catches the second case at translation
+time, before a divergent fragment can ever reach commit.
+
+.. _poison-detection:
+
+Translation-time poison detection
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Before materializing a fragment, ``vcpu_tb_trans`` runs two
+stability checks on every canonical insn in the candidate TB:
+
+* **Capstone decode failure** — an empty mnemonic means the bytes
+  do not parse as a valid instruction for the target ISA.  Real
+  code does not fail to decode.
+* **Byte change since first sighting** — every per-PC 4-byte
+  instruction word is memoized in ``g_first_insn_word`` on first
+  observation.  A subsequent translation of the same PC whose bytes
+  differ from the memoized value means the underlying memory is
+  writable storage being interpreted as code (stack / heap / .bss
+  / .rodata frame the program is writing through).  Real code does
+  not change.
+
+Either signal poisons the TB's ``start_pc`` (adding it to
+``g_poisoned_pcs``); the fragment is *not* created and no exec-cb
+``udata`` is registered for the TB.  Subsequent WP walks check
+``cst_pc_is_poisoned`` at the top of each iteration and abort
+before re-translating the address.  When poisoning fires inside the
+main binary's text segment (``[qemu_plugin_start_code(),
+qemu_plugin_end_code())``) the plugin emits a one-shot SMC-suspect
+warning to stderr — that is the actual self-modifying-code signal.
+Out-of-text-segment poison fires silently because the symptom is
+"WP wrong-pathed into data," which is normal speculative behaviour
+the tracer just refuses to record.  Both the byte-memo and the
+poison set are dropped on ``vcpu_tb_flush``.
 
 *REP-prefixed x86 string instructions fan out per iteration.*  An x86
 ``REP MOVS`` executes N times against architectural memory.  The
@@ -664,27 +749,26 @@ is funneled through ``MemAccessRecorder::record_synthetic_load`` so
 it shows up in the ``LOAD_ADDR[0]`` slot the same way a normal load
 would.  This relies on the ``scale`` (x86 SIB) and
 ``shift_type`` / ``shift_amount`` (AArch64) fields the plugin's
-QEMU base adds to ``qemu_plugin_operand`` — see :doc:`extending`.  WP-side capture
-is suppressed by ``CF_MEMI_ONLY``; that's intentional, because the
-suppressed insns generate no architectural memops to begin with.
+QEMU base adds to ``qemu_plugin_operand`` — see :doc:`extending`.
+The WP path runs the same ``vcpu_mem_cb`` plumbing as the CP path
+(``CF_MEMI_ONLY`` is no longer set on the speculative TBs), so
+mem-callback-driven capture stays correct under speculation.
 
-*The TB-fragment cache collides on start_pc, and that is handled,
-not avoided.*  When a TB at start_pc=X is translated more than once
-(different cflags — notably the wrong-path simulator's
-``CF_NO_GOTO_TB`` / ``CF_SINGLE_STEP`` translations — or a page
-flush + retranslate), QEMU keys its own TB cache by
-``(pc, cs_base, flags, cflags)`` so distinct translations get
-distinct ``vcpu_tb_trans`` calls — but ``tb_map_`` keys by start_pc
-only, and the *first* translation wins.  Two collided TBs can have
-different lengths and so different terminating-instruction shapes.
-The plugin therefore never reads true-BB structure off a cached
-fragment: ``vcpu_tb_trans`` classifies each TB's ``TbTerminus``
-from the instructions of the TB *being translated*, and the
-wrong-path simulator iterates the true-BB cache (``find_bb_template``),
-falling back to the fragment cache only on a genuine first sighting.
-The *insns at those PCs* never change (no SMC), so the assembled
-true BB is identical regardless of which collided fragment the
-cache happens to hold.
+*Sibling TB translations get distinct fragment lists.*  When QEMU
+translates the same start_pc more than once (different cflags —
+notably the wrong-path simulator's ``CF_NO_GOTO_TB`` /
+``CF_SINGLE_STEP`` translations — or a page flush + retranslate),
+each translation produces its own splitter output and its own
+fragment list.  ``tb_templates_`` is a vector, not a start_pc-keyed
+map, so sibling translations never overwrite each other: the per-TB
+exec-cb ``udata`` always points at the exact list the just-executed
+QEMU TB produced.  For real binary code the canonical-insn arrays
+are identical across siblings (the static bytes don't change), so
+the splitter produces the same fragment shape every time and the
+chain assembler folds it deterministically.  When the bytes *do*
+appear to change — the dynamic-memory speculation case — the
+poison detector (see :ref:`poison-detection`) catches it at
+translation time and refuses to materialize the fragment at all.
 
 *Stats are exact, lock-free on the bump path.*  ``g_stats`` is a macro
 that forwards to a per-thread heap-allocated ``Stats`` slot via
@@ -736,9 +820,11 @@ Synchronization summary
        assembly, and a synchronous WP simulation all serialize.  Also
        held during ``vcpu_tb_flush`` reset and ``plugin_exit``.
    * - ``data_lock``
-     - Mutates the BB caches (``tb_map_``, ``bb_map_``), the chain
-       assembler's fragment list, and ``g_branch_history``.  Acquired
-       briefly inside the larger ``exec_lock`` window.
+     - Mutates the BB caches (``tb_templates_``, ``bb_map_``), the
+       byte-stability / poison maps (``g_first_insn_word``,
+       ``g_poisoned_pcs``), the chain assembler's fragment list, and
+       ``g_branch_history``.  Acquired briefly inside the larger
+       ``exec_lock`` window.
    * - ``unknown_warn_lock``
      - Serializes writes to the ``.unknown_warnings.log`` sidecar.
    * - Plugin writer thread

@@ -487,6 +487,29 @@ struct BBTemplate {
      * Lazily allocated on first accumulation; freed with the
      * template.  NULL until this BB executes at least once. */
     TemplateProfile *profile;
+    /* Fast-path back-edge from a TB template to the true-BB template
+     * it has been folded into.  Set when get_or_create_bb_template
+     * commits or reuses a true-BB whose fragments include this TB;
+     * subsequent re-finalizations of the same chain short-circuit
+     * the fragment-walk + lookup dance and return this pointer
+     * directly.  Invalidated to NULL by clear_bb_map() at segment
+     * switches, since bb_map_ owns the pointee. */
+    BBTemplate *parent_true_bb;
+    /* How this TB fragment contributes to true-BB assembly (TbTerminus,
+     * see split_tb_into_fragments).  Set on TB fragment templates at
+     * translation time; the BB chain assembler and the WP walker both
+     * read it to decide whether the fragment completes a true-BB, is
+     * awaiting a delay-slot landing, or is a non-terminal fragment.
+     * Unused (TB_TERMINUS_NONE) on assembled true-BB templates. */
+    uint8_t terminus;
+    /* Linked list of sibling fragments produced from the same QEMU TB
+     * by the mid-TB-branch splitter.  Head is what vcpu_tb_trans
+     * attached as the per-TB exec-cb udata; vcpu_tb_exec and the WP
+     * walker walk the list to decide which fragments actually
+     * executed in this exec (via the scoreboard's last-executed
+     * fragment values, or via post_pc on WP).  NULL on singletons
+     * (TBs with no mid-TB branch). */
+    BBTemplate *next_tb_fragment;
 };
 
 enum DynParamType {
@@ -725,6 +748,22 @@ extern uint32_t iframe_rate;
  * that need to split warmup vs evaluation regions. */
 extern uint64_t warmup_insns;
 extern uint64_t simulation_insns;
+
+/* Executable code range of the main binary, captured at plugin install.
+ * Gates fragment-template creation and WP speculation entry; a PC
+ * outside this range is dynamic memory and any "instructions" we'd read
+ * there are non-deterministic.  See champsim_tracer.cc for details. */
+extern uint64_t g_code_start;
+extern uint64_t g_code_end;
+
+static inline bool cst_pc_in_code(uint64_t pc)
+{
+    return pc >= g_code_start && pc < g_code_end;
+}
+
+/* Is @pc a TB start_pc that has been poisoned (decode failure or
+ * byte change detected at translation time)?  Acquires data_lock. */
+bool cst_pc_is_poisoned(uint64_t pc);
 
 /* Synchronization & diagnostics.  Must stay GMutex, not std::mutex:
  * <mutex> pulls <ctype.h>, which QEMU's include/qemu/ctype.h shadows

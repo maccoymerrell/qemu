@@ -2212,15 +2212,21 @@ typedef struct StageRec {
     U512     delta;
 } StageRec;
 
-static void stage_rec_append(StageRec **stage, unsigned int *stage_len,
-                             unsigned int *stage_cap, StageRec rec)
+/* Reserve the next slot and return a pointer to it, growing on demand.
+ * Lets the caller fill fields directly instead of materialising a
+ * 72-byte StageRec on the stack and passing it by value — that copy
+ * (movdqa stack→reg + reg→stage) and the zero-init `rec = {}`
+ * cleared the bigger stalls in this hot loop on mcf. */
+[[gnu::always_inline]] static inline StageRec *
+stage_rec_reserve(StageRec **stage, unsigned int *stage_len,
+                  unsigned int *stage_cap)
 {
     if (*stage_len == *stage_cap) {
         *stage_cap *= 2;
         *stage = (StageRec *)g_realloc_n(*stage, *stage_cap,
                                          sizeof(**stage));
     }
-    (*stage)[(*stage_len)++] = rec;
+    return &(*stage)[(*stage_len)++];
 }
 
 /* CP memop overflow warning.  The slot loop silently clamps a
@@ -2247,37 +2253,35 @@ static void warn_memop_overflow(const BBTemplate *tmpl, uint32_t insn_i,
     g_mutex_unlock(&unknown_warn_lock);
 }
 
-/* Per-tuple processors.  Inlined into the sparse walker — single
- * call site per family — so the call shape disappears at -O.  Both
- * helpers replicate the previous extract/compare/stage body verbatim;
- * the refactor is in *which* (i, fd, slot) tuples we visit, not how
- * each tuple gets emitted. */
-static inline void emit_one_u64(StageRec **stage_p, unsigned int *stage_len,
-                                unsigned int *stage_cap,
-                                FieldStateBlock *state_block,
-                                uint32_t state_generation,
-                                FieldStateBlock *base_block,
-                                uint32_t base_generation,
-                                const EntryView *ev, uint32_t i,
-                                const FieldDescriptor *fd, uint8_t slot)
+/* Stage a u64 delta record for (i, fid, cur).  The caller has already
+ * decided this slot has content and extracted `cur` directly — no
+ * fd->extract_u64() indirect dispatch.  always_inline so the per-family
+ * blocks below see this body inlined at -O.
+ *
+ * @deflt is the template default for this field (0 for runtime
+ * fields, the template's static value for INSN_BYTES/OPCODE/etc.).
+ * The state-block lookups below are family-agnostic. */
+[[gnu::always_inline]] static inline void
+stage_u64_delta(StageRec **stage_p, unsigned int *stage_len,
+                unsigned int *stage_cap,
+                FieldStateBlock *state_block, uint32_t state_generation,
+                FieldStateBlock *base_block, uint32_t base_generation,
+                uint32_t i, uint16_t fid,
+                uint64_t cur, uint64_t deflt)
 {
-    uint64_t cur;
-    if (!fd->extract_u64(ev, i, slot, &cur)) return;
-    uint16_t fid = (uint16_t)(fd->base_field_id + slot * fd->slot_stride);
     uint16_t slot_index = field_state_slot_index(fid);
     uint64_t base;
     if (!field_state_block_get_u64(state_block, state_generation,
                                    i, slot_index, &base) &&
         !field_state_block_get_u64(base_block, base_generation,
                                    i, slot_index, &base)) {
-        base = fd->template_default_u64(ev->tmpl, i, slot);
+        base = deflt;
     }
     if (cur == base) return;
-    StageRec rec = {};
-    rec.pos = i;
-    rec.fid = fid;
-    rec.delta = u512_from_u64_diff(cur, base);
-    stage_rec_append(stage_p, stage_len, stage_cap, rec);
+    StageRec *rec = stage_rec_reserve(stage_p, stage_len, stage_cap);
+    rec->pos = i;
+    rec->fid = fid;
+    rec->delta = u512_from_u64_diff(cur, base);
     if (state_block && i < state_block->n_insns &&
         slot_index != FIELD_STATE_SLOT_INVALID) {
         size_t idx = ((size_t)i * FIELD_STATE_SLOT_COUNT) + slot_index;
@@ -2286,27 +2290,26 @@ static inline void emit_one_u64(StageRec **stage_p, unsigned int *stage_len,
     }
 }
 
-static inline void emit_one_wide(StageRec **stage_p, unsigned int *stage_len,
-                                 unsigned int *stage_cap,
-                                 FieldStateBlock *state_block,
-                                 uint32_t state_generation,
-                                 FieldStateBlock *base_block,
-                                 uint32_t base_generation,
-                                 const EntryView *ev, uint32_t i,
-                                 const FieldDescriptor *fd, uint8_t slot)
+/* Wide variant: takes the already-extracted U512 value.  fd is kept
+ * for the field_state_get pathway (it walks fd->template_default for
+ * the template-derived families — wide families today are all runtime
+ * with template_default == 0, but field_state_get still consults it). */
+[[gnu::always_inline]] static inline void
+stage_wide_delta(StageRec **stage_p, unsigned int *stage_len,
+                 unsigned int *stage_cap,
+                 FieldStateBlock *state_block, uint32_t state_generation,
+                 FieldStateBlock *base_block, uint32_t base_generation,
+                 const EntryView *ev, uint32_t i, uint16_t fid,
+                 const FieldDescriptor *fd, uint8_t slot, const U512 &cur)
 {
-    U512 cur;
-    if (!fd->extract(ev, i, slot, &cur)) return;
-    uint16_t fid = (uint16_t)(fd->base_field_id + slot * fd->slot_stride);
     U512 base = field_state_get(state_block, state_generation,
                                 base_block, base_generation,
                                 i, fid, fd, ev->tmpl, slot);
     if (u512_equal(cur, base)) return;
-    StageRec rec = {};
-    rec.pos = i;
-    rec.fid = fid;
-    rec.delta = u512_sub(cur, base);
-    stage_rec_append(stage_p, stage_len, stage_cap, rec);
+    StageRec *rec = stage_rec_reserve(stage_p, stage_len, stage_cap);
+    rec->pos = i;
+    rec->fid = fid;
+    rec->delta = u512_sub(cur, base);
     field_state_put(state_block, state_generation, i, fid, cur);
 }
 
@@ -2359,12 +2362,10 @@ static void emit_field_delta_section(BitWriter *main_bw,
         const bool want_memdata = (header_flags & CST_FLAG_MEM_DATA) != 0;
         const bool want_regdata = (header_flags & CST_FLAG_REG_DATA) != 0;
 
-        /* Locked-in descriptor pointers — one constant per family. */
-        const FieldDescriptor *fd_n_loads     = &field_descriptors[FD_IDX_N_LOADS];
-        const FieldDescriptor *fd_n_stores    = &field_descriptors[FD_IDX_N_STORES];
-        const FieldDescriptor *fd_metaflags   = &field_descriptors[FD_IDX_METAFLAGS];
-        const FieldDescriptor *fd_load_addr   = &field_descriptors[FD_IDX_LOAD_ADDR];
-        const FieldDescriptor *fd_store_addr  = &field_descriptors[FD_IDX_STORE_ADDR];
+        /* Locked-in descriptor pointers — only the wide families
+         * (LOAD_DATA, STORE_DATA, DST_REG) still need fd for the
+         * field_state_get path; the u64 families inline their extract
+         * directly, so the table lookup is gone for them. */
         const FieldDescriptor *fd_load_data   = &field_descriptors[FD_IDX_LOAD_DATA];
         const FieldDescriptor *fd_store_data  = &field_descriptors[FD_IDX_STORE_DATA];
         const FieldDescriptor *fd_dst_reg     = &field_descriptors[FD_IDX_DST_REG];
@@ -2373,14 +2374,28 @@ static void emit_field_delta_section(BitWriter *main_bw,
         const FieldDescriptor *fd_load_lm     = &field_descriptors[FD_IDX_LOAD_DATA_LANE_MASK];
         const FieldDescriptor *fd_store_lm    = &field_descriptors[FD_IDX_STORE_DATA_LANE_MASK];
 
-#define U64(I, FD, SLOT)  emit_one_u64(&stage, &stage_len, &stage_cap, \
-                                       state_block, state_generation, \
-                                       base_block, base_generation, \
-                                       ev, (I), (FD), (SLOT))
-#define WIDE(I, FD, SLOT) emit_one_wide(&stage, &stage_len, &stage_cap, \
-                                        state_block, state_generation, \
-                                        base_block, base_generation, \
-                                        ev, (I), (FD), (SLOT))
+#define STAGE_U64(I, FID, CUR, DEFLT) \
+    stage_u64_delta(&stage, &stage_len, &stage_cap, \
+                    state_block, state_generation, \
+                    base_block, base_generation, \
+                    (I), (FID), (CUR), (DEFLT))
+#define STAGE_WIDE(I, FID, FD, SLOT, CUR) \
+    stage_wide_delta(&stage, &stage_len, &stage_cap, \
+                     state_block, state_generation, \
+                     base_block, base_generation, \
+                     ev, (I), (FID), (FD), (SLOT), (CUR))
+
+        /* Pre-resolve the metaflags mapper once — devirtualizes the
+         * per-insn `mapper(raw)` call into a hot loop where the ISA
+         * never changes within a trace. */
+        MetaFlagsMapperFn metaflags_mapper = want_regdata
+            ? isa_properties[trace_isa].flags_to_metaflags
+            : nullptr;
+
+        const DynParam *const *load_slots  = ev->load_slots;
+        const DynParam *const *store_slots = ev->store_slots;
+        const uint32_t *insn_rs_off        = ev->insn_rs_off;
+        const auto *reg_snaps              = ev->reg_snaps;
 
         for (uint32_t i = 0; i < ev->tmpl->n_insns; i++) {
             const InsnFields *f = &ev->tmpl->insn_fields[i];
@@ -2390,56 +2405,131 @@ static void emit_field_delta_section(BitWriter *main_bw,
                 ? ev->actual_n_stores[i] : 0;
             warn_memop_overflow(ev->tmpl, i, insn_n_loads, insn_n_stores);
 
-            /* Hot singletons: N_LOADS / N_STORES always visited (they
-             * are per-iter counts whose default is the template's
-             * declared value; refreshing is the only way the decoder
-             * learns this iter's runtime count differs). */
-            U64(i, fd_n_loads,  0);
-            U64(i, fd_n_stores, 0);
-
-            /* METAFLAGS gated by regdata + writes_int_flags. */
-            if (want_regdata && f->writes_int_flags) {
-                U64(i, fd_metaflags, 0);
+            /* N_LOADS / N_STORES — per-iter runtime counts, always
+             * visited.  Default 0 (template carries no static count). */
+            if (ev->actual_n_loads) {
+                STAGE_U64(i, CST_FID_N_LOADS, insn_n_loads, 0);
+            }
+            if (ev->actual_n_stores) {
+                STAGE_U64(i, CST_FID_N_STORES, insn_n_stores, 0);
             }
 
-            /* Memop families — sparse over actual_n_loads / n_stores.
-             * cap_min collapses overflowing counts to the wire slot
-             * count, matching the previous cap_loads/cap_stores. */
-            uint8_t n_loads_cap  = cap_min(insn_n_loads);
-            uint8_t n_stores_cap = cap_min(insn_n_stores);
-            for (uint8_t s = 0; s < n_loads_cap; s++) {
-                U64(i, fd_load_addr, s);
-                if (want_memdata) WIDE(i, fd_load_data, s);
-            }
-            for (uint8_t s = 0; s < n_stores_cap; s++) {
-                U64(i, fd_store_addr, s);
-                if (want_memdata) WIDE(i, fd_store_data, s);
-            }
-
-            /* DST_REG gated by regdata + per-insn n_dst_regs. */
-            if (want_regdata) {
-                uint8_t n_dsts = f->n_dst_regs;
-                for (uint8_t s = 0; s < n_dsts; s++) {
-                    WIDE(i, fd_dst_reg, s);
+            /* METAFLAGS — gated by regdata + writes_int_flags + reg
+             * snap availability.  Mapper resolved per-ISA above. */
+            if (metaflags_mapper && f->writes_int_flags &&
+                reg_snaps && insn_rs_off) {
+                for (uint8_t k = 0; k < f->n_dst_regs; k++) {
+                    if (f->dst_regs[k] != REG_FLAGS) continue;
+                    uint32_t pos = insn_rs_off[i] + (uint32_t)k;
+                    if (pos < reg_snaps->size()) {
+                        uint64_t raw = (*reg_snaps)[pos].value.limb[0];
+                        STAGE_U64(i, CST_FID_METAFLAGS,
+                                  metaflags_mapper(raw), 0);
+                    }
+                    break;
                 }
             }
 
-            /* Lane masks visited only for vec insns (the vast majority
-             * of scalar-pipeline traces have has_vec_lanes==false and
-             * skip all four families entirely). */
+            /* Memop families — sparse over actual_n_loads / n_stores.
+             * Inlined extract: load_slots[i*SLOT_COUNT + s] is the
+             * authoritative source (see find_memop_slot). */
+            uint8_t n_loads_cap  = cap_min(insn_n_loads);
+            uint8_t n_stores_cap = cap_min(insn_n_stores);
+            if (load_slots) {
+                size_t la_base = (size_t)i * CST_FID_SLOT_COUNT;
+                for (uint8_t s = 0; s < n_loads_cap; s++) {
+                    const DynParam *dp = load_slots[la_base + s];
+                    if (!dp) continue;
+                    uint16_t la_fid = (uint16_t)(CST_FID_LOAD_ADDR_BASE +
+                                                 s * CST_FID_SLOT_STRIDE);
+                    STAGE_U64(i, la_fid, dp->value, 0);
+                    if (want_memdata) {
+                        U512 cur = dp->data;
+                        u512_mask_bytes(&cur, dp->data_size);
+                        uint16_t ld_fid =
+                            (uint16_t)(CST_FID_LOAD_DATA_BASE +
+                                       s * CST_FID_SLOT_STRIDE);
+                        STAGE_WIDE(i, ld_fid, fd_load_data, s, cur);
+                    }
+                }
+            }
+            if (store_slots) {
+                size_t sa_base = (size_t)i * CST_FID_SLOT_COUNT;
+                for (uint8_t s = 0; s < n_stores_cap; s++) {
+                    const DynParam *dp = store_slots[sa_base + s];
+                    if (!dp) continue;
+                    uint16_t sa_fid = (uint16_t)(CST_FID_STORE_ADDR_BASE +
+                                                 s * CST_FID_SLOT_STRIDE);
+                    STAGE_U64(i, sa_fid, dp->value, 0);
+                    if (want_memdata) {
+                        U512 cur = dp->data;
+                        u512_mask_bytes(&cur, dp->data_size);
+                        uint16_t sd_fid =
+                            (uint16_t)(CST_FID_STORE_DATA_BASE +
+                                       s * CST_FID_SLOT_STRIDE);
+                        STAGE_WIDE(i, sd_fid, fd_store_data, s, cur);
+                    }
+                }
+            }
+
+            /* DST_REG — wide family, gated by regdata + per-insn n_dst.
+             * Inline extract: reg_snaps[insn_rs_off[i] + slot]. */
+            if (want_regdata && reg_snaps && insn_rs_off) {
+                uint8_t n_dsts = f->n_dst_regs;
+                uint32_t rs_off = insn_rs_off[i];
+                for (uint8_t s = 0; s < n_dsts; s++) {
+                    uint32_t pos = rs_off + (uint32_t)s;
+                    if (pos >= reg_snaps->size()) break;
+                    uint16_t fid = (uint16_t)(CST_FID_DST_REG_BASE +
+                                              s * CST_FID_SLOT_STRIDE);
+                    STAGE_WIDE(i, fid, fd_dst_reg, s,
+                               (*reg_snaps)[pos].value);
+                }
+            }
+
+            /* Lane masks — only for vec insns.  These still go through
+             * the fd dispatch because each family has its own non-
+             * trivial extraction (memop_data_lane_mask vs reg-side
+             * lookups); the cost is negligible on scalar code. */
             if (f->has_vec_lanes) {
                 uint8_t n_src = f->n_src_regs;
                 uint8_t n_dst = f->n_dst_regs;
                 uint8_t n_ml  = f->max_dep_loads;
                 uint8_t n_ms  = f->max_dep_stores;
-                for (uint8_t s = 0; s < n_src; s++) U64(i, fd_src_lm,    s);
-                for (uint8_t s = 0; s < n_dst; s++) U64(i, fd_dst_lm,    s);
-                for (uint8_t s = 0; s < n_ml;  s++) U64(i, fd_load_lm,   s);
-                for (uint8_t s = 0; s < n_ms;  s++) U64(i, fd_store_lm,  s);
+                for (uint8_t s = 0; s < n_src; s++) {
+                    uint64_t cur;
+                    if (!fd_src_lm->extract_u64(ev, i, s, &cur)) continue;
+                    uint16_t fid = (uint16_t)(CST_FID_SRC_LANE_MASK_BASE +
+                                              s * CST_FID_LANE_BLOCK_STRIDE);
+                    STAGE_U64(i, fid, cur, 0);
+                }
+                for (uint8_t s = 0; s < n_dst; s++) {
+                    uint64_t cur;
+                    if (!fd_dst_lm->extract_u64(ev, i, s, &cur)) continue;
+                    uint16_t fid = (uint16_t)(CST_FID_DST_LANE_MASK_BASE +
+                                              s * CST_FID_LANE_BLOCK_STRIDE);
+                    STAGE_U64(i, fid, cur, 0);
+                }
+                for (uint8_t s = 0; s < n_ml; s++) {
+                    uint64_t cur;
+                    if (!fd_load_lm->extract_u64(ev, i, s, &cur)) continue;
+                    uint16_t fid =
+                        (uint16_t)(CST_FID_LOAD_DATA_LANE_MASK_BASE +
+                                   s * CST_FID_LANE_BLOCK_STRIDE);
+                    STAGE_U64(i, fid, cur, 0);
+                }
+                for (uint8_t s = 0; s < n_ms; s++) {
+                    uint64_t cur;
+                    if (!fd_store_lm->extract_u64(ev, i, s, &cur)) continue;
+                    uint16_t fid =
+                        (uint16_t)(CST_FID_STORE_DATA_LANE_MASK_BASE +
+                                   s * CST_FID_LANE_BLOCK_STRIDE);
+                    STAGE_U64(i, fid, cur, 0);
+                }
             }
         }
-#undef U64
-#undef WIDE
+#undef STAGE_U64
+#undef STAGE_WIDE
     }
 
     /* Wire requires non-descending (ins_pos, fid).  The family-major

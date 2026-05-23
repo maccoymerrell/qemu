@@ -100,18 +100,21 @@ bool set_iframe_rate(PluginConfig *cfg, const char *v)
 }
 
 /*
- * trace_window=PREFIX:KEY=VALUE;KEY=VALUE;...
+ * trace_window=PREFIX:KEY=VALUE+KEY=VALUE+...
  *
- *   trace_window=icount:start=0;stop=20000000
- *   trace_window=simpoint:file=mcf.sp;interval=100000000;simulation=20000000;warmup=2000000
- *   trace_window=symbol:name=main;occurrence=3;simulation=20000000
+ *   trace_window=icount:start=0+stop=20000000
+ *   trace_window=simpoint:file=mcf.sp+interval=100000000+simulation=20000000+warmup=2000000
+ *   trace_window=symbol:name=main+occurrence=3+simulation=20000000
  *
  * First colon-delimited token names the mode; each mode accepts only
  * its own keys (cross-mode keys are rejected, no silent mixing).
  *
- * The inner k/v list uses ';' not ',': QEMU's plugin-arg parser
- * splits argv on commas before the plugin sees it, so commas inside a
- * value would scatter pairs across separate argv entries.
+ * The inner k/v separator is '+' (preferred — no shell quoting
+ * required) OR ';' (back-compat — works only when the whole
+ * -plugin arg is shell-quoted, since unquoted ';' is a shell
+ * command separator).  Both are accepted; commas can never appear
+ * inside a value because QEMU's plugin-arg parser splits argv on
+ * commas before the plugin sees it.
  */
 bool parse_kv_pair(PluginConfig *cfg, const char *mode,
                    const std::pair<const char *, const char *> &kv)
@@ -185,10 +188,18 @@ bool set_trace_window(PluginConfig *cfg, const char *v)
     if (!v || !*v) {
         fprintf(stderr,
                 "champsim_tracer: trace_window= requires "
-                "MODE:KEY=VALUE;...  Example: "
-                "trace_window=icount:start=0;stop=20000000\n");
+                "MODE:KEY=VALUE+...  Example: "
+                "trace_window=icount:start=0+stop=20000000\n");
         return false;
     }
+    /* Normalise the back-compat ';' separator to the canonical '+'
+     * so users can use either; '+' is the preferred form because it
+     * needs no shell quoting (';' is a command separator). */
+    g_autofree char *v_norm = g_strdup(v);
+    for (char *p = v_norm; *p; p++) {
+        if (*p == ';') *p = '+';
+    }
+    v = v_norm;
     g_auto(GStrv) head_tail = g_strsplit(v, ":", 2);
     if (!head_tail[0] || !head_tail[1]) {
         fprintf(stderr,
@@ -208,7 +219,7 @@ bool set_trace_window(PluginConfig *cfg, const char *v)
                 "(expected: icount, simpoint, symbol)\n", head_tail[0]);
         return false;
     }
-    g_auto(GStrv) pairs = g_strsplit(head_tail[1], ";", -1);
+    g_auto(GStrv) pairs = g_strsplit(head_tail[1], "+", -1);
     for (int i = 0; pairs[i]; i++) {
         if (!*pairs[i]) continue;
         g_auto(GStrv) kv = g_strsplit(pairs[i], "=", 2);
@@ -272,8 +283,40 @@ bool parse_plugin_options(PluginConfig *cfg, int argc, char **argv)
             break;
         }
         if (!found) {
-            fprintf(stderr, "champsim_tracer: unknown option: %s\n",
+            /* Common typo: ',' instead of '+' inside trace_window=.
+             * QEMU's plugin-arg parser splits on ',' before the
+             * plugin sees argv, so a comma in the value scatters
+             * the trailing key/value pairs across separate argv
+             * entries — they arrive here as unknown top-level
+             * options.  Detect the case by matching against the
+             * trace_window inner-key vocabulary. */
+            static const char *tw_keys[] = {
+                "start", "stop",                       /* icount */
+                "file", "interval", "warmup",
+                "simulation",                          /* simpoint */
+                "name", "occurrence",                  /* symbol */
+                nullptr,
+            };
+            bool looks_like_tw = false;
+            for (int k = 0; tw_keys[k]; k++) {
+                if (cst_str_eq(tokens[0], tw_keys[k])) {
+                    looks_like_tw = true;
+                    break;
+                }
+            }
+            if (looks_like_tw) {
+                fprintf(stderr,
+                    "champsim_tracer: unknown option: %s\n"
+                    "  This looks like a trace_window inner key.  Use\n"
+                    "  '+' (NOT ',') between key=value pairs inside\n"
+                    "  trace_window=.  Example:\n"
+                    "    -plugin libchampsim_tracer.so,...,"
+                    "trace_window=icount:start=0+stop=20000000\n",
                     argv[i]);
+            } else {
+                fprintf(stderr, "champsim_tracer: unknown option: %s\n",
+                        argv[i]);
+            }
             return false;
         }
     }

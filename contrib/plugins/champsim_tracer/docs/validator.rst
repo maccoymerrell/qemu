@@ -40,7 +40,7 @@ Every run follows a five-stage pipeline:
    ``-nostdlib -nostartfiles`` so the trace contains only generated
    code (no libc / dynamic loader noise).
 #. **trace** — run the binary under ``qemu-<isa>`` with the plugin
-   loaded, supplying ``trace_window=icount:start=0;stop=N`` (or
+   loaded, supplying ``trace_window=icount:start=0+stop=N`` (or
    ``trace_window=symbol:...`` / ``trace_window=simpoint:...``) and
    ``memdata=1[,regdata=1]``.
 #. **analyze** — post-process the binary to extract PC spans per
@@ -102,7 +102,7 @@ Flags worth knowing:
    (3–10) exercises the IFRAME-validation path on short traces.
 
 ``--start-symbol NAME``
-   Use ``trace_window=symbol:name=NAME;simulation=<stop>`` instead of
+   Use ``trace_window=symbol:name=NAME+simulation=<stop>`` instead of
    the default icount-based window.  The validator trims
    ``correct_path`` to start at ``NAME``'s block, so symbol-based
    traces still get full CP / WP validation.
@@ -383,7 +383,7 @@ What it does:
    second simpoint interval).
 #. Writes a simpoint-selection file picking two intervals (interval
    id 0 and interval id 2).
-#. Runs ``trace_window=simpoint:file=...;interval=N;simulation=M``
+#. Runs ``trace_window=simpoint:file=...+interval=N+simulation=M``
    under the plugin.  The plugin writes each segment to its own
    file named ``<prog>_<isa>-<positionB>.cst``, where
    ``<positionB>`` is the simpoint position in billions of

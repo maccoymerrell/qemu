@@ -139,19 +139,22 @@ icount range in the per-segment statistics summary).
    single: simulation_insns
 
 The single config option that controls segmentation is
-``trace_window=MODE:KEY=VALUE;KEY=VALUE;...``: it forces the user to
+``trace_window=MODE:KEY=VALUE+KEY=VALUE+...``: it forces the user to
 pick exactly one mode and rejects keys that don't apply to it (so
 ``warmup=`` under ``icount`` is an error rather than a silent
-no-op).  The inner KEY=VALUE list is **semicolon-separated** because
-QEMU's plugin-argument parser splits on commas before the plugin
-sees its argv — embedding commas inside the value would scatter the
-pairs across separate argv entries.
+no-op).  The inner KEY=VALUE list uses **``+``** as the separator —
+``+`` is not a shell metacharacter, so the whole plugin argument
+needs no quoting.  ``;`` is also accepted for back-compat but
+requires shell-quoting the ``-plugin`` value (unquoted ``;`` is a
+command separator).  Commas can never appear inside the value
+because QEMU's plugin-argument parser splits on commas before the
+plugin sees its argv.
 
-``trace_window=icount:start=<lo>;stop=<hi>``
+``trace_window=icount:start=<lo>+stop=<hi>``
    Single contiguous window in instruction-count space.  The
    only legal keys are ``start`` and ``stop``.
 
-``trace_window=simpoint:file=<path>;interval=<insns>;warmup=<insns>;simulation=<insns>``
+``trace_window=simpoint:file=<path>+interval=<insns>+warmup=<insns>+simulation=<insns>``
    One segment per simpoint listed in ``file``.  ``interval``
    defaults to ``100000000`` and must match the granularity used to
    *generate* the simpoint file.  ``warmup`` (default ``0``) traces
@@ -193,7 +196,7 @@ pairs across separate argv entries.
       178 1                    0.3001 1
       933 2                    0.1876 2
 
-``trace_window=symbol:name=<sym>;occurrence=<N>;simulation=<insns>``
+``trace_window=symbol:name=<sym>+occurrence=<N>+simulation=<insns>``
    Trace begins on the *N*-th time the named symbol appears as a
    basic-block entry, then runs for ``simulation`` architectural
    instructions before the process is exited (or for the rest of
@@ -207,9 +210,9 @@ pairs across separate argv entries.
 
 Examples::
 
-   trace_window=icount:start=0;stop=20000000
-   trace_window=simpoint:file=mcf.sp;interval=100000000;warmup=2000000;simulation=20000000
-   trace_window=symbol:name=main;occurrence=3;simulation=20000000
+   trace_window=icount:start=0+stop=20000000
+   trace_window=simpoint:file=mcf.sp+interval=100000000+warmup=2000000+simulation=20000000
+   trace_window=symbol:name=main+occurrence=3+simulation=20000000
 
 Without ``trace_window=`` the segment opens at process start and runs
 until the guest exits — equivalent to ``trace_window=icount:start=0``
@@ -429,8 +432,8 @@ the workload's data footprint; enable per-member compression
 .. code-block:: console
 
    $ qemu-x86_64 -plugin ./libchampsim_tracer.so,outfile=run,wp=1,\
-   trace_window=simpoint:file=run.simpts;interval=100000000;\
-   warmup=100000000;simulation=100000000 \
+   trace_window=simpoint:file=run.simpts+interval=100000000+\
+   warmup=100000000+simulation=100000000 \
                  ./prog
 
 One per-simpoint ``.cst`` file with 100 M warmup + 100 M evaluation
@@ -442,7 +445,7 @@ on multi-billion-instruction workloads in tractable trace volume.
 .. code-block:: console
 
    $ qemu-x86_64 -plugin ./libchampsim_tracer.so,outfile=run,wp=1,\
-   trace_window=symbol:name=main;occurrence=1;simulation=20000000 \
+   trace_window=symbol:name=main+occurrence=1+simulation=20000000 \
                  ./prog
 
 Trace opens the first time ``main`` is entered as a TB and captures
@@ -595,7 +598,7 @@ above-listed sources permit, wrap the QEMU invocation like this:
      taskset -c 0 setarch -R \
      qemu-x86_64 -seed 42 \
        -plugin ./libchampsim_tracer.so,outfile=run,wp=1,memdata=1,regdata=1,\
-                trace_window=icount:start=0;stop=20000000 \
+                trace_window=icount:start=0+stop=20000000 \
        ./your_workload
 
 What each piece does:

@@ -73,6 +73,7 @@ enum class Metric {
     GenOp,
     GenReg,
     BtbMiss,
+    WpDivergence,
 };
 
 struct Options {
@@ -110,8 +111,12 @@ struct Options {
 "  -m wp_insns      Wasted WP insns/1k under gshare (lines per --history)\n"
 "  -m wp_memops     Wasted WP memops/1k under gshare (lines per --history)\n"
 "  -m btb_miss      BTB miss rate (lines per --btb-entries)\n"
-"  -m mem_pat       Memory-access-pattern breakdown (CP+WP stacked area)\n"
-"  -m branch_dir    Branch direction / class breakdown (CP+WP stacked area)\n"
+"  -m wp_divergence Fraction of WP branches whose predicted next-PC\n"
+"                   differs from the recorded WP chain target (i.e.\n"
+"                   the speculative path a real predictor would take\n"
+"                   that the trace's single WP path does not cover)\n"
+"  -m mem_pat       Memory-access-pattern breakdown (CP top / WP bottom)\n"
+"  -m branch_dir    Branch direction / class breakdown (CP top / WP bottom)\n"
 "  -m gen_op        GenericOpcode breakdown, top-K + other\n"
 "  -m gen_reg       Generic destination-register breakdown, top-K + other\n"
 "\n"
@@ -180,6 +185,7 @@ static Metric parse_metric(const char *s)
     if (!std::strcmp(s, "gen_op"))      return Metric::GenOp;
     if (!std::strcmp(s, "gen_reg"))     return Metric::GenReg;
     if (!std::strcmp(s, "btb_miss"))    return Metric::BtbMiss;
+    if (!std::strcmp(s, "wp_divergence")) return Metric::WpDivergence;
     std::fprintf(stderr, "cst_visualize: unknown metric '%s'\n", s);
     std::exit(2);
 }
@@ -397,13 +403,21 @@ struct Series {
 };
 
 struct ChartPlan {
-    /* Chart geometry. */
-    int     width        = 1280;
-    int     height       = 600;
+    /* Chart geometry — describes where in the SVG this plan
+     * renders.  Default (0/0/W/H) fills the whole canvas; dual-plot
+     * mode sets up two ChartPlans whose viewports share the SVG. */
+    int     viewport_x   = 0;
+    int     viewport_y   = 0;
+    int     viewport_w   = 1280;
+    int     viewport_h   = 600;
     int     margin_left  = 80;
     int     margin_right = 220; /* room for legend */
     int     margin_top   = 50;
     int     margin_bot   = 60;
+    /* When false, the x-axis tick numbers (instruction-count
+     * labels) are suppressed — useful when stacking plots so only
+     * the bottom plot prints the shared x-axis. */
+    bool    show_x_labels = true;
 
     std::string title;
     std::string x_label;
@@ -493,16 +507,43 @@ static std::string fmt_double(double v, bool percent)
     return buf;
 }
 
-static void render_svg(std::FILE *out, const ChartPlan &plan)
+/* Write the <svg ...> opening tag + background.  Caller follows with
+ * one or more render_plan() calls and a write_svg_footer(). */
+static void write_svg_header(std::FILE *out, int width, int height)
 {
-    const int W = plan.width;
-    const int H = plan.height;
-    const int L = plan.margin_left;
-    const int R = plan.margin_right;
-    const int T = plan.margin_top;
-    const int B = plan.margin_bot;
-    const int plot_w = W - L - R;
-    const int plot_h = H - T - B;
+    std::fprintf(out,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" "
+        "viewBox=\"0 0 %d %d\" width=\"%d\" height=\"%d\" "
+        "font-family=\"-apple-system, system-ui, sans-serif\" "
+        "font-size=\"12\">\n",
+        width, height, width, height);
+    std::fprintf(out,
+        "<rect width=\"%d\" height=\"%d\" fill=\"#ffffff\"/>\n",
+        width, height);
+}
+
+static void write_svg_footer(std::FILE *out)
+{
+    std::fprintf(out, "</svg>\n");
+}
+
+/* Render one ChartPlan into its viewport.  Multiple plans can be
+ * rendered into the same SVG by giving them disjoint viewports. */
+static void render_plan(std::FILE *out, const ChartPlan &plan)
+{
+    const int VX = plan.viewport_x;
+    const int VY = plan.viewport_y;
+    const int VW = plan.viewport_w;
+    const int VH = plan.viewport_h;
+    /* L/R/T are absolute SVG coords; plot_w/plot_h are plot-area
+     * extents inside the per-plan margins. */
+    const int L = VX + plan.margin_left;
+    const int R_edge = VX + VW - plan.margin_right;
+    const int T = VY + plan.margin_top;
+    const int B_edge = VY + VH - plan.margin_bot;
+    const int plot_w = R_edge - L;
+    const int plot_h = B_edge - T;
 
     auto x_of = [&](double bin_idx) {
         return L + (bin_idx / std::max(plan.n_bins, 1)) * plot_w;
@@ -513,18 +554,6 @@ static void render_svg(std::FILE *out, const ChartPlan &plan)
         if (frac > 1) frac = 1;
         return T + plot_h - frac * plot_h;
     };
-
-    std::fprintf(out,
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" "
-        "viewBox=\"0 0 %d %d\" width=\"%d\" height=\"%d\" "
-        "font-family=\"-apple-system, system-ui, sans-serif\" "
-        "font-size=\"12\">\n",
-        W, H, W, H);
-
-    /* Background. */
-    std::fprintf(out,
-        "<rect width=\"%d\" height=\"%d\" fill=\"#ffffff\"/>\n", W, H);
 
     /* Plot frame. */
     std::fprintf(out,
@@ -549,7 +578,6 @@ static void render_svg(std::FILE *out, const ChartPlan &plan)
 
     /* X-axis labels. */
     int x_ticks = 6;
-    uint64_t total_insns = plan.x_bin_size * (uint64_t)plan.n_bins;
     for (int t = 0; t <= x_ticks; t++) {
         double bin = (plan.n_bins * (double)t) / x_ticks;
         uint64_t insn = (uint64_t)(plan.x_bin_size * bin);
@@ -558,19 +586,21 @@ static void render_svg(std::FILE *out, const ChartPlan &plan)
             "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
             "stroke=\"#cccccc\" stroke-width=\"1\"/>\n",
             x, T + plot_h, x, T + plot_h + 4);
-        std::fprintf(out,
-            "<text x=\"%.2f\" y=\"%d\" text-anchor=\"middle\" "
-            "fill=\"#555\">%s</text>\n",
-            x, T + plot_h + 18, xml_escape(fmt_count(insn)).c_str());
+        if (plan.show_x_labels) {
+            std::fprintf(out,
+                "<text x=\"%.2f\" y=\"%d\" text-anchor=\"middle\" "
+                "fill=\"#555\">%s</text>\n",
+                x, T + plot_h + 18,
+                xml_escape(fmt_count(insn)).c_str());
+        }
     }
-    (void)total_insns;
 
     /* Axis labels. */
-    if (!plan.x_label.empty()) {
+    if (!plan.x_label.empty() && plan.show_x_labels) {
         std::fprintf(out,
             "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" "
             "fill=\"#333\" font-size=\"13\">%s</text>\n",
-            L + plot_w / 2, H - 12, xml_escape(plan.x_label).c_str());
+            L + plot_w / 2, B_edge - 8, xml_escape(plan.x_label).c_str());
     }
     if (!plan.y_label.empty()) {
         int yx = 22, yy = T + plot_h / 2;
@@ -670,8 +700,6 @@ static void render_svg(std::FILE *out, const ChartPlan &plan)
             ly = T + 8;
         }
     }
-
-    std::fprintf(out, "</svg>\n");
 }
 
 /* ===================================================================
@@ -758,15 +786,39 @@ struct WalkCtx {
     };
     std::vector<OpcodeInsnCounts> precomp;
 
-    /* Predictors (only populated for gshare-driven metrics). */
+    /* Predictors (only populated for gshare-driven metrics).  The
+     * second set is CP+WP-pulluted: WP branches in each entry's
+     * chain also update it, modelling the speculative pollution a
+     * real predictor sees but a stat-tool driving only on CP
+     * outcomes would not. */
     std::vector<GShare> predictors;
-    /* BTBs (only populated for btb_miss).  One per --btb-entries value;
-     * a single per-entry walk feeds all of them so distinct sizes
-     * see identical access streams. */
+    std::vector<GShare> predictors_corrupted;
+    /* BTBs (only populated for btb_miss / wp_divergence).  One per
+     * --btb-entries value; a single per-entry walk feeds all of
+     * them so distinct sizes see identical access streams. */
     std::vector<BTB>    btbs;
+    std::vector<BTB>    btbs_corrupted;
     /* Per-bin total branches observed by BTB, used to convert raw
      * miss counters to miss-rate (misses/branch). */
     std::vector<uint64_t> btb_branches_per_bin;
+
+    /* Parallel bin matrix for the bottom pane in dual-plot metrics.
+     * bins_wp.n_series == bins.n_series for predictor metrics
+     * (corrupted variant) and may differ for breakdown metrics
+     * (different label set / count). */
+    BinMatrix bins_wp;
+    /* Per-bin total WP memops / WP branches observed, used as
+     * normalisers for the wp_divergence metric and as the
+     * denominator for the WP breakdown panes' percent-stacking. */
+    std::vector<uint64_t> wp_branches_per_bin;
+
+    /* For wp_divergence: per-CP-bin vector of "match depth"
+     * observations — how many WP-chain edges the BP+BTB model
+     * predicts correctly before it diverges from the recorded chain
+     * (or runs the chain to completion).  One observation per CP
+     * branch whose chain has at least one edge.  Sorted later to
+     * compute min / median / max along with the running mean. */
+    std::vector<std::vector<int>> wp_depth_per_bin;
 
     /* For branch_dir / gen_op / gen_reg: dynamic label -> series-id
      * mapping built as we encounter new names. */
@@ -865,26 +917,44 @@ static void handle_gshare_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
 
     /* Resolve the PREVIOUS entry's branch outcome now that we know
      * this entry's start_pc.  Taken iff this start_pc != previous
-     * fall_through. */
+     * fall_through.  Drive both predictor variants: pred[*] sees
+     * only CP outcomes; pred_corrupted[*] also sees the just-
+     * completed WP chain's branches (loop below). */
+    auto resolve_cp = [&](int pi, bool taken) {
+        GShare &g = ctx.predictors[pi];
+        bool pred = g.predict(ctx.pending_branch_pc);
+        bool mispred = (pred != taken);
+        if (ctx.opts.metric == Metric::BranchMpki) {
+            if (mispred) ctx.bins.at(pi, (int)ctx.pending_bin) += 1.0;
+        } else if (ctx.opts.metric == Metric::WpInsns) {
+            if (mispred) ctx.bins.at(pi, (int)ctx.pending_bin)
+                            += ctx.pending_wp_insns;
+        } else if (ctx.opts.metric == Metric::WpMemops) {
+            if (mispred) ctx.bins.at(pi, (int)ctx.pending_bin)
+                            += ctx.pending_wp_memops;
+        }
+        g.update(ctx.pending_branch_pc, taken);
+    };
+    auto resolve_corrupted = [&](int pi, bool taken) {
+        GShare &g = ctx.predictors_corrupted[pi];
+        bool pred = g.predict(ctx.pending_branch_pc);
+        bool mispred = (pred != taken);
+        if (ctx.opts.metric == Metric::BranchMpki) {
+            if (mispred) ctx.bins_wp.at(pi, (int)ctx.pending_bin) += 1.0;
+        } else if (ctx.opts.metric == Metric::WpInsns) {
+            if (mispred) ctx.bins_wp.at(pi, (int)ctx.pending_bin)
+                            += ctx.pending_wp_insns;
+        } else if (ctx.opts.metric == Metric::WpMemops) {
+            if (mispred) ctx.bins_wp.at(pi, (int)ctx.pending_bin)
+                            += ctx.pending_wp_memops;
+        }
+        g.update(ctx.pending_branch_pc, taken);
+    };
     if (ctx.have_pending && ctx.pending_is_branch) {
         bool taken = (t.start_pc != ctx.pending_fall_pc);
-        int  pbin  = (int)ctx.pending_bin;
         for (size_t pi = 0; pi < ctx.predictors.size(); pi++) {
-            GShare &g = ctx.predictors[pi];
-            bool pred = g.predict(ctx.pending_branch_pc);
-            bool mispred = (pred != taken);
-            if (ctx.opts.metric == Metric::BranchMpki) {
-                if (mispred) ctx.bins.at((int)pi, pbin) += 1.0;
-            } else if (ctx.opts.metric == Metric::WpInsns) {
-                if (mispred) {
-                    ctx.bins.at((int)pi, pbin) += ctx.pending_wp_insns;
-                }
-            } else if (ctx.opts.metric == Metric::WpMemops) {
-                if (mispred) {
-                    ctx.bins.at((int)pi, pbin) += ctx.pending_wp_memops;
-                }
-            }
-            g.update(ctx.pending_branch_pc, taken);
+            resolve_cp((int)pi, taken);
+            resolve_corrupted((int)pi, taken);
         }
     }
 
@@ -918,6 +988,28 @@ static void handle_gshare_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
         }
     }
 
+    /* WP-side predictor pollution.  Walk the just-completed WP
+     * chain pairwise: WP entry i's terminating branch resolved to
+     * WP entry i+1's start_pc.  For each such branch, update the
+     * CORRUPTED predictors only (the CP-only set is by design
+     * insulated from WP).  The chain's last entry's branch has no
+     * recorded successor, so we drop it. */
+    for (size_t i = 0; i + 1 < e.wp_entries.size(); i++) {
+        const auto &cur_wp  = e.wp_entries[i];
+        const auto &next_wp = e.wp_entries[i + 1];
+        auto it = ctx.by_id->find(cur_wp.template_id);
+        if (it == ctx.by_id->end()) continue;
+        auto nit = ctx.by_id->find(next_wp.template_id);
+        if (nit == ctx.by_id->end()) continue;
+        const WalkCtx::TermBranch &wtb = ctx.term[it->second];
+        if (!wtb.is_branch || !wtb.is_conditional) continue;
+        const cst::Template &nt = (*ctx.templates)[nit->second];
+        bool taken = (nt.start_pc != wtb.fall_through);
+        for (auto &g : ctx.predictors_corrupted) {
+            g.update(wtb.pc, taken);
+        }
+    }
+
     ctx.cp_insns_so_far += n_insns;
 }
 
@@ -934,7 +1026,8 @@ static void handle_btb_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
 
     /* Resolve previous branch's observed target via this entry's
      * start_pc, then drive each BTB and tally misses into the
-     * previous bin. */
+     * previous bin.  Two parallel sets of BTBs: cp_only sees CP
+     * targets exclusively; corrupted sees CP + WP. */
     if (ctx.have_pending && ctx.pending_is_branch) {
         uint64_t actual_target = t.start_pc;
         int  pbin = (int)ctx.pending_bin;
@@ -949,6 +1042,13 @@ static void handle_btb_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
                                             actual_target);
             if (!hit && pbin < ctx.opts.bins) {
                 ctx.bins.at((int)bi, pbin) += 1.0;
+            }
+        }
+        for (size_t bi = 0; bi < ctx.btbs_corrupted.size(); bi++) {
+            bool hit = ctx.btbs_corrupted[bi].access(
+                ctx.pending_branch_pc, actual_target);
+            if (!hit && pbin < ctx.opts.bins) {
+                ctx.bins_wp.at((int)bi, pbin) += 1.0;
             }
         }
     }
@@ -970,6 +1070,26 @@ static void handle_btb_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
     ctx.pending_fall_pc   = tb.fall_through;
     ctx.pending_is_branch = tb.is_branch;
 
+    /* WP-side BTB pollution.  Walk this entry's WP chain pairwise:
+     * WP entry i's terminating branch resolved to WP entry i+1's
+     * start_pc.  Feed each (PC, target) into the corrupted BTBs
+     * only.  These accesses pollute the LRU but DO NOT count toward
+     * the displayed CP miss rate (which only measures CP branches). */
+    for (size_t i = 0; i + 1 < e.wp_entries.size(); i++) {
+        const auto &cur_wp  = e.wp_entries[i];
+        const auto &next_wp = e.wp_entries[i + 1];
+        auto it = ctx.by_id->find(cur_wp.template_id);
+        if (it == ctx.by_id->end()) continue;
+        auto nit = ctx.by_id->find(next_wp.template_id);
+        if (nit == ctx.by_id->end()) continue;
+        const WalkCtx::TermBranch &wtb = ctx.term[it->second];
+        if (!wtb.is_branch) continue;
+        const cst::Template &nt = (*ctx.templates)[nit->second];
+        for (auto &b : ctx.btbs_corrupted) {
+            (void)b.access(wtb.pc, nt.start_pc);
+        }
+    }
+
     ctx.cp_insns_so_far += n_insns;
 }
 
@@ -977,16 +1097,27 @@ static void handle_mem_pat_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
 {
     const cst::Template &t = (*ctx.templates)[ctx.by_id->at(e.template_id)];
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
-    /* Layers: 0=none, 1=regular, 2=irregular, 3=random.  Counted in
-     * units of (memops_on_this_visit) per insn — i.e. how many CP
-     * load/store operations of each pattern class ran in this bin. */
+    /* Layers: 0=none, 1=regular, 2=irregular, 3=random.  CP-side
+     * counted in units of memops on this visit (one CP memop per
+     * dyn_param entry); WP-side aggregates the same way over each
+     * WP entry's dyn_params, using its own template's pat_wp. */
     for (const auto &dp : e.dyn_params) {
         if (dp.insn_index >= t.insns.size()) continue;
-        /* Per-insn profile is template-static (pat_cp). */
         if (dp.insn_index >= t.profile.insns.size()) continue;
         uint8_t pat = t.profile.insns[dp.insn_index].pat_cp;
         if (pat > 3) pat = 0;
         ctx.bins.at((int)pat, bin) += 1.0;
+    }
+    for (const auto &wp : e.wp_entries) {
+        auto it = ctx.by_id->find(wp.template_id);
+        if (it == ctx.by_id->end()) continue;
+        const cst::Template &wt = (*ctx.templates)[it->second];
+        for (const auto &dp : wp.dyn_params) {
+            if (dp.insn_index >= wt.profile.insns.size()) continue;
+            uint8_t pat = wt.profile.insns[dp.insn_index].pat_wp;
+            if (pat > 3) pat = 0;
+            ctx.bins_wp.at((int)pat, bin) += 1.0;
+        }
     }
     ctx.cp_insns_so_far += t.insns.size();
 }
@@ -1028,6 +1159,27 @@ static void handle_branch_dir_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
     ctx.pending_fall_pc   = tb.fall_through;
     ctx.pending_is_branch = tb.is_branch;
 
+    /* WP-side branch direction breakdown.  Walk the chain pairwise
+     * to recover each WP branch's taken/not-taken; the chain's last
+     * entry has no recorded successor and is dropped. */
+    for (size_t i = 0; i + 1 < e.wp_entries.size(); i++) {
+        const auto &cur_wp  = e.wp_entries[i];
+        const auto &next_wp = e.wp_entries[i + 1];
+        auto it = ctx.by_id->find(cur_wp.template_id);
+        if (it == ctx.by_id->end()) continue;
+        auto nit = ctx.by_id->find(next_wp.template_id);
+        if (nit == ctx.by_id->end()) continue;
+        const WalkCtx::TermBranch &wtb = ctx.term[it->second];
+        if (!wtb.is_branch) continue;
+        const cst::Template &nt = (*ctx.templates)[nit->second];
+        bool wp_taken = (nt.start_pc != wtb.fall_through);
+        std::string label = wtb.is_conditional
+            ? wtb.class_name + (wp_taken ? " taken" : " not-taken")
+            : wtb.class_name;
+        int sid = ctx.add_label(label);
+        ctx.bins_wp.at(sid, bin) += 1.0;
+    }
+
     ctx.cp_insns_so_far += t.insns.size();
 }
 
@@ -1039,6 +1191,93 @@ static void handle_genop_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
     for (const auto &p : precomp.series_increments) {
         ctx.bins.at(p.first, bin) += p.second;
     }
+    ctx.cp_insns_so_far += t.insns.size();
+}
+
+/* wp_divergence: for each CP branch's WP chain, how many edges does
+ * a real-hardware predictor (BP + BTB) follow before its predicted
+ * next-PC stops matching the recorded WP chain?  That depth tells
+ * us how far the trace's single recorded wrong-path covers the
+ * paths a real machine would actually take.  Per CP-insn bin we
+ * collect the depths into a vector and render min / mean / median /
+ * max over the run.
+ *
+ * Uses a single BP variant (largest --history) and a single BTB
+ * (largest --btb-entries); sensitivity to those parameters is left
+ * to the dedicated branch_mpki / btb_miss metrics.
+ */
+static void handle_wp_divergence_entry(WalkCtx &ctx,
+                                        const cst::DecodedEntry &e)
+{
+    const cst::Template &t = (*ctx.templates)[ctx.by_id->at(e.template_id)];
+    int bin = bin_of(ctx, ctx.cp_insns_so_far);
+
+    /* Train predictors / BTB on the previous CP branch, before
+     * stepping the WP chain. */
+    if (ctx.have_pending && ctx.pending_is_branch) {
+        bool taken = (t.start_pc != ctx.pending_fall_pc);
+        for (auto &g : ctx.predictors) g.update(ctx.pending_branch_pc, taken);
+        for (auto &b : ctx.btbs)       b.access(ctx.pending_branch_pc, t.start_pc);
+    }
+    const WalkCtx::TermBranch &tb =
+        ctx.term[ctx.by_id->at(e.template_id)];
+    ctx.have_pending      = true;
+    ctx.pending_bin       = (uint64_t)bin;
+    ctx.pending_branch_pc = tb.pc;
+    ctx.pending_fall_pc   = tb.fall_through;
+    ctx.pending_is_branch = tb.is_branch;
+
+    if (e.wp_entries.size() < 2) {
+        ctx.cp_insns_so_far += t.insns.size();
+        return;
+    }
+
+    /* Walk the chain pairwise: count how many leading edges the
+     * BP+BTB predicts to the recorded successor before the first
+     * mismatch.  Walk to the END if every prediction matches; the
+     * depth then equals (chain_size - 1) and represents "the trace's
+     * WP recording is consistent with what a real predictor would
+     * have taken." */
+    int matched = 0;
+    bool diverged = false;
+    for (size_t i = 0; i + 1 < e.wp_entries.size(); i++) {
+        const auto &cur_wp  = e.wp_entries[i];
+        const auto &next_wp = e.wp_entries[i + 1];
+        auto it = ctx.by_id->find(cur_wp.template_id);
+        if (it == ctx.by_id->end()) break;
+        auto nit = ctx.by_id->find(next_wp.template_id);
+        if (nit == ctx.by_id->end()) break;
+        const WalkCtx::TermBranch &wtb = ctx.term[it->second];
+        if (!wtb.is_branch) break;
+        const cst::Template &nt = (*ctx.templates)[nit->second];
+        uint64_t actual_target = nt.start_pc;
+        bool wp_taken = (actual_target != wtb.fall_through);
+
+        GShare &g = ctx.predictors[0];
+        BTB    &b = ctx.btbs[0];
+        bool pred_taken = wtb.is_conditional ? g.predict(wtb.pc) : true;
+        auto btb_it = b.table.find(wtb.pc);
+        uint64_t pred_target = pred_taken
+            ? (btb_it != b.table.end() ? btb_it->second.target
+                                        : wtb.fall_through)
+            : wtb.fall_through;
+        if (pred_target == actual_target) {
+            matched++;
+        } else {
+            diverged = true;
+        }
+        g.update(wtb.pc, wp_taken);
+        b.access(wtb.pc, actual_target);
+        if (diverged) break;
+    }
+
+    /* Record the observation in the bin's depth list, growing it as
+     * needed. */
+    if ((int)ctx.wp_depth_per_bin.size() <= bin) {
+        ctx.wp_depth_per_bin.resize(bin + 1);
+    }
+    ctx.wp_depth_per_bin[bin].push_back(matched);
+
     ctx.cp_insns_so_far += t.insns.size();
 }
 
@@ -1185,18 +1424,37 @@ int main(int argc, char **argv)
                opts.metric == Metric::WpMemops) {
         for (int hl : opts.histories) {
             ctx.predictors.emplace_back(hl, opts.pht_bits);
+            ctx.predictors_corrupted.emplace_back(hl, opts.pht_bits);
             char b[32];
             std::snprintf(b, sizeof(b), "history=%d", hl);
             ctx.add_label(b);
         }
     } else if (opts.metric == Metric::BtbMiss) {
         ctx.btbs.reserve(opts.btb_entries.size());
+        ctx.btbs_corrupted.reserve(opts.btb_entries.size());
         for (int n : opts.btb_entries) {
             ctx.btbs.emplace_back(n);
+            ctx.btbs_corrupted.emplace_back(n);
             char b[32];
             std::snprintf(b, sizeof(b), "%d entries", n);
             ctx.add_label(b);
         }
+    } else if (opts.metric == Metric::WpDivergence) {
+        /* BP variants: one line per history.  A single BTB (the
+         * largest configured size) plays the role of an oracle
+         * target store; sensitivity to BTB capacity is left to
+         * the dedicated btb_miss metric. */
+        for (int hl : opts.histories) {
+            ctx.predictors.emplace_back(hl, opts.pht_bits);
+            char b[32];
+            std::snprintf(b, sizeof(b), "history=%d", hl);
+            ctx.add_label(b);
+        }
+        int biggest = 0;
+        for (int n : opts.btb_entries) {
+            if (n > biggest) biggest = n;
+        }
+        if (biggest > 0) ctx.btbs.emplace_back(biggest);
     }
     /* branch_dir labels are allocated lazily as classes appear.  Pre-
      * seed with "no branch" series so it always renders even when no
@@ -1223,6 +1481,8 @@ int main(int argc, char **argv)
             fn = handle_genreg_entry; break;
         case Metric::BtbMiss:
             fn = handle_btb_entry; break;
+        case Metric::WpDivergence:
+            fn = handle_wp_divergence_entry; break;
     }
 
     walker.walk([&](const cst::DecodedEntry &e) { fn(ctx, e); });
@@ -1237,8 +1497,8 @@ int main(int argc, char **argv)
 
     /* Build the chart plan and render. */
     ChartPlan plan;
-    plan.width  = opts.width;
-    plan.height = opts.height;
+    plan.viewport_w = opts.width;
+    plan.viewport_h = opts.height;
     plan.n_bins = actual_bins;
     plan.x_bin_size = bin_width;
     plan.x_label = "CP instruction window";
@@ -1254,6 +1514,8 @@ int main(int argc, char **argv)
                 return "Wasted wrong-path memops / 1k CP";
             case Metric::BtbMiss:
                 return "BTB miss rate";
+            case Metric::WpDivergence:
+                return "Wrong-path divergence vs trace's recorded WP";
             case Metric::MemPat:
                 return "Memory-access pattern breakdown";
             case Metric::BranchDir:
@@ -1276,55 +1538,140 @@ int main(int argc, char **argv)
         return n == 0 ? 0.0 : v * 1000.0 / (double)n;
     };
 
+    /* For metrics that produce a second pane (CP+WP variant) we
+     * build a parallel ChartPlan that gets stacked below the main
+     * one in the same SVG.  has_second_pane stays false for
+     * single-pane metrics. */
+    ChartPlan plan2 = plan;
+    bool has_second_pane = false;
+    auto build_lines_plan = [&](ChartPlan &p, const BinMatrix &mat,
+                                const std::vector<int> &series_count_list,
+                                std::function<double(double, int)> normalize,
+                                const std::string &y_label_str,
+                                bool cap_at_one) -> double {
+        p.mode = ChartPlan::Mode::Lines;
+        p.y_label = y_label_str;
+        double y_max = 0.0;
+        p.series.resize(series_count_list.size());
+        for (size_t i = 0; i < series_count_list.size(); i++) {
+            p.series[i].label = ctx.label_names[i];
+            p.series[i].color = palette_color(i);
+            p.series[i].y.resize(actual_bins);
+            for (int b = 0; b < actual_bins; b++) {
+                double v = normalize(mat.get((int)i, b), b);
+                p.series[i].y[b] = v;
+                if (b >= opts.warmup_bins && v > y_max) y_max = v;
+            }
+        }
+        double scaled = (y_max > 0) ? y_max * 1.1 : 1.0;
+        p.y_max = cap_at_one ? std::min(1.0, scaled) : scaled;
+        p.warmup_bins = opts.warmup_bins;
+        return p.y_max;
+    };
+
     switch (opts.metric) {
-        case Metric::BranchMpki:
+        case Metric::BranchMpki: {
+            /* Dual: CP-only-trained predictor vs CP+WP-polluted
+             * predictor.  Same y-scale so the gap is read directly
+             * as the speculative-pollution cost. */
+            double m1 = build_lines_plan(plan, ctx.bins, opts.histories,
+                                          per_kilo,
+                                          "Mispredictions per 1k CP", false);
+            double m2 = build_lines_plan(plan2, ctx.bins_wp,
+                                          opts.histories,
+                                          per_kilo,
+                                          "Mispredictions per 1k CP", false);
+            double yshared = std::max(m1, m2);
+            plan.y_max = plan2.y_max = yshared;
+            plan.title  = std::string(pick_title()) + " (CP-only)";
+            plan2.title = std::string(pick_title()) + " (CP + WP-polluted)";
+            has_second_pane = true;
+            break;
+        }
         case Metric::WpInsns:
         case Metric::WpMemops: {
-            plan.mode = ChartPlan::Mode::Lines;
-            plan.y_label = (opts.metric == Metric::BranchMpki)
-                ? "Mispredictions per 1k CP insns"
-                : (opts.metric == Metric::WpInsns
-                    ? "Wasted WP insns / 1k CP" :
-                    "Wasted WP memops / 1k CP");
-            double y_max = 0.0;
-            plan.series.resize(opts.histories.size());
-            for (size_t i = 0; i < opts.histories.size(); i++) {
-                plan.series[i].label = ctx.label_names[i];
-                plan.series[i].color = palette_color(i);
-                plan.series[i].y.resize(actual_bins);
-                for (int b = 0; b < actual_bins; b++) {
-                    double v = per_kilo(ctx.bins.get((int)i, b), b);
-                    plan.series[i].y[b] = v;
-                    /* Skip warmup bins from y_max scaling — the
-                     * predictor's untrained transient would otherwise
-                     * dominate the chart's vertical range. */
-                    if (b >= opts.warmup_bins && v > y_max) y_max = v;
-                }
-            }
-            plan.y_max = (y_max > 0) ? y_max * 1.1 : 1.0;
-            plan.warmup_bins = opts.warmup_bins;
+            /* Single pane.  These count *the recorded WP chain's
+             * work that would have been wasted on mispredicted CP
+             * branches*, weighted by misprediction under each
+             * --history.  A CP-only-vs-polluted-predictor split
+             * doesn't add interpretable information here because the
+             * underlying WP chain lengths are fixed by the trace —
+             * the predictor only gates whether to count them.  Use
+             * branch_mpki to see the polluted-vs-clean predictor
+             * quality directly. */
+            std::string ylab = (opts.metric == Metric::WpInsns)
+                ? "Wasted WP insns / 1k CP"
+                : "Wasted WP memops / 1k CP";
+            build_lines_plan(plan, ctx.bins, opts.histories,
+                             per_kilo, ylab, false);
             break;
         }
         case Metric::BtbMiss: {
+            auto miss_rate = [&](double v, int b) {
+                uint64_t d = b < (int)ctx.btb_branches_per_bin.size()
+                                ? ctx.btb_branches_per_bin[b] : 0;
+                return d == 0 ? 0.0 : v / (double)d;
+            };
+            double m1 = build_lines_plan(plan, ctx.bins, opts.btb_entries,
+                                          miss_rate, "Miss rate", true);
+            double m2 = build_lines_plan(plan2, ctx.bins_wp,
+                                          opts.btb_entries,
+                                          miss_rate, "Miss rate", true);
+            double yshared = std::max(m1, m2);
+            plan.y_max = plan2.y_max = yshared;
+            plan.percent = plan2.percent = true;
+            plan.title  = std::string(pick_title()) + " (CP-only)";
+            plan2.title = std::string(pick_title()) + " (CP + WP-polluted)";
+            has_second_pane = true;
+            break;
+        }
+        case Metric::WpDivergence: {
+            /* Per CP-bin, compute (min, mean, median, max) match-
+             * depth across all CP branches whose WP chain we sized
+             * up against the BP+BTB model.  Renders as four
+             * overlaid lines so the centre tendency and the spread
+             * are both visible — bins where the model usually
+             * follows the recorded WP deep have all four lines
+             * high; bins where it diverges early have low values
+             * with a wide min/max gap. */
             plan.mode = ChartPlan::Mode::Lines;
-            plan.y_label = "Miss rate";
-            plan.percent = true;
-            double y_max = 0.0;
-            plan.series.resize(opts.btb_entries.size());
-            for (size_t i = 0; i < opts.btb_entries.size(); i++) {
-                plan.series[i].label = ctx.label_names[i];
-                plan.series[i].color = palette_color(i);
-                plan.series[i].y.resize(actual_bins);
-                for (int b = 0; b < actual_bins; b++) {
-                    uint64_t denom = b < (int)ctx.btb_branches_per_bin.size()
-                        ? ctx.btb_branches_per_bin[b] : 0;
-                    double v = denom == 0 ? 0.0
-                        : ctx.bins.get((int)i, b) / (double)denom;
-                    plan.series[i].y[b] = v;
-                    if (b >= opts.warmup_bins && v > y_max) y_max = v;
-                }
+            plan.y_label = "WP chain match depth (edges)";
+            plan.series.resize(4);
+            plan.series[0].label = "min";
+            plan.series[1].label = "median";
+            plan.series[2].label = "mean";
+            plan.series[3].label = "max";
+            const char *colors[] = {
+                "#999999",  /* min: gray */
+                "#1f77b4",  /* median: blue */
+                "#ff7f0e",  /* mean: orange */
+                "#999999",  /* max: gray */
+            };
+            for (int s = 0; s < 4; s++) {
+                plan.series[s].color = colors[s];
+                plan.series[s].y.assign((size_t)actual_bins, 0.0);
             }
-            plan.y_max = std::min(1.0, (y_max > 0) ? y_max * 1.1 : 1.0);
+            double y_max = 0.0;
+            for (int b = 0; b < actual_bins; b++) {
+                if (b >= (int)ctx.wp_depth_per_bin.size() ||
+                    ctx.wp_depth_per_bin[b].empty()) {
+                    continue;
+                }
+                auto v = ctx.wp_depth_per_bin[b];
+                std::sort(v.begin(), v.end());
+                double mn = v.front();
+                double mx = v.back();
+                double median = v[v.size() / 2];
+                double sum = 0;
+                for (int x : v) sum += x;
+                double mean = sum / (double)v.size();
+                plan.series[0].y[b] = mn;
+                plan.series[1].y[b] = median;
+                plan.series[2].y[b] = mean;
+                plan.series[3].y[b] = mx;
+                if (b >= opts.warmup_bins && mx > y_max) y_max = mx;
+            }
+            plan.y_max = (y_max > 0) ? y_max * 1.1 : 1.0;
             plan.warmup_bins = opts.warmup_bins;
             break;
         }
@@ -1332,35 +1679,51 @@ int main(int argc, char **argv)
         case Metric::BranchDir:
         case Metric::GenOp:
         case Metric::GenReg: {
-            plan.mode = ChartPlan::Mode::Stacked;
-            plan.y_label = (opts.metric == Metric::MemPat)
-                ? "CP memops" :
-                  (opts.metric == Metric::BranchDir
-                      ? "CP branches"
-                      : (opts.metric == Metric::GenOp
-                            ? "CP insns" : "CP dst-reg refs"));
-            /* For stacked-area we want each bin to sum to 100% (the
-             * fraction of activity in each layer) so the chart reads
-             * as composition, not magnitude. */
-            plan.y_max   = 1.0;
-            plan.percent = true;
-            int S = (int)ctx.label_names.size();
-            plan.series.resize(S);
-            std::vector<double> col_total((size_t)actual_bins, 0.0);
-            for (int b = 0; b < actual_bins; b++) {
-                for (int s = 0; s < S; s++) {
-                    col_total[b] += ctx.bins.get(s, b);
-                }
+            const char *cp_y_axis;
+            const char *wp_y_axis;
+            switch (opts.metric) {
+                case Metric::MemPat:
+                    cp_y_axis = "CP memops"; wp_y_axis = "WP memops"; break;
+                case Metric::BranchDir:
+                    cp_y_axis = "CP branches"; wp_y_axis = "WP branches"; break;
+                case Metric::GenOp:
+                    cp_y_axis = "CP insns"; wp_y_axis = "WP insns"; break;
+                default:
+                    cp_y_axis = "CP dst-reg refs";
+                    wp_y_axis = "WP dst-reg refs"; break;
             }
-            for (int s = 0; s < S; s++) {
-                plan.series[s].label = ctx.label_names[s];
-                plan.series[s].color = palette_color(s);
-                plan.series[s].y.resize(actual_bins);
+            auto build_stacked = [&](ChartPlan &p, const BinMatrix &mat,
+                                     const char *y_axis_str) {
+                p.mode = ChartPlan::Mode::Stacked;
+                p.y_label = y_axis_str;
+                p.y_max   = 1.0;
+                p.percent = true;
+                int S = (int)ctx.label_names.size();
+                p.series.resize(S);
+                std::vector<double> col_total((size_t)actual_bins, 0.0);
                 for (int b = 0; b < actual_bins; b++) {
-                    double v = ctx.bins.get(s, b);
-                    plan.series[s].y[b] = col_total[b] > 0
-                        ? v / col_total[b] : 0.0;
+                    for (int s = 0; s < S; s++) {
+                        col_total[b] += mat.get(s, b);
+                    }
                 }
+                for (int s = 0; s < S; s++) {
+                    p.series[s].label = ctx.label_names[s];
+                    p.series[s].color = palette_color(s);
+                    p.series[s].y.resize(actual_bins);
+                    for (int b = 0; b < actual_bins; b++) {
+                        double v = mat.get(s, b);
+                        p.series[s].y[b] =
+                            col_total[b] > 0 ? v / col_total[b] : 0.0;
+                    }
+                }
+            };
+            build_stacked(plan, ctx.bins, cp_y_axis);
+            if (opts.metric == Metric::MemPat ||
+                opts.metric == Metric::BranchDir) {
+                build_stacked(plan2, ctx.bins_wp, wp_y_axis);
+                plan.title  = std::string(pick_title()) + " (CP)";
+                plan2.title = std::string(pick_title()) + " (WP)";
+                has_second_pane = true;
             }
             break;
         }
@@ -1375,7 +1738,38 @@ int main(int argc, char **argv)
             return 1;
         }
     }
-    render_svg(out, plan);
+
+    if (has_second_pane) {
+        /* Two panes stacked vertically.  The top pane suppresses
+         * its x-axis tick labels and x_label; the shared instruction
+         * axis is printed once under the bottom pane. */
+        plan.viewport_x  = 0;
+        plan.viewport_y  = 0;
+        plan.viewport_w  = opts.width;
+        plan.viewport_h  = opts.height / 2;
+        plan.show_x_labels = false;
+        plan.x_label = "";
+
+        plan2.viewport_x = 0;
+        plan2.viewport_y = opts.height / 2;
+        plan2.viewport_w = opts.width;
+        plan2.viewport_h = opts.height - opts.height / 2;
+        plan2.n_bins     = actual_bins;
+        plan2.x_bin_size = bin_width;
+        plan2.x_label    = "CP instruction window";
+        plan2.show_x_labels = true;
+
+        write_svg_header(out, opts.width, opts.height);
+        render_plan(out, plan);
+        render_plan(out, plan2);
+        write_svg_footer(out);
+    } else {
+        plan.viewport_w = opts.width;
+        plan.viewport_h = opts.height;
+        write_svg_header(out, opts.width, opts.height);
+        render_plan(out, plan);
+        write_svg_footer(out);
+    }
     if (opts.output) std::fclose(out);
     return 0;
 }

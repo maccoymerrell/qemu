@@ -39,7 +39,12 @@ thread_local unsigned tls_wide_cap = 0;
 GByteArray *read_scratch()
 {
     if (!tls_read_buf) {
-        tls_read_buf = g_byte_array_new();
+        /* Size the buffer up-front to the largest architectural reg
+         * we ever read (vector reg widths: x86 ZMM=64, RVV vlen up
+         * to 256, SVE Z up to 256 bytes).  Avoids the g_byte_array
+         * realloc that fired on the first wide-reg read each thread
+         * and again whenever the previous read had been narrower. */
+        tls_read_buf = g_byte_array_sized_new(256);
     } else {
         g_byte_array_set_size(tls_read_buf, 0);
     }

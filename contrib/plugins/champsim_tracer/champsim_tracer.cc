@@ -556,6 +556,13 @@ static void emit_body_entry(BodyStreamState *out_stream,
     if (enable_reg_data && !pending_reg_snaps.empty()) {
         entry.reg_snaps = std::move(pending_reg_snaps);
         pending_reg_snaps.clear();
+        /* Restore a typical-BB capacity after the move stole the
+         * allocation.  Otherwise every BB starts at cap=0 and the
+         * first few push_backs pay realloc overhead — perf showed
+         * std::vector<RegSnap>::_M_realloc_insert at 0.84% of total
+         * runtime on mcf with regdata=1.  64 slots = 16 insns × 4
+         * dst regs, well above mcf's 5-insn/2-dst-reg per BB. */
+        pending_reg_snaps.reserve(64);
     }
 
     /*

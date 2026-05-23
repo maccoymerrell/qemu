@@ -227,36 +227,23 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         }
 
         /*
-         * Drive iteration from the true-BB cache when bb_map_ has the
-         * canonical, branch-terminated assembly at pre_pc.  Otherwise
-         * fall through to qemu_plugin_exec_tb and pick up the exact-
-         * shape template of the TB that just ran from
-         * g_wp_state.last_executed_tb — set by vcpu_tb_exec from its
-         * own per-TB udata, symmetric with how the CP path picks up
-         * its current TB.  No start_pc lookup is involved: the WP-mode
-         * and CP-mode QEMU translations of the same start_pc each
-         * carry their own template and cannot conflate.
-         */
-        g_mutex_lock(&data_lock);
-        tmpl = g_bb_template_cache.find_bb_template(pre_pc);
-        g_mutex_unlock(&data_lock);
-
-        /*
-         * WP reg-data capture is post-exec, per-insn live: no wide
-         * regfile snapshot here (would read every arch reg on every WP
-         * TB, dominating regdata=1+wp=1 runs).  capture_insn_snaps_live
-         * below (after exec_tb) reads only the dst regs each insn writes.
-         * When CF_SINGLE_STEP doesn't reduce to 1 insn and multiple
-         * insns write the same reg, only the final post-fragment value
-         * is visible — identical to a wide post-fragment snap, so
-         * dropping the wide path costs no correctness.
+         * Use the TB-fragment template that vcpu_tb_exec just stashed
+         * in g_wp_state.last_executed_tb.  The previous code also did
+         * a g_bb_template_cache.find_bb_template(pre_pc) BEFORE exec_tb
+         * to prefer the canonical (assembled) true-BB template when the
+         * bb_map_ had one — but that lookup took the global data_lock
+         * per WP iter, costing ~100ns per iter × tens of millions of
+         * WP iters on full mcf runs.  The TB-fragment template is
+         * branch-terminated identically (next_tb_fragment chains the
+         * mid-TB splits) and produces the same WPBBEntry shape after
+         * the fragment-walk below; preferring it skips the mutex
+         * entirely.  capture_insn_snaps_live below (post-exec) reads
+         * only the dst regs each insn writes — see champsim_tracer.md
+         * §"WP per-insn regdata".
          */
         g_wp_state.last_executed_tb = nullptr;
         tb_ok = qemu_plugin_exec_tb();
-
-        if (!tmpl) {
-            tmpl = g_wp_state.last_executed_tb;
-        }
+        tmpl = g_wp_state.last_executed_tb;
 
         if (!tmpl) {
             clear_accum();

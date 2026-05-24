@@ -1751,9 +1751,20 @@ static uint64_t memop_data_lane_mask(const EntryView *ev, uint32_t i,
      * lane is the instruction immediate (PINSR, PEXTR, INSERTPS,
      * etc.).  The immediate is already a valid in-range lane index
      * for these ops, so the memop feeds/drains exactly that lane,
-     * matching the decode-time INSERT/EXTRACT reg-mask narrowing. */
+     * matching the decode-time INSERT/EXTRACT reg-mask narrowing.
+     *
+     * Single-memop check goes through actual_n_loads/n_stores instead
+     * of probing load_slots[i*64+1] for null: the slot-array entries
+     * past actual_n_loads[i] aren't guaranteed cleared (the scratch
+     * skips that memset for cost, see entry_view_scratch_ensure), so
+     * a stale pointer from a prior emit would mis-trigger the probe. */
+    uint32_t n_same_type = (want_type == DYN_LOAD_ADDR
+                             ? (ev->actual_n_loads
+                                ? ev->actual_n_loads[i] : 0)
+                             : (ev->actual_n_stores
+                                ? ev->actual_n_stores[i] : 0));
     if (f->has_immediate && dp->data_size == lane_bytes
-        && find_memop_slot(ev, i, 1, want_type) == nullptr) {
+        && n_same_type == 1) {
         uint64_t lane = (uint64_t)f->immediate;
         return (lane < 64) ? ((uint64_t)1 << lane) : 0;
     }
@@ -2167,10 +2178,18 @@ static void entry_view_scratch_ensure(EntryViewScratch *scratch, uint32_t n)
         scratch->slot_cap = new_cap;
     }
 
-    memset(scratch->load_slots, 0, need_slots *
-           sizeof(*scratch->load_slots));
-    memset(scratch->store_slots, 0, need_slots *
-           sizeof(*scratch->store_slots));
+    /* No per-emit memset: load_slots[]/store_slots[] entries past
+     * actual_n_loads[i] / actual_n_stores[i] are never read by the
+     * emit hot loop (its iteration is `for (s = 0; s < cap_min(actual);
+     * s++)`), and the one site that DID probe past the actual count
+     * (memop_data_lane_mask's PINSR/PEXTR detect) was rewritten to
+     * consult actual_n_loads/n_stores directly.  The g_renew above
+     * leaves stale data in newly-grown regions, but those are bounded
+     * by the same per-insn actual count so the hot loop never reads
+     * them.  perf attributed ~2 KB-30 KB of per-emit memset traffic
+     * (per template's n_insns × 64 slots × 8 bytes × 2 arrays); for
+     * mcf with 2M emits this is multiple GB of writes per run that
+     * were producing no observable effect. */
 }
 
 static void entry_view_scratch_free(EntryViewScratch *scratch)

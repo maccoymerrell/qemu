@@ -428,17 +428,24 @@ Decode by repeated outer-section unwrapping.
                                    ;   through the `mem_access_pattern`
                                    ;   map (CST_PAT_*) — do NOT assume
                                    ;   fixed numbers.  Classes, by
-                                   ;   meaning: no memory access; a
-                                   ;   regular access (constant
-                                   ;   stride); an irregular access
-                                   ;   (stride varies but each change
-                                   ;   in stride stays within a page);
-                                   ;   a random access (some stride
-                                   ;   change exceeds a page).  The
-                                   ;   writer classifies on the
-                                   ;   second-order address difference
-                                   ;   and reports the strongest class
-                                   ;   observed; the exact heuristic
+                                   ;   meaning: no memory access on
+                                   ;   that stream; REGULAR (the
+                                   ;   address sequence converges at
+                                   ;   the first derivative — constant
+                                   ;   stride, including the trivial 0
+                                   ;   and 1-sample cases); IRREGULAR
+                                   ;   (delta varies but the second
+                                   ;   derivative ddelta is constant);
+                                   ;   RANDOM (ddelta itself varies —
+                                   ;   3rd-order or higher, no
+                                   ;   convergence at ddelta).  The
+                                   ;   writer reports the strongest
+                                   ;   class observed across the run,
+                                   ;   composing a per-insn PC-keyed
+                                   ;   classifier with a cross-insn
+                                   ;   page-keyed spatial classifier
+                                   ;   (lower / more-regular of the
+                                   ;   two wins); the exact heuristic
                                    ;   is a writer-side detail, not a
                                    ;   wire contract.
                                    ; bit[4] cp data-is-address
@@ -1701,32 +1708,53 @@ profile_block:
                             bit[3:2] WP access-pattern class
                               resolve via encoding map
                               "mem_access_pattern" (CST_PAT_*).
-                              Classified on the SECOND-order
-                              difference of effective addresses —
-                              the change in step size between
-                              consecutive accesses (ddelta =
-                              delta_n − delta_{n-1}), NOT the raw
-                              step size.  The four classes (numeric
-                              values resolved through the
-                              `mem_access_pattern` map, not pinned
-                              here):
+                              Classified by DERIVATIVE-CONVERGENCE
+                              BINNING on effective addresses:
+                              delta_n = ea_n − ea_{n-1};
+                              ddelta_n = delta_n − delta_{n-1}.
+                              Each memop is tagged with the lowest-
+                              order class that explains it —
+                              REGULAR when this delta equals the
+                              prior delta, IRREGULAR when delta
+                              varies but ddelta equals the prior
+                              ddelta, RANDOM when ddelta itself
+                              varies — and the tag is tallied into
+                              a per-insn histogram.  The reported
+                              class is the ARGMAX bin: the regime
+                              the insn spends most of its lifetime
+                              in.  Convergence is a structural
+                              property; there is no magnitude
+                              threshold, and a 1-byte and a 1-MiB
+                              constant stride both tally as
+                              REGULAR.  Numeric values resolved
+                              through the `mem_access_pattern` map,
+                              not pinned here:
                               CST_PAT_NONE       no memory access
                                                  seen
-                              CST_PAT_REGULAR    constant stride:
-                                                 every ddelta == 0
-                                                 (incl. stride 0)
-                              CST_PAT_IRREGULAR  stride varies but
-                                                 every |ddelta| ≤ 4096
+                              CST_PAT_REGULAR    dominant: delta
+                                                 constant (incl.
+                                                 stride 0 and the
+                                                 trivial 1–2 step
+                                                 default)
+                              CST_PAT_IRREGULAR  dominant: delta
+                                                 varies but ddelta
+                                                 constant
                                                  (e.g. a walking
                                                  stride 1,2,3,… →
                                                  ddelta == 1)
-                              CST_PAT_RANDOM     some |ddelta| > 4096
-                                                 (step size jumped by
-                                                 > a page between two
-                                                 accesses)
-                            (the strongest class observed wins;
-                             the |ddelta| threshold is the writer's
-                             CST_PROFILE_RAND_DELTA, 4096)
+                              CST_PAT_RANDOM     dominant: ddelta
+                                                 itself varies —
+                                                 no convergence at
+                                                 the second
+                                                 derivative
+                            (two trackers run a per-access bin
+                             tally — a per-insn PC-keyed classifier
+                             and a cross-insn page-keyed spatial
+                             classifier — each takes its argmax,
+                             and the LOWER, more-regular argmax
+                             wins.  The exact heuristic is a
+                             writer-side detail, not a wire
+                             contract)
                             bit[4]/bit[5] CP/WP data-is-address —
                               resolve via encoding map
                               "profile_flag" (CST_PROFILE_ADDR_*);

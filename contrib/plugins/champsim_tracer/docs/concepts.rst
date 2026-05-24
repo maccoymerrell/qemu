@@ -141,16 +141,24 @@ Per basic block:
   whose page a real correct-path mem-op also touched — a pointer-
   chasing signal), and an **access-pattern class**:
 
-  - ``regular`` — constant stride (including stride 0);
-  - ``irregular`` — stride varies but smoothly;
-  - ``random`` — the stride itself jumps by more than a page
-    between consecutive accesses.
+  - ``regular`` — the address sequence's first derivative is
+    constant (constant stride, including stride 0);
+  - ``irregular`` — delta varies but the second derivative
+    ``ddelta = delta_n - delta_{n-1}`` is constant;
+  - ``random`` — ddelta itself varies, so convergence needs the
+    third derivative or higher.
 
-  The class is computed on the *second-order* difference of
-  effective addresses (how much the step size itself changed),
-  not the raw step size, so a linearly-accelerating walk reads as
-  irregular rather than random.  The strongest class observed
-  wins.
+  Classification is **derivative-convergence binning**: every
+  memop is tagged with the lowest-order class that explains it
+  and the tag is tallied into a per-instruction histogram; the
+  reported class is the argmax bin — the regime the instruction
+  spends most of its lifetime in.  Two trackers contribute to the
+  histogram in parallel — a per-insn classifier keyed by issuing
+  PC, and a cross-instruction *spatial* classifier keyed by page
+  (within-page offset deltas — picks up stencil sweeps where each
+  insn looks chaotic but the basic block stripes a page linearly).
+  Each tracker takes its own argmax, and the emitted class is the
+  lower (more regular) of the two.
 
 The exact byte layout is in :doc:`format` (Step 4.6 / §6); the
 :doc:`decoder` renders it inline per BB and ``cst_audit`` shows

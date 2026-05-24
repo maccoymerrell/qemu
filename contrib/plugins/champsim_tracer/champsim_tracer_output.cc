@@ -679,6 +679,8 @@ static void write_insn_descriptors(BitWriter *sub, const BBTemplate *tmpl)
  * counts are 1:1 with the header target list (n_targets not
  * repeated).
  */
+static uint8_t profile_argmax_bin(const uint32_t bins[3]);
+
 static void write_template_profile(BitWriter *sub,
                                    const BBTemplate *tmpl,
                                    const std::vector<ProfTgt> &prof_tgts)
@@ -703,10 +705,30 @@ static void write_template_profile(BitWriter *sub,
             tmpl->profile ? &p->insns[i] : &zero;
         bw_write_uleb128(sub, ip->memops_cp);
         bw_write_uleb128(sub, ip->memops_wp);
+        /* Resolve each stream's dominant class via argmax over the
+         * per-access bin histograms, then compose PC-side and spatial-
+         * side: the LOWER (more regular) wins, so either tracker may
+         * rescue the other.  A NONE on either side means "no signal
+         * from that tracker" and is treated as the identity (don't
+         * drag the composed class down). */
+        uint8_t pc_pat_cp = profile_argmax_bin(ip->pc_bins_cp);
+        uint8_t sp_pat_cp = profile_argmax_bin(ip->spatial_bins_cp);
+        uint8_t pc_pat_wp = profile_argmax_bin(ip->pc_bins_wp);
+        uint8_t sp_pat_wp = profile_argmax_bin(ip->spatial_bins_wp);
+        uint8_t emit_pat_cp = pc_pat_cp;
+        if (sp_pat_cp != CST_PAT_NONE &&
+            (emit_pat_cp == CST_PAT_NONE || sp_pat_cp < emit_pat_cp)) {
+            emit_pat_cp = sp_pat_cp;
+        }
+        uint8_t emit_pat_wp = pc_pat_wp;
+        if (sp_pat_wp != CST_PAT_NONE &&
+            (emit_pat_wp == CST_PAT_NONE || sp_pat_wp < emit_pat_wp)) {
+            emit_pat_wp = sp_pat_wp;
+        }
         uint8_t pf = 0;
-        pf |= (ip->pat_cp & CST_PROFILE_PAT_MASK)
+        pf |= (emit_pat_cp & CST_PROFILE_PAT_MASK)
               << CST_PROFILE_PAT_CP_SHIFT;
-        pf |= (ip->pat_wp & CST_PROFILE_PAT_MASK)
+        pf |= (emit_pat_wp & CST_PROFILE_PAT_MASK)
               << CST_PROFILE_PAT_WP_SHIFT;
         if (ip->addr_cp) pf |= CST_PROFILE_ADDR_CP;
         if (ip->addr_wp) pf |= CST_PROFILE_ADDR_WP;
@@ -2999,56 +3021,119 @@ static bool profile_value_is_addr(const DynParam &dp)
     return g_obs_pages.count(profile_canon_page(v)) != 0;
 }
 
-/* Per-insn memop step of the stride classifier (items 3/4/6).
- * Escalates monotonically (once RANDOM, stays RANDOM).  Classifies on
- * the SECOND-order difference, not raw stride:
+/* Per-step derivative-convergence classifier on @ea.  Returns the bin
+ * (CST_PAT_REGULAR / IRREGULAR / RANDOM) for THIS step and rolls the
+ * state forward.  Bins are tallied per-insn (see profile_step); the
+ * insn's emitted class is the argmax bin — the regime the insn spends
+ * most of its lifetime in.  Per-step decision:
  *
- *   delta_n  = ea_n   - ea_{n-1}     (this step)
- *   ddelta_n = delta_n - delta_{n-1} (change in step size)
+ *   REGULAR    delta_n == delta_{n-1} (fits the constant-stride
+ *              trajectory; first 1–2 steps default here because no
+ *              prior derivative is established yet).
+ *   IRREGULAR  delta_n varies but ddelta_n == ddelta_{n-1} (fits a
+ *              smoothly accelerating stride — constant-ddelta
+ *              trajectory; first ddelta defaults here).
+ *   RANDOM     ddelta_n itself varies (no convergence at ddelta —
+ *              would need >= 3rd-order to explain).
  *
- *   REGULAR    constant stride, ddelta == 0 (incl. stride 0).
- *   IRREGULAR  varies but every |ddelta| <= 4096 (smoothly walking).
- *   RANDOM     some |ddelta| > 4096 (step jumped >1 page).
- *
- * `strd` = rolling PREVIOUS delta; `hs` = a prev delta exists. */
+ * No magnitude threshold: convergence is a structural property, not a
+ * size one.  A 1-byte and a 1-MiB constant stride are both REGULAR. */
+static uint8_t profile_stride_step(StrideState *s, uint64_t ea)
+{
+    if (!s->have_addr) {
+        s->prev_addr = ea;
+        s->have_addr = 1;
+        return CST_PAT_REGULAR;
+    }
+    int64_t d = (int64_t)(ea - s->prev_addr);
+    s->prev_addr = ea;
+    if (!s->have_delta) {
+        s->prev_delta = d;
+        s->have_delta = 1;
+        return CST_PAT_REGULAR;
+    }
+    if (d == s->prev_delta) {
+        return CST_PAT_REGULAR;
+    }
+    int64_t dd = d - s->prev_delta;
+    s->prev_delta = d;
+    if (!s->have_ddelta) {
+        s->prev_ddelta = dd;
+        s->have_ddelta = 1;
+        return CST_PAT_IRREGULAR;
+    }
+    if (dd == s->prev_ddelta) {
+        return CST_PAT_IRREGULAR;
+    }
+    s->prev_ddelta = dd;
+    return CST_PAT_RANDOM;
+}
+
+/* Spatial (cross-instruction) classifier — per-page StrideState keyed
+ * by page number.  Within a page, every memop's offset feeds the same
+ * StrideState, so a stencil sweep registers REGULAR even when the
+ * individual insns alternate.  Two maps (CP / WP) because wrong-path
+ * memops on a page must not bleed into the committed-path picture.
+ * Lifetime parallels g_obs_pages (per-process cumulative). */
+static std::unordered_map<uint64_t, StrideState> g_page_stride_cp;
+static std::unordered_map<uint64_t, StrideState> g_page_stride_wp;
+
+/* Feed @ea (canonicalized within its page) to the spatial classifier
+ * and return the bin assigned to THIS step.  Uses within-page offset
+ * (not absolute ea) so deltas reflect movement within the page; page
+ * selection itself is captured by the map keying, not the delta. */
+static uint8_t profile_spatial_step(uint64_t ea, bool wp)
+{
+    uint64_t page = profile_canon_page(ea);
+    uint64_t offset = ea & ((((uint64_t)1) << CST_PROFILE_PAGE_SHIFT) - 1);
+    auto &m = wp ? g_page_stride_wp : g_page_stride_cp;
+    StrideState &s = m[page];
+    return profile_stride_step(&s, offset);
+}
+
+/* Per-insn memop step (items 3/4/6).  Classifies THIS access against
+ * the PC-keyed and page-keyed stride machines and tallies both bins
+ * into the insn's per-stream histograms; write_template_profile takes
+ * argmax to pick the dominant class per stream and composes both with
+ * a min (lower = more regular wins). */
 static void profile_step(InsnProfile *ip, uint64_t ea, bool wp,
                          bool is_addr)
 {
-    uint64_t *lo   = wp ? &ip->lo_wp : &ip->lo_cp;
-    uint64_t *hi   = wp ? &ip->hi_wp : &ip->hi_cp;
-    uint64_t *mc   = wp ? &ip->memops_wp : &ip->memops_cp;
-    uint64_t *prev = wp ? &ip->prev_addr_wp : &ip->prev_addr_cp;
-    int64_t  *strd = wp ? &ip->stride_wp : &ip->stride_cp;
-    uint8_t  *hp   = wp ? &ip->have_prev_wp : &ip->have_prev_cp;
-    uint8_t  *hs   = wp ? &ip->have_stride_wp : &ip->have_stride_cp;
-    uint8_t  *pat  = wp ? &ip->pat_wp : &ip->pat_cp;
-    uint8_t  *adr  = wp ? &ip->addr_wp : &ip->addr_cp;
+    uint64_t *lo  = wp ? &ip->lo_wp : &ip->lo_cp;
+    uint64_t *hi  = wp ? &ip->hi_wp : &ip->hi_cp;
+    uint64_t *mc  = wp ? &ip->memops_wp : &ip->memops_cp;
+    StrideState *s = wp ? &ip->stride_wp : &ip->stride_cp;
+    uint32_t *pc_bins = wp ? ip->pc_bins_wp : ip->pc_bins_cp;
+    uint32_t *sp_bins = wp ? ip->spatial_bins_wp : ip->spatial_bins_cp;
+    uint8_t *adr  = wp ? &ip->addr_wp : &ip->addr_cp;
 
     (*mc)++;
     if (ea < *lo) *lo = ea;
     if (ea > *hi) *hi = ea;
-    uint8_t cls = CST_PAT_REGULAR;             /* lone/constant = regular */
-    if (*hp) {
-        int64_t d = (int64_t)(ea - *prev);     /* this step (delta_n) */
-        if (!*hs) {
-            /* First delta: nothing to difference against yet — a
-             * lone step is still a (trivially) constant stride. */
-            *hs = 1;
-            *strd = d;
-        } else if (d != *strd) {
-            /* Step size changed: classify on the difference of
-             * deltas, not on the delta's magnitude. */
-            int64_t dd = d - *strd;            /* ddelta_n */
-            uint64_t add = dd < 0 ? (uint64_t)(-dd) : (uint64_t)dd;
-            cls = add > CST_PROFILE_RAND_DELTA ? CST_PAT_RANDOM
-                                               : CST_PAT_IRREGULAR;
-            *strd = d;                         /* roll: prev delta */
-        }
-    }
-    if (cls > *pat) *pat = cls;
-    *prev = ea;
-    *hp = 1;
+
+    uint8_t pc_bin = profile_stride_step(s, ea);
+    uint8_t sp_bin = profile_spatial_step(ea, wp);
+    pc_bins[pc_bin - CST_PAT_REGULAR]++;
+    sp_bins[sp_bin - CST_PAT_REGULAR]++;
+
     if (is_addr) *adr = 1;
+}
+
+/* Pick the highest-count bin from a [REGULAR, IRREGULAR, RANDOM]
+ * histogram.  Ties resolve toward the LOWER class (more regular) by
+ * walking REGULAR → IRREGULAR → RANDOM and updating only on a strict
+ * win; an insn with no memops returns CST_PAT_NONE so callers can
+ * suppress the bit. */
+static uint8_t profile_argmax_bin(const uint32_t bins[3])
+{
+    if (bins[0] == 0 && bins[1] == 0 && bins[2] == 0) {
+        return CST_PAT_NONE;
+    }
+    uint32_t best = bins[0];
+    uint8_t  cls  = CST_PAT_REGULAR;
+    if (bins[1] > best) { best = bins[1]; cls = CST_PAT_IRREGULAR; }
+    if (bins[2] > best) { best = bins[2]; cls = CST_PAT_RANDOM; }
+    return cls;
 }
 
 static void profile_accumulate(BBTemplate *t,

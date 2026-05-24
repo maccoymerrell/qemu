@@ -355,19 +355,33 @@ typedef struct {
  * deterministic replay; POD for the BBTemplate g_new0/g_free
  * lifecycle.  On-disk values are final run totals.
  *
- * Access-pattern class (pat_*) is classified on the SECOND-order
- * difference of effective addresses (ddelta = delta_n - delta_{n-1}),
- * not the raw step size: 0 none, 1 regular (every ddelta == 0), 2
- * irregular (every |ddelta| ≤ 4096), 3 random (some |ddelta| > 4096,
- * i.e. step jumped > a page).  Strongest class observed wins.
+ * Access-pattern class (pat_*) uses DERIVATIVE-CONVERGENCE BINNING:
+ * each memop is classified individually by the lowest-order derivative
+ * needed to explain it, then tallied into a per-insn histogram; the
+ * emitted class is the bin with the highest count — the DOMINANT
+ * regime the insn spends its lifetime in.  Per memop:
+ *
+ *   REGULAR    delta_n == delta_{n-1} (this step fits the constant-
+ *              stride trajectory), incl. the first one or two memops
+ *              when no prior derivative has been established.
+ *   IRREGULAR  delta_n varies but ddelta_n == ddelta_{n-1}
+ *              (this step fits a smoothly accelerating stride —
+ *              ddelta-constant trajectory).
+ *   RANDOM    ddelta_n itself varies (third-order or worse — no
+ *              convergence at ddelta).
+ *
+ * Two trackers run in parallel: a per-insn classifier keyed by issuing
+ * PC, and a CROSS-INSN spatial classifier keyed by page (within-page
+ * offset deltas — picks up stencil sweeps where each insn looks
+ * chaotic but the BB stripes a page linearly).  Each contributes its
+ * own per-insn histogram; their argmax bins are composed at emit time
+ * and the LOWER (more regular) class wins, so either tracker may
+ * rescue the other.
  */
 enum {
     CST_PAT_NONE = 0, CST_PAT_REGULAR = 1,
     CST_PAT_IRREGULAR = 2, CST_PAT_RANDOM = 3,
 };
-/* |ddelta| threshold separating IRREGULAR from RANDOM: a step-size
- * change larger than one 4 KiB page is treated as random. */
-enum { CST_PROFILE_RAND_DELTA = 4096 };
 /*
  * profile pat_flags byte layout (self-described on the wire by the
  * "mem_access_pattern" and "profile_flag" encoding maps):
@@ -384,16 +398,36 @@ enum {
     CST_PROFILE_ADDR_WP      = 0x20,
 };
 
+/*
+ * Derivative-convergence stride-classifier state.  prev_delta /
+ * prev_ddelta hold the most-recent observed values; the per-step
+ * classifier (profile_stride_step) returns the bin (REGULAR /
+ * IRREGULAR / RANDOM) THIS step fits and rolls the state forward.
+ * Bin selection per step is the model's only output; tallying lives in
+ * the caller's per-insn histograms.
+ */
 typedef struct {
-    uint64_t memops_cp, memops_wp;     /* total mem-ops issued     */
-    uint64_t lo_cp, hi_cp;             /* effective-addr bounds, CP */
-    uint64_t lo_wp, hi_wp;             /*                        WP */
-    uint64_t prev_addr_cp, prev_addr_wp;   /* last effective addr      */
-    int64_t  stride_cp, stride_wp;         /* PREVIOUS delta (rolling) */
-    uint8_t  have_prev_cp, have_prev_wp;   /* prev_addr valid          */
-    uint8_t  have_stride_cp, have_stride_wp; /* prev delta valid       */
-    uint8_t  pat_cp, pat_wp;           /* CST_PAT_*                */
-    uint8_t  addr_cp, addr_wp;         /* data-is-address seen     */
+    uint64_t prev_addr;
+    int64_t  prev_delta;
+    int64_t  prev_ddelta;
+    uint8_t  have_addr;
+    uint8_t  have_delta;
+    uint8_t  have_ddelta;
+} StrideState;
+
+/* Per-insn histograms: [REGULAR-1, IRREGULAR-1, RANDOM-1] counts —
+ * NONE is implicit (memops_X == 0 ⇒ no class emitted).  Argmax at
+ * write_template_profile picks the dominant bin per stream. */
+typedef struct {
+    uint64_t memops_cp, memops_wp;       /* total mem-ops issued      */
+    uint64_t lo_cp, hi_cp;               /* effective-addr bounds, CP */
+    uint64_t lo_wp, hi_wp;               /*                        WP */
+    StrideState stride_cp, stride_wp;    /* PC-keyed classifier state */
+    uint32_t pc_bins_cp[3];              /* per-access PC tally       */
+    uint32_t pc_bins_wp[3];
+    uint32_t spatial_bins_cp[3];         /* per-access page-spatial tally */
+    uint32_t spatial_bins_wp[3];
+    uint8_t  addr_cp, addr_wp;           /* data-is-address seen      */
 } InsnProfile;
 
 /*

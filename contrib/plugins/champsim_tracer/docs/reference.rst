@@ -693,16 +693,29 @@ Memory access-pattern classes (``CST_PAT_*``)
 Each template-profile per-instruction record carries a 2-bit
 access-pattern class for the correct path and another for the
 wrong path (see :doc:`concepts`, *Run-aggregated profile*, and
-:doc:`format` §6).  The classifier looks at the **second-order**
-difference of effective addresses — how much the *step size*
-changed between consecutive accesses (``ddelta = delta_n -
-delta_{n-1}``), not the raw step — so a smoothly accelerating walk
-is *irregular*, not *random*.  The strongest class observed over
-the run wins; the page threshold separating irregular from random
-is ``CST_PROFILE_RAND_DELTA`` (4096).  A class is a value resolved
-through the trace's own ``mem_access_pattern`` encoding map; the
-numeric values are the writer's assignment and are not pinned by
-this reference.
+:doc:`format` §6).  Classification is **derivative-convergence
+binning** on effective addresses: ``delta_n = ea_n - ea_{n-1}``,
+``ddelta_n = delta_n - delta_{n-1}``.  Each memop is tagged with
+the lowest-order class that explains it — *regular* when this
+delta equals the prior delta, *irregular* when delta varies but
+ddelta equals the prior ddelta, *random* when ddelta itself
+varies — and the tag is tallied into a per-instruction histogram.
+The reported class is the **argmax** bin: the regime the
+instruction spends most of its lifetime in.  Convergence is a
+structural property; there is no magnitude threshold, and a
+1-byte and a 1-MiB constant stride both tally as regular.
+
+Two trackers contribute to the histogram in parallel: a per-insn
+classifier keyed by issuing PC, and a cross-instruction *spatial*
+classifier keyed by page (every memop in a 4 KiB page feeds the
+same within-page offset stream, so a stencil sweep across a page
+registers as regular even when individual insns look chaotic).
+Each takes its own argmax, and the emitted class is the **lower**
+(more regular) of the two — either tracker may rescue the other.
+The exact heuristic is a writer-side detail, not a wire contract.
+A class is a value resolved through the trace's own
+``mem_access_pattern`` encoding map; the numeric values are the
+writer's assignment and are not pinned by this reference.
 
 .. list-table::
    :header-rows: 1
@@ -713,15 +726,18 @@ this reference.
    * - ``CST_PAT_NONE``
      - No memory access observed for this instruction.
    * - ``CST_PAT_REGULAR``
-     - Constant stride, including stride 0 (same address
-       re-touched).  Every ``ddelta`` is 0.
+     - Delta is constant — including stride 0 (same address
+       re-touched) and the trivial one-sample case.  First-order
+       convergence.
    * - ``CST_PAT_IRREGULAR``
-     - Stride varies but every ``|ddelta|`` ≤ 4096 — a smoothly
+     - Delta varies but ``ddelta`` is constant — a smoothly
        changing stride (e.g. an address walk ``1, 2, 3, …`` whose
-       step grows by 1 each time).
+       step grows by a fixed amount each time).  Second-order
+       convergence.
    * - ``CST_PAT_RANDOM``
-     - Some ``|ddelta|`` > 4096 — the step size itself jumped by
-       more than a page between two consecutive accesses.
+     - ``ddelta`` itself varies — no convergence at the second
+       derivative, so the access pattern needs the third derivative
+       or higher to be predicted.
 
 A companion *data-is-address* bit (``CST_PROFILE_ADDR_CP`` /
 ``CST_PROFILE_ADDR_WP`` in the profile ``pat_flags`` byte) flags

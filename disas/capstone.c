@@ -968,6 +968,33 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 break;
             }
         }
+        /*
+         * Capstone 6.0.0 MIPS store-conditional bug workaround.
+         *
+         * MIPS store-conditional (sc / scd / sce / scwp) atomically
+         * stores the source register and overwrites it with a
+         * success/failure bit (1 = paired ll's monitor still set,
+         * 0 = lost the monitor).  Capstone reports the $rt operand
+         * as CS_AC_READ only — it sees the store-from but misses
+         * the success-bit write-back.  Without WRITE access the
+         * destination snap chain (regdata_reconstruction) sees stale
+         * pre-SC values for $rt on every successor BB.
+         *
+         * Promote $rt's access to READ|WRITE for the SC family.
+         * The first register operand is the data/result register.
+         */
+        if (insn->id == MIPS_INS_SC || insn->id == MIPS_INS_SCD
+            || insn->id == MIPS_INS_SCE || insn->id == MIPS_INS_SCWP) {
+            for (uint8_t i = 0; i < n; i++) {
+                qemu_plugin_operand *op = &out->operands[i];
+                if (op->type != QEMU_PLUGIN_OP_REG) {
+                    continue;
+                }
+                op->access = QEMU_PLUGIN_OP_ACC_READ
+                           | QEMU_PLUGIN_OP_ACC_WRITE;
+                break;
+            }
+        }
     } else {
         out->n_operands = 0;
     }

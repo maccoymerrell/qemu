@@ -510,6 +510,17 @@ struct BBTemplate {
      * fragment values, or via post_pc on WP).  NULL on singletons
      * (TBs with no mid-TB branch). */
     BBTemplate *next_tb_fragment;
+
+    /* Cached BranchRecord* for this BB's terminal branch.  set lazily
+     * on first observe_branch_transition (which would otherwise hash-
+     * lookup g_branch_history.records_ by branch PC every fire — perf
+     * showed BranchHistory::get_or_create at 2.15% of CP-only runtime
+     * on mcf, all of it the same templates re-resolving the same PC).
+     * Pointer stays valid across std::unordered_map rehashes (C++
+     * standard guarantee for unordered associative containers); we
+     * never erase entries.  NULL invalidates across segment switches
+     * since the BBTemplate itself is freed/recreated. */
+    struct BranchRecord *cached_branch_record;
 };
 
 enum DynParamType {
@@ -625,7 +636,7 @@ typedef struct {
     bool valid;
 } BranchTargetHistoryEntry;
 
-typedef struct {
+typedef struct BranchRecord {
     uint64_t pc;
     uint64_t fall_through;
     /* Distinct taken-target history.  CORRECT-PATH ONLY: note_target()

@@ -762,7 +762,8 @@ static void finish_trace_segment(void)
  * architectural fall-through.  Returns the BranchRecord.  Called only
  * when a true BB finalized; caller holds data_lock.
  */
-static BranchRecord *observe_branch_transition(bool branch_taken,
+static BranchRecord *observe_branch_transition(BBTemplate *bb_tmpl,
+                                               bool branch_taken,
                                                uint64_t branch_pc,
                                                uint64_t bb_fall_through)
 {
@@ -781,8 +782,18 @@ static BranchRecord *observe_branch_transition(bool branch_taken,
             h->branches_not_taken++;
         }
     }
-    BranchRecord *br =
-        g_branch_history.get_or_create(branch_pc, bb_fall_through);
+    /* Fast path: BBTemplate caches the BranchRecord*.  First fire does
+     * the hash lookup; subsequent fires of the same template skip
+     * straight to the cached pointer.  Valid because we never erase
+     * BranchHistory entries and std::unordered_map preserves pointer
+     * stability across rehashes. */
+    BranchRecord *br = bb_tmpl ? bb_tmpl->cached_branch_record : nullptr;
+    if (!br) {
+        br = g_branch_history.get_or_create(branch_pc, bb_fall_through);
+        if (bb_tmpl) {
+            bb_tmpl->cached_branch_record = br;
+        }
+    }
     if (br) {
         br->fall_through = bb_fall_through;
     }
@@ -909,7 +920,26 @@ static void snap_prev_tail_dsts(unsigned int cpu_index,
     if (enable_reg_data && tmpl->insn_reg_names &&
         tmpl->n_insns > 0 &&
         g_trace_segments.is_active_atomic()) {
+        /* Delay-slot reorder (mirrors tb_arm_new_template_cbs): the
+         * canonical reorder put the delay slot at canonical[n-2] and
+         * the branch at canonical[n-1].  The branch's raw form
+         * executed FIRST (condition check), then the delay slot ran
+         * (its dst write), then control transferred.  At the next
+         * TB's vcpu_tb_exec — where we are now — the registers
+         * still hold the delay slot's post-exec dsts, so capture
+         * them.  Detect via insn_pcs[n-2] > insn_pcs[n-1]. */
         uint32_t last = tmpl->n_insns - 1;
+        if (tmpl->n_insns >= 2 &&
+            tmpl->insn_pcs[last - 1] > tmpl->insn_pcs[last]) {
+            const InsnFields *fd = &tmpl->insn_fields[last - 1];
+            const InsnRegNames *nd = &tmpl->insn_reg_names[last - 1];
+            for (uint8_t i = 0; i < fd->n_dst_regs; i++) {
+                RegSnap s;
+                g_reg_snaps.read_into_snap(
+                    cpu_index, nd->dst_qemu_reg_keys[i], &s);
+                pending_reg_snaps.push_back(s);
+            }
+        }
         const InsnFields *fl = &tmpl->insn_fields[last];
         const InsnRegNames *nl = &tmpl->insn_reg_names[last];
         for (uint8_t i = 0; i < fl->n_dst_regs; i++) {
@@ -1273,7 +1303,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
                 if (br_idx >= 0) {
                     pe.branch_pc = bb_tmpl->insn_pcs[br_idx];
                     BranchRecord *br = observe_branch_transition(
-                        frag_branch_taken, pe.branch_pc, frag_prev_ft);
+                        bb_tmpl, frag_branch_taken, pe.branch_pc,
+                        frag_prev_ft);
                     uint64_t taken_target = 0;
                     pe.wrong_target = resolve_wrong_target(
                         bb_tmpl, br, frag_branch_taken,
@@ -1357,7 +1388,24 @@ static void tb_arm_new_template_cbs(struct qemu_plugin_tb *tb,
          * registers hold post-exec values.  The TB's last
          * canonical insn is captured at the next TB's
          * vcpu_tb_exec ("Tail-insn dst snap").
-         */
+         *
+         * Delay-slot reordering caveat: on MIPS (and similar ISAs)
+         * the canonical ordering swaps a trailing [branch,
+         * delay-slot] pair to [delay-slot, branch] so the
+         * terminating branch is always canonical[n-1].  The branch's
+         * raw form executes FIRST (it checks condition), then the
+         * delay slot (canonical[n-2]) runs, then control transfers.
+         * That means canonical[n-2]'s "first raw" is at HIGHER PC
+         * than canonical[n-1]'s, and a pre-exec cb on canonical[n-1]'s
+         * raw fires BEFORE canonical[n-2]'s delay slot runs — the
+         * snap captures the PRE-delay-slot value, not the post.
+         * Detect via insn_pcs[n-2] > insn_pcs[n-1] and skip the
+         * broken registration; snap_prev_tail_dsts on the next TB
+         * captures both canonical[n-1] and canonical[n-2] dsts at
+         * the right time. */
+        bool delay_slot_reorder = canonical_n_insns >= 2
+            && new_tmpl->insn_pcs[canonical_n_insns - 2]
+                 > new_tmpl->insn_pcs[canonical_n_insns - 1];
         for (size_t i = 0; i < raw_n_insns; i++) {
             if (!canonical_first[i]) {
                 continue;
@@ -1365,6 +1413,14 @@ static void tb_arm_new_template_cbs(struct qemu_plugin_tb *tb,
             uint32_t ci = canonical_index[i];
             if (ci == 0) {
                 continue;  /* no predecessor canonical insn in this TB */
+            }
+            if (delay_slot_reorder && ci == canonical_n_insns - 1) {
+                /* The reg snap registered HERE would fire pre-branch
+                 * = pre-delay-slot.  Captured value is the pre-delay-
+                 * slot value of the delay slot's dst register — stale
+                 * by exactly one insn.  Skip and capture in
+                 * snap_prev_tail_dsts instead. */
+                continue;
             }
             struct qemu_plugin_insn *insn =
                 qemu_plugin_tb_get_insn(tb, i);

@@ -1283,27 +1283,31 @@ struct WalkCtx {
     std::vector<uint64_t> ws_lines_per_bin;
     std::vector<uint64_t> ws_pages_per_bin;
 
-    /* --- dep_depth state.  Sliding reorder-buffer window of the
-     * last @rob_size insns.  When an insn ages out of the window,
-     * its dst-register contributions are erased from last_writer so
-     * chain depth bounded by the buffer (the natural ILP scale).
+    /* --- dep_depth state.  Tracks the dependency-chain depth of
+     * each CP insn through architectural-register RAW edges,
+     * subject to two filters that keep the metric ILP-relevant
+     * instead of dominated by self-modification loops:
      *
-     * Per-bin we keep a fixed-size depth HISTOGRAM (one bucket per
-     * possible depth 0..rob_size) instead of every insn's depth in
-     * a vector — depths are bounded by rob_size so 1024+1 buckets
-     * × 200 bins × 8 bytes ≈ 1.6 MB total, vs ~1 GB for the
-     * vector-per-bin form on a 300M-insn trace. */
-    struct DdWriterInfo { uint32_t depth; uint64_t owner_id; };
-    struct DdWindowEntry {
-        uint64_t insn_id;
-        uint32_t depth;
-        std::vector<uint8_t> dsts; /* copied from InsnTemplate */
-    };
-    std::unordered_map<uint8_t, DdWriterInfo> dd_last_writer;
-    std::deque<DdWindowEntry>                  dd_window;
-    uint64_t                                   dd_next_insn_id = 0;
-    /* Per-bin histogram of depths.  Index i = depth i; value = count. */
-    std::vector<std::vector<uint64_t>>         dd_depth_hist_per_bin;
+     *   1. Special regs (FLAGS, IP, ZERO, NONE) are excluded
+     *      entirely — they aren't real ILP data flow in renamed
+     *      hardware.  SP is KEPT because real code updates it
+     *      through genuine data dependencies (push/pop chains
+     *      etc.).
+     *   2. Self-RMW (a reg that's both src AND dst of the same
+     *      insn) does NOT contribute the reg's old depth to the
+     *      insn's chain.  This is the key fix: in `add rcx, 1`
+     *      the chain we care about is the dependency the NEW rcx
+     *      forms for downstream consumers, not the iter-count
+     *      self-loop through rcx.  A ROB can unroll that
+     *      self-loop; what bounds parallelism is the chain of
+     *      OTHER consumers depending on rcx's new value.
+     *
+     * Last-writer state persists across BB boundaries — real
+     * dependency chains do live past branches. */
+    std::array<bool, 256> dd_excluded_reg{};
+    bool                  dd_excluded_built = false;
+    std::unordered_map<uint8_t, uint32_t> dd_last_writer;
+    std::vector<std::vector<uint64_t>>    dd_depth_hist_per_bin;
 
     /* --- reuse_distance state.  LRU stack (front = most recent) of
      * cache lines, with a hash-map from line -> its position iterator
@@ -1891,69 +1895,73 @@ static void handle_working_set_entry(WalkCtx &ctx,
     ctx.cp_insns_so_far += t.insns.size();
 }
 
-/* dep_depth: ILP proxy.  Each insn's depth = 1 + max(depth of any
- * source-register's last writer that is still in the reorder-buffer
- * window).  Insns older than @rob_size insns age out and their
- * writer contributions are erased — so chain depth is bounded by
- * the buffer (the natural ILP scale).  Without this bound, a tight
- * loop counter's chain depth would grow with iteration count
- * forever instead of measuring anything ILP-relevant. */
+/* dep_depth: dependency-chain depth as an ILP-relevant proxy.
+ *   depth_i = 1 + max(depth_j for j writing each "real" src reg of i)
+ *
+ * "Real" src reg = NOT a special reg (FLAGS/IP/ZERO/NONE) AND NOT
+ * a self-RMW of i.  Special regs are not actual ILP data flow in
+ * renamed hardware.  Self-RMW (e.g. `add rcx, 1` where rcx is
+ * both src and dst) doesn't count its OWN reg's prior depth — the
+ * chain we care about is what depends on the NEW value, not the
+ * iter-count self-loop the ROB can unroll.
+ *
+ * Last-writer state persists across BB boundaries; chains can be
+ * long-lived through data dependencies, just not through self-RMW
+ * loops or noise from FLAGS/IP/ZERO bookkeeping. */
 static void handle_dep_depth_entry(WalkCtx &ctx,
                                    const cst::DecodedEntry &e)
 {
+    if (!ctx.dd_excluded_built) {
+        /* Build the excluded-reg lookup once, from the trace's reg
+         * encoding map.  Anything named ZERO/FLAGS/IP/NONE is
+         * filtered out of the chain.  SP and any other named reg
+         * (including FPR / VEC / PRED / SEG banks) is kept. */
+        for (const auto &kv : ctx.h->maps.reg) {
+            if (kv.first > 255) continue;
+            const std::string &name = kv.second;
+            bool ex = (name.find("ZERO") != std::string::npos)
+                   || (name.find("FLAGS") != std::string::npos)
+                   || (name == "REG_IP" || name == "IP"
+                       || name == "REG_PC" || name == "PC")
+                   || (name == "REG_NONE" || name == "NONE");
+            if (ex) ctx.dd_excluded_reg[(size_t)kv.first] = true;
+        }
+        ctx.dd_excluded_built = true;
+    }
+
     const cst::Template &t = (*ctx.templates)[ctx.by_id->at(e.template_id)];
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
-    uint32_t rob = ctx.opts.rob_size;
+    uint32_t rob = ctx.opts.rob_size; /* histogram cap only */
     if ((int)ctx.dd_depth_hist_per_bin.size() <= bin) {
         ctx.dd_depth_hist_per_bin.resize(bin + 1);
     }
     auto &bin_hist = ctx.dd_depth_hist_per_bin[bin];
-    /* Lazy-allocate the per-bin histogram on first use (depths
-     * range 0..rob inclusive). */
     if (bin_hist.empty()) {
         bin_hist.assign((size_t)rob + 1, 0);
     }
     for (const auto &insn : t.insns) {
         uint32_t max_src = 0;
         for (uint8_t r : insn.src_regs) {
+            if (ctx.dd_excluded_reg[r]) continue;
+            /* Self-RMW: same reg appears in dst — skip its
+             * contribution.  Tiny linear scan is fine, insns rarely
+             * have more than a handful of dst regs. */
+            bool self_rmw = false;
+            for (uint8_t d : insn.dst_regs) {
+                if (d == r) { self_rmw = true; break; }
+            }
+            if (self_rmw) continue;
             auto it = ctx.dd_last_writer.find(r);
-            if (it != ctx.dd_last_writer.end() &&
-                it->second.depth > max_src) {
-                max_src = it->second.depth;
+            if (it != ctx.dd_last_writer.end() && it->second > max_src) {
+                max_src = it->second;
             }
         }
-        /* Saturate at the reorder-buffer window.  Chain depth that
-         * grew beyond what the CPU can see at once isn't ILP-relevant
-         * — past that point, additional dependency steps don't
-         * further constrain the schedule.  This also bounds the
-         * compounding seen in tight `op reg, reg` loops where the
-         * same writer is constantly refreshed inside the window. */
         uint32_t this_depth = max_src + 1;
-        if (this_depth > rob) this_depth = rob;
+        if (this_depth > rob) this_depth = rob; /* histogram cap */
         bin_hist[this_depth]++;
-
-        uint64_t this_id = ctx.dd_next_insn_id++;
         for (uint8_t r : insn.dst_regs) {
-            ctx.dd_last_writer[r] = {this_depth, this_id};
-        }
-
-        /* Track this insn in the window so we can retire its writer
-         * contributions when it ages out. */
-        WalkCtx::DdWindowEntry entry;
-        entry.insn_id = this_id;
-        entry.depth   = this_depth;
-        entry.dsts.assign(insn.dst_regs.begin(), insn.dst_regs.end());
-        ctx.dd_window.push_back(std::move(entry));
-        while (ctx.dd_window.size() > rob) {
-            auto &old = ctx.dd_window.front();
-            for (uint8_t r : old.dsts) {
-                auto it = ctx.dd_last_writer.find(r);
-                if (it != ctx.dd_last_writer.end() &&
-                    it->second.owner_id == old.insn_id) {
-                    ctx.dd_last_writer.erase(it);
-                }
-            }
-            ctx.dd_window.pop_front();
+            if (ctx.dd_excluded_reg[r]) continue;
+            ctx.dd_last_writer[r] = this_depth;
         }
     }
     ctx.cp_insns_so_far += t.insns.size();
@@ -2619,16 +2627,12 @@ int main(int argc, char **argv)
                 }
                 return std::string(buf);
             }
-            case Metric::DepDepth: {
-                /* Title includes the ROB size since chains saturate
-                 * at this value — readers seeing a flat plateau at
-                 * y = ROB shouldn't mistake it for missing data. */
-                char buf[96];
-                std::snprintf(buf, sizeof(buf),
-                    "Dependency-chain depth (ROB = %u, saturates at this value)",
-                    opts.rob_size);
-                return std::string(buf);
-            }
+            case Metric::DepDepth:
+                /* Title flags the two filters that make the metric
+                 * ILP-relevant: excluded special regs and self-RMW
+                 * skip.  No window — chains live across BBs. */
+                return "Dependency-chain depth "
+                       "(excl. FLAGS / IP / ZERO and self-RMW)";
             case Metric::ReuseDistance:
                 return "Memory reuse-distance histogram";
         }
@@ -3132,21 +3136,6 @@ int main(int argc, char **argv)
             }
             plan.y_max = (y_peak > 0) ? y_peak * 1.1 : 1.0;
             plan.warmup_bins = 0;
-            /* Reference line at the ROB-size saturation level — any
-             * bin that hits this y value has at least one dep chain
-             * stretching the entire reorder buffer.  Drawn dashed +
-             * grey to clearly mark it as a reference, not data. */
-            {
-                Series ref;
-                char lab[32];
-                std::snprintf(lab, sizeof(lab), "ROB = %u (max)",
-                              opts.rob_size);
-                ref.label = lab;
-                ref.color = "#999999";
-                ref.dashed = true;
-                ref.y.assign(actual_bins, (double)opts.rob_size);
-                plan.series.push_back(std::move(ref));
-            }
             break;
         }
         case Metric::ReuseDistance: {

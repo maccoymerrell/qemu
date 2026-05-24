@@ -70,9 +70,9 @@ fi
 # rare-path tracer bugs.  Index 2 piles on iterations so hot-loop
 # state-machine bugs in the tracer become more likely to hit.
 SHAPES=(
-    "coverage      --coverage --hot-iters $HOT_ITERS --diamonds $DIAMONDS --side-len-min $SIDE_LEN_MIN --side-len-max $SIDE_LEN_MAX"
-    "wide-cfg      --coverage --hot-iters $HOT_ITERS --diamonds $((DIAMONDS * 2)) --side-len-min $((SIDE_LEN_MIN + 1)) --side-len-max $((SIDE_LEN_MAX + 2))"
-    "hot-stress    --coverage --hot-iters $((HOT_ITERS * 4)) --diamonds $DIAMONDS --side-len-min $SIDE_LEN_MIN --side-len-max $SIDE_LEN_MAX"
+    "coverage      --coverage --regdata --hot-iters $HOT_ITERS --diamonds $DIAMONDS --side-len-min $SIDE_LEN_MIN --side-len-max $SIDE_LEN_MAX"
+    "wide-cfg      --coverage --regdata --hot-iters $HOT_ITERS --diamonds $((DIAMONDS * 2)) --side-len-min $((SIDE_LEN_MIN + 1)) --side-len-max $((SIDE_LEN_MAX + 2))"
+    "hot-stress    --coverage --regdata --hot-iters $((HOT_ITERS * 4)) --diamonds $DIAMONDS --side-len-min $SIDE_LEN_MIN --side-len-max $SIDE_LEN_MAX"
 )
 
 OUT_ROOT="$(mktemp -d -t large_scale.XXXXXXXX)"

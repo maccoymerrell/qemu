@@ -141,6 +141,13 @@ struct Options {
      * forward-looking 1024 — larger than current Intel / AMD ROBs
      * (~600) but in the range upcoming designs are reaching for. */
     uint32_t            rob_size          = 1024;
+    /* Histogram tail-clipping: fold the rightmost bins that
+     * cumulatively account for less than @hist_tail_pct percent of
+     * the total into a single ">N" overflow bin.  Keeps the chart's
+     * x-axis labeled-and-readable when a distribution has a long
+     * sparse tail (typical for bb_length, reuse_distance).  Set 0
+     * to keep every bin un-clipped. */
+    double              hist_tail_pct     = 0.5;
 
     /* Diagnostic.  When > 0 and metric is branch_mpki, the gshare
      * handler dumps the first @debug_branches (pc, taken, bin,
@@ -189,6 +196,8 @@ struct Options {
 "      --warmup-bins=N     Bins excluded from y_max scaling (default 5)\n"
 "      --ws-window=N       working_set sliding-window size in CP insns (default 100000)\n"
 "      --rob-size=N        dep_depth reorder-buffer window size in insns (default 1024)\n"
+"      --hist-tail-pct=F   fold histogram bins past 100-F%% cumulative into a ‘>N’\n"
+"                          overflow bin so the x-axis stays readable (default 0.5; 0 = off)\n"
 "  -b, --bins=N            Number of bins (default 200)\n"
 "  -w, --width=PX          SVG width  (default 1280)\n"
 "  -h, --height=PX         SVG height (default 600)\n"
@@ -354,6 +363,16 @@ static Options parse_args(int argc, char **argv)
             o.ws_window = (uint64_t)parse_int(a + 12, "--ws-window");
         } else if (!std::strncmp(a, "--rob-size=", 11)) {
             o.rob_size = (uint32_t)parse_int(a + 11, "--rob-size");
+        } else if (!std::strncmp(a, "--hist-tail-pct=", 16)) {
+            char *end = nullptr;
+            double v = std::strtod(a + 16, &end);
+            if (!end || *end || v < 0.0 || v > 50.0) {
+                std::fprintf(stderr,
+                    "cst_visualize: bad value for --hist-tail-pct: %s\n",
+                    a + 16);
+                std::exit(2);
+            }
+            o.hist_tail_pct = v;
         } else if (!std::strcmp(a, "-b") || !std::strcmp(a, "--bins")) {
             need(i + 1, a); o.bins = parse_int(argv[++i], a);
         } else if (!std::strncmp(a, "--bins=", 7)) {
@@ -666,6 +685,12 @@ struct ChartPlan {
     /* Suffix appended to auto-generated Bars-mode tick labels (e.g.
      * "%" for the entropy histogram). */
     std::string x_unit_suffix;
+    /* When true the rightmost bin is an overflow (folded tail of
+     * the distribution).  Bars-mode rendering replaces the last bin
+     * tick label with @overflow_label (e.g. ">64") so readers can
+     * tell it's a fold-up, not just another value. */
+    bool        has_overflow_bin = false;
+    std::string overflow_label;
 
     std::vector<Series> series;
 };
@@ -837,12 +862,20 @@ static void render_plan(std::FILE *out, const ChartPlan &plan)
     } else if (plan.mode == ChartPlan::Mode::Bars) {
         /* Bin-centered ticks.  Pick a "nice" step (1/2/5 × 10^k)
          * targeting ~6 ticks across n_bins; label = bin index, with
-         * optional unit suffix. */
+         * optional unit suffix.  When an overflow bin is present at
+         * the right edge, skip any auto-tick that would land on it
+         * (its label would mis-describe a folded tail) and draw an
+         * explicit ">N" tick at the rightmost bin instead. */
+        int last_b = plan.n_bins - 1;
+        bool has_overflow = plan.has_overflow_bin
+                            && !plan.overflow_label.empty()
+                            && plan.n_bins > 0;
         int step = std::max(1, plan.n_bins / 6);
         static const int snap[] = {1, 2, 5, 10, 20, 50, 100, 200,
                                    500, 1000, 2000, 5000, 10000};
         for (int s : snap) { if (s >= step) { step = s; break; } }
         for (int b = 0; b < plan.n_bins; b += step) {
+            if (has_overflow && b == last_b) continue;
             double x = x_of((double)b + 0.5);
             std::fprintf(out,
                 "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
@@ -857,6 +890,20 @@ static void render_plan(std::FILE *out, const ChartPlan &plan)
                     "<text x=\"%.2f\" y=\"%d\" text-anchor=\"middle\" "
                     "fill=\"#555\">%s</text>\n",
                     x, T + plot_h + 18, xml_escape(lab).c_str());
+            }
+        }
+        if (has_overflow) {
+            double x = x_of((double)last_b + 0.5);
+            std::fprintf(out,
+                "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
+                "stroke=\"#cccccc\" stroke-width=\"1\"/>\n",
+                x, T + plot_h, x, T + plot_h + 4);
+            if (plan.show_x_labels) {
+                std::fprintf(out,
+                    "<text x=\"%.2f\" y=\"%d\" text-anchor=\"middle\" "
+                    "fill=\"#555\">%s</text>\n",
+                    x, T + plot_h + 18,
+                    xml_escape(plan.overflow_label).c_str());
             }
         }
     } else {
@@ -2919,6 +2966,53 @@ int main(int argc, char **argv)
                 y_lab_dynamic = "conditional-branch executions";
             }
 
+            /* Tail-clip: long sparse right-tails make the x-axis
+             * unreadable (BB length in particular has the occasional
+             * outlier in the thousands).  Fold the rightmost bins
+             * whose CUMULATIVE share is under hist_tail_pct percent
+             * into a single ">N" overflow bin.  Skip for the entropy
+             * histogram (0-100% is semantically bounded — each
+             * bucket represents a specific entropy level that you
+             * lose if you fold) and for indirect_targets (already
+             * bounded by BRANCH_TARGET_HISTORY). */
+            int clip_idx = (int)hist_static.size() - 1;
+            if (opts.metric == Metric::BbLength
+                && opts.hist_tail_pct > 0.0
+                && !hist_static.empty()) {
+                auto clip_one = [&](const std::vector<uint64_t> &h) -> int {
+                    uint64_t total = 0;
+                    for (auto v : h) total += v;
+                    if (total == 0) return (int)h.size() - 1;
+                    uint64_t thresh =
+                        (uint64_t)((double)total
+                                   * (1.0 - opts.hist_tail_pct / 100.0));
+                    uint64_t cum = 0;
+                    for (size_t i = 0; i < h.size(); i++) {
+                        cum += h[i];
+                        if (cum >= thresh) return (int)i;
+                    }
+                    return (int)h.size() - 1;
+                };
+                /* Take the WIDER of the two panes' clips so both
+                 * panes' tails are preserved up to whichever pane
+                 * needs more. */
+                int c = std::max(clip_one(hist_static),
+                                 clip_one(hist_dynamic));
+                if (c + 2 < (int)hist_static.size()) {
+                    auto fold = [&](std::vector<uint64_t> &h) {
+                        uint64_t over = 0;
+                        for (int i = c + 1; i < (int)h.size(); i++) {
+                            over += h[i];
+                        }
+                        h.resize(c + 2);
+                        h[c + 1] = over;
+                    };
+                    fold(hist_static);
+                    fold(hist_dynamic);
+                    clip_idx = c;
+                }
+            }
+
             auto fill_plan = [&](ChartPlan &p,
                                  const std::vector<uint64_t> &h,
                                  const char *y_lab) {
@@ -2942,6 +3036,16 @@ int main(int argc, char **argv)
                 p.y_max = (y_peak > 0) ? (double)y_peak * 1.1 : 1.0;
                 if (opts.metric == Metric::BranchEntropy) {
                     p.x_unit_suffix = "%";
+                }
+                /* If a tail was folded above, mark the rightmost bin
+                 * as an overflow so the tick reads ">N" instead of
+                 * just "N". */
+                if (opts.metric == Metric::BbLength
+                    && clip_idx + 2 == p.n_bins) {
+                    char buf[32];
+                    std::snprintf(buf, sizeof(buf), ">%d", clip_idx);
+                    p.has_overflow_bin = true;
+                    p.overflow_label   = buf;
                 }
                 /* Single-series histograms have no legend — reclaim
                  * the legend margin so the chart fills the canvas. */
@@ -3060,6 +3164,37 @@ int main(int argc, char **argv)
             for (size_t b = 0; b < ctx.ru_hist.size(); b++) {
                 h[b + 1] = ctx.ru_hist[b];
             }
+
+            /* Tail-clip: log buckets at the high end are typically
+             * tiny — fold them into an ">N" overflow at the right.
+             * Apply the same hist_tail_pct rule as the linear
+             * histograms.  Build the x-axis label list against the
+             * post-clip bin layout below. */
+            int clip_idx = (int)h.size() - 1; /* "no clip" sentinel */
+            if (opts.hist_tail_pct > 0.0) {
+                uint64_t total = 0;
+                for (auto v : h) total += v;
+                if (total > 0) {
+                    uint64_t thresh = (uint64_t)((double)total
+                        * (1.0 - opts.hist_tail_pct / 100.0));
+                    uint64_t cum = 0;
+                    int c = (int)h.size() - 1;
+                    for (size_t i = 0; i < h.size(); i++) {
+                        cum += h[i];
+                        if (cum >= thresh) { c = (int)i; break; }
+                    }
+                    if (c + 2 < (int)h.size()) {
+                        uint64_t over = 0;
+                        for (int i = c + 1; i < (int)h.size(); i++) {
+                            over += h[i];
+                        }
+                        h.resize(c + 2);
+                        h[c + 1] = over;
+                        clip_idx = c;
+                    }
+                }
+            }
+
             plan.mode = ChartPlan::Mode::Bars;
             plan.n_bins = (int)h.size();
             plan.x_bin_size = 1;
@@ -3078,10 +3213,18 @@ int main(int argc, char **argv)
                 if (h[b] > y_peak) y_peak = h[b];
             }
             plan.y_max = (y_peak > 0) ? (double)y_peak * 1.1 : 1.0;
-            /* Custom x labels: "cold", "0", "1", "2-3", "4-7", ... */
+            /* Custom x labels: "cold", "0", "1", "2-3", "4-7", ...
+             * For the post-clip layout, plan.n_bins = clip_idx + 2
+             * when an overflow bin is present (1 for "cold" + clip_idx
+             * data bins + 1 for ">N"); otherwise plan.n_bins ==
+             * 1 + n_buckets and no overflow tick is set. */
+            int data_bins = plan.n_bins - 1; /* exclude "cold" */
+            bool overflow = (clip_idx + 2 == plan.n_bins
+                             && clip_idx + 1 < (int)n_buckets);
+            int draw_bins = overflow ? clip_idx : (data_bins);
             plan.x_tick_labels.clear();
             plan.x_tick_labels.push_back("cold");
-            for (size_t b = 0; b < n_buckets; b++) {
+            auto bucket_label = [](size_t b) -> std::string {
                 char buf[32];
                 if (b == 0) std::snprintf(buf, sizeof(buf), "0");
                 else if (b == 1) std::snprintf(buf, sizeof(buf), "1");
@@ -3095,7 +3238,23 @@ int main(int argc, char **argv)
                     else std::snprintf(buf, sizeof(buf),
                         "%luM", (unsigned long)(lo / (1024 * 1024)));
                 }
-                plan.x_tick_labels.push_back(buf);
+                return std::string(buf);
+            };
+            for (int b = 0; b < draw_bins; b++) {
+                plan.x_tick_labels.push_back(bucket_label((size_t)b));
+            }
+            if (overflow) {
+                /* The overflow bin folds buckets [clip_idx .. n_buckets-1];
+                 * label it as ">{label of bucket clip_idx-1's hi end}". */
+                std::string base = bucket_label((size_t)clip_idx - 1);
+                /* Take whatever comes after the dash (or the whole
+                 * label if there's no dash) as the lower-bound name. */
+                std::string upper = base;
+                size_t dash = base.find('-');
+                if (dash != std::string::npos) {
+                    upper = base.substr(dash + 1);
+                }
+                plan.x_tick_labels.push_back(">" + upper);
             }
             plan.margin_right = 40;
             break;

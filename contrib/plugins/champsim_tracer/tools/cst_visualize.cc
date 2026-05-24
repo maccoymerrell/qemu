@@ -48,7 +48,6 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
-#include <list>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -57,10 +56,24 @@
 #include <unordered_set>
 #include <vector>
 
+#include <ext/pb_ds/assoc_container.hpp>
+#include <ext/pb_ds/tree_policy.hpp>
+
 #include "cst_common.h"
 #include "cst_decode.h"
 #include "cst_format.h"
 #include "cst_reader.h"
+
+/* Order-statistic tree (libstdc++ extension) used by reuse_distance: a
+ * red-black tree augmented with subtree-size counters so order_of_key
+ * is O(log N).  Lets stack-distance lookups beat the std::list + linear
+ * std::distance approach (O(working_set) per memop). */
+using OrderStatTree = __gnu_pbds::tree<
+    uint64_t,
+    __gnu_pbds::null_type,
+    std::less<uint64_t>,
+    __gnu_pbds::rb_tree_tag,
+    __gnu_pbds::tree_order_statistics_node_update>;
 
 /* ===================================================================
  *                            CLI parsing
@@ -614,6 +627,23 @@ static std::string lookup_name(
     char buf[32];
     std::snprintf(buf, sizeof(buf), "0x%" PRIx64, id);
     return buf;
+}
+
+/* Special-register predicate shared by dep_depth (chain-walk exclusion)
+ * and gen_reg (top-K destination-register breakdown).  Names matched
+ * here are architectural side-effects implicit on every instruction —
+ * the program counter / instruction pointer, the flags / condition
+ * register, the hardwired zero, and the placeholder for "no operand".
+ * They aren't true reg dependencies and dominate the histogram when
+ * counted; SP / FP and any architectural GPR / FPR / VEC / PRED / SEG
+ * bank are kept. */
+static bool reg_is_special_excluded(const std::string &name)
+{
+    return (name.find("ZERO") != std::string::npos)
+        || (name.find("FLAGS") != std::string::npos)
+        || (name == "REG_IP" || name == "IP"
+            || name == "REG_PC" || name == "PC")
+        || (name == "REG_NONE" || name == "NONE");
 }
 
 /* ===================================================================
@@ -1309,15 +1339,20 @@ struct WalkCtx {
     std::unordered_map<uint8_t, uint32_t> dd_last_writer;
     std::vector<std::vector<uint64_t>>    dd_depth_hist_per_bin;
 
-    /* --- reuse_distance state.  LRU stack (front = most recent) of
-     * cache lines, with a hash-map from line -> its position iterator
-     * for O(1) lookup.  std::distance from begin() to iter gives the
-     * stack distance.  Histogram counts log2-bucketed distances plus
-     * a "cold" bucket for first-access lines. */
-    std::list<uint64_t> ru_lru;
-    std::unordered_map<uint64_t, std::list<uint64_t>::iterator> ru_pos;
-    std::vector<uint64_t> ru_hist;                     /* sized at init */
-    uint64_t              ru_cold = 0;                 /* first-access count */
+    /* --- reuse_distance state.  An order-statistic tree (RB-tree
+     * augmented with subtree sizes) holds one entry per currently-live
+     * cache line, keyed by a monotonic access-time counter so younger
+     * keys are larger.  Stack distance = #entries above L = ru_tree
+     * size - order_of_key(L's last time) - 1; both lookup and
+     * promote-to-top run in O(log N) instead of the std::list +
+     * linear-scan O(N) the prior implementation paid per memop.
+     * Histogram counts log2-bucketed distances plus a "cold" bucket
+     * for first-access lines. */
+    OrderStatTree                          ru_tree;
+    std::unordered_map<uint64_t, uint64_t> ru_last_t;  /* line → tree key */
+    uint64_t                               ru_clock = 0;
+    std::vector<uint64_t>                  ru_hist;    /* sized at init */
+    uint64_t                               ru_cold = 0; /* first-access cnt */
 };
 
 /* Helper: classify a template's terminating instruction for
@@ -1913,18 +1948,15 @@ static void handle_dep_depth_entry(WalkCtx &ctx,
 {
     if (!ctx.dd_excluded_built) {
         /* Build the excluded-reg lookup once, from the trace's reg
-         * encoding map.  Anything named ZERO/FLAGS/IP/NONE is
-         * filtered out of the chain.  SP and any other named reg
-         * (including FPR / VEC / PRED / SEG banks) is kept. */
+         * encoding map.  Shared predicate with gen_reg — drops the
+         * same architectural side-effect regs (IP/PC/FLAGS/ZERO/NONE)
+         * so they don't dominate the chain.  SP and other named regs
+         * (including FPR / VEC / PRED / SEG banks) are kept. */
         for (const auto &kv : ctx.h->maps.reg) {
             if (kv.first > 255) continue;
-            const std::string &name = kv.second;
-            bool ex = (name.find("ZERO") != std::string::npos)
-                   || (name.find("FLAGS") != std::string::npos)
-                   || (name == "REG_IP" || name == "IP"
-                       || name == "REG_PC" || name == "PC")
-                   || (name == "REG_NONE" || name == "NONE");
-            if (ex) ctx.dd_excluded_reg[(size_t)kv.first] = true;
+            if (reg_is_special_excluded(kv.second)) {
+                ctx.dd_excluded_reg[(size_t)kv.first] = true;
+            }
         }
         ctx.dd_excluded_built = true;
     }
@@ -1971,8 +2003,13 @@ static void handle_dep_depth_entry(WalkCtx &ctx,
  * unique lines were accessed since this line was last seen (LRU
  * stack distance).  Bucket the distance log2 and tally into a
  * histogram.  First-access lines go to a separate "cold" bucket.
- * O(distance) per access via std::list — fine for typical workloads
- * (working-set ≪ access count). */
+ *
+ * Backed by an order-statistic tree keyed by a monotonic access-time
+ * counter: each line's last access time is one entry; stack distance
+ * is the count of entries with larger keys.  Both order_of_key and
+ * erase/insert are O(log N), so per-memop cost is O(log working_set)
+ * — a dramatic improvement over the prior std::list scan whose
+ * std::distance was O(working_set). */
 static constexpr int RU_BUCKETS = 24;  /* covers distance up to ~16M */
 static int ru_bucket_of(uint64_t distance) {
     if (distance == 0) return 0;
@@ -1988,24 +2025,28 @@ static void handle_reuse_distance_entry(WalkCtx &ctx,
     const cst::Template &t = (*ctx.templates)[ctx.by_id->at(e.template_id)];
     for (const auto &dp : e.dyn_params) {
         uint64_t line = dp.addr >> 6;
-        auto it = ctx.ru_pos.find(line);
-        if (it == ctx.ru_pos.end()) {
+        uint64_t t_new = ++ctx.ru_clock;
+        auto it = ctx.ru_last_t.find(line);
+        if (it == ctx.ru_last_t.end()) {
             ctx.ru_cold++;
-            ctx.ru_lru.push_front(line);
-            ctx.ru_pos[line] = ctx.ru_lru.begin();
+            ctx.ru_last_t.emplace(line, t_new);
         } else {
-            auto pos_it = it->second;
-            uint64_t distance =
-                (uint64_t)std::distance(ctx.ru_lru.begin(), pos_it);
+            uint64_t t_prev = it->second;
+            /* order_of_key(t_prev) = #entries with key < t_prev
+             * (older accesses, lower in the LRU stack).  Stack
+             * distance = entries strictly above L = size minus the
+             * below count minus 1 for L's own entry. */
+            size_t below = ctx.ru_tree.order_of_key(t_prev);
+            size_t distance = ctx.ru_tree.size() - below - 1;
             int b = ru_bucket_of(distance);
             if (b >= (int)ctx.ru_hist.size()) {
                 ctx.ru_hist.resize(b + 1, 0);
             }
             ctx.ru_hist[b]++;
-            ctx.ru_lru.erase(pos_it);
-            ctx.ru_lru.push_front(line);
-            ctx.ru_pos[line] = ctx.ru_lru.begin();
+            ctx.ru_tree.erase(t_prev);
+            it->second = t_new;
         }
+        ctx.ru_tree.insert(t_new);
     }
     ctx.cp_insns_so_far += t.insns.size();
 }
@@ -2184,6 +2225,22 @@ int main(int argc, char **argv)
      * them.  Done up-front so the per-entry hot path is just one
      * matrix update per (series, bin). */
     if (opts.metric == Metric::GenOp || opts.metric == Metric::GenReg) {
+        /* gen_reg drops architectural side-effect regs (IP/PC/FLAGS/
+         * ZERO/NONE) from the histogram — they appear on virtually
+         * every insn and would otherwise drown out the named GPR /
+         * FPR / VEC traffic that the chart is supposed to surface.
+         * SP/FP and other normal regs are kept.  Build the mask once
+         * by id so the per-insn loop is just an array lookup. */
+        std::array<bool, 256> reg_excluded{};
+        if (opts.metric == Metric::GenReg) {
+            for (const auto &kv : h.maps.reg) {
+                if (kv.first > 255) continue;
+                if (reg_is_special_excluded(kv.second)) {
+                    reg_excluded[(size_t)kv.first] = true;
+                }
+            }
+        }
+
         /* First pass: count per-name occurrences (opcode or
          * destination register) across the trace, weighted by
          * exec_cp so we can pick the top-K names to render and
@@ -2197,6 +2254,7 @@ int main(int argc, char **argv)
                     name_weight[lookup_name(h.maps.opcode, ins.opcode)] += w;
                 } else {
                     for (uint8_t r : ins.dst_regs) {
+                        if (reg_excluded[r]) continue;
                         name_weight[lookup_name(h.maps.reg, r)] += w;
                     }
                 }
@@ -2229,8 +2287,12 @@ int main(int argc, char **argv)
                 } else {
                     /* gen_reg counts each dst-reg occurrence as 1
                      * (an instruction with two dst regs contributes
-                     * one to each). */
+                     * one to each).  Architectural side-effect regs
+                     * are excluded; an insn whose only dst is one of
+                     * those (e.g. a flag-only update) contributes
+                     * nothing to gen_reg. */
                     for (uint8_t r : ins.dst_regs) {
+                        if (reg_excluded[r]) continue;
                         std::string n = lookup_name(h.maps.reg, r);
                         auto it = ctx.label_to_series.find(n);
                         int sid = (it != ctx.label_to_series.end()

@@ -56,13 +56,19 @@ size_t BBTemplateCache::tb_count() const
 void BBTemplateCache::clear_bb_map()
 {
     bb_map_.clear();
-    /* parent_true_bb on every TB template points into the bb_map_ we
-     * just wiped, so the back-edges must be invalidated.  Walking
-     * tb_templates_ is O(distinct translations) and only runs on
-     * segment switches, not per-exec. */
+    /* TB templates hold two back-edges into bb_map_ — parent_true_bb
+     * (fast-path link to the assembled true-BB) and rep_subtmpl (the
+     * 1-insn REP self-loop true-BB built at translation time for x86
+     * REP string ops).  Both must be invalidated after the wipe;
+     * otherwise commit_true_bb_refs propagates a dangling rep_subtmpl
+     * onto the next finalized true-BB, and emit_body_entry's REP
+     * fan-out path then derefs freed memory.  Walking tb_templates_
+     * is O(distinct translations) and only runs on segment switches,
+     * not per-exec. */
     for (auto &p : tb_templates_) {
         if (p) {
             p->parent_true_bb = nullptr;
+            p->rep_subtmpl    = nullptr;
         }
     }
     /*
@@ -502,11 +508,17 @@ BBTemplate *BBTemplateCache::get_or_create_bb_template(
                                            symbol_name, final_ft);
     /*
      * Propagate the REP self-loop sub-template from the last fragment
-     * (the TB ending in the REP string op, built at TB-translation
-     * time) onto the assembled BB so emit_body_entry can fan iterations
-     * without re-walking fragments.  No-op for non-REP BBs.
+     * (the TB ending in the REP string op) onto the assembled BB so
+     * emit_body_entry can fan iterations without re-walking fragments.
+     * No-op for non-REP BBs.  Materialization is lazy: the parent
+     * TB's rep_subtmpl is built on first chain-finalize use here, not
+     * at translation time — that avoids paying the cost for REP TBs
+     * translated outside an active segment, AND rebuilds the pointer
+     * the next time it is needed after clear_bb_map() invalidated it
+     * at a segment switch.
      */
     if (tmpl && n_fragments > 0 && fragments[n_fragments - 1]) {
+        ensure_rep_subtmpl(fragments[n_fragments - 1]);
         tmpl->rep_subtmpl = fragments[n_fragments - 1]->rep_subtmpl;
     }
 
@@ -585,33 +597,40 @@ BBTemplate *BBTemplateCache::create_tb_template(
     BBTemplate *raw = tmpl.get();
     tb_templates_.push_back(std::move(tmpl));
     g_stats.tb_templates_created++;
-
-    /*
-     * REP string ops fan into per-iteration body entries: iter 1 stays
-     * on the parent TB template (the BB first entering the loop ends
-     * with the first REP, like a normal branch); iter 2..N emit on a
-     * 1-insn self-loop sub-template built here.  The body emitter
-     * follows raw->rep_subtmpl when the terminator has
-     * rep_loads_per_iter + rep_stores_per_iter > 0.  The sub-template
-     * is a 1-insn BB at the REP PC with the same InsnFields (incl.
-     * BRANCH_COND_DIRECT) so it is structurally a self-loop.
-     */
-    if (raw->n_insns > 0) {
-        uint32_t last = raw->n_insns - 1;
-        const InsnFields *lf = &raw->insn_fields[last];
-        if (lf->rep_loads_per_iter + lf->rep_stores_per_iter > 0) {
-            uint64_t  sub_pc   = raw->insn_pcs[last];
-            uint8_t   sub_size = raw->insn_sizes[last];
-            const uint8_t *sub_bytes =
-                &raw->insn_bytes[(size_t)last * MAX_INSN_BYTES];
-            const InsnRegNames *sub_regs =
-                raw->insn_reg_names ? &raw->insn_reg_names[last] : nullptr;
-            uint64_t  sub_ft   = sub_pc + sub_size;
-            raw->rep_subtmpl = commit_true_bb(sub_pc, 1, &sub_pc, lf,
-                                              &sub_size, sub_bytes,
-                                              sub_regs,
-                                              raw->symbol_name, sub_ft);
-        }
-    }
+    /* rep_subtmpl is materialized lazily on first chain-finalize use
+     * inside an active segment (see ensure_rep_subtmpl); doing it
+     * here would burn translation cost on every TB during warmup, on
+     * top of leaving a freed pointer cached on the TB after the next
+     * clear_bb_map. */
     return raw;
+}
+
+void BBTemplateCache::ensure_rep_subtmpl(BBTemplate *tb)
+{
+    /* No-op when already built, when not a REP TB, or on a degenerate
+     * template (no insns).  commit_true_bb dedups by start_pc, so
+     * repeated calls within a segment are safe — but the early-out
+     * keeps the hot path branch-predicted. */
+    if (!tb || tb->rep_subtmpl || tb->n_insns == 0) {
+        return;
+    }
+    uint32_t last = tb->n_insns - 1;
+    const InsnFields *lf = &tb->insn_fields[last];
+    if (lf->rep_loads_per_iter + lf->rep_stores_per_iter == 0) {
+        return;
+    }
+    /* 1-insn self-loop sub-template at the REP PC with the same
+     * InsnFields (incl. BRANCH_COND_DIRECT), structurally a self-
+     * loop.  emit_body_entry fans iter 2..N onto this template. */
+    uint64_t  sub_pc   = tb->insn_pcs[last];
+    uint8_t   sub_size = tb->insn_sizes[last];
+    const uint8_t *sub_bytes =
+        &tb->insn_bytes[(size_t)last * MAX_INSN_BYTES];
+    const InsnRegNames *sub_regs =
+        tb->insn_reg_names ? &tb->insn_reg_names[last] : nullptr;
+    uint64_t sub_ft = sub_pc + sub_size;
+    tb->rep_subtmpl = commit_true_bb(sub_pc, 1, &sub_pc, lf,
+                                     &sub_size, sub_bytes,
+                                     sub_regs,
+                                     tb->symbol_name, sub_ft);
 }

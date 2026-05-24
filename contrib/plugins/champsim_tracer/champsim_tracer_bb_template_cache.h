@@ -126,6 +126,18 @@ public:
     void clear_tb_templates();
 
 private:
+    /* Materialize @tb's REP self-loop sub-template lazily on first
+     * demand from the chain-finalize path.  No-op when @tb's
+     * terminator is not a REP string op, or when rep_subtmpl is
+     * already populated.  Deferring the build to first use (instead
+     * of running it for every TB during translation) avoids paying
+     * the cost for TBs that never run inside an active trace
+     * segment, AND avoids leaving stale rep_subtmpl pointers behind
+     * across segment switches — the only consumer (emit_body_entry's
+     * REP fan-out) runs while the segment owning the sub-template is
+     * still live. */
+    void ensure_rep_subtmpl(BBTemplate *tb);
+
     /* Shared existing-true-BB handling for commit_true_bb and its
      * reference variant: returns the cached template (logging a
      * one-shot SMC/divergence warning if the insn-pc sequence

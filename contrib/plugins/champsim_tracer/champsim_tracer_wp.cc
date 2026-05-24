@@ -591,7 +591,22 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             repeated_fault_pc = 0;
             last_fault_pc = UINT64_MAX;
 
-            uint64_t fall_through = pre_pc + last_insn_size;
+            /*
+             * Architectural fall-through = PC after the BB's LAST
+             * INSTRUCTION (the branch), NOT @pre_pc + last_insn_size.
+             * @pre_pc is the START of the current TB fragment; for a
+             * multi-insn fragment that's some insn BEFORE the branch
+             * and gives a fall_through that lands INSIDE the BB.
+             * Use the branch's own PC + its size instead.  Because
+             * WP-discovered BBs are committed to the shared
+             * bb_template_cache BEFORE the CP-side commit (WP runs
+             * inside emit_finalized_bb), a wrong value here is
+             * inherited by every subsequent CP lookup of the same BB.
+             */
+            uint64_t last_insn_pc = n_executed_in_cur > 0
+                ? cur->insn_pcs[n_executed_in_cur - 1]
+                : pre_pc;
+            uint64_t fall_through = last_insn_pc + last_insn_size;
 
             g_mutex_lock(&data_lock);
             BBTemplate *bb_tmpl = g_bb_template_cache.commit_true_bb_refs(

@@ -430,15 +430,29 @@ Decode by repeated outer-section unwrapping.
                                    ;   fixed numbers.  Classes, by
                                    ;   meaning: no memory access on
                                    ;   that stream; REGULAR (the
-                                   ;   address sequence converges at
-                                   ;   the first derivative — constant
-                                   ;   stride, including the trivial 0
-                                   ;   and 1-sample cases); IRREGULAR
-                                   ;   (delta varies but the second
-                                   ;   derivative ddelta is constant);
-                                   ;   RANDOM (ddelta itself varies —
-                                   ;   3rd-order or higher, no
-                                   ;   convergence at ddelta).  The
+                                   ;   abs-magnitude polynomial chain
+                                   ;   converges at level 0 — |delta|
+                                   ;   constant, covering constant
+                                   ;   stride, stride 0, direction
+                                   ;   reversals of the same magnitude,
+                                   ;   and the 1-sample case);
+                                   ;   IRREGULAR (the polynomial chain
+                                   ;   converges at some deeper level
+                                   ;   k in 1..K-1 — degree-2 through
+                                   ;   degree-K polynomial streams —
+                                   ;   OR the geometric rescue fires
+                                   ;   at some walked level via
+                                   ;   |x_n|*|x_{n-2}| = |x_{n-1}|^2 —
+                                   ;   pure exponential, or any
+                                   ;   polynomial-plus-exponential
+                                   ;   mixture up to polynomial degree
+                                   ;   K-2); RANDOM (neither test
+                                   ;   classifies the step within
+                                   ;   CST_PAT_POLY_DEPTH=K=4 levels —
+                                   ;   would need degree-(K+1) or
+                                   ;   higher polynomial, or a non-
+                                   ;   geometric non-polynomial
+                                   ;   structure).  The
                                    ;   writer reports the strongest
                                    ;   class observed across the run,
                                    ;   composing a per-insn PC-keyed
@@ -1708,45 +1722,81 @@ profile_block:
                             bit[3:2] WP access-pattern class
                               resolve via encoding map
                               "mem_access_pattern" (CST_PAT_*).
-                              Classified by DERIVATIVE-CONVERGENCE
-                              BINNING on effective addresses:
-                              delta_n = ea_n − ea_{n-1};
-                              ddelta_n = delta_n − delta_{n-1}.
-                              Each memop is tagged with the lowest-
-                              order class that explains it —
-                              REGULAR when this delta equals the
-                              prior delta, IRREGULAR when delta
-                              varies but ddelta equals the prior
-                              ddelta, RANDOM when ddelta itself
-                              varies — and the tag is tallied into
-                              a per-insn histogram.  The reported
-                              class is the ARGMAX bin: the regime
-                              the insn spends most of its lifetime
-                              in.  Convergence is a structural
-                              property; there is no magnitude
-                              threshold, and a 1-byte and a 1-MiB
-                              constant stride both tally as
-                              REGULAR.  Numeric values resolved
-                              through the `mem_access_pattern` map,
-                              not pinned here:
+                              Per-memop classification runs two
+                              complementary tests on the effective-
+                              address stream and tallies the tag
+                              into a per-insn histogram; the
+                              reported class is the ARGMAX bin:
+                              the regime the insn spends most of
+                              its lifetime in.
+
+                              Test 1 (POLYNOMIAL CHAIN, abs-
+                              magnitude).  Walk derivative levels
+                              0..K-1 where K = CST_PAT_POLY_DEPTH =
+                              4 and each level is the abs
+                              difference of the previous:
+                                  level 0:  |delta_n|
+                                  level k:  ||x_{k-1,n}| -
+                                            |x_{k-1,n-1}||
+                              Convergence at level 0 (|delta_n| ==
+                              |delta_{n-1}|) ⇒ REGULAR; convergence
+                              at any deeper level ⇒ IRREGULAR.
+                              Abs at every level avoids the
+                              constructive-sign-compounding failure
+                              mode (e.g. 0,1,3,4,6,7 ⇒ |d|=1,2,1,
+                              2,1 ⇒ signed ddelta alternates ±1 yet
+                              |ddelta|=1 throughout ⇒ IRREGULAR).
+                              K=4 covers polynomial address streams
+                              up to degree 4.
+
+                              Test 2 (GEOMETRIC RESCUE).  At every
+                              level the polynomial walk descends
+                              past, run the exact-integer cross-
+                              multiply test
+                                  |x_n| * |x_{n-2}| == |x_{n-1}|^2
+                              on the last three level-k magnitudes.
+                              A match anywhere overrides RANDOM to
+                              IRREGULAR.  Catches pure exponential
+                              and any polynomial-plus-exponential
+                              mixture up to polynomial degree K-2.
+                              Only consulted when the polynomial
+                              chain returned no convergence.
+
+                              Both tests are structural properties;
+                              there is no magnitude threshold, and
+                              a 1-byte and a 1-MiB constant stride
+                              both tally as REGULAR.  Numeric
+                              values resolved through the
+                              `mem_access_pattern` map, not pinned
+                              here:
                               CST_PAT_NONE       no memory access
                                                  seen
-                              CST_PAT_REGULAR    dominant: delta
+                              CST_PAT_REGULAR    dominant: |delta|
                                                  constant (incl.
-                                                 stride 0 and the
-                                                 trivial 1–2 step
-                                                 default)
-                              CST_PAT_IRREGULAR  dominant: delta
-                                                 varies but ddelta
-                                                 constant
-                                                 (e.g. a walking
-                                                 stride 1,2,3,… →
-                                                 ddelta == 1)
-                              CST_PAT_RANDOM     dominant: ddelta
-                                                 itself varies —
-                                                 no convergence at
-                                                 the second
-                                                 derivative
+                                                 stride 0, direction
+                                                 reversals of the
+                                                 same magnitude, and
+                                                 the trivial 1–2
+                                                 step default)
+                              CST_PAT_IRREGULAR  dominant: polynomial
+                                                 chain converges at
+                                                 level ≥1 OR
+                                                 geometric rescue
+                                                 fires at some
+                                                 walked level
+                                                 (e.g. cubic walk:
+                                                 |Δ³d|=const; 2^n
+                                                 walk: constant
+                                                 ratio across
+                                                 |d_n|,|d_{n-1}|,
+                                                 |d_{n-2}|)
+                              CST_PAT_RANDOM     dominant: neither
+                                                 test classifies —
+                                                 needs degree-(K+1)
+                                                 or higher
+                                                 polynomial, or
+                                                 non-poly non-geo
+                                                 structure
                             (two trackers run a per-access bin
                              tally — a per-insn PC-keyed classifier
                              and a cross-insn page-keyed spatial

@@ -359,16 +359,50 @@ typedef struct {
  * each memop is classified individually by the lowest-order derivative
  * needed to explain it, then tallied into a per-insn histogram; the
  * emitted class is the bin with the highest count — the DOMINANT
- * regime the insn spends its lifetime in.  Per memop:
+ * regime the insn spends its lifetime in.
  *
- *   REGULAR    delta_n == delta_{n-1} (this step fits the constant-
- *              stride trajectory), incl. the first one or two memops
- *              when no prior derivative has been established.
- *   IRREGULAR  delta_n varies but ddelta_n == ddelta_{n-1}
- *              (this step fits a smoothly accelerating stride —
- *              ddelta-constant trajectory).
- *   RANDOM    ddelta_n itself varies (third-order or worse — no
- *              convergence at ddelta).
+ * Two complementary tests run per step:
+ *
+ *  1. POLYNOMIAL CHAIN.  Walk derivative levels 0..CST_PAT_POLY_DEPTH-1
+ *     in ABSOLUTE MAGNITUDE space (each level is the abs difference of
+ *     the previous level), declaring IRREGULAR on convergence at any
+ *     deeper level and REGULAR on convergence at level 0.  K=4 covers
+ *     up to degree-4 polynomial access streams.  Absolute magnitudes
+ *     avoid the constructive-sign-compounding failure mode where
+ *     bounded-complexity patterns (e.g. 0,1,3,4,6,7 ⇒ deltas 1,2,1,2,1,
+ *     signed ddeltas +1,-1,+1,-1) would be mislabelled because their
+ *     signed ddeltas never repeat — taking abs gives |ddelta|=1
+ *     everywhere and the pattern resolves to IRREGULAR.
+ *
+ *  2. GEOMETRIC RESCUE.  Exponential patterns (e.g. 2^n) have NO
+ *     polynomial convergence at any finite depth — at every level the
+ *     magnitudes stay exponential.  Detected by the constant-ratio
+ *     test |x_n| * |x_{n-2}| == |x_{n-1}|^2 (exact integer cross-
+ *     multiply, no division, no FP rounding) applied at EVERY
+ *     polynomial level the walk descends past.  This catches any
+ *     (polynomial of degree <= K-2) + (exponential) mixture: the
+ *     polynomial part annihilates under K-2 differences and the
+ *     exponential survives, so at least one level shows the constant
+ *     ratio.  Fires only as a rescue when the polynomial chain
+ *     returned RANDOM.
+ *
+ * Per memop:
+ *
+ *   REGULAR    |delta_n| == |delta_{n-1}| (constant-magnitude stride;
+ *              direction reversals of the same magnitude still count
+ *              as REGULAR; first one or two memops default here).
+ *   IRREGULAR  Either the abs-derivative chain converges at some
+ *              level k in 1..K-1 (|Δ^(k+1)| constant — degree-2
+ *              through degree-K polynomial access streams qualify),
+ *              OR the geometric rescue fires at some walked level
+ *              (constant ratio across three consecutive level-k
+ *              magnitudes — catches pure exponential at any level
+ *              and any polynomial-plus-exponential mixture up to
+ *              degree K-2).
+ *   RANDOM    Neither the abs-derivative chain converges within
+ *              CST_PAT_POLY_DEPTH levels nor a constant ratio is
+ *              detected — would need degree-(K+1) or higher
+ *              polynomial, or a non-geometric non-polynomial pattern.
  *
  * Two trackers run in parallel: a per-insn classifier keyed by issuing
  * PC, and a CROSS-INSN spatial classifier keyed by page (within-page
@@ -399,20 +433,32 @@ enum {
 };
 
 /*
- * Derivative-convergence stride-classifier state.  prev_delta /
- * prev_ddelta hold the most-recent observed values; the per-step
- * classifier (profile_stride_step) returns the bin (REGULAR /
- * IRREGULAR / RANDOM) THIS step fits and rolls the state forward.
- * Bin selection per step is the model's only output; tallying lives in
- * the caller's per-insn histograms.
+ * Maximum polynomial derivative depth for the abs-magnitude chain
+ * test.  Detects convergence in |Δ^(k+1)f| for k in 0..K-1 — i.e.
+ * degree-1 through degree-K polynomial address streams.  K=4 covers
+ * up to quartic, which is well past anything seen in real cache-
+ * relevant code; exponential patterns (no polynomial convergence at
+ * any depth) are caught separately by the geometric-ratio rescue.
+ */
+#define CST_PAT_POLY_DEPTH 4
+
+/*
+ * Derivative-convergence stride-classifier state.  prev_abs_d[k] /
+ * prev_prev_abs_d[k] hold the last two observed |Δ^(k+1)f| magnitudes
+ * at derivative level k — the second slot enables the per-level
+ * geometric-ratio cross-multiply.  The per-step classifier
+ * (profile_stride_step) returns the bin (REGULAR / IRREGULAR /
+ * RANDOM) THIS step fits and rolls the state forward.  Bin selection
+ * per step is the model's only output; tallying lives in the caller's
+ * per-insn histograms.
  */
 typedef struct {
     uint64_t prev_addr;
-    int64_t  prev_delta;
-    int64_t  prev_ddelta;
+    uint64_t prev_abs_d[CST_PAT_POLY_DEPTH];      /* |Δ^(k+1)|_{n-1} */
+    uint64_t prev_prev_abs_d[CST_PAT_POLY_DEPTH]; /* |Δ^(k+1)|_{n-2} */
     uint8_t  have_addr;
-    uint8_t  have_delta;
-    uint8_t  have_ddelta;
+    uint8_t  have_d_mask;       /* bit k: prev_abs_d[k] valid      */
+    uint8_t  have_pprev_d_mask; /* bit k: prev_prev_abs_d[k] valid */
 } StrideState;
 
 /* Per-insn histograms: [REGULAR-1, IRREGULAR-1, RANDOM-1] counts —

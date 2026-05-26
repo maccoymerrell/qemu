@@ -139,26 +139,47 @@ Per basic block:
   correct- and wrong-path mem-op counts, the effective-address
   range touched, a *data-is-address* flag (a loaded / stored value
   whose page a real correct-path mem-op also touched — a pointer-
-  chasing signal), and an **access-pattern class**:
+  chasing signal), and an **access-pattern class** — one of
+  ``regular``, ``irregular``, or ``random``.
 
-  - ``regular`` — the address sequence's first derivative is
-    constant (constant stride, including stride 0);
-  - ``irregular`` — delta varies but the second derivative
-    ``ddelta = delta_n - delta_{n-1}`` is constant;
-  - ``random`` — ddelta itself varies, so convergence needs the
-    third derivative or higher.
+  Each memop is classified individually and tallied into a
+  per-instruction histogram; the reported class is the argmax bin
+  — the regime the instruction spends most of its lifetime in.
+  Two complementary tests run per memop:
 
-  Classification is **derivative-convergence binning**: every
-  memop is tagged with the lowest-order class that explains it
-  and the tag is tallied into a per-instruction histogram; the
-  reported class is the argmax bin — the regime the instruction
-  spends most of its lifetime in.  Two trackers contribute to the
-  histogram in parallel — a per-insn classifier keyed by issuing
-  PC, and a cross-instruction *spatial* classifier keyed by page
-  (within-page offset deltas — picks up stencil sweeps where each
-  insn looks chaotic but the basic block stripes a page linearly).
-  Each tracker takes its own argmax, and the emitted class is the
-  lower (more regular) of the two.
+  1. A **polynomial chain** in absolute-magnitude space — walk
+     derivative levels :math:`0 \dots K-1` (where :math:`K =
+     \texttt{CST\_PAT\_POLY\_DEPTH} = 4`).  Each level is the
+     abs difference of the previous level: level 0 is
+     :math:`|\Delta f|`, level 1 is :math:`||\Delta f|_n -
+     |\Delta f|_{n-1}|`, and so on.  Convergence at level 0
+     (``|delta_n| == |delta_{n-1}|``) tags the step ``regular``;
+     convergence at any deeper level tags it ``irregular``.
+     :math:`K = 4` covers polynomial address streams up to
+     degree 4.  Absolute magnitudes prevent bounded-complexity
+     patterns whose signed deltas oscillate (e.g. addresses
+     ``0,1,3,4,6,7`` ⇒ deltas ``1,2,1,2,1`` ⇒ signed ddeltas
+     ``+1,-1,+1,-1`` but ``|ddelta|=1`` everywhere) from being
+     labelled higher-order than they structurally are.
+  2. A **geometric rescue** — constant-ratio detection on the
+     last three magnitudes at every level the polynomial walk
+     descends past, using the exact-integer cross-multiply
+     :math:`|x_n|\,|x_{n-2}| = |x_{n-1}|^2`.  Catches pure
+     exponential patterns (e.g. ``2^n``-stride binary walks) and
+     any polynomial-plus-exponential mixture up to polynomial
+     degree :math:`K-2`: the polynomial part annihilates by
+     some level and the exponential survives with a constant
+     ratio.  Fires the rescue (overriding ``random`` to
+     ``irregular``) only when the polynomial chain found no
+     convergence.
+
+  Two trackers contribute to the histogram in parallel — a
+  per-insn classifier keyed by issuing PC, and a cross-instruction
+  *spatial* classifier keyed by page (within-page offset deltas —
+  picks up stencil sweeps where each insn looks chaotic but the
+  basic block stripes a page linearly).  Each tracker takes its
+  own argmax, and the emitted class is the lower (more regular)
+  of the two.
 
 The exact byte layout is in :doc:`format` (Step 4.6 / §6); the
 :doc:`decoder` renders it inline per BB and ``cst_audit`` shows

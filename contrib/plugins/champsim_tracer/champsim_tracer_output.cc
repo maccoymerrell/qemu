@@ -3025,19 +3025,49 @@ static bool profile_value_is_addr(const DynParam &dp)
  * (CST_PAT_REGULAR / IRREGULAR / RANDOM) for THIS step and rolls the
  * state forward.  Bins are tallied per-insn (see profile_step); the
  * insn's emitted class is the argmax bin — the regime the insn spends
- * most of its lifetime in.  Per-step decision:
+ * most of its lifetime in.
  *
- *   REGULAR    delta_n == delta_{n-1} (fits the constant-stride
- *              trajectory; first 1–2 steps default here because no
- *              prior derivative is established yet).
- *   IRREGULAR  delta_n varies but ddelta_n == ddelta_{n-1} (fits a
- *              smoothly accelerating stride — constant-ddelta
- *              trajectory; first ddelta defaults here).
- *   RANDOM     ddelta_n itself varies (no convergence at ddelta —
- *              would need >= 3rd-order to explain).
+ * Two complementary tests run per step (see champsim_tracer.h, the
+ * "Access-pattern class" block, for the full design rationale):
+ *
+ *  1. POLYNOMIAL CHAIN in absolute-magnitude space.  Walk derivative
+ *     levels 0..CST_PAT_POLY_DEPTH-1, where each level k stores the
+ *     previously-seen |Δ^(k+1)f| and the next level's "cur" is the
+ *     abs difference of this level's cur and the stored value.
+ *     Convergence at level 0 ⇒ REGULAR; convergence at any deeper
+ *     level ⇒ IRREGULAR.  K=4 covers up to degree-4 polynomial
+ *     access streams.  Taking abs at every level prevents bounded-
+ *     complexity patterns whose signed deltas oscillate from being
+ *     misclassified as a higher order than they structurally are
+ *     (e.g. 0,1,3,4,6,7 ⇒ |d|=1,2,1,2,1 ⇒ |ddelta|=1 everywhere ⇒
+ *     IRREGULAR; signed-only would mark this RANDOM).
+ *
+ *  2. GEOMETRIC RESCUE (constant-ratio detection).  Applied at EVERY
+ *     polynomial level the walk descends past — exponential
+ *     components survive any number of differences while polynomial
+ *     components annihilate after enough, so testing at every walked
+ *     level catches any (polynomial of degree <= K-2) + (exponential)
+ *     mixture (the polynomial annihilates by some level k <= K-2 and
+ *     the exponential shows a constant ratio at that level).  Test
+ *     in exact-integer cross-multiply form at level k:
+ *         |Δ^(k+1)|_n * |Δ^(k+1)|_{n-2}  ==  |Δ^(k+1)|_{n-1}^2
+ *     128-bit multiply keeps the test safe up to magnitudes of 2^64
+ *     (real-world deltas comfortably fit in 32–48 bits).  Requires
+ *     |Δ^(k+1)|_{n-2} > 0 to exclude the degenerate all-zero case
+ *     (which the polynomial test already classifies as REGULAR).
+ *     Fires the rescue only when the polynomial chain returned
+ *     RANDOM; otherwise the polynomial result wins.
  *
  * No magnitude threshold: convergence is a structural property, not a
  * size one.  A 1-byte and a 1-MiB constant stride are both REGULAR. */
+static inline uint64_t profile_abs_i64(int64_t v)
+{
+    /* Safe abs for two's-complement: avoids UB on INT64_MIN.  EAs in
+     * practice live in 48-bit canonical space so deltas comfortably
+     * fit in int64; this is defensive only. */
+    return v < 0 ? (uint64_t)(-(v + 1)) + 1u : (uint64_t)v;
+}
+
 static uint8_t profile_stride_step(StrideState *s, uint64_t ea)
 {
     if (!s->have_addr) {
@@ -3047,26 +3077,67 @@ static uint8_t profile_stride_step(StrideState *s, uint64_t ea)
     }
     int64_t d = (int64_t)(ea - s->prev_addr);
     s->prev_addr = ea;
-    if (!s->have_delta) {
-        s->prev_delta = d;
-        s->have_delta = 1;
-        return CST_PAT_REGULAR;
+    uint64_t ad = profile_abs_i64(d);
+
+    /* Walk the polynomial-convergence chain.  At each level k:
+     *  - !have at level k ⇒ store cur, default REGULAR (k=0) /
+     *    IRREGULAR (k>=1), stop.
+     *  - cur == prev_abs_d[k] ⇒ convergence at level k, return
+     *    REGULAR (k=0) / IRREGULAR (k>=1), stop.
+     *  - otherwise: run the level-k geometric cross-multiply test
+     *    on cur, prev_abs_d[k], prev_prev_abs_d[k] (skipped until
+     *    have_pprev_d_mask bit is set — needs three consecutive
+     *    samples at this level), then shift prev_prev_abs_d[k] :=
+     *    prev_abs_d[k], compute next = ||cur - prev_abs_d[k]|, and
+     *    descend to level k+1.
+     *
+     * If the polynomial walk reaches the end of the chain without
+     * converging (cls_set still false), cls is RANDOM by default,
+     * overridden to IRREGULAR if any per-level geo test fired. */
+    uint8_t cls = CST_PAT_RANDOM;
+    bool cls_set = false;
+    bool geo_fired = false;
+    uint64_t cur = ad;
+    for (int k = 0; k < CST_PAT_POLY_DEPTH; k++) {
+        uint8_t bit = (uint8_t)(1u << k);
+        if (!(s->have_d_mask & bit)) {
+            s->prev_abs_d[k] = cur;
+            s->have_d_mask = (uint8_t)(s->have_d_mask | bit);
+            cls = (k == 0) ? CST_PAT_REGULAR : CST_PAT_IRREGULAR;
+            cls_set = true;
+            break;
+        }
+        uint64_t prev_k = s->prev_abs_d[k];
+        if (cur == prev_k) {
+            cls = (k == 0) ? CST_PAT_REGULAR : CST_PAT_IRREGULAR;
+            cls_set = true;
+            break;
+        }
+        /* Level-k geometric test: cur * prev_prev[k] == prev[k]^2.
+         * Needs three level-k samples (the third one is cur right
+         * now); also requires prev_prev > 0 so the degenerate
+         * (0,0,0) sequence does not fire (already REGULAR via the
+         * convergence path anyway). */
+        if (!geo_fired && (s->have_pprev_d_mask & bit) != 0 &&
+            s->prev_prev_abs_d[k] > 0) {
+            __uint128_t lhs = (__uint128_t)cur *
+                              (__uint128_t)s->prev_prev_abs_d[k];
+            __uint128_t rhs = (__uint128_t)prev_k * (__uint128_t)prev_k;
+            if (lhs == rhs) {
+                geo_fired = true;
+            }
+        }
+        /* Shift level-k state forward: today's prev becomes
+         * tomorrow's prev-prev; cur becomes the new prev. */
+        s->prev_prev_abs_d[k] = prev_k;
+        s->have_pprev_d_mask = (uint8_t)(s->have_pprev_d_mask | bit);
+        s->prev_abs_d[k] = cur;
+        cur = (cur >= prev_k) ? cur - prev_k : prev_k - cur;
     }
-    if (d == s->prev_delta) {
-        return CST_PAT_REGULAR;
+    if (!cls_set) {
+        cls = geo_fired ? CST_PAT_IRREGULAR : CST_PAT_RANDOM;
     }
-    int64_t dd = d - s->prev_delta;
-    s->prev_delta = d;
-    if (!s->have_ddelta) {
-        s->prev_ddelta = dd;
-        s->have_ddelta = 1;
-        return CST_PAT_IRREGULAR;
-    }
-    if (dd == s->prev_ddelta) {
-        return CST_PAT_IRREGULAR;
-    }
-    s->prev_ddelta = dd;
-    return CST_PAT_RANDOM;
+    return cls;
 }
 
 /* Spatial (cross-instruction) classifier — per-page StrideState keyed

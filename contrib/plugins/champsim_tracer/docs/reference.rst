@@ -693,17 +693,39 @@ Memory access-pattern classes (``CST_PAT_*``)
 Each template-profile per-instruction record carries a 2-bit
 access-pattern class for the correct path and another for the
 wrong path (see :doc:`concepts`, *Run-aggregated profile*, and
-:doc:`format` §6).  Classification is **derivative-convergence
-binning** on effective addresses: ``delta_n = ea_n - ea_{n-1}``,
-``ddelta_n = delta_n - delta_{n-1}``.  Each memop is tagged with
-the lowest-order class that explains it — *regular* when this
-delta equals the prior delta, *irregular* when delta varies but
-ddelta equals the prior ddelta, *random* when ddelta itself
-varies — and the tag is tallied into a per-instruction histogram.
-The reported class is the **argmax** bin: the regime the
-instruction spends most of its lifetime in.  Convergence is a
-structural property; there is no magnitude threshold, and a
-1-byte and a 1-MiB constant stride both tally as regular.
+:doc:`format` §6).  Each memop runs through two complementary
+tests on effective addresses and is tagged with the most
+specific class that explains it; tags tally into a per-
+instruction histogram and the reported class is the **argmax**
+bin — the regime the instruction spends most of its lifetime in.
+
+The first test is a **polynomial-convergence chain** in
+absolute-magnitude space.  Walk derivative levels :math:`0 \dots
+K-1` where :math:`K = \texttt{CST\_PAT\_POLY\_DEPTH} = 4`, each
+level being the abs difference of the previous: level 0 holds
+:math:`|\Delta f|`, level 1 holds :math:`|\,|\Delta f|_n -
+|\Delta f|_{n-1}\,|`, and so on.  Convergence at level 0 (the
+new ``|delta|`` matches the prior one) tags the step *regular*;
+convergence at any deeper level tags it *irregular*.  K = 4
+covers polynomial address streams up to degree 4.  Taking abs at
+every level prevents bounded-complexity patterns whose signed
+deltas oscillate (e.g. ``0,1,3,4,6,7`` ⇒ deltas ``1,2,1,2,1`` ⇒
+signed ddeltas ``+1,-1,+1,-1`` but ``|ddelta|=1`` everywhere)
+from being mislabelled.
+
+The second test is a **geometric rescue** that fires only when
+the polynomial chain found no convergence.  At every level the
+walk descends past, the classifier runs an exact-integer cross-
+multiply :math:`|x_n|\,|x_{n-2}| = |x_{n-1}|^2` on the last
+three magnitudes at that level.  A match anywhere overrides
+*random* to *irregular*.  This catches pure exponential patterns
+(``2^n`` and friends) as well as any (polynomial of degree
+:math:`\le K-2`) + (exponential) mixture: the polynomial part
+annihilates after enough differences and the exponential
+survives with a constant ratio at the level where it becomes
+pure.  Convergence and ratio are both structural properties;
+there is no magnitude threshold, and a 1-byte and a 1-MiB
+constant stride both tally as *regular*.
 
 Two trackers contribute to the histogram in parallel: a per-insn
 classifier keyed by issuing PC, and a cross-instruction *spatial*
@@ -726,18 +748,22 @@ writer's assignment and are not pinned by this reference.
    * - ``CST_PAT_NONE``
      - No memory access observed for this instruction.
    * - ``CST_PAT_REGULAR``
-     - Delta is constant — including stride 0 (same address
-       re-touched) and the trivial one-sample case.  First-order
-       convergence.
+     - ``|delta|`` is constant — including stride 0 (same address
+       re-touched), direction reversals of the same magnitude, and
+       the trivial one-sample case.  Level-0 convergence in the
+       polynomial chain.
    * - ``CST_PAT_IRREGULAR``
-     - Delta varies but ``ddelta`` is constant — a smoothly
-       changing stride (e.g. an address walk ``1, 2, 3, …`` whose
-       step grows by a fixed amount each time).  Second-order
-       convergence.
+     - One of: the polynomial chain converges at some level
+       :math:`k \in 1\dots K-1` (a degree-2 through degree-K
+       polynomial address stream); OR the geometric rescue fires
+       at some walked level (constant ratio across the last three
+       magnitudes — pure exponential, or any polynomial-plus-
+       exponential mixture up to polynomial degree :math:`K-2`).
    * - ``CST_PAT_RANDOM``
-     - ``ddelta`` itself varies — no convergence at the second
-       derivative, so the access pattern needs the third derivative
-       or higher to be predicted.
+     - The polynomial chain found no convergence within :math:`K`
+       levels AND no walked level showed a constant ratio — the
+       pattern needs a degree-:math:`(K+1)` polynomial or higher,
+       or is neither polynomial nor geometric in structure.
 
 A companion *data-is-address* bit (``CST_PROFILE_ADDR_CP`` /
 ``CST_PROFILE_ADDR_WP`` in the profile ``pat_flags`` byte) flags

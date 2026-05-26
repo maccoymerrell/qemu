@@ -547,6 +547,12 @@ struct CPUArchState {
     struct CPUWatchpoint *cpu_watchpoint[MAX_NDBREAK];
     /* Breakpoints for IBREAK registers */
     struct CPUBreakpoint *cpu_breakpoint[MAX_NIBREAK];
+
+    /* End-of-execution-state marker used by the plugin spec-mode
+     * save/restore path (offsetof(CPUArchState, end_reset_fields));
+     * placed at struct end here, so the whole CPUArchState is
+     * captured under spec mode for this target. */
+    struct {} end_reset_fields;
 };
 
 /**

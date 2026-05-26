@@ -63,6 +63,18 @@ void qemu_plugin_reset(qemu_plugin_id_t id, qemu_plugin_simple_cb_t cb)
     plugin_reset_uninstall(id, cb, true);
 }
 
+void qemu_plugin_request_tb_flush(void)
+{
+    /* tb_flush dispatches synchronously when the calling vCPU is
+     * already in exclusive context (running, e.g., a flush-cb from
+     * core code), otherwise it async-schedules do_tb_flush on the
+     * vCPU thread so it runs between TBs.  Either way any registered
+     * flush callback fires before the next TB executes.  Callers
+     * are expected to be on a vCPU thread (current_cpu set);
+     * tb_flush is a no-op when tcg_enabled() is false. */
+    tb_flush(current_cpu);
+}
+
 /*
  * Plugin Register Functions
  *
@@ -637,8 +649,14 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
     g_assert(current_cpu);
     g_assert(!current_cpu->plugin_spec_mode);
 
-    /* Flush TLB to force slow-path for all spec-mode memory accesses */
-    cpu_plugin_flush_tlb(current_cpu);
+    /* Slow-path memory routing is enforced by CF_FORCE_SLOW on
+     * spec-mode TB cflags (see cpu_plugin_exec_inline /
+     * cpu_plugin_exec_tb); that makes the spec-mode translation a
+     * distinct TB-cache entry whose tb_gen_code emits slow-path
+     * mem helpers directly, with no dependence on TLB state.  A
+     * tlb_flush here would be a no-op anyway in CONFIG_USER_ONLY
+     * (the cputlb.h stub is empty) and pure overhead in
+     * system-mode. */
 
     /* Reuse existing hash table (cleared on previous spec_mode_end) */
     if (!current_cpu->plugin_spec_store_buf) {
@@ -668,8 +686,11 @@ void qemu_plugin_spec_mode_end(void)
     }
     current_cpu->plugin_spec_store_pool_used = 0;
 
-    /* Flush stale TLB entries from wrong-path execution */
-    cpu_plugin_flush_tlb(current_cpu);
+    /* No TLB flush needed at exit either: spec-mode TBs run with
+     * CF_FORCE_SLOW so their accesses bypass the TLB rather than
+     * populating it, and the normal-mode TLB entries that were
+     * present before spec-mode entry are still valid (guest page
+     * tables don't change underneath us). */
 }
 
 struct qemu_plugin_scoreboard *qemu_plugin_scoreboard_new(size_t element_size)

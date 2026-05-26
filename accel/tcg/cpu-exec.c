@@ -800,11 +800,6 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
     }
 }
 
-void cpu_plugin_flush_tlb(CPUState *cpu)
-{
-    tlb_flush(cpu);
-}
-
 size_t cpu_plugin_arch_state_size(void)
 {
     /*

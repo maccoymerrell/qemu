@@ -13,7 +13,7 @@ matching code.
 Plugin API additions
 --------------------
 
-``include/qemu/qemu-plugin.h`` (``QEMU_PLUGIN_VERSION = 7``)
+``include/qemu/qemu-plugin.h`` (``QEMU_PLUGIN_VERSION = 8``)
 
    * ``qemu_plugin_insn_detail`` — Capstone-detail accessor that
      returns a structured ``qemu_plugin_insn_info`` for an
@@ -40,7 +40,23 @@ Plugin API additions
      wrong-path simulator consumes this so a not-taken branch's
      alternate edge can be traced even when the program never
      executes it.
-   * ``QEMU_PLUGIN_VERSION = 7`` advertises these entry
+   * ``qemu_plugin_request_tb_flush`` — drops QEMU's entire TB
+     cache from a plugin callback so every subsequent execution
+     re-translates through ``vcpu_tb_trans``.  ChampSim Tracer
+     uses it at trace-segment boundaries: ``vcpu_tb_trans`` gates
+     its expensive instrumentation work (Capstone decode, BBTemplate
+     creation, per-insn memory callbacks) on
+     ``g_trace_segments.is_active_atomic()``, so a cached
+     translation taken on the inactive side of a window has none of
+     the segment-time hooks.  Flushing on window-open forces a
+     fresh translation pass while ``is_active`` is true, and the
+     next TB exec arrives with full instrumentation in place.  The
+     entry point is async-safe — QEMU schedules ``do_tb_flush`` to
+     run between TBs (or synchronously when already in serial
+     context), and any plugin ``flush_cb`` registered via
+     ``qemu_plugin_register_flush_cb`` fires before the next TB
+     executes.
+   * ``QEMU_PLUGIN_VERSION = 8`` advertises these entry
      points to plugin loaders.
 
 ``plugins/api.c`` and ``disas/disas-target.c``
@@ -371,6 +387,40 @@ Disassembly and target metadata
    before any register field would leave that field on the preserved
    side, and the post-WP correct-path snapshot would observe a
    speculatively-corrupted value instead of the architectural one.
+
+``target/alpha/cpu.h``, ``target/avr/cpu.h``,
+``target/hexagon/cpu.h``, ``target/loongarch/cpu.h``,
+``target/ppc/cpu.h``, ``target/tricore/cpu.h``,
+``target/xtensa/cpu.h``
+
+   Same ``end_reset_fields`` insertion as RISC-V, but placed at the
+   end of each ``CPUArchState`` so the boundary covers the whole
+   struct.  The marker is required for these targets because the
+   plugin-API surface (``qemu_plugin_cpu_state_save`` and friends)
+   is built once per ``target/`` and resolves
+   ``offsetof(CPUArchState, end_reset_fields)`` per-target; without
+   the field the whole tree fails to compile.  ChampSim Tracer does
+   not exercise wrong-path simulation on these ISAs, so the
+   conservative whole-struct placement is correct (anything a future
+   spec-mode user might write to is captured for rollback) and the
+   placement is easy to refine downstream if speculative execution
+   is ever lit up for one of them.
+
+Speculative-execution slow-path routing
+---------------------------------------
+
+``qemu_plugin_spec_mode_begin`` / ``qemu_plugin_spec_mode_end`` set
+and clear ``cpu->plugin_spec_mode`` without flushing the TLB.  Slow-
+path memory routing during spec mode is enforced by ``CF_FORCE_SLOW``
+on the cflags passed through ``cpu_plugin_exec_inline`` and
+``cpu_plugin_exec_tb`` (``accel/tcg/cpu-exec.c``): spec-mode TBs
+hash to a distinct ``tb_lookup`` key whose ``tb_gen_code`` emits the
+slow-path memory helpers directly, with no dependence on TLB state.
+A TLB flush at entry would be redundant (in CONFIG_USER_ONLY the
+helper is the empty stub from ``include/exec/cputlb.h``, and in
+system mode the spec-mode translation already bypasses the softmmu
+TLB), and at exit it would be unnecessary because spec-mode TBs do
+not populate the normal-mode TLB they bypass.
 
 ``include/elf.h``
 

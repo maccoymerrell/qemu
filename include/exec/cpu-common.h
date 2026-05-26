@@ -29,7 +29,6 @@ void cpu_exec_step_atomic(CPUState *cpu);
 /* Plugin helpers for wrong-path speculative execution */
 bool cpu_plugin_exec_inline(CPUState *cpu);
 bool cpu_plugin_exec_tb(CPUState *cpu);
-void cpu_plugin_flush_tlb(CPUState *cpu);
 size_t cpu_plugin_arch_state_size(void);
 void cpu_plugin_arch_state_restore(void *saved, size_t size);
 

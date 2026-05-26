@@ -1420,6 +1420,12 @@ struct CPUArchState {
      * running cycles.
      */
     uint64_t pmu_base_time;
+
+    /* End-of-execution-state marker used by the plugin spec-mode
+     * save/restore path (offsetof(CPUArchState, end_reset_fields));
+     * placed at struct end here, so the whole CPUArchState is
+     * captured under spec mode for this target. */
+    struct {} end_reset_fields;
 };
 
 #define THREAD_SIBLING_FOREACH(cs, cs_sibling)                  \

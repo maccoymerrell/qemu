@@ -80,11 +80,16 @@ typedef uint64_t qemu_plugin_id_t;
  * version 7:
  * - added qemu_plugin_insn_branch_target_pc (the translator-resolved
  *   static control-transfer target of a branch instruction)
+ *
+ * version 8:
+ * - added qemu_plugin_request_tb_flush (drop the TB cache from a
+ *   plugin so a state change that gates translation-time
+ *   instrumentation can take effect on every subsequent TB)
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 7
+#define QEMU_PLUGIN_VERSION 8
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -977,6 +982,24 @@ void qemu_plugin_vcpu_for_each(qemu_plugin_id_t id,
 QEMU_PLUGIN_API
 void qemu_plugin_register_flush_cb(qemu_plugin_id_t id,
                                    qemu_plugin_simple_cb_t cb);
+
+/**
+ * qemu_plugin_request_tb_flush() - drop every cached translation
+ *
+ * Asks QEMU to invalidate its entire TB cache so subsequent
+ * executions retranslate every basic block from scratch and re-fire
+ * the plugin's translation callback for each.  Use this when the
+ * plugin's translation-time instrumentation depends on dynamic state
+ * (for example whether a trace segment is active): toggling that
+ * state mid-execution otherwise leaves cached TBs running with their
+ * out-of-date instrumentation until QEMU happens to evict them.
+ *
+ * Runs on the calling vCPU and is async-safe relative to TB
+ * execution — any registered flush callback fires before the next TB
+ * begins executing.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_request_tb_flush(void);
 
 /**
  * qemu_plugin_register_atexit_cb() - register exit callback

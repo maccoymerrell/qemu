@@ -4745,6 +4745,117 @@ def _check_regdata_reconstruction(
 # ---------------------------------------------------------------------------
 
 
+def validate_cross_segment_consistency(
+        segment_paths: list[Path]) -> Report:
+    """Decode every segment and assert that the CONSTANT parts of any
+    template shared across segments (matched by `start_pc`) are
+    bit-identical.
+
+    A template's constant part is everything determined at translation
+    time — `n_insns`, `fall_through_pc`, the terminal-branch target
+    list, and per-insn `pc / opcode / branch_type / branch_conditional /
+    src_regs / dst_regs / imm / is_atomic / lane_parallel / raw_bytes`.
+    These describe what the BB IS, not what it did, so identical code
+    must decode to identical fields no matter which segment captured
+    it.  Variable per-execution counters (`exec_cp`, `memops_cp`,
+    `pat_*`, etc.) are legitimately different per segment — each
+    segment is a separate stage of the program — and are deliberately
+    NOT compared.
+
+    Guards specifically against the failure mode where a stub or
+    partially-instrumented translation produced outside an active
+    segment leaks into a segment's wire dictionary: its constant
+    fields would differ from the fresh, full-fidelity translation
+    produced after the segment opens.
+    """
+    if len(segment_paths) < 2:
+        return Report(issues=[], stats={
+            "segments_compared": len(segment_paths),
+            "shared_templates": 0,
+        })
+    dec = _load_decoder()
+
+    def insn_signature(ins: dict) -> tuple:
+        return (
+            ins["pc"],
+            ins["opcode"],
+            ins["branch_type"],
+            ins["branch_conditional"],
+            tuple(ins.get("src_regs", [])),
+            tuple(ins.get("dst_regs", [])),
+            ins.get("imm"),
+            ins.get("is_atomic", False),
+            ins.get("lane_parallel", False),
+            bytes(ins.get("raw_bytes", b"")),
+        )
+
+    def template_signature(t: dict) -> tuple:
+        prof_targets = tuple(sorted(
+            tg.get("pc", 0) for tg in t["profile"].get("targets", [])))
+        return (
+            t["n_insns"],
+            t["fall_through_pc"],
+            prof_targets,
+            tuple(insn_signature(ins) for ins in t["insns"]),
+        )
+
+    seg_data: list[tuple[Path, dict[int, dict]]] = []
+    for p in segment_paths:
+        _meta, templates, _entries = dec.decode_champsim_tracer(p)
+        by_pc: dict[int, dict] = {}
+        for t in templates:
+            by_pc[t["start_pc"]] = t
+        seg_data.append((p, by_pc))
+
+    issues: list[Issue] = []
+    shared_total = 0
+    base_path, base_map = seg_data[0]
+    for other_path, other_map in seg_data[1:]:
+        common = set(base_map.keys()) & set(other_map.keys())
+        shared_total += len(common)
+        for start_pc in sorted(common):
+            t1 = base_map[start_pc]
+            t2 = other_map[start_pc]
+            sig1 = template_signature(t1)
+            sig2 = template_signature(t2)
+            if sig1 == sig2:
+                continue
+            # Find the first differing field for a helpful message.
+            diffs: list[str] = []
+            if t1["n_insns"] != t2["n_insns"]:
+                diffs.append(f"n_insns {t1['n_insns']} vs {t2['n_insns']}")
+            if t1["fall_through_pc"] != t2["fall_through_pc"]:
+                diffs.append(
+                    f"fall_through 0x{t1['fall_through_pc']:x} vs "
+                    f"0x{t2['fall_through_pc']:x}")
+            if not diffs:
+                # Per-insn divergence
+                for i, (a, b) in enumerate(
+                        zip(t1["insns"], t2["insns"])):
+                    if insn_signature(a) != insn_signature(b):
+                        diffs.append(f"insn[{i}] differs")
+                        break
+            issues.append(Issue(
+                check="cross_segment_template_shape",
+                severity="error",
+                message=(
+                    f"template start_pc=0x{start_pc:x} structural "
+                    f"fields differ across segments: "
+                    f"{base_path.name} vs {other_path.name}: "
+                    f"{', '.join(diffs) or 'unspecified'}"),
+                detail={
+                    "start_pc": start_pc,
+                    "seg1_path": str(base_path),
+                    "seg2_path": str(other_path),
+                    "diffs": diffs,
+                }))
+    stats = {
+        "segments_compared": len(segment_paths),
+        "shared_templates":  shared_total,
+    }
+    return Report(issues=issues, stats=stats)
+
+
 def validate_structural(trace_path: Path,
                         expected_threads: int = 1) -> Report:
     """Decode @trace_path and run only the checks that don't depend on

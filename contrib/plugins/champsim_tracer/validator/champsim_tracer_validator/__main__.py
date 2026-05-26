@@ -560,6 +560,18 @@ def cmd_simpoint_test(args) -> int:
             print(report.summary())
             if report.errors():
                 rc_total = 1
+
+        # Cross-segment regression check: shared templates must report
+        # the same per-execution memop shape across segments.  Catches
+        # a TB whose per-insn callbacks aren't armed when it executes
+        # inside one segment after caching during the inactive gap
+        # between segments — the per-segment structural check would
+        # see an internally consistent (but lossy) segment-N and pass.
+        print(f"validate[{isa}] cross-segment consistency:")
+        xseg = V.validate_cross_segment_consistency(list(seg_files))
+        print(xseg.summary())
+        if xseg.errors():
+            rc_total = 1
     return rc_total
 
 

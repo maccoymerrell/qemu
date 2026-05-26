@@ -1696,6 +1696,166 @@ class RegIdSweep(CodeBlock):
         return "\n".join(lines) + "\n"
 
 
+@register
+class MipsMidTbTeqSplit(CodeBlock):
+    """
+    Exercises the tracer's mid-TB fragment splitter on MIPS.  A MIPS
+    `teq` (trap-if-equal) is classified as ``BRANCH_SYSCALL_TYPE`` by
+    the Capstone-based decoder, but QEMU's MIPS TCG keeps translating
+    past it because the trap is dynamic — TCG can't prove statically
+    whether the registers compare equal, so it emits a conditional
+    helper and continues.  The resulting QEMU TB therefore contains
+    insns on both sides of the `teq`, which ``split_tb_into_fragments``
+    must break at the `teq` (terminus = COMPLETE) so the trace shows
+    two true-BBs from one QEMU TB.  We seed the operands so the
+    comparison is NEVER equal (the trap is never taken), so the
+    program continues normally and the trace covers both fragments.
+    """
+    name = "mips_midtb_teq_split"
+    scratch_slots = 2
+    supported_isas = ("mipsel",)
+    randomizable = False
+    coverage_probe = True
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        s_load, s_store = ctx.scratch_slots
+        a = ctx.rng.randrange(1, 1 << 14)
+        # Pre-teq operand (loaded) and a value guaranteed to differ.
+        # Post-teq we add a small constant so the store carries a
+        # different value than the load (otherwise the validator's
+        # data-flow check is trivial).
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=[
+                ExpectedMemOp("load",  s_load,  8, a),
+                ExpectedMemOp("store", s_store, 8, _u32(a + 17)),
+            ],
+            coarse_opcodes={"LOAD": 1, "STORE": 1, "INT_ADD": 2,
+                             "SYSCALL": 1, "BRANCH": 1},
+            asserted_branch_types=["BRANCH_SYSCALL", "BRANCH_DIRECT_JUMP"],
+            asserted_opcodes=["SYSCALL", "LOAD", "STORE", "INT_ADD",
+                              "BRANCH"],
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        s_load  = plan.memops[0].arena_u64_index
+        s_store = plan.memops[1].arena_u64_index
+        # $t0 holds the loaded value; $t1 = $t0 + 1 makes
+        # `teq $t0, $t1` guaranteed NOT to trap.  The post-teq
+        # addiu/store live in a second fragment after the splitter
+        # ends the first fragment on `teq` (BRANCH_SYSCALL_TYPE,
+        # TB_TERMINUS_COMPLETE).
+        lines = _prologue(ctx.block_id) + _load_base(ctx.isa) + [
+            f"  lw $t0, {s_load * 8}($t8)",
+            "  addiu $t1, $t0, 1",
+            "  teq $t0, $t1",
+            "  addiu $t0, $t0, 17",
+            f"  sw $t0, {s_store * 8}($t8)",
+            f"  sw $zero, {s_store * 8 + 4}($t8)",
+        ]
+        lines += _jump(ctx.isa, ctx.successor_labels[0])
+        return "\n".join(lines) + "\n"
+
+
+@register
+class LongBasicBlock(CodeBlock):
+    """
+    Exercises the tracer's multi-TB true-BB accumulation path.  QEMU's
+    TCG caps each translation block at ``TCG_MAX_INSNS = 512``
+    instructions, so a single architectural basic block longer than
+    that crosses a TB boundary: the chain assembler must accumulate
+    fragments from two (or more) consecutive QEMU TBs into one true-BB
+    before the terminating branch fires.  We emit ~560 dependent INT_ADD
+    instructions with no intervening branches, ensuring at least one
+    QEMU TB split inside one architectural BB; the trace must report a
+    single true-BB whose insn list spans every ADD.
+
+    Per-execution memops are limited to the two scratch loads and the
+    final store, so the block is cheap to trace despite the large insn
+    count.  The terminating jump is emitted normally; ``coarse_opcodes``
+    asserts the assembled INT_ADD count rather than checking each one
+    individually.
+    """
+    name = "long_basic_block"
+    scratch_slots = 3
+    supported_isas = ("x86_64", "aarch64", "riscv64", "mipsel")
+    randomizable = False
+    coverage_probe = True
+
+    # Just over TCG_MAX_INSNS = 512 to guarantee at least one TB split
+    # inside the architectural BB on every ISA; a couple of leading
+    # loads + the terminator put us comfortably past 512.
+    _ADD_COUNT: ClassVar[int] = 560
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        s_a, s_b, s_out = ctx.scratch_slots
+        a = ctx.rng.randrange(1, 1 << 14)
+        b = ctx.rng.randrange(1, 1 << 14)
+        # Each emitted ADD does `acc += b` for N = _ADD_COUNT
+        # iterations, so the final stored value is a + N*b (mod 2^32).
+        result = _u32(a + cls._ADD_COUNT * b)
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=[
+                ExpectedMemOp("load",  s_a,   8, a),
+                ExpectedMemOp("load",  s_b,   8, b),
+                ExpectedMemOp("store", s_out, 8, result),
+            ],
+            coarse_opcodes={"LOAD": 2, "INT_ADD": cls._ADD_COUNT,
+                             "STORE": 1},
+            # x86's `mov mem,reg` / `mov reg,mem` classify as MOV, not
+            # LOAD/STORE (the GEN_OP_LOAD / GEN_OP_STORE buckets are
+            # reserved for explicit-load / explicit-store ISAs and a
+            # few special x86 insns like BNDLDX).  Branch / INT_ADD
+            # are universal.
+            asserted_opcodes=(
+                ["INT_ADD", "BRANCH", "MOV"] if ctx.isa == "x86_64"
+                else ["LOAD", "INT_ADD", "STORE", "BRANCH"]
+            ),
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        s_a, s_b, s_out = (m.arena_u64_index for m in plan.memops)
+        lines = _prologue(ctx.block_id) + _load_base(ctx.isa)
+        if ctx.isa == "x86_64":
+            lines += _load_slot(ctx.isa, s_a, "%r8")
+            lines += _load_slot(ctx.isa, s_b, "%r9")
+            for _ in range(cls._ADD_COUNT):
+                lines.append("  addq %r9, %r8")
+            lines += _store_slot(ctx.isa, s_out, "%r8")
+        elif ctx.isa == "aarch64":
+            lines += _load_slot(ctx.isa, s_a, "x9")
+            lines += _load_slot(ctx.isa, s_b, "x10")
+            for _ in range(cls._ADD_COUNT):
+                lines.append("  add x9, x9, x10")
+            lines += _store_slot(ctx.isa, s_out, "x9")
+        elif ctx.isa == "riscv64":
+            lines += _load_slot(ctx.isa, s_a, "t0")
+            lines += _load_slot(ctx.isa, s_b, "t1")
+            # No compressed forms in the long ADD chain — keep encoding
+            # uniform so the insn count is exactly _ADD_COUNT regardless
+            # of the assembler's c.add choice for short ops.
+            lines += ["  .option push", "  .option norvc"]
+            for _ in range(cls._ADD_COUNT):
+                lines.append("  add t0, t0, t1")
+            lines += ["  .option pop"]
+            lines += _store_slot(ctx.isa, s_out, "t0")
+        else:
+            lines += _load_slot(ctx.isa, s_a, "$t0")
+            lines += _load_slot(ctx.isa, s_b, "$t1")
+            for _ in range(cls._ADD_COUNT):
+                lines.append("  addu $t0, $t0, $t1")
+            lines += _store_slot(ctx.isa, s_out, "$t0")
+        lines += _jump(ctx.isa, ctx.successor_labels[0])
+        return "\n".join(lines) + "\n"
+
+
 def _decode_c_asm_string(c_text: str) -> list[str]:
     """Convert a C inline-asm literal block to plain assembly lines."""
     parts = re.findall(r'"(?:[^"\\]|\\.)*"', c_text)

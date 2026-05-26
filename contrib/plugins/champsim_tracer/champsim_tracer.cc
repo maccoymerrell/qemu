@@ -1117,6 +1117,73 @@ static void tw_manage_window(unsigned int cpu_index,
     }
 }
 
+/*
+ * Lightweight TB-exec callback used while no segment is active.  The
+ * heavy `vcpu_tb_exec` keeps the chain assembler running, emits body
+ * entries, etc. — all wasted work between segments.  The light path
+ * does just the two things needed during the inactive gap:
+ *
+ *   1. Maintain the architectural icount (with the same REP-reentry
+ *      suppression the heavy path applies) so window-start triggers
+ *      fire on the correct insn.
+ *   2. Re-check `tw_manage_window`; if it opened a segment, force a
+ *      TB-cache flush so every subsequent execution re-translates
+ *      through the heavy `vcpu_tb_trans` path with `is_active=true`.
+ *
+ * `udata` carries the TB's `n_insns` (cast to uintptr_t) so we can
+ * bump the icount without consulting a BBTemplate — the whole point
+ * of light mode is that no template was built at translation time.
+ *
+ * Symbol-trigger mode is excluded from light mode because its match
+ * predicate needs the BB's symbol_name (carried on the template);
+ * `vcpu_tb_trans` keeps using the heavy path while
+ * `g_window_mode == WIN_SYMBOL`.
+ */
+static void vcpu_tb_exec_light(unsigned int cpu_index, void *udata)
+{
+    uint64_t n_insns = (uint64_t)(uintptr_t)udata;
+
+    g_mutex_lock(&exec_lock);
+    if (g_trace_segments.is_shutting_down()) {
+        g_mutex_unlock(&exec_lock);
+        return;
+    }
+
+    /* Same REP-reentry suppression as the heavy path: a single-insn
+     * TB re-fired at the same start_pc is one architectural insn
+     * (x86 REP string ops translate to a 1-insn TB looped per REP
+     * iteration). */
+    uint64_t cur_start_pc = qemu_plugin_u64_get(
+        g_scoreboard.current_pc, cpu_index);
+    uint64_t icount_prev = qemu_plugin_u64_get(
+        g_scoreboard.insn_count, cpu_index);
+    uint64_t last_counted = qemu_plugin_u64_get(
+        g_scoreboard.last_counted_start_pc, cpu_index);
+    bool is_rep_reentry = (n_insns == 1 && cur_start_pc == last_counted);
+    if (!is_rep_reentry) {
+        qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index,
+                            icount_prev + n_insns);
+        qemu_plugin_u64_set(g_scoreboard.last_counted_start_pc,
+                            cpu_index, cur_start_pc);
+    }
+
+    tw_manage_window(cpu_index, icount_prev, /* cur_tb_tmpl */ nullptr);
+    bool need_flush = g_trace_segments.is_active();
+    g_mutex_unlock(&exec_lock);
+
+    if (need_flush) {
+        /* The current TB still finishes on its light translation
+         * (so its body entry is NOT in the trace — a one-TB lossy
+         * boundary at segment open).  The next TB cache miss
+         * triggers re-translation, vcpu_tb_trans now sees
+         * is_active=true, and we get full instrumentation from
+         * that TB onward.  qemu_plugin_request_tb_flush wraps
+         * QEMU's tb_flush and is async-safe relative to the
+         * current TB execution. */
+        qemu_plugin_request_tb_flush();
+    }
+}
+
 static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 {
     /* udata = the head fragment of this TB's per-translation fragment
@@ -1587,6 +1654,35 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     if (raw_n_insns == 0) {
         return;
     }
+
+    /*
+     * Light path while no segment is active.  Skips Capstone decode,
+     * BBTemplate creation, per-insn mem_cb / synthetic-EA / poison
+     * machinery, and fragment-split — none of it shows up in any
+     * trace because the trace isn't running.  Arms only what's
+     * needed to detect the next window-open: an inline current_pc
+     * store (for REP-reentry icount suppression) and a tb_exec
+     * callback that maintains icount and fires `tb_flush` when a
+     * segment opens.  After the flush every TB executes a fresh
+     * translation, which arrives here again with `is_active=true`
+     * and runs the heavy path below.
+     *
+     * Symbol-trigger mode keeps using the heavy path: detecting the
+     * trigger needs the BB's symbol_name, which lives on the
+     * template the heavy path builds.
+     */
+    bool light_window_mode = (g_window_mode == PluginConfig::WIN_ICOUNT
+                           || g_window_mode == PluginConfig::WIN_SIMPOINT);
+    if (light_window_mode && !g_trace_segments.is_active_atomic()) {
+        qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
+            tb, QEMU_PLUGIN_INLINE_STORE_U64,
+            g_scoreboard.current_pc, pc);
+        qemu_plugin_register_vcpu_tb_exec_cb(
+            tb, vcpu_tb_exec_light, QEMU_PLUGIN_CB_NO_REGS,
+            (void *)(uintptr_t)raw_n_insns);
+        return;
+    }
+
     struct qemu_plugin_insn *first_insn = qemu_plugin_tb_get_insn(tb, 0);
 
     uint64_t *insn_pcs = g_new0(uint64_t, raw_n_insns);

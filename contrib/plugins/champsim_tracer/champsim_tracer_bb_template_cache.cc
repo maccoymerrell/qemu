@@ -568,7 +568,13 @@ BBTemplate *BBTemplateCache::create_tb_template(
     }
 
     tmpl->insn_fields = g_new0(InsnFields, n_insns);
-    if (enable_reg_data) {
+    /* Allocate the per-insn reg-name table when either CP or WP
+     * regdata is enabled — the WP fragment-walk reads dst_qemu_reg_keys
+     * out of this table for its per-insn-accurate snap consumption
+     * (see vcpu_insn_reg_snap_cb / champsim_tracer_wp.cc).  Skipping
+     * it would force WP regdata-only runs back to the old post-
+     * fragment live-read fallback. */
+    if (enable_reg_data || enable_wp_reg_data) {
         tmpl->insn_reg_names = g_new0(InsnRegNames, n_insns);
     }
     for (uint32_t i = 0; i < n_insns; i++) {

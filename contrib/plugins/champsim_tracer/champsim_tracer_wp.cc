@@ -237,10 +237,22 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
          * branch-terminated identically (next_tb_fragment chains the
          * mid-TB splits) and produces the same WPBBEntry shape after
          * the fragment-walk below; preferring it skips the mutex
-         * entirely.  capture_insn_snaps_live below (post-exec) reads
-         * only the dst regs each insn writes — see champsim_tracer.md
-         * §"WP per-insn regdata".
+         * entirely.
+         *
+         * Per-insn regdata capture: clear the per-thread WP scratch
+         * buffer here, then exec_tb fires the per-insn callbacks
+         * registered at translation time, which append dst snaps in
+         * execution order while WP is in progress (see
+         * vcpu_insn_reg_snap_cb in champsim_tracer.cc).  The fragment
+         * walk below pulls those snaps in FIFO order for every insn
+         * except the very last executed insn of each fragment — that
+         * one has no successor pre-exec hook inside the fragment to
+         * trigger its capture, so the walk falls back to a live read
+         * for it.
          */
+        if (enable_wp_reg_data) {
+            wp_pending_reg_snaps.clear();
+        }
         g_wp_state.last_executed_tb = nullptr;
         tb_ok = qemu_plugin_exec_tb();
         tmpl = g_wp_state.last_executed_tb;
@@ -277,6 +289,13 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         uint64_t post_pc_now = qemu_plugin_get_pc();
         bool fault_consumed = false;
         bool walk_done = false;
+        /* Cursor into wp_pending_reg_snaps, advanced as the walk
+         * consumes per-insn snaps in execution order across all
+         * fragments executed in this exec_tb.  Bumped by every insn
+         * the callback captured (i.e., every executed insn except the
+         * last of each fragment), whether or not WP appends that insn
+         * after dedup. */
+        size_t wp_snap_cursor = 0;
 
         for (BBTemplate *cur = tmpl; cur != nullptr && !walk_done;
              cur = cur->next_tb_fragment) {
@@ -362,6 +381,16 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                        MAX_INSN_BYTES) == 0;
                 }
                 if (duplicate) {
+                    /* The per-insn callback fired for this insn (if
+                     * it is not the fragment's last executed insn)
+                     * regardless of dedup, so advance the WP snap
+                     * cursor past its slot to keep alignment with
+                     * subsequent insns' captures. */
+                    if (enable_wp_reg_data &&
+                        i + 1 < n_executed_in_cur) {
+                        wp_snap_cursor +=
+                            cur->insn_fields[i].n_dst_regs;
+                    }
                     continue;
                 }
 
@@ -400,11 +429,46 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                           : &kEmptyRegNames);
                 }
                 if (enable_wp_reg_data) {
-                    /* Per-insn live read of only the dst regs this
-                     * insn writes from post-fragment state, not the
-                     * whole file. */
-                    g_reg_snaps.capture_insn_snaps_live(cpu_index, cur, i,
-                                                        bb_reg_snaps);
+                    const InsnFields *f = &cur->insn_fields[i];
+                    if (i + 1 < n_executed_in_cur) {
+                        /* Per-insn-accurate snap from the WP scratch
+                         * buffer: captured at insn (i+1)'s pre-exec
+                         * during the just-finished exec_tb, i.e.
+                         * exactly the post-this-insn / pre-next-insn
+                         * regfile state.  Mirrors CP regdata semantics
+                         * for all but each fragment's last executed
+                         * insn. */
+                        for (uint8_t k = 0; k < f->n_dst_regs; k++) {
+                            if (wp_snap_cursor <
+                                wp_pending_reg_snaps.size()) {
+                                bb_reg_snaps.push_back(
+                                    wp_pending_reg_snaps[
+                                        wp_snap_cursor++]);
+                            } else {
+                                /* Underrun fallback: a missed callback
+                                 * (shouldn't happen for executed
+                                 * insns) — push a zeroed snap so
+                                 * downstream indexing stays aligned
+                                 * with bb_regnames. */
+                                bb_reg_snaps.emplace_back(RegSnap{});
+                            }
+                        }
+                    } else {
+                        /* Last executed insn of this fragment: no
+                         * successor pre-exec hook inside the fragment
+                         * to capture it.  Fall back to a live read
+                         * from current (post-exec_tb) regfile state.
+                         * For a single-fragment exec_tb this is
+                         * post-this-insn-state; for multi-fragment
+                         * exec_tb's this captures the post-everything-
+                         * in-exec_tb state, so later fragments'
+                         * writes can shadow this insn's writes (the
+                         * one residual case where WP regdata loses
+                         * per-insn precision). */
+                        g_reg_snaps.capture_insn_snaps_live(cpu_index,
+                                                            cur, i,
+                                                            bb_reg_snaps);
+                    }
                 }
                 appended_insns++;
             }

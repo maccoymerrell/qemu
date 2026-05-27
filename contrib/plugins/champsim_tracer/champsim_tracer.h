@@ -15,6 +15,7 @@
  * resolve before glib does. */
 #ifdef __cplusplus
 #include <atomic>
+#include <vector>
 #endif
 
 #include <glib.h>
@@ -298,6 +299,25 @@ static inline void cst_wide_from_le_bytes(CSTWideValue *out,
 typedef struct {
     CSTWideValue value;
 } RegSnap;
+
+/*
+ * Per-thread wrong-path scratch buffer for per-insn destination-
+ * register snapshots captured during a single qemu_plugin_exec_tb()
+ * call.  Populated by vcpu_insn_reg_snap_cb when g_wp_state.in_progress
+ * is true; drained by the WP fragment-walk loop in
+ * champsim_tracer_wp.cc to attribute each insn its per-insn-accurate
+ * post-write snapshot (the snap captured at the next canonical
+ * insn's pre-exec hook).  See the docstring above
+ * vcpu_insn_reg_snap_cb for the full lifecycle.
+ *
+ * Cleared just before each exec_tb in the WP loop; the fragment
+ * walk consumes entries in FIFO execution order.  The very last
+ * canonical insn of each fragment is NOT captured here (no
+ * successor pre-exec hook within the fragment to trigger it) —
+ * the WP walk falls back to a live post-fragment read for that
+ * one insn.
+ */
+extern thread_local std::vector<RegSnap> wp_pending_reg_snaps;
 
 /*
  * Architectural-register snapshot at segment start.  Captured once per

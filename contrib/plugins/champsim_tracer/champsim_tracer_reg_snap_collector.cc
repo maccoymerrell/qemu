@@ -161,7 +161,10 @@ void RegSnapCollector::capture_insn_snaps_live(unsigned int cpu_index,
                                                uint32_t insn_idx,
                                                std::vector<RegSnap> &out_snaps)
 {
-    if (!enable_reg_data || !tmpl ||
+    /* Permit WP-only callers: champsim_tracer_wp.cc falls back to a
+     * live read for the trailing insn of each WP fragment even when
+     * CP regdata is off, so this gate must accept either flag. */
+    if ((!enable_reg_data && !enable_wp_reg_data) || !tmpl ||
         !tmpl->insn_reg_names || insn_idx >= tmpl->n_insns) {
         return;
     }

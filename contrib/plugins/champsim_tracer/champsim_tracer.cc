@@ -218,10 +218,16 @@ static GMutex exec_lock;
  */
 static thread_local std::vector<RegSnap> pending_reg_snaps;
 
+/* WP-side counterpart to pending_reg_snaps.  See the docstring on the
+ * extern declaration in champsim_tracer.h for the contract.  Non-static
+ * so champsim_tracer_wp.cc can drain it after each WP exec_tb. */
+thread_local std::vector<RegSnap> wp_pending_reg_snaps;
+
 /* ========================= Reg-data snapshot capture =========================
  *
  * Snap mechanics live in RegSnapCollector; this file owns only the
- * per-insn correct-path callback feeding pending_reg_snaps.
+ * per-insn callback that feeds pending_reg_snaps (CP context) or
+ * wp_pending_reg_snaps (WP context).
  */
 
 typedef struct {
@@ -232,17 +238,38 @@ typedef struct {
 /*
  * Per-insn destination snap callback.  Registered on the first raw
  * insn of canonical (ci+1), so when it fires pre-exec, canonical ci
- * has just finished and its dst registers hold post-exec values;
- * appends them to pending_reg_snaps.  The TB's last canonical insn
- * is captured at the NEXT TB's vcpu_tb_exec ("Tail-insn dst snap").
+ * has just finished and its dst registers hold post-exec values.
+ * The TB's last canonical insn is captured at the NEXT TB's
+ * vcpu_tb_exec ("Tail-insn dst snap") for CP; the WP fragment walk
+ * does a live post-fragment read for its trailing insn (no successor
+ * pre-exec inside a WP fragment can capture it).
+ *
+ * Routes by execution context:
+ *  - CP: append to pending_reg_snaps; drained by the next
+ *    vcpu_tb_exec.
+ *  - WP (g_wp_state.in_progress): append to wp_pending_reg_snaps;
+ *    drained by the fragment walk after the in-flight exec_tb
+ *    returns.  Skipped when enable_wp_reg_data is off.
  */
 static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
 {
-    if (!enable_reg_data || g_wp_state.in_progress) {
+    if (!enable_reg_data && !enable_wp_reg_data) {
         return;
     }
     if (!g_trace_segments.is_active_atomic()) {
         return;
+    }
+    std::vector<RegSnap> *sink;
+    if (g_wp_state.in_progress) {
+        if (!enable_wp_reg_data) {
+            return;
+        }
+        sink = &wp_pending_reg_snaps;
+    } else {
+        if (!enable_reg_data) {
+            return;
+        }
+        sink = &pending_reg_snaps;
     }
     const RegSnapInsnRef *ref = (const RegSnapInsnRef *)udata;
     if (!ref || !ref->tb_tmpl ||
@@ -257,7 +284,7 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
         RegSnap s;
         g_reg_snaps.read_into_snap(cpu_index,
                                    names->dst_qemu_reg_keys[i], &s);
-        pending_reg_snaps.push_back(s);
+        sink->push_back(s);
     }
 }
 
@@ -1440,7 +1467,8 @@ static void tb_arm_new_template_cbs(struct qemu_plugin_tb *tb,
                                     const bool *canonical_first,
                                     uint32_t canonical_n_insns)
 {
-    if (enable_reg_data && new_tmpl && new_tmpl->insn_reg_names) {
+    if ((enable_reg_data || enable_wp_reg_data) && new_tmpl &&
+        new_tmpl->insn_reg_names) {
         RegSnapInsnRef *refs = g_new0(RegSnapInsnRef,
                                       canonical_n_insns);
         new_tmpl->insn_snap_refs = refs;

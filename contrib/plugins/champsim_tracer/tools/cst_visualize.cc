@@ -99,6 +99,7 @@ enum class Metric {
      * / insn stream. */
     WorkingSet,
     DepDepth,
+    Ilp,
     ReuseDistance,
 };
 
@@ -194,7 +195,11 @@ struct Options {
 "  -m indirect_targets Histogram: # of indirect branches by distinct-target count\n"
 "  -m branch_entropy   Histogram: # of conditional branches by direction entropy (%%)\n"
 "  -m working_set      Cumulative unique cache lines + 4KB pages touched over time\n"
-"  -m dep_depth        Per-bin avg + p90 dependency-chain depth (proxy for ILP)\n"
+"  -m dep_depth        Per-bin avg + p90 Wall-style RAW chain depth\n"
+"                      (rename-aware tumbling window of --rob-size insns)\n"
+"  -m ilp              Ideal IPC under perfect rename: top pane = per-bin\n"
+"                      avg + p90 IPC across tumbling --rob-size windows;\n"
+"                      bottom pane = in-window issue-cycle histogram\n"
 "  -m reuse_distance   Histogram: log-bucketed memop reuse (stack) distance\n"
 "\n"
 "Options:\n"
@@ -208,7 +213,7 @@ struct Options {
 "      --cache-policy=P    Replacement: lru | mru | random (default lru)\n"
 "      --warmup-bins=N     Bins excluded from y_max scaling (default 5)\n"
 "      --ws-window=N       working_set sliding-window size in CP insns (default 100000)\n"
-"      --rob-size=N        dep_depth reorder-buffer window size in insns (default 1024)\n"
+"      --rob-size=N        dep_depth / ilp reorder-buffer window size in insns (default 1024)\n"
 "      --hist-tail-pct=F   fold histogram bins past 100-F%% cumulative into a ‘>N’\n"
 "                          overflow bin so the x-axis stays readable (default 0.5; 0 = off)\n"
 "  -b, --bins=N            Number of bins (default 200)\n"
@@ -278,6 +283,7 @@ static Metric parse_metric(const char *s)
     if (!std::strcmp(s, "branch_entropy"))   return Metric::BranchEntropy;
     if (!std::strcmp(s, "working_set"))      return Metric::WorkingSet;
     if (!std::strcmp(s, "dep_depth"))        return Metric::DepDepth;
+    if (!std::strcmp(s, "ilp"))              return Metric::Ilp;
     if (!std::strcmp(s, "reuse_distance"))   return Metric::ReuseDistance;
     std::fprintf(stderr, "cst_visualize: unknown metric '%s'\n", s);
     std::exit(2);
@@ -1313,31 +1319,48 @@ struct WalkCtx {
     std::vector<uint64_t> ws_lines_per_bin;
     std::vector<uint64_t> ws_pages_per_bin;
 
-    /* --- dep_depth state.  Tracks the dependency-chain depth of
-     * each CP insn through architectural-register RAW edges,
-     * subject to two filters that keep the metric ILP-relevant
-     * instead of dominated by self-modification loops:
+    /* --- dep_depth / ilp shared state.  Wall's ideal-rename data-
+     * flow model: each insn's complete cycle = 1 + max over its
+     * architectural sources of (producer's complete cycle), with
+     * the producer table maintained per arch dst — exactly what a
+     * physical-register-file rename eliminates the WAW/WAR hazards
+     * of, leaving only RAW edges to bound parallelism.
      *
-     *   1. Special regs (FLAGS, IP, ZERO, NONE) are excluded
-     *      entirely — they aren't real ILP data flow in renamed
-     *      hardware.  SP is KEPT because real code updates it
-     *      through genuine data dependencies (push/pop chains
-     *      etc.).
-     *   2. Self-RMW (a reg that's both src AND dst of the same
-     *      insn) does NOT contribute the reg's old depth to the
-     *      insn's chain.  This is the key fix: in `add rcx, 1`
-     *      the chain we care about is the dependency the NEW rcx
-     *      forms for downstream consumers, not the iter-count
-     *      self-loop through rcx.  A ROB can unroll that
-     *      self-loop; what bounds parallelism is the chain of
-     *      OTHER consumers depending on rcx's new value.
+     * Special regs (FLAGS/IP/ZERO/NONE) are excluded from both
+     * sides so the metric is dominated by real GPR/FPR/VEC data
+     * flow rather than the implicit FLAGS chain every arithmetic
+     * op would otherwise serialize through.  Self-RMW IS counted:
+     * `add rcx, 1` truly serializes through rcx (each iteration
+     * reads the previous iteration's value); rename removes the
+     * WAR/WAW hazards but not the RAW edge.
      *
-     * Last-writer state persists across BB boundaries — real
-     * dependency chains do live past branches. */
-    std::array<bool, 256> dd_excluded_reg{};
-    bool                  dd_excluded_built = false;
-    std::unordered_map<uint8_t, uint32_t> dd_last_writer;
+     * Tumbling window of --rob-size insns: at every window
+     * boundary we clear the producer table and reset chunk
+     * state.  This bounds chain depth to the window (matching the
+     * "scheduling window a real OoO core can see at once") and
+     * lets us emit a per-window summary for the ilp metric:
+     * ideal IPC = window / max_complete_cycle_in_chunk.
+     *
+     *   dd_*:  per-insn complete-cycle histogram (dep_depth metric)
+     *   ilp_*: per-chunk IPC samples + global issue-cycle hist
+     *
+     * Memory dependences are NOT modelled: a load aliasing a
+     * prior store in the same window reads as cycle-0-ready
+     * even though hardware would serialize via the store buffer.
+     * Register RAW is usually the tighter bound in practice but
+     * this is a known overstatement of available parallelism. */
+    std::array<bool, 256> df_excluded_reg{};
+    bool                  df_excluded_built = false;
+    std::unordered_map<uint8_t, uint32_t> df_producer_complete;
+    uint32_t                              df_chunk_insns      = 0;
+    uint32_t                              df_chunk_max_cycle  = 0;
     std::vector<std::vector<uint64_t>>    dd_depth_hist_per_bin;
+    /* Per-bin per-chunk samples of (ipc × 1000).  uint32_t is enough
+     * since ipc <= window_size <= 2^30. */
+    std::vector<std::vector<uint32_t>>    ilp_samples_per_bin;
+    /* Global issue-cycle histogram: count of insns that issued at
+     * each in-window cycle, summed across all chunks. */
+    std::vector<uint64_t>                 ilp_cycle_hist;
 
     /* --- reuse_distance state.  An order-statistic tree (RB-tree
      * augmented with subtree sizes) holds one entry per currently-live
@@ -1930,71 +1953,136 @@ static void handle_working_set_entry(WalkCtx &ctx,
     ctx.cp_insns_so_far += t.insns.size();
 }
 
-/* dep_depth: dependency-chain depth as an ILP-relevant proxy.
- *   depth_i = 1 + max(depth_j for j writing each "real" src reg of i)
+/* Shared between dep_depth and ilp: build the special-reg lookup
+ * once from the trace's reg-name map.  Excludes FLAGS / IP / ZERO /
+ * NONE so they neither carry nor break chains. */
+static void df_ensure_excluded_built(WalkCtx &ctx)
+{
+    if (ctx.df_excluded_built) return;
+    for (const auto &kv : ctx.h->maps.reg) {
+        if (kv.first > 255) continue;
+        if (reg_is_special_excluded(kv.second)) {
+            ctx.df_excluded_reg[(size_t)kv.first] = true;
+        }
+    }
+    ctx.df_excluded_built = true;
+}
+
+/* Wall-style RAW-only depth under perfect rename, bounded to a
+ * tumbling --rob-size window:
+ *   complete_i = 1 + max(producer_complete[r] for r in real srcs)
+ *   producer_complete[r] := complete_i for r in real dsts
+ * "Real" = NOT one of FLAGS / IP / ZERO / NONE.  Self-RMW IS a
+ * real chain (rename removes only WAR/WAW; the RAW through the
+ * arch reg survives).  When the chunk reaches window_size insns
+ * we tally the just-completed window's IPC sample (for the ilp
+ * metric) and clear producer state so the next chunk starts
+ * with all sources cycle-0-ready.
  *
- * "Real" src reg = NOT a special reg (FLAGS/IP/ZERO/NONE) AND NOT
- * a self-RMW of i.  Special regs are not actual ILP data flow in
- * renamed hardware.  Self-RMW (e.g. `add rcx, 1` where rcx is
- * both src and dst) doesn't count its OWN reg's prior depth — the
- * chain we care about is what depends on the NEW value, not the
- * iter-count self-loop the ROB can unroll.
- *
- * Last-writer state persists across BB boundaries; chains can be
- * long-lived through data dependencies, just not through self-RMW
- * loops or noise from FLAGS/IP/ZERO bookkeeping. */
+ * Returns the per-insn complete cycle (clamped to window).  Both
+ * metrics consume it: dep_depth bins it; ilp also tracks the per-
+ * chunk max for the IPC summary. */
+static inline uint32_t df_step_insn(WalkCtx &ctx,
+                                    const cst::InsnTemplate &insn,
+                                    uint32_t window,
+                                    int bin,
+                                    bool record_ipc_samples)
+{
+    uint32_t max_src = 0;
+    for (uint8_t r : insn.src_regs) {
+        if (ctx.df_excluded_reg[r]) continue;
+        auto it = ctx.df_producer_complete.find(r);
+        if (it != ctx.df_producer_complete.end() && it->second > max_src) {
+            max_src = it->second;
+        }
+    }
+    uint32_t this_complete = max_src + 1;
+    if (this_complete > window) this_complete = window;
+    for (uint8_t r : insn.dst_regs) {
+        if (ctx.df_excluded_reg[r]) continue;
+        ctx.df_producer_complete[r] = this_complete;
+    }
+    if (this_complete > ctx.df_chunk_max_cycle) {
+        ctx.df_chunk_max_cycle = this_complete;
+    }
+    ctx.df_chunk_insns++;
+    if (ctx.df_chunk_insns >= window) {
+        if (record_ipc_samples && ctx.df_chunk_max_cycle > 0) {
+            /* Ideal IPC × 1000 in fixed-point: window insns retired
+             * in chunk_max_cycle cycles assuming unlimited-width
+             * issue.  An infinite-renamer / infinite-issue model
+             * has no other bound, so this is the upper bound on
+             * what better rename or wider issue could buy. */
+            uint64_t ipc_x1000 =
+                ((uint64_t)window * 1000) / ctx.df_chunk_max_cycle;
+            if (ipc_x1000 > UINT32_MAX) ipc_x1000 = UINT32_MAX;
+            if ((int)ctx.ilp_samples_per_bin.size() <= bin) {
+                ctx.ilp_samples_per_bin.resize(bin + 1);
+            }
+            ctx.ilp_samples_per_bin[bin].push_back((uint32_t)ipc_x1000);
+        }
+        ctx.df_producer_complete.clear();
+        ctx.df_chunk_insns = 0;
+        ctx.df_chunk_max_cycle = 0;
+    }
+    return this_complete;
+}
+
+/* dep_depth: per-insn RAW chain depth, histogrammed per bin.
+ * Same dataflow model as ilp (Wall's ideal rename, tumbling
+ * --rob-size window) but the chart summarizes the *distribution*
+ * of per-insn depths (avg + p90) rather than the per-chunk
+ * critical path.  Useful for seeing how many insns are stuck
+ * deep in chains vs. how many start fresh chains each cycle. */
 static void handle_dep_depth_entry(WalkCtx &ctx,
                                    const cst::DecodedEntry &e)
 {
-    if (!ctx.dd_excluded_built) {
-        /* Build the excluded-reg lookup once, from the trace's reg
-         * encoding map.  Shared predicate with gen_reg — drops the
-         * same architectural side-effect regs (IP/PC/FLAGS/ZERO/NONE)
-         * so they don't dominate the chain.  SP and other named regs
-         * (including FPR / VEC / PRED / SEG banks) are kept. */
-        for (const auto &kv : ctx.h->maps.reg) {
-            if (kv.first > 255) continue;
-            if (reg_is_special_excluded(kv.second)) {
-                ctx.dd_excluded_reg[(size_t)kv.first] = true;
-            }
-        }
-        ctx.dd_excluded_built = true;
-    }
-
+    df_ensure_excluded_built(ctx);
     const cst::Template &t = (*ctx.templates)[ctx.by_id->at(e.template_id)];
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
-    uint32_t rob = ctx.opts.rob_size; /* histogram cap only */
+    uint32_t window = ctx.opts.rob_size;
     if ((int)ctx.dd_depth_hist_per_bin.size() <= bin) {
         ctx.dd_depth_hist_per_bin.resize(bin + 1);
     }
     auto &bin_hist = ctx.dd_depth_hist_per_bin[bin];
     if (bin_hist.empty()) {
-        bin_hist.assign((size_t)rob + 1, 0);
+        bin_hist.assign((size_t)window + 1, 0);
     }
     for (const auto &insn : t.insns) {
-        uint32_t max_src = 0;
-        for (uint8_t r : insn.src_regs) {
-            if (ctx.dd_excluded_reg[r]) continue;
-            /* Self-RMW: same reg appears in dst — skip its
-             * contribution.  Tiny linear scan is fine, insns rarely
-             * have more than a handful of dst regs. */
-            bool self_rmw = false;
-            for (uint8_t d : insn.dst_regs) {
-                if (d == r) { self_rmw = true; break; }
-            }
-            if (self_rmw) continue;
-            auto it = ctx.dd_last_writer.find(r);
-            if (it != ctx.dd_last_writer.end() && it->second > max_src) {
-                max_src = it->second;
-            }
+        uint32_t d = df_step_insn(ctx, insn, window, bin,
+                                  /*record_ipc_samples=*/false);
+        bin_hist[d]++;
+    }
+    ctx.cp_insns_so_far += t.insns.size();
+}
+
+/* ilp: ideal IPC under perfect rename.  Drives the same Wall
+ * dataflow walk as dep_depth but summarizes each chunk by
+ *   ipc = window / max_complete_cycle_in_chunk
+ * and emits a global issue-cycle histogram showing how many
+ * insns issue at each in-window cycle (cycle 0 = no deps in
+ * chunk, ...).  Top pane is the per-bin IPC time-series;
+ * bottom pane is the issue-cycle distribution. */
+static void handle_ilp_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
+{
+    df_ensure_excluded_built(ctx);
+    const cst::Template &t = (*ctx.templates)[ctx.by_id->at(e.template_id)];
+    int bin = bin_of(ctx, ctx.cp_insns_so_far);
+    uint32_t window = ctx.opts.rob_size;
+    if (ctx.ilp_cycle_hist.empty()) {
+        ctx.ilp_cycle_hist.assign((size_t)window + 1, 0);
+    }
+    for (const auto &insn : t.insns) {
+        uint32_t complete = df_step_insn(ctx, insn, window, bin,
+                                         /*record_ipc_samples=*/true);
+        /* Issue cycle is one less than complete (1-cycle latency
+         * model).  cycle_hist[k] = insns that issued at in-chunk
+         * cycle k across the whole trace. */
+        uint32_t issue_cycle = complete - 1;
+        if (issue_cycle >= ctx.ilp_cycle_hist.size()) {
+            issue_cycle = (uint32_t)ctx.ilp_cycle_hist.size() - 1;
         }
-        uint32_t this_depth = max_src + 1;
-        if (this_depth > rob) this_depth = rob; /* histogram cap */
-        bin_hist[this_depth]++;
-        for (uint8_t r : insn.dst_regs) {
-            if (ctx.dd_excluded_reg[r]) continue;
-            ctx.dd_last_writer[r] = this_depth;
-        }
+        ctx.ilp_cycle_hist[issue_cycle]++;
     }
     ctx.cp_insns_so_far += t.insns.size();
 }
@@ -2534,6 +2622,8 @@ int main(int argc, char **argv)
                 fn = handle_working_set_entry; break;
             case Metric::DepDepth:
                 fn = handle_dep_depth_entry; break;
+            case Metric::Ilp:
+                fn = handle_ilp_entry; break;
             case Metric::ReuseDistance:
                 fn = handle_reuse_distance_entry; break;
             case Metric::BbLength:
@@ -2689,12 +2779,22 @@ int main(int argc, char **argv)
                 }
                 return std::string(buf);
             }
-            case Metric::DepDepth:
-                /* Title flags the two filters that make the metric
-                 * ILP-relevant: excluded special regs and self-RMW
-                 * skip.  No window — chains live across BBs. */
-                return "Dependency-chain depth "
-                       "(excl. FLAGS / IP / ZERO and self-RMW)";
+            case Metric::DepDepth: {
+                /* Title flags the model: Wall ideal-rename RAW
+                 * chain, bounded to a tumbling ROB-sized window. */
+                char b[96];
+                std::snprintf(b, sizeof(b),
+                    "Dependency-chain depth (Wall ideal-rename, window=%u)",
+                    (unsigned)opts.rob_size);
+                return std::string(b);
+            }
+            case Metric::Ilp: {
+                char b[96];
+                std::snprintf(b, sizeof(b),
+                    "Ideal IPC under perfect rename (window=%u)",
+                    (unsigned)opts.rob_size);
+                return std::string(b);
+            }
             case Metric::ReuseDistance:
                 return "Memory reuse-distance histogram";
         }
@@ -3153,6 +3253,85 @@ int main(int argc, char **argv)
             }
             plan.y_max = (y_peak > 0) ? (double)y_peak * 1.1 : 1.0;
             plan.warmup_bins = 0;
+            break;
+        }
+        case Metric::Ilp: {
+            /* Top pane: per-bin ideal IPC (avg + p90) from the
+             * per-chunk samples emitted by df_step_insn.  Bottom
+             * pane: global issue-cycle histogram aggregating
+             * every insn's in-chunk issue cycle across all
+             * tumbling windows.  The two panes describe the same
+             * dataflow walk from different angles: the time
+             * series tells you HOW MUCH parallelism is available
+             * over the trace; the histogram tells you WHERE in
+             * the chunk that parallelism sits (heavy bar at
+             * cycle 0 = many no-dep "fresh chain starts"; long
+             * tail = critical path dominated by a few serialized
+             * chains). */
+            plan.mode = ChartPlan::Mode::Lines;
+            plan.y_label = "ideal IPC (window/critical-path)";
+            plan.series.resize(2);
+            plan.series[0].label = "avg";
+            plan.series[0].color = palette_color(0);
+            plan.series[1].label = "p90";
+            plan.series[1].color = palette_color(1);
+            plan.series[0].y.assign(actual_bins, 0.0);
+            plan.series[1].y.assign(actual_bins, 0.0);
+            double y_peak = 0;
+            std::vector<uint32_t> sorted_scratch;
+            for (int b = 0; b < actual_bins; b++) {
+                if (b >= (int)ctx.ilp_samples_per_bin.size()) continue;
+                const auto &samples = ctx.ilp_samples_per_bin[b];
+                if (samples.empty()) continue;
+                uint64_t sum = 0;
+                for (uint32_t v : samples) sum += v;
+                double avg = (double)sum / (double)samples.size() / 1000.0;
+                sorted_scratch.assign(samples.begin(), samples.end());
+                std::sort(sorted_scratch.begin(), sorted_scratch.end());
+                size_t p90_idx = (size_t)((double)sorted_scratch.size() * 0.9);
+                if (p90_idx >= sorted_scratch.size()) {
+                    p90_idx = sorted_scratch.size() - 1;
+                }
+                double p90 = (double)sorted_scratch[p90_idx] / 1000.0;
+                plan.series[0].y[b] = avg;
+                plan.series[1].y[b] = p90;
+                if (p90 > y_peak) y_peak = p90;
+            }
+            plan.y_max = (y_peak > 0) ? y_peak * 1.1 : 1.0;
+            plan.warmup_bins = 0;
+
+            /* Bottom pane: issue-cycle histogram.  Trim trailing
+             * zeros so the x-axis isn't dominated by an empty tail
+             * (typical chunks complete well before cycle = window). */
+            size_t n_cycles = ctx.ilp_cycle_hist.size();
+            while (n_cycles > 1 &&
+                   ctx.ilp_cycle_hist[n_cycles - 1] == 0) {
+                n_cycles--;
+            }
+            plan2.mode = ChartPlan::Mode::Bars;
+            plan2.n_bins = (int)n_cycles;
+            plan2.x_bin_size = 1;
+            plan2.x_label = "in-window issue cycle";
+            plan2.y_label = "insns issued (all chunks)";
+            plan2.y_is_count = true;
+            plan2.percent = false;
+            plan2.warmup_bins = 0;
+            plan2.series.resize(1);
+            plan2.series[0].label = "";
+            plan2.series[0].color = palette_color(0);
+            plan2.series[0].y.assign(n_cycles, 0.0);
+            uint64_t y_peak2 = 0;
+            for (size_t c = 0; c < n_cycles; c++) {
+                plan2.series[0].y[c] = (double)ctx.ilp_cycle_hist[c];
+                if (ctx.ilp_cycle_hist[c] > y_peak2) {
+                    y_peak2 = ctx.ilp_cycle_hist[c];
+                }
+            }
+            plan2.y_max = (y_peak2 > 0) ? (double)y_peak2 * 1.1 : 1.0;
+            plan2.margin_right = 40;
+            plan.title  = pick_title() + " (per-bin IPC)";
+            plan2.title = pick_title() + " (issue-cycle histogram)";
+            has_second_pane = true;
             break;
         }
         case Metric::DepDepth: {

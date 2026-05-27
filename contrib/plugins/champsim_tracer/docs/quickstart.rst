@@ -10,12 +10,13 @@ Building
 Prerequisites
 ~~~~~~~~~~~~~
 
-The tracer is a C++17 QEMU TCG plugin.  Tested combinations:
+The tracer is a C++17 QEMU TCG plugin.  It was developed and tested on linux,
+with the following toolchain and library version(s); other environments may work but are untested.:
 
-* **OS:** Ubuntu 22.04 / 24.04, Debian 13, Fedora 40.  Other
+* **OS:** Ubuntu 22.04 / 24.04.  Other
   Linuxes likely work; macOS is untested; Windows builds via the
   meson plumbing but is not exercised in CI.
-* **Compiler:** gcc 11+ or clang 14+.  C++17 is required.
+* **Compiler:** gcc 11+  C++17 is required.
 * **glib:** 2.66 or newer (Ubuntu 22.04 default is fine).
 * **Capstone:** auto-downloaded by meson via
   ``subprojects/capstone.wrap``.  The plugin uses Capstone's
@@ -121,11 +122,26 @@ Output destination
 Segmentation
 ~~~~~~~~~~~~
 
-These options carve up the run into one or more *segments*.  Each
-segment produces an independent window of trace records inside the
-same output file (i.e., one ``.cst`` covers all segments; segments
-appear sequentially in the body stream and are demarcated by their
-icount range in the per-segment statistics summary).
+These options carve up the run into one or more *segments*.  A
+segment is one bounded window of guest execution captured into
+its own stand-alone ``.cst`` file — independently decodable,
+with its own header / templates dictionary / body stream and its
+own per-segment statistics summary on stderr.  The three modes
+below differ in how many segments a single QEMU run emits and
+how the segment boundaries are picked:
+
+* ``icount`` and ``symbol`` modes each produce exactly **one**
+  segment per run and write a single ``<basename>.cst``.
+* ``simpoint`` mode produces **one segment per simpoint** listed
+  in the input file and writes **one ``.cst`` file per segment**,
+  named ``<basename>-<positionB>.cst`` (see the ``outfile=``
+  description above for the position-encoding rule).
+
+Segments never share a body stream: when simpoint mode emits N
+segments, you get N independent traces a decoder can process in
+any order.  Each segment opens at its window's start icount,
+writes its own header at finish, and the next segment begins
+fresh.
 
 .. index::
    single: trace_window
@@ -268,9 +284,8 @@ rather than spawning further wrong-path chains.
    soon as ``sim_insns >= wpdepth`` *and* the in-flight WP basic
    block has finished (i.e., the loop won't truncate a BB mid-flight).
    Bigger values give a longer speculative shadow per branch but
-   linearly increase runtime on misprediction-heavy workloads —
-   doubling ``wpdepth`` roughly doubles the WP work.  Setter rejects
-   non-positive values.
+   linearly increase runtime — doubling ``wpdepth`` roughly doubles 
+   the WP work.  Setter rejects non-positive values.
 
 Capture flags
 ~~~~~~~~~~~~~
@@ -291,6 +306,8 @@ below is opt-in because it can substantially grow the trace.
    by data-aware consumers (correctness simulators, value-prediction
    research); typical cache-and-prefetcher work doesn't use it.
 
+.. _regdata-semantics:
+
 ``regdata=0`` / ``regdata=1``
    ``0`` (default) records no register values.  ``1`` snapshots each
    instruction's *destination* register values immediately after it
@@ -299,11 +316,36 @@ below is opt-in because it can substantially grow the trace.
    architectural write, so consumers can derive any register's value
    at any point from the most recent post-write observation, and
    there are typically fewer destinations than sources per insn).
-   The CP capture point is the pre-exec hook of the *next* canonical
-   instruction (so we observe registers between the just-finished
-   insn's writes and the next insn's reads); the tail insn of each
-   TB is captured at the next TB's tb_exec.  WP uses a wide
-   post-fragment regfile snap.
+
+   Both CP and WP capture the same set of registers (destinations
+   only) using the same per-insn callback machinery: when canonical
+   insn ``ci``'s pre-exec hook fires, it reads canonical insn
+   ``ci-1``'s destination registers from live state (the regfile
+   holds ``ci-1``'s post-write values, since ``ci`` hasn't run yet).
+   Result: **per-instruction-accurate** destination snapshots for
+   every insn whose successor canonical insn pre-execs in the same
+   TB / WP fragment.
+
+   The capture point of the *tail* canonical insn of each
+   TB / fragment differs by path, because there is no in-flight
+   successor inside the same TB to trigger its capture:
+
+   * **CP** captures the tail insn at the *next* TB's first
+     ``vcpu_tb_exec`` (between the two TBs, the regfile still
+     holds the tail's post-write state).  Per-instruction-accurate
+     for every CP insn.
+   * **WP** captures the tail insn of each fragment with a live
+     post-fragment read.  For a **single-fragment** ``exec_tb``
+     this read still lands on the tail's post-write state and is
+     per-instruction-accurate.  For a **multi-fragment**
+     ``exec_tb`` (mid-TB-branch splits, e.g. MIPS ``teq``), the
+     trailing insn of every fragment except the very last one
+     reads from a regfile that has already been mutated by later
+     fragments in the same ``exec_tb`` — those tail snapshots
+     reflect post-everything-in-``exec_tb`` state.  The number
+     of WP insns with the post-everything caveat is bounded by
+     ``(fragments_per_exec_tb − 1) ≤ 1`` for typical TBs and a
+     small multiple for mid-TB-branch ISAs.
 
 ``wp_memdata=0`` / ``wp_memdata=1``
    WP-side override for ``memdata``.  Default *inherits* the value
@@ -314,7 +356,7 @@ below is opt-in because it can substantially grow the trace.
    on speculation-heavy workloads dropping WP data values is one of
    the larger trace-size knobs.  Measured impact on the
    architecture page's mcf table: full data → WP-addresses-only
-   takes the trace from 548 MB to 280 MB on a 20 M-insn run.
+   takes the trace from 623 MiB to 281 MiB on a 20 M-insn run.
    Setting ``wp_memdata=1`` while ``memdata=0`` is permitted but
    unusual — you'd record values on WP only.
 
@@ -508,13 +550,32 @@ A byte-budget audit (helpful when tuning trace size) is one command:
 .. code-block:: console
 
    $ build/contrib/plugins/cst_audit run.cst
-   FILE                                     12.34 MiB  100.00%
-   === TOP-LEVEL SECTIONS ===
-     HEADER                                  6.18 KiB    0.05%
-     TEMPLATES                              412.30 KiB    3.27%
-     BODY                                    11.94 MiB   96.66%
-     TRAILER                                      64 B    0.00%
-   ...
+     profile: exec_cp=142 exec_wp=317  mem-insns=279 addr-insns=0  pat[none/reg/irr/rand]=1153/192/2/0
+   === ON DISK ===
+     container (.cst)                                82.00 KiB
+
+   === MEMBER SIZES (uncompressed) ===
+     TOTAL uncompressed                              79.71 KiB  100.00%
+     HEADER member                                   54.96 KiB   68.95%  [       140 tmpl, avg  402.0 B]
+     BODY member (records)                           24.75 KiB   31.05%
+
+   === HEADER BREAKDOWN (54.96 KiB) ===
+     preamble + encoding maps                        19.18 KiB   34.89%
+     section framing (counts+lengths)                    221 B    0.39%
+     BB info (id/pc/n/ft/targets/sym)                 3.10 KiB    5.64%
+     instruction descriptors                         21.92 KiB   39.88%
+     dependency sub-blocks                            3.58 KiB    6.52%
+     template profile block                           6.96 KiB   12.67%
+
+   === BODY BREAKDOWN (24.75 KiB) ===
+     CP entry framing                                    284 B    1.12%
+     CP field-delta section                          13.42 KiB   54.22%
+     WP chain envelope (incl. inner)                 10.17 KiB   41.10%
+     ...
+
+The report distinguishes the on-disk ``.cst`` container size (the
+tar-of-compressed-members blob) from the post-decompression
+``TOTAL uncompressed`` figure that the breakdowns sum to.
 
 For both tools' full surface see :doc:`decoder`.  For the
 self-checking workload harness that exercises the plugin under
@@ -529,101 +590,156 @@ Reproducibility
 The trace is deterministic in the following sense: given the same
 guest binary, the same QEMU command line, the same plugin flags,
 and the same plugin build, two runs produce body streams that are
-*architecturally identical* — every basic block invoked, every
-memop, every register snapshot matches across runs.  In practice
-two ``.cst`` files from back-to-back runs differ only in the
-per-segment header's ``DATETIME`` and ``COMMAND`` strings, which
-are recorded as-is.  The encoding-maps section is deterministic:
-the C++ writer sorts the templates dictionary on serialization, so
-``template_id`` assignments are stable across runs and the section
-does not vary with hash-table iteration order.
+*architecturally identical* — every basic block invoked matches across runs.
+In practice two ``.cst`` files from back-to-back runs differ due to 
+non-determinism in the guest's address space layout, random bytes,
+host scheduling, and other factors. The flags below reduce this non-determinism
+and make runs more closely match each other, but they don't eliminate all sources of divergence.
 
-Things that *can* break determinism:
+.. _reproducibility-flags:
 
-* **ASLR.**  Virtual addresses in the trace are guest-mode virtual
-  addresses; if the guest randomizes its layout, the body stream's
-  ``LOAD_ADDR`` / ``STORE_ADDR`` slots and the templates'
-  ``start_pc`` values will shift accordingly.  Disable ASLR via
-  ``setarch -R`` on the QEMU command for byte-stable traces.
-* **Concurrency.**  Multi-threaded guest workloads can interleave
-  vCPUs differently across runs.  See :ref:`multi-vcpu` in the
-  architecture doc.
-* **Wall-clock-dependent guest behavior.**  Workloads that
-  dispatch differently based on ``gettimeofday()`` etc.  The
-  tracer records the divergence faithfully; if you want bit-stable
-  traces, fix the workload's clock.
-* **AT_RANDOM and other kernel-supplied randomness.**  QEMU's
-  user-mode emulator stuffs 16 random bytes into the guest's
-  auxiliary vector (``AT_RANDOM``) on every invocation; glibc reads
-  them for the stack canary, the pointer guard, and several
-  internal hash seeds.  Any guest-side computation that funnels
-  those bytes into memory (which mcf and most C programs do via
-  malloc and stack-canary bookkeeping) produces a different value
-  stream per run.  Pass ``-seed N`` to the QEMU binary to make
-  ``AT_RANDOM`` deterministic.
-* **Uninitialized data.**  The plugin doesn't scrub uninitialized
-  memory or registers; if the guest reads them (on correct *or*
-  wrong path) before writing them, the trace captures whatever
-  junk was there.  Correct-path execution typically initialises
-  before reading, but the wrong-path simulator follows branch
-  directions the program would not normally take — it can leap
-  past the initialization step and dereference a stack frame or
-  heap chunk while it still holds residue from a prior function
-  call.  When that happens the WP chain captures whatever bytes
-  the OS / glibc / prior caller happened to leave, which can
-  differ across runs even with ``-seed`` fixed.  Aggregate
-  counts (entries, total instructions, address-set coverage)
-  remain reproducible; the value bytes attached to a small
-  number of WP fragments do not.  See :doc:`limitations` for
-  the detailed mechanism and why this is fundamentally not
-  fixable from the plugin side.
+Flags that reduce non-determinism
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Cross-host reproducibility holds when the above sources are
-controlled — the same guest binary produces the same trace on two
-different hosts running the same QEMU+plugin build.  Cross-QEMU-
-version reproducibility is *not* guaranteed: if the QEMU base
-moves to a different upstream commit, the TB carving heuristics
-may shift, which renumbers ``template_id`` in the dictionary.
-The body's architectural content stays the same.
+Non-determinism enters a user-mode QEMU run through three layers,
+each with its own knob.  Set all of them when you want runs that
+match each other.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 30 52
+
+   * - Layer
+     - Knob
+     - What it pins / what's left unpinned without it
+   * - Guest randomness
+     - ``-seed N`` on the QEMU binary (env ``QEMU_RAND_SEED``)
+     - Switches ``qemu_guest_getrandom`` to a deterministic
+       Mersenne Twister seeded by ``N``.  Backs the ``AT_RANDOM``
+       16-byte auxv entry that glibc reads for the stack canary,
+       the pointer-mangling key (``__pointer_chk_guard``), and
+       several internal hash-table seeds, plus any guest call to
+       ``getrandom(2)``.  Without it every run gets fresh
+       cryptographic-random bytes here.
+   * - Guest base address
+     - ``-B address`` (env ``QEMU_GUEST_BASE``)
+     - Fixes the host↔guest virtual-address offset so PIE
+       binaries and the dynamic linker land at the same guest
+       VAs every run.  Without it, ``probe_guest_base`` /
+       ``pgb_dynamic`` derives the base from the host's
+       ``sbrk(0)`` and ``/proc/self/maps`` — both subject to
+       host ASLR — so every guest pointer that survives a
+       run-to-run comparison shifts.
+   * - Guest mmap layout
+     - ``-R size`` (env ``QEMU_RESERVED_VA``)
+     - Pre-allocates a reserved guest-VA window of ``size``
+       bytes and routes every guest ``mmap`` through a
+       deterministic linear walker
+       (``mmap_find_vma_reserved``).  Without it each guest
+       ``mmap`` is forwarded to the host kernel, which applies
+       host ASLR per call — so glibc / vDSO / ld.so end up at
+       different guest addresses each run.  ``-R 8G`` is enough
+       for typical SPEC-class workloads on a 64-bit guest.
+   * - Host scheduling
+     - ``taskset -c 0`` on the QEMU command
+     - Pins the QEMU process to one host CPU.  Removes a class
+       of TCG-translation-cache timing variance.  Does not
+       affect what the guest sees of itself.
+   * - Host ASLR
+     - ``setarch -R`` on the QEMU command
+     - Disables host-side ASLR for the QEMU process itself.
+       Belt-and-braces complement to ``-B`` / ``-R``: even when
+       the guest layout is fully pinned, host-side ASLR can
+       shift where QEMU's own libraries land, which can affect
+       ``pgb_dynamic``'s fallback search when ``-B`` is *not*
+       set.  With ``-B`` set this knob has no observable effect
+       on the trace, but it costs nothing to leave on.
+   * - Inherited environment
+     - ``env -i HOME=/tmp PATH=/usr/bin LANG=C``
+     - Strips inherited environment variables.  Different shell
+       environments leave different bytes in the guest's
+       startup stack via ``envp`` and ``auxv``, which feeds back
+       into glibc-initialised data structures the workload may
+       later touch.
+
+Knobs that exist but do *not* belong here:
+
+* ``-d ...`` (logging) and ``--icount`` (system-mode only) do
+  not change what the user-mode plugin observes.
+* QEMU's full record/replay machinery
+  (``-record`` / ``-replay``, documented in the upstream
+  ``docs/system/replay.rst``) is **system-mode only** and cannot
+  be combined with user-mode emulation.
+
+Residual sources after all knobs are set
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Even with the full flag set above, four sources are not
+controlled by any QEMU flag:
+
+* **Host-passthrough syscalls.**  ``gettimeofday``,
+  ``clock_gettime``, ``time``, ``getpid``, ``gettid`` and reads
+  from ``/proc/self/*`` go straight to the host.  Workloads
+  that read wall-clock time or hash by PID will diverge.  The
+  tracer records the divergence faithfully; pin the workload's
+  clock at the workload level if bit-stability is required.
+* **Pre-segment icount drift.**  When a segment opens at a
+  fixed ``icount=N``, every guest instruction *before* the
+  segment counts toward ``N`` — including the dynamic linker
+  and glibc startup.  Glibc init's instruction count is
+  sensitive to ``AT_RANDOM``, library load addresses, and heap
+  layout, so without all three of ``-seed`` / ``-B`` / ``-R``,
+  the pre-segment count drifts by a few thousand instructions
+  per run, and the segment ends up covering a slightly
+  different *slice* of the workload's user code.  The window
+  length stays exact; the slice it covers does not.  Observed
+  manifestation: ``exec_cp`` differs by ~0.01 % across re-runs
+  of the same SPEC binary at the same icount window.  Setting
+  all three layer-1 knobs pins glibc init byte-for-byte and
+  removes the drift.
+* **Multi-vCPU interleaving.**  Multi-threaded guest workloads
+  can interleave vCPUs differently across runs.  See
+  :ref:`multi-vcpu` in the architecture doc.
+* **WP reads of uninitialised data.**  The wrong-path simulator
+  follows branch directions the program would not normally
+  take, so it can dereference a stack frame or malloc chunk
+  while it still holds residue from a prior function call.
+  The bytes there are whatever the OS / glibc / a prior caller
+  happened to leave behind — they are not bound by the
+  program's data-flow.  Aggregate WP counts (entries, total
+  instructions, address-set coverage) remain reproducible; a
+  small number of WP fragments' value bytes do not.  See
+  :doc:`limitations` for the detailed mechanism and why this is
+  fundamentally not fixable from the plugin side.
+
+Cross-host reproducibility holds when the above-listed
+controllable sources are pinned — the same guest binary
+produces the same trace on two different hosts running the
+same QEMU+plugin build.  Cross-QEMU-version reproducibility is
+*not* guaranteed: if the QEMU base moves to a different
+upstream commit, the TB carving heuristics may shift, which
+renumbers ``template_id`` in the dictionary.  The body's
+architectural content stays the same.
 
 Recommended invocation for maximum reproducibility
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-For studies that need traces as close to byte-identical as the
-above-listed sources permit, wrap the QEMU invocation like this:
 
 .. code-block:: console
 
    $ env -i HOME=/tmp PATH=/usr/bin LANG=C \
      taskset -c 0 setarch -R \
-     qemu-x86_64 -seed 42 \
+     qemu-x86_64 -seed 42 -B 0x40000000 -R 8G \
        -plugin ./libchampsim_tracer.so,outfile=run,wp=1,memdata=1,regdata=1,\
                 trace_window=icount:start=0+stop=20000000 \
        ./your_workload
 
-What each piece does:
-
-* ``env -i ... LANG=C`` strips inherited environment variables that
-  end up in the guest's startup stack via ``envp``.  Different
-  inherited environments leave different bytes in the stack
-  region the guest's startup code reads, which feeds back into
-  glibc-initialised data structures the workload may touch.
-* ``taskset -c 0`` pins the QEMU process to one host CPU.  Does
-  not affect the guest's view of itself; only constrains host
-  scheduling, which removes a class of TCG-translation-cache
-  timing variance.
-* ``setarch -R`` disables host-side ASLR for the QEMU process.
-  QEMU's user-mode emulator further controls guest layout
-  independently, but disabling the host's ASLR removes another
-  variable when comparing runs.
-* ``-seed 42`` seeds QEMU's guest-randomness generator so
-  ``AT_RANDOM`` (16 bytes the guest's glibc reads on startup) is
-  identical across runs.  Without this, every run is unique.
-
-With all four in place on the same host and same QEMU+plugin
-build, the CP path of a single-vCPU workload is reproducible to
-the last byte except for the unavoidable WP-on-uninitialised-
-memory residue described above.
+With all six knobs in place on the same host and same QEMU +
+plugin build, the CP path of a single-vCPU workload is
+reproducible byte-for-byte except for the residual sources
+listed above.  Drop any of the layer-1 knobs (``-seed`` /
+``-B`` / ``-R``) and the *content* of any windowed segment
+shifts via the pre-segment-icount-drift mechanism — even when
+the workload itself reads no clocks and uses no randomness.
 
 Feeding ChampSim
 ----------------

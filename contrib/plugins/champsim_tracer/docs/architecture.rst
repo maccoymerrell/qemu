@@ -45,19 +45,22 @@ three layers in series:
    cost is roughly proportional to ``wpdepth`` instructions of
    speculative execution per branch.
 
-The numbers below are measured on the SPEC CPU2017 ``mcf_r`` test
-workload, 20 M architectural instructions of capture (x86_64 host,
-gcc 13).  They are representative of this workload only; other
-workloads vary in both runtime and trace size.
+The numbers below are measured on the SPEC CPU2017 ``mcf_r``
+refrate input, 20 M architectural instructions of capture
+(x86_64 host, gcc 13).  They are representative of this workload
+only; other workloads vary in both runtime and trace size.
+Sizes are MiB; compressed sizes come from recompressing the raw
+body+header pair with ``xz -T0`` (the tracer's default in-process
+compressor when ``compress=`` is set).
 
 .. list-table::
    :header-rows: 1
-   :widths: 38 12 14 14 12 10
+   :widths: 38 12 12 12 12 14
 
    * - Configuration
      - Wall (s)
      - Raw size
-     - zstd-19
+     - xz size
      - B/insn raw
      - Slowdown
    * - stoptrigger only (no recording)
@@ -67,53 +70,55 @@ workloads vary in both runtime and trace size.
      - n/a
      - 1× (baseline)
    * - ``wp=0,memdata=0,regdata=0``
-     - 7.4
-     - 35 MB
-     - 0.18 MB
-     - 1.8
-     - 41×
+     - 3.2
+     - 19.4 MiB
+     - 0.15 MiB
+     - 1.0
+     - 18×
    * - ``wp=1,memdata=0,regdata=0``
-     - 116
-     - 272 MB
-     - 2.2 MB
+     - 60.4
+     - 272 MiB
+     - 2.4 MiB
      - 14
-     - 644×
+     - 335×
    * - ``wp=1,memdata=1,regdata=0,wp_memdata=0``
-     - 122
-     - 280 MB
-     - 2.8 MB
+     - 63.6
+     - 281 MiB
+     - 3.0 MiB
      - 15
-     - 679×
+     - 353×
    * - ``wp=1,memdata=1,regdata=1``
-     - 176
-     - 548 MB
-     - 16 MB
-     - 29
-     - 979×
+     - 109.2
+     - 623 MiB
+     - 18.8 MiB
+     - 33
+     - 607×
 
 Reading the table:
 
 * **Slowdown vs the stoptrigger plugin** (which is roughly
-  unmodified-QEMU runtime): tracing without WP costs ~40× on this
+  unmodified-QEMU runtime): tracing without WP costs ~18× on this
   workload because every TB pays a ``vcpu_tb_exec`` callback +
   Capstone-classification + chain-assembly walk.  Enabling
   WP simulation jumps to several-hundred× because every CP branch
   triggers a separate TCG re-entry for the speculative side-trip.
-  Adding ``regdata=1`` is a further ~1.5× on top — every
+  Adding ``regdata=1`` is a further ~1.8× on top — every
   instruction's destination registers are read out via
   ``qemu_plugin_read_register``.
-* **Trace size:** heavily compression-friendly at the small end.
-  CP-only addresses produce ~2 bytes/insn raw and compress to
-  under a hundredth of a byte each — the field-delta encoding is
-  near-optimal for the steady-state inner loop.  The full
-  configuration (CP+WP, all data, all reg snaps) lands at ~30
-  bytes/insn raw, compressing to under a byte/insn.
+* **Trace size:** the field-delta encoder is highly compression-
+  friendly.  CP-only addresses produce ~1 byte/insn raw and
+  compress to under a hundredth of a byte each.  The full
+  configuration (CP+WP, all data, all reg snaps) lands near
+  33 bytes/insn raw, compressing to ~1 byte/insn.  The recent
+  encoder optimisations (per-template field-state cache, inlined
+  field-delta emit loop) account for the gap vs. older numbers in
+  the public small-trace bundle.
 * **Memory footprint:** the plugin's RSS grows roughly with the
   template-cache size (one ``BBTemplate`` per static basic block,
   on the order of a few hundred bytes each) plus the WP simulator's
   speculative-store buffer (bounded by ``wpdepth`` × the workload's
-  store rate).  Steady-state RSS on this 20 M run was ~140 MB
-  with ``wp=0`` and ~390 MB with full capture.
+  store rate).  Peak RSS on this 20 M run was ~320 MiB with
+  ``wp=0,memdata=0`` and ~1.25 GiB with full capture.
 
 Workload-dependence caveat: mcf has a tight inner loop that delta-
 encodes well.  Branch-heavy workloads (e.g. SPEC ``perlbench``)
@@ -145,13 +150,15 @@ If trace size or runtime is a problem:
 * **``simpoint`` mode** carves a long workload into representative
   segments rather than tracing it whole.  Combine with
   ``warmup=N,simulation=N`` to control segment length precisely.
-* **``compress="zstd -T0 -19 -q -c"``** runs zstd in-process so each
-  member inside the ``.cst`` archive lands compressed.  The wire
-  format's delta encoding leaves long runs of small bytes that ``zstd
-  -19`` compresses aggressively — measured ratios on the mcf workload
-  above range from ~34× (full data) to ~190× (CP-only addresses).
-  The in-memory trace size is unchanged but the on-disk footprint
-  shrinks substantially.
+* **``compress="xz -T0 -q -c"``** or
+  ``compress="zstd -T0 -19 -q -c"`` runs the compressor in-process
+  so each member inside the ``.cst`` archive lands compressed.
+  The wire format's delta encoding leaves long runs of small bytes
+  that both compressors handle well — measured ratios on the mcf
+  workload above range from ~33× (full data) to ~129× (CP-only
+  addresses) under default ``xz -T0``.  ``zstd -19`` lands at
+  similar ratios on this data (within ~10 %).  The in-memory trace
+  size is unchanged but the on-disk footprint shrinks substantially.
 * **``wp_memdata=0``** keeps the WP cache-pollution stream
   (addresses) but drops the WP data values.  This is usually the
   biggest single trace-size knob.
@@ -429,9 +436,13 @@ order they're touched on a hot path:
        TLS vector and per-WP-simulation memops in
        ``g_wp_state.mem_accesses``.
    * - ``champsim_tracer_reg_snap_collector.{h,cc}``
-     - Captures source-register values on instructions whose templates
-       say register data is needed.  Either inline at exec time (CP)
-       or out-of-band against a wide pre-fragment regfile dump (WP).
+     - Captures destination-register values per instruction (templates
+       enumerate the live dst keys; sources are not snapshotted).  CP
+       and WP both use the same per-insn callback to read each insn's
+       dst values when its successor canonical insn pre-execs in the
+       same TB / fragment; only the trailing insn of each WP fragment
+       falls back to a live post-fragment read.  See
+       :ref:`regdata-semantics` for the per-path timing detail.
    * - ``champsim_tracer_wp.cc``
      - The wrong-path simulator.  Saves CPU state, enters spec mode at
        a wrong target, runs ``cpu_plugin_exec_tb`` until depth budget
@@ -538,8 +549,13 @@ operation):
     b.  Look up the cached *true-BB* at ``pre_pc``.  If absent, the
         fragment template the next ``exec_tb`` produces becomes the
         driver via ``g_wp_state.last_executed_tb``.
-    c.  Capture pre-fragment register values into a per-fragment wide
-        snapshot if reg-data is enabled.
+    c.  Clear the per-thread WP regsnap scratch buffer
+        (``wp_pending_reg_snaps``) if WP reg-data is enabled.  The
+        in-flight ``exec_tb`` below will fire the per-insn
+        ``vcpu_insn_reg_snap_cb`` registered at translation time, and
+        in WP context those callbacks append into this buffer
+        instead of the CP-side ``pending_reg_snaps``.  See
+        :ref:`regdata-semantics` for the per-path timing.
     d.  ``cpu_plugin_exec_tb()`` runs the TB.  Memory, instruction-
         exec, inline-store, and ``vcpu_tb_exec`` callbacks all fire —
         ``CF_MEMI_ONLY`` was removed so that the plugin's per-fragment

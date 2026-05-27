@@ -2,7 +2,7 @@ ChampSim Tracer
 ===============
 
 ChampSim Tracer is a QEMU TCG plugin that records execution traces
-of user-mode binaries for cache-, branch-, and prefetcher-research.
+of user-mode binaries for micro-architectural research.
 It runs the workload under QEMU's user-mode emulator and writes a
 ``.cst`` binary file containing both the architectural correct-path
 execution and a per-branch *wrong-path* shadow that models what a
@@ -35,11 +35,11 @@ the byte-level wire format.
   records destination-register and memory values post-execution.
 * **Microarchitectural design-space exploration** — ChampSim and
   comparable simulators consume the trace to drive out-of-order
-  issue, BTB, and prefetcher models.
+  issue, BTB, branch predictor, and prefetcher models.
 
-The tracer is not a cycle-accurate timing model and does not see
-inside the kernel — it captures *what* executed at user level, not
-*when* the hardware would issue it.  See :doc:`limitations` for the
+The tracer contains no timing information, and does not see
+inside the kernel — it captures *what* executed at user level (*commit-order*), not
+when the hardware would issue it (*timing*).  See :doc:`limitations` for the
 full list of out-of-scope categories.
 
 Supported guest ISAs: x86_64, aarch64, riscv64, mipsel.  Per-ISA

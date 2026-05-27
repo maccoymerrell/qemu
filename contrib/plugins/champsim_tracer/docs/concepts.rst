@@ -25,57 +25,80 @@ Each template also carries a small **run-aggregated profile block**
 — PGO-style metadata accumulated over the whole run (execution
 counts, terminal-branch behaviour, per-instruction memory-access
 shape).  It is pure annotation: a consumer that does not model it
-skips the bytes, and it never affects deterministic replay.
+skips the bytes.
 
 **Body** (the timeline).  One record per dynamic invocation of a
-basic block.  Each record points at a template by ID and adds the
-runtime data: per-instruction memory addresses, optional values,
-optional destination-register snapshots, and (when wrong-path
+basic block.  Each record points at a basic block by ID and adds the
+runtime data: per-instruction memory addresses, optional data values,
+optional destination-register data snapshots, and (when wrong-path
 simulation is enabled) the speculative chain a mispredicting CPU
 *would have* run from the just-finished branch.
 
-Trace size on a measured workload (20 M instructions of mcf_r,
-SPEC CPU2017 test input, x86_64; numbers are bytes per
-architectural instruction, raw and after ``zstd -19``):
+Trace size on a measured workload — 20 M instructions of
+``505.mcf_r`` and ``502.gcc_r`` (SPEC CPU2017 refrate input,
+x86_64), each captured in three plugin configurations and
+compressed in-process by the tracer with ``xz -T0 -q -c``.
+Numbers are bytes per architectural instruction of the 20 M
+window:
 
 .. list-table::
    :header-rows: 1
-   :widths: 40 20 20 20
+   :widths: 38 12 16 16 18
 
    * - Configuration
+     - Workload
      - Raw B/insn
-     - zstd B/insn
-     - Compression
+     - xz B/insn
+     - Ratio
    * - CP-only, addresses only
+       (``wp=0,memdata=0``)
+     - mcf
      - 1.83
-     - 0.0095
-     - 192×
+     - 0.21
+     - 8.9×
+   * -
+     - gcc
+     - 2.00
+     - 0.07
+     - 27×
    * - CP+WP, addresses only
-     - 14.3
-     - 0.113
-     - 126×
-   * - CP full data, WP addresses only
-     - 14.7
-     - 0.148
-     - 99×
-   * - CP+WP full (data + reg snaps)
-     - 28.7
-     - 0.84
-     - 34×
+       (``wp=1,memdata=0,wp_memdata=0``)
+     - mcf
+     - 22.5
+     - 2.29
+     - 9.8×
+   * -
+     - gcc
+     - 21.9
+     - 0.88
+     - 25×
+   * - CP+WP full
+       (``wp=1,memdata=1,regdata=1``)
+     - mcf
+     - 66.3
+     - 7.94
+     - 8.3×
+   * -
+     - gcc
+     - 49.4
+     - 4.52
+     - 11×
 
-Compression ratio falls as more entropy is captured.  The CP-only
-trace is dominated by sparse delta records that pack to almost
-nothing under ``zstd -19``; once memory data and register
-snapshots are recorded the entropy rises and the compression
-shrinks.  The :doc:`decoder` ``cst_audit`` tool breaks any trace
-down into this byte structure exactly.
+Compression ratio falls as more entropy is captured: the CP-only
+trace is dominated by sparse delta records that compress well,
+while memop addresses are nearly random and load / store /
+register values are entropy-rich.  The :doc:`decoder`
+``cst_audit`` tool breaks any trace down into this byte
+structure exactly.
 
-These numbers are workload-dependent.  Branch-heavy workloads
-typically produce larger per-instruction figures than mcf (which
-has a tight inner loop that delta-encodes well); memory-bound
-workloads with diverse access patterns inflate the ``CP+WP full``
-configuration further.  Run ``cst_audit`` on a representative
-slice of your own workload before sizing storage for a long run.
+These numbers are workload-dependent.  gcc has more BB diversity
+and more conditional flow than mcf but a smaller and more
+repetitive memory footprint, so its CP-only trace compresses 3×
+better despite being slightly larger raw.  mcf's heavy random-
+ish memory traffic inflates the CP+WP-full configuration and
+caps its compression ratio around 8×.  Run ``cst_audit`` on a
+representative slice of your own workload before sizing storage
+for a long run.
 
 What a body entry represents
 ----------------------------
@@ -102,10 +125,10 @@ correct path, with speculative side-trips attached at every branch.
 Run-aggregated profile (PGO metadata)
 -------------------------------------
 
-Every template carries a profile block summarising what happened
+Every template carries a profile block summarizing what happened
 across the *whole* run — final totals, serialized at segment
 finish, never running snapshots.  It is the trace's built-in
-profile-guided-optimisation layer: a consumer can size structures
+profile-guided-optimization layer: a consumer can size structures
 or pick policies from it without a separate profiling pass.  Pure
 metadata — skipping it changes nothing about replay.
 
@@ -225,8 +248,8 @@ predictors against the recorded post-execution values.
 **Microarchitectural design-space exploration.**  The combination
 of templates + dynamic memops + wrong-path chains is enough for
 detailed simulators (ChampSim and similar) to model out-of-order
-issue, BTB hits, cache pollution from speculation, and prefetcher
-training in one pass.
+issue, BTB hits, branch prediction, cache pollution from speculation, 
+and prefetcher training in one pass.
 
 What the trace is *not* designed for
 ------------------------------------
@@ -244,12 +267,11 @@ A few categories the trace deliberately does not cover — see
 * **Branch nesting beyond the initial mispredict.**  The wrong-
   path chain follows a single mispredicted branch; subsequent
   branches inside the speculative window are followed in their
-  *predicted* (i.e. statically-resolved) direction without
-  spawning further nested wrong-path chains.  This matches what
-  most cache- and prefetcher-research workloads need; if your
-  research depends on multiple-mispredict speculation chains
-  (e.g. transient-execution side-channel work), the chain will
-  under-cover that domain.
+  statically-resolved direction without spawning further nested 
+  wrong-path chains.  This matches what most cache- and 
+  prefetcher-research workloads need; if your research depends 
+  on multiple-mispredict speculation chains (e.g. transient-execution 
+  side-channel work), the chain will under-cover that domain.
 
 Reading on
 ----------

@@ -322,7 +322,7 @@ The recommended validation workflow:
 .. code-block:: console
 
    $ build/contrib/plugins/cst_audit trace.cst
-   FILE  ...  100.00%       # totals must sum to 100%
+   # HEADER BREAKDOWN must end in '[rollup 100.00%]'
 
    $ build/contrib/plugins/cst_decode trace.cst > /dev/null
    # exit status 0 means the body walker accepted every record

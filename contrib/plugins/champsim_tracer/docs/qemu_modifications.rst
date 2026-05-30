@@ -234,17 +234,33 @@ speculative path.
    because no other ISA has a single instruction looping a 64-bit
    register-sized memory operation.
 
-``accel/tcg/internal-common.h`` — ``spec_store_byte``
+``include/exec/plugin-spec.h`` and ``accel/tcg/internal-common.h`` —
+spec store buffer
 
-   The per-vCPU spec store buffer holds one ``g_hash_table`` node
-   per speculative byte, so an unbounded wrong-path bulk store
-   would exhaust memory and crash inside glib.  ``spec_store_byte``
-   bounds the table at ``PLUGIN_SPEC_STORE_BUF_MAX`` (64 MiB of byte
-   entries): beyond the limit no new keys are added, but existing
-   keys still update so store-to-load forwarding stays correct for
-   the tracked working set, and excess speculative stores are not
-   forwarded.  The bound is ISA-generic — it applies to every target
-   that routes stores through the buffer.
+   The per-vCPU spec store buffer is a ``g_hash_table`` keyed by
+   64-byte cache line (``PluginSpecLine``: a ``valid_mask`` bitmap
+   plus a ``bytes[64]`` payload, declared in ``plugin-spec.h``).
+   Both the store and the store-to-load-forwarding load resolve a
+   whole access **per cache line, not per byte**: a naturally-aligned
+   access stays within one line, so the common case is a single hash
+   lookup, and a load whose line holds no speculative bytes falls
+   straight through to a bulk read from guest memory.
+
+   * ``spec_store_bytes`` (``internal-common.h``) chunks a store by
+     line, ``memcpy``-ing each chunk into the line payload and OR-ing
+     the covered bits into ``valid_mask``.
+   * ``spec_load_bytes_user`` (``accel/tcg/user-exec.c``, linux-user)
+     and ``spec_load_bytes`` (``accel/tcg/cputlb.c``, softmmu) are the
+     two mirror-image forwarding loads; both chunk by line and only
+     fall to per-byte selection when a line is partially speculative.
+
+   ``spec_line_get_or_alloc`` bounds the table at
+   ``PLUGIN_SPEC_STORE_LINE_MAX`` lines: beyond the cap no new lines
+   are added, but existing lines still update so store-to-load
+   forwarding stays correct for the tracked working set and excess
+   speculative stores are simply not forwarded.  The bound, and the
+   buffer itself, are ISA-generic — they apply to every target that
+   routes stores through the buffer.
 
 x86 lazy-flags resolution for plugin reads
 ------------------------------------------

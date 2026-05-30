@@ -45,22 +45,55 @@ __thread uintptr_t helper_retaddr;
 /*
  * Load N bytes with store-to-load forwarding (user mode).
  * Checks page validity via g2h; returns zero for unmapped bytes.
+ *
+ * Line-chunked to mirror spec_store_bytes: one spec-buffer lookup per
+ * cache line (a naturally-aligned access stays within one line), not
+ * one per byte.  The common case — no speculative store overlaps this
+ * load's line — resolves to a single lookup + one page check + a bulk
+ * memcpy from guest memory, instead of N hash lookups and N byte reads.
+ * A 64-byte-aligned line never straddles a (>=4 KiB) page, so one page
+ * check covers the whole chunk.
  */
 static void spec_load_bytes_user(CPUState *cpu, vaddr guest_addr,
                                  void *out, int size)
 {
     uint8_t *op = out;
-    for (int i = 0; i < size; i++) {
-        vaddr byte_addr = guest_addr + i;
-        if (!spec_load_byte(cpu, byte_addr, &op[i])) {
-            /* Not in spec buffer; try real memory */
-            if (guest_addr_valid_untagged(byte_addr) &&
-                (page_get_flags(byte_addr) & PAGE_READ)) {
-                op[i] = *(uint8_t *)g2h(cpu, byte_addr);
+    while (size > 0) {
+        vaddr    line_addr = guest_addr & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
+        unsigned idx       = (unsigned)(guest_addr & PLUGIN_SPEC_LINE_MASK);
+        unsigned remain    = PLUGIN_SPEC_LINE_SIZE - idx;
+        unsigned chunk     = (unsigned)size < remain ? (unsigned)size : remain;
+
+        PluginSpecLine *line = spec_line_lookup(cpu, line_addr);
+        uint64_t chunk_mask = (chunk >= 64 ? ~(uint64_t)0
+                                           : (((uint64_t)1 << chunk) - 1)) << idx;
+
+        if (!line || !(line->valid_mask & chunk_mask)) {
+            /* No forwarded bytes in this chunk: bulk-read from real
+             * memory (whole chunk is within one page). */
+            if (guest_addr_valid_untagged(guest_addr) &&
+                (page_get_flags(guest_addr) & PAGE_READ)) {
+                memcpy(op, g2h(cpu, guest_addr), chunk);
             } else {
-                op[i] = 0;
+                memset(op, 0, chunk);
+            }
+        } else {
+            /* Mixed: forward stored bytes, fill the rest from memory. */
+            for (unsigned i = 0; i < chunk; i++) {
+                unsigned b = idx + i;
+                if (line->valid_mask & ((uint64_t)1 << b)) {
+                    op[i] = line->bytes[b];
+                } else {
+                    vaddr ba = line_addr + b;
+                    op[i] = (guest_addr_valid_untagged(ba) &&
+                             (page_get_flags(ba) & PAGE_READ))
+                            ? *(uint8_t *)g2h(cpu, ba) : 0;
+                }
             }
         }
+        guest_addr += chunk;
+        op         += chunk;
+        size       -= chunk;
     }
 }
 #endif /* CONFIG_PLUGIN */

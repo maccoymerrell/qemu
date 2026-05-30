@@ -51,17 +51,42 @@
 #ifdef CONFIG_PLUGIN
 /*
  * Load N bytes with store-to-load forwarding (system mode).
- * Falls back to the supplied host address for bytes not in the buffer.
+ * Falls back to the supplied (pre-resolved, contiguous) host address
+ * for bytes not in the buffer.
+ *
+ * Line-chunked to mirror spec_store_bytes: one spec-buffer lookup per
+ * cache line rather than one per byte.  When no speculative store
+ * overlaps the chunk (the common case) it is a single lookup plus a
+ * bulk memcpy from host_addr.
  */
 static void spec_load_bytes(CPUState *cpu, vaddr guest_addr,
                             void *host_addr, void *out, int size)
 {
     uint8_t *hp = host_addr;
     uint8_t *op = out;
-    for (int i = 0; i < size; i++) {
-        if (!spec_load_byte(cpu, guest_addr + i, &op[i])) {
-            op[i] = hp[i];
+    while (size > 0) {
+        vaddr    line_addr = guest_addr & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
+        unsigned idx       = (unsigned)(guest_addr & PLUGIN_SPEC_LINE_MASK);
+        unsigned remain    = PLUGIN_SPEC_LINE_SIZE - idx;
+        unsigned chunk     = (unsigned)size < remain ? (unsigned)size : remain;
+
+        PluginSpecLine *line = spec_line_lookup(cpu, line_addr);
+        uint64_t chunk_mask = (chunk >= 64 ? ~(uint64_t)0
+                                           : (((uint64_t)1 << chunk) - 1)) << idx;
+
+        if (!line || !(line->valid_mask & chunk_mask)) {
+            memcpy(op, hp, chunk);
+        } else {
+            for (unsigned i = 0; i < chunk; i++) {
+                unsigned b = idx + i;
+                op[i] = (line->valid_mask & ((uint64_t)1 << b))
+                        ? line->bytes[b] : hp[i];
+            }
         }
+        guest_addr += chunk;
+        hp         += chunk;
+        op         += chunk;
+        size       -= chunk;
     }
 }
 

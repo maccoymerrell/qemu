@@ -978,29 +978,77 @@ static void bw_write_sleb128_u512(BitWriter *bw, U512 v)
     bw_raw(bw, buf, n);
 }
 
+/*
+ * Per-template prev-value store (the baseline each entry's deltas are
+ * computed against).  This used to be a dense [n_insns × 778] array of
+ * U512 cells — one cell for every (insn, family, slot) the wire could
+ * ever carry, 64 slots per family reserved unconditionally.  Real basic
+ * blocks touch a tiny fraction (mcf: ≤1 load + ≤1 store + ≤2 dst regs
+ * per insn), so >99% of that array was allocated, zeroed, page-faulted
+ * and never read.
+ *
+ * The store is now split into two planes and sized to the runtime
+ * high-water slot occupancy (max_slots), grown on demand:
+ *
+ *   - scalar plane (u64 cells): the 3 singletons (N_LOADS / N_STORES /
+ *     METAFLAGS) + 7 insn-metadata cells in a fixed [0..9] prefix, then
+ *     9 scalar slotted families × max_slots.
+ *   - wide plane (U512 cells): the 3 genuinely-wide families
+ *     (LOAD_DATA / STORE_DATA / DST_REG) × max_slots.
+ *
+ * The slot *space* on the wire is still CST_FID_SLOT_COUNT (64) — the
+ * cap on memops/dst-regs per insn — but a block only ever materialises
+ * cells up to the largest slot index it has actually observed.  This is
+ * a producer-internal representation; the wire format is unchanged, so
+ * the decoder's own state tracking is unaffected.
+ */
 enum {
     FIELD_STATE_SLOT_INVALID = 0xFFFFu,
-    /* Layout: 1 (N_LOADS) + 1 (N_STORES) + 1 (METAFLAGS) + 8
-     * (slotted families: LOAD_ADDR / STORE_ADDR / LOAD_DATA /
-     * STORE_DATA / DST_REG / LOAD_SIZE / STORE_SIZE / DST_REG_WIDTH) ×
-     * CST_FID_SLOT_COUNT + 4 (lane-mask families: SRC / DST /
-     * LOAD_DATA / STORE_DATA) × CST_FID_SLOT_COUNT + 7 (insn-metadata
-     * bytes_lo..size).  EXTENDED has no persistent state cell.  Keep
-     * the matching FIELD_STATE_SLOT_COUNT in tools/cst_decode.h in
-     * sync when this grows.                                           */
-    FIELD_STATE_SLOT_COUNT = 3 + (8 * CST_FID_SLOT_COUNT)
-                               + (4 * CST_FID_SLOT_COUNT) + 7,
-    /* Power-of-two so fid -> slot is a single load.  Largest FID
-     * ~778 at slot count 64 / stride-8 slotted, stride-4 lane block;
-     * 1024 has headroom. */
-    FIELD_STATE_LUT_SIZE   = 1024,
+    /* Scalar fixed prefix: N_LOADS, N_STORES, METAFLAGS, then the 7
+     * insn-metadata cells (BYTES_LO..SIZE).  N_SCALAR_SLOTTED scalar
+     * slotted families and N_WIDE_SLOTTED wide families follow. */
+    FIELD_STATE_SCALAR_FIXED = 10,
+    FIELD_STATE_N_SCALAR_FAM = 9,   /* load/store addr, load/store size,
+                                     * dst_reg_width, 4 lane masks */
+    FIELD_STATE_N_WIDE_FAM   = 3,   /* load_data, store_data, dst_reg */
+    /* Power-of-two so fid -> location is a single load.  Largest FID
+     * ~778 at slot count 64 / stride-8 slotted, stride-4 lane block. */
+    FIELD_STATE_LUT_SIZE     = 1024,
 };
 
+/* Per-insn cell counts for a block sized to @ms high-water slots. */
+static inline uint32_t fs_scalar_stride(uint32_t ms)
+{
+    return FIELD_STATE_SCALAR_FIXED + FIELD_STATE_N_SCALAR_FAM * ms;
+}
+static inline uint32_t fs_wide_stride(uint32_t ms)
+{
+    return FIELD_STATE_N_WIDE_FAM * ms;
+}
+
 typedef struct FieldStateBlock {
-    uint32_t n_insns;
-    U512 *values;
-    uint32_t *generations;
+    uint32_t  n_insns;
+    uint32_t  max_slots;       /* high-water slot occupancy (>=1 once live) */
+    uint64_t *scalar_values;   /* [n_insns * fs_scalar_stride(max_slots)] */
+    uint32_t *scalar_gen;
+    U512     *wide_values;     /* [n_insns * fs_wide_stride(max_slots)]   */
+    uint32_t *wide_gen;
 } FieldStateBlock;
+
+/*
+ * Resolved location of a field-id within the two-plane block.  Built
+ * once into g_fid_loc[].  cls picks the plane/kind; for fixed scalar
+ * fields `a` is the [0..9] prefix offset; for slotted families `a` is
+ * the family ordinal within its plane and `slot` the slot index.
+ */
+enum { FS_LOC_INVALID = 0, FS_LOC_SCALAR_FIXED = 1,
+       FS_LOC_SCALAR_SLOT = 2, FS_LOC_WIDE_SLOT = 3 };
+typedef struct FidLoc {
+    uint8_t cls;
+    uint8_t a;       /* fixed: prefix offset; slotted: family ordinal */
+    uint8_t slot;    /* slotted only */
+    uint8_t _pad;
+} FidLoc;
 
 /*
  * Per-(template_id) FieldStateBlock cache, vector indexed by
@@ -1015,57 +1063,56 @@ struct FieldStateTable {
 };
 
 /*
- * Field-id -> slot-index LUT, built once.  Replaces an eight-branch
+ * Field-id -> FidLoc LUT, built once.  Maps every wire field-id to its
+ * plane/family/slot in the two-plane block.  Replaces an eight-branch
  * chain that was 2.6% of runtime (~80M calls on a 5M-insn mcf trace).
+ *
+ * Scalar fixed prefix (offsets 0..9):
+ *   0 N_LOADS  1 N_STORES  2 METAFLAGS  3..9 INSN_BYTES_LO..INSN_SIZE
+ * Scalar slotted families (ordinals 0..8):
+ *   0 LOAD_ADDR  1 STORE_ADDR  2 LOAD_SIZE  3 STORE_SIZE  4 DST_REG_WIDTH
+ *   5 SRC_LANE  6 DST_LANE  7 LOAD_DATA_LANE  8 STORE_DATA_LANE
+ * Wide slotted families (ordinals 0..2):
+ *   0 LOAD_DATA  1 STORE_DATA  2 DST_REG
  */
-static uint16_t g_field_state_slot_lut[FIELD_STATE_LUT_SIZE];
-static bool     g_field_state_slot_lut_built = false;
+static FidLoc g_fid_loc[FIELD_STATE_LUT_SIZE];
+static bool   g_field_state_slot_lut_built = false;
 
-/* FIELD_STATE_SLOT_COUNT layout (matches the LUT below):
- *   slot 0:   N_LOADS
- *   slot 1:   N_STORES
- *   slot 2:   METAFLAGS
- *   slot 3:   LOAD_ADDR[0]      ... slot (3 + 8*k + 0): LOAD_ADDR[k]
- *   slot 4:   STORE_ADDR[0]     ... slot (3 + 8*k + 1): STORE_ADDR[k]
- *   slot 5:   LOAD_DATA[0]      ... slot (3 + 8*k + 2): LOAD_DATA[k]
- *   slot 6:   STORE_DATA[0]     ... slot (3 + 8*k + 3): STORE_DATA[k]
- *   slot 7:   DST_REG[0]        ... slot (3 + 8*k + 4): DST_REG[k]
- *   slot 8:   LOAD_SIZE[0]      ... slot (3 + 8*k + 5): LOAD_SIZE[k]
- *   slot 9:   STORE_SIZE[0]     ... slot (3 + 8*k + 6): STORE_SIZE[k]
- *   slot 10:  DST_REG_WIDTH[0]  ... slot (3 + 8*k + 7): DST_REG_WIDTH[k]
- *   slot (3 + 8*N) + 4*k:     SRC_LANE_MASK[k]   (k in 0..N-1)
- *   slot (3 + 8*N) + 4*k + 1: DST_LANE_MASK[k]
- *   slot (3 + 8*N) + 4*k + 2: LOAD_DATA_LANE_MASK[k]
- *   slot (3 + 8*N) + 4*k + 3: STORE_DATA_LANE_MASK[k]
- *   slot (3 + 8*N + 4*N): INSN_BYTES_LO ... INSN_SIZE
- *     (N = CST_FID_SLOT_COUNT)
- * Total = 3 + 8*N + 4*N + 7 = FIELD_STATE_SLOT_COUNT. */
 static void field_state_slot_lut_build(void)
 {
     for (unsigned i = 0; i < FIELD_STATE_LUT_SIZE; i++) {
-        g_field_state_slot_lut[i] = FIELD_STATE_SLOT_INVALID;
+        g_fid_loc[i] = FidLoc{ FS_LOC_INVALID, 0, 0, 0 };
     }
-    g_field_state_slot_lut[CST_FID_N_LOADS]   = 0;
-    g_field_state_slot_lut[CST_FID_N_STORES]  = 1;
-    g_field_state_slot_lut[CST_FID_METAFLAGS] = 2;
+    auto set_fixed = [](unsigned fid, uint8_t off) {
+        g_fid_loc[fid] = FidLoc{ FS_LOC_SCALAR_FIXED, off, 0, 0 };
+    };
+    set_fixed(CST_FID_N_LOADS,   0);
+    set_fixed(CST_FID_N_STORES,  1);
+    set_fixed(CST_FID_METAFLAGS, 2);
+    for (unsigned f = CST_FID_INSN_BYTES_LO; f <= CST_FID_INSN_SIZE; f++) {
+        set_fixed(f, (uint8_t)(3 + (f - CST_FID_INSN_BYTES_LO)));
+    }
 
-    static const uint8_t fam_base[8] = {
-        CST_FID_LOAD_ADDR_BASE,
-        CST_FID_STORE_ADDR_BASE,
-        CST_FID_LOAD_DATA_BASE,
-        CST_FID_STORE_DATA_BASE,
-        CST_FID_DST_REG_BASE,
-        CST_FID_LOAD_SIZE_BASE,
-        CST_FID_STORE_SIZE_BASE,
-        CST_FID_DST_REG_WIDTH_BASE,
+    /* The 8 stride-8 slotted families: cls + family ordinal within plane. */
+    struct FamMap { uint8_t base; uint8_t cls; uint8_t ord; };
+    static const FamMap fam_map[8] = {
+        { CST_FID_LOAD_ADDR_BASE,     FS_LOC_SCALAR_SLOT, 0 },
+        { CST_FID_STORE_ADDR_BASE,    FS_LOC_SCALAR_SLOT, 1 },
+        { CST_FID_LOAD_DATA_BASE,     FS_LOC_WIDE_SLOT,   0 },
+        { CST_FID_STORE_DATA_BASE,    FS_LOC_WIDE_SLOT,   1 },
+        { CST_FID_DST_REG_BASE,       FS_LOC_WIDE_SLOT,   2 },
+        { CST_FID_LOAD_SIZE_BASE,     FS_LOC_SCALAR_SLOT, 2 },
+        { CST_FID_STORE_SIZE_BASE,    FS_LOC_SCALAR_SLOT, 3 },
+        { CST_FID_DST_REG_WIDTH_BASE, FS_LOC_SCALAR_SLOT, 4 },
     };
     for (unsigned k = 0; k < CST_FID_SLOT_COUNT; k++) {
-        for (unsigned f = 0; f < G_N_ELEMENTS(fam_base); f++) {
-            unsigned fid = fam_base[f] + k * CST_FID_SLOT_STRIDE;
-            g_field_state_slot_lut[fid] = (uint16_t)(3 + 8 * k + f);
+        for (unsigned f = 0; f < G_N_ELEMENTS(fam_map); f++) {
+            unsigned fid = fam_map[f].base + k * CST_FID_SLOT_STRIDE;
+            g_fid_loc[fid] = FidLoc{ fam_map[f].cls, fam_map[f].ord,
+                                     (uint8_t)k, 0 };
         }
     }
-    unsigned lane_dense_base = 3 + 8 * CST_FID_SLOT_COUNT;
+    /* The 4 stride-CST_FID_LANE_BLOCK_STRIDE lane families: scalar, ords 5..8. */
     static const uint16_t lane_fam_base[4] = {
         CST_FID_SRC_LANE_MASK_BASE,
         CST_FID_DST_LANE_MASK_BASE,
@@ -1075,22 +1122,19 @@ static void field_state_slot_lut_build(void)
     for (unsigned k = 0; k < CST_FID_SLOT_COUNT; k++) {
         for (unsigned f = 0; f < G_N_ELEMENTS(lane_fam_base); f++) {
             unsigned fid = lane_fam_base[f] + k * CST_FID_LANE_BLOCK_STRIDE;
-            g_field_state_slot_lut[fid] =
-                (uint16_t)(lane_dense_base + 4 * k + f);
+            g_fid_loc[fid] = FidLoc{ FS_LOC_SCALAR_SLOT, (uint8_t)(5 + f),
+                                     (uint8_t)k, 0 };
         }
-    }
-    unsigned slotted_dense_end = lane_dense_base + 4 * CST_FID_SLOT_COUNT;
-    for (unsigned f = CST_FID_INSN_BYTES_LO; f <= CST_FID_INSN_SIZE; f++) {
-        g_field_state_slot_lut[f] =
-            (uint16_t)(slotted_dense_end + (f - CST_FID_INSN_BYTES_LO));
     }
     g_field_state_slot_lut_built = true;
 }
 
-static inline uint16_t field_state_slot_index(unsigned field_id)
+static inline FidLoc field_state_loc(unsigned field_id)
 {
-    if (field_id >= FIELD_STATE_LUT_SIZE) return FIELD_STATE_SLOT_INVALID;
-    return g_field_state_slot_lut[field_id];
+    if (field_id >= FIELD_STATE_LUT_SIZE) {
+        return FidLoc{ FS_LOC_INVALID, 0, 0, 0 };
+    }
+    return g_fid_loc[field_id];
 }
 
 static void field_state_block_free(void * data)
@@ -1099,8 +1143,10 @@ static void field_state_block_free(void * data)
     if (!block) {
         return;
     }
-    g_free(block->values);
-    g_free(block->generations);
+    g_free(block->scalar_values);
+    g_free(block->scalar_gen);
+    g_free(block->wide_values);
+    g_free(block->wide_gen);
     g_free(block);
 }
 
@@ -1143,53 +1189,129 @@ static FieldStateBlock *field_state_table_get_block(FieldStateTable *table,
 
     FieldStateBlock *block = g_new0(FieldStateBlock, 1);
     block->n_insns = tmpl->n_insns;
-    size_t n_slots = (size_t)block->n_insns * FIELD_STATE_SLOT_COUNT;
-    block->values = g_new0(U512, n_slots ? n_slots : 1);
-    block->generations = g_new0(uint32_t, n_slots ? n_slots : 1);
+    /* Start at one slot per family — covers the overwhelmingly common
+     * scalar BB (≤1 load/store/dst per insn) with no growth.  Variable
+     * memop / vector insns grow the block lazily (see ..._ensure_slots). */
+    block->max_slots = 1;
+    uint32_t n = block->n_insns;
+    size_t ss = (size_t)n * fs_scalar_stride(block->max_slots);
+    size_t ws = (size_t)n * fs_wide_stride(block->max_slots);
+    block->scalar_values = g_new0(uint64_t, ss ? ss : 1);
+    block->scalar_gen    = g_new0(uint32_t, ss ? ss : 1);
+    block->wide_values   = g_new0(U512,     ws ? ws : 1);
+    block->wide_gen      = g_new0(uint32_t, ws ? ws : 1);
     table->blocks[template_id] = block;
     return block;
 }
 
-static inline bool field_state_block_get(FieldStateBlock *block,
-                                         uint32_t table_generation,
-                                         uint32_t ins_pos,
-                                         uint16_t slot_index,
-                                         U512 *out)
+/*
+ * Grow a block's high-water slot occupancy to at least @need slots,
+ * preserving every already-observed cell (deltas are computed against
+ * these — losing one would desync the decoder).  Both planes are
+ * family-major with a per-slot stride, so growth re-lays-out into
+ * wider strides and copies each family's live [0, old_ms) cells across.
+ * Rare after warm-up; never called on a read-only base block.
+ */
+static void field_state_block_ensure_slots(FieldStateBlock *b, uint32_t need)
 {
-    if (!block || ins_pos >= block->n_insns ||
-        slot_index == FIELD_STATE_SLOT_INVALID) {
+    if (need <= b->max_slots) {
+        return;
+    }
+    uint32_t n = b->n_insns;
+    uint32_t old_ms = b->max_slots, new_ms = need;
+    uint32_t old_ss = fs_scalar_stride(old_ms), new_ss = fs_scalar_stride(new_ms);
+    uint32_t old_ws = fs_wide_stride(old_ms),   new_ws = fs_wide_stride(new_ms);
+
+    size_t nsv = (size_t)n * new_ss, nwv = (size_t)n * new_ws;
+    uint64_t *sv = g_new0(uint64_t, nsv ? nsv : 1);
+    uint32_t *sg = g_new0(uint32_t, nsv ? nsv : 1);
+    U512     *wv = g_new0(U512,     nwv ? nwv : 1);
+    uint32_t *wg = g_new0(uint32_t, nwv ? nwv : 1);
+
+    for (uint32_t i = 0; i < n; i++) {
+        /* scalar: fixed prefix is layout-stable; slotted families shift. */
+        memcpy(sv + (size_t)i * new_ss, b->scalar_values + (size_t)i * old_ss,
+               FIELD_STATE_SCALAR_FIXED * sizeof(uint64_t));
+        memcpy(sg + (size_t)i * new_ss, b->scalar_gen + (size_t)i * old_ss,
+               FIELD_STATE_SCALAR_FIXED * sizeof(uint32_t));
+        for (uint32_t f = 0; f < FIELD_STATE_N_SCALAR_FAM; f++) {
+            size_t o = (size_t)i * old_ss + FIELD_STATE_SCALAR_FIXED + (size_t)f * old_ms;
+            size_t nn = (size_t)i * new_ss + FIELD_STATE_SCALAR_FIXED + (size_t)f * new_ms;
+            memcpy(sv + nn, b->scalar_values + o, (size_t)old_ms * sizeof(uint64_t));
+            memcpy(sg + nn, b->scalar_gen + o,    (size_t)old_ms * sizeof(uint32_t));
+        }
+        for (uint32_t f = 0; f < FIELD_STATE_N_WIDE_FAM; f++) {
+            size_t o = (size_t)i * old_ws + (size_t)f * old_ms;
+            size_t nn = (size_t)i * new_ws + (size_t)f * new_ms;
+            memcpy(wv + nn, b->wide_values + o, (size_t)old_ms * sizeof(U512));
+            memcpy(wg + nn, b->wide_gen + o,    (size_t)old_ms * sizeof(uint32_t));
+        }
+    }
+    g_free(b->scalar_values); g_free(b->scalar_gen);
+    g_free(b->wide_values);   g_free(b->wide_gen);
+    b->scalar_values = sv; b->scalar_gen = sg;
+    b->wide_values = wv;   b->wide_gen = wg;
+    b->max_slots = new_ms;
+}
+
+/* Resolve a FidLoc to its flat cell index within @block's scalar plane.
+ * Returns false for the wide plane / invalid / a slot beyond this
+ * block's occupancy (an unobserved high slot — treat as a state miss). */
+static inline bool fs_scalar_index(const FieldStateBlock *block,
+                                   uint32_t ins_pos, FidLoc loc, size_t *idx)
+{
+    uint32_t off;
+    if (loc.cls == FS_LOC_SCALAR_FIXED) {
+        off = loc.a;
+    } else if (loc.cls == FS_LOC_SCALAR_SLOT) {
+        if (loc.slot >= block->max_slots) return false;
+        off = FIELD_STATE_SCALAR_FIXED + (uint32_t)loc.a * block->max_slots
+              + loc.slot;
+    } else {
         return false;
     }
-    size_t index = ((size_t)ins_pos * FIELD_STATE_SLOT_COUNT) + slot_index;
-    if (block->generations[index] != table_generation) {
-        return false;
-    }
-    *out = block->values[index];
+    *idx = (size_t)ins_pos * fs_scalar_stride(block->max_slots) + off;
     return true;
 }
 
-/*
- * Narrow accessors over FieldStateBlock storage: u64-fitting families
- * read/write only limb[0], skipping the wide get/put's 56-byte
- * zeroing.  Upper limbs are never inspected; a family is narrow or
- * wide for the whole trace, decided by FieldDescriptor::extract_u64
- * being non-null.
- */
-static inline bool field_state_block_get_u64(FieldStateBlock *block,
-                                             uint32_t table_generation,
-                                             uint32_t ins_pos,
-                                             uint16_t slot_index,
-                                             uint64_t *out)
+static inline bool fs_wide_index(const FieldStateBlock *block,
+                                 uint32_t ins_pos, FidLoc loc, size_t *idx)
 {
+    if (loc.cls != FS_LOC_WIDE_SLOT || loc.slot >= block->max_slots) {
+        return false;
+    }
+    *idx = (size_t)ins_pos * fs_wide_stride(block->max_slots)
+           + (size_t)loc.a * block->max_slots + loc.slot;
+    return true;
+}
+
+static inline bool field_state_get_scalar(FieldStateBlock *block,
+                                           uint32_t table_generation,
+                                           uint32_t ins_pos, FidLoc loc,
+                                           uint64_t *out)
+{
+    size_t index;
     if (!block || ins_pos >= block->n_insns ||
-        slot_index == FIELD_STATE_SLOT_INVALID) {
+        !fs_scalar_index(block, ins_pos, loc, &index) ||
+        block->scalar_gen[index] != table_generation) {
         return false;
     }
-    size_t index = ((size_t)ins_pos * FIELD_STATE_SLOT_COUNT) + slot_index;
-    if (block->generations[index] != table_generation) {
+    *out = block->scalar_values[index];
+    return true;
+}
+
+static inline bool field_state_get_wide(FieldStateBlock *block,
+                                         uint32_t table_generation,
+                                         uint32_t ins_pos, FidLoc loc,
+                                         U512 *out)
+{
+    size_t index;
+    if (!block || ins_pos >= block->n_insns ||
+        !fs_wide_index(block, ins_pos, loc, &index) ||
+        block->wide_gen[index] != table_generation) {
         return false;
     }
-    *out = block->values[index].limb[0];
+    *out = block->wide_values[index];
     return true;
 }
 
@@ -2271,6 +2393,9 @@ static void entry_view_scratch_free(EntryViewScratch *scratch)
 
 /* Look up baseline value for (template_id, ins_pos, field_id).  Falls
  * back to the descriptor's template_default if no prior observation. */
+/* Look up baseline value for (ins_pos, field_id) in the wide plane.
+ * Falls back to the WP base overlay, then the descriptor's template
+ * default.  Wide families only (LOAD_DATA / STORE_DATA / DST_REG). */
 static U512 field_state_get(FieldStateBlock *state_block,
                             uint32_t state_generation,
                             FieldStateBlock *base_block,
@@ -2282,14 +2407,13 @@ static U512 field_state_get(FieldStateBlock *state_block,
                             uint8_t slot)
 {
     U512 cur;
-    uint16_t slot_index = field_state_slot_index(field_id);
-    if (field_state_block_get(state_block, state_generation, ins_pos,
-                              slot_index, &cur)) {
+    FidLoc loc = field_state_loc(field_id);
+    if (field_state_get_wide(state_block, state_generation, ins_pos,
+                             loc, &cur)) {
         return cur;
     }
-
-    if (field_state_block_get(base_block, base_generation, ins_pos,
-                              slot_index, &cur)) {
+    if (field_state_get_wide(base_block, base_generation, ins_pos,
+                             loc, &cur)) {
         return cur;
     }
     return fd->template_default(tmpl, ins_pos, slot);
@@ -2301,14 +2425,14 @@ static void field_state_put(FieldStateBlock *state_block,
                             uint16_t field_id,
                             U512 v)
 {
-    uint16_t slot_index = field_state_slot_index(field_id);
+    size_t index;
+    FidLoc loc = field_state_loc(field_id);
     if (!state_block || ins_pos >= state_block->n_insns ||
-        slot_index == FIELD_STATE_SLOT_INVALID) {
+        !fs_wide_index(state_block, ins_pos, loc, &index)) {
         return;
     }
-    size_t index = ((size_t)ins_pos * FIELD_STATE_SLOT_COUNT) + slot_index;
-    state_block->values[index] = v;
-    state_block->generations[index] = state_generation;
+    state_block->wide_values[index] = v;
+    state_block->wide_gen[index] = state_generation;
 }
 
 typedef struct StageRec {
@@ -2376,12 +2500,12 @@ stage_u64_delta(StageRec **stage_p, unsigned int *stage_len,
                 uint32_t i, uint16_t fid,
                 uint64_t cur, uint64_t deflt)
 {
-    uint16_t slot_index = field_state_slot_index(fid);
+    FidLoc loc = field_state_loc(fid);
     uint64_t base;
-    if (!field_state_block_get_u64(state_block, state_generation,
-                                   i, slot_index, &base) &&
-        !field_state_block_get_u64(base_block, base_generation,
-                                   i, slot_index, &base)) {
+    if (!field_state_get_scalar(state_block, state_generation,
+                                i, loc, &base) &&
+        !field_state_get_scalar(base_block, base_generation,
+                                i, loc, &base)) {
         base = deflt;
     }
     if (cur == base) return;
@@ -2389,11 +2513,11 @@ stage_u64_delta(StageRec **stage_p, unsigned int *stage_len,
     rec->pos = i;
     rec->fid = fid;
     rec->delta = u512_from_u64_diff(cur, base);
+    size_t idx;
     if (state_block && i < state_block->n_insns &&
-        slot_index != FIELD_STATE_SLOT_INVALID) {
-        size_t idx = ((size_t)i * FIELD_STATE_SLOT_COUNT) + slot_index;
-        state_block->values[idx].limb[0] = cur;
-        state_block->generations[idx] = state_generation;
+        fs_scalar_index(state_block, i, loc, &idx)) {
+        state_block->scalar_values[idx] = cur;
+        state_block->scalar_gen[idx] = state_generation;
     }
 }
 
@@ -2503,6 +2627,32 @@ static void emit_field_delta_section(BitWriter *main_bw,
         const DynParam *const *store_slots = ev->store_slots;
         const uint32_t *insn_rs_off        = ev->insn_rs_off;
         const auto *reg_snaps              = ev->reg_snaps;
+
+        /* Grow the writable block to this entry's high-water slot count
+         * once, up front, so per-field staging never relayouts mid-loop.
+         * Bounded by CST_FID_SLOT_COUNT.  base_block is read-only and is
+         * never grown — an unobserved high slot there misses to default. */
+        {
+            uint32_t needed = 1;
+            for (uint32_t i = 0; i < ev->tmpl->n_insns; i++) {
+                const InsnFields *f = &ev->tmpl->insn_fields[i];
+                uint32_t m = ev->actual_n_loads ? cap_min(ev->actual_n_loads[i]) : 0;
+                uint32_t s = ev->actual_n_stores ? cap_min(ev->actual_n_stores[i]) : 0;
+                if (s > m) m = s;
+                if (want_regdata && f->n_dst_regs > m) m = f->n_dst_regs;
+                if (f->has_vec_lanes) {
+                    if (f->n_src_regs > m)     m = f->n_src_regs;
+                    if (f->n_dst_regs > m)     m = f->n_dst_regs;
+                    if (f->max_dep_loads > m)  m = f->max_dep_loads;
+                    if (f->max_dep_stores > m) m = f->max_dep_stores;
+                }
+                if (m > needed) needed = m;
+            }
+            if (needed > CST_FID_SLOT_COUNT) needed = CST_FID_SLOT_COUNT;
+            if (needed > state_block->max_slots) {
+                field_state_block_ensure_slots(state_block, needed);
+            }
+        }
 
         for (uint32_t i = 0; i < ev->tmpl->n_insns; i++) {
             const InsnFields *f = &ev->tmpl->insn_fields[i];

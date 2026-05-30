@@ -226,6 +226,25 @@ static void bw_write_section(BitWriter *main_bw, GByteArray *data)
     g_byte_array_unref(data);
 }
 
+/*
+ * RawBuf variant of the above: bind @sub to a reused scratch buffer
+ * (cleared, no allocation), let the caller fill it, then emit it as a
+ * length-prefixed sub-section.  No ownership transfer / free — the
+ * scratch persists for the next record.  Pair bw_section_begin_rb with
+ * bw_section_end_rb around the section body.
+ */
+static inline void bw_section_begin_rb(BitWriter *sub, RawBuf *scratch)
+{
+    raw_buf_clear(scratch);
+    bw_init_rb(sub, scratch);
+}
+
+static inline void bw_section_end_rb(BitWriter *main_bw, RawBuf *scratch)
+{
+    bw_write_uleb128(main_bw, scratch->len);
+    bw_raw(main_bw, scratch->data, scratch->len);
+}
+
 typedef struct EncodingMapEntry {
     uint64_t value;
     const char *name;
@@ -509,6 +528,13 @@ struct BodyStreamState {
      * reused StageRec[] the descriptor walk fills; raw pointer because
      * StageRec is defined further down this TU. */
     RawBuf rec_scratch;
+    /* Reused scratch for the per-record WP chain / events sub-sections
+     * (emit_body_record_payload).  Distinct from rec_scratch, which the
+     * inner per-BB delta emit uses while this one accumulates the
+     * enclosing section — both are live at once during WP-chain build.
+     * Replaces a per-record g_byte_array_new/unref (~5.5% of cache
+     * misses on a wp+memdata+regdata profile). */
+    RawBuf sub_scratch;
     struct StageRec *stage_buf;
     size_t stage_cap;
     uint64_t num_entries;
@@ -2809,6 +2835,8 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
     /* Pre-allocate the per-entry scratch; growth on demand. */
     raw_buf_init(&st->rec_scratch);
     raw_buf_reserve(&st->rec_scratch, 256);
+    raw_buf_init(&st->sub_scratch);
+    raw_buf_reserve(&st->sub_scratch, 256);
     st->stage_cap = 64;
     st->stage_buf = (StageRec *)g_malloc(sizeof(StageRec) * st->stage_cap);
 
@@ -2900,7 +2928,7 @@ static void emit_body_record_payload(
     /* WP chain sub-section */
     {
         BitWriter sub;
-        bw_init_buf(&sub);
+        bw_section_begin_rb(&sub, &st->sub_scratch);
         bw_write_uleb128(&sub, num_wp);
         int64_t prev_wp_template = 0;
         for (uint32_t w = 0; w < num_wp; w++) {
@@ -2914,7 +2942,7 @@ static void emit_body_record_payload(
                                         true, entry->cpu_index);
         }
         bw_byte_align(&sub);
-        bw_write_section(bw, bw_finish_buf(&sub));
+        bw_section_end_rb(bw, &st->sub_scratch);
     }
 
     /* WP events sub-section */
@@ -2928,7 +2956,7 @@ static void emit_body_record_payload(
         }
 
         BitWriter sub;
-        bw_init_buf(&sub);
+        bw_section_begin_rb(&sub, &st->sub_scratch);
         bw_write_uleb128(&sub, num_events);
 
         int64_t prev_event_idx = -1;
@@ -2956,7 +2984,7 @@ static void emit_body_record_payload(
         g_stats.bin_wp_exception_bits += (bw_tell_bytes(&sub) - ev_start) * 8;
 
         bw_byte_align(&sub);
-        bw_write_section(bw, bw_finish_buf(&sub));
+        bw_section_end_rb(bw, &st->sub_scratch);
     }
 }
 
@@ -3474,6 +3502,7 @@ void body_stream_finish(BodyStreamState *st, GByteArray **header_bytes)
     }
     entry_view_scratch_free(&st->ev_scratch);
     raw_buf_free(&st->rec_scratch);
+    raw_buf_free(&st->sub_scratch);
     g_free(st->stage_buf);
     st->stage_buf = nullptr;
 }

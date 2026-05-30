@@ -7,7 +7,7 @@
 #include "champsim_tracer_bb_chain_assembler.h"
 #include "champsim_tracer_bb_template_cache.h"
 
-thread_local BBChainAssembler g_cp_chain;
+thread_local BBChainAssembler g_cp_chain CST_TLS_HOT;
 std::atomic<uint32_t> g_segment_generation{1};
 
 void BBChainAssembler::append_fragment(uint64_t entry_pc,

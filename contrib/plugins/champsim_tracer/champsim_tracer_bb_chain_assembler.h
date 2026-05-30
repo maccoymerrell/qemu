@@ -86,7 +86,7 @@ private:
 
 /* Per-vCPU CP chain; a basic block doesn't span thread switches so
  * cross-vCPU fragment mixing would be incorrect anyway. */
-extern thread_local BBChainAssembler g_cp_chain;
+extern thread_local BBChainAssembler g_cp_chain CST_TLS_HOT;
 
 /* Bumped by reset_segment_local_state() on segment switch.  Per-vCPU
  * chains compare against this on append_fragment() and self-reset

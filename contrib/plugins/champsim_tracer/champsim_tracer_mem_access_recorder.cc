@@ -15,8 +15,8 @@ MemAccessRecorder g_mem_recorder;
 
 namespace {
 
-thread_local std::vector<WPMemAccess> tls_cp_mem_accesses;
-thread_local GByteArray              *tls_mem_read_buf = nullptr;
+thread_local std::vector<WPMemAccess> tls_cp_mem_accesses CST_TLS_HOT;
+thread_local GByteArray              *tls_mem_read_buf CST_TLS_HOT = nullptr;
 
 GByteArray *read_scratch()
 {

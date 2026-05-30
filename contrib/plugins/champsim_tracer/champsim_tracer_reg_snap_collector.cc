@@ -31,10 +31,10 @@ typedef struct {
 } WideRegEntry;
 
 /* Per-thread scratch backing for the wide snap and the read buffer. */
-thread_local GByteArray *tls_read_buf = nullptr;
-thread_local WideRegEntry *tls_wide_entries = nullptr;
-thread_local unsigned tls_wide_n = 0;
-thread_local unsigned tls_wide_cap = 0;
+thread_local GByteArray *tls_read_buf CST_TLS_HOT = nullptr;
+thread_local WideRegEntry *tls_wide_entries CST_TLS_HOT = nullptr;
+thread_local unsigned tls_wide_n CST_TLS_HOT = 0;
+thread_local unsigned tls_wide_cap CST_TLS_HOT = 0;
 
 GByteArray *read_scratch()
 {
@@ -87,7 +87,7 @@ struct _WideRegSnap {
     char unused;
 };
 
-static thread_local _WideRegSnap tls_wide_handle;
+static thread_local _WideRegSnap tls_wide_handle CST_TLS_HOT;
 
 void RegSnapCollector::read_into_snap(unsigned int cpu_index,
                                       const QemuRegKey *qemu_reg,

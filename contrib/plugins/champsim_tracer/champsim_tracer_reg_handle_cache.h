@@ -57,8 +57,8 @@ private:
     GMutex                                  lock_;
 
     /* Hot-path TLS shortcut for the most-recent (cpu_index, cache) pair. */
-    static thread_local VCPUCache    *tls_cache_;
-    static thread_local unsigned int  tls_cache_cpu_index_;
+    static thread_local VCPUCache    *tls_cache_ CST_TLS_HOT;
+    static thread_local unsigned int  tls_cache_cpu_index_ CST_TLS_HOT;
 
     /* Hot-path TLS direct-mapped cache, keyed by const QemuRegKey *
      * pointer identity (one instance per BBTemplate InsnRegNames, so
@@ -71,8 +71,17 @@ private:
         const QemuRegKey            *key;
         struct qemu_plugin_register *handle;
     };
-    static thread_local TlsPtrEntry  tls_ptr_cache_[TLS_PTR_CACHE_SIZE];
-    static thread_local unsigned int tls_ptr_cache_cpu_index_;
+    /* The cache table (~4 KiB) lives on the heap, reached through a
+     * thread_local pointer, rather than as an inline thread_local
+     * array.  A single IE-model thread_local forces the loader to
+     * place this module's ENTIRE TLS segment into the finite static-TLS
+     * surplus; keeping a 4 KiB array there would overflow it and break
+     * dlopen.  The pointer + cpu-index guard are tiny, so they stay in
+     * TLS (and IE); the table they point at does not.  The block is
+     * allocated lazily on first lookup per thread and intentionally
+     * leaked at thread exit (vCPU threads live for the whole run). */
+    static thread_local TlsPtrEntry *tls_ptr_cache_ CST_TLS_HOT;
+    static thread_local unsigned int tls_ptr_cache_cpu_index_ CST_TLS_HOT;
 
     VCPUCache *get_or_create(unsigned int cpu_index);
     static void populate_cache(VCPUCache &cache);

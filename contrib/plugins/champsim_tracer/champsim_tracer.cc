@@ -115,7 +115,7 @@ bool cst_pc_is_poisoned(uint64_t pc)
  * folds this snapshot at the next exec — an exact-shape pointer that
  * cannot collide with a sibling translation (CP vs WP) of the same
  * start_pc, and that needs no start_pc lookup. */
-thread_local BBTemplate *g_cp_prev_tb_template = nullptr;
+thread_local BBTemplate *g_cp_prev_tb_template CST_TLS_HOT = nullptr;
 
 /* Window-stop is reached optimistically at TB-start (icount_prev >=
  * window_stop), but the in-flight chain may still hold fragments
@@ -167,7 +167,7 @@ std::atomic<uint64_t> g_next_threshold{UINT64_MAX};
  * print the final icount, that slot reads back as freed memory.  This
  * thread_local mirror is bumped at the same point as the scoreboard
  * slot inside vcpu_tb_exec; it stays valid through plugin_exit. */
-thread_local uint64_t g_host_icount = 0;
+thread_local uint64_t g_host_icount CST_TLS_HOT = 0;
 
 /* Total sub-entries emitted by REP fan-out (sum of (n_iter - 1)
  * across every emit_body_entry call that fanned out).  Each
@@ -370,12 +370,12 @@ static GMutex exec_lock;
  * BodyEntry.reg_snaps at finalize, discarded on flush.  Active only
  * when enable_reg_data.
  */
-static thread_local std::vector<RegSnap> pending_reg_snaps;
+static thread_local std::vector<RegSnap> pending_reg_snaps CST_TLS_HOT;
 
 /* WP-side counterpart to pending_reg_snaps.  See the docstring on the
  * extern declaration in champsim_tracer.h for the contract.  Non-static
  * so champsim_tracer_wp.cc can drain it after each WP exec_tb. */
-thread_local std::vector<RegSnap> wp_pending_reg_snaps;
+thread_local std::vector<RegSnap> wp_pending_reg_snaps CST_TLS_HOT;
 
 /* ========================= Reg-data snapshot capture =========================
  *

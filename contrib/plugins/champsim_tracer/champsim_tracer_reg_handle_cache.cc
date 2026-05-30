@@ -8,13 +8,15 @@
 
 RegHandleCache g_reg_handle_cache;
 
-thread_local RegHandleCache::VCPUCache *RegHandleCache::tls_cache_ = nullptr;
-thread_local unsigned int RegHandleCache::tls_cache_cpu_index_ = (unsigned int)-1;
+thread_local RegHandleCache::VCPUCache *RegHandleCache::tls_cache_
+    CST_TLS_HOT = nullptr;
+thread_local unsigned int RegHandleCache::tls_cache_cpu_index_
+    CST_TLS_HOT = (unsigned int)-1;
 
-thread_local RegHandleCache::TlsPtrEntry
-    RegHandleCache::tls_ptr_cache_[RegHandleCache::TLS_PTR_CACHE_SIZE] = {};
-thread_local unsigned int
-    RegHandleCache::tls_ptr_cache_cpu_index_ = (unsigned int)-1;
+thread_local RegHandleCache::TlsPtrEntry *RegHandleCache::tls_ptr_cache_
+    CST_TLS_HOT = nullptr;
+thread_local unsigned int RegHandleCache::tls_ptr_cache_cpu_index_
+    CST_TLS_HOT = (unsigned int)-1;
 
 namespace {
 
@@ -137,16 +139,23 @@ struct qemu_plugin_register *RegHandleCache::lookup(unsigned int cpu_index,
         return nullptr;
     }
 
-    /* Direct-mapped TLS cache by key-pointer identity: the same
-     * QemuRegKey instance recurs per template run, so hot loops hit
-     * after warm-up.  Invalidated on cpu_index change. */
-    if (tls_ptr_cache_cpu_index_ != cpu_index) {
-        memset(tls_ptr_cache_, 0, sizeof(tls_ptr_cache_));
+    /* Direct-mapped cache by key-pointer identity: the same QemuRegKey
+     * instance recurs per template run, so hot loops hit after warm-up.
+     * The table is a heap block reached through a thread_local pointer
+     * (see header); allocate it on first use, invalidate on cpu_index
+     * change. */
+    TlsPtrEntry *ptab = tls_ptr_cache_;
+    if (!ptab) {
+        ptab = new TlsPtrEntry[TLS_PTR_CACHE_SIZE]();
+        tls_ptr_cache_ = ptab;
+        tls_ptr_cache_cpu_index_ = cpu_index;
+    } else if (tls_ptr_cache_cpu_index_ != cpu_index) {
+        memset(ptab, 0, sizeof(TlsPtrEntry) * TLS_PTR_CACHE_SIZE);
         tls_ptr_cache_cpu_index_ = cpu_index;
     }
     unsigned int slot = (unsigned int)(((uintptr_t)key) >> 4)
                         & (TLS_PTR_CACHE_SIZE - 1);
-    TlsPtrEntry *e = &tls_ptr_cache_[slot];
+    TlsPtrEntry *e = &ptab[slot];
     if (e->key == key) {
         return e->handle;
     }

@@ -56,6 +56,6 @@ struct WPThreadState {
     BBTemplate *last_executed_tb = nullptr;
 };
 
-extern thread_local WPThreadState g_wp_state;
+extern thread_local WPThreadState g_wp_state CST_TLS_HOT;
 
 #endif /* CHAMPSIM_TRACER_WP_THREAD_STATE_H */

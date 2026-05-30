@@ -6,4 +6,4 @@
 
 #include "champsim_tracer_wp_thread_state.h"
 
-thread_local WPThreadState g_wp_state;
+thread_local WPThreadState g_wp_state CST_TLS_HOT;

@@ -31,6 +31,23 @@ extern "C" {
 
 #include "champsim_tracer_mnemonics.h"
 
+/*
+ * The plugin is dlopen'd, so by default every thread_local resolves
+ * through the general-dynamic TLS model (a __tls_get_addr call per
+ * access — ~4-5% of plugin time in a wp+memdata+regdata profile,
+ * concentrated in the per-memop / per-insn callbacks and the emit
+ * path).  initial-exec collapses each access to a single %fs-relative
+ * load with no call, but consumes the loader's finite static-TLS
+ * surplus, so it must be applied selectively: only to the small,
+ * hot thread_locals on the CP/WP critical path.  The large caches
+ * (e.g. RegHandleCache::tls_ptr_cache_, ~4 KiB) deliberately stay on
+ * general-dynamic to keep the IE footprint within surplus.
+ *
+ * Apply to BOTH the definition and any extern declaration of the same
+ * variable — a model mismatch is an ODR/codegen hazard.
+ */
+#define CST_TLS_HOT __attribute__((tls_model("initial-exec")))
+
 /* ===== Constants ===== */
 #define MAX_INSN_BYTES 16
 /* MAX_SRC_REGS / MAX_DST_REGS now live in champsim_tracer_mnemonics.h
@@ -353,7 +370,7 @@ typedef struct {
  * the WP walk falls back to a live post-fragment read for that
  * one insn.
  */
-extern thread_local std::vector<RegSnap> wp_pending_reg_snaps;
+extern thread_local std::vector<RegSnap> wp_pending_reg_snaps CST_TLS_HOT;
 
 /*
  * Architectural-register snapshot at segment start.  Captured once per

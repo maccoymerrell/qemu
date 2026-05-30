@@ -291,6 +291,25 @@ static inline void cst_wide_from_le_bytes(CSTWideValue *out,
     memcpy(out->limb, bytes, len);
 }
 
+/* In-place target-endian -> little-endian normalisation for a buffer
+ * returned by qemu_plugin_read_register().  No-op on LE targets (and
+ * for length-1 buffers); on BE targets the buffer is byte-reversed so
+ * downstream encoders can treat the bytes as little-endian.  Forward
+ * declaration of the global so this header-only helper compiles before
+ * the canonical extern in the plugin-wide globals block below. */
+extern bool target_big_endian;
+static inline void cst_normalize_reg_bytes_to_le(uint8_t *bytes, size_t len)
+{
+    if (!target_big_endian || !bytes || len < 2) {
+        return;
+    }
+    for (size_t i = 0, j = len - 1; i < j; i++, j--) {
+        uint8_t t = bytes[i];
+        bytes[i] = bytes[j];
+        bytes[j] = t;
+    }
+}
+
 /*
  * Per-register snapshot, captured immediately before the issuing
  * instruction executes.  Registers the plugin could not resolve to a
@@ -725,6 +744,21 @@ typedef struct {
      * tracks unique-PC visits, keeping icount aligned with PIN-style
      * one-count-per-architectural-insn accounting. */
     uint64_t last_counted_start_pc;
+    /* Mirror of g_trace_segments.is_active() as a per-vCPU scoreboard
+     * slot (1 in-segment, 0 inter-segment).  Backs the cond_cb gate
+     * on the per-insn heavy callbacks (reg_snap_cb, synth_ea_cb): a
+     * GE-1 condition emitted into the TCG-compiled TB skips the
+     * callback at the JIT level when inactive, avoiding the
+     * function-call / TLS-cache overhead the callback's C-level
+     * early-bail still pays. */
+    uint64_t is_active;
+    /* Signed budget tracking insns until the next window event
+     * (segment open in inter-segment, or sentinel "far future" while
+     * in-segment).  Bumped by INLINE_ADD_U64(-n_insns) per TB exec
+     * so the JIT counts down without a C call; a cond_cb on
+     * budget < 1 fires the heavy threshold-handler once when the
+     * countdown crosses zero. */
+    int64_t budget;
 } VCPUScoreBoard;
 
 enum { BRANCH_TARGET_HISTORY = 16 };
@@ -825,6 +859,13 @@ extern TraceISA trace_isa;
 extern int cst_cap_arch;
 extern unsigned int cst_cap_mode;
 extern const char *target_name;
+/* True when the guest target is big-endian (currently only MIPS BE, when
+ * trace_isa==TRACE_ISA_MIPS and target_name does not end in "el").  Set
+ * once during qemu_plugin_install.  qemu_plugin_read_register() returns
+ * bytes in target byte order; the reg-snap path normalises those bytes
+ * to little-endian before they reach the trace, so the on-disk format
+ * is unconditionally LE regardless of guest endianness. */
+extern bool target_big_endian;
 extern const InsnClassification *active_insn_table;
 extern unsigned active_insn_table_size;
 extern const RegClassification *active_reg_table;
@@ -952,6 +993,13 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry);
  * destination (the WriterCtx passed to body_stream_new) is closed
  * by the segment manager separately after this returns. */
 void body_stream_finish(BodyStreamState *st, GByteArray **header_bytes);
+/* Stash the in-trace architectural CP-insn count at which warmup
+ * ends and the simulation phase begins, so finish writes it into
+ * the header (§2.13 in champsim_tracer_format.md).  Call before
+ * body_stream_finish.  0 = no warmup configured / warmup never
+ * elapsed (the entire trace is warmup). */
+void body_stream_set_warmup_end_arch_insns(BodyStreamState *st,
+                                           uint64_t value);
 /* Free a BodyStreamState.  Required (not free()): it carries
  * std::vector members needing destructors, and the opaque forward
  * decl here doesn't let callers `delete` directly. */

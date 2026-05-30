@@ -104,6 +104,7 @@ void RegSnapCollector::read_into_snap(unsigned int cpu_index,
     if (n <= 0) {
         return;
     }
+    cst_normalize_reg_bytes_to_le(buf->data, (size_t)n);
     cst_wide_from_le_bytes(&out->value, buf->data, (size_t)n);
 }
 

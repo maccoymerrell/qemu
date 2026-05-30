@@ -1349,6 +1349,12 @@ void emit_disasm_file_header(FILE *out, const cst::Header &h,
                  (unsigned long long)h.start_insn,
                  (unsigned long long)h.warmup_insns,
                  (unsigned long long)h.total_target_insns);
+    if (h.warmup_end_arch_insns == UINT64_MAX) {
+        std::fprintf(out, "; warmup_end_arch_insns=uncrossed\n");
+    } else {
+        std::fprintf(out, "; warmup_end_arch_insns=%llu\n",
+                     (unsigned long long)h.warmup_end_arch_insns);
+    }
     std::fprintf(out, "; simpoint_weight=%.17g\n", h.weight);
     std::fprintf(out, "; templates=%zu\n\n", n_templates);
 }
@@ -1726,6 +1732,12 @@ void emit_legacy_meta(FILE *out, const cst::Header &h)
     std::fprintf(out, "TOTAL_TARGET_INSNS %llu%s\n",
                  (unsigned long long)h.total_target_insns,
                  h.total_target_insns == 0 ? " (unbounded)" : "");
+    if (h.warmup_end_arch_insns == UINT64_MAX) {
+        std::fprintf(out, "WARMUP_END_ARCH_INSNS uncrossed\n");
+    } else {
+        std::fprintf(out, "WARMUP_END_ARCH_INSNS %llu\n",
+                     (unsigned long long)h.warmup_end_arch_insns);
+    }
     std::fprintf(out, "SIMPOINT_WEIGHT %.17g\n", h.weight);
     std::fprintf(out, "\n");
 }

@@ -227,7 +227,30 @@ sanity check.
 2.10 comment      : string
 2.11 target_name  : string
 2.12 encoding_maps_section : section    ; see Step 3 for inner shape
-2.13 templates section := raw payload to end-of-member (no outer
+2.13 warmup_end_arch_insns : ULEB
+     Architectural CP-insn count, measured against the body's
+     own BB-template `n_insns` values, at which the segment
+     transitions from warmup to simulation phase.  A consumer
+     walking BODY_TAG_ENTRY records and summing the referenced
+     template's `n_insns` enters the simulation phase the moment
+     that sum reaches this value.
+
+     Why a separate field, not just `warmup_insns`: the segment
+     boundaries (start, warmup, stop) are configured in
+     BBV-equivalent TB-execution count, matching the BBV plugin
+     and SimPoint clustering.  The body, by contrast, fans REP
+     out into one record per architectural iteration, so the
+     in-trace arch-insn count diverges from BBV count whenever
+     REP MOVSB/STOSB/etc. fires in warmup.  Counting
+     `warmup_insns` of body entries would put the consumer
+     somewhere in the *middle* of warmup on REP-heavy phases.
+
+     Sentinel ULEB-encoded `UINT64_MAX` = the warmup boundary
+     was not crossed in this segment (the trace was cut short,
+     e.g. by guest exit, before warmup elapsed; the whole
+     trace is warmup).  0 = warmup ends immediately (no
+     warmup configured, e.g. non-simpoint icount mode).
+2.14 templates section := raw payload to end-of-member (no outer
      length-prefix; the templates section runs to the header
      member's EOF).  Decode per Step 4.
 ```
@@ -537,8 +560,11 @@ Loop until a `BODY_TAG_END` is seen:
          gen_id : u8
          width  : u8
          bytes[width] : raw
-       Emit a per-thread initial-regfile snapshot for `thread_id`
-       (the bytes are in target-endian order).
+       Emit a per-thread initial-regfile snapshot for `thread_id`.
+       Each `bytes[width]` payload is little-endian (the producer
+       normalises from target byte order before write), so decoders
+       interpret it as a little-endian unsigned scalar of `width`
+       bytes regardless of guest endianness.
 6.4  ENTRY record:
        template_id_delta : SLEB
        cur_template_id = prev_entry_template_id + template_id_delta
@@ -570,6 +596,8 @@ Loop until a `BODY_TAG_END` is seen:
        since the start of the body stream.  Exit the loop.
 6.7  CP field-delta section payload:
        n_records : ULEB
+       ipos : u32 = 0                  ; reset at section start; not
+                                       ; carried across sections
        repeat n_records times: one field-delta record per Step 6.10.
      After all records are consumed the section payload must be
      empty.
@@ -1066,7 +1094,7 @@ metaflags reconstruct absolute values. It is not counted in
 |   gen_id       u8     GenericRegId; resolve via   |
 |                       the `reg` map               |
 |   width        u8     snapshot byte count          |
-|   bytes[width]        raw, target-endian order     |
+|   bytes[width]        raw, little-endian order     |
 +--------------------------------------------------+
 ```
 
@@ -1091,6 +1119,15 @@ delta_section payload:
                              ext_payload:ULEB only when fid resolves
                              to CST_FID_EXTENDED
 ```
+
+The running `ipos` cursor is **section-local**: decoders initialise
+`ipos = 0` at the start of every delta section (one per CP block, one
+per each WP chain entry, one per IFRAME) and add `ipos_delta` from each
+record. It is **not** carried across sections — there is no rolling
+per-BB or per-template ipos. The persistent state that *does* carry
+across sections is the per-template field-state cell keyed by
+`(template_id, ipos, field_id)` (see below); the wire-level `ipos`
+cursor is just the in-section pointer used to address those cells.
 
 Records are emitted in non-descending `(ipos, fid)` order. When two
 records describe the same instruction, the later record has

@@ -48,6 +48,7 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -106,9 +107,19 @@ enum class Metric {
 enum class CachePolicy { LRU, MRU, Random };
 
 struct Options {
-    const char *input        = nullptr;
+    /* One or more input traces.  A single trace renders as before; two
+     * or more (or an explicit --aggregate) trigger aggregate mode, which
+     * combines traces of one program into a single representative SVG. */
+    std::vector<const char *> inputs;
     const char *output       = nullptr;   /* nullptr -> stdout */
     Metric      metric       = Metric::BranchMpki;
+    /* Aggregate mode controls.  @aggregate forces it even for one input.
+     * @weights overrides the per-trace header simpoint_weight (CLI order);
+     * empty -> use header weights, all-zero -> even split.  @agg_name is
+     * the program label used in aggregate titles. */
+    bool        aggregate    = false;
+    std::vector<double> weights;
+    const char *agg_name     = nullptr;
     /* History lengths used by the gshare predictor variants.  Multiple
      * values produce overlaid lines on the same chart.  Ignored for
      * non-gshare metrics.  history=0 collapses gshare to a pure
@@ -174,7 +185,13 @@ struct Options {
 [[noreturn]] static void usage(int rc)
 {
     std::fprintf(rc == 0 ? stdout : stderr,
-"Usage: cst_visualize -m METRIC [options] TRACE.cst\n"
+"Usage: cst_visualize -m METRIC [options] TRACE.cst [TRACE2.cst ...]\n"
+"\n"
+"Passing more than one trace (or --aggregate) combines simpoint traces of\n"
+"one program into a single representative SVG: instruction-window charts\n"
+"become a weighted composition montage (one segment per trace, in program\n"
+"order, width proportional to weight); histograms become a weighted-mean\n"
+"distribution.\n"
 "\n"
 "Metric (required):\n"
 "  -m branch_mpki   Branch MPKI under gshare (lines per --history)\n"
@@ -222,6 +239,10 @@ struct Options {
 "  -k, --top-k=N           Top-K layers for gen_op / gen_reg (default 10)\n"
 "  -t, --title=STR         Override chart title\n"
 "  -o, --output=FILE       Write SVG to FILE (default stdout)\n"
+"      --aggregate         Force aggregate mode (implied for >1 trace)\n"
+"      --weights=W,W,...   Per-trace weights (CLI order; default = header\n"
+"                          simpoint_weight; all-zero -> even split)\n"
+"      --name=STR          Program label used in aggregate titles\n"
 "      --help              Show this help and exit\n");
     std::exit(rc);
 }
@@ -261,6 +282,35 @@ static std::vector<int> parse_int_list(const char *s, const char *opt)
     }
     if (out.empty()) {
         std::fprintf(stderr, "cst_visualize: empty list for %s\n", opt);
+        std::exit(2);
+    }
+    return out;
+}
+
+/* Parse a comma-separated list of non-negative doubles (--weights). */
+static std::vector<double> parse_double_list(const char *s)
+{
+    std::vector<double> out;
+    const char *p = s;
+    while (*p) {
+        char *end = nullptr;
+        double v = std::strtod(p, &end);
+        if (!end || end == p || v < 0) {
+            std::fprintf(stderr, "cst_visualize: bad --weights entry "
+                         "near '%s'\n", p);
+            std::exit(2);
+        }
+        out.push_back(v);
+        p = end;
+        if (*p == ',') p++;
+        else if (*p != '\0') {
+            std::fprintf(stderr, "cst_visualize: bad --weights separator "
+                         "'%c'\n", *p);
+            std::exit(2);
+        }
+    }
+    if (out.empty()) {
+        std::fprintf(stderr, "cst_visualize: empty --weights list\n");
         std::exit(2);
     }
     return out;
@@ -416,21 +466,32 @@ static Options parse_args(int argc, char **argv)
             need(i + 1, a); o.output = argv[++i];
         } else if (!std::strncmp(a, "--output=", 9)) {
             o.output = a + 9;
+        } else if (!std::strcmp(a, "--aggregate")) {
+            o.aggregate = true;
+        } else if (!std::strcmp(a, "--weights")) {
+            need(i + 1, a); o.weights = parse_double_list(argv[++i]);
+        } else if (!std::strncmp(a, "--weights=", 10)) {
+            o.weights = parse_double_list(a + 10);
+        } else if (!std::strcmp(a, "--name")) {
+            need(i + 1, a); o.agg_name = argv[++i];
+        } else if (!std::strncmp(a, "--name=", 7)) {
+            o.agg_name = a + 7;
         } else if (a[0] == '-') {
             std::fprintf(stderr, "cst_visualize: unknown option '%s'\n", a);
             usage(2);
         } else {
-            if (o.input) {
-                std::fprintf(stderr, "cst_visualize: extra positional '%s'\n",
-                             a);
-                usage(2);
-            }
-            o.input = a;
+            o.inputs.push_back(a);
         }
         i++;
     }
-    if (!o.input) {
+    if (o.inputs.empty()) {
         std::fprintf(stderr, "cst_visualize: missing TRACE.cst\n");
+        usage(2);
+    }
+    if (!o.weights.empty() && o.weights.size() != o.inputs.size()) {
+        std::fprintf(stderr, "cst_visualize: --weights count (%zu) != "
+                     "number of input traces (%zu)\n",
+                     o.weights.size(), o.inputs.size());
         usage(2);
     }
     return o;
@@ -728,7 +789,31 @@ struct ChartPlan {
     bool        has_overflow_bin = false;
     std::string overflow_label;
 
+    /* Trace-encoded warmup->simulation boundary (header §2.13
+     * warmup_end_arch_insns), in the SAME architectural CP-insn units
+     * as the x-axis.  Drawn as a single dashed vertical marker on
+     * instruction-window plots so the reader can see how much of the
+     * trace is warmup.  Sentinels UINT64_MAX (uncrossed) and 0 (no
+     * warmup configured) suppress the marker. */
+    uint64_t    warmup_end_insns = UINT64_MAX;
+
     std::vector<Series> series;
+
+    /* Aggregate (composition) mode: when non-empty, this pane is a montage
+     * of per-trace segments laid out left-to-right, each occupying a
+     * weight-proportional fraction of the plot width and rendering its own
+     * native-bin series.  @series above is then used only as the unified
+     * legend (label + colour per global series); the actual data lives in
+     * the segments.  Empty -> ordinary single-trace pane (unchanged). */
+    struct CompSegment {
+        std::vector<Series> series;   /* this trace's series, global colours */
+        int         n_bins      = 0;  /* trace's native bin count */
+        double      x0_frac     = 0;  /* [0,1] sub-range of the plot width */
+        double      x1_frac     = 1;
+        std::string label;            /* e.g. "545.2B  18%" */
+        double      warmup_frac = -1; /* -1 = none; else pos within the slice */
+    };
+    std::vector<CompSegment> segments;
 };
 
 /* CSS-style palette: distinguishable hues + monotonic luminance for
@@ -861,6 +946,183 @@ static void render_plan(std::FILE *out, const ChartPlan &plan)
             "<text x=\"%d\" y=\"%.2f\" text-anchor=\"end\" "
             "dominant-baseline=\"middle\" fill=\"#555\">%s</text>\n",
             L - 6, y, xml_escape(lab).c_str());
+    }
+
+    /* Composition (aggregate) pane: a montage of weight-proportional
+     * per-trace segments, each rendering its own native bins inside its
+     * pixel sub-range.  Replaces the normal x-axis / data / single-marker
+     * path entirely; the shared frame, y-axis, title and legend are still
+     * drawn here.  Decorations (per-segment label + warmup rule) are gated
+     * on segment pixel width so the chart stays readable for any K. */
+    if (!plan.segments.empty()) {
+        const double LABEL_MIN_PX  = 46.0;  /* show segment label if wider */
+        const double WARMUP_MIN_PX = 14.0;  /* show warmup rule if wider */
+
+        /* Per-segment data first, so dividers / markers land on top. */
+        for (const auto &seg : plan.segments) {
+            double sxl = L + seg.x0_frac * plot_w;
+            double sxr = L + seg.x1_frac * plot_w;
+            double sw  = sxr - sxl;
+            int nb = seg.n_bins > 0 ? seg.n_bins : 1;
+            /* Bin b's true center x.  The drawn path additionally anchors
+             * explicit vertices at the segment edges (sxl/sxr) so the
+             * fill/line spans the full slice — otherwise the half-bin
+             * margin at each end leaves a visible gap on either side of
+             * every divider.  Edge anchoring is robust for nb==1. */
+            auto ctr = [&](int b) {
+                return sxl + ((b + 0.5) / (double)nb) * sw;
+            };
+            auto val = [&](const Series &s, int b) {
+                return (b < (int)s.y.size()) ? s.y[b] : 0.0;
+            };
+            if (plan.mode == ChartPlan::Mode::Stacked) {
+                std::vector<double> cum((size_t)nb, 0.0);
+                for (const Series &s : seg.series) {
+                    std::fprintf(out,
+                        "<polygon fill=\"%s\" fill-opacity=\"0.9\" "
+                        "stroke=\"%s\" stroke-width=\"0.5\" points=\"",
+                        s.color.c_str(), s.color.c_str());
+                    /* upper edge: left edge, centers L→R, right edge */
+                    std::fprintf(out, "%.2f,%.2f ",
+                                 sxl, y_of(cum[0] + val(s, 0)));
+                    for (int b = 0; b < nb; b++) {
+                        std::fprintf(out, "%.2f,%.2f ",
+                                     ctr(b), y_of(cum[b] + val(s, b)));
+                    }
+                    std::fprintf(out, "%.2f,%.2f ",
+                                 sxr, y_of(cum[nb - 1] + val(s, nb - 1)));
+                    /* lower edge: right edge, centers R→L, left edge */
+                    std::fprintf(out, "%.2f,%.2f ", sxr, y_of(cum[nb - 1]));
+                    for (int b = nb - 1; b >= 0; b--) {
+                        std::fprintf(out, "%.2f,%.2f ", ctr(b), y_of(cum[b]));
+                    }
+                    std::fprintf(out, "%.2f,%.2f ", sxl, y_of(cum[0]));
+                    std::fprintf(out, "\"/>\n");
+                    for (int b = 0; b < nb; b++) cum[b] += val(s, b);
+                }
+            } else { /* Lines */
+                for (const Series &s : seg.series) {
+                    const char *dash = s.dashed
+                        ? " stroke-dasharray=\"6 4\"" : "";
+                    std::fprintf(out, "<polyline fill=\"none\" stroke=\"%s\" "
+                        "stroke-width=\"1.5\"%s points=\"",
+                        s.color.c_str(), dash);
+                    std::fprintf(out, "%.2f,%.2f ", sxl, y_of(val(s, 0)));
+                    for (int b = 0; b < nb; b++) {
+                        std::fprintf(out, "%.2f,%.2f ", ctr(b), y_of(val(s, b)));
+                    }
+                    std::fprintf(out, "%.2f,%.2f ",
+                                 sxr, y_of(val(s, nb - 1)));
+                    std::fprintf(out, "\"/>\n");
+                }
+            }
+        }
+
+        /* Boundary dividers, x-axis cumulative-weight ticks, gated
+         * per-segment labels, and gated per-segment warmup rules. */
+        double last_lbl_x = -1e9;
+        for (size_t si = 0; si < plan.segments.size(); si++) {
+            const auto &seg = plan.segments[si];
+            double sxl = L + seg.x0_frac * plot_w;
+            double sxr = L + seg.x1_frac * plot_w;
+            double sw  = sxr - sxl;
+
+            /* Divider at the segment's left boundary (skip the very left
+             * edge, which is the frame).  Solid and dark so simpoint edges
+             * read at least as strongly as the dashed warmup rules and
+             * don't fade into the plot background. */
+            if (si > 0) {
+                std::fprintf(out,
+                    "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
+                    "stroke=\"#444444\" stroke-width=\"1.5\"/>\n",
+                    sxl, T, sxl, T + plot_h);
+            }
+            /* Cumulative-weight x tick at the left boundary, labelled if
+             * there's room since the last label. */
+            if (plan.show_x_labels) {
+                std::fprintf(out,
+                    "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
+                    "stroke=\"#cccccc\" stroke-width=\"1\"/>\n",
+                    sxl, T + plot_h, sxl, T + plot_h + 4);
+                if (sxl - last_lbl_x > 40.0) {
+                    char buf[16];
+                    std::snprintf(buf, sizeof(buf), "%.0f%%",
+                                  seg.x0_frac * 100.0);
+                    std::fprintf(out,
+                        "<text x=\"%.2f\" y=\"%d\" text-anchor=\"middle\" "
+                        "fill=\"#555\">%s</text>\n",
+                        sxl, T + plot_h + 18, buf);
+                    last_lbl_x = sxl;
+                }
+            }
+
+            /* Per-segment warmup rule (the trace's own §2.13 boundary,
+             * placed at its relative position within the slice). */
+            if (seg.warmup_frac >= 0.0 && sw >= WARMUP_MIN_PX) {
+                double wx = sxl + seg.warmup_frac * sw;
+                std::fprintf(out,
+                    "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
+                    "stroke=\"#000000\" stroke-width=\"2\" "
+                    "stroke-dasharray=\"9,5\"/>\n",
+                    wx, T, wx, T + plot_h);
+            }
+            /* Per-segment label above the frame, if the slice is wide
+             * enough to hold it. */
+            if (!seg.label.empty() && sw >= LABEL_MIN_PX) {
+                std::fprintf(out,
+                    "<text x=\"%.2f\" y=\"%d\" text-anchor=\"middle\" "
+                    "fill=\"#333\" font-size=\"10\">%s</text>\n",
+                    sxl + sw / 2.0, T - 5, xml_escape(seg.label).c_str());
+            }
+        }
+        /* Final right-edge cumulative tick (100%). */
+        if (plan.show_x_labels) {
+            std::fprintf(out,
+                "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" "
+                "stroke=\"#cccccc\" stroke-width=\"1\"/>\n",
+                L + plot_w, T + plot_h, L + plot_w, T + plot_h + 4);
+            std::fprintf(out,
+                "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" "
+                "fill=\"#555\">100%%</text>\n", L + plot_w, T + plot_h + 18);
+        }
+
+        /* x-axis title, y-axis title, chart title. */
+        if (!plan.x_label.empty() && plan.show_x_labels) {
+            std::fprintf(out,
+                "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" "
+                "fill=\"#333\" font-size=\"13\">%s</text>\n",
+                L + plot_w / 2, B_edge + 38, xml_escape(plan.x_label).c_str());
+        }
+        if (!plan.y_label.empty()) {
+            int yx = 22, yy = T + plot_h / 2;
+            std::fprintf(out,
+                "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" fill=\"#333\" "
+                "font-size=\"13\" transform=\"rotate(-90, %d, %d)\">%s</text>\n",
+                yx, yy, yx, yy, xml_escape(plan.y_label).c_str());
+        }
+        if (!plan.title.empty()) {
+            std::fprintf(out,
+                "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" "
+                "fill=\"#222\" font-size=\"16\" font-weight=\"600\">%s</text>\n",
+                L + plot_w / 2, T - 22, xml_escape(plan.title).c_str());
+        }
+
+        /* Unified legend from plan.series (label + global colour). */
+        int lx = L + plot_w + 16;
+        int ly = T + 8;
+        for (const Series &s : plan.series) {
+            if (s.label.empty()) continue;
+            std::fprintf(out,
+                "<rect x=\"%d\" y=\"%d\" width=\"12\" height=\"12\" "
+                "fill=\"%s\"/>\n", lx, ly, s.color.c_str());
+            std::fprintf(out,
+                "<text x=\"%d\" y=\"%d\" dominant-baseline=\"middle\" "
+                "fill=\"#222\">%s</text>\n",
+                lx + 18, ly + 6, xml_escape(s.label).c_str());
+            ly += 18;
+            if (ly > T + plot_h - 12) { lx += 120; ly = T + 8; }
+        }
+        return;
     }
 
     /* X-axis labels.  Three modes:
@@ -1008,9 +1270,14 @@ static void render_plan(std::FILE *out, const ChartPlan &plan)
 
     /* Plot. */
     if (plan.mode == ChartPlan::Mode::Bars) {
-        /* Histogram bars: one filled rect per bin, single series.
-         * y_of(0) is the bottom of the plot area; y_of(v) the top of
-         * the bar.  Skips zero-valued bins to keep the SVG small. */
+        /* Histogram bars.  With a single series this is one filled rect
+         * per bin (top = y_of(value), bottom = y_of(0)).  With multiple
+         * series (aggregate mode: one per simpoint) the bars STACK, so
+         * each bucket shows how each simpoint contributes to the overall
+         * shape while the total height stays the weighted-mean
+         * distribution.  Single-series plots are unaffected (the stack of
+         * one == the old single bar). */
+        std::vector<double> cum((size_t)plan.n_bins, 0.0);
         for (size_t si = 0; si < plan.series.size(); si++) {
             const Series &s = plan.series[si];
             for (int b = 0; b < plan.n_bins; b++) {
@@ -1018,8 +1285,9 @@ static void render_plan(std::FILE *out, const ChartPlan &plan)
                 if (v <= 0) continue;
                 double xl = x_of(b);
                 double xr = x_of(b + 1);
-                double yt = y_of(v);
-                double yb = y_of(0);
+                double yt = y_of(cum[b] + v);
+                double yb = y_of(cum[b]);
+                cum[b] += v;
                 std::fprintf(out,
                     "<rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" "
                     "height=\"%.2f\" fill=\"%s\" fill-opacity=\"0.85\" "
@@ -1070,6 +1338,41 @@ static void render_plan(std::FILE *out, const ChartPlan &plan)
                 double v = (b < (int)s.y.size()) ? s.y[b] : 0.0;
                 cum[b] += v;
             }
+        }
+    }
+
+    /* Trace-encoded warmup->simulation boundary marker (header §2.13).
+     * Drawn AFTER the series so the rule sits on top of the (opaque)
+     * stacked-area / line data rather than being painted over.  Only
+     * meaningful on instruction-window axes — Bars-mode histograms and
+     * custom-tick static-summary plots measure something other than CP
+     * insns, so skip them.  The value is an arch CP-insn count mapped to
+     * a bin via x_bin_size, clamped to the plotted range. */
+    if (plan.warmup_end_insns != UINT64_MAX && plan.warmup_end_insns != 0 &&
+        plan.mode != ChartPlan::Mode::Bars && plan.x_tick_labels.empty() &&
+        plan.x_bin_size > 0 && plan.n_bins > 0) {
+        double bin = (double)plan.warmup_end_insns / (double)plan.x_bin_size;
+        if (bin > 0 && bin <= plan.n_bins) {
+            double x = x_of(bin);
+            /* Heavy solid black dashed rule, full opacity, drawn over the
+             * data so it's unmistakable. */
+            std::fprintf(out,
+                "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
+                "stroke=\"#000000\" stroke-width=\"2.5\" "
+                "stroke-dasharray=\"9,5\"/>\n",
+                x, T, x, T + plot_h);
+            /* Label ABOVE the plot frame, centred on the rule, on the
+             * white canvas margin where it's always legible.  Nudge it
+             * inward at the extreme right edge so it doesn't collide with
+             * the legend / clip off-canvas. */
+            const char *lbl = "end of warmup";
+            const char *anchor = "middle";
+            double lx = x;
+            if (x > R_edge - 40) { anchor = "end"; lx = x; }
+            std::fprintf(out,
+                "<text x=\"%.2f\" y=\"%d\" text-anchor=\"%s\" "
+                "fill=\"#000000\" font-size=\"11\" font-weight=\"700\">"
+                "%s</text>\n", lx, T - 6, anchor, lbl);
         }
     }
 
@@ -1292,7 +1595,31 @@ struct WalkCtx {
     BTB       bp_btb_gate{1024};
     bool      pending_is_conditional = false;
     bool      pending_should_pollute = false;
-    std::vector<cst::WPEntry> pending_wp_entries;
+
+    /* Streaming path: minimal structural projection of one CP entry's
+     * wrong-path chain, accumulated live as the WP BBs stream in (never
+     * the decoder's BB objects).  Replayed at the NEXT CP BB, where the
+     * misprediction gate is finally resolvable.  start_pc / n_insns are
+     * the only per-WP-BB fields the gated pairwise replay needs;
+     * tidx == UINT32_MAX marks an unknown template (replay skips it,
+     * mirroring the batch by_id miss). */
+    struct WpProjBB {
+        uint32_t tidx;
+        uint64_t start_pc;
+        uint32_t n_insns;
+    };
+    std::vector<WpProjBB> wp_chain;
+
+    /* mem_pat streaming: the wrong-path memory-pattern contribution is
+     * additive (bins_wp[pat] += 1 per WP memop), so it accumulates into
+     * a tentative per-pattern tally as the chain streams and commits at
+     * the next CP BB iff the gate passed — no address retention. */
+    uint64_t wp_pat_tally[4] = {0, 0, 0, 0};
+    /* cache_miss streaming: the corrupted-cache pollution mutates LRU
+     * state in arrival order, so it can't be folded into a counter; the
+     * WP memop addresses are retained for in-order replay (still scalar
+     * addresses, never the BBs). */
+    std::vector<uint64_t> wp_addrs;
 
     /* Branch-stream diagnostics enabled via --debug-branches=N.  We
      * capture exactly what the gshare predictor sees so we can
@@ -1344,14 +1671,19 @@ struct WalkCtx {
      *   dd_*:  per-insn complete-cycle histogram (dep_depth metric)
      *   ilp_*: per-chunk IPC samples + global issue-cycle hist
      *
-     * Memory dependences are NOT modelled: a load aliasing a
-     * prior store in the same window reads as cycle-0-ready
-     * even though hardware would serialize via the store buffer.
-     * Register RAW is usually the tighter bound in practice but
-     * this is a known overstatement of available parallelism. */
+     * Memory RAW is modelled alongside register RAW: a store
+     * publishes its completion cycle for its address, and a load
+     * aliasing that address in the same window takes a dependency on
+     * it (store→load forwarding latency folded into the 1-cycle
+     * model).  Disambiguation is by exact byte address — the standard
+     * true-dependence proxy; partial overlaps are treated as
+     * independent.  WAR/WAW through memory are removed by the same
+     * ideal-rename assumption as registers, so only store→load (RAW)
+     * carries a chain. */
     std::array<bool, 256> df_excluded_reg{};
     bool                  df_excluded_built = false;
-    std::unordered_map<uint8_t, uint32_t> df_producer_complete;
+    std::unordered_map<uint8_t, uint32_t>  df_producer_complete;
+    std::unordered_map<uint64_t, uint32_t> df_mem_producer_complete;
     uint32_t                              df_chunk_insns      = 0;
     uint32_t                              df_chunk_max_cycle  = 0;
     std::vector<std::vector<uint64_t>>    dd_depth_hist_per_bin;
@@ -1434,10 +1766,40 @@ static int bin_of(const WalkCtx &ctx, uint64_t cp_insns)
     return b;
 }
 
-static void handle_gshare_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
+/* Push one streaming WP BB's structural projection (template index,
+ * start_pc, insn count) onto the current chain — never the BB object.
+ * Shared by every deferred branch handler's WP-accumulation step. */
+static inline void wp_chain_push(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 {
-    const cst::Template &t = (*ctx.templates)[ctx.by_id->at(e.template_id)];
-    uint32_t n_insns = (uint32_t)t.insns.size();
+    ctx.wp_chain.push_back({bb.template_index,
+                            bb.tmpl ? bb.tmpl->start_pc : 0,
+                            bb.n_insns});
+}
+
+/* Accumulate one streaming WP BB into the current chain projection +
+ * the wasted-WP running sums.  Memop count is only meaningful when the
+ * BB carries field data (WpMemops level); at Structure it stays 0,
+ * which is all branch_mpki / wp_insns need. */
+static inline void handle_gshare_wp(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
+{
+    wp_chain_push(ctx, bb);
+    ctx.pending_wp_insns += bb.n_insns;
+    if (bb.has_fields()) {
+        for (uint32_t i = 0; i < bb.n_insns; i++) {
+            uint64_t nl = bb.load_count(i);
+            if (nl > cst::FID_SLOT_COUNT) nl = cst::FID_SLOT_COUNT;
+            uint64_t ns = bb.store_count(i);
+            if (ns > cst::FID_SLOT_COUNT) ns = cst::FID_SLOT_COUNT;
+            ctx.pending_wp_memops += (uint32_t)(nl + ns);
+        }
+    }
+}
+
+static void handle_gshare_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
+{
+    if (bb.is_wp) { handle_gshare_wp(ctx, bb); return; }
+    const cst::Template &t = *bb.tmpl;
+    uint32_t n_insns = bb.n_insns;
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
 
     /* Resolve the PREVIOUS entry's branch outcome now that we know
@@ -1482,17 +1844,14 @@ static void handle_gshare_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
          * versions of this handler effectively did (unconditional
          * WP training of every corrupted variant). */
         if (mispred) {
-            for (size_t i = 0; i + 1 < ctx.pending_wp_entries.size(); i++) {
-                const auto &cur_wp  = ctx.pending_wp_entries[i];
-                const auto &next_wp = ctx.pending_wp_entries[i + 1];
-                auto it = ctx.by_id->find(cur_wp.template_id);
-                if (it == ctx.by_id->end()) continue;
-                auto nit = ctx.by_id->find(next_wp.template_id);
-                if (nit == ctx.by_id->end()) continue;
-                const WalkCtx::TermBranch &wtb = ctx.term[it->second];
+            for (size_t i = 0; i + 1 < ctx.wp_chain.size(); i++) {
+                const auto &cur_wp  = ctx.wp_chain[i];
+                const auto &next_wp = ctx.wp_chain[i + 1];
+                if (cur_wp.tidx == 0xFFFFFFFFu) continue;
+                if (next_wp.tidx == 0xFFFFFFFFu) continue;
+                const WalkCtx::TermBranch &wtb = ctx.term[cur_wp.tidx];
                 if (!wtb.is_branch || !wtb.is_conditional) continue;
-                const cst::Template &nt = (*ctx.templates)[nit->second];
-                bool wp_taken = (nt.start_pc != wtb.fall_through);
+                bool wp_taken = (next_wp.start_pc != wtb.fall_through);
                 g.update(wtb.pc, wp_taken);
             }
         }
@@ -1551,32 +1910,20 @@ static void handle_gshare_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
     /* Capture this entry's terminating branch so the NEXT entry can
      * close it.  Only conditional / non-indirect-class branches are
      * accounted (those gshare can usefully predict). */
-    const WalkCtx::TermBranch &tb =
-        ctx.term[ctx.by_id->at(e.template_id)];
+    const WalkCtx::TermBranch &tb = ctx.term[bb.template_index];
     ctx.have_pending = true;
     ctx.pending_bin  = (uint64_t)bin;
     ctx.pending_branch_pc = tb.pc;
     ctx.pending_fall_pc   = tb.fall_through;
     ctx.pending_is_branch = tb.is_branch && tb.is_conditional;
 
-    /* Wasted-WP scoring: WP chain insns / memops contributed by this
-     * BB get attributed to its own branch.  Sum across WP entries. */
+    /* Reset the wasted-WP sums and chain projection; THIS entry's WP
+     * BBs stream in next and refill them via handle_gshare_wp, to be
+     * gated and replayed at the next CP BB's resolve.  (The CP-only
+     * predictor set is never trained on WP — by design.) */
     ctx.pending_wp_insns  = 0;
     ctx.pending_wp_memops = 0;
-    for (const auto &wp : e.wp_entries) {
-        ctx.pending_wp_insns += wp.n_insns;
-        for (const auto &dp : wp.dyn_params) {
-            (void)dp;
-            ctx.pending_wp_memops++;
-        }
-    }
-
-    /* Defer THIS entry's WP chain so the next-entry resolve can
-     * gate pollution per-corrupted-predictor on each variant's own
-     * misprediction of THIS entry's branch (real hardware only
-     * fetches WP when the BP actually mispredicts).  The CP-only
-     * predictor set is never trained on WP — by design. */
-    ctx.pending_wp_entries = e.wp_entries;
+    ctx.wp_chain.clear();
 
     ctx.cp_insns_so_far += n_insns;
 }
@@ -1606,12 +1953,12 @@ static void handle_gshare_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
  *     Always taken; no direction prediction.
  *     BTB miss or stale-target → pollute.
  *
- * Must be called from any handler that consumes pending_wp_entries. */
+ * Must be called from any handler that replays the deferred WP chain
+ * (the streaming wp_chain projection). */
 static void resolve_bp_gate(WalkCtx &ctx, const cst::Template &t_now)
 {
     if (!ctx.have_pending || !ctx.pending_is_branch) {
         ctx.pending_should_pollute = false;
-        ctx.pending_wp_entries.clear();
         return;
     }
     uint64_t actual_target = t_now.start_pc;
@@ -1634,10 +1981,11 @@ static void resolve_bp_gate(WalkCtx &ctx, const cst::Template &t_now)
     }
 }
 
-static void handle_btb_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
+static void handle_btb_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 {
-    const cst::Template &t = (*ctx.templates)[ctx.by_id->at(e.template_id)];
-    uint32_t n_insns = (uint32_t)t.insns.size();
+    if (bb.is_wp) { wp_chain_push(ctx, bb); return; }
+    const cst::Template &t = *bb.tmpl;
+    uint32_t n_insns = bb.n_insns;
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
 
     /* BP gate: decide whether the PREVIOUS entry's WP chain should
@@ -1680,19 +2028,15 @@ static void handle_btb_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
          * BP failure.  Walk pairwise: WP entry i's terminating
          * branch resolved to WP entry i+1's start_pc. */
         if (ctx.pending_should_pollute) {
-            for (size_t i = 0; i + 1 < ctx.pending_wp_entries.size(); i++) {
-                const auto &cur_wp  = ctx.pending_wp_entries[i];
-                const auto &next_wp = ctx.pending_wp_entries[i + 1];
-                auto it = ctx.by_id->find(cur_wp.template_id);
-                if (it == ctx.by_id->end()) continue;
-                auto nit = ctx.by_id->find(next_wp.template_id);
-                if (nit == ctx.by_id->end()) continue;
-                const WalkCtx::TermBranch &wtb = ctx.term[it->second];
+            for (size_t i = 0; i + 1 < ctx.wp_chain.size(); i++) {
+                const auto &cur_wp  = ctx.wp_chain[i];
+                const auto &next_wp = ctx.wp_chain[i + 1];
+                if (cur_wp.tidx == 0xFFFFFFFFu) continue;
+                if (next_wp.tidx == 0xFFFFFFFFu) continue;
+                const WalkCtx::TermBranch &wtb = ctx.term[cur_wp.tidx];
                 if (!wtb.is_branch) continue;
-                const cst::Template &nt =
-                    (*ctx.templates)[nit->second];
                 for (auto &b : ctx.btbs_corrupted) {
-                    (void)b.access(wtb.pc, nt.start_pc);
+                    (void)b.access(wtb.pc, next_wp.start_pc);
                 }
             }
         }
@@ -1707,8 +2051,7 @@ static void handle_btb_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
      * gets ALL branches (direct, indirect, conditional, ret) — the
      * BTB caches every kind of branch target, not just predictable
      * ones. */
-    const WalkCtx::TermBranch &tb =
-        ctx.term[ctx.by_id->at(e.template_id)];
+    const WalkCtx::TermBranch &tb = ctx.term[bb.template_index];
     ctx.have_pending      = true;
     ctx.pending_bin       = (uint64_t)bin;
     ctx.pending_branch_pc = tb.pc;
@@ -1716,9 +2059,9 @@ static void handle_btb_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
     ctx.pending_is_branch = tb.is_branch;
     ctx.pending_is_conditional = tb.is_conditional;
 
-    /* Defer this entry's WP chain to the next-entry resolve, where
-     * we can gate on the BP's prediction of this entry's branch. */
-    ctx.pending_wp_entries = e.wp_entries;
+    /* Reset the chain projection; THIS entry's WP BBs stream next and
+     * refill it, gated and replayed at the next CP BB's resolve. */
+    ctx.wp_chain.clear();
 
     ctx.cp_insns_so_far += n_insns;
 }
@@ -1728,112 +2071,142 @@ static void handle_btb_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
  * the same entry get fed into the corrupted-variant caches only —
  * those caches measure CP miss rate but their tag/LRU state is
  * polluted by every speculative access the WP chain recorded. */
-static void handle_cache_miss_entry(WalkCtx &ctx,
-                                     const cst::DecodedEntry &e)
+/* Visit each memop of a streaming BB in the same order the batch
+ * decoder materialised dyn_params: per instruction, loads (slot 0..N)
+ * then stores.  @f receives (insn_index, addr).  Counts are clamped to
+ * FID_SLOT_COUNT exactly as the batch path's materialise_slotted_memops
+ * does, so a malformed over-count drops the excess instead of reading
+ * out-of-range slots. */
+template <class F>
+static inline void for_each_cp_memop(const cst::BodyWalker::BB &bb, F &&f)
 {
-    const cst::Template &t = (*ctx.templates)[ctx.by_id->at(e.template_id)];
+    for (uint32_t i = 0; i < bb.n_insns; i++) {
+        uint64_t nl = bb.load_count(i);
+        if (nl > cst::FID_SLOT_COUNT) nl = cst::FID_SLOT_COUNT;
+        for (uint32_t k = 0; k < nl; k++) f(i, bb.load_addr(i, k));
+        uint64_t ns = bb.store_count(i);
+        if (ns > cst::FID_SLOT_COUNT) ns = cst::FID_SLOT_COUNT;
+        for (uint32_t k = 0; k < ns; k++) f(i, bb.store_addr(i, k));
+    }
+}
+
+static void handle_cache_miss_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
+{
+    if (bb.is_wp) {
+        /* Retain WP memop addresses in chain order for the gated,
+         * order-dependent corrupted-cache replay at the next CP BB. */
+        for_each_cp_memop(bb, [&](uint32_t, uint64_t addr) {
+            ctx.wp_addrs.push_back(addr);
+        });
+        return;
+    }
+    const cst::Template &t = *bb.tmpl;
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
 
     /* BP gate: decide whether the PREVIOUS entry's WP memops should
-     * pollute the corrupted caches.  Replay deferred WP from
-     * pending_wp_entries when the BP would have mispredicted. */
+     * pollute the corrupted caches.  Replay the retained WP addresses
+     * when the BP would have mispredicted. */
     resolve_bp_gate(ctx, t);
     if (ctx.pending_should_pollute) {
-        for (const auto &wp : ctx.pending_wp_entries) {
-            for (const auto &dp : wp.dyn_params) {
-                for (auto &c : ctx.caches_corrupted) (void)c.access(dp.addr);
-            }
+        for (uint64_t addr : ctx.wp_addrs) {
+            for (auto &c : ctx.caches_corrupted) (void)c.access(addr);
         }
     }
+    ctx.wp_addrs.clear();   /* ready for THIS entry's WP chain */
 
     /* CP memops drive BOTH cache variants, counted only in their
      * respective bin matrices for CP miss-rate computation. */
     uint64_t n_cp_memops = 0;
-    for (const auto &dp : e.dyn_params) {
+    for_each_cp_memop(bb, [&](uint32_t, uint64_t addr) {
         n_cp_memops++;
         for (size_t ci = 0; ci < ctx.caches.size(); ci++) {
-            bool hit = ctx.caches[ci].access(dp.addr);
+            bool hit = ctx.caches[ci].access(addr);
             if (!hit) ctx.bins.at((int)ci, bin) += 1.0;
         }
         for (size_t ci = 0; ci < ctx.caches_corrupted.size(); ci++) {
-            bool hit = ctx.caches_corrupted[ci].access(dp.addr);
+            bool hit = ctx.caches_corrupted[ci].access(addr);
             if (!hit) ctx.bins_wp.at((int)ci, bin) += 1.0;
         }
-    }
+    });
     if ((int)ctx.cp_memops_per_bin.size() <= bin) {
         ctx.cp_memops_per_bin.resize(bin + 1, 0);
     }
     ctx.cp_memops_per_bin[bin] += n_cp_memops;
 
-    /* Cache this entry's terminating branch + defer its WP chain so
-     * the next entry's resolve step can gate pollution by BP. */
-    const WalkCtx::TermBranch &tb =
-        ctx.term[ctx.by_id->at(e.template_id)];
+    /* Cache this entry's terminating branch so the next entry's resolve
+     * step can gate the just-streamed WP chain's pollution by BP. */
+    const WalkCtx::TermBranch &tb = ctx.term[bb.template_index];
     ctx.have_pending      = true;
     ctx.pending_bin       = (uint64_t)bin;
     ctx.pending_branch_pc = tb.pc;
     ctx.pending_fall_pc   = tb.fall_through;
     ctx.pending_is_branch = tb.is_branch;
     ctx.pending_is_conditional = tb.is_conditional;
-    ctx.pending_wp_entries = e.wp_entries;
 
-    ctx.cp_insns_so_far += t.insns.size();
+    ctx.cp_insns_so_far += bb.n_insns;
 }
 
-static void handle_mem_pat_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
+/* Accumulate one streaming WP BB's per-pattern memop counts into the
+ * tentative tally (committed at the next CP BB iff the gate passes). */
+static inline void handle_mem_pat_wp(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 {
-    const cst::Template &t = (*ctx.templates)[ctx.by_id->at(e.template_id)];
+    if (!bb.tmpl) return;
+    const cst::Template &wt = *bb.tmpl;
+    for_each_cp_memop(bb, [&](uint32_t insn_index, uint64_t) {
+        if (insn_index >= wt.profile.insns.size()) return;
+        uint8_t pat = wt.profile.insns[insn_index].pat_wp;
+        if (pat > 3) pat = 0;
+        ctx.wp_pat_tally[pat]++;
+    });
+}
+
+static void handle_mem_pat_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
+{
+    if (bb.is_wp) { handle_mem_pat_wp(ctx, bb); return; }
+    const cst::Template &t = *bb.tmpl;
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
-    /* BP gate: replay deferred WP only on mispredicted CP branches.
-     * Without the gate, every CP entry's WP memops contribute to
-     * bins_wp regardless of whether the BP would have triggered the
-     * speculation in real hw. */
+
+    /* BP gate: commit the previous chain's tentative WP tally only on a
+     * mispredicted CP branch.  Without the gate, every CP entry's WP
+     * memops would contribute to bins_wp regardless of whether the BP
+     * would have triggered the speculation in real hw.  Attributed to
+     * the resolved entry's bin (pending_bin) — the BB the mispredict
+     * fired from. */
     resolve_bp_gate(ctx, t);
     if (ctx.pending_should_pollute) {
-        for (const auto &wp : ctx.pending_wp_entries) {
-            auto it = ctx.by_id->find(wp.template_id);
-            if (it == ctx.by_id->end()) continue;
-            const cst::Template &wt = (*ctx.templates)[it->second];
-            for (const auto &dp : wp.dyn_params) {
-                if (dp.insn_index >= wt.profile.insns.size()) continue;
-                uint8_t pat = wt.profile.insns[dp.insn_index].pat_wp;
-                if (pat > 3) pat = 0;
-                /* Use the resolved entry's bin (pending_bin), not the
-                 * current entry's bin — the WP belongs to the BB the
-                 * mispredict fired from. */
-                ctx.bins_wp.at((int)pat, (int)ctx.pending_bin) += 1.0;
-            }
+        for (int pat = 0; pat < 4; pat++) {
+            ctx.bins_wp.at(pat, (int)ctx.pending_bin) +=
+                (double)ctx.wp_pat_tally[pat];
         }
     }
+    ctx.wp_pat_tally[0] = ctx.wp_pat_tally[1] =
+        ctx.wp_pat_tally[2] = ctx.wp_pat_tally[3] = 0;
 
     /* Layers: 0=none, 1=regular, 2=irregular, 3=random.  CP-side
      * counted in units of memops on this visit (one CP memop per
      * dyn_param entry). */
-    for (const auto &dp : e.dyn_params) {
-        if (dp.insn_index >= t.insns.size()) continue;
-        if (dp.insn_index >= t.profile.insns.size()) continue;
-        uint8_t pat = t.profile.insns[dp.insn_index].pat_cp;
+    for_each_cp_memop(bb, [&](uint32_t insn_index, uint64_t) {
+        if (insn_index >= t.profile.insns.size()) return;
+        uint8_t pat = t.profile.insns[insn_index].pat_cp;
         if (pat > 3) pat = 0;
         ctx.bins.at((int)pat, bin) += 1.0;
-    }
+    });
 
-    /* Defer this entry's WP for next-resolve gating. */
-    const WalkCtx::TermBranch &tb =
-        ctx.term[ctx.by_id->at(e.template_id)];
+    const WalkCtx::TermBranch &tb = ctx.term[bb.template_index];
     ctx.have_pending      = true;
     ctx.pending_bin       = (uint64_t)bin;
     ctx.pending_branch_pc = tb.pc;
     ctx.pending_fall_pc   = tb.fall_through;
     ctx.pending_is_branch = tb.is_branch;
     ctx.pending_is_conditional = tb.is_conditional;
-    ctx.pending_wp_entries = e.wp_entries;
 
-    ctx.cp_insns_so_far += t.insns.size();
+    ctx.cp_insns_so_far += bb.n_insns;
 }
 
-static void handle_branch_dir_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
+static void handle_branch_dir_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 {
-    const cst::Template &t = (*ctx.templates)[ctx.by_id->at(e.template_id)];
+    if (bb.is_wp) { wp_chain_push(ctx, bb); return; }
+    const cst::Template &t = *bb.tmpl;
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
 
     /* BP gate: decide if the PREVIOUS entry's WP branches should
@@ -1864,17 +2237,14 @@ static void handle_branch_dir_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
     /* Replay deferred WP-direction breakdown for the previous entry,
      * only if BP would have mispredicted. */
     if (ctx.pending_should_pollute) {
-        for (size_t i = 0; i + 1 < ctx.pending_wp_entries.size(); i++) {
-            const auto &cur_wp  = ctx.pending_wp_entries[i];
-            const auto &next_wp = ctx.pending_wp_entries[i + 1];
-            auto it = ctx.by_id->find(cur_wp.template_id);
-            if (it == ctx.by_id->end()) continue;
-            auto nit = ctx.by_id->find(next_wp.template_id);
-            if (nit == ctx.by_id->end()) continue;
-            const WalkCtx::TermBranch &wtb = ctx.term[it->second];
+        for (size_t i = 0; i + 1 < ctx.wp_chain.size(); i++) {
+            const auto &cur_wp  = ctx.wp_chain[i];
+            const auto &next_wp = ctx.wp_chain[i + 1];
+            if (cur_wp.tidx == 0xFFFFFFFFu) continue;
+            if (next_wp.tidx == 0xFFFFFFFFu) continue;
+            const WalkCtx::TermBranch &wtb = ctx.term[cur_wp.tidx];
             if (!wtb.is_branch) continue;
-            const cst::Template &nt = (*ctx.templates)[nit->second];
-            bool wp_taken = (nt.start_pc != wtb.fall_through);
+            bool wp_taken = (next_wp.start_pc != wtb.fall_through);
             std::string label = wtb.is_conditional
                 ? wtb.class_name + (wp_taken ? " taken" : " not-taken")
                 : wtb.class_name;
@@ -1886,7 +2256,7 @@ static void handle_branch_dir_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
     /* Stash this entry's classification for the next resolution.  We
      * defer the series-id allocation until resolution-time so the
      * label encodes taken/not-taken. */
-    const size_t tidx = ctx.by_id->at(e.template_id);
+    const size_t tidx = bb.template_index;
     const WalkCtx::TermBranch &tb = ctx.term[tidx];
     ctx.have_pending      = tb.is_branch;
     ctx.pending_bin       = (uint64_t)bin;
@@ -1895,9 +2265,11 @@ static void handle_branch_dir_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
     ctx.pending_fall_pc   = tb.fall_through;
     ctx.pending_is_branch = tb.is_branch;
     ctx.pending_is_conditional = tb.is_conditional;
-    ctx.pending_wp_entries = e.wp_entries;
 
-    ctx.cp_insns_so_far += t.insns.size();
+    /* Reset the chain projection; THIS entry's WP BBs stream next. */
+    ctx.wp_chain.clear();
+
+    ctx.cp_insns_so_far += bb.n_insns;
 }
 
 /* working_set: SLIDING-WINDOW unique cache lines and 4 KiB pages
@@ -1907,10 +2279,8 @@ static void handle_branch_dir_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
  * bin we record the live |set| sizes so the chart shows working-set
  * size over program phases (not a since-start cumulative footprint
  * — that would just trend upward forever). */
-static void handle_working_set_entry(WalkCtx &ctx,
-                                     const cst::DecodedEntry &e)
+static void handle_working_set_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 {
-    const cst::Template &t = (*ctx.templates)[ctx.by_id->at(e.template_id)];
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
     uint64_t now = ctx.cp_insns_so_far;
     uint64_t window = ctx.opts.ws_window;
@@ -1936,21 +2306,21 @@ static void handle_working_set_entry(WalkCtx &ctx,
             ctx.ws_page_count.erase(it);
         }
     }
-    for (const auto &dp : e.dyn_params) {
-        uint64_t line = dp.addr >> 6;
-        uint64_t page = dp.addr >> 12;
+    for_each_cp_memop(bb, [&](uint32_t, uint64_t addr) {
+        uint64_t line = addr >> 6;
+        uint64_t page = addr >> 12;
         ctx.ws_line_accesses.emplace_back(now, line);
         ctx.ws_page_accesses.emplace_back(now, page);
         ctx.ws_line_count[line]++;
         ctx.ws_page_count[page]++;
-    }
+    });
     if ((int)ctx.ws_lines_per_bin.size() <= bin) {
         ctx.ws_lines_per_bin.resize(bin + 1, 0);
         ctx.ws_pages_per_bin.resize(bin + 1, 0);
     }
     ctx.ws_lines_per_bin[bin] = ctx.ws_line_count.size();
     ctx.ws_pages_per_bin[bin] = ctx.ws_page_count.size();
-    ctx.cp_insns_so_far += t.insns.size();
+    ctx.cp_insns_so_far += bb.n_insns;
 }
 
 /* Shared between dep_depth and ilp: build the special-reg lookup
@@ -1968,8 +2338,26 @@ static void df_ensure_excluded_built(WalkCtx &ctx)
     ctx.df_excluded_built = true;
 }
 
-/* Wall-style RAW-only depth under perfect rename, bounded to a
- * tumbling --rob-size window:
+/* Gather instruction @i's dynamic load/store addresses into caller
+ * buffers (each sized FID_SLOT_COUNT), returning the counts.  Mirrors
+ * for_each_cp_memop's per-insn slot ordering + clamp.  Requires the BB
+ * to carry field data (cp_fields). */
+static inline void df_gather_addrs(const cst::BodyWalker::BB &bb, uint32_t i,
+                                   uint64_t *la, uint32_t *nl,
+                                   uint64_t *sa, uint32_t *ns)
+{
+    uint64_t cl = bb.load_count(i);
+    if (cl > cst::FID_SLOT_COUNT) cl = cst::FID_SLOT_COUNT;
+    for (uint32_t k = 0; k < cl; k++) la[k] = bb.load_addr(i, k);
+    *nl = (uint32_t)cl;
+    uint64_t cs = bb.store_count(i);
+    if (cs > cst::FID_SLOT_COUNT) cs = cst::FID_SLOT_COUNT;
+    for (uint32_t k = 0; k < cs; k++) sa[k] = bb.store_addr(i, k);
+    *ns = (uint32_t)cs;
+}
+
+/* Wall-style RAW depth (register + memory) under perfect rename,
+ * bounded to a tumbling --rob-size window:
  *   complete_i = 1 + max(producer_complete[r] for r in real srcs)
  *   producer_complete[r] := complete_i for r in real dsts
  * "Real" = NOT one of FLAGS / IP / ZERO / NONE.  Self-RMW IS a
@@ -1984,6 +2372,8 @@ static void df_ensure_excluded_built(WalkCtx &ctx)
  * chunk max for the IPC summary. */
 static inline uint32_t df_step_insn(WalkCtx &ctx,
                                     const cst::InsnTemplate &insn,
+                                    const uint64_t *load_addrs, uint32_t n_load,
+                                    const uint64_t *store_addrs, uint32_t n_store,
                                     uint32_t window,
                                     int bin,
                                     bool record_ipc_samples)
@@ -1996,11 +2386,25 @@ static inline uint32_t df_step_insn(WalkCtx &ctx,
             max_src = it->second;
         }
     }
+    /* Memory RAW: a load takes a dependency on the most recent store
+     * to the same address in this window (read before the store side
+     * below publishes, so a same-insn RMW sees the prior writer). */
+    for (uint32_t k = 0; k < n_load; k++) {
+        auto it = ctx.df_mem_producer_complete.find(load_addrs[k]);
+        if (it != ctx.df_mem_producer_complete.end() && it->second > max_src) {
+            max_src = it->second;
+        }
+    }
     uint32_t this_complete = max_src + 1;
     if (this_complete > window) this_complete = window;
     for (uint8_t r : insn.dst_regs) {
         if (ctx.df_excluded_reg[r]) continue;
         ctx.df_producer_complete[r] = this_complete;
+    }
+    /* A store publishes its completion cycle for its address so a later
+     * aliasing load in this window chains off it. */
+    for (uint32_t k = 0; k < n_store; k++) {
+        ctx.df_mem_producer_complete[store_addrs[k]] = this_complete;
     }
     if (this_complete > ctx.df_chunk_max_cycle) {
         ctx.df_chunk_max_cycle = this_complete;
@@ -2022,23 +2426,23 @@ static inline uint32_t df_step_insn(WalkCtx &ctx,
             ctx.ilp_samples_per_bin[bin].push_back((uint32_t)ipc_x1000);
         }
         ctx.df_producer_complete.clear();
+        ctx.df_mem_producer_complete.clear();
         ctx.df_chunk_insns = 0;
         ctx.df_chunk_max_cycle = 0;
     }
     return this_complete;
 }
 
-/* dep_depth: per-insn RAW chain depth, histogrammed per bin.
- * Same dataflow model as ilp (Wall's ideal rename, tumbling
- * --rob-size window) but the chart summarizes the *distribution*
- * of per-insn depths (avg + p90) rather than the per-chunk
- * critical path.  Useful for seeing how many insns are stuck
+/* dep_depth: per-insn RAW chain depth (register + memory),
+ * histogrammed per bin.  Same dataflow model as ilp (Wall's ideal
+ * rename, tumbling --rob-size window) but the chart summarizes the
+ * *distribution* of per-insn depths (avg + p90) rather than the
+ * per-chunk critical path.  Useful for seeing how many insns are stuck
  * deep in chains vs. how many start fresh chains each cycle. */
-static void handle_dep_depth_entry(WalkCtx &ctx,
-                                   const cst::DecodedEntry &e)
+static void handle_dep_depth_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 {
     df_ensure_excluded_built(ctx);
-    const cst::Template &t = (*ctx.templates)[ctx.by_id->at(e.template_id)];
+    const cst::Template &t = *bb.tmpl;
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
     uint32_t window = ctx.opts.rob_size;
     if ((int)ctx.dd_depth_hist_per_bin.size() <= bin) {
@@ -2048,12 +2452,15 @@ static void handle_dep_depth_entry(WalkCtx &ctx,
     if (bin_hist.empty()) {
         bin_hist.assign((size_t)window + 1, 0);
     }
-    for (const auto &insn : t.insns) {
-        uint32_t d = df_step_insn(ctx, insn, window, bin,
-                                  /*record_ipc_samples=*/false);
+    uint64_t la[cst::FID_SLOT_COUNT], sa[cst::FID_SLOT_COUNT];
+    for (uint32_t i = 0; i < bb.n_insns; i++) {
+        uint32_t nl, ns;
+        df_gather_addrs(bb, i, la, &nl, sa, &ns);
+        uint32_t d = df_step_insn(ctx, t.insns[i], la, nl, sa, ns,
+                                  window, bin, /*record_ipc_samples=*/false);
         bin_hist[d]++;
     }
-    ctx.cp_insns_so_far += t.insns.size();
+    ctx.cp_insns_so_far += bb.n_insns;
 }
 
 /* ilp: ideal IPC under perfect rename.  Drives the same Wall
@@ -2063,17 +2470,21 @@ static void handle_dep_depth_entry(WalkCtx &ctx,
  * insns issue at each in-window cycle (cycle 0 = no deps in
  * chunk, ...).  Top pane is the per-bin IPC time-series;
  * bottom pane is the issue-cycle distribution. */
-static void handle_ilp_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
+static void handle_ilp_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 {
     df_ensure_excluded_built(ctx);
-    const cst::Template &t = (*ctx.templates)[ctx.by_id->at(e.template_id)];
+    const cst::Template &t = *bb.tmpl;
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
     uint32_t window = ctx.opts.rob_size;
     if (ctx.ilp_cycle_hist.empty()) {
         ctx.ilp_cycle_hist.assign((size_t)window + 1, 0);
     }
-    for (const auto &insn : t.insns) {
-        uint32_t complete = df_step_insn(ctx, insn, window, bin,
+    uint64_t la[cst::FID_SLOT_COUNT], sa[cst::FID_SLOT_COUNT];
+    for (uint32_t i = 0; i < bb.n_insns; i++) {
+        uint32_t nl, ns;
+        df_gather_addrs(bb, i, la, &nl, sa, &ns);
+        uint32_t complete = df_step_insn(ctx, t.insns[i], la, nl, sa, ns,
+                                         window, bin,
                                          /*record_ipc_samples=*/true);
         /* Issue cycle is one less than complete (1-cycle latency
          * model).  cycle_hist[k] = insns that issued at in-chunk
@@ -2084,7 +2495,7 @@ static void handle_ilp_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
         }
         ctx.ilp_cycle_hist[issue_cycle]++;
     }
-    ctx.cp_insns_so_far += t.insns.size();
+    ctx.cp_insns_so_far += bb.n_insns;
 }
 
 /* reuse_distance: for each CP memop's cache line, count how many
@@ -2107,12 +2518,11 @@ static int ru_bucket_of(uint64_t distance) {
     if (b >= RU_BUCKETS) b = RU_BUCKETS - 1;
     return b;
 }
-static void handle_reuse_distance_entry(WalkCtx &ctx,
-                                        const cst::DecodedEntry &e)
+static void handle_reuse_distance_bb(WalkCtx &ctx,
+                                     const cst::BodyWalker::BB &bb)
 {
-    const cst::Template &t = (*ctx.templates)[ctx.by_id->at(e.template_id)];
-    for (const auto &dp : e.dyn_params) {
-        uint64_t line = dp.addr >> 6;
+    for_each_cp_memop(bb, [&](uint32_t, uint64_t addr) {
+        uint64_t line = addr >> 6;
         uint64_t t_new = ++ctx.ru_clock;
         auto it = ctx.ru_last_t.find(line);
         if (it == ctx.ru_last_t.end()) {
@@ -2135,19 +2545,18 @@ static void handle_reuse_distance_entry(WalkCtx &ctx,
             it->second = t_new;
         }
         ctx.ru_tree.insert(t_new);
-    }
-    ctx.cp_insns_so_far += t.insns.size();
+    });
+    ctx.cp_insns_so_far += bb.n_insns;
 }
 
-static void handle_genop_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
+static void handle_genop_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 {
-    const cst::Template &t = (*ctx.templates)[ctx.by_id->at(e.template_id)];
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
-    const auto &precomp = ctx.precomp[ctx.by_id->at(e.template_id)];
+    const auto &precomp = ctx.precomp[bb.template_index];
     for (const auto &p : precomp.series_increments) {
         ctx.bins.at(p.first, bin) += p.second;
     }
-    ctx.cp_insns_so_far += t.insns.size();
+    ctx.cp_insns_so_far += bb.n_insns;
 }
 
 /* wp_divergence: for each CP branch's WP chain, how many WP
@@ -2161,50 +2570,27 @@ static void handle_genop_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
  * (largest --btb-entries); sensitivity to those parameters is left
  * to the dedicated branch_mpki / btb_miss metrics.
  */
-static void handle_wp_divergence_entry(WalkCtx &ctx,
-                                        const cst::DecodedEntry &e)
+/* Process one CP entry's accumulated WP chain at its last WP BB:
+ * pairwise edge-follow depth into wp_depth_per_bin[pending_bin].  The
+ * batch handler ran this at the CP entry (step 3), AFTER training the
+ * previous CP branch (step 1); in the stream the equivalent point is
+ * the chain's last WP BB, which lands after this entry's CP BB and
+ * before the next — preserving the predictors[0]/btbs[0] mutation
+ * order exactly. */
+static void wp_divergence_process_chain(WalkCtx &ctx)
 {
-    const cst::Template &t = (*ctx.templates)[ctx.by_id->at(e.template_id)];
-    int bin = bin_of(ctx, ctx.cp_insns_so_far);
+    if (ctx.wp_chain.size() < 2) return;
 
-    /* Train predictors / BTB on the previous CP branch, before
-     * stepping the WP chain. */
-    if (ctx.have_pending && ctx.pending_is_branch) {
-        bool taken = (t.start_pc != ctx.pending_fall_pc);
-        for (auto &g : ctx.predictors) g.update(ctx.pending_branch_pc, taken);
-        for (auto &b : ctx.btbs)       b.access(ctx.pending_branch_pc, t.start_pc);
-    }
-    const WalkCtx::TermBranch &tb =
-        ctx.term[ctx.by_id->at(e.template_id)];
-    ctx.have_pending      = true;
-    ctx.pending_bin       = (uint64_t)bin;
-    ctx.pending_branch_pc = tb.pc;
-    ctx.pending_fall_pc   = tb.fall_through;
-    ctx.pending_is_branch = tb.is_branch;
-
-    if (e.wp_entries.size() < 2) {
-        ctx.cp_insns_so_far += t.insns.size();
-        return;
-    }
-
-    /* Walk the chain pairwise: count how many leading WP INSTRUCTIONS
-     * the BP+BTB follows before the first edge mismatch.  wp[0] is
-     * always "covered" — that's the BP-mispredicted starting target;
-     * each subsequent matched edge adds the next WP BB's insns. */
-    uint32_t matched_insns =
-        e.wp_entries.empty() ? 0 : e.wp_entries[0].n_insns;
+    uint32_t matched_insns = ctx.wp_chain[0].n_insns;
     bool diverged = false;
-    for (size_t i = 0; i + 1 < e.wp_entries.size(); i++) {
-        const auto &cur_wp  = e.wp_entries[i];
-        const auto &next_wp = e.wp_entries[i + 1];
-        auto it = ctx.by_id->find(cur_wp.template_id);
-        if (it == ctx.by_id->end()) break;
-        auto nit = ctx.by_id->find(next_wp.template_id);
-        if (nit == ctx.by_id->end()) break;
-        const WalkCtx::TermBranch &wtb = ctx.term[it->second];
+    for (size_t i = 0; i + 1 < ctx.wp_chain.size(); i++) {
+        const auto &cur_wp  = ctx.wp_chain[i];
+        const auto &next_wp = ctx.wp_chain[i + 1];
+        if (cur_wp.tidx == 0xFFFFFFFFu) break;
+        if (next_wp.tidx == 0xFFFFFFFFu) break;
+        const WalkCtx::TermBranch &wtb = ctx.term[cur_wp.tidx];
         if (!wtb.is_branch) break;
-        const cst::Template &nt = (*ctx.templates)[nit->second];
-        uint64_t actual_target = nt.start_pc;
+        uint64_t actual_target = next_wp.start_pc;
         bool wp_taken = (actual_target != wtb.fall_through);
 
         GShare &g = ctx.predictors[0];
@@ -2225,9 +2611,7 @@ static void handle_wp_divergence_entry(WalkCtx &ctx,
         if (diverged) break;
     }
 
-    /* Record into the bin's depth histogram (index = insns matched,
-     * value = count).  Grows the per-bin vector lazily as larger
-     * depths appear. */
+    int bin = (int)ctx.pending_bin;
     if ((int)ctx.wp_depth_per_bin.size() <= bin) {
         ctx.wp_depth_per_bin.resize(bin + 1);
     }
@@ -2237,44 +2621,245 @@ static void handle_wp_divergence_entry(WalkCtx &ctx,
         bin_hist.resize(d + 1, 0);
     }
     bin_hist[d]++;
+}
 
-    ctx.cp_insns_so_far += t.insns.size();
+static void handle_wp_divergence_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
+{
+    if (bb.is_wp) {
+        wp_chain_push(ctx, bb);
+        if (bb.wp_chain_last) wp_divergence_process_chain(ctx);
+        return;
+    }
+    const cst::Template &t = *bb.tmpl;
+    int bin = bin_of(ctx, ctx.cp_insns_so_far);
+
+    /* Train predictors / BTB on the previous CP branch, before
+     * stepping the WP chain. */
+    if (ctx.have_pending && ctx.pending_is_branch) {
+        bool taken = (t.start_pc != ctx.pending_fall_pc);
+        for (auto &g : ctx.predictors) g.update(ctx.pending_branch_pc, taken);
+        for (auto &b : ctx.btbs)       b.access(ctx.pending_branch_pc, t.start_pc);
+    }
+    const WalkCtx::TermBranch &tb = ctx.term[bb.template_index];
+    ctx.have_pending      = true;
+    ctx.pending_bin       = (uint64_t)bin;
+    ctx.pending_branch_pc = tb.pc;
+    ctx.pending_fall_pc   = tb.fall_through;
+    ctx.pending_is_branch = tb.is_branch;
+
+    /* Reset the chain projection; THIS entry's WP BBs stream next and
+     * are processed at the chain's last BB. */
+    ctx.wp_chain.clear();
+
+    ctx.cp_insns_so_far += bb.n_insns;
 }
 
 /* gen_reg uses the same shape as genop — precomputed per-template
  * series increments. */
-static void handle_genreg_entry(WalkCtx &ctx, const cst::DecodedEntry &e)
+static void handle_genreg_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 {
-    handle_genop_entry(ctx, e);   /* same precomp shape */
+    handle_genop_bb(ctx, bb);   /* same precomp shape */
 }
 
 /* ===================================================================
  *                            Main driver
  * =================================================================== */
 
+/* The finished, render-ready result of processing one trace.  Aggregate
+ * mode collects one of these per input (compact: just the built plans +
+ * a little metadata) and combines them, so only one trace's heavy decode
+ * state is ever live at a time. */
+struct TraceResult {
+    ChartPlan   plan, plan2;
+    bool        has_second_pane = false;
+    double      weight          = 0.0;        /* header simpoint_weight   */
+    uint64_t    start_insn      = 0;          /* program-order sort key   */
+    uint64_t    warmup_end_insns = UINT64_MAX;/* header §2.13             */
+    uint64_t    total_insns     = 0;          /* x-axis span (CP insns)   */
+    std::string label;                        /* short trace name         */
+};
+
+/* Lightweight header-only view of a trace, gathered in a pre-pass so we
+ * can size each trace's bin count by its (normalised) weight before the
+ * full decode — no body walk, so it's cheap. */
+struct TraceMeta {
+    double   weight     = 0.0;
+    uint64_t start_insn = 0;
+    uint64_t warmup_end = UINT64_MAX;
+    uint64_t total_insns = 1;
+    bool     ok         = false;
+};
+
+static TraceResult process_trace(const char *path, const Options &opts);
+static TraceResult aggregate_results(std::vector<TraceResult> &rs,
+                                     const Options &opts);
+static TraceMeta   peek_trace_meta(const char *path);
+
+/* Derive a short human label for a trace from its file path: basename with
+ * any ".cst" suffix and a common "<prog>_(cp|full)-" prefix stripped, so a
+ * file like ".../mcf_full-545_2B.cst" labels as "545_2B". */
+static std::string short_trace_label(const char *path)
+{
+    std::string s = path;
+    size_t slash = s.find_last_of('/');
+    if (slash != std::string::npos) s = s.substr(slash + 1);
+    if (s.size() > 4 && s.substr(s.size() - 4) == ".cst") {
+        s = s.substr(0, s.size() - 4);
+    }
+    size_t dash = s.find('-');
+    if (dash != std::string::npos) s = s.substr(dash + 1);
+    return s;
+}
+
+/* Lay out a finished TraceResult into the SVG and render it.  Shared by the
+ * single-trace and aggregate paths; the plans are already fully built (the
+ * dual-pane axis finalisation happened upstream). */
+static int render_result(const TraceResult &tr, const Options &opts)
+{
+    std::FILE *out = stdout;
+    if (opts.output) {
+        out = std::fopen(opts.output, "wb");
+        if (!out) {
+            std::fprintf(stderr, "cst_visualize: cannot open '%s'\n",
+                         opts.output);
+            return 1;
+        }
+    }
+    ChartPlan plan  = tr.plan;
+    ChartPlan plan2 = tr.plan2;
+    if (tr.has_second_pane) {
+        plan.viewport_x  = 0;
+        plan.viewport_y  = 0;
+        plan.viewport_w  = opts.width;
+        plan.viewport_h  = opts.height / 2;
+        plan.show_x_labels = false;
+        plan.x_label = "";
+
+        plan2.viewport_x = 0;
+        plan2.viewport_y = opts.height / 2;
+        plan2.viewport_w = opts.width;
+        plan2.viewport_h = opts.height - opts.height / 2;
+        plan2.show_x_labels = true;
+
+        write_svg_header(out, opts.width, opts.height);
+        render_plan(out, plan);
+        render_plan(out, plan2);
+        write_svg_footer(out);
+    } else {
+        plan.viewport_w = opts.width;
+        plan.viewport_h = opts.height;
+        write_svg_header(out, opts.width, opts.height);
+        render_plan(out, plan);
+        write_svg_footer(out);
+    }
+    if (opts.output) std::fclose(out);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     Options opts = parse_args(argc, argv);
+    bool aggregate = opts.aggregate || opts.inputs.size() > 1;
 
-    std::unique_ptr<cst::CstFile> cf;
-    try {
-        cf = cst::cst_file_open(opts.input);
-    } catch (const std::exception &ex) {
-        std::fprintf(stderr, "cst_visualize: open '%s': %s\n",
-                     opts.input, ex.what());
+    if (!aggregate) {
+        try {
+            TraceResult tr = process_trace(opts.inputs[0], opts);
+            return render_result(tr, opts);
+        } catch (const std::exception &ex) {
+            std::fprintf(stderr, "cst_visualize: %s: %s\n",
+                         opts.inputs[0], ex.what());
+            return 1;
+        }
+    }
+
+    /* Aggregate mode.
+     *
+     * Pass 1 (cheap, header-only): peek every trace's weight + warmup
+     * boundary.  A trace's NORMALISED weight (hence its segment width) is
+     * only knowable once all headers are read, so this can't be folded
+     * into the decode.
+     *
+     * Then size each trace's bin count by its weight, so the rendered
+     * data-point density is uniform across the montage: a wide (high-
+     * weight) segment is decoded at higher resolution and a narrow one at
+     * lower, instead of every trace getting the same bins stretched to
+     * different widths (which made wide segments look blocky).  The target
+     * is ~DISPLAY_BUDGET post-warmup points spread across the montage by
+     * weight; we divide by the simulation fraction because only the
+     * post-warmup region is plotted.
+     *
+     * Pass 2: decode traces ONE AT A TIME (peak memory ~ one trace's
+     * working set), keeping only the compact TraceResults. */
+    const size_t N = opts.inputs.size();
+    std::vector<TraceMeta> metas(N);
+    for (size_t i = 0; i < N; i++) {
+        try { metas[i] = peek_trace_meta(opts.inputs[i]); metas[i].ok = true; }
+        catch (const std::exception &ex) {
+            std::fprintf(stderr, "cst_visualize: skipping %s: %s\n",
+                         opts.inputs[i], ex.what());
+        }
+    }
+    /* Effective (un-normalised) weights, then normalise over OK traces. */
+    std::vector<double> wraw(N, 0.0);
+    double wsum = 0.0;
+    int nok = 0;
+    for (size_t i = 0; i < N; i++) {
+        if (!metas[i].ok) continue;
+        wraw[i] = !opts.weights.empty() ? opts.weights[i] : metas[i].weight;
+        wsum += wraw[i];
+        nok++;
+    }
+    if (nok == 0) {
+        std::fprintf(stderr, "cst_visualize: no traces processed\n");
         return 1;
     }
+    std::vector<double> wnorm(N, 0.0);
+    for (size_t i = 0; i < N; i++) {
+        if (!metas[i].ok) continue;
+        wnorm[i] = (wsum > 0.0) ? wraw[i] / wsum : 1.0 / (double)nok;
+    }
+
+    const double DISPLAY_BUDGET = 1000.0;  /* post-warmup points / montage */
+    std::vector<TraceResult> rs;
+    rs.reserve(N);
+    for (size_t i = 0; i < N; i++) {
+        if (!metas[i].ok) continue;
+        double sim_frac = 1.0;
+        if (metas[i].warmup_end != UINT64_MAX && metas[i].total_insns > 0) {
+            double wf = (double)metas[i].warmup_end /
+                        (double)metas[i].total_insns;
+            sim_frac = 1.0 - wf;
+            if (sim_frac < 0.05) sim_frac = 0.05;   /* avoid blow-up */
+        }
+        int bins_i = (int)std::ceil(DISPLAY_BUDGET * wnorm[i] / sim_frac);
+        if (bins_i < 40)   bins_i = 40;
+        if (bins_i > 6000) bins_i = 6000;
+        Options o = opts;
+        o.bins = bins_i;
+        try {
+            TraceResult t = process_trace(opts.inputs[i], o);
+            t.weight = wraw[i];          /* carry the effective weight */
+            rs.push_back(std::move(t));
+        } catch (const std::exception &ex) {
+            std::fprintf(stderr, "cst_visualize: skipping %s: %s\n",
+                         opts.inputs[i], ex.what());
+        }
+    }
+    if (rs.empty()) {
+        std::fprintf(stderr, "cst_visualize: no traces processed\n");
+        return 1;
+    }
+    TraceResult agg = aggregate_results(rs, opts);
+    return render_result(agg, opts);
+}
+
+static TraceResult process_trace(const char *path, const Options &opts)
+{
+    std::unique_ptr<cst::CstFile> cf = cst::cst_file_open(path);
 
     std::vector<cst::Template> templates;
     std::unordered_map<uint32_t, size_t> by_id;
-    cst::Header h;
-    try {
-        h = cst::parse_header(cf->header(), &templates, &by_id);
-    } catch (const std::exception &ex) {
-        std::fprintf(stderr, "cst_visualize: parse header: %s\n",
-                     ex.what());
-        return 1;
-    }
+    cst::Header h = cst::parse_header(cf->header(), &templates, &by_id);
 
     /* Decide bin width up front.  total_target_insns is the
      * configured-stop number from the header; for unbounded
@@ -2307,6 +2892,49 @@ int main(int argc, char **argv)
     ctx.term.resize(templates.size());
     for (size_t i = 0; i < templates.size(); i++) {
         ctx.term[i] = classify_term(templates[i], h.maps.branch_type);
+    }
+
+    /* branch_dir: pre-register the direction-breakdown series in a
+     * canonical, trace-independent order BEFORE the walk.  The handler
+     * otherwise allocates a series the first time each (class,
+     * direction) is resolved — and because the CP and WP panes share
+     * one label set, a trace that carries WP chains discovers classes
+     * in a different order than a CP-only trace of the same region.
+     * That made the SAME class land on a DIFFERENT series/colour across
+     * the two plots, so the (identical) correct-path breakdowns looked
+     * completely different.  Keying registration on the branch_type
+     * code (a fixed format enum value, identical across traces) pins
+     * each class to a stable colour.  Conditional classes get a
+     * taken/not-taken pair; every other family is always-taken and gets
+     * a single bare-name series.  A code that appears both ways (rare;
+     * name-vs-flag disagreement in classify_term) registers all
+     * variants so the runtime never has to append out of order. */
+    if (opts.metric == Metric::BranchDir) {
+        struct ClassVariants {
+            std::string class_name;
+            bool any_conditional   = false;
+            bool any_unconditional = false;
+        };
+        std::map<uint64_t, ClassVariants> by_code;
+        for (size_t i = 0; i < templates.size(); i++) {
+            const WalkCtx::TermBranch &tb = ctx.term[i];
+            if (!tb.is_branch || templates[i].insns.empty()) continue;
+            uint64_t code = templates[i].insns.back().branch_type;
+            ClassVariants &cv = by_code[code];
+            cv.class_name = tb.class_name;
+            if (tb.is_conditional) cv.any_conditional = true;
+            else                   cv.any_unconditional = true;
+        }
+        for (const auto &kv : by_code) {
+            const ClassVariants &cv = kv.second;
+            if (cv.any_conditional) {
+                ctx.add_label(cv.class_name + " taken");
+                ctx.add_label(cv.class_name + " not-taken");
+            }
+            if (cv.any_unconditional) {
+                ctx.add_label(cv.class_name);
+            }
+        }
     }
 
     /* Build per-template series increments for the metrics that use
@@ -2597,42 +3225,70 @@ int main(int argc, char **argv)
         cst::BodyWalker walker(h, templates, by_id,
                                body_stream->reader());
 
-        using EntryFn = void (*)(WalkCtx &, const cst::DecodedEntry &);
-        EntryFn fn = nullptr;
+        /* Every body-walk metric uses the streaming BB walk: it
+         * allocates nothing per BB and parse-skips field deltas a metric
+         * doesn't read.  Each case picks the minimum it needs —
+         * cp_fields (apply CP deltas, enable CP accessors) and a WP
+         * decode level (skip / structure / fields). */
+        using BBFn    = void (*)(WalkCtx &, const cst::BodyWalker::BB &);
+        using Wp          = cst::BodyWalker::WpDecode;
+        BBFn    bb_fn     = nullptr;
+        bool    cp_fields = false;       /* streaming-path: apply CP deltas */
+        Wp      wp_mode   = Wp::Skip;    /* streaming-path: WP decode level */
         switch (opts.metric) {
+            /* --- streaming BB path: CP structure only, no wrong-path --- */
+            case Metric::GenOp:
+                bb_fn = handle_genop_bb; break;
+            case Metric::GenReg:
+                bb_fn = handle_genreg_bb; break;
+            /* --- streaming BB path: CP fields, no wrong-path --- */
+            case Metric::DepDepth:
+                /* needs memop addresses for the memory-RAW dependency */
+                bb_fn = handle_dep_depth_bb; cp_fields = true; break;
+            case Metric::Ilp:
+                bb_fn = handle_ilp_bb; cp_fields = true; break;
+            case Metric::WorkingSet:
+                bb_fn = handle_working_set_bb; cp_fields = true; break;
+            case Metric::ReuseDistance:
+                bb_fn = handle_reuse_distance_bb; cp_fields = true; break;
+            /* --- streaming BB path: CP + WP structure --- */
             case Metric::BranchMpki:
             case Metric::WpInsns:
+                bb_fn = handle_gshare_bb; wp_mode = Wp::Structure; break;
             case Metric::WpMemops:
-                fn = handle_gshare_entry; break;
-            case Metric::MemPat:
-                fn = handle_mem_pat_entry; break;
+                /* needs per-WP-BB memop counts -> WP field deltas */
+                bb_fn = handle_gshare_bb; wp_mode = Wp::Fields; break;
             case Metric::BranchDir:
-                fn = handle_branch_dir_entry; break;
-            case Metric::GenOp:
-                fn = handle_genop_entry; break;
-            case Metric::GenReg:
-                fn = handle_genreg_entry; break;
+                bb_fn = handle_branch_dir_bb; wp_mode = Wp::Structure; break;
             case Metric::BtbMiss:
-                fn = handle_btb_entry; break;
+                bb_fn = handle_btb_bb; wp_mode = Wp::Structure; break;
             case Metric::WpDivergence:
-                fn = handle_wp_divergence_entry; break;
+                bb_fn = handle_wp_divergence_bb; wp_mode = Wp::Structure; break;
+            /* --- streaming BB path: CP + WP fields --- */
+            case Metric::MemPat:
+                bb_fn = handle_mem_pat_bb;
+                cp_fields = true; wp_mode = Wp::Fields; break;
             case Metric::CacheMiss:
-                fn = handle_cache_miss_entry; break;
-            case Metric::WorkingSet:
-                fn = handle_working_set_entry; break;
-            case Metric::DepDepth:
-                fn = handle_dep_depth_entry; break;
-            case Metric::Ilp:
-                fn = handle_ilp_entry; break;
-            case Metric::ReuseDistance:
-                fn = handle_reuse_distance_entry; break;
+                bb_fn = handle_cache_miss_bb;
+                cp_fields = true; wp_mode = Wp::Fields; break;
             case Metric::BbLength:
             case Metric::IndirectTargets:
             case Metric::BranchEntropy:
                 break; /* unreachable: gated above */
         }
 
-        walker.walk([&](const cst::DecodedEntry &e) { fn(ctx, e); });
+        if (!bb_fn) {
+            /* All body-walk metrics set bb_fn; the header-only metrics
+             * never reach here (gated by is_header_only).  A null here
+             * means a newly-added metric wasn't wired — fail loudly
+             * rather than silently emit an empty chart. */
+            throw std::runtime_error(
+                "internal error: metric has no walk handler");
+        }
+        walker.walk_bb(cp_fields, wp_mode,
+                       [&](const cst::BodyWalker::BB &bb) {
+                           bb_fn(ctx, bb);
+                       });
         try { body_stream->finalize(); }
         catch (...) {}
 
@@ -2719,6 +3375,10 @@ int main(int argc, char **argv)
     plan.n_bins = actual_bins;
     plan.x_bin_size = bin_width;
     plan.x_label = "CP instruction window";
+    /* Trace-encoded warmup boundary (header §2.13, arch CP insns).
+     * render_plan() draws it as a dashed marker on instruction-window
+     * axes and ignores it on the bin-indexed / static-summary panes. */
+    plan.warmup_end_insns = h.warmup_end_arch_insns;
 
     auto pick_title = [&]() -> std::string {
         if (opts.title) return opts.title;
@@ -3491,53 +4151,273 @@ int main(int argc, char **argv)
         }
     }
 
-    std::FILE *out = stdout;
-    if (opts.output) {
-        out = std::fopen(opts.output, "wb");
-        if (!out) {
-            std::fprintf(stderr, "cst_visualize: cannot open '%s'\n",
-                         opts.output);
-            return 1;
-        }
+    /* Finalise the dual-pane bottom axis for time-series panes (histogram
+     * panes already set their own axis in the build switch above).  Done
+     * here so both the single-trace and aggregate render paths receive a
+     * fully-formed plan2. */
+    if (has_second_pane && plan2.mode != ChartPlan::Mode::Bars) {
+        plan2.n_bins     = actual_bins;
+        plan2.x_bin_size = bin_width;
+        plan2.x_label    = "CP instruction window";
+        plan2.warmup_end_insns = h.warmup_end_arch_insns;
     }
 
-    if (has_second_pane) {
-        /* Two panes stacked vertically.  The top pane suppresses
-         * its x-axis tick labels and x_label; the shared x-axis is
-         * printed once under the bottom pane. */
-        plan.viewport_x  = 0;
-        plan.viewport_y  = 0;
-        plan.viewport_w  = opts.width;
-        plan.viewport_h  = opts.height / 2;
-        plan.show_x_labels = false;
-        plan.x_label = "";
+    TraceResult tr;
+    tr.has_second_pane  = has_second_pane;
+    tr.weight           = h.weight;
+    tr.start_insn       = h.start_insn;
+    tr.warmup_end_insns = h.warmup_end_arch_insns;
+    tr.total_insns      = total_cp_insns;
+    tr.label            = short_trace_label(path);
+    tr.plan             = std::move(plan);
+    tr.plan2            = std::move(plan2);
+    return tr;
+}
 
-        plan2.viewport_x = 0;
-        plan2.viewport_y = opts.height / 2;
-        plan2.viewport_w = opts.width;
-        plan2.viewport_h = opts.height - opts.height / 2;
-        plan2.show_x_labels = true;
-        /* For time-series dual-panes the bottom pane shares the CP
-         * instruction-window x-axis; for histogram dual-panes the
-         * case has already set plan2's own x-axis (length, target
-         * count, or entropy %), so don't clobber it. */
-        if (plan2.mode != ChartPlan::Mode::Bars) {
-            plan2.n_bins     = actual_bins;
-            plan2.x_bin_size = bin_width;
-            plan2.x_label    = "CP instruction window";
+/* Combine one pane (plan or plan2) across traces.  @panes[i] is trace i's
+ * pane, @w[i] its normalised weight, @meta[i] its source TraceResult.  The
+ * pane's shape decides the strategy: an instruction-window time-series
+ * (mode != Bars, no custom x ticks) becomes a weight-proportional
+ * composition montage; anything else (Bars histogram / custom-tick
+ * static-summary) becomes a weighted average of each trace's normalised
+ * distribution. */
+static ChartPlan aggregate_pane(const std::vector<const ChartPlan *> &panes,
+                                const std::vector<double> &w,
+                                const std::vector<const TraceResult *> &meta,
+                                const Options &opts,
+                                const std::string &progname)
+{
+    ChartPlan out;
+    if (panes.empty()) return out;
+    const ChartPlan &first = *panes[0];
+    bool timeline = (first.mode != ChartPlan::Mode::Bars &&
+                     first.x_tick_labels.empty());
+
+    if (timeline) {
+        /* Global series order by aggregate magnitude (Σ wᵢ·Σy), so colours
+         * and legend are consistent across all segments.  gen_op/gen_reg
+         * additionally cap to a global top-K with the rest folded into
+         * "other". */
+        std::unordered_map<std::string, double> mag;
+        std::vector<std::string> seen;
+        for (size_t i = 0; i < panes.size(); i++) {
+            for (const Series &s : panes[i]->series) {
+                double t = 0; for (double v : s.y) t += v;
+                if (mag.find(s.label) == mag.end()) seen.push_back(s.label);
+                mag[s.label] += w[i] * t;
+            }
+        }
+        std::stable_sort(seen.begin(), seen.end(),
+            [&](const std::string &a, const std::string &b) {
+                return mag[a] > mag[b];
+            });
+        bool capk = (opts.metric == Metric::GenOp ||
+                     opts.metric == Metric::GenReg);
+        std::vector<std::string> labels;
+        bool need_other = false;
+        for (const std::string &name : seen) {
+            if (name == "other") { need_other = true; continue; }
+            if (capk && (int)labels.size() >= opts.top_k) {
+                need_other = true; continue;
+            }
+            labels.push_back(name);
+        }
+        if (need_other) labels.push_back("other");
+        std::unordered_map<std::string, std::string> color;
+        std::unordered_map<std::string, int> label_idx;
+        for (size_t i = 0; i < labels.size(); i++) {
+            color[labels[i]] = palette_color(i);
+            label_idx[labels[i]] = (int)i;
+        }
+        /* Unified legend (label + colour, no data). */
+        for (const std::string &l : labels) {
+            Series s; s.label = l; s.color = color[l];
+            out.series.push_back(s);
         }
 
-        write_svg_header(out, opts.width, opts.height);
-        render_plan(out, plan);
-        render_plan(out, plan2);
-        write_svg_footer(out);
+        double cum = 0.0;
+        double y_max = 0.0;
+        for (size_t i = 0; i < panes.size(); i++) {
+            ChartPlan::CompSegment seg;
+            int full_nb = panes[i]->n_bins > 0 ? panes[i]->n_bins : 1;
+            /* Warmup is not part of the simpoint region, so for a
+             * composition view we plot only the post-warmup bins (decode
+             * still ran the warmup in-order; we just don't draw it).  The
+             * segment keeps its weight-proportional width — the simpoint
+             * region is stretched across it — and carries no warmup rule,
+             * leaving a clean simpoint separator. */
+            int wb = 0;
+            if (meta[i]->warmup_end_insns != UINT64_MAX &&
+                meta[i]->total_insns > 0) {
+                double f = (double)meta[i]->warmup_end_insns /
+                           (double)meta[i]->total_insns;
+                if (f < 0) f = 0;
+                if (f > 1) f = 1;
+                wb = (int)(f * full_nb);
+                if (wb >= full_nb) wb = full_nb - 1;   /* keep >=1 bin */
+            }
+            int nb = full_nb - wb;
+            if (nb < 1) nb = 1;
+            seg.n_bins  = nb;
+            seg.warmup_frac = -1;          /* warmup excluded → no marker */
+            seg.x0_frac = cum; cum += w[i]; seg.x1_frac = cum;
+            char wbuf[16];
+            std::snprintf(wbuf, sizeof(wbuf), "  %.0f%%", w[i] * 100.0);
+            seg.label = meta[i]->label + wbuf;
+            /* One output series per global label, in label order. */
+            seg.series.resize(labels.size());
+            for (size_t li = 0; li < labels.size(); li++) {
+                seg.series[li].label = labels[li];
+                seg.series[li].color = color[labels[li]];
+                seg.series[li].y.assign((size_t)nb, 0.0);
+            }
+            int other_li = need_other ? label_idx["other"] : -1;
+            for (const Series &s : panes[i]->series) {
+                auto it = label_idx.find(s.label);
+                int dst;
+                if (it != label_idx.end() && s.label != "other") {
+                    dst = it->second;
+                } else {
+                    dst = other_li;           /* folded / explicit other */
+                }
+                if (dst < 0) continue;
+                std::vector<double> &y = seg.series[dst].y;
+                for (int b = 0; b < nb; b++) {
+                    int src = wb + b;
+                    if (src < (int)s.y.size()) y[b] += s.y[src];
+                }
+            }
+            /* Track y_max for non-percent panes (stacked → per-bin sum). */
+            if (!first.percent) {
+                for (int b = 0; b < nb; b++) {
+                    double col = 0.0;
+                    for (const Series &s : seg.series) {
+                        if (first.mode == ChartPlan::Mode::Stacked) {
+                            col += (b < (int)s.y.size()) ? s.y[b] : 0.0;
+                        } else {
+                            double v = (b < (int)s.y.size()) ? s.y[b] : 0.0;
+                            if (v > col) col = v;
+                        }
+                    }
+                    if (col > y_max) y_max = col;
+                }
+            }
+            out.segments.push_back(std::move(seg));
+        }
+
+        out.mode       = first.mode;
+        out.percent    = first.percent;
+        out.y_is_count = first.y_is_count;
+        out.y_label    = first.y_label;
+        out.x_label    = "program composition (weighted)";
+        out.y_max      = first.percent ? 1.0 : (y_max > 0 ? y_max * 1.1 : 1.0);
+        out.title      = progname + ": " + first.title;
+        return out;
+    }
+
+    /* Histogram / static-summary → per-simpoint STACKED distribution.
+     * Each trace contributes one output series (label = simpoint name,
+     * colour = per-simpoint hue in program order) holding its
+     * weighted-normalised distribution; the stacked bars show how each
+     * simpoint shapes the whole, and the total height is the weighted-mean
+     * distribution.  Use the widest pane as the canonical x-axis (bucket
+     * index b has the same meaning across traces of one program); fold any
+     * longer tails into the canonical last bucket. */
+    size_t canon = 0;
+    for (size_t i = 1; i < panes.size(); i++) {
+        if (panes[i]->n_bins > panes[canon]->n_bins) canon = i;
+    }
+    out = *panes[canon];        /* copy x ticks / overflow / n_bins / mode */
+    out.segments.clear();
+    out.series.clear();
+    int cn = out.n_bins > 0 ? out.n_bins : 1;
+    std::vector<double> stack((size_t)cn, 0.0);
+    for (size_t i = 0; i < panes.size(); i++) {
+        Series s;
+        s.label = meta[i]->label;
+        s.color = palette_color(i);          /* per-simpoint hue */
+        s.y.assign((size_t)cn, 0.0);
+        if (!panes[i]->series.empty()) {
+            const Series &ts = panes[i]->series[0];
+            double tot = 0; for (double v : ts.y) tot += v;
+            if (tot > 0) {
+                for (int b = 0; b < (int)ts.y.size(); b++) {
+                    int idx = b < cn ? b : cn - 1;
+                    s.y[idx] += w[i] * (ts.y[b] / tot);
+                }
+            }
+        }
+        for (int b = 0; b < cn; b++) stack[b] += s.y[b];
+        out.series.push_back(std::move(s));
+    }
+    double mx = 0.0; for (double v : stack) if (v > mx) mx = v;
+    out.percent      = true;
+    out.y_is_count   = false;
+    out.y_max        = mx > 0 ? mx * 1.1 : 1.0;
+    out.margin_right = 150;     /* room for the per-simpoint legend */
+    out.title        = progname + ": " + panes[canon]->title;
+    return out;
+}
+
+static TraceResult aggregate_results(std::vector<TraceResult> &rs,
+                                     const Options &opts)
+{
+    /* Program order so the montage reads left-to-right as execution. */
+    std::stable_sort(rs.begin(), rs.end(),
+        [](const TraceResult &a, const TraceResult &b) {
+            return a.start_insn < b.start_insn;
+        });
+
+    /* Normalise weights; all-zero (or missing) → even split. */
+    std::vector<double> w(rs.size());
+    double sum = 0.0;
+    for (size_t i = 0; i < rs.size(); i++) { w[i] = rs[i].weight; sum += w[i]; }
+    if (sum <= 0.0) {
+        for (double &x : w) x = 1.0 / (double)rs.size();
     } else {
-        plan.viewport_w = opts.width;
-        plan.viewport_h = opts.height;
-        write_svg_header(out, opts.width, opts.height);
-        render_plan(out, plan);
-        write_svg_footer(out);
+        for (double &x : w) x /= sum;
     }
-    if (opts.output) std::fclose(out);
-    return 0;
+
+    std::string progname = opts.agg_name ? opts.agg_name : "aggregate";
+
+    std::vector<const ChartPlan *> p1, p2;
+    std::vector<const TraceResult *> meta;
+    bool dual = rs[0].has_second_pane;
+    for (const TraceResult &r : rs) {
+        p1.push_back(&r.plan);
+        meta.push_back(&r);
+        if (dual) p2.push_back(&r.plan2);
+    }
+
+    TraceResult out;
+    out.has_second_pane = dual;
+    out.plan = aggregate_pane(p1, w, meta, opts, progname);
+    if (dual) out.plan2 = aggregate_pane(p2, w, meta, opts, progname);
+    return out;
+}
+
+/* Header-only peek: open + parse header (no body walk) to read the
+ * simpoint weight, start_insn, and warmup boundary, plus the trace's CP
+ * instruction span (total_target_insns, or a profile-summed estimate when
+ * unbounded — mirrors process_trace's bin-width derivation). */
+static TraceMeta peek_trace_meta(const char *path)
+{
+    std::unique_ptr<cst::CstFile> cf = cst::cst_file_open(path);
+    std::vector<cst::Template> templates;
+    std::unordered_map<uint32_t, size_t> by_id;
+    cst::Header h = cst::parse_header(cf->header(), &templates, &by_id);
+
+    TraceMeta m;
+    m.weight     = h.weight;
+    m.start_insn = h.start_insn;
+    m.warmup_end = h.warmup_end_arch_insns;
+    uint64_t total = h.total_target_insns;
+    if (total == 0) {
+        for (const auto &t : templates) {
+            total += (uint64_t)t.profile.exec_cp * t.insns.size();
+        }
+        if (total == 0) total = 1;
+    }
+    m.total_insns = total;
+    return m;
 }

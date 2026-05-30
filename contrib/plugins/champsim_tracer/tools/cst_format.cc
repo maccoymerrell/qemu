@@ -859,6 +859,12 @@ Header parse_header(MemberView view,
         throw std::runtime_error("encoding-map section has trailing bytes");
     }
 
+    /* §2.13: in-trace architectural CP-insn count at the
+     * warmup→simulation boundary.  Lets consumers skip warmup
+     * without re-counting BBV-vs-architectural insns under REP
+     * fan-out.  See champsim_tracer_format.md. */
+    h.warmup_end_arch_insns = r.uleb();
+
     /* Reverse-resolve every well-known name in the encoding maps to
      * its wire-format ID.  Tools dispatch off @h.ids from here on. */
     resolve_ids(h.maps, &h.ids);

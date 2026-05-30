@@ -891,6 +891,260 @@ void BodyWalker::decode_field_delta(Reader &outer,
 }
 
 /* ====================================================================
+ * §6b  Streaming BB walk  (walk_bb — zero per-BB allocation)
+ *
+ * Reuses §1's cell storage and §6's apply_record_deltas, but never runs
+ * pass-2 materialisation: instead of building dyn_params / reg_snaps
+ * vectors, the BB handed to the consumer exposes scalar accessors that
+ * read the live field-state cells on demand.  One BB at a time, CP then
+ * its WP chain, per Step 6.8 of the format spec.
+ * ==================================================================== */
+
+/* BB scalar accessors: read one cell through the (state, base) cell
+ * hierarchy.  blk_ is null when the relevant fields were not decoded
+ * for this BB (cp_fields=false, or a WP BB below Fields level), in
+ * which case the accessors return zero. */
+uint64_t BodyWalker::BB::load_count(uint32_t insn) const
+{
+    if (!blk_) return 0;
+    return lookup_cell(blk_, state_gen_, base_blk_, base_gen_,
+                       *slot_lut_, insn, ids_->fid_n_loads).low64();
+}
+uint64_t BodyWalker::BB::store_count(uint32_t insn) const
+{
+    if (!blk_) return 0;
+    return lookup_cell(blk_, state_gen_, base_blk_, base_gen_,
+                       *slot_lut_, insn, ids_->fid_n_stores).low64();
+}
+uint64_t BodyWalker::BB::load_addr(uint32_t insn, uint32_t slot) const
+{
+    if (!blk_ || slot >= FID_SLOT_COUNT) return 0;
+    return lookup_cell(blk_, state_gen_, base_blk_, base_gen_,
+                       *slot_lut_, insn, ids_->fid_load_addr[slot]).low64();
+}
+uint64_t BodyWalker::BB::store_addr(uint32_t insn, uint32_t slot) const
+{
+    if (!blk_ || slot >= FID_SLOT_COUNT) return 0;
+    return lookup_cell(blk_, state_gen_, base_blk_, base_gen_,
+                       *slot_lut_, insn, ids_->fid_store_addr[slot]).low64();
+}
+Wide BodyWalker::BB::load_data(uint32_t insn, uint32_t slot) const
+{
+    if (!blk_ || slot >= FID_SLOT_COUNT) return Wide{};
+    return lookup_cell(blk_, state_gen_, base_blk_, base_gen_,
+                       *slot_lut_, insn, ids_->fid_load_data[slot]);
+}
+Wide BodyWalker::BB::store_data(uint32_t insn, uint32_t slot) const
+{
+    if (!blk_ || slot >= FID_SLOT_COUNT) return Wide{};
+    return lookup_cell(blk_, state_gen_, base_blk_, base_gen_,
+                       *slot_lut_, insn, ids_->fid_store_data[slot]);
+}
+Wide BodyWalker::BB::dst_reg(uint32_t insn, uint32_t op) const
+{
+    if (!blk_ || op >= FID_SLOT_COUNT) return Wide{};
+    return lookup_cell(blk_, state_gen_, base_blk_, base_gen_,
+                       *slot_lut_, insn, ids_->fid_dst_reg[op]);
+}
+
+void BodyWalker::consume_field_section(Reader &outer, uint32_t template_id,
+                                       const Template *tmpl,
+                                       FieldStateTable *state,
+                                       const FieldStateTable *base_state)
+{
+    Reader sec = outer.sub();
+    uint64_t n_records = sec.uleb();
+    const ResolvedIds &ids = header_.ids;
+
+    /* Parse-skip: advance past every record's bytes without touching
+     * the state table.  No accessor at this level reads these cells,
+     * so applying them would be pure waste (Step 6.10 byte shape). */
+    if (!state) {
+        for (uint64_t i = 0; i < n_records; i++) {
+            sec.uleb();                              /* ipos delta */
+            uint16_t fid = (uint16_t)sec.uleb();
+            sec.sleb_wide();                         /* value delta */
+            if (fid == ids.fid_extended) sec.uleb(); /* ext payload */
+        }
+        return;
+    }
+
+    uint32_t need_insns = tmpl ? (uint32_t)tmpl->insns.size() : 0;
+    FieldStateBlock *state_blk =
+        table_get_or_create_block(*state, template_id,
+                                  std::max<uint32_t>(need_insns, 1));
+    const FieldStateBlock *base_blk =
+        base_state ? table_get_block(*base_state, template_id) : nullptr;
+    apply_record_deltas(*this, sec, n_records, template_id, tmpl, ids,
+                        slot_lut_, state_blk, state->generation,
+                        base_blk, base_state ? base_state->generation : 0,
+                        scalar_bits_, &BodyWalker::template_default);
+}
+
+void BodyWalker::stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
+                                    FieldStateTable &cp_state, WpDecode wp,
+                                    uint32_t seq, uint32_t thread,
+                                    const BBCallback &cb)
+{
+    const bool fields = (wp == WpDecode::Fields);
+    uint64_t num_wp = wpb.uleb();
+    int32_t prev_wp_tmpl = 0;
+    for (uint64_t w = 0; w < num_wp; w++) {
+        int32_t wt = prev_wp_tmpl + (int32_t)wpb.sleb();
+        prev_wp_tmpl = wt;
+        auto it = by_id_.find((uint32_t)wt);
+        const Template *wtmpl = (it != by_id_.end())
+            ? &templates_[it->second] : nullptr;
+
+        /* Apply (Fields) or parse-skip (Structure) this BB's deltas
+         * before reading it — Step 6.8 makes each pair self-contained,
+         * so reading now is correct even if a later BB in the chain
+         * reuses this template and overwrites the cells. */
+        consume_field_section(wpb, (uint32_t)wt, wtmpl,
+                              fields ? &wp_state : nullptr,
+                              fields ? &cp_state : nullptr);
+
+        stats_.wp_entries++;
+        BB bb;
+        bb.template_id    = (uint32_t)wt;
+        bb.template_index = (it != by_id_.end())
+            ? (uint32_t)it->second : 0xFFFFFFFFu;
+        bb.tmpl           = wtmpl;
+        bb.thread_id      = thread;
+        bb.seq_num        = seq;
+        bb.is_wp          = true;
+        bb.wp_index       = (uint32_t)w;
+        bb.wp_chain_start = (w == 0);
+        bb.wp_chain_last  = (w + 1 == num_wp);
+        bb.n_insns        = wtmpl ? (uint32_t)wtmpl->insns.size() : 0;
+        if (fields) {
+            bb.blk_       = table_get_block(wp_state, (uint32_t)wt);
+            bb.state_gen_ = wp_state.generation;
+            bb.base_blk_  = table_get_block(cp_state, (uint32_t)wt);
+            bb.base_gen_  = cp_state.generation;
+            bb.slot_lut_  = &slot_lut_;
+            bb.ids_       = &header_.ids;
+        }
+        cb(bb);
+    }
+}
+
+void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
+                                 const BBCallback &cb)
+{
+    int64_t tdelta = body_.sleb();
+    int32_t entry_tmpl = ws.prev_entry_template + (int32_t)tdelta;
+    ws.prev_entry_template = entry_tmpl;
+
+    FieldStateTable &cp_state = ws.state_at(ws.cp_states, ws.current_thread);
+
+    auto cp_it = by_id_.find((uint32_t)entry_tmpl);
+    const Template *cp_tmpl = (cp_it != by_id_.end())
+        ? &templates_[cp_it->second] : nullptr;
+
+    consume_field_section(body_, (uint32_t)entry_tmpl, cp_tmpl,
+                          cp_fields ? &cp_state : nullptr, nullptr);
+
+    uint32_t seq = ++ws.seq;
+    stats_.cp_entries++;
+
+    BB bb;
+    bb.template_id     = (uint32_t)entry_tmpl;
+    bb.template_index  = (cp_it != by_id_.end())
+        ? (uint32_t)cp_it->second : 0xFFFFFFFFu;
+    bb.tmpl            = cp_tmpl;
+    bb.thread_id       = ws.current_thread;
+    bb.seq_num         = seq;
+    bb.thread_switched = ws.pending_thread_switch;
+    bb.n_insns         = cp_tmpl ? (uint32_t)cp_tmpl->insns.size() : 0;
+    if (cp_fields) {
+        bb.blk_       = table_get_block(cp_state, (uint32_t)entry_tmpl);
+        bb.state_gen_ = cp_state.generation;
+        bb.slot_lut_  = &slot_lut_;
+        bb.ids_       = &header_.ids;
+    }
+    ws.pending_thread_switch = false;
+    cb(bb);
+
+    /* WP chain + events (Steps 6.8 / 6.9), present only under
+     * CST_FLAG_WP.  sub() consumes each section regardless of whether
+     * we walk it, so Skip / event parse-skip are one line each. */
+    if (flags_ & header_.ids.flag_wp) {
+        Reader wpb = body_.sub();
+        if (wp != WpDecode::Skip) {
+            FieldStateTable &wp_state =
+                ws.state_at(ws.wp_states, ws.current_thread);
+            stream_wp_chain_bb(wpb, wp_state, cp_state, wp, seq,
+                               ws.current_thread, cb);
+        }
+        Reader evb = body_.sub();   /* WP events: parse-skipped */
+        (void)evb;
+    }
+}
+
+void BodyWalker::skip_iframe_bb()
+{
+    /* IFRAME (Step 6.5): cp_delta_section [+ wp_chain + wp_events
+     * under CST_FLAG_WP], no leading template delta.  Consume the
+     * sections to stay byte-aligned; the streaming path does not
+     * field-validate. */
+    { Reader sec = body_.sub(); (void)sec; }
+    if (flags_ & header_.ids.flag_wp) {
+        { Reader wpb = body_.sub(); (void)wpb; }
+        { Reader evb = body_.sub(); (void)evb; }
+    }
+    stats_.iframe_count++;
+}
+
+void BodyWalker::walk_bb(bool cp_fields, WpDecode wp,
+                         const BBCallback &cb, const RegfileCallback &rb)
+{
+    /* WP field cells fall back to the CP field state (base_state), so
+     * reconstructing WP fields requires the CP deltas to have been
+     * applied — a WP BB that reuses a CP template need not re-encode an
+     * unchanged n_loads/addr.  Force CP-field decode whenever WP fields
+     * are requested, regardless of what the caller passed. */
+    if (wp == WpDecode::Fields) cp_fields = true;
+
+    WalkState ws;
+    std::optional<uint64_t> footer_num_entries;
+    const ResolvedIds &ids = header_.ids;
+
+    for (;;) {
+        uint8_t tag = body_.u8();
+
+        if (tag == ids.body_tag_end) {
+            footer_num_entries = handle_end();
+            break;
+        }
+        if (tag == ids.body_tag_thread_switch) {
+            handle_thread_switch(ws);
+            continue;
+        }
+        if (tag == ids.body_tag_regfile) {
+            handle_regfile(rb);
+            continue;
+        }
+        if (tag == ids.body_tag_entry) {
+            handle_entry_bb(ws, cp_fields, wp, cb);
+            if (max_entries_ && stats_.cp_entries >= max_entries_) {
+                return;
+            }
+            continue;
+        }
+        if (tag == ids.body_tag_iframe) {
+            skip_iframe_bb();
+            continue;
+        }
+        throw std::runtime_error("Unknown body tag");
+    }
+
+    if (footer_num_entries && *footer_num_entries != ws.seq) {
+        throw std::runtime_error("Footer entry-count mismatch");
+    }
+}
+
+/* ====================================================================
  * §7  Instruction fan-out  (instructions_from_entry)
  *
  * Converts the entry-shaped output of walk() into a flat sequence of

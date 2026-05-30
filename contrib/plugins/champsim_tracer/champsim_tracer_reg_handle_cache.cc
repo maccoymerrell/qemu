@@ -169,6 +169,7 @@ bool cst_reg_read_u64(unsigned cpu_index, const QemuRegKey *key, uint64_t *out)
     int n = qemu_plugin_read_register(handle, buf);
     bool ok = false;
     if (n > 0) {
+        cst_normalize_reg_bytes_to_le(buf->data, (size_t)n);
         uint64_t v = 0;
         size_t take = (size_t)n < sizeof(v) ? (size_t)n : sizeof(v);
         memcpy(&v, buf->data, take);

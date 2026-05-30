@@ -108,6 +108,7 @@ void capture_initial_regfile(unsigned int cpu_index,
                     if (w > CST_MAX_WIDE_BYTES) {
                         w = CST_MAX_WIDE_BYTES;
                     }
+                    cst_normalize_reg_bytes_to_le(buf->data, w);
                     snap.width_bytes = (uint8_t)w;
                     memcpy(snap.bytes, buf->data, w);
                 }

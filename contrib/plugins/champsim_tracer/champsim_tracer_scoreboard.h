@@ -33,6 +33,17 @@ public:
     qemu_plugin_u64 prev_bb_terminus;
     qemu_plugin_u64 insn_count;
     qemu_plugin_u64 last_counted_start_pc;
+    /* is_active mirror (per-vCPU 0/1) for cond_cb gating of per-insn
+     * heavy callbacks. */
+    qemu_plugin_u64 is_active;
+    /* Signed budget that counts down by n_insns per TB exec (via
+     * INLINE_ADD_U64 with imm = (uint64_t)(-n_insns)).  When it drops
+     * below 1, a cond_cb fires (vcpu_tb_check_budget) to handle the
+     * threshold crossing — opening the next segment or shutting down.
+     * Set to a large positive value while in-segment so the cb does
+     * not fire; reset by finish_trace_segment to (next_eff_start -
+     * current_icount). */
+    qemu_plugin_u64 budget;
 
 private:
     struct qemu_plugin_scoreboard *sb_;

@@ -511,6 +511,13 @@ struct BodyStreamState {
     uint64_t num_entries;
     uint64_t body_off;
     uint8_t  header_flags;   /* CST_FLAG_* bits emitted in header */
+    /* In-trace architectural CP-insn count at the warmup→simulation
+     * transition for this segment.  Stashed by the segment manager
+     * just before body_stream_finish so the value lands in the
+     * header (right before the templates section).  Consumer counts
+     * body-entry arch insns and switches to "simulation" once it
+     * passes this count.  0 = no warmup configured. */
+    uint64_t warmup_end_arch_insns;
 };
 
 /* ========================= Template dictionary ========================= */
@@ -3388,6 +3395,12 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
  * @header_bytes receives the header buffer (ownership transferred);
  * caller frees it via g_byte_array_unref.
  */
+void body_stream_set_warmup_end_arch_insns(BodyStreamState *st,
+                                           uint64_t value)
+{
+    st->warmup_end_arch_insns = value;
+}
+
 void body_stream_finish(BodyStreamState *st, GByteArray **header_bytes)
 {
     uint64_t stats_start = bw_tell_bytes(&st->bw);
@@ -3401,6 +3414,9 @@ void body_stream_finish(BodyStreamState *st, GByteArray **header_bytes)
      * dominant corruption mode for pipe-compressed traces. */
     bw_write_u32_le(&st->bw, CST_MAGIC);
     bw_flush(&st->bw);
+
+    /* --- warmup→simulation arch-insn marker (header §2.13). --- */
+    bw_write_uleb128(&st->header_bw, st->warmup_end_arch_insns);
 
     /* --- Append the templates section to the header buffer. --- */
     g_mutex_lock(&data_lock);

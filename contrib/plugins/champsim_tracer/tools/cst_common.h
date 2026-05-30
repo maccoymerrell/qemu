@@ -493,6 +493,13 @@ struct Header {
     uint64_t start_insn = 0;
     uint64_t warmup_insns = 0;
     uint64_t total_target_insns = 0;
+    /* In-trace architectural CP-insn count at the warmup→simulation
+     * boundary.  Consumer counts body-entry arch insns; once it
+     * passes this many, the simulation phase has begun.  Decouples
+     * warmup_insns (BBV-style, matches the inline_add budget) from
+     * what the trace actually contains after REP fan-out.  Sentinel
+     * UINT64_MAX = warmup boundary not crossed in this segment. */
+    uint64_t warmup_end_arch_insns = 0;
     /* SimPoint weight: fraction of whole-program execution this
      * segment represents (0.0 for non-simpoint segments). */
     double   weight = 0.0;

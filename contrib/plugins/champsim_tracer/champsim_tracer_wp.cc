@@ -82,6 +82,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                                      cpu_index);
     g_wp_state.saved_prev_bb_terminus =
         qemu_plugin_u64_get(g_scoreboard.prev_bb_terminus, cpu_index);
+    g_wp_state.saved_budget = qemu_plugin_u64_get(g_scoreboard.budget, cpu_index);
     g_wp_state.in_progress = true;
 
     qemu_plugin_spec_mode_begin(saved_state);
@@ -751,6 +752,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                         g_wp_state.saved_prev_fall_through);
     qemu_plugin_u64_set(g_scoreboard.prev_bb_terminus, cpu_index,
                         g_wp_state.saved_prev_bb_terminus);
+    qemu_plugin_u64_set(g_scoreboard.budget, cpu_index, g_wp_state.saved_budget);
 
     qemu_plugin_spec_mode_end();
     qemu_plugin_cpu_state_restore(saved_state);

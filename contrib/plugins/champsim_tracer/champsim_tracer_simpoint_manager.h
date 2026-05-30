@@ -33,11 +33,15 @@ public:
 
     /* True if any simpoint entries are loaded.  Driving code uses this
      * to decide whether to apply the simpoint state machine in the
-     * vcpu_tb_exec hot path. */
-    bool is_active() const { return entries_ && entries_->len > 0; }
+     * vcpu_tb_exec hot path.  Uses the cached size so atexit-time
+     * reads (post-dtor) don't UAF. */
+    bool is_active() const { return size_ > 0; }
 
-    /* Total entries loaded. */
-    size_t size() const { return entries_ ? entries_->len : 0; }
+    /* Total entries loaded.  Cached at load() time so post-shutdown
+     * readers (e.g. plugin_atexit, which runs AFTER this object's
+     * static dtor under exit(0) cleanup ordering) don't UAF
+     * entries_->len. */
+    size_t size() const { return size_; }
 
     /* Index of the entry the iterator is currently pointing at.  After
      * exhausting all entries this equals size(). */
@@ -59,6 +63,7 @@ private:
     GArray  *entries_ = nullptr;
     unsigned int    current_idx_ = 0;
     uint64_t interval_insns_ = 0;
+    size_t   size_ = 0;
 };
 
 extern SimPointManager g_simpoints;

@@ -42,6 +42,10 @@ struct WPThreadState {
     uint64_t saved_prev_start_pc = 0;
     uint64_t saved_prev_fall_through = 0;
     uint64_t saved_prev_bb_terminus = 0;
+    /* Budget slot is decremented per spec-mode TB via the inline_add;
+     * save+restore so the WP simulation doesn't trip
+     * vcpu_tb_check_budget after returning to CP. */
+    uint64_t saved_budget = 0;
 
     /* Template of the TB the WP simulator most recently ran via
      * qemu_plugin_exec_tb.  Set by vcpu_tb_exec from its own per-TB

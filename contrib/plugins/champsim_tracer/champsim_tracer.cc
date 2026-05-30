@@ -44,6 +44,13 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 int max_wrong_path_depth = 64;
 bool enable_wrong_path = true;
 static char *unknown_warn_path = nullptr;
+/* File for the final stats / icount report.  Opened at install time
+ * so it has a valid fd even after QEMU closes stderr during the
+ * guest's exit-syscall path (which would otherwise turn our
+ * qemu_plugin_outs writes into EBADF).  Flushed and closed in
+ * plugin_exit. */
+static char *stats_path = nullptr;
+static FILE *stats_file = nullptr;
 static char *program_name = nullptr;
 const char *target_name;
 FILE *unknown_warn_file;
@@ -121,6 +128,81 @@ thread_local BBTemplate *g_cp_prev_tb_template = nullptr;
  * no active in-flight chain. */
 thread_local bool g_icount_shutdown_pending = false;
 
+/* Simpoint analogue of g_icount_shutdown_pending: tw_manage_window
+ * detects icount_prev >= window_stop optimistically (counter bumped
+ * by the current TB), but the chain assembler may still hold
+ * fragments waiting for a branch terminator.  Closing here would
+ * truncate the trace below the requested simulation_insns; defer
+ * the actual finish_trace_segment / g_simpoints.advance to a
+ * vcpu_tb_exec tail when has_active_chain() is false (= at a true-BB
+ * boundary).  Each bumped insn then either makes it into the trace
+ * or never triggered the bump in the first place. */
+thread_local bool g_simpoint_close_pending = false;
+
+/* Next icount threshold above which vcpu_tb_exec MUST take the slow
+ * path (acquire exec_lock and call tw_manage_window).  Below this
+ * threshold the callback is allowed to just bump the per-vCPU icount
+ * slot and return — no mutex, no tw_manage_window, no scoreboard
+ * contention.
+ *
+ * Meaning by phase:
+ *   - inter-segment: the next eff_start (next simpoint open icount,
+ *     or window_start in icount mode).  Set to UINT64_MAX when no
+ *     more opens are possible (= drained simpoint list).
+ *   - in-segment: 0, so the slow path always runs (chain emit, BB
+ *     emit, WP, close detect).
+ *
+ * Updated from start_trace_segment / finish_trace_segment under
+ * exec_lock; the fast path reads relaxed because a one-TB lag is
+ * harmless (next slow-path TB will see the new value and act on it).
+ * This is the hot-path optimisation for the inter-segment gap, where
+ * profiling (perf record) showed g_mutex_lock + g_mutex_unlock
+ * accounting for >20% of CPU. */
+std::atomic<uint64_t> g_next_threshold{UINT64_MAX};
+
+/* Host-side mirror of the per-vCPU icount accumulator.  The scoreboard
+ * slot (g_scoreboard.insn_count) is the source of truth at runtime,
+ * but QEMU tears down the scoreboard storage in qemu_plugin_user_exit
+ * before our plugin_exit callback fires — so by the time we want to
+ * print the final icount, that slot reads back as freed memory.  This
+ * thread_local mirror is bumped at the same point as the scoreboard
+ * slot inside vcpu_tb_exec; it stays valid through plugin_exit. */
+thread_local uint64_t g_host_icount = 0;
+
+/* Total sub-entries emitted by REP fan-out (sum of (n_iter - 1)
+ * across every emit_body_entry call that fanned out).  Each
+ * sub-entry uses the 1-insn rep_subtmpl, so this counter is the
+ * architectural insns the trace contains BEYOND the per-TB-exec
+ * inline_add count, scoped to in-segment because emit_body_entry
+ * only runs when a trace stream is open. */
+std::atomic<uint64_t> g_rep_fanout_extra_insns{0};
+
+/* Sum of per-segment `covered` (icount[finish] - icount[start])
+ * accumulated at finish_trace_segment.  Matches the BBV-equivalent
+ * TB-exec insn count for the portion of execution that landed in
+ * trace files. */
+std::atomic<uint64_t> g_traced_icount{0};
+
+/* Sum of per-segment g_seg_arch_insns accumulated at finish.
+ * Matches cst_audit's "CP insns (total)" summed across all
+ * segments — the actual architectural insn count the body
+ * streams carry, including REP fan-out sub-entries and the
+ * BB-end-deferral drain. */
+std::atomic<uint64_t> g_total_arch_insns{0};
+
+/* Defined later after g_window_mode / warmup_insns are in scope. */
+static void recompute_next_threshold(void);
+/* Set the per-vCPU `budget` scoreboard slot so the JIT-emitted
+ * INLINE_ADD_U64(-n_insns) per TB will hit < 1 exactly when the next
+ * eff_start is reached, firing vcpu_tb_check_budget once.  In-segment
+ * we set a sentinel that won't be crossed during a single segment
+ * window. */
+static void recompute_budget(unsigned int cpu_index);
+/* Sentinel for the budget slot while in-segment.  Large enough that
+ * even billion-instruction segments don't decrement it past zero. */
+#define BUDGET_INACTIVE_SENTINEL ((int64_t)1ULL << 62)
+static void vcpu_tb_check_budget(unsigned int cpu_index, void *udata);
+
 /* Symbol-trigger state (trace_window=symbol:...).  start_symbol_match
  * _count counts TBs whose template names start_symbol; on reaching
  * start_symbol_occurrence we open a segment of simulation_insns. */
@@ -128,6 +210,66 @@ static char     *start_symbol            = nullptr;
 static uint64_t  start_symbol_occurrence = 1;
 static uint64_t  start_symbol_match_count = 0;
 static int       g_window_mode           = 0; /* PluginConfig::WIN_AUTO */
+
+/* Recompute g_next_threshold given the current segments / simpoint
+ * state.  Caller holds exec_lock OR is on the install-time path
+ * before any vCPU thread has fired. */
+static void recompute_next_threshold(void)
+{
+    if (g_trace_segments.is_active()) {
+        g_next_threshold.store(0, std::memory_order_relaxed);
+        return;
+    }
+    if (g_window_mode == PluginConfig::WIN_ICOUNT) {
+        g_next_threshold.store(g_trace_segments.window_start(),
+                               std::memory_order_relaxed);
+        return;
+    }
+    if (g_window_mode == PluginConfig::WIN_SIMPOINT) {
+        if (const SimPointEntry *sp = g_simpoints.current()) {
+            uint64_t eff_start = (sp->start_insn > warmup_insns)
+                ? sp->start_insn - warmup_insns : 0;
+            g_next_threshold.store(eff_start,
+                                   std::memory_order_relaxed);
+        } else {
+            g_next_threshold.store(UINT64_MAX,
+                                   std::memory_order_relaxed);
+        }
+        return;
+    }
+    /* Symbol mode opens on TB template symbol name, not on an icount
+     * threshold; every TB must take the slow path. */
+    g_next_threshold.store(0, std::memory_order_relaxed);
+}
+
+/* Companion to recompute_next_threshold for the per-vCPU budget slot.
+ * In-segment: sentinel large positive so vcpu_tb_check_budget never
+ * fires.  Inter-segment: countdown from now to next eff_start, so a
+ * sequence of INLINE_ADD_U64(-n_insns) per TB walks the slot down to
+ * zero exactly when icount reaches the threshold. */
+static void recompute_budget(unsigned int cpu_index)
+{
+    int64_t target;
+    if (g_trace_segments.is_active()) {
+        target = BUDGET_INACTIVE_SENTINEL;
+    } else {
+        uint64_t threshold = g_next_threshold.load(
+            std::memory_order_relaxed);
+        if (threshold == UINT64_MAX) {
+            target = BUDGET_INACTIVE_SENTINEL;
+        } else {
+            uint64_t icount_now = qemu_plugin_u64_get(
+                g_scoreboard.insn_count, cpu_index);
+            target = (int64_t)threshold - (int64_t)icount_now;
+            if (target < 1) {
+                /* Already past the threshold; still need the cb to
+                 * fire once to handle it. */
+                target = 0;
+            }
+        }
+    }
+    qemu_plugin_u64_set(g_scoreboard.budget, cpu_index, (uint64_t)target);
+}
 
 /* ========================= Thread ID assignment =========================
  *
@@ -146,6 +288,7 @@ static uint64_t simpoint_interval_insns = 100000000ULL;
 TraceISA trace_isa = TRACE_ISA_UNKNOWN;
 int cst_cap_arch = -1;
 unsigned int cst_cap_mode;
+bool target_big_endian = false;
 
 static_assert(TRACE_ISA_MIPS < 256,
               "TraceISA no longer fits in u8");
@@ -183,6 +326,17 @@ static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
     if (enable_reg_data) {
         g_reg_handle_cache.ensure_initialized(cpu_index);
     }
+
+    /* If the trace_window opened a segment at install time (icount
+     * start=0), the scoreboard is_active slot couldn't be set then
+     * because no vCPU existed.  Back-fill it now so the per-insn
+     * cond_cb gates fire for this vCPU.  Initialize the budget slot
+     * too — either the in-segment sentinel or the inter-segment
+     * countdown to the first eff_start, depending on state. */
+    if (g_trace_segments.is_active_atomic()) {
+        qemu_plugin_u64_set(g_scoreboard.is_active, cpu_index, 1);
+    }
+    recompute_budget(cpu_index);
 
     /* Snapshot the main binary's text-segment range on first vCPU
      * init.  qemu_plugin_start_code() / end_code() dereference the
@@ -331,6 +485,7 @@ static inline uint64_t read_reg_u64(unsigned int cpu_index,
     if (n <= 0) {
         return 0;
     }
+    cst_normalize_reg_bytes_to_le(scratch->data, (size_t)n);
     uint64_t val = 0;
     size_t copy = (size_t)n < sizeof(val) ? (size_t)n : sizeof(val);
     memcpy(&val, scratch->data, copy);
@@ -465,6 +620,24 @@ static void reset_segment_local_state(void)
     pending_reg_snaps.clear();
 }
 
+/* Snapshot of g_rep_fanout_extra_insns at segment open, so
+ * finish_trace_segment can diff and report per-segment fan-out. */
+static uint64_t g_seg_fanout_start = 0;
+
+/* Segment-local architectural CP-insn counter.  Bumped by parent
+ * BB template n_insns (and +1 per REP sub-iteration) inside
+ * emit_body_entry so it tracks exactly what cst_audit counts off
+ * the body stream.  At the warmup→simulation transition (host
+ * icount reaches window_start + warmup_insns) we snapshot this
+ * into g_seg_warmup_end_arch_insns, which finish_trace_segment
+ * then writes into the header (§2.13). */
+static uint64_t g_seg_arch_insns = 0;
+/* UINT64_MAX sentinel = warmup boundary has not been crossed
+ * (segment cut short, or warmup_insns==0 and no entry emitted
+ * yet).  0 is a legitimate value (warmup_insns==0 → captured at
+ * the very first entry). */
+static uint64_t g_seg_warmup_end_arch_insns = UINT64_MAX;
+
 static void start_trace_segment(const char *label,
                                 uint64_t start, uint64_t stop,
                                 uint64_t warmup,
@@ -473,6 +646,10 @@ static void start_trace_segment(const char *label,
                                 double simpoint_weight)
 {
     reset_segment_local_state();
+    g_seg_fanout_start = g_rep_fanout_extra_insns.load(
+        std::memory_order_relaxed);
+    g_seg_arch_insns = 0;
+    g_seg_warmup_end_arch_insns = UINT64_MAX;
 
     /* Capture the architectural register file so consumers can prime
      * register state without replaying a prior segment's dst-write
@@ -484,6 +661,24 @@ static void start_trace_segment(const char *label,
 
     g_trace_segments.start(label, start, stop, warmup, total_target,
                            (uint32_t)cpu_index, simpoint_weight, &regfile);
+
+    /* Segment is active now → next-threshold becomes 0 so the
+     * fast-path bail never fires in-segment (every TB takes the slow
+     * path for chain emit + close-detect). */
+    recompute_next_threshold();
+
+    /* Mirror is_active into the per-vCPU scoreboard so the per-insn
+     * heavy callbacks (registered with QEMU_PLUGIN_COND_GE 1) fire.
+     * Also park the budget slot at the sentinel so
+     * vcpu_tb_check_budget does not fire during the segment.  Skip
+     * the slot writes on the install-time call (cpu_index == -1, no
+     * vCPU yet); vcpu_init_cb back-fills both when a vCPU actually
+     * appears with the manager already in "active" state. */
+    if (cpu_index != (unsigned)-1) {
+        qemu_plugin_u64_set(g_scoreboard.is_active, cpu_index, 1);
+        qemu_plugin_u64_set(g_scoreboard.budget, cpu_index,
+                            (uint64_t)BUDGET_INACTIVE_SENTINEL);
+    }
 
     uint64_t span = stop > start ? stop - start : 0;
     progress_step = span >= 10 ? span / 10 : 1;
@@ -570,6 +765,21 @@ static void emit_body_entry(BodyStreamState *out_stream,
                             unsigned int cpu_index,
                             std::vector<WPBBEntry> wp_entries)
 {
+    /* warmup→simulation boundary capture.  This BB is the first
+     * emitted at host_icount >= window_start + warmup_insns, so
+     * the consumer reads the simulation phase as "after this many
+     * in-trace architectural insns".  Snapshot g_seg_arch_insns
+     * BEFORE this entry's insns get added so the value points at
+     * the first sim-phase entry, not past it. */
+    if (g_seg_warmup_end_arch_insns == UINT64_MAX &&
+        g_trace_segments.is_active()) {
+        uint64_t simpoint_start =
+            g_trace_segments.window_start() + warmup_insns;
+        if (g_host_icount >= simpoint_start) {
+            g_seg_warmup_end_arch_insns = g_seg_arch_insns;
+        }
+    }
+
     BodyEntry entry;
     entry.seq_num = g_trace_segments.next_seq_num();
     entry.template_id = bb_tmpl ? bb_tmpl->template_id : 0;
@@ -623,6 +833,15 @@ static void emit_body_entry(BodyStreamState *out_stream,
             }
             size_t n_iter = rep_dps.size() / mpi;
             if (n_iter > 1) {
+                /* Track sub-entries (iters 2..N) that this fan-out
+                 * will emit beyond the single TB-exec icount bump.
+                 * Each sub-entry contributes 1 architectural insn
+                 * via the 1-insn rep_subtmpl, so the increment is
+                 * (n_iter - 1).  Cumulative at exit lets us verify
+                 *   trace_insns == g_host_icount + this_counter. */
+                g_rep_fanout_extra_insns.fetch_add(
+                    (uint64_t)(n_iter - 1),
+                    std::memory_order_relaxed);
                 /* Iter 1: parent BB template + non-REP memops +
                  * first mpi REP memops. */
                 entry.dyn_params = std::move(other_dps);
@@ -633,6 +852,12 @@ static void emit_body_entry(BodyStreamState *out_stream,
                 if (out_stream) {
                     body_stream_write_entry(out_stream, &entry);
                 }
+                /* Parent + (n_iter-1) rep_subtmpl entries, each
+                 * counted as 1 arch insn for the warmup boundary
+                 * tracker. */
+                g_seg_arch_insns +=
+                    (bb_tmpl ? bb_tmpl->n_insns : 0)
+                    + (uint64_t)(n_iter - 1);
                 /* Iter 2..N: rep_subtmpl, mpi memops each, insn_index
                  * remapped to 0 (sub has exactly one insn). */
                 for (size_t k = 1; k < n_iter; k++) {
@@ -660,6 +885,7 @@ static void emit_body_entry(BodyStreamState *out_stream,
     if (out_stream) {
         body_stream_write_entry(out_stream, &entry);
     }
+    g_seg_arch_insns += bb_tmpl ? bb_tmpl->n_insns : 0;
 }
 
 /*
@@ -747,20 +973,74 @@ static void flush_pending_final_body_entry(void)
  */
 static void finish_trace_segment(void)
 {
-    {
-        uint64_t lo = g_trace_segments.window_start();
-        uint64_t hi = g_trace_segments.window_stop();
-        if (hi == UINT64_MAX) {
-            fprintf(stderr,
-                    "champsim_tracer: finished segment [icount %"
-                    PRIu64 " .. unbounded]\n", lo);
-        } else {
-            fprintf(stderr,
-                    "champsim_tracer: finished segment [icount %"
-                    PRIu64 " .. %" PRIu64 "]\n", lo, hi);
-        }
+    uint64_t lo = g_trace_segments.window_start();
+    uint64_t hi = g_trace_segments.window_stop();
+
+    /* Hand the warmup→simulation arch-insn boundary to the body
+     * stream so body_stream_finish writes it into the header
+     * (§2.13 in champsim_tracer_format.md). */
+    if (BodyStreamState *bs = g_trace_segments.body_stream()) {
+        body_stream_set_warmup_end_arch_insns(
+            bs, g_seg_warmup_end_arch_insns);
     }
+    /* Drain any chain still in flight.  This may call emit_body_entry
+     * one or more times, which bumps g_seg_arch_insns — so we print
+     * the per-segment stats AFTER finish() returns so the counter
+     * reflects the entire segment, including the trailing chain. */
     g_trace_segments.finish(flush_pending_final_body_entry);
+
+    /* Actual icount at finish — must be >= window_stop for the
+     * trace to be at-least-budget.  Underrun means we stopped
+     * tracing before the configured stop (guest exit, or worse,
+     * a bug in close-pending plumbing). */
+    if (hi == UINT64_MAX) {
+        fprintf(stderr,
+                "champsim_tracer: finished segment [icount %"
+                PRIu64 " .. unbounded]  actual_icount=%"
+                PRIu64 "\n", lo, g_host_icount);
+    } else {
+        uint64_t budget = hi - lo;
+        uint64_t covered = g_host_icount > lo
+            ? g_host_icount - lo : 0;
+        const char *flag = covered >= budget ? "OK" : "UNDER";
+        /* Per-segment rep_fanout: diff against the snapshot taken
+         * at start_trace_segment.  Makes "architectural CP insns
+         * in this trace > covered" visible (the trace fans REP
+         * out N-way while the BBV-style inline_add only bumps by
+         * 1 per REP TB-exec). */
+        uint64_t fanout_now = g_rep_fanout_extra_insns.load(
+            std::memory_order_relaxed);
+        uint64_t seg_fanout = fanout_now - g_seg_fanout_start;
+        /* trace_arch_insns is the truth: summed inside
+         * emit_body_entry from each entry's template->n_insns
+         * (plus +1 per REP sub-iteration), so it equals exactly
+         * what cst_audit will report as "CP insns (total)".  We
+         * still print rep_fanout for visibility into where the
+         * arch-vs-BBV divergence comes from. */
+        fprintf(stderr,
+                "champsim_tracer: finished segment [icount %"
+                PRIu64 " .. %" PRIu64 "]  actual_icount=%"
+                PRIu64 "  covered=%" PRIu64
+                "  budget=%" PRIu64 "  rep_fanout=%" PRIu64
+                "  trace_arch_insns=%" PRIu64 "  %s\n",
+                lo, hi, g_host_icount, covered, budget,
+                seg_fanout, g_seg_arch_insns, flag);
+        g_traced_icount.fetch_add(covered,
+                                  std::memory_order_relaxed);
+        g_total_arch_insns.fetch_add(g_seg_arch_insns,
+                                     std::memory_order_relaxed);
+    }
+
+    /* Mirror is_active=0 into every vCPU's scoreboard slot so the
+     * per-insn heavy callbacks stop firing across the inter-segment
+     * gap.  Setting the manager's atomic above already gates the C
+     * early-bail; this slot gates the JIT cond_cb.  The budget slot
+     * is re-armed in the caller (close handler) AFTER it advances
+     * simpoint state and calls recompute_next_threshold, so the
+     * countdown targets the post-advance next eff_start. */
+    for (int i = 0; i < qemu_plugin_num_vcpus(); i++) {
+        qemu_plugin_u64_set(g_scoreboard.is_active, i, 0);
+    }
 
     /* Per-segment stats: diff against the segment-start snapshot. */
     Stats seg_stats;
@@ -1060,8 +1340,16 @@ static void tw_manage_window(unsigned int cpu_index,
     } else if (g_simpoints.is_active()) {
         if (g_trace_segments.is_active() &&
             icount_prev >= g_trace_segments.window_stop()) {
-            finish_trace_segment();
-            g_simpoints.advance();
+            /* icount has optimistically crossed window_stop but the
+             * chain assembler may still have in-flight fragments
+             * awaiting a branch terminator.  Defer the actual
+             * finish + advance to a BB boundary at the tail of
+             * vcpu_tb_exec (symmetric to the icount-shutdown path
+             * just above).  Until then we stay is_active so pending
+             * fragments emit normally and the trace covers the full
+             * simulation_insns window. */
+            g_simpoint_close_pending = true;
+            return;
         }
         if (!g_trace_segments.is_active()) {
             if (const SimPointEntry *sp = g_simpoints.current()) {
@@ -1144,91 +1432,56 @@ static void tw_manage_window(unsigned int cpu_index,
     }
 }
 
-/*
- * Lightweight TB-exec callback used while no segment is active.  The
- * heavy `vcpu_tb_exec` keeps the chain assembler running, emits body
- * entries, etc. — all wasted work between segments.  The light path
- * does just the two things needed during the inactive gap:
- *
- *   1. Maintain the architectural icount (with the same REP-reentry
- *      suppression the heavy path applies) so window-start triggers
- *      fire on the correct insn.
- *   2. Re-check `tw_manage_window`; if it opened a segment, force a
- *      TB-cache flush so every subsequent execution re-translates
- *      through the heavy `vcpu_tb_trans` path with `is_active=true`.
- *
- * `udata` carries the TB's `n_insns` (cast to uintptr_t) so we can
- * bump the icount without consulting a BBTemplate — the whole point
- * of light mode is that no template was built at translation time.
- *
- * Symbol-trigger mode is excluded from light mode because its match
- * predicate needs the BB's symbol_name (carried on the template);
- * `vcpu_tb_trans` keeps using the heavy path while
- * `g_window_mode == WIN_SYMBOL`.
- */
-static void vcpu_tb_exec_light(unsigned int cpu_index, void *udata)
+/* Threshold-crossing handler registered as a cond_cb on the budget
+ * scoreboard slot (COND_GE (1<<63) on the u64 storage — see the
+ * registration site for the signed-negative-via-unsigned trick).
+ * Fires when the per-TB INLINE_ADD_U64(-n_insns) decrements the
+ * budget into the signed-negative range — i.e., when icount has
+ * reached the next eff_start.  Open the segment via tw_manage_window
+ * and reset the budget so the cond becomes false again.  During WP
+ * simulation we bail without touching the budget since spec-mode TBs
+ * decrement it too; finish_wp restores the pre-WP budget value,
+ * which re-triggers this cb cleanly post-WP. */
+static void vcpu_tb_check_budget(unsigned int cpu_index, void *udata)
 {
-    uint64_t n_insns = (uint64_t)(uintptr_t)udata;
-
+    (void)udata;
+    if (g_wp_state.in_progress) {
+        /* No-op inside WP; spec-mode TB inline_adds will keep firing
+         * this cb on every spec TB until WP restores the saved
+         * budget.  The cost is one C call + return per spec TB. */
+        return;
+    }
     g_mutex_lock(&exec_lock);
     if (g_trace_segments.is_shutting_down()) {
         g_mutex_unlock(&exec_lock);
         return;
     }
-
-    /* Same REP-reentry suppression as the heavy path: a single-insn
-     * TB re-fired at the same start_pc is one architectural insn
-     * (x86 REP string ops translate to a 1-insn TB looped per REP
-     * iteration). */
-    uint64_t cur_start_pc = qemu_plugin_u64_get(
-        g_scoreboard.current_pc, cpu_index);
-    uint64_t icount_prev = qemu_plugin_u64_get(
+    uint64_t icount_now = qemu_plugin_u64_get(
         g_scoreboard.insn_count, cpu_index);
-    uint64_t last_counted = qemu_plugin_u64_get(
-        g_scoreboard.last_counted_start_pc, cpu_index);
-    bool is_rep_reentry = (n_insns == 1 && cur_start_pc == last_counted);
-    if (!is_rep_reentry) {
-        qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index,
-                            icount_prev + n_insns);
-        qemu_plugin_u64_set(g_scoreboard.last_counted_start_pc,
-                            cpu_index, cur_start_pc);
-    }
-
-    tw_manage_window(cpu_index, icount_prev, /* cur_tb_tmpl */ nullptr);
-    bool need_flush = g_trace_segments.is_active();
+    g_host_icount = icount_now;
+    /* tw_manage_window handles both icount-mode and simpoint-mode
+     * open/close logic.  Passing icount_now (post-inline-add value)
+     * matches BBV's "count past threshold" semantics. */
+    tw_manage_window(cpu_index, icount_now, nullptr);
+    /* Re-arm the budget for the next event.  In-segment: sentinel
+     * (won't fire while is_active=1 dispatches to vcpu_tb_exec for
+     * close detection).  Inter-segment: countdown to next eff_start. */
+    recompute_budget(cpu_index);
     g_mutex_unlock(&exec_lock);
-
-    if (need_flush) {
-        /* The current TB still finishes on its light translation
-         * (so its body entry is NOT in the trace — a one-TB lossy
-         * boundary at segment open).  The next TB cache miss
-         * triggers re-translation, vcpu_tb_trans now sees
-         * is_active=true, and we get full instrumentation from
-         * that TB onward.  qemu_plugin_request_tb_flush wraps
-         * QEMU's tb_flush and is async-safe relative to the
-         * current TB execution. */
-        qemu_plugin_request_tb_flush();
-    }
 }
 
 static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 {
-    /* udata = the head fragment of this TB's per-translation fragment
+    /* This callback is registered via register_vcpu_tb_exec_cond_cb
+     * with COND_GE on is_active, so the JIT only dispatches it when
+     * we're in-segment.  Inter-segment dispatch is handled solely by
+     * inline_add (icount/budget) and vcpu_tb_check_budget.
+     *
+     * udata = the head fragment of this TB's per-translation fragment
      * list, set when the translation was armed in vcpu_tb_trans.
      * Both CP-mode and WP-mode (qemu_plugin_exec_tb) invocations
-     * deliver the executing TB through the same pointer — no start_pc
-     * lookup, no shape ambiguity between sibling translations of the
-     * same address.  Sum across the linked fragment list so n_insns
-     * reflects the whole QEMU TB's instruction count; counting only
-     * the head would under-bump insn_count on multi-fragment TBs
-     * (mid-TB branch present) and let the trace overshoot its
-     * configured stop. */
+     * deliver the executing TB through the same pointer. */
     BBTemplate *cur_tb_tmpl = (BBTemplate *)udata;
-    uint64_t n_insns = 0;
-    for (BBTemplate *f = cur_tb_tmpl; f != nullptr;
-         f = f->next_tb_fragment) {
-        n_insns += f->n_insns;
-    }
 
     /* WP-mode early-out runs BEFORE exec_lock acquisition.  The CP
      * thread that triggered this WP simulation already holds
@@ -1242,6 +1495,21 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         return;
     }
 
+    /* icount bump is now an inline_add registered AFTER this cb in
+     * vcpu_tb_trans, so the scoreboard slot still holds the pre-TB
+     * value at this point — matches the old icount_prev semantics
+     * that tw_manage_window expects. */
+    uint64_t icount_prev = qemu_plugin_u64_get(
+        g_scoreboard.insn_count, cpu_index);
+    g_host_icount = icount_prev;
+
+    /* Snapshot the previous-TB cursor BEFORE updating it.  The chain
+     * emit below walks this fragment list as "the TB that ran just
+     * before this one", so it must capture the value g_cp_prev_tb_template
+     * held on entry — NOT the value we are about to write. */
+    BBTemplate *prev_cp_tb_tmpl = g_cp_prev_tb_template;
+    g_cp_prev_tb_template = cur_tb_tmpl;
+
     g_mutex_lock(&exec_lock);
 
     if (g_trace_segments.is_shutting_down()) {
@@ -1249,46 +1517,34 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         return;
     }
 
-    /* Update the per-vCPU instruction counter (CP path only — the
-     * WP-mode early-out above already returned).
-     *
-     * QEMU emits x86 REP string ops as a single-insn TB re-executed
-     * once per REP iteration, each re-exec firing vcpu_tb_exec with
-     * the same start_pc.  Skipping the increment when n_insns == 1 &&
-     * start_pc == last_counted suppresses that drift; a normal tight
-     * loop is a multi-insn TB so its per-iteration count is kept. */
-    uint64_t cur_start_pc = qemu_plugin_u64_get(g_scoreboard.prev_start_pc,
-                                                cpu_index);
-    /*
-     * icount_prev = architectural insns actually executed (TBs
-     * 1..N-1); THIS TB has NOT run yet (vcpu_tb_exec fires at TB
-     * start).  All trigger logic keys off icount_prev so conditions
-     * track completed work — using the post-bump count would
-     * undershoot by this TB on threshold-crossing exits.
-     */
-    uint64_t icount_prev = qemu_plugin_u64_get(g_scoreboard.insn_count,
-                                               cpu_index);
-    uint64_t last_counted = qemu_plugin_u64_get(
-        g_scoreboard.last_counted_start_pc, cpu_index);
-    bool is_rep_reentry = (n_insns == 1 && cur_start_pc == last_counted);
-    if (!is_rep_reentry) {
-        qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index,
-                            icount_prev + n_insns);
-        qemu_plugin_u64_set(g_scoreboard.last_counted_start_pc,
-                            cpu_index, cur_start_pc);
-    }
-
-    /* Snapshot the CP previous-TB cursor and advance it to the current
-     * TB before any other exit path: the chain assembler folds the
-     * snapshot below, and the next CP vcpu_tb_exec must see this TB as
-     * "previous" no matter which branch returns. */
-    BBTemplate *prev_cp_tb_tmpl = g_cp_prev_tb_template;
-    g_cp_prev_tb_template = cur_tb_tmpl;
-
+    /* Snapshot the segment generation before tw_manage_window so we
+     * can detect a segment-open that happened inside it.  Each
+     * segment is an independent trace: when a new segment opens
+     * here, the local prev_cp_tb_tmpl and cur_tb_tmpl point at
+     * fragments from the previous segment / inter-segment gap.
+     * Walking them would bridge stale fragments into the new
+     * segment's trace AND run WP against PCs unrelated to the new
+     * segment's execution stream.  Drop this TB as a one-TB lossy
+     * boundary; the next TB starts a fresh chain at its own
+     * entry_pc.  No tb_flush is needed: per-insn callbacks for
+     * already-translated TBs are gated via cond_cb on
+     * `g_scoreboard.is_active`, so cached translations just fire
+     * the cond_cb predicate (false outside segments) and skip the
+     * callbacks at JIT-level. */
+    uint32_t seg_gen_before = g_segment_generation.load(
+        std::memory_order_relaxed);
     tw_manage_window(cpu_index, icount_prev, cur_tb_tmpl);
+    bool segment_just_opened =
+        g_segment_generation.load(std::memory_order_relaxed) != seg_gen_before;
 
     BodyStreamState *out_stream = g_trace_segments.body_stream();
     if (!g_trace_segments.is_active() || !out_stream) {
+        g_mutex_unlock(&exec_lock);
+        return;
+    }
+
+    if (segment_just_opened) {
+        g_cp_prev_tb_template = nullptr;
         g_mutex_unlock(&exec_lock);
         return;
     }
@@ -1444,8 +1700,34 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         finish_trace_segment();
         g_trace_segments.set_shutting_down();
         g_icount_shutdown_pending = false;
+        /* No need to recompute_budget: we're exiting immediately and
+         * the budget slot will be torn down with the scoreboard. */
         g_mutex_unlock(&exec_lock);
         exit(0);
+    }
+
+    /* Simpoint analogue: tw_manage_window set close_pending when
+     * icount_prev crossed window_stop.  Finalize only after the chain
+     * has drained to a BB boundary so the trace covers AT LEAST
+     * eff_stop - eff_start (warmup + simulation) insns. */
+    if (g_simpoint_close_pending &&
+        !g_cp_chain.has_active_chain() &&
+        g_trace_segments.is_active()) {
+        finish_trace_segment();
+        g_simpoints.advance();
+        g_simpoint_close_pending = false;
+        g_cp_prev_tb_template = nullptr;
+        if (!g_simpoints.current()) {
+            g_trace_segments.set_shutting_down();
+            g_mutex_unlock(&exec_lock);
+            exit(0);
+        }
+        recompute_next_threshold();
+        /* Re-arm budget so the per-TB inline_add countdown lands at
+         * zero when icount reaches the now-current eff_start. */
+        for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
+            recompute_budget((unsigned)i);
+        }
     }
 
     g_mutex_unlock(&exec_lock);
@@ -1519,9 +1801,17 @@ static void tb_arm_new_template_cbs(struct qemu_plugin_tb *tb,
             }
             struct qemu_plugin_insn *insn =
                 qemu_plugin_tb_get_insn(tb, i);
-            qemu_plugin_register_vcpu_insn_exec_cb(
+            /* Gate on the is_active scoreboard slot so the callback
+             * skips entirely between segments via a JIT-emitted
+             * check — no plugin-side tb_flush needed at segment
+             * boundaries.  Translations cached from any prior
+             * segment continue to fire harmlessly: the cond_cb
+             * predicate is false outside segments and the JIT
+             * skips the callback. */
+            qemu_plugin_register_vcpu_insn_exec_cond_cb(
                 insn, vcpu_insn_reg_snap_cb,
                 QEMU_PLUGIN_CB_R_REGS,
+                QEMU_PLUGIN_COND_GE, g_scoreboard.is_active, 1,
                 &refs[ci - 1]);
         }
     }
@@ -1561,9 +1851,10 @@ static void tb_arm_new_template_cbs(struct qemu_plugin_tb *tb,
                 }
                 struct qemu_plugin_insn *insn =
                     qemu_plugin_tb_get_insn(tb, i);
-                qemu_plugin_register_vcpu_insn_exec_cb(
+                qemu_plugin_register_vcpu_insn_exec_cond_cb(
                     insn, vcpu_insn_synth_ea_cb,
                     QEMU_PLUGIN_CB_R_REGS,
+                    QEMU_PLUGIN_COND_GE, g_scoreboard.is_active, 1,
                     &synth_refs[ci]);
             }
         }
@@ -1684,33 +1975,14 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     }
 
     /*
-     * Light path while no segment is active.  Skips Capstone decode,
-     * BBTemplate creation, per-insn mem_cb / synthetic-EA / poison
-     * machinery, and fragment-split — none of it shows up in any
-     * trace because the trace isn't running.  Arms only what's
-     * needed to detect the next window-open: an inline current_pc
-     * store (for REP-reentry icount suppression) and a tb_exec
-     * callback that maintains icount and fires `tb_flush` when a
-     * segment opens.  After the flush every TB executes a fresh
-     * translation, which arrives here again with `is_active=true`
-     * and runs the heavy path below.
-     *
-     * Symbol-trigger mode keeps using the heavy path: detecting the
-     * trigger needs the BB's symbol_name, which lives on the
-     * template the heavy path builds.
+     * Every TB gets the full heavy translation, regardless of segment
+     * state.  Per-insn callbacks are gated via cond_cb on the
+     * scoreboard `is_active` slot so inter-segment execution skips
+     * them via a JIT-emitted check, with no plugin-side flush
+     * required at segment boundaries.  This avoids the user-mode
+     * `tb_flush` hazard where a chained TB jumps to JIT-region bytes
+     * that subsequent translations have overwritten.
      */
-    bool light_window_mode = (g_window_mode == PluginConfig::WIN_ICOUNT
-                           || g_window_mode == PluginConfig::WIN_SIMPOINT);
-    if (light_window_mode && !g_trace_segments.is_active_atomic()) {
-        qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
-            tb, QEMU_PLUGIN_INLINE_STORE_U64,
-            g_scoreboard.current_pc, pc);
-        qemu_plugin_register_vcpu_tb_exec_cb(
-            tb, vcpu_tb_exec_light, QEMU_PLUGIN_CB_NO_REGS,
-            (void *)(uintptr_t)raw_n_insns);
-        return;
-    }
-
     struct qemu_plugin_insn *first_insn = qemu_plugin_tb_get_insn(tb, 0);
 
     uint64_t *insn_pcs = g_new0(uint64_t, raw_n_insns);
@@ -1771,9 +2043,21 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             }
         }
 
+        /* Per-memop callback fires unconditionally; the cb body
+         * does its own is_active check before doing real work.
+         *
+         * Why NOT cond_cb: a JIT-emitted brcond at memop sites would
+         * introduce a TCG label mid-instruction.  Helpers like x86
+         * cmpxchg expand into a load + movcond + store sequence
+         * sharing TEMP_EBB temps across the memops; inserting a
+         * set_label between the qemu_ld/qemu_st pair breaks the
+         * containing EBB and the post-memop ops read dead temps.
+         * Aborts with "tcg.c:temp_load: code should not be reached".
+         * Keep the per-memop overhead in C and bail fast there. */
         qemu_plugin_register_vcpu_mem_cb(
             insn, vcpu_mem_cb, QEMU_PLUGIN_CB_NO_REGS,
-            QEMU_PLUGIN_MEM_RW, (void *)(uintptr_t)raw_pc);
+            QEMU_PLUGIN_MEM_RW,
+            (void *)(uintptr_t)raw_pc);
     }
 
     /*
@@ -1988,8 +2272,54 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
         tb, QEMU_PLUGIN_INLINE_STORE_U64, g_scoreboard.current_pc, pc);
 
-    qemu_plugin_register_vcpu_tb_exec_cb(
+    /* icount bump as a JIT-emitted ADD on the scoreboard slot — same
+     * pattern as the BBV plugin.  This eliminates the
+     * qemu_plugin_u64_get/set function calls the C cb used to do per
+     * TB exec.  Per-TB raw_n_insns matches the value BBV's inline ADD
+     * uses, so the icount counter stays byte-identical to BBV. */
+    qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
+        tb, QEMU_PLUGIN_INLINE_ADD_U64,
+        g_scoreboard.insn_count, raw_n_insns);
+    /* Mirror the bump into the budget slot but negated — it counts
+     * DOWN by n_insns per TB exec.  When budget < 1 the cond_cb
+     * below fires once, handles the threshold crossing, and resets
+     * budget.  Same inline pattern; no C call on the hot path. */
+    qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
+        tb, QEMU_PLUGIN_INLINE_ADD_U64,
+        g_scoreboard.budget, (uint64_t)(int64_t)(-(int64_t)raw_n_insns));
+
+    /* Threshold-crossing detector: fires once when the budget slot
+     * crosses zero (i.e. icount reached the next eff_start).  The
+     * scoreboard slot is u64 storage; plugin-gen emits an UNSIGNED
+     * comparison (TCG_COND_GEU), so testing budget < 1 in unsigned
+     * arithmetic only catches budget == 0 exactly.  We want to fire
+     * for any signed-negative budget too (per-TB inline_add can
+     * overshoot zero by up to one TB's n_insns).  Trick: a signed
+     * int64 is negative iff its u64 representation is >= 2^63, so
+     * COND_GE with imm = (1ULL << 63) gives the signed-negative test
+     * we actually want.
+     *
+     * IMPORTANT: this cond_cb is registered BEFORE the vcpu_tb_exec
+     * cond_cb below.  At the crossing TB that opens a segment, the
+     * budget cb fires first and tw_manage_window sets is_active=1.
+     * The vcpu_tb_exec brcond then re-loads is_active from the
+     * scoreboard and fires for the crossing TB too — so its body
+     * entry lands in the trace instead of being lost as a BBV-count
+     * deficit.  Symmetric at close: budget cb only sets
+     * g_simpoint_close_pending and never clears is_active here, so
+     * vcpu_tb_exec still fires and emits the closing TB's entry. */
+    qemu_plugin_register_vcpu_tb_exec_cond_cb(
+        tb, vcpu_tb_check_budget, QEMU_PLUGIN_CB_NO_REGS,
+        QEMU_PLUGIN_COND_GE, g_scoreboard.budget, (1ULL << 63),
+        nullptr);
+    /* Heavy callback: chain assembler, WP simulator, body-entry
+     * emission.  Gated via cond_cb on is_active so it is NOT
+     * dispatched at all during inter-segment — the JIT emits a
+     * brcond and skips the call.  In-segment, is_active=1 and the
+     * cb fires per TB just like before. */
+    qemu_plugin_register_vcpu_tb_exec_cond_cb(
         tb, vcpu_tb_exec, QEMU_PLUGIN_CB_RW_REGS,
+        QEMU_PLUGIN_COND_GE, g_scoreboard.is_active, 1,
         (void *)head_fragment);
 
     g_free(insn_pcs);
@@ -2023,6 +2353,8 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
                             g_wp_state.saved_prev_fall_through);
         qemu_plugin_u64_set(g_scoreboard.prev_bb_terminus, g_wp_state.saved_cpu_index,
                             g_wp_state.saved_prev_bb_terminus);
+        qemu_plugin_u64_set(g_scoreboard.budget, g_wp_state.saved_cpu_index,
+                            g_wp_state.saved_budget);
         g_wp_state.mem_accesses.clear();
     }
 
@@ -2356,6 +2688,46 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
 
     g_autoptr(GString) report = g_string_new("");
 
+    /* Three counters with distinct meaning:
+     *
+     *   host_icount     — last per-vCPU TB-exec icount seen by this
+     *                     thread.  Read from g_host_icount (the
+     *                     scoreboard storage is torn down before
+     *                     plugin_exit fires).  Matches the BBV
+     *                     plugin's count for the same run.
+     *
+     *   traced_icount   — sum of per-segment `covered` (in-segment
+     *                     architectural insns).  Should match the
+     *                     number of CP body entries in the trace
+     *                     files, BEFORE REP fan-out expansion.
+     *
+     *   rep_fanout      — total sub-entries emitted by REP fan-out
+     *                     inside emit_body_entry, in-segment only.
+     *
+     * Identity the trace files satisfy:
+     *   sum of cst_audit "CP insns (total)" across segments
+     *     == g_total_arch_insns
+     *
+     * (traced_icount + rep_fanout under-counts by a handful of
+     * insns per segment from chain-assembly edge cases — the BB-end
+     * deferral and mid-TB-branch fragments don't always preserve
+     * the "covered + fanout = audit" identity, but g_total_arch_insns
+     * is summed directly from what emit_body_entry actually wrote.)
+     *
+     * host_icount (full-run BBV-style count) is reported separately
+     * so it can be cross-checked against the BBV plugin run. */
+    uint64_t fanout = g_rep_fanout_extra_insns.load(
+        std::memory_order_relaxed);
+    uint64_t traced = g_traced_icount.load(std::memory_order_relaxed);
+    uint64_t arch   = g_total_arch_insns.load(
+        std::memory_order_relaxed);
+    g_string_append_printf(report,
+        "champsim_tracer: host_icount=%" PRIu64
+        " traced_icount=%" PRIu64
+        " rep_fanout=%" PRIu64
+        " trace_arch_insns=%" PRIu64 "\n",
+        g_host_icount, traced, fanout, arch);
+
     g_mutex_lock(&data_lock);
     append_stats_summary(report, "Cumulative", stats_snapshot());
     if (g_simpoints.is_active()) {
@@ -2366,6 +2738,19 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     g_mutex_unlock(&data_lock);
 
     qemu_plugin_outs(report->str);
+
+    /* qemu_plugin_outs goes via qemu_log, whose target (stderr by
+     * default) may have been closed by the time we run — the guest's
+     * exit syscall reaches us through preexit_cleanup AFTER QEMU has
+     * torn its log fd down.  Mirror to a side file so the icount /
+     * fanout / cumulative report is always recoverable. */
+    if (stats_file) {
+        fputs(report->str, stats_file);
+        fclose(stats_file);
+        stats_file = nullptr;
+    }
+    g_free(stats_path);
+    stats_path = nullptr;
 
     if (unknown_warn_file) {
         fclose(unknown_warn_file);
@@ -2411,6 +2796,13 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         fprintf(stderr, "champsim_tracer: warning: unsupported ISA '%s', "
                 "instruction decode will be limited\n", target_name);
     }
+
+    /* Target byte order.  The four currently-supported ISAs (x86, AArch64,
+     * RISC-V, MIPS) are LE in every QEMU configuration we ship except the
+     * MIPS BE variants (qemu-mips, qemu-mips64), distinguished by the
+     * lack of an "el" suffix on the target_name. */
+    target_big_endian = (trace_isa == TRACE_ISA_MIPS &&
+                         !g_str_has_suffix(target_name, "el"));
 
     /*
      * Map ISA to Capstone arch/mode.  arch is determined by
@@ -2495,6 +2887,13 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         fflush(unknown_warn_file);
     }
 
+    stats_path = g_strdup_printf("%s.stats.log", cfg.output_path);
+    stats_file = fopen(stats_path, "w");
+    if (!stats_file) {
+        fprintf(stderr, "champsim_tracer: cannot open stats output: %s\n",
+                stats_path);
+    }
+
     uint64_t trace_start_insn = cfg.trace_start_insn;
     uint64_t trace_stop_insn  = cfg.trace_stop_insn;
     if (simpoints_file_path) {
@@ -2546,6 +2945,10 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                             /* cpu_index= */ (unsigned int)-1,
                             /* simpoint_weight= */ 0.0);
     }
+
+    /* Prime the fast-path threshold with the first event icount so
+     * pre-segment TBs lockless-bail until they get close. */
+    recompute_next_threshold();
 
 
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);

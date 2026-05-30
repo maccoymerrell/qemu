@@ -634,7 +634,7 @@ def _run_cst_decode(path: str | os.PathLike) -> str:
     proc = subprocess.run(
         [str(binary), "--format=legacy", str(path)],
         check=True,
-        stdout=subprocess.PIPE,
+        capture_output=True,
         text=True,
     )
     return proc.stdout

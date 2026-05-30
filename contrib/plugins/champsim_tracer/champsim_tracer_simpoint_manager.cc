@@ -126,8 +126,12 @@ bool SimPointManager::load(const char *path, uint64_t interval_insns)
     }
     interval_insns_ = interval_insns;
     current_idx_ = 0;
+    size_ = 0;
     entries_ = parse_selections(path, interval_insns);
-    return entries_ && entries_->len > 0;
+    if (entries_) {
+        size_ = entries_->len;
+    }
+    return size_ > 0;
 }
 
 const SimPointEntry *SimPointManager::current() const

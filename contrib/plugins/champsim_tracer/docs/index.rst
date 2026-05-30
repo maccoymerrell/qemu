@@ -45,10 +45,13 @@ full list of out-of-scope categories.
 Supported guest ISAs: x86_64, aarch64, riscv64, mipsel.  Per-ISA
 extension coverage is summarized in :doc:`reference`.
 
-The companion C++ tools (``cst_decode``, ``cst_audit``, built next
-to the plugin shared object) read the binary trace and either emit a
-disassembly-style text dump or print a byte-budget breakdown of
-where bytes go.
+The companion C++ tools, built next to the plugin shared object, read
+the binary trace directly: ``cst_decode`` emits a disassembly-style
+text dump, ``cst_audit`` prints a byte-budget breakdown of where bytes
+go, and ``cst_visualize`` renders a metric over the run as an SVG chart
+(branch behaviour, memory-access patterns, instruction mix, dependency
+depth, speculative-pollution cost), with an aggregate mode that composes
+a SimPoint sweep into one weighted whole-program view.
 
 A Python harness, :doc:`validator`, generates self-checking
 workloads, runs them through the plugin, and validates the resulting
@@ -68,6 +71,7 @@ as well as the tracer itself (an upcoming publication).
    concepts
    quickstart
    decoder
+   visualizer
    validator
    troubleshooting
    limitations

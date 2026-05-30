@@ -116,9 +116,96 @@ public:
      * against the immediately-preceding ENTRY and do not produce a
      * callback.  THREAD_SWITCH records flip the next entry's
      * thread_id and set thread_switched.  @rb (optional) receives
-     * each BODY_TAG_REGFILE record. */
+     * each BODY_TAG_REGFILE record.
+     *
+     * This is the batch path: it materialises a DecodedEntry (and,
+     * under CST_FLAG_WP, the whole wrong-path chain) per ENTRY.  Use
+     * it when the consumer wants the fully-assembled entry shape
+     * (objdump / instructions_from_entry / IFRAME validation).  For a
+     * streaming consumer that processes one basic block at a time,
+     * prefer walk_bb() below — it allocates no per-entry containers. */
     void walk(const Callback &cb,
               const RegfileCallback &rb = {});
+
+    /* ====== Streaming BB walk (zero per-BB allocation) ============
+     *
+     * walk_bb() surfaces the body one basic block at a time — correct
+     * path then, in order, its wrong-path chain — with NO difference
+     * in shape between CP and WP (the BB::is_wp flag distinguishes).
+     * Per Step 6.8 of the format spec each WP BB is fully decodable on
+     * its own as the chain is walked, so there is no batching: the
+     * walker applies that BB's field deltas, hands the consumer a BB
+     * whose scalar accessors read the live per-template field-state,
+     * and only then advances to the next BB.  Nothing is materialised
+     * into vectors; a consumer reads exactly the cells it asks for.
+     *
+     * Two orthogonal cost dials let a metric pay only for what it
+     * reads:
+     *   @cp_fields  false => CP field deltas are parse-skipped (the BB
+     *               still carries template_id / n_insns); the CP
+     *               scalar accessors are unavailable.  true => CP
+     *               deltas are applied and the accessors are live.
+     *   @wp         Skip      => the WP chain section is consumed but
+     *                           not walked; no WP BBs are emitted.
+     *               Structure => WP BBs are emitted (template_id /
+     *                           n_insns / chain markers) but their
+     *                           field deltas are parse-skipped.
+     *               Fields    => WP BBs are emitted with field deltas
+     *                           applied and accessors live.
+     * The WP events section (fault / translation flags, Step 6.9) is
+     * always parse-skipped here — it is not surfaced on BB.  Consumers
+     * that need it must use the batch walk().  IFRAME records are
+     * parse-skipped (no field-content validation on this path). */
+    enum class WpDecode { Skip, Structure, Fields };
+
+    /* One basic-block execution surfaced by walk_bb().  The scalar
+     * accessors read the live field-state block for this BB; they are
+     * valid only for the duration of the callback (the next BB may
+     * overwrite the shared block).  Accessors return 0 / Wide{} when
+     * the relevant fields were not decoded (cp_fields=false, or a WP
+     * BB at Structure level). */
+    struct BB {
+        uint32_t        template_id    = 0;
+        /* Index into the templates vector (and any parallel per-
+         * template array the consumer keeps), or UINT32_MAX if the
+         * template id is unknown (never happens for a conformant CP
+         * BB). */
+        uint32_t        template_index = 0xFFFFFFFFu;
+        const Template *tmpl           = nullptr;
+        uint32_t        thread_id      = 0;
+        uint32_t        seq_num        = 0;   /* CP visit counter; a WP
+                                               * BB shares its parent
+                                               * CP entry's seq_num. */
+        bool            thread_switched = false; /* CP only */
+        bool            is_wp          = false;
+        uint32_t        wp_index       = 0;   /* position in WP chain */
+        bool            wp_chain_start = false;
+        bool            wp_chain_last  = false;
+        uint32_t        n_insns        = 0;   /* template insn count */
+
+        bool     has_fields() const { return blk_ != nullptr; }
+        uint64_t load_count(uint32_t insn) const;
+        uint64_t store_count(uint32_t insn) const;
+        uint64_t load_addr(uint32_t insn, uint32_t slot) const;
+        uint64_t store_addr(uint32_t insn, uint32_t slot) const;
+        Wide     load_data(uint32_t insn, uint32_t slot) const;
+        Wide     store_data(uint32_t insn, uint32_t slot) const;
+        Wide     dst_reg(uint32_t insn, uint32_t op) const;
+
+    private:
+        friend class BodyWalker;
+        const FieldStateBlock *blk_      = nullptr;
+        uint32_t               state_gen_ = 0;
+        const FieldStateBlock *base_blk_ = nullptr;
+        uint32_t               base_gen_  = 0;
+        const std::array<uint16_t, FID_LUT_SIZE> *slot_lut_ = nullptr;
+        const ResolvedIds     *ids_      = nullptr;
+    };
+    using BBCallback = std::function<void(const BB &)>;
+
+    void walk_bb(bool cp_fields, WpDecode wp,
+                 const BBCallback &cb,
+                 const RegfileCallback &rb = {});
 
 private:
     /* Transient bookkeeping shared across the per-tag handlers below.
@@ -135,6 +222,26 @@ private:
     void     handle_entry(WalkState &ws, const Callback &cb);
     void     handle_iframe(WalkState &ws);
     uint64_t handle_end();
+
+    /* Streaming-path counterparts of handle_entry / handle_iframe.
+     * handle_entry_bb applies (or parse-skips) the CP field deltas,
+     * emits the CP BB, then walks the WP chain per @wp.  skip_iframe_bb
+     * consumes an IFRAME's sections without applying or validating.
+     * consume_field_section applies one field-delta section into
+     * @state (or parse-skips it when @state is null) with no pass-2
+     * materialisation.  stream_wp_chain_bb walks one WP chain,
+     * emitting a BB per entry. */
+    void consume_field_section(Reader &outer, uint32_t template_id,
+                               const Template *tmpl,
+                               FieldStateTable *state,
+                               const FieldStateTable *base_state);
+    void stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
+                            FieldStateTable &cp_state, WpDecode wp,
+                            uint32_t seq, uint32_t thread,
+                            const BBCallback &cb);
+    void handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
+                         const BBCallback &cb);
+    void skip_iframe_bb();
 
     /* Read one WP chain section from @wpb, returning the populated WP
      * entries.  Used by both handle_entry and handle_iframe.  @state

@@ -23,6 +23,10 @@ VCPUScoreboard::VCPUScoreboard()
         sb_, VCPUScoreBoard, insn_count);
     last_counted_start_pc = qemu_plugin_scoreboard_u64_in_struct(
         sb_, VCPUScoreBoard, last_counted_start_pc);
+    is_active = qemu_plugin_scoreboard_u64_in_struct(
+        sb_, VCPUScoreBoard, is_active);
+    budget = qemu_plugin_scoreboard_u64_in_struct(
+        sb_, VCPUScoreBoard, budget);
 }
 
 VCPUScoreboard::~VCPUScoreboard()

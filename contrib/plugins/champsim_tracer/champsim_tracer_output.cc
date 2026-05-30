@@ -272,11 +272,11 @@ static void write_reg_encoding_map(BitWriter *bw)
 
 static void write_field_id_encoding_map(BitWriter *bw)
 {
-    /* Count: 3 hot singletons + 5 slotted families × CST_FID_SLOT_COUNT
+    /* Count: 3 hot singletons + 8 slotted families × CST_FID_SLOT_COUNT
      * + 4 lane-mask families × CST_FID_SLOT_COUNT + 7 insn-metadata
      * + 1 EXTENDED. */
     const uint64_t n_entries =
-        3 + (uint64_t)5 * CST_FID_SLOT_COUNT
+        3 + (uint64_t)8 * CST_FID_SLOT_COUNT
           + (uint64_t)4 * CST_FID_SLOT_COUNT + 7 + 1;
     bw_write_string(bw, "field_id");
     bw_write_uleb128(bw, n_entries);
@@ -290,11 +290,14 @@ static void write_field_id_encoding_map(BitWriter *bw)
      * k*CST_FID_SLOT_STRIDE; one (id, name) pair per slot so decoders
      * need not know the stride. */
     static const struct { uint8_t base; const char *prefix; } fam[] = {
-        { CST_FID_LOAD_ADDR_BASE,   "CST_FID_LOAD_ADDR"   },
-        { CST_FID_STORE_ADDR_BASE,  "CST_FID_STORE_ADDR"  },
-        { CST_FID_LOAD_DATA_BASE,   "CST_FID_LOAD_DATA"   },
-        { CST_FID_STORE_DATA_BASE,  "CST_FID_STORE_DATA"  },
-        { CST_FID_DST_REG_BASE,     "CST_FID_DST_REG"     },
+        { CST_FID_LOAD_ADDR_BASE,      "CST_FID_LOAD_ADDR"      },
+        { CST_FID_STORE_ADDR_BASE,     "CST_FID_STORE_ADDR"     },
+        { CST_FID_LOAD_DATA_BASE,      "CST_FID_LOAD_DATA"      },
+        { CST_FID_STORE_DATA_BASE,     "CST_FID_STORE_DATA"     },
+        { CST_FID_DST_REG_BASE,        "CST_FID_DST_REG"        },
+        { CST_FID_LOAD_SIZE_BASE,      "CST_FID_LOAD_SIZE"      },
+        { CST_FID_STORE_SIZE_BASE,     "CST_FID_STORE_SIZE"     },
+        { CST_FID_DST_REG_WIDTH_BASE,  "CST_FID_DST_REG_WIDTH"  },
     };
     for (uint64_t k = 0; k < CST_FID_SLOT_COUNT; k++) {
         for (size_t f = 0; f < G_N_ELEMENTS(fam); f++) {
@@ -951,17 +954,19 @@ static void bw_write_sleb128_u512(BitWriter *bw, U512 v)
 
 enum {
     FIELD_STATE_SLOT_INVALID = 0xFFFFu,
-    /* Layout: 1 (N_LOADS) + 1 (N_STORES) + 1 (METAFLAGS) + 5
-     * (slotted families) × CST_FID_SLOT_COUNT + 4 (lane-mask
-     * families: SRC / DST / LOAD_DATA / STORE_DATA) ×
-     * CST_FID_SLOT_COUNT + 7 (insn-metadata bytes_lo..size).
-     * EXTENDED has no persistent state cell.  Keep the matching
-     * FIELD_STATE_SLOT_COUNT in tools/cst_decode.h in sync when
-     * this grows.                                                    */
-    FIELD_STATE_SLOT_COUNT = 3 + (5 * CST_FID_SLOT_COUNT)
+    /* Layout: 1 (N_LOADS) + 1 (N_STORES) + 1 (METAFLAGS) + 8
+     * (slotted families: LOAD_ADDR / STORE_ADDR / LOAD_DATA /
+     * STORE_DATA / DST_REG / LOAD_SIZE / STORE_SIZE / DST_REG_WIDTH) ×
+     * CST_FID_SLOT_COUNT + 4 (lane-mask families: SRC / DST /
+     * LOAD_DATA / STORE_DATA) × CST_FID_SLOT_COUNT + 7 (insn-metadata
+     * bytes_lo..size).  EXTENDED has no persistent state cell.  Keep
+     * the matching FIELD_STATE_SLOT_COUNT in tools/cst_decode.h in
+     * sync when this grows.                                           */
+    FIELD_STATE_SLOT_COUNT = 3 + (8 * CST_FID_SLOT_COUNT)
                                + (4 * CST_FID_SLOT_COUNT) + 7,
     /* Power-of-two so fid -> slot is a single load.  Largest FID
-     * ~590 at slot count 64 / stride-4 lane block; 1024 has headroom. */
+     * ~778 at slot count 64 / stride-8 slotted, stride-4 lane block;
+     * 1024 has headroom. */
     FIELD_STATE_LUT_SIZE   = 1024,
 };
 
@@ -994,18 +999,21 @@ static bool     g_field_state_slot_lut_built = false;
  *   slot 0:   N_LOADS
  *   slot 1:   N_STORES
  *   slot 2:   METAFLAGS
- *   slot 3:   LOAD_ADDR[0]      ... slot (3 + 5*k):     LOAD_ADDR[k]
- *   slot 4:   STORE_ADDR[0]     ... slot (3 + 5*k + 1): STORE_ADDR[k]
- *   slot 5:   LOAD_DATA[0]      ... slot (3 + 5*k + 2): LOAD_DATA[k]
- *   slot 6:   STORE_DATA[0]     ... slot (3 + 5*k + 3): STORE_DATA[k]
- *   slot 7:   DST_REG[0]        ... slot (3 + 5*k + 4): DST_REG[k]
- *   slot (3 + 5*N) + 4*k:     SRC_LANE_MASK[k]   (k in 0..N-1)
- *   slot (3 + 5*N) + 4*k + 1: DST_LANE_MASK[k]
- *   slot (3 + 5*N) + 4*k + 2: LOAD_DATA_LANE_MASK[k]
- *   slot (3 + 5*N) + 4*k + 3: STORE_DATA_LANE_MASK[k]
- *   slot (3 + 5*N + 4*N): INSN_BYTES_LO ... INSN_SIZE
+ *   slot 3:   LOAD_ADDR[0]      ... slot (3 + 8*k + 0): LOAD_ADDR[k]
+ *   slot 4:   STORE_ADDR[0]     ... slot (3 + 8*k + 1): STORE_ADDR[k]
+ *   slot 5:   LOAD_DATA[0]      ... slot (3 + 8*k + 2): LOAD_DATA[k]
+ *   slot 6:   STORE_DATA[0]     ... slot (3 + 8*k + 3): STORE_DATA[k]
+ *   slot 7:   DST_REG[0]        ... slot (3 + 8*k + 4): DST_REG[k]
+ *   slot 8:   LOAD_SIZE[0]      ... slot (3 + 8*k + 5): LOAD_SIZE[k]
+ *   slot 9:   STORE_SIZE[0]     ... slot (3 + 8*k + 6): STORE_SIZE[k]
+ *   slot 10:  DST_REG_WIDTH[0]  ... slot (3 + 8*k + 7): DST_REG_WIDTH[k]
+ *   slot (3 + 8*N) + 4*k:     SRC_LANE_MASK[k]   (k in 0..N-1)
+ *   slot (3 + 8*N) + 4*k + 1: DST_LANE_MASK[k]
+ *   slot (3 + 8*N) + 4*k + 2: LOAD_DATA_LANE_MASK[k]
+ *   slot (3 + 8*N) + 4*k + 3: STORE_DATA_LANE_MASK[k]
+ *   slot (3 + 8*N + 4*N): INSN_BYTES_LO ... INSN_SIZE
  *     (N = CST_FID_SLOT_COUNT)
- * Total = 3 + 5*N + 4*N + 7 = FIELD_STATE_SLOT_COUNT. */
+ * Total = 3 + 8*N + 4*N + 7 = FIELD_STATE_SLOT_COUNT. */
 static void field_state_slot_lut_build(void)
 {
     for (unsigned i = 0; i < FIELD_STATE_LUT_SIZE; i++) {
@@ -1015,20 +1023,23 @@ static void field_state_slot_lut_build(void)
     g_field_state_slot_lut[CST_FID_N_STORES]  = 1;
     g_field_state_slot_lut[CST_FID_METAFLAGS] = 2;
 
-    static const uint8_t fam_base[5] = {
+    static const uint8_t fam_base[8] = {
         CST_FID_LOAD_ADDR_BASE,
         CST_FID_STORE_ADDR_BASE,
         CST_FID_LOAD_DATA_BASE,
         CST_FID_STORE_DATA_BASE,
         CST_FID_DST_REG_BASE,
+        CST_FID_LOAD_SIZE_BASE,
+        CST_FID_STORE_SIZE_BASE,
+        CST_FID_DST_REG_WIDTH_BASE,
     };
     for (unsigned k = 0; k < CST_FID_SLOT_COUNT; k++) {
         for (unsigned f = 0; f < G_N_ELEMENTS(fam_base); f++) {
             unsigned fid = fam_base[f] + k * CST_FID_SLOT_STRIDE;
-            g_field_state_slot_lut[fid] = (uint16_t)(3 + 5 * k + f);
+            g_field_state_slot_lut[fid] = (uint16_t)(3 + 8 * k + f);
         }
     }
-    unsigned lane_dense_base = 3 + 5 * CST_FID_SLOT_COUNT;
+    unsigned lane_dense_base = 3 + 8 * CST_FID_SLOT_COUNT;
     static const uint16_t lane_fam_base[4] = {
         CST_FID_SRC_LANE_MASK_BASE,
         CST_FID_DST_LANE_MASK_BASE,
@@ -2520,6 +2531,13 @@ static void emit_field_delta_section(BitWriter *main_bw,
                             (uint16_t)(CST_FID_LOAD_DATA_BASE +
                                        s * CST_FID_SLOT_STRIDE);
                         STAGE_WIDE(i, ld_fid, fd_load_data, s, cur);
+                        /* Byte width of the access, for value prediction.
+                         * Narrow (1..64), mostly static -> ~one delta per
+                         * slot per segment. */
+                        uint16_t lsz_fid =
+                            (uint16_t)(CST_FID_LOAD_SIZE_BASE +
+                                       s * CST_FID_SLOT_STRIDE);
+                        STAGE_U64(i, lsz_fid, dp->data_size, 0);
                     }
                 }
             }
@@ -2538,6 +2556,10 @@ static void emit_field_delta_section(BitWriter *main_bw,
                             (uint16_t)(CST_FID_STORE_DATA_BASE +
                                        s * CST_FID_SLOT_STRIDE);
                         STAGE_WIDE(i, sd_fid, fd_store_data, s, cur);
+                        uint16_t ssz_fid =
+                            (uint16_t)(CST_FID_STORE_SIZE_BASE +
+                                       s * CST_FID_SLOT_STRIDE);
+                        STAGE_U64(i, ssz_fid, dp->data_size, 0);
                     }
                 }
             }
@@ -2554,6 +2576,11 @@ static void emit_field_delta_section(BitWriter *main_bw,
                                               s * CST_FID_SLOT_STRIDE);
                     STAGE_WIDE(i, fid, fd_dst_reg, s,
                                (*reg_snaps)[pos].value);
+                    /* Architectural write width, for value prediction. */
+                    uint16_t dw_fid =
+                        (uint16_t)(CST_FID_DST_REG_WIDTH_BASE +
+                                   s * CST_FID_SLOT_STRIDE);
+                    STAGE_U64(i, dw_fid, (*reg_snaps)[pos].width_bytes, 0);
                 }
             }
 

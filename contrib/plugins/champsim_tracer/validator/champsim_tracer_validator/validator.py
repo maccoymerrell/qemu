@@ -4892,6 +4892,95 @@ def validate_structural(trace_path: Path,
     return Report(issues=issues, stats=stats)
 
 
+def _check_data_widths(entries: list[dict],
+                       has_mem_data: bool,
+                       has_reg_data: bool) -> list[Issue]:
+    """Verify the per-slot data-width families (CST_FID_LOAD_SIZE /
+    STORE_SIZE / DST_REG_WIDTH).
+
+    A natural extension of the memdata / regdata checks: a recorded width
+    must be within range (<= CST_MAX_WIDE_BYTES = 64) and wide enough to
+    hold the value the trace recorded — the writer masks each value to its
+    width, so the value must fit in `width` bytes.  Width 0 marks a slot
+    with no real access (a synthetic address-only memop such as prefetch /
+    cache-flush / TLB-flush, or an unresolved register); its value is 0,
+    so a width-0 slot carrying a nonzero value is the one inconsistency
+    flagged there.  Catches a width narrower than its value (wrong field)
+    or out of range — which the magnitude-derived estimate the runner
+    used previously could not.
+    """
+    MAXW = 64
+    issues: list[Issue] = []
+    n_mem = 0
+    n_reg = 0
+    if has_mem_data:
+        for e in entries:
+            for dp in e.get("dyn_params") or []:
+                w = int(getattr(dp, "data_size", 0) or 0)
+                val = int(getattr(dp, "data", 0) or 0)
+                if w == 0:
+                    # 0 = a synthetic / address-only memop (prefetch,
+                    # cache-flush, TLB-flush) with no real access and so
+                    # no architectural width; its value is 0.  Only a
+                    # nonzero value would then be inconsistent.
+                    if val != 0:
+                        issues.append(Issue(
+                            "data_width", "error",
+                            f"{dp.type_name} memop insn[{dp.insn_index}] "
+                            f"has value 0x{val:x} but width 0"))
+                    continue
+                if w > MAXW:
+                    issues.append(Issue(
+                        "data_width", "error",
+                        f"{dp.type_name} memop insn[{dp.insn_index}] width "
+                        f"{w} > {MAXW}"))
+                    continue
+                if val >> (8 * w):
+                    issues.append(Issue(
+                        "data_width", "error",
+                        f"{dp.type_name} memop insn[{dp.insn_index}] value "
+                        f"0x{val:x} does not fit in its {w}-byte width"))
+                    continue
+                n_mem += 1
+    if has_reg_data:
+        for e in entries:
+            for s in e.get("reg_snaps") or []:
+                w = s.get("width_bytes")
+                val = int(s.get("value", 0) or 0)
+                if w is None:
+                    continue                      # trace carried no width
+                if w == 0:
+                    # 0 = register the plugin could not resolve; only a
+                    # nonzero value would then be inconsistent.
+                    if val != 0:
+                        issues.append(Issue(
+                            "data_width", "error",
+                            f"reg snap insn[{s['insn_index']}] "
+                            f"dst[{s['operand_index']}] has value "
+                            f"0x{val:x} but width 0"))
+                    continue
+                if w > MAXW:
+                    issues.append(Issue(
+                        "data_width", "error",
+                        f"reg snap insn[{s['insn_index']}] "
+                        f"dst[{s['operand_index']}] width {w} > {MAXW}"))
+                    continue
+                if val >> (8 * w):
+                    issues.append(Issue(
+                        "data_width", "error",
+                        f"reg snap insn[{s['insn_index']}] "
+                        f"dst[{s['operand_index']}] value 0x{val:x} does "
+                        f"not fit in its {w}-byte width"))
+                    continue
+                n_reg += 1
+    if has_mem_data or has_reg_data:
+        issues.append(Issue(
+            "data_width", "info",
+            f"verified {n_mem} memop and {n_reg} dst-register widths "
+            f"(present, ≤{MAXW}B, value-consistent)"))
+    return issues
+
+
 # ---------------------------------------------------------------------------
 # Top-level validate()
 # ---------------------------------------------------------------------------
@@ -5080,9 +5169,14 @@ def validate(meta_path: Path, trace_path: Path,
         cp_entries, template_runs, templates_by_id, blocks_by_id, cp_set)
 
     has_reg_data = bool(trace_meta.get("has_reg_data"))
+    has_mem_data = bool(trace_meta.get("has_mem_data"))
     issues += _check_reg_value_assertions(cp_entries, templates_by_id,
                                           blocks_by_id, pcmap, cp_set,
                                           has_reg_data, reg_id_to_name)
+
+    # Per-slot data-width families (CST_FID_LOAD_SIZE / STORE_SIZE /
+    # DST_REG_WIDTH): present, bounded, and value-consistent.
+    issues += _check_data_widths(cp_entries, has_mem_data, has_reg_data)
     issues += _check_expected_reg_sets(cp_entries, templates_by_id,
                                        blocks_by_id, pcmap, cp_set, isa,
                                        reg_id_to_name)

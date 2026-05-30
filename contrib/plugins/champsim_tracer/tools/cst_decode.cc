@@ -38,9 +38,11 @@ void slot_lut_build(const ResolvedIds &ids,
                     std::array<uint16_t, FID_LUT_SIZE> *out)
 {
     out->fill(FIELD_STATE_SLOT_INVALID);
-    (*out)[ids.fid_n_loads]   = 0;
-    (*out)[ids.fid_n_stores]  = 1;
-    (*out)[ids.fid_metaflags] = 2;
+    /* Singletons may be absent (sentinel) on a trace that doesn't use
+     * them — guard so an out-of-range fid never indexes the LUT. */
+    if (ids.fid_n_loads   < FID_LUT_SIZE) (*out)[ids.fid_n_loads]   = 0;
+    if (ids.fid_n_stores  < FID_LUT_SIZE) (*out)[ids.fid_n_stores]  = 1;
+    if (ids.fid_metaflags < FID_LUT_SIZE) (*out)[ids.fid_metaflags] = 2;
 
     /* Dense slot order is a consumer-side internal mapping; the FID
      * each (family, k) pair takes on the wire comes from
@@ -52,6 +54,9 @@ void slot_lut_build(const ResolvedIds &ids,
         &ids.fid_load_data,
         &ids.fid_store_data,
         &ids.fid_dst_reg,
+        &ids.fid_load_size,
+        &ids.fid_store_size,
+        &ids.fid_dst_reg_width,
         &ids.fid_src_lane_mask,
         &ids.fid_dst_lane_mask,
         &ids.fid_load_data_lane_mask,
@@ -703,6 +708,7 @@ void materialise_slotted_memops(uint32_t insn_idx, uint64_t n_fixed,
                                 DynParam::Type type,
                                 const std::array<uint16_t, FID_SLOT_COUNT> &addr_fids,
                                 const std::array<uint16_t, FID_SLOT_COUNT> &data_fids,
+                                const std::array<uint16_t, FID_SLOT_COUNT> &size_fids,
                                 bool has_mem,
                                 const FieldStateBlock *state_blk,
                                 uint32_t state_gen,
@@ -727,6 +733,11 @@ void materialise_slotted_memops(uint32_t insn_idx, uint64_t n_fixed,
             dp.data = lookup_cell(state_blk, state_gen, base_blk, base_gen,
                                   slot_lut, insn_idx, data_fid);
             dp.has_data = true;
+            /* Access byte width rides with the value (gated by mem_data).
+             * 0 when the trace predates the *_SIZE families. */
+            dp.data_size = (uint8_t)lookup_cell(state_blk, state_gen,
+                                                base_blk, base_gen, slot_lut,
+                                                insn_idx, size_fids[s]).low64();
         }
         out->push_back(dp);
     }
@@ -756,6 +767,11 @@ void materialise_reg_snaps_and_metaflags(uint32_t insn_idx,
         r.operand_index = (uint8_t)op_i;
         r.reg_id = it.dst_regs[op_i];
         r.value = v;
+        r.width_bytes = (uint8_t)lookup_cell(state_blk, state_gen,
+                                             base_blk, base_gen, slot_lut,
+                                             insn_idx,
+                                             ids.fid_dst_reg_width[op_i])
+                            .low64();
         snaps_out->push_back(r);
     }
     /* FID_METAFLAGS only fires when (a) the trace names a flags reg
@@ -830,6 +846,7 @@ void BodyWalker::decode_field_delta(Reader &outer,
             materialise_slotted_memops(idx, n_loads, DynParam::Load,
                                        ids.fid_load_addr,
                                        ids.fid_load_data,
+                                       ids.fid_load_size,
                                        has_mem,
                                        state_blk, state_gen,
                                        base_blk,  base_gen,
@@ -837,6 +854,7 @@ void BodyWalker::decode_field_delta(Reader &outer,
             materialise_slotted_memops(idx, n_stores, DynParam::Store,
                                        ids.fid_store_addr,
                                        ids.fid_store_data,
+                                       ids.fid_store_size,
                                        has_mem,
                                        state_blk, state_gen,
                                        base_blk,  base_gen,
@@ -945,6 +963,28 @@ Wide BodyWalker::BB::dst_reg(uint32_t insn, uint32_t op) const
     if (!blk_ || op >= FID_SLOT_COUNT) return Wide{};
     return lookup_cell(blk_, state_gen_, base_blk_, base_gen_,
                        *slot_lut_, insn, ids_->fid_dst_reg[op]);
+}
+/* Byte width of memop value / dst-register write.  0 means the trace did
+ * not carry the width (memdata/regdata off, or a trace produced before the
+ * *_SIZE / *_WIDTH families existed — those fids resolve to 0, which the
+ * slot LUT never maps). */
+uint64_t BodyWalker::BB::load_size(uint32_t insn, uint32_t slot) const
+{
+    if (!blk_ || slot >= FID_SLOT_COUNT) return 0;
+    return lookup_cell(blk_, state_gen_, base_blk_, base_gen_,
+                       *slot_lut_, insn, ids_->fid_load_size[slot]).low64();
+}
+uint64_t BodyWalker::BB::store_size(uint32_t insn, uint32_t slot) const
+{
+    if (!blk_ || slot >= FID_SLOT_COUNT) return 0;
+    return lookup_cell(blk_, state_gen_, base_blk_, base_gen_,
+                       *slot_lut_, insn, ids_->fid_store_size[slot]).low64();
+}
+uint64_t BodyWalker::BB::dst_reg_width(uint32_t insn, uint32_t op) const
+{
+    if (!blk_ || op >= FID_SLOT_COUNT) return 0;
+    return lookup_cell(blk_, state_gen_, base_blk_, base_gen_,
+                       *slot_lut_, insn, ids_->fid_dst_reg_width[op]).low64();
 }
 
 void BodyWalker::consume_field_section(Reader &outer, uint32_t template_id,

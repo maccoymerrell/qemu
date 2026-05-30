@@ -37,14 +37,15 @@ namespace cst {
  * so bumping the generation invalidates every cell in O(1).  Replaces
  * an unordered_map<u64,Wide> (~10% of decode time in hash lookups). */
 /* Layout matches FIELD_STATE_SLOT_COUNT in champsim_tracer_output.cc:
- *   3 singletons (N_LOADS, N_STORES, METAFLAGS) + 5 * FID_SLOT_COUNT
+ *   3 singletons (N_LOADS, N_STORES, METAFLAGS) + 8 * FID_SLOT_COUNT
  *   (slotted families: load_addr/store_addr/load_data/store_data/
- *   dst_reg) + 4 * FID_SLOT_COUNT (lane-mask block: SRC_LANE_MASK
- *   / DST_LANE_MASK / LOAD_DATA_LANE_MASK / STORE_DATA_LANE_MASK) +
- *   7 insn-metadata.  EXTENDED has no persistent cell.  Bump
- *   alongside the writer when new families are added. */
+ *   dst_reg/load_size/store_size/dst_reg_width) + 4 * FID_SLOT_COUNT
+ *   (lane-mask block: SRC_LANE_MASK / DST_LANE_MASK / LOAD_DATA_LANE_MASK
+ *   / STORE_DATA_LANE_MASK) + 7 insn-metadata.  EXTENDED has no
+ *   persistent cell.  Bump alongside the writer when new families are
+ *   added. */
 inline constexpr size_t  FIELD_STATE_SLOT_COUNT   =
-    3 + 5 * FID_SLOT_COUNT + 4 * FID_SLOT_COUNT + 7;
+    3 + 8 * FID_SLOT_COUNT + 4 * FID_SLOT_COUNT + 7;
 inline constexpr uint16_t FIELD_STATE_SLOT_INVALID = 0xFFFFu;
 /* fid space is ULEB-encoded; the highest slotted FID at slot 63 is
  * ~322.  Round to next power-of-two for a single-load slot lookup. */
@@ -191,6 +192,11 @@ public:
         Wide     load_data(uint32_t insn, uint32_t slot) const;
         Wide     store_data(uint32_t insn, uint32_t slot) const;
         Wide     dst_reg(uint32_t insn, uint32_t op) const;
+        /* Byte width (1..64) of the memop value / dst-register write;
+         * 0 when the trace did not capture it. */
+        uint64_t load_size(uint32_t insn, uint32_t slot) const;
+        uint64_t store_size(uint32_t insn, uint32_t slot) const;
+        uint64_t dst_reg_width(uint32_t insn, uint32_t op) const;
 
     private:
         friend class BodyWalker;

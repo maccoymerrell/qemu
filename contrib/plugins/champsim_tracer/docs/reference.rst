@@ -536,9 +536,9 @@ mapping.
    the wire and the writer chooses the (id → name) assignment to
    keep hot fields in the 1-byte range; decoders MUST resolve every
    field by *name* via the header's ``field_id`` encoding map, never
-   by a hard-coded number.  The five memop / register slotted
+   by a hard-coded number.  The eight memop / register slotted
    families are *interleaved by slot* (slot ``k`` of every family
-   co-located) with a stride of 5 — ``CST_FID_SLOT_STRIDE`` —
+   co-located) with a stride of 8 — ``CST_FID_SLOT_STRIDE`` —
    rather than family-then-slot; the four lane-mask families form a
    separate block after them, interleaved by slot with a stride of
    4 (``CST_FID_LANE_BLOCK_STRIDE``).  Each slotted family has
@@ -574,6 +574,15 @@ mapping.
        snapshot for ``dst_regs[k]``.  Gated by
        ``CST_FLAG_REG_DATA``.  Source-register values are not
        emitted — consumers reconstruct them from the regfile.
+   * - ``CST_FID_LOAD_SIZE{k}`` / ``CST_FID_STORE_SIZE{k}`` /
+       ``CST_FID_DST_REG_WIDTH{k}``, ``k ∈ [0, 64)``
+     - Scalar delta — byte width (1..``CST_MAX_WIDE_BYTES``) of the
+       memop value / destination-register write for slot ``k``, for
+       value-prediction consumers (the width is not recoverable from
+       the magnitude-suppressed value, nor static across ISAs — RVV
+       ``SEW`` / SVE ``VL``).  The size families ride with their value
+       families: ``LOAD_SIZE`` / ``STORE_SIZE`` gated by
+       ``CST_FLAG_MEM_DATA``, ``DST_REG_WIDTH`` by ``CST_FLAG_REG_DATA``.
    * - ``CST_FID_SRC_LANE_MASK{k}`` /
        ``CST_FID_DST_LANE_MASK{k}``, ``k ∈ [0, 64)``
      - Scalar delta — per-source / per-destination vector lane

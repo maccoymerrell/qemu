@@ -103,7 +103,10 @@ writer stamped into the trace header.
 Captured per-instruction data is folded into the operand line:
 
 * ``%dst[<value>]`` — destination register post-execution
-  snapshot (when ``regdata=1`` was set during capture).
+  snapshot (when ``regdata=1`` was set during capture).  A
+  ``/w<n>`` suffix inside the brackets gives the write's byte width
+  (``%dst[0x5/w4]`` is a 4-byte write), for value-prediction
+  consumers; the width is the ``CST_FID_DST_REG_WIDTH`` field.
 * ``%mflags[<bits>]`` — synthetic canonical-flags register
   rendered as a bit-string of set flags drawn from
   ``Z`` / ``N`` / ``C`` / ``V`` / ``P``, in that order, or ``-``
@@ -117,7 +120,10 @@ Captured per-instruction data is folded into the operand line:
   ``st(<addr>)`` (when ``memdata=0``).  When ``memdata=1`` the
   ``=<value>`` suffix is always present, including for zero
   values, so the absence of ``=`` unambiguously means
-  ``memdata`` was not captured.
+  ``memdata`` was not captured.  A ``/w<n>`` suffix on the value
+  (and ``,w<n>`` inside the parentheses of an address-only memop)
+  gives the access byte width — the ``CST_FID_LOAD_SIZE`` /
+  ``CST_FID_STORE_SIZE`` field — for value-prediction consumers.
 * ``# <target> <symbol+offset>`` trailing comment — branch
   target captured from the ``REG_IP`` snapshot post-execution,
   with the matching symbol name when known.

@@ -94,6 +94,7 @@ void RegSnapCollector::read_into_snap(unsigned int cpu_index,
                                       RegSnap *out)
 {
     cst_wide_zero(&out->value);
+    out->width_bytes = 0;
     struct qemu_plugin_register *handle =
         g_reg_handle_cache.lookup(cpu_index, qemu_reg);
     if (!handle) {
@@ -106,6 +107,11 @@ void RegSnapCollector::read_into_snap(unsigned int cpu_index,
     }
     cst_normalize_reg_bytes_to_le(buf->data, (size_t)n);
     cst_wide_from_le_bytes(&out->value, buf->data, (size_t)n);
+    /* Architectural width of the read, clamped to the 512-bit value cap
+     * (registers wider than CST_MAX_WIDE_BYTES already truncate @value,
+     * so the recorded width matches what is actually stored). */
+    out->width_bytes = (uint8_t)(n > CST_MAX_WIDE_BYTES ? CST_MAX_WIDE_BYTES
+                                                        : n);
 }
 
 

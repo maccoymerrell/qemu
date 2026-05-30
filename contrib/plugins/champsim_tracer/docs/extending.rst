@@ -219,7 +219,8 @@ Field IDs are ULEB128 values, not a fixed-width ``u8`` space; the
 canonical authority for the layout is the wire-format spec
 :doc:`/format` §5.1, and the constants live next to each other in
 ``champsim_tracer.h``.  Slotted families (load/store addresses,
-load/store data, destination-register snapshots) each span
+load/store data, destination-register snapshots, load/store/dst-register
+byte widths) each span
 ``CST_FID_SLOT_COUNT`` (64) slots, interleaved by slot with a
 per-family stride of ``CST_FID_SLOT_STRIDE`` so slot 0 of every family
 plus the hot singletons occupy the cheap low-ID range.  The lane-mask

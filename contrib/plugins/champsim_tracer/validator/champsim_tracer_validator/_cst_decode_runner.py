@@ -196,13 +196,15 @@ _WP_HEAD_RE = re.compile(
     r"^  wp\[(\d+)\] template=BB(\d+) n_insns=(\d+)$"
 )
 _LOAD_RE  = re.compile(
-    r"^( +)insn\[(\d+)\] load=0x([0-9a-f]+)(?::data=0x([0-9a-f]+))?$"
+    r"^( +)insn\[(\d+)\] load=0x([0-9a-f]+)"
+    r"(?::data=0x([0-9a-f]+):size=(\d+))?$"
 )
 _STORE_RE = re.compile(
-    r"^( +)insn\[(\d+)\] store=0x([0-9a-f]+)(?::data=0x([0-9a-f]+))?$"
+    r"^( +)insn\[(\d+)\] store=0x([0-9a-f]+)"
+    r"(?::data=0x([0-9a-f]+):size=(\d+))?$"
 )
 _REG_RE = re.compile(
-    r"^( +)insn\[(\d+)\] (dst|src)\[(\d+)\] (\S+)=0x([0-9a-f]+)$"
+    r"^( +)insn\[(\d+)\] (dst|src)\[(\d+)\] (\S+)=0x([0-9a-f]+)(?::w=(\d+))?$"
 )
 _MFLAGS_RE = re.compile(
     r"^( +)insn\[(\d+)\] 0x([0-9a-fA-F]+) \[([A-Z\-]+)\]$"
@@ -218,19 +220,23 @@ _DEP_FAMILY_RE = re.compile(
 
 
 def _make_dyn(type_name: str, value: int, insn_index: int,
-              data_hex: str | None) -> DynParam:
+              data_hex: str | None, size: str | None = None) -> DynParam:
     dp = DynParam(type_name=type_name, value=value, insn_index=insn_index)
     if data_hex:
         d = int(data_hex, 16)
         dp.data = d
         dp.data_lo = d & ((1 << 64) - 1)
         dp.data_hi = (d >> 64) & ((1 << 64) - 1)
-        dp.data_size = (d.bit_length() + 7) // 8
+        # Prefer the trace's captured access width (CST_FID_*_SIZE); fall
+        # back to the value-magnitude estimate only for older traces whose
+        # legacy output carries no ``:size=``.
+        dp.data_size = int(size) if size is not None \
+            else (d.bit_length() + 7) // 8
     return dp
 
 
 def _make_reg_snap(insn_index: int, kind: str, operand_index: int,
-                   reg_id: int, hexv: str) -> dict:
+                   reg_id: int, hexv: str, width: str | None = None) -> dict:
     v = int(hexv, 16)
     return {
         "insn_index": insn_index,
@@ -240,6 +246,9 @@ def _make_reg_snap(insn_index: int, kind: str, operand_index: int,
         "value":      v,
         "lo":         v & ((1 << 64) - 1),
         "hi":         (v >> 64) & ((1 << 64) - 1),
+        # Captured write byte width (CST_FID_DST_REG_WIDTH); None for
+        # older traces whose legacy output carries no ``:w=``.
+        "width_bytes": int(width) if width is not None else None,
     }
 
 
@@ -480,13 +489,15 @@ def _parse_observations(lines: list[str], i: int,
                 ml = _LOAD_RE.match(lines[i])
                 if ml:
                     dyn.append(_make_dyn("load", int(ml.group(3), 16),
-                                          int(ml.group(2)), ml.group(4)))
+                                          int(ml.group(2)), ml.group(4),
+                                          ml.group(5)))
                     i += 1
                     continue
                 ms = _STORE_RE.match(lines[i])
                 if ms:
                     dyn.append(_make_dyn("store", int(ms.group(3), 16),
-                                          int(ms.group(2)), ms.group(4)))
+                                          int(ms.group(2)), ms.group(4),
+                                          ms.group(5)))
                     i += 1
                     continue
                 break
@@ -501,7 +512,7 @@ def _parse_observations(lines: list[str], i: int,
                     int(mr.group(2)), mr.group(3),
                     int(mr.group(4)),
                     reg_name_to_id.get(mr.group(5), 0),
-                    mr.group(6)))
+                    mr.group(6), mr.group(7)))
                 i += 1
             continue
         if line == "metaflags:":

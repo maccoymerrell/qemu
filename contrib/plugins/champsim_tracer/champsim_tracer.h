@@ -179,7 +179,7 @@ extern "C" {
  * See champsim_tracer_format.md §5.1.
  */
 #define CST_FID_SLOT_COUNT       64   /* slots per slotted family */
-#define CST_FID_SLOT_STRIDE      5    /* family IDs per slot       */
+#define CST_FID_SLOT_STRIDE      8    /* family IDs per slot (== family count) */
 #define CST_MAX_WIDE_BYTES       64   /* 512-bit data/reg scalar cap */
 
 /* Hot singletons — kept in the 0..127 1-byte ULEB range. */
@@ -189,20 +189,30 @@ extern "C" {
 
 /* Slotted families.  Slot k of family f lives at
  *   CST_FID_<FAMILY>_BASE + k * CST_FID_SLOT_STRIDE
- * Bases are adjacent (3..7) so slot 0 of all five families plus the
- * three hot singletons occupy IDs 0..7.  No source-value family
+ * Bases are adjacent (3..10) so slot 0 of all eight families plus the
+ * three hot singletons occupy IDs 0..10.  No source-value family
  * exists: consumers reconstruct any register's current value from
  * the regfile + accumulated DST_REG snapshots.
+ *
+ * The *_SIZE / *_WIDTH families carry the byte width of each captured
+ * memop value / destination-register write (1..CST_MAX_WIDE_BYTES) for
+ * value-prediction consumers; the width is not derivable from the
+ * magnitude-suppressed SLEB value, nor statically across ISAs (RVV SEW,
+ * SVE VL).  They are gated with their value families and, being mostly
+ * static per slot, cost one delta record per slot per segment.
  */
-#define CST_FID_LOAD_ADDR_BASE   3    /* slot k at base + 5k     */
-#define CST_FID_STORE_ADDR_BASE  4
-#define CST_FID_LOAD_DATA_BASE   5    /* gated by CST_FLAG_MEM_DATA */
-#define CST_FID_STORE_DATA_BASE  6
-#define CST_FID_DST_REG_BASE     7    /* gated by CST_FLAG_REG_DATA */
+#define CST_FID_LOAD_ADDR_BASE      3    /* slot k at base + STRIDE*k  */
+#define CST_FID_STORE_ADDR_BASE     4
+#define CST_FID_LOAD_DATA_BASE      5    /* gated by CST_FLAG_MEM_DATA */
+#define CST_FID_STORE_DATA_BASE     6
+#define CST_FID_DST_REG_BASE        7    /* gated by CST_FLAG_REG_DATA */
+#define CST_FID_LOAD_SIZE_BASE      8    /* gated by CST_FLAG_MEM_DATA */
+#define CST_FID_STORE_SIZE_BASE     9    /* gated by CST_FLAG_MEM_DATA */
+#define CST_FID_DST_REG_WIDTH_BASE  10   /* gated by CST_FLAG_REG_DATA */
 
-/* Last slotted ID = base + (SLOT_COUNT-1) * STRIDE = base + 315.
+/* Last slotted ID = base of the final family + (SLOT_COUNT-1) * STRIDE.
  * Lane-mask block + insn-metadata start immediately after. */
-#define CST_FID_SLOTTED_END      (CST_FID_DST_REG_BASE + \
+#define CST_FID_SLOTTED_END      (CST_FID_DST_REG_WIDTH_BASE + \
                                   (CST_FID_SLOT_COUNT - 1) * CST_FID_SLOT_STRIDE)
 
 /* Lane-mask block.  Kept out of the hot slotted block so the cheap
@@ -317,6 +327,13 @@ static inline void cst_normalize_reg_bytes_to_le(uint8_t *bytes, size_t len)
  */
 typedef struct {
     CSTWideValue value;
+    /* Architectural width of the register read, in bytes (the
+     * qemu_plugin_read_register() byte count).  Surfaced via the
+     * CST_FID_DST_REG_WIDTH family for value-prediction consumers, which
+     * need to know how many bytes of @value the write covers (a width
+     * not derivable from the magnitude-suppressed SLEB delta, nor static
+     * across ISAs — SVE/RVV register width is VL/vtype-driven). */
+    uint8_t     width_bytes;
 } RegSnap;
 
 /*

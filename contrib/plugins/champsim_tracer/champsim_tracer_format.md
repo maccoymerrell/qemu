@@ -1239,6 +1239,30 @@ Field families (one canonical name each):
   that the wp_event_flag stream + initial-state REGFILE records
   + DST_REG snapshots collectively define.
 
+* **Width families** — the byte width of each captured value, for
+  value-prediction consumers that need to know how many bytes a
+  predicted register or memory value covers.  The width is not
+  recoverable from the value itself (the `SLEB_WIDE` encoding is
+  magnitude-suppressed, with no length prefix) and is not static
+  across ISAs (RISC-V V element width is the runtime `SEW`; SVE
+  register width follows the vector length), so it is carried as its
+  own per-slot field:
+
+  * **`CST_FID_LOAD_SIZE{k}`** / **`CST_FID_STORE_SIZE{k}`** — access
+    byte width of load / store memop slot `k`.  Gated on
+    `CST_FLAG_MEM_DATA` (they ride with `LOAD_DATA` / `STORE_DATA`).
+  * **`CST_FID_DST_REG_WIDTH{k}`** — write byte width of
+    destination-register slot `k`.  Gated on `CST_FLAG_REG_DATA`.
+
+  Each is a per-`(template_id, ins_pos, slot)` sparse scalar with
+  baseline default zero, so a fixed-width access emits one record at
+  first observation and zero bytes thereafter, while a width that
+  varies (RVV `SEW` / SVE `VL` changes) emits a delta only when it
+  changes.  Values are clamped to `CST_MAX_WIDE_BYTES`.  These
+  families post-date the others; a trace produced without them is
+  well-formed and decoders treat their absence as "width not
+  captured".
+
 * **Vector lane-mask families** (four, one slot per operand, gated on
   the per-insn `CST_INSN_FLAG_VEC` bit — see §6 *Vector lane masks*):
 

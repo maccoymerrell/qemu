@@ -793,6 +793,11 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
                 find_dst_regdata(insn, (uint8_t)k)) {
             line.push_back('[');
             append_wide_hex(&line, r->value);
+            /* Write byte width for value prediction (CST_FID_DST_REG_WIDTH). */
+            if (r->width_bytes) {
+                line.append("/w");
+                line.append(std::to_string(r->width_bytes));
+            }
             line.push_back(']');
         }
         if (ctx.show_lanes) {
@@ -943,6 +948,10 @@ void emit_disasm_memops(std::string &line, const DisasmContext &ctx,
              * address-input set; the walker has no info). */
             line.append(is_load ? "  ld(0x" : "  st(0x");
             append_hex(&line, dp.addr);
+            if (dp.data_size) {
+                line.append(",w");
+                line.append(std::to_string(dp.data_size));
+            }
             line.push_back(')');
         }
         if (with_data) {
@@ -950,6 +959,11 @@ void emit_disasm_memops(std::string &line, const DisasmContext &ctx,
              * here (would produce "st=0x0x.."). */
             line.append(is_load ? "  ld=" : "  st=");
             append_wide_hex(&line, dp.data);
+            /* Access byte width for value prediction (CST_FID_*_SIZE). */
+            if (dp.data_size) {
+                line.append("/w");
+                line.append(std::to_string(dp.data_size));
+            }
         }
         if (is_load) load_idx++;
         else         store_idx++;
@@ -1646,6 +1660,10 @@ void format_dyn_legacy(const cst::DynParam &dp, bool show_data,
         w.reserve(16);
         append_wide_hex(&w, dp.data);
         out->append(w);
+        /* Access byte width (CST_FID_*_SIZE), for value prediction; 0
+         * when a trace predates the width families. */
+        out->append(":size=");
+        out->append(std::to_string(dp.data_size));
     }
 }
 
@@ -1685,10 +1703,11 @@ void emit_legacy_observations(FILE *out, const std::string &prefix,
     if (!snaps.empty()) {
         std::fprintf(out, "%sregs:\n", prefix.c_str());
         for (auto &r : snaps) {
-            std::fprintf(out, "%s  insn[%u] dst[%u] %s=%s\n",
+            std::fprintf(out, "%s  insn[%u] dst[%u] %s=%s:w=%u\n",
                          prefix.c_str(), r.insn_index, r.operand_index,
                          fmt_reg(h, r.reg_id).c_str(),
-                         fmt_snap_value(r.value).c_str());
+                         fmt_snap_value(r.value).c_str(),
+                         (unsigned)r.width_bytes);
         }
     }
     if (!mflags.empty()) {

@@ -72,6 +72,12 @@ struct ResolvedIds {
     std::array<uint16_t, 64> fid_load_data             {};
     std::array<uint16_t, 64> fid_store_data            {};
     std::array<uint16_t, 64> fid_dst_reg               {};
+    /* Per-slot byte width of each memop value / dst-register write
+     * (CST_FID_LOAD_SIZE / STORE_SIZE / DST_REG_WIDTH), for value
+     * prediction.  Gated with their value families. */
+    std::array<uint16_t, 64> fid_load_size             {};
+    std::array<uint16_t, 64> fid_store_size            {};
+    std::array<uint16_t, 64> fid_dst_reg_width         {};
     std::array<uint16_t, 64> fid_src_lane_mask         {};
     std::array<uint16_t, 64> fid_dst_lane_mask         {};
     std::array<uint16_t, 64> fid_load_data_lane_mask   {};
@@ -210,6 +216,7 @@ struct DynParam {
     uint64_t addr        = 0;     /* always low 64 bits */
     Wide     data{};              /* full width when has_mem_data */
     bool     has_data    = false;
+    uint8_t  data_size   = 0;     /* access byte width; 0 = not captured */
 };
 
 struct RegSnap {
@@ -217,6 +224,7 @@ struct RegSnap {
     uint8_t  operand_index = 0;
     uint8_t  reg_id        = 0;
     Wide     value{};             /* full width */
+    uint8_t  width_bytes   = 0;   /* write byte width; 0 = not captured */
 };
 
 /* Per-insn metaflags byte (FID_METAFLAGS).  Only emitted for insns

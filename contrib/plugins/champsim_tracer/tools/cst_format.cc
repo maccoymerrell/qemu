@@ -208,9 +208,17 @@ static void resolve_one(const std::unordered_map<uint64_t, std::string> &m,
                              + "' missing well-known name '" + want + "'");
 }
 
-static void resolve_one(const std::unordered_map<uint64_t, std::string> &m,
-                        const char *map_name, const char *want,
-                        uint16_t *out)
+/* Like resolve_one but tolerant: per the format spec (Step 3.3), no
+ * field_id name is structurally required — a trace need only name the
+ * fields it actually uses (e.g. a memdata-off trace omits LOAD_DATA /
+ * STORE_DATA; a scalar trace omits the lane masks).  A name the trace
+ * does not carry resolves to an out-of-range sentinel so the slot LUT
+ * and per-fid lookups skip it (and it can never collide with a real fid
+ * such as N_LOADS == 0).  If such a fid nonetheless appears in the body
+ * it is an open-map violation caught at parse time, not here. */
+static void resolve_optional(const std::unordered_map<uint64_t,
+                                                      std::string> &m,
+                             const char *want, uint16_t *out)
 {
     for (const auto &kv : m) {
         if (kv.second == want) {
@@ -218,8 +226,7 @@ static void resolve_one(const std::unordered_map<uint64_t, std::string> &m,
             return;
         }
     }
-    throw std::runtime_error(std::string("encoding map '") + map_name
-                             + "' missing well-known name '" + want + "'");
+    *out = 0xFFFFu;   /* absent: out-of-range sentinel */
 }
 
 /* Populate @ids from the well-known names in @maps.  Throws on any
@@ -240,14 +247,15 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
                 &ids->body_tag_regfile);
 
     /* field_id (per-slot families + singletons): each looked up by
-     * full CST_FID_<family><k> name, no stride/ordering assumption. */
-    resolve_one(maps.field_id, "field_id", "CST_FID_N_LOADS",
-                &ids->fid_n_loads);
-    resolve_one(maps.field_id, "field_id", "CST_FID_N_STORES",
-                &ids->fid_n_stores);
-    resolve_one(maps.field_id, "field_id", "CST_FID_METAFLAGS",
-                &ids->fid_metaflags);
-    /* Slotted families: resolve every (family, slot) by name. */
+     * full CST_FID_<family><k> name, no stride/ordering assumption.
+     * Per Step 3.3 NO field_id name is structurally required — a trace
+     * names only the fields it uses — so every one resolves tolerantly
+     * (absent -> sentinel).  CST_FID_EXTENDED is "required iff present";
+     * its absence is likewise fine, and a stray EXTENDED record with no
+     * name is caught at parse time. */
+    resolve_optional(maps.field_id, "CST_FID_N_LOADS",   &ids->fid_n_loads);
+    resolve_optional(maps.field_id, "CST_FID_N_STORES",  &ids->fid_n_stores);
+    resolve_optional(maps.field_id, "CST_FID_METAFLAGS", &ids->fid_metaflags);
     static const struct { const char *prefix;
                           std::array<uint16_t, 64> ResolvedIds::*arr; } fam[] = {
         { "CST_FID_LOAD_ADDR",            &ResolvedIds::fid_load_addr            },
@@ -255,6 +263,9 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
         { "CST_FID_LOAD_DATA",            &ResolvedIds::fid_load_data            },
         { "CST_FID_STORE_DATA",           &ResolvedIds::fid_store_data           },
         { "CST_FID_DST_REG",              &ResolvedIds::fid_dst_reg              },
+        { "CST_FID_LOAD_SIZE",            &ResolvedIds::fid_load_size            },
+        { "CST_FID_STORE_SIZE",           &ResolvedIds::fid_store_size           },
+        { "CST_FID_DST_REG_WIDTH",        &ResolvedIds::fid_dst_reg_width        },
         { "CST_FID_SRC_LANE_MASK",        &ResolvedIds::fid_src_lane_mask        },
         { "CST_FID_DST_LANE_MASK",        &ResolvedIds::fid_dst_lane_mask        },
         { "CST_FID_LOAD_DATA_LANE_MASK",  &ResolvedIds::fid_load_data_lane_mask  },
@@ -263,26 +274,25 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
     for (const auto &f : fam) {
         for (uint16_t k = 0; k < FID_SLOT_COUNT; k++) {
             std::string name = std::string(f.prefix) + std::to_string(k);
-            resolve_one(maps.field_id, "field_id", name.c_str(),
-                        &(ids->*f.arr)[k]);
+            resolve_optional(maps.field_id, name.c_str(), &(ids->*f.arr)[k]);
         }
     }
-    resolve_one(maps.field_id, "field_id", "CST_FID_INSN_BYTES_LO",
-                &ids->fid_insn_bytes_lo);
-    resolve_one(maps.field_id, "field_id", "CST_FID_INSN_BYTES_HI",
-                &ids->fid_insn_bytes_hi);
-    resolve_one(maps.field_id, "field_id", "CST_FID_INSN_OPCODE",
-                &ids->fid_insn_opcode);
-    resolve_one(maps.field_id, "field_id", "CST_FID_INSN_BRANCH_TYPE",
-                &ids->fid_insn_branch_type);
-    resolve_one(maps.field_id, "field_id", "CST_FID_INSN_FLAGS",
-                &ids->fid_insn_flags);
-    resolve_one(maps.field_id, "field_id", "CST_FID_INSN_IMMEDIATE",
-                &ids->fid_insn_immediate);
-    resolve_one(maps.field_id, "field_id", "CST_FID_INSN_SIZE",
-                &ids->fid_insn_size);
-    resolve_one(maps.field_id, "field_id", "CST_FID_EXTENDED",
-                &ids->fid_extended);
+    resolve_optional(maps.field_id, "CST_FID_INSN_BYTES_LO",
+                     &ids->fid_insn_bytes_lo);
+    resolve_optional(maps.field_id, "CST_FID_INSN_BYTES_HI",
+                     &ids->fid_insn_bytes_hi);
+    resolve_optional(maps.field_id, "CST_FID_INSN_OPCODE",
+                     &ids->fid_insn_opcode);
+    resolve_optional(maps.field_id, "CST_FID_INSN_BRANCH_TYPE",
+                     &ids->fid_insn_branch_type);
+    resolve_optional(maps.field_id, "CST_FID_INSN_FLAGS",
+                     &ids->fid_insn_flags);
+    resolve_optional(maps.field_id, "CST_FID_INSN_IMMEDIATE",
+                     &ids->fid_insn_immediate);
+    resolve_optional(maps.field_id, "CST_FID_INSN_SIZE",
+                     &ids->fid_insn_size);
+    resolve_optional(maps.field_id, "CST_FID_EXTENDED",
+                     &ids->fid_extended);
 
     /* insn_flag (bit masks) */
     resolve_one(maps.insn_flag, "insn_flag", "CST_INSN_FLAG_BRANCH_COND",

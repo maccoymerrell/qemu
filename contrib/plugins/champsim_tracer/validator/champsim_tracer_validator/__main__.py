@@ -128,6 +128,13 @@ def _parse_args() -> argparse.Namespace:
     t.add_argument("--depth", type=int, default=64,
                    help="wrong-path depth (plugin option)")
     t.add_argument("--stop", type=int, default=200_000)
+    t.add_argument("--tb-size", type=int, default=0,
+                   help="QEMU code-cache size in MiB (passes -tb-size). "
+                        "0 leaves QEMU's default. A small value (e.g. 1) "
+                        "forces frequent tb_flush mid-trace, exercising the "
+                        "flush-during-wrong-path reclamation path; only "
+                        "bites on programs whose translation footprint "
+                        "exceeds the cache (~700 synthetic BBs per MiB).")
     t.add_argument("--regdata", action="store_true",
                    help="Enable per-insn register-value capture (regdata=1)")
     t.add_argument("--compress", choices=("none", "xz", "zstd", "gzip"),
@@ -163,6 +170,10 @@ def _parse_args() -> argparse.Namespace:
     al.add_argument("--side-len-max", type=int, default=4)
     al.add_argument("--depth", type=int, default=64)
     al.add_argument("--stop", type=int, default=200_000)
+    al.add_argument("--tb-size", type=int, default=0,
+                    help="QEMU code-cache size in MiB (passes -tb-size; "
+                         "0 = QEMU default). Small values force tb_flush "
+                         "mid-trace; see `trace --tb-size`.")
     al.add_argument("--regdata", action="store_true",
                     help="Enable per-insn register-value capture (regdata=1)")
     al.add_argument("--iframe-rate", type=int, default=None,
@@ -354,9 +365,15 @@ def cmd_trace(args, isa: str | None = None) -> int:
         plugin_opts += ",regdata=1"
     if getattr(args, "iframe_rate", None) is not None:
         plugin_opts += f",iframe_rate={int(args.iframe_rate)}"
-    cmd = [
-        str(qemu), "-plugin", f"{plugin},{plugin_opts}", str(bin_path),
-    ]
+    cmd = [str(qemu)]
+    tb_size = getattr(args, "tb_size", 0)
+    if tb_size:
+        # Shrink the TCG code cache so the program's translation
+        # footprint overflows it, forcing tb_flush mid-trace.  This is
+        # what exercises the flush-during-wrong-path template reclamation
+        # path; on a small program (footprint < cache) it is a no-op.
+        cmd += ["-tb-size", str(int(tb_size))]
+    cmd += ["-plugin", f"{plugin},{plugin_opts}", str(bin_path)]
     print(f"trace[{isa}]: {' '.join(cmd)}")
     rc = subprocess.call(cmd)
     cst = Path(f"{out_base}.cst")

@@ -9,6 +9,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
+#include <unordered_set>
 #include <vector>
 
 #include "champsim_tracer_bb_template_cache.h"
@@ -81,9 +82,28 @@ void BBTemplateCache::clear_bb_map()
     next_template_id_ = 1;
 }
 
-void BBTemplateCache::clear_tb_templates()
+BBTemplate *BBTemplateCache::lookup_tb_chain(uint64_t tb_start_pc,
+                                             uint32_t total_n_insns)
 {
-    tb_templates_.clear();
+    auto it = tb_chain_dedup_.find(tb_start_pc);
+    if (it == tb_chain_dedup_.end()) {
+        return nullptr;
+    }
+    for (BBTemplate *head : it->second) {
+        uint32_t sum = 0;
+        for (BBTemplate *f = head; f; f = f->next_tb_fragment) {
+            sum += f->n_insns;
+        }
+        if (sum == total_n_insns) {
+            return head;
+        }
+    }
+    return nullptr;
+}
+
+void BBTemplateCache::register_tb_chain(uint64_t tb_start_pc, BBTemplate *head)
+{
+    tb_chain_dedup_[tb_start_pc].push_back(head);
 }
 
 size_t BBTemplateCache::bb_count() const

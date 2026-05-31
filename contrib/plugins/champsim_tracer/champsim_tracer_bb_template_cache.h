@@ -118,12 +118,26 @@ public:
      * the TBs themselves. */
     void clear_bb_map();
 
-    /* Drop ownership of every TB template.  Called from the tb_flush
-     * callback after QEMU has invalidated the TBs that hold these
-     * templates via per-TB udata; any in-flight CP chain or WP
-     * walker holding raw BBTemplate* into tb_templates_ must be
-     * reset first. */
-    void clear_tb_templates();
+    /* Dedup support for the persistent per-translation store.  TB
+     * templates are NEVER freed on tb_flush: a flush just re-translates
+     * the same code, so the matching chain is reused instead.  This keeps
+     * every per-insn-callback udata (RegSnapInsnRef inside a template)
+     * valid for the QEMU TB's whole lifetime without any flush-time
+     * reclamation — the trace is flush-invariant by construction, because
+     * a flush changes nothing in the plugin's state.
+     *
+     * lookup_tb_chain returns the head fragment of an already-built chain
+     * for a TB starting at @tb_start_pc with @total_n_insns canonical
+     * insns, or nullptr on a miss.  Byte-identity is guaranteed by the
+     * caller's bytes-changed/poison gate (a TB that reaches here has
+     * insns matching their first sighting), so (start_pc, n_insns) is a
+     * sufficient key.  register_tb_chain records a freshly built chain's
+     * head for future reuse.  Memory is bounded by the segment's
+     * distinct-translation footprint (code size), not execution length;
+     * SMC produces a new entry and leaves the dead one in place (rare,
+     * bounded, never dereferenced once its QEMU TB is gone). */
+    BBTemplate *lookup_tb_chain(uint64_t tb_start_pc, uint32_t total_n_insns);
+    void        register_tb_chain(uint64_t tb_start_pc, BBTemplate *head);
 
 private:
     /* Materialize @tb's REP self-loop sub-template lazily on first
@@ -151,7 +165,16 @@ private:
                                       const uint64_t *insn_pcs,
                                       bool candidate_tail_swapped);
 
+    /* Persistent set of per-translation templates (one BBTemplatePtr per
+     * TB fragment), never freed on tb_flush.  Owned here for the whole
+     * run; deduped via tb_chain_dedup_ so a re-translation reuses the
+     * existing chain instead of appending a duplicate. */
     std::vector<BBTemplatePtr>                  tb_templates_;
+    /* Dedup index: TB start_pc -> heads of already-built fragment chains
+     * (one per distinct canonical length seen at that PC — e.g. a
+     * multi-insn CP TB and a 1-insn wrong-path single-step TB coexist).
+     * lookup_tb_chain matches on total canonical insn count. */
+    std::unordered_map<uint64_t, std::vector<BBTemplate *>> tb_chain_dedup_;
     std::unordered_map<uint64_t, BBTemplatePtr> bb_map_;
     uint32_t                                    next_template_id_ = 1;
 };

@@ -319,6 +319,42 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     assert_no_pages_locked();
     tb = tcg_tb_alloc(tcg_ctx);
     if (unlikely(!tb)) {
+#ifdef CONFIG_PLUGIN
+        if (cpu->plugin_spec_mode) {
+            /*
+             * The code buffer filled while translating a plugin wrong-path
+             * (speculative) TB.  We must NOT tb_flush here: the flush resets
+             * the buffer under the correct-path TB this wrong-path walk is
+             * nested inside (the walk runs synchronously from that TB's
+             * vcpu_tb_exec plugin callback), and post-flush translation would
+             * overwrite the host code we still have to return into -> SIGSEGV.
+             *
+             * Instead, on the first overflow of this walk, open the spec
+             * reserve held back by tcg_region_assign so the walk runs to its
+             * natural end (the wrong-path chain is then identical with or
+             * without the flush — flush-invariant, never truncated), and flag
+             * the flush so cpu_exec_loop() performs it at the next safe point,
+             * once the walk has unwound and the correct-path TB has finished.
+             */
+            if (!cpu->plugin_flush_pending) {
+                cpu->plugin_flush_pending = true;
+                tcg_region_open_spec_reserve(tcg_ctx);
+                goto buffer_overflow;          /* retry alloc into the reserve */
+            }
+            /*
+             * The reserve itself is exhausted: a single wrong-path walk's
+             * translation footprint exceeds it (only reachable with a very
+             * large wpdepth; the reserve is sized for the default).  End the
+             * walk here — the flush is already owed.  Logged, never silent.
+             * Return NULL with mmap held: the plugin exec callers unlock
+             * after tb_gen_code and handle NULL (no double-unlock).
+             */
+            qemu_log_mask(CPU_LOG_TB_OP,
+                          "plugin spec reserve exhausted; wrong-path walk "
+                          "truncated (consider a larger code buffer)\n");
+            return NULL;
+        }
+#endif
         /* flush must be done */
         tb_flush(cpu);
         mmap_unlock();

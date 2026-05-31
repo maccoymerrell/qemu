@@ -635,6 +635,12 @@ TranslationBlock *tcg_tb_alloc(TCGContext *s);
 
 void tcg_region_reset_all(void);
 
+#ifdef CONFIG_PLUGIN
+/* Open the spec reserve so an in-flight wrong-path walk can finish; see
+ * tcg/region.c and the spec-overflow path in tb_gen_code. */
+void tcg_region_open_spec_reserve(TCGContext *s);
+#endif
+
 size_t tcg_code_size(void);
 size_t tcg_code_capacity(void);
 

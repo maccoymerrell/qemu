@@ -164,6 +164,37 @@ speculative path.
    did not cover translation, the longjmp would unwind past the
    plugin callback frame and deadlock on the next call.
 
+``accel/tcg/translate-all.c`` — ``tb_gen_code``,
+``accel/tcg/cpu-exec.c`` — ``cpu_exec_loop``,
+``tcg/region.c`` — spec reserve
+
+   A wrong-path walk runs nested inside the ``vcpu_tb_exec`` callback
+   of an executing correct-path TB, so that TB's host code must stay
+   intact until the walk unwinds and the TB finishes.  A code-buffer
+   overflow during ordinary translation resolves with ``tb_flush`` +
+   ``cpu_loop_exit``, which resets the buffer and re-dispatches — but
+   taken mid-walk that resets the buffer *under* the correct-path TB
+   the walk is nested inside, clobbering the host code control returns
+   into (a JIT ``SIGSEGV``).
+
+   Two cooperating mechanisms keep wrong-path translation
+   flush-invariant instead.  Each region holds back a small reserve at
+   the top: ``tcg_region_assign`` lowers ``code_gen_highwater`` by up
+   to 2 MiB.  When ``tb_gen_code`` overflows while
+   ``cpu->plugin_spec_mode`` is set, it opens that reserve
+   (``tcg_region_open_spec_reserve``) so the in-flight walk translates
+   to its natural end — wrong-path is a series of independent true BBs,
+   and the emitted chain is identical with or without the flush, never
+   truncated — and records the owed flush in
+   ``cpu->plugin_flush_pending`` rather than flushing in place.
+   ``cpu_exec_loop`` honors that flag with the real ``tb_flush`` at its
+   next safe point, after the walk has unwound and the correct-path TB
+   has finished, so the flush recycles the whole buffer (reserve
+   included) with no TB in flight.  At the default buffer size the
+   reserve is never reached and neither path runs; it is a
+   wrong-path-only safety valve, and the correct path is byte-for-byte
+   and speed-for-speed unaffected.
+
 ``accel/tcg/cputlb.c`` and ``accel/tcg/user-exec.c`` —
 ``probe_access``
 

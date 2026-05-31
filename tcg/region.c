@@ -355,7 +355,43 @@ static void tcg_region_assign(TCGContext *s, size_t curr_region)
     s->code_gen_ptr = start;
     s->code_gen_buffer_size = end - start;
     s->code_gen_highwater = end - TCG_HIGHWATER;
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Hold back a reserve at the top of the region for plugin wrong-path
+     * (spec-mode) translation.  A wrong-path walk runs nested inside an
+     * executing correct-path TB and must NOT trigger a real tb_flush
+     * mid-walk (that would reset the buffer under the TB we still have to
+     * return into).  When such a walk overflows the normal highwater,
+     * tb_gen_code opens this reserve (tcg_region_open_spec_reserve) so the
+     * walk runs to completion — the wrong-path chain is then identical with
+     * or without the flush (flush-invariant), never truncated — and defers
+     * the real flush to the next safe point in cpu_exec_loop().  The whole
+     * region (reserve included) is recycled by that deferred flush.
+     */
+    {
+        size_t reserve = s->code_gen_buffer_size / 4;
+        if (reserve > 2 * MiB) {
+            reserve = 2 * MiB;
+        }
+        s->code_gen_highwater -= reserve;
+    }
+#endif
 }
+
+#ifdef CONFIG_PLUGIN
+/*
+ * Expose the spec reserve held back by tcg_region_assign so an in-flight
+ * plugin wrong-path walk that just overflowed the normal highwater can keep
+ * translating to its natural end.  Single-threaded: the plugin serializes
+ * wrong-path execution, and the next tb_flush restores the reserve.
+ */
+void tcg_region_open_spec_reserve(TCGContext *s)
+{
+    s->code_gen_highwater = (void *)((uintptr_t)s->code_gen_buffer
+                                     + s->code_gen_buffer_size - TCG_HIGHWATER);
+}
+#endif
 
 static bool tcg_region_alloc__locked(TCGContext *s)
 {

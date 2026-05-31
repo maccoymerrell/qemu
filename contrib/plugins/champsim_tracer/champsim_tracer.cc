@@ -117,6 +117,13 @@ bool cst_pc_is_poisoned(uint64_t pc)
  * start_pc, and that needs no start_pc lookup. */
 thread_local BBTemplate *g_cp_prev_tb_template CST_TLS_HOT = nullptr;
 
+/* See champsim_tracer.h: threads holding cross-flush BBTemplate*
+ * references (in-flight wrong-path simulation).  Gates drain_pending_flush
+ * so a tb_flush mid-WP defers template reclamation until the WP unwinds. */
+/* See champsim_tracer.h: monotonic tb_flush event count, read by the WP
+ * loop to retry a flush-interrupted spec-mode exec_tb. */
+std::atomic<uint64_t> g_tb_flush_count{0};
+
 /* Window-stop is reached optimistically at TB-start (icount_prev >=
  * window_stop), but the in-flight chain may still hold fragments
  * waiting for a branch terminator — exiting immediately would drop
@@ -359,7 +366,16 @@ static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
 /* ========================= Global state ========================= */
 
 GMutex data_lock;
-static GMutex exec_lock;
+/*
+ * Recursive: a TCG code-buffer flush during wrong-path simulation runs
+ * vcpu_tb_flush() synchronously (tb_gen_code -> qemu_plugin_flush_cb)
+ * while this same thread is already inside vcpu_tb_exec holding
+ * exec_lock.  A non-recursive mutex self-deadlocks there (seen on
+ * large-footprint workloads like gcc that fill the buffer mid-WP).
+ * exec_lock is never paired with a GCond, so recursion is safe.
+ */
+static GRecMutex exec_lock;
+
 
 /*
  * Pending dst register snapshots for the currently-executing BB.
@@ -1200,8 +1216,16 @@ static void emit_finalized_bb(BodyStreamState *out_stream,
 
     std::vector<WPBBEntry> wp_entries;
     if (enable_wrong_path && wrong_target != 0) {
+        /* If a tb_flush unwinds a spec-mode exec_tb mid-WP, the chain is
+         * truncated at that point: the WP simulation cannot be safely
+         * resumed OR re-run across the flush (QEMU's flush + spec-mode
+         * interaction faults if wrong-path execution continues), so we
+         * accept the truncated (still-valid, shorter) chain.  Only bites
+         * under heavy flushing (rare except a tiny code cache). */
+        bool flush_interrupted = false;
         wp_entries = simulate_wrong_path_ext(
-            prev_last, current_pc, wrong_target, cpu_index);
+            prev_last, current_pc, wrong_target, cpu_index,
+            &flush_interrupted);
     } else if (wrong_target == 0) {
         thread_stats_get().wp_skipped++;
         if (Stats *h = g_current_hist_bucket) {
@@ -1306,7 +1330,7 @@ static void tw_manage_window(unsigned int cpu_index,
             icount_prev >= g_trace_segments.window_stop()) {
             finish_trace_segment();
             g_trace_segments.set_shutting_down();
-            g_mutex_unlock(&exec_lock);
+            g_rec_mutex_unlock(&exec_lock);
             exit(0);
         }
         if (!g_trace_segments.is_active() && start_symbol) {
@@ -1400,7 +1424,7 @@ static void tw_manage_window(unsigned int cpu_index,
                 }
             } else {
                 g_trace_segments.set_shutting_down();
-                g_mutex_unlock(&exec_lock);
+                g_rec_mutex_unlock(&exec_lock);
                 exit(0);
             }
         }
@@ -1451,9 +1475,9 @@ static void vcpu_tb_check_budget(unsigned int cpu_index, void *udata)
          * budget.  The cost is one C call + return per spec TB. */
         return;
     }
-    g_mutex_lock(&exec_lock);
+    g_rec_mutex_lock(&exec_lock);
     if (g_trace_segments.is_shutting_down()) {
-        g_mutex_unlock(&exec_lock);
+        g_rec_mutex_unlock(&exec_lock);
         return;
     }
     uint64_t icount_now = qemu_plugin_u64_get(
@@ -1467,7 +1491,7 @@ static void vcpu_tb_check_budget(unsigned int cpu_index, void *udata)
      * (won't fire while is_active=1 dispatches to vcpu_tb_exec for
      * close detection).  Inter-segment: countdown to next eff_start. */
     recompute_budget(cpu_index);
-    g_mutex_unlock(&exec_lock);
+    g_rec_mutex_unlock(&exec_lock);
 }
 
 static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
@@ -1510,10 +1534,10 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     BBTemplate *prev_cp_tb_tmpl = g_cp_prev_tb_template;
     g_cp_prev_tb_template = cur_tb_tmpl;
 
-    g_mutex_lock(&exec_lock);
+    g_rec_mutex_lock(&exec_lock);
 
     if (g_trace_segments.is_shutting_down()) {
-        g_mutex_unlock(&exec_lock);
+        g_rec_mutex_unlock(&exec_lock);
         return;
     }
 
@@ -1539,13 +1563,13 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     BodyStreamState *out_stream = g_trace_segments.body_stream();
     if (!g_trace_segments.is_active() || !out_stream) {
-        g_mutex_unlock(&exec_lock);
+        g_rec_mutex_unlock(&exec_lock);
         return;
     }
 
     if (segment_just_opened) {
         g_cp_prev_tb_template = nullptr;
-        g_mutex_unlock(&exec_lock);
+        g_rec_mutex_unlock(&exec_lock);
         return;
     }
 
@@ -1569,7 +1593,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     /* Skip initial block (no previous context). */
     if (prev_ft == 0) {
-        g_mutex_unlock(&exec_lock);
+        g_rec_mutex_unlock(&exec_lock);
         return;
     }
 
@@ -1676,7 +1700,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     g_mutex_unlock(&data_lock);
 
     if (!any_finalize) {
-        g_mutex_unlock(&exec_lock);
+        g_rec_mutex_unlock(&exec_lock);
         return;
     }
 
@@ -1702,7 +1726,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         g_icount_shutdown_pending = false;
         /* No need to recompute_budget: we're exiting immediately and
          * the budget slot will be torn down with the scoreboard. */
-        g_mutex_unlock(&exec_lock);
+        g_rec_mutex_unlock(&exec_lock);
         exit(0);
     }
 
@@ -1719,7 +1743,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         g_cp_prev_tb_template = nullptr;
         if (!g_simpoints.current()) {
             g_trace_segments.set_shutting_down();
-            g_mutex_unlock(&exec_lock);
+            g_rec_mutex_unlock(&exec_lock);
             exit(0);
         }
         recompute_next_threshold();
@@ -1730,7 +1754,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         }
     }
 
-    g_mutex_unlock(&exec_lock);
+    g_rec_mutex_unlock(&exec_lock);
 }
 
 /* ========================= Translation callback ========================= */
@@ -1751,13 +1775,20 @@ static void tb_arm_new_template_cbs(struct qemu_plugin_tb *tb,
 {
     if ((enable_reg_data || enable_wp_reg_data) && new_tmpl &&
         new_tmpl->insn_reg_names) {
-        RegSnapInsnRef *refs = g_new0(RegSnapInsnRef,
-                                      canonical_n_insns);
-        new_tmpl->insn_snap_refs = refs;
-        for (uint32_t i = 0; i < canonical_n_insns; i++) {
-            refs[i].tb_tmpl = new_tmpl;
-            refs[i].insn_index = i;
+        /* The RegSnapInsnRef udata array lives in the (persistent)
+         * template and is allocated once; on a dedup reuse it already
+         * exists and we only re-register the QEMU callbacks below against
+         * it (a re-translation must re-arm the JIT-level callbacks even
+         * though the udata is unchanged). */
+        if (!new_tmpl->insn_snap_refs) {
+            RegSnapInsnRef *refs = g_new0(RegSnapInsnRef, canonical_n_insns);
+            new_tmpl->insn_snap_refs = refs;
+            for (uint32_t i = 0; i < canonical_n_insns; i++) {
+                refs[i].tb_tmpl = new_tmpl;
+                refs[i].insn_index = i;
+            }
         }
+        RegSnapInsnRef *refs = (RegSnapInsnRef *)new_tmpl->insn_snap_refs;
         /*
          * Post-exec dst capture: register the snap cb on raw insn
          * i (canonical_first && ci > 0) pointing at ci-1.  Firing
@@ -1835,12 +1866,17 @@ static void tb_arm_new_template_cbs(struct qemu_plugin_tb *tb,
                                 &new_tmpl->insn_synthetic_ea[i]);
         }
         if (new_tmpl->insn_synthetic_ea) {
-            synth_refs = g_new0(SynthEAInsnRef, canonical_n_insns);
-            new_tmpl->insn_synth_ea_refs = synth_refs;
-            for (uint32_t i = 0; i < canonical_n_insns; i++) {
-                synth_refs[i].tb_tmpl = new_tmpl;
-                synth_refs[i].insn_index = i;
+            /* Allocate the udata once (persistent template); on a dedup
+             * reuse re-register the callbacks against the existing refs. */
+            if (!new_tmpl->insn_synth_ea_refs) {
+                synth_refs = g_new0(SynthEAInsnRef, canonical_n_insns);
+                new_tmpl->insn_synth_ea_refs = synth_refs;
+                for (uint32_t i = 0; i < canonical_n_insns; i++) {
+                    synth_refs[i].tb_tmpl = new_tmpl;
+                    synth_refs[i].insn_index = i;
+                }
             }
+            synth_refs = (SynthEAInsnRef *)new_tmpl->insn_synth_ea_refs;
             for (size_t i = 0; i < raw_n_insns; i++) {
                 if (!canonical_first[i]) {
                     continue;
@@ -2173,8 +2209,25 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     bool     *local_canonical_first = g_new0(bool, raw_n_insns);
 
     const char *tb_symbol_name = qemu_plugin_insn_symbol(first_insn);
-    BBTemplate *head_fragment = nullptr;
+
+    /* Persistent-template dedup: a tb_flush re-translates the same code,
+     * so reuse the already-built fragment chain for this (start_pc,
+     * canonical-insn-count) instead of allocating a duplicate.  Byte
+     * identity is guaranteed by the bytes-changed/poison gate above (a TB
+     * reaching here matches its first sighting), so the chain's shape and
+     * decoded contents are identical; we only need to re-arm the JIT-level
+     * per-insn callbacks and scoreboard stores below (done every
+     * translation regardless of reuse). */
+    uint64_t tb_start_pc = insn_pcs[0];
+    g_mutex_lock(&data_lock);
+    BBTemplate *reuse_head =
+        g_bb_template_cache.lookup_tb_chain(tb_start_pc, canonical_n_insns);
+    g_mutex_unlock(&data_lock);
+    const bool reuse = (reuse_head != nullptr);
+
+    BBTemplate *head_fragment = reuse_head;
     BBTemplate *prev_fragment = nullptr;
+    BBTemplate *reuse_cursor  = reuse_head;
 
     for (size_t f = 0; f < fragment_specs.size(); f++) {
         const TbFragmentSpec &spec = fragment_specs[f];
@@ -2190,13 +2243,19 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         const char *frag_symbol =
             (f == 0) ? tb_symbol_name : nullptr;
 
-        /* Every QEMU translation gets its own fresh template stream —
-         * no start_pc dedup.  Per fragment, an exact-shape template
-         * is attached to the QEMU TB via udata so vcpu_tb_exec walks
-         * the list and feeds the chain assembler only the fragments
-         * that actually executed, on both CP and WP paths. */
-        g_mutex_lock(&data_lock);
-        BBTemplate *frag_tmpl = g_bb_template_cache.create_tb_template(
+        /* Reuse the existing per-fragment template on a dedup hit; else
+         * build a fresh one.  The template is attached to the QEMU TB via
+         * udata so vcpu_tb_exec walks the chain and feeds the assembler
+         * only the fragments that actually executed (CP and WP paths). */
+        BBTemplate *frag_tmpl;
+        if (reuse) {
+            frag_tmpl = reuse_cursor;
+            if (reuse_cursor) {
+                reuse_cursor = reuse_cursor->next_tb_fragment;
+            }
+        } else {
+            g_mutex_lock(&data_lock);
+            frag_tmpl = g_bb_template_cache.create_tb_template(
                                 f_start_pc,
                                 spec.n_insns,
                                 &insn_pcs[f_first_ci],
@@ -2207,16 +2266,17 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                                             MAX_INSN_BYTES],
                                 frag_symbol,
                                 f_fall_through);
-        frag_tmpl->terminus = (uint8_t)spec.terminus;
-        g_mutex_unlock(&data_lock);
+            frag_tmpl->terminus = (uint8_t)spec.terminus;
+            g_mutex_unlock(&data_lock);
 
-        if (!head_fragment) {
-            head_fragment = frag_tmpl;
+            if (!head_fragment) {
+                head_fragment = frag_tmpl;
+            }
+            if (prev_fragment) {
+                prev_fragment->next_tb_fragment = frag_tmpl;
+            }
+            prev_fragment = frag_tmpl;
         }
-        if (prev_fragment) {
-            prev_fragment->next_tb_fragment = frag_tmpl;
-        }
-        prev_fragment = frag_tmpl;
 
         /* Build the fragment-local canonical_index/first mask: raw
          * insns inside [f_first_ci, f_last_ci] map to local canonical
@@ -2261,6 +2321,14 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                 g_scoreboard.prev_bb_terminus,
                 (uint64_t)spec.terminus);
         }
+    }
+
+    /* Record a freshly built chain for future reuse (a tb_flush will
+     * re-translate the same code and reuse it instead of duplicating). */
+    if (!reuse && head_fragment) {
+        g_mutex_lock(&data_lock);
+        g_bb_template_cache.register_tb_chain(tb_start_pc, head_fragment);
+        g_mutex_unlock(&data_lock);
     }
 
     g_free(local_canonical_index);
@@ -2341,45 +2409,24 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
  */
 static void vcpu_tb_flush(qemu_plugin_id_t id)
 {
-    g_mutex_lock(&exec_lock);
-
-    if (g_wp_state.in_progress) {
-        g_wp_state.in_progress = false;
-        qemu_plugin_u64_set(g_scoreboard.insn_count, g_wp_state.saved_cpu_index,
-                            g_wp_state.saved_insn_count);
-        qemu_plugin_u64_set(g_scoreboard.prev_start_pc, g_wp_state.saved_cpu_index,
-                            g_wp_state.saved_prev_start_pc);
-        qemu_plugin_u64_set(g_scoreboard.prev_fall_through, g_wp_state.saved_cpu_index,
-                            g_wp_state.saved_prev_fall_through);
-        qemu_plugin_u64_set(g_scoreboard.prev_bb_terminus, g_wp_state.saved_cpu_index,
-                            g_wp_state.saved_prev_bb_terminus);
-        qemu_plugin_u64_set(g_scoreboard.budget, g_wp_state.saved_cpu_index,
-                            g_wp_state.saved_budget);
-        g_wp_state.mem_accesses.clear();
-    }
-
-    /* Drop the partial BB: preserving it across a flush would risk
-     * splicing pre- and post-flush fragments.  The chain and any in-
-     * flight WP walker hold raw BBTemplate* into tb_templates_, so
-     * reset them first; then it is safe to drop the TB-template
-     * ownership (QEMU has invalidated the TBs that hold these
-     * templates via per-TB udata). */
-    g_mutex_lock(&data_lock);
-    g_cp_chain.reset();
-    g_mem_recorder.clear_cp();
-    pending_reg_snaps.clear();
-    g_cp_prev_tb_template = nullptr;
-    g_wp_state.last_executed_tb = nullptr;
-    g_bb_template_cache.clear_tb_templates();
-    /* Drop the bytes/poison caches with the rest of per-translation
-     * state: after a tb_flush QEMU re-translates every TB, and we want
-     * the bytes-changed-since check to start fresh (otherwise a
-     * legitimate flush+retranslate would falsely poison every PC). */
-    g_first_insn_word.clear();
-    g_poisoned_pcs.clear();
-    g_mutex_unlock(&data_lock);
-
-    g_mutex_unlock(&exec_lock);
+    /* A tb_flush is QEMU JIT housekeeping — the code cache filled and
+     * every TB is being re-translated — NOT a guest-execution event, so
+     * the trace must be identical with or without it.  The plugin's
+     * per-translation templates (tb_templates_) are PERSISTENT and
+     * deduped: a re-translation reuses its existing chain (see
+     * lookup_tb_chain), so a flush frees nothing and perturbs no walk
+     * state.  That makes the trace flush-invariant by construction and
+     * removes the whole class of flush-time use-after-free.
+     *
+     * We do NOT clear the bytes/poison caches (g_first_insn_word /
+     * g_poisoned_pcs): they persist so SMC detection survives a flush,
+     * and a legitimate flush+retranslate of unchanged code re-matches its
+     * first sighting (no false poison) and reuses its template.
+     *
+     * The only state a flush touches is the flush counter, which the
+     * wrong-path loop reads to detect (and retry) a spec-mode exec_tb
+     * that a flush unwound before the guest insn ran. */
+    g_tb_flush_count.fetch_add(1, std::memory_order_acq_rel);
 }
 
 /* ========================= Exit / statistics ========================= */
@@ -2680,7 +2727,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
 {
     g_trace_segments.set_shutting_down();
 
-    g_mutex_lock(&exec_lock);
+    g_rec_mutex_lock(&exec_lock);
 
     if (g_trace_segments.is_active()) {
         finish_trace_segment();
@@ -2912,7 +2959,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     plugin_config_free(&cfg);
 
     g_mutex_init(&data_lock);
-    g_mutex_init(&exec_lock);
+    g_rec_mutex_init(&exec_lock);
     g_mutex_init(&unknown_warn_lock);
 
     active_insn_table = isa_insn_class[trace_isa];

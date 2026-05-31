@@ -28,6 +28,7 @@
 #include "exec/cpu-common.h"
 #include "exec/page-protection.h"
 #include "exec/translation-block.h"
+#include "exec/tb-flush.h"
 #include "tcg/tcg.h"
 #include "qemu/atomic.h"
 #include "qemu/rcu.h"
@@ -1180,6 +1181,22 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             vaddr pc;
             uint64_t cs_base;
             uint32_t flags, cflags;
+
+#ifdef CONFIG_PLUGIN
+            /*
+             * A code-buffer overflow during a plugin wrong-path walk deferred
+             * its flush (see tb_gen_code): the walk has now unwound and its
+             * host correct-path TB has finished executing, so we are at a safe
+             * point with no TB in flight.  Honor the flush before translating
+             * anything new, exactly as the in-line overflow path would.
+             */
+            if (unlikely(cpu->plugin_flush_pending)) {
+                cpu->plugin_flush_pending = false;
+                tb_flush(cpu);
+                cpu->exception_index = EXCP_INTERRUPT;
+                cpu_loop_exit(cpu);
+            }
+#endif
 
             cpu_get_tb_cpu_state(cpu_env(cpu), &pc, &cs_base, &flags);
 

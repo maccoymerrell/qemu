@@ -889,6 +889,14 @@ typedef struct {
 
 /* ISA resolution: set once during qemu_plugin_install based on the
  * guest target_name. */
+/* Monotonic count of tb_flush events.  The wrong-path loop snapshots it
+ * around each spec-mode exec_tb: if a flush fired during the call AND the
+ * TB did not execute (last_executed_tb stayed null), that exec_tb was
+ * unwound by the flush before the guest insn ran — JIT housekeeping, not
+ * a spec-mode fault — so the loop retries instead of truncating the chain
+ * (keeps WP flush-invariant). */
+extern std::atomic<uint64_t> g_tb_flush_count;
+
 extern TraceISA trace_isa;
 extern int cst_cap_arch;
 extern unsigned int cst_cap_mode;
@@ -999,7 +1007,8 @@ typedef struct _WideRegSnap WideRegSnap;
 std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                                uint64_t correct_target,
                                                uint64_t wrong_target,
-                                               unsigned int cpu_index);
+                                               unsigned int cpu_index,
+                                               bool *flush_interrupted);
 #endif
 
 /*

@@ -1,5 +1,6 @@
 /GNUmakefile
 /build/
+/build*
 /.cache/
 /.vscode/
 *.pyc
@@ -22,5 +23,5 @@ GTAGS
 *.gcov
 build_wptrace/
 contrib/plugins/wptrace_tests/run_output
-contrib/plugins/wptrace_genval/out_*
+contrib/plugins/champsim_tracer/validator/out*
 build-gprof/

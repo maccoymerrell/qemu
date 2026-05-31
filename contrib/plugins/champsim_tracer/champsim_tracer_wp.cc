@@ -33,10 +33,18 @@
 std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                                uint64_t correct_target,
                                                uint64_t wrong_target,
-                                               unsigned int cpu_index)
+                                               unsigned int cpu_index,
+                                               bool *flush_interrupted)
 {
     (void)branch_pc;
     (void)correct_target;
+    /* Set true if a tb_flush unwound a spec-mode exec_tb before its guest
+     * insn ran (last_executed_tb stayed null while the flush count moved).
+     * The caller cleanly re-runs the whole WP in the now-fresh code cache
+     * — re-running across the flush IN-PLACE would execute wrong-path code
+     * after the flush dropped its translation, unsandboxed; restarting a
+     * fresh spec session avoids that. */
+    *flush_interrupted = false;
 
     /* Cache the per-thread Stats ref once: g_stats expands to a
      * thread_stats_get()/__tls_get_addr call, ~1% of total time from
@@ -255,10 +263,24 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             wp_pending_reg_snaps.clear();
         }
         g_wp_state.last_executed_tb = nullptr;
+        uint64_t flush_before =
+            g_tb_flush_count.load(std::memory_order_acquire);
         tb_ok = qemu_plugin_exec_tb();
         tmpl = g_wp_state.last_executed_tb;
 
         if (!tmpl) {
+            /* A tb_flush during this exec_tb unwound it (via cpu_loop_exit,
+             * caught by cpu_plugin_exec_tb's local guard) before the guest
+             * insn ran, so nothing executed.  Signal the caller to re-run
+             * the whole WP from a fresh spec session in the now-fresh
+             * cache; do NOT continue this session (the flush dropped the
+             * spec-mode translation, and resuming would run wrong-path
+             * code outside the sandbox).  A genuine null (no flush, e.g.
+             * translation-unavailable) just truncates the chain. */
+            if (g_tb_flush_count.load(std::memory_order_acquire) !=
+                    flush_before) {
+                *flush_interrupted = true;
+            }
             clear_accum();
             bb_reg_snaps.clear();
             early_exit = true;

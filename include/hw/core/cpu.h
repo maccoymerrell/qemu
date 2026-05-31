@@ -553,6 +553,16 @@ struct CPUState {
     size_t plugin_spec_store_pool_used;       /* high water in pool */
     size_t plugin_spec_store_pool_cap;        /* allocated slots */
     struct qemu_plugin_cpu_state *plugin_spec_saved_state;
+    /*
+     * Set when a code-buffer overflow is detected DURING wrong-path
+     * (plugin_spec_mode) translation.  A real tb_flush there would reset the
+     * code buffer under the correct-path TB this wrong-path walk is nested
+     * inside, clobbering the host code we must return into.  Instead the
+     * overflow is deferred: the wrong-path walk ends cleanly at its current
+     * true-BB boundary and the flush is honored by cpu_exec_loop() at the
+     * next safe point, after the nested walk has fully unwound.
+     */
+    bool plugin_flush_pending;
 #endif
 
     /* TODO Move common fields from CPUArchState here. */

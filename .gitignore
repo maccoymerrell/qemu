@@ -25,3 +25,4 @@ build_wptrace/
 contrib/plugins/wptrace_tests/run_output
 contrib/plugins/champsim_tracer/validator/out*
 build-gprof/
+/sweeps/

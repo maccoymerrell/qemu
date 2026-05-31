@@ -36,13 +36,24 @@
 #   --maxk N                 simpoint -maxK ceiling (default 10)
 #   --rob-size N             cst_visualize --rob-size for ilp/dep_depth
 #                            (default 1024)
+#   --parallel N             max concurrent cst_visualize jobs in the plot
+#                            and aggregate stages (default: nproc).  Plotting
+#                            is the sweep's wall-clock bottleneck (dozens of
+#                            minutes-long renders), so this is the main knob.
+#   --stage all|trace|plot   which stages to run (default all).  trace =
+#                            BBV+SimPoint+CST tracing (the qemu phase); plot =
+#                            per-simpoint plots + whole-program aggregates (the
+#                            cst_visualize phase).  Lets an orchestrator run
+#                            the qemu phase across sweeps in parallel, then
+#                            give each sweep's plot phase the full core budget.
 #
 # Output tree (under --out-dir):
 #   bbv/             basic-block vectors from libbbv
 #   simpoints/       .simpoints + .weights from simpoint
 #   traces_cp/       CST traces (CP only, no regdata/memdata)
 #   traces_full/     CST traces (CP+WP+regdata+memdata)
-#   plots/           SVGs per trace per metric
+#   plots/           <slug>_<variant>-<NNNB>__<metric>.svg per simpoint, plus
+#                    <slug>_<variant>__AGG__<metric>.svg whole-program aggregates
 #   logs/            per-stage stdout+stderr
 #   progress.log     overall timeline
 #
@@ -83,6 +94,31 @@ SIM_INSNS=100000000      # 100M
 WARMUP_INSNS=300000000   # 300M
 SIMPOINT_MAXK=10
 ROB_SIZE=1024
+# Max concurrent cst_visualize jobs in the plot / aggregate stages.
+# cst_visualize is single-threaded but each run is minutes-long and there
+# are dozens (metrics × simpoints), so plotting them serially is the sweep's
+# wall-clock bottleneck.  Default to all cores; the orchestrator passes a
+# per-sweep budget so the total across sweeps stays bounded.
+PARALLEL=$(nproc 2>/dev/null || echo 4)
+# Which stages to run: all | trace | plot.  "trace" = bbv+simpoint+trace
+# (the qemu phase); "plot" = plot+aggregate (the cst_visualize phase).  Lets
+# an orchestrator run the qemu phase across sweeps in parallel, then give
+# each sweep's plot phase the full core budget in turn.
+STAGE=all
+
+# Metrics computable from a CP-only trace.  memdata gates the load/store
+# *values*, but addresses are always emitted, so the address-driven metrics
+# (mem_pat / cache_miss / working_set / reuse_distance) work on CP traces
+# too — only the WP metrics need a full (wp=1) trace.
+CP_METRICS=(
+    branch_mpki btb_miss bb_length indirect_targets
+    branch_entropy dep_depth ilp gen_op gen_reg branch_dir
+    mem_pat cache_miss working_set reuse_distance
+)
+# Metrics that genuinely need wrong-path data — only on the full trace.
+FULL_EXTRA=(
+    wp_insns wp_memops wp_divergence
+)
 
 # Parse "100M" / "1B" / "2G" / "500k" suffixes into raw integer
 # instructions.  Bare digits pass through unchanged.
@@ -224,6 +260,13 @@ stage_trace() {
     log_progress "trace[$variant]: produced ${n} traces"
 }
 
+# Block until fewer than $PARALLEL background jobs are running, so the
+# caller can launch the next one.  `wait -n || true` keeps set -e from
+# tripping on a plot job's nonzero exit (those are handled in-job).
+pool_gate() {
+    while (( $(jobs -r | wc -l) >= PARALLEL )); do wait -n 2>/dev/null || true; done
+}
+
 # Plot a single .cst with a metric -> SVG.
 plot_one() {
     local cst=$1
@@ -243,45 +286,77 @@ plot_one() {
     }
 }
 
+# Aggregate every per-simpoint trace of one variant into a single weighted
+# whole-program SVG per metric (cst_visualize aggregate mode; weights come
+# from each trace's header simpoint_weight).
+agg_one() {
+    local variant=$1
+    local metric=$2
+    shift 2
+    local csts=("$@")
+    local svg=${PLOTS_DIR}/${WORKLOAD_NAME}_${variant}__AGG__${metric}.svg
+    if stage_done "$svg"; then return 0; fi
+    "$CST_VISUALIZE" -m "$metric" "--rob-size=${ROB_SIZE}" --aggregate \
+        --name "${WORKLOAD_NAME}_${variant}" -o "$svg" "${csts[@]}" \
+        >>"${LOGS_DIR}/plot.log" 2>&1 || {
+        echo "    aggregate $metric failed for ${WORKLOAD_NAME}_${variant}" \
+            "(see plot.log)" >>"$PROGRESS_LOG"
+        rm -f "$svg"
+        return 0
+    }
+}
+
+# Per-simpoint plots, up to $PARALLEL cst_visualize runs at once.
 stage_plot() {
-    log_progress "plot: rendering SVGs"
+    log_progress "plot: rendering per-simpoint SVGs (parallel=${PARALLEL})"
     mkdir -p "$PLOTS_DIR"
     : >"${LOGS_DIR}/plot.log"
 
-    # Metrics computable from a CP-only trace.  memdata gates the load/
-    # store *values*, but addresses are always emitted, so the
-    # address-driven metrics (mem_pat / cache_miss / working_set /
-    # reuse_distance) work on CP traces too — only the WP metrics need a
-    # full (wp=1) trace.  On a CP trace the WP/“corrupted” second pane of
-    # the dual-pane metrics is simply empty, same as branch_mpki/btb_miss.
-    local cp_metrics=(
-        branch_mpki btb_miss bb_length indirect_targets
-        branch_entropy dep_depth ilp gen_op gen_reg branch_dir
-        mem_pat cache_miss working_set reuse_distance
-    )
-    # Metrics that genuinely need wrong-path data — only on the full trace.
-    local full_extra=(
-        wp_insns wp_memops wp_divergence
-    )
-
-    local cst
+    local cst m
     for cst in "${TR_CP_DIR}/${WORKLOAD_NAME}_cp-"*.cst; do
         [[ -e "$cst" ]] || continue
-        for m in "${cp_metrics[@]}"; do
-            plot_one "$cst" "$m"
+        for m in "${CP_METRICS[@]}"; do
+            pool_gate; plot_one "$cst" "$m" &
         done
     done
-
     for cst in "${TR_FULL_DIR}/${WORKLOAD_NAME}_full-"*.cst; do
         [[ -e "$cst" ]] || continue
-        for m in "${cp_metrics[@]}" "${full_extra[@]}"; do
-            plot_one "$cst" "$m"
+        for m in "${CP_METRICS[@]}" "${FULL_EXTRA[@]}"; do
+            pool_gate; plot_one "$cst" "$m" &
         done
     done
+    wait
 
     local n
     n=$(compgen -G "${PLOTS_DIR}/*.svg" | wc -l)
-    log_progress "plot: produced ${n} SVGs"
+    log_progress "plot: produced ${n} per-simpoint SVGs"
+}
+
+# One weighted whole-program SVG per metric per variant, also up to
+# $PARALLEL at once.
+stage_aggregate() {
+    log_progress "aggregate: rendering whole-program SVGs (parallel=${PARALLEL})"
+    mkdir -p "$PLOTS_DIR"
+
+    local cp_csts full_csts m
+    mapfile -t cp_csts   < <(compgen -G "${TR_CP_DIR}/${WORKLOAD_NAME}_cp-*.cst"     || true)
+    mapfile -t full_csts < <(compgen -G "${TR_FULL_DIR}/${WORKLOAD_NAME}_full-*.cst" || true)
+
+    if (( ${#cp_csts[@]} > 0 )); then
+        for m in "${CP_METRICS[@]}"; do
+            pool_gate; agg_one cp "$m" "${cp_csts[@]}" &
+        done
+    fi
+    if (( ${#full_csts[@]} > 0 )); then
+        for m in "${CP_METRICS[@]}" "${FULL_EXTRA[@]}"; do
+            pool_gate; agg_one full "$m" "${full_csts[@]}" &
+        done
+    fi
+    wait
+
+    local n
+    n=$(compgen -G "${PLOTS_DIR}/${WORKLOAD_NAME}_*__AGG__*.svg" | wc -l)
+    log_progress "aggregate: produced ${n} whole-program SVGs"
 }
 
 # --- Driver --------------------------------------------------------
@@ -306,6 +381,8 @@ main() {
         --warmup-insns)   WARMUP_INSNS=$(parse_count "$2"); shift 2 ;;
         --maxk)           SIMPOINT_MAXK=$2; shift 2 ;;
         --rob-size)       ROB_SIZE=$2; shift 2 ;;
+        --parallel)       PARALLEL=$2; shift 2 ;;
+        --stage)          STAGE=$2; shift 2 ;;
         --help|-h)        usage 0 ;;
         --)
             shift
@@ -370,35 +447,54 @@ main() {
     need_file "$WORKLOAD_BIN"
     [[ -d "$WORKLOAD_CWD" ]] || { echo "no cwd: $WORKLOAD_CWD" >&2; exit 1; }
 
-    log_progress "=== sweep start: name=${WORKLOAD_NAME}"
+    case "$STAGE" in
+        all|trace|plot) ;;
+        *) echo "bad --stage $STAGE (want: all | trace | plot)" >&2; exit 1 ;;
+    esac
+    if ! [[ "$PARALLEL" =~ ^[0-9]+$ ]] || (( PARALLEL < 1 )); then
+        echo "bad --parallel $PARALLEL (want a positive integer)" >&2; exit 1
+    fi
+
+    log_progress "=== sweep start: name=${WORKLOAD_NAME} stage=${STAGE}"
     log_progress "    binary=${WORKLOAD_BIN}"
     log_progress "    cwd=${WORKLOAD_CWD}"
     log_progress "    argv=(${WORKLOAD_ARGV[*]})"
     log_progress "    bbv_interval=${BBV_INTERVAL} sim=${SIM_INSNS} warmup=${WARMUP_INSNS}"
-    log_progress "    maxK=${SIMPOINT_MAXK} rob_size=${ROB_SIZE}"
+    log_progress "    maxK=${SIMPOINT_MAXK} rob_size=${ROB_SIZE} parallel=${PARALLEL}"
 
-    local bb_file
-    bb_file=$(stage_bbv)
-    stage_simpoint "$bb_file"
+    # Trace (qemu) phase: BBV -> SimPoint clustering -> CST traces.
+    if [[ "$STAGE" == all || "$STAGE" == trace ]]; then
+        local bb_file
+        bb_file=$(stage_bbv)
+        stage_simpoint "$bb_file"
 
-    # Both variants pipe each tarball member (body, header) through
-    # multi-threaded xz.  -T 0 = use every available core for that
-    # compressor invocation; members compress serially but each gets
-    # the whole CPU.
-    local COMPRESS="compress=xz -T 0"
+        # Both variants pipe each tarball member (body, header) through
+        # multi-threaded xz.  -T 0 = use every available core for that
+        # compressor invocation; members compress serially but each gets
+        # the whole CPU.
+        local COMPRESS="compress=xz -T 0"
 
-    # CP-only: no WP, no regdata, no memdata.
-    stage_trace cp  "$TR_CP_DIR"  \
-        "wp=0" "memdata=0" "regdata=0" "$COMPRESS"
+        # CP-only: no WP, no regdata, no memdata.
+        stage_trace cp  "$TR_CP_DIR"  \
+            "wp=0" "memdata=0" "regdata=0" "$COMPRESS"
 
-    # Full: WP on for both reads & writes, regdata+memdata on both
-    # CP and WP sides.
-    stage_trace full "$TR_FULL_DIR" \
-        "wp=1" "memdata=1" "regdata=1" \
-        "wp_memdata=1" "wp_regdata=1" "$COMPRESS"
+        # Full: WP on for both reads & writes, regdata+memdata on both
+        # CP and WP sides.
+        stage_trace full "$TR_FULL_DIR" \
+            "wp=1" "memdata=1" "regdata=1" \
+            "wp_memdata=1" "wp_regdata=1" "$COMPRESS"
+    fi
 
-    stage_plot
-    log_progress "=== sweep done"
+    # Plot (cst_visualize) phase: per-simpoint SVGs + whole-program
+    # aggregates.  Split out so an orchestrator can run the qemu phase
+    # across sweeps in parallel, then hand each sweep's plot phase the
+    # full core budget in turn.
+    if [[ "$STAGE" == all || "$STAGE" == plot ]]; then
+        stage_plot
+        stage_aggregate
+    fi
+
+    log_progress "=== sweep done (stage=${STAGE})"
 }
 
 main "$@"

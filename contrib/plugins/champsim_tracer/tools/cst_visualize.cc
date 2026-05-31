@@ -4210,22 +4210,42 @@ static ChartPlan aggregate_pane(const std::vector<const ChartPlan *> &panes,
                 mag[s.label] += w[i] * t;
             }
         }
-        std::stable_sort(seen.begin(), seen.end(),
-            [&](const std::string &a, const std::string &b) {
-                return mag[a] > mag[b];
-            });
-        bool capk = (opts.metric == Metric::GenOp ||
-                     opts.metric == Metric::GenReg);
         std::vector<std::string> labels;
         bool need_other = false;
-        for (const std::string &name : seen) {
-            if (name == "other") { need_other = true; continue; }
-            if (capk && (int)labels.size() >= opts.top_k) {
-                need_other = true; continue;
+        if (first.mode == ChartPlan::Mode::Stacked) {
+            /* Category breakdown (gen_op / gen_reg / branch_dir / mem_pat):
+             * the categories have no natural order, so order the legend by
+             * aggregate magnitude and cap gen_op/gen_reg to a global top-K,
+             * folding the rest into "other". */
+            std::stable_sort(seen.begin(), seen.end(),
+                [&](const std::string &a, const std::string &b) {
+                    return mag[a] > mag[b];
+                });
+            bool capk = (opts.metric == Metric::GenOp ||
+                         opts.metric == Metric::GenReg);
+            for (const std::string &name : seen) {
+                if (name == "other") { need_other = true; continue; }
+                if (capk && (int)labels.size() >= opts.top_k) {
+                    need_other = true; continue;
+                }
+                labels.push_back(name);
             }
-            labels.push_back(name);
+            if (need_other) labels.push_back("other");
+        } else {
+            /* Parameter-sweep lines (branch_mpki history lengths, btb_miss
+             * sizes, cache_miss assocs, wp_divergence min/median/mean/max,
+             * working_set) have a natural series order.  Preserve the
+             * per-pane order instead of scrambling the legend by magnitude;
+             * every pane shares the same series in the same order, so
+             * pane[0] is canonical.  This also matches the single-trace
+             * legend (and colour) order. */
+            for (const Series &s : first.series) {
+                if (s.label.empty()) continue;
+                if (s.label == "other") { need_other = true; continue; }
+                labels.push_back(s.label);
+            }
+            if (need_other) labels.push_back("other");
         }
-        if (need_other) labels.push_back("other");
         std::unordered_map<std::string, std::string> color;
         std::unordered_map<std::string, int> label_idx;
         for (size_t i = 0; i < labels.size(); i++) {

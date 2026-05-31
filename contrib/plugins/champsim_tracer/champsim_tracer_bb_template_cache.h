@@ -171,9 +171,11 @@ private:
      * existing chain instead of appending a duplicate. */
     std::vector<BBTemplatePtr>                  tb_templates_;
     /* Dedup index: TB start_pc -> heads of already-built fragment chains
-     * (one per distinct canonical length seen at that PC — e.g. a
-     * multi-insn CP TB and a 1-insn wrong-path single-step TB coexist).
-     * lookup_tb_chain matches on total canonical insn count. */
+     * (one per distinct canonical length seen at that PC — sibling
+     * translations of the same start_pc can differ in length, e.g. a
+     * full-BB correct-path TB vs a wrong-path TB that entered mid-block or
+     * stopped at a different branch terminator).  lookup_tb_chain matches on
+     * total canonical insn count so they never conflate. */
     std::unordered_map<uint64_t, std::vector<BBTemplate *>> tb_chain_dedup_;
     std::unordered_map<uint64_t, BBTemplatePtr> bb_map_;
     uint32_t                                    next_template_id_ = 1;

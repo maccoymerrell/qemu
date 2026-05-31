@@ -97,11 +97,13 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     qemu_plugin_set_pc(wrong_target);
 
     /*
-     * Per-insn accumulator for the BB being built.  Spec mode forces
-     * CF_SINGLE_STEP|1 at execution time, but find_template(pre_pc) may
-     * return a multi-insn CP-cached translation (different cflags) where
-     * only insn[0] executed.  Accumulate per-step (1 insn each) into raw
-     * arrays and commit a true BB at each branch fire via commit_true_bb().
+     * Per-insn accumulator for the BB being built.  Each exec_tb runs a
+     * multi-insn wrong-path TB up to its branch terminator — CF_SINGLE_STEP
+     * bounds rep-string ops to one iteration per exec_tb, it does NOT limit
+     * the TB to a single instruction — and a fault or partial run can stop
+     * inside it.  The fragment walk below accumulates exactly the insns that
+     * executed (post_pc matching) into raw arrays and commits a true BB at
+     * each branch fire via commit_true_bb_refs().
      */
     std::vector<uint64_t>     bb_pcs;
     std::vector<uint8_t>      bb_sizes;

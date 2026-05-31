@@ -1243,10 +1243,13 @@ static void emit_finalized_bb(BodyStreamState *out_stream,
  * the next TB's first insn, unknowable at translation.  Capturing
  * here at the next TB's vcpu_tb_exec is equivalent: registers still
  * hold prev_tb's last insn's post-exec values (this TB's body hasn't
- * run yet).
+ * run yet).  The one exception is the branch's PC dst, which a goto_tb
+ * chain leaves stale in env->eip; it is taken from @current_pc (the
+ * known successor) instead of the live read — see the loop body.
  */
 static void snap_prev_tail_dsts(unsigned int cpu_index,
-                                const BBTemplate *tmpl)
+                                const BBTemplate *tmpl,
+                                uint64_t current_pc)
 {
     if (enable_reg_data && tmpl->insn_reg_names &&
         tmpl->n_insns > 0 &&
@@ -1277,6 +1280,19 @@ static void snap_prev_tail_dsts(unsigned int cpu_index,
             RegSnap s;
             g_reg_snaps.read_into_snap(
                 cpu_index, nl->dst_qemu_reg_keys[i], &s);
+            if (fl->dst_regs[i] == REG_IP) {
+                /* The BB-terminating branch's PC dst.  Correct-path TBs chain
+                 * into their successor by default (goto_tb), and that direct
+                 * host jump SKIPS the env->eip write at the boundary, so the
+                 * live read above returns a stale PC (the chain's entry, not
+                 * this branch's target).  The post-branch PC is exactly the
+                 * successor, which we already hold reliably as @current_pc
+                 * (the successor's inline scoreboard store, not the lazy
+                 * eip).  Keep the read's architectural width; override the
+                 * value.  WP TBs are CF_NO_GOTO_TB so their eip is always
+                 * synced — this only matters on the chained correct path. */
+                s.value = cst_wide_from_u64(current_pc);
+            }
             pending_reg_snaps.push_back(s);
         }
     }
@@ -1653,7 +1669,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         bool frag_branch_taken = (frag_current_pc != frag_prev_ft);
 
         if (is_last_executed) {
-            snap_prev_tail_dsts(cpu_index, frag);
+            snap_prev_tail_dsts(cpu_index, frag, frag_current_pc);
         }
         g_cp_chain.append_fragment(frag->start_pc, frag,
                                    frag->fall_through_pc,

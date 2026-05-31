@@ -3505,17 +3505,20 @@ static TraceResult process_trace(const char *path, const Options &opts)
     switch (opts.metric) {
         case Metric::BranchMpki: {
             /* Dual: CP-only-trained predictor vs CP+WP-polluted
-             * predictor.  Same y-scale so the gap is read directly
-             * as the speculative-pollution cost. */
-            double m1 = build_lines_plan(plan, ctx.bins, opts.histories,
-                                          per_kilo,
-                                          "Mispredictions per 1k CP", false);
-            double m2 = build_lines_plan(plan2, ctx.bins_wp,
-                                          opts.histories,
-                                          per_kilo,
-                                          "Mispredictions per 1k CP", false);
-            double yshared = std::max(m1, m2);
-            plan.y_max = plan2.y_max = yshared;
+             * predictor.  INDEPENDENT y-scales: this metric is
+             * non-normalized (mispredictions per 1k), and the polluted
+             * pane's magnitude is routinely many times the CP-only
+             * pane's, so a shared scale flattens the CP-only curve into a
+             * single line and hides its behavior.  Each pane keeps the
+             * own y_max build_lines_plan computed from its own data; both
+             * panes' axes are labeled and ticked from their own y_max, so
+             * each is legible on its own scale.  (The rate / percent
+             * dual-pane metrics below stay shared, where the cross-pane
+             * value comparison is the point.) */
+            build_lines_plan(plan, ctx.bins, opts.histories,
+                             per_kilo, "Mispredictions per 1k CP", false);
+            build_lines_plan(plan2, ctx.bins_wp, opts.histories,
+                             per_kilo, "Mispredictions per 1k CP", false);
             plan.title  = std::string(pick_title()) + " (CP-only)";
             plan2.title = std::string(pick_title()) + " (CP + WP-polluted)";
             has_second_pane = true;

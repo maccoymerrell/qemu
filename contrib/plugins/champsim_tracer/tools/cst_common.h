@@ -22,6 +22,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "../cst_wire_spec.h"
+
 namespace cst {
 
 /* ===== Wire-format magic =====
@@ -29,22 +31,25 @@ namespace cst {
  * .cst is a POSIX-ustar archive of body.cst[.<codec>] +
  * header.cst[.<codec>].  Each member starts with CST_MAGIC; the body
  * also carries a trailing CST_MAGIC after BODY_TAG_END so truncation
- * is detectable at either end. */
+ * is detectable at either end.
+ *
+ * Magic and the layout caps below are aliased from the shared spec
+ * (../cst_wire_spec.h) so writer and readers can't diverge. */
 
-inline constexpr uint32_t CST_MAGIC = 0x1D545343u;
+inline constexpr uint32_t CST_MAGIC = cst_wire::MAGIC;
 
 /* ===== Format-layout invariants =====
  *
  * Buffer-size limits the encoding maps cannot describe.  Everything
  * else (flag bits, field_id assignments) IS derivable from the
  * header's maps via resolve_ids(); never hardcode those. */
-inline constexpr uint16_t FID_SLOT_COUNT       = 64;
+inline constexpr uint16_t FID_SLOT_COUNT       = cst_wire::FID_SLOT_COUNT;
 /* Intentionally no FID_SLOT_STRIDE / FID_LANE_BLOCK_STRIDE: slot->FID
  * is defined entirely by the CST_FID_<family><k> map entries;
  * consumers MUST look each slot's FID up by name, never by stride.
  * See ResolvedIds for the per-slot arrays. */
-inline constexpr size_t  MAX_WIDE_BYTES       = 64;
-inline constexpr int     MAX_INSN_BYTES       = 16;
+inline constexpr size_t  MAX_WIDE_BYTES       = cst_wire::WIDE_BYTES_MAX;
+inline constexpr int     MAX_INSN_BYTES       = cst_wire::INSN_BYTES_MAX;
 
 /* ===== Resolved IDs =====
  *

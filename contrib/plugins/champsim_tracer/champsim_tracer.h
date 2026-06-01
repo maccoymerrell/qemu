@@ -29,6 +29,8 @@ extern "C" {
 #include <qemu-plugin.h>
 }
 
+#include "cst_wire_spec.h"
+
 #include "champsim_tracer_mnemonics.h"
 
 /*
@@ -49,7 +51,9 @@ extern "C" {
 #define CST_TLS_HOT __attribute__((tls_model("initial-exec")))
 
 /* ===== Constants ===== */
-#define MAX_INSN_BYTES 16
+/* Wire-format invariants aliased from the shared spec (cst_wire_spec.h)
+ * so the plugin and the offline tools can't diverge. */
+#define MAX_INSN_BYTES (cst_wire::INSN_BYTES_MAX)
 /* MAX_SRC_REGS / MAX_DST_REGS now live in champsim_tracer_mnemonics.h
  * (alongside the InsnFields struct they size) so per-ISA mnemonic refiners
  * compiled in the C tables TU can manipulate InsnFields directly. */
@@ -63,7 +67,7 @@ extern "C" {
  * architectural truth.  Templates track true BBs (start_pc to first
  * branch, immutable, unique by start_pc).
  */
-#define CST_MAGIC          0x1D545343u
+#define CST_MAGIC          (cst_wire::MAGIC)
 
 /*
  * REG_METAFLAGS bit layout is defined in champsim_tracer_generic_ids.h
@@ -195,9 +199,9 @@ extern "C" {
  * alongside the hot singletons (slot 0..24 → 1 byte, 25..63 → 2).
  * See champsim_tracer_format.md §5.1.
  */
-#define CST_FID_SLOT_COUNT       64   /* slots per slotted family */
+#define CST_FID_SLOT_COUNT       (cst_wire::FID_SLOT_COUNT)  /* slots per slotted family */
 #define CST_FID_SLOT_STRIDE      8    /* family IDs per slot (== family count) */
-#define CST_MAX_WIDE_BYTES       64   /* 512-bit data/reg scalar cap */
+#define CST_MAX_WIDE_BYTES       (cst_wire::WIDE_BYTES_MAX)  /* 512-bit data/reg scalar cap */
 
 /* Hot singletons — kept in the 0..127 1-byte ULEB range. */
 #define CST_FID_N_LOADS          0

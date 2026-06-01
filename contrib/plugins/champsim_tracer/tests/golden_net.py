@@ -35,6 +35,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 from pathlib import Path
 
 # --- layout -----------------------------------------------------------------
@@ -43,6 +44,11 @@ PLUGIN_DIR = HERE.parent                                # .../champsim_tracer
 VALIDATOR_DIR = PLUGIN_DIR / "validator"               # holds the importable pkg
 GOLDEN_DIR = HERE / "golden"
 MANIFEST = GOLDEN_DIR / "manifest.json"
+# Frozen .cst traces kept as the renderer's golden inputs.  SVG goldens are
+# rendered from THESE fixed files on both capture and check, never from a
+# re-traced .cst -- a renderer refactor must be tested against an unchanging
+# input so a trace difference can't masquerade as (or mask) a render change.
+GOLDEN_TRACES = GOLDEN_DIR / "traces"
 
 ALL_ISAS = ["x86_64", "aarch64", "riscv64", "mipsel"]
 
@@ -171,18 +177,23 @@ def triple_hash(build: Path, cst: Path) -> dict:
 
 
 def svg_hash(build: Path, cst: Path, metric: str) -> str:
-    out_svg = cst.parent / f"{cst.stem}.{metric}.svg"
-    subprocess.run([str(cst_visualize_bin(build)), "-m", metric,
-                    "-o", str(out_svg), str(cst)],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                   check=True)
-    return sha(out_svg.read_bytes())
+    # Render to a throwaway temp so the frozen-trace dir stays clean (it
+    # holds only the golden .cst inputs, not render artifacts).
+    with tempfile.NamedTemporaryFile(suffix=".svg") as tf:
+        out_svg = Path(tf.name)
+        subprocess.run([str(cst_visualize_bin(build)), "-m", metric,
+                        "-o", str(out_svg), str(cst)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       check=True)
+        return sha(out_svg.read_bytes())
 
 
 # --- modes ------------------------------------------------------------------
 def capture(build: Path, root: Path) -> int:
     if root.exists():
         shutil.rmtree(root)
+    if GOLDEN_TRACES.exists():
+        shutil.rmtree(GOLDEN_TRACES)   # drop any stale frozen traces
     GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
     manifest = {"cells": {}, "svg": {}, "excluded": {}}
     bad = 0
@@ -224,13 +235,19 @@ def capture(build: Path, root: Path) -> int:
             tag = "ok" if rc0 == 0 else f"VALIDATE_RC={rc0}"
             print(f"  {cell}: deterministic {tag}")
         out_a = out
-        # SVG goldens
+        # SVG goldens.  Freeze the trace as a renderer-golden input, then
+        # render THAT stored file -- so check renders the identical bytes
+        # rather than a re-traced .cst (isolates render from trace drift).
         if name in SVG_WORKLOADS:
             cst = cst_path(out_a, SVG_ISA)
             if cst.exists():
+                frozen = GOLDEN_TRACES / f"{name}_{SVG_ISA}.cst"
+                frozen.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(cst, frozen)
                 for m in SVG_METRICS:
                     try:
-                        manifest["svg"][f"{name}:{SVG_ISA}:{m}"] = svg_hash(build, cst, m)
+                        manifest["svg"][f"{name}:{SVG_ISA}:{m}"] = \
+                            svg_hash(build, frozen, m)
                     except subprocess.CalledProcessError:
                         print(f"  WARN svg {name}:{m} failed")
     MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True))
@@ -276,14 +293,16 @@ def check(build: Path, root: Path) -> int:
             if rc != base_rc:
                 validate_fails.append(
                     f"{cell}: validator rc={rc} (baseline {base_rc})")
-    # SVG goldens
+    # SVG goldens: render the FROZEN golden trace, never a re-traced .cst,
+    # so a mismatch can only be a renderer change.
     for key, want in manifest.get("svg", {}).items():
         name, isa, metric = key.split(":")
-        cst = (root / name) / f"{name}_{isa}.cst"
+        cst = GOLDEN_TRACES / f"{name}_{isa}.cst"
         if not cst.exists():
-            fails.append(f"svg {key}: trace missing"); continue
+            fails.append(f"svg {key}: frozen golden trace missing "
+                         f"(re-run capture)"); continue
         if svg_hash(build, cst, metric) != want:
-            fails.append(f"svg {key}: SVG mismatch")
+            fails.append(f"svg {key}: SVG mismatch (frozen trace {cst.name})")
 
     if fails or validate_fails:
         print("\n=== GOLDEN NET FAILED ===")

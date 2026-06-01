@@ -166,12 +166,23 @@ static void apply_delay_slot_swap(BBTemplate *tmpl)
         tmpl->insn_fields[ds].branch_type != BRANCH_NONE) {
         return;
     }
-    uint64_t tmp_pc = tmpl->insn_pcs[br];
-    tmpl->insn_pcs[br] = tmpl->insn_pcs[ds];
-    tmpl->insn_pcs[ds] = tmp_pc;
+    /*
+     * PCs are positional, not carried.  The swap relocates instruction
+     * *content* (bytes/fields/sizes/regnames) so the branch lands last,
+     * but an address is a property of the slot, not of the instruction.
+     * Carrying the original PCs leaves insn_pcs non-monotonic (the
+     * branch sitting below its own delay slot) and breaks every
+     * positional consumer — most visibly the WP fall-through, which
+     * reads insn_pcs[n-1]+size and would land ON the delay slot, one
+     * insn short of the architectural successor.  Reassign the trailing
+     * pair to ascending PCs: the predecessor slot keeps the pair's base
+     * (already in insn_pcs[br] — the lower of the two), and the
+     * now-branch slot follows the relocated delay slot.
+     */
     uint8_t tmp_sz = tmpl->insn_sizes[br];
     tmpl->insn_sizes[br] = tmpl->insn_sizes[ds];
     tmpl->insn_sizes[ds] = tmp_sz;
+    tmpl->insn_pcs[ds] = tmpl->insn_pcs[br] + tmpl->insn_sizes[br];
     uint8_t tmp_bytes[MAX_INSN_BYTES];
     memcpy(tmp_bytes, &tmpl->insn_bytes[(size_t)br * MAX_INSN_BYTES],
            MAX_INSN_BYTES);

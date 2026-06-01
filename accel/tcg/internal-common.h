@@ -171,6 +171,53 @@ static inline void spec_store_bytes(CPUState *cpu, vaddr addr,
         size -= chunk;
     }
 }
+
+/*
+ * Redirect an atomic read-modify-write's memory pointer into the
+ * speculative sandbox.  Atomic helpers (atomic_template.h) obtain a raw
+ * host pointer from atomic_mmu_lookup and RMW it in place with real host
+ * atomic primitives; left unsandboxed that mutates real guest memory on
+ * the discarded wrong path (kernel spinlocks, refcounts, page-table
+ * cmpxchg — and user-mode futexes / lock cmpxchg alike).
+ *
+ * We pre-fill the @size accessed bytes of the line from real memory
+ * wherever they are not already speculatively dirty (so the RMW reads
+ * the correct store-to-load-forwarded baseline), mark them valid, and
+ * return a pointer into the line.  The in-place RMW then mutates the
+ * shadow, never real memory, and later speculative loads forward from
+ * it; spec_mode_end discards the whole line.
+ *
+ * A naturally-aligned atomic of size <= 16 never crosses a 64-byte line,
+ * so idx + size <= 64 and the returned pointer carries the same
+ * alignment the guest access guaranteed (PluginSpecLine is 16-aligned
+ * with bytes[] at offset 0 — see plugin-spec.h).  Returns NULL when the
+ * sandbox line cap is reached; the caller falls back to the real
+ * pointer, bounding a dropped speculative atomic exactly as a dropped
+ * speculative store is bounded.
+ */
+static inline void *spec_atomic_shadow(CPUState *cpu, vaddr addr,
+                                       const void *real_host, int size)
+{
+    vaddr  line_addr = addr & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
+    unsigned idx     = (unsigned)(addr & PLUGIN_SPEC_LINE_MASK);
+    PluginSpecLine *line = spec_line_get_or_alloc(cpu, line_addr);
+    if (!line) {
+        return NULL;
+    }
+    const uint8_t *src = real_host;
+    for (int k = 0; k < size; k++) {
+        uint64_t bit = (uint64_t)1 << (idx + k);
+        if (!(line->valid_mask & bit)) {
+            line->bytes[idx + k] = src[k];
+        }
+    }
+    /* The RMW will write all @size bytes: mark them valid up front. */
+    uint64_t span = size >= 64
+        ? ~(uint64_t)0
+        : ((((uint64_t)1 << size) - 1) << idx);
+    line->valid_mask |= span;
+    return &line->bytes[idx];
+}
 #endif /* CONFIG_PLUGIN */
 
 #endif

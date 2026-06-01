@@ -1281,6 +1281,23 @@ static bool tlb_fill_align(CPUState *cpu, vaddr addr, MMUAccessType type,
     const TCGCPUOps *ops = cpu->cc->tcg_ops;
     CPUTLBEntryFull full;
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Plugin wrong-path (speculative) execution must neither raise a guest
+     * fault nor demand-page: a speculative access to an absent/ill-aligned
+     * page is a dead end, not a real architectural fault.  Force probe so
+     * the target walker reports the miss instead of raising, and remember
+     * the caller's real intent so a genuine (non-probe) wrong-path miss
+     * aborts the chain below.  This mirrors the user-mode path, where
+     * cpu_loop_exit_sigsegv() longjmps out instead of queuing a guest
+     * signal under plugin_spec_mode.
+     */
+    bool spec_real_access = cpu_plugin_spec_active(cpu) && !probe;
+    if (spec_real_access) {
+        probe = true;
+    }
+#endif
+
     if (ops->tlb_fill_align) {
         if (ops->tlb_fill_align(cpu, &full, addr, type, mmu_idx,
                                 memop, size, probe, ra)) {
@@ -1288,6 +1305,10 @@ static bool tlb_fill_align(CPUState *cpu, vaddr addr, MMUAccessType type,
             return true;
         }
     } else {
+#ifdef CONFIG_PLUGIN
+        /* Don't raise an alignment fault on the wrong path either. */
+        if (!spec_real_access)
+#endif
         /* Legacy behaviour is alignment before paging. */
         if (addr & ((1u << memop_alignment_bits(memop)) - 1)) {
             ops->do_unaligned_access(cpu, addr, type, mmu_idx, ra);
@@ -1296,6 +1317,19 @@ static bool tlb_fill_align(CPUState *cpu, vaddr addr, MMUAccessType type,
             return true;
         }
     }
+
+#ifdef CONFIG_PLUGIN
+    if (spec_real_access) {
+        /*
+         * A real wrong-path access missed (absent page) with the raise
+         * suppressed.  Abort the wrong-path chain via the same unwind the
+         * user-mode fault hook uses: cpu_loop_exit -> cpu_plugin_exec_tb's
+         * sigsetjmp -> tb_ok=false -> CST_WP_EVENT_FAULT + PC poison.  No
+         * page is demand-allocated, as required of speculative execution.
+         */
+        cpu_loop_exit_restore(cpu, ra);
+    }
+#endif
     assert(probe);
     return false;
 }
@@ -1933,6 +1967,22 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     hostaddr = (void *)((uintptr_t)addr + tlbe->addend);
     full = &cpu->neg.tlb.d[mmu_idx].fulltlb[index];
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative) atomics must not mutate real guest memory.
+     * Redirect the RMW into the speculative sandbox and return before the
+     * real-memory side effects below (notdirty dirtying / TB invalidation,
+     * watchpoint delivery) — none of which apply to a discarded write.
+     * NULL means the sandbox is capped; fall through to the real pointer.
+     */
+    if (cpu_plugin_spec_active(cpu)) {
+        void *shadow = spec_atomic_shadow(cpu, addr, hostaddr, size);
+        if (shadow) {
+            return shadow;
+        }
+    }
+#endif
+
     if (unlikely(tlb_addr & TLB_NOTDIRTY)) {
         notdirty_write(cpu, addr, size, full, retaddr);
     }
@@ -2034,6 +2084,19 @@ static uint64_t do_ld_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
 
     tcg_debug_assert(size > 0 && size <= 8);
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative) MMIO read must not touch the device: device
+     * reads can side-effect (read-to-clear, FIFO pops, ...).  Return the
+     * accumulator unchanged (the new bytes read as 0); any speculatively-
+     * written bytes are overlaid from the spec store buffer by the caller,
+     * exactly as for sandboxed RAM loads.
+     */
+    if (cpu_plugin_spec_active(cpu)) {
+        return ret_be;
+    }
+#endif
+
     attrs = full->attrs;
     section = io_prepare(&mr_offset, cpu, full->xlat_section, attrs, addr, ra);
     mr = section->mr;
@@ -2054,6 +2117,15 @@ static Int128 do_ld16_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
     uint64_t a, b;
 
     tcg_debug_assert(size > 8 && size <= 16);
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path 128-bit MMIO read: sandbox (no device touch), as in
+     * do_ld_mmio_beN.  Returns zero; a 16-byte device access on the wrong
+     * path is not expected in practice. */
+    if (cpu_plugin_spec_active(cpu)) {
+        return int128_zero();
+    }
+#endif
 
     attrs = full->attrs;
     section = io_prepare(&mr_offset, cpu, full->xlat_section, attrs, addr, ra);

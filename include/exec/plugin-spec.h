@@ -16,23 +16,33 @@
 #ifdef CONFIG_PLUGIN
 
 #include <stdint.h>
+#include "qemu/compiler.h"
 #include "exec/vaddr.h"
 
 #define PLUGIN_SPEC_LINE_SHIFT 6
 #define PLUGIN_SPEC_LINE_SIZE  (1u << PLUGIN_SPEC_LINE_SHIFT)
 #define PLUGIN_SPEC_LINE_MASK  (PLUGIN_SPEC_LINE_SIZE - 1u)
 
-/* Sandbox grows up to this many lines per vCPU (each 72 bytes ≈ 72 MiB
+/* Sandbox grows up to this many lines per vCPU (each 80 bytes ≈ 80 MiB
  * at the cap) before further speculative stores are dropped.  Matches
  * the prior per-byte buffer's overflow semantics — see the AArch64
  * FEAT_MOPS / x86 REP-on-garbage-size case comment in
  * accel/tcg/internal-common.h. */
 #define PLUGIN_SPEC_STORE_LINE_MAX (1u << 20)
 
+/*
+ * bytes[] is placed first and the line is 16-byte aligned so that a
+ * naturally-aligned guest atomic (size <= 16, never crossing a 64-byte
+ * line) yields a correspondingly-aligned pointer into bytes[] when an
+ * atomic RMW is redirected into the sandbox (spec_atomic_shadow).  The
+ * host atomic primitives — notably x86 cmpxchg16b and AArch64 128-bit
+ * LDXP/STXP — fault on a misaligned operand, so the shadow target must
+ * satisfy the same alignment the guest access already guaranteed.
+ */
 typedef struct PluginSpecLine {
-    uint64_t valid_mask;                       /* bit k = byte k stored */
     uint8_t  bytes[PLUGIN_SPEC_LINE_SIZE];
-} PluginSpecLine;
+    uint64_t valid_mask;                       /* bit k = byte k stored */
+} QEMU_ALIGNED(16) PluginSpecLine;
 
 /* Defined in plugins/api.c; declared here so the inline helpers in
  * accel/tcg/internal-common.h can call it. */

@@ -1502,6 +1502,22 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
 
     ret = g2h(cpu, addr);
     set_helper_retaddr(retaddr);
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative) atomics must not mutate real guest memory
+     * (user-mode futexes, lock cmpxchg, std::atomic).  Redirect the RMW
+     * into the speculative sandbox; NULL means the sandbox is capped, in
+     * which case we fall through to the real pointer.
+     */
+    if (cpu_plugin_spec_active(cpu)) {
+        void *shadow = spec_atomic_shadow(cpu, addr, ret, size);
+        if (shadow) {
+            return shadow;
+        }
+    }
+#endif
+
     return ret;
 }
 

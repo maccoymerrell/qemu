@@ -1352,9 +1352,12 @@ static void tw_manage_window(unsigned int cpu_index,
                              uint64_t icount_prev,
                              BBTemplate *cur_tb_tmpl)
 {
-    if (g_window_mode == PluginConfig::WIN_SYMBOL) {
-        /* Stop once the post-trigger simulation_insns budget is
-         * spent (window_stop set when the symbol fired). */
+    if (g_window_mode == PluginConfig::WIN_SYMBOL ||
+        g_window_mode == PluginConfig::WIN_MARKER) {
+        /* Stop once the post-trigger simulation_insns budget is spent
+         * (window_stop set when the symbol fired, or when the guest
+         * marker fired — see vcpu_marker_cb, which is what opens the
+         * segment in WIN_MARKER mode; only the close runs here). */
         if (g_trace_segments.is_active() &&
             icount_prev >= g_trace_segments.window_stop()) {
             finish_trace_segment();
@@ -1362,7 +1365,8 @@ static void tw_manage_window(unsigned int cpu_index,
             g_rec_mutex_unlock(&exec_lock);
             exit(0);
         }
-        if (!g_trace_segments.is_active() && start_symbol) {
+        if (g_window_mode == PluginConfig::WIN_SYMBOL &&
+            !g_trace_segments.is_active() && start_symbol) {
             /* cur_tb_tmpl IS the executing TB's template (passed
              * straight from the caller's per-TB udata); no start_pc
              * lookup needed. */
@@ -2031,6 +2035,52 @@ static void split_tb_into_fragments(const qemu_plugin_insn_info *insn_info,
     }
 }
 
+/*
+ * Guest-issued trace marker (WIN_MARKER, x86 only for now).
+ *
+ * A generic launch wrapper executes `mov $CST_MARKER_MAGIC, %eax` just
+ * before execve-ing the unmodified target.  The plugin spots that exact
+ * encoding (B8 imm32) at translation time and arms a one-shot exec
+ * callback; when it runs, a trace segment opens here and covers the
+ * next `simulation` instructions of the launched process.  This is the
+ * only window source that needs no ELF symbol table, no host icount,
+ * and no modification to the target or the guest kernel — so it is the
+ * mechanism for system-mode tracing of a chosen process (paging on,
+ * where wrong-path speculation is bounded).
+ *
+ * NOTE (quick first cut): the window is `simulation` total instructions
+ * from the marker, not yet user-space-only counted or pinned to the
+ * target's address space.  The brief wrapper tail before execve is
+ * negligible; SimPoint-grade user-space-instruction alignment and ASID
+ * pinning are the planned refinement.
+ */
+static const uint32_t CST_MARKER_MAGIC = 0x43535401u;   /* mov: B8 01 54 53 43 */
+static std::atomic<bool> g_marker_fired{false};
+
+static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
+{
+    (void)udata;
+    if (g_wp_state.in_progress) {
+        return;
+    }
+    bool expected = false;
+    if (!g_marker_fired.compare_exchange_strong(expected, true)) {
+        return;                              /* one-shot */
+    }
+    g_rec_mutex_lock(&exec_lock);
+    if (!g_trace_segments.is_active() && !g_trace_segments.is_shutting_down()) {
+        uint64_t lo = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
+        uint64_t span = simulation_insns ? simulation_insns : 1000000;
+        uint64_t hi = lo + span;
+        g_trace_segments.set_window(lo, hi);
+        fprintf(stderr, "champsim_tracer: marker fired at icount %" PRIu64
+                " — tracing %" PRIu64 " insns\n", lo, span);
+        start_trace_segment("marker", lo, hi, /* warmup= */ 0, span,
+                            cpu_index, /* simpoint_weight= */ 0.0);
+    }
+    g_rec_mutex_unlock(&exec_lock);
+}
+
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     uint64_t pc = qemu_plugin_tb_vaddr(tb);
@@ -2075,6 +2125,22 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         uint8_t raw_bytes[MAX_INSN_BYTES] = {0};
 
         qemu_plugin_insn_data(insn, raw_bytes, raw_size);
+
+        /* WIN_MARKER (x86): arm the one-shot trace-open callback on the
+         * launch wrapper's magic `mov $CST_MARKER_MAGIC, %eax`
+         * (B8 imm32, little-endian).  Registered at every translation so
+         * the marker is caught whenever and wherever the process runs;
+         * the callback itself is one-shot. */
+        if (g_window_mode == PluginConfig::WIN_MARKER &&
+            trace_isa == TRACE_ISA_X86 && raw_size >= 5 &&
+            raw_bytes[0] == 0xB8 &&
+            raw_bytes[1] == (uint8_t)(CST_MARKER_MAGIC) &&
+            raw_bytes[2] == (uint8_t)(CST_MARKER_MAGIC >> 8) &&
+            raw_bytes[3] == (uint8_t)(CST_MARKER_MAGIC >> 16) &&
+            raw_bytes[4] == (uint8_t)(CST_MARKER_MAGIC >> 24)) {
+            qemu_plugin_register_vcpu_insn_exec_cb(
+                insn, vcpu_marker_cb, QEMU_PLUGIN_CB_NO_REGS, nullptr);
+        }
 
         bool duplicate = false;
         if (canonical_n_insns > 0) {
@@ -3019,6 +3085,14 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         }
         /* No segment opens until the named symbol is seen
          * start_symbol_occurrence times in vcpu_tb_exec. */
+    } else if (g_window_mode == PluginConfig::WIN_MARKER) {
+        if (trace_isa != TRACE_ISA_X86) {
+            fprintf(stderr, "champsim_tracer: trace_window=marker is "
+                    "x86-only for now\n");
+            return -1;
+        }
+        /* No segment opens until the guest launch wrapper's magic
+         * marker instruction executes (see vcpu_marker_cb). */
     } else if (!g_simpoints.is_active() && trace_start_insn == 0) {
         /* No vCPU at install time: empty initial regfile (id→name
          * still pinned, no live values).  Header total 0 = unbounded

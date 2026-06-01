@@ -177,9 +177,19 @@ bool parse_kv_pair(PluginConfig *cfg, const char *mode,
         }
         return bad_key("name, occurrence, simulation");
     }
+    if (cst_str_eq(mode, "marker")) {
+        /* Guest-driven window: a launch wrapper issues a magic marker
+         * instruction, the plugin opens a segment there and traces
+         * `simulation` instructions of the launched process. */
+        if (match("simulation")) {
+            cfg->simulation_insns = g_ascii_strtoull(kv.second, nullptr, 10);
+            return cfg->simulation_insns > 0;
+        }
+        return bad_key("simulation");
+    }
     fprintf(stderr,
             "champsim_tracer: trace_window: unknown mode '%s' "
-            "(expected: icount, simpoint, symbol)\n", mode);
+            "(expected: icount, simpoint, symbol, marker)\n", mode);
     return false;
 }
 
@@ -213,10 +223,13 @@ bool set_trace_window(PluginConfig *cfg, const char *v)
         cfg->window_mode = PluginConfig::WIN_SIMPOINT;
     } else if (cst_str_eq(head_tail[0], "symbol")) {
         cfg->window_mode = PluginConfig::WIN_SYMBOL;
+    } else if (cst_str_eq(head_tail[0], "marker")) {
+        cfg->window_mode = PluginConfig::WIN_MARKER;
     } else {
         fprintf(stderr,
                 "champsim_tracer: trace_window: unknown mode '%s' "
-                "(expected: icount, simpoint, symbol)\n", head_tail[0]);
+                "(expected: icount, simpoint, symbol, marker)\n",
+                head_tail[0]);
         return false;
     }
     g_auto(GStrv) pairs = g_strsplit(head_tail[1], "+", -1);

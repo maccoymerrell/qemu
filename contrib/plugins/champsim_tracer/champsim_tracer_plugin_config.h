@@ -70,6 +70,11 @@ struct PluginConfig {
         WIN_ICOUNT   = 1,
         WIN_SIMPOINT = 2,
         WIN_SYMBOL   = 3,
+        /* Guest-driven: a magic marker instruction in the traced
+         * process opens the segment, a second one closes it.  The only
+         * window source that needs no ELF symbol table or host icount,
+         * so it works in system mode (x86 only for now). */
+        WIN_MARKER   = 4,
     };
     int window_mode = WIN_AUTO;
 };

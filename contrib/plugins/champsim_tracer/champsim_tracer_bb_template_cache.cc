@@ -485,15 +485,17 @@ BBTemplate *BBTemplateCache::get_or_create_bb_template(
 
 BBTemplate *BBTemplateCache::create_tb_template(
     uint64_t start_pc,
-    uint32_t n_insns,
-    uint64_t *insn_pcs,
-    qemu_plugin_insn_info *insn_info,
-    const uint64_t *insn_branch_target_pcs,
-    uint8_t *insn_sizes,
-    uint8_t *insn_bytes,
+    const TbInsnView &insns,
     const char *symbol_name,
     uint64_t fall_through_pc)
 {
+    uint32_t n_insns                            = insns.n;
+    const uint64_t *insn_pcs                    = insns.pcs;
+    const qemu_plugin_insn_info *insn_info      = insns.info;
+    const uint64_t *insn_branch_target_pcs      = insns.branch_target_pcs;
+    const uint8_t *insn_sizes                   = insns.sizes;
+    const uint8_t *insn_bytes                   = insns.bytes;
+
     /* Always fresh: one template per QEMU translation, attached to
      * that TB via udata.  Distinct CP-mode and WP-mode translations
      * at the same start_pc therefore each get their own template and

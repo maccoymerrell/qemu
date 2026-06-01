@@ -38,6 +38,35 @@ struct BBTemplateDeleter {
 
 using BBTemplatePtr = std::unique_ptr<BBTemplate, BBTemplateDeleter>;
 
+/*
+ * Read-only view of a contiguous run of canonical instructions (a whole TB
+ * or a fragment slice).  Groups the six parallel per-insn arrays that
+ * describe a translation so they travel together rather than as a
+ * six-pointer parameter clump.  Non-owning: the backing arrays must outlive
+ * the view.
+ */
+struct TbInsnView {
+    uint32_t                     n;
+    const uint64_t              *pcs;
+    const qemu_plugin_insn_info *info;
+    const uint64_t              *branch_target_pcs;
+    const uint8_t               *sizes;
+    const uint8_t               *bytes;   /* n * MAX_INSN_BYTES */
+
+    /* Sub-view covering canonical insns [first, first + count). */
+    TbInsnView slice(uint32_t first, uint32_t count) const
+    {
+        return TbInsnView{
+            count,
+            pcs + first,
+            info + first,
+            branch_target_pcs + first,
+            sizes + first,
+            bytes + (size_t)first * MAX_INSN_BYTES,
+        };
+    }
+};
+
 class BBTemplateCache {
 public:
     BBTemplateCache() = default;
@@ -53,12 +82,7 @@ public:
      * per-TB exec-cb udata; vcpu_tb_exec reads it back as the current
      * TB's exact-shape template on both CP and WP paths. */
     BBTemplate *create_tb_template(uint64_t start_pc,
-                                   uint32_t n_insns,
-                                   uint64_t *insn_pcs,
-                                   qemu_plugin_insn_info *insn_info,
-                                   const uint64_t *insn_branch_target_pcs,
-                                   uint8_t *insn_sizes,
-                                   uint8_t *insn_bytes,
+                                   const TbInsnView &insns,
                                    const char *symbol_name,
                                    uint64_t fall_through_pc);
 

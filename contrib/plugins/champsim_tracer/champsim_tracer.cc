@@ -2377,6 +2377,13 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * decoded contents are identical; we only need to re-arm the JIT-level
      * per-insn callbacks and scoreboard stores below (done every
      * translation regardless of reuse). */
+    /* Whole-TB canonical view; each fragment passes a slice to
+     * create_tb_template (groups the six parallel per-insn arrays). */
+    TbInsnView tb_view = {
+        canonical_n_insns, insn_pcs, insn_info, insn_branch_target_pcs,
+        insn_sizes, insn_bytes,
+    };
+
     uint64_t tb_start_pc = insn_pcs[0];
     g_mutex_lock(&data_lock);
     BBTemplate *reuse_head =
@@ -2416,13 +2423,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             g_mutex_lock(&data_lock);
             frag_tmpl = g_bb_template_cache.create_tb_template(
                                 f_start_pc,
-                                spec.n_insns,
-                                &insn_pcs[f_first_ci],
-                                &insn_info[f_first_ci],
-                                &insn_branch_target_pcs[f_first_ci],
-                                &insn_sizes[f_first_ci],
-                                &insn_bytes[(size_t)f_first_ci *
-                                            MAX_INSN_BYTES],
+                                tb_view.slice(f_first_ci, spec.n_insns),
                                 frag_symbol,
                                 f_fall_through);
             frag_tmpl->terminus = (uint8_t)spec.terminus;

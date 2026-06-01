@@ -279,6 +279,51 @@ hint.
    add a branch that consults the new manager when its option was
    set.  Cf. how SimPoint mode and stop-only mode coexist there.
 
+Porting to a new target ISA (system-mode wrong-path)
+----------------------------------------------------
+
+Correct-path tracing of a new ISA needs only a classification table
+(see *Adding a generic opcode* / *Adding a register ID*) and Capstone
+support.  Supporting the **wrong-path simulator in system mode** on a
+new ISA additionally requires a few QEMU-base hooks, because
+speculative execution must be both *bounded* (the MMU faults stop it)
+and *side-effect-free* (nothing escapes the discarded path).  The
+load/store/atomic sandbox and the translation-fault handling are
+already ISA-generic in the TCG memory path; what a new target must
+supply is everything that is expressed in *that target's* code.  See
+:doc:`qemu_modifications` for the reference description of each.
+
+#. **State introspection** — implement ``TCGCPUOps::get_plugin_state``
+   (``#if CONFIG_PLUGIN && !CONFIG_USER_ONLY``) to report ``priv``,
+   ``asid``, and ``mmu_on``.  ``mmu_on`` is load-bearing: the plugin
+   does not speculate when paging is off, because without the MMU there
+   is no instruction-fetch fault to bound a wrong-path branch into
+   non-code (it would decode data as an endless no-branch run).  Report
+   it from the ISA's paging-enable state (x86 ``CR0.PG``, Arm
+   ``SCTLR.M``, RISC-V ``SATP``-mode, …).
+
+#. **Suppress device / global side effects** under
+   ``cpu->plugin_spec_mode``.  Find the ISA's helpers that write an
+   emulated device or global CPU state — interrupt-controller and timer
+   registers, the interrupt-request line, page-table accessed/dirty-bit
+   writeback — and skip the device/global part on the speculative path
+   while still applying any architectural-register part (it is rolled
+   back at walk end regardless).  Arm's ``ARM_CP_IO`` flag is a ready
+   marker for the device-bearing system registers; other ISAs gate the
+   specific timer / interrupt helpers.
+
+#. **Abort on unsandboxable instructions** — the ISA's halt / wait
+   instruction (do not let ``cs->halted`` persist past the walk) and any
+   instruction that writes guest *physical* memory through a path that
+   bypasses the softmmu helpers, or performs a complete mode switch.
+   Call ``cpu_loop_exit`` under ``plugin_spec_mode`` to end the walk,
+   the same way ``hlt`` does.
+
+The :doc:`validator` runs only in linux-user, so it does not exercise
+these system-mode hooks; validate a new ISA's wrong-path-in-system-mode
+support by tracing a real guest process with paging on and confirming
+the run neither leaks memory nor mutates device state.
+
 Verifying changes
 -----------------
 

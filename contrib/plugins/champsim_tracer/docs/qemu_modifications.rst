@@ -56,8 +56,40 @@ Plugin API additions
      context), and any plugin ``flush_cb`` registered via
      ``qemu_plugin_register_flush_cb`` fires before the next TB
      executes.
+   * ``qemu_plugin_get_priv_level`` / ``qemu_plugin_get_addr_space_id``
+     / ``qemu_plugin_paging_enabled`` — system-mode introspection backed
+     by the per-target ``TCGCPUOps::get_plugin_state`` hook (below).
+     They report the executing vCPU's privilege ordinal (0 = user,
+     larger = more privileged), its address-space identifier (the
+     page-table base / ASID register: x86 ``CR3``, RISC-V ``SATP``, Arm
+     ``TTBR0_EL1``, MIPS ASID), and whether the guest MMU / paging is
+     currently enabled.  They let a system-mode plugin pin tracing to a
+     single process address space and, critically for the wrong-path
+     simulator, decline to speculate when there is no paging to bound a
+     speculative fetch (see *No speculation without paging*, below).  All
+     three return their user-mode defaults — privilege 0, ASID 0, paging
+     on — in ``*-linux-user``, where a process always has one valid
+     address space.
    * ``QEMU_PLUGIN_VERSION = 8`` advertises these entry
      points to plugin loaders.
+
+``include/accel/tcg/cpu-ops.h`` and per-target
+``TCGCPUOps::get_plugin_state``
+
+   A new optional ``TCGCPUOps`` callback,
+   ``get_plugin_state(cpu, *priv, *asid, *mmu_on)``, is the single
+   per-target source for the three introspection accessors above.  Each
+   softmmu target fills it from architectural state: x86 from ``CPL`` /
+   ``CR3`` / ``CR0.PG`` (``target/i386/tcg/tcg-cpu.c``), Arm from the
+   current EL / ``TTBR0_EL1`` / ``SCTLR.M``
+   (``target/arm/cpu.c``), RISC-V from ``priv`` / ``SATP`` /
+   (``SATP != 0 && priv != M``) (``target/riscv/tcg/tcg-cpu.c``), and
+   MIPS from ``KSU`` / ``EntryHi.ASID`` / always-true (the MIPS TLB has
+   no global enable) (``target/mips/cpu.c``).  ``plugins/api.c`` calls
+   the hook when present and otherwise returns the user-mode defaults.
+   The hook is gated ``CONFIG_PLUGIN && !CONFIG_USER_ONLY``; porting a
+   new ISA to system-mode tracing means implementing it (see
+   :doc:`extending`).
 
 ``plugins/api.c`` and ``disas/disas-target.c``
 
@@ -292,6 +324,122 @@ spec store buffer
    speculative stores are simply not forwarded.  The bound, and the
    buffer itself, are ISA-generic — they apply to every target that
    routes stores through the buffer.
+
+   ``PluginSpecLine`` places its ``bytes[64]`` payload first and is
+   ``QEMU_ALIGNED(16)`` so a naturally-aligned guest atomic (size ≤ 16,
+   never crossing a 64-byte line) yields a correspondingly-aligned
+   pointer into the payload — the redirect for speculative atomics
+   (below) depends on this, because the host atomic primitives (x86
+   ``cmpxchg16b``, AArch64 128-bit ``LDXP``/``STXP``) fault on a
+   misaligned operand.
+
+``accel/tcg/cputlb.c`` and ``accel/tcg/user-exec.c`` —
+``atomic_mmu_lookup``
+
+   The atomic read-modify-write helpers (``atomic_template.h``:
+   ``cmpxchg``, ``xchg``, ``fetch_*``, ``*_fetch``) obtain a raw host
+   pointer from ``atomic_mmu_lookup`` and mutate it in place with real
+   host atomics.  Left unsandboxed that writes real guest memory on the
+   discarded wrong path — kernel spinlocks, refcounts and page-table
+   cmpxchg in system mode, and ``lock``-prefixed RMW / futex words in
+   user mode alike — because the spec store buffer only intercepts the
+   plain load/store helpers.  Under ``cpu_plugin_spec_active`` both
+   copies of ``atomic_mmu_lookup`` redirect the returned pointer into
+   the spec store buffer via ``spec_atomic_shadow``
+   (``internal-common.h``): it pre-fills the accessed bytes from real
+   memory wherever they are not already speculatively dirty (so the RMW
+   reads the correct store-to-load-forwarded baseline), marks them
+   valid, and returns a pointer into the line.  The in-place RMW then
+   mutates the shadow, later speculative loads forward from it, and the
+   line is discarded at walk end.  The softmmu copy also returns before
+   the real-memory ``notdirty_write`` / watchpoint side effects.  As
+   with the store buffer this is ISA-generic and fixes user-mode
+   wrong-path atomics too.
+
+Bounding wrong-path: no speculation without paging
+--------------------------------------------------
+
+   A real processor's wrong-path fetch still goes through the MMU: a
+   speculative branch into a non-code page faults on the
+   instruction-fetch translation, which is what stops it.  The
+   wrong-path simulator relies on exactly that — a speculative branch
+   into data takes a guest instruction-fetch fault, which unwinds via
+   ``cpu_plugin_exec_tb`` and ends the walk.  With the guest MMU
+   *disabled* (x86 real-mode / early boot before ``CR0.PG``) there is no
+   such fault: a branch into a zero/data page decodes as an unbounded
+   run of no-branch instructions — a "NOP sled to infinity" — that folds
+   into a true basic block which never seals, exhausting host memory.
+
+   The plugin therefore consults ``qemu_plugin_paging_enabled()`` before
+   launching a wrong-path walk and does not speculate when the MMU is
+   off.  This is system-mode-only by construction: ``*-linux-user``
+   reports paging on (a process address space always bounds fetches),
+   so user-mode wrong-path is unchanged.  It also matches the intended
+   use — system-mode tracing targets a user process and its (mapped)
+   kernel invocations, which run with paging on, not the pre-paging
+   boot path.
+
+Suppressing device and global side effects
+------------------------------------------
+
+   Wrong-path execution may run privileged instructions whose effect is
+   neither a register write (rolled back with ``CPUArchState``) nor a
+   guest-memory store (caught by the spec store buffer) but a poke at an
+   emulated *device* or at *global* CPU state — an interrupt-controller
+   register, a timer, the interrupt-request line.  Those escape the
+   discarded path.  Each target suppresses them under
+   ``plugin_spec_mode`` while still applying any architectural-register
+   part (which is restored at walk end anyway):
+
+   * **x86** (``target/i386/tcg/system/misc_helper.c``): port I/O
+     (``in``/``out``) returns without touching ``address_space_io``;
+     ``mov cr8`` applies the ``V_TPR`` shadow but skips
+     ``cpu_set_apic_tpr`` and the ``VIRQ`` ``cpu_interrupt``; ``wrmsr``
+     skips ``cpu_set_apic_base`` and the x2APIC ``apic_msr_write``.
+   * **Arm** (``target/arm/tcg/op_helper.c``): ``set_cp_reg`` /
+     ``set_cp_reg64`` skip the ``writefn`` for ``ARM_CP_IO`` registers —
+     the architecture's own marker for system registers with device
+     side effects (GIC ``ICC_*``, the generic timer).
+   * **RISC-V**: ``riscv_cpu_interrupt`` (``cpu_helper.c``) leaves the
+     real interrupt line alone (a speculative ``mip``/``sip`` write
+     still updates ``env->mip``, restored at walk end);
+     ``riscv_timer_write_timecmp`` (``time_helper.c``) skips the timer
+     reprogram.
+   * **MIPS** (``target/mips/tcg/system/cp0_helper.c``):
+     ``mtc0 Count`` / ``Compare`` skip the timer reprogram; the
+     VPE wake/sleep paths skip ``cpu_interrupt`` / ``halted``.
+
+   Guest-memory device escapes (MMIO) need no separate gate: an MMIO
+   store is unreachable because the softmmu store helpers route to the
+   spec buffer before the device dispatch, and an MMIO load returns
+   zero.  Page-table accessed/dirty-bit writeback is likewise suppressed
+   per target (``target/i386/tcg/system/excp_helper.c`` ``ptw_setl``,
+   ``target/arm/ptw.c`` ``arm_casq_ptw``, ``target/riscv/cpu_helper.c``).
+
+Aborting unsandboxable instructions
+-----------------------------------
+
+   A few instructions change state too sweepingly to sandbox: they halt
+   the vCPU, write to guest *physical* memory through paths that bypass
+   the softmmu helpers, or perform a complete mode switch.  On the wrong
+   path the simulator simply stops there — a real wrong path would not
+   retire deep past one of these either.  Each calls ``cpu_loop_exit``
+   under ``plugin_spec_mode`` (caught by ``cpu_plugin_exec_tb``'s guard,
+   ending the walk), exactly like the existing ``hlt`` gate:
+
+   * **Halt family** — x86 ``mwait``
+     (``misc_helper.c``), Arm ``wfi`` / ``wfit`` (``op_helper.c``),
+     RISC-V ``wfi`` (``op_helper.c``), MIPS ``wait`` (``exception.c``):
+     setting ``cs->halted`` on the discarded path would stall the VM.
+   * **x86 SVM** ``vmrun`` / ``vmload`` / ``vmsave`` and **SMM**
+     ``rsm`` (``svm_helper.c`` / ``smm_helper.c``): these write host
+     save-state to guest physical memory (``x86_st*_phys``, outside the
+     sandbox) and switch virtualization / SMM mode.
+   * **Exceptions**: ``raise_interrupt2`` (``excp_helper.c``) aborts the
+     walk rather than delivering a guest fault, so a speculative
+     ``#GP`` / ``#UD`` / ``#PF`` does not vector into a handler (whose
+     side effects would pollute the correct path) nor escalate to a
+     triple fault.
 
 x86 lazy-flags resolution for plugin reads
 ------------------------------------------

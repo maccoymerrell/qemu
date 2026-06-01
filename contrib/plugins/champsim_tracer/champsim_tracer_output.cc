@@ -3466,26 +3466,16 @@ static void profile_branch(BBTemplate *t, uint64_t next_pc, bool wp)
     }
 }
 
-void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
+/*
+ * Template profile accumulation (§6).  Pure metadata, serialized later in
+ * write_bin_templates.
+ *   - CP: the prev CP BB's terminal branch is now resolvable (its
+ *     successor is this BB's start_pc); classify and remember.
+ *   - WP: chain order gives each non-final WP BB's successor.
+ */
+static void accumulate_template_profiles(BodyStreamState *st, BodyEntry *entry,
+                                         uint32_t num_wp)
 {
-    int64_t entry_tmpl = entry->template_id;
-    uint32_t num_wp = (uint32_t)entry->wp_entries.size();
-    uint64_t body_start = bw_tell_bytes(&st->bw);
-    uint32_t tid = entry->thread_id;
-
-    dyn_params_sort_template_order(entry->dyn_params);
-    for (uint32_t w = 0; w < num_wp; w++) {
-        WPBBEntry &wp = entry->wp_entries[w];
-        dyn_params_sort_template_order(wp.dyn_params);
-    }
-
-    /*
-     * Template profile accumulation (§6).  Pure metadata, serialized
-     * later in write_bin_templates.
-     *   - CP: the prev CP BB's terminal branch is now resolvable (its
-     *     successor is this BB's start_pc); classify and remember.
-     *   - WP: chain order gives each non-final WP BB's successor.
-     */
     profile_accumulate(entry->tmpl, entry->dyn_params, false);
     if (st->prev_cp_tmpl && entry->tmpl) {
         profile_branch(st->prev_cp_tmpl, entry->tmpl->start_pc, false);
@@ -3497,40 +3487,97 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
         WPBBEntry &wp = entry->wp_entries[w];
         profile_accumulate(wp.tmpl, wp.dyn_params, true);
         if (!wp.fault && w + 1 < num_wp) {
-            profile_branch(wp.tmpl, entry->wp_entries[w + 1].start_pc,
-                           true);
+            profile_branch(wp.tmpl, entry->wp_entries[w + 1].start_pc, true);
         }
     }
+}
 
+/* Announce a BODY_TAG_THREAD_SWITCH when the active thread changes (and on
+ * the very first entry). */
+static void emit_thread_switch_if_needed(BodyStreamState *st, uint32_t tid)
+{
     if (!st->thread_announced || (int64_t)tid != st->current_thread) {
         bw_write_u8(&st->bw, BODY_TAG_THREAD_SWITCH);
         bw_write_sleb128(&st->bw, (int64_t)tid - st->current_thread);
         st->current_thread = tid;
         st->thread_announced = true;
     }
+}
 
-    /*
-     * Per-thread regfile emission: each thread's first body entry is
-     * preceded by a BODY_TAG_REGFILE so the consumer can prime that
-     * thread's simulator state.  Seed thread uses the pre-first-BB
-     * snapshot (seed_regfile); joiners capture live here (post-first-BB
-     * on their side — best without a per-thread pre-exec hook).
-     */
+/*
+ * Per-thread regfile emission: each thread's first body entry is preceded
+ * by a BODY_TAG_REGFILE so the consumer can prime that thread's simulator
+ * state.  Seed thread uses the pre-first-BB snapshot (seed_regfile);
+ * joiners capture live here (post-first-BB on their side — best without a
+ * per-thread pre-exec hook).
+ */
+static void emit_regfile_if_first(BodyStreamState *st, BodyEntry *entry,
+                                  uint32_t tid)
+{
     if (tid >= st->regfile_emitted.size()) {
         st->regfile_emitted.resize((size_t)tid + 1, false);
     }
-    if (!st->regfile_emitted[tid]) {
-        if ((int32_t)tid == st->seed_thread && !st->seed_regfile.empty()) {
-            emit_regfile_record(&st->bw, tid, st->seed_regfile);
-            st->seed_regfile.clear();
-            st->seed_thread = -1;
-        } else {
-            std::vector<InitialRegSnap> snaps;
-            capture_initial_regfile(entry->cpu_index, &snaps);
-            emit_regfile_record(&st->bw, tid, snaps);
-        }
-        st->regfile_emitted[tid] = true;
+    if (st->regfile_emitted[tid]) {
+        return;
     }
+    if ((int32_t)tid == st->seed_thread && !st->seed_regfile.empty()) {
+        emit_regfile_record(&st->bw, tid, st->seed_regfile);
+        st->seed_regfile.clear();
+        st->seed_thread = -1;
+    } else {
+        std::vector<InitialRegSnap> snaps;
+        capture_initial_regfile(entry->cpu_index, &snaps);
+        emit_regfile_record(&st->bw, tid, snaps);
+    }
+    st->regfile_emitted[tid] = true;
+}
+
+/*
+ * IFRAME trigger.  Every iframe_rate emissions of this CP template, emit a
+ * redundant BODY_TAG_IFRAME with the same payload but encoded against fresh
+ * scratch overlays (all values absolute).  It neither advances
+ * prev_entry_template nor writes a tmpl_delta (template = the preceding
+ * ENTRY's) — a pure validation/resync record.
+ */
+static void emit_iframe_if_due(BodyStreamState *st, BodyEntry *entry,
+                               uint32_t num_wp)
+{
+    if (iframe_rate <= 0 || !entry->tmpl) {
+        return;
+    }
+    entry->tmpl->emit_count++;
+    if ((entry->tmpl->emit_count % iframe_rate) != 0) {
+        return;
+    }
+    if (!st->iframe_cp_scratch) {
+        st->iframe_cp_scratch = field_state_table_new();
+    }
+    if (!st->iframe_wp_scratch) {
+        st->iframe_wp_scratch = field_state_table_new();
+    }
+    st->iframe_cp_scratch->generation++;
+    st->iframe_wp_scratch->generation++;
+    bw_write_u8(&st->bw, BODY_TAG_IFRAME);
+    emit_body_record_payload(st, &st->bw, entry, num_wp,
+                             st->iframe_cp_scratch, st->iframe_wp_scratch,
+                             st->iframe_cp_scratch);
+}
+
+void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
+{
+    int64_t entry_tmpl = entry->template_id;
+    uint32_t num_wp = (uint32_t)entry->wp_entries.size();
+    uint64_t body_start = bw_tell_bytes(&st->bw);
+    uint32_t tid = entry->thread_id;
+
+    dyn_params_sort_template_order(entry->dyn_params);
+    for (uint32_t w = 0; w < num_wp; w++) {
+        dyn_params_sort_template_order(entry->wp_entries[w].dyn_params);
+    }
+
+    accumulate_template_profiles(st, entry, num_wp);
+    emit_thread_switch_if_needed(st, tid);
+    emit_regfile_if_first(st, entry, tid);
 
     /* Regular delta-encoded entry against this thread's persistent
      * per-vCPU overlays (deltas stay within-thread, compressible). */
@@ -3545,32 +3592,7 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
     emit_body_record_payload(st, &st->bw, entry, num_wp,
                              cp_fst, wp_fst, cp_fst);
 
-    /*
-     * IFRAME trigger.  Every iframe_rate emissions of this CP
-     * template, emit a redundant BODY_TAG_IFRAME with the same payload
-     * but encoded against fresh scratch overlays (all values
-     * absolute).  It neither advances prev_entry_template nor writes a
-     * tmpl_delta (template = the preceding ENTRY's) — a pure
-     * validation/resync record.
-     */
-    if (iframe_rate > 0 && entry->tmpl) {
-        entry->tmpl->emit_count++;
-        if ((entry->tmpl->emit_count % iframe_rate) == 0) {
-            if (!st->iframe_cp_scratch) {
-                st->iframe_cp_scratch = field_state_table_new();
-            }
-            if (!st->iframe_wp_scratch) {
-                st->iframe_wp_scratch = field_state_table_new();
-            }
-            st->iframe_cp_scratch->generation++;
-            st->iframe_wp_scratch->generation++;
-            bw_write_u8(&st->bw, BODY_TAG_IFRAME);
-            emit_body_record_payload(st, &st->bw, entry, num_wp,
-                                     st->iframe_cp_scratch,
-                                     st->iframe_wp_scratch,
-                                     st->iframe_cp_scratch);
-        }
-    }
+    emit_iframe_if_due(st, entry, num_wp);
 
     bw_byte_align(&st->bw);
 

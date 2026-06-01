@@ -904,6 +904,30 @@ static void emit_body_entry(BodyStreamState *out_stream,
     g_seg_arch_insns += bb_tmpl ? bb_tmpl->n_insns : 0;
 }
 
+/* Append a CP fragment to the true-BB chain (shared by the per-exec walk
+ * in vcpu_tb_exec and the segment-final flush below). */
+static inline void cp_chain_append(BBTemplate *frag)
+{
+    g_cp_chain.append_fragment(frag->start_pc, frag,
+                               frag->fall_through_pc,
+                               (TbTerminus)frag->terminus);
+}
+
+/* Finalize and reset the CP chain if it now forms a complete true BB.
+ * Returns the finalized template (the caller emits/records it) or
+ * nullptr if the BB is not yet complete.  Resetting immediately lets a
+ * subsequent fragment in the same walk start a fresh chain at its own
+ * entry_pc instead of being appended onto the just-committed BB. */
+static inline BBTemplate *cp_chain_finalize_if_complete(void)
+{
+    if (g_cp_chain.bb_complete() && g_cp_chain.has_active_chain()) {
+        BBTemplate *bb_tmpl = g_cp_chain.finalize();
+        g_cp_chain.reset();
+        return bb_tmpl;
+    }
+    return nullptr;
+}
+
 /*
  * Flush the pending final-TB body entry before a segment finishes.
  * BodyEntries are emitted lazily: vcpu_tb_exec emits the *previous*
@@ -965,17 +989,9 @@ static void flush_pending_final_body_entry(void)
                 }
             }
 
-            g_cp_chain.append_fragment(frag->start_pc, frag,
-                                       frag->fall_through_pc,
-                                       (TbTerminus)frag->terminus);
-
-            if (g_cp_chain.bb_complete() &&
-                g_cp_chain.has_active_chain()) {
-                BBTemplate *bb_tmpl = g_cp_chain.finalize();
-                g_cp_chain.reset();
-                if (bb_tmpl) {
-                    finalized.push_back(bb_tmpl);
-                }
+            cp_chain_append(frag);
+            if (BBTemplate *bb_tmpl = cp_chain_finalize_if_complete()) {
+                finalized.push_back(bb_tmpl);
             }
 
             if (is_last_executed) {
@@ -1701,41 +1717,27 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         if (is_last_executed) {
             snap_prev_tail_dsts(cpu_index, frag, frag_current_pc);
         }
-        g_cp_chain.append_fragment(frag->start_pc, frag,
-                                   frag->fall_through_pc,
-                                   (TbTerminus)frag->terminus);
+        cp_chain_append(frag);
         attribute_cp_insns(frag);
 
-        if (g_cp_chain.bb_complete() && g_cp_chain.has_active_chain()) {
-            BBTemplate *bb_tmpl = g_cp_chain.finalize();
-            /* Reset the chain now so a subsequent fragment in the
-             * same walk (no-trap path between mid-TB branches) starts
-             * a fresh chain at its own entry_pc instead of getting
-             * appended onto the just-committed fragments.  Today's
-             * fall-through reset lives inside emit_finalized_bb, but
-             * we accumulate emits to fire after the data_lock
-             * section, so the reset has to happen here. */
-            g_cp_chain.reset();
-            if (bb_tmpl) {
-                PendingEmit pe = {bb_tmpl, 0, frag_current_pc, 0};
-                int br_idx =
-                    BBTemplateCache::template_branch_index(bb_tmpl);
-                if (br_idx >= 0) {
-                    pe.branch_pc = bb_tmpl->insn_pcs[br_idx];
-                    BranchRecord *br = observe_branch_transition(
-                        bb_tmpl, frag_branch_taken, pe.branch_pc,
-                        frag_prev_ft);
-                    uint64_t taken_target = 0;
-                    pe.wrong_target = resolve_wrong_target(
-                        bb_tmpl, br, frag_branch_taken,
-                        frag_current_pc, frag_prev_ft, &taken_target);
-                    if (taken_target != 0) {
-                        bb_tmpl->taken_pc = taken_target;
-                    }
+        if (BBTemplate *bb_tmpl = cp_chain_finalize_if_complete()) {
+            PendingEmit pe = {bb_tmpl, 0, frag_current_pc, 0};
+            int br_idx = BBTemplateCache::template_branch_index(bb_tmpl);
+            if (br_idx >= 0) {
+                pe.branch_pc = bb_tmpl->insn_pcs[br_idx];
+                BranchRecord *br = observe_branch_transition(
+                    bb_tmpl, frag_branch_taken, pe.branch_pc,
+                    frag_prev_ft);
+                uint64_t taken_target = 0;
+                pe.wrong_target = resolve_wrong_target(
+                    bb_tmpl, br, frag_branch_taken,
+                    frag_current_pc, frag_prev_ft, &taken_target);
+                if (taken_target != 0) {
+                    bb_tmpl->taken_pc = taken_target;
                 }
-                pending_emits.push_back(pe);
-                any_finalize = true;
             }
+            pending_emits.push_back(pe);
+            any_finalize = true;
         }
 
         if (is_last_executed) {

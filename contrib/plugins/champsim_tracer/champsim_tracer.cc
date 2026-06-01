@@ -1832,6 +1832,144 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
  * memory-hint opcodes.  See the inline comments for the
  * canonical-first / ci-1 timing rationale.
  */
+/*
+ * Post-exec dst-register capture.  Register the snap cb on raw insn i
+ * (canonical_first && ci > 0) pointing at ci-1: firing pre-exec of ci means
+ * ci-1 just completed, so its dst registers hold post-exec values.  The
+ * TB's last canonical insn is captured at the next TB's vcpu_tb_exec
+ * ("Tail-insn dst snap").
+ *
+ * Delay-slot tail: on MIPS (and similar ISAs) a true BB ends with a
+ * [branch, delay-slot] pair kept in true execution order — branch at
+ * canonical[n-2], delay slot at canonical[n-1].  The branch's PC-dst
+ * (REG_IP) needs the goto_tb override that only snap_prev_tail_dsts can
+ * supply (it knows the successor PC), so DEFER the branch's snap to the
+ * next TB rather than capturing it here at the delay slot's pre-exec hook.
+ * Detect the pair by branch_type and skip the cb whose ci-1 is the branch
+ * (ci == n-1); snap_prev_tail_dsts then captures both canonical[n-2]
+ * (branch, with REG_IP override) and canonical[n-1] (delay slot) at the
+ * right time.
+ */
+static void arm_reg_snap_cbs(struct qemu_plugin_tb *tb, BBTemplate *new_tmpl,
+                             size_t raw_n_insns,
+                             const uint32_t *canonical_index,
+                             const bool *canonical_first,
+                             uint32_t canonical_n_insns)
+{
+    if (!((enable_reg_data || enable_wp_reg_data) && new_tmpl &&
+          new_tmpl->insn_reg_names)) {
+        return;
+    }
+    /* The RegSnapInsnRef udata array lives in the (persistent) template and
+     * is allocated once; on a dedup reuse it already exists and we only
+     * re-register the QEMU callbacks below against it (a re-translation must
+     * re-arm the JIT-level callbacks even though the udata is unchanged). */
+    if (!new_tmpl->insn_snap_refs) {
+        RegSnapInsnRef *refs = g_new0(RegSnapInsnRef, canonical_n_insns);
+        new_tmpl->insn_snap_refs = refs;
+        for (uint32_t i = 0; i < canonical_n_insns; i++) {
+            refs[i].tb_tmpl = new_tmpl;
+            refs[i].insn_index = i;
+        }
+    }
+    RegSnapInsnRef *refs = (RegSnapInsnRef *)new_tmpl->insn_snap_refs;
+    bool delay_slot_tail = canonical_n_insns >= 2
+        && new_tmpl->insn_fields[canonical_n_insns - 2].branch_type
+             != BRANCH_NONE
+        && new_tmpl->insn_fields[canonical_n_insns - 1].branch_type
+             == BRANCH_NONE;
+    for (size_t i = 0; i < raw_n_insns; i++) {
+        if (!canonical_first[i]) {
+            continue;
+        }
+        uint32_t ci = canonical_index[i];
+        if (ci == 0) {
+            continue;  /* no predecessor canonical insn in this TB */
+        }
+        if (delay_slot_tail && ci == canonical_n_insns - 1) {
+            /* The cb HERE would capture canonical[n-2] (the branch); defer
+             * it to snap_prev_tail_dsts so the branch's REG_IP dst gets the
+             * goto_tb successor override. */
+            continue;
+        }
+        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+        /* Gate on the is_active scoreboard slot so the callback skips
+         * entirely between segments via a JIT-emitted check — no
+         * plugin-side tb_flush needed at segment boundaries.  Translations
+         * cached from any prior segment continue to fire harmlessly: the
+         * cond_cb predicate is false outside segments and the JIT skips the
+         * callback. */
+        qemu_plugin_register_vcpu_insn_exec_cond_cb(
+            insn, vcpu_insn_reg_snap_cb,
+            QEMU_PLUGIN_CB_R_REGS,
+            QEMU_PLUGIN_COND_GE, g_scoreboard.is_active, 1,
+            &refs[ci - 1]);
+    }
+}
+
+/*
+ * Synthetic-EA capture for memory-hint opcodes (prefetch / cache-flush /
+ * tlb-flush) whose effective address QEMU does not surface as a memop.
+ * Decode the EA per canonical insn, then arm a register-reading cb on each
+ * raw insn whose canonical insn resolved an address.
+ */
+static void arm_synth_ea_cbs(struct qemu_plugin_tb *tb, BBTemplate *new_tmpl,
+                             const qemu_plugin_insn_info *insn_info,
+                             size_t raw_n_insns,
+                             const uint32_t *canonical_index,
+                             const bool *canonical_first,
+                             uint32_t canonical_n_insns)
+{
+    if (!new_tmpl) {
+        return;
+    }
+    for (uint32_t i = 0; i < canonical_n_insns; i++) {
+        uint8_t op = new_tmpl->insn_fields[i].opcode;
+        if (op != GEN_OP_PREFETCH &&
+            op != GEN_OP_CACHE_FLUSH &&
+            op != GEN_OP_TLB_FLUSH) {
+            continue;
+        }
+        if (!new_tmpl->insn_synthetic_ea) {
+            new_tmpl->insn_synthetic_ea =
+                g_new0(SyntheticEAInfo, canonical_n_insns);
+        }
+        decode_synthetic_ea(&insn_info[i], op,
+                            new_tmpl->insn_pcs[i],
+                            new_tmpl->insn_sizes[i],
+                            &new_tmpl->insn_synthetic_ea[i]);
+    }
+    if (!new_tmpl->insn_synthetic_ea) {
+        return;
+    }
+    /* Allocate the udata once (persistent template); on a dedup reuse
+     * re-register the callbacks against the existing refs. */
+    if (!new_tmpl->insn_synth_ea_refs) {
+        SynthEAInsnRef *synth_refs = g_new0(SynthEAInsnRef, canonical_n_insns);
+        new_tmpl->insn_synth_ea_refs = synth_refs;
+        for (uint32_t i = 0; i < canonical_n_insns; i++) {
+            synth_refs[i].tb_tmpl = new_tmpl;
+            synth_refs[i].insn_index = i;
+        }
+    }
+    SynthEAInsnRef *synth_refs = (SynthEAInsnRef *)new_tmpl->insn_synth_ea_refs;
+    for (size_t i = 0; i < raw_n_insns; i++) {
+        if (!canonical_first[i]) {
+            continue;
+        }
+        uint32_t ci = canonical_index[i];
+        if (!new_tmpl->insn_synthetic_ea[ci].has_addr) {
+            continue;
+        }
+        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+        qemu_plugin_register_vcpu_insn_exec_cond_cb(
+            insn, vcpu_insn_synth_ea_cb,
+            QEMU_PLUGIN_CB_R_REGS,
+            QEMU_PLUGIN_COND_GE, g_scoreboard.is_active, 1,
+            &synth_refs[ci]);
+    }
+}
+
 static void tb_arm_new_template_cbs(struct qemu_plugin_tb *tb,
                                     BBTemplate *new_tmpl,
                                     const qemu_plugin_insn_info *insn_info,
@@ -1840,127 +1978,10 @@ static void tb_arm_new_template_cbs(struct qemu_plugin_tb *tb,
                                     const bool *canonical_first,
                                     uint32_t canonical_n_insns)
 {
-    if ((enable_reg_data || enable_wp_reg_data) && new_tmpl &&
-        new_tmpl->insn_reg_names) {
-        /* The RegSnapInsnRef udata array lives in the (persistent)
-         * template and is allocated once; on a dedup reuse it already
-         * exists and we only re-register the QEMU callbacks below against
-         * it (a re-translation must re-arm the JIT-level callbacks even
-         * though the udata is unchanged). */
-        if (!new_tmpl->insn_snap_refs) {
-            RegSnapInsnRef *refs = g_new0(RegSnapInsnRef, canonical_n_insns);
-            new_tmpl->insn_snap_refs = refs;
-            for (uint32_t i = 0; i < canonical_n_insns; i++) {
-                refs[i].tb_tmpl = new_tmpl;
-                refs[i].insn_index = i;
-            }
-        }
-        RegSnapInsnRef *refs = (RegSnapInsnRef *)new_tmpl->insn_snap_refs;
-        /*
-         * Post-exec dst capture: register the snap cb on raw insn
-         * i (canonical_first && ci > 0) pointing at ci-1.  Firing
-         * pre-exec of ci means ci-1 just completed, so its dst
-         * registers hold post-exec values.  The TB's last
-         * canonical insn is captured at the next TB's
-         * vcpu_tb_exec ("Tail-insn dst snap").
-         *
-         * Delay-slot tail: on MIPS (and similar ISAs) a true BB ends
-         * with a [branch, delay-slot] pair kept in true execution
-         * order — branch at canonical[n-2], delay slot at
-         * canonical[n-1].  The branch's PC-dst (REG_IP) needs the
-         * goto_tb override that only snap_prev_tail_dsts can supply
-         * (it knows the successor PC), so DEFER the branch's snap to
-         * the next TB rather than capturing it here at the delay
-         * slot's pre-exec hook.  Detect the pair by branch_type and
-         * skip the cb whose ci-1 is the branch (ci == n-1);
-         * snap_prev_tail_dsts then captures both canonical[n-2]
-         * (branch, with REG_IP override) and canonical[n-1] (delay
-         * slot) at the right time. */
-        bool delay_slot_tail = canonical_n_insns >= 2
-            && new_tmpl->insn_fields[canonical_n_insns - 2].branch_type
-                 != BRANCH_NONE
-            && new_tmpl->insn_fields[canonical_n_insns - 1].branch_type
-                 == BRANCH_NONE;
-        for (size_t i = 0; i < raw_n_insns; i++) {
-            if (!canonical_first[i]) {
-                continue;
-            }
-            uint32_t ci = canonical_index[i];
-            if (ci == 0) {
-                continue;  /* no predecessor canonical insn in this TB */
-            }
-            if (delay_slot_tail && ci == canonical_n_insns - 1) {
-                /* The cb HERE would capture canonical[n-2] (the
-                 * branch); defer it to snap_prev_tail_dsts so the
-                 * branch's REG_IP dst gets the goto_tb successor
-                 * override. */
-                continue;
-            }
-            struct qemu_plugin_insn *insn =
-                qemu_plugin_tb_get_insn(tb, i);
-            /* Gate on the is_active scoreboard slot so the callback
-             * skips entirely between segments via a JIT-emitted
-             * check — no plugin-side tb_flush needed at segment
-             * boundaries.  Translations cached from any prior
-             * segment continue to fire harmlessly: the cond_cb
-             * predicate is false outside segments and the JIT
-             * skips the callback. */
-            qemu_plugin_register_vcpu_insn_exec_cond_cb(
-                insn, vcpu_insn_reg_snap_cb,
-                QEMU_PLUGIN_CB_R_REGS,
-                QEMU_PLUGIN_COND_GE, g_scoreboard.is_active, 1,
-                &refs[ci - 1]);
-        }
-    }
-
-    if (new_tmpl) {
-        SynthEAInsnRef *synth_refs = nullptr;
-        for (uint32_t i = 0; i < canonical_n_insns; i++) {
-            uint8_t op = new_tmpl->insn_fields[i].opcode;
-            if (op != GEN_OP_PREFETCH &&
-                op != GEN_OP_CACHE_FLUSH &&
-                op != GEN_OP_TLB_FLUSH) {
-                continue;
-            }
-            if (!new_tmpl->insn_synthetic_ea) {
-                new_tmpl->insn_synthetic_ea =
-                    g_new0(SyntheticEAInfo, canonical_n_insns);
-            }
-            decode_synthetic_ea(&insn_info[i], op,
-                                new_tmpl->insn_pcs[i],
-                                new_tmpl->insn_sizes[i],
-                                &new_tmpl->insn_synthetic_ea[i]);
-        }
-        if (new_tmpl->insn_synthetic_ea) {
-            /* Allocate the udata once (persistent template); on a dedup
-             * reuse re-register the callbacks against the existing refs. */
-            if (!new_tmpl->insn_synth_ea_refs) {
-                synth_refs = g_new0(SynthEAInsnRef, canonical_n_insns);
-                new_tmpl->insn_synth_ea_refs = synth_refs;
-                for (uint32_t i = 0; i < canonical_n_insns; i++) {
-                    synth_refs[i].tb_tmpl = new_tmpl;
-                    synth_refs[i].insn_index = i;
-                }
-            }
-            synth_refs = (SynthEAInsnRef *)new_tmpl->insn_synth_ea_refs;
-            for (size_t i = 0; i < raw_n_insns; i++) {
-                if (!canonical_first[i]) {
-                    continue;
-                }
-                uint32_t ci = canonical_index[i];
-                if (!new_tmpl->insn_synthetic_ea[ci].has_addr) {
-                    continue;
-                }
-                struct qemu_plugin_insn *insn =
-                    qemu_plugin_tb_get_insn(tb, i);
-                qemu_plugin_register_vcpu_insn_exec_cond_cb(
-                    insn, vcpu_insn_synth_ea_cb,
-                    QEMU_PLUGIN_CB_R_REGS,
-                    QEMU_PLUGIN_COND_GE, g_scoreboard.is_active, 1,
-                    &synth_refs[ci]);
-            }
-        }
-    }
+    arm_reg_snap_cbs(tb, new_tmpl, raw_n_insns, canonical_index,
+                     canonical_first, canonical_n_insns);
+    arm_synth_ea_cbs(tb, new_tmpl, insn_info, raw_n_insns, canonical_index,
+                     canonical_first, canonical_n_insns);
 }
 
 /*

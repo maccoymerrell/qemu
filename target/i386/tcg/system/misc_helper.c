@@ -27,38 +27,69 @@
 #include "tcg/helper-tcg.h"
 #include "hw/i386/apic.h"
 
+/*
+ * Wrong-path (plugin speculative) port I/O must not reach devices — an
+ * `out` to a shutdown/reset/IRQ port or an `in` that pops a FIFO would be a
+ * real side effect on the discarded path.  Port I/O bypasses the cputlb
+ * spec store buffer (it goes straight to address_space_io), so it is
+ * sandboxed here directly: writes are dropped, reads return 0.
+ */
+#ifdef CONFIG_PLUGIN
+#define CST_SPEC_PORT_IO(env) (env_cpu(env)->plugin_spec_mode)
+#else
+#define CST_SPEC_PORT_IO(env) (false)
+#endif
+
 void helper_outb(CPUX86State *env, uint32_t port, uint32_t data)
 {
+    if (CST_SPEC_PORT_IO(env)) {
+        return;
+    }
     address_space_stb(&address_space_io, port, data,
                       cpu_get_mem_attrs(env), NULL);
 }
 
 target_ulong helper_inb(CPUX86State *env, uint32_t port)
 {
+    if (CST_SPEC_PORT_IO(env)) {
+        return 0;
+    }
     return address_space_ldub(&address_space_io, port,
                               cpu_get_mem_attrs(env), NULL);
 }
 
 void helper_outw(CPUX86State *env, uint32_t port, uint32_t data)
 {
+    if (CST_SPEC_PORT_IO(env)) {
+        return;
+    }
     address_space_stw(&address_space_io, port, data,
                       cpu_get_mem_attrs(env), NULL);
 }
 
 target_ulong helper_inw(CPUX86State *env, uint32_t port)
 {
+    if (CST_SPEC_PORT_IO(env)) {
+        return 0;
+    }
     return address_space_lduw(&address_space_io, port,
                               cpu_get_mem_attrs(env), NULL);
 }
 
 void helper_outl(CPUX86State *env, uint32_t port, uint32_t data)
 {
+    if (CST_SPEC_PORT_IO(env)) {
+        return;
+    }
     address_space_stl(&address_space_io, port, data,
                       cpu_get_mem_attrs(env), NULL);
 }
 
 target_ulong helper_inl(CPUX86State *env, uint32_t port)
 {
+    if (CST_SPEC_PORT_IO(env)) {
+        return 0;
+    }
     return address_space_ldl(&address_space_io, port,
                              cpu_get_mem_attrs(env), NULL);
 }
@@ -108,6 +139,19 @@ void helper_write_crN(CPUX86State *env, int reg, target_ulong t0)
         cpu_x86_update_cr4(env, t0);
         break;
     case 8:
+#ifdef CONFIG_PLUGIN
+        /*
+         * Wrong-path (speculative): cr8 is the APIC task-priority register.
+         * Apply the env-shadowed V_TPR bits (rolled back at walk end so the
+         * speculative path stays self-consistent) but suppress the real APIC
+         * device poke and the global VIRQ interrupt-request mutation — both
+         * would persist past the discarded walk.
+         */
+        if (env_cpu(env)->plugin_spec_mode) {
+            env->int_ctl = (env->int_ctl & ~V_TPR_MASK) | (t0 & V_TPR_MASK);
+            break;
+        }
+#endif
         if (!(env->hflags2 & HF2_VINTR_MASK)) {
             bql_lock();
             cpu_set_apic_tpr(env_archcpu(env)->apic_state, t0);
@@ -154,6 +198,12 @@ void helper_wrmsr(CPUX86State *env)
         if (val & MSR_IA32_APICBASE_RESERVED) {
             goto error;
         }
+#ifdef CONFIG_PLUGIN
+        /* Wrong-path: do not relocate/reprogram the real APIC device. */
+        if (cs->plugin_spec_mode) {
+            break;
+        }
+#endif
 
         ret = cpu_set_apic_base(env_archcpu(env)->apic_state, val);
         if (ret < 0) {
@@ -297,6 +347,16 @@ void helper_wrmsr(CPUX86State *env)
         int ret;
         int index = (uint32_t)env->regs[R_ECX] - MSR_APIC_START;
 
+#ifdef CONFIG_PLUGIN
+        /*
+         * Wrong-path: x2APIC register writes reach the real APIC device —
+         * ICR writes can fire IPIs, LVT/timer writes reprogram it.  Drop
+         * the write on the discarded path.
+         */
+        if (cs->plugin_spec_mode) {
+            break;
+        }
+#endif
         bql_lock();
         ret = apic_msr_write(index, val);
         bql_unlock();
@@ -509,6 +569,19 @@ G_NORETURN void helper_hlt(CPUX86State *env)
 {
     CPUState *cs = env_cpu(env);
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative) hlt must not actually halt the vCPU: cs->halted
+     * would persist past the discarded walk and stall the VM.  Abort the
+     * wrong-path chain instead — cpu_loop_exit lands in cpu_plugin_exec_tb's
+     * spec-exec guard (tb_ok=false -> CST_WP_EVENT_FAULT + poison) — leaving
+     * cs->halted / exception_index untouched.
+     */
+    if (cs->plugin_spec_mode) {
+        cpu_loop_exit(cs);
+    }
+#endif
+
     do_end_instruction(env);
     cs->halted = 1;
     cs->exception_index = EXCP_HLT;
@@ -527,6 +600,14 @@ void helper_monitor(CPUX86State *env, target_ulong ptr)
 G_NORETURN void helper_mwait(CPUX86State *env, int next_eip_addend)
 {
     CPUState *cs = env_cpu(env);
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: don't halt the vCPU (cs->halted would stall the VM past
+     * the discarded walk).  Abort the speculative walk, like helper_hlt. */
+    if (cs->plugin_spec_mode) {
+        cpu_loop_exit(cs);
+    }
+#endif
 
     if ((uint32_t)env->regs[R_ECX] != 0) {
         raise_exception_ra(env, EXCP0D_GPF, GETPC());

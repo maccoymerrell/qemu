@@ -819,6 +819,17 @@ void riscv_cpu_interrupt(CPURISCVState *env)
     uint64_t gein, vsgein = 0, vstip = 0, irqf = 0;
     CPUState *cs = env_cpu(env);
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): don't raise/lower the real CPU interrupt
+     * line.  A speculative CSR write to mip/sip/mie still updates env->mip
+     * (rolled back at walk end), but the global interrupt-request side
+     * effect must not escape the discarded path.
+     */
+    if (cs->plugin_spec_mode) {
+        return;
+    }
+#endif
     BQL_LOCK_GUARD();
 
     if (env->virt_enabled) {
@@ -1633,6 +1644,14 @@ static int get_physical_address(CPURISCVState *env, hwaddr *physical,
      * Otherwise raise an exception if necessary.
      */
     if (adue) {
+#ifdef CONFIG_PLUGIN
+        /*
+         * Wrong-path (speculative) walk: don't set/persist A/D in the guest
+         * PTE.  Leaving updated_pte == pte skips the writeback block below;
+         * the translation still succeeds, the bits just aren't persisted.
+         */
+        if (!cs->plugin_spec_mode)
+#endif
         updated_pte |= PTE_A | (access_type == MMU_DATA_STORE ? PTE_D : 0);
     } else if (!(pte & PTE_A) ||
                (access_type == MMU_DATA_STORE && !(pte & PTE_D))) {

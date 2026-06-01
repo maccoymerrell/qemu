@@ -735,6 +735,17 @@ static uint64_t arm_casq_ptw(CPUARMState *env, uint64_t old_val,
                              uint64_t new_val, S1Translate *ptw,
                              ARMMMUFaultInfo *fi)
 {
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative) page walk: don't persist the AF/dirty
+     * update to the guest descriptor.  Return old_val so the caller
+     * proceeds with the in-memory descriptor unchanged; the access fault,
+     * if any, is already suppressed in tlb_fill_align().
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return old_val;
+    }
+#endif
 #if defined(TARGET_AARCH64) && defined(CONFIG_TCG)
     uint64_t cur_val;
     void *host = ptw->out_host;

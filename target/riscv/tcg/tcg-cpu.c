@@ -133,11 +133,27 @@ static void riscv_restore_state_to_opc(CPUState *cs,
     env->excp_uw2 = data[2];
 }
 
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+static void riscv_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
+                                   bool *mmu_on)
+{
+    CPURISCVState *env = cpu_env(cs);
+    *priv = env->priv;     /* PRV_U(0) = user, PRV_S(1)/PRV_M(3) privileged */
+    *asid = env->satp;     /* SATP: page-table base + ASID */
+    /* Translation active iff not M-mode and SATP selects a paging mode
+     * (SATP != 0 ⇒ MODE field non-Bare). */
+    *mmu_on = (env->priv != PRV_M) && (env->satp != 0);
+}
+#endif
+
 static const TCGCPUOps riscv_tcg_ops = {
     .initialize = riscv_translate_init,
     .translate_code = riscv_translate_code,
     .synchronize_from_tb = riscv_cpu_synchronize_from_tb,
     .restore_state_to_opc = riscv_restore_state_to_opc,
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    .get_plugin_state = riscv_get_plugin_state,
+#endif
 
 #ifndef CONFIG_USER_ONLY
     .tlb_fill = riscv_cpu_tlb_fill,

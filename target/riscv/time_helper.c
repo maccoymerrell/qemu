@@ -44,6 +44,17 @@ void riscv_timer_write_timecmp(CPURISCVState *env, QEMUTimer *timer,
                                uint64_t timecmp, uint64_t delta,
                                uint32_t timer_irq)
 {
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): a speculative stimecmp/vstimecmp CSR write
+     * already updated env (rolled back at walk end); don't reprogram the
+     * real guest timer (timer_mod) or raise its interrupt on the discarded
+     * path.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
     uint64_t diff, ns_diff, next;
     RISCVAclintMTimerState *mtimer = env->rdtime_fn_arg;
     uint32_t timebase_freq = mtimer->timebase_freq;

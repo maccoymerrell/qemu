@@ -152,6 +152,23 @@ static inline bool virtual_gif_set(CPUX86State *env)
     return !virtual_gif_enabled(env) || (env->int_ctl & V_GIF_MASK);
 }
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Wrong-path (speculative): the SVM/virtualization helpers write host save
+ * state to guest *physical* memory (x86_st*_phys, bypassing the sandboxed
+ * softmmu store path) and mutate complex global VMM state.  None of that can
+ * be rolled back, so abort the speculative walk on encountering one — caught
+ * by cpu_plugin_exec_tb's guard (tb_ok=false), exactly like helper_hlt.
+ */
+#define CST_SPEC_ABORT_VMM(env) do {                       \
+    if (env_cpu(env)->plugin_spec_mode) {                  \
+        cpu_loop_exit(env_cpu(env));                       \
+    }                                                      \
+} while (0)
+#else
+#define CST_SPEC_ABORT_VMM(env) ((void)0)
+#endif
+
 void helper_vmrun(CPUX86State *env, int aflag, int next_eip_addend)
 {
     CPUState *cs = env_cpu(env);
@@ -159,6 +176,8 @@ void helper_vmrun(CPUX86State *env, int aflag, int next_eip_addend)
     target_ulong addr;
     uint64_t nested_ctl;
     uint32_t event_inj;
+
+    CST_SPEC_ABORT_VMM(env);
     uint32_t asid;
     uint64_t new_cr0;
     uint64_t new_cr3;
@@ -479,6 +498,8 @@ void helper_vmload(CPUX86State *env, int aflag)
     int mmu_idx = MMU_PHYS_IDX;
     target_ulong addr;
 
+    CST_SPEC_ABORT_VMM(env);
+
     if (aflag == 2) {
         addr = env->regs[R_EAX];
     } else {
@@ -539,6 +560,8 @@ void helper_vmsave(CPUX86State *env, int aflag)
 {
     int mmu_idx = MMU_PHYS_IDX;
     target_ulong addr;
+
+    CST_SPEC_ABORT_VMM(env);
 
     if (aflag == 2) {
         addr = env->regs[R_EAX];

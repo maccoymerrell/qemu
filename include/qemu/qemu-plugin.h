@@ -1382,4 +1382,42 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state);
 QEMU_PLUGIN_API
 void qemu_plugin_spec_mode_end(void);
 
+/**
+ * qemu_plugin_get_priv_level() - current privilege level of the executing vCPU
+ *
+ * Returns a normalized privilege ordinal: 0 = user / least privileged,
+ * larger = more privileged (kernel/supervisor/hypervisor).  In *-linux-user
+ * this is always 0.  Lets a plugin tell user-space execution from kernel /
+ * system execution (e.g. to count only the target program's user-space
+ * instructions, or stamp a kernel-vs-user bit).  Must be called from a vCPU
+ * context (e.g. an exec callback).
+ */
+QEMU_PLUGIN_API
+int qemu_plugin_get_priv_level(void);
+
+/**
+ * qemu_plugin_get_addr_space_id() - current address-space id of the vCPU
+ *
+ * Returns the architectural identifier of the current address space — the
+ * page-table base / ASID register (x86 CR3, RISC-V SATP, Arm TTBR, MIPS
+ * ASID).  Unique per process address space, so a plugin can pin tracing to a
+ * single target process.  Returns 0 in *-linux-user (one address space).
+ * Must be called from a vCPU context.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_get_addr_space_id(void);
+
+/**
+ * qemu_plugin_paging_enabled() - whether the guest MMU / paging is enabled
+ *
+ * Returns true when the executing vCPU's MMU / paging translation is active
+ * (x86 CR0.PG, Arm SCTLR.M, RISC-V SATP!=Bare; MIPS always has a TLB so
+ * reports true), false otherwise.  Always true in *-linux-user.  A plugin
+ * that speculatively executes wrong-path code relies on the MMU to fault on
+ * fetches into non-code; with paging disabled there is no such bound, so the
+ * plugin should refrain from speculating.  Must be called from a vCPU context.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_paging_enabled(void);
+
 #endif /* QEMU_QEMU_PLUGIN_H */

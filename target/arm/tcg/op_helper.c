@@ -384,6 +384,13 @@ void HELPER(wfi)(CPUARMState *env, uint32_t insn_len)
     uint32_t excp;
     int target_el = check_wfx_trap(env, false, &excp);
 
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: don't halt the vCPU; abort the speculative walk. */
+    if (cs->plugin_spec_mode) {
+        cpu_loop_exit(cs);
+    }
+#endif
+
     if (cpu_has_work(cs)) {
         /* Don't bother to go into our "low power state" if
          * we would just wake up immediately.
@@ -425,6 +432,13 @@ void HELPER(wfit)(CPUARMState *env, uint64_t timeout)
     CPUState *cs = env_cpu(env);
     uint32_t excp;
     int target_el = check_wfx_trap(env, false, &excp);
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: don't halt the vCPU; abort the speculative walk. */
+    if (cs->plugin_spec_mode) {
+        cpu_loop_exit(cs);
+    }
+#endif
     /* The WFIT should time out when CNTVCT_EL0 >= the specified value. */
     uint64_t cntval = gt_get_countervalue(env);
     /*
@@ -971,6 +985,19 @@ void HELPER(set_cp_reg)(CPUARMState *env, const void *rip, uint32_t value)
     const ARMCPRegInfo *ri = rip;
 
     if (ri->type & ARM_CP_IO) {
+#ifdef CONFIG_PLUGIN
+        /*
+         * Wrong-path (speculative): ARM_CP_IO marks system registers whose
+         * write has a device side effect (GIC ICC_*, generic timer, …) —
+         * exactly what must not escape the discarded path.  Suppress the
+         * writefn; the register's CPUArchState backing (if any) is rolled
+         * back at walk end regardless, so dropping the speculative update is
+         * harmless.  Non-ARM_CP_IO regs are plain CPU state and still apply.
+         */
+        if (env_cpu(env)->plugin_spec_mode) {
+            return;
+        }
+#endif
         bql_lock();
         ri->writefn(env, ri, value);
         bql_unlock();
@@ -1000,6 +1027,13 @@ void HELPER(set_cp_reg64)(CPUARMState *env, const void *rip, uint64_t value)
     const ARMCPRegInfo *ri = rip;
 
     if (ri->type & ARM_CP_IO) {
+#ifdef CONFIG_PLUGIN
+        /* Wrong-path: suppress device side effect of ARM_CP_IO writes.
+         * See HELPER(set_cp_reg). */
+        if (env_cpu(env)->plugin_spec_mode) {
+            return;
+        }
+#endif
         bql_lock();
         ri->writefn(env, ri, value);
         bql_unlock();

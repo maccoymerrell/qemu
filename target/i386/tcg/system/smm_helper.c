@@ -199,6 +199,17 @@ void helper_rsm(CPUX86State *env)
     int i, offset;
     uint32_t val;
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): RSM resumes from SMM, reloading complete CPU
+     * state from SMRAM and leaving SMM (cpu_smm_update / global mode change).
+     * Not sandboxable; abort the speculative walk (caught by the WP guard).
+     */
+    if (cs->plugin_spec_mode) {
+        cpu_loop_exit(cs);
+    }
+#endif
+
     sm_state = env->smbase + 0x8000;
 #ifdef TARGET_X86_64
     cpu_load_efer(env, x86_ldq_phys(cs, sm_state + 0x7ed0));

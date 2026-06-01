@@ -2668,12 +2668,27 @@ static const struct SysemuCPUOps arm_sysemu_ops = {
 #endif
 
 #ifdef CONFIG_TCG
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+static void arm_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
+                                 bool *mmu_on)
+{
+    CPUARMState *env = cpu_env(cs);
+    *priv = arm_current_el(env);          /* EL0 = user, EL1+ = privileged */
+    *asid = env->cp15.ttbr0_el[1];        /* TTBR0_EL1: user page-table base */
+    /* MMU active iff the current EL's SCTLR.M is set. */
+    *mmu_on = (arm_sctlr(env, arm_current_el(env)) & SCTLR_M) != 0;
+}
+#endif
+
 static const TCGCPUOps arm_tcg_ops = {
     .initialize = arm_translate_init,
     .translate_code = arm_translate_code,
     .synchronize_from_tb = arm_cpu_synchronize_from_tb,
     .debug_excp_handler = arm_debug_excp_handler,
     .restore_state_to_opc = arm_restore_state_to_opc,
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    .get_plugin_state = arm_get_plugin_state,
+#endif
 
 #ifdef CONFIG_USER_ONLY
     .record_sigsegv = arm_cpu_record_sigsegv,

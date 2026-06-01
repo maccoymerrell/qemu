@@ -67,6 +67,28 @@ struct TCGCPUOps {
     /** @debug_excp_handler: Callback for handling debug exceptions */
     void (*debug_excp_handler)(CPUState *cpu);
 
+#ifdef CONFIG_PLUGIN
+    /**
+     * @get_plugin_state: report current privilege + address space to plugins
+     *
+     * Optional.  Fills @priv with a normalized privilege ordinal
+     * (0 = user / least privileged, larger = more privileged) and @asid with
+     * the current address-space identifier (x86 CR3, RISC-V SATP, Arm TTBR,
+     * MIPS ASID).  Lets a plugin filter by process / privilege in system
+     * mode (and read priv=0 in user mode); see qemu_plugin_get_priv_level()
+     * and qemu_plugin_get_addr_space_id().
+     *
+     * Also fills @mmu_on with whether the guest's MMU / paging is currently
+     * enabled (x86 CR0.PG, Arm SCTLR.M, RISC-V SATP!=Bare; MIPS always has a
+     * TLB so reports true).  A plugin's speculative (wrong-path) execution
+     * relies on the MMU to fault on fetches into non-code; with paging off
+     * there is no such bound, so the plugin must not speculate.  See
+     * qemu_plugin_paging_enabled().
+     */
+    void (*get_plugin_state)(CPUState *cpu, int *priv, uint64_t *asid,
+                             bool *mmu_on);
+#endif
+
 #ifdef CONFIG_USER_ONLY
     /**
      * @fake_user_interrupt: Callback for 'fake exception' handling.

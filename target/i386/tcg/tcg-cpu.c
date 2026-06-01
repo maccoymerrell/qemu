@@ -107,6 +107,22 @@ static bool x86_debug_check_breakpoint(CPUState *cs)
 
 #include "accel/tcg/cpu-ops.h"
 
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+static void x86_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
+                                 bool *mmu_on)
+{
+    CPUX86State *env = cpu_env(cs);
+    /* CPL: 0 = kernel … 3 = user.  Normalize so 0 = user (least
+     * privileged), larger = more privileged. */
+    int cpl = (env->hflags & HF_CPL_MASK) >> HF_CPL_SHIFT;
+    *priv = 3 - cpl;
+    /* CR3 = current page-table base / address-space id. */
+    *asid = env->cr[3];
+    /* Paging active iff CR0.PG; off in real mode / early boot. */
+    *mmu_on = (env->cr[0] & CR0_PG_MASK) != 0;
+}
+#endif
+
 static const TCGCPUOps x86_tcg_ops = {
     .initialize = tcg_x86_init,
     .translate_code = x86_translate_code,
@@ -114,6 +130,9 @@ static const TCGCPUOps x86_tcg_ops = {
     .restore_state_to_opc = x86_restore_state_to_opc,
     .cpu_exec_enter = x86_cpu_exec_enter,
     .cpu_exec_exit = x86_cpu_exec_exit,
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    .get_plugin_state = x86_get_plugin_state,
+#endif
 #ifdef CONFIG_USER_ONLY
     .fake_user_interrupt = x86_cpu_do_interrupt,
     .record_sigsegv = x86_cpu_record_sigsegv,

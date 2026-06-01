@@ -53,6 +53,12 @@ static bool mips_vp_is_wfi(MIPSCPU *c)
 
 static inline void mips_vpe_wake(MIPSCPU *c)
 {
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: don't poke another VPE's global interrupt/run state. */
+    if (CPU(c)->plugin_spec_mode) {
+        return;
+    }
+#endif
     /*
      * Don't set ->halted = 0 directly, let it be done via cpu_has_work
      * because there might be other conditions that state that c should
@@ -67,6 +73,12 @@ static inline void mips_vpe_sleep(MIPSCPU *cpu)
 {
     CPUState *cs = CPU(cpu);
 
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: don't halt the VPE or clear its wake request. */
+    if (cs->plugin_spec_mode) {
+        return;
+    }
+#endif
     /*
      * The VPE was shut off, really go to bed.
      * Reset any old _WAKE requests.
@@ -1061,6 +1073,12 @@ void helper_mtc0_hwrena(CPUMIPSState *env, target_ulong arg1)
 
 void helper_mtc0_count(CPUMIPSState *env, target_ulong arg1)
 {
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: don't reprogram the guest timer device. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
     cpu_mips_store_count(env, arg1);
 }
 
@@ -1110,6 +1128,12 @@ void helper_mttc0_entryhi(CPUMIPSState *env, target_ulong arg1)
 
 void helper_mtc0_compare(CPUMIPSState *env, target_ulong arg1)
 {
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: don't reprogram the guest timer / clear its interrupt. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
     cpu_mips_store_compare(env, arg1);
 }
 

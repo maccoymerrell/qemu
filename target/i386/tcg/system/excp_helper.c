@@ -126,6 +126,18 @@ static inline bool ptw_setl(const PTETranslate *in, uint32_t old, uint32_t set)
 {
     if (set & ~old) {
         uint32_t new = old | set;
+#ifdef CONFIG_PLUGIN
+        /*
+         * Wrong-path (speculative) page walks must not perturb guest page
+         * tables: skip the A/D-bit (PG_ACCESSED/PG_DIRTY) writeback.  The
+         * translation proceeds with the in-memory PTE; the bits are simply
+         * not persisted.  The fault itself is already suppressed in
+         * tlb_fill_align().
+         */
+        if (env_cpu(in->env)->plugin_spec_mode) {
+            return true;
+        }
+#endif
         if (likely(in->haddr)) {
             old = cpu_to_le32(old);
             new = cpu_to_le32(new);

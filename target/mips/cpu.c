@@ -548,11 +548,30 @@ static const Property mips_cpu_properties[] = {
 
 #ifdef CONFIG_TCG
 #include "accel/tcg/cpu-ops.h"
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+static void mips_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
+                                  bool *mmu_on)
+{
+    CPUMIPSState *env = cpu_env(cs);
+    /* KSU: 0 = kernel, 1 = supervisor, 2 (MIPS_HFLAG_UM) = user.
+     * Normalize so 0 = user (least privileged), larger = more privileged. */
+    int ksu = env->hflags & MIPS_HFLAG_KSU;
+    *priv = MIPS_HFLAG_UM - ksu;
+    *asid = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+    /* MIPS always translates through the TLB (mapped segments fault on a
+     * TLB miss); there is no global paging-disable, so report on. */
+    *mmu_on = true;
+}
+#endif
+
 static const TCGCPUOps mips_tcg_ops = {
     .initialize = mips_tcg_init,
     .translate_code = mips_translate_code,
     .synchronize_from_tb = mips_cpu_synchronize_from_tb,
     .restore_state_to_opc = mips_restore_state_to_opc,
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    .get_plugin_state = mips_get_plugin_state,
+#endif
 
 #if !defined(CONFIG_USER_ONLY)
     .tlb_fill = mips_cpu_tlb_fill,

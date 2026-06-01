@@ -40,6 +40,7 @@
 #include "qemu/plugin.h"
 #include "qemu/log.h"
 #include "tcg/tcg.h"
+#include "accel/tcg/cpu-ops.h"
 #include "hw/core/cpu.h"
 #include "exec/gdbstub.h"
 #include "exec/plugin-spec.h"
@@ -548,6 +549,16 @@ int qemu_plugin_write_register(struct qemu_plugin_register *reg,
 struct qemu_plugin_cpu_state {
     void *arch_state;       /* Raw copy of CPUArchState execution fields */
     size_t arch_state_size; /* offsetof(CPUArchState, end_reset_fields) */
+    /*
+     * A few CPUState (not CPUArchState) execution fields that a wrong-path
+     * walk can dirty and that the arch_state copy above does NOT cover.
+     * Without restoring these, a speculative exception/halt leaks to the
+     * correct path: the main loop then delivers a spurious exception whose
+     * delivery faults against the restored arch state and double/triple-
+     * faults the guest (a real reset in system mode).
+     */
+    int exception_index;
+    uint32_t halted;
 };
 
 struct qemu_plugin_cpu_state *qemu_plugin_cpu_state_save(void)
@@ -559,6 +570,8 @@ struct qemu_plugin_cpu_state *qemu_plugin_cpu_state_save(void)
     state->arch_state_size = cpu_plugin_arch_state_size();
     state->arch_state = g_memdup2((void *)(current_cpu + 1),
                                   state->arch_state_size);
+    state->exception_index = current_cpu->exception_index;
+    state->halted = current_cpu->halted;
 
     return state;
 }
@@ -572,6 +585,8 @@ bool qemu_plugin_cpu_state_restore(struct qemu_plugin_cpu_state *state)
     }
 
     cpu_plugin_arch_state_restore(state->arch_state, state->arch_state_size);
+    current_cpu->exception_index = state->exception_index;
+    current_cpu->halted = state->halted;
     return true;
 }
 
@@ -596,6 +611,49 @@ uint64_t qemu_plugin_get_pc(void)
     g_assert(current_cpu);
     g_assert(current_cpu->cc->get_pc);
     return (uint64_t)current_cpu->cc->get_pc(current_cpu);
+}
+
+/* Fill (priv, asid, mmu_on) from the per-target hook; defaults
+ * (0, 0, true) when the target provides none (e.g. *-linux-user, where a
+ * process always has a valid address space, so "paging" is effectively
+ * on for the purpose of bounding speculative fetches). */
+static void plugin_cpu_state(int *priv, uint64_t *asid, bool *mmu_on)
+{
+    *priv = 0;
+    *asid = 0;
+    *mmu_on = true;
+    g_assert(current_cpu);
+    const TCGCPUOps *ops = current_cpu->cc->tcg_ops;
+    if (ops && ops->get_plugin_state) {
+        ops->get_plugin_state(current_cpu, priv, asid, mmu_on);
+    }
+}
+
+int qemu_plugin_get_priv_level(void)
+{
+    int priv;
+    uint64_t asid;
+    bool mmu_on;
+    plugin_cpu_state(&priv, &asid, &mmu_on);
+    return priv;
+}
+
+uint64_t qemu_plugin_get_addr_space_id(void)
+{
+    int priv;
+    uint64_t asid;
+    bool mmu_on;
+    plugin_cpu_state(&priv, &asid, &mmu_on);
+    return asid;
+}
+
+bool qemu_plugin_paging_enabled(void)
+{
+    int priv;
+    uint64_t asid;
+    bool mmu_on;
+    plugin_cpu_state(&priv, &asid, &mmu_on);
+    return mmu_on;
 }
 
 bool qemu_plugin_exec_inline_insn(void)

@@ -95,6 +95,23 @@ void raise_interrupt2(CPUX86State *env, int intno,
 {
     CPUState *cs = env_cpu(env);
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Plugin wrong-path (speculative) execution must not deliver a guest
+     * exception/interrupt.  On kernel code a speculative fault would nest via
+     * check_exception() into a double/triple fault -> qemu_system_reset_request
+     * and reset the VM, or vector into a handler whose side effects pollute
+     * the discarded path.  Abort the wrong-path chain at the first one:
+     * cpu_loop_exit lands in cpu_plugin_exec_tb's spec guard (tb_ok=false ->
+     * CST_WP_EVENT_FAULT + PC poison).  Paging faults are already aborted
+     * earlier in tlb_fill_align; this catches #GP/#UD/#DE/etc. before x86's
+     * synchronous double-fault escalation.
+     */
+    if (cs->plugin_spec_mode) {
+        cpu_loop_exit_restore(cs, retaddr);
+    }
+#endif
+
     if (!is_int) {
         cpu_svm_check_intercept_param(env, SVM_EXIT_EXCP_BASE + intno,
                                       error_code, retaddr);

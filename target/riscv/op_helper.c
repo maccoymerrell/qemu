@@ -529,6 +529,13 @@ void helper_wfi(CPURISCVState *env)
     bool prv_u = env->priv == PRV_U;
     bool prv_s = env->priv == PRV_S;
 
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: don't halt the vCPU; abort the speculative walk. */
+    if (cs->plugin_spec_mode) {
+        cpu_loop_exit(cs);
+    }
+#endif
+
     if (((prv_s || (!rvs && prv_u)) && get_field(env->mstatus, MSTATUS_TW)) ||
         (rvs && prv_u && !env->virt_enabled)) {
         riscv_raise_exception(env, RISCV_EXCP_ILLEGAL_INST, GETPC());

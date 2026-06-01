@@ -69,6 +69,14 @@ void helper_wait(CPUMIPSState *env)
 {
     CPUState *cs = env_cpu(env);
 
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: don't halt the vCPU or clear its wake request; abort the
+     * speculative walk (caught by cpu_plugin_exec_tb's guard). */
+    if (cs->plugin_spec_mode) {
+        cpu_loop_exit(cs);
+    }
+#endif
+
     cs->halted = 1;
     cpu_reset_interrupt(cs, CPU_INTERRUPT_WAKE);
     /*

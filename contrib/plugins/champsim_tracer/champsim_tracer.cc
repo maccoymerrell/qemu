@@ -1556,6 +1556,89 @@ static void vcpu_tb_check_budget(unsigned int cpu_index, void *udata)
     g_rec_mutex_unlock(&exec_lock);
 }
 
+/* A finalized true BB awaiting emission, with its terminal-branch
+ * classification already resolved.  Collected under data_lock; the actual
+ * emit happens later under exec_lock only. */
+struct PendingEmit {
+    BBTemplate *bb_tmpl;
+    uint64_t    branch_pc;
+    uint64_t    emit_current_pc;
+    uint64_t    wrong_target;
+};
+
+/*
+ * Walk the previous TB's fragment list up to the LAST EXECUTED fragment
+ * (identified by the scoreboard's @prev_start), fold each executed
+ * fragment into the CP true-BB chain, and collect every completed BB as a
+ * PendingEmit -- resolving its terminal-branch direction and wrong-path
+ * target here.  Intermediate fragments fell through by definition (a later
+ * fragment in the same TB ran), so their "next PC" is the successor
+ * fragment's start_pc; the last-executed fragment uses the scoreboard's
+ * @current_pc.  A trap mid-TB stops later fragments' stores from firing, so
+ * the walk naturally truncates at the trapping fragment.  Returns true if
+ * any BB finalized.  Caller holds exec_lock; this takes data_lock for the
+ * chain/cache mutations.
+ */
+static bool collect_finalized_bbs(unsigned int cpu_index,
+                                  BBTemplate *prev_tb_head,
+                                  uint64_t prev_start, uint64_t current_pc,
+                                  std::vector<PendingEmit> &pending_emits)
+{
+    g_mutex_lock(&data_lock);
+    bool any_finalize = false;
+
+    for (BBTemplate *frag = prev_tb_head; frag != nullptr;
+         frag = frag->next_tb_fragment) {
+        bool is_last_executed = (frag->start_pc == prev_start);
+
+        uint64_t frag_current_pc;
+        uint64_t frag_prev_ft = frag->fall_through_pc;
+        if (is_last_executed) {
+            frag_current_pc = current_pc;
+        } else if (frag->next_tb_fragment) {
+            frag_current_pc = frag->next_tb_fragment->start_pc;
+        } else {
+            /* No successor but not the last-executed: only the first TB of
+             * the trace (untouched scoreboard).  Use the scoreboard value. */
+            frag_current_pc = current_pc;
+        }
+        bool frag_branch_taken = (frag_current_pc != frag_prev_ft);
+
+        if (is_last_executed) {
+            snap_prev_tail_dsts(cpu_index, frag, frag_current_pc);
+        }
+        cp_chain_append(frag);
+        attribute_cp_insns(frag);
+
+        if (BBTemplate *bb_tmpl = cp_chain_finalize_if_complete()) {
+            PendingEmit pe = {bb_tmpl, 0, frag_current_pc, 0};
+            int br_idx = BBTemplateCache::template_branch_index(bb_tmpl);
+            if (br_idx >= 0) {
+                pe.branch_pc = bb_tmpl->insn_pcs[br_idx];
+                BranchRecord *br = observe_branch_transition(
+                    bb_tmpl, frag_branch_taken, pe.branch_pc,
+                    frag_prev_ft);
+                uint64_t taken_target = 0;
+                pe.wrong_target = resolve_wrong_target(
+                    bb_tmpl, br, frag_branch_taken,
+                    frag_current_pc, frag_prev_ft, &taken_target);
+                if (taken_target != 0) {
+                    bb_tmpl->taken_pc = taken_target;
+                }
+            }
+            pending_emits.push_back(pe);
+            any_finalize = true;
+        }
+
+        if (is_last_executed) {
+            break;
+        }
+    }
+
+    g_mutex_unlock(&data_lock);
+    return any_finalize;
+}
+
 static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 {
     /* This callback is registered via register_vcpu_tb_exec_cond_cb
@@ -1678,74 +1761,10 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
      * cases naturally truncate the walk at the trapping fragment, so
      * post-trap fragments never enter the chain.
      */
-    g_mutex_lock(&data_lock);
-
-    BBTemplate *prev_tb_head = prev_cp_tb_tmpl;
-    bool any_finalize = false;
-
-    struct PendingEmit {
-        BBTemplate *bb_tmpl;
-        uint64_t    branch_pc;
-        uint64_t    emit_current_pc;
-        uint64_t    wrong_target;
-    };
     std::vector<PendingEmit> pending_emits;
-
-    for (BBTemplate *frag = prev_tb_head; frag != nullptr;
-         frag = frag->next_tb_fragment) {
-        bool is_last_executed = (frag->start_pc == prev_start);
-
-        /* Per-fragment current_pc / prev_ft.  For intermediate
-         * fragments we know they fell through, so the "next PC" is
-         * the next fragment's start_pc (= this fragment's
-         * fall_through, by construction). */
-        uint64_t frag_current_pc;
-        uint64_t frag_prev_ft = frag->fall_through_pc;
-        if (is_last_executed) {
-            frag_current_pc = current_pc;
-        } else if (frag->next_tb_fragment) {
-            frag_current_pc = frag->next_tb_fragment->start_pc;
-        } else {
-            /* Should not happen: a fragment with no successor must be
-             * the last executed (or scoreboard hasn't been touched on
-             * this TB, e.g. first TB of the trace).  Conservatively
-             * use the scoreboard value. */
-            frag_current_pc = current_pc;
-        }
-        bool frag_branch_taken = (frag_current_pc != frag_prev_ft);
-
-        if (is_last_executed) {
-            snap_prev_tail_dsts(cpu_index, frag, frag_current_pc);
-        }
-        cp_chain_append(frag);
-        attribute_cp_insns(frag);
-
-        if (BBTemplate *bb_tmpl = cp_chain_finalize_if_complete()) {
-            PendingEmit pe = {bb_tmpl, 0, frag_current_pc, 0};
-            int br_idx = BBTemplateCache::template_branch_index(bb_tmpl);
-            if (br_idx >= 0) {
-                pe.branch_pc = bb_tmpl->insn_pcs[br_idx];
-                BranchRecord *br = observe_branch_transition(
-                    bb_tmpl, frag_branch_taken, pe.branch_pc,
-                    frag_prev_ft);
-                uint64_t taken_target = 0;
-                pe.wrong_target = resolve_wrong_target(
-                    bb_tmpl, br, frag_branch_taken,
-                    frag_current_pc, frag_prev_ft, &taken_target);
-                if (taken_target != 0) {
-                    bb_tmpl->taken_pc = taken_target;
-                }
-            }
-            pending_emits.push_back(pe);
-            any_finalize = true;
-        }
-
-        if (is_last_executed) {
-            break;
-        }
-    }
-
-    g_mutex_unlock(&data_lock);
+    bool any_finalize = collect_finalized_bbs(cpu_index, prev_cp_tb_tmpl,
+                                              prev_start, current_pc,
+                                              pending_emits);
 
     if (!any_finalize) {
         g_rec_mutex_unlock(&exec_lock);

@@ -174,28 +174,36 @@ def capture(build: Path, root: Path) -> int:
     GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
     manifest = {"cells": {}, "svg": {}, "excluded": {}}
     bad = 0
+    # Determinism pre-check: trace each cell N_DET times and only record a
+    # golden for cells whose hashes are identical across ALL runs.  Some
+    # workloads (notably flush-heavy ones: --tb-size 1, large coverage)
+    # are byte-nondeterministic at the trace level (tb_flush / window-edge
+    # boundary), and a 2-run check matches them by luck — so use enough
+    # runs to exclude the flaky cells reliably; the validator still covers
+    # them for correctness.
+    N_DET = 4
     for wl in WORKLOADS:
         name = wl["name"]
-        out_a = root / "a" / name
-        out_b = root / "b" / name
-        rc_a = run_all(build, wl, out_a)
-        rc_b = run_all(build, wl, out_b)
+        outs = [root / f"run{i}" / name for i in range(N_DET)]
+        rcs = [run_all(build, wl, o) for o in outs]
         for isa in wl["isas"]:
             cell = f"{name}:{isa}"
-            ca, cb = cst_path(out_a, isa), cst_path(out_b, isa)
-            if not ca.exists() or not cb.exists():
+            csts = [cst_path(o, isa) for o in outs]
+            if not all(c.exists() for c in csts):
                 manifest["excluded"][cell] = "trace not produced"
                 print(f"  EXCLUDE {cell}: trace missing"); bad += 1
                 continue
-            ha, hb = triple_hash(build, ca), triple_hash(build, cb)
-            if ha != hb:
-                diff = {k: (ha[k], hb[k]) for k in ha if ha[k] != hb[k]}
-                manifest["excluded"][cell] = f"nondeterministic: {diff}"
-                print(f"  EXCLUDE {cell}: NONDETERMINISTIC {list(diff)}"); bad += 1
+            hashes = [triple_hash(build, c) for c in csts]
+            if any(h != hashes[0] for h in hashes[1:]):
+                moved = sorted({k for h in hashes[1:] for k in h
+                                if h[k] != hashes[0][k]})
+                manifest["excluded"][cell] = f"nondeterministic over {N_DET} runs: {moved}"
+                print(f"  EXCLUDE {cell}: NONDETERMINISTIC {moved}"); bad += 1
                 continue
-            manifest["cells"][cell] = {**ha, "validate_rc": rc_a}
-            tag = "ok" if rc_a == 0 else f"VALIDATE_RC={rc_a}"
+            manifest["cells"][cell] = {**hashes[0], "validate_rc": rcs[0]}
+            tag = "ok" if rcs[0] == 0 else f"VALIDATE_RC={rcs[0]}"
             print(f"  {cell}: deterministic {tag}")
+        out_a = outs[0]
         # SVG goldens
         if name in SVG_WORKLOADS:
             cst = cst_path(out_a, SVG_ISA)

@@ -1215,7 +1215,20 @@ static void emit_finalized_bb(BodyStreamState *out_stream,
     g_cp_chain.reset();
 
     std::vector<WPBBEntry> wp_entries;
-    if (enable_wrong_path && wrong_target != 0) {
+    /*
+     * Wrong-path speculation relies on the guest MMU to fault on fetches
+     * into non-code (a speculative branch into data then page-faults, which
+     * aborts the walk).  With paging/MMU disabled — e.g. x86 early boot
+     * before CR0.PG — there is no such bound: a speculative branch into a
+     * zero/data page decodes as an endless run of no-branch instructions
+     * ("NOP sled to infinity"), folding into a true-BB that never seals and
+     * exhausting memory.  Don't speculate when the MMU is off.  Always true
+     * in linux-user (a process has a valid address space), so user-mode WP
+     * is unaffected; this only gates the system-mode pre-paging window,
+     * which is not a trace target anyway (the real target is a user process
+     * with paging on).
+     */
+    if (enable_wrong_path && wrong_target != 0 && qemu_plugin_paging_enabled()) {
         /* If a tb_flush unwinds a spec-mode exec_tb mid-WP, the chain is
          * truncated at that point: the WP simulation cannot be safely
          * resumed OR re-run across the flush (QEMU's flush + spec-mode
@@ -2988,6 +3001,15 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      * future register groups) uses it to cover every constituent
      * generic id, not just the leading one. */
     build_qemu_reg_reverse_index();
+
+    /* Pre-size the per-thread stats registry now, on the main thread,
+     * before any vCPU runs.  This pins its backing buffer in the main
+     * malloc arena so a teardown-time push_back (body_stream_finish on the
+     * main thread) never reallocates/frees a buffer owned by a vCPU
+     * thread's arena — the system-mode cross-arena teardown crash.  The
+     * bound covers any realistic vCPU + service-thread count; exceeding it
+     * merely falls back to the original lazy-growth path. */
+    stats_registry_reserve(1024);
 
     if (g_window_mode == PluginConfig::WIN_SYMBOL) {
         if (!start_symbol) {

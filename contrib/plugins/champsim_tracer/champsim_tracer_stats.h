@@ -94,6 +94,13 @@ static inline void stats_diff(Stats *out, const Stats &a, const Stats &b)
  */
 Stats &thread_stats_get();
 
+/* Pre-size the per-thread stats registry on the calling thread.  Call
+ * once from the main thread at plugin install (before vCPUs run) so the
+ * registry's backing buffer is allocated in the main malloc arena and
+ * never reallocated cross-thread at teardown.  See the definition in
+ * champsim_tracer_stats.cc for the system-mode rationale. */
+void stats_registry_reserve(size_t n);
+
 /* Hot-path callers write `g_stats.foo++` and the macro forwards to
  * the per-thread slot.  Read-side aggregation is via stats_snapshot()
  * below; never read `g_stats` directly when you need a process-wide

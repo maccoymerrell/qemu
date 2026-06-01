@@ -72,6 +72,34 @@ Stats &thread_stats_get()
     return *tls.slot;
 }
 
+void stats_registry_reserve(size_t n)
+{
+    /*
+     * Pre-size the registry on the calling thread (intended: the main
+     * thread, at plugin install, while still single-threaded).
+     *
+     * Why this matters in system emulation: the registry grows lazily as
+     * each thread first touches g_stats, so without this its backing
+     * buffer is first allocated by whichever *vCPU* thread traces first —
+     * landing in that thread's glibc per-thread malloc arena.  At
+     * plugin_exit the main thread bumps g_stats (body_stream_finish), which
+     * triggers a push_back; if that reallocates, the main thread relocates
+     * and frees a buffer owned by a (possibly exited) vCPU arena ->
+     * cross-arena free of a transient-arena chunk at teardown -> SIGSEGV /
+     * "corrupted double-linked list".  In linux-user there is only one
+     * thread/arena, so the bug never surfaced.
+     *
+     * Reserving once up front, on the main thread, keeps the buffer in the
+     * main arena and guarantees no reallocation for any realistic thread
+     * count, so every later (lock-guarded) push_back advances in place.
+     */
+    g_mutex_lock(&stats_registry_lock);
+    if (stats_registry.capacity() < n) {
+        stats_registry.reserve(n);
+    }
+    g_mutex_unlock(&stats_registry_lock);
+}
+
 Stats stats_snapshot()
 {
     Stats out{};

@@ -19,11 +19,27 @@ TraceSegmentManager g_trace_segments;
 
 TraceSegmentManager::~TraceSegmentManager()
 {
-    if (current_) {
-        segment_free(current_);
-    }
-    g_free(output_path_);
-    g_free(compress_cmd_);
+    /*
+     * Intentionally a no-op.  g_trace_segments is a process-lifetime
+     * global, so this destructor runs as a C++ static destructor at
+     * process teardown.  Its ordering versus QEMU's libc-registered
+     * atexit handler that fires our QEMU_PLUGIN_EV_ATEXIT callback
+     * (plugin_exit -> finish_trace_segment -> TraceSegmentManager::finish)
+     * is not guaranteed.
+     *
+     * In system-emulation teardown (qemu_default_main -> exit) this
+     * destructor runs *before* plugin_exit.  Freeing current_ here
+     * therefore (a) left plugin_exit's finish() walking a freed segment
+     * whose temp-path strings had been reused -> cst_tar stat()/open()
+     * failures on a garbage path and a double free at segment_free, and
+     * (b) freed compress_cmd_, which finish() still reads to open the
+     * header sink.  In linux-user the order was the reverse, masking the
+     * bug.  plugin_exit is the authoritative finalize hook and runs while
+     * this manager is still valid in both modes; it frees the segment and
+     * nulls current_.  Anything not finalized by then is a single
+     * allocation reclaimed by the OS at exit, so leaving teardown to
+     * plugin_exit removes the ordering dependency entirely.
+     */
 }
 
 void TraceSegmentManager::set_output_path(const char *path)

@@ -31,7 +31,23 @@ VCPUScoreboard::VCPUScoreboard()
 
 VCPUScoreboard::~VCPUScoreboard()
 {
-    if (sb_) {
-        qemu_plugin_scoreboard_free(sb_);
-    }
+    /*
+     * Intentionally do NOT free the scoreboard here.
+     *
+     * g_scoreboard is a process-lifetime global, so this destructor runs
+     * as a C++ static destructor at process teardown.  Its ordering versus
+     * QEMU's libc-registered atexit handler that fires our QEMU_PLUGIN_EV_
+     * ATEXIT callback (plugin_exit -> finish_trace_segment ->
+     * flush_pending_final_body_entry, which reads this scoreboard) is not
+     * guaranteed.  In system-emulation teardown (qemu_default_main -> exit)
+     * this destructor runs *before* plugin_exit; freeing here left
+     * plugin_exit's final flush dereferencing a freed scoreboard -> SIGSEGV
+     * (and no .cst produced).  In linux-user the order happened to be the
+     * reverse, masking the bug.
+     *
+     * The scoreboard is a single allocation reclaimed by the OS at exit, so
+     * leaving it for process teardown is harmless and removes the ordering
+     * dependency entirely.  plugin_exit is the authoritative teardown hook
+     * and runs while the scoreboard is still valid in both modes.
+     */
 }

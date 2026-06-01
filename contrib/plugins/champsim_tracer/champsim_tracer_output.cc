@@ -2983,44 +2983,31 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
  * field_descriptors[] is the single source of truth for the wire
  * fields.
  */
-static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
-                                        FieldStateTable *state,
-                                        FieldStateTable *base_state,
-                                        uint32_t template_id,
-                                        const BBTemplate *tmpl,
-                                        const std::vector<DynParam> *dyn_params,
-                                        const std::vector<RegSnap> *reg_snaps,
-                                        bool is_wp,
-                                        unsigned int cpu_index);
-
-static void emit_one_bb_delta(BitWriter *bw, BodyStreamState *st,
-                              FieldStateTable *state, uint32_t template_id,
-                              const BBTemplate *tmpl,
-                              const std::vector<DynParam> *dyn_params,
-                              const std::vector<RegSnap> *reg_snaps,
-                              bool is_wp,
-                              unsigned int cpu_index)
-{
-    emit_one_bb_delta_with_base(bw, st, state, nullptr, template_id,
-                                tmpl, dyn_params, reg_snaps, is_wp,
-                                cpu_index);
-}
+/*
+ * The four pieces that identify one BB record to delta-encode: its template
+ * id, the template itself, and the dynamic params / register snapshots
+ * observed for this execution.  Grouped so they travel together through the
+ * emit_one_bb_delta* path instead of as a four-argument clump.
+ */
+struct BBDeltaInput {
+    uint32_t                     template_id;
+    const BBTemplate            *tmpl;
+    const std::vector<DynParam> *dyn_params;
+    const std::vector<RegSnap>  *reg_snaps;
+};
 
 static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
                                         FieldStateTable *state,
                                         FieldStateTable *base_state,
-                                        uint32_t template_id,
-                                        const BBTemplate *tmpl,
-                                        const std::vector<DynParam> *dyn_params,
-                                        const std::vector<RegSnap> *reg_snaps,
+                                        const BBDeltaInput &rec,
                                         bool is_wp,
                                         unsigned int cpu_index)
 {
     EntryView ev;
-    uint32_t n = tmpl ? tmpl->n_insns : 0;
+    uint32_t n = rec.tmpl ? rec.tmpl->n_insns : 0;
     EntryViewScratch *scratch = &st->ev_scratch;
     entry_view_scratch_ensure(scratch, n);
-    build_entry_view(&ev, tmpl, dyn_params, reg_snaps,
+    build_entry_view(&ev, rec.tmpl, rec.dyn_params, rec.reg_snaps,
                      scratch->actual_n_loads,
                      scratch->actual_n_stores,
                      scratch->insn_dp_off,
@@ -3028,8 +3015,15 @@ static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
                      scratch->load_slots,
                      scratch->store_slots);
     ev.cpu_index = cpu_index;
-    emit_field_delta_section(bw, st, state, base_state, template_id,
+    emit_field_delta_section(bw, st, state, base_state, rec.template_id,
                              &ev, is_wp, st->header_flags);
+}
+
+static void emit_one_bb_delta(BitWriter *bw, BodyStreamState *st,
+                              FieldStateTable *state, const BBDeltaInput &rec,
+                              bool is_wp, unsigned int cpu_index)
+{
+    emit_one_bb_delta_with_base(bw, st, state, nullptr, rec, is_wp, cpu_index);
 }
 
 /*
@@ -3049,9 +3043,10 @@ static void emit_body_record_payload(
     FieldStateTable *cp_state, FieldStateTable *wp_state,
     FieldStateTable *wp_base)
 {
-    emit_one_bb_delta(bw, st, cp_state, entry->template_id, entry->tmpl,
-                      &entry->dyn_params, &entry->reg_snaps, false,
-                      entry->cpu_index);
+    emit_one_bb_delta(bw, st, cp_state,
+                      {entry->template_id, entry->tmpl,
+                       &entry->dyn_params, &entry->reg_snaps},
+                      false, entry->cpu_index);
 
     /* The wrong-path chain + events sections follow only when
      * CST_FLAG_WP is set.  With wrong-path simulation off the entry
@@ -3072,8 +3067,8 @@ static void emit_body_record_payload(
             bw_write_sleb128(&sub, (int64_t)wp_tmpl - prev_wp_template);
             prev_wp_template = wp_tmpl;
             emit_one_bb_delta_with_base(&sub, st, wp_state, wp_base,
-                                        wp_tmpl, wp->tmpl,
-                                        &wp->dyn_params, &wp->reg_snaps,
+                                        {wp_tmpl, wp->tmpl,
+                                         &wp->dyn_params, &wp->reg_snaps},
                                         true, entry->cpu_index);
         }
         bw_byte_align(&sub);

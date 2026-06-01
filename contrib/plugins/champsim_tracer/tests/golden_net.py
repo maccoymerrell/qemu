@@ -63,14 +63,26 @@ WORKLOADS = [
      "args": ["--diamonds", "8", "--depth", "128"]},
     {"name": "w7_iframe",    "seed": "0x0707", "isas": ALL_ISAS,
      "args": ["--diamonds", "8", "--depth", "4", "--iframe-rate", "50"]},
-    {"name": "w8_dense",     "seed": "0x0808", "isas": ALL_ISAS,
-     "args": ["--coverage", "--regdata"]},
-    {"name": "w9_tbflush",   "seed": "0x0909", "isas": ALL_ISAS,
-     "args": ["--diamonds", "64", "--tb-size", "1"]},
+    # NOTE: flush-heavy workloads (large coverage+regdata, and --tb-size 1)
+    # are intentionally NOT byte-golden cells.  When the guest's translated
+    # code + plugin instrumentation overflows the code cache, tb_flush
+    # timing depends on the plugin .so codegen, so the *byte* trace shifts
+    # across any rebuild (even behavior-preserving ones) — a false positive
+    # for byte-identity.  The tracer is flush-INVARIANT semantically (the
+    # decoded execution and the validator result are identical with vs
+    # without flushing); those workloads are covered by `validator all`
+    # and tests/large_scale.sh (whose coverage/wide-cfg/hot-stress shapes
+    # exercise coverage+regdata), not by this byte net.
+    #   w8_dense  (--coverage --regdata)   -> validator/large_scale
+    #   w9_tbflush(--diamonds 64 --tb-size 1) -> validator/large_scale
 ]
 
-# SVG goldens: render every metric on two dense traces (guards Phase 7).
-SVG_WORKLOADS = ["w1_baseline", "w8_dense"]
+# SVG goldens: render every metric on two traces (guards Phase 7).
+# Render only from non-flushing cells — w8_dense's .cst is build-sensitive
+# (see the WORKLOADS note above), so it can't anchor a byte-stable SVG.
+# w3_coverage stands in for it: it exercises every opcode/branch family
+# the metric ladders touch.
+SVG_WORKLOADS = ["w1_baseline", "w3_coverage"]
 SVG_ISA = "x86_64"
 SVG_METRICS = [
     "branch_mpki", "wp_insns", "wp_memops", "mem_pat", "branch_dir",

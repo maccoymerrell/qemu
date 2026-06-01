@@ -2921,30 +2921,13 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
         bw_write_u64_le(&st->header_bw, bits);
     }
 
-    {
-        const char *cmd = qemu_command_line ? qemu_command_line : "";
-        size_t len = strlen(cmd);
-        bw_write_uleb128(&st->header_bw, len);
-        bw_write_bytes(&st->header_bw, (const uint8_t *)cmd, len);
-    }
-    {
-        const char *dt_str = (seg_datetime && *seg_datetime) ? seg_datetime : "";
-        size_t len = strlen(dt_str);
-        bw_write_uleb128(&st->header_bw, len);
-        bw_write_bytes(&st->header_bw, (const uint8_t *)dt_str, len);
-    }
-    {
-        const char *comment = trace_comment ? trace_comment : "";
-        size_t len = strlen(comment);
-        bw_write_uleb128(&st->header_bw, len);
-        bw_write_bytes(&st->header_bw, (const uint8_t *)comment, len);
-    }
-    {
-        const char *tname = target_name ? target_name : "";
-        size_t len = strlen(tname);
-        bw_write_uleb128(&st->header_bw, len);
-        bw_write_bytes(&st->header_bw, (const uint8_t *)tname, len);
-    }
+    /* Header strings: bw_write_string writes uleb len + bytes, and
+     * treats null as the empty string (len 0) — same wire bytes the
+     * inline form produced. */
+    bw_write_string(&st->header_bw, qemu_command_line);
+    bw_write_string(&st->header_bw, seg_datetime);
+    bw_write_string(&st->header_bw, trace_comment);
+    bw_write_string(&st->header_bw, target_name);
 
     write_header_encoding_maps(&st->header_bw);
     bw_byte_align(&st->header_bw);

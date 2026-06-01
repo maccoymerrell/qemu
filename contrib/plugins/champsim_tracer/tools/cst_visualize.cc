@@ -1712,22 +1712,34 @@ struct WalkCtx {
 
 /* Helper: classify a template's terminating instruction for
  * gshare-vs-direction accounting. */
+/* The terminating branch is the highest-indexed branch-type insn:
+ * n-1 normally, or n-2 on a delay-slot ISA where the delay slot is the
+ * last insn (templates are stored in true execution order). */
+static const cst::InsnTemplate *find_term_branch(const cst::Template &t)
+{
+    for (size_t i = t.insns.size(); i-- > 0; ) {
+        if (t.insns[i].branch_type != 0) {
+            return &t.insns[i];
+        }
+    }
+    return nullptr;
+}
+
 static WalkCtx::TermBranch classify_term(
     const cst::Template &t,
     const std::unordered_map<uint64_t, std::string> &bt_map)
 {
     WalkCtx::TermBranch tb;
-    if (t.insns.empty()) return tb;
-    const auto &last = t.insns.back();
-    tb.pc            = last.pc;
     tb.fall_through  = t.fall_through_pc;
-    tb.is_branch     = (last.branch_type != 0);
-    if (!tb.is_branch) return tb;
+    const cst::InsnTemplate *last = find_term_branch(t);
+    if (!last) return tb;        /* is_branch stays false */
+    tb.pc            = last->pc;
+    tb.is_branch     = true;
 
     /* Look up the name to identify direct vs indirect vs return vs
      * syscall.  The trace's encoding map carries the canonical
      * BRANCH_* names. */
-    std::string n = lookup_name(bt_map, last.branch_type);
+    std::string n = lookup_name(bt_map, last->branch_type);
     tb.class_name = n;
     bool name_says_indirect =
         n.find("INDIRECT") != std::string::npos ||
@@ -1741,7 +1753,7 @@ static WalkCtx::TermBranch classify_term(
         n.find("RETURN")      != std::string::npos ||
         n.find("INDIRECT")    != std::string::npos;
     tb.is_conditional =
-        last.branch_conditional && !name_says_indirect && !unconditional;
+        last->branch_conditional && !name_says_indirect && !unconditional;
     /* COND_DIRECT explicitly marks conditional even if the template
      * flag is set differently. */
     if (n.find("COND") != std::string::npos) {
@@ -2919,7 +2931,9 @@ static TraceResult process_trace(const char *path, const Options &opts)
         for (size_t i = 0; i < templates.size(); i++) {
             const WalkCtx::TermBranch &tb = ctx.term[i];
             if (!tb.is_branch || templates[i].insns.empty()) continue;
-            uint64_t code = templates[i].insns.back().branch_type;
+            const cst::InsnTemplate *brins = find_term_branch(templates[i]);
+            if (!brins) continue;
+            uint64_t code = brins->branch_type;
             ClassVariants &cv = by_code[code];
             cv.class_name = tb.class_name;
             if (tb.is_conditional) cv.any_conditional = true;

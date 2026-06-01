@@ -934,20 +934,34 @@ static void flush_pending_final_body_entry(void)
             bool is_last_executed = (frag->start_pc == prev_start);
 
             if (is_last_executed) {
-                /* Tail-insn dst snap (see vcpu_tb_exec): the
-                 * last-executed fragment's tail registers still
-                 * hold post-exec values. */
+                /* Tail-insn dst snap (see snap_prev_tail_dsts): the
+                 * last-executed fragment's tail registers still hold
+                 * post-exec values.  On a delay-slot tail [branch@n-2,
+                 * delay@n-1] the branch's snap was deferred and there is
+                 * no next TB to catch it (segment end), so capture both
+                 * the branch (n-2) and the delay slot (n-1) here. */
                 if (enable_reg_data && frag->insn_reg_names &&
                     frag->n_insns > 0) {
                     uint32_t last = frag->n_insns - 1;
-                    const InsnFields *fl = &frag->insn_fields[last];
-                    const InsnRegNames *nl = &frag->insn_reg_names[last];
-                    for (uint8_t i = 0; i < fl->n_dst_regs; i++) {
-                        RegSnap s;
-                        g_reg_snaps.read_into_snap(
-                            cpu_index, nl->dst_qemu_reg_keys[i], &s);
-                        pending_reg_snaps.push_back(s);
+                    bool ds_tail = frag->n_insns >= 2 &&
+                        frag->insn_fields[last - 1].branch_type
+                            != BRANCH_NONE &&
+                        frag->insn_fields[last].branch_type
+                            == BRANCH_NONE;
+                    auto snap_tail = [&](uint32_t idx) {
+                        const InsnFields *fl = &frag->insn_fields[idx];
+                        const InsnRegNames *nl = &frag->insn_reg_names[idx];
+                        for (uint8_t i = 0; i < fl->n_dst_regs; i++) {
+                            RegSnap s;
+                            g_reg_snaps.read_into_snap(
+                                cpu_index, nl->dst_qemu_reg_keys[i], &s);
+                            pending_reg_snaps.push_back(s);
+                        }
+                    };
+                    if (ds_tail) {
+                        snap_tail(last - 1);  /* branch */
                     }
+                    snap_tail(last);          /* delay slot, or branch */
                 }
             }
 
@@ -1267,47 +1281,46 @@ static void snap_prev_tail_dsts(unsigned int cpu_index,
     if (enable_reg_data && tmpl->insn_reg_names &&
         tmpl->n_insns > 0 &&
         g_trace_segments.is_active_atomic()) {
-        /* Delay-slot reorder (mirrors tb_arm_new_template_cbs): the
-         * canonical reorder put the delay slot at canonical[n-2] and
-         * the branch at canonical[n-1].  The branch's raw form
-         * executed FIRST (condition check), then the delay slot ran
-         * (its dst write), then control transferred.  At the next
-         * TB's vcpu_tb_exec — where we are now — the registers
-         * still hold the delay slot's post-exec dsts, so capture
-         * them.  Detect via insn_pcs[n-2] > insn_pcs[n-1]. */
+        /* Capture the tail insn(s) whose dsts the per-insn hooks could
+         * not reach.  Templates are in true execution order, so the
+         * last insn is the delay slot on a delay-slot tail
+         * [branch@n-2, delay@n-1]; otherwise it is the branch itself.
+         *
+         * On a delay-slot tail the branch's snap was deferred here (see
+         * tb_arm_new_template_cbs) so its REG_IP (PC) dst can take the
+         * goto_tb successor override.  Capture the branch (n-2) first,
+         * then the delay slot (n-1) — matching execution and template
+         * order.  The override fires only on the branch's REG_IP dst,
+         * so applying it in both passes is correct on every ISA. */
         uint32_t last = tmpl->n_insns - 1;
-        if (tmpl->n_insns >= 2 &&
-            tmpl->insn_pcs[last - 1] > tmpl->insn_pcs[last]) {
-            const InsnFields *fd = &tmpl->insn_fields[last - 1];
-            const InsnRegNames *nd = &tmpl->insn_reg_names[last - 1];
-            for (uint8_t i = 0; i < fd->n_dst_regs; i++) {
+        bool delay_slot_tail = tmpl->n_insns >= 2 &&
+            tmpl->insn_fields[last - 1].branch_type != BRANCH_NONE &&
+            tmpl->insn_fields[last].branch_type == BRANCH_NONE;
+        auto capture_tail = [&](uint32_t idx) {
+            const InsnFields *fl = &tmpl->insn_fields[idx];
+            const InsnRegNames *nl = &tmpl->insn_reg_names[idx];
+            for (uint8_t i = 0; i < fl->n_dst_regs; i++) {
                 RegSnap s;
                 g_reg_snaps.read_into_snap(
-                    cpu_index, nd->dst_qemu_reg_keys[i], &s);
+                    cpu_index, nl->dst_qemu_reg_keys[i], &s);
+                if (fl->dst_regs[i] == REG_IP) {
+                    /* The BB-terminating branch's PC dst.  Correct-path
+                     * TBs chain via goto_tb, which SKIPS the env->eip
+                     * write at the boundary, so the live read is stale
+                     * (the chain's entry, not this branch's target).
+                     * The post-branch PC is exactly the successor, held
+                     * reliably as @current_pc.  Keep the architectural
+                     * width; override the value.  (WP TBs are
+                     * CF_NO_GOTO_TB so their eip is always synced.) */
+                    s.value = cst_wide_from_u64(current_pc);
+                }
                 pending_reg_snaps.push_back(s);
             }
+        };
+        if (delay_slot_tail) {
+            capture_tail(last - 1);   /* branch (deferred) */
         }
-        const InsnFields *fl = &tmpl->insn_fields[last];
-        const InsnRegNames *nl = &tmpl->insn_reg_names[last];
-        for (uint8_t i = 0; i < fl->n_dst_regs; i++) {
-            RegSnap s;
-            g_reg_snaps.read_into_snap(
-                cpu_index, nl->dst_qemu_reg_keys[i], &s);
-            if (fl->dst_regs[i] == REG_IP) {
-                /* The BB-terminating branch's PC dst.  Correct-path TBs chain
-                 * into their successor by default (goto_tb), and that direct
-                 * host jump SKIPS the env->eip write at the boundary, so the
-                 * live read above returns a stale PC (the chain's entry, not
-                 * this branch's target).  The post-branch PC is exactly the
-                 * successor, which we already hold reliably as @current_pc
-                 * (the successor's inline scoreboard store, not the lazy
-                 * eip).  Keep the read's architectural width; override the
-                 * value.  WP TBs are CF_NO_GOTO_TB so their eip is always
-                 * synced — this only matters on the chained correct path. */
-                s.value = cst_wide_from_u64(current_pc);
-            }
-            pending_reg_snaps.push_back(s);
-        }
+        capture_tail(last);           /* delay slot, or branch on non-delay ISAs */
     }
 }
 
@@ -1830,23 +1843,23 @@ static void tb_arm_new_template_cbs(struct qemu_plugin_tb *tb,
          * canonical insn is captured at the next TB's
          * vcpu_tb_exec ("Tail-insn dst snap").
          *
-         * Delay-slot reordering caveat: on MIPS (and similar ISAs)
-         * the canonical ordering swaps a trailing [branch,
-         * delay-slot] pair to [delay-slot, branch] so the
-         * terminating branch is always canonical[n-1].  The branch's
-         * raw form executes FIRST (it checks condition), then the
-         * delay slot (canonical[n-2]) runs, then control transfers.
-         * That means canonical[n-2]'s "first raw" is at HIGHER PC
-         * than canonical[n-1]'s, and a pre-exec cb on canonical[n-1]'s
-         * raw fires BEFORE canonical[n-2]'s delay slot runs — the
-         * snap captures the PRE-delay-slot value, not the post.
-         * Detect via insn_pcs[n-2] > insn_pcs[n-1] and skip the
-         * broken registration; snap_prev_tail_dsts on the next TB
-         * captures both canonical[n-1] and canonical[n-2] dsts at
-         * the right time. */
-        bool delay_slot_reorder = canonical_n_insns >= 2
-            && new_tmpl->insn_pcs[canonical_n_insns - 2]
-                 > new_tmpl->insn_pcs[canonical_n_insns - 1];
+         * Delay-slot tail: on MIPS (and similar ISAs) a true BB ends
+         * with a [branch, delay-slot] pair kept in true execution
+         * order — branch at canonical[n-2], delay slot at
+         * canonical[n-1].  The branch's PC-dst (REG_IP) needs the
+         * goto_tb override that only snap_prev_tail_dsts can supply
+         * (it knows the successor PC), so DEFER the branch's snap to
+         * the next TB rather than capturing it here at the delay
+         * slot's pre-exec hook.  Detect the pair by branch_type and
+         * skip the cb whose ci-1 is the branch (ci == n-1);
+         * snap_prev_tail_dsts then captures both canonical[n-2]
+         * (branch, with REG_IP override) and canonical[n-1] (delay
+         * slot) at the right time. */
+        bool delay_slot_tail = canonical_n_insns >= 2
+            && new_tmpl->insn_fields[canonical_n_insns - 2].branch_type
+                 != BRANCH_NONE
+            && new_tmpl->insn_fields[canonical_n_insns - 1].branch_type
+                 == BRANCH_NONE;
         for (size_t i = 0; i < raw_n_insns; i++) {
             if (!canonical_first[i]) {
                 continue;
@@ -1855,12 +1868,11 @@ static void tb_arm_new_template_cbs(struct qemu_plugin_tb *tb,
             if (ci == 0) {
                 continue;  /* no predecessor canonical insn in this TB */
             }
-            if (delay_slot_reorder && ci == canonical_n_insns - 1) {
-                /* The reg snap registered HERE would fire pre-branch
-                 * = pre-delay-slot.  Captured value is the pre-delay-
-                 * slot value of the delay slot's dst register — stale
-                 * by exactly one insn.  Skip and capture in
-                 * snap_prev_tail_dsts instead. */
+            if (delay_slot_tail && ci == canonical_n_insns - 1) {
+                /* The cb HERE would capture canonical[n-2] (the
+                 * branch); defer it to snap_prev_tail_dsts so the
+                 * branch's REG_IP dst gets the goto_tb successor
+                 * override. */
                 continue;
             }
             struct qemu_plugin_insn *insn =

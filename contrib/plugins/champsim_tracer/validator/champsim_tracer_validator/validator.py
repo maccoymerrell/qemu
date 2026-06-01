@@ -255,8 +255,8 @@ def _insns_in_block(template: dict, start_pc: int, end_pc: int
 
 
 def _check_template_raw_bytes(templates: list[dict],
-                              blocks_by_id: dict[int, dict],
-                              isa: str) -> list[Issue]:
+                              blocks_by_id: dict[int, dict]
+                              ) -> list[Issue]:
     """Byte-for-byte compare each template insn's `raw_bytes` against the
     analyzer's ground-truth disassembly bytes for the same PC.
 
@@ -274,42 +274,11 @@ def _check_template_raw_bytes(templates: list[dict],
         for ins in gt["insns"]:
             gt_by_pc[int(ins["pc"])] = ins
 
-    has_delay_slot = isa.startswith("mips")
-    # Branch types with NO delay slot: the tracer leaves these branch-last
-    # without a swap.  On MIPS every jump/branch carries a delay slot
-    # EXCEPT syscall/break/trap (all BRANCH_SYSCALL_TYPE), so only those
-    # (and NONE) are excluded from the swap detection below.
-    _, _branch_names = _load_name_tables()
-    no_delay_ids = {bid for bid, nm in _branch_names.items()
-                    if nm in ("NONE", "SYSCALL")}
-
     issues: list[Issue] = []
     mismatches = 0
     for t in templates:
-        ins_list = t.get("insns", [])
-        # Replicate the tracer's delay-slot normalisation (the plugin's
-        # apply_delay_slot_swap).  On a delay-slot ISA the tracer reorders
-        # a trailing [branch, delay-slot] pair branch-last and reassigns
-        # the pair to ASCENDING (positional) PCs — so the bytes recorded
-        # at the lower PC are the delay slot's and the branch's bytes move
-        # to the higher slot.  The pair is identified from the TEMPLATE's
-        # branch classification (the analyzer's ground-truth classifier
-        # does not flag every MIPS jump); only a delay-slot-bearing branch
-        # (not syscall/trap) triggers it, and the two slots then compare
-        # against each other's real ground-truth PC.
-        swap_lo = swap_hi = None
-        if has_delay_slot and len(ins_list) >= 2:
-            last, prev = ins_list[-1], ins_list[-2]
-            if int(last.get("branch_type", 0)) not in no_delay_ids and \
-               int(prev.get("branch_type", 0)) == 0:
-                swap_lo, swap_hi = int(prev["pc"]), int(last["pc"])
-        for ins in ins_list:
-            lookup_pc = int(ins["pc"])
-            if lookup_pc == swap_lo:
-                lookup_pc = swap_hi
-            elif lookup_pc == swap_hi:
-                lookup_pc = swap_lo
-            gt = gt_by_pc.get(lookup_pc)
+        for ins in t.get("insns", []):
+            gt = gt_by_pc.get(int(ins["pc"]))
             if gt is None:
                 continue
             trace_bytes = bytes(ins["raw_bytes"]).hex()
@@ -5147,8 +5116,7 @@ def validate(meta_path: Path, trace_path: Path,
                                         cp_block_seq_effective)
 
     # Disassembly-driven first-order sanity checks.
-    issues += _check_template_raw_bytes(templates, blocks_by_id,
-                                        meta.get("isa", "x86_64"))
+    issues += _check_template_raw_bytes(templates, blocks_by_id)
     issues += _check_block_insn_counts(templates, blocks_by_id, pcmap,
                                        cp_set)
     issues += _check_block_assertions(templates, blocks_by_id, pcmap,

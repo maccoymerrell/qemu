@@ -133,71 +133,18 @@ int BBTemplateCache::template_branch_index(const BBTemplate *tmpl)
         return -1;
     }
 
-    uint32_t last = tmpl->n_insns - 1;
-    if (tmpl->insn_fields[last].branch_type != BRANCH_NONE) {
-        return (int)last;
+    /* The terminating branch is the highest-indexed branch-type insn.
+     * On a delay-slot ISA the template is in true execution order
+     * [branch, delay-slot], so the branch is at n-2 (the delay slot at
+     * n-1 is BRANCH_NONE); on every other ISA it is the last insn.
+     * Scan from the end for the first branch-type insn either way. */
+    for (int i = (int)tmpl->n_insns - 1; i >= 0; i--) {
+        if (tmpl->insn_fields[i].branch_type != BRANCH_NONE) {
+            return i;
+        }
     }
 
     return -1;
-}
-
-/*
- * Delay-slot reordering: swap a trailing [branch, delay-slot] pair to
- * [delay-slot, branch] so the terminating branch is always the last
- * insn — template_branch_index and WP steering then stay ISA-uniform.
- *
- * Idempotent: the swap condition (insn[n-2] is a branch, insn[n-1] is
- * not) is false for an already-normalised [delay-slot, branch] tail,
- * so calling this on a template built from already-swapped fragments
- * is a no-op.  That matters for assembled true-BBs: a single-TB BB
- * inherits the TB fragment's already-swapped order, while a page-split
- * BB ([..,branch] TB + [delay-slot] TB) arrives unswapped and needs
- * this pass.
- */
-static void apply_delay_slot_swap(BBTemplate *tmpl)
-{
-    uint32_t n_insns = tmpl->n_insns;
-    if (isa_properties[trace_isa].branch_delay_slots == 0 || n_insns < 2) {
-        return;
-    }
-    uint32_t br = n_insns - 2;
-    uint32_t ds = n_insns - 1;
-    if (tmpl->insn_fields[br].branch_type == BRANCH_NONE ||
-        tmpl->insn_fields[ds].branch_type != BRANCH_NONE) {
-        return;
-    }
-    /*
-     * PCs are positional, not carried.  The swap relocates instruction
-     * *content* (bytes/fields/sizes/regnames) so the branch lands last,
-     * but an address is a property of the slot, not of the instruction.
-     * Carrying the original PCs leaves insn_pcs non-monotonic (the
-     * branch sitting below its own delay slot) and breaks every
-     * positional consumer — most visibly the WP fall-through, which
-     * reads insn_pcs[n-1]+size and would land ON the delay slot, one
-     * insn short of the architectural successor.  Reassign the trailing
-     * pair to ascending PCs: the predecessor slot keeps the pair's base
-     * (already in insn_pcs[br] — the lower of the two), and the
-     * now-branch slot follows the relocated delay slot.
-     */
-    uint8_t tmp_sz = tmpl->insn_sizes[br];
-    tmpl->insn_sizes[br] = tmpl->insn_sizes[ds];
-    tmpl->insn_sizes[ds] = tmp_sz;
-    tmpl->insn_pcs[ds] = tmpl->insn_pcs[br] + tmpl->insn_sizes[br];
-    uint8_t tmp_bytes[MAX_INSN_BYTES];
-    memcpy(tmp_bytes, &tmpl->insn_bytes[(size_t)br * MAX_INSN_BYTES],
-           MAX_INSN_BYTES);
-    memcpy(&tmpl->insn_bytes[(size_t)br * MAX_INSN_BYTES],
-           &tmpl->insn_bytes[(size_t)ds * MAX_INSN_BYTES], MAX_INSN_BYTES);
-    memcpy(&tmpl->insn_bytes[(size_t)ds * MAX_INSN_BYTES],
-           tmp_bytes, MAX_INSN_BYTES);
-    InsnFields tmp_fld = tmpl->insn_fields[br];
-    tmpl->insn_fields[br] = tmpl->insn_fields[ds];
-    tmpl->insn_fields[ds] = tmp_fld;
-    if (tmpl->insn_reg_names) {
-        InsnRegNames tmp_n = tmpl->insn_reg_names[br];
-        tmpl->insn_reg_names[br] = tmpl->insn_reg_names[ds];
-        tmpl->insn_reg_names[ds] = tmp_n;
-    }
 }
 
 /* Allocate and populate a fresh BBTemplate with @n_insns entries from
@@ -239,18 +186,19 @@ static BBTemplatePtr build_bb_template(uint32_t template_id,
         }
     }
     /*
-     * Normalise the terminating branch to the last slot.  A page-split
-     * true BB is assembled as [.., branch][delay-slot] across two TB
-     * fragments and arrives here unswapped; without this its branch
-     * sits at n-2 and template_branch_index would miss it.
+     * No delay-slot reorder: the template stays in TRUE EXECUTION ORDER
+     * [.., branch, delay-slot].  Reordering to branch-last would make
+     * per-insn register/dependency deltas incoherent (the delay slot
+     * really executes after the branch).  Consumers (and
+     * template_branch_index) locate the terminating branch by scanning
+     * for the branch-type insn; the fall-through is the separate
+     * fall_through_pc field.
      */
-    apply_delay_slot_swap(tmpl.get());
     return tmpl;
 }
 
 BBTemplate *BBTemplateCache::find_existing_true_bb(
-    uint64_t start_pc, uint32_t n_insns, const uint64_t *insn_pcs,
-    bool candidate_tail_swapped)
+    uint64_t start_pc, uint32_t n_insns, const uint64_t *insn_pcs)
 {
     BBTemplate *existing = find_bb_template(start_pc);
     if (!existing) {
@@ -258,25 +206,11 @@ BBTemplate *BBTemplateCache::find_existing_true_bb(
     }
     bool same = (existing->n_insns == n_insns);
     if (same) {
-        /*
-         * Stored templates are delay-slot-normalised (terminating
-         * branch last) by build_bb_template.  A page-split delay-slot
-         * BB reaches commit unnormalised — [.., branch, delay-slot] —
-         * which the caller signals via @candidate_tail_swapped; its
-         * trailing pair is then matched against the stored
-         * [.., delay-slot, branch] with the two indices exchanged, so
-         * the identical BB is not misreported as a sequence mismatch.
-         */
+        /* Templates are stored in true execution order (no delay-slot
+         * reorder), so the candidate and the stored copy share the same
+         * insn ordering — compare PCs directly. */
         for (uint32_t i = 0; i < n_insns; i++) {
-            uint32_t ci = i;
-            if (candidate_tail_swapped && n_insns >= 2) {
-                if (i == n_insns - 2) {
-                    ci = n_insns - 1;
-                } else if (i == n_insns - 1) {
-                    ci = n_insns - 2;
-                }
-            }
-            if (existing->insn_pcs[i] != insn_pcs[ci]) {
+            if (existing->insn_pcs[i] != insn_pcs[i]) {
                 same = false;
                 break;
             }
@@ -326,17 +260,8 @@ BBTemplate *BBTemplateCache::commit_true_bb(uint64_t start_pc,
                                             const char *symbol_name,
                                             uint64_t fall_through_pc)
 {
-    /* A page-split delay-slot BB reaches commit as
-     * [.., branch, delay-slot] (build_bb_template normalises it to
-     * branch-last); flag that so the cache lookup compares the
-     * trailing pair in the stored, normalised order. */
-    bool tail_swapped =
-        isa_properties[trace_isa].branch_delay_slots > 0 && n_insns >= 2 &&
-        insn_fields[n_insns - 2].branch_type != BRANCH_NONE &&
-        insn_fields[n_insns - 1].branch_type == BRANCH_NONE;
     if (BBTemplate *existing =
-            find_existing_true_bb(start_pc, n_insns, insn_pcs,
-                                  tail_swapped)) {
+            find_existing_true_bb(start_pc, n_insns, insn_pcs)) {
         return existing;
     }
 
@@ -360,18 +285,11 @@ BBTemplate *BBTemplateCache::commit_true_bb_refs(
     const InsnRegNames *const *insn_reg_names,
     const char *symbol_name, uint64_t fall_through_pc)
 {
-    /* Already-templated BB: return the cached record without
-     * touching the field/regnames payload at all.  A page-split
-     * delay-slot BB arrives as [.., branch, delay-slot]; flag that so
-     * the lookup compares the trailing pair in the stored,
-     * branch-last normalised order. */
-    bool tail_swapped =
-        isa_properties[trace_isa].branch_delay_slots > 0 && n_insns >= 2 &&
-        insn_fields[n_insns - 2]->branch_type != BRANCH_NONE &&
-        insn_fields[n_insns - 1]->branch_type == BRANCH_NONE;
+    /* Already-templated BB: return the cached record without touching
+     * the field/regnames payload at all.  Templates are stored in true
+     * execution order, so the dedup compares insn PCs directly. */
     if (BBTemplate *existing =
-            find_existing_true_bb(start_pc, n_insns, insn_pcs,
-                                  tail_swapped)) {
+            find_existing_true_bb(start_pc, n_insns, insn_pcs)) {
         return existing;
     }
 
@@ -627,10 +545,7 @@ BBTemplate *BBTemplateCache::create_tb_template(
         }
     }
 
-    /* Normalise the terminating branch to the last slot (delay-slot
-     * ISAs); see apply_delay_slot_swap. */
-    apply_delay_slot_swap(tmpl.get());
-
+    /* No delay-slot reorder: template stays in true execution order. */
     BBTemplate *raw = tmpl.get();
     tb_templates_.push_back(std::move(tmpl));
     g_stats.tb_templates_created++;

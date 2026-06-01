@@ -568,8 +568,18 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             bool branch_fired = false;
             if (!bb_pcs.empty()) {
                 size_t last_local = bb_pcs.size() - 1;
-                branch_fired =
-                    (bb_fields[last_local]->branch_type != BRANCH_NONE);
+                if (bb_fields[last_local]->branch_type != BRANCH_NONE) {
+                    branch_fired = true;
+                } else if (last_local >= 1 &&
+                           bb_fields[last_local - 1]->branch_type
+                               != BRANCH_NONE) {
+                    /* Delay-slot tail [branch, delay-slot] in true
+                     * execution order: the just-appended delay slot
+                     * completes the BB whose terminating branch is the
+                     * prior insn.  (On non-delay-slot ISAs the branch is
+                     * always the last insn, handled above.) */
+                    branch_fired = true;
+                }
             }
             bool bb_complete = false;
             if (awaiting_delay_slot) {
@@ -715,6 +725,11 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
              */
             if (bb_tmpl && bb_tmpl->taken_pc == 0 && !bb_fields.empty()) {
                 const InsnFields *lf = bb_fields.back();
+                if (lf->branch_type == BRANCH_NONE && bb_fields.size() >= 2) {
+                    /* Delay-slot tail: terminator is the insn before
+                     * the trailing delay slot. */
+                    lf = bb_fields[bb_fields.size() - 2];
+                }
                 bool indirect =
                     lf->branch_type == BRANCH_INDIRECT_JUMP ||
                     lf->branch_type == BRANCH_RETURN;

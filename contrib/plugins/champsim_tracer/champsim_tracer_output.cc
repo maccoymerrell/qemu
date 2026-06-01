@@ -579,8 +579,10 @@ static std::vector<ProfTgt> build_prof_targets(const BBTemplate *tmpl)
 {
     std::vector<ProfTgt> prof_tgts;
     const TemplateProfile *pp = tmpl->profile;
-    const InsnFields *last = tmpl->n_insns > 0
-        ? &tmpl->insn_fields[tmpl->n_insns - 1] : nullptr;
+    /* Terminating branch (n-1 normally, n-2 on delay-slot ISAs). */
+    int bidx = BBTemplateCache::template_branch_index(tmpl);
+    const InsnFields *last = bidx >= 0
+        ? &tmpl->insn_fields[bidx] : nullptr;
     uint64_t bt_cp = pp ? pp->br_taken_cp : 0;
     uint64_t bnt_cp = pp ? pp->br_nottaken_cp : 0;
     uint64_t bt_wp = pp ? pp->br_taken_wp : 0;
@@ -3441,8 +3443,11 @@ static void profile_accumulate(BBTemplate *t,
 static void profile_branch(BBTemplate *t, uint64_t next_pc, bool wp)
 {
     if (!t || t->n_insns == 0) return;
-    const InsnFields *last = &t->insn_fields[t->n_insns - 1];
-    if (last->branch_type == BRANCH_NONE) return;
+    /* The terminating branch is at template_branch_index (n-1 normally,
+     * n-2 on delay-slot ISAs where the delay slot is last). */
+    int bidx = BBTemplateCache::template_branch_index(t);
+    if (bidx < 0) return;
+    const InsnFields *last = &t->insn_fields[bidx];
     TemplateProfile *p = profile_get(t);
     bool taken = (next_pc != t->fall_through_pc);
     if (!last->branch_conditional) taken = true;

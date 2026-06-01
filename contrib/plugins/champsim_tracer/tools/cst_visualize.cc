@@ -899,53 +899,82 @@ static void write_svg_footer(std::FILE *out)
 
 /* Render one ChartPlan into its viewport.  Multiple plans can be
  * rendered into the same SVG by giving them disjoint viewports. */
-static void render_plan(std::FILE *out, const ChartPlan &plan)
-{
-    const int VX = plan.viewport_x;
-    const int VY = plan.viewport_y;
-    const int VW = plan.viewport_w;
-    const int VH = plan.viewport_h;
-    /* L/R/T are absolute SVG coords; plot_w/plot_h are plot-area
-     * extents inside the per-plan margins. */
-    const int L = VX + plan.margin_left;
-    const int R_edge = VX + VW - plan.margin_right;
-    const int T = VY + plan.margin_top;
-    const int B_edge = VY + VH - plan.margin_bot;
-    const int plot_w = R_edge - L;
-    const int plot_h = B_edge - T;
+/*
+ * Renders one ChartPlan into an SVG <g> body.  The geometry (plot-area
+ * coords L/R/T/B and the x_of/y_of mappings) is shared state across every
+ * rendering pass, so it lives on the emitter rather than being recomputed
+ * or threaded through free functions.  render() dispatches between the two
+ * top-level layouts: the composition/aggregate pane (montage of
+ * weight-proportional per-trace segments) and the normal single-axis plot.
+ * Output is byte-identical to the former monolithic render_plan().
+ */
+class SvgEmitter {
+public:
+    SvgEmitter(std::FILE *out, const ChartPlan &plan)
+        : out_(out), plan_(plan),
+          VX(plan.viewport_x), VY(plan.viewport_y),
+          VW(plan.viewport_w), VH(plan.viewport_h),
+          L(VX + plan.margin_left), R_edge(VX + VW - plan.margin_right),
+          T(VY + plan.margin_top), B_edge(VY + VH - plan.margin_bot),
+          plot_w(R_edge - L), plot_h(B_edge - T) {}
 
-    auto x_of = [&](double bin_idx) {
-        return L + (bin_idx / std::max(plan.n_bins, 1)) * plot_w;
-    };
-    auto y_of = [&](double v) {
-        double frac = plan.y_max > 0 ? v / plan.y_max : 0.0;
+    void render()
+    {
+        emit_frame();
+        emit_y_axis();
+        if (!plan_.segments.empty()) {
+            emit_composition_pane();
+            return;
+        }
+        emit_x_axis();
+        emit_axis_titles();
+        emit_title();
+        emit_warmup_overlay();
+        emit_data();
+        emit_warmup_end_marker();
+        /* Normal legend suppresses the wrap after the final series. */
+        emit_legend(true);
+    }
+
+private:
+    double x_of(double bin_idx) const
+    {
+        return L + (bin_idx / std::max(plan_.n_bins, 1)) * plot_w;
+    }
+    double y_of(double v) const
+    {
+        double frac = plan_.y_max > 0 ? v / plan_.y_max : 0.0;
         if (frac < 0) frac = 0;
         if (frac > 1) frac = 1;
         return T + plot_h - frac * plot_h;
-    };
+    }
 
-    /* Plot frame. */
-    std::fprintf(out,
-        "<rect x=\"%d\" y=\"%d\" width=\"%d\" height=\"%d\" "
-        "fill=\"#fafafa\" stroke=\"#cccccc\"/>\n",
-        L, T, plot_w, plot_h);
+    void emit_frame()
+    {
+        std::fprintf(out_,
+            "<rect x=\"%d\" y=\"%d\" width=\"%d\" height=\"%d\" "
+            "fill=\"#fafafa\" stroke=\"#cccccc\"/>\n",
+            L, T, plot_w, plot_h);
+    }
 
-    /* Y-axis gridlines + labels. */
-    int y_ticks = 5;
-    for (int t = 0; t <= y_ticks; t++) {
-        double v = (plan.y_max * t) / y_ticks;
-        double y = y_of(v);
-        std::fprintf(out,
-            "<line x1=\"%d\" y1=\"%.2f\" x2=\"%d\" y2=\"%.2f\" "
-            "stroke=\"#e0e0e0\" stroke-width=\"1\"/>\n",
-            L, y, L + plot_w, y);
-        std::string lab = plan.y_is_count
-                              ? fmt_count((uint64_t)(v + 0.5))
-                              : fmt_double(v, plan.percent);
-        std::fprintf(out,
-            "<text x=\"%d\" y=\"%.2f\" text-anchor=\"end\" "
-            "dominant-baseline=\"middle\" fill=\"#555\">%s</text>\n",
-            L - 6, y, xml_escape(lab).c_str());
+    void emit_y_axis()
+    {
+        int y_ticks = 5;
+        for (int t = 0; t <= y_ticks; t++) {
+            double v = (plan_.y_max * t) / y_ticks;
+            double y = y_of(v);
+            std::fprintf(out_,
+                "<line x1=\"%d\" y1=\"%.2f\" x2=\"%d\" y2=\"%.2f\" "
+                "stroke=\"#e0e0e0\" stroke-width=\"1\"/>\n",
+                L, y, L + plot_w, y);
+            std::string lab = plan_.y_is_count
+                                  ? fmt_count((uint64_t)(v + 0.5))
+                                  : fmt_double(v, plan_.percent);
+            std::fprintf(out_,
+                "<text x=\"%d\" y=\"%.2f\" text-anchor=\"end\" "
+                "dominant-baseline=\"middle\" fill=\"#555\">%s</text>\n",
+                L - 6, y, xml_escape(lab).c_str());
+        }
     }
 
     /* Composition (aggregate) pane: a montage of weight-proportional
@@ -954,12 +983,13 @@ static void render_plan(std::FILE *out, const ChartPlan &plan)
      * path entirely; the shared frame, y-axis, title and legend are still
      * drawn here.  Decorations (per-segment label + warmup rule) are gated
      * on segment pixel width so the chart stays readable for any K. */
-    if (!plan.segments.empty()) {
+    void emit_composition_pane()
+    {
         const double LABEL_MIN_PX  = 46.0;  /* show segment label if wider */
         const double WARMUP_MIN_PX = 14.0;  /* show warmup rule if wider */
 
         /* Per-segment data first, so dividers / markers land on top. */
-        for (const auto &seg : plan.segments) {
+        for (const auto &seg : plan_.segments) {
             double sxl = L + seg.x0_frac * plot_w;
             double sxr = L + seg.x1_frac * plot_w;
             double sw  = sxr - sxl;
@@ -975,45 +1005,45 @@ static void render_plan(std::FILE *out, const ChartPlan &plan)
             auto val = [&](const Series &s, int b) {
                 return (b < (int)s.y.size()) ? s.y[b] : 0.0;
             };
-            if (plan.mode == ChartPlan::Mode::Stacked) {
+            if (plan_.mode == ChartPlan::Mode::Stacked) {
                 std::vector<double> cum((size_t)nb, 0.0);
                 for (const Series &s : seg.series) {
-                    std::fprintf(out,
+                    std::fprintf(out_,
                         "<polygon fill=\"%s\" fill-opacity=\"0.9\" "
                         "stroke=\"%s\" stroke-width=\"0.5\" points=\"",
                         s.color.c_str(), s.color.c_str());
                     /* upper edge: left edge, centers L→R, right edge */
-                    std::fprintf(out, "%.2f,%.2f ",
+                    std::fprintf(out_, "%.2f,%.2f ",
                                  sxl, y_of(cum[0] + val(s, 0)));
                     for (int b = 0; b < nb; b++) {
-                        std::fprintf(out, "%.2f,%.2f ",
+                        std::fprintf(out_, "%.2f,%.2f ",
                                      ctr(b), y_of(cum[b] + val(s, b)));
                     }
-                    std::fprintf(out, "%.2f,%.2f ",
+                    std::fprintf(out_, "%.2f,%.2f ",
                                  sxr, y_of(cum[nb - 1] + val(s, nb - 1)));
                     /* lower edge: right edge, centers R→L, left edge */
-                    std::fprintf(out, "%.2f,%.2f ", sxr, y_of(cum[nb - 1]));
+                    std::fprintf(out_, "%.2f,%.2f ", sxr, y_of(cum[nb - 1]));
                     for (int b = nb - 1; b >= 0; b--) {
-                        std::fprintf(out, "%.2f,%.2f ", ctr(b), y_of(cum[b]));
+                        std::fprintf(out_, "%.2f,%.2f ", ctr(b), y_of(cum[b]));
                     }
-                    std::fprintf(out, "%.2f,%.2f ", sxl, y_of(cum[0]));
-                    std::fprintf(out, "\"/>\n");
+                    std::fprintf(out_, "%.2f,%.2f ", sxl, y_of(cum[0]));
+                    std::fprintf(out_, "\"/>\n");
                     for (int b = 0; b < nb; b++) cum[b] += val(s, b);
                 }
             } else { /* Lines */
                 for (const Series &s : seg.series) {
                     const char *dash = s.dashed
                         ? " stroke-dasharray=\"6 4\"" : "";
-                    std::fprintf(out, "<polyline fill=\"none\" stroke=\"%s\" "
+                    std::fprintf(out_, "<polyline fill=\"none\" stroke=\"%s\" "
                         "stroke-width=\"1.5\"%s points=\"",
                         s.color.c_str(), dash);
-                    std::fprintf(out, "%.2f,%.2f ", sxl, y_of(val(s, 0)));
+                    std::fprintf(out_, "%.2f,%.2f ", sxl, y_of(val(s, 0)));
                     for (int b = 0; b < nb; b++) {
-                        std::fprintf(out, "%.2f,%.2f ", ctr(b), y_of(val(s, b)));
+                        std::fprintf(out_, "%.2f,%.2f ", ctr(b), y_of(val(s, b)));
                     }
-                    std::fprintf(out, "%.2f,%.2f ",
+                    std::fprintf(out_, "%.2f,%.2f ",
                                  sxr, y_of(val(s, nb - 1)));
-                    std::fprintf(out, "\"/>\n");
+                    std::fprintf(out_, "\"/>\n");
                 }
             }
         }
@@ -1021,8 +1051,8 @@ static void render_plan(std::FILE *out, const ChartPlan &plan)
         /* Boundary dividers, x-axis cumulative-weight ticks, gated
          * per-segment labels, and gated per-segment warmup rules. */
         double last_lbl_x = -1e9;
-        for (size_t si = 0; si < plan.segments.size(); si++) {
-            const auto &seg = plan.segments[si];
+        for (size_t si = 0; si < plan_.segments.size(); si++) {
+            const auto &seg = plan_.segments[si];
             double sxl = L + seg.x0_frac * plot_w;
             double sxr = L + seg.x1_frac * plot_w;
             double sw  = sxr - sxl;
@@ -1032,15 +1062,15 @@ static void render_plan(std::FILE *out, const ChartPlan &plan)
              * read at least as strongly as the dashed warmup rules and
              * don't fade into the plot background. */
             if (si > 0) {
-                std::fprintf(out,
+                std::fprintf(out_,
                     "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
                     "stroke=\"#444444\" stroke-width=\"1.5\"/>\n",
                     sxl, T, sxl, T + plot_h);
             }
             /* Cumulative-weight x tick at the left boundary, labelled if
              * there's room since the last label. */
-            if (plan.show_x_labels) {
-                std::fprintf(out,
+            if (plan_.show_x_labels) {
+                std::fprintf(out_,
                     "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
                     "stroke=\"#cccccc\" stroke-width=\"1\"/>\n",
                     sxl, T + plot_h, sxl, T + plot_h + 4);
@@ -1048,7 +1078,7 @@ static void render_plan(std::FILE *out, const ChartPlan &plan)
                     char buf[16];
                     std::snprintf(buf, sizeof(buf), "%.0f%%",
                                   seg.x0_frac * 100.0);
-                    std::fprintf(out,
+                    std::fprintf(out_,
                         "<text x=\"%.2f\" y=\"%d\" text-anchor=\"middle\" "
                         "fill=\"#555\">%s</text>\n",
                         sxl, T + plot_h + 18, buf);
@@ -1060,7 +1090,7 @@ static void render_plan(std::FILE *out, const ChartPlan &plan)
              * placed at its relative position within the slice). */
             if (seg.warmup_frac >= 0.0 && sw >= WARMUP_MIN_PX) {
                 double wx = sxl + seg.warmup_frac * sw;
-                std::fprintf(out,
+                std::fprintf(out_,
                     "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
                     "stroke=\"#000000\" stroke-width=\"2\" "
                     "stroke-dasharray=\"9,5\"/>\n",
@@ -1069,60 +1099,27 @@ static void render_plan(std::FILE *out, const ChartPlan &plan)
             /* Per-segment label above the frame, if the slice is wide
              * enough to hold it. */
             if (!seg.label.empty() && sw >= LABEL_MIN_PX) {
-                std::fprintf(out,
+                std::fprintf(out_,
                     "<text x=\"%.2f\" y=\"%d\" text-anchor=\"middle\" "
                     "fill=\"#333\" font-size=\"10\">%s</text>\n",
                     sxl + sw / 2.0, T - 5, xml_escape(seg.label).c_str());
             }
         }
         /* Final right-edge cumulative tick (100%). */
-        if (plan.show_x_labels) {
-            std::fprintf(out,
+        if (plan_.show_x_labels) {
+            std::fprintf(out_,
                 "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" "
                 "stroke=\"#cccccc\" stroke-width=\"1\"/>\n",
                 L + plot_w, T + plot_h, L + plot_w, T + plot_h + 4);
-            std::fprintf(out,
+            std::fprintf(out_,
                 "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" "
                 "fill=\"#555\">100%%</text>\n", L + plot_w, T + plot_h + 18);
         }
 
-        /* x-axis title, y-axis title, chart title. */
-        if (!plan.x_label.empty() && plan.show_x_labels) {
-            std::fprintf(out,
-                "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" "
-                "fill=\"#333\" font-size=\"13\">%s</text>\n",
-                L + plot_w / 2, B_edge + 38, xml_escape(plan.x_label).c_str());
-        }
-        if (!plan.y_label.empty()) {
-            int yx = 22, yy = T + plot_h / 2;
-            std::fprintf(out,
-                "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" fill=\"#333\" "
-                "font-size=\"13\" transform=\"rotate(-90, %d, %d)\">%s</text>\n",
-                yx, yy, yx, yy, xml_escape(plan.y_label).c_str());
-        }
-        if (!plan.title.empty()) {
-            std::fprintf(out,
-                "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" "
-                "fill=\"#222\" font-size=\"16\" font-weight=\"600\">%s</text>\n",
-                L + plot_w / 2, T - 22, xml_escape(plan.title).c_str());
-        }
-
-        /* Unified legend from plan.series (label + global colour). */
-        int lx = L + plot_w + 16;
-        int ly = T + 8;
-        for (const Series &s : plan.series) {
-            if (s.label.empty()) continue;
-            std::fprintf(out,
-                "<rect x=\"%d\" y=\"%d\" width=\"12\" height=\"12\" "
-                "fill=\"%s\"/>\n", lx, ly, s.color.c_str());
-            std::fprintf(out,
-                "<text x=\"%d\" y=\"%d\" dominant-baseline=\"middle\" "
-                "fill=\"#222\">%s</text>\n",
-                lx + 18, ly + 6, xml_escape(s.label).c_str());
-            ly += 18;
-            if (ly > T + plot_h - 12) { lx += 120; ly = T + 8; }
-        }
-        return;
+        emit_axis_titles();
+        emit_title();
+        /* Composition legend wraps even after the final series. */
+        emit_legend(false);
     }
 
     /* X-axis labels.  Three modes:
@@ -1131,95 +1128,98 @@ static void render_plan(std::FILE *out, const ChartPlan &plan)
      *      each label sits under its bar instead of between bars.
      *  (c) Lines / Stacked: 6 evenly-spaced ticks labelled via
      *      fmt_count(bin * x_bin_size). */
-    if (!plan.x_tick_labels.empty()) {
-        int x_ticks = std::max(1, (int)plan.x_tick_labels.size() - 1);
-        /* When a Bars-mode plot supplies exactly one label per bin,
-         * center each label on its bar (instead of placing labels at
-         * bin EDGES, which leaves them visually offset half a bar from
-         * what they describe). */
-        bool center_on_bin =
-            (plan.mode == ChartPlan::Mode::Bars
-             && (int)plan.x_tick_labels.size() == plan.n_bins);
-        for (int t = 0; t <= x_ticks; t++) {
-            double bin = center_on_bin
-                ? (double)t + 0.5
-                : (plan.n_bins * (double)t) / x_ticks;
-            double x = x_of(bin);
-            std::fprintf(out,
-                "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
-                "stroke=\"#cccccc\" stroke-width=\"1\"/>\n",
-                x, T + plot_h, x, T + plot_h + 4);
-            if (plan.show_x_labels && t < (int)plan.x_tick_labels.size()) {
-                std::fprintf(out,
-                    "<text x=\"%.2f\" y=\"%d\" text-anchor=\"middle\" "
-                    "fill=\"#555\">%s</text>\n",
-                    x, T + plot_h + 18,
-                    xml_escape(plan.x_tick_labels[t]).c_str());
+    void emit_x_axis()
+    {
+        if (!plan_.x_tick_labels.empty()) {
+            int x_ticks = std::max(1, (int)plan_.x_tick_labels.size() - 1);
+            /* When a Bars-mode plot supplies exactly one label per bin,
+             * center each label on its bar (instead of placing labels at
+             * bin EDGES, which leaves them visually offset half a bar from
+             * what they describe). */
+            bool center_on_bin =
+                (plan_.mode == ChartPlan::Mode::Bars
+                 && (int)plan_.x_tick_labels.size() == plan_.n_bins);
+            for (int t = 0; t <= x_ticks; t++) {
+                double bin = center_on_bin
+                    ? (double)t + 0.5
+                    : (plan_.n_bins * (double)t) / x_ticks;
+                double x = x_of(bin);
+                std::fprintf(out_,
+                    "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
+                    "stroke=\"#cccccc\" stroke-width=\"1\"/>\n",
+                    x, T + plot_h, x, T + plot_h + 4);
+                if (plan_.show_x_labels && t < (int)plan_.x_tick_labels.size()) {
+                    std::fprintf(out_,
+                        "<text x=\"%.2f\" y=\"%d\" text-anchor=\"middle\" "
+                        "fill=\"#555\">%s</text>\n",
+                        x, T + plot_h + 18,
+                        xml_escape(plan_.x_tick_labels[t]).c_str());
+                }
             }
-        }
-    } else if (plan.mode == ChartPlan::Mode::Bars) {
-        /* Bin-centered ticks.  Pick a "nice" step (1/2/5 × 10^k)
-         * targeting ~6 ticks across n_bins; label = bin index, with
-         * optional unit suffix.  When an overflow bin is present at
-         * the right edge, skip any auto-tick that would land on it
-         * (its label would mis-describe a folded tail) and draw an
-         * explicit ">N" tick at the rightmost bin instead. */
-        int last_b = plan.n_bins - 1;
-        bool has_overflow = plan.has_overflow_bin
-                            && !plan.overflow_label.empty()
-                            && plan.n_bins > 0;
-        int step = std::max(1, plan.n_bins / 6);
-        static const int snap[] = {1, 2, 5, 10, 20, 50, 100, 200,
-                                   500, 1000, 2000, 5000, 10000};
-        for (int s : snap) { if (s >= step) { step = s; break; } }
-        for (int b = 0; b < plan.n_bins; b += step) {
-            if (has_overflow && b == last_b) continue;
-            double x = x_of((double)b + 0.5);
-            std::fprintf(out,
-                "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
-                "stroke=\"#cccccc\" stroke-width=\"1\"/>\n",
-                x, T + plot_h, x, T + plot_h + 4);
-            if (plan.show_x_labels) {
-                char buf[32];
-                std::snprintf(buf, sizeof(buf), "%d", b);
-                std::string lab = buf;
-                lab += plan.x_unit_suffix;
-                std::fprintf(out,
-                    "<text x=\"%.2f\" y=\"%d\" text-anchor=\"middle\" "
-                    "fill=\"#555\">%s</text>\n",
-                    x, T + plot_h + 18, xml_escape(lab).c_str());
+        } else if (plan_.mode == ChartPlan::Mode::Bars) {
+            /* Bin-centered ticks.  Pick a "nice" step (1/2/5 × 10^k)
+             * targeting ~6 ticks across n_bins; label = bin index, with
+             * optional unit suffix.  When an overflow bin is present at
+             * the right edge, skip any auto-tick that would land on it
+             * (its label would mis-describe a folded tail) and draw an
+             * explicit ">N" tick at the rightmost bin instead. */
+            int last_b = plan_.n_bins - 1;
+            bool has_overflow = plan_.has_overflow_bin
+                                && !plan_.overflow_label.empty()
+                                && plan_.n_bins > 0;
+            int step = std::max(1, plan_.n_bins / 6);
+            static const int snap[] = {1, 2, 5, 10, 20, 50, 100, 200,
+                                       500, 1000, 2000, 5000, 10000};
+            for (int s : snap) { if (s >= step) { step = s; break; } }
+            for (int b = 0; b < plan_.n_bins; b += step) {
+                if (has_overflow && b == last_b) continue;
+                double x = x_of((double)b + 0.5);
+                std::fprintf(out_,
+                    "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
+                    "stroke=\"#cccccc\" stroke-width=\"1\"/>\n",
+                    x, T + plot_h, x, T + plot_h + 4);
+                if (plan_.show_x_labels) {
+                    char buf[32];
+                    std::snprintf(buf, sizeof(buf), "%d", b);
+                    std::string lab = buf;
+                    lab += plan_.x_unit_suffix;
+                    std::fprintf(out_,
+                        "<text x=\"%.2f\" y=\"%d\" text-anchor=\"middle\" "
+                        "fill=\"#555\">%s</text>\n",
+                        x, T + plot_h + 18, xml_escape(lab).c_str());
+                }
             }
-        }
-        if (has_overflow) {
-            double x = x_of((double)last_b + 0.5);
-            std::fprintf(out,
-                "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
-                "stroke=\"#cccccc\" stroke-width=\"1\"/>\n",
-                x, T + plot_h, x, T + plot_h + 4);
-            if (plan.show_x_labels) {
-                std::fprintf(out,
-                    "<text x=\"%.2f\" y=\"%d\" text-anchor=\"middle\" "
-                    "fill=\"#555\">%s</text>\n",
-                    x, T + plot_h + 18,
-                    xml_escape(plan.overflow_label).c_str());
+            if (has_overflow) {
+                double x = x_of((double)last_b + 0.5);
+                std::fprintf(out_,
+                    "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
+                    "stroke=\"#cccccc\" stroke-width=\"1\"/>\n",
+                    x, T + plot_h, x, T + plot_h + 4);
+                if (plan_.show_x_labels) {
+                    std::fprintf(out_,
+                        "<text x=\"%.2f\" y=\"%d\" text-anchor=\"middle\" "
+                        "fill=\"#555\">%s</text>\n",
+                        x, T + plot_h + 18,
+                        xml_escape(plan_.overflow_label).c_str());
+                }
             }
-        }
-    } else {
-        int x_ticks = 6;
-        for (int t = 0; t <= x_ticks; t++) {
-            double bin = (plan.n_bins * (double)t) / x_ticks;
-            uint64_t insn = (uint64_t)(plan.x_bin_size * bin);
-            double x = x_of(bin);
-            std::fprintf(out,
-                "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
-                "stroke=\"#cccccc\" stroke-width=\"1\"/>\n",
-                x, T + plot_h, x, T + plot_h + 4);
-            if (plan.show_x_labels) {
-                std::fprintf(out,
-                    "<text x=\"%.2f\" y=\"%d\" text-anchor=\"middle\" "
-                    "fill=\"#555\">%s</text>\n",
-                    x, T + plot_h + 18,
-                    xml_escape(fmt_count(insn)).c_str());
+        } else {
+            int x_ticks = 6;
+            for (int t = 0; t <= x_ticks; t++) {
+                double bin = (plan_.n_bins * (double)t) / x_ticks;
+                uint64_t insn = (uint64_t)(plan_.x_bin_size * bin);
+                double x = x_of(bin);
+                std::fprintf(out_,
+                    "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
+                    "stroke=\"#cccccc\" stroke-width=\"1\"/>\n",
+                    x, T + plot_h, x, T + plot_h + 4);
+                if (plan_.show_x_labels) {
+                    std::fprintf(out_,
+                        "<text x=\"%.2f\" y=\"%d\" text-anchor=\"middle\" "
+                        "fill=\"#555\">%s</text>\n",
+                        x, T + plot_h + 18,
+                        xml_escape(fmt_count(insn)).c_str());
+                }
             }
         }
     }
@@ -1228,115 +1228,126 @@ static void render_plan(std::FILE *out, const ChartPlan &plan)
      * (~B_edge + 38), well outside the plot frame; previously it lived
      * INSIDE the frame at B_edge - 8 and overlapped data, especially
      * histogram bars and any series whose values approached zero. */
-    if (!plan.x_label.empty() && plan.show_x_labels) {
-        std::fprintf(out,
-            "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" "
-            "fill=\"#333\" font-size=\"13\">%s</text>\n",
-            L + plot_w / 2, B_edge + 38,
-            xml_escape(plan.x_label).c_str());
-    }
-    if (!plan.y_label.empty()) {
-        int yx = 22, yy = T + plot_h / 2;
-        std::fprintf(out,
-            "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" fill=\"#333\" "
-            "font-size=\"13\" transform=\"rotate(-90, %d, %d)\">%s</text>\n",
-            yx, yy, yx, yy, xml_escape(plan.y_label).c_str());
+    void emit_axis_titles()
+    {
+        if (!plan_.x_label.empty() && plan_.show_x_labels) {
+            std::fprintf(out_,
+                "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" "
+                "fill=\"#333\" font-size=\"13\">%s</text>\n",
+                L + plot_w / 2, B_edge + 38,
+                xml_escape(plan_.x_label).c_str());
+        }
+        if (!plan_.y_label.empty()) {
+            int yx = 22, yy = T + plot_h / 2;
+            std::fprintf(out_,
+                "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" fill=\"#333\" "
+                "font-size=\"13\" transform=\"rotate(-90, %d, %d)\">%s</text>\n",
+                yx, yy, yx, yy, xml_escape(plan_.y_label).c_str());
+        }
     }
 
-    /* Title. */
-    if (!plan.title.empty()) {
-        std::fprintf(out,
-            "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" "
-            "fill=\"#222\" font-size=\"16\" font-weight=\"600\">%s</text>\n",
-            L + plot_w / 2, T - 22, xml_escape(plan.title).c_str());
+    void emit_title()
+    {
+        if (!plan_.title.empty()) {
+            std::fprintf(out_,
+                "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" "
+                "fill=\"#222\" font-size=\"16\" font-weight=\"600\">%s</text>\n",
+                L + plot_w / 2, T - 22, xml_escape(plan_.title).c_str());
+        }
     }
 
     /* Warm-up overlay: a translucent rectangle over the first
      * @warmup_bins bins, plus a small "warmup" label at the top of
      * the overlay so it's clear the data isn't missing — it's
      * deliberately excluded from scaling. */
-    if (plan.warmup_bins > 0 && plan.warmup_bins < plan.n_bins) {
-        double x0 = x_of(0);
-        double x1 = x_of(plan.warmup_bins);
-        std::fprintf(out,
-            "<rect x=\"%.2f\" y=\"%d\" width=\"%.2f\" height=\"%d\" "
-            "fill=\"#000000\" fill-opacity=\"0.05\"/>\n",
-            x0, T, x1 - x0, plot_h);
-        std::fprintf(out,
-            "<text x=\"%.2f\" y=\"%d\" text-anchor=\"start\" "
-            "fill=\"#666\" font-size=\"10\" font-style=\"italic\">"
-            "warmup</text>\n", x0 + 3, T + 12);
+    void emit_warmup_overlay()
+    {
+        if (plan_.warmup_bins > 0 && plan_.warmup_bins < plan_.n_bins) {
+            double x0 = x_of(0);
+            double x1 = x_of(plan_.warmup_bins);
+            std::fprintf(out_,
+                "<rect x=\"%.2f\" y=\"%d\" width=\"%.2f\" height=\"%d\" "
+                "fill=\"#000000\" fill-opacity=\"0.05\"/>\n",
+                x0, T, x1 - x0, plot_h);
+            std::fprintf(out_,
+                "<text x=\"%.2f\" y=\"%d\" text-anchor=\"start\" "
+                "fill=\"#666\" font-size=\"10\" font-style=\"italic\">"
+                "warmup</text>\n", x0 + 3, T + 12);
+        }
     }
 
     /* Plot. */
-    if (plan.mode == ChartPlan::Mode::Bars) {
-        /* Histogram bars.  With a single series this is one filled rect
-         * per bin (top = y_of(value), bottom = y_of(0)).  With multiple
-         * series (aggregate mode: one per simpoint) the bars STACK, so
-         * each bucket shows how each simpoint contributes to the overall
-         * shape while the total height stays the weighted-mean
-         * distribution.  Single-series plots are unaffected (the stack of
-         * one == the old single bar). */
-        std::vector<double> cum((size_t)plan.n_bins, 0.0);
-        for (size_t si = 0; si < plan.series.size(); si++) {
-            const Series &s = plan.series[si];
-            for (int b = 0; b < plan.n_bins; b++) {
-                double v = (b < (int)s.y.size()) ? s.y[b] : 0.0;
-                if (v <= 0) continue;
-                double xl = x_of(b);
-                double xr = x_of(b + 1);
-                double yt = y_of(cum[b] + v);
-                double yb = y_of(cum[b]);
-                cum[b] += v;
-                std::fprintf(out,
-                    "<rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" "
-                    "height=\"%.2f\" fill=\"%s\" fill-opacity=\"0.85\" "
-                    "stroke=\"%s\" stroke-width=\"0.5\"/>\n",
-                    xl, yt, std::max(0.5, xr - xl), yb - yt,
+    void emit_data()
+    {
+        if (plan_.mode == ChartPlan::Mode::Bars) {
+            /* Histogram bars.  With a single series this is one filled rect
+             * per bin (top = y_of(value), bottom = y_of(0)).  With multiple
+             * series (aggregate mode: one per simpoint) the bars STACK, so
+             * each bucket shows how each simpoint contributes to the overall
+             * shape while the total height stays the weighted-mean
+             * distribution.  Single-series plots are unaffected (the stack of
+             * one == the old single bar). */
+            std::vector<double> cum((size_t)plan_.n_bins, 0.0);
+            for (size_t si = 0; si < plan_.series.size(); si++) {
+                const Series &s = plan_.series[si];
+                for (int b = 0; b < plan_.n_bins; b++) {
+                    double v = (b < (int)s.y.size()) ? s.y[b] : 0.0;
+                    if (v <= 0) continue;
+                    double xl = x_of(b);
+                    double xr = x_of(b + 1);
+                    double yt = y_of(cum[b] + v);
+                    double yb = y_of(cum[b]);
+                    cum[b] += v;
+                    std::fprintf(out_,
+                        "<rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" "
+                        "height=\"%.2f\" fill=\"%s\" fill-opacity=\"0.85\" "
+                        "stroke=\"%s\" stroke-width=\"0.5\"/>\n",
+                        xl, yt, std::max(0.5, xr - xl), yb - yt,
+                        s.color.c_str(), s.color.c_str());
+                }
+            }
+        } else if (plan_.mode == ChartPlan::Mode::Lines) {
+            for (size_t si = 0; si < plan_.series.size(); si++) {
+                const Series &s = plan_.series[si];
+                const char *dash_attr = s.dashed
+                    ? " stroke-dasharray=\"6 4\""
+                    : "";
+                std::fprintf(out_, "<polyline fill=\"none\" stroke=\"%s\" "
+                    "stroke-width=\"1.5\"%s points=\"",
+                    s.color.c_str(), dash_attr);
+                for (int b = 0; b < plan_.n_bins; b++) {
+                    double v = (b < (int)s.y.size()) ? s.y[b] : 0.0;
+                    std::fprintf(out_, "%.2f,%.2f ",
+                                 x_of(b + 0.5), y_of(v));
+                }
+                std::fprintf(out_, "\"/>\n");
+            }
+        } else {
+            /* Stacked area: layer 0 at the bottom; cumulative y per bin. */
+            std::vector<double> cum(plan_.n_bins, 0.0);
+            for (size_t si = 0; si < plan_.series.size(); si++) {
+                const Series &s = plan_.series[si];
+                std::fprintf(out_,
+                    "<polygon fill=\"%s\" fill-opacity=\"0.9\" "
+                    "stroke=\"%s\" stroke-width=\"0.5\" points=\"",
                     s.color.c_str(), s.color.c_str());
-            }
-        }
-    } else if (plan.mode == ChartPlan::Mode::Lines) {
-        for (size_t si = 0; si < plan.series.size(); si++) {
-            const Series &s = plan.series[si];
-            const char *dash_attr = s.dashed
-                ? " stroke-dasharray=\"6 4\""
-                : "";
-            std::fprintf(out, "<polyline fill=\"none\" stroke=\"%s\" "
-                "stroke-width=\"1.5\"%s points=\"",
-                s.color.c_str(), dash_attr);
-            for (int b = 0; b < plan.n_bins; b++) {
-                double v = (b < (int)s.y.size()) ? s.y[b] : 0.0;
-                std::fprintf(out, "%.2f,%.2f ",
-                             x_of(b + 0.5), y_of(v));
-            }
-            std::fprintf(out, "\"/>\n");
-        }
-    } else {
-        /* Stacked area: layer 0 at the bottom; cumulative y per bin. */
-        std::vector<double> cum(plan.n_bins, 0.0);
-        for (size_t si = 0; si < plan.series.size(); si++) {
-            const Series &s = plan.series[si];
-            std::fprintf(out,
-                "<polygon fill=\"%s\" fill-opacity=\"0.9\" "
-                "stroke=\"%s\" stroke-width=\"0.5\" points=\"",
-                s.color.c_str(), s.color.c_str());
-            /* upper edge */
-            for (int b = 0; b < plan.n_bins; b++) {
-                double v = (b < (int)s.y.size()) ? s.y[b] : 0.0;
-                std::fprintf(out, "%.2f,%.2f ",
-                             x_of(b + 0.5), y_of(cum[b] + v));
-            }
-            /* lower edge (reverse) */
-            for (int b = plan.n_bins - 1; b >= 0; b--) {
-                std::fprintf(out, "%.2f,%.2f ",
-                             x_of(b + 0.5), y_of(cum[b]));
-            }
-            std::fprintf(out, "\"/>\n");
+                /* upper edge */
+                for (int b = 0; b < plan_.n_bins; b++) {
+                    double v = (b < (int)s.y.size()) ? s.y[b] : 0.0;
+                    std::fprintf(out_, "%.2f,%.2f ",
+                                 x_of(b + 0.5), y_of(cum[b] + v));
+                }
+                /* lower edge (reverse) */
+                for (int b = plan_.n_bins - 1; b >= 0; b--) {
+                    std::fprintf(out_, "%.2f,%.2f ",
+                                 x_of(b + 0.5), y_of(cum[b]));
+                }
+                std::fprintf(out_, "\"/>\n");
 
-            for (int b = 0; b < plan.n_bins; b++) {
-                double v = (b < (int)s.y.size()) ? s.y[b] : 0.0;
-                cum[b] += v;
+                for (int b = 0; b < plan_.n_bins; b++) {
+                    double v = (b < (int)s.y.size()) ? s.y[b] : 0.0;
+                    cum[b] += v;
+                }
             }
         }
     }
@@ -1348,59 +1359,75 @@ static void render_plan(std::FILE *out, const ChartPlan &plan)
      * custom-tick static-summary plots measure something other than CP
      * insns, so skip them.  The value is an arch CP-insn count mapped to
      * a bin via x_bin_size, clamped to the plotted range. */
-    if (plan.warmup_end_insns != UINT64_MAX && plan.warmup_end_insns != 0 &&
-        plan.mode != ChartPlan::Mode::Bars && plan.x_tick_labels.empty() &&
-        plan.x_bin_size > 0 && plan.n_bins > 0) {
-        double bin = (double)plan.warmup_end_insns / (double)plan.x_bin_size;
-        if (bin > 0 && bin <= plan.n_bins) {
-            double x = x_of(bin);
-            /* Heavy solid black dashed rule, full opacity, drawn over the
-             * data so it's unmistakable. */
-            std::fprintf(out,
-                "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
-                "stroke=\"#000000\" stroke-width=\"2.5\" "
-                "stroke-dasharray=\"9,5\"/>\n",
-                x, T, x, T + plot_h);
-            /* Label ABOVE the plot frame, centred on the rule, on the
-             * white canvas margin where it's always legible.  Nudge it
-             * inward at the extreme right edge so it doesn't collide with
-             * the legend / clip off-canvas. */
-            const char *lbl = "end of warmup";
-            const char *anchor = "middle";
-            double lx = x;
-            if (x > R_edge - 40) { anchor = "end"; lx = x; }
-            std::fprintf(out,
-                "<text x=\"%.2f\" y=\"%d\" text-anchor=\"%s\" "
-                "fill=\"#000000\" font-size=\"11\" font-weight=\"700\">"
-                "%s</text>\n", lx, T - 6, anchor, lbl);
+    void emit_warmup_end_marker()
+    {
+        if (plan_.warmup_end_insns != UINT64_MAX && plan_.warmup_end_insns != 0 &&
+            plan_.mode != ChartPlan::Mode::Bars && plan_.x_tick_labels.empty() &&
+            plan_.x_bin_size > 0 && plan_.n_bins > 0) {
+            double bin = (double)plan_.warmup_end_insns / (double)plan_.x_bin_size;
+            if (bin > 0 && bin <= plan_.n_bins) {
+                double x = x_of(bin);
+                /* Heavy solid black dashed rule, full opacity, drawn over the
+                 * data so it's unmistakable. */
+                std::fprintf(out_,
+                    "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
+                    "stroke=\"#000000\" stroke-width=\"2.5\" "
+                    "stroke-dasharray=\"9,5\"/>\n",
+                    x, T, x, T + plot_h);
+                /* Label ABOVE the plot frame, centred on the rule, on the
+                 * white canvas margin where it's always legible.  Nudge it
+                 * inward at the extreme right edge so it doesn't collide with
+                 * the legend / clip off-canvas. */
+                const char *lbl = "end of warmup";
+                const char *anchor = "middle";
+                double lx = x;
+                if (x > R_edge - 40) { anchor = "end"; lx = x; }
+                std::fprintf(out_,
+                    "<text x=\"%.2f\" y=\"%d\" text-anchor=\"%s\" "
+                    "fill=\"#000000\" font-size=\"11\" font-weight=\"700\">"
+                    "%s</text>\n", lx, T - 6, anchor, lbl);
+            }
         }
     }
 
-    /* Legend.  Entries with empty labels are skipped — used by
-     * single-series histograms whose y-axis label already names the
-     * data, so a legend square would just be noise. */
-    int lx = L + plot_w + 16;
-    int ly = T + 8;
-    for (size_t si = 0; si < plan.series.size(); si++) {
-        const Series &s = plan.series[si];
-        if (s.label.empty()) continue;
-        std::fprintf(out,
-            "<rect x=\"%d\" y=\"%d\" width=\"12\" height=\"12\" "
-            "fill=\"%s\"/>\n",
-            lx, ly, s.color.c_str());
-        std::fprintf(out,
-            "<text x=\"%d\" y=\"%d\" dominant-baseline=\"middle\" "
-            "fill=\"#222\">%s</text>\n",
-            lx + 18, ly + 6, xml_escape(s.label).c_str());
-        ly += 18;
-        /* Wrap into a second column if the legend overflows the
-         * plot height — keeps the SVG readable even with many top-K
-         * layers. */
-        if (ly > T + plot_h - 12 && si + 1 < plan.series.size()) {
-            lx += 120;
-            ly = T + 8;
+    /* Legend.  Entries with empty labels are skipped — used by single-series
+     * histograms whose y-axis label already names the data, so a legend
+     * square would just be noise.  Entries wrap into a second column when
+     * they overflow the plot height; @guard_last suppresses the wrap after
+     * the final series (the normal path's behaviour, vs the composition
+     * pane which always evaluates the wrap). */
+    void emit_legend(bool guard_last)
+    {
+        int lx = L + plot_w + 16;
+        int ly = T + 8;
+        for (size_t si = 0; si < plan_.series.size(); si++) {
+            const Series &s = plan_.series[si];
+            if (s.label.empty()) continue;
+            std::fprintf(out_,
+                "<rect x=\"%d\" y=\"%d\" width=\"12\" height=\"12\" "
+                "fill=\"%s\"/>\n",
+                lx, ly, s.color.c_str());
+            std::fprintf(out_,
+                "<text x=\"%d\" y=\"%d\" dominant-baseline=\"middle\" "
+                "fill=\"#222\">%s</text>\n",
+                lx + 18, ly + 6, xml_escape(s.label).c_str());
+            ly += 18;
+            bool wrap = ly > T + plot_h - 12;
+            if (guard_last) {
+                wrap = wrap && si + 1 < plan_.series.size();
+            }
+            if (wrap) { lx += 120; ly = T + 8; }
         }
     }
+
+    std::FILE *out_;
+    const ChartPlan &plan_;
+    const int VX, VY, VW, VH, L, R_edge, T, B_edge, plot_w, plot_h;
+};
+
+static void render_plan(std::FILE *out, const ChartPlan &plan)
+{
+    SvgEmitter(out, plan).render();
 }
 
 /* ===================================================================

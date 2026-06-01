@@ -2114,6 +2114,80 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
     g_rec_mutex_unlock(&exec_lock);
 }
 
+/* Outcome of the pre-commit instruction-memory stability check. */
+struct TbPoison {
+    bool        poisoned = false;
+    uint64_t    pc = 0;
+    const char *reason = nullptr;
+    bool        is_smc_signal = false;
+};
+
+/*
+ * Detect non-stable "instruction" memory before committing this TB as a
+ * fragment.  Two independent signals:
+ *
+ *   1. Capstone decode failure on any canonical insn (empty mnemonic): the
+ *      bytes don't parse as a valid instruction of this ISA.  Cannot be
+ *      real code.
+ *
+ *   2. Byte change since the first sighting of this VA: the same address
+ *      now reads different bytes than the last time the tracer saw it.
+ *      Real code does not change (no self-modification in this workload);
+ *      writable memory (stack, heap, .bss) does.
+ *
+ * Either signal poisons the TB's start_pc — the WP walker bails before
+ * re-entering, and subsequent translations short-circuit fragment creation.
+ * Only the byte-change signal points specifically at self-modifying code;
+ * Capstone decode failure also fires on perfectly stable .rodata that the
+ * R-E LOAD segment happens to cover (static binaries place .text and
+ * .rodata in the same R-E LOAD, so start_code/end_code spans both) — that
+ * is WP wrong-pathing into data, not SMC.  Records the first-sighting word
+ * of every new canonical PC.  Takes data_lock.
+ */
+static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
+                                 const uint8_t *insn_bytes,
+                                 const qemu_plugin_insn_info *insn_info,
+                                 uint32_t canonical_n_insns)
+{
+    TbPoison p;
+
+    g_mutex_lock(&data_lock);
+    if (g_poisoned_pcs.count(pc)) {
+        p.poisoned = true;
+        p.pc = pc;
+        p.reason = "previously poisoned";
+    } else {
+        for (uint32_t ci = 0; ci < canonical_n_insns && !p.poisoned; ci++) {
+            uint64_t ipc = insn_pcs[ci];
+            uint32_t word = 0;
+            memcpy(&word, &insn_bytes[(size_t)ci * MAX_INSN_BYTES],
+                   sizeof(word));
+            auto it = g_first_insn_word.find(ipc);
+            if (it != g_first_insn_word.end()) {
+                if (it->second != word) {
+                    p.poisoned = true;
+                    p.pc = ipc;
+                    p.reason = "bytes changed since first sighting";
+                    p.is_smc_signal = true;
+                }
+            } else {
+                g_first_insn_word.emplace(ipc, word);
+            }
+            if (!p.poisoned &&
+                cst_cap_arch >= 0 && !insn_info[ci].mnemonic[0]) {
+                p.poisoned = true;
+                p.pc = ipc;
+                p.reason = "Capstone decode failure";
+            }
+        }
+        if (p.poisoned) {
+            g_poisoned_pcs.insert(pc);
+        }
+    }
+    g_mutex_unlock(&data_lock);
+    return p;
+}
+
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     uint64_t pc = qemu_plugin_tb_vaddr(tb);
@@ -2224,77 +2298,13 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             (void *)(uintptr_t)raw_pc);
     }
 
-    /*
-     * Detect non-stable "instruction" memory before committing this TB
-     * as a fragment.  Two independent signals:
-     *
-     *   1. Capstone decode failure on any canonical insn (empty
-     *      mnemonic): the bytes don't parse as a valid instruction of
-     *      this ISA.  Cannot be real code.
-     *
-     *   2. Byte change since the first sighting of this VA: the same
-     *      address now reads different bytes than the last time the
-     *      tracer saw it.  Real code does not change (no
-     *      self-modification in this workload); writable memory
-     *      (stack, heap, .bss) does.
-     *
-     * Either signal poisons the TB's start_pc — the WP walker bails
-     * before re-entering, and subsequent translations short-circuit
-     * fragment creation here.  If the poisoning fires inside the main
-     * binary's text segment [g_code_start, g_code_end), warn once: that
-     * is a real SMC suspect, not WP wrong-pathing into data.
-     */
-    bool poison_tb = false;
-    uint64_t poison_pc = 0;
-    const char *poison_reason = nullptr;
-    bool poison_is_smc_signal = false;
-
-    g_mutex_lock(&data_lock);
-    if (g_poisoned_pcs.count(pc)) {
-        poison_tb = true;
-        poison_pc = pc;
-        poison_reason = "previously poisoned";
-    } else {
-        for (uint32_t ci = 0; ci < canonical_n_insns && !poison_tb; ci++) {
-            uint64_t ipc = insn_pcs[ci];
-            uint32_t word = 0;
-            memcpy(&word, &insn_bytes[(size_t)ci * MAX_INSN_BYTES],
-                   sizeof(word));
-            auto it = g_first_insn_word.find(ipc);
-            if (it != g_first_insn_word.end()) {
-                if (it->second != word) {
-                    poison_tb = true;
-                    poison_pc = ipc;
-                    poison_reason = "bytes changed since first sighting";
-                    /* Byte change at a stable VA is the only signal
-                     * that points specifically at self-modifying code.
-                     * Capstone decode failure on the other hand fires
-                     * on perfectly stable .rodata that the R-E LOAD
-                     * segment happens to cover (typical static
-                     * binaries place .text and .rodata in the same
-                     * R-E LOAD, so qemu_plugin_start_code/end_code
-                     * spans both) — that's WP wrong-pathing into
-                     * data, not SMC. */
-                    poison_is_smc_signal = true;
-                }
-            } else {
-                g_first_insn_word.emplace(ipc, word);
-            }
-            if (!poison_tb &&
-                cst_cap_arch >= 0 && !insn_info[ci].mnemonic[0]) {
-                poison_tb = true;
-                poison_pc = ipc;
-                poison_reason = "Capstone decode failure";
-            }
-        }
-        if (poison_tb) {
-            g_poisoned_pcs.insert(pc);
-        }
-    }
-    g_mutex_unlock(&data_lock);
-
-    if (poison_tb) {
-        if (poison_is_smc_signal && cst_pc_in_code(poison_pc)) {
+    /* Pre-commit instruction-memory stability check.  If the poisoning
+     * fires inside the main binary's text segment, warn once: that is a
+     * real SMC suspect, not WP wrong-pathing into data. */
+    TbPoison poison = detect_tb_poison(pc, insn_pcs, insn_bytes, insn_info,
+                                       canonical_n_insns);
+    if (poison.poisoned) {
+        if (poison.is_smc_signal && cst_pc_in_code(poison.pc)) {
             static std::atomic<int> warned{0};
             int expected = 0;
             if (warned.compare_exchange_strong(expected, 1)) {
@@ -2304,7 +2314,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                     "self-modifying code; suppressing fragment "
                     "creation for TB at 0x%" PRIx64 ".  "
                     "(Further occurrences suppressed.)\n",
-                    poison_pc, poison_reason, pc);
+                    poison.pc, poison.reason, pc);
             }
         }
         /* Drop all per-TB scratch; do not create fragments, do not arm

@@ -107,6 +107,19 @@ static inline bool cpu_plugin_spec_active(CPUState *cpu)
     return unlikely(cpu->plugin_spec_mode && cpu->plugin_spec_store_buf);
 }
 
+/*
+ * True when a probe_access* fast-path host pointer must be suppressed.
+ * In speculative mode we return NULL so callers fall back to the
+ * cpu_ld/cpu_st slow-path helpers, where the spec store buffer and load
+ * overlay intercept the access.  Callers keep their own return shape (and
+ * any size guard); this only names the redirect decision so the rationale
+ * lives in one place rather than being copied at each probe site.
+ */
+static inline bool cpu_plugin_spec_redirect_probe(CPUState *cpu)
+{
+    return cpu_plugin_spec_active(cpu);
+}
+
 /* spec_line_get_or_alloc is declared in include/exec/plugin-spec.h. */
 
 static inline PluginSpecLine *spec_line_lookup(CPUState *cpu, vaddr line_addr)

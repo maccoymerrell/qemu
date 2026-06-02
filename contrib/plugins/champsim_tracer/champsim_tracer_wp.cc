@@ -122,6 +122,131 @@ static void wp_enter_spec_session(unsigned int cpu_index, uint64_t wrong_target,
     qemu_plugin_set_pc(wrong_target);
 }
 
+/*
+ * Append the executed prefix [0, n_executed_in_cur) of fragment @cur into
+ * the WP accumulator, de-duplicating against the accumulator tail (a
+ * self-looping single-insn TB re-appends the same insn) and recording
+ * per-execution WP attribution stats.  Advances @wp_snap_cursor over the
+ * per-insn reg snaps the exec_tb callbacks captured (every executed insn
+ * except each fragment's last, which falls back to a live regfile read).
+ * Returns the number of insns actually appended (post-dedup).
+ */
+static uint32_t wp_append_fragment_insns(WpAccum &acc, BBTemplate *cur,
+                                         uint32_t n_executed_in_cur,
+                                         size_t &wp_snap_cursor,
+                                         unsigned int cpu_index,
+                                         Stats &stats, Stats *hist)
+{
+    auto &bb_pcs       = acc.bb_pcs;
+    auto &bb_sizes     = acc.bb_sizes;
+    auto &bb_bytes     = acc.bb_bytes;
+    auto &bb_fields    = acc.bb_fields;
+    auto &bb_regnames  = acc.bb_regnames;
+    auto &bb_reg_snaps = acc.bb_reg_snaps;
+    /* Stable zeroed sentinel for the rare reg-data-on-but-template-has-no-
+     * regnames case (keeps a valid pointer to push). */
+    static const InsnRegNames kEmptyRegNames{};
+
+    uint32_t appended_insns = 0;
+    for (uint32_t i = 0; i < n_executed_in_cur; i++) {
+        uint64_t insn_pc = cur->insn_pcs[i];
+        uint8_t isz = cur->insn_sizes[i];
+        bool duplicate = false;
+        if (!bb_pcs.empty()) {
+            size_t prev = bb_pcs.size() - 1;
+            duplicate = bb_pcs[prev] == insn_pc &&
+                        bb_sizes[prev] == isz &&
+                        memcmp(&bb_bytes[prev * MAX_INSN_BYTES],
+                               &cur->insn_bytes[(size_t)i *
+                                                MAX_INSN_BYTES],
+                               MAX_INSN_BYTES) == 0;
+        }
+        if (duplicate) {
+            /* The per-insn callback fired for this insn (if it is not the
+             * fragment's last executed insn) regardless of dedup, so advance
+             * the WP snap cursor past its slot to keep alignment with
+             * subsequent insns' captures. */
+            if (g_features.wp_reg_data &&
+                i + 1 < n_executed_in_cur) {
+                wp_snap_cursor +=
+                    cur->insn_fields[i].n_dst_regs;
+            }
+            continue;
+        }
+
+        bb_pcs.push_back(insn_pc);
+        bb_sizes.push_back(isz);
+        bb_bytes.insert(bb_bytes.end(),
+                        &cur->insn_bytes[i * MAX_INSN_BYTES],
+                        &cur->insn_bytes[i * MAX_INSN_BYTES] +
+                        MAX_INSN_BYTES);
+        bb_fields.push_back(&cur->insn_fields[i]);
+
+        /* WP-side per-execution attribution: mirrors the CP walk in
+         * vcpu_tb_exec, scoped to non-duplicate WP insns. */
+        {
+            const InsnFields *f = &cur->insn_fields[i];
+            stats.wp_insns_by_opcode[f->opcode]++;
+            if (hist) hist->wp_insns_by_opcode[f->opcode]++;
+            if (f->branch_type != BRANCH_NONE) {
+                stats.wp_branches_by_type[f->branch_type]++;
+                if (hist) hist->wp_branches_by_type[f->branch_type]++;
+            }
+            for (uint8_t k = 0; k < f->n_src_regs; k++) {
+                stats.wp_src_reg_uses[f->src_regs[k]]++;
+                if (hist) hist->wp_src_reg_uses[f->src_regs[k]]++;
+            }
+            for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+                stats.wp_dst_reg_writes[f->dst_regs[d]]++;
+                if (hist) hist->wp_dst_reg_writes[f->dst_regs[d]]++;
+            }
+        }
+
+        if (g_features.reg_data) {
+            bb_regnames.push_back(cur->insn_reg_names
+                                  ? &cur->insn_reg_names[i]
+                                  : &kEmptyRegNames);
+        }
+        if (g_features.wp_reg_data) {
+            const InsnFields *f = &cur->insn_fields[i];
+            if (i + 1 < n_executed_in_cur) {
+                /* Per-insn-accurate snap from the WP scratch buffer:
+                 * captured at insn (i+1)'s pre-exec during the just-finished
+                 * exec_tb, i.e. exactly the post-this-insn / pre-next-insn
+                 * regfile state.  Mirrors CP regdata semantics for all but
+                 * each fragment's last executed insn. */
+                for (uint8_t k = 0; k < f->n_dst_regs; k++) {
+                    if (wp_snap_cursor <
+                        wp_pending_reg_snaps.size()) {
+                        bb_reg_snaps.push_back(
+                            wp_pending_reg_snaps[
+                                wp_snap_cursor++]);
+                    } else {
+                        /* Underrun fallback: a missed callback (shouldn't
+                         * happen for executed insns) — push a zeroed snap so
+                         * downstream indexing stays aligned with
+                         * bb_regnames. */
+                        bb_reg_snaps.emplace_back(RegSnap{});
+                    }
+                }
+            } else {
+                /* Last executed insn of this fragment: no successor pre-exec
+                 * hook inside the fragment to capture it.  Fall back to a
+                 * live read from current (post-exec_tb) regfile state.  For
+                 * a multi-fragment exec_tb this captures the
+                 * post-everything-in-exec_tb state, so later fragments'
+                 * writes can shadow this insn's writes (the one residual
+                 * case where WP regdata loses per-insn precision). */
+                g_reg_snaps.capture_insn_snaps_live(cpu_index,
+                                                    cur, i,
+                                                    bb_reg_snaps);
+            }
+        }
+        appended_insns++;
+    }
+    return appended_insns;
+}
+
 std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                                uint64_t correct_target,
                                                uint64_t wrong_target,
@@ -197,7 +322,6 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     auto &bb_first_fault_idx = acc.bb_first_fault_idx;
     /* Stable zeroed sentinel for the rare reg-data-on-but-template-has-no-
      * regnames case (keeps a valid pointer to push). */
-    static const InsnRegNames kEmptyRegNames{};
     bb_pcs.reserve(initial_insn_cap);
     bb_sizes.reserve(initial_insn_cap);
     bb_bytes.reserve(initial_insn_cap * MAX_INSN_BYTES);
@@ -423,112 +547,10 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                     bb_symbol_name = cur->symbol_name;
                 }
             }
-            uint32_t appended_insns = 0;
-            for (uint32_t i = 0; i < n_executed_in_cur; i++) {
-                uint64_t insn_pc = cur->insn_pcs[i];
-                uint8_t isz = cur->insn_sizes[i];
-                bool duplicate = false;
-                if (!bb_pcs.empty()) {
-                    size_t prev = bb_pcs.size() - 1;
-                    duplicate = bb_pcs[prev] == insn_pc &&
-                                bb_sizes[prev] == isz &&
-                                memcmp(&bb_bytes[prev * MAX_INSN_BYTES],
-                                       &cur->insn_bytes[(size_t)i *
-                                                        MAX_INSN_BYTES],
-                                       MAX_INSN_BYTES) == 0;
-                }
-                if (duplicate) {
-                    /* The per-insn callback fired for this insn (if
-                     * it is not the fragment's last executed insn)
-                     * regardless of dedup, so advance the WP snap
-                     * cursor past its slot to keep alignment with
-                     * subsequent insns' captures. */
-                    if (g_features.wp_reg_data &&
-                        i + 1 < n_executed_in_cur) {
-                        wp_snap_cursor +=
-                            cur->insn_fields[i].n_dst_regs;
-                    }
-                    continue;
-                }
-
-                bb_pcs.push_back(insn_pc);
-                bb_sizes.push_back(isz);
-                bb_bytes.insert(bb_bytes.end(),
-                                &cur->insn_bytes[i * MAX_INSN_BYTES],
-                                &cur->insn_bytes[i * MAX_INSN_BYTES] +
-                                MAX_INSN_BYTES);
-                bb_fields.push_back(&cur->insn_fields[i]);
-
-                /* WP-side per-execution attribution: mirrors the CP
-                 * walk in vcpu_tb_exec, scoped to non-duplicate WP
-                 * insns. */
-                {
-                    const InsnFields *f = &cur->insn_fields[i];
-                    stats.wp_insns_by_opcode[f->opcode]++;
-                    if (hist) hist->wp_insns_by_opcode[f->opcode]++;
-                    if (f->branch_type != BRANCH_NONE) {
-                        stats.wp_branches_by_type[f->branch_type]++;
-                        if (hist) hist->wp_branches_by_type[f->branch_type]++;
-                    }
-                    for (uint8_t k = 0; k < f->n_src_regs; k++) {
-                        stats.wp_src_reg_uses[f->src_regs[k]]++;
-                        if (hist) hist->wp_src_reg_uses[f->src_regs[k]]++;
-                    }
-                    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
-                        stats.wp_dst_reg_writes[f->dst_regs[d]]++;
-                        if (hist) hist->wp_dst_reg_writes[f->dst_regs[d]]++;
-                    }
-                }
-
-                if (g_features.reg_data) {
-                    bb_regnames.push_back(cur->insn_reg_names
-                                          ? &cur->insn_reg_names[i]
-                                          : &kEmptyRegNames);
-                }
-                if (g_features.wp_reg_data) {
-                    const InsnFields *f = &cur->insn_fields[i];
-                    if (i + 1 < n_executed_in_cur) {
-                        /* Per-insn-accurate snap from the WP scratch
-                         * buffer: captured at insn (i+1)'s pre-exec
-                         * during the just-finished exec_tb, i.e.
-                         * exactly the post-this-insn / pre-next-insn
-                         * regfile state.  Mirrors CP regdata semantics
-                         * for all but each fragment's last executed
-                         * insn. */
-                        for (uint8_t k = 0; k < f->n_dst_regs; k++) {
-                            if (wp_snap_cursor <
-                                wp_pending_reg_snaps.size()) {
-                                bb_reg_snaps.push_back(
-                                    wp_pending_reg_snaps[
-                                        wp_snap_cursor++]);
-                            } else {
-                                /* Underrun fallback: a missed callback
-                                 * (shouldn't happen for executed
-                                 * insns) — push a zeroed snap so
-                                 * downstream indexing stays aligned
-                                 * with bb_regnames. */
-                                bb_reg_snaps.emplace_back(RegSnap{});
-                            }
-                        }
-                    } else {
-                        /* Last executed insn of this fragment: no
-                         * successor pre-exec hook inside the fragment
-                         * to capture it.  Fall back to a live read
-                         * from current (post-exec_tb) regfile state.
-                         * For a single-fragment exec_tb this is
-                         * post-this-insn-state; for multi-fragment
-                         * exec_tb's this captures the post-everything-
-                         * in-exec_tb state, so later fragments'
-                         * writes can shadow this insn's writes (the
-                         * one residual case where WP regdata loses
-                         * per-insn precision). */
-                        g_reg_snaps.capture_insn_snaps_live(cpu_index,
-                                                            cur, i,
-                                                            bb_reg_snaps);
-                    }
-                }
-                appended_insns++;
-            }
+            uint32_t appended_insns =
+                wp_append_fragment_insns(acc, cur, n_executed_in_cur,
+                                         wp_snap_cursor, cpu_index,
+                                         stats, hist);
             uint8_t last_insn_size = n_executed_in_cur > 0
                 ? cur->insn_sizes[n_executed_in_cur - 1]
                 : 0;

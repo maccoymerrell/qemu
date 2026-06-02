@@ -2089,24 +2089,48 @@ static void split_tb_into_fragments(const qemu_plugin_insn_info *insn_info,
 /*
  * Guest-issued trace marker (WIN_MARKER, x86 only for now).
  *
- * A generic launch wrapper executes `mov $CST_MARKER_MAGIC, %eax` just
- * before execve-ing the unmodified target.  The plugin spots that exact
- * encoding (B8 imm32) at translation time and arms a one-shot exec
- * callback; when it runs, a trace segment opens here and covers the
- * next `simulation` instructions of the launched process.  This is the
- * only window source that needs no ELF symbol table, no host icount,
- * and no modification to the target or the guest kernel — so it is the
- * mechanism for system-mode tracing of a chosen process (paging on,
- * where wrong-path speculation is bounded).
+ * The marker is a sequence of CST_MARKER_SEQ_LEN identical
+ * `mov $CST_MARKER_MAGIC, %eax` instructions back to back.  The plugin
+ * spots that exact byte run at translation time and arms a one-shot exec
+ * callback on the last one; when it executes, a trace segment opens and
+ * the window pins to the executing address space (see vcpu_marker_cb).
+ * It needs no ELF symbol table, no host icount, and no modification to the
+ * target or the guest kernel, so it is the mechanism for system-mode
+ * tracing of a chosen process (paging on, where wrong-path speculation is
+ * bounded).
  *
- * NOTE (quick first cut): the window is `simulation` total instructions
- * from the marker, not yet user-space-only counted or pinned to the
- * target's address space.  The brief wrapper tail before execve is
- * negligible; SimPoint-grade user-space-instruction alignment and ASID
- * pinning are the planned refinement.
+ * Why a repeated sequence and not a single mov: a lone `mov $imm, %eax`
+ * can collide with ordinary code that happens to load that constant.
+ * Three identical immediate-loads to the same register in a row are
+ * provably-dead redundant work (the 2nd and 3rd rewrite %eax with a value
+ * it already holds) — no compiler emits that and a human only would
+ * deliberately, so the marker cannot occur in real code by accident.  The
+ * sequence must sit within one TB (straight-line, no branch, not straddling
+ * a page); the injector that emits it (cst_attach / synthetic workload)
+ * places it so.
+ *
+ * The magic must execute INSIDE the target's address space.  A launcher
+ * that runs it then execve's the target does NOT work: execve replaces the
+ * address space, so the marker's CR3 is the launcher's, not the target's.
+ * The marker therefore originates in the post-execve image — compiled into
+ * a synthetic workload, or injected at the entry point by cst_attach.
  */
-static const uint32_t CST_MARKER_MAGIC = 0x43535401u;   /* mov: B8 01 54 53 43 */
+static const uint32_t CST_MARKER_MAGIC = 0x43535401u;  /* mov: B8 01 54 53 43 */
+static const int CST_MARKER_INSN_BYTES = 5;            /* len of one B8 imm32 */
+static const uint32_t CST_MARKER_SEQ_LEN = 3;          /* identical movs in a row */
 static std::atomic<bool> g_marker_fired{false};
+
+/* True if @bytes/@size begins with one `mov $CST_MARKER_MAGIC, %eax`
+ * (B8 imm32, little-endian). */
+static inline bool marker_mov_match(const uint8_t *bytes, uint8_t size)
+{
+    return size >= CST_MARKER_INSN_BYTES &&
+           bytes[0] == 0xB8 &&
+           bytes[1] == (uint8_t)(CST_MARKER_MAGIC) &&
+           bytes[2] == (uint8_t)(CST_MARKER_MAGIC >> 8) &&
+           bytes[3] == (uint8_t)(CST_MARKER_MAGIC >> 16) &&
+           bytes[4] == (uint8_t)(CST_MARKER_MAGIC >> 24);
+}
 
 static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
 {
@@ -2260,6 +2284,7 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
     uint32_t *canonical_index          = scratch.canonical_index.get();
     bool *canonical_first              = scratch.canonical_first.get();
     uint32_t canonical_n_insns = 0;
+    uint32_t marker_run = 0;  /* consecutive marker movs seen (WIN_MARKER) */
 
     for (size_t i = 0; i < raw_n_insns; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
@@ -2270,20 +2295,22 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
 
         qemu_plugin_insn_data(insn, raw_bytes, raw_size);
 
-        /* WIN_MARKER (x86): arm the one-shot trace-open callback on the
-         * launch wrapper's magic `mov $CST_MARKER_MAGIC, %eax`
-         * (B8 imm32, little-endian).  Registered at every translation so
-         * the marker is caught whenever and wherever the process runs;
-         * the callback itself is one-shot. */
+        /* WIN_MARKER (x86): detect the CST_MARKER_SEQ_LEN-long run of
+         * identical marker movs and arm the one-shot trace-open callback on
+         * the LAST one.  marker_run counts consecutive matches in this TB's
+         * straight-line stream; arming on the final insn of the run means
+         * that when it executes, the whole sequence executed before it.
+         * Registered at every translation so the marker is caught wherever
+         * the process runs; the callback itself is one-shot. */
         if (g_window_mode == PluginConfig::WIN_MARKER &&
-            trace_isa == TRACE_ISA_X86 && raw_size >= 5 &&
-            raw_bytes[0] == 0xB8 &&
-            raw_bytes[1] == (uint8_t)(CST_MARKER_MAGIC) &&
-            raw_bytes[2] == (uint8_t)(CST_MARKER_MAGIC >> 8) &&
-            raw_bytes[3] == (uint8_t)(CST_MARKER_MAGIC >> 16) &&
-            raw_bytes[4] == (uint8_t)(CST_MARKER_MAGIC >> 24)) {
-            qemu_plugin_register_vcpu_insn_exec_cb(
-                insn, vcpu_marker_cb, QEMU_PLUGIN_CB_NO_REGS, nullptr);
+            trace_isa == TRACE_ISA_X86 &&
+            marker_mov_match(raw_bytes, raw_size)) {
+            if (++marker_run >= CST_MARKER_SEQ_LEN) {
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, vcpu_marker_cb, QEMU_PLUGIN_CB_NO_REGS, nullptr);
+            }
+        } else {
+            marker_run = 0;
         }
 
         bool duplicate = false;

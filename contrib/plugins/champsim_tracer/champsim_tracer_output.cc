@@ -289,6 +289,51 @@ static void write_reg_encoding_map(BitWriter *bw)
     }
 }
 
+/*
+ * Field-state storage class for a field-id (which plane it lands in).
+ * Lifted above the encoding-map writer so the single slotted/lane family
+ * table below can name the classes; FidLoc (which carries a cls) stays with
+ * the field-state machinery.
+ */
+enum { FS_LOC_INVALID = 0, FS_LOC_SCALAR_FIXED = 1,
+       FS_LOC_SCALAR_SLOT = 2, FS_LOC_WIDE_SLOT = 3 };
+
+/*
+ * The 8 stride-CST_FID_SLOT_STRIDE slotted field-id families, in wire order.
+ * ONE source of truth shared by write_field_id_encoding_map (which needs the
+ * base id + name prefix) and field_state_slot_lut_build (base + storage
+ * class + ordinal within that class's plane), so the encoding map the trace
+ * advertises and the writer's slot layout can never drift apart.
+ */
+struct SlottedFamily {
+    uint16_t    base;
+    const char *prefix;
+    uint8_t     cls;   /* FS_LOC_SCALAR_SLOT | FS_LOC_WIDE_SLOT */
+    uint8_t     ord;   /* ordinal within the cls plane */
+};
+static const SlottedFamily kSlottedFamilies[] = {
+    { CST_FID_LOAD_ADDR_BASE,     "CST_FID_LOAD_ADDR",     FS_LOC_SCALAR_SLOT, 0 },
+    { CST_FID_STORE_ADDR_BASE,    "CST_FID_STORE_ADDR",    FS_LOC_SCALAR_SLOT, 1 },
+    { CST_FID_LOAD_DATA_BASE,     "CST_FID_LOAD_DATA",     FS_LOC_WIDE_SLOT,   0 },
+    { CST_FID_STORE_DATA_BASE,    "CST_FID_STORE_DATA",    FS_LOC_WIDE_SLOT,   1 },
+    { CST_FID_DST_REG_BASE,       "CST_FID_DST_REG",       FS_LOC_WIDE_SLOT,   2 },
+    { CST_FID_LOAD_SIZE_BASE,     "CST_FID_LOAD_SIZE",     FS_LOC_SCALAR_SLOT, 2 },
+    { CST_FID_STORE_SIZE_BASE,    "CST_FID_STORE_SIZE",    FS_LOC_SCALAR_SLOT, 3 },
+    { CST_FID_DST_REG_WIDTH_BASE, "CST_FID_DST_REG_WIDTH", FS_LOC_SCALAR_SLOT, 4 },
+};
+/*
+ * The 4 stride-CST_FID_LANE_BLOCK_STRIDE lane-mask families, in wire order.
+ * All land in the scalar plane at ordinals 5 + index (continuing after the
+ * slotted scalars).  Shared by the same two consumers.
+ */
+struct LaneFamily { uint16_t base; const char *prefix; };
+static const LaneFamily kLaneFamilies[] = {
+    { CST_FID_SRC_LANE_MASK_BASE,        "CST_FID_SRC_LANE_MASK"        },
+    { CST_FID_DST_LANE_MASK_BASE,        "CST_FID_DST_LANE_MASK"        },
+    { CST_FID_LOAD_DATA_LANE_MASK_BASE,  "CST_FID_LOAD_DATA_LANE_MASK"  },
+    { CST_FID_STORE_DATA_LANE_MASK_BASE, "CST_FID_STORE_DATA_LANE_MASK" },
+};
+
 static void write_field_id_encoding_map(BitWriter *bw)
 {
     /* Count: 3 hot singletons + 8 slotted families × CST_FID_SLOT_COUNT
@@ -305,42 +350,27 @@ static void write_field_id_encoding_map(BitWriter *bw)
     write_encoding_entry(bw, CST_FID_N_STORES,  "CST_FID_N_STORES");
     write_encoding_entry(bw, CST_FID_METAFLAGS, "CST_FID_METAFLAGS");
 
-    /* Slotted families.  Slot k of <F> is at CST_FID_<F>_BASE +
-     * k*CST_FID_SLOT_STRIDE; one (id, name) pair per slot so decoders
-     * need not know the stride. */
-    static const struct { uint8_t base; const char *prefix; } fam[] = {
-        { CST_FID_LOAD_ADDR_BASE,      "CST_FID_LOAD_ADDR"      },
-        { CST_FID_STORE_ADDR_BASE,     "CST_FID_STORE_ADDR"     },
-        { CST_FID_LOAD_DATA_BASE,      "CST_FID_LOAD_DATA"      },
-        { CST_FID_STORE_DATA_BASE,     "CST_FID_STORE_DATA"     },
-        { CST_FID_DST_REG_BASE,        "CST_FID_DST_REG"        },
-        { CST_FID_LOAD_SIZE_BASE,      "CST_FID_LOAD_SIZE"      },
-        { CST_FID_STORE_SIZE_BASE,     "CST_FID_STORE_SIZE"     },
-        { CST_FID_DST_REG_WIDTH_BASE,  "CST_FID_DST_REG_WIDTH"  },
-    };
+    /* Slotted families (shared kSlottedFamilies, wire order).  Slot k of
+     * <F> is at base + k*CST_FID_SLOT_STRIDE; one (id, name) pair per slot
+     * so decoders need not know the stride. */
     for (uint64_t k = 0; k < CST_FID_SLOT_COUNT; k++) {
-        for (size_t f = 0; f < G_N_ELEMENTS(fam); f++) {
-            unsigned id = fam[f].base + (unsigned)k * CST_FID_SLOT_STRIDE;
-            g_autofree char *name = g_strdup_printf("%s%" PRIu64,
-                                                    fam[f].prefix, k);
+        for (size_t f = 0; f < G_N_ELEMENTS(kSlottedFamilies); f++) {
+            unsigned id = kSlottedFamilies[f].base
+                + (unsigned)k * CST_FID_SLOT_STRIDE;
+            g_autofree char *name = g_strdup_printf(
+                "%s%" PRIu64, kSlottedFamilies[f].prefix, k);
             write_encoding_entry(bw, id, name);
         }
     }
 
-    /* Lane-mask block (separate from the hot slotted block so it
-     * doesn't shift the cheaper 1-byte ULEB range). */
-    static const struct { uint16_t base; const char *prefix; } lane_fam[] = {
-        { CST_FID_SRC_LANE_MASK_BASE,        "CST_FID_SRC_LANE_MASK"        },
-        { CST_FID_DST_LANE_MASK_BASE,        "CST_FID_DST_LANE_MASK"        },
-        { CST_FID_LOAD_DATA_LANE_MASK_BASE,  "CST_FID_LOAD_DATA_LANE_MASK"  },
-        { CST_FID_STORE_DATA_LANE_MASK_BASE, "CST_FID_STORE_DATA_LANE_MASK" },
-    };
+    /* Lane-mask block (shared kLaneFamilies; separate from the hot slotted
+     * block so it doesn't shift the cheaper 1-byte ULEB range). */
     for (uint64_t k = 0; k < CST_FID_SLOT_COUNT; k++) {
-        for (size_t f = 0; f < G_N_ELEMENTS(lane_fam); f++) {
-            unsigned id = lane_fam[f].base
+        for (size_t f = 0; f < G_N_ELEMENTS(kLaneFamilies); f++) {
+            unsigned id = kLaneFamilies[f].base
                 + (unsigned)k * CST_FID_LANE_BLOCK_STRIDE;
-            g_autofree char *name = g_strdup_printf("%s%" PRIu64,
-                                                    lane_fam[f].prefix, k);
+            g_autofree char *name = g_strdup_printf(
+                "%s%" PRIu64, kLaneFamilies[f].prefix, k);
             write_encoding_entry(bw, id, name);
         }
     }
@@ -1043,8 +1073,7 @@ typedef struct FieldStateBlock {
  * fields `a` is the [0..9] prefix offset; for slotted families `a` is
  * the family ordinal within its plane and `slot` the slot index.
  */
-enum { FS_LOC_INVALID = 0, FS_LOC_SCALAR_FIXED = 1,
-       FS_LOC_SCALAR_SLOT = 2, FS_LOC_WIDE_SLOT = 3 };
+/* FS_LOC_* enum lifted up next to kSlottedFamilies (see above). */
 typedef struct FidLoc {
     uint8_t cls;
     uint8_t a;       /* fixed: prefix offset; slotted: family ordinal */
@@ -1095,35 +1124,20 @@ static void field_state_slot_lut_build(void)
         set_fixed(f, (uint8_t)(3 + (f - CST_FID_INSN_BYTES_LO)));
     }
 
-    /* The 8 stride-8 slotted families: cls + family ordinal within plane. */
-    struct FamMap { uint8_t base; uint8_t cls; uint8_t ord; };
-    static const FamMap fam_map[8] = {
-        { CST_FID_LOAD_ADDR_BASE,     FS_LOC_SCALAR_SLOT, 0 },
-        { CST_FID_STORE_ADDR_BASE,    FS_LOC_SCALAR_SLOT, 1 },
-        { CST_FID_LOAD_DATA_BASE,     FS_LOC_WIDE_SLOT,   0 },
-        { CST_FID_STORE_DATA_BASE,    FS_LOC_WIDE_SLOT,   1 },
-        { CST_FID_DST_REG_BASE,       FS_LOC_WIDE_SLOT,   2 },
-        { CST_FID_LOAD_SIZE_BASE,     FS_LOC_SCALAR_SLOT, 2 },
-        { CST_FID_STORE_SIZE_BASE,    FS_LOC_SCALAR_SLOT, 3 },
-        { CST_FID_DST_REG_WIDTH_BASE, FS_LOC_SCALAR_SLOT, 4 },
-    };
+    /* The 8 stride-CST_FID_SLOT_STRIDE slotted families (shared
+     * kSlottedFamilies): cls + family ordinal within plane. */
     for (unsigned k = 0; k < CST_FID_SLOT_COUNT; k++) {
-        for (unsigned f = 0; f < G_N_ELEMENTS(fam_map); f++) {
-            unsigned fid = fam_map[f].base + k * CST_FID_SLOT_STRIDE;
-            g_fid_loc[fid] = FidLoc{ fam_map[f].cls, fam_map[f].ord,
-                                     (uint8_t)k, 0 };
+        for (unsigned f = 0; f < G_N_ELEMENTS(kSlottedFamilies); f++) {
+            unsigned fid = kSlottedFamilies[f].base + k * CST_FID_SLOT_STRIDE;
+            g_fid_loc[fid] = FidLoc{ kSlottedFamilies[f].cls,
+                                     kSlottedFamilies[f].ord, (uint8_t)k, 0 };
         }
     }
-    /* The 4 stride-CST_FID_LANE_BLOCK_STRIDE lane families: scalar, ords 5..8. */
-    static const uint16_t lane_fam_base[4] = {
-        CST_FID_SRC_LANE_MASK_BASE,
-        CST_FID_DST_LANE_MASK_BASE,
-        CST_FID_LOAD_DATA_LANE_MASK_BASE,
-        CST_FID_STORE_DATA_LANE_MASK_BASE,
-    };
+    /* The 4 stride-CST_FID_LANE_BLOCK_STRIDE lane families (shared
+     * kLaneFamilies): scalar plane, ordinals 5..8. */
     for (unsigned k = 0; k < CST_FID_SLOT_COUNT; k++) {
-        for (unsigned f = 0; f < G_N_ELEMENTS(lane_fam_base); f++) {
-            unsigned fid = lane_fam_base[f] + k * CST_FID_LANE_BLOCK_STRIDE;
+        for (unsigned f = 0; f < G_N_ELEMENTS(kLaneFamilies); f++) {
+            unsigned fid = kLaneFamilies[f].base + k * CST_FID_LANE_BLOCK_STRIDE;
             g_fid_loc[fid] = FidLoc{ FS_LOC_SCALAR_SLOT, (uint8_t)(5 + f),
                                      (uint8_t)k, 0 };
         }

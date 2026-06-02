@@ -1012,15 +1012,12 @@ static void bw_write_sleb128_u512(BitWriter *bw, U512 v)
 
 /*
  * Per-template prev-value store (the baseline each entry's deltas are
- * computed against).  This used to be a dense [n_insns × 778] array of
- * U512 cells — one cell for every (insn, family, slot) the wire could
- * ever carry, 64 slots per family reserved unconditionally.  Real basic
- * blocks touch a tiny fraction (mcf: ≤1 load + ≤1 store + ≤2 dst regs
- * per insn), so >99% of that array was allocated, zeroed, page-faulted
- * and never read.
- *
- * The store is now split into two planes and sized to the runtime
- * high-water slot occupancy (max_slots), grown on demand:
+ * computed against).  Sparse by design: the wire reserves
+ * CST_FID_SLOT_COUNT (64) slots per family, but real BBs touch a tiny
+ * fraction (mcf: ≤1 load + ≤1 store + ≤2 dst regs per insn), so rather than
+ * a dense [insn × family × 64] array the store is split into two planes,
+ * each sized to the runtime high-water slot occupancy (max_slots) and grown
+ * on demand:
  *
  *   - scalar plane (u64 cells): the 3 singletons (N_LOADS / N_STORES /
  *     METAFLAGS) + 7 insn-metadata cells in a fixed [0..9] prefix, then

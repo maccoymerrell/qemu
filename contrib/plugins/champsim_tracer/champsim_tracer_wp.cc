@@ -420,28 +420,20 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         }
 
         /*
-         * Use the TB-fragment template that vcpu_tb_exec just stashed
-         * in g_wp_state.last_executed_tb.  The previous code also did
-         * a g_bb_template_cache.find_bb_template(pre_pc) BEFORE exec_tb
-         * to prefer the canonical (assembled) true-BB template when the
-         * bb_map_ had one — but that lookup took the global data_lock
-         * per WP iter, costing ~100ns per iter × tens of millions of
-         * WP iters on full mcf runs.  The TB-fragment template is
-         * branch-terminated identically (next_tb_fragment chains the
-         * mid-TB splits) and produces the same WPBBEntry shape after
-         * the fragment-walk below; preferring it skips the mutex
-         * entirely.
+         * Use the TB-fragment template vcpu_tb_exec stashed in
+         * g_wp_state.last_executed_tb rather than a bb_map_ lookup: the
+         * fragment template is branch-terminated identically (next_tb_fragment
+         * chains the mid-TB splits) and yields the same WPBBEntry shape after
+         * the fragment walk, while skipping the global data_lock a cache
+         * lookup takes on every WP iter (~100ns × tens of millions of iters
+         * on full mcf runs).
          *
-         * Per-insn regdata capture: clear the per-thread WP scratch
-         * buffer here, then exec_tb fires the per-insn callbacks
-         * registered at translation time, which append dst snaps in
-         * execution order while WP is in progress (see
-         * vcpu_insn_reg_snap_cb in champsim_tracer.cc).  The fragment
-         * walk below pulls those snaps in FIFO order for every insn
-         * except the very last executed insn of each fragment — that
-         * one has no successor pre-exec hook inside the fragment to
-         * trigger its capture, so the walk falls back to a live read
-         * for it.
+         * Per-insn regdata: clear the per-thread WP scratch buffer here;
+         * exec_tb then fires the per-insn callbacks (registered at
+         * translation time) that append dst snaps in execution order during
+         * WP (see vcpu_insn_reg_snap_cb).  The fragment walk pulls them FIFO
+         * for every insn except each fragment's last executed insn, which
+         * has no in-fragment successor hook and falls back to a live read.
          */
         if (g_features.wp_reg_data) {
             wp_pending_reg_snaps.clear();

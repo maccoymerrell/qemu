@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "champsim_tracer.h"
+#include "champsim_marker.h"
 #include "champsim_tracer_bb_chain_assembler.h"
 #include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_branch_history.h"
@@ -2142,21 +2143,18 @@ static void split_tb_into_fragments(const qemu_plugin_insn_info *insn_info,
  * The marker therefore originates in the post-execve image — compiled into
  * a synthetic workload, or injected at the entry point by cst_attach.
  */
-static const uint32_t CST_MARKER_MAGIC = 0x43535401u;  /* mov: B8 01 54 53 43 */
-static const int CST_MARKER_INSN_BYTES = 5;            /* len of one B8 imm32 */
-static const uint32_t CST_MARKER_SEQ_LEN = 3;          /* identical movs in a row */
+/* Marker magic / sequence length / x86 encoding: champsim_marker.h (the
+ * contract shared with the cst_attach injector). */
 static std::atomic<bool> g_marker_fired{false};
 
-/* True if @bytes/@size begins with one `mov $CST_MARKER_MAGIC, %eax`
- * (B8 imm32, little-endian). */
+/* True if @bytes/@size begins with one x86 marker insn
+ * (`mov $CST_MARKER_MAGIC, %eax`, B8 imm32 little-endian). */
 static inline bool marker_mov_match(const uint8_t *bytes, uint8_t size)
 {
-    return size >= CST_MARKER_INSN_BYTES &&
-           bytes[0] == 0xB8 &&
-           bytes[1] == (uint8_t)(CST_MARKER_MAGIC) &&
-           bytes[2] == (uint8_t)(CST_MARKER_MAGIC >> 8) &&
-           bytes[3] == (uint8_t)(CST_MARKER_MAGIC >> 16) &&
-           bytes[4] == (uint8_t)(CST_MARKER_MAGIC >> 24);
+    uint8_t want[CST_MARKER_X86_INSN_BYTES];
+    cst_marker_x86_encode_one(want);
+    return size >= CST_MARKER_X86_INSN_BYTES &&
+           memcmp(bytes, want, CST_MARKER_X86_INSN_BYTES) == 0;
 }
 
 static void vcpu_marker_cb(unsigned int cpu_index, void *udata)

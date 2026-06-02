@@ -31,6 +31,70 @@
  * BodyEntry::wp_entries).
  */
 /*
+ * Per-BB accumulator for the wrong-path walk.  Each spec-mode exec_tb runs
+ * a (possibly multi-insn) wrong-path fragment up to its branch terminator;
+ * the fragment walk appends exactly the insns that executed into these
+ * parallel arrays and commits a true BB at each branch fire.  bb_fields /
+ * bb_regnames are non-owning pointers into the source template's stable
+ * storage (commit_true_bb_refs copies only on a first-sighting commit).
+ */
+struct WpAccum {
+    std::vector<uint64_t>             bb_pcs;
+    std::vector<uint8_t>              bb_sizes;
+    std::vector<uint8_t>              bb_bytes;
+    std::vector<const InsnFields *>   bb_fields;
+    std::vector<const InsnRegNames *> bb_regnames;
+    std::vector<DynParam>             bb_dyn_params;
+    std::vector<RegSnap>              bb_reg_snaps;
+    uint64_t    bb_start_pc      = 0;
+    const char *bb_symbol_name   = nullptr;
+    /* A true BB always ends in a branch, so a spec-mode fault inside a BB
+     * does not terminate it: the walk skips past the faulting insn and
+     * accumulates to the natural branch end.  bb_first_fault_idx marks the
+     * uop speculation would actually squash on. */
+    bool        bb_has_fault     = false;
+    uint32_t    bb_first_fault_idx = 0;
+
+    /* Reset per-BB state.  bb_reg_snaps is intentionally NOT cleared here:
+     * its lifecycle is caller-managed (cleared after a no-template drop,
+     * transferred + realloc'd after a successful commit). */
+    void clear()
+    {
+        bb_pcs.clear();
+        bb_sizes.clear();
+        bb_bytes.clear();
+        bb_fields.clear();
+        bb_regnames.clear();
+        bb_dyn_params.clear();
+        bb_start_pc = 0;
+        bb_symbol_name = nullptr;
+        bb_has_fault = false;
+        bb_first_fault_idx = 0;
+    }
+
+    /* Build a WPBBEntry from the current accumulator, moving bb_dyn_params /
+     * bb_reg_snaps into it (those vectors are empty after; the caller still
+     * runs clear() to reset bb_pcs/etc.). */
+    WPBBEntry make_entry(BBTemplate *bb_tmpl, bool fault,
+                         uint32_t fault_insn_index)
+    {
+        WPBBEntry e;
+        e.template_id = bb_tmpl ? bb_tmpl->template_id : 0;
+        e.start_pc = bb_start_pc;
+        e.dyn_params = std::move(bb_dyn_params);
+        e.n_insns_executed = (uint32_t)bb_pcs.size();
+        e.fault = fault;
+        e.translation_unavailable = false;
+        e.fault_insn_index = fault_insn_index;
+        e.tmpl = bb_tmpl;
+        if (g_features.reg_data) {
+            e.reg_snaps = std::move(bb_reg_snaps);
+        }
+        return e;
+    }
+};
+
+/*
  * Enter a wrong-path speculative session: snapshot the scoreboard cursor
  * into g_wp_state (so the nested vcpu_tb_exec on this thread observes WP
  * mode and can restore the cursor afterwards), flip spec mode on, and
@@ -118,20 +182,22 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
      * executed (post_pc matching) into raw arrays and commits a true BB at
      * each branch fire via commit_true_bb_refs().
      */
-    std::vector<uint64_t>     bb_pcs;
-    std::vector<uint8_t>      bb_sizes;
-    std::vector<uint8_t>      bb_bytes;
-    /* Per-insn fields/regnames of the accumulating WP BB, held as
-     * non-owning pointers into the source TB template's stable
-     * storage.  commit_true_bb_refs takes them by reference and only
-     * a first-sighting commit copies (gathers) them. */
-    std::vector<const InsnFields *>   bb_fields;
-    std::vector<const InsnRegNames *> bb_regnames;
-    /* Stable zeroed sentinel for the rare reg-data-on-but-template-
-     * has-no-regnames case (keeps a valid pointer to push). */
+    WpAccum acc;
+    /* Same-name references keep the walk body below verbatim. */
+    auto &bb_pcs             = acc.bb_pcs;
+    auto &bb_sizes           = acc.bb_sizes;
+    auto &bb_bytes           = acc.bb_bytes;
+    auto &bb_fields          = acc.bb_fields;
+    auto &bb_regnames        = acc.bb_regnames;
+    auto &bb_dyn_params      = acc.bb_dyn_params;
+    auto &bb_reg_snaps       = acc.bb_reg_snaps;
+    auto &bb_start_pc        = acc.bb_start_pc;
+    auto &bb_symbol_name     = acc.bb_symbol_name;
+    auto &bb_has_fault       = acc.bb_has_fault;
+    auto &bb_first_fault_idx = acc.bb_first_fault_idx;
+    /* Stable zeroed sentinel for the rare reg-data-on-but-template-has-no-
+     * regnames case (keeps a valid pointer to push). */
     static const InsnRegNames kEmptyRegNames{};
-    std::vector<DynParam>     bb_dyn_params;
-    std::vector<RegSnap>      bb_reg_snaps;
     bb_pcs.reserve(initial_insn_cap);
     bb_sizes.reserve(initial_insn_cap);
     bb_bytes.reserve(initial_insn_cap * MAX_INSN_BYTES);
@@ -143,53 +209,6 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     if (g_features.wp_reg_data) {
         bb_reg_snaps.reserve((size_t)initial_insn_cap * MAX_SRC_REGS);
     }
-    uint64_t bb_start_pc = 0;
-    const char *bb_symbol_name = nullptr;
-
-    /* Fault metadata for the in-progress BB.  A true BB always ends in
-     * a branch (basic_block.md), so a spec-mode fault inside a BB does
-     * not terminate it: WP skips past the faulting insn and accumulates
-     * until the natural branch end.  bb_first_fault_idx marks the uop
-     * speculation would actually squash on. */
-    bool bb_has_fault = false;
-    uint32_t bb_first_fault_idx = 0;
-
-    /* Reset all per-BB accumulator state.  bb_reg_snaps is left alone
-     * (caller handles it: clear after a no-template drop, transfer +
-     * realloc after a successful commit). */
-    auto clear_accum = [&]() {
-        bb_pcs.clear();
-        bb_sizes.clear();
-        bb_bytes.clear();
-        bb_fields.clear();
-        bb_regnames.clear();
-        bb_dyn_params.clear();
-        bb_start_pc = 0;
-        bb_symbol_name = nullptr;
-        bb_has_fault = false;
-        bb_first_fault_idx = 0;
-    };
-
-    /* Build a WPBBEntry from the current accumulator and move
-     * bb_reg_snaps / bb_dyn_params into it.  After this call the
-     * accumulator vectors are empty (moved-from); the caller still
-     * runs clear_accum() afterwards to reset bb_pcs/etc. */
-    auto make_wp_entry = [&](BBTemplate *bb_tmpl, bool fault,
-                             uint32_t fault_insn_index) {
-        WPBBEntry e;
-        e.template_id = bb_tmpl ? bb_tmpl->template_id : 0;
-        e.start_pc = bb_start_pc;
-        e.dyn_params = std::move(bb_dyn_params);
-        e.n_insns_executed = (uint32_t)bb_pcs.size();
-        e.fault = fault;
-        e.translation_unavailable = false;
-        e.fault_insn_index = fault_insn_index;
-        e.tmpl = bb_tmpl;
-        if (g_features.reg_data) {
-            e.reg_snaps = std::move(bb_reg_snaps);
-        }
-        return e;
-    };
 
     uint64_t prev_pre_pc = UINT64_MAX;
     uint32_t same_pre_pc_count = 0;
@@ -208,7 +227,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
          * accumulator and end this WP simulation; chain so far is
          * preserved. */
         if (cst_pc_is_poisoned(pre_pc)) {
-            clear_accum();
+            acc.clear();
             bb_reg_snaps.clear();
             poisoned_targets.insert(pre_pc);
             early_exit = true;
@@ -296,7 +315,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                     flush_before) {
                 *flush_interrupted = true;
             }
-            clear_accum();
+            acc.clear();
             bb_reg_snaps.clear();
             early_exit = true;
             break;
@@ -765,11 +784,11 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                 }
             }
 
-            wp_chain.push_back(make_wp_entry(bb_tmpl,
+            wp_chain.push_back(acc.make_entry(bb_tmpl,
                                              bb_has_fault,
                                              bb_first_fault_idx));
 
-            clear_accum();
+            acc.clear();
 
             if (poisoned_targets.count(commit_post_pc)) {
                 early_exit = true;
@@ -786,7 +805,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             /* Fault PC truly outside the TB.  Give up the chain
              * rather than guess; this is a real abnormal exit
              * (e.g. translation-unavailable cousin). */
-            clear_accum();
+            acc.clear();
             bb_reg_snaps.clear();
             early_exit = true;
             break;

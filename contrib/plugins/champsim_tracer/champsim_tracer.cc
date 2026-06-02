@@ -58,11 +58,7 @@ GMutex unknown_warn_lock;
 
 char *qemu_command_line = nullptr;
 char *trace_comment = nullptr;
-bool enable_mem_data = false;
-bool enable_reg_data = false;
-bool enable_wp_mem_data = false;
-bool enable_wp_reg_data = false;
-uint32_t iframe_rate = 0;
+TraceFeatures g_features;
 uint64_t warmup_insns = 0;
 uint64_t simulation_insns = 0;
 
@@ -330,7 +326,7 @@ static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
         }
     }
 
-    if (enable_reg_data) {
+    if (g_features.reg_data) {
         g_reg_handle_cache.ensure_initialized(cpu_index);
     }
 
@@ -384,7 +380,7 @@ static GRecMutex exec_lock;
  * hook).  Last canonical insn of a TB is captured at the NEXT TB's
  * vcpu_tb_exec ("Tail-insn dst snap").  Drained into
  * BodyEntry.reg_snaps at finalize, discarded on flush.  Active only
- * when enable_reg_data.
+ * when g_features.reg_data.
  */
 static thread_local std::vector<RegSnap> pending_reg_snaps CST_TLS_HOT;
 
@@ -419,11 +415,11 @@ typedef struct {
  *    vcpu_tb_exec.
  *  - WP (g_wp_state.in_progress): append to wp_pending_reg_snaps;
  *    drained by the fragment walk after the in-flight exec_tb
- *    returns.  Skipped when enable_wp_reg_data is off.
+ *    returns.  Skipped when g_features.wp_reg_data is off.
  */
 static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
 {
-    if (!enable_reg_data && !enable_wp_reg_data) {
+    if (!g_features.reg_data && !g_features.wp_reg_data) {
         return;
     }
     if (!g_trace_segments.is_active_atomic()) {
@@ -431,12 +427,12 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
     }
     std::vector<RegSnap> *sink;
     if (g_wp_state.in_progress) {
-        if (!enable_wp_reg_data) {
+        if (!g_features.wp_reg_data) {
             return;
         }
         sink = &wp_pending_reg_snaps;
     } else {
-        if (!enable_reg_data) {
+        if (!g_features.reg_data) {
             return;
         }
         sink = &pending_reg_snaps;
@@ -806,7 +802,7 @@ static void emit_body_entry(BodyStreamState *out_stream,
     entry.cpu_index = cpu_index;
 
     g_mem_recorder.drain_cp_into_dyn_params(entry.dyn_params, bb_tmpl);
-    if (enable_reg_data && !pending_reg_snaps.empty()) {
+    if (g_features.reg_data && !pending_reg_snaps.empty()) {
         entry.reg_snaps = std::move(pending_reg_snaps);
         pending_reg_snaps.clear();
         /* Restore a typical-BB capacity after the move stole the
@@ -964,7 +960,7 @@ static void flush_pending_final_body_entry(void)
                  * delay@n-1] the branch's snap was deferred and there is
                  * no next TB to catch it (segment end), so capture both
                  * the branch (n-2) and the delay slot (n-1) here. */
-                if (enable_reg_data && frag->insn_reg_names &&
+                if (g_features.reg_data && frag->insn_reg_names &&
                     frag->n_insns > 0) {
                     uint32_t last = frag->n_insns - 1;
                     bool ds_tail = frag->n_insns >= 2 &&
@@ -1294,7 +1290,7 @@ static void snap_prev_tail_dsts(unsigned int cpu_index,
                                 const BBTemplate *tmpl,
                                 uint64_t current_pc)
 {
-    if (enable_reg_data && tmpl->insn_reg_names &&
+    if (g_features.reg_data && tmpl->insn_reg_names &&
         tmpl->n_insns > 0 &&
         g_trace_segments.is_active_atomic()) {
         /* Capture the tail insn(s) whose dsts the per-insn hooks could
@@ -1856,7 +1852,7 @@ static void arm_reg_snap_cbs(struct qemu_plugin_tb *tb, BBTemplate *new_tmpl,
                              const bool *canonical_first,
                              uint32_t canonical_n_insns)
 {
-    if (!((enable_reg_data || enable_wp_reg_data) && new_tmpl &&
+    if (!((g_features.reg_data || g_features.wp_reg_data) && new_tmpl &&
           new_tmpl->insn_reg_names)) {
         return;
     }
@@ -3056,16 +3052,16 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      * plugin_config_free below. */
     max_wrong_path_depth = cfg.wp_depth;
     enable_wrong_path    = cfg.enable_wp;
-    enable_mem_data      = cfg.enable_mem_data;
-    enable_reg_data      = cfg.enable_reg_data;
+    g_features.mem_data      = cfg.enable_mem_data;
+    g_features.reg_data      = cfg.enable_reg_data;
     /* Per-path toggles default to their CP siblings when unset (-1). */
-    enable_wp_mem_data   = (cfg.wp_mem_data < 0)
-        ? enable_mem_data : (cfg.wp_mem_data != 0);
-    enable_wp_reg_data   = (cfg.wp_reg_data < 0)
-        ? enable_reg_data : (cfg.wp_reg_data != 0);
+    g_features.wp_mem_data   = (cfg.wp_mem_data < 0)
+        ? g_features.mem_data : (cfg.wp_mem_data != 0);
+    g_features.wp_reg_data   = (cfg.wp_reg_data < 0)
+        ? g_features.reg_data : (cfg.wp_reg_data != 0);
     g_histogram_intervals = cfg.histogram_intervals > 0
         ? (unsigned int)cfg.histogram_intervals : 0;
-    iframe_rate         = cfg.iframe_rate;
+    g_features.iframe_rate         = cfg.iframe_rate;
     simpoint_interval_insns = cfg.simpoint_interval;
     warmup_insns        = cfg.warmup_insns;
     simulation_insns    = cfg.simulation_insns;

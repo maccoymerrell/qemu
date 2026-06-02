@@ -625,7 +625,7 @@ struct BBTemplate {
     /* Per-insn opaque udata for the synthetic-EA exec callback. */
     void *insn_synth_ea_refs;
     /* Counts ENTRY emissions of this template (CP and WP combined).
-     * Used by the writer to drive iframe_rate-triggered IFRAME
+     * Used by the writer to drive g_features.iframe_rate-triggered IFRAME
      * emissions on a per-template cadence. */
     uint64_t emit_count;
     /*
@@ -734,7 +734,7 @@ struct BodyEntry {
     uint32_t template_id;
     std::vector<DynParam> dyn_params;
     /* RegSnap vector, ordered: for each insn in the template, n_src
-     * snaps only.  Only populated when enable_reg_data is true. */
+     * snaps only.  Only populated when g_features.reg_data is true. */
     std::vector<RegSnap> reg_snaps;
     std::vector<WPBBEntry> wp_entries;
     BBTemplate *tmpl;  /* Non-owning; for per-insn schema access */
@@ -921,23 +921,29 @@ extern unsigned active_reg_table_size;
  * qemu_plugin_install. */
 extern int max_wrong_path_depth;
 extern bool enable_wrong_path;
-extern bool enable_mem_data;
-extern bool enable_reg_data;
-/* WP-side data toggles.  Default to the matching CP-side flag when
- * unset at install time.
- *
- * enable_wp_mem_data: gates only the VALUE half of WP memops; WP
- *   addresses are always recorded (preserves the speculative memory
- *   footprint for cache/prefetcher sims).
- * enable_wp_reg_data: gates WP per-insn register-value snapshots;
- *   register identifiers still come from the template. */
-extern bool enable_wp_mem_data;
-extern bool enable_wp_reg_data;
+/* Effective per-run trace-feature toggles, derived once from PluginConfig
+ * at install (the tristate WP flags resolved against their CP counterparts)
+ * and immutable after.  Grouped so the write-once/read-many feature set
+ * travels as one object rather than as five scattered globals. */
+struct TraceFeatures {
+    bool     mem_data    = false;   /* capture CP memop effective addresses */
+    bool     reg_data    = false;   /* capture CP per-insn register values  */
+    /* WP-side data toggles.  Default to the matching CP-side flag when unset
+     * at install time.
+     *   wp_mem_data: gates only the VALUE half of WP memops; WP addresses
+     *     are always recorded (preserves the speculative memory footprint
+     *     for cache/prefetcher sims).
+     *   wp_reg_data: gates WP per-insn register-value snapshots; register
+     *     identifiers still come from the template. */
+    bool     wp_mem_data = false;
+    bool     wp_reg_data = false;
+    /* I-frame trigger: emit a self-contained IFRAME after every N-th ENTRY
+     * of the same template.  0 disables the feature. */
+    uint32_t iframe_rate = 0;
+};
+extern TraceFeatures g_features;
 extern char *qemu_command_line;
 extern char *trace_comment;
-/* I-frame trigger: emit a self-contained IFRAME after every N-th
- * ENTRY of the same template.  0 disables the feature. */
-extern uint32_t iframe_rate;
 
 /* Simpoint windowing.  warmup_insns is the number of instructions
  * traced BEFORE each simpoint position; simulation_insns is the

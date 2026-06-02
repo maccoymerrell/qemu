@@ -400,7 +400,7 @@ BBTemplate *BBTemplateCache::get_or_create_bb_template(
     const InsnFields **field_ptrs = tls_field_ptrs.data();
 
     const InsnRegNames **regname_ptrs = nullptr;
-    if (enable_reg_data) {
+    if (g_features.reg_data) {
         if (tls_regname_ptrs.size() < max_insns) {
             tls_regname_ptrs.resize(max_insns);
         }
@@ -525,7 +525,7 @@ BBTemplate *BBTemplateCache::create_tb_template(
      * (see vcpu_insn_reg_snap_cb / champsim_tracer_wp.cc).  Skipping
      * it would force WP regdata-only runs back to the old post-
      * fragment live-read fallback. */
-    if (enable_reg_data || enable_wp_reg_data) {
+    if (g_features.reg_data || g_features.wp_reg_data) {
         tmpl->insn_reg_names = g_new0(InsnRegNames, n_insns);
     }
     for (uint32_t i = 0; i < n_insns; i++) {

@@ -78,7 +78,7 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
                                uint64_t insn_pc)
 {
     /* WP path always records the access ADDRESS (full speculative
-     * footprint); enable_wp_mem_data gates only the VALUE capture.
+     * footprint); g_features.wp_mem_data gates only the VALUE capture.
      *
      * The per-insn memop cap is unconditional: a wire-format
      * constraint (CST_FID_SLOT_COUNT slots/insn) and a loop bound for
@@ -111,10 +111,10 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
     };
     cst_wide_zero(&acc.data);
 
-    /* CP path uses enable_mem_data; WP path uses enable_wp_mem_data
+    /* CP path uses g_features.mem_data; WP path uses g_features.wp_mem_data
      * (already gated above to true if we reach here). */
     bool capture_data = wp.in_progress
-        ? enable_wp_mem_data : enable_mem_data;
+        ? g_features.wp_mem_data : g_features.mem_data;
     if (capture_data) {
         capture_mem_value(info, vaddr, &acc);
     }

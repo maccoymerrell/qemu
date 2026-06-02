@@ -2880,10 +2880,10 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
     bw_write_u8(&st->header_bw, (uint8_t)trace_isa);
 
     uint8_t flags = 0;
-    if (enable_mem_data) {
+    if (g_features.mem_data) {
         flags |= CST_FLAG_MEM_DATA;
     }
-    if (enable_reg_data) {
+    if (g_features.reg_data) {
         flags |= CST_FLAG_REG_DATA;
     }
     /* Set when each template carries the §6 profile block; clear
@@ -3528,7 +3528,7 @@ static void emit_regfile_if_first(BodyStreamState *st, BodyEntry *entry,
 }
 
 /*
- * IFRAME trigger.  Every iframe_rate emissions of this CP template, emit a
+ * IFRAME trigger.  Every g_features.iframe_rate emissions of this CP template, emit a
  * redundant BODY_TAG_IFRAME with the same payload but encoded against fresh
  * scratch overlays (all values absolute).  It neither advances
  * prev_entry_template nor writes a tmpl_delta (template = the preceding
@@ -3537,11 +3537,11 @@ static void emit_regfile_if_first(BodyStreamState *st, BodyEntry *entry,
 static void emit_iframe_if_due(BodyStreamState *st, BodyEntry *entry,
                                uint32_t num_wp)
 {
-    if (iframe_rate <= 0 || !entry->tmpl) {
+    if (g_features.iframe_rate <= 0 || !entry->tmpl) {
         return;
     }
     entry->tmpl->emit_count++;
-    if ((entry->tmpl->emit_count % iframe_rate) != 0) {
+    if ((entry->tmpl->emit_count % g_features.iframe_rate) != 0) {
         return;
     }
     if (!st->iframe_cp_scratch) {

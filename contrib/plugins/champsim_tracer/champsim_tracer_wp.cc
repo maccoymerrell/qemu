@@ -124,10 +124,10 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     bb_bytes.reserve(initial_insn_cap * MAX_INSN_BYTES);
     bb_fields.reserve(initial_insn_cap);
     bb_dyn_params.reserve(initial_insn_cap);
-    if (enable_reg_data) {
+    if (g_features.reg_data) {
         bb_regnames.reserve(initial_insn_cap);
     }
-    if (enable_wp_reg_data) {
+    if (g_features.wp_reg_data) {
         bb_reg_snaps.reserve((size_t)initial_insn_cap * MAX_SRC_REGS);
     }
     uint64_t bb_start_pc = 0;
@@ -172,7 +172,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         e.translation_unavailable = false;
         e.fault_insn_index = fault_insn_index;
         e.tmpl = bb_tmpl;
-        if (enable_reg_data) {
+        if (g_features.reg_data) {
             e.reg_snaps = std::move(bb_reg_snaps);
         }
         return e;
@@ -261,7 +261,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
          * trigger its capture, so the walk falls back to a live read
          * for it.
          */
-        if (enable_wp_reg_data) {
+        if (g_features.wp_reg_data) {
             wp_pending_reg_snaps.clear();
         }
         g_wp_state.last_executed_tb = nullptr;
@@ -411,7 +411,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                      * regardless of dedup, so advance the WP snap
                      * cursor past its slot to keep alignment with
                      * subsequent insns' captures. */
-                    if (enable_wp_reg_data &&
+                    if (g_features.wp_reg_data &&
                         i + 1 < n_executed_in_cur) {
                         wp_snap_cursor +=
                             cur->insn_fields[i].n_dst_regs;
@@ -448,12 +448,12 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                     }
                 }
 
-                if (enable_reg_data) {
+                if (g_features.reg_data) {
                     bb_regnames.push_back(cur->insn_reg_names
                                           ? &cur->insn_reg_names[i]
                                           : &kEmptyRegNames);
                 }
-                if (enable_wp_reg_data) {
+                if (g_features.wp_reg_data) {
                     const InsnFields *f = &cur->insn_fields[i];
                     if (i + 1 < n_executed_in_cur) {
                         /* Per-insn-accurate snap from the WP scratch
@@ -714,7 +714,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                 bb_fields.data(),
                 bb_sizes.data(),
                 bb_bytes.data(),
-                enable_reg_data ? bb_regnames.data() : nullptr,
+                g_features.reg_data ? bb_regnames.data() : nullptr,
                 bb_symbol_name, fall_through);
             g_mutex_unlock(&data_lock);
 

@@ -120,6 +120,15 @@ if get_option('plugins')
     cpp_args: cst_tools_cpp_args,
     link_with: cst_tools_common,
     install: false)
+  # cst_attach: ptrace launcher that injects the trace marker at a target's
+  # entry so the plugin attaches + pins to its address space (system mode).
+  # Plain C, no deps.  Built here for the host (host==guest for an x86-64
+  # Linux guest); for other guests build it statically against that sysroot.
+  t += executable(
+    'cst_attach',
+    files('champsim_tracer/tools/cst_attach.c'),
+    c_args: ['-std=gnu11'],
+    install: false)
   endif
 endif
 if t.length() > 0

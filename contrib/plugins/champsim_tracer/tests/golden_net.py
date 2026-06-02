@@ -50,6 +50,23 @@ MANIFEST = GOLDEN_DIR / "manifest.json"
 # input so a trace difference can't masquerade as (or mask) a render change.
 GOLDEN_TRACES = GOLDEN_DIR / "traces"
 
+# Fixed environment for the trace pipeline.  The kernel sets the guest's
+# initial stack pointer from the argv+envp block size; setarch -R pins ASLR
+# but NOT that size, so a varying shell environment shifts the guest SP and
+# with it the REGFILE record's REG_SP -- the one field that otherwise makes
+# an otherwise-identical body trace differ across invocations (verified by
+# decode-diff: a single differing REG_SP line out of thousands).  Spawn the
+# whole generate/build/trace pipeline under a hard-coded env so argv+envp --
+# and thus the stack base and the entire trace -- is reproducible across
+# shell sessions.  PATH covers the anaconda python tooling and the /usr/bin
+# cross-compilers; HOME/LANG are pinned so their lengths can't drift.
+PINNED_ENV = {
+    "PATH": "/home/maccoy-merrell/anaconda3/bin:/usr/local/bin:/usr/bin:/bin",
+    "HOME": "/home/maccoy-merrell",
+    "LANG": "C",
+    "LC_ALL": "C",
+}
+
 ALL_ISAS = ["x86_64", "aarch64", "riscv64", "mipsel"]
 
 # Workload matrix: real generator/trace knobs. --memdata is hardcoded on by
@@ -121,6 +138,10 @@ def run_all(build: Path, wl: dict, out_dir: Path) -> int:
     # child) so guest stack/mmap bases are fixed -> recorded memory
     # addresses are reproducible across runs. Without it, only mipsel
     # happens to be deterministic; x86_64/aarch64/riscv64 traces vary.
+    # env=PINNED_ENV pins argv+envp size so the guest stack base (and the
+    # REGFILE REG_SP it sets) is reproducible across shell sessions too --
+    # setarch -R alone does not fix that.  sys.executable is absolute, so the
+    # pipeline still finds python regardless of the pinned PATH.
     cmd = ["setarch", "-R",
            sys.executable, "-m", "champsim_tracer_validator", "all",
            "--seed", wl["seed"], "--build-dir", str(build.resolve()),
@@ -128,7 +149,7 @@ def run_all(build: Path, wl: dict, out_dir: Path) -> int:
     for isa in wl["isas"]:
         cmd += ["--isa", isa]
     cmd += wl["args"]
-    proc = subprocess.run(cmd, cwd=VALIDATOR_DIR,
+    proc = subprocess.run(cmd, cwd=VALIDATOR_DIR, env=PINNED_ENV,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           text=True)
     return proc.returncode

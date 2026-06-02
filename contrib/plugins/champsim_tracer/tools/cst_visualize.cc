@@ -1762,10 +1762,9 @@ struct WalkCtx {
      * cache line, keyed by a monotonic access-time counter so younger
      * keys are larger.  Stack distance = #entries above L = ru_tree
      * size - order_of_key(L's last time) - 1; both lookup and
-     * promote-to-top run in O(log N) instead of the std::list +
-     * linear-scan O(N) the prior implementation paid per memop.
-     * Histogram counts log2-bucketed distances plus a "cold" bucket
-     * for first-access lines. */
+     * promote-to-top run in O(log N) rather than the O(N) of a
+     * list + linear scan per memop.  Histogram counts log2-bucketed
+     * distances plus a "cold" bucket for first-access lines. */
     struct ReuseDistState {
         OrderStatTree                          tree;
         std::unordered_map<uint64_t, uint64_t> last_t;  /* line → tree key */

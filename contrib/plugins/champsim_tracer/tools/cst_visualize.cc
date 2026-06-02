@@ -3164,6 +3164,86 @@ static void build_metric_state(WalkCtx &ctx,
  * holds the per-metric plan-construction ladders (title/axis/series), the
  * dual-pane assembly, and the header-only static-summary metrics.
  */
+/* Chart title for a metric (or the user's --title override).  Depends only
+ * on Options, so it lives outside finalize_metric instead of as an inline
+ * 80-line lambda in the middle of the per-metric build. */
+static std::string title_for(const Options &opts)
+{
+    if (opts.title) return opts.title;
+    switch (opts.metric) {
+        case Metric::BranchMpki:
+            return "Branch MPKI under gshare";
+        case Metric::WpInsns:
+            return "Wasted wrong-path insns / 1k CP";
+        case Metric::WpMemops:
+            return "Wasted wrong-path memops / 1k CP";
+        case Metric::BtbMiss:
+            return "BTB miss rate";
+        case Metric::WpDivergence:
+            return "WP chain insns followed before BP+BTB diverges from trace's recorded WP";
+        case Metric::CacheMiss: {
+            char b[96];
+            std::snprintf(b, sizeof(b),
+                "Cache miss rate (block=%d sets=%d policy=%s)",
+                opts.cache_block_size, opts.cache_sets,
+                cache_policy_name(opts.cache_policy));
+            return b;
+        }
+        case Metric::MemPat:
+            return "Memory-access pattern breakdown";
+        case Metric::BranchDir:
+            return "Branch direction breakdown";
+        case Metric::GenOp:
+            return "GenericOpcode breakdown";
+        case Metric::GenReg:
+            return "Destination-register breakdown";
+        case Metric::BbLength:
+            return "Basic-block length distribution";
+        case Metric::IndirectTargets:
+            return "Indirect-branch target diversity";
+        case Metric::BranchEntropy:
+            return "Conditional-branch direction entropy";
+        case Metric::WorkingSet: {
+            /* Title spells out the sliding-window bound — the curve is the
+             * working-set size over the last @ws_window insns, NOT the
+             * cumulative footprint since program start. */
+            char buf[128];
+            uint64_t w = opts.ws_window;
+            if (w >= 1000000 && w % 1000000 == 0) {
+                std::snprintf(buf, sizeof(buf),
+                    "Working set (sliding window: %luM insns)",
+                    (unsigned long)(w / 1000000));
+            } else if (w >= 1000 && w % 1000 == 0) {
+                std::snprintf(buf, sizeof(buf),
+                    "Working set (sliding window: %luK insns)",
+                    (unsigned long)(w / 1000));
+            } else {
+                std::snprintf(buf, sizeof(buf),
+                    "Working set (sliding window: %lu insns)",
+                    (unsigned long)w);
+            }
+            return std::string(buf);
+        }
+        case Metric::DepDepth: {
+            char b[96];
+            std::snprintf(b, sizeof(b),
+                "Dependency-chain depth (Wall ideal-rename, window=%u)",
+                (unsigned)opts.rob_size);
+            return std::string(b);
+        }
+        case Metric::Ilp: {
+            char b[96];
+            std::snprintf(b, sizeof(b),
+                "Ideal IPC under perfect rename (window=%u)",
+                (unsigned)opts.rob_size);
+            return std::string(b);
+        }
+        case Metric::ReuseDistance:
+            return "Memory reuse-distance histogram";
+    }
+    return "";
+}
+
 static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
                                    const std::vector<cst::Template> &templates,
                                    const cst::Header &h,
@@ -3190,86 +3270,7 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
      * axes and ignores it on the bin-indexed / static-summary panes. */
     plan.warmup_end_insns = h.warmup_end_arch_insns;
 
-    auto pick_title = [&]() -> std::string {
-        if (opts.title) return opts.title;
-        switch (opts.metric) {
-            case Metric::BranchMpki:
-                return "Branch MPKI under gshare";
-            case Metric::WpInsns:
-                return "Wasted wrong-path insns / 1k CP";
-            case Metric::WpMemops:
-                return "Wasted wrong-path memops / 1k CP";
-            case Metric::BtbMiss:
-                return "BTB miss rate";
-            case Metric::WpDivergence:
-                return "WP chain insns followed before BP+BTB diverges from trace's recorded WP";
-            case Metric::CacheMiss: {
-                char b[96];
-                std::snprintf(b, sizeof(b),
-                    "Cache miss rate (block=%d sets=%d policy=%s)",
-                    opts.cache_block_size, opts.cache_sets,
-                    cache_policy_name(opts.cache_policy));
-                return b;
-            }
-            case Metric::MemPat:
-                return "Memory-access pattern breakdown";
-            case Metric::BranchDir:
-                return "Branch direction breakdown";
-            case Metric::GenOp:
-                return "GenericOpcode breakdown";
-            case Metric::GenReg:
-                return "Destination-register breakdown";
-            case Metric::BbLength:
-                return "Basic-block length distribution";
-            case Metric::IndirectTargets:
-                return "Indirect-branch target diversity";
-            case Metric::BranchEntropy:
-                return "Conditional-branch direction entropy";
-            case Metric::WorkingSet: {
-                /* Title spells out the sliding-window bound — the
-                 * curve is the working-set size over the last @ws_window
-                 * insns, NOT the cumulative footprint since program
-                 * start.  Keeps readers from mis-interpreting a
-                 * plateau as the program "settling". */
-                char buf[128];
-                /* Compact the window with K/M suffixes for readability. */
-                uint64_t w = opts.ws_window;
-                if (w >= 1000000 && w % 1000000 == 0) {
-                    std::snprintf(buf, sizeof(buf),
-                        "Working set (sliding window: %luM insns)",
-                        (unsigned long)(w / 1000000));
-                } else if (w >= 1000 && w % 1000 == 0) {
-                    std::snprintf(buf, sizeof(buf),
-                        "Working set (sliding window: %luK insns)",
-                        (unsigned long)(w / 1000));
-                } else {
-                    std::snprintf(buf, sizeof(buf),
-                        "Working set (sliding window: %lu insns)",
-                        (unsigned long)w);
-                }
-                return std::string(buf);
-            }
-            case Metric::DepDepth: {
-                /* Title flags the model: Wall ideal-rename RAW
-                 * chain, bounded to a tumbling ROB-sized window. */
-                char b[96];
-                std::snprintf(b, sizeof(b),
-                    "Dependency-chain depth (Wall ideal-rename, window=%u)",
-                    (unsigned)opts.rob_size);
-                return std::string(b);
-            }
-            case Metric::Ilp: {
-                char b[96];
-                std::snprintf(b, sizeof(b),
-                    "Ideal IPC under perfect rename (window=%u)",
-                    (unsigned)opts.rob_size);
-                return std::string(b);
-            }
-            case Metric::ReuseDistance:
-                return "Memory reuse-distance histogram";
-        }
-        return "";
-    };
+    auto pick_title = [&]{ return title_for(opts); };
     plan.title = pick_title();
 
     /* Convert raw bin counters to display series.  Per-1k metrics

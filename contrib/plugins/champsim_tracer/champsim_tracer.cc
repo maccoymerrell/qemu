@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <memory>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2205,6 +2206,38 @@ static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
     return p;
 }
 
+/*
+ * Owning per-TB scratch for vcpu_tb_trans: the parallel canonical-insn
+ * arrays plus the reused per-fragment local mapping.  RAII via unique_ptr,
+ * so every exit path frees the whole set automatically — previously each of
+ * the three returns had to g_free them by hand, a leak waiting for the next
+ * array to be added.  make_unique<T[]> value-initialises (zeroes), matching
+ * the old g_new0.
+ */
+struct TbScratch {
+    std::unique_ptr<uint64_t[]>              insn_pcs;
+    std::unique_ptr<qemu_plugin_insn_info[]> insn_info;
+    std::unique_ptr<uint64_t[]>              insn_branch_target_pcs;
+    std::unique_ptr<uint8_t[]>               insn_sizes;
+    std::unique_ptr<uint8_t[]>               insn_bytes;   /* n * MAX_INSN_BYTES */
+    std::unique_ptr<uint32_t[]>              canonical_index;
+    std::unique_ptr<bool[]>                  canonical_first;
+    /* Per-fragment local canonical mapping, reused across fragments. */
+    std::unique_ptr<uint32_t[]>              local_canonical_index;
+    std::unique_ptr<bool[]>                  local_canonical_first;
+
+    explicit TbScratch(size_t n)
+        : insn_pcs(std::make_unique<uint64_t[]>(n)),
+          insn_info(std::make_unique<qemu_plugin_insn_info[]>(n)),
+          insn_branch_target_pcs(std::make_unique<uint64_t[]>(n)),
+          insn_sizes(std::make_unique<uint8_t[]>(n)),
+          insn_bytes(std::make_unique<uint8_t[]>(n * MAX_INSN_BYTES)),
+          canonical_index(std::make_unique<uint32_t[]>(n)),
+          canonical_first(std::make_unique<bool[]>(n)),
+          local_canonical_index(std::make_unique<uint32_t[]>(n)),
+          local_canonical_first(std::make_unique<bool[]>(n)) {}
+};
+
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     uint64_t pc = qemu_plugin_tb_vaddr(tb);
@@ -2224,21 +2257,19 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      */
     struct qemu_plugin_insn *first_insn = qemu_plugin_tb_get_insn(tb, 0);
 
-    uint64_t *insn_pcs = g_new0(uint64_t, raw_n_insns);
-    qemu_plugin_insn_info *insn_info =
-        g_new0(qemu_plugin_insn_info, raw_n_insns);
-    /*
-     * Per-canonical-insn static branch target the translator resolved
-     * for this instruction (via qemu_plugin_insn_branch_target_pc()).
-     * Parallel to insn_info[] / insn_pcs[].  Zero on non-branches and
-     * on indirect branches (which fall back to BranchHistory).
-     */
-    uint64_t *insn_branch_target_pcs = g_new0(uint64_t, raw_n_insns);
-    uint8_t *insn_sizes = g_new0(uint8_t, raw_n_insns);
-    uint8_t *insn_bytes = g_new0(uint8_t,
-                                 raw_n_insns * MAX_INSN_BYTES);
-    uint32_t *canonical_index = g_new0(uint32_t, raw_n_insns);
-    bool *canonical_first = g_new0(bool, raw_n_insns);
+    /* RAII-owned scratch; raw aliases below keep the loop body unchanged.
+     * insn_branch_target_pcs is the per-canonical-insn static branch target
+     * the translator resolved (qemu_plugin_insn_branch_target_pc()), parallel
+     * to insn_info[]/insn_pcs[]; zero on non-branches and indirect branches
+     * (which fall back to BranchHistory). */
+    TbScratch scratch(raw_n_insns);
+    uint64_t *insn_pcs                 = scratch.insn_pcs.get();
+    qemu_plugin_insn_info *insn_info   = scratch.insn_info.get();
+    uint64_t *insn_branch_target_pcs   = scratch.insn_branch_target_pcs.get();
+    uint8_t *insn_sizes                = scratch.insn_sizes.get();
+    uint8_t *insn_bytes                = scratch.insn_bytes.get();
+    uint32_t *canonical_index          = scratch.canonical_index.get();
+    bool *canonical_first              = scratch.canonical_first.get();
     uint32_t canonical_n_insns = 0;
 
     for (size_t i = 0; i < raw_n_insns; i++) {
@@ -2334,15 +2365,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                     poison.pc, poison.reason, pc);
             }
         }
-        /* Drop all per-TB scratch; do not create fragments, do not arm
-         * callbacks.  vcpu_tb_exec gets no udata for this TB. */
-        g_free(insn_pcs);
-        g_free(insn_info);
-        g_free(insn_branch_target_pcs);
-        g_free(insn_sizes);
-        g_free(insn_bytes);
-        g_free(canonical_index);
-        g_free(canonical_first);
+        /* Do not create fragments, do not arm callbacks.  vcpu_tb_exec gets
+         * no udata for this TB; scratch is freed by TbScratch on return. */
         return;
     }
 
@@ -2360,8 +2384,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * index space.  Allocated once and reused per fragment.  For raw
      * insns not in the current fragment, local_canonical_first is set
      * to false so tb_arm_new_template_cbs skips them. */
-    uint32_t *local_canonical_index = g_new0(uint32_t, raw_n_insns);
-    bool     *local_canonical_first = g_new0(bool, raw_n_insns);
+    uint32_t *local_canonical_index = scratch.local_canonical_index.get();
+    bool     *local_canonical_first = scratch.local_canonical_first.get();
 
     const char *tb_symbol_name = qemu_plugin_insn_symbol(first_insn);
 
@@ -2487,8 +2511,6 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         g_mutex_unlock(&data_lock);
     }
 
-    g_free(local_canonical_index);
-    g_free(local_canonical_first);
 
     /* Instrument the block for execution tracking.  current_pc is set
      * per-TB-exec to the TB's start_pc (== head fragment's start_pc).
@@ -2546,13 +2568,6 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         QEMU_PLUGIN_COND_GE, g_scoreboard.is_active, 1,
         (void *)head_fragment);
 
-    g_free(insn_pcs);
-    g_free(insn_info);
-    g_free(insn_branch_target_pcs);
-    g_free(insn_sizes);
-    g_free(insn_bytes);
-    g_free(canonical_index);
-    g_free(canonical_first);
 }
 
 /* ========================= Flush callback ========================= */

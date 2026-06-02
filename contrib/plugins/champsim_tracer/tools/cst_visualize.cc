@@ -2906,46 +2906,19 @@ int main(int argc, char **argv)
     return render_result(agg, opts);
 }
 
-static TraceResult process_trace(const char *path, const Options &opts)
+/*
+ * Per-metric state setup, run once before the body walk: pre-register
+ * the breakdown series in a stable order and allocate the predictors /
+ * BTBs / caches the chosen metric needs.  Pulled out of process_trace so
+ * that 1300-line function reads as setup -> walk -> finalize; the label
+ * registration order here is load-bearing (see the branch_dir note) and
+ * is preserved verbatim.
+ */
+static void build_metric_state(WalkCtx &ctx,
+                               const std::vector<cst::Template> &templates,
+                               const cst::Header &h)
 {
-    std::unique_ptr<cst::CstFile> cf = cst::cst_file_open(path);
-
-    std::vector<cst::Template> templates;
-    std::unordered_map<uint32_t, size_t> by_id;
-    cst::Header h = cst::parse_header(cf->header(), &templates, &by_id);
-
-    /* Decide bin width up front.  total_target_insns is the
-     * configured-stop number from the header; for unbounded
-     * (icount-mode without stop) it's 0 and we fall back to a
-     * profile-summed estimate via t.profile.exec_cp * t.insns.size().
-     * In both cases we know the bin width before the walk so the
-     * x-axis is stable. */
-    uint64_t total_cp_insns = 0;
-    if (h.total_target_insns > 0) {
-        total_cp_insns = h.total_target_insns;
-    } else {
-        for (const auto &t : templates) {
-            total_cp_insns += (uint64_t)t.profile.exec_cp * t.insns.size();
-        }
-        if (total_cp_insns == 0) total_cp_insns = 1;
-    }
-    uint64_t bin_width = total_cp_insns / (uint64_t)opts.bins;
-    if (bin_width == 0) bin_width = 1;
-
-    /* Pre-classify every template's terminating branch so per-entry
-     * dispatch stays O(1).  Also precompute the gen_op / gen_reg /
-     * mem_pat / branch_dir per-template series-increments. */
-    WalkCtx ctx;
-    ctx.h         = &h;
-    ctx.templates = &templates;
-    ctx.by_id     = &by_id;
-    ctx.opts      = opts;
-    ctx.bin_width = bin_width;
-
-    ctx.term.resize(templates.size());
-    for (size_t i = 0; i < templates.size(); i++) {
-        ctx.term[i] = classify_term(templates[i], h.maps.branch_type);
-    }
+    const Options &opts = ctx.opts;
 
     /* branch_dir: pre-register the direction-breakdown series in a
      * canonical, trace-independent order BEFORE the walk.  The handler
@@ -3151,6 +3124,50 @@ static TraceResult process_trace(const char *path, const Options &opts)
         for (int n : opts.btb_entries) if (n > gate_size) gate_size = n;
         if (gate_size > 0) ctx.bp_btb_gate = BTB(gate_size);
     }
+}
+
+static TraceResult process_trace(const char *path, const Options &opts)
+{
+    std::unique_ptr<cst::CstFile> cf = cst::cst_file_open(path);
+
+    std::vector<cst::Template> templates;
+    std::unordered_map<uint32_t, size_t> by_id;
+    cst::Header h = cst::parse_header(cf->header(), &templates, &by_id);
+
+    /* Decide bin width up front.  total_target_insns is the
+     * configured-stop number from the header; for unbounded
+     * (icount-mode without stop) it's 0 and we fall back to a
+     * profile-summed estimate via t.profile.exec_cp * t.insns.size().
+     * In both cases we know the bin width before the walk so the
+     * x-axis is stable. */
+    uint64_t total_cp_insns = 0;
+    if (h.total_target_insns > 0) {
+        total_cp_insns = h.total_target_insns;
+    } else {
+        for (const auto &t : templates) {
+            total_cp_insns += (uint64_t)t.profile.exec_cp * t.insns.size();
+        }
+        if (total_cp_insns == 0) total_cp_insns = 1;
+    }
+    uint64_t bin_width = total_cp_insns / (uint64_t)opts.bins;
+    if (bin_width == 0) bin_width = 1;
+
+    /* Pre-classify every template's terminating branch so per-entry
+     * dispatch stays O(1).  Also precompute the gen_op / gen_reg /
+     * mem_pat / branch_dir per-template series-increments. */
+    WalkCtx ctx;
+    ctx.h         = &h;
+    ctx.templates = &templates;
+    ctx.by_id     = &by_id;
+    ctx.opts      = opts;
+    ctx.bin_width = bin_width;
+
+    ctx.term.resize(templates.size());
+    for (size_t i = 0; i < templates.size(); i++) {
+        ctx.term[i] = classify_term(templates[i], h.maps.branch_type);
+    }
+
+    build_metric_state(ctx, templates, h);
 
     /* Header-derived static-summary metrics (bb_length /
      * indirect_targets / branch_entropy) compute purely from the

@@ -123,6 +123,32 @@ static void wp_enter_spec_session(unsigned int cpu_index, uint64_t wrong_target,
 }
 
 /*
+ * Exit the wrong-path speculative session: restore the scoreboard cursor
+ * from the snapshot wp_enter_spec_session took, leave spec mode, and restore
+ * + free the saved CPU register state.  The symmetric counterpart to
+ * wp_enter_spec_session; WP-result stats are the caller's concern.
+ */
+static void wp_end_spec_session(unsigned int cpu_index,
+                                struct qemu_plugin_cpu_state *saved_state)
+{
+    g_wp_state.in_progress = false;
+
+    qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index, g_wp_state.saved_insn_count);
+    qemu_plugin_u64_set(g_scoreboard.prev_start_pc, cpu_index, g_wp_state.saved_prev_start_pc);
+    qemu_plugin_u64_set(g_scoreboard.prev_fall_through, cpu_index,
+                        g_wp_state.saved_prev_fall_through);
+    qemu_plugin_u64_set(g_scoreboard.prev_bb_terminus, cpu_index,
+                        g_wp_state.saved_prev_bb_terminus);
+    qemu_plugin_u64_set(g_scoreboard.budget, cpu_index, g_wp_state.saved_budget);
+
+    qemu_plugin_spec_mode_end();
+    qemu_plugin_cpu_state_restore(saved_state);
+    qemu_plugin_cpu_state_free(saved_state);
+
+    g_wp_state.mem_accesses.clear();
+}
+
+/*
  * Append the executed prefix [0, n_executed_in_cur) of fragment @cur into
  * the WP accumulator, de-duplicating against the accumulator tail (a
  * self-looping single-insn TB re-appends the same insn) and recording
@@ -837,21 +863,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         }
     }
 
-    g_wp_state.in_progress = false;
-
-    qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index, g_wp_state.saved_insn_count);
-    qemu_plugin_u64_set(g_scoreboard.prev_start_pc, cpu_index, g_wp_state.saved_prev_start_pc);
-    qemu_plugin_u64_set(g_scoreboard.prev_fall_through, cpu_index,
-                        g_wp_state.saved_prev_fall_through);
-    qemu_plugin_u64_set(g_scoreboard.prev_bb_terminus, cpu_index,
-                        g_wp_state.saved_prev_bb_terminus);
-    qemu_plugin_u64_set(g_scoreboard.budget, cpu_index, g_wp_state.saved_budget);
-
-    qemu_plugin_spec_mode_end();
-    qemu_plugin_cpu_state_restore(saved_state);
-    qemu_plugin_cpu_state_free(saved_state);
-
-    g_wp_state.mem_accesses.clear();
+    wp_end_spec_session(cpu_index, saved_state);
 
     stats.wp_simulations++;
     stats.wp_total_insns += sim_insns;

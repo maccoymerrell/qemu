@@ -821,13 +821,44 @@ struct ChartPlan {
 static const char *palette_color(size_t i)
 {
     static const char *p[] = {
+        /* tab20 (indices 0..19 unchanged so index-keyed series keep their
+         * historical colours). */
         "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
         "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
         "#bcbd22", "#17becf", "#aec7e8", "#ffbb78",
         "#98df8a", "#ff9896", "#c5b0d5", "#c49c94",
         "#f7b6d2", "#c7c7c7", "#dbdb8d", "#9edae5",
+        /* tab20b — extends the wheel to 40 so name-keyed category colours
+         * (color_for_label) collide far less within a single plot. */
+        "#393b79", "#5254a3", "#6b6ecf", "#9c9ede",
+        "#637939", "#8ca252", "#b5cf6b", "#cedb9c",
+        "#8c6d31", "#bd9e39", "#e7ba52", "#e7cb94",
+        "#843c39", "#ad494a", "#d6616b", "#e7969c",
+        "#7b4173", "#a55194", "#ce6dbd", "#de9ed6",
     };
     return p[i % (sizeof(p) / sizeof(p[0]))];
+}
+
+/*
+ * Deterministic colour for a category label: a stable hash of the NAME into
+ * the palette, so a given category (opcode, dst-reg, branch class, memory
+ * pattern, ...) draws in the SAME colour in every plot and every pane —
+ * regardless of discovery order, top-K selection, or which other categories
+ * happen to be present.  Index-based colouring drifted across traces and
+ * across the CP/WP panes whenever that set or its order changed, which made
+ * cross-plot comparison confusing.  Dense single-pane breakdowns can collide
+ * within one plot (more categories than palette slots), but each series is
+ * still named in the legend, and cross-plot/pane stability is the property
+ * that matters here.  FNV-1a so the mapping is fixed across builds/runs.
+ */
+static const char *color_for_label(const std::string &label)
+{
+    uint64_t h = 1469598103934665603ULL;
+    for (unsigned char c : label) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    return palette_color((size_t)h);
 }
 
 static std::string xml_escape(const std::string &s)
@@ -3456,7 +3487,7 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
                 }
                 for (int s = 0; s < S; s++) {
                     p.series[s].label = ctx.label_names[s];
-                    p.series[s].color = palette_color(s);
+                    p.series[s].color = color_for_label(ctx.label_names[s]);
                     p.series[s].y.resize(actual_bins);
                     for (int b = 0; b < actual_bins; b++) {
                         double v = mat.get(s, b);
@@ -3742,14 +3773,52 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
             plan.y_max = (y_peak > 0) ? y_peak * 1.1 : 1.0;
             plan.warmup_bins = 0;
 
-            /* Bottom pane: issue-cycle histogram.  Trim trailing
-             * zeros so the x-axis isn't dominated by an empty tail
-             * (typical chunks complete well before cycle = window). */
+            /* Bottom pane: issue-cycle histogram.  Trim trailing zeros so
+             * the x-axis isn't dominated by an empty tail (chunks typically
+             * complete well before cycle = window). */
             size_t n_cycles = ctx.df.ilp_cycle_hist.size();
             while (n_cycles > 1 &&
                    ctx.df.ilp_cycle_hist[n_cycles - 1] == 0) {
                 n_cycles--;
             }
+            /* Then fold the sparse high-cycle tail into a ">N" overflow bin
+             * (same hist_tail_pct rule as the other histograms) so a few
+             * long chains don't stretch the axis into illegibility. */
+            std::vector<uint64_t> cyc(ctx.df.ilp_cycle_hist.begin(),
+                                      ctx.df.ilp_cycle_hist.begin()
+                                          + (long)n_cycles);
+            /* The issue-cycle distribution is latency-like — a long thin
+             * tail of a few deep dependency chains — so the global 0.5%
+             * fold (tuned for concentrated histograms like bb_length) barely
+             * clips it and the axis sprawls.  Fold at least the top 2% (p98)
+             * here so the informative low-cycle bulk stays legible; a larger
+             * user --hist-tail-pct still wins. */
+            int ilp_clip = -1;
+            double ilp_tail = std::max(opts.hist_tail_pct, 2.0);
+            if (ilp_tail > 0.0) {
+                uint64_t total = 0;
+                for (uint64_t v : cyc) total += v;
+                if (total > 0) {
+                    uint64_t thresh = (uint64_t)((double)total
+                        * (1.0 - ilp_tail / 100.0));
+                    uint64_t cum = 0;
+                    int c = (int)cyc.size() - 1;
+                    for (size_t i = 0; i < cyc.size(); i++) {
+                        cum += cyc[i];
+                        if (cum >= thresh) { c = (int)i; break; }
+                    }
+                    if (c + 2 < (int)cyc.size()) {
+                        uint64_t over = 0;
+                        for (int i = c + 1; i < (int)cyc.size(); i++) {
+                            over += cyc[i];
+                        }
+                        cyc.resize(c + 2);
+                        cyc[c + 1] = over;
+                        ilp_clip = c;
+                    }
+                }
+            }
+            n_cycles = cyc.size();
             plan2.mode = ChartPlan::Mode::Bars;
             plan2.n_bins = (int)n_cycles;
             plan2.x_bin_size = 1;
@@ -3764,12 +3833,16 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
             plan2.series[0].y.assign(n_cycles, 0.0);
             uint64_t y_peak2 = 0;
             for (size_t c = 0; c < n_cycles; c++) {
-                plan2.series[0].y[c] = (double)ctx.df.ilp_cycle_hist[c];
-                if (ctx.df.ilp_cycle_hist[c] > y_peak2) {
-                    y_peak2 = ctx.df.ilp_cycle_hist[c];
-                }
+                plan2.series[0].y[c] = (double)cyc[c];
+                if (cyc[c] > y_peak2) y_peak2 = cyc[c];
             }
             plan2.y_max = (y_peak2 > 0) ? (double)y_peak2 * 1.1 : 1.0;
+            if (ilp_clip >= 0) {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), ">%d", ilp_clip);
+                plan2.has_overflow_bin = true;
+                plan2.overflow_label   = buf;
+            }
             plan2.margin_right = 40;
             plan.title  = pick_title() + " (per-bin IPC)";
             plan2.title = pick_title() + " (issue-cycle histogram)";
@@ -3896,16 +3969,19 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
             int draw_bins = overflow ? clip_idx : (data_bins);
             plan.x_tick_labels.clear();
             plan.x_tick_labels.push_back("cold");
+            /* Standardised to the bucket's LOW BOUND only (e.g. 256, 1K, 1M).
+             * The prior code alternated "lo-hi" ranges for small buckets and
+             * a bare low bound for large ones, which crowded the small-bucket
+             * end of the x-axis and read inconsistently. */
             auto bucket_label = [](size_t b) -> std::string {
                 char buf[32];
-                if (b == 0) std::snprintf(buf, sizeof(buf), "0");
-                else if (b == 1) std::snprintf(buf, sizeof(buf), "1");
-                else {
-                    uint64_t lo = uint64_t{1} << (b - 1);
-                    uint64_t hi = (uint64_t{1} << b) - 1;
-                    if (hi < 1024) std::snprintf(buf, sizeof(buf),
-                        "%lu-%lu", (unsigned long)lo, (unsigned long)hi);
-                    else if (hi < 1024 * 1024) std::snprintf(buf, sizeof(buf),
+                if (b == 0) {
+                    std::snprintf(buf, sizeof(buf), "0");
+                } else {
+                    uint64_t lo = uint64_t{1} << (b - 1);   /* b==1 -> 1 */
+                    if (lo < 1024) std::snprintf(buf, sizeof(buf),
+                        "%lu", (unsigned long)lo);
+                    else if (lo < 1024 * 1024) std::snprintf(buf, sizeof(buf),
                         "%luK", (unsigned long)(lo / 1024));
                     else std::snprintf(buf, sizeof(buf),
                         "%luM", (unsigned long)(lo / (1024 * 1024)));
@@ -3917,16 +3993,9 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
             }
             if (overflow) {
                 /* The overflow bin folds buckets [clip_idx .. n_buckets-1];
-                 * label it as ">{label of bucket clip_idx-1's hi end}". */
-                std::string base = bucket_label((size_t)clip_idx - 1);
-                /* Take whatever comes after the dash (or the whole
-                 * label if there's no dash) as the lower-bound name. */
-                std::string upper = base;
-                size_t dash = base.find('-');
-                if (dash != std::string::npos) {
-                    upper = base.substr(dash + 1);
-                }
-                plan.x_tick_labels.push_back(">" + upper);
+                 * label it ">{low bound of the first folded bucket}". */
+                plan.x_tick_labels.push_back(
+                    ">" + bucket_label((size_t)clip_idx));
             }
             plan.margin_right = 40;
             break;
@@ -4339,7 +4408,7 @@ static ChartPlan aggregate_pane(const std::vector<const ChartPlan *> &panes,
         std::unordered_map<std::string, std::string> color;
         std::unordered_map<std::string, int> label_idx;
         for (size_t i = 0; i < labels.size(); i++) {
-            color[labels[i]] = palette_color(i);
+            color[labels[i]] = color_for_label(labels[i]);
             label_idx[labels[i]] = (int)i;
         }
         /* Unified legend (label + colour, no data). */

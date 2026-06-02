@@ -1256,9 +1256,8 @@ private:
     }
 
     /* Axis labels.  The x-axis title sits below the tick labels
-     * (~B_edge + 38), well outside the plot frame; previously it lived
-     * INSIDE the frame at B_edge - 8 and overlapped data, especially
-     * histogram bars and any series whose values approached zero. */
+     * (~B_edge + 38), outside the plot frame, so it never overlaps data
+     * (histogram bars, or any series approaching zero). */
     void emit_axis_titles()
     {
         if (!plan_.x_label.empty() && plan_.show_x_labels) {
@@ -1579,17 +1578,14 @@ struct WalkCtx {
      * denominator for the WP breakdown panes' percent-stacking. */
     std::vector<uint64_t> wp_branches_per_bin;
 
-    /* For wp_divergence: per-CP-bin vector of "match depth"
-     * observations — how many WP-chain edges the BP+BTB model
-     * predicts correctly before it diverges from the recorded chain
-     * (or runs the chain to completion).  One observation per CP
-     * branch whose chain has at least one edge.  Sorted later to
-     * compute min / median / max along with the running mean. */
-    /* Per-bin histogram of WP-chain match-depth observations.
-     * Replaces the prior std::vector<std::vector<int>> which would
-     * accumulate one int per CP branch (200MB+ on a 300M trace);
-     * depths are bounded by max_wrong_path_depth so a small fixed
-     * histogram per bin is plenty. */
+    /* For wp_divergence: per-CP-bin histogram of "match depth" — how many
+     * WP-chain edges the BP+BTB model predicts correctly before it diverges
+     * from the recorded chain (or runs it to completion), one observation
+     * per CP branch whose chain has at least one edge.  A histogram (not a
+     * per-branch vector) because depths are bounded by max_wrong_path_depth,
+     * so a small fixed bucket array per bin suffices where one int per CP
+     * branch would be 200MB+ on a 300M trace; finalize derives min / median
+     * / max / mean from it. */
     std::vector<std::vector<uint64_t>> wp_depth_per_bin;
 
     /* For branch_dir / gen_op / gen_reg: dynamic label -> series-id

@@ -114,6 +114,19 @@ bool cst_pc_is_poisoned(uint64_t pc)
  * start_pc, and that needs no start_pc lookup. */
 thread_local BBTemplate *g_cp_prev_tb_template CST_TLS_HOT = nullptr;
 
+/*
+ * Address-space pin (marker mode).  When the marker fires we capture the
+ * executing vCPU's ASID (x86 CR3 etc., via qemu_plugin_get_addr_space_id)
+ * — the marker runs as one of the target's own instructions, so that ASID
+ * IS the target's.  Thereafter vcpu_tb_exec traces only TBs whose current
+ * ASID matches the pin, so a preempt into another process (a different CR3)
+ * is filtered out.  In user mode the ASID is always 0, so the pin matches
+ * every TB and is a no-op.  CST_ASID_UNPINNED means "not pinned" — every
+ * non-marker window mode leaves it so and pays only one atomic load per TB.
+ */
+static const uint64_t CST_ASID_UNPINNED = UINT64_MAX;
+static std::atomic<uint64_t> g_pinned_asid{CST_ASID_UNPINNED};
+
 /* See champsim_tracer.h: threads holding cross-flush BBTemplate*
  * references (in-flight wrong-path simulation).  Gates drain_pending_flush
  * so a tb_flush mid-WP defers template reclamation until the WP unwinds. */
@@ -1661,6 +1674,20 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         return;
     }
 
+    /* Address-space pin (marker mode): trace only the pinned target's TBs.
+     * A TB in another address space (a preempt to another process, or the
+     * kernel on a different mm) is dropped, and the CP chain cursor is reset
+     * so its fragments never bridge into the pinned trace across the gap —
+     * the same one-TB lossy boundary the segment-switch path takes.  Reads
+     * the ASID only when actually pinned, so non-marker modes pay just the
+     * atomic load.  (User mode: ASID is always 0, the pin matches, no-op.) */
+    uint64_t pinned_asid = g_pinned_asid.load(std::memory_order_relaxed);
+    if (pinned_asid != CST_ASID_UNPINNED &&
+        qemu_plugin_get_addr_space_id() != pinned_asid) {
+        g_cp_prev_tb_template = nullptr;
+        return;
+    }
+
     /* icount bump is now an inline_add registered AFTER this cb in
      * vcpu_tb_trans, so the scoreboard slot still holds the pre-TB
      * value at this point — matches the old icount_prev semantics
@@ -2142,6 +2169,12 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
     if (!g_marker_fired.compare_exchange_strong(expected, true)) {
         return;                              /* one-shot */
     }
+    /* Pin to the target's address space.  The marker is one of the
+     * target's own instructions, so the current ASID is the target's; every
+     * later TB in a different address space is filtered in vcpu_tb_exec. */
+    uint64_t asid = qemu_plugin_get_addr_space_id();
+    g_pinned_asid.store(asid, std::memory_order_relaxed);
+
     g_rec_mutex_lock(&exec_lock);
     if (!g_trace_segments.is_active() && !g_trace_segments.is_shutting_down()) {
         uint64_t lo = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
@@ -2149,7 +2182,8 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
         uint64_t hi = lo + span;
         g_trace_segments.set_window(lo, hi);
         fprintf(stderr, "champsim_tracer: marker fired at icount %" PRIu64
-                " — tracing %" PRIu64 " insns\n", lo, span);
+                ", asid 0x%" PRIx64 " — tracing %" PRIu64 " insns\n",
+                lo, asid, span);
         start_trace_segment("marker", lo, hi, /* warmup= */ 0, span,
                             cpu_index, /* simpoint_weight= */ 0.0);
     }

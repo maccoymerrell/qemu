@@ -2238,31 +2238,20 @@ struct TbScratch {
           local_canonical_first(std::make_unique<bool[]>(n)) {}
 };
 
-static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
+/*
+ * Decode the TB's raw instruction stream into the canonical (de-duplicated)
+ * arrays in @scratch, and arm the per-insn memop callback (plus, in marker
+ * window mode, the one-shot trace-open callback on the x86 launch magic).
+ * A QEMU TB can repeat an instruction (e.g. REP string ops): consecutive
+ * byte-identical insns at the same PC fold to one canonical entry, with
+ * canonical_index[] mapping each raw insn to its canonical slot and
+ * canonical_first[] marking the first raw occurrence.  Returns the canonical
+ * insn count.  insn_branch_target_pcs holds the translator-resolved static
+ * branch target per canonical insn (0 on non-branch / indirect).
+ */
+static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
+                                      size_t raw_n_insns, TbScratch &scratch)
 {
-    uint64_t pc = qemu_plugin_tb_vaddr(tb);
-    size_t raw_n_insns = qemu_plugin_tb_n_insns(tb);
-    if (raw_n_insns == 0) {
-        return;
-    }
-
-    /*
-     * Every TB gets the full heavy translation, regardless of segment
-     * state.  Per-insn callbacks are gated via cond_cb on the
-     * scoreboard `is_active` slot so inter-segment execution skips
-     * them via a JIT-emitted check, with no plugin-side flush
-     * required at segment boundaries.  This avoids the user-mode
-     * `tb_flush` hazard where a chained TB jumps to JIT-region bytes
-     * that subsequent translations have overwritten.
-     */
-    struct qemu_plugin_insn *first_insn = qemu_plugin_tb_get_insn(tb, 0);
-
-    /* RAII-owned scratch; raw aliases below keep the loop body unchanged.
-     * insn_branch_target_pcs is the per-canonical-insn static branch target
-     * the translator resolved (qemu_plugin_insn_branch_target_pc()), parallel
-     * to insn_info[]/insn_pcs[]; zero on non-branches and indirect branches
-     * (which fall back to BranchHistory). */
-    TbScratch scratch(raw_n_insns);
     uint64_t *insn_pcs                 = scratch.insn_pcs.get();
     qemu_plugin_insn_info *insn_info   = scratch.insn_info.get();
     uint64_t *insn_branch_target_pcs   = scratch.insn_branch_target_pcs.get();
@@ -2345,6 +2334,44 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             QEMU_PLUGIN_MEM_RW,
             (void *)(uintptr_t)raw_pc);
     }
+    return canonical_n_insns;
+}
+
+static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
+{
+    uint64_t pc = qemu_plugin_tb_vaddr(tb);
+    size_t raw_n_insns = qemu_plugin_tb_n_insns(tb);
+    if (raw_n_insns == 0) {
+        return;
+    }
+
+    /*
+     * Every TB gets the full heavy translation, regardless of segment
+     * state.  Per-insn callbacks are gated via cond_cb on the
+     * scoreboard `is_active` slot so inter-segment execution skips
+     * them via a JIT-emitted check, with no plugin-side flush
+     * required at segment boundaries.  This avoids the user-mode
+     * `tb_flush` hazard where a chained TB jumps to JIT-region bytes
+     * that subsequent translations have overwritten.
+     */
+    struct qemu_plugin_insn *first_insn = qemu_plugin_tb_get_insn(tb, 0);
+
+    /* RAII-owned scratch; raw aliases below keep the loop body unchanged.
+     * insn_branch_target_pcs is the per-canonical-insn static branch target
+     * the translator resolved (qemu_plugin_insn_branch_target_pc()), parallel
+     * to insn_info[]/insn_pcs[]; zero on non-branches and indirect branches
+     * (which fall back to BranchHistory). */
+    TbScratch scratch(raw_n_insns);
+    uint64_t *insn_pcs                 = scratch.insn_pcs.get();
+    qemu_plugin_insn_info *insn_info   = scratch.insn_info.get();
+    uint64_t *insn_branch_target_pcs   = scratch.insn_branch_target_pcs.get();
+    uint8_t *insn_sizes                = scratch.insn_sizes.get();
+    uint8_t *insn_bytes                = scratch.insn_bytes.get();
+    uint32_t *canonical_index          = scratch.canonical_index.get();
+    bool *canonical_first              = scratch.canonical_first.get();
+
+    uint32_t canonical_n_insns =
+        build_canonical_insns(tb, raw_n_insns, scratch);
 
     /* Pre-commit instruction-memory stability check.  If the poisoning
      * fires inside the main binary's text segment, warn once: that is a

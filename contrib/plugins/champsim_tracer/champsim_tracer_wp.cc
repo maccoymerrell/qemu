@@ -30,6 +30,34 @@
  * fault.  Returns the WPBBEntry chain by value (callers move it into
  * BodyEntry::wp_entries).
  */
+/*
+ * Enter a wrong-path speculative session: snapshot the scoreboard cursor
+ * into g_wp_state (so the nested vcpu_tb_exec on this thread observes WP
+ * mode and can restore the cursor afterwards), flip spec mode on, and
+ * redirect the PC to the wrong target.  The caller has already saved the
+ * CPU register state (@saved_state) and reset the WP chain/mem accumulator.
+ */
+static void wp_enter_spec_session(unsigned int cpu_index, uint64_t wrong_target,
+                                  struct qemu_plugin_cpu_state *saved_state)
+{
+    g_wp_state.mem_accesses.clear();
+    g_wp_state.cur_insn_pc = 0;
+    g_wp_state.cur_insn_count = 0;
+
+    g_wp_state.saved_cpu_index = cpu_index;
+    g_wp_state.saved_insn_count = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
+    g_wp_state.saved_prev_start_pc = qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
+    g_wp_state.saved_prev_fall_through = qemu_plugin_u64_get(g_scoreboard.prev_fall_through,
+                                                     cpu_index);
+    g_wp_state.saved_prev_bb_terminus =
+        qemu_plugin_u64_get(g_scoreboard.prev_bb_terminus, cpu_index);
+    g_wp_state.saved_budget = qemu_plugin_u64_get(g_scoreboard.budget, cpu_index);
+    g_wp_state.in_progress = true;
+
+    qemu_plugin_spec_mode_begin(saved_state);
+    qemu_plugin_set_pc(wrong_target);
+}
+
 std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                                uint64_t correct_target,
                                                uint64_t wrong_target,
@@ -79,22 +107,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         return wp_chain;
     }
 
-    g_wp_state.mem_accesses.clear();
-    g_wp_state.cur_insn_pc = 0;
-    g_wp_state.cur_insn_count = 0;
-
-    g_wp_state.saved_cpu_index = cpu_index;
-    g_wp_state.saved_insn_count = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
-    g_wp_state.saved_prev_start_pc = qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
-    g_wp_state.saved_prev_fall_through = qemu_plugin_u64_get(g_scoreboard.prev_fall_through,
-                                                     cpu_index);
-    g_wp_state.saved_prev_bb_terminus =
-        qemu_plugin_u64_get(g_scoreboard.prev_bb_terminus, cpu_index);
-    g_wp_state.saved_budget = qemu_plugin_u64_get(g_scoreboard.budget, cpu_index);
-    g_wp_state.in_progress = true;
-
-    qemu_plugin_spec_mode_begin(saved_state);
-    qemu_plugin_set_pc(wrong_target);
+    wp_enter_spec_session(cpu_index, wrong_target, saved_state);
 
     /*
      * Per-insn accumulator for the BB being built.  Each exec_tb runs a

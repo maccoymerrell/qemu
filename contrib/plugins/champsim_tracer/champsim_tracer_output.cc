@@ -2564,9 +2564,9 @@ stage_wide_delta(StageRec **stage_p, unsigned int *stage_len,
  * actual_n_stores; DST_REG / METAFLAGS / lane-masks gated by the
  * immutable per-insn schema in InsnFields).  Skips entire families
  * for insns where the template schema or runtime count guarantees
- * extract() would return false — the prior dense walker called
- * runtime_slot_cap() N_INSNS * N_DESCRIPTORS times per call regardless,
- * and that dispatch overhead dominated on scalar-heavy traces (mcf).
+ * extract() would return false; visiting every (insn, descriptor) pair
+ * unconditionally would let the per-pair dispatch overhead dominate on
+ * scalar-heavy traces (mcf).
  *
  * A final (pos, fid) sort produces the wire's required non-descending
  * order, since the per-insn sub-walks emit family-major within each

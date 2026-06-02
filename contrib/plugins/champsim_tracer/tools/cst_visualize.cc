@@ -1652,26 +1652,32 @@ struct WalkCtx {
      * capture exactly what the gshare predictor sees so we can
      * verify, post-walk, that the outcomes the handler derived match
      * what the branches actually did. */
-    struct PcAgg {
-        uint64_t taken      = 0;
-        uint64_t nottaken   = 0;
-        uint64_t mispred_h0 = 0;
-        uint64_t mispred_h12 = 0;
+    struct DebugBranchState {
+        struct PcAgg {
+            uint64_t taken      = 0;
+            uint64_t nottaken   = 0;
+            uint64_t mispred_h0 = 0;
+            uint64_t mispred_h12 = 0;
+        };
+        std::unordered_map<uint64_t, PcAgg> per_pc;
+        uint64_t                            dumped = 0;
     };
-    std::unordered_map<uint64_t, PcAgg> dbg_per_pc;
-    uint64_t                            dbg_dumped = 0;
+    DebugBranchState dbg;
 
     /* --- working_set state.  Sliding-window accounting: each access
      * is recorded with the cp_insn position at which it happened;
      * accesses older than (cp_insns_so_far - ws_window) get retired
      * from the per-line / per-page counts, so the maps' sizes are
      * the LIVE working set, not a since-start cumulative footprint. */
-    std::deque<std::pair<uint64_t, uint64_t>> ws_line_accesses; /* (cp_insn, line) */
-    std::deque<std::pair<uint64_t, uint64_t>> ws_page_accesses;
-    std::unordered_map<uint64_t, uint32_t>    ws_line_count;     /* line -> count in window */
-    std::unordered_map<uint64_t, uint32_t>    ws_page_count;
-    std::vector<uint64_t> ws_lines_per_bin;
-    std::vector<uint64_t> ws_pages_per_bin;
+    struct WorkingSetState {
+        std::deque<std::pair<uint64_t, uint64_t>> line_accesses; /* (cp_insn, line) */
+        std::deque<std::pair<uint64_t, uint64_t>> page_accesses;
+        std::unordered_map<uint64_t, uint32_t>    line_count;    /* line -> count in window */
+        std::unordered_map<uint64_t, uint32_t>    page_count;
+        std::vector<uint64_t> lines_per_bin;
+        std::vector<uint64_t> pages_per_bin;
+    };
+    WorkingSetState ws;
 
     /* --- dep_depth / ilp shared state.  Wall's ideal-rename data-
      * flow model: each insn's complete cycle = 1 + max over its
@@ -1707,19 +1713,22 @@ struct WalkCtx {
      * independent.  WAR/WAW through memory are removed by the same
      * ideal-rename assumption as registers, so only store→load (RAW)
      * carries a chain. */
-    std::array<bool, 256> df_excluded_reg{};
-    bool                  df_excluded_built = false;
-    std::unordered_map<uint8_t, uint32_t>  df_producer_complete;
-    std::unordered_map<uint64_t, uint32_t> df_mem_producer_complete;
-    uint32_t                              df_chunk_insns      = 0;
-    uint32_t                              df_chunk_max_cycle  = 0;
-    std::vector<std::vector<uint64_t>>    dd_depth_hist_per_bin;
-    /* Per-bin per-chunk samples of (ipc × 1000).  uint32_t is enough
-     * since ipc <= window_size <= 2^30. */
-    std::vector<std::vector<uint32_t>>    ilp_samples_per_bin;
-    /* Global issue-cycle histogram: count of insns that issued at
-     * each in-window cycle, summed across all chunks. */
-    std::vector<uint64_t>                 ilp_cycle_hist;
+    struct DataflowState {
+        std::array<bool, 256> excluded_reg{};
+        bool                  excluded_built = false;
+        std::unordered_map<uint8_t, uint32_t>  producer_complete;
+        std::unordered_map<uint64_t, uint32_t> mem_producer_complete;
+        uint32_t                              chunk_insns      = 0;
+        uint32_t                              chunk_max_cycle  = 0;
+        std::vector<std::vector<uint64_t>>    dd_depth_hist_per_bin;
+        /* Per-bin per-chunk samples of (ipc × 1000).  uint32_t is enough
+         * since ipc <= window_size <= 2^30. */
+        std::vector<std::vector<uint32_t>>    ilp_samples_per_bin;
+        /* Global issue-cycle histogram: count of insns that issued at
+         * each in-window cycle, summed across all chunks. */
+        std::vector<uint64_t>                 ilp_cycle_hist;
+    };
+    DataflowState df;
 
     /* --- reuse_distance state.  An order-statistic tree (RB-tree
      * augmented with subtree sizes) holds one entry per currently-live
@@ -1730,11 +1739,14 @@ struct WalkCtx {
      * linear-scan O(N) the prior implementation paid per memop.
      * Histogram counts log2-bucketed distances plus a "cold" bucket
      * for first-access lines. */
-    OrderStatTree                          ru_tree;
-    std::unordered_map<uint64_t, uint64_t> ru_last_t;  /* line → tree key */
-    uint64_t                               ru_clock = 0;
-    std::vector<uint64_t>                  ru_hist;    /* sized at init */
-    uint64_t                               ru_cold = 0; /* first-access cnt */
+    struct ReuseDistState {
+        OrderStatTree                          tree;
+        std::unordered_map<uint64_t, uint64_t> last_t;  /* line → tree key */
+        uint64_t                               clock = 0;
+        std::vector<uint64_t>                  hist;    /* grown lazily */
+        uint64_t                               cold = 0; /* first-access cnt */
+    };
+    ReuseDistState ru;
 };
 
 /* Helper: classify a template's terminating instruction for
@@ -1924,15 +1936,15 @@ static void handle_gshare_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
             resolve_corrupted((int)pi, taken);
         }
         if (dbg_on) {
-            if (ctx.dbg_dumped < (uint64_t)ctx.opts.debug_branches) {
+            if (ctx.dbg.dumped < (uint64_t)ctx.opts.debug_branches) {
                 std::fprintf(stderr,
                     "BR pc=0x%lx taken=%d bin=%d pred_h0=%d pred_h12=%d\n",
                     (unsigned long)ctx.pending_branch_pc, taken ? 1 : 0,
                     (int)ctx.pending_bin, pred_h0 ? 1 : 0,
                     pred_h12 ? 1 : 0);
-                ctx.dbg_dumped++;
+                ctx.dbg.dumped++;
             }
-            auto &agg = ctx.dbg_per_pc[ctx.pending_branch_pc];
+            auto &agg = ctx.dbg.per_pc[ctx.pending_branch_pc];
             if (taken) agg.taken++; else agg.nottaken++;
             if (pi_h0  >= 0 && pred_h0  != taken) agg.mispred_h0++;
             if (pi_h12 >= 0 && pred_h12 != taken) agg.mispred_h12++;
@@ -2320,6 +2332,7 @@ static void handle_branch_dir_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
  * — that would just trend upward forever). */
 static void handle_working_set_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 {
+    auto &ws = ctx.ws;
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
     uint64_t now = ctx.cp_insns_so_far;
     uint64_t window = ctx.opts.ws_window;
@@ -2327,38 +2340,38 @@ static void handle_working_set_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
     /* Retire accesses that have aged out of the window.  Each line /
      * page exits the live count when its last in-window reference
      * does — count reaches 0 → erase from map. */
-    while (!ctx.ws_line_accesses.empty() &&
-           ctx.ws_line_accesses.front().first < cutoff) {
-        uint64_t line = ctx.ws_line_accesses.front().second;
-        ctx.ws_line_accesses.pop_front();
-        auto it = ctx.ws_line_count.find(line);
-        if (it != ctx.ws_line_count.end() && --it->second == 0) {
-            ctx.ws_line_count.erase(it);
+    while (!ws.line_accesses.empty() &&
+           ws.line_accesses.front().first < cutoff) {
+        uint64_t line = ws.line_accesses.front().second;
+        ws.line_accesses.pop_front();
+        auto it = ws.line_count.find(line);
+        if (it != ws.line_count.end() && --it->second == 0) {
+            ws.line_count.erase(it);
         }
     }
-    while (!ctx.ws_page_accesses.empty() &&
-           ctx.ws_page_accesses.front().first < cutoff) {
-        uint64_t page = ctx.ws_page_accesses.front().second;
-        ctx.ws_page_accesses.pop_front();
-        auto it = ctx.ws_page_count.find(page);
-        if (it != ctx.ws_page_count.end() && --it->second == 0) {
-            ctx.ws_page_count.erase(it);
+    while (!ws.page_accesses.empty() &&
+           ws.page_accesses.front().first < cutoff) {
+        uint64_t page = ws.page_accesses.front().second;
+        ws.page_accesses.pop_front();
+        auto it = ws.page_count.find(page);
+        if (it != ws.page_count.end() && --it->second == 0) {
+            ws.page_count.erase(it);
         }
     }
     for_each_cp_memop(bb, [&](uint32_t, uint64_t addr) {
         uint64_t line = addr >> 6;
         uint64_t page = addr >> 12;
-        ctx.ws_line_accesses.emplace_back(now, line);
-        ctx.ws_page_accesses.emplace_back(now, page);
-        ctx.ws_line_count[line]++;
-        ctx.ws_page_count[page]++;
+        ws.line_accesses.emplace_back(now, line);
+        ws.page_accesses.emplace_back(now, page);
+        ws.line_count[line]++;
+        ws.page_count[page]++;
     });
-    if ((int)ctx.ws_lines_per_bin.size() <= bin) {
-        ctx.ws_lines_per_bin.resize(bin + 1, 0);
-        ctx.ws_pages_per_bin.resize(bin + 1, 0);
+    if ((int)ws.lines_per_bin.size() <= bin) {
+        ws.lines_per_bin.resize(bin + 1, 0);
+        ws.pages_per_bin.resize(bin + 1, 0);
     }
-    ctx.ws_lines_per_bin[bin] = ctx.ws_line_count.size();
-    ctx.ws_pages_per_bin[bin] = ctx.ws_page_count.size();
+    ws.lines_per_bin[bin] = ws.line_count.size();
+    ws.pages_per_bin[bin] = ws.page_count.size();
     ctx.cp_insns_so_far += bb.n_insns;
 }
 
@@ -2367,14 +2380,14 @@ static void handle_working_set_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
  * NONE so they neither carry nor break chains. */
 static void df_ensure_excluded_built(WalkCtx &ctx)
 {
-    if (ctx.df_excluded_built) return;
+    if (ctx.df.excluded_built) return;
     for (const auto &kv : ctx.h->maps.reg) {
         if (kv.first > 255) continue;
         if (reg_is_special_excluded(kv.second)) {
-            ctx.df_excluded_reg[(size_t)kv.first] = true;
+            ctx.df.excluded_reg[(size_t)kv.first] = true;
         }
     }
-    ctx.df_excluded_built = true;
+    ctx.df.excluded_built = true;
 }
 
 /* Gather instruction @i's dynamic load/store addresses into caller
@@ -2419,9 +2432,9 @@ static inline uint32_t df_step_insn(WalkCtx &ctx,
 {
     uint32_t max_src = 0;
     for (uint8_t r : insn.src_regs) {
-        if (ctx.df_excluded_reg[r]) continue;
-        auto it = ctx.df_producer_complete.find(r);
-        if (it != ctx.df_producer_complete.end() && it->second > max_src) {
+        if (ctx.df.excluded_reg[r]) continue;
+        auto it = ctx.df.producer_complete.find(r);
+        if (it != ctx.df.producer_complete.end() && it->second > max_src) {
             max_src = it->second;
         }
     }
@@ -2429,45 +2442,45 @@ static inline uint32_t df_step_insn(WalkCtx &ctx,
      * to the same address in this window (read before the store side
      * below publishes, so a same-insn RMW sees the prior writer). */
     for (uint32_t k = 0; k < n_load; k++) {
-        auto it = ctx.df_mem_producer_complete.find(load_addrs[k]);
-        if (it != ctx.df_mem_producer_complete.end() && it->second > max_src) {
+        auto it = ctx.df.mem_producer_complete.find(load_addrs[k]);
+        if (it != ctx.df.mem_producer_complete.end() && it->second > max_src) {
             max_src = it->second;
         }
     }
     uint32_t this_complete = max_src + 1;
     if (this_complete > window) this_complete = window;
     for (uint8_t r : insn.dst_regs) {
-        if (ctx.df_excluded_reg[r]) continue;
-        ctx.df_producer_complete[r] = this_complete;
+        if (ctx.df.excluded_reg[r]) continue;
+        ctx.df.producer_complete[r] = this_complete;
     }
     /* A store publishes its completion cycle for its address so a later
      * aliasing load in this window chains off it. */
     for (uint32_t k = 0; k < n_store; k++) {
-        ctx.df_mem_producer_complete[store_addrs[k]] = this_complete;
+        ctx.df.mem_producer_complete[store_addrs[k]] = this_complete;
     }
-    if (this_complete > ctx.df_chunk_max_cycle) {
-        ctx.df_chunk_max_cycle = this_complete;
+    if (this_complete > ctx.df.chunk_max_cycle) {
+        ctx.df.chunk_max_cycle = this_complete;
     }
-    ctx.df_chunk_insns++;
-    if (ctx.df_chunk_insns >= window) {
-        if (record_ipc_samples && ctx.df_chunk_max_cycle > 0) {
+    ctx.df.chunk_insns++;
+    if (ctx.df.chunk_insns >= window) {
+        if (record_ipc_samples && ctx.df.chunk_max_cycle > 0) {
             /* Ideal IPC × 1000 in fixed-point: window insns retired
              * in chunk_max_cycle cycles assuming unlimited-width
              * issue.  An infinite-renamer / infinite-issue model
              * has no other bound, so this is the upper bound on
              * what better rename or wider issue could buy. */
             uint64_t ipc_x1000 =
-                ((uint64_t)window * 1000) / ctx.df_chunk_max_cycle;
+                ((uint64_t)window * 1000) / ctx.df.chunk_max_cycle;
             if (ipc_x1000 > UINT32_MAX) ipc_x1000 = UINT32_MAX;
-            if ((int)ctx.ilp_samples_per_bin.size() <= bin) {
-                ctx.ilp_samples_per_bin.resize(bin + 1);
+            if ((int)ctx.df.ilp_samples_per_bin.size() <= bin) {
+                ctx.df.ilp_samples_per_bin.resize(bin + 1);
             }
-            ctx.ilp_samples_per_bin[bin].push_back((uint32_t)ipc_x1000);
+            ctx.df.ilp_samples_per_bin[bin].push_back((uint32_t)ipc_x1000);
         }
-        ctx.df_producer_complete.clear();
-        ctx.df_mem_producer_complete.clear();
-        ctx.df_chunk_insns = 0;
-        ctx.df_chunk_max_cycle = 0;
+        ctx.df.producer_complete.clear();
+        ctx.df.mem_producer_complete.clear();
+        ctx.df.chunk_insns = 0;
+        ctx.df.chunk_max_cycle = 0;
     }
     return this_complete;
 }
@@ -2484,10 +2497,10 @@ static void handle_dep_depth_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
     const cst::Template &t = *bb.tmpl;
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
     uint32_t window = ctx.opts.rob_size;
-    if ((int)ctx.dd_depth_hist_per_bin.size() <= bin) {
-        ctx.dd_depth_hist_per_bin.resize(bin + 1);
+    if ((int)ctx.df.dd_depth_hist_per_bin.size() <= bin) {
+        ctx.df.dd_depth_hist_per_bin.resize(bin + 1);
     }
-    auto &bin_hist = ctx.dd_depth_hist_per_bin[bin];
+    auto &bin_hist = ctx.df.dd_depth_hist_per_bin[bin];
     if (bin_hist.empty()) {
         bin_hist.assign((size_t)window + 1, 0);
     }
@@ -2515,8 +2528,8 @@ static void handle_ilp_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
     const cst::Template &t = *bb.tmpl;
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
     uint32_t window = ctx.opts.rob_size;
-    if (ctx.ilp_cycle_hist.empty()) {
-        ctx.ilp_cycle_hist.assign((size_t)window + 1, 0);
+    if (ctx.df.ilp_cycle_hist.empty()) {
+        ctx.df.ilp_cycle_hist.assign((size_t)window + 1, 0);
     }
     uint64_t la[cst::FID_SLOT_COUNT], sa[cst::FID_SLOT_COUNT];
     for (uint32_t i = 0; i < bb.n_insns; i++) {
@@ -2529,10 +2542,10 @@ static void handle_ilp_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
          * model).  cycle_hist[k] = insns that issued at in-chunk
          * cycle k across the whole trace. */
         uint32_t issue_cycle = complete - 1;
-        if (issue_cycle >= ctx.ilp_cycle_hist.size()) {
-            issue_cycle = (uint32_t)ctx.ilp_cycle_hist.size() - 1;
+        if (issue_cycle >= ctx.df.ilp_cycle_hist.size()) {
+            issue_cycle = (uint32_t)ctx.df.ilp_cycle_hist.size() - 1;
         }
-        ctx.ilp_cycle_hist[issue_cycle]++;
+        ctx.df.ilp_cycle_hist[issue_cycle]++;
     }
     ctx.cp_insns_so_far += bb.n_insns;
 }
@@ -2560,30 +2573,31 @@ static int ru_bucket_of(uint64_t distance) {
 static void handle_reuse_distance_bb(WalkCtx &ctx,
                                      const cst::BodyWalker::BB &bb)
 {
+    auto &ru = ctx.ru;
     for_each_cp_memop(bb, [&](uint32_t, uint64_t addr) {
         uint64_t line = addr >> 6;
-        uint64_t t_new = ++ctx.ru_clock;
-        auto it = ctx.ru_last_t.find(line);
-        if (it == ctx.ru_last_t.end()) {
-            ctx.ru_cold++;
-            ctx.ru_last_t.emplace(line, t_new);
+        uint64_t t_new = ++ru.clock;
+        auto it = ru.last_t.find(line);
+        if (it == ru.last_t.end()) {
+            ru.cold++;
+            ru.last_t.emplace(line, t_new);
         } else {
             uint64_t t_prev = it->second;
             /* order_of_key(t_prev) = #entries with key < t_prev
              * (older accesses, lower in the LRU stack).  Stack
              * distance = entries strictly above L = size minus the
              * below count minus 1 for L's own entry. */
-            size_t below = ctx.ru_tree.order_of_key(t_prev);
-            size_t distance = ctx.ru_tree.size() - below - 1;
+            size_t below = ru.tree.order_of_key(t_prev);
+            size_t distance = ru.tree.size() - below - 1;
             int b = ru_bucket_of(distance);
-            if (b >= (int)ctx.ru_hist.size()) {
-                ctx.ru_hist.resize(b + 1, 0);
+            if (b >= (int)ru.hist.size()) {
+                ru.hist.resize(b + 1, 0);
             }
-            ctx.ru_hist[b]++;
-            ctx.ru_tree.erase(t_prev);
+            ru.hist[b]++;
+            ru.tree.erase(t_prev);
             it->second = t_new;
         }
-        ctx.ru_tree.insert(t_new);
+        ru.tree.insert(t_new);
     });
     ctx.cp_insns_so_far += bb.n_insns;
 }
@@ -3338,7 +3352,7 @@ static TraceResult process_trace(const char *path, const Options &opts)
          * appear first.  --debug-branches=N is the gate; the first
          * N raw tuples already went to stderr during the walk. */
         if (opts.debug_branches > 0 && opts.metric == Metric::BranchMpki
-            && !ctx.dbg_per_pc.empty()) {
+            && !ctx.dbg.per_pc.empty()) {
             /* Build a tracer-side ground-truth: per Jcc PC, sum
              * profile.targets[0].{taken_cp, nottaken_cp} across every
              * template whose terminator is at this PC.  If the
@@ -3356,8 +3370,8 @@ static TraceResult process_trace(const char *path, const Options &opts)
                 tt.second += prof.targets[0].nottaken_cp;
             }
 
-            std::vector<std::pair<uint64_t, WalkCtx::PcAgg>> rows(
-                ctx.dbg_per_pc.begin(), ctx.dbg_per_pc.end());
+            std::vector<std::pair<uint64_t, WalkCtx::DebugBranchState::PcAgg>>
+                rows(ctx.dbg.per_pc.begin(), ctx.dbg.per_pc.end());
             std::sort(rows.begin(), rows.end(),
                 [](const auto &a, const auto &b) {
                     return (a.second.taken + a.second.nottaken) >
@@ -3389,7 +3403,7 @@ static TraceResult process_trace(const char *path, const Options &opts)
             }
             /* Also count mismatches across the FULL per-PC set, not just top-40. */
             size_t full_mismatch = 0;
-            for (const auto &row : ctx.dbg_per_pc) {
+            for (const auto &row : ctx.dbg.per_pc) {
                 auto it = tracer_truth.find(row.first);
                 uint64_t t_t = (it != tracer_truth.end()) ? it->second.first : 0;
                 uint64_t t_n = (it != tracer_truth.end()) ? it->second.second : 0;
@@ -3945,11 +3959,11 @@ static TraceResult process_trace(const char *path, const Options &opts)
             plan.series[1].y.assign(actual_bins, 0.0);
             uint64_t last_lines = 0, last_pages = 0, y_peak = 0;
             for (int b = 0; b < actual_bins; b++) {
-                if (b < (int)ctx.ws_lines_per_bin.size()) {
-                    last_lines = ctx.ws_lines_per_bin[b];
+                if (b < (int)ctx.ws.lines_per_bin.size()) {
+                    last_lines = ctx.ws.lines_per_bin[b];
                 }
-                if (b < (int)ctx.ws_pages_per_bin.size()) {
-                    last_pages = ctx.ws_pages_per_bin[b];
+                if (b < (int)ctx.ws.pages_per_bin.size()) {
+                    last_pages = ctx.ws.pages_per_bin[b];
                 }
                 plan.series[0].y[b] = (double)last_lines;
                 plan.series[1].y[b] = (double)last_pages;
@@ -3984,8 +3998,8 @@ static TraceResult process_trace(const char *path, const Options &opts)
             double y_peak = 0;
             std::vector<uint32_t> sorted_scratch;
             for (int b = 0; b < actual_bins; b++) {
-                if (b >= (int)ctx.ilp_samples_per_bin.size()) continue;
-                const auto &samples = ctx.ilp_samples_per_bin[b];
+                if (b >= (int)ctx.df.ilp_samples_per_bin.size()) continue;
+                const auto &samples = ctx.df.ilp_samples_per_bin[b];
                 if (samples.empty()) continue;
                 uint64_t sum = 0;
                 for (uint32_t v : samples) sum += v;
@@ -4007,9 +4021,9 @@ static TraceResult process_trace(const char *path, const Options &opts)
             /* Bottom pane: issue-cycle histogram.  Trim trailing
              * zeros so the x-axis isn't dominated by an empty tail
              * (typical chunks complete well before cycle = window). */
-            size_t n_cycles = ctx.ilp_cycle_hist.size();
+            size_t n_cycles = ctx.df.ilp_cycle_hist.size();
             while (n_cycles > 1 &&
-                   ctx.ilp_cycle_hist[n_cycles - 1] == 0) {
+                   ctx.df.ilp_cycle_hist[n_cycles - 1] == 0) {
                 n_cycles--;
             }
             plan2.mode = ChartPlan::Mode::Bars;
@@ -4026,9 +4040,9 @@ static TraceResult process_trace(const char *path, const Options &opts)
             plan2.series[0].y.assign(n_cycles, 0.0);
             uint64_t y_peak2 = 0;
             for (size_t c = 0; c < n_cycles; c++) {
-                plan2.series[0].y[c] = (double)ctx.ilp_cycle_hist[c];
-                if (ctx.ilp_cycle_hist[c] > y_peak2) {
-                    y_peak2 = ctx.ilp_cycle_hist[c];
+                plan2.series[0].y[c] = (double)ctx.df.ilp_cycle_hist[c];
+                if (ctx.df.ilp_cycle_hist[c] > y_peak2) {
+                    y_peak2 = ctx.df.ilp_cycle_hist[c];
                 }
             }
             plan2.y_max = (y_peak2 > 0) ? (double)y_peak2 * 1.1 : 1.0;
@@ -4055,8 +4069,8 @@ static TraceResult process_trace(const char *path, const Options &opts)
             plan.series[1].y.assign(actual_bins, 0.0);
             double y_peak = 0;
             for (int b = 0; b < actual_bins; b++) {
-                if (b >= (int)ctx.dd_depth_hist_per_bin.size()) continue;
-                const auto &hist = ctx.dd_depth_hist_per_bin[b];
+                if (b >= (int)ctx.df.dd_depth_hist_per_bin.size()) continue;
+                const auto &hist = ctx.df.dd_depth_hist_per_bin[b];
                 if (hist.empty()) continue;
                 /* Avg + p90 directly from the histogram — depths are
                  * the index, counts are the values. */
@@ -4090,13 +4104,13 @@ static TraceResult process_trace(const char *path, const Options &opts)
              * have distance 0 only on the SAME insn).  An additional
              * "cold" bar at the leftmost slot holds first-touch
              * accesses where no prior reference exists. */
-            size_t n_buckets = ctx.ru_hist.size();
+            size_t n_buckets = ctx.ru.hist.size();
             if (n_buckets < (size_t)RU_BUCKETS) n_buckets = RU_BUCKETS;
             /* +1 leading slot for the cold bucket. */
             std::vector<uint64_t> h(n_buckets + 1, 0);
-            h[0] = ctx.ru_cold;
-            for (size_t b = 0; b < ctx.ru_hist.size(); b++) {
-                h[b + 1] = ctx.ru_hist[b];
+            h[0] = ctx.ru.cold;
+            for (size_t b = 0; b < ctx.ru.hist.size(); b++) {
+                h[b + 1] = ctx.ru.hist[b];
             }
 
             /* Tail-clip: log buckets at the high end are typically

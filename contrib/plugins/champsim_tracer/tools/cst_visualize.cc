@@ -3126,313 +3126,20 @@ static void build_metric_state(WalkCtx &ctx,
     }
 }
 
-static TraceResult process_trace(const char *path, const Options &opts)
+/*
+ * Build the TraceResult (chart plan + optional second pane + metadata)
+ * from the walked WalkCtx state.  Split out of process_trace so that
+ * function reads as parse -> build_metric_state -> walk -> finalize; this
+ * holds the per-metric plan-construction ladders (title/axis/series), the
+ * dual-pane assembly, and the header-only static-summary metrics.
+ */
+static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
+                                   const std::vector<cst::Template> &templates,
+                                   const cst::Header &h,
+                                   uint64_t total_cp_insns)
 {
-    std::unique_ptr<cst::CstFile> cf = cst::cst_file_open(path);
-
-    std::vector<cst::Template> templates;
-    std::unordered_map<uint32_t, size_t> by_id;
-    cst::Header h = cst::parse_header(cf->header(), &templates, &by_id);
-
-    /* Decide bin width up front.  total_target_insns is the
-     * configured-stop number from the header; for unbounded
-     * (icount-mode without stop) it's 0 and we fall back to a
-     * profile-summed estimate via t.profile.exec_cp * t.insns.size().
-     * In both cases we know the bin width before the walk so the
-     * x-axis is stable. */
-    uint64_t total_cp_insns = 0;
-    if (h.total_target_insns > 0) {
-        total_cp_insns = h.total_target_insns;
-    } else {
-        for (const auto &t : templates) {
-            total_cp_insns += (uint64_t)t.profile.exec_cp * t.insns.size();
-        }
-        if (total_cp_insns == 0) total_cp_insns = 1;
-    }
-    uint64_t bin_width = total_cp_insns / (uint64_t)opts.bins;
-    if (bin_width == 0) bin_width = 1;
-
-    /* Pre-classify every template's terminating branch so per-entry
-     * dispatch stays O(1).  Also precompute the gen_op / gen_reg /
-     * mem_pat / branch_dir per-template series-increments. */
-    WalkCtx ctx;
-    ctx.h         = &h;
-    ctx.templates = &templates;
-    ctx.by_id     = &by_id;
-    ctx.opts      = opts;
-    ctx.bin_width = bin_width;
-
-    ctx.term.resize(templates.size());
-    for (size_t i = 0; i < templates.size(); i++) {
-        ctx.term[i] = classify_term(templates[i], h.maps.branch_type);
-    }
-
-    build_metric_state(ctx, templates, h);
-
-    /* Header-derived static-summary metrics (bb_length /
-     * indirect_targets / branch_entropy) compute purely from the
-     * template list and skip the body walk entirely. */
-    bool is_header_only = (opts.metric == Metric::BbLength ||
-                           opts.metric == Metric::IndirectTargets ||
-                           opts.metric == Metric::BranchEntropy);
-
-    /* --debug-branches early-exit dump.  Aggregates the tracer-side
-     * profile counts (taken_cp, nottaken_cp) PER Jcc PC across every
-     * template that ends at that PC, sorted by total executions.
-     * This is purely header-derived — no body walk needed — so it
-     * runs in seconds and lets us see what the trace ITSELF claims
-     * about each branch's outcome distribution before paying the
-     * full-walk cost. */
-    if (opts.debug_branches > 0 && opts.metric == Metric::BranchMpki) {
-        struct PcTruth {
-            uint64_t taken = 0, nottaken = 0;
-            uint64_t fall_through = 0;
-            uint64_t taken_target = 0;
-            uint64_t pc_plus_size = 0; /* sanity: where fall-through SHOULD be */
-            uint32_t templates_seen = 0;
-        };
-        std::unordered_map<uint64_t, PcTruth> truth;
-        for (size_t i = 0; i < templates.size(); i++) {
-            if (!ctx.term[i].is_branch ||
-                !ctx.term[i].is_conditional) continue;
-            const auto &tmpl = templates[i];
-            const auto &prof = tmpl.profile;
-            if (prof.targets.empty()) continue;
-            auto &tt = truth[ctx.term[i].pc];
-            tt.taken    += prof.targets[0].taken_cp;
-            tt.nottaken += prof.targets[0].nottaken_cp;
-            tt.fall_through = tmpl.fall_through_pc;
-            tt.taken_target = tmpl.target_pcs.empty() ? 0 : tmpl.target_pcs[0];
-            /* Compute the architectural-next-PC for the terminator
-             * (= last insn's PC + its byte length).  raw_bytes carries
-             * the actual instruction encoding when available; if it
-             * was omitted (insn_size==0 in the trace), leave 0. */
-            const auto &last_insn = tmpl.insns.back();
-            tt.pc_plus_size = last_insn.raw_bytes.empty()
-                ? 0
-                : last_insn.pc + (uint64_t)last_insn.raw_bytes.size();
-            tt.templates_seen++;
-        }
-        /* Per-template sanity: for every conditional template, check
-         * whether its stored fall_through_pc matches the architectural
-         * fall-through (last_insn.pc + last_insn.raw_bytes.size()). */
-        size_t tpl_total = 0, tpl_ft_ok = 0, tpl_ft_bad = 0, tpl_unknown = 0;
-        for (size_t i = 0; i < templates.size(); i++) {
-            if (!ctx.term[i].is_branch ||
-                !ctx.term[i].is_conditional) continue;
-            tpl_total++;
-            const auto &tmpl = templates[i];
-            if (tmpl.insns.empty()) { tpl_unknown++; continue; }
-            const auto &li = tmpl.insns.back();
-            if (li.raw_bytes.empty()) { tpl_unknown++; continue; }
-            uint64_t expected = li.pc + (uint64_t)li.raw_bytes.size();
-            if (expected == tmpl.fall_through_pc) tpl_ft_ok++;
-            else tpl_ft_bad++;
-        }
-        std::fprintf(stderr,
-            "=== PER-TEMPLATE fall_through sanity (all conditional templates) ===\n"
-            "  total: %zu | ft_ok (matches pc+size): %zu | ft_bad: %zu | unknown size: %zu\n\n",
-            tpl_total, tpl_ft_ok, tpl_ft_bad, tpl_unknown);
-
-        std::vector<std::pair<uint64_t, PcTruth>> rows(
-            truth.begin(), truth.end());
-        std::sort(rows.begin(), rows.end(),
-            [](const auto &a, const auto &b) {
-                return (a.second.taken + a.second.nottaken) >
-                       (b.second.taken + b.second.nottaken);
-            });
-        std::fprintf(stderr,
-            "=== TRACER-SIDE per-Jcc-PC truth (header-only, top 40 by total exec) ===\n"
-            "%-18s %12s %12s %10s %18s %18s %18s %5s %s\n",
-            "pc", "taken_cp", "nottaken_cp", "tk_rate",
-            "fall_through", "pc+size_(expected_fall)",
-            "taken_target", "ntpl", "OK?");
-        size_t top = std::min((size_t)40, rows.size());
-        uint64_t grand_taken = 0, grand_total = 0;
-        size_t   biased_99 = 0, mixed_30_70 = 0, ft_bad = 0;
-        for (const auto &row : rows) {
-            uint64_t t = row.second.taken, n = row.second.nottaken;
-            uint64_t tot = t + n;
-            grand_taken += t;
-            grand_total += tot;
-            if (tot > 0) {
-                double r = (double)t / tot;
-                if (r >= 0.99 || r <= 0.01) biased_99++;
-                else if (r >= 0.30 && r <= 0.70) mixed_30_70++;
-            }
-            if (row.second.fall_through != row.second.pc_plus_size) ft_bad++;
-        }
-        for (size_t i = 0; i < top; i++) {
-            uint64_t pc = rows[i].first;
-            const auto &tt = rows[i].second;
-            uint64_t tot = tt.taken + tt.nottaken;
-            double rate = tot ? (double)tt.taken / tot : 0.0;
-            bool ft_ok = (tt.fall_through == tt.pc_plus_size);
-            std::fprintf(stderr,
-                "0x%016lx %12lu %12lu %10.4f 0x%016lx 0x%016lx 0x%016lx %5u %s\n",
-                (unsigned long)pc, (unsigned long)tt.taken,
-                (unsigned long)tt.nottaken, rate,
-                (unsigned long)tt.fall_through,
-                (unsigned long)tt.pc_plus_size,
-                (unsigned long)tt.taken_target,
-                (unsigned)tt.templates_seen,
-                ft_ok ? "✓" : "★FT_MISMATCH");
-        }
-        std::fprintf(stderr,
-            "(%zu of %zu distinct Jcc PCs shown)\n"
-            "  grand total executions: %lu, grand taken: %lu (rate %.4f)\n"
-            "  >=99%% biased PCs: %zu (%.1f%%);  30-70%% mixed: %zu (%.1f%%)\n"
-            "  PCs where stored fall_through != pc+insn_size: %zu (%.1f%%)\n\n",
-            top, rows.size(),
-            (unsigned long)grand_total, (unsigned long)grand_taken,
-            grand_total ? (double)grand_taken / grand_total : 0.0,
-            biased_99,    rows.empty() ? 0.0 : 100.0 * biased_99    / rows.size(),
-            mixed_30_70,  rows.empty() ? 0.0 : 100.0 * mixed_30_70  / rows.size(),
-            ft_bad,       rows.empty() ? 0.0 : 100.0 * ft_bad       / rows.size());
-    }
-
-    if (!is_header_only) {
-        /* Walk. */
-        auto body_stream = cst::body_stream_open(*cf);
-        cst::BodyWalker walker(h, templates, by_id,
-                               body_stream->reader());
-
-        /* Every body-walk metric uses the streaming BB walk: it
-         * allocates nothing per BB and parse-skips field deltas a metric
-         * doesn't read.  Each case picks the minimum it needs —
-         * cp_fields (apply CP deltas, enable CP accessors) and a WP
-         * decode level (skip / structure / fields). */
-        using BBFn    = void (*)(WalkCtx &, const cst::BodyWalker::BB &);
-        using Wp          = cst::BodyWalker::WpDecode;
-        BBFn    bb_fn     = nullptr;
-        bool    cp_fields = false;       /* streaming-path: apply CP deltas */
-        Wp      wp_mode   = Wp::Skip;    /* streaming-path: WP decode level */
-        switch (opts.metric) {
-            /* --- streaming BB path: CP structure only, no wrong-path --- */
-            case Metric::GenOp:
-                bb_fn = handle_genop_bb; break;
-            case Metric::GenReg:
-                bb_fn = handle_genreg_bb; break;
-            /* --- streaming BB path: CP fields, no wrong-path --- */
-            case Metric::DepDepth:
-                /* needs memop addresses for the memory-RAW dependency */
-                bb_fn = handle_dep_depth_bb; cp_fields = true; break;
-            case Metric::Ilp:
-                bb_fn = handle_ilp_bb; cp_fields = true; break;
-            case Metric::WorkingSet:
-                bb_fn = handle_working_set_bb; cp_fields = true; break;
-            case Metric::ReuseDistance:
-                bb_fn = handle_reuse_distance_bb; cp_fields = true; break;
-            /* --- streaming BB path: CP + WP structure --- */
-            case Metric::BranchMpki:
-            case Metric::WpInsns:
-                bb_fn = handle_gshare_bb; wp_mode = Wp::Structure; break;
-            case Metric::WpMemops:
-                /* needs per-WP-BB memop counts -> WP field deltas */
-                bb_fn = handle_gshare_bb; wp_mode = Wp::Fields; break;
-            case Metric::BranchDir:
-                bb_fn = handle_branch_dir_bb; wp_mode = Wp::Structure; break;
-            case Metric::BtbMiss:
-                bb_fn = handle_btb_bb; wp_mode = Wp::Structure; break;
-            case Metric::WpDivergence:
-                bb_fn = handle_wp_divergence_bb; wp_mode = Wp::Structure; break;
-            /* --- streaming BB path: CP + WP fields --- */
-            case Metric::MemPat:
-                bb_fn = handle_mem_pat_bb;
-                cp_fields = true; wp_mode = Wp::Fields; break;
-            case Metric::CacheMiss:
-                bb_fn = handle_cache_miss_bb;
-                cp_fields = true; wp_mode = Wp::Fields; break;
-            case Metric::BbLength:
-            case Metric::IndirectTargets:
-            case Metric::BranchEntropy:
-                break; /* unreachable: gated above */
-        }
-
-        if (!bb_fn) {
-            /* All body-walk metrics set bb_fn; the header-only metrics
-             * never reach here (gated by is_header_only).  A null here
-             * means a newly-added metric wasn't wired — fail loudly
-             * rather than silently emit an empty chart. */
-            throw std::runtime_error(
-                "internal error: metric has no walk handler");
-        }
-        walker.walk_bb(cp_fields, wp_mode,
-                       [&](const cst::BodyWalker::BB &bb) {
-                           bb_fn(ctx, bb);
-                       });
-        try { body_stream->finalize(); }
-        catch (...) {}
-
-        /* Branch-stream diagnostics dump (per-PC aggregates).  Sorted
-         * by total executions descending so the dominant branches
-         * appear first.  --debug-branches=N is the gate; the first
-         * N raw tuples already went to stderr during the walk. */
-        if (opts.debug_branches > 0 && opts.metric == Metric::BranchMpki
-            && !ctx.dbg.per_pc.empty()) {
-            /* Build a tracer-side ground-truth: per Jcc PC, sum
-             * profile.targets[0].{taken_cp, nottaken_cp} across every
-             * template whose terminator is at this PC.  If the
-             * visualizer's handler-derived per-PC totals don't match
-             * this, the outcome derivation has a bug. */
-            std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> tracer_truth;
-            for (size_t i = 0; i < templates.size(); i++) {
-                if (!ctx.term[i].is_branch ||
-                    !ctx.term[i].is_conditional) continue;
-                const auto &prof = templates[i].profile;
-                if (prof.targets.empty()) continue;
-                uint64_t pc = ctx.term[i].pc;
-                auto &tt = tracer_truth[pc];
-                tt.first  += prof.targets[0].taken_cp;
-                tt.second += prof.targets[0].nottaken_cp;
-            }
-
-            std::vector<std::pair<uint64_t, WalkCtx::DebugBranchState::PcAgg>>
-                rows(ctx.dbg.per_pc.begin(), ctx.dbg.per_pc.end());
-            std::sort(rows.begin(), rows.end(),
-                [](const auto &a, const auto &b) {
-                    return (a.second.taken + a.second.nottaken) >
-                           (b.second.taken + b.second.nottaken);
-                });
-            std::fprintf(stderr,
-                "\n=== branch-stream per-PC aggregate (top 40 by exec; ★ = handler vs tracer profile mismatch) ===\n"
-                "%-18s %12s %12s %12s %10s %10s | %12s %12s %s\n",
-                "pc", "h_taken", "h_nottaken", "h_total", "miss_h0",
-                "miss_h12", "t_taken", "t_nottaken", "match?");
-            size_t top = std::min((size_t)40, rows.size());
-            size_t mismatch_count = 0;
-            for (size_t i = 0; i < top; i++) {
-                uint64_t pc = rows[i].first;
-                const auto &a = rows[i].second;
-                uint64_t h_total = a.taken + a.nottaken;
-                auto it = tracer_truth.find(pc);
-                uint64_t t_t = (it != tracer_truth.end()) ? it->second.first : 0;
-                uint64_t t_n = (it != tracer_truth.end()) ? it->second.second : 0;
-                bool match = (t_t == a.taken && t_n == a.nottaken);
-                if (!match) mismatch_count++;
-                std::fprintf(stderr,
-                    "0x%016lx %12lu %12lu %12lu %10lu %10lu | %12lu %12lu %s\n",
-                    (unsigned long)pc, (unsigned long)a.taken,
-                    (unsigned long)a.nottaken, (unsigned long)h_total,
-                    (unsigned long)a.mispred_h0, (unsigned long)a.mispred_h12,
-                    (unsigned long)t_t, (unsigned long)t_n,
-                    match ? "ok" : "★ MISMATCH");
-            }
-            /* Also count mismatches across the FULL per-PC set, not just top-40. */
-            size_t full_mismatch = 0;
-            for (const auto &row : ctx.dbg.per_pc) {
-                auto it = tracer_truth.find(row.first);
-                uint64_t t_t = (it != tracer_truth.end()) ? it->second.first : 0;
-                uint64_t t_n = (it != tracer_truth.end()) ? it->second.second : 0;
-                if (t_t != row.second.taken || t_n != row.second.nottaken) {
-                    full_mismatch++;
-                }
-            }
-            std::fprintf(stderr,
-                "(showing %zu of %zu distinct PCs; mismatches in top: %zu; mismatches total: %zu)\n",
-                top, rows.size(), mismatch_count, full_mismatch);
-        }
-    }
+    const Options &opts = ctx.opts;
+    const uint64_t bin_width = ctx.bin_width;
 
     /* Finalize the trailing pending-branch resolution for the gshare
      * metrics — there's no next entry to peek at, so we drop the
@@ -4247,6 +3954,317 @@ static TraceResult process_trace(const char *path, const Options &opts)
     tr.plan             = std::move(plan);
     tr.plan2            = std::move(plan2);
     return tr;
+}
+
+static TraceResult process_trace(const char *path, const Options &opts)
+{
+    std::unique_ptr<cst::CstFile> cf = cst::cst_file_open(path);
+
+    std::vector<cst::Template> templates;
+    std::unordered_map<uint32_t, size_t> by_id;
+    cst::Header h = cst::parse_header(cf->header(), &templates, &by_id);
+
+    /* Decide bin width up front.  total_target_insns is the
+     * configured-stop number from the header; for unbounded
+     * (icount-mode without stop) it's 0 and we fall back to a
+     * profile-summed estimate via t.profile.exec_cp * t.insns.size().
+     * In both cases we know the bin width before the walk so the
+     * x-axis is stable. */
+    uint64_t total_cp_insns = 0;
+    if (h.total_target_insns > 0) {
+        total_cp_insns = h.total_target_insns;
+    } else {
+        for (const auto &t : templates) {
+            total_cp_insns += (uint64_t)t.profile.exec_cp * t.insns.size();
+        }
+        if (total_cp_insns == 0) total_cp_insns = 1;
+    }
+    uint64_t bin_width = total_cp_insns / (uint64_t)opts.bins;
+    if (bin_width == 0) bin_width = 1;
+
+    /* Pre-classify every template's terminating branch so per-entry
+     * dispatch stays O(1).  Also precompute the gen_op / gen_reg /
+     * mem_pat / branch_dir per-template series-increments. */
+    WalkCtx ctx;
+    ctx.h         = &h;
+    ctx.templates = &templates;
+    ctx.by_id     = &by_id;
+    ctx.opts      = opts;
+    ctx.bin_width = bin_width;
+
+    ctx.term.resize(templates.size());
+    for (size_t i = 0; i < templates.size(); i++) {
+        ctx.term[i] = classify_term(templates[i], h.maps.branch_type);
+    }
+
+    build_metric_state(ctx, templates, h);
+
+    /* Header-derived static-summary metrics (bb_length /
+     * indirect_targets / branch_entropy) compute purely from the
+     * template list and skip the body walk entirely. */
+    bool is_header_only = (opts.metric == Metric::BbLength ||
+                           opts.metric == Metric::IndirectTargets ||
+                           opts.metric == Metric::BranchEntropy);
+
+    /* --debug-branches early-exit dump.  Aggregates the tracer-side
+     * profile counts (taken_cp, nottaken_cp) PER Jcc PC across every
+     * template that ends at that PC, sorted by total executions.
+     * This is purely header-derived — no body walk needed — so it
+     * runs in seconds and lets us see what the trace ITSELF claims
+     * about each branch's outcome distribution before paying the
+     * full-walk cost. */
+    if (opts.debug_branches > 0 && opts.metric == Metric::BranchMpki) {
+        struct PcTruth {
+            uint64_t taken = 0, nottaken = 0;
+            uint64_t fall_through = 0;
+            uint64_t taken_target = 0;
+            uint64_t pc_plus_size = 0; /* sanity: where fall-through SHOULD be */
+            uint32_t templates_seen = 0;
+        };
+        std::unordered_map<uint64_t, PcTruth> truth;
+        for (size_t i = 0; i < templates.size(); i++) {
+            if (!ctx.term[i].is_branch ||
+                !ctx.term[i].is_conditional) continue;
+            const auto &tmpl = templates[i];
+            const auto &prof = tmpl.profile;
+            if (prof.targets.empty()) continue;
+            auto &tt = truth[ctx.term[i].pc];
+            tt.taken    += prof.targets[0].taken_cp;
+            tt.nottaken += prof.targets[0].nottaken_cp;
+            tt.fall_through = tmpl.fall_through_pc;
+            tt.taken_target = tmpl.target_pcs.empty() ? 0 : tmpl.target_pcs[0];
+            /* Compute the architectural-next-PC for the terminator
+             * (= last insn's PC + its byte length).  raw_bytes carries
+             * the actual instruction encoding when available; if it
+             * was omitted (insn_size==0 in the trace), leave 0. */
+            const auto &last_insn = tmpl.insns.back();
+            tt.pc_plus_size = last_insn.raw_bytes.empty()
+                ? 0
+                : last_insn.pc + (uint64_t)last_insn.raw_bytes.size();
+            tt.templates_seen++;
+        }
+        /* Per-template sanity: for every conditional template, check
+         * whether its stored fall_through_pc matches the architectural
+         * fall-through (last_insn.pc + last_insn.raw_bytes.size()). */
+        size_t tpl_total = 0, tpl_ft_ok = 0, tpl_ft_bad = 0, tpl_unknown = 0;
+        for (size_t i = 0; i < templates.size(); i++) {
+            if (!ctx.term[i].is_branch ||
+                !ctx.term[i].is_conditional) continue;
+            tpl_total++;
+            const auto &tmpl = templates[i];
+            if (tmpl.insns.empty()) { tpl_unknown++; continue; }
+            const auto &li = tmpl.insns.back();
+            if (li.raw_bytes.empty()) { tpl_unknown++; continue; }
+            uint64_t expected = li.pc + (uint64_t)li.raw_bytes.size();
+            if (expected == tmpl.fall_through_pc) tpl_ft_ok++;
+            else tpl_ft_bad++;
+        }
+        std::fprintf(stderr,
+            "=== PER-TEMPLATE fall_through sanity (all conditional templates) ===\n"
+            "  total: %zu | ft_ok (matches pc+size): %zu | ft_bad: %zu | unknown size: %zu\n\n",
+            tpl_total, tpl_ft_ok, tpl_ft_bad, tpl_unknown);
+
+        std::vector<std::pair<uint64_t, PcTruth>> rows(
+            truth.begin(), truth.end());
+        std::sort(rows.begin(), rows.end(),
+            [](const auto &a, const auto &b) {
+                return (a.second.taken + a.second.nottaken) >
+                       (b.second.taken + b.second.nottaken);
+            });
+        std::fprintf(stderr,
+            "=== TRACER-SIDE per-Jcc-PC truth (header-only, top 40 by total exec) ===\n"
+            "%-18s %12s %12s %10s %18s %18s %18s %5s %s\n",
+            "pc", "taken_cp", "nottaken_cp", "tk_rate",
+            "fall_through", "pc+size_(expected_fall)",
+            "taken_target", "ntpl", "OK?");
+        size_t top = std::min((size_t)40, rows.size());
+        uint64_t grand_taken = 0, grand_total = 0;
+        size_t   biased_99 = 0, mixed_30_70 = 0, ft_bad = 0;
+        for (const auto &row : rows) {
+            uint64_t t = row.second.taken, n = row.second.nottaken;
+            uint64_t tot = t + n;
+            grand_taken += t;
+            grand_total += tot;
+            if (tot > 0) {
+                double r = (double)t / tot;
+                if (r >= 0.99 || r <= 0.01) biased_99++;
+                else if (r >= 0.30 && r <= 0.70) mixed_30_70++;
+            }
+            if (row.second.fall_through != row.second.pc_plus_size) ft_bad++;
+        }
+        for (size_t i = 0; i < top; i++) {
+            uint64_t pc = rows[i].first;
+            const auto &tt = rows[i].second;
+            uint64_t tot = tt.taken + tt.nottaken;
+            double rate = tot ? (double)tt.taken / tot : 0.0;
+            bool ft_ok = (tt.fall_through == tt.pc_plus_size);
+            std::fprintf(stderr,
+                "0x%016lx %12lu %12lu %10.4f 0x%016lx 0x%016lx 0x%016lx %5u %s\n",
+                (unsigned long)pc, (unsigned long)tt.taken,
+                (unsigned long)tt.nottaken, rate,
+                (unsigned long)tt.fall_through,
+                (unsigned long)tt.pc_plus_size,
+                (unsigned long)tt.taken_target,
+                (unsigned)tt.templates_seen,
+                ft_ok ? "✓" : "★FT_MISMATCH");
+        }
+        std::fprintf(stderr,
+            "(%zu of %zu distinct Jcc PCs shown)\n"
+            "  grand total executions: %lu, grand taken: %lu (rate %.4f)\n"
+            "  >=99%% biased PCs: %zu (%.1f%%);  30-70%% mixed: %zu (%.1f%%)\n"
+            "  PCs where stored fall_through != pc+insn_size: %zu (%.1f%%)\n\n",
+            top, rows.size(),
+            (unsigned long)grand_total, (unsigned long)grand_taken,
+            grand_total ? (double)grand_taken / grand_total : 0.0,
+            biased_99,    rows.empty() ? 0.0 : 100.0 * biased_99    / rows.size(),
+            mixed_30_70,  rows.empty() ? 0.0 : 100.0 * mixed_30_70  / rows.size(),
+            ft_bad,       rows.empty() ? 0.0 : 100.0 * ft_bad       / rows.size());
+    }
+
+    if (!is_header_only) {
+        /* Walk. */
+        auto body_stream = cst::body_stream_open(*cf);
+        cst::BodyWalker walker(h, templates, by_id,
+                               body_stream->reader());
+
+        /* Every body-walk metric uses the streaming BB walk: it
+         * allocates nothing per BB and parse-skips field deltas a metric
+         * doesn't read.  Each case picks the minimum it needs —
+         * cp_fields (apply CP deltas, enable CP accessors) and a WP
+         * decode level (skip / structure / fields). */
+        using BBFn    = void (*)(WalkCtx &, const cst::BodyWalker::BB &);
+        using Wp          = cst::BodyWalker::WpDecode;
+        BBFn    bb_fn     = nullptr;
+        bool    cp_fields = false;       /* streaming-path: apply CP deltas */
+        Wp      wp_mode   = Wp::Skip;    /* streaming-path: WP decode level */
+        switch (opts.metric) {
+            /* --- streaming BB path: CP structure only, no wrong-path --- */
+            case Metric::GenOp:
+                bb_fn = handle_genop_bb; break;
+            case Metric::GenReg:
+                bb_fn = handle_genreg_bb; break;
+            /* --- streaming BB path: CP fields, no wrong-path --- */
+            case Metric::DepDepth:
+                /* needs memop addresses for the memory-RAW dependency */
+                bb_fn = handle_dep_depth_bb; cp_fields = true; break;
+            case Metric::Ilp:
+                bb_fn = handle_ilp_bb; cp_fields = true; break;
+            case Metric::WorkingSet:
+                bb_fn = handle_working_set_bb; cp_fields = true; break;
+            case Metric::ReuseDistance:
+                bb_fn = handle_reuse_distance_bb; cp_fields = true; break;
+            /* --- streaming BB path: CP + WP structure --- */
+            case Metric::BranchMpki:
+            case Metric::WpInsns:
+                bb_fn = handle_gshare_bb; wp_mode = Wp::Structure; break;
+            case Metric::WpMemops:
+                /* needs per-WP-BB memop counts -> WP field deltas */
+                bb_fn = handle_gshare_bb; wp_mode = Wp::Fields; break;
+            case Metric::BranchDir:
+                bb_fn = handle_branch_dir_bb; wp_mode = Wp::Structure; break;
+            case Metric::BtbMiss:
+                bb_fn = handle_btb_bb; wp_mode = Wp::Structure; break;
+            case Metric::WpDivergence:
+                bb_fn = handle_wp_divergence_bb; wp_mode = Wp::Structure; break;
+            /* --- streaming BB path: CP + WP fields --- */
+            case Metric::MemPat:
+                bb_fn = handle_mem_pat_bb;
+                cp_fields = true; wp_mode = Wp::Fields; break;
+            case Metric::CacheMiss:
+                bb_fn = handle_cache_miss_bb;
+                cp_fields = true; wp_mode = Wp::Fields; break;
+            case Metric::BbLength:
+            case Metric::IndirectTargets:
+            case Metric::BranchEntropy:
+                break; /* unreachable: gated above */
+        }
+
+        if (!bb_fn) {
+            /* All body-walk metrics set bb_fn; the header-only metrics
+             * never reach here (gated by is_header_only).  A null here
+             * means a newly-added metric wasn't wired — fail loudly
+             * rather than silently emit an empty chart. */
+            throw std::runtime_error(
+                "internal error: metric has no walk handler");
+        }
+        walker.walk_bb(cp_fields, wp_mode,
+                       [&](const cst::BodyWalker::BB &bb) {
+                           bb_fn(ctx, bb);
+                       });
+        try { body_stream->finalize(); }
+        catch (...) {}
+
+        /* Branch-stream diagnostics dump (per-PC aggregates).  Sorted
+         * by total executions descending so the dominant branches
+         * appear first.  --debug-branches=N is the gate; the first
+         * N raw tuples already went to stderr during the walk. */
+        if (opts.debug_branches > 0 && opts.metric == Metric::BranchMpki
+            && !ctx.dbg.per_pc.empty()) {
+            /* Build a tracer-side ground-truth: per Jcc PC, sum
+             * profile.targets[0].{taken_cp, nottaken_cp} across every
+             * template whose terminator is at this PC.  If the
+             * visualizer's handler-derived per-PC totals don't match
+             * this, the outcome derivation has a bug. */
+            std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> tracer_truth;
+            for (size_t i = 0; i < templates.size(); i++) {
+                if (!ctx.term[i].is_branch ||
+                    !ctx.term[i].is_conditional) continue;
+                const auto &prof = templates[i].profile;
+                if (prof.targets.empty()) continue;
+                uint64_t pc = ctx.term[i].pc;
+                auto &tt = tracer_truth[pc];
+                tt.first  += prof.targets[0].taken_cp;
+                tt.second += prof.targets[0].nottaken_cp;
+            }
+
+            std::vector<std::pair<uint64_t, WalkCtx::DebugBranchState::PcAgg>>
+                rows(ctx.dbg.per_pc.begin(), ctx.dbg.per_pc.end());
+            std::sort(rows.begin(), rows.end(),
+                [](const auto &a, const auto &b) {
+                    return (a.second.taken + a.second.nottaken) >
+                           (b.second.taken + b.second.nottaken);
+                });
+            std::fprintf(stderr,
+                "\n=== branch-stream per-PC aggregate (top 40 by exec; ★ = handler vs tracer profile mismatch) ===\n"
+                "%-18s %12s %12s %12s %10s %10s | %12s %12s %s\n",
+                "pc", "h_taken", "h_nottaken", "h_total", "miss_h0",
+                "miss_h12", "t_taken", "t_nottaken", "match?");
+            size_t top = std::min((size_t)40, rows.size());
+            size_t mismatch_count = 0;
+            for (size_t i = 0; i < top; i++) {
+                uint64_t pc = rows[i].first;
+                const auto &a = rows[i].second;
+                uint64_t h_total = a.taken + a.nottaken;
+                auto it = tracer_truth.find(pc);
+                uint64_t t_t = (it != tracer_truth.end()) ? it->second.first : 0;
+                uint64_t t_n = (it != tracer_truth.end()) ? it->second.second : 0;
+                bool match = (t_t == a.taken && t_n == a.nottaken);
+                if (!match) mismatch_count++;
+                std::fprintf(stderr,
+                    "0x%016lx %12lu %12lu %12lu %10lu %10lu | %12lu %12lu %s\n",
+                    (unsigned long)pc, (unsigned long)a.taken,
+                    (unsigned long)a.nottaken, (unsigned long)h_total,
+                    (unsigned long)a.mispred_h0, (unsigned long)a.mispred_h12,
+                    (unsigned long)t_t, (unsigned long)t_n,
+                    match ? "ok" : "★ MISMATCH");
+            }
+            /* Also count mismatches across the FULL per-PC set, not just top-40. */
+            size_t full_mismatch = 0;
+            for (const auto &row : ctx.dbg.per_pc) {
+                auto it = tracer_truth.find(row.first);
+                uint64_t t_t = (it != tracer_truth.end()) ? it->second.first : 0;
+                uint64_t t_n = (it != tracer_truth.end()) ? it->second.second : 0;
+                if (t_t != row.second.taken || t_n != row.second.nottaken) {
+                    full_mismatch++;
+                }
+            }
+            std::fprintf(stderr,
+                "(showing %zu of %zu distinct PCs; mismatches in top: %zu; mismatches total: %zu)\n",
+                top, rows.size(), mismatch_count, full_mismatch);
+        }
+    }
+
+    return finalize_metric(path, ctx, templates, h, total_cp_insns);
 }
 
 /* Combine one pane (plan or plan2) across traces.  @panes[i] is trace i's

@@ -25,6 +25,7 @@ from pathlib import Path
 from . import generator as G
 from . import analyzer as A
 from . import validator as V
+from . import _system as SYS
 
 
 ISA_CHOICES = ("x86_64", "aarch64", "riscv64", "mipsel")
@@ -91,6 +92,21 @@ def _parse_args() -> argparse.Namespace:
         sp.add_argument("--prog", default=None,
                         help="Program basename (default: name of out-dir).")
 
+    def system_args(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("--system", action="store_true",
+                        help="Trace under qemu-system-<isa> (boot a guest with "
+                             "the workload staged into an initramfs) instead of "
+                             "qemu-user. Implies --marker. x86_64 only. Use "
+                             "--build-dir pointing at the softmmu build.")
+        sp.add_argument("--kernel", type=Path, default=None,
+                        help="System-mode kernel image (default: the local "
+                             "systest vmlinuz).")
+        sp.add_argument("--rootfs", type=Path, default=None,
+                        help="System-mode base initramfs root dir to stage the "
+                             "workload into (default: the local systest root).")
+        sp.add_argument("--sys-mem", default="512M",
+                        help="Guest RAM for system-mode (default: 512M).")
+
     # generate
     g = sub.add_parser("generate", help="Emit .S + .meta.json")
     common(g)
@@ -146,6 +162,7 @@ def _parse_args() -> argparse.Namespace:
                    help="Compress each member inside the .cst tarball "
                         "(passes compress=<cmd> to the plugin). Output "
                         "file is always <out_base>.cst.")
+    system_args(t)
 
     # analyze
     a = sub.add_parser("analyze",
@@ -197,6 +214,7 @@ def _parse_args() -> argparse.Namespace:
                     help="See `generate --marker`.")
     al.add_argument("--compress", choices=("none", "xz", "zstd", "gzip"),
                     default="none", help="See `trace --compress`.")
+    system_args(al)
 
     sp = sub.add_parser(
         "simpoint_test",
@@ -273,7 +291,9 @@ def cmd_generate(args, isa: str | None = None) -> None:
         coverage=getattr(args, "coverage", False),
         hot_iters=getattr(args, "hot_iters", 0),
         stride_loops=getattr(args, "stride_loops", False),
-        marker=getattr(args, "marker", False),
+        # System-mode tracing relies on the marker firing in the workload's
+        # own address space, so --system implies --marker.
+        marker=getattr(args, "marker", False) or getattr(args, "system", False),
     )
     # Emit per-ISA metadata and a per-ISA assembly source.
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -312,6 +332,66 @@ def cmd_build(args, isa: str | None = None) -> int:
     return rc
 
 
+def _optional_plugin_opts(args) -> str:
+    """The compress/regdata/iframe_rate suffix shared by the user- and
+    system-mode plugin option strings."""
+    opts = ""
+    compress = getattr(args, "compress", "none")
+    if compress != "none":
+        cc = {"xz": "xz -T0 -2 -c", "zstd": "zstd -T0 -3 -q -c",
+              "gzip": "gzip -c"}[compress]
+        if "," in cc:
+            raise SystemExit("trace[--compress]: resolved compress= command "
+                             "contains a comma (the plugin arg separator); "
+                             "wrap it in a script instead.")
+        opts += f",compress={cc}"
+    if getattr(args, "regdata", False):
+        opts += ",regdata=1"
+    if getattr(args, "iframe_rate", None) is not None:
+        opts += f",iframe_rate={int(args.iframe_rate)}"
+    return opts
+
+
+def _trace_system(args, isa: str, bin_path: Path, plugin: Path,
+                  out_base) -> int:
+    """System-mode trace: boot qemu-system-<isa> with @bin_path staged into
+    an initramfs.  The workload's compiled-in marker (generate --marker)
+    opens and ASID-pins the trace window inside the guest.  x86_64 only."""
+    if isa not in SYS.ISA_QEMU_SYSTEM:
+        print(f"trace[{isa}]: SKIP  system mode is x86_64-only for now")
+        return 0
+    qemu_sys = args.build_dir / SYS.ISA_QEMU_SYSTEM[isa]
+    kernel = Path(getattr(args, "kernel", None) or SYS.DEFAULT_SYSTEST / "vmlinuz")
+    base_root = Path(getattr(args, "rootfs", None) or SYS.DEFAULT_SYSTEST / "root")
+    for p, what in ((qemu_sys, "qemu-system"), (kernel, "kernel"),
+                    (base_root, "rootfs base")):
+        if not p.exists():
+            print(f"trace[{isa}]: SKIP  {what} not found: {p}")
+            return 0
+
+    # The marker (at the workload's _start) opens + ASID-pins the window.
+    # TODO(count-set): once the window counter excludes kernel/wrong-ASID
+    # insns, compose the marker pin with trace_window=icount/simpoint
+    # instead of this standalone marker mode.
+    window_opt = f"trace_window=marker:simulation={args.stop}"
+    plugin_opts = (f"outfile={out_base},wpdepth={args.depth},"
+                   f"{window_opt},memdata=1") + _optional_plugin_opts(args)
+
+    stage_dir = args.out_dir / f"sysstage_{isa}"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    initrd = SYS.stage_initramfs(base_root, bin_path, stage_dir)
+    cmd = SYS.system_qemu_cmd(qemu_sys, kernel, initrd, plugin, plugin_opts,
+                              mem=getattr(args, "sys_mem", "512M"))
+    print(f"trace[{isa}] (system): {' '.join(cmd)}")
+    rc = subprocess.call(cmd)
+    cst = Path(f"{out_base}.cst")
+    if rc != 0 or not cst.is_file():
+        print(f"trace[{isa}]: FAIL rc={rc}")
+        return rc or 1
+    print(f"trace[{isa}]: wrote {cst.name}")
+    return 0
+
+
 def cmd_trace(args, isa: str | None = None) -> int:
     isa = isa or args.isa
     prog = _prog_base(args.out_dir, args.prog)
@@ -319,27 +399,20 @@ def cmd_trace(args, isa: str | None = None) -> int:
     if not bin_path.is_file():
         print(f"trace[{isa}]: SKIP  binary not found: {bin_path}")
         return 0
-    qemu = args.build_dir / ISA_QEMU[isa]
     plugin = args.build_dir / "contrib" / "plugins" / "libchampsim_tracer.so"
-    if not qemu.is_file():
-        print(f"trace[{isa}]: SKIP  qemu not found: {qemu}")
-        return 0
     if not plugin.is_file():
         print(f"trace[{isa}]: SKIP  plugin not found: {plugin}")
         return 0
 
     out_base = _trace_base(args.out_dir, prog, isa)
 
-    # Per-member compression inside the .cst tarball.  `compress=<cmd>`
-    # tells the tracer to spawn that shell command for each member
-    # (header.cst.<ext>, body.cst.<ext>); the outer container is always
-    # a tar, so the on-disk path is always `<out_base>.cst`.
-    compress = getattr(args, "compress", "none")
-    compress_cmd = {
-        "xz":   "xz -T0 -2 -c",
-        "zstd": "zstd -T0 -3 -q -c",
-        "gzip": "gzip -c",
-    }
+    if getattr(args, "system", False):
+        return _trace_system(args, isa, bin_path, plugin, out_base)
+
+    qemu = args.build_dir / ISA_QEMU[isa]
+    if not qemu.is_file():
+        print(f"trace[{isa}]: SKIP  qemu not found: {qemu}")
+        return 0
 
     # Plugin args (current ChampSim Tracer flag names, v1.11):
     #   - wpdepth=N            (was: depth=N)
@@ -359,19 +432,7 @@ def cmd_trace(args, isa: str | None = None) -> int:
     plugin_opts = (
         f"outfile={out_base},"
         f"wpdepth={args.depth},{window_opt},memdata=1"
-    )
-    if compress != "none":
-        cc = compress_cmd[compress]
-        if "," in cc:
-            raise SystemExit(
-                "trace[--compress]: plugin arg parser uses ',' as a "
-                "separator and the resolved compress= command contains "
-                "a comma; wrap it in a script instead.")
-        plugin_opts += f",compress={cc}"
-    if getattr(args, "regdata", False):
-        plugin_opts += ",regdata=1"
-    if getattr(args, "iframe_rate", None) is not None:
-        plugin_opts += f",iframe_rate={int(args.iframe_rate)}"
+    ) + _optional_plugin_opts(args)
     cmd = [str(qemu)]
     tb_size = getattr(args, "tb_size", 0)
     if tb_size:
@@ -439,6 +500,14 @@ def cmd_all(args) -> int:
             continue
         if cmd_trace(args, isa) != 0:
             rc_total = 1
+            continue
+        if getattr(args, "system", False):
+            # System-mode traces include the pinned process's kernel calls,
+            # which have no workload ground truth; analyze/validate parity is
+            # gated on the count-set (user-space-only window counting). Until
+            # then `all --system` stops after producing the trace.
+            print(f"analyze[{isa}]: SKIP (system mode; ground-truth parity "
+                  f"pending the user-space count-set)")
             continue
         cmd_analyze(args, isa)
         if cmd_validate(args, isa) != 0:

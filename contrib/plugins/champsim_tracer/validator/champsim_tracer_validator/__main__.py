@@ -113,6 +113,10 @@ def _parse_args() -> argparse.Namespace:
                         "that exercises varying load/store ADDRESSES across "
                         "executions of the same template; intended for "
                         "stressing the per-execution memop encoder.")
+    g.add_argument("--marker", action="store_true",
+                   help="Emit the trace marker at _start (x86_64) so the "
+                        "plugin's trace_window=marker opens + ASID-pins the "
+                        "window; lets one workload drive user and system mode.")
 
     # build
     b = sub.add_parser("build", help="Assemble/link .S for an ISA")
@@ -189,6 +193,8 @@ def _parse_args() -> argparse.Namespace:
                     help="See `generate --hot-iters`.")
     al.add_argument("--stride-loops", action="store_true",
                     help="See `generate --stride-loops`.")
+    al.add_argument("--marker", action="store_true",
+                    help="See `generate --marker`.")
     al.add_argument("--compress", choices=("none", "xz", "zstd", "gzip"),
                     default="none", help="See `trace --compress`.")
 
@@ -267,6 +273,7 @@ def cmd_generate(args, isa: str | None = None) -> None:
         coverage=getattr(args, "coverage", False),
         hot_iters=getattr(args, "hot_iters", 0),
         stride_loops=getattr(args, "stride_loops", False),
+        marker=getattr(args, "marker", False),
     )
     # Emit per-ISA metadata and a per-ISA assembly source.
     args.out_dir.mkdir(parents=True, exist_ok=True)

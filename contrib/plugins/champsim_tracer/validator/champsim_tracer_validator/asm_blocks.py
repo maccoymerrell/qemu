@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import random
 import re
+from pathlib import Path
 from typing import ClassVar
 
 
@@ -180,6 +181,34 @@ def emit_entry_jump(isa: str, entry_symbol: str) -> list[str]:
     if isa.startswith("mips"):
         return [f"  j {entry_symbol}", "  nop"]
     raise ValueError(f"unsupported ISA: {isa}")
+
+
+# The trace-marker contract lives in the plugin's champsim_marker.h (the
+# single source of truth the plugin's detector reads).  Parse the magic and
+# sequence length from it so the marker we emit here can never drift from
+# what the plugin detects.
+_MARKER_HEADER = Path(__file__).resolve().parents[2] / "champsim_marker.h"
+
+
+def _marker_contract() -> tuple[int, int]:
+    """(magic, seq_len) parsed from champsim_marker.h."""
+    text = _MARKER_HEADER.read_text()
+    m = re.search(r"#define\s+CST_MARKER_MAGIC\s+(0x[0-9A-Fa-f]+)", text)
+    s = re.search(r"#define\s+CST_MARKER_SEQ_LEN\s+(\d+)", text)
+    if not m or not s:
+        raise RuntimeError(f"cannot parse marker contract from {_MARKER_HEADER}")
+    return int(m.group(1), 16), int(s.group(1))
+
+
+def emit_trace_marker(isa: str) -> list[str]:
+    """Emit the champsim_tracer trace marker: CST_MARKER_SEQ_LEN identical
+    immediate-loads the plugin detects to open and ASID-pin the trace window
+    (trace_window=marker).  x86 only for now, matching the plugin's detector;
+    other ISAs emit nothing (the system-mode marker is x86-only)."""
+    if isa != "x86_64":
+        return []
+    magic, seq = _marker_contract()
+    return [f"  mov $0x{magic:08x}, %eax"] * seq
 
 
 def emit_helper_symbols(isa: str) -> list[str]:

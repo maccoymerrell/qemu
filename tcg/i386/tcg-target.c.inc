@@ -2154,6 +2154,21 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
         ldst->oi = oi;
         ldst->addr_reg = addr;
 
+        /*
+         * Plugin spec (wrong-path) TBs must never take the inline TLB
+         * fast path: the spec store sandbox lives in the do_ld/do_st
+         * helpers, and an inline TLB-hit store would commit speculative
+         * state to real guest memory.  Jump unconditionally to the slow
+         * path, mirroring the !softmmu CF_FORCE_SLOW case below.
+         */
+        if (tb_cflags(s->gen_tb) & CF_FORCE_SLOW) {
+            tcg_out_opc(s, OPC_JMP_long, 0, 0, 0);
+            ldst->label_ptr[0] = s->code_ptr;
+            s->code_ptr += 4;
+            ldst->label_ptr[1] = NULL;
+            return ldst;
+        }
+
         if (TCG_TARGET_REG_BITS == 64) {
             ttype = s->addr_type;
             trexw = (ttype == TCG_TYPE_I32 ? 0 : P_REXW);

@@ -352,8 +352,17 @@ spec store buffer
    valid, and returns a pointer into the line.  The in-place RMW then
    mutates the shadow, later speculative loads forward from it, and the
    line is discarded at walk end.  The softmmu copy also returns before
-   the real-memory ``notdirty_write`` / watchpoint side effects.  As
-   with the store buffer this is ISA-generic and fixes user-mode
+   the real-memory ``notdirty_write`` / watchpoint side effects.
+
+   When the line pool is at ``PLUGIN_SPEC_STORE_LINE_MAX`` and no
+   shadow line can be allocated, both copies discard the RMW into a
+   per-thread scratch line seeded from the real bytes.  No path falls
+   back to the real host pointer: a wrong-path atomic cannot mutate
+   guest memory even under sandbox exhaustion.  The cost is
+   store-to-load forwarding for that one line — the same degradation
+   the plain store path takes when a capped pool drops a store.
+
+   As with the store buffer this is ISA-generic and fixes user-mode
    wrong-path atomics too.
 
 Bounding wrong-path: no speculation without paging
@@ -616,6 +625,31 @@ helper is the empty stub from ``include/exec/cputlb.h``, and in
 system mode the spec-mode translation already bypasses the softmmu
 TLB), and at exit it would be unnecessary because spec-mode TBs do
 not populate the normal-mode TLB they bypass.
+
+``tcg/i386/tcg-target.c.inc`` — ``prepare_host_addr``
+
+   ``CF_FORCE_SLOW`` takes effect at code-generation time, in the TCG
+   backend's guest-memory address preparation.  For a spec-mode TB the
+   backend emits an unconditional jump to the slow-path helper call in
+   place of the usual fast path, in both configurations: under softmmu
+   this replaces the inline TLB lookup-and-compare — whose TLB-hit
+   store would otherwise write real guest memory through the TLB
+   entry's addend, bypassing the sandbox entirely — and in user mode
+   it replaces the direct guest-base access.  Every wrong-path load
+   and store therefore reaches the ``do_ld*`` / ``do_st*`` helpers,
+   which is where the spec store buffer redirect and load overlay
+   live.  Correct-path translation is untouched: the branch is keyed
+   on the TB's cflags, and only spec-mode TBs carry the flag.
+
+   ``CF_FORCE_SLOW`` is implemented only in the i386 backend (which
+   serves both x86 and x86-64 **hosts** — guest ISA coverage is
+   unaffected).  Every other TCG backend (aarch64, ppc, riscv, s390x,
+   …) ignores the flag and emits its normal fast path, so on a
+   non-x86 host wrong-path stores reach real guest memory and
+   wrong-path simulation is unsafe to enable.  Porting wrong-path
+   support to another host architecture starts here: the equivalent
+   force-slow branch in that backend's address-preparation routine
+   (``tcg/<host>/tcg-target.c.inc``).
 
 ``include/elf.h``
 

@@ -269,6 +269,16 @@ def emit_source(cfg: CFG, plans: list[B.BlockPlan],
             loop_iterations=n.loop_iterations,
         )
         body = cls.emit(plan, ctx).rstrip()
+        if marker and n.block_id == cfg.exit:
+            # End marker right after the exit block's label (before the exit
+            # syscall) so the plugin closes the trace window as the process
+            # ends — the "or the program ends" stop for sub-budget runs.
+            blines = body.split("\n")
+            label = f"{B.symbol_name(n.block_id)}:"
+            if label in blines:
+                idx = blines.index(label)
+                blines[idx + 1:idx + 1] = B.emit_trace_marker_end(isa)
+                body = "\n".join(blines)
         # Append `.size sym, .-sym` so the symbol's st_size is non-zero
         # in the linked ELF.  QEMU user-mode's lookup_symbolxx() does
         # bsearch using `addr >= st_value && addr < st_value+st_size`,

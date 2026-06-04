@@ -128,6 +128,32 @@ thread_local BBTemplate *g_cp_prev_tb_template CST_TLS_HOT = nullptr;
 static const uint64_t CST_ASID_UNPINNED = UINT64_MAX;
 static std::atomic<uint64_t> g_pinned_asid{CST_ASID_UNPINNED};
 
+/*
+ * User-space instruction count for the pinned process (the count set).
+ * The raw insn_count inline-add stays unconditional (fast), counting every
+ * TB.  When pinned, vcpu_tb_exec derives each TB's instruction count as the
+ * delta of consecutive insn_count reads and folds it into g_user_icount
+ * ONLY for counted TBs — pinned ASID at user privilege.  Kernel calls of the
+ * pinned process (priv != 0, same ASID) are traced but NOT counted, and
+ * other processes (different ASID) are neither.  So the window budget tracks
+ * the same user-space instructions a user-mode run would, while the trace
+ * still captures the interleaved kernel.  Reset at each segment open via
+ * user_count_reset(); only touched when pinned, so user mode is unaffected.
+ */
+static uint64_t g_user_icount = 0;       /* counted user-space insns so far */
+static uint64_t g_user_icount_seen = 0;  /* insn_count at the last TB seen */
+
+/* Set when the segment is closed by the guest's end marker (the workload
+ * finished under budget by design) so the finish printout reports END
+ * rather than an UNDER underrun. */
+static bool g_seg_end_marker_close = false;
+
+static inline void user_count_reset(uint64_t insn_count_now)
+{
+    g_user_icount = 0;
+    g_user_icount_seen = insn_count_now;
+}
+
 /* See champsim_tracer.h: threads holding cross-flush BBTemplate*
  * references (in-flight wrong-path simulation).  Gates drain_pending_flush
  * so a tb_flush mid-WP defers template reclamation until the WP unwinds. */
@@ -710,6 +736,7 @@ static void start_trace_segment(const char *label,
     uint64_t span = stop > start ? stop - start : 0;
     progress_step = span >= 10 ? span / 10 : 1;
     progress_next = start + progress_step;
+    g_seg_end_marker_close = false;
 
     /* Snapshot cumulative stats for finish_trace_segment's diff.
      * stats_snapshot() folds every thread's slot plus the exited-
@@ -765,19 +792,43 @@ static Stats *select_histogram_bucket(uint64_t icount)
     return &g_histogram_buckets[idx];
 }
 
+/* True when the window budget runs on the pinned process's user-space
+ * instruction count (g_user_icount) instead of raw icount: marker mode
+ * with a live ASID pin.  Window open/close, the progress heartbeat, and
+ * the finish printout must all read the same clock. */
+static inline bool marker_user_clock(void)
+{
+    return g_window_mode == PluginConfig::WIN_MARKER &&
+           g_pinned_asid.load(std::memory_order_relaxed) != CST_ASID_UNPINNED;
+}
+
 static void heartbeat_progress(uint64_t icount)
 {
-    if (!g_trace_segments.is_active() || icount < progress_next) {
+    /* On the user-instruction clock, progress is g_user_icount through
+     * the span; rebase it onto the raw window bounds so the
+     * progress_next/progress_step pacing (initialised from the span,
+     * which in marker mode IS the user-insn budget) works unchanged. */
+    bool user_clock = marker_user_clock();
+    uint64_t clock = user_clock
+        ? g_trace_segments.window_start() + g_user_icount : icount;
+    if (!g_trace_segments.is_active() || clock < progress_next) {
         return;
     }
     uint64_t start = g_trace_segments.window_start();
     uint64_t stop  = g_trace_segments.window_stop();
     uint64_t span  = stop > start ? stop - start : 1;
-    uint64_t pct   = ((icount - start) * 100) / span;
-    fprintf(stderr,
-            "champsim_tracer: progress %" PRIu64 "/%" PRIu64
-            " insns (%" PRIu64 "%%)\n",
-            icount, stop, pct);
+    uint64_t pct   = ((clock - start) * 100) / span;
+    if (user_clock) {
+        fprintf(stderr,
+                "champsim_tracer: progress %" PRIu64 "/%" PRIu64
+                " user insns (%" PRIu64 "%%)\n",
+                g_user_icount, span, pct);
+    } else {
+        fprintf(stderr,
+                "champsim_tracer: progress %" PRIu64 "/%" PRIu64
+                " insns (%" PRIu64 "%%)\n",
+                clock, stop, pct);
+    }
     progress_next += progress_step;
 }
 
@@ -1057,9 +1108,18 @@ static void finish_trace_segment(void)
                 PRIu64 "\n", lo, g_host_icount);
     } else {
         uint64_t budget = hi - lo;
-        uint64_t covered = g_host_icount > lo
-            ? g_host_icount - lo : 0;
-        const char *flag = covered >= budget ? "OK" : "UNDER";
+        /* On the user-instruction clock the budget is measured in the
+         * pinned process's user-space insns, so coverage is too; raw
+         * icount would count the (traced-but-uncounted) kernel insns
+         * and overstate progress.  actual_icount stays raw — it is the
+         * real guest icount at close. */
+        bool user_clock = marker_user_clock();
+        uint64_t covered = user_clock ? g_user_icount
+            : (g_host_icount > lo ? g_host_icount - lo : 0);
+        /* An end-marker close is the workload finishing under budget by
+         * design ("budget or program end"), not an underrun. */
+        const char *flag = covered >= budget ? "OK"
+            : (g_seg_end_marker_close ? "END" : "UNDER");
         /* Per-segment rep_fanout: diff against the snapshot taken
          * at start_trace_segment.  Makes "architectural CP insns
          * in this trace > covered" visible (the trace fans REP
@@ -1077,10 +1137,12 @@ static void finish_trace_segment(void)
         fprintf(stderr,
                 "champsim_tracer: finished segment [icount %"
                 PRIu64 " .. %" PRIu64 "]  actual_icount=%"
-                PRIu64 "  covered=%" PRIu64
-                "  budget=%" PRIu64 "  rep_fanout=%" PRIu64
+                PRIu64 "  %scovered=%" PRIu64
+                "  %sbudget=%" PRIu64 "  rep_fanout=%" PRIu64
                 "  trace_arch_insns=%" PRIu64 "  %s\n",
-                lo, hi, g_host_icount, covered, budget,
+                lo, hi, g_host_icount,
+                user_clock ? "user_" : "", covered,
+                user_clock ? "user_" : "", budget,
                 seg_fanout, g_seg_arch_insns, flag);
         g_traced_icount.fetch_add(covered,
                                   std::memory_order_relaxed);
@@ -1397,9 +1459,24 @@ static void tw_manage_window(unsigned int cpu_index,
         /* Stop once the post-trigger simulation_insns budget is spent
          * (window_stop set when the symbol fired, or when the guest
          * marker fired — see vcpu_marker_cb, which is what opens the
-         * segment in WIN_MARKER mode; only the close runs here). */
-        if (g_trace_segments.is_active() &&
-            icount_prev >= g_trace_segments.window_stop()) {
+         * segment in WIN_MARKER mode; only the close runs here).
+         *
+         * In WIN_MARKER the budget is measured in the pinned process's
+         * USER-SPACE instructions (g_user_icount), not raw icount: the
+         * marker pins one address space, and its kernel calls are traced
+         * but must not count toward the window — so the window covers the
+         * same user-space instructions a user-mode run would.  WIN_SYMBOL
+         * (user mode) has no pin and uses raw icount as before. */
+        bool marker_pinned = marker_user_clock();
+        /* window_start/stop stay in raw icount (the header's start_insn is
+         * the real icount at the marker).  In marker mode g_user_icount
+         * counts user-space insns from 0, so compare it against the span
+         * (stop - start), not the absolute stop. */
+        uint64_t budget_now = marker_pinned ? g_user_icount : icount_prev;
+        uint64_t budget_stop = marker_pinned
+            ? g_trace_segments.window_stop() - g_trace_segments.window_start()
+            : g_trace_segments.window_stop();
+        if (g_trace_segments.is_active() && budget_now >= budget_stop) {
             finish_trace_segment();
             g_trace_segments.set_shutting_down();
             g_rec_mutex_unlock(&exec_lock);
@@ -1675,27 +1752,40 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         return;
     }
 
-    /* Address-space pin (marker mode): trace only the pinned target's TBs.
-     * A TB in another address space (a preempt to another process, or the
-     * kernel on a different mm) is dropped, and the CP chain cursor is reset
-     * so its fragments never bridge into the pinned trace across the gap —
-     * the same one-TB lossy boundary the segment-switch path takes.  Reads
-     * the ASID only when actually pinned, so non-marker modes pay just the
-     * atomic load.  (User mode: ASID is always 0, the pin matches, no-op.) */
-    uint64_t pinned_asid = g_pinned_asid.load(std::memory_order_relaxed);
-    if (pinned_asid != CST_ASID_UNPINNED &&
-        qemu_plugin_get_addr_space_id() != pinned_asid) {
-        g_cp_prev_tb_template = nullptr;
-        return;
-    }
-
-    /* icount bump is now an inline_add registered AFTER this cb in
-     * vcpu_tb_trans, so the scoreboard slot still holds the pre-TB
-     * value at this point — matches the old icount_prev semantics
-     * that tw_manage_window expects. */
+    /* Read the running instruction count.  The per-TB insn_count inline-add
+     * is injected BEFORE this callback (plugin-gen emits a TB's cbs in
+     * registration order, and the add is registered first in vcpu_tb_trans),
+     * so insn_count already includes this TB.  tw_manage_window consumes it
+     * as the running icount. */
     uint64_t icount_prev = qemu_plugin_u64_get(
         g_scoreboard.insn_count, cpu_index);
     g_host_icount = icount_prev;
+
+    /* Address-space pin + count set (marker mode only — pinned != UNPINNED).
+     * The inline-add counts every TB; here we fold this TB's instruction
+     * count (the delta of consecutive insn_count reads) into g_user_icount
+     * ONLY when the pinned process runs at user privilege.  So the window
+     * budget tracks the same user-space instructions a user-mode run would.
+     * A TB in another address space (a preempt to another process) is then
+     * dropped from tracing, resetting the CP chain cursor so its fragments
+     * never bridge across the gap — the one-TB lossy boundary the
+     * segment-switch path also takes.  The pinned process's kernel calls
+     * (same ASID, priv != 0) are TRACED but not counted.  User mode leaves
+     * the pin UNPINNED, so this whole block is a no-op there. */
+    uint64_t pinned_asid = g_pinned_asid.load(std::memory_order_relaxed);
+    if (pinned_asid != CST_ASID_UNPINNED) {
+        uint64_t delta = icount_prev - g_user_icount_seen;
+        g_user_icount_seen = icount_prev;
+        uint64_t asid = qemu_plugin_get_addr_space_id();
+        int priv = qemu_plugin_get_priv_level();
+        if (asid == pinned_asid && priv == 0) {
+            g_user_icount += delta;
+        }
+        if (asid != pinned_asid) {
+            g_cp_prev_tb_template = nullptr;
+            return;
+        }
+    }
 
     /* Snapshot the previous-TB cursor BEFORE updating it.  The chain
      * emit below walks this fragment list as "the TB that ran just
@@ -2147,15 +2237,20 @@ static void split_tb_into_fragments(const qemu_plugin_insn_info *insn_info,
  * contract shared with the cst_attach injector). */
 static std::atomic<bool> g_marker_fired{false};
 
-/* True if @bytes/@size begins with one x86 marker insn
- * (`mov $CST_MARKER_MAGIC, %eax`, B8 imm32 little-endian). */
-static inline bool marker_mov_match(const uint8_t *bytes, uint8_t size)
+/* True if @bytes/@size begins with one x86 `mov $imm, %eax` (B8 imm32 LE). */
+static inline bool marker_mov_imm_match(const uint8_t *bytes, uint8_t size,
+                                        uint32_t imm)
 {
     uint8_t want[CST_MARKER_X86_INSN_BYTES];
-    cst_marker_x86_encode_one(want);
+    cst_marker_x86_encode_imm(want, imm);
     return size >= CST_MARKER_X86_INSN_BYTES &&
            memcmp(bytes, want, CST_MARKER_X86_INSN_BYTES) == 0;
 }
+/* Start-marker insn (open + ASID-pin) / end-marker insn (close). */
+static inline bool marker_mov_match(const uint8_t *bytes, uint8_t size)
+{ return marker_mov_imm_match(bytes, size, CST_MARKER_MAGIC); }
+static inline bool marker_end_mov_match(const uint8_t *bytes, uint8_t size)
+{ return marker_mov_imm_match(bytes, size, CST_MARKER_END_MAGIC); }
 
 static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
 {
@@ -2179,11 +2274,51 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
         uint64_t span = simulation_insns ? simulation_insns : 1000000;
         uint64_t hi = lo + span;
         g_trace_segments.set_window(lo, hi);
+        /* The window budget counts the pinned process's user-space insns
+         * from 0 (kernel calls are traced but not counted); start the
+         * counter here at the marker's icount. */
+        user_count_reset(lo);
         fprintf(stderr, "champsim_tracer: marker fired at icount %" PRIu64
-                ", asid 0x%" PRIx64 " — tracing %" PRIu64 " insns\n",
-                lo, asid, span);
+                ", asid 0x%" PRIx64 " priv=%d (0=user,3=kernel) pc=0x%" PRIx64
+                " — tracing %" PRIu64 " insns\n",
+                lo, asid, qemu_plugin_get_priv_level(),
+                qemu_plugin_get_pc(), span);
         start_trace_segment("marker", lo, hi, /* warmup= */ 0, span,
                             cpu_index, /* simpoint_weight= */ 0.0);
+    }
+    g_rec_mutex_unlock(&exec_lock);
+}
+
+/*
+ * End-of-program marker (WIN_MARKER).  The workload emits the END-marker
+ * sequence just before it exits; when it executes in the pinned process's
+ * address space, close the trace window here.  This is the "or the program
+ * ends" stop: a workload shorter than the icount/simpoint budget ends
+ * cleanly instead of running past process exit, where the freed address
+ * space (ASID/CR3) may be reused by another process and re-match the pin.
+ * Ignored if unpinned, if not the pinned process, or during WP.
+ */
+static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
+{
+    (void)udata;
+    (void)cpu_index;
+    if (g_wp_state.in_progress) {
+        return;
+    }
+    uint64_t pinned = g_pinned_asid.load(std::memory_order_relaxed);
+    if (pinned == CST_ASID_UNPINNED ||
+        qemu_plugin_get_addr_space_id() != pinned) {
+        return;
+    }
+    g_rec_mutex_lock(&exec_lock);
+    if (g_trace_segments.is_active() && !g_trace_segments.is_shutting_down()) {
+        fprintf(stderr, "champsim_tracer: end marker — closing after %" PRIu64
+                " user insns\n", g_user_icount);
+        g_seg_end_marker_close = true;
+        finish_trace_segment();
+        g_trace_segments.set_shutting_down();
+        g_rec_mutex_unlock(&exec_lock);
+        exit(0);
     }
     g_rec_mutex_unlock(&exec_lock);
 }
@@ -2316,7 +2451,8 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
     uint32_t *canonical_index          = scratch.canonical_index.get();
     bool *canonical_first              = scratch.canonical_first.get();
     uint32_t canonical_n_insns = 0;
-    uint32_t marker_run = 0;  /* consecutive marker movs seen (WIN_MARKER) */
+    uint32_t marker_run = 0;      /* consecutive START-marker movs (WIN_MARKER) */
+    uint32_t marker_end_run = 0;  /* consecutive END-marker movs (WIN_MARKER) */
 
     for (size_t i = 0; i < raw_n_insns; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
@@ -2328,21 +2464,31 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
         qemu_plugin_insn_data(insn, raw_bytes, raw_size);
 
         /* WIN_MARKER (x86): detect the CST_MARKER_SEQ_LEN-long run of
-         * identical marker movs and arm the one-shot trace-open callback on
-         * the LAST one.  marker_run counts consecutive matches in this TB's
-         * straight-line stream; arming on the final insn of the run means
-         * that when it executes, the whole sequence executed before it.
-         * Registered at every translation so the marker is caught wherever
-         * the process runs; the callback itself is one-shot. */
+         * identical marker movs and arm the trace-open (START) or
+         * trace-close (END) callback on the LAST one.  Each counter counts
+         * consecutive matches in this TB's straight-line stream; arming on
+         * the final insn means that when it executes, the whole sequence ran
+         * before it.  Registered at every translation so the marker is
+         * caught wherever the process runs. */
         if (g_window_mode == PluginConfig::WIN_MARKER &&
-            trace_isa == TRACE_ISA_X86 &&
-            marker_mov_match(raw_bytes, raw_size)) {
-            if (++marker_run >= CST_MARKER_SEQ_LEN) {
-                qemu_plugin_register_vcpu_insn_exec_cb(
-                    insn, vcpu_marker_cb, QEMU_PLUGIN_CB_NO_REGS, nullptr);
+            trace_isa == TRACE_ISA_X86) {
+            if (marker_mov_match(raw_bytes, raw_size)) {
+                if (++marker_run >= CST_MARKER_SEQ_LEN) {
+                    qemu_plugin_register_vcpu_insn_exec_cb(
+                        insn, vcpu_marker_cb, QEMU_PLUGIN_CB_NO_REGS, nullptr);
+                }
+            } else {
+                marker_run = 0;
             }
-        } else {
-            marker_run = 0;
+            if (marker_end_mov_match(raw_bytes, raw_size)) {
+                if (++marker_end_run >= CST_MARKER_SEQ_LEN) {
+                    qemu_plugin_register_vcpu_insn_exec_cb(
+                        insn, vcpu_marker_end_cb, QEMU_PLUGIN_CB_NO_REGS,
+                        nullptr);
+                }
+            } else {
+                marker_end_run = 0;
+            }
         }
 
         bool duplicate = false;

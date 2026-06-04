@@ -190,25 +190,37 @@ def emit_entry_jump(isa: str, entry_symbol: str) -> list[str]:
 _MARKER_HEADER = Path(__file__).resolve().parents[2] / "champsim_marker.h"
 
 
-def _marker_contract() -> tuple[int, int]:
-    """(magic, seq_len) parsed from champsim_marker.h."""
+def _marker_contract() -> tuple[int, int, int]:
+    """(start_magic, end_magic, seq_len) parsed from champsim_marker.h."""
     text = _MARKER_HEADER.read_text()
     m = re.search(r"#define\s+CST_MARKER_MAGIC\s+(0x[0-9A-Fa-f]+)", text)
+    e = re.search(r"#define\s+CST_MARKER_END_MAGIC\s+(0x[0-9A-Fa-f]+)", text)
     s = re.search(r"#define\s+CST_MARKER_SEQ_LEN\s+(\d+)", text)
-    if not m or not s:
+    if not m or not e or not s:
         raise RuntimeError(f"cannot parse marker contract from {_MARKER_HEADER}")
-    return int(m.group(1), 16), int(s.group(1))
+    return int(m.group(1), 16), int(e.group(1), 16), int(s.group(1))
 
 
 def emit_trace_marker(isa: str) -> list[str]:
-    """Emit the champsim_tracer trace marker: CST_MARKER_SEQ_LEN identical
-    immediate-loads the plugin detects to open and ASID-pin the trace window
+    """Emit the START marker: CST_MARKER_SEQ_LEN identical immediate-loads
+    the plugin detects to open and ASID-pin the trace window
     (trace_window=marker).  x86 only for now, matching the plugin's detector;
     other ISAs emit nothing (the system-mode marker is x86-only)."""
     if isa != "x86_64":
         return []
-    magic, seq = _marker_contract()
+    magic, _end, seq = _marker_contract()
     return [f"  mov $0x{magic:08x}, %eax"] * seq
+
+
+def emit_trace_marker_end(isa: str) -> list[str]:
+    """Emit the END marker just before the workload exits: the plugin closes
+    the trace window when it executes in the pinned process (the "or the
+    program ends" stop, so a sub-budget workload ends cleanly instead of
+    running past process exit).  x86 only; other ISAs emit nothing."""
+    if isa != "x86_64":
+        return []
+    _magic, end, seq = _marker_contract()
+    return [f"  mov $0x{end:08x}, %eax"] * seq
 
 
 def emit_helper_symbols(isa: str) -> list[str]:

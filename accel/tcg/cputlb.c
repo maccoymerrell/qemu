@@ -1968,13 +1968,26 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
      * Redirect the RMW into the speculative sandbox and return before the
      * real-memory side effects below (notdirty dirtying / TB invalidation,
      * watchpoint delivery) — none of which apply to a discarded write.
-     * NULL means the sandbox is capped; fall through to the real pointer.
      */
     if (cpu_plugin_spec_active(cpu)) {
         void *shadow = spec_atomic_shadow(cpu, addr, hostaddr, size);
         if (shadow) {
             return shadow;
         }
+        /*
+         * Sandbox capped: NEVER fall through to the real host pointer (a
+         * wrong-path RMW must not mutate real guest memory).  Discard the
+         * RMW into a per-thread scratch line, seeded from the real bytes so
+         * the compare/exchange still behaves; we lose store->load forwarding
+         * for this one line, exactly as the spec_store path drops a store on
+         * a capped pool.  This keeps the wrong-path side-effect-free even
+         * under sandbox exhaustion.
+         */
+        static __thread PluginSpecLine spec_atomic_scratch;
+        unsigned soff = (unsigned)(addr & PLUGIN_SPEC_LINE_MASK);
+        memcpy(spec_atomic_scratch.bytes,
+               (const uint8_t *)hostaddr - soff, PLUGIN_SPEC_LINE_SIZE);
+        return &spec_atomic_scratch.bytes[soff];
     }
 #endif
 

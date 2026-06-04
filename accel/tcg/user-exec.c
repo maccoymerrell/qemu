@@ -1502,14 +1502,24 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     /*
      * Wrong-path (speculative) atomics must not mutate real guest memory
      * (user-mode futexes, lock cmpxchg, std::atomic).  Redirect the RMW
-     * into the speculative sandbox; NULL means the sandbox is capped, in
-     * which case we fall through to the real pointer.
+     * into the speculative sandbox.
      */
     if (cpu_plugin_spec_active(cpu)) {
         void *shadow = spec_atomic_shadow(cpu, addr, ret, size);
         if (shadow) {
             return shadow;
         }
+        /*
+         * Sandbox capped: NEVER fall through to the real host pointer (a
+         * wrong-path RMW must not mutate real guest memory).  Discard the
+         * RMW into a per-thread scratch line seeded from the real bytes,
+         * mirroring the softmmu twin in cputlb.c atomic_mmu_lookup.
+         */
+        static __thread PluginSpecLine spec_atomic_scratch;
+        unsigned soff = (unsigned)(addr & PLUGIN_SPEC_LINE_MASK);
+        memcpy(spec_atomic_scratch.bytes,
+               (const uint8_t *)ret - soff, PLUGIN_SPEC_LINE_SIZE);
+        return &spec_atomic_scratch.bytes[soff];
     }
 #endif
 

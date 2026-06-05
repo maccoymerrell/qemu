@@ -293,6 +293,23 @@ line, and the body terminator.  The ``IFRAME records`` line appears
 only on traces produced with ``iframe_rate>0``; those bytes are
 pure validation overhead and disappear when the feature is off.
 
+When the trace carries register data (``regdata=1``), the
+**dest registers** line of the field-delta breakdown is typically the
+single largest body cost.  A **REGISTER-DATA BREAKDOWN** section then
+splits that one bucket down to the individual architectural register:
+each field-delta record charges its bytes to the register the
+record's template binds to that destination slot, resolved through
+the header's register-name map.  Rows are sorted by total bytes, each
+showing the correct-path / wrong-path split and record count, and the
+section reconciles — the per-register bytes sum back to the
+``dest registers`` bucket (a ``rollup ... of dest-register bucket``
+line asserts it; any residue that could not be tied to a register
+lands in an ``(unresolved)`` row).  This is the tool to reach for when
+``regdata`` blows up a trace and you need to know *which* register is
+responsible — a single hot accumulator or the flags register often
+dominates, and the CP/WP split shows whether the cost is correct-path
+state or wrong-path speculation.
+
 Validating a trace
 ------------------
 

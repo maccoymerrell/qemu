@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 #include <string>
@@ -47,9 +48,19 @@ enum : int {
 struct FidTables {
     static constexpr size_t LUT_SIZE = 1024;
     std::array<uint8_t, LUT_SIZE> bucket{};
+    /* For FIDs in the dst-register-value family, the per-instruction
+     * destination slot index this FID names (so a field-delta record
+     * can be charged to the architectural register the template binds
+     * to that slot); -1 for every other FID. */
+    std::array<int16_t, LUT_SIZE> dst_slot{};
 
     explicit FidTables(const cst::ResolvedIds &ids) {
         bucket.fill(BIDX_OTHER);
+        dst_slot.fill(-1);
+        for (int k = 0; k < cst::FID_SLOT_COUNT; k++) {
+            uint16_t fid = ids.fid_dst_reg[k];
+            if (fid != 0 && fid < LUT_SIZE) dst_slot[fid] = (int16_t)k;
+        }
         if (ids.fid_n_loads   < LUT_SIZE) bucket[ids.fid_n_loads]   = BIDX_MEM_COUNTS;
         if (ids.fid_n_stores  < LUT_SIZE) bucket[ids.fid_n_stores]  = BIDX_MEM_COUNTS;
         if (ids.fid_metaflags < LUT_SIZE) bucket[ids.fid_metaflags] = BIDX_INSN_META;
@@ -132,6 +143,16 @@ struct Stats {
     /* Per-bucket detail across CP and WP field-delta streams. */
     std::array<Bucket, NUM_BUCKETS> cp_fd{};
     std::array<Bucket, NUM_BUCKETS> wp_fd{};
+
+    /* Per-architectural-register breakdown of the dest-register-value
+     * family (the regdata payload).  Keyed by generic register id; the
+     * cp+wp byte sum reconciles exactly with the BIDX_DST_REG bucket.
+     * Records whose (template, ipos, slot) can't resolve to a register
+     * (missing template, out-of-range slot) land in @reg_unresolved. */
+    struct RegBucket { uint64_t cp_bytes = 0, wp_bytes = 0,
+                                cp_count = 0, wp_count = 0; };
+    std::unordered_map<uint16_t, RegBucket> reg_data;
+    RegBucket reg_unresolved;
 
     /* HEADER member byte breakdown (templates section + preamble). */
     struct HeaderBreakdown {
@@ -243,16 +264,32 @@ void account_header(cst::MemberView hv, const cst::ResolvedIds &ids,
  * to 512 bits) walked by skip_varint (no overflow guard). */
 static inline void tally_fd_record(
     cst::Reader &sec, const FidTables &fid, const cst::ResolvedIds &ids,
-    std::array<Bucket, NUM_BUCKETS> *fd_b)
+    std::array<Bucket, NUM_BUCKETS> *fd_b,
+    uint32_t *ipos, const cst::Template *tmpl, bool is_wp, Stats *s)
 {
     size_t before = sec.consumed();
-    sec.skip_varint();                       /* ipos delta */
+    *ipos += (uint32_t)sec.uleb();           /* ipos delta (accumulates) */
     uint64_t f = sec.uleb();                 /* fid (ULEB128) */
     sec.skip_varint();                       /* sleb_wide delta */
     if (f == ids.fid_extended) sec.skip_varint();
     int idx = fid.bucket_for((unsigned)f);
-    (*fd_b)[idx].bytes += sec.consumed() - before;
+    uint64_t nbytes = sec.consumed() - before;
+    (*fd_b)[idx].bytes += nbytes;
     (*fd_b)[idx].count += 1;
+
+    /* Charge dest-register-value records to the architectural register
+     * the template binds to this (ipos, slot).  Sums back to the
+     * BIDX_DST_REG bucket (resolvable + unresolved). */
+    if (idx == BIDX_DST_REG) {
+        int slot = (f < FidTables::LUT_SIZE) ? fid.dst_slot[f] : -1;
+        Stats::RegBucket *rb = &s->reg_unresolved;
+        if (slot >= 0 && tmpl && *ipos < tmpl->insns.size()) {
+            const auto &dr = tmpl->insns[*ipos].dst_regs;
+            if ((size_t)slot < dr.size()) rb = &s->reg_data[dr[(size_t)slot]];
+        }
+        if (is_wp) { rb->wp_bytes += nbytes; rb->wp_count += 1; }
+        else       { rb->cp_bytes += nbytes; rb->cp_count += 1; }
+    }
 }
 
 /* Walk the body record stream through a Reader.  Works identically
@@ -261,10 +298,16 @@ static inline void tally_fd_record(
 void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                uint8_t header_flags,
                const std::unordered_map<uint32_t, uint32_t> &insns_by_tid,
+               const std::vector<cst::Template> &templates,
+               const std::unordered_map<uint32_t, size_t> &by_id,
                Stats *s)
 {
     const bool have_wp = (header_flags & ids.flag_wp) != 0;
     const FidTables fid(ids);
+    auto tmpl_for = [&](int32_t tid) -> const cst::Template * {
+        auto it = by_id.find((uint32_t)tid);
+        return it != by_id.end() ? &templates[it->second] : nullptr;
+    };
     int32_t prev_cp_tid = 0;
     auto &cpfd_b = s->cp_fd;
     auto &wpfd_b = s->wp_fd;
@@ -304,8 +347,11 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
             cpfd_b[BIDX_OVERHEAD].bytes += sec.consumed() - rec_st;
             cpfd_b[BIDX_OVERHEAD].count += 1;
 
+            const cst::Template *cp_tmpl = tmpl_for(prev_cp_tid);
+            uint32_t cp_ipos = 0;
             for (uint64_t r = 0; r < n_records; r++) {
-                tally_fd_record(sec, fid, ids, &cpfd_b);
+                tally_fd_record(sec, fid, ids, &cpfd_b,
+                                &cp_ipos, cp_tmpl, /*is_wp=*/false, s);
             }
             if (!sec.eof()) {
                 throw std::runtime_error("CP field-delta had trailing bytes");
@@ -348,8 +394,11 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                 uint64_t wp_nrec = wpsec.uleb();
                 wpfd_b[BIDX_OVERHEAD].bytes += wpsec.consumed() - wp_rec_st;
                 wpfd_b[BIDX_OVERHEAD].count += 1;
+                const cst::Template *wp_tmpl = tmpl_for(prev_wp_tid);
+                uint32_t wp_ipos = 0;
                 for (uint64_t r = 0; r < wp_nrec; r++) {
-                    tally_fd_record(wpsec, fid, ids, &wpfd_b);
+                    tally_fd_record(wpsec, fid, ids, &wpfd_b,
+                                    &wp_ipos, wp_tmpl, /*is_wp=*/true, s);
                 }
                 if (!wpsec.eof()) {
                     throw std::runtime_error("WP field-delta had trailing bytes");
@@ -498,7 +547,7 @@ std::string fd_row(const std::string &label, const Bucket &cp,
     return buf;
 }
 
-void print_report(const Stats &s)
+void print_report(const Stats &s, const cst::Header &h)
 {
     /* Member sizes are uncompressed, so the 100% anchor MUST be the
      * uncompressed total, not the on-disk container size (else
@@ -608,6 +657,44 @@ void print_report(const Stats &s)
                                     fd_total).c_str());
     }
 
+    /* Per-register split of the dest-register-value family (regdata).
+     * Empty unless the trace carried regdata; sorted by total bytes so
+     * the registers blowing up the trace surface first. */
+    uint64_t dstreg_total = s.cp_fd[BIDX_DST_REG].bytes +
+                            s.wp_fd[BIDX_DST_REG].bytes;
+    if (dstreg_total || !s.reg_data.empty()) {
+        std::printf("\n=== REGISTER-DATA BREAKDOWN "
+                    "(dest-register values, per architectural register) ===\n");
+        std::vector<std::pair<uint16_t, Stats::RegBucket>> regs(
+            s.reg_data.begin(), s.reg_data.end());
+        std::sort(regs.begin(), regs.end(),
+                  [](const auto &a, const auto &b) {
+                      uint64_t ta = a.second.cp_bytes + a.second.wp_bytes;
+                      uint64_t tb = b.second.cp_bytes + b.second.wp_bytes;
+                      if (ta != tb) return ta > tb;
+                      return a.first < b.first;   /* stable tiebreak */
+                  });
+        uint64_t roll = 0;
+        for (const auto &pr : regs) {
+            const Stats::RegBucket &rb = pr.second;
+            Bucket cp{rb.cp_bytes, rb.cp_count};
+            Bucket wp{rb.wp_bytes, rb.wp_count};
+            roll += rb.cp_bytes + rb.wp_bytes;
+            std::printf("%s\n", fd_row(cst::reg_name_or_unknown(h, pr.first),
+                                       cp, wp, dstreg_total).c_str());
+        }
+        if (s.reg_unresolved.cp_bytes || s.reg_unresolved.wp_bytes) {
+            Bucket cp{s.reg_unresolved.cp_bytes, s.reg_unresolved.cp_count};
+            Bucket wp{s.reg_unresolved.wp_bytes, s.reg_unresolved.wp_count};
+            roll += s.reg_unresolved.cp_bytes + s.reg_unresolved.wp_bytes;
+            std::printf("%s\n", fd_row("(unresolved)", cp, wp,
+                                       dstreg_total).c_str());
+        }
+        std::printf("  %-20s %12s  [rollup %.2f%% of dest-register bucket]\n",
+                    "sum", human((double)roll).c_str(),
+                    dstreg_total ? 100.0 * roll / dstreg_total : 100.0);
+    }
+
     std::printf("\n=== ENTRIES & INSNS ===\n");
     std::printf("  CP entries           %14s\n", fmt_n(s.cp_entries).c_str());
     std::printf("  WP entries (total)   %14s\n", fmt_n(s.wp_entries_total).c_str());
@@ -697,7 +784,7 @@ int main(int argc, char **argv)
 
         try {
             walk_body(body_stream->reader(), h.ids, h.flags,
-                      insns_by_tid, &s);
+                      insns_by_tid, templates, by_id, &s);
         } catch (const std::exception &e) {
             std::fprintf(stderr,
                 "cst_audit: body walk failed at cp_entries=%lu wp_entries=%lu thread_switches=%lu iframes=%lu: %s\n",
@@ -720,7 +807,7 @@ int main(int argc, char **argv)
                      + s.regfile_bytes.bytes
                      + s.body_terminator;
 
-        print_report(s);
+        print_report(s, h);
     } catch (const std::exception &e) {
         std::fprintf(stderr, "cst_audit: %s\n", e.what());
         return 1;

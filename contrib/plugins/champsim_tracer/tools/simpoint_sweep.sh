@@ -321,18 +321,22 @@ stage_plot() {
     : >"${LOGS_DIR}/plot.log"
 
     local cst m
-    for cst in "${TR_CP_DIR}/${WORKLOAD_NAME}_cp-"*.cst; do
-        [[ -e "$cst" ]] || continue
-        for m in "${CP_METRICS[@]}"; do
-            pool_gate; plot_one "$cst" "$m" &
+    if [[ "$VARIANT_SEL" == cp || "$VARIANT_SEL" == both ]]; then
+        for cst in "${TR_CP_DIR}/${WORKLOAD_NAME}_cp-"*.cst; do
+            [[ -e "$cst" ]] || continue
+            for m in "${CP_METRICS[@]}"; do
+                pool_gate; plot_one "$cst" "$m" &
+            done
         done
-    done
-    for cst in "${TR_FULL_DIR}/${WORKLOAD_NAME}_full-"*.cst; do
-        [[ -e "$cst" ]] || continue
-        for m in "${CP_METRICS[@]}" "${FULL_EXTRA[@]}"; do
-            pool_gate; plot_one "$cst" "$m" &
+    fi
+    if [[ "$VARIANT_SEL" == full || "$VARIANT_SEL" == both ]]; then
+        for cst in "${TR_FULL_DIR}/${WORKLOAD_NAME}_${FULL_TAG}-"*.cst; do
+            [[ -e "$cst" ]] || continue
+            for m in "${CP_METRICS[@]}" "${FULL_EXTRA[@]}"; do
+                pool_gate; plot_one "$cst" "$m" &
+            done
         done
-    done
+    fi
     wait
 
     local n
@@ -347,17 +351,17 @@ stage_aggregate() {
     mkdir -p "$PLOTS_DIR"
 
     local cp_csts full_csts m
-    mapfile -t cp_csts   < <(compgen -G "${TR_CP_DIR}/${WORKLOAD_NAME}_cp-*.cst"     || true)
-    mapfile -t full_csts < <(compgen -G "${TR_FULL_DIR}/${WORKLOAD_NAME}_full-*.cst" || true)
+    mapfile -t cp_csts   < <(compgen -G "${TR_CP_DIR}/${WORKLOAD_NAME}_cp-*.cst" || true)
+    mapfile -t full_csts < <(compgen -G "${TR_FULL_DIR}/${WORKLOAD_NAME}_${FULL_TAG}-*.cst" || true)
 
-    if (( ${#cp_csts[@]} > 0 )); then
+    if [[ "$VARIANT_SEL" == cp || "$VARIANT_SEL" == both ]] && (( ${#cp_csts[@]} > 0 )); then
         for m in "${CP_METRICS[@]}"; do
             pool_gate; agg_one cp "$m" "${cp_csts[@]}" &
         done
     fi
-    if (( ${#full_csts[@]} > 0 )); then
+    if [[ "$VARIANT_SEL" == full || "$VARIANT_SEL" == both ]] && (( ${#full_csts[@]} > 0 )); then
         for m in "${CP_METRICS[@]}" "${FULL_EXTRA[@]}"; do
-            pool_gate; agg_one full "$m" "${full_csts[@]}" &
+            pool_gate; agg_one "$FULL_TAG" "$m" "${full_csts[@]}" &
         done
     fi
     wait
@@ -442,7 +446,16 @@ main() {
     BBV_DIR=${OUT_DIR}/bbv
     SP_DIR=${OUT_DIR}/simpoints
     TR_CP_DIR=${OUT_DIR}/traces_cp
-    TR_FULL_DIR=${OUT_DIR}/traces_full
+    # Full variant tag + dir, parameterized by --wpprune so trace AND plot/
+    # aggregate stages all target the same pruning level (full_p<N> /
+    # traces_full_p<N>); unset = canonical "full" / traces_full.
+    if [[ -n "$WPPRUNE" ]]; then
+        FULL_TAG="full_p${WPPRUNE}"
+        TR_FULL_DIR=${OUT_DIR}/traces_full_p${WPPRUNE}
+    else
+        FULL_TAG=full
+        TR_FULL_DIR=${OUT_DIR}/traces_full
+    fi
     PLOTS_DIR=${OUT_DIR}/plots
     LOGS_DIR=${OUT_DIR}/logs
     PROGRESS_LOG=${OUT_DIR}/progress.log
@@ -497,14 +510,9 @@ main() {
         # CP and WP sides.  With --wpprune N the full variant is tagged
         # full_p<N> and lands in traces_full_p<N>/ with wpprune=<N>.
         if [[ "$VARIANT_SEL" == full || "$VARIANT_SEL" == both ]]; then
-            local full_tag=full full_dir=$TR_FULL_DIR
             local -a prune_opt=()
-            if [[ -n "$WPPRUNE" ]]; then
-                full_tag="full_p${WPPRUNE}"
-                full_dir="${OUT_DIR}/traces_full_p${WPPRUNE}"
-                prune_opt=("wpprune=${WPPRUNE}")
-            fi
-            stage_trace "$full_tag" "$full_dir" \
+            [[ -n "$WPPRUNE" ]] && prune_opt=("wpprune=${WPPRUNE}")
+            stage_trace "$FULL_TAG" "$TR_FULL_DIR" \
                 "wp=1" "memdata=1" "regdata=1" \
                 "wp_memdata=1" "wp_regdata=1" "${prune_opt[@]}" "$COMPRESS"
         fi

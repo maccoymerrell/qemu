@@ -106,6 +106,14 @@ PARALLEL=$(nproc 2>/dev/null || echo 4)
 # each sweep's plot phase the full core budget in turn.
 STAGE=all
 
+# Which trace variant(s) to produce: cp | full | both (default both).
+# Lets an orchestrator drive CP once and full once per wpprune level.
+VARIANT_SEL=both
+# Wrong-path pruning level for the full variant (empty = unset/0).  When
+# set, the full trace gets wpprune=<N>, is tagged full_p<N>, and lands in
+# traces_full_p<N>/ — so several prune levels coexist in one sweep dir.
+WPPRUNE=
+
 # Metrics computable from a CP-only trace.  memdata gates the load/store
 # *values*, but addresses are always emitted, so the address-driven metrics
 # (mem_pat / cache_miss / working_set / reuse_distance) work on CP traces
@@ -383,6 +391,8 @@ main() {
         --rob-size)       ROB_SIZE=$2; shift 2 ;;
         --parallel)       PARALLEL=$2; shift 2 ;;
         --stage)          STAGE=$2; shift 2 ;;
+        --variant)        VARIANT_SEL=$2; shift 2 ;;
+        --wpprune)        WPPRUNE=$2; shift 2 ;;
         --help|-h)        usage 0 ;;
         --)
             shift
@@ -472,17 +482,32 @@ main() {
         # multi-threaded xz.  -T 0 = use every available core for that
         # compressor invocation; members compress serially but each gets
         # the whole CPU.
-        local COMPRESS="compress=xz -T 0"
+        # xz threads per compressor.  Default 0 (= all cores); an
+        # orchestrator running many sweeps concurrently should bound this
+        # (XZ_THREADS=4) to avoid 16x all-core compressor storms.
+        local COMPRESS="compress=xz -T ${XZ_THREADS:-0}"
 
         # CP-only: no WP, no regdata, no memdata.
-        stage_trace cp  "$TR_CP_DIR"  \
-            "wp=0" "memdata=0" "regdata=0" "$COMPRESS"
+        if [[ "$VARIANT_SEL" == cp || "$VARIANT_SEL" == both ]]; then
+            stage_trace cp  "$TR_CP_DIR"  \
+                "wp=0" "memdata=0" "regdata=0" "$COMPRESS"
+        fi
 
         # Full: WP on for both reads & writes, regdata+memdata on both
-        # CP and WP sides.
-        stage_trace full "$TR_FULL_DIR" \
-            "wp=1" "memdata=1" "regdata=1" \
-            "wp_memdata=1" "wp_regdata=1" "$COMPRESS"
+        # CP and WP sides.  With --wpprune N the full variant is tagged
+        # full_p<N> and lands in traces_full_p<N>/ with wpprune=<N>.
+        if [[ "$VARIANT_SEL" == full || "$VARIANT_SEL" == both ]]; then
+            local full_tag=full full_dir=$TR_FULL_DIR
+            local -a prune_opt=()
+            if [[ -n "$WPPRUNE" ]]; then
+                full_tag="full_p${WPPRUNE}"
+                full_dir="${OUT_DIR}/traces_full_p${WPPRUNE}"
+                prune_opt=("wpprune=${WPPRUNE}")
+            fi
+            stage_trace "$full_tag" "$full_dir" \
+                "wp=1" "memdata=1" "regdata=1" \
+                "wp_memdata=1" "wp_regdata=1" "${prune_opt[@]}" "$COMPRESS"
+        fi
     fi
 
     # Plot (cst_visualize) phase: per-simpoint SVGs + whole-program

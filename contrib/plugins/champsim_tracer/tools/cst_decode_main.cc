@@ -357,6 +357,8 @@ const char *branch_mnem_from_name(const std::string *name)
     if (n == "BRANCH_COND_DIRECT")   return "jcc";
     if (n == "BRANCH_REP")           return "rep";
     if (n == "BRANCH_RETURN")        return "ret";
+    if (n == "BRANCH_DIRECT_CALL")   return "call";
+    if (n == "BRANCH_INDIRECT_CALL") return "callr";
     if (n == "BRANCH_SYSCALL_TYPE")  return "syscall";
     return nullptr;
 }

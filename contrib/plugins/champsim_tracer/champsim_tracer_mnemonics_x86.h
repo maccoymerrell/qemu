@@ -325,9 +325,11 @@ static void refine_x86_implicit_stack_store(
 static void refine_x86_call_branch(
     const struct qemu_plugin_insn_info *info, InsnFields *f)
 {
+    /* X86_INS_CALL is classified BRANCH_DIRECT_CALL in the table; a
+     * register/memory target makes it an indirect call. */
     if (info && info->n_operands > 0 &&
         info->operands[0].type != QEMU_PLUGIN_OP_IMM) {
-        f->branch_type = BRANCH_INDIRECT_JUMP;
+        f->branch_type = BRANCH_INDIRECT_CALL;
     }
     f->branch_conditional = false;
 }
@@ -518,7 +520,7 @@ static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
                                         .dep_refine = dep_all_to_all },
     [X86_INS_BZHI]                        = { .opcode = GEN_OP_BITMANIP, .branch_type = BRANCH_NONE,           .flags = MF_NONE,
                                         .dep_refine = dep_all_to_all },
-    [X86_INS_CALL]                        = { .opcode = GEN_OP_BRANCH, .branch_type = BRANCH_DIRECT_JUMP,    .flags = MF_NONE,
+    [X86_INS_CALL]                        = { .opcode = GEN_OP_BRANCH, .branch_type = BRANCH_DIRECT_CALL,    .flags = MF_NONE,
                                         .refine = refine_x86_call_branch,
                                         .dep_refine = dep_x86_stack_push },
     [X86_INS_CBW]                         = { .opcode = GEN_OP_MOVSX,  .branch_type = BRANCH_NONE,           .flags = MF_NONE,
@@ -793,7 +795,7 @@ static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
                                         .lane_parallel = false },
     [X86_INS_F2XM1]                       = { .opcode = GEN_OP_FP_MOV, .branch_type = BRANCH_NONE,           .flags = MF_NONE,
                                         .dep_refine = dep_all_to_all },
-    [X86_INS_LCALL]                       = { .opcode = GEN_OP_BRANCH, .branch_type = BRANCH_DIRECT_JUMP,    .flags = MF_NONE,
+    [X86_INS_LCALL]                       = { .opcode = GEN_OP_BRANCH, .branch_type = BRANCH_DIRECT_CALL,    .flags = MF_NONE,
                                         .dep_refine = dep_x86_stack_push },
     [X86_INS_LJMP]                        = { .opcode = GEN_OP_BRANCH, .branch_type = BRANCH_DIRECT_JUMP,    .flags = MF_NONE,
                                         .dep_refine = dep_passthrough },

@@ -78,6 +78,7 @@ BRANCH_NAMES = {
     0: "NONE",
     1: "DIRECT_JUMP", 2: "INDIRECT_JUMP",
     3: "RETURN", 4: "SYSCALL", 5: "COND_DIRECT",
+    6: "REP", 7: "DIRECT_CALL", 8: "INDIRECT_CALL",
 }
 
 # Field IDs mirror champsim_tracer.h.

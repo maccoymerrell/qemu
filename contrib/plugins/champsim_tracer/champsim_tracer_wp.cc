@@ -811,7 +811,8 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                 }
                 bool indirect =
                     lf->branch_type == BRANCH_INDIRECT_JUMP ||
-                    lf->branch_type == BRANCH_RETURN;
+                    lf->branch_type == BRANCH_RETURN ||
+                    lf->branch_type == BRANCH_INDIRECT_CALL;
                 if (!indirect) {
                     bool cond = lf->branch_type == BRANCH_COND_DIRECT ||
                                 (lf->branch_type == BRANCH_DIRECT_JUMP &&

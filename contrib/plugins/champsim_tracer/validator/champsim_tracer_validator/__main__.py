@@ -147,6 +147,10 @@ def _parse_args() -> argparse.Namespace:
                    help="QEMU build dir containing qemu-<isa> and plugin")
     t.add_argument("--depth", type=int, default=64,
                    help="wrong-path depth (plugin option)")
+    t.add_argument("--wpprune", type=int, default=0, choices=(0, 1, 2),
+                   help="wrong-path pruning level (plugin wpprune=N): 0 none, "
+                        "1 drop WP for branches never seen taken / monomorphic "
+                        "indirects, 2 also drop one-directional conditionals.")
     t.add_argument("--stop", type=int, default=200_000)
     t.add_argument("--tb-size", type=int, default=0,
                    help="QEMU code-cache size in MiB (passes -tb-size). "
@@ -190,6 +194,8 @@ def _parse_args() -> argparse.Namespace:
     al.add_argument("--side-len-min", type=int, default=2)
     al.add_argument("--side-len-max", type=int, default=4)
     al.add_argument("--depth", type=int, default=64)
+    al.add_argument("--wpprune", type=int, default=0, choices=(0, 1, 2),
+                    help="wrong-path pruning level (plugin wpprune=N).")
     al.add_argument("--stop", type=int, default=200_000)
     al.add_argument("--tb-size", type=int, default=0,
                     help="QEMU code-cache size in MiB (passes -tb-size; "
@@ -349,6 +355,8 @@ def _optional_plugin_opts(args) -> str:
         opts += ",regdata=1"
     if getattr(args, "iframe_rate", None) is not None:
         opts += f",iframe_rate={int(args.iframe_rate)}"
+    if getattr(args, "wpprune", 0):
+        opts += f",wpprune={int(args.wpprune)}"
     return opts
 
 

@@ -44,6 +44,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 /* ========================= Configuration ========================= */
 
 int max_wrong_path_depth = 64;
+int g_wp_prune = 0;          /* wpprune level: 0 none, 1 cold, 2 monotone */
 bool enable_wrong_path = true;
 static char *unknown_warn_path = nullptr;
 /* File for the final stats / icount report.  Opened at install time
@@ -1222,6 +1223,12 @@ static BranchRecord *observe_branch_transition(BBTemplate *bb_tmpl,
     }
     if (br) {
         br->fall_through = bb_fall_through;
+        /* CP direction history for the wpprune cold-branch filter. */
+        if (branch_taken) {
+            br->taken_count++;
+        } else {
+            br->nottaken_count++;
+        }
     }
     return br;
 }
@@ -1254,7 +1261,8 @@ static uint64_t resolve_wrong_target(const BBTemplate *bb_tmpl,
     }
 
     bool is_indirect = bf->branch_type == BRANCH_INDIRECT_JUMP ||
-                       bf->branch_type == BRANCH_RETURN;
+                       bf->branch_type == BRANCH_RETURN ||
+                       bf->branch_type == BRANCH_INDIRECT_CALL;
     bool direct_cond = bf->branch_type == BRANCH_COND_DIRECT ||
                        (bf->branch_type == BRANCH_DIRECT_JUMP &&
                         bf->branch_conditional);
@@ -1302,6 +1310,51 @@ static uint64_t resolve_wrong_target(const BBTemplate *bb_tmpl,
      * taken edge.  No distinct wrong path. */
     *taken_out = current_pc;
     return 0;
+}
+
+/*
+ * wpprune cold-branch filter: should the wrong path for this just-resolved
+ * branch be skipped?  Off when g_wp_prune == 0.  Uses the branch's
+ * correct-path history (BranchRecord), which already includes the current
+ * execution (observe_branch_transition runs first):
+ *
+ *   level 1 — drop WP for a branch never seen taken; for an indirect
+ *             (incl. return) drop when it is monomorphic (< 2 distinct
+ *             observed targets), i.e. no alternative target to speculate to.
+ *   level 2 — additionally drop WP for a conditional seen going only one
+ *             way (not both taken and not-taken).
+ *
+ * Pruning only suppresses the speculative walk; the correct-path taken edge
+ * and all CP recording are untouched.
+ */
+static bool wp_branch_pruned(const BBTemplate *bb_tmpl, const BranchRecord *br)
+{
+    if (g_wp_prune <= 0 || !br) {
+        return false;
+    }
+    int br_idx = BBTemplateCache::template_branch_index(bb_tmpl);
+    const InsnFields *bf = (br_idx >= 0)
+        ? &bb_tmpl->insn_fields[br_idx] : nullptr;
+    if (!bf) {
+        return false;
+    }
+    bool is_indirect = bf->branch_type == BRANCH_INDIRECT_JUMP ||
+                       bf->branch_type == BRANCH_RETURN ||
+                       bf->branch_type == BRANCH_INDIRECT_CALL;
+    if (is_indirect) {
+        return br->n_targets < 2;
+    }
+    bool conditional = bf->branch_conditional ||
+                       bf->branch_type == BRANCH_COND_DIRECT;
+    if (conditional) {
+        if (g_wp_prune >= 2) {
+            return br->taken_count == 0 || br->nottaken_count == 0;
+        }
+        return br->taken_count == 0;
+    }
+    /* Unconditional direct jump/call: resolve_wrong_target returns 0
+     * (no wrong path) anyway, so nothing to prune. */
+    return false;
 }
 
 /*
@@ -1712,6 +1765,12 @@ static bool collect_finalized_bbs(unsigned int cpu_index,
                     frag_current_pc, frag_prev_ft, &taken_target);
                 if (taken_target != 0) {
                     bb_tmpl->taken_pc = taken_target;
+                }
+                /* wpprune: skip the wrong path for a cold branch.  The
+                 * taken edge above is already recorded; only the
+                 * speculative walk is suppressed. */
+                if (pe.wrong_target != 0 && wp_branch_pruned(bb_tmpl, br)) {
+                    pe.wrong_target = 0;
                 }
             }
             pending_emits.push_back(pe);
@@ -2168,7 +2227,8 @@ static void split_tb_into_fragments(const qemu_plugin_insn_info *insn_info,
      */
     auto has_delay_slot = [](uint8_t bt) -> bool {
         return bt == BRANCH_DIRECT_JUMP || bt == BRANCH_INDIRECT_JUMP ||
-               bt == BRANCH_RETURN || bt == BRANCH_COND_DIRECT;
+               bt == BRANCH_RETURN || bt == BRANCH_COND_DIRECT ||
+               bt == BRANCH_DIRECT_CALL || bt == BRANCH_INDIRECT_CALL;
     };
     bool delay_isa = isa_properties[trace_isa].branch_delay_slots > 0;
 
@@ -3309,6 +3369,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      * cfg (ownership moved); the rest are freed by
      * plugin_config_free below. */
     max_wrong_path_depth = cfg.wp_depth;
+    g_wp_prune           = cfg.wp_prune;
     enable_wrong_path    = cfg.enable_wp;
     g_features.mem_data      = cfg.enable_mem_data;
     g_features.reg_data      = cfg.enable_reg_data;

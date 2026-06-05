@@ -1814,6 +1814,7 @@ static WalkCtx::TermBranch classify_term(
     tb.is_indirect_class = name_says_indirect;
     bool unconditional =
         n.find("DIRECT_JUMP") != std::string::npos ||
+        n.find("CALL")        != std::string::npos ||
         n.find("SYSCALL")     != std::string::npos ||
         n.find("RETURN")      != std::string::npos ||
         n.find("INDIRECT")    != std::string::npos;

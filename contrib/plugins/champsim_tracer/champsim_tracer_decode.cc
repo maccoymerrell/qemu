@@ -329,6 +329,45 @@ static const InsnClassification *classify_insn_id(
 }
 
 /*
+ * Refine the table's branch_type from per-instance Capstone detail for
+ * the cases a single insn_id cannot resolve statically (calls).
+ *
+ *  - riscv: one insn_id covers jal+j and jalr+jr+ret, and the
+ *    call/jump/return role is carried by rd (Capstone prints the alias):
+ *    "jal"/"jalr" link (call), "j"/"jr" do not (jump), "ret" returns.
+ *
+ * x86 (call direct/indirect) is handled by the per-row .refine callback
+ * refine_x86_call_branch in the generated table; aarch64 (bl/blr) and
+ * mips (jal/jalr vs j/jr) use distinct insn_ids, so the table is already
+ * exact and needs no refinement.
+ */
+static void refine_branch_type(const qemu_plugin_insn_info *info,
+                               InsnFields *out)
+{
+    switch (trace_isa) {
+    case TRACE_ISA_RISCV: {
+        const char *m = info->mnemonic;
+        if (!strcmp(m, "jal") || !strcmp(m, "c_jal") ||
+            !strcmp(m, "call") || !strcmp(m, "tail")) {
+            out->branch_type = BRANCH_DIRECT_CALL;
+        } else if (!strcmp(m, "jalr") || !strcmp(m, "c_jalr")) {
+            out->branch_type = BRANCH_INDIRECT_CALL;
+        } else if (!strcmp(m, "j") || !strcmp(m, "c_j") ||
+                   !strcmp(m, "jump")) {
+            out->branch_type = BRANCH_DIRECT_JUMP;
+        } else if (!strcmp(m, "jr") || !strcmp(m, "c_jr")) {
+            out->branch_type = BRANCH_INDIRECT_JUMP;
+        } else if (!strcmp(m, "ret")) {
+            out->branch_type = BRANCH_RETURN;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/*
  * Decode structured Capstone detail into ISA-agnostic InsnFields.
  * Operand roles, implicit registers, and prefixes come directly from
  * Capstone's structured output.  Opcode and branch type come from the
@@ -404,6 +443,10 @@ void decode_detail_to_generic(uint64_t pc,
             }
         }
     }
+
+    /* Resolve call vs jump vs return for the ISAs where one insn_id is
+     * ambiguous (x86 call direct/indirect, riscv jal/jalr/j/jr/ret). */
+    refine_branch_type(info, out);
 
     /*
      * Operand processing: use Capstone access flags where available
@@ -600,7 +643,8 @@ void decode_detail_to_generic(uint64_t pc,
         isa_properties[trace_isa].pc_relative_branch_imm) {
         bool is_direct_branch =
             out->branch_type == BRANCH_COND_DIRECT ||
-            out->branch_type == BRANCH_DIRECT_JUMP;
+            out->branch_type == BRANCH_DIRECT_JUMP ||
+            out->branch_type == BRANCH_DIRECT_CALL;
         if (is_direct_branch) {
             out->immediate = (int64_t)((uint64_t)pc + (uint64_t)out->immediate);
         }

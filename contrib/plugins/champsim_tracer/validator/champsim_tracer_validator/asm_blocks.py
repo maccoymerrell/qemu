@@ -1031,7 +1031,7 @@ class DirectCall(CodeBlock):
             block_id=ctx.block_id,
             name=cls.name,
             memops=[],
-            asserted_branch_types=["BRANCH_DIRECT_JUMP"],
+            asserted_branch_types=["BRANCH_DIRECT_CALL"],
             asserted_opcodes=["BRANCH"],
         )
 
@@ -1072,7 +1072,7 @@ class IndirectCall(CodeBlock):
             block_id=ctx.block_id,
             name=cls.name,
             memops=[],
-            asserted_branch_types=["BRANCH_INDIRECT_JUMP"],
+            asserted_branch_types=["BRANCH_INDIRECT_CALL"],
             asserted_opcodes=["BRANCH"],
         )
 

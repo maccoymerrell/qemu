@@ -845,6 +845,12 @@ typedef struct BranchRecord {
     BranchTargetHistoryEntry targets[BRANCH_TARGET_HISTORY];
     uint8_t n_targets;
     uint32_t target_tick;
+    /* Correct-path direction history (conditional branches), for the
+     * wpprune cold-branch filter: how many times CP took / fell through
+     * this branch.  CP-only, like targets[] — observe_branch_transition
+     * is never called during WP. */
+    uint32_t taken_count;
+    uint32_t nottaken_count;
 } BranchRecord;
 
 typedef struct {
@@ -945,6 +951,7 @@ extern unsigned active_reg_table_size;
 /* Plugin configuration: parsed from -plugin args, immutable after
  * qemu_plugin_install. */
 extern int max_wrong_path_depth;
+extern int g_wp_prune;
 extern bool enable_wrong_path;
 /* Effective per-run trace-feature toggles, derived once from PluginConfig
  * at install (the tristate WP flags resolved against their CP counterparts)

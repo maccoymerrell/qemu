@@ -18,6 +18,12 @@
 
 struct PluginConfig {
     int       wp_depth          = 64;
+    /* Wrong-path pruning level (wpprune=N): skip WP simulation for cold
+     * branches.  0 = no pruning (default); 1 = drop WP for a branch never
+     * seen taken on the correct path (indirect: < 2 observed targets, i.e.
+     * monomorphic — no alternative target to mispredict toward); 2 = also
+     * drop WP unless the branch has been seen BOTH taken and not-taken. */
+    int       wp_prune          = 0;
     bool      enable_wp         = true;
     bool      enable_mem_data   = false;
     bool      enable_reg_data   = false;

@@ -18,6 +18,12 @@ bool set_wpdepth(PluginConfig *cfg, const char *v)
     return cfg->wp_depth > 0;
 }
 
+bool set_wpprune(PluginConfig *cfg, const char *v)
+{
+    cfg->wp_prune = atoi(v);
+    return cfg->wp_prune >= 0 && cfg->wp_prune <= 2;
+}
+
 bool set_outfile(PluginConfig *cfg, const char *v)
 {
     g_free(cfg->output_path);
@@ -257,6 +263,7 @@ const struct {
     OptionSetter setter;
 } options[] = {
     { "wpdepth",    set_wpdepth    },
+    { "wpprune",    set_wpprune    },
     { "outfile",    set_outfile    },
     { "compress",   set_compress   },
     { "wp",         set_wp         },

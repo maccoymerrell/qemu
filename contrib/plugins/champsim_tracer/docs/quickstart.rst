@@ -284,8 +284,26 @@ rather than spawning further wrong-path chains.
    soon as ``sim_insns >= wpdepth`` *and* the in-flight WP basic
    block has finished (i.e., the loop won't truncate a BB mid-flight).
    Bigger values give a longer speculative shadow per branch but
-   linearly increase runtime — doubling ``wpdepth`` roughly doubles 
+   linearly increase runtime — doubling ``wpdepth`` roughly doubles
    the WP work.  Setter rejects non-positive values.
+
+``wpprune=<level>``
+   Prune the wrong path for *cold* branches, trading WP coverage for
+   speed and a smaller trace.  A degree, default ``0``:
+
+   * ``0`` — no pruning (every mispredictable branch gets a WP walk).
+   * ``1`` — skip the WP walk for a branch never seen taken on the
+     correct path; for an indirect branch (or return), skip it while
+     it is monomorphic (fewer than two distinct observed targets — no
+     alternative target to mispredict toward).
+   * ``2`` — additionally skip conditionals seen going only one way
+     (require both a taken and a not-taken observation).
+
+   Pruning only suppresses the speculative walk; correct-path
+   recording, branch directions, and observed targets are unchanged.
+   The decision uses each branch's accumulated correct-path history, so
+   a branch that is cold early and warms up later starts getting WP
+   walks once it warms.
 
 Capture flags
 ~~~~~~~~~~~~~

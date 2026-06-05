@@ -307,7 +307,8 @@ def _check_template_raw_bytes(templates: list[dict],
 def _check_block_insn_counts(templates: list[dict],
                              blocks_by_id: dict[int, dict],
                              pcmap: "PcMap",
-                             cp_set: set[int]) -> list[Issue]:
+                             cp_set: set[int],
+                             wpprune: int = 0) -> list[Issue]:
     """For every CP block, sum the distinct PCs covered across templates
     and compare to `ground_truth.n_insns`.
 
@@ -372,6 +373,12 @@ def _check_block_insn_counts(templates: list[dict],
                     {"block_id": bid, "expected": expected,
                      "actual": actual},
                 ))
+            continue
+        # Under wpprune, some of a block's instructions are reached only on
+        # the wrong path, whose simulation is now dropped for cold branches
+        # — so the trace can legitimately expose FEWER PCs than the static
+        # disassembly.  An over-count still indicates contamination.
+        if wpprune > 0 and actual < expected:
             continue
         if actual != expected:
             issues.append(Issue(
@@ -3113,7 +3120,8 @@ def _check_wrong_path_chains(entries: list[dict],
                              isa: str = "",
                              cp_pos_offset: int = 0,
                              templates_by_id: dict | None = None,
-                             marker: bool = False) -> list[Issue]:
+                             marker: bool = False,
+                             wpprune: int = 0) -> list[Issue]:
     """For every CP position predicted to fork, walk the trace's
     ``wp_entries`` for that block's TB and compare the distinct-block
     sequence against the predicted ``wp_chain`` as a prefix.
@@ -3254,6 +3262,14 @@ def _check_wrong_path_chains(entries: list[dict],
             # applies — accept the truncation, exactly as the MIPS
             # libgcc-helper case above.
             if wp_left_user:
+                continue
+            # wpprune: the tracer intentionally drops the wrong path for
+            # cold branches (never-taken / one-directional / monomorphic
+            # indirect).  Pruning is per-execution on live history, which
+            # the static CFG predictor cannot reproduce, so accept a
+            # missing or short chain.  A WP that IS present was already
+            # checked as a correct prefix (first_fail < 0 above).
+            if wpprune > 0:
                 continue
             # System mode (marker): softmmu wrong-path speculation can
             # terminate earlier than user mode at a spec-translation /
@@ -3524,6 +3540,17 @@ def _parse_iframe_rate_from_command(cmd: str) -> int:
     return int(m.group(1)) if m else 100000
 
 
+_WPPRUNE_RE = re.compile(r"wpprune=(\d+)")
+
+
+def _parse_wpprune_from_command(cmd: str) -> int:
+    """Extract the wpprune level from the trace's command string (0 if
+    absent).  When > 0 the tracer intentionally drops the wrong path for
+    cold branches, so WP-coverage checks must tolerate missing chains."""
+    m = _WPPRUNE_RE.search(cmd or "")
+    return int(m.group(1)) if m else 0
+
+
 def _check_header_window(trace_meta: dict,
                          expected_start: int | None,
                          expected_stop: int | None,
@@ -3745,6 +3772,63 @@ def _check_syscall_transitions(entries: list[dict],
         f"(branch out to kernel + return to fall-through)"
         + ("" if verified else "; none returned (terminal exit only)"),
         {"verified": verified})]
+
+
+def _check_call_return_balance(entries: list[dict],
+                               templates_by_id: dict,
+                               trace_meta: dict) -> list[Issue]:
+    """Calls and returns pair up, so their dynamic counts should be in
+    the same ballpark.  A gross imbalance means the classifier is mislabeling
+    one of them (e.g. calls folded into plain jumps, the bug this branch-type
+    split fixes).
+
+    Counts are dynamic: one per CP block execution, keyed by the block's
+    terminal branch type.  Exact equality is not expected even for correct
+    traces — tail calls turn a call+ret into a single ret, PIC/get-pc
+    thunks and setjmp/longjmp skew it, and a windowed trace clips partial
+    call trees — so the check only flags a *gross* mismatch.
+    """
+    bn = trace_meta.get("branch_names") or {}
+    call_ids = {int(k) for k, v in bn.items()
+                if v in ("BRANCH_DIRECT_CALL", "BRANCH_INDIRECT_CALL")}
+    ret_ids = {int(k) for k, v in bn.items() if v == "BRANCH_RETURN"}
+    if not call_ids and not ret_ids:
+        return [Issue("call_return_balance", "info",
+                      "trace declares no call/return branch types")]
+
+    def terminal_bt(t: dict) -> int | None:
+        for ins in reversed(t.get("insns") or []):
+            bt = int(ins.get("branch_type", 0))
+            if bn.get(bt, "BRANCH_NONE") not in ("", "BRANCH_NONE"):
+                return bt
+        return None
+
+    calls = rets = 0
+    for e in entries:
+        t = templates_by_id.get(e["template_id"])
+        if t is None:
+            continue
+        bt = terminal_bt(t)
+        if bt in call_ids:
+            calls += 1
+        elif bt in ret_ids:
+            rets += 1
+
+    # Gross-imbalance gate: one side present in force while the other is
+    # absent or >8x smaller means a classification failure, not normal
+    # tail-call/thunk skew.  Small absolute counts (windowed trace) are
+    # exempt — they carry no statistical weight.
+    hi, lo = max(calls, rets), min(calls, rets)
+    if hi >= 16 and (lo == 0 or hi > lo * 8):
+        return [Issue(
+            "call_return_balance", "error",
+            f"calls={calls} returns={rets}: grossly unbalanced — a call or "
+            f"return branch type is likely misclassified",
+            {"calls": calls, "returns": rets})]
+    return [Issue(
+        "call_return_balance", "info",
+        f"calls={calls} returns={rets} (dynamic, by terminal branch type)",
+        {"calls": calls, "returns": rets})]
 
 
 def _check_regfile_records(body_stats: dict,
@@ -5251,12 +5335,21 @@ def validate(meta_path: Path, trace_path: Path,
     issues += _check_cp_execution_order(correct_path_collapsed,
                                         cp_block_seq_effective)
 
+    # wpprune drops the wrong path for cold branches, so WP-discovered
+    # instructions/chains may be absent; the affected checks relax below.
+    wpprune = _parse_wpprune_from_command(trace_meta.get("command", ""))
+
     # Disassembly-driven first-order sanity checks.
     issues += _check_template_raw_bytes(templates, blocks_by_id)
     issues += _check_block_insn_counts(templates, blocks_by_id, pcmap,
-                                       cp_set)
-    issues += _check_block_assertions(templates, blocks_by_id, pcmap,
-                                      cp_set)
+                                       cp_set, wpprune=wpprune)
+    # The per-block opcode/branch-type coverage assertions assume the full
+    # CP+WP instruction set of each block is present; wpprune drops the
+    # wrong path for cold branches, so a block's WP-only-reached opcodes
+    # can be legitimately absent.  Keep the oracle strict at wpprune=0.
+    if wpprune == 0:
+        issues += _check_block_assertions(templates, blocks_by_id, pcmap,
+                                          cp_set)
     issues += _check_profile_consistency(
         templates, entries, trace_meta.get("body_stats") or {})
 
@@ -5348,10 +5441,14 @@ def validate(meta_path: Path, trace_path: Path,
                                        isa=isa,
                                        cp_pos_offset=cp_pos_offset,
                                        templates_by_id=templates_by_id,
-                                       marker=marker)
+                                       marker=marker,
+                                       wpprune=wpprune)
 
-    issues += _check_indirect_wp_assertions(cp_entries, templates_by_id,
-                                            blocks_by_id, pcmap, isa)
+    # wpprune drops the wrong path for monomorphic indirects, so the
+    # one-target/multi-target WP-shape assertions no longer hold.
+    if wpprune == 0:
+        issues += _check_indirect_wp_assertions(cp_entries, templates_by_id,
+                                                blocks_by_id, pcmap, isa)
 
     # ---- Structural / cadence / format-invariant checks ---------------------
     issues += _check_encoding_map_completeness(templates, trace_meta)
@@ -5371,6 +5468,7 @@ def validate(meta_path: Path, trace_path: Path,
     # plentiful), so walk the full entry stream, not just post-prologue.
     issues += _check_wp_events(body_stats, entries)
     issues += _check_atomic_count(body_stats, entries, templates_by_id)
+    issues += _check_call_return_balance(entries, templates_by_id, trace_meta)
     # System-mode only: the privilege bit and syscall round-trips are
     # meaningful when the trace interleaves a kernel (marker/pin mode).
     if marker:

@@ -165,6 +165,24 @@ enum BranchType {
      * self-loop semantics.
      */
     BRANCH_REP = 6,
+    /*
+     * Calls (link the return address): kept distinct from plain jumps so
+     * a consumer can drive a return-address stack — direct/indirect call
+     * pushes, BRANCH_RETURN pops.  The number of calls is ~the number of
+     * returns (they pair, modulo tail calls / PIC thunks / setjmp).
+     * Direct = static immediate/relative target; indirect = register or
+     * memory target.  Classification:
+     *   - aarch64: bl -> DIRECT, blr family -> INDIRECT (distinct opcodes)
+     *   - mips:    jal/bal/... -> DIRECT, jalr/jialc -> INDIRECT
+     *   - x86:     call/lcall -> DIRECT, refined to INDIRECT on a
+     *              register/memory target (one X86_INS_CALL covers both)
+     *   - riscv:   jal/jalr link-and-jump; the call/jump/return role is
+     *              carried by rd and only visible at run time (one
+     *              insn_id covers jal+j and jalr+jr+ret), so the decoder
+     *              refines from the live mnemonic alias.
+     */
+    BRANCH_DIRECT_CALL = 7,
+    BRANCH_INDIRECT_CALL = 8,
     BRANCH_TYPE_COUNT,
 };
 
@@ -346,6 +364,8 @@ static inline const char *branch_type_name(unsigned id)
     case BRANCH_SYSCALL_TYPE:   return "BRANCH_SYSCALL_TYPE";
     case BRANCH_COND_DIRECT:    return "BRANCH_COND_DIRECT";
     case BRANCH_REP:            return "BRANCH_REP";
+    case BRANCH_DIRECT_CALL:    return "BRANCH_DIRECT_CALL";
+    case BRANCH_INDIRECT_CALL:  return "BRANCH_INDIRECT_CALL";
     default:                    return NULL;
     }
 }

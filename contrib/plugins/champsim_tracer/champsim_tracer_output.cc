@@ -621,7 +621,8 @@ static std::vector<ProfTgt> build_prof_targets(const BBTemplate *tmpl)
     if (last && last->branch_type != BRANCH_NONE) {
         bool indirect =
             last->branch_type == BRANCH_INDIRECT_JUMP ||
-            last->branch_type == BRANCH_RETURN;
+            last->branch_type == BRANCH_RETURN ||
+            last->branch_type == BRANCH_INDIRECT_CALL;
         if (indirect) {
             /* Per-template indirect target distribution.  Overlapping
              * BBs sharing a terminal branch PC each maintain their own
@@ -3456,7 +3457,8 @@ static void profile_branch(BBTemplate *t, uint64_t next_pc, bool wp)
          * br_taken_cp / br_nottaken_cp. */
         bool indirect =
             last->branch_type == BRANCH_INDIRECT_JUMP ||
-            last->branch_type == BRANCH_RETURN;
+            last->branch_type == BRANCH_RETURN ||
+            last->branch_type == BRANCH_INDIRECT_CALL;
         if (indirect && taken) {
             for (uint8_t k = 0; k < p->n_indirect_targets; k++) {
                 if (p->indirect_targets[k].target == next_pc) {

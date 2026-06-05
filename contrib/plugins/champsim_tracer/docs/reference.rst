@@ -183,24 +183,23 @@ records.
    * - ``GEN_OP_BRANCH``
      - Control flow. Direction (taken / not-taken / fall-through) lives
        at runtime; the static branch flavour lives in ``branch_type``.
-       Direct jumps, indirect jumps, conditional jumps, and
-       direct/indirect ``call`` all collapse into this opcode — the
-       ``call`` vs ``jmp`` split is in ``branch_type`` (direct ``call``
-       looks like ``BRANCH_DIRECT_JUMP``; indirect ``call`` is refined to
-       ``BRANCH_INDIRECT_JUMP`` based on operand kind).
+       Jumps, conditional jumps, and calls all share this opcode; the
+       flavour split (``BRANCH_DIRECT_JUMP`` / ``BRANCH_INDIRECT_JUMP`` /
+       ``BRANCH_DIRECT_CALL`` / ``BRANCH_INDIRECT_CALL`` /
+       ``BRANCH_COND_DIRECT`` / ``BRANCH_RETURN``) is in ``branch_type``.
+       Calls are kept distinct from jumps so a consumer can drive a
+       return-address stack (see the branch-type table below).
    * - ``GEN_OP_RET``
      - Return from call. Always paired with ``branch_type =
        BRANCH_RETURN``. x86 ``ret`` / ``retf*`` / ``iret*`` get this;
        AArch64 ``ret`` gets this; RISC-V ``cm.popret*`` / ``dret`` and
-       MIPS exception-return ``eret`` / ``deret`` get this. *Plain*
-       RISC-V ``ret`` (the ``jalr x0, ra, 0`` pseudo) and MIPS ``jr $ra``
-       are classified by their canonical Capstone insn-id as
-       ``GEN_OP_BRANCH`` with ``branch_type = BRANCH_INDIRECT_JUMP``
-       because the classifier does not inspect the ``ra`` register
-       operand to recognize them as returns. This is a deliberate
-       trade-off: keeps the classification table operand-agnostic at the
-       cost of conflating RISC-V/MIPS returns with general indirect jumps
-       in the trace.
+       MIPS exception-return ``eret`` / ``deret`` get this.  Plain RISC-V
+       ``ret`` (``jalr x0, ra, 0``) is recognized too — Capstone prints
+       the ``ret`` alias and the decoder maps it to ``BRANCH_RETURN`` —
+       but MIPS ``jr $ra`` is **not**: Capstone prints it as ``jr`` (no
+       return alias) and the classifier does not inspect the ``ra``
+       operand, so a MIPS function return is classified as a general
+       ``BRANCH_INDIRECT_JUMP``.
    * - ``GEN_OP_FP_ADD``
      - Floating-point add.
    * - ``GEN_OP_FP_SUB``
@@ -373,28 +372,37 @@ Branch types (``BranchType``)
        last instruction (after delay-slot normalization, where
        applicable).
    * - ``BRANCH_DIRECT_JUMP``
-     - Direct target encoded in the instruction.  Covers
-       unconditional direct jumps (``jmp imm``), direct ``call``
-       (which is also a control-transfer-with-immediate-target),
-       and — when the per-ISA classifier flagged the row with
-       ``MF_CONDITIONAL`` *but* the table classified the branch as
-       ``DIRECT_JUMP`` — conditional direct branches that didn't
-       get the dedicated ``COND_DIRECT`` classification.  WP-target
-       resolution treats a taken instance as fall-through; if the
-       instance was *also* conditional and fell through, the WP
-       target is the translator-resolved static target reported by
-       ``qemu_plugin_insn_branch_target_pc`` (not Capstone's branch
-       immediate, whose encoding is ISA-specific).
+     - Plain jump with a direct target encoded in the instruction
+       (``jmp imm``), plus — when the per-ISA classifier flagged the
+       row ``MF_CONDITIONAL`` *but* the table left it ``DIRECT_JUMP``
+       — conditional direct branches that didn't get the dedicated
+       ``COND_DIRECT`` classification.  Calls have their own types
+       (below).  WP-target resolution treats a taken instance as
+       fall-through; if the instance was *also* conditional and fell
+       through, the WP target is the translator-resolved static
+       target reported by ``qemu_plugin_insn_branch_target_pc`` (not
+       Capstone's branch immediate, whose encoding is ISA-specific).
    * - ``BRANCH_INDIRECT_JUMP``
-     - Computed target.  Covers indirect jumps and indirect
-       ``call`` (the x86 refine callback rewrites the table's
-       default ``DIRECT_JUMP`` to ``INDIRECT_JUMP`` when the call's
-       first operand isn't an immediate).  WP-target picking: with
-       ≥2 distinct historic targets observed, return the most-
-       frequent target other than this execution's actual one;
-       with one observed target, fall back to the fall-through PC
-       (so single-target indirect calls in shared-library trampolines
-       don't produce all-CP WP slices).
+     - Plain jump to a computed (register/memory) target.  WP-target
+       picking: with ≥2 distinct historic targets observed, return
+       the most-frequent target other than this execution's actual
+       one; with one observed target, fall back to the fall-through
+       PC (so single-target indirect jumps in trampolines don't
+       produce all-CP WP slices).
+   * - ``BRANCH_DIRECT_CALL``
+     - Call with a static (immediate/relative) target — links the
+       return address.  aarch64 ``bl``, mips ``jal``/``bal``, x86
+       ``call imm``, riscv ``jal`` (rd != x0).  An unconditional
+       direct call has a single target, so it produces no wrong
+       path.  Pairs ~1:1 with ``BRANCH_RETURN`` (modulo tail calls /
+       PIC thunks / setjmp).
+   * - ``BRANCH_INDIRECT_CALL``
+     - Call to a computed (register/memory) target.  aarch64
+       ``blr``, mips ``jalr``/``jialc``, x86 ``call reg``/``call mem``
+       (the per-row refine rewrites ``DIRECT_CALL`` to this when the
+       target operand isn't an immediate), riscv ``jalr`` (rd != x0).
+       WP-target picking is the indirect rule (grouped with
+       ``BRANCH_INDIRECT_JUMP`` / ``BRANCH_RETURN``).
    * - ``BRANCH_RETURN``
      - Indirect via return address.  Grouped with
        ``BRANCH_INDIRECT_JUMP`` in WP-target picking — same rule.

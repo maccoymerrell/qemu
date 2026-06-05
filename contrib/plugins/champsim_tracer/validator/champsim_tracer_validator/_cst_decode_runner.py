@@ -168,7 +168,8 @@ def _find_cst_decode() -> Path:
 # ---------------------------------------------------------------------------
 
 _BB_HEAD_RE  = re.compile(
-    r"^BB(\d+) \[pc=0x([0-9a-f]+), insns=(\d+), fall_through=0x([0-9a-f]+)\]$"
+    r"^BB(\d+) \[pc=0x([0-9a-f]+), insns=(\d+), fall_through=0x([0-9a-f]+)"
+    r"(, system)?\]$"
 )
 # Run-aggregated profile block (format §6), emitted as part of each BB.
 _PROF_EXEC_RE = re.compile(
@@ -344,6 +345,7 @@ def _parse_templates(lines: list[str], i: int,
         start_pc = int(m.group(2), 16)
         n_insns = int(m.group(3))
         ft_pc = int(m.group(4), 16)
+        is_system = m.group(5) is not None
         i += 1
         # Optional terminal-branch target list (header): "  targets:
         # 0x.. 0x..".  n_targets is implicit in the count of pcs.
@@ -452,6 +454,7 @@ def _parse_templates(lines: list[str], i: int,
             "start_pc": start_pc,
             "n_insns": n_insns,
             "fall_through_pc": ft_pc,
+            "is_system": is_system,
             "target_pcs": target_pcs,
             "symbol_name": symbol,
             "insns": insns,

@@ -788,6 +788,13 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                 bb_bytes.data(),
                 g_features.reg_data ? bb_regnames.data() : nullptr,
                 bb_symbol_name, fall_through);
+            /* Privilege seed for WP-only-discovered BBs.  The WP walk
+             * can speculate across the privilege boundary, so this is
+             * only a guess; a correct-path finalize of the same BB
+             * overrides and latches it (see BBTemplate::is_system). */
+            if (bb_tmpl && !bb_tmpl->is_system_cp_confirmed) {
+                bb_tmpl->is_system = cur->is_system;
+            }
             g_mutex_unlock(&data_lock);
 
             /*

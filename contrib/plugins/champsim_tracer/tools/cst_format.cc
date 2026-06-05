@@ -108,6 +108,7 @@ void parse_templates_at(Reader &r,
             I.has_imm            = (flags & ids.insn_flag_has_imm) != 0;
             I.is_atomic          = (flags & ids.insn_flag_atomic) != 0;
             I.lane_parallel      = (flags & ids.insn_flag_lane_parallel) != 0;
+            I.is_system          = (flags & ids.insn_flag_system) != 0;
             if (I.has_imm) I.imm = sub.sleb();
             uint8_t insn_size = sub.u8();
             I.raw_bytes.resize(insn_size);
@@ -229,6 +230,23 @@ static void resolve_optional(const std::unordered_map<uint64_t,
     *out = 0xFFFFu;   /* absent: out-of-range sentinel */
 }
 
+/* Optional bit-mask resolution: a flag bit added after a trace was
+ * written is simply absent from that trace's map, and resolves to 0 so
+ * the bit never tests set.  (resolve_optional's 0xFFFF sentinel is for
+ * field IDs, not u8 masks.) */
+static void resolve_optional_mask(const std::unordered_map<uint64_t,
+                                                           std::string> &m,
+                                  const char *want, uint8_t *out)
+{
+    for (const auto &kv : m) {
+        if (kv.second == want) {
+            *out = (uint8_t)kv.first;
+            return;
+        }
+    }
+    *out = 0;
+}
+
 /* Populate @ids from the well-known names in @maps.  Throws on any
  * missing name — the wire format is the single source of truth, so a
  * trace that omits a name the decoder needs is malformed. */
@@ -307,6 +325,8 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
                 &ids->insn_flag_lane_parallel);
     resolve_one(maps.insn_flag, "insn_flag", "CST_INSN_FLAG_HAS_DEP_BLOCK",
                 &ids->insn_flag_has_dep_block);
+    resolve_optional_mask(maps.insn_flag, "CST_INSN_FLAG_SYSTEM",
+                          &ids->insn_flag_system);
 
     /* dep_block_flag (bit masks inside the optional dependency sub-block) */
     resolve_one(maps.dep_block_flag, "dep_block_flag",

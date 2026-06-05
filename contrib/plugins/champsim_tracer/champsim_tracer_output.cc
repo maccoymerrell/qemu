@@ -431,6 +431,7 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         { CST_INSN_FLAG_VEC, "CST_INSN_FLAG_VEC" },
         { CST_INSN_FLAG_LANE_PARALLEL, "CST_INSN_FLAG_LANE_PARALLEL" },
         { CST_INSN_FLAG_HAS_DEP_BLOCK, "CST_INSN_FLAG_HAS_DEP_BLOCK" },
+        { CST_INSN_FLAG_SYSTEM, "CST_INSN_FLAG_SYSTEM" },
     };
     static const EncodingMapEntry dep_block_flag_entries[] = {
         { CST_DEP_BLOCK_HAS_REG,  "CST_DEP_BLOCK_HAS_REG" },
@@ -694,6 +695,9 @@ static void write_insn_descriptors(BitWriter *sub, const BBTemplate *tmpl)
         }
         if (fld->has_reg_deps || fld->has_addr_deps) {
             flags |= CST_INSN_FLAG_HAS_DEP_BLOCK;
+        }
+        if (tmpl->is_system) {
+            flags |= CST_INSN_FLAG_SYSTEM;
         }
         bw_write_u8(sub, flags);
 

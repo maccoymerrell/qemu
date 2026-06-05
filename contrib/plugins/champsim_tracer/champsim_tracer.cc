@@ -1781,6 +1781,17 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         if (asid == pinned_asid && priv == 0) {
             g_user_icount += delta;
         }
+        /* Stamp the executing fragment's privilege from the LIVE
+         * correct-path context (authoritative, latched), overriding any
+         * translation-time stamp: the shared true-BB cache can be
+         * seeded first by a wrong-path session that spec-translated this
+         * PC at the kernel's CPL (a kernel branch speculating into user
+         * code), mis-marking it system.  CP execution is the ground
+         * truth.  See BBTemplate::is_system. */
+        if (cur_tb_tmpl) {
+            cur_tb_tmpl->is_system = priv != 0;
+            cur_tb_tmpl->is_system_cp_confirmed = true;
+        }
         if (asid != pinned_asid) {
             g_cp_prev_tb_template = nullptr;
             return;

@@ -455,6 +455,16 @@ BBTemplate *BBTemplateCache::get_or_create_bb_template(
                                            insn_sizes, insn_bytes,
                                            regname_ptrs,
                                            symbol_name, final_ft);
+    /* Privilege context rides from the translation-time stamp on the
+     * fragments onto the assembled true-BB.  Fragments of one BB share
+     * one privilege level (the transition instruction seals the BB).
+     * ASSIGN and latch: correct-path fragments are translated in the
+     * context that really executes this code, so they override and
+     * then lock out any wrong-path seed (see BBTemplate::is_system). */
+    if (tmpl && n_fragments > 0) {
+        tmpl->is_system = fragments[0]->is_system;
+        tmpl->is_system_cp_confirmed = true;
+    }
     /*
      * Propagate the REP self-loop sub-template from the last fragment
      * (the TB ending in the REP string op) onto the assembled BB so
@@ -505,6 +515,11 @@ BBTemplate *BBTemplateCache::create_tb_template(
     tmpl->start_pc = start_pc;
     tmpl->n_insns = n_insns;
     tmpl->fall_through_pc = fall_through_pc;
+    /* Privilege of the code being translated — see BBTemplate::is_system.
+     * Translation runs in the context about to execute this TB, so the
+     * level read here belongs to this code (a seal-time read would see
+     * the successor's context instead).  User mode always reads 0. */
+    tmpl->is_system = qemu_plugin_get_priv_level() != 0;
     tmpl->insn_pcs = g_new0(uint64_t, n_insns);
     tmpl->insn_sizes = g_new0(uint8_t, n_insns);
     tmpl->insn_bytes = g_new0(uint8_t, n_insns * MAX_INSN_BYTES);

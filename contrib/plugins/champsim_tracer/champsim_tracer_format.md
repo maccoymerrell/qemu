@@ -750,21 +750,21 @@ field-delta stream.  The byte is gated on `CST_FLAG_REG_DATA` and is
 otherwise absent; on ISAs with no integer flags reg (RISC-V, MIPS)
 the FID never appears.
 
-Canonical metaflags bit layout (1 byte; computed by the plugin via a
-per-ISA bit shuffle, not directly readable from QEMU):
+The metaflags byte carries an ISA-agnostic condition-flags summary,
+computed by the plugin via a per-ISA shuffle of the guest's native
+flags register (not directly readable from QEMU).  Each flag is
+resolved through the `metaflags` encoding map — the trace assigns the
+bit, a reader never assumes a position:
 
-```
-bit 0  CST_METAFLAGS_Z   zero / equal
-bit 1  CST_METAFLAGS_N   negative / sign
-bit 2  CST_METAFLAGS_C   unsigned carry / borrow
-bit 3  CST_METAFLAGS_V   signed overflow
-bit 4  CST_METAFLAGS_P   parity (x86 only)
-bits 5..7                reserved, written as 0
-```
+- `CST_METAFLAGS_Z` — zero / equal
+- `CST_METAFLAGS_N` — negative / sign
+- `CST_METAFLAGS_C` — unsigned carry / borrow
+- `CST_METAFLAGS_V` — signed overflow
+- `CST_METAFLAGS_P` — parity (x86 only)
 
-x86 `EFLAGS` bit map: CF→C, PF→P, ZF→Z, SF→N, OF→V.  AArch64
-`NZCV` (top nibble of CPSR) bit map: N→N, Z→Z, C→C, V→V; the P bit
-is not set.
+The guest-to-canonical correspondence is by flag, not by position: x86
+`EFLAGS` CF→C, PF→P, ZF→Z, SF→N, OF→V; AArch64 `NZCV` (top nibble of
+CPSR) N→N, Z→Z, C→C, V→V (no parity).
 
 Readers reject any file whose magic disagrees with `CST_MAGIC`.
 
@@ -774,47 +774,49 @@ each delta section.  CST_FLAG_PROFILE and CST_FLAG_WP are
 structural: they gate the presence of whole blocks (the
 per-template profile block — Step 4.6 / §6, and the per-entry
 wrong-path chain + events sections — Steps 6.4–6.5), exactly as the
-per-insn CST_INSN_FLAG_HAS_DEP_BLOCK gates the dep sub-block.
-Resolve every bit through the `header_flag` map.
+per-insn CST_INSN_FLAG_HAS_DEP_BLOCK gates the dep sub-block.  Resolve
+every flag through the `header_flag` map — the trace assigns each bit,
+a reader never assumes a position:
 
-```
-bit 0  CST_FLAG_MEM_DATA   LOAD_DATA / STORE_DATA may appear
-bit 1  CST_FLAG_REG_DATA   DST_REG fields may appear
-bit 2  CST_FLAG_PROFILE    per-template §6 profile block present
-bit 3  CST_FLAG_WP         per-entry wrong-path chain + events present
-bits 4..7                  reserved, written as 0
-```
+- `CST_FLAG_MEM_DATA` — LOAD_DATA / STORE_DATA may appear
+- `CST_FLAG_REG_DATA` — DST_REG fields may appear
+- `CST_FLAG_PROFILE` — per-template §6 profile block present
+- `CST_FLAG_WP` — per-entry wrong-path chain + events present
 
-Per-instruction template flags:
+Per-instruction template flags, resolved through the `insn_flag` map
+(again: names, not fixed positions):
 
-```
-bit 0  CST_INSN_FLAG_BRANCH_COND
-bit 1  CST_INSN_FLAG_HAS_IMM
-bit 2  CST_INSN_FLAG_ATOMIC          atomic / locked memory op
-bit 3  reserved, written as 0
-bit 4  CST_INSN_FLAG_VEC             per-operand lane masks emitted
-bit 5  CST_INSN_FLAG_LANE_PARALLEL   lane k of each dst depends only
-                                     on lane k of every src
-bit 6  CST_INSN_FLAG_HAS_DEP_BLOCK   intra-instruction dep mask
-bit 7  reserved, written as 0
-```
+- `CST_INSN_FLAG_BRANCH_COND` — conditional branch
+- `CST_INSN_FLAG_HAS_IMM` — carries an immediate
+- `CST_INSN_FLAG_ATOMIC` — atomic / locked memory op
+- `CST_INSN_FLAG_VEC` — per-operand lane masks emitted
+- `CST_INSN_FLAG_LANE_PARALLEL` — lane k of each dst depends only on
+  lane k of every src
+- `CST_INSN_FLAG_HAS_DEP_BLOCK` — intra-instruction dep mask present
+- `CST_INSN_FLAG_SYSTEM` — privileged (non-user) execution context;
+  uniform across a template, always clear in user-mode traces
+
+`CST_INSN_FLAG_SYSTEM` distinguishes the kernel instructions of a
+system-mode trace (the traced-but-not-counted privileged execution of
+the pinned process, per the marker count set) from its user
+instructions.  It is uniform across a template — a true basic block
+never straddles a privilege transition, since the transition
+instruction (syscall / interrupt entry / return) seals the block.
+User-mode traces, and traces predating the flag, omit the name from the
+`insn_flag` map and never set the bit; a consumer resolves an absent
+name as "always user".
 
 `dep_block_flag` map (only inspected when `CST_INSN_FLAG_HAS_DEP_BLOCK`
-is set on the per-insn flag byte):
+is set on the per-insn flag byte), resolved through the
+`dep_block_flag` map:
 
-```
-bit 0  CST_DEP_BLOCK_HAS_REG    dst_dep + store_data_dep present
-bit 1  CST_DEP_BLOCK_HAS_ADDR   load_addr_dep + store_addr_dep present
-bits 2..7  reserved
-```
+- `CST_DEP_BLOCK_HAS_REG` — dst_dep + store_data_dep present
+- `CST_DEP_BLOCK_HAS_ADDR` — load_addr_dep + store_addr_dep present
 
-Wrong-path event flags:
+Wrong-path event flags, resolved through the `wp_event_flag` map:
 
-```
-bit 0  CST_WP_EVENT_TRANSLATION_UNAVAIL
-bit 1  CST_WP_EVENT_FAULT
-bits 2..7  reserved, written as 0
-```
+- `CST_WP_EVENT_TRANSLATION_UNAVAIL`
+- `CST_WP_EVENT_FAULT`
 
 ## 3. Header
 

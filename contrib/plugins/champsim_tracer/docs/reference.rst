@@ -602,8 +602,12 @@ mapping.
        ``CST_FID_INSN_FLAGS``
      - Scalar delta — generic-opcode / branch-type / per-insn
        flag-byte override vs the template baseline.  The flag byte
-       packs ``BRANCH_COND`` | ``HAS_IMM`` | ``ATOMIC`` | ``VEC`` |
-       ``LANE_PARALLEL`` | ``HAS_DEP_BLOCK``.
+       carries ``BRANCH_COND``, ``HAS_IMM``, ``ATOMIC``, ``VEC``,
+       ``LANE_PARALLEL``, ``HAS_DEP_BLOCK``, and ``SYSTEM``
+       (privileged execution context — set on the kernel instructions
+       of a system-mode trace, always clear in user mode).  Each bit
+       is resolved through the ``insn_flag`` encoding map; the trace
+       assigns the positions, a reader never hard-codes them.
    * - ``CST_FID_INSN_IMMEDIATE`` / ``CST_FID_INSN_SIZE``
      - Scalar delta — signed immediate / instruction byte length.
    * - ``CST_FID_EXTENDED``

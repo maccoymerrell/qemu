@@ -103,6 +103,8 @@ struct ResolvedIds {
     uint8_t insn_flag_vec           = 0;
     uint8_t insn_flag_lane_parallel = 0;
     uint8_t insn_flag_has_dep_block = 0;
+    /* Optional (absent in traces predating the bit): 0 = never set. */
+    uint8_t insn_flag_system        = 0;
 
     /* dep_block_flag map: bit masks inside the optional dep sub-block
      * header (only inspected when insn_flag_has_dep_block is set on
@@ -379,6 +381,10 @@ struct InsnTemplate {
     bool     has_imm = false;
     int64_t  imm = 0;
     bool     is_atomic = false;
+    /* CST_INSN_FLAG_SYSTEM: privileged (non-user) execution context.
+     * Uniform across a template; always false in user-mode traces and
+     * in traces predating the flag. */
+    bool     is_system = false;
     /*
      * Template-static MAX memop counts.  Runtime counts arrive via
      * CST_FID_N_LOADS/N_STORES and may be smaller but never larger.

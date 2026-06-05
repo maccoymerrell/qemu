@@ -1629,9 +1629,11 @@ void render_templates_only(FILE *out, const cst::Header &h,
         if (!t.symbol_name.empty()) {
             std::fprintf(out, " <%s>", t.symbol_name.c_str());
         }
-        std::fprintf(out, " (insns=%zu fall_through=0x%llx)\n",
+        std::fprintf(out, " (insns=%zu fall_through=0x%llx%s)\n",
                      t.insns.size(),
-                     (unsigned long long)t.fall_through_pc);
+                     (unsigned long long)t.fall_through_pc,
+                     (!t.insns.empty() && t.insns[0].is_system)
+                         ? " system" : "");
         emit_bb_profile_lines(out, h, t, "  ");
         for (size_t k = 0; k < t.insns.size(); k++) {
             const cst::InsnProfileInfo *ip =
@@ -1906,11 +1908,13 @@ void emit_legacy_templates(FILE *out, const cst::Header &h,
     std::fprintf(out, "TEMPLATES\n---------\n");
     for (const auto &t : templates) {
         std::fprintf(out,
-                     "BB%u [pc=0x%llx, insns=%zu, fall_through=0x%llx]\n",
+                     "BB%u [pc=0x%llx, insns=%zu, fall_through=0x%llx%s]\n",
                      t.template_id,
                      (unsigned long long)t.start_pc,
                      t.insns.size(),
-                     (unsigned long long)t.fall_through_pc);
+                     (unsigned long long)t.fall_through_pc,
+                     (!t.insns.empty() && t.insns[0].is_system)
+                         ? ", system" : "");
         if (!t.target_pcs.empty()) {
             std::fprintf(out, "  targets:");
             for (uint64_t tp : t.target_pcs) {

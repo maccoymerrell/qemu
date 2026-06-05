@@ -111,7 +111,15 @@ extern "C" {
  *                             (consumer can model per-lane chains).
  *                             LANE_PARALLEL implies VEC.
  *   bit 6    HAS_DEP_BLOCK
- *   bit 7    (reserved)
+ *   bit 7    SYSTEM         — privileged (non-user) execution context
+ *
+ * SYSTEM marks instructions translated at a privilege level other
+ * than user (qemu_plugin_get_priv_level() != 0): in a system-mode
+ * trace these are the traced-but-not-counted kernel instructions of
+ * the pinned process (see the marker count set).  Uniform across a
+ * template — a true BB never straddles a privilege transition, since
+ * the transition instruction (syscall/iret/interrupt entry) seals
+ * the BB.  Always clear in user-mode traces.
  *
  * VEC and LANE_PARALLEL are orthogonal:
  *   - VEC: per-slot lane bitmaps present on the wire (useful even for
@@ -165,6 +173,7 @@ extern "C" {
  * the per-insn flag byte doesn't grow.
  */
 #define CST_INSN_FLAG_HAS_DEP_BLOCK (1u << 6)
+#define CST_INSN_FLAG_SYSTEM        (1u << 7)
 /* bit 7 reserved */
 
 /* dep_block_flags bits inside the optional dependency sub-block. */
@@ -659,6 +668,22 @@ struct BBTemplate {
      * awaiting a delay-slot landing, or is a non-terminal fragment.
      * Unused (TB_TERMINUS_NONE) on assembled true-BB templates. */
     uint8_t terminus;
+    /* Privileged (non-user) execution context.  Stamped on TB fragment
+     * templates at translation time from qemu_plugin_get_priv_level()
+     * (the seal happens in the SUCCESSOR's context — a syscall-ended BB
+     * seals while the kernel runs — so translation is the only point
+     * where the privilege belongs to this code).  Propagated onto the
+     * assembled true-BB and serialized as CST_INSN_FLAG_SYSTEM on every
+     * insn descriptor.  Always false in user mode.
+     *
+     * Correct-path stamps are authoritative (CP translates in the
+     * context that really executes the code) and latch
+     * is_system_cp_confirmed; a wrong-path stamp is only a seed for
+     * WP-only-discovered BBs — the WP walk can speculate across the
+     * privilege boundary and spec-translate code in the wrong
+     * context, so it must never override a CP-confirmed value. */
+    bool is_system;
+    bool is_system_cp_confirmed;
     /* Linked list of sibling fragments produced from the same QEMU TB
      * by the mid-TB-branch splitter.  Head is what vcpu_tb_trans
      * attached as the per-TB exec-cb udata; vcpu_tb_exec and the WP

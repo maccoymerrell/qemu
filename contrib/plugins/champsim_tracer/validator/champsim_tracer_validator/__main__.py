@@ -475,17 +475,21 @@ def cmd_validate(args, isa: str | None = None) -> int:
         print(f"validate[{isa}]: SKIP  missing inputs "
               f"(trace={trace.is_file()}, meta={meta.is_file()})")
         return 0
-    # Symbol-based start: validator can't know the exact icount the
-    # symbol resolves to, so disable the strict header_window check.
+    # Symbol-based start, or system-mode marker: validator can't know the
+    # exact icount the trigger resolves to, so disable the strict
+    # header_window start check (the window's total budget is in user
+    # instructions in marker mode, so the raw-icount total is skipped too).
     start_sym = getattr(args, "start_symbol", None)
-    expected_start = None if start_sym else 0
+    marker = getattr(args, "system", False)
+    expected_start = None if (start_sym or marker) else 0
     report = V.validate(meta, trace, bin_path,
                         wp_insn_budget=getattr(args, "depth", 64),
                         expected_start=expected_start,
-                        expected_stop=getattr(args, "stop", None),
+                        expected_stop=None if marker else getattr(args, "stop", None),
                         expected_warmup=0,
                         expected_threads=1,
-                        start_symbol=start_sym)
+                        start_symbol=start_sym,
+                        marker=marker)
     print(report.summary())
     return 1 if report.errors() else 0
 
@@ -501,14 +505,12 @@ def cmd_all(args) -> int:
         if cmd_trace(args, isa) != 0:
             rc_total = 1
             continue
-        if getattr(args, "system", False):
-            # System-mode traces include the pinned process's kernel calls,
-            # which have no workload ground truth; analyze/validate parity is
-            # gated on the count-set (user-space-only window counting). Until
-            # then `all --system` stops after producing the trace.
-            print(f"analyze[{isa}]: SKIP (system mode; ground-truth parity "
-                  f"pending the user-space count-set)")
-            continue
+        # System-mode traces interleave the pinned process's kernel calls,
+        # which carry CST_INSN_FLAG_SYSTEM and have no workload ground truth.
+        # analyze maps only the user blocks (kernel PCs aren't in the binary,
+        # so they get no ground-truth spans); validate aligns the user
+        # subsequence against correct_path and structurally checks the
+        # syscall->kernel->user transitions.
         cmd_analyze(args, isa)
         if cmd_validate(args, isa) != 0:
             rc_total = 1

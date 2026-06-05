@@ -277,6 +277,10 @@ def _check_template_raw_bytes(templates: list[dict],
     issues: list[Issue] = []
     mismatches = 0
     for t in templates:
+        # Kernel / kernel-context (CST_INSN_FLAG_SYSTEM) templates are not
+        # in the compiled binary — no ground-truth bytes to compare.
+        if t.get("is_system"):
+            continue
         for ins in t.get("insns", []):
             gt = gt_by_pc.get(int(ins["pc"]))
             if gt is None:
@@ -314,6 +318,13 @@ def _check_block_insn_counts(templates: list[dict],
     """
     seen_pcs: dict[int, set[int]] = {bid: set() for bid in cp_set}
     for t in templates:
+        # Skip kernel / kernel-context (CST_INSN_FLAG_SYSTEM) templates:
+        # a wrong-path session can spec-translate into a user block at a
+        # mid-instruction PC and, flagged system, would inflate the
+        # distinct-PC count for that block.  Only correct-path user
+        # templates correspond to the compiled binary's blocks.
+        if t.get("is_system"):
+            continue
         for ins in t.get("insns", []):
             bid = pcmap.lookup(ins["pc"])
             if bid is not None and bid in seen_pcs:
@@ -388,6 +399,11 @@ def _check_block_assertions(templates: list[dict],
     # Gather all trace insns per CP block.
     insns_by_block: dict[int, list[dict]] = {bid: [] for bid in cp_set}
     for t in templates:
+        # Skip kernel / kernel-context (CST_INSN_FLAG_SYSTEM) templates —
+        # the per-block encoding assertions describe the compiled binary's
+        # user blocks, not wrong-path strays into them.
+        if t.get("is_system"):
+            continue
         for ins in t.get("insns", []):
             bid = pcmap.lookup(ins["pc"])
             if bid is not None and bid in insns_by_block:
@@ -2090,6 +2106,12 @@ def _check_static_reg_sets(
                 out.add(reg_name)
 
     for tmpl in templates:
+        # Kernel (CST_INSN_FLAG_SYSTEM) templates of a system-mode trace
+        # are not in the compiled binary, so there is no ground truth to
+        # compare their register sets against — skip them, matching the
+        # user-subsequence alignment the rest of the validator performs.
+        if tmpl.get("is_system"):
+            continue
         tid = int(tmpl["template_id"])
         for idx, ins in enumerate(tmpl.get("insns", [])):
             raw = ins.get("raw_bytes")
@@ -3089,7 +3111,9 @@ def _check_wrong_path_chains(entries: list[dict],
                              wp_insn_budget: int = 64,
                              helper_leaf_n_insns: int = 0,
                              isa: str = "",
-                             cp_pos_offset: int = 0) -> list[Issue]:
+                             cp_pos_offset: int = 0,
+                             templates_by_id: dict | None = None,
+                             marker: bool = False) -> list[Issue]:
     """For every CP position predicted to fork, walk the trace's
     ``wp_entries`` for that block's TB and compare the distinct-block
     sequence against the predicted ``wp_chain`` as a prefix.
@@ -3163,11 +3187,17 @@ def _check_wrong_path_chains(entries: list[dict],
         exp_chain = _trim_by_insn_budget(exp_chain, wp_insn_budget)
         wp_raw: list[int] = []
         actual_sim_insns = 0
+        wp_left_user = False   # entered kernel, or faulted out of user CFG
         for wp in e.get("wp_entries", []):
             wp_raw.extend(
                 bid for (bid, _) in template_runs.get(wp["template_id"], [])
             )
             actual_sim_insns += int(wp.get("n_insns", 0) or 0)
+            if wp.get("fault") or wp.get("translation_unavailable"):
+                wp_left_user = True
+            wt = (templates_by_id or {}).get(wp["template_id"])
+            if wt is not None and wt.get("is_system"):
+                wp_left_user = True
         actual_wp = _collapse_runs(wp_raw)
 
         n = min(len(actual_wp), len(exp_chain))
@@ -3216,6 +3246,24 @@ def _check_wrong_path_chains(entries: list[dict],
             # as the plugin's sim_insns reached the depth budget.
             # All other ISAs must match the predicted length exactly.
             if isa.startswith("mips") and actual_sim_insns >= wp_insn_budget:
+                continue
+            # System mode: the wrong path speculatively crossed into the
+            # kernel (CST_INSN_FLAG_SYSTEM blocks the validator can't
+            # enumerate from blk_* symbols) or faulted out of the user
+            # CFG.  Either way the user-CFG-derived prediction no longer
+            # applies — accept the truncation, exactly as the MIPS
+            # libgcc-helper case above.
+            if wp_left_user:
+                continue
+            # System mode (marker): softmmu wrong-path speculation can
+            # terminate earlier than user mode at a spec-translation /
+            # flush / gated-instruction abort point the user-CFG
+            # predictor does not model.  The emitted blocks were already
+            # verified to be a correct prefix of the prediction
+            # (first_fail < 0 above), so the speculation is correct —
+            # just shorter.  Accept the shorter clean prefix; user-mode
+            # traces keep the exact-length requirement.
+            if marker and actual_wp:
                 continue
             issues.append(Issue(
                 "wrong_path_chains", "error",
@@ -3480,28 +3528,31 @@ def _check_header_window(trace_meta: dict,
                          expected_start: int | None,
                          expected_stop: int | None,
                          expected_warmup: int | None,
-                         start_symbol: str | None = None) -> list[Issue]:
+                         start_symbol: str | None = None,
+                         marker: bool = False) -> list[Issue]:
     """Cross-check the header's start/warmup/total_target_insns
     against the values the caller asked the tracer to use.
 
-    When @start_symbol is set, the exact icount the symbol resolves
-    to is not predictable, so this check only asserts start_insn > 0
-    and the total/warmup invariants."""
+    When @start_symbol is set, or @marker is true (system-mode: the
+    window opens at the guest marker's icount), the exact start icount
+    is not predictable, so this check only asserts start_insn > 0 and
+    the warmup invariant."""
     issues: list[Issue] = []
     actual_start  = int(trace_meta.get("start_insn", 0))
     actual_warm   = int(trace_meta.get("warmup_insns", 0))
     actual_total  = int(trace_meta.get("total_target_insns", 0))
 
-    if start_symbol is not None:
-        # Symbol-based start: just assert that the trace actually fired
-        # (start_insn > 0 means the symbol was reached).
+    if start_symbol is not None or marker:
+        # Dynamic start (symbol hit / marker fired): the exact icount
+        # is unpredictable; assert only that the window actually opened.
         if actual_start == 0:
+            trigger = (f"start-symbol={start_symbol!r}" if start_symbol
+                       else "the guest trace marker")
             issues.append(Issue(
                 "header_window", "error",
-                f"trace was launched with start-symbol={start_symbol!r} "
-                f"but start_insn=0 in header; the symbol was never hit "
-                f"(typo or weak/visibility-hidden symbol?)",
-                {"start_symbol": start_symbol,
+                f"trace was launched with {trigger} but start_insn=0 in "
+                f"header; the trigger was never hit",
+                {"start_symbol": start_symbol, "marker": marker,
                  "actual_start": actual_start},
             ))
     elif expected_start is not None and actual_start != expected_start:
@@ -3610,6 +3661,90 @@ def _check_iframe_cadence(body_stats: dict,
          "max_template_hits": max_hits},
     ))
     return issues
+
+
+def _check_syscall_transitions(entries: list[dict],
+                               templates_by_id: dict,
+                               trace_meta: dict) -> list[Issue]:
+    """System-mode privilege-transition check (CST_INSN_FLAG_SYSTEM).
+
+    A user-mode ``syscall`` transfers control to the kernel and, on
+    return, resumes at the instruction *after* the syscall (the block's
+    fall-through).  In the CP stream this appears as:
+
+        user block ending in a SYSCALL branch  (is_system == False)
+          -> one or more kernel blocks          (is_system == True)
+          -> a user block starting at the syscall's fall_through_pc
+
+    For every such user syscall that the trace resumes from, assert the
+    branch-out lands in the kernel and the return lands on the
+    fall-through.  The terminal process-exit syscall never returns, so a
+    syscall at end-of-trace (no following user block) is expected and not
+    flagged.  No user syscalls at all -> info (e.g. a fault-only
+    workload).
+    """
+    branch_names = trace_meta.get("branch_names") or {}
+    # The branch_type id naming a syscall (self-describing map; the name
+    # is BRANCH_SYSCALL_TYPE — match the SYSCALL substring so a rename
+    # can't silently disable the check).
+    syscall_ids = {int(k) for k, v in branch_names.items()
+                   if "SYSCALL" in str(v)}
+    if not syscall_ids:
+        return [Issue("syscall_transitions", "info",
+                      "trace declares no syscall branch type")]
+
+    def ends_in_syscall(t: dict) -> bool:
+        ins = t.get("insns") or []
+        return bool(ins) and int(ins[-1].get("branch_type", 0)) in syscall_ids
+
+    issues: list[Issue] = []
+    verified = 0
+    pending_ft: int | None = None      # fall-through we must return to
+    pending_pc: int | None = None      # the syscall block (for messages)
+    saw_kernel = False
+    for e in entries:
+        t = templates_by_id.get(e["template_id"])
+        if t is None:
+            continue
+        is_sys = bool(t.get("is_system"))
+        if pending_ft is not None:
+            # We are between a user syscall and its return to user.
+            if is_sys:
+                saw_kernel = True
+                continue
+            # First user block after the syscall: must be the fall-through.
+            if not saw_kernel:
+                issues.append(Issue(
+                    "syscall_transitions", "error",
+                    f"user syscall at 0x{pending_pc:x} was not followed by "
+                    f"a kernel (system) block before returning to user",
+                    {"syscall_pc": pending_pc}))
+            elif int(t.get("start_pc", 0)) != pending_ft:
+                issues.append(Issue(
+                    "syscall_transitions", "error",
+                    f"syscall at 0x{pending_pc:x} returned to user at "
+                    f"0x{int(t.get('start_pc',0)):x}, expected the "
+                    f"fall-through 0x{pending_ft:x}",
+                    {"syscall_pc": pending_pc, "expected_ft": pending_ft,
+                     "got": int(t.get("start_pc", 0))}))
+            else:
+                verified += 1
+            pending_ft = pending_pc = None
+            saw_kernel = False
+            # fall through to let this same block start a new transition
+        if (not is_sys) and ends_in_syscall(t):
+            pending_ft = int(t.get("fall_through_pc", 0))
+            pending_pc = int(t.get("start_pc", 0))
+            saw_kernel = False
+
+    if issues:
+        return issues
+    return [Issue(
+        "syscall_transitions", "info",
+        f"verified {verified} user-syscall round-trip(s) "
+        f"(branch out to kernel + return to fall-through)"
+        + ("" if verified else "; none returned (terminal exit only)"),
+        {"verified": verified})]
 
 
 def _check_regfile_records(body_stats: dict,
@@ -4992,7 +5127,8 @@ def validate(meta_path: Path, trace_path: Path,
              expected_stop: int | None = None,
              expected_warmup: int | None = 0,
              expected_threads: int = 1,
-             start_symbol: str | None = None) -> Report:
+             start_symbol: str | None = None,
+             marker: bool = False) -> Report:
     meta = json.loads(meta_path.read_text())
     dec = _load_decoder()
     trace_meta, templates, entries = dec.decode_champsim_tracer(trace_path)
@@ -5210,7 +5346,9 @@ def validate(meta_path: Path, trace_path: Path,
                                        wp_insn_budget=wp_insn_budget,
                                        helper_leaf_n_insns=int(meta.get("helper_leaf_n_insns", 0) or 0),
                                        isa=isa,
-                                       cp_pos_offset=cp_pos_offset)
+                                       cp_pos_offset=cp_pos_offset,
+                                       templates_by_id=templates_by_id,
+                                       marker=marker)
 
     issues += _check_indirect_wp_assertions(cp_entries, templates_by_id,
                                             blocks_by_id, pcmap, isa)
@@ -5219,7 +5357,7 @@ def validate(meta_path: Path, trace_path: Path,
     issues += _check_encoding_map_completeness(templates, trace_meta)
     issues += _check_header_window(trace_meta, expected_start,
                                     expected_stop, expected_warmup,
-                                    start_symbol)
+                                    start_symbol, marker)
 
     body_stats = trace_meta.get("body_stats") or {}
     stats["body_stats"] = body_stats
@@ -5227,8 +5365,17 @@ def validate(meta_path: Path, trace_path: Path,
     issues += _check_regfile_records(body_stats, expected_threads)
     issues += _check_thread_switch(body_stats, expected_threads)
     issues += _check_thread_distribution(entries, expected_threads)
-    issues += _check_wp_events(body_stats, cp_entries)
+    # WP-event tallies are global (the writer counts every WP fault,
+    # including those in the pre-window prologue — which in system mode
+    # is the whole kernel boot + marker wait, where wrong-path faults are
+    # plentiful), so walk the full entry stream, not just post-prologue.
+    issues += _check_wp_events(body_stats, entries)
     issues += _check_atomic_count(body_stats, entries, templates_by_id)
+    # System-mode only: the privilege bit and syscall round-trips are
+    # meaningful when the trace interleaves a kernel (marker/pin mode).
+    if marker:
+        issues += _check_syscall_transitions(entries, templates_by_id,
+                                             trace_meta)
 
     # ---- Per-insn regdata semantic checks ----------------------------------
     opcode_names = dict(trace_meta.get("encoding_maps", {}).get("opcode", {}))

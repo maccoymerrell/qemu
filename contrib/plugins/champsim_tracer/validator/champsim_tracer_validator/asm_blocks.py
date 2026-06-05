@@ -212,6 +212,35 @@ def emit_trace_marker(isa: str) -> list[str]:
     return [f"  mov $0x{magic:08x}, %eax"] * seq
 
 
+def emit_trace_syscall_probe(isa: str) -> list[str]:
+    """Emit one deterministic, returning syscall right after the start
+    marker so a system-mode trace contains a user->kernel->user round
+    trip the validator can check (``_check_syscall_transitions``): the
+    syscall seals a user block, the kernel handles it, and control
+    resumes at the syscall's fall-through.
+
+    ``close(-1)`` always returns ``-EBADF`` (no side effects), and runs
+    before the workload sets up any state, so clobbering the syscall
+    ABI registers (rax/rcx/r11) is harmless.  x86-only, matching the
+    marker; other ISAs emit nothing."""
+    if isa != "x86_64":
+        return []
+    # The marker opens the trace window *inside* the _start TB, and that
+    # TB is dropped as the one-TB lossy segment-open boundary — so the
+    # syscall must live in a SEPARATE TB that begins after the window is
+    # already open.  A branch to a fresh label ends the marker's TB; the
+    # syscall block then starts at the label and is captured.  Its
+    # fall-through is the following instruction (the entry jump), which is
+    # exactly where the kernel returns control.
+    return [
+        "  jmp cst_syscall_probe",
+        "cst_syscall_probe:",
+        "  mov $3, %eax",     # __NR_close
+        "  mov $-1, %edi",    # fd = -1  -> deterministic -EBADF
+        "  syscall",
+    ]
+
+
 def emit_trace_marker_end(isa: str) -> list[str]:
     """Emit the END marker just before the workload exits: the plugin closes
     the trace window when it executes in the pinned process (the "or the

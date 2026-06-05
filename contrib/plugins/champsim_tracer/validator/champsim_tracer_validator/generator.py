@@ -251,6 +251,10 @@ def emit_source(cfg: CFG, plans: list[B.BlockPlan],
         # window here (trace_window=marker).  Lets the same generated
         # workload drive user- and system-mode runs.
         lines.extend(B.emit_trace_marker(isa))
+        # One returning syscall in-window so the system-mode validator can
+        # check the user->kernel->fall-through round trip.  No-op in user
+        # mode (kernel not traced); harmless before the workload starts.
+        lines.extend(B.emit_trace_syscall_probe(isa))
     lines.extend(B.emit_entry_jump(isa, B.symbol_name(cfg.entry)))
 
     plan_by_id = {p.block_id: p for p in plans}

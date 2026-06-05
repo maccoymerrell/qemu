@@ -360,6 +360,14 @@ BBTemplate *BBTemplateCache::get_or_create_bb_template(
                 }
             }
             if (all_match) {
+                /* Refresh the privilege stamp from this correct-path
+                 * execution: the cached true-BB may have been first
+                 * committed with a wrong-path seed (a WP session that
+                 * spec-translated this PC at the other privilege), and
+                 * the fast path would otherwise return that stale value
+                 * without passing through the re-stamp below. */
+                cand->is_system = fragments[0]->is_system;
+                cand->is_system_cp_confirmed = true;
                 return cand;
             }
         }
@@ -602,4 +610,13 @@ void BBTemplateCache::ensure_rep_subtmpl(BBTemplate *tb)
                                      &sub_size, sub_bytes,
                                      sub_regs,
                                      tb->symbol_name, sub_ft);
+    /* Inherit the parent REP TB's privilege: the sub-template covers the
+     * same instruction, so it shares its execution context.  commit_true_bb
+     * (unlike the CP/WP commit paths) does not stamp is_system, so without
+     * this a kernel REP (memset/memcpy clear_page) sub-template would
+     * serialize as user code. */
+    if (tb->rep_subtmpl) {
+        tb->rep_subtmpl->is_system = tb->is_system;
+        tb->rep_subtmpl->is_system_cp_confirmed = tb->is_system_cp_confirmed;
+    }
 }

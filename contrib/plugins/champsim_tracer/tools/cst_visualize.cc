@@ -898,6 +898,104 @@ static const char *branch_dir_color(const std::string &label)
     return color_for_label(label);
 }
 
+/*
+ * gen_op colouring.  GenericOpcodes are a closed enum, but their
+ * declaration order does not track dynamic frequency — the hottest ops
+ * (LOAD, STORE, CMP, BRANCH) sit at mid/high enum ids that would land
+ * in the muted half of the palette.  Pin the common ops to the vivid
+ * head by an explicit frequency priority (slot 7, gray, is reserved for
+ * the "other" fold), so the categories that dominate real traces get
+ * the most distinct colours and every op keeps one fixed colour across
+ * all plots.  Ops past the list fall back to the stable name hash.
+ */
+static const char *gen_op_color(const std::string &label)
+{
+    static const char *order[] = {
+        "GEN_OP_LOAD",   "GEN_OP_STORE",  "GEN_OP_MOV",    "GEN_OP_INT_ADD",
+        "GEN_OP_INT_SUB","GEN_OP_CMP",    "GEN_OP_BRANCH", "GEN_OP_AND",
+        "GEN_OP_OR",     "GEN_OP_XOR",    "GEN_OP_SHL",    "GEN_OP_SHR",
+        "GEN_OP_LEA",    "GEN_OP_TEST",   "GEN_OP_PUSH",   "GEN_OP_POP",
+        "GEN_OP_RET",    "GEN_OP_CMOV",   "GEN_OP_INT_MUL","GEN_OP_SETCC",
+        "GEN_OP_FP_ADD", "GEN_OP_FP_SUB", "GEN_OP_FP_MUL", "GEN_OP_FP_DIV",
+        "GEN_OP_FP_MOV", "GEN_OP_FP_CVT", "GEN_OP_FP_CMP", "GEN_OP_VEC_ADD",
+        "GEN_OP_VEC_MUL","GEN_OP_VEC_MOV","GEN_OP_VEC_LOAD","GEN_OP_VEC_STORE",
+        "GEN_OP_VEC_LOGIC","GEN_OP_VEC_SHUF","GEN_OP_NEG", "GEN_OP_INC",
+        "GEN_OP_DEC",    "GEN_OP_NOT",    "GEN_OP_MOVZX",
+    };
+    for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+        if (label == order[i]) {
+            /* Skip slot 7 (gray) — reserved for "other". */
+            return palette_color(i < 7 ? i : i + 1);
+        }
+    }
+    return color_for_label(label);
+}
+
+/*
+ * gen_reg colouring.  The register space is large but structured.  Map
+ * each class to a palette band and the index within the class to an
+ * offset so a given register draws the same colour in every plot, with
+ * the common low GPRs on the vivid head.  gen_reg already drops the
+ * architectural side-effect regs (IP/FLAGS/ZERO), so those need no slot.
+ */
+static const char *gen_reg_color(const std::string &label)
+{
+    auto in_class = [&](const char *pfx, long *idx) -> bool {
+        size_t n = 0; while (pfx[n]) n++;
+        if (label.size() <= n || label.compare(0, n, pfx) != 0) return false;
+        long v = 0;
+        for (size_t i = n; i < label.size(); i++) {
+            char c = label[i];
+            if (c < '0' || c > '9') return false;
+            v = v * 10 + (c - '0');
+        }
+        *idx = v;
+        return true;
+    };
+    long idx;
+    if (label == "REG_SP") return palette_color(16);
+    if (label == "REG_FP") return palette_color(17);
+    /* GPRs -> slots {0..6, 8..15} (skip gray 7), VEC -> 20..31,
+     * FPR -> 32..39; wider files wrap within their band. */
+    if (in_class("REG_GPR", &idx)) {
+        size_t s = (size_t)(idx % 15);
+        return palette_color(s < 7 ? s : s + 1);
+    }
+    if (in_class("REG_VEC", &idx)) return palette_color(20 + (size_t)(idx % 12));
+    if (in_class("REG_FPR", &idx)) return palette_color(32 + (size_t)(idx % 8));
+    return color_for_label(label);
+}
+
+/* mem_pat: four fixed categories -> four fixed distinct colours
+ * ("none" gray, since it is the absence of a pattern). */
+static const char *mem_pat_color(const std::string &label)
+{
+    if (label == "none")      return palette_color(7);   /* gray   */
+    if (label == "regular")   return palette_color(2);   /* green  */
+    if (label == "irregular") return palette_color(1);   /* orange */
+    if (label == "random")    return palette_color(3);   /* red    */
+    return color_for_label(label);
+}
+
+/*
+ * Colour for a stacked categorical series.  Each metric pins its
+ * categories to fixed palette slots by identity (not by per-plot rank),
+ * so a category draws the same colour in every plot, pane and prune
+ * level while the most distinct colours still fall on the most common
+ * categories.  The "other" fold is always gray.
+ */
+static const char *categorical_color(Metric m, const std::string &label)
+{
+    if (label == "other") return palette_color(7);       /* gray */
+    switch (m) {
+        case Metric::BranchDir: return branch_dir_color(label);
+        case Metric::GenOp:     return gen_op_color(label);
+        case Metric::GenReg:    return gen_reg_color(label);
+        case Metric::MemPat:    return mem_pat_color(label);
+        default:                return color_for_label(label);
+    }
+}
+
 static std::string xml_escape(const std::string &s)
 {
     std::string o;
@@ -3519,23 +3617,16 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
                         col_total[b] += mat.get(s, b);
                     }
                 }
-                /* Colour by series position so the most-distinct palette
-                 * colours land on the most important categories first.
-                 * These metrics register their series in a meaningful
-                 * order — gen_op / gen_reg by descending frequency,
-                 * mem_pat in a fixed none/regular/irregular/random order
-                 * — so position 0 is the dominant category and gets the
-                 * vivid head of the palette.  Both panes share one label
-                 * set, so a category keeps its colour across CP/WP.
-                 * branch_dir instead pins each class to a fixed slot by
-                 * name (branch_dir_color), which is stable regardless of
-                 * order. */
-                const bool is_branch_dir = (opts.metric == Metric::BranchDir);
+                /* Colour each category by its fixed identity (see
+                 * categorical_color): the most distinct palette colours
+                 * fall on the most common categories, and a category
+                 * keeps the same colour across every plot, pane and
+                 * prune level — not by per-plot magnitude, which would
+                 * make a category's colour drift between plots. */
                 for (int s = 0; s < S; s++) {
                     p.series[s].label = ctx.label_names[s];
-                    p.series[s].color = is_branch_dir
-                        ? branch_dir_color(ctx.label_names[s])
-                        : palette_color((size_t)s);
+                    p.series[s].color =
+                        categorical_color(opts.metric, ctx.label_names[s]);
                     p.series[s].y.resize(actual_bins);
                     for (int b = 0; b < actual_bins; b++) {
                         double v = mat.get(s, b);
@@ -4453,24 +4544,22 @@ static ChartPlan aggregate_pane(const std::vector<const ChartPlan *> &panes,
             }
             if (need_other) labels.push_back("other");
         }
-        /* Colour assignment mirrors the single-trace renderer.  For the
-         * stacked category breakdowns colour by legend position so the
-         * most distinct palette colours fall on the most important
-         * categories (the legend is magnitude-ordered above, so
-         * position 0 is the dominant category), and pin branch_dir
-         * classes to fixed slots by name.  Parameter-sweep line metrics
-         * (branch_mpki / btb / cache / wp_divergence / working_set) keep
-         * their established colours — wp_divergence in particular hand-
-         * picks its min/median/mean/max hues — so leave those on the
-         * name-stable mapping. */
+        /* Colour assignment mirrors the single-trace renderer.  The
+         * stacked category breakdowns pin each category to a fixed
+         * palette slot by identity (categorical_color), so a category
+         * keeps the same colour across every aggregate, single-trace
+         * plot and pane.  Parameter-sweep line metrics (branch_mpki /
+         * btb / cache / wp_divergence / working_set) keep their
+         * established per-series colours — wp_divergence in particular
+         * hand-picks its min/median/mean/max hues — so leave those on
+         * the name-stable hash. */
         const bool stacked_cat = (first.mode == ChartPlan::Mode::Stacked);
-        const bool is_branch_dir = (opts.metric == Metric::BranchDir);
         std::unordered_map<std::string, std::string> color;
         std::unordered_map<std::string, int> label_idx;
         for (size_t i = 0; i < labels.size(); i++) {
-            color[labels[i]] = !stacked_cat   ? color_for_label(labels[i])
-                             : is_branch_dir  ? branch_dir_color(labels[i])
-                             :                  palette_color(i);
+            color[labels[i]] = stacked_cat
+                ? categorical_color(opts.metric, labels[i])
+                : color_for_label(labels[i]);
             label_idx[labels[i]] = (int)i;
         }
         /* Unified legend (label + colour, no data). */

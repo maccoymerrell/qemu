@@ -256,14 +256,18 @@ across every segment and the legend.  For ``gen_op`` / ``gen_reg`` the
 per-trace top-K sets are reconciled into a single program-wide top-K by
 aggregate weight.
 
-Colours are assigned so the most visually distinct hues land on the most
-important categories.  The category breakdowns (``gen_op``, ``gen_reg``,
-``mem_pat``) colour by rank — the legend is ordered by magnitude, and the
-vivid head of the palette is spent on the dominant categories first, with
-rarer ones (and the ``other`` fold) taking later slots.  ``branch_dir`` is
-a small closed set, so each branch class is pinned to a fixed distinct
-colour by name (the conditional taken/not-taken pair, then jumps, returns
-and calls), keeping a class's colour identical across panes, traces and
-prune levels regardless of how often it occurs.  The parameter-sweep line
-charts (``branch_mpki``, ``btb_miss``, ``cache_miss``, ``wp_divergence``,
-``working_set``) keep their fixed per-series colours.
+Colours are assigned so that the most visually distinct hues land on the
+most common categories while a given category keeps the *same* colour in
+every plot.  Each category breakdown pins its categories to fixed palette
+slots by identity, not by per-plot rank — colouring by magnitude would let
+a category's colour drift from one plot to the next and make it hard to
+track across the montage.  ``branch_dir`` pins each branch class by name
+(the conditional taken/not-taken pair, then jumps, returns and calls);
+``gen_op`` pins the common opcodes (loads, stores, moves, the integer ALU
+and control ops) to the vivid head of the palette by a fixed frequency
+priority, with rarer opcodes falling back to a stable name hash;
+``gen_reg`` maps each register class (GPR / VEC / FPR / SP) to a palette
+band and the index within the class to an offset; ``mem_pat`` uses four
+fixed colours.  The ``other`` fold is always grey.  The parameter-sweep
+line charts (``branch_mpki``, ``btb_miss``, ``cache_miss``,
+``wp_divergence``, ``working_set``) keep their fixed per-series colours.

@@ -348,7 +348,7 @@ static const InsnClassification *classify_insn_id(
  * and need no refinement.
  */
 static void refine_branch_type(const qemu_plugin_insn_info *info,
-                               InsnFields *out)
+                               InsnFields *out, InsnRegNames *out_names)
 {
     switch (trace_isa) {
     case TRACE_ISA_AARCH64: {
@@ -385,6 +385,28 @@ static void refine_branch_type(const qemu_plugin_insn_info *info,
             out->branch_type = BRANCH_INDIRECT_JUMP;
         } else if (!strcmp(m, "ret")) {
             out->branch_type = BRANCH_RETURN;
+        }
+        /*
+         * Aliased link forms hide ra COMPLETELY in Capstone 6 — it is
+         * in neither the operand list nor the (always-empty for
+         * RISC-V) implicit regs_read/regs_write — so without a fixup
+         * the call's return-address write and the return's read
+         * vanish from the dataflow.  Non-aliased forms ("jal t0, ..."
+         * / "jalr t0, t1") carry the link register explicitly, which
+         * the n_dst/n_src==0 guards leave untouched.  (Caught by
+         * probe_rv_link_dataflow.)
+         */
+        if (out->branch_type == BRANCH_DIRECT_CALL ||
+            out->branch_type == BRANCH_INDIRECT_CALL) {
+            if (out->n_dst_regs == 0) {
+                add_dst_reg(out, out_names, REG_LR,
+                            qemu_reg_for_generic(REG_LR));
+            }
+        } else if (out->branch_type == BRANCH_RETURN) {
+            if (out->n_src_regs == 0) {
+                add_src_reg(out, out_names, REG_LR,
+                            qemu_reg_for_generic(REG_LR));
+            }
         }
         break;
     }
@@ -470,9 +492,9 @@ void decode_detail_to_generic(uint64_t pc,
         }
     }
 
-    /* Resolve call vs jump vs return for the ISAs where one insn_id is
-     * ambiguous (x86 call direct/indirect, riscv jal/jalr/j/jr/ret). */
-    refine_branch_type(info, out);
+    /* refine_branch_type moved below the operand walk: its riscv arm
+     * inspects n_src/n_dst_regs to detect alias-hidden link registers,
+     * so it needs the explicit operands already populated. */
 
     /*
      * Operand processing: use Capstone access flags where available
@@ -580,6 +602,13 @@ void decode_detail_to_generic(uint64_t pc,
             add_dst_cap_reg(out, out_names, info->regs_write_id[i]);
         }
     }
+
+    /* Resolve call vs jump vs return for the ISAs where one insn_id is
+     * ambiguous (x86 call direct/indirect, riscv jal/jalr/j/jr/ret,
+     * aarch64 b vs b.<cc>, mips jr $ra).  Runs after the operand walk
+     * (the riscv arm needs n_src/n_dst populated) and before the
+     * per-row .refine (whose x86 call body overrides this one). */
+    refine_branch_type(info, out, out_names);
 
     /*
      * Optional ISA-specific post-classification .refine: fixes up

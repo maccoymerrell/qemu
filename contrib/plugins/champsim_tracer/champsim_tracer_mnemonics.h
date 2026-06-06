@@ -518,7 +518,14 @@ const IsaProperties isa_properties[] = {
     },
     [TRACE_ISA_MIPS]    = {
         .branch_delay_slots = 1,
-        .include_implicit_regs = false,
+        /* MIPS MUST fold implicit regs: the HI:LO accumulator never
+         * appears in MULT / DIV / MFHI / MFLO operand fields — only in
+         * Capstone's implicit regs_read/regs_write — so without the
+         * fold the whole accumulator dependency chain vanishes (mfhi
+         * appears input-less).  The historical double-count worry is
+         * moot: add_src/dst_cap_reg dedup by generic reg id.  (Caught
+         * by probe_implicit_acc.) */
+        .include_implicit_regs = true,
         .target_prefixes = isa_prefixes_mips,
         .cap_arch = CS_ARCH_MIPS,
         .cap_mode_for_target = cap_mode_mips,

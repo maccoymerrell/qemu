@@ -2171,8 +2171,10 @@ def _check_static_reg_sets(
             # Implicit regs (regs_read[]/regs_write[]) fold in only
             # where the tracer's ISA properties say so — matches
             # decode.cc's `isa_properties[..].include_implicit_regs`
-            # gate (true for x86 + AArch64, false for RISC-V + MIPS).
-            if isa not in ("riscv64", "mipsel"):
+            # gate (true for x86 + AArch64 + MIPS — MIPS needs it for
+            # the HI:LO accumulator, which only exists implicitly —
+            # false for RISC-V).
+            if isa != "riscv64":
                 for cap_id in getattr(d, "regs_read", []) or []:
                     add(exp_src, cap_id)
                 for cap_id in getattr(d, "regs_write", []) or []:
@@ -2212,9 +2214,24 @@ def _check_static_reg_sets(
             if isa == "riscv64" and mnemonic in ("beqz", "bnez", "ecall"):
                 n_skipped += 1
                 continue
-            if isa == "riscv64" and mnemonic in ("auipc", "lui", "jal"):
+            if isa == "riscv64" and mnemonic in ("auipc", "lui"):
                 n_skipped += 1
                 continue
+            # Aliased link forms hide ra completely in Capstone 6 (not
+            # in operands NOR the always-empty riscv implicit arrays);
+            # the tracer re-adds REG_LR in refine_branch_type.  Assert
+            # that restoration positively instead of skipping: raw
+            # Capstone's sets plus the link register ARE the expected
+            # truth.  Plain "jal imm" / 1-reg "jalr rs" write ra;
+            # "ret" reads it.  Non-aliased forms carry the link reg
+            # explicitly and need no fixup.
+            if isa == "riscv64":
+                if mnemonic == "jal" and not exp_dst:
+                    exp_dst.add("REG_LR")
+                elif mnemonic == "jalr" and not exp_dst:
+                    exp_dst.add("REG_LR")
+                elif mnemonic == "ret" and not exp_src:
+                    exp_src.add("REG_LR")
             if isa == "riscv64" and mnemonic.startswith("v"):
                 n_skipped += 1
                 continue
@@ -2223,6 +2240,14 @@ def _check_static_reg_sets(
                 n_skipped += 1
                 continue
             if isa == "mipsel" and mnemonic == "sc":
+                n_skipped += 1
+                continue
+            # lwl/lwr (and 64-bit ldl/ldr) partially write the dst, so
+            # the tracer promotes it to READ|WRITE (disas/capstone.c
+            # workaround); raw Capstone says WRITE-only.  The corrected
+            # behaviour is pinned exactly by probe_mips_lwl_lwr.
+            if isa == "mipsel" and mnemonic in ("lwl", "lwr",
+                                                "ldl", "ldr"):
                 n_skipped += 1
                 continue
             if isa == "mipsel" and mnemonic in ("madd", "msub"):

@@ -995,6 +995,31 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 break;
             }
         }
+        /*
+         * Capstone 6.0.0 MIPS unaligned-load merge bug workaround.
+         *
+         * LWL/LWR (and the 64-bit LDL/LDR) merge selected bytes of the
+         * loaded word into the destination register, preserving the
+         * rest — architecturally the old $rt value is an INPUT.
+         * Capstone reports $rt as CS_AC_WRITE only, so the partial
+         * write's dependency on the previous register value is lost
+         * and consumers see the pair as a full overwrite.  Promote
+         * $rt to READ|WRITE.  The stores of the family (SWL/SWR/...)
+         * already read $rt and need no correction.  Revisit when
+         * Capstone is bumped past 6.0.0.
+         */
+        if (insn->id == MIPS_INS_LWL || insn->id == MIPS_INS_LWR
+            || insn->id == MIPS_INS_LDL || insn->id == MIPS_INS_LDR) {
+            for (uint8_t i = 0; i < n; i++) {
+                qemu_plugin_operand *op = &out->operands[i];
+                if (op->type != QEMU_PLUGIN_OP_REG) {
+                    continue;
+                }
+                op->access = QEMU_PLUGIN_OP_ACC_READ
+                           | QEMU_PLUGIN_OP_ACC_WRITE;
+                break;
+            }
+        }
     } else {
         out->n_operands = 0;
     }

@@ -560,6 +560,13 @@ Disassembly and target metadata
      always this defect; ``cap_fill_generic_operands`` infers the
      direction from the data register operand (a written data
      register implies a load, a read one implies a store).
+   * MIPS unaligned-load register merge.  ``LWL`` / ``LWR`` (and the
+     64-bit ``LDL`` / ``LDR``) merge selected bytes of the loaded
+     word into the destination register, preserving the rest — the
+     old register value is architecturally an input.  Capstone marks
+     the register ``WRITE``-only; ``cap_fill_generic_operands``
+     promotes it to ``READ|WRITE`` so the partial write's dependency
+     on the previous value survives.
 
 ``target/mips/cpu.c`` and ``configs/targets/mips*.mak`` plus
 ``gdb-xml/mips-cpu.xml`` / ``mips64-cpu.xml``

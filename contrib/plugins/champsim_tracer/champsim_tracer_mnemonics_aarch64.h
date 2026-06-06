@@ -811,38 +811,35 @@ static const RegClassification aarch64_reg_class[AARCH64_REG_ENDING] = {
  *
  * Capstone uses the same instruction ID for "LDR Xd, [Xn]" and for
  * "LDR Xd, [Xn], #imm" / "LDR Xd, [Xn, #imm]!", so the static table
- * can only see the base mnemonic.  At runtime we can detect writeback
- * by comparing the number of regs Capstone reports as written to the
- * number of explicit register-operand destinations:
+ * can only see the base mnemonic.  Writeback forms reclassify to
+ * GEN_OP_INT_ADD: the opcode carries the instruction's SUBSTANTIAL
+ * operation — the address-ALU work — while the LOAD/STORE side is
+ * trivial from the core's view (its delay belongs to the consumer's
+ * memory model, and the memop still rides in the trace via the QEMU
+ * memory callbacks).  Same principle as x86 "add reg, (mem)" staying
+ * INT_ADD.
  *
- *   LDR Xd, [Xn]            — 1 reg-op write, n_regs_write = 1.
- *   LDR Xd, [Xn]!  / , #imm — 1 reg-op write, n_regs_write = 2
- *                             (the base Xn gets written by writeback).
- *   STR Xs, [Xn]            — 0 reg-op writes, n_regs_write = 0.
- *   STR Xs, [Xn]!  / , #imm — 0 reg-op writes, n_regs_write = 1.
- *   LDP Xd1, Xd2, [Xn]      — 2 reg-op writes, n_regs_write = 2.
- *   LDP Xd1, Xd2, [Xn]!     — 2 reg-op writes, n_regs_write = 3.
- *
- * When n_regs_write exceeds the explicit-destination count, the
- * difference is the base-register writeback — semantically a pointer
- * advance happening alongside the memory access, so the more specific
- * operation is INT_ADD, not LOAD / STORE.  Memory counts are still
- * runtime fields derived from QEMU memory callbacks; only opcode is
- * touched here.
+ * Writeback detection: on Capstone 6 the implicit regs_write list for
+ * an AArch64 load/store carries EXACTLY the writeback base when
+ * present (explicit destination operands are NOT duplicated there, and
+ * no load/store writes flags), so any implicit write on a MEM-operand
+ * instruction is the writeback.  An earlier revision instead compared
+ * n_regs_write against the explicit REG-operand write count, assuming
+ * explicit dsts also appear in regs_write — under Capstone 6 that
+ * fired only for stores, so writeback LOADS kept GEN_OP_LOAD against
+ * design intent.  (Asymmetry caught by probe_arm_writeback_addr.)
  */
 static void refine_arm64_ldst_access(
     const struct qemu_plugin_insn_info *info, InsnFields *f)
 {
-    unsigned explicit_writes = 0;
-    for (unsigned i = 0; i < info->n_operands; i++) {
-        const qemu_plugin_operand *op = &info->operands[i];
-        if (op->type == QEMU_PLUGIN_OP_REG
-            && (op->access & QEMU_PLUGIN_OP_ACC_WRITE)) {
-            explicit_writes++;
-        }
+    if (info->n_regs_write == 0) {
+        return;
     }
-    if (info->n_regs_write > explicit_writes) {
-        f->opcode = GEN_OP_INT_ADD;
+    for (unsigned i = 0; i < info->n_operands; i++) {
+        if (info->operands[i].type == QEMU_PLUGIN_OP_MEM) {
+            f->opcode = GEN_OP_INT_ADD;
+            return;
+        }
     }
 }
 

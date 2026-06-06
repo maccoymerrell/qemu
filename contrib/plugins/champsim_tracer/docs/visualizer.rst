@@ -271,3 +271,14 @@ band and the index within the class to an offset; ``mem_pat`` uses four
 fixed colours.  The ``other`` fold is always grey.  The parameter-sweep
 line charts (``branch_mpki``, ``btb_miss``, ``cache_miss``,
 ``wp_divergence``, ``working_set``) keep their fixed per-series colours.
+In an aggregate (composition) plot a series reuses the colour it has in
+the single-trace plot, so a history length, cache associativity or class
+looks the same whether viewed alone or in the montage.
+
+Secondary Y axis
+   A line chart whose series span very different magnitudes can give one
+   series its own right-hand axis so neither is squashed flat.
+   ``working_set`` uses this: cumulative unique cache lines scale against
+   the left axis and 4 KiB pages against the right, with each axis (ticks
+   and title) tinted to match its line.  The right axis is drawn only
+   when a plan declares one, so every other chart is unchanged.

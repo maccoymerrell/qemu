@@ -725,6 +725,11 @@ struct Series {
      * reference (e.g. a saturation marker), distinguishing it from
      * the actual data series at a glance. */
     bool                dashed = false;
+    /* When true (and the plan has a secondary axis, y_max2 > 0) this
+     * series is scaled against the right-hand Y axis instead of the
+     * left.  Lets one Lines chart overlay series with very different
+     * magnitudes (e.g. working_set cache lines vs 4 KiB pages). */
+    bool                right_axis = false;
 };
 
 struct ChartPlan {
@@ -761,6 +766,19 @@ struct ChartPlan {
     double y_max     = 1.0;
     bool   percent   = false;
     bool   y_is_count = false;
+
+    /* Optional secondary (right-hand) Y axis for Lines charts whose
+     * series span very different magnitudes (e.g. working_set: cache
+     * lines vs 4 KiB pages).  Zero y_max2 disables it — the plot is an
+     * ordinary single-axis chart, unchanged.  Series flagged
+     * right_axis scale to [0, y_max2]; the right axis is drawn and
+     * titled, and (when set) the left/right axis ticks + titles are
+     * tinted @y_color / @y2_color to tie each axis to its line. */
+    double      y_max2      = 0.0;
+    std::string y_label2;
+    bool        y2_is_count = false;
+    std::string y_color;     /* left axis tint  (empty = default gray) */
+    std::string y2_color;    /* right axis tint (empty = default gray) */
 
     /* mode: "lines" (one polyline per series), "stacked" (cumulative
      * stacked polygons, layer 0 at bottom), or "bars" (per-bin filled
@@ -1088,6 +1106,7 @@ public:
     {
         emit_frame();
         emit_y_axis();
+        if (has_y2()) emit_y_axis2();
         if (!plan_.segments.empty()) {
             emit_composition_pane();
             return;
@@ -1103,6 +1122,7 @@ public:
     }
 
 private:
+    bool has_y2() const { return plan_.y_max2 > 0.0; }
     double x_of(double bin_idx) const
     {
         return L + (bin_idx / std::max(plan_.n_bins, 1)) * plot_w;
@@ -1113,6 +1133,19 @@ private:
         if (frac < 0) frac = 0;
         if (frac > 1) frac = 1;
         return T + plot_h - frac * plot_h;
+    }
+    /* Map a value against the secondary (right-hand) axis scale. */
+    double y_of2(double v) const
+    {
+        double frac = plan_.y_max2 > 0 ? v / plan_.y_max2 : 0.0;
+        if (frac < 0) frac = 0;
+        if (frac > 1) frac = 1;
+        return T + plot_h - frac * plot_h;
+    }
+    /* Y position for a series, honouring its axis assignment. */
+    double y_of_series(const Series &s, double v) const
+    {
+        return (has_y2() && s.right_axis) ? y_of2(v) : y_of(v);
     }
 
     void emit_frame()
@@ -1125,6 +1158,8 @@ private:
 
     void emit_y_axis()
     {
+        const char *tick_fill = plan_.y_color.empty() ? "#555"
+                                                      : plan_.y_color.c_str();
         int y_ticks = 5;
         for (int t = 0; t <= y_ticks; t++) {
             double v = (plan_.y_max * t) / y_ticks;
@@ -1138,8 +1173,34 @@ private:
                                   : fmt_double(v, plan_.percent);
             std::fprintf(out_,
                 "<text x=\"%d\" y=\"%.2f\" text-anchor=\"end\" "
-                "dominant-baseline=\"middle\" fill=\"#555\">%s</text>\n",
-                L - 6, y, xml_escape(lab).c_str());
+                "dominant-baseline=\"middle\" fill=\"%s\">%s</text>\n",
+                L - 6, y, tick_fill, xml_escape(lab).c_str());
+        }
+    }
+
+    /* Secondary (right-hand) Y axis: tick marks and labels just outside
+     * the right plot edge, tinted to tie them to the right-axis line.
+     * No gridlines — they would overlay the left axis's and confuse the
+     * reading.  Only drawn when has_y2(). */
+    void emit_y_axis2()
+    {
+        const char *tick_fill = plan_.y2_color.empty() ? "#555"
+                                                       : plan_.y2_color.c_str();
+        int y_ticks = 5;
+        for (int t = 0; t <= y_ticks; t++) {
+            double v = (plan_.y_max2 * t) / y_ticks;
+            double y = y_of2(v);
+            std::fprintf(out_,
+                "<line x1=\"%d\" y1=\"%.2f\" x2=\"%d\" y2=\"%.2f\" "
+                "stroke=\"%s\" stroke-width=\"1\"/>\n",
+                L + plot_w, y, L + plot_w + 4, y, tick_fill);
+            std::string lab = plan_.y2_is_count
+                                  ? fmt_count((uint64_t)(v + 0.5))
+                                  : fmt_double(v, plan_.percent);
+            std::fprintf(out_,
+                "<text x=\"%d\" y=\"%.2f\" text-anchor=\"start\" "
+                "dominant-baseline=\"middle\" fill=\"%s\">%s</text>\n",
+                L + plot_w + 8, y, tick_fill, xml_escape(lab).c_str());
         }
     }
 
@@ -1203,12 +1264,14 @@ private:
                     std::fprintf(out_, "<polyline fill=\"none\" stroke=\"%s\" "
                         "stroke-width=\"1.5\"%s points=\"",
                         s.color.c_str(), dash);
-                    std::fprintf(out_, "%.2f,%.2f ", sxl, y_of(val(s, 0)));
+                    std::fprintf(out_, "%.2f,%.2f ",
+                                 sxl, y_of_series(s, val(s, 0)));
                     for (int b = 0; b < nb; b++) {
-                        std::fprintf(out_, "%.2f,%.2f ", ctr(b), y_of(val(s, b)));
+                        std::fprintf(out_, "%.2f,%.2f ",
+                                     ctr(b), y_of_series(s, val(s, b)));
                     }
                     std::fprintf(out_, "%.2f,%.2f ",
-                                 sxr, y_of(val(s, nb - 1)));
+                                 sxr, y_of_series(s, val(s, nb - 1)));
                     std::fprintf(out_, "\"/>\n");
                 }
             }
@@ -1404,10 +1467,23 @@ private:
         }
         if (!plan_.y_label.empty()) {
             int yx = 22, yy = T + plot_h / 2;
+            const char *fill = plan_.y_color.empty() ? "#333"
+                                                     : plan_.y_color.c_str();
             std::fprintf(out_,
-                "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" fill=\"#333\" "
+                "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" fill=\"%s\" "
                 "font-size=\"13\" transform=\"rotate(-90, %d, %d)\">%s</text>\n",
-                yx, yy, yx, yy, xml_escape(plan_.y_label).c_str());
+                yx, yy, fill, yx, yy, xml_escape(plan_.y_label).c_str());
+        }
+        /* Right-axis title, rotated the other way, between the right
+         * tick labels and the legend. */
+        if (has_y2() && !plan_.y_label2.empty()) {
+            int yx = L + plot_w + 52, yy = T + plot_h / 2;
+            const char *fill = plan_.y2_color.empty() ? "#333"
+                                                      : plan_.y2_color.c_str();
+            std::fprintf(out_,
+                "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" fill=\"%s\" "
+                "font-size=\"13\" transform=\"rotate(90, %d, %d)\">%s</text>\n",
+                yx, yy, fill, yx, yy, xml_escape(plan_.y_label2).c_str());
         }
     }
 
@@ -1483,7 +1559,7 @@ private:
                 for (int b = 0; b < plan_.n_bins; b++) {
                     double v = (b < (int)s.y.size()) ? s.y[b] : 0.0;
                     std::fprintf(out_, "%.2f,%.2f ",
-                                 x_of(b + 0.5), y_of(v));
+                                 x_of(b + 0.5), y_of_series(s, v));
                 }
                 std::fprintf(out_, "\"/>\n");
             }
@@ -1563,7 +1639,9 @@ private:
      * pane which always evaluates the wrap). */
     void emit_legend(bool guard_last)
     {
-        int lx = L + plot_w + 16;
+        /* Clear the right-hand axis (tick labels + rotated title) when
+         * present so the legend doesn't sit on top of it. */
+        int lx = L + plot_w + (has_y2() ? 72 : 16);
         int ly = T + 8;
         for (size_t si = 0; si < plan_.series.size(); si++) {
             const Series &s = plan_.series[si];
@@ -3842,16 +3920,22 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
              * non-decreasing — so the curve shows the workload
              * exiting / entering its memory working set. */
             plan.mode = ChartPlan::Mode::Lines;
-            plan.y_label = "unique addresses touched";
+            /* Cache lines and pages differ by ~the lines-per-page ratio,
+             * so a single shared axis squashes the pages curve flat.
+             * Give each series its own axis — lines on the left, pages
+             * on the right — and tint each axis to match its line. */
+            plan.y_label = "unique cache lines (64B)";
             plan.y_is_count = true;
             plan.series.resize(2);
             plan.series[0].label = "cache lines (64B)";
             plan.series[0].color = palette_color(0);
             plan.series[1].label = "pages (4 KiB)";
-            plan.series[1].color = palette_color(1);
+            plan.series[1].color = palette_color(3);
+            plan.series[1].right_axis = true;
             plan.series[0].y.assign(actual_bins, 0.0);
             plan.series[1].y.assign(actual_bins, 0.0);
-            uint64_t last_lines = 0, last_pages = 0, y_peak = 0;
+            uint64_t last_lines = 0, last_pages = 0;
+            uint64_t lines_peak = 0, pages_peak = 0;
             for (int b = 0; b < actual_bins; b++) {
                 if (b < (int)ctx.ws.lines_per_bin.size()) {
                     last_lines = ctx.ws.lines_per_bin[b];
@@ -3861,9 +3945,16 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
                 }
                 plan.series[0].y[b] = (double)last_lines;
                 plan.series[1].y[b] = (double)last_pages;
-                if (last_lines > y_peak) y_peak = last_lines;
+                if (last_lines > lines_peak) lines_peak = last_lines;
+                if (last_pages > pages_peak) pages_peak = last_pages;
             }
-            plan.y_max = (y_peak > 0) ? (double)y_peak * 1.1 : 1.0;
+            plan.y_max  = (lines_peak > 0) ? (double)lines_peak * 1.1 : 1.0;
+            plan.y_max2 = (pages_peak > 0) ? (double)pages_peak * 1.1 : 1.0;
+            plan.y_label2 = "unique pages (4 KiB)";
+            plan.y2_is_count = true;
+            plan.y_color  = plan.series[0].color;
+            plan.y2_color = plan.series[1].color;
+            plan.margin_right = 280;   /* right axis (ticks+title) + legend */
             plan.warmup_bins = 0;
             break;
         }
@@ -4544,32 +4635,50 @@ static ChartPlan aggregate_pane(const std::vector<const ChartPlan *> &panes,
             }
             if (need_other) labels.push_back("other");
         }
-        /* Colour assignment mirrors the single-trace renderer.  The
-         * stacked category breakdowns pin each category to a fixed
-         * palette slot by identity (categorical_color), so a category
-         * keeps the same colour across every aggregate, single-trace
-         * plot and pane.  Parameter-sweep line metrics (branch_mpki /
-         * btb / cache / wp_divergence / working_set) keep their
-         * established per-series colours — wp_divergence in particular
-         * hand-picks its min/median/mean/max hues — so leave those on
-         * the name-stable hash. */
+        /* Colour assignment must match the single-trace renderer so a
+         * series looks the same in the aggregate as it does on its own.
+         * The stacked category breakdowns pin each category to a fixed
+         * palette slot by identity (categorical_color).  Every other
+         * (line) metric — branch_mpki history lengths, btb / cache
+         * sweeps, wp_divergence's hand-picked min/median/mean/max hues,
+         * working_set's two axes — already carries the right colour on
+         * its canonical-pane series, so copy that by label rather than
+         * re-hashing the name (which clashed and diverged from the
+         * single-trace plot). */
         const bool stacked_cat = (first.mode == ChartPlan::Mode::Stacked);
+        std::unordered_map<std::string, std::string> first_color;
+        for (const Series &s : first.series) first_color[s.label] = s.color;
         std::unordered_map<std::string, std::string> color;
         std::unordered_map<std::string, int> label_idx;
         for (size_t i = 0; i < labels.size(); i++) {
-            color[labels[i]] = stacked_cat
-                ? categorical_color(opts.metric, labels[i])
-                : color_for_label(labels[i]);
-            label_idx[labels[i]] = (int)i;
+            const std::string &lab = labels[i];
+            if (stacked_cat) {
+                color[lab] = categorical_color(opts.metric, lab);
+            } else if (first_color.count(lab)) {
+                color[lab] = first_color[lab];      /* match single trace */
+            } else {
+                color[lab] = color_for_label(lab);  /* label absent from pane[0] */
+            }
+            label_idx[lab] = (int)i;
         }
+        /* Which series ride the secondary (right-hand) axis — taken from
+         * the canonical pane so the aggregate matches the single trace. */
+        std::unordered_map<std::string, bool> right_of;
+        for (const Series &s : first.series) right_of[s.label] = s.right_axis;
+        auto is_right = [&](const std::string &l) {
+            auto it = right_of.find(l);
+            return it != right_of.end() && it->second;
+        };
+
         /* Unified legend (label + colour, no data). */
         for (const std::string &l : labels) {
             Series s; s.label = l; s.color = color[l];
+            s.right_axis = is_right(l);
             out.series.push_back(s);
         }
 
         double cum = 0.0;
-        double y_max = 0.0;
+        double y_max = 0.0, y_max2 = 0.0;
         for (size_t i = 0; i < panes.size(); i++) {
             ChartPlan::CompSegment seg;
             int full_nb = panes[i]->n_bins > 0 ? panes[i]->n_bins : 1;
@@ -4602,6 +4711,7 @@ static ChartPlan aggregate_pane(const std::vector<const ChartPlan *> &panes,
             for (size_t li = 0; li < labels.size(); li++) {
                 seg.series[li].label = labels[li];
                 seg.series[li].color = color[labels[li]];
+                seg.series[li].right_axis = is_right(labels[li]);
                 seg.series[li].y.assign((size_t)nb, 0.0);
             }
             int other_li = need_other ? label_idx["other"] : -1;
@@ -4620,19 +4730,24 @@ static ChartPlan aggregate_pane(const std::vector<const ChartPlan *> &panes,
                     if (src < (int)s.y.size()) y[b] += s.y[src];
                 }
             }
-            /* Track y_max for non-percent panes (stacked → per-bin sum). */
+            /* Track y_max for non-percent panes (stacked → per-bin sum).
+             * Right-axis series are scaled separately into y_max2 so a
+             * large-magnitude left series can't squash them. */
             if (!first.percent) {
                 for (int b = 0; b < nb; b++) {
-                    double col = 0.0;
+                    double col = 0.0, col2 = 0.0;
                     for (const Series &s : seg.series) {
+                        double v = (b < (int)s.y.size()) ? s.y[b] : 0.0;
                         if (first.mode == ChartPlan::Mode::Stacked) {
-                            col += (b < (int)s.y.size()) ? s.y[b] : 0.0;
+                            col += v;   /* right_axis unused for stacked */
+                        } else if (s.right_axis) {
+                            if (v > col2) col2 = v;
                         } else {
-                            double v = (b < (int)s.y.size()) ? s.y[b] : 0.0;
                             if (v > col) col = v;
                         }
                     }
-                    if (col > y_max) y_max = col;
+                    if (col  > y_max)  y_max  = col;
+                    if (col2 > y_max2) y_max2 = col2;
                 }
             }
             out.segments.push_back(std::move(seg));
@@ -4644,6 +4759,15 @@ static ChartPlan aggregate_pane(const std::vector<const ChartPlan *> &panes,
         out.y_label    = first.y_label;
         out.x_label    = "program composition (weighted)";
         out.y_max      = first.percent ? 1.0 : (y_max > 0 ? y_max * 1.1 : 1.0);
+        /* Carry the secondary axis through to the montage. */
+        if (first.y_max2 > 0) {
+            out.y_max2      = (y_max2 > 0) ? y_max2 * 1.1 : 1.0;
+            out.y_label2    = first.y_label2;
+            out.y2_is_count = first.y2_is_count;
+            out.y_color     = first.y_color;
+            out.y2_color    = first.y2_color;
+            out.margin_right = first.margin_right;
+        }
         out.title      = progname + ": " + first.title;
         return out;
     }

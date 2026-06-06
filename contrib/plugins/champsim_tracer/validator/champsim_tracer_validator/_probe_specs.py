@@ -1152,3 +1152,193 @@ _register_probe('probe_exact_store_rm', {
                                 store_addr_deps=[["src_reg[1]"]],
                                 store_data_deps=[["src_reg[0]"]])]},
 })
+
+# ============================================================================
+# Ambiguity / high-consequence probes.  Each targets an encoding whose
+# operand roles, implicit registers, or memop direction are easy to get
+# wrong even when the tracer-internal handling "should be trivial" —
+# misreads here corrupt consumer dataflow silently.  src/dst are exact
+# set assertions; {} entries are unchecked setup instructions.
+# ============================================================================
+
+# x86 read-modify-write direction.  `add r,(m)` and `add (m),r` share
+# X86_INS_ADD, and Capstone-under-AT&T reverses the operand array vs the
+# Intel docs — exactly the conditions under which a load/store direction
+# flip slips in.  The store form must carry BOTH a load and a store slot
+# and no register destination (flags aside); the load form exactly one
+# load slot and a register destination.
+_register_probe('probe_x86_rmw_direction', {'x86_64': {
+    'asm': '"addq %%rax, (%%rsp)\\n\\t"\n'
+           '    "addq (%%rsp), %%rax"',
+    'clobbers': '"rax","cc","memory"',
+    'opcodes': ['INT_ADD'],
+    'insns': [
+        _insn("GEN_OP_INT_ADD",
+              src=["REG_GPR0", "REG_SP"],
+              dst=["REG_FLAGS"],
+              load_addr_deps=[["src_reg[1]"]],
+              store_addr_deps=[["src_reg[1]"]]),
+        # Load form: the MEM base walks first, so SP is src_reg[0]
+        # (the store form above walks the value reg first).
+        _insn("GEN_OP_INT_ADD",
+              src=["REG_GPR0", "REG_SP"],
+              dst=["REG_GPR0", "REG_FLAGS"],
+              load_addr_deps=[["src_reg[0]"]],
+              store_addr_deps=[],
+              store_data_deps=[]),
+    ]}})
+
+# x86 cmpxchg: implicit RAX is compared (read) and conditionally
+# written; the memory store only fires on success, but the template's
+# static shape still carries both slots.  LOCK must set the atomic flag.
+_register_probe('probe_x86_cmpxchg', {'x86_64': {
+    'asm': '"movq $5, (%%rsp)\\n\\t"\n'
+           '    "movq $5, %%rax\\n\\t"\n'
+           '    "movq $9, %%rbx\\n\\t"\n'
+           '    "lock cmpxchgq %%rbx, (%%rsp)"',
+    'clobbers': '"rax","cc","memory"',
+    'opcodes': ['XCHG'],
+    'insns': [
+        {}, {}, {},
+        _insn("GEN_OP_XCHG",
+              src=["REG_GPR0", "REG_GPR3", "REG_SP"],
+              dst=["REG_GPR0", "REG_FLAGS"],
+              insn_flags=["CST_INSN_FLAG_ATOMIC"]),
+    ]}})
+
+# aarch64 pre/post-index writeback.  Two invariants, by design:
+#   1. opcode = GEN_OP_INT_ADD for EVERY writeback form, load or store
+#      alike — the opcode carries the substantial (address-ALU)
+#      operation; the memory side rides in the memop stream and its
+#      delay belongs to the consumer's memory model.  An asymmetric
+#      writeback detector once let LOADS keep GEN_OP_LOAD here.
+#   2. the base register is BOTH an address source and a destination;
+#      dropping the writeback dst breaks every downstream dependency
+#      through the base.
+_register_probe('probe_arm_writeback_addr', {'aarch64': {
+    'asm': '"sub sp, sp, #64\\n\\t"\n'
+           '    "mov x9, sp\\n\\t"\n'
+           '    "ldr x0, [x9], #8\\n\\t"\n'
+           '    "str x1, [x9, #8]!\\n\\t"\n'
+           '    "ldp x2, x3, [x9], #16\\n\\t"\n'
+           '    "add sp, sp, #64"',
+    'clobbers': '"x0","x1","x2","x3","x9","memory"',
+    'opcodes': ['INT_ADD'],
+    'insns': [
+        {}, {},
+        _insn("GEN_OP_INT_ADD",
+              src=["REG_GPR9"],
+              dst=["REG_GPR0", "REG_GPR9"],
+              load_addr_deps=[["src_reg[0]"]]),
+        _insn("GEN_OP_INT_ADD",
+              src=["REG_GPR1", "REG_GPR9"],
+              dst=["REG_GPR9"]),
+        _insn("GEN_OP_INT_ADD",
+              src=["REG_GPR9"],
+              dst=["REG_GPR2", "REG_GPR3", "REG_GPR9"]),
+        {},
+    ]}})
+
+# mips lwl/lwr: the unaligned-word pair partially writes the
+# destination, so the dst register is ALSO a source — and this sits in
+# the same Capstone access-flag territory as the known MSA/unaligned
+# workarounds in disas/capstone.c (regression-pins them).
+_register_probe('probe_mips_lwl_lwr', {'mipsel': {
+    'asm': '"addiu $sp, $sp, -16\\n\\t"\n'
+           '    "sw $t1, 0($sp)\\n\\t"\n'
+           '    "sw $t1, 4($sp)\\n\\t"\n'
+           '    "addiu $t2, $sp, 1\\n\\t"\n'
+           '    "lwr $t0, 0($t2)\\n\\t"\n'
+           '    "lwl $t0, 3($t2)\\n\\t"\n'
+           '    "addiu $sp, $sp, 16"',
+    'clobbers': '"$t0","$t2","memory"',
+    'opcodes': ['LOAD'],
+    'insns': [
+        {}, {}, {}, {},
+        _insn("GEN_OP_LOAD",
+              src=["REG_GPR8", "REG_GPR10"],
+              dst=["REG_GPR8"]),
+        _insn("GEN_OP_LOAD",
+              src=["REG_GPR8", "REG_GPR10"],
+              dst=["REG_GPR8"]),
+        {},
+    ]}})
+
+# Zero-register semantics.  riscv x0 / mips $zero as a destination is
+# architecturally discarded but must still be identified as REG_ZERO;
+# aarch64 encodes XZR and SP as the same register number 31, with the
+# role decided per instruction — the classic disambiguation trap.
+_register_probe('probe_zero_reg', {
+    'aarch64': {
+        'asm': '"orr x9, xzr, x10\\n\\t"\n'
+               '    "add x9, sp, #16"',
+        'clobbers': '"x9"',
+        'insns': [
+            # Capstone prints the alias (mov x9, x10): the XZR source
+            # disappears.  Pin it — XZR is constant zero, nothing lost.
+            {"src": ["REG_GPR10"], "dst": ["REG_GPR9"]},
+            {"src": ["REG_SP"], "dst": ["REG_GPR9"]},
+        ]},
+    'riscv64': {
+        'asm': '"add x0, t0, t1\\n\\t"\n'
+               '    "add t2, x0, t0"',
+        'clobbers': '',
+        'insns': [
+            {"src": ["REG_GPR5", "REG_GPR6"], "dst": ["REG_ZERO"]},
+            # Capstone prints the alias (mv t2, t0): the x0 source
+            # disappears from the operand list.  Pin that behaviour —
+            # x0 is the constant zero, so no dependency is lost.
+            {"src": ["REG_GPR5"], "dst": ["REG_GPR7"]},
+        ]},
+    'mipsel': {
+        'asm': '"addu $zero, $t0, $t1\\n\\t"\n'
+               '    "addu $t3, $zero, $t0"',
+        'clobbers': '"$t3"',
+        'insns': [
+            {"src": ["REG_GPR8", "REG_GPR9"], "dst": ["REG_ZERO"]},
+            {"src": ["REG_ZERO", "REG_GPR8"], "dst": ["REG_GPR11"]},
+        ]},
+})
+
+# Implicit accumulators: x86 cqo (RAX -> RDX sign spill), one-operand
+# mulq (RDX:RAX widening destination), shift-by-CL (implicit count
+# register); mips mult/mfhi/mflo (the HI:LO accumulator never appears
+# in the encoding's operand fields at all).
+_register_probe('probe_implicit_acc', {
+    'x86_64': {
+        'asm': '"movq $3, %%rax\\n\\t"\n'
+               '    "cqo\\n\\t"\n'
+               '    "movq $5, %%rbx\\n\\t"\n'
+               '    "mulq %%rbx\\n\\t"\n'
+               '    "movq $2, %%rcx\\n\\t"\n'
+               '    "shlq %%cl, %%rbx"',
+        'clobbers': '"rax","rbx","rcx","rdx","cc"',
+        'opcodes': ['INT_MUL', 'SHL'],
+        'insns': [
+            {},
+            # Capstone marks RAX written too (conservative rw on the
+            # implicit pair); the trace follows Capstone.
+            {"src": ["REG_GPR0"], "dst": ["REG_GPR0", "REG_GPR2"]},
+            {},
+            {"src": ["REG_GPR0", "REG_GPR3"],
+             "dst": ["REG_GPR0", "REG_GPR2", "REG_FLAGS"]},
+            {},
+            {"src": ["REG_GPR1", "REG_GPR3"],
+             "dst": ["REG_GPR3", "REG_FLAGS"]},
+        ]},
+    'mipsel': {
+        'asm': '"li $t1, 7\\n\\t"\n'
+               '    "li $t2, 9\\n\\t"\n'
+               '    "mult $t1, $t2\\n\\t"\n'
+               '    "mfhi $t3\\n\\t"\n'
+               '    "mflo $t4"',
+        'clobbers': '"$t1","$t2","$t3","$t4","hi","lo"',
+        'opcodes': ['INT_MUL'],
+        'insns': [
+            {}, {},
+            {"src": ["REG_GPR9", "REG_GPR10"], "dst": ["REG_ACC0"]},
+            {"src": ["REG_ACC0"], "dst": ["REG_GPR11"]},
+            {"src": ["REG_ACC0"], "dst": ["REG_GPR12"]},
+        ]},
+})
+

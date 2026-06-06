@@ -5005,6 +5005,15 @@ def _check_regdata_reconstruction(
         for s in (e.get("reg_snaps") or []):
             snap_idx[(int(s["insn_index"]), int(s["reg_id"]))] = s
 
+        # Insn positions that touched memory this execution.  Memory-
+        # coupled ALU forms (x86 RMW "add (m), r" — dst = src + MEM;
+        # aarch64 writeback addressing, classified INT_ADD by design —
+        # dst = base ± imm) cannot be reconstructed from the two named
+        # GPR sources; they bootstrap like atomics below.
+        mem_ipos = {int(getattr(d, "insn_index"))
+                    for d in (e.get("dyn_params") or [])
+                    if getattr(d, "insn_index", None) is not None}
+
         for ipos, I in enumerate(tmpl.get("insns") or []):
             op_id = int(I.get("opcode", 0))
             op_name = opcode_names.get(op_id, "")
@@ -5016,7 +5025,8 @@ def _check_regdata_reconstruction(
             # dst-reg semantically loaded from memory rather than
             # computed from src operands.  The is_atomic marker is
             # what distinguishes these; skip reconstruction for them.
-            if I.get("is_atomic"):
+            # Memory-coupled insns get the identical treatment.
+            if I.get("is_atomic") or ipos in mem_ipos:
                 for r in gpr_dsts:
                     snap = snap_idx.get((ipos, r))
                     if snap is not None:
@@ -5064,12 +5074,17 @@ def _check_regdata_reconstruction(
             width = 64  # GP-default; could refine per-insn but the
                        # GPR snap is always 64-bit-padded on the wire.
             mask  = (1 << width) - 1
-            expected = compute(a & mask, b & mask, mask)
+            expected_alu = compute(a & mask, b & mask, mask)
             for r in gpr_dsts:
                 snap = snap_idx.get((ipos, r))
                 if snap is None:
                     continue
                 got = _reg_snap_value(snap) & mask
+                # The hardwired zero register (riscv x0 / mips $zero /
+                # aarch64 xzr) discards writes — its architectural
+                # value is always 0, not the ALU result.
+                expected = 0 if r == name_to_id.get("REG_ZERO") \
+                    else expected_alu
                 n_checked += 1
                 if got != expected:
                     n_errors += 1

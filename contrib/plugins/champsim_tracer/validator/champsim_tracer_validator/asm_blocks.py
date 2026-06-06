@@ -1243,6 +1243,137 @@ class CondCcBranch(CodeBlock):
 
 
 @register
+class BranchZoo(CodeBlock):
+    """One block per ISA emitting every architecturally distinct
+    control-transfer idiom the other probes don't reach, with the full
+    expected branch-type set asserted.  The taxonomy bugs that slipped
+    through (aarch64 b.<cc>, mips jr $ra) survived because each probe
+    exercised exactly one canonical encoding per class; the zoo makes
+    the *other* encodings load-bearing too:
+
+      x86_64:  ja/js/jp condition codes; memory-indirect jmp and call
+               (same X86_INS_JMP/CALL ids as the register forms, but a
+               MEM operand — the .refine must classify both).
+      aarch64: more b.<cc> codes (hi/vs); tbz/tbnz (distinct ids,
+               previously never asserted); ret with an explicit
+               non-x30 register.
+      riscv64: blt/bgeu compare-branches; jalr with a non-ra link
+               register (still a call); the compressed c.j / c.beqz
+               encodings, which carry their own insn ids and are
+               otherwise never emitted explicitly.
+      mipsel:  bgtz/blez compare-branches; jalr with an explicit
+               non-ra destination; the jr.hb hazard-barrier return
+               ("jr.hb $ra" must classify RETURN like plain jr).
+    """
+    name = "branch_zoo"
+    scratch_slots = 0
+    randomizable = False
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        asserted = {
+            "x86_64":  ["BRANCH_COND_DIRECT", "BRANCH_INDIRECT_JUMP",
+                        "BRANCH_INDIRECT_CALL", "BRANCH_RETURN",
+                        "BRANCH_DIRECT_JUMP"],
+            "aarch64": ["BRANCH_COND_DIRECT", "BRANCH_DIRECT_CALL",
+                        "BRANCH_RETURN", "BRANCH_DIRECT_JUMP"],
+            "riscv64": ["BRANCH_COND_DIRECT", "BRANCH_INDIRECT_CALL",
+                        "BRANCH_DIRECT_JUMP"],
+        }.get(ctx.isa, ["BRANCH_COND_DIRECT", "BRANCH_INDIRECT_CALL",
+                        "BRANCH_DIRECT_CALL", "BRANCH_RETURN",
+                        "BRANCH_DIRECT_JUMP"])
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=[],
+            asserted_branch_types=asserted,
+            asserted_opcodes=["BRANCH"],
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        lines = _prologue(ctx.block_id)
+        if ctx.isa == "x86_64":
+            lines += [
+                "  ja 1f",                       # COND (CF|ZF)
+                "1:",
+                "  js 2f",                       # COND (SF)
+                "2:",
+                "  jp 3f",                       # COND (PF)
+                "3:",
+                "  leaq 4f(%rip), %rax",         # mem-indirect jmp
+                "  movq %rax, -16(%rsp)",        # (red zone)
+                "  jmp *-16(%rsp)",
+                "4:",
+                "  leaq 5f(%rip), %rax",         # mem-indirect call
+                "  movq %rax, -16(%rsp)",
+                "  call *-16(%rsp)",
+                "  jmp 6f",                      # plain DIRECT_JUMP
+                "5:",
+                "  ret",                         # RETURN
+                "6:",
+            ]
+        elif ctx.isa == "aarch64":
+            lines += [
+                "  b.hi 1f",                     # COND b.<cc>
+                "1:",
+                "  b.vs 2f",                     # COND b.<cc>
+                "2:",
+                "  tbz x9, #3, 3f",              # COND test-bit
+                "3:",
+                "  tbnz x9, #4, 4f",             # COND test-bit
+                "4:",
+                "  bl 5f",                       # DIRECT_CALL
+                "  b 6f",                        # plain DIRECT_JUMP
+                "5:",
+                "  mov x1, x30",
+                "  ret x1",                      # RETURN, explicit reg
+                "6:",
+            ]
+        elif ctx.isa == "riscv64":
+            lines += [
+                "  blt t0, t1, 1f",              # COND compare
+                "1:",
+                "  bgeu t0, t1, 2f",             # COND compare
+                "2:",
+                "  la t1, 3f",
+                "  jalr t0, t1, 0",              # INDIRECT_CALL, link=t0
+                "3:",
+                "  c.j 4f",                      # compressed DIRECT_JUMP
+                "4:",
+                "  c.beqz a0, 5f",               # compressed COND
+                "5:",
+            ]
+        else:
+            lines += [
+                "  bgtz $t0, 1f",                # COND compare
+                "  nop",
+                "1:",
+                "  blez $t0, 2f",                # COND compare
+                "  nop",
+                "2:",
+                "  lui $t9, %hi(3f)",
+                "  addiu $t9, $t9, %lo(3f)",
+                "  jalr $t8, $t9",               # INDIRECT_CALL, link=$t8
+                "  nop",
+                "3:",
+                "  jal 4f",                      # DIRECT_CALL
+                "  nop",
+                "  b 5f",                        # plain DIRECT_JUMP
+                "  nop",
+                "4:",
+                "  .set push",
+                "  .set mips32r2",
+                "  jr.hb $ra",                   # RETURN, hazard barrier
+                "  nop",
+                "  .set pop",
+                "5:",
+            ]
+        lines += _jump(ctx.isa, ctx.successor_labels[0])
+        return "\n".join(lines) + "\n"
+
+
+@register
 class NarrowMemData(CodeBlock):
     name = "narrow_mem_data"
     scratch_slots = 8

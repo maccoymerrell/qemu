@@ -251,7 +251,19 @@ Weighted distribution
    the overall shape — which simpoints contribute which features — is
    visible.
 
-A series is matched across traces by label, so the colour assigned to a
-branch class, opcode, or simpoint is consistent across every segment and
-the legend.  For ``gen_op`` / ``gen_reg`` the per-trace top-K sets are
-reconciled into a single program-wide top-K by aggregate weight.
+A series is matched across traces by label, so its colour is consistent
+across every segment and the legend.  For ``gen_op`` / ``gen_reg`` the
+per-trace top-K sets are reconciled into a single program-wide top-K by
+aggregate weight.
+
+Colours are assigned so the most visually distinct hues land on the most
+important categories.  The category breakdowns (``gen_op``, ``gen_reg``,
+``mem_pat``) colour by rank — the legend is ordered by magnitude, and the
+vivid head of the palette is spent on the dominant categories first, with
+rarer ones (and the ``other`` fold) taking later slots.  ``branch_dir`` is
+a small closed set, so each branch class is pinned to a fixed distinct
+colour by name (the conditional taken/not-taken pair, then jumps, returns
+and calls), keeping a class's colour identical across panes, traces and
+prune levels regardless of how often it occurs.  The parameter-sweep line
+charts (``branch_mpki``, ``btb_miss``, ``cache_miss``, ``wp_divergence``,
+``working_set``) keep their fixed per-series colours.

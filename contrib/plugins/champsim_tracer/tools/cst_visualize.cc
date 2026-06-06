@@ -861,6 +861,43 @@ static const char *color_for_label(const std::string &label)
     return palette_color((size_t)h);
 }
 
+/*
+ * Branch-direction coloring.  Unlike opcodes or registers, the branch
+ * classes are a small, closed, format-defined set (the BRANCH_* enum,
+ * plus a taken/not-taken pair for the conditional class and a
+ * "no branch" filler).  Hashing the name (color_for_label) scatters
+ * these across the whole 40-slot palette — including the muted tab20b
+ * half — so the handful of classes that actually appear usually drew
+ * in hard-to-distinguish, often near-duplicate colors, and which slot
+ * a class landed on changed whenever the classifier renamed it (e.g.
+ * splitting BRANCH_*_CALL out of the jump classes).  Pin each class to
+ * a fixed slot in the vivid tab20 head instead, ordered so the classes
+ * that dominate real traces (the conditional pair, then jumps /
+ * returns / calls) take the most distinct colors first.  Keying on the
+ * class name keeps the mapping stable across panes, traces and prune
+ * levels; unknown labels fall back to the name hash.
+ */
+static const char *branch_dir_color(const std::string &label)
+{
+    static const struct { const char *name; size_t slot; } fixed[] = {
+        { "BRANCH_COND_DIRECT taken",     0 },  /* blue   */
+        { "BRANCH_COND_DIRECT not-taken", 1 },  /* orange */
+        { "BRANCH_DIRECT_JUMP",           2 },  /* green  */
+        { "BRANCH_RETURN",                3 },  /* red    */
+        { "BRANCH_DIRECT_CALL",           4 },  /* purple */
+        { "BRANCH_INDIRECT_CALL",         5 },  /* brown  */
+        { "BRANCH_INDIRECT_JUMP",         6 },  /* pink   */
+        { "BRANCH_REP",                   8 },  /* olive  */
+        { "BRANCH_SYSCALL_TYPE",          9 },  /* cyan   */
+        { "no branch",                    7 },  /* gray (de-emphasised) */
+        { "BRANCH_NONE",                  7 },
+    };
+    for (const auto &f : fixed) {
+        if (label == f.name) return palette_color(f.slot);
+    }
+    return color_for_label(label);
+}
+
 static std::string xml_escape(const std::string &s)
 {
     std::string o;
@@ -3482,9 +3519,23 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
                         col_total[b] += mat.get(s, b);
                     }
                 }
+                /* Colour by series position so the most-distinct palette
+                 * colours land on the most important categories first.
+                 * These metrics register their series in a meaningful
+                 * order — gen_op / gen_reg by descending frequency,
+                 * mem_pat in a fixed none/regular/irregular/random order
+                 * — so position 0 is the dominant category and gets the
+                 * vivid head of the palette.  Both panes share one label
+                 * set, so a category keeps its colour across CP/WP.
+                 * branch_dir instead pins each class to a fixed slot by
+                 * name (branch_dir_color), which is stable regardless of
+                 * order. */
+                const bool is_branch_dir = (opts.metric == Metric::BranchDir);
                 for (int s = 0; s < S; s++) {
                     p.series[s].label = ctx.label_names[s];
-                    p.series[s].color = color_for_label(ctx.label_names[s]);
+                    p.series[s].color = is_branch_dir
+                        ? branch_dir_color(ctx.label_names[s])
+                        : palette_color((size_t)s);
                     p.series[s].y.resize(actual_bins);
                     for (int b = 0; b < actual_bins; b++) {
                         double v = mat.get(s, b);
@@ -4402,10 +4453,24 @@ static ChartPlan aggregate_pane(const std::vector<const ChartPlan *> &panes,
             }
             if (need_other) labels.push_back("other");
         }
+        /* Colour assignment mirrors the single-trace renderer.  For the
+         * stacked category breakdowns colour by legend position so the
+         * most distinct palette colours fall on the most important
+         * categories (the legend is magnitude-ordered above, so
+         * position 0 is the dominant category), and pin branch_dir
+         * classes to fixed slots by name.  Parameter-sweep line metrics
+         * (branch_mpki / btb / cache / wp_divergence / working_set) keep
+         * their established colours — wp_divergence in particular hand-
+         * picks its min/median/mean/max hues — so leave those on the
+         * name-stable mapping. */
+        const bool stacked_cat = (first.mode == ChartPlan::Mode::Stacked);
+        const bool is_branch_dir = (opts.metric == Metric::BranchDir);
         std::unordered_map<std::string, std::string> color;
         std::unordered_map<std::string, int> label_idx;
         for (size_t i = 0; i < labels.size(); i++) {
-            color[labels[i]] = color_for_label(labels[i]);
+            color[labels[i]] = !stacked_cat   ? color_for_label(labels[i])
+                             : is_branch_dir  ? branch_dir_color(labels[i])
+                             :                  palette_color(i);
             label_idx[labels[i]] = (int)i;
         }
         /* Unified legend (label + colour, no data). */

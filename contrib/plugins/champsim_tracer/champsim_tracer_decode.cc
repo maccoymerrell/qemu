@@ -330,21 +330,47 @@ static const InsnClassification *classify_insn_id(
 
 /*
  * Refine the table's branch_type from per-instance Capstone detail for
- * the cases a single insn_id cannot resolve statically (calls).
+ * the cases a single insn_id cannot resolve statically.
  *
  *  - riscv: one insn_id covers jal+j and jalr+jr+ret, and the
  *    call/jump/return role is carried by rd (Capstone prints the alias):
  *    "jal"/"jalr" link (call), "j"/"jr" do not (jump), "ret" returns.
+ *  - aarch64: plain "b" and every conditional "b.<cc>" share
+ *    AARCH64_INS_B (the table's static default is the unconditional
+ *    DIRECT_JUMP); the condition lives only in the printed mnemonic.
+ *  - mips: every "jr <rs>" shares MIPS_INS_JR (static default
+ *    INDIRECT_JUMP); "jr $ra" is the architectural return idiom and the
+ *    register is only visible per instance.
  *
  * x86 (call direct/indirect) is handled by the per-row .refine callback
- * refine_x86_call_branch in the generated table; aarch64 (bl/blr) and
- * mips (jal/jalr vs j/jr) use distinct insn_ids, so the table is already
- * exact and needs no refinement.
+ * refine_x86_call_branch in the generated table; the remaining aarch64 /
+ * mips control transfers (bl/blr/ret, jal/jalr/j) have distinct insn_ids
+ * and need no refinement.
  */
 static void refine_branch_type(const qemu_plugin_insn_info *info,
                                InsnFields *out)
 {
     switch (trace_isa) {
+    case TRACE_ISA_AARCH64: {
+        /* "b.eq", "b.ne", ... and the FEAT_HBC "bc.<cc>" form.  The
+         * refine runs after the MF_CONDITIONAL/branch_type-derived flag
+         * assignment, so set branch_conditional here as well. */
+        const char *m = info->mnemonic;
+        if ((m[0] == 'b' && m[1] == '.') ||
+            (m[0] == 'b' && m[1] == 'c' && m[2] == '.')) {
+            out->branch_type        = BRANCH_COND_DIRECT;
+            out->branch_conditional = true;
+        }
+        break;
+    }
+    case TRACE_ISA_MIPS: {
+        const char *m = info->mnemonic;
+        if ((!strcmp(m, "jr") || !strcmp(m, "jr.hb")) &&
+            !strcmp(info->op_str, "$ra")) {
+            out->branch_type = BRANCH_RETURN;
+        }
+        break;
+    }
     case TRACE_ISA_RISCV: {
         const char *m = info->mnemonic;
         if (!strcmp(m, "jal") || !strcmp(m, "c_jal") ||

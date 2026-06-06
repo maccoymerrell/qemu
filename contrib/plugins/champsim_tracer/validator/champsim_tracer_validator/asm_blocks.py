@@ -692,6 +692,7 @@ class CondBranch(CodeBlock):
                 ExpectedMemOp("store", s1, 8, _u32(a ^ 0xA5A5)),
             ],
             coarse_opcodes={"LOAD": 2, "XOR": 1, "STORE": 1, "BRANCH": 1},
+            asserted_branch_types=["BRANCH_COND_DIRECT"],
             branch_pred=ctx.branch_outcome,
         )
 
@@ -1149,6 +1150,95 @@ class IndirectJump(CodeBlock):
                 "  jr $t9",
                 "  nop",
             ]
+        return "\n".join(lines) + "\n"
+
+
+@register
+class CallReturnLocal(CodeBlock):
+    """Self-contained call + return + rejoin.  Pins three branch
+    classes in ONE asserted PC range on every ISA: the direct call,
+    the callee's RETURN, and the plain unconditional DIRECT_JUMP that
+    hops over the callee.  DirectCall/IndirectCall call the external
+    wptgen_leaf, whose return instruction lies OUTSIDE any asserted
+    block range — which is exactly how MIPS "jr $ra" being classified
+    INDIRECT_JUMP (returns never logged) went unnoticed.  Keeping the
+    callee inside the block makes the return assertable."""
+    name = "call_return_local"
+    scratch_slots = 0
+    randomizable = False
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=[],
+            asserted_branch_types=["BRANCH_DIRECT_CALL", "BRANCH_RETURN",
+                                   "BRANCH_DIRECT_JUMP"],
+            asserted_opcodes=["BRANCH"],
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        lines = _prologue(ctx.block_id)
+        if ctx.isa == "x86_64":
+            lines += ["  call 1f", "  jmp 2f", "1:", "  ret", "2:"]
+        elif ctx.isa == "aarch64":
+            # x30 clobber is fine: DirectCall's bl wptgen_leaf already
+            # relies on the generated flow not holding lr live.
+            lines += ["  bl 1f", "  b 2f", "1:", "  ret", "2:"]
+        elif ctx.isa == "riscv64":
+            lines += ["  jal ra, 1f", "  j 2f", "1:", "  ret", "2:"]
+        else:
+            lines += [
+                "  jal 1f",
+                "  nop",
+                "  b 2f",
+                "  nop",
+                "1:",
+                "  jr $ra",
+                "  nop",
+                "2:",
+            ]
+        lines += _jump(ctx.isa, ctx.successor_labels[0])
+        return "\n".join(lines) + "\n"
+
+
+@register
+class CondCcBranch(CodeBlock):
+    """Compare + flag-conditional branch, asserting BRANCH_COND_DIRECT.
+    The shared _branch_zero_to helper uses the compare-and-branch
+    register forms (cbz / beqz / beq), so on aarch64 the "b.<cc>"
+    encoding — which shares AARCH64_INS_B with the unconditional "b" —
+    was never emitted by any probe, hiding its misclassification as
+    DIRECT_JUMP.  This block pins the flag-based conditional family on
+    every ISA (aarch64 b.<cc>, x86 jcc, riscv/mips compare-branch)."""
+    name = "cond_cc_branch"
+    scratch_slots = 0
+    randomizable = False
+
+    @classmethod
+    def plan(cls, ctx: EmitCtx) -> BlockPlan:
+        return BlockPlan(
+            block_id=ctx.block_id,
+            name=cls.name,
+            memops=[],
+            asserted_branch_types=["BRANCH_COND_DIRECT"],
+            asserted_opcodes=["BRANCH"],
+        )
+
+    @classmethod
+    def emit(cls, plan: BlockPlan, ctx: EmitCtx) -> str:
+        lines = _prologue(ctx.block_id)
+        if ctx.isa == "x86_64":
+            lines += ["  testq %rsp, %rsp", "  jne 1f", "  nop", "1:"]
+        elif ctx.isa == "aarch64":
+            lines += ["  cmp sp, #0", "  b.ne 1f", "  nop", "1:"]
+        elif ctx.isa == "riscv64":
+            lines += ["  bne sp, zero, 1f", "  nop", "1:"]
+        else:
+            lines += ["  bne $sp, $zero, 1f", "  nop", "  nop", "1:"]
+        lines += _jump(ctx.isa, ctx.successor_labels[0])
         return "\n".join(lines) + "\n"
 
 

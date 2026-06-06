@@ -3831,6 +3831,129 @@ def _check_call_return_balance(entries: list[dict],
         {"calls": calls, "returns": rets})]
 
 
+def _check_unconditional_direction(templates: list[dict],
+                                   entries: list[dict],
+                                   templates_by_id: dict,
+                                   trace_meta: dict) -> list[Issue]:
+    """An unconditional direct transfer (DIRECT_JUMP / DIRECT_CALL
+    without the conditional flag) has exactly one outcome — it can
+    never fall through.  A trace where one does means the classifier
+    mistyped a conditional branch (the aarch64 "b.<cc>" -> DIRECT_JUMP
+    bug shape).  Trace-wide, so it catches misclassification on any
+    workload, not only asserted probe blocks.
+
+    Two evidence sources, weakest first:
+
+    1. Template profile taken/nottaken counts.  Secondary only — the
+       writer's profile_branch() forces taken=true for terminals
+       without the conditional flag (correct wire semantics for
+       indirect terminals and the jump-to-next degenerate), so this
+       pass cannot see THIS bug shape; it guards against profile
+       corruption generally.
+    2. The CP entry stream — the unlaundered ground truth.  For each
+       same-thread consecutive entry pair, an unconditional direct
+       terminal followed by its own fall-through PC (when the recorded
+       jump target differs from the fall-through) fell through, which
+       is impossible for a correctly-classified direct transfer.
+
+    The x86 loop-family encoding (DIRECT_JUMP + branch_conditional,
+    see X86CondUncondBlock) legitimately resolves both ways and is
+    exempted via the conditional flag."""
+    bn = trace_meta.get("branch_names") or {}
+    uncond_direct = {int(k) for k, v in bn.items()
+                     if v in ("BRANCH_DIRECT_JUMP", "BRANCH_DIRECT_CALL")}
+    if not uncond_direct:
+        return []
+
+    def uncond_term(t: dict):
+        """Terminal insn if it is an unconditional direct transfer."""
+        if t.get("is_system"):
+            return None
+        for ins in reversed(t.get("insns") or []):
+            if bn.get(ins.get("branch_type", 0),
+                      "BRANCH_NONE") not in ("", "BRANCH_NONE"):
+                if (int(ins["branch_type"]) in uncond_direct
+                        and not ins.get("branch_conditional")):
+                    return ins
+                return None
+        return None
+
+    issues: list[Issue] = []
+
+    # Pass 1: profile counts (secondary net, see docstring).
+    prof_checked = prof_flagged = 0
+    for t in templates:
+        term = uncond_term(t)
+        if term is None:
+            continue
+        prof_checked += 1
+        taken = nottaken = 0
+        for tgt in (t.get("profile") or {}).get("targets") or []:
+            taken    += tgt["taken_cp"] + tgt["taken_wp"]
+            nottaken += tgt["nottaken_cp"] + tgt["nottaken_wp"]
+        if taken > 0 and nottaken > 0:
+            prof_flagged += 1
+            if prof_flagged <= 3:
+                issues.append(Issue(
+                    "unconditional_direction", "error",
+                    f"template {t.get('template_id')} "
+                    f"pc=0x{t.get('start_pc', 0):x}: unconditional "
+                    f"{bn[int(term['branch_type'])]} profile resolved "
+                    f"both ends (taken={taken} nottaken={nottaken})",
+                    {"template_id": t.get("template_id")}))
+
+    # Pass 2: entry-stream successor check (authoritative).
+    fell_through = 0
+    seen_pairs = 0
+    example_tmpls: dict = {}        # template_id -> (pc, ft); distinct sites
+    prev_by_thread: dict = {}
+    for e in entries:
+        tid = e.get("thread_id", 0)
+        prev = prev_by_thread.get(tid)
+        prev_by_thread[tid] = e
+        if prev is None:
+            continue
+        pt = templates_by_id.get(prev["template_id"])
+        ct = templates_by_id.get(e["template_id"])
+        if pt is None or ct is None:
+            continue
+        term = uncond_term(pt)
+        if term is None:
+            continue
+        ft = pt.get("fall_through_pc")
+        if not ft:
+            continue
+        tgt_pcs = {tg["pc"] for tg in
+                   (pt.get("profile") or {}).get("targets") or []}
+        if ft in tgt_pcs:
+            continue            # jump-to-next degenerate: taking == falling
+        seen_pairs += 1
+        if ct.get("start_pc") == ft:
+            fell_through += 1
+            k = pt.get("template_id")
+            if len(example_tmpls) < 3 and k not in example_tmpls:
+                example_tmpls[k] = (pt.get("start_pc", 0), ft)
+    examples = [(k, pc, ft) for k, (pc, ft) in example_tmpls.items()]
+    for tid_, pc_, ft_ in examples:
+        issues.append(Issue(
+            "unconditional_direction", "error",
+            f"template {tid_} pc=0x{pc_:x}: unconditional direct "
+            f"terminal fell through to 0x{ft_:x} — a conditional branch "
+            f"is likely misclassified",
+            {"template_id": tid_}))
+    if fell_through > len(examples):
+        issues.append(Issue(
+            "unconditional_direction", "error",
+            f"...and {fell_through - len(examples)} more fall-through "
+            f"executions of unconditional direct terminals"))
+    issues.append(Issue(
+        "unconditional_direction", "info",
+        f"profile: {prof_checked} unconditional direct terminals, "
+        f"{prof_flagged} both-ends; entry stream: {seen_pairs} successor "
+        f"pairs, {fell_through} fell through"))
+    return issues
+
+
 def _check_regfile_records(body_stats: dict,
                            expected_threads: int = 1) -> list[Issue]:
     """A BODY_TAG_REGFILE record must precede each thread's first
@@ -5102,6 +5225,8 @@ def validate_structural(trace_path: Path,
     body_stats = trace_meta.get("body_stats") or {}
     stats["body_stats"] = body_stats
     templates_by_id = {t["template_id"]: t for t in templates}
+    issues += _check_unconditional_direction(templates, entries,
+                                             templates_by_id, trace_meta)
     issues += _check_iframe_cadence(body_stats, entries, trace_meta)
     issues += _check_regfile_records(body_stats, expected_threads)
     issues += _check_thread_switch(body_stats, expected_threads)
@@ -5468,6 +5593,8 @@ def validate(meta_path: Path, trace_path: Path,
     # plentiful), so walk the full entry stream, not just post-prologue.
     issues += _check_wp_events(body_stats, entries)
     issues += _check_atomic_count(body_stats, entries, templates_by_id)
+    issues += _check_unconditional_direction(templates, entries,
+                                             templates_by_id, trace_meta)
     issues += _check_call_return_balance(entries, templates_by_id, trace_meta)
     # System-mode only: the privilege bit and syscall round-trips are
     # meaningful when the trace interleaves a kernel (marker/pin mode).

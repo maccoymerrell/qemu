@@ -725,6 +725,54 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
     current_cpu->plugin_spec_mode = true;
 }
 
+/*
+ * Checkpoint / restore the guest virtual clock around a whole wrong-path
+ * excursion.  A WP excursion executes (bounded by wpdepth) in real host
+ * wall-clock time, but it is *outside* guest time: it must not advance the
+ * guest's perception of time any more than it advances the guest's registers.
+ * QEMU_CLOCK_VIRTUAL with icount off tracks host time, and every target reads
+ * its architected counter from it — aarch64 CNTVCT_EL0, x86 TSC, riscv `time`,
+ * mips Count — so a single freeze checkpoints the timer count for all ISAs at
+ * once.
+ *
+ * Driven from the plugin's OUTER excursion boundary (wp_enter/wp_end), not
+ * from spec_mode_begin/end: a wrong-path fault-skip tears down and re-enters
+ * spec mode mid-excursion, and pausing per spec-mode-entry would re-enable
+ * ticks across that gap and leak time per skip.  The real per-CPU work
+ * (cpu_disable_ticks/enable_ticks) lives in cpu_plugin_spec_vtime_* in
+ * cpu-exec.c, which is compiled per-target so it is a no-op in user mode;
+ * this common file must not reference the softmmu-only timer symbols.
+ */
+void qemu_plugin_spec_vtime_pause(void)
+{
+    g_assert(current_cpu);
+    cpu_plugin_spec_vtime_pause(current_cpu);
+}
+
+void qemu_plugin_spec_vtime_resume(void)
+{
+    g_assert(current_cpu);
+    cpu_plugin_spec_vtime_resume(current_cpu);
+}
+
+bool qemu_plugin_in_async_int(void)
+{
+#ifdef CONFIG_USER_ONLY
+    return false;
+#else
+    return current_cpu && current_cpu->plugin_in_async_int;
+#endif
+}
+
+void qemu_plugin_async_int_reset(void)
+{
+#ifndef CONFIG_USER_ONLY
+    if (current_cpu) {
+        current_cpu->plugin_in_async_int = false;
+    }
+#endif
+}
+
 void qemu_plugin_spec_mode_end(void)
 {
     g_assert(current_cpu);
@@ -744,11 +792,15 @@ void qemu_plugin_spec_mode_end(void)
     }
     current_cpu->plugin_spec_store_pool_used = 0;
 
-    /* No TLB flush needed at exit either: spec-mode TBs run with
-     * CF_FORCE_SLOW so their accesses bypass the TLB rather than
-     * populating it, and the normal-mode TLB entries that were
-     * present before spec-mode entry are still valid (guest page
-     * tables don't change underneath us). */
+    /*
+     * Flush the softmmu TLB on spec-mode exit (no-op in user mode).  Spec-mode
+     * accesses still run tlb_fill on a miss and install entries that a regime
+     * change on the wrong path can invalidate for the correct path; the
+     * register snapshot can't undo them (the TLB lives in CPUState).  The
+     * actual flush is in cpu_plugin_spec_tlb_flush (cpu-exec.c, per-target) so
+     * this common file does not reference softmmu-only tlb_flush.
+     */
+    cpu_plugin_spec_tlb_flush(current_cpu);
 }
 
 struct qemu_plugin_scoreboard *qemu_plugin_scoreboard_new(size_t element_size)

@@ -271,13 +271,36 @@ static void r4k_helper_tlbr(CPUMIPSState *env)
     }
 }
 
+/*
+ * Wrong-path (speculative) containment.  The emulated MIPS TLB array
+ * (env->tlb->mmu...) lives PAST end_reset_fields in CPUMIPSState, so it is
+ * NOT part of the register snapshot the wrong-path walk rolls back.  A
+ * speculative TLBWI/TLBWR/TLBINV(F) rewrites that array (and may flush the
+ * softmmu TLB), and the change survives the walk — corrupting the correct
+ * path's address translation.  Suppress these on the discarded path; the
+ * CP0 registers they consume (EntryHi/Lo/Index) are in the snapshot and are
+ * rolled back regardless.
+ */
+#ifdef CONFIG_PLUGIN
+#define MIPS_WP_TLB_GATE(env)                          \
+    do {                                               \
+        if (env_cpu(env)->plugin_spec_mode) {          \
+            return;                                    \
+        }                                              \
+    } while (0)
+#else
+#define MIPS_WP_TLB_GATE(env) do { } while (0)
+#endif
+
 void helper_tlbwi(CPUMIPSState *env)
 {
+    MIPS_WP_TLB_GATE(env);
     env->tlb->helper_tlbwi(env);
 }
 
 void helper_tlbwr(CPUMIPSState *env)
 {
+    MIPS_WP_TLB_GATE(env);
     env->tlb->helper_tlbwr(env);
 }
 
@@ -288,16 +311,19 @@ void helper_tlbp(CPUMIPSState *env)
 
 void helper_tlbr(CPUMIPSState *env)
 {
+    MIPS_WP_TLB_GATE(env);
     env->tlb->helper_tlbr(env);
 }
 
 void helper_tlbinv(CPUMIPSState *env)
 {
+    MIPS_WP_TLB_GATE(env);
     env->tlb->helper_tlbinv(env);
 }
 
 void helper_tlbinvf(CPUMIPSState *env)
 {
+    MIPS_WP_TLB_GATE(env);
     env->tlb->helper_tlbinvf(env);
 }
 
@@ -1034,6 +1060,21 @@ void mips_cpu_do_interrupt(CPUState *cs)
     bool update_badinstr = 0;
     target_ulong offset;
     int cause = -1;
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * System-mode tracing: flag an asynchronous-interrupt excursion (external
+     * hardware interrupt) so the tracer drops the handler (OS noise) while
+     * keeping synchronous exceptions (syscall, TLB/address faults).  Record
+     * the interrupted PC; the generic resume in cpu_exec_loop clears the flag
+     * when execution returns there.  Outermost only; never on wrong path.
+     */
+    if (cs->exception_index == EXCP_EXT_INTERRUPT &&
+        !cs->plugin_spec_mode && !cs->plugin_in_async_int) {
+        cs->plugin_in_async_int = true;
+        cs->plugin_async_departure_pc = cs->cc->get_pc(cs);
+    }
+#endif
 
     if (qemu_loglevel_mask(CPU_LOG_INT)
         && cs->exception_index != EXCP_EXT_INTERRUPT) {

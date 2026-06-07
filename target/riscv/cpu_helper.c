@@ -2280,6 +2280,20 @@ void riscv_cpu_do_interrupt(CPUState *cs)
      */
     bool async = !!(cs->exception_index & RISCV_EXCP_INT_FLAG);
     target_ulong cause = cs->exception_index & RISCV_EXCP_INT_MASK;
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * System-mode tracing: flag an asynchronous-interrupt excursion so the
+     * tracer drops the handler (OS noise) while keeping synchronous traps
+     * (ecall, page faults).  Record the interrupted PC as the departure point;
+     * the generic resume in cpu_exec_loop clears the flag when execution
+     * returns there.  Outermost only; never on the wrong path.  See cpu.h.
+     */
+    if (async && !cs->plugin_spec_mode && !cs->plugin_in_async_int) {
+        cs->plugin_in_async_int = true;
+        cs->plugin_async_departure_pc = cs->cc->get_pc(cs);
+    }
+#endif
     uint64_t deleg = async ? env->mideleg : env->medeleg;
     bool s_injected = env->mvip & (1ULL << cause) & env->mvien &&
         !(env->mip & (1ULL << cause));

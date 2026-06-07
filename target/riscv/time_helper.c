@@ -18,6 +18,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "cpu_bits.h"
 #include "time_helper.h"
 #include "hw/intc/riscv_aclint.h"
@@ -26,6 +27,18 @@ static void riscv_vstimer_cb(void *opaque)
 {
     RISCVCPU *cpu = opaque;
     CPURISCVState *env = &cpu->env;
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path: the host timer fired during a speculative excursion.  Don't
+     * touch the (rolled-back) interrupt state on the discarded path; just flag
+     * the host timer for re-sync on excursion exit so it isn't left dead (this
+     * one-shot has now fired and the cb does not itself re-arm).
+     */
+    if (CPU(cpu)->plugin_spec_mode) {
+        CPU(cpu)->plugin_spec_timer_dirty = true;
+        return;
+    }
+#endif
     env->vstime_irq = 1;
     riscv_cpu_update_mip(env, 0, BOOL_TO_MASK(1));
 }
@@ -33,6 +46,12 @@ static void riscv_vstimer_cb(void *opaque)
 static void riscv_stimer_cb(void *opaque)
 {
     RISCVCPU *cpu = opaque;
+#ifdef CONFIG_PLUGIN
+    if (CPU(cpu)->plugin_spec_mode) {
+        CPU(cpu)->plugin_spec_timer_dirty = true;
+        return;
+    }
+#endif
     riscv_cpu_update_mip(&cpu->env, MIP_STIP, BOOL_TO_MASK(1));
 }
 
@@ -52,6 +71,7 @@ void riscv_timer_write_timecmp(CPURISCVState *env, QEMUTimer *timer,
      * path.
      */
     if (env_cpu(env)->plugin_spec_mode) {
+        env_cpu(env)->plugin_spec_timer_dirty = true;
         return;
     }
 #endif
@@ -151,3 +171,39 @@ void riscv_timer_init(RISCVCPU *cpu)
     env->vstimer = timer_new_ns(QEMU_CLOCK_VIRTUAL, &riscv_vstimer_cb, cpu);
     env->vstimecmp = 0;
 }
+
+#ifdef CONFIG_PLUGIN
+void riscv_cpu_plugin_resync_timers(CPUState *cs)
+{
+    CPURISCVState *env = cpu_env(cs);
+    bool held;
+
+    if (likely(!cs->plugin_spec_timer_dirty)) {
+        return;
+    }
+    cs->plugin_spec_timer_dirty = false;
+
+    /* rdtime_fn is wired only when the supervisor timer (Sstc) is usable. */
+    if (!env->rdtime_fn) {
+        return;
+    }
+
+    /* riscv_timer_write_timecmp drives the interrupt line, which needs the BQL.
+     * It runs in full here because spec mode has already ended. */
+    held = bql_locked();
+    if (!held) {
+        bql_lock();
+    }
+    if (env->stimer) {
+        riscv_timer_write_timecmp(env, env->stimer, env->stimecmp,
+                                  0, MIP_STIP);
+    }
+    if (env->vstimer) {
+        riscv_timer_write_timecmp(env, env->vstimer, env->vstimecmp,
+                                  env->htimedelta, MIP_VSTIP);
+    }
+    if (!held) {
+        bql_unlock();
+    }
+}
+#endif

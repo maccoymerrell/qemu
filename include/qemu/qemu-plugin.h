@@ -1383,6 +1383,56 @@ QEMU_PLUGIN_API
 void qemu_plugin_spec_mode_end(void);
 
 /**
+ * qemu_plugin_spec_vtime_pause() - freeze the guest virtual clock
+ *
+ * Pause the guest's virtual clock (QEMU_CLOCK_VIRTUAL) for the duration of a
+ * wrong-path excursion so the speculative run's host wall-clock time does not
+ * advance the guest's architected timer counters (e.g. aarch64 CNTVCT, x86
+ * TSC, riscv `time`, mips Count).  Call once at the OUTER excursion boundary,
+ * before qemu_plugin_spec_mode_begin(); pair with qemu_plugin_spec_vtime_resume().
+ * Idempotent and a no-op in user-mode emulation.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_spec_vtime_pause(void);
+
+/**
+ * qemu_plugin_spec_vtime_resume() - resume the guest virtual clock
+ *
+ * Undo qemu_plugin_spec_vtime_pause(), discarding the wall-clock interval the
+ * excursion consumed so the guest's architected counters read the same value
+ * after the excursion as before it.  Call once at the OUTER excursion boundary,
+ * after qemu_plugin_spec_mode_end().
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_spec_vtime_resume(void);
+
+/**
+ * qemu_plugin_in_async_int() - is the vCPU inside an async-interrupt handler?
+ *
+ * Returns true while the executing vCPU is handling an asynchronous interrupt
+ * (timer/device IRQ/FIQ/SError) — from the interrupt's exception entry until
+ * the exception return that lands back at the interrupted PC, spanning any
+ * scheduler context-switch or nested sync/async exception in between.  False
+ * for synchronous entries alone (syscall/SVC, faults).  A system-mode tracer
+ * reads this to drop the async handler from the trace (non-representative OS
+ * noise) while keeping synchronous syscalls/faults.  Always false in user-mode
+ * emulation and on targets whose exception path is not yet instrumented.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_in_async_int(void);
+
+/**
+ * qemu_plugin_async_int_reset() - force-clear the async-interrupt flag
+ *
+ * Clears qemu_plugin_in_async_int() for the executing vCPU.  A tracer calls
+ * this at a known-clean point (e.g. opening a trace segment with the traced
+ * process at user level) to discard any stale state left by a pre-segment
+ * interrupt whose exception return never matched its departure PC.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_async_int_reset(void);
+
+/**
  * qemu_plugin_get_priv_level() - current privilege level of the executing vCPU
  *
  * Returns a normalized privilege ordinal: 0 = user / least privileged,

@@ -1484,6 +1484,32 @@ static int probe_access_internal(CPUState *cpu, vaddr addr,
     return flags;
 }
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Plugin wrong-path (speculative) execution: deny direct host pointers
+ * from the probe family so helper-mediated memory ops (SVE loads/stores,
+ * DC ZVA's block zero, MOPS, target PTW fast paths, ...) cannot touch
+ * real guest RAM — without a host pointer every caller falls back to its
+ * per-unit cpu_ld/st path, which routes through do_ld/do_st and the
+ * speculative store buffer / load redirection.  CF_FORCE_SLOW only
+ * covers the backend's INLINE qemu_ld/st path; these probes are how
+ * out-of-line helpers bypass it, identically on every guest ISA.
+ *
+ * Returning TLB_MMIO is the canonical "not directly accessible" signal.
+ * The gate also sits BEFORE notdirty_write: marking a clean page dirty
+ * is a real side effect, and on code pages it triggers TB invalidation —
+ * mutating JIT state mid-speculation.
+ */
+static inline bool probe_spec_deny(CPUState *cpu, void **phost)
+{
+    if (cpu_plugin_spec_redirect_probe(cpu)) {
+        *phost = NULL;
+        return true;
+    }
+    return false;
+}
+#endif
+
 int probe_access_full(CPUArchState *env, vaddr addr, int size,
                       MMUAccessType access_type, int mmu_idx,
                       bool nonfault, void **phost, CPUTLBEntryFull **pfull,
@@ -1492,6 +1518,12 @@ int probe_access_full(CPUArchState *env, vaddr addr, int size,
     int flags = probe_access_internal(env_cpu(env), addr, size, access_type,
                                       mmu_idx, nonfault, phost, pfull, retaddr,
                                       true);
+
+#ifdef CONFIG_PLUGIN
+    if (probe_spec_deny(env_cpu(env), phost)) {
+        return flags | TLB_MMIO;
+    }
+#endif
 
     /* Handle clean RAM pages.  */
     if (unlikely(flags & TLB_NOTDIRTY)) {
@@ -1517,6 +1549,12 @@ int probe_access_full_mmu(CPUArchState *env, vaddr addr, int size,
     int flags = probe_access_internal(env_cpu(env), addr, size, access_type,
                                       mmu_idx, true, phost, pfull, 0, false);
 
+#ifdef CONFIG_PLUGIN
+    if (probe_spec_deny(env_cpu(env), phost)) {
+        return flags | TLB_MMIO;
+    }
+#endif
+
     /* Handle clean RAM pages.  */
     if (unlikely(flags & TLB_NOTDIRTY)) {
         int dirtysize = size == 0 ? 1 : size;
@@ -1539,6 +1577,12 @@ int probe_access_flags(CPUArchState *env, vaddr addr, int size,
     flags = probe_access_internal(env_cpu(env), addr, size, access_type,
                                   mmu_idx, nonfault, phost, &full, retaddr,
                                   true);
+
+#ifdef CONFIG_PLUGIN
+    if (probe_spec_deny(env_cpu(env), phost)) {
+        return flags | TLB_MMIO;
+    }
+#endif
 
     /* Handle clean RAM pages. */
     if (unlikely(flags & TLB_NOTDIRTY)) {
@@ -1568,6 +1612,15 @@ void *probe_access(CPUArchState *env, vaddr addr, int size,
         return NULL;
     }
 
+#ifdef CONFIG_PLUGIN
+    /* Before the side effects below: a speculative probe must neither
+     * mark pages dirty (TB invalidation on code pages) nor fire
+     * watchpoints. */
+    if (cpu_plugin_spec_redirect_probe(env_cpu(env))) {
+        return NULL;
+    }
+#endif
+
     if (unlikely(flags & (TLB_NOTDIRTY | TLB_WATCHPOINT))) {
         /* Handle watchpoints.  */
         if (flags & TLB_WATCHPOINT) {
@@ -1583,12 +1636,6 @@ void *probe_access(CPUArchState *env, vaddr addr, int size,
         }
     }
 
-#ifdef CONFIG_PLUGIN
-    if (cpu_plugin_spec_redirect_probe(env_cpu(env))) {
-        return NULL;
-    }
-#endif
-
     return host;
 }
 
@@ -1598,6 +1645,16 @@ void *tlb_vaddr_to_host(CPUArchState *env, vaddr addr,
     CPUTLBEntryFull *full;
     void *host;
     int flags;
+
+#ifdef CONFIG_PLUGIN
+    /* Speculative execution: no direct host pointers (DC ZVA et al.
+     * fall back to their per-unit cpu_ld/st paths, which the spec
+     * sandbox intercepts).  Mirrors the documented user-mode
+     * behaviour. */
+    if (cpu_plugin_spec_redirect_probe(env_cpu(env))) {
+        return NULL;
+    }
+#endif
 
     flags = probe_access_internal(env_cpu(env), addr, 0, access_type,
                                   mmu_idx, true, &host, &full, 0, false);
@@ -2766,6 +2823,25 @@ static uint64_t do_st_leN(CPUState *cpu, MMULookupPageData *p,
     MemOp atom;
     unsigned tmp, half_size;
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Plugin wrong-path (speculative) execution: this is the bulk /
+     * cross-page store path (do_st4/8/16 route here when an access
+     * spans a page, and store_helper's general leN path).  Unlike the
+     * fixed-width do_st_1..16 it had no spec gate, so a speculative
+     * cross-page store landed straight in guest RAM via the
+     * store_*_leN host-pointer writes below — escaping the per-vCPU
+     * store sandbox and corrupting real memory (e.g. guest page
+     * tables) that the WP rollback cannot undo.  Sandbox the low
+     * p->size bytes here and return the unconsumed remainder, exactly
+     * as the TLB_DISCARD_WRITE path does. */
+    if (cpu_plugin_spec_active(cpu)) {
+        uint64_t v = val_le;
+        spec_store_bytes(cpu, p->addr, &v, p->size);
+        return p->size >= 8 ? 0 : (val_le >> (p->size * 8));
+    }
+#endif
+
     if (unlikely(p->flags & TLB_MMIO)) {
         return do_st_mmio_leN(cpu, p->full, val_le, p->addr,
                               p->size, mmu_idx, ra);
@@ -2819,6 +2895,20 @@ static uint64_t do_st16_leN(CPUState *cpu, MMULookupPageData *p,
 {
     int size = p->size;
     MemOp atom;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path containment: same missing-gate gap as do_st_leN, for
+     * the 8<size<=16 cross-page path (e.g. a page-straddling STP). */
+    if (cpu_plugin_spec_active(cpu)) {
+        uint64_t lo = int128_getlo(val_le), hi = int128_gethi(val_le);
+        unsigned nlo = size < 8 ? size : 8;
+        spec_store_bytes(cpu, p->addr, &lo, nlo);
+        if (size > 8) {
+            spec_store_bytes(cpu, p->addr + 8, &hi, size - 8);
+        }
+        return size > 8 ? (hi >> ((size - 8) * 8)) : (lo >> (size * 8));
+    }
+#endif
 
     if (unlikely(p->flags & TLB_MMIO)) {
         return do_st16_mmio_leN(cpu, p->full, val_le, p->addr,

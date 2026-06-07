@@ -535,8 +535,19 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
     /*
      * Clean up speculative state after an exception during wrong-path
      * execution.  Save the pointer before spec_mode_end() clears it.
+     *
+     * This is the ABNORMAL counterpart of wp_end_spec_session(): when a
+     * speculative exception/longjmp escapes the wrong-path walk it lands here
+     * instead of the normal wp_end path, so it must undo EVERYTHING that
+     * wp_enter_spec_session() set up — including resuming the guest virtual
+     * clock paused for the excursion.  Omitting the vtime resume leaves
+     * cpu_disable_ticks() in effect: QEMU_CLOCK_VIRTUAL (hence the guest's
+     * CNTVCT/TSC/time/Count) freezes for good, and the guest's timer
+     * subsystem livelocks — the self-sustaining aarch64 system-mode storm.
+     * vtime_resume is idempotent (per-CPU paused flag), so this is safe even
+     * if wp_end later runs too.
      */
-    if (cpu->plugin_spec_mode) {
+    if (cpu->plugin_spec_mode || cpu->plugin_spec_vtime_paused) {
         struct qemu_plugin_cpu_state *saved =
             cpu->plugin_spec_saved_state;
         qemu_plugin_spec_mode_end();
@@ -544,6 +555,7 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
             qemu_plugin_cpu_state_restore(saved);
             qemu_plugin_cpu_state_free(saved);
         }
+        cpu_plugin_spec_vtime_resume(cpu);
     }
 #endif
 
@@ -830,11 +842,147 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
     void *bp_save[16], *wp_save[16];
     memcpy(bp_save, env->cpu_breakpoint, sizeof(bp_save));
     memcpy(wp_save, env->cpu_watchpoint, sizeof(wp_save));
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    /*
+     * The generic timer's host QEMUTimers live OUTSIDE this register snapshot.
+     * If the restore rolls back any timer's ctl/cval — most importantly the
+     * ISTATUS bit, which the timer can advance to 1 when it expires (its
+     * iothread callback running while spec mode is briefly open in a fault-skip
+     * gap) during the excursion's host wall-clock window — the architected
+     * registers revert but the host QEMUTimer does not, leaving it parked
+     * (e.g. at INT64_MAX) and never firing again.  The guest's timer subsystem
+     * then livelocks: the aarch64 system-mode storm.  Detect any such rollback
+     * here and flag a resync (below) to re-arm the host timer to match the
+     * restored registers.  This is NOT covered by the spec-gate dirty flag,
+     * because the desyncing gt_recalc_timer ran with spec mode closed.
+     */
+    {
+        const CPUARMState *s = (const CPUARMState *)saved;
+        for (int i = 0; i < NUM_GTIMERS; i++) {
+            if (env->cp15.c14_timer[i].ctl != s->cp15.c14_timer[i].ctl ||
+                env->cp15.c14_timer[i].cval != s->cp15.c14_timer[i].cval) {
+                current_cpu->plugin_spec_timer_dirty = true;
+                break;
+            }
+        }
+    }
+#endif
     memcpy(env, saved, size);
     memcpy(env->cpu_breakpoint, bp_save, sizeof(bp_save));
     memcpy(env->cpu_watchpoint, wp_save, sizeof(wp_save));
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    /*
+     * Reconcile the host QEMUTimers with the just-restored registers (no-op
+     * unless the excursion dirtied the timer via a spec-gated write or the
+     * rollback above changed timer state).
+     */
+    arm_cpu_plugin_resync_timers(current_cpu);
+#endif
+#elif defined(TARGET_RISCV)
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    /*
+     * The Sstc supervisor/VS host timers (env->stimer/vstimer) live outside
+     * this register snapshot.  If the restore rolls back stimecmp/vstimecmp (or
+     * the vstime_irq latch), re-sync them so a rolled-back compare can't leave
+     * the host timer armed for a stale deadline (the ARM storm class).
+     */
+    {
+        const CPURISCVState *s = (const CPURISCVState *)saved;
+        if (env->stimecmp != s->stimecmp || env->vstimecmp != s->vstimecmp ||
+            env->vstime_irq != s->vstime_irq) {
+            current_cpu->plugin_spec_timer_dirty = true;
+        }
+    }
+    memcpy(env, saved, size);
+    riscv_cpu_plugin_resync_timers(current_cpu);
 #else
     memcpy(env, saved, size);
+#endif
+#elif defined(TARGET_MIPS)
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    /*
+     * The R4K host timer (env->timer) lives outside this register snapshot.
+     * If the restore rolls back CP0_Count/Compare, re-arm it so a rolled-back
+     * compare can't leave it stale (the ARM storm class).
+     */
+    {
+        const CPUMIPSState *s = (const CPUMIPSState *)saved;
+        if (env->CP0_Count != s->CP0_Count ||
+            env->CP0_Compare != s->CP0_Compare) {
+            current_cpu->plugin_spec_timer_dirty = true;
+        }
+    }
+    memcpy(env, saved, size);
+    mips_cpu_plugin_resync_timers(current_cpu);
+#else
+    memcpy(env, saved, size);
+#endif
+#else
+    memcpy(env, saved, size);
+#endif
+}
+
+/*
+ * Wrong-path containment helpers with softmmu-only side effects.  Compiled
+ * per-target so CONFIG_USER_ONLY selects the no-op forms; the common
+ * plugins/api.c calls these rather than referencing tlb_flush /
+ * cpu_disable_ticks directly (which are not linked into user-mode binaries).
+ */
+void cpu_plugin_spec_vtime_pause(CPUState *cpu)
+{
+#ifndef CONFIG_USER_ONLY
+    /*
+     * Freeze the guest virtual clock across a whole wrong-path excursion so
+     * the speculative run's host wall-clock time does not advance the guest's
+     * architected timer counters (CNTVCT / TSC / time / Count) — WP is outside
+     * guest time.  Idempotent + balanced via plugin_spec_vtime_paused so a
+     * fault-skip's spec_mode teardown/re-entry does not leak ticks.
+     */
+    if (cpu->plugin_spec_vtime_paused) {
+        return;
+    }
+    bool need_bql = !bql_locked();
+    if (need_bql) {
+        bql_lock();
+    }
+    cpu_disable_ticks();
+    cpu->plugin_spec_vtime_paused = true;
+    if (need_bql) {
+        bql_unlock();
+    }
+#endif
+}
+
+void cpu_plugin_spec_vtime_resume(CPUState *cpu)
+{
+#ifndef CONFIG_USER_ONLY
+    if (!cpu->plugin_spec_vtime_paused) {
+        return;
+    }
+    bool need_bql = !bql_locked();
+    if (need_bql) {
+        bql_lock();
+    }
+    cpu_enable_ticks();
+    cpu->plugin_spec_vtime_paused = false;
+    if (need_bql) {
+        bql_unlock();
+    }
+#endif
+}
+
+void cpu_plugin_spec_tlb_flush(CPUState *cpu)
+{
+#ifndef CONFIG_USER_ONLY
+    /*
+     * CF_FORCE_SLOW routes spec-mode memory through the slow do_ld/do_st
+     * helpers, but those still run tlb_fill on a miss, installing TLB entries.
+     * A wrong path can change the translation regime (an `eret` flips EL), so
+     * those entries are not guaranteed valid for the correct-path regime we
+     * roll back to; the register snapshot can't undo them (the softmmu TLB
+     * lives in CPUState, outside the snapshot).
+     */
+    tlb_flush(cpu);
 #endif
 }
 
@@ -1199,6 +1347,23 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 #endif
 
             cpu_get_tb_cpu_state(cpu_env(cpu), &pc, &cs_base, &flags);
+
+#ifdef CONFIG_PLUGIN
+            /*
+             * End an asynchronous-interrupt excursion when execution returns
+             * to the departure PC recorded on async entry (the interrupted
+             * instruction).  This generic resume point is target-independent
+             * and robust to the scheduler context-switching away during the
+             * handler and to nested exceptions: the departure PC is not
+             * executed inside the handler, only when its exception return
+             * lands back there.  Entry is flagged per-target in each
+             * <arch>_cpu_do_interrupt; see cpu.h.
+             */
+            if (unlikely(cpu->plugin_in_async_int) &&
+                pc == cpu->plugin_async_departure_pc) {
+                cpu->plugin_in_async_int = false;
+            }
+#endif
 
             /*
              * When requested, use an exact setting for cflags for the next

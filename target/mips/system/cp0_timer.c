@@ -53,12 +53,48 @@ static void cpu_mips_timer_update(CPUMIPSState *env)
 /* Expire the timer.  */
 static void cpu_mips_timer_expire(CPUMIPSState *env)
 {
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): don't set CP0_Cause[TI], drive the timer IRQ
+     * line, or reprogram the host timer on the discarded path.  CP0_Cause is in
+     * the register snapshot and is rolled back, but the IRQ line and the host
+     * QEMUTimer are external state that is not.  This callback may be the host
+     * timer firing mid-excursion; flag it so the host timer is re-armed on exit
+     * (mips_cpu_plugin_resync_timers) instead of being left stale.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        env_cpu(env)->plugin_spec_timer_dirty = true;
+        return;
+    }
+#endif
     cpu_mips_timer_update(env);
     if (env->insn_flags & ISA_MIPS_R2) {
         env->CP0_Cause |= 1 << CP0Ca_TI;
     }
     qemu_irq_raise(env->irq[(env->CP0_IntCtl >> CP0IntCtl_IPTI) & 0x7]);
 }
+
+#ifdef CONFIG_PLUGIN
+/*
+ * Re-arm the host R4K timer to match the architected CP0_Count/Compare after a
+ * wrong-path speculative state restore (no-op unless the excursion dirtied the
+ * timer).  cpu_mips_timer_update only reprograms the QEMUTimer (no IRQ line),
+ * so no BQL is required.  Called from cpu_plugin_arch_state_restore.
+ */
+void mips_cpu_plugin_resync_timers(CPUState *cs)
+{
+    CPUMIPSState *env = cpu_env(cs);
+
+    if (likely(!cs->plugin_spec_timer_dirty)) {
+        return;
+    }
+    cs->plugin_spec_timer_dirty = false;
+
+    if (env->timer && !(env->CP0_Cause & (1 << CP0Ca_DC))) {
+        cpu_mips_timer_update(env);
+    }
+}
+#endif
 
 uint32_t cpu_mips_get_count(CPUMIPSState *env)
 {

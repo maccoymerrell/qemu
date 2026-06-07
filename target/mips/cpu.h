@@ -1362,6 +1362,9 @@ uint64_t cpu_mips_phys_to_kseg1(void *opaque, uint64_t addr);
 void cpu_mips_soft_irq(CPUMIPSState *env, int irq, int level);
 void cpu_mips_irq_init_cpu(MIPSCPU *cpu);
 void cpu_mips_clock_init(MIPSCPU *cpu);
+#ifdef CONFIG_PLUGIN
+void mips_cpu_plugin_resync_timers(CPUState *cs);
+#endif
 
 #endif /* !CONFIG_USER_ONLY */
 

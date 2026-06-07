@@ -563,6 +563,45 @@ struct CPUState {
      * next safe point, after the nested walk has fully unwound.
      */
     bool plugin_flush_pending;
+    /*
+     * Set while the guest virtual clock is paused for a wrong-path excursion
+     * (qemu_plugin_spec_vtime_pause/resume).  Keeps the pause idempotent and
+     * balanced across a fault-skip's spec_mode teardown/re-entry, so the
+     * excursion's host wall-clock time never leaks into the guest's
+     * architected counters.
+     */
+    bool plugin_spec_vtime_paused;
+    /*
+     * Asynchronous-interrupt exclusion for system-mode tracing.  The target's
+     * exception-delivery path sets plugin_in_async_int=true on an ASYNCHRONOUS
+     * interrupt entry (timer/device IRQ/FIQ/SError), recording the interrupted
+     * guest PC (the departure point, where the handler's exception return will
+     * resume) in plugin_async_departure_pc.  The exception-return path clears
+     * the flag when it returns to exactly that PC — robust to the scheduler
+     * context-switching away and to nesting (the outermost departure PC is
+     * kept).  A tracer reads the flag (qemu_plugin_in_async_int) to drop the
+     * async handler — non-representative OS noise — while keeping synchronous
+     * syscalls/faults.  Set only on the correct path (never wrong-path).
+     */
+    bool plugin_in_async_int;
+    uint64_t plugin_async_departure_pc;
+    /*
+     * Register-coupled host-QEMUTimer desync guard for wrong-path rollback.
+     * Some targets back an architected timer (e.g. ARM generic timer) with a
+     * host QEMUTimer that lives OUTSIDE the CPUArchState register snapshot the
+     * wrong-path walk rolls back.  Two things can desync that host timer from
+     * the restored registers: (1) gt_recalc_timer is spec-gated, so a guest
+     * speculative timer-register write does not reprogram it; (2) worse, the
+     * host timer can FIRE in the iothread while the vcpu thread is mid-walk —
+     * its callback hits the spec gate and returns without re-arming, leaving
+     * the one-shot timer dead.  Either way, after the walk unwinds the
+     * registers say "armed/expired" but the host timer never fires again, and
+     * the guest's timer subsystem livelocks (the aarch64 system-mode storm).
+     * The target's spec-gated timer path sets this flag; on wrong-path exit
+     * the per-target state restore re-syncs the host timer to the restored
+     * registers (idempotent) and clears it.
+     */
+    bool plugin_spec_timer_dirty;
 #endif
 
     /* TODO Move common fields from CPUArchState here. */

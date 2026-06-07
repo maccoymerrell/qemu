@@ -81,4 +81,67 @@ static inline int cst_marker_x86_encode_seq(uint8_t *out)
     return cst_marker_x86_encode_seq_imm(out, CST_MARKER_MAGIC);
 }
 
+/*
+ * AArch64 / RISC-V / MIPS markers.  None of these can load a 32-bit
+ * immediate in one instruction, so the marker UNIT is the minimal
+ * two-instruction load pair, and the sequence is the unit repeated
+ * CST_MARKER_SEQ_LEN times (6 fixed-width instructions, 24 bytes).
+ * The redundancy argument is unchanged: three back-to-back loads of
+ * the same constant into the same register are provably-dead work no
+ * compiler emits.
+ *
+ * The RISC-V pair uses the unadjusted hi20/lo12 split, which is only
+ * correct while (magic & 0xfff) < 0x800 — true for both magics
+ * (0x...401 / 0x...402); keep that property if the magics ever change.
+ */
+#define CST_MARKER_PAIR_INSN_BYTES 4
+#define CST_MARKER_PAIR_SEQ_INSNS  (2u * CST_MARKER_SEQ_LEN)
+#define CST_MARKER_PAIR_SEQ_BYTES  \
+    (CST_MARKER_PAIR_INSN_BYTES * CST_MARKER_PAIR_SEQ_INSNS)
+
+static inline void cst_marker_put_u32le(uint8_t *out, uint32_t w)
+{
+    out[0] = (uint8_t)(w);
+    out[1] = (uint8_t)(w >> 8);
+    out[2] = (uint8_t)(w >> 16);
+    out[3] = (uint8_t)(w >> 24);
+}
+
+/* aarch64: movz w0, #(imm & 0xffff) ; movk w0, #(imm >> 16), lsl #16 */
+static inline int cst_marker_a64_encode_seq_imm(uint8_t *out, uint32_t imm)
+{
+    uint32_t movz = 0x52800000u | ((imm & 0xffffu) << 5);
+    uint32_t movk = 0x72a00000u | ((imm >> 16) << 5);
+    for (unsigned i = 0; i < CST_MARKER_SEQ_LEN; i++) {
+        cst_marker_put_u32le(out + i * 8, movz);
+        cst_marker_put_u32le(out + i * 8 + 4, movk);
+    }
+    return CST_MARKER_PAIR_SEQ_BYTES;
+}
+
+/* riscv: lui a0, (imm >> 12) ; addi a0, a0, (imm & 0xfff) */
+static inline int cst_marker_riscv_encode_seq_imm(uint8_t *out, uint32_t imm)
+{
+    uint32_t lui  = ((imm >> 12) << 12) | (10u << 7) | 0x37u;
+    uint32_t addi = ((imm & 0xfffu) << 20) | (10u << 15) | (10u << 7) | 0x13u;
+    for (unsigned i = 0; i < CST_MARKER_SEQ_LEN; i++) {
+        cst_marker_put_u32le(out + i * 8, lui);
+        cst_marker_put_u32le(out + i * 8 + 4, addi);
+    }
+    return CST_MARKER_PAIR_SEQ_BYTES;
+}
+
+/* mips: lui $t0, (imm >> 16) ; ori $t0, $t0, (imm & 0xffff)
+ * (little-endian word stream — mipsel only, matching the traced target) */
+static inline int cst_marker_mips_encode_seq_imm(uint8_t *out, uint32_t imm)
+{
+    uint32_t lui = 0x3c080000u | (imm >> 16);
+    uint32_t ori = 0x35080000u | (imm & 0xffffu);
+    for (unsigned i = 0; i < CST_MARKER_SEQ_LEN; i++) {
+        cst_marker_put_u32le(out + i * 8, lui);
+        cst_marker_put_u32le(out + i * 8 + 4, ori);
+    }
+    return CST_MARKER_PAIR_SEQ_BYTES;
+}
+
 #endif /* CHAMPSIM_TRACER_MARKER_H */

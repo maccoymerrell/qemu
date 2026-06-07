@@ -9,7 +9,9 @@
  */
 
 #include <string.h>
+#include <stdlib.h>
 
+#include <atomic>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -118,6 +120,13 @@ static void wp_enter_spec_session(unsigned int cpu_index, uint64_t wrong_target,
     g_wp_state.saved_budget = qemu_plugin_u64_get(g_scoreboard.budget, cpu_index);
     g_wp_state.in_progress = true;
 
+    /* Freeze the guest virtual clock for the whole excursion (system mode):
+     * the speculative run burns host wall-clock time but is outside guest
+     * time, so it must not advance the guest's architected timer counters.
+     * Paused here at the outer boundary — not in spec_mode_begin — so a
+     * fault-skip's spec_mode teardown/re-entry does not leak ticks.  No-op
+     * in user mode. */
+    qemu_plugin_spec_vtime_pause();
     qemu_plugin_spec_mode_begin(saved_state);
     qemu_plugin_set_pc(wrong_target);
 }
@@ -144,6 +153,9 @@ static void wp_end_spec_session(unsigned int cpu_index,
     qemu_plugin_spec_mode_end();
     qemu_plugin_cpu_state_restore(saved_state);
     qemu_plugin_cpu_state_free(saved_state);
+    /* Resume the guest virtual clock, discarding the excursion's wall-clock
+     * time (outer-boundary twin of the pause in wp_enter_spec_session). */
+    qemu_plugin_spec_vtime_resume();
 
     g_wp_state.mem_accesses.clear();
 }
@@ -362,6 +374,12 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
 
     uint64_t prev_pre_pc = UINT64_MAX;
     uint32_t same_pre_pc_count = 0;
+    /* No-forward-progress detection: a same-PC repeat with no memop
+     * growth is a stuck excursion; bail after two (see the stuck-PC
+     * handler below).  prev_mem_size tracks the spec memop count to
+     * tell a stuck loop from a legitimately-advancing rep-string. */
+    uint32_t wp_noprogress_count = 0;
+    size_t   prev_mem_size = g_wp_state.mem_accesses.size();
     while (sim_insns < (uint64_t)max_wrong_path_depth ||
            !bb_pcs.empty()) {
         uint64_t pre_pc = qemu_plugin_get_pc();
@@ -392,15 +410,40 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
          * same-PC iterations (same threshold as the per-insn memop cap). */
         if (pre_pc == prev_pre_pc) {
             same_pre_pc_count++;
+            /*
+             * A legitimate same-PC repeat is a rep-string op: PC stays
+             * anchored while each sandboxed iteration advances state
+             * (its memop grows g_wp_state.mem_accesses).  A repeat with
+             * NO such progress is a genuinely stuck excursion — a
+             * degenerate wrong-path target that re-faults or self-loops
+             * on every fetch, making no forward progress at all.  Those
+             * must die fast: in a system-mode kernel a stuck excursion
+             * recurs on essentially every BB, and at the old
+             * CST_FID_SLOT_COUNT (64) threshold each wasted ~64 steps,
+             * so the trace never advanced (observed: ~900k degenerate
+             * kernel excursions pinning an aarch64 system-mode run).
+             * Bail after two no-progress repeats; rep-string keeps the
+             * higher tolerance because its memop count climbs. */
+            if (g_wp_state.mem_accesses.size() == prev_mem_size) {
+                if (++wp_noprogress_count >= 2) {
+                    poisoned_targets.insert(pre_pc);
+                    acc.clear();
+                    bb_reg_snaps.clear();
+                    early_exit = true;
+                    break;
+                }
+            } else {
+                wp_noprogress_count = 0;
+            }
         } else {
             prev_pre_pc = pre_pc;
             same_pre_pc_count = 1;
+            wp_noprogress_count = 0;
         }
+        prev_mem_size = g_wp_state.mem_accesses.size();
         if (same_pre_pc_count > CST_FID_SLOT_COUNT) {
-            /* Stuck on the same pre_pc: the previous iteration's
-             * exec_tb ran a TB starting at pre_pc, so its first
-             * insn's size is what we need to step past.  Fall back
-             * to 1 if no exec_tb has happened on this WP sim yet. */
+            /* rep-string overrun guard (PC anchored, memops climbing
+             * past the per-insn cap): nudge past the offending insn. */
             BBTemplate *stuck = g_wp_state.last_executed_tb;
             uint8_t isz = (stuck && stuck->n_insns > 0)
                 ? stuck->insn_sizes[0] : 1;

@@ -31,6 +31,15 @@ bool cpu_plugin_exec_inline(CPUState *cpu);
 bool cpu_plugin_exec_tb(CPUState *cpu);
 size_t cpu_plugin_arch_state_size(void);
 void cpu_plugin_arch_state_restore(void *saved, size_t size);
+/*
+ * Wrong-path containment helpers with system-only side effects.  Defined in
+ * cpu-exec.c (compiled per-target, so the CONFIG_USER_ONLY split applies);
+ * no-ops in user-mode emulation.  Called from the common plugins/api.c, which
+ * itself must not reference softmmu-only symbols directly.
+ */
+void cpu_plugin_spec_vtime_pause(CPUState *cpu);
+void cpu_plugin_spec_vtime_resume(CPUState *cpu);
+void cpu_plugin_spec_tlb_flush(CPUState *cpu);
 
 #define REAL_HOST_PAGE_ALIGN(addr) ROUND_UP((addr), qemu_real_host_page_size())
 

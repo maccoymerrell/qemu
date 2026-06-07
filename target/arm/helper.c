@@ -1658,9 +1658,40 @@ static void pmintenclr_write(CPUARMState *env, const ARMCPRegInfo *ri,
     pmu_update_irq(env);
 }
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Wrong-path (speculative) containment for the address-translation regime.
+ *
+ * A write to a system register that reconfigures address translation
+ * (TTBR/TCR/SCTLR/TTBCR) or the exception vector base (VBAR) takes effect on
+ * the QEMU translation regime *immediately*.  On the discarded wrong path that
+ * is a containment hole: a mispredicted WP that lands in the KPTI trampoline
+ * (mapped at the fixed 0xffff_fbff_… address) executes `msr TTBR1_EL1` to
+ * switch from the restricted user-time page tables to the full kernel tables,
+ * then escapes its sandbox and runs away through the exception vectors —
+ * millions of speculative insns that never return.  The register's
+ * CPUArchState backing is rolled back at walk end, so dropping the speculative
+ * reconfiguration is harmless; keeping the WP in the regime it started in is
+ * the whole point of containment.
+ */
+static inline bool arm_spec_freeze_regime(CPUARMState *env)
+{
+    return unlikely(env_cpu(env)->plugin_spec_mode);
+}
+#else
+static inline bool arm_spec_freeze_regime(CPUARMState *env)
+{
+    (void)env;
+    return false;
+}
+#endif
+
 static void vbar_write(CPUARMState *env, const ARMCPRegInfo *ri,
                        uint64_t value)
 {
+    if (arm_spec_freeze_regime(env)) {
+        return;
+    }
     /*
      * Note that even though the AArch64 view of this register has bits
      * [10:0] all RES0 we can only mask the bottom 5, to comply with the
@@ -2457,6 +2488,19 @@ uint64_t gt_get_countervalue(CPUARMState *env)
 static void gt_update_irq(ARMCPU *cpu, int timeridx)
 {
     CPUARMState *env = &cpu->env;
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative) containment: never drive the generic-timer
+     * IRQ line on the discarded path.  qemu_set_irq() mutates the GIC's
+     * pending state, which lives outside the CPUArchState register snapshot
+     * the wrong-path walk rolls back, so a speculative toggle leaks into the
+     * correct path's interrupt delivery.
+     */
+    if (unlikely(CPU(cpu)->plugin_spec_mode)) {
+        CPU(cpu)->plugin_spec_timer_dirty = true;
+        return;
+    }
+#endif
     uint64_t cnthctl = env->cp15.cnthctl_el2;
     ARMSecuritySpace ss = arm_security_space(env);
     /* ISTATUS && !IMASK */
@@ -2577,7 +2621,30 @@ uint64_t gt_direct_access_timer_offset(CPUARMState *env, int timeridx)
 static void gt_recalc_timer(ARMCPU *cpu, int timeridx)
 {
     ARMGenericTimer *gt = &cpu->env.cp15.c14_timer[timeridx];
-
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative) containment: never reprogram the host
+     * QEMUTimer (timer_mod) or touch the IRQ line on the discarded path.
+     * The QEMUTimer's armed deadline is external state, not part of the
+     * CPUArchState register snapshot the walk rolls back; a single
+     * speculative reprogram (reached e.g. via an ungated CNTVOFF/CNTHCTL
+     * writefn) leaves the kernel's virtual-timer deadline wrong after the
+     * walk unwinds, which wedged the aarch64 system-mode timer subsystem
+     * (the IRQ then fired without end and the guest never returned to
+     * userspace).  The c14_timer[].ctl ISTATUS this would recompute is in
+     * CPUArchState and is restored regardless.
+     *
+     * Mark the host timer dirty so the wrong-path state restore re-syncs it:
+     * this call may be the host timer's own (iothread) callback firing during
+     * the walk, which hits this gate and returns without re-arming, leaving
+     * the one-shot timer dead.  Re-syncing on exit reconciles host timer and
+     * registers regardless of which spec path dirtied it.
+     */
+    if (unlikely(CPU(cpu)->plugin_spec_mode)) {
+        CPU(cpu)->plugin_spec_timer_dirty = true;
+        return;
+    }
+#endif
     if (gt->ctl & 1) {
         /*
          * Timer enabled: calculate and set current ISTATUS, irq, and
@@ -3132,6 +3199,46 @@ void arm_gt_hvtimer_cb(void *opaque)
 
     gt_recalc_timer(cpu, GTIMER_HYPVIRT);
 }
+
+#ifdef CONFIG_PLUGIN
+/*
+ * Re-synchronise the host generic-timer QEMUTimers with the architected timer
+ * registers after a wrong-path (speculative) state restore.  See the
+ * plugin_spec_timer_dirty comment in include/hw/core/cpu.h: the host timers
+ * live outside the rolled-back register snapshot, so a spec-gated reprogram or
+ * a host-timer callback that fired (and bailed) mid-walk can leave them out of
+ * step with the restored cval/ctl — wedging the guest's timer subsystem.
+ *
+ * gt_recalc_timer recomputes ISTATUS from the restored registers + current
+ * (un-frozen) count and re-arms / re-fires each timer, so it is exactly the
+ * reconciliation needed; it is idempotent on an already-consistent timer.
+ * Called only after spec mode has ended, so its own spec gate is open.  It
+ * drives the IRQ line, which requires the BQL.
+ */
+void arm_cpu_plugin_resync_timers(CPUState *cs)
+{
+    ARMCPU *cpu = ARM_CPU(cs);
+    bool held;
+
+    if (likely(!cs->plugin_spec_timer_dirty)) {
+        return;
+    }
+    cs->plugin_spec_timer_dirty = false;
+
+    held = bql_locked();
+    if (!held) {
+        bql_lock();
+    }
+    for (int i = 0; i < NUM_GTIMERS; i++) {
+        if (cpu->gt_timer[i]) {
+            gt_recalc_timer(cpu, i);
+        }
+    }
+    if (!held) {
+        bql_unlock();
+    }
+}
+#endif
 
 static const ARMCPRegInfo generic_timer_cp_reginfo[] = {
     /*
@@ -4278,6 +4385,9 @@ static void vmsa_tcr_el12_write(CPUARMState *env, const ARMCPRegInfo *ri,
 static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
                             uint64_t value)
 {
+    if (arm_spec_freeze_regime(env)) {
+        return;
+    }
     /* If the ASID changes (with a 64-bit write), we must flush the TLB.  */
     if (cpreg_field_is_64bit(ri) &&
         extract64(raw_read(env, ri) ^ value, 48, 16) != 0) {
@@ -10951,6 +11061,32 @@ void arm_cpu_do_interrupt(CPUState *cs)
     if (cs->exception_index == EXCP_SEMIHOST) {
         tcg_handle_semihosting(cs);
         return;
+    }
+#endif
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * System-mode tracing: flag asynchronous-interrupt entries so the tracer
+     * can exclude the handler (OS noise at emulator cadence) while keeping
+     * synchronous syscalls/faults.  Record the interrupted PC (where the
+     * exception return will resume) as the point at which the tracer resumes
+     * emission.  Placed after the PSCI/semihosting fast-returns (no real
+     * vector entry); skipped during wrong-path so a speculative path never
+     * sets it.
+     */
+    if (!cs->plugin_spec_mode && !cs->plugin_in_async_int) {
+        int idx = cs->exception_index;
+        bool is_async = (idx == EXCP_IRQ || idx == EXCP_FIQ ||
+                         idx == EXCP_VIRQ || idx == EXCP_VFIQ ||
+                         idx == EXCP_VSERR || idx == EXCP_NMI ||
+                         idx == EXCP_VINMI || idx == EXCP_VFNMI);
+        if (is_async) {
+            /* Enter the async excursion; record the departure PC (interrupted
+             * instruction) so the exception return that lands back there ends
+             * it.  Outermost only — nested async keeps this departure PC. */
+            cs->plugin_in_async_int = true;
+            cs->plugin_async_departure_pc = cs->cc->get_pc(cs);
+        }
     }
 #endif
 

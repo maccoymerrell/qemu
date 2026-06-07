@@ -1168,6 +1168,24 @@ void do_interrupt_all(X86CPU *cpu, int intno, int is_int,
 {
     CPUX86State *env = &cpu->env;
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * System-mode tracing: flag an asynchronous-interrupt excursion.  is_hw
+     * marks a hardware (external/NMI) interrupt — async; is_int (software INT)
+     * and exceptions (is_int=0,is_hw=0) are synchronous and stay traced.
+     * Record the interrupted linear PC as the departure point; the generic
+     * resume in cpu_exec_loop clears the flag on iret back to it.  Outermost
+     * only; never on the wrong path.  See cpu.h.
+     */
+    if (is_hw) {
+        CPUState *cs_ = CPU(cpu);
+        if (!cs_->plugin_spec_mode && !cs_->plugin_in_async_int) {
+            cs_->plugin_in_async_int = true;
+            cs_->plugin_async_departure_pc = cs_->cc->get_pc(cs_);
+        }
+    }
+#endif
+
     if (qemu_loglevel_mask(CPU_LOG_INT)) {
         if ((env->cr[0] & CR0_PE_MASK)) {
             static int count;

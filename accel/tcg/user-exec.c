@@ -888,6 +888,15 @@ int probe_access_flags(CPUArchState *env, vaddr addr, int size,
 
     g_assert(-(addr | TARGET_PAGE_MASK) >= size);
     flags = probe_access_internal(env, addr, size, access_type, nonfault, ra);
+#ifdef CONFIG_PLUGIN
+    /* Speculative execution: no direct host pointers — callers fall
+     * back to their per-unit cpu_ld/st path, which the spec sandbox
+     * intercepts (twin of the softmmu probe_access_flags gate). */
+    if (cpu_plugin_spec_redirect_probe(env_cpu(env))) {
+        *phost = NULL;
+        return flags | TLB_MMIO;
+    }
+#endif
     *phost = (flags & TLB_INVALID_MASK) ? NULL : g2h(env_cpu(env), addr);
     return flags;
 }

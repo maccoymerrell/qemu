@@ -1811,6 +1811,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         return;
     }
 
+
     /* Read the running instruction count.  The per-TB insn_count inline-add
      * is injected BEFORE this callback (plugin-gen emits a TB's cbs in
      * registration order, and the add is registered first in vcpu_tb_trans),
@@ -1857,6 +1858,32 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         }
     }
 
+    /*
+     * Asynchronous-interrupt exclusion.  An async IRQ/FIQ/SError is OS noise
+     * injected at the emulator's clock cadence — non-representative for a
+     * replay consumer, the source of trace non-determinism, and the trigger
+     * for the wrong-path "storm" (a spurious WP into the exception vector).
+     * Synchronous kernel work (syscalls, faults) is workload-induced and
+     * stays traced; only async excursions are suppressed.
+     *
+     * Resume is PC-based, not exception-nesting-based: depth counting is
+     * unreliable because the kernel's timer->schedule() context-switch
+     * decouples the entry from its eret across tasks (the per-CPU nesting is
+     * scrambled), which would leave the suspend stuck.  Instead we record the
+     * interrupted PC at async entry (in QEMU's delivery path) and resume when
+     * the traced process returns to exactly that PC.
+     *
+     * Critically, while suspended do NOT touch g_cp_prev_tb_template: leaving
+     * it at the pre-interrupt BB means the next traced TB (the resume point)
+     * is the interrupted branch's REAL target, so that branch finalizes
+     * correctly (no vector mislabel, no indirect-pool pollution, no spurious
+     * WP) and the handler simply never appears.  g_user_icount_seen was
+     * already advanced above, so the user clock excludes these insns.
+     */
+    if (qemu_plugin_in_async_int()) {
+        return;
+    }
+
     /* Snapshot the previous-TB cursor BEFORE updating it.  The chain
      * emit below walks this fragment list as "the TB that ran just
      * before this one", so it must capture the value g_cp_prev_tb_template
@@ -1899,6 +1926,11 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     if (segment_just_opened) {
         g_cp_prev_tb_template = nullptr;
+        /* Fresh segment: clear any pre-marker (boot) async-interrupt state, in
+         * case a boot interrupt's exception-return never matched its departure
+         * PC and left the flag stuck.  The marker fires with the pinned
+         * process at user level, with no async excursion in flight. */
+        qemu_plugin_async_int_reset();
         g_rec_mutex_unlock(&exec_lock);
         return;
     }
@@ -2304,24 +2336,84 @@ static void split_tb_into_fragments(const qemu_plugin_insn_info *insn_info,
  * The marker therefore originates in the post-execve image — compiled into
  * a synthetic workload, or injected at the entry point by cst_attach.
  */
-/* Marker magic / sequence length / x86 encoding: champsim_marker.h (the
- * contract shared with the cst_attach injector). */
+/* Marker magic / sequence length / per-arch encodings: champsim_marker.h
+ * (the contract shared with the cst_attach injector). */
 static std::atomic<bool> g_marker_fired{false};
 
-/* True if @bytes/@size begins with one x86 `mov $imm, %eax` (B8 imm32 LE). */
-static inline bool marker_mov_imm_match(const uint8_t *bytes, uint8_t size,
-                                        uint32_t imm)
+/*
+ * Per-ISA marker byte sequences, built once from the shared contract at
+ * install time.  x86 is CST_MARKER_SEQ_LEN identical 5-byte movs; the
+ * fixed-width ISAs are the minimal two-insn load pair repeated
+ * CST_MARKER_SEQ_LEN times (so their per-insn words ALTERNATE — the
+ * detector matches by sequence position, not by identical-insn run).
+ */
+struct MarkerSeq {
+    uint8_t start[CST_MARKER_PAIR_SEQ_BYTES];
+    uint8_t end[CST_MARKER_PAIR_SEQ_BYTES];
+    uint8_t insn_bytes = 0;            /* fixed insn width in the seq */
+    uint8_t n_insns    = 0;            /* insns per full sequence */
+    bool    valid      = false;
+};
+static MarkerSeq g_marker_seq;
+
+static void marker_seq_init(void)
 {
-    uint8_t want[CST_MARKER_X86_INSN_BYTES];
-    cst_marker_x86_encode_imm(want, imm);
-    return size >= CST_MARKER_X86_INSN_BYTES &&
-           memcmp(bytes, want, CST_MARKER_X86_INSN_BYTES) == 0;
+    MarkerSeq &m = g_marker_seq;
+    switch (trace_isa) {
+    case TRACE_ISA_X86:
+        static_assert(CST_MARKER_X86_SEQ_BYTES <= CST_MARKER_PAIR_SEQ_BYTES,
+                      "MarkerSeq buffers sized by the pair sequence");
+        cst_marker_x86_encode_seq_imm(m.start, CST_MARKER_MAGIC);
+        cst_marker_x86_encode_seq_imm(m.end, CST_MARKER_END_MAGIC);
+        m.insn_bytes = CST_MARKER_X86_INSN_BYTES;
+        m.n_insns    = CST_MARKER_SEQ_LEN;
+        m.valid      = true;
+        break;
+    case TRACE_ISA_AARCH64:
+        cst_marker_a64_encode_seq_imm(m.start, CST_MARKER_MAGIC);
+        cst_marker_a64_encode_seq_imm(m.end, CST_MARKER_END_MAGIC);
+        m.insn_bytes = CST_MARKER_PAIR_INSN_BYTES;
+        m.n_insns    = CST_MARKER_PAIR_SEQ_INSNS;
+        m.valid      = true;
+        break;
+    case TRACE_ISA_RISCV:
+        cst_marker_riscv_encode_seq_imm(m.start, CST_MARKER_MAGIC);
+        cst_marker_riscv_encode_seq_imm(m.end, CST_MARKER_END_MAGIC);
+        m.insn_bytes = CST_MARKER_PAIR_INSN_BYTES;
+        m.n_insns    = CST_MARKER_PAIR_SEQ_INSNS;
+        m.valid      = true;
+        break;
+    case TRACE_ISA_MIPS:
+        cst_marker_mips_encode_seq_imm(m.start, CST_MARKER_MAGIC);
+        cst_marker_mips_encode_seq_imm(m.end, CST_MARKER_END_MAGIC);
+        m.insn_bytes = CST_MARKER_PAIR_INSN_BYTES;
+        m.n_insns    = CST_MARKER_PAIR_SEQ_INSNS;
+        m.valid      = true;
+        break;
+    default:
+        m.valid = false;
+        break;
+    }
 }
-/* Start-marker insn (open + ASID-pin) / end-marker insn (close). */
-static inline bool marker_mov_match(const uint8_t *bytes, uint8_t size)
-{ return marker_mov_imm_match(bytes, size, CST_MARKER_MAGIC); }
-static inline bool marker_end_mov_match(const uint8_t *bytes, uint8_t size)
-{ return marker_mov_imm_match(bytes, size, CST_MARKER_END_MAGIC); }
+
+/* Advance a position-indexed marker run: returns the new run position
+ * after seeing @bytes/@size at position @run (0-based).  On mismatch the
+ * insn may itself restart a run at position 0 (pair sequences alternate
+ * words, so a stray first-word can begin a fresh run immediately). */
+static inline uint32_t marker_run_step(const uint8_t *seq, uint32_t run,
+                                       const uint8_t *bytes, uint8_t size)
+{
+    const MarkerSeq &m = g_marker_seq;
+    if (size == m.insn_bytes &&
+        memcmp(bytes, seq + (size_t)run * m.insn_bytes, m.insn_bytes) == 0) {
+        return run + 1;
+    }
+    if (run != 0 && size == m.insn_bytes &&
+        memcmp(bytes, seq, m.insn_bytes) == 0) {
+        return 1;
+    }
+    return 0;
+}
 
 static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
 {
@@ -2534,30 +2626,27 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
 
         qemu_plugin_insn_data(insn, raw_bytes, raw_size);
 
-        /* WIN_MARKER (x86): detect the CST_MARKER_SEQ_LEN-long run of
-         * identical marker movs and arm the trace-open (START) or
-         * trace-close (END) callback on the LAST one.  Each counter counts
-         * consecutive matches in this TB's straight-line stream; arming on
-         * the final insn means that when it executes, the whole sequence ran
-         * before it.  Registered at every translation so the marker is
-         * caught wherever the process runs. */
-        if (g_window_mode == PluginConfig::WIN_MARKER &&
-            trace_isa == TRACE_ISA_X86) {
-            if (marker_mov_match(raw_bytes, raw_size)) {
-                if (++marker_run >= CST_MARKER_SEQ_LEN) {
-                    qemu_plugin_register_vcpu_insn_exec_cb(
-                        insn, vcpu_marker_cb, QEMU_PLUGIN_CB_NO_REGS, nullptr);
-                }
-            } else {
+        /* WIN_MARKER: detect the marker sequence (per-ISA bytes, see
+         * MarkerSeq) and arm the trace-open (START) or trace-close (END)
+         * callback on its LAST instruction.  Each counter tracks the
+         * sequence position reached in this TB's straight-line stream;
+         * arming on the final insn means that when it executes, the whole
+         * sequence ran before it.  Registered at every translation so the
+         * marker is caught wherever the process runs. */
+        if (g_window_mode == PluginConfig::WIN_MARKER && g_marker_seq.valid) {
+            marker_run = marker_run_step(g_marker_seq.start, marker_run,
+                                         raw_bytes, raw_size);
+            if (marker_run >= g_marker_seq.n_insns) {
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, vcpu_marker_cb, QEMU_PLUGIN_CB_NO_REGS, nullptr);
                 marker_run = 0;
             }
-            if (marker_end_mov_match(raw_bytes, raw_size)) {
-                if (++marker_end_run >= CST_MARKER_SEQ_LEN) {
-                    qemu_plugin_register_vcpu_insn_exec_cb(
-                        insn, vcpu_marker_end_cb, QEMU_PLUGIN_CB_NO_REGS,
-                        nullptr);
-                }
-            } else {
+            marker_end_run = marker_run_step(g_marker_seq.end, marker_end_run,
+                                             raw_bytes, raw_size);
+            if (marker_end_run >= g_marker_seq.n_insns) {
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, vcpu_marker_end_cb, QEMU_PLUGIN_CB_NO_REGS,
+                    nullptr);
                 marker_end_run = 0;
             }
         }
@@ -3325,6 +3414,11 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     target_big_endian = (trace_isa == TRACE_ISA_MIPS &&
                          !g_str_has_suffix(target_name, "el"));
 
+    /* Build the per-ISA marker byte sequences (WIN_MARKER detection).
+     * The MIPS encoding is little-endian — mipsel only, matching the
+     * supported targets. */
+    marker_seq_init();
+
     /*
      * Map ISA to Capstone arch/mode.  arch is determined by
      * target_name and set here; the mode resolver may introspect the
@@ -3466,9 +3560,9 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         /* No segment opens until the named symbol is seen
          * start_symbol_occurrence times in vcpu_tb_exec. */
     } else if (g_window_mode == PluginConfig::WIN_MARKER) {
-        if (trace_isa != TRACE_ISA_X86) {
-            fprintf(stderr, "champsim_tracer: trace_window=marker is "
-                    "x86-only for now\n");
+        if (!g_marker_seq.valid) {
+            fprintf(stderr, "champsim_tracer: trace_window=marker has no "
+                    "marker encoding for this ISA\n");
             return -1;
         }
         /* No segment opens until the guest launch wrapper's magic

@@ -334,10 +334,15 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
              * NOTE: must use remaining(), not sec.end() — for
              * mem-backed subs end() is the absolute offset, not
              * payload size, and the subtraction underflows. */
+            /* Decode the length-prefixed section IN PLACE — no sub-reader,
+             * no copy.  Derive the same byte split (overhead = prefix +
+             * framing, payload = section bytes) from the length, and assert
+             * exact consumption instead of the old sub-reader eof(). */
             size_t sec_in_start = body.consumed();
-            cst::Reader sec = body.sub();
-            size_t sec_payload = sec.remaining();
-            size_t sec_total = body.consumed() - sec_in_start;
+            uint64_t sec_payload = body.uleb();
+            cst::Reader &sec = body;
+            size_t sec_end = sec.consumed() + sec_payload;
+            size_t sec_total = (sec.consumed() - sec_in_start) + sec_payload;
             s->cp_field_delta.bytes += sec_total;
             cpfd_b[BIDX_OVERHEAD].bytes += sec_total - sec_payload;
             cpfd_b[BIDX_OVERHEAD].count += 1;
@@ -353,7 +358,7 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                 tally_fd_record(sec, fid, ids, &cpfd_b,
                                 &cp_ipos, cp_tmpl, /*is_wp=*/false, s);
             }
-            if (!sec.eof()) {
+            if (sec.consumed() != sec_end) {
                 throw std::runtime_error("CP field-delta had trailing bytes");
             }
 
@@ -362,10 +367,13 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                 continue;
             }
 
-            /* WP chain envelope. */
+            /* WP chain envelope — decoded in place (no sub-reader). */
             size_t wp_in_start = body.consumed();
-            cst::Reader wpb = body.sub();
-            s->wp_chain_envelope.bytes += body.consumed() - wp_in_start;
+            uint64_t wp_env_payload = body.uleb();
+            cst::Reader &wpb = body;
+            size_t wp_env_end = wpb.consumed() + wp_env_payload;
+            s->wp_chain_envelope.bytes +=
+                (wpb.consumed() - wp_in_start) + wp_env_payload;
 
             uint64_t num_wp = wpb.uleb();
             int32_t prev_wp_tid = 0;
@@ -383,9 +391,11 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                 }
 
                 size_t wp_sec_in = wpb.consumed();
-                cst::Reader wpsec = wpb.sub();
-                size_t wp_sec_payload = wpsec.remaining();
-                size_t wp_sec_total = wpb.consumed() - wp_sec_in;
+                uint64_t wp_sec_payload = wpb.uleb();
+                cst::Reader &wpsec = wpb;
+                size_t wp_sec_end = wpsec.consumed() + wp_sec_payload;
+                size_t wp_sec_total =
+                    (wpsec.consumed() - wp_sec_in) + wp_sec_payload;
                 s->wp_field_delta.bytes += wp_sec_total;
                 wpfd_b[BIDX_OVERHEAD].bytes += wp_sec_total - wp_sec_payload;
                 wpfd_b[BIDX_OVERHEAD].count += 1;
@@ -400,18 +410,19 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                     tally_fd_record(wpsec, fid, ids, &wpfd_b,
                                     &wp_ipos, wp_tmpl, /*is_wp=*/true, s);
                 }
-                if (!wpsec.eof()) {
+                if (wpsec.consumed() != wp_sec_end) {
                     throw std::runtime_error("WP field-delta had trailing bytes");
                 }
             }
             s->wp_entries_total += num_wp;
-            if (!wpb.eof()) {
+            if (wpb.consumed() != wp_env_end) {
                 throw std::runtime_error("WP chain had trailing bytes");
             }
 
-            /* WP events sub-section: opaque to audit. */
+            /* WP events sub-section: opaque to audit — skip in place. */
             size_t ev_in = body.consumed();
-            (void)body.sub();
+            uint64_t ev_payload = body.uleb();
+            body.skip(ev_payload);
             s->wp_events.bytes += body.consumed() - ev_in;
             continue;
         }
@@ -424,10 +435,10 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
         }
 
         if (tag == ids.body_tag_iframe) {
-            (void)body.sub();                 /* cp delta section */
+            { uint64_t n = body.uleb(); body.skip(n); }   /* cp delta section */
             if (have_wp) {
-                (void)body.sub();             /* wp chain section */
-                (void)body.sub();             /* wp events section */
+                { uint64_t n = body.uleb(); body.skip(n); }  /* wp chain  */
+                { uint64_t n = body.uleb(); body.skip(n); }  /* wp events */
             }
             s->iframe_count++;
             s->iframe_bytes.bytes += body.consumed() - tag_start;

@@ -148,6 +148,32 @@ public:
         return s;
     }
 
+    /* Advance @n bytes without materialising them — refills the streaming
+     * window as needed, no copy.  Used to skip the unknown tail of a
+     * length-prefixed section decoded in place (forward-compat) and to
+     * parse-skip sections the consumer doesn't read. */
+    void skip(uint64_t n) {
+        while (n > 0) {
+            if (pos_ >= end_) {
+                ensure(1);   /* refill (streaming) or throw (past end) */
+            }
+            size_t take = end_ - pos_;
+            if ((uint64_t)take > n) take = (size_t)n;
+            pos_ += take;
+            n   -= take;
+        }
+    }
+
+    /* Skip forward until consumed() == @target (the absolute byte offset of
+     * a section's end).  Cheap no-op when already there. */
+    void skip_to_consumed(size_t target) {
+        size_t cur = consumed();
+        if (target < cur) {
+            throw std::runtime_error("reader: backward section skip");
+        }
+        skip(target - cur);
+    }
+
     /*
      * Fast path: a single-byte ULEB already resident in the buffer window
      * — overwhelmingly the common case in delta-encoded bodies.  Just a
@@ -345,6 +371,34 @@ private:
     /* For streaming readers: cumulative bytes shifted out of the
      * sliding buffer; consumed() returns this + pos_. */
     size_t                  consumed_total_ = 0;
+};
+
+/*
+ * In-place reader for a length-prefixed section, replacing sub() on the hot
+ * body path: it reads the section length, then lets the caller decode records
+ * straight from the SAME (streaming) reader into its maps — no copy, no
+ * per-section container — and on scope exit skips any unread trailing bytes
+ * (forward-compat), exactly as the old sub() sub-reader's destructor did by
+ * having already consumed the whole section.  Bind a `Reader &` to it via the
+ * conversion operator and use that as before:
+ *
+ *     SectionScope scope(parent);
+ *     Reader &sec = scope;          // decode from sec exactly like the old sub
+ */
+class SectionScope {
+public:
+    explicit SectionScope(Reader &r) : r_(r) {
+        uint64_t n = r_.uleb();              /* section payload length */
+        end_ = r_.consumed() + n;            /* sequence after the length read */
+    }
+    ~SectionScope() { r_.skip_to_consumed(end_); }
+    SectionScope(const SectionScope &) = delete;
+    SectionScope &operator=(const SectionScope &) = delete;
+    operator Reader &() { return r_; }
+    Reader &reader() { return r_; }
+private:
+    Reader &r_;
+    size_t  end_;
 };
 
 }  /* namespace cst */

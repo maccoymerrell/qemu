@@ -533,10 +533,10 @@ void BodyWalker::handle_entry(WalkState &ws, const Callback &cb)
      * sub-section, present only when the CST_FLAG_WP header bit is
      * set; otherwise the entry is just its CP delta. */
     if (flags_ & header_.ids.flag_wp) {
-        Reader wpb = body_.sub();
-        entry.wp_entries = decode_wp_chain(wpb, wp_state, &cp_state);
-        Reader evb = body_.sub();
-        decode_wp_events(evb, &entry.wp_entries);
+        { SectionScope s(body_); Reader &wpb = s;
+          entry.wp_entries = decode_wp_chain(wpb, wp_state, &cp_state); }
+        { SectionScope s(body_); Reader &evb = s;
+          decode_wp_events(evb, &entry.wp_entries); }
     }
 
     entry.thread_id       = ws.current_thread;
@@ -597,11 +597,11 @@ void BodyWalker::handle_iframe(WalkState &ws)
      * overlay falls back to iframe_cp as base, matching
      * st->iframe_cp_scratch shared between wp_state and wp_base. */
     if (flags_ & header_.ids.flag_wp) {
-        Reader wpb = body_.sub();
-        iframe_entry.wp_entries = decode_wp_chain(wpb, iframe_wp,
-                                                  &iframe_cp);
-        Reader evb = body_.sub();
-        decode_wp_events(evb, &iframe_entry.wp_entries);
+        { SectionScope s(body_); Reader &wpb = s;
+          iframe_entry.wp_entries = decode_wp_chain(wpb, iframe_wp,
+                                                    &iframe_cp); }
+        { SectionScope s(body_); Reader &evb = s;
+          decode_wp_events(evb, &iframe_entry.wp_entries); }
     }
 
     validate_iframe(*ws.prev_entry, iframe_entry);
@@ -803,7 +803,8 @@ void BodyWalker::decode_field_delta(Reader &outer,
                                     std::vector<MetaFlagsEntry> *metaflags,
                                     std::vector<LaneMaskEntry>  *lane_masks)
 {
-    Reader sec = outer.sub();
+    SectionScope scope(outer);
+    Reader &sec = scope;
     uint64_t n_records = sec.uleb();
     const ResolvedIds &ids = header_.ids;
 
@@ -992,7 +993,13 @@ void BodyWalker::consume_field_section(Reader &outer, uint32_t template_id,
                                        FieldStateTable *state,
                                        const FieldStateTable *base_state)
 {
-    Reader sec = outer.sub();
+    /* Decode the length-prefixed section IN PLACE — no sub-reader, no copy.
+     * Records are consumed strictly sequentially into the per-template state
+     * block (allocated once per bb template), so the bytes never need to be
+     * materialised; SectionScope skips any unknown trailing bytes on exit
+     * (forward-compat), matching the old sub() dtor. */
+    SectionScope scope(outer);
+    Reader &sec = scope;
     uint64_t n_records = sec.uleb();
     const ResolvedIds &ids = header_.ids;
 
@@ -1110,15 +1117,15 @@ void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
      * CST_FLAG_WP.  sub() consumes each section regardless of whether
      * we walk it, so Skip / event parse-skip are one line each. */
     if (flags_ & header_.ids.flag_wp) {
-        Reader wpb = body_.sub();
-        if (wp != WpDecode::Skip) {
-            FieldStateTable &wp_state =
-                ws.state_at(ws.wp_states, ws.current_thread);
-            stream_wp_chain_bb(wpb, wp_state, cp_state, wp, seq,
-                               ws.current_thread, cb);
+        { SectionScope s(body_); Reader &wpb = s;
+          if (wp != WpDecode::Skip) {
+              FieldStateTable &wp_state =
+                  ws.state_at(ws.wp_states, ws.current_thread);
+              stream_wp_chain_bb(wpb, wp_state, cp_state, wp, seq,
+                                 ws.current_thread, cb);
+          }
         }
-        Reader evb = body_.sub();   /* WP events: parse-skipped */
-        (void)evb;
+        { SectionScope s(body_); (void)s; }   /* WP events: parse-skipped */
     }
 }
 
@@ -1128,10 +1135,10 @@ void BodyWalker::skip_iframe_bb()
      * under CST_FLAG_WP], no leading template delta.  Consume the
      * sections to stay byte-aligned; the streaming path does not
      * field-validate. */
-    { Reader sec = body_.sub(); (void)sec; }
+    { SectionScope s(body_); (void)s; }
     if (flags_ & header_.ids.flag_wp) {
-        { Reader wpb = body_.sub(); (void)wpb; }
-        { Reader evb = body_.sub(); (void)evb; }
+        { SectionScope s(body_); (void)s; }
+        { SectionScope s(body_); (void)s; }
     }
     stats_.iframe_count++;
 }

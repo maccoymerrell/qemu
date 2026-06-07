@@ -112,6 +112,10 @@ struct Options {
      * combines traces of one program into a single representative SVG. */
     std::vector<const char *> inputs;
     const char *output       = nullptr;   /* nullptr -> stdout */
+    /* When set, also write the plotted numeric data as CSV here (a literal
+     * "-" means stdout).  The CSV carries the same per-bin series values the
+     * SVG draws, so stats can be compared/loaded without parsing the SVG. */
+    const char *csv_output   = nullptr;
     Metric      metric       = Metric::BranchMpki;
     /* Aggregate mode controls.  @aggregate forces it even for one input.
      * @weights overrides the per-trace header simpoint_weight (CLI order);
@@ -239,6 +243,10 @@ struct Options {
 "  -k, --top-k=N           Top-K layers for gen_op / gen_reg (default 10)\n"
 "  -t, --title=STR         Override chart title\n"
 "  -o, --output=FILE       Write SVG to FILE (default stdout)\n"
+"      --csv=FILE          Also write the plotted data as tidy CSV to FILE\n"
+"                          (\"-\" = stdout).  Columns: pane,segment,bin,x,\n"
+"                          series,value.  With --csv but no -o, only CSV is\n"
+"                          written (no SVG).\n"
 "      --aggregate         Force aggregate mode (implied for >1 trace)\n"
 "      --weights=W,W,...   Per-trace weights (CLI order; default = header\n"
 "                          simpoint_weight; all-zero -> even split)\n"
@@ -466,6 +474,10 @@ static Options parse_args(int argc, char **argv)
             need(i + 1, a); o.output = argv[++i];
         } else if (!std::strncmp(a, "--output=", 9)) {
             o.output = a + 9;
+        } else if (!std::strcmp(a, "--csv")) {
+            need(i + 1, a); o.csv_output = argv[++i];
+        } else if (!std::strncmp(a, "--csv=", 6)) {
+            o.csv_output = a + 6;
         } else if (!std::strcmp(a, "--aggregate")) {
             o.aggregate = true;
         } else if (!std::strcmp(a, "--weights")) {
@@ -3007,8 +3019,119 @@ static std::string short_trace_label(const char *path)
 /* Lay out a finished TraceResult into the SVG and render it.  Shared by the
  * single-trace and aggregate paths; the plans are already fully built (the
  * dual-pane axis finalisation happened upstream). */
+/* CSV escaping: quote a field iff it contains a comma, quote or newline. */
+static std::string csv_field(const std::string &s)
+{
+    if (s.find_first_of(",\"\n") == std::string::npos) {
+        return s;
+    }
+    std::string o = "\"";
+    for (char c : s) {
+        if (c == '"') {
+            o += '"';
+        }
+        o += c;
+    }
+    o += '"';
+    return o;
+}
+
+/* X-axis value for a bin, matching what the SVG prints: an explicit tick
+ * label if the plan supplies one, the bucket index (+ unit/overflow) for
+ * Bars histograms, else the instruction-window position bin*x_bin_size. */
+static std::string csv_x_value(const ChartPlan &plan, int bin)
+{
+    if (!plan.x_tick_labels.empty()) {
+        if (bin >= 0 && bin < (int)plan.x_tick_labels.size()) {
+            return plan.x_tick_labels[(size_t)bin];
+        }
+    }
+    if (plan.mode == ChartPlan::Mode::Bars) {
+        if (plan.has_overflow_bin && bin == plan.n_bins - 1 &&
+            !plan.overflow_label.empty()) {
+            return plan.overflow_label;
+        }
+        return std::to_string(bin) + plan.x_unit_suffix;
+    }
+    return std::to_string((unsigned long long)((uint64_t)bin * plan.x_bin_size));
+}
+
+/*
+ * Write one pane's plotted data as tidy (long-form) CSV: one row per
+ * (segment, bin, series).  This serialises the SAME per-bin Series values the
+ * SVG draws, for every metric/mode (lines, stacked, bars, aggregate montage),
+ * so the numbers can be diffed or loaded directly (e.g. pandas) without
+ * parsing SVG.  Dashed reference markers (saturation lines) are skipped.
+ * In montage (aggregate) mode the data lives per-segment and x is the
+ * segment-local bin index; otherwise x follows the plan's x-axis.
+ */
+static void write_csv_pane(std::FILE *out, const ChartPlan &plan,
+                           const char *pane, bool emit_header)
+{
+    if (emit_header) {
+        std::fprintf(out, "pane,segment,bin,x,series,value\n");
+    }
+    auto emit = [&](const std::string &seg, bool montage, int nbins,
+                    const std::vector<Series> &series) {
+        std::string segf = csv_field(seg);
+        for (const Series &s : series) {
+            if (s.dashed) {
+                continue;
+            }
+            std::string sf = csv_field(s.label);
+            int n = (int)s.y.size();
+            if (nbins > 0 && nbins < n) {
+                n = nbins;
+            }
+            for (int b = 0; b < n; b++) {
+                std::string x = montage ? std::to_string(b)
+                                        : csv_x_value(plan, b);
+                std::fprintf(out, "%s,%s,%d,%s,%s,%.10g\n",
+                             pane, segf.c_str(), b, csv_field(x).c_str(),
+                             sf.c_str(), s.y[(size_t)b]);
+            }
+        }
+    };
+    if (plan.segments.empty()) {
+        emit("", false, plan.n_bins, plan.series);
+    } else {
+        for (const auto &seg : plan.segments) {
+            emit(seg.label, true, seg.n_bins, seg.series);
+        }
+    }
+}
+
+static int write_csv_result(const TraceResult &tr, const Options &opts)
+{
+    std::FILE *out = stdout;
+    bool to_file = std::strcmp(opts.csv_output, "-") != 0;
+    if (to_file) {
+        out = std::fopen(opts.csv_output, "wb");
+        if (!out) {
+            std::fprintf(stderr, "cst_visualize: cannot open '%s'\n",
+                         opts.csv_output);
+            return 1;
+        }
+    }
+    write_csv_pane(out, tr.plan, "main", true);
+    if (tr.has_second_pane) {
+        write_csv_pane(out, tr.plan2, "second", false);
+    }
+    if (to_file) {
+        std::fclose(out);
+    }
+    return 0;
+}
+
 static int render_result(const TraceResult &tr, const Options &opts)
 {
+    if (opts.csv_output) {
+        int rc = write_csv_result(tr, opts);
+        /* --csv alone (no -o) emits only CSV; with -o, also draw the SVG. */
+        if (rc != 0 || !opts.output) {
+            return rc;
+        }
+    }
     std::FILE *out = stdout;
     if (opts.output) {
         out = std::fopen(opts.output, "wb");

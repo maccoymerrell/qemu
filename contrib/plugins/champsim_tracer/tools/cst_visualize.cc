@@ -1273,8 +1273,11 @@ private:
                 for (const Series &s : seg.series) {
                     const char *dash = s.dashed
                         ? " stroke-dasharray=\"6 4\"" : "";
+                    /* Thinner than the single-trace plot (1.5): the montage
+                     * packs every segment's series side by side, so a lighter
+                     * stroke keeps overlapping colours distinguishable. */
                     std::fprintf(out_, "<polyline fill=\"none\" stroke=\"%s\" "
-                        "stroke-width=\"1.5\"%s points=\"",
+                        "stroke-width=\"1.0\"%s points=\"",
                         s.color.c_str(), dash);
                     std::fprintf(out_, "%.2f,%.2f ",
                                  sxl, y_of_series(s, val(s, 0)));
@@ -3235,7 +3238,12 @@ int main(int argc, char **argv)
         wnorm[i] = (wsum > 0.0) ? wraw[i] / wsum : 1.0 / (double)nok;
     }
 
-    const double DISPLAY_BUDGET = 1000.0;  /* post-warmup points / montage */
+    /* Post-warmup data points spread across the whole montage.  Kept well
+     * below the montage pixel width (~1 point per ~2 px) so the per-segment
+     * Lines don't oscillate within a pixel and self-overlap into unreadable
+     * colour bands — the failure mode at 1 point/px.  Lower this further if
+     * lines still blur together; raise it for more temporal detail. */
+    const double DISPLAY_BUDGET = 500.0;
     std::vector<TraceResult> rs;
     rs.reserve(N);
     for (size_t i = 0; i < N; i++) {

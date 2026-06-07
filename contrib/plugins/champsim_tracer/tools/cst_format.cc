@@ -24,6 +24,41 @@
 
 namespace cst {
 
+/*
+ * LEB128 slow path (out-of-line).  The uleb()/sleb() fast paths in the
+ * header handle the dominant single-byte-resident case inline; these cover
+ * multi-byte values and values straddling a streaming buffer refill.
+ * Byte-for-byte equivalent to the original in-header loops.
+ */
+uint64_t Reader::uleb_slow() {
+    uint64_t out = 0;
+    unsigned shift = 0;
+    while (true) {
+        uint8_t b = u8();
+        out |= uint64_t(b & 0x7F) << shift;
+        if (!(b & 0x80)) return out;
+        shift += 7;
+        if (shift >= 64) throw std::runtime_error("ULEB128 too large");
+    }
+}
+
+int64_t Reader::sleb_slow() {
+    uint64_t out = 0;
+    unsigned shift = 0;
+    while (true) {
+        uint8_t b = u8();
+        out |= uint64_t(b & 0x7F) << shift;
+        shift += 7;
+        if (!(b & 0x80)) {
+            if (shift < 64 && (b & 0x40)) {
+                out |= ~uint64_t(0) << shift;
+            }
+            return static_cast<int64_t>(out);
+        }
+        if (shift >= 64) throw std::runtime_error("SLEB128 too large");
+    }
+}
+
 /* ===== Template parsing (shared) ========================================= */
 
 namespace {

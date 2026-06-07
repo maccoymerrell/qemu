@@ -148,16 +148,21 @@ public:
         return s;
     }
 
+    /*
+     * Fast path: a single-byte ULEB already resident in the buffer window
+     * — overwhelmingly the common case in delta-encoded bodies.  Just a
+     * bounds compare and a (near-always-predicted) high-bit test, small
+     * enough to inline into the caller, so the dominant case costs no
+     * call/ret and no per-byte ensure().  Multi-byte values and streaming
+     * buffer boundaries fall to the out-of-line uleb_slow().
+     */
     uint64_t uleb() {
-        uint64_t out = 0;
-        unsigned shift = 0;
-        while (true) {
-            uint8_t b = u8();
-            out |= uint64_t(b & 0x7F) << shift;
-            if (!(b & 0x80)) return out;
-            shift += 7;
-            if (shift >= 64) throw std::runtime_error("ULEB128 too large");
+        size_t p = pos_;
+        if (p < end_) {
+            uint8_t b = data_[p];
+            if (!(b & 0x80)) { pos_ = p + 1; return b; }
         }
+        return uleb_slow();
     }
 
     /*
@@ -201,21 +206,21 @@ public:
         }
     }
 
+    /* SLEB twin of the uleb() fast path: a single-byte value carries a
+     * 7-bit two's-complement payload; sign-extend bit 6.  Multi-byte and
+     * boundary cases fall to sleb_slow(). */
     int64_t sleb() {
-        uint64_t out = 0;
-        unsigned shift = 0;
-        while (true) {
-            uint8_t b = u8();
-            out |= uint64_t(b & 0x7F) << shift;
-            shift += 7;
+        size_t p = pos_;
+        if (p < end_) {
+            uint8_t b = data_[p];
             if (!(b & 0x80)) {
-                if (shift < 64 && (b & 0x40)) {
-                    out |= ~uint64_t(0) << shift;
-                }
+                pos_ = p + 1;
+                uint64_t out = b;                       /* b < 0x80 */
+                if (b & 0x40) out |= ~uint64_t(0x7F);   /* sign-extend bit 6 */
                 return static_cast<int64_t>(out);
             }
-            if (shift >= 64) throw std::runtime_error("SLEB128 too large");
         }
+        return sleb_slow();
     }
 
     std::array<uint64_t, 8> sleb_wide() {
@@ -279,6 +284,13 @@ public:
 
 private:
     static constexpr size_t STREAM_BUFFER_BYTES = 64 * 1024;
+
+    /* Out-of-line LEB decode for the non-trivial cases (multi-byte value
+     * or a value straddling a streaming refill).  Kept out of the header
+     * so the uleb()/sleb() fast paths stay small and inlinable; defined
+     * in cst_format.cc. */
+    uint64_t uleb_slow();
+    int64_t  sleb_slow();
 
     /* Memory-backed bounds check (used by sub() on mmap Readers). */
     void check_mem(size_t n) const {

@@ -976,13 +976,33 @@ void cpu_plugin_spec_tlb_flush(CPUState *cpu)
 #ifndef CONFIG_USER_ONLY
     /*
      * CF_FORCE_SLOW routes spec-mode memory through the slow do_ld/do_st
-     * helpers, but those still run tlb_fill on a miss, installing TLB entries.
-     * A wrong path can change the translation regime (an `eret` flips EL), so
-     * those entries are not guaranteed valid for the correct-path regime we
-     * roll back to; the register snapshot can't undo them (the softmmu TLB
-     * lives in CPUState, outside the snapshot).
+     * helpers, which run tlb_fill on a miss and install TLB entries.  Those
+     * entries are not guaranteed valid for the correct-path regime we roll back
+     * to (a wrong path can flip EL via `eret`), and the register snapshot can't
+     * undo them (the softmmu TLB lives in CPUState, outside the snapshot).
+     *
+     * A full tlb_flush() here is correct but ruinously expensive: it drops the
+     * entire correct-path TLB and jump cache on every excursion, and WP runs
+     * constantly.  Instead, tlb_set_page_full logged exactly the pages this
+     * excursion installed; invalidate only those (keyed by their install
+     * mmu_idx, which encodes the regime).  An excursion that only HIT existing
+     * entries logged nothing, so the common case costs zero.  A large-page
+     * install or log overflow falls back to the full flush.
      */
+#ifdef CONFIG_PLUGIN
+    if (cpu->plugin_spec_tlb_log_overflow) {
+        tlb_flush(cpu);
+    } else {
+        for (uint16_t i = 0; i < cpu->plugin_spec_tlb_log_n; i++) {
+            tlb_flush_page_by_mmuidx(cpu, cpu->plugin_spec_tlb_log[i].page,
+                                     1 << cpu->plugin_spec_tlb_log[i].mmu_idx);
+        }
+    }
+    cpu->plugin_spec_tlb_log_n = 0;
+    cpu->plugin_spec_tlb_log_overflow = false;
+#else
     tlb_flush(cpu);
+#endif
 #endif
 }
 

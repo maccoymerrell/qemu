@@ -1052,6 +1052,39 @@ static inline void tlb_set_compare(CPUTLBEntryFull *full, CPUTLBEntry *ent,
     full->slow_flags[access_type] = flags;
 }
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Record a TLB entry installed by a wrong-path (speculative) excursion so
+ * cpu_plugin_spec_tlb_flush() can invalidate just these pages on exit instead
+ * of flushing the whole TLB.  De-duplicated; a large page or overflow sets the
+ * overflow flag to force a full flush fallback.
+ */
+static void plugin_spec_tlb_log_add(CPUState *cpu, int mmu_idx, vaddr page,
+                                    bool large_page)
+{
+    if (cpu->plugin_spec_tlb_log_overflow) {
+        return;
+    }
+    if (large_page) {
+        cpu->plugin_spec_tlb_log_overflow = true;
+        return;
+    }
+    for (uint16_t i = 0; i < cpu->plugin_spec_tlb_log_n; i++) {
+        if (cpu->plugin_spec_tlb_log[i].page == page &&
+            cpu->plugin_spec_tlb_log[i].mmu_idx == mmu_idx) {
+            return;
+        }
+    }
+    if (cpu->plugin_spec_tlb_log_n >= CPU_SPEC_TLB_LOG_MAX) {
+        cpu->plugin_spec_tlb_log_overflow = true;
+        return;
+    }
+    cpu->plugin_spec_tlb_log[cpu->plugin_spec_tlb_log_n].page = page;
+    cpu->plugin_spec_tlb_log[cpu->plugin_spec_tlb_log_n].mmu_idx = mmu_idx;
+    cpu->plugin_spec_tlb_log_n++;
+}
+#endif
+
 /*
  * Add a new TLB entry. At most one entry for a given virtual address
  * is permitted. Only a single TARGET_PAGE_SIZE region is mapped, the
@@ -1084,6 +1117,17 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     }
     addr_page = addr & TARGET_PAGE_MASK;
     paddr_page = full->phys_addr & TARGET_PAGE_MASK;
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path installs are logged for targeted invalidation on excursion
+     * exit (see CPUState::plugin_spec_tlb_log), avoiding a full flush.
+     */
+    if (unlikely(cpu_plugin_spec_active(cpu))) {
+        plugin_spec_tlb_log_add(cpu, mmu_idx, addr_page,
+                                full->lg_page_size > TARGET_PAGE_BITS);
+    }
+#endif
 
     prot = full->prot;
     asidx = cpu_asidx_from_attrs(cpu, full->attrs);

@@ -602,6 +602,25 @@ struct CPUState {
      * registers (idempotent) and clears it.
      */
     bool plugin_spec_timer_dirty;
+    /*
+     * Wrong-path TLB-install log.  Speculative (wrong-path) accesses can
+     * install softmmu TLB entries on a miss.  Rather than a full tlb_flush()
+     * on every excursion exit — which drops the ENTIRE correct-path TLB plus
+     * the jump cache, ruinously expensive given how often WP runs — we record
+     * the pages an excursion installed (in tlb_set_page_full) and invalidate
+     * only those on exit.  When WP merely HITS existing entries (the common
+     * case) the log stays empty and no flush happens at all.  mmu_idx encodes
+     * the translation regime, so recording the actual install mmu_idx also
+     * covers the wrong-path-changed-EL (eret) concern.  A large-page install or
+     * log overflow falls back to a full flush.
+     */
+#define CPU_SPEC_TLB_LOG_MAX 64
+    struct {
+        vaddr page;
+        uint16_t mmu_idx;
+    } plugin_spec_tlb_log[CPU_SPEC_TLB_LOG_MAX];
+    uint16_t plugin_spec_tlb_log_n;
+    bool plugin_spec_tlb_log_overflow;
 #endif
 
     /* TODO Move common fields from CPUArchState here. */

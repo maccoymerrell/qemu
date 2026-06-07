@@ -205,11 +205,53 @@ std::string fmt_reg(const cst::Header &h, uint64_t r)
     return buf;
 }
 
+/*
+ * Hand-rolled lowercase-hex formatting.  These replace per-value /
+ * per-byte snprintf("%02x"/"%lx"), which dominated cst_decode (glibc's
+ * __printf_buffer + _itoa_word were ~28% of the legacy emit) because each
+ * call re-parses the format string and goes through the locale-aware int
+ * conversion.  A nibble table is far cheaper.  Output is byte-identical to
+ * the printf forms below.
+ */
+static const char k_hex_lc[] = "0123456789abcdef";
+
+/* Append @v as minimal-width lowercase hex (like "%" PRIx64). */
+static inline void append_hex(std::string &out, uint64_t v)
+{
+    char tmp[16];
+    int n = 0;
+    do {
+        tmp[n++] = k_hex_lc[v & 0xF];
+        v >>= 4;
+    } while (v);
+    while (n) {
+        out += tmp[--n];
+    }
+}
+
+/* Append @v as exactly @w lowercase-hex digits (like "%0*" PRIx64). */
+static inline void append_hex_width(std::string &out, uint64_t v, int w)
+{
+    char tmp[16];
+    for (int i = w - 1; i >= 0; i--) {
+        tmp[i] = k_hex_lc[v & 0xF];
+        v >>= 4;
+    }
+    out.append(tmp, (size_t)w);
+}
+
+/* Append @x as two lowercase-hex digits (like "%02x"). */
+static inline void append_byte_hex(std::string &out, uint8_t x)
+{
+    out += k_hex_lc[x >> 4];
+    out += k_hex_lc[x & 0xF];
+}
+
 std::string fmt_hex_lower(uint64_t v)
 {
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%" PRIx64, v);
-    return buf;
+    std::string out;
+    append_hex(out, v);
+    return out;
 }
 
 std::string fmt_bytes_hex(const std::vector<uint8_t> &b)
@@ -217,9 +259,7 @@ std::string fmt_bytes_hex(const std::vector<uint8_t> &b)
     std::string out;
     out.reserve(b.size() * 2);
     for (uint8_t x : b) {
-        char buf[3];
-        std::snprintf(buf, sizeof(buf), "%02x", x);
-        out += buf;
+        append_byte_hex(out, x);
     }
     return out;
 }
@@ -233,13 +273,14 @@ std::string fmt_snap_value(const cst::Wide &w)
 {
     uint64_t hi = w.limb[1];
     uint64_t lo = w.limb[0];
-    char buf[64];
+    std::string out = "0x";
     if (hi) {
-        std::snprintf(buf, sizeof(buf), "0x%" PRIx64 "%016" PRIx64, hi, lo);
+        append_hex(out, hi);
+        append_hex_width(out, lo, 16);
     } else {
-        std::snprintf(buf, sizeof(buf), "0x%" PRIx64, lo);
+        append_hex(out, lo);
     }
-    return buf;
+    return out;
 }
 
 /* ====================================================================

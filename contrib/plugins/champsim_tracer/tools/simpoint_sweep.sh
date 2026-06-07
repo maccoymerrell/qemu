@@ -51,7 +51,7 @@
 #   bbv/             basic-block vectors from libbbv
 #   simpoints/       .simpoints + .weights from simpoint
 #   traces_cp/       CST traces (CP only, no regdata/memdata)
-#   traces_full/     CST traces (CP+WP+regdata+memdata)
+#   traces_full/     CST traces (CP+WP; reg/mem values on CP, omitted on WP)
 #   plots/           <slug>_<variant>-<NNNB>__<metric>.svg per simpoint, plus
 #                    <slug>_<variant>__AGG__<metric>.svg whole-program aggregates
 #   logs/            per-stage stdout+stderr
@@ -506,15 +506,21 @@ main() {
                 "wp=0" "memdata=0" "regdata=0" "$COMPRESS"
         fi
 
-        # Full: WP on for both reads & writes, regdata+memdata on both
-        # CP and WP sides.  With --wpprune N the full variant is tagged
-        # full_p<N> and lands in traces_full_p<N>/ with wpprune=<N>.
+        # Full: WP on, with register + memory VALUES captured on the
+        # correct path (regdata=1, memdata=1) but OMITTED on the wrong
+        # path (wp_memdata=0, wp_regdata=0).  This is the default
+        # baseline: the wrong-path BB/branch structure is still traced
+        # (so branch-prediction, BTB, cache-pollution-by-address etc. are
+        # intact), but the speculative register/memory contents are
+        # dropped -- far smaller, and meaningful only if you are modelling
+        # speculative pollution of value predictors.  With --wpprune N the
+        # full variant is tagged full_p<N> and lands in traces_full_p<N>/.
         if [[ "$VARIANT_SEL" == full || "$VARIANT_SEL" == both ]]; then
             local -a prune_opt=()
             [[ -n "$WPPRUNE" ]] && prune_opt=("wpprune=${WPPRUNE}")
             stage_trace "$FULL_TAG" "$TR_FULL_DIR" \
                 "wp=1" "memdata=1" "regdata=1" \
-                "wp_memdata=1" "wp_regdata=1" "${prune_opt[@]}" "$COMPRESS"
+                "wp_memdata=0" "wp_regdata=0" "${prune_opt[@]}" "$COMPRESS"
         fi
     fi
 

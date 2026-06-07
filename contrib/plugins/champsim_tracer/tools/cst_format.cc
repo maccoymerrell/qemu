@@ -564,6 +564,33 @@ std::string codec_from_suffix(const std::string &member_name)
     return "";
 }
 
+/*
+ * "-T<n>" flag for the xz decompressor.  CST_DECODE_THREADS overrides the
+ * count (0 = one thread per core); unset uses a bounded auto of
+ * min(online_cpus, 8) — most of the multi-block decode speedup without the
+ * memory/thread blow-up of -T0 on a many-core host or when several tools
+ * run at once.  Set CST_DECODE_THREADS=1 to force serial (lowest memory),
+ * e.g. for a high-concurrency batch sweep.
+ */
+std::string decode_thread_flag()
+{
+    long n;
+    const char *e = getenv("CST_DECODE_THREADS");
+    if (e && *e) {
+        n = strtol(e, nullptr, 10);
+        if (n < 0) {
+            n = 0;
+        }
+    } else {
+        long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        if (cpus < 1) {
+            cpus = 1;
+        }
+        n = cpus < 8 ? cpus : 8;
+    }
+    return "-T" + std::to_string(n);
+}
+
 /* Source pulling bytes from a subprocess decompressor's stdout.
  * ctor forks the decompressor + a feeder child (writes compressed
  * bytes to its stdin); dtor closes stdout, SIGTERMs + reaps both
@@ -578,6 +605,19 @@ public:
                        const uint8_t *data, size_t size)
         : codec_(codec)
     {
+        /*
+         * xz can decode a multi-block stream in parallel, and the writer
+         * compresses bodies with -T so they ARE multi-block; serial decode
+         * is otherwise the dominant cost of every offline tool (lzma_decode
+         * was ~45% of cst_audit cycles).  Pass -T so the decompressor uses
+         * threads.  Compute the flag BEFORE fork() so the child does no
+         * allocation between fork and exec.  zstd decode does not parallelize
+         * this way, so it is left alone. */
+        std::string xz_tflag;
+        if (codec == "xz") {
+            xz_tflag = decode_thread_flag();
+        }
+
         int in_pipe[2], out_pipe[2];
         if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0) {
             throw std::runtime_error("decompress pipe(): "
@@ -593,8 +633,13 @@ public:
             dup2(out_pipe[1], 1);
             close(in_pipe[0]); close(in_pipe[1]);
             close(out_pipe[0]); close(out_pipe[1]);
-            execlp(codec.c_str(), codec.c_str(), "-d", "-c",
-                   (char *)nullptr);
+            if (!xz_tflag.empty()) {
+                execlp(codec.c_str(), codec.c_str(), "-d", "-c",
+                       xz_tflag.c_str(), (char *)nullptr);
+            } else {
+                execlp(codec.c_str(), codec.c_str(), "-d", "-c",
+                       (char *)nullptr);
+            }
             _exit(127);
         }
         close(in_pipe[0]);

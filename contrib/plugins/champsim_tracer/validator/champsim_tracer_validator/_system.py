@@ -8,7 +8,7 @@ space at ``_start``; the plugin pins the trace window to that address space
 (see champsim_marker.h / the marker docs in champsim_tracer.cc).
 
 Only the *runner* differs from user mode — generation, decode, and analysis
-are shared.  x86_64 only for now (the marker is x86-only).
+are shared.
 
 The system-mode assets (a kernel + a base initramfs root) are local and not
 in the repo; default to the maintainer's harness under ``--rootfs``-able
@@ -25,11 +25,43 @@ from pathlib import Path
 
 # Default local harness (override with --kernel / --rootfs).  The base root
 # is a busybox initramfs tree; we add /workload + /init and repack per run.
-DEFAULT_SYSTEST = Path("/mnt/md0/QEMU/systest/x86")
+SYSTEST_ROOT = Path("/mnt/md0/QEMU/systest")
+DEFAULT_SYSTEST = SYSTEST_ROOT / "x86"          # back-compat (x86 layout)
 
 ISA_QEMU_SYSTEM = {
-    "x86_64": "qemu-system-x86_64",
+    "x86_64":  "qemu-system-x86_64",
+    "aarch64": "qemu-system-aarch64",
+    "riscv64": "qemu-system-riscv64",
+    "mipsel":  "qemu-system-mipsel",
 }
+
+# Per-ISA boot shape: asset dir, kernel image name, machine/cpu flags, and
+# the console the kernel must be told to use.  virt machines for aarch64
+# and riscv64 (riscv's -kernel boots through the bundled OpenSBI); malta
+# for mipsel (little-endian kernel).
+_ISA_BOOT = {
+    "x86_64":  {"dir": "x86",     "kernel": "vmlinuz",
+                "machine": [],
+                "console": "ttyS0"},
+    "aarch64": {"dir": "aarch64", "kernel": "Image",
+                "machine": ["-M", "virt", "-cpu", "max,pauth-impdef=on"],
+                "console": "ttyAMA0"},
+    "riscv64": {"dir": "riscv64", "kernel": "Image",
+                "machine": ["-M", "virt"],
+                "console": "ttyS0"},
+    "mipsel":  {"dir": "mipsel",  "kernel": "vmlinux",
+                "machine": ["-M", "malta"],
+                "console": "ttyS0"},
+}
+
+
+def default_kernel(isa: str) -> Path:
+    b = _ISA_BOOT[isa]
+    return SYSTEST_ROOT / b["dir"] / b["kernel"]
+
+
+def default_root(isa: str) -> Path:
+    return SYSTEST_ROOT / _ISA_BOOT[isa]["dir"] / "root"
 
 # Guest init: mount the pseudo-filesystems, run the staged workload (which
 # fires the marker at _start so the plugin attaches + pins), then power off
@@ -84,15 +116,18 @@ def stage_initramfs(base_root: Path, workload: Path, stage_dir: Path) -> Path:
 
 
 def system_qemu_cmd(qemu_system: Path, kernel: Path, initrd: Path,
-                    plugin: Path, plugin_opts: str, mem: str = "512M"
-                    ) -> list[str]:
+                    plugin: Path, plugin_opts: str, mem: str = "512M",
+                    isa: str = "x86_64") -> list[str]:
     """Build the qemu-system command that boots @kernel + @initrd headless
-    with the plugin loaded, powering off (not rebooting) on guest halt."""
+    with the plugin loaded, powering off (not rebooting) on guest halt.
+    Machine model and console come from the per-ISA boot table."""
+    b = _ISA_BOOT[isa]
     return [
         str(qemu_system),
+        *b["machine"],
         "-kernel", str(kernel),
         "-initrd", str(initrd),
-        "-append", "console=ttyS0 panic=-1",
+        "-append", f"console={b['console']} panic=-1",
         "-nographic", "-no-reboot", "-m", mem,
         "-plugin", f"{plugin},{plugin_opts}",
     ]

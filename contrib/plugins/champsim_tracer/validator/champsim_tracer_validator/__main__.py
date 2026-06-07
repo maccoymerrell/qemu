@@ -364,13 +364,13 @@ def _trace_system(args, isa: str, bin_path: Path, plugin: Path,
                   out_base) -> int:
     """System-mode trace: boot qemu-system-<isa> with @bin_path staged into
     an initramfs.  The workload's compiled-in marker (generate --marker)
-    opens and ASID-pins the trace window inside the guest.  x86_64 only."""
+    opens and ASID-pins the trace window inside the guest."""
     if isa not in SYS.ISA_QEMU_SYSTEM:
-        print(f"trace[{isa}]: SKIP  system mode is x86_64-only for now")
+        print(f"trace[{isa}]: SKIP  no system-mode boot shape for this ISA")
         return 0
     qemu_sys = args.build_dir / SYS.ISA_QEMU_SYSTEM[isa]
-    kernel = Path(getattr(args, "kernel", None) or SYS.DEFAULT_SYSTEST / "vmlinuz")
-    base_root = Path(getattr(args, "rootfs", None) or SYS.DEFAULT_SYSTEST / "root")
+    kernel = Path(getattr(args, "kernel", None) or SYS.default_kernel(isa))
+    base_root = Path(getattr(args, "rootfs", None) or SYS.default_root(isa))
     for p, what in ((qemu_sys, "qemu-system"), (kernel, "kernel"),
                     (base_root, "rootfs base")):
         if not p.exists():
@@ -389,7 +389,7 @@ def _trace_system(args, isa: str, bin_path: Path, plugin: Path,
     stage_dir.mkdir(parents=True, exist_ok=True)
     initrd = SYS.stage_initramfs(base_root, bin_path, stage_dir)
     cmd = SYS.system_qemu_cmd(qemu_sys, kernel, initrd, plugin, plugin_opts,
-                              mem=getattr(args, "sys_mem", "512M"))
+                              mem=getattr(args, "sys_mem", "512M"), isa=isa)
     print(f"trace[{isa}] (system): {' '.join(cmd)}")
     rc = subprocess.call(cmd)
     cst = Path(f"{out_base}.cst")

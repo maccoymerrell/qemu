@@ -201,15 +201,33 @@ def _marker_contract() -> tuple[int, int, int]:
     return int(m.group(1), 16), int(e.group(1), 16), int(s.group(1))
 
 
+def _marker_seq(isa: str, magic: int, seq: int) -> list[str]:
+    """The marker sequence for @magic on @isa: identical immediate-loads
+    (x86: one mov each; fixed-width ISAs: the minimal two-insn load pair)
+    repeated @seq times.  The asm here must assemble to EXACTLY the bytes
+    champsim_marker.h's per-arch encoders produce — the plugin matches
+    raw bytes, and the encodings were verified assembler-vs-encoder."""
+    if isa == "x86_64":
+        return [f"  mov $0x{magic:08x}, %eax"] * seq
+    hi16, lo16 = magic >> 16, magic & 0xffff
+    if isa == "aarch64":
+        return [f"  movz w0, #0x{lo16:x}",
+                f"  movk w0, #0x{hi16:x}, lsl #16"] * seq
+    if isa == "riscv64":
+        # Unadjusted hi20/lo12 split — valid while (magic & 0xfff) < 0x800,
+        # a property champsim_marker.h asserts for both magics.
+        return [f"  lui a0, 0x{magic >> 12:x}",
+                f"  addi a0, a0, 0x{magic & 0xfff:x}"] * seq
+    # mipsel
+    return [f"  lui $t0, 0x{hi16:x}",
+            f"  ori $t0, $t0, 0x{lo16:x}"] * seq
+
+
 def emit_trace_marker(isa: str) -> list[str]:
-    """Emit the START marker: CST_MARKER_SEQ_LEN identical immediate-loads
-    the plugin detects to open and ASID-pin the trace window
-    (trace_window=marker).  x86 only for now, matching the plugin's detector;
-    other ISAs emit nothing (the system-mode marker is x86-only)."""
-    if isa != "x86_64":
-        return []
+    """Emit the START marker: the per-ISA marker sequence the plugin
+    detects to open and ASID-pin the trace window (trace_window=marker)."""
     magic, _end, seq = _marker_contract()
-    return [f"  mov $0x{magic:08x}, %eax"] * seq
+    return _marker_seq(isa, magic, seq)
 
 
 def emit_trace_syscall_probe(isa: str) -> list[str]:
@@ -220,23 +238,46 @@ def emit_trace_syscall_probe(isa: str) -> list[str]:
     resumes at the syscall's fall-through.
 
     ``close(-1)`` always returns ``-EBADF`` (no side effects), and runs
-    before the workload sets up any state, so clobbering the syscall
-    ABI registers (rax/rcx/r11) is harmless.  x86-only, matching the
-    marker; other ISAs emit nothing."""
-    if isa != "x86_64":
-        return []
+    before the workload sets up any state, so clobbering the per-ISA
+    syscall ABI registers is harmless."""
     # The marker opens the trace window *inside* the _start TB, and that
     # TB is dropped as the one-TB lossy segment-open boundary — so the
     # syscall must live in a SEPARATE TB that begins after the window is
     # already open.  A branch to a fresh label ends the marker's TB; the
     # syscall block then starts at the label and is captured.  Its
-    # fall-through is the following instruction (the entry jump), which is
-    # exactly where the kernel returns control.
+    # fall-through is the following instruction, which is exactly where
+    # the kernel returns control.
+    if isa == "x86_64":
+        return [
+            "  jmp cst_syscall_probe",
+            "cst_syscall_probe:",
+            "  mov $3, %eax",     # __NR_close
+            "  mov $-1, %edi",    # fd = -1  -> deterministic -EBADF
+            "  syscall",
+        ]
+    if isa == "aarch64":
+        return [
+            "  b cst_syscall_probe",
+            "cst_syscall_probe:",
+            "  mov w8, #57",      # __NR_close (asm-generic)
+            "  mov x0, #-1",
+            "  svc #0",
+        ]
+    if isa == "riscv64":
+        return [
+            "  j cst_syscall_probe",
+            "cst_syscall_probe:",
+            "  li a7, 57",        # __NR_close (asm-generic)
+            "  li a0, -1",
+            "  ecall",
+        ]
+    # mipsel (o32): __NR_close = 4000 + 6; branch needs its delay slot.
     return [
-        "  jmp cst_syscall_probe",
+        "  b cst_syscall_probe",
+        "  nop",
         "cst_syscall_probe:",
-        "  mov $3, %eax",     # __NR_close
-        "  mov $-1, %edi",    # fd = -1  -> deterministic -EBADF
+        "  li $v0, 4006",
+        "  li $a0, -1",
         "  syscall",
     ]
 
@@ -245,11 +286,9 @@ def emit_trace_marker_end(isa: str) -> list[str]:
     """Emit the END marker just before the workload exits: the plugin closes
     the trace window when it executes in the pinned process (the "or the
     program ends" stop, so a sub-budget workload ends cleanly instead of
-    running past process exit).  x86 only; other ISAs emit nothing."""
-    if isa != "x86_64":
-        return []
+    running past process exit)."""
     _magic, end, seq = _marker_contract()
-    return [f"  mov $0x{end:08x}, %eax"] * seq
+    return _marker_seq(isa, end, seq)
 
 
 def emit_helper_symbols(isa: str) -> list[str]:

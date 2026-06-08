@@ -117,10 +117,14 @@ struct Options {
      * SVG draws, so stats can be compared/loaded without parsing the SVG. */
     const char *csv_output   = nullptr;
     Metric      metric       = Metric::BranchMpki;
-    /* Unified mode: ignore @metric and render EVERY metric from a single
-     * decode pass.  @output is treated as a path prefix; each metric writes
-     * <prefix>__<metric>.svg (single trace) or <prefix>__AGG__<metric>.svg
-     * (aggregate), and likewise <prefix>__<metric>.csv when --csv is set. */
+    /* @metric_explicit: a -m/--metric was given, selecting a SINGLE metric.
+     * Otherwise the DEFAULT is the unified all-metrics pass.  @all forces the
+     * unified pass explicitly (accepted for back-compat; redundant now that it
+     * is the default).  Unified mode renders EVERY metric from a single decode
+     * pass: @output is a path PREFIX and each metric writes
+     * <prefix>__<metric>.svg (single trace) / <prefix>__AGG__<metric>.svg
+     * (aggregate), plus <prefix>__<metric>.csv when --csv is set. */
+    bool        metric_explicit = false;
     bool        all          = false;
     /* Aggregate mode controls.  @aggregate forces it even for one input.
      * @weights overrides the per-trace header simpoint_weight (CLI order);
@@ -202,8 +206,9 @@ struct Options {
 "order, width proportional to weight); histograms become a weighted-mean\n"
 "distribution.\n"
 "\n"
-"Metric (required):\n"
-"  -m branch_mpki   Branch MPKI under gshare (lines per --history)\n"
+"Metric (optional; DEFAULT renders every metric — see --all below):\n"
+"  -m branch_mpki   Render ONLY this metric (to -o FILE, or stdout).\n"
+"                   Branch MPKI under gshare (lines per --history)\n"
 "  -m wp_insns      Wasted WP insns/1k under gshare (lines per --history)\n"
 "  -m wp_memops     Wasted WP memops/1k under gshare (lines per --history)\n"
 "  -m btb_miss      BTB miss rate (lines per --btb-entries)\n"
@@ -252,13 +257,15 @@ struct Options {
 "                          (\"-\" = stdout).  Columns: pane,segment,bin,x,\n"
 "                          series,value.  With --csv but no -o, only CSV is\n"
 "                          written (no SVG).\n"
-"      --all               Render EVERY metric from a single decode pass.\n"
-"                          Ignores -m; -o is a path PREFIX and each metric\n"
+"  (default)               With no -m, render EVERY metric from a single\n"
+"                          decode pass: -o is a path PREFIX and each metric\n"
 "                          writes PREFIX__<metric>.svg (PREFIX__AGG__<metric>\n"
 "                          .svg with --aggregate), plus PREFIX__<metric>.csv\n"
 "                          when --csv is given.  Far cheaper than one run per\n"
 "                          metric.  All config (--history/--btb-entries/\n"
 "                          --cache-*/--rob-size) applies to the whole set.\n"
+"      --all               Explicitly request the all-metrics pass (this is\n"
+"                          the default when -m is absent; kept for clarity).\n"
 "      --aggregate         Force aggregate mode (implied for >1 trace)\n"
 "      --weights=W,W,...   Per-trace weights (CLI order; default = header\n"
 "                          simpoint_weight; all-zero -> even split)\n"
@@ -473,8 +480,10 @@ static Options parse_args(int argc, char **argv)
             usage(0);
         } else if (!std::strcmp(a, "-m") || !std::strcmp(a, "--metric")) {
             need(i + 1, a); o.metric = parse_metric(argv[++i]);
+            o.metric_explicit = true;
         } else if (!std::strncmp(a, "--metric=", 9)) {
             o.metric = parse_metric(a + 9);
+            o.metric_explicit = true;
         } else if (!std::strcmp(a, "-H") || !std::strcmp(a, "--history")) {
             need(i + 1, a); o.histories = parse_int_list(argv[++i], a);
         } else if (!std::strncmp(a, "--history=", 10)) {
@@ -3268,16 +3277,21 @@ int main(int argc, char **argv)
     Options opts = parse_args(argc, argv);
     bool aggregate = opts.aggregate || opts.inputs.size() > 1;
 
-    if (opts.all && !opts.output) {
+    /* Default: render every metric in one decode pass.  -m/--metric overrides
+     * to a single metric (--all forces the unified pass explicitly). */
+    bool all_mode = opts.all || !opts.metric_explicit;
+
+    if (all_mode && !opts.output) {
         std::fprintf(stderr,
-            "cst_visualize: --all requires -o PREFIX (writes "
-            "PREFIX__<metric>.svg)\n");
+            "cst_visualize: rendering all metrics requires -o PREFIX (writes "
+            "PREFIX__<metric>.svg); use -m <metric> for a single plot to "
+            "stdout\n");
         return 2;
     }
 
     if (!aggregate) {
         try {
-            if (opts.all) {
+            if (all_mode) {
                 auto results = process_trace_multi(opts.inputs[0], opts,
                                                    all_metrics());
                 for (const auto &r : results) {
@@ -3348,10 +3362,10 @@ int main(int argc, char **argv)
      * lines still blur together; raise it for more temporal detail. */
     const double DISPLAY_BUDGET = 500.0;
 
-    /* Unified --all aggregate: each trace is decoded ONCE, feeding every
+    /* Unified all-metrics aggregate: each trace is decoded ONCE, feeding every
      * metric; results are bucketed per metric and each metric is aggregated +
      * rendered to its own <prefix>__AGG__<metric>.svg. */
-    if (opts.all) {
+    if (all_mode) {
         std::vector<Metric> mlist = all_metrics();
         std::unordered_map<int, std::vector<TraceResult>> per_metric;
         for (size_t i = 0; i < N; i++) {

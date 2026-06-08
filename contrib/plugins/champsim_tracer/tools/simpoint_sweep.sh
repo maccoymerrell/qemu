@@ -114,7 +114,7 @@ VARIANT_SEL=both
 # traces_full_p<N>/ — so several prune levels coexist in one sweep dir.
 WPPRUNE=
 
-# The plot phase uses `cst_visualize --all`, which renders every metric in a
+# The plot phase runs cst_visualize with no -m (its DEFAULT renders every metric in a
 # single decode pass and auto-selects the applicable set per trace: the 14
 # CP-computable metrics for a cp trace (memdata gates load/store *values* but
 # addresses are always emitted, so mem_pat / cache_miss / working_set /
@@ -268,20 +268,20 @@ pool_gate() {
     while (( $(jobs -r | wc -l) >= PARALLEL )); do wait -n 2>/dev/null || true; done
 }
 
-# Plot ALL metrics of a single .cst in one decode pass (cst_visualize --all
+# Plot ALL metrics of a single .cst in one decode pass (cst_visualize default,
 # writes <base>__<metric>.svg per metric).  One invocation replaces the former
 # per-metric loop, so the trace is decompressed + walked once instead of once
-# per metric.  --all auto-selects the applicable set: 14 for a cp trace
+# per metric.  It auto-selects the applicable set: 14 for a cp trace
 # (wrong-path metrics dropped), 17 for a full trace.
 plot_one() {
     local cst=$1
     local base; base=$(basename "$cst" .cst)
     # Sentinel: branch_mpki is produced for both cp and full variants.
     if stage_done "${PLOTS_DIR}/${base}__branch_mpki.svg"; then return 0; fi
-    "$CST_VISUALIZE" --all "--rob-size=${ROB_SIZE}" \
+    "$CST_VISUALIZE" "--rob-size=${ROB_SIZE}" \
         -o "${PLOTS_DIR}/${base}" "$cst" \
         >>"${LOGS_DIR}/plot.log" 2>&1 || {
-        echo "    plot --all failed for $base (see plot.log)" \
+        echo "    plot failed for $base (see plot.log)" \
             >>"$PROGRESS_LOG"
         return 0
     }
@@ -298,11 +298,11 @@ agg_one() {
     if stage_done "${PLOTS_DIR}/${WORKLOAD_NAME}_${variant}__AGG__branch_mpki.svg"; then
         return 0
     fi
-    "$CST_VISUALIZE" --all "--rob-size=${ROB_SIZE}" --aggregate \
+    "$CST_VISUALIZE" "--rob-size=${ROB_SIZE}" --aggregate \
         --name "${WORKLOAD_NAME}_${variant}" \
         -o "${PLOTS_DIR}/${WORKLOAD_NAME}_${variant}" "${csts[@]}" \
         >>"${LOGS_DIR}/plot.log" 2>&1 || {
-        echo "    aggregate --all failed for ${WORKLOAD_NAME}_${variant}" \
+        echo "    aggregate failed for ${WORKLOAD_NAME}_${variant}" \
             "(see plot.log)" >>"$PROGRESS_LOG"
         return 0
     }

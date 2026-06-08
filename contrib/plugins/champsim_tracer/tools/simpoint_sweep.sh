@@ -114,19 +114,12 @@ VARIANT_SEL=both
 # traces_full_p<N>/ — so several prune levels coexist in one sweep dir.
 WPPRUNE=
 
-# Metrics computable from a CP-only trace.  memdata gates the load/store
-# *values*, but addresses are always emitted, so the address-driven metrics
-# (mem_pat / cache_miss / working_set / reuse_distance) work on CP traces
-# too — only the WP metrics need a full (wp=1) trace.
-CP_METRICS=(
-    branch_mpki btb_miss bb_length indirect_targets
-    branch_entropy dep_depth ilp gen_op gen_reg branch_dir
-    mem_pat cache_miss working_set reuse_distance
-)
-# Metrics that genuinely need wrong-path data — only on the full trace.
-FULL_EXTRA=(
-    wp_insns wp_memops wp_divergence
-)
+# The plot phase uses `cst_visualize --all`, which renders every metric in a
+# single decode pass and auto-selects the applicable set per trace: the 14
+# CP-computable metrics for a cp trace (memdata gates load/store *values* but
+# addresses are always emitted, so mem_pat / cache_miss / working_set /
+# reuse_distance work on CP traces too) plus the 3 wrong-path metrics
+# (wp_insns / wp_memops / wp_divergence) on a full (wp=1) trace.
 
 # Parse "100M" / "1B" / "2G" / "500k" suffixes into raw integer
 # instructions.  Bare digits pass through unchanged.
@@ -275,41 +268,42 @@ pool_gate() {
     while (( $(jobs -r | wc -l) >= PARALLEL )); do wait -n 2>/dev/null || true; done
 }
 
-# Plot a single .cst with a metric -> SVG.
+# Plot ALL metrics of a single .cst in one decode pass (cst_visualize --all
+# writes <base>__<metric>.svg per metric).  One invocation replaces the former
+# per-metric loop, so the trace is decompressed + walked once instead of once
+# per metric.  --all auto-selects the applicable set: 14 for a cp trace
+# (wrong-path metrics dropped), 17 for a full trace.
 plot_one() {
     local cst=$1
-    local metric=$2
-    local extra=("${@:3}")
-    local base
-    base=$(basename "$cst" .cst)
-    local svg=${PLOTS_DIR}/${base}__${metric}.svg
-    if stage_done "$svg"; then return 0; fi
-    "$CST_VISUALIZE" -m "$metric" "--rob-size=${ROB_SIZE}" \
-        "${extra[@]}" -o "$svg" "$cst" \
+    local base; base=$(basename "$cst" .cst)
+    # Sentinel: branch_mpki is produced for both cp and full variants.
+    if stage_done "${PLOTS_DIR}/${base}__branch_mpki.svg"; then return 0; fi
+    "$CST_VISUALIZE" --all "--rob-size=${ROB_SIZE}" \
+        -o "${PLOTS_DIR}/${base}" "$cst" \
         >>"${LOGS_DIR}/plot.log" 2>&1 || {
-        echo "    plot $metric failed for $base (see plot.log)" \
+        echo "    plot --all failed for $base (see plot.log)" \
             >>"$PROGRESS_LOG"
-        rm -f "$svg"
         return 0
     }
 }
 
-# Aggregate every per-simpoint trace of one variant into a single weighted
-# whole-program SVG per metric (cst_visualize aggregate mode; weights come
-# from each trace's header simpoint_weight).
+# Aggregate every per-simpoint trace of one variant into the weighted
+# whole-program SVGs (one decode pass over all simpoints, all metrics ->
+# <name>_<variant>__AGG__<metric>.svg).  Weights come from each trace's header
+# simpoint_weight.
 agg_one() {
     local variant=$1
-    local metric=$2
-    shift 2
+    shift
     local csts=("$@")
-    local svg=${PLOTS_DIR}/${WORKLOAD_NAME}_${variant}__AGG__${metric}.svg
-    if stage_done "$svg"; then return 0; fi
-    "$CST_VISUALIZE" -m "$metric" "--rob-size=${ROB_SIZE}" --aggregate \
-        --name "${WORKLOAD_NAME}_${variant}" -o "$svg" "${csts[@]}" \
+    if stage_done "${PLOTS_DIR}/${WORKLOAD_NAME}_${variant}__AGG__branch_mpki.svg"; then
+        return 0
+    fi
+    "$CST_VISUALIZE" --all "--rob-size=${ROB_SIZE}" --aggregate \
+        --name "${WORKLOAD_NAME}_${variant}" \
+        -o "${PLOTS_DIR}/${WORKLOAD_NAME}_${variant}" "${csts[@]}" \
         >>"${LOGS_DIR}/plot.log" 2>&1 || {
-        echo "    aggregate $metric failed for ${WORKLOAD_NAME}_${variant}" \
+        echo "    aggregate --all failed for ${WORKLOAD_NAME}_${variant}" \
             "(see plot.log)" >>"$PROGRESS_LOG"
-        rm -f "$svg"
         return 0
     }
 }
@@ -320,21 +314,17 @@ stage_plot() {
     mkdir -p "$PLOTS_DIR"
     : >"${LOGS_DIR}/plot.log"
 
-    local cst m
+    local cst
     if [[ "$VARIANT_SEL" == cp || "$VARIANT_SEL" == both ]]; then
         for cst in "${TR_CP_DIR}/${WORKLOAD_NAME}_cp-"*.cst; do
             [[ -e "$cst" ]] || continue
-            for m in "${CP_METRICS[@]}"; do
-                pool_gate; plot_one "$cst" "$m" &
-            done
+            pool_gate; plot_one "$cst" &
         done
     fi
     if [[ "$VARIANT_SEL" == full || "$VARIANT_SEL" == both ]]; then
         for cst in "${TR_FULL_DIR}/${WORKLOAD_NAME}_${FULL_TAG}-"*.cst; do
             [[ -e "$cst" ]] || continue
-            for m in "${CP_METRICS[@]}" "${FULL_EXTRA[@]}"; do
-                pool_gate; plot_one "$cst" "$m" &
-            done
+            pool_gate; plot_one "$cst" &
         done
     fi
     wait
@@ -350,19 +340,15 @@ stage_aggregate() {
     log_progress "aggregate: rendering whole-program SVGs (parallel=${PARALLEL})"
     mkdir -p "$PLOTS_DIR"
 
-    local cp_csts full_csts m
+    local cp_csts full_csts
     mapfile -t cp_csts   < <(compgen -G "${TR_CP_DIR}/${WORKLOAD_NAME}_cp-*.cst" || true)
     mapfile -t full_csts < <(compgen -G "${TR_FULL_DIR}/${WORKLOAD_NAME}_${FULL_TAG}-*.cst" || true)
 
     if [[ "$VARIANT_SEL" == cp || "$VARIANT_SEL" == both ]] && (( ${#cp_csts[@]} > 0 )); then
-        for m in "${CP_METRICS[@]}"; do
-            pool_gate; agg_one cp "$m" "${cp_csts[@]}" &
-        done
+        pool_gate; agg_one cp "${cp_csts[@]}" &
     fi
     if [[ "$VARIANT_SEL" == full || "$VARIANT_SEL" == both ]] && (( ${#full_csts[@]} > 0 )); then
-        for m in "${CP_METRICS[@]}" "${FULL_EXTRA[@]}"; do
-            pool_gate; agg_one "$FULL_TAG" "$m" "${full_csts[@]}" &
-        done
+        pool_gate; agg_one "$FULL_TAG" "${full_csts[@]}" &
     fi
     wait
 

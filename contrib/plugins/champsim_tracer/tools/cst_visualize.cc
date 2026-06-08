@@ -117,6 +117,11 @@ struct Options {
      * SVG draws, so stats can be compared/loaded without parsing the SVG. */
     const char *csv_output   = nullptr;
     Metric      metric       = Metric::BranchMpki;
+    /* Unified mode: ignore @metric and render EVERY metric from a single
+     * decode pass.  @output is treated as a path prefix; each metric writes
+     * <prefix>__<metric>.svg (single trace) or <prefix>__AGG__<metric>.svg
+     * (aggregate), and likewise <prefix>__<metric>.csv when --csv is set. */
+    bool        all          = false;
     /* Aggregate mode controls.  @aggregate forces it even for one input.
      * @weights overrides the per-trace header simpoint_weight (CLI order);
      * empty -> use header weights, all-zero -> even split.  @agg_name is
@@ -247,6 +252,13 @@ struct Options {
 "                          (\"-\" = stdout).  Columns: pane,segment,bin,x,\n"
 "                          series,value.  With --csv but no -o, only CSV is\n"
 "                          written (no SVG).\n"
+"      --all               Render EVERY metric from a single decode pass.\n"
+"                          Ignores -m; -o is a path PREFIX and each metric\n"
+"                          writes PREFIX__<metric>.svg (PREFIX__AGG__<metric>\n"
+"                          .svg with --aggregate), plus PREFIX__<metric>.csv\n"
+"                          when --csv is given.  Far cheaper than one run per\n"
+"                          metric.  All config (--history/--btb-entries/\n"
+"                          --cache-*/--rob-size) applies to the whole set.\n"
 "      --aggregate         Force aggregate mode (implied for >1 trace)\n"
 "      --weights=W,W,...   Per-trace weights (CLI order; default = header\n"
 "                          simpoint_weight; all-zero -> even split)\n"
@@ -345,6 +357,53 @@ static Metric parse_metric(const char *s)
     if (!std::strcmp(s, "reuse_distance"))   return Metric::ReuseDistance;
     std::fprintf(stderr, "cst_visualize: unknown metric '%s'\n", s);
     std::exit(2);
+}
+
+/* Canonical metric name (matches parse_metric / the sweep's SVG naming). */
+static const char *metric_name(Metric m)
+{
+    switch (m) {
+        case Metric::BranchMpki:      return "branch_mpki";
+        case Metric::WpInsns:         return "wp_insns";
+        case Metric::WpMemops:        return "wp_memops";
+        case Metric::MemPat:          return "mem_pat";
+        case Metric::BranchDir:       return "branch_dir";
+        case Metric::GenOp:           return "gen_op";
+        case Metric::GenReg:          return "gen_reg";
+        case Metric::BtbMiss:         return "btb_miss";
+        case Metric::WpDivergence:    return "wp_divergence";
+        case Metric::CacheMiss:       return "cache_miss";
+        case Metric::BbLength:        return "bb_length";
+        case Metric::IndirectTargets: return "indirect_targets";
+        case Metric::BranchEntropy:   return "branch_entropy";
+        case Metric::WorkingSet:      return "working_set";
+        case Metric::DepDepth:        return "dep_depth";
+        case Metric::Ilp:             return "ilp";
+        case Metric::ReuseDistance:   return "reuse_distance";
+    }
+    return "unknown";
+}
+
+/* Whether a metric needs wrong-path data; on a CP-only trace these are
+ * dropped from a --all run (they would be empty), matching the sweep's
+ * cp-variant metric set. */
+static bool metric_needs_wp(Metric m)
+{
+    return m == Metric::WpInsns || m == Metric::WpMemops ||
+           m == Metric::WpDivergence;
+}
+
+/* Every metric, in a stable order, for the unified --all run. */
+static std::vector<Metric> all_metrics()
+{
+    return {
+        Metric::BranchMpki, Metric::WpInsns, Metric::WpMemops,
+        Metric::MemPat, Metric::BranchDir, Metric::GenOp, Metric::GenReg,
+        Metric::BtbMiss, Metric::WpDivergence, Metric::CacheMiss,
+        Metric::BbLength, Metric::IndirectTargets, Metric::BranchEntropy,
+        Metric::WorkingSet, Metric::DepDepth, Metric::Ilp,
+        Metric::ReuseDistance,
+    };
 }
 
 static CachePolicy parse_cache_policy(const char *s)
@@ -478,6 +537,8 @@ static Options parse_args(int argc, char **argv)
             need(i + 1, a); o.csv_output = argv[++i];
         } else if (!std::strncmp(a, "--csv=", 6)) {
             o.csv_output = a + 6;
+        } else if (!std::strcmp(a, "--all")) {
+            o.all = true;
         } else if (!std::strcmp(a, "--aggregate")) {
             o.aggregate = true;
         } else if (!std::strcmp(a, "--weights")) {
@@ -2999,6 +3060,12 @@ struct TraceMeta {
 };
 
 static TraceResult process_trace(const char *path, const Options &opts);
+
+/* Unified decode-once / all-metrics pass (definition after process_trace). */
+struct MultiResult { Metric metric; TraceResult result; };
+static std::vector<MultiResult>
+process_trace_multi(const char *path, const Options &opts,
+                    const std::vector<Metric> &metrics);
 static TraceResult aggregate_results(std::vector<TraceResult> &rs,
                                      const Options &opts);
 static TraceMeta   peek_trace_meta(const char *path);
@@ -3175,13 +3242,49 @@ static int render_result(const TraceResult &tr, const Options &opts)
     return 0;
 }
 
+/* Render one metric's result to "<opts.output>__<metric>.svg" (and the
+ * matching .csv when --csv is set); the AGG marker distinguishes aggregate
+ * montages.  Used by the unified --all path. */
+static int render_to_prefix(const TraceResult &tr, Metric m,
+                            const Options &opts, bool agg)
+{
+    const char *mark = agg ? "__AGG__" : "__";
+    Options o = opts;
+    o.metric = m;
+    std::string svg = std::string(opts.output) + mark + metric_name(m) + ".svg";
+    o.output = svg.c_str();
+    std::string csv;
+    if (opts.csv_output) {
+        csv = std::string(opts.csv_output) + mark + metric_name(m) + ".csv";
+        o.csv_output = csv.c_str();
+    } else {
+        o.csv_output = nullptr;
+    }
+    return render_result(tr, o);
+}
+
 int main(int argc, char **argv)
 {
     Options opts = parse_args(argc, argv);
     bool aggregate = opts.aggregate || opts.inputs.size() > 1;
 
+    if (opts.all && !opts.output) {
+        std::fprintf(stderr,
+            "cst_visualize: --all requires -o PREFIX (writes "
+            "PREFIX__<metric>.svg)\n");
+        return 2;
+    }
+
     if (!aggregate) {
         try {
+            if (opts.all) {
+                auto results = process_trace_multi(opts.inputs[0], opts,
+                                                   all_metrics());
+                for (const auto &r : results) {
+                    render_to_prefix(r.result, r.metric, opts, /*agg=*/false);
+                }
+                return 0;
+            }
             TraceResult tr = process_trace(opts.inputs[0], opts);
             return render_result(tr, opts);
         } catch (const std::exception &ex) {
@@ -3244,6 +3347,51 @@ int main(int argc, char **argv)
      * colour bands — the failure mode at 1 point/px.  Lower this further if
      * lines still blur together; raise it for more temporal detail. */
     const double DISPLAY_BUDGET = 500.0;
+
+    /* Unified --all aggregate: each trace is decoded ONCE, feeding every
+     * metric; results are bucketed per metric and each metric is aggregated +
+     * rendered to its own <prefix>__AGG__<metric>.svg. */
+    if (opts.all) {
+        std::vector<Metric> mlist = all_metrics();
+        std::unordered_map<int, std::vector<TraceResult>> per_metric;
+        for (size_t i = 0; i < N; i++) {
+            if (!metas[i].ok) continue;
+            double sim_frac = 1.0;
+            if (metas[i].warmup_end != UINT64_MAX && metas[i].total_insns > 0) {
+                double wf = (double)metas[i].warmup_end /
+                            (double)metas[i].total_insns;
+                sim_frac = 1.0 - wf;
+                if (sim_frac < 0.05) sim_frac = 0.05;
+            }
+            int bins_i = (int)std::ceil(DISPLAY_BUDGET * wnorm[i] / sim_frac);
+            if (bins_i < 40)   bins_i = 40;
+            if (bins_i > 6000) bins_i = 6000;
+            Options o = opts;
+            o.bins = bins_i;
+            try {
+                auto results = process_trace_multi(opts.inputs[i], o, mlist);
+                for (auto &r : results) {
+                    r.result.weight = wraw[i];
+                    per_metric[(int)r.metric].push_back(std::move(r.result));
+                }
+            } catch (const std::exception &ex) {
+                std::fprintf(stderr, "cst_visualize: skipping %s: %s\n",
+                             opts.inputs[i], ex.what());
+            }
+        }
+        if (per_metric.empty()) {
+            std::fprintf(stderr, "cst_visualize: no traces processed\n");
+            return 1;
+        }
+        for (Metric m : mlist) {
+            auto it = per_metric.find((int)m);
+            if (it == per_metric.end() || it->second.empty()) continue;
+            TraceResult agg = aggregate_results(it->second, opts);
+            render_to_prefix(agg, m, opts, /*agg=*/true);
+        }
+        return 0;
+    }
+
     std::vector<TraceResult> rs;
     rs.reserve(N);
     for (size_t i = 0; i < N; i++) {
@@ -4386,6 +4534,57 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
     return tr;
 }
 
+/* Per-metric body-walk requirements: which handler, and the minimum decode
+ * level (apply CP field deltas? how much wrong-path?).  Single source of
+ * truth for both the single-metric walk and the unified --all walk (which
+ * unions these across every metric). */
+using BBFn = void (*)(WalkCtx &, const cst::BodyWalker::BB &);
+struct MetricWalkSpec {
+    BBFn bb_fn = nullptr;
+    bool cp_fields = false;
+    cst::BodyWalker::WpDecode wp_mode = cst::BodyWalker::WpDecode::Skip;
+    bool header_only = false;   /* computed from templates; no body walk */
+};
+static MetricWalkSpec metric_walk_spec(Metric m)
+{
+    using Wp = cst::BodyWalker::WpDecode;
+    MetricWalkSpec s;
+    switch (m) {
+        case Metric::GenOp:    s.bb_fn = handle_genop_bb; break;
+        case Metric::GenReg:   s.bb_fn = handle_genreg_bb; break;
+        case Metric::DepDepth:
+            s.bb_fn = handle_dep_depth_bb; s.cp_fields = true; break;
+        case Metric::Ilp:
+            s.bb_fn = handle_ilp_bb; s.cp_fields = true; break;
+        case Metric::WorkingSet:
+            s.bb_fn = handle_working_set_bb; s.cp_fields = true; break;
+        case Metric::ReuseDistance:
+            s.bb_fn = handle_reuse_distance_bb; s.cp_fields = true; break;
+        case Metric::BranchMpki:
+        case Metric::WpInsns:
+            s.bb_fn = handle_gshare_bb; s.wp_mode = Wp::Structure; break;
+        case Metric::WpMemops:
+            s.bb_fn = handle_gshare_bb; s.wp_mode = Wp::Fields; break;
+        case Metric::BranchDir:
+            s.bb_fn = handle_branch_dir_bb; s.wp_mode = Wp::Structure; break;
+        case Metric::BtbMiss:
+            s.bb_fn = handle_btb_bb; s.wp_mode = Wp::Structure; break;
+        case Metric::WpDivergence:
+            s.bb_fn = handle_wp_divergence_bb; s.wp_mode = Wp::Structure; break;
+        case Metric::MemPat:
+            s.bb_fn = handle_mem_pat_bb;
+            s.cp_fields = true; s.wp_mode = Wp::Fields; break;
+        case Metric::CacheMiss:
+            s.bb_fn = handle_cache_miss_bb;
+            s.cp_fields = true; s.wp_mode = Wp::Fields; break;
+        case Metric::BbLength:
+        case Metric::IndirectTargets:
+        case Metric::BranchEntropy:
+            s.header_only = true; break;
+    }
+    return s;
+}
+
 static TraceResult process_trace(const char *path, const Options &opts)
 {
     std::unique_ptr<cst::CstFile> cf = cst::cst_file_open(path);
@@ -4432,9 +4631,7 @@ static TraceResult process_trace(const char *path, const Options &opts)
     /* Header-derived static-summary metrics (bb_length /
      * indirect_targets / branch_entropy) compute purely from the
      * template list and skip the body walk entirely. */
-    bool is_header_only = (opts.metric == Metric::BbLength ||
-                           opts.metric == Metric::IndirectTargets ||
-                           opts.metric == Metric::BranchEntropy);
+    bool is_header_only = metric_walk_spec(opts.metric).header_only;
 
     /* --debug-branches early-exit dump.  Aggregates the tracer-side
      * profile counts (taken_cp, nottaken_cp) PER Jcc PC across every
@@ -4562,52 +4759,10 @@ static TraceResult process_trace(const char *path, const Options &opts)
          * doesn't read.  Each case picks the minimum it needs —
          * cp_fields (apply CP deltas, enable CP accessors) and a WP
          * decode level (skip / structure / fields). */
-        using BBFn    = void (*)(WalkCtx &, const cst::BodyWalker::BB &);
-        using Wp          = cst::BodyWalker::WpDecode;
-        BBFn    bb_fn     = nullptr;
-        bool    cp_fields = false;       /* streaming-path: apply CP deltas */
-        Wp      wp_mode   = Wp::Skip;    /* streaming-path: WP decode level */
-        switch (opts.metric) {
-            /* --- streaming BB path: CP structure only, no wrong-path --- */
-            case Metric::GenOp:
-                bb_fn = handle_genop_bb; break;
-            case Metric::GenReg:
-                bb_fn = handle_genreg_bb; break;
-            /* --- streaming BB path: CP fields, no wrong-path --- */
-            case Metric::DepDepth:
-                /* needs memop addresses for the memory-RAW dependency */
-                bb_fn = handle_dep_depth_bb; cp_fields = true; break;
-            case Metric::Ilp:
-                bb_fn = handle_ilp_bb; cp_fields = true; break;
-            case Metric::WorkingSet:
-                bb_fn = handle_working_set_bb; cp_fields = true; break;
-            case Metric::ReuseDistance:
-                bb_fn = handle_reuse_distance_bb; cp_fields = true; break;
-            /* --- streaming BB path: CP + WP structure --- */
-            case Metric::BranchMpki:
-            case Metric::WpInsns:
-                bb_fn = handle_gshare_bb; wp_mode = Wp::Structure; break;
-            case Metric::WpMemops:
-                /* needs per-WP-BB memop counts -> WP field deltas */
-                bb_fn = handle_gshare_bb; wp_mode = Wp::Fields; break;
-            case Metric::BranchDir:
-                bb_fn = handle_branch_dir_bb; wp_mode = Wp::Structure; break;
-            case Metric::BtbMiss:
-                bb_fn = handle_btb_bb; wp_mode = Wp::Structure; break;
-            case Metric::WpDivergence:
-                bb_fn = handle_wp_divergence_bb; wp_mode = Wp::Structure; break;
-            /* --- streaming BB path: CP + WP fields --- */
-            case Metric::MemPat:
-                bb_fn = handle_mem_pat_bb;
-                cp_fields = true; wp_mode = Wp::Fields; break;
-            case Metric::CacheMiss:
-                bb_fn = handle_cache_miss_bb;
-                cp_fields = true; wp_mode = Wp::Fields; break;
-            case Metric::BbLength:
-            case Metric::IndirectTargets:
-            case Metric::BranchEntropy:
-                break; /* unreachable: gated above */
-        }
+        MetricWalkSpec spec = metric_walk_spec(opts.metric);
+        BBFn    bb_fn     = spec.bb_fn;
+        bool    cp_fields = spec.cp_fields;
+        cst::BodyWalker::WpDecode wp_mode = spec.wp_mode;
 
         if (!bb_fn) {
             /* All body-walk metrics set bb_fn; the header-only metrics
@@ -4695,6 +4850,112 @@ static TraceResult process_trace(const char *path, const Options &opts)
     }
 
     return finalize_metric(path, ctx, templates, h, total_cp_insns);
+}
+
+/*
+ * Decode-once / all-metrics.  Parse the header + templates ONCE, build an
+ * independent WalkCtx per requested metric (reusing build_metric_state), run a
+ * SINGLE body pass that dispatches every metric's handler — unioning the
+ * minimum CP-fields / wrong-path decode level the set needs — and finalize
+ * each.  One decompress+decode produces every plot, instead of re-decoding the
+ * whole trace once per metric.  WP-only metrics are skipped on a CP-only
+ * trace.  Returns one result per metric produced, in request order.
+ */
+static std::vector<MultiResult>
+process_trace_multi(const char *path, const Options &opts,
+                    const std::vector<Metric> &metrics)
+{
+    std::unique_ptr<cst::CstFile> cf = cst::cst_file_open(path);
+
+    std::vector<cst::Template> templates;
+    std::unordered_map<uint32_t, size_t> by_id;
+    cst::Header h = cst::parse_header(cf->header(), &templates, &by_id);
+
+    uint64_t total_cp_insns = 0;
+    if (h.total_target_insns > 0) {
+        total_cp_insns = h.total_target_insns;
+    } else {
+        for (const auto &t : templates) {
+            total_cp_insns += (uint64_t)t.profile.exec_cp * t.insns.size();
+        }
+        if (total_cp_insns == 0) total_cp_insns = 1;
+    }
+    uint64_t bin_width = total_cp_insns / (uint64_t)opts.bins;
+    if (bin_width == 0) bin_width = 1;
+
+    const bool has_wp = (h.flags & h.ids.flag_wp) != 0;
+
+    /* One independent WalkCtx + walk-spec per applicable metric. */
+    std::vector<std::unique_ptr<WalkCtx>> ctxs;
+    std::vector<Metric>                   chosen;
+    std::vector<MetricWalkSpec>           specs;
+    for (Metric m : metrics) {
+        if (metric_needs_wp(m) && !has_wp) {
+            continue;   /* would be empty on a CP-only trace */
+        }
+        std::unique_ptr<WalkCtx> ctx(new WalkCtx());
+        ctx->h         = &h;
+        ctx->templates = &templates;
+        ctx->by_id     = &by_id;
+        ctx->opts      = opts;
+        ctx->opts.metric = m;
+        ctx->bin_width = bin_width;
+        ctx->term.resize(templates.size());
+        for (size_t i = 0; i < templates.size(); i++) {
+            ctx->term[i] = classify_term(templates[i], h.maps.branch_type);
+        }
+        build_metric_state(*ctx, templates, h);
+        ctxs.push_back(std::move(ctx));
+        chosen.push_back(m);
+        specs.push_back(metric_walk_spec(m));
+    }
+
+    /* Single body pass for all body-walk metrics; the header-only ones
+     * (bb_length / indirect_targets / branch_entropy) finalize without it.
+     * Union the decode requirements so every handler gets what it needs. */
+    bool any_body = false;
+    bool cp_fields = false;
+    cst::BodyWalker::WpDecode wp_mode = cst::BodyWalker::WpDecode::Skip;
+    for (const auto &s : specs) {
+        if (s.header_only) continue;
+        any_body = true;
+        cp_fields = cp_fields || s.cp_fields;
+        if ((int)s.wp_mode > (int)wp_mode) wp_mode = s.wp_mode;
+    }
+    if (any_body) {
+        auto body_stream = cst::body_stream_open(*cf);
+        cst::BodyWalker walker(h, templates, by_id, body_stream->reader());
+        walker.walk_bb(cp_fields, wp_mode,
+                       [&](const cst::BodyWalker::BB &bb) {
+                           for (size_t i = 0; i < ctxs.size(); i++) {
+                               if (!specs[i].bb_fn) {
+                                   continue;
+                               }
+                               /* A CP-only metric (wp_mode == Skip) would not
+                                * see wrong-path BBs in its own single-metric
+                                * walk; the unioned walk surfaces them, and its
+                                * handler doesn't filter is_wp — so gate them
+                                * out here to reproduce single-metric input. */
+                               if (bb.is_wp &&
+                                   specs[i].wp_mode ==
+                                       cst::BodyWalker::WpDecode::Skip) {
+                                   continue;
+                               }
+                               specs[i].bb_fn(*ctxs[i], bb);
+                           }
+                       });
+        try { body_stream->finalize(); }
+        catch (...) {}
+    }
+
+    std::vector<MultiResult> out;
+    out.reserve(ctxs.size());
+    for (size_t i = 0; i < ctxs.size(); i++) {
+        out.push_back({ chosen[i],
+                        finalize_metric(path, *ctxs[i], templates, h,
+                                        total_cp_insns) });
+    }
+    return out;
 }
 
 /* Combine one pane (plan or plan2) across traces.  @panes[i] is trace i's

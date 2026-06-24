@@ -529,6 +529,17 @@ void BodyWalker::handle_entry(WalkState &ws, const Callback &cb)
                        &entry.dyn_params, &entry.reg_snaps, &entry.metaflags,
                        &entry.lane_masks);
 
+    /* Per-entry synchronous-fault trailer (Step 6.4a), present only when the
+     * CST_FLAG_FAULT header bit is set; sits between the CP delta and the WP
+     * sections.  Exception-nesting depth at which this BB executed. */
+    if (flags_ & header_.ids.flag_fault) {
+        entry.fault_depth = (uint32_t)body_.uleb();
+        uint64_t n_anchors = body_.uleb();
+        for (uint64_t a = 0; a < n_anchors; a++) {
+            entry.fault_anchors.push_back((uint32_t)body_.uleb());
+        }
+    }
+
     /* WP chain + events.  Each is its own length-prefixed
      * sub-section, present only when the CST_FLAG_WP header bit is
      * set; otherwise the entry is just its CP delta. */
@@ -591,6 +602,16 @@ void BodyWalker::handle_iframe(WalkState &ws)
                        &iframe_entry.reg_snaps,
                        &iframe_entry.metaflags,
                        &iframe_entry.lane_masks);
+
+    /* Fault trailer, mirroring the ENTRY path (writer emits the same payload
+     * for an IFRAME).  Consume to stay in sync. */
+    if (flags_ & header_.ids.flag_fault) {
+        iframe_entry.fault_depth = (uint32_t)body_.uleb();
+        uint64_t n_anchors = body_.uleb();
+        for (uint64_t a = 0; a < n_anchors; a++) {
+            iframe_entry.fault_anchors.push_back((uint32_t)body_.uleb());
+        }
+    }
 
     /* WP chain + events, gated by CST_FLAG_WP exactly as the ENTRY
      * path.  Mirror the writer's IFRAME emission: the iframe_wp
@@ -1092,6 +1113,16 @@ void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
     consume_field_section(body_, (uint32_t)entry_tmpl, cp_tmpl,
                           cp_fields ? &cp_state : nullptr, nullptr);
 
+    /* Fault trailer (Step 6.4a), between the CP delta and the WP sections. */
+    uint32_t fault_depth = 0;
+    if (flags_ & header_.ids.flag_fault) {
+        fault_depth = (uint32_t)body_.uleb();
+        uint64_t n_anchors = body_.uleb();   /* anchors: parse-skipped here */
+        for (uint64_t a = 0; a < n_anchors; a++) {
+            (void)body_.uleb();
+        }
+    }
+
     uint32_t seq = ++ws.seq;
     stats_.cp_entries++;
 
@@ -1104,6 +1135,7 @@ void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
     bb.seq_num         = seq;
     bb.thread_switched = ws.pending_thread_switch;
     bb.n_insns         = cp_tmpl ? (uint32_t)cp_tmpl->insns.size() : 0;
+    bb.fault_depth     = fault_depth;
     if (cp_fields) {
         bb.blk_       = table_get_block(cp_state, (uint32_t)entry_tmpl);
         bb.state_gen_ = cp_state.generation;
@@ -1136,6 +1168,13 @@ void BodyWalker::skip_iframe_bb()
      * sections to stay byte-aligned; the streaming path does not
      * field-validate. */
     { SectionScope s(body_); (void)s; }
+    if (flags_ & header_.ids.flag_fault) {
+        (void)body_.uleb();    /* fault depth */
+        uint64_t n_anchors = body_.uleb();
+        for (uint64_t a = 0; a < n_anchors; a++) {
+            (void)body_.uleb();
+        }
+    }
     if (flags_ & header_.ids.flag_wp) {
         { SectionScope s(body_); (void)s; }
         { SectionScope s(body_); (void)s; }

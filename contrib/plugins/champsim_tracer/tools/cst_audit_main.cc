@@ -303,6 +303,8 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                Stats *s)
 {
     const bool have_wp = (header_flags & ids.flag_wp) != 0;
+    const bool have_fault = (ids.flag_fault != 0) &&
+                            (header_flags & ids.flag_fault) != 0;
     const FidTables fid(ids);
     auto tmpl_for = [&](int32_t tid) -> const cst::Template * {
         auto it = by_id.find((uint32_t)tid);
@@ -360,6 +362,23 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
             }
             if (sec.consumed() != sec_end) {
                 throw std::runtime_error("CP field-delta had trailing bytes");
+            }
+
+            /* Per-entry sync-fault trailer (CST_FLAG_FAULT): exception-nesting
+             * depth ULEB, between the CP delta and the WP sections.  Charge
+             * its bytes to CP-field-delta overhead so the budget rolls to
+             * 100%. */
+            if (have_fault) {
+                size_t ft_st = body.consumed();
+                (void)body.uleb();                  /* fault depth */
+                uint64_t n_anchors = body.uleb();   /* anchor count */
+                for (uint64_t a = 0; a < n_anchors; a++) {
+                    (void)body.uleb();
+                }
+                size_t ft_bytes = body.consumed() - ft_st;
+                s->cp_field_delta.bytes += ft_bytes;
+                cpfd_b[BIDX_OVERHEAD].bytes += ft_bytes;
+                cpfd_b[BIDX_OVERHEAD].count += 1;
             }
 
             /* WP chain + events present only under CST_FLAG_WP. */
@@ -436,6 +455,13 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
 
         if (tag == ids.body_tag_iframe) {
             { uint64_t n = body.uleb(); body.skip(n); }   /* cp delta section */
+            if (have_fault) {
+                (void)body.uleb();                        /* fault depth      */
+                uint64_t na = body.uleb();                /* anchor count     */
+                for (uint64_t a = 0; a < na; a++) {
+                    (void)body.uleb();
+                }
+            }
             if (have_wp) {
                 { uint64_t n = body.uleb(); body.skip(n); }  /* wp chain  */
                 { uint64_t n = body.uleb(); body.skip(n); }  /* wp events */

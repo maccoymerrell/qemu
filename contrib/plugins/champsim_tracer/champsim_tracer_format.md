@@ -47,6 +47,16 @@ Length-prefixed sections use the same shape:
 section := len:ULEB  payload[len]
 ```
 
+Throughout the recipe, a field typed `: section` is therefore **two
+reads**: first the `len:ULEB` byte-length prefix, then the `payload[len]`
+bytes.  The step a `: section` field cross-references (e.g. "see Step
+6.7") describes only the *payload* — the `len:ULEB` has already been
+consumed by the `: section` framing at the use site, exactly as a
+`: string` field reads its `len:ULEB` before its bytes.  The two are
+distinct: `len` is the on-the-wire byte size of the section (what a
+reader skips to reach the next one), independent of how many logical
+records the payload then declares.
+
 This spec is split into two parts.  **Part I** is a procedural
 recipe for a decoder author: each step is "read N bytes, decode as
 X, branch on Y."  Following the recipe in order is sufficient to
@@ -595,6 +605,10 @@ Loop until a `BODY_TAG_END` is seen:
        must equal the total number of BODY_TAG_ENTRY records seen
        since the start of the body stream.  Exit the loop.
 6.7  CP field-delta section payload:
+     ; The `: section` field in Step 6.4 already read this section's
+     ; len:ULEB; the steps below decode payload[len].  `len` (bytes)
+     ; and `n_records` (count) are independent — an empty section is
+     ; len=1 / n_records=0 (the single byte IS the n_records=0 ULEB).
        n_records : ULEB
        ipos : u32 = 0                  ; reset at section start; not
                                        ; carried across sections

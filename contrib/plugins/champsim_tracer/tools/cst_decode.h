@@ -183,6 +183,10 @@ public:
         bool            wp_chain_start = false;
         bool            wp_chain_last  = false;
         uint32_t        n_insns        = 0;   /* template insn count */
+        /* Exception-nesting depth (CST_FLAG_FAULT traces): 0 = normal code,
+         * >=1 = synchronous-fault handler code at that nesting level.  CP
+         * only; WP BBs inherit their parent CP entry's depth. */
+        uint32_t        fault_depth    = 0;
 
         bool     has_fields() const { return blk_ != nullptr; }
         uint64_t load_count(uint32_t insn) const;

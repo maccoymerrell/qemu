@@ -379,6 +379,10 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
                 &ids->flag_profile);
     resolve_one(maps.header_flag, "header_flag", "CST_FLAG_WP",
                 &ids->flag_wp);
+    /* Optional: present only in system-mode traces with the fault trailer;
+     * resolves to 0 (never tests set) when absent. */
+    resolve_optional_mask(maps.header_flag, "CST_FLAG_FAULT",
+                          &ids->flag_fault);
 
     /* wp_event_flag (bit masks) */
     resolve_one(maps.wp_event_flag, "wp_event_flag",

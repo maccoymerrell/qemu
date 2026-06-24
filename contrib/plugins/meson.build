@@ -105,6 +105,7 @@ if get_option('plugins')
   t += executable(
     'cst_decode',
     files('champsim_tracer/tools/cst_decode_main.cc',
+          'champsim_tracer/tools/cst_raw.cc',
           'champsim_tracer/tools/cst_objdump.cc'),
     cpp_args: cst_tools_cpp_args + ['-DCST_HAVE_CAPSTONE=1'],
     link_with: cst_tools_common,

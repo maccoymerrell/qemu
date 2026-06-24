@@ -121,6 +121,9 @@ struct ResolvedIds {
     /* Bit mask within Header::flags marking the per-entry
      * wrong-path chain + events sections present. */
     uint8_t flag_wp = 0;
+    /* Bit mask within Header::flags marking the per-entry synchronous-fault
+     * trailer (exception-nesting depth, + anchor on a faulting BB) present. */
+    uint8_t flag_fault = 0;
 
     /* wp_event_flag map: bit masks inside the per-WP-event flags byte */
     uint8_t wp_event_translation_unavail = 0;
@@ -278,6 +281,12 @@ struct DecodedEntry {
     std::vector<MetaFlagsEntry> metaflags;
     std::vector<LaneMaskEntry>  lane_masks;
     std::vector<WPEntry>        wp_entries;
+    /* Exception-nesting depth (CST_FLAG_FAULT traces): 0 = normal code,
+     * >=1 = synchronous-fault handler code at that nesting level. */
+    uint32_t                    fault_depth = 0;
+    /* Faulting-instruction indices for a whole-BB-merged faulting BB (one
+     * per fault excursion, in order); empty for ordinary entries. */
+    std::vector<uint32_t>       fault_anchors;
 };
 
 /* Forward declarations so Instruction can hold non-owning pointers

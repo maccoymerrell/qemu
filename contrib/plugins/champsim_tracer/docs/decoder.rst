@@ -13,7 +13,9 @@ from the file.
   one PC-sorted line per static template entry — the analogue of
   ``objdump -d`` over the captured templates.  ``--objdump`` adds a
   side-by-side Capstone disassembly column so the generic-opcode line
-  can be cross-checked against ``objdump`` output.
+  can be cross-checked against ``objdump`` output.  ``--format=raw``
+  swaps the disassembly for a byte-offset-annotated pseudo-wire dump of
+  the raw header and body records, for debugging the format itself.
 
 * :ref:`cst_audit <audit-cc>` prints a byte-budget breakdown of
   where bytes go (header, templates, CP body, WP body, field-delta
@@ -43,6 +45,7 @@ the plugin shared object.  Lands in
    $ build/contrib/plugins/cst_decode trace.cst > trace.disasm
    $ build/contrib/plugins/cst_decode --templates-only trace.cst > trace.t.disasm
    $ build/contrib/plugins/cst_decode --objdump trace.cst > trace.objdump.disasm
+   $ build/contrib/plugins/cst_decode --format=raw trace.cst > trace.wire.txt
 
 Output format
 ~~~~~~~~~~~~~
@@ -173,6 +176,26 @@ comment prefix.
    output, retained so trace-diffing scripts that predate the C++
    decoder keep working.  ``--format=legacy`` is incompatible with
    ``--templates-only``.
+
+``--format=raw``
+   Pseudo-wire structural dump — a debugging view that walks the raw
+   header and body bytes and prints every field, record, and section
+   in decode order.  Each line carries the absolute byte offset within
+   its member (``@xxxxxxxx``), a hex column showing the raw bytes that
+   line consumed (so the output reads alongside an ``xxd`` of the same
+   member), and the :doc:`format` recipe step that produced it (e.g.
+   ``[Step 6.7]``), so a divergence between a producer and a
+   third-party reader can be pinned to the exact byte.  The hex column
+   shows up to ten bytes (longer fields end in ``+``); a field that
+   straddles a decompressor-buffer refill shows ``<refill>`` instead,
+   with its offset and decoded value still intact.
+   Unlike ``disasm`` / ``legacy`` it does **not** reconstruct
+   architectural state: field-delta records show the raw
+   ``ipos_delta`` / ``fid`` / signed-delta wire values (with the
+   numeric ids resolved through the trace's own encoding maps), not the
+   replayed absolute field value.  Honours ``--max N`` to stop after
+   ``N`` body entries; ``--objdump`` / ``--show-deps`` / ``--show-lanes``
+   do not apply.
 
 ``--templates-only``
    Skip the body stream and emit the static template dictionary,

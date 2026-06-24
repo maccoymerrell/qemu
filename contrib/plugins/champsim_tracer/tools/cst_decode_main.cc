@@ -1,7 +1,7 @@
 /*
  * cst_decode — textual decoder for .cst traces.
  *
- * Three output modes:
+ * Output modes:
  *
  *   --format=disasm  (default): objdump-style, one architectural
  *     instruction per line, with memops / register writes / branch
@@ -11,6 +11,12 @@
  *   --format=legacy: byte-identical to champsim_tracer_decode.py's
  *     render_text_streaming output.  Retained for wptrace_genval
  *     scripts that diff trace dumps.
+ *
+ *   --format=raw: pseudo-wire structural dump (cst_raw.cc).  Walks the
+ *     raw header + body bytes and prints every field / record / section
+ *     in decode order with its byte offset and the format-spec recipe
+ *     step that produced it.  A debugging view of the wire structure,
+ *     not a state reconstruction.
  *
  *   --templates-only: dump just the template dictionary (no body).
  *
@@ -47,6 +53,7 @@
 #include "cst_decode.h"
 #include "cst_format.h"
 #include "cst_objdump.h"
+#include "cst_raw.h"
 
 /* Pull ObjdumpRenderer into the anonymous namespace below so its
  * unqualified name works in the rest of this file — the class itself
@@ -1419,12 +1426,17 @@ void emit_disasm_file_header(FILE *out, const cst::Header &h,
 void emit_bb_header(FILE *out, const cst::DecodedEntry &e,
                     const cst::Template &t)
 {
+    char fd[40];
+    fd[0] = '\0';
+    if (e.fault_depth > 0) {
+        std::snprintf(fd, sizeof(fd), " fault_depth=%u", e.fault_depth);
+    }
     std::fprintf(out,
                  "; ----- BB %u entry pc=0x%" PRIx64
-                 " insns=%zu seq=%u tid=%u%s -----\n",
+                 " insns=%zu seq=%u tid=%u%s%s -----\n",
                  e.template_id, t.start_pc, t.insns.size(),
                  e.seq_num, e.thread_id,
-                 e.thread_switched ? " (thread_switch)" : "");
+                 e.thread_switched ? " (thread_switch)" : "", fd);
 }
 
 void emit_wp_run_separator(FILE *out, const cst::Instruction &first,
@@ -2104,8 +2116,26 @@ void emit_legacy_entry(FILE *out, const cst::Header &h,
                        const cst::DecodedEntry &e)
 {
     const char *sw = e.thread_switched ? " switch=1" : "";
-    std::fprintf(out, "ENTRY %04u thread=%u%s template=BB%u\n",
-                 e.seq_num, e.thread_id, sw, e.template_id);
+    /* Exception-nesting depth + faulting-insn anchors (CST_FLAG_FAULT traces),
+     * emitted only when present so normal/user-mode entries stay
+     * byte-identical. */
+    char fd[160];
+    int n = 0;
+    fd[0] = '\0';
+    if (e.fault_depth > 0) {
+        n += std::snprintf(fd + n, sizeof(fd) - n, " fault_depth=%u",
+                           e.fault_depth);
+    }
+    if (!e.fault_anchors.empty()) {
+        n += std::snprintf(fd + n, sizeof(fd) - n, " fault_at=");
+        for (size_t i = 0; i < e.fault_anchors.size() &&
+                           n < (int)sizeof(fd) - 12; i++) {
+            n += std::snprintf(fd + n, sizeof(fd) - n, "%s%u",
+                               i ? "," : "", e.fault_anchors[i]);
+        }
+    }
+    std::fprintf(out, "ENTRY %04u thread=%u%s%s template=BB%u\n",
+                 e.seq_num, e.thread_id, sw, fd, e.template_id);
     std::fprintf(out, "  cp:\n");
     emit_legacy_observations(out, "    ", h, e.dyn_params, e.reg_snaps,
                              e.metaflags, e.lane_masks);
@@ -2192,8 +2222,11 @@ struct Options {
 void print_usage(FILE *err, const char *argv0)
 {
     std::fprintf(err,
-        "usage: %s [--format=disasm|legacy] [--templates-only] "
+        "usage: %s [--format=disasm|legacy|raw] [--templates-only] "
         "[--objdump] [--show-deps] [--show-lanes] [--max N] <trace.cst>\n"
+        "  --format=raw      pseudo-wire structural dump: every field,\n"
+        "                    record, and section in decode order with\n"
+        "                    byte offsets + format-spec step refs (debug)\n"
         "  --templates-only  print only the template dictionary,\n"
         "                    skip the body delta-replay\n"
         "  --objdump         emit Capstone-rendered native disasm\n"
@@ -2314,6 +2347,13 @@ int run(const Options &opts)
         /* No body access at all — no decompressor spawned, no body
          * bytes read off disk.  Cheap even on huge traces. */
         render_templates_only(stdout, h, templates, by_id, odp);
+        return 0;
+    }
+    if (std::strcmp(opts.format, "raw") == 0) {
+        /* Pseudo-wire structural dump: walks the raw bytes itself
+         * (header + body) rather than going through BodyWalker, so it
+         * owns its own body_stream_open + finalize. */
+        cst::render_raw(stdout, *cf, h, templates, by_id, opts.max_entries);
         return 0;
     }
     return run_body_render(opts, h, *cf, templates, by_id, odp);

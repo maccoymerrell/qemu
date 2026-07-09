@@ -426,10 +426,16 @@ void decode_detail_to_generic(uint64_t pc,
                               InsnFields *out,
                               InsnRegNames *out_names)
 {
-    memset(out, 0, sizeof(*out));
-    if (out_names) {
-        memset(out_names, 0, sizeof(*out_names));
-    }
+    /* CONTRACT: @out is a freshly-reset InsnFieldsScratch::f — all scalars
+     * zero and every span wired to zeroed full-size backing (see
+     * insn_fields_scratch_reset).  The walker and the dep/lane refiners
+     * append and compact through those spans; a whole-struct memset here
+     * would sever them.  Committed templates are never passed in (their
+     * spans are immutable, pool- or zero-array-backed). */
+    g_assert(out->src_regs && out->dst_dep_mask);
+    /* Same contract for @out_names: a freshly-reset InsnRegNamesScratch::rn
+     * with spans wired to full-size backing. */
+    g_assert(!out_names || out_names->src_qemu_reg_keys);
 
     if (!info || !info->mnemonic[0]) {
         return;

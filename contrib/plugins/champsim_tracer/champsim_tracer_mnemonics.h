@@ -115,8 +115,21 @@ typedef struct InsnFields {
     bool    writes_int_flags;
     uint8_t n_src_regs;
     uint8_t n_dst_regs;
-    uint8_t src_regs[MAX_SRC_REGS];
-    uint8_t dst_regs[MAX_DST_REGS];
+    /*
+     * SPAN MEMBERS.  Every array below is a pointer span sized by its
+     * count (noted per member), not a fixed inline array: per-insn
+     * metadata dominated the plugin's heap at 3272 B/insn when these
+     * were eight fixed 64-slot arrays.  Committed templates point the
+     * spans into one per-template pool (BBTemplate::insn_fields_pool);
+     * empty spans alias shared zero arrays so out-of-count reads still
+     * return 0.  During template BUILD the spans point at the full-size
+     * backing of an InsnFieldsScratch (below) so the operand walker and
+     * dep/lane refiners can append and compact freely; the pack step at
+     * template commit copies exactly the final-count prefixes.  Spans
+     * are immutable after commit.  Indexing syntax is unchanged.
+     */
+    uint8_t *src_regs;              /* [n_src_regs] */
+    uint8_t *dst_regs;              /* [n_dst_regs] */
     bool    has_immediate;
     int64_t immediate;
     /*
@@ -166,8 +179,8 @@ typedef struct InsnFields {
      * uint64_t so the imm bit fits when src + load slots stack up.
      */
     bool     has_reg_deps;
-    uint64_t dst_dep_mask[MAX_DST_REGS];
-    uint64_t store_data_dep_mask[MAX_STORES];
+    uint64_t *dst_dep_mask;         /* [n_dst_regs] */
+    uint64_t *store_data_dep_mask;  /* [max_dep_stores] */
     /*
      * Intra-instruction address dataflow (HAS_ADDR sub-block).
      * Per-memop mask of which template inputs feed its address
@@ -181,8 +194,8 @@ typedef struct InsnFields {
      * has_addr_deps trips when at least one MEM operand was seen.
      */
     bool     has_addr_deps;
-    uint64_t load_addr_dep_mask[MAX_LOADS];
-    uint64_t store_addr_dep_mask[MAX_STORES];
+    uint64_t *load_addr_dep_mask;   /* [max_dep_loads] */
+    uint64_t *store_addr_dep_mask;  /* [max_dep_stores] */
     /*
      * Lane participation (CST_INSN_FLAG_VEC).  Unified runtime path:
      * the refiner picks lane_mask_kind + baseline data; the exec-time
@@ -226,8 +239,8 @@ typedef struct InsnFields {
      * src_regs[] / dst_regs[].  STATIC: these are the final values.
      * Register-sourced kinds: structural pattern AND-ed at exec with
      * the gate read from lane_mask_source_reg. */
-    uint64_t              src_lane_mask[MAX_SRC_REGS];
-    uint64_t              dst_lane_mask[MAX_DST_REGS];
+    uint64_t              *src_lane_mask;  /* [n_src_regs] */
+    uint64_t              *dst_lane_mask;  /* [n_dst_regs] */
     /* Capstone-side (feature, name) of the register the dynamic gate
      * reads at exec — vl CSR on RISC-V V, k1 on x86 EVEX masked,
      * predicate reg on AArch64 SVE.  Empty key on STATIC rows. */
@@ -241,6 +254,42 @@ typedef struct InsnFields {
     uint8_t  rep_loads_per_iter;
     uint8_t  rep_stores_per_iter;
 } InsnFields;
+
+/*
+ * Build-time backing for one InsnFields: full-size arrays for every span
+ * so the operand walker and the dep/lane refiners (which append past the
+ * walker's counts — x86 stack push/pop — or compact and shrink them —
+ * dep_lea, arm64 cmp-alias) always have room.  insn_fields_scratch_reset
+ * gives the exact semantics the old fixed-array struct got from a whole-
+ * struct memset: everything zero, spans wired to zeroed full-size arrays.
+ *
+ * SELF-REFERENTIAL: f's spans point into this object.  Never copy, move,
+ * or place it in a reallocating container; reuse one instance per insn.
+ */
+typedef struct InsnFieldsScratch {
+    InsnFields f;
+    uint8_t  src_regs[MAX_SRC_REGS];
+    uint8_t  dst_regs[MAX_DST_REGS];
+    uint64_t dst_dep_mask[MAX_DST_REGS];
+    uint64_t store_data_dep_mask[MAX_STORES];
+    uint64_t load_addr_dep_mask[MAX_LOADS];
+    uint64_t store_addr_dep_mask[MAX_STORES];
+    uint64_t src_lane_mask[MAX_SRC_REGS];
+    uint64_t dst_lane_mask[MAX_DST_REGS];
+} InsnFieldsScratch;
+
+static inline void insn_fields_scratch_reset(InsnFieldsScratch *s)
+{
+    memset(s, 0, sizeof(*s));
+    s->f.src_regs            = s->src_regs;
+    s->f.dst_regs            = s->dst_regs;
+    s->f.dst_dep_mask        = s->dst_dep_mask;
+    s->f.store_data_dep_mask = s->store_data_dep_mask;
+    s->f.load_addr_dep_mask  = s->load_addr_dep_mask;
+    s->f.store_addr_dep_mask = s->store_addr_dep_mask;
+    s->f.src_lane_mask       = s->src_lane_mask;
+    s->f.dst_lane_mask       = s->dst_lane_mask;
+}
 
 
 /*

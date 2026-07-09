@@ -99,7 +99,18 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
         if (wp.cur_insn_count > CST_FID_SLOT_COUNT) {
             return;
         }
-    } else if (!g_trace_segments.is_active_atomic()) {
+    } else if (!g_trace_segments.is_active_atomic() || g_capture_mute) {
+        /* CP path.  Drop memops issued inside an asynchronous interrupt
+         * (timer / device IRQ / scheduler tick): the async excursion is
+         * excluded from the trace entirely — vcpu_tb_exec bails at the
+         * same gate so the handler's BODY never appears — but this
+         * per-memop callback still fires for the handler's instructions.
+         * Without this gate those kernel memops pile into the CP
+         * accumulator and, having no matching PC in the interrupted user
+         * BB's template, collapse onto insn_index 0 when that BB drains
+         * (a phantom 64-load/64-store blob on, e.g., an adrp).  Sync
+         * faults stay traced (qemu_plugin_in_async_int() is false for
+         * them), so their memops are recorded and attributed normally. */
         return;
     }
 
@@ -145,7 +156,9 @@ void MemAccessRecorder::record_synthetic_load(uint64_t vaddr, uint64_t insn_pc)
         if (wp.cur_insn_count > CST_FID_SLOT_COUNT) {
             return;
         }
-    } else if (!g_trace_segments.is_active_atomic()) {
+    } else if (!g_trace_segments.is_active_atomic() || g_capture_mute) {
+        /* Drop synthetic-EA loads issued inside an async interrupt — see
+         * the rationale in record(). */
         return;
     }
 
@@ -177,6 +190,29 @@ size_t MemAccessRecorder::cp_count() const
 void MemAccessRecorder::clear_cp()
 {
     tls_cp_mem_accesses.clear();
+}
+
+void MemAccessRecorder::take_cp(std::vector<WPMemAccess> &out)
+{
+    /* Move the CP buffer out (leaving it empty) so a fault excursion can set
+     * it aside while the handler records its own memops, then restore it on
+     * resume — the faulting BB's memops accumulate across the detour exactly
+     * as the WP walk accumulates past a spec fault. */
+    out = std::move(tls_cp_mem_accesses);
+    tls_cp_mem_accesses.clear();
+}
+
+void MemAccessRecorder::prepend_cp(const std::vector<WPMemAccess> &front)
+{
+    /* Re-inject @front ahead of the current CP buffer.  Memops are keyed by
+     * absolute insn_pc and drained by matching against the template's
+     * insn_pcs, so prefix-then-suffix order is preserved and indices resolve
+     * correctly regardless of the per-piece template the pieces ran under. */
+    if (front.empty()) {
+        return;
+    }
+    tls_cp_mem_accesses.insert(tls_cp_mem_accesses.begin(),
+                               front.begin(), front.end());
 }
 
 void MemAccessRecorder::drain_cp_into_dyn_params(

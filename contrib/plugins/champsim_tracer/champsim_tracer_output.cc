@@ -423,6 +423,7 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         { CST_FLAG_REG_DATA, "CST_FLAG_REG_DATA" },
         { CST_FLAG_PROFILE, "CST_FLAG_PROFILE" },
         { CST_FLAG_WP, "CST_FLAG_WP" },
+        { CST_FLAG_FAULT, "CST_FLAG_FAULT" },
     };
     static const EncodingMapEntry insn_flag_entries[] = {
         { CST_INSN_FLAG_BRANCH_COND, "CST_INSN_FLAG_BRANCH_COND" },
@@ -2911,6 +2912,11 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
     if (enable_wrong_path) {
         flags |= CST_FLAG_WP;
     }
+    /* System-mode sync-fault trailer: each entry carries its
+     * exception-nesting depth (+ anchor on a faulting BB). */
+    if (g_features.fault_excursions) {
+        flags |= CST_FLAG_FAULT;
+    }
     bw_write_u8(&st->header_bw, flags);
     st->header_flags = flags;
 
@@ -3063,6 +3069,22 @@ static void emit_body_record_payload(
                       {entry->template_id, entry->tmpl,
                        &entry->dyn_params, &entry->reg_snaps},
                       false, entry->cpu_index);
+
+    /* Per-entry synchronous-fault trailer (CST_FLAG_FAULT, system mode):
+     * the exception-nesting depth at which this BB executed.  0 = normal
+     * (non-handler) code; >=1 = synchronous-fault handler code that detoured
+     * execution at that nesting level.  Written before the WP sections so it
+     * is present whether or not CST_FLAG_WP is set. */
+    if (st->header_flags & CST_FLAG_FAULT) {
+        bw_write_uleb128(bw, (uint64_t)entry->fault_depth);
+        /* Faulting-instruction anchors for a whole-BB-merged faulting BB
+         * (one index per fault excursion, in order).  n=0 on ordinary
+         * entries and on handler entries. */
+        bw_write_uleb128(bw, (uint64_t)entry->fault_anchors.size());
+        for (uint32_t a : entry->fault_anchors) {
+            bw_write_uleb128(bw, (uint64_t)a);
+        }
+    }
 
     /* The wrong-path chain + events sections follow only when
      * CST_FLAG_WP is set.  With wrong-path simulation off the entry

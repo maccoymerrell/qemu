@@ -491,8 +491,8 @@ Per TB executed on the correct path, ``vcpu_tb_exec`` runs:
     leaves its own values in the scoreboard, which is exactly what
     the chain assembler needs to fold.
 4.  Walk the previously-executed QEMU TB's fragment list from the
-    head fragment (stashed in ``g_cp_prev_tb_template`` by the
-    *prior* ``vcpu_tb_exec``) up to the fragment whose ``start_pc``
+    head fragment (stashed in the PathBuilder's pending-seal slot by
+    the *prior* ``vcpu_tb_exec``) up to the fragment whose ``start_pc``
     matches the scoreboard's ``prev_start_pc``.  For each fragment
     in the walk: append it to the in-flight CP chain (passing its
     ``TbTerminus``), bump per-instruction attribution

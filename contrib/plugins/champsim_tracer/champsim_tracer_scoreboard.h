@@ -30,9 +30,7 @@ public:
     qemu_plugin_u64 current_pc;
     qemu_plugin_u64 prev_start_pc;
     qemu_plugin_u64 prev_fall_through;
-    qemu_plugin_u64 prev_bb_terminus;
     qemu_plugin_u64 insn_count;
-    qemu_plugin_u64 last_counted_start_pc;
     /* is_active mirror (per-vCPU 0/1) for cond_cb gating of per-insn
      * heavy callbacks. */
     qemu_plugin_u64 is_active;

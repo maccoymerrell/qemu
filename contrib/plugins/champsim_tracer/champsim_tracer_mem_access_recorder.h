@@ -37,6 +37,12 @@ public:
     size_t cp_count() const;
     void clear_cp();
 
+    /* Set the CP buffer aside (move out, leaving it empty) across a
+     * synchronous-fault excursion, and re-inject it on resume so the
+     * faulting BB's memops accumulate across the detour.  See the .cc. */
+    void take_cp(std::vector<WPMemAccess> &out);
+    void prepend_cp(const std::vector<WPMemAccess> &front);
+
     /* Drain the CP accumulator into @dyn_params, attributing each
      * memop to the matching insn_pc within @bb_tmpl's insn list.
      * Empties the CP buffer on return. */

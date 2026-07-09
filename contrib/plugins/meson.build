@@ -43,6 +43,7 @@ if get_option('plugins')
       'champsim_tracer/champsim_tracer_reg_snap_collector.cc',
       'champsim_tracer/champsim_tracer_bb_chain_assembler.cc',
       'champsim_tracer/champsim_tracer_mem_access_recorder.cc',
+      'champsim_tracer/champsim_tracer_path_builder.cc',
       'champsim_tracer/champsim_tracer_wp_thread_state.cc',
       'champsim_tracer/champsim_tracer_plugin_config.cc',
       'champsim_tracer/champsim_tracer_mnemonic_tables.cc',

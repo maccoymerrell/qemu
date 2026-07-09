@@ -115,8 +115,6 @@ static void wp_enter_spec_session(unsigned int cpu_index, uint64_t wrong_target,
     g_wp_state.saved_prev_start_pc = qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
     g_wp_state.saved_prev_fall_through = qemu_plugin_u64_get(g_scoreboard.prev_fall_through,
                                                      cpu_index);
-    g_wp_state.saved_prev_bb_terminus =
-        qemu_plugin_u64_get(g_scoreboard.prev_bb_terminus, cpu_index);
     g_wp_state.saved_budget = qemu_plugin_u64_get(g_scoreboard.budget, cpu_index);
     g_wp_state.in_progress = true;
 
@@ -146,8 +144,6 @@ static void wp_end_spec_session(unsigned int cpu_index,
     qemu_plugin_u64_set(g_scoreboard.prev_start_pc, cpu_index, g_wp_state.saved_prev_start_pc);
     qemu_plugin_u64_set(g_scoreboard.prev_fall_through, cpu_index,
                         g_wp_state.saved_prev_fall_through);
-    qemu_plugin_u64_set(g_scoreboard.prev_bb_terminus, cpu_index,
-                        g_wp_state.saved_prev_bb_terminus);
     qemu_plugin_u64_set(g_scoreboard.budget, cpu_index, g_wp_state.saved_budget);
 
     qemu_plugin_spec_mode_end();
@@ -183,7 +179,8 @@ static uint32_t wp_append_fragment_insns(WpAccum &acc, BBTemplate *cur,
     auto &bb_reg_snaps = acc.bb_reg_snaps;
     /* Stable zeroed sentinel for the rare reg-data-on-but-template-has-no-
      * regnames case (keeps a valid pointer to push). */
-    static const InsnRegNames kEmptyRegNames{};
+    static const InsnRegNames kEmptyRegNames{g_zero_regkeys,
+                                             g_zero_regkeys};
 
     uint32_t appended_insns = 0;
     for (uint32_t i = 0; i < n_executed_in_cur; i++) {
@@ -383,6 +380,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     while (sim_insns < (uint64_t)max_wrong_path_depth ||
            !bb_pcs.empty()) {
         uint64_t pre_pc = qemu_plugin_get_pc();
+        cst_ring_push('W', pre_pc);  /* #77 ring (gated) */
         size_t mem_start_idx = g_wp_state.mem_accesses.size();
         BBTemplate *tmpl = nullptr;
         bool tb_ok;
@@ -393,8 +391,18 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
          * any of the TB's canonical insns — both signals that the
          * region is dynamic data, not real code.  Drop the in-flight
          * accumulator and end this WP simulation; chain so far is
-         * preserved. */
-        if (cst_pc_is_poisoned(pre_pc)) {
+         * preserved.
+         *
+         * EXCEPT on the very first iteration (empty chain): the branch
+         * predictor deliberately chose this wrong_target, so a stale
+         * global poison (keyed by TB start_pc, sometimes never erased
+         * because the correct path only reaches this VA mid-TB) must not
+         * veto the excursion's entry and produce a 0-block truncation.
+         * The per-TB detect_tb_poison in vcpu_tb_trans still refuses a
+         * genuinely-garbage first TB (Capstone-fail -> null tmpl below),
+         * so dropping the global check here only recovers real code. */
+        if (!(wp_chain.empty() && bb_pcs.empty()) &&
+            cst_pc_is_poisoned(pre_pc)) {
             acc.clear();
             bb_reg_snaps.clear();
             poisoned_targets.insert(pre_pc);
@@ -494,12 +502,36 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
              * the whole WP from a fresh spec session in the now-fresh
              * cache; do NOT continue this session (the flush dropped the
              * spec-mode translation, and resuming would run wrong-path
-             * code outside the sandbox).  A genuine null (no flush, e.g.
-             * translation-unavailable) just truncates the chain. */
+             * code outside the sandbox).  A genuine null (no flush) means
+             * the wrong-path target could not be fetched/translated —
+             * un-resident code under demand paging, or a refused garbage
+             * region — and truncates the chain: mark the last completed WP
+             * BB translation_unavailable so the truncation is explicit on
+             * the wire (CST_WP_EVENT_TRANSLATION_UNAVAIL) instead of
+             * indistinguishable from a clean depth-budget end.  The
+             * validator reads the marker to tell an honest boundary from a
+             * silently short chain. */
             if (g_tb_flush_count.load(std::memory_order_acquire) !=
                     flush_before) {
                 *flush_interrupted = true;
+            } else if (!wp_chain.empty()) {
+                wp_chain.back().translation_unavailable = true;
             }
+            acc.clear();
+            bb_reg_snaps.clear();
+            early_exit = true;
+            break;
+        }
+
+        /*
+         * Wild speculative store: a garbage-size memop the wrong path just
+         * executed wrote past the spec-store soft budget into the sandbox
+         * without faulting (it is buffered, not real).  The wrong path has
+         * diverged into nonsense — a real CPU's wrong-path store would fault and
+         * mispredict-recover — so terminate the excursion rather than fill the
+         * sandbox to its hard cap and start dropping stores.  Drop the in-flight
+         * chain; the correct-path BBs already emitted are preserved. */
+        if (qemu_plugin_spec_store_overflowed()) {
             acc.clear();
             bb_reg_snaps.clear();
             early_exit = true;
@@ -615,6 +647,23 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             uint8_t last_insn_size = n_executed_in_cur > 0
                 ? cur->insn_sizes[n_executed_in_cur - 1]
                 : 0;
+            /* Nop-slide bound (#91): an unsealed wrong-path BB growing past
+             * any real block size means the speculation is running a
+             * branchless straight line through non-code — typically zeroed
+             * pages, which decode as nop streams — far past the depth
+             * budget (the walk continues while the BB is unsealed).  Left
+             * unbounded it commits multi-thousand-insn garbage templates
+             * (~3.3 KB/insn) into the trace per excursion.  DROP the
+             * accumulator (never commit a slide) and end the excursion;
+             * the cap leaves generous headroom over the largest legitimate
+             * generated blocks so exact-chain validation is unaffected. */
+            if (bb_pcs.size() > 2048) {
+                acc.clear();
+                bb_reg_snaps.clear();
+                early_exit = true;
+                walk_done = true;
+                break;
+            }
 
             /*
              * Budget accounting.  Charge AT LEAST 1 per exec_tb even

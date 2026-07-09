@@ -19,8 +19,28 @@
 namespace {
 
 GMutex stats_registry_lock;
-std::vector<Stats *> stats_registry;
-Stats stats_graveyard;  /* sums of threads that have exited */
+
+/*
+ * Process-lifetime ("immortal") aggregates: heap objects bound to references,
+ * deliberately never destructed.  These are touched by THREE flows whose order
+ * at teardown is otherwise unmanaged:
+ *   - each ThreadStats CTOR registers its slot (push_back into the registry);
+ *   - each ThreadStats DTOR (a vCPU thread exiting mid-run, or the main thread
+ *     at process exit) folds the slot into the graveyard and erases it;
+ *   - plugin_exit (an atexit callback) reads them via body_stream_finish.
+ * A plain file-scope global would get an implicit __cxa_atexit destructor whose
+ * run-order vs. plugin_exit and vs. the (later) main-thread ThreadStats dtor is
+ * not guaranteed.  In system mode the main thread first touches its slot AT
+ * plugin_exit; if the registry's own destructor (or buffer free) has already
+ * run, that push_back writes freed memory -> heap corruption (ASAN:
+ * heap-buffer-overflow in the push_back; observed as "corrupted double-linked
+ * list" at the cst_tar finalize malloc).  Giving the shared aggregates
+ * process lifetime means every ctor/dtor/finalize can always touch them
+ * safely; this is correct lifetime management, not a workaround.  Each leaks
+ * exactly one object for the life of the process.
+ */
+std::vector<Stats *> &stats_registry = *new std::vector<Stats *>();
+Stats &stats_graveyard = *new Stats{};  /* sums of threads that have exited */
 
 void stats_add(Stats *dst, const Stats &src)
 {

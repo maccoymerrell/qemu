@@ -17,12 +17,8 @@ VCPUScoreboard::VCPUScoreboard()
         sb_, VCPUScoreBoard, prev_start_pc);
     prev_fall_through = qemu_plugin_scoreboard_u64_in_struct(
         sb_, VCPUScoreBoard, prev_fall_through);
-    prev_bb_terminus = qemu_plugin_scoreboard_u64_in_struct(
-        sb_, VCPUScoreBoard, prev_bb_terminus);
     insn_count = qemu_plugin_scoreboard_u64_in_struct(
         sb_, VCPUScoreBoard, insn_count);
-    last_counted_start_pc = qemu_plugin_scoreboard_u64_in_struct(
-        sb_, VCPUScoreBoard, last_counted_start_pc);
     is_active = qemu_plugin_scoreboard_u64_in_struct(
         sb_, VCPUScoreBoard, is_active);
     budget = qemu_plugin_scoreboard_u64_in_struct(
@@ -38,7 +34,7 @@ VCPUScoreboard::~VCPUScoreboard()
      * as a C++ static destructor at process teardown.  Its ordering versus
      * QEMU's libc-registered atexit handler that fires our QEMU_PLUGIN_EV_
      * ATEXIT callback (plugin_exit -> finish_trace_segment ->
-     * flush_pending_final_body_entry, which reads this scoreboard) is not
+     * PathBuilder::flush_final, which reads this scoreboard) is not
      * guaranteed.  In system-emulation teardown (qemu_default_main -> exit)
      * this destructor runs *before* plugin_exit; freeing here left
      * plugin_exit's final flush dereferencing a freed scoreboard -> SIGSEGV

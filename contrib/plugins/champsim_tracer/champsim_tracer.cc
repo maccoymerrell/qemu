@@ -29,6 +29,7 @@
 #include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_branch_history.h"
 #include "champsim_tracer_mem_access_recorder.h"
+#include "champsim_tracer_path_builder.h"
 #include "champsim_tracer_plugin_config.h"
 #include "champsim_tracer_reg_handle_cache.h"
 #include "champsim_tracer_reg_snap_collector.h"
@@ -46,6 +47,75 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 int max_wrong_path_depth = 64;
 int g_wp_prune = 0;          /* wpprune level: 0 none, 1 cold, 2 monotone */
 bool enable_wrong_path = true;
+
+/* ---- #77 diagnostic ring buffer (gated on CST_RING) -------------------
+ * Records recent correct-path BB starts ('C') and wrong-path instruction
+ * PCs ('W') into an in-memory ring (no I/O on the hot path).  A periodic
+ * overwrite dump to /tmp/rv_ring.txt means the last dump before QEMU is
+ * killed shows the steady-state CP loop + the WP running through it.  A
+ * one-shot dump to /tmp/rv_ring_onset.txt fires the first time a sustained
+ * near-PC CP run is seen, capturing the WP that ran BEFORE the loop formed. */
+namespace {
+struct CstRingEvt { char tag; uint64_t pc; };
+constexpr uint32_t CST_RING_SZ = 32768;
+CstRingEvt g_cst_ring[CST_RING_SZ];
+uint64_t   g_cst_ring_head = 0;
+int        g_cst_ring_on = -1;
+uint64_t   g_cst_last_cp_pc = 0;
+uint64_t   g_cst_loop_run = 0;
+bool       g_cst_onset_dumped = false;
+
+void cst_ring_dump_to(const char *path)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return;
+    }
+    uint64_t n = g_cst_ring_head < CST_RING_SZ ? g_cst_ring_head : CST_RING_SZ;
+    uint64_t start = g_cst_ring_head < CST_RING_SZ ? 0 : g_cst_ring_head;
+    for (uint64_t i = 0; i < n; i++) {
+        const CstRingEvt &e = g_cst_ring[(start + i) & (CST_RING_SZ - 1)];
+        fprintf(f, "%c 0x%" PRIx64 "\n", e.tag, e.pc);
+    }
+    fclose(f);
+}
+} /* namespace */
+
+void cst_ring_push(char tag, uint64_t pc)
+{
+    if (g_cst_ring_on < 0) {
+        g_cst_ring_on = getenv("CST_RING") ? 1 : 0;
+    }
+    if (!g_cst_ring_on) {
+        return;
+    }
+    g_cst_ring[g_cst_ring_head & (CST_RING_SZ - 1)] = { tag, pc };
+    g_cst_ring_head++;
+
+    /* Periodic overwrite dump on TOTAL event count (C or W), so a
+     * wrong-path-dominated stream (runaway WP excursion) still dumps. */
+    if ((g_cst_ring_head % 200000) == 0) {
+        cst_ring_dump_to("/tmp/rv_ring.txt");
+    }
+
+    if (tag != 'C') {
+        return;
+    }
+    /* Loop-onset detector: a sustained run of CP BBs within a 64 KiB window
+     * (same function/region) => we have entered a tight CP loop.  Dump once. */
+    uint64_t d = pc > g_cst_last_cp_pc ? pc - g_cst_last_cp_pc
+                                       : g_cst_last_cp_pc - pc;
+    g_cst_last_cp_pc = pc;
+    if (d < 0x10000) {
+        g_cst_loop_run++;
+    } else {
+        g_cst_loop_run = 0;
+    }
+    if (!g_cst_onset_dumped && g_cst_loop_run > 12000) {
+        cst_ring_dump_to("/tmp/rv_ring_onset.txt");
+        g_cst_onset_dumped = true;
+    }
+}
 static char *unknown_warn_path = nullptr;
 /* File for the final stats / icount report.  Opened at install time
  * so it has a valid fd even after QEMU closes stderr during the
@@ -109,13 +179,6 @@ bool cst_pc_is_poisoned(uint64_t pc)
     return poisoned;
 }
 
-/* Thread-local cursor of the last CP TB this vCPU executed, set by
- * vcpu_tb_exec from its own per-TB udata.  The CP chain assembler
- * folds this snapshot at the next exec — an exact-shape pointer that
- * cannot collide with a sibling translation (CP vs WP) of the same
- * start_pc, and that needs no start_pc lookup. */
-thread_local BBTemplate *g_cp_prev_tb_template CST_TLS_HOT = nullptr;
-
 /*
  * Address-space pin (marker mode).  When the marker fires we capture the
  * executing vCPU's ASID (x86 CR3 etc., via qemu_plugin_get_addr_space_id)
@@ -154,6 +217,17 @@ static inline void user_count_reset(uint64_t insn_count_now)
     g_user_icount = 0;
     g_user_icount_seen = insn_count_now;
 }
+
+/* Emit-time fault-depth trailer register (system mode): the exception-
+ * nesting depth the deferred prev TB ran at, stamped by the PathBuilder
+ * seal phase (which carries the depth pipeline) and read by
+ * emit_body_entry into the entry's fault trailer.  0 = normal code,
+ * >=1 = fault-handler code at that nesting. */
+thread_local uint32_t g_emit_fault_depth CST_TLS_HOT = 0;
+
+/* Anchors (faulting-insn indices) for the whole-BB merge emit currently in
+ * flight; read by emit_body_entry into the entry's fault trailer. */
+thread_local std::vector<uint32_t> g_emit_fault_anchors CST_TLS_HOT;
 
 /* See champsim_tracer.h: threads holding cross-flush BBTemplate*
  * references (in-flight wrong-path simulation).  Gates drain_pending_flush
@@ -422,9 +496,10 @@ static GRecMutex exec_lock;
  * hook).  Last canonical insn of a TB is captured at the NEXT TB's
  * vcpu_tb_exec ("Tail-insn dst snap").  Drained into
  * BodyEntry.reg_snaps at finalize, discarded on flush.  Active only
- * when g_features.reg_data.
- */
-static thread_local std::vector<RegSnap> pending_reg_snaps CST_TLS_HOT;
+ * when g_features.reg_data.  Non-static (extern in
+ * champsim_tracer_path_builder.h) so the PathBuilder's fault frames can
+ * stash and re-inject it. */
+thread_local std::vector<RegSnap> pending_reg_snaps CST_TLS_HOT;
 
 /* WP-side counterpart to pending_reg_snaps.  See the docstring on the
  * extern declaration in champsim_tracer.h for the contract.  Non-static
@@ -465,6 +540,15 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
         return;
     }
     if (!g_trace_segments.is_active_atomic()) {
+        return;
+    }
+    /* Async-interrupt exclusion: same rationale as the memop recorder.  A
+     * suppressed async handler's per-insn dst snaps must not leak into the
+     * interrupted user BB's pending_reg_snaps — they would attach to the
+     * wrong instruction and surface kernel register values on a user insn
+     * (e.g. a user `add` whose dst snap is a kernel stack pointer).  Sync
+     * faults stay traced, so this does not affect them. */
+    if (g_capture_mute) {
         return;
     }
     std::vector<RegSnap> *sink;
@@ -552,6 +636,11 @@ static void vcpu_insn_synth_ea_cb(unsigned int cpu_index, void *udata)
         return;
     }
     if (!g_trace_segments.is_active_atomic()) {
+        return;
+    }
+    /* Async-interrupt exclusion: drop synthetic-EA loads issued by a
+     * suppressed async handler (see the memop recorder rationale). */
+    if (g_capture_mute) {
         return;
     }
     const SynthEAInsnRef *ref = (const SynthEAInsnRef *)udata;
@@ -668,7 +757,10 @@ static void reset_segment_local_state(void)
      */
     g_segment_generation.fetch_add(1, std::memory_order_release);
 
-    /* Our own thread's TLS state (we're called from vcpu_tb_exec). */
+    /* Our own thread's TLS state (we're called from vcpu_tb_exec).  The
+     * PathBuilder's frames and cursors are dropped by its own
+     * on_segment_open (each thread runs it as it crosses the segment
+     * generation, this one included). */
     g_cp_chain.reset();
     g_mem_recorder.clear_cp();
     pending_reg_snaps.clear();
@@ -838,11 +930,13 @@ static void heartbeat_progress(uint64_t icount)
  * accumulators (draining them) and write it to @out_stream.
  * @wp_entries is moved in.  Caller holds exec_lock; data_lock is NOT
  * held — the per-thread accumulators are unsynchronised by design.
+ * Non-static (declared in champsim_tracer_path_builder.h): also the
+ * emission primitive of PathBuilder::flush_final.
  */
-static void emit_body_entry(BodyStreamState *out_stream,
-                            BBTemplate *bb_tmpl,
-                            unsigned int cpu_index,
-                            std::vector<WPBBEntry> wp_entries)
+void emit_body_entry(BodyStreamState *out_stream,
+                     BBTemplate *bb_tmpl,
+                     unsigned int cpu_index,
+                     std::vector<WPBBEntry> wp_entries)
 {
     /* warmup→simulation boundary capture.  This BB is the first
      * emitted at host_icount >= window_start + warmup_insns, so
@@ -865,6 +959,8 @@ static void emit_body_entry(BodyStreamState *out_stream,
     entry.dyn_params.reserve(g_mem_recorder.cp_count());
     entry.wp_entries = std::move(wp_entries);
     entry.tmpl = bb_tmpl;
+    entry.fault_depth = g_emit_fault_depth;
+    entry.fault_anchors = g_emit_fault_anchors;
     entry.thread_id = (uint32_t)cpu_index;
     entry.cpu_index = cpu_index;
 
@@ -967,8 +1063,7 @@ static void emit_body_entry(BodyStreamState *out_stream,
     g_seg_arch_insns += bb_tmpl ? bb_tmpl->n_insns : 0;
 }
 
-/* Append a CP fragment to the true-BB chain (shared by the per-exec walk
- * in vcpu_tb_exec and the segment-final flush below). */
+/* Append a CP fragment to the true-BB chain (per-exec seal walk). */
 static inline void cp_chain_append(BBTemplate *frag)
 {
     g_cp_chain.append_fragment(frag->start_pc, frag,
@@ -992,91 +1087,6 @@ static inline BBTemplate *cp_chain_finalize_if_complete(void)
 }
 
 /*
- * Flush the pending final-TB body entry before a segment finishes.
- * BodyEntries are emitted lazily: vcpu_tb_exec emits the *previous*
- * TB's entry once its branch direction is known.  A TB ended by a
- * process-exiting syscall has no "next" TB, so without this its
- * memops would vanish.  No wrong-path (WP undefined after exit).
- * Caller holds exec_lock.
- */
-static void flush_pending_final_body_entry(void)
-{
-    BodyStreamState *out_stream = g_trace_segments.body_stream();
-    unsigned int cpu_index = 0;
-    uint64_t prev_start =
-        qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
-
-    std::vector<BBTemplate *> finalized;
-    if (out_stream && prev_start != 0) {
-        g_mutex_lock(&data_lock);
-        /* Head fragment of the segment-final QEMU TB.  Walk its
-         * fragment list up to the last-executed one (matched by
-         * scoreboard's @prev_start), same as the per-exec walk in
-         * vcpu_tb_exec.  No later vcpu_tb_exec will fire after
-         * shutdown so this is the only chance to flush the trailing
-         * chain. */
-        BBTemplate *prev_tb_head = g_cp_prev_tb_template;
-        for (BBTemplate *frag = prev_tb_head; frag != nullptr;
-             frag = frag->next_tb_fragment) {
-            bool is_last_executed = (frag->start_pc == prev_start);
-
-            if (is_last_executed) {
-                /* Tail-insn dst snap (see snap_prev_tail_dsts): the
-                 * last-executed fragment's tail registers still hold
-                 * post-exec values.  On a delay-slot tail [branch@n-2,
-                 * delay@n-1] the branch's snap was deferred and there is
-                 * no next TB to catch it (segment end), so capture both
-                 * the branch (n-2) and the delay slot (n-1) here. */
-                if (g_features.reg_data && frag->insn_reg_names &&
-                    frag->n_insns > 0) {
-                    uint32_t last = frag->n_insns - 1;
-                    bool ds_tail = frag->n_insns >= 2 &&
-                        frag->insn_fields[last - 1].branch_type
-                            != BRANCH_NONE &&
-                        frag->insn_fields[last].branch_type
-                            == BRANCH_NONE;
-                    auto snap_tail = [&](uint32_t idx) {
-                        const InsnFields *fl = &frag->insn_fields[idx];
-                        const InsnRegNames *nl = &frag->insn_reg_names[idx];
-                        for (uint8_t i = 0; i < fl->n_dst_regs; i++) {
-                            RegSnap s;
-                            g_reg_snaps.read_into_snap(
-                                cpu_index, nl->dst_qemu_reg_keys[i], &s);
-                            pending_reg_snaps.push_back(s);
-                        }
-                    };
-                    if (ds_tail) {
-                        snap_tail(last - 1);  /* branch */
-                    }
-                    snap_tail(last);          /* delay slot, or branch */
-                }
-            }
-
-            cp_chain_append(frag);
-            if (BBTemplate *bb_tmpl = cp_chain_finalize_if_complete()) {
-                finalized.push_back(bb_tmpl);
-            }
-
-            if (is_last_executed) {
-                break;
-            }
-        }
-        g_mutex_unlock(&data_lock);
-    }
-
-    for (BBTemplate *bb_tmpl : finalized) {
-        emit_body_entry(out_stream, bb_tmpl, cpu_index, {});
-    }
-
-    /* cp_chain and tls_cp_mem_accesses are thread_local; no lock. */
-    g_cp_chain.reset();
-    g_mem_recorder.clear_cp();
-
-    qemu_plugin_u64_set(g_scoreboard.prev_start_pc, 0, 0);
-    qemu_plugin_u64_set(g_scoreboard.prev_fall_through, 0, 0);
-}
-
-/*
  * Finalize and write the current trace segment.  Must be called with
  * exec_lock held.
  */
@@ -1096,7 +1106,7 @@ static void finish_trace_segment(void)
      * one or more times, which bumps g_seg_arch_insns — so we print
      * the per-segment stats AFTER finish() returns so the counter
      * reflects the entire segment, including the trailing chain. */
-    g_trace_segments.finish(flush_pending_final_body_entry);
+    g_trace_segments.finish(path_builder_flush_final);
 
     /* Actual icount at finish — must be >= window_stop for the
      * trace to be at-least-budget.  Underrun means we stopped
@@ -1149,6 +1159,16 @@ static void finish_trace_segment(void)
                                   std::memory_order_relaxed);
         g_total_arch_insns.fetch_add(g_seg_arch_insns,
                                      std::memory_order_relaxed);
+    }
+
+    /* CST_MEMSTATS (#91): template-store footprint breakdown at segment
+     * close — attributes the multi-GiB heap baseline to its owners. */
+    if (getenv("CST_MEMSTATS")) {
+        g_mutex_lock(&data_lock);
+        g_bb_template_cache.mem_stats(stderr);
+        g_mutex_unlock(&data_lock);
+        fprintf(stderr, "[memstats] first_insn_word=%zu poisoned=%zu\n",
+                g_first_insn_word.size(), g_poisoned_pcs.size());
     }
 
     /* Mirror is_active=0 into every vCPU's scoreboard slot so the
@@ -1361,12 +1381,12 @@ static bool wp_branch_pruned(const BBTemplate *bb_tmpl, const BranchRecord *br)
  * Run the WP simulator (if applicable), then emit the just-finalized
  * BB's BodyEntry.  Caller holds exec_lock; cp_chain is thread_local.
  */
-static void emit_finalized_bb(BodyStreamState *out_stream,
-                              BBTemplate *bb_tmpl,
-                              uint64_t prev_last,
-                              uint64_t current_pc,
-                              uint64_t wrong_target,
-                              unsigned int cpu_index)
+void emit_finalized_bb(BodyStreamState *out_stream,
+                       BBTemplate *bb_tmpl,
+                       uint64_t prev_last,
+                       uint64_t current_pc,
+                       uint64_t wrong_target,
+                       unsigned int cpu_index)
 {
     g_cp_chain.reset();
 
@@ -1697,15 +1717,8 @@ static void vcpu_tb_check_budget(unsigned int cpu_index, void *udata)
     g_rec_mutex_unlock(&exec_lock);
 }
 
-/* A finalized true BB awaiting emission, with its terminal-branch
- * classification already resolved.  Collected under data_lock; the actual
- * emit happens later under exec_lock only. */
-struct PendingEmit {
-    BBTemplate *bb_tmpl;
-    uint64_t    branch_pc;
-    uint64_t    emit_current_pc;
-    uint64_t    wrong_target;
-};
+/* PendingEmit is declared in champsim_tracer_path_builder.h: the events
+ * path shares the walk below and the emission entry points verbatim. */
 
 /*
  * Walk the previous TB's fragment list up to the LAST EXECUTED fragment
@@ -1720,10 +1733,10 @@ struct PendingEmit {
  * any BB finalized.  Caller holds exec_lock; this takes data_lock for the
  * chain/cache mutations.
  */
-static bool collect_finalized_bbs(unsigned int cpu_index,
-                                  BBTemplate *prev_tb_head,
-                                  uint64_t prev_start, uint64_t current_pc,
-                                  std::vector<PendingEmit> &pending_emits)
+bool collect_finalized_bbs(unsigned int cpu_index,
+                           BBTemplate *prev_tb_head,
+                           uint64_t prev_start, uint64_t current_pc,
+                           std::vector<PendingEmit> &pending_emits)
 {
     g_mutex_lock(&data_lock);
     bool any_finalize = false;
@@ -1786,6 +1799,238 @@ static bool collect_finalized_bbs(unsigned int cpu_index,
     return any_finalize;
 }
 
+/*
+ * RAII freeze of the guest virtual clock across a plugin instrumentation
+ * window (per-TB emission in vcpu_tb_exec, translation work in
+ * vcpu_tb_trans).  Instrumentation runs on the vCPU thread but is not guest
+ * execution, so its host wall-clock cost must not be charged to guest time:
+ * left unfrozen, a heavily traced guest timer-tick handler can cost more
+ * guest time than one tick period, and the guest collapses into a
+ * self-sustaining tick/scheduler storm (context-switch storm, RCU-kthread
+ * starvation, zero foreground progress — the x86 system-mode livelock).
+ * Nestable and composes with the wrong-path vtime pause; no-op in user mode.
+ */
+struct VClockPauseGuard {
+    VClockPauseGuard() { qemu_plugin_vclock_pause(); }
+    ~VClockPauseGuard() { qemu_plugin_vclock_resume(); }
+    VClockPauseGuard(const VClockPauseGuard &) = delete;
+    VClockPauseGuard &operator=(const VClockPauseGuard &) = delete;
+};
+
+/* Set by the spec-budget trip in vcpu_tb_trans (mid-excursion); consumed
+ * at the end of the CP step in vcpu_tb_exec, where no wrong-path walk is
+ * in flight and the translation that tripped has completed. */
+static std::atomic<bool> g_spec_flush_latched{false};
+
+/*
+ * Deferred icount / simpoint window closes.  The crossing is detected
+ * optimistically at TB-start while the chain assembler may still hold
+ * fragments awaiting a terminator; closing is deferred to a step tail
+ * with no active in-flight chain, so every inline-add-counted insn is
+ * either committed to an emitted BB or never bumped ("trace covers AT
+ * LEAST the requested window").  Caller holds exec_lock; the close paths
+ * unlock it themselves before exit(0).  @pb is the calling thread's
+ * builder (its pending-seal slot must be cleared on the simpoint close).
+ */
+static void run_deferred_window_closes(PathBuilder &pb)
+{
+    /* Deferred-exit on icount window-stop.  The trigger was set in
+     * tw_manage_window when icount first crossed window_stop. */
+    if (g_icount_shutdown_pending &&
+        !g_cp_chain.has_active_chain() &&
+        g_trace_segments.is_active()) {
+        finish_trace_segment();
+        g_trace_segments.set_shutting_down();
+        g_icount_shutdown_pending = false;
+        /* No need to recompute_budget: we're exiting immediately and
+         * the budget slot will be torn down with the scoreboard. */
+        g_rec_mutex_unlock(&exec_lock);
+        exit(0);
+    }
+
+    /* Simpoint analogue: finalize only after the chain has drained to a
+     * BB boundary so the trace covers AT LEAST eff_stop - eff_start
+     * (warmup + simulation) insns. */
+    if (g_simpoint_close_pending &&
+        !g_cp_chain.has_active_chain() &&
+        g_trace_segments.is_active()) {
+        finish_trace_segment();
+        g_simpoints.advance();
+        g_simpoint_close_pending = false;
+        pb.clear_prev();
+        pb.events_queue_disable();
+        if (!g_simpoints.current()) {
+            g_trace_segments.set_shutting_down();
+            g_rec_mutex_unlock(&exec_lock);
+            exit(0);
+        }
+        recompute_next_threshold();
+        /* Re-arm budget so the per-TB inline_add countdown lands at
+         * zero when icount reaches the now-current eff_start. */
+        for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
+            recompute_budget((unsigned)i);
+        }
+    }
+}
+
+/*
+ * The CP step, driven by the ordered per-vCPU event queue.  The shared
+ * prologue of vcpu_tb_exec — WP early-out, cp_executed stamp,
+ * capture-mute latch, blkwatch, vclock guard, icount read — has already
+ * run.  This glue keeps the SHARED machinery at the step level (window
+ * management, segment boundary, heartbeat/histogram, scoreboard reads,
+ * deferred closes, spec-flush latch) and hands everything path-shaped to
+ * the PathBuilder: the drained events, the async/foreign arrows, the
+ * pending-seal slot, the fault frames, and emission.  The gate ORDER is
+ * load-bearing on both sides of the window management: step_events
+ * (async gate, foreign-ASID drop, prev swap) runs before it — an
+ * async-suspended TB must not drive window decisions, and the marker
+ * close's segment-final flush walks the just-swapped prev — while
+ * step_seal (depth pipeline, fault classification, seal walk, emits)
+ * runs after the boundary gates so events during bailed steps accumulate
+ * to the next surviving step.
+ */
+static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
+                             uint64_t icount_prev, uint64_t watch_pc)
+{
+    PathBuilder &pb = path_builder_tls();
+
+    /* Enable this vCPU's event queue lazily on its first CP exec (clears
+     * any boot-time backlog).  Must run on the owning vCPU thread, which
+     * a tb_exec callback guarantees. */
+    if (!pb.events_queue_enabled()) {
+        qemu_plugin_cpu_events_set(cpu_index, true);
+        pb.mark_events_queue_enabled(cpu_index);
+    }
+
+    g_rec_mutex_lock(&exec_lock);
+
+    /* Address-space pin + count set (marker mode only — pinned !=
+     * UNPINNED).  The inline-add counts every TB; here we fold this TB's
+     * instruction count (the delta of consecutive insn_count reads) into
+     * g_user_icount ONLY when the pinned process runs at user privilege,
+     * so the window budget tracks the same user-space instructions a
+     * user-mode run would.  The executing fragment's privilege is stamped
+     * from the LIVE correct-path context (authoritative — the shared
+     * true-BB cache can be seeded first by a wrong-path session that
+     * spec-translated this PC at the kernel's CPL; see
+     * BBTemplate::is_system).  Runs under exec_lock —
+     * g_user_icount/g_user_icount_seen are plain statics, racy if mutated
+     * pre-lock on multi-vCPU guests.  It must run before tw_manage_window
+     * (the marker budget clock includes this TB) and before the
+     * async/foreign arrows (every TB — including ones about to be
+     * dropped — advances the seen cursor and carries the CP ground-truth
+     * privilege stamp). */
+    uint64_t pinned_asid = g_pinned_asid.load(std::memory_order_relaxed);
+    uint64_t live_asid = 0;
+    int live_priv = -1;
+    if (pinned_asid != CST_ASID_UNPINNED) {
+        uint64_t delta = icount_prev - g_user_icount_seen;
+        g_user_icount_seen = icount_prev;
+        live_asid = qemu_plugin_get_addr_space_id();
+        live_priv = qemu_plugin_get_priv_level();
+        if (live_asid == pinned_asid && live_priv == 0) {
+            g_user_icount += delta;
+        }
+        if (cur_tb_tmpl) {
+            cur_tb_tmpl->is_system = live_priv != 0;
+            cur_tb_tmpl->is_system_cp_confirmed = true;
+        }
+    }
+
+    if (cur_tb_tmpl) {
+        cst_ring_push('C', cur_tb_tmpl->start_pc);  /* #77 ring (gated) */
+    }
+
+    /* Drain the ordered path events.  step_events copies them out
+     * immediately (the queue's internal buffer is only valid until the
+     * next push) and retains fault events across bailed steps, so no
+     * event is ever lost to an early return below. */
+    PathBuilder::StepIn in;
+    in.cur = cur_tb_tmpl;
+    in.prev_start = 0;      /* scoreboard fields read after window mgmt */
+    in.prev_ft = 0;
+    in.current_pc = 0;
+    in.pinned = pinned_asid != CST_ASID_UNPINNED;
+    in.pinned_asid = pinned_asid;
+    in.live_asid = live_asid;
+    in.live_priv = live_priv;
+    in.evs = nullptr;
+    in.n_evs = qemu_plugin_drain_cpu_events(cpu_index, &in.evs);
+    in.cpu_index = cpu_index;
+    in.watch_pc = watch_pc;
+
+    /* Pre-window phase: async-window arrows, foreign-ASID drop, prev
+     * swap — in that order, before any window decision. */
+    PathBuilder::StepStatus st = pb.step_events(in);
+    if (st != PathBuilder::StepStatus::CONTINUE) {
+        g_rec_mutex_unlock(&exec_lock);
+        return;
+    }
+
+    if (g_trace_segments.is_shutting_down()) {
+        g_rec_mutex_unlock(&exec_lock);
+        return;
+    }
+
+    uint32_t seg_gen_before = g_segment_generation.load(
+        std::memory_order_relaxed);
+    tw_manage_window(cpu_index, icount_prev, cur_tb_tmpl);
+    bool segment_just_opened =
+        g_segment_generation.load(std::memory_order_relaxed) != seg_gen_before;
+
+    BodyStreamState *out_stream = g_trace_segments.body_stream();
+    if (!g_trace_segments.is_active() || !out_stream) {
+        g_rec_mutex_unlock(&exec_lock);
+        return;
+    }
+
+    if (segment_just_opened) {
+        /* PER-THREAD segment-open boundary (one-TB lossy):
+         * reset_segment_local_state runs once on the OPENER thread
+         * (global caches + its own TLS); every vCPU thread crosses into
+         * the new segment HERE, via the generation check, and must reset
+         * its own builder (frames, pending seal, retained events, mute
+         * window, depth pipeline — lazily re-primed), clear any
+         * pre-marker async state, and re-enable the queue, which discards
+         * the queue-side backlog straddling the boundary (pre-segment
+         * events are baselined out by the lazy re-prime). */
+        pb.on_segment_open();
+        qemu_plugin_async_int_reset();
+        g_capture_mute = false;
+        qemu_plugin_cpu_events_set(cpu_index, true);
+        g_rec_mutex_unlock(&exec_lock);
+        return;
+    }
+
+    heartbeat_progress(icount_prev);
+    g_current_hist_bucket = select_histogram_bucket(icount_prev);
+
+    in.current_pc = qemu_plugin_u64_get(g_scoreboard.current_pc, cpu_index);
+    in.prev_start = qemu_plugin_u64_get(g_scoreboard.prev_start_pc,
+                                        cpu_index);
+    in.prev_ft    = qemu_plugin_u64_get(g_scoreboard.prev_fall_through,
+                                        cpu_index);
+
+    st = pb.step_seal(in, out_stream);
+
+    /* Only a normally-sealed step evaluates the deferred closes and
+     * consumes the spec-flush latch — the stash / merge / no-seal
+     * outcomes skip both (a pending close waits for the next normal
+     * step). */
+    if (st != PathBuilder::StepStatus::SEALED) {
+        g_rec_mutex_unlock(&exec_lock);
+        return;
+    }
+
+    run_deferred_window_closes(pb);
+    g_rec_mutex_unlock(&exec_lock);
+
+    if (g_spec_flush_latched.exchange(false, std::memory_order_relaxed)) {
+        qemu_plugin_request_tb_flush();
+    }
+}
+
 static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 {
     /* This callback is registered via register_vcpu_tb_exec_cond_cb
@@ -1803,13 +2048,48 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
      * thread that triggered this WP simulation already holds
      * exec_lock from emit_finalized_bb's caller; vcpu_tb_exec fires
      * synchronously inside qemu_plugin_exec_tb on the same thread, so
-     * acquiring exec_lock here would self-deadlock (it is a
-     * non-recursive GMutex).  The WP-mode branch only touches
-     * thread-local state, so it can skip the lock cleanly. */
+     * the WP branch must not re-acquire it (exec_lock is a GRecMutex,
+     * so a nested acquire would recurse rather than deadlock — but the
+     * nested step would then run the full CP machinery against WP
+     * state).  The WP-mode branch only touches thread-local state, so
+     * it skips the lock cleanly. */
     if (g_wp_state.in_progress) {
         g_wp_state.last_executed_tb = cur_tb_tmpl;
         return;
     }
+
+    /* Correct-path execution protects this template from the spec-born
+     * reclaim at tb_flush (#91): a template the CP really runs is real
+     * code whose pointer may sit in deferred prev/chain state across a
+     * flush, and whose decode is worth keeping for re-translation dedup.
+     * Covers dedup-shared chains first built by a wrong-path translation. */
+    if (cur_tb_tmpl) {
+        cur_tb_tmpl->cp_executed = true;
+    }
+
+    /* Latch the async-exclusion decision for this TB's body callbacks
+     * (see g_capture_mute) before any early return below — the dropped
+     * boundary TBs still fire their per-insn capture callbacks. */
+    g_capture_mute = qemu_plugin_in_async_int();
+
+    /* CST_BLKWATCH=<hex pc> (#90 diagnostic): one-line report every time a
+     * watched TB's exec callback fires, with the gate states that could
+     * suppress its emission.  A single integer compare per call; prints only
+     * for the watched PC, so the timing perturbation is negligible. */
+    static uint64_t watch_pc = getenv("CST_BLKWATCH")
+        ? strtoull(getenv("CST_BLKWATCH"), nullptr, 16) : 0;
+    if (watch_pc && cur_tb_tmpl && cur_tb_tmpl->start_pc == watch_pc) {
+        BBTemplate *watch_prev = path_builder_tls().prev();
+        fprintf(stderr, "[blkwatch] exec pc=0x%" PRIx64 " async=%d fdepth=%u "
+                "prev=0x%" PRIx64 "\n",
+                cur_tb_tmpl->start_pc, (int)qemu_plugin_in_async_int(),
+                qemu_plugin_fault_depth(),
+                watch_prev ? watch_prev->start_pc : 0);
+    }
+
+    /* Everything below is instrumentation cost, not guest execution:
+     * keep it off the guest clock (see VClockPauseGuard). */
+    VClockPauseGuard vclock_guard;
 
 
     /* Read the running instruction count.  The per-TB insn_count inline-add
@@ -1821,224 +2101,10 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         g_scoreboard.insn_count, cpu_index);
     g_host_icount = icount_prev;
 
-    /* Address-space pin + count set (marker mode only — pinned != UNPINNED).
-     * The inline-add counts every TB; here we fold this TB's instruction
-     * count (the delta of consecutive insn_count reads) into g_user_icount
-     * ONLY when the pinned process runs at user privilege.  So the window
-     * budget tracks the same user-space instructions a user-mode run would.
-     * A TB in another address space (a preempt to another process) is then
-     * dropped from tracing, resetting the CP chain cursor so its fragments
-     * never bridge across the gap — the one-TB lossy boundary the
-     * segment-switch path also takes.  The pinned process's kernel calls
-     * (same ASID, priv != 0) are TRACED but not counted.  User mode leaves
-     * the pin UNPINNED, so this whole block is a no-op there. */
-    uint64_t pinned_asid = g_pinned_asid.load(std::memory_order_relaxed);
-    if (pinned_asid != CST_ASID_UNPINNED) {
-        uint64_t delta = icount_prev - g_user_icount_seen;
-        g_user_icount_seen = icount_prev;
-        uint64_t asid = qemu_plugin_get_addr_space_id();
-        int priv = qemu_plugin_get_priv_level();
-        if (asid == pinned_asid && priv == 0) {
-            g_user_icount += delta;
-        }
-        /* Stamp the executing fragment's privilege from the LIVE
-         * correct-path context (authoritative, latched), overriding any
-         * translation-time stamp: the shared true-BB cache can be
-         * seeded first by a wrong-path session that spec-translated this
-         * PC at the kernel's CPL (a kernel branch speculating into user
-         * code), mis-marking it system.  CP execution is the ground
-         * truth.  See BBTemplate::is_system. */
-        if (cur_tb_tmpl) {
-            cur_tb_tmpl->is_system = priv != 0;
-            cur_tb_tmpl->is_system_cp_confirmed = true;
-        }
-        if (asid != pinned_asid) {
-            g_cp_prev_tb_template = nullptr;
-            return;
-        }
-    }
-
-    /*
-     * Asynchronous-interrupt exclusion.  An async IRQ/FIQ/SError is OS noise
-     * injected at the emulator's clock cadence — non-representative for a
-     * replay consumer, the source of trace non-determinism, and the trigger
-     * for the wrong-path "storm" (a spurious WP into the exception vector).
-     * Synchronous kernel work (syscalls, faults) is workload-induced and
-     * stays traced; only async excursions are suppressed.
-     *
-     * Resume is PC-based, not exception-nesting-based: depth counting is
-     * unreliable because the kernel's timer->schedule() context-switch
-     * decouples the entry from its eret across tasks (the per-CPU nesting is
-     * scrambled), which would leave the suspend stuck.  Instead we record the
-     * interrupted PC at async entry (in QEMU's delivery path) and resume when
-     * the traced process returns to exactly that PC.
-     *
-     * Critically, while suspended do NOT touch g_cp_prev_tb_template: leaving
-     * it at the pre-interrupt BB means the next traced TB (the resume point)
-     * is the interrupted branch's REAL target, so that branch finalizes
-     * correctly (no vector mislabel, no indirect-pool pollution, no spurious
-     * WP) and the handler simply never appears.  g_user_icount_seen was
-     * already advanced above, so the user clock excludes these insns.
-     */
-    if (qemu_plugin_in_async_int()) {
-        return;
-    }
-
-    /* Snapshot the previous-TB cursor BEFORE updating it.  The chain
-     * emit below walks this fragment list as "the TB that ran just
-     * before this one", so it must capture the value g_cp_prev_tb_template
-     * held on entry — NOT the value we are about to write. */
-    BBTemplate *prev_cp_tb_tmpl = g_cp_prev_tb_template;
-    g_cp_prev_tb_template = cur_tb_tmpl;
-
-    g_rec_mutex_lock(&exec_lock);
-
-    if (g_trace_segments.is_shutting_down()) {
-        g_rec_mutex_unlock(&exec_lock);
-        return;
-    }
-
-    /* Snapshot the segment generation before tw_manage_window so we
-     * can detect a segment-open that happened inside it.  Each
-     * segment is an independent trace: when a new segment opens
-     * here, the local prev_cp_tb_tmpl and cur_tb_tmpl point at
-     * fragments from the previous segment / inter-segment gap.
-     * Walking them would bridge stale fragments into the new
-     * segment's trace AND run WP against PCs unrelated to the new
-     * segment's execution stream.  Drop this TB as a one-TB lossy
-     * boundary; the next TB starts a fresh chain at its own
-     * entry_pc.  No tb_flush is needed: per-insn callbacks for
-     * already-translated TBs are gated via cond_cb on
-     * `g_scoreboard.is_active`, so cached translations just fire
-     * the cond_cb predicate (false outside segments) and skip the
-     * callbacks at JIT-level. */
-    uint32_t seg_gen_before = g_segment_generation.load(
-        std::memory_order_relaxed);
-    tw_manage_window(cpu_index, icount_prev, cur_tb_tmpl);
-    bool segment_just_opened =
-        g_segment_generation.load(std::memory_order_relaxed) != seg_gen_before;
-
-    BodyStreamState *out_stream = g_trace_segments.body_stream();
-    if (!g_trace_segments.is_active() || !out_stream) {
-        g_rec_mutex_unlock(&exec_lock);
-        return;
-    }
-
-    if (segment_just_opened) {
-        g_cp_prev_tb_template = nullptr;
-        /* Fresh segment: clear any pre-marker (boot) async-interrupt state, in
-         * case a boot interrupt's exception-return never matched its departure
-         * PC and left the flag stuck.  The marker fires with the pinned
-         * process at user level, with no async excursion in flight. */
-        qemu_plugin_async_int_reset();
-        g_rec_mutex_unlock(&exec_lock);
-        return;
-    }
-
-    heartbeat_progress(icount_prev);
-
-    /* Refresh the histogram bucket for this TB exec.  WP runs
-     * synchronously below under exec_lock so its bumps land here too.
-     * Selection uses icount_prev so stats land in the slice the TB
-     * actually ran in. */
-    g_current_hist_bucket = select_histogram_bucket(icount_prev);
-
-    /* Snapshot the previous-TB scoreboard fields.  @prev_start is the
-     * last-executed fragment's start_pc — set by that fragment's
-     * first-raw-insn inline store; @prev_ft is its fall_through.  The
-     * per-TB terminus is no longer read from the scoreboard: each
-     * fragment's terminus is stored on its BBTemplate and consumed by
-     * the per-fragment walk below. */
-    uint64_t current_pc = qemu_plugin_u64_get(g_scoreboard.current_pc, cpu_index);
-    uint64_t prev_start = qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
-    uint64_t prev_ft    = qemu_plugin_u64_get(g_scoreboard.prev_fall_through, cpu_index);
-
-    /* Skip initial block (no previous context). */
-    if (prev_ft == 0) {
-        g_rec_mutex_unlock(&exec_lock);
-        return;
-    }
-
-    /*
-     * Walk the previous TB's fragment list up to the LAST EXECUTED
-     * fragment.  The scoreboard's @prev_start identifies that
-     * fragment (each fragment's first raw insn fires an inline store
-     * with its own start_pc; a trap mid-TB stops later fragments'
-     * stores from firing).  For each fragment that ran:
-     *
-     *   - intermediate fragments: by definition their branch did NOT
-     *     take (a later fragment in the same TB executed), so their
-     *     "next PC" is the next fragment's start_pc.
-     *   - last-executed fragment: its current_pc / prev_ft come from
-     *     the scoreboard (= where execution went after the entire
-     *     prev TB ran).
-     *
-     * The chain assembler folds fragments into true BBs; each
-     * completion is finalized + emitted independently.  Trap-fires
-     * cases naturally truncate the walk at the trapping fragment, so
-     * post-trap fragments never enter the chain.
-     */
-    std::vector<PendingEmit> pending_emits;
-    bool any_finalize = collect_finalized_bbs(cpu_index, prev_cp_tb_tmpl,
-                                              prev_start, current_pc,
-                                              pending_emits);
-
-    if (!any_finalize) {
-        g_rec_mutex_unlock(&exec_lock);
-        return;
-    }
-
-    for (const PendingEmit &pe : pending_emits) {
-        emit_finalized_bb(out_stream, pe.bb_tmpl, pe.branch_pc,
-                          pe.emit_current_pc, pe.wrong_target, cpu_index);
-    }
-
-    /* Deferred-exit on icount window-stop.  The trigger was set in
-     * tw_manage_window when icount_prev first crossed window_stop;
-     * exiting then would have left in-flight chain fragments
-     * uncommitted (= recorded count below the requested stop, which
-     * violates the "trace covers AT LEAST the requested window"
-     * guarantee).  Wait until a vcpu_tb_exec ends with no active
-     * in-flight chain — i.e. at a true-BB boundary — so every bumped
-     * insn has either been committed to a BB in the trace or never
-     * triggered the bump in the first place. */
-    if (g_icount_shutdown_pending &&
-        !g_cp_chain.has_active_chain() &&
-        g_trace_segments.is_active()) {
-        finish_trace_segment();
-        g_trace_segments.set_shutting_down();
-        g_icount_shutdown_pending = false;
-        /* No need to recompute_budget: we're exiting immediately and
-         * the budget slot will be torn down with the scoreboard. */
-        g_rec_mutex_unlock(&exec_lock);
-        exit(0);
-    }
-
-    /* Simpoint analogue: tw_manage_window set close_pending when
-     * icount_prev crossed window_stop.  Finalize only after the chain
-     * has drained to a BB boundary so the trace covers AT LEAST
-     * eff_stop - eff_start (warmup + simulation) insns. */
-    if (g_simpoint_close_pending &&
-        !g_cp_chain.has_active_chain() &&
-        g_trace_segments.is_active()) {
-        finish_trace_segment();
-        g_simpoints.advance();
-        g_simpoint_close_pending = false;
-        g_cp_prev_tb_template = nullptr;
-        if (!g_simpoints.current()) {
-            g_trace_segments.set_shutting_down();
-            g_rec_mutex_unlock(&exec_lock);
-            exit(0);
-        }
-        recompute_next_threshold();
-        /* Re-arm budget so the per-TB inline_add countdown lands at
-         * zero when icount reaches the now-current eff_start. */
-        for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
-            recompute_budget((unsigned)i);
-        }
-    }
-
-    g_rec_mutex_unlock(&exec_lock);
+    /* The PathBuilder consumes the ordered per-vCPU event queue and runs
+     * the CP step from here on.  Everything above this line is the shared
+     * per-TB prologue. */
+    events_path_step(cpu_index, cur_tb_tmpl, icount_prev, watch_pc);
 }
 
 /* ========================= Translation callback ========================= */
@@ -2247,20 +2313,41 @@ static void split_tb_into_fragments(const qemu_plugin_insn_info *insn_info,
         if (!info->mnemonic[0]) {
             return BRANCH_NONE;
         }
-        InsnFields f;
-        decode_detail_to_generic(0, info, &f, nullptr);
-        return f.branch_type;
+        /* Full-size scratch backing: the decode contract requires wired
+         * spans (the dep/lane refiners write through them even though
+         * only branch_type is consumed here). */
+        InsnFieldsScratch s;
+        insn_fields_scratch_reset(&s);
+        decode_detail_to_generic(0, info, &s.f, nullptr);
+        return s.f.branch_type;
     };
     /*
      * Branch families that carry an architectural delay slot — the
      * insn right after the branch always executes (MIPS j / jal /
      * jr / b*).  syscall- and trap-type "branches" do NOT have a
      * delay slot and so end their fragment on the branch insn itself.
+     *
+     * The exception-return family (MIPS eret / eretnc / deret) is
+     * classified BRANCH_RETURN — semantically right for consumers —
+     * but unlike `jr $ra` it has NO delay slot.  QEMU always ends the
+     * TB at an eret, so without this exclusion the splitter marks the
+     * eret fragment BARE_BRANCH and the chain assembler absorbs the
+     * next executed TB (the exception-return TARGET — usually user
+     * code) as its "delay slot", welding kernel and user code into one
+     * true-BB and desyncing the whole system-mode fault machinery.
      */
-    auto has_delay_slot = [](uint8_t bt) -> bool {
-        return bt == BRANCH_DIRECT_JUMP || bt == BRANCH_INDIRECT_JUMP ||
-               bt == BRANCH_RETURN || bt == BRANCH_COND_DIRECT ||
-               bt == BRANCH_DIRECT_CALL || bt == BRANCH_INDIRECT_CALL;
+    auto is_no_delay_slot_mnemonic = [](const char *m) -> bool {
+        return m[0] == 'e' ? (!strcmp(m, "eret") || !strcmp(m, "eretnc"))
+                           : !strcmp(m, "deret");
+    };
+    auto has_delay_slot = [&](uint8_t bt,
+                              const qemu_plugin_insn_info *info) -> bool {
+        if (bt != BRANCH_DIRECT_JUMP && bt != BRANCH_INDIRECT_JUMP &&
+            bt != BRANCH_RETURN && bt != BRANCH_COND_DIRECT &&
+            bt != BRANCH_DIRECT_CALL && bt != BRANCH_INDIRECT_CALL) {
+            return false;
+        }
+        return !is_no_delay_slot_mnemonic(info->mnemonic);
     };
     bool delay_isa = isa_properties[trace_isa].branch_delay_slots > 0;
 
@@ -2272,7 +2359,7 @@ static void split_tb_into_fragments(const qemu_plugin_insn_info *insn_info,
             i++;
             continue;
         }
-        if (delay_isa && has_delay_slot(bt)) {
+        if (delay_isa && has_delay_slot(bt, &insn_info[i])) {
             if (i + 1 < n_insns) {
                 /* Branch + delay slot both in this TB: fragment runs
                  * through the delay slot (canonical index i+1). */
@@ -2523,26 +2610,75 @@ static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
 {
     TbPoison p;
 
+    /* A wrong-path (spec-mode) translation must never MUTATE the persistent
+     * SMC state.  In system mode a spec excursion routinely reads a VA whose
+     * softmmu page is mid-refill (garbage bytes) or belongs to another address
+     * space (ASID reuse at the same VA).  If such a read seeds the first-
+     * sighting word, the subsequent real correct-path translation reads the
+     * true bytes, looks "self-modifying", and the whole basic block is dropped
+     * from the trace; if it persists into g_poisoned_pcs, that PC is blocked
+     * from CP tracing forever.  Spec mode therefore only READS this state (so
+     * a genuinely-bad spec TB still yields poisoned=true and gets no fragment);
+     * the WP walker tracks its own transient poison in a local set. */
+    const bool spec = g_wp_state.in_progress;
+
     g_mutex_lock(&data_lock);
-    if (g_poisoned_pcs.count(pc)) {
+    if (g_poisoned_pcs.count(pc) && spec) {
         p.poisoned = true;
         p.pc = pc;
         p.reason = "previously poisoned";
     } else {
+        /* Correct-path execution reaching a poisoned PC is proof the poison was
+         * wrong: the CPU is really executing this code in the current address
+         * space, so a prior verdict (spec contamination, or a stale/cross-ASID
+         * byte-change) no longer holds.  Unpoison and re-validate against the
+         * CP bytes — the same "correct path is ground truth" rule the byte-
+         * change refresh below follows.  Without this, one bad spec/boot
+         * sighting permanently blocks both CP tracing AND every WP excursion
+         * that targets this PC (the 0-block wrong_path_chains truncation).
+         *
+         * Erase per CANONICAL VA, not just this TB's start_pc: a poison entry is
+         * keyed by the start_pc of whatever TB first tripped it, which can be a
+         * WP-target VA that the correct path only ever reaches MID-TB (never as
+         * a TB start).  Erasing only @pc would then never clear it, leaving that
+         * WP target refused forever.  The per-VA erase below (in the canonical
+         * loop) clears it the first time the correct path executes through it. */
+        if (!spec) {
+            g_poisoned_pcs.erase(pc);
+        }
         for (uint32_t ci = 0; ci < canonical_n_insns && !p.poisoned; ci++) {
             uint64_t ipc = insn_pcs[ci];
+            if (!spec) {
+                g_poisoned_pcs.erase(ipc);
+            }
             uint32_t word = 0;
             memcpy(&word, &insn_bytes[(size_t)ci * MAX_INSN_BYTES],
                    sizeof(word));
             auto it = g_first_insn_word.find(ipc);
             if (it != g_first_insn_word.end()) {
                 if (it->second != word) {
-                    p.poisoned = true;
-                    p.pc = ipc;
-                    p.reason = "bytes changed since first sighting";
-                    p.is_smc_signal = true;
+                    if (spec) {
+                        /* Spec read differs from the CP-recorded first word.
+                         * The presence of that word means the correct path
+                         * already confirmed this VA is real code, so the differ
+                         * is real code in another context (ASID reuse) or a
+                         * resident page the CP first saw mid-refill — NOT data.
+                         * Do not poison: let the fragment form so the wrong path
+                         * can speculate through it (genuine WP-into-data is
+                         * still caught by the Capstone-decode check below).
+                         * Stay read-only: never mutate the CP first word. */
+                    } else {
+                        /* Correct-path execution is ground truth: the CPU is
+                         * really executing these bytes.  In system mode the
+                         * same VA legitimately reads different bytes across CP
+                         * translations (demand paging, an earlier read racing
+                         * page-in, ASID reuse).  Poisoning here dropped whole
+                         * executed basic blocks from the trace.  Refresh the
+                         * cache to the CP-observed word instead of poisoning. */
+                        it->second = word;
+                    }
                 }
-            } else {
+            } else if (!spec) {
                 g_first_insn_word.emplace(ipc, word);
             }
             if (!p.poisoned &&
@@ -2552,7 +2688,7 @@ static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
                 p.reason = "Capstone decode failure";
             }
         }
-        if (p.poisoned) {
+        if (p.poisoned && !spec) {
             g_poisoned_pcs.insert(pc);
         }
     }
@@ -2709,6 +2845,16 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     if (raw_n_insns == 0) {
         return;
     }
+
+    /* Translation-time template building (Capstone decode, fragment split,
+     * callback arming) is instrumentation cost, not guest execution: keep it
+     * off the guest clock (see VClockPauseGuard at vcpu_tb_exec). */
+    VClockPauseGuard vclock_guard;
+
+    /* Spec-born template accounting (#91): templates built for a wrong-path
+     * translation are reclaimable at tb_flush unless the correct path later
+     * executes them (see BBTemplate::spec_born). */
+    g_bb_template_cache.set_creating_spec(g_wp_state.in_progress);
 
     /*
      * Every TB gets the full heavy translation, regardless of segment
@@ -2888,10 +3034,6 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
                 frag_first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
                 g_scoreboard.prev_fall_through, f_fall_through);
-            qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
-                frag_first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
-                g_scoreboard.prev_bb_terminus,
-                (uint64_t)spec.terminus);
         }
     }
 
@@ -2960,6 +3102,41 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         QEMU_PLUGIN_COND_GE, g_scoreboard.is_active, 1,
         (void *)head_fragment);
 
+    /* Proactive spec-template reclaim (#91): when the wrong path has minted
+     * more than a budget of reclaimable templates since the last flush —
+     * speculative fetch wandering mutable data that happens to decode —
+     * request a tb_flush.  The flush callback then frees every spec-born
+     * template the correct path never executed, bounding the growth that
+     * previously ran to tens of GiB (one-insn templates at millions of
+     * fresh PCs, or ~1.7 MB 512-insn nop-slide templates from zeroed
+     * pages).  Deferred-flush machinery makes the request safe here. */
+    {
+        /* Budget recalibrated for the InsnFields/RegNames span diet
+         * (~450 B per one-insn spec template vs ~3.5 KB before): 256 MB
+         * of reclaimable spec templates ≈ half a million wander
+         * templates — far above any healthy run (~1-2 MB), reached only
+         * by a genuine runaway.  CST_SPEC_FLUSH_BUDGET overrides (bytes;
+         * also the reclaim live-fire test knob). */
+        static uint64_t budget;
+        if (budget == 0) {
+            const char *e = getenv("CST_SPEC_FLUSH_BUDGET");
+            budget = (e && *e) ? strtoull(e, nullptr, 0) : (256ull << 20);
+        }
+        if (g_wp_state.in_progress &&
+            g_bb_template_cache.spec_pending_bytes() > budget) {
+            if (getenv("CST_MEMSTATS")) {
+                fprintf(stderr, "[memstats] spec budget tripped: pending=%"
+                        PRIu64 " > %" PRIu64 " -- flush latched\n",
+                        g_bb_template_cache.spec_pending_bytes(), budget);
+            }
+            /* LATCH ONLY.  Requesting here — mid-excursion, inside a WP
+             * translation — kicks the vCPU (async-safe work) and the
+             * nested WP executor bails, truncating the current chain
+             * (exact-or-longer violation).  The CP step boundary issues
+             * the request once no excursion is in flight. */
+            g_spec_flush_latched.store(true, std::memory_order_relaxed);
+        }
+    }
 }
 
 /* ========================= Flush callback ========================= */
@@ -2974,22 +3151,41 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
 {
     /* A tb_flush is QEMU JIT housekeeping — the code cache filled and
      * every TB is being re-translated — NOT a guest-execution event, so
-     * the trace must be identical with or without it.  The plugin's
-     * per-translation templates (tb_templates_) are PERSISTENT and
-     * deduped: a re-translation reuses its existing chain (see
-     * lookup_tb_chain), so a flush frees nothing and perturbs no walk
-     * state.  That makes the trace flush-invariant by construction and
-     * removes the whole class of flush-time use-after-free.
+     * the trace must be identical with or without it.  Templates for code
+     * the CORRECT PATH has executed are PERSISTENT and deduped: a
+     * re-translation reuses its existing chain (see lookup_tb_chain), so
+     * for real code a flush frees nothing and perturbs no walk state —
+     * flush-invariant by construction, no flush-time use-after-free.
+     *
+     * SPEC-BORN templates the correct path never executed are the
+     * exception (#91): they are wrong-path fetch residue (speculation
+     * wandering mutable data that happens to decode), unbounded across a
+     * run, and nothing references them once the flush drops their owning
+     * QEMU TBs — the deferred-flush machinery guarantees no wrong-path
+     * walk is in flight when this callback fires.  Reclaim them here; a
+     * proactive flush is requested from vcpu_tb_trans when their
+     * footprint crosses the budget.
      *
      * We do NOT clear the bytes/poison caches (g_first_insn_word /
      * g_poisoned_pcs): they persist so SMC detection survives a flush,
      * and a legitimate flush+retranslate of unchanged code re-matches its
      * first sighting (no false poison) and reuses its template.
      *
-     * The only state a flush touches is the flush counter, which the
-     * wrong-path loop reads to detect (and retry) a spec-mode exec_tb
-     * that a flush unwound before the guest insn ran. */
+     * The flush counter is read by the wrong-path loop to detect (and
+     * retry) a spec-mode exec_tb that a flush unwound before the guest
+     * insn ran. */
     g_tb_flush_count.fetch_add(1, std::memory_order_acq_rel);
+    g_wp_state.last_executed_tb = nullptr;   /* may point at a reclaimee */
+    g_mutex_lock(&data_lock);
+    uint64_t freed = g_bb_template_cache.reclaim_spec_templates();
+    g_mutex_unlock(&data_lock);
+    if (getenv("CST_MEMSTATS")) {
+        /* Unconditional: freed==0 vs flush-never-ran must be
+         * distinguishable when proving the request->flush->reclaim
+         * chain end-to-end. */
+        fprintf(stderr, "[memstats] tb_flush reclaimed %" PRIu64
+                " spec-born templates\n", freed);
+    }
 }
 
 /* ========================= Exit / statistics ========================= */
@@ -3465,6 +3661,20 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     max_wrong_path_depth = cfg.wp_depth;
     g_wp_prune           = cfg.wp_prune;
     enable_wrong_path    = cfg.enable_wp;
+    /*
+     * Wrong-path speculation freezes the guest virtual clock for the excursion
+     * via cpu_disable_ticks (host wall-clock).  Under -icount the virtual clock
+     * is driven by the instruction count, which that freeze does NOT stop, so a
+     * speculative excursion's instructions leak into guest time.  WP still runs
+     * under icount (the trace is still valid); warn once that guest timing may
+     * be perturbed.
+     */
+    if (enable_wrong_path && qemu_plugin_icount_enabled()) {
+        fprintf(stderr, "champsim_tracer: warning: -icount is active; "
+                "wrong-path speculation advances guest instruction-count time "
+                "(the vtime freeze only covers wall-clock). Trace is valid but "
+                "guest timing may be perturbed.\n");
+    }
     g_features.mem_data      = cfg.enable_mem_data;
     g_features.reg_data      = cfg.enable_reg_data;
     /* Per-path toggles default to their CP siblings when unset (-1). */
@@ -3485,6 +3695,14 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     start_symbol        = cfg.start_symbol;    cfg.start_symbol   = nullptr;
     start_symbol_occurrence = cfg.start_symbol_occurrence;
     g_window_mode       = cfg.window_mode;
+
+    /* Marker mode is the system-mode entrypoint (the validator's --system
+     * implies --marker, pinning a real guest ASID).  Enable the per-entry
+     * sync-fault trailer there so handler code is depth-tagged; user-mode
+     * windows leave it off and emit no trailer. */
+    g_features.fault_excursions =
+        (g_window_mode == PluginConfig::WIN_MARKER) &&
+        getenv("CST_NO_FAULT") == nullptr;
 
     if (!cfg.output_path) {
         cfg.output_path = g_strdup("champsim_tracer_out");

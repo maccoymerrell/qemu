@@ -198,6 +198,11 @@ extern "C" {
 #define CST_FLAG_REG_DATA      (1 << 1)  /* CST_FID_DST_REG values        */
 #define CST_FLAG_PROFILE       (1 << 2)  /* §6 profile block per template  */
 #define CST_FLAG_WP            (1 << 3)  /* per-entry WP chain + events    */
+#define CST_FLAG_FAULT         (1 << 4)  /* per-entry sync-fault trailer
+                                          * (exception-nesting depth, +
+                                          * anchor on a faulting BB); set in
+                                          * system mode so user-mode traces
+                                          * carry no trailer */
 /* bits 4..7 reserved */
 
 /* ===== Field-ID space (unified delta stream) =====
@@ -407,9 +412,35 @@ typedef struct {
  * NULL: generic reg has no single directly-readable QEMU register.
  */
 typedef struct {
-    const QemuRegKey *src_qemu_reg_keys[MAX_SRC_REGS];
-    const QemuRegKey *dst_qemu_reg_keys[MAX_DST_REGS];
+    /* SPAN MEMBERS, sized by the sibling InsnFields' n_src_regs /
+     * n_dst_regs and packed into the template's insn_fields_pool (see
+     * champsim_tracer_mnemonics.h SPAN MEMBERS).  Empty or sentinel
+     * tables alias a shared all-NULL key array so readers that index
+     * them with a REAL sibling count (the kEmptyRegNames pairing) still
+     * read NULL, exactly as the old zero-initialized fixed arrays did. */
+    const QemuRegKey **src_qemu_reg_keys;   /* [n_src_regs] */
+    const QemuRegKey **dst_qemu_reg_keys;   /* [n_dst_regs] */
 } InsnRegNames;
+
+/* Shared all-NULL key span for empty/sentinel InsnRegNames (defined in
+ * champsim_tracer_bb_template_cache.cc). */
+extern const QemuRegKey *g_zero_regkeys[MAX_SRC_REGS];
+
+/*
+ * Build-time backing for one InsnRegNames — same discipline as
+ * InsnFieldsScratch (self-referential; reset in place; never copy). */
+typedef struct InsnRegNamesScratch {
+    InsnRegNames rn;
+    const QemuRegKey *src_keys[MAX_SRC_REGS];
+    const QemuRegKey *dst_keys[MAX_DST_REGS];
+} InsnRegNamesScratch;
+
+static inline void insn_reg_names_scratch_reset(InsnRegNamesScratch *s)
+{
+    memset(s, 0, sizeof(*s));
+    s->rn.src_qemu_reg_keys = s->src_keys;
+    s->rn.dst_qemu_reg_keys = s->dst_keys;
+}
 
 /*
  * Synthetic effective-address descriptor for instructions whose
@@ -619,6 +650,11 @@ struct BBTemplate {
     uint8_t *insn_sizes;
     uint8_t *insn_bytes;
     InsnFields *insn_fields;
+    /* Backing pool for insn_fields' span members (one allocation per
+     * template; see the SPAN MEMBERS comment in champsim_tracer_mnemonics.h).
+     * pool_bytes is kept for footprint accounting. */
+    void *insn_fields_pool;
+    uint32_t insn_fields_pool_bytes;
     /* Optional: parallel Capstone-name array, one entry per insn.
      * Allocated only when reg-data capture is enabled at translation
      * time. */
@@ -684,6 +720,23 @@ struct BBTemplate {
      * context, so it must never override a CP-confirmed value. */
     bool is_system;
     bool is_system_cp_confirmed;
+    /*
+     * Spec-born template reclaim (#91).  spec_born: this template was
+     * created by a WRONG-PATH (spec-mode) translation.  cp_executed: the
+     * correct path has executed a TB whose udata is this template.  A
+     * spec-born template the correct path never runs is speculative-fetch
+     * residue — the wrong path wandering mutable data that happens to
+     * decode (millions of one-insn CF_SINGLE_STEP templates at ever-fresh
+     * PCs, or 512-insn nop-slides through zeroed pages at ~1.7 MB each) —
+     * and retaining it for the run is the unbounded heap growth behind the
+     * intermittent OOM aborts.  Such templates are freed at tb_flush
+     * (their owning QEMU TBs are gone; nothing else references them),
+     * with a flush requested proactively when their footprint crosses a
+     * budget.  CP-executed templates are never reclaimed, preserving the
+     * deferred-prev/chain invariants and flush-invariance for real code.
+     */
+    bool spec_born;
+    bool cp_executed;
     /* Linked list of sibling fragments produced from the same QEMU TB
      * by the mid-TB-branch splitter.  Head is what vcpu_tb_trans
      * attached as the per-TB exec-cb udata; vcpu_tb_exec and the WP
@@ -763,6 +816,15 @@ struct BodyEntry {
     std::vector<RegSnap> reg_snaps;
     std::vector<WPBBEntry> wp_entries;
     BBTemplate *tmpl;  /* Non-owning; for per-insn schema access */
+    /* Exception-nesting depth at which this BB executed: 0 = normal code,
+     * >=1 = synchronous-fault handler code that detoured execution at that
+     * nesting level (system-mode).  Emitted as a metaflag-gated per-entry
+     * trailer; absent/0 on a normal entry so user-mode output is unchanged. */
+    uint32_t fault_depth = 0;
+    /* For a faulting BB reassembled across its fault excursions (whole-BB
+     * merge): the indices of the instructions that faulted, one per
+     * excursion, in order.  Empty for ordinary entries. */
+    std::vector<uint32_t> fault_anchors;
     uint32_t thread_id;
     /* QEMU vCPU index this entry came from.  Used by the body writer
      * to capture this thread's BODY_TAG_REGFILE on first emit when
@@ -797,16 +859,7 @@ typedef struct {
     uint64_t current_pc;
     uint64_t prev_start_pc;
     uint64_t prev_fall_through;
-    /* TbTerminus for the previous TB — drives true-BB finalization. */
-    uint64_t prev_bb_terminus;
     uint64_t insn_count;
-    /* Start PC of the most recent TB counted toward insn_count.  When
-     * QEMU re-enters the same single-insn TB without architectural
-     * progress (x86 REP string ops: each iteration is a separate
-     * exec_tb at the same start_pc), insn_count is held steady so it
-     * tracks unique-PC visits, keeping icount aligned with PIN-style
-     * one-count-per-architectural-insn accounting. */
-    uint64_t last_counted_start_pc;
     /* Mirror of g_trace_segments.is_active() as a per-vCPU scoreboard
      * slot (1 in-segment, 0 inter-segment).  Backs the cond_cb gate
      * on the per-insn heavy callbacks (reg_snap_cb, synth_ea_cb): a
@@ -953,6 +1006,9 @@ extern unsigned active_reg_table_size;
 extern int max_wrong_path_depth;
 extern int g_wp_prune;
 extern bool enable_wrong_path;
+/* #77 diagnostic ring buffer (gated on CST_RING); 'C'=correct-path BB start,
+ * 'W'=wrong-path instruction PC. */
+void cst_ring_push(char tag, uint64_t pc);
 /* Effective per-run trace-feature toggles, derived once from PluginConfig
  * at install (the tristate WP flags resolved against their CP counterparts)
  * and immutable after.  Grouped so the write-once/read-many feature set
@@ -972,6 +1028,12 @@ struct TraceFeatures {
     /* I-frame trigger: emit a self-contained IFRAME after every N-th ENTRY
      * of the same template.  0 disables the feature. */
     uint32_t iframe_rate = 0;
+    /* System-mode synchronous-fault tracking: when set, entries carry the
+     * per-entry fault trailer (CST_FLAG_FAULT) so handler code is tagged with
+     * its exception-nesting depth and faulting BBs carry the detour anchor.
+     * Enabled in marker (system) mode; off in user mode, so user-mode traces
+     * carry no trailer. */
+    bool     fault_excursions = false;
 };
 extern TraceFeatures g_features;
 extern char *qemu_command_line;

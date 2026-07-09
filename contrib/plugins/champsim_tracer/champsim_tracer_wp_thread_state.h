@@ -41,7 +41,6 @@ struct WPThreadState {
     uint64_t saved_insn_count = 0;
     uint64_t saved_prev_start_pc = 0;
     uint64_t saved_prev_fall_through = 0;
-    uint64_t saved_prev_bb_terminus = 0;
     /* Budget slot is decremented per spec-mode TB via the inline_add;
      * save+restore so the WP simulation doesn't trip
      * vcpu_tb_check_budget after returning to CP. */
@@ -57,5 +56,17 @@ struct WPThreadState {
 };
 
 extern thread_local WPThreadState g_wp_state CST_TLS_HOT;
+
+/*
+ * Capture sink (rearchitecture M3): the per-TB async-exclusion decision,
+ * latched ONCE at the top of the CP step in vcpu_tb_exec from
+ * qemu_plugin_in_async_int() and cleared at both async_int_reset sites.
+ * The flag is constant across one TB's body (it changes only at exception
+ * delivery / the departure-PC close, both between TBs), so the per-insn
+ * capture callbacks (memops, reg snaps, synthetic EAs) read this bool
+ * instead of each making a cross-DSO call — one exclusion decision, one
+ * owner, identical semantics.  true = mute (drop async-handler capture).
+ */
+extern thread_local bool g_capture_mute CST_TLS_HOT;
 
 #endif /* CHAMPSIM_TRACER_WP_THREAD_STATE_H */

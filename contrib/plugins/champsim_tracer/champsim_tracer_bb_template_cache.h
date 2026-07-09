@@ -26,6 +26,7 @@
 #ifndef CHAMPSIM_TRACER_BB_TEMPLATE_CACHE_H
 #define CHAMPSIM_TRACER_BB_TEMPLATE_CACHE_H
 
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <unordered_map>
@@ -128,6 +129,28 @@ public:
      * serialization).  Invoked once at end-of-trace by the writer. */
     void for_each_bb(const std::function<void(BBTemplate &)> &fn);
 
+    /* Spec-born template reclaim (#91): see BBTemplate::spec_born.
+     * set_creating_spec marks templates built by the CURRENT translation
+     * as spec-born (called by vcpu_tb_trans with its spec flag).
+     * spec_pending_bytes is the estimated footprint of spec-born
+     * templates created since the last reclaim — the proactive-flush
+     * trigger.  reclaim_spec_templates frees every spec-born template the
+     * correct path never executed; call it ONLY from the tb_flush
+     * callback (all owning QEMU TBs are gone, wrong-path walks have
+     * unwound).  Returns the number of templates freed. */
+    void set_creating_spec(bool spec);
+    uint64_t spec_pending_bytes() const { return spec_pending_bytes_; }
+    void note_spec_creation(uint64_t bytes) { spec_pending_bytes_ += bytes; }
+    uint64_t reclaim_spec_templates(void);
+
+    /* CST_MEMSTATS: print a footprint breakdown of the template store to
+     * @out — template counts, per-array byte totals (insn_fields dominates:
+     * sizeof(InsnFields) is KBs because of the fixed 64-slot dep/lane mask
+     * arrays), and the tb_chain_dedup_ duplicate-chain histogram (how many
+     * PCs carry >1 sibling chain = dedup misses accumulating duplicates
+     * across tb_flush cycles).  Diagnostic for the multi-GiB heap baseline. */
+    void mem_stats(FILE *out) const;
+
     /* Pure: return the index of the (last) branch instruction within
      * @tmpl, or -1 if @tmpl has no branch.  After delay-slot
      * normalization the branch is always the last instruction. */
@@ -200,6 +223,7 @@ private:
     std::unordered_map<uint64_t, std::vector<BBTemplate *>> tb_chain_dedup_;
     std::unordered_map<uint64_t, BBTemplatePtr> bb_map_;
     uint32_t                                    next_template_id_ = 1;
+    uint64_t                                    spec_pending_bytes_ = 0;
 };
 
 extern BBTemplateCache g_bb_template_cache;

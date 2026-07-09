@@ -816,9 +816,15 @@ bool qemu_plugin_in_async_int(void)
 
 /* The wire and plugin-facing event layouts are kept field-for-field
  * identical; the drain below converts explicitly all the same, so a
- * layout drift shows up as a compile break here rather than corruption. */
+ * layout drift shows up as a compile break here rather than corruption.
+ * The KIND VALUES pass through raw as well: the two enums
+ * (QemuPluginCpuEventKind in hw/core/cpu.h, qemu_plugin_cpu_event_kind
+ * in qemu-plugin.h) must stay value-aligned member for member —
+ * FAULT_ENTER/RETURN = 0/1, ASYNC_ENTER/RETURN = 2/3, ASID_WRITE = 4. */
 QEMU_BUILD_BUG_ON(sizeof(struct qemu_plugin_cpu_event) !=
                   sizeof(QemuPluginCpuEvent));
+QEMU_BUILD_BUG_ON((int)QEMU_PLUGIN_CPU_EV_ASID_WRITE !=
+                  (int)QEMU_PLUGIN_CPU_EVENT_ASID_WRITE);
 
 void qemu_plugin_cpu_events_set(unsigned int vcpu_index, bool enabled)
 {

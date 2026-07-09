@@ -64,6 +64,21 @@ struct Stats {
     /* Decode-side warning count. */
     uint64_t unknown_insn_warnings = 0;
 
+    /* Kernel-excursion ownership (kexc=1; all zero when off).  Writes is
+     * every ASID_WRITE path event consumed; overlays counts excursions
+     * that installed a kernel overlay ASID (a PTI entry switch or a
+     * TLB-maintenance save/probe value); cuts counts committed context
+     * switches (a third distinct value inside one excursion); kept /
+     * dropped split the kernel (priv!=0) TBs the ownership rule
+     * admitted vs refused; write_storm counts excursions whose distinct
+     * new-value count hit the storm threshold. */
+    uint64_t kexc_asid_writes = 0;
+    uint64_t kexc_overlays = 0;
+    uint64_t kexc_cuts = 0;
+    uint64_t kexc_kernel_kept = 0;
+    uint64_t kexc_kernel_dropped = 0;
+    uint64_t kexc_write_storm = 0;
+
     /* Per-execution attribution.  cp_* bumped at vcpu_tb_exec walking
      * the prev TB's template; wp_* inside the WP per-iteration loop.
      * Sized by the generic enum sentinels to stay in lockstep. */

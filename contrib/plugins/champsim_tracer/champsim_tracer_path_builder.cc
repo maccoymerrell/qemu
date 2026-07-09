@@ -23,6 +23,7 @@
 #include "champsim_tracer_mem_access_recorder.h"
 #include "champsim_tracer_reg_snap_collector.h"
 #include "champsim_tracer_scoreboard.h"
+#include "champsim_tracer_stats.h"
 #include "champsim_tracer_trace_segment_manager.h"
 #include "champsim_tracer_wp_thread_state.h"
 
@@ -157,6 +158,13 @@ void PathBuilder::on_segment_open()
     raw_depth_ = 0;
     base_depth_ = 0;
     async_excluding_ = false;
+    /* Kernel-excursion ownership starts the segment unowned: the pin was
+     * just captured at user privilege, so the first user TB re-seeds
+     * last_user_asid_; kernel TBs before it have no owner and drop
+     * (conservative, and a window of at most the marker's own tail). */
+    kexc_reset();
+    kexc_have_user_ = false;
+    kexc_last_user_asid_ = 0;
     /* Re-prime lazily at the next seal: a fault in flight across
      * segment-open is baselined out so the window starts at depth 0
      * rather than inheriting a pre-trace excursion. */
@@ -267,6 +275,129 @@ void PathBuilder::prime_from_live()
     base_depth_ = raw_depth_;
     depth_next_ = 0;
     primed_ = true;
+}
+
+/*
+ * ---- Kernel-excursion ownership (kexc=1) ----
+ * The model and the full rule table live at the state declarations in
+ * champsim_tracer_path_builder.h; these are its four arrows.
+ */
+
+/* Close any open excursion; the next kernel TB fires a fresh entry
+ * edge.  last_user_asid_ deliberately survives (it is TB-history, not
+ * excursion state). */
+void PathBuilder::kexc_reset()
+{
+    kexc_in_kernel_ = false;
+    kexc_have_overlay_ = false;
+    kexc_overlay_ = 0;
+    kexc_cut_ = false;
+    kexc_nvals_ = 0;
+    kexc_stormed_ = false;
+}
+
+/* One ASID_WRITE path event (@new_asid = the committed NEW value).
+ * Applied exactly once, at the step that drained it, before any gate —
+ * including steps the async window suspends: the window's TBs are
+ * excluded regardless, but the ownership state must track the writes so
+ * post-window attribution is right.  Only meaningful while an excursion
+ * is open; a write draining outside one (e.g. the segment's very first
+ * steps) has no owner to classify against and is consumed. */
+void PathBuilder::kexc_apply_asid_write(uint64_t new_asid)
+{
+    g_stats.kexc_asid_writes++;
+    if (!kexc_in_kernel_) {
+        return;
+    }
+
+    /* Storm detection (detection only; pin-invalidation policy is a
+     * later decision): distinct new-values this excursion. */
+    if (!kexc_stormed_) {
+        bool seen = false;
+        for (uint32_t i = 0; i < kexc_nvals_; i++) {
+            if (kexc_vals_[i] == new_asid) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            kexc_vals_[kexc_nvals_++] = new_asid;
+            if (kexc_nvals_ >= KEXC_STORM_THRESHOLD) {
+                kexc_stormed_ = true;
+                g_stats.kexc_write_storm++;
+                /* One stderr warning per segment (any thread). */
+                static std::atomic<uint32_t> warned_gen{UINT32_MAX};
+                uint32_t gen = g_segment_generation.load(
+                    std::memory_order_relaxed);
+                uint32_t prev = warned_gen.exchange(
+                    gen, std::memory_order_relaxed);
+                if (prev != gen) {
+                    fprintf(stderr, "champsim_tracer: kexc: ASID-write "
+                            "storm (>= %u distinct values in one kernel "
+                            "excursion, entry ASID 0x%" PRIx64 ") — "
+                            "possible ASID rollover; ownership stays "
+                            "conservative (cut)\n",
+                            KEXC_STORM_THRESHOLD, kexc_exc_entry_);
+                }
+            }
+        }
+    }
+
+    if (new_asid == kexc_exc_entry_) {
+        return;                     /* restore; ownership continues */
+    }
+    if (!kexc_have_overlay_) {
+        kexc_have_overlay_ = true;  /* the excursion's kernel overlay —
+                                     * a PTI-style entry switch or a
+                                     * TLB-maintenance save/probe; NOT a
+                                     * committed switch */
+        kexc_overlay_ = new_asid;
+        g_stats.kexc_overlays++;
+        return;
+    }
+    if (new_asid == kexc_overlay_) {
+        return;
+    }
+    if (!kexc_cut_) {
+        kexc_cut_ = true;           /* third distinct value = committed
+                                     * context switch; sticky until the
+                                     * next user TB */
+        g_stats.kexc_cuts++;
+    }
+}
+
+/* Every priv==0 TB: the excursion (if any) is over, live ASID is
+ * authoritative again, and this address space is the owner of the next
+ * kernel entry.  Foreign user TBs update ownership too — after a
+ * committed switch, the next process's kernel work must charge to ITS
+ * user ASID, not linger on the pin. */
+void PathBuilder::kexc_user_tb(uint64_t live_asid)
+{
+    kexc_reset();
+    kexc_last_user_asid_ = live_asid;
+    kexc_have_user_ = true;
+}
+
+/* Every non-suspended priv!=0 TB: latch the entry edge once at the
+ * outermost user->kernel transition (nested faults inside an open
+ * excursion never re-fire it — the single-edge model), then answer the
+ * ownership question.  Replaces the live-ASID foreign-drop test for
+ * kernel TBs only. */
+bool PathBuilder::kexc_kernel_tb_keep(uint64_t pinned_asid)
+{
+    if (!kexc_in_kernel_) {
+        kexc_reset();
+        kexc_in_kernel_ = true;
+        kexc_exc_entry_ = kexc_last_user_asid_;
+    }
+    bool keep = kexc_have_user_ && kexc_exc_entry_ == pinned_asid &&
+                !kexc_cut_;
+    if (keep) {
+        g_stats.kexc_kernel_kept++;
+    } else {
+        g_stats.kexc_kernel_dropped++;
+    }
+    return keep;
 }
 
 /* Frame lookup by the FAULT event's identity: resume PC plus the ASID
@@ -492,6 +623,23 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
         pending_evs_.insert(pending_evs_.end(), in.evs, in.evs + in.n_evs);
     }
 
+    /* Kernel-excursion ownership: apply this step's FRESH drain of
+     * ASID_WRITE events exactly once, before any gate — the retained-
+     * event rescans below must never see them twice, and a step the
+     * async window suspends (or any later gate bails) still updates
+     * ownership so post-window state is right.  The event's asid field
+     * carries the committed NEW value for this kind.  With kexc off the
+     * events are consumed-and-ignored (the async and fault scans below
+     * skip kind 4 by construction), keeping legacy behavior
+     * byte-for-byte. */
+    if (g_features.kexc && in.pinned) {
+        for (size_t i = 0; i < in.n_evs; i++) {
+            if (in.evs[i].kind == QEMU_PLUGIN_CPU_EV_ASID_WRITE) {
+                kexc_apply_asid_write(in.evs[i].asid);
+            }
+        }
+    }
+
     /* Async mute window.  Until the first seal-phase prime the live flag
      * is authoritative (it already reflects every retained event); after
      * that the ordered edges drive it.  Assignment semantics make the
@@ -507,6 +655,9 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
             } else if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_RETURN) {
                 async_excluding_ = false;
             }
+            /* ASID_WRITE (kind 4) is window-neutral: consumed by the
+             * kexc ownership pass at drain time above, explicitly
+             * ignored here on the legacy (kexc=0) rule. */
         }
     }
     g_capture_mute = async_excluding_;
@@ -538,13 +689,32 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
     }
 
     /* Foreign-ASID boundary (non-async; the async case bailed above,
-     * preserving prev). */
-    if (in.pinned && in.live_asid != in.pinned_asid) {
-        /* rearch: suspend-or-seal candidate.  For now the deferred prev
-         * is DROPPED — the one-TB lossy boundary — rather than suspended,
-         * so its fragments never bridge across the gap. */
-        clear_prev();
-        return StepStatus::DROPPED_FOREIGN;
+     * preserving prev).  With kexc on, kernel (priv!=0) TBs are gated by
+     * the excursion-ownership rule INSTEAD of the live ASID — the live
+     * register is not trustworthy inside the kernel (PTI entry
+     * switches, TLB-maintenance save/probe writes) — while user
+     * (priv==0) TBs keep the live-ASID rule verbatim, additionally
+     * driving the ownership edges (reset + owner tracking).  Suspended
+     * TBs never reach this point, so excluded async-window content
+     * drives no ownership edge. */
+    if (in.pinned) {
+        bool drop;
+        if (!g_features.kexc) {
+            drop = in.live_asid != in.pinned_asid;
+        } else if (in.live_priv == 0) {
+            kexc_user_tb(in.live_asid);
+            drop = in.live_asid != in.pinned_asid;
+        } else {
+            drop = !kexc_kernel_tb_keep(in.pinned_asid);
+        }
+        if (drop) {
+            /* rearch: suspend-or-seal candidate.  For now the deferred
+             * prev is DROPPED — the one-TB lossy boundary — rather than
+             * suspended, so its fragments never bridge across the
+             * gap. */
+            clear_prev();
+            return StepStatus::DROPPED_FOREIGN;
+        }
     }
 
     /* Promote: cur becomes the pending seal; the seal phase walks the
@@ -648,7 +818,10 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                     apply_fault_return(ev);
                 }
             }
-            /* async kinds were applied by step_events */
+            /* async kinds were applied by step_events; ASID_WRITE
+             * (kind 4) was consumed at drain time (kexc) or is ignored
+             * outright (legacy) — it never reaches the depth pipeline
+             * or the fault classifier. */
         }
         pending_evs_.clear();
         /* Baselined, 0-clamped depth the CURRENT TB runs at (raw can drop

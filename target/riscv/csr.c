@@ -4303,7 +4303,26 @@ static RISCVException write_satp(CPURISCVState *env, int csrno,
         return RISCV_EXCP_NONE;
     }
 
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    /*
+     * Address-space switch observation: SATP is the register
+     * riscv_get_plugin_state reports, full-register (page-table base +
+     * ASID + mode).  Compare around the legalized commit so writes the
+     * WARL legalization discards (or that rewrite the same value) do
+     * not emit.  The event's pc slot carries the OLD value; the push
+     * itself stamps the just-committed NEW value as the event's asid
+     * (and is a no-op on the wrong path or while the queue is
+     * disabled).
+     */
+    target_ulong old_satp = env->satp;
     env->satp = legalize_xatp(env, env->satp, val);
+    if (env->satp != old_satp) {
+        cpu_plugin_evq_push(env_cpu(env), QEMU_PLUGIN_CPU_EVENT_ASID_WRITE,
+                            old_satp, env_cpu(env)->plugin_fault_depth);
+    }
+#else
+    env->satp = legalize_xatp(env, env->satp, val);
+#endif
     return RISCV_EXCP_NONE;
 }
 

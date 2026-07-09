@@ -1196,6 +1196,20 @@ void helper_mtc0_entryhi(CPUMIPSState *env, target_ulong arg1)
     if ((old & env->CP0_EntryHi_ASID_mask) !=
         (val & env->CP0_EntryHi_ASID_mask)) {
         tlb_flush(env_cpu(env));
+#ifdef CONFIG_PLUGIN
+        /*
+         * Address-space switch observation: the ASID field
+         * mips_get_plugin_state reports just changed.  EntryHi also
+         * carries VPN bits for TLB maintenance; VPN-only writes take the
+         * branch above and never land here.  The event's pc slot carries
+         * the OLD field value; the push itself stamps the just-committed
+         * NEW value as the event's asid (and is a no-op on the wrong
+         * path or while the queue is disabled).
+         */
+        cpu_plugin_evq_push(env_cpu(env), QEMU_PLUGIN_CPU_EVENT_ASID_WRITE,
+                            old & env->CP0_EntryHi_ASID_mask,
+                            env_cpu(env)->plugin_fault_depth);
+#endif
     }
 }
 

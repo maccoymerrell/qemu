@@ -85,6 +85,12 @@ bool set_wp_regdata(PluginConfig *cfg, const char *v)
     return true;
 }
 
+bool set_kexc(PluginConfig *cfg, const char *v)
+{
+    cfg->kexc = atoi(v);
+    return cfg->kexc == 0 || cfg->kexc == 1;
+}
+
 bool set_histogram(PluginConfig *cfg, const char *v)
 {
     int n = atoi(v);
@@ -273,6 +279,7 @@ const struct {
     { "regdata",    set_regdata    },
     { "wp_memdata", set_wp_memdata },
     { "wp_regdata", set_wp_regdata },
+    { "kexc",       set_kexc       },
     { "histogram",  set_histogram  },
     { "iframe_rate", set_iframe_rate },
     { "trace_window", set_trace_window },

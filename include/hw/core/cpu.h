@@ -464,6 +464,23 @@ typedef enum QemuPluginCpuEventKind {
     QEMU_PLUGIN_CPU_EVENT_FAULT_RETURN = 1,
     QEMU_PLUGIN_CPU_EVENT_ASYNC_ENTER  = 2,
     QEMU_PLUGIN_CPU_EVENT_ASYNC_RETURN = 3,
+    /*
+     * A committed architectural write that changed the address-space
+     * register the target's get_plugin_state hook reports (MIPS
+     * EntryHi.ASID, Arm TTBR0_EL1, RISC-V SATP, x86 CR3).  Field
+     * semantics FOR THIS KIND differ from the fault/async kinds:
+     * @asid is the NEW value just committed (the producer pushes after
+     * the commit, so the event-instant stamp reads it), @pc carries the
+     * OLD value it replaced (not a PC), @priv is the current privilege
+     * and @depth_after the live plugin_fault_depth.  Produced only in
+     * system-mode TUs, and only when the reported field's value
+     * actually changes under the same masking get_plugin_state applies
+     * (a MIPS EntryHi VPN-only write for TLB maintenance does not
+     * emit).  Values must stay aligned with the public
+     * qemu_plugin_cpu_event_kind enum: the drain passes kind through
+     * raw.
+     */
+    QEMU_PLUGIN_CPU_EVENT_ASID_WRITE   = 4,
 } QemuPluginCpuEventKind;
 
 typedef struct QemuPluginCpuEvent {

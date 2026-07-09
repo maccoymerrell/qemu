@@ -37,6 +37,14 @@ struct PluginConfig {
      * adds per-interval breakdowns of the attribution tables to the
      * per-segment summary. */
     int       histogram_intervals = 0;
+    /* Kernel-excursion ownership model (kexc=1, system/marker mode).
+     * When on, kernel (priv!=0) TBs are attributed to the trace by the
+     * owning excursion — the user address space the kernel was entered
+     * from, tracked through ASID-write path events — instead of by the
+     * live ASID, so a kernel that switches to a private address space
+     * on entry (PTI-style) keeps its synchronous-handler coverage.
+     * 0 (default) keeps the live-ASID rule byte-for-byte. */
+    int       kexc              = 0;
     /* Per-template IFRAME trigger interval.  0 disables. */
     uint32_t  iframe_rate         = 100000;
     uint64_t  simpoint_interval = 100000000ULL;

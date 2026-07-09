@@ -227,6 +227,10 @@ public:
 
 private:
     void prime_from_live();
+    void kexc_apply_asid_write(uint64_t new_asid);
+    void kexc_user_tb(uint64_t live_asid);
+    bool kexc_kernel_tb_keep(uint64_t pinned_asid);
+    void kexc_reset();
     void classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
                               bool *prev_stashed);
     void apply_fault_return(const struct qemu_plugin_cpu_event &ev);
@@ -281,6 +285,71 @@ private:
 
     /* Lazy per-segment baseline; see prime_from_live(). */
     bool primed_ = false;
+
+    /*
+     * ---- Kernel-excursion ownership (kexc=1) ----
+     *
+     * Who owns a kernel TB?  The user address space the kernel was
+     * entered FROM — not whatever the live ASID register happens to
+     * hold, because a kernel is free to run under a private address
+     * space (PTI-style entry switches) or to scribble save/probe values
+     * into the ASID register for TLB maintenance.  All of it is
+     * observable architecturally: privilege transitions delimit the
+     * excursion and ASID_WRITE path events expose every committed swap.
+     *
+     *   user TB (priv==0)   ownership resets; live ASID is authoritative
+     *                       (the exact legacy rule) and is recorded as
+     *                       kexc_last_user_asid_.
+     *   kernel-entry edge   the first priv!=0 TB after a priv==0 TB —
+     *                       once per excursion, at the OUTERMOST
+     *                       user->kernel transition (nested faults
+     *                       inside a syscall do not re-fire it):
+     *                       exc_entry_ = last_user_asid_, overlay
+     *                       cleared, cut cleared.
+     *   ASID_WRITE (new V)  only meaningful while in kernel:
+     *                         V == exc_entry_   nothing (restore;
+     *                                           ownership continues)
+     *                         no overlay yet    overlay_ = V (the
+     *                                           excursion's kernel
+     *                                           overlay — a PTI entry
+     *                                           switch or a TLB-
+     *                                           maintenance save/probe;
+     *                                           NOT a committed switch)
+     *                         V == overlay_     nothing
+     *                         else              cut_ = true (a third
+     *                                           distinct value is a
+     *                                           committed context
+     *                                           switch; sticky until
+     *                                           the next user TB)
+     *   kernel TB           keep for the trace iff
+     *                       exc_entry_ == pinned && !cut_ (the async
+     *                       exclusion has already run).  This REPLACES
+     *                       the live-ASID foreign-drop test for priv!=0
+     *                       TBs only.
+     *
+     * Conservative by construction: a TLB-maintenance loop writing two
+     * DIFFERENT probe values fakes a cut and under-attributes until the
+     * next user TB (counted in kexc_cuts); kernel TBs before a
+     * segment's first user TB have no owner and drop.  An ASID_WRITE
+     * inside an async window still updates this state (the window's TBs
+     * are excluded regardless) so post-window ownership is right.
+     * Storm detection only counts distinct values (>= threshold warns
+     * once per segment + kexc_write_storm); pin invalidation on ASID
+     * rollover is a later policy decision.
+     */
+    bool     kexc_in_kernel_ = false;   /* excursion open (edge latched) */
+    bool     kexc_have_user_ = false;   /* last_user_asid_ is valid */
+    uint64_t kexc_last_user_asid_ = 0;
+    uint64_t kexc_exc_entry_ = 0;       /* owning ASID at the entry edge */
+    bool     kexc_have_overlay_ = false;
+    uint64_t kexc_overlay_ = 0;
+    bool     kexc_cut_ = false;
+    /* Distinct new-values this excursion (storm detection).  Bounded
+     * scan is fine: the set never grows past the storm threshold. */
+    static constexpr uint32_t KEXC_STORM_THRESHOLD = 16;
+    uint64_t kexc_vals_[KEXC_STORM_THRESHOLD];
+    uint32_t kexc_nvals_ = 0;
+    bool     kexc_stormed_ = false;     /* this excursion already counted */
 
     bool evq_enabled_ = false;
     unsigned int cpu_index_ = 0;

@@ -4394,7 +4394,29 @@ static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
         ARMCPU *cpu = env_archcpu(env);
         tlb_flush(CPU(cpu));
     }
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    /*
+     * Address-space switch observation.  This writefn serves several
+     * TTBR banks and aliases (TTBR0/TTBR1_EL1, their AArch32 views, and
+     * the memdup'd TTBR0_EL12 redirect), so rather than decode which
+     * cpreg is being written, bracket the write with a compare of the
+     * one backing field arm_get_plugin_state reports — TTBR0_EL1, i.e.
+     * cp15.ttbr0_el[1] — and emit only when its value changed.  The
+     * event's pc slot carries the OLD value; the push itself stamps the
+     * just-committed NEW value as the event's asid (and is a no-op on
+     * the wrong path — additionally unreachable here through the
+     * spec-freeze gate above — or while the queue is disabled).
+     */
+    uint64_t old_ttbr0_el1 = env->cp15.ttbr0_el[1];
     raw_write(env, ri, value);
+    if (env->cp15.ttbr0_el[1] != old_ttbr0_el1) {
+        cpu_plugin_evq_push(env_cpu(env), QEMU_PLUGIN_CPU_EVENT_ASID_WRITE,
+                            old_ttbr0_el1,
+                            env_cpu(env)->plugin_fault_depth);
+    }
+#else
+    raw_write(env, ri, value);
+#endif
 }
 
 static void vmsa_tcr_ttbr_el2_write(CPUARMState *env, const ARMCPRegInfo *ri,

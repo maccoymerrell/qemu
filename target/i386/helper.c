@@ -172,12 +172,31 @@ void cpu_x86_update_cr0(CPUX86State *env, uint32_t new_cr0)
    the PDPT */
 void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3)
 {
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    target_ulong old_cr3 = env->cr[3];
+#endif
     env->cr[3] = new_cr3;
     if (env->cr[0] & CR0_PG_MASK) {
         qemu_log_mask(CPU_LOG_MMU,
                         "CR3 update: CR3=" TARGET_FMT_lx "\n", new_cr3);
         tlb_flush(env_cpu(env));
     }
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    /*
+     * Address-space switch observation: CR3 is the register
+     * x86_get_plugin_state reports, full-register compare.  This is the
+     * one TCG commit point for every architectural CR3 write — MOV CR3
+     * (helper_write_crN), hardware task switches, SMM RSM and SVM world
+     * switches all funnel through here.  The event's pc slot carries
+     * the OLD value; the push itself stamps the just-committed NEW
+     * value as the event's asid (and is a no-op on the wrong path or
+     * while the queue is disabled).
+     */
+    if (new_cr3 != old_cr3) {
+        cpu_plugin_evq_push(env_cpu(env), QEMU_PLUGIN_CPU_EVENT_ASID_WRITE,
+                            old_cr3, env_cpu(env)->plugin_fault_depth);
+    }
+#endif
 }
 
 void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4)

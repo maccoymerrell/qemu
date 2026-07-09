@@ -1454,6 +1454,22 @@ enum qemu_plugin_cpu_event_kind {
     QEMU_PLUGIN_CPU_EV_FAULT_RETURN = 1,
     QEMU_PLUGIN_CPU_EV_ASYNC_ENTER  = 2,
     QEMU_PLUGIN_CPU_EV_ASYNC_RETURN = 3,
+    /*
+     * A committed architectural write that changed the address-space
+     * register qemu_plugin_get_addr_space_id() reports (MIPS
+     * EntryHi.ASID, Arm TTBR0_EL1, RISC-V SATP, x86 CR3).  Field
+     * semantics FOR THIS KIND differ from the fault/async kinds:
+     * @asid is the NEW value just committed, @pc carries the OLD value
+     * it replaced (not a PC), @priv is the privilege the write executed
+     * at and @depth_after the live fault-stack depth.  Emitted only in
+     * system mode, only when the reported value actually changes, and
+     * never on the wrong path.  Every OS must execute this privileged,
+     * expensive operation to switch address spaces, so the event stream
+     * makes address-space swap mechanics (PTI-style kernel entry
+     * switches, TLB-maintenance save/probe writes, committed context
+     * switches) observable without any OS-specific assumption.
+     */
+    QEMU_PLUGIN_CPU_EV_ASID_WRITE   = 4,
 };
 
 struct qemu_plugin_cpu_event {

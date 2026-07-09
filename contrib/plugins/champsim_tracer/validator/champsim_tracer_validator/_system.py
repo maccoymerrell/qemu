@@ -14,11 +14,26 @@ The system-mode assets (a kernel + a base initramfs root) are local and not
 in the repo; default to the maintainer's harness under ``--rootfs``-able
 paths and override on the command line.
 
+Environment passthrough (read by :func:`system_qemu_cmd`):
+
+``CST_QEMU_EXTRA_ARGS``
+    Space-separated extra arguments appended verbatim to the end of the
+    qemu-system command line — e.g.
+    ``CST_QEMU_EXTRA_ARGS="-cpu qemu64,vendor=GenuineIntel"`` flips the
+    staged x86 guest's CPUID vendor so the guest kernel enables page-table
+    isolation (a later ``-cpu`` wins over an earlier one, so this also
+    overrides a boot-table CPU).
+``CST_PLUGIN_EXTRA_ARGS``
+    Extra plugin arguments, comma-prefixed onto the plugin option string —
+    e.g. ``CST_PLUGIN_EXTRA_ARGS=kexc=1`` rides the kernel-excursion
+    ownership model along a validator run.
+
 SPDX-License-Identifier: GPL-2.0-or-later
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -125,12 +140,19 @@ def system_qemu_cmd(qemu_system: Path, kernel: Path, initrd: Path,
                     isa: str = "x86_64") -> list[str]:
     """Build the qemu-system command that boots @kernel + @initrd headless
     with the plugin loaded, powering off (not rebooting) on guest halt.
-    Machine model and console come from the per-ISA boot table."""
+    Machine model and console come from the per-ISA boot table.
+
+    Honors ``CST_PLUGIN_EXTRA_ARGS`` (comma-prefixed onto @plugin_opts)
+    and ``CST_QEMU_EXTRA_ARGS`` (space-split, appended last so e.g. a
+    ``-cpu`` override wins) — see the module docstring."""
     b = _ISA_BOOT[isa]
     append = f"console={b['console']} panic=-1"
     if b.get("extra_append"):
         append += f" {b['extra_append']}"
-    return [
+    extra_plugin = os.environ.get("CST_PLUGIN_EXTRA_ARGS", "").strip()
+    if extra_plugin:
+        plugin_opts = f"{plugin_opts},{extra_plugin.lstrip(',')}"
+    cmd = [
         str(qemu_system),
         *b["machine"],
         "-kernel", str(kernel),
@@ -139,3 +161,5 @@ def system_qemu_cmd(qemu_system: Path, kernel: Path, initrd: Path,
         "-nographic", "-no-reboot", "-m", mem,
         "-plugin", f"{plugin},{plugin_opts}",
     ]
+    cmd += os.environ.get("CST_QEMU_EXTRA_ARGS", "").split()
+    return cmd

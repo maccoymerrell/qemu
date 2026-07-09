@@ -3344,6 +3344,12 @@ static void append_stats_summary(GString *report, const char *label,
         { "WP flush re-runs",                    stats.wp_flush_reruns },
         { "WP first-TB unavailable",             stats.wp_first_tb_unavail },
         { "Unknown-instruction warnings",        stats.unknown_insn_warnings },
+        { "kexc ASID-write events",              stats.kexc_asid_writes },
+        { "kexc overlays installed",             stats.kexc_overlays },
+        { "kexc committed-switch cuts",          stats.kexc_cuts },
+        { "kexc kernel TBs kept",                stats.kexc_kernel_kept },
+        { "kexc kernel TBs dropped",             stats.kexc_kernel_dropped },
+        { "kexc write storms",                   stats.kexc_write_storm },
     };
     const struct { const char *name; uint64_t value; } bin_counters[] = {
         { "  Header bits",        stats.bin_header_bits },
@@ -3773,6 +3779,12 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     g_features.fault_excursions =
         (g_window_mode == PluginConfig::WIN_MARKER) &&
         getenv("CST_NO_FAULT") == nullptr;
+
+    /* Kernel-excursion ownership rides the marker-mode ASID pin (the
+     * ownership rule replaces the live-ASID test for kernel TBs of the
+     * PINNED run only); outside marker mode the flag is inert, so keep
+     * it wired verbatim rather than mode-gated. */
+    g_features.kexc = cfg.kexc != 0;
 
     if (!cfg.output_path) {
         cfg.output_path = g_strdup("champsim_tracer_out");

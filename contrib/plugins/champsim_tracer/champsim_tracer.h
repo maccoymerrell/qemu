@@ -1087,6 +1087,14 @@ struct TraceFeatures {
      * Enabled in marker (system) mode; off in user mode, so user-mode traces
      * carry no trailer. */
     bool     fault_excursions = false;
+    /* Kernel-excursion ownership (kexc=1): attribute kernel (priv!=0) TBs
+     * by the owning excursion's entry ASID — tracked through ASID-write
+     * path events — instead of by the live ASID, so PTI-style kernel
+     * entry switches don't drop the pinned process's synchronous kernel
+     * work.  Off (default) keeps the live-ASID rule byte-for-byte; the
+     * PathBuilder then consumes-and-ignores ASID_WRITE events.  See the
+     * ownership state machine in champsim_tracer_path_builder.h. */
+    bool     kexc = false;
 };
 extern TraceFeatures g_features;
 extern char *qemu_command_line;

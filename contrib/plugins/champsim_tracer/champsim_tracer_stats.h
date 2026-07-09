@@ -52,6 +52,12 @@ struct Stats {
     /* Correct-path memops observed by the per-thread mem callback.
      * Counted before the loads-vs-stores split, so it covers both. */
     uint64_t cp_total_mem_accesses = 0;
+    /* CP memops whose insn_pc matched nothing in the draining entry's
+     * template — orphans from an executed-but-never-emitted path
+     * (foreign-TB drops clear their memops at the source; anything
+     * still surfacing here indicates a leak).  Dropped at drain
+     * instead of mis-slotted onto insn 0. */
+    uint64_t cp_orphan_mem_accesses = 0;
 
     /* Binary writer byte-count breakdown. */
     uint64_t bin_total_bits = 0;

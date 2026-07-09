@@ -711,7 +711,20 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
             /* rearch: suspend-or-seal candidate.  For now the deferred
              * prev is DROPPED — the one-TB lossy boundary — rather than
              * suspended, so its fragments never bridge across the
-             * gap. */
+             * gap.
+             *
+             * Prev's memops die with it: they are still sitting in the
+             * CP accumulator (drained only at prev's emit, which now
+             * never happens) and would otherwise be attributed to the
+             * NEXT emitted entry — whose template contains none of
+             * their PCs, collapsing them onto insn 0 as a phantom blob
+             * and displacing that entry's own memops in the drain's
+             * monotonic walk.  The TB being dispatched right now is
+             * equally unemitted, so mute its upcoming accesses too;
+             * the step recomputes g_capture_mute at every dispatch, so
+             * the mute self-clears with the foreign span. */
+            g_mem_recorder.clear_cp();
+            g_capture_mute = true;
             clear_prev();
             return StepStatus::DROPPED_FOREIGN;
         }

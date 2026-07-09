@@ -16,6 +16,14 @@ MemAccessRecorder g_mem_recorder;
 namespace {
 
 thread_local std::vector<WPMemAccess> tls_cp_mem_accesses CST_TLS_HOT;
+/* Memops whose insn_pc missed the previous drain's template, retained
+ * for exactly one more drain.  The legitimate producer is a split BB
+ * (e.g. the MIPS page-split branch whose delay slot executes in the
+ * next TB): the straggler belongs to the neighboring entry, whose
+ * drain immediately follows and whose template does contain its PC.
+ * A second miss means the memop is a true orphan — recorded by an
+ * executed-but-never-emitted path — and is dropped and counted. */
+thread_local std::vector<WPMemAccess> tls_cp_carry;
 thread_local GByteArray              *tls_mem_read_buf CST_TLS_HOT = nullptr;
 
 GByteArray *read_scratch()
@@ -190,6 +198,11 @@ size_t MemAccessRecorder::cp_count() const
 void MemAccessRecorder::clear_cp()
 {
     tls_cp_mem_accesses.clear();
+    /* Discard carried stragglers too: every clear_cp() caller is
+     * abandoning the pending CP context (segment close, foreign-TB
+     * drop), and a straggler must not outlive the path that would
+     * have owned it. */
+    tls_cp_carry.clear();
 }
 
 void MemAccessRecorder::take_cp(std::vector<WPMemAccess> &out)
@@ -221,21 +234,67 @@ void MemAccessRecorder::drain_cp_into_dyn_params(
 {
     /* memops are in execution order and insn_pc is monotonically
      * non-decreasing across an entry's memops, so walk the template's
-     * insn_pcs[] in lockstep to assign insn_index. */
-    unsigned int idx = 0;
+     * insn_pcs[] in lockstep to assign insn_index.  A cursor miss gets
+     * one rescan from the top (an intra-entry loop or a merge-reinjected
+     * prefix can legitimately step the PC backwards).  A memop whose PC
+     * is nowhere in the template is NOT slotted onto insn 0 (where it
+     * would masquerade as the entry's own traffic and derail the
+     * lockstep for everything after it): first-time misses are carried
+     * to the NEXT drain — a split BB's straggler (MIPS page-split delay
+     * slot executing in the following TB) belongs to the neighboring
+     * entry, whose template does contain its PC — and a second miss
+     * drops the memop as a true orphan, counted in the run stats. */
     unsigned int n_insns = bb_tmpl ? bb_tmpl->n_insns : 0;
-    for (const WPMemAccess &acc : tls_cp_mem_accesses) {
+    auto slot_for = [&](const WPMemAccess &acc, unsigned int &idx) -> int {
         while (idx < n_insns && bb_tmpl->insn_pcs[idx] != acc.insn_pc) {
             idx++;
         }
+        if (idx < n_insns) {
+            return (int)idx;
+        }
+        unsigned int j = 0;
+        while (j < n_insns && bb_tmpl->insn_pcs[j] != acc.insn_pc) {
+            j++;
+        }
+        if (j < n_insns) {
+            idx = j;
+            return (int)j;
+        }
+        idx = 0;
+        return -1;
+    };
+    auto push_dp = [&](const WPMemAccess &acc, int slot) {
         DynParam dp = {
             .type = (uint8_t)(acc.is_store ? DYN_STORE_ADDR : DYN_LOAD_ADDR),
-            .insn_index = (uint16_t)(idx < n_insns ? idx : 0),
+            .insn_index = (uint16_t)slot,
             .value = acc.mem_vaddr,
             .data_size = acc.data_size,
             .data = acc.data,
         };
         dyn_params.push_back(dp);
+    };
+
+    /* Carried stragglers first (they are older than the live buffer);
+     * a second miss is terminal. */
+    unsigned int idx = 0;
+    for (const WPMemAccess &acc : tls_cp_carry) {
+        int slot = slot_for(acc, idx);
+        if (slot < 0) {
+            thread_stats_get().cp_orphan_mem_accesses++;
+            continue;
+        }
+        push_dp(acc, slot);
+    }
+    tls_cp_carry.clear();
+
+    idx = 0;
+    for (const WPMemAccess &acc : tls_cp_mem_accesses) {
+        int slot = slot_for(acc, idx);
+        if (slot < 0) {
+            tls_cp_carry.push_back(acc);
+            continue;
+        }
+        push_dp(acc, slot);
     }
     tls_cp_mem_accesses.clear();
 }
@@ -248,6 +307,7 @@ void MemAccessRecorder::cleanup_current_thread()
      * been seen to SIGSEGV in __libc_free during late teardown.  The
      * TLS destructor frees it cleanly afterwards. */
     tls_cp_mem_accesses.clear();
+    tls_cp_carry.clear();
     if (tls_mem_read_buf) {
         g_byte_array_unref(tls_mem_read_buf);
         tls_mem_read_buf = nullptr;

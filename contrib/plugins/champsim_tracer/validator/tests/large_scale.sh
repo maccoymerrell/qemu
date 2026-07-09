@@ -57,6 +57,12 @@ QEMU_ROOT="$(cd "$VAL_ROOT/../../../.." && pwd)"
 : "${SIDE_LEN_MAX:=5}"
 : "${HOT_ITERS:=16}"
 : "${STOP_ON_FAIL:=0}"
+# MODE: "user" (linux-user trace) or "system" (full-system trace).  System mode
+# appends --system --marker.  Coverage (incl. vector ops) is kept in both modes,
+# so the system guest must expose AND enable vector/SIMD — the system QEMU cmd
+# selects a V-capable CPU (see _system.py) and the guest enables it lazily on
+# first use.  An ISA without a staged rootfs is reported SKIP, not failed.
+: "${MODE:=user}"
 
 if [ -z "${PARALLEL:-}" ]; then
     cores=$(nproc 2>/dev/null || echo 4)
@@ -92,7 +98,13 @@ done
 run_one() {
     local seed="$1" isa="$2" shape_label="$3"; shift 3
     local shape_args=("$@")
-    local tag="${shape_label}_${isa}_${seed//0x/}"
+    if [ "$MODE" = "system" ]; then
+        # Full-system trace of a marker window.  Coverage (incl. vector ops) is
+        # kept; the guest must therefore expose + enable vector — see
+        # _system.py (the system QEMU cmd selects a V-capable CPU).
+        shape_args=( "${shape_args[@]}" --system --marker )
+    fi
+    local tag="${MODE}_${shape_label}_${isa}_${seed//0x/}"
     local out="$OUT_ROOT/$tag"
     mkdir -p "$out"
 
@@ -110,7 +122,15 @@ run_one() {
     local summary
     summary=$(grep -E '^[[:space:]]*total: ' "$log" | tail -1)
     if [ -z "$summary" ]; then
-        echo "RUN seed=$seed isa=$isa shape=$shape_label status=CRASH rc=$rc log=$log"
+        # No summary: either the run was skipped (e.g. system mode with no
+        # staged rootfs for this ISA) or the validator crashed before
+        # summarising.  SKIP is not a failure.
+        if grep -q "SKIP" "$log"; then
+            echo "RUN seed=$seed isa=$isa shape=$shape_label mode=$MODE status=SKIP rc=$rc"
+            rm -rf "$out"
+            return 0
+        fi
+        echo "RUN seed=$seed isa=$isa shape=$shape_label mode=$MODE status=CRASH rc=$rc log=$log"
         return 1
     fi
     local errors

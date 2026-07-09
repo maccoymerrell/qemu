@@ -47,7 +47,12 @@ _ISA_BOOT = {
                 "machine": ["-M", "virt", "-cpu", "max,pauth-impdef=on"],
                 "console": "ttyAMA0"},
     "riscv64": {"dir": "riscv64", "kernel": "Image",
-                "machine": ["-M", "virt"],
+                # -cpu max exposes the V (vector) extension so --coverage's
+                # vector ops are legal; the default virt CPU lacks V, making
+                # vsetvli a true illegal-instruction (SIGILL) the guest kernel
+                # cannot lazily enable.  The kernel still enables VS on first
+                # use.
+                "machine": ["-M", "virt", "-cpu", "max"],
                 "console": "ttyS0"},
     "mipsel":  {"dir": "mipsel",  "kernel": "vmlinux",
                 "machine": ["-M", "malta"],
@@ -122,12 +127,15 @@ def system_qemu_cmd(qemu_system: Path, kernel: Path, initrd: Path,
     with the plugin loaded, powering off (not rebooting) on guest halt.
     Machine model and console come from the per-ISA boot table."""
     b = _ISA_BOOT[isa]
+    append = f"console={b['console']} panic=-1"
+    if b.get("extra_append"):
+        append += f" {b['extra_append']}"
     return [
         str(qemu_system),
         *b["machine"],
         "-kernel", str(kernel),
         "-initrd", str(initrd),
-        "-append", f"console={b['console']} panic=-1",
+        "-append", append,
         "-nographic", "-no-reboot", "-m", mem,
         "-plugin", f"{plugin},{plugin_opts}",
     ]

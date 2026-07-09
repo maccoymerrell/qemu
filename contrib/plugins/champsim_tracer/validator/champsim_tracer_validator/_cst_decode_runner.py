@@ -192,7 +192,8 @@ _INSN_RE = re.compile(
     r"(?:  prof: (.*))?$"
 )
 _ENTRY_HEAD_RE = re.compile(
-    r"^ENTRY (\d+) thread=(\d+)(?: switch=(\d))? template=BB(\d+)$"
+    r"^ENTRY (\d+) thread=(\d+)(?: switch=(\d))?"
+    r"(?: fault_depth=(\d+))?(?: fault_at=([\d,]+))? template=BB(\d+)$"
 )
 _WP_HEAD_RE = re.compile(
     r"^  wp\[(\d+)\] template=BB(\d+) n_insns=(\d+)$"
@@ -571,7 +572,10 @@ def _iter_body(lines: list[str], i: int,
         seq_num = int(m.group(1))
         thread_id = int(m.group(2))
         thread_switched = m.group(3) == "1"
-        template_id = int(m.group(4))
+        fault_depth = int(m.group(4)) if m.group(4) is not None else 0
+        fault_anchors = ([int(x) for x in m.group(5).split(",")]
+                         if m.group(5) else [])
+        template_id = int(m.group(6))
         i += 1
         # CP block: indented "cp:" header followed by observations.
         cp_dyn: list[DynParam] = []
@@ -632,6 +636,8 @@ def _iter_body(lines: list[str], i: int,
             "template_id": template_id,
             "thread_id": thread_id,
             "thread_switched": thread_switched,
+            "fault_depth": fault_depth,
+            "fault_anchors": fault_anchors,
             "dyn_params": cp_dyn,
             "reg_snaps": cp_snaps,
             "metaflags": cp_mflags,

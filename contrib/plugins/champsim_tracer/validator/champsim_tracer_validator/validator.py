@@ -1249,6 +1249,13 @@ def _check_per_execution_memop_shape(
         tmpl = templates_by_id.get(tid)
         if tmpl is None:
             continue
+        # Kernel templates and fault-handler executions (fault_depth>0)
+        # are exempt: a faulting access transfers 0 bytes on the attempt
+        # that traps and the full width on the post-handler retry, so the
+        # per-execution shape legitimately differs across a fault.  Fault
+        # blocks must not perturb the user workload's shape baseline.
+        if tmpl.get("is_system") or int(e.get("fault_depth", 0) or 0) > 0:
+            continue
         shape = _shape_for_entry(e, tmpl)
         if tid not in baseline:
             baseline[tid] = shape
@@ -3221,17 +3228,28 @@ def _check_wrong_path_chains(entries: list[dict],
         wp_raw: list[int] = []
         actual_sim_insns = 0
         wp_left_user = False   # entered kernel, or faulted out of user CFG
+        raw_len_at_cross: int | None = None   # len(wp_raw) just BEFORE the
+                                              # first block that left user space
         for wp in e.get("wp_entries", []):
+            crossed = bool(wp.get("fault") or wp.get("translation_unavailable"))
+            wt = (templates_by_id or {}).get(wp["template_id"])
+            if wt is not None and wt.get("is_system"):
+                crossed = True
+            if crossed and raw_len_at_cross is None:
+                # user blocks emitted before this crossing entry
+                raw_len_at_cross = len(wp_raw)
             wp_raw.extend(
                 bid for (bid, _) in template_runs.get(wp["template_id"], [])
             )
             actual_sim_insns += int(wp.get("n_insns", 0) or 0)
-            if wp.get("fault") or wp.get("translation_unavailable"):
-                wp_left_user = True
-            wt = (templates_by_id or {}).get(wp["template_id"])
-            if wt is not None and wt.get("is_system"):
+            if crossed:
                 wp_left_user = True
         actual_wp = _collapse_runs(wp_raw)
+        # Collapsed index at which the wrong path left the enumerable user CFG.
+        left_user_at = (
+            len(_collapse_runs(wp_raw[:raw_len_at_cross]))
+            if raw_len_at_cross is not None else None
+        )
 
         n = min(len(actual_wp), len(exp_chain))
         first_fail = -1
@@ -3270,42 +3288,43 @@ def _check_wrong_path_chains(entries: list[dict],
                  "expected": exp_chain},
             ))
         elif len(actual_wp) < len(exp_chain):
-            # MIPS user binaries pull in many libgcc soft-float and
-            # software int-div helpers whose body insns the validator
-            # cannot enumerate from `blk_*` symbols.  Those helpers'
-            # insns *are* counted by the plugin toward sim_insns, so
-            # the predicted chain over-shoots the plugin's actual
-            # output.  For MIPS only, accept any truncation as long
-            # as the plugin's sim_insns reached the depth budget.
-            # All other ISAs must match the predicted length exactly.
-            if isa.startswith("mips") and actual_sim_insns >= wp_insn_budget:
+            # Budget exhaustion is a legitimate chain terminator on any
+            # ISA: when the plugin PROVABLY spent the full WP instruction
+            # budget (sim_insns >= budget), the chain is not "short" — the
+            # plugin's per-insn accounting is finer than the predictor's
+            # block-count trim.  Two known sources: MIPS user binaries pull
+            # in libgcc soft-float / int-div helpers whose body insns the
+            # predictor cannot enumerate from `blk_*` symbols; x86 REP
+            # string ops burn one budget unit per sandboxed ITERATION while
+            # the predictor counts the REP as a single instruction.  The
+            # emitted prefix was already verified correct (first_fail < 0),
+            # so exact-or-longer is preserved in instruction terms.
+            if actual_sim_insns >= wp_insn_budget:
                 continue
             # System mode: the wrong path speculatively crossed into the
             # kernel (CST_INSN_FLAG_SYSTEM blocks the validator can't
-            # enumerate from blk_* symbols) or faulted out of the user
-            # CFG.  Either way the user-CFG-derived prediction no longer
-            # applies — accept the truncation, exactly as the MIPS
-            # libgcc-helper case above.
-            if wp_left_user:
+            # enumerate from blk_* symbols) or faulted out of the user CFG.
+            # A crossing makes the chain unpredictable from there ON — but
+            # ONLY beyond that point.  The synthetic wrong path is exact-
+            # known, so the WP must follow the ENTIRE predicted user prefix
+            # before crossing; a crossing BEFORE the prefix completes is a
+            # real truncation (the WP stopped short of known code), not an
+            # unpredictable tail.  Accept only when the crossing is at/after
+            # the full predicted length.
+            if wp_left_user and left_user_at is not None \
+                    and left_user_at >= len(exp_chain):
                 continue
-            # wpprune: the tracer intentionally drops the wrong path for
-            # cold branches (never-taken / one-directional / monomorphic
-            # indirect).  Pruning is per-execution on live history, which
-            # the static CFG predictor cannot reproduce, so accept a
-            # missing or short chain.  A WP that IS present was already
-            # checked as a correct prefix (first_fail < 0 above).
-            if wpprune > 0:
+            # wpprune: the tracer intentionally drops the wrong path WHOLE
+            # for cold branches (never-taken / one-directional / monomorphic
+            # indirect).  Pruning removes the entire path, so accept ONLY an
+            # empty chain here; a non-empty-but-short chain was NOT pruned and
+            # is a genuine truncation.
+            if wpprune > 0 and not actual_wp:
                 continue
-            # System mode (marker): softmmu wrong-path speculation can
-            # terminate earlier than user mode at a spec-translation /
-            # flush / gated-instruction abort point the user-CFG
-            # predictor does not model.  The emitted blocks were already
-            # verified to be a correct prefix of the prediction
-            # (first_fail < 0 above), so the speculation is correct —
-            # just shorter.  Accept the shorter clean prefix; user-mode
-            # traces keep the exact-length requirement.
-            if marker and actual_wp:
-                continue
+            # A shorter-than-predicted chain that neither crossed out of the
+            # user CFG at/after the full prefix nor was wholly pruned is a
+            # real plugin truncation: the synthetic wrong path is exact-known
+            # and the actual chain must match it exactly or run longer.
             issues.append(Issue(
                 "wrong_path_chains", "error",
                 f"WP at CP pos {cp_pos} (blk_{last_cp_bid}) truncated: "
@@ -3797,6 +3816,88 @@ def _check_syscall_transitions(entries: list[dict],
         f"(branch out to kernel + return to fall-through)"
         + ("" if verified else "; none returned (terminal exit only)"),
         {"verified": verified})]
+
+
+def _check_fault_excursions(entries: list[dict],
+                            templates_by_id: dict,
+                            trace_meta: dict) -> list[Issue]:
+    """System-mode synchronous-fault excursion depth (CST_FLAG_FAULT).
+
+    Each CP entry carries a fault-handler nesting depth: 0 = normal code,
+    >=1 = synchronous-fault handler code that detoured execution at that
+    level.  The strong, semantic invariants:
+
+      * **depth>0 => kernel.**  A fault handler runs at system privilege, so
+        any entry tagged depth>=1 MUST be ``is_system`` code.  User-privilege
+        code at depth>0 means the depth baseline is wrong (e.g. a phantom
+        frame from a fault delivered before tracing began that never popped) —
+        exactly the stuck-baseline failure this guards against.
+      * **depth baselines at 0.**  The trace opens at user level (the marker),
+        so depth-0 entries must exist; an all-depth>0 trace is a stuck stack.
+
+    Syscall-entered kernel code stays depth 0 (SVC is not a fault), so this is
+    orthogonal to the syscall-transition check.  A fault-free / user-only
+    trace carries no depths -> info.
+    """
+    issues: list[Issue] = []
+    seen_depth = False
+    n_depth0 = 0
+    n_handler = 0
+    max_depth = 0
+    user_at_depth = 0
+    n_merged = 0          # faulting BBs reassembled across excursions
+    for e in entries:
+        # Faulting-instruction anchors mark a BB that faulted and was
+        # reassembled whole; verify each indexes a real instruction.
+        anchors = e.get("fault_anchors") or []
+        if anchors:
+            n_merged += 1
+            t = templates_by_id.get(e["template_id"])
+            n_insns = len(t.get("insns") or []) if t else 0
+            for a in anchors:
+                if n_insns and a >= n_insns:
+                    issues.append(Issue(
+                        "fault_excursions", "error",
+                        f"entry seq={e.get('seq_num')} (BB{e['template_id']}) "
+                        f"fault anchor {a} out of range (n_insns={n_insns})",
+                        {"seq_num": e.get("seq_num"), "anchor": a}))
+        d = int(e.get("fault_depth", 0) or 0)
+        if d == 0:
+            n_depth0 += 1
+            continue
+        seen_depth = True
+        n_handler += 1
+        max_depth = max(max_depth, d)
+        t = templates_by_id.get(e["template_id"])
+        is_sys = bool(t.get("is_system")) if t else False
+        if not is_sys:
+            user_at_depth += 1
+            if user_at_depth <= 5:
+                issues.append(Issue(
+                    "fault_excursions", "error",
+                    f"entry seq={e.get('seq_num')} (BB{e['template_id']}) has "
+                    f"fault_depth={d} but is not kernel (is_system) code; "
+                    f"fault-handler code must run at system privilege",
+                    {"seq_num": e.get("seq_num"), "depth": d}))
+    if not seen_depth:
+        return [Issue("fault_excursions", "info",
+                      "no fault-handler depth in trace "
+                      "(fault-free or user-only window)")]
+    if n_depth0 == 0:
+        issues.append(Issue(
+            "fault_excursions", "error",
+            f"every one of {n_handler} entries is at fault_depth>0; the "
+            f"excursion stack never returns to baseline (stuck depth)",
+            {"handler_entries": n_handler}))
+    if issues:
+        return issues
+    return [Issue(
+        "fault_excursions", "info",
+        f"fault excursions: {n_handler} handler entries (max depth "
+        f"{max_depth}), all kernel-privileged; {n_merged} faulting BBs "
+        f"reassembled whole; {n_depth0} entries at baseline depth 0",
+        {"handler_entries": n_handler, "max_depth": max_depth,
+         "merged_bbs": n_merged, "depth0_entries": n_depth0})]
 
 
 def _check_call_return_balance(entries: list[dict],
@@ -4848,6 +4949,11 @@ def _check_metaflags(
         tmpl = templates_by_id.get(int(e["template_id"]))
         if tmpl is None:
             continue
+        # Kernel / fault-handler code: not ours to model (ccmp/ccmn set
+        # NZCV to an immediate when the condition fails, etc.).  Limit
+        # flag reconstruction to the synthetic user workload.
+        if tmpl.get("is_system"):
+            continue
         mf_by_insn = {int(m["insn_index"]): int(m["byte"])
                       for m in (e.get("metaflags") or [])}
         if not mf_by_insn:
@@ -4949,7 +5055,8 @@ def _check_regdata_reconstruction(
         templates_by_id: dict[int, dict],
         opcode_names: dict[int, str],
         reg_id_to_name: dict[int, str],
-        has_reg_data: bool) -> list[Issue]:
+        has_reg_data: bool,
+        isa: str = "x86_64") -> list[Issue]:
     """For arithmetic insns whose semantics we know how to model, take
     the *prior* dst snap of each src register as the operand value,
     compute the expected result, and compare to the trace's dst snap.
@@ -5005,6 +5112,18 @@ def _check_regdata_reconstruction(
         for s in (e.get("reg_snaps") or []):
             snap_idx[(int(s["insn_index"]), int(s["reg_id"]))] = s
 
+        # Kernel / fault-handler code (CST_INSN_FLAG_SYSTEM): we did not
+        # generate it, so we cannot model its operand semantics (aarch64
+        # shifted/extended-register ALU forms, ccmp, riscv `sub rd,rs1,rd`
+        # operand aliasing, …).  Don't verify it — but still fold its dst
+        # snaps into reg_state so a subsequent *user* op that reads a
+        # kernel-written register reconstructs against the right value
+        # rather than a stale one.
+        if tmpl.get("is_system"):
+            for (_ipos_k, r_k), snap in snap_idx.items():
+                reg_state[(tid, r_k)] = _reg_snap_value(snap)
+            continue
+
         # Insn positions that touched memory this execution.  Memory-
         # coupled ALU forms (x86 RMW "add (m), r" — dst = src + MEM;
         # aarch64 writeback addressing, classified INT_ADD by design —
@@ -5055,10 +5174,14 @@ def _check_regdata_reconstruction(
                 continue
             compute, commutative = handlers[op_name]
             # Reorder for non-commutative ops so `a` is the minuend.
-            # 2-op form: the dst-also-src reg is the minuend → put it
-            # first.  3-op form: src[0] is already the minuend.
+            # x86 2-op form (`sub src, dst` → dst = dst - src): the
+            # dst-also-src reg is the minuend → put it first.  3-op ISAs
+            # (riscv/mips/aarch64 `sub rd, rs1, rs2`): src[0] is ALWAYS
+            # the minuend — the dst-alias test must not run there, or
+            # `sub rd, rs1, rd` (rd == rs2, common in kernel code) gets
+            # its operands swapped and a correct trace is flagged.
             ordered_srcs = list(srcs)
-            if not commutative:
+            if not commutative and isa in ("x86_64", "i386"):
                 if srcs[1] in dsts and srcs[0] not in dsts:
                     ordered_srcs = [srcs[1], srcs[0]]
             a = reg_state.get((tid, ordered_srcs[0]))
@@ -5641,6 +5764,8 @@ def validate(meta_path: Path, trace_path: Path,
     if marker:
         issues += _check_syscall_transitions(entries, templates_by_id,
                                              trace_meta)
+        issues += _check_fault_excursions(entries, templates_by_id,
+                                          trace_meta)
 
     # ---- Per-insn regdata semantic checks ----------------------------------
     opcode_names = dict(trace_meta.get("encoding_maps", {}).get("opcode", {}))
@@ -5649,7 +5774,7 @@ def validate(meta_path: Path, trace_path: Path,
                                 reg_id_to_name, has_reg_data)
     issues += _check_regdata_reconstruction(cp_entries, templates_by_id,
                                              opcode_names, reg_id_to_name,
-                                             has_reg_data)
+                                             has_reg_data, isa)
     pc_to_gt = _build_pc_to_gt_insn(meta["blocks"])
     issues += _check_lane_masks(cp_entries, templates_by_id, opcode_names,
                                 isa, pc_to_gt)

@@ -2536,30 +2536,94 @@ static void marker_seq_init(void)
     }
 }
 
-/* Advance a position-indexed marker run: returns the new run position
- * after seeing @bytes/@size at position @run (0-based).  On mismatch the
- * insn may itself restart a run at position 0 (pair sequences alternate
- * words, so a stray first-word can begin a fresh run immediately). */
-static inline uint32_t marker_run_step(const uint8_t *seq, uint32_t run,
-                                       const uint8_t *bytes, uint8_t size)
+/* Does @bytes/@size match ANY per-insn word of @seq?  Membership is all
+ * translation needs to know: consecutivity is judged at EXECUTION time,
+ * in the user-space instruction stream, by PC adjacency (below) — so the
+ * marker is detected regardless of how translation happens to slice it
+ * into TBs (page splits, single-stepping under a guest debugger/ptrace
+ * injector, chained 1-insn TBs). */
+static inline bool marker_word_match(const uint8_t *seq,
+                                     const uint8_t *bytes, uint8_t size)
 {
     const MarkerSeq &m = g_marker_seq;
-    if (size == m.insn_bytes &&
-        memcmp(bytes, seq + (size_t)run * m.insn_bytes, m.insn_bytes) == 0) {
-        return run + 1;
+    if (size != m.insn_bytes) {
+        return false;
     }
-    if (run != 0 && size == m.insn_bytes &&
-        memcmp(bytes, seq, m.insn_bytes) == 0) {
-        return 1;
+    for (uint32_t i = 0; i < m.n_insns; i++) {
+        if (memcmp(bytes, seq + (size_t)i * m.insn_bytes, m.insn_bytes) == 0) {
+            return true;
+        }
     }
-    return 0;
+    return false;
+}
+
+/*
+ * Execution-time marker run, per thread: three(+) marker instructions are
+ * a marker exactly when they are CONSECUTIVE IN THE USER-SPACE STREAM —
+ * i.e. each executes at user privilege, in the same address space, at the
+ * PC immediately after the previous one.  Kernel instructions interposed
+ * between them (single-step traps, interrupts) do not break the run: they
+ * never match the adjacency test and are not part of the user stream.
+ * A marker insn that is NOT adjacent to the previous one simply starts a
+ * fresh run of length 1.
+ */
+struct MarkerExecRun {
+    uint64_t next_pc = 0;      /* pc the run's next insn must have */
+    uint64_t asid = 0;
+    uint32_t run = 0;
+};
+static thread_local MarkerExecRun tls_marker_run;
+static thread_local MarkerExecRun tls_marker_end_run;
+
+/* udata for the per-insn marker exec cb: the insn's vaddr and size packed
+ * into a pointer-sized word (size in the low byte; marker insns are
+ * 4/5/8-byte encodings, and vaddrs on every target fit 56 bits). */
+static inline void *marker_udata_pack(uint64_t pc, uint8_t size)
+{
+    return (void *)(uintptr_t)((pc << 8) | size);
+}
+
+static inline void marker_udata_unpack(void *udata, uint64_t *pc,
+                                       uint8_t *size)
+{
+    uintptr_t v = (uintptr_t)udata;
+    *size = (uint8_t)(v & 0xff);
+    *pc = (uint64_t)(v >> 8);
+}
+
+/* Advance an execution-time run with this marker-word execution; returns
+ * true when the run reaches full sequence length. */
+static inline bool marker_exec_step(MarkerExecRun *r, uint64_t pc,
+                                    uint8_t size)
+{
+    if (qemu_plugin_get_priv_level() != 0) {
+        return false;                       /* user-space stream only */
+    }
+    uint64_t asid = qemu_plugin_get_addr_space_id();
+    if (r->run > 0 && pc == r->next_pc && asid == r->asid) {
+        r->run++;
+    } else {
+        r->run = 1;
+        r->asid = asid;
+    }
+    r->next_pc = pc + size;
+    if (r->run >= g_marker_seq.n_insns) {
+        r->run = 0;
+        return true;
+    }
+    return false;
 }
 
 static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
 {
-    (void)udata;
     if (g_wp_state.in_progress) {
         return;
+    }
+    uint64_t pc;
+    uint8_t size;
+    marker_udata_unpack(udata, &pc, &size);
+    if (!marker_exec_step(&tls_marker_run, pc, size)) {
+        return;                              /* run not complete yet */
     }
     bool expected = false;
     if (!g_marker_fired.compare_exchange_strong(expected, true)) {
@@ -2603,9 +2667,14 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
  */
 static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
 {
-    (void)udata;
     (void)cpu_index;
     if (g_wp_state.in_progress) {
+        return;
+    }
+    uint64_t pc;
+    uint8_t size;
+    marker_udata_unpack(udata, &pc, &size);
+    if (!marker_exec_step(&tls_marker_end_run, pc, size)) {
         return;
     }
     uint64_t pinned = g_pinned_asid.load(std::memory_order_relaxed);
@@ -2815,8 +2884,6 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
     uint32_t *canonical_index          = scratch.canonical_index.get();
     bool *canonical_first              = scratch.canonical_first.get();
     uint32_t canonical_n_insns = 0;
-    uint32_t marker_run = 0;      /* consecutive START-marker movs (WIN_MARKER) */
-    uint32_t marker_end_run = 0;  /* consecutive END-marker movs (WIN_MARKER) */
 
     for (size_t i = 0; i < raw_n_insns; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
@@ -2835,20 +2902,19 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
          * sequence ran before it.  Registered at every translation so the
          * marker is caught wherever the process runs. */
         if (g_window_mode == PluginConfig::WIN_MARKER && g_marker_seq.valid) {
-            marker_run = marker_run_step(g_marker_seq.start, marker_run,
-                                         raw_bytes, raw_size);
-            if (marker_run >= g_marker_seq.n_insns) {
+            /* Arm the exec callback on every insn whose bytes belong to a
+             * marker sequence; the callback judges consecutivity in the
+             * user-space stream by PC adjacency, so detection is
+             * independent of TB slicing (see marker_exec_step). */
+            if (marker_word_match(g_marker_seq.start, raw_bytes, raw_size)) {
                 qemu_plugin_register_vcpu_insn_exec_cb(
-                    insn, vcpu_marker_cb, QEMU_PLUGIN_CB_NO_REGS, nullptr);
-                marker_run = 0;
+                    insn, vcpu_marker_cb, QEMU_PLUGIN_CB_NO_REGS,
+                    marker_udata_pack(raw_pc, raw_size));
             }
-            marker_end_run = marker_run_step(g_marker_seq.end, marker_end_run,
-                                             raw_bytes, raw_size);
-            if (marker_end_run >= g_marker_seq.n_insns) {
+            if (marker_word_match(g_marker_seq.end, raw_bytes, raw_size)) {
                 qemu_plugin_register_vcpu_insn_exec_cb(
                     insn, vcpu_marker_end_cb, QEMU_PLUGIN_CB_NO_REGS,
-                    nullptr);
-                marker_end_run = 0;
+                    marker_udata_pack(raw_pc, raw_size));
             }
         }
 

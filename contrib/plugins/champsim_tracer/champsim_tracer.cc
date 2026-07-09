@@ -242,6 +242,36 @@ static inline void user_count_reset(uint64_t insn_count_now)
     g_user_icount_seen = insn_count_now;
 }
 
+/*
+ * Coarse fast-forward (pinned-simpoint positioning).  The exact
+ * positioning path — is_active=1 so vcpu_tb_exec dispatches per TB —
+ * costs a register-synced callback plus two state-hook calls per TB,
+ * which caps fast-forward well below plain emulation speed.  Over the
+ * hundreds of billions of instructions between the pin and a simpoint,
+ * that dominates wall time.
+ *
+ * While g_ff_coarse is set, the per-vCPU budget slot is repurposed as a
+ * countdown of USER-MODE instructions: the JIT-inlined decrement and its
+ * crossing detector are registered only on TBs translated at priv==0
+ * (privilege is part of the TB context key, so a TB translated in user
+ * context only ever executes in user context), and is_active stays 0 so
+ * no callback dispatches at all.  The countdown target is set
+ * FF_COARSE_MARGIN short of the simpoint's effective start;
+ * vcpu_tb_check_budget hands the final stretch to the exact path.
+ *
+ * Exactness: the countdown cannot distinguish the pinned process's user
+ * instructions from another process's, so any other user-mode activity
+ * decrements it too — the crossing can only fire EARLY, never past the
+ * target, and the exact stretch (which checks the live ASID) simply
+ * lengthens.  The fold of the countdown into g_user_icount at handoff is
+ * therefore an upper bound; on a dedicated single-workload guest the
+ * error is ~zero.  Multi-vCPU guests skip the coarse leg entirely: the
+ * budget slots are per-vCPU but the user clock is global.
+ */
+static std::atomic<bool> g_ff_coarse{false};
+static uint64_t g_ff_coarse_target = 0;   /* user insns from pin to handoff */
+static constexpr uint64_t FF_COARSE_MARGIN = 200000000;   /* 200M-insn exact tail */
+
 /* Emit-time fault-depth trailer register (system mode): the exception-
  * nesting depth the deferred prev TB ran at, stamped by the PathBuilder
  * seal phase (which carries the depth pipeline) and read by
@@ -383,9 +413,18 @@ static void recompute_next_threshold(void)
         }
         return;
     }
-    /* Symbol / marker / pinned-simpoint open on an executed instruction
-     * (symbol name, or the marker that then arms the user-clock), not on
-     * an icount threshold; every TB must take the slow path. */
+    if (pinned_simpoint_mode()) {
+        /* Pinned-simpoint positioning needs no icount threshold at all:
+         * the marker insn callback pins, the coarse countdown (armed at
+         * pin) fires the handoff, and the exact fast-path opens the
+         * window on the user clock.  Park the budget at the sentinel so
+         * vcpu_tb_check_budget never dispatches during boot or FF. */
+        g_next_threshold.store(UINT64_MAX, std::memory_order_relaxed);
+        return;
+    }
+    /* Symbol / marker open on an executed instruction (symbol name, or
+     * the marker that arms the window), not on an icount threshold;
+     * every TB must take the slow path. */
     g_next_threshold.store(0, std::memory_order_relaxed);
 }
 
@@ -1814,6 +1853,32 @@ static void vcpu_tb_check_budget(unsigned int cpu_index, void *udata)
     }
     uint64_t icount_now = qemu_plugin_u64_get(
         g_scoreboard.insn_count, cpu_index);
+    if (g_ff_coarse.load(std::memory_order_relaxed)) {
+        /* Coarse fast-forward handoff: the user-insn countdown armed at
+         * pin time crossed zero, FF_COARSE_MARGIN short of the simpoint's
+         * effective start.  Fold the countdown into the user clock (an
+         * upper bound — see g_ff_coarse; overcount lands early, never
+         * late) and switch the final stretch to the exact per-TB path,
+         * which counts against the live ASID and opens the window on the
+         * precise threshold.  The flush retires coarse-instrumented TBs
+         * so later translations regain the unconditional budget
+         * decrement for post-window inter-segment logic. */
+        g_ff_coarse.store(false, std::memory_order_relaxed);
+        g_user_icount = g_ff_coarse_target;
+        g_user_icount_seen = icount_now;
+        for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
+            qemu_plugin_u64_set(g_scoreboard.is_active, (unsigned)i, 1);
+            qemu_plugin_u64_set(g_scoreboard.budget, (unsigned)i,
+                                (uint64_t)BUDGET_INACTIVE_SENTINEL);
+        }
+        qemu_plugin_request_tb_flush();
+        fprintf(stderr, "champsim_tracer: coarse fast-forward handoff at "
+                "user clock %" PRIu64 " (raw icount %" PRIu64 ") — exact "
+                "positioning for the final %" PRIu64 " insns\n",
+                g_user_icount, icount_now, FF_COARSE_MARGIN);
+        g_rec_mutex_unlock(&exec_lock);
+        return;
+    }
     g_host_icount = icount_now;
     /* tw_manage_window handles both icount-mode and simpoint-mode
      * open/close logic.  Passing icount_now (post-inline-add value)
@@ -2735,18 +2800,44 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
 
     if (pinned_simpoint_mode()) {
         /* Pin only: zero the user clock at the target's first instruction
-         * and turn on the per-TB callback so the clock advances (the
-         * budget slot parks at the sentinel; the capture callbacks all
-         * bail while no segment is active).  tw_manage_window opens the
-         * window when the clock reaches the simpoint's effective start. */
+         * and start positioning toward the simpoint's effective start. */
         uint64_t lo = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
         user_count_reset(lo);
+        const SimPointEntry *sp = g_simpoints.current();
+        uint64_t eff_start = (sp && sp->start_insn > warmup_insns)
+            ? sp->start_insn - warmup_insns : 0;
+        if (qemu_plugin_num_vcpus() == 1 &&
+            eff_start > 2 * FF_COARSE_MARGIN) {
+            /* Distant simpoint: coarse leg first (see g_ff_coarse).
+             * is_active stays 0 — nothing dispatches per TB; the
+             * user-mode-only budget countdown fires the handoff
+             * FF_COARSE_MARGIN short of the target.  Flush so TBs
+             * translated before the pin — whose budget decrements are
+             * unconditional, kernel included — are retired before the
+             * countdown accumulates. */
+            g_ff_coarse_target = eff_start - FF_COARSE_MARGIN;
+            g_ff_coarse.store(true, std::memory_order_relaxed);
+            qemu_plugin_u64_set(g_scoreboard.budget, cpu_index,
+                                g_ff_coarse_target);
+            qemu_plugin_request_tb_flush();
+            fprintf(stderr, "champsim_tracer: marker pinned asid 0x%" PRIx64
+                    " at icount %" PRIu64 " — coarse fast-forward %" PRIu64
+                    " user insns toward simpoint start %" PRIu64
+                    " (warmup %" PRIu64 ")\n",
+                    asid, lo, g_ff_coarse_target,
+                    sp ? sp->start_insn : 0, warmup_insns);
+            return;
+        }
+        /* Near simpoint (or SMP guest): exact path from the pin — turn
+         * on the per-TB callback so the clock advances (the budget slot
+         * parks at the sentinel; the capture callbacks all bail while no
+         * segment is active).  The vcpu_tb_exec fast-path opens the
+         * window when the clock reaches the effective start. */
         for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
             qemu_plugin_u64_set(g_scoreboard.is_active, (unsigned)i, 1);
             qemu_plugin_u64_set(g_scoreboard.budget, (unsigned)i,
                                 (uint64_t)BUDGET_INACTIVE_SENTINEL);
         }
-        const SimPointEntry *sp = g_simpoints.current();
         fprintf(stderr, "champsim_tracer: marker pinned asid 0x%" PRIx64
                 " at icount %" PRIu64 " — positioning to simpoint start %"
                 PRIu64 " user insns (warmup %" PRIu64 ")\n",
@@ -3079,11 +3170,20 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
          * set_label between the qemu_ld/qemu_st pair breaks the
          * containing EBB and the post-memop ops read dead temps.
          * Aborts with "tcg.c:temp_load: code should not be reached".
-         * Keep the per-memop overhead in C and bail fast there. */
-        qemu_plugin_register_vcpu_mem_cb(
-            insn, vcpu_mem_cb, QEMU_PLUGIN_CB_NO_REGS,
-            QEMU_PLUGIN_MEM_RW,
-            (void *)(uintptr_t)raw_pc);
+         * Keep the per-memop overhead in C and bail fast there.
+         *
+         * Coarse fast-forward is the exception: a C call per guest
+         * memory access is the dominant positioning cost, and nothing
+         * consumes memops until a window opens.  TBs translated during
+         * the coarse phase skip the callback entirely; the pin-time
+         * and handoff-time flushes guarantee none of them survives
+         * into a phase that records (see g_ff_coarse). */
+        if (!g_ff_coarse.load(std::memory_order_relaxed)) {
+            qemu_plugin_register_vcpu_mem_cb(
+                insn, vcpu_mem_cb, QEMU_PLUGIN_CB_NO_REGS,
+                QEMU_PLUGIN_MEM_RW,
+                (void *)(uintptr_t)raw_pc);
+        }
     }
     return canonical_n_insns;
 }
@@ -3316,10 +3416,21 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     /* Mirror the bump into the budget slot but negated — it counts
      * DOWN by n_insns per TB exec.  When budget < 1 the cond_cb
      * below fires once, handles the threshold crossing, and resets
-     * budget.  Same inline pattern; no C call on the hot path. */
-    qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
-        tb, QEMU_PLUGIN_INLINE_ADD_U64,
-        g_scoreboard.budget, (uint64_t)(int64_t)(-(int64_t)raw_n_insns));
+     * budget.  Same inline pattern; no C call on the hot path.
+     *
+     * During coarse fast-forward the budget slot is a USER-insn
+     * countdown: kernel-context translations skip both the decrement
+     * and the crossing detector (see g_ff_coarse).  The pin-time and
+     * handoff-time flushes bound each phase's TBs to its own
+     * registration shape. */
+    bool ff_coarse_kernel_tb =
+        g_ff_coarse.load(std::memory_order_relaxed) &&
+        qemu_plugin_get_priv_level() != 0;
+    if (!ff_coarse_kernel_tb) {
+        qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
+            tb, QEMU_PLUGIN_INLINE_ADD_U64,
+            g_scoreboard.budget, (uint64_t)(int64_t)(-(int64_t)raw_n_insns));
+    }
 
     /* Threshold-crossing detector: fires once when the budget slot
      * crosses zero (i.e. icount reached the next eff_start).  The
@@ -3341,10 +3452,12 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * deficit.  Symmetric at close: budget cb only sets
      * g_simpoint_close_pending and never clears is_active here, so
      * vcpu_tb_exec still fires and emits the closing TB's entry. */
-    qemu_plugin_register_vcpu_tb_exec_cond_cb(
-        tb, vcpu_tb_check_budget, QEMU_PLUGIN_CB_NO_REGS,
-        QEMU_PLUGIN_COND_GE, g_scoreboard.budget, (1ULL << 63),
-        nullptr);
+    if (!ff_coarse_kernel_tb) {
+        qemu_plugin_register_vcpu_tb_exec_cond_cb(
+            tb, vcpu_tb_check_budget, QEMU_PLUGIN_CB_NO_REGS,
+            QEMU_PLUGIN_COND_GE, g_scoreboard.budget, (1ULL << 63),
+            nullptr);
+    }
     /* Heavy callback: chain assembler, WP simulator, body-entry
      * emission.  Gated via cond_cb on is_active so it is NOT
      * dispatched at all during inter-segment — the JIT emits a

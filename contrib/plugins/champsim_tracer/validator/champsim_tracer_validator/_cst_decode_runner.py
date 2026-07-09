@@ -631,6 +631,14 @@ def _iter_body(lines: list[str], i: int,
              wp["metaflags"], wp["lane_masks"], _) = _parse_observations(
                 obs_lines, j, reg_name_to_id)
             wp_entries.append(wp)
+        # Chain-level TRANSLATION_UNAVAIL event (format spec §4.4): the
+        # excursion was kicked but its first target could not be
+        # fetched, so the entry has no wp[k] blocks and the decoder
+        # prints this line instead.
+        wp_first_fetch_unavailable = False
+        if i < len(lines) and lines[i] == "  wp: none (first fetch unavailable)":
+            wp_first_fetch_unavailable = True
+            i += 1
         yield {
             "seq_num": seq_num,
             "template_id": template_id,
@@ -643,6 +651,7 @@ def _iter_body(lines: list[str], i: int,
             "metaflags": cp_mflags,
             "lane_masks": cp_lanes,
             "wp_entries": wp_entries,
+            "wp_first_fetch_unavailable": wp_first_fetch_unavailable,
         }
 
 

@@ -570,6 +570,11 @@ void dump_wp_sections(FILE *out, const Header &h, Reader &b, int depth)
             uint64_t fi = b.uleb();
             extra = "  fault_insn_index=" + std::to_string(fi);
         }
+        /* Resolved index past the chain = chain-level event (§4.4):
+         * describes the excursion's unrealized first target. */
+        if (wp_index >= 0 && (uint64_t)wp_index >= num_wp) {
+            extra += "  (chain-level: first fetch unavailable)";
+        }
         emitf(out, b, off, depth + 1,
               "event[%" PRIu64 "] pos_gap=%" PRIu64 " ->wp_index=%d"
               "  ev_flags=0x%02x (%s)%s",

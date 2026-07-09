@@ -2149,6 +2149,12 @@ void emit_legacy_entry(FILE *out, const cst::Header &h,
         emit_legacy_observations(out, "    ", h, wp.dyn_params, wp.reg_snaps,
                                  wp.metaflags, wp.lane_masks);
     }
+    /* Chain-level TRANSLATION_UNAVAIL event (§4.4): the excursion was
+     * kicked but its first target could not be fetched, so no wp[k]
+     * blocks exist to carry a status line. */
+    if (e.wp_first_fetch_unavailable) {
+        std::fprintf(out, "  wp: none (first fetch unavailable)\n");
+    }
     std::fprintf(out, "\n");
 }
 

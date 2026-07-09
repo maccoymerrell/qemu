@@ -281,6 +281,11 @@ struct DecodedEntry {
     std::vector<MetaFlagsEntry> metaflags;
     std::vector<LaneMaskEntry>  lane_masks;
     std::vector<WPEntry>        wp_entries;
+    /* Chain-level TRANSLATION_UNAVAIL event (wp_events index >= num_wp,
+     * §4.4): the wrong-path excursion was kicked but its first target
+     * could not be fetched/translated, so wp_entries is empty and the
+     * event applies to the chain as a whole. */
+    bool                        wp_first_fetch_unavailable = false;
     /* Exception-nesting depth (CST_FLAG_FAULT traces): 0 = normal code,
      * >=1 = synchronous-fault handler code at that nesting level. */
     uint32_t                    fault_depth = 0;

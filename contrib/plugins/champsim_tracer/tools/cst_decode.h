@@ -262,9 +262,13 @@ private:
                                          const FieldStateTable *base_state);
     /* Read one WP events sub-section, attaching fault /
      * translation_unavailable flags to entries in @wp_entries by
-     * index.  Throws when an event index is past the chain length. */
+     * index.  An event whose resolved index is past the chain length
+     * is chain-level (§4.4): it carries no per-block flags and instead
+     * sets *@chain_unavail when it bears the TRANSLATION_UNAVAIL bit
+     * (the excursion's first target was never realized). */
     void decode_wp_events(Reader &evb,
-                          std::vector<WPEntry> *wp_entries);
+                          std::vector<WPEntry> *wp_entries,
+                          bool *chain_unavail);
 
     /* Field-delta record decoder.  Splits into two passes: pass 1
      * applies record deltas to the per-template state block and

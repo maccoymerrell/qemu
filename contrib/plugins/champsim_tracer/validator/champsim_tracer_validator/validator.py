@@ -124,6 +124,17 @@ class Report:
             lines.append("  first warnings:")
             for i in warnings[:15]:
                 lines.append(f"    ~ {i.check}: {i.message}")
+        # Info issues flagged notable (detail["notable"]) carry an
+        # auditable per-instance message — e.g. a WP acceptance made on
+        # a chain-level event alone — and print in full; ordinary
+        # per-check summary infos stay as counts above.
+        notable = [i for i in self.issues if i.severity == "info"
+                   and (i.detail or {}).get("notable")]
+        if notable:
+            lines.append("")
+            lines.append("  notable info:")
+            for i in notable[:15]:
+                lines.append(f"    * {i.check}: {i.message}")
         return "\n".join(lines)
 
 
@@ -3163,6 +3174,13 @@ def _check_wrong_path_chains(entries: list[dict],
     count. The active generator model represents loops as explicit CFG
     cycles, so repeated iterations appear as repeated block visits
     rather than as in-block backedges.
+
+    An empty actual chain carrying the chain-level TRANSLATION_UNAVAIL
+    event (format spec §4.4 — first wrong-path fetch could not
+    complete) is accepted when a later CP instance of the same static
+    branch realizes an exact-or-longer chain vs its own prediction;
+    with no later instance it is accepted on the event alone and
+    surfaced as a notable INFO issue naming the branch and target.
     """
     issues: list[Issue] = []
     cp_pos = -1
@@ -3201,6 +3219,11 @@ def _check_wrong_path_chains(entries: list[dict],
             leak = this_leak
         return out
 
+    # Pass 1: resolve every predicted-fork CP position to a record the
+    # verdict pass can evaluate.  Deferring the verdicts lets the
+    # chain-level-event acceptance below look AHEAD for a later CP
+    # instance of the same static branch.
+    records: list[dict] = []
     for e in entries:
         runs = template_runs.get(e["template_id"], [])
         if not runs:
@@ -3257,6 +3280,45 @@ def _check_wrong_path_chains(entries: list[dict],
             if actual_wp[j] != exp_chain[j]:
                 first_fail = j
                 break
+        records.append({
+            "cp_pos": cp_pos,
+            "bid": last_cp_bid,
+            "exp_chain": exp_chain,
+            "actual_wp": actual_wp,
+            "actual_sim_insns": actual_sim_insns,
+            "wp_left_user": wp_left_user,
+            "left_user_at": left_user_at,
+            "first_fail": first_fail,
+            # Chain-level TRANSLATION_UNAVAIL event (format spec §4.4):
+            # the excursion was kicked but its first fetch could not
+            # complete, so the chain is empty and says so explicitly.
+            "chain_event": bool(e.get("wp_first_fetch_unavailable")),
+        })
+
+    def _realizes_exact_or_longer(r: dict) -> bool:
+        """True when @r emitted a non-empty chain satisfying the
+        exact-or-longer invariant under the same terminators the
+        verdicts below accept: full predicted length, provable budget
+        exhaustion, or a user-CFG crossing at/after the full prefix."""
+        if not r["actual_wp"] or r["first_fail"] >= 0:
+            return False
+        if len(r["actual_wp"]) >= len(r["exp_chain"]):
+            return True
+        if r["actual_sim_insns"] >= wp_insn_budget:
+            return True
+        return bool(r["wp_left_user"] and r["left_user_at"] is not None
+                    and r["left_user_at"] >= len(r["exp_chain"]))
+
+    # Pass 2: verdicts.
+    for ri, rec in enumerate(records):
+        cp_pos = rec["cp_pos"]
+        last_cp_bid = rec["bid"]
+        exp_chain = rec["exp_chain"]
+        actual_wp = rec["actual_wp"]
+        actual_sim_insns = rec["actual_sim_insns"]
+        wp_left_user = rec["wp_left_user"]
+        left_user_at = rec["left_user_at"]
+        first_fail = rec["first_fail"]
         if first_fail == 0 and actual_wp and last_cp_bid is not None:
             # Common plugin bug: for a conditional branch where CP
             # falls through (branch-not-taken), the plugin's wrong
@@ -3314,6 +3376,40 @@ def _check_wrong_path_chains(entries: list[dict],
             if wp_left_user and left_user_at is not None \
                     and left_user_at >= len(exp_chain):
                 continue
+            # Chain-level TRANSLATION_UNAVAIL event (format spec §4.4):
+            # the plugin kicked the excursion but the first fetch could
+            # not complete — on a software-managed-TLB ISA the refill
+            # exception cannot be taken speculatively, so real hardware
+            # also fetches nothing and the explicit 0-block chain is
+            # architecturally faithful.  Accept it when a later CP
+            # instance of the SAME static branch realizes an exact-or-
+            # longer chain vs its own prediction (proving the target is
+            # real code the plugin speculates into once its translation
+            # is available).  With no later instance there is nothing to
+            # corroborate against — and a cold TLB says nothing about
+            # execution order (long-ago-executed code can be evicted) —
+            # so accept on the event alone, audibly via a notable INFO.
+            if not actual_wp and rec["chain_event"]:
+                later = [r for r in records[ri + 1:]
+                         if r["bid"] == last_cp_bid]
+                if any(_realizes_exact_or_longer(r) for r in later):
+                    continue
+                if not later:
+                    issues.append(Issue(
+                        "wrong_path_chains", "info",
+                        f"WP at CP pos {cp_pos} (blk_{last_cp_bid}) empty "
+                        f"with chain-level TRANSLATION_UNAVAIL event; no "
+                        f"later instance of blk_{last_cp_bid} in the trace "
+                        f"corroborates target blk_{exp_chain[0]} — accepted "
+                        f"on the event alone",
+                        {"notable": True, "cp_pos": cp_pos,
+                         "branch": last_cp_bid, "target": exp_chain[0]},
+                    ))
+                    continue
+                # Later instances of this branch exist but none realized
+                # the chain: the event does not excuse a target the
+                # plugin never manages to speculate into.  Fall through
+                # to the wpprune / truncation verdicts.
             # wpprune: the tracer intentionally drops the wrong path WHOLE
             # for cold branches (never-taken / one-directional / monomorphic
             # indirect).  Pruning removes the entire path, so accept ONLY an
@@ -3325,12 +3421,15 @@ def _check_wrong_path_chains(entries: list[dict],
             # user CFG at/after the full prefix nor was wholly pruned is a
             # real plugin truncation: the synthetic wrong path is exact-known
             # and the actual chain must match it exactly or run longer.
+            ev_note = ("; chain-level TRANSLATION_UNAVAIL event present but "
+                       "no later instance realized the chain"
+                       if rec["chain_event"] else "")
             issues.append(Issue(
                 "wrong_path_chains", "error",
                 f"WP at CP pos {cp_pos} (blk_{last_cp_bid}) truncated: "
                 f"plugin emitted {len(actual_wp)} blocks "
                 f"(sim_insns={actual_sim_insns}, budget={wp_insn_budget}); "
-                f"predicted {len(exp_chain)}",
+                f"predicted {len(exp_chain)}{ev_note}",
             ))
     return issues
 

@@ -1043,8 +1043,11 @@ the start of the chain and discarded at the end of the entry.
 
 ### 4.4 Wrong-Path Events Section
 
-Events identify wrong-path blocks that faulted or could not be
-translated.
+Events annotate the entry's wrong-path chain: an event whose resolved
+index addresses a chain position identifies a wrong-path block that
+faulted or could not be translated; an event whose resolved index lies
+past the chain is chain-level and describes the unrealized first
+target of the wrong path itself (see below).
 
 ```
 wp_events_section payload:
@@ -1060,6 +1063,23 @@ wp_events_section payload:
 
 `prev_index` starts at -1. `fault_insn_index` is the 0-based index of
 the faulting instruction within that wrong-path block.
+
+The event index space extends one convention beyond the chain: a
+resolved index `>= num_wp` does not address any encoded wrong-path
+block — it is a **chain-level** event describing the excursion's first
+target, which was never realized as a block.  The writer emits exactly
+one form of chain-level event: on an entry whose wrong-path chain is
+empty (`num_wp == 0`) because the excursion was kicked but its first
+fetch could not complete — the target's translation is unavailable at
+that point in execution (for example a software-managed-TLB ISA where
+the refill exception cannot be taken speculatively, so real hardware
+would also fetch nothing) — the section carries `num_events = 1`,
+`pos_gap = 0`, `ev_flags = CST_WP_EVENT_TRANSLATION_UNAVAIL`.  This
+makes the architecturally faithful 0-block chain explicit rather than
+indistinguishable from an entry whose wrong path was never simulated.
+Readers MUST accept a resolved index `>= num_wp`, apply the event to
+the chain as a whole rather than to a block, and still consume
+`fault_insn_index` when the FAULT bit is set.
 
 ### 4.5 BODY_TAG_IFRAME
 

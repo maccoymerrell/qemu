@@ -280,6 +280,11 @@ void validate_iframe(const DecodedEntry &prev, const DecodedEntry &iframe)
              std::to_string(prev.wp_entries.size()) +
              " IFRAME=" + std::to_string(iframe.wp_entries.size()));
     }
+    if (prev.wp_first_fetch_unavailable != iframe.wp_first_fetch_unavailable) {
+        fail("chain-level wp event mismatch: ENTRY=" +
+             std::to_string(prev.wp_first_fetch_unavailable) +
+             " IFRAME=" + std::to_string(iframe.wp_first_fetch_unavailable));
+    }
     for (size_t w = 0; w < prev.wp_entries.size(); w++) {
         const WPEntry &pe = prev.wp_entries[w];
         const WPEntry &ie = iframe.wp_entries[w];
@@ -473,7 +478,8 @@ std::vector<WPEntry> BodyWalker::decode_wp_chain(
 }
 
 void BodyWalker::decode_wp_events(Reader &evb,
-                                  std::vector<WPEntry> *wp_entries)
+                                  std::vector<WPEntry> *wp_entries,
+                                  bool *chain_unavail)
 {
     const ResolvedIds &ids = header_.ids;
     uint64_t num_events = evb.uleb();
@@ -481,13 +487,28 @@ void BodyWalker::decode_wp_events(Reader &evb,
     for (uint64_t k = 0; k < num_events; k++) {
         uint64_t gap = evb.uleb();
         int64_t idx = prev_idx + 1 + (int64_t)gap;
-        if (idx < 0 || (size_t)idx >= wp_entries->size()) {
+        if (idx < 0) {
             throw std::runtime_error("wp event index out of range");
         }
         uint8_t evf = evb.u8();
+        bool is_fault = (evf & ids.wp_event_fault) != 0;
+        if ((size_t)idx >= wp_entries->size()) {
+            /* Chain-level event (§4.4): the resolved index lies past
+             * the encoded chain, so it describes the excursion's
+             * unrealized first target rather than any block.  The
+             * FAULT payload, if present, is consumed for wire
+             * consistency but carries no per-block anchor. */
+            if ((evf & ids.wp_event_translation_unavail) && chain_unavail) {
+                *chain_unavail = true;
+            }
+            if (is_fault) {
+                (void)evb.uleb();
+            }
+            prev_idx = idx;
+            continue;
+        }
         WPEntry &we = (*wp_entries)[idx];
         we.translation_unavailable = (evf & ids.wp_event_translation_unavail) != 0;
-        bool is_fault = (evf & ids.wp_event_fault) != 0;
         we.fault = is_fault;
         if (is_fault) {
             we.fault_insn_index = (uint32_t)evb.uleb();
@@ -547,7 +568,8 @@ void BodyWalker::handle_entry(WalkState &ws, const Callback &cb)
         { SectionScope s(body_); Reader &wpb = s;
           entry.wp_entries = decode_wp_chain(wpb, wp_state, &cp_state); }
         { SectionScope s(body_); Reader &evb = s;
-          decode_wp_events(evb, &entry.wp_entries); }
+          decode_wp_events(evb, &entry.wp_entries,
+                           &entry.wp_first_fetch_unavailable); }
     }
 
     entry.thread_id       = ws.current_thread;
@@ -622,7 +644,8 @@ void BodyWalker::handle_iframe(WalkState &ws)
           iframe_entry.wp_entries = decode_wp_chain(wpb, iframe_wp,
                                                     &iframe_cp); }
         { SectionScope s(body_); Reader &evb = s;
-          decode_wp_events(evb, &iframe_entry.wp_entries); }
+          decode_wp_events(evb, &iframe_entry.wp_entries,
+                           &iframe_entry.wp_first_fetch_unavailable); }
     }
 
     validate_iframe(*ws.prev_entry, iframe_entry);

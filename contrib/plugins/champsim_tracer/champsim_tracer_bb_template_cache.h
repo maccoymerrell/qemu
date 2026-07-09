@@ -8,12 +8,13 @@
  *
  * Owns two distinct stores of BBTemplate records:
  *   - tb_templates_: per-translation TB templates, pure ownership (no
- *     start_pc lookup).  Each QEMU translation creates a fresh entry
- *     and the template pointer is handed to that QEMU TB as its
+ *     start_pc lookup).  Each QEMU translation creates (or dedup-reuses)
+ *     an entry and the template pointer is handed to that QEMU TB as its
  *     per-TB exec-cb udata.  vcpu_tb_exec reads it back directly on
  *     both CP and WP paths, so distinct CP-mode and WP-mode QEMU
- *     translations of the same start_pc cannot conflate.  Cleared
- *     together on tb_flush, when QEMU drops the TBs themselves.
+ *     translations of the same start_pc cannot conflate.  Lifetime is
+ *     class-split (TmplLife): CODE templates persist for the run;
+ *     SPEC templates are reclaimed at tb_flush.
  *   - bb_map_: true-BB templates keyed by BB start_pc, assembled from
  *     TB fragments; what the trace's templates section serializes.
  *

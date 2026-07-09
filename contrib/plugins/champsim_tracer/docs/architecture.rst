@@ -14,6 +14,16 @@ Architecture
    single: speculative store buffer
    single: vcpu_tb_exec
    single: vcpu_tb_trans
+   single: PathBuilder
+   single: path-event queue
+   single: TemplateStore
+   single: TmplLife
+   single: SegRef
+   single: marker window
+   single: ASID pin
+   single: fault excursion
+   single: async-interrupt exclusion
+   single: vclock
 
 This page describes how ChampSim Tracer is organized, the two main flow
 loops (CP and WP), and the caveats every prospective modifier needs
@@ -360,10 +370,13 @@ summary) is the number of architectural basic blocks the trace
 describes.  Per-segment resets clear ``bb_map_`` only;
 ``tb_templates_`` survives across segment boundaries because each
 QEMU TB carries its fragment list via the per-TB exec-cb ``udata``
-for the QEMU TB's lifetime.  ``tb_templates_`` is dropped wholesale
-by the ``vcpu_tb_flush`` callback, when QEMU has just invalidated
-all of its own TBs (and therefore the udata pointing at our list
-entries).
+for the QEMU TB's lifetime.  Fragment templates carry a lifetime
+class: templates the correct path executes (``CODE``) persist for the
+whole run — a QEMU ``tb_flush`` merely re-translates the same code,
+and the dedup index hands the re-translation its existing chain —
+while templates only wrong-path speculation ever minted (``SPEC``)
+are reclaimed at the flush.  See :ref:`template-lifetimes` for the
+full lifetime model.
 
 Subsystem map
 -------------
@@ -381,8 +394,20 @@ order they're touched on a hot path:
    * - ``champsim_tracer.cc``
      - Plugin entry point.  Owns ``qemu_plugin_install``, the
        ``vcpu_tb_trans`` / ``vcpu_tb_exec`` / ``vcpu_tb_flush``
-       callbacks, segment lifecycle, and the exit-time statistics
-       printer.
+       callbacks, segment lifecycle, the marker / address-space-pin
+       machinery, and the exit-time statistics printer.
+   * - ``champsim_tracer_path_builder.{h,cc}``
+     - The per-vCPU-thread CP step state machine.  Consumes the
+       ordered per-vCPU path-event queue and owns everything
+       path-shaped: the async-exclusion mute window, the foreign-ASID
+       boundary, the pending-seal slot (the deferred previous TB),
+       the fault-excursion context frames, and the seal / merge /
+       emit decision.  See :ref:`path-builder`.
+   * - ``champsim_tracer_wp_thread_state.{h,cc}``
+     - Per-thread wrong-path session state (``g_wp_state``: the
+       in-progress flag, the ``last_executed_tb`` handshake, saved
+       scoreboard cursors, the WP memop buffer) and the per-thread
+       capture-mute latch ``g_capture_mute``.
    * - ``champsim_tracer_plugin_config.{h,cc}``
      - Parses ``key=value`` plugin args into a ``PluginConfig`` POD.
        New flags get an entry in the setter table here.
@@ -418,13 +443,15 @@ order they're touched on a hot path:
        ``GenericRegId``.  Everything in the plugin and the decoder
        agrees on these IDs.
    * - ``champsim_tracer_bb_template_cache.{h,cc}``
-     - Owns ``tb_templates_`` (a vector of per-fragment templates,
-       one entry per fragment produced by the splitter; cleared
-       wholesale on ``vcpu_tb_flush``) and ``bb_map_`` (an
+     - The ``TemplateStore`` (the file keeps its historical name so
+       build entries stay stable).  Owns ``tb_templates_`` (the
+       per-translation fragment templates, one entry per fragment
+       produced by the splitter, with ``SPEC`` / ``CODE`` lifetime
+       classes and per-class dedup indexes) and ``bb_map_`` (an
        ``unordered_map`` keyed by branch-target start_pc holding the
        *true* basic-block templates assembled from contiguous
-       fragments).  Per :doc:`reference`, ``bb_map_`` is the
-       templates section of the trace.
+       fragments; segment-scoped).  ``bb_map_`` is the templates
+       section of the trace.  See :ref:`template-lifetimes`.
    * - ``champsim_tracer_bb_chain_assembler.{h,cc}``
      - Walks a chain of TB fragments and finalizes them into a true BB
        at the next branch.  See :ref:`cp-flow`.
@@ -464,63 +491,313 @@ order they're touched on a hot path:
        ``g_stats`` and (when ``histogram=N``) per-interval buckets.
 
 A handful of synchronization primitives sit at the top of
-``champsim_tracer.cc``: ``data_lock`` guards the BB caches and chain
-assembler; ``exec_lock`` serializes the per-vCPU execution callback so
-the WP simulator can run synchronously inside it.
+``champsim_tracer.cc``: ``data_lock`` (a ``GMutex``) guards the
+template stores and chain assembler; ``exec_lock`` (a ``GRecMutex``)
+serializes the per-vCPU execution callback so the WP simulator can
+run synchronously inside it.  See `Synchronization summary`_ for why
+``exec_lock`` is recursive.
 
 .. _cp-flow:
 
 Correct-path flow
 -----------------
 
-Per TB executed on the correct path, ``vcpu_tb_exec`` runs:
+``vcpu_tb_exec`` fires once per executed TB.  It is registered as a
+conditional callback on the scoreboard's ``is_active`` slot, so the
+JIT skips the dispatch entirely between segments; its ``udata`` is
+the head fragment of the TB's per-translation fragment list.  The
+callback has two layers: a short shared prologue, then the
+PathBuilder step.
 
-1.  Bump ``insn_count`` by ``n_insns`` of the TB's head fragment.
-2.  Window check.  If we're outside an open segment but the icount has
-    crossed the next configured window, open a new segment via
-    ``start_trace_segment``.  If we're past the segment's stop, close
-    it and (for SimPoint mode) advance to the next window.
-3.  Read the previous TB's last-executed fragment's start PC, fall-
-    through PC, and the current PC from the per-vCPU scoreboard.
-    Those fields are populated by inline stores
-    ``vcpu_tb_trans`` registered on the *first raw instruction of
-    each fragment*, encoding that fragment's parameters.  A
-    fragment that never executes (e.g. its predecessor's mid-TB
-    branch took, diverting control past this fragment) never fires
-    its store; the last fragment to actually execute therefore
-    leaves its own values in the scoreboard, which is exactly what
-    the chain assembler needs to fold.
-4.  Walk the previously-executed QEMU TB's fragment list from the
-    head fragment (stashed in the PathBuilder's pending-seal slot by
-    the *prior* ``vcpu_tb_exec``) up to the fragment whose ``start_pc``
-    matches the scoreboard's ``prev_start_pc``.  For each fragment
-    in the walk: append it to the in-flight CP chain (passing its
-    ``TbTerminus``), bump per-instruction attribution
-    (opcode / branch-type / src-reg / dst-reg counters in
-    ``g_stats``, mirrored into the active histogram bucket), and if
-    the chain assembler reports ``bb_complete()`` queue a finalize.
-    The assembler is ``reset()`` between finalizes so consecutive
-    fragments in the same walk don't get appended onto a just-
-    committed chain.
-5.  For every queued finalize, derive the branch decision from the
-    finalized true BB's terminating branch — never a single fragment.
-    Update the :class:`BranchHistory` record (so the WP simulator
-    has indirect targets to mine later) and resolve the wrong-path
-    target (the fall-through for a taken direct branch, the
-    translator-resolved static target for a not-taken direct
-    branch, the most-frequent-non-CP indirect target for an
-    indirect branch).
-6.  Release ``data_lock``, then call ``emit_finalized_bb`` on each
-    queued finalize: it optionally invokes the WP simulator for the
-    resolved wrong target, builds a :class:`BodyEntry` from the
-    just-finalized BB plus the drained per-thread memop / reg-snap
-    accumulators, and streams it through the writer.
+**Shared prologue** (before any lock):
 
-Steps 4-5 happen under ``data_lock``; the BB cache writes plus chain
-state and the WP-target resolution are mutated there.  ``data_lock``
-is released before step 6 — the WP simulator and the body-stream
-write run under ``exec_lock`` only.  The writer is internally
-synchronized.
+1.  **WP early-out.**  When ``g_wp_state.in_progress`` is set, this
+    invocation is the wrong-path simulator's nested ``exec_tb`` on
+    the same thread: stash the template in
+    ``g_wp_state.last_executed_tb`` and return.  The CP frame that
+    kicked the simulation already holds ``exec_lock``; the WP branch
+    touches only thread-local state and never runs the CP machinery.
+2.  **Promote.**  Correct-path execution promotes the TB's whole
+    fragment chain to the ``CODE`` lifetime class
+    (``TemplateStore::promote``), protecting chains the wrong path
+    minted first from the SPEC reclaim.  A racy pre-lock read of
+    ``chain_indexed`` keeps the steady state lock-free; ``promote()``
+    rechecks under ``data_lock``.  See :ref:`template-lifetimes`.
+3.  **Capture-mute latch.**  ``g_capture_mute`` latches
+    ``qemu_plugin_in_async_int()`` for this TB before any early
+    return: the per-memop, reg-snap, and synthetic-EA callbacks all
+    consult the latch, so even a TB the step later suppresses has
+    its captures dropped.  See :ref:`async-exclusion`.
+4.  **Guest-clock guard.**  A ``VClockPauseGuard`` freezes the guest
+    virtual clock for the rest of the callback — everything below is
+    instrumentation cost, not guest execution.  See
+    :ref:`time-transparency`.
+5.  **icount read.**  The per-TB ``INLINE_ADD_U64`` is emitted ahead
+    of this callback, so the scoreboard's ``insn_count`` already
+    includes this TB; the value read here drives window management.
+
+**The step glue** (``events_path_step``) enables the vCPU's
+path-event queue lazily on the thread's first CP exec, then runs
+everything shared between path outcomes — in an order that is
+load-bearing — under ``exec_lock``:
+
+1.  Marker-pin fold: with an address-space pin armed, fold this TB's
+    insn-count delta into the user-instruction clock (pinned ASID at
+    privilege 0 only) and stamp the fragment's ``is_system`` from
+    the live privilege — the correct-path ground truth that a
+    wrong-path seed never overrides.  See :ref:`asid-pin`.
+2.  Drain the event queue (``qemu_plugin_drain_cpu_events``) into
+    the step input and run ``PathBuilder::step_events`` — the
+    pre-window phase (async-window arrows, foreign-ASID boundary,
+    the pending-seal swap).  Any outcome but ``CONTINUE`` ends the
+    step here: an async-suspended TB must not drive window
+    decisions.
+3.  ``tw_manage_window``: segment open / close / deferred-close
+    arming, on the raw icount or (marker mode) the user-instruction
+    clock.  A step that *opens* a segment ends at the per-thread
+    segment-open boundary: the builder resets
+    (``PathBuilder::on_segment_open``), the async state clears, and
+    the queue re-enables, discarding the backlog that straddles the
+    boundary.
+4.  Heartbeat and histogram-bucket selection, then the scoreboard
+    reads: ``current_pc`` (the executing TB's start, a per-TB inline
+    store) and the previous TB's last-executed fragment's
+    ``prev_start_pc`` / ``prev_fall_through``.  The latter two are
+    inline stores on each *fragment's first raw instruction*; a
+    fragment that never executed (a predecessor's mid-TB branch
+    diverted control past it) never fires its store, so the
+    scoreboard always describes the executed tail.
+5.  ``PathBuilder::step_seal`` — the post-window phase: depth
+    stamping, fault-entry classification against the deferred prev,
+    the shared seal walk, merge completion, emission.  See
+    :ref:`path-builder`.
+6.  Only a normally ``SEALED`` step runs the deferred window closes
+    (icount stop and simpoint advance are both deferred to a true-BB
+    boundary so the trace covers *at least* the requested window)
+    and consumes the spec-flush latch, issuing
+    ``qemu_plugin_request_tb_flush`` once no wrong-path excursion is
+    in flight.
+
+**The seal walk** (``collect_finalized_bbs``; shared by the per-step
+seal, the fault-merge fold, and the segment-final flush) walks the
+deferred previous TB's fragment list up to the last-executed
+fragment.  Per fragment: capture the tail instruction's
+destination-register snaps (``snap_prev_tail_dsts`` — the one capture
+the per-insn hooks cannot reach, since the tail has no successor
+hook inside its own TB), append the fragment to the in-flight
+true-BB chain with its ``TbTerminus``, bump per-instruction
+attribution (opcode / branch-type / src / dst counters, mirrored
+into the active histogram bucket), and whenever the chain assembler
+reports a complete true BB, finalize it and resolve its terminal
+branch: direction from the executed edge, :class:`BranchHistory`
+update (the pool the WP simulator mines for indirect targets),
+wrong-path-target resolution (the fall-through for a taken direct
+branch, the translator-resolved static target for a not-taken one,
+the most-frequent-non-CP indirect target for an indirect branch),
+and the ``wpprune`` cold-branch filter.  The assembler is reset
+between finalizes so consecutive fragments in one walk never append
+onto a just-committed chain.  The walk runs under ``data_lock``;
+emission (``emit_finalized_bb`` — the synchronous WP kick plus the
+body-entry write) runs afterwards under ``exec_lock`` only.  The
+writer is internally synchronized.
+
+One deferral is inherent to this shape: TB *N*'s branch outcome and
+its tail instruction's post-execution register values are only
+knowable at TB *N+1* (the successor's inline ``current_pc`` store
+resolves the branch, and between the two TBs the register file still
+holds the tail's post-write state).  The PathBuilder's pending-seal
+slot is that deferral's single owner — each step seals the
+*previous* TB and promotes the current one into the slot — and
+``PathBuilder::flush_final`` drains the slot when a segment
+finishes, so a TB ended by a process-exiting syscall still emits its
+body entry (with no wrong path: speculation past exit is undefined).
+
+.. _path-builder:
+
+Path events and the PathBuilder
+-------------------------------
+
+The trace's output is a causally-ordered stream of sealed true BBs;
+the input that orders it is the **per-vCPU path-event queue**, a
+QEMU-side structure (``CPUState::plugin_evq``, see
+:doc:`qemu_modifications`) that delivers path causality as ordered
+events rather than sampled state.
+
+**The event-queue contract.**  Four event kinds:
+
+* ``FAULT_ENTER`` / ``FAULT_RETURN`` — a synchronous-fault entry or
+  its exception return, appended at QEMU's fault-stack chokepoints
+  (``cpu_plugin_fault_push`` / ``cpu_plugin_fault_pop``).  The
+  event's ``pc`` is the *resume PC* — the faulting instruction, where
+  the handler's exception return lands — and ``depth_after`` is the
+  fault-stack depth after the event applies.
+* ``ASYNC_ENTER`` / ``ASYNC_RETURN`` — an asynchronous-interrupt
+  delivery or the fetch of its departure PC, bracketing the async
+  exclusion window (see :ref:`async-exclusion`).  The event's ``pc``
+  is the departure PC.
+
+Every event carries the address-space ID and privilege level
+**stamped at the event instant**, so a page-fault handler rewriting
+the MMU context register mid-excursion cannot drift a frame's
+identity.  The queue is single-producer, single-consumer — both are
+the owning vCPU thread — so it needs no locking; it grows and never
+drops (a dense fault storm delivers one event per entry, none
+collapsed); and it is spec-mode-suppressed at the source, so
+wrong-path excursions leave it untouched.  It is empty and disabled
+until the plugin opts in per vCPU; the plugin enables it lazily at
+each thread's first in-segment exec and disables it across
+inter-segment gaps (where the exec callback — the only consumer —
+does not fire).
+
+The ordering invariant beneath everything below: *an event's effects
+belong to the first TB executed after it*.  The events drained at
+step *N* happened after the previous TB's execution and before the
+current TB's, so they classify the **previous** TB (which executed
+before them) and set the depth / mute context the **current** TB
+runs under.
+
+**The PathBuilder** (one per vCPU thread, by construction: frames,
+chain, capture buffers, and reg-snap accumulators are all
+thread-local) consumes the queue and owns all path-shaped state.
+Its step is split into two phases around the shared window
+management because the gate order is load-bearing on both sides:
+
+``step_events`` (pre-window) retains the step's drained events (the
+queue's internal buffer is only valid until the next push; fault
+events must survive bailed steps until a seal consumes them), then:
+
+* **Async mute window.**  The ordered ``ASYNC_ENTER`` /
+  ``ASYNC_RETURN`` edges drive the mute flag with assignment
+  semantics (re-scanning retained events across a bailed step is
+  idempotent); until the first per-segment prime the live QEMU flag
+  is authoritative.  While excluding, the step suspends: the TB is
+  dropped, the pending seal stays untouched, and the resume TB later
+  seals the interrupted branch against its real target.  A pinned
+  process observed at user privilege inside a supposedly-open window
+  is definitionally not handler content, so the window is
+  force-closed there (stuck-window recovery — the one local reset
+  that produces no event).
+* **Foreign-ASID boundary.**  A pinned run executing under another
+  address space drops the deferred prev (a one-TB-lossy boundary) so
+  its fragments never bridge across the gap.  The async suspend runs
+  *first*: an async excursion routinely context-switches through
+  foreign address spaces, and those TBs must take the suspend (which
+  preserves the deferred prev for the resume), not the drop.
+* **The pending-seal swap.**  On ``CONTINUE`` the current TB is
+  promoted into the pending-seal slot and the old occupant becomes
+  the TB the seal phase walks, together with the fault depth stamped
+  when it *executed* (the fault stack may pop between a TB's
+  execution and its emission one step later; a seal-time read would
+  lose the handler's level).
+
+``step_seal`` (post-window, only on steps that survived the
+shutdown / active / segment-boundary gates) applies the retained
+fault events exactly once, then runs the shared seal walk:
+
+* **Depth pipeline.**  ``raw_depth_`` tracks the last event's
+  ``depth_after``; ``base_depth_`` is the segment baseline, primed
+  lazily from live state at the segment's first seal (a fault in
+  flight across segment-open is baselined out, and events predating
+  the prime are swallowed — entries before a segment's first
+  surviving step never stash and never count); the baselined,
+  0-clamped difference is the depth the current TB runs at.
+* **Fault-entry classification.**  Each ``FAULT_ENTER`` is handled
+  individually against the deferred prev — see
+  :ref:`fault-excursions` for the three cases and the context-frame
+  (whole-BB merge) machinery.
+* **Seal, merge, emit.**  The seal walk collects finalized BBs; if
+  the first seal completes a fault frame, the merge emits the frame's
+  full template with its accumulated pieces; otherwise every
+  finalized BB emits normally.
+
+Segment opens reset the builder (``on_segment_open``): frames are
+dropped (their templates point into the just-cleared ``bb_map_``),
+the pending-seal slot and retained events clear, the depth pipeline
+zeroes and re-primes lazily, and the mute window closes.
+``flush_final`` is the segment-finish counterpart: it drains the
+pending-seal slot through the same fragment walk (including the
+delay-slot tail snaps) so the segment's last TB is not lost to the
+one-step deferral.
+
+.. _template-lifetimes:
+
+Template store lifetimes
+------------------------
+
+``TemplateStore`` (``champsim_tracer_bb_template_cache.{h,cc}``)
+owns every template and expresses lifetime three ways:
+
+* **CODE** — templates for code the correct path executes.
+  Persistent for the whole run and *flush-invariant by
+  construction*: a QEMU ``tb_flush`` is JIT housekeeping, and a
+  re-translation of the same code reuses its existing chain through
+  the dedup index (``lookup_tb_chain``, keyed by ``(start_pc,
+  canonical insn count)`` — byte identity is guaranteed by the
+  poison gate upstream), so a flush frees nothing and perturbs no
+  walk state for real code.
+* **SPEC** — templates minted by a wrong-path (spec-mode)
+  translation (``set_creating_spec`` selects the class at
+  translation time).  Wrong-path fetch residue unless the correct
+  path later runs it: speculation wandering mutable data that
+  happens to decode can mint templates at millions of fresh PCs, so
+  retaining them for the run is unbounded heap growth.  They are
+  freed wholesale at ``tb_flush`` (``reclaim_spec_templates``) —
+  their owning QEMU TBs are gone and, by the deferred-flush
+  machinery, no wrong-path walk is in flight when the flush callback
+  runs.
+* **SEGMENT** — expressed by ``bb_map_`` membership, not by the
+  class enum: the true-BB store owns its records and drops them
+  wholesale at ``clear_bb_map()`` on every segment switch.
+
+**Class-split dedup indexes.**  The CODE index
+(``tb_chain_dedup_``) holds only CODE chains; SPEC-born chains live
+in a separate SPEC index populated at creation.  Lookups consult the
+CODE index first, then the SPEC index — creation-time SPEC
+visibility is load-bearing, because a correct-path translation
+routinely *adopts* a chain the wrong path minted first (WP discovers
+code before CP reaches it), and a WP translation reuses real code's
+chain.  Reclaim is therefore a pure partition: free every still-SPEC
+template, clear the SPEC index in one O(1) operation, and never
+touch the CODE index.  ``promote()`` is the only SPEC→CODE
+transition and the only CODE-index inserter; it converts a *whole*
+sibling-fragment chain at once (a mixed-class chain is impossible by
+construction) and is idempotent.  A promoted chain's stale SPEC-index
+entry is harmless — lookups prefer the CODE index, and the entry
+vanishes at the next reclaim.
+
+**The spec-budget latch.**  ``vcpu_tb_trans`` accounts each
+SPEC-born template's estimated footprint into
+``spec_pending_bytes``; when a wrong-path translation pushes it past
+the budget (256 MiB by default — far above any healthy run's
+speculative footprint, reached only by a genuine runaway; the
+``CST_SPEC_FLUSH_BUDGET`` environment variable overrides it in
+bytes, which is also the reclaim live-fire test knob), a flush is
+*latched*, not requested: a request mid-excursion would kick the
+vCPU and truncate the in-flight chain.  The CP step boundary issues
+the actual ``qemu_plugin_request_tb_flush`` once no excursion is in
+flight, and the flush callback's reclaim frees everything still
+SPEC.
+
+**Cross-lifetime references are generation-stamped handles.**  A
+persistent fragment template can point into the segment-scoped
+``bb_map_`` (its REP self-loop sub-template ``rep_subtmpl``, its
+true-BB back-edge ``parent_true_bb``).  Those are ``SegRef`` handles
+carrying the store's segment generation at mint time; staleness is
+detected at deref (``seg_deref`` returns null on a generation
+mismatch — one integer compare, cheap enough for the REP fan-out hot
+path), so ``clear_bb_map()`` needs no invalidation walk over the
+persistent translations.  The generation counter is store-owned and
+starts at 1, so a zero-initialized handle is stale from birth.
+
+Two environment knobs observe the lifetime machinery:
+``CST_MEMSTATS`` prints footprint breakdowns (per-array byte totals,
+duplicate-chain histogram, reclaim counts) at segment close and on
+creation-rate thresholds; ``CST_LIFE_AUDIT`` enables debug boundary
+audits that walk the surviving stores after each lifetime boundary
+and abort if any survivor still references reclaimed memory (after
+reclaim: no surviving fragment references a freed SPEC template and
+survivors are uniformly CODE; after clear: no persistent template
+holds a current-generation ``SegRef``).
 
 .. _wp-flow:
 
@@ -541,38 +818,43 @@ operation):
 2.  Loop until the depth budget is exhausted *and* the in-flight BB is
     empty:
 
-    a.  Early-out if ``pre_pc`` is in ``g_poisoned_pcs`` (see
+    a.  Early-out if ``pre_pc`` is poisoned (see
         :ref:`poison-detection`): the speculator has tried to enter
         this PC before and the translation-time detector flagged it
         as non-stable bytes.  Drop the in-flight accumulator and end
-        the WP chain.
-    b.  Look up the cached *true-BB* at ``pre_pc``.  If absent, the
-        fragment template the next ``exec_tb`` produces becomes the
-        driver via ``g_wp_state.last_executed_tb``.
-    c.  Clear the per-thread WP regsnap scratch buffer
+        the WP chain.  The global poison set is *not* consulted on
+        the excursion's very first iteration — the branch predictor
+        deliberately chose the wrong target, and a stale entry keyed
+        by a start_pc the correct path only ever reaches mid-TB must
+        not veto the excursion's entry (the per-TB poison detector in
+        ``vcpu_tb_trans`` still refuses a genuinely-garbage first
+        TB).  The walk also keeps a per-excursion local poison set
+        for PCs that faulted during this excursion.
+    b.  Clear the per-thread WP regsnap scratch buffer
         (``wp_pending_reg_snaps``) if WP reg-data is enabled.  The
         in-flight ``exec_tb`` below will fire the per-insn
         ``vcpu_insn_reg_snap_cb`` registered at translation time, and
         in WP context those callbacks append into this buffer
         instead of the CP-side ``pending_reg_snaps``.  See
         :ref:`regdata-semantics` for the per-path timing.
-    d.  ``cpu_plugin_exec_tb()`` runs the TB.  Memory, instruction-
-        exec, inline-store, and ``vcpu_tb_exec`` callbacks all fire —
-        ``CF_MEMI_ONLY`` was removed so that the plugin's per-fragment
-        ``vcpu_tb_exec`` can stash the just-executed template into
-        ``g_wp_state.last_executed_tb`` via the same per-TB-udata path
-        the CP walker uses.  The plugin distinguishes WP-mode
-        invocations from CP-mode via the thread-local
-        ``g_wp_state.in_progress`` flag and short-circuits CP-only
-        state mutations on the WP path.
-    e.  Walk the fragment list of the just-executed QEMU TB.  For
+    c.  ``cpu_plugin_exec_tb()`` runs the TB.  The speculative TB
+        runs the full callback surface — memory, instruction-exec,
+        inline-store, and ``vcpu_tb_exec`` callbacks all fire — so
+        the plugin's ``vcpu_tb_exec`` delivers the just-executed
+        fragment template into ``g_wp_state.last_executed_tb``
+        through the same per-TB-udata path the CP step uses (no
+        template-cache lookup on the WP hot loop).  The plugin
+        distinguishes WP-mode invocations from CP-mode via the
+        thread-local ``g_wp_state.in_progress`` flag and
+        short-circuits CP-only state mutations on the WP path.
+    d.  Walk the fragment list of the just-executed QEMU TB.  For
         each fragment determine ``n_executed_in_cur`` via ``post_pc``
         matching against the fragment's own ``insn_pcs`` (on success)
         or fault-PC matching (on a fault).  Append the executed
         prefix's insns to ``bb_pcs`` / ``bb_fields`` / ``bb_bytes`` /
         ``bb_sizes``, bump per-WP attribution counters, and attribute
         the just-captured memops to insn indexes.
-    f.  After each fragment, check ``bb_complete``: a ``COMPLETE``
+    e.  After each fragment, check ``bb_complete``: a ``COMPLETE``
         terminus or a delay-slot landing for a previously-pending
         ``BARE_BRANCH`` seals the in-flight WP BB.  Commit the
         accumulator to the BB cache via ``commit_true_bb_refs``,
@@ -580,13 +862,14 @@ operation):
         next BB with the next fragment's ``start_pc``.  A single
         ``exec_tb`` can therefore commit multiple BBs (one per
         mid-TB branch the splitter found).
-    g.  If a fragment faulted on a non-branch insn, mark
+    f.  If a fragment faulted on a non-branch insn, mark
         ``bb_has_fault`` / ``bb_first_fault_idx`` (first fault wins),
-        poison the faulting PC against re-faults, set the next PC
-        to ``fault_pc + last_insn_size``, and continue the outer
-        iteration.  Faults on a ``BARE_BRANCH`` fragment do *not*
-        force-commit (the delay slot is in a different TB and
-        never landed) — they take the skip-past-and-retry branch.
+        poison the faulting PC against re-faults (excursion-locally),
+        set the next PC to ``fault_pc + last_insn_size``, and
+        continue the outer iteration.  Faults on a ``BARE_BRANCH``
+        fragment do *not* force-commit (the delay slot is in a
+        different TB and never landed) — they take the
+        skip-past-and-retry branch.
 
 3.  ``qemu_plugin_spec_mode_end`` + ``qemu_plugin_cpu_state_restore``
     +  scoreboard restore.
@@ -594,6 +877,288 @@ operation):
 The chain returned to the caller is *moved* into the
 :class:`BodyEntry`'s ``wp_entries`` field and serialized inline within
 the same body record as its CP entry.
+
+.. _wp-termination:
+
+Wrong-path chain termination
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Every excursion ends in one of a small set of conditions, each with
+its own wire semantics.  Consumers should treat them differently:
+
+* **Depth budget.**  ``sim_insns`` reached ``wpdepth`` and the
+  in-flight BB has sealed.  The clean, unmarked end: the chain is
+  exactly the speculative window a ``wpdepth``-deep frontend would
+  fetch, and the consumer simply stops replaying at its end.
+* **Fault.**  A speculative fault on a non-branch instruction does
+  *not* end the BB — the walk traces past it to the natural branch
+  end, preserving the BBs-end-in-a-branch invariant — and the sealed
+  :class:`WPBBEntry` carries ``fault`` plus ``fault_insn_index``.  A
+  consumer marks that uop non-completing and squashes its dependent
+  slice.  A faulting syscall-type branch seals its BB and the
+  post-PC poisoning ends the chain; speculative state past a syscall
+  is not modeled.
+* **Translation unavailable, mid-chain.**  The *next* wrong-path
+  target could not be fetched or translated — un-resident code under
+  demand paging is the architectural case.  The last completed
+  :class:`WPBBEntry` carries the ``translation_unavailable`` marker
+  (``CST_WP_EVENT_TRANSLATION_UNAVAIL`` on the wire), making the
+  honest fetch boundary distinguishable from a clean budget end.  A
+  real frontend's fetch stalls at exactly that translation fault, so
+  the consumer should treat the chain as complete-but-bounded, not
+  defective.
+* **Translation unavailable, first fetch.**  The excursion's *first*
+  target cannot be fetched or translated, so the chain is empty and
+  there is no :class:`WPBBEntry` to carry the marker; the condition
+  rides the body entry itself and is emitted as a *chain-level*
+  ``CST_WP_EVENT_TRANSLATION_UNAVAIL`` event.  An empty or truncated
+  chain whose target is genuinely unmapped in the current address
+  space is *correct output*, not a defect: a wrong-path fetch goes
+  through the MMU, and a real frontend fetches nothing past a
+  translation fault.  Wrong-path targets come from real static
+  branch targets and observed indirect history inside the workload's
+  text, so this is the exceptional case — and a *resident* target
+  producing an empty chain indicates a plugin bug, which is why the
+  exit summary counts ``WP first-TB unavailable`` separately and
+  ``CST_WP_DIAG`` prints each instance with its refusal reason.
+* **Containment bails.**  The sandbox's soft-budget overflow (a
+  garbage-size speculative store — a real CPU's wrong path would
+  fault and recover), the stuck-PC / no-forward-progress guards, the
+  nop-slide cap on an unsealed BB growing far past any real block,
+  and the poison early-out all drop the *in-flight accumulator* and
+  end the chain; WP BBs already committed are preserved.  These
+  chains look like early budget ends on the wire.
+* **Flush re-run.**  A ``tb_flush`` that unwinds a spec-mode
+  ``exec_tb`` before its guest instruction ran never reaches the
+  wire: the walker signals the caller, which discards the truncated
+  chain and re-runs the whole excursion in the fresh code cache.
+  The wire contract is exact-or-longer — a flush-shortened chain
+  would be indistinguishable from a silent bug.
+
+System-mode tracing
+-------------------
+
+Under ``qemu-system-<isa>`` the tracer targets one chosen *process*
+inside the guest, not the whole machine.  A guest-issued marker
+opens the window and pins it to that process's address space; the
+trace then contains the pinned process's user-space execution plus
+the kernel code it synchronously invokes (syscalls and faults),
+while asynchronous interrupts — OS noise uncorrelated with the
+workload — are excluded whole.  Everything in this section is
+system-mode machinery; under ``*-linux-user`` the pin is a no-op,
+the fault stack stays empty, and the async flag is always false.
+
+.. _asid-pin:
+
+Marker windows and the address-space pin
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``trace_window=marker:simulation=N`` arms a guest-driven window.
+The marker is a per-ISA byte sequence of provably-dead redundant
+instructions — on x86, ``CST_MARKER_SEQ_LEN`` identical
+``mov $CST_MARKER_MAGIC, %eax`` back to back; on the fixed-width
+ISAs, a minimal two-instruction immediate-load pair repeated the
+same number of times.  Rewriting the same register with a value it
+already holds is work no compiler emits, so the sequence cannot
+occur in real code by accident; and it needs no ELF symbols, no
+host icount, and no guest-kernel modification.  ``vcpu_tb_trans``
+recognizes the byte run inside a single TB and arms a one-shot exec
+callback on its last instruction, so when that callback fires the
+whole sequence has executed.
+
+The marker must execute *inside the target's own address space* —
+it is compiled into the workload (or injected at its entry point),
+never run by a launcher that then ``execve``\ s, because ``execve``
+replaces the address space and would leave the pin on the
+launcher's.  When it fires, the plugin captures the executing
+vCPU's address-space ID (``qemu_plugin_get_addr_space_id()`` — CR3
+on x86, SATP on RISC-V, TTBR0 on Arm, the MIPS ASID), stores it as
+the **pin**, and opens a segment of ``simulation`` instructions.
+
+The pin defines both the trace filter and the window clock:
+
+* **Privilege 0 at the pinned ASID** is the ground truth for "the
+  workload's own instruction".  Those instructions are traced *and
+  counted*: the window budget, the progress heartbeat, and the
+  finish report all run on this user-instruction clock, so a
+  marker-mode window covers the same user-space instructions a
+  user-mode run of the workload would.
+* **Kernel execution at the pinned ASID** (syscalls, fault
+  handlers) is traced but *not counted*.  Its templates carry
+  ``is_system``, stamped from the live correct-path privilege at
+  execution time — authoritative over any wrong-path seed, because
+  speculation can cross the privilege boundary and translate code
+  in the wrong context — and serialized on every instruction
+  descriptor as the ``SYSTEM`` flag bit.
+* **Foreign address spaces** are neither traced nor counted: the
+  PathBuilder's foreign-ASID boundary drops them (async excursions
+  are suspended instead — see :ref:`async-exclusion`).
+
+A workload shorter than its budget emits the **end marker** (the
+same sequence shape, built on ``CST_MARKER_END_MAGIC``) just before
+it exits.  Executed in the pinned address space, it closes the
+window at that point — the "budget *or* program end" stop.  Closing
+at the marker rather than at process teardown matters because a
+freed ASID can be reused by another process and silently re-match
+the pin; the finish line reports ``END`` rather than an underrun.
+
+Segment opens in marker mode follow the same per-thread boundary as
+every other mode: ``reset_segment_local_state`` runs once on the
+opening thread (global stores plus its own TLS), and every other
+vCPU thread resets its own PathBuilder, async state, and event
+queue as it observes the bumped segment generation on its next
+step — TLS cursors can only be reset from their own thread.
+
+In every non-marker window mode the pin holds ``UNPINNED`` and the
+whole machinery costs one relaxed atomic load per TB.
+
+.. _fault-excursions:
+
+Synchronous-fault excursions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Synchronous faults — page faults, TLB refills, lazy-enable traps —
+are *kept*: the handler is real, workload-induced kernel code.  The
+tracer's contract for them has two halves: handler code is emitted
+first-class at its exception-nesting depth, and the faulting BB is
+emitted **whole**, exactly once, after its excursions resolve.
+
+QEMU owns the ground truth.  Each target's ``do_interrupt`` calls
+``cpu_plugin_fault_push`` for a *re-executing* fault only (the
+handler's exception return lands back on the faulting instruction;
+syscalls and advance-past exceptions never push), pushing the resume
+PC; each target's exception-return path calls
+``cpu_plugin_fault_pop``, which pops only when the return target
+equals the top frame's resume PC — an exact match, not a heuristic,
+because a pushed fault always re-executes its faulting instruction.
+Both chokepoints append the corresponding ordered event, and both
+are no-ops on the wrong path.  ``plugin_fault_depth`` is the live
+nesting depth.
+
+On the plugin side, each drained ``FAULT_ENTER`` is classified
+against the deferred prev (see :ref:`path-builder`):
+
+* **Case (a) — re-fault.**  The resume PC matches an in-flight
+  frame ``{resume_pc, asid}``: the same instruction faulted again
+  (a TLB refill followed by the demand fault is *one* faulting
+  instruction).  The deferred prev's accumulated pieces join that
+  frame; the anchor is recorded once.
+* **Case (b) — new fault.**  The resume PC lies inside the deferred
+  prev: prev *is* the faulting BB and its terminating branch never
+  ran.  It is folded into a serializable template (force-committing
+  an incomplete head if needed) and a fresh context frame absorbs
+  its memops, register snaps, and the faulting-instruction anchor.
+* **Case (c) — no action.**  The resume PC is in neither: the fault
+  hit a block whose exec callback never ran (an instruction-fetch
+  miss).  The event is consumed and prev seals normally.
+
+A ``FAULT_RETURN`` marks its frame returnable, but emission rides
+the resume suffix's *seal*, one or more steps later: when a sealed
+BB starts at a frame's resume PC, the merge re-injects the frame's
+accumulated pieces ahead of the suffix's own, emits the **full**
+template once with the suffix's resolved branch, and retires the
+frame.  A returned frame matches by event identity; a frame whose
+return was never observed (a non-LIFO guest return — a context
+switch inside a blocking fault resuming the outer task first)
+completes on a byte-content check alone.  The content check is what
+keeps a same-VA frame from *another* address space — reachable
+through ASID reuse, since every process maps code at the same low
+VAs — from swallowing an innocent block's seal.
+
+On the wire (``CST_FLAG_FAULT``, set in marker mode; user-mode
+traces carry no trailer): every CP entry carries ``fault_depth``
+(0 = normal code, ≥1 = handler code at that nesting level,
+baselined per segment) and a merged faulting BB carries
+``fault_anchors`` — the faulting-instruction indices, one per
+excursion, in order.  Consumers replay the handler at its depth and
+see the faulting block once, whole, with its detour points marked.
+Three environment toggles support A/B diagnosis: ``CST_NO_FAULT``
+(marker mode runs without the fault feature), ``CST_NO_FAULT_MERGE``
+(depth stamping without classification/stash/completion), and
+``CST_NO_FAULT_WP`` (merged emits carry no wrong path).
+
+.. _async-exclusion:
+
+Asynchronous-interrupt exclusion
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Asynchronous interrupts — timer ticks, device IRQs, the scheduler
+activity they trigger — are not induced by the traced workload, so
+the entire delivery-to-return excursion is excluded from the trace.
+
+QEMU marks the window: the target's exception-delivery path sets a
+per-vCPU flag on an *asynchronous* entry and records the
+interrupted PC (the **departure PC**, where the handler's return
+will resume); the fetch loop clears the flag when execution returns
+to exactly that PC.  The pairing is robust to the scheduler
+context-switching away mid-handler and to nesting (the outermost
+departure PC is kept).  Both edges also produce ordered
+``ASYNC_ENTER`` / ``ASYNC_RETURN`` events.
+
+While the window is open the PathBuilder suspends: excluded TBs
+never step, the pending seal stays untouched — so the resume TB
+later seals the interrupted branch against its *real* target, with
+no phantom edge through the handler — and the per-thread
+``g_capture_mute`` latch drops the handler's memops, register
+snaps, and synthetic-EA loads at their capture sites (left
+unmuted, a handler's captures would attach to the interrupted user
+BB's slots: kernel addresses collapsing onto instruction 0 of a
+user block).  The suspend deliberately precedes the foreign-ASID
+boundary: an async excursion routinely context-switches through
+other address spaces, and those TBs must take the
+prev-preserving suspend, not the prev-dropping ASID gate.
+
+A window can be abandoned — the departure PC is never fetched
+again (the interrupted task was killed, or a signal rewrote its
+resume point).  The recovery is definitional: the pinned process
+observed at *user privilege* cannot be handler content, so the
+window force-closes there (``qemu_plugin_async_int_reset`` plus
+the local mute reset; no ``ASYNC_RETURN`` event exists for it, and
+a later fresh ``ASYNC_ENTER`` opens a well-formed new window).
+
+.. _time-transparency:
+
+Guest-time transparency
+-----------------------
+
+Plugin work runs on the vCPU thread but is not guest execution, so
+its host wall-clock cost must never be charged to guest time.  The
+stakes are highest in system mode: if one guest timer-tick
+handler's instrumented cost exceeds the tick period, the next tick
+is already pending when the handler returns and the guest collapses
+into a self-sustaining tick/scheduler storm (RCU stalls, zero
+foreground progress).  Three cooperating layers keep the guest's
+clocks clean; all are no-ops in user mode, and the QEMU side of
+each is catalogued in :doc:`qemu_modifications`.
+
+* **Per-callback vclock freeze.**  ``VClockPauseGuard`` wraps the
+  CP step in ``vcpu_tb_exec`` and the translation work in
+  ``vcpu_tb_trans`` with ``qemu_plugin_vclock_pause`` / ``resume``
+  — a nesting-depth freeze of the guest virtual clock, so
+  arbitrary instrumentation regions compose.
+* **Whole-excursion freeze for the wrong path.**  The WP session
+  boundary (``wp_enter_spec_session`` / ``wp_end_spec_session``)
+  pauses guest virtual time for the entire excursion via
+  ``qemu_plugin_spec_vtime_pause`` / ``resume`` — at the *outer*
+  boundary, not per spec-mode entry, so a fault-skip's spec-mode
+  teardown/re-entry cannot leak ticks.  On excursion exit the QEMU
+  base re-syncs register-coupled host timers (the Arm generic
+  timer, the RISC-V/MIPS timer compare) to the rolled-back
+  register state, so a speculative timer write or a mid-walk timer
+  expiry cannot park a one-shot host timer dead.
+* **The x86 TSC pin.**  x86 guests read two clock families (TSC
+  and HPET-class devices) and their watchdog cross-checks them;
+  the QEMU base locks the guest TSC to the guest virtual clock at
+  each resume with a once-calibrated frozen ratio, and holds the
+  BQL across each wrong-path excursion, so the two clocksources
+  cannot skew regardless of how often excursions cycle.
+
+The virtual-clock freeze covers wall-clock-driven time only.  Under
+``-icount`` the virtual clock is driven by the instruction count,
+which a tick freeze does not stop, so wrong-path instructions leak
+into guest time; the plugin warns once at install when wrong-path
+simulation is enabled together with ``-icount`` (the trace is
+valid; guest timing may be perturbed).
 
 .. _caveats:
 
@@ -637,15 +1202,43 @@ stability checks on every canonical insn in the candidate TB:
 Either signal poisons the TB's ``start_pc`` (adding it to
 ``g_poisoned_pcs``); the fragment is *not* created and no exec-cb
 ``udata`` is registered for the TB.  Subsequent WP walks check
-``cst_pc_is_poisoned`` at the top of each iteration and abort
-before re-translating the address.  When poisoning fires inside the
-main binary's text segment (``[qemu_plugin_start_code(),
-qemu_plugin_end_code())``) the plugin emits a one-shot SMC-suspect
-warning to stderr — that is the actual self-modifying-code signal.
-Out-of-text-segment poison fires silently because the symptom is
-"WP wrong-pathed into data," which is normal speculative behaviour
-the tracer just refuses to record.  Both the byte-memo and the
-poison set are dropped on ``vcpu_tb_flush``.
+``cst_pc_is_poisoned`` at the top of each iteration (excursion entry
+excepted — see :ref:`wp-flow`) and abort before re-translating the
+address.  When poisoning fires inside the main binary's text segment
+(``[qemu_plugin_start_code(), qemu_plugin_end_code())``) the plugin
+emits a one-shot SMC-suspect warning to stderr — that is the actual
+self-modifying-code signal.  Out-of-text-segment poison fires
+silently because the symptom is "WP wrong-pathed into data," which
+is normal speculative behaviour the tracer just refuses to record.
+
+Both the byte-memo and the poison set **persist across**
+``vcpu_tb_flush``: a flush is JIT housekeeping, so SMC detection
+must survive it, and a legitimate flush-plus-retranslate of
+unchanged code re-matches its first sighting (no false poison) and
+reuses its template.  Staleness is handled by content, not by
+lifetime:
+
+* **Poison entries carry a content hash.**  Each entry stores a hash
+  of the whole TB's canonical byte image at verdict time.  Virtual
+  addresses are reused across address spaces (static binaries map at
+  the same base), so a poison earned by one process's bytes must not
+  refuse another process's wrong-path target at the same VA: a
+  spec-mode translation whose bytes no longer match the stored hash
+  proves different content lives there now and self-clears the
+  entry.
+* **The correct path heals.**  Correct-path execution reaching a
+  poisoned PC is proof the verdict no longer holds — the CPU really
+  is executing that code — so a CP translation erases poison for
+  every canonical VA it covers and refreshes the byte-memo to the
+  CP-observed word (in system mode the same VA legitimately reads
+  different bytes across CP translations: demand paging, ASID
+  reuse).
+* **Spec mode only reads.**  A wrong-path translation never mutates
+  the persistent state: a spec read of a mid-refill page or a
+  foreign address space's bytes must not seed the first-sighting
+  word or park a permanent poison that would block the correct path.
+  The WP walker tracks its own transient poison in an
+  excursion-local set.
 
 *REP-prefixed x86 string instructions fan out per iteration.*  An x86
 ``REP MOVS`` executes N times against architectural memory.  The
@@ -690,18 +1283,29 @@ On REP-heavy workloads it can be MiB-sized and backed by a direct
 that point.  ``cleanup_current_thread`` therefore only ``clear()`` s;
 the TLS destructor runs the natural vector destructor afterwards.
 
-*GMutex, not std::mutex.*  ``<mutex>``'s transitive include chain
-pulls ``<cctype>``, which goes through QEMU's ``include/qemu/ctype.h``
-shadow that breaks libstdc++'s ``using ::isalnum;`` declarations.  The
-plugin uses ``GMutex`` everywhere to avoid that build-time hazard.
+*glib mutexes, not std::mutex.*  ``<mutex>``'s transitive include
+chain pulls ``<cctype>``, which goes through QEMU's
+``include/qemu/ctype.h`` shadow that breaks libstdc++'s
+``using ::isalnum;`` declarations.  The plugin uses glib mutexes
+everywhere to avoid that build-time hazard: ``GMutex`` for
+``data_lock`` / ``unknown_warn_lock`` and ``GRecMutex`` for
+``exec_lock`` (see `Synchronization summary`_ for why that one is
+recursive).
 
-*TB-flush longjmp hazard.*  During WP execution
-``tb_gen_code()`` may call ``tb_flush()`` on a full code buffer,
-which ``longjmp`` s past ``simulate_wrong_path_ext``'s cleanup.
-The ``vcpu_tb_flush`` callback must reset the ``g_wp_state``
-fields itself or ``vcpu_tb_exec`` stays permanently suppressed
-(``in_progress`` never clears); it also drops the partial CP chain,
-since splicing pre- and post-flush fragments would fabricate a BB.
+*The trace is flush-invariant.*  A ``tb_flush`` is QEMU JIT
+housekeeping — the code buffer filled and every TB re-translates —
+not a guest-execution event, so the trace must be identical with or
+without it.  Three mechanisms make that hold: CODE-class templates
+are never freed and a re-translation reuses its existing chain
+through the dedup index (see :ref:`template-lifetimes`); a flush
+that unwinds a spec-mode ``exec_tb`` is detected via a monotonic
+flush counter and the whole excursion re-runs in the fresh cache
+(see :ref:`wp-termination`); and a flush raised *during* a
+wrong-path translation is deferred by the QEMU base to the next safe
+point after the walk unwinds (see :doc:`qemu_modifications`).  The
+``vcpu_tb_flush`` callback itself only bumps the flush counter,
+nulls ``g_wp_state.last_executed_tb`` (which may point at a
+reclaimee), and reclaims SPEC-class templates.
 
 *Segment-generation stale-fragment guard.*  Switching segments
 calls ``clear_bb_map()``, which drops the owning ``unique_ptr`` s
@@ -710,8 +1314,11 @@ dangles.  ``reset_segment_local_state`` bumps a monotonic
 ``g_segment_generation``; every chain stamps the generation on each
 ``append_fragment`` and self-resets on mismatch, so one thread can
 reset segment-local state without reaching into other threads'
-``thread_local`` chains.  ``vcpu_tb_exec`` independently
-re-validates ``prev_tb_tmpl`` via ``find_tb_template``.
+``thread_local`` chains.  Each thread's PathBuilder likewise resets
+its own frames and pending-seal slot via ``on_segment_open`` as it
+observes the bumped generation (TLS cursors can only be reset from
+their own thread), and cross-segment references held by persistent
+templates are ``SegRef`` handles that read as null once stale.
 
 *The async writer exists to protect guest timing.*  Without it the
 ~64 KiB kernel pipe buffer is the only slack between the QEMU CPU
@@ -767,24 +1374,27 @@ would.  This relies on the ``scale`` (x86 SIB) and
 ``shift_type`` / ``shift_amount`` (AArch64) fields the plugin's
 QEMU base adds to ``qemu_plugin_operand`` — see :doc:`extending`.
 The WP path runs the same ``vcpu_mem_cb`` plumbing as the CP path
-(``CF_MEMI_ONLY`` is no longer set on the speculative TBs), so
+(speculative TBs carry the full callback surface), so
 mem-callback-driven capture stays correct under speculation.
 
-*Sibling TB translations get distinct fragment lists.*  When QEMU
-translates the same start_pc more than once (different cflags —
-notably the wrong-path simulator's ``CF_NO_GOTO_TB`` /
-``CF_SINGLE_STEP`` translations — or a page flush + retranslate),
-each translation produces its own splitter output and its own
-fragment list.  ``tb_templates_`` is a vector, not a start_pc-keyed
-map, so sibling translations never overwrite each other: the per-TB
-exec-cb ``udata`` always points at the exact list the just-executed
-QEMU TB produced.  For real binary code the canonical-insn arrays
-are identical across siblings (the static bytes don't change), so
-the splitter produces the same fragment shape every time and the
-chain assembler folds it deterministically.  When the bytes *do*
-appear to change — the dynamic-memory speculation case — the
-poison detector (see :ref:`poison-detection`) catches it at
-translation time and refuses to materialize the fragment at all.
+*Sibling TB translations never conflate.*  QEMU translates the same
+start_pc more than once: different cflags (notably the wrong-path
+simulator's ``CF_NO_GOTO_TB`` / ``CF_SINGLE_STEP`` translations) or
+a flush + retranslate.  ``tb_templates_`` is a vector, not a
+start_pc-keyed map, and the dedup index keys on ``(start_pc,
+canonical insn count)``, so siblings of *different length* — a
+full-BB correct-path TB vs a wrong-path TB that entered mid-block —
+each keep their own fragment chain, while a sibling of the *same*
+shape reuses the existing chain rather than duplicating it.  The
+per-TB exec-cb ``udata`` always points at a chain whose shape
+exactly matches the just-executed QEMU TB.  For real binary code the
+canonical-insn arrays are identical across same-shape siblings (the
+static bytes don't change), so the splitter produces the same
+fragment shape every time and the chain assembler folds it
+deterministically.  When the bytes *do* appear to change — the
+dynamic-memory speculation case — the poison detector (see
+:ref:`poison-detection`) catches it at translation time and refuses
+to materialize the fragment at all.
 
 *Stats are exact, lock-free on the bump path.*  ``g_stats`` is a macro
 that forwards to a per-thread heap-allocated ``Stats`` slot via
@@ -831,17 +1441,21 @@ Synchronization summary
 
    * - Lock
      - Covers
-   * - ``exec_lock``
-     - Held during ``vcpu_tb_exec`` so CP attribution, chain
-       assembly, and a synchronous WP simulation all serialize.  Also
-       held during ``vcpu_tb_flush`` reset and ``plugin_exit``.
-   * - ``data_lock``
-     - Mutates the BB caches (``tb_templates_``, ``bb_map_``), the
-       byte-stability / poison maps (``g_first_insn_word``,
-       ``g_poisoned_pcs``), the chain assembler's fragment list, and
-       ``g_branch_history``.  Acquired briefly inside the larger
-       ``exec_lock`` window.
-   * - ``unknown_warn_lock``
+   * - ``exec_lock`` (``GRecMutex``)
+     - Held across the CP step in ``vcpu_tb_exec`` so path state,
+       chain assembly, window management, emission, and any
+       synchronous WP simulation all serialize.  Also held during
+       ``plugin_exit``, the marker open/close callbacks, and the
+       budget threshold handler.
+   * - ``data_lock`` (``GMutex``)
+     - Mutates the template stores (``tb_templates_``, ``bb_map_``,
+       the dedup indexes), the byte-stability / poison maps
+       (``g_first_insn_word``, ``g_poisoned_pcs``), the chain
+       assembler's fragment list, and ``g_branch_history``.  Acquired
+       briefly inside the larger ``exec_lock`` window (and by
+       ``vcpu_tb_trans`` / ``vcpu_tb_flush``, which run without
+       ``exec_lock``).
+   * - ``unknown_warn_lock`` (``GMutex``)
      - Serializes writes to the ``.unknown_warnings.log`` sidecar.
    * - Plugin writer thread
      - Internally synchronized SPSC queue.  Producers (segments) push
@@ -855,3 +1469,14 @@ saved state across nested invocations).  ``data_lock`` is grabbed
 briefly inside that long window only when mutating cache state, so
 the WP simulator can drop and reacquire it across each cache write
 without holding the whole simulation under one lock.
+
+``exec_lock`` is a *recursive* mutex because plugin callbacks can be
+re-entered on the same thread mid-step: a TCG code-buffer flush
+during wrong-path simulation dispatches plugin callbacks
+synchronously (``tb_gen_code`` → ``qemu_plugin_flush_cb``) while the
+thread is already inside ``vcpu_tb_exec`` holding the lock, and a
+non-recursive mutex self-deadlocks there.  ``exec_lock`` is never
+paired with a condition variable, so the recursion is safe.  The
+WP-mode early-out in ``vcpu_tb_exec`` deliberately runs *before* any
+lock acquisition — the nested spec-mode invocation must not run the
+CP step against wrong-path state.

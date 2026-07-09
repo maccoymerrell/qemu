@@ -881,3 +881,138 @@ consumer may rely on them.
    * - 4
      - ``TRACE_ISA_MIPS``
      - MIPS (32-bit little-endian; mipsel).
+
+.. _plugin-args:
+
+Plugin arguments
+----------------
+
+The complete ``key=value`` argument set ``qemu_plugin_install``
+accepts (an unknown key aborts the install).  Full prose for each is
+in :doc:`quickstart`; this table is the at-a-glance contract.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 26 16 58
+
+   * - Argument
+     - Default
+     - Meaning
+   * - ``outfile=<basename>``
+     - ``champsim_tracer_out``
+     - Basename for the ``.cst`` trace, the
+       ``.unknown_warnings.log`` sidecar, and the ``.stats.log``
+       mirror of the exit-time summary.
+   * - ``compress=<shell command>``
+     - unset
+     - Per-member compressor command (``popen``'d once per archive
+       member).
+   * - ``wp=0|1``
+     - ``1``
+     - Enable wrong-path simulation.
+   * - ``wpdepth=<insns>``
+     - ``64``
+     - Wrong-path budget in speculative instructions per branch;
+       must be positive.
+   * - ``wpprune=0|1|2``
+     - ``0``
+     - Cold-branch wrong-path pruning level (see :doc:`quickstart`).
+   * - ``memdata=0|1``
+     - ``0``
+     - Capture load/store *values* on the correct path.
+   * - ``regdata=0|1``
+     - ``0``
+     - Capture destination-register post-execution snapshots.
+   * - ``wp_memdata=0|1``
+     - inherits ``memdata``
+     - WP-side override for memop values (WP addresses are always
+       recorded).
+   * - ``wp_regdata=0|1``
+     - inherits ``regdata``
+     - WP-side override for register snapshots.
+   * - ``histogram=<N>``
+     - ``0``
+     - Per-segment interval histograms (N buckets) in the exit-time
+       summary.
+   * - ``iframe_rate=<N>``
+     - ``100000``
+     - Emit a validation IFRAME after every Nth observation of a CP
+       template; ``0`` disables IFRAMEs.
+   * - ``trace_window=MODE:KEY=VALUE+...``
+     - unset (trace whole run)
+     - Segmentation.  Exactly one mode; each mode accepts only its
+       own keys.  The four forms:
+       ``icount:start=<lo>+stop=<hi>``;
+       ``simpoint:file=<path>+interval=<insns>+warmup=<insns>+simulation=<insns>``;
+       ``symbol:name=<sym>+occurrence=<N>+simulation=<insns>``;
+       ``marker:simulation=<insns>`` (guest-driven, system-mode).
+   * - ``program=<string>``
+     - unset
+     - Free-form program identifier stamped into the header.
+   * - ``comment=<string>``
+     - unset
+     - Free-form note stamped into the header.
+
+.. _env-knobs:
+
+Environment knobs
+-----------------
+
+Environment variables the plugin and its tools consult.  All except
+``CST_SPEC_FLUSH_BUDGET`` and ``CST_DECODE_THREADS`` are
+**diagnostics**: they exist for debugging and A/B isolation, perturb
+either output or performance, and have no place in a production
+trace run.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Variable
+     - Meaning
+   * - ``CST_SPEC_FLUSH_BUDGET``
+     - Byte budget of SPEC-class (wrong-path-minted) templates that
+       triggers a proactive ``tb_flush`` + reclaim; default 256 MiB.
+       Also the reclaim live-fire test knob.  See
+       :ref:`template-lifetimes`.
+   * - ``CST_MEMSTATS``
+     - *Diagnostic.*  Template-store footprint breakdowns (per-array
+       byte totals, duplicate-chain histogram) at segment close and
+       on creation-rate thresholds, plus per-flush reclaim counts.
+   * - ``CST_LIFE_AUDIT``
+     - *Diagnostic.*  Debug boundary audits after each template
+       lifetime boundary; aborts with a report if a survivor still
+       references reclaimed memory.  See :ref:`template-lifetimes`.
+   * - ``CST_WP_DIAG``
+     - *Diagnostic.*  Prints each wrong-path first-fetch-unavailable
+       instance with its refusal reason (fetch vs poison).  See
+       :ref:`wp-termination`.
+   * - ``CST_BLKWATCH=<hex pc>``
+     - *Diagnostic.*  One-line report at every exec and seal of the
+       TB starting at the watched PC, with the gate states that
+       could suppress its emission.
+   * - ``CST_FAULT_DIAG``
+     - *Diagnostic.*  PathBuilder fault-machinery event log (stash /
+       return / merge-emit / orphan lines).
+   * - ``CST_NO_FAULT``
+     - *Diagnostic.*  Marker-mode runs without the fault-excursion
+       feature (no per-entry fault trailer).
+   * - ``CST_NO_FAULT_MERGE``
+     - *Diagnostic.*  Keep fault-depth stamping but disable
+       fault-frame classification / stash / merge completion.
+   * - ``CST_NO_FAULT_WP``
+     - *Diagnostic.*  Merged (whole-BB) emits carry no wrong-path
+       chain.
+   * - ``CST_RING``
+     - *Diagnostic.*  In-memory ring of recent CP BB starts and WP
+       instruction PCs, dumped periodically to ``/tmp``.
+   * - ``CST_DECODE_THREADS``
+     - Decompressor thread count for the offline tools' ``xz``
+       pipeline (``0`` = one per core; ``1`` forces serial for
+       lowest memory; unset = a bounded auto of min(cores, 8)).
+
+The modified QEMU base carries its own ``CST_*`` diagnostic
+switches (clock-skew probes, wrong-path state-diff snapshots,
+timer-freeze A/B toggles) in ``accel/tcg/cpu-exec.c``; they gate
+QEMU-side instrumentation rather than plugin behaviour and are
+enumerated at their definition sites.

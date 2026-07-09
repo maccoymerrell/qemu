@@ -775,9 +775,9 @@ static void reset_segment_local_state(void)
      * pending_reg_snaps) can't be touched directly.  Bumping
      * g_segment_generation makes each thread self-drop its stale
      * chain on its next append_fragment; the other two drain every
-     * BB / body emit, and any stale BBTemplate* they hold was just
-     * invalidated by clear_bb_map (vcpu_tb_exec re-validates
-     * prev_tb_tmpl via find_tb_template, now returning nullptr).
+     * BB / body emit, and each thread's PathBuilder runs its own
+     * on_segment_open (frames, pending-seal slot, retained events)
+     * as it observes the bumped generation in vcpu_tb_exec.
      */
     g_segment_generation.fetch_add(1, std::memory_order_release);
 

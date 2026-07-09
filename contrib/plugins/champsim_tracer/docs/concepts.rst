@@ -208,6 +208,46 @@ The exact byte layout is in :doc:`format` (Step 4.6 / §6); the
 :doc:`decoder` renders it inline per BB and ``cst_audit`` shows
 how many trace bytes it costs.
 
+System-mode traces
+------------------
+
+The tracer runs against both of QEMU's TCG emulators.  Under
+``qemu-<isa>`` (user mode) the trace covers one process's user-space
+execution; system-call boundaries appear as ``GEN_OP_SYSCALL``
+instructions and kernel execution is invisible (QEMU emulates the
+syscall itself).  Under ``qemu-system-<isa>`` the tracer targets one
+chosen process inside a full guest OS, and the kernel becomes part
+of the picture:
+
+* **The window is guest-driven and process-pinned.**  The workload
+  executes a magic marker instruction sequence at its entry; the
+  plugin opens the trace window there and pins it to the executing
+  address space.  Other processes never enter the trace, and the
+  window budget counts the pinned process's *user-space*
+  instructions — so a system-mode window covers the same workload
+  instructions a user-mode run would, with the kernel's
+  contribution added rather than substituted.
+* **Synchronous kernel code is first-class.**  The syscalls the
+  workload makes and the fault handlers it triggers (page faults,
+  TLB refills) are traced as ordinary basic blocks.  Kernel-context
+  instructions carry the ``SYSTEM`` flag bit, so a consumer can
+  model or filter them; entries executed inside a fault handler
+  additionally carry the handler's nesting depth, and a faulting
+  basic block appears once, whole, with its faulting instructions
+  marked.  (See :doc:`format` for the flag bit and the per-entry
+  fault trailer.)
+* **Asynchronous interrupts are excluded.**  Timer ticks, device
+  IRQs, and the scheduling they trigger are OS noise uncorrelated
+  with the traced workload; the whole delivery-to-return excursion
+  is left out of the trace by design.
+* **The wrong path crosses the privilege boundary.**  Speculative
+  chains run through kernel code like any other, bounded by the
+  same MMU rules a real speculative fetch obeys.
+
+The mechanics — marker detection, the address-space pin, fault
+excursions, async exclusion — are described in
+:doc:`architecture`.
+
 Research questions the trace is designed to answer
 --------------------------------------------------
 
@@ -257,10 +297,13 @@ What the trace is *not* designed for
 A few categories the trace deliberately does not cover — see
 :doc:`limitations` for the full list:
 
-* **Kernel behavior.**  The plugin runs only against QEMU's
-  user-mode emulators.  System-call boundaries appear in the trace
-  as ``GEN_OP_SYSCALL`` instructions, but the trace does not see
-  inside the kernel.
+* **Whole-system behavior.**  A system-mode trace is pinned to one
+  process: it captures that process plus the kernel code it
+  synchronously invokes, not other processes, not asynchronous
+  interrupt handling, and not the OS at large.  In a user-mode
+  trace, kernel execution is invisible entirely — system-call
+  boundaries appear as ``GEN_OP_SYSCALL`` instructions and nothing
+  more.
 * **Microarchitectural timing.**  The trace is a functional record
   of *what executed*, not a cycle-accurate description of *when*.
   Timing models live in the consumer simulator.

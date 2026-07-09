@@ -184,10 +184,6 @@ extern "C" {
 #define CST_WP_EVENT_TRANSLATION_UNAVAIL (1u << 0)
 #define CST_WP_EVENT_FAULT               (1u << 1)
 
-/* WP-invocation envelope flags byte */
-#define CST_WP_INV_CHAIN_REF      (1u << 0)
-/* bits 1..7 reserved */
-
 /* Header feature flags.  MEM_DATA / REG_DATA advise which optional
  * field-ID families may appear (the field IDs still determine actual
  * presence).  PROFILE / WP are structural gates: they decide whether

@@ -8,13 +8,26 @@ usually a sign you want a different tool, or a documented workaround.
 Out-of-scope categories
 -----------------------
 
-**System-mode emulation.**  The plugin is built and tested against
-QEMU's user-mode emulators (``qemu-x86_64``, ``qemu-aarch64`` etc.).
-It runs only against user-space binaries; system-call boundaries
-appear in the trace as ``GEN_OP_SYSCALL`` instructions, but the
-trace ends at the syscall — kernel execution is not captured.  If
-you need kernel-mode visibility, a system-mode plugin or a different
-infrastructure is required.
+**Whole-system tracing.**  System-mode tracing is process-pinned: a
+guest-issued marker opens the window and pins it to one address
+space, and the trace covers that process plus the kernel code it
+synchronously invokes (see the *System-mode tracing* section of
+:doc:`architecture`).  What it deliberately does not cover:
+asynchronous-interrupt handling (excluded by design — OS noise
+uncorrelated with the workload), other processes, and the
+pre-paging boot path (wrong-path speculation requires the guest MMU
+to bound fetches).  Tracing "everything the machine does" is not a
+supported shape.  In user mode, kernel execution is invisible
+entirely — system-call boundaries appear as ``GEN_OP_SYSCALL``
+instructions and the trace resumes at the syscall's return.
+
+**Wrong-path simulation requires an x86 host.**  The spec-mode
+slow-path routing flag (``CF_FORCE_SLOW``) is implemented in the
+i386 TCG backend only, which serves x86 and x86-64 *hosts* (guest
+ISA coverage is unaffected).  On another host architecture,
+wrong-path stores would reach real guest memory, so wrong-path
+simulation is unsafe to enable there; see the porting note in
+:doc:`qemu_modifications`.
 
 **Cycle-accurate timing.**  The trace is a *functional* record of
 the architectural correct path plus its speculative shadow.  It

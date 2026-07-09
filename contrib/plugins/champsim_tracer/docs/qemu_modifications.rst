@@ -42,20 +42,60 @@ Plugin API additions
      executes it.
    * ``qemu_plugin_request_tb_flush`` — drops QEMU's entire TB
      cache from a plugin callback so every subsequent execution
-     re-translates through ``vcpu_tb_trans``.  ChampSim Tracer
-     uses it at trace-segment boundaries: ``vcpu_tb_trans`` gates
-     its expensive instrumentation work (Capstone decode, BBTemplate
-     creation, per-insn memory callbacks) on
-     ``g_trace_segments.is_active_atomic()``, so a cached
-     translation taken on the inactive side of a window has none of
-     the segment-time hooks.  Flushing on window-open forces a
-     fresh translation pass while ``is_active`` is true, and the
-     next TB exec arrives with full instrumentation in place.  The
-     entry point is async-safe — QEMU schedules ``do_tb_flush`` to
-     run between TBs (or synchronously when already in serial
-     context), and any plugin ``flush_cb`` registered via
+     re-translates through ``vcpu_tb_trans``.  ChampSim Tracer uses
+     it to honor the SPEC-template reclaim budget (the flush
+     callback is where wrong-path-minted templates are freed).
+     Plugin callbacks run inside a translation or an executing TB —
+     contexts where a synchronous flush would reset the code region
+     under an in-flight ``tb_gen_code`` — so the entry point always
+     defers through ``tb_flush_deferred``
+     (``include/exec/tb-flush.h``): the flush is queued as
+     async-safe work, ``do_tb_flush`` runs at the vCPU thread-loop
+     safe point after any plugin excursion has unwound, and any
+     plugin ``flush_cb`` registered via
      ``qemu_plugin_register_flush_cb`` fires before the next TB
      executes.
+   * ``qemu_plugin_cpu_events_set`` / ``qemu_plugin_drain_cpu_events``
+     — enable and drain the ordered per-vCPU path-event queue (see
+     *Path-event delivery*, below).  Draining hands out the queue's
+     internal buffer — valid until the next push, which cannot happen
+     before the consuming ``tb_exec`` callback returns — and resets
+     its length; both producer and consumer are the owning vCPU
+     thread, so the API is lock-free by construction.
+   * ``qemu_plugin_fault_depth`` — the live synchronous-fault
+     nesting depth from QEMU's fault stack (see *Path-event
+     delivery*).  The plugin baselines per-segment depth reporting
+     from it.
+   * ``qemu_plugin_in_async_int`` / ``qemu_plugin_async_int_reset``
+     — read and force-clear the asynchronous-interrupt exclusion
+     window flag.  The reset exists for abandoned windows (the
+     departure PC is never fetched again); the plugin invokes it only
+     when the pinned process is observed at user privilege, which is
+     definitionally outside any handler.
+   * ``qemu_plugin_vclock_pause`` / ``qemu_plugin_vclock_resume`` —
+     nestable guest-virtual-clock freeze for plugin instrumentation
+     windows (see *Guest-time transparency*, below).
+   * ``qemu_plugin_icount_enabled`` — whether ``-icount`` drives the
+     virtual clock; the plugin warns at install that wrong-path
+     instructions advance instruction-count time (the vclock freeze
+     covers wall-clock-driven time only).
+   * The wrong-path session surface:
+     ``qemu_plugin_cpu_state_save`` / ``_restore`` / ``_free``
+     (architectural-register snapshot and rollback, sized per target
+     by the ``end_reset_fields`` marker),
+     ``qemu_plugin_spec_mode_begin`` / ``_end`` (enter/leave the
+     side-effect-suppressed execution mode; ``_end`` also flushes the
+     spec store sandbox and invalidates any wrong-path-installed TLB
+     entries), ``qemu_plugin_set_pc`` / ``qemu_plugin_get_pc``
+     (redirect and observe the speculative PC),
+     ``qemu_plugin_exec_tb`` (run one TB at the current PC with the
+     full plugin-callback surface),
+     ``qemu_plugin_spec_vtime_pause`` / ``_resume``
+     (whole-excursion guest-time freeze), and
+     ``qemu_plugin_spec_store_overflowed`` (the sandbox's
+     soft-budget flag — a wrong-path store footprint past the soft
+     budget marks the excursion as diverged into nonsense so the
+     walker can terminate it before the hard cap drops stores).
    * ``qemu_plugin_get_priv_level`` / ``qemu_plugin_get_addr_space_id``
      / ``qemu_plugin_paging_enabled`` — system-mode introspection backed
      by the per-target ``TCGCPUOps::get_plugin_state`` hook (below).
@@ -172,6 +212,117 @@ Per-ISA translator call sites
      (the unconditional ``JAL``) and ``gen_branch`` (the B-type
      conditionals), using ``ctx->base.pc_next + imm``.  ``JALR``
      (indirect) is unaffected.
+
+Path-event delivery
+-------------------
+
+System-mode path causality — which faults and interrupts detoured
+execution, and exactly where — is observed by QEMU at its own
+chokepoints and delivered to the plugin as ordered events plus two
+pieces of live state.  All of it lives in ``include/hw/core/cpu.h``
+(the ``CPUState`` plugin fields) with the API in ``plugins/api.c``.
+
+``CPUState::plugin_fault_stack`` / ``plugin_fault_depth`` —
+synchronous-fault resume stack
+
+   QEMU owns the resume-PC stack directly because it observes every
+   fault entry and every exception return synchronously and in
+   strict LIFO order.  ``cpu_plugin_fault_push`` is called from each
+   target's fault-delivery path for a *re-executing* fault only
+   (TLB refill, lazy-enable trap — not syscalls or advance-past
+   exceptions), pushing the resume PC: ``target/arm/helper.c``,
+   ``target/i386/tcg/seg_helper.c``, ``target/riscv/cpu_helper.c``,
+   ``target/mips/tcg/system/tlb_helper.c``.
+   ``cpu_plugin_fault_pop`` is called from each target's
+   exception-return path and pops only when the return target equals
+   the top frame's resume PC — an exact match, since a pushed fault
+   always re-executes its faulting instruction — so syscall and
+   async returns, which never pushed, leave the stack untouched.
+   Both are no-ops on the wrong path (``plugin_spec_mode``).
+
+``CPUState::plugin_in_async_int`` / ``plugin_async_departure_pc`` —
+async-interrupt window
+
+   The target's exception-delivery path sets the flag on an
+   *asynchronous* entry (timer / device IRQ / FIQ / SError) and
+   records the interrupted guest PC — the departure point.  The
+   fetch loop in ``accel/tcg/cpu-exec.c`` clears the flag when
+   execution returns to exactly that PC, which is robust to the
+   scheduler context-switching away mid-handler and to nesting (the
+   outermost departure PC is kept).  The four delivery sites mirror
+   the fault-push sites above.  Set only on the correct path.
+
+``CPUState::plugin_evq`` — the ordered per-vCPU path-event queue
+
+   Each fault push/pop and async-window edge appends one event
+   (``FAULT_ENTER`` / ``FAULT_RETURN`` / ``ASYNC_ENTER`` /
+   ``ASYNC_RETURN``) carrying the resume/departure PC, the
+   depth-after, and the address-space ID and privilege level
+   **stamped at the event instant** via the per-target
+   ``get_plugin_state`` hook (``cpu_plugin_evq_push``,
+   ``plugins/core.c``).  The queue is single-producer,
+   single-consumer (both the owning vCPU thread), grow-only — it
+   never drops an event, so a dense fault storm delivers one event
+   per entry — spec-mode-suppressed at source, and disabled (and
+   empty) until a plugin opts in per vCPU.  This is the channel the
+   tracer's PathBuilder consumes; ``plugin_fault_depth`` remains the
+   authoritative live depth.
+
+Guest-time transparency
+-----------------------
+
+Plugin instrumentation runs on the vCPU thread but is not guest
+execution; these mechanisms keep its host wall-clock cost out of
+the guest's clocks.  A traced guest whose timer-tick handler costs
+more than a tick period otherwise collapses into a self-sustaining
+tick/scheduler storm.
+
+``CPUState::plugin_vclock_depth`` + ``cpu_plugin_vclock_pause`` /
+``_resume`` (``accel/tcg/cpu-exec.c``)
+
+   Nesting-depth freeze of the guest virtual clock for correct-path
+   instrumentation windows (per-TB emission, translation-time
+   decoding).  Composes with the wrong-path excursion freeze below:
+   ticks re-enable only when both say so.  No-op in user mode, and
+   never re-enables a clock that ``vm_stop`` owns.
+
+``CPUState::plugin_spec_vtime_paused`` +
+``cpu_plugin_spec_vtime_pause`` / ``_resume``
+
+   Whole-excursion guest-clock freeze for wrong-path simulation,
+   idempotent and balanced so a fault-skip's spec-mode
+   teardown/re-entry cannot leak ticks.  The resume side is also
+   the excursion-exit hook where per-target timer state is
+   reconciled (below).
+
+``CPUState::plugin_spec_timer_dirty`` + per-target timer resync
+
+   Some targets back an architected timer with a host ``QEMUTimer``
+   that lives outside the register snapshot the wrong-path walk
+   rolls back; a speculative timer-register write is gated, and the
+   host timer can fire mid-walk into the spec gate without
+   re-arming — either way the registers and the host timer desync
+   and a one-shot timer parks dead.  The spec-gated timer paths set
+   the flag; at true excursion exit (``spec_vtime_resume``) the
+   per-target resync (``riscv_cpu_plugin_resync_timers``,
+   ``arm_cpu_plugin_resync_timers``,
+   ``mips_cpu_plugin_resync_timers``) re-arms the host timer to
+   match the restored registers, idempotently.
+
+x86 TSC pin + BQL hold (``accel/tcg/cpu-exec.c``)
+
+   x86 guests read two clock families — TSC and HPET-class devices —
+   and the guest's clocksource watchdog cross-checks them; excursion
+   pause/resume cycling can skew the two until the watchdog marks
+   the TSC unstable and wedges timekeeping.  At each resume the
+   guest TSC is forced to ``ref_tsc + tsc_hz × (guest_clock −
+   ref_clock)`` with a ratio calibrated once and then frozen, so the
+   two guest clocksources are locked by construction.  The BQL is
+   additionally held across each wrong-path excursion (x86 only;
+   other targets' WP legitimately takes the BQL for sandboxed device
+   accesses) so the iothread cannot interleave mid-excursion.  Other
+   ISAs read a single guest clock family reconciled by their timer
+   resync, so they need no pin.
 
 Speculative-execution support
 -----------------------------
@@ -323,7 +474,13 @@ spec store buffer
    forwarding stays correct for the tracked working set and excess
    speculative stores are simply not forwarded.  The bound, and the
    buffer itself, are ISA-generic — they apply to every target that
-   routes stores through the buffer.
+   routes stores through the buffer.  A *soft* budget sits below the
+   hard cap: when a single excursion's store footprint crosses it,
+   ``cpu->plugin_spec_store_overflow`` is set (readable via
+   ``qemu_plugin_spec_store_overflowed()``) so the wrong-path walker
+   can terminate a wild excursion — a garbage-size memop that a real
+   CPU's wrong path would fault on — before the hard cap starts
+   dropping stores.
 
    ``PluginSpecLine`` places its ``bytes[64]`` payload first and is
    ``QEMU_ALIGNED(16)`` so a naturally-aligned guest atomic (size ≤ 16,
@@ -424,6 +581,26 @@ Suppressing device and global side effects
    zero.  Page-table accessed/dirty-bit writeback is likewise suppressed
    per target (``target/i386/tcg/system/excp_helper.c`` ``ptw_setl``,
    ``target/arm/ptw.c`` ``arm_casq_ptw``, ``target/riscv/cpu_helper.c``).
+
+   The gated timer writes (Arm generic timer, RISC-V ``timecmp``,
+   MIPS ``Count`` / ``Compare``) additionally flag
+   ``plugin_spec_timer_dirty`` so the post-walk timer resync (see
+   *Guest-time transparency*) re-arms the host ``QEMUTimer`` to the
+   restored register state at excursion exit.
+
+``accel/tcg/cputlb.c`` — wrong-path TLB-install log
+
+   Speculative accesses still run ``tlb_fill`` on a miss and install
+   softmmu TLB entries.  Rather than a full ``tlb_flush`` on every
+   excursion exit — which would drop the entire correct-path TLB and
+   jump cache, ruinously expensive at wrong-path frequency — the
+   pages an excursion installs are logged (with their ``mmu_idx``,
+   which also covers a wrong-path privilege change) in
+   ``cpu->plugin_spec_tlb_log`` at ``tlb_set_page_full``, and only
+   those pages are invalidated at spec-mode exit.  An excursion that
+   only hits existing entries — the common case — leaves the log
+   empty and flushes nothing; a large-page install or log overflow
+   falls back to a full flush.
 
 Aborting unsandboxable instructions
 -----------------------------------

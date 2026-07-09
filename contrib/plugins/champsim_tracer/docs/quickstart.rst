@@ -130,8 +130,8 @@ own per-segment statistics summary on stderr.  The three modes
 below differ in how many segments a single QEMU run emits and
 how the segment boundaries are picked:
 
-* ``icount`` and ``symbol`` modes each produce exactly **one**
-  segment per run and write a single ``<basename>.cst``.
+* ``icount``, ``symbol``, and ``marker`` modes each produce exactly
+  **one** segment per run and write a single ``<basename>.cst``.
 * ``simpoint`` mode produces **one segment per simpoint** listed
   in the input file and writes **one ``.cst`` file per segment**,
   named ``<basename>-<positionB>.cst`` (see the ``outfile=``
@@ -148,9 +148,11 @@ fresh.
    single: trace_window; icount mode
    single: trace_window; simpoint mode
    single: trace_window; symbol mode
+   single: trace_window; marker mode
    single: segmentation
    single: simpoint mode
    single: symbol mode
+   single: marker mode
    single: warmup_insns
    single: simulation_insns
 
@@ -224,11 +226,27 @@ plugin sees its argv.
    ``qemu_plugin_insn_symbol`` on the TB's first instruction; the
    symbol name must match exactly (no demangling, no fnmatch).
 
+``trace_window=marker:simulation=<insns>``
+   Guest-driven window for **system-mode** tracing
+   (``qemu-system-<isa>``).  The workload carries a magic marker
+   instruction sequence at its entry point; when it executes, the
+   segment opens there, pins to the executing process's address
+   space, and traces ``simulation`` of that process's *user-space*
+   instructions (its synchronous kernel calls are traced but not
+   counted against the budget).  A matching end-marker in the
+   workload closes the window early when the program finishes under
+   budget.  ``simulation`` is the only legal key and must be
+   positive when given; with no key list the window spans 1 million
+   user instructions.  See the *System-mode tracing* section of
+   :doc:`architecture` for the marker contract, the address-space
+   pin, and what a system-mode trace contains.
+
 Examples::
 
    trace_window=icount:start=0+stop=20000000
    trace_window=simpoint:file=mcf.sp+interval=100000000+warmup=2000000+simulation=20000000
    trace_window=symbol:name=main+occurrence=3+simulation=20000000
+   trace_window=marker:simulation=20000000
 
 Without ``trace_window=`` the segment opens at process start and runs
 until the guest exits — equivalent to ``trace_window=icount:start=0``

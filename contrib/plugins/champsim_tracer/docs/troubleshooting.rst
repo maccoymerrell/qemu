@@ -80,14 +80,17 @@ and the disassembled string of the offending instruction.
 
 **``WP simulations skipped = N`` is large**
 
-The WP simulator skips branches whose
-``branch_type`` it can't classify into a known WP-target shape
-(usually because the per-ISA classifier left the branch as
-``BRANCH_NONE`` or routed it through an opcode the WP target
-resolver doesn't handle).  Skipped branches still appear in CP;
-they just have an empty ``wp_entries`` list.  See
-``resolve_wrong_target`` in ``champsim_tracer.cc`` for the
-classification logic.
+The counter tallies sealed BBs whose resolved wrong-path target is
+zero — no plausible alternate edge exists, so no excursion is
+kicked.  The common sources: unconditional direct jumps and calls
+(one architecturally-fixed target, nothing to mispredict toward),
+monomorphic indirect branches under ``wpprune``, cold branches the
+``wpprune`` level suppresses, and BBs without a classified branch
+terminator.  Skipped branches still appear in CP; they just have an
+empty ``wp_entries`` list.  See ``resolve_wrong_target`` and
+``wp_branch_pruned`` in ``champsim_tracer.cc`` for the resolution
+logic.  A high count on a ``wpprune=0`` run of ordinary code
+usually just reflects a call-heavy instruction mix.
 
 **``no valid simpoints in: <file>``**
 

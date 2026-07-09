@@ -353,6 +353,8 @@ static char     *start_symbol            = nullptr;
 static uint64_t  start_symbol_occurrence = 1;
 static uint64_t  start_symbol_match_count = 0;
 static int       g_window_mode           = 0; /* PluginConfig::WIN_AUTO */
+static bool g_system_mode;                 /* full-system emulation (set at install) */
+static inline bool pinned_simpoint_mode(void);
 
 /* Recompute g_next_threshold given the current segments / simpoint
  * state.  Caller holds exec_lock OR is on the install-time path
@@ -368,7 +370,8 @@ static void recompute_next_threshold(void)
                                std::memory_order_relaxed);
         return;
     }
-    if (g_window_mode == PluginConfig::WIN_SIMPOINT) {
+    if (g_window_mode == PluginConfig::WIN_SIMPOINT &&
+        !pinned_simpoint_mode()) {
         if (const SimPointEntry *sp = g_simpoints.current()) {
             uint64_t eff_start = (sp->start_insn > warmup_insns)
                 ? sp->start_insn - warmup_insns : 0;
@@ -380,8 +383,9 @@ static void recompute_next_threshold(void)
         }
         return;
     }
-    /* Symbol mode opens on TB template symbol name, not on an icount
-     * threshold; every TB must take the slow path. */
+    /* Symbol / marker / pinned-simpoint open on an executed instruction
+     * (symbol name, or the marker that then arms the user-clock), not on
+     * an icount threshold; every TB must take the slow path. */
     g_next_threshold.store(0, std::memory_order_relaxed);
 }
 
@@ -913,9 +917,32 @@ static Stats *select_histogram_bucket(uint64_t icount)
  * instruction count (g_user_icount) instead of raw icount: marker mode
  * with a live ASID pin.  Window open/close, the progress heartbeat, and
  * the finish printout must all read the same clock. */
+/*
+ * Pinned-simpoint mode: full-system WIN_SIMPOINT.  The guest marker (a
+ * self-emitting workload or the cst_attach ptrace injector) PINS the
+ * target's address space and zeroes the user-instruction clock; the
+ * SimPoint offsets — computed from a user-mode run that counts exactly
+ * the same user-space instruction stream — then position the window on
+ * that clock.  Kernel work is traced (and attributed by the excursion
+ * ownership rules) but never advances the clock, which is what makes the
+ * user-mode SimPoints valid here.  One simpoint per run: the window
+ * close exits like marker mode.
+ */
+static inline bool pinned_simpoint_mode(void)
+{
+    return g_window_mode == PluginConfig::WIN_SIMPOINT && g_system_mode;
+}
+
+static inline bool marker_scan_enabled(void)
+{
+    return g_window_mode == PluginConfig::WIN_MARKER ||
+           pinned_simpoint_mode();
+}
+
 static inline bool marker_user_clock(void)
 {
-    return g_window_mode == PluginConfig::WIN_MARKER &&
+    return (g_window_mode == PluginConfig::WIN_MARKER ||
+            pinned_simpoint_mode()) &&
            g_pinned_asid.load(std::memory_order_relaxed) != CST_ASID_UNPINNED;
 }
 
@@ -1572,12 +1599,45 @@ static void attribute_cp_insns(const BBTemplate *tmpl)
  * exec_lock and proceeds to the body-stream check.  Checks key off
  * icount_prev so the trace covers AT LEAST the requested window.
  */
+/* Open the pinned-simpoint trace window at the current TB.  Called from
+ * the fast-forward fast-path (vcpu_tb_exec) the moment the pinned
+ * process's user clock reaches the simpoint's effective start; the first
+ * traced TB is this one.  user_count_reset(lo) zeroes the clock so the
+ * window budget (warmup + simulation) is measured from here. */
+static void open_pinned_simpoint_window(unsigned int cpu_index,
+                                        uint64_t icount_prev)
+{
+    const SimPointEntry *sp = g_simpoints.current();
+    if (!sp) {
+        return;
+    }
+    uint64_t sim = simulation_insns ? simulation_insns
+                                    : simpoint_interval_insns;
+    uint64_t span = warmup_insns + sim;
+    uint64_t lo = icount_prev;
+    uint64_t hi = lo + span;
+    uint64_t reached_at = g_user_icount;
+    g_trace_segments.set_window(lo, hi);
+    user_count_reset(lo);
+    g_autofree char *label = g_strdup_printf("simpoint_%d", sp->cluster_id);
+    fprintf(stderr, "champsim_tracer: pinned simpoint %d reached (user clock %"
+            PRIu64 ") — tracing %" PRIu64 " user insns (%" PRIu64
+            " warmup)\n", sp->cluster_id, reached_at, span, warmup_insns);
+    start_trace_segment(label, lo, hi, warmup_insns, span, cpu_index,
+                        sp->weight);
+}
+
 static void tw_manage_window(unsigned int cpu_index,
                              uint64_t icount_prev,
                              BBTemplate *cur_tb_tmpl)
 {
     if (g_window_mode == PluginConfig::WIN_SYMBOL ||
-        g_window_mode == PluginConfig::WIN_MARKER) {
+        g_window_mode == PluginConfig::WIN_MARKER ||
+        pinned_simpoint_mode()) {
+        /* Pinned-simpoint takes this branch even before the marker pins:
+         * its open (below, gated on marker_pinned) waits for the pin, and
+         * falling through to the icount else-branch would wrongly open a
+         * window at icount 0 during boot. */
         /* Stop once the post-trigger simulation_insns budget is spent
          * (window_stop set when the symbol fired, or when the guest
          * marker fired — see vcpu_marker_cb, which is what opens the
@@ -1633,7 +1693,7 @@ static void tw_manage_window(unsigned int cpu_index,
                 }
             }
         }
-    } else if (g_simpoints.is_active()) {
+    } else if (g_simpoints.is_active() && !pinned_simpoint_mode()) {
         if (g_trace_segments.is_active() &&
             icount_prev >= g_trace_segments.window_stop()) {
             /* icount has optimistically crossed window_stop but the
@@ -2104,6 +2164,44 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
      * it skips the lock cleanly. */
     if (g_wp_state.in_progress) {
         g_wp_state.last_executed_tb = cur_tb_tmpl;
+        return;
+    }
+
+    /* Fast-forward fast-path (pinned-simpoint, system mode).  Between the
+     * pin and the window opening, the ONLY work needed per TB is to
+     * advance the pinned process's user-instruction clock and watch for
+     * the simpoint's effective start.  Placed ahead of the whole per-TB
+     * prologue (promote, capture-mute latch, the vclock pause/resume) so
+     * the hundreds of billions of fast-forward instructions skip all of
+     * it.  On the TB that crosses the threshold we open the window and
+     * fall through into the full path so this same TB is the first one
+     * traced. */
+    if (pinned_simpoint_mode() &&
+        g_pinned_asid.load(std::memory_order_relaxed) != CST_ASID_UNPINNED &&
+        !g_trace_segments.is_active()) {
+        uint64_t icount_ff = qemu_plugin_u64_get(g_scoreboard.insn_count,
+                                                 cpu_index);
+        uint64_t delta = icount_ff - g_user_icount_seen;
+        g_user_icount_seen = icount_ff;
+        if (qemu_plugin_get_addr_space_id() ==
+                g_pinned_asid.load(std::memory_order_relaxed) &&
+            qemu_plugin_get_priv_level() == 0) {
+            g_user_icount += delta;
+        }
+        const SimPointEntry *sp = g_simpoints.current();
+        uint64_t eff_start = (sp && sp->start_insn > warmup_insns)
+            ? sp->start_insn - warmup_insns : 0;
+        if (sp && g_user_icount >= eff_start) {
+            g_rec_mutex_lock(&exec_lock);
+            if (!g_trace_segments.is_active() &&
+                !g_trace_segments.is_shutting_down()) {
+                open_pinned_simpoint_window(cpu_index, icount_ff);
+            }
+            g_rec_mutex_unlock(&exec_lock);
+        }
+        /* Fast-forward is per-TB accounting only; the first traced TB is
+         * handled by the full path on the NEXT dispatch (segment now
+         * active).  Always return here. */
         return;
     }
 
@@ -2635,6 +2733,27 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
     uint64_t asid = qemu_plugin_get_addr_space_id();
     g_pinned_asid.store(asid, std::memory_order_relaxed);
 
+    if (pinned_simpoint_mode()) {
+        /* Pin only: zero the user clock at the target's first instruction
+         * and turn on the per-TB callback so the clock advances (the
+         * budget slot parks at the sentinel; the capture callbacks all
+         * bail while no segment is active).  tw_manage_window opens the
+         * window when the clock reaches the simpoint's effective start. */
+        uint64_t lo = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
+        user_count_reset(lo);
+        for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
+            qemu_plugin_u64_set(g_scoreboard.is_active, (unsigned)i, 1);
+            qemu_plugin_u64_set(g_scoreboard.budget, (unsigned)i,
+                                (uint64_t)BUDGET_INACTIVE_SENTINEL);
+        }
+        const SimPointEntry *sp = g_simpoints.current();
+        fprintf(stderr, "champsim_tracer: marker pinned asid 0x%" PRIx64
+                " at icount %" PRIu64 " — positioning to simpoint start %"
+                PRIu64 " user insns (warmup %" PRIu64 ")\n",
+                asid, lo, sp ? sp->start_insn : 0, warmup_insns);
+        return;
+    }
+
     g_rec_mutex_lock(&exec_lock);
     if (!g_trace_segments.is_active() && !g_trace_segments.is_shutting_down()) {
         uint64_t lo = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
@@ -2901,7 +3020,7 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
          * arming on the final insn means that when it executes, the whole
          * sequence ran before it.  Registered at every translation so the
          * marker is caught wherever the process runs. */
-        if (g_window_mode == PluginConfig::WIN_MARKER && g_marker_seq.valid) {
+        if (marker_scan_enabled() && g_marker_seq.valid) {
             /* Arm the exec callback on every insn whose bytes belong to a
              * marker sequence; the callback judges consecutivity in the
              * user-space stream by PC adjacency, so detection is
@@ -3842,8 +3961,10 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      * implies --marker, pinning a real guest ASID).  Enable the per-entry
      * sync-fault trailer there so handler code is depth-tagged; user-mode
      * windows leave it off and emit no trailer. */
+    g_system_mode = info->system_emulation;
     g_features.fault_excursions =
-        (g_window_mode == PluginConfig::WIN_MARKER) &&
+        (g_window_mode == PluginConfig::WIN_MARKER ||
+         pinned_simpoint_mode()) &&
         getenv("CST_NO_FAULT") == nullptr;
 
     /* Kernel-excursion ownership rides the marker-mode ASID pin (the

@@ -921,6 +921,14 @@ typedef struct {
      * function-call / TLS-cache overhead the callback's C-level
      * early-bail still pays. */
     uint64_t is_active;
+    /* 1 while the live address space is the pinned one, 0 otherwise.
+     * Maintained by the synchronous ASID-write hook (see
+     * asid_write_track_cb): the value only changes at the architectural
+     * address-space-register commit points, so a per-write update keeps
+     * the flag exact with zero per-TB cost.  Backs the cond_cb that
+     * compensates the coarse fast-forward countdown for foreign-process
+     * user instructions. */
+    uint64_t asid_match;
     /* Signed budget tracking insns until the next window event
      * (segment open in inter-segment, or sentinel "far future" while
      * in-segment).  Bumped by INLINE_ADD_U64(-n_insns) per TB exec

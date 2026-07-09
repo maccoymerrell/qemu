@@ -259,18 +259,60 @@ static inline void user_count_reset(uint64_t insn_count_now)
  * FF_COARSE_MARGIN short of the simpoint's effective start;
  * vcpu_tb_check_budget hands the final stretch to the exact path.
  *
- * Exactness: the countdown cannot distinguish the pinned process's user
- * instructions from another process's, so any other user-mode activity
- * decrements it too — the crossing can only fire EARLY, never past the
- * target, and the exact stretch (which checks the live ASID) simply
- * lengthens.  The fold of the countdown into g_user_icount at handoff is
- * therefore an upper bound; on a dedicated single-workload guest the
- * error is ~zero.  Multi-vCPU guests skip the coarse leg entirely: the
- * budget slots are per-vCPU but the user clock is global.
+ * Exactness: a JIT inline op cannot test the live ASID, so the raw
+ * decrement counts every process's user instructions.  The correction
+ * rides the scoreboard asid_match flag — maintained by the synchronous
+ * ASID-write hook at the architectural commit points, so it is exact at
+ * every user TB with zero per-TB maintenance — via a compensating
+ * cond_cb registered between the decrement and the crossing detector:
+ * when asid_match == 0 (a foreign process's user TB), a trivial
+ * callback adds the decrement back and tallies the foreign count.  The
+ * countdown therefore counts exactly the PINNED process's user
+ * instructions; concurrent user workloads (e.g. a duplicate of the
+ * traced program) cost only the tiny add-back call on their own TBs,
+ * never positioning error.  The pinned process's TBs pay one untaken
+ * JIT compare.
+ *
+ * The only uncompensated sliver is the handful of TBs between the pin
+ * and the pin-time flush landing (pre-pin TBs carry the unconditional
+ * decrement); it is bounded by a few TBs' worth of instructions and
+ * fires the crossing EARLY, never late.  Multi-vCPU guests skip the
+ * coarse leg entirely: the budget slots are per-vCPU but the user
+ * clock is global.
  */
 static std::atomic<bool> g_ff_coarse{false};
 static uint64_t g_ff_coarse_target = 0;   /* user insns from pin to handoff */
+static uint64_t g_ff_foreign_insns = 0;   /* compensated foreign user insns */
 static constexpr uint64_t FF_COARSE_MARGIN = 200000000;   /* 200M-insn exact tail */
+
+/* Compensation callback for the coarse countdown: fires (via cond_cb
+ * on asid_match == 0) only on user TBs executed by a process other
+ * than the pinned one; adds the TB's unconditional decrement back so
+ * the countdown nets to pinned-process user instructions only.  udata
+ * carries the TB's raw insn count.  Post-handoff stale firings (before
+ * the handoff flush lands) add to the sentinel-parked budget —
+ * harmless headroom. */
+static void vcpu_tb_ff_foreign(unsigned int cpu_index, void *udata)
+{
+    uint64_t n = (uint64_t)(uintptr_t)udata;
+    qemu_plugin_u64_add(g_scoreboard.budget, cpu_index, n);
+    g_ff_foreign_insns += n;
+}
+
+/* Synchronous ASID-write hook: keep the per-vCPU asid_match flag in
+ * step with the live address space.  Fires at the same architectural
+ * commit points that produce ASID_WRITE path events (and with the same
+ * wrong-path suppression), including while the event queue is disabled
+ * — which is the whole point: the coarse fast-forward runs with no
+ * dispatching callbacks at all.  Kernel-side transient values (PTI
+ * overlays, TLB maintenance) flip the flag while no user TB can
+ * execute; the exit write restores it before user code resumes. */
+static void asid_write_track_cb(unsigned int vcpu_index, uint64_t new_asid)
+{
+    qemu_plugin_u64_set(
+        g_scoreboard.asid_match, vcpu_index,
+        new_asid == g_pinned_asid.load(std::memory_order_relaxed) ? 1 : 0);
+}
 
 /* Emit-time fault-depth trailer register (system mode): the exception-
  * nesting depth the deferred prev TB ran at, stamped by the PathBuilder
@@ -1854,15 +1896,17 @@ static void vcpu_tb_check_budget(unsigned int cpu_index, void *udata)
     uint64_t icount_now = qemu_plugin_u64_get(
         g_scoreboard.insn_count, cpu_index);
     if (g_ff_coarse.load(std::memory_order_relaxed)) {
-        /* Coarse fast-forward handoff: the user-insn countdown armed at
-         * pin time crossed zero, FF_COARSE_MARGIN short of the simpoint's
-         * effective start.  Fold the countdown into the user clock (an
-         * upper bound — see g_ff_coarse; overcount lands early, never
-         * late) and switch the final stretch to the exact per-TB path,
-         * which counts against the live ASID and opens the window on the
-         * precise threshold.  The flush retires coarse-instrumented TBs
-         * so later translations regain the unconditional budget
-         * decrement for post-window inter-segment logic. */
+        /* Coarse fast-forward handoff: the pinned-user countdown armed
+         * at pin time crossed zero, FF_COARSE_MARGIN short of the
+         * simpoint's effective start.  The compensation cond_cb nets
+         * foreign user TBs out of the countdown, so the fold into the
+         * user clock is exact (see g_ff_coarse; the only slack is the
+         * few pre-pin-flush TBs, which land early, never late).  Switch
+         * the final stretch to the exact per-TB path, which counts
+         * against the live ASID and opens the window on the precise
+         * threshold.  The flush retires coarse-instrumented TBs so
+         * later translations regain the unconditional budget decrement
+         * for post-window inter-segment logic. */
         g_ff_coarse.store(false, std::memory_order_relaxed);
         g_user_icount = g_ff_coarse_target;
         g_user_icount_seen = icount_now;
@@ -1873,9 +1917,11 @@ static void vcpu_tb_check_budget(unsigned int cpu_index, void *udata)
         }
         qemu_plugin_request_tb_flush();
         fprintf(stderr, "champsim_tracer: coarse fast-forward handoff at "
-                "user clock %" PRIu64 " (raw icount %" PRIu64 ") — exact "
-                "positioning for the final %" PRIu64 " insns\n",
-                g_user_icount, icount_now, FF_COARSE_MARGIN);
+                "user clock %" PRIu64 " (raw icount %" PRIu64 ", foreign "
+                "user insns compensated %" PRIu64 ") — exact positioning "
+                "for the final %" PRIu64 " insns\n",
+                g_user_icount, icount_now, g_ff_foreign_insns,
+                FF_COARSE_MARGIN);
         g_rec_mutex_unlock(&exec_lock);
         return;
     }
@@ -2810,12 +2856,16 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
             eff_start > 2 * FF_COARSE_MARGIN) {
             /* Distant simpoint: coarse leg first (see g_ff_coarse).
              * is_active stays 0 — nothing dispatches per TB; the
-             * user-mode-only budget countdown fires the handoff
-             * FF_COARSE_MARGIN short of the target.  Flush so TBs
-             * translated before the pin — whose budget decrements are
-             * unconditional, kernel included — are retired before the
-             * countdown accumulates. */
+             * pinned-user budget countdown fires the handoff
+             * FF_COARSE_MARGIN short of the target.  The marker
+             * executes in the pinned process, so asid_match seeds to 1
+             * here; the ASID-write hook maintains it from now on.
+             * Flush so TBs translated before the pin — whose budget
+             * decrements are unconditional, kernel included — are
+             * retired before the countdown accumulates. */
             g_ff_coarse_target = eff_start - FF_COARSE_MARGIN;
+            g_ff_foreign_insns = 0;
+            qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
             g_ff_coarse.store(true, std::memory_order_relaxed);
             qemu_plugin_u64_set(g_scoreboard.budget, cpu_index,
                                 g_ff_coarse_target);
@@ -3423,13 +3473,25 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * and the crossing detector (see g_ff_coarse).  The pin-time and
      * handoff-time flushes bound each phase's TBs to its own
      * registration shape. */
-    bool ff_coarse_kernel_tb =
-        g_ff_coarse.load(std::memory_order_relaxed) &&
+    bool ff_coarse = g_ff_coarse.load(std::memory_order_relaxed);
+    bool ff_coarse_kernel_tb = ff_coarse &&
         qemu_plugin_get_priv_level() != 0;
     if (!ff_coarse_kernel_tb) {
         qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
             tb, QEMU_PLUGIN_INLINE_ADD_U64,
             g_scoreboard.budget, (uint64_t)(int64_t)(-(int64_t)raw_n_insns));
+    }
+    if (ff_coarse && !ff_coarse_kernel_tb) {
+        /* Coarse-countdown compensation: registered between the
+         * unconditional decrement above and the crossing detector
+         * below (per-TB callbacks execute in registration order), so a
+         * foreign-process user TB nets to zero before the crossing is
+         * evaluated.  asid_match == 0 exactly when the live address
+         * space is not the pinned one. */
+        qemu_plugin_register_vcpu_tb_exec_cond_cb(
+            tb, vcpu_tb_ff_foreign, QEMU_PLUGIN_CB_NO_REGS,
+            QEMU_PLUGIN_COND_EQ, g_scoreboard.asid_match, 0,
+            (void *)(uintptr_t)raw_n_insns);
     }
 
     /* Threshold-crossing detector: fires once when the budget slot
@@ -4188,6 +4250,14 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     qemu_plugin_register_flush_cb(id, vcpu_tb_flush);
     qemu_plugin_register_vcpu_init_cb(id, vcpu_init_cb);
     qemu_plugin_register_atexit_cb(id, plugin_exit, nullptr);
+    if (g_system_mode) {
+        /* Keep the per-vCPU asid_match flag current from the
+         * architectural ASID-write commit points (fires even while the
+         * path-event queue is disabled; wrong-path writes suppressed).
+         * Backs the coarse fast-forward compensation — see
+         * asid_write_track_cb. */
+        qemu_plugin_register_asid_write_cb(id, asid_write_track_cb);
+    }
 
     return 0;
 }

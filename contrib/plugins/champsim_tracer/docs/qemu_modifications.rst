@@ -62,6 +62,18 @@ Plugin API additions
      before the consuming ``tb_exec`` callback returns — and resets
      its length; both producer and consumer are the owning vCPU
      thread, so the API is lock-free by construction.
+   * ``qemu_plugin_register_asid_write_cb`` — synchronous
+     notification each time the guest commits a changed value to the
+     register ``qemu_plugin_get_addr_space_id()`` reports, fired from
+     the same per-target commit points that produce
+     ``QEMU_PLUGIN_CPU_EVENT_ASID_WRITE`` path events and with the
+     same wrong-path suppression.  Unlike the queued event it fires
+     even while the event queue is disabled, which is its purpose:
+     the coarse fast-forward phase runs with no dispatching
+     callbacks at all, yet must know whether the live address space
+     is the pinned process's so the JIT-inlined user-instruction
+     countdown can be compensated for foreign-process execution.
+     The callback runs on the owning vCPU thread.
    * ``qemu_plugin_fault_depth`` — the live synchronous-fault
      nesting depth from QEMU's fault stack (see *Path-event
      delivery*).  The plugin baselines per-segment depth reporting

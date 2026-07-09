@@ -32,12 +32,46 @@
  * space the event actually happened in, not whatever is live at the next
  * TB boundary.
  */
+/* Synchronous ASID-write hook (qemu_plugin_register_asid_write_cb).
+ * A single slot suffices: the path-event machinery is already
+ * effectively single-consumer (the queue drain hands the whole buffer
+ * to whichever plugin asks). */
+static qemu_plugin_asid_write_cb_t asid_write_hook;
+
+void qemu_plugin_register_asid_write_cb(qemu_plugin_id_t id,
+                                        qemu_plugin_asid_write_cb_t cb)
+{
+    asid_write_hook = cb;
+}
+
 void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
                          uint32_t depth_after)
 {
     QemuPluginCpuEventQueue *q = &cpu->plugin_evq;
 
-    if (!q->enabled || cpu->plugin_spec_mode) {
+    if (cpu->plugin_spec_mode) {
+        return;
+    }
+    /*
+     * The synchronous ASID-write hook fires BEFORE the queue-enabled
+     * check: it exists precisely for phases where nothing drains the
+     * queue (so it stays disabled) but the plugin still needs to
+     * observe address-space transitions — e.g. fast-forward counting
+     * gated on a pinned process.  Same spec-mode suppression as the
+     * queued event; the value passed is the just-committed one the
+     * per-target state hook reports.
+     */
+    if (kind == QEMU_PLUGIN_CPU_EVENT_ASID_WRITE && asid_write_hook) {
+        int hpriv = 0;
+        uint64_t hasid = 0;
+        bool hmmu_on = true;
+        const TCGCPUOps *hops = cpu->cc->tcg_ops;
+        if (hops && hops->get_plugin_state) {
+            hops->get_plugin_state(cpu, &hpriv, &hasid, &hmmu_on);
+        }
+        asid_write_hook(cpu->cpu_index, hasid);
+    }
+    if (!q->enabled) {
         return;
     }
     if (q->len == q->cap) {

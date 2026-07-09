@@ -21,6 +21,8 @@ VCPUScoreboard::VCPUScoreboard()
         sb_, VCPUScoreBoard, insn_count);
     is_active = qemu_plugin_scoreboard_u64_in_struct(
         sb_, VCPUScoreBoard, is_active);
+    asid_match = qemu_plugin_scoreboard_u64_in_struct(
+        sb_, VCPUScoreBoard, asid_match);
     budget = qemu_plugin_scoreboard_u64_in_struct(
         sb_, VCPUScoreBoard, budget);
 }

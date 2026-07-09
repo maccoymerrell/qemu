@@ -85,11 +85,16 @@ typedef uint64_t qemu_plugin_id_t;
  * - added qemu_plugin_request_tb_flush (drop the TB cache from a
  *   plugin so a state change that gates translation-time
  *   instrumentation can take effect on every subsequent TB)
+ *
+ * version 9:
+ * - added qemu_plugin_register_asid_write_cb (synchronous notification
+ *   at the architectural address-space-register commit points; fires
+ *   even while the per-vCPU path-event queue is disabled)
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 8
+#define QEMU_PLUGIN_VERSION 9
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -1000,6 +1005,33 @@ void qemu_plugin_register_flush_cb(qemu_plugin_id_t id,
  */
 QEMU_PLUGIN_API
 void qemu_plugin_request_tb_flush(void);
+
+/**
+ * typedef qemu_plugin_asid_write_cb_t - address-space-register write hook
+ * @vcpu_index: the vCPU that committed the write
+ * @new_asid: the just-committed value, as reported by
+ *            qemu_plugin_get_addr_space_id()
+ */
+typedef void (*qemu_plugin_asid_write_cb_t)(unsigned int vcpu_index,
+                                            uint64_t new_asid);
+
+/**
+ * qemu_plugin_register_asid_write_cb() - register ASID-write hook
+ * @id: plugin ID
+ * @cb: callback, or NULL to unregister
+ *
+ * Fires synchronously on the owning vCPU thread each time the guest
+ * commits a changed value to the register
+ * qemu_plugin_get_addr_space_id() reports (the same per-target commit
+ * points that produce QEMU_PLUGIN_CPU_EVENT_ASID_WRITE path events),
+ * system emulation only.  Unlike the queued event, the hook fires even
+ * while the per-vCPU event queue is disabled — a plugin can track
+ * address-space transitions during phases where nothing drains the
+ * queue.  Wrong-path (speculative) writes are suppressed.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_register_asid_write_cb(qemu_plugin_id_t id,
+                                        qemu_plugin_asid_write_cb_t cb);
 
 /**
  * qemu_plugin_register_atexit_cb() - register exit callback

@@ -760,6 +760,21 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
     arm_call_el_change_hook(cpu);
     bql_unlock();
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Report the exception return so a system-mode tracer can pop its fault
+     * resume-PC stack when this lands back on a faulting instruction.  Every
+     * legal return is reported (PC committed above, in env->pc for AArch64 or
+     * regs[15] for AArch32 — get_pc reads whichever); the tracer pops only on
+     * a top-of-stack match, so syscall/async returns it never pushed are
+     * ignored.  Correct path only — a wrong-path eret must not perturb it.
+     */
+    {
+        CPUState *cs_ = env_cpu(env);
+        cpu_plugin_fault_pop(cs_, cs_->cc->get_pc(cs_));
+    }
+#endif
+
     return;
 
 illegal_return:

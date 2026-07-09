@@ -1407,6 +1407,25 @@ QEMU_PLUGIN_API
 void qemu_plugin_spec_vtime_resume(void);
 
 /**
+ * qemu_plugin_vclock_pause() - freeze the guest clock for instrumentation work
+ *
+ * Nestable.  Wrap plugin work that runs on the vCPU thread but is not guest
+ * execution (translation-time decoding, per-TB trace emission) so its host
+ * wall-clock cost is not charged to guest time.  Without it, instrumented
+ * guest interrupt handlers can cost more guest time than one timer period and
+ * the guest collapses into a tick storm.  Pair with
+ * qemu_plugin_vclock_resume(); no-op in user-mode emulation.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_vclock_pause(void);
+
+/**
+ * qemu_plugin_vclock_resume() - undo one qemu_plugin_vclock_pause()
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_vclock_resume(void);
+
+/**
  * qemu_plugin_in_async_int() - is the vCPU inside an async-interrupt handler?
  *
  * Returns true while the executing vCPU is handling an asynchronous interrupt
@@ -1421,6 +1440,54 @@ void qemu_plugin_spec_vtime_resume(void);
 QEMU_PLUGIN_API
 bool qemu_plugin_in_async_int(void);
 
+/*
+ * Ordered per-vCPU path events — the event-stream alternative to
+ * edge-detecting the accumulated fault/async state above.  Each fault
+ * entry/return and async-window edge is appended at its QEMU chokepoint,
+ * in order, with the address-space id and privilege level stamped at the
+ * event instant.  Only populated after a plugin opts in per vCPU via
+ * qemu_plugin_cpu_events_set(); the producing and consuming thread are
+ * both the owning vCPU thread.
+ */
+enum qemu_plugin_cpu_event_kind {
+    QEMU_PLUGIN_CPU_EV_FAULT_ENTER  = 0,
+    QEMU_PLUGIN_CPU_EV_FAULT_RETURN = 1,
+    QEMU_PLUGIN_CPU_EV_ASYNC_ENTER  = 2,
+    QEMU_PLUGIN_CPU_EV_ASYNC_RETURN = 3,
+};
+
+struct qemu_plugin_cpu_event {
+    uint8_t  kind;          /* enum qemu_plugin_cpu_event_kind */
+    uint8_t  priv;          /* privilege level at the event instant */
+    uint32_t depth_after;   /* fault-stack depth after this event */
+    uint64_t pc;            /* resume PC (fault) / departure PC (async) */
+    uint64_t asid;          /* address-space id at the event instant */
+};
+
+/**
+ * qemu_plugin_cpu_events_set() - enable/disable the vCPU path-event queue
+ * @vcpu_index: which vCPU
+ * @enabled: true to start collecting events (clears any prior backlog)
+ *
+ * Must be called from the vCPU's own thread (e.g. a tb_exec callback) or
+ * before the vCPU runs.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_cpu_events_set(unsigned int vcpu_index, bool enabled);
+
+/**
+ * qemu_plugin_drain_cpu_events() - consume the vCPU's pending path events
+ * @vcpu_index: which vCPU
+ * @evs: out — pointer to the drained events (valid until the next drain
+ *       or events_set call on this vCPU)
+ *
+ * Returns the number of drained events and resets the queue.  Call from
+ * the owning vCPU thread only.
+ */
+QEMU_PLUGIN_API
+size_t qemu_plugin_drain_cpu_events(unsigned int vcpu_index,
+                                    const struct qemu_plugin_cpu_event **evs);
+
 /**
  * qemu_plugin_async_int_reset() - force-clear the async-interrupt flag
  *
@@ -1431,6 +1498,42 @@ bool qemu_plugin_in_async_int(void);
  */
 QEMU_PLUGIN_API
 void qemu_plugin_async_int_reset(void);
+
+/**
+ * qemu_plugin_fault_depth() - current synchronous-fault nesting depth
+ *
+ * Returns the executing vCPU's live fault-stack depth: the number of
+ * synchronous fault deliveries (whose handlers re-execute the faulting
+ * instruction on exception return) not yet matched by their exception
+ * return.  Unlike async interrupts (dropped via qemu_plugin_in_async_int()),
+ * synchronous faults are KEPT — the handler is real workload-induced code —
+ * so a tracer reads this depth to tag handler code with its nesting level.
+ * QEMU owns the underlying resume-PC stack and maintains it synchronously at
+ * each delivery/return chokepoint, so the value is exact even under dense
+ * nested faults.  The ordered per-vCPU event queue above carries the same
+ * transitions as FAULT_ENTER/FAULT_RETURN events with per-event depth_after
+ * stamps; this accessor reads the live depth at a point in time (e.g. to
+ * baseline a trace window) without consuming events.  Reads zero in
+ * *-linux-user and on uninstrumented targets.  Must be called from a vCPU
+ * context (e.g. an exec callback).
+ */
+QEMU_PLUGIN_API
+uint32_t qemu_plugin_fault_depth(void);
+
+/**
+ * qemu_plugin_spec_store_overflowed() - did the current wrong-path excursion's
+ * speculative-store footprint cross the soft budget?
+ *
+ * True when a single wrong-path instruction wrote a garbage-size region into
+ * the speculative store sandbox without faulting (it is buffered, not real),
+ * crossing PLUGIN_SPEC_STORE_SOFT_BUDGET lines.  A normal wpdepth-bounded
+ * excursion never trips this; the wrong-path loop should poll it and terminate
+ * the excursion so the sandbox is not filled to its hard cap (which would
+ * silently drop later speculative stores).  Always false in user mode / outside
+ * spec mode.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_spec_store_overflowed(void);
 
 /**
  * qemu_plugin_get_priv_level() - current privilege level of the executing vCPU
@@ -1469,5 +1572,19 @@ uint64_t qemu_plugin_get_addr_space_id(void);
  */
 QEMU_PLUGIN_API
 bool qemu_plugin_paging_enabled(void);
+
+/**
+ * qemu_plugin_icount_enabled() - whether QEMU is running with -icount
+ *
+ * Returns true when instruction-count timing is active.  Under icount the
+ * guest virtual clock is driven by the instruction count rather than host
+ * wall-clock, so the wrong-path virtual-clock freeze (cpu_disable_ticks) does
+ * NOT stop guest time from advancing during a speculative excursion.  A plugin
+ * that speculatively executes wrong-path code should refrain from speculating
+ * under icount (the excursion's instructions would leak into guest time).
+ * Always false in *-linux-user.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_icount_enabled(void);
 
 #endif /* QEMU_QEMU_PLUGIN_H */

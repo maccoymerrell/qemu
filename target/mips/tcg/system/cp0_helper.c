@@ -528,6 +528,12 @@ void helper_mtc0_mvpcontrol(CPUMIPSState *env, target_ulong arg1)
     uint32_t mask = 0;
     uint32_t newval;
 
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes the shared MVP context (env->mvp), out of snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
     if (env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) {
         mask |= (1 << CP0MVPCo_CPA) | (1 << CP0MVPCo_VPC) |
                 (1 << CP0MVPCo_EVP);
@@ -564,9 +570,17 @@ void helper_mtc0_vpecontrol(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_vpecontrol(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
     uint32_t mask;
     uint32_t newval;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     mask = (1 << CP0VPECo_YSI) | (1 << CP0VPECo_GSI) |
            (1 << CP0VPECo_TE) | (0xff << CP0VPECo_TargTC);
@@ -614,9 +628,17 @@ void helper_mtc0_vpeconf0(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_vpeconf0(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
     uint32_t mask = 0;
     uint32_t newval;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     mask |= (1 << CP0VPEC0_MVP) | (1 << CP0VPEC0_VPA);
     newval = (other->CP0_VPEConf0 & ~mask) | (arg1 & mask);
@@ -688,7 +710,15 @@ void helper_mtc0_tcstatus(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_tcstatus(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.CP0_TCStatus = arg1;
@@ -715,7 +745,15 @@ void helper_mttc0_tcbind(CPUMIPSState *env, target_ulong arg1)
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
     uint32_t mask = (1 << CP0TCBd_TBE);
     uint32_t newval;
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other->mvp->CP0_MVPControl & (1 << CP0MVPCo_VPC)) {
         mask |= (1 << CP0TCBd_CurVPE);
@@ -741,7 +779,15 @@ void helper_mtc0_tcrestart(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_tcrestart(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.PC = arg1;
@@ -775,8 +821,20 @@ void helper_mtc0_tchalt(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_tchalt(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
-    MIPSCPU *other_cpu = env_archcpu(other);
+    CPUMIPSState *other;
+    MIPSCPU *other_cpu;
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path: writes a sibling TC's env and toggles its run state
+     * (mips_tc_sleep/wake), both out of this CPU's snapshot.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
+    other_cpu = env_archcpu(other);
 
     /* TODO: Halt TC / Restart (if allocated+active) TC. */
 
@@ -801,7 +859,15 @@ void helper_mtc0_tccontext(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_tccontext(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.CP0_TCContext = arg1;
@@ -818,7 +884,15 @@ void helper_mtc0_tcschedule(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_tcschedule(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.CP0_TCSchedule = arg1;
@@ -835,7 +909,15 @@ void helper_mtc0_tcschefback(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_tcschefback(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.CP0_TCScheFBack = arg1;
@@ -1120,7 +1202,15 @@ void helper_mtc0_entryhi(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_entryhi(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     other->CP0_EntryHi = arg1;
     sync_c0_entryhi(other, other_tc);
@@ -1174,7 +1264,15 @@ void helper_mttc0_status(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
     uint32_t mask = env->CP0_Status_rw_bitmask & ~0xf1000018;
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     other->CP0_Status = (other->CP0_Status & ~mask) | (arg1 & mask);
     sync_c0_status(env, other, other_tc);
@@ -1193,13 +1291,35 @@ void helper_mtc0_srsctl(CPUMIPSState *env, target_ulong arg1)
 
 void helper_mtc0_cause(CPUMIPSState *env, target_ulong arg1)
 {
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path: cpu_mips_store_cause toggles the soft IRQ line
+     * (interrupt_request, out of snapshot) and on a CP0_Cause.DC flip
+     * starts/stops the host count timer. The CP0_Cause register write
+     * is rolled back with the snapshot anyway, so skip the whole store.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
     cpu_mips_store_cause(env, arg1);
 }
 
 void helper_mttc0_cause(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path: writes a sibling TC's CP0_Cause (out of this CPU's
+     * snapshot) and toggles its soft IRQ line / host count timer.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     cpu_mips_store_cause(other, arg1);
 }
@@ -1232,8 +1352,16 @@ void helper_mtc0_ebase(CPUMIPSState *env, target_ulong arg1)
 void helper_mttc0_ebase(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
     target_ulong mask = 0x3FFFF000 | env->CP0_EBaseWG_rw_bitmask;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
     if (arg1 & env->CP0_EBaseWG_rw_bitmask) {
         mask |= ~0x3FFFFFFF;
     }
@@ -1384,7 +1512,15 @@ void helper_mttc0_debug(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
     uint32_t val = arg1 & ((1 << CP0DB_SSt) | (1 << CP0DB_Halt));
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     /* XXX: Might be wrong, check with EJTAG spec. */
     if (other_tc == other->current_tc) {
@@ -1510,7 +1646,15 @@ target_ulong helper_mftdsp(CPUMIPSState *env)
 void helper_mttgpr(CPUMIPSState *env, target_ulong arg1, uint32_t sel)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.gpr[sel] = arg1;
@@ -1522,7 +1666,15 @@ void helper_mttgpr(CPUMIPSState *env, target_ulong arg1, uint32_t sel)
 void helper_mttlo(CPUMIPSState *env, target_ulong arg1, uint32_t sel)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.LO[sel] = arg1;
@@ -1534,7 +1686,15 @@ void helper_mttlo(CPUMIPSState *env, target_ulong arg1, uint32_t sel)
 void helper_mtthi(CPUMIPSState *env, target_ulong arg1, uint32_t sel)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.HI[sel] = arg1;
@@ -1546,7 +1706,15 @@ void helper_mtthi(CPUMIPSState *env, target_ulong arg1, uint32_t sel)
 void helper_mttacx(CPUMIPSState *env, target_ulong arg1, uint32_t sel)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.ACX[sel] = arg1;
@@ -1558,7 +1726,15 @@ void helper_mttacx(CPUMIPSState *env, target_ulong arg1, uint32_t sel)
 void helper_mttdsp(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
-    CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+    CPUMIPSState *other;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes a sibling TC's env, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
+    other = mips_cpu_map_tc(env, &other_tc);
 
     if (other_tc == other->current_tc) {
         other->active_tc.DSPControl = arg1;
@@ -1583,7 +1759,15 @@ target_ulong helper_emt(void)
 target_ulong helper_dvpe(CPUMIPSState *env)
 {
     CPUState *other_cs = first_cpu;
-    target_ulong prev = env->mvp->CP0_MVPControl;
+    target_ulong prev;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes the shared mvp context, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return 0;
+    }
+#endif
+    prev = env->mvp->CP0_MVPControl;
 
     if (env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) {
         CPU_FOREACH(other_cs) {
@@ -1601,7 +1785,15 @@ target_ulong helper_dvpe(CPUMIPSState *env)
 target_ulong helper_evpe(CPUMIPSState *env)
 {
     CPUState *other_cs = first_cpu;
-    target_ulong prev = env->mvp->CP0_MVPControl;
+    target_ulong prev;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: writes the shared mvp context, out of this CPU's snapshot. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return 0;
+    }
+#endif
+    prev = env->mvp->CP0_MVPControl;
 
     if (env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) {
         CPU_FOREACH(other_cs) {
@@ -1623,7 +1815,19 @@ target_ulong helper_evpe(CPUMIPSState *env)
 target_ulong helper_dvp(CPUMIPSState *env)
 {
     CPUState *other_cs = first_cpu;
-    target_ulong prev = env->CP0_VPControl;
+    target_ulong prev;
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path: only own-CPU CP0_VPControl (in-snapshot) plus sibling
+     * sleep/wake (gated in mips_vpe_sleep/wake) — safe, but gate at entry to
+     * match dvpe/evpe and stay robust if the sink gates ever change.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return 0;
+    }
+#endif
+    prev = env->CP0_VPControl;
 
     if (!((env->CP0_VPControl >> CP0VPCtl_DIS) & 1)) {
         CPU_FOREACH(other_cs) {
@@ -1641,7 +1845,15 @@ target_ulong helper_dvp(CPUMIPSState *env)
 target_ulong helper_evp(CPUMIPSState *env)
 {
     CPUState *other_cs = first_cpu;
-    target_ulong prev = env->CP0_VPControl;
+    target_ulong prev;
+
+#ifdef CONFIG_PLUGIN
+    /* Wrong-path: see helper_dvp — gate at entry for symmetry/robustness. */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return 0;
+    }
+#endif
+    prev = env->CP0_VPControl;
 
     if ((env->CP0_VPControl >> CP0VPCtl_DIS) & 1) {
         CPU_FOREACH(other_cs) {

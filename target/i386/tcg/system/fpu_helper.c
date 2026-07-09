@@ -31,6 +31,18 @@ void x86_register_ferr_irq(qemu_irq irq)
 
 void fpu_check_raise_ferr_irq(CPUX86State *env)
 {
+    /*
+     * Wrong-path (speculative): asserting FERR# (env->ferr_irq, wired to a
+     * GSI on the PC machine) is a host IRQ-line side effect that lives
+     * outside the WP env snapshot and is not lowered on rollback.  The
+     * architected x87 status (env->fpus/fpstt) is in-snapshot and rolled
+     * back, so we drop only the external IRQ-line assertion here.  The
+     * CR0.NE=1 (#MF) path in fpu_raise_exception is unaffected: it raises
+     * an exception that already aborts the WP chain.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
     if (ferr_irq && !(env->hflags2 & HF2_IGNNE_MASK)) {
         bql_lock();
         qemu_irq_raise(ferr_irq);

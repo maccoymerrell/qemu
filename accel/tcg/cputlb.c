@@ -1209,8 +1209,18 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     /*
      * Only evict the old entry to the victim tlb if it's for a
      * different page; otherwise just overwrite the stale data.
+     *
+     * Wrong-path (#77): skip the victim-tlb eviction entirely.  The eviction
+     * is pure softmmu housekeeping (preserve the displaced entry so a future
+     * lookup can re-promote it) -- it is NOT needed to translate the
+     * speculative access, and it mutates persistent victim-TLB / counter state
+     * that the spec containment does not revert, corrupting the correct path.
+     * Overwriting the slot is harmless: the spec install log invalidates this
+     * slot on excursion exit and the correct path simply re-fills on its next
+     * access.
      */
-    if (!tlb_hit_page_anyprot(te, addr_page) && !tlb_entry_is_empty(te)) {
+    if (!cpu_plugin_spec_active(cpu) &&
+        !tlb_hit_page_anyprot(te, addr_page) && !tlb_entry_is_empty(te)) {
         unsigned vidx = desc->vindex++ % CPU_VTLB_SIZE;
         CPUTLBEntry *tv = &desc->vtable[vidx];
 
@@ -1426,6 +1436,18 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
     size_t vidx;
 
     assert_cpu_is_self(cpu);
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (#77): never promote a victim-tlb entry into the main TLB.
+     * The promotion swaps entries between the victim and main tables -- pure
+     * housekeeping that mutates persistent TLB state the spec containment can't
+     * revert.  Returning false makes the caller re-fill via tlb_fill instead,
+     * whose install is logged and reverted on excursion exit.
+     */
+    if (cpu_plugin_spec_active(cpu)) {
+        return false;
+    }
+#endif
     for (vidx = 0; vidx < CPU_VTLB_SIZE; ++vidx) {
         CPUTLBEntry *vtlb = &cpu->neg.tlb.d[mmu_idx].vtable[vidx];
         uint64_t cmp = tlb_read_idx(vtlb, access_type);
@@ -1891,6 +1913,22 @@ static void mmu_watch_or_dirty(CPUState *cpu, MMULookupPageData *data,
     vaddr addr = data->addr;
     int flags = data->flags;
     int size = data->size;
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): a watchpoint hit (cpu_check_watchpoint) sets
+     * watchpoint_hit / wp->flags, raises CPU_INTERRUPT_DEBUG and can invalidate
+     * the current TB; notdirty_write marks a clean page dirty and can
+     * invalidate a code TB -- persistent state outside the WP register
+     * snapshot.  The store/probe entrypoints already gate before mmu_lookup,
+     * but the slow LOAD path reaches here for a read/access watchpoint, so
+     * clear the flags without the side effect on the discarded path.
+     */
+    if (cpu_plugin_spec_active(cpu)) {
+        data->flags &= ~(TLB_WATCHPOINT | TLB_NOTDIRTY);
+        return;
+    }
+#endif
 
     /* On watchpoint hit, this will longjmp out.  */
     if (flags & TLB_WATCHPOINT) {

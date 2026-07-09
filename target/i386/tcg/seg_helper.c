@@ -1182,6 +1182,22 @@ void do_interrupt_all(X86CPU *cpu, int intno, int is_int,
         if (!cs_->plugin_spec_mode && !cs_->plugin_in_async_int) {
             cs_->plugin_in_async_int = true;
             cs_->plugin_async_departure_pc = cs_->cc->get_pc(cs_);
+            cpu_plugin_evq_push(cs_, QEMU_PLUGIN_CPU_EVENT_ASYNC_ENTER,
+                                cs_->plugin_async_departure_pc,
+                                cs_->plugin_fault_depth);
+        }
+    } else if (!is_int) {
+        /*
+         * Synchronous FAULT (#PF, #GP, #UD, alignment, …): is_int=0,is_hw=0.
+         * The fault handler's iret re-executes the faulting instruction, so
+         * the resume PC is the trapping PC.  Software INT n (is_int) and
+         * SYSCALL advance past the instruction and are left to the normal
+         * branch-into-kernel representation.  Report the entry; the tracer
+         * owns the resume-PC stack.
+         */
+        CPUState *cs_ = CPU(cpu);
+        if (!cs_->plugin_in_async_int) {
+            cpu_plugin_fault_push(cs_, cs_->cc->get_pc(cs_));
         }
     }
 #endif
@@ -2193,6 +2209,19 @@ static inline void helper_ret_protected(CPUX86State *env, int shift,
     }
     SET_ESP(sa.sp, sa.sp_mask);
     env->eip = new_eip;
+#ifdef CONFIG_PLUGIN
+    if (is_iret) {
+        /*
+         * Report the IRET so a system-mode tracer can pop its fault resume-PC
+         * stack when this lands back on a faulting instruction (env->eip just
+         * committed above).  Far RET (is_iret=0) is not an exception return
+         * and is skipped.  The tracer pops only on a top-of-stack match.
+         * Correct path only — a wrong-path iret must not perturb it.
+         */
+        CPUState *cs_ = env_cpu(env);
+        cpu_plugin_fault_pop(cs_, env->eip);
+    }
+#endif
     if (is_iret) {
         /* NOTE: 'cpl' is the _old_ CPL */
         eflags_mask = TF_MASK | AC_MASK | ID_MASK | RF_MASK | NT_MASK;

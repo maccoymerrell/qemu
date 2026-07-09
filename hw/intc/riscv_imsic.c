@@ -203,6 +203,23 @@ static int riscv_imsic_rmw(void *arg, target_ulong reg, target_ulong *val,
     RISCVIMSICState *imsic = arg;
     uint32_t isel, priv, virt, vgein, xlen, page;
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative) execution: the IMSIC is real device state
+     * outside the WP register snapshot, and a *TOPEI read/write CLAIMS (clears)
+     * the top external interrupt and refreshes the CPU IRQ line.  A speculative
+     * AIA IREG/TOPEI access must not mutate the device or claim an interrupt
+     * (which would be permanently dropped on the discarded path).  Return a
+     * benign zero with no side effect.
+     */
+    if (current_cpu && current_cpu->plugin_spec_mode) {
+        if (val) {
+            *val = 0;
+        }
+        return 0;
+    }
+#endif
+
     priv = AIA_IREG_PRIV(reg);
     virt = AIA_IREG_VIRT(reg);
     isel = AIA_IREG_ISEL(reg);

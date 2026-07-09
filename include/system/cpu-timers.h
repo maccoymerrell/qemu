@@ -82,6 +82,20 @@ void cpu_enable_ticks(void);
 /* Caller must hold BQL */
 void cpu_disable_ticks(void);
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Force cpu_get_ticks() (the guest TSC source) to read @target_tsc right now by
+ * re-basing cpu_ticks_offset, without touching cpu_clock_offset.  Used by the
+ * wrong-path tracer to re-lock the guest TSC to QEMU_CLOCK_VIRTUAL after each
+ * speculative excursion: the guest TSC is derived from the host rdtsc and the
+ * guest HPET from host CLOCK_MONOTONIC, two host oscillators whose ratio drifts
+ * across excursions, so without re-locking they diverge and the guest's
+ * clocksource watchdog marks the TSC unstable.  No-op while ticks are disabled.
+ * Caller must hold BQL.
+ */
+void cpu_plugin_pin_tsc(int64_t target_tsc);
+#endif
+
 /*
  * return the time elapsed in VM between vm_start and vm_stop.
  * cpu_get_ticks() uses units of the host CPU cycle counter.

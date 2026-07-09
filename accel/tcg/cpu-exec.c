@@ -37,6 +37,7 @@
 #include "exec/cpu-all.h"
 #include "exec/exec-all.h"
 #include "system/cpu-timers.h"
+#include "system/runstate.h"
 #include "exec/replay-core.h"
 #include "system/tcg.h"
 #include "exec/helper-proto-common.h"
@@ -870,31 +871,62 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
     memcpy(env, saved, size);
     memcpy(env->cpu_breakpoint, bp_save, sizeof(bp_save));
     memcpy(env->cpu_watchpoint, wp_save, sizeof(wp_save));
-#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     /*
-     * Reconcile the host QEMUTimers with the just-restored registers (no-op
-     * unless the excursion dirtied the timer via a spec-gated write or the
-     * rollback above changed timer state).
+     * Timer resync deferred to cpu_plugin_spec_vtime_resume (true excursion
+     * exit) -- see the riscv branch / #77.  Running it at this restore would
+     * fire at an intermediate fault-skip restore too.
      */
-    arm_cpu_plugin_resync_timers(current_cpu);
-#endif
 #elif defined(TARGET_RISCV)
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     /*
      * The Sstc supervisor/VS host timers (env->stimer/vstimer) live outside
-     * this register snapshot.  If the restore rolls back stimecmp/vstimecmp (or
-     * the vstime_irq latch), re-sync them so a rolled-back compare can't leave
-     * the host timer armed for a stale deadline (the ARM storm class).
+     * this register snapshot.  If the restore rolls back the architected
+     * compare register (stimecmp/vstimecmp), the host QEMUTimer is left armed
+     * for the speculative deadline while the register says otherwise -- re-sync
+     * so a rolled-back compare can't leave the host timer stale (the ARM storm
+     * class: architected timer register desynced from the host timer).
+     *
+     * Only compare fields that are actually inside the snapshot (i.e. before
+     * end_reset_fields): stimecmp/vstimecmp qualify.  vstime_irq, stimer and
+     * vstimer all sit AFTER end_reset_fields, so they are neither saved nor
+     * rolled back -- reading them through `s` would index past the saved
+     * buffer.
      */
     {
         const CPURISCVState *s = (const CPURISCVState *)saved;
-        if (env->stimecmp != s->stimecmp || env->vstimecmp != s->vstimecmp ||
-            env->vstime_irq != s->vstime_irq) {
+        if (env->stimecmp != s->stimecmp || env->vstimecmp != s->vstimecmp) {
             current_cpu->plugin_spec_timer_dirty = true;
         }
+#ifdef CONFIG_PLUGIN
+        /* #77 (i)-vs-(ii) probe: does a WP restore knock mstatus.VS On->Off,
+         * i.e. clobber a real correct-path vector-enable with a stale snapshot? */
+        if (getenv("CST_ILL_DIAG") &&
+            (env->mstatus & MSTATUS_VS) && !(s->mstatus & MSTATUS_VS)) {
+            fprintf(stderr, "[vsclobber] restore VS 1->0 spec=%d FS:%d->%d\n",
+                    (int)current_cpu->plugin_spec_mode,
+                    (int)!!(env->mstatus & MSTATUS_FS),
+                    (int)!!(s->mstatus & MSTATUS_FS));
+        }
+#endif
     }
+    /*
+     * Pure rollback: WP is fully transparent to the correct path, so env->mip
+     * (interrupt-pending) is reverted to its pre-excursion value -- interrupts
+     * remain untouched and unhandled by WP.  A timer that fired during the
+     * excursion is deferred by the timer-cb gate (plugin_spec_timer_dirty) and
+     * re-asserted by riscv_cpu_plugin_resync_timers at vtime_resume; it is not
+     * carried forward here (that force-carry perturbed interrupt-delivery
+     * timing across the merge, #77).
+     */
     memcpy(env, saved, size);
-    riscv_cpu_plugin_resync_timers(current_cpu);
+    /*
+     * Timer resync is deferred to cpu_plugin_spec_vtime_resume (the true
+     * excursion-exit boundary).  Running it here would fire at an intermediate
+     * wrong-path fault-skip restore (spec_mode_end -> restore -> spec_mode_begin),
+     * consuming plugin_spec_timer_dirty and synthesising STIP that the FINAL
+     * wp_end restore then clobbers with the stale snapshot -- losing the timer
+     * IRQ and livelocking the guest (#77).
+     */
 #else
     memcpy(env, saved, size);
 #endif
@@ -913,7 +945,7 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
         }
     }
     memcpy(env, saved, size);
-    mips_cpu_plugin_resync_timers(current_cpu);
+    /* Timer resync deferred to cpu_plugin_spec_vtime_resume -- see #77. */
 #else
     memcpy(env, saved, size);
 #endif
@@ -921,6 +953,460 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
     memcpy(env, saved, size);
 #endif
 }
+
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+/*
+ * #77 UNBIASED wrong-path write-leak detector (gated on CST_WPROTECT=<delay_s>).
+ * Host-MMU based: write-protect ALL guest RAM for the duration of each wrong-
+ * path excursion.  Reads and sandboxed (buffered) stores never touch real RAM,
+ * so they don't fault; ANY real write -- from ANY code path, known or not --
+ * traps in wprot_handler, which prints the leaking guest-physical address and
+ * the wrong-path PC of the instruction that did it, then aborts.  No guessing
+ * where to place a probe.  Armed only after a delay (default 15s) so the boot +
+ * workload phase isn't slowed; the teardown livelock happens later.
+ */
+#include <sys/mman.h>
+typedef struct { void *host; size_t len; uint64_t off; } WProtBlk;
+static WProtBlk g_wprot_blk[16];
+static int      g_wprot_nblk = 0;
+static bool     g_wprot_collected = false;
+static bool     g_wprot_installed = false;
+static bool     g_wprot_active = false;
+static bool     g_wp_bql_held = false;  /* #77 test: BQL held across excursion */
+static int      g_wprot_enabled = -1;
+static long     g_wprot_delay = 15;
+static time_t   g_wprot_start = 0;
+static long     g_wprot_pgsz = 4096;
+static struct sigaction g_wprot_old_sa;
+
+static int wprot_collect_cb(RAMBlock *rb, void *opaque)
+{
+    void *h = qemu_ram_get_host_addr(rb);
+    if (h && g_wprot_nblk < 16) {
+        g_wprot_blk[g_wprot_nblk].host = h;
+        g_wprot_blk[g_wprot_nblk].len  = qemu_ram_get_used_length(rb);
+        g_wprot_blk[g_wprot_nblk].off  = qemu_ram_get_offset(rb);
+        g_wprot_nblk++;
+    }
+    return 0;
+}
+
+static void wprot_handler(int sig, siginfo_t *si, void *uc)
+{
+    char *a = (char *)si->si_addr;
+    for (int i = 0; i < g_wprot_nblk; i++) {
+        char *base = (char *)g_wprot_blk[i].host;
+        if (a >= base && a < base + g_wprot_blk[i].len) {
+            bool spec = current_cpu && current_cpu->plugin_spec_mode;
+            bool vtp  = current_cpu && current_cpu->plugin_spec_vtime_paused;
+            if (spec || vtp) {
+                uint64_t phys = g_wprot_blk[i].off + (uint64_t)(a - base);
+                uint64_t pc = current_cpu ? current_cpu->cc->get_pc(current_cpu)
+                                          : 0;
+                fprintf(stderr, "[wpleak] WP wrote guest RAM phys=0x%" PRIx64
+                        " host=%p wp_pc=0x%" PRIx64 " spec=%d vtp=%d\n",
+                        phys, (void *)a, pc, (int)spec, (int)vtp);
+                fflush(stderr);
+                abort();
+            }
+            /* concurrent non-WP write (iothread/DMA): unprotect + continue */
+            void *pg = (void *)((uintptr_t)a & ~(uintptr_t)(g_wprot_pgsz - 1));
+            mprotect(pg, g_wprot_pgsz, PROT_READ | PROT_WRITE);
+            return;
+        }
+    }
+    /* Not guest RAM: chain to QEMU's previous SIGSEGV handler. */
+    if (g_wprot_old_sa.sa_flags & SA_SIGINFO) {
+        if (g_wprot_old_sa.sa_sigaction) {
+            g_wprot_old_sa.sa_sigaction(sig, si, uc);
+            return;
+        }
+    } else if (g_wprot_old_sa.sa_handler &&
+               g_wprot_old_sa.sa_handler != SIG_DFL &&
+               g_wprot_old_sa.sa_handler != SIG_IGN) {
+        g_wprot_old_sa.sa_handler(sig);
+        return;
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void wprot_setprot(int prot)
+{
+    for (int i = 0; i < g_wprot_nblk; i++) {
+        mprotect(g_wprot_blk[i].host, g_wprot_blk[i].len, prot);
+    }
+}
+
+static bool wprot_ready(void)
+{
+    if (g_wprot_enabled < 0) {
+        const char *e = getenv("CST_WPROTECT");
+        g_wprot_enabled = e ? 1 : 0;
+        /* delay in seconds before arming; default 0 = arm on the first WP
+         * excursion (in marker mode WP only runs post-marker, so there is no
+         * boot phase to skip). */
+        g_wprot_delay = (e && *e) ? atol(e) : 0;
+        g_wprot_pgsz = qemu_real_host_page_size();
+    }
+    if (!g_wprot_enabled) {
+        return false;
+    }
+    if (g_wprot_start == 0) {
+        g_wprot_start = time(NULL);
+    }
+    if (time(NULL) - g_wprot_start < g_wprot_delay) {
+        return false;
+    }
+    if (!g_wprot_collected) {
+        qemu_ram_foreach_block(wprot_collect_cb, NULL);
+        g_wprot_collected = true;
+    }
+    if (!g_wprot_installed) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = wprot_handler;
+        sa.sa_flags = SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, &g_wprot_old_sa);
+        g_wprot_installed = true;
+        fprintf(stderr, "[wpleak] armed: %d RAM block(s) write-protected "
+                "during WP\n", g_wprot_nblk);
+    }
+    return g_wprot_nblk > 0;
+}
+#endif /* CONFIG_PLUGIN && !CONFIG_USER_ONLY */
+
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+/*
+ * #77 UNBIASED CPU-state leak detector (gated on CST_STATEDIFF).  The WP
+ * snapshot saves/restores only CPUArchState[0..end_reset_fields] + halted +
+ * exception_index.  ANY other CPUState/env byte a wrong-path excursion mutates
+ * persists into the correct path.  This snapshots CPUState[0..neg] (all scalar
+ * fields, excludes the huge TLB) and the un-restored env tail at excursion
+ * start, compares after the restore, and logs each distinct changed-and-not-
+ * restored byte once -- revealing the leaked field with no guessing.
+ */
+#define SDIFF_CPU_SZ  sizeof(CPUState)   /* now INCLUDES neg.tlb descriptors */
+#define SDIFF_ENV_OFF offsetof(CPUArchState, end_reset_fields)
+#define SDIFF_ENV_SZ  (sizeof(CPUArchState) - offsetof(CPUArchState, end_reset_fields))
+static uint8_t g_sdiff_cpu[SDIFF_CPU_SZ];
+static uint8_t g_sdiff_env[SDIFF_ENV_SZ];
+static uint8_t g_sdiff_cpu_seen[SDIFF_CPU_SZ];
+static uint8_t g_sdiff_env_seen[SDIFF_ENV_SZ];
+static bool    g_sdiff_have = false;
+static int     g_sdiff_on = -1;
+static long    g_sdiff_delay = 0;
+static time_t  g_sdiff_start = 0;
+static bool    g_sdiff_printed_off = false;
+
+static bool sdiff_enabled(void)
+{
+    if (g_sdiff_on < 0) {
+        const char *e = getenv("CST_STATEDIFF");
+        g_sdiff_on = e ? 1 : 0;
+        g_sdiff_delay = (e && *e) ? atol(e) : 0;
+    }
+    if (g_sdiff_on <= 0) {
+        return false;
+    }
+    if (g_sdiff_start == 0) {
+        g_sdiff_start = time(NULL);
+    }
+    if (time(NULL) - g_sdiff_start < g_sdiff_delay) {
+        return false;
+    }
+    if (!g_sdiff_printed_off) {
+        g_sdiff_printed_off = true;
+        fprintf(stderr, "[statediff] armed. offsetof: interrupt_request=%zu "
+                "neg=%zu plugin_spec_tlb_log=%zu sizeof(CPUState)=%zu\n",
+                offsetof(CPUState, interrupt_request),
+                offsetof(CPUState, neg),
+                offsetof(CPUState, plugin_spec_tlb_log),
+                sizeof(CPUState));
+        fflush(stderr);
+    }
+    return true;
+}
+
+static const char *sdiff_cpu_field(size_t off)
+{
+    if (off == offsetof(CPUState, interrupt_request)) return "interrupt_request";
+    if (off == offsetof(CPUState, cflags_next_tb))     return "cflags_next_tb";
+    if (off == offsetof(CPUState, exit_request))       return "exit_request";
+    if (off >= offsetof(CPUState, plugin_spec_tlb_log) &&
+        off <  offsetof(CPUState, neg)) {
+        return "(plugin_spec_tlb_log/plugin block - intentional)";
+    }
+    if (off >= offsetof(CPUState, neg)) {
+        return "(neg/TLB)";
+    }
+    return NULL;
+}
+
+static void sdiff_snapshot(CPUState *cpu)
+{
+    if (!sdiff_enabled()) {
+        return;
+    }
+    memcpy(g_sdiff_cpu, cpu, SDIFF_CPU_SZ);
+    memcpy(g_sdiff_env, (uint8_t *)cpu_env(cpu) + SDIFF_ENV_OFF, SDIFF_ENV_SZ);
+    g_sdiff_have = true;
+}
+
+static void sdiff_compare(CPUState *cpu)
+{
+    if (!sdiff_enabled() || !g_sdiff_have) {
+        return;
+    }
+    const uint8_t *now = (const uint8_t *)cpu;
+    for (size_t i = 0; i < SDIFF_CPU_SZ; i++) {
+        if (now[i] != g_sdiff_cpu[i] && !g_sdiff_cpu_seen[i]) {
+            g_sdiff_cpu_seen[i] = 1;
+            const char *f = sdiff_cpu_field(i);
+            fprintf(stderr, "[statediff] CPUState off=%zu%s%s changed across WP "
+                    "(0x%02x->0x%02x) NOT restored\n", i,
+                    f ? " field=" : "", f ? f : "",
+                    g_sdiff_cpu[i], now[i]);
+            fflush(stderr);
+        }
+    }
+    const uint8_t *enow = (const uint8_t *)cpu_env(cpu) + SDIFF_ENV_OFF;
+    for (size_t i = 0; i < SDIFF_ENV_SZ; i++) {
+        if (enow[i] != g_sdiff_env[i] && !g_sdiff_env_seen[i]) {
+            g_sdiff_env_seen[i] = 1;
+            fprintf(stderr, "[statediff] env tail off=%zu (env+%zu) changed "
+                    "across WP (0x%02x->0x%02x) NOT restored\n",
+                    i, SDIFF_ENV_OFF + i, g_sdiff_env[i], enow[i]);
+            fflush(stderr);
+        }
+    }
+}
+
+/*
+ * #77 causation test: snapshot the ENTIRE softmmu TLB at wrong-path entry and
+ * fully restore it at exit -- descriptors, the inline victim tables, AND the
+ * heap fast-table / fulltlb arrays (which sdiff cannot see, being behind
+ * pointers).  If forcing the TLB byte-identical across every excursion makes
+ * the riscv64 livelock vanish, the TLB is conclusively the leak channel.
+ * Heavy (per-excursion memcpy of the tables); diagnostic only, gated
+ * CST_TLB_SAVE.
+ */
+static int  g_tlbsave_on = -1;
+static bool g_tlbsave_have = false;
+static CPUTLBDesc      g_tlbsave_d[NB_MMU_MODES];
+static uintptr_t       g_tlbsave_mask[NB_MMU_MODES];
+static size_t          g_tlbsave_nent[NB_MMU_MODES];
+static CPUTLBEntry    *g_tlbsave_table[NB_MMU_MODES];
+static CPUTLBEntryFull *g_tlbsave_fulltlb[NB_MMU_MODES];
+static uint16_t        g_tlbsave_dirty;
+static size_t          g_tlbsave_ffc, g_tlbsave_pfc, g_tlbsave_efc;
+
+static bool tlbsave_enabled(void)
+{
+    if (g_tlbsave_on < 0) {
+        g_tlbsave_on = getenv("CST_TLB_SAVE") ? 1 : 0;
+    }
+    return g_tlbsave_on > 0;
+}
+
+static void tlbsave_snapshot(CPUState *cpu)
+{
+    if (!tlbsave_enabled()) {
+        return;
+    }
+    CPUTLB *tlb = &cpu->neg.tlb;
+    qemu_spin_lock(&tlb->c.lock);
+    g_tlbsave_dirty = tlb->c.dirty;
+    g_tlbsave_ffc = tlb->c.full_flush_count;
+    g_tlbsave_pfc = tlb->c.part_flush_count;
+    g_tlbsave_efc = tlb->c.elide_flush_count;
+    for (int i = 0; i < NB_MMU_MODES; i++) {
+        size_t nent = (tlb->f[i].mask >> CPU_TLB_ENTRY_BITS) + 1;
+        g_tlbsave_d[i] = tlb->d[i];
+        g_tlbsave_mask[i] = tlb->f[i].mask;
+        g_tlbsave_nent[i] = nent;
+        g_tlbsave_table[i] = g_realloc(g_tlbsave_table[i],
+                                       nent * sizeof(CPUTLBEntry));
+        memcpy(g_tlbsave_table[i], tlb->f[i].table,
+               nent * sizeof(CPUTLBEntry));
+        g_tlbsave_fulltlb[i] = g_realloc(g_tlbsave_fulltlb[i],
+                                         nent * sizeof(CPUTLBEntryFull));
+        memcpy(g_tlbsave_fulltlb[i], tlb->d[i].fulltlb,
+               nent * sizeof(CPUTLBEntryFull));
+    }
+    qemu_spin_unlock(&tlb->c.lock);
+    g_tlbsave_have = true;
+}
+
+static void tlbsave_restore(CPUState *cpu)
+{
+    if (!tlbsave_enabled() || !g_tlbsave_have) {
+        return;
+    }
+    CPUTLB *tlb = &cpu->neg.tlb;
+    qemu_spin_lock(&tlb->c.lock);
+    tlb->c.dirty = g_tlbsave_dirty;
+    tlb->c.full_flush_count = g_tlbsave_ffc;
+    tlb->c.part_flush_count = g_tlbsave_pfc;
+    tlb->c.elide_flush_count = g_tlbsave_efc;
+    for (int i = 0; i < NB_MMU_MODES; i++) {
+        size_t saved_nent = g_tlbsave_nent[i];
+        size_t cur_nent = (tlb->f[i].mask >> CPU_TLB_ENTRY_BITS) + 1;
+        CPUTLBEntry *table = tlb->f[i].table;
+        CPUTLBEntryFull *fulltlb = tlb->d[i].fulltlb;
+        if (cur_nent != saved_nent) {
+            /* WP resized this mmu_idx: the saved heap pointers were freed.
+             * Reallocate the live buffers back to the saved geometry. */
+            g_free(table);
+            g_free(fulltlb);
+            table = g_new(CPUTLBEntry, saved_nent);
+            fulltlb = g_new(CPUTLBEntryFull, saved_nent);
+        }
+        memcpy(table, g_tlbsave_table[i], saved_nent * sizeof(CPUTLBEntry));
+        memcpy(fulltlb, g_tlbsave_fulltlb[i],
+               saved_nent * sizeof(CPUTLBEntryFull));
+        tlb->d[i] = g_tlbsave_d[i];        /* restores inline victim + scalars */
+        tlb->d[i].fulltlb = fulltlb;       /* but keep the LIVE heap pointer */
+        tlb->f[i].mask = g_tlbsave_mask[i];
+        tlb->f[i].table = table;
+    }
+    qemu_spin_unlock(&tlb->c.lock);
+    g_tlbsave_have = false;
+}
+#endif /* CONFIG_PLUGIN && !CONFIG_USER_ONLY */
+
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+static bool cst_nofreeze(void)   /* cached: called on every excursion */
+{
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("CST_NOFREEZE") != NULL;
+    }
+    return v;
+}
+/*
+ * CST_CLKPROBE (#80 diagnostic): measure the guest-visible TSC-vs-monotonic
+ * skew the WP time-freeze accumulates.  Every excursion the freeze excludes a
+ * host-TSC interval (cpu_get_host_ticks = rdtsc) from the guest TSC and a
+ * host-monotonic interval (get_clock) from the guest HPET clock; if those two
+ * host clocks drift, the guest's clocksource watchdog eventually marks the TSC
+ * unstable.  tsc_hz is self-calibrated from the correct-path intervals between
+ * excursions (both host clocks measured over the same real interval), so
+ * "SKEW" is exactly the divergence the guest sees.  Off unless CST_CLKPROBE.
+ */
+static __thread int64_t  g_clkp_ht_pause, g_clkp_hm_pause;
+static __thread int64_t  g_clkp_ht_resume, g_clkp_hm_resume;
+static __thread int64_t  g_clkp_cp_tsc, g_clkp_cp_ns;
+static __thread int64_t  g_clkp_excl_tsc, g_clkp_excl_ns;
+static __thread int64_t  g_clkp_gt_pause, g_clkp_gc_pause;   /* GUEST tsc/clock */
+static __thread int64_t  g_clkp_gleak_tsc, g_clkp_gleak_ns;  /* guest-visible leak */
+static __thread uint64_t g_clkp_n;
+static void cst_clkprobe(bool resume)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("CST_CLKPROBE") != NULL;
+    }
+    if (!on) {
+        return;
+    }
+    int64_t ht = cpu_get_host_ticks();
+    int64_t hm = get_clock();
+    int64_t gt = cpu_get_ticks();      /* guest TSC source */
+    int64_t gc = cpu_get_clock();      /* guest QEMU_CLOCK_VIRTUAL source */
+    if (!resume) {
+        if (g_clkp_ht_resume) {          /* correct-path interval for calibration */
+            g_clkp_cp_tsc += ht - g_clkp_ht_resume;
+            g_clkp_cp_ns  += hm - g_clkp_hm_resume;
+        }
+        g_clkp_ht_pause = ht;
+        g_clkp_hm_pause = hm;
+        g_clkp_gt_pause = gt;
+        g_clkp_gc_pause = gc;
+        return;
+    }
+    g_clkp_excl_tsc += ht - g_clkp_ht_pause;   /* frozen (excluded) this excursion */
+    g_clkp_excl_ns  += hm - g_clkp_hm_pause;
+    g_clkp_gleak_tsc += gt - g_clkp_gt_pause;  /* guest TSC that LEAKED across WP */
+    g_clkp_gleak_ns  += gc - g_clkp_gc_pause;  /* guest clock that LEAKED across WP */
+    g_clkp_ht_resume = ht;
+    g_clkp_hm_resume = hm;
+    if (++g_clkp_n % 20000 == 0 && g_clkp_cp_ns > 0) {
+        double tsc_hz = (double)g_clkp_cp_tsc / (double)g_clkp_cp_ns * 1e9;
+        double excl_tsc_s  = (double)g_clkp_excl_tsc / tsc_hz;
+        double excl_mono_s = (double)g_clkp_excl_ns / 1e9;
+        double gleak_tsc_s = (double)g_clkp_gleak_tsc / tsc_hz;
+        double gleak_ns_s  = (double)g_clkp_gleak_ns / 1e9;
+        fprintf(stderr, "[clkprobe] n=%llu tsc=%.3fGHz host_skew=%.4fms "
+                "GUEST_leak_tsc=%.4fms GUEST_leak_clk=%.4fms GUEST_skew=%.4fms\n",
+                (unsigned long long)g_clkp_n, tsc_hz / 1e9,
+                (excl_tsc_s - excl_mono_s) * 1e3,
+                gleak_tsc_s * 1e3, gleak_ns_s * 1e3,
+                (gleak_tsc_s - gleak_ns_s) * 1e3);
+    }
+}
+#endif
+
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY) && defined(TARGET_I386)
+/*
+ * Re-lock the guest TSC to QEMU_CLOCK_VIRTUAL after every wrong-path excursion.
+ *
+ * The guest TSC is derived from the host rdtsc (cpu_get_host_ticks) and the
+ * guest HPET/LAPIC clock from host CLOCK_MONOTONIC (get_clock).  Those two host
+ * oscillators do not keep a constant ratio across the excursion windows vs the
+ * correct-path windows (TSC read jitter across host-core migration, P-state
+ * effects), so however balanced the per-excursion freeze is, the guest TSC and
+ * guest HPET diverge by a growing skew (measured ~38ns/excursion -> hundreds of
+ * ms) and the guest's clocksource watchdog marks the TSC unstable, wedging
+ * timekeeping/RCU (the x86 system-mode livelock).
+ *
+ * Fix: force guest_TSC == ref_tsc + tsc_hz * (guest_clock - ref_clock) at each
+ * resume, so the two guest clocksources are locked by construction and cannot
+ * skew — regardless of the host clocks' relationship.  tsc_hz is self-
+ * calibrated once from the host rdtsc/monotonic ratio over the first stretch of
+ * correct-path execution (both host clocks measured over the SAME real
+ * intervals), then frozen so the lock slope never moves.  x86-only: other ISAs
+ * read one guest clock family (arm CNTVCT, riscv time, mips Count) reconciled by
+ * their per-target timer resync, so they have no two-clock split to lock.
+ */
+static __thread int64_t g_pin_cp_tsc, g_pin_cp_ns;      /* CP calibration sums */
+static __thread int64_t g_pin_last_ht, g_pin_last_hm;   /* host tsc/mono @ resume */
+static __thread double  g_pin_tsc_hz;                   /* frozen once calibrated */
+static __thread int64_t g_pin_ref_tsc, g_pin_ref_clk;   /* lock reference point */
+static __thread bool    g_pin_ready;
+
+static void cst_pin_note_pause(void)
+{
+    int64_t ht = cpu_get_host_ticks();
+    int64_t hm = get_clock();
+    if (g_pin_last_hm) {                 /* accumulate the correct-path interval */
+        g_pin_cp_tsc += ht - g_pin_last_ht;
+        g_pin_cp_ns  += hm - g_pin_last_hm;
+    }
+}
+
+static void cst_pin_tsc_to_clock(void)
+{
+    if (!g_pin_ready) {
+        /* Calibrate over ~0.2s of correct-path host time, then freeze the
+         * ratio and anchor the lock at the current (still-unskewed) values. */
+        if (g_pin_cp_ns >= 200 * 1000 * 1000) {
+            g_pin_tsc_hz  = (double)g_pin_cp_tsc / (double)g_pin_cp_ns * 1e9;
+            g_pin_ref_tsc = cpu_get_ticks();
+            g_pin_ref_clk = cpu_get_clock();
+            g_pin_ready   = true;
+        }
+    } else {
+        int64_t target = g_pin_ref_tsc +
+            (int64_t)(g_pin_tsc_hz * (double)(cpu_get_clock() - g_pin_ref_clk)
+                      / 1e9);
+        cpu_plugin_pin_tsc(target);
+    }
+    g_pin_last_ht = cpu_get_host_ticks();
+    g_pin_last_hm = get_clock();
+}
+#endif
 
 /*
  * Wrong-path containment helpers with softmmu-only side effects.  Compiled
@@ -941,12 +1427,72 @@ void cpu_plugin_spec_vtime_pause(CPUState *cpu)
     if (cpu->plugin_spec_vtime_paused) {
         return;
     }
+#ifdef CONFIG_PLUGIN
+    static int no_vtpause = -1;    /* cache: getenv per excursion is a hot path */
+    if (no_vtpause < 0) {
+        no_vtpause = getenv("CST_NO_VTPAUSE") != NULL;
+    }
+    if (no_vtpause) {                 /* #77 test: don't freeze guest clock in WP */
+        return;
+    }
+#endif
     bool need_bql = !bql_locked();
     if (need_bql) {
         bql_lock();
     }
+#ifdef CONFIG_PLUGIN
+    cst_clkprobe(false);              /* #80: skew measurement (gated) */
+#if defined(TARGET_I386)
+    cst_pin_note_pause();             /* #80: accumulate correct-path calibration */
+#endif
+    /* #77 test: keep the excursion flag + resync, but DON'T freeze the guest
+     * virtual clock during WP (lets the stimer deadline still be reached in a
+     * WP-saturated spin).  Distinguishes timer-freeze starvation from a leak. */
+    if (!cst_nofreeze())
+#endif
     cpu_disable_ticks();
     cpu->plugin_spec_vtime_paused = true;
+#ifdef CONFIG_PLUGIN
+    if (wprot_ready()) {           /* #77: write-protect guest RAM for the WP */
+        wprot_setprot(PROT_READ);
+        g_wprot_active = true;
+    }
+    sdiff_snapshot(cpu);           /* #77: snapshot CPU state for leak diff */
+    tlbsave_snapshot(cpu);         /* #77: snapshot full TLB (causation test) */
+    /*
+     * x86 only: hold the BQL across the whole wrong-path excursion so the main
+     * loop (iothread) cannot interleave mid-WP.  The excursion freezes the
+     * guest virtual clock (cpu_disable_ticks above), but that freeze is a
+     * VM-global boolean+offset, not per-vCPU: x86 delivers speculative page
+     * faults extremely often, so the abnormal-longjmp / fault-skip spec_mode
+     * re-entry cycling runs far more than on other ISAs and can leave the
+     * disable/enable unbalanced, desyncing cpu_clock_offset from
+     * cpu_ticks_offset.  The guest's TSC-vs-HPET clocksource watchdog then
+     * marks the TSC unstable and wedges timekeeping/RCU — a system-mode
+     * livelock (the vCPU spins in WP while jiffies drift and the scheduler
+     * starves; confirmed: holding the BQL, or booting tsc=reliable, both clear
+     * it).  Serialising the excursion against the iothread — as -icount does —
+     * keeps guest time consistent.  This is x86's analogue of the per-target
+     * timer resync arm/riscv/mips run at excursion exit (cpu_plugin_spec_vtime
+     * _resume); x86 has no env-backed timer to resync, so it holds the BQL
+     * instead.  It is x86-ONLY because other ISAs' WP execution legitimately
+     * takes the BQL for a sandboxed device access, and holding it here would
+     * recursively self-lock (bql_lock asserts !bql_locked()).  Bounded by
+     * wpdepth; the excursion never blocks on the iothread, so no deadlock.
+     */
+#if defined(TARGET_I386)
+    {
+        static int no_hold = -1;   /* CST_NO_BQLHOLD: A/B the BQL-hold */
+        if (no_hold < 0) {
+            no_hold = getenv("CST_NO_BQLHOLD") != NULL;
+        }
+        if (need_bql && !no_hold) {
+            g_wp_bql_held = true;
+            return;                /* keep BQL; resume releases it */
+        }
+    }
+#endif
+#endif
     if (need_bql) {
         bql_unlock();
     }
@@ -959,12 +1505,142 @@ void cpu_plugin_spec_vtime_resume(CPUState *cpu)
     if (!cpu->plugin_spec_vtime_paused) {
         return;
     }
+    bool we_hold_from_pause = false;
+#ifdef CONFIG_PLUGIN
+    we_hold_from_pause = g_wp_bql_held;   /* #77 test: pause kept BQL held */
+    g_wp_bql_held = false;
+#endif
     bool need_bql = !bql_locked();
     if (need_bql) {
         bql_lock();
     }
-    cpu_enable_ticks();
+    /*
+     * Re-enable ticks only if the VM is still running.  do_vm_stop() calls
+     * cpu_disable_ticks() BEFORE pausing vcpus (system/cpus.c), so a QMP
+     * vm_stop landing during this excursion leaves ticks disabled and owns
+     * that state; blindly re-enabling here would advance the guest clock while
+     * the VM is meant to be stopped.  vm_start()'s cpu_enable_ticks() restores
+     * ticks when the VM resumes.  (cpu_disable_ticks/enable_ticks is a single
+     * global boolean, not a refcount, so the plugin pause must not fight the
+     * vm_stop owner.)
+     */
+    if (runstate_is_running()
+#ifdef CONFIG_PLUGIN
+        && !cst_nofreeze()   /* #77 test: never disabled ticks; don't re-enable */
+#endif
+        && cpu->plugin_vclock_depth == 0  /* callback freeze still active */
+        ) {
+        cpu_enable_ticks();
+#if defined(CONFIG_PLUGIN) && defined(TARGET_I386)
+        cst_pin_tsc_to_clock();   /* #80: re-lock guest TSC to QEMU_CLOCK_VIRTUAL */
+#endif
+    }
     cpu->plugin_spec_vtime_paused = false;
+#ifdef CONFIG_PLUGIN
+    cst_clkprobe(true);            /* #80: skew measurement (gated) */
+    if (g_wprot_active) {          /* #77: restore guest RAM to read-write */
+        wprot_setprot(PROT_READ | PROT_WRITE);
+        g_wprot_active = false;
+    }
+    tlbsave_restore(cpu);         /* #77: revert full TLB (causation test) */
+    sdiff_compare(cpu);           /* #77: detect un-restored CPU-state leak */
+#endif
+    /*
+     * Reconcile the host QEMUTimers with the restored registers HERE -- the true
+     * excursion-exit boundary -- not inside cpu_plugin_arch_state_restore.  A
+     * wrong-path fault-skip does an intermediate cpu_state_restore mid-excursion
+     * (spec_mode_end -> restore -> spec_mode_begin) without resuming vtime; doing
+     * the resync at every restore would consume plugin_spec_timer_dirty there and
+     * synthesise a pending timer IRQ (e.g. riscv STIP) that the FINAL wp_end
+     * restore then clobbers with the stale snapshot, losing the timer event and
+     * livelocking the guest (#77).  Deferring to vtime_resume lets the dirty flag
+     * survive intermediate restores so the resync runs once against the final
+     * state, after ticks are re-enabled and with spec mode already ended.
+     */
+#if defined(CONFIG_PLUGIN)
+#if defined(TARGET_RISCV)
+    riscv_cpu_plugin_resync_timers(cpu);
+#elif defined(TARGET_ARM)
+    arm_cpu_plugin_resync_timers(cpu);
+#elif defined(TARGET_MIPS)
+    mips_cpu_plugin_resync_timers(cpu);
+#endif
+#ifdef CONFIG_PLUGIN
+    /* #77 test: the WP-saturated vCPU starves the main loop's QEMU_CLOCK_VIRTUAL
+     * timer processing, so the guest stimer never fires -> tick death.  Process
+     * expired virtual timers in-thread here (as -icount does at insn boundaries)
+     * under the BQL we already hold, so the deferred tick is delivered. */
+    if (getenv("CST_RUNTIMERS")) {
+        qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
+    }
+#endif
+#endif
+    if (need_bql || we_hold_from_pause) {
+        bql_unlock();
+    }
+#endif
+}
+
+/*
+ * Nestable guest-virtual-clock freeze for plugin instrumentation windows
+ * (translation-time decoding, per-TB trace emission).  Same transparency
+ * principle as the wrong-path vtime pause above — plugin work is outside
+ * guest execution, so its host wall-clock cost must not advance guest time —
+ * but for the CORRECT-path instrumentation cost.  Without this, a heavily
+ * instrumented guest tick handler can cost more guest time than one tick
+ * period, leaving the next tick already pending on return: the guest
+ * collapses into a self-sustaining tick/scheduler storm (context-switch
+ * storm, RCU-kthread starvation, zero foreground progress).
+ *
+ * Nesting (plugin_vclock_depth) lets callers wrap arbitrary regions without
+ * coordinating; composition with the WP pause is by "ticks re-enable only
+ * when both mechanisms have fully resumed".  The vm_stop guard mirrors
+ * cpu_plugin_spec_vtime_resume: never re-enable a clock a vm_stop owns.
+ */
+void cpu_plugin_vclock_pause(CPUState *cpu)
+{
+#ifndef CONFIG_USER_ONLY
+    if (cpu->plugin_vclock_depth++ > 0 || cpu->plugin_spec_vtime_paused) {
+        return;                    /* already frozen */
+    }
+#ifdef CONFIG_PLUGIN
+    if (cst_nofreeze()) {
+        return;
+    }
+#endif
+    bool need_bql = !bql_locked();
+    if (need_bql) {
+        bql_lock();
+    }
+    cpu_disable_ticks();
+    if (need_bql) {
+        bql_unlock();
+    }
+#endif
+}
+
+void cpu_plugin_vclock_resume(CPUState *cpu)
+{
+#ifndef CONFIG_USER_ONLY
+    g_assert(cpu->plugin_vclock_depth > 0);
+    if (--cpu->plugin_vclock_depth > 0 || cpu->plugin_spec_vtime_paused) {
+        return;                    /* still frozen by an outer window / WP */
+    }
+#ifdef CONFIG_PLUGIN
+    if (cst_nofreeze()) {
+        return;
+    }
+#endif
+    bool need_bql = !bql_locked();
+    if (need_bql) {
+        bql_lock();
+    }
+    if (runstate_is_running()) {
+        cpu_enable_ticks();
+#if defined(CONFIG_PLUGIN) && defined(TARGET_I386)
+        cst_pin_tsc_to_clock();   /* #80: re-lock guest TSC to the virtual clock */
+#endif
+    }
     if (need_bql) {
         bql_unlock();
     }
@@ -990,7 +1666,11 @@ void cpu_plugin_spec_tlb_flush(CPUState *cpu)
      * install or log overflow falls back to the full flush.
      */
 #ifdef CONFIG_PLUGIN
-    if (cpu->plugin_spec_tlb_log_overflow) {
+    /* #77 diagnostic toggle: CST_WP_FULLFLUSH forces a full TLB flush on every
+     * WP exit instead of the selective per-logged-page flush, to test whether a
+     * WP-installed TLB entry leaking into the correct path causes the teardown
+     * livelock. */
+    if (cpu->plugin_spec_tlb_log_overflow || getenv("CST_WP_FULLFLUSH")) {
         tlb_flush(cpu);
     } else {
         for (uint16_t i = 0; i < cpu->plugin_spec_tlb_log_n; i++) {
@@ -1239,8 +1919,38 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
            and via longjmp via cpu_loop_exit.  */
         else {
             const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
+#ifdef CONFIG_PLUGIN
+            /* CST_IRQSTORM (#80 diagnostic): detect an interrupt storm —
+             * repeated async delivery with the INTERRUPTED guest PC (sampled
+             * before the vector redirect) never advancing: each IRQ pass
+             * consumed more virtual time than the guest needed to retire one
+             * instruction, so the same insn is re-interrupted forever. */
+            static int storm_diag = -1;
+            if (storm_diag < 0) {
+                storm_diag = getenv("CST_IRQSTORM") != NULL;
+            }
+            uint64_t storm_pre_pc = storm_diag ? cpu->cc->get_pc(cpu) : 0;
+#endif
 
             if (tcg_ops->cpu_exec_interrupt(cpu, interrupt_request)) {
+#ifdef CONFIG_PLUGIN
+                if (storm_diag) {
+                    static uint64_t last_pc, storm_len, reported;
+                    if (storm_pre_pc == last_pc) {
+                        storm_len++;
+                        if (storm_len >= 1000 && storm_len >= reported * 10) {
+                            fprintf(stderr, "[irqstorm] pc=0x%" PRIx64
+                                    " consecutive_irqs=%" PRIu64 "\n",
+                                    storm_pre_pc, storm_len);
+                            reported = storm_len;
+                        }
+                    } else {
+                        last_pc = storm_pre_pc;
+                        storm_len = 1;
+                        reported = 0;
+                    }
+                }
+#endif
                 if (!tcg_ops->need_replay_interrupt ||
                     tcg_ops->need_replay_interrupt(interrupt_request)) {
                     replay_interrupt();
@@ -1291,6 +2001,18 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
                                     int *tb_exit)
 {
     trace_exec_tb(tb, pc);
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    /*
+     * Diagnostic (#77): the main loop only runs REAL TBs; speculative wrong-path
+     * TBs run via cpu_plugin_exec_tb/_inline.  If plugin_spec_mode is set here,
+     * a WP excursion leaked spec mode into real execution (would make riscv
+     * stimecmp writes bail -> timer death) -- a spec-mode escape.
+     */
+    if (unlikely(cpu->plugin_spec_mode) && getenv("CST_SPEC_ESCAPE_DIAG")) {
+        fprintf(stderr, "[specescape] REAL tb exec with plugin_spec_mode=1 "
+                "pc=0x%" PRIx64 "\n", (uint64_t)pc);
+    }
+#endif
     tb = cpu_tb_exec(cpu, tb, tb_exit);
     if (*tb_exit != TB_EXIT_REQUESTED) {
         *last_tb = tb;
@@ -1382,6 +2104,8 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             if (unlikely(cpu->plugin_in_async_int) &&
                 pc == cpu->plugin_async_departure_pc) {
                 cpu->plugin_in_async_int = false;
+                cpu_plugin_evq_push(cpu, QEMU_PLUGIN_CPU_EVENT_ASYNC_RETURN,
+                                    pc, cpu->plugin_fault_depth);
             }
 #endif
 

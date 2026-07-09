@@ -96,6 +96,17 @@ target_ulong helper_inl(CPUX86State *env, uint32_t port)
 
 target_ulong helper_read_cr8(CPUX86State *env)
 {
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): cpu_get_apic_tpr reads the APIC device (a
+     * vAPIC sync with read side effects) outside the env snapshot.  Mirror
+     * the cr8 write-gate and return the env-shadowed V_TPR bits instead of
+     * touching the device.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return env->int_ctl & V_TPR_MASK;
+    }
+#endif
     if (!(env->hflags2 & HF2_VINTR_MASK)) {
         return cpu_get_apic_tpr(env_archcpu(env)->apic_state);
     } else {
@@ -535,6 +546,18 @@ void helper_rdmsr(CPUX86State *env)
         int ret;
         int index = (uint32_t)env->regs[R_ECX] - MSR_APIC_START;
 
+#ifdef CONFIG_PLUGIN
+        /*
+         * Wrong-path: x2APIC register reads hit the real APIC device, and
+         * some (e.g. the ISR/IRR/EOI-adjacent regs) carry read side effects.
+         * Mirror the apic_msr_write spec-gate: return 0 without poking the
+         * device on the discarded path.
+         */
+        if (env_cpu(env)->plugin_spec_mode) {
+            val = 0;
+            break;
+        }
+#endif
         bql_lock();
         ret = apic_msr_read(index, &val);
         bql_unlock();

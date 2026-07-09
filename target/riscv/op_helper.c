@@ -19,6 +19,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"   /* #77 WFI diag: qemu_clock_get_ns / QEMUTimer */
 #include "cpu.h"
 #include "internals.h"
 #include "exec/exec-all.h"
@@ -177,6 +178,22 @@ void helper_cbo_zero(CPURISCVState *env, target_ulong address)
      * to raise any exceptions, including PMP.
      */
     mem = probe_write(env, address, cbozlen, mmu_idx, ra);
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative) execution: cbo.zero zeroes a whole cache block
+     * of guest memory directly -- a memset on the probed host RAM pointer (or
+     * byte stores to an I/O page) -- which bypasses the TCG store-sandboxing
+     * that holds speculative stores off real memory.  A speculative clear_page
+     * (the kernel routes page-zeroing through cbo.zero when Zicboz is present)
+     * would therefore zero real guest RAM and never be rolled back, corrupting
+     * pages behind the discarded path.  Probe above (to mirror real fault
+     * behaviour), then drop the actual zeroing on the speculative path.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
 
     if (likely(mem)) {
         memset(mem, 0, cbozlen);
@@ -349,6 +366,20 @@ target_ulong helper_sret(CPURISCVState *env)
                             src_priv, src_virt);
     }
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Report the trap return (SRET) so a system-mode tracer can pop its fault
+     * resume-PC stack when @retpc lands back on a faulting instruction.  The
+     * caller commits env->pc = retpc, so report retpc directly.  Every return
+     * is reported; the tracer pops only on a top-of-stack match.  Correct path
+     * only — a wrong-path trap return must not perturb it.
+     */
+    {
+        CPUState *cs_ = env_cpu(env);
+        cpu_plugin_fault_pop(cs_, retpc);
+    }
+#endif
+
     return retpc;
 }
 
@@ -435,6 +466,14 @@ target_ulong helper_mret(CPURISCVState *env)
                             PRV_M, false);
     }
 
+#ifdef CONFIG_PLUGIN
+    /* Report the trap return (MRET); see helper_sret. */
+    {
+        CPUState *cs_ = env_cpu(env);
+        cpu_plugin_fault_pop(cs_, retpc);
+    }
+#endif
+
     return retpc;
 }
 
@@ -449,7 +488,19 @@ target_ulong helper_mnret(CPURISCVState *env)
 
     prev_virt = get_field(env->mnstatus, MNSTATUS_MNPV) &&
                 (prev_priv != PRV_M);
-    env->mnstatus = set_field(env->mnstatus, MNSTATUS_NMIE, true);
+    /*
+     * Wrong-path (speculative): mnstatus lives after end_reset_fields and is
+     * not covered by the WP register snapshot.  Re-enabling NMIE here on a
+     * discarded mnret would permanently leak onto the real CPU, so skip the
+     * mnstatus mutation in spec mode while keeping the in-snapshot mode/pc
+     * restore below for WP control-flow fidelity.
+     */
+#ifdef CONFIG_PLUGIN
+    if (!env_cpu(env)->plugin_spec_mode)
+#endif
+    {
+        env->mnstatus = set_field(env->mnstatus, MNSTATUS_NMIE, true);
+    }
 
     /*
      * If MNRET changes the privilege mode to a mode
@@ -481,7 +532,13 @@ target_ulong helper_mnret(CPURISCVState *env)
     if (cpu_get_fcfien(env)) {
         env->elp = get_field(env->mnstatus, MNSTATUS_MNPELP);
     }
-    env->mnstatus = set_field(env->mnstatus, MNSTATUS_MNPELP, 0);
+    /* Wrong-path: skip the non-rolled-back mnstatus.MNPELP clear (see above). */
+#ifdef CONFIG_PLUGIN
+    if (!env_cpu(env)->plugin_spec_mode)
+#endif
+    {
+        env->mnstatus = set_field(env->mnstatus, MNSTATUS_MNPELP, 0);
+    }
 
     return retpc;
 }
@@ -543,6 +600,29 @@ void helper_wfi(CPURISCVState *env)
                (prv_u || (prv_s && get_field(env->hstatus, HSTATUS_VTW)))) {
         riscv_raise_exception(env, RISCV_EXCP_VIRT_INSTRUCTION_FAULT, GETPC());
     } else {
+#ifdef CONFIG_PLUGIN
+        /* #77: at the moment the guest idles (WFI), is the wake stimer correctly
+         * armed?  A mis-armed/unarmed host timer here = WFI never wakes. */
+        if (getenv("CST_TIMER_DIAG")) {
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            int64_t exp = env->stimer ? env->stimer->expire_time : -1;
+            fprintf(stderr, "[wfi] HALT stimecmp=0x%llx now_ns=%lld exp_ns=%lld "
+                    "STIP=%d STIE=%d SIE=%d mip=0x%llx\n",
+                    (unsigned long long)env->stimecmp, (long long)now,
+                    (long long)exp,
+                    !!(env->mip & MIP_STIP), !!(env->mie & MIE_STIE),
+                    !!(env->mstatus & MSTATUS_SIE), (unsigned long long)env->mip);
+            fflush(stderr);
+        }
+        /*
+         * #77: reconcile the host timer + STIP against the architected stimecmp
+         * before the guest idles, so a wrong-path excursion that deferred or
+         * dropped a timer firing cannot leave WFI sleeping on a dead timer.
+         * Correct path only (spec mode is gated out above); see
+         * riscv_cpu_plugin_wfi_resync().
+         */
+        riscv_cpu_plugin_wfi_resync(cs);
+#endif
         cs->halted = 1;
         cs->exception_index = EXCP_HLT;
         cpu_loop_exit(cs);

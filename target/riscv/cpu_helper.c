@@ -647,6 +647,24 @@ bool riscv_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
         RISCVCPU *cpu = RISCV_CPU(cs);
         CPURISCVState *env = &cpu->env;
         int interruptno = riscv_cpu_local_irq_pending(env);
+#ifdef CONFIG_PLUGIN
+        /* #77: why does the timer tick stop being delivered during teardown?
+         * Throttled to ~1/host-sec: is this even called (interrupt_request set?),
+         * and if so does STIP deliver or is it masked (interruptno<0)? */
+        if (getenv("CST_IRQ_DIAG") && !cs->plugin_spec_mode) {
+            static long last;
+            long now = (long)time(NULL);
+            if (now != last) {
+                last = now;
+                fprintf(stderr, "[irq] t=%ld ireq=0x%x deliver=%d mip=0x%llx "
+                        "mie=0x%llx STIP=%d STIE=%d SIE=%d priv=%d\n", now,
+                        interrupt_request, interruptno,
+                        (unsigned long long)env->mip, (unsigned long long)env->mie,
+                        !!(env->mip & MIP_STIP), !!(env->mie & MIE_STIE),
+                        !!(env->mstatus & MSTATUS_SIE), (int)env->priv);
+            }
+        }
+#endif
         if (interruptno >= 0) {
             cs->exception_index = RISCV_EXCP_INT_FLAG | interruptno;
             riscv_cpu_do_interrupt(cs);
@@ -2282,6 +2300,45 @@ void riscv_cpu_do_interrupt(CPUState *cs)
     target_ulong cause = cs->exception_index & RISCV_EXCP_INT_MASK;
 
 #ifdef CONFIG_PLUGIN
+    if (!async && cause == RISCV_EXCP_ILLEGAL_INST && getenv("CST_ILL_DIAG")) {
+        /* #77: pin down the SIGILL source. bins==0 / garbage => instruction-
+         * memory corruption (leaked store); a valid-but-misaligned encoding =>
+         * bad branch IP.  spec=1 would mean WP is delivering (should never). */
+        fprintf(stderr, "[ill] spec=%d pc=0x%llx bins=0x%08llx priv=%d "
+                "VS=%d FS=%d vill=%d\n",
+                (int)cs->plugin_spec_mode,
+                (unsigned long long)cs->cc->get_pc(cs),
+                (unsigned long long)env->bins, (int)env->priv,
+                (int)((env->mstatus & MSTATUS_VS) >> 9),
+                (int)((env->mstatus & MSTATUS_FS) >> 13),
+                (int)((env->vtype >> (sizeof(target_ulong) * 8 - 1)) & 1));
+    }
+    if (cs->plugin_spec_mode && getenv("CST_TIMER_DIAG")) {
+        fprintf(stderr, "[wpfault] do_interrupt IN SPEC MODE async=%d "
+                "cause=0x%llx pc=0x%llx -- WP fault being RESOLVED\n",
+                (int)async, (unsigned long long)cause,
+                (unsigned long long)cs->cc->get_pc(cs));
+    }
+    /* #77: is the guest timer tick dying?  Count timer IRQs DELIVERED on the
+     * correct path; print the running total once per host-second.  If the total
+     * plateaus after "powering off", the timer tick has stopped (livelock by
+     * timer starvation, the aarch64-storm class). */
+    if (getenv("CST_TICK_DIAG") && async && !cs->plugin_spec_mode) {
+        static unsigned long n_timer, n_async;
+        static long last_sec;
+        n_async++;
+        if (cause == IRQ_S_TIMER || cause == IRQ_M_TIMER ||
+            cause == IRQ_VS_TIMER) {
+            n_timer++;
+        }
+        long nowt = (long)time(NULL);
+        if (nowt != last_sec) {
+            last_sec = nowt;
+            fprintf(stderr, "[tick] t=%ld timer_irqs=%lu async_irqs=%lu\n",
+                    nowt, n_timer, n_async);
+            fflush(stderr);
+        }
+    }
     /*
      * System-mode tracing: flag an asynchronous-interrupt excursion so the
      * tracer drops the handler (OS noise) while keeping synchronous traps
@@ -2292,6 +2349,22 @@ void riscv_cpu_do_interrupt(CPUState *cs)
     if (async && !cs->plugin_spec_mode && !cs->plugin_in_async_int) {
         cs->plugin_in_async_int = true;
         cs->plugin_async_departure_pc = cs->cc->get_pc(cs);
+        cpu_plugin_evq_push(cs, QEMU_PLUGIN_CPU_EVENT_ASYNC_ENTER,
+                            cs->plugin_async_departure_pc,
+                            cs->plugin_fault_depth);
+    } else if (!async && !cs->plugin_spec_mode && !cs->plugin_in_async_int) {
+        /*
+         * Synchronous FAULT (page/access fault, illegal insn, misaligned, …):
+         * the trap return re-executes the faulting instruction, so the resume
+         * PC is the trapping PC.  ECALL advances past the instruction and is
+         * left to the normal branch-into-kernel representation.  Report the
+         * entry; the tracer owns the resume-PC stack.
+         */
+        int c = cs->exception_index;
+        if (c != RISCV_EXCP_U_ECALL && c != RISCV_EXCP_S_ECALL &&
+            c != RISCV_EXCP_VS_ECALL && c != RISCV_EXCP_M_ECALL) {
+            cpu_plugin_fault_push(cs, cs->cc->get_pc(cs));
+        }
     }
 #endif
     uint64_t deleg = async ? env->mideleg : env->medeleg;
@@ -2313,6 +2386,20 @@ void riscv_cpu_do_interrupt(CPUState *cs)
     bool nnmi_excep = false;
 
     if (cpu->cfg.ext_smrnmi && env->rnmip && async) {
+#ifdef CONFIG_PLUGIN
+        /*
+         * Defensive WP guard: riscv_do_nmi() writes the Smrnmi RNMI block
+         * (mnstatus/mncause/mnepc), which lives after end_reset_fields and so
+         * is NOT covered by the plugin's wrong-path state snapshot.  This
+         * function is not reached in spec mode today (WP faults are caught by
+         * cpu_plugin_exec_tb's sigsetjmp before do_interrupt runs), but skip
+         * the RNMI write under spec mode anyway so the no-RNMI-leak invariant
+         * survives any future change that routes a WP fault through here.
+         */
+        if (cs->plugin_spec_mode) {
+            return;
+        }
+#endif
         riscv_do_nmi(env, cause | ((target_ulong)1U << (mxlen - 1)),
                      env->virt_enabled);
         return;
@@ -2507,7 +2594,17 @@ void riscv_cpu_do_interrupt(CPUState *cs)
         /* handle the trap in M-mode */
         /* save elp status */
         if (cpu_get_fcfien(env)) {
+#ifdef CONFIG_PLUGIN
+            /*
+             * Defensive WP guard: the MNPELP write below touches the Smrnmi
+             * RNMI block (after end_reset_fields, outside the plugin's WP
+             * snapshot).  Not reachable in spec mode today, but skip it under
+             * spec mode to preserve the no-RNMI-leak invariant defensively.
+             */
+            if (nnmi_excep && !cs->plugin_spec_mode) {
+#else
             if (nnmi_excep) {
+#endif
                 env->mnstatus = set_field(env->mnstatus, MNSTATUS_MNPELP,
                                           env->elp);
             } else {
@@ -2549,6 +2646,18 @@ void riscv_cpu_do_interrupt(CPUState *cs)
                 if (!cpu->cfg.ext_smrnmi || nnmi_excep) {
                     cpu_abort(CPU(cpu), "M-mode double trap\n");
                 } else {
+#ifdef CONFIG_PLUGIN
+                    /*
+                     * Defensive WP guard: riscv_do_nmi() writes the Smrnmi
+                     * RNMI block (after end_reset_fields, outside the plugin's
+                     * WP snapshot).  Not reachable in spec mode today, but skip
+                     * it under spec mode to preserve the no-RNMI-leak invariant
+                     * defensively.
+                     */
+                    if (cs->plugin_spec_mode) {
+                        return;
+                    }
+#endif
                     riscv_do_nmi(env, cause, false);
                     return;
                 }

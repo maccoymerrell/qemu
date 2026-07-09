@@ -803,6 +803,22 @@ void tb_flush(CPUState *cpu)
     }
 }
 
+void tb_flush_deferred(CPUState *cpu)
+{
+    /* Unconditionally-async variant of tb_flush for callers that may sit
+     * inside an in-flight translation or TB execution (TCG plugin
+     * callbacks).  In serial (single-threaded rr) context tb_flush would
+     * dispatch do_tb_flush synchronously and reset the code region under
+     * a running tb_gen_code; deferring to the vCPU thread-loop safe point
+     * is always correct, merely later.  The flush-count token dedups
+     * repeated requests exactly like tb_flush's async arm. */
+    if (tcg_enabled()) {
+        unsigned tb_flush_count = qatomic_read(&tb_ctx.tb_flush_count);
+        async_safe_run_on_cpu(cpu, do_tb_flush,
+                              RUN_ON_CPU_HOST_INT(tb_flush_count));
+    }
+}
+
 /* remove @orig from its @n_orig-th jump list */
 static inline void tb_remove_from_jmp_list(TranslationBlock *orig, int n_orig)
 {

@@ -459,6 +459,28 @@ struct qemu_work_item;
  * some common TCG CPU variables which are accessed with a negative offset
  * from cpu_env.
  */
+typedef enum QemuPluginCpuEventKind {
+    QEMU_PLUGIN_CPU_EVENT_FAULT_ENTER  = 0,
+    QEMU_PLUGIN_CPU_EVENT_FAULT_RETURN = 1,
+    QEMU_PLUGIN_CPU_EVENT_ASYNC_ENTER  = 2,
+    QEMU_PLUGIN_CPU_EVENT_ASYNC_RETURN = 3,
+} QemuPluginCpuEventKind;
+
+typedef struct QemuPluginCpuEvent {
+    uint8_t  kind;          /* QemuPluginCpuEventKind */
+    uint8_t  priv;          /* privilege level at the event instant */
+    uint32_t depth_after;   /* plugin_fault_depth after applying the event */
+    uint64_t pc;            /* resume PC (fault) / departure PC (async) */
+    uint64_t asid;          /* address-space id at the event instant */
+} QemuPluginCpuEvent;
+
+typedef struct QemuPluginCpuEventQueue {
+    QemuPluginCpuEvent *buf;    /* grow-only; owned by the vCPU */
+    uint32_t len;
+    uint32_t cap;
+    bool enabled;
+} QemuPluginCpuEventQueue;
+
 struct CPUState {
     /*< private >*/
     DeviceState parent_obj;
@@ -552,6 +574,13 @@ struct CPUState {
     void *plugin_spec_store_pool;             /* PluginSpecLine[] */
     size_t plugin_spec_store_pool_used;       /* high water in pool */
     size_t plugin_spec_store_pool_cap;        /* allocated slots */
+    /* Set when a single wrong-path excursion's speculative-store footprint
+     * crosses PLUGIN_SPEC_STORE_SOFT_BUDGET lines — a garbage-size memop the
+     * wrong path executed without faulting (it is buffered, not real).  The WP
+     * loop polls qemu_plugin_spec_store_overflowed() and terminates the
+     * excursion rather than filling the buffer to the hard cap and dropping
+     * stores.  Cleared per excursion in qemu_plugin_spec_mode_begin. */
+    bool plugin_spec_store_overflow;
     struct qemu_plugin_cpu_state *plugin_spec_saved_state;
     /*
      * Set when a code-buffer overflow is detected DURING wrong-path
@@ -572,6 +601,18 @@ struct CPUState {
      */
     bool plugin_spec_vtime_paused;
     /*
+     * Nesting depth of qemu_plugin_vclock_pause/resume: freezes the guest
+     * virtual clock while a plugin runs instrumentation work on the vCPU
+     * thread (translation-time decoding, per-TB trace emission).  That work
+     * is outside guest execution, so its host wall-clock cost must not be
+     * charged to guest time: if one guest timer-tick handler's instrumented
+     * cost exceeds the tick period, the next tick is already pending when
+     * the handler returns and the guest collapses into a self-sustaining
+     * tick/scheduler storm (RCU stall, zero foreground progress).  Composes
+     * with plugin_spec_vtime_paused: ticks re-enable only when BOTH say so.
+     */
+    int plugin_vclock_depth;
+    /*
      * Asynchronous-interrupt exclusion for system-mode tracing.  The target's
      * exception-delivery path sets plugin_in_async_int=true on an ASYNCHRONOUS
      * interrupt entry (timer/device IRQ/FIQ/SError), recording the interrupted
@@ -585,6 +626,43 @@ struct CPUState {
      */
     bool plugin_in_async_int;
     uint64_t plugin_async_departure_pc;
+    /*
+     * Synchronous-fault excursion reporting for system-mode tracing.  Unlike
+     * the async path above, sync faults are KEPT (the handler is real,
+     * workload-induced kernel code), but the tracer needs to know (a) that a
+     * fault detoured execution and (b) how deeply nested it is, so it can emit
+     * the handler as first-class code at a nesting depth and resume the
+     * faulting BB as a whole block afterwards.
+     *
+     * QEMU owns the resume-PC stack directly (cpu_plugin_fault_push/pop), which
+     * it can maintain ACCURATELY because it observes every entry and every
+     * exception-return synchronously and in strict LIFO order.
+     *
+     * cpu_plugin_fault_push (each target's do_interrupt, for a RE-EXECUTING
+     * fault only -- TLB/coprocessor-lazy-enable, NOT syscall/advance-past)
+     * pushes the resume PC (the faulting instruction, where the handler's
+     * exception-return lands) and bumps plugin_fault_depth.
+     * cpu_plugin_fault_pop (each target's exception-return path) pops the top
+     * IFF the return target equals it -- so syscall/async returns, which never
+     * pushed, don't disturb the stack.  Both are no-ops on the wrong path
+     * (plugin_spec_mode).  Each push/pop also appends an ordered
+     * FAULT_ENTER/FAULT_RETURN event to the queue below — the channel a
+     * plugin consumes the transitions through; plugin_fault_depth is the
+     * authoritative live nesting depth (qemu_plugin_fault_depth()).
+     */
+#define CPU_PLUGIN_FAULT_STACK_MAX 64
+    uint64_t plugin_fault_stack[CPU_PLUGIN_FAULT_STACK_MAX];
+    uint32_t plugin_fault_depth;      /* == number of live pushed faults */
+    /*
+     * Ordered per-vCPU path-event queue.  Delivers path causality as
+     * ORDERED EVENTS: each fault entry/return and async-window edge is
+     * appended at its chokepoint, with (asid, priv) stamped at the event
+     * instant.  Single producer and single consumer — the owning vCPU
+     * thread — so no locking; grow-only, never drops; spec-mode-suppressed
+     * at source like everything else here.  Disabled (and empty) unless a
+     * plugin opts in via qemu_plugin_cpu_events_set().
+     */
+    QemuPluginCpuEventQueue plugin_evq;
     /*
      * Register-coupled host-QEMUTimer desync guard for wrong-path rollback.
      * Some targets back an architected timer (e.g. ARM generic timer) with a
@@ -661,6 +739,57 @@ struct CPUState {
 /* Validate placement of CPUNegativeOffsetState. */
 QEMU_BUILD_BUG_ON(offsetof(CPUState, neg) !=
                   sizeof(CPUState) - sizeof(CPUNegativeOffsetState));
+
+#ifdef CONFIG_PLUGIN
+/*
+ * System-mode synchronous-fault excursion stack (see the plugin_fault_* fields
+ * above).  Each target's do_interrupt calls _push for a RE-EXECUTING fault
+ * (the handler's ERET lands back on @resume_pc); each target's exception-return
+ * path calls _pop with the ERET target.  QEMU maintaining this synchronously
+ * is what makes the tracer's fault depth exact under dense nested faults.
+ */
+/* Append one path event to @cpu's plugin event queue (no-op while the
+ * queue is disabled or on the wrong path).  Defined in plugins/core.c,
+ * where the per-target get_plugin_state hook is reachable for stamping
+ * (asid, priv) at the event instant. */
+void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
+                         uint32_t depth_after);
+
+static inline void cpu_plugin_fault_push(CPUState *cpu, uint64_t resume_pc)
+{
+    if (cpu->plugin_spec_mode) {
+        return;   /* wrong-path faults must not perturb the real stack */
+    }
+    if (cpu->plugin_fault_depth < CPU_PLUGIN_FAULT_STACK_MAX) {
+        cpu->plugin_fault_stack[cpu->plugin_fault_depth] = resume_pc;
+    }
+    cpu->plugin_fault_depth++;   /* saturating read is fine; depth caps effect */
+    cpu_plugin_evq_push(cpu, QEMU_PLUGIN_CPU_EVENT_FAULT_ENTER, resume_pc,
+                        cpu->plugin_fault_depth);
+}
+
+static inline void cpu_plugin_fault_pop(CPUState *cpu, uint64_t target_pc)
+{
+    if (cpu->plugin_spec_mode || cpu->plugin_fault_depth == 0) {
+        return;
+    }
+    /*
+     * Pop only when this exception-return lands on the top frame's resume PC.
+     * A syscall/async return (which never pushed) targets somewhere else, so it
+     * leaves the fault stack untouched.  Every pushed fault re-executes its
+     * faulting instruction, so its ERET target always equals the pushed PC --
+     * the match is exact, not heuristic.
+     */
+    uint32_t top = cpu->plugin_fault_depth - 1;
+    if (top < CPU_PLUGIN_FAULT_STACK_MAX &&
+        cpu->plugin_fault_stack[top] != target_pc) {
+        return;
+    }
+    cpu->plugin_fault_depth--;
+    cpu_plugin_evq_push(cpu, QEMU_PLUGIN_CPU_EVENT_FAULT_RETURN, target_pc,
+                        cpu->plugin_fault_depth);
+}
+#endif /* CONFIG_PLUGIN */
 
 static inline CPUArchState *cpu_env(CPUState *cpu)
 {

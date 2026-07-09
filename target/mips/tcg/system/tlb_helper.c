@@ -364,6 +364,11 @@ static void global_invalidate_tlb(CPUMIPSState *env,
 
 void helper_ginvt(CPUMIPSState *env, target_ulong arg, uint32_t type)
 {
+    /*
+     * Wrong-path: global_invalidate_tlb writes tlb->EHINV into the emulated
+     * TLB array of every vCPU (out of this CPU's snapshot). Skip in spec mode.
+     */
+    MIPS_WP_TLB_GATE(env);
     bool invAll = type == 0;
     bool invVA = type == 1;
     bool invMMid = type == 2;
@@ -963,7 +968,20 @@ bool mips_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         return true;
     }
 #if !defined(TARGET_MIPS64)
-    if ((ret == TLBRET_NOMATCH) && (env->tlb->nb_tlb > 1)) {
+    if ((ret == TLBRET_NOMATCH) && (env->tlb->nb_tlb > 1)
+#ifdef CONFIG_PLUGIN
+        /*
+         * Wrong-path (speculative): the hardware page-table walker inserts the
+         * walked entry into the emulated TLB array via r4k_helper_tlbwr (tlbwr
+         * shadow + tlb_in_use), which lives AFTER end_reset_fields and is not
+         * rolled back by the register snapshot.  The forced-probe in
+         * tlb_fill_align only suppresses the final raise, not the walker's
+         * side effect, so skip the HTW refill on the discarded path; the miss
+         * is then reported as a probe failure and aborts the wrong-path chain.
+         */
+        && !cs->plugin_spec_mode
+#endif
+        ) {
         /*
          * Memory reads during hardware page table walking are performed
          * as if they were kernel-mode load instructions.
@@ -1053,6 +1071,39 @@ static inline void set_badinstr_registers(CPUMIPSState *env)
     }
 }
 
+#ifdef CONFIG_PLUGIN
+/*
+ * True only for synchronous exceptions whose handler RE-EXECUTES the faulting
+ * instruction — i.e. ERET returns to exactly the PC we recorded as the resume
+ * PC.  The tracer's fault-excursion stack pops on an exact resume-PC match, so
+ * only these may push a frame.  An exception whose handler ADVANCES past the
+ * instruction (SYSCALL/BREAK/TRAP/RI/OVERFLOW/FPE, unaligned AdEL/AdES emulated
+ * and skipped, …) would push a frame that never pops and leave the depth stuck
+ * +1 for the rest of that ASID's execution.  The re-executing set is the whole
+ * TLB family (demand paging — the common case, plus LTLBL = TLB-Modified,
+ * execute/read-inhibit) and the coprocessor/feature-unusable faults that lazily
+ * enable a unit and re-run the instruction.
+ */
+static inline bool mips_fault_reexecutes(int excp)
+{
+    switch (excp) {
+    case EXCP_TLBF:     /* TLB refill                       */
+    case EXCP_TLBL:     /* TLB invalid (load/fetch)         */
+    case EXCP_TLBS:     /* TLB invalid (store)              */
+    case EXCP_LTLBL:    /* TLB modified (store to clean pg) */
+    case EXCP_TLBXI:    /* TLB execute-inhibit              */
+    case EXCP_TLBRI:    /* TLB read-inhibit                 */
+    case EXCP_CpU:      /* coprocessor unusable (lazy FP)   */
+    case EXCP_MSADIS:   /* MSA disabled (lazy enable)       */
+    case EXCP_DSPDIS:   /* DSP disabled (lazy enable)       */
+    case EXCP_MDMX:     /* MDMX unusable (lazy enable)      */
+        return true;
+    default:
+        return false;
+    }
+}
+#endif
+
 void mips_cpu_do_interrupt(CPUState *cs)
 {
     MIPSCPU *cpu = MIPS_CPU(cs);
@@ -1069,10 +1120,42 @@ void mips_cpu_do_interrupt(CPUState *cs)
      * the interrupted PC; the generic resume in cpu_exec_loop clears the flag
      * when execution returns there.  Outermost only; never on wrong path.
      */
+    /*
+     * Both recorded PCs must be the RESUME pc — where the handler's eret
+     * lands — not the raw trapping pc.  On MIPS they differ whenever the
+     * exception hits a branch DELAY SLOT: EPC points at the branch
+     * (CAUSE.BD=1) and the eret re-executes branch+slot.
+     * exception_resume_pc() backs the pc up to the branch under
+     * MIPS_HFLAG_BMASK, exactly as the CP0_EPC assignment below does.
+     * Recording the raw get_pc() slot address instead leaves the async
+     * flag stuck (the departure pc is never re-executed — only the branch
+     * is) and fault-merge frames unmatched (the resume lands on the
+     * branch, not the slot), dropping the faulting BB from the trace.
+     * Mask the mips16 ISA-mode bit so the value compares against TB PCs.
+     */
     if (cs->exception_index == EXCP_EXT_INTERRUPT &&
         !cs->plugin_spec_mode && !cs->plugin_in_async_int) {
         cs->plugin_in_async_int = true;
-        cs->plugin_async_departure_pc = cs->cc->get_pc(cs);
+        cs->plugin_async_departure_pc =
+            exception_resume_pc(env) & ~(target_ulong)1;
+        cpu_plugin_evq_push(cs, QEMU_PLUGIN_CPU_EVENT_ASYNC_ENTER,
+                            cs->plugin_async_departure_pc,
+                            cs->plugin_fault_depth);
+    } else if (mips_fault_reexecutes(cs->exception_index) &&
+               !cs->plugin_spec_mode && !cs->plugin_in_async_int) {
+        /*
+         * Re-executing synchronous FAULT (TLB refill/invalid/modified,
+         * execute/read-inhibit, coprocessor-unusable lazy enable): the ERET
+         * re-executes the faulting instruction (the whole branch+slot pair when
+         * it hit a delay slot), landing on exactly this recorded resume PC so
+         * the tracer's stack pops.  Advance-past exceptions (SYSCALL/BREAK/
+         * TRAP/RI/OVERFLOW/FPE, emulated unaligned AdEL/AdES) are deliberately
+         * NOT pushed — their handler advances CP0_EPC, so a pushed frame would
+         * never match a return PC and would stick the depth +1.  Report the
+         * entry; the tracer owns the stack.
+         */
+        cpu_plugin_fault_push(cs,
+                              exception_resume_pc(env) & ~(target_ulong)1);
     }
 #endif
 

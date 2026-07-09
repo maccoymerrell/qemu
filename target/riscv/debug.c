@@ -744,6 +744,17 @@ void helper_itrigger_match(CPURISCVState *env)
 
 static void riscv_itrigger_update_count(CPURISCVState *env)
 {
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): do not re-arm the itrigger host timer or fire
+     * trigger actions.  env->itrigger_timer[] is a host QEMUTimer outside the
+     * WP register snapshot; a speculative privilege change (sret/mret) or a
+     * speculative timer callback must not reprogram it.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return;
+    }
+#endif
     int count, executed;
     /*
      * Record last icount, so that we can evaluate the executed instructions

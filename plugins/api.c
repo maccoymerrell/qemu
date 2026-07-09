@@ -49,6 +49,7 @@
 #include "exec/translator.h"
 #include "exec/tb-flush.h"
 #include "exec/cpu-common.h"
+#include "system/cpu-timers.h"
 #include "disas/disas.h"
 #include "plugin.h"
 
@@ -66,14 +67,15 @@ void qemu_plugin_reset(qemu_plugin_id_t id, qemu_plugin_simple_cb_t cb)
 
 void qemu_plugin_request_tb_flush(void)
 {
-    /* tb_flush dispatches synchronously when the calling vCPU is
-     * already in exclusive context (running, e.g., a flush-cb from
-     * core code), otherwise it async-schedules do_tb_flush on the
-     * vCPU thread so it runs between TBs.  Either way any registered
-     * flush callback fires before the next TB executes.  Callers
-     * are expected to be on a vCPU thread (current_cpu set);
-     * tb_flush is a no-op when tcg_enabled() is false. */
-    tb_flush(current_cpu);
+    /* Plugin callbacks run inside a translation (tb_trans) or an
+     * executing TB (tb_exec) — contexts where tb_flush's serial-mode
+     * synchronous dispatch would reset the code region under an
+     * in-flight tb_gen_code.  Always defer: do_tb_flush runs at the
+     * vCPU thread-loop safe point, after any plugin excursion unwinds,
+     * and fires registered flush callbacks from there.  Callers are
+     * expected to be on a vCPU thread (current_cpu set); no-op when
+     * tcg_enabled() is false. */
+    tb_flush_deferred(current_cpu);
 }
 
 /*
@@ -603,6 +605,18 @@ void qemu_plugin_set_pc(uint64_t pc)
 {
     g_assert(current_cpu);
     g_assert(current_cpu->cc->set_pc);
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    /*
+     * Diagnostic (#77): a wrong-path PC redirect must only happen inside a
+     * speculative excursion (plugin_spec_mode set).  If set_pc runs with the
+     * flag OFF, it is steering the REAL guest PC -- a spec-mode escape that
+     * corrupts real execution.
+     */
+    if (unlikely(!current_cpu->plugin_spec_mode) && getenv("CST_SPEC_ESCAPE_DIAG")) {
+        fprintf(stderr, "[setpc-real] set_pc(0x%" PRIx64 ") with "
+                "plugin_spec_mode=0\n", pc);
+    }
+#endif
     current_cpu->cc->set_pc(current_cpu, (vaddr)pc);
 }
 
@@ -656,6 +670,15 @@ bool qemu_plugin_paging_enabled(void)
     return mmu_on;
 }
 
+bool qemu_plugin_icount_enabled(void)
+{
+#ifdef CONFIG_USER_ONLY
+    return false;
+#else
+    return icount_enabled();
+#endif
+}
+
 bool qemu_plugin_exec_inline_insn(void)
 {
     g_assert(current_cpu);
@@ -684,6 +707,13 @@ PluginSpecLine *spec_line_get_or_alloc(CPUState *cpu, vaddr line_addr)
     }
     if (cpu->plugin_spec_store_pool_used >= PLUGIN_SPEC_STORE_LINE_MAX) {
         return NULL;
+    }
+    if (cpu->plugin_spec_store_pool_used >= PLUGIN_SPEC_STORE_SOFT_BUDGET) {
+        /* Wild wrong-path store (a garbage-size memop buffered without faulting):
+         * flag the excursion for prompt termination by the WP loop
+         * (qemu_plugin_spec_store_overflowed).  Keep allocating up to the hard
+         * cap meanwhile so the in-flight store is not torn mid-region. */
+        cpu->plugin_spec_store_overflow = true;
     }
     if (cpu->plugin_spec_store_pool_used >= cpu->plugin_spec_store_pool_cap) {
         size_t new_cap = cpu->plugin_spec_store_pool_cap
@@ -722,6 +752,7 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
                                                                g_direct_equal);
     }
     current_cpu->plugin_spec_saved_state = saved_state;
+    current_cpu->plugin_spec_store_overflow = false;
     current_cpu->plugin_spec_mode = true;
 }
 
@@ -755,6 +786,25 @@ void qemu_plugin_spec_vtime_resume(void)
     cpu_plugin_spec_vtime_resume(current_cpu);
 }
 
+/*
+ * Nestable guest-clock freeze for correct-path instrumentation windows
+ * (translation-time decode, per-TB emission).  Same transparency rule as the
+ * WP pause above: plugin work is outside guest execution, so its host cost
+ * must not advance guest time.  Per-target impl in cpu-exec.c; no-op in user
+ * mode.
+ */
+void qemu_plugin_vclock_pause(void)
+{
+    g_assert(current_cpu);
+    cpu_plugin_vclock_pause(current_cpu);
+}
+
+void qemu_plugin_vclock_resume(void)
+{
+    g_assert(current_cpu);
+    cpu_plugin_vclock_resume(current_cpu);
+}
+
 bool qemu_plugin_in_async_int(void)
 {
 #ifdef CONFIG_USER_ONLY
@@ -764,12 +814,64 @@ bool qemu_plugin_in_async_int(void)
 #endif
 }
 
+/* The wire and plugin-facing event layouts are kept field-for-field
+ * identical; the drain below converts explicitly all the same, so a
+ * layout drift shows up as a compile break here rather than corruption. */
+QEMU_BUILD_BUG_ON(sizeof(struct qemu_plugin_cpu_event) !=
+                  sizeof(QemuPluginCpuEvent));
+
+void qemu_plugin_cpu_events_set(unsigned int vcpu_index, bool enabled)
+{
+    CPUState *cpu = qemu_get_cpu(vcpu_index);
+    if (!cpu) {
+        return;
+    }
+    cpu->plugin_evq.enabled = enabled;
+    cpu->plugin_evq.len = 0;
+}
+
+size_t qemu_plugin_drain_cpu_events(unsigned int vcpu_index,
+                                    const struct qemu_plugin_cpu_event **evs)
+{
+    CPUState *cpu = qemu_get_cpu(vcpu_index);
+    if (!cpu || !cpu->plugin_evq.buf) {
+        *evs = NULL;
+        return 0;
+    }
+    QemuPluginCpuEventQueue *q = &cpu->plugin_evq;
+    size_t n = q->len;
+    /* Single producer/consumer == this vCPU thread; handing out the
+     * internal buffer is race-free until the next push, which cannot
+     * happen before the consumer's tb_exec callback returns. */
+    *evs = (const struct qemu_plugin_cpu_event *)q->buf;
+    q->len = 0;
+    return n;
+}
+
 void qemu_plugin_async_int_reset(void)
 {
 #ifndef CONFIG_USER_ONLY
     if (current_cpu) {
         current_cpu->plugin_in_async_int = false;
     }
+#endif
+}
+
+uint32_t qemu_plugin_fault_depth(void)
+{
+#ifdef CONFIG_USER_ONLY
+    return 0;
+#else
+    return current_cpu ? current_cpu->plugin_fault_depth : 0;
+#endif
+}
+
+bool qemu_plugin_spec_store_overflowed(void)
+{
+#ifdef CONFIG_USER_ONLY
+    return false;
+#else
+    return current_cpu && current_cpu->plugin_spec_store_overflow;
 #endif
 }
 

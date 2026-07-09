@@ -40,6 +40,8 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size);
 void cpu_plugin_spec_vtime_pause(CPUState *cpu);
 void cpu_plugin_spec_vtime_resume(CPUState *cpu);
 void cpu_plugin_spec_tlb_flush(CPUState *cpu);
+void cpu_plugin_vclock_pause(CPUState *cpu);
+void cpu_plugin_vclock_resume(CPUState *cpu);
 
 #define REAL_HOST_PAGE_ALIGN(addr) ROUND_UP((addr), qemu_real_host_page_size())
 

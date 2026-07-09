@@ -11083,9 +11083,27 @@ void arm_cpu_do_interrupt(CPUState *cs)
         if (is_async) {
             /* Enter the async excursion; record the departure PC (interrupted
              * instruction) so the exception return that lands back there ends
-             * it.  Outermost only — nested async keeps this departure PC. */
+             * it.  Outermost edge only: the enclosing !plugin_in_async_int
+             * guard keeps a nested async interrupt from re-entering this
+             * block, so the departure PC is stamped once per window and the
+             * ASYNC_ENTER event fires once per window (the inner guard is
+             * redundant with the enclosing one; it keeps the event push
+             * edge-gated on its own terms). */
+            if (!cs->plugin_in_async_int) {
+                cpu_plugin_evq_push(cs, QEMU_PLUGIN_CPU_EVENT_ASYNC_ENTER,
+                                    cs->cc->get_pc(cs),
+                                    cs->plugin_fault_depth);
+            }
             cs->plugin_in_async_int = true;
             cs->plugin_async_departure_pc = cs->cc->get_pc(cs);
+        } else if (idx != EXCP_SWI && idx != EXCP_HVC && idx != EXCP_SMC) {
+            /* Synchronous FAULT (data/prefetch abort, undef, alignment, …):
+             * the handler's exception return re-executes the faulting
+             * instruction, so the resume PC is the current (trapping) PC.
+             * Deliberate calls (SVC/HVC/SMC) advance past the instruction and
+             * are left to the normal branch-into-kernel representation.
+             * Report the entry; the tracer owns the resume-PC stack. */
+            cpu_plugin_fault_push(cs, cs->cc->get_pc(cs));
         }
     }
 #endif

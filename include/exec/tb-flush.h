@@ -23,6 +23,15 @@
  */
 void tb_flush(CPUState *cs);
 
+/*
+ * tb_flush_deferred() - always-asynchronous tb_flush
+ *
+ * Safe from contexts where the caller may be inside tb_gen_code or an
+ * executing TB (e.g. TCG plugin callbacks): the flush is queued as
+ * async-safe work and runs at the vCPU thread-loop safe point.
+ */
+void tb_flush_deferred(CPUState *cs);
+
 void tcg_flush_jmp_cache(CPUState *cs);
 
 #endif /* _TB_FLUSH_H_ */

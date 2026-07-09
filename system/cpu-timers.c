@@ -134,6 +134,23 @@ void cpu_disable_ticks(void)
                          &timers_state.vm_clock_lock);
 }
 
+#ifdef CONFIG_PLUGIN
+void cpu_plugin_pin_tsc(int64_t target_tsc)
+{
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    if (timers_state.cpu_ticks_enabled) {
+        /* Choose the offset so cpu_get_ticks_locked() == target_tsc now, and
+         * keep the monotonicity clamp consistent so the next read does not
+         * snap the value back forward. */
+        timers_state.cpu_ticks_offset = target_tsc - cpu_get_host_ticks();
+        timers_state.cpu_ticks_prev = target_tsc;
+    }
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+}
+#endif
+
 static bool icount_state_needed(void *opaque)
 {
     return icount_enabled();

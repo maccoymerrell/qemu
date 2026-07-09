@@ -382,6 +382,17 @@ int riscv_pmu_update_event_map(CPURISCVState *env, uint64_t value,
     uint32_t event_idx;
     RISCVCPU *cpu = env_archcpu(env);
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): do not mutate the event->counter map.  It lives
+     * in RISCVCPU (outside the WP register snapshot) and is not rolled back, so
+     * a speculative mhpmevent write would persist a stale binding.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return -1;
+    }
+#endif
+
     if (!riscv_pmu_counter_valid(cpu, ctr_idx) || !cpu->pmu_event_ctr_map) {
         return -1;
     }
@@ -524,6 +535,21 @@ void riscv_pmu_timer_cb(void *priv)
 {
     RISCVCPU *cpu = priv;
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): the host pmu_timer (QEMU_CLOCK_VIRTUAL) callback
+     * can fire in the iothread during an excursion's wall-clock window (the
+     * gt-timer precedent, accel/tcg/cpu-exec.c).  pmu_timer_trigger_irq would
+     * re-arm cpu->pmu_timer (outside the WP snapshot, not reconciled by
+     * riscv_cpu_plugin_resync_timers) and clear counter->irq_overflow_left.
+     * Bail on the discarded path; the guest re-arms on its next real counter
+     * write (riscv_pmu_setup_timer, itself spec-gated).
+     */
+    if (CPU(cpu)->plugin_spec_mode) {
+        return;
+    }
+#endif
+
     /* Timer event was triggered only for these events */
     pmu_timer_trigger_irq(cpu, RISCV_PMU_EVENT_HW_CPU_CYCLES);
     pmu_timer_trigger_irq(cpu, RISCV_PMU_EVENT_HW_INSTRUCTIONS);
@@ -535,6 +561,21 @@ int riscv_pmu_setup_timer(CPURISCVState *env, uint64_t value, uint32_t ctr_idx)
     int64_t overflow_ns, overflow_left = 0;
     RISCVCPU *cpu = env_archcpu(env);
     PMUCTRState *counter = &env->pmu_ctrs[ctr_idx];
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): do not arm the host PMU overflow timer.
+     * cpu->pmu_timer lives outside the WP register snapshot and is NOT
+     * reconciled by riscv_cpu_plugin_resync_timers, so a speculative
+     * mhpmcounter/mcountinhibit write would leave the real timer programmed for
+     * a discarded-path deadline (the #77 host-timer-desync class).  The
+     * speculative counter state is rolled back; leave the host timer as the
+     * correct path armed it.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return -1;
+    }
+#endif
 
     /* No need to setup a timer if LCOFI is disabled when OF is set */
     if (!riscv_pmu_counter_valid(cpu, ctr_idx) || !cpu->cfg.ext_sscofpmf ||

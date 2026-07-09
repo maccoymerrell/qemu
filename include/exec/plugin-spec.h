@@ -30,6 +30,15 @@
  * accel/tcg/internal-common.h. */
 #define PLUGIN_SPEC_STORE_LINE_MAX (1u << 20)
 
+/* Soft per-excursion budget (≈ 16 MiB of lines).  A normal wrong-path excursion
+ * (wpdepth-bounded, ~hundreds of lines) never approaches this; crossing it means
+ * a single instruction wrote a garbage-size region into the sandbox without
+ * faulting (AArch64 FEAT_MOPS / x86 REP / vector with a wrong-path-garbage
+ * size/count).  The allocator flags it and the WP loop terminates the excursion,
+ * so the hard cap above is never reached and speculative stores are never
+ * silently dropped in normal operation. */
+#define PLUGIN_SPEC_STORE_SOFT_BUDGET (1u << 18)
+
 /*
  * bytes[] is placed first and the line is 16-byte aligned so that a
  * naturally-aligned guest atomic (size <= 16, never crossing a 64-byte

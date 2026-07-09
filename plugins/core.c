@@ -21,6 +21,46 @@
 #include "exec/tb-flush.h"
 #include "tcg/tcg-op-common.h"
 #include "plugin.h"
+#include "accel/tcg/cpu-ops.h"
+
+/*
+ * Ordered per-vCPU path-event producer (see QemuPluginCpuEventQueue in
+ * hw/core/cpu.h).  Called from the fault push/pop helpers and the async
+ * delivery/close chokepoints, always on the owning vCPU thread.  (asid,
+ * priv) are stamped HERE, at the event instant, via the same per-target
+ * hook that backs qemu_plugin_get_asid — a later drain sees the address
+ * space the event actually happened in, not whatever is live at the next
+ * TB boundary.
+ */
+void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
+                         uint32_t depth_after)
+{
+    QemuPluginCpuEventQueue *q = &cpu->plugin_evq;
+
+    if (!q->enabled || cpu->plugin_spec_mode) {
+        return;
+    }
+    if (q->len == q->cap) {
+        q->cap = q->cap ? q->cap * 2 : 64;
+        q->buf = g_realloc(q->buf, q->cap * sizeof(*q->buf));
+    }
+
+    int priv = 0;
+    uint64_t asid = 0;
+    bool mmu_on = true;
+    const TCGCPUOps *ops = cpu->cc->tcg_ops;
+    if (ops && ops->get_plugin_state) {
+        ops->get_plugin_state(cpu, &priv, &asid, &mmu_on);
+    }
+
+    q->buf[q->len++] = (QemuPluginCpuEvent) {
+        .kind = (uint8_t)kind,
+        .priv = (uint8_t)priv,
+        .depth_after = depth_after,
+        .pc = pc,
+        .asid = asid,
+    };
+}
 
 struct qemu_plugin_cb {
     struct qemu_plugin_ctx *ctx;

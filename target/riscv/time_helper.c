@@ -33,8 +33,14 @@ static void riscv_vstimer_cb(void *opaque)
      * touch the (rolled-back) interrupt state on the discarded path; just flag
      * the host timer for re-sync on excursion exit so it isn't left dead (this
      * one-shot has now fired and the cb does not itself re-arm).
+     *
+     * Gate on plugin_spec_vtime_paused (true for the WHOLE excursion), not just
+     * plugin_spec_mode: a wrong-path fault-skip briefly clears spec_mode
+     * (spec_mode_end -> restore -> spec_mode_begin) while the snapshot is still
+     * live and vtime still paused.  A real IRQ set in that gap is rolled back by
+     * the final wp_end restore but never re-synced (dirty unset), losing it (#77).
      */
-    if (CPU(cpu)->plugin_spec_mode) {
+    if (CPU(cpu)->plugin_spec_mode || CPU(cpu)->plugin_spec_vtime_paused) {
         CPU(cpu)->plugin_spec_timer_dirty = true;
         return;
     }
@@ -47,7 +53,18 @@ static void riscv_stimer_cb(void *opaque)
 {
     RISCVCPU *cpu = opaque;
 #ifdef CONFIG_PLUGIN
-    if (CPU(cpu)->plugin_spec_mode) {
+    if (getenv("CST_TIMER_DIAG")) {
+        fprintf(stderr, "[stimer] FIRE spec=%d vtp=%d stimecmp=0x%llx\n",
+                (int)CPU(cpu)->plugin_spec_mode,
+                (int)CPU(cpu)->plugin_spec_vtime_paused,
+                (unsigned long long)cpu->env.stimecmp);
+    }
+    /*
+     * Gate on plugin_spec_vtime_paused (whole excursion) not just
+     * plugin_spec_mode: see riscv_vstimer_cb / #77 -- a fault-skip gap clears
+     * spec_mode while the excursion is still live, and a STIP set there is lost.
+     */
+    if (CPU(cpu)->plugin_spec_mode || CPU(cpu)->plugin_spec_vtime_paused) {
         CPU(cpu)->plugin_spec_timer_dirty = true;
         return;
     }
@@ -80,6 +97,22 @@ void riscv_timer_write_timecmp(CPURISCVState *env, QEMUTimer *timer,
     uint32_t timebase_freq = mtimer->timebase_freq;
     uint64_t rtc_r = env->rdtime_fn(env->rdtime_fn_arg) + delta;
 
+#ifdef CONFIG_PLUGIN
+    if (getenv("CST_TIMER_DIAG")) {
+        static long last;
+        long now = (long)time(NULL);
+        if (now != last) {
+            last = now;
+            fprintf(stderr, "[wtc] t=%ld irq=0x%x timecmp=0x%llx rtc_r=0x%llx "
+                    "pc=0x%llx ra=0x%llx -> %s\n", now, timer_irq,
+                    (unsigned long long)timecmp, (unsigned long long)rtc_r,
+                    (unsigned long long)env->pc,
+                    (unsigned long long)env->gpr[1],
+                    timecmp <= rtc_r ? "RAISE-now"
+                    : timecmp == UINT64_MAX ? "timer_del" : "CLEAR+arm");
+        }
+    }
+#endif
     if (timecmp <= rtc_r) {
         /*
          * If we're setting an stimecmp value in the "past",
@@ -173,37 +206,86 @@ void riscv_timer_init(RISCVCPU *cpu)
 }
 
 #ifdef CONFIG_PLUGIN
-void riscv_cpu_plugin_resync_timers(CPUState *cs)
+/*
+ * Reconcile the host stimer/vstimer QEMUTimers + STIP/VSTIP with the architected
+ * stimecmp/vstimecmp on the REAL (running) clock.  Re-arm only timers the guest
+ * has actually configured: stimecmp/vstimecmp are 0 at reset (the unconfigured
+ * sentinel), and riscv_timer_write_timecmp(0) would take the "timecmp <= now"
+ * branch and synthesise a pending interrupt the guest never armed.  The caller
+ * must be on the correct path (spec mode ended) so driving the IRQ line is safe;
+ * BQL is taken if not already held.
+ */
+static void riscv_plugin_reconcile_timers(CPURISCVState *env)
 {
-    CPURISCVState *env = cpu_env(cs);
     bool held;
-
-    if (likely(!cs->plugin_spec_timer_dirty)) {
-        return;
-    }
-    cs->plugin_spec_timer_dirty = false;
 
     /* rdtime_fn is wired only when the supervisor timer (Sstc) is usable. */
     if (!env->rdtime_fn) {
         return;
     }
-
-    /* riscv_timer_write_timecmp drives the interrupt line, which needs the BQL.
-     * It runs in full here because spec mode has already ended. */
     held = bql_locked();
     if (!held) {
         bql_lock();
     }
-    if (env->stimer) {
+    if (env->stimer && env->stimecmp != 0) {
         riscv_timer_write_timecmp(env, env->stimer, env->stimecmp,
                                   0, MIP_STIP);
     }
-    if (env->vstimer) {
+    if (env->vstimer && env->vstimecmp != 0) {
         riscv_timer_write_timecmp(env, env->vstimer, env->vstimecmp,
                                   env->htimedelta, MIP_VSTIP);
     }
     if (!held) {
         bql_unlock();
     }
+}
+
+/*
+ * Wrong-path excursion-exit reconcile (#77).  A WP excursion can perturb the
+ * host timers — a stimer cb fires and is deferred, or stimecmp is rolled back
+ * by the register-state restore.  The cb sets plugin_spec_timer_dirty when it
+ * suppresses a firing; re-arm / re-raise once per excursion when dirty so the
+ * deferred firing is not lost.  Runs at the true excursion-exit boundary
+ * (cpu_plugin_spec_vtime_resume), after ticks are re-enabled and spec mode has
+ * ended, not at an intermediate fault-skip restore.
+ */
+void riscv_cpu_plugin_resync_timers(CPUState *cs)
+{
+    CPURISCVState *env = cpu_env(cs);
+
+    if (getenv("CST_SYNCIRQ")) {   /* #77 diag toggle */
+        riscv_cpu_update_mip(env, 0, 0);
+    }
+    if (likely(!cs->plugin_spec_timer_dirty) && !getenv("CST_ALWAYS_RESYNC")) {
+        return;
+    }
+    cs->plugin_spec_timer_dirty = false;
+    if (getenv("CST_TIMER_DIAG")) {
+        fprintf(stderr, "[stimer] RESYNC stimecmp=0x%llx vstimecmp=0x%llx "
+                "rdtime=%d%s\n",
+                (unsigned long long)env->stimecmp,
+                (unsigned long long)env->vstimecmp, env->rdtime_fn != NULL,
+                env->vstimecmp == 0 ? " (old:spurious-VSTIP)" : "");
+    }
+    riscv_plugin_reconcile_timers(env);
+}
+
+/*
+ * Idle-boundary reconcile (#77).  Called from helper_wfi on the correct path,
+ * just before the guest halts.  A wrong-path excursion can defer/drop a stimer
+ * firing whose re-raise is then lost: the excursion-exit resync re-evaluates
+ * due-ness against the rdtime clock that cpu_disable_ticks froze at excursion
+ * entry, so an already-elapsed deadline reads "not due" and STIP is dropped; or
+ * no further excursion runs before the guest idles.  The host stimer is then
+ * left unarmed (expire_time = -1) while the architected stimecmp has already
+ * passed (STIP should be pending but is 0) -> WFI sleeps on a wake that never
+ * comes -> system livelock.  Reconcile against stimecmp on the REAL (running)
+ * clock here so the idling guest always has a valid wake source.  WFI is rare,
+ * so this is not a per-excursion cost and cannot storm; it is idempotent for an
+ * already-correctly-armed timer.
+ */
+void riscv_cpu_plugin_wfi_resync(CPUState *cs)
+{
+    riscv_plugin_reconcile_timers(cpu_env(cs));
 }
 #endif

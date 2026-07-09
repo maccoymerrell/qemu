@@ -447,6 +447,21 @@ target_ulong HELPER(rdrand)(CPUX86State *env)
     Error *err = NULL;
     target_ulong ret;
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): qemu_guest_getrandom consumes the host RNG,
+     * which is not part of the env snapshot and cannot be rolled back — a
+     * speculative rdrand would skew the entropy stream seen on the real path.
+     * Skip the RNG and return a benign value, mimicking the "no entropy yet"
+     * outcome (CF cleared, all-zero result).
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        env->cc_src = 0;
+        env->cc_op = CC_OP_EFLAGS;
+        return 0;
+    }
+#endif
+
     if (qemu_guest_getrandom(&ret, sizeof(ret), &err) < 0) {
         qemu_log_mask(LOG_UNIMP, "rdrand: Crypto failure: %s",
                       error_get_pretty(err));

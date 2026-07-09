@@ -114,6 +114,20 @@ static inline void exception_return(CPUMIPSState *env)
     }
     compute_hflags(env);
     debug_post_eret(env);
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Report the ERET so a system-mode tracer can pop its fault resume-PC
+     * stack when this lands back on a faulting instruction.  PC was just
+     * committed via mips_env_set_pc, so get_pc reads the return target.
+     * Every return is reported; the tracer pops only on a top-of-stack match.
+     * Correct path only — a wrong-path eret must not perturb it.
+     */
+    {
+        CPUState *cs_ = env_cpu(env);
+        cpu_plugin_fault_pop(cs_, cs_->cc->get_pc(cs_));
+    }
+#endif
 }
 
 void helper_eret(CPUMIPSState *env)
@@ -154,6 +168,17 @@ void helper_cache(CPUMIPSState *env, target_ulong addr, uint32_t op)
 
     switch (cache_operation) {
     case 0b010: /* Index Store Tag */
+#ifdef CONFIG_PLUGIN
+        /*
+         * Wrong-path: this is a device write into the ITC tag MMIO region
+         * (out of the CPU snapshot, not rolled back). The Index-Load-Tag
+         * case below only writes env->CP0_TagLo, which is snapshotted, so it
+         * stays live.
+         */
+        if (env_cpu(env)->plugin_spec_mode) {
+            break;
+        }
+#endif
         memory_region_dispatch_write(env->itc_tag, index, env->CP0_TagLo,
                                      MO_64, MEMTXATTRS_UNSPECIFIED);
         break;

@@ -48,12 +48,42 @@ static void cpu_mips_irq_request(void *opaque, int irq, int level)
         kvm_mips_set_interrupt(cpu, irq, level);
     }
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative) or the fault-skip gap inside one: the
+     * CP0_Cause.IP bits above are register state that the walk-end restore
+     * reverts, but driving CPU_INTERRUPT_HARD is an external side effect
+     * that would escape the discarded path -- leaving the line raised from
+     * an IP bit the restore then erases.  Defer the line drive; the
+     * excursion-exit resync recomputes it from the restored CP0_Cause
+     * (mirror of the riscv path, #77).
+     */
+    if (cs->plugin_spec_mode || cs->plugin_spec_vtime_paused) {
+        cs->plugin_spec_irq_dirty = true;
+        return;
+    }
+#endif
     if (env->CP0_Cause & CP0Ca_IP_mask) {
         cpu_interrupt(cs, CPU_INTERRUPT_HARD);
     } else {
         cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
     }
 }
+
+#ifdef CONFIG_PLUGIN
+/* Recompute CPU_INTERRUPT_HARD from the restored CP0_Cause after a
+ * wrong-path excursion suppressed a line update (#77).  Called from
+ * mips_cpu_plugin_resync_timers at the excursion-exit boundary. */
+void cpu_mips_plugin_reconcile_irq(CPUMIPSState *env)
+{
+    CPUState *cs = env_cpu(env);
+    if (env->CP0_Cause & CP0Ca_IP_mask) {
+        cpu_interrupt(cs, CPU_INTERRUPT_HARD);
+    } else {
+        cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
+    }
+}
+#endif
 
 void cpu_mips_irq_init_cpu(MIPSCPU *cpu)
 {

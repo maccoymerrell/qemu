@@ -1468,6 +1468,23 @@ bool mips_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
     if (interrupt_request & CPU_INTERRUPT_HARD) {
         CPUMIPSState *env = cpu_env(cs);
 
+#ifdef CONFIG_PLUGIN
+        /* #77 line-leak probe (mirror of the riscv CST_IRQ_DIAG): is the
+         * CPU_INTERRUPT_HARD line stuck set with no backing CP0_Cause.IP
+         * (the wrong-path line leak signature)?  Throttled ~1/host-sec. */
+        if (getenv("CST_IRQ_DIAG") && !cs->plugin_spec_mode) {
+            static long last;
+            long now = (long)time(NULL);
+            if (now != last) {
+                last = now;
+                fprintf(stderr, "[mirq] t=%ld ireq=0x%x IP=0x%x en=%d pend=%d\n",
+                        now, interrupt_request,
+                        (env->CP0_Cause & CP0Ca_IP_mask) >> CP0Ca_IP,
+                        cpu_mips_hw_interrupts_enabled(env),
+                        cpu_mips_hw_interrupts_pending(env));
+            }
+        }
+#endif
         if (cpu_mips_hw_interrupts_enabled(env) &&
             cpu_mips_hw_interrupts_pending(env)) {
             /* Raise it */

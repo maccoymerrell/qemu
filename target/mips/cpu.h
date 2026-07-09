@@ -1360,6 +1360,9 @@ uint64_t cpu_mips_phys_to_kseg1(void *opaque, uint64_t addr);
 
 /* HW declaration specific to the MIPS target */
 void cpu_mips_soft_irq(CPUMIPSState *env, int irq, int level);
+#ifdef CONFIG_PLUGIN
+void cpu_mips_plugin_reconcile_irq(CPUMIPSState *env);
+#endif
 void cpu_mips_irq_init_cpu(MIPSCPU *cpu);
 void cpu_mips_clock_init(MIPSCPU *cpu);
 #ifdef CONFIG_PLUGIN

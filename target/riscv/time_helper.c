@@ -253,7 +253,16 @@ void riscv_cpu_plugin_resync_timers(CPUState *cs)
 {
     CPURISCVState *env = cpu_env(cs);
 
-    if (getenv("CST_SYNCIRQ")) {   /* #77 diag toggle */
+    /* Recompute the CPU_INTERRUPT_HARD line from the restored register
+     * state when an excursion suppressed (or raced) a line update: the
+     * snapshot restore is a raw memcpy and never drives the line, so a
+     * raise derived from a rolled-back mip bit would otherwise persist —
+     * observably (a stuck line costs the TB loop its BQL fast path), even
+     * though the mip-based wake/deliver paths ignore it.
+     * riscv_cpu_interrupt is the normal mip-update path's own line logic,
+     * idempotent from current state. */
+    if (cs->plugin_spec_irq_dirty) {
+        cs->plugin_spec_irq_dirty = false;
         riscv_cpu_update_mip(env, 0, 0);
     }
     if (likely(!cs->plugin_spec_timer_dirty) && !getenv("CST_ALWAYS_RESYNC")) {

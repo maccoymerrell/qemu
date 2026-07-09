@@ -698,6 +698,16 @@ struct CPUState {
      */
     bool plugin_spec_timer_dirty;
     /*
+     * Interrupt-line twin of the timer flag: a wrong-path window (or the
+     * fault-skip gap inside one, when spec_mode is briefly false but the
+     * register snapshot is still live) suppressed or raced an update of
+     * the target's env-derived CPU_INTERRUPT_HARD line.  The excursion-
+     * exit resync recomputes the line from restored state — the register
+     * restore is a raw memcpy and never drives it — so a line raised
+     * from a rolled-back pending bit cannot outlive the excursion.
+     */
+    bool plugin_spec_irq_dirty;
+    /*
      * Wrong-path TLB-install log.  Speculative (wrong-path) accesses can
      * install softmmu TLB entries on a miss.  Rather than a full tlb_flush()
      * on every excursion exit — which drops the ENTIRE correct-path TLB plus

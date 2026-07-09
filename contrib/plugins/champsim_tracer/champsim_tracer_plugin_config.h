@@ -43,8 +43,10 @@ struct PluginConfig {
      * from, tracked through ASID-write path events — instead of by the
      * live ASID, so a kernel that switches to a private address space
      * on entry (PTI-style) keeps its synchronous-handler coverage.
-     * 0 (default) keeps the live-ASID rule byte-for-byte. */
-    int       kexc              = 0;
+     * kexc=0 restores the live-ASID rule (kernel work whose live ASID
+     * differs from the pinned value — e.g. a PTI kernel page-table base
+     * — is dropped); it is byte-for-byte the pre-ownership behavior. */
+    int       kexc              = 1;
     /* Per-template IFRAME trigger interval.  0 disables. */
     uint32_t  iframe_rate         = 100000;
     uint64_t  simpoint_interval = 100000000ULL;

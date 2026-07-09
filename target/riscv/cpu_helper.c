@@ -842,9 +842,15 @@ void riscv_cpu_interrupt(CPURISCVState *env)
      * Wrong-path (speculative): don't raise/lower the real CPU interrupt
      * line.  A speculative CSR write to mip/sip/mie still updates env->mip
      * (rolled back at walk end), but the global interrupt-request side
-     * effect must not escape the discarded path.
+     * effect must not escape the discarded path.  Gate on the WHOLE
+     * excursion (vtime_paused), not just spec_mode: the fault-skip gap
+     * briefly clears spec_mode while the snapshot is live, and an
+     * iothread mip update landing there would drive the line from state
+     * the walk-end restore erases.  Mark the excursion dirty so the exit
+     * resync recomputes the line from restored state.
      */
-    if (cs->plugin_spec_mode) {
+    if (cs->plugin_spec_mode || cs->plugin_spec_vtime_paused) {
+        cs->plugin_spec_irq_dirty = true;
         return;
     }
 #endif

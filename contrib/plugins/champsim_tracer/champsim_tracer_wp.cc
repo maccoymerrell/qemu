@@ -286,7 +286,8 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                                uint64_t correct_target,
                                                uint64_t wrong_target,
                                                unsigned int cpu_index,
-                                               bool *flush_interrupted)
+                                               bool *flush_interrupted,
+                                               bool *first_tb_unavail)
 {
     (void)branch_pc;
     (void)correct_target;
@@ -297,6 +298,14 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
      * after the flush dropped its translation, unsandboxed; restarting a
      * fresh spec session avoids that. */
     *flush_interrupted = false;
+    /* Set true only by the genuine-null empty-chain arm below (the one
+     * that bumps wp_first_tb_unavail): the wrong path's FIRST target
+     * could not be fetched/translated, so the returned chain is empty
+     * and there is no WPBBEntry to carry the truncation marker.  The
+     * emitter reads this and writes the chain-level
+     * CST_WP_EVENT_TRANSLATION_UNAVAIL event instead.  Saved-state
+     * failure, fault-loop exits, and flush interruption do NOT set it. */
+    *first_tb_unavail = false;
 
     /* Cache the per-thread Stats ref once: g_stats expands to a
      * thread_stats_get()/__tls_get_addr call, ~1% of total time from
@@ -490,6 +499,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             wp_pending_reg_snaps.clear();
         }
         g_wp_state.last_executed_tb = nullptr;
+        g_last_spec_refusal = SpecRefusal::FETCH;   /* refined by translation */
         uint64_t flush_before =
             g_tb_flush_count.load(std::memory_order_acquire);
         tb_ok = qemu_plugin_exec_tb();
@@ -516,6 +526,30 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                 *flush_interrupted = true;
             } else if (!wp_chain.empty()) {
                 wp_chain.back().translation_unavailable = true;
+            } else {
+                /* Genuine null on the FIRST target: the wrong-path entry
+                 * point itself could not be fetched/translated and there
+                 * is no chain to carry the truncation marker.  Hand the
+                 * condition to the caller via @first_tb_unavail so the
+                 * emitter makes it explicit on the wire as a chain-level
+                 * CST_WP_EVENT_TRANSLATION_UNAVAIL event (§4.4) instead
+                 * of leaving an indistinguishable silent 0-block chain.
+                 * Also count it (a nonzero count against resident
+                 * targets is a bug) and expose the instance under
+                 * CST_WP_DIAG. */
+                *first_tb_unavail = true;
+                thread_stats_get().wp_first_tb_unavail++;
+                if (Stats *h = g_current_hist_bucket) {
+                    h->wp_first_tb_unavail++;
+                }
+                if (getenv("CST_WP_DIAG")) {
+                    fprintf(stderr, "[wpdiag] first-TB unavailable: "
+                            "target=0x%" PRIx64 " wrong_target=0x%" PRIx64
+                            " reason=%s\n",
+                            qemu_plugin_get_pc(), wrong_target,
+                            g_last_spec_refusal == SpecRefusal::POISON
+                                ? "poison" : "fetch");
+                }
             }
             acc.clear();
             bb_reg_snaps.clear();
@@ -872,7 +906,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             uint64_t fall_through = last_insn_pc + last_insn_size;
 
             g_mutex_lock(&data_lock);
-            BBTemplate *bb_tmpl = g_bb_template_cache.commit_true_bb_refs(
+            BBTemplate *bb_tmpl = g_template_store.commit_true_bb_refs(
                 bb_start_pc, (uint32_t)bb_pcs.size(),
                 bb_pcs.data(),
                 bb_fields.data(),

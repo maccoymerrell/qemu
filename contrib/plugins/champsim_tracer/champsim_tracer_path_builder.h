@@ -79,13 +79,18 @@ void emit_finalized_bb(BodyStreamState *out_stream,
 
 /* Build a BodyEntry from the calling thread's CP memop/reg-snap
  * accumulators (draining them) and write it to @out_stream.  @wp_entries
- * is moved in.  Caller holds exec_lock; data_lock is NOT held.  Used by
+ * is moved in.  @wp_first_tb_unavail marks a kicked excursion whose
+ * first wrong-path target could not be fetched/translated (so
+ * @wp_entries is empty); the writer emits it as a chain-level
+ * CST_WP_EVENT_TRANSLATION_UNAVAIL event (champsim_tracer_format.md
+ * §4.4).  Caller holds exec_lock; data_lock is NOT held.  Used by
  * PathBuilder::flush_final, which emits without branch resolution or WP
  * (unlike emit_finalized_bb above). */
 void emit_body_entry(BodyStreamState *out_stream,
                      BBTemplate *bb_tmpl,
                      unsigned int cpu_index,
-                     std::vector<WPBBEntry> wp_entries);
+                     std::vector<WPBBEntry> wp_entries,
+                     bool wp_first_tb_unavail = false);
 
 /* Thread-local CP-step accumulators owned by champsim_tracer.cc.
  * PathBuilder moves them into / out of its frames (the stash and the

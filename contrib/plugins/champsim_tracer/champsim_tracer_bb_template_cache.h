@@ -1,5 +1,10 @@
 /*
- * Wrong-Path Tracing Plugin — BB template cache.
+ * Wrong-Path Tracing Plugin — TemplateStore.
+ *
+ * Naming note: the class is TemplateStore (it owns template lifetime,
+ * not just caching), but the file keeps its historical
+ * champsim_tracer_bb_template_cache.* name so build entries and diffs
+ * stay stable.
  *
  * Owns two distinct stores of BBTemplate records:
  *   - tb_templates_: per-translation TB templates, pure ownership (no
@@ -30,6 +35,7 @@
 #include <functional>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "champsim_tracer.h"
 
@@ -68,13 +74,13 @@ struct TbInsnView {
     }
 };
 
-class BBTemplateCache {
+class TemplateStore {
 public:
-    BBTemplateCache() = default;
-    ~BBTemplateCache() = default;
+    TemplateStore() = default;
+    ~TemplateStore() = default;
 
-    BBTemplateCache(const BBTemplateCache &) = delete;
-    BBTemplateCache &operator=(const BBTemplateCache &) = delete;
+    TemplateStore(const TemplateStore &) = delete;
+    TemplateStore &operator=(const TemplateStore &) = delete;
 
     /* Create a fresh per-translation TB template.  Always allocates
      * (no start_pc dedup) and stores the BBTemplatePtr in
@@ -129,15 +135,16 @@ public:
      * serialization).  Invoked once at end-of-trace by the writer. */
     void for_each_bb(const std::function<void(BBTemplate &)> &fn);
 
-    /* Spec-born template reclaim (#91): see BBTemplate::spec_born.
-     * set_creating_spec marks templates built by the CURRENT translation
-     * as spec-born (called by vcpu_tb_trans with its spec flag).
-     * spec_pending_bytes is the estimated footprint of spec-born
-     * templates created since the last reclaim — the proactive-flush
-     * trigger.  reclaim_spec_templates frees every spec-born template the
-     * correct path never executed; call it ONLY from the tb_flush
-     * callback (all owning QEMU TBs are gone, wrong-path walks have
-     * unwound).  Returns the number of templates freed. */
+    /* SPEC-lifetime template reclaim (#91): see TmplLife.
+     * set_creating_spec selects the lifetime class of templates built by
+     * the CURRENT translation (called by vcpu_tb_trans with its spec
+     * flag; SPEC for a wrong-path translation, CODE otherwise).
+     * spec_pending_bytes is the estimated footprint of SPEC templates
+     * created since the last reclaim — the proactive-flush trigger.
+     * reclaim_spec_templates frees every template still in the SPEC
+     * class; call it ONLY from the tb_flush callback (all owning QEMU
+     * TBs are gone, wrong-path walks have unwound).  Returns the number
+     * of templates freed. */
     void set_creating_spec(bool spec);
     uint64_t spec_pending_bytes() const { return spec_pending_bytes_; }
     void note_spec_creation(uint64_t bytes) { spec_pending_bytes_ += bytes; }
@@ -161,11 +168,27 @@ public:
      * across segment switches: each QEMU TB carries its template via
      * the per-TB exec-cb udata for the QEMU TB's lifetime, and
      * clearing the ownership list would leave that udata dangling.
-     * Cleared by clear_tb_templates() on tb_flush, when QEMU drops
-     * the TBs themselves. */
+     * Bumps the segment generation, which invalidates every SegRef
+     * into the dropped store at its next deref — no invalidation walk
+     * over the persistent translations. */
     void clear_bb_map();
 
-    /* Dedup support for the persistent per-translation store.  TB
+    /* SegRef mint/deref pair for references into bb_map_ (see SegRef).
+     * seg_ref stamps the store's current segment generation; seg_deref
+     * yields the pointee only while that generation is still current —
+     * a stale handle reads as nullptr, exactly like the pre-handle
+     * "field was reset at segment switch" contract.  Inline: the REP
+     * fan-out derefs on the body-emit hot path. */
+    SegRef seg_ref(BBTemplate *t) const
+    {
+        return SegRef{t, segment_gen_};
+    }
+    BBTemplate *seg_deref(const SegRef &r) const
+    {
+        return r.seg_gen == segment_gen_ ? r.ptr : nullptr;
+    }
+
+    /* Dedup support for the persistent per-translation store.  CODE
      * templates are NEVER freed on tb_flush: a flush just re-translates
      * the same code, so the matching chain is reused instead.  This keeps
      * every per-insn-callback udata (RegSnapInsnRef inside a template)
@@ -178,26 +201,60 @@ public:
      * insns, or nullptr on a miss.  Byte-identity is guaranteed by the
      * caller's bytes-changed/poison gate (a TB that reaches here has
      * insns matching their first sighting), so (start_pc, n_insns) is a
-     * sufficient key.  register_tb_chain records a freshly built chain's
-     * head for future reuse.  Memory is bounded by the segment's
+     * sufficient key.  The lookup consults the CODE index first, then
+     * the SPEC index: chains of both lifetime classes are visible from
+     * creation (register_tb_chain routes on the chain's class), so a CP
+     * translation adopts a chain the wrong path minted first — the
+     * common shape for code WP discovers before CP reaches it (spec
+     * translations are full multi-insn TBs) — and a WP translation
+     * reuses real code's chain.  Memory is bounded by the segment's
      * distinct-translation footprint (code size), not execution length;
      * SMC produces a new entry and leaves the dead one in place (rare,
      * bounded, never dereferenced once its QEMU TB is gone). */
     BBTemplate *lookup_tb_chain(uint64_t tb_start_pc, uint32_t total_n_insns);
     void        register_tb_chain(uint64_t tb_start_pc, BBTemplate *head);
 
+    /* Correct-path execution notice for the chain headed by @head (the
+     * per-TB exec-cb udata).  Converts every sibling fragment on the
+     * next_tb_fragment chain SPEC→CODE — code the correct path really
+     * runs is real code whose pointers may sit in deferred prev/chain
+     * state across a flush, and whose decode is worth keeping for
+     * re-translation dedup — and enters the chain into the CODE index.
+     * This is the ONLY SPEC→CODE transition; whole-chain conversion
+     * makes a mixed-class chain impossible by construction.  The
+     * chain's now-stale SPEC-index entry is left in place: harmless,
+     * since lookups prefer the CODE index and reclaim drops the SPEC
+     * index wholesale.  Idempotent (chain_indexed guards re-insertion);
+     * caller holds data_lock. */
+    void promote(BBTemplate *head);
+
 private:
     /* Materialize @tb's REP self-loop sub-template lazily on first
      * demand from the chain-finalize path.  No-op when @tb's
      * terminator is not a REP string op, or when rep_subtmpl is
-     * already populated.  Deferring the build to first use (instead
-     * of running it for every TB during translation) avoids paying
-     * the cost for TBs that never run inside an active trace
-     * segment, AND avoids leaving stale rep_subtmpl pointers behind
-     * across segment switches — the only consumer (emit_body_entry's
-     * REP fan-out) runs while the segment owning the sub-template is
-     * still live. */
+     * already live in the current segment.  Deferring the build to
+     * first use (instead of running it for every TB during
+     * translation) avoids paying the cost for TBs that never run
+     * inside an active trace segment; a handle left over from a
+     * previous segment is stale by generation and simply rebuilt
+     * here — the only consumer (emit_body_entry's REP fan-out) runs
+     * while the segment owning the sub-template is still live. */
     void ensure_rep_subtmpl(BBTemplate *tb);
+
+    /* CST_LIFE_AUDIT (env-gated) boundary checks: walk the surviving
+     * stores after a lifetime boundary and abort with a report if any
+     * survivor still references reclaimed memory.  after_reclaim
+     * verifies no surviving fragment's next_tb_fragment or SegRef
+     * targets a freed SPEC template and that survivors are uniformly
+     * CODE (whole-chain promotion makes mixed chains impossible by
+     * construction — this proves it live).  after_clear verifies no
+     * persistent template holds a SegRef stamped with the CURRENT
+     * (just-bumped) generation, i.e. nothing can deref into the
+     * dropped bb_map_.  Pointer-value comparisons only; freed memory
+     * is never dereferenced. */
+    void life_audit_after_reclaim(
+        const std::unordered_set<const BBTemplate *> &freed) const;
+    void life_audit_after_clear() const;
 
     /* Shared existing-true-BB handling for commit_true_bb and its
      * reference variant: returns the cached template (logging a
@@ -214,18 +271,38 @@ private:
      * run; deduped via tb_chain_dedup_ so a re-translation reuses the
      * existing chain instead of appending a duplicate. */
     std::vector<BBTemplatePtr>                  tb_templates_;
-    /* Dedup index: TB start_pc -> heads of already-built fragment chains
-     * (one per distinct canonical length seen at that PC — sibling
-     * translations of the same start_pc can differ in length, e.g. a
-     * full-BB correct-path TB vs a wrong-path TB that entered mid-block or
-     * stopped at a different branch terminator).  lookup_tb_chain matches on
-     * total canonical insn count so they never conflate. */
+    /* CODE-class dedup index: TB start_pc -> heads of already-built
+     * fragment chains (one per distinct canonical length seen at that
+     * PC — sibling translations of the same start_pc can differ in
+     * length, e.g. a full-BB correct-path TB vs a wrong-path TB that
+     * entered mid-block or stopped at a different branch terminator).
+     * lookup_tb_chain matches on total canonical insn count so they
+     * never conflate.  Holds CODE chains only (CODE-born at creation,
+     * SPEC-born on promotion), so reclaim never touches it. */
     std::unordered_map<uint64_t, std::vector<BBTemplate *>> tb_chain_dedup_;
+    /* SPEC-class twin of tb_chain_dedup_, populated at creation for
+     * SPEC-born chains and dropped WHOLESALE by reclaim_spec_templates
+     * — correct because reclaim frees every still-SPEC chain, and an
+     * adopted (promoted) chain lives on in the CODE index.  A promoted
+     * chain's entry here goes stale rather than being erased; lookups
+     * prefer the CODE index, so the stale entry only ever resolves to
+     * the same head, and it vanishes at the next reclaim.  This split
+     * is what lets reclaim be a pure partition: no per-chain index
+     * surgery, ever. */
+    std::unordered_map<uint64_t, std::vector<BBTemplate *>> spec_chain_index_;
     std::unordered_map<uint64_t, BBTemplatePtr> bb_map_;
     uint32_t                                    next_template_id_ = 1;
     uint64_t                                    spec_pending_bytes_ = 0;
+    /* Current bb_map_ generation, bumped by clear_bb_map at every
+     * segment switch.  Starts at 1 so a zero-initialized SegRef is
+     * stale from birth.  Store-owned (not the global
+     * g_segment_generation): handle validity is a property of THIS
+     * store's clear cycle, and coupling it to the window manager's
+     * counter would make deref correctness depend on reset ordering
+     * at the segment boundary. */
+    uint32_t                                    segment_gen_ = 1;
 };
 
-extern BBTemplateCache g_bb_template_cache;
+extern TemplateStore g_template_store;
 
 #endif /* CHAMPSIM_TRACER_BB_TEMPLATE_CACHE_H */

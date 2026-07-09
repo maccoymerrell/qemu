@@ -164,13 +164,37 @@ std::unordered_map<uint64_t, uint32_t> g_first_insn_word;
  * translation re-attempts at the same start_pc skip fragment
  * materialization.  Persistent across WP simulations; cleared with
  * tb_flush. */
-std::unordered_set<uint64_t> g_poisoned_pcs;
+/* pc -> hash of the TB's full canonical byte image when the poison verdict
+ * was made.  The stored content is the staleness discriminator: every VA is
+ * reused across address spaces (static binaries map at the same base), so a
+ * poison earned by one process's bytes must not refuse another process's
+ * wrong-path target at the same VA.  A refusal only holds while the bytes
+ * still match; a mismatch proves different content now lives there and
+ * self-clears the entry (same principle as the merge content guard).
+ * Handles exec()-time ASID reuse too, which ASID-keying would miss.  A
+ * whole-TB hash rather than the first word: x86 prologues make first-word
+ * collisions across unrelated binaries routine. */
+std::unordered_map<uint64_t, uint64_t> g_poisoned_pcs;
+
+/* FNV-1a over the canonical per-insn byte image (fixed MAX_INSN_BYTES
+ * stride, zero-padded, so equal content implies equal hash input). */
+static uint64_t tb_bytes_hash(const uint8_t *insn_bytes, uint32_t n_insns)
+{
+    uint64_t h = 0xcbf29ce484222325ull;
+    size_t len = (size_t)n_insns * MAX_INSN_BYTES;
+    for (size_t i = 0; i < len; i++) {
+        h = (h ^ insn_bytes[i]) * 0x100000001b3ull;
+    }
+    return h;
+}
 
 /* Both maps above are accessed from vcpu_tb_trans (translation time,
  * no lock currently held) and from the WP walker (under exec_lock).
  * Protected by data_lock — already held by vcpu_tb_trans's
  * fragment-creation critical section and acquired here briefly for
  * lookups during translation. */
+thread_local SpecRefusal g_last_spec_refusal = SpecRefusal::NONE;
+
 bool cst_pc_is_poisoned(uint64_t pc)
 {
     g_mutex_lock(&data_lock);
@@ -743,7 +767,7 @@ static void reset_segment_local_state(void)
     /* Clearing bb_map_ drops the old BBTemplates and their
      * accumulated emit_count; the next commit_true_bb rebuilds each
      * zero-initialized, so the IFRAME cadence resets implicitly. */
-    g_bb_template_cache.clear_bb_map();
+    g_template_store.clear_bb_map();
     g_mutex_unlock(&data_lock);
 
     /*
@@ -936,7 +960,8 @@ static void heartbeat_progress(uint64_t icount)
 void emit_body_entry(BodyStreamState *out_stream,
                      BBTemplate *bb_tmpl,
                      unsigned int cpu_index,
-                     std::vector<WPBBEntry> wp_entries)
+                     std::vector<WPBBEntry> wp_entries,
+                     bool wp_first_tb_unavail)
 {
     /* warmup→simulation boundary capture.  This BB is the first
      * emitted at host_icount >= window_start + warmup_insns, so
@@ -958,6 +983,7 @@ void emit_body_entry(BodyStreamState *out_stream,
     entry.template_id = bb_tmpl ? bb_tmpl->template_id : 0;
     entry.dyn_params.reserve(g_mem_recorder.cp_count());
     entry.wp_entries = std::move(wp_entries);
+    entry.wp_first_tb_unavail = wp_first_tb_unavail;
     entry.tmpl = bb_tmpl;
     entry.fault_depth = g_emit_fault_depth;
     entry.fault_anchors = g_emit_fault_anchors;
@@ -987,7 +1013,9 @@ void emit_body_entry(BodyStreamState *out_stream,
      * branch, and per-iter RSI/RDI/RCX deltas ride the field-delta
      * stream like any repeated BB visit.
      */
-    BBTemplate *rep_sub = bb_tmpl ? bb_tmpl->rep_subtmpl : nullptr;
+    BBTemplate *rep_sub = bb_tmpl
+        ? g_template_store.seg_deref(bb_tmpl->rep_subtmpl)
+        : nullptr;
     if (rep_sub && bb_tmpl->n_insns > 0) {
         uint32_t last = bb_tmpl->n_insns - 1;
         const InsnFields *lf = &bb_tmpl->insn_fields[last];
@@ -1165,7 +1193,7 @@ static void finish_trace_segment(void)
      * close — attributes the multi-GiB heap baseline to its owners. */
     if (getenv("CST_MEMSTATS")) {
         g_mutex_lock(&data_lock);
-        g_bb_template_cache.mem_stats(stderr);
+        g_template_store.mem_stats(stderr);
         g_mutex_unlock(&data_lock);
         fprintf(stderr, "[memstats] first_insn_word=%zu poisoned=%zu\n",
                 g_first_insn_word.size(), g_poisoned_pcs.size());
@@ -1273,7 +1301,7 @@ static uint64_t resolve_wrong_target(const BBTemplate *bb_tmpl,
                                      uint64_t *taken_out)
 {
     *taken_out = 0;
-    int br_idx = BBTemplateCache::template_branch_index(bb_tmpl);
+    int br_idx = TemplateStore::template_branch_index(bb_tmpl);
     const InsnFields *bf = (br_idx >= 0)
         ? &bb_tmpl->insn_fields[br_idx] : nullptr;
     if (!bf) {
@@ -1352,7 +1380,7 @@ static bool wp_branch_pruned(const BBTemplate *bb_tmpl, const BranchRecord *br)
     if (g_wp_prune <= 0 || !br) {
         return false;
     }
-    int br_idx = BBTemplateCache::template_branch_index(bb_tmpl);
+    int br_idx = TemplateStore::template_branch_index(bb_tmpl);
     const InsnFields *bf = (br_idx >= 0)
         ? &bb_tmpl->insn_fields[br_idx] : nullptr;
     if (!bf) {
@@ -1391,6 +1419,12 @@ void emit_finalized_bb(BodyStreamState *out_stream,
     g_cp_chain.reset();
 
     std::vector<WPBBEntry> wp_entries;
+    /* Genuine first-fetch failure from the accepted (non-flush-
+     * interrupted) walker run: the excursion was kicked but its first
+     * wrong-path target could not be fetched/translated, so wp_entries
+     * is empty.  Carried onto the BodyEntry so the writer emits the
+     * chain-level CST_WP_EVENT_TRANSLATION_UNAVAIL event (§4.4). */
+    bool wp_first_tb_unavail = false;
     /*
      * Wrong-path speculation relies on the guest MMU to fault on fetches
      * into non-code (a speculative branch into data then page-faults, which
@@ -1405,16 +1439,30 @@ void emit_finalized_bb(BodyStreamState *out_stream,
      * with paging on).
      */
     if (enable_wrong_path && wrong_target != 0 && qemu_plugin_paging_enabled()) {
-        /* If a tb_flush unwinds a spec-mode exec_tb mid-WP, the chain is
-         * truncated at that point: the WP simulation cannot be safely
-         * resumed OR re-run across the flush (QEMU's flush + spec-mode
-         * interaction faults if wrong-path execution continues), so we
-         * accept the truncated (still-valid, shorter) chain.  Only bites
-         * under heavy flushing (rare except a tiny code cache). */
-        bool flush_interrupted = false;
-        wp_entries = simulate_wrong_path_ext(
-            prev_last, current_pc, wrong_target, cpu_index,
-            &flush_interrupted);
+        /* A tb_flush that unwinds a spec-mode exec_tb mid-walk truncates
+         * the chain at that point — the walk cannot be RESUMED (the flush
+         * dropped its spec translations; continuing would run wrong-path
+         * code outside the sandbox).  A fresh RE-RUN is safe and is the
+         * walker's designed contract: the bail epilogue fully restored CP
+         * state, the flush has completed, and the re-run re-translates in
+         * the fresh cache.  Discard the truncated chain and take the
+         * re-run's complete one (exact-or-longer: a flush-shortened chain
+         * is indistinguishable from a silent bug on the wire).  Bounded:
+         * back-to-back flushes landing inside consecutive re-runs are
+         * vanishingly rare; two attempts cover the observed class. */
+        for (int attempt = 0; attempt < 3; attempt++) {
+            bool flush_interrupted = false;
+            wp_entries = simulate_wrong_path_ext(
+                prev_last, current_pc, wrong_target, cpu_index,
+                &flush_interrupted, &wp_first_tb_unavail);
+            if (!flush_interrupted) {
+                break;
+            }
+            thread_stats_get().wp_flush_reruns++;
+            if (Stats *h = g_current_hist_bucket) {
+                h->wp_flush_reruns++;
+            }
+        }
     } else if (wrong_target == 0) {
         thread_stats_get().wp_skipped++;
         if (Stats *h = g_current_hist_bucket) {
@@ -1422,7 +1470,8 @@ void emit_finalized_bb(BodyStreamState *out_stream,
         }
     }
 
-    emit_body_entry(out_stream, bb_tmpl, cpu_index, std::move(wp_entries));
+    emit_body_entry(out_stream, bb_tmpl, cpu_index, std::move(wp_entries),
+                    wp_first_tb_unavail);
 }
 
 /*
@@ -1766,7 +1815,7 @@ bool collect_finalized_bbs(unsigned int cpu_index,
 
         if (BBTemplate *bb_tmpl = cp_chain_finalize_if_complete()) {
             PendingEmit pe = {bb_tmpl, 0, frag_current_pc, 0};
-            int br_idx = BBTemplateCache::template_branch_index(bb_tmpl);
+            int br_idx = TemplateStore::template_branch_index(bb_tmpl);
             if (br_idx >= 0) {
                 pe.branch_pc = bb_tmpl->insn_pcs[br_idx];
                 BranchRecord *br = observe_branch_transition(
@@ -1875,7 +1924,7 @@ static void run_deferred_window_closes(PathBuilder &pb)
 
 /*
  * The CP step, driven by the ordered per-vCPU event queue.  The shared
- * prologue of vcpu_tb_exec — WP early-out, cp_executed stamp,
+ * prologue of vcpu_tb_exec — WP early-out, chain promotion,
  * capture-mute latch, blkwatch, vclock guard, icount read — has already
  * run.  This glue keeps the SHARED machinery at the step level (window
  * management, segment boundary, heartbeat/histogram, scoreboard reads,
@@ -2058,13 +2107,17 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         return;
     }
 
-    /* Correct-path execution protects this template from the spec-born
-     * reclaim at tb_flush (#91): a template the CP really runs is real
-     * code whose pointer may sit in deferred prev/chain state across a
-     * flush, and whose decode is worth keeping for re-translation dedup.
-     * Covers dedup-shared chains first built by a wrong-path translation. */
-    if (cur_tb_tmpl) {
-        cur_tb_tmpl->cp_executed = true;
+    /* Correct-path execution promotes this TB's whole fragment chain to
+     * the CODE lifetime class and moves its dedup visibility to the
+     * CODE index — protection from the SPEC reclaim at tb_flush (#91)
+     * for chains the wrong path minted first, in one transition (see
+     * TemplateStore::promote).  CODE-born chains are indexed at
+     * registration, so the pre-lock gate on chain_indexed keeps the
+     * steady state lock-free; promote() rechecks under data_lock. */
+    if (cur_tb_tmpl && !cur_tb_tmpl->chain_indexed) {
+        g_mutex_lock(&data_lock);
+        g_template_store.promote(cur_tb_tmpl);
+        g_mutex_unlock(&data_lock);
     }
 
     /* Latch the async-exclusion decision for this TB's body callbacks
@@ -2623,10 +2676,22 @@ static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
     const bool spec = g_wp_state.in_progress;
 
     g_mutex_lock(&data_lock);
-    if (g_poisoned_pcs.count(pc) && spec) {
+    uint64_t bytes_hash = tb_bytes_hash(insn_bytes, canonical_n_insns);
+    auto poison_it = g_poisoned_pcs.find(pc);
+    if (poison_it != g_poisoned_pcs.end() && spec &&
+        poison_it->second != bytes_hash) {
+        /* Different bytes than when the verdict was made: the VA has been
+         * reused by another context since (process exit, exec, page reuse).
+         * The old verdict says nothing about THIS content — clear it and
+         * evaluate normally below. */
+        g_poisoned_pcs.erase(poison_it);
+        poison_it = g_poisoned_pcs.end();
+    }
+    if (poison_it != g_poisoned_pcs.end() && spec) {
         p.poisoned = true;
         p.pc = pc;
         p.reason = "previously poisoned";
+        g_last_spec_refusal = SpecRefusal::POISON;
     } else {
         /* Correct-path execution reaching a poisoned PC is proof the poison was
          * wrong: the CPU is really executing this code in the current address
@@ -2689,7 +2754,7 @@ static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
             }
         }
         if (p.poisoned && !spec) {
-            g_poisoned_pcs.insert(pc);
+            g_poisoned_pcs[pc] = bytes_hash;
         }
     }
     g_mutex_unlock(&data_lock);
@@ -2851,10 +2916,10 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * off the guest clock (see VClockPauseGuard at vcpu_tb_exec). */
     VClockPauseGuard vclock_guard;
 
-    /* Spec-born template accounting (#91): templates built for a wrong-path
-     * translation are reclaimable at tb_flush unless the correct path later
-     * executes them (see BBTemplate::spec_born). */
-    g_bb_template_cache.set_creating_spec(g_wp_state.in_progress);
+    /* Lifetime-class selection (#91): templates built for a wrong-path
+     * translation are born SPEC — reclaimable at tb_flush unless the
+     * correct path executes them first (see TmplLife). */
+    g_template_store.set_creating_spec(g_wp_state.in_progress);
 
     /*
      * Every TB gets the full heavy translation, regardless of segment
@@ -2945,7 +3010,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     uint64_t tb_start_pc = insn_pcs[0];
     g_mutex_lock(&data_lock);
     BBTemplate *reuse_head =
-        g_bb_template_cache.lookup_tb_chain(tb_start_pc, canonical_n_insns);
+        g_template_store.lookup_tb_chain(tb_start_pc, canonical_n_insns);
     g_mutex_unlock(&data_lock);
     const bool reuse = (reuse_head != nullptr);
 
@@ -2979,7 +3044,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             }
         } else {
             g_mutex_lock(&data_lock);
-            frag_tmpl = g_bb_template_cache.create_tb_template(
+            frag_tmpl = g_template_store.create_tb_template(
                                 f_start_pc,
                                 tb_view.slice(f_first_ci, spec.n_insns),
                                 frag_symbol,
@@ -3037,14 +3102,17 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         }
     }
 
-    /* Record a freshly built chain for future reuse (a tb_flush will
-     * re-translate the same code and reuse it instead of duplicating). */
+    /* Record a freshly built chain for future reuse in its lifetime
+     * class's index (a tb_flush will re-translate the same code and
+     * reuse it instead of duplicating; a CP translation adopts a chain
+     * the wrong path minted first).  SPEC chains go to the separate
+     * SPEC index so the reclaim can drop them wholesale — no per-chain
+     * index surgery (see register_tb_chain / promote). */
     if (!reuse && head_fragment) {
         g_mutex_lock(&data_lock);
-        g_bb_template_cache.register_tb_chain(tb_start_pc, head_fragment);
+        g_template_store.register_tb_chain(tb_start_pc, head_fragment);
         g_mutex_unlock(&data_lock);
     }
-
 
     /* Instrument the block for execution tracking.  current_pc is set
      * per-TB-exec to the TB's start_pc (== head fragment's start_pc).
@@ -3105,8 +3173,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     /* Proactive spec-template reclaim (#91): when the wrong path has minted
      * more than a budget of reclaimable templates since the last flush —
      * speculative fetch wandering mutable data that happens to decode —
-     * request a tb_flush.  The flush callback then frees every spec-born
-     * template the correct path never executed, bounding the growth that
+     * request a tb_flush.  The flush callback then frees every template
+     * still in the SPEC lifetime class, bounding the growth that
      * previously ran to tens of GiB (one-insn templates at millions of
      * fresh PCs, or ~1.7 MB 512-insn nop-slide templates from zeroed
      * pages).  Deferred-flush machinery makes the request safe here. */
@@ -3123,11 +3191,11 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             budget = (e && *e) ? strtoull(e, nullptr, 0) : (256ull << 20);
         }
         if (g_wp_state.in_progress &&
-            g_bb_template_cache.spec_pending_bytes() > budget) {
+            g_template_store.spec_pending_bytes() > budget) {
             if (getenv("CST_MEMSTATS")) {
                 fprintf(stderr, "[memstats] spec budget tripped: pending=%"
                         PRIu64 " > %" PRIu64 " -- flush latched\n",
-                        g_bb_template_cache.spec_pending_bytes(), budget);
+                        g_template_store.spec_pending_bytes(), budget);
             }
             /* LATCH ONLY.  Requesting here — mid-excursion, inside a WP
              * translation — kicks the vCPU (async-safe work) and the
@@ -3157,14 +3225,14 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
      * for real code a flush frees nothing and perturbs no walk state —
      * flush-invariant by construction, no flush-time use-after-free.
      *
-     * SPEC-BORN templates the correct path never executed are the
-     * exception (#91): they are wrong-path fetch residue (speculation
-     * wandering mutable data that happens to decode), unbounded across a
-     * run, and nothing references them once the flush drops their owning
-     * QEMU TBs — the deferred-flush machinery guarantees no wrong-path
-     * walk is in flight when this callback fires.  Reclaim them here; a
-     * proactive flush is requested from vcpu_tb_trans when their
-     * footprint crosses the budget.
+     * SPEC-lifetime templates (never promoted by a correct-path
+     * execution) are the exception (#91): they are wrong-path fetch
+     * residue (speculation wandering mutable data that happens to
+     * decode), unbounded across a run, and nothing references them once
+     * the flush drops their owning QEMU TBs — the deferred-flush
+     * machinery guarantees no wrong-path walk is in flight when this
+     * callback fires.  Reclaim them here; a proactive flush is requested
+     * from vcpu_tb_trans when their footprint crosses the budget.
      *
      * We do NOT clear the bytes/poison caches (g_first_insn_word /
      * g_poisoned_pcs): they persist so SMC detection survives a flush,
@@ -3177,14 +3245,14 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
     g_tb_flush_count.fetch_add(1, std::memory_order_acq_rel);
     g_wp_state.last_executed_tb = nullptr;   /* may point at a reclaimee */
     g_mutex_lock(&data_lock);
-    uint64_t freed = g_bb_template_cache.reclaim_spec_templates();
+    uint64_t freed = g_template_store.reclaim_spec_templates();
     g_mutex_unlock(&data_lock);
     if (getenv("CST_MEMSTATS")) {
         /* Unconditional: freed==0 vs flush-never-ran must be
          * distinguishable when proving the request->flush->reclaim
          * chain end-to-end. */
         fprintf(stderr, "[memstats] tb_flush reclaimed %" PRIu64
-                " spec-born templates\n", freed);
+                " spec templates\n", freed);
     }
 }
 
@@ -3273,6 +3341,8 @@ static void append_stats_summary(GString *report, const char *label,
         { "WP total instructions",               stats.wp_total_insns },
         { "WP total memory accesses",            stats.wp_total_mem_accesses },
         { "WP early exits (fault)",              stats.wp_early_exits },
+        { "WP flush re-runs",                    stats.wp_flush_reruns },
+        { "WP first-TB unavailable",             stats.wp_first_tb_unavail },
         { "Unknown-instruction warnings",        stats.unknown_insn_warnings },
     };
     const struct { const char *name; uint64_t value; } bin_counters[] = {

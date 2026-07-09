@@ -630,6 +630,44 @@ typedef struct {
 enum { CST_PROFILE_PAGE_SHIFT = 12 };
 
 typedef struct BBTemplate BBTemplate;
+
+/*
+ * Template lifetime class.  A template is born into one of two classes
+ * from the mode of the translation that minted it:
+ *
+ *   SPEC — minted by a wrong-path (spec-mode) translation.  Wrong-path
+ *          fetch residue unless the correct path later runs it: freed
+ *          wholesale at tb_flush (see reclaim_spec_templates).  Dedup-
+ *          visible via a separate SPEC-class index that reclaim drops
+ *          in one clear.
+ *   CODE — minted by a correct-path translation, or promoted from SPEC
+ *          on first correct-path execution (TemplateStore::promote).
+ *          Persistent for the run; the CODE-class dedup index only
+ *          ever contains CODE chains, so reclaim never touches it.
+ *
+ * The third lifetime regime — segment-scoped true-BB templates — is
+ * expressed by bb_map_ membership, not by this enum: bb_map_ owns its
+ * records and drops them wholesale at clear_bb_map().
+ */
+enum class TmplLife : uint8_t { SPEC, CODE };
+
+/*
+ * Generation-stamped handle for a cross-lifetime reference INTO the
+ * segment-scoped true-BB store (bb_map_).  Flush-persistent fragment
+ * templates outlive the true-BBs they point at, so a raw pointer would
+ * dangle after every clear_bb_map(); instead of a remembered
+ * invalidation walk over all translations, the handle carries the
+ * segment generation it was minted in and staleness is detected at
+ * deref (TemplateStore::seg_deref returns nullptr for a stale handle
+ * — one integer compare, cheap enough for the REP fan-out hot path).
+ * Zero-initialized state ({nullptr, 0}) is stale by construction: the
+ * store's generation counter starts at 1.
+ */
+struct SegRef {
+    BBTemplate *ptr;
+    uint32_t    seg_gen;
+};
+
 struct BBTemplate {
     uint32_t template_id;
     uint64_t start_pc;
@@ -679,12 +717,17 @@ struct BBTemplate {
      * last canonical insn): a 1-insn self-loop sub-template at the
      * REP's PC, built at translation time.  Body emitter fans a single
      * TB-exec into N entries (iter 1 on this template, iter 2..N on
-     * rep_subtmpl).  NULL on non-REP TBs.  Materialized at translation
-     * but only emitted at >= 2 iters, so an unexercised REP leaves a
-     * 0/0-exec template in the dictionary — expected and benign;
-     * consumers treat it as a pre-declared, unreferenced self-loop.
+     * rep_subtmpl).  Stale/null handle on non-REP TBs.  Materialized
+     * lazily on first chain-finalize use, but only emitted at >= 2
+     * iters, so an unexercised REP leaves a 0/0-exec template in the
+     * dictionary — expected and benign; consumers treat it as a
+     * pre-declared, unreferenced self-loop.  A SegRef because the
+     * pointee lives in bb_map_ (segment lifetime) while this template
+     * may persist across segments: a handle minted in a previous
+     * segment derefs to nullptr and the sub-template is rebuilt on
+     * next use (see ensure_rep_subtmpl).
      */
-    BBTemplate *rep_subtmpl;
+    SegRef rep_subtmpl;
     /* Run-aggregated profiling (champsim_tracer_format.md §6).
      * Lazily allocated on first accumulation; freed with the
      * template.  NULL until this BB executes at least once. */
@@ -693,10 +736,12 @@ struct BBTemplate {
      * it has been folded into.  Set when get_or_create_bb_template
      * commits or reuses a true-BB whose fragments include this TB;
      * subsequent re-finalizations of the same chain short-circuit
-     * the fragment-walk + lookup dance and return this pointer
-     * directly.  Invalidated to NULL by clear_bb_map() at segment
-     * switches, since bb_map_ owns the pointee. */
-    BBTemplate *parent_true_bb;
+     * the fragment-walk + lookup dance and return the pointee
+     * directly.  A SegRef because bb_map_ owns the pointee: after a
+     * segment switch the handle is stale (generation mismatch) and
+     * seg_deref returns nullptr, sending the finalize down the slow
+     * path that re-commits the true-BB in the new segment. */
+    SegRef parent_true_bb;
     /* How this TB fragment contributes to true-BB assembly (TbTerminus,
      * see split_tb_into_fragments).  Set on TB fragment templates at
      * translation time; the BB chain assembler and the WP walker both
@@ -721,22 +766,26 @@ struct BBTemplate {
     bool is_system;
     bool is_system_cp_confirmed;
     /*
-     * Spec-born template reclaim (#91).  spec_born: this template was
-     * created by a WRONG-PATH (spec-mode) translation.  cp_executed: the
-     * correct path has executed a TB whose udata is this template.  A
-     * spec-born template the correct path never runs is speculative-fetch
-     * residue — the wrong path wandering mutable data that happens to
-     * decode (millions of one-insn CF_SINGLE_STEP templates at ever-fresh
-     * PCs, or 512-insn nop-slides through zeroed pages at ~1.7 MB each) —
-     * and retaining it for the run is the unbounded heap growth behind the
-     * intermittent OOM aborts.  Such templates are freed at tb_flush
-     * (their owning QEMU TBs are gone; nothing else references them),
-     * with a flush requested proactively when their footprint crosses a
-     * budget.  CP-executed templates are never reclaimed, preserving the
-     * deferred-prev/chain invariants and flush-invariance for real code.
+     * Lifetime class (see TmplLife).  SPEC templates the correct path
+     * never runs are speculative-fetch residue — the wrong path
+     * wandering mutable data that happens to decode (millions of
+     * one-insn CF_SINGLE_STEP templates at ever-fresh PCs, or 512-insn
+     * nop-slides through zeroed pages at ~1.7 MB each) — and retaining
+     * them for the run is the unbounded heap growth behind the
+     * intermittent OOM aborts (#91).  They are freed at tb_flush (their
+     * owning QEMU TBs are gone; nothing else references them), with a
+     * flush requested proactively when their footprint crosses a budget.
+     * CODE templates are never reclaimed, preserving the deferred-
+     * prev/chain invariants and flush-invariance for real code.
      */
-    bool spec_born;
-    bool cp_executed;
+    TmplLife life;
+    /* Set once the chain headed by this fragment has been entered into
+     * the CODE-class dedup index — at registration for a CODE-born
+     * chain, at first correct-path execution for a SPEC-born one
+     * (TemplateStore::promote).  Meaningful on chain HEADS only; the
+     * pre-lock fast gate in vcpu_tb_exec reads it racily, which is
+     * benign — promote() rechecks under data_lock. */
+    bool chain_indexed;
     /* Linked list of sibling fragments produced from the same QEMU TB
      * by the mid-TB-branch splitter.  Head is what vcpu_tb_trans
      * attached as the per-TB exec-cb udata; vcpu_tb_exec and the WP
@@ -815,6 +864,14 @@ struct BodyEntry {
      * snaps only.  Only populated when g_features.reg_data is true. */
     std::vector<RegSnap> reg_snaps;
     std::vector<WPBBEntry> wp_entries;
+    /* The wrong-path excursion was kicked but its FIRST target could
+     * not be fetched/translated (wp_entries is empty, so there is no
+     * WPBBEntry to carry translation_unavailable).  The body writer
+     * emits it as a chain-level CST_WP_EVENT_TRANSLATION_UNAVAIL event
+     * (resolved index >= num_wp; see champsim_tracer_format.md §4.4).
+     * Set from simulate_wrong_path_ext's first_tb_unavail out-param;
+     * always false in user mode and on REP fan-out sub-entries. */
+    bool wp_first_tb_unavail = false;
     BBTemplate *tmpl;  /* Non-owning; for per-insn schema access */
     /* Exception-nesting depth at which this BB executed: 0 = normal code,
      * >=1 = synchronous-fault handler code that detoured execution at that
@@ -1063,6 +1120,12 @@ static inline bool cst_pc_in_code(uint64_t pc)
  * byte change detected at translation time)?  Acquires data_lock. */
 bool cst_pc_is_poisoned(uint64_t pc);
 
+/* Why the most recent spec-mode exec_tb produced no template (TLS; set
+ * before each spec exec_tb, refined by detect_tb_poison).  Diagnostic
+ * plumbing for the wrong-path first-TB-unavailable classification. */
+enum class SpecRefusal : uint8_t { NONE, FETCH, POISON };
+extern thread_local SpecRefusal g_last_spec_refusal;
+
 /* Synchronization & diagnostics.  Must stay GMutex, not std::mutex:
  * <mutex> pulls <ctype.h>, which QEMU's include/qemu/ctype.h shadows
  * on the plugin -I path, breaking libstdc++'s `using ::isalnum;`. */
@@ -1106,13 +1169,20 @@ typedef struct _WideRegSnap WideRegSnap;
  * champsim_tracer_reg_snap_collector.h. */
 
 /* Defined in champsim_tracer_wp.cc.  Returns the speculative chain by
- * value; callers move it into BodyEntry::wp_entries. */
+ * value; callers move it into BodyEntry::wp_entries.
+ * @first_tb_unavail is set when the excursion's FIRST wrong-path
+ * target could not be fetched/translated (genuine null, no flush): the
+ * returned chain is empty and carries no WPBBEntry to mark, so the
+ * condition rides this out-param instead.  The emitter records it as a
+ * chain-level CST_WP_EVENT_TRANSLATION_UNAVAIL event (§4.4 of
+ * champsim_tracer_format.md). */
 #ifdef __cplusplus
 std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                                uint64_t correct_target,
                                                uint64_t wrong_target,
                                                unsigned int cpu_index,
-                                               bool *flush_interrupted);
+                                               bool *flush_interrupted,
+                                               bool *first_tb_unavail);
 #endif
 
 /*

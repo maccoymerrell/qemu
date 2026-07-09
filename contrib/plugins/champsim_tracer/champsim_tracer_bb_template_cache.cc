@@ -1,5 +1,9 @@
 /*
- * Wrong-Path Tracing Plugin — BB template cache implementation.
+ * Wrong-Path Tracing Plugin — TemplateStore implementation.
+ *
+ * Naming note: the class is TemplateStore, but the file keeps its
+ * historical champsim_tracer_bb_template_cache.* name so build entries
+ * and diffs stay stable.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -15,14 +19,14 @@
 #include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_stats.h"
 
-BBTemplateCache g_bb_template_cache;
+TemplateStore g_template_store;
 
 /* Per-thread: is the translation currently being templated a wrong-path
  * (spec-mode) one?  Thread-local because translations run on each vCPU's
  * own thread; a plain member would cross-mislabel under MTTCG. */
 static thread_local bool tls_creating_spec = false;
 
-void BBTemplateCache::set_creating_spec(bool spec)
+void TemplateStore::set_creating_spec(bool spec)
 {
     tls_creating_spec = spec;
 }
@@ -58,35 +62,103 @@ void BBTemplateDeleter::operator()(BBTemplate *t) const noexcept
     g_free(t);
 }
 
-BBTemplate *BBTemplateCache::find_bb_template(uint64_t entry_pc)
+BBTemplate *TemplateStore::find_bb_template(uint64_t entry_pc)
 {
     auto it = bb_map_.find(entry_pc);
     return it == bb_map_.end() ? nullptr : it->second.get();
 }
 
-size_t BBTemplateCache::tb_count() const
+size_t TemplateStore::tb_count() const
 {
     return tb_templates_.size();
 }
 
-void BBTemplateCache::clear_bb_map()
+/* CST_LIFE_AUDIT: opt-in debug boundary audit (see the header). */
+static bool life_audit_enabled(void)
 {
-    bb_map_.clear();
-    /* TB templates hold two back-edges into bb_map_ — parent_true_bb
-     * (fast-path link to the assembled true-BB) and rep_subtmpl (the
-     * 1-insn REP self-loop true-BB built at translation time for x86
-     * REP string ops).  Both must be invalidated after the wipe;
-     * otherwise commit_true_bb_refs propagates a dangling rep_subtmpl
-     * onto the next finalized true-BB, and emit_body_entry's REP
-     * fan-out path then derefs freed memory.  Walking tb_templates_
-     * is O(distinct translations) and only runs on segment switches,
-     * not per-exec. */
-    for (auto &p : tb_templates_) {
-        if (p) {
-            p->parent_true_bb = nullptr;
-            p->rep_subtmpl    = nullptr;
+    static const bool on = getenv("CST_LIFE_AUDIT") != nullptr;
+    return on;
+}
+
+void TemplateStore::life_audit_after_reclaim(
+    const std::unordered_set<const BBTemplate *> &freed) const
+{
+    /* Pointer-target checks apply to both stores; the class check only
+     * to fragments — a bb_map_ template's lifetime IS its bb_map_
+     * membership, and one committed during a wrong-path walk can carry
+     * a SPEC birth-stamp without ever being reclaim-eligible. */
+    auto check_targets = [&](const BBTemplate *t, const char *store) {
+        if (t->next_tb_fragment && freed.count(t->next_tb_fragment)) {
+            fprintf(stderr, "champsim_tracer: LIFE_AUDIT violation: "
+                    "%s survivor pc=0x%" PRIx64 " sibling link targets a "
+                    "reclaimed fragment\n", store, t->start_pc);
+            abort();
+        }
+        if ((t->parent_true_bb.ptr && freed.count(t->parent_true_bb.ptr)) ||
+            (t->rep_subtmpl.ptr && freed.count(t->rep_subtmpl.ptr))) {
+            fprintf(stderr, "champsim_tracer: LIFE_AUDIT violation: "
+                    "%s survivor pc=0x%" PRIx64 " SegRef targets a "
+                    "reclaimed fragment\n", store, t->start_pc);
+            abort();
+        }
+    };
+    for (const auto &p : tb_templates_) {
+        if (!p) {
+            continue;
+        }
+        if (p->life != TmplLife::CODE) {
+            fprintf(stderr, "champsim_tracer: LIFE_AUDIT violation: "
+                    "fragment survivor pc=0x%" PRIx64
+                    " not CODE after reclaim\n", p->start_pc);
+            abort();
+        }
+        /* Membership checks run BEFORE the sibling class check: the
+         * latter dereferences next_tb_fragment, which is only safe
+         * once it is known not to be a freed pointer. */
+        check_targets(p.get(), "tb_templates");
+        if (p->next_tb_fragment &&
+            p->next_tb_fragment->life != TmplLife::CODE) {
+            fprintf(stderr, "champsim_tracer: LIFE_AUDIT violation: "
+                    "fragment survivor pc=0x%" PRIx64
+                    " sibling link targets a SPEC fragment\n", p->start_pc);
+            abort();
         }
     }
+    for (const auto &kv : bb_map_) {
+        if (kv.second) {
+            check_targets(kv.second.get(), "bb_map");
+        }
+    }
+}
+
+void TemplateStore::life_audit_after_clear() const
+{
+    for (const auto &p : tb_templates_) {
+        if (!p) {
+            continue;
+        }
+        if ((p->parent_true_bb.ptr &&
+             p->parent_true_bb.seg_gen == segment_gen_) ||
+            (p->rep_subtmpl.ptr &&
+             p->rep_subtmpl.seg_gen == segment_gen_)) {
+            fprintf(stderr, "champsim_tracer: LIFE_AUDIT violation: "
+                    "fragment pc=0x%" PRIx64 " holds a current-generation "
+                    "SegRef right after clear_bb_map\n", p->start_pc);
+            abort();
+        }
+    }
+}
+
+void TemplateStore::clear_bb_map()
+{
+    bb_map_.clear();
+    /* TB templates hold two back-edges into the store just dropped —
+     * parent_true_bb (fast-path link to the assembled true-BB) and
+     * rep_subtmpl (the 1-insn REP self-loop true-BB for x86 REP
+     * string ops).  Both are SegRef handles: bumping the generation
+     * invalidates every one of them at its next deref, with no walk
+     * over the persistent translations. */
+    segment_gen_++;
     /*
      * Reset template-id counter so each segment starts at id 1; else
      * ids accumulate across segments and the fresh FieldStateTable's
@@ -95,13 +167,19 @@ void BBTemplateCache::clear_bb_map()
      * segment opens a new TEMPLATES section.
      */
     next_template_id_ = 1;
+    if (life_audit_enabled()) {
+        life_audit_after_clear();
+    }
 }
 
-BBTemplate *BBTemplateCache::lookup_tb_chain(uint64_t tb_start_pc,
-                                             uint32_t total_n_insns)
+/* Scan one class index for a chain at @tb_start_pc totalling
+ * @total_n_insns canonical insns. */
+static BBTemplate *chain_index_scan(
+    const std::unordered_map<uint64_t, std::vector<BBTemplate *>> &index,
+    uint64_t tb_start_pc, uint32_t total_n_insns)
 {
-    auto it = tb_chain_dedup_.find(tb_start_pc);
-    if (it == tb_chain_dedup_.end()) {
+    auto it = index.find(tb_start_pc);
+    if (it == index.end()) {
         return nullptr;
     }
     for (BBTemplate *head : it->second) {
@@ -116,17 +194,62 @@ BBTemplate *BBTemplateCache::lookup_tb_chain(uint64_t tb_start_pc,
     return nullptr;
 }
 
-void BBTemplateCache::register_tb_chain(uint64_t tb_start_pc, BBTemplate *head)
+BBTemplate *TemplateStore::lookup_tb_chain(uint64_t tb_start_pc,
+                                             uint32_t total_n_insns)
 {
-    tb_chain_dedup_[tb_start_pc].push_back(head);
+    /* CODE index first: a promoted chain's SPEC-index entry is left
+     * stale (see promote), so the CODE side is the authoritative one
+     * whenever both hold the chain. */
+    if (BBTemplate *head =
+            chain_index_scan(tb_chain_dedup_, tb_start_pc, total_n_insns)) {
+        return head;
+    }
+    return chain_index_scan(spec_chain_index_, tb_start_pc, total_n_insns);
 }
 
-size_t BBTemplateCache::bb_count() const
+void TemplateStore::register_tb_chain(uint64_t tb_start_pc, BBTemplate *head)
+{
+    /* Route on the chain's lifetime class so each class is visible to
+     * dedup from creation — mint sequences (and with them serialized
+     * template ids) are independent of when a chain first executes. */
+    if (head->life == TmplLife::SPEC) {
+        spec_chain_index_[tb_start_pc].push_back(head);
+    } else {
+        tb_chain_dedup_[tb_start_pc].push_back(head);
+        head->chain_indexed = true;
+    }
+}
+
+void TemplateStore::promote(BBTemplate *head)
+{
+    /* Idempotence recheck under data_lock: the caller's pre-lock gate
+     * on chain_indexed is racy across vCPUs executing the same TB.
+     * CODE-born chains enter the CODE index at registration, so only a
+     * SPEC-born chain's first correct-path execution reaches past this
+     * check. */
+    if (!head || head->chain_indexed) {
+        return;
+    }
+    /* Whole-chain conversion: every sibling fragment of an executed TB
+     * shares the TB's fate, so promoting only the head would leave a
+     * mixed-class chain for the reclaim to tear apart. */
+    for (BBTemplate *f = head; f; f = f->next_tb_fragment) {
+        f->life = TmplLife::CODE;
+    }
+    /* Move the chain's dedup visibility to the CODE index.  The stale
+     * SPEC-index entry stays behind (lookups prefer the CODE index;
+     * reclaim clears the SPEC index wholesale).  head->start_pc is the
+     * TB start_pc (the head fragment begins at canonical insn 0). */
+    tb_chain_dedup_[head->start_pc].push_back(head);
+    head->chain_indexed = true;
+}
+
+size_t TemplateStore::bb_count() const
 {
     return bb_map_.size();
 }
 
-void BBTemplateCache::for_each_bb(const std::function<void(BBTemplate &)> &fn)
+void TemplateStore::for_each_bb(const std::function<void(BBTemplate &)> &fn)
 {
     /* Walk by sorted start_pc so templates-section serialization is
      * deterministic (unordered_map order is implementation-defined).
@@ -142,7 +265,7 @@ void BBTemplateCache::for_each_bb(const std::function<void(BBTemplate &)> &fn)
     }
 }
 
-int BBTemplateCache::template_branch_index(const BBTemplate *tmpl)
+int TemplateStore::template_branch_index(const BBTemplate *tmpl)
 {
     if (!tmpl || tmpl->n_insns == 0) {
         return -1;
@@ -310,12 +433,12 @@ static BBTemplatePtr build_bb_template(uint32_t template_id,
     if (getenv("CST_MEMSTATS")) {
         static uint64_t n_created;
         if (++n_created % 200000 == 0) {
-            g_bb_template_cache.mem_stats(stderr);
+            g_template_store.mem_stats(stderr);
         }
     }
     BBTemplatePtr tmpl(g_new0(BBTemplate, 1));
     tmpl->template_id = template_id;
-    tmpl->spec_born = tls_creating_spec;
+    tmpl->life = tls_creating_spec ? TmplLife::SPEC : TmplLife::CODE;
     tmpl->start_pc = start_pc;
     tmpl->n_insns = n_insns;
     tmpl->fall_through_pc = fall_through_pc;
@@ -351,7 +474,7 @@ static BBTemplatePtr build_bb_template(uint32_t template_id,
     if (tls_creating_spec) {
         /* Reclaimable-footprint accounting for the proactive-flush
          * trigger — exact now that the span pool is sized. */
-        g_bb_template_cache.note_spec_creation(sizeof(BBTemplate) +
+        g_template_store.note_spec_creation(sizeof(BBTemplate) +
             (uint64_t)n_insns * (sizeof(InsnFields) + sizeof(uint64_t) +
                                  1 + MAX_INSN_BYTES + sizeof(InsnRegNames)) +
             tmpl->insn_fields_pool_bytes);
@@ -368,7 +491,7 @@ static BBTemplatePtr build_bb_template(uint32_t template_id,
     return tmpl;
 }
 
-BBTemplate *BBTemplateCache::find_existing_true_bb(
+BBTemplate *TemplateStore::find_existing_true_bb(
     uint64_t start_pc, uint32_t n_insns, const uint64_t *insn_pcs)
 {
     BBTemplate *existing = find_bb_template(start_pc);
@@ -421,7 +544,7 @@ BBTemplate *BBTemplateCache::find_existing_true_bb(
     return existing;
 }
 
-BBTemplate *BBTemplateCache::commit_true_bb(uint64_t start_pc,
+BBTemplate *TemplateStore::commit_true_bb(uint64_t start_pc,
                                             uint32_t n_insns,
                                             const uint64_t *insn_pcs,
                                             const InsnFields *insn_fields,
@@ -448,7 +571,7 @@ BBTemplate *BBTemplateCache::commit_true_bb(uint64_t start_pc,
     return raw;
 }
 
-BBTemplate *BBTemplateCache::commit_true_bb_refs(
+BBTemplate *TemplateStore::commit_true_bb_refs(
     uint64_t start_pc, uint32_t n_insns,
     const uint64_t *insn_pcs,
     const InsnFields *const *insn_fields,
@@ -499,7 +622,7 @@ BBTemplate *BBTemplateCache::commit_true_bb_refs(
     return raw;
 }
 
-BBTemplate *BBTemplateCache::get_or_create_bb_template(
+BBTemplate *TemplateStore::get_or_create_bb_template(
     uint64_t entry_pc,
     BBTemplate *const *fragments,
     unsigned int n_fragments)
@@ -516,16 +639,18 @@ BBTemplate *BBTemplateCache::get_or_create_bb_template(
      * Fast path: every fragment of this chain has already been folded
      * into the same true-BB whose start_pc matches @entry_pc.  Skip
      * the per-fragment concat + dedup + find_existing_true_bb dance
-     * and return the cached BB directly.  parent_true_bb is cleared
-     * across segment switches (clear_bb_map drops bb_map_'s
-     * ownership), so a non-NULL value here is always live.
+     * and return the cached BB directly.  parent_true_bb is a SegRef
+     * (clear_bb_map drops bb_map_'s ownership and bumps the
+     * generation), so a successful deref here is always live — a
+     * prior-segment handle reads as nullptr and falls to the slow
+     * path, which re-commits the BB in this segment.
      */
     if (n_fragments > 0) {
-        BBTemplate *cand = fragments[0]->parent_true_bb;
+        BBTemplate *cand = seg_deref(fragments[0]->parent_true_bb);
         if (cand && cand->start_pc == entry_pc) {
             bool all_match = true;
             for (unsigned int f = 1; f < n_fragments; f++) {
-                if (fragments[f]->parent_true_bb != cand) {
+                if (seg_deref(fragments[f]->parent_true_bb) != cand) {
                     all_match = false;
                     break;
                 }
@@ -651,9 +776,12 @@ BBTemplate *BBTemplateCache::get_or_create_bb_template(
      * No-op for non-REP BBs.  Materialization is lazy: the parent
      * TB's rep_subtmpl is built on first chain-finalize use here, not
      * at translation time — that avoids paying the cost for REP TBs
-     * translated outside an active segment, AND rebuilds the pointer
-     * the next time it is needed after clear_bb_map() invalidated it
-     * at a segment switch.
+     * translated outside an active segment, and a handle stale from a
+     * previous segment is rebuilt the next time it is needed.  The
+     * handle copies verbatim: for a REP fragment ensure_rep_subtmpl
+     * just (re)built it in this generation, and for anything else the
+     * copied handle is null/stale and derefs to nullptr on the
+     * emit-side read.
      */
     if (tmpl && n_fragments > 0 && fragments[n_fragments - 1]) {
         ensure_rep_subtmpl(fragments[n_fragments - 1]);
@@ -666,13 +794,13 @@ BBTemplate *BBTemplateCache::get_or_create_bb_template(
      * without walking the fragments. */
     if (tmpl) {
         for (unsigned int f = 0; f < n_fragments; f++) {
-            fragments[f]->parent_true_bb = tmpl;
+            fragments[f]->parent_true_bb = seg_ref(tmpl);
         }
     }
     return tmpl;
 }
 
-BBTemplate *BBTemplateCache::create_tb_template(
+BBTemplate *TemplateStore::create_tb_template(
     uint64_t start_pc,
     const TbInsnView &insns,
     const char *symbol_name,
@@ -700,7 +828,7 @@ BBTemplate *BBTemplateCache::create_tb_template(
     }
     BBTemplatePtr tmpl(g_new0(BBTemplate, 1));
     tmpl->template_id = next_template_id_++;
-    tmpl->spec_born = tls_creating_spec;
+    tmpl->life = tls_creating_spec ? TmplLife::SPEC : TmplLife::CODE;
     tmpl->start_pc = start_pc;
     tmpl->n_insns = n_insns;
     tmpl->fall_through_pc = fall_through_pc;
@@ -781,7 +909,7 @@ BBTemplate *BBTemplateCache::create_tb_template(
          * trigger.  Fragments are the volume path — a wandering
          * wrong path mints its templates HERE, not through the
          * true-BB funnel. */
-        g_bb_template_cache.note_spec_creation(sizeof(BBTemplate) +
+        g_template_store.note_spec_creation(sizeof(BBTemplate) +
             (uint64_t)n_insns * (sizeof(InsnFields) + sizeof(uint64_t) +
                                  1 + MAX_INSN_BYTES) +
             tmpl->insn_fields_pool_bytes);
@@ -799,13 +927,14 @@ BBTemplate *BBTemplateCache::create_tb_template(
     return raw;
 }
 
-void BBTemplateCache::ensure_rep_subtmpl(BBTemplate *tb)
+void TemplateStore::ensure_rep_subtmpl(BBTemplate *tb)
 {
-    /* No-op when already built, when not a REP TB, or on a degenerate
-     * template (no insns).  commit_true_bb dedups by start_pc, so
-     * repeated calls within a segment are safe — but the early-out
-     * keeps the hot path branch-predicted. */
-    if (!tb || tb->rep_subtmpl || tb->n_insns == 0) {
+    /* No-op when already live in this segment (a stale prior-segment
+     * handle derefs to nullptr and is rebuilt), when not a REP TB, or
+     * on a degenerate template (no insns).  commit_true_bb dedups by
+     * start_pc, so repeated calls within a segment are safe — but the
+     * early-out keeps the hot path branch-predicted. */
+    if (!tb || seg_deref(tb->rep_subtmpl) || tb->n_insns == 0) {
         return;
     }
     uint32_t last = tb->n_insns - 1;
@@ -823,22 +952,23 @@ void BBTemplateCache::ensure_rep_subtmpl(BBTemplate *tb)
     const InsnRegNames *sub_regs =
         tb->insn_reg_names ? &tb->insn_reg_names[last] : nullptr;
     uint64_t sub_ft = sub_pc + sub_size;
-    tb->rep_subtmpl = commit_true_bb(sub_pc, 1, &sub_pc, lf,
+    BBTemplate *sub = commit_true_bb(sub_pc, 1, &sub_pc, lf,
                                      &sub_size, sub_bytes,
                                      sub_regs,
                                      tb->symbol_name, sub_ft);
+    tb->rep_subtmpl = seg_ref(sub);
     /* Inherit the parent REP TB's privilege: the sub-template covers the
      * same instruction, so it shares its execution context.  commit_true_bb
      * (unlike the CP/WP commit paths) does not stamp is_system, so without
      * this a kernel REP (memset/memcpy clear_page) sub-template would
      * serialize as user code. */
-    if (tb->rep_subtmpl) {
-        tb->rep_subtmpl->is_system = tb->is_system;
-        tb->rep_subtmpl->is_system_cp_confirmed = tb->is_system_cp_confirmed;
+    if (sub) {
+        sub->is_system = tb->is_system;
+        sub->is_system_cp_confirmed = tb->is_system_cp_confirmed;
     }
 }
 
-void BBTemplateCache::mem_stats(FILE *out) const
+void TemplateStore::mem_stats(FILE *out) const
 {
     /* Footprint estimator matching the allocations in create_tb_template /
      * commit_true_bb: per-template fixed struct + per-insn arrays.  The
@@ -897,9 +1027,12 @@ void BBTemplateCache::mem_stats(FILE *out) const
         bb_insns += kv.second->n_insns;
         bb_bytes += tmpl_bytes(*kv.second);
     }
-    /* Dedup-miss histogram: PCs whose sibling-chain list holds >1 head mean
-     * re-translations at the same start_pc produced different canonical
-     * lengths and accumulated as duplicates. */
+    /* Dedup-miss histogram over BOTH class indexes: PCs whose
+     * sibling-chain list holds >1 head mean re-translations at the same
+     * start_pc produced different canonical lengths and accumulated as
+     * duplicates.  The spec-index totals are reported separately — its
+     * chains (plus any stale entries for promoted chains) vanish
+     * wholesale at the next reclaim. */
     uint64_t dedup_pcs = tb_chain_dedup_.size();
     uint64_t dedup_multi = 0, dedup_chains = 0, dedup_max = 0;
     for (const auto &kv : tb_chain_dedup_) {
@@ -911,6 +1044,10 @@ void BBTemplateCache::mem_stats(FILE *out) const
             dedup_max = kv.second.size();
         }
     }
+    uint64_t spec_pcs = spec_chain_index_.size(), spec_chains = 0;
+    for (const auto &kv : spec_chain_index_) {
+        spec_chains += kv.second.size();
+    }
     fprintf(out,
             "[memstats] sizeof(InsnFields)=%zu sizeof(BBTemplate)=%zu\n"
             "[memstats] tb_templates: %" PRIu64 " tmpl, %" PRIu64 " insns, "
@@ -918,63 +1055,63 @@ void BBTemplateCache::mem_stats(FILE *out) const
             "[memstats] bb_map: %" PRIu64 " tmpl, %" PRIu64 " insns, "
             "%.2f GiB\n"
             "[memstats] dedup: %" PRIu64 " pcs, %" PRIu64 " chains, %" PRIu64
-            " pcs with >1 sibling (max %" PRIu64 ")\n",
+            " pcs with >1 sibling (max %" PRIu64 "); spec index: %" PRIu64
+            " pcs, %" PRIu64 " chains\n",
             sizeof(InsnFields), sizeof(BBTemplate),
             tb_count, tb_insns, tb_bytes / 1073741824.0,
             tb_fields_bytes / 1073741824.0,
             bb_count, bb_insns, bb_bytes / 1073741824.0,
-            dedup_pcs, dedup_chains, dedup_multi, dedup_max);
+            dedup_pcs, dedup_chains, dedup_multi, dedup_max,
+            spec_pcs, spec_chains);
     fprintf(out, "[memstats] regions: utext=%" PRIu64 " udata=%" PRIu64
             " kernel=%" PRIu64 " one_insn=%" PRIu64 "\n",
             n_utext, n_udata, n_kernel, n_one_insn);
 }
 
-uint64_t BBTemplateCache::reclaim_spec_templates(void)
+uint64_t TemplateStore::reclaim_spec_templates(void)
 {
-    /* Free spec-born templates the correct path never executed.  Safe only
-     * at tb_flush: every QEMU TB (and thus every JIT udata reference to a
+    /* Free every template still in the SPEC class.  Safe only at
+     * tb_flush: every QEMU TB (and thus every JIT udata reference to a
      * fragment) is gone, and the deferred-flush machinery guarantees no
-     * wrong-path walk is in flight.  CP-executed templates stay — the
+     * wrong-path walk is in flight.  CODE templates stay — the
      * PathBuilder's deferred pending-seal slot / chain state may reference
      * them across the flush, and real code should keep its decoded template
      * so a re-translation dedups instead of re-decoding (flush invariance).
-     * Spec-born chains are single-fragment (spec translation runs
-     * CF_SINGLE_STEP, one insn per TB), but next_tb_fragment is nulled
-     * defensively on survivors that pointed at a freed sibling. */
+     *
+     * A plain partition suffices: still-SPEC chains live only in the
+     * SPEC index (dropped wholesale below) and are all-SPEC by
+     * construction (chains are minted under one lifetime class and
+     * promote() converts whole chains), so there is no per-chain index
+     * surgery and no surviving sibling link into freed memory —
+     * promoted chains live on in the CODE index, which reclaim never
+     * touches. */
+    /* CST_LIFE_AUDIT captures the doomed pointer VALUES up front so the
+     * post-partition walk can prove no survivor still references them
+     * (membership tests only — freed memory is never dereferenced). */
     std::unordered_set<const BBTemplate *> freed;
-    for (const auto &p : tb_templates_) {
-        if (p && p->spec_born && !p->cp_executed) {
-            freed.insert(p.get());
+    const bool audit = life_audit_enabled();
+    if (audit) {
+        for (const auto &p : tb_templates_) {
+            if (p && p->life == TmplLife::SPEC) {
+                freed.insert(p.get());
+            }
         }
     }
-    if (freed.empty()) {
-        spec_pending_bytes_ = 0;
-        return 0;
-    }
-    for (const auto &p : tb_templates_) {
-        if (p && !freed.count(p.get()) && p->next_tb_fragment &&
-            freed.count(p->next_tb_fragment)) {
-            p->next_tb_fragment = nullptr;
-        }
-    }
-    for (auto &kv : tb_chain_dedup_) {
-        auto &v = kv.second;
-        v.erase(std::remove_if(v.begin(), v.end(),
-                               [&](BBTemplate *t) {
-                                   return freed.count(t) != 0;
-                               }),
-                v.end());
-    }
-    for (auto it = tb_chain_dedup_.begin(); it != tb_chain_dedup_.end(); ) {
-        it = it->second.empty() ? tb_chain_dedup_.erase(it) : std::next(it);
-    }
-    uint64_t n = freed.size();
+    uint64_t n = 0;
     tb_templates_.erase(
         std::remove_if(tb_templates_.begin(), tb_templates_.end(),
-                       [&](const BBTemplatePtr &p) {
-                           return p && freed.count(p.get()) != 0;
+                       [&n](const BBTemplatePtr &p) {
+                           if (p && p->life == TmplLife::SPEC) {
+                               n++;
+                               return true;
+                           }
+                           return false;
                        }),
         tb_templates_.end());
+    spec_chain_index_.clear();
     spec_pending_bytes_ = 0;
+    if (audit) {
+        life_audit_after_reclaim(freed);
+    }
     return n;
 }

@@ -19,7 +19,7 @@
 
 struct Stats {
     /* Cache populations, bumped on insert.  Mirrored as POD counters
-     * because g_bb_template_cache / g_branch_history containers are
+     * because g_template_store / g_branch_history containers are
      * destroyed before plugin_exit runs (QEMU's atexit hook fires
      * before the .so's __cxa_atexit dtors), so .size() returns 0 at
      * exit-time; these survive that ordering. */
@@ -37,6 +37,16 @@ struct Stats {
     uint64_t wp_skipped = 0;
     uint64_t wp_total_insns = 0;
     uint64_t wp_early_exits = 0;
+    /* Excursions re-run from scratch after a tb_flush unwound a spec-mode
+     * exec_tb mid-walk (the truncated chain is discarded; the re-run's
+     * complete chain replaces it). */
+    uint64_t wp_flush_reruns = 0;
+    /* Excursions whose FIRST spec exec_tb returned no translation with no
+     * flush in flight: the wrong-path entry point itself could not be
+     * fetched/translated.  Correct output only when the target is
+     * genuinely unmapped in the current address space; a nonzero count on
+     * a workload whose targets are resident indicates a bug. */
+    uint64_t wp_first_tb_unavail = 0;
     uint64_t wp_total_mem_accesses = 0;
 
     /* Correct-path memops observed by the per-thread mem callback.

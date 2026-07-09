@@ -3,7 +3,7 @@
  *
  * Accumulates per-TB fragments since the last branch-target boundary
  * and, on terminating-branch finalization, builds (or reuses) a true
- * BBTemplate via BBTemplateCache.
+ * BBTemplate via TemplateStore.
  *
  * QEMU emits TB fragments out of branch-target alignment (each starts
  * where the prev ended), but a true BB begins at a branch target and

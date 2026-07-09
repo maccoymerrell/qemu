@@ -612,7 +612,7 @@ static std::vector<ProfTgt> build_prof_targets(const BBTemplate *tmpl)
     std::vector<ProfTgt> prof_tgts;
     const TemplateProfile *pp = tmpl->profile;
     /* Terminating branch (n-1 normally, n-2 on delay-slot ISAs). */
-    int bidx = BBTemplateCache::template_branch_index(tmpl);
+    int bidx = TemplateStore::template_branch_index(tmpl);
     const InsnFields *last = bidx >= 0
         ? &tmpl->insn_fields[bidx] : nullptr;
     uint64_t bt_cp = pp ? pp->br_taken_cp : 0;
@@ -831,9 +831,9 @@ static void write_template_profile(BitWriter *sub,
  */
 static void write_bin_templates(BitWriter *bw)
 {
-    bw_write_uleb128(bw, g_bb_template_cache.bb_count());
+    bw_write_uleb128(bw, g_template_store.bb_count());
 
-    g_bb_template_cache.for_each_bb([bw](BBTemplate &tmpl_ref) {
+    g_template_store.for_each_bb([bw](BBTemplate &tmpl_ref) {
         BBTemplate *tmpl = &tmpl_ref;
         BitWriter sub;
         bw_init_buf(&sub);
@@ -3115,7 +3115,15 @@ static void emit_body_record_payload(
 
     /* WP events sub-section */
     {
-        uint32_t num_events = 0;
+        /* Chain-level event (§4.4): the excursion was kicked but its
+         * FIRST wrong-path target could not be fetched/translated, so
+         * the chain is empty and no per-block event can carry the
+         * marker.  Encoded as a single event whose resolved index (0)
+         * is >= num_wp (0) — the index-past-the-chain convention that
+         * addresses the unrealized first target itself. */
+        bool chain_unavail = (num_wp == 0) && entry->wp_first_tb_unavail;
+
+        uint32_t num_events = chain_unavail ? 1 : 0;
         for (uint32_t w = 0; w < num_wp; w++) {
             const WPBBEntry *wp = &entry->wp_entries[w];
             if (wp->fault || wp->translation_unavailable) {
@@ -3148,6 +3156,10 @@ static void emit_body_record_payload(
                 bw_write_uleb128(&sub, (uint64_t)wp->fault_insn_index);
             }
             prev_event_idx = w;
+        }
+        if (chain_unavail) {
+            bw_write_uleb128(&sub, 0);   /* pos_gap: index 0 == num_wp */
+            bw_write_u8(&sub, CST_WP_EVENT_TRANSLATION_UNAVAIL);
         }
         g_stats.bin_wp_exception_bits += (bw_tell_bytes(&sub) - ev_start) * 8;
 
@@ -3461,7 +3473,7 @@ static void profile_branch(BBTemplate *t, uint64_t next_pc, bool wp)
     if (!t || t->n_insns == 0) return;
     /* The terminating branch is at template_branch_index (n-1 normally,
      * n-2 on delay-slot ISAs where the delay slot is last). */
-    int bidx = BBTemplateCache::template_branch_index(t);
+    int bidx = TemplateStore::template_branch_index(t);
     if (bidx < 0) return;
     const InsnFields *last = &t->insn_fields[bidx];
     TemplateProfile *p = profile_get(t);

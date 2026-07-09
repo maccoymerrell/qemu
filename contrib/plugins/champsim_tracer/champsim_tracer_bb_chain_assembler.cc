@@ -75,7 +75,7 @@ BBTemplate *BBChainAssembler::finalize()
     if (entry_pc_ == 0 || fragments_.empty()) {
         return nullptr;
     }
-    return g_bb_template_cache.get_or_create_bb_template(
+    return g_template_store.get_or_create_bb_template(
         entry_pc_, fragments_.data(), (unsigned int)fragments_.size());
 }
 

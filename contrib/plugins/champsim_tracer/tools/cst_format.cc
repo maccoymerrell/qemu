@@ -390,6 +390,11 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
                 &ids->wp_event_translation_unavail);
     resolve_one(maps.wp_event_flag, "wp_event_flag", "CST_WP_EVENT_FAULT",
                 &ids->wp_event_fault);
+    /* Optional: chain terminator introduced with the dep-branch-kill
+     * wrong-path fault policy; resolves to 0 (never tests set) when the
+     * writing tracer predates it. */
+    resolve_optional_mask(maps.wp_event_flag, "CST_WP_EVENT_DEP_BRANCH_KILL",
+                          &ids->wp_event_dep_branch_kill);
 
     /* metaflags (bit positions inside the FID_METAFLAGS byte) */
     resolve_one(maps.metaflags, "metaflags", "CST_METAFLAGS_Z",

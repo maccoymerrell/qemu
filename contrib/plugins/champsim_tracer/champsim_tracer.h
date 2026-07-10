@@ -183,6 +183,11 @@ extern "C" {
 /* WP event flags byte */
 #define CST_WP_EVENT_TRANSLATION_UNAVAIL (1u << 0)
 #define CST_WP_EVENT_FAULT               (1u << 1)
+/* The excursion terminated AT this block because its terminating branch
+ * depends (transitively, through registers) on a faulted wrong-path
+ * instruction whose result never materialized.  Always the last block
+ * of its chain.  See champsim_tracer_format.md §4.4. */
+#define CST_WP_EVENT_DEP_BRANCH_KILL     (1u << 2)
 
 /* Header feature flags.  MEM_DATA / REG_DATA advise which optional
  * field-ID families may appear (the field IDs still determine actual
@@ -839,6 +844,14 @@ struct WPBBEntry {
     uint32_t n_insns_executed;  /* BB length when complete; partial on fault */
     bool fault;
     bool translation_unavailable;
+    /*
+     * The excursion died AT this BB: its terminating branch reads a
+     * register carrying the (never-materialized) result of a faulted
+     * wrong-path instruction, so the branch outcome is unresolvable
+     * and fetch past it is unknowable.  Emitted as
+     * CST_WP_EVENT_DEP_BRANCH_KILL; always the chain's last entry.
+     */
+    bool dep_branch_kill = false;
     /*
      * Index within THIS BB of the insn that raised the synchronous
      * exception when `fault`; undefined otherwise.  Consumers flag

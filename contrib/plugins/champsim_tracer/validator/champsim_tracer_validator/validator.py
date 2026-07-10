@@ -3260,7 +3260,8 @@ def _check_wrong_path_chains(entries: list[dict],
                              cp_pos_offset: int = 0,
                              templates_by_id: dict | None = None,
                              marker: bool = False,
-                             wpprune: int = 0) -> list[Issue]:
+                             wpprune: int = 0,
+                             reg_name_to_id: dict | None = None) -> list[Issue]:
     """For every CP position predicted to fork, walk the trace's
     ``wp_entries`` for that block's TB and compare the distinct-block
     sequence against the predicted ``wp_chain`` as a prefix.
@@ -3278,22 +3279,25 @@ def _check_wrong_path_chains(entries: list[dict],
     with no later instance it is accepted on the event alone and
     surfaced as a notable INFO issue naming the branch and target.
 
-    A chain that diverges at/after the *fault-poison boundary* — the
-    first block of the first FAULT-marked WP entry — is accepted and
-    surfaced as a notable INFO.  The plugin's wrong-path fault
-    semantics (architecture.rst "Wrong-path chain termination")
-    suppress a speculative fault and trace past it to the natural
-    branch end, so branches downstream of the fault resolve on
-    registers the unfulfilled access left off-model; the wire entry
-    carries ``fault_insn_index`` and the consumer squashes the
-    dependent slice, so the post-fault tail is squash-shadow output
-    the exact-known synthetic model deliberately does not cover.
-    (System mode; the canonical trigger is a guest-TLB-cold excursion
-    on a software-managed-TLB ISA, where the refill exception cannot
-    be taken speculatively — corroborated by the CP taking the real
-    refill fault immediately after the fork.)  A divergence *before*
-    the boundary is still an error, as is any divergence with no
-    fault-marked entry.
+    Wrong-path fault policy (architecture.rst "Wrong-path chain
+    termination"): the plugin proceeds around a suppressed speculative
+    fault with the ACCUMULATED wrong-path state, so instructions not
+    data-dependent on the fault execute exactly as they normally would
+    and the chain must keep matching the exact-known synthetic model —
+    post-fault divergence is an error like any other.  The faulted
+    instruction's destinations are poisoned and propagate transitively
+    through register dataflow, and the excursion MUST die at the first
+    branch whose sources are poisoned, marked
+    CST_WP_EVENT_DEP_BRANCH_KILL on the chain's last entry.  This
+    check replays that poison propagation over the trace's own
+    per-insn template reg sets: a chain that continues past a provably
+    fault-dependent branch is an error, a kill event anywhere but the
+    chain's last entry is an error, and a kill-terminated chain whose
+    emitted prefix matched is accepted as an explicit terminator.  The
+    plugin may kill EARLIER than the replay predicts (the wire records
+    only each block's first fault, while the plugin poisons every
+    faulted instruction), so the replay's kill point is a
+    latest-acceptable bound, not an exact one.
     """
     issues: list[Issue] = []
     cp_pos = -1
@@ -3366,11 +3370,27 @@ def _check_wrong_path_chains(entries: list[dict],
         wp_left_user = False   # entered kernel, or faulted out of user CFG
         raw_len_at_cross: int | None = None   # len(wp_raw) just BEFORE the
                                               # first block that left user space
-        raw_len_at_fault: int | None = None   # len(wp_raw) just BEFORE the
-                                              # first FAULT-marked entry
-        fault_entry_has_blocks = False
-        first_fault_at = None   # (entry index, fault_insn_index) for reporting
-        for wp in e.get("wp_entries", []):
+        wp_list = e.get("wp_entries", [])
+        first_fault_entry = None   # entry index of the first FAULT
+        kill_entries = [wi for wi, wp in enumerate(wp_list)
+                        if wp.get("dep_branch_kill")]
+        # Poison-propagation replay over the trace's own per-insn
+        # template reg sets, mirroring the plugin's model: the faulted
+        # insn's dsts are poisoned (its result never materialized);
+        # a retired insn with a poisoned source propagates poison to
+        # its dsts, an all-clean-source insn overwrites (cleans) them;
+        # the flags register mediates conditionals with no explicit
+        # reg sources.  The wire only records each block's FIRST
+        # fault, while the plugin poisons every faulted insn, so the
+        # replay UNDERSTATES poison: its kill point is the latest the
+        # plugin may legitimately continue to, never an exact match.
+        expected_kill_entry = None   # entry index whose terminating
+                                     # branch the replay proves poisoned
+        rnm = reg_name_to_id or {}
+        reg_zero = rnm.get("REG_ZERO")
+        reg_flags = rnm.get("REG_FLAGS")
+        poisoned: set[int] = set()
+        for wi, wp in enumerate(wp_list):
             crossed = bool(wp.get("fault") or wp.get("translation_unavailable"))
             wt = (templates_by_id or {}).get(wp["template_id"])
             if wt is not None and wt.get("is_system"):
@@ -3380,35 +3400,47 @@ def _check_wrong_path_chains(entries: list[dict],
                 raw_len_at_cross = len(wp_raw)
             blocks = [bid for (bid, _)
                       in template_runs.get(wp["template_id"], [])]
-            if wp.get("fault") and raw_len_at_fault is None:
-                raw_len_at_fault = len(wp_raw)
-                fault_entry_has_blocks = bool(blocks)
-                first_fault_at = (wp.get("index"),
-                                  wp.get("fault_insn_index"))
+            if wp.get("fault") and first_fault_entry is None:
+                first_fault_entry = wi
             wp_raw.extend(blocks)
             actual_sim_insns += int(wp.get("n_insns", 0) or 0)
             if crossed:
                 wp_left_user = True
+
+            tinsns = (wt or {}).get("insns") or []
+            n_exec = min(int(wp.get("n_insns", 0) or 0), len(tinsns))
+            fidx = wp.get("fault_insn_index") if wp.get("fault") else None
+            for ii in range(n_exec):
+                fi = tinsns[ii]
+                if fidx is not None and ii == fidx:
+                    # Faulted insn: result never materialized.
+                    for r in fi.get("dst_regs", []):
+                        if r != reg_zero:
+                            poisoned.add(r)
+                    continue
+                src_poisoned = any(r in poisoned
+                                   for r in fi.get("src_regs", []))
+                if (not src_poisoned and fi.get("branch_type")
+                        and fi.get("branch_conditional")
+                        and not fi.get("src_regs")
+                        and reg_flags in poisoned):
+                    src_poisoned = True
+                if (src_poisoned and fi.get("branch_type")
+                        and expected_kill_entry is None):
+                    expected_kill_entry = wi
+                for r in fi.get("dst_regs", []):
+                    if r == reg_zero:
+                        continue
+                    if src_poisoned:
+                        poisoned.add(r)
+                    else:
+                        poisoned.discard(r)
         actual_wp = _collapse_runs(wp_raw)
         # Collapsed index at which the wrong path left the enumerable user CFG.
         left_user_at = (
             len(_collapse_runs(wp_raw[:raw_len_at_cross]))
             if raw_len_at_cross is not None else None
         )
-        # Fault-poison boundary (collapsed index): the plugin's documented
-        # wrong-path fault semantics (architecture.rst "Wrong-path chain
-        # termination") suppress a speculative fault, restore fork state,
-        # and trace past it to the natural branch end — so every branch
-        # resolution downstream of the first FAULT-marked entry runs on
-        # registers the fault left off-model, and the synthetic chain is
-        # no longer exact-known from there on.  The faulted entry's own
-        # first block is still reliable (its identity was chosen by a
-        # pre-fault branch); everything strictly after is squash-shadow
-        # output a consumer discards at fault_insn_index.
-        fault_poison_at = None
-        if raw_len_at_fault is not None:
-            end = raw_len_at_fault + (1 if fault_entry_has_blocks else 0)
-            fault_poison_at = len(_collapse_runs(wp_raw[:end]))
 
         n = min(len(actual_wp), len(exp_chain))
         first_fail = -1
@@ -3425,8 +3457,10 @@ def _check_wrong_path_chains(entries: list[dict],
             "wp_left_user": wp_left_user,
             "left_user_at": left_user_at,
             "first_fail": first_fail,
-            "fault_poison_at": fault_poison_at,
-            "first_fault_at": first_fault_at,
+            "n_wp_entries": len(wp_list),
+            "first_fault_entry": first_fault_entry,
+            "kill_entries": kill_entries,
+            "expected_kill_entry": expected_kill_entry,
             # Chain-level TRANSLATION_UNAVAIL event (format spec §4.4):
             # the excursion was kicked but its first fetch could not
             # complete, so the chain is empty and says so explicitly.
@@ -3478,37 +3512,57 @@ def _check_wrong_path_chains(entries: list[dict],
                      "expected": exp_chain},
                 ))
                 continue
+        # Dep-branch-kill structural verdicts (wrong-path fault policy).
+        # Placement: the kill is an excursion terminator, so the event
+        # is only legal on the chain's LAST entry, and only in a chain
+        # that carries a FAULT at/before it.
+        kill_entries = rec["kill_entries"]
+        n_wp_entries = rec["n_wp_entries"]
+        first_fault_entry = rec["first_fault_entry"]
+        expected_kill_entry = rec["expected_kill_entry"]
+        kill_at = kill_entries[0] if kill_entries else None
+        if kill_entries and (len(kill_entries) > 1 or
+                             kill_at != n_wp_entries - 1):
+            issues.append(Issue(
+                "wrong_path_chains", "error",
+                f"WP at CP pos {cp_pos} (blk_{last_cp_bid}): "
+                f"DEP_BRANCH_KILL at chain entries {kill_entries} of "
+                f"{n_wp_entries} — the kill is an excursion terminator "
+                f"and must be the last entry, exactly once",
+                {"cp_pos": cp_pos, "kill_entries": kill_entries},
+            ))
+        elif kill_at is not None and (first_fault_entry is None or
+                                      first_fault_entry > kill_at):
+            issues.append(Issue(
+                "wrong_path_chains", "error",
+                f"WP at CP pos {cp_pos} (blk_{last_cp_bid}): "
+                f"DEP_BRANCH_KILL at entry {kill_at} without a FAULT "
+                f"at/before it — a dependent-branch kill requires a "
+                f"faulted instruction upstream",
+                {"cp_pos": cp_pos, "kill_at": kill_at},
+            ))
+        # Required termination: the replay proved the terminating
+        # branch of entry @expected_kill_entry reads a register that
+        # (transitively) carries a faulted insn's never-materialized
+        # result.  The plugin poisons at least as much as the replay
+        # (the wire records only each block's first fault), so it MUST
+        # have killed at or before that entry; a chain that continues
+        # past it resolved an unresolvable branch.
+        if expected_kill_entry is not None and \
+                (kill_at is None or kill_at > expected_kill_entry):
+            issues.append(Issue(
+                "wrong_path_chains", "error",
+                f"WP at CP pos {cp_pos} (blk_{last_cp_bid}): chain "
+                f"entry {expected_kill_entry}'s terminating branch is "
+                f"fault-dependent (poison replay) but the excursion "
+                f"{'continued past it' if expected_kill_entry < n_wp_entries - 1 else 'ended'} "
+                f"without DEP_BRANCH_KILL — the wrong path must die on "
+                f"that branch",
+                {"cp_pos": cp_pos,
+                 "expected_kill_entry": expected_kill_entry,
+                 "kill_at": kill_at, "n_wp_entries": n_wp_entries},
+            ))
         if first_fail >= 0:
-            # Suppressed speculative fault upstream of the divergence
-            # (system mode; e.g. a guest-TLB-cold excursion on a
-            # software-managed-TLB ISA, where the refill exception
-            # cannot be taken speculatively).  The plugin traces past
-            # the fault by design — the WPBBEntry carries
-            # fault_insn_index and the consumer squashes the dependent
-            # slice — so branch resolutions after the fault-poison
-            # boundary run on off-model registers and the exact-known
-            # synthetic chain stops applying there.  The prefix at or
-            # before the boundary already matched (first_fail >=
-            # fault_poison_at), which is everything real hardware
-            # would architecturally realize; accept, audibly.
-            fpa = rec["fault_poison_at"]
-            if fpa is not None and first_fail >= fpa:
-                issues.append(Issue(
-                    "wrong_path_chains", "info",
-                    f"WP at CP pos {cp_pos} (blk_{last_cp_bid}) diverges at "
-                    f"depth {first_fail} (expected blk_"
-                    f"{exp_chain[first_fail]}, got blk_"
-                    f"{actual_wp[first_fail]}) past a suppressed speculative "
-                    f"fault at chain entry {rec['first_fault_at']} — "
-                    f"post-fault resolution is squash-shadow output per the "
-                    f"wrong-path fault semantics; prefix before the fault "
-                    f"matched",
-                    {"notable": True, "cp_pos": cp_pos,
-                     "fault_poison_at": fpa,
-                     "first_fault_at": rec["first_fault_at"],
-                     "actual": actual_wp, "expected": exp_chain},
-                ))
-                continue
             issues.append(Issue(
                 "wrong_path_chains", "error",
                 f"WP at CP pos {cp_pos} (blk_{last_cp_bid}) "
@@ -3578,6 +3632,17 @@ def _check_wrong_path_chains(entries: list[dict],
                 # the chain: the event does not excuse a target the
                 # plugin never manages to speculate into.  Fall through
                 # to the wpprune / truncation verdicts.
+            # Dep-branch kill: the chain ended at a branch whose sources
+            # depend on a faulted wrong-path insn's never-materialized
+            # result (explicit CST_WP_EVENT_DEP_BRANCH_KILL terminator
+            # on the last entry, placement/fault-precedence verified
+            # above).  The emitted prefix already matched (first_fail <
+            # 0), and the branch outcome past the kill is unresolvable
+            # by definition, so the shorter chain is policy-correct.
+            if kill_at is not None and kill_at == n_wp_entries - 1 and \
+                    len(kill_entries) == 1 and first_fault_entry is not None \
+                    and first_fault_entry <= kill_at:
+                continue
             # wpprune: the tracer intentionally drops the wrong path WHOLE
             # for cold branches (never-taken / one-directional / monomorphic
             # indirect).  Pruning removes the entire path, so accept ONLY an
@@ -4407,20 +4472,52 @@ def _check_wp_events(body_stats: dict,
 
     Walking ensures the writer's runtime counter agrees with the
     per-WP-entry payload that was actually encoded.
+
+    Also lints CST_WP_EVENT_DEP_BRANCH_KILL structurally on EVERY
+    entry (including kernel-side excursions the synthetic-chain check
+    cannot model): the kill is an excursion terminator, so it may only
+    appear on a chain's last entry and only with a FAULT at/before it.
     """
     walk_faults  = 0
     walk_translu = 0
+    walk_kills   = 0
+    kill_issues: list[Issue] = []
     for e in cp_entries:
-        for wp in e.get("wp_entries") or []:
+        wps = e.get("wp_entries") or []
+        first_fault = None
+        for wi, wp in enumerate(wps):
             if wp.get("fault"):
                 walk_faults += 1
+                if first_fault is None:
+                    first_fault = wi
             if wp.get("translation_unavailable"):
                 walk_translu += 1
+            if wp.get("dep_branch_kill"):
+                walk_kills += 1
+                if wi != len(wps) - 1:
+                    kill_issues.append(Issue(
+                        "wp_events", "error",
+                        f"entry seq={e.get('seq_num')}: DEP_BRANCH_KILL "
+                        f"on chain entry {wi} of {len(wps)} — the kill "
+                        f"is an excursion terminator and must be the "
+                        f"chain's last entry",
+                        {"seq_num": e.get("seq_num"), "kill_at": wi,
+                         "n_wp": len(wps)},
+                    ))
+                elif first_fault is None:
+                    kill_issues.append(Issue(
+                        "wp_events", "error",
+                        f"entry seq={e.get('seq_num')}: DEP_BRANCH_KILL "
+                        f"with no FAULT at/before it in the chain — a "
+                        f"dependent-branch kill requires a faulted "
+                        f"instruction upstream",
+                        {"seq_num": e.get("seq_num"), "kill_at": wi},
+                    ))
 
     body_faults  = int(body_stats.get("fault_count", 0))
     body_translu = int(body_stats.get("translation_unavail_count", 0))
     if (walk_faults, walk_translu) != (body_faults, body_translu):
-        return [Issue(
+        return kill_issues + [Issue(
             "wp_events", "error",
             f"WP event counts disagree with per-entry walk: "
             f"writer={{fault: {body_faults}, "
@@ -4432,11 +4529,13 @@ def _check_wp_events(body_stats: dict,
              "walk": {"fault": walk_faults,
                       "translation_unavail": walk_translu}},
         )]
-    return [Issue(
+    return kill_issues + [Issue(
         "wp_events", "info",
         f"WP events: fault={body_faults}, "
-        f"translation_unavail={body_translu}",
-        {"fault": body_faults, "translation_unavail": body_translu},
+        f"translation_unavail={body_translu}, "
+        f"dep_branch_kill={walk_kills}",
+        {"fault": body_faults, "translation_unavail": body_translu,
+         "dep_branch_kill": walk_kills},
     )]
 
 
@@ -6549,6 +6648,15 @@ def validate(meta_path: Path, trace_path: Path,
     # per-ISA register classification tables as the reachable universe.
     issues += _check_reg_coverage(templates, isa, reg_id_to_name)
 
+    # Invert the trace's own reg encodings map for the wrong-path
+    # poison-propagation replay (REG_ZERO / REG_FLAGS lookups; the
+    # per-insn src/dst ids in decoded templates use the same space).
+    _wp_reg_name_to_id = {}
+    for _rid, _rname in reg_id_to_name.items():
+        try:
+            _wp_reg_name_to_id[_rname] = int(_rid)
+        except (TypeError, ValueError):
+            continue
     issues += _check_wrong_path_chains(cp_entries, template_runs,
                                        cp_block_seq, correct_path,
                                        meta["wrong_paths"],
@@ -6559,7 +6667,8 @@ def validate(meta_path: Path, trace_path: Path,
                                        cp_pos_offset=cp_pos_offset,
                                        templates_by_id=templates_by_id,
                                        marker=marker,
-                                       wpprune=wpprune)
+                                       wpprune=wpprune,
+                                       reg_name_to_id=_wp_reg_name_to_id)
 
     # wpprune drops the wrong path for monomorphic indirects, so the
     # one-target/multi-target WP-shape assertions no longer hold.

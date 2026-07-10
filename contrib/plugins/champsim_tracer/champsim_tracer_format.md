@@ -1045,9 +1045,10 @@ the start of the chain and discarded at the end of the entry.
 
 Events annotate the entry's wrong-path chain: an event whose resolved
 index addresses a chain position identifies a wrong-path block that
-faulted or could not be translated; an event whose resolved index lies
-past the chain is chain-level and describes the unrealized first
-target of the wrong path itself (see below).
+faulted, could not be translated, or terminated the excursion at a
+fault-dependent branch; an event whose resolved index lies past the
+chain is chain-level and describes the unrealized first target of the
+wrong path itself (see below).
 
 ```
 wp_events_section payload:
@@ -1063,6 +1064,25 @@ wp_events_section payload:
 
 `prev_index` starts at -1. `fault_insn_index` is the 0-based index of
 the faulting instruction within that wrong-path block.
+
+`CST_WP_EVENT_FAULT` marks a wrong-path instruction whose synchronous
+exception was suppressed (a speculative access must not fault the
+guest): the instruction's result never materializes and consumers
+prevent its execution on the wrong path.  Execution proceeds around
+the fault — instructions not data-dependent on it run exactly as they
+normally would, with the accumulated wrong-path register state.
+
+`CST_WP_EVENT_DEP_BRANCH_KILL` marks the block at which the excursion
+died because its terminating branch depends, transitively through
+registers, on a faulted instruction's never-materialized result: the
+branch outcome is unresolvable, so fetch past it is unknowable and the
+chain ends there.  The bit only appears on a chain's LAST block, and
+only in chains that also carry a `CST_WP_EVENT_FAULT` at or before it.
+Dependence is tracked at register granularity (the ISA's integer-flags
+register included); poison carried through memory (a poisoned store
+forwarded to a later load) is not tracked.  Traces written before this
+bit existed do not list `CST_WP_EVENT_DEP_BRANCH_KILL` in their
+`wp_event_flag` encoding map; readers resolve it optionally.
 
 The event index space extends one convention beyond the chain: a
 resolved index `>= num_wp` does not address any encoded wrong-path

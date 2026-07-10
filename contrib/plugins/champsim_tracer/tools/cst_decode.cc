@@ -515,6 +515,8 @@ void BodyWalker::decode_wp_events(Reader &evb,
         }
         WPEntry &we = (*wp_entries)[idx];
         we.translation_unavailable = (evf & ids.wp_event_translation_unavail) != 0;
+        we.dep_branch_kill = ids.wp_event_dep_branch_kill != 0 &&
+                             (evf & ids.wp_event_dep_branch_kill) != 0;
         we.fault = is_fault;
         if (is_fault) {
             we.fault_insn_index = (uint32_t)evb.uleb();
@@ -1466,6 +1468,7 @@ std::vector<Instruction> instructions_from_entry(
             insn.wp_index               = (uint16_t)wp.index;
             insn.wp_fault               = wp.fault;
             insn.wp_translation_unavail = wp.translation_unavailable;
+            insn.wp_dep_branch_kill     = wp.dep_branch_kill;
             insn.wp_has_fault_idx       = wp.has_fault_idx;
             insn.wp_fault_insn_index    = wp.fault_insn_index;
             out.push_back(std::move(insn));

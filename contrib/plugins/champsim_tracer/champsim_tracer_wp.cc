@@ -56,6 +56,13 @@ struct WpAccum {
      * uop speculation would actually squash on. */
     bool        bb_has_fault     = false;
     uint32_t    bb_first_fault_idx = 0;
+    /* The BB's terminating branch reads a register poisoned by a faulted
+     * wrong-path insn (transitively): the branch outcome is unresolvable,
+     * so the excursion dies AT this BB once it seals.  Set by the poison
+     * propagation in the fragment walk; consumed at commit, where the
+     * sealed entry is marked CST_WP_EVENT_DEP_BRANCH_KILL and the walk
+     * ends. */
+    bool        bb_kill_branch   = false;
 
     /* Reset per-BB state.  bb_reg_snaps is intentionally NOT cleared here:
      * its lifecycle is caller-managed (cleared after a no-template drop,
@@ -72,6 +79,7 @@ struct WpAccum {
         bb_symbol_name = nullptr;
         bb_has_fault = false;
         bb_first_fault_idx = 0;
+        bb_kill_branch = false;
     }
 
     /* Build a WPBBEntry from the current accumulator, moving bb_dyn_params /
@@ -87,6 +95,7 @@ struct WpAccum {
         e.n_insns_executed = (uint32_t)bb_pcs.size();
         e.fault = fault;
         e.translation_unavailable = false;
+        e.dep_branch_kill = bb_kill_branch;
         e.fault_insn_index = fault_insn_index;
         e.tmpl = bb_tmpl;
         if (g_features.reg_data) {
@@ -319,8 +328,27 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     std::vector<WPBBEntry> wp_chain;
     wp_chain.reserve(initial_insn_cap);
     std::unordered_set<uint64_t> poisoned_targets;
+    /*
+     * Fault-dependence poison set (wrong-path fault policy): a faulted
+     * wrong-path insn's result never materializes, so its dst registers
+     * are poisoned; every retired insn propagates poison srcs->dsts, and
+     * an all-clean-src insn overwrites (cleans) its dsts.  A branch whose
+     * sources are poisoned is unresolvable — the excursion dies AT that
+     * branch (CST_WP_EVENT_DEP_BRANCH_KILL on the sealed entry).
+     * Independent insns and branches proceed exactly as they normally
+     * would.  Excursion-scoped: poison crosses BB boundaries until
+     * overwritten.  Register-channel only — poison carried through
+     * memory (a poisoned store forwarded to a later load) is not
+     * tracked.  writes_int_flags models the ISA's integer-flags register
+     * as an extra dst; a conditional branch with no explicit reg sources
+     * reads it (x86 jcc / aarch64 b.cc).
+     */
+    bool wp_poisoned_regs[REG_ID_COUNT] = {};
     uint64_t sim_insns = 0;
     bool early_exit = false;
+    /* Policy-correct termination at a fault-dependent branch (not an
+     * abnormal early exit): counted separately as wp_dep_branch_kills. */
+    bool dep_kill_exit = false;
     uint64_t last_fault_pc = UINT64_MAX;
     unsigned int repeated_fault_pc = 0;
     /* Set when the previously appended TB ended with a bare delay-
@@ -678,6 +706,71 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                 wp_append_fragment_insns(acc, cur, n_executed_in_cur,
                                          wp_snap_cursor, cpu_index,
                                          stats, hist);
+
+            /*
+             * Fault-dependence poison propagation over the executed
+             * slice, in execution order (dedup-independent: a re-
+             * executed insn re-propagates identically).  The faulted
+             * insn — last of the slice when this fragment faulted —
+             * did NOT retire: its dsts become poisoned instead of
+             * propagated.  A retired branch whose sources are poisoned
+             * arms the dep-branch kill; the commit path below seals the
+             * BB it terminates and ends the excursion there.
+             */
+            for (uint32_t pi = 0; pi < n_executed_in_cur; pi++) {
+                const InsnFields *pf = &cur->insn_fields[pi];
+                bool faulted_insn = cur_is_fault_fragment &&
+                                    pi == n_executed_in_cur - 1;
+                if (faulted_insn) {
+                    for (uint8_t d = 0; d < pf->n_dst_regs; d++) {
+                        uint8_t r = pf->dst_regs[d];
+                        if (r != REG_ZERO) {
+                            wp_poisoned_regs[r] = true;
+                        }
+                    }
+                    if (pf->writes_int_flags) {
+                        wp_poisoned_regs[REG_FLAGS] = true;
+                    }
+                    break;      /* last insn of the slice by definition */
+                }
+                bool src_poisoned = false;
+                for (uint8_t k = 0; k < pf->n_src_regs; k++) {
+                    if (wp_poisoned_regs[pf->src_regs[k]]) {
+                        src_poisoned = true;
+                        break;
+                    }
+                }
+                /* Flags-mediated conditionals (x86 jcc, aarch64 b.cc)
+                 * often carry no explicit reg sources; they read the
+                 * integer-flags register the poison model tracks via
+                 * writes_int_flags. */
+                if (!src_poisoned && pf->branch_type != BRANCH_NONE &&
+                    pf->branch_conditional && pf->n_src_regs == 0 &&
+                    wp_poisoned_regs[REG_FLAGS]) {
+                    src_poisoned = true;
+                }
+                if (src_poisoned && pf->branch_type != BRANCH_NONE) {
+                    acc.bb_kill_branch = true;
+                }
+                for (uint8_t d = 0; d < pf->n_dst_regs; d++) {
+                    uint8_t r = pf->dst_regs[d];
+                    if (r == REG_ZERO) {
+                        continue;
+                    }
+                    if (src_poisoned) {
+                        wp_poisoned_regs[r] = true;
+                    } else {
+                        wp_poisoned_regs[r] = false;
+                    }
+                }
+                if (pf->writes_int_flags) {
+                    if (src_poisoned) {
+                        wp_poisoned_regs[REG_FLAGS] = true;
+                    } else {
+                        wp_poisoned_regs[REG_FLAGS] = false;
+                    }
+                }
+            }
             uint8_t last_insn_size = n_executed_in_cur > 0
                 ? cur->insn_sizes[n_executed_in_cur - 1]
                 : 0;
@@ -820,13 +913,23 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                  * never landed here, so a commit now would write the
                  * wrong (n-1 insns, no delay slot) shape into bb_map_
                  * and collide with the natural full-BB shape from the
-                 * non-fault path.  Fall through to the skip-past-fault
-                 * branch so the next iter can re-attempt landing the
-                 * delay slot from skip_pc. */
+                 * non-fault path.  With the retired branch's delay-slot
+                 * hflags pending in the unwound state (and set_pc not
+                 * clearing MIPS_HFLAG_BMASK), a skip-resume here would
+                 * translate skip_pc as-if-in-a-delay-slot; end the
+                 * excursion instead — the in-flight accumulator is
+                 * dropped, committed WP BBs are preserved. */
                 bool bare_branch_pending = branch_fired &&
                     cur->terminus == TB_TERMINUS_BARE_BRANCH;
+                if (bare_branch_pending) {
+                    acc.clear();
+                    bb_reg_snaps.clear();
+                    early_exit = true;
+                    walk_done = true;
+                    break;
+                }
 
-                if ((branch_fired || bb_complete) && !bare_branch_pending) {
+                if (branch_fired || bb_complete) {
                     /* Force bb_complete so the post-fault commit fires
                      * even when only the branch (no delay slot) ran. */
                     bb_complete = true;
@@ -843,9 +946,26 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                         walk_done = true;
                         break;
                     }
-                    qemu_plugin_spec_mode_end();
-                    qemu_plugin_cpu_state_restore(saved_state);
-                    qemu_plugin_spec_mode_begin(saved_state);
+                    /*
+                     * Proceed around the fault with the ACCUMULATED
+                     * wrong-path state.  The fault unwind
+                     * (cpu_loop_exit_restore -> restore_state_to_opc)
+                     * already re-synced the register file to the
+                     * faulting insn's boundary — every pre-fault insn's
+                     * effects are in place, only the faulted insn's dst
+                     * is stale (and now poisoned above).  The spec
+                     * session stays live: tearing it down here would
+                     * flush the sandboxed store buffer (losing
+                     * store-to-load forwarding for the rest of the
+                     * excursion) and revert the spec TLB installs;
+                     * restoring the fork snapshot would throw away all
+                     * legitimately-computed wrong-path values, making
+                     * every downstream branch resolve on stale fork
+                     * state.  Independent instructions proceed exactly
+                     * as they normally would; dependents are tracked by
+                     * the poison set and the first dependent branch
+                     * kills the excursion at the commit path.
+                     */
                     qemu_plugin_set_pc(skip_pc);
                     /* Skip the rest of this exec_tb's fragments and
                      * resume the outer iter from skip_pc. */
@@ -964,6 +1084,24 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
 
             acc.clear();
 
+            /*
+             * Dep-branch kill: this BB's terminating branch reads a
+             * register poisoned by a faulted wrong-path insn, so its
+             * outcome is unresolvable and any fetch past it is
+             * unknowable.  The excursion dies HERE; the entry just
+             * pushed carries CST_WP_EVENT_DEP_BRANCH_KILL as the
+             * explicit chain terminator.
+             */
+            if (wp_chain.back().dep_branch_kill) {
+                stats.wp_dep_branch_kills++;
+                if (hist) {
+                    hist->wp_dep_branch_kills++;
+                }
+                dep_kill_exit = true;
+                walk_done = true;
+                break;
+            }
+
             if (poisoned_targets.count(commit_post_pc)) {
                 early_exit = true;
                 walk_done = true;
@@ -984,7 +1122,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             early_exit = true;
             break;
         }
-        if (early_exit) {
+        if (early_exit || dep_kill_exit) {
             break;
         }
     }

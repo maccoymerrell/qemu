@@ -911,13 +911,31 @@ its own wire semantics.  Consumers should treat them differently:
   exactly the speculative window a ``wpdepth``-deep frontend would
   fetch, and the consumer simply stops replaying at its end.
 * **Fault.**  A speculative fault on a non-branch instruction does
-  *not* end the BB — the walk traces past it to the natural branch
-  end, preserving the BBs-end-in-a-branch invariant — and the sealed
-  :class:`WPBBEntry` carries ``fault`` plus ``fault_insn_index``.  A
-  consumer marks that uop non-completing and squashes its dependent
-  slice.  A faulting syscall-type branch seals its BB and the
-  post-PC poisoning ends the chain; speculative state past a syscall
-  is not modeled.
+  *not* end the BB — the walk proceeds around the fault to the
+  natural branch end, preserving the BBs-end-in-a-branch invariant —
+  and the sealed :class:`WPBBEntry` carries ``fault`` plus
+  ``fault_insn_index`` so the consumer can prevent that instruction's
+  execution on the wrong path.  The walk resumes with the
+  *accumulated* wrong-path state: the fault unwind
+  (``cpu_loop_exit_restore`` → ``restore_state_to_opc``) re-syncs the
+  register file to the faulting instruction's boundary, so every
+  pre-fault instruction's effects are in place and only the faulted
+  instruction's destination is unfulfilled.  The speculative session
+  (sandboxed store buffer, spec-TLB log) stays live across the skip.
+  Instructions not data-dependent on the fault then proceed exactly
+  as they normally would.  The faulted destination registers are
+  *poisoned* and the poison propagates transitively through register
+  dataflow (an all-clean-source write cleans its destinations; the
+  integer-flags register is modeled); when the wrong path reaches a
+  branch whose sources are poisoned, its outcome is unresolvable and
+  the excursion **dies on that branch**: the BB it terminates seals
+  as the chain's last entry, marked ``CST_WP_EVENT_DEP_BRANCH_KILL``
+  on the wire.  Branches independent of the fault resolve normally
+  and the chain continues.  Poison carried through memory (a
+  poisoned store forwarded to a later load) is not tracked.  A
+  faulting syscall-type branch seals its BB and the post-PC
+  poisoning ends the chain; speculative state past a syscall is not
+  modeled.
 * **Translation unavailable, mid-chain.**  The *next* wrong-path
   target could not be fetched or translated — un-resident code under
   demand paging is the architectural case.  The last completed

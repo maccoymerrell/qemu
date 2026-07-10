@@ -609,6 +609,7 @@ def _iter_body(lines: list[str], i: int,
                 "lane_masks": [],
                 "fault": False,
                 "translation_unavailable": False,
+                "dep_branch_kill": False,
                 "fault_insn_index": None,
             }
             if i < len(lines) and lines[i].startswith("    status:"):
@@ -621,6 +622,11 @@ def _iter_body(lines: list[str], i: int,
                         wp["fault_insn_index"] = int(t[len("FAULT@insn"):])
                     elif t == "TRANSLATION_UNAVAILABLE":
                         wp["translation_unavailable"] = True
+                    elif t == "DEP_BRANCH_KILL":
+                        # Chain terminator: the excursion died at this
+                        # block because its terminating branch depends
+                        # on a faulted wrong-path insn (format §4.4).
+                        wp["dep_branch_kill"] = True
                 i += 1
             obs_lines = []
             while i < len(lines) and lines[i].startswith("    "):

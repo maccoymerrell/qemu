@@ -936,7 +936,18 @@ typedef struct {
      * budget < 1 fires the heavy threshold-handler once when the
      * countdown crosses zero. */
     int64_t budget;
+    /* Marker-mode user-clock cursor: this vCPU's insn_count at the
+     * last TB the pinned fold observed HERE.  insn_count is per-vCPU
+     * (each TB's inline-add bumps its own slot), so the fold's
+     * consecutive-read delta must be per-vCPU too — one shared cursor
+     * flip-flopping between two active vCPUs' independent counters
+     * yields garbage deltas.  USER_SEEN_UNPRIMED marks a cursor whose
+     * vCPU has not folded since the last user_count_reset(); its first
+     * fold primes the cursor and contributes 0. */
+    uint64_t user_seen;
 } VCPUScoreBoard;
+
+#define USER_SEEN_UNPRIMED UINT64_MAX
 
 enum { BRANCH_TARGET_HISTORY = 16 };
 

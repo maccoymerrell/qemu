@@ -45,6 +45,7 @@ private:
     std::unordered_map<uint64_t, BranchRecord> records_;
 };
 
-extern BranchHistory g_branch_history;
+/* Immortal reference — see the definition's lifetime note. */
+extern BranchHistory &g_branch_history;
 
 #endif /* CHAMPSIM_TRACER_BRANCH_HISTORY_H */

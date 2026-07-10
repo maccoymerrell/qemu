@@ -19,7 +19,15 @@
 #include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_stats.h"
 
-TemplateStore g_template_store;
+/* Immortalized (never-destructed heap object): exit(0) at a segment close
+ * runs static destructors on the closing vCPU thread while, on an SMP
+ * guest, other vCPU threads may still be translating — a survivor inside
+ * lookup_tb_chain scanning a store whose containers were just destructed
+ * SIGSEGVs (observed: mipsel -smp 2 thread_test, one thread in
+ * chain_index_scan racing another in ~vector<unique_ptr<BBTemplate>>).
+ * The process is exiting; reclaiming tens of MiB of templates one
+ * unique_ptr at a time buys nothing (same policy as VCPUScoreboard). */
+TemplateStore &g_template_store = *new TemplateStore();
 
 /* Per-thread: is the translation currently being templated a wrong-path
  * (spec-mode) one?  Thread-local because translations run on each vCPU's

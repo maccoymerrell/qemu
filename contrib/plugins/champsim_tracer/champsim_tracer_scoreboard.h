@@ -45,6 +45,9 @@ public:
      * not fire; reset by finish_trace_segment to (next_eff_start -
      * current_icount). */
     qemu_plugin_u64 budget;
+    /* Per-vCPU user-clock cursor for the marker-mode pinned fold; see
+     * the field comment in champsim_tracer.h. */
+    qemu_plugin_u64 user_seen;
 
 private:
     struct qemu_plugin_scoreboard *sb_;

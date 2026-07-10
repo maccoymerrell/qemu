@@ -315,6 +315,7 @@ private:
     uint32_t                                    segment_gen_ = 1;
 };
 
-extern TemplateStore g_template_store;
+/* Immortal reference — see the definition's lifetime note. */
+extern TemplateStore &g_template_store;
 
 #endif /* CHAMPSIM_TRACER_BB_TEMPLATE_CACHE_H */

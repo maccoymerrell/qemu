@@ -187,7 +187,13 @@ void PathBuilder::on_segment_open()
 void PathBuilder::flush_final()
 {
     BodyStreamState *out_stream = g_trace_segments.body_stream();
-    unsigned int cpu_index = 0;
+    /* This builder's own vCPU (recorded at the lazy event-queue enable;
+     * a builder that never stepped holds 0 and has no pending prev
+     * anyway).  The scoreboard slots and the emitted entry's thread_id
+     * must be THIS vCPU's — a hardcoded slot 0 read the wrong cursor
+     * and mislabeled the segment's final entry whenever the closing
+     * thread wasn't vCPU 0. */
+    unsigned int cpu_index = cpu_index_;
     uint64_t prev_start =
         qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
 
@@ -254,8 +260,8 @@ void PathBuilder::flush_final()
     g_cp_chain.reset();
     g_mem_recorder.clear_cp();
 
-    qemu_plugin_u64_set(g_scoreboard.prev_start_pc, 0, 0);
-    qemu_plugin_u64_set(g_scoreboard.prev_fall_through, 0, 0);
+    qemu_plugin_u64_set(g_scoreboard.prev_start_pc, cpu_index, 0);
+    qemu_plugin_u64_set(g_scoreboard.prev_fall_through, cpu_index, 0);
 }
 
 void path_builder_flush_final()
@@ -951,8 +957,20 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
     }
 
     /* Stamp cur (already promoted by step_events) with the depth it runs
-     * at, and expose prev's execute-time depth for this step's emits. */
-    prev_depth_ = depth_next_;
+     * at, and expose prev's execute-time depth for this step's emits.
+     *
+     * User-privilege TBs stamp depth 0 regardless of the vCPU's raw
+     * fault-stack depth: user code is never fault-handler content, but a
+     * preemptible kernel can context-switch INSIDE a blocking fault
+     * handler (cond_resched in the fault path) and resume another guest
+     * thread's user code while the interrupted task's fault frames are
+     * still live on this vCPU's stack — without the clamp those user
+     * entries would carry the interrupted excursion's depth (observed:
+     * depth-4 user loop blocks under a two-thread yield workload).  The
+     * other thread's KERNEL work keeps the raw-baselined depth — the
+     * per-vCPU stack cannot attribute frames per guest thread, an
+     * accepted approximation. */
+    prev_depth_ = (in.pinned && in.live_priv == 0) ? 0 : depth_next_;
     if (fault_on) {
         g_emit_fault_depth = walk_depth_;
     }

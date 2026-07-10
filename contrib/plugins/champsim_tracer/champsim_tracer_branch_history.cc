@@ -9,7 +9,10 @@
 #include "champsim_tracer_branch_history.h"
 #include "champsim_tracer_stats.h"
 
-BranchHistory g_branch_history;
+/* Immortalized — see g_template_store's lifetime note (the CP seal path
+ * reads this history; it must survive exit-time static destruction while
+ * other vCPU threads drain). */
+BranchHistory &g_branch_history = *new BranchHistory();
 
 namespace {
 

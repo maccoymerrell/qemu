@@ -155,8 +155,16 @@ uint64_t g_code_end   = 0;
  * "code" being translated is actually dynamic memory (stack / heap /
  * data the program is writing to) and not real instructions.  Stored
  * as plain uint32 to avoid endianness ambiguity; we only compare for
- * equality, never decode. */
-std::unordered_map<uint64_t, uint32_t> g_first_insn_word;
+ * equality, never decode.
+ *
+ * Immortalized (never-destructed heap object): exit(0) at a segment
+ * close runs static destructors while OTHER vCPU threads may still be
+ * inside vcpu_tb_trans consulting this map — on an SMP guest the
+ * closing vCPU races the survivors, and a destructed map under a live
+ * reader is a straight SIGSEGV.  The process is exiting; reclaiming
+ * these containers buys nothing (same policy as VCPUScoreboard). */
+std::unordered_map<uint64_t, uint32_t> &g_first_insn_word =
+    *new std::unordered_map<uint64_t, uint32_t>();
 
 /* TB start_pcs that have been detected as carrying non-stable
  * instruction bytes (decode failure OR byte change since first
@@ -173,8 +181,10 @@ std::unordered_map<uint64_t, uint32_t> g_first_insn_word;
  * self-clears the entry (same principle as the merge content guard).
  * Handles exec()-time ASID reuse too, which ASID-keying would miss.  A
  * whole-TB hash rather than the first word: x86 prologues make first-word
- * collisions across unrelated binaries routine. */
-std::unordered_map<uint64_t, uint64_t> g_poisoned_pcs;
+ * collisions across unrelated binaries routine.
+ * Immortalized — see g_first_insn_word. */
+std::unordered_map<uint64_t, uint64_t> &g_poisoned_pcs =
+    *new std::unordered_map<uint64_t, uint64_t>();
 
 /* FNV-1a over the canonical per-insn byte image (fixed MAX_INSN_BYTES
  * stride, zero-padded, so equal content implies equal hash input). */
@@ -248,17 +258,43 @@ int g_xlate_bypass_priv = -1;
  * user_count_reset(); only touched when pinned, so user mode is unaffected.
  */
 static uint64_t g_user_icount = 0;       /* counted user-space insns so far */
-static uint64_t g_user_icount_seen = 0;  /* insn_count at the last TB seen */
 
 /* Set when the segment is closed by the guest's end marker (the workload
  * finished under budget by design) so the finish printout reports END
  * rather than an UNDER underrun. */
 static bool g_seg_end_marker_close = false;
 
-static inline void user_count_reset(uint64_t insn_count_now)
+/*
+ * Reset the user clock at a pin/segment boundary.  The per-vCPU seen
+ * cursors (scoreboard user_seen; each vCPU's fold computes its delta
+ * against its OWN insn_count slot) start over: the calling vCPU's cursor
+ * is seated exactly at @insn_count_now — its own count, already including
+ * the marker TB — so the very next TB's insns are the clock's first
+ * contribution; every other vCPU's cursor goes to the unprimed sentinel
+ * and self-seats, contributing 0, at that vCPU's first fold (its
+ * pre-reset insns must not leak into the fresh clock).
+ */
+static inline void user_count_reset(unsigned int cpu_index,
+                                    uint64_t insn_count_now)
 {
     g_user_icount = 0;
-    g_user_icount_seen = insn_count_now;
+    for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
+        qemu_plugin_u64_set(g_scoreboard.user_seen, (unsigned)i,
+                            (unsigned)i == cpu_index
+                                ? insn_count_now : USER_SEEN_UNPRIMED);
+    }
+}
+
+/* One vCPU-local tick of the user clock's delta source: this vCPU's
+ * insn_count advance since its last fold.  Self-seats on the first fold
+ * after a reset (delta 0).  Caller decides whether the delta is COUNTED
+ * (pinned ASID at user privilege) — the cursor advances either way. */
+static inline uint64_t user_seen_advance(unsigned int cpu_index,
+                                         uint64_t insn_count_now)
+{
+    uint64_t seen = qemu_plugin_u64_get(g_scoreboard.user_seen, cpu_index);
+    qemu_plugin_u64_set(g_scoreboard.user_seen, cpu_index, insn_count_now);
+    return seen == USER_SEEN_UNPRIMED ? 0 : insn_count_now - seen;
 }
 
 /*
@@ -1022,17 +1058,27 @@ static void start_trace_segment(const char *label,
      * path for chain emit + close-detect). */
     recompute_next_threshold();
 
-    /* Mirror is_active into the per-vCPU scoreboard so the per-insn
-     * heavy callbacks (registered with QEMU_PLUGIN_COND_GE 1) fire.
-     * Also park the budget slot at the sentinel so
-     * vcpu_tb_check_budget does not fire during the segment.  Skip
-     * the slot writes on the install-time call (cpu_index == -1, no
-     * vCPU yet); vcpu_init_cb back-fills both when a vCPU actually
-     * appears with the manager already in "active" state. */
-    if (cpu_index != (unsigned)-1) {
-        qemu_plugin_u64_set(g_scoreboard.is_active, cpu_index, 1);
-        qemu_plugin_u64_set(g_scoreboard.budget, cpu_index,
+    /* Mirror is_active into EVERY existing vCPU's scoreboard slot so the
+     * per-TB exec dispatch and the per-insn heavy callbacks (registered
+     * with QEMU_PLUGIN_COND_GE 1) fire machine-wide, and park each
+     * budget slot at the sentinel so vcpu_tb_check_budget does not fire
+     * during the segment.  A mid-run segment open (marker fire, icount
+     * threshold) executes on ONE vCPU, but on an SMP guest the pinned
+     * process's threads run wherever the guest scheduler put them — a
+     * slot left inactive would leave that entire vCPU untraced (and its
+     * pinned-user instructions uncounted) for the whole segment, exactly
+     * what the pinned-simpoint positioning path already guards against
+     * with the same loop.  The install-time call (cpu_index == -1, no
+     * vCPU yet) loops over zero vCPUs; vcpu_init_cb back-fills any vCPU
+     * created after the open. */
+    for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
+        qemu_plugin_u64_set(g_scoreboard.is_active, (unsigned)i, 1);
+        qemu_plugin_u64_set(g_scoreboard.budget, (unsigned)i,
                             (uint64_t)BUDGET_INACTIVE_SENTINEL);
+    }
+    if (getenv("CST_SMP_DIAG")) {
+        fprintf(stderr, "champsim_tracer: [smpdiag] segment open on cpu %d: "
+                "num_vcpus=%d\n", (int)cpu_index, qemu_plugin_num_vcpus());
     }
 
     uint64_t span = stop > start ? stop - start : 0;
@@ -1799,7 +1845,7 @@ static void open_pinned_simpoint_window(unsigned int cpu_index,
     uint64_t hi = lo + span;
     uint64_t reached_at = g_user_icount;
     g_trace_segments.set_window(lo, hi);
-    user_count_reset(lo);
+    user_count_reset(cpu_index, lo);
     g_autofree char *label = g_strdup_printf("simpoint_%d", sp->cluster_id);
     fprintf(stderr, "champsim_tracer: pinned simpoint %d reached (user clock %"
             PRIu64 ") — tracing %" PRIu64 " user insns (%" PRIu64
@@ -2009,7 +2055,7 @@ static void vcpu_tb_check_budget(unsigned int cpu_index, void *udata)
          * for post-window inter-segment logic. */
         g_ff_coarse.store(false, std::memory_order_relaxed);
         g_user_icount = g_ff_coarse_target;
-        g_user_icount_seen = icount_now;
+        qemu_plugin_u64_set(g_scoreboard.user_seen, cpu_index, icount_now);
         for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
             qemu_plugin_u64_set(g_scoreboard.is_active, (unsigned)i, 1);
             qemu_plugin_u64_set(g_scoreboard.budget, (unsigned)i,
@@ -2234,9 +2280,9 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
      * from the LIVE correct-path context (authoritative — the shared
      * true-BB cache can be seeded first by a wrong-path session that
      * spec-translated this PC at the kernel's CPL; see
-     * BBTemplate::is_system).  Runs under exec_lock —
-     * g_user_icount/g_user_icount_seen are plain statics, racy if mutated
-     * pre-lock on multi-vCPU guests.  It must run before tw_manage_window
+     * BBTemplate::is_system).  Runs under exec_lock — g_user_icount is a
+     * plain static, racy if mutated pre-lock on multi-vCPU guests (the
+     * seen cursor itself is per-vCPU).  It must run before tw_manage_window
      * (the marker budget clock includes this TB) and before the
      * async/foreign arrows (every TB — including ones about to be
      * dropped — advances the seen cursor and carries the CP ground-truth
@@ -2245,8 +2291,7 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     uint64_t live_asid = 0;
     int live_priv = -1;
     if (pinned_asid != CST_ASID_UNPINNED) {
-        uint64_t delta = icount_prev - g_user_icount_seen;
-        g_user_icount_seen = icount_prev;
+        uint64_t delta = user_seen_advance(cpu_index, icount_prev);
         live_asid = qemu_plugin_get_addr_space_id();
         live_priv = qemu_plugin_get_priv_level();
         if (live_asid == pinned_asid && live_priv == 0) {
@@ -2392,8 +2437,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         !g_trace_segments.is_active()) {
         uint64_t icount_ff = qemu_plugin_u64_get(g_scoreboard.insn_count,
                                                  cpu_index);
-        uint64_t delta = icount_ff - g_user_icount_seen;
-        g_user_icount_seen = icount_ff;
+        uint64_t delta = user_seen_advance(cpu_index, icount_ff);
         if (qemu_plugin_get_addr_space_id() ==
                 g_pinned_asid.load(std::memory_order_relaxed) &&
             qemu_plugin_get_priv_level() == 0) {
@@ -2462,6 +2506,18 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     uint64_t icount_prev = qemu_plugin_u64_get(
         g_scoreboard.insn_count, cpu_index);
     g_host_icount = icount_prev;
+
+    /* CST_SMP_DIAG: one line at each vCPU's first in-segment dispatch —
+     * SMP coverage triage (a vCPU missing from this set traced nothing). */
+    static const bool smp_diag = getenv("CST_SMP_DIAG") != nullptr;
+    if (smp_diag) {
+        static thread_local bool announced;
+        if (!announced) {
+            announced = true;
+            fprintf(stderr, "champsim_tracer: [smpdiag] first exec dispatch "
+                    "on cpu %u\n", cpu_index);
+        }
+    }
 
     /* The PathBuilder consumes the ordered per-vCPU event queue and runs
      * the CP step from here on.  Everything above this line is the shared
@@ -2949,7 +3005,7 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
         /* Pin only: zero the user clock at the target's first instruction
          * and start positioning toward the simpoint's effective start. */
         uint64_t lo = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
-        user_count_reset(lo);
+        user_count_reset(cpu_index, lo);
         const SimPointEntry *sp = g_simpoints.current();
         uint64_t eff_start = (sp && sp->start_insn > warmup_insns)
             ? sp->start_insn - warmup_insns : 0;
@@ -3005,7 +3061,7 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
         /* The window budget counts the pinned process's user-space insns
          * from 0 (kernel calls are traced but not counted); start the
          * counter here at the marker's icount. */
-        user_count_reset(lo);
+        user_count_reset(cpu_index, lo);
         fprintf(stderr, "champsim_tracer: marker fired at icount %" PRIu64
                 ", asid 0x%" PRIx64 " priv=%d (0=user,3=kernel) pc=0x%" PRIx64
                 " — tracing %" PRIu64 " insns\n",
@@ -3344,6 +3400,18 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     uint64_t pc = qemu_plugin_tb_vaddr(tb);
     size_t raw_n_insns = qemu_plugin_tb_n_insns(tb);
     if (raw_n_insns == 0) {
+        return;
+    }
+
+    /* Shutdown gate: a segment close on another vCPU thread sets the
+     * shutting-down flag and calls exit(0), whose teardown races any
+     * still-running vCPU (translation is not is_active-gated — new code
+     * translates whenever a vCPU meets it).  Once the flag is up the
+     * trace is finished; skip the template work entirely so surviving
+     * vCPUs stop touching the process-wide stores while the process
+     * dies.  (The stores themselves are also immortalized — this gate
+     * closes the window, the immortalization removes the cliff.) */
+    if (g_trace_segments.is_shutting_down()) {
         return;
     }
 

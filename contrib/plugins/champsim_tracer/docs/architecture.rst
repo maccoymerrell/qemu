@@ -1026,6 +1026,17 @@ vCPU thread resets its own PathBuilder, async state, and event
 queue as it observes the bumped segment generation on its next
 step — TLS cursors can only be reset from their own thread.
 
+A mid-run open executes on one vCPU but activates **every**
+vCPU's scoreboard (``is_active`` mirror plus the budget sentinel):
+on an SMP guest the pinned process's threads run wherever the
+scheduler put them, and a vCPU left inactive would silently carry
+no trace coverage — and no user-clock contribution — for the whole
+segment.  The user-instruction clock's delta source is likewise
+per-vCPU (each vCPU's fold reads its own ``insn_count`` cursor;
+``user_count_reset`` seats the opener's cursor exactly and marks
+every other vCPU's unprimed, so its first fold contributes zero
+rather than its pre-pin backlog).
+
 In every non-marker window mode the pin holds ``UNPINNED`` and the
 whole machinery costs one relaxed atomic load per TB.
 
@@ -1097,7 +1108,14 @@ VAs — from swallowing an innocent block's seal.
 On the wire (``CST_FLAG_FAULT``, set in marker mode; user-mode
 traces carry no trailer): every CP entry carries ``fault_depth``
 (0 = normal code, ≥1 = handler code at that nesting level,
-baselined per segment) and a merged faulting BB carries
+baselined per segment).  User-privilege entries always stamp 0:
+user code is never handler content, but a preemptible kernel can
+context-switch inside a blocking fault handler and resume another
+guest thread's user code while the interrupted task's frames are
+still live on the vCPU's per-CPU fault stack — the clamp keeps
+that depth from leaking onto the resumed thread (its *kernel* work
+keeps the raw-baselined depth, an accepted approximation of the
+per-vCPU stack).  A merged faulting BB carries
 ``fault_anchors`` — the faulting-instruction indices, one per
 excursion, in order.  Consumers replay the handler at its depth and
 see the faulting block once, whole, with its detour points marked.
@@ -1315,12 +1333,23 @@ PC and would otherwise spin forever.
 
 *atexit ordering inversion.*  QEMU registers its plugin atexit
 callback *before* the plugin shared object's own ``__cxa_atexit``
-destructors run.  By the time ``plugin_exit`` fires, the C++
-containers in ``g_bb_template_cache`` and ``g_branch_history`` have
-already been destroyed and their ``size()`` returns 0.  The plugin
-therefore mirrors the relevant cardinality counts as raw ``uint64_t``
-in ``g_stats`` (``tb_templates_created`` etc.) and bumps them at
+destructors run.  By the time ``plugin_exit`` fires, C++ containers
+in plugin globals may already have been destroyed, so the plugin
+mirrors the relevant cardinality counts as raw ``uint64_t`` in
+``g_stats`` (``tb_templates_created`` etc.) and bumps them at
 insertion time, so the exit-time summary still reports useful numbers.
+
+*Immortal process-wide aggregates.*  The stores the vCPU callbacks
+touch (``g_template_store``, ``g_branch_history``, the poison /
+byte-memo maps, the scoreboard) are deliberately never destructed:
+``exit(0)`` at a segment close runs static destructors on the closing
+vCPU thread while, on an SMP guest, the *other* vCPU threads are
+still executing — a survivor inside ``vcpu_tb_trans`` scanning a
+just-destructed template store is a straight SIGSEGV.  The process is
+exiting, so reclaiming these containers buys nothing; a shutdown gate
+at the top of ``vcpu_tb_trans`` (translation is not ``is_active``-
+gated) additionally stops surviving vCPUs from doing pointless
+template work while the process dies.
 
 *Thread-locals at exit.*  The CP memop accumulator is a TLS vector.
 On REP-heavy workloads it can be MiB-sized and backed by a direct

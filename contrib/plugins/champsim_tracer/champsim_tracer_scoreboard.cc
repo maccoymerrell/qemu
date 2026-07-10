@@ -25,6 +25,8 @@ VCPUScoreboard::VCPUScoreboard()
         sb_, VCPUScoreBoard, asid_match);
     budget = qemu_plugin_scoreboard_u64_in_struct(
         sb_, VCPUScoreBoard, budget);
+    user_seen = qemu_plugin_scoreboard_u64_in_struct(
+        sb_, VCPUScoreBoard, user_seen);
 }
 
 VCPUScoreboard::~VCPUScoreboard()

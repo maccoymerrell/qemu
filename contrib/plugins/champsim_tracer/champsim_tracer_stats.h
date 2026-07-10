@@ -98,6 +98,12 @@ struct Stats {
      * attribution rules (kexc on and off), separately from
      * kexc_kernel_dropped — these TBs never consult the ownership rule. */
     uint64_t kexc_mmode_dropped = 0;
+    /* Rewrites of the pinned ASID value observed after enough DISTINCT
+     * other values to imply the target's narrow ASID space wrapped (a
+     * generation rollover recycled the pinned value — the trace may be
+     * following a different process from that point).  Detection only;
+     * see pin_reuse_track in champsim_tracer.cc. */
+    uint64_t pin_asid_reuse_suspected = 0;
 
     /* Per-execution attribution.  cp_* bumped at vcpu_tb_exec walking
      * the prev TB's template; wp_* inside the WP per-iteration loop.

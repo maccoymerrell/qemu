@@ -318,6 +318,81 @@ static void vcpu_tb_ff_foreign(unsigned int cpu_index, void *udata)
     g_ff_foreign_insns += n;
 }
 
+/*
+ * Pinned-ASID reuse detector (narrow-ASID targets; currently MIPS).
+ *
+ * The MIPS pin is a bare EntryHi.ASID value from an architecturally
+ * 8-bit field (10 bits with Config4.AE) — a space small enough that the
+ * OS must recycle values.  Linux does so by generations: on rollover
+ * every live process is silently handed a fresh ASID, so the pinned
+ * VALUE can be re-assigned to a different process and the raw-equality
+ * pin follows the wrong one from then on.  The rollover itself is
+ * invisible in the register stream, but its footprint is not: the
+ * committed ASID-write stream (this hook) shows the pinned value going
+ * absent while a large share of the whole space is written with OTHER
+ * values.  Seeing >= PIN_REUSE_THRESHOLD distinct other values between
+ * two writes of the pinned value implies the space wrapped, so the
+ * pinned value's return is suspect.  Detection only — one stderr
+ * warning per pin plus the pin_asid_reuse_suspected stat; whether to
+ * unpin is a policy decision deliberately not taken here.
+ *
+ * Not armed on the wide-register targets (CR3 / TTBR0 / SATP carry a
+ * page-table base): distinct-value counts there measure how many
+ * processes ran, not how much of an exhaustible ID space burned, so the
+ * same signal would false-fire on any busy guest.
+ *
+ * Cost: one bounded scan per committed ASID change (a context-switch-
+ * rate event), only while pinned.  Fixed POD state — no ctor/dtor
+ * ordering against plugin_exit to manage.
+ */
+static bool g_pin_reuse_guard = false;   /* armed at install (narrow space) */
+static constexpr uint32_t PIN_REUSE_THRESHOLD = 200;
+static GMutex pin_reuse_lock;
+static uint64_t g_pin_reuse_vals[PIN_REUSE_THRESHOLD];
+static uint32_t g_pin_reuse_nvals = 0;   /* distinct non-pinned values since
+                                          * the pinned value's last write;
+                                          * saturates at the threshold */
+static bool g_pin_reuse_warned = false;  /* one warning per pin */
+
+static void pin_reuse_reset(void)
+{
+    g_mutex_lock(&pin_reuse_lock);
+    g_pin_reuse_nvals = 0;
+    g_pin_reuse_warned = false;
+    g_mutex_unlock(&pin_reuse_lock);
+}
+
+static void pin_reuse_track(uint64_t new_asid, uint64_t pinned_asid)
+{
+    g_mutex_lock(&pin_reuse_lock);
+    if (new_asid == pinned_asid) {
+        if (g_pin_reuse_nvals >= PIN_REUSE_THRESHOLD) {
+            g_stats.pin_asid_reuse_suspected++;
+            if (!g_pin_reuse_warned) {
+                g_pin_reuse_warned = true;
+                fprintf(stderr, "champsim_tracer: pinned ASID value 0x%"
+                        PRIx64 " re-assigned after apparent rollover (%u "
+                        "distinct other ASID values since its last write) "
+                        "— trace may follow a different process\n",
+                        pinned_asid, g_pin_reuse_nvals);
+            }
+        }
+        g_pin_reuse_nvals = 0;          /* a fresh absence window opens */
+    } else if (g_pin_reuse_nvals < PIN_REUSE_THRESHOLD) {
+        bool seen = false;
+        for (uint32_t i = 0; i < g_pin_reuse_nvals; i++) {
+            if (g_pin_reuse_vals[i] == new_asid) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            g_pin_reuse_vals[g_pin_reuse_nvals++] = new_asid;
+        }
+    }
+    g_mutex_unlock(&pin_reuse_lock);
+}
+
 /* Synchronous ASID-write hook: keep the per-vCPU asid_match flag in
  * step with the live address space.  Fires at the same architectural
  * commit points that produce ASID_WRITE path events (and with the same
@@ -325,12 +400,18 @@ static void vcpu_tb_ff_foreign(unsigned int cpu_index, void *udata)
  * — which is the whole point: the coarse fast-forward runs with no
  * dispatching callbacks at all.  Kernel-side transient values (PTI
  * overlays, TLB maintenance) flip the flag while no user TB can
- * execute; the exit write restores it before user code resumes. */
+ * execute; the exit write restores it before user code resumes.  Also
+ * feeds the pinned-ASID reuse detector above — this hook is the one
+ * place every committed ASID change is visible. */
 static void asid_write_track_cb(unsigned int vcpu_index, uint64_t new_asid)
 {
+    uint64_t pinned = g_pinned_asid.load(std::memory_order_relaxed);
     qemu_plugin_u64_set(
         g_scoreboard.asid_match, vcpu_index,
-        new_asid == g_pinned_asid.load(std::memory_order_relaxed) ? 1 : 0);
+        new_asid == pinned ? 1 : 0);
+    if (g_pin_reuse_guard && pinned != CST_ASID_UNPINNED) {
+        pin_reuse_track(new_asid, pinned);
+    }
 }
 
 /* Emit-time fault-depth trailer register (system mode): the exception-
@@ -2862,6 +2943,7 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
      * later TB in a different address space is filtered in vcpu_tb_exec. */
     uint64_t asid = qemu_plugin_get_addr_space_id();
     g_pinned_asid.store(asid, std::memory_order_relaxed);
+    pin_reuse_reset();
 
     if (pinned_simpoint_mode()) {
         /* Pin only: zero the user clock at the target's first instruction
@@ -3736,6 +3818,7 @@ static void append_stats_summary(GString *report, const char *label,
         { "kexc kernel TBs dropped",             stats.kexc_kernel_dropped },
         { "kexc write storms",                   stats.kexc_write_storm },
         { "kexc M-mode TBs dropped",             stats.kexc_mmode_dropped },
+        { "pin ASID reuse suspected",            stats.pin_asid_reuse_suspected },
     };
     const struct { const char *name; uint64_t value; } bin_counters[] = {
         { "  Header bits",        stats.bin_header_bits },
@@ -4070,6 +4153,13 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      * exclude it — see g_xlate_bypass_priv at the pin machinery. */
     if (trace_isa == TRACE_ISA_RISCV) {
         g_xlate_bypass_priv = 3;
+    }
+
+    /* MIPS pins a bare EntryHi.ASID value from an 8-bit (10 with
+     * Config4.AE) space the OS must recycle, so arm the reuse detector —
+     * see pin_reuse_track.  The wide-register targets stay unarmed. */
+    if (trace_isa == TRACE_ISA_MIPS) {
+        g_pin_reuse_guard = true;
     }
 
     /* Target byte order.  The four currently-supported ISAs (x86, AArch64,

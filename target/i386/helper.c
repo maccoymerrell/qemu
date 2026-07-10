@@ -184,17 +184,22 @@ void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3)
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     /*
      * Address-space switch observation: CR3 is the register
-     * x86_get_plugin_state reports, full-register compare.  This is the
-     * one TCG commit point for every architectural CR3 write — MOV CR3
-     * (helper_write_crN), hardware task switches, SMM RSM and SVM world
-     * switches all funnel through here.  The event's pc slot carries
-     * the OLD value; the push itself stamps the just-committed NEW
+     * x86_get_plugin_state reports, compared under the same
+     * CR3_NOFLUSH_MASK that hook applies — the event contract is "the
+     * reported value changed", and a write differing only in bit 63
+     * (the PCID no-flush command bit, never part of the stored
+     * register) does not change it.  This is the one TCG commit point
+     * for every architectural CR3 write — MOV CR3 (helper_write_crN),
+     * hardware task switches, SMM RSM and SVM world switches all
+     * funnel through here.  The event's pc slot carries the OLD
+     * (masked) value; the push itself stamps the just-committed NEW
      * value as the event's asid (and is a no-op on the wrong path or
      * while the queue is disabled).
      */
-    if (new_cr3 != old_cr3) {
+    if ((new_cr3 & ~CR3_NOFLUSH_MASK) != (old_cr3 & ~CR3_NOFLUSH_MASK)) {
         cpu_plugin_evq_push(env_cpu(env), QEMU_PLUGIN_CPU_EVENT_ASID_WRITE,
-                            old_cr3, env_cpu(env)->plugin_fault_depth);
+                            old_cr3 & ~CR3_NOFLUSH_MASK,
+                            env_cpu(env)->plugin_fault_depth);
     }
 #endif
 }

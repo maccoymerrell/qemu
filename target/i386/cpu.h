@@ -269,6 +269,15 @@ typedef enum X86Seg {
 #define CR4_FRED_MASK   0
 #endif
 
+/*
+ * CR3 bit 63 (PCID "no-flush"): a command bit on the MOV-to-CR3 *write*
+ * when CR4.PCIDE=1 — suppress the PCID-tagged TLB flush — and never part
+ * of the stored register (MOV from CR3 always reads bit 63 as 0).  Used
+ * by the plugin address-space reporting to keep an ASID compare from
+ * seeing a flush hint as an address-space change.
+ */
+#define CR3_NOFLUSH_MASK (1ULL << 63)
+
 #define CR4_RESERVED_MASK \
 (~(target_ulong)(CR4_VME_MASK | CR4_PVI_MASK | CR4_TSD_MASK \
                 | CR4_DE_MASK | CR4_PSE_MASK | CR4_PAE_MASK \

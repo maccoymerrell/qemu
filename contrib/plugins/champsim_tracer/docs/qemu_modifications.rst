@@ -132,7 +132,12 @@ Plugin API additions
    ``get_plugin_state(cpu, *priv, *asid, *mmu_on)``, is the single
    per-target source for the three introspection accessors above.  Each
    softmmu target fills it from architectural state: x86 from ``CPL`` /
-   ``CR3`` / ``CR0.PG`` (``target/i386/tcg/tcg-cpu.c``), Arm from the
+   ``CR3`` / ``CR0.PG`` (``target/i386/tcg/tcg-cpu.c``; the reported
+   ``CR3`` masks bit 63, the PCID no-flush command bit that is never
+   part of the stored register, and the ``ASID_WRITE`` producer in
+   ``cpu_x86_update_cr3`` compares under the same mask — PCID bits
+   [11:0] pass through, since with ``CR4.PCIDE`` they are a real
+   component of the address-space identity), Arm from the
    current EL / ``TTBR0_EL1`` / ``SCTLR.M``
    (``target/arm/cpu.c``), RISC-V from ``priv`` / ``SATP`` /
    (``SATP != 0 && priv != M``) (``target/riscv/tcg/tcg-cpu.c``), and

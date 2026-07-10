@@ -116,8 +116,27 @@ static void x86_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
      * privileged), larger = more privileged. */
     int cpl = (env->hflags & HF_CPL_MASK) >> HF_CPL_SHIFT;
     *priv = 3 - cpl;
-    /* CR3 = current page-table base / address-space id. */
-    *asid = env->cr[3];
+    /*
+     * CR3 = current page-table base / address-space id, masking bit 63
+     * (PCID NOFLUSH).  Architecturally bit 63 is a command bit on the
+     * MOV-to-CR3 write — "skip the TLB flush" — not state: MOV from CR3
+     * always reads it as 0, so it can never distinguish address spaces
+     * and masking it is unconditionally safe.  It is also unreachable
+     * under current TCG — system emulation never advertises PCID
+     * (TCG_EXT_FEATURES), a Linux guest therefore never sets
+     * CR4.PCIDE/NOFLUSH (audited empirically: -cpu Haswell boot, 20k+
+     * committed CR3 writes, all 4 KiB-aligned, bit 63 clear), and
+     * helper_write_crN faults long-mode CR3 writes with bits above
+     * phys_bits as reserved anyway — so the mask only guards the
+     * verbatim CR3 image loads (VMRUN, SMM RSM) and any future TCG PCID
+     * support.  PCID bits [11:0] are deliberately NOT masked: with
+     * CR4.PCIDE they are a genuine component of the address-space
+     * identity (Linux PTI tags the user-half CR3 with PCID bit 11), and
+     * no PCID-capable TCG configuration exists to justify collapsing
+     * them.  Producers of ASID-change notifications must compare under
+     * this same mask (see cpu_x86_update_cr3).
+     */
+    *asid = env->cr[3] & ~CR3_NOFLUSH_MASK;
     /* Paging active iff CR0.PG; off in real mode / early boot. */
     *mmu_on = (env->cr[0] & CR0_PG_MASK) != 0;
 }

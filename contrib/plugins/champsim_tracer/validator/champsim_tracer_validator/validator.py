@@ -385,6 +385,20 @@ def _check_block_insn_counts(templates: list[dict],
                      "actual": actual},
                 ))
             continue
+        # The terminal block (END marker + exit syscall) can be
+        # legitimately truncated: the end-marker close lands on the
+        # marker's last insn, and when a page boundary splits the block
+        # into two TBs the plugin emits only the executed first sub-TB —
+        # the exit syscall itself never runs inside the window.  Accept a
+        # contiguous PREFIX of the disassembly for the terminal block;
+        # holes or an overcount still flag.
+        if b.get("terminal") and 0 < actual < expected:
+            prefix_pcs = set()
+            for ins in gt.get("insns", [])[:actual]:
+                pc = ins["pc"]
+                prefix_pcs.add(int(pc, 16) if isinstance(pc, str) else pc)
+            if seen_pcs[bid] == prefix_pcs:
+                continue
         # Under wpprune, some of a block's instructions are reached only on
         # the wrong path, whose simulation is now dropped for cold branches
         # — so the trace can legitimately expose FEWER PCs than the static

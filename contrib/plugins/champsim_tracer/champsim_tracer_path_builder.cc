@@ -249,6 +249,22 @@ void PathBuilder::flush_final()
                 break;
             }
         }
+        /* The walk can end with the chain mid-BB and no sealing branch
+         * ever coming — the segment is closing.  This is the pending
+         * TB whose true BB a page boundary split (TB_TERMINUS_NONE
+         * tail): its instructions are already counted in the window's
+         * coverage (the per-TB inline-add ran at TB entry), so
+         * discarding the chain here would break covered == emitted —
+         * observed as the end-marker close dropping the workload's
+         * final block whenever the END sequence completed inside the
+         * first sub-TB of a page-straddling exit block.  Finalize the
+         * partial BB as-is; like every entry this flush emits, its
+         * terminal branch is simply unresolved. */
+        if (g_cp_chain.has_active_chain()) {
+            if (BBTemplate *bb_tmpl = g_cp_chain.finalize()) {
+                finalized.push_back(bb_tmpl);
+            }
+        }
         g_mutex_unlock(&data_lock);
     }
 

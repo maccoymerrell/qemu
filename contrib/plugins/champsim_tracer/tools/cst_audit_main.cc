@@ -402,6 +402,12 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
             cpfd_b[BIDX_OVERHEAD].count += 1;
 
             const cst::Template *cp_tmpl = tmpl_for(prev_cp_tid);
+            /* Dangling-template-ref lint (cst_lint.h): a CP ENTRY
+             * naming an id the templates section never defined. */
+            if (!cp_tmpl) {
+                lint->note_dangling((uint32_t)prev_cp_tid,
+                                    /*is_wp=*/false);
+            }
             LintCtx lctx = {
                 lint, &tracker, lint->row((uint32_t)prev_cp_tid),
                 (uint32_t)current_thread, (uint32_t)prev_cp_tid,
@@ -483,6 +489,12 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                 wpfd_b[BIDX_OVERHEAD].bytes += wpsec.consumed() - wp_rec_st;
                 wpfd_b[BIDX_OVERHEAD].count += 1;
                 const cst::Template *wp_tmpl = tmpl_for(prev_wp_tid);
+                /* Dangling-template-ref lint: id 0 is the writer's
+                 * "no template" sentinel, every other id must resolve. */
+                if (!wp_tmpl && prev_wp_tid != 0) {
+                    lint->note_dangling((uint32_t)prev_wp_tid,
+                                        /*is_wp=*/true);
+                }
                 uint32_t wp_ipos = 0;
                 for (uint64_t r = 0; r < wp_nrec; r++) {
                     tally_fd_record(wpsec, fid, ids, &wpfd_b,

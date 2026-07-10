@@ -50,9 +50,22 @@
  *   count is zero), or on an insn position past the template.  Only
  *   meaningful on CST_FLAG_REG_DATA traces; disabled otherwise.
  *
- * Correct-path entries only: wrong-path excursions walk speculative
- * wandering and are not held to this contract.  IFRAMEs re-encode the
- * preceding entry and must not double-count.
+ *   DANGLING TEMPLATE REF: a body record naming a template id the
+ *   trace's own templates section does not define.  Every CP ENTRY and
+ *   every WP chain block carries a template id, and the templates
+ *   section is the id's only definition — a reference with no
+ *   definition is structural corruption (the writer emitted entries
+ *   whose templates never serialized; observed as the stale-ASID-pin
+ *   empty-templates trace), not a decode-quality nuance.  The check is
+ *   id-set membership only, so it costs one hash probe per entry.
+ *   WP id 0 is exempt: the writer emits 0 as the "no template" sentinel
+ *   (template ids start at 1).
+ *
+ * Correct-path entries only for the MEM/REG rules: wrong-path
+ * excursions walk speculative wandering and are not held to that
+ * contract.  The dangling-ref rule covers CP and WP alike — an id
+ * without a definition is corrupt regardless of path.  IFRAMEs
+ * re-encode the preceding entry and must not double-count.
  *
  * Two feeding modes cover both consumers:
  *   - cst_decode's BodyWalker resolves per-entry cell values anyway;
@@ -192,20 +205,42 @@ public:
         }
     }
 
+    /* One body record (CP ENTRY or WP chain block) named @template_id
+     * and the templates section defines no such id. */
+    void note_dangling(uint32_t template_id, bool is_wp) {
+        dangling_refs_ += 1;
+        if (distinct_dangling_.insert(template_id).second && debug_) {
+            std::fprintf(stderr,
+                         "cst lint: %s record references undefined "
+                         "template id %u\n",
+                         is_wp ? "WP" : "CP entry", template_id);
+        }
+    }
+
     uint64_t mem_violations() const { return mem_memops_; }
     uint64_t reg_violations() const { return reg_records_; }
+    uint64_t dangling_refs() const { return dangling_refs_; }
     size_t   distinct_mem_insns() const { return distinct_mem_.size(); }
     size_t   distinct_reg_insns() const { return distinct_reg_.size(); }
-    bool     any() const { return mem_memops_ || reg_records_; }
+    size_t   distinct_dangling_ids() const {
+        return distinct_dangling_.size();
+    }
+    bool     any() const {
+        return mem_memops_ || reg_records_ || dangling_refs_;
+    }
 
-    /* "N memop (M distinct insns), R regdata (S distinct insns)" */
+    /* "N memop (M distinct insns), R regdata (S distinct insns),
+     *  D dangling template refs (K distinct ids)" */
     std::string summary() const {
-        char buf[160];
+        char buf[224];
         std::snprintf(buf, sizeof(buf),
                       "%llu memop (%zu distinct insns), "
-                      "%llu regdata (%zu distinct insns)",
+                      "%llu regdata (%zu distinct insns), "
+                      "%llu dangling template refs (%zu distinct ids)",
                       (unsigned long long)mem_memops_, distinct_mem_.size(),
-                      (unsigned long long)reg_records_, distinct_reg_.size());
+                      (unsigned long long)reg_records_, distinct_reg_.size(),
+                      (unsigned long long)dangling_refs_,
+                      distinct_dangling_.size());
         return buf;
     }
 
@@ -316,10 +351,12 @@ private:
      * separate dump pass. */
     bool debug_;
 
-    uint64_t mem_memops_  = 0;
-    uint64_t reg_records_ = 0;
+    uint64_t mem_memops_    = 0;
+    uint64_t reg_records_   = 0;
+    uint64_t dangling_refs_ = 0;
     std::unordered_set<uint64_t> distinct_mem_;
     std::unordered_set<uint64_t> distinct_reg_;
+    std::unordered_set<uint32_t> distinct_dangling_;
 };
 
 }  /* namespace cst */

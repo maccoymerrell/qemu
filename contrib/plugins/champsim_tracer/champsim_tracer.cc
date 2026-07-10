@@ -1004,6 +1004,12 @@ static void append_histogram(GString *report, const char *segment_label,
  */
 static void reset_segment_local_state(void)
 {
+    if (getenv("CST_SEGDIAG")) {
+        fprintf(stderr, "champsim_tracer: [segdiag] reset_segment_local_state"
+                " bb_map=%zu active=%d\n",
+                g_template_store.bb_count(),
+                (int)g_trace_segments.is_active());
+    }
     g_mutex_lock(&data_lock);
     /* Clearing bb_map_ drops the old BBTemplates and their
      * accumulated emit_count; the next commit_true_bb rebuilds each

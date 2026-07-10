@@ -362,6 +362,16 @@ collectively check every one:
    total, and the HEADER BREAKDOWN sub-groups sum back to the
    HEADER member (a ``[rollup 100.00%]`` line asserts it).  A
    non-100 % rollup or an ``UNACCOUNTED`` line is a writer bug.
+6. **Every template id the body references is defined.**  Each CP
+   ``ENTRY`` and each WP chain block names a template id, and the
+   trace's own templates section is the id's only definition — a
+   reference with no definition means the writer emitted entries
+   whose templates never serialized, and the trace cannot be
+   replayed.  Both tools count these as *dangling template refs*
+   in the attribution-lint summary: ``cst_audit`` fails (exit 1)
+   on any, and ``cst_decode --strict`` escalates its trailing
+   lint summary to exit 1.  WP id 0 is exempt (the writer's
+   "no template" sentinel; real ids start at 1).
 
 The recommended validation workflow:
 

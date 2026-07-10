@@ -469,6 +469,11 @@ std::vector<WPEntry> BodyWalker::decode_wp_chain(
         const Template *wtmpl = by_id_.count((uint32_t)wp_tmpl)
             ? &templates_[by_id_.at((uint32_t)wp_tmpl)] : nullptr;
         if (wtmpl) we.n_insns = (uint32_t)wtmpl->insns.size();
+        /* Dangling-template-ref lint (cst_lint.h): id 0 is the writer's
+         * "no template" sentinel, every other id must resolve. */
+        if (!wtmpl && wp_tmpl != 0) {
+            lint_.note_dangling((uint32_t)wp_tmpl, /*is_wp=*/true);
+        }
         decode_field_delta(wpb, (uint32_t)wp_tmpl, wtmpl,
                            state, base_state,
                            &we.dyn_params, &we.reg_snaps, &we.metaflags,
@@ -546,6 +551,12 @@ void BodyWalker::handle_entry(WalkState &ws, const Callback &cb)
     /* CP delta section. */
     const Template *cp_tmpl = by_id_.count((uint32_t)entry_tmpl)
         ? &templates_[by_id_.at((uint32_t)entry_tmpl)] : nullptr;
+    /* Dangling-template-ref lint (cst_lint.h): a CP ENTRY naming a
+     * template the templates section never defined is structural
+     * corruption, whatever the id's value. */
+    if (!cp_tmpl) {
+        lint_.note_dangling((uint32_t)entry_tmpl, /*is_wp=*/false);
+    }
     decode_field_delta(body_, (uint32_t)entry_tmpl, cp_tmpl,
                        cp_state, nullptr,
                        &entry.dyn_params, &entry.reg_snaps, &entry.metaflags,

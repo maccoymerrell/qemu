@@ -417,6 +417,31 @@ ptrdiff_t PathBuilder::frame_idx_for_resume(uint64_t resume_pc,
     return -1;
 }
 
+/* Frame lookup by block identity: the frame whose stashed full template
+ * CONTAINS the faulting TB (@piece is a byte-identical subrun of
+ * full_tmpl) and covers @resume.  This is the join key for a SECOND
+ * fault inside an already-pending block: the resume suffix re-executing
+ * after the first fault is a subrun of the frame's own template, so a
+ * fresh fault it takes on a LATER instruction belongs to the same
+ * pending block — not to a new frame keyed at the suffix's start, which
+ * would drop every instruction ahead of the first resume from the
+ * merged emission.  Same ASID and byte-content guards as the resume
+ * match; top-down so nesting is respected. */
+ptrdiff_t PathBuilder::frame_idx_for_block(const BBTemplate *piece,
+                                           uint64_t resume,
+                                           uint64_t asid) const
+{
+    for (size_t i = frames_.size(); i-- > 0; ) {
+        const CtxFrame &f = frames_[i];
+        if (f.asid == asid &&
+            tmpl_contains_pc(f.full_tmpl, resume) &&
+            tmpl_subrun_pos(f.full_tmpl, piece) != UINT32_MAX) {
+            return (ptrdiff_t)i;
+        }
+    }
+    return -1;
+}
+
 /*
  * Completion candidate for a just-sealed BB claiming to be some frame's
  * resume suffix.  Preferred match: a frame whose FAULT_RETURN was already
@@ -544,6 +569,19 @@ BBTemplate *PathBuilder::fold_prev_full_bb(BBTemplate *prev)
  *      to the handler and must NOT be absorbed into the frame — the
  *      guard demotes exactly that case to (c).
  *
+ *  (a2) a LATER instruction of an already-pending block — the frame's
+ *      resume suffix (walk_prev_, a byte-identical subrun of some
+ *      frame's full template) took a fresh fault at a NEW resume PC
+ *      still inside that template (the aarch64 archetype: the ldr's
+ *      demand-zero fault, then the str's CoW fault, in one BB).  The
+ *      new fault JOINS the frame: the suffix's committed pieces and the
+ *      new anchor accumulate, and the frame re-keys to the new resume
+ *      PC so the eventual completion matches the final suffix.  Without
+ *      the join, case (b) would mint a second frame keyed at the FIRST
+ *      resume PC — the merged emission would start there, silently
+ *      dropping every instruction ahead of it, and the original frame
+ *      would leak.
+ *
  *  (b) inside the deferred prev — prev IS the faulting BB and its
  *      terminating branch never ran; fold it into a serialisable
  *      template and push a fresh frame.
@@ -572,7 +610,16 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
             == UINT32_MAX) {
         cont = -1;
     }
-    if (cont >= 0) {                                       /* case (a) */
+    if (cont < 0) {                                        /* case (a2) */
+        /* Same guards as (a) minus the resume-PC identity: the faulting
+         * TB must be a byte-identical subrun of the frame's template
+         * and the NEW resume PC must lie inside it (a suffix extending
+         * past a force-committed head keeps the old (b) path, so the
+         * frame key never leaves its template).  collect_piece re-keys
+         * the frame and records the new anchor. */
+        cont = frame_idx_for_block(walk_prev_, resume, ev.asid);
+    }
+    if (cont >= 0) {                                  /* case (a) / (a2) */
         g_mutex_lock(&data_lock);
         g_cp_chain.reset();
         g_mutex_unlock(&data_lock);

@@ -1060,6 +1060,18 @@ against the deferred prev (see :ref:`path-builder`):
   (a TLB refill followed by the demand fault is *one* faulting
   instruction).  The deferred prev's accumulated pieces join that
   frame; the anchor is recorded once.
+* **Case (a2) — second fault, same block.**  The resume PC is new,
+  but the faulting TB is a byte-identical subrun of an in-flight
+  frame's template and the new resume PC lies inside that template:
+  a *later* instruction of the same pending block faulted (the
+  archetype is a load's demand-zero fault followed by a store's CoW
+  fault in one BB — the resume suffix re-executing after the first
+  fault is a subrun of the frame's own template by construction).
+  The piece joins that frame — anchors and accumulators extend —
+  and the frame re-keys to the new resume PC so the eventual
+  completion matches the final suffix.  Minting a second frame
+  keyed at the first resume PC instead would drop every instruction
+  ahead of it from the merged emission and leak the original frame.
 * **Case (b) — new fault.**  The resume PC lies inside the deferred
   prev: prev *is* the faulting BB and its terminating branch never
   ran.  It is folded into a serializable template (force-committing

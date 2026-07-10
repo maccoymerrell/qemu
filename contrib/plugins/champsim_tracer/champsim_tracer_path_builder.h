@@ -235,6 +235,8 @@ private:
                               bool *prev_stashed);
     void apply_fault_return(const struct qemu_plugin_cpu_event &ev);
     ptrdiff_t frame_idx_for_resume(uint64_t resume_pc, uint64_t asid) const;
+    ptrdiff_t frame_idx_for_block(const BBTemplate *piece, uint64_t resume,
+                                  uint64_t asid) const;
     ptrdiff_t frame_idx_for_completion(const BBTemplate *suffix) const;
     void collect_piece(CtxFrame &f, uint64_t resume_pc);
     BBTemplate *fold_prev_full_bb(BBTemplate *prev);

@@ -21,19 +21,16 @@
  *   (prefetch / cache-flush / TLB-flush) record load-style memops the
  *   operand walker may not have given static slots, so those opcode
  *   classes are exempted wholesale.  Definitionally-memory classes
- *   are exempt too — an insn of these classes with 0/0 static counts
- *   is a static-decode gap, not an attribution impossibility:
- *     - GEN_OP_LOAD / STORE / VEC_LOAD / VEC_STORE and atomics (by
- *       flag): Capstone 6.0.0-Alpha7 leaves the MEM operand's access
- *       flags empty on aarch64 register-offset / extended-register
- *       addressing (ldr w3, [x1, x2] — verified: access==0, while
- *       [x1, #8] reads access==READ) and on LSE atomics (SWP) — same
- *       upstream bug class as the MIPS MSA / x86 store-move
- *       workarounds in disas/capstone.c.  The proper fix is an arm64
- *       boundary workaround there (infer the MEM access from the
- *       ld- / st- / swp / cas mnemonic class); it changes template
- *       bytes, so it is deferred to a Capstone-bump / format window
- *       rather than folded into this lint.
+ *   (GEN_OP_LOAD / STORE / VEC_* / atomics) are deliberately NOT
+ *   exempt: their static memop capability is decode-critical, so a
+ *   0/0 template on one of them is exactly the failure this lint
+ *   exists to surface.  The Capstone 6.0.0-Alpha7 hole that used to
+ *   force an exemption here — access==0 on the MEM operand of aarch64
+ *   register-offset / extended-register load-stores and the LSE SWP
+ *   family — is closed at the boundary (cap_aarch64_infer_mem_access
+ *   in disas/capstone.c, same workaround family as the MIPS MSA / x86
+ *   store-move fixes), so those insns now mint their static slots.
+ *   Remaining narrow exemptions:
  *     - GEN_OP_PUSH / POP / RET: implicit stack traffic.  The x86
  *       stack refiners mint their static slots, but corner encodings
  *       fall through (`pop %rsp` — dep_x86_stack_pop emits slots per
@@ -110,19 +107,18 @@ public:
          * own opcode map so renumbering stays harmless.  Synthetic-EA
          * classes (PREFETCH / CACHE_FLUSH / TLB_FLUSH) record their
          * effective address as a load-style memop even when the
-         * operand walker minted no static load slot; the explicit
-         * memory classes (LOAD / STORE / VEC_*) are memory insns by
-         * definition whose static counts can read 0/0 under the
-         * Capstone aarch64 access-flag bug (see the header comment). */
+         * operand walker minted no static load slot; PUSH / POP / RET
+         * cover the x86 implicit-stack corner encodings (see the
+         * header comment).  The explicit memory classes (LOAD / STORE
+         * / VEC_*) and atomics are NOT exempt — with the aarch64
+         * access-flag boundary workaround in disas/capstone.c their
+         * templates always carry static slots, and a 0/0 memory insn
+         * is a real decode failure this lint must surface. */
         std::unordered_set<uint64_t> exempt;
         for (const auto &kv : h.maps.opcode) {
             if (kv.second == "GEN_OP_PREFETCH" ||
                 kv.second == "GEN_OP_CACHE_FLUSH" ||
                 kv.second == "GEN_OP_TLB_FLUSH" ||
-                kv.second == "GEN_OP_LOAD" ||
-                kv.second == "GEN_OP_STORE" ||
-                kv.second == "GEN_OP_VEC_LOAD" ||
-                kv.second == "GEN_OP_VEC_STORE" ||
                 kv.second == "GEN_OP_PUSH" ||
                 kv.second == "GEN_OP_POP" ||
                 kv.second == "GEN_OP_RET") {
@@ -150,7 +146,7 @@ public:
                     if (seg_regs.count(r)) { writes_seg = true; break; }
                 }
                 if (I.max_dep_loads == 0 && I.max_dep_stores == 0 &&
-                    !I.is_atomic && !writes_seg && !exempt.count(I.opcode)) {
+                    !writes_seg && !exempt.count(I.opcode)) {
                     b |= MEM_IMPOSSIBLE;
                 }
                 row.push_back(b);

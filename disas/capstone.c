@@ -693,6 +693,66 @@ static bool cap_aarch64_is_buggy_shift_imm_alias(const char *mnem)
 }
 
 /*
+ * Capstone 6.0.0-Alpha7 AArch64 access-flag bug workaround.
+ *
+ * The generated per-operand table (AArch64GenCSMappingInsnOp.inc)
+ * carries CS_AC_INVALID (0) on the MEM-tagged operands of the
+ * register-offset / extended-register load-store forms (LDRWroX,
+ * STRWroX, ...: "ldr w3, [x1, x2]", "str w3, [x1, w2, uxtw #2]") and
+ * of the LSE SWP family.  Capstone's own repair pass
+ * (AArch64_correct_mem_access) patches the MEM operand from a
+ * per-instruction mem_acc fallback table, but in Alpha7 that table is
+ * CS_AC_INVALID for the same rows, so the MEM operand reaches us with
+ * access == 0.  The immediate-offset, pre/post-index, exclusive,
+ * CAS/LD<op> atomic, and vector structure forms all report correctly.
+ * Without correction the operand walker mints no static load/store
+ * slot at all for the affected instructions — the trace template
+ * claims a plain load/store/atomic cannot touch memory, dropping its
+ * address/store-data dependencies along with it.
+ *
+ * Upstream regenerated the mem_acc rows for the register-offset forms
+ * in commit e5c6e09 ("Fix AArch64 register-offset load/store memory
+ * operand access", #2802), first released in 6.0.0-Alpha8; the SWP
+ * rows are still CS_AC_INVALID on master as of 857e556 (2026-07).
+ *
+ * Infer the missing access from the mnemonic class: atomic
+ * read-modify-write families (SWP / CAS / LD<op> / ST<op>) ->
+ * READ|WRITE, other ld* -> READ, other st* -> WRITE.  Prefetch
+ * (prfm / prf*) and non-memory classes stay untouched (return 0).
+ * The caller applies this ONLY when Capstone reported access == 0,
+ * so once a Capstone bump starts reporting real access bits for
+ * these forms, its answer wins and this inference is dead code.
+ * Revisit / remove on a Capstone bump past 6.0.0-Alpha7 (the SWP
+ * rows need a fix that has not landed upstream yet).
+ */
+static unsigned cap_aarch64_infer_mem_access(const char *mnem)
+{
+    static const char *const rmw_prefixes[] = {
+        "swp", "cas",
+        "ldadd", "ldclr", "ldeor", "ldset",
+        "ldsmax", "ldsmin", "ldumax", "ldumin",
+        "stadd", "stclr", "steor", "stset",
+        "stsmax", "stsmin", "stumax", "stumin",
+    };
+
+    if (!mnem || !mnem[0]) {
+        return 0;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(rmw_prefixes); i++) {
+        if (g_str_has_prefix(mnem, rmw_prefixes[i])) {
+            return QEMU_PLUGIN_OP_ACC_READ | QEMU_PLUGIN_OP_ACC_WRITE;
+        }
+    }
+    if (g_str_has_prefix(mnem, "ld")) {
+        return QEMU_PLUGIN_OP_ACC_READ;
+    }
+    if (g_str_has_prefix(mnem, "st")) {
+        return QEMU_PLUGIN_OP_ACC_WRITE;
+    }
+    return 0;
+}
+
+/*
  * Extract per-operand detail for AArch64 into the plugin operand struct.
  */
 static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
@@ -753,6 +813,15 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
                               handle, cop->mem.index, CS_ARCH_ARM64);
             op->index_id   = cop->mem.index;
             op->imm = cop->mem.disp;
+            /* Capstone-6.0.0-Alpha7 bug: register-offset /
+             * extended-register forms and the SWP family leave the
+             * MEM operand's access empty.  Infer it from the
+             * mnemonic class — only when Capstone reported nothing,
+             * so a fixed Capstone's own access bits take precedence
+             * (see cap_aarch64_infer_mem_access). */
+            if (cop->access == 0) {
+                op->access = cap_aarch64_infer_mem_access(insn->mnemonic);
+            }
             break;
         default:
             op->type = QEMU_PLUGIN_OP_INVALID;

@@ -572,11 +572,20 @@ load-bearing — under ``exec_lock``:
     the shared seal walk, merge completion, emission.  See
     :ref:`path-builder`.
 6.  Only a normally ``SEALED`` step runs the deferred window closes
-    (icount stop and simpoint advance are both deferred to a true-BB
-    boundary so the trace covers *at least* the requested window)
-    and consumes the spec-flush latch, issuing
-    ``qemu_plugin_request_tb_flush`` once no wrong-path excursion is
-    in flight.
+    (the icount stop, the simpoint advance, and the marker / symbol
+    budget close are all deferred to a true-BB boundary so the trace
+    covers *at least* the requested window) and consumes the
+    spec-flush latch, issuing ``qemu_plugin_request_tb_flush`` once
+    no wrong-path excursion is in flight.  The deferral is also what
+    keeps the segment's tail well-formed: the budget crossing is
+    detected between the pending-seal swap and the seal phase, and a
+    close taken at that instant would emit the just-swapped current
+    TB twice (once via the segment-final flush, once as a later walk
+    of the slot) while dropping the deferred previous TB's entry
+    outright.  Deferring to the step tail lets the seal phase emit
+    the previous TB normally; the segment-final flush then drains
+    the pending-seal slot — the budget-crossing TB whose
+    instructions the window clock already counted — exactly once.
 
 **The seal walk** (``collect_finalized_bbs``; shared by the per-step
 seal, the fault-merge fold, and the segment-final flush) walks the

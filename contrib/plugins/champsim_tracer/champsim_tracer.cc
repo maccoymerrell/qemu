@@ -1886,10 +1886,19 @@ static void tw_manage_window(unsigned int cpu_index,
             ? g_trace_segments.window_stop() - g_trace_segments.window_start()
             : g_trace_segments.window_stop();
         if (g_trace_segments.is_active() && budget_now >= budget_stop) {
-            finish_trace_segment();
-            g_trace_segments.set_shutting_down();
-            g_rec_mutex_unlock(&exec_lock);
-            exit(0);
+            /* Budget reached — but this runs MID-STEP: step_events has
+             * already promoted the current TB into the pending-seal slot,
+             * while the previous TB (the slot's old occupant) is still
+             * waiting for step_seal.  Closing here would emit the current
+             * TB twice (once by the segment-final flush, once as the seal
+             * walk's already-swapped prev) and lose the previous TB's
+             * entry outright — the [body, head, head] duplicate-final-
+             * entry corruption.  Defer to the same sealed-step tail the
+             * icount window-stop uses: the seal phase first emits the
+             * deferred prev normally, then the tail's segment-final flush
+             * drains the pending-seal slot (the budget-crossing TB whose
+             * insns the clock already counted) exactly once. */
+            g_icount_shutdown_pending = true;
         }
         if (g_window_mode == PluginConfig::WIN_SYMBOL &&
             !g_trace_segments.is_active() && start_symbol) {

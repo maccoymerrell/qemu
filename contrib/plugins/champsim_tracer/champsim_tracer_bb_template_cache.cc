@@ -173,10 +173,15 @@ void TemplateStore::clear_bb_map()
 }
 
 /* Scan one class index for a chain at @tb_start_pc totalling
- * @total_n_insns canonical insns. */
+ * @total_n_insns canonical insns with byte-identical content.
+ * @insn_sizes / @insn_bytes carry the candidate TB's canonical view
+ * (MAX_INSN_BYTES stride, zero-padded); a chain whose count matches
+ * but whose bytes differ is guest-patched code sharing the VA and
+ * must NOT be reused (see the lookup_tb_chain header comment). */
 static BBTemplate *chain_index_scan(
     const std::unordered_map<uint64_t, std::vector<BBTemplate *>> &index,
-    uint64_t tb_start_pc, uint32_t total_n_insns)
+    uint64_t tb_start_pc, uint32_t total_n_insns,
+    const uint8_t *insn_sizes, const uint8_t *insn_bytes)
 {
     auto it = index.find(tb_start_pc);
     if (it == index.end()) {
@@ -184,10 +189,20 @@ static BBTemplate *chain_index_scan(
     }
     for (BBTemplate *head : it->second) {
         uint32_t sum = 0;
-        for (BBTemplate *f = head; f; f = f->next_tb_fragment) {
+        bool same = true;
+        for (BBTemplate *f = head; f && same; f = f->next_tb_fragment) {
+            if (sum + f->n_insns > total_n_insns) {
+                same = false;
+                break;
+            }
+            same = memcmp(f->insn_sizes, &insn_sizes[sum],
+                          f->n_insns) == 0 &&
+                   memcmp(f->insn_bytes,
+                          &insn_bytes[(size_t)sum * MAX_INSN_BYTES],
+                          (size_t)f->n_insns * MAX_INSN_BYTES) == 0;
             sum += f->n_insns;
         }
-        if (sum == total_n_insns) {
+        if (same && sum == total_n_insns) {
             return head;
         }
     }
@@ -195,16 +210,20 @@ static BBTemplate *chain_index_scan(
 }
 
 BBTemplate *TemplateStore::lookup_tb_chain(uint64_t tb_start_pc,
-                                             uint32_t total_n_insns)
+                                             uint32_t total_n_insns,
+                                             const uint8_t *insn_sizes,
+                                             const uint8_t *insn_bytes)
 {
     /* CODE index first: a promoted chain's SPEC-index entry is left
      * stale (see promote), so the CODE side is the authoritative one
      * whenever both hold the chain. */
     if (BBTemplate *head =
-            chain_index_scan(tb_chain_dedup_, tb_start_pc, total_n_insns)) {
+            chain_index_scan(tb_chain_dedup_, tb_start_pc, total_n_insns,
+                             insn_sizes, insn_bytes)) {
         return head;
     }
-    return chain_index_scan(spec_chain_index_, tb_start_pc, total_n_insns);
+    return chain_index_scan(spec_chain_index_, tb_start_pc, total_n_insns,
+                            insn_sizes, insn_bytes);
 }
 
 void TemplateStore::register_tb_chain(uint64_t tb_start_pc, BBTemplate *head)

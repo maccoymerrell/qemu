@@ -3329,12 +3329,15 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
     /* Persistent-template dedup: a tb_flush re-translates the same code,
      * so reuse the already-built fragment chain for this (start_pc,
-     * canonical-insn-count) instead of allocating a duplicate.  Byte
-     * identity is guaranteed by the bytes-changed/poison gate above (a TB
-     * reaching here matches its first sighting), so the chain's shape and
-     * decoded contents are identical; we only need to re-arm the JIT-level
-     * per-insn callbacks and scoreboard stores below (done every
-     * translation regardless of reuse). */
+     * canonical-insn-count, canonical bytes) instead of allocating a
+     * duplicate.  Byte identity is verified inside the lookup — the
+     * poison gate above refreshes its first-sighting cache on CP byte
+     * changes rather than invalidating chains, so guest code patching
+     * (x86 kernel alternatives) at an already-templated VA must miss
+     * here and mint a fresh chain.  On a hit the chain's shape and
+     * decoded contents are identical; we only need to re-arm the
+     * JIT-level per-insn callbacks and scoreboard stores below (done
+     * every translation regardless of reuse). */
     /* Whole-TB canonical view; each fragment passes a slice to
      * create_tb_template (groups the six parallel per-insn arrays). */
     TbInsnView tb_view = {
@@ -3345,7 +3348,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     uint64_t tb_start_pc = insn_pcs[0];
     g_mutex_lock(&data_lock);
     BBTemplate *reuse_head =
-        g_template_store.lookup_tb_chain(tb_start_pc, canonical_n_insns);
+        g_template_store.lookup_tb_chain(tb_start_pc, canonical_n_insns,
+                                         insn_sizes, insn_bytes);
     g_mutex_unlock(&data_lock);
     const bool reuse = (reuse_head != nullptr);
 

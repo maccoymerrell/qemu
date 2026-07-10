@@ -199,10 +199,19 @@ public:
      *
      * lookup_tb_chain returns the head fragment of an already-built chain
      * for a TB starting at @tb_start_pc with @total_n_insns canonical
-     * insns, or nullptr on a miss.  Byte-identity is guaranteed by the
-     * caller's bytes-changed/poison gate (a TB that reaches here has
-     * insns matching their first sighting), so (start_pc, n_insns) is a
-     * sufficient key.  The lookup consults the CODE index first, then
+     * insns whose per-insn sizes/bytes match @insn_sizes / @insn_bytes
+     * (canonical layout, MAX_INSN_BYTES stride, zero-padded), or
+     * nullptr on a miss.  Byte identity is VERIFIED here, not assumed
+     * from the caller's poison gate: that gate follows the
+     * "correct path is ground truth" rule and refreshes its
+     * first-sighting cache when CP bytes change, so guest code
+     * patching — canonically the x86 kernel's boot-time alternatives
+     * rewriting `jmp __x86_return_thunk` into `ret` at the same VA
+     * with the same canonical insn count — would otherwise reuse the
+     * stale pre-patch chain and serialize templates whose bytes the
+     * guest no longer executes (surfaced by the impossible-attribution
+     * lint as return-address pops riding on "jmp" templates).  The
+     * lookup consults the CODE index first, then
      * the SPEC index: chains of both lifetime classes are visible from
      * creation (register_tb_chain routes on the chain's class), so a CP
      * translation adopts a chain the wrong path minted first — the
@@ -212,7 +221,9 @@ public:
      * distinct-translation footprint (code size), not execution length;
      * SMC produces a new entry and leaves the dead one in place (rare,
      * bounded, never dereferenced once its QEMU TB is gone). */
-    BBTemplate *lookup_tb_chain(uint64_t tb_start_pc, uint32_t total_n_insns);
+    BBTemplate *lookup_tb_chain(uint64_t tb_start_pc, uint32_t total_n_insns,
+                                const uint8_t *insn_sizes,
+                                const uint8_t *insn_bytes);
     void        register_tb_chain(uint64_t tb_start_pc, BBTemplate *head);
 
     /* Correct-path execution notice for the chain headed by @head (the

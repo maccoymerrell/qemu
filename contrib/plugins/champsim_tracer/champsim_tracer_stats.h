@@ -92,6 +92,12 @@ struct Stats {
     uint64_t kexc_kernel_kept = 0;
     uint64_t kexc_kernel_dropped = 0;
     uint64_t kexc_write_storm = 0;
+    /* Kernel (priv!=0) TBs dropped because they executed at the target's
+     * translation-bypassing privilege level (RISC-V M-mode firmware, which
+     * satp does not govern; see g_xlate_bypass_priv).  Counted on both
+     * attribution rules (kexc on and off), separately from
+     * kexc_kernel_dropped — these TBs never consult the ownership rule. */
+    uint64_t kexc_mmode_dropped = 0;
 
     /* Per-execution attribution.  cp_* bumped at vcpu_tb_exec walking
      * the prev TB's template; wp_* inside the WP per-iteration loop.

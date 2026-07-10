@@ -1050,6 +1050,17 @@ extern TraceISA trace_isa;
 extern int cst_cap_arch;
 extern unsigned int cst_cap_mode;
 extern const char *target_name;
+/* Privilege level (normalized, 0 = user) at which the target executes
+ * WITHOUT translating through the address-space register that
+ * qemu_plugin_get_addr_space_id() reports, or -1 when every privilege
+ * level translates.  Set once during qemu_plugin_install.  At such a
+ * level the reported register is a stale bystander — execution there is
+ * firmware/monitor work that belongs to no guest address space — so the
+ * pinned-attribution path drops those TBs (see the foreign-ASID
+ * boundary in champsim_tracer_path_builder.cc).  Currently RISC-V
+ * M-mode (priv 3): M-mode fetches bypass satp entirely, so OpenSBI
+ * handling a sync SBI ecall still reads the pinned process's satp. */
+extern int g_xlate_bypass_priv;
 /* True when the guest target is big-endian (currently only MIPS BE, when
  * trace_isa==TRACE_ISA_MIPS and target_name does not end in "el").  Set
  * once during qemu_plugin_install.  qemu_plugin_read_register() returns

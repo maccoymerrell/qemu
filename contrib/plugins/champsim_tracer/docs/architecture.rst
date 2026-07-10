@@ -994,6 +994,16 @@ The pin defines both the trace filter and the window clock:
   PathBuilder's foreign-ASID boundary drops them (async excursions
   are suspended instead — see :ref:`async-exclusion`).
 
+A per-target refinement keeps the pin honest about what the
+address-space register can actually attest.  On RISC-V the highest
+privilege level does not translate through the pinned register at
+all — M-mode fetches bypass ``satp`` — so firmware handling a
+synchronous SBI call executes while the register still holds the
+pinned process's value.  Those TBs are firmware a level above the
+OS kernel, not the process's kernel work, and the attribution path
+drops them regardless of the ASID match (the ``kexc M-mode TBs
+dropped`` stat).
+
 A workload shorter than its budget emits the **end marker** (the
 same sequence shape, built on ``CST_MARKER_END_MAGIC``) just before
 it exits.  Executed in the pinned address space, it closes the

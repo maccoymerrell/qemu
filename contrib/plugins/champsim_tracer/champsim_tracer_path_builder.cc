@@ -699,7 +699,21 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
      * drives no ownership edge. */
     if (in.pinned) {
         bool drop;
-        if (!g_features.kexc) {
+        if (in.live_priv > 0 && in.live_priv == g_xlate_bypass_priv) {
+            /* Translation-bypassing privilege level (RISC-V M-mode; see
+             * g_xlate_bypass_priv in champsim_tracer.cc).  Execution here
+             * never translates through the pinned register — the live
+             * satp is a stale bystander, and matching it (or owning the
+             * excursion under kexc) says nothing about whose work this
+             * is.  It is firmware above the OS kernel, not the pinned
+             * process's kernel work, so it drops on BOTH attribution
+             * rules.  Deliberately ahead of the kexc arrows: a dropped
+             * M-mode TB neither opens nor cuts an excursion, so an
+             * S-mode excursion interrupted by a sync SBI call resumes
+             * with its ownership intact. */
+            g_stats.kexc_mmode_dropped++;
+            drop = true;
+        } else if (!g_features.kexc) {
             drop = in.live_asid != in.pinned_asid;
         } else if (in.live_priv == 0) {
             kexc_user_tb(in.live_asid);

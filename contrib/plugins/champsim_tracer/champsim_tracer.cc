@@ -217,6 +217,25 @@ static const uint64_t CST_ASID_UNPINNED = UINT64_MAX;
 static std::atomic<uint64_t> g_pinned_asid{CST_ASID_UNPINNED};
 
 /*
+ * Translation-bypassing privilege level (see champsim_tracer.h).  The pin
+ * identifies a process by the value of the target's address-space register,
+ * which presumes execution actually translates through that register.  On
+ * RISC-V the highest privilege level breaks that presumption: M-mode
+ * fetches and loads/stores bypass satp entirely (the privileged spec makes
+ * M-mode accesses untranslated regardless of satp.MODE), so firmware
+ * handling a synchronous SBI ecall executes while the pinned process's
+ * satp sits untouched in the register.  Without a gate those TBs read as
+ * "pinned + kernel" and the trace absorbs OpenSBI as the process's kernel
+ * work.  No other supported target has an equivalent level: x86 ring 0 and
+ * Arm EL1 translate through the reported register, and MIPS kernel mode —
+ * though it fetches through unmapped kseg segments — IS the level the OS
+ * serves the process's syscalls and faults at, i.e. exactly the kernel
+ * work the trace wants, where RISC-V M-mode is firmware a level above the
+ * OS kernel.
+ */
+int g_xlate_bypass_priv = -1;
+
+/*
  * User-space instruction count for the pinned process (the count set).
  * The raw insn_count inline-add stays unconditional (fast), counting every
  * TB.  When pinned, vcpu_tb_exec derives each TB's instruction count as the
@@ -3716,6 +3735,7 @@ static void append_stats_summary(GString *report, const char *label,
         { "kexc kernel TBs kept",                stats.kexc_kernel_kept },
         { "kexc kernel TBs dropped",             stats.kexc_kernel_dropped },
         { "kexc write storms",                   stats.kexc_write_storm },
+        { "kexc M-mode TBs dropped",             stats.kexc_mmode_dropped },
     };
     const struct { const char *name; uint64_t value; } bin_counters[] = {
         { "  Header bits",        stats.bin_header_bits },
@@ -4043,6 +4063,13 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     if (trace_isa == TRACE_ISA_UNKNOWN) {
         fprintf(stderr, "champsim_tracer: warning: unsupported ISA '%s', "
                 "instruction decode will be limited\n", target_name);
+    }
+
+    /* RISC-V M-mode (normalized priv 3, the raw PRV_M the target hook
+     * reports) executes with satp bypassed, so pinned attribution must
+     * exclude it — see g_xlate_bypass_priv at the pin machinery. */
+    if (trace_isa == TRACE_ISA_RISCV) {
+        g_xlate_bypass_priv = 3;
     }
 
     /* Target byte order.  The four currently-supported ISAs (x86, AArch64,

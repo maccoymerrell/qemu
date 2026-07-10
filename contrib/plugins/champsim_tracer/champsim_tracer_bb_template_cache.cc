@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <inttypes.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <string.h>
 #include <unordered_set>
@@ -1023,13 +1024,25 @@ void TemplateStore::mem_stats(FILE *out) const
      * non-.text user addresses = the wrong path wandering the mutable
      * data arena, minting a fresh CF_SINGLE_STEP template per PC. */
     uint64_t n_utext = 0, n_udata = 0, n_kernel = 0, n_one_insn = 0;
+    /* Window attribution: a pinned window's correct path stamps
+     * is_system_cp_confirmed on every TB it executes, so templates
+     * WITHOUT the stamp were never CP-executed inside the traced
+     * window — boot-time translations plus wrong-path-only mints.
+     * Their byte total is the upper bound a pin-time reclaim of
+     * pre-window templates could free. */
+    uint64_t idle_cnt = 0, idle_bytes = 0;
     for (const auto &p : tb_templates_) {
         if (!p) {
             continue;
         }
         tb_count++;
         tb_insns += p->n_insns;
-        tb_bytes += tmpl_bytes(*p);
+        uint64_t b = tmpl_bytes(*p);
+        tb_bytes += b;
+        if (!p->is_system_cp_confirmed) {
+            idle_cnt++;
+            idle_bytes += b;
+        }
         if (p->insn_fields) {
             tb_fields_bytes += (uint64_t)p->n_insns * sizeof(InsnFields) +
                                p->insn_fields_pool_bytes;
@@ -1093,6 +1106,31 @@ void TemplateStore::mem_stats(FILE *out) const
     fprintf(out, "[memstats] regions: utext=%" PRIu64 " udata=%" PRIu64
             " kernel=%" PRIu64 " one_insn=%" PRIu64 "\n",
             n_utext, n_udata, n_kernel, n_one_insn);
+    fprintf(out, "[memstats] window split: idle (never CP-executed "
+            "in-window) %" PRIu64 " tmpl %.3f GiB of %" PRIu64
+            " tmpl %.3f GiB\n",
+            idle_cnt, idle_bytes / 1073741824.0,
+            tb_count, tb_bytes / 1073741824.0);
+    /* Process-level ground truth alongside the store's own estimate:
+     * glibc arena usage (what malloc holds) and the kernel's RSS view
+     * (VmHWM = peak).  The gap between VmRSS and the store's total is
+     * everything else — QEMU's guest RAM and JIT caches, the writer's
+     * buffers, the auxiliary maps. */
+    struct mallinfo2 mi = mallinfo2();
+    fprintf(out, "[memstats] mallinfo2: arena=%.2f GiB (in-use=%.2f GiB) "
+            "mmap=%.2f GiB\n",
+            mi.arena / 1073741824.0, mi.uordblks / 1073741824.0,
+            mi.hblkhd / 1073741824.0);
+    FILE *st = fopen("/proc/self/status", "r");
+    if (st) {
+        char line[256];
+        while (fgets(line, sizeof(line), st)) {
+            if (!strncmp(line, "VmRSS:", 6) || !strncmp(line, "VmHWM:", 6)) {
+                fprintf(out, "[memstats] %s", line);
+            }
+        }
+        fclose(st);
+    }
 }
 
 uint64_t TemplateStore::reclaim_spec_templates(void)

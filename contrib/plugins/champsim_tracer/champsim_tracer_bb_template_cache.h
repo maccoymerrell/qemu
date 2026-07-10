@@ -159,6 +159,7 @@ public:
      * across tb_flush cycles).  Diagnostic for the multi-GiB heap baseline. */
     void mem_stats(FILE *out) const;
 
+
     /* Pure: return the index of the (last) branch instruction within
      * @tmpl, or -1 if @tmpl has no branch.  After delay-slot
      * normalization the branch is always the last instruction. */

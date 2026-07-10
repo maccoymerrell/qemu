@@ -12,7 +12,10 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <execinfo.h>
+#include <malloc.h>
 #include <memory>
+#include <new>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1148,6 +1151,18 @@ static void start_trace_segment(const char *label,
                 "[icount %" PRIu64 " .. %" PRIu64 "]\n",
                 label ? label : "trace", start, stop);
     }
+
+    /* CST_MEMSTATS: snapshot at segment OPEN, paired with the close-time
+     * print — the observed multi-GiB RSS (and the ulimit bad_alloc
+     * aborts) materialise in the open/first-steps window, not as
+     * gradual template growth. */
+    if (getenv("CST_MEMSTATS")) {
+        struct mallinfo2 mi = mallinfo2();
+        fprintf(stderr, "[memstats] at segment open: arena=%.2f GiB "
+                "(in-use=%.2f GiB) mmap=%.2f GiB\n",
+                mi.arena / 1073741824.0, mi.uordblks / 1073741824.0,
+                mi.hblkhd / 1073741824.0);
+    }
 }
 
 /* Pick the bucket matching @icount; null when histograms are disabled
@@ -1477,6 +1492,11 @@ static void finish_trace_segment(void)
         g_mutex_unlock(&data_lock);
         fprintf(stderr, "[memstats] first_insn_word=%zu poisoned=%zu\n",
                 g_first_insn_word.size(), g_poisoned_pcs.size());
+        fprintf(stderr, "[memstats] branch_history: %zu records "
+                "(~%.2f GiB est)\n",
+                g_branch_history.size(),
+                g_branch_history.size() *
+                    (sizeof(BranchRecord) + 48.0) / 1073741824.0);
     }
 
     /* Mirror is_active=0 into every vCPU's scoreboard slot so the
@@ -4268,11 +4288,34 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
 
 /* ========================= Plugin installation ========================= */
 
+/* CST_MEMSTATS one-shot allocation-failure reporter: name the caller of
+ * the C++ allocation that tripped the ulimit (the intermittent
+ * segment-open bad_alloc aborts), then clear the handler so the retry
+ * throws bad_alloc on the normal path.  Best effort — backtrace() may
+ * itself fail under a hard address-space limit. */
+static void memstats_new_failure_handler()
+{
+    std::set_new_handler(nullptr);
+    struct mallinfo2 mi = mallinfo2();
+    fprintf(stderr, "[memstats] C++ allocation FAILED: arena=%.2f GiB "
+            "(in-use=%.2f GiB) mmap=%.2f GiB — backtrace:\n",
+            mi.arena / 1073741824.0, mi.uordblks / 1073741824.0,
+            mi.hblkhd / 1073741824.0);
+    void *bt[64];
+    int n = backtrace(bt, 64);
+    backtrace_symbols_fd(bt, n, fileno(stderr));
+    fflush(stderr);
+}
+
 QEMU_PLUGIN_EXPORT
 int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                         int argc, char **argv)
 {
     target_name = info->target_name;
+
+    if (getenv("CST_MEMSTATS")) {
+        std::set_new_handler(memstats_new_failure_handler);
+    }
 
     /* Resolve ISA from target_name via the per-ISA prefix tables. */
     trace_isa = TRACE_ISA_UNKNOWN;

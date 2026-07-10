@@ -923,13 +923,56 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
     /* Depth pipeline + fault-entry classification: only steps that
      * survive every gate consume the retained events. */
     bool prev_stashed = false;
+    /* Architectural-successor override for a synchronous fault that
+     * interposed between prev and cur.  A FAULT_ENTER whose resume PC
+     * lies outside the deferred prev is case (c): the fetch of prev's
+     * successor missed (or a resume suffix's refetch re-faulted before
+     * its exec callback), so the TB executing now is the fault HANDLER
+     * — not where prev's control flow architecturally went.  Sealing
+     * prev against the scoreboard's current_pc would then attribute
+     * the branch edge to the handler's entry PC: a taken conditional's
+     * template taken_pc records the handler (breaking the decoder's
+     * chain walk at the real target), a fall-through fetch-miss
+     * flips the recorded direction to "taken", and a handler-tail
+     * ERET whose refetch re-faults records the next excursion's
+     * handler entry as its own target.  The event's resume PC IS the
+     * successor — the PC the CPU attempted after prev and re-executes
+     * after the excursion — so the first FAULT_ENTER taken OUTSIDE an
+     * async window supplies the seal's successor.  In-window entries
+     * are excluded content interposed by an interrupt, not prev's
+     * edge; the async machinery already seals prev against the
+     * window's departure PC. */
+    uint64_t fault_resume_pc = 0;
     if (!primed_) {
         prime_from_live();
         pending_evs_.clear();   /* priming swallow */
     } else {
+        /* Async-window state at the head of the retained batch: the
+         * step survived to the seal phase, so any window the batch
+         * opened is closed again by its end; a batch whose FIRST async
+         * edge is a RETURN was inside a window from the start (its
+         * earlier events are in-window). */
+        bool ev_in_async = false;
         for (const struct qemu_plugin_cpu_event &ev : pending_evs_) {
+            if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_RETURN) {
+                ev_in_async = true;
+                break;
+            }
+            if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER) {
+                break;
+            }
+        }
+        for (const struct qemu_plugin_cpu_event &ev : pending_evs_) {
+            if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER) {
+                ev_in_async = true;
+            } else if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_RETURN) {
+                ev_in_async = false;
+            }
             if (ev.kind == QEMU_PLUGIN_CPU_EV_FAULT_ENTER) {
                 raw_depth_ = ev.depth_after;
+                if (fault_on && !ev_in_async && fault_resume_pc == 0) {
+                    fault_resume_pc = ev.pc;
+                }
                 if (pb_diag()) {
                     fprintf(stderr, "[pathbuilder] ENTRY resume=0x%" PRIx64
                             " depth=%u asid=0x%" PRIx64 " priv=%u\n",
@@ -950,9 +993,25 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
              * or the fault classifier. */
         }
         pending_evs_.clear();
-        /* Baselined, 0-clamped depth the CURRENT TB runs at (raw can drop
-         * below the segment baseline when a pre-segment fault returns
-         * inside the segment). */
+        /* Baselined, 0-clamped depth the CURRENT TB runs at.  Raw can
+         * drop below the segment baseline when a pre-segment fault
+         * returns inside the segment; when it does, the baseline
+         * RE-FLOORS to the new raw depth rather than clamping forever.
+         * The distinction matters because the pre-segment frames under
+         * the baseline are not all live excursions: a non-LIFO guest
+         * return (a context switch inside a blocking fault resuming the
+         * outer task first) never pops its frame, so a busy boot leaves
+         * STALE frames on the per-vCPU stack and the prime baselines
+         * them in.  When an unrelated in-segment exception return later
+         * matches such a frame's resume PC, the pop drops raw below
+         * base permanently — without the re-floor, every later
+         * excursion's depth clamps to 0 for the rest of the segment
+         * (observed: depth-0 TLB-refill handler entries followed by a
+         * merged faulting BB whose anchors then violate the depth-
+         * nesting invariant). */
+        if (raw_depth_ < base_depth_) {
+            base_depth_ = raw_depth_;
+        }
         depth_next_ = raw_depth_ > base_depth_ ? raw_depth_ - base_depth_ : 0;
     }
 
@@ -985,9 +1044,16 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
     /* The stuck-window recovery substitutes the abandoned window's
      * departure PC for the scoreboard's current_pc: the TB executing
      * now belongs to another guest thread, and prev's successor is
-     * where its own interrupted flow would have resumed. */
+     * where its own interrupted flow would have resumed.  With no
+     * recovery in play, a case-(c) fault entry substitutes its resume
+     * PC the same way: the TB executing now is the fault handler, and
+     * prev's successor is the PC whose fetch faulted (see the
+     * fault_resume_pc derivation above).  Reaching the walk with
+     * fault_resume_pc set implies every entry this step classified as
+     * case (c) — the stash cases returned STASHED just above. */
     uint64_t seal_current_pc = seal_pc_override_ ? seal_pc_override_
-                                                 : in.current_pc;
+                             : fault_resume_pc  ? fault_resume_pc
+                                                : in.current_pc;
     seal_pc_override_ = 0;
     std::vector<PendingEmit> pending_emits;
     bool any_finalize = collect_finalized_bbs(in.cpu_index, walk_prev_,

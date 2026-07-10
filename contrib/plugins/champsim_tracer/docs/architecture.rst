@@ -709,7 +709,18 @@ fault events exactly once, then runs the shared seal walk:
   flight across segment-open is baselined out, and events predating
   the prime are swallowed — entries before a segment's first
   surviving step never stash and never count); the baselined,
-  0-clamped difference is the depth the current TB runs at.
+  0-clamped difference is the depth the current TB runs at.  When a
+  pre-segment fault returns mid-segment and takes raw below the
+  baseline, the baseline re-floors to the new raw depth.  The
+  re-floor is load-bearing, not cosmetic: the prime also baselines
+  in *stale* pre-segment frames — a non-LIFO guest exception return
+  (a context switch inside a blocking fault resuming the outer task
+  first) never pops its frame, so a busy boot leaves them on the
+  per-vCPU stack — and when a later unrelated return matches a stale
+  frame's resume PC, the pop is permanent.  A fixed baseline would
+  clamp every subsequent excursion's depth to 0 for the rest of the
+  segment, mislabelling handler content and breaking the merged-BB
+  nesting invariant.
 * **Fault-entry classification.**  Each ``FAULT_ENTER`` is handled
   individually against the deferred prev — see
   :ref:`fault-excursions` for the three cases and the context-frame
@@ -1119,9 +1130,22 @@ against the deferred prev (see :ref:`path-builder`):
   ran.  It is folded into a serializable template (force-committing
   an incomplete head if needed) and a fresh context frame absorbs
   its memops, register snaps, and the faulting-instruction anchor.
-* **Case (c) — no action.**  The resume PC is in neither: the fault
-  hit a block whose exec callback never ran (an instruction-fetch
-  miss).  The event is consumed and prev seals normally.
+* **Case (c) — successor substitution.**  The resume PC is in
+  neither: the fault hit a block whose exec callback never ran (an
+  instruction-fetch miss on prev's successor, or a resume suffix
+  re-faulting before its own callback).  No frame is minted, but the
+  TB executing now is the fault *handler* — not where prev's control
+  flow went — so the seal substitutes the entry's resume PC for the
+  scoreboard's ``current_pc``: that PC is the architectural
+  successor (the fetch the CPU attempted after prev and re-executes
+  after the excursion).  Sealing against the handler instead would
+  record the handler's entry PC as a taken conditional's target
+  (breaking the decoder's chain walk at the real target), flip a
+  fall-through fetch-miss's direction to "taken", and poison an
+  indirect branch's observed-target pool with the handler PC.  Only
+  entries taken outside an async window qualify — an in-window fault
+  is excluded handler content, and the async machinery already seals
+  prev against the window's departure PC.
 
 A ``FAULT_RETURN`` marks its frame returnable, but emission rides
 the resume suffix's *seal*, one or more steps later: when a sealed

@@ -273,8 +273,13 @@ private:
     /* Depth pipeline: raw_depth_ tracks depth_after of the last fault
      * event; base_depth_ is the segment baseline (a fault in flight
      * across segment-open is baselined out); depth_next_ is the
-     * baselined, 0-clamped depth the CURRENT TB runs at (a pre-segment
-     * fault returning mid-segment can take raw below base). */
+     * baselined, 0-clamped depth the CURRENT TB runs at.  A pre-segment
+     * fault returning mid-segment takes raw below base; the baseline
+     * re-floors to it there — mandatory, because the prime also
+     * baselines in STALE pre-segment frames (non-LIFO guest returns
+     * never pop), and a stale frame popped by a later same-PC return
+     * would otherwise clamp every subsequent depth to 0 for the rest
+     * of the segment. */
     uint32_t depth_next_ = 0;
     uint32_t raw_depth_ = 0;
     uint32_t base_depth_ = 0;

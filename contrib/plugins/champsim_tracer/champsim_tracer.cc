@@ -264,6 +264,26 @@ static uint64_t g_user_icount = 0;       /* counted user-space insns so far */
  * rather than an UNDER underrun. */
 static bool g_seg_end_marker_close = false;
 
+/* CST_MARKER_DIAG: trace every correct-path invocation of the marker exec
+ * callbacks (plus WP-gated / step-bail counters) to stderr.  Diagnostic
+ * only — no effect on the trace. */
+static inline bool marker_diag(void)
+{
+    static std::atomic<int> v{-1};
+    int x = v.load(std::memory_order_relaxed);
+    if (x < 0) {
+        x = getenv("CST_MARKER_DIAG") ? 1 : 0;
+        v.store(x, std::memory_order_relaxed);
+    }
+    return x != 0;
+}
+static thread_local uint64_t tls_mkdiag_end_wp_gated = 0;
+static thread_local uint64_t tls_mkdiag_start_wp_gated = 0;
+/* Step-bail counters for pinned user-privilege TBs (diag): a stall of the
+ * user clock while the guest keeps running shows up here. */
+static thread_local uint64_t tls_mkdiag_susp_user = 0;
+static thread_local uint64_t tls_mkdiag_foreign_user = 0;
+
 /*
  * Reset the user clock at a pin/segment boundary.  The per-vCPU seen
  * cursors (scoreboard user_seen; each vCPU's fold computes its delta
@@ -2338,6 +2358,15 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
      * swap — in that order, before any window decision. */
     PathBuilder::StepStatus st = pb.step_events(in);
     if (st != PathBuilder::StepStatus::CONTINUE) {
+        if (in.pinned && live_priv == 0 && live_asid == pinned_asid) {
+            /* CST_MARKER_DIAG stall canaries: pinned user TBs bailing
+             * here means the user clock advances but nothing traces. */
+            if (st == PathBuilder::StepStatus::SUSPENDED) {
+                tls_mkdiag_susp_user++;
+            } else if (st == PathBuilder::StepStatus::DROPPED_FOREIGN) {
+                tls_mkdiag_foreign_user++;
+            }
+        }
         g_rec_mutex_unlock(&exec_lock);
         return;
     }
@@ -2990,7 +3019,19 @@ static inline bool marker_exec_step(MarkerExecRun *r, uint64_t pc,
 
 static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
 {
-    if (g_wp_state.in_progress) {
+    /* Wrong-path fence, two independent gates: the QEMU-side per-vCPU
+     * spec-mode flag is the ground truth for *this execution* (a
+     * speculative invocation observes it regardless of which thread's
+     * TLS the callback happens to read), and the per-thread session
+     * flag covers the walker's bracketing on the owning thread.
+     * Marker detection is a correct-path fact — speculation routinely
+     * runs the marker bytes (the wrong path of a spin-wait branch
+     * falls straight into the END sequence), so a leak past this
+     * fence opens/closes windows from wrong-path execution (observed:
+     * a 2 M-insn SMP window closed "END" after 385 k user insns,
+     * mid-loop, end-marker template exec_cp=0 / exec_wp=98722). */
+    if (qemu_plugin_in_spec_mode() || g_wp_state.in_progress) {
+        tls_mkdiag_start_wp_gated++;
         return;
     }
     uint64_t pc;
@@ -3094,12 +3135,27 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
 static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
 {
     (void)cpu_index;
-    if (g_wp_state.in_progress) {
+    /* Wrong-path fence — see vcpu_marker_cb. */
+    if (qemu_plugin_in_spec_mode() || g_wp_state.in_progress) {
+        tls_mkdiag_end_wp_gated++;
         return;
     }
     uint64_t pc;
     uint8_t size;
     marker_udata_unpack(udata, &pc, &size);
+    if (marker_diag()) {
+        fprintf(stderr, "[mkdiag] end-cb CP cpu=%u pc=0x%" PRIx64
+                " sz=%u priv=%d asid=0x%" PRIx64 " pinned=0x%" PRIx64
+                " run=%u next=0x%" PRIx64 " user=%" PRIu64
+                " wp_gated=%" PRIu64 " susp_u=%" PRIu64
+                " foreign_u=%" PRIu64 "\n",
+                cpu_index, pc, size, qemu_plugin_get_priv_level(),
+                qemu_plugin_get_addr_space_id(),
+                g_pinned_asid.load(std::memory_order_relaxed),
+                tls_marker_end_run.run, tls_marker_end_run.next_pc,
+                g_user_icount, tls_mkdiag_end_wp_gated,
+                tls_mkdiag_susp_user, tls_mkdiag_foreign_user);
+    }
     if (!marker_exec_step(&tls_marker_end_run, pc, size)) {
         return;
     }
@@ -3325,8 +3381,19 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
          * callback on its LAST instruction.  Each counter tracks the
          * sequence position reached in this TB's straight-line stream;
          * arming on the final insn means that when it executes, the whole
-         * sequence ran before it.  Registered at every translation so the
-         * marker is caught wherever the process runs. */
+         * sequence ran before it.  Registered at every translation —
+         * wrong-path (spec-born) ones included — so the marker is caught
+         * wherever the process runs; the wrong-path fence lives in the
+         * callbacks (see vcpu_marker_cb), which drop every speculative
+         * invocation on the QEMU-side spec-mode flag before touching the
+         * adjacency run.  Suppressing the registration on spec-born
+         * translations instead is NOT equivalent: it changes the WP
+         * translations' instrumentation shape, and an A/B pair on the
+         * SMP thread_test showed that variant livelocking the guest
+         * right after segment open (one vCPU pinned in a userspace spin
+         * below every plugin callback) while this registration-
+         * preserving build completes — a QEMU-base interaction
+         * preserved under mkclose_bug1/ab for follow-up. */
         if (marker_scan_enabled() && g_marker_seq.valid) {
             /* Arm the exec callback on every insn whose bytes belong to a
              * marker sequence; the callback judges consecutivity in the

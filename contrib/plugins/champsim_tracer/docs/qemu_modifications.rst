@@ -84,6 +84,11 @@ Plugin API additions
      departure PC is never fetched again); the plugin invokes it only
      when the pinned process is observed at user privilege, which is
      definitionally outside any handler.
+   * ``qemu_plugin_in_spec_mode`` — the executing vCPU's speculative
+     (wrong-path) mode flag, read from the vCPU itself.  The marker
+     open/close callbacks gate on it so an invocation fired by a
+     speculative execution is dropped on the QEMU-side ground truth,
+     independent of any plugin thread-local session state.
    * ``qemu_plugin_vclock_pause`` / ``qemu_plugin_vclock_resume`` —
      nestable guest-virtual-clock freeze for plugin instrumentation
      windows (see *Guest-time transparency*, below).

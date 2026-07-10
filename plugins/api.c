@@ -814,6 +814,11 @@ bool qemu_plugin_in_async_int(void)
 #endif
 }
 
+bool qemu_plugin_in_spec_mode(void)
+{
+    return current_cpu && current_cpu->plugin_spec_mode;
+}
+
 /* The wire and plugin-facing event layouts are kept field-for-field
  * identical; the drain below converts explicitly all the same, so a
  * layout drift shows up as a compile break here rather than corruption.

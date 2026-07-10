@@ -971,9 +971,31 @@ same number of times.  Rewriting the same register with a value it
 already holds is work no compiler emits, so the sequence cannot
 occur in real code by accident; and it needs no ELF symbols, no
 host icount, and no guest-kernel modification.  ``vcpu_tb_trans``
-recognizes the byte run inside a single TB and arms a one-shot exec
-callback on its last instruction, so when that callback fires the
-whole sequence has executed.
+arms an exec callback on every instruction whose bytes match a
+marker word; the callbacks judge consecutivity at execution time by
+user-space PC adjacency (same address space, user privilege, each
+insn at the PC immediately after the previous one), so detection is
+independent of how translation slices the sequence into TBs.
+
+Marker detection is a correct-path fact, and the wrong path is
+fenced out of it at the callback level by two independent gates:
+the QEMU-side per-vCPU spec-mode flag
+(``qemu_plugin_in_spec_mode()`` — the ground truth for the
+*executing* vCPU, visible to a speculative invocation regardless of
+which thread's TLS the callback reads) and the per-thread
+``g_wp_state.in_progress`` session flag.  Speculation routinely runs
+the marker bytes — the wrong path of a spin-wait branch falls
+straight into the END sequence on every excursion — so an invocation
+that leaked past the fence could advance the adjacency run, or
+complete it, from wrong-path execution.  The callbacks stay
+*registered* on every translation, spec-born ones included: the
+fence is in the callback, not the registration, because suppressing
+registration on wrong-path translations changes their
+instrumentation shape and was observed (A/B on the SMP thread_test)
+to livelock the guest at segment open through a QEMU-base
+interaction.  ``CST_MARKER_DIAG=1`` prints every correct-path
+marker-callback invocation (plus WP-gated and step-bail counters)
+for triage.
 
 The marker must execute *inside the target's own address space* —
 it is compiled into the workload (or injected at its entry point),

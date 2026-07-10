@@ -1472,6 +1472,20 @@ void qemu_plugin_vclock_resume(void);
 QEMU_PLUGIN_API
 bool qemu_plugin_in_async_int(void);
 
+/**
+ * qemu_plugin_in_spec_mode() - is the vCPU executing speculatively?
+ *
+ * Returns true while the executing vCPU is inside a plugin-driven
+ * speculative (wrong-path) session — between qemu_plugin_spec_mode_begin()
+ * and qemu_plugin_spec_mode_end().  This is the QEMU-side ground truth for
+ * the mode, read from the vCPU itself: a callback fired by a speculative
+ * execution observes true here even if the plugin's own thread-local
+ * session state is not visible to the invoking context.  False when no
+ * vCPU is current.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_in_spec_mode(void);
+
 /*
  * Ordered per-vCPU path events — the event-stream alternative to
  * edge-detecting the accumulated fault/async state above.  Each fault

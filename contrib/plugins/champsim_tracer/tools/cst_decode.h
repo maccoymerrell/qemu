@@ -24,6 +24,7 @@
 
 #include "cst_common.h"
 #include "cst_format.h"
+#include "cst_lint.h"
 #include "cst_reader.h"
 
 namespace cst {
@@ -111,6 +112,11 @@ public:
     void set_max_entries(uint64_t n) { max_entries_ = n; }
 
     const BodyStats &stats() const { return stats_; }
+
+    /* Impossible-attribution lint (see cst_lint.h).  Populated on the
+     * batch walk() path only — CP entries checked, WP chains and
+     * IFRAMEs exempt.  Zero counters on a conformant trace. */
+    const AttributionLint &lint() const { return lint_; }
 
     /* Walk every body record once.  @cb is invoked with each
      * BODY_TAG_ENTRY's fully-decoded entry; IFRAME records validate
@@ -274,7 +280,9 @@ private:
      * applies record deltas to the per-template state block and
      * collects per-entry EXTRA_* vectors; pass 2 walks the template
      * insns and materialises dyn_params / reg_snaps / metaflags /
-     * lane_masks. */
+     * lane_masks.  @lint non-null only for CP ENTRY sections: pass 1
+     * flags dst-reg records on impossible operand slots, pass 2 flags
+     * runtime memop counts on memop-incapable insns. */
     void decode_field_delta(Reader &outer, uint32_t template_id,
                             const Template *tmpl,
                             FieldStateTable &state,
@@ -282,7 +290,8 @@ private:
                             std::vector<DynParam>       *dyn_params,
                             std::vector<RegSnap>        *reg_snaps,
                             std::vector<MetaFlagsEntry> *metaflags,
-                            std::vector<LaneMaskEntry>  *lane_masks);
+                            std::vector<LaneMaskEntry>  *lane_masks,
+                            AttributionLint             *lint);
 
     /* Compute the template-default for FID_INSN_* fields (those whose
      * baseline is the template's static value).  Returns Wide{} for
@@ -307,6 +316,7 @@ private:
      * FID_LUT_SIZE (covers the ULEB-encoded fid space). */
     std::array<uint16_t, FID_LUT_SIZE> slot_lut_{};
     BodyStats stats_;
+    AttributionLint lint_;
 };
 
 /*

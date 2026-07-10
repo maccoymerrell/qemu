@@ -58,6 +58,14 @@ struct Stats {
      * still surfacing here indicates a leak).  Dropped at drain
      * instead of mis-slotted onto insn 0. */
     uint64_t cp_orphan_mem_accesses = 0;
+    /* CP memops whose insn_pc DID match a template slot, but the slot's
+     * instruction cannot physically touch memory (static max loads and
+     * stores both zero; atomics and synthetic-EA opcode classes
+     * exempt).  The memop is still emitted — the trace records what
+     * was observed — but a nonzero count means attribution corruption
+     * upstream of the drain, the class the offline lint (cst_lint.h)
+     * fails traces on. */
+    uint64_t cp_impossible_slot_memops = 0;
 
     /* Binary writer byte-count breakdown. */
     uint64_t bin_total_bits = 0;

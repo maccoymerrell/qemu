@@ -2222,6 +2222,7 @@ struct Options {
     bool        show_objdump   = false;
     bool        show_deps      = false;
     bool        show_lanes     = false;
+    bool        strict         = false;
     uint64_t    max_entries    = 0;        /* 0 = unbounded */
 };
 
@@ -2229,7 +2230,8 @@ void print_usage(FILE *err, const char *argv0)
 {
     std::fprintf(err,
         "usage: %s [--format=disasm|legacy|raw] [--templates-only] "
-        "[--objdump] [--show-deps] [--show-lanes] [--max N] <trace.cst>\n"
+        "[--objdump] [--show-deps] [--show-lanes] [--strict] [--max N] "
+        "<trace.cst>\n"
         "  --format=raw      pseudo-wire structural dump: every field,\n"
         "                    record, and section in decode order with\n"
         "                    byte offsets + format-spec step refs (debug)\n"
@@ -2243,6 +2245,11 @@ void print_usage(FILE *err, const char *argv0)
         "  --show-lanes      annotate each vec operand with its lane set\n"
         "                    ({0..3,6}), split memop -> dst arrows by\n"
         "                    per-source lane contribution when disjoint\n"
+        "  --strict          fail (exit 1, summary on stderr) when any\n"
+        "                    CP observation is attributed to an insn\n"
+        "                    that cannot produce it (memop on a\n"
+        "                    memop-incapable insn, dst-reg value on a\n"
+        "                    nonexistent operand slot)\n"
         "  --max N           stop after N body entries (tears the\n"
         "                    decompressor subprocess down early)\n",
         argv0);
@@ -2267,6 +2274,8 @@ int parse_options(int argc, char **argv, Options *opts)
             opts->show_deps = true;
         } else if (std::strcmp(a, "--show-lanes") == 0) {
             opts->show_lanes = true;
+        } else if (std::strcmp(a, "--strict") == 0) {
+            opts->strict = true;
         } else if (std::strncmp(a, "--max=", 6) == 0) {
             opts->max_entries = std::strtoull(a + 6, nullptr, 10);
         } else if (std::strcmp(a, "--max") == 0 && i + 1 < argc) {
@@ -2331,6 +2340,22 @@ int run_body_render(const Options &opts, const cst::Header &h,
         opts.max_entries != 0 &&
         walker.stats().cp_entries >= opts.max_entries;
     if (!stopped_early) body_stream->finalize();
+
+    /* Impossible-attribution lint (cst_lint.h).  Silent on a clean
+     * trace so the rendered output stays byte-identical; a corrupt
+     * trace gets a trailing summary comment, and --strict escalates
+     * to stderr + a nonzero exit. */
+    const cst::AttributionLint &lint = walker.lint();
+    if (lint.any()) {
+        if (opts.strict) {
+            std::fprintf(stderr,
+                         "cst_decode: impossible attributions: %s\n",
+                         lint.summary().c_str());
+            return 1;
+        }
+        std::fprintf(stdout, "; impossible attributions: %s\n",
+                     lint.summary().c_str());
+    }
     return 0;
 }
 

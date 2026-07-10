@@ -6,6 +6,7 @@
 
 #include <string.h>
 
+#include "champsim_tracer_bb_chain_assembler.h"
 #include "champsim_tracer_mem_access_recorder.h"
 #include "champsim_tracer_stats.h"
 #include "champsim_tracer_trace_segment_manager.h"
@@ -263,7 +264,60 @@ void MemAccessRecorder::drain_cp_into_dyn_params(
         idx = 0;
         return -1;
     };
+    /*
+     * Impossibility check at emit, mirroring the offline lint
+     * (tools/cst_lint.h): a memop resolving to a slot whose insn has
+     * static max loads AND stores both zero cannot be that insn's own
+     * traffic.  Exempt (see cst_lint.h for the full rationale):
+     * atomics and the explicit memory classes (Capstone 6.0.0-Alpha7
+     * leaves aarch64 register-offset / LSE-atomic MEM access flags
+     * empty), PUSH / POP / RET (implicit stack traffic; corner
+     * encodings like `pop %rsp` and `iretq` carry no static slot),
+     * segment-register writers (the descriptor fetch QEMU's
+     * segment-load helper performs is that mov's own load), and the
+     * synthetic-EA classes (record_synthetic_load mints load-style
+     * memops with no static slot).  A few byte tests on the hot path,
+     * reached only for slots whose static counts are already zero.
+     */
+    static std::atomic<uint32_t> impossible_warned_gen{0};
+    auto note_impossible_slot = [&](int slot) {
+        const InsnFields *f = bb_tmpl->insn_fields
+            ? &bb_tmpl->insn_fields[slot] : nullptr;
+        if (!f || f->max_dep_loads != 0 || f->max_dep_stores != 0 ||
+            f->is_atomic ||
+            f->opcode == GEN_OP_LOAD ||
+            f->opcode == GEN_OP_STORE ||
+            f->opcode == GEN_OP_VEC_LOAD ||
+            f->opcode == GEN_OP_VEC_STORE ||
+            f->opcode == GEN_OP_PUSH ||
+            f->opcode == GEN_OP_POP ||
+            f->opcode == GEN_OP_RET ||
+            f->opcode == GEN_OP_PREFETCH ||
+            f->opcode == GEN_OP_CACHE_FLUSH ||
+            f->opcode == GEN_OP_TLB_FLUSH) {
+            return;
+        }
+        for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+            if (f->dst_regs[d] >= REG_SEG0 && f->dst_regs[d] < REG_SEG0 + 6) {
+                return;
+            }
+        }
+        thread_stats_get().cp_impossible_slot_memops++;
+        uint32_t gen = g_segment_generation.load(std::memory_order_relaxed);
+        uint32_t seen = impossible_warned_gen.load(std::memory_order_relaxed);
+        if (seen != gen &&
+            impossible_warned_gen.compare_exchange_strong(seen, gen)) {
+            fprintf(stderr,
+                    "champsim_tracer: WARNING memop attributed to a "
+                    "memop-incapable insn (template %u insn[%d] "
+                    "pc=0x%" PRIx64 ") — attribution corruption "
+                    "upstream of the drain; counted in "
+                    "cp_impossible_slot_memops (once per segment)\n",
+                    bb_tmpl->template_id, slot, bb_tmpl->insn_pcs[slot]);
+        }
+    };
     auto push_dp = [&](const WPMemAccess &acc, int slot) {
+        note_impossible_slot(slot);
         DynParam dp = {
             .type = (uint8_t)(acc.is_store ? DYN_STORE_ADDR : DYN_LOAD_ADDR),
             .insn_index = (uint16_t)slot,

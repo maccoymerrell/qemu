@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "cst_format.h"
+#include "cst_lint.h"
 #include "cst_reader.h"
 
 namespace {
@@ -259,18 +260,58 @@ void account_header(cst::MemberView hv, const cst::ResolvedIds &ids,
     }
 }
 
+/* Impossible-attribution lint context for one CP field-delta section
+ * (cst_lint.h).  Null for WP sections — wrong-path wandering is not
+ * held to the CP attribution contract. */
+struct LintCtx {
+    cst::AttributionLint               *lint;
+    cst::AttributionLint::DeltaTracker *tracker;
+    const std::vector<uint8_t>         *row;      /* template caps row */
+    uint32_t                            thread;
+    uint32_t                            template_id;
+    uint64_t                            entry_ordinal;  /* debug locator */
+};
+
 /* Tally one field-delta record's bytes into @fd_b.  Format 0x1D:
  * fid is ULEB128, every record carries a single SLEB_WIDE delta (up
  * to 512 bits) walked by skip_varint (no overflow guard). */
 static inline void tally_fd_record(
     cst::Reader &sec, const FidTables &fid, const cst::ResolvedIds &ids,
     std::array<Bucket, NUM_BUCKETS> *fd_b,
-    uint32_t *ipos, const cst::Template *tmpl, bool is_wp, Stats *s)
+    uint32_t *ipos, const cst::Template *tmpl, bool is_wp, Stats *s,
+    const LintCtx *lctx)
 {
     size_t before = sec.consumed();
     *ipos += (uint32_t)sec.uleb();           /* ipos delta (accumulates) */
     uint64_t f = sec.uleb();                 /* fid (ULEB128) */
-    sec.skip_varint();                       /* sleb_wide delta */
+
+    /* Reg-side lint: a dst-reg VALUE record naming an operand slot the
+     * template's insn does not carry (or an insn past the template) is
+     * an impossible attribution — the writer never emits such records. */
+    if (lctx && lctx->row && lctx->lint->reg_check_enabled()) {
+        int slot = (f < FidTables::LUT_SIZE) ? fid.dst_slot[f] : -1;
+        if (slot >= 0 &&
+            (*ipos >= lctx->row->size() ||
+             slot >= (int)((*lctx->row)[*ipos] &
+                           cst::AttributionLint::N_DST_MASK))) {
+            lctx->lint->note_reg(lctx->template_id, *ipos);
+        }
+    }
+
+    /* Mem-side lint: N_LOADS/N_STORES deltas landing on an insn whose
+     * static max memop counts are both zero feed the tracker's cell
+     * reconstruction; every other record keeps the skip fast path. */
+    if (lctx && lctx->row &&
+        (f == ids.fid_n_loads || f == ids.fid_n_stores) &&
+        *ipos < lctx->row->size() &&
+        ((*lctx->row)[*ipos] & cst::AttributionLint::MEM_IMPOSSIBLE)) {
+        std::array<uint64_t, 8> wd = sec.sleb_wide();  /* same bytes */
+        lctx->tracker->on_count_delta(lctx->thread, lctx->template_id,
+                                      *ipos, f == ids.fid_n_stores,
+                                      wd[0], lctx->entry_ordinal);
+    } else {
+        sec.skip_varint();                   /* sleb_wide delta */
+    }
     if (f == ids.fid_extended) sec.skip_varint();
     int idx = fid.bucket_for((unsigned)f);
     uint64_t nbytes = sec.consumed() - before;
@@ -300,7 +341,7 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                const std::unordered_map<uint32_t, uint32_t> &insns_by_tid,
                const std::vector<cst::Template> &templates,
                const std::unordered_map<uint32_t, size_t> &by_id,
-               Stats *s)
+               Stats *s, cst::AttributionLint *lint)
 {
     const bool have_wp = (header_flags & ids.flag_wp) != 0;
     const bool have_fault = (ids.flag_fault != 0) &&
@@ -313,6 +354,12 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
     int32_t prev_cp_tid = 0;
     auto &cpfd_b = s->cp_fd;
     auto &wpfd_b = s->wp_fd;
+
+    /* Impossible-attribution lint over the CP stream.  The count
+     * cells are per-guest-thread writer state, so mirror the
+     * decoder's thread tracking off the THREAD_SWITCH records. */
+    cst::AttributionLint::DeltaTracker tracker(*lint);
+    int32_t current_thread = 0;
 
     while (!body.eof()) {
         size_t tag_start = body.consumed();
@@ -355,14 +402,26 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
             cpfd_b[BIDX_OVERHEAD].count += 1;
 
             const cst::Template *cp_tmpl = tmpl_for(prev_cp_tid);
+            LintCtx lctx = {
+                lint, &tracker, lint->row((uint32_t)prev_cp_tid),
+                (uint32_t)current_thread, (uint32_t)prev_cp_tid,
+                s->cp_entries,
+            };
             uint32_t cp_ipos = 0;
             for (uint64_t r = 0; r < n_records; r++) {
                 tally_fd_record(sec, fid, ids, &cpfd_b,
-                                &cp_ipos, cp_tmpl, /*is_wp=*/false, s);
+                                &cp_ipos, cp_tmpl, /*is_wp=*/false, s,
+                                &lctx);
             }
             if (sec.consumed() != sec_end) {
                 throw std::runtime_error("CP field-delta had trailing bytes");
             }
+            /* Per-entry lint accounting: counts are persistent cells,
+             * so a violating insn stays violating on every subsequent
+             * entry of its template until a delta zeroes it — matching
+             * what the decoder's resolved cells would report. */
+            tracker.on_cp_entry_end((uint32_t)current_thread,
+                                    (uint32_t)prev_cp_tid);
 
             /* Per-entry sync-fault trailer (CST_FLAG_FAULT): exception-nesting
              * depth ULEB, between the CP delta and the WP sections.  Charge
@@ -427,7 +486,8 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                 uint32_t wp_ipos = 0;
                 for (uint64_t r = 0; r < wp_nrec; r++) {
                     tally_fd_record(wpsec, fid, ids, &wpfd_b,
-                                    &wp_ipos, wp_tmpl, /*is_wp=*/true, s);
+                                    &wp_ipos, wp_tmpl, /*is_wp=*/true, s,
+                                    /*lctx=*/nullptr);
                 }
                 if (wpsec.consumed() != wp_sec_end) {
                     throw std::runtime_error("WP field-delta had trailing bytes");
@@ -447,7 +507,7 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
         }
 
         if (tag == ids.body_tag_thread_switch) {
-            body.sleb();                 /* signed delta */
+            current_thread += (int32_t)body.sleb();   /* signed delta */
             s->thread_switch.bytes += body.consumed() - tag_start;
             s->thread_switch.count += 1;
             continue;
@@ -819,9 +879,10 @@ int main(int argc, char **argv)
                     (unsigned long long)prof_pat[2],
                     (unsigned long long)prof_pat[3]);
 
+        cst::AttributionLint lint(h, templates);
         try {
             walk_body(body_stream->reader(), h.ids, h.flags,
-                      insns_by_tid, templates, by_id, &s);
+                      insns_by_tid, templates, by_id, &s, &lint);
         } catch (const std::exception &e) {
             std::fprintf(stderr,
                 "cst_audit: body walk failed at cp_entries=%lu wp_entries=%lu thread_switches=%lu iframes=%lu: %s\n",
@@ -845,6 +906,19 @@ int main(int argc, char **argv)
                      + s.body_terminator;
 
         print_report(s, h);
+
+        /* Impossible-attribution lint verdict (cst_lint.h): always
+         * printed, and a nonzero count fails the audit — a corrupt
+         * trace must not exit 0. */
+        std::printf("\n=== ATTRIBUTION LINT ===\n");
+        std::printf("  impossible attributions: %s\n",
+                    lint.summary().c_str());
+        if (lint.any()) {
+            std::fprintf(stderr,
+                         "cst_audit: FAIL: impossible attributions: %s\n",
+                         lint.summary().c_str());
+            return 1;
+        }
     } catch (const std::exception &e) {
         std::fprintf(stderr, "cst_audit: %s\n", e.what());
         return 1;

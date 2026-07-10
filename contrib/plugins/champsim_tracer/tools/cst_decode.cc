@@ -376,7 +376,8 @@ BodyWalker::BodyWalker(const Header &header,
       body_(body),
       scalar_bits_(header.scalar_width_bits()),
       flags_(header.flags),
-      reg_flags_id_(-1)
+      reg_flags_id_(-1),
+      lint_(header, templates)
 {
     /* Resolve REG_FLAGS' id from the trace's own reg map. */
     for (const auto &kv : header.maps.reg) {
@@ -471,7 +472,7 @@ std::vector<WPEntry> BodyWalker::decode_wp_chain(
         decode_field_delta(wpb, (uint32_t)wp_tmpl, wtmpl,
                            state, base_state,
                            &we.dyn_params, &we.reg_snaps, &we.metaflags,
-                           &we.lane_masks);
+                           &we.lane_masks, /*lint=*/nullptr);
         out.push_back(std::move(we));
     }
     return out;
@@ -548,7 +549,7 @@ void BodyWalker::handle_entry(WalkState &ws, const Callback &cb)
     decode_field_delta(body_, (uint32_t)entry_tmpl, cp_tmpl,
                        cp_state, nullptr,
                        &entry.dyn_params, &entry.reg_snaps, &entry.metaflags,
-                       &entry.lane_masks);
+                       &entry.lane_masks, &lint_);
 
     /* Per-entry synchronous-fault trailer (Step 6.4a), present only when the
      * CST_FLAG_FAULT header bit is set; sits between the CP delta and the WP
@@ -623,7 +624,9 @@ void BodyWalker::handle_iframe(WalkState &ws)
                        &iframe_entry.dyn_params,
                        &iframe_entry.reg_snaps,
                        &iframe_entry.metaflags,
-                       &iframe_entry.lane_masks);
+                       &iframe_entry.lane_masks,
+                       /*lint=*/nullptr);   /* re-encodes the prev ENTRY;
+                                             * counting would double-report */
 
     /* Fault trailer, mirroring the ENTRY path (writer emits the same payload
      * for an IFRAME).  Consume to stay in sync. */
@@ -712,7 +715,11 @@ namespace {
 
 /* Pass-1 record loop: apply each non-EXTENDED delta to its
  * (state_blk, ipos, slot) cell.  Format 0x1D: fid is ULEB128, no
- * EXTRA_* overflow path. */
+ * EXTRA_* overflow path.  @lint (with @lint_row, the template's
+ * per-insn capability row) is non-null only for CP ENTRY sections:
+ * a dst-reg VALUE record naming an operand slot the template does
+ * not carry — or an insn position past the template — is an
+ * impossible attribution (the writer never emits such records). */
 void apply_record_deltas(BodyWalker &walker, Reader &sec, uint64_t n_records,
                          uint32_t template_id, const Template *tmpl,
                          const ResolvedIds &ids,
@@ -720,13 +727,24 @@ void apply_record_deltas(BodyWalker &walker, Reader &sec, uint64_t n_records,
                          FieldStateBlock *state_blk, uint32_t state_gen,
                          const FieldStateBlock *base_blk, uint32_t base_gen,
                          int scalar_bits,
-                         Wide (BodyWalker::*tmpl_default)(const Template*, uint32_t, uint8_t) const)
+                         Wide (BodyWalker::*tmpl_default)(const Template*, uint32_t, uint8_t) const,
+                         AttributionLint *lint,
+                         const std::vector<uint8_t> *lint_row)
 {
-    (void)template_id;
     uint32_t pos = 0;
     for (uint64_t i = 0; i < n_records; i++) {
         pos += (uint32_t)sec.uleb();
         uint16_t fid = (uint16_t)sec.uleb();
+
+        if (lint && lint_row && lint->reg_check_enabled()) {
+            int slot = lint->dst_slot_for_fid(fid);
+            if (slot >= 0 &&
+                (pos >= lint_row->size() ||
+                 slot >= (int)((*lint_row)[pos] &
+                               AttributionLint::N_DST_MASK))) {
+                lint->note_reg(template_id, pos);
+            }
+        }
 
         std::array<uint64_t, Wide::LIMBS> wd = sec.sleb_wide();
         if (fid == ids.fid_extended) {
@@ -845,12 +863,18 @@ void BodyWalker::decode_field_delta(Reader &outer,
                                     std::vector<DynParam>       *dyn_params,
                                     std::vector<RegSnap>        *reg_snaps,
                                     std::vector<MetaFlagsEntry> *metaflags,
-                                    std::vector<LaneMaskEntry>  *lane_masks)
+                                    std::vector<LaneMaskEntry>  *lane_masks,
+                                    AttributionLint             *lint)
 {
     SectionScope scope(outer);
     Reader &sec = scope;
     uint64_t n_records = sec.uleb();
     const ResolvedIds &ids = header_.ids;
+
+    /* Per-insn capability row for the lint checks; resolved once per
+     * section so the record loop stays hash-free. */
+    const std::vector<uint8_t> *lint_row =
+        lint ? lint->row(template_id) : nullptr;
 
     /* Resolve the per-(state,base) blocks once; the record loop
      * indexes directly rather than hashing per record. */
@@ -868,7 +892,8 @@ void BodyWalker::decode_field_delta(Reader &outer,
                         template_id, tmpl, ids, slot_lut_,
                         state_blk, state_gen, base_blk, base_gen,
                         scalar_bits_,
-                        &BodyWalker::template_default);
+                        &BodyWalker::template_default,
+                        lint, lint_row);
 
     /* Pass 2: materialise per-insn outputs.  Skipped entirely when
      * we don't have a template (decoder doesn't know the insn count). */
@@ -886,6 +911,16 @@ void BodyWalker::decode_field_delta(Reader &outer,
                                         base_blk,  base_gen,
                                         slot_lut_, idx,
                                         ids.fid_n_stores).low64();
+
+        /* Impossible attribution: a runtime memop count on an insn
+         * whose template can produce none (static max loads AND
+         * stores both zero).  The n_loads/n_stores cells were read
+         * anyway, so a conformant trace pays one flag test. */
+        if (lint && (n_loads || n_stores) && lint_row &&
+            i < lint_row->size() &&
+            ((*lint_row)[i] & AttributionLint::MEM_IMPOSSIBLE)) {
+            lint->note_mem(template_id, idx, n_loads + n_stores);
+        }
 
         if (n_loads || n_stores) {
             materialise_slotted_memops(idx, n_loads, DynParam::Load,
@@ -1069,7 +1104,8 @@ void BodyWalker::consume_field_section(Reader &outer, uint32_t template_id,
     apply_record_deltas(*this, sec, n_records, template_id, tmpl, ids,
                         slot_lut_, state_blk, state->generation,
                         base_blk, base_state ? base_state->generation : 0,
-                        scalar_bits_, &BodyWalker::template_default);
+                        scalar_bits_, &BodyWalker::template_default,
+                        /*lint=*/nullptr, /*lint_row=*/nullptr);
 }
 
 void BodyWalker::stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,

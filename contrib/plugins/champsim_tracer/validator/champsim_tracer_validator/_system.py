@@ -252,5 +252,12 @@ def system_qemu_cmd(qemu_system: Path, kernel: Path, initrd: Path,
     ]
     if smp and int(smp) > 1:
         cmd += ["-smp", str(int(smp))]
+        if isa == "mipsel":
+            # Malta SMP needs the MT ASE: the guest's CONFIG_MIPS_MT_SMP
+            # secondary bring-up runs VPE probes that corrupt the stack
+            # and panic on the default 24Kc ("stack-protector: Kernel
+            # stack is corrupted in: vsnprintf"), leaving CPU 1 offline
+            # for the whole run.  34Kf onlines both CPUs.
+            cmd += ["-cpu", "34Kf"]
     cmd += os.environ.get("CST_QEMU_EXTRA_ARGS", "").split()
     return cmd

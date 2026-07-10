@@ -3931,7 +3931,8 @@ def _check_iframe_cadence(body_stats: dict,
 
 def _check_syscall_transitions(entries: list[dict],
                                templates_by_id: dict,
-                               trace_meta: dict) -> list[Issue]:
+                               trace_meta: dict,
+                               guest_threads: int = 1) -> list[Issue]:
     """System-mode privilege-transition check (CST_INSN_FLAG_SYSTEM).
 
     A user-mode ``syscall`` transfers control to the kernel and, on
@@ -3942,12 +3943,19 @@ def _check_syscall_transitions(entries: list[dict],
           -> one or more kernel blocks          (is_system == True)
           -> a user block starting at the syscall's fall_through_pc
 
-    For every such user syscall that the trace resumes from, assert the
-    branch-out lands in the kernel and the return lands on the
-    fall-through.  The terminal process-exit syscall never returns, so a
-    syscall at end-of-trace (no following user block) is expected and not
-    flagged.  No user syscalls at all -> info (e.g. a fault-only
-    workload).
+    Resumes are matched against the *set* of outstanding syscall
+    fall-throughs rather than the single most recent one: a blocking or
+    yielding syscall legitimately context-switches to another guest
+    thread first, so its own fall-through arrives later in the
+    interleaved stream while the switch target's resume (typically that
+    thread's own outstanding fall-through) arrives now.  With
+    @guest_threads == 1 an unmatched return is an error (the flow has
+    nowhere else to legally resume); with more threads it is tolerated —
+    the switch target may have been suspended mid-flow by an excluded
+    async preemption, so its resume PC is not predictable from the
+    trace.  The terminal process-exit syscall never returns, so its
+    fall-through staying outstanding is expected.  No user syscalls at
+    all -> info (e.g. a fault-only workload).
     """
     branch_names = trace_meta.get("branch_names") or {}
     # The branch_type id naming a syscall (self-describing map; the name
@@ -3965,42 +3973,64 @@ def _check_syscall_transitions(entries: list[dict],
 
     issues: list[Issue] = []
     verified = 0
-    pending_ft: int | None = None      # fall-through we must return to
-    pending_pc: int | None = None      # the syscall block (for messages)
+    strict = guest_threads <= 1
+    outstanding: dict[int, int] = {}    # resume pc -> open count
+    out_pc: dict[int, int] = {}         # resume pc -> a syscall pc (messages)
+    pending: tuple[int, int] | None = None   # (syscall_pc, ft) of the most
+                                             # recent user block, when it
+                                             # ended in a syscall
     saw_kernel = False
     for e in entries:
         t = templates_by_id.get(e["template_id"])
         if t is None:
             continue
         is_sys = bool(t.get("is_system"))
-        if pending_ft is not None:
-            # We are between a user syscall and its return to user.
-            if is_sys:
+        if is_sys:
+            if pending is not None:
                 saw_kernel = True
-                continue
-            # First user block after the syscall: must be the fall-through.
+            continue
+        pc = int(t.get("start_pc", 0))
+        if pending is not None:
+            sy_pc, sy_ft = pending
+            pending = None
             if not saw_kernel:
                 issues.append(Issue(
                     "syscall_transitions", "error",
-                    f"user syscall at 0x{pending_pc:x} was not followed by "
+                    f"user syscall at 0x{sy_pc:x} was not followed by "
                     f"a kernel (system) block before returning to user",
-                    {"syscall_pc": pending_pc}))
-            elif int(t.get("start_pc", 0)) != pending_ft:
-                issues.append(Issue(
-                    "syscall_transitions", "error",
-                    f"syscall at 0x{pending_pc:x} returned to user at "
-                    f"0x{int(t.get('start_pc',0)):x}, expected the "
-                    f"fall-through 0x{pending_ft:x}",
-                    {"syscall_pc": pending_pc, "expected_ft": pending_ft,
-                     "got": int(t.get("start_pc", 0))}))
+                    {"syscall_pc": sy_pc}))
             else:
-                verified += 1
-            pending_ft = pending_pc = None
+                # The syscall entered the kernel; its resume is now open.
+                outstanding[sy_ft] = outstanding.get(sy_ft, 0) + 1
+                out_pc[sy_ft] = sy_pc
+                # This user block is the kernel's return target: it must
+                # resume one of the outstanding syscalls (strict mode) —
+                # in multi-thread mode a mid-flow resume of a previously
+                # preempted thread is legal.
+                if outstanding.get(pc, 0) > 0:
+                    outstanding[pc] -= 1
+                    if not outstanding[pc]:
+                        del outstanding[pc]
+                    verified += 1
+                elif strict:
+                    issues.append(Issue(
+                        "syscall_transitions", "error",
+                        f"syscall at 0x{sy_pc:x} returned to user at "
+                        f"0x{pc:x}, expected the fall-through 0x{sy_ft:x}",
+                        {"syscall_pc": sy_pc, "expected_ft": sy_ft,
+                         "got": pc}))
             saw_kernel = False
-            # fall through to let this same block start a new transition
-        if (not is_sys) and ends_in_syscall(t):
-            pending_ft = int(t.get("fall_through_pc", 0))
-            pending_pc = int(t.get("start_pc", 0))
+        elif outstanding.get(pc, 0) > 0:
+            # A user entry resuming an outstanding fall-through without
+            # kernel blocks immediately before it: the return interleaved
+            # with other threads' entries (or the excluded window hid the
+            # tail of the excursion).  Consume it.
+            outstanding[pc] -= 1
+            if not outstanding[pc]:
+                del outstanding[pc]
+            verified += 1
+        if ends_in_syscall(t):
+            pending = (pc, int(t.get("fall_through_pc", 0)))
             saw_kernel = False
 
     if issues:
@@ -4008,7 +4038,7 @@ def _check_syscall_transitions(entries: list[dict],
     return [Issue(
         "syscall_transitions", "info",
         f"verified {verified} user-syscall round-trip(s) "
-        f"(branch out to kernel + return to fall-through)"
+        f"(branch out to kernel + return to an outstanding fall-through)"
         + ("" if verified else "; none returned (terminal exit only)"),
         {"verified": verified})]
 
@@ -4523,12 +4553,21 @@ def _check_thread_record_cadence(entries: list[dict],
     return issues
 
 
-def _template_successor_pcs(t: dict) -> set[int]:
+def _template_successor_pcs(t: dict,
+                            rep_branch_id: int | None = None) -> set[int]:
     """The set of PCs a CP execution of template @t may hand control to
     next, from the trace's own data: the fall-through, the static
     terminal-branch target list, and any profile target this branch
     actually took on the correct path (covers indirect branches, whose
-    static target list is empty)."""
+    static target list is empty).
+
+    A template whose terminal instruction is the x86 ``BRANCH_REP``
+    additionally hands control to that instruction's own PC: REP
+    iterations 2..N each ride a synthetic 1-insn self-loop BB whose
+    start_pc is the REP's PC (format spec, "REP-prefixed self-loop
+    BBs"), so both the block that ENTERS a REP loop and the self-loop
+    BB itself may legitimately be followed by an entry starting there.
+    """
     s: set[int] = set()
     ft = int(t.get("fall_through_pc", 0) or 0)
     if ft:
@@ -4538,12 +4577,17 @@ def _template_successor_pcs(t: dict) -> set[int]:
     for tgt in (t.get("profile") or {}).get("targets") or []:
         if int(tgt.get("taken_cp", 0)) > 0:
             s.add(int(tgt["pc"]))
+    if rep_branch_id is not None:
+        insns = t.get("insns") or []
+        if insns and int(insns[-1].get("branch_type", 0)) == rep_branch_id:
+            s.add(int(insns[-1]["pc"]))
     return s
 
 
 def _check_thread_chain(entries: list[dict],
                         templates_by_id: dict,
-                        expected_guest_threads: int | None = None
+                        expected_guest_threads: int | None = None,
+                        trace_meta: dict | None = None
                         ) -> list[Issue]:
     """User-flow continuity of the interleaved body stream.
 
@@ -4577,6 +4621,16 @@ def _check_thread_chain(entries: list[dict],
     last_user_succ_by_tid: dict[int, set[int] | None] = {}
     tid_pairs = tid_connected = 0
 
+    # REP self-loop entries start at their predecessor's terminal REP
+    # PC; resolve BRANCH_REP's id from the trace's own encoding map so
+    # _template_successor_pcs can admit that edge.
+    rep_branch_id = None
+    if trace_meta is not None:
+        for bid, name in (trace_meta.get("branch_names") or {}).items():
+            if name == "BRANCH_REP":
+                rep_branch_id = int(bid)
+                break
+
     for e in entries:
         t = templates_by_id.get(e["template_id"])
         if t is None:
@@ -4587,7 +4641,7 @@ def _check_thread_chain(entries: list[dict],
             continue
         pc = int(t.get("start_pc", 0))
         n_user += 1
-        succ = _template_successor_pcs(t)
+        succ = _template_successor_pcs(t, rep_branch_id)
 
         hit = next((i for i, c in enumerate(contexts) if pc in c), None)
         if hit is not None:
@@ -4734,7 +4788,8 @@ def _check_user_code_identity(templates: list[dict],
 def _check_syscall_fault_nesting(entries: list[dict],
                                  templates_by_id: dict,
                                  trace_meta: dict,
-                                 require_nested: bool = False
+                                 require_nested: bool = False,
+                                 guest_threads: int = 1
                                  ) -> list[Issue]:
     """Nested-excursion discipline: a synchronous fault taken *inside* a
     syscall handler.
@@ -4747,7 +4802,14 @@ def _check_syscall_fault_nesting(entries: list[dict],
     the probe, the fault stack must behave like a stack per vCPU:
 
       * consecutive same-tid entries change depth by at most 1 (one
-        fault entered or one excursion unwound per boundary),
+        fault entered or one excursion unwound per boundary).  With
+        @guest_threads > 1 the step discipline is only asserted within a
+        privilege level: user-privilege entries carry a clamped depth 0
+        (user code is never handler content) while kernel entries carry
+        the vCPU's raw baselined depth, and a preemptible kernel that
+        context-switches inside a blocking fault handler puts another
+        thread's clamped user entries right next to raw-depth kernel
+        entries — a legitimate discontinuity at the boundary,
       * fault-anchored (whole-BB-merged) entries sit at the unwind of
         an excursion: the same tid was at a *higher* depth on the
         previous entry, or the anchor marks the merged completion of
@@ -4764,6 +4826,7 @@ def _check_syscall_fault_nesting(entries: list[dict],
     issues: list[Issue] = []
     depth_hist: Counter = Counter()
     prev_depth_by_tid: dict[int, int] = {}
+    prev_sys_by_tid: dict[int, bool] = {}
     step_errors = 0
 
     # Per-tid syscall windows: user syscall block -> kernel entries ->
@@ -4781,8 +4844,11 @@ def _check_syscall_fault_nesting(entries: list[dict],
         d = int(e.get("fault_depth", 0) or 0)
         depth_hist[d] += 1
 
+        is_sys = bool(t.get("is_system"))
         pd = prev_depth_by_tid.get(tid)
-        if pd is not None and abs(d - pd) > 1:
+        ps = prev_sys_by_tid.get(tid)
+        exempt = (guest_threads > 1 and ps is not None and ps != is_sys)
+        if pd is not None and abs(d - pd) > 1 and not exempt:
             step_errors += 1
             if step_errors <= 5:
                 issues.append(Issue(
@@ -4794,8 +4860,12 @@ def _check_syscall_fault_nesting(entries: list[dict],
         # A fault-anchored entry is the whole-BB merge of the block the
         # excursion interrupted, so it must sit at the unwind: the same
         # tid's previous entry ran one level deeper (inside the fault
-        # handler this merge is returning from).
-        if (e.get("fault_anchors") and pd is not None and pd <= d):
+        # handler this merge is returning from).  Multi-thread traces
+        # interleave guest threads on one vCPU, so the same-tid
+        # predecessor may be an unrelated thread's entry — the unwind
+        # adjacency only holds single-threaded.
+        if (guest_threads <= 1 and
+                e.get("fault_anchors") and pd is not None and pd <= d):
             issues.append(Issue(
                 "syscall_fault_nesting", "error",
                 f"entry seq={e.get('seq_num')} thread={tid} carries fault "
@@ -4804,8 +4874,8 @@ def _check_syscall_fault_nesting(entries: list[dict],
                 f"must follow its excursion's unwind",
                 {"seq_num": e.get("seq_num"), "depth": d, "prev": pd}))
         prev_depth_by_tid[tid] = d
+        prev_sys_by_tid[tid] = is_sys
 
-        is_sys = bool(t.get("is_system"))
         if in_syscall_by_tid.get(tid):
             if is_sys:
                 cur_window_max[tid] = max(cur_window_max.get(tid, 0), d)
@@ -6021,18 +6091,44 @@ def validate_structural(trace_path: Path,
     issues += _check_iframe_cadence(body_stats, entries, trace_meta)
     issues += _check_regfile_records(body_stats, expected_threads)
     issues += _check_thread_switch(body_stats, expected_threads)
-    issues += _check_thread_distribution(entries, expected_threads)
+    if marker:
+        # System-mode thread_ids are vCPU INDEXES, not a dense 0..N-1
+        # population: the pinned process runs on whichever vCPU(s) the
+        # guest scheduler picked (a serial schedule on vCPU 1 alone is
+        # legitimate).  Validate the indexes against the guest's -smp
+        # bound — the same convention the meta-driven battery uses —
+        # while @expected_threads keeps meaning the CONTRIBUTING-thread
+        # count for the regfile / switch cadence above.
+        observed_tids = sorted({int(e.get("thread_id", 0))
+                                for e in entries})
+        smp = _parse_smp_from_command(trace_meta.get("command", ""))
+        extras = [t for t in observed_tids if t >= smp]
+        if extras:
+            issues.append(Issue(
+                "thread_distribution", "error",
+                f"entries carry thread_id(s) {extras} >= the guest's "
+                f"vCPU count (-smp {smp})",
+                {"observed": observed_tids, "smp": smp}))
+        else:
+            issues.append(Issue(
+                "thread_distribution", "info",
+                f"observed vCPU tid(s) {observed_tids} of -smp {smp}",
+                {"observed": observed_tids, "smp": smp}))
+    else:
+        issues += _check_thread_distribution(entries, expected_threads)
     issues += _check_thread_record_cadence(
         entries, trace_meta.get("body_record_order") or [])
     issues += _check_thread_chain(entries, templates_by_id,
-                                  expected_guest_threads)
+                                  expected_guest_threads, trace_meta)
     if marker:
-        issues += _check_syscall_transitions(entries, templates_by_id,
-                                             trace_meta)
+        issues += _check_syscall_transitions(
+            entries, templates_by_id, trace_meta,
+            guest_threads=expected_guest_threads or 1)
         issues += _check_fault_excursions(entries, templates_by_id,
                                           trace_meta)
-        issues += _check_syscall_fault_nesting(entries, templates_by_id,
-                                               trace_meta)
+        issues += _check_syscall_fault_nesting(
+            entries, templates_by_id, trace_meta,
+            guest_threads=expected_guest_threads or 1)
     if pinned_binary is not None:
         issues += _check_user_code_identity(templates, entries,
                                             templates_by_id,
@@ -6435,15 +6531,16 @@ def validate(meta_path: Path, trace_path: Path,
     issues += _check_thread_switch(body_stats, threads_effective)
     issues += _check_thread_record_cadence(
         entries, trace_meta.get("body_record_order") or [])
-    # _check_thread_chain (the generated workload's user entries form
-    # exactly one control-flow chain) is NOT wired into this battery
-    # yet: it correctly fails on system-mode traces whose first-of-two
-    # faults in one BB drops the pre-fault prefix from the merged
-    # emission (aarch64 repro: seed 0x5150 blk_0, ldr demand fault then
-    # str CoW fault — the merged entry starts at the ldr, losing the
-    # adrp/add ahead of it).  Wire it here once that fault-merge bug is
-    # fixed; until then it runs in validate_structural() (thread_test,
-    # churn_test) where its verdicts gate those harnesses.
+    # The generated workload is single-threaded, so its user-privilege
+    # entries must form exactly one control-flow chain.  (Wired here
+    # once the tracer's whole-BB fault merge kept the pre-fault prefix
+    # for a twice-faulting BB — the aarch64 seed-0x5150 archetype: the
+    # ldr's demand fault then the str's CoW fault in one block — since
+    # a merged emission re-keyed at the first resume PC surfaced here
+    # as an orphaned user entry.)
+    issues += _check_thread_chain(entries, templates_by_id,
+                                  expected_guest_threads=1,
+                                  trace_meta=trace_meta)
     # WP-event tallies are global (the writer counts every WP fault,
     # including those in the pre-window prologue — which in system mode
     # is the whole kernel boot + marker wait, where wrong-path faults are

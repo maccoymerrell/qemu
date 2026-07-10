@@ -27,6 +27,20 @@ Two consumers:
   iteration count keeps both threads spinning long enough for the
   guest scheduler to spread them across the ``-smp`` vCPUs.
 
+  On mipsel the system-mode variant drives the vCPU placement itself
+  instead of gambling on the guest load balancer: ``_start`` confines
+  the process to guest CPU 0 via ``sched_setaffinity`` *before* the
+  marker fires (the clone child inherits the mask), so both threads'
+  RMW loops deterministically time-share the marker vCPU — the regime
+  where an async-excluded guest-thread switch puts two same-ASID
+  threads adjacent on one vCPU, which is exactly what the tracer's
+  abandoned-window seal handling must survive.  Same-vCPU confinement
+  is also the only regime the MIPS pin can see at all: ``EntryHi.ASID``
+  is a per-CPU value (Linux allocates each mm an independent ASID per
+  CPU), so the pinned value captured at the marker cannot match the
+  same process's execution on any other vCPU — a genuine cross-vCPU
+  spread assertion is architecturally out of the pin's reach on MIPS.
+
 The trace produced (either mode) must show:
   * one BODY_TAG_REGFILE per contributing thread, before its first entry,
   * BODY_TAG_THREAD_SWITCH records exactly at the tid changes,
@@ -247,6 +261,7 @@ parent_body:
 shared_counter:    .word 0
                    .word 0
 child_tid:         .word 1
+cpu0_mask:         .word 1
 
 .section .bss
 .align 16
@@ -257,7 +272,7 @@ child_stack_top:
 .globl _start
 .type _start, @function
 _start:
-{marker}
+{affinity_pin}{marker}
     # SYS_clone = 4120; o32 abi: $a0 flags, $a1 stack, $a2 ptid, $a3 tls,
     # ctid passed on stack at sp+16
     li   $v0, 4120
@@ -288,7 +303,7 @@ child_body:
     addiu $t2, $t2, 1
     sc   $t2, 0($t0)
     addiu $t1, $t1, -1
-    bnez $t1, .Lchild_loop
+{child_yield}    bnez $t1, .Lchild_loop
     nop
     li   $v0, 4001
     li   $a0, 0
@@ -307,7 +322,7 @@ parent_body:
     addiu $t2, $t2, 1
     sc   $t2, 0($t0)
     addiu $t1, $t1, -1
-    bnez $t1, .Lparent_loop
+{parent_yield}    bnez $t1, .Lparent_loop
     nop
     lui  $t3, %hi(child_tid)
     addiu $t3, $t3, %lo(child_tid)
@@ -325,6 +340,50 @@ parent_body:
 }
 
 
+# mipsel system-mode vCPU placement (module docstring): confine the
+# process to guest CPU 0 BEFORE the marker fires, so both threads
+# deterministically time-share the marker vCPU.  sched_setaffinity(0,
+# 4, &mask) is o32 4239; errors are deliberately ignored (a mask
+# outside the online set leaves the scheduler's own placement,
+# degrading to the old luck-based behavior).
+_MIPSEL_AFFINITY_PIN = r"""    # Confine to CPU 0 (pre-marker; the clone child inherits the mask)
+    li   $v0, 4239
+    li   $a0, 0
+    li   $a1, 4
+    lui  $a2, %hi(cpu0_mask)
+    addiu $a2, $a2, %lo(cpu0_mask)
+    syscall
+    nop
+"""
+
+# Periodic sched_yield (o32 4162) inside each RMW loop, every 4096
+# iterations: with the guest virtual clock frozen across the tracer's
+# per-TB instrumentation, timer ticks land so rarely inside a marker
+# window that two same-CPU spinners may never preempt each other — the
+# window can close with only one thread's flow in the trace.  The yield
+# hands the CPU over deterministically (a traced synchronous syscall,
+# not an excluded async switch, so it does not stand in for the
+# timer-preemption regime — those switches still occur on top whenever
+# a tick does land).  MIPS syscalls do NOT preserve the caller-saved
+# $t registers (observed: the loop's $t0 came back 0 through a yield
+# that context-switched, faulting the next ll at address 0), so the
+# loop cursor and counter round-trip the call in callee-saved $s0/$s1,
+# which the kernel keeps in the switched thread context.
+_MIPSEL_LOOP_YIELD = r"""    andi $t7, $t1, 0xfff
+    bnez $t7, {loop_label}
+    nop
+    move $s0, $t0
+    move $s1, $t1
+    li   $v0, 4162
+    syscall
+    nop
+    move $t0, $s0
+    move $t1, $s1
+    bnez $t1, {loop_label}
+    nop
+"""
+
+
 def thread_test_asm(isa: str, marker: bool = False,
                     iters: int = 1000) -> str:
     """Render the 2-thread test program for @isa.
@@ -334,6 +393,9 @@ def thread_test_asm(isa: str, marker: bool = False,
     TB from the marker's — the marker TB is the one-TB lossy
     segment-open boundary) and places the end marker right before the
     parent's ``exit_group``.  @iters scales both threads' loop counts.
+    On mipsel, @marker also enables the pre-marker CPU-0 pin (see the
+    module docstring); user-mode renders stay affinity-free — under
+    qemu-user the syscall would target HOST CPUs.
     """
     if isa not in _THREAD_TEST_TEMPLATE:
         raise KeyError(f"no thread-test template for ISA {isa!r}")
@@ -344,10 +406,19 @@ def thread_test_asm(isa: str, marker: bool = False,
                        + emit_entry_jump(isa, "cst_thread_main")
                        + ["cst_thread_main:"])
         endmk = "\n".join(emit_trace_marker_end(isa))
+    aff_pin = ""
+    child_yield = ""
+    parent_yield = ""
+    if marker and isa == "mipsel":
+        aff_pin = _MIPSEL_AFFINITY_PIN
+        child_yield = _MIPSEL_LOOP_YIELD.format(loop_label=".Lchild_loop")
+        parent_yield = _MIPSEL_LOOP_YIELD.format(loop_label=".Lparent_loop")
     return _THREAD_TEST_TEMPLATE[isa].format(
         marker=mk, end_marker=endmk, iters=int(iters),
         iters_lo=f"0x{int(iters) & 0xffff:x}",
-        iters_hi=f"0x{(int(iters) >> 16) & 0xffff:x}")
+        iters_hi=f"0x{(int(iters) >> 16) & 0xffff:x}",
+        affinity_pin=aff_pin,
+        child_yield=child_yield, parent_yield=parent_yield)
 
 
 # Back-compat view for callers that only need the default user-mode

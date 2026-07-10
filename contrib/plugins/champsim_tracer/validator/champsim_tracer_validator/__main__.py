@@ -756,12 +756,36 @@ def cmd_thread_test(args) -> int:
             print(report.summary())
             if report.errors():
                 rc_total = 1
-            if len(observed) < 2:
-                print(f"thread_test[{isa}]: FAIL  the pinned workload's "
-                      f"entries all rode vCPU {observed}; the guest "
-                      f"scheduler never spread the clone pair — raise "
-                      f"--iters or --stop")
+            # The multi-thread assertion proper: both guest threads'
+            # user flows must be present as distinct control-flow
+            # chains (a serial trace of only one thread would decompose
+            # into 1).
+            chains = next((int((i.detail or {}).get("chains", 0))
+                           for i in report.issues
+                           if i.check == "thread_chain"
+                           and i.severity == "info"), 0)
+            if chains < 2:
+                print(f"thread_test[{isa}]: FAIL  user entries decompose "
+                      f"into {chains} chain(s); both clone threads must "
+                      f"appear in the trace")
                 rc_total = 1
+            if len(observed) < 2:
+                if isa == "mipsel":
+                    # Architecturally expected: EntryHi.ASID is a
+                    # per-CPU value, so the pin can only attribute the
+                    # process on the vCPU where the marker fired; the
+                    # workload pins both threads there (see
+                    # _thread_test_asm) and the 2-chain check above is
+                    # the multi-thread assertion.
+                    print(f"thread_test[{isa}]: single-vCPU population "
+                          f"(expected on MIPS: per-CPU ASIDs limit the "
+                          f"pin to the marker vCPU)")
+                else:
+                    print(f"thread_test[{isa}]: FAIL  the pinned "
+                          f"workload's entries all rode vCPU {observed}; "
+                          f"the guest scheduler never spread the clone "
+                          f"pair — raise --iters or --stop")
+                    rc_total = 1
             if _check_segment_coverage(
                     Path(f"{bin_path}.console.log"), label=isa):
                 rc_total = 1

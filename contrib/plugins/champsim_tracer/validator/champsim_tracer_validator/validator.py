@@ -666,9 +666,11 @@ def _check_cp_memops(entries: list[dict],
                      cp_set: set[int],
                      arena_addr: int,
                      arena_size: int | None = None,
-                     isa: str = "x86_64") -> list[Issue]:
-    """Memop/value check, aggregated by (template, block) bipartite
-    component.
+                     isa: str = "x86_64",
+                     templates_by_id: dict[int, dict] | None = None,
+                     pcmap: "PcMap | None" = None) -> list[Issue]:
+    """Memop/value/identity check, aggregated by (template, block)
+    bipartite component.
 
     Background: a single source-level block can be split across
     multiple templates when the compiler emits an *internal*
@@ -684,8 +686,19 @@ def _check_cp_memops(entries: list[dict],
     multiset of expected memops (over all blocks in the component)
     against the multiset of dyn_params (over the first execution of
     every template in the component).
+
+    The match is STRICT on instruction identity: the generator
+    annotates each ExpectedMemOp with the ordinal(s) of the block's
+    memory instruction(s) that perform it (insn_seq, see
+    asm_blocks.annotate_memop_insn_seq), the trace side resolves each
+    dyn_param's insn_index to its instruction PC, and the multiset
+    key carries that identity — a memop with the right value on the
+    wrong instruction no longer passes.  A memop with no insn_seq
+    (identity not statically derivable) falls back to value-only
+    matching; the check itself is never loosened.
     """
     issues: list[Issue] = []
+    templates_by_id = templates_by_id or {}
 
     # ---- 1. Build bipartite adjacency restricted to CP. ----
     # @first_entry maps tid -> single representative entry (default
@@ -742,15 +755,49 @@ def _check_cp_memops(entries: list[dict],
                         stack.append(("t", tid))
         visited_tmpls |= comp_tmpls
 
-        # ---- 3. Build expected and actual multisets for component. ----
-        expected: list[tuple[str, int, int, bool]] = []
+        # ---- 3. Instruction-identity table for the component. ----
+        # mem_pcs[bid]: ascending PCs of the block's memory-capable
+        # insns (static max loads+stores nonzero, or atomic — Capstone
+        # leaves some atomics' mem-access flags empty so their static
+        # counts read 0/0), unioned across the component's templates.
+        # The generator's ExpectedMemOp.insn_seq ordinals index this
+        # list: the emitted asm's memory instructions in order equal
+        # ascending-pc order.  MIPS note: templates keep true
+        # execution order with ascending PCs (no delay-slot reorder,
+        # champsim_tracer_bb_template_cache.cc), and no generator
+        # block puts a memop in a branch delay slot, so the WP-side
+        # positional-pc reassignment never touches this mapping.
+        mem_pcs: dict[int, list[int]] = {bid: [] for bid in comp_blocks}
+        for tid in comp_tmpls:
+            for ins in templates_by_id.get(tid, {}).get("insns", []):
+                pc = int(ins["pc"])
+                bid = pcmap.lookup(pc) if pcmap else None
+                if bid not in mem_pcs:
+                    continue
+                if (int(ins.get("n_loads", 0)) +
+                        int(ins.get("n_stores", 0)) > 0
+                        or ins.get("is_atomic")):
+                    mem_pcs[bid].append(pc)
+        for bid in mem_pcs:
+            mem_pcs[bid] = sorted(set(mem_pcs[bid]))
+
+        # ---- 4. Build expected and actual multisets for component. ----
+        # Tuple shape: (kind, off, data, optional, identity) where
+        # identity is a sorted tuple of instruction PCs (usually one;
+        # two for a 32-bit u64 lo/hi pair) or None for value-only.
+        expected: list[tuple[str, int, int, bool, tuple | None]] = []
         for bid in sorted(comp_blocks):
+            pcs = mem_pcs.get(bid, [])
             for m in blocks_by_id[bid].get("memops", []):
+                seq = m.get("insn_seq") or None
+                ident: tuple | None = None
+                if seq and all(0 <= int(k) < len(pcs) for k in seq):
+                    ident = tuple(sorted(pcs[int(k)] for k in seq))
                 expected.append(
                     (m["kind"], int(m["arena_u64_index"]), int(m["data"]),
-                     bool(m.get("optional", False)))
+                     bool(m.get("optional", False)), ident)
                 )
-        actual: list[tuple[str, int, int]] = []
+        actual: list[tuple[str, int, int, tuple]] = []
         # 32-bit ISAs lower `uint64_t` arena accesses to a pair of
         # 32-bit memops at the low and high halves of an 8-byte slot.
         # On 64-bit ISAs the compiler issues a single 8-byte memop, so
@@ -777,6 +824,13 @@ def _check_cp_memops(entries: list[dict],
         for tid in sorted(comp_tmpls):
             raw_dps = _dps_for(tid)
             consumed = [False] * len(raw_dps)
+            tmpl_insns = templates_by_id.get(tid, {}).get("insns", [])
+
+            def _pc_of(dp) -> int | None:
+                idx = int(getattr(dp, "insn_index", -1))
+                if 0 <= idx < len(tmpl_insns):
+                    return int(tmpl_insns[idx]["pc"])
+                return None
 
             def _arena_off4(va: int) -> int:
                 """Return arena offset in 4-byte units, or -1."""
@@ -808,8 +862,10 @@ def _check_cp_memops(entries: list[dict],
                             continue
                         lo = int(dp.data_lo) & 0xFFFFFFFF
                         hi = int(raw_dps[j].data_lo) & 0xFFFFFFFF
+                        pcs = {_pc_of(dp), _pc_of(raw_dps[j])} - {None}
                         actual.append(
-                            (dp.type_name, off4 // 2, (hi << 32) | lo)
+                            (dp.type_name, off4 // 2, (hi << 32) | lo,
+                             tuple(sorted(pcs)))
                         )
                         consumed[i] = consumed[j] = True
                         break
@@ -825,43 +881,83 @@ def _check_cp_memops(entries: list[dict],
                     # constant-pool load for FP immediates, or a stack
                     # spill).  Not a generator-managed memop; ignore.
                     continue
+                pc = _pc_of(dp)
                 actual.append((
                     dp.type_name,
                     off,
                     _dyn_data_int(dp),
+                    (pc,) if pc is not None else (),
                 ))
 
-        required_ctr = Counter((kind, off, data)
-                               for kind, off, data, optional in expected
-                               if not optional)
-        optional_ctr = Counter((kind, off, data)
-                               for kind, off, data, optional in expected
-                               if optional)
+        # ---- 5. Identity-strict multiset match. ----
+        # Strict requireds match on (kind, off, data, identity);
+        # identity-less requireds and optionals consume leftovers by
+        # value.  A value-correct memop attributed to the wrong
+        # instruction therefore surfaces as one missing (the strict
+        # required) plus one extra (the actual, with its wrong PC).
+        required_strict = Counter(
+            (kind, off, data, ident)
+            for kind, off, data, optional, ident in expected
+            if not optional and ident is not None)
+        required_wild = Counter(
+            (kind, off, data)
+            for kind, off, data, optional, ident in expected
+            if not optional and ident is None)
+        optional_ctr = Counter(
+            (kind, off, data)
+            for kind, off, data, optional, ident in expected
+            if optional)
         act_ctr = Counter(actual)
-        missing = list((required_ctr - act_ctr).elements())
-        extra = list((act_ctr - required_ctr - optional_ctr).elements())
+
+        missing: list[tuple] = list((required_strict - act_ctr).elements())
+        remaining = act_ctr - required_strict
+        rem_by_val = Counter()
+        for (kind, off, data, ident), n in remaining.items():
+            rem_by_val[(kind, off, data)] += n
+        missing += list((required_wild - rem_by_val).elements())
+
+        budget = required_wild + optional_ctr
+        extra: list[tuple] = []
+        for key in sorted(remaining, key=repr):
+            kind, off, data, ident = key
+            n = remaining[key]
+            take = min(n, budget[(kind, off, data)])
+            budget[(kind, off, data)] -= take
+            extra += [key] * (n - take)
         if not missing and not extra:
             continue
 
+        def _fmt(item: tuple) -> str:
+            if len(item) == 4:
+                kind, off, data, ident = item
+                at = ("@" + "+".join(f"0x{p:x}" for p in ident)
+                      if ident else "@*")
+                return f"('{kind}', {off}, {data}, {at})"
+            kind, off, data = item
+            return f"('{kind}', {off}, {data}, @*)"
+
+        n_required = sum(required_strict.values()) + \
+            sum(required_wild.values())
         tmpl_label = "+".join(f"t{t}" for t in sorted(comp_tmpls))
         blk_label = "/".join(f"blk_{b}" for b in sorted(comp_blocks))
         issues.append(Issue(
             "cp_memops", "error",
             f"templates {{{tmpl_label}}} ({blk_label}): "
             f"memop multiset mismatch "
-            f"(required={sum(required_ctr.values())} "
+            f"(required={n_required} "
             f"optional={sum(optional_ctr.values())} act={len(actual)} "
             f"missing={len(missing)} extra={len(extra)})\n"
-            f"      required: {list(required_ctr.elements())}\n"
+            f"      required: "
+            f"{[_fmt(x) for x in required_strict.elements()] + [_fmt(x) for x in required_wild.elements()]}\n"
             f"      optional: {list(optional_ctr.elements())}\n"
-            f"      actual  : {actual}\n"
-            f"      missing : {missing}\n"
-            f"      extra   : {extra}",
+            f"      actual  : {[_fmt(x) for x in actual]}\n"
+            f"      missing : {[_fmt(x) for x in missing]}\n"
+            f"      extra   : {[_fmt(x) for x in extra]}",
             {
                 "template_ids": sorted(comp_tmpls),
                 "cp_blocks": sorted(comp_blocks),
-                "missing_first5": missing[:5],
-                "extra_first5": extra[:5],
+                "missing_first5": [_fmt(x) for x in missing[:5]],
+                "extra_first5": [_fmt(x) for x in extra[:5]],
             },
         ))
     return issues
@@ -5740,6 +5836,23 @@ def validate(meta_path: Path, trace_path: Path,
     issues += _check_profile_consistency(
         templates, entries, trace_meta.get("body_stats") or {})
 
+    # Impossible-attribution lint verdict, surfaced by cst_decode's
+    # trailing summary (tools/cst_lint.h): runtime memops attributed to
+    # memop-incapable insns, or dst-reg values on operand slots the
+    # template does not carry.  Always zero on a conformant trace.
+    imp = trace_meta.get("impossible_attributions") or {}
+    if imp.get("memop") or imp.get("regdata"):
+        issues.append(Issue(
+            "impossible_attribution", "error",
+            f"decoder lint counted impossible attributions: "
+            f"{imp.get('memop', 0)} memop "
+            f"({imp.get('memop_insns', 0)} distinct insns), "
+            f"{imp.get('regdata', 0)} regdata "
+            f"({imp.get('regdata_insns', 0)} distinct insns)",
+            dict(imp)))
+
+    templates_by_id = {t["template_id"]: t for t in templates}
+
     arena_info = _find_arena_address(binary_path)
     if arena_info is None:
         issues.append(Issue(
@@ -5753,13 +5866,14 @@ def validate(meta_path: Path, trace_path: Path,
         issues += _check_cp_memops(cp_entries, template_runs,
                                    blocks_by_id, cp_set, arena_addr,
                                    arena_size,
-                                   meta.get("isa", "x86_64"))
+                                   meta.get("isa", "x86_64"),
+                                   templates_by_id=templates_by_id,
+                                   pcmap=pcmap)
         issues += _check_per_execution_memop_data(
             cp_entries, template_runs, blocks_by_id,
             cp_set, arena_addr, arena_size,
             meta.get("isa", "x86_64"))
 
-    templates_by_id = {t["template_id"]: t for t in templates}
     isa = meta.get("isa", "x86_64")
 
     # Static register identity check: verify the template's src_regs and

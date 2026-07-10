@@ -21,6 +21,15 @@ class ExpectedMemOp:
     size: int
     data: int
     optional: bool = False
+    # Identity of the instruction(s) that perform this access:
+    # ordinals into the block's ordered sequence of memory-touching
+    # instructions (emission == ascending-pc order).  Usually one
+    # ordinal; two on 32-bit ISAs where a u64 access lowers to a
+    # lo/hi pair of 4-byte instructions.  Filled by
+    # annotate_memop_insn_seq() at generation time by parsing the
+    # emitted assembly; None = identity not statically derivable
+    # (the validator then matches this memop by value only).
+    insn_seq: list[int] | None = None
 
 
 @dataclasses.dataclass
@@ -481,6 +490,222 @@ def _store_slot(isa: str, slot: int, reg: str) -> list[str]:
     if isa.startswith("mips"):
         return [f"  sw {reg}, {off}($t8)", f"  sw $zero, {off + 4}($t8)"]
     raise ValueError(f"unsupported ISA: {isa}")
+
+
+# ---------------------------------------------------------------------------
+# Memop instruction-identity annotation
+# ---------------------------------------------------------------------------
+#
+# The generator knows exactly which emitted instruction performs each
+# ExpectedMemOp: every block accesses the arena through the per-ISA
+# base register the helpers above pin (%r15 / x20 / t6 / $t8), so the
+# emitting instruction is recoverable from the assembly text.  The
+# parser below walks a block's emitted body, enumerates its
+# memory-touching instructions in order (that order equals
+# ascending-pc order — mem instructions never pseudo-expand, unlike
+# `li`), and resolves each one's static arena byte range, tracking the
+# small computed-base idioms the emit helpers use (aarch64
+# `add xN, x20, #off`; riscv `li t5, off; add t5, t6, t5`; x86 REP
+# setup `leaq off(%r15), %rsi/%rdi` + `mov $N, %ecx`).
+#
+# annotate_memop_insn_seq() then assigns each ExpectedMemOp the
+# ordinal(s) of the instruction(s) whose access ranges cover its byte
+# span — two ordinals for a 32-bit u64 lo/hi pair — falling back to a
+# per-kind order match for index-register accesses with no static
+# offset (StrideLoopHead).  A memop the parser cannot pin keeps
+# insn_seq=None and is matched by value only; the validator's strict
+# cp_memops check maps ordinals to instruction PCs through the trace
+# templates (see _check_cp_memops).
+
+# One memory-access instruction: (kind, static byte offset | None,
+# byte span) triples; REP string ops carry both a load and a store.
+_X86_LOAD_W = {"movq": 8, "movl": 4, "movzwq": 2, "movzbq": 1,
+               "movdqu": 16, "vmovdqu": 32}
+_X86_STORE_W = {"movq": 8, "movl": 4, "movw": 2, "movb": 1,
+                "movdqu": 16, "vmovdqu": 32}
+_A64_LOAD_W = {"ldr": None, "ldrh": 2, "ldrb": 1}   # None: width from reg
+_A64_STORE_W = {"str": None, "strh": 2, "strb": 1}
+_RV_LOAD_W = {"ld": 8, "lwu": 4, "lw": 4, "lhu": 2, "lh": 2,
+              "lbu": 1, "lb": 1}
+_RV_STORE_W = {"sd": 8, "sw": 4, "sh": 2, "sb": 1}
+_MIPS_LOAD_W = {"lw": 4, "lhu": 2, "lh": 2, "lbu": 1, "lb": 1}
+_MIPS_STORE_W = {"sw": 4, "sh": 2, "sb": 1}
+
+_X86_MEM_RE = re.compile(r"^(-?\d+)?\(%r15(,\s*%\w+,\s*\d+)?\)$")
+
+
+def _a64_reg_width(reg: str) -> int:
+    return {"q": 16, "d": 8, "x": 8, "w": 4}.get(reg[0], 8)
+
+
+def _split_operands(rest: str) -> list[str]:
+    """Split an operand string on top-level commas only, so x86 SIB
+    forms ``off(%r15, %r8, 8)`` and aarch64 ``[x20, #16]`` stay single
+    operands."""
+    out: list[str] = []
+    depth = 0
+    cur = ""
+    for ch in rest:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
+def _parse_block_mem_insns(body: str, isa: str) -> list[list[tuple]]:
+    """Return the block's memory-touching instructions, in order; each
+    entry is that instruction's [(kind, off|None, span), ...] list."""
+    mem_insns: list[list[tuple]] = []
+    tracked: dict[str, int] = {}    # computed-base / setup registers
+    li_vals: dict[str, int] = {}    # riscv `li` staging values
+
+    for raw in body.split("\n"):
+        line = raw.strip()
+        if (not line or line.startswith(".") or line.startswith("#")
+                or line.endswith(":")):
+            continue
+        mnem, _, rest = line.partition(" ")
+        ops = _split_operands(rest)
+        accesses: list[tuple] = []
+
+        if isa == "x86_64":
+            if mnem == "leaq" and len(ops) == 2 and ops[1] in ("%rsi", "%rdi"):
+                m = _X86_MEM_RE.match(ops[0])
+                if m and not m.group(2):
+                    tracked[ops[1]] = int(m.group(1) or 0)
+                continue
+            if mnem == "mov" and len(ops) == 2 and ops[1] == "%ecx" \
+                    and ops[0].startswith("$"):
+                tracked["%ecx"] = int(ops[0][1:], 0)
+                continue
+            if mnem == "rep" and ops and ops[0] == "movsq":
+                n = tracked.get("%ecx")
+                span = n * 8 if n is not None else None
+                accesses.append(("load", tracked.get("%rsi"), span))
+                accesses.append(("store", tracked.get("%rdi"), span))
+            elif mnem in _X86_LOAD_W and len(ops) == 2 \
+                    and _X86_MEM_RE.match(ops[0]):
+                m = _X86_MEM_RE.match(ops[0])
+                off = None if m.group(2) else int(m.group(1) or 0)
+                accesses.append(("load", off, _X86_LOAD_W[mnem]))
+            elif mnem in _X86_STORE_W and len(ops) == 2 \
+                    and _X86_MEM_RE.match(ops[1]):
+                m = _X86_MEM_RE.match(ops[1])
+                off = None if m.group(2) else int(m.group(1) or 0)
+                accesses.append(("store", off, _X86_STORE_W[mnem]))
+
+        elif isa == "aarch64":
+            if mnem == "add" and len(ops) == 3 and ops[1] == "x20" \
+                    and ops[2].startswith("#"):
+                tracked[ops[0]] = int(ops[2][1:], 0)
+                continue
+            is_load = mnem in _A64_LOAD_W
+            is_store = mnem in _A64_STORE_W
+            if (is_load or is_store) and len(ops) >= 2:
+                mem = " ".join(ops[1:])
+                m = re.match(r"^\[\s*(\w+)(?:\s*,?\s*#(-?\d+))?\s*\]$", mem)
+                if m:
+                    base, disp = m.group(1), int(m.group(2) or 0)
+                    off = (disp if base == "x20"
+                           else (tracked[base] + disp
+                                 if base in tracked else None))
+                    w = (_A64_LOAD_W if is_load else _A64_STORE_W)[mnem]
+                    if w is None:
+                        w = _a64_reg_width(ops[0])
+                    accesses.append(("load" if is_load else "store", off, w))
+            if not accesses and len(ops) >= 1 and ops[0] in tracked \
+                    and mnem not in ("ldr", "str"):
+                tracked.pop(ops[0], None)   # base clobbered
+
+        elif isa == "riscv64":
+            if mnem == "li" and len(ops) == 2:
+                li_vals[ops[0]] = int(ops[1], 0)
+                continue
+            if mnem == "add" and len(ops) == 3 and ops[1] == "t6" \
+                    and ops[2] in li_vals:
+                tracked[ops[0]] = li_vals[ops[2]]
+                continue
+            is_load = mnem in _RV_LOAD_W
+            is_store = mnem in _RV_STORE_W
+            if (is_load or is_store) and len(ops) == 2:
+                m = re.match(r"^(-?\d+)\((\w+)\)$", ops[1])
+                if m:
+                    disp, base = int(m.group(1)), m.group(2)
+                    off = (disp if base == "t6"
+                           else (tracked[base] + disp
+                                 if base in tracked else None))
+                    w = (_RV_LOAD_W if is_load else _RV_STORE_W)[mnem]
+                    accesses.append(("load" if is_load else "store", off, w))
+
+        elif isa.startswith("mips"):
+            is_load = mnem in _MIPS_LOAD_W
+            is_store = mnem in _MIPS_STORE_W
+            if (is_load or is_store) and len(ops) == 2:
+                m = re.match(r"^(-?\d+)\(\$t8\)$", ops[1])
+                if m:
+                    w = (_MIPS_LOAD_W if is_load else _MIPS_STORE_W)[mnem]
+                    accesses.append(("load" if is_load else "store",
+                                     int(m.group(1)), w))
+
+        if accesses:
+            mem_insns.append(accesses)
+    return mem_insns
+
+
+def annotate_memop_insn_seq(plan: "BlockPlan", body: str, isa: str) -> None:
+    """Fill each of @plan's memops' insn_seq from the emitted @body."""
+    if not plan.memops:
+        return
+    mem_insns = _parse_block_mem_insns(body, isa)
+
+    # Phase 1: static byte-range coverage.  A memop's [lo, hi) span
+    # must be fully covered by same-kind accesses with known offsets;
+    # the covering instructions' ordinals become its identity.
+    for mop in plan.memops:
+        lo = mop.arena_u64_index * 8
+        hi = lo + max(1, int(mop.size))
+        ords: set[int] = set()
+        covered: list[tuple[int, int]] = []
+        for k, accesses in enumerate(mem_insns):
+            for kind, off, span in accesses:
+                if kind != mop.kind or off is None or span is None:
+                    continue
+                if off < hi and lo < off + span:
+                    ords.add(k)
+                    covered.append((max(off, lo), min(off + span, hi)))
+        covered.sort()
+        pos = lo
+        for c_lo, c_hi in covered:
+            if c_lo <= pos:
+                pos = max(pos, c_hi)
+        # Full coverage, or the 32-bit lo-half idiom: a u64-declared
+        # slot whose block only ever touches the low 4 bytes (MIPS
+        # teq-split reads just the lw'd half; the hi half stays at its
+        # zero init), so the low-half instruction IS the identity.
+        lo_half_only = (int(mop.size) == 8 and pos == lo + 4)
+        if ords and (pos >= hi or lo_half_only):
+            mop.insn_seq = sorted(ords)
+
+    # Phase 2: index-register accesses carry no static offset
+    # (StrideLoopHead's (%r15, %r8, 8)).  When the leftover memops of
+    # a kind pair 1:1, in order, with the leftover offset-less
+    # instructions of that kind, the correspondence is forced.
+    for kind in ("load", "store"):
+        rem_m = [m for m in plan.memops
+                 if m.kind == kind and m.insn_seq is None]
+        rem_i = [k for k, accesses in enumerate(mem_insns)
+                 if any(a[0] == kind and a[1] is None for a in accesses)]
+        if rem_m and len(rem_m) == len(rem_i):
+            for mop, k in zip(rem_m, rem_i):
+                mop.insn_seq = [k]
 
 
 def _branch_zero_to(isa: str, reg: str, target: str) -> list[str]:

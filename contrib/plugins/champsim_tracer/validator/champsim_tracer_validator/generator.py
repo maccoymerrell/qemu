@@ -273,6 +273,12 @@ def emit_source(cfg: CFG, plans: list[B.BlockPlan],
             loop_iterations=n.loop_iterations,
         )
         body = cls.emit(plan, ctx).rstrip()
+        # Pin each expected memop to the instruction(s) that perform it
+        # (asm_blocks.annotate_memop_insn_seq): the .meta.json then
+        # carries per-memop insn_seq ordinals, which the validator's
+        # cp_memops check resolves to instruction PCs so the match is
+        # strict on (kind, insn, value) instead of value-only.
+        B.annotate_memop_insn_seq(plan, body, isa)
         if marker and n.block_id == cfg.exit:
             # End marker right after the exit block's label (before the exit
             # syscall) so the plugin closes the trace window as the process

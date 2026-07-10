@@ -699,7 +699,31 @@ def _parse_full(text: str) -> tuple[dict, list[dict], list[dict]]:
     # tracking position because the body iterator above leaves `i`
     # mid-stream when it short-circuits.
     meta["body_stats"] = _parse_body_stats(lines)
+    meta["impossible_attributions"] = _parse_impossible_attributions(lines)
     return meta, templates, entries
+
+
+_IMPOSSIBLE_RE = re.compile(
+    r"^; impossible attributions: (\d+) memop \((\d+) distinct insns\), "
+    r"(\d+) regdata \((\d+) distinct insns\)$"
+)
+
+
+def _parse_impossible_attributions(lines: list[str]) -> dict:
+    """Pick up cst_decode's trailing impossible-attribution summary
+    (emitted only when the lint counted violations — a clean trace has
+    no such line, keeping the legacy text byte-stable).  Surfaced in
+    meta so the validator can fail the trace on its own terms."""
+    out = {"memop": 0, "memop_insns": 0, "regdata": 0, "regdata_insns": 0}
+    for line in reversed(lines[-8:]):
+        m = _IMPOSSIBLE_RE.match(line)
+        if m:
+            out = {"memop": int(m.group(1)),
+                   "memop_insns": int(m.group(2)),
+                   "regdata": int(m.group(3)),
+                   "regdata_insns": int(m.group(4))}
+            break
+    return out
 
 
 def _parse_body_stats(lines: list[str]) -> dict:

@@ -807,6 +807,24 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
         if (have_mmap_lock()) {
             mmap_unlock();
         }
+#else
+        /*
+         * A translation-time fault lands here from INSIDE tb_gen_code: a
+         * wrong-path translator_ld() crossing into an absent page unwinds
+         * via cpu_loop_exit_restore (the spec_real_access abort in
+         * cputlb.c's tlb_fill_align) while tb_gen_code still holds the TB's
+         * PageDesc lock(s) and tcg_ctx->gen_tb.  The outer loop's landing
+         * pad releases those (cpu_exec_longjmp_cleanup); this pad must do
+         * the same, or the page spinlock leaks permanently and the next
+         * tb_gen_code touching that page spins forever below every plugin
+         * callback — a 100%-utime vCPU freeze (observed as the x86 -smp 2
+         * marker-window stall at segment open, where cold-branch wrong
+         * paths translate heavily and fault often).
+         */
+        if (tcg_ctx->gen_tb) {
+            tb_unlock_pages(tcg_ctx->gen_tb);
+            tcg_ctx->gen_tb = NULL;
+        }
 #endif
         cpu->running = saved_running;
         memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));

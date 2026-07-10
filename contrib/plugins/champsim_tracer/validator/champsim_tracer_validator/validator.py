@@ -4420,6 +4420,429 @@ def _check_thread_distribution(entries: list[dict],
     )]
 
 
+_SMP_RE = re.compile(r"(?:^|\s)-smp\s+(\d+)")
+
+
+def _parse_smp_from_command(cmd: str) -> int:
+    """Extract the guest vCPU count from the trace's command string
+    (system-mode ``-smp N``).  1 if absent — qemu-system's default, and
+    the value under qemu-user where thread_ids are host threads and not
+    bounded by any -smp."""
+    m = _SMP_RE.search(cmd or "")
+    return int(m.group(1)) if m else 1
+
+
+def _check_thread_record_cadence(entries: list[dict],
+                                 body_record_order: list[tuple[str, int]]
+                                 ) -> list[Issue]:
+    """Positional thread-bookkeeping invariants of the body stream.
+
+    Two record-level contracts the writer must honor on every segment,
+    single- or multi-vCPU:
+
+      * **Switch flags mark exactly the tid changes.**  The segment's
+        first ENTRY carries the mandatory opener's switch flag
+        (BODY_TAG_THREAD_SWITCH names the starting thread), and every
+        later ENTRY carries it iff its ``thread_id`` differs from the
+        previous ENTRY's — the writer emits a switch record only when
+        the firing vCPU changes.
+      * **A thread's REGFILE precedes its first ENTRY.**  Field-state
+        delta encoding is per-thread, so a consumer must have thread
+        T's full register file in hand before decoding T's first entry;
+        the writer guarantees this by emitting BODY_TAG_REGFILE lazily
+        right before each thread's first ENTRY of the segment.  Exactly
+        one REGFILE per contributing thread per segment.
+    """
+    issues: list[Issue] = []
+
+    # Switch-flag correctness against the entry stream itself.
+    flag_errors = 0
+    prev_tid: int | None = None
+    for i, e in enumerate(entries):
+        tid = int(e.get("thread_id", 0))
+        expected = (i == 0) or (tid != prev_tid)
+        actual = bool(e.get("thread_switched"))
+        if actual != expected:
+            flag_errors += 1
+            if flag_errors <= 5:
+                issues.append(Issue(
+                    "thread_records", "error",
+                    f"entry seq={e.get('seq_num')} thread={tid}: "
+                    f"switch flag {'set' if actual else 'missing'} but tid "
+                    f"{'did not change' if actual else 'changed'} "
+                    f"(prev tid={prev_tid})",
+                    {"seq_num": e.get("seq_num"), "tid": tid,
+                     "prev_tid": prev_tid}))
+        prev_tid = tid
+    if flag_errors > 5:
+        issues.append(Issue(
+            "thread_records", "error",
+            f"...and {flag_errors - 5} more switch-flag mismatches"))
+
+    # REGFILE-before-first-ENTRY, from the positional record stream.
+    first_entry_pos: dict[int, int] = {}
+    regfile_pos: dict[int, list[int]] = {}
+    for pos, (kind, tid) in enumerate(body_record_order or []):
+        if kind == "entry":
+            first_entry_pos.setdefault(tid, pos)
+        elif kind == "regfile":
+            regfile_pos.setdefault(tid, []).append(pos)
+    for tid, epos in sorted(first_entry_pos.items()):
+        rposes = regfile_pos.get(tid, [])
+        if not rposes:
+            issues.append(Issue(
+                "thread_records", "error",
+                f"thread {tid} contributed entries but has no REGFILE "
+                f"record in the segment",
+                {"tid": tid}))
+        elif min(rposes) > epos:
+            issues.append(Issue(
+                "thread_records", "error",
+                f"thread {tid}'s REGFILE (record #{min(rposes)}) appears "
+                f"after its first ENTRY (record #{epos})",
+                {"tid": tid}))
+        if len(rposes) > 1:
+            issues.append(Issue(
+                "thread_records", "error",
+                f"thread {tid} has {len(rposes)} REGFILE records in one "
+                f"segment; expected exactly one",
+                {"tid": tid, "count": len(rposes)}))
+    for tid in sorted(set(regfile_pos) - set(first_entry_pos)):
+        issues.append(Issue(
+            "thread_records", "error",
+            f"REGFILE for thread {tid} but the thread contributed no "
+            f"entries",
+            {"tid": tid}))
+
+    if not issues:
+        issues.append(Issue(
+            "thread_records", "info",
+            f"switch flags consistent across {len(entries)} entries; "
+            f"REGFILE precedes first ENTRY for thread(s) "
+            f"{sorted(first_entry_pos)}"))
+    return issues
+
+
+def _template_successor_pcs(t: dict) -> set[int]:
+    """The set of PCs a CP execution of template @t may hand control to
+    next, from the trace's own data: the fall-through, the static
+    terminal-branch target list, and any profile target this branch
+    actually took on the correct path (covers indirect branches, whose
+    static target list is empty)."""
+    s: set[int] = set()
+    ft = int(t.get("fall_through_pc", 0) or 0)
+    if ft:
+        s.add(ft)
+    for pc in t.get("target_pcs") or []:
+        s.add(int(pc))
+    for tgt in (t.get("profile") or {}).get("targets") or []:
+        if int(tgt.get("taken_cp", 0)) > 0:
+            s.add(int(tgt["pc"]))
+    return s
+
+
+def _check_thread_chain(entries: list[dict],
+                        templates_by_id: dict,
+                        expected_guest_threads: int | None = None
+                        ) -> list[Issue]:
+    """User-flow continuity of the interleaved body stream.
+
+    The body stream serializes every vCPU's CP blocks in execution
+    order.  Filtered down to user-privilege entries (kernel excursions
+    detour and return; excluded async windows are transparent to user
+    control flow), the stream must decompose into the control-flow
+    chains of the guest process's logical threads: every user entry's
+    start PC must be reachable from some live thread's previous block
+    (its fall-through or a branch target), or it begins a new logical
+    thread (bounded by @expected_guest_threads when given — e.g. 1 for
+    the single-threaded generated workload, 2 for the clone test).
+
+    A dropped user block, a phantom entry, or another process's code
+    leaking past the ASID pin all surface here as an *orphan*: an entry
+    whose PC no live chain can reach.  Guest threads may migrate across
+    vCPUs (thread_id is the vCPU index), so chains are matched globally
+    against a live set, not per tid; the per-tid direct-adjacency
+    connect rate is reported as info (breaks there are legitimate —
+    an excluded async window can reschedule guest threads between two
+    adjacent same-tid entries).
+    """
+    issues: list[Issue] = []
+    contexts: list[set[int]] = []      # live logical threads' successor sets
+    created: list[tuple] = []          # (seq_num, pc) of chain births
+    orphans: list[tuple] = []          # (seq_num, pc, tid)
+    n_user = 0
+
+    # Per-tid adjacency tally: prev user entry per tid, invalidated by an
+    # intervening kernel entry on the same tid (excursion boundary).
+    last_user_succ_by_tid: dict[int, set[int] | None] = {}
+    tid_pairs = tid_connected = 0
+
+    for e in entries:
+        t = templates_by_id.get(e["template_id"])
+        if t is None:
+            continue
+        tid = int(e.get("thread_id", 0))
+        if t.get("is_system"):
+            last_user_succ_by_tid[tid] = None      # excursion boundary
+            continue
+        pc = int(t.get("start_pc", 0))
+        n_user += 1
+        succ = _template_successor_pcs(t)
+
+        hit = next((i for i, c in enumerate(contexts) if pc in c), None)
+        if hit is not None:
+            contexts[hit] = succ
+        elif (expected_guest_threads is None
+              or len(contexts) < expected_guest_threads):
+            contexts.append(succ)
+            created.append((e.get("seq_num"), pc))
+        else:
+            orphans.append((e.get("seq_num"), pc, tid))
+            contexts.append(succ)      # resync so one gap can't cascade
+
+        prev = last_user_succ_by_tid.get(tid)
+        if prev is not None:
+            tid_pairs += 1
+            if pc in prev:
+                tid_connected += 1
+        last_user_succ_by_tid[tid] = succ
+
+    for seq, pc, tid in orphans[:5]:
+        issues.append(Issue(
+            "thread_chain", "error",
+            f"user entry seq={seq} thread={tid} pc=0x{pc:x} is not "
+            f"reachable from any live thread chain (dropped block, "
+            f"phantom entry, or foreign-process code)",
+            {"seq_num": seq, "pc": pc, "tid": tid}))
+    if len(orphans) > 5:
+        issues.append(Issue(
+            "thread_chain", "error",
+            f"...and {len(orphans) - 5} more unreachable user entries"))
+    if issues:
+        return issues
+    born = ", ".join(f"seq={s} pc=0x{pc:x}" for s, pc in created)
+    return [Issue(
+        "thread_chain", "info",
+        f"{n_user} user entries decompose into {len(contexts)} logical "
+        f"thread chain(s) with 0 orphans (births: {born}); per-tid "
+        f"direct adjacency: {tid_connected}/{tid_pairs} connected",
+        {"user_entries": n_user, "chains": len(contexts),
+         "tid_pairs": tid_pairs, "tid_connected": tid_connected})]
+
+
+def _check_user_code_identity(templates: list[dict],
+                              entries: list[dict],
+                              templates_by_id: dict,
+                              binary_path: Path) -> list[Issue]:
+    """Every user-privilege template the CP stream executed must be the
+    pinned binary's own code: each template instruction's raw bytes
+    must equal the ELF image's bytes at that virtual address.
+
+    This is the content gate for the ASID pin under multi-process
+    churn: a foreign process scheduled into a reused ASID would leak
+    *its* user code into the trace, at VAs that either fall outside
+    the pinned binary's PT_LOAD footprint or fail the byte comparison
+    (the -nostdlib workload shares no code with anything else in the
+    guest).  WP-only templates are exempt (wrong-path fetch may wander
+    off the binary by design) and reported as info.
+    """
+    try:
+        import lief
+    except ImportError:
+        return [Issue("user_code_identity", "error",
+                      "LIEF unavailable; cannot byte-check user "
+                      "templates against the pinned binary")]
+    img = lief.parse(str(binary_path))
+    if img is None:
+        return [Issue("user_code_identity", "error",
+                      f"cannot parse ELF {binary_path}")]
+    # LIEF >= 0.17 nests the enum as Segment.TYPE; older releases used
+    # lief.ELF.SEGMENT_TYPES (same compat split as mnemonic_survey's).
+    seg_load = (getattr(getattr(lief.ELF.Segment, "TYPE", None),
+                        "LOAD", None)
+                or lief.ELF.SEGMENT_TYPES.LOAD)
+    loads: list[tuple[int, bytes]] = []
+    for seg in img.segments:
+        if seg.type == seg_load:
+            loads.append((int(seg.virtual_address), bytes(seg.content)))
+
+    def image_bytes(va: int, n: int) -> bytes | None:
+        for base, blob in loads:
+            if base <= va and va + n <= base + len(blob):
+                return blob[va - base:va - base + n]
+        return None
+
+    cp_user_tids = {int(e["template_id"]) for e in entries
+                    if not (templates_by_id.get(e["template_id"]) or {})
+                    .get("is_system")}
+    issues: list[Issue] = []
+    checked_insns = 0
+    checked_templates = 0
+    wp_only_user = 0
+    mismatches = 0
+    for t in templates:
+        if t.get("is_system"):
+            continue
+        if int(t["template_id"]) not in cp_user_tids:
+            wp_only_user += 1
+            continue
+        checked_templates += 1
+        for idx, ins in enumerate(t.get("insns") or []):
+            raw = ins.get("raw_bytes") or b""
+            if not raw:
+                continue
+            expect = image_bytes(int(ins["pc"]), len(raw))
+            if expect is None:
+                mismatches += 1
+                if mismatches <= 5:
+                    issues.append(Issue(
+                        "user_code_identity", "error",
+                        f"template {t['template_id']} insn[{idx}] "
+                        f"pc=0x{int(ins['pc']):x} lies outside the pinned "
+                        f"binary's PT_LOAD footprint",
+                        {"template_id": t["template_id"], "insn": idx}))
+                continue
+            if expect != raw:
+                mismatches += 1
+                if mismatches <= 5:
+                    issues.append(Issue(
+                        "user_code_identity", "error",
+                        f"template {t['template_id']} insn[{idx}] "
+                        f"pc=0x{int(ins['pc']):x}: trace bytes "
+                        f"{raw.hex()} != binary bytes {expect.hex()} — "
+                        f"foreign user code under the pin",
+                        {"template_id": t["template_id"], "insn": idx}))
+                continue
+            checked_insns += 1
+    if mismatches > 5:
+        issues.append(Issue(
+            "user_code_identity", "error",
+            f"...and {mismatches - 5} more foreign/out-of-image "
+            f"instructions"))
+    if issues:
+        return issues
+    return [Issue(
+        "user_code_identity", "info",
+        f"{checked_insns} instructions across {checked_templates} "
+        f"CP-executed user templates byte-match the pinned binary "
+        f"({wp_only_user} WP-only user templates exempt)",
+        {"checked_insns": checked_insns,
+         "checked_templates": checked_templates,
+         "wp_only_user": wp_only_user})]
+
+
+def _check_syscall_fault_nesting(entries: list[dict],
+                                 templates_by_id: dict,
+                                 trace_meta: dict,
+                                 require_nested: bool = False
+                                 ) -> list[Issue]:
+    """Nested-excursion discipline: a synchronous fault taken *inside* a
+    syscall handler.
+
+    The generated marker workload issues a syscall whose kernel path is
+    guaranteed to fault (``sysinfo`` writing into a never-touched
+    demand-zero page — see ``emit_trace_fault_probe``), so a system-mode
+    trace must exhibit at least one user-syscall excursion containing
+    entries at ``fault_depth >= 1`` (@require_nested).  Independent of
+    the probe, the fault stack must behave like a stack per vCPU:
+
+      * consecutive same-tid entries change depth by at most 1 (one
+        fault entered or one excursion unwound per boundary),
+      * fault-anchored (whole-BB-merged) entries sit at the unwind of
+        an excursion: the same tid was at a *higher* depth on the
+        previous entry, or the anchor marks the merged completion of
+        the faulting BB at its own level,
+      * depth histogram is reported so nesting regressions are visible.
+    """
+    bn = trace_meta.get("branch_names") or {}
+    syscall_ids = {int(k) for k, v in bn.items() if "SYSCALL" in str(v)}
+
+    def ends_in_syscall(t: dict) -> bool:
+        ins = t.get("insns") or []
+        return bool(ins) and int(ins[-1].get("branch_type", 0)) in syscall_ids
+
+    issues: list[Issue] = []
+    depth_hist: Counter = Counter()
+    prev_depth_by_tid: dict[int, int] = {}
+    step_errors = 0
+
+    # Per-tid syscall windows: user syscall block -> kernel entries ->
+    # next user entry.  Track the max fault depth inside each window.
+    in_syscall_by_tid: dict[int, bool] = {}
+    window_count = 0
+    nested_windows = 0
+    cur_window_max: dict[int, int] = {}
+
+    for e in entries:
+        t = templates_by_id.get(e["template_id"])
+        if t is None:
+            continue
+        tid = int(e.get("thread_id", 0))
+        d = int(e.get("fault_depth", 0) or 0)
+        depth_hist[d] += 1
+
+        pd = prev_depth_by_tid.get(tid)
+        if pd is not None and abs(d - pd) > 1:
+            step_errors += 1
+            if step_errors <= 5:
+                issues.append(Issue(
+                    "syscall_fault_nesting", "error",
+                    f"entry seq={e.get('seq_num')} thread={tid}: fault "
+                    f"depth jumped {pd} -> {d}; excursions must nest and "
+                    f"unwind one level at a time",
+                    {"seq_num": e.get("seq_num"), "from": pd, "to": d}))
+        # A fault-anchored entry is the whole-BB merge of the block the
+        # excursion interrupted, so it must sit at the unwind: the same
+        # tid's previous entry ran one level deeper (inside the fault
+        # handler this merge is returning from).
+        if (e.get("fault_anchors") and pd is not None and pd <= d):
+            issues.append(Issue(
+                "syscall_fault_nesting", "error",
+                f"entry seq={e.get('seq_num')} thread={tid} carries fault "
+                f"anchors {e['fault_anchors']} at depth {d} but the tid's "
+                f"previous entry was at depth {pd}; a merged faulting BB "
+                f"must follow its excursion's unwind",
+                {"seq_num": e.get("seq_num"), "depth": d, "prev": pd}))
+        prev_depth_by_tid[tid] = d
+
+        is_sys = bool(t.get("is_system"))
+        if in_syscall_by_tid.get(tid):
+            if is_sys:
+                cur_window_max[tid] = max(cur_window_max.get(tid, 0), d)
+            else:
+                window_count += 1
+                if cur_window_max.get(tid, 0) >= 1:
+                    nested_windows += 1
+                in_syscall_by_tid[tid] = False
+        if (not is_sys) and ends_in_syscall(t):
+            in_syscall_by_tid[tid] = True
+            cur_window_max[tid] = 0
+
+    if step_errors > 5:
+        issues.append(Issue(
+            "syscall_fault_nesting", "error",
+            f"...and {step_errors - 5} more depth-step violations"))
+    if require_nested and window_count and not nested_windows:
+        issues.append(Issue(
+            "syscall_fault_nesting", "error",
+            f"no user-syscall excursion contains fault_depth >= 1 "
+            f"entries ({window_count} completed excursions inspected); "
+            f"the workload's fault probe guarantees a fault inside a "
+            f"syscall handler, so the nesting machinery lost it",
+            {"windows": window_count}))
+    if issues:
+        return issues
+    hist = {k: depth_hist[k] for k in sorted(depth_hist)}
+    return [Issue(
+        "syscall_fault_nesting", "info",
+        f"fault-depth histogram {hist}; max depth "
+        f"{max(depth_hist) if depth_hist else 0}; "
+        f"{nested_windows}/{window_count} completed user-syscall "
+        f"excursion(s) contained a nested fault",
+        {"hist": hist, "windows": window_count,
+         "nested_windows": nested_windows})]
+
+
 def _check_atomic_count(body_stats: dict,
                         all_entries: list[dict],
                         templates_by_id: dict[int, dict]) -> list[Issue]:
@@ -5557,7 +5980,10 @@ def validate_cross_segment_consistency(
 
 
 def validate_structural(trace_path: Path,
-                        expected_threads: int = 1) -> Report:
+                        expected_threads: int = 1,
+                        expected_guest_threads: int | None = None,
+                        marker: bool = False,
+                        pinned_binary: Path | None = None) -> Report:
     """Decode @trace_path and run only the checks that don't depend on
     the generator's meta.json (correct_path, blocks, wrong_paths).
 
@@ -5567,8 +5993,15 @@ def validate_structural(trace_path: Path,
     internally consistent: encoding maps are complete, atomic_count
     and wp_events agree between writer-aggregate and per-entry walk,
     IFRAMEs match their ENTRYs (already enforced by the decoder),
-    REGFILE record(s) present, no unexpected thread_switch on
-    single-thread runs.
+    REGFILE record(s) present and positioned before each thread's
+    first ENTRY, switch flags marking exactly the tid changes, no
+    unexpected thread_switch on single-thread runs, and — when
+    @expected_guest_threads is given — the user-privilege entry
+    stream decomposing into that many control-flow chains.
+
+    @marker: the trace came from a system-mode marker/pin run, so the
+    kernel interleaves and the privilege-transition checks
+    (syscall round-trips, fault-excursion depth discipline) apply.
     """
     dec = _load_decoder()
     trace_meta, templates, entries = dec.decode_champsim_tracer(trace_path)
@@ -5589,6 +6022,21 @@ def validate_structural(trace_path: Path,
     issues += _check_regfile_records(body_stats, expected_threads)
     issues += _check_thread_switch(body_stats, expected_threads)
     issues += _check_thread_distribution(entries, expected_threads)
+    issues += _check_thread_record_cadence(
+        entries, trace_meta.get("body_record_order") or [])
+    issues += _check_thread_chain(entries, templates_by_id,
+                                  expected_guest_threads)
+    if marker:
+        issues += _check_syscall_transitions(entries, templates_by_id,
+                                             trace_meta)
+        issues += _check_fault_excursions(entries, templates_by_id,
+                                          trace_meta)
+        issues += _check_syscall_fault_nesting(entries, templates_by_id,
+                                               trace_meta)
+    if pinned_binary is not None:
+        issues += _check_user_code_identity(templates, entries,
+                                            templates_by_id,
+                                            pinned_binary)
     issues += _check_wp_events(body_stats, entries)
     issues += _check_atomic_count(body_stats, entries, templates_by_id)
     return Report(issues=issues, stats=stats)
@@ -5960,9 +6408,42 @@ def validate(meta_path: Path, trace_path: Path,
     body_stats = trace_meta.get("body_stats") or {}
     stats["body_stats"] = body_stats
     issues += _check_iframe_cadence(body_stats, cp_entries, trace_meta)
-    issues += _check_regfile_records(body_stats, expected_threads)
-    issues += _check_thread_switch(body_stats, expected_threads)
-    issues += _check_thread_distribution(entries, expected_threads)
+    # System-mode thread population is scheduler-driven: the pinned
+    # process (and its kernel excursions) runs on whichever vCPU(s) the
+    # guest scheduler picked, so the per-thread record cadence is
+    # asserted against the *observed* tid set, bounded above by -smp.
+    if marker:
+        observed_tids = sorted({int(e.get("thread_id", 0))
+                                for e in entries})
+        smp = _parse_smp_from_command(trace_meta.get("command", ""))
+        extras = [t for t in observed_tids if t >= smp]
+        if extras:
+            issues.append(Issue(
+                "thread_distribution", "error",
+                f"entries carry thread_id(s) {extras} >= the guest's "
+                f"vCPU count (-smp {smp})",
+                {"observed": observed_tids, "smp": smp}))
+        issues.append(Issue(
+            "thread_distribution", "info",
+            f"observed vCPU tid(s) {observed_tids} of -smp {smp}",
+            {"observed": observed_tids, "smp": smp}))
+        threads_effective = max(1, len(observed_tids))
+    else:
+        threads_effective = expected_threads
+        issues += _check_thread_distribution(entries, expected_threads)
+    issues += _check_regfile_records(body_stats, threads_effective)
+    issues += _check_thread_switch(body_stats, threads_effective)
+    issues += _check_thread_record_cadence(
+        entries, trace_meta.get("body_record_order") or [])
+    # _check_thread_chain (the generated workload's user entries form
+    # exactly one control-flow chain) is NOT wired into this battery
+    # yet: it correctly fails on system-mode traces whose first-of-two
+    # faults in one BB drops the pre-fault prefix from the merged
+    # emission (aarch64 repro: seed 0x5150 blk_0, ldr demand fault then
+    # str CoW fault — the merged entry starts at the ldr, losing the
+    # adrp/add ahead of it).  Wire it here once that fault-merge bug is
+    # fixed; until then it runs in validate_structural() (thread_test,
+    # churn_test) where its verdicts gate those harnesses.
     # WP-event tallies are global (the writer counts every WP fault,
     # including those in the pre-window prologue — which in system mode
     # is the whole kernel boot + marker wait, where wrong-path faults are
@@ -5979,6 +6460,16 @@ def validate(meta_path: Path, trace_path: Path,
                                              trace_meta)
         issues += _check_fault_excursions(entries, templates_by_id,
                                           trace_meta)
+        # The generated marker workload carries the deterministic fault
+        # probe (sysinfo into a demand-zero page), so a system-mode
+        # trace must show a fault nested inside a syscall excursion.
+        issues += _check_syscall_fault_nesting(entries, templates_by_id,
+                                               trace_meta,
+                                               require_nested=True)
+        # ASID-pin content gate: user templates executed on CP must be
+        # the pinned binary's own bytes.
+        issues += _check_user_code_identity(templates, entries,
+                                            templates_by_id, binary_path)
 
     # ---- Per-insn regdata semantic checks ----------------------------------
     opcode_names = dict(trace_meta.get("encoding_maps", {}).get("opcode", {}))

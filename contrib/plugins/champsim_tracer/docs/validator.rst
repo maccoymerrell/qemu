@@ -117,8 +117,21 @@ Flags worth knowing:
    iterations.  Useful for pushing the trace past short-program
    icount budgets when testing simpoint mode.  The default depends on
    the sub-command: ``0`` (no injected loop) for ``generate`` and
-   ``all``, and ``5000`` for ``simpoint_test`` (so the synthetic
-   program runs past the second simpoint interval).
+   ``all``, ``5000`` for ``simpoint_test`` (so the synthetic
+   program runs past the second simpoint interval), and ``2000`` for
+   ``churn_test`` (long enough to outlive its budget, small enough to
+   stay inside the generator's CP-walk step cap).
+
+``--system`` (with ``--kernel`` / ``--rootfs`` / ``--sys-mem`` / ``--smp``)
+   Trace under ``qemu-system-<isa>`` instead of qemu-user: the
+   workload is staged into an initramfs and its compiled-in marker
+   opens + ASID-pins the window (``trace_window=marker``).  Implies
+   ``--marker`` at generation, which also injects the close(-1)
+   syscall probe and the sysinfo fault probe right after the marker.
+   ``--smp N`` boots N vCPUs; body entries then carry the vCPU index
+   as ``thread_id``.  The guest console (plus the plugin's stderr) is
+   captured to ``<base>.console.log`` and the segment-close coverage
+   line is asserted after the run.
 
 Sub-commands
 ~~~~~~~~~~~~
@@ -142,7 +155,16 @@ Sub-commands
    :ref:`Multi-thread test <validator-multi-thread>`.  Builds the
    hand-written 2-thread program for the requested ISA (parent +
    child both run identical atomic-RMW loops), traces it, and
-   asserts both threads are visible.
+   asserts both threads are visible.  With ``--system --smp N`` the
+   same clone pair runs marker-pinned inside a booted guest and the
+   assertions run against the vCPU-indexed body stream.
+
+``churn_test``
+   :ref:`Multi-process churn test <validator-churn>`.  System-mode
+   only: the guest's init forks through short-lived unmarked
+   processes before and while the marked workload runs, rolling the
+   ASID space over while the pinned window is open; asserts the pin
+   followed only the marked process.
 
 What gets checked
 -----------------
@@ -185,13 +207,66 @@ These don't need a generator ``meta.json`` and run on any ``.cst``.
    Exactly one BODY_TAG_REGFILE per ``(segment, thread)``.
 
 ``thread_switch``
-   Single-thread runs must produce zero BODY_TAG_THREAD_SWITCH
-   records; multi-thread runs must produce at least one (otherwise
+   Every segment body opens with one mandatory
+   BODY_TAG_THREAD_SWITCH naming the starting thread, so
+   single-thread runs must show exactly that opener (count equal to
+   the REGFILE cadence) and no interleaving switches; multi-thread
+   runs must show at least one switch per expected thread (otherwise
    no interleaving was captured).
 
 ``thread_distribution``
    Every expected thread contributed entries; no entries reference a
-   ``thread_id`` outside ``[0, expected_threads)``.
+   ``thread_id`` outside ``[0, expected_threads)``.  On system-mode
+   marker runs the thread population is the guest scheduler's choice,
+   so the cadence checks run against the *observed* tid set instead,
+   bounded above by the guest's ``-smp`` vCPU count (parsed from the
+   trace's own command line).
+
+``thread_records``
+   Positional per-record thread bookkeeping, from the decoder's body
+   record stream: an ENTRY carries the switch flag exactly when its
+   ``thread_id`` differs from the previous ENTRY's (plus the
+   mandatory opener on the segment's first ENTRY), and each
+   contributing thread has exactly one REGFILE record positioned
+   before its first ENTRY — the delta decoder's hard prerequisite.
+
+``thread_chain``
+   User-flow continuity of the interleaved body stream.  Filtered to
+   user-privilege entries, the stream must decompose into the
+   control-flow chains of the guest process's logical threads: every
+   user entry's start PC is reachable from a live chain's previous
+   block (fall-through, static branch target, or a CP-observed
+   profile target), or it births a new chain up to the expected
+   guest-thread count.  A dropped user block, a phantom entry, or a
+   foreign process's code leaking past the ASID pin all surface as an
+   *orphan* entry no chain can reach.  Chains are matched globally
+   (guest threads migrate across vCPUs); the per-tid direct-adjacency
+   connect rate is reported as info.  Runs in ``validate_structural``
+   (``thread_test``, ``churn_test``); not yet wired into the ``all``
+   battery — it correctly fails on a known fault-merge defect (see
+   the comment at the ``validate()`` call site).
+
+``syscall_fault_nesting``
+   Nested-excursion discipline (system-mode marker runs).  The
+   generated marker workload issues one syscall whose kernel path is
+   guaranteed to fault — ``sysinfo`` writing into a never-touched
+   demand-zero page (``emit_trace_fault_probe``; the buffer sits
+   64 KiB past the .data tail so no guest page size up to 64 KiB
+   pre-maps it) — so the trace must contain at least one user-syscall
+   excursion with ``fault_depth >= 1`` entries inside it.
+   Independent of the probe: per-tid fault depth changes by at most
+   one between consecutive entries, and a fault-anchored
+   (whole-BB-merged) entry sits at its excursion's unwind.  The
+   fault-depth histogram is reported for regression visibility.
+
+``user_code_identity``
+   ASID-pin content gate (system-mode marker runs).  Every
+   user-privilege template the CP stream executed must byte-match the
+   pinned binary's ELF image at its instruction addresses — a foreign
+   process scheduled into a reused ASID cannot byte-match the
+   ``-nostdlib`` workload even where guest processes share load
+   addresses.  WP-only user templates are exempt (wrong-path fetch
+   may wander) and counted in the info summary.
 
 ``wp_events``
    The writer's aggregate ``fault_count`` and
@@ -443,6 +518,75 @@ Run-to-completion is reliable because the parent's
 ``exit_group`` only fires after the child has set ``child_tid`` to
 zero on exit — both threads always finish.  Per-thread entry counts
 are deterministic enough to compare across runs at a glance.
+
+System-mode SMP form
+~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: console
+
+   $ python3 -m champsim_tracer_validator thread_test \
+         --system --smp 2 --isa mipsel -o out/ \
+         --build-dir ../../../../build --stop 2000000 --iters 2000000
+
+``thread_test_asm(isa, marker=True, iters=N)`` renders the same clone
+pair with the trace marker at ``_start`` (pinning the window before
+the clone — both guest threads share the pinned address space) and
+the end marker before ``exit_group``; the large default iteration
+count (300 000; raise with ``--iters``) keeps both threads runnable
+long enough for the guest scheduler to spread them across the
+``-smp`` vCPUs.  ``thread_id`` is then the vCPU index and the thread
+*population* is the scheduler's choice, so:
+
+* the record-cadence checks (``thread_records``, ``regfile_records``,
+  ``thread_switch``) run against the observed tid set,
+* ``thread_chain`` decomposes the user entries into the two guest
+  threads' control-flow chains regardless of which vCPUs they rode,
+* the run **fails** if all entries rode one vCPU (nothing multi-vCPU
+  was exercised — raise ``--iters`` / ``--stop``), and
+* the captured console log's segment-close line must not report an
+  under-budget close.
+
+.. _validator-churn:
+
+Multi-process churn test (``churn_test``)
+-----------------------------------------
+
+The ASID pin must follow *only* the marked process across ASID reuse.
+On MIPS the ASID space is 8 bits, so a few hundred short-lived
+processes force a generation rollover and the guest kernel reassigns
+the pinned ASID value to foreign processes while the trace window is
+open — the exact scenario the pin's reuse detector
+(``pin_asid_reuse_suspected``) and the kexc ownership model guard.
+
+.. code-block:: console
+
+   $ python3 -m champsim_tracer_validator churn_test \
+         --seed 0x5150 --isa mipsel -o out/ \
+         --build-dir ../../../../build
+
+What it does:
+
+#. Generates the standard marker workload with two extra probes: the
+   fault probe (as in every marker run) and a ``nanosleep`` probe
+   (``--sleep-probe``, default 40 s) right after the pin — the sleep
+   holds the window open on a frozen user clock while init churns.
+#. Stages an initramfs whose init forks ``--churn-pre`` (default 60)
+   short-lived processes before starting the workload and
+   ``--churn-during`` (default 300) more while it runs; each shell
+   iteration forks a subshell and execs ``/bin/true``, two fresh mm's
+   (and so two fresh ASIDs) per iteration.
+#. After the guest run, asserts on the decoded trace:
+
+   * **user_code_identity**: every CP-executed user template
+     byte-matches the marked binary's ELF image,
+   * **thread_chain**: the user entries form one control-flow chain,
+   * the window closed **at budget** on the user clock
+     (``user_covered == budget``, OK flag) — the workload outlives
+     the budget by construction (``--hot-iters``),
+   * ``pin_asid_reuse_suspected`` and ``kexc ASID-write events`` are
+     reported from the stats log (the detector may legitimately fire;
+     the content checks above are the gate),
+   * ``cst_audit`` and ``cst_decode --strict`` exit clean.
 
 Adding new validator coverage
 -----------------------------

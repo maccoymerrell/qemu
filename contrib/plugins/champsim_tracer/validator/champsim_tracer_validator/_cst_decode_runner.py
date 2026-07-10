@@ -700,7 +700,35 @@ def _parse_full(text: str) -> tuple[dict, list[dict], list[dict]]:
     # mid-stream when it short-circuits.
     meta["body_stats"] = _parse_body_stats(lines)
     meta["impossible_attributions"] = _parse_impossible_attributions(lines)
+    meta["body_record_order"] = _scan_body_order(lines)
     return meta, templates, entries
+
+
+_REGFILE_HEAD_RE = re.compile(r"^REGFILE thread=(\d+) n=\d+$")
+
+
+def _scan_body_order(lines: list[str]) -> list[tuple[str, int]]:
+    """Ordered body-record stream: ("regfile", thread_id) and
+    ("entry", thread_id) tuples in the order the records appear in the
+    body section.  ``_iter_body`` deliberately skips REGFILE blocks (they
+    carry no per-entry payload the validator's entry checks consume), so
+    record *ordering* invariants — a thread's REGFILE preceding its first
+    ENTRY — need this positional view."""
+    order: list[tuple[str, int]] = []
+    in_body = False
+    for i, line in enumerate(lines):
+        if not in_body:
+            if line == "BODY" and i + 1 < len(lines) and lines[i + 1] == "----":
+                in_body = True
+            continue
+        m = _REGFILE_HEAD_RE.match(line)
+        if m:
+            order.append(("regfile", int(m.group(1))))
+            continue
+        m = _ENTRY_HEAD_RE.match(line)
+        if m:
+            order.append(("entry", int(m.group(2))))
+    return order
 
 
 _IMPOSSIBLE_RE = re.compile(

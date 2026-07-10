@@ -106,6 +106,12 @@ def _parse_args() -> argparse.Namespace:
                              "workload into (default: the local systest root).")
         sp.add_argument("--sys-mem", default="512M",
                         help="Guest RAM for system-mode (default: 512M).")
+        sp.add_argument("--smp", type=int, default=1,
+                        help="Guest vCPU count for system-mode (-smp N). "
+                             "Body entries then carry the vCPU index as "
+                             "thread_id; the validator asserts the "
+                             "per-thread record cadence against the "
+                             "observed tid set.")
 
     # generate
     g = sub.add_parser("generate", help="Emit .S + .meta.json")
@@ -181,6 +187,7 @@ def _parse_args() -> argparse.Namespace:
     v.add_argument("--depth", type=int, default=64,
                    help="plugin's WP instruction budget; must match "
                         "the value passed to `trace --depth`")
+    system_args(v)
 
     # all
     al = sub.add_parser("all", help="generate+build+trace+analyze+validate")
@@ -246,13 +253,71 @@ def _parse_args() -> argparse.Namespace:
         "thread_test",
         help="End-to-end 2-thread test: parent+child run identical "
              "atomic-RMW loops, validator asserts both threads visible "
-             "in the trace")
+             "in the trace.  With --system --smp 2 the clone pair runs "
+             "inside a marker-pinned guest and the assertions run "
+             "against the vCPU-indexed body stream.")
     common(tt)
     tt.add_argument("--isa", choices=ISA_CHOICES, action="append",
                     required=True)
     tt.add_argument("--build-dir", type=Path, required=True)
     tt.add_argument("--depth", type=int, default=64)
     tt.add_argument("--regdata", action="store_true")
+    tt.add_argument("--iters", type=int, default=None,
+                    help="Per-thread loop iterations (default 1000; "
+                         "system mode defaults to 300000 so both guest "
+                         "threads stay runnable long enough for the "
+                         "scheduler to spread them across vCPUs).")
+    tt.add_argument("--stop", type=int, default=200_000,
+                    help="System mode: marker-window user-insn budget.")
+    system_args(tt)
+
+    ct = sub.add_parser(
+        "churn_test",
+        help="Multi-process ASID-churn test (system mode): guest init "
+             "burns through short-lived unmarked processes before and "
+             "while the marked workload runs; asserts the pin followed "
+             "only the marked process (every user template byte-matches "
+             "the marked binary), coverage closed at budget, and "
+             "audit/strict-lint stay clean.")
+    common(ct)
+    ct.add_argument("--seed", type=_parse_seed, required=True)
+    ct.add_argument("--isa", choices=("x86_64", "mipsel"), action="append",
+                    required=True,
+                    help="mipsel (8-bit ASIDs; churn forces a generation "
+                         "rollover) and/or x86_64.")
+    ct.add_argument("--build-dir", type=Path, required=True)
+    ct.add_argument("--diamonds", type=int, default=8)
+    ct.add_argument("--side-len-min", type=int, default=2)
+    ct.add_argument("--side-len-max", type=int, default=4)
+    ct.add_argument("--depth", type=int, default=8,
+                    help="Wrong-path depth; kept small — the test's "
+                         "subject is the ASID pin, not WP coverage.")
+    ct.add_argument("--stop", type=int, default=150_000,
+                    help="Marker-window user-insn budget.  The workload "
+                         "(scaled by --hot-iters) must run past it so "
+                         "the window closes AT budget after the churn "
+                         "overlap.")
+    ct.add_argument("--hot-iters", type=int, default=2_000,
+                    help="Loop iterations per diamond side; sized so the "
+                         "workload's user-insn total exceeds --stop "
+                         "while keeping the generator's CP walk within "
+                         "its step cap.")
+    ct.add_argument("--sleep-probe", type=int, default=40,
+                    help="Seconds the marked workload nanosleeps right "
+                         "after pinning (user clock frozen, window "
+                         "open) so the in-flight churn can roll the "
+                         "guest's ASID space before the workload's "
+                         "user code runs.")
+    ct.add_argument("--churn-pre", type=int, default=60,
+                    help="Short-lived processes launched before the "
+                         "marked workload starts.")
+    ct.add_argument("--churn-during", type=int, default=300,
+                    help="Short-lived processes launched while the "
+                         "marked workload runs (each iteration forks a "
+                         "subshell + execs /bin/true: two fresh mm's; "
+                         "300 iterations comfortably roll MIPS's 8-bit "
+                         "ASID space inside the sleep window).")
+    system_args(ct)
 
     return p.parse_args()
 
@@ -300,6 +365,7 @@ def cmd_generate(args, isa: str | None = None) -> None:
         # System-mode tracing relies on the marker firing in the workload's
         # own address space, so --system implies --marker.
         marker=getattr(args, "marker", False) or getattr(args, "system", False),
+        sleep_probe=getattr(args, "sleep_probe", 0),
     )
     # Emit per-ISA metadata and a per-ISA assembly source.
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -387,17 +453,73 @@ def _trace_system(args, isa: str, bin_path: Path, plugin: Path,
 
     stage_dir = args.out_dir / f"sysstage_{isa}"
     stage_dir.mkdir(parents=True, exist_ok=True)
-    initrd = SYS.stage_initramfs(base_root, bin_path, stage_dir)
+    initrd = SYS.stage_initramfs(base_root, bin_path, stage_dir,
+                                 init_text=getattr(args, "_init_text", None))
     cmd = SYS.system_qemu_cmd(qemu_sys, kernel, initrd, plugin, plugin_opts,
-                              mem=getattr(args, "sys_mem", "512M"), isa=isa)
+                              mem=getattr(args, "sys_mem", "512M"), isa=isa,
+                              smp=getattr(args, "smp", 1))
     print(f"trace[{isa}] (system): {' '.join(cmd)}")
-    rc = subprocess.call(cmd)
+    rc = _run_and_log(cmd, Path(f"{out_base}.console.log"))
     cst = Path(f"{out_base}.cst")
     if rc != 0 or not cst.is_file():
         print(f"trace[{isa}]: FAIL rc={rc}")
         return rc or 1
     print(f"trace[{isa}]: wrote {cst.name}")
     return 0
+
+
+def _run_and_log(cmd: list[str], log_path: Path) -> int:
+    """Run @cmd with guest console + plugin stderr captured to
+    @log_path (system-mode qemu mixes both on stdio; the plugin's
+    segment-coverage line is asserted from this log after the run).
+    The log's tail is echoed on failure."""
+    with open(log_path, "w") as f:
+        rc = subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT)
+    if rc != 0:
+        try:
+            tail = log_path.read_text().splitlines()[-15:]
+            print(f"--- {log_path.name} (tail) ---")
+            for line in tail:
+                print(f"  {line}")
+        except OSError:
+            pass
+    return rc
+
+
+def _check_segment_coverage(console_log: Path, require_ok: bool = False,
+                            label: str = "") -> int:
+    """Assert the plugin's per-segment coverage line from the captured
+    console log: ``finished segment [...] user_covered=C user_budget=B
+    ... FLAG``.  UNDER means the window closed before its budget for a
+    reason other than the end marker — always an error.  @require_ok
+    additionally rejects END closes (the workload must have run past
+    its budget, so kernel/excursion instructions charged to the user
+    clock would surface as covered != budget).  Returns 0 on pass."""
+    try:
+        text = console_log.read_text()
+    except OSError:
+        print(f"coverage[{label}]: FAIL  console log missing: {console_log}")
+        return 1
+    segs = SYS.parse_finished_segments(text)
+    if not segs:
+        print(f"coverage[{label}]: FAIL  no 'finished segment' line in "
+              f"{console_log.name} (plugin never closed a window)")
+        return 1
+    rc = 0
+    for s in segs:
+        line = (f"coverage[{label}]: covered={s['covered']} "
+                f"budget={s['budget']} flag={s['flag']} "
+                f"(user_clock={s['user_clock']})")
+        if s["flag"] == "UNDER":
+            print(f"{line}  FAIL (window closed under budget)")
+            rc = 1
+        elif require_ok and s["flag"] != "OK":
+            print(f"{line}  FAIL (expected the window to close at "
+                  f"budget, not at workload end)")
+            rc = 1
+        else:
+            print(f"{line}  ok")
+    return rc
 
 
 def cmd_trace(args, isa: str | None = None) -> int:
@@ -499,7 +621,14 @@ def cmd_validate(args, isa: str | None = None) -> int:
                         start_symbol=start_sym,
                         marker=marker)
     print(report.summary())
-    return 1 if report.errors() else 0
+    rc = 1 if report.errors() else 0
+    if marker:
+        # System-mode runs capture the guest console; the plugin's
+        # segment-close line must not report an under-budget close.
+        console = Path(f"{_trace_base(args.out_dir, prog, isa)}.console.log")
+        if console.is_file() and _check_segment_coverage(console, label=isa):
+            rc = 1
+    return rc
 
 
 def cmd_all(args) -> int:
@@ -525,45 +654,63 @@ def cmd_all(args) -> int:
     return rc_total
 
 
+_THREAD_TEST_CC = {
+    "x86_64":  ["g++"],
+    "aarch64": ["aarch64-linux-gnu-g++"],
+    "riscv64": ["riscv64-linux-gnu-g++", "-march=rv64gc",
+                "-mabi=lp64d", "-mno-relax", "-Wl,--no-relax"],
+    "mipsel":  ["mipsel-linux-gnu-g++", "-mno-abicalls",
+                "-fno-pic", "-e", "_start"],
+}
+
+
 def cmd_thread_test(args) -> int:
     """End-to-end multi-thread test.
 
     Builds a hand-written 2-thread program for the requested ISA
-    (parent + child both run identical 1000-iteration atomic-RMW
-    loops; parent spins on the kernel-cleared child-tid slot, then
-    exit_groups), traces it, and validates that the resulting .cst
-    captures both threads:
+    (parent + child both run identical atomic-RMW loops; parent spins
+    on the kernel-cleared child-tid slot, then exit_groups), traces it,
+    and validates that the resulting .cst captures both threads:
 
-      * exactly 2 BODY_TAG_REGFILE records (one per thread),
-      * at least one BODY_TAG_THREAD_SWITCH (the threads interleaved),
-      * both thread_ids 0 and 1 contributed CP entries,
-      * atomic_count / wp_events / iframe / encoding-map invariants pass.
+      * one BODY_TAG_REGFILE per contributing thread, positioned
+        before that thread's first entry,
+      * BODY_TAG_THREAD_SWITCH records exactly at the tid changes,
+      * both threads' user entries decomposing into 2 valid
+        control-flow chains (thread_chain),
+      * atomic_count / wp_events / iframe / encoding-map invariants.
+
+    Default mode traces under qemu-user (thread_id = host thread,
+    deterministically 0 and 1).  With ``--system --smp N`` the same
+    clone pair runs marker-pinned inside a booted guest: thread_id is
+    then the vCPU index and the *population* is the guest scheduler's
+    choice, so the record-cadence checks run against the observed tid
+    set — but the test demands the workload actually exercised more
+    than one vCPU, and fails if the scheduler kept it serial.
     """
-    from . import _thread_test_asm as TASM
+    from ._thread_test_asm import thread_test_asm
+    system = getattr(args, "system", False)
+    iters = args.iters if args.iters is not None else \
+        (300_000 if system else 1000)
     rc_total = 0
     for isa in args.isa:
-        print(f"\n==== thread_test {isa} ====")
-        if isa not in TASM.THREAD_TEST_ASM:
+        print(f"\n==== thread_test {isa}"
+              f"{' (system)' if system else ''} ====")
+        out_dir = Path(args.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        suffix = "_sys" if system else ""
+        s_path = out_dir / f"thread_test{suffix}_{isa}.S"
+        bin_path = out_dir / f"thread_test{suffix}_{isa}"
+        cst_path = out_dir / f"thread_test{suffix}_{isa}.cst"
+        try:
+            s_path.write_text(thread_test_asm(isa, marker=system,
+                                              iters=iters))
+        except KeyError:
             print(f"thread_test[{isa}]: SKIP  no template available")
             continue
 
-        out_dir = Path(args.out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        s_path = out_dir / f"thread_test_{isa}.S"
-        bin_path = out_dir / f"thread_test_{isa}"
-        cst_path = out_dir / f"thread_test_{isa}.cst"
-        s_path.write_text(TASM.THREAD_TEST_ASM[isa])
-
-        cc_map = {
-            "x86_64":  ["g++"],
-            "aarch64": ["aarch64-linux-gnu-g++"],
-            "riscv64": ["riscv64-linux-gnu-g++", "-march=rv64gc",
-                        "-mabi=lp64d", "-mno-relax", "-Wl,--no-relax"],
-            "mipsel":  ["mipsel-linux-gnu-g++", "-mno-abicalls",
-                        "-fno-pic", "-e", "_start"],
-        }[isa]
-        build_cmd = cc_map + ["-static", "-nostdlib", "-nostartfiles",
-                              str(s_path), "-o", str(bin_path)]
+        build_cmd = _THREAD_TEST_CC[isa] + [
+            "-static", "-nostdlib", "-nostartfiles",
+            str(s_path), "-o", str(bin_path)]
         print(f"build[{isa}]: {' '.join(build_cmd)}")
         rc = subprocess.call(build_cmd)
         if rc != 0:
@@ -572,23 +719,160 @@ def cmd_thread_test(args) -> int:
             continue
 
         plugin = args.build_dir / "contrib" / "plugins" / "libchampsim_tracer.so"
-        qemu = args.build_dir / f"qemu-{isa}"
-        plugin_opts = f"outfile={bin_path},wpdepth={args.depth},memdata=1"
-        if getattr(args, "regdata", False):
-            plugin_opts += ",regdata=1"
-        cmd = [str(qemu), "-plugin", f"{plugin},{plugin_opts}", str(bin_path)]
-        print(f"trace[{isa}]: {' '.join(cmd)}")
-        rc = subprocess.call(cmd)
-        if rc != 0 or not cst_path.is_file():
-            print(f"thread_test[{isa}]: trace FAILED rc={rc}")
-            rc_total = 1
-            continue
+        if system:
+            rc = _trace_system(args, isa, bin_path, plugin, bin_path)
+            if rc != 0:
+                rc_total = 1
+                continue
+        else:
+            qemu = args.build_dir / f"qemu-{isa}"
+            plugin_opts = f"outfile={bin_path},wpdepth={args.depth},memdata=1"
+            if getattr(args, "regdata", False):
+                plugin_opts += ",regdata=1"
+            cmd = [str(qemu), "-plugin", f"{plugin},{plugin_opts}",
+                   str(bin_path)]
+            print(f"trace[{isa}]: {' '.join(cmd)}")
+            rc = subprocess.call(cmd)
+            if rc != 0 or not cst_path.is_file():
+                print(f"thread_test[{isa}]: trace FAILED rc={rc}")
+                rc_total = 1
+                continue
 
         print(f"validate[{isa}] {cst_path.name}:")
-        report = V.validate_structural(cst_path, expected_threads=2)
+        if system:
+            # vCPU population is the guest scheduler's choice: derive
+            # expected_threads from the trace, then insist the pinned
+            # process actually ran on more than one vCPU (otherwise the
+            # -smp run exercised nothing multi-vCPU).
+            dec = V._load_decoder()
+            _m, _t, entries = dec.decode_champsim_tracer(cst_path)
+            observed = sorted({int(e.get("thread_id", 0))
+                               for e in entries})
+            print(f"thread_test[{isa}]: observed vCPU tids {observed} "
+                  f"(-smp {getattr(args, 'smp', 1)})")
+            report = V.validate_structural(
+                cst_path, expected_threads=max(1, len(observed)),
+                expected_guest_threads=2, marker=True)
+            print(report.summary())
+            if report.errors():
+                rc_total = 1
+            if len(observed) < 2:
+                print(f"thread_test[{isa}]: FAIL  the pinned workload's "
+                      f"entries all rode vCPU {observed}; the guest "
+                      f"scheduler never spread the clone pair — raise "
+                      f"--iters or --stop")
+                rc_total = 1
+            if _check_segment_coverage(
+                    Path(f"{bin_path}.console.log"), label=isa):
+                rc_total = 1
+        else:
+            report = V.validate_structural(cst_path, expected_threads=2,
+                                           expected_guest_threads=2)
+            print(report.summary())
+            if report.errors():
+                rc_total = 1
+    return rc_total
+
+
+def cmd_churn_test(args) -> int:
+    """Multi-process ASID-churn test (system mode).
+
+    The guest's init launches a stream of short-lived unmarked
+    processes before and while the marked workload runs (see
+    ``_system.churn_init``); on MIPS the churn rolls the 8-bit ASID
+    space over, forcing the guest kernel to reassign the pinned ASID
+    value to foreign processes while the trace window is open.  The
+    pin must follow only the marked process:
+
+      * every user-privilege template the CP stream executed must
+        byte-match the marked binary's ELF image (foreign user code
+        leaking past the pin cannot byte-match the -nostdlib workload),
+      * the user entries form one control-flow chain (thread_chain),
+      * the window closes AT its budget on the user clock
+        (user_covered == budget, OK flag) — the workload outlives the
+        budget by construction (--hot-iters),
+      * ``pin_asid_reuse_suspected`` is reported (the detector may
+        legitimately fire; what must hold is the trace content above),
+      * cst_audit and cst_decode --strict stay clean.
+    """
+    args.system = True
+    rc_total = 0
+    for isa in args.isa:
+        print(f"\n==== churn_test {isa} ====")
+        cmd_generate(args, isa)
+        if cmd_build(args, isa) != 0:
+            rc_total = 1
+            continue
+        prog = _prog_base(args.out_dir, args.prog)
+        bin_path = _bin_path(args.out_dir, prog, isa)
+        out_base = _trace_base(args.out_dir, prog, isa)
+        plugin = args.build_dir / "contrib" / "plugins" / "libchampsim_tracer.so"
+
+        args._init_text = SYS.churn_init(args.churn_pre, args.churn_during)
+        try:
+            rc = _trace_system(args, isa, bin_path, plugin, out_base)
+        finally:
+            args._init_text = None
+        if rc != 0:
+            rc_total = 1
+            continue
+        cst = Path(f"{out_base}.cst")
+
+        # Guest-side churn actually happened: init echoes its phases.
+        # The plugin exits qemu the moment the window closes at budget,
+        # so the *completion* echo of the in-flight churn is usually
+        # cut off — its start echo plus the kernel-side scheduling
+        # signature (kexc ASID-write events in the stats log) are the
+        # evidence that churn overlapped the open window.
+        console = Path(f"{out_base}.console.log")
+        ctext = console.read_text() if console.exists() else ""
+        for tag in ("pre-workload churn done", "in-flight churn started"):
+            if tag not in ctext:
+                print(f"churn_test[{isa}]: FAIL  guest init never "
+                      f"reported '{tag}' (churn did not run)")
+                rc_total = 1
+        if "in-flight churn done" in ctext:
+            print(f"churn_test[{isa}]: in-flight churn completed before "
+                  f"the window closed")
+
+        print(f"validate[{isa}] {cst.name}:")
+        dec = V._load_decoder()
+        _meta, _templates, entries = dec.decode_champsim_tracer(cst)
+        observed = sorted({int(e.get("thread_id", 0)) for e in entries})
+        report = V.validate_structural(
+            cst, expected_threads=max(1, len(observed)),
+            expected_guest_threads=1, marker=True,
+            pinned_binary=bin_path)
         print(report.summary())
         if report.errors():
             rc_total = 1
+
+        if _check_segment_coverage(console, require_ok=True, label=isa):
+            rc_total = 1
+
+        stats_log = Path(f"{out_base}.stats.log")
+        stats_text = stats_log.read_text() if stats_log.is_file() else ""
+        reuse = SYS.parse_pin_asid_reuse(stats_text)
+        kexc_writes = SYS.parse_kexc_asid_writes(stats_text)
+        if reuse is None:
+            print(f"churn_test[{isa}]: FAIL  no 'pin ASID reuse suspected' "
+                  f"counter in {stats_log.name}")
+            rc_total = 1
+        else:
+            print(f"churn_test[{isa}]: pin_asid_reuse_suspected={reuse} "
+                  f"kexc_asid_writes={kexc_writes} "
+                  f"(detector report; content checks above are the gate)")
+
+        for tool, extra in (("cst_audit", []), ("cst_decode", ["--strict"])):
+            tool_path = args.build_dir / "contrib" / "plugins" / tool
+            cmd = [str(tool_path)] + extra + [str(cst)]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            name = " ".join([tool] + extra)
+            print(f"churn_test[{isa}]: {name} rc={res.returncode}")
+            if res.returncode != 0:
+                for line in (res.stderr or res.stdout).splitlines()[-10:]:
+                    print(f"  {line}")
+                rc_total = 1
     return rc_total
 
 
@@ -698,6 +982,8 @@ def main() -> int:
         return cmd_simpoint_test(args)
     if args.cmd == "thread_test":
         return cmd_thread_test(args)
+    if args.cmd == "churn_test":
+        return cmd_churn_test(args)
     return 2
 
 

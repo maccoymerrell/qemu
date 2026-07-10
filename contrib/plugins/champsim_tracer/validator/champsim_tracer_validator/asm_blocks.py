@@ -291,6 +291,125 @@ def emit_trace_syscall_probe(isa: str) -> list[str]:
     ]
 
 
+def emit_trace_fault_probe(isa: str) -> list[str]:
+    """Emit one deterministic syscall whose kernel path takes a
+    synchronous fault, right after the close(-1) probe: ``sysinfo``
+    writing its result into a never-touched demand-zero page.
+
+    The destination buffer lives on its own .bss page, padded 64 KiB
+    away from the .data tail so the ELF loader's partial-page zeroing
+    cannot pre-map it under any guest page size up to 64 KiB (MIPS and
+    aarch64 kernels commonly run 16K/64K pages, where a 4K pad would
+    leave the buffer inside the pre-touched file-tail page and the
+    probe would never fault).  The probe runs before any workload code
+    touches memory — so the kernel's copy-out is the page's first
+    access ever.  In system mode that access faults *inside* the
+    syscall handler (a demand-zero page fault at kernel privilege,
+    ``fault_depth >= 1`` nested in the depth-0 syscall excursion),
+    giving the validator's ``syscall_fault_nesting`` check a guaranteed
+    nested excursion to assert on.  The fault is resolved by the
+    kernel (the page maps), so the syscall still returns normally and
+    the round-trip lands on the fall-through like any other syscall.
+    Under qemu-user the page is host-managed and the syscall is a
+    harmless no-op for the trace."""
+    bss = [
+        "  .pushsection .bss",
+        "  .balign 65536",
+        "  .skip 65536",
+        "cst_fault_probe_page:",
+        "  .skip 65536",
+        "  .popsection",
+    ]
+    if isa == "x86_64":
+        return bss + [
+            "  leaq cst_fault_probe_page(%rip), %rdi",
+            "  mov $99, %eax",     # __NR_sysinfo
+            "  syscall",
+        ]
+    if isa == "aarch64":
+        return bss + [
+            "  adrp x0, cst_fault_probe_page",
+            "  add x0, x0, :lo12:cst_fault_probe_page",
+            "  mov w8, #179",      # __NR_sysinfo (asm-generic)
+            "  svc #0",
+        ]
+    if isa == "riscv64":
+        return bss + [
+            "  la a0, cst_fault_probe_page",
+            "  li a7, 179",        # __NR_sysinfo (asm-generic)
+            "  ecall",
+        ]
+    # mipsel (o32): __NR_sysinfo = 4000 + 116.
+    return bss + [
+        "  lui $a0, %hi(cst_fault_probe_page)",
+        "  addiu $a0, $a0, %lo(cst_fault_probe_page)",
+        "  li $v0, 4116",
+        "  syscall",
+    ]
+
+
+def emit_trace_sleep_probe(isa: str, seconds: int) -> list[str]:
+    """Emit one ``nanosleep(@seconds)`` right after the start marker.
+
+    The churn test uses this to hold the marker-pinned window open on a
+    frozen user clock (sleeping burns no user instructions) while the
+    guest's init forks through enough short-lived processes to roll the
+    ASID space over — the pinned process then wakes and runs the actual
+    workload *after* its ASID generation was recycled, which is the
+    content-purity scenario the test asserts.  The timespec lives on the
+    stack; the syscall ABI registers are clobbered before the workload
+    proper starts, which is harmless (same contract as the other
+    probes)."""
+    s = int(seconds)
+    if isa == "x86_64":
+        return [
+            "  sub $16, %rsp",
+            f"  movq ${s}, (%rsp)",
+            "  movq $0, 8(%rsp)",
+            "  mov %rsp, %rdi",
+            "  xor %esi, %esi",
+            "  mov $35, %eax",     # __NR_nanosleep
+            "  syscall",
+            "  add $16, %rsp",
+        ]
+    if isa == "aarch64":
+        return [
+            "  sub sp, sp, #16",
+            f"  mov x9, #{s}",
+            "  str x9, [sp]",
+            "  str xzr, [sp, #8]",
+            "  mov x0, sp",
+            "  mov x1, #0",
+            "  mov w8, #101",      # __NR_nanosleep (asm-generic)
+            "  svc #0",
+            "  add sp, sp, #16",
+        ]
+    if isa == "riscv64":
+        return [
+            "  addi sp, sp, -16",
+            f"  li t0, {s}",
+            "  sd t0, 0(sp)",
+            "  sd zero, 8(sp)",
+            "  mv a0, sp",
+            "  li a1, 0",
+            "  li a7, 101",        # __NR_nanosleep (asm-generic)
+            "  ecall",
+            "  addi sp, sp, 16",
+        ]
+    # mipsel (o32): __NR_nanosleep = 4000 + 166; 32-bit timespec words.
+    return [
+        "  addiu $sp, $sp, -16",
+        f"  li $t1, {s}",
+        "  sw $t1, 0($sp)",
+        "  sw $zero, 4($sp)",
+        "  move $a0, $sp",
+        "  move $a1, $zero",
+        "  li $v0, 4166",
+        "  syscall",
+        "  addiu $sp, $sp, 16",
+    ]
+
+
 def emit_trace_marker_end(isa: str) -> list[str]:
     """Emit the END marker just before the workload exits: the plugin closes
     the trace window when it executes in the pinned process (the "or the

@@ -34,6 +34,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -75,6 +76,57 @@ _ISA_BOOT = {
 }
 
 
+# The plugin's per-segment close line (stderr).  In marker mode the
+# coverage and budget run on the user-instruction clock and carry the
+# "user_" prefix; OK = covered >= budget, END = closed by the end
+# marker / workload exit under budget, UNDER = closed early for any
+# other reason (always a failure).
+_FINISHED_SEG_RE = re.compile(
+    r"champsim_tracer: finished segment \[icount (\d+) \.\. (\d+)\]\s+"
+    r"actual_icount=(\d+)\s+(user_)?covered=(\d+)\s+(?:user_)?budget=(\d+)"
+    r"\s+rep_fanout=(\d+)\s+trace_arch_insns=(\d+)\s+(OK|END|UNDER)")
+
+
+def parse_finished_segments(console_text: str) -> list[dict]:
+    """Parse every per-segment coverage line the plugin printed into the
+    captured console log.  Returns one dict per closed segment with
+    covered / budget / flag / user_clock keys."""
+    out = []
+    for m in _FINISHED_SEG_RE.finditer(console_text):
+        out.append({
+            "lo": int(m.group(1)),
+            "hi": int(m.group(2)),
+            "actual_icount": int(m.group(3)),
+            "user_clock": m.group(4) is not None,
+            "covered": int(m.group(5)),
+            "budget": int(m.group(6)),
+            "rep_fanout": int(m.group(7)),
+            "trace_arch_insns": int(m.group(8)),
+            "flag": m.group(9),
+        })
+    return out
+
+
+_PIN_REUSE_RE = re.compile(r"pin ASID reuse suspected\s+(\d+)")
+_KEXC_ASID_RE = re.compile(r"kexc ASID-write events\s+(\d+)")
+
+
+def parse_pin_asid_reuse(stats_text: str) -> int | None:
+    """The `pin ASID reuse suspected` counter from a <out>.stats.log
+    (None when the stats file carries no summary)."""
+    m = _PIN_REUSE_RE.search(stats_text)
+    return int(m.group(1)) if m else None
+
+
+def parse_kexc_asid_writes(stats_text: str) -> int | None:
+    """The `kexc ASID-write events` counter from a <out>.stats.log —
+    every guest context switch writes the ASID register, so this is the
+    churn test's kernel-side evidence that other processes were being
+    scheduled while the pinned window was open."""
+    m = _KEXC_ASID_RE.search(stats_text)
+    return int(m.group(1)) if m else None
+
+
 def default_kernel(isa: str) -> Path:
     b = _ISA_BOOT[isa]
     return SYSTEST_ROOT / b["dir"] / b["kernel"]
@@ -97,10 +149,47 @@ echo "=== /workload exit=$? ; powering off ==="
 poweroff -f
 """
 
+# Churn-test init: the marked workload runs concurrently with a stream of
+# short-lived unmarked processes (each shell-loop iteration forks a subshell
+# and execs /bin/true, so every iteration burns through two fresh mm's and
+# with them two fresh ASIDs).  A pre-workload burst gets the guest's ASID
+# allocator away from its boot-time state; the in-flight churn then forces
+# allocator pressure — on MIPS's 8-bit ASID space, a full generation
+# rollover — while the pinned trace window is open.  The workload runs in
+# the background so init's own shell can keep forking; init waits for it
+# before powering off.
+_INIT_CHURN = """#!/bin/sh
+mount -t devtmpfs none /dev 2>/dev/null
+mount -t proc  none /proc 2>/dev/null
+mount -t sysfs none /sys  2>/dev/null
+exec >/dev/console 2>&1 </dev/console
+echo "=== cst_validator churn-test guest: $(uname -r) ==="
+i=0
+while [ $i -lt {pre} ]; do /bin/true; i=$((i+1)); done
+echo "=== pre-workload churn done ($i procs) ==="
+/workload &
+wpid=$!
+echo "=== in-flight churn started ==="
+i=0
+while [ $i -lt {during} ]; do /bin/true; i=$((i+1)); done
+echo "=== in-flight churn done ($i procs) ==="
+wait $wpid
+echo "=== /workload exit=$? ; powering off ==="
+poweroff -f
+"""
 
-def stage_initramfs(base_root: Path, workload: Path, stage_dir: Path) -> Path:
+
+def churn_init(pre: int, during: int) -> str:
+    """The churn-test /init script: @pre short-lived processes before the
+    marked workload starts, @during more launched while it runs."""
+    return _INIT_CHURN.format(pre=int(pre), during=int(during))
+
+
+def stage_initramfs(base_root: Path, workload: Path, stage_dir: Path,
+                    init_text: str | None = None) -> Path:
     """Copy @base_root, add @workload as /workload plus an init that runs it,
-    and repack into <stage_dir>/rootfs.cpio.gz.  Returns the cpio path."""
+    and repack into <stage_dir>/rootfs.cpio.gz.  Returns the cpio path.
+    @init_text overrides the default run-then-poweroff /init script."""
     root = stage_dir / "sysroot"
     if root.exists():
         shutil.rmtree(root)
@@ -114,7 +203,7 @@ def stage_initramfs(base_root: Path, workload: Path, stage_dir: Path) -> Path:
     shutil.copy2(workload, dst)
     dst.chmod(0o755)
     init = root / "init"
-    init.write_text(_INIT)
+    init.write_text(init_text if init_text is not None else _INIT)
     init.chmod(0o755)
 
     cpio = stage_dir / "rootfs.cpio.gz"
@@ -137,7 +226,7 @@ def stage_initramfs(base_root: Path, workload: Path, stage_dir: Path) -> Path:
 
 def system_qemu_cmd(qemu_system: Path, kernel: Path, initrd: Path,
                     plugin: Path, plugin_opts: str, mem: str = "512M",
-                    isa: str = "x86_64") -> list[str]:
+                    isa: str = "x86_64", smp: int = 1) -> list[str]:
     """Build the qemu-system command that boots @kernel + @initrd headless
     with the plugin loaded, powering off (not rebooting) on guest halt.
     Machine model and console come from the per-ISA boot table.
@@ -161,5 +250,7 @@ def system_qemu_cmd(qemu_system: Path, kernel: Path, initrd: Path,
         "-nographic", "-no-reboot", "-m", mem,
         "-plugin", f"{plugin},{plugin_opts}",
     ]
+    if smp and int(smp) > 1:
+        cmd += ["-smp", str(int(smp))]
     cmd += os.environ.get("CST_QEMU_EXTRA_ARGS", "").split()
     return cmd

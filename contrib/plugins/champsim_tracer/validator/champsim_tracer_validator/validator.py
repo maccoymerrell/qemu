@@ -3277,6 +3277,23 @@ def _check_wrong_path_chains(entries: list[dict],
     branch realizes an exact-or-longer chain vs its own prediction;
     with no later instance it is accepted on the event alone and
     surfaced as a notable INFO issue naming the branch and target.
+
+    A chain that diverges at/after the *fault-poison boundary* — the
+    first block of the first FAULT-marked WP entry — is accepted and
+    surfaced as a notable INFO.  The plugin's wrong-path fault
+    semantics (architecture.rst "Wrong-path chain termination")
+    suppress a speculative fault and trace past it to the natural
+    branch end, so branches downstream of the fault resolve on
+    registers the unfulfilled access left off-model; the wire entry
+    carries ``fault_insn_index`` and the consumer squashes the
+    dependent slice, so the post-fault tail is squash-shadow output
+    the exact-known synthetic model deliberately does not cover.
+    (System mode; the canonical trigger is a guest-TLB-cold excursion
+    on a software-managed-TLB ISA, where the refill exception cannot
+    be taken speculatively — corroborated by the CP taking the real
+    refill fault immediately after the fork.)  A divergence *before*
+    the boundary is still an error, as is any divergence with no
+    fault-marked entry.
     """
     issues: list[Issue] = []
     cp_pos = -1
@@ -3349,6 +3366,10 @@ def _check_wrong_path_chains(entries: list[dict],
         wp_left_user = False   # entered kernel, or faulted out of user CFG
         raw_len_at_cross: int | None = None   # len(wp_raw) just BEFORE the
                                               # first block that left user space
+        raw_len_at_fault: int | None = None   # len(wp_raw) just BEFORE the
+                                              # first FAULT-marked entry
+        fault_entry_has_blocks = False
+        first_fault_at = None   # (entry index, fault_insn_index) for reporting
         for wp in e.get("wp_entries", []):
             crossed = bool(wp.get("fault") or wp.get("translation_unavailable"))
             wt = (templates_by_id or {}).get(wp["template_id"])
@@ -3357,9 +3378,14 @@ def _check_wrong_path_chains(entries: list[dict],
             if crossed and raw_len_at_cross is None:
                 # user blocks emitted before this crossing entry
                 raw_len_at_cross = len(wp_raw)
-            wp_raw.extend(
-                bid for (bid, _) in template_runs.get(wp["template_id"], [])
-            )
+            blocks = [bid for (bid, _)
+                      in template_runs.get(wp["template_id"], [])]
+            if wp.get("fault") and raw_len_at_fault is None:
+                raw_len_at_fault = len(wp_raw)
+                fault_entry_has_blocks = bool(blocks)
+                first_fault_at = (wp.get("index"),
+                                  wp.get("fault_insn_index"))
+            wp_raw.extend(blocks)
             actual_sim_insns += int(wp.get("n_insns", 0) or 0)
             if crossed:
                 wp_left_user = True
@@ -3369,6 +3395,20 @@ def _check_wrong_path_chains(entries: list[dict],
             len(_collapse_runs(wp_raw[:raw_len_at_cross]))
             if raw_len_at_cross is not None else None
         )
+        # Fault-poison boundary (collapsed index): the plugin's documented
+        # wrong-path fault semantics (architecture.rst "Wrong-path chain
+        # termination") suppress a speculative fault, restore fork state,
+        # and trace past it to the natural branch end — so every branch
+        # resolution downstream of the first FAULT-marked entry runs on
+        # registers the fault left off-model, and the synthetic chain is
+        # no longer exact-known from there on.  The faulted entry's own
+        # first block is still reliable (its identity was chosen by a
+        # pre-fault branch); everything strictly after is squash-shadow
+        # output a consumer discards at fault_insn_index.
+        fault_poison_at = None
+        if raw_len_at_fault is not None:
+            end = raw_len_at_fault + (1 if fault_entry_has_blocks else 0)
+            fault_poison_at = len(_collapse_runs(wp_raw[:end]))
 
         n = min(len(actual_wp), len(exp_chain))
         first_fail = -1
@@ -3385,6 +3425,8 @@ def _check_wrong_path_chains(entries: list[dict],
             "wp_left_user": wp_left_user,
             "left_user_at": left_user_at,
             "first_fail": first_fail,
+            "fault_poison_at": fault_poison_at,
+            "first_fault_at": first_fault_at,
             # Chain-level TRANSLATION_UNAVAIL event (format spec §4.4):
             # the excursion was kicked but its first fetch could not
             # complete, so the chain is empty and says so explicitly.
@@ -3437,6 +3479,36 @@ def _check_wrong_path_chains(entries: list[dict],
                 ))
                 continue
         if first_fail >= 0:
+            # Suppressed speculative fault upstream of the divergence
+            # (system mode; e.g. a guest-TLB-cold excursion on a
+            # software-managed-TLB ISA, where the refill exception
+            # cannot be taken speculatively).  The plugin traces past
+            # the fault by design — the WPBBEntry carries
+            # fault_insn_index and the consumer squashes the dependent
+            # slice — so branch resolutions after the fault-poison
+            # boundary run on off-model registers and the exact-known
+            # synthetic chain stops applying there.  The prefix at or
+            # before the boundary already matched (first_fail >=
+            # fault_poison_at), which is everything real hardware
+            # would architecturally realize; accept, audibly.
+            fpa = rec["fault_poison_at"]
+            if fpa is not None and first_fail >= fpa:
+                issues.append(Issue(
+                    "wrong_path_chains", "info",
+                    f"WP at CP pos {cp_pos} (blk_{last_cp_bid}) diverges at "
+                    f"depth {first_fail} (expected blk_"
+                    f"{exp_chain[first_fail]}, got blk_"
+                    f"{actual_wp[first_fail]}) past a suppressed speculative "
+                    f"fault at chain entry {rec['first_fault_at']} — "
+                    f"post-fault resolution is squash-shadow output per the "
+                    f"wrong-path fault semantics; prefix before the fault "
+                    f"matched",
+                    {"notable": True, "cp_pos": cp_pos,
+                     "fault_poison_at": fpa,
+                     "first_fault_at": rec["first_fault_at"],
+                     "actual": actual_wp, "expected": exp_chain},
+                ))
+                continue
             issues.append(Issue(
                 "wrong_path_chains", "error",
                 f"WP at CP pos {cp_pos} (blk_{last_cp_bid}) "

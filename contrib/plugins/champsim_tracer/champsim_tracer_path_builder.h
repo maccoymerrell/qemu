@@ -285,6 +285,28 @@ private:
      * until the first seal-phase prime. */
     bool async_excluding_ = false;
 
+    /* Departure PC of the open async window: the pc of the outermost
+     * ASYNC_ENTER (QEMU emits the event only at the outermost entry, so
+     * the last un-returned ENTER's pc is exactly where the interrupted
+     * flow would resume — the deferred prev's true successor).  Tracked
+     * by the same assignment-semantics event sweep as the mute flag;
+     * 0 when no window is open or the window predates the segment
+     * prime (the live-flag latch carries no pc). */
+    uint64_t async_departure_pc_ = 0;
+
+    /* One-step seal-successor override, set by the stuck-window
+     * recovery: the abandoned window means execution resumed in ANOTHER
+     * guest thread (a proper resume refetches the departure PC and
+     * closes the window with an ASYNC_RETURN instead), so the TB
+     * executing now is not the deferred prev's successor.  The seal
+     * phase substitutes this PC — the window's departure PC — for the
+     * scoreboard's current_pc, making the abandoned-window seal
+     * byte-identical to a proper resume's: same-flow adjacency only,
+     * never the other thread's PC (the cross-thread taken-edge
+     * poisoning).  Cleared at every step_events entry (a recovery step
+     * always survives to its own seal). */
+    uint64_t seal_pc_override_ = 0;
+
     /* Lazy per-segment baseline; see prime_from_live(). */
     bool primed_ = false;
 

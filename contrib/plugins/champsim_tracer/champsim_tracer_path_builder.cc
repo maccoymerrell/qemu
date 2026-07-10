@@ -158,6 +158,8 @@ void PathBuilder::on_segment_open()
     raw_depth_ = 0;
     base_depth_ = 0;
     async_excluding_ = false;
+    async_departure_pc_ = 0;
+    seal_pc_override_ = 0;
     /* Kernel-excursion ownership starts the segment unowned: the pin was
      * just captured at user privilege, so the first user TB re-seeds
      * last_user_asid_; kernel TBs before it have no owner and drop
@@ -663,6 +665,13 @@ void PathBuilder::apply_fault_return(const struct qemu_plugin_cpu_event &ev)
 
 PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
 {
+    /* The seal-successor override is strictly one-step state: a
+     * recovery step always survives to its own seal (recovery implies
+     * pinned-user, which passes the foreign-ASID gate), and any
+     * harder bail between the phases also drops the walk prev the
+     * override was meant for. */
+    seal_pc_override_ = 0;
+
     /* Retain this step's drain: the queue's internal buffer is only
      * valid until the next push, and fault events may have to survive
      * bailed steps until a seal consumes them. */
@@ -695,12 +704,15 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
      * callbacks (the event precedes the resume TB's execution). */
     if (!primed_) {
         async_excluding_ = qemu_plugin_in_async_int();
+        async_departure_pc_ = 0;    /* pre-prime windows carry no pc */
     } else {
         for (const struct qemu_plugin_cpu_event &ev : pending_evs_) {
             if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER) {
                 async_excluding_ = true;
+                async_departure_pc_ = ev.pc;
             } else if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_RETURN) {
                 async_excluding_ = false;
+                async_departure_pc_ = 0;
             }
             /* ASID_WRITE (kind 4) is window-neutral: consumed by the
              * kexc ownership pass at drain time above, explicitly
@@ -717,10 +729,44 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
              * abandoned window here.  The reset produces NO ASYNC_RETURN
              * event (the departure PC may never be hit again), so the
              * window is closed locally too; a later fresh ASYNC_ENTER
-             * opens a well-formed new window. */
+             * opens a well-formed new window.
+             *
+             * An abandoned window is precisely a guest-thread switch the
+             * exclusion hid: a proper resume refetches the departure PC
+             * (closing the window with an ASYNC_RETURN before this TB
+             * dispatches), so reaching here means the scheduler handed
+             * this vCPU to ANOTHER thread of the pinned process (or a
+             * signal rewrote the resume point).  The TB executing now is
+             * therefore NOT the deferred prev's successor, and sealing
+             * prev against it would fabricate a cross-thread taken edge —
+             * observed as a loop branch whose profile targets the other
+             * thread's resume PC (and, through the template's last-write
+             * taken_pc, relabels every prior taken count with it).  Seal
+             * prev against the window's departure PC instead: that is
+             * where the interrupted flow architecturally continues, making
+             * this seal identical to the one a proper resume would have
+             * produced.  When no departure PC is known (window predates
+             * the segment prime), drop prev like the foreign-ASID
+             * boundary does — prev's accumulated memops die with it, or
+             * they would collapse onto the next entry's slots. */
             qemu_plugin_async_int_reset();
             async_excluding_ = false;
             g_capture_mute = false;
+            if (async_departure_pc_) {
+                seal_pc_override_ = async_departure_pc_;
+                async_departure_pc_ = 0;
+            } else if (prev_tb_) {
+                g_mem_recorder.clear_cp();
+                pending_reg_snaps.clear();
+                clear_prev();
+            }
+            if (pb_diag()) {
+                fprintf(stderr, "[pathbuilder] ABANDONED-WINDOW recovery "
+                        "prev=0x%" PRIx64 " cur=0x%" PRIx64 " seal_pc=0x%"
+                        PRIx64 "\n",
+                        prev_tb_ ? prev_tb_->start_pc : 0,
+                        in.cur ? in.cur->start_pc : 0, seal_pc_override_);
+            }
         } else {
             /* Suspend: the handler (and anything it context-switches
              * through, foreign address spaces included) never appears in
@@ -918,9 +964,16 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
     }
 
     /* ---- process_tb: the shared seal walk ---- */
+    /* The stuck-window recovery substitutes the abandoned window's
+     * departure PC for the scoreboard's current_pc: the TB executing
+     * now belongs to another guest thread, and prev's successor is
+     * where its own interrupted flow would have resumed. */
+    uint64_t seal_current_pc = seal_pc_override_ ? seal_pc_override_
+                                                 : in.current_pc;
+    seal_pc_override_ = 0;
     std::vector<PendingEmit> pending_emits;
     bool any_finalize = collect_finalized_bbs(in.cpu_index, walk_prev_,
-                                              in.prev_start, in.current_pc,
+                                              in.prev_start, seal_current_pc,
                                               pending_emits);
 
     if (in.watch_pc && walk_prev_ && walk_prev_->start_pc == in.watch_pc) {

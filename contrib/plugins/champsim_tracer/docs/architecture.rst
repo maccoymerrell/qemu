@@ -1138,12 +1138,29 @@ other address spaces, and those TBs must take the
 prev-preserving suspend, not the prev-dropping ASID gate.
 
 A window can be abandoned — the departure PC is never fetched
-again (the interrupted task was killed, or a signal rewrote its
-resume point).  The recovery is definitional: the pinned process
-observed at *user privilege* cannot be handler content, so the
-window force-closes there (``qemu_plugin_async_int_reset`` plus
-the local mute reset; no ``ASYNC_RETURN`` event exists for it, and
-a later fresh ``ASYNC_ENTER`` opens a well-formed new window).
+again (the guest scheduler handed the vCPU to another thread of
+the pinned process, the interrupted task was killed, or a signal
+rewrote its resume point).  The recovery is definitional: the
+pinned process observed at *user privilege* cannot be handler
+content, so the window force-closes there
+(``qemu_plugin_async_int_reset`` plus the local mute reset; no
+``ASYNC_RETURN`` event exists for it, and a later fresh
+``ASYNC_ENTER`` opens a well-formed new window).
+
+An abandoned window is precisely a control transfer the exclusion
+hid, so the TB observed at the recovery is *not* the deferred
+prev's successor — on an SMP guest it is routinely another guest
+thread of the same process, and sealing the interrupted branch
+against it would fabricate a cross-thread taken edge (and, through
+the template's last-write ``taken_pc``, relabel every prior taken
+count with the foreign target).  The recovery therefore seals the
+deferred prev against the window's **departure PC** — where the
+interrupted flow architecturally resumes, read from the retained
+outermost ``ASYNC_ENTER`` event — making the abandoned-window seal
+identical to the one a proper resume would have produced.  When no
+departure PC is known (a window latched from live state before the
+segment's first prime), the deferred prev is dropped like the
+foreign-ASID boundary drops it, accumulated captures included.
 
 .. _time-transparency:
 

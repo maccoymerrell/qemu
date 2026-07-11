@@ -128,10 +128,12 @@ Flags worth knowing:
    opens + ASID-pins the window (``trace_window=marker``).  Implies
    ``--marker`` at generation, which also injects the close(-1)
    syscall probe and the sysinfo fault probe right after the marker.
-   ``--smp N`` boots N vCPUs; body entries then carry the vCPU index
-   as ``thread_id``.  The guest console (plus the plugin's stderr) is
-   captured to ``<base>.console.log`` and the segment-close coverage
-   line is asserted after the run.
+   ``--smp N`` boots N vCPUs; body entries carry the GUEST-THREAD
+   identity as ``thread_id`` (resolved from the kernel per-thread
+   pointer, stable across vCPU migration), never the vCPU index — the
+   vCPU is absent from the wire.  The guest console (plus the plugin's
+   stderr) is captured to ``<base>.console.log`` and the segment-close
+   coverage line is asserted after the run.
 
 Sub-commands
 ~~~~~~~~~~~~
@@ -216,11 +218,13 @@ These don't need a generator ``meta.json`` and run on any ``.cst``.
 
 ``thread_distribution``
    Every expected thread contributed entries; no entries reference a
-   ``thread_id`` outside ``[0, expected_threads)``.  On system-mode
-   marker runs the thread population is the guest scheduler's choice,
-   so the cadence checks run against the *observed* tid set instead,
-   bounded above by the guest's ``-smp`` vCPU count (parsed from the
-   trace's own command line).
+   ``thread_id`` outside ``[0, expected_threads)``.  Because
+   ``thread_id`` is the guest-thread identity (dense 0..N-1 by
+   first-sighting, not the vCPU index), this bound holds on system-mode
+   marker runs too: a single-threaded pinned process is exactly
+   ``thread_id`` 0 however many vCPUs it migrated across, and the clone
+   test's pair is exactly ``{0, 1}`` — a stray higher id would be a
+   foreign thread leaking past the pin.
 
 ``thread_records``
    Positional per-record thread bookkeeping, from the decoder's body
@@ -231,20 +235,26 @@ These don't need a generator ``meta.json`` and run on any ``.cst``.
    before its first ENTRY — the delta decoder's hard prerequisite.
 
 ``thread_chain``
-   User-flow continuity of the interleaved body stream.  Filtered to
-   user-privilege entries, the stream must decompose into the
-   control-flow chains of the guest process's logical threads: every
-   user entry's start PC is reachable from a live chain's previous
-   block (fall-through, static branch target, or a CP-observed
-   profile target), or it births a new chain up to the expected
-   guest-thread count.  A dropped user block, a phantom entry, or a
-   foreign process's code leaking past the ASID pin all surface as an
-   *orphan* entry no chain can reach.  Chains are matched globally
-   (guest threads migrate across vCPUs); the per-tid direct-adjacency
-   connect rate is reported as info.  Runs in ``validate_structural``
-   (``thread_test``, ``churn_test``); not yet wired into the ``all``
-   battery — it correctly fails on a known fault-merge defect (see
-   the comment at the ``validate()`` call site).
+   User-flow continuity of the interleaved body stream, matched **per
+   guest thread**.  Because ``thread_id`` is the guest-thread identity
+   (one tid across vCPU migration), the entries of a single tid,
+   filtered from the interleaved stream, are that one thread's user
+   execution in order — so each must continue that SAME thread's
+   control flow: its start PC is reachable from the tid's previous user
+   block (fall-through, static branch target, or a CP-observed profile
+   target).  A kernel excursion (``is_system`` entries) may resume the
+   thread at a redirected PC, so it breaks the chain and the first user
+   entry after it restarts without penalty.  A disconnect within a
+   tid's own chain is an *orphan*: a dropped user block, a phantom
+   entry, or foreign code leaking past the pin.  Matching per tid (not
+   globally against a live set) cannot launder one thread's block onto
+   another's successors, so it is strictly stronger than the
+   pre-identity check; ``chains`` in the info detail is the number of
+   distinct guest threads that contributed user entries.  Runs in
+   ``validate_structural`` (``thread_test``, ``churn_test``); not yet
+   wired into the ``all`` battery — it correctly fails on a known
+   fault-merge defect (see the comment at the ``validate()`` call
+   site).
 
 ``syscall_fault_nesting``
    Nested-excursion discipline (system-mode marker runs).  The
@@ -531,20 +541,36 @@ System-mode SMP form
 ``thread_test_asm(isa, marker=True, iters=N)`` renders the same clone
 pair with the trace marker at ``_start`` (pinning the window before
 the clone — both guest threads share the pinned address space) and
-the end marker before ``exit_group``; the large default iteration
-count (300 000; raise with ``--iters``) keeps both threads runnable
-long enough for the guest scheduler to spread them across the
-``-smp`` vCPUs.  ``thread_id`` is then the vCPU index and the thread
-*population* is the scheduler's choice, so:
+the end marker before ``exit_group``.  In system mode the pair is
+given DISTINCT per-thread pointers (the parent installs one before
+the marker; the child receives one via ``CLONE_SETTLS``) and a start
+barrier holds the parent until the child has entered user code, so the
+window reliably captures both — the tracer then resolves them to two
+GUEST-THREAD tids (``0`` for the parent, ``1`` for the child), **not**
+vCPU indexes.  So:
 
 * the record-cadence checks (``thread_records``, ``regfile_records``,
-  ``thread_switch``) run against the observed tid set,
+  ``thread_switch``) and ``thread_distribution`` run against the
+  guest-thread population — exactly ``{0, 1}``, independent of ``-smp``,
 * ``thread_chain`` decomposes the user entries into the two guest
-  threads' control-flow chains regardless of which vCPUs they rode,
-* the run **fails** if all entries rode one vCPU (nothing multi-vCPU
-  was exercised — raise ``--iters`` / ``--stop``), and
+  threads' control-flow chains **per tid** — one well-formed chain each,
+  which a migrating thread keeps intact because it holds one tid across
+  vCPUs, and
 * the captured console log's segment-close line must not report an
   under-budget close.
+
+``--migrate`` turns it into an SMP migration stress: it adds a periodic
+``sched_yield`` to every ISA's RMW loop and drops the mipsel CPU-0
+affinity confinement, so under ``-smp N`` the guest scheduler spreads,
+time-slices, and migrates the pair.  ``--seeds K`` repeats the traced
+run ``K`` times under varied scheduling entropy and reports ``x/K``
+passing; with ``CST_TIDDIAG`` the plugin logs the ``vcpu <-> tid``
+bindings it observed to stderr, and the harness asserts the run set
+**witnessed the tid decoupled from the vCPU** at least once — a tid
+seen on two vCPUs (migration), a vCPU hosting two tids (time-slice), or
+a binding whose tid simply differs from its vCPU index.  A run whose
+bindings were all ``tid == vcpu`` is ambiguous, not a failure; the gate
+fails only if *no* run in the set distinguished the identity.
 
 .. _validator-churn:
 

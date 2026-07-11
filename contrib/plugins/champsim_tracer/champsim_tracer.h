@@ -891,11 +891,16 @@ struct BodyEntry {
      * merge): the indices of the instructions that faulted, one per
      * excursion, in order.  Empty for ordinary entries. */
     std::vector<uint32_t> fault_anchors;
+    /* Wire thread identity: the guest-thread id (system-mode pin,
+     * resolved from the kernel per-thread pointer and stable across vCPU
+     * migration) or the vCPU index (user mode / unpinned).  This is the
+     * ONLY thread field that reaches the stream. */
     uint32_t thread_id;
-    /* QEMU vCPU index this entry came from.  Used by the body writer
-     * to capture this thread's BODY_TAG_REGFILE on first emit when
-     * the thread did not trigger segment open (i.e. is not the seed
-     * thread whose regfile was pre-captured at start_trace_segment). */
+    /* QEMU vCPU index this entry came from — used ONLY for live register
+     * reads (BODY_TAG_REGFILE capture on a thread's first emit, WP lane
+     * gates); never serialised.  Distinct from thread_id: on a system
+     * pin one guest thread's entries may carry different cpu_index values
+     * across a migration while keeping one thread_id. */
     uint32_t cpu_index;
 };
 #endif  /* __cplusplus */

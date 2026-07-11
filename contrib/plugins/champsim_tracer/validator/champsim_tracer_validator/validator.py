@@ -4127,29 +4127,37 @@ def _check_syscall_transitions(entries: list[dict],
     strict = guest_threads <= 1
     outstanding: dict[int, int] = {}    # resume pc -> open count
     out_pc: dict[int, int] = {}         # resume pc -> a syscall pc (messages)
-    pending: tuple[int, int] | None = None   # (syscall_pc, ft) of the most
-                                             # recent user block, when it
-                                             # ended in a syscall
-    saw_kernel = False
+    # Per-GUEST-THREAD: the most recent user block that ended in a syscall,
+    # and whether a kernel block for THAT thread has been seen since.
+    # Tracking per tid (not globally) is essential on a concurrent SMP run:
+    # another guest thread's user block legitimately interleaves between a
+    # thread's syscall and its own kernel entry, which a global tracker
+    # misreads as "syscall not followed by a kernel block".  Kernel blocks
+    # inherit the tid of the thread that entered the kernel, so a thread's
+    # excursion lands on its own pending slot.
+    pending_by_tid: dict[int, tuple[int, int]] = {}   # tid -> (syscall_pc, ft)
+    saw_kernel_by_tid: dict[int, bool] = {}
     for e in entries:
         t = templates_by_id.get(e["template_id"])
         if t is None:
             continue
+        tid = int(e.get("thread_id", 0))
         is_sys = bool(t.get("is_system"))
         if is_sys:
-            if pending is not None:
-                saw_kernel = True
+            if pending_by_tid.get(tid) is not None:
+                saw_kernel_by_tid[tid] = True
             continue
         pc = int(t.get("start_pc", 0))
-        if pending is not None:
-            sy_pc, sy_ft = pending
-            pending = None
-            if not saw_kernel:
+        pend = pending_by_tid.pop(tid, None)
+        if pend is not None:
+            sy_pc, sy_ft = pend
+            if not saw_kernel_by_tid.get(tid, False):
                 issues.append(Issue(
                     "syscall_transitions", "error",
-                    f"user syscall at 0x{sy_pc:x} was not followed by "
-                    f"a kernel (system) block before returning to user",
-                    {"syscall_pc": sy_pc}))
+                    f"user syscall at 0x{sy_pc:x} (thread {tid}) was not "
+                    f"followed by a kernel (system) block before returning "
+                    f"to user",
+                    {"syscall_pc": sy_pc, "tid": tid}))
             else:
                 # The syscall entered the kernel; its resume is now open.
                 outstanding[sy_ft] = outstanding.get(sy_ft, 0) + 1
@@ -4170,7 +4178,7 @@ def _check_syscall_transitions(entries: list[dict],
                         f"0x{pc:x}, expected the fall-through 0x{sy_ft:x}",
                         {"syscall_pc": sy_pc, "expected_ft": sy_ft,
                          "got": pc}))
-            saw_kernel = False
+            saw_kernel_by_tid[tid] = False
         elif outstanding.get(pc, 0) > 0:
             # A user entry resuming an outstanding fall-through without
             # kernel blocks immediately before it: the return interleaved
@@ -4181,8 +4189,8 @@ def _check_syscall_transitions(entries: list[dict],
                 del outstanding[pc]
             verified += 1
         if ends_in_syscall(t):
-            pending = (pc, int(t.get("fall_through_pc", 0)))
-            saw_kernel = False
+            pending_by_tid[tid] = (pc, int(t.get("fall_through_pc", 0)))
+            saw_kernel_by_tid[tid] = False
 
     if issues:
         return issues
@@ -4660,7 +4668,7 @@ def _check_thread_record_cadence(entries: list[dict],
         (BODY_TAG_THREAD_SWITCH names the starting thread), and every
         later ENTRY carries it iff its ``thread_id`` differs from the
         previous ENTRY's — the writer emits a switch record only when
-        the firing vCPU changes.
+        the running guest thread changes.
       * **A thread's REGFILE precedes its first ENTRY.**  Field-state
         delta encoding is per-thread, so a consumer must have thread
         T's full register file in hand before decoding T's first entry;
@@ -4774,36 +4782,40 @@ def _check_thread_chain(entries: list[dict],
                         expected_guest_threads: int | None = None,
                         trace_meta: dict | None = None
                         ) -> list[Issue]:
-    """User-flow continuity of the interleaved body stream.
+    """User-flow continuity of the interleaved body stream, PER GUEST
+    THREAD.
 
-    The body stream serializes every vCPU's CP blocks in execution
-    order.  Filtered down to user-privilege entries (kernel excursions
-    detour and return; excluded async windows are transparent to user
-    control flow), the stream must decompose into the control-flow
-    chains of the guest process's logical threads: every user entry's
-    start PC must be reachable from some live thread's previous block
-    (its fall-through or a branch target), or it begins a new logical
-    thread (bounded by @expected_guest_threads when given — e.g. 1 for
-    the single-threaded generated workload, 2 for the clone test).
+    The body stream serializes every vCPU's CP blocks in global
+    execution order.  ``thread_id`` is the guest-thread identity (the
+    tracer resolves it from the kernel per-thread pointer, not the vCPU
+    index), so a thread that migrates across vCPUs keeps ONE tid and a
+    thread time-slicing a vCPU with another keeps its own — which makes
+    the strong assertion possible: filtered to one tid, the user-privilege
+    entries are that single thread's execution in order, and each must be
+    reachable from that SAME thread's previous user block (its
+    fall-through or a branch target).  A kernel excursion (is_system
+    entries) detours and may resume the thread at a redirected PC, so it
+    breaks the chain — the first user entry of that tid after an excursion
+    restarts it without penalty; every other entry must connect.
 
-    A dropped user block, a phantom entry, or another process's code
-    leaking past the ASID pin all surface here as an *orphan*: an entry
-    whose PC no live chain can reach.  Guest threads may migrate across
-    vCPUs (thread_id is the vCPU index), so chains are matched globally
-    against a live set, not per tid; the per-tid direct-adjacency
-    connect rate is reported as info (breaks there are legitimate —
-    an excluded async window can reschedule guest threads between two
-    adjacent same-tid entries).
+    A disconnect within a tid's chain is an *orphan*: a dropped user
+    block, a phantom entry, or another process's code leaking past the
+    ASID pin.  Matching per tid (not globally against a live set) is
+    strictly stronger than the pre-identity check — it cannot launder a
+    thread A block onto thread B's successor set.  ``chains`` in the info
+    detail is the number of distinct guest threads that contributed user
+    entries (bounded by @expected_guest_threads when given).
     """
     issues: list[Issue] = []
-    contexts: list[set[int]] = []      # live logical threads' successor sets
-    created: list[tuple] = []          # (seq_num, pc) of chain births
-    orphans: list[tuple] = []          # (seq_num, pc, tid)
     n_user = 0
 
-    # Per-tid adjacency tally: prev user entry per tid, invalidated by an
-    # intervening kernel entry on the same tid (excursion boundary).
-    last_user_succ_by_tid: dict[int, set[int] | None] = {}
+    # Per-tid live chain: the successor-PC set of that thread's previous
+    # user block, or None when a kernel excursion broke it (next user
+    # entry of the tid restarts the chain).  Absent = thread not yet seen.
+    chain_by_tid: dict[int, set[int] | None] = {}
+    births_by_tid: dict[int, tuple] = {}     # tid -> (seq_num, pc) first sight
+    orphans: list[tuple] = []                # (seq_num, pc, tid)
+    # Per-tid direct-adjacency tally (connected / total non-restart pairs).
     tid_pairs = tid_connected = 0
 
     # REP self-loop entries start at their predecessor's terminal REP
@@ -4822,50 +4834,57 @@ def _check_thread_chain(entries: list[dict],
             continue
         tid = int(e.get("thread_id", 0))
         if t.get("is_system"):
-            last_user_succ_by_tid[tid] = None      # excursion boundary
+            if tid in chain_by_tid:
+                chain_by_tid[tid] = None       # excursion breaks this thread
             continue
         pc = int(t.get("start_pc", 0))
         n_user += 1
         succ = _template_successor_pcs(t, rep_branch_id)
 
-        hit = next((i for i, c in enumerate(contexts) if pc in c), None)
-        if hit is not None:
-            contexts[hit] = succ
-        elif (expected_guest_threads is None
-              or len(contexts) < expected_guest_threads):
-            contexts.append(succ)
-            created.append((e.get("seq_num"), pc))
+        prev = chain_by_tid.get(tid, "unseen")
+        if prev == "unseen":
+            births_by_tid[tid] = (e.get("seq_num"), pc)   # first sight
+        elif prev is None:
+            pass                                          # excursion restart
         else:
-            orphans.append((e.get("seq_num"), pc, tid))
-            contexts.append(succ)      # resync so one gap can't cascade
-
-        prev = last_user_succ_by_tid.get(tid)
-        if prev is not None:
             tid_pairs += 1
             if pc in prev:
                 tid_connected += 1
-        last_user_succ_by_tid[tid] = succ
+            else:
+                orphans.append((e.get("seq_num"), pc, tid))
+        chain_by_tid[tid] = succ
 
     for seq, pc, tid in orphans[:5]:
         issues.append(Issue(
             "thread_chain", "error",
-            f"user entry seq={seq} thread={tid} pc=0x{pc:x} is not "
-            f"reachable from any live thread chain (dropped block, "
+            f"user entry seq={seq} thread={tid} pc=0x{pc:x} does not "
+            f"continue thread {tid}'s own control flow (dropped block, "
             f"phantom entry, or foreign-process code)",
             {"seq_num": seq, "pc": pc, "tid": tid}))
     if len(orphans) > 5:
         issues.append(Issue(
             "thread_chain", "error",
-            f"...and {len(orphans) - 5} more unreachable user entries"))
+            f"...and {len(orphans) - 5} more intra-thread control breaks"))
+
+    n_chains = len(births_by_tid)
+    if (expected_guest_threads is not None
+            and n_chains > expected_guest_threads):
+        issues.append(Issue(
+            "thread_chain", "error",
+            f"{n_chains} distinct guest threads carried user entries but "
+            f"expected at most {expected_guest_threads} (foreign thread "
+            f"leaked past the pin?)",
+            {"chains": n_chains, "expected": expected_guest_threads}))
     if issues:
         return issues
-    born = ", ".join(f"seq={s} pc=0x{pc:x}" for s, pc in created)
+    born = ", ".join(f"tid={t} seq={s} pc=0x{pc:x}"
+                     for t, (s, pc) in sorted(births_by_tid.items()))
     return [Issue(
         "thread_chain", "info",
-        f"{n_user} user entries decompose into {len(contexts)} logical "
-        f"thread chain(s) with 0 orphans (births: {born}); per-tid "
-        f"direct adjacency: {tid_connected}/{tid_pairs} connected",
-        {"user_entries": n_user, "chains": len(contexts),
+        f"{n_user} user entries decompose into {n_chains} guest-thread "
+        f"chain(s) with 0 orphans (births: {born}); per-tid direct "
+        f"adjacency: {tid_connected}/{tid_pairs} connected",
+        {"user_entries": n_user, "chains": n_chains,
          "tid_pairs": tid_pairs, "tid_connected": tid_connected})]
 
 
@@ -6277,28 +6296,14 @@ def validate_structural(trace_path: Path,
     issues += _check_regfile_records(body_stats, expected_threads)
     issues += _check_thread_switch(body_stats, expected_threads)
     if marker:
-        # System-mode thread_ids are vCPU INDEXES, not a dense 0..N-1
-        # population: the pinned process runs on whichever vCPU(s) the
-        # guest scheduler picked (a serial schedule on vCPU 1 alone is
-        # legitimate).  Validate the indexes against the guest's -smp
-        # bound — the same convention the meta-driven battery uses —
-        # while @expected_threads keeps meaning the CONTRIBUTING-thread
-        # count for the regfile / switch cadence above.
-        observed_tids = sorted({int(e.get("thread_id", 0))
-                                for e in entries})
-        smp = _parse_smp_from_command(trace_meta.get("command", ""))
-        extras = [t for t in observed_tids if t >= smp]
-        if extras:
-            issues.append(Issue(
-                "thread_distribution", "error",
-                f"entries carry thread_id(s) {extras} >= the guest's "
-                f"vCPU count (-smp {smp})",
-                {"observed": observed_tids, "smp": smp}))
-        else:
-            issues.append(Issue(
-                "thread_distribution", "info",
-                f"observed vCPU tid(s) {observed_tids} of -smp {smp}",
-                {"observed": observed_tids, "smp": smp}))
+        # System-mode thread_ids are GUEST-THREAD identities, dense
+        # 0..N-1 by first-sighting order — NOT vCPU indexes, and not
+        # bounded by -smp (one vCPU can host many guest threads, and a
+        # thread that migrates keeps one tid).  The population is the
+        # pinned process's own thread count: @expected_guest_threads
+        # (the clone test's 2) or, absent that, @expected_threads.
+        issues += _check_thread_distribution(
+            entries, expected_guest_threads or expected_threads)
     else:
         issues += _check_thread_distribution(entries, expected_threads)
     issues += _check_thread_record_cadence(
@@ -6699,29 +6704,15 @@ def validate(meta_path: Path, trace_path: Path,
     body_stats = trace_meta.get("body_stats") or {}
     stats["body_stats"] = body_stats
     issues += _check_iframe_cadence(body_stats, cp_entries, trace_meta)
-    # System-mode thread population is scheduler-driven: the pinned
-    # process (and its kernel excursions) runs on whichever vCPU(s) the
-    # guest scheduler picked, so the per-thread record cadence is
-    # asserted against the *observed* tid set, bounded above by -smp.
-    if marker:
-        observed_tids = sorted({int(e.get("thread_id", 0))
-                                for e in entries})
-        smp = _parse_smp_from_command(trace_meta.get("command", ""))
-        extras = [t for t in observed_tids if t >= smp]
-        if extras:
-            issues.append(Issue(
-                "thread_distribution", "error",
-                f"entries carry thread_id(s) {extras} >= the guest's "
-                f"vCPU count (-smp {smp})",
-                {"observed": observed_tids, "smp": smp}))
-        issues.append(Issue(
-            "thread_distribution", "info",
-            f"observed vCPU tid(s) {observed_tids} of -smp {smp}",
-            {"observed": observed_tids, "smp": smp}))
-        threads_effective = max(1, len(observed_tids))
-    else:
-        threads_effective = expected_threads
-        issues += _check_thread_distribution(entries, expected_threads)
+    # Guest-thread identity: the generated workload is single-threaded,
+    # so every entry — user, or kernel inheriting the current thread —
+    # carries tid 0, no matter which vCPU(s) the scheduler used or how the
+    # process migrated between them.  A second tid would be a foreign
+    # thread leaking past the pin, which the per-thread distribution check
+    # now catches directly (stronger than the old -smp index bound, which
+    # accepted any tid < smp).
+    threads_effective = expected_threads
+    issues += _check_thread_distribution(entries, expected_threads)
     issues += _check_regfile_records(body_stats, threads_effective)
     issues += _check_thread_switch(body_stats, threads_effective)
     issues += _check_thread_record_cadence(

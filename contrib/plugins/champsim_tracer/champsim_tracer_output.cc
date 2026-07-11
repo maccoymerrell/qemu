@@ -527,11 +527,13 @@ struct BodyStreamState {
     /* False until the first BODY_TAG_THREAD_SWITCH; forces it so the
      * starting thread is an explicit delta-from-0, no implicit base. */
     bool    thread_announced;
-    /* Per-vCPU field-state tables, keyed by thread_id (== guest vCPU
-     * index), lazy-grown on first emit (slot null until then).  Deltas
-     * stay within-thread, not cross-thread.  CP state persists across
-     * a thread's entries; WP state is a per-chain overlay falling back
-     * to that thread's CP state. */
+    /* Per-guest-thread field-state tables, keyed by the entry's
+     * thread_id (the guest-thread identity, not the vCPU), lazy-grown on
+     * first emit (slot null until then).  Deltas stay within-thread, not
+     * cross-thread — a thread that migrates across vCPUs keeps one id and
+     * one continuous overlay.  CP state persists across a thread's
+     * entries; WP state is a per-chain overlay falling back to that
+     * thread's CP state. */
     std::vector<FieldStateTable *> cp_field_state;
     std::vector<FieldStateTable *> wp_field_state;
     /* Whether thread_id has emitted its BODY_TAG_REGFILE this segment.

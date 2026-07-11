@@ -544,9 +544,22 @@ starting thread is stated explicitly rather than assumed.  It is an
 ordinary delta from `prev_thread_id = 0` (no special-case base): a
 reader that just applies thread-switch deltas from 0, like every
 other delta in the format, gets the correct starting thread with no
-extra knowledge.  `thread_id` is the guest vCPU index and is stable
-for the whole run — the same vCPU keeps the same `thread_id` across
-every segment.
+extra knowledge.
+
+`thread_id` is an **opaque guest-thread identifier**, and the vCPU (host
+scheduling slot) the thread ran on is deliberately NOT on the wire — the
+consumer maps threads onto simulated cores however its model requires.  In
+a system-mode pinned trace the producer derives the id from the guest
+kernel's per-thread pointer register, so it names a software thread that is
+stable across vCPU migration: a thread that the guest scheduler moves
+between vCPUs keeps ONE `thread_id`, and two threads that time-slice a
+single vCPU are two distinct `thread_id`s.  Ids are small integers assigned
+in first-sighting order within a segment (0, 1, 2, …); a single-threaded
+traced process is `thread_id` 0.  In a user-mode trace each guest thread is
+its own host thread and `thread_id` is that thread's index, likewise stable
+for the thread's lifetime.  Either way a decoder needs no knowledge of the
+mapping — it keys per-thread state (the initial regfile, the field-delta
+overlays) on the id as an opaque tag.
 
 Loop until a `BODY_TAG_END` is seen:
 
@@ -1019,7 +1032,7 @@ wrong-path chain.
 ```
 
 `previous_entry_template` starts at 0 and updates after each CP entry.
-The current thread/vCPU ID comes from the most recent
+The current guest-thread ID comes from the most recent
 `BODY_TAG_THREAD_SWITCH` record; because the body's first record is
 always a thread switch (§4.1), an ENTRY is always preceded by one.
 

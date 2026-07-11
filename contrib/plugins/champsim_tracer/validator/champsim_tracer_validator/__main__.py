@@ -108,10 +108,11 @@ def _parse_args() -> argparse.Namespace:
                         help="Guest RAM for system-mode (default: 512M).")
         sp.add_argument("--smp", type=int, default=1,
                         help="Guest vCPU count for system-mode (-smp N). "
-                             "Body entries then carry the vCPU index as "
-                             "thread_id; the validator asserts the "
-                             "per-thread record cadence against the "
-                             "observed tid set.")
+                             "Body entries carry the GUEST-THREAD identity "
+                             "as thread_id (stable across vCPU migration), "
+                             "never the vCPU index; the validator asserts "
+                             "the per-thread record cadence and one "
+                             "well-formed chain per guest thread.")
 
     # generate
     g = sub.add_parser("generate", help="Emit .S + .meta.json")
@@ -254,8 +255,9 @@ def _parse_args() -> argparse.Namespace:
         help="End-to-end 2-thread test: parent+child run identical "
              "atomic-RMW loops, validator asserts both threads visible "
              "in the trace.  With --system --smp 2 the clone pair runs "
-             "inside a marker-pinned guest and the assertions run "
-             "against the vCPU-indexed body stream.")
+             "inside a marker-pinned guest and thread_id is the "
+             "guest-thread identity (stable across vCPU migration); "
+             "--migrate --seeds K stresses SMP migration.")
     common(tt)
     tt.add_argument("--isa", choices=ISA_CHOICES, action="append",
                     required=True)
@@ -269,6 +271,17 @@ def _parse_args() -> argparse.Namespace:
                          "scheduler to spread them across vCPUs).")
     tt.add_argument("--stop", type=int, default=200_000,
                     help="System mode: marker-window user-insn budget.")
+    tt.add_argument("--migrate", action="store_true",
+                    help="System mode: SMP migration stress.  Adds a "
+                         "periodic sched_yield to every ISA's RMW loop and "
+                         "drops the mipsel CPU-0 affinity pin so the clone "
+                         "pair spreads and migrates across the -smp vCPUs; "
+                         "the tracer must keep one guest-thread tid per "
+                         "thread through migration.  Use with --smp >1.")
+    tt.add_argument("--seeds", type=int, default=1,
+                    help="Repeat the traced run this many times (varied "
+                         "scheduling entropy) and require the guest-thread "
+                         "invariants on every run; reports x/N.")
     system_args(tt)
 
     ct = sub.add_parser(
@@ -654,6 +667,37 @@ def cmd_all(args) -> int:
     return rc_total
 
 
+import re as _re
+
+_TIDDIAG_BIND_RE = _re.compile(r"\[tiddiag\] binding vcpu=(\d+) tid=(\d+)")
+
+
+def _parse_tiddiag_bindings(console_log: Path) -> dict:
+    """Parse the plugin's CST_TIDDIAG ``binding vcpu=V tid=T`` lines from
+    a system run's console log into the bipartite vCPU<->tid graph.
+
+    A tid on >= 2 vCPUs proves the guest thread MIGRATED yet kept one
+    identity; a vCPU hosting >= 2 tids proves two threads TIME-SLICED it
+    yet stayed distinct.  Either witnesses that the wire's thread_id is
+    the guest thread, not the vCPU (which the wire never carries)."""
+    vcpus_of_tid: dict[int, set[int]] = {}
+    tids_of_vcpu: dict[int, set[int]] = {}
+    pairs: set[tuple[int, int]] = set()
+    tids: set[int] = set()
+    try:
+        text = console_log.read_text(errors="replace")
+    except OSError:
+        text = ""
+    for m in _TIDDIAG_BIND_RE.finditer(text):
+        v, t = int(m.group(1)), int(m.group(2))
+        vcpus_of_tid.setdefault(t, set()).add(v)
+        tids_of_vcpu.setdefault(v, set()).add(t)
+        pairs.add((v, t))
+        tids.add(t)
+    return {"tids": tids, "vcpus_of_tid": vcpus_of_tid,
+            "tids_of_vcpu": tids_of_vcpu, "pairs": pairs}
+
+
 _THREAD_TEST_CC = {
     "x86_64":  ["g++"],
     "aarch64": ["aarch64-linux-gnu-g++"],
@@ -681,14 +725,25 @@ def cmd_thread_test(args) -> int:
 
     Default mode traces under qemu-user (thread_id = host thread,
     deterministically 0 and 1).  With ``--system --smp N`` the same
-    clone pair runs marker-pinned inside a booted guest: thread_id is
-    then the vCPU index and the *population* is the guest scheduler's
-    choice, so the record-cadence checks run against the observed tid
-    set — but the test demands the workload actually exercised more
-    than one vCPU, and fails if the scheduler kept it serial.
+    clone pair runs marker-pinned inside a booted guest.  thread_id is
+    then the GUEST-THREAD identity (the tracer resolves it from the
+    kernel per-thread pointer, not the vCPU), so the assertion is
+    strong and vCPU-independent: exactly two tids, each a well-formed
+    per-thread control-flow chain, no matter how the scheduler placed or
+    migrated the pair.  ``--migrate`` turns it into an SMP migration
+    stress (distinct per-thread pointers + yields + no affinity pin) and
+    ``--seeds N`` repeats it under varied scheduling entropy; the run set
+    must also DEMONSTRATE decoupling — a tid that spanned vCPUs
+    (migration) or two tids that shared a vCPU (time-slice) — proving the
+    tid is the guest thread and not the vCPU index.
     """
     from ._thread_test_asm import thread_test_asm
     system = getattr(args, "system", False)
+    # Migration mode (system only): distinct per-thread pointers + periodic
+    # sched_yield on every ISA + no mipsel affinity confinement, so the
+    # clone pair spreads/migrates across the -smp vCPUs.  The tracer must
+    # keep ONE guest-thread tid per thread through migration and time-slice.
+    migrate = system and getattr(args, "migrate", False)
     iters = args.iters if args.iters is not None else \
         (300_000 if system else 1000)
     rc_total = 0
@@ -703,7 +758,8 @@ def cmd_thread_test(args) -> int:
         cst_path = out_dir / f"thread_test{suffix}_{isa}.cst"
         try:
             s_path.write_text(thread_test_asm(isa, marker=system,
-                                              iters=iters))
+                                              iters=iters,
+                                              migrate=migrate))
         except KeyError:
             print(f"thread_test[{isa}]: SKIP  no template available")
             continue
@@ -719,12 +775,8 @@ def cmd_thread_test(args) -> int:
             continue
 
         plugin = args.build_dir / "contrib" / "plugins" / "libchampsim_tracer.so"
-        if system:
-            rc = _trace_system(args, isa, bin_path, plugin, bin_path)
-            if rc != 0:
-                rc_total = 1
-                continue
-        else:
+        if not system:
+            # ---- qemu-user: single run, thread_id = host thread (0, 1) ----
             qemu = args.build_dir / f"qemu-{isa}"
             plugin_opts = f"outfile={bin_path},wpdepth={args.depth},memdata=1"
             if getattr(args, "regdata", False):
@@ -737,63 +789,85 @@ def cmd_thread_test(args) -> int:
                 print(f"thread_test[{isa}]: trace FAILED rc={rc}")
                 rc_total = 1
                 continue
-
-        print(f"validate[{isa}] {cst_path.name}:")
-        if system:
-            # vCPU population is the guest scheduler's choice: derive
-            # expected_threads from the trace, then insist the pinned
-            # process actually ran on more than one vCPU (otherwise the
-            # -smp run exercised nothing multi-vCPU).
-            dec = V._load_decoder()
-            _m, _t, entries = dec.decode_champsim_tracer(cst_path)
-            observed = sorted({int(e.get("thread_id", 0))
-                               for e in entries})
-            print(f"thread_test[{isa}]: observed vCPU tids {observed} "
-                  f"(-smp {getattr(args, 'smp', 1)})")
-            report = V.validate_structural(
-                cst_path, expected_threads=max(1, len(observed)),
-                expected_guest_threads=2, marker=True)
-            print(report.summary())
-            if report.errors():
-                rc_total = 1
-            # The multi-thread assertion proper: both guest threads'
-            # user flows must be present as distinct control-flow
-            # chains (a serial trace of only one thread would decompose
-            # into 1).
-            chains = next((int((i.detail or {}).get("chains", 0))
-                           for i in report.issues
-                           if i.check == "thread_chain"
-                           and i.severity == "info"), 0)
-            if chains < 2:
-                print(f"thread_test[{isa}]: FAIL  user entries decompose "
-                      f"into {chains} chain(s); both clone threads must "
-                      f"appear in the trace")
-                rc_total = 1
-            if len(observed) < 2:
-                if isa == "mipsel":
-                    # Architecturally expected: EntryHi.ASID is a
-                    # per-CPU value, so the pin can only attribute the
-                    # process on the vCPU where the marker fired; the
-                    # workload pins both threads there (see
-                    # _thread_test_asm) and the 2-chain check above is
-                    # the multi-thread assertion.
-                    print(f"thread_test[{isa}]: single-vCPU population "
-                          f"(expected on MIPS: per-CPU ASIDs limit the "
-                          f"pin to the marker vCPU)")
-                else:
-                    print(f"thread_test[{isa}]: FAIL  the pinned "
-                          f"workload's entries all rode vCPU {observed}; "
-                          f"the guest scheduler never spread the clone "
-                          f"pair — raise --iters or --stop")
-                    rc_total = 1
-            if _check_segment_coverage(
-                    Path(f"{bin_path}.console.log"), label=isa):
-                rc_total = 1
-        else:
             report = V.validate_structural(cst_path, expected_threads=2,
                                            expected_guest_threads=2)
             print(report.summary())
             if report.errors():
+                rc_total = 1
+            continue
+
+        # ---- system: N seeded runs, guest-thread-identity assertions ----
+        # The bindings the decoupling proof reads are stderr-only diag;
+        # enable them for the pinned qemu-system child (they never touch
+        # the wire).
+        os.environ["CST_TIDDIAG"] = "1"
+        seeds = max(1, getattr(args, "seeds", 1))
+        console = Path(f"{bin_path}.console.log")
+        passed = mig_runs = ts_runs = split_runs = decoupled_runs = 0
+        for seed in range(seeds):
+            rc = _trace_system(args, isa, bin_path, plugin, bin_path)
+            if rc != 0:
+                print(f"thread_test[{isa}] seed {seed + 1}/{seeds}: "
+                      f"trace FAILED rc={rc}")
+                continue
+            report = V.validate_structural(
+                cst_path, expected_threads=2,
+                expected_guest_threads=2, marker=True)
+            chains = next((int((i.detail or {}).get("chains", 0))
+                           for i in report.issues
+                           if i.check == "thread_chain"
+                           and i.severity == "info"), 0)
+            run_ok = (not report.errors()) and chains == 2
+            if _check_segment_coverage(console, label=isa):
+                run_ok = False
+            # Decoupling evidence from the vCPU<->tid bindings (diag).
+            # thread_id == vCPU index would force every binding to be
+            # (v, v): one tid per vCPU, equal to it.  ANY deviation
+            # disproves that hypothesis — a tid seen on two vCPUs
+            # (migration), a vCPU hosting two tids (time-slice), or simply
+            # a binding whose tid differs from its vCPU index (the
+            # first-sighting identity landed a thread on a non-matching
+            # vCPU).  Only an all-(v, v) run is ambiguous.
+            note = ""
+            if migrate:
+                b = _parse_tiddiag_bindings(console)
+                migrated = any(len(v) >= 2
+                               for v in b["vcpus_of_tid"].values())
+                timesliced = any(len(t) >= 2
+                                 for t in b["tids_of_vcpu"].values())
+                inverted = any(v != t for (v, t) in b["pairs"])
+                decoupled = migrated or timesliced or inverted
+                mig_runs += int(migrated)
+                ts_runs += int(timesliced)
+                decoupled_runs += int(decoupled)
+                split_runs += int(not decoupled)
+                note = (f"  [migration={int(migrated)} "
+                        f"time-slice={int(timesliced)} "
+                        f"tid!=vcpu={int(inverted)} "
+                        f"tids={sorted(b['tids'])}]")
+            passed += int(run_ok)
+            if not run_ok:
+                for i in report.errors()[:4]:
+                    print(f"    [{i.check}] {i.message}")
+            print(f"thread_test[{isa}] seed {seed + 1}/{seeds}: "
+                  f"{'PASS' if run_ok else 'FAIL'} chains={chains}{note}")
+
+        print(f"thread_test[{isa}]: {passed}/{seeds} runs passed the "
+              f"guest-thread-identity assertion (exactly 2 tids, 2 "
+              f"well-formed per-thread chains, vCPU absent from the wire)")
+        if passed < seeds:
+            rc_total = 1
+        if migrate:
+            print(f"thread_test[{isa}]: decoupling over {seeds} run(s) — "
+                  f"decoupled={decoupled_runs} (migration={mig_runs}, "
+                  f"time-slice={ts_runs}), ambiguous-split={split_runs}")
+            # The whole point: the run set must witness the tid decoupled
+            # from the vCPU at least once (else an all-(vcpu==tid) split
+            # would pass without ever distinguishing the identity).
+            if decoupled_runs == 0:
+                print(f"thread_test[{isa}]: FAIL  no run distinguished the "
+                      f"guest-thread tid from the vCPU index (every "
+                      f"binding was tid==vcpu)")
                 rc_total = 1
     return rc_total
 

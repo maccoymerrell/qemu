@@ -547,6 +547,125 @@ static constexpr uint64_t PIN_PAGE_MASK = ~(uint64_t)0xFFF;
  * virtual page. */
 static constexpr size_t PIN_SIG_BYTES = 256;
 
+/*
+ * Guest-thread identity for a system-mode pin.
+ *
+ * The wire's thread_id names a GUEST thread, not the vCPU it happens to
+ * run on: a thread that migrates across vCPUs keeps one identity, and two
+ * threads time-slicing one vCPU are two identities.  The vCPU index (the
+ * QEMU cpu_index) is a scheduling slot and never reaches the wire.
+ *
+ * The kernel-maintained per-thread pointer register (x86 FS/GS.base,
+ * AArch64 TPIDR_EL0, RISC-V tp, MIPS CP0 UserLocal — qemu_plugin_get_
+ * thread_ptr) is that identity: every mainstream kernel context-switches
+ * it per software thread.  A per-SEGMENT map assigns each distinct value a
+ * compact tid in first-sighting order (0, 1, 2, …), so a single-threaded
+ * pinned process is always tid 0 regardless of vCPU, and the field width
+ * (small ints) is never stressed.  The map is meaningful only at USER
+ * privilege for the pinned process; it is populated exactly where the pin
+ * machinery already confirms that context (a user-owned priv-0 TB).
+ *
+ * g_vcpu_cur_tid[c] tracks the tid of the most recent user TB on vCPU c;
+ * kernel TBs of the pinned process carry it unchanged (they inherit the
+ * thread that entered the kernel), and it is advanced AFTER the deferred-
+ * prev seal so an emitted BB is attributed to the thread that executed it,
+ * not the one about to run next.  Both structures are guarded by exec_lock
+ * (every sample and every emit runs under it) and reset per segment.
+ *
+ * Degradation, documented: a target/model whose thread pointer is never
+ * written (no MIPS Config3.ULRI, a guest that sets no TLS) reports 0 for
+ * every thread, so all threads collapse to tid 0 — honest indistinctness,
+ * not fabricated identity.
+ */
+static std::unordered_map<uint64_t, uint32_t> *g_thread_tid_map;
+static uint32_t g_thread_tid_next = 0;
+static uint32_t g_vcpu_cur_tid[CST_PIN_MAX_VCPUS];
+/* Per-vCPU cache of the last thread-pointer value mapped, so the hot path
+ * re-maps only when the value actually changes (a thread's pointer is
+ * constant while it runs).  CST_TP_UNSEEN is a non-canonical sentinel no
+ * real thread pointer takes, forcing a re-map on the first TB of a
+ * segment. */
+static constexpr uint64_t CST_TP_UNSEEN = UINT64_MAX;
+static uint64_t g_vcpu_last_tp[CST_PIN_MAX_VCPUS];
+
+/* CST_TIDDIAG: emit (thread_ptr -> tid) and (vcpu <-> tid) bindings to
+ * stderr so an offline check can confirm the wire's tid is decoupled from
+ * the vCPU (one tid spanning vCPUs = migration; two tids on one vCPU =
+ * time-slice).  vCPU never reaches the wire; this is a stderr-only aid. */
+static bool tiddiag_on(void)
+{
+    static int flag = -1;
+    if (flag < 0) {
+        flag = getenv("CST_TIDDIAG") ? 1 : 0;
+    }
+    return flag != 0;
+}
+
+/* Log the first sighting of each distinct (vCPU, tid) pair.  A set-based
+ * record (not a per-vCPU transition) is what captures a migrating thread
+ * whose tid happens to equal a fresh vCPU's initial tid — the exact case a
+ * transition edge misses.  Caller holds exec_lock. */
+static void tiddiag_note_binding(unsigned int cpu_index, uint32_t tid)
+{
+    static std::unordered_set<uint64_t> *seen;
+    if (!seen) {
+        seen = new std::unordered_set<uint64_t>();
+    }
+    uint64_t key = ((uint64_t)cpu_index << 32) | tid;
+    if (seen->insert(key).second) {
+        fprintf(stderr, "champsim_tracer: [tiddiag] binding vcpu=%u tid=%u\n",
+                cpu_index, tid);
+    }
+}
+
+/* Map a guest thread-pointer value to its compact per-segment tid
+ * (first-sighting order).  Caller holds exec_lock and has established the
+ * value was sampled at user privilege for the pinned process. */
+static uint32_t thread_ptr_to_tid(uint64_t tp)
+{
+    if (!g_thread_tid_map) {
+        g_thread_tid_map = new std::unordered_map<uint64_t, uint32_t>();
+    }
+    auto it = g_thread_tid_map->find(tp);
+    if (it != g_thread_tid_map->end()) {
+        return it->second;
+    }
+    uint32_t tid = g_thread_tid_next++;
+    g_thread_tid_map->emplace(tp, tid);
+    if (tiddiag_on()) {
+        fprintf(stderr, "champsim_tracer: [tiddiag] new guest thread: "
+                "thread_ptr=0x%" PRIx64 " -> tid=%u\n", tp, tid);
+    }
+    return tid;
+}
+
+/* Reset the per-segment guest-thread identity map and every vCPU's current
+ * tid.  Caller holds exec_lock (via reset_segment_local_state). */
+static void thread_identity_reset(void)
+{
+    if (g_thread_tid_map) {
+        g_thread_tid_map->clear();
+    }
+    g_thread_tid_next = 0;
+    for (unsigned i = 0; i < CST_PIN_MAX_VCPUS; i++) {
+        g_vcpu_cur_tid[i] = 0;
+        g_vcpu_last_tp[i] = CST_TP_UNSEEN;
+    }
+}
+
+/* The thread_id stamped on an emitted body entry.  System-mode pin: the
+ * guest-thread identity (stable across vCPU migration).  User mode and any
+ * unpinned run: the vCPU index verbatim, exactly as before this mapping
+ * existed, so those traces stay byte-identical. */
+static inline uint32_t resolve_thread_id(unsigned int cpu_index)
+{
+    if (g_pinned_asid.load(std::memory_order_relaxed) != CST_ASID_UNPINNED &&
+        cpu_index < CST_PIN_MAX_VCPUS) {
+        return g_vcpu_cur_tid[cpu_index];
+    }
+    return (uint32_t)cpu_index;
+}
+
 /* Content signature of the guest code page based at @vpage in the
  * CURRENT address space: FNV-1a over PIN_SIG_BYTES from the page base
  * (the read is page-bounded, so it never straddles into an unmapped
@@ -1303,9 +1422,10 @@ static void append_histogram(GString *report, const char *segment_label,
  *   - pending_reg_snaps: would otherwise attach to the new segment's
  *     first body entry.
  *
- * No per-segment thread state (thread_id == vCPU index).  Persistent
- * FieldStateTable overlays are already fresh per segment (new
- * BodyStreamState per open).
+ * The per-segment guest-thread identity map (thread-pointer -> tid) is
+ * reset here via thread_identity_reset(), so tids are numbered in
+ * first-sighting order within each segment.  Persistent FieldStateTable
+ * overlays are already fresh per segment (new BodyStreamState per open).
  */
 static void reset_segment_local_state(void)
 {
@@ -1321,6 +1441,12 @@ static void reset_segment_local_state(void)
      * zero-initialized, so the IFRAME cadence resets implicitly. */
     g_template_store.clear_bb_map();
     g_mutex_unlock(&data_lock);
+
+    /* Per-segment guest-thread identity: tids are assigned in first-
+     * sighting order WITHIN a segment, so the map (and every vCPU's
+     * current tid) starts fresh here.  The opener's tid is re-seeded to 0
+     * by start_trace_segment below. */
+    thread_identity_reset();
 
     /*
      * Other threads' TLS state (cp_chain, tls_cp_mem_accesses,
@@ -1381,8 +1507,32 @@ static void start_trace_segment(const char *label,
     std::vector<InitialRegSnap> regfile;
     capture_initial_regfile(cpu_index, &regfile);
 
+    /* Seed thread id: the opener's guest-thread identity.  The map was
+     * just reset (reset_segment_local_state), so the first user-privilege
+     * thread pointer sampled here takes tid 0 — a single-threaded pinned
+     * process is thread 0 on any vCPU, and single-thread system goldens
+     * stay byte-stable (cpu_index 0 and first-sighting 0 coincide).  A
+     * non-pinned (user-mode / plain-icount) open keeps the vCPU index as
+     * the seed, preserving byte-identical output.  When the open lands on
+     * a kernel TB (no meaningful thread pointer yet) the seed is thread 0
+     * and the first user TB establishes the mapping. */
+    uint32_t seed_thread_id = (uint32_t)cpu_index;
+    if (g_pinned_asid.load(std::memory_order_relaxed) != CST_ASID_UNPINNED &&
+        cpu_index < CST_PIN_MAX_VCPUS) {
+        seed_thread_id = 0;
+        if (qemu_plugin_get_priv_level() == 0) {
+            uint64_t tp = qemu_plugin_get_thread_ptr();
+            seed_thread_id = thread_ptr_to_tid(tp);
+            g_vcpu_last_tp[cpu_index] = tp;
+            if (tiddiag_on()) {
+                tiddiag_note_binding(cpu_index, seed_thread_id);
+            }
+        }
+        g_vcpu_cur_tid[cpu_index] = seed_thread_id;
+    }
+
     g_trace_segments.start(label, start, stop, warmup, total_target,
-                           (uint32_t)cpu_index, simpoint_weight, &regfile);
+                           seed_thread_id, simpoint_weight, &regfile);
 
     /* Segment is active now → next-threshold becomes 0 so the
      * fast-path bail never fires in-segment (every TB takes the slow
@@ -1585,7 +1735,10 @@ void emit_body_entry(BodyStreamState *out_stream,
     entry.tmpl = bb_tmpl;
     entry.fault_depth = g_emit_fault_depth;
     entry.fault_anchors = g_emit_fault_anchors;
-    entry.thread_id = (uint32_t)cpu_index;
+    /* Guest-thread identity on the wire (system-mode pin); the raw vCPU
+     * index otherwise.  cpu_index is retained for live register reads only
+     * (regfile capture, WP lane gates) and never reaches the stream. */
+    entry.thread_id = resolve_thread_id(cpu_index);
     entry.cpu_index = cpu_index;
 
     g_mem_recorder.drain_cp_into_dyn_params(entry.dyn_params, bb_tmpl);
@@ -2763,6 +2916,26 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
                                         cpu_index);
 
     st = pb.step_seal(in, out_stream);
+
+    /* Advance this vCPU's guest-thread identity AFTER the deferred-prev
+     * seal above: the just-emitted BB belongs to the thread that executed
+     * it (the previous user TB), so this refresh takes effect only for the
+     * NEXT emit.  A user-owned priv-0 TB re-reads the thread pointer (which
+     * survives vCPU migration); a kernel TB leaves it, inheriting the
+     * thread that entered the kernel.  Under exec_lock — thread_ptr_to_tid
+     * mutates the per-segment map. */
+    if (in.pinned && in.user_owned && in.live_priv == 0 &&
+        cpu_index < CST_PIN_MAX_VCPUS) {
+        uint64_t tp = qemu_plugin_get_thread_ptr();
+        if (tp != g_vcpu_last_tp[cpu_index]) {
+            g_vcpu_last_tp[cpu_index] = tp;
+            uint32_t new_tid = thread_ptr_to_tid(tp);
+            g_vcpu_cur_tid[cpu_index] = new_tid;
+            if (tiddiag_on()) {
+                tiddiag_note_binding(cpu_index, new_tid);
+            }
+        }
+    }
 
     /* Only a normally-sealed step evaluates the deferred closes and
      * consumes the spec-flush latch — the stash / merge / no-seal

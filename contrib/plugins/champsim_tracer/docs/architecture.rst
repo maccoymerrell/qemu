@@ -234,13 +234,31 @@ the trace stream:
   the order ``vcpu_tb_exec`` callbacks fired across the host
   process.  Each ENTRY record is tagged with a
   ``thread_id`` (set by the most recent ``BODY_TAG_THREAD_SWITCH``)
-  so consumers can reconstruct per-vCPU sub-streams by filtering.
-* **``thread_id`` is the guest vCPU index, verbatim.**  Each ENTRY
-  records ``cpu_index`` directly as its ``thread_id`` — there is no
-  remapping table and no per-segment renumbering, so the value is
-  stable for the whole run.  Each segment's body opens with an
-  explicit ``BODY_TAG_THREAD_SWITCH`` naming the starting thread;
-  there is no per-segment thread state to reset.
+  so consumers can reconstruct per-thread sub-streams by filtering.
+* **``thread_id`` names a guest thread, not the vCPU.**  The vCPU
+  (host scheduling slot) is deliberately absent from the wire — the
+  consumer owns the thread-to-core mapping, not the tracer.  In a
+  user-mode trace each guest thread is its own host thread and
+  ``thread_id`` is that thread's index.  In a **system-mode pinned**
+  trace the id is resolved from the guest kernel's per-thread pointer
+  register (x86 ``FS.base``, AArch64 ``TPIDR_EL0``, RISC-V ``tp``,
+  MIPS CP0 ``UserLocal`` — :c:func:`qemu_plugin_get_thread_ptr`),
+  sampled at user privilege for the pinned process and mapped to a
+  compact id in first-sighting order within the segment.  Because that
+  pointer follows the software thread, the id is **stable across vCPU
+  migration**: a thread the guest scheduler moves between vCPUs keeps
+  one ``thread_id``, and two threads time-slicing a single vCPU are two
+  distinct ids — the opposite of a vCPU index, which would split the
+  first and merge the second.  A single-threaded pinned process is
+  ``thread_id`` 0 regardless of which vCPU(s) it ran on; kernel entries
+  inherit the tid of the thread that entered the kernel (a kernel TB
+  before any user TB of the segment reads as thread 0).  Each segment's
+  body opens with an explicit ``BODY_TAG_THREAD_SWITCH`` naming the
+  starting thread; the per-segment thread-id map is reset at each open.
+  *Degradation:* a target/model whose thread-pointer register is never
+  written (no MIPS ``Config3.ULRI``, a guest that sets no TLS) reports
+  0 for every thread, so its threads collapse to one id — honest
+  indistinctness, never a fabricated identity.
 * **``icount`` is per-vCPU.**  The plugin maintains one instruction
   counter per QEMU vCPU.  Segment-window comparisons (``start=N``
   / ``stop=N``, simpoint windows) consult the firing vCPU's
@@ -271,8 +289,8 @@ Practical implications:
   (``taskset -c 0``) to reduce the variability of
   inherently-concurrent applications.
 * **Sub-segment thread switches are sparse.**  ``BODY_TAG_THREAD_SWITCH``
-  records are emitted only when the firing vCPU differs from the
-  previous body record's vCPU.  Single-threaded workloads pay
+  records are emitted only when the running guest thread differs from the
+  previous body record's.  Single-threaded workloads pay
   zero per-block thread-id overhead.
 * **Field-state delta encoding is per-thread.**  Each
   thread maintains its own ``FieldStateTable``, so an ENTRY's

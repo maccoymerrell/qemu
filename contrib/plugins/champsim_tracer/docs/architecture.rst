@@ -503,11 +503,35 @@ Correct-path flow
 -----------------
 
 ``vcpu_tb_exec`` fires once per executed TB.  It is registered as a
-conditional callback on the scoreboard's ``is_active`` slot, so the
-JIT skips the dispatch entirely between segments; its ``udata`` is
-the head fragment of the TB's per-translation fragment list.  The
-callback has two layers: a short shared prologue, then the
-PathBuilder step.
+conditional callback on the scoreboard's ``trace_this_ctx`` slot,
+which folds ``is_active`` together with pinned-context ownership: the
+JIT skips the dispatch entirely between segments *and* for any TB the
+trace does not own.  Its ``udata`` is the head fragment of the TB's
+per-translation fragment list.  The callback has two layers: a short
+shared prologue, then the PathBuilder step.
+
+``trace_this_ctx`` is a bare ``is_active`` mirror everywhere the
+ownership question is trivial — user mode, an unpinned system trace,
+and the wide-register system pins (CR3 / TTBR0 / SATP) whose ASID is
+a reliable per-process id, foreign-dropped inside the step as before.
+It diverges only for a **narrow-ASID (MIPS) system pin**, where a
+recycled ``EntryHi.ASID`` cannot distinguish processes: there only a
+physical-page-confirmed dwell traces, and a separate light callback,
+``vcpu_pin_probe`` (gated on the companion ``pin_probe`` slot,
+registered ahead of ``vcpu_tb_exec``), runs for every other in-segment
+TB.  The light probe carries the whole per-foreign-TB budget — a
+user-clock cursor tick, the physical-page content probe on user TBs,
+and the capture mute the heavy drop path used to set — with no
+``VClockPauseGuard`` and no PathBuilder step; on the TB that
+re-acquires the pinned process it flips ``trace_this_ctx`` to 1 so the
+heavy callback's re-loaded brcond fires for that same TB.  Both slots
+are maintained event-driven (``refresh_ctx_gates``): at every
+``is_active`` edge, at each committed ASID write, and on a re-acquiring
+probe — never on the per-TB path.  This is what keeps a churning
+guest, where a rollover hands the pinned ASID value to a stream of
+foreign processes, from paying the guest-clock freeze on millions of
+dropped foreign TBs (the throttle that otherwise collapses the guest
+virtual clock to a fraction of realtime).
 
 **Shared prologue** (before any lock):
 
@@ -1087,11 +1111,12 @@ queue as it observes the bumped segment generation on its next
 step — TLS cursors can only be reset from their own thread.
 
 A mid-run open executes on one vCPU but activates **every**
-vCPU's scoreboard (``is_active`` mirror plus the budget sentinel):
-on an SMP guest the pinned process's threads run wherever the
-scheduler put them, and a vCPU left inactive would silently carry
-no trace coverage — and no user-clock contribution — for the whole
-segment.  The user-instruction clock's delta source is likewise
+vCPU's scoreboard (``is_active`` mirror plus the budget sentinel,
+each ``is_active`` write followed by ``refresh_ctx_gates`` to stamp
+the derived ``trace_this_ctx`` / ``pin_probe`` gates): on an SMP
+guest the pinned process's threads run wherever the scheduler put
+them, and a vCPU left inactive would silently carry no trace
+coverage — and no user-clock contribution — for the whole segment.  The user-instruction clock's delta source is likewise
 per-vCPU (each vCPU's fold reads its own ``insn_count`` cursor;
 ``user_count_reset`` seats the opener's cursor exactly and marks
 every other vCPU's unprimed, so its first fold contributes zero
@@ -1272,7 +1297,11 @@ each is catalogued in :doc:`qemu_modifications`.
   CP step in ``vcpu_tb_exec`` and the translation work in
   ``vcpu_tb_trans`` with ``qemu_plugin_vclock_pause`` / ``resume``
   — a nesting-depth freeze of the guest virtual clock, so
-  arbitrary instrumentation regions compose.
+  arbitrary instrumentation regions compose.  Because the CP step is
+  gated on ``trace_this_ctx`` (see :ref:`cp-flow`), the freeze wraps
+  only genuinely-owned pinned content: a foreign TB never dispatches
+  the heavy callback, so its execution stays on the guest clock and a
+  foreign-process storm cannot throttle guest time.
 * **Whole-excursion freeze for the wrong path.**  The WP session
   boundary (``wp_enter_spec_session`` / ``wp_end_spec_session``)
   pauses guest virtual time for the entire excursion via

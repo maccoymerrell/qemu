@@ -37,6 +37,11 @@ public:
     /* live-ASID == pinned-ASID flag (per-vCPU 0/1); see the field
      * comment in champsim_tracer.h. */
     qemu_plugin_u64 asid_match;
+    /* Context gate for the heavy per-TB capture callback and its light
+     * re-acquisition probe (per-vCPU 0/1); see the field comments in
+     * champsim_tracer.h. */
+    qemu_plugin_u64 trace_this_ctx;
+    qemu_plugin_u64 pin_probe;
     /* Signed budget that counts down by n_insns per TB exec (via
      * INLINE_ADD_U64 with imm = (uint64_t)(-n_insns)).  When it drops
      * below 1, a cond_cb fires (vcpu_tb_check_budget) to handle the

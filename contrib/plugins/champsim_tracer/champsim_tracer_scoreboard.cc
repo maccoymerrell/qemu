@@ -23,6 +23,10 @@ VCPUScoreboard::VCPUScoreboard()
         sb_, VCPUScoreBoard, is_active);
     asid_match = qemu_plugin_scoreboard_u64_in_struct(
         sb_, VCPUScoreBoard, asid_match);
+    trace_this_ctx = qemu_plugin_scoreboard_u64_in_struct(
+        sb_, VCPUScoreBoard, trace_this_ctx);
+    pin_probe = qemu_plugin_scoreboard_u64_in_struct(
+        sb_, VCPUScoreBoard, pin_probe);
     budget = qemu_plugin_scoreboard_u64_in_struct(
         sb_, VCPUScoreBoard, budget);
     user_seen = qemu_plugin_scoreboard_u64_in_struct(

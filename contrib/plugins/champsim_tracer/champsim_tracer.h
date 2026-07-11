@@ -942,6 +942,27 @@ typedef struct {
      * compensates the coarse fast-forward countdown for foreign-process
      * user instructions. */
     uint64_t asid_match;
+    /* Context gate for the heavy per-TB capture callback (vcpu_tb_exec).
+     * Folds is_active AND pinned-context-ownership into ONE JIT-testable
+     * slot so a foreign / unowned TB is never dispatched at all — no
+     * callback, no vclock pause, no drop decision.  Byte-identical to
+     * is_active everywhere the ownership question is trivial (user mode,
+     * unpinned system, and the wide-register system pins whose ASID is a
+     * reliable process id); it diverges only for a narrow-ASID (MIPS)
+     * system pin, where a recycled ASID cannot distinguish processes and
+     * the physical-page probe adjudicates.  Maintained EVENT-DRIVEN (see
+     * refresh_ctx_gates): at every is_active edge, at each ASID-write
+     * commit, and when the light probe re-acquires the pinned process. */
+    uint64_t trace_this_ctx;
+    /* Companion gate for the light re-acquisition probe (vcpu_pin_probe),
+     * set only for a narrow-ASID system pin.  1 exactly when a segment is
+     * active but this vCPU's dwell is NOT a confirmed-owned pinned
+     * context: the light probe runs per such TB (a user-clock cursor
+     * tick, the physical-page content probe on user TBs, and the capture
+     * mute the heavy drop path used to set) and flips trace_this_ctx to 1
+     * on the TB that re-acquires the process.  0 (probe never fires) for
+     * user mode, unpinned system, and wide-register pins. */
+    uint64_t pin_probe;
     /* Signed budget tracking insns until the next window event
      * (segment open in inter-segment, or sentinel "far future" while
      * in-segment).  Bumped by INLINE_ADD_U64(-n_insns) per TB exec

@@ -703,6 +703,42 @@ static inline uint64_t pin_effective_asid(unsigned int cpu_index,
     return pinned_asid;
 }
 
+/*
+ * Recompute this vCPU's context gates (trace_this_ctx / pin_probe) from
+ * the live segment-active flag and the pin-ownership state, and stamp
+ * them into the scoreboard.  This is the single event-driven maintainer
+ * — called at every is_active edge, at each committed ASID write, and on
+ * a light-probe re-acquisition — so the heavy per-TB callback is gated
+ * by ONE JIT-testable slot instead of the runtime foreign-drop decision.
+ *
+ * Divergence from a bare is_active mirror happens ONLY for a narrow-ASID
+ * (MIPS) system pin: there a recycled EntryHi.ASID cannot distinguish
+ * processes, so only a physical-page-confirmed dwell (g_pin_vcpu
+ * .confirmed) is traced and every other context runs the light probe.
+ * User mode, unpinned system, and the wide-register pins (CR3 / TTBR0 /
+ * SATP — a reliable per-process id, foreign-dropped in the heavy step as
+ * before) keep trace_this_ctx == is_active and never arm the probe, so
+ * their traces are byte-identical to the pre-gating path.
+ */
+static inline void refresh_ctx_gates(unsigned int cpu_index)
+{
+    bool active = qemu_plugin_u64_get(g_scoreboard.is_active, cpu_index) != 0;
+    bool diverge = g_pin_reuse_guard &&
+        g_pinned_asid.load(std::memory_order_relaxed) != CST_ASID_UNPINNED;
+    if (!diverge) {
+        qemu_plugin_u64_set(g_scoreboard.trace_this_ctx, cpu_index,
+                            active ? 1 : 0);
+        qemu_plugin_u64_set(g_scoreboard.pin_probe, cpu_index, 0);
+        return;
+    }
+    bool conf = cpu_index < CST_PIN_MAX_VCPUS &&
+        g_pin_vcpu[cpu_index].confirmed.load(std::memory_order_relaxed);
+    qemu_plugin_u64_set(g_scoreboard.trace_this_ctx, cpu_index,
+                        (active && conf) ? 1 : 0);
+    qemu_plugin_u64_set(g_scoreboard.pin_probe, cpu_index,
+                        (active && !conf) ? 1 : 0);
+}
+
 /* Synchronous ASID-write hook: keep the per-vCPU asid_match flag in
  * step with the live address space.  Fires at the same architectural
  * commit points that produce ASID_WRITE path events (and with the same
@@ -724,8 +760,15 @@ static void asid_write_track_cb(unsigned int vcpu_index, uint64_t new_asid)
         new_asid == pin_effective_asid(vcpu_index, pinned) ? 1 : 0);
     if (g_pin_reuse_guard && pinned != CST_ASID_UNPINNED) {
         if (vcpu_index < CST_PIN_MAX_VCPUS) {
+            /* A committed ASID write ends the vCPU's verified dwell: the
+             * written value may have been handed to anyone, so the next
+             * user TB must re-probe the physical-page map before this
+             * context is traced again.  Dropping trace_this_ctx (and
+             * arming the probe) HERE, off the per-TB path, is exactly
+             * how the foreign span stops dispatching the heavy callback. */
             g_pin_vcpu[vcpu_index].confirmed.store(
                 false, std::memory_order_relaxed);
+            refresh_ctx_gates(vcpu_index);
         }
         pin_reuse_track(new_asid, pinned);
     }
@@ -981,6 +1024,7 @@ static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
     if (g_trace_segments.is_active_atomic()) {
         qemu_plugin_u64_set(g_scoreboard.is_active, cpu_index, 1);
     }
+    refresh_ctx_gates(cpu_index);
     recompute_budget(cpu_index);
 
     /* Snapshot the main binary's text-segment range on first vCPU
@@ -1362,6 +1406,7 @@ static void start_trace_segment(const char *label,
         qemu_plugin_u64_set(g_scoreboard.is_active, (unsigned)i, 1);
         qemu_plugin_u64_set(g_scoreboard.budget, (unsigned)i,
                             (uint64_t)BUDGET_INACTIVE_SENTINEL);
+        refresh_ctx_gates((unsigned)i);
     }
     if (getenv("CST_SMP_DIAG")) {
         fprintf(stderr, "champsim_tracer: [smpdiag] segment open on cpu %d: "
@@ -1766,6 +1811,7 @@ static void finish_trace_segment(void)
      * countdown targets the post-advance next eff_start. */
     for (int i = 0; i < qemu_plugin_num_vcpus(); i++) {
         qemu_plugin_u64_set(g_scoreboard.is_active, i, 0);
+        refresh_ctx_gates((unsigned)i);
     }
 
     /* Per-segment stats: diff against the segment-start snapshot. */
@@ -2373,6 +2419,7 @@ static void vcpu_tb_check_budget(unsigned int cpu_index, void *udata)
             qemu_plugin_u64_set(g_scoreboard.is_active, (unsigned)i, 1);
             qemu_plugin_u64_set(g_scoreboard.budget, (unsigned)i,
                                 (uint64_t)BUDGET_INACTIVE_SENTINEL);
+            refresh_ctx_gates((unsigned)i);
         }
         qemu_plugin_request_tb_flush();
         fprintf(stderr, "champsim_tracer: coarse fast-forward handoff at "
@@ -2734,12 +2781,96 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     }
 }
 
+/*
+ * Light per-TB probe for the unowned / unconfirmed context under a
+ * narrow-ASID system pin.  Registered (only when g_pin_reuse_guard)
+ * BEFORE the heavy vcpu_tb_exec and gated on the pin_probe scoreboard
+ * slot, so it dispatches ONLY while a segment is active and this vCPU's
+ * dwell is not a confirmed-owned pinned context — never for user mode,
+ * unpinned system, or a wide-register pin.  It is the whole per-foreign-
+ * TB budget: no VClockPauseGuard, no PathBuilder step, and exec_lock is
+ * taken only on the user-TB probe path.  Everything the heavy callback's
+ * DROPPED_FOREIGN branch used to do for a foreign span (mute the per-insn
+ * capture callbacks, drop the deferred prev so nothing seals across the
+ * gap, tick the user-clock cursor) is done here instead — cheaply — and
+ * on the TB that re-acquires the pinned process it flips trace_this_ctx
+ * to 1 so the heavy callback's re-loaded brcond fires for that same TB.
+ */
+static void vcpu_pin_probe(unsigned int cpu_index, void *udata)
+{
+    /* Wrong-path simulation re-dispatches the TB's callbacks on the same
+     * thread that already owns the CP step; it touches no pin state. */
+    if (g_wp_state.in_progress) {
+        return;
+    }
+    BBTemplate *cur_tb_tmpl = (BBTemplate *)udata;
+    uint64_t icount = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
+
+    /* Physical-page re-acquisition (user TBs only; a kernel TB carries no
+     * user-code PC to match against the map, and the switch-return kernel
+     * path is charged to the excursion owner by kexc regardless).  One
+     * probe per unconfirmed user TB — the exact per-TB semantics the
+     * heavy path had, minus its cost — until a hit confirms the dwell. */
+    if (cur_tb_tmpl && cpu_index < CST_PIN_MAX_VCPUS &&
+        !g_pin_vcpu[cpu_index].confirmed.load(std::memory_order_relaxed) &&
+        qemu_plugin_get_priv_level() == 0) {
+        uint64_t live_asid = qemu_plugin_get_addr_space_id();
+        g_rec_mutex_lock(&exec_lock);
+        int m = pin_map_probe(cur_tb_tmpl->start_pc);
+        if (m == 1) {
+            PinVcpuState &ps = g_pin_vcpu[cpu_index];
+            if (live_asid != ps.asid.load(std::memory_order_relaxed)) {
+                /* Re-acquired under a different ASID value — a generation
+                 * rollover re-numbered the process or it migrated onto a
+                 * vCPU whose per-CPU ASID differs.  Re-pin the dwell tag. */
+                ps.asid.store(live_asid, std::memory_order_relaxed);
+                qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
+                g_stats.pin_repins++;
+            }
+            ps.confirmed.store(true, std::memory_order_relaxed);
+            refresh_ctx_gates(cpu_index);   /* trace_this_ctx=1, pin_probe=0 */
+            g_rec_mutex_unlock(&exec_lock);
+            /* Do NOT advance the user cursor here: the heavy callback
+             * fires for this very TB (its brcond re-loads trace_this_ctx)
+             * and folds this TB's delta into the user clock itself. */
+            return;
+        }
+        if (m < 0) {
+            g_stats.pin_phys_mismatch_dropped++;
+        } else {
+            g_stats.pin_unverified_dropped++;
+        }
+        g_rec_mutex_unlock(&exec_lock);
+    }
+
+    /* Unowned this TB.  Mute the per-insn capture callbacks (still gated
+     * on is_active, they self-drop on g_capture_mute) so the foreign
+     * span's registers/memops never pile into the pinned process's
+     * pending state.  Outside an async window, also drop the deferred
+     * prev exactly as the heavy DROPPED_FOREIGN branch does, so the
+     * resume never seals a fabricated edge across the gap; INSIDE an
+     * async window prev is preserved (the SUSPENDED contract — the resume
+     * seals the interrupted branch against its real target). */
+    g_capture_mute = true;
+    if (!qemu_plugin_in_async_int()) {
+        g_mem_recorder.clear_cp();
+        path_builder_tls().clear_prev();
+    }
+    /* User-clock cursor tick: advance this vCPU's seen cursor so the
+     * foreign span's instructions never fold into the pinned process's
+     * user clock when it resumes (the delta is measured from HERE). */
+    user_seen_advance(cpu_index, icount);
+}
+
 static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 {
     /* This callback is registered via register_vcpu_tb_exec_cond_cb
-     * with COND_GE on is_active, so the JIT only dispatches it when
-     * we're in-segment.  Inter-segment dispatch is handled solely by
-     * inline_add (icount/budget) and vcpu_tb_check_budget.
+     * gated on the trace_this_ctx scoreboard slot (is_active folded with
+     * pinned-context ownership), so the JIT only dispatches it in-segment
+     * for a context this trace owns.  Inter-segment dispatch is handled
+     * solely by inline_add (icount/budget) and vcpu_tb_check_budget; a
+     * foreign / unowned in-segment TB is handled by the light
+     * vcpu_pin_probe instead (narrow-ASID pins) or never diverges at all.
      *
      * udata = the head fragment of this TB's per-translation fragment
      * list, set when the translation was armed in vcpu_tb_trans.
@@ -3415,6 +3546,7 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
             qemu_plugin_u64_set(g_scoreboard.is_active, (unsigned)i, 1);
             qemu_plugin_u64_set(g_scoreboard.budget, (unsigned)i,
                                 (uint64_t)BUDGET_INACTIVE_SENTINEL);
+            refresh_ctx_gates((unsigned)i);
         }
         fprintf(stderr, "champsim_tracer: marker pinned asid 0x%" PRIx64
                 " at icount %" PRIu64 " — positioning to simpoint start %"
@@ -4096,14 +4228,30 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             QEMU_PLUGIN_COND_GE, g_scoreboard.budget, (1ULL << 63),
             nullptr);
     }
+    /* Light re-acquisition probe (narrow-ASID system pins only).  Gated
+     * on pin_probe and registered BEFORE the heavy callback so that on
+     * the TB re-acquiring the pinned process it flips trace_this_ctx to
+     * 1, and the heavy callback's brcond — re-loaded from the scoreboard
+     * — fires for that same TB (the identical ordering trick the budget
+     * cb uses above).  Not registered for user mode or wide-register
+     * pins, so those paths carry no extra per-TB brcond. */
+    if (g_pin_reuse_guard) {
+        qemu_plugin_register_vcpu_tb_exec_cond_cb(
+            tb, vcpu_pin_probe, QEMU_PLUGIN_CB_NO_REGS,
+            QEMU_PLUGIN_COND_GE, g_scoreboard.pin_probe, 1,
+            (void *)head_fragment);
+    }
     /* Heavy callback: chain assembler, WP simulator, body-entry
-     * emission.  Gated via cond_cb on is_active so it is NOT
-     * dispatched at all during inter-segment — the JIT emits a
-     * brcond and skips the call.  In-segment, is_active=1 and the
-     * cb fires per TB just like before. */
+     * emission.  Gated via cond_cb on trace_this_ctx (is_active folded
+     * with pinned-context ownership) so it is NOT dispatched at all
+     * inter-segment OR for a foreign / unowned context — the JIT emits a
+     * brcond and skips the call, sparing the vclock pause and the drop
+     * decision the dropped foreign TB used to pay.  For user mode,
+     * unpinned system, and wide-register pins trace_this_ctx mirrors
+     * is_active exactly, so the cb fires per TB just as it did before. */
     qemu_plugin_register_vcpu_tb_exec_cond_cb(
         tb, vcpu_tb_exec, QEMU_PLUGIN_CB_RW_REGS,
-        QEMU_PLUGIN_COND_GE, g_scoreboard.is_active, 1,
+        QEMU_PLUGIN_COND_GE, g_scoreboard.trace_this_ctx, 1,
         (void *)head_fragment);
 
     /* Proactive spec-template reclaim (#91): when the wrong path has minted

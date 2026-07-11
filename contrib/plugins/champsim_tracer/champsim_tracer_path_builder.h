@@ -139,9 +139,18 @@ public:
         uint64_t prev_ft;         /* scoreboard prev_fall_through */
         uint64_t current_pc;      /* scoreboard current_pc */
         bool pinned;              /* marker-mode ASID pin armed */
-        uint64_t pinned_asid;     /* valid iff pinned */
+        uint64_t pinned_asid;     /* the vCPU's EFFECTIVE pin (dwell tag
+                                   * on narrow-ASID targets, marker-time
+                                   * value on wide ones); valid iff
+                                   * pinned */
         uint64_t live_asid;       /* live read at TB exec (0 unpinned) */
         int live_priv;            /* live read at TB exec (-1 unpinned) */
+        bool user_owned;          /* priv==0 TB owned by the pinned
+                                   * process (pin_user_tb_owned: legacy
+                                   * ASID equality on wide targets,
+                                   * physical-page verification on
+                                   * narrow ones); false for kernel TBs
+                                   * and when unpinned */
         const struct qemu_plugin_cpu_event *evs;
         size_t n_evs;
         unsigned int cpu_index;
@@ -228,8 +237,8 @@ public:
 private:
     void prime_from_live();
     void kexc_apply_asid_write(uint64_t new_asid);
-    void kexc_user_tb(uint64_t live_asid);
-    bool kexc_kernel_tb_keep(uint64_t pinned_asid);
+    void kexc_user_tb(uint64_t live_asid, bool owned);
+    bool kexc_kernel_tb_keep(void);
     void kexc_reset();
     void classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
                               bool *prev_stashed);
@@ -326,15 +335,21 @@ private:
      * observable architecturally: privilege transitions delimit the
      * excursion and ASID_WRITE path events expose every committed swap.
      *
-     *   user TB (priv==0)   ownership resets; live ASID is authoritative
-     *                       (the exact legacy rule) and is recorded as
-     *                       kexc_last_user_asid_.
+     *   user TB (priv==0)   ownership resets; the step glue's
+     *                       pin_user_tb_owned verdict is recorded as
+     *                       kexc_user_owned_ (on wide-register targets
+     *                       that is the exact legacy live-ASID
+     *                       equality; on narrow-ASID targets it is the
+     *                       physical-page verification — a raw value
+     *                       match after a rollover is not identity),
+     *                       and the live ASID as kexc_last_user_asid_.
      *   kernel-entry edge   the first priv!=0 TB after a priv==0 TB —
      *                       once per excursion, at the OUTERMOST
      *                       user->kernel transition (nested faults
      *                       inside a syscall do not re-fire it):
-     *                       exc_entry_ = last_user_asid_, overlay
-     *                       cleared, cut cleared.
+     *                       exc_entry_ = last_user_asid_, entry_owned_
+     *                       = user_owned_, overlay cleared, cut
+     *                       cleared.
      *   ASID_WRITE (new V)  only meaningful while in kernel:
      *                         V == exc_entry_   nothing (restore;
      *                                           ownership continues)
@@ -351,7 +366,7 @@ private:
      *                                           switch; sticky until
      *                                           the next user TB)
      *   kernel TB           keep for the trace iff
-     *                       exc_entry_ == pinned && !cut_ (the async
+     *                       entry_owned_ && !cut_ (the async
      *                       exclusion has already run).  This REPLACES
      *                       the live-ASID foreign-drop test for priv!=0
      *                       TBs only.
@@ -369,7 +384,11 @@ private:
     bool     kexc_in_kernel_ = false;   /* excursion open (edge latched) */
     bool     kexc_have_user_ = false;   /* last_user_asid_ is valid */
     uint64_t kexc_last_user_asid_ = 0;
+    bool     kexc_user_owned_ = false;  /* last user TB's ownership
+                                         * verdict (TB-history: survives
+                                         * kexc_reset with last_user) */
     uint64_t kexc_exc_entry_ = 0;       /* owning ASID at the entry edge */
+    bool     kexc_entry_owned_ = false; /* ownership latched at the edge */
     bool     kexc_have_overlay_ = false;
     uint64_t kexc_overlay_ = 0;
     bool     kexc_cut_ = false;

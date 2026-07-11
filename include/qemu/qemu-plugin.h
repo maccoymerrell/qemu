@@ -90,11 +90,19 @@ typedef uint64_t qemu_plugin_id_t;
  * - added qemu_plugin_register_asid_write_cb (synchronous notification
  *   at the architectural address-space-register commit points; fires
  *   even while the per-vCPU path-event queue is disabled)
+ *
+ * version 10:
+ * - added qemu_plugin_vaddr_to_paddr (debug-walk the current address
+ *   space's translation; physical-page identity for address spaces a
+ *   narrow ASID cannot distinguish)
+ * - added qemu_plugin_get_thread_ptr (the kernel-maintained per-thread
+ *   pointer register; guest-thread identity independent of the vCPU a
+ *   thread happens to be scheduled on)
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 9
+#define QEMU_PLUGIN_VERSION 10
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -1634,6 +1642,51 @@ uint64_t qemu_plugin_get_addr_space_id(void);
  */
 QEMU_PLUGIN_API
 bool qemu_plugin_paging_enabled(void);
+
+/**
+ * qemu_plugin_vaddr_to_paddr() - translate a guest-virtual address
+ * @vaddr: guest-virtual address in the vCPU's CURRENT address space
+ * @paddr: filled with the guest-physical translation on success
+ *
+ * Debug-walks the current address space's translation (page tables, or
+ * the live software TLB on TLB-refill architectures such as MIPS)
+ * without perturbing it.  Returns false when no translation exists
+ * right now — on a TLB-refill architecture that includes mappings the
+ * guest TLB has evicted, so a false is "unknown", not "unmapped".
+ *
+ * Physical addresses are the one architectural identity virtual
+ * aliases cannot forge: two processes mapping the same virtual page to
+ * different content necessarily map different physical pages, while a
+ * narrow, recycled ASID (MIPS EntryHi.ASID) can silently alias them.
+ * A plugin pinned to one process can therefore verify address-space
+ * identity by physical page when the ASID value alone is ambiguous.
+ * In *-linux-user (one address space, no guest MMU) the identity map
+ * is returned.  Must be called from a vCPU context.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_vaddr_to_paddr(uint64_t vaddr, uint64_t *paddr);
+
+/**
+ * qemu_plugin_get_thread_ptr() - the guest's per-thread pointer register
+ *
+ * Returns the architectural thread-pointer state the guest kernel
+ * maintains per software thread: x86_64 FS.base (GS.base for a 32-bit
+ * compat task), AArch64 TPIDR_EL0, RISC-V tp (x4), MIPS CP0 UserLocal.
+ * Every mainstream kernel context-switches this register per thread
+ * (it is the TLS base the thread library hands out), so its value is a
+ * stable per-guest-thread identity that survives vCPU migration —
+ * unlike the vCPU index, which names a scheduling slot, not a thread.
+ *
+ * The value is only meaningful when sampled at user privilege: inside
+ * the kernel the register may hold the previous task's value mid-switch
+ * (or, for RISC-V tp, the kernel's own per-CPU pointer).  Returns 0
+ * when the target provides no hook or the register was never written
+ * (e.g. a CPU model without the feature, or a guest that sets no TLS);
+ * threads without a thread pointer are architecturally
+ * indistinguishable.  Must be called from a vCPU context.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_get_thread_ptr(void);
 
 /**
  * qemu_plugin_icount_enabled() - whether QEMU is running with -icount

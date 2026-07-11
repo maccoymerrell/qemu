@@ -452,6 +452,257 @@ static void pin_reuse_track(uint64_t new_asid, uint64_t pinned_asid)
     g_mutex_unlock(&pin_reuse_lock);
 }
 
+/*
+ * Physical-page process identity (narrow-ASID targets; currently MIPS).
+ *
+ * The wide-register targets pin a page-table base (CR3 / TTBR0 / SATP):
+ * equality is stable per process and distinct across processes for the
+ * whole run.  MIPS exposes no such register — the CP0 audit recorded in
+ * mips_get_plugin_state (target/mips/cpu.c) found Context.PTEBase is a
+ * per-CPU constant on a 32-bit Linux guest and KScratch / MemoryMapID
+ * absent from the 24K/34K-class models — so the bare EntryHi.ASID pin
+ * inherits every weakness of an 8-bit, per-CPU, generation-recycled
+ * space: a rollover hands the pinned VALUE to a foreign process (whose
+ * user code then traces as if pinned), hands the pinned PROCESS a new
+ * value (its execution stops matching), and a migration lands the
+ * process on a vCPU where its per-CPU ASID differs from the pin.
+ *
+ * The identity that survives all three is the user code itself: the
+ * pinned process's code pages carry the same BYTES no matter which
+ * ASID value or vCPU it currently holds, while a foreign process
+ * aliasing the same virtual addresses runs different bytes (a distinct
+ * binary at that VA) — and byte-identical code shared from the page
+ * cache is the same content, which the trace records identically
+ * either way.  So on narrow-ASID targets the pin's AUTHORITY is a map
+ * of executed user-code pages (virtual page -> {physical page, content
+ * signature}), seeded at the marker and grown by every verified user
+ * TB; the per-vCPU ASID value is a dwell tag:
+ *
+ *   - an ASID write ends the vCPU's dwell (confirmed=false; the value
+ *     may have been handed to anyone);
+ *   - the first user TB of a dwell must probe the map: a hit-match
+ *     confirms the dwell (one probe per context switch, not per TB); a
+ *     content MISMATCH on a mapped page is a foreign process and the
+ *     TB is dropped; an unmapped page stays unverified and the TB is
+ *     dropped (the genuine process resumes on a page it has executed,
+ *     so it confirms immediately; a foreign process that never touches
+ *     mapped pages parks unverified forever — traced never);
+ *   - a user TB probing hit-match under a DIFFERENT ASID value
+ *     re-acquires the process: the vCPU's dwell tag re-pins to the live
+ *     value (rollover re-numbering and cross-vCPU migration both land
+ *     here, one-TB lossy).
+ *
+ * The physical frame is the FAST path, not the authority: a frame match
+ * confirms without touching guest memory, but a frame mismatch is not
+ * proof of a foreign process — the guest evicts a clean file-backed
+ * code page under memory pressure and re-faults it to a DIFFERENT frame
+ * with identical bytes (observed reliably across the churn test's sleep
+ * window: 512 MiB guest, hundreds of short-lived processes).  Anchoring
+ * on the frame alone stalled there — the marker page, the map's only
+ * seed, re-faulted while the pinned process slept, so every revisit
+ * mismatched and the process (its entire hot region unmapped, having
+ * run only post-rollover) never re-acquired.  Content is the true
+ * invariant: on a frame mismatch the probe reads the page's bytes and
+ * compares their signature, so a re-faulted page reads as a hit (and
+ * refreshes its frame) while a genuinely foreign page reads as a
+ * mismatch.  Reading guest memory is confined to that mismatch path —
+ * the frame fast-path and the confirmed-dwell hot path never touch it.
+ *
+ * Verification runs only on narrow-ASID targets (g_pin_reuse_guard) in
+ * the CP step glue under exec_lock — the map needs no lock of its own;
+ * the marker's seed takes exec_lock around it.  The map is immortal
+ * (see "Immortal process-wide aggregates" in docs/architecture.rst) and
+ * reset at each marker fire.  Known residual, accepted: two live
+ * instances of the SAME binary share byte-identical text, so a
+ * re-acquisition cannot tell them apart (their user code is identical;
+ * data capture may interleave) — the duplicate-binary discriminator
+ * would need private (written) page anchors, deliberately not spent
+ * here.
+ */
+static constexpr unsigned CST_PIN_MAX_VCPUS = 1024;
+struct PinVcpuState {
+    /* The ASID value the pinned process most recently held on this
+     * vCPU (dwell tag), CST_ASID_UNPINNED until first acquisition. */
+    std::atomic<uint64_t> asid{CST_ASID_UNPINNED};
+    /* Current dwell verified by a map hit.  Cleared by every committed
+     * ASID write on this vCPU; set by the step glue's probe. */
+    std::atomic<bool> confirmed{false};
+};
+static PinVcpuState g_pin_vcpu[CST_PIN_MAX_VCPUS];
+/* One learned code page.  @ppage is the fast-path frame identity (last
+ * seen); @sig is the content signature, the authority that survives a
+ * re-fault to a new frame. */
+struct PinPage {
+    uint64_t ppage;
+    uint64_t sig;
+};
+/* vpage -> {ppage, sig} of user code the pinned process executed.
+ * Immortal; guarded by exec_lock.  4 KiB granule: a larger guest page
+ * yields multiple consistent sub-entries. */
+static std::unordered_map<uint64_t, PinPage> *g_pin_page_map;
+static constexpr uint64_t PIN_PAGE_MASK = ~(uint64_t)0xFFF;
+/* Bytes hashed for a page's content signature.  Page-bounded (< 4 KiB)
+ * so the read never straddles into an unmapped successor page; 256
+ * bytes of code discriminates any two distinct binaries at a shared
+ * virtual page. */
+static constexpr size_t PIN_SIG_BYTES = 256;
+
+/* Content signature of the guest code page based at @vpage in the
+ * CURRENT address space: FNV-1a over PIN_SIG_BYTES from the page base
+ * (the read is page-bounded, so it never straddles into an unmapped
+ * successor).  Returns false when the page cannot be read (no live
+ * mapping); caller holds exec_lock, so the single scratch buffer needs
+ * no lock. */
+static bool pin_page_sig(uint64_t vpage, uint64_t *sig_out)
+{
+    static GByteArray *buf;
+    if (!buf) {
+        buf = g_byte_array_new();
+    }
+    if (!qemu_plugin_read_memory_vaddr(vpage, buf, PIN_SIG_BYTES)) {
+        return false;
+    }
+    uint64_t h = 1469598103934665603ULL;          /* FNV-1a offset basis */
+    for (guint i = 0; i < buf->len; i++) {
+        h ^= buf->data[i];
+        h *= 1099511628211ULL;                     /* FNV-1a prime */
+    }
+    *sig_out = h;
+    return true;
+}
+
+static void pin_identity_reset(uint64_t marker_asid, unsigned int cpu_index)
+{
+    if (!g_pin_page_map) {
+        g_pin_page_map = new std::unordered_map<uint64_t, PinPage>();
+    }
+    g_pin_page_map->clear();
+    for (unsigned i = 0; i < CST_PIN_MAX_VCPUS; i++) {
+        g_pin_vcpu[i].asid.store(CST_ASID_UNPINNED,
+                                 std::memory_order_relaxed);
+        g_pin_vcpu[i].confirmed.store(false, std::memory_order_relaxed);
+    }
+    if (cpu_index < CST_PIN_MAX_VCPUS) {
+        g_pin_vcpu[cpu_index].asid.store(marker_asid,
+                                         std::memory_order_relaxed);
+        g_pin_vcpu[cpu_index].confirmed.store(true,
+                                              std::memory_order_relaxed);
+    }
+}
+
+/* Learn the current translation of @pc into the map (no-op when the
+ * page is already mapped, so the confirmed-dwell hot path is one hash
+ * lookup; the translation and content signature are taken only on
+ * insert).  Caller holds exec_lock and has established the executing
+ * context is the pinned process at user privilege. */
+static void pin_map_learn(uint64_t pc)
+{
+    uint64_t vp = pc & PIN_PAGE_MASK;
+    auto it = g_pin_page_map->find(vp);
+    if (it != g_pin_page_map->end()) {
+        return;
+    }
+    uint64_t pa;
+    if (!qemu_plugin_vaddr_to_paddr(pc, &pa)) {
+        return;                 /* no live translation: learn later */
+    }
+    uint64_t sig;
+    if (!pin_page_sig(vp, &sig)) {
+        return;                 /* page unreadable right now: learn later */
+    }
+    g_pin_page_map->emplace(vp, PinPage{pa & PIN_PAGE_MASK, sig});
+    g_stats.pin_pages_mapped++;
+}
+
+/* Probe @pc against the map: 1 = hit-match, 0 = unmapped page or no
+ * live translation (unknown), -1 = content mismatch (foreign process
+ * running different code at a mapped VA).  The physical frame is the
+ * fast path; on a frame mismatch the page's byte signature is the
+ * authority — a re-faulted page (identical bytes, new frame) reads as a
+ * hit and its frame is refreshed, a genuinely foreign page as a
+ * mismatch.  Caller holds exec_lock. */
+static int pin_map_probe(uint64_t pc)
+{
+    if (!g_pin_page_map) {
+        return 0;
+    }
+    uint64_t vp = pc & PIN_PAGE_MASK;
+    auto it = g_pin_page_map->find(vp);
+    if (it == g_pin_page_map->end()) {
+        return 0;
+    }
+    uint64_t pa;
+    if (!qemu_plugin_vaddr_to_paddr(pc, &pa)) {
+        return 0;
+    }
+    if ((pa & PIN_PAGE_MASK) == it->second.ppage) {
+        return 1;               /* frame fast-path: no re-fault */
+    }
+    uint64_t sig;
+    if (!pin_page_sig(vp, &sig)) {
+        return 0;               /* cannot read to adjudicate: unknown */
+    }
+    if (sig == it->second.sig) {
+        it->second.ppage = pa & PIN_PAGE_MASK;   /* re-faulted: refresh */
+        g_stats.pin_refault_repaired++;
+        return 1;
+    }
+    return -1;                   /* different bytes: foreign */
+}
+
+/*
+ * Ownership of a user-privilege TB under an armed pin — the ONE rule
+ * every consumer (user clock, foreign gate, kexc ownership seed,
+ * stuck-window recovery, end marker) shares.  Wide-register targets:
+ * the exact legacy equality against the marker-time value.  Narrow
+ * targets: the dwell/verify/re-pin machinery above.  Caller holds
+ * exec_lock; @pc is the executing TB's start.
+ */
+static bool pin_user_tb_owned(unsigned int cpu_index, uint64_t live_asid,
+                              uint64_t pinned_asid, uint64_t pc)
+{
+    if (!g_pin_reuse_guard) {
+        return live_asid == pinned_asid;
+    }
+    if (cpu_index >= CST_PIN_MAX_VCPUS) {
+        return false;
+    }
+    PinVcpuState &ps = g_pin_vcpu[cpu_index];
+    if (ps.confirmed.load(std::memory_order_relaxed) &&
+        live_asid == ps.asid.load(std::memory_order_relaxed)) {
+        pin_map_learn(pc);
+        return true;
+    }
+    int m = pin_map_probe(pc);
+    if (m == 1) {
+        if (live_asid != ps.asid.load(std::memory_order_relaxed)) {
+            ps.asid.store(live_asid, std::memory_order_relaxed);
+            qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
+            g_stats.pin_repins++;
+        }
+        ps.confirmed.store(true, std::memory_order_relaxed);
+        return true;
+    }
+    if (m < 0) {
+        g_stats.pin_phys_mismatch_dropped++;
+    } else {
+        g_stats.pin_unverified_dropped++;
+    }
+    return false;
+}
+
+/* The per-vCPU effective pin value: what kernel-TB attribution and the
+ * asid_match flag compare against.  Narrow targets follow the vCPU's
+ * dwell tag; wide targets use the marker-time value. */
+static inline uint64_t pin_effective_asid(unsigned int cpu_index,
+                                          uint64_t pinned_asid)
+{
+    if (g_pin_reuse_guard && cpu_index < CST_PIN_MAX_VCPUS) {
+        return g_pin_vcpu[cpu_index].asid.load(std::memory_order_relaxed);
+    }
+    return pinned_asid;
+}
+
 /* Synchronous ASID-write hook: keep the per-vCPU asid_match flag in
  * step with the live address space.  Fires at the same architectural
  * commit points that produce ASID_WRITE path events (and with the same
@@ -461,14 +712,21 @@ static void pin_reuse_track(uint64_t new_asid, uint64_t pinned_asid)
  * overlays, TLB maintenance) flip the flag while no user TB can
  * execute; the exit write restores it before user code resumes.  Also
  * feeds the pinned-ASID reuse detector above — this hook is the one
- * place every committed ASID change is visible. */
+ * place every committed ASID change is visible — and, on narrow-ASID
+ * targets, ends the vCPU's verified dwell: the written value may have
+ * been handed to anyone, so the next user TB must re-probe the
+ * physical-page map. */
 static void asid_write_track_cb(unsigned int vcpu_index, uint64_t new_asid)
 {
     uint64_t pinned = g_pinned_asid.load(std::memory_order_relaxed);
     qemu_plugin_u64_set(
         g_scoreboard.asid_match, vcpu_index,
-        new_asid == pinned ? 1 : 0);
+        new_asid == pin_effective_asid(vcpu_index, pinned) ? 1 : 0);
     if (g_pin_reuse_guard && pinned != CST_ASID_UNPINNED) {
+        if (vcpu_index < CST_PIN_MAX_VCPUS) {
+            g_pin_vcpu[vcpu_index].confirmed.store(
+                false, std::memory_order_relaxed);
+        }
         pin_reuse_track(new_asid, pinned);
     }
 }
@@ -2345,11 +2603,22 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     uint64_t pinned_asid = g_pinned_asid.load(std::memory_order_relaxed);
     uint64_t live_asid = 0;
     int live_priv = -1;
+    bool user_owned = false;
     if (pinned_asid != CST_ASID_UNPINNED) {
         uint64_t delta = user_seen_advance(cpu_index, icount_prev);
         live_asid = qemu_plugin_get_addr_space_id();
         live_priv = qemu_plugin_get_priv_level();
-        if (live_asid == pinned_asid && live_priv == 0) {
+        /* Ownership of a user TB: legacy ASID equality on the
+         * wide-register targets, the physical-page identity machinery
+         * on narrow-ASID ones (see pin_user_tb_owned).  Counted and
+         * traced are the same set by construction — an unverified TB
+         * neither advances the user clock nor reaches the trace. */
+        if (live_priv == 0 && cur_tb_tmpl) {
+            user_owned = pin_user_tb_owned(cpu_index, live_asid,
+                                           pinned_asid,
+                                           cur_tb_tmpl->start_pc);
+        }
+        if (user_owned) {
             g_user_icount += delta;
         }
         if (cur_tb_tmpl) {
@@ -2372,9 +2641,14 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     in.prev_ft = 0;
     in.current_pc = 0;
     in.pinned = pinned_asid != CST_ASID_UNPINNED;
-    in.pinned_asid = pinned_asid;
+    /* Kernel-TB attribution and event matching compare against the
+     * vCPU's EFFECTIVE pin: the dwell tag on narrow-ASID targets (which
+     * re-pins across rollover/migration), the marker-time value on the
+     * wide-register ones. */
+    in.pinned_asid = pin_effective_asid(cpu_index, pinned_asid);
     in.live_asid = live_asid;
     in.live_priv = live_priv;
+    in.user_owned = user_owned;
     in.evs = nullptr;
     in.n_evs = qemu_plugin_drain_cpu_events(cpu_index, &in.evs);
     in.cpu_index = cpu_index;
@@ -2384,7 +2658,7 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
      * swap — in that order, before any window decision. */
     PathBuilder::StepStatus st = pb.step_events(in);
     if (st != PathBuilder::StepStatus::CONTINUE) {
-        if (in.pinned && live_priv == 0 && live_asid == pinned_asid) {
+        if (in.pinned && user_owned) {
             /* CST_MARKER_DIAG stall canaries: pinned user TBs bailing
              * here means the user clock advances but nothing traces. */
             if (st == PathBuilder::StepStatus::SUSPENDED) {
@@ -2502,8 +2776,15 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         uint64_t icount_ff = qemu_plugin_u64_get(g_scoreboard.insn_count,
                                                  cpu_index);
         uint64_t delta = user_seen_advance(cpu_index, icount_ff);
+        /* Positioning accuracy only, lock-free: compare against the
+         * vCPU's effective pin (dwell tag on narrow-ASID targets) but
+         * without the map probe — a rollover during a long fast-forward
+         * can drift the count until the process's next verified dwell;
+         * the traced window itself is always probe-verified. */
         if (qemu_plugin_get_addr_space_id() ==
-                g_pinned_asid.load(std::memory_order_relaxed) &&
+                pin_effective_asid(cpu_index,
+                                   g_pinned_asid.load(
+                                       std::memory_order_relaxed)) &&
             qemu_plugin_get_priv_level() == 0) {
             g_user_icount += delta;
         }
@@ -3076,6 +3357,20 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
     uint64_t asid = qemu_plugin_get_addr_space_id();
     g_pinned_asid.store(asid, std::memory_order_relaxed);
     pin_reuse_reset();
+    if (g_pin_reuse_guard) {
+        /* Physical-page identity: seat the marker vCPU's dwell and seed
+         * the map with the marker's own page — the process is executing
+         * it right now, so the translation is live.  @pc is this
+         * callback's own instruction address (from its udata), NOT
+         * qemu_plugin_get_pc(): the env PC is only synced at TB
+         * boundaries/exceptions, so a mid-TB read is stale and would
+         * seed a bogus page.  exec_lock guards the map against
+         * concurrent step-glue probes on other vCPUs. */
+        g_rec_mutex_lock(&exec_lock);
+        pin_identity_reset(asid, cpu_index);
+        pin_map_learn(pc);
+        g_rec_mutex_unlock(&exec_lock);
+    }
 
     if (pinned_simpoint_mode()) {
         /* Pin only: zero the user clock at the target's first instruction
@@ -3160,7 +3455,6 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
  */
 static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
 {
-    (void)cpu_index;
     /* Wrong-path fence — see vcpu_marker_cb. */
     if (qemu_plugin_in_spec_mode() || g_wp_state.in_progress) {
         tls_mkdiag_end_wp_gated++;
@@ -3186,8 +3480,15 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
         return;
     }
     uint64_t pinned = g_pinned_asid.load(std::memory_order_relaxed);
-    if (pinned == CST_ASID_UNPINNED ||
-        qemu_plugin_get_addr_space_id() != pinned) {
+    if (pinned == CST_ASID_UNPINNED) {
+        return;
+    }
+    /* The end marker must be the pinned process's own: compare against
+     * the executing vCPU's effective pin (on a narrow-ASID target the
+     * process may hold a re-pinned value by now; its dwell was verified
+     * by the step glue before this insn callback fired). */
+    if (qemu_plugin_get_addr_space_id() !=
+        pin_effective_asid(cpu_index, pinned)) {
         return;
     }
     g_rec_mutex_lock(&exec_lock);
@@ -3990,6 +4291,11 @@ static void append_stats_summary(GString *report, const char *label,
         { "kexc write storms",                   stats.kexc_write_storm },
         { "kexc M-mode TBs dropped",             stats.kexc_mmode_dropped },
         { "pin ASID reuse suspected",            stats.pin_asid_reuse_suspected },
+        { "pin re-acquisitions (new ASID)",      stats.pin_repins },
+        { "pin content-mismatch user TBs dropped", stats.pin_phys_mismatch_dropped },
+        { "pin re-fault frames repaired",        stats.pin_refault_repaired },
+        { "pin unverified user TBs dropped",     stats.pin_unverified_dropped },
+        { "pin code pages mapped",               stats.pin_pages_mapped },
     };
     const struct { const char *name; uint64_t value; } bin_counters[] = {
         { "  Header bits",        stats.bin_header_bits },

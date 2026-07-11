@@ -87,6 +87,17 @@ struct TCGCPUOps {
      */
     void (*get_plugin_state)(CPUState *cpu, int *priv, uint64_t *asid,
                              bool *mmu_on);
+
+    /**
+     * @get_plugin_thread_ptr: report the guest thread-pointer register
+     *
+     * Optional.  Returns the architectural per-thread pointer the
+     * guest kernel context-switches per software thread (x86_64
+     * FS.base — GS.base for a 32-bit compat task — AArch64 TPIDR_EL0,
+     * RISC-V tp/x4, MIPS CP0 UserLocal).  Meaningful when sampled at
+     * user privilege; see qemu_plugin_get_thread_ptr().
+     */
+    uint64_t (*get_plugin_thread_ptr)(CPUState *cpu);
 #endif
 
 #ifdef CONFIG_USER_ONLY

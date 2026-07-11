@@ -140,6 +140,23 @@ static void x86_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
     /* Paging active iff CR0.PG; off in real mode / early boot. */
     *mmu_on = (env->cr[0] & CR0_PG_MASK) != 0;
 }
+
+static uint64_t x86_get_plugin_thread_ptr(CPUState *cs)
+{
+    CPUX86State *env = cpu_env(cs);
+    /*
+     * The user TLS base the kernel context-switches per thread: FS.base
+     * for a 64-bit task, GS.base for a 32-bit (compat/legacy) one — the
+     * i386 TLS ABI points GS at a set_thread_area GDT descriptor, whose
+     * base the segment cache carries.  Selected by the current CS.L, so
+     * sample at user privilege (in-kernel the bases are mid-switch and
+     * GS is swapped onto the kernel's per-CPU base).
+     */
+    if (env->hflags & HF_CS64_MASK) {
+        return env->segs[R_FS].base;
+    }
+    return env->segs[R_GS].base;
+}
 #endif
 
 static const TCGCPUOps x86_tcg_ops = {
@@ -151,6 +168,7 @@ static const TCGCPUOps x86_tcg_ops = {
     .cpu_exec_exit = x86_cpu_exec_exit,
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = x86_get_plugin_state,
+    .get_plugin_thread_ptr = x86_get_plugin_thread_ptr,
 #endif
 #ifdef CONFIG_USER_ONLY
     .fake_user_interrupt = x86_cpu_do_interrupt,

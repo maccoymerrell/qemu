@@ -106,10 +106,33 @@ struct Stats {
     uint64_t kexc_mmode_dropped = 0;
     /* Rewrites of the pinned ASID value observed after enough DISTINCT
      * other values to imply the target's narrow ASID space wrapped (a
-     * generation rollover recycled the pinned value — the trace may be
-     * following a different process from that point).  Detection only;
-     * see pin_reuse_track in champsim_tracer.cc. */
+     * generation rollover recycled the pinned value).  Detection stat;
+     * the physical-page identity below is what actually adjudicates
+     * ownership — see pin_reuse_track in champsim_tracer.cc. */
     uint64_t pin_asid_reuse_suspected = 0;
+
+    /* Physical-page process identity (narrow-ASID targets; all zero on
+     * the wide-register targets and in user mode).  The pin's authority
+     * is the map of user-code pages (virtual page -> physical page) the
+     * pinned process has executed; the per-vCPU ASID value is only a
+     * dwell tag.  repins counts dwells where the pinned process was
+     * re-acquired under a DIFFERENT ASID value (generation rollover
+     * re-numbering it, or a migration onto a vCPU where its per-CPU
+     * ASID differs); phys_mismatch counts user TBs refused because a
+     * mapped virtual page ran DIFFERENT BYTES (a foreign process
+     * aliasing the pinned value's VAs — a frame mismatch alone is not
+     * enough, the page's content signature must also differ);
+     * refault_repaired counts mapped pages whose frame moved but whose
+     * bytes matched (a clean code page evicted and re-faulted), re-tied
+     * to the new frame instead of refused; unverified counts user TBs
+     * dropped while a dwell awaited its first map hit (a foreign
+     * process that never touches mapped pages parks here forever,
+     * traced never); pages is the map's final size. */
+    uint64_t pin_repins = 0;
+    uint64_t pin_phys_mismatch_dropped = 0;
+    uint64_t pin_refault_repaired = 0;
+    uint64_t pin_unverified_dropped = 0;
+    uint64_t pin_pages_mapped = 0;
 
     /* Per-execution attribution.  cp_* bumped at vcpu_tb_exec walking
      * the prev TB's template; wp_* inside the WP per-iteration loop.

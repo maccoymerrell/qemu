@@ -279,8 +279,17 @@ const mips_def_t mips_defs[] =
                        (0 << CP0C1_DS) | (3 << CP0C1_DL) | (1 << CP0C1_DA) |
                        (1 << CP0C1_CA),
         .CP0_Config2 = MIPS_CONFIG2,
+        /*
+         * ULRI: the real 34K implements the CP0 UserLocal register
+         * (rdhwr $29 TLS base; MIPS32 34K SUM, CP0 register 4 select
+         * 2) and advertises it here — QEMU's model historically left
+         * the bit clear, which makes a Linux guest fall back to
+         * trap-and-emulating every rdhwr $29 and, more importantly,
+         * never write UserLocal on a thread switch, erasing the
+         * per-thread signal get_plugin_thread_ptr reports.
+         */
         .CP0_Config3 = MIPS_CONFIG3 | (1 << CP0C3_VInt) | (1 << CP0C3_MT) |
-                       (1 << CP0C3_DSPP),
+                       (1 << CP0C3_DSPP) | (1 << CP0C3_ULRI),
         .CP0_LLAddr_rw_bitmask = 0,
         .CP0_LLAddr_shift = 0,
         .SYNCI_Step = 32,

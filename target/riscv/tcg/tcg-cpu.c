@@ -144,6 +144,14 @@ static void riscv_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
      * (SATP != 0 ⇒ MODE field non-Bare). */
     *mmu_on = (env->priv != PRV_M) && (env->satp != 0);
 }
+
+static uint64_t riscv_get_plugin_thread_ptr(CPUState *cs)
+{
+    /* tp (x4) — the ABI thread pointer, restored per thread by the
+     * kernel's user-return path.  Only meaningful at U-mode: inside
+     * the kernel tp holds the kernel's own per-CPU/task pointer. */
+    return cpu_env(cs)->gpr[4];
+}
 #endif
 
 static const TCGCPUOps riscv_tcg_ops = {
@@ -153,6 +161,7 @@ static const TCGCPUOps riscv_tcg_ops = {
     .restore_state_to_opc = riscv_restore_state_to_opc,
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = riscv_get_plugin_state,
+    .get_plugin_thread_ptr = riscv_get_plugin_thread_ptr,
 #endif
 
 #ifndef CONFIG_USER_ONLY

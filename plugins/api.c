@@ -679,6 +679,16 @@ bool qemu_plugin_icount_enabled(void)
 #endif
 }
 
+uint64_t qemu_plugin_get_thread_ptr(void)
+{
+    g_assert(current_cpu);
+    const TCGCPUOps *ops = current_cpu->cc->tcg_ops;
+    if (ops && ops->get_plugin_thread_ptr) {
+        return ops->get_plugin_thread_ptr(current_cpu);
+    }
+    return 0;
+}
+
 bool qemu_plugin_exec_inline_insn(void)
 {
     g_assert(current_cpu);

@@ -15,6 +15,7 @@
 #include "qapi/error.h"
 #include "migration/blocker.h"
 #include "hw/boards.h"
+#include "exec/target_page.h"
 #include "qemu/plugin-memory.h"
 #include "qemu/plugin.h"
 
@@ -94,6 +95,20 @@ const char *qemu_plugin_hwaddr_device_name(const struct qemu_plugin_hwaddr *h)
     } else {
         return g_intern_static_string("RAM");
     }
+}
+
+bool qemu_plugin_vaddr_to_paddr(uint64_t vaddr, uint64_t *paddr)
+{
+    g_assert(current_cpu);
+    hwaddr pa = cpu_get_phys_page_debug(current_cpu, vaddr);
+    if (pa == (hwaddr)-1) {
+        return false;
+    }
+    /* Per-target implementations disagree on whether the in-page offset
+     * rides along; normalize so the result translates @vaddr itself. */
+    uint64_t off_mask = qemu_target_page_size() - 1;
+    *paddr = ((uint64_t)pa & ~off_mask) | (vaddr & off_mask);
+    return true;
 }
 
 /*

@@ -40,6 +40,13 @@ const char *qemu_plugin_hwaddr_device_name(const struct qemu_plugin_hwaddr *h)
     return g_intern_static_string("Invalid");
 }
 
+bool qemu_plugin_vaddr_to_paddr(uint64_t vaddr, uint64_t *paddr)
+{
+    /* One address space, no guest MMU: the identity map. */
+    *paddr = vaddr;
+    return true;
+}
+
 /*
  * Time control - for user mode the only real time is wall clock time
  * so realistically all you can do in user mode is slow down execution

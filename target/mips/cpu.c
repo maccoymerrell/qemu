@@ -557,10 +557,49 @@ static void mips_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
      * Normalize so 0 = user (least privileged), larger = more privileged. */
     int ksu = env->hflags & MIPS_HFLAG_KSU;
     *priv = MIPS_HFLAG_UM - ksu;
+    /*
+     * EntryHi.ASID is the only per-process identity MIPS exposes
+     * architecturally, and it is a weak one: 8 bits (10 with
+     * Config4.AE), allocated per CPU, recycled by generation rollover.
+     * The obvious upgrades were audited empirically and do not exist
+     * on real guests (Linux 6.6, Malta, 24Kf UP / 34Kf SMP):
+     *
+     *  - CP0 Context.PTEBase never holds a page-table base.  A 32-bit
+     *    kernel keeps the pgd in the pgd_current[] array in RAM and
+     *    writes Context exactly once per CPU at bring-up with
+     *    (cpu_id << 25) so the TLB-refill handler can index that
+     *    array (observed: one committed write per secondary CPU,
+     *    value 0x02000000 on CPU 1, none after; the low 23 bits churn
+     *    with hardware-set BadVPN2).  Reporting Context or a
+     *    (Context | ASID) compound would make equality WORSE: the
+     *    per-CPU constant breaks cross-vCPU equality for one process.
+     *  - CP0 XContext exists only on MIPS64 kernels
+     *    (CONFIG_MIPS_PGD_C0_CONTEXT).
+     *  - A KScratch-resident pgd needs Config4.KScrExist and
+     *    MemoryMapID needs Config5.MI; the 24K/34K-class models
+     *    implement neither, so the kernel programs neither.
+     *
+     * So the bare ASID stays the reported id, and disambiguating its
+     * reuse (rollover, per-CPU allocation) is the plugin's job — done
+     * by physical-page identity via qemu_plugin_vaddr_to_paddr(),
+     * which virtual aliasing cannot forge.
+     */
     *asid = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
     /* MIPS always translates through the TLB (mapped segments fault on a
      * TLB miss); there is no global paging-disable, so report on. */
     *mmu_on = true;
+}
+
+static uint64_t mips_get_plugin_thread_ptr(CPUState *cs)
+{
+    /*
+     * CP0 UserLocal (reg 4 sel 2, the rdhwr $29 TLS base).  A kernel
+     * writes it on every thread switch when Config3.ULRI advertises it;
+     * on models without ULRI it stays 0 and threads are architecturally
+     * indistinguishable (the kernel keeps the TLS pointer in RAM and
+     * trap-emulates rdhwr).
+     */
+    return cpu_env(cs)->active_tc.CP0_UserLocal;
 }
 #endif
 
@@ -571,6 +610,7 @@ static const TCGCPUOps mips_tcg_ops = {
     .restore_state_to_opc = mips_restore_state_to_opc,
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = mips_get_plugin_state,
+    .get_plugin_thread_ptr = mips_get_plugin_thread_ptr,
 #endif
 
 #if !defined(CONFIG_USER_ONLY)

@@ -167,6 +167,7 @@ void PathBuilder::on_segment_open()
     kexc_reset();
     kexc_have_user_ = false;
     kexc_last_user_asid_ = 0;
+    kexc_user_owned_ = false;
     /* Re-prime lazily at the next seal: a fault in flight across
      * segment-open is baselined out so the window starts at depth 0
      * rather than inheriting a pre-trace excursion. */
@@ -394,12 +395,17 @@ void PathBuilder::kexc_apply_asid_write(uint64_t new_asid)
  * authoritative again, and this address space is the owner of the next
  * kernel entry.  Foreign user TBs update ownership too — after a
  * committed switch, the next process's kernel work must charge to ITS
- * user ASID, not linger on the pin. */
-void PathBuilder::kexc_user_tb(uint64_t live_asid)
+ * user ASID, not linger on the pin.  @owned is the step glue's
+ * pin_user_tb_owned verdict: on narrow-ASID targets a raw value match
+ * is not proof of identity (a rollover can hand the pinned value to a
+ * foreign process), so the ownership seed carries the verified bit
+ * rather than re-deriving it from ASID equality. */
+void PathBuilder::kexc_user_tb(uint64_t live_asid, bool owned)
 {
     kexc_reset();
     kexc_last_user_asid_ = live_asid;
     kexc_have_user_ = true;
+    kexc_user_owned_ = owned;
 }
 
 /* Every non-suspended priv!=0 TB: latch the entry edge once at the
@@ -407,15 +413,15 @@ void PathBuilder::kexc_user_tb(uint64_t live_asid)
  * excursion never re-fire it — the single-edge model), then answer the
  * ownership question.  Replaces the live-ASID foreign-drop test for
  * kernel TBs only. */
-bool PathBuilder::kexc_kernel_tb_keep(uint64_t pinned_asid)
+bool PathBuilder::kexc_kernel_tb_keep(void)
 {
     if (!kexc_in_kernel_) {
         kexc_reset();
         kexc_in_kernel_ = true;
         kexc_exc_entry_ = kexc_last_user_asid_;
+        kexc_entry_owned_ = kexc_user_owned_;
     }
-    bool keep = kexc_have_user_ && kexc_exc_entry_ == pinned_asid &&
-                !kexc_cut_;
+    bool keep = kexc_have_user_ && kexc_entry_owned_ && !kexc_cut_;
     if (keep) {
         g_stats.kexc_kernel_kept++;
     } else {
@@ -744,8 +750,7 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
     g_capture_mute = async_excluding_;
 
     if (async_excluding_) {
-        if (in.pinned && in.live_asid == in.pinned_asid &&
-            in.live_priv == 0) {
+        if (in.pinned && in.user_owned) {
             /* Stuck-window recovery: the pinned process at user privilege
              * is definitionally not handler content, so force-close an
              * abandoned window here.  The reset produces NO ASYNC_RETURN
@@ -829,12 +834,13 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
             g_stats.kexc_mmode_dropped++;
             drop = true;
         } else if (!g_features.kexc) {
-            drop = in.live_asid != in.pinned_asid;
+            drop = in.live_priv == 0 ? !in.user_owned
+                                     : in.live_asid != in.pinned_asid;
         } else if (in.live_priv == 0) {
-            kexc_user_tb(in.live_asid);
-            drop = in.live_asid != in.pinned_asid;
+            kexc_user_tb(in.live_asid, in.user_owned);
+            drop = !in.user_owned;
         } else {
-            drop = !kexc_kernel_tb_keep(in.pinned_asid);
+            drop = !kexc_kernel_tb_keep();
         }
         if (drop) {
             /* rearch: suspend-or-seal candidate.  For now the deferred

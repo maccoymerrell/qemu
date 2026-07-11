@@ -30,6 +30,22 @@
 #include "exec/cputlb.h"
 
 
+/*
+ * CST_CP0_AUDIT: temporary empirical audit of the CP0 registers a guest
+ * kernel writes at context-switch time (Context PTEBase, EntryHi ASID,
+ * MemoryMapID).  Gated off unless the environment variable is set; used
+ * to establish what the staged Linux guests actually program so the
+ * plugin's address-space identity can be grounded in observed writes.
+ */
+static bool cst_cp0_audit(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("CST_CP0_AUDIT") ? 1 : 0;
+    }
+    return on;
+}
+
 /* SMP helpers.  */
 static bool mips_vpe_is_wfi(MIPSCPU *c)
 {
@@ -944,7 +960,16 @@ void helper_dmtc0_entrylo1(CPUMIPSState *env, uint64_t arg1)
 
 void helper_mtc0_context(CPUMIPSState *env, target_ulong arg1)
 {
+    target_ulong old = env->CP0_Context;
     env->CP0_Context = (env->CP0_Context & 0x007FFFFF) | (arg1 & ~0x007FFFFF);
+    if (cst_cp0_audit() && old != env->CP0_Context) {
+        fprintf(stderr, "[cp0audit] cpu=%d CTX  old=0x%08lx new=0x%08lx "
+                "(ptebase 0x%08lx) um=%d\n",
+                env_cpu(env)->cpu_index, (unsigned long)old,
+                (unsigned long)env->CP0_Context,
+                (unsigned long)(env->CP0_Context & ~(target_ulong)0x007FFFFF),
+                (int)(env->hflags & MIPS_HFLAG_KSU));
+    }
 }
 
 void helper_mtc0_memorymapid(CPUMIPSState *env, target_ulong arg1)
@@ -1210,6 +1235,14 @@ void helper_mtc0_entryhi(CPUMIPSState *env, target_ulong arg1)
                             old & env->CP0_EntryHi_ASID_mask,
                             env_cpu(env)->plugin_fault_depth);
 #endif
+        if (cst_cp0_audit()) {
+            fprintf(stderr, "[cp0audit] cpu=%d ASID old=0x%02lx new=0x%02lx "
+                    "ctx=0x%08lx\n",
+                    env_cpu(env)->cpu_index,
+                    (unsigned long)(old & env->CP0_EntryHi_ASID_mask),
+                    (unsigned long)(val & env->CP0_EntryHi_ASID_mask),
+                    (unsigned long)env->CP0_Context);
+        }
     }
 }
 

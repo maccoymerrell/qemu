@@ -2678,6 +2678,13 @@ static void arm_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
     /* MMU active iff the current EL's SCTLR.M is set. */
     *mmu_on = (arm_sctlr(env, arm_current_el(env)) & SCTLR_M) != 0;
 }
+
+static uint64_t arm_get_plugin_thread_ptr(CPUState *cs)
+{
+    /* TPIDR_EL0 — the EL0 thread pointer (AArch32 TPIDRURW aliases the
+     * same state), context-switched per thread by the kernel. */
+    return cpu_env(cs)->cp15.tpidr_el[0];
+}
 #endif
 
 static const TCGCPUOps arm_tcg_ops = {
@@ -2688,6 +2695,7 @@ static const TCGCPUOps arm_tcg_ops = {
     .restore_state_to_opc = arm_restore_state_to_opc,
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = arm_get_plugin_state,
+    .get_plugin_thread_ptr = arm_get_plugin_thread_ptr,
 #endif
 
 #ifdef CONFIG_USER_ONLY

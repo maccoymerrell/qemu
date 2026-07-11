@@ -3019,13 +3019,30 @@ static void vcpu_pin_probe(unsigned int cpu_index, void *udata)
     /* Unowned this TB.  Mute the per-insn capture callbacks (still gated
      * on is_active, they self-drop on g_capture_mute) so the foreign
      * span's registers/memops never pile into the pinned process's
-     * pending state.  Outside an async window, also drop the deferred
-     * prev exactly as the heavy DROPPED_FOREIGN branch does, so the
-     * resume never seals a fabricated edge across the gap; INSIDE an
-     * async window prev is preserved (the SUSPENDED contract — the resume
-     * seals the interrupted branch against its real target). */
+     * pending state.
+     *
+     * Dropping the deferred prev, though, is a USER-TB decision only.  The
+     * physical-page map adjudicates USER-CODE identity; a kernel TB carries
+     * no user-code PC to probe (see the priv==0 guard above), so a kernel
+     * TB reaching here is a synchronous excursion — a fault/exception
+     * handler — whose ownership the heavy path decides with the kexc
+     * machinery, not the dwell.  The pinned process's own fault handler
+     * routes through this light probe whenever a transient foreign ASID
+     * write (a brief kernel overlay, e.g. a MIPS EntryHi ASID scratch) has
+     * un-confirmed the dwell an instant before the exception; destroying
+     * the interrupted user block's pending seal HERE drops that block
+     * outright (silent CP corruption — the resume then seals a later block
+     * against the handler's fetch, and the interrupted block never emits).
+     * Leave prev intact for kernel TBs: the pinned process resumes at the
+     * faulting instruction and seals the interrupted block against its real
+     * successor (the case-(c) fault path), exactly as the heavy+kexc path
+     * would have; a genuinely foreign span still drops prev when its own
+     * USER code resumes and mismatches the physical-page map (the priv==0
+     * probe above).  INSIDE an async window prev is likewise preserved
+     * (the SUSPENDED contract — the resume seals the interrupted branch
+     * against its real target). */
     g_capture_mute = true;
-    if (!qemu_plugin_in_async_int()) {
+    if (!qemu_plugin_in_async_int() && qemu_plugin_get_priv_level() == 0) {
         g_mem_recorder.clear_cp();
         path_builder_tls().clear_prev();
     }

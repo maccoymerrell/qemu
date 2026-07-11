@@ -558,6 +558,30 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
         }
         cpu_plugin_spec_vtime_resume(cpu);
     }
+
+    /*
+     * Symmetric to the wrong-path vtime reconcile above, but for the
+     * CORRECT-path instrumentation freeze.  The plugin brackets its
+     * correct-path callbacks (translation-time decoding, per-TB emission)
+     * with a nestable cpu_plugin_vclock_pause/_resume pair tracked by
+     * plugin_vclock_depth (the RAII VClockPauseGuard in the ChampSim Tracer
+     * plugin).  A cpu_loop_exit that longjmps out of a callback -- e.g. a
+     * tlb_fill fault taken while re-translating inside an instrumented
+     * region -- unwinds past the guard's scope without running its
+     * destructor, so the paired _resume is never issued and the depth is
+     * leaked > 0.  With the depth stuck above zero, cpu_disable_ticks()
+     * stays in effect and QEMU_CLOCK_VIRTUAL never re-enables: the guest
+     * clock freezes for good and its timer subsystem livelocks -- the same
+     * permanent-freeze class the spec-mode reconcile above guards against
+     * on the wrong path.  Drain the leaked depth here so the invariant
+     * "an unbalanced longjmp still leaves the clock running" holds on both
+     * paths.  A no-op when the guard was balanced (depth already 0, the
+     * normal case) and in user-mode (pause/resume never touch the depth),
+     * and idempotent with a later balanced _resume via the depth guard.
+     */
+    while (cpu->plugin_vclock_depth > 0) {
+        cpu_plugin_vclock_resume(cpu);
+    }
 #endif
 
 #ifdef CONFIG_USER_ONLY

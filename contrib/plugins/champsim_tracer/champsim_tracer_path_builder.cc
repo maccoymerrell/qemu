@@ -1008,11 +1008,34 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                 if (fault_on && !pb_no_merge()) {
                     apply_fault_return(ev);
                 }
+            } else if (fault_on && ev.kind == QEMU_PLUGIN_CPU_EV_ASID_WRITE) {
+                /* Guest context switch — the reported address-space
+                 * register genuinely changed (a TLB-maintenance write
+                 * that leaves the masked field alone emits nothing).
+                 * Any fault frames still live on the per-vCPU stack were
+                 * pushed by the OUTGOING context; the incoming process is
+                 * unrelated to them and establishes its own nesting from
+                 * here.  Re-floor the segment baseline to the switch-
+                 * instant depth so the incoming context's handlers are
+                 * measured against ITS zero, not the stale frames a
+                 * non-LIFO switch left behind: a page fault whose handler
+                 * the scheduler preempts (an async tick landing inside
+                 * the handler, then a switch to another task) never
+                 * returns to pop its frame, and without this re-baseline
+                 * every later fault under the reused ASID stamps one
+                 * level too deep — the intermittent 0->2+ jump the churn
+                 * battery's syscall_fault_nesting check flags.  This is
+                 * the inflate-side twin of the raw < base re-floor below
+                 * (which handles a stale frame finally popping); the
+                 * ASID_WRITE event's depth_after carries the live
+                 * plugin_fault_depth at the write. */
+                base_depth_ = ev.depth_after;
             }
-            /* async kinds were applied by step_events; ASID_WRITE
-             * (kind 4) was consumed at drain time (kexc) or is ignored
-             * outright (legacy) — it never reaches the depth pipeline
-             * or the fault classifier. */
+            /* async kinds were applied by step_events.  ASID_WRITE (kind
+             * 4) was also consumed at drain time for kexc ownership; here
+             * it additionally re-floors the depth baseline across the
+             * context switch (above).  On the legacy (fault-off) path it
+             * is ignored, as before. */
         }
         pending_evs_.clear();
         /* Baselined, 0-clamped depth the CURRENT TB runs at.  Raw can

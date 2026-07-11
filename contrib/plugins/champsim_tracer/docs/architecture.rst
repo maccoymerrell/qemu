@@ -762,7 +762,21 @@ fault events exactly once, then runs the shared seal walk:
   frame's resume PC, the pop is permanent.  A fixed baseline would
   clamp every subsequent excursion's depth to 0 for the rest of the
   segment, mislabelling handler content and breaking the merged-BB
-  nesting invariant.
+  nesting invariant.  The baseline also re-floors *upward* at a guest
+  context switch: an ``ASID_WRITE`` event (the reported address-space
+  register genuinely changed) sets ``base_depth_`` to the switch-instant
+  depth (its ``depth_after``).  The incoming process is unrelated to
+  whatever fault frames the outgoing context left live on the per-vCPU
+  stack, so it must measure its own handlers against *its* zero.  The
+  archetype the churn battery exercises: a user page fault whose handler
+  an asynchronous tick preempts into the scheduler, which switches to
+  another task and never returns to pop the frame — a non-LIFO leak that,
+  without the up-re-floor, would stamp every subsequent fault under the
+  reused ASID one nesting level too deep (the intermittent ``0 -> 2+``
+  jump that skips depth 1).  The two re-floors are complementary: the
+  ``ASID_WRITE`` case raises the baseline as stale frames accumulate
+  across switches, the ``raw < base`` case lowers it when one finally
+  pops.
 * **Fault-entry classification.**  Each ``FAULT_ENTER`` is handled
   individually against the deferred prev — see
   :ref:`fault-excursions` for the three cases and the context-frame

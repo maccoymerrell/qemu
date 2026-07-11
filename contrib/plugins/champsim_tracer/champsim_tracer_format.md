@@ -1092,10 +1092,16 @@ branch outcome is unresolvable, so fetch past it is unknowable and the
 chain ends there.  The bit only appears on a chain's LAST block, and
 only in chains that also carry a `CST_WP_EVENT_FAULT` at or before it.
 Dependence is tracked at register granularity (the ISA's integer-flags
-register included); poison carried through memory (a poisoned store
-forwarded to a later load) is not tracked.  Traces written before this
-bit existed do not list `CST_WP_EVENT_DEP_BRANCH_KILL` in their
-`wp_event_flag` encoding map; readers resolve it optionally.
+register included).  A faulting instruction itself never commits its
+effect — a faulted store performs no write — and carries
+`CST_WP_EVENT_FAULT` at its `fault_insn_index`, so a consumer squashes
+it and its forwards directly; that is the fault contract.  What is not
+tracked is poison *through memory*: a successful store of an
+already-poisoned register value, reloaded later, is not re-poisoned on
+the load (a conservative under-poison on a wrong path whose control
+flow has already died at the first dependent branch).  Traces written
+before this bit existed do not list `CST_WP_EVENT_DEP_BRANCH_KILL` in
+their `wp_event_flag` encoding map; readers resolve it optionally.
 
 The event index space extends one convention beyond the chain: a
 resolved index `>= num_wp` does not address any encoded wrong-path

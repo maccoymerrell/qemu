@@ -973,8 +973,17 @@ its own wire semantics.  Consumers should treat them differently:
   the excursion **dies on that branch**: the BB it terminates seals
   as the chain's last entry, marked ``CST_WP_EVENT_DEP_BRANCH_KILL``
   on the wire.  Branches independent of the fault resolve normally
-  and the chain continues.  Poison carried through memory (a
-  poisoned store forwarded to a later load) is not tracked.  A
+  and the chain continues.  The **consumer contract** for the fault
+  itself is simple: a faulting instruction never commits its
+  architectural effect — a store that faults performs no write — and
+  the wire marks it (``CST_WP_EVENT_FAULT`` at its ``fault_insn_index``),
+  so the consumer squashes that instruction and anything that would
+  forward from it.  What the *plugin* tracks is register-granularity
+  poison; it does not propagate poison **through memory** — a
+  *successful* store of an already-poisoned value, reloaded later,
+  is not re-poisoned on the load.  This is a conservative
+  under-poison on the wrong path (whose control flow has already
+  died at the first dependent branch), not a missed fault.  A
   faulting syscall-type branch seals its BB and the post-PC
   poisoning ends the chain; speculative state past a syscall is not
   modeled.

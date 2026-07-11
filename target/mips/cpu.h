@@ -1189,6 +1189,15 @@ typedef struct CPUArchState {
 
     const mips_def_t *cpu_model;
     QEMUTimer *timer; /* Internal timer */
+    /*
+     * The R4K timer expired during a wrong-path excursion and its delivery
+     * (Cause.TI + IRQ line raise) was deferred.  Lives outside the
+     * end_reset_fields snapshot window so the excursion's register-state
+     * restore cannot roll it back; consumed by mips_cpu_plugin_resync_timers
+     * at the excursion-exit boundary, which re-delivers the expiry on the
+     * correct path.
+     */
+    bool plugin_spec_timer_expired;
     Clock *count_clock; /* CP0_Count clock */
     target_ulong exception_base; /* ExceptionBase input to the core */
 } CPUMIPSState;

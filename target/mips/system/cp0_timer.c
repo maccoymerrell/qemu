@@ -59,11 +59,21 @@ static void cpu_mips_timer_expire(CPUMIPSState *env)
      * line, or reprogram the host timer on the discarded path.  CP0_Cause is in
      * the register snapshot and is rolled back, but the IRQ line and the host
      * QEMUTimer are external state that is not.  This callback may be the host
-     * timer firing mid-excursion; flag it so the host timer is re-armed on exit
-     * (mips_cpu_plugin_resync_timers) instead of being left stale.
+     * timer firing mid-excursion; flag it so the expiry is re-delivered on exit
+     * (mips_cpu_plugin_resync_timers) instead of being lost — the raise must
+     * not be dropped, and re-arming alone would park the timer a full Count
+     * wrap out (wait = Compare - Count computes ~0 -> clamps to UINT32_MAX).
+     *
+     * Gate on plugin_spec_vtime_paused (true for the WHOLE excursion), not
+     * just plugin_spec_mode: a wrong-path fault-skip briefly clears spec_mode
+     * (spec_mode_end -> restore -> spec_mode_begin) while the snapshot is
+     * still live, and a Cause.TI/IP set in that gap is erased by the final
+     * walk-end restore (mirror of the riscv stimer/aclint-mtimer gates, #77).
      */
-    if (env_cpu(env)->plugin_spec_mode) {
+    if (env_cpu(env)->plugin_spec_mode ||
+        env_cpu(env)->plugin_spec_vtime_paused) {
         env_cpu(env)->plugin_spec_timer_dirty = true;
+        env->plugin_spec_timer_expired = true;
         return;
     }
 #endif
@@ -76,14 +86,16 @@ static void cpu_mips_timer_expire(CPUMIPSState *env)
 
 #ifdef CONFIG_PLUGIN
 /*
- * Re-arm the host R4K timer to match the architected CP0_Count/Compare after a
- * wrong-path speculative state restore (no-op unless the excursion dirtied the
- * timer).  cpu_mips_timer_update only reprograms the QEMUTimer (no IRQ line),
- * so no BQL is required.  Called from cpu_plugin_arch_state_restore.
+ * Reconcile the host R4K timer with the architected CP0_Count/Compare after a
+ * wrong-path excursion (no-op unless the excursion dirtied the timer).  Called
+ * from cpu_plugin_spec_vtime_resume — the true excursion-exit boundary, with
+ * spec mode ended and the BQL held (a re-delivered expiry raises the timer IRQ
+ * line through cpu_mips_irq_request, which expects the BQL).
  */
 void mips_cpu_plugin_resync_timers(CPUState *cs)
 {
     CPUMIPSState *env = cpu_env(cs);
+    bool expired;
 
     /* Reconcile the interrupt line from restored CP0_Cause first: an
      * excursion (or its fault-skip gap) can suppress a line update while
@@ -98,9 +110,27 @@ void mips_cpu_plugin_resync_timers(CPUState *cs)
         return;
     }
     cs->plugin_spec_timer_dirty = false;
+    expired = env->plugin_spec_timer_expired;
+    env->plugin_spec_timer_expired = false;
 
     if (env->timer && !(env->CP0_Cause & (1 << CP0Ca_DC))) {
-        cpu_mips_timer_update(env);
+        if (expired) {
+            /*
+             * The host timer genuinely expired mid-excursion and its delivery
+             * was deferred by the gate in cpu_mips_timer_expire.  Re-deliver
+             * it on the correct path — set Cause.TI, raise the timer IRQ
+             * line, and re-arm — the same sequence a normal expiry runs.
+             * cpu_mips_timer_update alone would lose the raise and, with
+             * Count sitting at Compare, re-arm a full Count wrap (~2^32
+             * ticks) in the future: a lost guest tick and a stalled
+             * clockevent until the wraparound.
+             */
+            cpu_mips_timer_expire(env);
+        } else {
+            /* Only Count/Compare were rolled back (a speculative CP0 write
+             * erased); re-arm the host deadline from the restored values. */
+            cpu_mips_timer_update(env);
+        }
     }
 }
 #endif

@@ -915,6 +915,26 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
         if (env->stimecmp != s->stimecmp || env->vstimecmp != s->vstimecmp) {
             current_cpu->plugin_spec_timer_dirty = true;
         }
+        /*
+         * A timer-pending bit that materialised in the LIVE env->mip after
+         * the snapshot was taken is about to be erased by the memcpy below.
+         * This happens when a host timer cb (ACLINT mtimer -> MTIP, Sstc
+         * stimer/vstimer -> STIP/VSTIP; iothread, under BQL) fires in the
+         * race window at excursion ENTRY: the snapshot is already taken but
+         * the spec/vtime flags are not yet visible to the cb's thread, so
+         * the cb-side deferral gates cannot catch it (the freezing fire
+         * observably logs spec=0 vtp=0).  The one-shot host timer has
+         * already fired and will not re-arm itself, so the erased raise
+         * would be lost forever — the machine-timer park that freezes an
+         * SBI-timer (sstc=false) guest at its next nanosleep tick.  Flag
+         * the excursion dirty; the exit resync re-derives the level + host
+         * deadline from the compare registers, which this restore does not
+         * damage (mtimecmp is device state; stimecmp/vstimecmp revert to
+         * their correct-path values).
+         */
+        if ((env->mip & ~s->mip) & (MIP_MTIP | MIP_STIP | MIP_VSTIP)) {
+            current_cpu->plugin_spec_timer_dirty = true;
+        }
 #ifdef CONFIG_PLUGIN
         /* #77 (i)-vs-(ii) probe: does a WP restore knock mstatus.VS On->Off,
          * i.e. clobber a real correct-path vector-enable with a stale snapshot? */
@@ -960,6 +980,23 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
         if (env->CP0_Count != s->CP0_Count ||
             env->CP0_Compare != s->CP0_Compare) {
             current_cpu->plugin_spec_timer_dirty = true;
+        }
+        /*
+         * Cause.TI materialised in the LIVE env after the snapshot was
+         * taken: the R4K timer expired in the race window at excursion
+         * ENTRY (snapshot taken, spec/vtime flags not yet visible to the
+         * iothread), so the gate in cpu_mips_timer_expire could not defer
+         * it.  The memcpy below erases the pending TI/IP while the host
+         * QEMUTimer has already been re-armed a full Count wrap out — the
+         * tick would be lost.  Mark it as a deferred expiry so
+         * mips_cpu_plugin_resync_timers re-delivers it at excursion exit
+         * (mirror of the riscv mip-rollback detection).  Pre-R2 CPUs have
+         * no Cause.TI to key on; only the in-excursion cb gate covers them.
+         */
+        if ((env->insn_flags & ISA_MIPS_R2) &&
+            ((env->CP0_Cause & ~s->CP0_Cause) & (1 << CP0Ca_TI))) {
+            current_cpu->plugin_spec_timer_dirty = true;
+            env->plugin_spec_timer_expired = true;
         }
     }
     memcpy(env, saved, size);

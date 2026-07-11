@@ -219,7 +219,11 @@ static void riscv_plugin_reconcile_timers(CPURISCVState *env)
 {
     bool held;
 
-    /* rdtime_fn is wired only when the supervisor timer (Sstc) is usable. */
+    /*
+     * rdtime_fn is wired by the machine's ACLINT mtimer (provide_rdtime);
+     * without it there is no time source to evaluate compares against and
+     * no mtimer handle to reconcile.
+     */
     if (!env->rdtime_fn) {
         return;
     }
@@ -234,6 +238,24 @@ static void riscv_plugin_reconcile_timers(CPURISCVState *env)
     if (env->vstimer && env->vstimecmp != 0) {
         riscv_timer_write_timecmp(env, env->vstimer, env->vstimecmp,
                                   env->htimedelta, MIP_VSTIP);
+    }
+    /*
+     * The ACLINT machine timer (mip.MTIP) is the hart's clockevent when it
+     * has no usable Sstc (e.g. -cpu max,sstc=false: the kernel programs
+     * timers through SBI ecalls into M-mode firmware, which writes mtimecmp
+     * over MMIO).  Its compare register is device state — never rolled back
+     * by the excursion's register-snapshot restore — but its one-shot host
+     * QEMUTimer does not re-arm itself, and its expiry cb is deferred by the
+     * same excursion gate as stimer/vstimer (or its mip.MTIP raise erased by
+     * the restore when the fire races excursion entry).  Without this
+     * reconcile the pending MTIP is lost and the guest tick never fires
+     * again.  rdtime_fn_arg is the mtimer that owns this hart (the ACLINT is
+     * the only in-tree rdtime provider) — the same handle
+     * riscv_timer_write_timecmp above dereferences.
+     */
+    if (env->rdtime_fn_arg) {
+        riscv_aclint_mtimer_plugin_resync(env->rdtime_fn_arg,
+                                          (uint32_t)env->mhartid);
     }
     if (!held) {
         bql_unlock();

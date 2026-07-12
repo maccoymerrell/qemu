@@ -32,6 +32,19 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+/*
+ * sched_setaffinity() and the CPU_SET/CPU_ZERO macros (used to pin the
+ * traced process to a core) live behind the GNU extensions.  This file is
+ * compiled standalone and statically for staging into a guest rootfs, so
+ * it must request them itself rather than lean on a build system defining
+ * _GNU_SOURCE; the define has to precede the first system header.  Guard
+ * it so a build system that already passes -D_GNU_SOURCE (meson does)
+ * does not trip a -Werror redefinition.
+ */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

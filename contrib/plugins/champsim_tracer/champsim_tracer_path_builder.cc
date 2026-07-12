@@ -28,9 +28,10 @@
 #include "champsim_tracer_wp_thread_state.h"
 
 /* A/B env toggles for the fault machinery: CST_NO_FAULT kills the
- * feature upstream (g_features.fault_excursions), CST_NO_FAULT_MERGE keeps
- * depth stamping but disables classification/stash/completion, and
- * CST_NO_FAULT_WP zeroes only the merged emit's wrong-path target. */
+ * feature upstream (g_features.fault_depth_trailer and wp_fault_poison),
+ * CST_NO_FAULT_MERGE keeps depth stamping but disables classification/
+ * stash/completion, and CST_NO_FAULT_WP zeroes only the merged emit's
+ * wrong-path target. */
 static bool pb_no_merge()
 {
     static const bool v = getenv("CST_NO_FAULT_MERGE") != nullptr;
@@ -933,7 +934,11 @@ PathBuilder::complete_merge(size_t idx,
 PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                                                BodyStreamState *out_stream)
 {
-    const bool fault_on = g_features.fault_excursions;
+    /* The depth-pipeline + kernel-handler fault merge is the system-only
+     * DEPTH TRAILER machinery (fault_depth_trailer); it is orthogonal to the
+     * wrong-path fault-poisoning policy (wp_fault_poison), which lives in the
+     * WP walker and runs in user mode too. */
+    const bool fault_on = g_features.fault_depth_trailer;
 
     /* No previous context (first TB after install / after the segment-
      * final flush zeroed the scoreboard): nothing to seal, and the

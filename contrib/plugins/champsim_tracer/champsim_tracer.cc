@@ -5154,15 +5154,31 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     start_symbol_occurrence = cfg.start_symbol_occurrence;
     g_window_mode       = cfg.window_mode;
 
-    /* Marker mode is the system-mode entrypoint (the validator's --system
-     * implies --marker, pinning a real guest ASID).  Enable the per-entry
-     * sync-fault trailer there so handler code is depth-tagged; user-mode
-     * windows leave it off and emit no trailer. */
+    /*
+     * Two decoupled fault concerns, split from the former single flag:
+     *
+     *  (a) The system-only sync-fault DEPTH TRAILER + kernel-handler merge.
+     *      Marker mode is the system-mode entrypoint (the validator's
+     *      --system implies --marker, pinning a real guest ASID); a pinned
+     *      simpoint qualifies too.  The per-entry trailer depth-tags handler
+     *      code there; user-mode windows leave it off and emit no trailer.
+     *
+     *  (b) The wrong-path fault-POISONING policy (poison + dep-branch-kill).
+     *      This models a real CPU squashing a speculative path once a
+     *      faulting load's result reaches a branch, so it must run whenever
+     *      wrong-path simulation runs — system AND user mode alike.  It used
+     *      to ride flag (a) and so was silently system-only; user-mode bad
+     *      speculative loads absorbed the fault as zeros and never poisoned.
+     *
+     * CST_NO_FAULT disables BOTH for A/B measurement.
+     */
     g_system_mode = info->system_emulation;
-    g_features.fault_excursions =
+    const bool fault_env_ok = getenv("CST_NO_FAULT") == nullptr;
+    g_features.fault_depth_trailer =
         (g_window_mode == PluginConfig::WIN_MARKER ||
          pinned_simpoint_mode()) &&
-        getenv("CST_NO_FAULT") == nullptr;
+        fault_env_ok;
+    g_features.wp_fault_poison = enable_wrong_path && fault_env_ok;
 
     /* Kernel-excursion ownership rides the marker-mode ASID pin (the
      * ownership rule replaces the live-ASID test for kernel TBs of the

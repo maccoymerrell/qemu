@@ -43,8 +43,32 @@ __thread uintptr_t helper_retaddr;
 
 #ifdef CONFIG_PLUGIN
 /*
+ * Signal a wrong-path (speculative) memory fault to the plugin's WP walker.
+ *
+ * A speculative access to an absent/unreadable/unwritable page is a dead
+ * end, not a real architectural fault: cpu_loop_exit_sigsegv() detects
+ * plugin_spec_mode and, instead of queuing a guest SIGSEGV, longjmps out
+ * through cpu->jmp_env so cpu_plugin_exec_tb()'s setjmp guard returns
+ * tb_ok=false with the guest PC restored to the faulting instruction.
+ * The walker then marks that insn faulted, poisons its destination(s),
+ * and the dep-branch-kill policy squashes the excursion at the first
+ * dependent branch.  This is the user-mode twin of the softmmu spec path,
+ * where tlb_fill_align() reaches cpu_loop_exit_restore() under
+ * spec_real_access (accel/tcg/cputlb.c); prior to this the user-mode
+ * load absorbed the fault as zero bytes and the wrong path ran on
+ * garbage, never poisoning and never emitting DEP_BRANCH_KILL.
+ */
+static G_NORETURN void spec_fault_user(CPUState *cpu, vaddr addr,
+                                       MMUAccessType access_type,
+                                       uintptr_t ra)
+{
+    bool maperr = !guest_addr_valid_untagged(addr) ||
+                  !(page_get_flags(addr) & PAGE_VALID);
+    cpu_loop_exit_sigsegv(cpu, addr, access_type, maperr, ra);
+}
+
+/*
  * Load N bytes with store-to-load forwarding (user mode).
- * Checks page validity via g2h; returns zero for unmapped bytes.
  *
  * Line-chunked to mirror spec_store_bytes: one spec-buffer lookup per
  * cache line (a naturally-aligned access stays within one line), not
@@ -53,9 +77,16 @@ __thread uintptr_t helper_retaddr;
  * memcpy from guest memory, instead of N hash lookups and N byte reads.
  * A 64-byte-aligned line never straddles a (>=4 KiB) page, so one page
  * check covers the whole chunk.
+ *
+ * Bytes covered by a prior speculative store are forwarded from the
+ * sandbox regardless of the underlying page's mapping (a spec store to a
+ * writable page succeeded there).  Any byte that must come from real
+ * memory and lands on an unmapped/unreadable page faults the excursion
+ * via spec_fault_user() — the softmmu twin faults the whole access at
+ * tlb_fill before forwarding.
  */
 static void spec_load_bytes_user(CPUState *cpu, vaddr guest_addr,
-                                 void *out, int size)
+                                 void *out, int size, uintptr_t ra)
 {
     uint8_t *op = out;
     while (size > 0) {
@@ -75,7 +106,7 @@ static void spec_load_bytes_user(CPUState *cpu, vaddr guest_addr,
                 (page_get_flags(guest_addr) & PAGE_READ)) {
                 memcpy(op, g2h(cpu, guest_addr), chunk);
             } else {
-                memset(op, 0, chunk);
+                spec_fault_user(cpu, guest_addr, MMU_DATA_LOAD, ra);
             }
         } else {
             /* Mixed: forward stored bytes, fill the rest from memory. */
@@ -85,9 +116,12 @@ static void spec_load_bytes_user(CPUState *cpu, vaddr guest_addr,
                     op[i] = line->bytes[b];
                 } else {
                     vaddr ba = line_addr + b;
-                    op[i] = (guest_addr_valid_untagged(ba) &&
-                             (page_get_flags(ba) & PAGE_READ))
-                            ? *(uint8_t *)g2h(cpu, ba) : 0;
+                    if (guest_addr_valid_untagged(ba) &&
+                        (page_get_flags(ba) & PAGE_READ)) {
+                        op[i] = *(uint8_t *)g2h(cpu, ba);
+                    } else {
+                        spec_fault_user(cpu, ba, MMU_DATA_LOAD, ra);
+                    }
                 }
             }
         }
@@ -95,6 +129,36 @@ static void spec_load_bytes_user(CPUState *cpu, vaddr guest_addr,
         op         += chunk;
         size       -= chunk;
     }
+}
+
+/*
+ * Store N bytes into the speculative sandbox (user mode).
+ *
+ * A wrong-path store to an unmapped/read-only page must fault the
+ * excursion, exactly as the softmmu twin does (do_st -> cpu_mmu_lookup
+ * -> tlb_fill_align -> cpu_loop_exit_restore under spec_real_access);
+ * otherwise a speculative store to a wild address would silently buffer
+ * into the sandbox and a later speculative load could forward those
+ * bytes without either access ever faulting.  Every page the store
+ * touches is checked for original writability (PAGE_WRITE_ORG, so a
+ * store to an SMC-dirty-tracked page whose PAGE_WRITE was cleared is not
+ * mis-faulted).  For a good target the bytes are buffered in the spec
+ * sandbox — never real guest memory — preserving store-to-load
+ * forwarding for the rest of the excursion.
+ */
+static void spec_store_bytes_user(CPUState *cpu, vaddr addr,
+                                  const void *buf, int size, uintptr_t ra)
+{
+    vaddr end = addr + size;
+    for (vaddr p = addr; p < end; ) {
+        if (!guest_addr_valid_untagged(p) ||
+            !(page_get_flags(p) & PAGE_WRITE_ORG)) {
+            spec_fault_user(cpu, p, MMU_DATA_STORE, ra);
+        }
+        vaddr next = (p & TARGET_PAGE_MASK) + TARGET_PAGE_SIZE;
+        p = next < end ? next : end;
+    }
+    spec_store_bytes(cpu, addr, buf, size);
 }
 #endif /* CONFIG_PLUGIN */
 
@@ -1134,7 +1198,7 @@ static uint8_t do_ld1_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
         uint8_t result = 0;
-        spec_load_bytes_user(cpu, addr, &result, 1);
+        spec_load_bytes_user(cpu, addr, &result, 1, ra);
         return result;
     }
 #endif
@@ -1155,7 +1219,7 @@ static uint16_t do_ld2_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
 
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
-        spec_load_bytes_user(cpu, addr, &ret, 2);
+        spec_load_bytes_user(cpu, addr, &ret, 2, ra);
         if (mop & MO_BSWAP) {
             ret = bswap16(ret);
         }
@@ -1183,7 +1247,7 @@ static uint32_t do_ld4_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
 
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
-        spec_load_bytes_user(cpu, addr, &ret, 4);
+        spec_load_bytes_user(cpu, addr, &ret, 4, ra);
         if (mop & MO_BSWAP) {
             ret = bswap32(ret);
         }
@@ -1211,7 +1275,7 @@ static uint64_t do_ld8_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
 
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
-        spec_load_bytes_user(cpu, addr, &ret, 8);
+        spec_load_bytes_user(cpu, addr, &ret, 8, ra);
         if (mop & MO_BSWAP) {
             ret = bswap64(ret);
         }
@@ -1239,7 +1303,7 @@ static Int128 do_ld16_mmu(CPUState *cpu, abi_ptr addr,
 
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
-        spec_load_bytes_user(cpu, addr, &ret, 16);
+        spec_load_bytes_user(cpu, addr, &ret, 16, ra);
         if (mop & MO_BSWAP) {
             ret = bswap128(ret);
         }
@@ -1266,7 +1330,7 @@ static void do_st1_mmu(CPUState *cpu, vaddr addr, uint8_t val,
 
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
-        spec_store_byte(cpu, addr, val);
+        spec_store_bytes_user(cpu, addr, &val, 1, ra);
         return;
     }
 #endif
@@ -1289,7 +1353,7 @@ static void do_st2_mmu(CPUState *cpu, vaddr addr, uint16_t val,
             val = bswap16(val);
         }
         uint16_t host_val = val;
-        spec_store_bytes(cpu, addr, &host_val, 2);
+        spec_store_bytes_user(cpu, addr, &host_val, 2, ra);
         return;
     }
 #endif
@@ -1316,7 +1380,7 @@ static void do_st4_mmu(CPUState *cpu, vaddr addr, uint32_t val,
             val = bswap32(val);
         }
         uint32_t host_val = val;
-        spec_store_bytes(cpu, addr, &host_val, 4);
+        spec_store_bytes_user(cpu, addr, &host_val, 4, ra);
         return;
     }
 #endif
@@ -1343,7 +1407,7 @@ static void do_st8_mmu(CPUState *cpu, vaddr addr, uint64_t val,
             val = bswap64(val);
         }
         uint64_t host_val = val;
-        spec_store_bytes(cpu, addr, &host_val, 8);
+        spec_store_bytes_user(cpu, addr, &host_val, 8, ra);
         return;
     }
 #endif
@@ -1370,7 +1434,7 @@ static void do_st16_mmu(CPUState *cpu, vaddr addr, Int128 val,
             val = bswap128(val);
         }
         Int128 host_val = val;
-        spec_store_bytes(cpu, addr, &host_val, 16);
+        spec_store_bytes_user(cpu, addr, &host_val, 16, ra);
         return;
     }
 #endif

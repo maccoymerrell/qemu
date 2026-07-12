@@ -1150,12 +1150,25 @@ struct TraceFeatures {
     /* I-frame trigger: emit a self-contained IFRAME after every N-th ENTRY
      * of the same template.  0 disables the feature. */
     uint32_t iframe_rate = 0;
-    /* System-mode synchronous-fault tracking: when set, entries carry the
-     * per-entry fault trailer (CST_FLAG_FAULT) so handler code is tagged with
-     * its exception-nesting depth and faulting BBs carry the detour anchor.
-     * Enabled in marker (system) mode; off in user mode, so user-mode traces
-     * carry no trailer. */
-    bool     fault_excursions = false;
+    /* System-mode synchronous-fault DEPTH TRAILER: when set, entries carry
+     * the per-entry fault trailer (CST_FLAG_FAULT) so handler code is tagged
+     * with its exception-nesting depth and faulting BBs carry the detour
+     * anchor, and the PathBuilder runs the kernel-handler whole-BB fault
+     * merge.  Enabled only in marker (system) mode or a pinned simpoint;
+     * off in user mode, so user-mode traces carry no trailer.  This is the
+     * kernel-privilege depth machinery — decoupled from the wrong-path
+     * fault-poisoning policy below, which runs in BOTH modes. */
+    bool     fault_depth_trailer = false;
+    /* Wrong-path fault-POISONING policy: when set, a speculative access that
+     * faults out of the excursion (tb_ok=false) poisons the faulting insn's
+     * destination register(s); a downstream branch that reads a poisoned
+     * source is unresolvable, so the excursion is squashed at that branch
+     * (its sealed WP entry carries CST_WP_EVENT_DEP_BRANCH_KILL).  ON
+     * whenever wrong-path simulation runs — system AND user mode alike, now
+     * that user-mode bad speculative loads signal a fault (accel/tcg/
+     * user-exec.c spec_load_bytes_user) exactly as the softmmu path does.
+     * CST_NO_FAULT clears it for A/B measurement of the policy's effect. */
+    bool     wp_fault_poison = false;
     /* Kernel-excursion ownership (kexc=1): attribute kernel (priv!=0) TBs
      * by the owning excursion's entry ASID — tracked through ASID-write
      * path events — instead of by the live ASID, so PTI-style kernel

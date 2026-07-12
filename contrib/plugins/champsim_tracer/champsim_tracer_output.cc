@@ -2916,8 +2916,10 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
         flags |= CST_FLAG_WP;
     }
     /* System-mode sync-fault trailer: each entry carries its
-     * exception-nesting depth (+ anchor on a faulting BB). */
-    if (g_features.fault_excursions) {
+     * exception-nesting depth (+ anchor on a faulting BB).  This is the
+     * kernel-privilege depth machinery; the wrong-path fault-poisoning
+     * policy (wp_fault_poison) is independent and adds no trailer. */
+    if (g_features.fault_depth_trailer) {
         flags |= CST_FLAG_FAULT;
     }
     bw_write_u8(&st->header_bw, flags);

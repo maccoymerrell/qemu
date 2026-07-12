@@ -716,7 +716,17 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
              * propagated.  A retired branch whose sources are poisoned
              * arms the dep-branch kill; the commit path below seals the
              * BB it terminates and ends the excursion there.
+             *
+             * Gated on the wrong-path fault-poisoning policy: it fires in
+             * both system and user mode (any synchronous wrong-path fault
+             * — bad speculative load/store, div-by-zero, illegal opcode —
+             * reaches here via tb_ok=false).  CST_NO_FAULT clears the
+             * policy for A/B, leaving the fault detected and skipped but
+             * no register poisoned, so no branch is killed on it.  The
+             * excursion then runs to its depth/store budget exactly as it
+             * did before this policy existed.
              */
+            if (g_features.wp_fault_poison)
             for (uint32_t pi = 0; pi < n_executed_in_cur; pi++) {
                 const InsnFields *pf = &cur->insn_fields[pi];
                 bool faulted_insn = cur_is_fault_fragment &&

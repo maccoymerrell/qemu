@@ -52,6 +52,7 @@
 #include <sys/wait.h>
 #include <sys/user.h>
 #include <sys/personality.h>
+#include <sched.h>
 #include <unistd.h>
 
 /* ptrace POKETEXT/PEEKTEXT operate on word granularity. */
@@ -164,7 +165,32 @@ static int inject_marker_at_entry(pid_t pid)
     return 0;
 }
 
-static int run(char **argv)
+/*
+ * Confine the target to a single guest CPU (default for pinned-process
+ * tracing).  The ChampSim Tracer is single-address-space: a marker-mode
+ * trace pins one process, and thread_id follows the software thread across
+ * whatever core the guest scheduler picks — but only user-code identity is
+ * architecturally recoverable across a migration, since kernel code carries
+ * no per-thread register.  Pinning the target to one guest CPU removes
+ * migration entirely, so per-thread attribution is trivially stable and the
+ * plugin's migration-detect guard stays quiet.  This is a guest-side,
+ * Linux-specific action, which is why it lives in the OS-specific injector.
+ * Best-effort: a failure (e.g. the CPU is offline) is a warning, not fatal —
+ * the trace still runs, just without the confinement guarantee.
+ */
+static void pin_target_to_cpu(pid_t pid, int cpu)
+{
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    if (sched_setaffinity(pid, sizeof(set), &set) == -1) {
+        fprintf(stderr, "cst_attach: warning: could not pin target to guest "
+                "CPU %d (%s); per-thread attribution may be unstable if the "
+                "guest migrates it across vCPUs\n", cpu, strerror(errno));
+    }
+}
+
+static int run(char **argv, int pin_cpu)
 {
     pid_t pid = fork();
     if (pid < 0) {
@@ -196,6 +222,13 @@ static int run(char **argv)
         return 1;
     }
 
+    /* The target is now its own post-execve image, stopped at its entry.
+     * Confine it to one guest CPU (unless disabled) BEFORE it runs, so it
+     * never migrates and per-thread attribution stays clean. */
+    if (pin_cpu >= 0) {
+        pin_target_to_cpu(pid, pin_cpu);
+    }
+
     if (inject_marker_at_entry(pid) != 0) {
         ptrace(PTRACE_KILL, pid, 0, 0);
         return 1;
@@ -215,21 +248,65 @@ static int run(char **argv)
 
 #endif /* CST_ATTACH_SUPPORTED */
 
+static void usage(void)
+{
+    fprintf(stderr,
+        "usage: cst_attach [--pin-cpu N | --no-pin] [--] <target> [args...]\n"
+        "\n"
+        "Runs <target>, injecting the ChampSim Tracer marker at its entry\n"
+        "point so the plugin attaches and pins to its address space.\n"
+        "Intended to run under qemu(-system) with the plugin loaded in\n"
+        "trace_window=marker mode.\n"
+        "\n"
+        "  --pin-cpu N   Confine the target to guest CPU N (default: 0).\n"
+        "                The tracer is single-address-space, so a target\n"
+        "                pinned to one core never migrates and its\n"
+        "                per-thread attribution is stable.\n"
+        "  --no-pin      Do NOT confine the target (let the guest scheduler\n"
+        "                place it freely).  A pinned process that then\n"
+        "                migrates across vCPUs is outside the clean\n"
+        "                attribution envelope; the plugin warns when it\n"
+        "                observes this.\n");
+}
+
 int main(int argc, char **argv)
 {
-    if (argc < 2) {
-        fprintf(stderr,
-            "usage: cst_attach <target> [args...]\n"
-            "\n"
-            "Runs <target>, injecting the ChampSim Tracer marker at its\n"
-            "entry point so the plugin attaches and pins to its address\n"
-            "space.  Intended to run under qemu(-system) with the plugin\n"
-            "loaded in trace_window=marker mode.\n");
+    /* Pin the target to one guest CPU by default (see pin_target_to_cpu);
+     * -1 disables confinement. */
+    int pin_cpu = 0;
+    int i = 1;
+    for (; i < argc; i++) {
+        if (!strcmp(argv[i], "--")) {
+            i++;
+            break;
+        } else if (!strcmp(argv[i], "--no-pin")) {
+            pin_cpu = -1;
+        } else if (!strcmp(argv[i], "--pin-cpu")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "cst_attach: --pin-cpu needs an argument\n");
+                return 2;
+            }
+            pin_cpu = atoi(argv[++i]);
+            if (pin_cpu < 0) {
+                fprintf(stderr, "cst_attach: --pin-cpu must be >= 0\n");
+                return 2;
+            }
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            fprintf(stderr, "cst_attach: unknown option '%s'\n", argv[i]);
+            usage();
+            return 2;
+        } else {
+            break;   /* first non-option token is the target */
+        }
+    }
+    if (i >= argc) {
+        usage();
         return 2;
     }
 #if CST_ATTACH_SUPPORTED
-    return run(argv + 1);
+    return run(argv + i, pin_cpu);
 #else
+    (void)pin_cpu;
     fprintf(stderr,
         "cst_attach: unsupported host/arch (need Linux + x86/x86-64).\n"
         "The ptrace injector is the only platform-specific piece; add a\n"

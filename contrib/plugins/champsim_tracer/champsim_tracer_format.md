@@ -561,6 +561,22 @@ for the thread's lifetime.  Either way a decoder needs no knowledge of the
 mapping — it keys per-thread state (the initial regfile, the field-delta
 overlays) on the id as an opaque tag.
 
+**Scope: one address space.**  A system-mode (marker/pin) trace represents
+a SINGLE address space — the pinned process.  Every virtual address in the
+body is that process's, and `thread_id` distinguishes the software threads
+*within* it; the wire carries no address-space id, so it cannot disambiguate
+memory across processes (the same VA in another address space is different
+memory).  Whole-system / multi-process tracing would require an address-space
+id (CR3 / TTBR0 / SATP / MIPS ASID) on the wire and is a deliberate FUTURE
+extension, not a current capability.  Within the one address space, a
+`thread_id`'s USER-code blocks are exact wherever the guest scheduler runs the
+thread (the per-thread pointer is a user register that survives migration); a
+migrating pinned process is, however, outside the clean-attribution envelope
+for its KERNEL code, which carries no per-thread register.  The producer keeps
+the process inside the envelope by pinning it to one core (`cst_attach` does
+this by default) and emits a diagnostic if it observes the process spanning
+vCPUs.  See `docs/architecture.rst`, "Single address space".
+
 Loop until a `BODY_TAG_END` is seen:
 
 ```

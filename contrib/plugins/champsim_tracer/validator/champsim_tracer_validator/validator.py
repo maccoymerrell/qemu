@@ -5020,10 +5020,24 @@ def _check_syscall_fault_nesting(entries: list[dict],
         per-vCPU object: the SAME tid's consecutive kernel entries can
         straddle two vCPUs' baselines at the migration boundary, which
         the wire deliberately hides (thread_id carries no vCPU).  That
-        kernel->kernel step is therefore exempted too — the per-vCPU
-        stack discipline is unverifiable from a vCPU-blind wire once a
-        tid migrates mid-kernel; the user-level clamp and the
-        non-migrating threads stay strict,
+        kernel->kernel step is therefore exempted too, as a DOCUMENTED
+        SCOPE BOUNDARY, not a papered-over bug.  The ChampSim Tracer is
+        single-address-space (one pinned process; thread_id names a
+        thread WITHIN it): the SUPPORTED regime pins the process to one
+        core, where it never migrates and per-thread attribution is
+        exact.  A cross-vCPU migration is explicitly outside that
+        clean-attribution envelope — the plugin's migration-detect guard
+        emits a stderr warning and a pin_multivcpu_observed stat when it
+        sees the pinned process span vCPUs, and cst_attach pins the
+        target by default to avoid it.  A migrated thread's USER-code
+        tid still follows the thread correctly (verified by the thread
+        chain and distribution checks); only KERNEL-code per-thread
+        identity across the migration is unrecoverable from an
+        architectural signal — kernel code carries no per-thread
+        register — so the per-vCPU stack discipline cannot be asserted
+        for it.  The user-level clamp and the non-migrating threads stay
+        strict; whole-system multi-process attribution (ASID on the
+        wire) is future work, see docs/architecture.rst,
       * fault-anchored (whole-BB-merged) entries sit at the unwind of
         an excursion: the same tid was at a *higher* depth on the
         previous entry, or the anchor marks the merged completion of
@@ -5063,7 +5077,13 @@ def _check_syscall_fault_nesting(entries: list[dict],
         ps = prev_sys_by_tid.get(tid)
         # Privilege-boundary discontinuity (multi-thread, always) and the
         # per-vCPU-baseline discontinuity a migrated tid carries across a
-        # kernel->kernel vCPU boundary (migration test only).
+        # kernel->kernel vCPU boundary.  The latter is exempted only under
+        # @expect_migration, the deliberate out-of-envelope migration test:
+        # a single-address-space trace attributes kernel code by the vCPU it
+        # ran on, which a migration straddles.  This is the documented scope
+        # boundary (see the docstring + docs/architecture.rst), not a bug —
+        # the SUPPORTED regime pins the process to one core (cst_attach does
+        # this by default; the plugin warns when a process migrates anyway).
         exempt = (guest_threads > 1 and ps is not None
                   and (ps != is_sys
                        or (expect_migration and ps and is_sys)))

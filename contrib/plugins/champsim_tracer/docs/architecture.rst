@@ -258,7 +258,8 @@ the trace stream:
   *Degradation:* a target/model whose thread-pointer register is never
   written (no MIPS ``Config3.ULRI``, a guest that sets no TLS) reports
   0 for every thread, so its threads collapse to one id — honest
-  indistinctness, never a fabricated identity.
+  indistinctness, never a fabricated identity.  For the attribution
+  envelope and the migration boundary see :ref:`single-address-space`.
 * **``icount`` is per-vCPU.**  The plugin maintains one instruction
   counter per QEMU vCPU.  Segment-window comparisons (``start=N``
   / ``stop=N``, simpoint windows) consult the firing vCPU's
@@ -307,6 +308,52 @@ Practical implications:
   carries no initial-regfile blob; the body-stream record
   represents threads that come online mid-segment, which a
   header-resident blob bound to the install-time vCPU cannot.
+
+.. _single-address-space:
+
+Single address space (system-mode scope)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A system-mode trace represents **one address space**.  The marker pins a
+single process, every virtual address in the body is that process's, and
+``thread_id`` distinguishes the software threads *within* it — nothing in
+the wire disambiguates memory across processes (the same VA in a different
+address space is different memory).  Whole-system / multi-process tracing
+would require an address-space id (CR3 / TTBR0 / SATP / MIPS ASID) on the
+wire so a consumer could key memory per process; that is a deliberate
+**future** format extension, not a current capability.
+
+Within that one address space, clean per-thread attribution rests on the
+pinned process **not migrating across vCPUs**:
+
+* **User code is exact.**  ``thread_id`` is read from the per-thread
+  pointer, a user register the kernel context-switches, so a thread's
+  user-space blocks carry one id wherever the guest scheduler runs them —
+  stable across a migration.
+* **Kernel code is attributed by entry, within a vCPU.**  A user-to-kernel
+  excursion (syscall, fault handler) inherits the tid of the thread that
+  entered it on that vCPU.  This is correct while the process stays on one
+  vCPU.  It has **no architecturally-clean answer across a migration**:
+  kernel code carries no per-thread register (the thread pointer is a user
+  register; no ISA exposes a kernel-privilege one), so scheduler /
+  context-switch code the guest runs on a vCPU a thread has just left, or
+  arrives on before reaching user, belongs to no single thread the wire
+  can name.
+
+The tracer therefore treats a migrating pinned process as **outside the
+clean-attribution envelope** rather than fabricating a kernel-thread
+identity for it.  The supported path keeps it inside the envelope by
+pinning: :program:`cst_attach` confines the target to one guest CPU by
+default (``--pin-cpu N`` / ``--no-pin``), and ``taskset`` / ``isolcpus``
+do the same for a compiled-in marker.  When a segment nonetheless observes
+the pinned process running **user** code on more than one vCPU — the
+architectural migration signal — the plugin emits **one** stderr warning
+per segment and sets the ``pin_multivcpu_observed`` stat, making the
+misuse loud rather than silent.  Only the user-code tid is guaranteed
+across such a migration; the per-vCPU kernel-nesting discipline the
+validator's ``syscall_fault_nesting`` check asserts is relaxed at the
+migration seam for exactly this reason (a documented boundary, verified by
+the forced-migration test, not a papered-over defect).
 
 .. _tb-vs-true-bb:
 

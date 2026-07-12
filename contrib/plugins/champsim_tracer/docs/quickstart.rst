@@ -241,6 +241,21 @@ plugin sees its argv.
    :doc:`architecture` for the marker contract, the address-space
    pin, and what a system-mode trace contains.
 
+   To trace an **unmodified binary** (no compiled-in marker), run it
+   inside the guest under :program:`cst_attach`, which injects the
+   marker at the target's entry point via ``ptrace``::
+
+      cst_attach ./workload arg1 arg2
+
+   Because the tracer is single-address-space and kernel-code
+   per-thread attribution is only clean while the process stays on one
+   vCPU, ``cst_attach`` confines the target to a single guest CPU by
+   default (``--pin-cpu N`` selects the CPU, ``--no-pin`` disables the
+   confinement).  A compiled-in marker gets the same guarantee from
+   ``taskset``/``isolcpus``.  If a pinned process migrates across vCPUs
+   anyway, the plugin emits one ``pin_multivcpu_observed`` warning per
+   segment — pin it to a core for clean per-thread attribution.
+
 Examples::
 
    trace_window=icount:start=0+stop=20000000

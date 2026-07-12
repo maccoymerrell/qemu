@@ -580,6 +580,31 @@ static constexpr size_t PIN_SIG_BYTES = 256;
 static std::unordered_map<uint64_t, uint32_t> *g_thread_tid_map;
 static uint32_t g_thread_tid_next = 0;
 static uint32_t g_vcpu_cur_tid[CST_PIN_MAX_VCPUS];
+
+/*
+ * Pinned-process migration-detect guard (system-mode pin, SMP guests).
+ *
+ * The wire is single-address-space by construction: a marker-mode trace
+ * pins ONE process, every VA is that process's, and thread_id distinguishes
+ * the software threads WITHIN it (see docs/architecture.rst, "Single
+ * address space").  Clean per-thread attribution therefore relies on the
+ * pinned process NOT migrating across vCPUs — kernel code carries no
+ * architecturally-reliable per-thread identity (the thread pointer is a
+ * USER register; no ISA exposes a kernel-privilege one), so a thread the
+ * guest scheduler moves between vCPUs leaves the kernel work on the vCPU it
+ * left with no clean owner.  cst_attach pins the target to a single guest
+ * CPU by default, keeping it inside the clean-attribution envelope; this
+ * guard makes the misuse loud rather than silent when it is not pinned.
+ *
+ * g_pin_user_vcpu_mask records, per segment, which vCPUs the pinned process
+ * ran USER code on (one bit per cpu_index).  When its population first
+ * exceeds one the process is migrating: emit ONE stderr warning and bump a
+ * stat.  The vCPU index is architectural (known to the plugin) and stays
+ * OFF the wire — this is a diagnostic, not trace content.  Reset per
+ * segment; guarded by exec_lock.
+ */
+static uint64_t g_pin_user_vcpu_mask = 0;
+static bool g_pin_multivcpu_warned = false;
 /* Per-vCPU cache of the last thread-pointer value mapped, so the hot path
  * re-maps only when the value actually changes (a thread's pointer is
  * constant while it runs).  CST_TP_UNSEEN is a non-canonical sentinel no
@@ -639,6 +664,32 @@ static uint32_t thread_ptr_to_tid(uint64_t tp)
     return tid;
 }
 
+/* Note that the pinned process ran USER code on vCPU @cpu_index, and fire
+ * the migration-detect guard the FIRST time in a segment that it is seen on
+ * more than one vCPU.  Caller holds exec_lock, at a user-owned priv-0 TB of
+ * the pinned process.  Architectural (vCPU index) diagnostic — off the wire. */
+static void pin_user_vcpu_observe(unsigned int cpu_index)
+{
+    if (cpu_index >= 64) {
+        return;
+    }
+    uint64_t before = g_pin_user_vcpu_mask;
+    g_pin_user_vcpu_mask |= (uint64_t)1 << cpu_index;
+    if (before != 0 && g_pin_user_vcpu_mask != before &&
+        !g_pin_multivcpu_warned) {
+        g_pin_multivcpu_warned = true;
+        g_stats.pin_multivcpu_observed++;
+        fprintf(stderr,
+            "champsim_tracer: pinned process ran user code on multiple vCPUs "
+            "in one segment — pin it to a core (cst_attach does this by "
+            "default; or use taskset/isolcpus) for clean per-thread "
+            "attribution.  A migrating pinned process is outside the "
+            "single-address-space tracer's clean-attribution envelope: its "
+            "user-code thread_id still follows the thread, but kernel code it "
+            "leaves on a vacated vCPU has no architecturally-clean owner.\n");
+    }
+}
+
 /* Reset the per-segment guest-thread identity map and every vCPU's current
  * tid.  Caller holds exec_lock (via reset_segment_local_state). */
 static void thread_identity_reset(void)
@@ -651,6 +702,8 @@ static void thread_identity_reset(void)
         g_vcpu_cur_tid[i] = 0;
         g_vcpu_last_tp[i] = CST_TP_UNSEEN;
     }
+    g_pin_user_vcpu_mask = 0;
+    g_pin_multivcpu_warned = false;
 }
 
 /* The thread_id stamped on an emitted body entry.  System-mode pin: the
@@ -1524,6 +1577,9 @@ static void start_trace_segment(const char *label,
             uint64_t tp = qemu_plugin_get_thread_ptr();
             seed_thread_id = thread_ptr_to_tid(tp);
             g_vcpu_last_tp[cpu_index] = tp;
+            /* Opener sampled at user privilege: seed the migration-detect
+             * guard's per-segment vCPU set with this vCPU. */
+            pin_user_vcpu_observe(cpu_index);
             if (tiddiag_on()) {
                 tiddiag_note_binding(cpu_index, seed_thread_id);
             }
@@ -2935,6 +2991,10 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
                 tiddiag_note_binding(cpu_index, new_tid);
             }
         }
+        /* Migration-detect guard: record this vCPU in the pinned process's
+         * per-segment user-vCPU set (every user TB, not only on a tid
+         * change), firing one warning if the process spans vCPUs. */
+        pin_user_vcpu_observe(cpu_index);
     }
 
     /* Only a normally-sealed step evaluates the deferred closes and
@@ -4634,6 +4694,7 @@ static void append_stats_summary(GString *report, const char *label,
         { "pin re-fault frames repaired",        stats.pin_refault_repaired },
         { "pin unverified user TBs dropped",     stats.pin_unverified_dropped },
         { "pin code pages mapped",               stats.pin_pages_mapped },
+        { "pin multi-vCPU observed (segments)",  stats.pin_multivcpu_observed },
     };
     const struct { const char *name; uint64_t value; } bin_counters[] = {
         { "  Header bits",        stats.bin_header_bits },

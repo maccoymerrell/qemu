@@ -134,6 +134,16 @@ struct Stats {
     uint64_t pin_unverified_dropped = 0;
     uint64_t pin_pages_mapped = 0;
 
+    /* Pinned-process migration-detect guard (system-mode pin, SMP guests).
+     * Set once per segment when the pinned process is seen executing USER
+     * code on more than one vCPU within a segment — a pinned-process-mode
+     * misuse the diagnostic makes loud: pin the workload to a core
+     * (cst_attach does this by default) for stable per-thread identity.  A
+     * migrating pinned process is outside the single-address-space tracer's
+     * clean-attribution envelope.  Zero on single-vCPU guests, in user
+     * mode, and on any unpinned run. */
+    uint64_t pin_multivcpu_observed = 0;
+
     /* Per-execution attribution.  cp_* bumped at vcpu_tb_exec walking
      * the prev TB's template; wp_* inside the WP per-iteration loop.
      * Sized by the generic enum sentinels to stay in lockstep. */

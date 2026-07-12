@@ -43,31 +43,6 @@ __thread uintptr_t helper_retaddr;
 
 #ifdef CONFIG_PLUGIN
 /*
- * Signal a wrong-path (speculative) memory fault to the plugin's WP walker.
- *
- * A speculative access to an absent/unreadable/unwritable page is a dead
- * end, not a real architectural fault: cpu_loop_exit_sigsegv() detects
- * plugin_spec_mode and, instead of queuing a guest SIGSEGV, longjmps out
- * through cpu->jmp_env so cpu_plugin_exec_tb()'s setjmp guard returns
- * tb_ok=false with the guest PC restored to the faulting instruction.
- * The walker then marks that insn faulted, poisons its destination(s),
- * and the dep-branch-kill policy squashes the excursion at the first
- * dependent branch.  This is the user-mode twin of the softmmu spec path,
- * where tlb_fill_align() reaches cpu_loop_exit_restore() under
- * spec_real_access (accel/tcg/cputlb.c); prior to this the user-mode
- * load absorbed the fault as zero bytes and the wrong path ran on
- * garbage, never poisoning and never emitting DEP_BRANCH_KILL.
- */
-static G_NORETURN void spec_fault_user(CPUState *cpu, vaddr addr,
-                                       MMUAccessType access_type,
-                                       uintptr_t ra)
-{
-    bool maperr = !guest_addr_valid_untagged(addr) ||
-                  !(page_get_flags(addr) & PAGE_VALID);
-    cpu_loop_exit_sigsegv(cpu, addr, access_type, maperr, ra);
-}
-
-/*
  * Load N bytes with store-to-load forwarding (user mode).
  *
  * Line-chunked to mirror spec_store_bytes: one spec-buffer lookup per
@@ -80,14 +55,18 @@ static G_NORETURN void spec_fault_user(CPUState *cpu, vaddr addr,
  *
  * Bytes covered by a prior speculative store are forwarded from the
  * sandbox regardless of the underlying page's mapping (a spec store to a
- * writable page succeeded there).  Any byte that must come from real
- * memory and lands on an unmapped/unreadable page faults the excursion
- * via spec_fault_user() — the softmmu twin faults the whole access at
- * tlb_fill before forwarding.
+ * writable page succeeded there).  A byte that must come from real memory
+ * but lands on an unmapped/unreadable page does NOT fault the excursion:
+ * on the wrong path the faulting instruction never retires, so a back-end
+ * memory fault is never taken by a real core.  We fill a deterministic
+ * placeholder (plugin_spec_garbage_fill) and set plugin_spec_mem_faulted
+ * so the plugin can tag the memop synthetic, then continue.  This is the
+ * user-mode twin of the softmmu TLB_SPEC_ABSENT path.
  */
 static void spec_load_bytes_user(CPUState *cpu, vaddr guest_addr,
                                  void *out, int size, uintptr_t ra)
 {
+    (void)ra;
     uint8_t *op = out;
     while (size > 0) {
         vaddr    line_addr = guest_addr & ~(vaddr)PLUGIN_SPEC_LINE_MASK;
@@ -106,7 +85,8 @@ static void spec_load_bytes_user(CPUState *cpu, vaddr guest_addr,
                 (page_get_flags(guest_addr) & PAGE_READ)) {
                 memcpy(op, g2h(cpu, guest_addr), chunk);
             } else {
-                spec_fault_user(cpu, guest_addr, MMU_DATA_LOAD, ra);
+                plugin_spec_garbage_fill(op, chunk, guest_addr);
+                cpu->plugin_spec_mem_faulted = true;
             }
         } else {
             /* Mixed: forward stored bytes, fill the rest from memory. */
@@ -120,7 +100,8 @@ static void spec_load_bytes_user(CPUState *cpu, vaddr guest_addr,
                         (page_get_flags(ba) & PAGE_READ)) {
                         op[i] = *(uint8_t *)g2h(cpu, ba);
                     } else {
-                        spec_fault_user(cpu, ba, MMU_DATA_LOAD, ra);
+                        plugin_spec_garbage_fill(&op[i], 1, ba);
+                        cpu->plugin_spec_mem_faulted = true;
                     }
                 }
             }
@@ -134,26 +115,27 @@ static void spec_load_bytes_user(CPUState *cpu, vaddr guest_addr,
 /*
  * Store N bytes into the speculative sandbox (user mode).
  *
- * A wrong-path store to an unmapped/read-only page must fault the
- * excursion, exactly as the softmmu twin does (do_st -> cpu_mmu_lookup
- * -> tlb_fill_align -> cpu_loop_exit_restore under spec_real_access);
- * otherwise a speculative store to a wild address would silently buffer
- * into the sandbox and a later speculative load could forward those
- * bytes without either access ever faulting.  Every page the store
- * touches is checked for original writability (PAGE_WRITE_ORG, so a
+ * A wrong-path store to an unmapped/read-only page does NOT fault the
+ * excursion (a mispredicted store never retires): it sandboxes-and-continues,
+ * exactly as the softmmu twin does — the do_st spec branch buffers the bytes
+ * into the per-vCPU spec line regardless of the real page's writability.  We
+ * still probe each touched page's original writability (PAGE_WRITE_ORG, so a
  * store to an SMC-dirty-tracked page whose PAGE_WRITE was cleared is not
- * mis-faulted).  For a good target the bytes are buffered in the spec
- * sandbox — never real guest memory — preserving store-to-load
- * forwarding for the rest of the excursion.
+ * mis-flagged) purely to set plugin_spec_mem_faulted for a bad-page store so
+ * its memop is tagged synthetic.  The bytes are buffered in the spec sandbox —
+ * never real guest memory — preserving store-to-load forwarding for the rest
+ * of the excursion.
  */
 static void spec_store_bytes_user(CPUState *cpu, vaddr addr,
                                   const void *buf, int size, uintptr_t ra)
 {
+    (void)ra;
     vaddr end = addr + size;
     for (vaddr p = addr; p < end; ) {
         if (!guest_addr_valid_untagged(p) ||
             !(page_get_flags(p) & PAGE_WRITE_ORG)) {
-            spec_fault_user(cpu, p, MMU_DATA_STORE, ra);
+            cpu->plugin_spec_mem_faulted = true;
+            break;
         }
         vaddr next = (p & TARGET_PAGE_MASK) + TARGET_PAGE_SIZE;
         p = next < end ? next : end;

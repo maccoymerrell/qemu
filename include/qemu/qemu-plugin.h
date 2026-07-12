@@ -1606,6 +1606,23 @@ QEMU_PLUGIN_API
 bool qemu_plugin_spec_store_overflowed(void);
 
 /**
+ * qemu_plugin_spec_mem_faulted_take() - did the just-executed wrong-path memory
+ * access read a synthetic placeholder?
+ *
+ * Returns true (and clears the sentinel) when the memory access the current
+ * vCPU just performed on the wrong (speculative) path landed on an
+ * absent/unreadable page and was served a deterministic placeholder value
+ * instead of real memory — the excursion continues, but the value is
+ * synthetic.  A tracer calls this from its memory callback (which fires
+ * immediately after the access) to tag that memop as a synthetic-data fault.
+ * Reads false (and is a no-op) outside wrong-path execution and in user mode
+ * for accesses that hit real memory.  Consumes the flag, so a second call for
+ * the same access returns false.  Must be called from a vCPU context.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_spec_mem_faulted_take(void);
+
+/**
  * qemu_plugin_get_priv_level() - current privilege level of the executing vCPU
  *
  * Returns a normalized privilege ordinal: 0 = user / least privileged,

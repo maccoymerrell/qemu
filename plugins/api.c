@@ -923,6 +923,15 @@ bool qemu_plugin_spec_store_overflowed(void)
 #endif
 }
 
+bool qemu_plugin_spec_mem_faulted_take(void)
+{
+    if (!current_cpu || !current_cpu->plugin_spec_mem_faulted) {
+        return false;
+    }
+    current_cpu->plugin_spec_mem_faulted = false;
+    return true;
+}
+
 void qemu_plugin_spec_mode_end(void)
 {
     g_assert(current_cpu);

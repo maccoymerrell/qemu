@@ -167,6 +167,22 @@ static inline int cpu_mmu_index(CPUState *cs, bool ifetch)
 /* The two sets of flags must not overlap. */
 QEMU_BUILD_BUG_ON(TLB_FLAGS_MASK & TLB_SLOW_FLAGS_MASK);
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Plugin wrong-path (speculative) synthetic flag.  Set ONLY in
+ * MMULookupPageData.flags (never in a real CPUTLBEntry address) by
+ * mmu_lookup1 when a speculative access hit an absent page: tlb_fill_align
+ * declined to raise or demand-page and signalled cpu->plugin_spec_absent
+ * instead of longjmping.  The load path then substitutes deterministic
+ * placeholder bytes rather than dereferencing the (stale/invalid) host
+ * pointer, and the wrong-path excursion continues.  Chosen well above the
+ * fast/slow flag bits packed near TARGET_PAGE_BITS_MIN so it can never
+ * collide with them or with an address bit that reaches these flags.
+ */
+#define TLB_SPEC_ABSENT      (1 << 18)
+QEMU_BUILD_BUG_ON(TLB_SPEC_ABSENT & (TLB_FLAGS_MASK | TLB_SLOW_FLAGS_MASK));
+#endif
+
 #endif /* !CONFIG_USER_ONLY */
 
 /* Validate correct placement of CPUArchState. */

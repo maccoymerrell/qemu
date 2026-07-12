@@ -58,6 +58,28 @@ typedef struct PluginSpecLine {
 struct CPUState;
 PluginSpecLine *spec_line_get_or_alloc(struct CPUState *cpu, vaddr line_addr);
 
+/*
+ * Deterministic pseudo-random placeholder for a wrong-path speculative
+ * access to an absent/unreadable page.  On the wrong path the faulting
+ * instruction never retires, so this value is never architecturally
+ * forwarded in a real simulation — it is a pure placeholder that only
+ * drives further wrong-path exploration.  Garbage (not zero) so a
+ * data-dependent branch on it is not systematically biased.  Keyed on
+ * each byte's guest address for reproducibility and read-consistency.
+ */
+static inline void plugin_spec_garbage_fill(void *out, unsigned size,
+                                            vaddr addr)
+{
+    uint8_t *op = out;
+    for (unsigned i = 0; i < size; i++) {
+        uint64_t z = (uint64_t)(addr + i) + 0x9E3779B97F4A7C15ULL;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        z =  z ^ (z >> 31);
+        op[i] = (uint8_t)z;
+    }
+}
+
 #endif /* CONFIG_PLUGIN */
 
 #endif /* QEMU_PLUGIN_SPEC_H */

@@ -726,6 +726,26 @@ struct CPUState {
     } plugin_spec_tlb_log[CPU_SPEC_TLB_LOG_MAX];
     uint16_t plugin_spec_tlb_log_n;
     bool plugin_spec_tlb_log_overflow;
+    /*
+     * Wrong-path speculative absent-page sentinel (softmmu).  A speculative
+     * access to a genuinely-absent page must neither raise a guest fault nor
+     * demand-page, but it also must NOT truncate the excursion: on a
+     * mispredicted path no instruction retires, so a back-end memory fault is
+     * never taken by a real core.  tlb_fill_align sets this instead of
+     * longjmping; the immediate caller (mmu_lookup1 / atomic_mmu_lookup)
+     * consumes and clears it, substituting a deterministic placeholder value
+     * (plugin_spec_garbage_fill) and continuing.  Transient — never observed
+     * across a memory-op boundary.
+     */
+    bool plugin_spec_absent;
+    /*
+     * Set by the garbage-filling wrong-path load/store path (user-exec twin and
+     * softmmu) for the current speculative access when it landed on an
+     * absent/unreadable page and read a synthetic placeholder.  The plugin's
+     * memory callback reads and clears it (qemu_plugin_spec_mem_faulted_take)
+     * to tag that memop as a synthetic-data fault in the wrong-path trace.
+     */
+    bool plugin_spec_mem_faulted;
 #endif
 
     /* TODO Move common fields from CPUArchState here. */

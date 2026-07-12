@@ -1376,14 +1376,18 @@ static bool tlb_fill_align(CPUState *cpu, vaddr addr, MMUAccessType type,
     if (spec_real_access) {
         /*
          * A real wrong-path access missed (absent page) with the raise
-         * suppressed.  Abort the wrong-path chain via the same unwind the
-         * user-mode fault hook uses: cpu_loop_exit -> cpu_plugin_exec_tb's
-         * sigsetjmp -> tb_ok=false -> CST_WP_EVENT_FAULT + PC poison.  No
+         * suppressed.  Do NOT longjmp/truncate: on a mispredicted path no
+         * instruction retires, so a back-end memory fault is never taken by a
+         * real core.  Signal the miss to the immediate caller (mmu_lookup1 /
+         * atomic_mmu_lookup) via the per-CPU sentinel; it substitutes a
+         * deterministic placeholder value and the excursion continues.  No
          * page is demand-allocated, as required of speculative execution.
          */
-        cpu_loop_exit_restore(cpu, ra);
+        cpu->plugin_spec_absent = true;
+        return false;
     }
 #endif
+    /* Reached only for a genuine non-spec probe (nonfault) miss. */
     assert(probe);
     return false;
 }
@@ -1515,6 +1519,15 @@ static int probe_access_internal(CPUState *cpu, vaddr addr,
             if (!tlb_fill_align(cpu, addr, access_type, mmu_idx,
                                 0, fault_size, nonfault, retaddr)) {
                 /* Non-faulting page table read failed.  */
+#ifdef CONFIG_PLUGIN
+                /* A wrong-path (spec) real-access miss now returns false and
+                 * sets the absent sentinel instead of longjmping.  This probe
+                 * is not the mmu_lookup1 / atomic consumer, so clear it here so
+                 * it cannot leak into the next real access; the NULL host makes
+                 * helper callers fall back to per-unit ld/st, which garbage-fill
+                 * and continue via the do_ld TLB_SPEC_ABSENT path. */
+                cpu->plugin_spec_absent = false;
+#endif
                 *phost = NULL;
                 *pfull = NULL;
                 return TLB_INVALID_MASK;
@@ -1861,6 +1874,24 @@ static bool mmu_lookup1(CPUState *cpu, MMULookupPageData *data, MemOp memop,
             maybe_resized = true;
             index = tlb_index(cpu, mmu_idx, addr);
             entry = tlb_entry(cpu, mmu_idx, addr);
+#ifdef CONFIG_PLUGIN
+            if (cpu->plugin_spec_absent) {
+                /*
+                 * Wrong-path speculative access to an absent page.  The fill
+                 * declined to raise or demand-page; the entry is stale, so do
+                 * NOT compute a host pointer from it.  Mark this page absent —
+                 * the load path substitutes a deterministic placeholder — and
+                 * return before the haddr compute below.  Both pages of a
+                 * cross-page access are resolved independently by mmu_lookup,
+                 * so each inherits its own TLB_SPEC_ABSENT.
+                 */
+                cpu->plugin_spec_absent = false;
+                data->full = &cpu->neg.tlb.d[mmu_idx].fulltlb[index];
+                data->flags = TLB_SPEC_ABSENT;
+                data->haddr = NULL;
+                return maybe_resized;
+            }
+#endif
         }
         tlb_addr = tlb_read_idx(entry, access_type) & ~TLB_INVALID_MASK;
     }
@@ -2017,6 +2048,41 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     return crosspage;
 }
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Wrong-path speculative atomic RMW to an absent/unreadable page: never touch
+ * real memory and never longjmp.  Seed the speculative sandbox line with
+ * deterministic placeholder bytes and return a pointer into it, exactly as
+ * spec_atomic_shadow does for a present page.  The RMW mutates the shadow and
+ * the excursion continues; the plugin tags the memop synthetic via
+ * plugin_spec_mem_faulted.  Consumes cpu->plugin_spec_absent (already cleared
+ * by the caller before this is reached).
+ */
+static void *spec_atomic_absent(CPUState *cpu, vaddr addr, int size,
+                                uintptr_t retaddr)
+{
+    cpu->plugin_spec_mem_faulted = true;
+    if (addr & (size - 1)) {
+        /* Guest atomics are naturally aligned; a garbage-unaligned wrong-path
+         * address is pathological — take the world-stop the non-spec path would
+         * (a graceful-stop via the WP walker), rather than mis-shadowing. */
+        cpu_loop_exit_atomic(cpu, retaddr);
+    }
+    uint8_t garbage[16];
+    plugin_spec_garbage_fill(garbage, size, addr);
+    void *shadow = spec_atomic_shadow(cpu, addr, garbage, size);
+    if (shadow) {
+        return shadow;
+    }
+    /* Sandbox capped: discard the RMW into a garbage-seeded scratch line, as
+     * the present-page capped path does with a real-memory seed. */
+    static __thread PluginSpecLine scratch;
+    unsigned soff = (unsigned)(addr & PLUGIN_SPEC_LINE_MASK);
+    plugin_spec_garbage_fill(&scratch.bytes[soff], size, addr);
+    return &scratch.bytes[soff];
+}
+#endif
+
 /*
  * Probe for an atomic operation.  Do not allow unaligned operations,
  * or io operations to proceed.  Return the host address.
@@ -2048,6 +2114,12 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
                             addr & TARGET_PAGE_MASK)) {
             tlb_fill_align(cpu, addr, MMU_DATA_STORE, mmu_idx,
                            mop, size, false, retaddr);
+#ifdef CONFIG_PLUGIN
+            if (cpu->plugin_spec_absent) {
+                cpu->plugin_spec_absent = false;
+                return spec_atomic_absent(cpu, addr, size, retaddr);
+            }
+#endif
             did_tlb_fill = true;
             index = tlb_index(cpu, mmu_idx, addr);
             tlbe = tlb_entry(cpu, mmu_idx, addr);
@@ -2064,6 +2136,15 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     if (unlikely(tlbe->addr_read == -1)) {
         tlb_fill_align(cpu, addr, MMU_DATA_LOAD, mmu_idx,
                        0, size, false, retaddr);
+#ifdef CONFIG_PLUGIN
+        if (cpu->plugin_spec_absent) {
+            /* Wrong-path atomic on a present-but-unreadable page: the read-side
+             * fill declined under spec.  Sandbox with placeholder bytes and
+             * continue rather than raising. */
+            cpu->plugin_spec_absent = false;
+            return spec_atomic_absent(cpu, addr, size, retaddr);
+        }
+#endif
         /*
          * Since we don't support reads and writes to different
          * addresses, and we do have the proper page loaded for
@@ -2427,6 +2508,20 @@ static uint64_t do_ld_beN(CPUState *cpu, MMULookupPageData *p,
     MemOp atom;
     unsigned tmp, half_size;
 
+#ifdef CONFIG_PLUGIN
+    if (unlikely(p->flags & TLB_SPEC_ABSENT)) {
+        /* Wrong-path cross-page load whose page is absent: deterministic
+         * placeholder bytes, concatenated big-endian exactly as
+         * do_ld_bytes_beN concatenates the real bytes. */
+        for (int i = 0; i < p->size; i++) {
+            uint8_t gb;
+            plugin_spec_garbage_fill(&gb, 1, p->addr + i);
+            ret_be = (ret_be << 8) | gb;
+        }
+        cpu->plugin_spec_mem_faulted = true;
+        return ret_be;
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         return do_ld_mmio_beN(cpu, p->full, ret_be, p->addr, p->size,
                               mmu_idx, type, ra);
@@ -2477,6 +2572,26 @@ static Int128 do_ld16_beN(CPUState *cpu, MMULookupPageData *p,
     uint64_t b;
     MemOp atom;
 
+#ifdef CONFIG_PLUGIN
+    if (unlikely(p->flags & TLB_SPEC_ABSENT)) {
+        /* Wrong-path cross-page 128-bit load whose page is absent: fill the
+         * per-page slice with deterministic placeholder bytes (big-endian,
+         * matching the MO_ATOM_NONE accumulation) instead of dereferencing the
+         * invalid host pointer.  8 < size <= 16 here. */
+        uint8_t g[16];
+        plugin_spec_garbage_fill(g, size, p->addr);
+        uint64_t hi = a;
+        for (int i = 0; i < size - 8; i++) {
+            hi = (hi << 8) | g[i];
+        }
+        uint64_t lo = 0;
+        for (int i = size - 8; i < size; i++) {
+            lo = (lo << 8) | g[i];
+        }
+        cpu->plugin_spec_mem_faulted = true;
+        return int128_make128(lo, hi);
+    }
+#endif
     if (unlikely(p->flags & TLB_MMIO)) {
         return do_ld16_mmio_beN(cpu, p->full, a, p->addr, size, mmu_idx, ra);
     }
@@ -2528,6 +2643,13 @@ static uint8_t do_ld_1(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
         if (spec_load_byte(cpu, p->addr, &val)) {
             return val;
         }
+        if (unlikely(p->flags & TLB_SPEC_ABSENT)) {
+            /* Wrong-path load from an absent page: deterministic placeholder
+             * instead of dereferencing the invalid host pointer. */
+            plugin_spec_garbage_fill(&val, 1, p->addr);
+            cpu->plugin_spec_mem_faulted = true;
+            return val;
+        }
     }
 #endif
     if (unlikely(p->flags & TLB_MMIO)) {
@@ -2545,7 +2667,12 @@ static uint16_t do_ld_2(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
         /* Read from real memory, then overlay any speculative bytes */
-        if (unlikely(p->flags & TLB_MMIO)) {
+        if (unlikely(p->flags & TLB_SPEC_ABSENT)) {
+            /* Absent page: deterministic placeholder baseline (no host
+             * dereference), still overlaid with genuine forwarded stores. */
+            plugin_spec_garbage_fill(&ret, 2, p->addr);
+            cpu->plugin_spec_mem_faulted = true;
+        } else if (unlikely(p->flags & TLB_MMIO)) {
             ret = do_ld_mmio_beN(cpu, p->full, 0, p->addr, 2,
                                  mmu_idx, type, ra);
             if ((memop & MO_BSWAP) == MO_LE) {
@@ -2586,7 +2713,10 @@ static uint32_t do_ld_4(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
 
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
-        if (unlikely(p->flags & TLB_MMIO)) {
+        if (unlikely(p->flags & TLB_SPEC_ABSENT)) {
+            plugin_spec_garbage_fill(&ret, 4, p->addr);
+            cpu->plugin_spec_mem_faulted = true;
+        } else if (unlikely(p->flags & TLB_MMIO)) {
             ret = do_ld_mmio_beN(cpu, p->full, 0, p->addr, 4,
                                  mmu_idx, type, ra);
             if ((memop & MO_BSWAP) == MO_LE) {
@@ -2626,7 +2756,10 @@ static uint64_t do_ld_8(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
 
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
-        if (unlikely(p->flags & TLB_MMIO)) {
+        if (unlikely(p->flags & TLB_SPEC_ABSENT)) {
+            plugin_spec_garbage_fill(&ret, 8, p->addr);
+            cpu->plugin_spec_mem_faulted = true;
+        } else if (unlikely(p->flags & TLB_MMIO)) {
             ret = do_ld_mmio_beN(cpu, p->full, 0, p->addr, 8,
                                  mmu_idx, type, ra);
             if ((memop & MO_BSWAP) == MO_LE) {
@@ -2751,6 +2884,16 @@ static Int128 do_ld16_mmu(CPUState *cpu, vaddr addr,
     cpu_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_LOAD, &l);
     if (likely(!crosspage)) {
+#ifdef CONFIG_PLUGIN
+        if (unlikely(l.page[0].flags & TLB_SPEC_ABSENT)) {
+            /* Wrong-path 128-bit load from an absent page: deterministic
+             * placeholder instead of dereferencing the invalid host pointer. */
+            uint8_t g[16];
+            plugin_spec_garbage_fill(g, 16, addr);
+            cpu->plugin_spec_mem_faulted = true;
+            return int128_make128(ldq_le_p(g), ldq_le_p(g + 8));
+        }
+#endif
         if (unlikely(l.page[0].flags & TLB_MMIO)) {
             ret = do_ld16_mmio_beN(cpu, l.page[0].full, 0, addr, 16,
                                    l.mmu_idx, ra);

@@ -27,6 +27,16 @@
 
 #define TCG_TARGET_INSN_UNIT_SIZE  1
 
+/*
+ * The i386/x86_64 backend honours CF_FORCE_SLOW: on a spec-mode TB it emits an
+ * unconditional jump to the slow path for inline qemu_ld/qemu_st, keeping
+ * speculative stores out of real guest RAM (see the CF_FORCE_SLOW handling in
+ * tcg-target.c.inc).  This is what lets the plugin's wrong-path simulator run
+ * safely; other backends do not implement it, so wrong-path tracing is gated
+ * on this capability.
+ */
+#define TCG_TARGET_HAS_SPEC_FORCE_SLOW 1
+
 #ifdef __x86_64__
 # define TCG_TARGET_NB_REGS   32
 # define MAX_CODE_GEN_BUFFER_SIZE  (2 * GiB)

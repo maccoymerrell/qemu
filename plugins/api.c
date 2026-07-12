@@ -39,6 +39,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/plugin.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
 #include "tcg/tcg.h"
 #include "accel/tcg/cpu-ops.h"
 #include "hw/core/cpu.h"
@@ -746,6 +747,32 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
 {
     g_assert(current_cpu);
     g_assert(!current_cpu->plugin_spec_mode);
+
+    /*
+     * Fail-safe host-capability guard.  Wrong-path tracing routes speculative
+     * inline stores through the slow-path do_st helpers via CF_FORCE_SLOW so
+     * they land in the spec store sandbox instead of real guest RAM.  Only
+     * host TCG backends that honour CF_FORCE_SLOW (currently x86/i386)
+     * implement that redirection for inline qemu_st; on any other host an
+     * inline TLB-hit speculative store would silently commit to guest memory.
+     * Refuse loudly at the first spec-mode request rather than corrupt guest
+     * RAM, and rather than silently disabling wrong-path tracing (which would
+     * leave the caller believing the speculative excursion ran).  On x86 the
+     * capability is a compile-time 1, so this collapses to a no-op.
+     *
+     * Terminate with _exit(): this fires from deep inside the plugin's WP
+     * excursion setup (locks held, a half-built speculative session), so the
+     * plugin's registered atexit dump must not run against that inconsistent
+     * state.  _exit() skips atexit handlers and stdio flush; error_report has
+     * already written the diagnostic to the unbuffered stderr.
+     */
+    if (!TCG_TARGET_HAS_SPEC_FORCE_SLOW) {
+        error_report("champsim_tracer wrong-path tracing requires a host TCG "
+                     "backend that honors CF_FORCE_SLOW (only x86/i386 hosts); "
+                     "on this host speculative stores would corrupt guest "
+                     "memory - refusing to enable.");
+        _exit(1);
+    }
 
     /* Slow-path memory routing is enforced by CF_FORCE_SLOW on
      * spec-mode TB cflags (see cpu_plugin_exec_inline /

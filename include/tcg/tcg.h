@@ -36,6 +36,23 @@
 #include "tcg/tcg-cond.h"
 #include "tcg/debug-assert.h"
 
+/*
+ * Speculative (wrong-path) memory containment capability of the host backend.
+ *
+ * The plugin wrong-path simulator routes speculative loads/stores through the
+ * slow-path do_ld/do_st helpers so they land in the spec store sandbox rather
+ * than real guest RAM.  For inline qemu_ld/qemu_st that redirection is driven
+ * by CF_FORCE_SLOW: on a spec-mode TB the host backend must jump
+ * unconditionally to the slow path instead of taking the inline TLB fast path.
+ * Only backends that implement that jump set TCG_TARGET_HAS_SPEC_FORCE_SLOW to
+ * 1 (see tcg/i386/tcg-target.c.inc); on every other host an inline TLB-hit
+ * speculative store would commit to guest memory, so wrong-path tracing must
+ * refuse to run (guarded in qemu_plugin_spec_mode_begin).
+ */
+#ifndef TCG_TARGET_HAS_SPEC_FORCE_SLOW
+#define TCG_TARGET_HAS_SPEC_FORCE_SLOW 0
+#endif
+
 /* XXX: make safe guess about sizes */
 #define MAX_OP_PER_INSTR 266
 

@@ -278,6 +278,17 @@ def _parse_args() -> argparse.Namespace:
                          "pair spreads and migrates across the -smp vCPUs; "
                          "the tracer must keep one guest-thread tid per "
                          "thread through migration.  Use with --smp >1.")
+    tt.add_argument("--migrate-churn", action="store_true",
+                    help="System mode, mipsel: FORCE a cross-vCPU migration. "
+                         "Implies --migrate but keeps the parent pinned to "
+                         "CPU 0 (stable marker/pin) and makes the child bounce "
+                         "between CPU 0 and CPU 1 via sched_setaffinity, so "
+                         "ONE guest-thread tid is executed on two vCPUs. The "
+                         "yield-only --migrate regime lets each thread settle "
+                         "on its own vCPU (a balanced -smp 2 runqueue never "
+                         "rebalances), so it reports ambiguous-split; this "
+                         "forces the migration the decoupling proof needs. "
+                         "Use with --smp 2.")
     tt.add_argument("--seeds", type=int, default=1,
                     help="Repeat the traced run this many times (varied "
                          "scheduling entropy) and require the guest-thread "
@@ -743,7 +754,8 @@ def cmd_thread_test(args) -> int:
     # sched_yield on every ISA + no mipsel affinity confinement, so the
     # clone pair spreads/migrates across the -smp vCPUs.  The tracer must
     # keep ONE guest-thread tid per thread through migration and time-slice.
-    migrate = system and getattr(args, "migrate", False)
+    churn = system and getattr(args, "migrate_churn", False)
+    migrate = (system and getattr(args, "migrate", False)) or churn
     iters = args.iters if args.iters is not None else \
         (300_000 if system else 1000)
     rc_total = 0
@@ -759,7 +771,8 @@ def cmd_thread_test(args) -> int:
         try:
             s_path.write_text(thread_test_asm(isa, marker=system,
                                               iters=iters,
-                                              migrate=migrate))
+                                              migrate=migrate,
+                                              affinity_churn=churn))
         except KeyError:
             print(f"thread_test[{isa}]: SKIP  no template available")
             continue
@@ -812,7 +825,8 @@ def cmd_thread_test(args) -> int:
                 continue
             report = V.validate_structural(
                 cst_path, expected_threads=2,
-                expected_guest_threads=2, marker=True)
+                expected_guest_threads=2, marker=True,
+                expect_migration=churn)
             chains = next((int((i.detail or {}).get("chains", 0))
                            for i in report.issues
                            if i.check == "thread_chain"

@@ -4993,7 +4993,8 @@ def _check_syscall_fault_nesting(entries: list[dict],
                                  templates_by_id: dict,
                                  trace_meta: dict,
                                  require_nested: bool = False,
-                                 guest_threads: int = 1
+                                 guest_threads: int = 1,
+                                 expect_migration: bool = False
                                  ) -> list[Issue]:
     """Nested-excursion discipline: a synchronous fault taken *inside* a
     syscall handler.
@@ -5013,7 +5014,16 @@ def _check_syscall_fault_nesting(entries: list[dict],
         the vCPU's raw baselined depth, and a preemptible kernel that
         context-switches inside a blocking fault handler puts another
         thread's clamped user entries right next to raw-depth kernel
-        entries — a legitimate discontinuity at the boundary,
+        entries — a legitimate discontinuity at the boundary.  With
+        @expect_migration (the cross-vCPU migration test) one guest tid
+        is executed on more than one vCPU, and the fault stack is a
+        per-vCPU object: the SAME tid's consecutive kernel entries can
+        straddle two vCPUs' baselines at the migration boundary, which
+        the wire deliberately hides (thread_id carries no vCPU).  That
+        kernel->kernel step is therefore exempted too — the per-vCPU
+        stack discipline is unverifiable from a vCPU-blind wire once a
+        tid migrates mid-kernel; the user-level clamp and the
+        non-migrating threads stay strict,
       * fault-anchored (whole-BB-merged) entries sit at the unwind of
         an excursion: the same tid was at a *higher* depth on the
         previous entry, or the anchor marks the merged completion of
@@ -5051,7 +5061,12 @@ def _check_syscall_fault_nesting(entries: list[dict],
         is_sys = bool(t.get("is_system"))
         pd = prev_depth_by_tid.get(tid)
         ps = prev_sys_by_tid.get(tid)
-        exempt = (guest_threads > 1 and ps is not None and ps != is_sys)
+        # Privilege-boundary discontinuity (multi-thread, always) and the
+        # per-vCPU-baseline discontinuity a migrated tid carries across a
+        # kernel->kernel vCPU boundary (migration test only).
+        exempt = (guest_threads > 1 and ps is not None
+                  and (ps != is_sys
+                       or (expect_migration and ps and is_sys)))
         if pd is not None and abs(d - pd) > 1 and not exempt:
             step_errors += 1
             if step_errors <= 5:
@@ -6257,7 +6272,8 @@ def validate_structural(trace_path: Path,
                         expected_threads: int = 1,
                         expected_guest_threads: int | None = None,
                         marker: bool = False,
-                        pinned_binary: Path | None = None) -> Report:
+                        pinned_binary: Path | None = None,
+                        expect_migration: bool = False) -> Report:
     """Decode @trace_path and run only the checks that don't depend on
     the generator's meta.json (correct_path, blocks, wrong_paths).
 
@@ -6318,7 +6334,8 @@ def validate_structural(trace_path: Path,
                                           trace_meta)
         issues += _check_syscall_fault_nesting(
             entries, templates_by_id, trace_meta,
-            guest_threads=expected_guest_threads or 1)
+            guest_threads=expected_guest_threads or 1,
+            expect_migration=expect_migration)
     if pinned_binary is not None:
         issues += _check_user_code_identity(templates, entries,
                                             templates_by_id,

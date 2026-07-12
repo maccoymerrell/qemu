@@ -262,7 +262,7 @@ shared_counter:    .word 0
                    .word 0
 child_tid:         .word 1
 cpu0_mask:         .word 1
-{extra_data}
+{churn_data}{extra_data}
 .section .bss
 .align 16
 child_stack_buf:   .space 65536
@@ -381,6 +381,59 @@ _MIPSEL_LOOP_YIELD = r"""    andi $t7, $t1, 0xfff
     move $t1, $s1
     bnez $t1, {loop_label}
     nop
+"""
+
+# mipsel guest-side cross-vCPU MIGRATION forcing (--migrate-churn).  The
+# yield-only migrate regime lets each guest thread settle on its own vCPU and
+# stay there (2 threads on -smp 2 is a balanced runqueue the scheduler never
+# rebalances), so the wire shows one tid per vCPU — decoupling the run cannot
+# distinguish from thread_id==vCPU.  To WITNESS a tid spanning vCPUs, the
+# child deterministically bounces itself between guest CPU 0 and CPU 1 with
+# sched_setaffinity every 4096 RMW iterations; the parent stays pinned to
+# CPU 0 (its affinity_pin is kept in churn mode) and fires the marker there,
+# so the pin is CPU 0's ASID for the shared mm.  On MIPS EntryHi.ASID is
+# per-CPU, but a freshly booted minimal guest tends to hand the shared mm the
+# same low ASID on both CPUs (empirically the child's CPU-1 execution matches
+# the CPU-0 pin), so the churned child is traced on BOTH vCPUs under ONE tid
+# — a genuine migration witness.  The block runs BEFORE the loop yield (which
+# owns the loop-back branch), guards itself with its own skip label, and
+# round-trips the loop cursor/counter through $s0/$s1 across the two syscalls
+# the MIPS ABI does not preserve $t across.  Errors (e.g. CPU 1 offline) are
+# ignored: the child simply stays put and the run degrades to ambiguous-split.
+_MIPSEL_CHILD_AFFINITY_CHURN = r"""    andi $t7, $t1, 0xfff
+    bnez $t7, .Lca_skip
+    nop
+    move $s0, $t0
+    move $s1, $t1
+    lui  $s2, %hi(aff_toggle)
+    addiu $s2, $s2, %lo(aff_toggle)
+    lw   $s3, 0($s2)
+    xori $s3, $s3, 1
+    sw   $s3, 0($s2)
+    beqz $s3, .Lca_cpu0
+    nop
+    lui  $a2, %hi(cpu1_mask)
+    addiu $a2, $a2, %lo(cpu1_mask)
+    b    .Lca_do
+    nop
+.Lca_cpu0:
+    lui  $a2, %hi(cpu0_mask)
+    addiu $a2, $a2, %lo(cpu0_mask)
+.Lca_do:
+    li   $v0, 4239
+    li   $a0, 0
+    li   $a1, 4
+    syscall
+    nop
+    move $t0, $s0
+    move $t1, $s1
+.Lca_skip:
+"""
+
+# Extra .data for the churn (cpu1 affinity mask + the alternating toggle).
+# Appended only in churn renders, so non-churn program bytes are unchanged.
+_MIPSEL_CHURN_DATA = r"""cpu1_mask:         .word 2
+aff_toggle:        .word 0
 """
 
 # ---------------------------------------------------------------------------
@@ -555,7 +608,8 @@ _START_WAIT = {
 
 
 def thread_test_asm(isa: str, marker: bool = False,
-                    iters: int = 1000, migrate: bool = False) -> str:
+                    iters: int = 1000, migrate: bool = False,
+                    affinity_churn: bool = False) -> str:
     """Render the 2-thread test program for @isa.
 
     @marker prepends the trace start marker at ``_start`` (followed by
@@ -578,7 +632,16 @@ def thread_test_asm(isa: str, marker: bool = False,
     thread across vCPUs — the tracer must keep one tid per guest thread
     through either.  Without @migrate, marker mode keeps the historical
     regime (mipsel confined + yielding, others free-running).
+
+    @affinity_churn (mipsel + marker only; implies @migrate) makes the
+    child DETERMINISTICALLY bounce between guest CPU 0 and CPU 1 via
+    sched_setaffinity while the parent stays pinned to CPU 0 and fires the
+    marker there.  The child's single tid is then executed on two vCPUs, so
+    the tracer's per-CPU-independent guest-thread identity witnesses a real
+    cross-vCPU migration under ONE tid (the yield-only regime never forces a
+    thread across vCPUs on a balanced -smp 2 runqueue).  A no-op off mipsel.
     """
+    affinity_churn = affinity_churn and marker and isa == "mipsel"
     if isa not in _THREAD_TEST_TEMPLATE:
         raise KeyError(f"no thread-test template for ISA {isa!r}")
     mk = ""
@@ -605,10 +668,17 @@ def thread_test_asm(isa: str, marker: bool = False,
     if want_yield:
         child_yield = _LOOP_YIELD[isa].format(loop_label=".Lchild_loop")
         parent_yield = _LOOP_YIELD[isa].format(loop_label=".Lparent_loop")
-    # Affinity confinement is the non-migration mipsel regime; a migration
-    # run must let the pair spread, so it is dropped there.
-    if marker and isa == "mipsel" and not migrate:
+    # Affinity confinement is the non-migration mipsel regime; a plain
+    # migration run must let the pair spread, so it is dropped there.  In
+    # @affinity_churn mode the pin is KEPT (the parent stays on CPU 0 so the
+    # pin is stable) and the child's churn block is prepended to its loop
+    # yield, so the child alternates CPU 0 / CPU 1 under one tid.
+    churn_data = ""
+    if marker and isa == "mipsel" and (affinity_churn or not migrate):
         aff_pin = _MIPSEL_AFFINITY_PIN
+    if affinity_churn:
+        child_yield = _MIPSEL_CHILD_AFFINITY_CHURN + child_yield
+        churn_data = _MIPSEL_CHURN_DATA
 
     # SMP start barrier: all system/marker renders (see _START_DATA).
     # It guarantees both threads are runnable before the window fills, so
@@ -628,7 +698,7 @@ def thread_test_asm(isa: str, marker: bool = False,
         clone_flags_hi=f"0x{(clone_flags >> 16) & 0xffff:x}",
         child_tls=child_tls,
         affinity_pin=aff_pin,
-        extra_data=extra_data,
+        extra_data=extra_data, churn_data=churn_data,
         start_signal=start_signal, start_wait=start_wait,
         child_yield=child_yield, parent_yield=parent_yield)
 

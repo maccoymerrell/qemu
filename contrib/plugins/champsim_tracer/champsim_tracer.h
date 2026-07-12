@@ -182,11 +182,20 @@ extern "C" {
 
 /* WP event flags byte */
 #define CST_WP_EVENT_TRANSLATION_UNAVAIL (1u << 0)
+/* This wrong-path BB contains a SYNTHETIC-DATA FAULT at fault_insn_index: a
+ * speculative memory access to an absent/unreadable page that was served a
+ * deterministic placeholder value (plugin_spec_garbage_fill) rather than real
+ * memory.  On a mispredicted path no instruction retires, so such a back-end
+ * fault is never taken by a real core; the excursion CONTINUES past it (memory
+ * faults) or STOPS cleanly at this block (the interim graceful-stop for
+ * non-memory synchronous faults — arithmetic / illegal-opcode — pending the
+ * arithmetic pass).  See champsim_tracer_format.md §4.4. */
 #define CST_WP_EVENT_FAULT               (1u << 1)
-/* The excursion terminated AT this block because its terminating branch
- * depends (transitively, through registers) on a faulted wrong-path
- * instruction whose result never materialized.  Always the last block
- * of its chain.  See champsim_tracer_format.md §4.4. */
+/* DEPRECATED / RETIRED (bit 2 reserved, never emitted): formerly marked an
+ * excursion terminated at a branch dependent on a faulted wrong-path insn
+ * (the poison + dep-branch-kill policy).  That policy is retired — wrong-path
+ * memory faults now continue on synthetic data instead of squashing at the
+ * first dependent branch.  Kept defined for decoder back-compat only. */
 #define CST_WP_EVENT_DEP_BRANCH_KILL     (1u << 2)
 
 /* Header feature flags.  MEM_DATA / REG_DATA advise which optional
@@ -1023,6 +1032,11 @@ typedef struct {
     bool is_store;
     uint8_t data_size;
     CSTWideValue data;
+    /* This wrong-path access landed on an absent/unreadable page and was
+     * served a deterministic placeholder value (never real memory).  Set from
+     * the per-CPU qemu_plugin_spec_mem_faulted_take() flag; the walker marks
+     * the owning WP BB entry as a synthetic-data fault at this insn. */
+    bool faulted = false;
 } WPMemAccess;
 
 typedef struct BodyStreamState BodyStreamState;
@@ -1159,16 +1173,18 @@ struct TraceFeatures {
      * kernel-privilege depth machinery — decoupled from the wrong-path
      * fault-poisoning policy below, which runs in BOTH modes. */
     bool     fault_depth_trailer = false;
-    /* Wrong-path fault-POISONING policy: when set, a speculative access that
-     * faults out of the excursion (tb_ok=false) poisons the faulting insn's
-     * destination register(s); a downstream branch that reads a poisoned
-     * source is unresolvable, so the excursion is squashed at that branch
-     * (its sealed WP entry carries CST_WP_EVENT_DEP_BRANCH_KILL).  ON
-     * whenever wrong-path simulation runs — system AND user mode alike, now
-     * that user-mode bad speculative loads signal a fault (accel/tcg/
-     * user-exec.c spec_load_bytes_user) exactly as the softmmu path does.
-     * CST_NO_FAULT clears it for A/B measurement of the policy's effect. */
-    bool     wp_fault_poison = false;
+    /* Wrong-path SYNTHETIC-FAULT marking policy: when set, a speculative
+     * memory access to an absent/unreadable page — served a deterministic
+     * placeholder value instead of real memory (accel/tcg garbage-fill seam) —
+     * marks its owning WP BB entry with CST_WP_EVENT_FAULT at the faulting
+     * insn.  The excursion CONTINUES on the placeholder (no truncation, no
+     * poison): on a mispredicted path no instruction retires, so the fault is
+     * never taken by a real core.  A non-memory synchronous fault (arithmetic
+     * / illegal opcode) still stops the excursion cleanly at its marked BB
+     * (interim, pending the arithmetic pass).  ON whenever wrong-path
+     * simulation runs — system AND user mode alike.  CST_NO_FAULT clears it
+     * for A/B: accesses still run on garbage, but the fault is not marked. */
+    bool     wp_synthetic_marking = false;
     /* Kernel-excursion ownership (kexc=1): attribute kernel (priv!=0) TBs
      * by the owning excursion's entry ASID — tracked through ASID-write
      * path events — instead of by the live ASID, so PTI-style kernel

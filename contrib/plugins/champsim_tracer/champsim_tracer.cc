@@ -4677,7 +4677,7 @@ static void append_stats_summary(GString *report, const char *label,
         { "WP total instructions",               stats.wp_total_insns },
         { "WP total memory accesses",            stats.wp_total_mem_accesses },
         { "WP early exits (fault)",              stats.wp_early_exits },
-        { "WP dep-branch kills",                 stats.wp_dep_branch_kills },
+        { "WP synthetic faults",                 stats.wp_synthetic_faults },
         { "WP flush re-runs",                    stats.wp_flush_reruns },
         { "WP first-TB unavailable",             stats.wp_first_tb_unavail },
         { "Unknown-instruction warnings",        stats.unknown_insn_warnings },
@@ -5163,14 +5163,15 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      *      simpoint qualifies too.  The per-entry trailer depth-tags handler
      *      code there; user-mode windows leave it off and emit no trailer.
      *
-     *  (b) The wrong-path fault-POISONING policy (poison + dep-branch-kill).
-     *      This models a real CPU squashing a speculative path once a
-     *      faulting load's result reaches a branch, so it must run whenever
-     *      wrong-path simulation runs — system AND user mode alike.  It used
-     *      to ride flag (a) and so was silently system-only; user-mode bad
-     *      speculative loads absorbed the fault as zeros and never poisoned.
+     *  (b) The wrong-path SYNTHETIC-FAULT marking policy.  A speculative
+     *      memory access to an absent/unreadable page runs on a deterministic
+     *      placeholder value and CONTINUES (a mispredicted-path fault is never
+     *      taken by a real core); when set, the faulting insn's WP BB entry is
+     *      marked CST_WP_EVENT_FAULT.  It must run whenever wrong-path
+     *      simulation runs — system AND user mode alike.
      *
-     * CST_NO_FAULT disables BOTH for A/B measurement.
+     * CST_NO_FAULT disables BOTH for A/B measurement (accesses still run on
+     * garbage, but the synthetic fault is not marked).
      */
     g_system_mode = info->system_emulation;
     const bool fault_env_ok = getenv("CST_NO_FAULT") == nullptr;
@@ -5178,7 +5179,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         (g_window_mode == PluginConfig::WIN_MARKER ||
          pinned_simpoint_mode()) &&
         fault_env_ok;
-    g_features.wp_fault_poison = enable_wrong_path && fault_env_ok;
+    g_features.wp_synthetic_marking = enable_wrong_path && fault_env_ok;
 
     /* Kernel-excursion ownership rides the marker-mode ASID pin (the
      * ownership rule replaces the live-ASID test for kernel TBs of the

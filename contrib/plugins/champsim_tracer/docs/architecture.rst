@@ -985,14 +985,20 @@ operation):
         next BB with the next fragment's ``start_pc``.  A single
         ``exec_tb`` can therefore commit multiple BBs (one per
         mid-TB branch the splitter found).
-    f.  If a fragment faulted on a non-branch insn, mark
-        ``bb_has_fault`` / ``bb_first_fault_idx`` (first fault wins),
-        poison the faulting PC against re-faults (excursion-locally),
-        set the next PC to ``fault_pc + last_insn_size``, and
-        continue the outer iteration.  Faults on a ``BARE_BRANCH``
-        fragment do *not* force-commit (the delay slot is in a
-        different TB and never landed) — they take the
-        skip-past-and-retry branch.
+    f.  A speculative **memory** fault never reaches here: the
+        load/store seam serves a deterministic placeholder value and
+        returns, so the fragment runs to completion (``tb_ok`` stays
+        true).  The memop drain marks ``bb_has_fault`` /
+        ``bb_first_fault_idx`` at the placeholder-served instruction
+        (first fault wins) and the excursion continues.  A **non-memory**
+        synchronous fault (arithmetic / illegal-opcode) still longjmps
+        out of spec mode; the walk marks that BB the same way, runs it
+        out to its natural branch (avoiding a partial, template-polluting
+        commit), and then ends the excursion cleanly at that block —
+        the interim graceful stop, pending a value model for the
+        faulting result.  Faults on a ``BARE_BRANCH`` fragment do *not*
+        force-commit (the delay slot is in a different TB and never
+        landed) — they drop the in-flight accumulator and end.
 
 3.  ``qemu_plugin_spec_mode_end`` + ``qemu_plugin_cpu_state_restore``
     +  scoreboard restore.
@@ -1013,41 +1019,30 @@ its own wire semantics.  Consumers should treat them differently:
   in-flight BB has sealed.  The clean, unmarked end: the chain is
   exactly the speculative window a ``wpdepth``-deep frontend would
   fetch, and the consumer simply stops replaying at its end.
-* **Fault.**  A speculative fault on a non-branch instruction does
-  *not* end the BB — the walk proceeds around the fault to the
-  natural branch end, preserving the BBs-end-in-a-branch invariant —
-  and the sealed :class:`WPBBEntry` carries ``fault`` plus
-  ``fault_insn_index`` so the consumer can prevent that instruction's
-  execution on the wrong path.  The walk resumes with the
-  *accumulated* wrong-path state: the fault unwind
-  (``cpu_loop_exit_restore`` → ``restore_state_to_opc``) re-syncs the
-  register file to the faulting instruction's boundary, so every
-  pre-fault instruction's effects are in place and only the faulted
-  instruction's destination is unfulfilled.  The speculative session
-  (sandboxed store buffer, spec-TLB log) stays live across the skip.
-  Instructions not data-dependent on the fault then proceed exactly
-  as they normally would.  The faulted destination registers are
-  *poisoned* and the poison propagates transitively through register
-  dataflow (an all-clean-source write cleans its destinations; the
-  integer-flags register is modeled); when the wrong path reaches a
-  branch whose sources are poisoned, its outcome is unresolvable and
-  the excursion **dies on that branch**: the BB it terminates seals
-  as the chain's last entry, marked ``CST_WP_EVENT_DEP_BRANCH_KILL``
-  on the wire.  Branches independent of the fault resolve normally
-  and the chain continues.  The **consumer contract** for the fault
-  itself is simple: a faulting instruction never commits its
-  architectural effect — a store that faults performs no write — and
-  the wire marks it (``CST_WP_EVENT_FAULT`` at its ``fault_insn_index``),
-  so the consumer squashes that instruction and anything that would
-  forward from it.  What the *plugin* tracks is register-granularity
-  poison; it does not propagate poison **through memory** — a
-  *successful* store of an already-poisoned value, reloaded later,
-  is not re-poisoned on the load.  This is a conservative
-  under-poison on the wrong path (whose control flow has already
-  died at the first dependent branch), not a missed fault.  A
-  faulting syscall-type branch seals its BB and the post-PC
-  poisoning ends the chain; speculative state past a syscall is not
-  modeled.
+* **Synthetic-data fault.**  On a mispredicted path no instruction
+  ever retires, so a back-end synchronous fault a speculative
+  instruction would raise is never actually taken by a real core — the
+  branch-mispredict squash kills the path before commit.  The tracer
+  models this instead of truncating.  A speculative **memory** access
+  to an absent/unreadable page is served a deterministic pseudo-random
+  placeholder value (keyed on the guest address, so the same bad
+  address always reads the same bytes and adjacent bytes are
+  decorrelated), the sealed :class:`WPBBEntry` is marked ``fault`` plus
+  ``fault_insn_index`` at that instruction (``CST_WP_EVENT_FAULT`` on
+  the wire), and the excursion **continues** on the placeholder to the
+  depth budget.  Everything downstream of the marked instruction is
+  synthetic; the **consumer contract** is that the marked instruction's
+  result — and anything derived from it — is speculative filler that
+  never architecturally retires.  This holds symmetrically in user and
+  system mode, and covers loads and atomics; a wrong-path store to an
+  absent page is sandboxed rather than faulting, exactly as a
+  present-page speculative store is.  A **non-memory** synchronous
+  fault (arithmetic / illegal-opcode) still longjmps out of spec mode;
+  it is marked the same way but — pending a value model for its result
+  — ends the chain cleanly at its marked block (the block runs out to
+  its natural branch first, so no partial template is committed).  Such
+  a block is the chain's last, distinguished from a memory fault only
+  by being terminal.
 * **Translation unavailable, mid-chain.**  The *next* wrong-path
   target could not be fetched or translated — un-resident code under
   demand paging is the architectural case.  The last completed

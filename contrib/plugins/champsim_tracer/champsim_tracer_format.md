@@ -1074,10 +1074,9 @@ the start of the chain and discarded at the end of the entry.
 
 Events annotate the entry's wrong-path chain: an event whose resolved
 index addresses a chain position identifies a wrong-path block that
-faulted, could not be translated, or terminated the excursion at a
-fault-dependent branch; an event whose resolved index lies past the
-chain is chain-level and describes the unrealized first target of the
-wrong path itself (see below).
+contains a synthetic-data fault or could not be translated; an event
+whose resolved index lies past the chain is chain-level and describes
+the unrealized first target of the wrong path itself (see below).
 
 ```
 wp_events_section payload:
@@ -1094,30 +1093,34 @@ wp_events_section payload:
 `prev_index` starts at -1. `fault_insn_index` is the 0-based index of
 the faulting instruction within that wrong-path block.
 
-`CST_WP_EVENT_FAULT` marks a wrong-path instruction whose synchronous
-exception was suppressed (a speculative access must not fault the
-guest): the instruction's result never materializes and consumers
-prevent its execution on the wrong path.  Execution proceeds around
-the fault — instructions not data-dependent on it run exactly as they
-normally would, with the accumulated wrong-path register state.
+`CST_WP_EVENT_FAULT` marks a wrong-path block that contains a
+**synthetic-data fault** at `fault_insn_index`.  On a mispredicted path
+no instruction ever retires, so a back-end synchronous fault a
+speculative instruction would raise is never actually taken by a real
+core — the branch-mispredict squash kills the path before commit.  The
+tracer models this rather than truncating: a speculative memory access
+to an absent/unreadable page is served a deterministic pseudo-random
+placeholder value (keyed on the guest address, so the same bad address
+always reads the same bytes), the instruction is marked here, and the
+excursion **continues** on that placeholder to the `wpdepth` budget.
+Everything downstream of the marked instruction is therefore synthetic;
+a consumer treats the marked instruction's result — and any value
+derived from it — as speculative filler that never architecturally
+retires.  Only a **front-end** fault (translation-unavailable, below)
+stops the excursion.  A non-memory synchronous fault (arithmetic /
+illegal-opcode) is also marked here, but — pending a value model for its
+result — it currently ends the chain cleanly at its marked block rather
+than continuing; such a block is the chain's last, distinguished from a
+memory fault only by being terminal.
 
-`CST_WP_EVENT_DEP_BRANCH_KILL` marks the block at which the excursion
-died because its terminating branch depends, transitively through
-registers, on a faulted instruction's never-materialized result: the
-branch outcome is unresolvable, so fetch past it is unknowable and the
-chain ends there.  The bit only appears on a chain's LAST block, and
-only in chains that also carry a `CST_WP_EVENT_FAULT` at or before it.
-Dependence is tracked at register granularity (the ISA's integer-flags
-register included).  A faulting instruction itself never commits its
-effect — a faulted store performs no write — and carries
-`CST_WP_EVENT_FAULT` at its `fault_insn_index`, so a consumer squashes
-it and its forwards directly; that is the fault contract.  What is not
-tracked is poison *through memory*: a successful store of an
-already-poisoned register value, reloaded later, is not re-poisoned on
-the load (a conservative under-poison on a wrong path whose control
-flow has already died at the first dependent branch).  Traces written
-before this bit existed do not list `CST_WP_EVENT_DEP_BRANCH_KILL` in
-their `wp_event_flag` encoding map; readers resolve it optionally.
+Bit 2 of `ev_flags` is **reserved** and never set.  It formerly carried
+`CST_WP_EVENT_DEP_BRANCH_KILL`, a terminator emitted when a fault
+poisoned a register whose value a later branch consumed; that policy is
+retired now that wrong-path faults continue on synthetic data instead of
+squashing at the first dependent branch.  Traces written before the bit
+was retired may list `CST_WP_EVENT_DEP_BRANCH_KILL` in their
+`wp_event_flag` encoding map; readers resolve it optionally and treat it
+as an excursion terminator on the block it addresses.
 
 The event index space extends one convention beyond the chain: a
 resolved index `>= num_wp` does not address any encoded wrong-path

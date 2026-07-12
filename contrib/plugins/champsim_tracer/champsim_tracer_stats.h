@@ -47,12 +47,11 @@ struct Stats {
      * genuinely unmapped in the current address space; a nonzero count on
      * a workload whose targets are resident indicates a bug. */
     uint64_t wp_first_tb_unavail = 0;
-    /* Excursions terminated at a branch whose sources depend
-     * (transitively, through registers) on a faulted wrong-path insn:
-     * the branch outcome is unresolvable, so the chain dies there with
-     * CST_WP_EVENT_DEP_BRANCH_KILL on its last entry.  A policy-correct
-     * terminator, counted separately from wp_early_exits. */
-    uint64_t wp_dep_branch_kills = 0;
+    /* Wrong-path BBs marked with a SYNTHETIC-DATA fault: a speculative memory
+     * access to an absent/unreadable page served a deterministic placeholder
+     * value, or a non-memory synchronous fault (arithmetic / illegal opcode)
+     * stopped the excursion cleanly.  Emitted as CST_WP_EVENT_FAULT. */
+    uint64_t wp_synthetic_faults = 0;
     uint64_t wp_total_mem_accesses = 0;
 
     /* Correct-path memops observed by the per-thread mem callback.

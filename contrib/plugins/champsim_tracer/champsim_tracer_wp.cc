@@ -56,13 +56,14 @@ struct WpAccum {
      * uop speculation would actually squash on. */
     bool        bb_has_fault     = false;
     uint32_t    bb_first_fault_idx = 0;
-    /* The BB's terminating branch reads a register poisoned by a faulted
-     * wrong-path insn (transitively): the branch outcome is unresolvable,
-     * so the excursion dies AT this BB once it seals.  Set by the poison
-     * propagation in the fragment walk; consumed at commit, where the
-     * sealed entry is marked CST_WP_EVENT_DEP_BRANCH_KILL and the walk
-     * ends. */
-    bool        bb_kill_branch   = false;
+    /* A NON-MEMORY synchronous fault (arithmetic / illegal opcode) longjmped
+     * out of spec mode inside this BB.  Unlike a memory fault — which now runs
+     * on a deterministic placeholder and continues — we have no substitute
+     * value, so the excursion STOPS cleanly once this BB seals (the interim
+     * graceful-stop pending the arithmetic pass).  Set in the tb_ok=false
+     * fault path; consumed at commit to end the walk.  Memory faults set
+     * bb_has_fault but NOT this. */
+    bool        bb_fault_stop    = false;
 
     /* Reset per-BB state.  bb_reg_snaps is intentionally NOT cleared here:
      * its lifecycle is caller-managed (cleared after a no-template drop,
@@ -79,7 +80,7 @@ struct WpAccum {
         bb_symbol_name = nullptr;
         bb_has_fault = false;
         bb_first_fault_idx = 0;
-        bb_kill_branch = false;
+        bb_fault_stop = false;
     }
 
     /* Build a WPBBEntry from the current accumulator, moving bb_dyn_params /
@@ -95,7 +96,7 @@ struct WpAccum {
         e.n_insns_executed = (uint32_t)bb_pcs.size();
         e.fault = fault;
         e.translation_unavailable = false;
-        e.dep_branch_kill = bb_kill_branch;
+        e.dep_branch_kill = false;   /* retired: poison/dep-branch-kill removed */
         e.fault_insn_index = fault_insn_index;
         e.tmpl = bb_tmpl;
         if (g_features.reg_data) {
@@ -328,27 +329,14 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     std::vector<WPBBEntry> wp_chain;
     wp_chain.reserve(initial_insn_cap);
     std::unordered_set<uint64_t> poisoned_targets;
-    /*
-     * Fault-dependence poison set (wrong-path fault policy): a faulted
-     * wrong-path insn's result never materializes, so its dst registers
-     * are poisoned; every retired insn propagates poison srcs->dsts, and
-     * an all-clean-src insn overwrites (cleans) its dsts.  A branch whose
-     * sources are poisoned is unresolvable — the excursion dies AT that
-     * branch (CST_WP_EVENT_DEP_BRANCH_KILL on the sealed entry).
-     * Independent insns and branches proceed exactly as they normally
-     * would.  Excursion-scoped: poison crosses BB boundaries until
-     * overwritten.  Register-channel only — poison carried through
-     * memory (a poisoned store forwarded to a later load) is not
-     * tracked.  writes_int_flags models the ISA's integer-flags register
-     * as an extra dst; a conditional branch with no explicit reg sources
-     * reads it (x86 jcc / aarch64 b.cc).
-     */
-    bool wp_poisoned_regs[REG_ID_COUNT] = {};
     uint64_t sim_insns = 0;
     bool early_exit = false;
-    /* Policy-correct termination at a fault-dependent branch (not an
-     * abnormal early exit): counted separately as wp_dep_branch_kills. */
-    bool dep_kill_exit = false;
+    /* A non-memory synchronous wrong-path fault (arithmetic / illegal opcode)
+     * committed its BB with the synthetic-fault marker and the excursion is
+     * ending cleanly at that block — the interim graceful-stop.  Distinct from
+     * early_exit (an abnormal drop): the chain so far is honest and terminated
+     * on a marked fault, not truncated. */
+    bool fault_stop = false;
     uint64_t last_fault_pc = UINT64_MAX;
     unsigned int repeated_fault_pc = 0;
     /* Set when the previously appended TB ended with a bare delay-
@@ -708,79 +696,16 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                          stats, hist);
 
             /*
-             * Fault-dependence poison propagation over the executed
-             * slice, in execution order (dedup-independent: a re-
-             * executed insn re-propagates identically).  The faulted
-             * insn — last of the slice when this fragment faulted —
-             * did NOT retire: its dsts become poisoned instead of
-             * propagated.  A retired branch whose sources are poisoned
-             * arms the dep-branch kill; the commit path below seals the
-             * BB it terminates and ends the excursion there.
-             *
-             * Gated on the wrong-path fault-poisoning policy: it fires in
-             * both system and user mode (any synchronous wrong-path fault
-             * — bad speculative load/store, div-by-zero, illegal opcode —
-             * reaches here via tb_ok=false).  CST_NO_FAULT clears the
-             * policy for A/B, leaving the fault detected and skipped but
-             * no register poisoned, so no branch is killed on it.  The
-             * excursion then runs to its depth/store budget exactly as it
-             * did before this policy existed.
+             * Wrong-path fault policy (retired poison/dep-branch-kill).  A
+             * back-end fault on a mispredicted path is never taken by a real
+             * core, so it no longer squashes the excursion at a dependent
+             * branch.  MEMORY faults never even reach here (the load/store
+             * seam garbage-fills and continues, tb_ok stays true; the memop
+             * drain above marks the BB synthetic).  Only a NON-memory
+             * synchronous fault — arithmetic / illegal opcode — still longjmps
+             * (tb_ok=false, cur_is_fault_fragment), and the fault block below
+             * marks it synthetic and stops the excursion cleanly.
              */
-            if (g_features.wp_fault_poison)
-            for (uint32_t pi = 0; pi < n_executed_in_cur; pi++) {
-                const InsnFields *pf = &cur->insn_fields[pi];
-                bool faulted_insn = cur_is_fault_fragment &&
-                                    pi == n_executed_in_cur - 1;
-                if (faulted_insn) {
-                    for (uint8_t d = 0; d < pf->n_dst_regs; d++) {
-                        uint8_t r = pf->dst_regs[d];
-                        if (r != REG_ZERO) {
-                            wp_poisoned_regs[r] = true;
-                        }
-                    }
-                    if (pf->writes_int_flags) {
-                        wp_poisoned_regs[REG_FLAGS] = true;
-                    }
-                    break;      /* last insn of the slice by definition */
-                }
-                bool src_poisoned = false;
-                for (uint8_t k = 0; k < pf->n_src_regs; k++) {
-                    if (wp_poisoned_regs[pf->src_regs[k]]) {
-                        src_poisoned = true;
-                        break;
-                    }
-                }
-                /* Flags-mediated conditionals (x86 jcc, aarch64 b.cc)
-                 * often carry no explicit reg sources; they read the
-                 * integer-flags register the poison model tracks via
-                 * writes_int_flags. */
-                if (!src_poisoned && pf->branch_type != BRANCH_NONE &&
-                    pf->branch_conditional && pf->n_src_regs == 0 &&
-                    wp_poisoned_regs[REG_FLAGS]) {
-                    src_poisoned = true;
-                }
-                if (src_poisoned && pf->branch_type != BRANCH_NONE) {
-                    acc.bb_kill_branch = true;
-                }
-                for (uint8_t d = 0; d < pf->n_dst_regs; d++) {
-                    uint8_t r = pf->dst_regs[d];
-                    if (r == REG_ZERO) {
-                        continue;
-                    }
-                    if (src_poisoned) {
-                        wp_poisoned_regs[r] = true;
-                    } else {
-                        wp_poisoned_regs[r] = false;
-                    }
-                }
-                if (pf->writes_int_flags) {
-                    if (src_poisoned) {
-                        wp_poisoned_regs[REG_FLAGS] = true;
-                    } else {
-                        wp_poisoned_regs[REG_FLAGS] = false;
-                    }
-                }
-            }
             uint8_t last_insn_size = n_executed_in_cur > 0
                 ? cur->insn_sizes[n_executed_in_cur - 1]
                 : 0;
@@ -836,6 +761,23 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                      * exec_tb; the loop iteration for THAT fragment
                      * will pick it up. */
                     continue;
+                }
+                /* Synthetic-data memory fault (new wrong-path policy): this
+                 * access hit an absent/unreadable page and ran on a
+                 * deterministic placeholder value.  Mark the owning WP BB
+                 * entry as faulted at this insn (the FIRST such insn is
+                 * sufficient — everything downstream is synthetic anyway) and
+                 * let the excursion CONTINUE.  wp_synthetic_marking gates the
+                 * marking for A/B (CST_NO_FAULT); the access still runs on
+                 * garbage either way. */
+                if (acc.faulted && g_features.wp_synthetic_marking &&
+                    !bb_has_fault) {
+                    bb_has_fault = true;
+                    bb_first_fault_idx = insn_idx;
+                    stats.wp_synthetic_faults++;
+                    if (hist) {
+                        hist->wp_synthetic_faults++;
+                    }
                 }
                 DynParam dp = {
                     .type = (uint8_t)(acc.is_store ? DYN_STORE_ADDR
@@ -895,12 +837,18 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             }
 
             if (cur_is_fault_fragment) {
-                /* Trace past the fault.  bb_pcs has insns 0..fault for
-                 * this fragment.  Mark fault metadata for the BB
-                 * committed at the natural branch end; if the faulting
-                 * insn IS the branch terminator (e.g. faulting
-                 * BRANCH_SYSCALL_TYPE), branch_fired catches it and
-                 * the normal commit path handles bb_has_fault. */
+                /* A NON-memory synchronous fault (arithmetic / illegal opcode)
+                 * longjmped out of spec mode inside this BB — memory faults no
+                 * longer reach here.  We have no substitute value for the
+                 * faulting insn's result, so this pass marks the BB synthetic
+                 * and STOPS the excursion cleanly once the BB seals (the
+                 * interim graceful-stop pending the arithmetic pass).  To avoid
+                 * committing a partial, template-polluting BB we still run out
+                 * the rest of the BB to its natural branch (skip-and-continue
+                 * below), then commit the full BB with the fault marker and end
+                 * the walk.  bb_pcs has insns 0..fault for this fragment; if the
+                 * faulting insn IS the branch terminator, branch_fired catches
+                 * it and the normal commit path handles bb_has_fault. */
                 uint64_t fault_pc = post_pc_now;
 
                 if (pre_pc == last_fault_pc) {
@@ -910,10 +858,22 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                     last_fault_pc = pre_pc;
                 }
 
-                if (!bb_has_fault) {
-                    bb_has_fault = true;
-                    bb_first_fault_idx = bb_pcs.empty()
-                        ? 0 : (uint32_t)(bb_pcs.size() - 1);
+                /* Mark + stop, gated for A/B: CST_NO_FAULT
+                 * (wp_synthetic_marking off) leaves the fault detected and
+                 * skipped but unmarked, and the excursion then runs to its
+                 * depth budget exactly as it did before this policy existed. */
+                if (g_features.wp_synthetic_marking) {
+                    if (!bb_has_fault) {
+                        bb_has_fault = true;
+                        bb_first_fault_idx = bb_pcs.empty()
+                            ? 0 : (uint32_t)(bb_pcs.size() - 1);
+                        stats.wp_synthetic_faults++;
+                        if (hist) {
+                            hist->wp_synthetic_faults++;
+                        }
+                    }
+                    /* Stop the excursion once this faulting BB seals. */
+                    acc.bb_fault_stop = true;
                 }
 
                 poisoned_targets.insert(fault_pc);
@@ -957,24 +917,17 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                         break;
                     }
                     /*
-                     * Proceed around the fault with the ACCUMULATED
-                     * wrong-path state.  The fault unwind
-                     * (cpu_loop_exit_restore -> restore_state_to_opc)
-                     * already re-synced the register file to the
-                     * faulting insn's boundary — every pre-fault insn's
-                     * effects are in place, only the faulted insn's dst
-                     * is stale (and now poisoned above).  The spec
-                     * session stays live: tearing it down here would
-                     * flush the sandboxed store buffer (losing
-                     * store-to-load forwarding for the rest of the
-                     * excursion) and revert the spec TLB installs;
-                     * restoring the fork snapshot would throw away all
-                     * legitimately-computed wrong-path values, making
-                     * every downstream branch resolve on stale fork
-                     * state.  Independent instructions proceed exactly
-                     * as they normally would; dependents are tracked by
-                     * the poison set and the first dependent branch
-                     * kills the excursion at the commit path.
+                     * Run out the rest of the BB around the faulting insn so
+                     * it seals at its natural branch (avoiding a partial,
+                     * template-polluting commit) — then the commit path stops
+                     * the excursion (acc.bb_fault_stop).  The fault unwind
+                     * (cpu_loop_exit_restore -> restore_state_to_opc) already
+                     * re-synced the register file to the faulting insn's
+                     * boundary; only the faulted insn's dst is stale, and the
+                     * BB is marked synthetic so the consumer knows the tail
+                     * runs on non-retiring state.  The spec session stays live
+                     * so the sandboxed store buffer and spec TLB installs
+                     * survive to the seal.
                      */
                     qemu_plugin_set_pc(skip_pc);
                     /* Skip the rest of this exec_tb's fragments and
@@ -1088,6 +1041,8 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                 }
             }
 
+            bool this_bb_fault_stop = acc.bb_fault_stop;
+
             wp_chain.push_back(acc.make_entry(bb_tmpl,
                                              bb_has_fault,
                                              bb_first_fault_idx));
@@ -1095,19 +1050,17 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             acc.clear();
 
             /*
-             * Dep-branch kill: this BB's terminating branch reads a
-             * register poisoned by a faulted wrong-path insn, so its
-             * outcome is unresolvable and any fetch past it is
-             * unknowable.  The excursion dies HERE; the entry just
-             * pushed carries CST_WP_EVENT_DEP_BRANCH_KILL as the
-             * explicit chain terminator.
+             * Graceful fault-stop: this BB sealed carrying a NON-memory
+             * synchronous fault (arithmetic / illegal opcode) that longjmped
+             * out of spec mode.  We have no substitute for the faulting insn's
+             * result, so the excursion ends cleanly HERE — the entry just
+             * pushed carries CST_WP_EVENT_FAULT at fault_insn_index as the
+             * explicit chain terminator.  (Memory faults, by contrast, run on a
+             * deterministic placeholder and do NOT set this — they continue.)
+             * The arithmetic pass will upgrade these to continue.
              */
-            if (wp_chain.back().dep_branch_kill) {
-                stats.wp_dep_branch_kills++;
-                if (hist) {
-                    hist->wp_dep_branch_kills++;
-                }
-                dep_kill_exit = true;
+            if (this_bb_fault_stop) {
+                fault_stop = true;
                 walk_done = true;
                 break;
             }
@@ -1132,7 +1085,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             early_exit = true;
             break;
         }
-        if (early_exit || dep_kill_exit) {
+        if (early_exit || fault_stop) {
             break;
         }
     }

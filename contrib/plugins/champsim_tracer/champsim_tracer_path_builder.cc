@@ -28,7 +28,7 @@
 #include "champsim_tracer_wp_thread_state.h"
 
 /* A/B env toggles for the fault machinery: CST_NO_FAULT kills the
- * feature upstream (g_features.fault_depth_trailer and wp_fault_poison),
+ * feature upstream (g_features.fault_depth_trailer and wp_synthetic_marking),
  * CST_NO_FAULT_MERGE keeps depth stamping but disables classification/
  * stash/completion, and CST_NO_FAULT_WP zeroes only the merged emit's
  * wrong-path target. */
@@ -936,8 +936,8 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
 {
     /* The depth-pipeline + kernel-handler fault merge is the system-only
      * DEPTH TRAILER machinery (fault_depth_trailer); it is orthogonal to the
-     * wrong-path fault-poisoning policy (wp_fault_poison), which lives in the
-     * WP walker and runs in user mode too. */
+     * wrong-path synthetic-fault marking policy (wp_synthetic_marking), which
+     * lives in the WP walker and runs in user mode too. */
     const bool fault_on = g_features.fault_depth_trailer;
 
     /* No previous context (first TB after install / after the segment-

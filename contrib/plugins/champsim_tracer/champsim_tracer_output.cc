@@ -460,7 +460,7 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         { CST_WP_EVENT_TRANSLATION_UNAVAIL,
           "CST_WP_EVENT_TRANSLATION_UNAVAIL" },
         { CST_WP_EVENT_FAULT, "CST_WP_EVENT_FAULT" },
-        { CST_WP_EVENT_DEP_BRANCH_KILL, "CST_WP_EVENT_DEP_BRANCH_KILL" },
+        /* CST_WP_EVENT_DEP_BRANCH_KILL (bit 2) retired — never emitted. */
     };
     static const EncodingMapEntry metaflags_entries[] = {
         { CST_METAFLAGS_Z, "CST_METAFLAGS_Z" },
@@ -2917,8 +2917,9 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
     }
     /* System-mode sync-fault trailer: each entry carries its
      * exception-nesting depth (+ anchor on a faulting BB).  This is the
-     * kernel-privilege depth machinery; the wrong-path fault-poisoning
-     * policy (wp_fault_poison) is independent and adds no trailer. */
+     * kernel-privilege depth machinery; the wrong-path synthetic-fault
+     * marking policy (wp_synthetic_marking) is independent and adds no
+     * trailer. */
     if (g_features.fault_depth_trailer) {
         flags |= CST_FLAG_FAULT;
     }
@@ -3131,8 +3132,7 @@ static void emit_body_record_payload(
         uint32_t num_events = chain_unavail ? 1 : 0;
         for (uint32_t w = 0; w < num_wp; w++) {
             const WPBBEntry *wp = &entry->wp_entries[w];
-            if (wp->fault || wp->translation_unavailable ||
-                wp->dep_branch_kill) {
+            if (wp->fault || wp->translation_unavailable) {
                 num_events++;
             }
         }
@@ -3145,8 +3145,7 @@ static void emit_body_record_payload(
         uint64_t ev_start = bw_tell_bytes(&sub);
         for (uint32_t w = 0; w < num_wp; w++) {
             const WPBBEntry *wp = &entry->wp_entries[w];
-            if (!wp->fault && !wp->translation_unavailable &&
-                !wp->dep_branch_kill) {
+            if (!wp->fault && !wp->translation_unavailable) {
                 continue;
             }
             bw_write_uleb128(&sub,
@@ -3157,9 +3156,6 @@ static void emit_body_record_payload(
             }
             if (wp->fault) {
                 evf |= CST_WP_EVENT_FAULT;
-            }
-            if (wp->dep_branch_kill) {
-                evf |= CST_WP_EVENT_DEP_BRANCH_KILL;
             }
             bw_write_u8(&sub, evf);
             if (wp->fault) {

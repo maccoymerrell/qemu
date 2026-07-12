@@ -131,6 +131,15 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
     };
     cst_wide_zero(&acc.data);
 
+    /* Synthetic-data fault tag: a wrong-path access to an absent/unreadable
+     * page was served a deterministic placeholder value (never real memory).
+     * The QEMU load/store path set the per-CPU sentinel for THIS access; the
+     * memory callback fires immediately after it, so take+clear the flag here
+     * and attribute it to this memop.  Only meaningful on the WP path (the
+     * sentinel is never set on the correct path); clearing it unconditionally
+     * keeps it from leaking. */
+    bool mem_faulted = qemu_plugin_spec_mem_faulted_take();
+
     /* CP path uses g_features.mem_data; WP path uses g_features.wp_mem_data
      * (already gated above to true if we reach here). */
     bool capture_data = wp.in_progress
@@ -140,6 +149,7 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
     }
 
     if (wp.in_progress) {
+        acc.faulted = mem_faulted;
         wp.mem_accesses.push_back(acc);
     } else {
         tls_cp_mem_accesses.push_back(acc);

@@ -217,6 +217,20 @@ bool cst_pc_is_poisoned(uint64_t pc)
 }
 
 /*
+ * Recursive: a TCG code-buffer flush during wrong-path simulation runs
+ * vcpu_tb_flush() synchronously (tb_gen_code -> qemu_plugin_flush_cb)
+ * while this same thread is already inside vcpu_tb_exec holding
+ * exec_lock.  A non-recursive mutex self-deadlocks there (seen on
+ * large-footprint workloads like gcc that fill the buffer mid-WP).
+ * exec_lock is never paired with a GCond, so recursion is safe.
+ *
+ * Defined up here (rather than beside data_lock) so the ASID-write hook
+ * — which runs off the per-TB path but ahead of this file's bulk — can
+ * take it to read the owned-ASID set (see g_owned / asid_write_track_cb).
+ */
+static GRecMutex exec_lock;
+
+/*
  * Address-space pin (marker mode).  When the marker fires we capture the
  * executing vCPU's ASID (x86 CR3 etc., via qemu_plugin_get_addr_space_id)
  * — the marker runs as one of the target's own instructions, so that ASID
@@ -228,6 +242,44 @@ bool cst_pc_is_poisoned(uint64_t pc)
  */
 static const uint64_t CST_ASID_UNPINNED = UINT64_MAX;
 static std::atomic<uint64_t> g_pinned_asid{CST_ASID_UNPINNED};
+
+/*
+ * Owned-ASID set (multi-ASID Stage B, wide-register targets).  The set of
+ * page-table roots (x86 CR3 / AArch64 TTBR / RISC-V SATP values, as
+ * reported by qemu_plugin_get_addr_space_id) currently INSIDE tracer
+ * vision — each process that ran the START marker and has not yet run its
+ * END marker.  A single-process trace is a set of one, so every legacy
+ * consumer behaves exactly as it did against the single pin.
+ *
+ * Generalizes the single g_pinned_asid gate: `g_pinned_asid` is retained
+ * as the FIRST/representative owned root (so the narrow-ASID MIPS path,
+ * pin_effective_asid, cst_pinned_asid_root/sig and the "marker mode armed"
+ * predicate keep working single-process), while the actual foreign-drop
+ * predicate (pin_user_tb_owned, wide-register) and the coarse-FF
+ * asid_match flag consult SET MEMBERSHIP here.
+ *
+ * Mutated only at marker START/END, under exec_lock (the marker callbacks
+ * already hold it around the segment open/close).  Read under exec_lock in
+ * pin_user_tb_owned (the caller holds it) and, off the per-TB path, in the
+ * ASID-write hook (which takes exec_lock for the read).  Kept consistent
+ * with the Stage-A index map: every root added here is also assigned a
+ * compact asid index + stored identity {root_phys, sig}.  The narrow-ASID
+ * (MIPS, g_pin_reuse_guard) path does NOT use this set — it keeps its
+ * dwell/verify machinery (Stage B3), so g_owned stays empty there.
+ */
+static std::unordered_set<uint64_t> &g_owned =
+    *new std::unordered_set<uint64_t>();
+
+/* Caller holds exec_lock.  Is @root a currently-owned address space? */
+static inline bool owned_contains_locked(uint64_t root)
+{
+    return g_owned.count(root) != 0;
+}
+
+/* Marker-window multi-process policy (PluginConfig::MarkerPolicy), set at
+ * install from trace_window=marker:policy=.  latch (default) is Stage B1;
+ * trace-all is the Stage B2 hook. */
+static int g_marker_policy = 0;   /* PluginConfig::MARKER_LATCH */
 
 /*
  * Translation-bypassing privilege level (see champsim_tracer.h).  The pin
@@ -1009,7 +1061,14 @@ static bool pin_user_tb_owned(unsigned int cpu_index, uint64_t live_asid,
                               uint64_t pinned_asid, uint64_t pc)
 {
     if (!g_pin_reuse_guard) {
-        return live_asid == pinned_asid;
+        /* Wide-register (x86 CR3 / AArch64 TTBR / RISC-V SATP): owned iff
+         * the live root is a member of the owned set.  Single-process is a
+         * set of one { pinned_asid }, so this is byte-identical to the
+         * former `live_asid == pinned_asid`; multi-process (Stage B1) traces
+         * every process whose window is open.  Caller holds exec_lock, which
+         * every mutation of g_owned also holds. */
+        (void)pinned_asid;
+        return owned_contains_locked(live_asid);
     }
     if (cpu_index >= CST_PIN_MAX_VCPUS) {
         return false;
@@ -1102,9 +1161,23 @@ static inline void refresh_ctx_gates(unsigned int cpu_index)
 static void asid_write_track_cb(unsigned int vcpu_index, uint64_t new_asid)
 {
     uint64_t pinned = g_pinned_asid.load(std::memory_order_relaxed);
-    qemu_plugin_u64_set(
-        g_scoreboard.asid_match, vcpu_index,
-        new_asid == pin_effective_asid(vcpu_index, pinned) ? 1 : 0);
+    uint64_t match;
+    if (g_pin_reuse_guard) {
+        /* Narrow-ASID (MIPS): the recycled EntryHi.ASID is compared against
+         * the vCPU's effective dwell tag, exactly as before (Stage B3 owns
+         * the narrow-ASID set generalization). */
+        match = new_asid == pin_effective_asid(vcpu_index, pinned) ? 1 : 0;
+    } else {
+        /* Wide-register: membership in the owned-ASID set.  Single-process
+         * is a set of one, so this is byte-identical to the former
+         * representative compare.  Off the per-TB hot path (fires per
+         * page-table-root write = per context switch), so taking exec_lock
+         * — the guard g_owned's mutations hold — is cheap and race-free. */
+        g_rec_mutex_lock(&exec_lock);
+        match = owned_contains_locked(new_asid) ? 1 : 0;
+        g_rec_mutex_unlock(&exec_lock);
+    }
+    qemu_plugin_u64_set(g_scoreboard.asid_match, vcpu_index, match);
     if (g_pin_reuse_guard && pinned != CST_ASID_UNPINNED) {
         if (vcpu_index < CST_PIN_MAX_VCPUS) {
             /* A committed ASID write ends the vCPU's verified dwell: the
@@ -1395,15 +1468,6 @@ static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
 /* ========================= Global state ========================= */
 
 GMutex data_lock;
-/*
- * Recursive: a TCG code-buffer flush during wrong-path simulation runs
- * vcpu_tb_flush() synchronously (tb_gen_code -> qemu_plugin_flush_cb)
- * while this same thread is already inside vcpu_tb_exec holding
- * exec_lock.  A non-recursive mutex self-deadlocks there (seen on
- * large-footprint workloads like gcc that fill the buffer mid-WP).
- * exec_lock is never paired with a GCond, so recursion is safe.
- */
-static GRecMutex exec_lock;
 
 
 /*
@@ -3915,6 +3979,99 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
     if (!marker_exec_step(&tls_marker_run, pc, size)) {
         return;                              /* run not complete yet */
     }
+    /* The marker is one of the target's own instructions, so the current
+     * ASID is the target's page-table root. */
+    uint64_t asid = qemu_plugin_get_addr_space_id();
+
+    /*
+     * Multi-process latch (Stage B1): wide-register WIN_MARKER.  Each
+     * process that runs the START marker OPENS ITS WINDOW — joins the
+     * owned set — and is traced concurrently; the first open starts the
+     * segment, later opens just widen the set.  Excludes the narrow-ASID
+     * (MIPS) path — its single-process dwell machinery is retained
+     * verbatim (Stage B3) — and the simpoint positioning path (single
+     * program by design); both keep the legacy one-shot below.
+     */
+    if (g_window_mode == PluginConfig::WIN_MARKER && !g_pin_reuse_guard) {
+        g_rec_mutex_lock(&exec_lock);
+        if (owned_contains_locked(asid)) {
+            /* This process already has an open window: the START marker is
+             * idempotent per address space (a re-run does not re-open). */
+            g_rec_mutex_unlock(&exec_lock);
+            return;
+        }
+        bool first_open = g_owned.empty();
+        g_owned.insert(asid);
+        if (first_open) {
+            /* First window: pin the representative root, seed its identity
+             * signature from the marker's own code page (@pc is this
+             * callback's own instruction address from udata, NOT
+             * qemu_plugin_get_pc() — the env PC is stale mid-TB), and open
+             * the segment exactly as the single-process path did. */
+            g_pinned_asid.store(asid, std::memory_order_relaxed);
+            pin_reuse_reset();
+            g_pin_repr_vpage = UINT64_MAX;
+            g_pin_repr_sig.store(0, std::memory_order_relaxed);
+            if (asid != 0) {
+                pin_repr_seed(pc);
+            }
+            /* B2 hook: policy=trace-all would begin tracing ALL contexts
+             * here rather than only the marker-emitting set.  Forced to
+             * latch at install for B1 (see g_marker_policy). */
+            if (!g_trace_segments.is_active() &&
+                !g_trace_segments.is_shutting_down()) {
+                uint64_t lo =
+                    qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
+                uint64_t span = simulation_insns ? simulation_insns : 1000000;
+                uint64_t hi = lo + span;
+                g_trace_segments.set_window(lo, hi);
+                user_count_reset(cpu_index, lo);
+                fprintf(stderr,
+                        "champsim_tracer: marker fired at icount %" PRIu64
+                        ", asid 0x%" PRIx64 " priv=%d (0=user,3=kernel) "
+                        "pc=0x%" PRIx64 " — tracing %" PRIu64 " insns\n",
+                        lo, asid, qemu_plugin_get_priv_level(),
+                        qemu_plugin_get_pc(), span);
+                start_trace_segment("marker", lo, hi, /* warmup= */ 0, span,
+                                    cpu_index, /* simpoint_weight= */ 0.0);
+            }
+            /* Assign this root's compact asid index (index 0) with its own
+             * marker-page signature.  Runs AFTER start_trace_segment (which
+             * resets the per-segment identity map) so the pre-registration
+             * survives; cst_pinned_asid_sig() is the repr sig just seeded,
+             * so this is byte-identical to letting the first emit assign it. */
+            asid_root_to_index(asid, cst_pinned_asid_sig());
+        } else {
+            /* Additional window while the segment is already open: no new
+             * segment.  Register this root's identity with ITS OWN
+             * marker-page signature (a per-process sig, not the
+             * representative's), and recompute this vCPU's gates so its TBs
+             * begin dispatching the heavy callback (pin_user_tb_owned now
+             * sees the live root as owned).  Other vCPUs running this root
+             * pick it up at their next ASID write via asid_write_track_cb. */
+            uint64_t sig = 0;
+            if (asid != 0) {
+                uint64_t s;
+                if (pin_page_sig(pc & PIN_PAGE_MASK, &s)) {
+                    sig = s;
+                }
+            }
+            asid_root_to_index(asid, sig);
+            qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
+            refresh_ctx_gates(cpu_index);
+            fprintf(stderr,
+                    "champsim_tracer: marker opened additional window for "
+                    "asid 0x%" PRIx64 " (%zu owned)\n", asid, g_owned.size());
+        }
+        g_rec_mutex_unlock(&exec_lock);
+        return;
+    }
+
+    /*
+     * Legacy single-pin path: pinned-simpoint positioning and the
+     * narrow-ASID (MIPS) marker window.  One process, one marker, one
+     * shot — byte-identical to the pre-Stage-B behavior.
+     */
     bool expected = false;
     if (!g_marker_fired.compare_exchange_strong(expected, true)) {
         return;                              /* one-shot */
@@ -3922,7 +4079,6 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
     /* Pin to the target's address space.  The marker is one of the
      * target's own instructions, so the current ASID is the target's; every
      * later TB in a different address space is filtered in vcpu_tb_exec. */
-    uint64_t asid = qemu_plugin_get_addr_space_id();
     g_pinned_asid.store(asid, std::memory_order_relaxed);
     pin_reuse_reset();
     /* Snapshot this pin's ASID identity (Phase 2): the root physical
@@ -3939,7 +4095,8 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
          * also seeds the representative and later refines it to the lowest
          * learned code vpage.  Existing behaviour (runs for user and system
          * mode); the representative it fills is used only when a real root
-         * is present (system mode). */
+         * is present (system mode).  g_owned stays empty on this path — the
+         * narrow-ASID set generalization is Stage B3. */
         g_rec_mutex_lock(&exec_lock);
         g_pin_repr_vpage = UINT64_MAX;
         g_pin_repr_sig.store(0, std::memory_order_relaxed);
@@ -3957,6 +4114,15 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
         g_pin_repr_vpage = UINT64_MAX;
         g_pin_repr_sig.store(0, std::memory_order_relaxed);
         pin_repr_seed(pc);
+        g_rec_mutex_unlock(&exec_lock);
+    }
+    /* Record the representative root in the owned set too, so the
+     * wide-register asid_match set-membership (asid_write_track_cb) is
+     * correct for a wide-register pinned simpoint (single-owned).  MIPS
+     * keeps its own dwell path and never reads the set. */
+    if (!g_pin_reuse_guard) {
+        g_rec_mutex_lock(&exec_lock);
+        g_owned.insert(asid);
         g_rec_mutex_unlock(&exec_lock);
     }
 
@@ -4068,6 +4234,65 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
     if (!marker_exec_step(&tls_marker_end_run, pc, size)) {
         return;
     }
+    uint64_t asid = qemu_plugin_get_addr_space_id();
+
+    /*
+     * Multi-process latch (Stage B1): wide-register WIN_MARKER.  The END
+     * marker CLOSES the emitting process's window (leaves the owned set).
+     * The segment closes only when the LAST window closes (the owned set
+     * empties); while other processes are still tracing, the ending
+     * process is dropped and the segment keeps running.  Symmetric with
+     * the START handler; excludes the narrow-ASID (MIPS) and simpoint
+     * paths, which keep the single-process exit below.
+     */
+    if (g_window_mode == PluginConfig::WIN_MARKER && !g_pin_reuse_guard) {
+        g_rec_mutex_lock(&exec_lock);
+        if (!owned_contains_locked(asid)) {
+            /* END from a process that never opened a window (or already
+             * closed it): not ours to act on. */
+            g_rec_mutex_unlock(&exec_lock);
+            return;
+        }
+        g_owned.erase(asid);
+        if (!g_owned.empty()) {
+            /* Other windows remain open — do NOT close the segment.  Drop
+             * only this root: recompute the emitting vCPU's gates/flag so
+             * its TBs stop being owned (pin_user_tb_owned now sees the live
+             * root as foreign); other vCPUs that were running this root
+             * self-correct at their next ASID write.  If this root was the
+             * representative, repoint it to a still-owned root so
+             * pin_effective_asid / cst_pinned_asid_root stay valid. */
+            if (g_pinned_asid.load(std::memory_order_relaxed) == asid) {
+                g_pinned_asid.store(*g_owned.begin(),
+                                    std::memory_order_relaxed);
+            }
+            qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 0);
+            refresh_ctx_gates(cpu_index);
+            fprintf(stderr,
+                    "champsim_tracer: end marker — closed window for asid "
+                    "0x%" PRIx64 " (%zu still tracing)\n",
+                    asid, g_owned.size());
+            g_rec_mutex_unlock(&exec_lock);
+            return;
+        }
+        /* Last window closed: all-windows-closed stop (peer of the
+         * icount/budget stop — whichever fires first wins). */
+        if (g_trace_segments.is_active() &&
+            !g_trace_segments.is_shutting_down()) {
+            fprintf(stderr,
+                    "champsim_tracer: end marker — closing after %" PRIu64
+                    " user insns (last window)\n", g_user_icount);
+            g_seg_end_marker_close = true;
+            finish_trace_segment();
+            g_trace_segments.set_shutting_down();
+            g_rec_mutex_unlock(&exec_lock);
+            exit(0);
+        }
+        g_rec_mutex_unlock(&exec_lock);
+        return;
+    }
+
+    /* Legacy single-pin path: pinned-simpoint / narrow-ASID (MIPS). */
     uint64_t pinned = g_pinned_asid.load(std::memory_order_relaxed);
     if (pinned == CST_ASID_UNPINNED) {
         return;
@@ -4076,8 +4301,7 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
      * the executing vCPU's effective pin (on a narrow-ASID target the
      * process may hold a re-pinned value by now; its dwell was verified
      * by the step glue before this insn callback fired). */
-    if (qemu_plugin_get_addr_space_id() !=
-        pin_effective_asid(cpu_index, pinned)) {
+    if (asid != pin_effective_asid(cpu_index, pinned)) {
         return;
     }
     g_rec_mutex_lock(&exec_lock);
@@ -5360,6 +5584,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     start_symbol        = cfg.start_symbol;    cfg.start_symbol   = nullptr;
     start_symbol_occurrence = cfg.start_symbol_occurrence;
     g_window_mode       = cfg.window_mode;
+    g_marker_policy     = cfg.marker_policy;
 
     /*
      * Two decoupled fault concerns, split from the former single flag:
@@ -5473,6 +5698,19 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                     "marker encoding for this ISA\n");
             return -1;
         }
+        if (g_marker_policy == PluginConfig::MARKER_TRACE_ALL) {
+            /* Stage B2 hook: trace-all (whole-system from the first marker)
+             * is not implemented yet.  Fall back to latch — the Stage B1
+             * per-process opt-in — so the run still produces a valid trace
+             * rather than silently doing the wrong thing. */
+            fprintf(stderr, "champsim_tracer: trace_window=marker "
+                    "policy=trace-all is not yet implemented (Stage B2); "
+                    "falling back to policy=latch\n");
+            g_marker_policy = PluginConfig::MARKER_LATCH;
+        }
+        fprintf(stderr, "champsim_tracer: marker window policy=latch "
+                "(per-process opt-in; segment closes when the last window "
+                "ends or the icount budget is met)\n");
         /* No segment opens until the guest launch wrapper's magic
          * marker instruction executes (see vcpu_marker_cb). */
     } else if (!g_simpoints.is_active() && trace_start_insn == 0) {

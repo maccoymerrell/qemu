@@ -197,7 +197,24 @@ bool parse_kv_pair(PluginConfig *cfg, const char *mode,
             cfg->simulation_insns = g_ascii_strtoull(kv.second, nullptr, 10);
             return cfg->simulation_insns > 0;
         }
-        return bad_key("simulation");
+        if (match("policy")) {
+            /* Multi-process policy (Stage B).  latch = per-process opt-in
+             * (default); trace-all = whole-system from first marker (B2). */
+            if (cst_str_eq(kv.second, "latch")) {
+                cfg->marker_policy = PluginConfig::MARKER_LATCH;
+                return true;
+            }
+            if (cst_str_eq(kv.second, "trace-all") ||
+                cst_str_eq(kv.second, "trace_all")) {
+                cfg->marker_policy = PluginConfig::MARKER_TRACE_ALL;
+                return true;
+            }
+            fprintf(stderr,
+                    "champsim_tracer: trace_window=marker: policy must be "
+                    "'latch' or 'trace-all' (got '%s')\n", kv.second);
+            return false;
+        }
+        return bad_key("simulation, policy");
     }
     fprintf(stderr,
             "champsim_tracer: trace_window: unknown mode '%s' "

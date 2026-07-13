@@ -93,6 +93,23 @@ struct PluginConfig {
         WIN_MARKER   = 4,
     };
     int window_mode = WIN_AUTO;
+
+    /*
+     * Marker-window multi-process policy (trace_window=marker:policy=...).
+     * Governs how WIN_MARKER treats more than one marker-emitting process
+     * (whole-system multi-ASID, Stage B).
+     *   latch     (0, default): each process that runs the START marker
+     *                           joins the owned set and is traced; the
+     *                           segment closes when the LAST open window's
+     *                           END marker fires (owned set empties) or the
+     *                           icount budget is met, whichever comes first.
+     *   trace-all (1): Stage B2 — the first START begins tracing ALL
+     *                  contexts until the marker window ends.  Parsed here
+     *                  as a forward hook; not yet implemented (falls back
+     *                  to latch with a warning at install).
+     */
+    enum MarkerPolicy { MARKER_LATCH = 0, MARKER_TRACE_ALL = 1 };
+    int marker_policy = MARKER_LATCH;
 };
 
 /* Parse plugin args.  Returns true on success; on failure prints to

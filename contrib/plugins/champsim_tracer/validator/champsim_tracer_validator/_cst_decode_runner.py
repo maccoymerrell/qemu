@@ -192,7 +192,7 @@ _INSN_RE = re.compile(
     r"(?:  prof: (.*))?$"
 )
 _ENTRY_HEAD_RE = re.compile(
-    r"^ENTRY (\d+) thread=(\d+)(?: switch=(\d))?"
+    r"^ENTRY (\d+) thread=(\d+)(?: asid=\d+)?(?: switch=(\d))?"
     r"(?: fault_depth=(\d+))?(?: fault_at=([\d,]+))? template=BB(\d+)$"
 )
 _WP_HEAD_RE = re.compile(

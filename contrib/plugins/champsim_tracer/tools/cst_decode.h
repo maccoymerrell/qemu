@@ -86,6 +86,7 @@ struct BodyStats {
     uint64_t iframe_count      = 0;
     uint64_t regfile_count     = 0;
     uint64_t thread_switch_count = 0;
+    uint64_t asid_switch_count = 0;
     uint64_t fault_count       = 0;
     uint64_t translation_unavail_count = 0;
     /* Count of insns observed carrying CST_INSN_FLAG_ATOMIC.
@@ -180,6 +181,11 @@ public:
         uint32_t        template_index = 0xFFFFFFFFu;
         const Template *tmpl           = nullptr;
         uint32_t        thread_id      = 0;
+        /* Address-space (ASID) index this BB executed under; the second
+         * half of the (thread_id, asid) context.  Rebased by
+         * BODY_TAG_ASID_SWITCH; a WP BB inherits its parent CP entry's
+         * asid. */
+        uint32_t        asid           = 0;
         uint32_t        seq_num        = 0;   /* CP visit counter; a WP
                                                * BB shares its parent
                                                * CP entry's seq_num. */
@@ -234,6 +240,7 @@ private:
      * from body_ and updates @ws / stats_ accordingly.  handle_end()
      * returns the trailer's num_entries field. */
     void     handle_thread_switch(WalkState &ws);
+    void     handle_asid_switch(WalkState &ws);
     void     handle_regfile(const RegfileCallback &rb);
     void     handle_entry(WalkState &ws, const Callback &cb);
     void     handle_iframe(WalkState &ws);
@@ -253,7 +260,7 @@ private:
                                const FieldStateTable *base_state);
     void stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
                             FieldStateTable &cp_state, WpDecode wp,
-                            uint32_t seq, uint32_t thread,
+                            uint32_t seq, uint32_t thread, uint32_t asid,
                             const BBCallback &cb);
     void handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
                          const BBCallback &cb);

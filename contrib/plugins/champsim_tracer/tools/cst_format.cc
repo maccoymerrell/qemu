@@ -298,6 +298,8 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
                 &ids->body_tag_iframe);
     resolve_one(maps.body_tag, "body_tag", "BODY_TAG_REGFILE",
                 &ids->body_tag_regfile);
+    resolve_one(maps.body_tag, "body_tag", "BODY_TAG_ASID_SWITCH",
+                &ids->body_tag_asid_switch);
 
     /* field_id (per-slot families + singletons): each looked up by
      * full CST_FID_<family><k> name, no stride/ordering assumption.

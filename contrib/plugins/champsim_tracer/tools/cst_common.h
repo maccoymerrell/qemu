@@ -65,6 +65,7 @@ struct ResolvedIds {
     uint8_t body_tag_thread_switch = 0;
     uint8_t body_tag_iframe        = 0;
     uint8_t body_tag_regfile       = 0;
+    uint8_t body_tag_asid_switch   = 0;
 
     /* field_id map: per-slot FID arrays + singletons.  FIDs are
      * ULEB128 on the wire; per-slot arrays are filled by name lookup
@@ -283,6 +284,11 @@ struct DecodedEntry {
     uint32_t                    template_id = 0;
     uint32_t                    thread_id = 0;
     bool                        thread_switched = false;
+    /* Address-space (ASID) index the entry executed under — the second
+     * half of the (thread_id, asid) context.  Memory is keyed
+     * (asid, vaddr); identical VAs under different asids are distinct
+     * physical memory.  Rebased by BODY_TAG_ASID_SWITCH records. */
+    uint32_t                    asid = 0;
     std::vector<DynParam>       dyn_params;
     std::vector<RegSnap>        reg_snaps;
     std::vector<MetaFlagsEntry> metaflags;

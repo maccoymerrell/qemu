@@ -130,6 +130,7 @@ struct Stats {
     Bucket cp_entry_framing;
     Bucket cp_field_delta;
     Bucket thread_switch;
+    Bucket asid_switch;
     Bucket wp_chain_envelope;
     Bucket wp_entry_framing;
     Bucket wp_field_delta;
@@ -360,6 +361,10 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
      * decoder's thread tracking off the THREAD_SWITCH records. */
     cst::AttributionLint::DeltaTracker tracker(*lint);
     int32_t current_thread = 0;
+    /* ASID index tracking mirrors the decoder: the inline identity
+     * (root_phys + sig) rides an index's FIRST sighting only. */
+    int32_t current_asid = 0;
+    std::vector<bool> seen_asids;
 
     while (!body.eof()) {
         size_t tag_start = body.consumed();
@@ -522,6 +527,23 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
             current_thread += (int32_t)body.sleb();   /* signed delta */
             s->thread_switch.bytes += body.consumed() - tag_start;
             s->thread_switch.count += 1;
+            continue;
+        }
+
+        if (tag == ids.body_tag_asid_switch) {
+            current_asid += (int32_t)body.sleb();     /* signed delta */
+            if (current_asid >= 0) {
+                if ((size_t)current_asid >= seen_asids.size()) {
+                    seen_asids.resize((size_t)current_asid + 1, false);
+                }
+                if (!seen_asids[current_asid]) {
+                    (void)body.u64_le();              /* root_phys */
+                    (void)body.u64_le();              /* sig       */
+                    seen_asids[current_asid] = true;
+                }
+            }
+            s->asid_switch.bytes += body.consumed() - tag_start;
+            s->asid_switch.count += 1;
             continue;
         }
 
@@ -725,6 +747,9 @@ void print_report(const Stats &s, const cst::Header &h)
     std::printf("%s\n", row("thread-switch records",
                              s.thread_switch.bytes, body,
                              s.thread_switch.count, "switch").c_str());
+    std::printf("%s\n", row("asid-switch records",
+                             s.asid_switch.bytes, body,
+                             s.asid_switch.count, "switch").c_str());
     std::printf("%s\n", row("WP chain envelope (incl. inner)",
                              s.wp_chain_envelope.bytes, body,
                              s.cp_entries, "entry").c_str());
@@ -911,6 +936,7 @@ int main(int argc, char **argv)
         s.body_total = s.cp_entry_framing.bytes
                      + s.cp_field_delta.bytes
                      + s.thread_switch.bytes
+                     + s.asid_switch.bytes
                      + s.wp_chain_envelope.bytes
                      + s.wp_events.bytes
                      + s.iframe_bytes.bytes

@@ -619,6 +619,8 @@ void dump_body(FILE *out, BodyStream &bs, const Header &h, uint64_t max_entries)
     int32_t cp_tid = 0;
     uint32_t seq = 0;
     int32_t thread = 0;
+    int32_t asid = 0;
+    std::vector<bool> seen_asids;
     bool stopped_early = false;
 
     while (!b.eof()) {
@@ -633,6 +635,33 @@ void dump_body(FILE *out, BodyStream &bs, const Header &h, uint64_t max_entries)
             thread += (int32_t)d;
             emitf(out, b, doff, 1,
                   "thread_id_delta=%" PRId64 " ->thread_id=%d", d, thread);
+            continue;
+        }
+
+        if (tag == ids.body_tag_asid_switch) {
+            emitf(out, b, off, 0, "ASID_SWITCH  tag=%u  [Step 6.7]",
+                  (unsigned)tag);
+            size_t doff = b.consumed();
+            int64_t d = b.sleb();
+            asid += (int32_t)d;
+            emitf(out, b, doff, 1,
+                  "asid_index_delta=%" PRId64 " ->asid_index=%d", d, asid);
+            bool first = true;
+            if (asid >= 0) {
+                if ((size_t)asid >= seen_asids.size()) {
+                    seen_asids.resize((size_t)asid + 1, false);
+                }
+                first = !seen_asids[asid];
+                seen_asids[asid] = true;
+            }
+            if (first) {
+                size_t ioff = b.consumed();
+                uint64_t root_phys = b.u64_le();
+                uint64_t sig = b.u64_le();
+                emitf(out, b, ioff, 1,
+                      "identity (first sighting): root_phys=0x%" PRIx64
+                      " sig=0x%" PRIx64, root_phys, sig);
+            }
             continue;
         }
 

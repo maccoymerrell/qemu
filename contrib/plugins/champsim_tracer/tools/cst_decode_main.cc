@@ -1437,9 +1437,9 @@ void emit_bb_header(FILE *out, const cst::DecodedEntry &e,
     }
     std::fprintf(out,
                  "; ----- BB %u entry pc=0x%" PRIx64
-                 " insns=%zu seq=%u tid=%u%s%s -----\n",
+                 " insns=%zu seq=%u tid=%u asid=%u%s%s -----\n",
                  e.template_id, t.start_pc, t.insns.size(),
-                 e.seq_num, e.thread_id,
+                 e.seq_num, e.thread_id, e.asid,
                  e.thread_switched ? " (thread_switch)" : "", fd);
 }
 
@@ -2141,8 +2141,8 @@ void emit_legacy_entry(FILE *out, const cst::Header &h,
                                i ? "," : "", e.fault_anchors[i]);
         }
     }
-    std::fprintf(out, "ENTRY %04u thread=%u%s%s template=BB%u\n",
-                 e.seq_num, e.thread_id, sw, fd, e.template_id);
+    std::fprintf(out, "ENTRY %04u thread=%u asid=%u%s%s template=BB%u\n",
+                 e.seq_num, e.thread_id, e.asid, sw, fd, e.template_id);
     std::fprintf(out, "  cp:\n");
     emit_legacy_observations(out, "    ", h, e.dyn_params, e.reg_snaps,
                              e.metaflags, e.lane_masks);
@@ -2189,6 +2189,7 @@ void emit_legacy_body_stats(FILE *out, const cst::BodyStats &s)
     std::fprintf(out, "iframe_count %llu\n",        (unsigned long long)s.iframe_count);
     std::fprintf(out, "regfile_count %llu\n",       (unsigned long long)s.regfile_count);
     std::fprintf(out, "thread_switch_count %llu\n", (unsigned long long)s.thread_switch_count);
+    std::fprintf(out, "asid_switch_count %llu\n",   (unsigned long long)s.asid_switch_count);
     std::fprintf(out, "fault_count %llu\n",         (unsigned long long)s.fault_count);
     std::fprintf(out, "translation_unavail_count %llu\n",
                  (unsigned long long)s.translation_unavail_count);

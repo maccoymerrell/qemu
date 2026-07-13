@@ -132,7 +132,9 @@ carry:
 * **Per insn:** `pc_delta`, `opcode`, `branch_type`, `flags`,
   `n_src`, `n_dst`, `src_regs[]`, `dst_regs[]`, `max_dep_loads`,
   `max_dep_stores`, `insn_size`, `insn_bytes[insn_size]`.
-* **Body:** a leading `BODY_TAG_THREAD_SWITCH`; one
+* **Body:** a leading `BODY_TAG_ASID_SWITCH` (declaring the opening
+  address space, with its inline identity) followed by a
+  `BODY_TAG_THREAD_SWITCH` (declaring the opening thread); one
   `BODY_TAG_ENTRY` per correct-path BB invocation; and for every
   memop an instruction issues, that memop's effective address
   (`CST_FID_LOAD_ADDR{k}` / `CST_FID_STORE_ADDR{k}`) together with
@@ -290,7 +292,7 @@ self-describing.  Decode it into a fresh `encoding_maps` table.
          exercises the constructs these tag, so a trace whose maps
          omit one is rejected here:
            body_tag:    BODY_TAG_END, BODY_TAG_ENTRY,
-                        BODY_TAG_THREAD_SWITCH
+                        BODY_TAG_THREAD_SWITCH, BODY_TAG_ASID_SWITCH
            header_flag: CST_FLAG_PROFILE, CST_FLAG_WP
            insn_flag:   CST_INSN_FLAG_HAS_IMM,
                         CST_INSN_FLAG_HAS_DEP_BLOCK
@@ -536,15 +538,28 @@ across the walk:
 ```
 prev_entry_template_id : i32 = 0
 prev_thread_id         : u32 = 0   (the current thread for the next ENTRY)
+prev_asid_index        : u32 = 0   (the current address space, next ENTRY)
 seq_num                : u32 = 0   (BODY_TAG_ENTRY counter)
 ```
 
-The body's first record is always a `BODY_TAG_THREAD_SWITCH`, so the
-starting thread is stated explicitly rather than assumed.  It is an
-ordinary delta from `prev_thread_id = 0` (no special-case base): a
-reader that just applies thread-switch deltas from 0, like every
-other delta in the format, gets the correct starting thread with no
-extra knowledge.
+The context of a body entry is the pair `(thread_id, asid)`: which
+software thread ran the block, and in which address space.  Memory is
+keyed `(asid, vaddr)` — identical virtual addresses under different
+asids are distinct physical memory.  Both dimensions are rebased by
+in-body switch records (`BODY_TAG_THREAD_SWITCH`, `BODY_TAG_ASID_SWITCH`)
+and each inherits into every subsequent `BODY_TAG_ENTRY` until the next
+switch of its dimension.
+
+The body opens with a mandatory initial context declaration: a
+`BODY_TAG_ASID_SWITCH` immediately followed by a `BODY_TAG_THREAD_SWITCH`,
+before the first entry, so the starting `(asid, thread)` is stated
+explicitly rather than assumed.  Each is an ordinary delta from its base
+`0` (no special-case base): a reader that just applies switch deltas
+from 0, like every other delta in the format, arrives at the correct
+starting context with no extra knowledge.  A single-address-space
+producer declares asid index 0 once and never switches the asid
+dimension again; the asid dimension only "activates" once more than one
+address space is traced.
 
 `thread_id` is an **opaque guest-thread identifier**, and the vCPU (host
 scheduling slot) the thread ran on is deliberately NOT on the wire — the
@@ -561,21 +576,33 @@ for the thread's lifetime.  Either way a decoder needs no knowledge of the
 mapping — it keys per-thread state (the initial regfile, the field-delta
 overlays) on the id as an opaque tag.
 
-**Scope: one address space.**  A system-mode (marker/pin) trace represents
-a SINGLE address space — the pinned process.  Every virtual address in the
-body is that process's, and `thread_id` distinguishes the software threads
-*within* it; the wire carries no address-space id, so it cannot disambiguate
-memory across processes (the same VA in another address space is different
-memory).  Whole-system / multi-process tracing would require an address-space
-id (CR3 / TTBR0 / SATP / MIPS ASID) on the wire and is a deliberate FUTURE
-extension, not a current capability.  Within the one address space, a
-`thread_id`'s USER-code blocks are exact wherever the guest scheduler runs the
-thread (the per-thread pointer is a user register that survives migration); a
-migrating pinned process is, however, outside the clean-attribution envelope
-for its KERNEL code, which carries no per-thread register.  The producer keeps
-the process inside the envelope by pinning it to one core (`cst_attach` does
-this by default) and emits a diagnostic if it observes the process spanning
-vCPUs.  See `docs/architecture.rst`, "Single address space".
+**Address space (asid).**  The `asid` dimension names the address space a
+block executed in, carried alongside `thread_id` as the second half of the
+context.  Memory is keyed `(asid, vaddr)`: the same virtual address under two
+asids is two different physical memories, and a consumer that models a cache
+or memory hierarchy must qualify every address by the current asid.  The wire
+carries a **compact asid index** assigned on first sighting (0, 1, 2, …); each
+index's identity — the page-table root physical address (`root_phys`: CR3 /
+TTBR0/1 base / SATP PPN / MIPS pgd) plus a content `sig` disambiguating a
+reused root — rides that index's first `BODY_TAG_ASID_SWITCH`, mirroring how a
+thread's register file rides its first ENTRY.  The root-physical is used
+rather than the architectural ASID field because the latter (8/16-bit on ARM
+and MIPS) rolls over and is reused across a long trace.
+
+A single-address-space (marker/pin) trace declares asid index 0 in the opening
+context record and never switches the asid dimension again: every virtual
+address in the body is the pinned process's, and `thread_id` distinguishes the
+software threads *within* it.  Within that one address space a `thread_id`'s
+USER-code blocks are exact wherever the guest scheduler runs the thread (the
+per-thread pointer is a user register that survives migration); a migrating
+pinned process is, however, outside the clean-attribution envelope for its
+KERNEL code, which carries no per-thread register.  The producer keeps the
+process inside the envelope by pinning it to one core (`cst_attach` does this
+by default) and emits a diagnostic if it observes the process spanning vCPUs.
+Whole-system multi-address-space capture — several processes' asids
+interleaved in one body, with the kernel's shared upper half resolving to the
+same physical memory across all asids — builds on this same record and is
+staged in.  See `docs/architecture.rst`, "Single address space".
 
 Loop until a `BODY_TAG_END` is seen:
 
@@ -583,6 +610,7 @@ Loop until a `BODY_TAG_END` is seen:
 6.1  tag : u8
      dispatch on tag against the ids resolved in Step 3:
        ids.body_tag_thread_switch  → Step 6.2
+       ids.body_tag_asid_switch    → Step 6.2a
        ids.body_tag_regfile        → Step 6.3
        ids.body_tag_entry          → Step 6.4
        ids.body_tag_iframe         → Step 6.5
@@ -592,6 +620,18 @@ Loop until a `BODY_TAG_END` is seen:
        thread_id_delta : SLEB
        prev_thread_id += thread_id_delta
        (No state output; the next ENTRY inherits prev_thread_id.)
+6.2a ASID_SWITCH record:
+       asid_index_delta : SLEB
+       prev_asid_index += asid_index_delta
+       if (this asid_index is seen for the FIRST time in the body):
+         root_phys : u64        ; page-table root physical address
+         sig       : u64        ; content signature (0 when unassigned)
+       The identity (`root_phys`, `sig`) rides an index's first sighting
+       only — exactly as a thread's register file rides its first ENTRY
+       (Step 6.3).  A repeat sighting carries the bare index delta with
+       no trailing identity.  A decoder tracks which asid indices it has
+       already seen to know whether to read the two identity words.
+       (No state output; the next ENTRY inherits prev_asid_index.)
 6.3  REGFILE record:
        thread_id : ULEB
        n_present : ULEB
@@ -616,7 +656,7 @@ Loop until a `BODY_TAG_END` is seen:
        ; entry has no wrong-path chain (num_wp treated as 0).
        seq_num += 1
        Emit a CP body entry tagged (seq_num, cur_template_id,
-       prev_thread_id) carrying the cp_delta_section's decoded
+       prev_thread_id, prev_asid_index) carrying the cp_delta_section's decoded
        dyn_params + reg_snaps, the wp_chain_section's WPEntries,
        and the wp_events bits applied to those WPEntries.
 6.5  IFRAME record (validation-only; producers may omit it):
@@ -765,8 +805,9 @@ IDs, flag-bit positions — is resolved through the per-trace encoding
 maps (§3.1) and is not pinned by this specification.  The body-tag
 values the writer currently assigns are `BODY_TAG_END = 0`,
 `BODY_TAG_ENTRY = 1`, `BODY_TAG_THREAD_SWITCH = 2`,
-`BODY_TAG_IFRAME = 3`, and `BODY_TAG_REGFILE = 4`; a decoder obtains
-them from the `body_tag` map, not from these numbers.
+`BODY_TAG_IFRAME = 3`, `BODY_TAG_REGFILE = 4`, and
+`BODY_TAG_ASID_SWITCH = 5`; a decoder obtains them from the `body_tag`
+map, not from these numbers.
 
 The body member begins with `CST_MAGIC` and ends with `CST_MAGIC`.  A
 file is treated as truncated if the trailing magic is missing.  The
@@ -982,15 +1023,19 @@ field-delta encoding scheme below is a compression layer over
 that conceptual picture, not a different shape of data.
 
 The body stream is a sequence of tagged records ending in one footer.
-Its first record is always a `BODY_TAG_THREAD_SWITCH` (§4.1), so the
-starting thread is stated explicitly.
+It opens with a mandatory context declaration — a `BODY_TAG_ASID_SWITCH`
+(§4.1a) followed by a `BODY_TAG_THREAD_SWITCH` (§4.1) — so the starting
+`(asid, thread)` context is stated explicitly before any entry.
 
 ```
 body stream:
 
   +------------------------------+
-  | tag = BODY_TAG_THREAD_SWITCH |   always the first record
-  | thread switch payload        |
+  | tag = BODY_TAG_ASID_SWITCH   |   always the first record;
+  | asid switch payload          |    declares the opening asid
+  +------------------------------+
+  | tag = BODY_TAG_THREAD_SWITCH |   always the second record;
+  | thread switch payload        |    declares the opening thread
   +------------------------------+
   | tag = BODY_TAG_REGFILE       |   (optional, per-thread initial
   | regfile payload              |    register state — §4.6)
@@ -1028,6 +1073,44 @@ so traces do not pay a per-block thread field.
 state when it sees this tag and associates that thread ID with following
 `BODY_TAG_ENTRY` records.
 
+### 4.1a BODY_TAG_ASID_SWITCH
+
+Address-space switches are sparse records, sibling to the thread switch.
+Normal basic-block entries inherit the current asid index until the next
+switch record, so traces do not pay a per-block asid field.  Memory is
+keyed `(asid, vaddr)`: a consumer qualifies every address by the current
+asid, and identical VAs under different asids are distinct physical
+memory.
+
+```
++--------------------------------------------------+
+| tag = 5                         u8               |
+| asid_index_delta                SLEB             |
+|   current_asid_index - previous_asid_index       |
+| -- present only on this index's FIRST sighting --|
+| root_phys                       u64  (LE)        |
+|   page-table root physical address (identity)    |
+| sig                             u64  (LE)        |
+|   content signature; 0 until assigned            |
++--------------------------------------------------+
+```
+
+`previous_asid_index` starts at 0.  The **compact asid index** is
+assigned on first sighting (0, 1, 2, …); its identity — `root_phys`
+(the page-table root physical: CR3, TTBR0/1 base, SATP PPN, or MIPS pgd)
+plus a content `sig` that distinguishes a root-physical reused by a new
+address space after the original process died — rides that index's first
+switch record only.  A decoder tracks which indices it has already seen;
+a repeat sighting of an index carries the bare `asid_index_delta` with no
+trailing identity words.  This first-sighting-inline scheme mirrors the
+per-thread register file (§4.6) and keeps the stream self-describing
+without a header-side asid table.
+
+Every trace opens with an initial `BODY_TAG_ASID_SWITCH` (before the
+opening `BODY_TAG_THREAD_SWITCH`), declaring the address space the trace
+starts in.  A single-address-space trace declares index 0 once and never
+switches the asid dimension again.
+
 ### 4.2 BODY_TAG_ENTRY
 
 Each entry records one correct-path basic block and its optional
@@ -1049,8 +1132,10 @@ wrong-path chain.
 
 `previous_entry_template` starts at 0 and updates after each CP entry.
 The current guest-thread ID comes from the most recent
-`BODY_TAG_THREAD_SWITCH` record; because the body's first record is
-always a thread switch (§4.1), an ENTRY is always preceded by one.
+`BODY_TAG_THREAD_SWITCH` record and the current asid index from the most
+recent `BODY_TAG_ASID_SWITCH`; because the body opens with an
+`(asid, thread)` declaration (§4.1a, §4.1), an ENTRY is always preceded
+by both, and every entry carries a well-defined `(asid, thread)` context.
 
 ### 4.3 Wrong-Path Chain Section
 

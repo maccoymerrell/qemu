@@ -455,6 +455,7 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         { BODY_TAG_THREAD_SWITCH, "BODY_TAG_THREAD_SWITCH" },
         { BODY_TAG_IFRAME, "BODY_TAG_IFRAME" },
         { BODY_TAG_REGFILE, "BODY_TAG_REGFILE" },
+        { BODY_TAG_ASID_SWITCH, "BODY_TAG_ASID_SWITCH" },
     };
     static const EncodingMapEntry wp_event_flag_entries[] = {
         { CST_WP_EVENT_TRANSLATION_UNAVAIL,
@@ -521,6 +522,20 @@ struct BodyStreamState {
     BitWriter header_bw;
     int64_t prev_entry_template;
     int64_t current_thread;
+    /* Active address-space (ASID) index, the second half of the body
+     * context pair (thread_id, asid).  Base 0; the body's first record
+     * is forced to be a BODY_TAG_ASID_SWITCH (see asid_announced), so
+     * the starting asid arrives as an ordinary delta from 0. */
+    int64_t current_asid;
+    /* False until the first BODY_TAG_ASID_SWITCH; forces it so the
+     * opening asid is an explicit delta-from-0, no implicit base — the
+     * mandatory initial (asid, thread) declaration. */
+    bool    asid_announced;
+    /* Whether each asid index has already emitted its inline identity
+     * (root_phys + sig).  Indexed by asid_index, grown on demand like
+     * regfile_emitted: the identity rides an index's FIRST sighting
+     * only, repeats carry the bare index. */
+    std::vector<bool> asid_identity_emitted;
     /* Previous CP entry's template, so the *next* CP entry can
      * classify the prior BB's terminal-branch outcome for §6. */
     BBTemplate *prev_cp_tmpl;
@@ -2971,6 +2986,14 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
     st->current_thread = 0;
     st->thread_announced = false;
 
+    /* Base 0.  The first body record is forced to be an ASID_SWITCH
+     * (see asid_announced), so the starting asid is an ordinary
+     * delta-from-0 declaring the opening (asid, thread) context.  The
+     * identity tracker starts empty and grows on first sighting. */
+    st->current_asid = 0;
+    st->asid_announced = false;
+    st->asid_identity_emitted.clear();
+
     /* Per-thread FieldStateTables lazy-allocate on first emit. */
     st->iframe_cp_scratch = nullptr;  /* lazy on first IFRAME */
     st->iframe_wp_scratch = nullptr;
@@ -3544,6 +3567,37 @@ static void accumulate_template_profiles(BodyStreamState *st, BodyEntry *entry,
     }
 }
 
+/*
+ * Announce a BODY_TAG_ASID_SWITCH when the active address space changes
+ * (and on the very first entry, giving every trace a mandatory opening
+ * (asid, thread) declaration).  The switch carries an sleb128 delta of
+ * the compact asid index; the FIRST sighting of an index additionally
+ * writes its identity — @root_phys (page-table root physical address)
+ * and @sig (content signature) — inline, mirroring the per-thread
+ * regfile's first-sighting emission.  Phase 1 is single-ASID: index 0 is
+ * declared once and never switches again.
+ */
+static void emit_asid_switch_if_needed(BodyStreamState *st,
+                                       uint64_t asid_index,
+                                       uint64_t root_phys, uint64_t sig)
+{
+    if (!st->asid_announced || (int64_t)asid_index != st->current_asid) {
+        bw_write_u8(&st->bw, BODY_TAG_ASID_SWITCH);
+        bw_write_sleb128(&st->bw, (int64_t)asid_index - st->current_asid);
+        st->current_asid = asid_index;
+        st->asid_announced = true;
+    }
+    /* Identity rides the index's first sighting only. */
+    if (asid_index >= st->asid_identity_emitted.size()) {
+        st->asid_identity_emitted.resize((size_t)asid_index + 1, false);
+    }
+    if (!st->asid_identity_emitted[asid_index]) {
+        bw_write_u64_le(&st->bw, root_phys);
+        bw_write_u64_le(&st->bw, sig);
+        st->asid_identity_emitted[asid_index] = true;
+    }
+}
+
 /* Announce a BODY_TAG_THREAD_SWITCH when the active thread changes (and on
  * the very first entry). */
 static void emit_thread_switch_if_needed(BodyStreamState *st, uint32_t tid)
@@ -3628,6 +3682,16 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
     }
 
     accumulate_template_profiles(st, entry, num_wp);
+    /* Declare the (asid, thread) context before the entry it scopes.
+     * ASID first so the opening pair is [ASID_SWITCH][THREAD_SWITCH].
+     * Phase 1 stays single-ASID: index 0, declared once.  root_phys/sig
+     * are Phase 2's job (hook -> root-phys -> compact index + reuse
+     * signature); the tracked ASID root is not reachable on this emit
+     * path (g_pinned_asid is a static in champsim_tracer.cc and holds
+     * the architectural ASID, not the pgd root physical). */
+    emit_asid_switch_if_needed(st, /*asid_index=*/0,
+                               /*root_phys=*/0 /* TODO(P2): real pgd root */,
+                               /*sig=*/0 /* TODO(P2): content signature */);
     emit_thread_switch_if_needed(st, tid);
     emit_regfile_if_first(st, entry, tid);
 

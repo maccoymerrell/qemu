@@ -407,6 +407,17 @@ struct BodyWalker::WalkState {
     uint32_t current_thread        = 0;
     bool     pending_thread_switch = false;
 
+    /* Active address-space (ASID) index, the second half of the
+     * (thread_id, asid) context.  Base 0: the body's first record is
+     * always an ASID_SWITCH, so the opening asid arrives as an ordinary
+     * delta from 0 (mandatory initial declaration).  @seen_asids tracks
+     * which indices have already carried their inline identity so the
+     * decoder reads it on first sighting only — mirroring the writer's
+     * asid_identity_emitted. */
+    uint32_t current_asid          = 0;
+    bool     pending_asid_switch   = false;
+    std::vector<bool> seen_asids;
+
     /* Per-thread FieldStateTables, indexed by thread_id (== guest
      * vCPU index); vectors stay short (one slot per vCPU). */
     std::vector<FieldStateTable> cp_states;
@@ -431,6 +442,30 @@ void BodyWalker::handle_thread_switch(WalkState &ws)
     ws.current_thread = (uint32_t)((int64_t)ws.current_thread + d);
     ws.pending_thread_switch = true;
     stats_.thread_switch_count++;
+}
+
+/*
+ * BODY_TAG_ASID_SWITCH: rebase the address-space dimension of the
+ * context.  Read the sleb128 asid-index delta; on an index's FIRST
+ * sighting also consume its inline identity (u64 root_phys + u64 sig),
+ * exactly as the writer emitted it.  P1 records only current_asid; the
+ * identity bytes are parsed for wire consistency (Phase 2 surfaces them
+ * to consumers).
+ */
+void BodyWalker::handle_asid_switch(WalkState &ws)
+{
+    int64_t d = body_.sleb();
+    ws.current_asid = (uint32_t)((int64_t)ws.current_asid + d);
+    if (ws.current_asid >= ws.seen_asids.size()) {
+        ws.seen_asids.resize((size_t)ws.current_asid + 1, false);
+    }
+    if (!ws.seen_asids[ws.current_asid]) {
+        (void)body_.u64_le();   /* root_phys — Phase 2 surfaces identity */
+        (void)body_.u64_le();   /* sig                                   */
+        ws.seen_asids[ws.current_asid] = true;
+    }
+    ws.pending_asid_switch = true;
+    stats_.asid_switch_count++;
 }
 
 void BodyWalker::handle_regfile(const RegfileCallback &rb)
@@ -588,8 +623,10 @@ void BodyWalker::handle_entry(WalkState &ws, const Callback &cb)
 
     entry.thread_id       = ws.current_thread;
     entry.thread_switched = ws.pending_thread_switch;
+    entry.asid            = ws.current_asid;
     entry.seq_num         = ++ws.seq;
     ws.pending_thread_switch = false;
+    ws.pending_asid_switch = false;
 
     /* stats_ aggregation. */
     stats_.cp_entries++;
@@ -688,6 +725,10 @@ void BodyWalker::walk(const Callback &cb, const RegfileCallback &rb)
         }
         if (tag == ids.body_tag_thread_switch) {
             handle_thread_switch(ws);
+            continue;
+        }
+        if (tag == ids.body_tag_asid_switch) {
+            handle_asid_switch(ws);
             continue;
         }
         if (tag == ids.body_tag_regfile) {
@@ -1124,7 +1165,7 @@ void BodyWalker::consume_field_section(Reader &outer, uint32_t template_id,
 void BodyWalker::stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
                                     FieldStateTable &cp_state, WpDecode wp,
                                     uint32_t seq, uint32_t thread,
-                                    const BBCallback &cb)
+                                    uint32_t asid, const BBCallback &cb)
 {
     const bool fields = (wp == WpDecode::Fields);
     uint64_t num_wp = wpb.uleb();
@@ -1151,6 +1192,7 @@ void BodyWalker::stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
             ? (uint32_t)it->second : 0xFFFFFFFFu;
         bb.tmpl           = wtmpl;
         bb.thread_id      = thread;
+        bb.asid           = asid;   /* WP BB inherits its CP entry's asid */
         bb.seq_num        = seq;
         bb.is_wp          = true;
         bb.wp_index       = (uint32_t)w;
@@ -1204,6 +1246,7 @@ void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
         ? (uint32_t)cp_it->second : 0xFFFFFFFFu;
     bb.tmpl            = cp_tmpl;
     bb.thread_id       = ws.current_thread;
+    bb.asid            = ws.current_asid;
     bb.seq_num         = seq;
     bb.thread_switched = ws.pending_thread_switch;
     bb.n_insns         = cp_tmpl ? (uint32_t)cp_tmpl->insns.size() : 0;
@@ -1215,6 +1258,7 @@ void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
         bb.ids_       = &header_.ids;
     }
     ws.pending_thread_switch = false;
+    ws.pending_asid_switch = false;
     cb(bb);
 
     /* WP chain + events (Steps 6.8 / 6.9), present only under
@@ -1226,7 +1270,7 @@ void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
               FieldStateTable &wp_state =
                   ws.state_at(ws.wp_states, ws.current_thread);
               stream_wp_chain_bb(wpb, wp_state, cp_state, wp, seq,
-                                 ws.current_thread, cb);
+                                 ws.current_thread, ws.current_asid, cb);
           }
         }
         { SectionScope s(body_); (void)s; }   /* WP events: parse-skipped */
@@ -1277,6 +1321,10 @@ void BodyWalker::walk_bb(bool cp_fields, WpDecode wp,
         }
         if (tag == ids.body_tag_thread_switch) {
             handle_thread_switch(ws);
+            continue;
+        }
+        if (tag == ids.body_tag_asid_switch) {
+            handle_asid_switch(ws);
             continue;
         }
         if (tag == ids.body_tag_regfile) {

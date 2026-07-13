@@ -98,6 +98,20 @@ extern "C" {
  * Wire format spec'd in champsim_tracer_format.md.
  */
 #define BODY_TAG_REGFILE         4
+/*
+ * BODY_TAG_ASID_SWITCH: rebases the address-space (ASID) dimension of
+ * the current body context, sibling to BODY_TAG_THREAD_SWITCH.  The
+ * context of a body record is the pair (thread_id, asid); memory is
+ * keyed (asid, vaddr) so identical VAs under different asids are
+ * distinct physical memory.  Payload: sleb128 asid-index delta from the
+ * current asid.  The FIRST appearance of an asid index additionally
+ * carries its identity inline — u64 root_phys (page-table root physical
+ * address) + u64 sig (content signature) — mirroring how a thread's
+ * register file rides its first sighting.  Every trace opens with an
+ * initial (asid, thread) declaration before the first entry.
+ * Wire format spec'd in champsim_tracer_format.md.
+ */
+#define BODY_TAG_ASID_SWITCH     5
 
 /*
  * Per-insn template flags byte

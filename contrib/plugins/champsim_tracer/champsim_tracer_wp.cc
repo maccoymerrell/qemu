@@ -995,15 +995,40 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                     poisoned_targets.insert(fault_pc);
 
                     if (branch_fired || bb_complete) {
-                        /* The faulting insn IS the BB terminator (a conditional
-                         * trap: MIPS teq / x86 INTO).  [.. trap] is a COMPLETE
-                         * true BB, so commit it now (below) with the fault
-                         * marker; re-dispatch at skip_pc (the trap's
-                         * architectural fall-through), not the trap's own
-                         * now-poisoned PC. */
+                        /*
+                         * The faulting insn IS the BB terminator, i.e. a
+                         * deliberate control-transfer-to-kernel instruction that
+                         * faulted out of spec mode: a syscall / software
+                         * interrupt (syscall/int/svc/ecall/brk) or a conditional
+                         * trap (MIPS teq-family / x86 INTO) — all
+                         * BRANCH_SYSCALL_TYPE, and a plain branch never raises.
+                         *
+                         * Its correct resolution is a privilege escalation into
+                         * the kernel, which the single-address-space,
+                         * side-effect-free spec model cannot follow; falling
+                         * through to skip_pc would fabricate a path the real
+                         * machine never takes, breaking the "correct path on the
+                         * wrong path" guarantee.  So this is a genuine wrong-path
+                         * boundary (like translation-unavailable): commit the
+                         * complete true BB with the fault marker and TERMINATE
+                         * the excursion here, rather than continue.  (Contrast
+                         * the mid-BB computation faults below — div/#DE, a bad
+                         * load — whose fall-through IS correct, so they continue
+                         * on a garbage placeholder.)
+                         */
                         bb_complete = true;
                         awaiting_delay_slot = false;
-                        fault_redispatch_pc = skip_pc;
+                        bool syscall_boundary =
+                            n_executed_in_cur > 0 &&
+                            cur->insn_fields[n_executed_in_cur - 1].branch_type
+                                == BRANCH_SYSCALL_TYPE;
+                        if (syscall_boundary) {
+                            acc.bb_fault_stop = g_features.wp_synthetic_marking;
+                        } else {
+                            /* Defensive: a non-syscall terminator that somehow
+                             * raised keeps the continue (should not arise). */
+                            fault_redispatch_pc = skip_pc;
+                        }
                     } else {
                         /* Mid-BB fault: run the BB out to its natural branch
                          * (no partial, template-polluting commit).  Resume the

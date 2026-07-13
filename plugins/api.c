@@ -932,6 +932,28 @@ bool qemu_plugin_spec_mem_faulted_take(void)
     return true;
 }
 
+void qemu_plugin_spec_clear_exception(void)
+{
+    g_assert(current_cpu);
+    /*
+     * Drop a pending guest exception latched by a wrong-path execution-time
+     * fault (x86 #DE/#UD/#GP/#AC, INTO/BOUND; MIPS arithmetic overflow, a
+     * teq-family trap) that longjmped out of a speculative exec_tb.  The raise
+     * path (raise_exception_ra / cpu_loop_exit_restore) already restored the
+     * guest PC to the faulting instruction and left exception_index set; the
+     * wrong-path walker skips that insn and re-dispatches, so the next
+     * speculative exec_tb must start clean with no exception pending.
+     *
+     * EXCP_NONE is -1 in common code (cpu_loop_exit_noexc); this mirrors the
+     * exception_index field access qemu_plugin_cpu_state_save/_restore already
+     * use.  Arch-specific latches (x86 error_code, etc.) live inside the
+     * CPUArchState snapshot restored wholesale at excursion end
+     * (qemu_plugin_cpu_state_restore) and are inert unless an exception is
+     * actually delivered, which the speculative walker never does.
+     */
+    current_cpu->exception_index = -1;
+}
+
 void qemu_plugin_spec_mode_end(void)
 {
     g_assert(current_cpu);

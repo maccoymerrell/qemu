@@ -15,11 +15,13 @@ load.  A wrong-path chain must therefore now carry FAULT (never
 DEP_BRANCH_KILL) and run PAST the faulting block.
 
 Only a FRONT-end fault (translation-unavailable / can't-fetch) still stops
-the excursion, and a NON-memory synchronous fault -- an x86 divide-by-zero
-(#DE), and by the same mechanism any other arithmetic / illegal-opcode trap
--- still longjmps and is handled this pass by a graceful STOP: the block is
-marked FAULT and the excursion ends cleanly there (no kill, no poison).  The
-arithmetic pass will later upgrade these to continue like memory faults.
+the excursion.  A NON-memory EXECUTION-TIME fault -- an x86 divide-by-zero
+(#DE), and by the same mechanism any other arithmetic / illegal-opcode /
+conditional-trap exception -- still longjmps out of spec mode, but the walker
+now clears the pending exception, SKIPS the faulting instruction, and
+re-dispatches at its fall-through: the block is marked FAULT and the
+excursion CONTINUES to the wpdepth budget, just like a memory fault (no kill,
+no poison, no stop).
 
 Each case assembles a tiny freestanding program whose correct path *takes* a
 conditional branch, so the not-taken fall-through -- which the wrong-path
@@ -155,11 +157,14 @@ _start:
 
 # x86 divide-by-zero (#DE).  Arithmetic traps are x86-specific: aarch64 sdiv
 # and riscv div return a defined value on /0 rather than trapping.  A #DE
-# still longjmps out of spec mode, so this pass handles it with a graceful
-# STOP -- the block is marked FAULT and the excursion ends there (it does NOT
-# run to budget; the arithmetic pass will upgrade that later).
+# longjmps out of spec mode; the walker now skips the faulting div and
+# CONTINUES.  The div lives in a SHORT wrong-path block ending at a branch
+# (``jmp 3f``) so the fault block seals BEFORE the sled -- a graceful-stop
+# build stops right there (~3 WP insns), while the continue build carries on
+# into the separate sled block (block 3) and runs to the wpdepth budget.  That
+# separation is what makes the test fail pre-fix and pass post-fix.
 DIVZERO_ASM = {
-    "x86_64": """
+    "x86_64": f"""
 .intel_syntax noprefix
 .global _start
 .text
@@ -169,11 +174,12 @@ _start:
     cmp rax, 0
     jne 1f                     # correct path takes this; WP = fall-through
     xor rdx, rdx
-    div rcx                    # wrong-path #DE -> synthetic fault, graceful stop
-    test rax, rax
-    je 2f
-    nop
-2:  jmp 2b
+    div rcx                    # wrong-path #DE -> synthetic fault, then skip
+    jmp 3f                     # seal the fault block at a branch (before sled)
+3:  .rept {SLED}
+    add rax, 1                 # forward sled: continue build runs past wpdepth
+    .endr
+2:  jmp 2b                     # seal the sled block (budget already reached)
 1:  mov rax, 60
     xor rdi, rdi
     syscall
@@ -271,10 +277,13 @@ def test_x86_wildload_synthetic():
     _assert_wildload_synthetic("x86_64")
 
 
-def test_x86_divzero_graceful_stop():
-    # A non-memory synchronous fault (#DE) still longjmps; this pass marks it
-    # and stops the excursion cleanly (no kill, no poison).  It is marked but
-    # NOT required to run to budget -- the arithmetic pass will upgrade that.
+def test_x86_divzero_synthetic():
+    # A non-memory EXECUTION-TIME fault (#DE) longjmps out of spec mode, but the
+    # walker now clears the exception, skips the faulting div, and CONTINUES on
+    # placeholder data -- exactly like a bad load.  The div block is MARKED
+    # FAULT and the excursion runs to the wpdepth budget instead of stopping at
+    # the div.  This FAILS against a pre-fix (graceful-stop) build, which seals
+    # the ~3-insn fault block and stops before the sled, and PASSES post-fix.
     reason = _toolchain_ready("x86_64")
     if reason:
         raise unittest.SkipTest(reason)
@@ -286,6 +295,12 @@ def test_x86_divzero_graceful_stop():
         "trap must be tagged a synthetic fault just like a bad load.")
     assert not _has(blocks, "DEP_BRANCH_KILL"), (
         "x86_64: retired DEP_BRANCH_KILL still emitted for divzero")
+    total = sum(b["n_insns"] for b in blocks)
+    assert total >= WPDEPTH // 2, (
+        f"x86_64: wrong-path divide-by-zero excursion truncated early (total "
+        f"WP insns {total} < {WPDEPTH // 2}); an arithmetic wrong-path fault "
+        f"must skip the faulting insn and continue to the wpdepth={WPDEPTH} "
+        f"budget, not stop at the div.")
 
 
 def test_x86_wildload_no_mark_under_cst_no_fault():

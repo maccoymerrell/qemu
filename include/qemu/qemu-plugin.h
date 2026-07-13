@@ -1623,6 +1623,26 @@ QEMU_PLUGIN_API
 bool qemu_plugin_spec_mem_faulted_take(void);
 
 /**
+ * qemu_plugin_spec_clear_exception() - drop a pending speculative exception
+ *
+ * Clears the guest exception a wrong-path EXECUTION-TIME fault latched when it
+ * longjmped out of a speculative qemu_plugin_exec_tb() (x86 #DE/#UD/#GP/#AC,
+ * INTO/BOUND; MIPS arithmetic overflow, teq-family trap).  The raise path
+ * (raise_exception_ra / cpu_loop_exit_restore) already unwound the guest PC
+ * back to the faulting instruction and left cpu->exception_index set; a
+ * wrong-path walker that skips the faulting insn and re-dispatches must call
+ * this first so the next speculative exec_tb starts with no exception pending.
+ * Sets exception_index to EXCP_NONE (-1 in common code, as cpu_loop_exit_noexc
+ * does).  Any arch-specific latch (x86 error_code, etc.) is register state
+ * covered by the CPUArchState snapshot restored wholesale at excursion end and
+ * is inert unless an exception is actually delivered, which the walker never
+ * does.  Only meaningful between qemu_plugin_spec_mode_begin() and _end().
+ * Must be called from a vCPU context.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_spec_clear_exception(void);
+
+/**
  * qemu_plugin_get_priv_level() - current privilege level of the executing vCPU
  *
  * Returns a normalized privilege ordinal: 0 = user / least privileged,

@@ -3684,14 +3684,15 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
     accumulate_template_profiles(st, entry, num_wp);
     /* Declare the (asid, thread) context before the entry it scopes.
      * ASID first so the opening pair is [ASID_SWITCH][THREAD_SWITCH].
-     * Phase 1 stays single-ASID: index 0, declared once.  root_phys/sig
-     * are Phase 2's job (hook -> root-phys -> compact index + reuse
-     * signature); the tracked ASID root is not reachable on this emit
-     * path (g_pinned_asid is a static in champsim_tracer.cc and holds
-     * the architectural ASID, not the pgd root physical). */
+     * Single-ASID: index 0 declared once, carrying the pinned address
+     * space's REAL identity — its page-table root physical address and a
+     * representative code-page content signature (both 0 in user mode /
+     * unpinned, so those traces stay byte-identical).  Phase 3 replaces the
+     * hardcoded index 0 with a first-sighting root_phys -> compact-index map
+     * plus hook-driven switch detection across multiple address spaces. */
     emit_asid_switch_if_needed(st, /*asid_index=*/0,
-                               /*root_phys=*/0 /* TODO(P2): real pgd root */,
-                               /*sig=*/0 /* TODO(P2): content signature */);
+                               cst_pinned_asid_root(),
+                               cst_pinned_asid_sig());
     emit_thread_switch_if_needed(st, tid);
     emit_regfile_if_first(st, entry, tid);
 

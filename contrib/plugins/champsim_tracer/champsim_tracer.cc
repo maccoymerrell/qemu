@@ -548,6 +548,60 @@ static constexpr uint64_t PIN_PAGE_MASK = ~(uint64_t)0xFFF;
 static constexpr size_t PIN_SIG_BYTES = 256;
 
 /*
+ * Representative content signature of the pinned address space (Phase 2
+ * ASID identity — see multiasid_plan.md §2).  It disambiguates a
+ * page-table root physical address reused after a process dies, and rides
+ * the BODY_TAG_ASID_SWITCH record's first-sighting identity next to the
+ * root.
+ *
+ * Snapshotted at pin time from the MARKER instruction's own code page, so
+ * it is non-zero for EVERY pinned target — including the wide-register
+ * pins (x86 CR3 / AArch64 TTBR / RISC-V SATP) that never populate
+ * g_pin_page_map (that map, and its lowest-vpage "text start" page, exist
+ * only on the narrow-ASID MIPS reuse-guard path).  Where the map IS
+ * learned, pin_map_learn refines the representative down to the lowest
+ * learned code vpage (the text-segment start — deterministic and stable).
+ * Either way it is a fixed, deterministic FNV-1a over PIN_SIG_BYTES of a
+ * real code page.
+ *
+ * Written only under exec_lock (the pin-fire seed and pin_map_learn);
+ * @g_pin_repr_sig is atomic so cst_pinned_asid_sig() can read it O(1) on
+ * the emit hot path (it is evaluated on every body entry, though the wire
+ * consumes it only at the ASID index's first sighting) without asserting
+ * the lock.  0 when unpinned (user mode / no marker) — keeping user
+ * traces byte-identical. */
+static std::atomic<uint64_t> g_pin_repr_sig{0};
+static uint64_t g_pin_repr_vpage = UINT64_MAX;   /* lowest learned code vpage */
+
+/*
+ * Phase-2 ASID identity accessors for the body-stream emit path
+ * (body_stream_write_entry, output.cc), which runs under exec_lock as does
+ * every writer of these values.
+ */
+uint64_t cst_pinned_asid_root(void)
+{
+    /* g_pinned_asid caches qemu_plugin_get_addr_space_id() = the
+     * page-table root physical address (x86 CR3 with PCID/NOFLUSH already
+     * masked, AArch64 TTBR base, RISC-V SATP PPN, MIPS pgd).  Unpinned
+     * (user mode / no marker) → 0, the single-user-address-space id. */
+    uint64_t a = g_pinned_asid.load(std::memory_order_relaxed);
+    return a == CST_ASID_UNPINNED ? 0 : a;
+}
+
+uint64_t cst_pinned_asid_sig(void)
+{
+    /* A signature companions a REAL (non-zero) page-table root — i.e. a
+     * system-mode pin.  User mode (and unpinned) reports root 0, so the
+     * signature is 0 too, keeping those traces byte-identical: a user-mode
+     * marker trace pins the address-space register's user value (0 in
+     * linux-user), which is a valid pin but NOT a real page-table root. */
+    if (cst_pinned_asid_root() == 0) {
+        return 0;
+    }
+    return g_pin_repr_sig.load(std::memory_order_relaxed);
+}
+
+/*
  * Guest-thread identity for a system-mode pin.
  *
  * The wire's thread_id names a GUEST thread, not the vCPU it happens to
@@ -743,6 +797,27 @@ static bool pin_page_sig(uint64_t vpage, uint64_t *sig_out)
     return true;
 }
 
+/* Seed/refine the pinned space's representative content signature from the
+ * code page based at @pc in the CURRENT address space, adopting it only
+ * when its vpage is the lowest seen so far (so the representative converges
+ * on the text-segment start page — deterministic and stable).  Used for
+ * the wide-register pins that never learn g_pin_page_map; the narrow-ASID
+ * path refines the representative from inside pin_map_learn instead.
+ * Caller holds exec_lock (pin_page_sig's scratch buffer needs it). */
+static void pin_repr_seed(uint64_t pc)
+{
+    uint64_t vp = pc & PIN_PAGE_MASK;
+    if (vp >= g_pin_repr_vpage) {
+        return;
+    }
+    uint64_t sig;
+    if (!pin_page_sig(vp, &sig)) {
+        return;                 /* page unreadable now: seed on a later TB */
+    }
+    g_pin_repr_vpage = vp;
+    g_pin_repr_sig.store(sig, std::memory_order_relaxed);
+}
+
 static void pin_identity_reset(uint64_t marker_asid, unsigned int cpu_index)
 {
     if (!g_pin_page_map) {
@@ -783,6 +858,12 @@ static void pin_map_learn(uint64_t pc)
         return;                 /* page unreadable right now: learn later */
     }
     g_pin_page_map->emplace(vp, PinPage{pa & PIN_PAGE_MASK, sig});
+    /* Refine the representative content signature toward the lowest learned
+     * code vpage (reusing the sig just computed — no second hash). */
+    if (vp < g_pin_repr_vpage) {
+        g_pin_repr_vpage = vp;
+        g_pin_repr_sig.store(sig, std::memory_order_relaxed);
+    }
     g_stats.pin_pages_mapped++;
 }
 
@@ -3738,18 +3819,38 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
     uint64_t asid = qemu_plugin_get_addr_space_id();
     g_pinned_asid.store(asid, std::memory_order_relaxed);
     pin_reuse_reset();
+    /* Snapshot this pin's ASID identity (Phase 2): the root physical
+     * address is @asid itself (cached above); the representative content
+     * signature is seeded from the marker's own code page.  @pc is this
+     * callback's own instruction address (from its udata), NOT
+     * qemu_plugin_get_pc(): the env PC is only synced at TB
+     * boundaries/exceptions, so a mid-TB read is stale and would hash a
+     * bogus page.  exec_lock guards the shared scratch buffer / page map
+     * against concurrent step-glue probes on other vCPUs. */
     if (g_pin_reuse_guard) {
-        /* Physical-page identity: seat the marker vCPU's dwell and seed
-         * the map with the marker's own page — the process is executing
-         * it right now, so the translation is live.  @pc is this
-         * callback's own instruction address (from its udata), NOT
-         * qemu_plugin_get_pc(): the env PC is only synced at TB
-         * boundaries/exceptions, so a mid-TB read is stale and would
-         * seed a bogus page.  exec_lock guards the map against
-         * concurrent step-glue probes on other vCPUs. */
+        /* Narrow-ASID (MIPS): seat the marker vCPU's dwell and seed the
+         * page map with the marker's own live-translated page; pin_map_learn
+         * also seeds the representative and later refines it to the lowest
+         * learned code vpage.  Existing behaviour (runs for user and system
+         * mode); the representative it fills is used only when a real root
+         * is present (system mode). */
         g_rec_mutex_lock(&exec_lock);
+        g_pin_repr_vpage = UINT64_MAX;
+        g_pin_repr_sig.store(0, std::memory_order_relaxed);
         pin_identity_reset(asid, cpu_index);
         pin_map_learn(pc);
+        g_rec_mutex_unlock(&exec_lock);
+    } else if (asid != 0) {
+        /* Wide-register SYSTEM pin (x86 CR3 / AArch64 TTBR / RISC-V SATP):
+         * no page map is learned, so seed the representative directly from
+         * the marker's own code page.  Gated on a real (non-zero) root:
+         * user-mode pins report asid 0 and need no signature, so this path
+         * — and its lock / guest read — never runs in user mode, leaving
+         * user traces byte-identical. */
+        g_rec_mutex_lock(&exec_lock);
+        g_pin_repr_vpage = UINT64_MAX;
+        g_pin_repr_sig.store(0, std::memory_order_relaxed);
+        pin_repr_seed(pc);
         g_rec_mutex_unlock(&exec_lock);
     }
 

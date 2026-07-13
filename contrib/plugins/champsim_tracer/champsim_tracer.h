@@ -1236,6 +1236,16 @@ static inline bool cst_pc_in_code(uint64_t pc)
  * byte change detected at translation time)?  Acquires data_lock. */
 bool cst_pc_is_poisoned(uint64_t pc);
 
+/* Phase-2 ASID identity of the single pinned address space (see
+ * multiasid_plan.md §2), read on the body-stream emit path to fill the
+ * BODY_TAG_ASID_SWITCH record's first-sighting identity.  Root = the
+ * page-table root physical address (masked CR3 / TTBR base / SATP PPN /
+ * MIPS pgd); sig = a stable representative code-page content signature.
+ * Both are 0 when unpinned (user mode / no marker), keeping user traces
+ * byte-identical.  The emit path holds exec_lock, as does every writer. */
+uint64_t cst_pinned_asid_root(void);
+uint64_t cst_pinned_asid_sig(void);
+
 /* Why the most recent spec-mode exec_tb produced no template (TLS; set
  * before each spec exec_tb, refined by detect_tb_poison).  Diagnostic
  * plumbing for the wrong-path first-TB-unavailable classification. */

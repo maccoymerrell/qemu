@@ -3678,9 +3678,15 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
     uint64_t body_start = bw_tell_bytes(&st->bw);
     uint32_t tid = entry->thread_id;
     /* The (asid, thread) context key for the per-context field-state and
-     * regfile tables.  Single-address-space (asid_index == 0) → key == tid,
-     * so those tables are indexed exactly as before. */
-    uint64_t ctx_key = ((uint64_t)entry->asid_index << 32) | tid;
+     * regfile tables.  Keyed on the CONTEXT (process) asid, not the memory
+     * asid: in system mode a thread's kernel excursion runs under a distinct
+     * kernel CR3 (KPTI) but must keep ONE register-file context, so
+     * ctx_asid_index holds the entering process's user CR3 across the
+     * excursion.  The per-entry memory tag below still uses entry->asid_index
+     * (the live kernel/user root).  User mode / unpinned: ctx_asid_index ==
+     * asid_index (== 0 for a single address space) → key == tid, so those
+     * tables are indexed exactly as before and the trace stays byte-identical. */
+    uint64_t ctx_key = ((uint64_t)entry->ctx_asid_index << 32) | tid;
 
     dyn_params_sort_template_order(entry->dyn_params);
     for (uint32_t w = 0; w < num_wp; w++) {

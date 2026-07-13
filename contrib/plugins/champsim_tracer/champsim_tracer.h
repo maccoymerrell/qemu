@@ -926,6 +926,16 @@ struct BodyEntry {
      * BODY_TAG_ASID_SWITCH.  Default 0 so any entry built off the main
      * capture path stays single-address-space. */
     uint32_t asid_index = 0;
+    /* Context asid index — the PROCESS asid, used ONLY to key the per-
+     * (asid,thread) regfile / FieldState tables, decoupled from the memory
+     * asid above.  Pinned system mode: the entering process's user CR3
+     * index, held stable across a kernel excursion, so one guest thread
+     * keeps a single register-file context across user<->kernel even under
+     * KPTI's distinct kernel CR3.  Equals asid_index in user mode /
+     * unpinned (live == process), keeping those traces byte-identical.
+     * INTERNAL: a table key only, never serialised.  Default 0 to match
+     * asid_index's single-address-space default. */
+    uint32_t ctx_asid_index = 0;
     /* QEMU vCPU index this entry came from — used ONLY for live register
      * reads (BODY_TAG_REGFILE capture on a thread's first emit, WP lane
      * gates); never serialised.  Distinct from thread_id: on a system

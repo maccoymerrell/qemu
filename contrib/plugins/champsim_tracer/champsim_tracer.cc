@@ -687,6 +687,16 @@ static std::unordered_map<uint64_t, uint32_t> *g_thread_tid_map;
 static uint32_t g_thread_tid_next = 0;
 static uint32_t g_vcpu_cur_tid[CST_PIN_MAX_VCPUS];
 
+/* g_vcpu_cur_asid_index[c] is the address-space sibling of g_vcpu_cur_tid:
+ * the compact asid index of the most recent USER TB on vCPU c.  A kernel
+ * excursion of the pinned process inherits it unchanged, so the thread's
+ * regfile/FieldState CONTEXT stays keyed on the ENTERING process's user CR3
+ * across user<->kernel (option a: the context asid is the process asid,
+ * decoupled from the per-entry MEMORY asid, which keeps the live kernel CR3
+ * tag on the wire).  Reset / seeded / advanced in lockstep with
+ * g_vcpu_cur_tid; guarded by exec_lock and reset per segment. */
+static uint32_t g_vcpu_cur_asid_index[CST_PIN_MAX_VCPUS];
+
 /*
  * Pinned-process migration-detect guard (system-mode pin, SMP guests).
  *
@@ -806,6 +816,7 @@ static void thread_identity_reset(void)
     g_thread_tid_next = 0;
     for (unsigned i = 0; i < CST_PIN_MAX_VCPUS; i++) {
         g_vcpu_cur_tid[i] = 0;
+        g_vcpu_cur_asid_index[i] = 0;
         g_vcpu_last_tp[i] = CST_TP_UNSEEN;
     }
     g_pin_user_vcpu_mask = 0;
@@ -896,6 +907,24 @@ static inline uint32_t resolve_asid_index(unsigned int cpu_index)
     (void)cpu_index;
     uint64_t root = qemu_plugin_get_addr_space_id();
     return asid_root_to_index(root, cst_pinned_asid_sig());
+}
+
+/* The CONTEXT asid index used ONLY to key the per-(asid,thread) regfile /
+ * FieldState tables — the PROCESS asid, decoupled from the per-entry memory
+ * asid (entry->asid_index, which stays the live page-table root).  Pinned:
+ * the entering process's user CR3 index (g_vcpu_cur_asid_index, held stable
+ * across a kernel excursion), so a thread keeps ONE register-file context
+ * across user<->kernel even under KPTI's distinct kernel CR3.  User mode /
+ * unpinned: the live index, where live == process anyway, so the key (and
+ * hence the whole trace) stays byte-identical.  Mirrors resolve_thread_id;
+ * caller holds exec_lock. */
+static inline uint32_t resolve_ctx_asid_index(unsigned int cpu_index)
+{
+    if (g_pinned_asid.load(std::memory_order_relaxed) != CST_ASID_UNPINNED &&
+        cpu_index < CST_PIN_MAX_VCPUS) {
+        return g_vcpu_cur_asid_index[cpu_index];
+    }
+    return resolve_asid_index(cpu_index);
 }
 
 /* Look up the stored identity (page-table root physical address + content
@@ -1817,6 +1846,7 @@ static void start_trace_segment(const char *label,
     if (g_pinned_asid.load(std::memory_order_relaxed) != CST_ASID_UNPINNED &&
         cpu_index < CST_PIN_MAX_VCPUS) {
         seed_thread_id = 0;
+        uint32_t seed_asid_index = 0;
         if (qemu_plugin_get_priv_level() == 0) {
             uint64_t tp = qemu_plugin_get_thread_ptr();
             seed_thread_id = thread_ptr_to_tid(tp);
@@ -1827,8 +1857,17 @@ static void start_trace_segment(const char *label,
             if (tiddiag_on()) {
                 tiddiag_note_binding(cpu_index, seed_thread_id);
             }
+            /* The live user root at priv 0 IS the process's user CR3, so
+             * seed the context asid to it (the tables' process key).  A
+             * kernel excursion before the first user TB then folds to the
+             * entering process rather than the KPTI kernel CR3.  Just after
+             * asid_identity_reset, so this first-sighting maps to index 0 —
+             * single-address-space stays byte-identical. */
+            seed_asid_index = asid_root_to_index(
+                qemu_plugin_get_addr_space_id(), cst_pinned_asid_sig());
         }
         g_vcpu_cur_tid[cpu_index] = seed_thread_id;
+        g_vcpu_cur_asid_index[cpu_index] = seed_asid_index;
     }
 
     g_trace_segments.start(label, start, stop, warmup, total_target,
@@ -2045,6 +2084,10 @@ void emit_body_entry(BodyStreamState *out_stream,
      * thread_id and frozen onto the entry, so a deferred emit carries the
      * index captured at execution time. */
     entry.asid_index = resolve_asid_index(cpu_index);
+    /* Context asid (regfile / FieldState table key ONLY): the process asid,
+     * held stable across a kernel excursion.  Equals asid_index in user
+     * mode / unpinned, so the key is unchanged there. */
+    entry.ctx_asid_index = resolve_ctx_asid_index(cpu_index);
     entry.cpu_index = cpu_index;
 
     g_mem_recorder.drain_cp_into_dyn_params(entry.dyn_params, bb_tmpl);
@@ -2127,6 +2170,7 @@ void emit_body_entry(BodyStreamState *out_stream,
                     sub_e.tmpl        = rep_sub;
                     sub_e.thread_id   = entry.thread_id;
                     sub_e.asid_index  = entry.asid_index;
+                    sub_e.ctx_asid_index = entry.ctx_asid_index;
                     sub_e.cpu_index   = entry.cpu_index;
                     sub_e.dyn_params.reserve(mpi);
                     for (unsigned j = 0; j < mpi; j++) {
@@ -3242,6 +3286,15 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
                 tiddiag_note_binding(cpu_index, new_tid);
             }
         }
+        /* Context-asid sibling of the tid refresh: the live user root at
+         * priv 0 IS the process's user CR3.  Record it (idempotent — same
+         * root maps to the same index) so a subsequent kernel excursion
+         * folds this thread's regfile/FieldState CONTEXT to the entering
+         * process, not the KPTI kernel CR3.  Set every user TB (not only on
+         * a tid change) so it holds the entering asid at the excursion. */
+        g_vcpu_cur_asid_index[cpu_index] =
+            asid_root_to_index(qemu_plugin_get_addr_space_id(),
+                               cst_pinned_asid_sig());
         /* Migration-detect guard: record this vCPU in the pinned process's
          * per-segment user-vCPU set (every user TB, not only on a tid
          * change), firing one warning if the process spans vCPUs. */

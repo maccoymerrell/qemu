@@ -418,6 +418,7 @@ static bool cap_decode_aarch64_vas(unsigned vas,
 static uint8_t cap_lane_bytes_from_mnemonic(const char *mnem);
 static bool cap_x86_is_extract_store(const char *mnem);
 static bool cap_x86_is_move_family(const char *mnem);
+static bool cap_x86_is_test(const char *mnem);
 
 /*
  * Extract per-operand detail for x86 into the plugin operand struct.
@@ -465,12 +466,24 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
     }
     bool move_store = mv_fam && mv_has_mem && mv_has_reg
         && !mv_any_write;
+    /* Capstone-6.0.0 bug: the register-source form of TEST (opcodes
+     * 84/85, `test r/m, r`) reports EVERY operand with empty access, so
+     * its MEM operand's READ is lost and it mints no load slot (the
+     * offline lint then flags the observed load as impossible).  TEST
+     * only reads its operands — it writes flags, never memory or a
+     * register — so force READ on any empty-access operand below.  The
+     * immediate forms (F6/F7) already report the MEM operand READ and
+     * are left untouched (their access is non-zero). */
+    bool test_read = cap_x86_is_test(insn->mnemonic);
 
     for (uint8_t i = 0; i < n; i++) {
         const cs_x86_op *cop = &x86->operands[i];
         qemu_plugin_operand *op = &out->operands[i];
 
         op->access = cop->access;
+        if (test_read && op->access == 0) {
+            op->access = QEMU_PLUGIN_OP_ACC_READ;
+        }
         op->size = cop->size;
         op->lane_bytes = insn_lane_bytes;
         op->scale = 1;
@@ -585,6 +598,18 @@ static bool cap_x86_is_extract_store(const char *mnem)
     if (mnem[0] == 'v') mnem++;            /* VEX/EVEX prefix */
     return g_str_has_prefix(mnem, "pextr") ||
            g_str_equal(mnem, "extractps");
+}
+
+/* The scalar integer TEST (`test r/m, r` / `test r/m, imm`).  Its
+ * register-source encodings lose all Capstone access flags (see the
+ * test_read workaround in cap_fill_x86_operands); TEST never writes an
+ * operand, so any empty-access operand is a lost READ. */
+static bool cap_x86_is_test(const char *mnem)
+{
+    /* AT&T syntax (QEMU's) size-suffixes the mnemonic: testb/testw/
+     * testl/testq.  Prefix-match — no other x86 mnemonic starts with
+     * "test" (ktest/vptest begin with k/v). */
+    return mnem && g_str_has_prefix(mnem, "test");
 }
 
 /*

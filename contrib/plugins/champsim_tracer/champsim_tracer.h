@@ -919,6 +919,13 @@ struct BodyEntry {
      * migration) or the vCPU index (user mode / unpinned).  This is the
      * ONLY thread field that reaches the stream. */
     uint32_t thread_id;
+    /* Wire address-space identity: the compact asid index of the live
+     * page-table root at capture (0 in user mode / a single address space).
+     * Pairs with thread_id as the body context (asid, thread); keys the
+     * per-context field-state / regfile tables and drives
+     * BODY_TAG_ASID_SWITCH.  Default 0 so any entry built off the main
+     * capture path stays single-address-space. */
+    uint32_t asid_index = 0;
     /* QEMU vCPU index this entry came from — used ONLY for live register
      * reads (BODY_TAG_REGFILE capture on a thread's first emit, WP lane
      * gates); never serialised.  Distinct from thread_id: on a system
@@ -1245,6 +1252,13 @@ bool cst_pc_is_poisoned(uint64_t pc);
  * byte-identical.  The emit path holds exec_lock, as does every writer. */
 uint64_t cst_pinned_asid_root(void);
 uint64_t cst_pinned_asid_sig(void);
+
+/* Identity (page-table root physical address + content signature) of a
+ * compact asid index, as recorded on the index's first sighting.  Returns
+ * false for an unassigned index.  The body-stream emit path carries this
+ * inline on an index's first BODY_TAG_ASID_SWITCH.  Caller holds exec_lock,
+ * as does every writer of the identity store. */
+bool cst_asid_identity(uint32_t index, uint64_t *root, uint64_t *sig);
 
 /* Why the most recent spec-mode exec_tb produced no template (TLS; set
  * before each spec exec_tb, refined by detect_tb_poison).  Diagnostic

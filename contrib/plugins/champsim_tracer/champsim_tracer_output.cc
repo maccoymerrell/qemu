@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <vector>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "champsim_tracer.h"
@@ -542,18 +543,21 @@ struct BodyStreamState {
     /* False until the first BODY_TAG_THREAD_SWITCH; forces it so the
      * starting thread is an explicit delta-from-0, no implicit base. */
     bool    thread_announced;
-    /* Per-guest-thread field-state tables, keyed by the entry's
-     * thread_id (the guest-thread identity, not the vCPU), lazy-grown on
-     * first emit (slot null until then).  Deltas stay within-thread, not
-     * cross-thread — a thread that migrates across vCPUs keeps one id and
-     * one continuous overlay.  CP state persists across a thread's
-     * entries; WP state is a per-chain overlay falling back to that
-     * thread's CP state. */
-    std::vector<FieldStateTable *> cp_field_state;
-    std::vector<FieldStateTable *> wp_field_state;
-    /* Whether thread_id has emitted its BODY_TAG_REGFILE this segment.
-     * Indexed by thread_id; resized on demand. */
-    std::vector<bool> regfile_emitted;
+    /* Per-context field-state tables, keyed by the (asid_index,
+     * thread_id) PAIR — a guest thread-pointer can collide across address
+     * spaces, so the address space is part of the identity.  The combined
+     * key is ((uint64_t)asid_index << 32) | thread_id; single-address-space
+     * traces (asid_index == 0) key on thread_id exactly as before.  Tables
+     * lazy-allocate on first emit.  Deltas stay within-context — a thread
+     * that migrates across vCPUs keeps one id and one continuous overlay.
+     * CP state persists across a context's entries; WP state is a per-chain
+     * overlay falling back to that context's CP state. */
+    std::unordered_map<uint64_t, FieldStateTable *> cp_field_state;
+    std::unordered_map<uint64_t, FieldStateTable *> wp_field_state;
+    /* Which (asid_index, thread_id) contexts have emitted their
+     * BODY_TAG_REGFILE this segment (same combined key as the field-state
+     * maps); presence == emitted. */
+    std::unordered_set<uint64_t> regfile_emitted;
     /* Segment-starting vCPU's pre-first-BB regfile (captured by
      * start_trace_segment before any traced BB on that thread),
      * consumed at that thread's first emit then cleared.  Threads
@@ -3198,19 +3202,18 @@ static void emit_body_record_payload(
 }
 
 /*
- * Lazily fetch/allocate the per-thread FieldStateTable at @vec[tid].
- * Result stable across grows (vector holds pointers).
+ * Lazily fetch/allocate the per-context FieldStateTable for @ctx_key (the
+ * combined (asid_index, thread_id) key).  The returned table is heap-owned
+ * and stable across further map insertions.
  */
 static FieldStateTable *get_or_create_per_thread_fst(
-    std::vector<FieldStateTable *> &vec, uint32_t tid)
+    std::unordered_map<uint64_t, FieldStateTable *> &m, uint64_t ctx_key)
 {
-    if (tid >= vec.size()) {
-        vec.resize((size_t)tid + 1, nullptr);
+    FieldStateTable *&slot = m[ctx_key];
+    if (!slot) {
+        slot = field_state_table_new();
     }
-    if (!vec[tid]) {
-        vec[tid] = field_state_table_new();
-    }
-    return vec[tid];
+    return slot;
 }
 
 /*
@@ -3618,12 +3621,11 @@ static void emit_thread_switch_if_needed(BodyStreamState *st, uint32_t tid)
  * per-thread pre-exec hook).
  */
 static void emit_regfile_if_first(BodyStreamState *st, BodyEntry *entry,
-                                  uint32_t tid)
+                                  uint32_t tid, uint64_t ctx_key)
 {
-    if (tid >= st->regfile_emitted.size()) {
-        st->regfile_emitted.resize((size_t)tid + 1, false);
-    }
-    if (st->regfile_emitted[tid]) {
+    /* Keyed on the (asid, thread) context, but the wire record still
+     * carries the bare thread_id — the register file is thread state. */
+    if (st->regfile_emitted.count(ctx_key)) {
         return;
     }
     if ((int32_t)tid == st->seed_thread && !st->seed_regfile.empty()) {
@@ -3635,7 +3637,7 @@ static void emit_regfile_if_first(BodyStreamState *st, BodyEntry *entry,
         capture_initial_regfile(entry->cpu_index, &snaps);
         emit_regfile_record(&st->bw, tid, snaps);
     }
-    st->regfile_emitted[tid] = true;
+    st->regfile_emitted.insert(ctx_key);
 }
 
 /*
@@ -3675,6 +3677,10 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
     uint32_t num_wp = (uint32_t)entry->wp_entries.size();
     uint64_t body_start = bw_tell_bytes(&st->bw);
     uint32_t tid = entry->thread_id;
+    /* The (asid, thread) context key for the per-context field-state and
+     * regfile tables.  Single-address-space (asid_index == 0) → key == tid,
+     * so those tables are indexed exactly as before. */
+    uint64_t ctx_key = ((uint64_t)entry->asid_index << 32) | tid;
 
     dyn_params_sort_template_order(entry->dyn_params);
     for (uint32_t w = 0; w < num_wp; w++) {
@@ -3687,21 +3693,23 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
      * Single-ASID: index 0 declared once, carrying the pinned address
      * space's REAL identity — its page-table root physical address and a
      * representative code-page content signature (both 0 in user mode /
-     * unpinned, so those traces stay byte-identical).  Phase 3 replaces the
-     * hardcoded index 0 with a first-sighting root_phys -> compact-index map
-     * plus hook-driven switch detection across multiple address spaces. */
-    emit_asid_switch_if_needed(st, /*asid_index=*/0,
-                               cst_pinned_asid_root(),
-                               cst_pinned_asid_sig());
+     * unpinned, so those traces stay byte-identical).  The index and its
+     * identity come from the entry itself (resolved and stored at capture):
+     * single-address-space traces carry index 0 with a {0,0} or pinned
+     * identity, exactly as the hardcoded emit did; Stage B's multi-process
+     * gating is what makes the index vary and switch mid-stream. */
+    uint64_t asid_root = 0, asid_sig = 0;
+    cst_asid_identity(entry->asid_index, &asid_root, &asid_sig);
+    emit_asid_switch_if_needed(st, entry->asid_index, asid_root, asid_sig);
     emit_thread_switch_if_needed(st, tid);
-    emit_regfile_if_first(st, entry, tid);
+    emit_regfile_if_first(st, entry, tid, ctx_key);
 
-    /* Regular delta-encoded entry against this thread's persistent
-     * per-vCPU overlays (deltas stay within-thread, compressible). */
+    /* Regular delta-encoded entry against this context's persistent
+     * per-(asid,thread) overlays (deltas stay within-context, compressible). */
     FieldStateTable *cp_fst = get_or_create_per_thread_fst(
-        st->cp_field_state, tid);
+        st->cp_field_state, ctx_key);
     FieldStateTable *wp_fst = get_or_create_per_thread_fst(
-        st->wp_field_state, tid);
+        st->wp_field_state, ctx_key);
 
     bw_write_u8(&st->bw, BODY_TAG_ENTRY);
     bw_write_sleb128(&st->bw, entry_tmpl - st->prev_entry_template);
@@ -3763,12 +3771,12 @@ void body_stream_finish(BodyStreamState *st, GByteArray **header_bytes)
     g_stats.bin_header_bits += (end_bytes - stats_start) * 8;
     g_stats.bin_total_bits += end_bytes * 8;
 
-    for (FieldStateTable *t : st->cp_field_state) {
-        if (t) field_state_table_free(t);
+    for (auto &kv : st->cp_field_state) {
+        if (kv.second) field_state_table_free(kv.second);
     }
     st->cp_field_state.clear();
-    for (FieldStateTable *t : st->wp_field_state) {
-        if (t) field_state_table_free(t);
+    for (auto &kv : st->wp_field_state) {
+        if (kv.second) field_state_table_free(kv.second);
     }
     st->wp_field_state.clear();
     if (st->iframe_cp_scratch) {

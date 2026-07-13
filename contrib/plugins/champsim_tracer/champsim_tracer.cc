@@ -773,6 +773,100 @@ static inline uint32_t resolve_thread_id(unsigned int cpu_index)
     return (uint32_t)cpu_index;
 }
 
+/*
+ * Compact per-entry ASID index — the address-space sibling of the
+ * guest-thread tid above, built the same way.  The wire's asid_index
+ * names an ADDRESS SPACE (a page-table root), not the vCPU running in it:
+ * a per-SEGMENT map assigns each distinct root physical address a compact
+ * index in first-sighting order (0, 1, 2, …), so a single-address-space
+ * trace is always index 0 (user mode's root is 0 → index 0 too) and the
+ * field width is never stressed.  A parallel identity store records each
+ * index's identity — its page-table root physical address and a content
+ * signature — so the body-stream emit can carry that identity inline on
+ * the index's first sighting (mirroring the register-file snapshot).
+ *
+ * Both structures are guarded by exec_lock (every sample and every emit
+ * runs under it) and reset per segment, exactly like the tid map.  In
+ * Stage A there is a single address space, so every entry resolves to
+ * index 0 and the output stays byte-identical to the single-thread wire;
+ * Stage B (multi-process gating) is what activates further indices.
+ */
+struct AsidIdentity {
+    uint64_t root_phys;   /* page-table root physical address (0 = user) */
+    uint64_t sig;         /* content signature companioning a real root */
+};
+static std::unordered_map<uint64_t, uint32_t> *g_asid_index_map;
+static std::vector<AsidIdentity> *g_asid_identity_store;
+static uint32_t g_asid_index_next = 0;
+
+/* Map a page-table root physical address to its compact per-segment asid
+ * index (first-sighting order), recording the index's identity on first
+ * sighting.  Caller holds exec_lock, exactly like thread_ptr_to_tid. */
+static uint32_t asid_root_to_index(uint64_t root_phys, uint64_t sig)
+{
+    if (!g_asid_index_map) {
+        g_asid_index_map = new std::unordered_map<uint64_t, uint32_t>();
+        g_asid_identity_store = new std::vector<AsidIdentity>();
+    }
+    auto it = g_asid_index_map->find(root_phys);
+    if (it != g_asid_index_map->end()) {
+        return it->second;
+    }
+    uint32_t index = g_asid_index_next++;
+    g_asid_index_map->emplace(root_phys, index);
+    g_asid_identity_store->push_back(AsidIdentity{root_phys, sig});
+    return index;
+}
+
+/* Reset the per-segment asid identity map and index store.  Caller holds
+ * exec_lock (via reset_segment_local_state), mirroring
+ * thread_identity_reset. */
+static void asid_identity_reset(void)
+{
+    if (g_asid_index_map) {
+        g_asid_index_map->clear();
+    }
+    if (g_asid_identity_store) {
+        g_asid_identity_store->clear();
+    }
+    g_asid_index_next = 0;
+}
+
+/* The compact asid index stamped on an emitted body entry: the LIVE
+ * address space's page-table root, first-sighting-mapped.  Root 0 (user
+ * mode / a single address space) → index 0, keeping those traces byte-
+ * identical.  cpu_index is retained for symmetry with resolve_thread_id
+ * (Stage B derives the per-process signature from the running context);
+ * called from a vCPU context, so qemu_plugin_get_addr_space_id() and
+ * cst_pinned_asid_sig() are valid.  Caller holds exec_lock. */
+static inline uint32_t resolve_asid_index(unsigned int cpu_index)
+{
+    (void)cpu_index;
+    uint64_t root = qemu_plugin_get_addr_space_id();
+    return asid_root_to_index(root, cst_pinned_asid_sig());
+}
+
+/* Look up the stored identity (page-table root physical address + content
+ * signature) of a compact asid index for the body-stream emit path.
+ * Returns false for an index never assigned (leaving the outputs
+ * untouched).  Caller holds exec_lock, as does every writer of the store,
+ * so the read needs no additional locking — the same contract as
+ * cst_pinned_asid_root/sig. */
+bool cst_asid_identity(uint32_t index, uint64_t *root, uint64_t *sig)
+{
+    if (!g_asid_identity_store || index >= g_asid_identity_store->size()) {
+        return false;
+    }
+    const AsidIdentity &id = (*g_asid_identity_store)[index];
+    if (root) {
+        *root = id.root_phys;
+    }
+    if (sig) {
+        *sig = id.sig;
+    }
+    return true;
+}
+
 /* Content signature of the guest code page based at @vpage in the
  * CURRENT address space: FNV-1a over PIN_SIG_BYTES from the page base
  * (the read is page-bounded, so it never straddles into an unmapped
@@ -1582,6 +1676,11 @@ static void reset_segment_local_state(void)
      * by start_trace_segment below. */
     thread_identity_reset();
 
+    /* Per-segment address-space identity: asid indices are likewise
+     * assigned in first-sighting order WITHIN a segment, so the root->index
+     * map and its identity store start fresh here (mirroring the tid map). */
+    asid_identity_reset();
+
     /*
      * Other threads' TLS state (cp_chain, tls_cp_mem_accesses,
      * pending_reg_snaps) can't be touched directly.  Bumping
@@ -1876,6 +1975,12 @@ void emit_body_entry(BodyStreamState *out_stream,
      * index otherwise.  cpu_index is retained for live register reads only
      * (regfile capture, WP lane gates) and never reaches the stream. */
     entry.thread_id = resolve_thread_id(cpu_index);
+    /* Address-space identity on the wire: the compact index of the live
+     * page-table root (index 0 in user mode / a single address space, so
+     * those traces stay byte-identical).  Resolved here alongside
+     * thread_id and frozen onto the entry, so a deferred emit carries the
+     * index captured at execution time. */
+    entry.asid_index = resolve_asid_index(cpu_index);
     entry.cpu_index = cpu_index;
 
     g_mem_recorder.drain_cp_into_dyn_params(entry.dyn_params, bb_tmpl);
@@ -1957,6 +2062,7 @@ void emit_body_entry(BodyStreamState *out_stream,
                     sub_e.template_id = rep_sub->template_id;
                     sub_e.tmpl        = rep_sub;
                     sub_e.thread_id   = entry.thread_id;
+                    sub_e.asid_index  = entry.asid_index;
                     sub_e.cpu_index   = entry.cpu_index;
                     sub_e.dyn_params.reserve(mpi);
                     for (unsigned j = 0; j < mpi; j++) {

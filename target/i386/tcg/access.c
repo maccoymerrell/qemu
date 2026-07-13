@@ -31,7 +31,16 @@ void access_prepare_mmu(X86Access *ret, CPUX86State *env,
     haddr1 = probe_access(env, vaddr, size1, type, mmu_idx, ra);
     ret->haddr1 = haddr1;
 
-    if (unlikely(size2)) {
+    /*
+     * When haddr1 is NULL, probe_access forced the slow path — under plugin
+     * speculative (wrong-path) execution probe_access returns NULL so the spec
+     * sandbox can intercept every unit access via access_ptr's !haddr1
+     * short-circuit.  There is then no host pointer to resolve for a second
+     * page, and the USER_ONLY contiguity assert below would fire on the two
+     * NULL probes for a page-crossing access.  Only resolve page 2 when page 1
+     * yielded a real host pointer; otherwise the whole access goes slow-path.
+     */
+    if (unlikely(size2) && haddr1) {
         haddr2 = probe_access(env, vaddr + size1, size2, type, mmu_idx, ra);
         if (haddr2 == haddr1 + size1) {
             ret->size1 = size;

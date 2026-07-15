@@ -593,6 +593,13 @@ struct PinVcpuState {
     /* Current dwell verified by a map hit.  Cleared by every committed
      * ASID write on this vCPU; set by the step glue's probe. */
     std::atomic<bool> confirmed{false};
+    /* Which owned process this vCPU's confirmed dwell belongs to — an
+     * index into g_owned_procs (multi-ASID Stage B3, narrow-ASID targets).
+     * -1 until first acquisition; also retained across an unconfirmed span
+     * as the O(1) re-probe hint (the value recycled but the process usually
+     * resumes as the same owner).  Single-owner (legacy / wide) leaves it
+     * 0 / unused. */
+    std::atomic<int> owner{-1};
 };
 static PinVcpuState g_pin_vcpu[CST_PIN_MAX_VCPUS];
 /* One learned code page.  @ppage is the fast-path frame identity (last
@@ -602,11 +609,49 @@ struct PinPage {
     uint64_t ppage;
     uint64_t sig;
 };
-/* vpage -> {ppage, sig} of user code the pinned process executed.
- * Immortal; guarded by exec_lock.  4 KiB granule: a larger guest page
- * yields multiple consistent sub-entries. */
-static std::unordered_map<uint64_t, PinPage> *g_pin_page_map;
 static constexpr uint64_t PIN_PAGE_MASK = ~(uint64_t)0xFFF;
+
+/*
+ * One owned process on a narrow-ASID target (MIPS), multi-ASID Stage B3.
+ *
+ * Generalizes the single g_pin_page_map: each process that ran a START
+ * marker (and has not run its END marker) is one OwnedProc with its OWN
+ * learned-code-page map — because an 8-bit EntryHi.ASID cannot name a
+ * process by value, the page map itself IS the process's identity.  A
+ * vCPU's dwell confirms against WHICHEVER owned process's map matches the
+ * executing user code (pin_map_probe_owners), and capture attributes to
+ * that owner.
+ *
+ * The stable wire handle is @root_phys — the marker code page's PHYSICAL
+ * address (a real, stable physical anchor; MIPS exposes no readable pgd
+ * root, so this deviates from multiasid_plan §2's "pgd root", see
+ * marker_anchor()).  @root_phys + @marker_sig ride the BODY_TAG_ASID_SWITCH
+ * first-sighting identity and, mapped through asid_root_to_index, give the
+ * owner a compact wire asid_index that is STABLE across an EntryHi.ASID
+ * rollover (the raw value is never the wire key).  A single owner reduces to
+ * the former single-pin behaviour; user mode (asid 0) uses root_phys/sig
+ * (0,0) so user traces stay byte-identical.
+ *
+ * @active is cleared (not erased) when the process runs its END marker, so
+ * PinVcpuState.owner indices stay valid for the segment; the vector is
+ * reset only at a marker-driven re-seed (pin_owned_reset_single).  Immortal
+ * (see docs/architecture.rst "Immortal process-wide aggregates"); guarded
+ * by exec_lock, like the map it replaces.
+ */
+struct OwnedProc {
+    std::unordered_map<uint64_t, PinPage> pages;   /* vpage -> {ppage, sig} */
+    uint64_t root_phys = 0;          /* stable wire anchor (marker page phys) */
+    uint64_t marker_sig = 0;         /* content signature companioning it */
+    uint64_t repr_vpage = UINT64_MAX;/* lowest learned code vpage (text start) */
+    bool     active = false;         /* false after this process's END marker */
+};
+/* The owned-process set (narrow-ASID Stage B3).  Immortal; guarded by
+ * exec_lock.  Empty on wide-register targets (they use g_owned + the
+ * live-root equality gate); populated only on g_pin_reuse_guard targets. */
+static std::vector<OwnedProc> *g_owned_procs;
+/* Count of ACTIVE owners (windows currently open) — the narrow-ASID sibling
+ * of g_owned.size(); drives the last-window-close decision at END. */
+static int g_owned_procs_active = 0;
 /* Bytes hashed for a page's content signature.  Page-bounded (< 4 KiB)
  * so the read never straddles into an unmapped successor page; 256
  * bytes of code discriminates any two distinct binaries at a shared
@@ -622,12 +667,12 @@ static constexpr size_t PIN_SIG_BYTES = 256;
  *
  * Snapshotted at pin time from the MARKER instruction's own code page, so
  * it is non-zero for EVERY pinned target — including the wide-register
- * pins (x86 CR3 / AArch64 TTBR / RISC-V SATP) that never populate
- * g_pin_page_map (that map, and its lowest-vpage "text start" page, exist
- * only on the narrow-ASID MIPS reuse-guard path).  Where the map IS
- * learned, pin_map_learn refines the representative down to the lowest
- * learned code vpage (the text-segment start — deterministic and stable).
- * Either way it is a fixed, deterministic FNV-1a over PIN_SIG_BYTES of a
+ * pins (x86 CR3 / AArch64 TTBR / RISC-V SATP) that never populate the
+ * per-owner page maps (those, and their per-owner "text start" anchors,
+ * exist only on the narrow-ASID MIPS reuse-guard path — see OwnedProc).
+ * On the narrow-ASID path each OwnedProc carries its OWN marker-page
+ * signature; this global representative serves the wide pins and the
+ * single-owner legacy path.  It is a fixed, deterministic FNV-1a of a
  * real code page.
  *
  * Written only under exec_lock (the pin-fire seed and pin_map_learn);
@@ -981,7 +1026,20 @@ static void asid_identity_reset(void)
  * process byte-identity), each other process's own-code fingerprint. */
 static inline uint32_t resolve_asid_index(unsigned int cpu_index)
 {
-    (void)cpu_index;
+    /* Narrow-ASID latch (MIPS, g_pin_reuse_guard, not trace-all): the live
+     * EntryHi.ASID is an 8-bit recycled value, so the per-entry memory asid
+     * must be the OWNER's stable index (held in g_vcpu_cur_asid_index across
+     * a kernel excursion), not asid_root_to_index(live value) — which would
+     * mint a spurious new index the moment the OS rolls the process's ASID
+     * over.  User mode (asid 0, owner 0's anchor is (0,0)) and single-pin
+     * (owner 0 -> index 0) stay byte-identical.  Wide targets, trace-all
+     * (every context by its live root, Stage B2), and unpinned runs keep the
+     * live-root mapping unchanged. */
+    if (g_pin_reuse_guard && !marker_trace_all() &&
+        g_pinned_asid.load(std::memory_order_relaxed) != CST_ASID_UNPINNED &&
+        cpu_index < CST_PIN_MAX_VCPUS) {
+        return g_vcpu_cur_asid_index[cpu_index];
+    }
     uint64_t root = qemu_plugin_get_addr_space_id();
     return asid_root_to_index(root, asid_first_sight_sig(root));
 }
@@ -1054,8 +1112,8 @@ static bool pin_page_sig(uint64_t vpage, uint64_t *sig_out)
  * code page based at @pc in the CURRENT address space, adopting it only
  * when its vpage is the lowest seen so far (so the representative converges
  * on the text-segment start page — deterministic and stable).  Used for
- * the wide-register pins that never learn g_pin_page_map; the narrow-ASID
- * path refines the representative from inside pin_map_learn instead.
+ * the wide-register pins that learn no per-owner page map; the narrow-ASID
+ * path seeds each OwnedProc's own signature at its marker instead.
  * Caller holds exec_lock (pin_page_sig's scratch buffer needs it). */
 static void pin_repr_seed(uint64_t pc)
 {
@@ -1071,35 +1129,111 @@ static void pin_repr_seed(uint64_t pc)
     g_pin_repr_sig.store(sig, std::memory_order_relaxed);
 }
 
-static void pin_identity_reset(uint64_t marker_asid, unsigned int cpu_index)
+/* Compute a marker firing's stable wire anchor: @root_phys = the marker
+ * code page's PHYSICAL page (a real, stable physical anchor that virtual
+ * aliasing cannot forge and an EntryHi.ASID rollover cannot move — MIPS has
+ * no readable pgd root, so this deviates from multiasid_plan §2), @sig = the
+ * FNV of the marker page.  User mode / no real address space (@asid 0) →
+ * (0,0) so user-mode marker traces stay byte-identical.  @pc is the marker
+ * instruction's own address (from its udata; the env PC is stale mid-TB).
+ * Caller holds exec_lock (pin_page_sig's scratch buffer). */
+static void marker_anchor(uint64_t pc, uint64_t asid,
+                          uint64_t *root_phys, uint64_t *sig, uint64_t *vpage)
 {
-    if (!g_pin_page_map) {
-        g_pin_page_map = new std::unordered_map<uint64_t, PinPage>();
+    uint64_t vp = pc & PIN_PAGE_MASK;
+    *vpage = vp;
+    if (asid == 0) {
+        *root_phys = 0;
+        *sig = 0;
+        return;
     }
-    g_pin_page_map->clear();
+    uint64_t s = 0;
+    pin_page_sig(vp, &s);
+    *sig = s;
+    uint64_t pa;
+    if (qemu_plugin_vaddr_to_paddr(pc, &pa)) {
+        *root_phys = pa & PIN_PAGE_MASK;
+    } else {
+        /* The marker page just executed, so this should not happen; a
+         * synthetic high-bit anchor keeps identity distinct if it ever
+         * does (a real physical page never has bit 63 set). */
+        *root_phys = (1ULL << 63) | vp;
+    }
+}
+
+/* Reset the owned-process set to a SINGLE owner and seat @cpu_index's dwell
+ * onto it (the legacy single-pin re-seed: simpoint, user-mode marker, and
+ * the FIRST system marker).  Every vCPU's dwell is cleared; the marker vCPU
+ * is confirmed as owner 0.  @root_phys/@sig/@vpage are the owner's anchor
+ * (marker_anchor()).  Caller holds exec_lock. */
+static void pin_owned_reset_single(uint64_t marker_asid, unsigned int cpu_index,
+                                   uint64_t root_phys, uint64_t sig,
+                                   uint64_t vpage)
+{
+    if (!g_owned_procs) {
+        g_owned_procs = new std::vector<OwnedProc>();
+    }
+    g_owned_procs->clear();
+    OwnedProc op;
+    op.root_phys = root_phys;
+    op.marker_sig = sig;
+    op.repr_vpage = vpage;
+    op.active = true;
+    g_owned_procs->push_back(std::move(op));
+    g_owned_procs_active = 1;
     for (unsigned i = 0; i < CST_PIN_MAX_VCPUS; i++) {
-        g_pin_vcpu[i].asid.store(CST_ASID_UNPINNED,
-                                 std::memory_order_relaxed);
+        g_pin_vcpu[i].asid.store(CST_ASID_UNPINNED, std::memory_order_relaxed);
         g_pin_vcpu[i].confirmed.store(false, std::memory_order_relaxed);
+        g_pin_vcpu[i].owner.store(-1, std::memory_order_relaxed);
     }
     if (cpu_index < CST_PIN_MAX_VCPUS) {
         g_pin_vcpu[cpu_index].asid.store(marker_asid,
                                          std::memory_order_relaxed);
-        g_pin_vcpu[cpu_index].confirmed.store(true,
-                                              std::memory_order_relaxed);
+        g_pin_vcpu[cpu_index].owner.store(0, std::memory_order_relaxed);
+        g_pin_vcpu[cpu_index].confirmed.store(true, std::memory_order_relaxed);
     }
 }
 
-/* Learn the current translation of @pc into the map (no-op when the
- * page is already mapped, so the confirmed-dwell hot path is one hash
- * lookup; the translation and content signature are taken only on
- * insert).  Caller holds exec_lock and has established the executing
- * context is the pinned process at user privilege. */
-static void pin_map_learn(uint64_t pc)
+/* Append a NEW owned process (an additional system marker while the segment
+ * is already open) and seat @cpu_index's dwell onto it.  Returns the new
+ * owner index.  Caller holds exec_lock. */
+static int pin_owned_append(uint64_t marker_asid, unsigned int cpu_index,
+                            uint64_t root_phys, uint64_t sig, uint64_t vpage)
 {
+    if (!g_owned_procs) {
+        g_owned_procs = new std::vector<OwnedProc>();
+    }
+    OwnedProc op;
+    op.root_phys = root_phys;
+    op.marker_sig = sig;
+    op.repr_vpage = vpage;
+    op.active = true;
+    int idx = (int)g_owned_procs->size();
+    g_owned_procs->push_back(std::move(op));
+    g_owned_procs_active++;
+    if (cpu_index < CST_PIN_MAX_VCPUS) {
+        g_pin_vcpu[cpu_index].asid.store(marker_asid,
+                                         std::memory_order_relaxed);
+        g_pin_vcpu[cpu_index].owner.store(idx, std::memory_order_relaxed);
+        g_pin_vcpu[cpu_index].confirmed.store(true, std::memory_order_relaxed);
+    }
+    return idx;
+}
+
+/* Learn the current translation of @pc into owner @oi's page map (no-op when
+ * already mapped, so the confirmed-dwell hot path is one hash lookup; the
+ * translation and content signature are taken only on insert).  Caller holds
+ * exec_lock and has established the executing context is owner @oi at user
+ * privilege. */
+static void pin_map_learn(int oi, uint64_t pc)
+{
+    if (!g_owned_procs || oi < 0 || oi >= (int)g_owned_procs->size()) {
+        return;
+    }
+    OwnedProc &op = (*g_owned_procs)[oi];
     uint64_t vp = pc & PIN_PAGE_MASK;
-    auto it = g_pin_page_map->find(vp);
-    if (it != g_pin_page_map->end()) {
+    auto it = op.pages.find(vp);
+    if (it != op.pages.end()) {
         return;
     }
     uint64_t pa;
@@ -1110,50 +1244,78 @@ static void pin_map_learn(uint64_t pc)
     if (!pin_page_sig(vp, &sig)) {
         return;                 /* page unreadable right now: learn later */
     }
-    g_pin_page_map->emplace(vp, PinPage{pa & PIN_PAGE_MASK, sig});
-    /* Refine the representative content signature toward the lowest learned
-     * code vpage (reusing the sig just computed — no second hash). */
-    if (vp < g_pin_repr_vpage) {
-        g_pin_repr_vpage = vp;
-        g_pin_repr_sig.store(sig, std::memory_order_relaxed);
-    }
+    op.pages.emplace(vp, PinPage{pa & PIN_PAGE_MASK, sig});
+    op.repr_vpage = vp < op.repr_vpage ? vp : op.repr_vpage;
     g_stats.pin_pages_mapped++;
 }
 
-/* Probe @pc against the map: 1 = hit-match, 0 = unmapped page or no
- * live translation (unknown), -1 = content mismatch (foreign process
- * running different code at a mapped VA).  The physical frame is the
- * fast path; on a frame mismatch the page's byte signature is the
- * authority — a re-faulted page (identical bytes, new frame) reads as a
- * hit and its frame is refreshed, a genuinely foreign page as a
- * mismatch.  Caller holds exec_lock. */
-static int pin_map_probe(uint64_t pc)
+/* Probe @pc against EVERY active owned process's page map (multi-ASID
+ * Stage B3).  Returns the matching owner index on a hit, or -1.  @hint (a
+ * vCPU's last-confirmed owner) is tried first for the O(1) common case.  On
+ * no hit, *@mismatch is set when SOME owner had this vpage mapped with
+ * differing bytes (a foreign process at a shared VA), cleared when the vpage
+ * was simply unmapped in every owner (unknown).  Physical frame is the fast
+ * path; on a frame mismatch the page's byte signature is the authority — a
+ * re-faulted page (identical bytes, new frame) reads as a hit and its frame
+ * is refreshed.  Caller holds exec_lock. */
+static int pin_map_probe_owners(uint64_t pc, int hint, bool *mismatch)
 {
-    if (!g_pin_page_map) {
-        return 0;
+    *mismatch = false;
+    if (!g_owned_procs || g_owned_procs->empty()) {
+        return -1;
     }
     uint64_t vp = pc & PIN_PAGE_MASK;
-    auto it = g_pin_page_map->find(vp);
-    if (it == g_pin_page_map->end()) {
-        return 0;
-    }
     uint64_t pa;
     if (!qemu_plugin_vaddr_to_paddr(pc, &pa)) {
-        return 0;
+        return -1;              /* no live translation: unknown */
     }
-    if ((pa & PIN_PAGE_MASK) == it->second.ppage) {
-        return 1;               /* frame fast-path: no re-fault */
+    pa &= PIN_PAGE_MASK;
+    uint64_t sig = 0;
+    bool have_sig = false;
+    bool any_mapped = false;
+    auto test = [&](int oi) -> bool {
+        OwnedProc &op = (*g_owned_procs)[oi];
+        if (!op.active) {
+            return false;
+        }
+        auto it = op.pages.find(vp);
+        if (it == op.pages.end()) {
+            return false;       /* not this owner's code page */
+        }
+        if (pa == it->second.ppage) {
+            return true;        /* frame fast-path: no re-fault */
+        }
+        any_mapped = true;      /* mapped here but a different frame */
+        if (!have_sig) {
+            if (!pin_page_sig(vp, &sig)) {
+                return false;   /* cannot read to adjudicate */
+            }
+            have_sig = true;
+        }
+        if (sig == it->second.sig) {
+            it->second.ppage = pa;      /* re-faulted: refresh */
+            g_stats.pin_refault_repaired++;
+            return true;
+        }
+        return false;           /* different bytes here — try other owners */
+    };
+    int n = (int)g_owned_procs->size();
+    if (hint >= 0 && hint < n && test(hint)) {
+        return hint;
     }
-    uint64_t sig;
-    if (!pin_page_sig(vp, &sig)) {
-        return 0;               /* cannot read to adjudicate: unknown */
+    for (int oi = 0; oi < n; oi++) {
+        if (oi == hint) {
+            continue;
+        }
+        if (test(oi)) {
+            return oi;
+        }
     }
-    if (sig == it->second.sig) {
-        it->second.ppage = pa & PIN_PAGE_MASK;   /* re-faulted: refresh */
-        g_stats.pin_refault_repaired++;
-        return 1;
-    }
-    return -1;                   /* different bytes: foreign */
+    /* No owner claimed this page.  A mapped-but-mismatched vpage means a
+     * foreign process is running different code at a shared VA; an unmapped
+     * vpage everywhere is merely unknown (not yet learned). */
+    *mismatch = any_mapped && have_sig;
+    return -1;
 }
 
 /*
@@ -1181,13 +1343,19 @@ static bool pin_user_tb_owned(unsigned int cpu_index, uint64_t live_asid,
         return false;
     }
     PinVcpuState &ps = g_pin_vcpu[cpu_index];
-    if (ps.confirmed.load(std::memory_order_relaxed) &&
+    int ow = ps.owner.load(std::memory_order_relaxed);
+    if (ps.confirmed.load(std::memory_order_relaxed) && ow >= 0 &&
         live_asid == ps.asid.load(std::memory_order_relaxed)) {
-        pin_map_learn(pc);
+        pin_map_learn(ow, pc);          /* grow the CONFIRMED owner's map */
         return true;
     }
-    int m = pin_map_probe(pc);
-    if (m == 1) {
+    /* Unconfirmed dwell: probe the executing code against EVERY owned
+     * process's map (last-confirmed owner first).  A hit confirms the dwell
+     * for THAT owner and attributes capture to it (Stage B3). */
+    bool mismatch = false;
+    int hit = pin_map_probe_owners(pc, ow, &mismatch);
+    if (hit >= 0) {
+        ps.owner.store(hit, std::memory_order_relaxed);
         if (live_asid != ps.asid.load(std::memory_order_relaxed)) {
             ps.asid.store(live_asid, std::memory_order_relaxed);
             qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
@@ -1196,7 +1364,7 @@ static bool pin_user_tb_owned(unsigned int cpu_index, uint64_t live_asid,
         ps.confirmed.store(true, std::memory_order_relaxed);
         return true;
     }
-    if (m < 0) {
+    if (mismatch) {
         g_stats.pin_phys_mismatch_dropped++;
     } else {
         g_stats.pin_unverified_dropped++;
@@ -1945,10 +2113,24 @@ static void start_trace_segment(const char *label,
              * kernel excursion before the first user TB then folds to the
              * entering process rather than the KPTI kernel CR3.  Just after
              * asid_identity_reset, so this first-sighting maps to index 0 —
-             * single-address-space stays byte-identical. */
-            uint64_t seed_root = qemu_plugin_get_addr_space_id();
-            seed_asid_index =
-                asid_root_to_index(seed_root, asid_first_sight_sig(seed_root));
+             * single-address-space stays byte-identical.
+             *
+             * Narrow-ASID latch (MIPS): the opener is owner 0, whose stable
+             * anchor (marker_anchor, not the recycled EntryHi.ASID) is the
+             * process key; derive index 0 from it so the seed matches every
+             * later user-TB attribution (seal path below). */
+            int ow = g_pin_reuse_guard ? g_pin_vcpu[cpu_index].owner.load(
+                                             std::memory_order_relaxed) : -1;
+            if (ow >= 0 && g_owned_procs && ow < (int)g_owned_procs->size() &&
+                (*g_owned_procs)[ow].active) {
+                const OwnedProc &op = (*g_owned_procs)[ow];
+                seed_asid_index = asid_root_to_index(op.root_phys,
+                                                     op.marker_sig);
+            } else {
+                uint64_t seed_root = qemu_plugin_get_addr_space_id();
+                seed_asid_index = asid_root_to_index(
+                    seed_root, asid_first_sight_sig(seed_root));
+            }
         }
         g_vcpu_cur_tid[cpu_index] = seed_thread_id;
         g_vcpu_cur_asid_index[cpu_index] = seed_asid_index;
@@ -3406,10 +3588,26 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
          * root maps to the same index) so a subsequent kernel excursion
          * folds this thread's regfile/FieldState CONTEXT to the entering
          * process, not the KPTI kernel CR3.  Set every user TB (not only on
-         * a tid change) so it holds the entering asid at the excursion. */
-        uint64_t live_root = qemu_plugin_get_addr_space_id();
-        g_vcpu_cur_asid_index[cpu_index] =
-            asid_root_to_index(live_root, asid_first_sight_sig(live_root));
+         * a tid change) so it holds the entering asid at the excursion.
+         *
+         * Narrow-ASID latch (MIPS, not trace-all): key on the CONFIRMED
+         * owner's stable anchor rather than the recycled EntryHi.ASID, so a
+         * rollover of the process's value never mints a spurious index and
+         * the memory/context asid stays pinned to the owning process across
+         * its whole run.  Trace-all keeps the live-root mapping (Stage B2:
+         * every context by its own root). */
+        int ow = (g_pin_reuse_guard && !marker_trace_all())
+            ? g_pin_vcpu[cpu_index].owner.load(std::memory_order_relaxed) : -1;
+        if (ow >= 0 && g_owned_procs && ow < (int)g_owned_procs->size() &&
+            (*g_owned_procs)[ow].active) {
+            const OwnedProc &op = (*g_owned_procs)[ow];
+            g_vcpu_cur_asid_index[cpu_index] =
+                asid_root_to_index(op.root_phys, op.marker_sig);
+        } else {
+            uint64_t live_root = qemu_plugin_get_addr_space_id();
+            g_vcpu_cur_asid_index[cpu_index] =
+                asid_root_to_index(live_root, asid_first_sight_sig(live_root));
+        }
         /* Migration-detect guard: record this vCPU in the pinned process's
          * per-segment user-vCPU set (every user TB, not only on a tid
          * change), firing one warning if the process spans vCPUs. */
@@ -3468,9 +3666,13 @@ static void vcpu_pin_probe(unsigned int cpu_index, void *udata)
         qemu_plugin_get_priv_level() == 0) {
         uint64_t live_asid = qemu_plugin_get_addr_space_id();
         g_rec_mutex_lock(&exec_lock);
-        int m = pin_map_probe(cur_tb_tmpl->start_pc);
-        if (m == 1) {
-            PinVcpuState &ps = g_pin_vcpu[cpu_index];
+        PinVcpuState &ps = g_pin_vcpu[cpu_index];
+        bool mismatch = false;
+        int hit = pin_map_probe_owners(cur_tb_tmpl->start_pc,
+                                       ps.owner.load(std::memory_order_relaxed),
+                                       &mismatch);
+        if (hit >= 0) {
+            ps.owner.store(hit, std::memory_order_relaxed);
             if (live_asid != ps.asid.load(std::memory_order_relaxed)) {
                 /* Re-acquired under a different ASID value — a generation
                  * rollover re-numbered the process or it migrated onto a
@@ -3487,7 +3689,7 @@ static void vcpu_pin_probe(unsigned int cpu_index, void *udata)
              * and folds this TB's delta into the user clock itself. */
             return;
         }
-        if (m < 0) {
+        if (mismatch) {
             g_stats.pin_phys_mismatch_dropped++;
         } else {
             g_stats.pin_unverified_dropped++;
@@ -4257,6 +4459,90 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
     }
 
     /*
+     * Multi-process latch (Stage B3): narrow-ASID WIN_MARKER (MIPS system
+     * mode).  An 8-bit EntryHi.ASID cannot name a process by value, so each
+     * owned process is an OwnedProc keyed by physical-page identity: the
+     * first START marker seeds owner 0 and opens the segment, later START
+     * markers append owners and widen the traced set, each with its own
+     * marker-seeded page map and stable (marker-page-phys, sig) wire anchor.
+     * Excludes trace-all (Stage B2: the first marker opens a whole-system
+     * window; the legacy single-pin path below serves its clock/END) and
+     * user mode (asid 0, single address space — also the legacy path, kept
+     * byte-identical).
+     */
+    if (g_window_mode == PluginConfig::WIN_MARKER && g_pin_reuse_guard &&
+        asid != 0 && !marker_trace_all()) {
+        g_rec_mutex_lock(&exec_lock);
+        PinVcpuState &ps = g_pin_vcpu[cpu_index];
+        /* Idempotent per process: a re-run of the START marker whose code
+         * already belongs to an active owner just re-seats the dwell. */
+        bool mm = false;
+        int existing = pin_map_probe_owners(
+            pc, ps.owner.load(std::memory_order_relaxed), &mm);
+        if (existing >= 0 && g_owned_procs &&
+            (*g_owned_procs)[existing].active) {
+            ps.owner.store(existing, std::memory_order_relaxed);
+            ps.asid.store(asid, std::memory_order_relaxed);
+            ps.confirmed.store(true, std::memory_order_relaxed);
+            qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
+            refresh_ctx_gates(cpu_index);
+            g_rec_mutex_unlock(&exec_lock);
+            return;
+        }
+        uint64_t root_phys, sig, vpage;
+        marker_anchor(pc, asid, &root_phys, &sig, &vpage);
+        bool first_open = !g_owned_procs || g_owned_procs->empty();
+        if (first_open) {
+            /* First window: pin the representative (owner 0), seed its
+             * page map + identity from the marker's own code page, and open
+             * the segment exactly as the single-process narrow path did. */
+            g_pinned_asid.store(asid, std::memory_order_relaxed);
+            pin_reuse_reset();
+            g_pin_repr_vpage = vpage;
+            g_pin_repr_sig.store(sig, std::memory_order_relaxed);
+            pin_owned_reset_single(asid, cpu_index, root_phys, sig, vpage);
+            pin_map_learn(0, pc);
+            if (!g_trace_segments.is_active() &&
+                !g_trace_segments.is_shutting_down()) {
+                uint64_t lo =
+                    qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
+                uint64_t span = simulation_insns ? simulation_insns : 1000000;
+                uint64_t hi = lo + span;
+                g_trace_segments.set_window(lo, hi);
+                user_count_reset(cpu_index, lo);
+                fprintf(stderr,
+                        "champsim_tracer: marker fired at icount %" PRIu64
+                        ", asid 0x%" PRIx64 " priv=%d (0=user,3=kernel) "
+                        "pc=0x%" PRIx64 " root_phys=0x%" PRIx64
+                        " — tracing %" PRIu64 " insns\n",
+                        lo, asid, qemu_plugin_get_priv_level(),
+                        qemu_plugin_get_pc(), root_phys, span);
+                start_trace_segment("marker", lo, hi, /* warmup= */ 0, span,
+                                    cpu_index, /* simpoint_weight= */ 0.0);
+            }
+            /* Pre-register owner 0's compact index (index 0) with its own
+             * marker-page anchor, AFTER start_trace_segment reset the
+             * per-segment identity map (mirrors the wide path). */
+            asid_root_to_index(root_phys, sig);
+        } else {
+            /* Additional window: append owner k, seed its map, register its
+             * identity, and recompute this vCPU's gates so its confirmed
+             * dwell begins dispatching the heavy callback. */
+            int idx = pin_owned_append(asid, cpu_index, root_phys, sig, vpage);
+            pin_map_learn(idx, pc);
+            asid_root_to_index(root_phys, sig);
+            qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
+            refresh_ctx_gates(cpu_index);
+            fprintf(stderr,
+                    "champsim_tracer: marker opened additional window for "
+                    "narrow owner %d root_phys=0x%" PRIx64 " (%d owned)\n",
+                    idx, root_phys, g_owned_procs_active);
+        }
+        g_rec_mutex_unlock(&exec_lock);
+        return;
+    }
+
+    /*
      * Legacy single-pin path: pinned-simpoint positioning and the
      * narrow-ASID (MIPS) marker window.  One process, one marker, one
      * shot — byte-identical to the pre-Stage-B behavior.
@@ -4279,18 +4565,20 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
      * bogus page.  exec_lock guards the shared scratch buffer / page map
      * against concurrent step-glue probes on other vCPUs. */
     if (g_pin_reuse_guard) {
-        /* Narrow-ASID (MIPS): seat the marker vCPU's dwell and seed the
-         * page map with the marker's own live-translated page; pin_map_learn
-         * also seeds the representative and later refines it to the lowest
-         * learned code vpage.  Existing behaviour (runs for user and system
-         * mode); the representative it fills is used only when a real root
-         * is present (system mode).  g_owned stays empty on this path — the
-         * narrow-ASID set generalization is Stage B3. */
+        /* Narrow-ASID (MIPS) single owner: user-mode marker (asid 0, one
+         * address space), pinned-simpoint positioning, and MIPS trace-all
+         * (whose clock/END ride this single pin while capture widens in the
+         * heavy step).  Seat owner 0's dwell and seed its page map from the
+         * marker's own live-translated page; the stable anchor is (0,0) in
+         * user mode so those traces stay byte-identical, the marker-page
+         * physical address in system mode. */
         g_rec_mutex_lock(&exec_lock);
-        g_pin_repr_vpage = UINT64_MAX;
-        g_pin_repr_sig.store(0, std::memory_order_relaxed);
-        pin_identity_reset(asid, cpu_index);
-        pin_map_learn(pc);
+        uint64_t root_phys, sig, vpage;
+        marker_anchor(pc, asid, &root_phys, &sig, &vpage);
+        g_pin_repr_vpage = vpage;
+        g_pin_repr_sig.store(sig, std::memory_order_relaxed);
+        pin_owned_reset_single(asid, cpu_index, root_phys, sig, vpage);
+        pin_map_learn(0, pc);
         g_rec_mutex_unlock(&exec_lock);
     } else if (asid != 0) {
         /* Wide-register SYSTEM pin (x86 CR3 / AArch64 TTBR / RISC-V SATP):
@@ -4480,6 +4768,73 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
         }
         /* Last window closed: all-windows-closed stop (peer of the
          * icount/budget stop — whichever fires first wins). */
+        if (g_trace_segments.is_active() &&
+            !g_trace_segments.is_shutting_down()) {
+            fprintf(stderr,
+                    "champsim_tracer: end marker — closing after %" PRIu64
+                    " user insns (last window)\n", g_user_icount);
+            g_seg_end_marker_close = true;
+            finish_trace_segment();
+            g_trace_segments.set_shutting_down();
+            g_rec_mutex_unlock(&exec_lock);
+            exit(0);
+        }
+        g_rec_mutex_unlock(&exec_lock);
+        return;
+    }
+
+    /*
+     * Multi-process latch (Stage B3): narrow-ASID WIN_MARKER (MIPS system).
+     * The END marker executes as the ending process's OWN user code, so the
+     * emitting vCPU's confirmed dwell owner IS the ender.  Close that owner's
+     * window (mark it inactive, free its page map); the segment closes only
+     * when the LAST active owner ends.  Symmetric with the narrow-ASID START
+     * handler; excludes trace-all / user / simpoint (the legacy exit below).
+     */
+    if (g_window_mode == PluginConfig::WIN_MARKER && g_pin_reuse_guard &&
+        asid != 0 && !marker_trace_all()) {
+        g_rec_mutex_lock(&exec_lock);
+        PinVcpuState &ps = g_pin_vcpu[cpu_index];
+        int ow = ps.owner.load(std::memory_order_relaxed);
+        bool ok = ps.confirmed.load(std::memory_order_relaxed) && ow >= 0 &&
+                  g_owned_procs && ow < (int)g_owned_procs->size() &&
+                  (*g_owned_procs)[ow].active;
+        if (!ok) {
+            /* Dwell not currently confirmed (a kernel overlay may have
+             * un-confirmed it an instant before this insn): identify the
+             * ender by probing its own code against the owned maps. */
+            bool mm = false;
+            ow = pin_map_probe_owners(pc, ow, &mm);
+        }
+        if (ow < 0 || !g_owned_procs || ow >= (int)g_owned_procs->size() ||
+            !(*g_owned_procs)[ow].active) {
+            /* END from a process that never opened a window (or already
+             * closed it): not ours to act on. */
+            g_rec_mutex_unlock(&exec_lock);
+            return;
+        }
+        (*g_owned_procs)[ow].active = false;
+        (*g_owned_procs)[ow].pages.clear();   /* free — never probed again */
+        g_owned_procs_active--;
+        /* The ending vCPU has left the owned set: un-confirm its dwell so its
+         * remaining TBs re-probe (and, finding no active owner, drop). */
+        ps.confirmed.store(false, std::memory_order_relaxed);
+        qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 0);
+        refresh_ctx_gates(cpu_index);
+        if (g_owned_procs_active > 0) {
+            /* Other windows remain open — do NOT close the segment.  The
+             * closed owner's true-BB templates stay until the segment's
+             * templates section is written; its live-ASID-keyed dedup index
+             * is byte-checked and bounded, so no cross-process reclaim is
+             * needed (a concurrently-owned process holds a distinct ASID
+             * value). */
+            fprintf(stderr,
+                    "champsim_tracer: end marker — closed narrow owner %d "
+                    "(%d still tracing)\n", ow, g_owned_procs_active);
+            g_rec_mutex_unlock(&exec_lock);
+            return;
+        }
+        /* Last window closed: all-windows-closed stop. */
         if (g_trace_segments.is_active() &&
             !g_trace_segments.is_shutting_down()) {
             fprintf(stderr,

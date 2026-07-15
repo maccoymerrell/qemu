@@ -71,12 +71,28 @@ Each index maps to an identity = the **page-table root physical address** (pgd):
 | x86_64 | `CR3` | mask PCID + NOFLUSH bit 63 (already done, `6db5eeaa47`) |
 | aarch64 | `TTBR0/1_EL1` base | strip the ASID field; keep the base phys |
 | riscv | `SATP` PPN | |
-| mips | pgd phys | (CP0 Context does not hold a pgd on 24K/34K) |
+| mips | **marker code-page physical address** | see the MIPS deviation below |
 
 **Why root-phys, not the architectural ASID field:** MIPS EntryHi ASID is 8-bit
 and aarch64 TTBR ASID is 8/16-bit — they roll over and get reused over a long
 trace (the reuse hazard the pinned-process work already solved). The pgd
 root-phys is uniform across ISAs and stable.
+
+**MIPS anchor deviation (Stage B3):** MIPS exposes no readable pgd root — the
+CP0 audit in `mips_get_plugin_state` found `Context.PTEBase` is a per-CPU
+constant on 24K/34K-class guests (the kernel keeps the pgd in the in-RAM
+`pgd_current[]` array), and `qemu_plugin_get_addr_space_id()` therefore returns
+the bare 8-bit `EntryHi.ASID`, which cannot be the stable wire root. Stage B3
+uses the **physical page address of the process's marker code page** as
+`root_phys` (a real, stable physical anchor that virtual aliasing cannot forge
+and an ASID rollover cannot move; `marker_anchor()`), with the FNV of that page
+as `sig`. Each owned process (`OwnedProc`) carries its own `(root_phys, sig)`,
+mapped through `asid_root_to_index` to a compact index that survives an
+`EntryHi.ASID` rollover — the raw value is never the wire key. User mode
+(asid 0, one address space) keeps `(0, 0)` so those traces stay byte-identical.
+Two concurrently-owned processes always hold **distinct** `EntryHi.ASID` values
+(recycling only follows death), so the internal template store keyed by the live
+value still separates them; only the wire index needed the owner-derived anchor.
 
 **pgd reuse after process death** (a freed pgd page reallocated — rare):
 disambiguate with a content **signature** (FNV of the pgd / first code page),

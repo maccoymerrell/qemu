@@ -881,6 +881,62 @@ static uint32_t asid_root_to_index(uint64_t root_phys, uint64_t sig)
     return index;
 }
 
+/* Per-process content fingerprint (Bug-C support): page-table root -> FNV of
+ * that process's own USER code page.  Populated the first time a non-
+ * representative root runs a user TB (or fires its marker), independent of
+ * the racy marker-callback read and of when the root's identity is first
+ * emitted.  The representative is deliberately absent — it keeps the
+ * representative marker-page signature so single-process traces stay
+ * byte-identical.  Reset per segment alongside the identity map. */
+static std::unordered_map<uint64_t, uint64_t> *g_cr3_user_sig;
+
+/* Record @root's own-code content signature @sig (from a user-code page).
+ * First writer wins (stable across the segment).  If @root already has a
+ * compact index whose identity carries a provisional (representative)
+ * signature, refresh it in place — harmless once the wire has emitted it,
+ * and correcting when it has not.  Skips the representative (byte-identity)
+ * and root 0.  Caller holds exec_lock. */
+static void asid_set_user_sig(uint64_t root, uint64_t sig)
+{
+    if (root == 0 ||
+        root == g_pinned_asid.load(std::memory_order_relaxed)) {
+        return;
+    }
+    if (!g_cr3_user_sig) {
+        g_cr3_user_sig = new std::unordered_map<uint64_t, uint64_t>();
+    }
+    if (!g_cr3_user_sig->emplace(root, sig).second) {
+        return;                              /* already fingerprinted */
+    }
+    if (g_asid_index_map) {
+        auto it = g_asid_index_map->find(root);
+        if (it != g_asid_index_map->end() && g_asid_identity_store &&
+            it->second < g_asid_identity_store->size()) {
+            (*g_asid_identity_store)[it->second].sig = sig;
+        }
+    }
+}
+
+/* Signature to record when a root is FIRST sighted: the representative (and
+ * root 0) keep the representative signature (single-process byte-identity);
+ * any other process uses its own-code fingerprint if one has been captured,
+ * else the representative as a provisional value (later refreshed by
+ * asid_set_user_sig once the process runs user code / marks).  Caller holds
+ * exec_lock. */
+static uint64_t asid_first_sight_sig(uint64_t root)
+{
+    if (root != 0 &&
+        root != g_pinned_asid.load(std::memory_order_relaxed) &&
+        g_cr3_user_sig) {
+        auto it = g_cr3_user_sig->find(root);
+        if (it != g_cr3_user_sig->end()) {
+            return it->second;
+        }
+    }
+    return cst_pinned_asid_sig();
+}
+
+
 /* Reset the per-segment asid identity map and index store.  Caller holds
  * exec_lock (via reset_segment_local_state), mirroring
  * thread_identity_reset. */
@@ -892,6 +948,9 @@ static void asid_identity_reset(void)
     if (g_asid_identity_store) {
         g_asid_identity_store->clear();
     }
+    if (g_cr3_user_sig) {
+        g_cr3_user_sig->clear();
+    }
     g_asid_index_next = 0;
 }
 
@@ -901,12 +960,16 @@ static void asid_identity_reset(void)
  * identical.  cpu_index is retained for symmetry with resolve_thread_id
  * (Stage B derives the per-process signature from the running context);
  * called from a vCPU context, so qemu_plugin_get_addr_space_id() and
- * cst_pinned_asid_sig() are valid.  Caller holds exec_lock. */
+ * cst_pinned_asid_sig() are valid.  Caller holds exec_lock.
+ *
+ * On a root's first sighting the identity records asid_first_sight_sig(root):
+ * the representative's marker-page signature for the representative (single-
+ * process byte-identity), each other process's own-code fingerprint. */
 static inline uint32_t resolve_asid_index(unsigned int cpu_index)
 {
     (void)cpu_index;
     uint64_t root = qemu_plugin_get_addr_space_id();
-    return asid_root_to_index(root, cst_pinned_asid_sig());
+    return asid_root_to_index(root, asid_first_sight_sig(root));
 }
 
 /* The CONTEXT asid index used ONLY to key the per-(asid,thread) regfile /
@@ -971,6 +1034,7 @@ static bool pin_page_sig(uint64_t vpage, uint64_t *sig_out)
     *sig_out = h;
     return true;
 }
+
 
 /* Seed/refine the pinned space's representative content signature from the
  * code page based at @pc in the CURRENT address space, adopting it only
@@ -1863,8 +1927,9 @@ static void start_trace_segment(const char *label,
              * entering process rather than the KPTI kernel CR3.  Just after
              * asid_identity_reset, so this first-sighting maps to index 0 —
              * single-address-space stays byte-identical. */
-            seed_asid_index = asid_root_to_index(
-                qemu_plugin_get_addr_space_id(), cst_pinned_asid_sig());
+            uint64_t seed_root = qemu_plugin_get_addr_space_id();
+            seed_asid_index =
+                asid_root_to_index(seed_root, asid_first_sight_sig(seed_root));
         }
         g_vcpu_cur_tid[cpu_index] = seed_thread_id;
         g_vcpu_cur_asid_index[cpu_index] = seed_asid_index;
@@ -3168,6 +3233,21 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
             user_owned = pin_user_tb_owned(cpu_index, live_asid,
                                            pinned_asid,
                                            cur_tb_tmpl->start_pc);
+            /* Fingerprint this process from its OWN user code (Bug C):
+             * the identity that reaches the wire must be a real per-process
+             * content hash, not the global representative one.  Capture the
+             * first time each non-representative root runs a user TB —
+             * reliable (live CR3 IS this root, its code page resident) and
+             * independent of the racy marker-callback read.  Bounded: one
+             * page hash per distinct root (skipped once known). */
+            if (live_asid != 0 && live_asid != pinned_asid &&
+                (!g_cr3_user_sig || !g_cr3_user_sig->count(live_asid))) {
+                uint64_t usig;
+                if (pin_page_sig(cur_tb_tmpl->start_pc & PIN_PAGE_MASK,
+                                 &usig)) {
+                    asid_set_user_sig(live_asid, usig);
+                }
+            }
         }
         if (user_owned) {
             g_user_icount += delta;
@@ -3292,9 +3372,9 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
          * folds this thread's regfile/FieldState CONTEXT to the entering
          * process, not the KPTI kernel CR3.  Set every user TB (not only on
          * a tid change) so it holds the entering asid at the excursion. */
+        uint64_t live_root = qemu_plugin_get_addr_space_id();
         g_vcpu_cur_asid_index[cpu_index] =
-            asid_root_to_index(qemu_plugin_get_addr_space_id(),
-                               cst_pinned_asid_sig());
+            asid_root_to_index(live_root, asid_first_sight_sig(live_root));
         /* Migration-detect guard: record this vCPU in the pinned process's
          * per-segment user-vCPU set (every user TB, not only on a tid
          * change), firing one warning if the process spans vCPUs. */
@@ -4091,8 +4171,9 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
             /* Assign this root's compact asid index (index 0) with its own
              * marker-page signature.  Runs AFTER start_trace_segment (which
              * resets the per-segment identity map) so the pre-registration
-             * survives; cst_pinned_asid_sig() is the repr sig just seeded,
-             * so this is byte-identical to letting the first emit assign it. */
+             * survives; cst_pinned_asid_sig() is the repr sig just seeded
+             * from THIS process's marker page, so this is byte-identical to
+             * letting the first emit assign it. */
             asid_root_to_index(asid, cst_pinned_asid_sig());
         } else {
             /* Additional window while the segment is already open: no new
@@ -4109,7 +4190,15 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
                     sig = s;
                 }
             }
-            asid_root_to_index(asid, sig);
+            /* Fingerprint this additional process from its own marker page
+             * (Bug C), refreshing the identity if a hot-path first-sighter
+             * already provisionally stamped the representative signature.
+             * The per-user-TB capture usually beats the marker to it; this
+             * covers a process whose first user TB has not run yet. */
+            if (sig) {
+                asid_set_user_sig(asid, sig);
+            }
+            asid_root_to_index(asid, asid_first_sight_sig(asid));
             qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
             refresh_ctx_gates(cpu_index);
             fprintf(stderr,
@@ -4318,6 +4407,20 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
             if (g_pinned_asid.load(std::memory_order_relaxed) == asid) {
                 g_pinned_asid.store(*g_owned.begin(),
                                     std::memory_order_relaxed);
+            }
+            /* Drop the closed process's asid-keyed dedup-index footprint so
+             * it does not accumulate across disparate ASIDs (single shared
+             * tracer with asid-keyed caches, not one tracer per ASID).  The
+             * process's true-BB templates stay until the segment's templates
+             * section is written (see reclaim_asid).  data_lock guards the
+             * store against a concurrent translation on another vCPU. */
+            g_mutex_lock(&data_lock);
+            uint64_t dropped = g_template_store.reclaim_asid(asid);
+            g_mutex_unlock(&data_lock);
+            if (dropped) {
+                fprintf(stderr, "champsim_tracer: dropped %" PRIu64
+                        " dedup buckets for closed asid 0x%" PRIx64 "\n",
+                        dropped, asid);
             }
             qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 0);
             refresh_ctx_gates(cpu_index);

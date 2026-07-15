@@ -3678,15 +3678,31 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
     uint64_t body_start = bw_tell_bytes(&st->bw);
     uint32_t tid = entry->thread_id;
     /* The (asid, thread) context key for the per-context field-state and
-     * regfile tables.  Keyed on the CONTEXT (process) asid, not the memory
-     * asid: in system mode a thread's kernel excursion runs under a distinct
-     * kernel CR3 (KPTI) but must keep ONE register-file context, so
-     * ctx_asid_index holds the entering process's user CR3 across the
-     * excursion.  The per-entry memory tag below still uses entry->asid_index
-     * (the live kernel/user root).  User mode / unpinned: ctx_asid_index ==
+     * regfile tables.  Keyed on the CONTEXT (process) asid, not the live
+     * memory asid, so a thread keeps ONE register-file context across a
+     * user<->kernel excursion.  User mode / unpinned: ctx_asid_index ==
      * asid_index (== 0 for a single address space) → key == tid, so those
      * tables are indexed exactly as before and the trace stays byte-identical. */
     uint64_t ctx_key = ((uint64_t)entry->ctx_asid_index << 32) | tid;
+
+    /* Wire asid tag (KPTI-off canonical model, multiasid_plan §0/§7): a
+     * kernel (priv>0) block carries the OWNING PROCESS asid on the wire, not
+     * the live page-table root.  entry->tmpl->is_system is the per-block
+     * privilege stamp — the SAME flag serialised as CST_INSN_FLAG_SYSTEM on
+     * this block's insns — so the block's system bit and its asid tag always
+     * agree.  Under the canonical KPTI-off baseline the kernel shares the
+     * process root, so ctx_asid_index == asid_index for kernel blocks too and
+     * this is a no-op; forcing it makes the trace KPTI-INVARIANT — an isolated
+     * kernel root (if the guest runs KPTI, the unsupported config) never
+     * reaches the wire as an asid — and, crucially, defers a process's FIRST
+     * wire sighting to its first traced USER block, where its content
+     * signature is latchable.  User blocks are unchanged (ctx == live at
+     * priv 0), so user-mode and single-address-space traces stay
+     * byte-identical. */
+    uint32_t wire_asid = entry->asid_index;
+    if (entry->tmpl && entry->tmpl->is_system) {
+        wire_asid = entry->ctx_asid_index;
+    }
 
     dyn_params_sort_template_order(entry->dyn_params);
     for (uint32_t w = 0; w < num_wp; w++) {
@@ -3705,8 +3721,8 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
      * identity, exactly as the hardcoded emit did; Stage B's multi-process
      * gating is what makes the index vary and switch mid-stream. */
     uint64_t asid_root = 0, asid_sig = 0;
-    cst_asid_identity(entry->asid_index, &asid_root, &asid_sig);
-    emit_asid_switch_if_needed(st, entry->asid_index, asid_root, asid_sig);
+    cst_asid_identity(wire_asid, &asid_root, &asid_sig);
+    emit_asid_switch_if_needed(st, wire_asid, asid_root, asid_sig);
     emit_thread_switch_if_needed(st, tid);
     emit_regfile_if_first(st, entry, tid, ctx_key);
 

@@ -56,9 +56,16 @@ ISA_QEMU_SYSTEM = {
 # and riscv64 (riscv's -kernel boots through the bundled OpenSBI); malta
 # for mipsel (little-endian kernel).
 _ISA_BOOT = {
+    # nopti: KPTI-off is the canonical system-mode configuration
+    # (multiasid_plan §0).  With page-table isolation disabled the kernel
+    # shares each process's ASID, so the wire's (asid,vaddr) key covers kernel
+    # and user under one process root and a consumer models OS isolation
+    # externally from the per-insn system bit.  Booting the system-validation
+    # guest with it makes the tested config the canonical one.
     "x86_64":  {"dir": "x86",     "kernel": "vmlinuz",
                 "machine": [],
-                "console": "ttyS0"},
+                "console": "ttyS0",
+                "extra_append": "nopti"},
     "aarch64": {"dir": "aarch64", "kernel": "Image",
                 "machine": ["-M", "virt", "-cpu", "max,pauth-impdef=on"],
                 "console": "ttyAMA0"},

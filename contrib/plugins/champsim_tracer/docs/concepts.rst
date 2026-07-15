@@ -244,6 +244,31 @@ of the picture:
   chains run through kernel code like any other, bounded by the
   same MMU rules a real speculative fetch obeys.
 
+.. important::
+
+   **Run system mode with kernel page-table isolation disabled**
+   (``nopti`` / ``pti=off`` on x86, and the analogous
+   page-table-isolation switch on other ISAs).  This is the canonical
+   system-mode configuration.  With KPTI off the kernel lives in each
+   process's page tables under that process's own address-space root,
+   so the kernel *shares the process's ASID* — one address space per
+   process, kernel included.  A kernel basic block is then tagged with
+   the **owning process's** ASID (distinguished from user code by the
+   per-insn ``SYSTEM`` bit), and the same kernel code at the same
+   address is one template rather than one per process.
+
+   OS-level isolation (KPTI and similar side-channel mitigations) is
+   **modeled by the consumer**, not captured in the trace.  This is
+   fully reconstructible: every block carries the ``SYSTEM`` bit, so
+   kernel and user execution are exact, and kernel data pages never
+   share virtual addresses with user pages — so a consumer can
+   re-impose any isolation policy on the address stream without
+   ambiguity.  Booting *with* KPTI enabled still produces a valid
+   trace, but it bakes one specific mitigation configuration into the
+   address stream (the isolated kernel root becomes visible) instead
+   of leaving the consumer free to model it, and is not the supported
+   baseline.
+
 The mechanics — marker detection, the address-space pin, fault
 excursions, async exclusion — are described in
 :doc:`architecture`.

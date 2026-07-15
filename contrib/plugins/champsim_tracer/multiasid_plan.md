@@ -6,7 +6,34 @@ space (ASID)** alongside the thread in the body stream so memory is keyed by
 This is the work anticipated by the single-address-space scope boundary.
 
 Status: **DESIGN LOCKED** (all four open questions resolved by the maintainer,
-below). Ready for Phase 1. Nothing implemented yet.
+below). Phases 1/2/3A/B1 + kernel-context fold implemented; internal-cache
+asid keying in progress.
+
+---
+
+## 0. REQUIRED GUEST CONFIGURATION: run system mode with KPTI DISABLED
+
+**This is the canonical way to run system-mode tracing** (kernel boot arg
+`pti=off` / `nopti`, and analogous page-table-isolation features off on other
+ISAs): the kernel then lives in each process's page tables under the process's
+own root, so **the kernel shares the process's ASID** — one address space per
+process, kernel included, exactly the model the wire's `(asid, vaddr)` key
+assumes.
+
+KPTI and other OS side-channel isolation features are **modeled externally by
+the consumer**, not captured in the trace. This is fully reconstructible
+because:
+- every block carries the per-insn **system bit** (`CST_INSN_FLAG_SYSTEM`), so
+  kernel vs user execution is exact; and
+- **kernel data pages and user pages are never shared** (disjoint VA ranges),
+  so a consumer can re-impose KPTI-style separation (or any isolation policy)
+  on the address stream without ambiguity.
+
+Running with KPTI **enabled** still works (the kernel's isolated root gets its
+own asid index; the kernel-context fold keeps thread/regfile keying on the
+process), but it splits kernel memory references onto a separate asid and is
+NOT the supported baseline — the trace then reflects one specific mitigation
+configuration instead of letting the consumer model it.
 
 ---
 
@@ -133,15 +160,34 @@ are identical; only the "is this context in-scope" predicate differs.
 
 ---
 
-## 7. Kernel attribution
+## 7. Kernel attribution (under the §0 KPTI-off baseline)
 
-- The kernel is **one physical instance** mapped into every asid's upper half →
-  a kernel VA resolves to the **same physical memory in all asids** → kernel
-  **memory** is unambiguous regardless of asid.
-- **Kernel BB asid tag** = the actual page-table root at execution time (with
-  KPTI the root switches on kernel entry and the hook fires → a "kernel" asid;
-  without KPTI kernel BBs keep the entering process's asid). Either way the tag
-  reflects the true root.
+- The kernel is **one physical instance** mapped into every asid (§0: KPTI
+  off), and **kernel data pages and user pages are never shared** (disjoint VA
+  ranges) → a kernel VA is unambiguous regardless of asid tag.
+- **Kernel BB asid tag = the owning PROCESS asid** (the kernel-context fold's
+  `ctx_asid_index`): the kernel shares the process's address space, so its
+  blocks carry the process's asid, distinguished by the per-insn **system
+  bit**. This makes the trace **KPTI-invariant**: even if the guest runs KPTI
+  (unsupported baseline), the isolated kernel root never appears as a wire
+  asid — kernel work still folds to the process, and the consumer models
+  isolation externally (§0).
+- **Template-cache identity for kernel code is shared** (one kernel): a kernel
+  true-BB keys its **serialised template** (`bb_map_`) into one shared kernel
+  bucket (sentinel asid), not the per-process root — the same kernel code at
+  the same VA is one serialised template, never duplicated per process.
+  - *Safety refinement (implementation):* the sentinel bucket's collision-
+    safety rests on kernel/user VA disjointness, so it must admit **only**
+    genuine kernel VAs. A wrong-path walk can speculatively *translate* a user
+    VA while at kernel privilege and mis-stamp it `is_system` — so only a
+    **CP-confirmed** kernel block (correct-path privilege, `is_system &&
+    is_system_cp_confirmed`) enters the shared bucket; wrong-path commits key
+    by their live process root, never the sentinel. Otherwise two processes'
+    user code at one VA would conflate in the shared bucket. The *internal*
+    fragment-chain dedup index (`tb_chain_dedup_`/`spec_chain_index_`) likewise
+    stays per-process (live root), so a wrong-path mis-stamp there is at worst
+    a per-process duplicate, never a cross-process reuse — the shared identity
+    is only the wire-visible template.
 - **Kernel-thread attribution is the ceiling** (unchanged): no kernel-privilege
   thread register exists, so *which process's* kernel work a kernel BB belongs
   to is best-effort via the entering context and degrades under cross-vCPU

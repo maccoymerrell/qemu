@@ -491,16 +491,31 @@ ptrdiff_t PathBuilder::frame_idx_for_completion(const BBTemplate *suffix) const
     }
     for (size_t i = frames_.size(); i-- > 0; ) {
         const CtxFrame &f = frames_[i];
-        if (f.returned && f.resume_pc == suffix->start_pc) {
-            assert(merge_suffix_matches(f.full_tmpl, suffix));
-            if (pb_diag() && !merge_suffix_matches(f.full_tmpl, suffix)) {
-                fprintf(stderr, "[pathbuilder] WARN completion content "
-                        "mismatch: frame full=0x%" PRIx64 " resume=0x%"
-                        PRIx64 " vs suffix=0x%" PRIx64 "\n",
-                        f.full_tmpl ? f.full_tmpl->start_pc : 0,
-                        f.resume_pc, suffix->start_pc);
-            }
+        if (!(f.returned && f.resume_pc == suffix->start_pc)) {
+            continue;
+        }
+        /* Content guard — the SAME check the fallback loop below uses, and
+         * the fix for the cross-ASID completion hazard the header comment
+         * names.  A returned frame's resume PC matching the seal is NOT
+         * proof of same-address-space identity: owned processes share load
+         * VAs, so a frame stashed by ANOTHER process's fault at this VA can
+         * carry the matching resume_pc while its template is foreign code.
+         * merge_suffix_matches must therefore be a HARD condition, not the
+         * old assert: under NDEBUG the assert compiles out, which let a
+         * cross-ASID frame silently complete and emit a foreign template in
+         * the innocent seal's place.  A genuine resume suffix is
+         * byte-identical to the stashed template at the resume position, so
+         * this rejects nothing real and leaves single-process output
+         * byte-identical (the check always held where the old assert did). */
+        if (merge_suffix_matches(f.full_tmpl, suffix)) {
             return (ptrdiff_t)i;
+        }
+        if (pb_diag()) {
+            fprintf(stderr, "[pathbuilder] WARN completion content "
+                    "mismatch (cross-ASID guard): frame full=0x%" PRIx64
+                    " resume=0x%" PRIx64 " vs suffix=0x%" PRIx64 "\n",
+                    f.full_tmpl ? f.full_tmpl->start_pc : 0,
+                    f.resume_pc, suffix->start_pc);
         }
     }
     for (size_t i = frames_.size(); i-- > 0; ) {

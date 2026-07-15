@@ -40,6 +40,55 @@ void TemplateStore::set_creating_spec(bool spec)
     tls_creating_spec = spec;
 }
 
+/* The CODE's live translation address-space id — the key component that
+ * disambiguates a shared code VA across owned processes (see BBKey).  Every
+ * store mutator/lookup runs from a live vCPU context (translation, or CP/WP
+ * execution under exec_lock), where qemu_plugin_get_addr_space_id() and
+ * qemu_plugin_get_priv_level() are valid and report the address space and
+ * privilege the code being (de)serialised belongs to; the user-mode root is
+ * the SAME value the per-entry memory dimension resolves from
+ * (resolve_asid_index), so the code and memory dimensions agree.  create_tb_
+ * template already reads qemu_plugin_get_priv_level() the same way, so the
+ * store is already coupled to the live vCPU.  A single address space always
+ * reports root 0, so single-process keys, and single-process output, are
+ * bit-identical to the old start_pc-only scheme.
+ *
+ * A single address space always reports root 0, so single-process keys, and
+ * single-process output, are bit-identical to the old start_pc-only scheme. */
+static inline uint64_t store_live_asid_root(void)
+{
+    return qemu_plugin_get_addr_space_id();
+}
+
+/* KPTI-off canonical model (multiasid_plan §7): the true-BB template a block
+ * SERIALISES keys into ONE shared kernel bucket, CST_KERNEL_ASID_ROOT, when
+ * the block is KERNEL code, instead of the entering process's live root — the
+ * kernel is one physical instance mapped into every process, so the same
+ * kernel code at the same VA becomes one serialised template rather than one
+ * per process.  USER code keys by its live root (the process's, stable across
+ * a kernel excursion under KPTI-off) so two owned processes sharing a code VA
+ * stay distinct (Bug A).
+ *
+ * @is_kernel MUST be a RELIABLE per-block kernel signal, and this is subtle:
+ * the sentinel bucket's collision-safety rests entirely on the maintainer's
+ * guarantee that kernel VAs never collide with user VAs — so it must contain
+ * ONLY genuine kernel VAs.  A wrong-path walk can speculatively TRANSLATE a
+ * user VA while at kernel privilege, stamping that user block is_system=1; if
+ * such a block reached the sentinel, two processes' user code at one VA would
+ * conflate there.  Callers therefore pass ONLY a CP-confirmed kernel stamp
+ * (is_system && is_system_cp_confirmed): a user block never CP-executes at
+ * kernel privilege, so it can never be CP-confirmed kernel and never enters
+ * the bucket.  Speculative (wrong-path) commits pass is_kernel=false and key
+ * by their live root, staying per-process and conflation-free.  The internal
+ * fragment-chain indices (tb_chain_dedup_/spec_chain_index_) likewise key by
+ * the live root, so a wrong-path mis-stamp there is at worst a per-process
+ * duplicate, never a cross-process reuse. */
+static inline uint64_t store_asid_root(bool is_kernel)
+{
+    return is_kernel ? CST_KERNEL_ASID_ROOT
+                     : qemu_plugin_get_addr_space_id();
+}
+
 /* Stable zeroed sentinel: a fragment may lack insn_reg_names while
  * reg-data is enabled; the by-reference commit points such slots
  * here so every regnames pointer is valid and reads as all-zero. */
@@ -71,9 +120,10 @@ void BBTemplateDeleter::operator()(BBTemplate *t) const noexcept
     g_free(t);
 }
 
-BBTemplate *TemplateStore::find_bb_template(uint64_t entry_pc)
+BBTemplate *TemplateStore::find_bb_template(uint64_t asid_root,
+                                            uint64_t entry_pc)
 {
-    auto it = bb_map_.find(entry_pc);
+    auto it = bb_map_.find(BBKey{asid_root, entry_pc});
     return it == bb_map_.end() ? nullptr : it->second.get();
 }
 
@@ -188,11 +238,12 @@ void TemplateStore::clear_bb_map()
  * but whose bytes differ is guest-patched code sharing the VA and
  * must NOT be reused (see the lookup_tb_chain header comment). */
 static BBTemplate *chain_index_scan(
-    const std::unordered_map<uint64_t, std::vector<BBTemplate *>> &index,
-    uint64_t tb_start_pc, uint32_t total_n_insns,
+    const std::unordered_map<BBKey, std::vector<BBTemplate *>, BBKeyHash>
+        &index,
+    const BBKey &key, uint32_t total_n_insns,
     const uint8_t *insn_sizes, const uint8_t *insn_bytes)
 {
-    auto it = index.find(tb_start_pc);
+    auto it = index.find(key);
     if (it == index.end()) {
         return nullptr;
     }
@@ -223,15 +274,16 @@ BBTemplate *TemplateStore::lookup_tb_chain(uint64_t tb_start_pc,
                                              const uint8_t *insn_sizes,
                                              const uint8_t *insn_bytes)
 {
+    BBKey key{store_live_asid_root(), tb_start_pc};
     /* CODE index first: a promoted chain's SPEC-index entry is left
      * stale (see promote), so the CODE side is the authoritative one
      * whenever both hold the chain. */
     if (BBTemplate *head =
-            chain_index_scan(tb_chain_dedup_, tb_start_pc, total_n_insns,
+            chain_index_scan(tb_chain_dedup_, key, total_n_insns,
                              insn_sizes, insn_bytes)) {
         return head;
     }
-    return chain_index_scan(spec_chain_index_, tb_start_pc, total_n_insns,
+    return chain_index_scan(spec_chain_index_, key, total_n_insns,
                             insn_sizes, insn_bytes);
 }
 
@@ -239,11 +291,22 @@ void TemplateStore::register_tb_chain(uint64_t tb_start_pc, BBTemplate *head)
 {
     /* Route on the chain's lifetime class so each class is visible to
      * dedup from creation — mint sequences (and with them serialized
-     * template ids) are independent of when a chain first executes. */
+     * template ids) are independent of when a chain first executes.
+     * Keyed by (live asid_root, tb_start_pc): the translation runs in the
+     * address space that owns this code, so the key scopes the chain to
+     * that process.  The internal fragment-chain index keys by the LIVE
+     * root even for kernel code (per-process), NOT the shared kernel
+     * sentinel: a wrong-path walk can translate a user VA at kernel
+     * privilege and mis-stamp is_system, and a shared bucket would then let
+     * two processes' code cross-reuse via this index (byte-guarded, but
+     * fragile).  Per-process keying is conflation-safe; the SERIALISED
+     * kernel template is still shared via store_asid_root at true-BB
+     * commit (see get_or_create_bb_template). */
+    BBKey key{store_live_asid_root(), tb_start_pc};
     if (head->life == TmplLife::SPEC) {
-        spec_chain_index_[tb_start_pc].push_back(head);
+        spec_chain_index_[key].push_back(head);
     } else {
-        tb_chain_dedup_[tb_start_pc].push_back(head);
+        tb_chain_dedup_[key].push_back(head);
         head->chain_indexed = true;
     }
 }
@@ -267,8 +330,14 @@ void TemplateStore::promote(BBTemplate *head)
     /* Move the chain's dedup visibility to the CODE index.  The stale
      * SPEC-index entry stays behind (lookups prefer the CODE index;
      * reclaim clears the SPEC index wholesale).  head->start_pc is the
-     * TB start_pc (the head fragment begins at canonical insn 0). */
-    tb_chain_dedup_[head->start_pc].push_back(head);
+     * TB start_pc (the head fragment begins at canonical insn 0); the
+     * key's asid_root is this executing process's live root — the same
+     * address space that translated (and registered) the chain, so a CP
+     * adoption lands in that process's CODE index.  Per-process (live root)
+     * like register_tb_chain / lookup_tb_chain — kernel chains are NOT
+     * folded into the shared sentinel bucket here (see register_tb_chain). */
+    tb_chain_dedup_[BBKey{store_live_asid_root(), head->start_pc}]
+        .push_back(head);
     head->chain_indexed = true;
 }
 
@@ -279,17 +348,26 @@ size_t TemplateStore::bb_count() const
 
 void TemplateStore::for_each_bb(const std::function<void(BBTemplate &)> &fn)
 {
-    /* Walk by sorted start_pc so templates-section serialization is
-     * deterministic (unordered_map order is implementation-defined).
-     * Called once at end-of-trace; sort cost amortized over the run. */
-    std::vector<uint64_t> keys;
+    /* Walk by sorted (start_pc, asid_root) so templates-section
+     * serialization is deterministic (unordered_map order is
+     * implementation-defined).  start_pc is the PRIMARY sort key: with a
+     * single address space every entry shares asid_root 0, so the order —
+     * and thus the serialized bytes — are identical to the old start_pc
+     * sort.  Called once at end-of-trace; sort cost amortized over the
+     * run. */
+    std::vector<BBKey> keys;
     keys.reserve(bb_map_.size());
     for (const auto &kv : bb_map_) {
         keys.push_back(kv.first);
     }
-    std::sort(keys.begin(), keys.end());
-    for (uint64_t pc : keys) {
-        fn(*bb_map_[pc]);
+    std::sort(keys.begin(), keys.end(), [](const BBKey &a, const BBKey &b) {
+        if (a.start_pc != b.start_pc) {
+            return a.start_pc < b.start_pc;
+        }
+        return a.asid_root < b.asid_root;
+    });
+    for (const BBKey &k : keys) {
+        fn(*bb_map_[k]);
     }
 }
 
@@ -520,9 +598,10 @@ static BBTemplatePtr build_bb_template(uint32_t template_id,
 }
 
 BBTemplate *TemplateStore::find_existing_true_bb(
-    uint64_t start_pc, uint32_t n_insns, const uint64_t *insn_pcs)
+    uint64_t asid_root, uint64_t start_pc, uint32_t n_insns,
+    const uint64_t *insn_pcs)
 {
-    BBTemplate *existing = find_bb_template(start_pc);
+    BBTemplate *existing = find_bb_template(asid_root, start_pc);
     if (!existing) {
         return nullptr;
     }
@@ -580,10 +659,12 @@ BBTemplate *TemplateStore::commit_true_bb(uint64_t start_pc,
                                             const uint8_t *insn_bytes,
                                             const InsnRegNames *insn_reg_names,
                                             const char *symbol_name,
-                                            uint64_t fall_through_pc)
+                                            uint64_t fall_through_pc,
+                                            bool is_kernel)
 {
+    uint64_t asid_root = store_asid_root(is_kernel);
     if (BBTemplate *existing =
-            find_existing_true_bb(start_pc, n_insns, insn_pcs)) {
+            find_existing_true_bb(asid_root, start_pc, n_insns, insn_pcs)) {
         return existing;
     }
 
@@ -594,7 +675,7 @@ BBTemplate *TemplateStore::commit_true_bb(uint64_t start_pc,
                                            insn_reg_names,
                                            symbol_name, fall_through_pc);
     BBTemplate *raw = tmpl.get();
-    bb_map_[start_pc] = std::move(tmpl);
+    bb_map_[BBKey{asid_root, start_pc}] = std::move(tmpl);
     g_stats.bb_templates_created++;
     return raw;
 }
@@ -605,13 +686,14 @@ BBTemplate *TemplateStore::commit_true_bb_refs(
     const InsnFields *const *insn_fields,
     const uint8_t *insn_sizes, const uint8_t *insn_bytes,
     const InsnRegNames *const *insn_reg_names,
-    const char *symbol_name, uint64_t fall_through_pc)
+    const char *symbol_name, uint64_t fall_through_pc, bool is_kernel)
 {
     /* Already-templated BB: return the cached record without touching
      * the field/regnames payload at all.  Templates are stored in true
      * execution order, so the dedup compares insn PCs directly. */
+    uint64_t asid_root = store_asid_root(is_kernel);
     if (BBTemplate *existing =
-            find_existing_true_bb(start_pc, n_insns, insn_pcs)) {
+            find_existing_true_bb(asid_root, start_pc, n_insns, insn_pcs)) {
         return existing;
     }
 
@@ -645,7 +727,7 @@ BBTemplate *TemplateStore::commit_true_bb_refs(
                                            reg_src,
                                            symbol_name, fall_through_pc);
     BBTemplate *raw = tmpl.get();
-    bb_map_[start_pc] = std::move(tmpl);
+    bb_map_[BBKey{asid_root, start_pc}] = std::move(tmpl);
     g_stats.bb_templates_created++;
     return raw;
 }
@@ -782,11 +864,23 @@ BBTemplate *TemplateStore::get_or_create_bb_template(
         return nullptr;
     }
 
+    /* is_kernel drives the shared-kernel-bucket key (store_asid_root).  This
+     * is the CP finalize (g_cp_chain is correct-path only), so the head
+     * fragment's is_system is its REAL execution privilege — a user block
+     * CP-executes at user privilege and is stamped is_system=0.  Require the
+     * CP-confirmed latch too: only a genuine, correct-path kernel block may
+     * enter the sentinel bucket, so a wrong-path is_system mis-stamp on a
+     * user VA (which is never CP-confirmed kernel) can never conflate two
+     * processes' user code there.  Not the ambient level: this finalize runs
+     * while the plugin processes the SUCCESSOR TB, whose privilege differs. */
+    bool is_kernel = n_fragments > 0 && fragments[0]->is_system &&
+                     fragments[0]->is_system_cp_confirmed;
     BBTemplate *tmpl = commit_true_bb_refs(entry_pc, off,
                                            insn_pcs, field_ptrs,
                                            insn_sizes, insn_bytes,
                                            regname_ptrs,
-                                           symbol_name, final_ft);
+                                           symbol_name, final_ft,
+                                           is_kernel);
     /* Privilege context rides from the translation-time stamp on the
      * fragments onto the assembled true-BB.  Fragments of one BB share
      * one privilege level (the transition instruction seals the BB).
@@ -980,10 +1074,15 @@ void TemplateStore::ensure_rep_subtmpl(BBTemplate *tb)
     const InsnRegNames *sub_regs =
         tb->insn_reg_names ? &tb->insn_reg_names[last] : nullptr;
     uint64_t sub_ft = sub_pc + sub_size;
+    /* Only a CP-confirmed kernel parent routes the REP sub-template into the
+     * shared kernel bucket (see store_asid_root): a user REP keys by its live
+     * process root, never the sentinel. */
     BBTemplate *sub = commit_true_bb(sub_pc, 1, &sub_pc, lf,
                                      &sub_size, sub_bytes,
                                      sub_regs,
-                                     tb->symbol_name, sub_ft);
+                                     tb->symbol_name, sub_ft,
+                                     tb->is_system &&
+                                         tb->is_system_cp_confirmed);
     tb->rep_subtmpl = seg_ref(sub);
     /* Inherit the parent REP TB's privilege: the sub-template covers the
      * same instruction, so it shares its execution context.  commit_true_bb
@@ -1179,4 +1278,51 @@ uint64_t TemplateStore::reclaim_spec_templates(void)
         life_audit_after_reclaim(freed);
     }
     return n;
+}
+
+uint64_t TemplateStore::reclaim_asid(uint64_t asid_root)
+{
+    /* Window-close reclaim for one address space (see the header).  Drops
+     * the closed process's (asid_root, *) entries from BOTH per-class chain
+     * dedup indices.  Those buckets only cache the "already translated this
+     * TB" shortcut for lookup_tb_chain: their vectors hold BBTemplate*
+     * pointers INTO tb_templates_, so erasing a bucket forgets the shortcut
+     * without freeing any fragment (the fragments stay owned by
+     * tb_templates_).  A later re-translation of this VA — only if the
+     * window ever reopens — simply misses dedup and mints a fresh chain,
+     * which is correct and bounded.  Wire-neutral: neither index is
+     * serialised.
+     *
+     * The true-BB templates in bb_map_ are DELIBERATELY NOT freed here.
+     * The templates section is serialised once, at segment finish
+     * (write_bin_templates -> for_each_bb), and every body entry emitted
+     * during this window references its template_id; freeing an emitted
+     * template mid-segment would leave those references dangling in the
+     * wire (a decode-time "dangling template ref").  Emitted templates must
+     * therefore live until the segment's templates section is written —
+     * clear_bb_map frees them wholesale at the segment boundary.  Likewise
+     * tb_templates_ fragments stay pinned by live QEMU exec-cb udata and
+     * are only reclaimable at a tb_flush (reclaim_spec_templates).  Within a
+     * segment, template memory is thus bounded by the segment's
+     * distinct-code footprint (which the icount/marker window caps), not by
+     * process turnover. */
+    uint64_t dropped = 0;
+    for (auto it = tb_chain_dedup_.begin(); it != tb_chain_dedup_.end(); ) {
+        if (it->first.asid_root == asid_root) {
+            dropped++;
+            it = tb_chain_dedup_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = spec_chain_index_.begin();
+         it != spec_chain_index_.end(); ) {
+        if (it->first.asid_root == asid_root) {
+            dropped++;
+            it = spec_chain_index_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return dropped;
 }

@@ -47,6 +47,53 @@ struct BBTemplateDeleter {
 using BBTemplatePtr = std::unique_ptr<BBTemplate, BBTemplateDeleter>;
 
 /*
+ * Multi-ASID cache key: a template (and its dedup chains) is identified by
+ * the pair (asid_root, start_pc), NOT by start_pc alone.  Two owned
+ * processes routinely map distinct code at the SAME virtual address (every
+ * static binary loads its .text at the same low VA), so a start_pc-only key
+ * conflates them — the second process's block is misattributed to the
+ * first's template.  asid_root is the CODE's live translation address-space
+ * id (qemu_plugin_get_addr_space_id(), the same value the per-entry memory
+ * dimension resolves from); a single address space is all root 0, so this
+ * partitions bit-identically to the old start_pc key and single-process
+ * traces stay byte-identical.
+ *
+ * KERNEL code is the one exception (KPTI-off canonical model, multiasid_plan
+ * §7): kernel-privilege translations key with CST_KERNEL_ASID_ROOT — a
+ * single SHARED kernel bucket — instead of the live process root.  The kernel
+ * is one physical instance; keying it by the entering process's root would
+ * mint a duplicate template per process for the same kernel code.  Kernel VAs
+ * never collide with user VAs (disjoint ranges, maintainer-guaranteed), so
+ * the sentinel bucket is collision-safe against every user (asid_root,
+ * start_pc).  store_live_asid_root() picks the sentinel from the live
+ * privilege level. */
+static constexpr uint64_t CST_KERNEL_ASID_ROOT = ~(uint64_t)0;
+
+struct BBKey {
+    uint64_t asid_root;
+    uint64_t start_pc;
+    bool operator==(const BBKey &o) const
+    {
+        return asid_root == o.asid_root && start_pc == o.start_pc;
+    }
+};
+
+struct BBKeyHash {
+    size_t operator()(const BBKey &k) const
+    {
+        /* Mix the two 64-bit halves (splitmix-style finaliser on a
+         * boost::hash_combine of the pair) so nearby start_pcs under one
+         * asid, and one start_pc across asids, both scatter. */
+        uint64_t h = k.asid_root + 0x9e3779b97f4a7c15ULL;
+        h ^= k.start_pc + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= h >> 30;
+        h *= 0xbf58476d1ce4e5b9ULL;
+        h ^= h >> 27;
+        return (size_t)h;
+    }
+};
+
+/*
  * Read-only view of a contiguous run of canonical instructions (a whole TB
  * or a fragment slice).  Groups the six parallel per-insn arrays that
  * describe a translation so they travel together rather than as a
@@ -94,8 +141,15 @@ public:
                                    const char *symbol_name,
                                    uint64_t fall_through_pc);
 
-    /* True basic blocks. */
-    BBTemplate *find_bb_template(uint64_t entry_pc);
+    /* True basic blocks.  Keyed by (asid_root, entry_pc): the caller
+     * supplies the live translation address-space id so a shared code VA
+     * in two owned processes resolves to each process's own template. */
+    BBTemplate *find_bb_template(uint64_t asid_root, uint64_t entry_pc);
+    /* @is_kernel selects the cache key's asid_root: the shared kernel bucket
+     * for kernel-privilege code, the live process root otherwise (see BBKey /
+     * store_asid_root).  It is the BLOCK's privilege — the caller's
+     * is_system — NOT the ambient level, which at a CP-side seal reports the
+     * successor TB's privilege and would misfile a user block. */
     BBTemplate *commit_true_bb(uint64_t start_pc,
                                uint32_t n_insns,
                                const uint64_t *insn_pcs,
@@ -104,7 +158,8 @@ public:
                                const uint8_t *insn_bytes,
                                const InsnRegNames *insn_reg_names,
                                const char *symbol_name,
-                               uint64_t fall_through_pc);
+                               uint64_t fall_through_pc,
+                               bool is_kernel);
     /*
      * Reference variant of commit_true_bb for the wrong-path walker.
      * @insn_fields / @insn_reg_names are arrays of *pointers* into
@@ -124,7 +179,8 @@ public:
                                     const uint8_t *insn_bytes,
                                     const InsnRegNames *const *insn_reg_names,
                                     const char *symbol_name,
-                                    uint64_t fall_through_pc);
+                                    uint64_t fall_through_pc,
+                                    bool is_kernel);
     BBTemplate *get_or_create_bb_template(uint64_t entry_pc,
                                           BBTemplate *const *fragments,
                                           unsigned int n_fragments);
@@ -150,6 +206,26 @@ public:
     uint64_t spec_pending_bytes() const { return spec_pending_bytes_; }
     void note_spec_creation(uint64_t bytes) { spec_pending_bytes_ += bytes; }
     uint64_t reclaim_spec_templates(void);
+
+    /* Drop @asid_root's (asid_root, *) entries from the per-class chain
+     * dedup indices when its trace window closes (its END marker / removal
+     * from the owned set), so the dedup index does not accumulate one
+     * bucket per address space across many disparate ASIDs.  These buckets
+     * cache only lookup_tb_chain's "already translated" shortcut and are
+     * not serialised, so dropping them is wire-neutral and frees no
+     * fragment (the pointers index tb_templates_, which persists).
+     *
+     * The closed process's true-BB templates (bb_map_) are NOT freed here:
+     * the templates section is serialised once at segment finish and every
+     * emitted body entry references its template_id, so freeing an emitted
+     * template mid-segment dangles those references — emitted templates
+     * live until clear_bb_map at the segment boundary.  tb_templates_
+     * fragments likewise stay pinned by live QEMU exec-cb udata until a
+     * tb_flush (reclaim_spec_templates).  Within a segment, template memory
+     * is bounded by the window's distinct-code footprint, not by process
+     * turnover.  Returns the number of dedup buckets dropped.  Caller holds
+     * data_lock. */
+    uint64_t reclaim_asid(uint64_t asid_root);
 
     /* CST_MEMSTATS: print a footprint breakdown of the template store to
      * @out — template counts, per-array byte totals (insn_fields dominates:
@@ -274,8 +350,10 @@ private:
      * one-shot SMC/divergence warning if the insn-pc sequence
      * differs) or nullptr on a true miss.  Compares only insn_pcs;
      * templates are stored in true execution order so the comparison
-     * is direct. */
-    BBTemplate *find_existing_true_bb(uint64_t start_pc,
+     * is direct.  @asid_root scopes the lookup to the executing address
+     * space (see BBKey). */
+    BBTemplate *find_existing_true_bb(uint64_t asid_root,
+                                      uint64_t start_pc,
                                       uint32_t n_insns,
                                       const uint64_t *insn_pcs);
 
@@ -284,15 +362,18 @@ private:
      * run; deduped via tb_chain_dedup_ so a re-translation reuses the
      * existing chain instead of appending a duplicate. */
     std::vector<BBTemplatePtr>                  tb_templates_;
-    /* CODE-class dedup index: TB start_pc -> heads of already-built
-     * fragment chains (one per distinct canonical length seen at that
-     * PC — sibling translations of the same start_pc can differ in
-     * length, e.g. a full-BB correct-path TB vs a wrong-path TB that
-     * entered mid-block or stopped at a different branch terminator).
+    /* CODE-class dedup index: (asid_root, TB start_pc) -> heads of
+     * already-built fragment chains (one per distinct canonical length
+     * seen at that PC — sibling translations of the same start_pc can
+     * differ in length, e.g. a full-BB correct-path TB vs a wrong-path TB
+     * that entered mid-block or stopped at a different branch terminator).
      * lookup_tb_chain matches on total canonical insn count so they
-     * never conflate.  Holds CODE chains only (CODE-born at creation,
-     * SPEC-born on promotion), so reclaim never touches it. */
-    std::unordered_map<uint64_t, std::vector<BBTemplate *>> tb_chain_dedup_;
+     * never conflate.  The asid_root component is what keeps two owned
+     * processes sharing a code VA from adopting each other's fragment
+     * chain.  Holds CODE chains only (CODE-born at creation, SPEC-born on
+     * promotion), so reclaim_spec_templates never touches it. */
+    std::unordered_map<BBKey, std::vector<BBTemplate *>, BBKeyHash>
+        tb_chain_dedup_;
     /* SPEC-class twin of tb_chain_dedup_, populated at creation for
      * SPEC-born chains and dropped WHOLESALE by reclaim_spec_templates
      * — correct because reclaim frees every still-SPEC chain, and an
@@ -301,9 +382,14 @@ private:
      * prefer the CODE index, so the stale entry only ever resolves to
      * the same head, and it vanishes at the next reclaim.  This split
      * is what lets reclaim be a pure partition: no per-chain index
-     * surgery, ever. */
-    std::unordered_map<uint64_t, std::vector<BBTemplate *>> spec_chain_index_;
-    std::unordered_map<uint64_t, BBTemplatePtr> bb_map_;
+     * surgery, ever.  Keyed by (asid_root, start_pc), as tb_chain_dedup_. */
+    std::unordered_map<BBKey, std::vector<BBTemplate *>, BBKeyHash>
+        spec_chain_index_;
+    /* True-BB templates, keyed by (asid_root, start_pc) — what the
+     * trace's templates section serialises.  The asid_root key is Bug-A's
+     * fix: a shared code VA in two owned processes now lands two distinct
+     * templates instead of the second block silently adopting the first. */
+    std::unordered_map<BBKey, BBTemplatePtr, BBKeyHash> bb_map_;
     uint32_t                                    next_template_id_ = 1;
     uint64_t                                    spec_pending_bytes_ = 0;
     /* Current bb_map_ generation, bumped by clear_bb_map at every

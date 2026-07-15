@@ -256,6 +256,26 @@ plugin sees its argv.
    anyway, the plugin emits one ``pin_multivcpu_observed`` warning per
    segment — pin it to a core for clean per-thread attribution.
 
+   .. important::
+
+      **Boot the guest with kernel page-table isolation disabled** —
+      add ``nopti`` (equivalently ``pti=off``) to the kernel command
+      line for x86, and the analogous switch on other ISAs::
+
+         qemu-system-x86_64 -kernel vmlinuz -initrd rootfs.cpio.gz \
+             -append "console=ttyS0 panic=-1 nopti" \
+             -plugin ./libchampsim_tracer.so,outfile=run,\
+      trace_window=marker:simulation=20000000 ...
+
+      This is the **canonical system-mode configuration**.  With KPTI
+      off the kernel shares each process's address space, so a
+      kernel basic block is tagged with the owning process's ASID
+      (told apart from user code by the per-insn ``SYSTEM`` bit) and
+      shared kernel code deduplicates to a single template instead of
+      one per process.  OS isolation is then modeled *by the consumer*
+      from the ``SYSTEM`` bit rather than baked into the trace — see
+      the *System-mode traces* discussion in :doc:`concepts`.
+
 Examples::
 
    trace_window=icount:start=0+stop=20000000

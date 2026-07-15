@@ -1094,6 +1094,15 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             uint64_t fall_through = last_insn_pc + last_insn_size;
 
             g_mutex_lock(&data_lock);
+            /* is_kernel = false: a wrong-path commit NEVER routes into the
+             * shared kernel bucket (store_asid_root).  The WP walk can
+             * speculatively translate a USER VA while at kernel privilege,
+             * stamping it is_system=1; admitting such a block to the sentinel
+             * would let two processes' user code at one VA conflate there.
+             * WP true-BBs therefore key by their live process root
+             * (per-process, conflation-free); the correct-path finalize of
+             * the same block owns the shared-kernel decision (see
+             * get_or_create_bb_template). */
             BBTemplate *bb_tmpl = g_template_store.commit_true_bb_refs(
                 bb_start_pc, (uint32_t)bb_pcs.size(),
                 bb_pcs.data(),
@@ -1101,7 +1110,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                 bb_sizes.data(),
                 bb_bytes.data(),
                 g_features.reg_data ? bb_regnames.data() : nullptr,
-                bb_symbol_name, fall_through);
+                bb_symbol_name, fall_through, /*is_kernel=*/false);
             /* Privilege seed for WP-only-discovered BBs.  The WP walk
              * can speculate across the privilege boundary, so this is
              * only a guess; a correct-path finalize of the same BB

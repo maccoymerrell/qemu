@@ -2428,17 +2428,44 @@ void emit_body_entry(BodyStreamState *out_stream,
                     (bb_tmpl ? bb_tmpl->n_insns : 0)
                     + (uint64_t)(n_iter - 1);
                 /* Iter 2..N: rep_subtmpl, mpi memops each, insn_index
-                 * remapped to 0 (sub has exactly one insn). */
+                 * remapped to 0 (sub has exactly one insn).  One reused
+                 * BodyEntry across iterations keeps the per-sub dyn_params /
+                 * reg_snaps buffers allocated once (a hot path on
+                 * memset/memcpy-heavy kernels) instead of per iteration. */
+                BodyEntry sub_e;
+                sub_e.template_id = rep_sub->template_id;
+                sub_e.tmpl        = rep_sub;
+                sub_e.thread_id   = entry.thread_id;
+                sub_e.asid_index  = entry.asid_index;
+                sub_e.ctx_asid_index = entry.ctx_asid_index;
+                sub_e.cpu_index   = entry.cpu_index;
+                sub_e.dyn_params.reserve(mpi);
+                /* Dedup case: a 1-insn REP BB (its start_pc IS the REP PC)
+                 * is its own rep_subtmpl (commit_true_bb deduped sub against
+                 * parent by start_pc), so the parent iter-1 entry and these
+                 * sub-entries share ONE template — and thus ONE persistent
+                 * (asid,thread) field-state block.  The parent iter-1 wrote
+                 * the REP insn's destination-register snapshots (e.g. RDI/RSI
+                 * /RCX) into that block; a sub-entry that omits them leaves
+                 * the block holding those values, so a later ENTRY decode
+                 * materialises them while an IFRAME triggered on a sub-entry
+                 * (re-encoded from the sub's empty reg_snaps against fresh
+                 * scratch) reproduces only template-defaults — tripping the
+                 * decoder's IFRAME self-validation (cp reg_snaps mismatch).
+                 * Carry the parent's REP-insn reg snaps so the sub-entry's
+                 * field-state and its IFRAME re-encode stay consistent; since
+                 * the values are already resident, the ENTRY delta is zero and
+                 * the wire ENTRY bytes are unchanged.  Skipped in the non-dedup
+                 * case (multi-insn parent -> distinct sub template, distinct
+                 * block, nothing to leak).  Positionally sound: a dedup parent
+                 * is provably 1-insn, so its reg_snaps are exactly insn 0's
+                 * destination slots, matching the 1-insn sub template. */
+                if (rep_sub == bb_tmpl && !entry.reg_snaps.empty()) {
+                    sub_e.reg_snaps = entry.reg_snaps;
+                }
                 for (size_t k = 1; k < n_iter; k++) {
-                    BodyEntry sub_e;
-                    sub_e.seq_num     = g_trace_segments.next_seq_num();
-                    sub_e.template_id = rep_sub->template_id;
-                    sub_e.tmpl        = rep_sub;
-                    sub_e.thread_id   = entry.thread_id;
-                    sub_e.asid_index  = entry.asid_index;
-                    sub_e.ctx_asid_index = entry.ctx_asid_index;
-                    sub_e.cpu_index   = entry.cpu_index;
-                    sub_e.dyn_params.reserve(mpi);
+                    sub_e.seq_num = g_trace_segments.next_seq_num();
+                    sub_e.dyn_params.clear();
                     for (unsigned j = 0; j < mpi; j++) {
                         DynParam dp = rep_dps[k * mpi + j];
                         dp.insn_index = 0;

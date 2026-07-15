@@ -33,18 +33,25 @@ namespace cst {
  * FieldStateTable storage (mirrors the writer's
  * BodyStreamState::cp_field_state in champsim_tracer_output.cc):
  * blocks indexed by template_id; values is a flat
- * (n_insns * FIELD_STATE_SLOT_COUNT) Wide array; gens is per-cell
+ * (n_insns * physical stride) Wide array; gens is per-cell
  * generation — a cell "exists" only when gens[idx]==table.generation,
  * so bumping the generation invalidates every cell in O(1).  Replaces
  * an unordered_map<u64,Wide> (~10% of decode time in hash lookups). */
-/* Layout matches FIELD_STATE_SLOT_COUNT in champsim_tracer_output.cc:
- *   3 singletons (N_LOADS, N_STORES, METAFLAGS) + 8 * FID_SLOT_COUNT
- *   (slotted families: load_addr/store_addr/load_data/store_data/
- *   dst_reg/load_size/store_size/dst_reg_width) + 4 * FID_SLOT_COUNT
- *   (lane-mask block: SRC_LANE_MASK / DST_LANE_MASK / LOAD_DATA_LANE_MASK
- *   / STORE_DATA_LANE_MASK) + 7 insn-metadata.  EXTENDED has no
+/* FIELD_STATE_SLOT_COUNT is the LOGICAL slot-index space produced by
+ * slot_lut_build (the fid -> dense-slot LUT):
+ *   3 singletons (N_LOADS, N_STORES, METAFLAGS) + 12 * FID_SLOT_COUNT
+ *   slot-major slotted cells (families: load_addr/store_addr/load_data/
+ *   store_data/dst_reg/load_size/store_size/dst_reg_width + the 4
+ *   lane-mask families) + 7 insn-metadata singletons.  EXTENDED has no
  *   persistent cell.  Bump alongside the writer when new families are
- *   added. */
+ *   added.
+ *
+ * The PHYSICAL block layout is compacted per FieldStateBlock::max_slots
+ * (see cell_read/cell_write in cst_decode.cc): fixed singletons first,
+ * then family-major slotted cells with only max_slots cells per family,
+ * exactly like the writer's two-plane block.  The logical index is
+ * decomposed on access; a slot >= max_slots reads as a miss and grows
+ * the block on write. */
 inline constexpr size_t  FIELD_STATE_SLOT_COUNT   =
     3 + 8 * FID_SLOT_COUNT + 4 * FID_SLOT_COUNT + 7;
 inline constexpr uint16_t FIELD_STATE_SLOT_INVALID = 0xFFFFu;
@@ -54,6 +61,16 @@ inline constexpr size_t  FID_LUT_SIZE             = 1024;
 
 struct FieldStateBlock {
     uint32_t              n_insns = 0;
+    /* Slot occupancy high-water mark, mirroring the writer's
+     * FieldStateBlock::max_slots: the physical row holds only
+     * max_slots cells per slotted family (grown lazily on the first
+     * write to a higher slot), not the full FID_SLOT_COUNT stride.
+     * The overwhelmingly common scalar template (<=1 memop / dst reg
+     * per insn) stays at 1, which keeps a full-length system-trace
+     * decode's field-state footprint ~35x smaller than the eager
+     * fixed-stride layout it replaces (which exceeded 20 GiB on a
+     * 100M-entry trace and aborted the decode with bad_alloc). */
+    uint32_t              max_slots = 1;
     std::vector<Wide>     values;
     std::vector<uint32_t> gens;
 };

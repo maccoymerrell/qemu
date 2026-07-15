@@ -90,15 +90,97 @@ void slot_lut_build(const ResolvedIds &ids,
     }
 }
 
+/*
+ * Physical block layout (mirrors the writer's lazy max_slots design;
+ * see the FieldStateBlock comment in cst_decode.h).  Logical slot
+ * indices from slot_lut_build decompose as:
+ *   [0, 3)                       hot singletons  -> fixed offset 0..2
+ *   [3, 3 + FID_SLOT_COUNT*12)   slot-major slotted: k=(L-3)/12,
+ *                                f=(L-3)%12 -> family-major physical
+ *                                cell FS_FIXED_CELLS + f*max_slots + k
+ *   [.., +7)                     cold metadata   -> fixed offset 3..9
+ */
+inline constexpr uint32_t FS_N_FAMILIES  = 12;
+inline constexpr uint32_t FS_FIXED_CELLS = 10;   /* 3 hot + 7 cold */
+inline constexpr uint32_t FS_SLOTTED_BASE = 3;
+inline constexpr uint32_t FS_SLOTTED_END  =
+    FS_SLOTTED_BASE + FID_SLOT_COUNT * FS_N_FAMILIES;
+
+static inline size_t fs_stride(uint32_t max_slots)
+{
+    return (size_t)FS_FIXED_CELLS + (size_t)FS_N_FAMILIES * max_slots;
+}
+
+/* Decompose a logical slot.  Returns false for a slotted cell whose
+ * slot index k is beyond @max_slots (an unobserved high slot — the
+ * caller treats it as a state miss, or grows the block on write). */
+static inline bool fs_phys_offset(uint16_t lslot, uint32_t max_slots,
+                                  uint32_t *off, uint32_t *k_out)
+{
+    if (lslot < FS_SLOTTED_BASE) {          /* hot singleton */
+        *off = lslot;
+        *k_out = 0;
+        return true;
+    }
+    if (lslot < FS_SLOTTED_END) {           /* slotted family cell */
+        uint32_t r = (uint32_t)lslot - FS_SLOTTED_BASE;
+        uint32_t k = r / FS_N_FAMILIES;
+        uint32_t f = r % FS_N_FAMILIES;
+        *k_out = k;
+        if (k >= max_slots) return false;
+        *off = FS_FIXED_CELLS + f * max_slots + k;
+        return true;
+    }
+    /* cold metadata singleton */
+    *off = 3 + ((uint32_t)lslot - FS_SLOTTED_END);
+    *k_out = 0;
+    return true;
+}
+
 /* Grow @blk to hold @n_insns instructions worth of cells.  Idempotent;
- * never shrinks. */
+ * never shrinks.  Stride is constant here, so the resize appends whole
+ * rows without disturbing existing indices. */
 void block_ensure_capacity(FieldStateBlock *blk, uint32_t n_insns)
 {
     if (blk->n_insns >= n_insns) return;
-    size_t new_cells = (size_t)n_insns * FIELD_STATE_SLOT_COUNT;
+    size_t new_cells = (size_t)n_insns * fs_stride(blk->max_slots);
     blk->values.resize(new_cells);
     blk->gens.resize(new_cells, 0);
     blk->n_insns = n_insns;
+}
+
+/* Grow @blk's per-family slot occupancy to at least @need slots,
+ * re-laying-out into the wider stride and copying every live cell
+ * (deltas are computed against these — losing one would desync the
+ * decode), exactly like the writer's field_state_block_ensure_slots. */
+static void block_grow_slots(FieldStateBlock *blk, uint32_t need)
+{
+    if (need <= blk->max_slots) return;
+    if (need > FID_SLOT_COUNT) need = FID_SLOT_COUNT;
+    uint32_t old_ms = blk->max_slots, new_ms = need;
+    size_t old_st = fs_stride(old_ms), new_st = fs_stride(new_ms);
+    uint32_t n = blk->n_insns;
+
+    std::vector<Wide>     nv((size_t)n * new_st);
+    std::vector<uint32_t> ng((size_t)n * new_st, 0);
+    for (uint32_t i = 0; i < n; i++) {
+        size_t o = (size_t)i * old_st, nn = (size_t)i * new_st;
+        for (uint32_t c = 0; c < FS_FIXED_CELLS; c++) {
+            nv[nn + c] = blk->values[o + c];
+            ng[nn + c] = blk->gens[o + c];
+        }
+        for (uint32_t f = 0; f < FS_N_FAMILIES; f++) {
+            size_t of = o + FS_FIXED_CELLS + (size_t)f * old_ms;
+            size_t nf = nn + FS_FIXED_CELLS + (size_t)f * new_ms;
+            for (uint32_t k = 0; k < old_ms; k++) {
+                nv[nf + k] = blk->values[of + k];
+                ng[nf + k] = blk->gens[of + k];
+            }
+        }
+    }
+    blk->values.swap(nv);
+    blk->gens.swap(ng);
+    blk->max_slots = new_ms;
 }
 
 FieldStateBlock *table_get_or_create_block(FieldStateTable &t,
@@ -132,7 +214,11 @@ bool cell_read(const FieldStateBlock *blk, uint32_t table_gen,
     if (!blk || ipos >= blk->n_insns || slot == FIELD_STATE_SLOT_INVALID) {
         return false;
     }
-    size_t idx = (size_t)ipos * FIELD_STATE_SLOT_COUNT + slot;
+    uint32_t off, k;
+    if (!fs_phys_offset(slot, blk->max_slots, &off, &k)) {
+        return false;   /* unobserved high slot -> state miss */
+    }
+    size_t idx = (size_t)ipos * fs_stride(blk->max_slots) + off;
     if (blk->gens[idx] != table_gen) return false;
     *out = blk->values[idx];
     return true;
@@ -143,7 +229,14 @@ void cell_write(FieldStateBlock *blk, uint32_t table_gen,
 {
     if (!blk || slot == FIELD_STATE_SLOT_INVALID) return;
     block_ensure_capacity(blk, ipos + 1);
-    size_t idx = (size_t)ipos * FIELD_STATE_SLOT_COUNT + slot;
+    uint32_t off, k;
+    if (!fs_phys_offset(slot, blk->max_slots, &off, &k)) {
+        block_grow_slots(blk, k + 1);
+        if (!fs_phys_offset(slot, blk->max_slots, &off, &k)) {
+            return;     /* slot beyond FID_SLOT_COUNT: cap, drop */
+        }
+    }
+    size_t idx = (size_t)ipos * fs_stride(blk->max_slots) + off;
     blk->values[idx] = val;
     blk->gens[idx] = table_gen;
 }
@@ -243,7 +336,17 @@ void compare_observation_triple(const std::string &label,
              " IFRAME=" + std::to_string(iframe_snap.size()));
     }
     if (size_t d = first_reg_snap_diff(prev_snap, iframe_snap)) {
-        fail("reg_snaps[" + std::to_string(d - 1) + "] mismatch");
+        const RegSnap &p = prev_snap[d - 1];
+        const RegSnap &f = iframe_snap[d - 1];
+        char detail[256];
+        std::snprintf(detail, sizeof(detail),
+                      " (ENTRY insn=%u op=%u reg=%u v0=0x%llx"
+                      " | IFRAME insn=%u op=%u reg=%u v0=0x%llx)",
+                      p.insn_index, p.operand_index, p.reg_id,
+                      (unsigned long long)p.value.low64(),
+                      f.insn_index, f.operand_index, f.reg_id,
+                      (unsigned long long)f.value.low64());
+        fail("reg_snaps[" + std::to_string(d - 1) + "] mismatch" + detail);
     }
     if (prev_mf.size() != iframe_mf.size()) {
         fail("metaflags count mismatch: ENTRY=" +
@@ -418,10 +521,20 @@ struct BodyWalker::WalkState {
     bool     pending_asid_switch   = false;
     std::vector<bool> seen_asids;
 
-    /* Per-thread FieldStateTables, indexed by thread_id (== guest
-     * vCPU index); vectors stay short (one slot per vCPU). */
-    std::vector<FieldStateTable> cp_states;
-    std::vector<FieldStateTable> wp_states;
+    /* Per-context FieldStateTables, keyed by (asid_index, thread_id) —
+     * mirroring the writer's per-(ctx_asid, thread) field-state overlays
+     * (body_stream_write_entry's ctx_key).  The writer computes each
+     * entry's delta baselines against the OWNING PROCESS's history, so a
+     * single guest thread that spans multiple address spaces (e.g. a
+     * kernel/idle thread running clear_page for different processes)
+     * carries a FRESH baseline per asid.  Keying by thread alone would
+     * merge those, mis-accumulating deltas (an N_STORES 0->1 emitted
+     * against a process's fresh block would be applied on top of another
+     * process's resident 1, yielding 2).  In user mode / single-address-
+     * space traces asid_index is always 0, so the key collapses to the
+     * thread and behaviour is unchanged. */
+    std::unordered_map<uint64_t, FieldStateTable> cp_states;
+    std::unordered_map<uint64_t, FieldStateTable> wp_states;
 
     /* Last observed ENTRY, retained for the next IFRAME's validation. */
     std::optional<DecodedEntry> prev_entry;
@@ -430,9 +543,12 @@ struct BodyWalker::WalkState {
      * DecodedEntry::seq_num field. */
     uint32_t seq = 0;
 
-    FieldStateTable &state_at(std::vector<FieldStateTable> &v, uint32_t k) {
-        if (k >= v.size()) v.resize((size_t)k + 1);
-        return v[k];
+    static uint64_t ctx_key(uint32_t asid, uint32_t thread) {
+        return ((uint64_t)asid << 32) | thread;
+    }
+    FieldStateTable &state_at(std::unordered_map<uint64_t, FieldStateTable> &m,
+                              uint32_t asid, uint32_t thread) {
+        return m[ctx_key(asid, thread)];
     }
 };
 
@@ -579,8 +695,10 @@ void BodyWalker::handle_entry(WalkState &ws, const Callback &cb)
     int32_t entry_tmpl = ws.prev_entry_template + (int32_t)tdelta;
     ws.prev_entry_template = entry_tmpl;
 
-    FieldStateTable &cp_state = ws.state_at(ws.cp_states, ws.current_thread);
-    FieldStateTable &wp_state = ws.state_at(ws.wp_states, ws.current_thread);
+    FieldStateTable &cp_state =
+        ws.state_at(ws.cp_states, ws.current_asid, ws.current_thread);
+    FieldStateTable &wp_state =
+        ws.state_at(ws.wp_states, ws.current_asid, ws.current_thread);
 
     DecodedEntry entry;
     entry.template_id = (uint32_t)entry_tmpl;
@@ -1218,7 +1336,8 @@ void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
     int32_t entry_tmpl = ws.prev_entry_template + (int32_t)tdelta;
     ws.prev_entry_template = entry_tmpl;
 
-    FieldStateTable &cp_state = ws.state_at(ws.cp_states, ws.current_thread);
+    FieldStateTable &cp_state =
+        ws.state_at(ws.cp_states, ws.current_asid, ws.current_thread);
 
     auto cp_it = by_id_.find((uint32_t)entry_tmpl);
     const Template *cp_tmpl = (cp_it != by_id_.end())
@@ -1268,7 +1387,8 @@ void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
         { SectionScope s(body_); Reader &wpb = s;
           if (wp != WpDecode::Skip) {
               FieldStateTable &wp_state =
-                  ws.state_at(ws.wp_states, ws.current_thread);
+                  ws.state_at(ws.wp_states, ws.current_asid,
+                              ws.current_thread);
               stream_wp_chain_bb(wpb, wp_state, cp_state, wp, seq,
                                  ws.current_thread, ws.current_asid, cb);
           }

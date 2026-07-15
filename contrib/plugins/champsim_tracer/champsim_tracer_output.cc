@@ -3646,9 +3646,25 @@ static void emit_regfile_if_first(BodyStreamState *st, BodyEntry *entry,
  * scratch overlays (all values absolute).  It neither advances
  * prev_entry_template nor writes a tmpl_delta (template = the preceding
  * ENTRY's) — a pure validation/resync record.
+ *
+ * The CP register families are re-encoded from the PERSISTENT overlay's
+ * post-ENTRY state, not from the entry's own reg_snaps.  The two differ
+ * whenever an entry carries no (or partial) register snapshots for a
+ * template whose block already holds observed values — e.g. a REP
+ * fan-out sub-entry, or any capture-miss revisit of a reg-observed
+ * template: the decoder's ENTRY materialisation always reads the running
+ * state for every declared dst slot, so an IFRAME re-encoded from an
+ * empty snap vector emits no register records at all, decodes to
+ * template-baseline values, and trips the decoder's self-validation
+ * ("cp reg_snaps mismatch").  Sourcing the values from the persistent
+ * block reproduces exactly what the decoder materialised for the
+ * preceding ENTRY — byte-identical to the entry-sourced encoding
+ * whenever the entry did carry snaps (staging wrote those same values
+ * into the block), and a genuinely complete absolute dump when it
+ * didn't.
  */
 static void emit_iframe_if_due(BodyStreamState *st, BodyEntry *entry,
-                               uint32_t num_wp)
+                               uint32_t num_wp, FieldStateTable *cp_persist)
 {
     if (g_features.iframe_rate <= 0 || !entry->tmpl) {
         return;
@@ -3665,10 +3681,56 @@ static void emit_iframe_if_due(BodyStreamState *st, BodyEntry *entry,
     }
     st->iframe_cp_scratch->generation++;
     st->iframe_wp_scratch->generation++;
+
+    /* Synthesise the decoder-visible register snapshot from the
+     * persistent CP overlay (see the function comment).  Missing cells
+     * read as the template default (zero value / zero width), matching
+     * the decoder's miss-to-default lookup, so the synthesised vector is
+     * the decoder's ENTRY materialisation verbatim. */
+    std::vector<RegSnap> synth_snaps;
+    bool swapped = false;
+    if ((st->header_flags & CST_FLAG_REG_DATA) && cp_persist) {
+        FieldStateBlock *blk = field_state_table_get_block(
+            cp_persist, entry->template_id, entry->tmpl, false);
+        uint32_t gen = cp_persist->generation;
+        const BBTemplate *t = entry->tmpl;
+        uint32_t total = 0;
+        for (uint32_t i = 0; i < t->n_insns; i++) {
+            total += t->insn_fields[i].n_dst_regs;
+        }
+        synth_snaps.reserve(total);
+        for (uint32_t i = 0; i < t->n_insns; i++) {
+            uint8_t n_dsts = t->insn_fields[i].n_dst_regs;
+            for (uint8_t s = 0; s < n_dsts; s++) {
+                uint16_t vfid = (uint16_t)(CST_FID_DST_REG_BASE +
+                                           s * CST_FID_SLOT_STRIDE);
+                uint16_t wfid = (uint16_t)(CST_FID_DST_REG_WIDTH_BASE +
+                                           s * CST_FID_SLOT_STRIDE);
+                RegSnap rs;
+                cst_wide_zero(&rs.value);
+                field_state_get_wide(blk, gen, i, field_state_loc(vfid),
+                                     &rs.value);
+                uint64_t w = 0;
+                field_state_get_scalar(blk, gen, i, field_state_loc(wfid),
+                                       &w);
+                rs.width_bytes = (uint8_t)w;
+                synth_snaps.push_back(rs);
+            }
+        }
+        entry->reg_snaps.swap(synth_snaps);
+        swapped = true;
+    }
+
     bw_write_u8(&st->bw, BODY_TAG_IFRAME);
     emit_body_record_payload(st, &st->bw, entry, num_wp,
                              st->iframe_cp_scratch, st->iframe_wp_scratch,
                              st->iframe_cp_scratch);
+
+    if (swapped) {
+        /* Restore the entry's own snaps (the REP fan-out loop reuses
+         * the entry object across sub-iterations). */
+        entry->reg_snaps.swap(synth_snaps);
+    }
 }
 
 void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
@@ -3677,13 +3739,6 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
     uint32_t num_wp = (uint32_t)entry->wp_entries.size();
     uint64_t body_start = bw_tell_bytes(&st->bw);
     uint32_t tid = entry->thread_id;
-    /* The (asid, thread) context key for the per-context field-state and
-     * regfile tables.  Keyed on the CONTEXT (process) asid, not the live
-     * memory asid, so a thread keeps ONE register-file context across a
-     * user<->kernel excursion.  User mode / unpinned: ctx_asid_index ==
-     * asid_index (== 0 for a single address space) → key == tid, so those
-     * tables are indexed exactly as before and the trace stays byte-identical. */
-    uint64_t ctx_key = ((uint64_t)entry->ctx_asid_index << 32) | tid;
 
     /* Wire asid tag (KPTI-off canonical model, multiasid_plan §0/§7): a
      * kernel (priv>0) block carries the OWNING PROCESS asid on the wire, not
@@ -3703,6 +3758,22 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
     if (entry->tmpl && entry->tmpl->is_system) {
         wire_asid = entry->ctx_asid_index;
     }
+
+    /* The (asid, thread) context key for the per-context field-state and
+     * regfile tables — the WIRE asid, so the writer's delta baselines and
+     * the decoder's replay tables are keyed identically BY CONSTRUCTION.
+     * Kernel blocks carry the owning process on the wire (above), so a
+     * thread still keeps ONE register-file context across a user<->kernel
+     * excursion.  User blocks key by their live address space — which is
+     * the executing process — even where the per-vCPU ctx latch lags (the
+     * latch advances only on user-owned TBs, so under multi-process
+     * gating another owned process's user run would otherwise be keyed to
+     * the stale latch context while its wire tag says the live process:
+     * writer and decoder would then delta against different histories,
+     * corrupting decoded values and tripping IFRAME validation).  User
+     * mode / a single address space: wire_asid == 0 → key == tid, so
+     * those traces stay byte-identical. */
+    uint64_t ctx_key = ((uint64_t)wire_asid << 32) | tid;
 
     dyn_params_sort_template_order(entry->dyn_params);
     for (uint32_t w = 0; w < num_wp; w++) {
@@ -3739,7 +3810,7 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
     emit_body_record_payload(st, &st->bw, entry, num_wp,
                              cp_fst, wp_fst, cp_fst);
 
-    emit_iframe_if_due(st, entry, num_wp);
+    emit_iframe_if_due(st, entry, num_wp, cp_fst);
 
     bw_byte_align(&st->bw);
 

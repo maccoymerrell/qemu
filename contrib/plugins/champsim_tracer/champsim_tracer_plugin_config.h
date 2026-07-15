@@ -103,10 +103,13 @@ struct PluginConfig {
      *                           segment closes when the LAST open window's
      *                           END marker fires (owned set empties) or the
      *                           icount budget is met, whichever comes first.
-     *   trace-all (1): Stage B2 — the first START begins tracing ALL
-     *                  contexts until the marker window ends.  Parsed here
-     *                  as a forward hook; not yet implemented (falls back
-     *                  to latch with a warning at install).
+     *   trace-all (1): Stage B2 — the FIRST START begins tracing ALL
+     *                  contexts/ASIDs (no foreign-drop) until that first
+     *                  process runs its END marker (or the icount budget is
+     *                  met).  Only the capture gate widens: the icount clock
+     *                  and END detection still ride that first marker
+     *                  process's user instructions (decision #4), so the
+     *                  owned set stays the single clock pin.
      */
     enum MarkerPolicy { MARKER_LATCH = 0, MARKER_TRACE_ALL = 1 };
     int marker_policy = MARKER_LATCH;

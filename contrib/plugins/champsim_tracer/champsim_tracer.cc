@@ -278,8 +278,22 @@ static inline bool owned_contains_locked(uint64_t root)
 
 /* Marker-window multi-process policy (PluginConfig::MarkerPolicy), set at
  * install from trace_window=marker:policy=.  latch (default) is Stage B1;
- * trace-all is the Stage B2 hook. */
+ * trace-all is Stage B2. */
 static int g_marker_policy = 0;   /* PluginConfig::MARKER_LATCH */
+
+/*
+ * Trace-all gating (Stage B2).  The FIRST marker emission opens the segment
+ * and begins tracing EVERY context/ASID — no foreign-drop, no ownership
+ * filter — until that first process runs its END marker (or the icount
+ * budget is met).  Only the CAPTURE gate widens: the clock and END detection
+ * keep riding the single marker-process pin (g_owned stays the set-of-one
+ * clock pin), exactly as the latch/single-pin machinery already does.  All
+ * ISAs: the widening is identical; the narrow-ASID (MIPS) dwell machinery
+ * still serves the clock, its capture-side verification is simply bypassed. */
+static inline bool marker_trace_all(void)
+{
+    return g_marker_policy == PluginConfig::MARKER_TRACE_ALL;
+}
 
 /*
  * Translation-bypassing privilege level (see champsim_tracer.h).  The pin
@@ -1222,7 +1236,12 @@ static inline uint64_t pin_effective_asid(unsigned int cpu_index,
 static inline void refresh_ctx_gates(unsigned int cpu_index)
 {
     bool active = qemu_plugin_u64_get(g_scoreboard.is_active, cpu_index) != 0;
-    bool diverge = g_pin_reuse_guard &&
+    /* Trace-all captures EVERY context, so the heavy callback must dispatch
+     * for all in-segment TBs on all ISAs — trace_this_ctx == is_active, no
+     * narrow-ASID divergence (the dwell probe would otherwise gate out
+     * unconfirmed contexts we intend to trace).  The clock still rides the
+     * marker pin via pin_user_tb_owned in the heavy step. */
+    bool diverge = g_pin_reuse_guard && !marker_trace_all() &&
         g_pinned_asid.load(std::memory_order_relaxed) != CST_ASID_UNPINNED;
     if (!diverge) {
         qemu_plugin_u64_set(g_scoreboard.trace_this_ctx, cpu_index,
@@ -3219,7 +3238,17 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     uint64_t pinned_asid = g_pinned_asid.load(std::memory_order_relaxed);
     uint64_t live_asid = 0;
     int live_priv = -1;
+    /* user_owned  == CLOCK ownership: the marker (pinned) process's user
+     *                TBs, which advance g_user_icount and the END window.
+     *                Narrow (pin_user_tb_owned) in every mode.
+     * capture_owned == CAPTURE ownership: which user TBs reach the trace.
+     *                In latch it equals user_owned; in trace-all it widens
+     *                to EVERY user TB (foreign processes are captured too),
+     *                so the foreign-ASID drop in step_events lets them
+     *                through and kernel work folds to whichever process
+     *                last ran user code. */
     bool user_owned = false;
+    bool capture_owned = false;
     if (pinned_asid != CST_ASID_UNPINNED) {
         uint64_t delta = user_seen_advance(cpu_index, icount_prev);
         live_asid = qemu_plugin_get_addr_space_id();
@@ -3248,6 +3277,9 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
                     asid_set_user_sig(live_asid, usig);
                 }
             }
+            /* Capture widens to every user context in trace-all; the clock
+             * (user_owned) stays the marker process. */
+            capture_owned = marker_trace_all() ? true : user_owned;
         }
         if (user_owned) {
             g_user_icount += delta;
@@ -3279,7 +3311,10 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     in.pinned_asid = pin_effective_asid(cpu_index, pinned_asid);
     in.live_asid = live_asid;
     in.live_priv = live_priv;
-    in.user_owned = user_owned;
+    /* CAPTURE ownership drives the foreign-ASID drop, the kernel-excursion
+     * fold, and the (asid,thread) context refresh — widened to every user
+     * context in trace-all.  The CLOCK stays user_owned (folded above). */
+    in.user_owned = capture_owned;
     in.evs = nullptr;
     in.n_evs = qemu_plugin_drain_cpu_events(cpu_index, &in.evs);
     in.cpu_index = cpu_index;
@@ -4133,6 +4168,15 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
             g_rec_mutex_unlock(&exec_lock);
             return;
         }
+        if (marker_trace_all() && !g_owned.empty()) {
+            /* Trace-all: the FIRST marker already opened the whole-system
+             * window and everything is being captured.  A later marker —
+             * from this process or any other — must NOT join the owned set:
+             * the clock and END detection stay pinned to that first process
+             * (decision #4), and every context is already traced anyway. */
+            g_rec_mutex_unlock(&exec_lock);
+            return;
+        }
         bool first_open = g_owned.empty();
         g_owned.insert(asid);
         if (first_open) {
@@ -4148,9 +4192,12 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
             if (asid != 0) {
                 pin_repr_seed(pc);
             }
-            /* B2 hook: policy=trace-all would begin tracing ALL contexts
-             * here rather than only the marker-emitting set.  Forced to
-             * latch at install for B1 (see g_marker_policy). */
+            /* This is the whole-system open under policy=trace-all too: the
+             * segment machinery is identical (pin the first process for the
+             * clock + END), and the widened CAPTURE gate lives in the heavy
+             * step (marker_trace_all() in events_path_step / refresh_ctx_gates),
+             * so every context is traced from here without touching the owned
+             * set — which stays this single clock pin (see the guard above). */
             if (!g_trace_segments.is_active() &&
                 !g_trace_segments.is_shutting_down()) {
                 uint64_t lo =
@@ -5854,19 +5901,19 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                     "marker encoding for this ISA\n");
             return -1;
         }
-        if (g_marker_policy == PluginConfig::MARKER_TRACE_ALL) {
-            /* Stage B2 hook: trace-all (whole-system from the first marker)
-             * is not implemented yet.  Fall back to latch — the Stage B1
-             * per-process opt-in — so the run still produces a valid trace
-             * rather than silently doing the wrong thing. */
-            fprintf(stderr, "champsim_tracer: trace_window=marker "
-                    "policy=trace-all is not yet implemented (Stage B2); "
-                    "falling back to policy=latch\n");
-            g_marker_policy = PluginConfig::MARKER_LATCH;
+        if (marker_trace_all()) {
+            /* Stage B2: trace-all.  The first marker opens the segment and
+             * captures every context/ASID; the clock and the closing END
+             * stay pinned to that first process (decision #4). */
+            fprintf(stderr, "champsim_tracer: marker window policy=trace-all "
+                    "(whole-system from the first marker; every context "
+                    "captured; clock and END ride the first marker process; "
+                    "segment closes at its END marker or the icount budget)\n");
+        } else {
+            fprintf(stderr, "champsim_tracer: marker window policy=latch "
+                    "(per-process opt-in; segment closes when the last window "
+                    "ends or the icount budget is met)\n");
         }
-        fprintf(stderr, "champsim_tracer: marker window policy=latch "
-                "(per-process opt-in; segment closes when the last window "
-                "ends or the icount budget is met)\n");
         /* No segment opens until the guest launch wrapper's magic
          * marker instruction executes (see vcpu_marker_cb). */
     } else if (!g_simpoints.is_active() && trace_start_insn == 0) {

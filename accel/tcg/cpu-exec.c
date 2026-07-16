@@ -1251,7 +1251,13 @@ static void sdiff_compare(CPUState *cpu)
         }
     }
     const uint8_t *enow = (const uint8_t *)cpu_env(cpu) + SDIFF_ENV_OFF;
-    for (size_t i = 0; i < SDIFF_ENV_SZ; i++) {
+    /*
+     * "!=" rather than "<": on targets whose CPUArchState ends at
+     * end_reset_fields (alpha, avr, microblaze, tricore, xtensa)
+     * SDIFF_ENV_SZ is compile-time 0 and an unsigned "< 0" trips
+     * -Wtype-limits under -Werror.
+     */
+    for (size_t i = 0; i != SDIFF_ENV_SZ; i++) {
         if (enow[i] != g_sdiff_env[i] && !g_sdiff_env_seen[i]) {
             g_sdiff_env_seen[i] = 1;
             fprintf(stderr, "[statediff] env tail off=%zu (env+%zu) changed "

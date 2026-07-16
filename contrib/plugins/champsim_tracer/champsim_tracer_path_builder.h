@@ -279,19 +279,17 @@ private:
     BBTemplate *walk_prev_ = nullptr;
     uint32_t walk_depth_ = 0;
 
-    /* Depth pipeline: raw_depth_ tracks depth_after of the last fault
-     * event; base_depth_ is the segment baseline (a fault in flight
-     * across segment-open is baselined out); depth_next_ is the
-     * baselined, 0-clamped depth the CURRENT TB runs at.  A pre-segment
-     * fault returning mid-segment takes raw below base; the baseline
-     * re-floors to it there — mandatory, because the prime also
-     * baselines in STALE pre-segment frames (non-LIFO guest returns
-     * never pop), and a stale frame popped by a later same-PC return
-     * would otherwise clamp every subsequent depth to 0 for the rest
-     * of the segment. */
+    /* Depth pipeline.  depth_next_ is the fault-nesting depth the CURRENT
+     * TB runs at; it is the count of the pinned process's OWN un-returned
+     * merge frames (see step_seal), NOT a function of the per-vCPU
+     * plugin_fault_depth.  The raw stack is a single object shared by every
+     * guest process and, under multi-process churn, mixes the pinned
+     * process's frames with a busy boot's leaked frames and the churn
+     * tasks' transient ones — no per-vCPU baseline scalar can partition it,
+     * so the trailer counts our own frames instead.  raw_depth_ tracks
+     * depth_after of the last fault event for the CST_DEPTH_DIAG log only. */
     uint32_t depth_next_ = 0;
     uint32_t raw_depth_ = 0;
-    uint32_t base_depth_ = 0;
 
     /* Async-interrupt mute window, driven by ASYNC_ENTER/ASYNC_RETURN
      * events plus the two local reset arrows that produce NO event

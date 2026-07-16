@@ -792,38 +792,34 @@ events must survive bailed steps until a seal consumes them), then:
 shutdown / active / segment-boundary gates) applies the retained
 fault events exactly once, then runs the shared seal walk:
 
-* **Depth pipeline.**  ``raw_depth_`` tracks the last event's
-  ``depth_after``; ``base_depth_`` is the segment baseline, primed
-  lazily from live state at the segment's first seal (a fault in
-  flight across segment-open is baselined out, and events predating
-  the prime are swallowed — entries before a segment's first
-  surviving step never stash and never count); the baselined,
-  0-clamped difference is the depth the current TB runs at.  When a
-  pre-segment fault returns mid-segment and takes raw below the
-  baseline, the baseline re-floors to the new raw depth.  The
-  re-floor is load-bearing, not cosmetic: the prime also baselines
-  in *stale* pre-segment frames — a non-LIFO guest exception return
-  (a context switch inside a blocking fault resuming the outer task
-  first) never pops its frame, so a busy boot leaves them on the
-  per-vCPU stack — and when a later unrelated return matches a stale
-  frame's resume PC, the pop is permanent.  A fixed baseline would
-  clamp every subsequent excursion's depth to 0 for the rest of the
-  segment, mislabelling handler content and breaking the merged-BB
-  nesting invariant.  The baseline also re-floors *upward* at a guest
-  context switch: an ``ASID_WRITE`` event (the reported address-space
-  register genuinely changed) sets ``base_depth_`` to the switch-instant
-  depth (its ``depth_after``).  The incoming process is unrelated to
-  whatever fault frames the outgoing context left live on the per-vCPU
-  stack, so it must measure its own handlers against *its* zero.  The
-  archetype the churn battery exercises: a user page fault whose handler
-  an asynchronous tick preempts into the scheduler, which switches to
-  another task and never returns to pop the frame — a non-LIFO leak that,
-  without the up-re-floor, would stamp every subsequent fault under the
-  reused ASID one nesting level too deep (the intermittent ``0 -> 2+``
-  jump that skips depth 1).  The two re-floors are complementary: the
-  ``ASID_WRITE`` case raises the baseline as stale frames accumulate
-  across switches, the ``raw < base`` case lowers it when one finally
-  pops.
+* **Depth pipeline.**  The fault-trailer depth the current TB runs at
+  is the count of the pinned process's *own* un-returned merge frames
+  — the live entries in ``frames_``.  It is deliberately **not**
+  derived from the per-vCPU ``plugin_fault_depth``.  That stack is a
+  single object shared by every guest process, and under multi-process
+  churn it interleaves the pinned process's frames with a busy boot's
+  leaked frames (a non-LIFO guest exception return — a context switch
+  inside a blocking fault resuming the outer task first — never pops
+  its frame, so a boot leaves dozens on the stack, observed near the
+  64-slot cap) and the churn tasks' transient frames.  No single
+  per-vCPU baseline scalar can partition those: a foreign frame popping
+  drags a subtractive baseline down and a later foreign push then
+  over-counts the pinned depth, while a context switch *through* the
+  pinned handler and back under-counts it — the two churn signatures a
+  raw-minus-baseline scheme produced (a merged faulting BB stamped at
+  its own handler's depth, and a handler depth jumping ``0 <-> 2``
+  across a kernel spin loop).  ``frames_`` holds exactly the pinned
+  process's in-flight faults: foreign excursions are dropped and async
+  excursions are suspended *before* they reach the merge, so neither
+  ever seeds a frame, and the boot's leaked frames predate ``frames_``,
+  which ``on_segment_open`` clears.  Counting its un-returned frames
+  therefore yields the pinned nesting depth directly — ISA-agnostic,
+  immune to the shared stack's pollution, and ``0`` on the fault-free
+  user path (``frames_`` empty).  A returned frame's handler has
+  already unwound (its ``FAULT_RETURN`` was observed), so it drops out
+  of the count immediately even though its merge completion (the resume
+  suffix's seal) is still pending.  ``raw_depth_`` tracks the last
+  event's ``depth_after`` for the ``CST_DEPTH_DIAG`` log only.
 * **Fault-entry classification.**  Each ``FAULT_ENTER`` is handled
   individually against the deferred prev — see
   :ref:`fault-excursions` for the three cases and the context-frame

@@ -50,6 +50,12 @@ static bool pb_diag()
     return v;
 }
 
+static bool pb_depth_diag()
+{
+    static const bool v = getenv("CST_DEPTH_DIAG") != nullptr;
+    return v;
+}
+
 PathBuilder &path_builder_tls()
 {
     static thread_local PathBuilder builder;
@@ -157,7 +163,6 @@ void PathBuilder::on_segment_open()
     prev_depth_ = 0;
     depth_next_ = 0;
     raw_depth_ = 0;
-    base_depth_ = 0;
     async_excluding_ = false;
     async_departure_pc_ = 0;
     seal_pc_override_ = 0;
@@ -288,17 +293,18 @@ void path_builder_flush_final()
 }
 
 /*
- * First seal of a segment (or of the builder's life): baseline from LIVE
- * state instead of events.  Events retained up to this point may predate
- * the baseline; the live fault depth reflects all of them, so the whole
- * retained batch is swallowed by the caller (the priming swallow:
- * entries before the first surviving step of a segment never stash and
- * never count).
+ * First seal of a segment (or of the builder's life): the priming swallow.
+ * Events retained up to this point may predate the segment and reflect a
+ * pre-trace excursion, so the caller discards the whole retained batch
+ * (entries before the first surviving step of a segment never stash and
+ * never count).  depth_next_ opens at 0; the pinned nesting depth then
+ * accrues purely from frames_ (empty at segment open), so a fault in flight
+ * across the boundary is baselined out for free.  raw_depth_ is sampled
+ * from the live per-vCPU stack for the diagnostic only.
  */
 void PathBuilder::prime_from_live()
 {
     raw_depth_ = qemu_plugin_fault_depth();
-    base_depth_ = raw_depth_;
     depth_next_ = 0;
     primed_ = true;
 }
@@ -1028,56 +1034,77 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                 if (fault_on && !pb_no_merge()) {
                     apply_fault_return(ev);
                 }
-            } else if (fault_on && ev.kind == QEMU_PLUGIN_CPU_EV_ASID_WRITE) {
-                /* Guest context switch — the reported address-space
-                 * register genuinely changed (a TLB-maintenance write
-                 * that leaves the masked field alone emits nothing).
-                 * Any fault frames still live on the per-vCPU stack were
-                 * pushed by the OUTGOING context; the incoming process is
-                 * unrelated to them and establishes its own nesting from
-                 * here.  Re-floor the segment baseline to the switch-
-                 * instant depth so the incoming context's handlers are
-                 * measured against ITS zero, not the stale frames a
-                 * non-LIFO switch left behind: a page fault whose handler
-                 * the scheduler preempts (an async tick landing inside
-                 * the handler, then a switch to another task) never
-                 * returns to pop its frame, and without this re-baseline
-                 * every later fault under the reused ASID stamps one
-                 * level too deep — the intermittent 0->2+ jump the churn
-                 * battery's syscall_fault_nesting check flags.  This is
-                 * the inflate-side twin of the raw < base re-floor below
-                 * (which handles a stale frame finally popping); the
-                 * ASID_WRITE event's depth_after carries the live
-                 * plugin_fault_depth at the write. */
-                base_depth_ = ev.depth_after;
             }
             /* async kinds were applied by step_events.  ASID_WRITE (kind
-             * 4) was also consumed at drain time for kexc ownership; here
-             * it additionally re-floors the depth baseline across the
-             * context switch (above).  On the legacy (fault-off) path it
-             * is ignored, as before. */
+             * 4) is consumed at drain time for kexc ownership (step_events);
+             * the fault-depth trailer no longer reads it.  Depth is the
+             * pinned process's OWN un-returned fault count (below), which the
+             * context switch an ASID_WRITE marks cannot perturb. */
         }
         pending_evs_.clear();
-        /* Baselined, 0-clamped depth the CURRENT TB runs at.  Raw can
-         * drop below the segment baseline when a pre-segment fault
-         * returns inside the segment; when it does, the baseline
-         * RE-FLOORS to the new raw depth rather than clamping forever.
-         * The distinction matters because the pre-segment frames under
-         * the baseline are not all live excursions: a non-LIFO guest
-         * return (a context switch inside a blocking fault resuming the
-         * outer task first) never pops its frame, so a busy boot leaves
-         * STALE frames on the per-vCPU stack and the prime baselines
-         * them in.  When an unrelated in-segment exception return later
-         * matches such a frame's resume PC, the pop drops raw below
-         * base permanently — without the re-floor, every later
-         * excursion's depth clamps to 0 for the rest of the segment
-         * (observed: depth-0 TLB-refill handler entries followed by a
-         * merged faulting BB whose anchors then violate the depth-
-         * nesting invariant). */
-        if (raw_depth_ < base_depth_) {
-            base_depth_ = raw_depth_;
+        /*
+         * Fault-trailer depth = the pinned process's OWN synchronous-fault
+         * nesting: the number of its un-returned merge frames.  It is
+         * deliberately NOT derived from the per-vCPU plugin_fault_depth
+         * (raw_depth_, tracked above only for the diag).  That stack is a
+         * SINGLE object SHARED by every guest process, and under
+         * multi-process churn it interleaves the pinned process's frames
+         * with a busy boot's leaked frames (observed raw 62-65, at the
+         * 64-slot cap) and the churn tasks' transient ones.  No single
+         * per-vCPU baseline scalar can partition those: a foreign frame
+         * popping re-floored the old baseline down and a later foreign push
+         * then OVER-counted the pinned depth, while a context switch through
+         * the pinned handler and back UNDER-counted it — the two churn
+         * signatures (a merged faulting BB stamped at its own handler's
+         * depth, and a handler depth jumping 0<->2 across a kernel spin
+         * loop).  frames_ holds exactly the pinned process's in-flight
+         * faults: foreign (dropped) and async (suspended) excursions never
+         * reach the merge, so they never seed a frame, and the boot's leaked
+         * frames predate frames_, which on_segment_open clears.  Counting
+         * its un-returned frames therefore gives the pinned nesting depth
+         * directly — ISA-agnostic, immune to the shared stack's pollution,
+         * and 0 on the fault-free user path (frames_ empty) so output stays
+         * byte-identical there.  A returned frame's handler has already
+         * unwound (its FAULT_RETURN was observed), so it does not count.
+         *
+         * Stale-frame retirement.  A pinned TB at USER privilege proves the
+         * process is at fault-nesting depth 0 — user code never runs inside
+         * its own fault handler.  Any frame still flagged un-returned when a
+         * pinned user TB executes is therefore a LEAK: its handler's
+         * exception-return was non-LIFO on the shared per-vCPU stack (a
+         * foreign churn frame sat on top of it, so QEMU's strict-LIFO
+         * cpu_plugin_fault_pop matched the top and suppressed this frame's
+         * FAULT_RETURN), so the plugin never saw the return and the frame
+         * lingered — inflating every subsequent pinned fault's depth (the
+         * residual 0<->2 churn jump).  Retire such frames: mark them
+         * returned so they drop out of the depth count, but do NOT erase
+         * them — their merge completion stays possible if the resume suffix
+         * still seals.  This is the single-address-space, one-core-pinned
+         * regime the tracer supports; a preemptible multi-thread guest can
+         * legitimately run another thread's user code beside a live handler,
+         * but that privilege boundary is already exempted by the nesting
+         * check as a documented approximation. */
+        if (fault_on && in.pinned && in.live_priv == 0) {
+            for (CtxFrame &f : frames_) {
+                f.returned = true;
+            }
         }
-        depth_next_ = raw_depth_ > base_depth_ ? raw_depth_ - base_depth_ : 0;
+        uint32_t pinned_inflight = 0;
+        for (const CtxFrame &f : frames_) {
+            if (!f.returned) {
+                pinned_inflight++;
+            }
+        }
+        depth_next_ = pinned_inflight;
+        if (pb_depth_diag()) {
+            fprintf(stderr, "[depthdiag] cur=0x%" PRIx64 " walk_prev=0x%"
+                    PRIx64 " raw=%u inflight=%u depth_next=%u "
+                    "walk_depth=%u frames=%zu\n",
+                    in.cur ? in.cur->start_pc : 0,
+                    walk_prev_ ? walk_prev_->start_pc : 0,
+                    raw_depth_, pinned_inflight, depth_next_,
+                    walk_depth_, frames_.size());
+        }
     }
 
     /* Stamp cur (already promoted by step_events) with the depth it runs

@@ -2344,16 +2344,38 @@ void emit_body_entry(BodyStreamState *out_stream,
      * index otherwise.  cpu_index is retained for live register reads only
      * (regfile capture, WP lane gates) and never reaches the stream. */
     entry.thread_id = resolve_thread_id(cpu_index);
-    /* Address-space identity on the wire: the compact index of the live
-     * page-table root (index 0 in user mode / a single address space, so
-     * those traces stay byte-identical).  Resolved here alongside
-     * thread_id and frozen onto the entry, so a deferred emit carries the
-     * index captured at execution time. */
-    entry.asid_index = resolve_asid_index(cpu_index);
     /* Context asid (regfile / FieldState table key ONLY): the process asid,
      * held stable across a kernel excursion.  Equals asid_index in user
      * mode / unpinned, so the key is unchanged there. */
     entry.ctx_asid_index = resolve_ctx_asid_index(cpu_index);
+    /* Address-space identity on the wire: the compact index of the live
+     * page-table root (index 0 in user mode / a single address space, so
+     * those traces stay byte-identical).  Resolved here alongside
+     * thread_id and frozen onto the entry, so a deferred emit carries the
+     * index captured at execution time.
+     *
+     * Bug 3 (non-compact wire indices): a KERNEL block is TAGGED on the wire
+     * with the owning process (ctx_asid_index), never the live page-table
+     * root — which mid-excursion is a TRANSIENT FOREIGN CR3, the scheduler's
+     * next process caught while the kernel still runs under this excursion.
+     * Resolving asid_index from that live root would MINT a fresh compact
+     * wire index for an address space that never emits an entry of its own
+     * (the wire uses ctx_asid_index for every kernel block), burning index
+     * numbers on foreign roots and leaving the OWNED processes' wire indices
+     * non-compact (the trial saw owned indices 0 and 5, not 0 and 1).  So
+     * carry the ctx index for kernel blocks: only a root that actually
+     * reaches the wire — an owned process, at user privilege, where the live
+     * root IS that already-minted process — mints an index, giving compact
+     * first-emission order.  Trace-all keeps the live-root mapping (every
+     * context is emitted by its own root there, so the mint is real and the
+     * order must not change).  User mode / a single address space:
+     * is_system is 0 and ctx == live == 0, so those traces stay
+     * byte-identical. */
+    if (bb_tmpl && bb_tmpl->is_system && !marker_trace_all()) {
+        entry.asid_index = entry.ctx_asid_index;
+    } else {
+        entry.asid_index = resolve_asid_index(cpu_index);
+    }
     entry.cpu_index = cpu_index;
 
     g_mem_recorder.drain_cp_into_dyn_params(entry.dyn_params, bb_tmpl);
@@ -2582,6 +2604,16 @@ static void finish_trace_segment(void)
                                   std::memory_order_relaxed);
         g_total_arch_insns.fetch_add(g_seg_arch_insns,
                                      std::memory_order_relaxed);
+    }
+
+    /* Template-cache census (kernel-bucket duplication investigation): dump
+     * the per-bucket breakdown of the templates just serialised (finish()
+     * above wrote the templates section), before the segment's bb_map_ is
+     * cleared at the next open.  Diagnostic only, gated by env. */
+    if (getenv("CST_TMPL_CENSUS")) {
+        g_mutex_lock(&data_lock);
+        g_template_store.census(stderr);
+        g_mutex_unlock(&data_lock);
     }
 
     /* CST_MEMSTATS (#91): template-store footprint breakdown at segment
@@ -4308,11 +4340,43 @@ static inline bool marker_word_match(const uint8_t *seq,
  */
 struct MarkerExecRun {
     uint64_t next_pc = 0;      /* pc the run's next insn must have */
-    uint64_t asid = 0;
-    uint32_t run = 0;
+    uint64_t asid = 0;         /* the address space this run belongs to */
+    uint32_t run = 0;          /* run length so far (0 == free slot) */
+    uint32_t used = 0;         /* LRU timestamp (0 == never advanced) */
 };
-static thread_local MarkerExecRun tls_marker_run;
-static thread_local MarkerExecRun tls_marker_end_run;
+
+/*
+ * Per-vCPU set of in-flight marker runs, one slot per address space.
+ *
+ * A single shared run per vCPU cannot survive CONCURRENT ptrace injections:
+ * cst_attach single-steps the marker's instructions (each a separate
+ * ptrace stop -> resume, with a scheduling window between them), so two
+ * simultaneous injections interleave in the user stream — A1, B1, A2, B2,
+ * A3, B3.  A single run keyed nothing but "the last marker word seen"
+ * resets on every foreign-asid step (the old `else { run = 1; asid = a; }`
+ * branch), so NEITHER injection ever reaches full sequence length: they
+ * mutually cancel (observed: traced_icount=0 on a simultaneous 2xmcf
+ * launch).  Compiled-in markers execute back-to-back and so never exposed
+ * this — only the stepped injector interleaves.
+ *
+ * Keying each run by address space isolates the injections: asid A advances
+ * its own run across B's interposed steps, and vice versa.  Bounded to a
+ * handful of slots (concurrent injections are few — the working set during
+ * a simultaneous launch is just the injecting asids); the least-recently-
+ * advanced slot is evicted when full.  A legitimate marker's words are
+ * back-to-back in the user stream, so an evicted stale partial run costs
+ * nothing (it would reset on its next non-adjacent word anyway).  A single
+ * address space (user mode, or a compiled-in back-to-back marker) uses
+ * exactly one slot and behaves identically to the former single run, so
+ * those traces stay byte-identical.
+ */
+struct MarkerRunSet {
+    static constexpr int SLOTS = 8;
+    MarkerExecRun runs[SLOTS];
+    uint32_t tick = 0;         /* monotonic LRU clock */
+};
+static thread_local MarkerRunSet tls_marker_run;
+static thread_local MarkerRunSet tls_marker_end_run;
 
 /* udata for the per-insn marker exec cb: the insn's vaddr and size packed
  * into a pointer-sized word (size in the low byte; marker insns are
@@ -4330,21 +4394,64 @@ static inline void marker_udata_unpack(void *udata, uint64_t *pc,
     *pc = (uint64_t)(v >> 8);
 }
 
-/* Advance an execution-time run with this marker-word execution; returns
- * true when the run reaches full sequence length. */
-static inline bool marker_exec_step(MarkerExecRun *r, uint64_t pc,
+/* Locate @asid's run slot in @set; when it has none, claim a slot — a free
+ * one (run == 0) if any, else the least-recently-advanced — and reset it for
+ * a fresh run.  The returned slot's asid always equals @asid. */
+static inline MarkerExecRun *marker_run_slot(MarkerRunSet *set, uint64_t asid)
+{
+    int victim = 0;
+    uint32_t victim_age = UINT32_MAX;
+    for (int i = 0; i < MarkerRunSet::SLOTS; i++) {
+        MarkerExecRun &r = set->runs[i];
+        if (r.run > 0 && r.asid == asid) {
+            return &r;                      /* this asid's live run */
+        }
+        /* A free slot is the ideal victim (age 0); otherwise the oldest. */
+        uint32_t age = (r.run == 0) ? 0 : r.used;
+        if (age < victim_age) {
+            victim_age = age;
+            victim = i;
+        }
+    }
+    MarkerExecRun *r = &set->runs[victim];
+    r->run = 0;                             /* fresh run for a new asid */
+    r->asid = asid;
+    r->next_pc = 0;
+    return r;
+}
+
+/* Read-only peek at @asid's current run (diagnostics only); null if none. */
+static inline const MarkerExecRun *marker_run_peek(const MarkerRunSet *set,
+                                                   uint64_t asid)
+{
+    for (int i = 0; i < MarkerRunSet::SLOTS; i++) {
+        if (set->runs[i].run > 0 && set->runs[i].asid == asid) {
+            return &set->runs[i];
+        }
+    }
+    return nullptr;
+}
+
+/* Advance the current address space's execution-time run with this marker-
+ * word execution; returns true when that run reaches full sequence length.
+ * Runs are kept per address space (see MarkerRunSet) so a concurrently
+ * injected marker in a different address space does not reset this one. */
+static inline bool marker_exec_step(MarkerRunSet *set, uint64_t pc,
                                     uint8_t size)
 {
     if (qemu_plugin_get_priv_level() != 0) {
         return false;                       /* user-space stream only */
     }
     uint64_t asid = qemu_plugin_get_addr_space_id();
-    if (r->run > 0 && pc == r->next_pc && asid == r->asid) {
+    uint32_t now = ++set->tick;
+    MarkerExecRun *r = marker_run_slot(set, asid);
+    /* The slot is keyed by asid, so adjacency is the only remaining test. */
+    if (r->run > 0 && pc == r->next_pc) {
         r->run++;
     } else {
         r->run = 1;
-        r->asid = asid;
     }
+    r->used = now;
     r->next_pc = pc + size;
     if (r->run >= g_marker_seq.n_insns) {
         r->run = 0;
@@ -4723,6 +4830,9 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
     uint8_t size;
     marker_udata_unpack(udata, &pc, &size);
     if (marker_diag()) {
+        const MarkerExecRun *er =
+            marker_run_peek(&tls_marker_end_run,
+                            qemu_plugin_get_addr_space_id());
         fprintf(stderr, "[mkdiag] end-cb CP cpu=%u pc=0x%" PRIx64
                 " sz=%u priv=%d asid=0x%" PRIx64 " pinned=0x%" PRIx64
                 " run=%u next=0x%" PRIx64 " user=%" PRIu64
@@ -4731,7 +4841,7 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
                 cpu_index, pc, size, qemu_plugin_get_priv_level(),
                 qemu_plugin_get_addr_space_id(),
                 g_pinned_asid.load(std::memory_order_relaxed),
-                tls_marker_end_run.run, tls_marker_end_run.next_pc,
+                er ? er->run : 0, er ? er->next_pc : 0,
                 g_user_icount, tls_mkdiag_end_wp_gated,
                 tls_mkdiag_susp_user, tls_mkdiag_foreign_user);
     }

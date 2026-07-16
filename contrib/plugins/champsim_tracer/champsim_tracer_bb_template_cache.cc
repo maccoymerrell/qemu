@@ -10,10 +10,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <inttypes.h>
 #include <malloc.h>
 #include <stdio.h>
 #include <string.h>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -369,6 +371,76 @@ void TemplateStore::for_each_bb(const std::function<void(BBTemplate &)> &fn)
     for (const BBKey &k : keys) {
         fn(*bb_map_[k]);
     }
+}
+
+void TemplateStore::census(std::FILE *out) const
+{
+    /* Per-bucket tallies of the serialisable true-BB cache (bb_map_).
+     *
+     * The reliable CP-vs-WP provenance discriminator is is_system_cp_confirmed
+     * (set only by a correct-path finalize; a WP-only commit leaves it false),
+     * NOT the life class — a true-BB's SPEC/CODE label is assigned at commit
+     * from the thread's last-translation tls_creating_spec, which can be
+     * stale-true when a CP finalize follows a WP translation, so life
+     * mislabels CP true-BBs as SPEC.  The census keys on cp_confirmed. */
+    size_t sent_conf = 0, sent_unconf = 0;       /* kernel in the sentinel */
+    size_t kroot_conf = 0, kroot_unconf = 0;     /* kernel under a real root */
+    size_t user_root = 0, user_sentinel = 0;     /* user (sentinel would be a bug) */
+    std::unordered_set<uint64_t> kernel_roots;
+
+    /* Kernel-code duplication: DISTINCT bucket keys per kernel start_pc.
+     * Perfect sharing => 1 template per distinct kernel start_pc. */
+    std::unordered_map<uint64_t, unsigned> kernel_pc_buckets;
+    size_t kernel_templates = 0;
+
+    for (const auto &kv : bb_map_) {
+        const BBKey &k = kv.first;
+        const BBTemplate *t = kv.second.get();
+        if (!t) {
+            continue;
+        }
+        bool sentinel = (k.asid_root == CST_KERNEL_ASID_ROOT);
+        bool conf = t->is_system_cp_confirmed;
+        if (t->is_system) {
+            kernel_templates++;
+            kernel_pc_buckets[t->start_pc]++;
+            if (sentinel) {
+                (conf ? sent_conf : sent_unconf)++;
+            } else {
+                (conf ? kroot_conf : kroot_unconf)++;
+                kernel_roots.insert(k.asid_root);
+            }
+        } else {
+            (sentinel ? user_sentinel : user_root)++;
+        }
+    }
+
+    size_t distinct_kernel_pcs = kernel_pc_buckets.size();
+    size_t dup_pcs = 0, excess = 0;
+    for (const auto &kv : kernel_pc_buckets) {
+        if (kv.second > 1) {
+            dup_pcs++;
+            excess += kv.second - 1;
+        }
+    }
+
+    std::fprintf(out,
+        "champsim_tracer: [tmpl_census] bb_map=%zu  "
+        "kernel_templates=%zu distinct_kernel_pcs=%zu "
+        "dup_kernel_pcs=%zu excess_kernel_copies=%zu\n",
+        bb_map_.size(), kernel_templates, distinct_kernel_pcs,
+        dup_pcs, excess);
+    std::fprintf(out,
+        "champsim_tracer: [tmpl_census]   kernel sentinel: cp_confirmed=%zu "
+        "unconfirmed=%zu   kernel per-root: cp_confirmed(a)=%zu "
+        "wp_only(b)=%zu (over %zu roots)\n",
+        sent_conf, sent_unconf, kroot_conf, kroot_unconf,
+        kernel_roots.size());
+    std::fprintf(out,
+        "champsim_tracer: [tmpl_census]   user per-root=%zu  "
+        "user-in-sentinel(BUG if >0)=%zu\n",
+        user_root, user_sentinel);
+    std::fflush(out);
 }
 
 int TemplateStore::template_branch_index(const BBTemplate *tmpl)

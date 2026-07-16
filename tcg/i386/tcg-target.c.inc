@@ -2159,8 +2159,15 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
          * fast path: the spec store sandbox lives in the do_ld/do_st
          * helpers, and an inline TLB-hit store would commit speculative
          * state to real guest memory.  Jump unconditionally to the slow
-         * path, mirroring the !softmmu CF_FORCE_SLOW case below.
+         * path, mirroring the !softmmu CF_FORCE_SLOW case below.  This is
+         * the i386 native containment path, advertised by
+         * TCG_TARGET_HAS_SPEC_FORCE_SLOW; system-mode builds on backends
+         * that lack it fall back to the portable per-TLB-entry
+         * TLB_FORCE_SLOW routing (accel/tcg: cputlb.c / cpu-exec.c).
+         * Forcing this macro to 0 exercises that portable path on an x86
+         * host, which is how it is functionally validated.
          */
+#if TCG_TARGET_HAS_SPEC_FORCE_SLOW
         if (tb_cflags(s->gen_tb) & CF_FORCE_SLOW) {
             tcg_out_opc(s, OPC_JMP_long, 0, 0, 0);
             ldst->label_ptr[0] = s->code_ptr;
@@ -2168,6 +2175,7 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
             ldst->label_ptr[1] = NULL;
             return ldst;
         }
+#endif
 
         if (TCG_TARGET_REG_BITS == 64) {
             ttype = s->addr_type;
@@ -2217,6 +2225,7 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
         /* TLB Hit.  */
         tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_L0, TCG_REG_L0,
                    offsetof(CPUTLBEntry, addend));
+#if TCG_TARGET_HAS_SPEC_FORCE_SLOW
     } else if (tb_cflags(s->gen_tb) & CF_FORCE_SLOW) {
         /* Force all memory ops through slow-path for spec store buffer */
         ldst = new_ldst_label(s);
@@ -2228,6 +2237,7 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
         ldst->label_ptr[0] = s->code_ptr;
         s->code_ptr += 4;
         ldst->label_ptr[1] = NULL;
+#endif
     } else if (a_mask) {
         int jcc;
 

@@ -1771,6 +1771,58 @@ void cpu_plugin_spec_tlb_flush(CPUState *cpu)
 #endif
 }
 
+/*
+ * Spec-mode entry TLB flush — the portable (host-independent) half of the
+ * wrong-path store sandbox.
+ *
+ * On a host TCG backend that does NOT honor CF_FORCE_SLOW, spec-mode routing
+ * to the sandboxed do_ld/do_st helpers relies on TLB_FORCE_SLOW being set on
+ * every TLB entry the excursion uses; tlb_set_page_full stamps it on each
+ * entry the excursion installs.  Correct-path entries already resident when
+ * the excursion begins predate that stamp and lack the flag, so an inline
+ * TLB-hit speculative store would reach real guest RAM (the storm this fixed:
+ * see the i386 CF_FORCE_SLOW commit).  Flush here so those entries refill —
+ * with the flag — inside the excursion, closing the window for pre-existing
+ * correct-path entries.
+ *
+ * Compiled to a no-op on hosts whose backend honors CF_FORCE_SLOW (x86: the
+ * inline fast-path bypass already keeps spec-mode data ops off the fast path,
+ * so the flag and this flush are unnecessary and would only cost a full TLB
+ * reload per excursion), and in user mode (no softmmu TLB).
+ */
+void cpu_plugin_spec_tlb_flush_enter(CPUState *cpu)
+{
+#if !defined(CONFIG_USER_ONLY) && !TCG_TARGET_HAS_SPEC_FORCE_SLOW
+    tlb_flush(cpu);
+#else
+    (void)cpu;
+#endif
+}
+
+/*
+ * Whether a wrong-path (speculative) excursion can be contained on this build,
+ * so the plugin can refuse loudly rather than corrupt guest memory.
+ *
+ * Safe when the host backend honors CF_FORCE_SLOW (its inline qemu_ld/qemu_st
+ * bypass routes speculative memory ops to the slow-path helpers in both user
+ * and system mode), OR in system mode, where the portable TLB_FORCE_SLOW path
+ * (cpu_plugin_spec_tlb_flush_enter + the tlb_set_page_full stamp) contains
+ * speculative stores on ANY host backend — every backend's inline fast-path
+ * compare already treats a TLB_FORCE_SLOW entry as a miss.  The only remaining
+ * unsupported case is user mode on a backend without CF_FORCE_SLOW: there is
+ * no softmmu TLB to carry the flag and stores go straight to the guest image.
+ */
+bool cpu_plugin_spec_mode_supported(void)
+{
+#if TCG_TARGET_HAS_SPEC_FORCE_SLOW
+    return true;
+#elif !defined(CONFIG_USER_ONLY)
+    return true;
+#else
+    return false;
+#endif
+}
+
 void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
 {
     /*

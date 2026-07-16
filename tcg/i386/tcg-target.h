@@ -31,9 +31,12 @@
  * The i386/x86_64 backend honours CF_FORCE_SLOW: on a spec-mode TB it emits an
  * unconditional jump to the slow path for inline qemu_ld/qemu_st, keeping
  * speculative stores out of real guest RAM (see the CF_FORCE_SLOW handling in
- * tcg-target.c.inc).  This is what lets the plugin's wrong-path simulator run
- * safely; other backends do not implement it, so wrong-path tracing is gated
- * on this capability.
+ * tcg-target.c.inc).  This is the native wrong-path containment path and is
+ * used in both user and system mode.  Other backends do not implement it and
+ * rely on the portable per-TLB-entry TLB_FORCE_SLOW routing in system mode
+ * (accel/tcg); user-mode wrong-path tracing still requires this capability.
+ * Forcing this to 0 on an x86 host builds the portable path in its place,
+ * which is how that path is functionally validated on this host.
  */
 #define TCG_TARGET_HAS_SPEC_FORCE_SLOW 1
 

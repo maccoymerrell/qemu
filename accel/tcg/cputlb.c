@@ -1256,6 +1256,25 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     tlb_set_compare(full, &tn, addr_page, read_flags,
                     MMU_INST_FETCH, prot & PAGE_EXEC);
 
+#if defined(CONFIG_PLUGIN) && !TCG_TARGET_HAS_SPEC_FORCE_SLOW
+    /*
+     * Portable wrong-path store containment (host backends that do not honor
+     * CF_FORCE_SLOW): tag this entry's data-load and data-store comparators
+     * TLB_FORCE_SLOW while a speculative excursion is active, so every
+     * speculative data access misses the inline fast path on any host and
+     * lands in the sandboxed do_ld/do_st helpers.  The slow path's tlb_hit
+     * ignores the flag (no refill loop) and mmu_lookup1 strips it from the
+     * effective flags, so it is purely a "route to the helper" marker.
+     * Instruction fetch is left untagged — CF_FORCE_SLOW governs data ops
+     * only.  Compiled out where the backend honors CF_FORCE_SLOW (x86), which
+     * bypasses the fast path directly and makes the flag redundant.
+     */
+    if (unlikely(cpu_plugin_spec_active(cpu))) {
+        read_flags |= TLB_FORCE_SLOW;
+        write_flags |= TLB_FORCE_SLOW;
+    }
+#endif
+
     if (wp_flags & BP_MEM_READ) {
         read_flags |= TLB_WATCHPOINT;
     }

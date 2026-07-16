@@ -767,16 +767,19 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
     g_assert(!current_cpu->plugin_spec_mode);
 
     /*
-     * Fail-safe host-capability guard.  Wrong-path tracing routes speculative
-     * inline stores through the slow-path do_st helpers via CF_FORCE_SLOW so
-     * they land in the spec store sandbox instead of real guest RAM.  Only
-     * host TCG backends that honour CF_FORCE_SLOW (currently x86/i386)
-     * implement that redirection for inline qemu_st; on any other host an
-     * inline TLB-hit speculative store would silently commit to guest memory.
-     * Refuse loudly at the first spec-mode request rather than corrupt guest
-     * RAM, and rather than silently disabling wrong-path tracing (which would
-     * leave the caller believing the speculative excursion ran).  On x86 the
-     * capability is a compile-time 1, so this collapses to a no-op.
+     * Fail-safe containment guard.  Wrong-path tracing routes speculative
+     * stores through the slow-path do_st helpers so they land in the spec
+     * store sandbox instead of real guest RAM.  Two mechanisms provide that
+     * routing (see cpu_plugin_spec_mode_supported): a host backend that
+     * honours CF_FORCE_SLOW bypasses the inline fast path directly (any mode),
+     * and in system mode the portable TLB_FORCE_SLOW path contains stores on
+     * any host backend.  Only user-mode tracing on a backend without
+     * CF_FORCE_SLOW is unsupported — there is no softmmu TLB to carry the flag,
+     * so an inline store would commit to the guest image.  Refuse loudly at
+     * the first spec-mode request there rather than corrupt guest memory, and
+     * rather than silently disabling wrong-path tracing (which would leave the
+     * caller believing the speculative excursion ran).  On x86 the capability
+     * is a compile-time constant, so this collapses to a no-op.
      *
      * Terminate with _exit(): this fires from deep inside the plugin's WP
      * excursion setup (locks held, a half-built speculative session), so the
@@ -784,22 +787,14 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
      * state.  _exit() skips atexit handlers and stdio flush; error_report has
      * already written the diagnostic to the unbuffered stderr.
      */
-    if (!TCG_TARGET_HAS_SPEC_FORCE_SLOW) {
-        error_report("champsim_tracer wrong-path tracing requires a host TCG "
-                     "backend that honors CF_FORCE_SLOW (only x86/i386 hosts); "
-                     "on this host speculative stores would corrupt guest "
-                     "memory - refusing to enable.");
+    if (!cpu_plugin_spec_mode_supported()) {
+        error_report("champsim_tracer wrong-path tracing is not supported on "
+                     "this build: user-mode tracing on a host TCG backend that "
+                     "does not honor CF_FORCE_SLOW has no way to sandbox "
+                     "speculative stores, which would corrupt the guest image "
+                     "- refusing to enable.");
         _exit(1);
     }
-
-    /* Slow-path memory routing is enforced by CF_FORCE_SLOW on
-     * spec-mode TB cflags (see cpu_plugin_exec_inline /
-     * cpu_plugin_exec_tb); that makes the spec-mode translation a
-     * distinct TB-cache entry whose tb_gen_code emits slow-path
-     * mem helpers directly, with no dependence on TLB state.  A
-     * tlb_flush here would be a no-op anyway in CONFIG_USER_ONLY
-     * (the cputlb.h stub is empty) and pure overhead in
-     * system-mode. */
 
     /* Reuse existing hash table (cleared on previous spec_mode_end) */
     if (!current_cpu->plugin_spec_store_buf) {
@@ -809,6 +804,21 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
     current_cpu->plugin_spec_saved_state = saved_state;
     current_cpu->plugin_spec_store_overflow = false;
     current_cpu->plugin_spec_mode = true;
+
+    /*
+     * Slow-path memory routing.  On a backend that honours CF_FORCE_SLOW the
+     * spec-mode TB cflag (see cpu_plugin_exec_inline / cpu_plugin_exec_tb)
+     * makes the spec-mode translation a distinct TB-cache entry whose
+     * tb_gen_code emits slow-path mem helpers directly, independent of TLB
+     * state, and the flush below is a no-op.  On other host backends (system
+     * mode) the portable TLB_FORCE_SLOW path carries the routing instead: flush
+     * the softmmu TLB here so any correct-path entries resident at excursion
+     * start refill — with TLB_FORCE_SLOW — inside the excursion, rather than
+     * being hit on the inline fast path.  A no-op in user mode (no softmmu
+     * TLB).  The per-target impl lives in cpu-exec.c so this common file does
+     * not reference softmmu-only tlb_flush.
+     */
+    cpu_plugin_spec_tlb_flush_enter(current_cpu);
 }
 
 /*

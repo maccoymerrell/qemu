@@ -40,6 +40,8 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size);
 void cpu_plugin_spec_vtime_pause(CPUState *cpu);
 void cpu_plugin_spec_vtime_resume(CPUState *cpu);
 void cpu_plugin_spec_tlb_flush(CPUState *cpu);
+void cpu_plugin_spec_tlb_flush_enter(CPUState *cpu);
+bool cpu_plugin_spec_mode_supported(void);
 void cpu_plugin_vclock_pause(CPUState *cpu);
 void cpu_plugin_vclock_resume(CPUState *cpu);
 

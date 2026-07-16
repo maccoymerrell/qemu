@@ -265,7 +265,7 @@ plugin sees its argv.
          qemu-system-x86_64 -kernel vmlinuz -initrd rootfs.cpio.gz \
              -append "console=ttyS0 panic=-1 nopti" \
              -plugin ./libchampsim_tracer.so,outfile=run,\
-      trace_window=marker:simulation=20000000 ...
+             trace_window=marker:simulation=20000000 ...
 
       This is the **canonical system-mode configuration**.  With KPTI
       off the kernel shares each process's address space, so a

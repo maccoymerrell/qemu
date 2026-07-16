@@ -276,12 +276,41 @@ plugin sees its argv.
       from the ``SYSTEM`` bit rather than baked into the trace — see
       the *System-mode traces* discussion in :doc:`concepts`.
 
+``latch_timeout=<ms>``
+   Dead-latch detector for the marker *latch* policy
+   (``trace_window=marker:policy=latch``, the default marker policy),
+   where each process that runs the start marker joins an owned set and
+   is traced concurrently until it runs its **end** marker.  A process
+   that instead *dies* — killed, or exits without ever reaching its end
+   marker — would otherwise leave its window open forever: "all windows
+   closed" never fires and only the icount budget closes the segment.
+
+   When ``latch_timeout`` is non-zero the tracer stamps each owned
+   process's last schedule-in (wall time) and, off the hot path, closes
+   any window that has gone idle — never scheduled — for longer than the
+   given number of milliseconds, exactly as that window's end marker
+   would.  A live dominant process ages out a dead peer through its own
+   user-clock progress; when the *last* window closes this way the whole
+   segment shuts down (the backstop for a set of processes all killed at
+   once).
+
+   Default ``0`` disables it.  The signal is wall-clock idleness, which
+   cannot tell a dead process from a merely long-idle live one — a
+   process blocked on I/O, sleeping, or (for a system pin) starved by
+   heavy foreign scheduling churn all look idle.  So the detector is
+   opt-in: enable it for latch traces where processes may die without
+   their end marker, and choose a timeout comfortably larger than the
+   longest idle any *live* process in the workload legitimately exhibits
+   (seconds, typically), trading detection latency against the risk of
+   closing a slow-but-alive window early.
+
 Examples::
 
    trace_window=icount:start=0+stop=20000000
    trace_window=simpoint:file=mcf.sp+interval=100000000+warmup=2000000+simulation=20000000
    trace_window=symbol:name=main+occurrence=3+simulation=20000000
    trace_window=marker:simulation=20000000
+   trace_window=marker:policy=latch+simulation=20000000 latch_timeout=2000
 
 Without ``trace_window=`` the segment opens at process start and runs
 until the guest exits — equivalent to ``trace_window=icount:start=0``

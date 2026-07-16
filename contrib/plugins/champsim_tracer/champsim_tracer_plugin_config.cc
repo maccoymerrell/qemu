@@ -101,6 +101,13 @@ bool set_histogram(PluginConfig *cfg, const char *v)
     return true;
 }
 
+bool set_latch_timeout(PluginConfig *cfg, const char *v)
+{
+    /* Dead-latch timeout in wall-clock milliseconds; 0 disables. */
+    cfg->latch_timeout_ms = g_ascii_strtoull(v, nullptr, 10);
+    return true;
+}
+
 bool set_iframe_rate(PluginConfig *cfg, const char *v)
 {
     long long n = g_ascii_strtoll(v, nullptr, 10);
@@ -299,6 +306,7 @@ const struct {
     { "kexc",       set_kexc       },
     { "histogram",  set_histogram  },
     { "iframe_rate", set_iframe_rate },
+    { "latch_timeout", set_latch_timeout },
     { "trace_window", set_trace_window },
     { nullptr, nullptr },
 };

@@ -938,6 +938,15 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
      - ``100000``
      - Emit a validation IFRAME after every Nth observation of a CP
        template; ``0`` disables IFRAMEs.
+   * - ``latch_timeout=<ms>``
+     - ``0`` (disabled)
+     - Dead-latch detector for marker *latch* mode (see
+       :doc:`quickstart`).  When non-zero, closes a marked process's
+       window once it has been idle — never scheduled — for this many
+       wall-clock milliseconds, so a process that dies WITHOUT running
+       its end marker does not hold the segment open until the icount
+       budget.  Off by default because the signal cannot distinguish a
+       dead process from a merely long-idle live one.
    * - ``trace_window=MODE:KEY=VALUE+...``
      - unset (trace whole run)
      - Segmentation.  Exactly one mode; each mode accepts only its

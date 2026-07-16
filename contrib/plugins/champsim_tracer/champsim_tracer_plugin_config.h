@@ -113,6 +113,27 @@ struct PluginConfig {
      */
     enum MarkerPolicy { MARKER_LATCH = 0, MARKER_TRACE_ALL = 1 };
     int marker_policy = MARKER_LATCH;
+
+    /*
+     * Dead-latch timeout (latch_timeout=<ms>).  In marker latch mode a
+     * process that exits WITHOUT running its END marker would leave its
+     * window open until the icount budget closes the segment.  When set,
+     * the detector stamps each owned root's last schedule-in (wall time)
+     * and, off the hot path, closes any window idle longer than this many
+     * milliseconds — exactly as its END marker would.  When the last
+     * window closes this way the whole segment shuts down (the backstop
+     * for an all-died SIGKILL).
+     *
+     * DEFAULT 0 = DISABLED (opt-in).  The signal is wall-clock idleness,
+     * which cannot distinguish a dead process from a merely long-idle live
+     * one (a blocked/sleeping process, or a pinned process starved by heavy
+     * foreign ASID churn — the churn stress test idles the pin ~30 s by
+     * design).  So the detector is off unless the user opts in with a
+     * timeout chosen to exceed the longest legitimate idle their workload
+     * exhibits; enable it for latch traces where processes may die without
+     * their END marker and the icount budget is too coarse a fallback.
+     */
+    uint64_t latch_timeout_ms = 0;
 };
 
 /* Parse plugin args.  Returns true on success; on failure prints to

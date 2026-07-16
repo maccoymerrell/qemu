@@ -296,6 +296,54 @@ static inline bool marker_trace_all(void)
 }
 
 /*
+ * Dead-latch detector (marker latch mode).  A latched process that exits
+ * WITHOUT running its END marker would otherwise leave its window open
+ * forever — "all windows closed" never fires and only the icount budget
+ * closes the segment.  On Linux a process's death tears down its mm, so its
+ * page-table root (the owned ASID) is never loaded again: a stale
+ * last-schedule-in is a death signal.  We stamp each owned root's last
+ * schedule-in wall time and, off the hot path (the ASID-write hook), close
+ * any window idle past g_latch_timeout_ms exactly as its END marker would;
+ * when the last window closes this way the segment shuts down (the backstop
+ * for an all-died SIGKILL).  0 (default) disables it: the wall-clock idle
+ * signal cannot tell a dead process from a merely long-idle live one, so
+ * the detector is opt-in via latch_timeout=<ms> (see PluginConfig). */
+static uint64_t g_latch_timeout_ms = 0;
+
+/* Per-owned-root last schedule-in (wall ms), wide-register path.  The
+ * narrow-ASID (MIPS) path carries the equivalent as OwnedProc.last_sched_ms.
+ * Guarded by exec_lock, like g_owned; immortal. */
+static std::unordered_map<uint64_t, uint64_t> &g_owned_last_sched =
+    *new std::unordered_map<uint64_t, uint64_t>();
+
+/* Monotonic wall-clock milliseconds.  Unlike g_user_icount (which freezes
+ * when no owned process runs, so an all-died set could never age out), this
+ * keeps advancing regardless of guest scheduling.  Read only off the hot
+ * path (owner creation, dwell re-confirm, the ASID-write hook). */
+static inline uint64_t deadlatch_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+/* Off-hot-path staleness sweep, driven from the synchronous ASID-write
+ * hook — defined after finish_trace_segment / data_lock are in scope. */
+static void deadlatch_on_asid_write(unsigned int vcpu_index,
+                                    uint64_t new_asid);
+
+/* Progress-driven peer sweep cadence: while an owned process runs, check
+ * for dead PEER windows every this many of its user-instructions (the
+ * design's "segment-budget threshold crossing" trigger).  This makes a
+ * live dominant process age out a dead peer through its OWN progress —
+ * independent of how often the guest happens to write the address-space
+ * register — and refreshes the running window's own stamp so it is never
+ * itself false-aged.  Reset per segment (user_count_reset). */
+static constexpr uint64_t DEADLATCH_UIC_STRIDE = 8192;
+static uint64_t g_deadlatch_checked_uic = 0;
+static void deadlatch_clock_check(unsigned int cpu_index, uint64_t live_asid);
+
+/*
  * Translation-bypassing privilege level (see champsim_tracer.h).  The pin
  * identifies a process by the value of the target's address-space register,
  * which presumes execution actually translates through that register.  On
@@ -367,6 +415,7 @@ static inline void user_count_reset(unsigned int cpu_index,
                                     uint64_t insn_count_now)
 {
     g_user_icount = 0;
+    g_deadlatch_checked_uic = 0;
     for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
         qemu_plugin_u64_set(g_scoreboard.user_seen, (unsigned)i,
                             (unsigned)i == cpu_index
@@ -644,6 +693,8 @@ struct OwnedProc {
     uint64_t marker_sig = 0;         /* content signature companioning it */
     uint64_t repr_vpage = UINT64_MAX;/* lowest learned code vpage (text start) */
     bool     active = false;         /* false after this process's END marker */
+    uint64_t last_sched_ms = 0;      /* wall time of last confirmed dwell —
+                                      * dead-latch liveness (see deadlatch_*) */
 };
 /* The owned-process set (narrow-ASID Stage B3).  Immortal; guarded by
  * exec_lock.  Empty on wide-register targets (they use g_owned + the
@@ -1179,6 +1230,7 @@ static void pin_owned_reset_single(uint64_t marker_asid, unsigned int cpu_index,
     op.marker_sig = sig;
     op.repr_vpage = vpage;
     op.active = true;
+    op.last_sched_ms = deadlatch_now_ms();
     g_owned_procs->push_back(std::move(op));
     g_owned_procs_active = 1;
     for (unsigned i = 0; i < CST_PIN_MAX_VCPUS; i++) {
@@ -1208,6 +1260,7 @@ static int pin_owned_append(uint64_t marker_asid, unsigned int cpu_index,
     op.marker_sig = sig;
     op.repr_vpage = vpage;
     op.active = true;
+    op.last_sched_ms = deadlatch_now_ms();
     int idx = (int)g_owned_procs->size();
     g_owned_procs->push_back(std::move(op));
     g_owned_procs_active++;
@@ -1356,6 +1409,13 @@ static bool pin_user_tb_owned(unsigned int cpu_index, uint64_t live_asid,
     int hit = pin_map_probe_owners(pc, ow, &mismatch);
     if (hit >= 0) {
         ps.owner.store(hit, std::memory_order_relaxed);
+        /* Dead-latch liveness: a re-confirmed dwell is this owner being
+         * scheduled in.  Stamped here (off the per-TB fast path, which
+         * short-circuits above on an already-confirmed dwell) so a live
+         * owner stays fresh while a dead one ages out. */
+        if (g_latch_timeout_ms && hit < (int)g_owned_procs->size()) {
+            (*g_owned_procs)[hit].last_sched_ms = deadlatch_now_ms();
+        }
         if (live_asid != ps.asid.load(std::memory_order_relaxed)) {
             ps.asid.store(live_asid, std::memory_order_relaxed);
             qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
@@ -1471,6 +1531,14 @@ static void asid_write_track_cb(unsigned int vcpu_index, uint64_t new_asid)
             refresh_ctx_gates(vcpu_index);
         }
         pin_reuse_track(new_asid, pinned);
+    }
+    /* Dead-latch detector: this hook is the one place every committed root
+     * write is visible, so a live process's root passes through here at each
+     * schedule-in.  Sweep the owned roots for one that has gone stale (its
+     * process died without an END marker).  Off the per-TB hot path.  The
+     * mode/policy gate lives inside (g_window_mode is declared below). */
+    if (g_latch_timeout_ms) {
+        deadlatch_on_asid_write(vcpu_index, new_asid);
     }
 }
 
@@ -2661,6 +2729,287 @@ static void finish_trace_segment(void)
     qemu_plugin_outs(report->str);
 }
 
+/* True when the dead-latch detector is armed: marker mode, per-process
+ * latch policy (trace-all pins a single clock process by design), and a
+ * non-zero timeout. */
+static inline bool deadlatch_enabled(void)
+{
+    return g_latch_timeout_ms != 0 &&
+           g_window_mode == PluginConfig::WIN_MARKER &&
+           !marker_trace_all();
+}
+
+/* Close the segment when a dead-latch sweep empties the owned set — the
+ * whole-set backstop.  Mirrors the END marker's last-window close so the
+ * trace finalises identically (audit rolls up to 100%).  Caller holds
+ * exec_lock; returns true if the caller should exit(0). */
+static bool deadlatch_close_segment(uint64_t now)
+{
+    if (!g_trace_segments.is_active() ||
+        g_trace_segments.is_shutting_down()) {
+        return false;
+    }
+    fprintf(stderr,
+            "champsim_tracer: dead-latch close — closing after %" PRIu64
+            " user insns (last window; wall %" PRIu64 " ms)\n",
+            g_user_icount, now);
+    /* A dead process is a process that ended, so report a clean close
+     * ("END") rather than an under-budget underrun. */
+    g_seg_end_marker_close = true;
+    finish_trace_segment();
+    g_trace_segments.set_shutting_down();
+    return true;
+}
+
+/*
+ * Wide-register staleness sweep (x86 CR3 / AArch64 TTBR / RISC-V SATP).
+ * Close every owned root idle past the timeout — its process died without
+ * running its END marker — exactly as the END handler drops a window, then
+ * close the segment if that was the last one.  Caller holds exec_lock;
+ * returns true if the caller should exit(0).
+ */
+static bool deadlatch_sweep_wide(uint64_t now)
+{
+    if (g_owned.empty()) {
+        return false;
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> dead;   /* {root, idle_ms} */
+    for (uint64_t root : g_owned) {
+        auto it = g_owned_last_sched.find(root);
+        if (it == g_owned_last_sched.end()) {
+            g_owned_last_sched[root] = now;     /* first sighting: not stale */
+            continue;
+        }
+        uint64_t idle = now - it->second;
+        if (idle >= g_latch_timeout_ms) {
+            dead.emplace_back(root, idle);
+        }
+    }
+    for (const auto &d : dead) {
+        uint64_t root = d.first;
+        g_owned.erase(root);
+        g_owned_last_sched.erase(root);
+        /* Drop the closed process's asid-keyed dedup-index footprint (its
+         * true-BB templates stay until the templates section is written),
+         * as the END handler does. */
+        g_mutex_lock(&data_lock);
+        uint64_t dropped = g_template_store.reclaim_asid(root);
+        g_mutex_unlock(&data_lock);
+        /* If the dead root was the representative, repoint it to a
+         * still-owned root so pin_effective_asid / cst_pinned_asid_root
+         * stay valid. */
+        if (g_pinned_asid.load(std::memory_order_relaxed) == root &&
+            !g_owned.empty()) {
+            g_pinned_asid.store(*g_owned.begin(), std::memory_order_relaxed);
+        }
+        fprintf(stderr,
+                "champsim_tracer: dead-latch close asid=0x%" PRIx64
+                " idle=%" PRIu64 " ms (%zu still tracing, dropped %" PRIu64
+                " dedup buckets)\n", root, d.second, g_owned.size(), dropped);
+    }
+    if (!dead.empty() && g_owned.empty()) {
+        return deadlatch_close_segment(now);
+    }
+    return false;
+}
+
+/*
+ * Narrow-ASID staleness sweep (MIPS system mode).  An owner's liveness is
+ * its last confirmed physical-page dwell (stamped in pin_user_tb_owned) —
+ * an EntryHi.ASID value cannot name a process.  An owner currently
+ * confirmed on some vCPU is running now, so refresh it and never close it;
+ * otherwise close it if its last dwell is older than the timeout.  Caller
+ * holds exec_lock; returns true if the caller should exit(0).
+ */
+static bool deadlatch_sweep_narrow(uint64_t now)
+{
+    if (!g_owned_procs || g_owned_procs_active <= 0) {
+        return false;
+    }
+    int n = (int)g_owned_procs->size();
+    for (int oi = 0; oi < n; oi++) {
+        OwnedProc &op = (*g_owned_procs)[oi];
+        if (!op.active) {
+            continue;
+        }
+        /* A vCPU whose confirmed dwell is this owner is executing it right
+         * now (covers a long-running owner on an SMP peer while another
+         * vCPU's writes drive this sweep). */
+        bool live_now = false;
+        unsigned nv = (unsigned)qemu_plugin_num_vcpus();
+        if (nv > CST_PIN_MAX_VCPUS) {
+            nv = CST_PIN_MAX_VCPUS;
+        }
+        for (unsigned v = 0; v < nv; v++) {
+            if (g_pin_vcpu[v].confirmed.load(std::memory_order_relaxed) &&
+                g_pin_vcpu[v].owner.load(std::memory_order_relaxed) == oi) {
+                live_now = true;
+                break;
+            }
+        }
+        if (live_now) {
+            op.last_sched_ms = now;
+            continue;
+        }
+        uint64_t idle = now - op.last_sched_ms;
+        if (idle < g_latch_timeout_ms) {
+            continue;
+        }
+        op.active = false;
+        op.pages.clear();               /* free — never probed again */
+        g_owned_procs_active--;
+        fprintf(stderr,
+                "champsim_tracer: dead-latch close narrow owner %d "
+                "root_phys=0x%" PRIx64 " idle=%" PRIu64 " ms (%d still "
+                "tracing)\n", oi, op.root_phys, idle, g_owned_procs_active);
+    }
+    if (g_owned_procs_active == 0) {
+        return deadlatch_close_segment(now);
+    }
+    return false;
+}
+
+/*
+ * Dead-latch entry point, called from the synchronous ASID-write hook on
+ * every committed root write (per context switch — off the per-TB path).
+ * On the wide path a schedule-in of an owned root refreshes its stamp
+ * before the sweep; on the narrow path the dwell machinery does the
+ * stamping and this only sweeps.  A stale window is closed like an END
+ * fire; if that empties the set the segment shuts down.
+ */
+static void deadlatch_on_asid_write(unsigned int vcpu_index, uint64_t new_asid)
+{
+    (void)vcpu_index;
+    if (!deadlatch_enabled()) {
+        return;
+    }
+    /* Wrong-path fence: never mutate the owned set or close a window from a
+     * speculative context (asid writes are wrong-path-suppressed upstream;
+     * this hard-enforces it, mirroring the marker callbacks). */
+    if (qemu_plugin_in_spec_mode() || g_wp_state.in_progress) {
+        return;
+    }
+    g_rec_mutex_lock(&exec_lock);
+    bool do_exit = false;
+    if (g_trace_segments.is_active() &&
+        !g_trace_segments.is_shutting_down()) {
+        uint64_t now = deadlatch_now_ms();
+        if (g_pin_reuse_guard) {
+            do_exit = deadlatch_sweep_narrow(now);
+        } else {
+            if (owned_contains_locked(new_asid)) {
+                g_owned_last_sched[new_asid] = now;   /* live: schedule-in */
+            }
+            do_exit = deadlatch_sweep_wide(now);
+        }
+    }
+    g_rec_mutex_unlock(&exec_lock);
+    if (do_exit) {
+        exit(0);
+    }
+}
+
+/*
+ * Progress-driven peer sweep, called off the owned user clock (throttled to
+ * once per DEADLATCH_UIC_STRIDE user insns — see the constant).  The vCPU
+ * is executing an OWNED user TB right now, so ITS window is alive: refresh
+ * it, and close any OTHER owned window idle past the timeout (a dead peer
+ * whose process died mid-window without an END marker).  The running window
+ * is never closed here, so the owned set cannot empty on this path — the
+ * whole-set/last-window backstop lives on the ASID-write path.  Caller
+ * holds exec_lock; @live_asid is the executing root (wide targets),
+ * @cpu_index identifies the confirmed owner (narrow targets).
+ */
+static void deadlatch_clock_check(unsigned int cpu_index, uint64_t live_asid)
+{
+    if (!deadlatch_enabled()) {
+        return;
+    }
+    uint64_t now = deadlatch_now_ms();
+    if (g_pin_reuse_guard) {
+        if (!g_owned_procs) {
+            return;
+        }
+        int cur = (cpu_index < CST_PIN_MAX_VCPUS)
+            ? g_pin_vcpu[cpu_index].owner.load(std::memory_order_relaxed) : -1;
+        int n = (int)g_owned_procs->size();
+        if (cur >= 0 && cur < n) {
+            (*g_owned_procs)[cur].last_sched_ms = now;   /* running: fresh */
+        }
+        unsigned nv = (unsigned)qemu_plugin_num_vcpus();
+        if (nv > CST_PIN_MAX_VCPUS) {
+            nv = CST_PIN_MAX_VCPUS;
+        }
+        for (int oi = 0; oi < n; oi++) {
+            if (oi == cur) {
+                continue;
+            }
+            OwnedProc &op = (*g_owned_procs)[oi];
+            if (!op.active) {
+                continue;
+            }
+            bool live_now = false;
+            for (unsigned v = 0; v < nv; v++) {
+                if (g_pin_vcpu[v].confirmed.load(std::memory_order_relaxed) &&
+                    g_pin_vcpu[v].owner.load(std::memory_order_relaxed) == oi) {
+                    live_now = true;
+                    break;
+                }
+            }
+            if (live_now) {
+                op.last_sched_ms = now;
+                continue;
+            }
+            uint64_t idle = now - op.last_sched_ms;
+            if (idle < g_latch_timeout_ms) {
+                continue;
+            }
+            op.active = false;
+            op.pages.clear();
+            g_owned_procs_active--;
+            fprintf(stderr,
+                    "champsim_tracer: dead-latch close narrow owner %d "
+                    "root_phys=0x%" PRIx64 " idle=%" PRIu64 " ms (%d still "
+                    "tracing)\n", oi, op.root_phys, idle, g_owned_procs_active);
+        }
+        return;
+    }
+    if (owned_contains_locked(live_asid)) {
+        g_owned_last_sched[live_asid] = now;             /* running: fresh */
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> dead;
+    for (uint64_t root : g_owned) {
+        if (root == live_asid) {
+            continue;
+        }
+        auto it = g_owned_last_sched.find(root);
+        if (it == g_owned_last_sched.end()) {
+            g_owned_last_sched[root] = now;
+            continue;
+        }
+        uint64_t idle = now - it->second;
+        if (idle >= g_latch_timeout_ms) {
+            dead.emplace_back(root, idle);
+        }
+    }
+    for (const auto &d : dead) {
+        uint64_t root = d.first;
+        g_owned.erase(root);
+        g_owned_last_sched.erase(root);
+        g_mutex_lock(&data_lock);
+        uint64_t dropped = g_template_store.reclaim_asid(root);
+        g_mutex_unlock(&data_lock);
+        if (g_pinned_asid.load(std::memory_order_relaxed) == root &&
+            !g_owned.empty()) {
+            g_pinned_asid.store(*g_owned.begin(), std::memory_order_relaxed);
+        }
+        fprintf(stderr,
+                "champsim_tracer: dead-latch close asid=0x%" PRIx64
+                " idle=%" PRIu64 " ms (%zu still tracing, dropped %" PRIu64
+                " dedup buckets)\n", root, d.second, g_owned.size(), dropped);
+    }
+}
+
 /* ========================= Execution callback ========================= */
 
 /*
@@ -3524,6 +3873,18 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
         }
         if (user_owned) {
             g_user_icount += delta;
+            /* Progress-driven dead-latch peer sweep (throttled).  A live
+             * owned process ages out a dead peer through its own user-clock
+             * progress, so a straggler window closes even when the guest is
+             * not context-switching (the ASID-write trigger's blind spot).
+             * Off the hot path: one compare per owned TB, the sweep only at
+             * a stride crossing. */
+            if (g_latch_timeout_ms &&
+                g_user_icount - g_deadlatch_checked_uic >=
+                    DEADLATCH_UIC_STRIDE) {
+                g_deadlatch_checked_uic = g_user_icount;
+                deadlatch_clock_check(cpu_index, live_asid);
+            }
         }
         if (cur_tb_tmpl) {
             cur_tb_tmpl->is_system = live_priv != 0;
@@ -4515,6 +4876,7 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
         }
         bool first_open = g_owned.empty();
         g_owned.insert(asid);
+        g_owned_last_sched[asid] = deadlatch_now_ms();
         if (first_open) {
             /* First window: pin the representative root, seed its identity
              * signature from the marker's own code page (@pc is this
@@ -4734,6 +5096,7 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
     if (!g_pin_reuse_guard) {
         g_rec_mutex_lock(&exec_lock);
         g_owned.insert(asid);
+        g_owned_last_sched[asid] = deadlatch_now_ms();
         g_rec_mutex_unlock(&exec_lock);
     }
 
@@ -4868,6 +5231,7 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
             return;
         }
         g_owned.erase(asid);
+        g_owned_last_sched.erase(asid);
         if (!g_owned.empty()) {
             /* Other windows remain open — do NOT close the segment.  Drop
              * only this root: recompute the emitting vCPU's gates/flag so
@@ -6280,6 +6644,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     start_symbol_occurrence = cfg.start_symbol_occurrence;
     g_window_mode       = cfg.window_mode;
     g_marker_policy     = cfg.marker_policy;
+    g_latch_timeout_ms  = cfg.latch_timeout_ms;
 
     /*
      * Two decoupled fault concerns, split from the former single flag:

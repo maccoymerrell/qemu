@@ -152,6 +152,33 @@ static uint64_t riscv_get_plugin_thread_ptr(CPUState *cs)
      * the kernel tp holds the kernel's own per-CPU/task pointer. */
     return cpu_env(cs)->gpr[4];
 }
+
+static bool riscv_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
+{
+    CPURISCVState *env = cpu_env(cs);
+    /*
+     * A paged RV64 VA must be sign-extended (canonical) from the width of the
+     * active SATP mode: Sv39 → 39 bits, Sv48 → 48, Sv57 → 57.  User VAs
+     * occupy the low canonical half (sign bit clear); the kernel half is the
+     * high, all-ones-extended range (sign bit set), where the OS maps kernel
+     * text.  The guest PC reaches the plugin already sign-extended to 64 bits,
+     * so "kernel" is exactly the addresses whose bits above the sign bit are
+     * all ones — a threshold derived from the live paging width.  With paging
+     * Bare, in M-mode (translation bypassed), or on RV32 (not a system-mode
+     * target; its 32-bit VA is not 64-bit sign-extended), there is no such
+     * kernel/user split — report user. */
+    if (env->priv == PRV_M || riscv_cpu_mxl(env) == MXL_RV32) {
+        return false;
+    }
+    unsigned va_bits;
+    switch (get_field(env->satp, SATP64_MODE)) {
+    case VM_1_10_SV39: va_bits = 39; break;
+    case VM_1_10_SV48: va_bits = 48; break;
+    case VM_1_10_SV57: va_bits = 57; break;
+    default:           return false;   /* Bare / unknown: do not classify */
+    }
+    return vaddr >= (~(uint64_t)0 << (va_bits - 1));
+}
 #endif
 
 static const TCGCPUOps riscv_tcg_ops = {
@@ -162,6 +189,7 @@ static const TCGCPUOps riscv_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = riscv_get_plugin_state,
     .get_plugin_thread_ptr = riscv_get_plugin_thread_ptr,
+    .vaddr_is_kernel = riscv_vaddr_is_kernel,
 #endif
 
 #ifndef CONFIG_USER_ONLY

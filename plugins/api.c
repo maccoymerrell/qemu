@@ -690,6 +690,24 @@ uint64_t qemu_plugin_get_thread_ptr(void)
     return 0;
 }
 
+bool qemu_plugin_vaddr_is_kernel(uint64_t vaddr)
+{
+    /* Defensive: the classification needs the live vCPU's paging config, but
+     * a plugin may also consult it from a non-vCPU housekeeping context (e.g.
+     * an end-of-run diagnostic).  With no current vCPU there is no address
+     * space to classify against — report user-domain rather than abort. */
+    if (!current_cpu) {
+        return false;
+    }
+    const TCGCPUOps *ops = current_cpu->cc->tcg_ops;
+    if (ops && ops->vaddr_is_kernel) {
+        return ops->vaddr_is_kernel(current_cpu, vaddr);
+    }
+    /* No target classifier (user-mode, or an ISA without a kernel/user VA
+     * split visible to the tracer): everything is user-domain. */
+    return false;
+}
+
 bool qemu_plugin_exec_inline_insn(void)
 {
     g_assert(current_cpu);

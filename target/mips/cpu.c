@@ -601,6 +601,33 @@ static uint64_t mips_get_plugin_thread_ptr(CPUState *cs)
      */
     return cpu_env(cs)->active_tc.CP0_UserLocal;
 }
+
+static bool mips_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
+{
+    /*
+     * MIPS partitions the VA space into fixed segments by address range
+     * (see get_physical_address()): the low useg (and, on MIPS64, xuseg) is
+     * the only user-accessible region; everything above — kseg0/1/2/3 and the
+     * 64-bit xsseg/xkphys/xkseg — is kernel/supervisor.  So a code fetch is
+     * kernel-domain exactly when it falls outside useg/xuseg.  This is a pure
+     * range test on the fixed segment map (no CPU state, no TLB probe); the
+     * same USEG_LIMIT / segment boundaries the address-translation path uses
+     * are applied here.  Cast to target_ulong first so a 32-bit guest's PC
+     * (kseg0 = 0x80000000) compares in its own width rather than as a
+     * spuriously-small uint64_t.
+     */
+    (void)cs;
+    target_ulong address = (target_ulong)vaddr;
+    if (address <= USEG_LIMIT) {
+        return false;                         /* useg — user */
+    }
+#if defined(TARGET_MIPS64)
+    if (address < 0x4000000000000000ULL) {
+        return false;                         /* xuseg — user */
+    }
+#endif
+    return true;                              /* kseg / xsseg / xkphys / xkseg */
+}
 #endif
 
 static const TCGCPUOps mips_tcg_ops = {
@@ -611,6 +638,7 @@ static const TCGCPUOps mips_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = mips_get_plugin_state,
     .get_plugin_thread_ptr = mips_get_plugin_thread_ptr,
+    .vaddr_is_kernel = mips_vaddr_is_kernel,
 #endif
 
 #if !defined(CONFIG_USER_ONLY)

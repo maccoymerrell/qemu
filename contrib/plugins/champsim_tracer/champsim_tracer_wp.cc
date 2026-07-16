@@ -299,8 +299,17 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                                bool *flush_interrupted,
                                                bool *first_tb_unavail)
 {
-    (void)branch_pc;
     (void)correct_target;
+    /*
+     * Privilege domain the excursion speculates in: the launching correct-path
+     * context's, fixed by branch_pc's VA class.  Spec mode redirects only PC
+     * and sandboxes memory — it never writes the paging/privilege registers —
+     * so the architectural VA classifier (qemu_plugin_vaddr_is_kernel) reports
+     * the same kernel/user split for every fetch on the walk.  A wrong-path
+     * fetch that lands in the OTHER domain is SMEP/PXN-forbidden on real
+     * hardware and terminates the excursion (see the loop body).
+     */
+    const bool excursion_is_kernel = cst_va_is_kernel_code(branch_pc);
     /* Set true if a tb_flush unwound a spec-mode exec_tb before its guest
      * insn ran (last_executed_tb stayed null while the flush count moved).
      * The caller cleanly re-runs the whole WP in the now-fresh code cache
@@ -489,6 +498,38 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         }
 
         if (poisoned_targets.count(pre_pc)) {
+            early_exit = true;
+            break;
+        }
+
+        /*
+         * Privilege-domain-switch terminate — the faithful SMEP/PXN model.
+         * The excursion speculates at the launching context's privilege
+         * (excursion_is_kernel); a mispredicted fetch that reaches a code VA
+         * in the OTHER domain (kernel-context excursion reaching a user-VA
+         * fetch, or the reverse) is architecturally forbidden — the
+         * speculative fetch faults and the pipeline recovers — so no real core
+         * follows it.  End the excursion cleanly here, the same shape as the
+         * translation-unavailable terminate: the sealed chain so far is
+         * preserved and its last entry marked, and the crossing block is NOT
+         * fetched.  This complements the syscall-boundary terminate (a
+         * legitimate CORRECT-path domain transition, never a wrong-path one)
+         * and eliminates the cross-domain mis-stamp at its source, so a
+         * committed wrong-path block's VA class is always its true domain.
+         */
+        if (cst_va_is_kernel_code(pre_pc) != excursion_is_kernel) {
+            if (!wp_chain.empty()) {
+                wp_chain.back().translation_unavailable = true;
+            } else {
+                /* Crossing on the very first target (e.g. an indirect branch
+                 * mispredicted across the boundary): no entry to mark, so the
+                 * emitter writes a chain-level CST_WP_EVENT_TRANSLATION_UNAVAIL.
+                 * Not the wp_first_tb_unavail "bug" counter — this is an
+                 * expected architectural terminate, not an unfetchable target. */
+                *first_tb_unavail = true;
+            }
+            acc.clear();
+            bb_reg_snaps.clear();
             early_exit = true;
             break;
         }
@@ -1094,15 +1135,15 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             uint64_t fall_through = last_insn_pc + last_insn_size;
 
             g_mutex_lock(&data_lock);
-            /* is_kernel = false: a wrong-path commit NEVER routes into the
-             * shared kernel bucket (store_asid_root).  The WP walk can
-             * speculatively translate a USER VA while at kernel privilege,
-             * stamping it is_system=1; admitting such a block to the sentinel
-             * would let two processes' user code at one VA conflate there.
-             * WP true-BBs therefore key by their live process root
-             * (per-process, conflation-free); the correct-path finalize of
-             * the same block owns the shared-kernel decision (see
-             * get_or_create_bb_template). */
+            /* The shared-kernel-bucket key is chosen from bb_start_pc's VA
+             * class inside commit_true_bb_refs (store_asid_root): a kernel-VA
+             * block joins the one shared kernel template even when only the
+             * wrong path ever discovers it, while a user VA can never reach
+             * the sentinel (kernel/user VA ranges are disjoint), so a
+             * speculative is_system mis-stamp cannot conflate two processes'
+             * user code.  The domain-switch terminate above guarantees this
+             * committed block was fetched entirely within one privilege
+             * domain, so its VA class is its true domain. */
             BBTemplate *bb_tmpl = g_template_store.commit_true_bb_refs(
                 bb_start_pc, (uint32_t)bb_pcs.size(),
                 bb_pcs.data(),
@@ -1110,13 +1151,18 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                 bb_sizes.data(),
                 bb_bytes.data(),
                 g_features.reg_data ? bb_regnames.data() : nullptr,
-                bb_symbol_name, fall_through, /*is_kernel=*/false);
-            /* Privilege seed for WP-only-discovered BBs.  The WP walk
-             * can speculate across the privilege boundary, so this is
-             * only a guess; a correct-path finalize of the same BB
-             * overrides and latches it (see BBTemplate::is_system). */
+                bb_symbol_name, fall_through);
+            /* Privilege seed for WP-only-discovered BBs.  Seed from the
+             * architectural VA class of the block's start, not the wrong-path
+             * priv level: a kernel-VA block IS kernel code regardless of what
+             * a speculative translation observed, so this is a reliable seed
+             * (SMEP/PXN forbid kernel-context execution of user pages, and the
+             * domain-switch terminate ends any excursion that would cross the
+             * boundary).  A correct-path finalize of the same BB still
+             * overrides and latches the authoritative value (see
+             * BBTemplate::is_system). */
             if (bb_tmpl && !bb_tmpl->is_system_cp_confirmed) {
-                bb_tmpl->is_system = cur->is_system;
+                bb_tmpl->is_system = cst_va_is_kernel_code(bb_start_pc);
             }
             g_mutex_unlock(&data_lock);
 

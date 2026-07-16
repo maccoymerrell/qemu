@@ -98,11 +98,16 @@ typedef uint64_t qemu_plugin_id_t;
  * - added qemu_plugin_get_thread_ptr (the kernel-maintained per-thread
  *   pointer register; guest-thread identity independent of the vCPU a
  *   thread happens to be scheduled on)
+ *
+ * version 11:
+ * - added qemu_plugin_vaddr_is_kernel (classify a code virtual address's
+ *   privilege domain via the target's own MMU / segment logic; a
+ *   speculation-proof kernel-vs-user split with no page-table walk)
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 10
+#define QEMU_PLUGIN_VERSION 11
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -1702,6 +1707,28 @@ bool qemu_plugin_paging_enabled(void);
  */
 QEMU_PLUGIN_API
 bool qemu_plugin_vaddr_to_paddr(uint64_t vaddr, uint64_t *paddr);
+
+/**
+ * qemu_plugin_vaddr_is_kernel() - classify a code VA's privilege domain
+ * @vaddr: a guest-virtual code (instruction-fetch) address
+ *
+ * Returns true when @vaddr lies in the guest's KERNEL (privileged) code
+ * region and false when it lies in the USER region, as decided by the
+ * target's own MMU / segment logic: the canonical upper half (x86_64), the
+ * TTBR1 region select (AArch64), the sign-extended kernel half for the
+ * active paging mode (RISC-V Sv39/48/57), or the fixed segment map (MIPS
+ * kuseg vs kseg).  Kernel and user virtual-address ranges are architecturally
+ * disjoint, so this is a pure range/bit test that never walks page tables and
+ * never faults — safe to call on a speculatively-fetched wrong-path address,
+ * and independent of the current privilege level (which speculative execution
+ * can mis-observe).
+ *
+ * Returns false unconditionally in *-linux-user (no kernel address space) and
+ * on any target that does not implement the classification.  Must be called
+ * from a vCPU context.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_vaddr_is_kernel(uint64_t vaddr);
 
 /**
  * qemu_plugin_get_thread_ptr() - the guest's per-thread pointer register

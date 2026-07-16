@@ -98,6 +98,26 @@ struct TCGCPUOps {
      * user privilege; see qemu_plugin_get_thread_ptr().
      */
     uint64_t (*get_plugin_thread_ptr)(CPUState *cpu);
+
+    /**
+     * @vaddr_is_kernel: classify a code virtual address's privilege domain
+     *
+     * Optional.  Returns true when @vaddr lies in the guest's KERNEL
+     * (privileged/supervisor) code region, false when it lies in the USER
+     * region, as determined by the target's own MMU / segment logic — the
+     * canonical/TTBR/sign-extension range the walker selects on, or the
+     * fixed-segment map (MIPS kuseg vs kseg).  This is a pure architectural
+     * range/bit test on the address; it does no page-table walk and cannot
+     * fault, so a plugin can call it on a speculatively-fetched wrong-path
+     * address safely.  Kernel and user virtual-address ranges are
+     * architecturally disjoint, so the classification does not depend on the
+     * current privilege level (which a wrong-path walk can mis-observe).
+     * Lets a plugin partition kernel from user code, seed a kernel/user bit
+     * without trusting a speculated privilege level, and detect a
+     * privilege-domain crossing on a control transfer.  Read priv=0 targets
+     * (user-mode QEMU) do not register this hook, so the API reports "user".
+     */
+    bool (*vaddr_is_kernel)(CPUState *cpu, uint64_t vaddr);
 #endif
 
 #ifdef CONFIG_USER_ONLY

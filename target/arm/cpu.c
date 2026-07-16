@@ -2685,6 +2685,25 @@ static uint64_t arm_get_plugin_thread_ptr(CPUState *cs)
      * same state), context-switched per thread by the kernel. */
     return cpu_env(cs)->cp15.tpidr_el[0];
 }
+
+static bool arm_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
+{
+    CPUARMState *env = cpu_env(cs);
+    /*
+     * The EL1&0 regime splits the VA space into TTBR0 (low, user) and TTBR1
+     * (high, kernel).  For an AArch64 kernel the architecture selects between
+     * them on bit 55 of the VA — "the bit that is always between the two
+     * regions", per aa64_va_parameters() — so a kernel code VA is exactly one
+     * with bit 55 set.  This is width-agnostic: it holds for 39/48/52-bit VA
+     * configurations alike, which is why it is preferred over a fixed
+     * TTBR1-base constant.  An AArch32 kernel splits the low 4 GiB by a
+     * TTBCR boundary instead (not our system-mode target); report user there.
+     */
+    if (!arm_el_is_aa64(env, 1)) {
+        return false;
+    }
+    return extract64(vaddr, 55, 1) != 0;
+}
 #endif
 
 static const TCGCPUOps arm_tcg_ops = {
@@ -2696,6 +2715,7 @@ static const TCGCPUOps arm_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = arm_get_plugin_state,
     .get_plugin_thread_ptr = arm_get_plugin_thread_ptr,
+    .vaddr_is_kernel = arm_vaddr_is_kernel,
 #endif
 
 #ifdef CONFIG_USER_ONLY

@@ -157,6 +157,27 @@ static uint64_t x86_get_plugin_thread_ptr(CPUState *cs)
     }
     return env->segs[R_GS].base;
 }
+
+static bool x86_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
+{
+    CPUX86State *env = cpu_env(cs);
+    /*
+     * Long mode: the linear address space is split into a low (user) and a
+     * high (kernel) canonical half with a non-canonical hole between them.
+     * The split sits at the sign bit of the paging width — 48-bit (LA48) or
+     * 57-bit (LA57, CR4.LA57) — so the kernel half is exactly the addresses
+     * whose bits above that sign bit are all ones.  Deriving the boundary
+     * from the live paging width (rather than a fixed constant) keeps the
+     * classification correct under LA57.  Outside long mode there is no such
+     * canonical kernel half (32-bit paging splits user/kernel by an
+     * OS-chosen boundary the hardware does not define), so report user.
+     */
+    if (!(env->hflags & HF_LMA_MASK)) {
+        return false;
+    }
+    unsigned va_bits = (env->cr[4] & CR4_LA57_MASK) ? 57 : 48;
+    return vaddr >= (~(uint64_t)0 << (va_bits - 1));
+}
 #endif
 
 static const TCGCPUOps x86_tcg_ops = {
@@ -169,6 +190,7 @@ static const TCGCPUOps x86_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = x86_get_plugin_state,
     .get_plugin_thread_ptr = x86_get_plugin_thread_ptr,
+    .vaddr_is_kernel = x86_vaddr_is_kernel,
 #endif
 #ifdef CONFIG_USER_ONLY
     .fake_user_interrupt = x86_cpu_do_interrupt,

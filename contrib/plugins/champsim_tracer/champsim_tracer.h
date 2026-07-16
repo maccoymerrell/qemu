@@ -1166,6 +1166,24 @@ extern int g_xlate_bypass_priv;
  * to little-endian before they reach the trace, so the on-disk format
  * is unconditionally LE regardless of guest endianness. */
 extern bool target_big_endian;
+
+/* True when @pc is a KERNEL code virtual address for the guest ISA — a
+ * speculation-proof architectural classification (kernel/user VA ranges are
+ * disjoint), unlike the privilege level a wrong-path walk can mis-stamp on a
+ * speculatively-translated user VA.  Delegates to QEMU's own per-target MMU /
+ * segment logic through the qemu_plugin_vaddr_is_kernel() plugin API (which
+ * asks the target's TCGCPUOps hook), so there is no parallel VA-boundary
+ * constant table in the plugin.  Drives the shared kernel template bucket
+ * (store_asid_root), seeds is_system for wrong-path-only-discovered blocks,
+ * and gates the wrong-path privilege-domain-switch terminate (multiasid_plan
+ * §7).  In user mode the target reports no kernel domain, so every code VA
+ * classifies user, the sentinel bucket is never used, and single-ASID output
+ * stays byte-identical to the pre-classifier scheme. */
+static inline bool cst_va_is_kernel_code(uint64_t pc)
+{
+    return qemu_plugin_vaddr_is_kernel(pc);
+}
+
 extern const InsnClassification *active_insn_table;
 extern unsigned active_insn_table_size;
 extern const RegClassification *active_reg_table;

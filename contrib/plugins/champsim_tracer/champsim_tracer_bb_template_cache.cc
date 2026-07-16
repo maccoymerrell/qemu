@@ -71,24 +71,28 @@ static inline uint64_t store_live_asid_root(void)
  * a kernel excursion under KPTI-off) so two owned processes sharing a code VA
  * stay distinct (Bug A).
  *
- * @is_kernel MUST be a RELIABLE per-block kernel signal, and this is subtle:
- * the sentinel bucket's collision-safety rests entirely on the maintainer's
- * guarantee that kernel VAs never collide with user VAs — so it must contain
- * ONLY genuine kernel VAs.  A wrong-path walk can speculatively TRANSLATE a
- * user VA while at kernel privilege, stamping that user block is_system=1; if
- * such a block reached the sentinel, two processes' user code at one VA would
- * conflate there.  Callers therefore pass ONLY a CP-confirmed kernel stamp
- * (is_system && is_system_cp_confirmed): a user block never CP-executes at
- * kernel privilege, so it can never be CP-confirmed kernel and never enters
- * the bucket.  Speculative (wrong-path) commits pass is_kernel=false and key
- * by their live root, staying per-process and conflation-free.  The internal
- * fragment-chain indices (tb_chain_dedup_/spec_chain_index_) likewise key by
- * the live root, so a wrong-path mis-stamp there is at worst a per-process
- * duplicate, never a cross-process reuse. */
-static inline uint64_t store_asid_root(bool is_kernel)
+ * The bucket is selected by the block's start_pc through the ARCHITECTURAL VA
+ * classifier (cst_va_is_kernel_code → qemu_plugin_vaddr_is_kernel, the
+ * target's own MMU/segment logic), NOT by an is_system privilege stamp.  This
+ * is what makes the shared bucket safe against the wrong path: kernel and user
+ * VA ranges are architecturally disjoint, so a user VA can NEVER classify
+ * kernel — a wrong-path walk that speculatively translates a user VA at kernel
+ * privilege and mis-stamps it is_system=1 still keys by the live process root
+ * (its VA classifies user), so two processes' user code at one VA can never
+ * conflate in the sentinel.  Both the correct and wrong paths therefore route
+ * a kernel-VA block into the shared bucket (so WP-only-discovered kernel code
+ * joins the one shared template instead of minting a per-process duplicate),
+ * while every user-VA block stays per-process.  The privilege domain-switch
+ * terminate on the wrong path (champsim_tracer_wp.cc) ends any excursion that
+ * would cross the kernel/user boundary, so a committed WP block's VA class
+ * matches the domain it was fetched in.  The internal fragment-chain indices
+ * (tb_chain_dedup_/spec_chain_index_) still key by the live root; the shared
+ * identity is only the wire-visible template. */
+static inline uint64_t store_asid_root(uint64_t start_pc)
 {
-    return is_kernel ? CST_KERNEL_ASID_ROOT
-                     : qemu_plugin_get_addr_space_id();
+    return cst_va_is_kernel_code(start_pc)
+               ? CST_KERNEL_ASID_ROOT
+               : qemu_plugin_get_addr_space_id();
 }
 
 /* Stable zeroed sentinel: a fragment may lack insn_reg_names while
@@ -393,6 +397,21 @@ void TemplateStore::census(std::FILE *out) const
     std::unordered_map<uint64_t, unsigned> kernel_pc_buckets;
     size_t kernel_templates = 0;
 
+    /* Empirical validation of the architectural VA classifier
+     * (qemu_plugin_vaddr_is_kernel) against the CP-confirmed privilege ground
+     * truth — the two must agree on every correct-path-confirmed template:
+     *   va_kernel_total   templates whose start_pc classifies kernel-VA
+     *   mismatch_cp_kernel  CP-confirmed KERNEL but VA says user  (boundary too
+     *                       high — kernel dedup would regress; MUST be 0)
+     *   mismatch_cp_user    CP-confirmed USER but VA says kernel  (boundary too
+     *                       low — user code could reach the sentinel and
+     *                       conflate across processes; MUST be 0)
+     * A nonzero mismatch means the target hook's boundary is wrong for this
+     * guest.  Uses the live vCPU paging config, so it is only meaningful when
+     * the census runs in vCPU context (a mid-execution window close). */
+    size_t va_kernel_total = 0;
+    size_t mismatch_cp_kernel = 0, mismatch_cp_user = 0;
+
     for (const auto &kv : bb_map_) {
         const BBKey &k = kv.first;
         const BBTemplate *t = kv.second.get();
@@ -401,6 +420,17 @@ void TemplateStore::census(std::FILE *out) const
         }
         bool sentinel = (k.asid_root == CST_KERNEL_ASID_ROOT);
         bool conf = t->is_system_cp_confirmed;
+        bool va_kernel = cst_va_is_kernel_code(t->start_pc);
+        if (va_kernel) {
+            va_kernel_total++;
+        }
+        if (conf) {
+            if (t->is_system && !va_kernel) {
+                mismatch_cp_kernel++;
+            } else if (!t->is_system && va_kernel) {
+                mismatch_cp_user++;
+            }
+        }
         if (t->is_system) {
             kernel_templates++;
             kernel_pc_buckets[t->start_pc]++;
@@ -440,6 +470,10 @@ void TemplateStore::census(std::FILE *out) const
         "champsim_tracer: [tmpl_census]   user per-root=%zu  "
         "user-in-sentinel(BUG if >0)=%zu\n",
         user_root, user_sentinel);
+    std::fprintf(out,
+        "champsim_tracer: [tmpl_census]   va_classifier: kernel_va=%zu  "
+        "mismatch_cp_kernel(BUG if >0)=%zu  mismatch_cp_user(BUG if >0)=%zu\n",
+        va_kernel_total, mismatch_cp_kernel, mismatch_cp_user);
     std::fflush(out);
 }
 
@@ -731,10 +765,9 @@ BBTemplate *TemplateStore::commit_true_bb(uint64_t start_pc,
                                             const uint8_t *insn_bytes,
                                             const InsnRegNames *insn_reg_names,
                                             const char *symbol_name,
-                                            uint64_t fall_through_pc,
-                                            bool is_kernel)
+                                            uint64_t fall_through_pc)
 {
-    uint64_t asid_root = store_asid_root(is_kernel);
+    uint64_t asid_root = store_asid_root(start_pc);
     if (BBTemplate *existing =
             find_existing_true_bb(asid_root, start_pc, n_insns, insn_pcs)) {
         return existing;
@@ -758,12 +791,12 @@ BBTemplate *TemplateStore::commit_true_bb_refs(
     const InsnFields *const *insn_fields,
     const uint8_t *insn_sizes, const uint8_t *insn_bytes,
     const InsnRegNames *const *insn_reg_names,
-    const char *symbol_name, uint64_t fall_through_pc, bool is_kernel)
+    const char *symbol_name, uint64_t fall_through_pc)
 {
     /* Already-templated BB: return the cached record without touching
      * the field/regnames payload at all.  Templates are stored in true
      * execution order, so the dedup compares insn PCs directly. */
-    uint64_t asid_root = store_asid_root(is_kernel);
+    uint64_t asid_root = store_asid_root(start_pc);
     if (BBTemplate *existing =
             find_existing_true_bb(asid_root, start_pc, n_insns, insn_pcs)) {
         return existing;
@@ -936,23 +969,17 @@ BBTemplate *TemplateStore::get_or_create_bb_template(
         return nullptr;
     }
 
-    /* is_kernel drives the shared-kernel-bucket key (store_asid_root).  This
-     * is the CP finalize (g_cp_chain is correct-path only), so the head
-     * fragment's is_system is its REAL execution privilege — a user block
-     * CP-executes at user privilege and is stamped is_system=0.  Require the
-     * CP-confirmed latch too: only a genuine, correct-path kernel block may
-     * enter the sentinel bucket, so a wrong-path is_system mis-stamp on a
-     * user VA (which is never CP-confirmed kernel) can never conflate two
-     * processes' user code there.  Not the ambient level: this finalize runs
-     * while the plugin processes the SUCCESSOR TB, whose privilege differs. */
-    bool is_kernel = n_fragments > 0 && fragments[0]->is_system &&
-                     fragments[0]->is_system_cp_confirmed;
+    /* The shared-kernel-bucket key is now derived from entry_pc's VA class
+     * inside commit_true_bb_refs (store_asid_root), not from a privilege
+     * stamp — a kernel-VA block keys to the sentinel on either path.  The
+     * is_system stamp below still records the block's REAL execution
+     * privilege (this is the CP finalize, so fragments[0]->is_system is
+     * authoritative) and latches is_system_cp_confirmed for the wire bit. */
     BBTemplate *tmpl = commit_true_bb_refs(entry_pc, off,
                                            insn_pcs, field_ptrs,
                                            insn_sizes, insn_bytes,
                                            regname_ptrs,
-                                           symbol_name, final_ft,
-                                           is_kernel);
+                                           symbol_name, final_ft);
     /* Privilege context rides from the translation-time stamp on the
      * fragments onto the assembled true-BB.  Fragments of one BB share
      * one privilege level (the transition instruction seals the BB).
@@ -1146,15 +1173,14 @@ void TemplateStore::ensure_rep_subtmpl(BBTemplate *tb)
     const InsnRegNames *sub_regs =
         tb->insn_reg_names ? &tb->insn_reg_names[last] : nullptr;
     uint64_t sub_ft = sub_pc + sub_size;
-    /* Only a CP-confirmed kernel parent routes the REP sub-template into the
-     * shared kernel bucket (see store_asid_root): a user REP keys by its live
-     * process root, never the sentinel. */
+    /* The REP sub-template inherits its parent's start VA, so store_asid_root
+     * routes it into the shared kernel bucket iff sub_pc is a kernel VA (a
+     * kernel REP such as clear_page/memset shares the one kernel template; a
+     * user REP keys by its live process root). */
     BBTemplate *sub = commit_true_bb(sub_pc, 1, &sub_pc, lf,
                                      &sub_size, sub_bytes,
                                      sub_regs,
-                                     tb->symbol_name, sub_ft,
-                                     tb->is_system &&
-                                         tb->is_system_cp_confirmed);
+                                     tb->symbol_name, sub_ft);
     tb->rep_subtmpl = seg_ref(sub);
     /* Inherit the parent REP TB's privilege: the sub-template covers the
      * same instruction, so it shares its execution context.  commit_true_bb

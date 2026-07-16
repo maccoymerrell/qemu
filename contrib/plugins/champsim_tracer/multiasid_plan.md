@@ -192,18 +192,52 @@ are identical; only the "is this context in-scope" predicate differs.
   true-BB keys its **serialised template** (`bb_map_`) into one shared kernel
   bucket (sentinel asid), not the per-process root — the same kernel code at
   the same VA is one serialised template, never duplicated per process.
-  - *Safety refinement (implementation):* the sentinel bucket's collision-
-    safety rests on kernel/user VA disjointness, so it must admit **only**
-    genuine kernel VAs. A wrong-path walk can speculatively *translate* a user
-    VA while at kernel privilege and mis-stamp it `is_system` — so only a
-    **CP-confirmed** kernel block (correct-path privilege, `is_system &&
-    is_system_cp_confirmed`) enters the shared bucket; wrong-path commits key
-    by their live process root, never the sentinel. Otherwise two processes'
-    user code at one VA would conflate in the shared bucket. The *internal*
-    fragment-chain dedup index (`tb_chain_dedup_`/`spec_chain_index_`) likewise
-    stays per-process (live root), so a wrong-path mis-stamp there is at worst
-    a per-process duplicate, never a cross-process reuse — the shared identity
-    is only the wire-visible template.
+  - *Bucket selection is by the architectural VA class, not a privilege
+    stamp.* The bucket a block serialises into is chosen from its `start_pc`
+    through `qemu_plugin_vaddr_is_kernel()` — a QEMU plugin API (added in API
+    version 11) that asks the **target's own MMU / segment logic** to classify
+    a code VA's privilege domain: the x86-64 canonical upper half (width from
+    live `CR4.LA57`), the AArch64 TTBR1 region (bit 55 of the VA), the RISC-V
+    sign-extended kernel half for the active `SATP` mode (Sv39/48/57), and the
+    MIPS fixed segment map (kuseg/xuseg vs kseg). It is a pure range/bit test —
+    no page-table walk, cannot fault — so it is safe to call on a
+    speculatively-fetched wrong-path address, and the plugin carries **no
+    parallel VA-boundary constant table**; the boundary lives in the target,
+    where it is the target's own architectural knowledge. Because kernel and
+    user VA ranges are architecturally **disjoint**, a kernel-VA block keys to
+    the shared sentinel on **either** path (so wrong-path-only-discovered
+    kernel code joins the one shared template instead of minting a per-process
+    duplicate), and a user VA can **never** classify kernel — so a wrong-path
+    walk that speculatively translates a user VA at kernel privilege and
+    mis-stamps it `is_system` still keys by its live process root, and two
+    processes' user code at one VA can never conflate in the sentinel. This
+    replaces the earlier `is_system && is_system_cp_confirmed` gate (which kept
+    WP-only kernel blocks out of the sentinel and so minted a per-process
+    duplicate for every kernel block the correct path had not yet reached — a
+    census of a 2-process x86 system trace measured 33,122 such WP-only
+    per-root kernel duplicates, ~2.4× the kernel template count). The
+    `is_system` seed of a wrong-path-only block likewise reads from the VA
+    class (a kernel-VA block **is** kernel code); a correct-path finalize still
+    overrides and latches the authoritative value. The *internal* fragment-
+    chain dedup index (`tb_chain_dedup_`/`spec_chain_index_`) stays per-process
+    (live root); the shared identity is only the wire-visible template.
+  - *Wrong-path privilege-domain-switch terminate (SMEP/PXN model).* A
+    speculative excursion runs at the launching correct-path context's
+    privilege (spec mode redirects only PC and sandboxes memory, never the
+    paging/privilege registers), so the VA classifier reports one fixed
+    kernel/user split for the whole walk. When the next wrong-path fetch lands
+    in the **other** privilege domain than the excursion speculates in
+    (kernel-context excursion reaching a user-VA fetch, or the reverse), the
+    fetch is architecturally forbidden on real hardware (SMEP / PXN and
+    analogues) — it would fault and the pipeline recover — so the excursion
+    **ends cleanly there**, the same shape as the translation-unavailable /
+    syscall-boundary terminates: the sealed chain so far is preserved and its
+    last entry marked (`CST_WP_EVENT_TRANSLATION_UNAVAIL`), and the crossing
+    block is not fetched. This complements the existing syscall-boundary
+    terminate (a legitimate correct-path domain transition, never a wrong-path
+    one), is the faithful micro-architectural model, and eliminates the
+    cross-domain mis-stamp at its source: every committed wrong-path block was
+    fetched entirely within one domain, so its VA class is its true domain.
 - **Kernel-thread attribution is the ceiling** (unchanged): no kernel-privilege
   thread register exists, so *which process's* kernel work a kernel BB belongs
   to is best-effort via the entering context and degrades under cross-vCPU

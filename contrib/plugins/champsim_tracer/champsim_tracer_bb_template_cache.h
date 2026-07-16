@@ -145,11 +145,12 @@ public:
      * supplies the live translation address-space id so a shared code VA
      * in two owned processes resolves to each process's own template. */
     BBTemplate *find_bb_template(uint64_t asid_root, uint64_t entry_pc);
-    /* @is_kernel selects the cache key's asid_root: the shared kernel bucket
-     * for kernel-privilege code, the live process root otherwise (see BBKey /
-     * store_asid_root).  It is the BLOCK's privilege — the caller's
-     * is_system — NOT the ambient level, which at a CP-side seal reports the
-     * successor TB's privilege and would misfile a user block. */
+    /* The cache key's asid_root is selected from @start_pc by the
+     * architectural VA classifier (kernel-VA code → the shared kernel
+     * sentinel bucket, user-VA code → the live process root; see BBKey /
+     * store_asid_root).  Path-independent and speculation-proof: a wrong-path
+     * commit of kernel code joins the shared template, and a user VA can never
+     * reach the sentinel regardless of any is_system mis-stamp. */
     BBTemplate *commit_true_bb(uint64_t start_pc,
                                uint32_t n_insns,
                                const uint64_t *insn_pcs,
@@ -158,8 +159,7 @@ public:
                                const uint8_t *insn_bytes,
                                const InsnRegNames *insn_reg_names,
                                const char *symbol_name,
-                               uint64_t fall_through_pc,
-                               bool is_kernel);
+                               uint64_t fall_through_pc);
     /*
      * Reference variant of commit_true_bb for the wrong-path walker.
      * @insn_fields / @insn_reg_names are arrays of *pointers* into
@@ -179,8 +179,7 @@ public:
                                     const uint8_t *insn_bytes,
                                     const InsnRegNames *const *insn_reg_names,
                                     const char *symbol_name,
-                                    uint64_t fall_through_pc,
-                                    bool is_kernel);
+                                    uint64_t fall_through_pc);
     BBTemplate *get_or_create_bb_template(uint64_t entry_pc,
                                           BBTemplate *const *fragments,
                                           unsigned int n_fragments);

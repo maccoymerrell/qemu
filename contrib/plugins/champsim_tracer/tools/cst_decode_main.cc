@@ -1546,6 +1546,27 @@ void render_disasm(FILE *out, const cst::Header &h,
     DisasmContext ctx{&h, &by_id, &templates, &dt, od, show_deps, show_lanes};
 
     emit_disasm_file_header(out, h, templates.size());
+    /* Disk-I/O records surface positionally as comment lines, in stream
+     * order with the entries — a START at the doorbell, a STOP where the
+     * completion lands. */
+    body.set_devio_callback([&](const cst::DecodedDevio &d) {
+        if (d.is_start) {
+            const char *rw = d.rw == CST_DEVIO_READ  ? "read"
+                           : d.rw == CST_DEVIO_WRITE ? "write"
+                           : d.rw == CST_DEVIO_FLUSH ? "flush"
+                                                     : "?";
+            std::fprintf(out,
+                "; DEVIO START req=%llu %s bytes=%llu block=%llu "
+                "(thread=%u asid=%u)\n",
+                (unsigned long long)d.request_id, rw,
+                (unsigned long long)d.bytes, (unsigned long long)d.block,
+                d.thread_id, d.asid);
+        } else {
+            std::fprintf(out,
+                "; DEVIO STOP  req=%llu (thread=%u asid=%u)\n",
+                (unsigned long long)d.request_id, d.thread_id, d.asid);
+        }
+    });
     body.walk([&](const cst::DecodedEntry &e) {
         render_entry_disasm(out, ctx, e);
     });

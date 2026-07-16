@@ -103,11 +103,15 @@ typedef uint64_t qemu_plugin_id_t;
  * - added qemu_plugin_vaddr_is_kernel (classify a code virtual address's
  *   privilege domain via the target's own MMU / segment logic; a
  *   speculation-proof kernel-vs-user split with no page-table walk)
+ *
+ * version 12:
+ * - added qemu_plugin_register_devio_cb (block-device I/O issue/complete
+ *   notifications from the block backend, for disk-request wire records)
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 11
+#define QEMU_PLUGIN_VERSION 12
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -1045,6 +1049,72 @@ typedef void (*qemu_plugin_asid_write_cb_t)(unsigned int vcpu_index,
 QEMU_PLUGIN_API
 void qemu_plugin_register_asid_write_cb(qemu_plugin_id_t id,
                                         qemu_plugin_asid_write_cb_t cb);
+
+/**
+ * enum qemu_plugin_devio_dir - direction/kind of a block-device request
+ * @QEMU_PLUGIN_DEVIO_READ: data read from the device into guest memory
+ * @QEMU_PLUGIN_DEVIO_WRITE: data written from guest memory to the device
+ *                           (also pwrite-zeroes / discard — a zero-byte
+ *                           payload distinguishes those from a data write)
+ * @QEMU_PLUGIN_DEVIO_FLUSH: a cache-flush / write-barrier (no data)
+ */
+enum qemu_plugin_devio_dir {
+    QEMU_PLUGIN_DEVIO_READ  = 0,
+    QEMU_PLUGIN_DEVIO_WRITE = 1,
+    QEMU_PLUGIN_DEVIO_FLUSH = 2,
+};
+
+/**
+ * typedef qemu_plugin_devio_start_cb_t - block-device request issue hook
+ * @vcpu_index: the vCPU that issued the request (the doorbell-writing
+ *              vCPU under the canonical no-iothread configuration), or
+ *              -1 when the block layer was entered off any vCPU thread
+ * @dir: an enum qemu_plugin_devio_dir value
+ * @offset: byte offset of the request within the backing image
+ * @bytes: request length in bytes (0 for flush)
+ *
+ * Fires synchronously from the block backend when an asynchronous
+ * request (blk_aio_*) is issued.  Returns a nonzero request id the
+ * plugin assigns for later correlation with the completion hook; a
+ * return of 0 means "not tracked" and suppresses the paired completion
+ * notification.  System emulation only.  Never fires on the wrong
+ * (speculative) path — a spec-mode doorbell store is sandboxed and
+ * reaches no device model.
+ */
+typedef uint64_t (*qemu_plugin_devio_start_cb_t)(int vcpu_index,
+                                                 int dir,
+                                                 uint64_t offset,
+                                                 uint64_t bytes);
+
+/**
+ * typedef qemu_plugin_devio_stop_cb_t - block-device completion hook
+ * @request_id: the id a prior start hook returned for this request
+ *
+ * Fires when a request the start hook tracked (returned nonzero for)
+ * completes, from the block backend's completion chokepoint.  In the
+ * canonical no-iothread configuration this runs on the main loop
+ * thread, not the issuing vCPU thread, so the plugin must serialise
+ * its own state.
+ */
+typedef void (*qemu_plugin_devio_stop_cb_t)(uint64_t request_id);
+
+/**
+ * qemu_plugin_register_devio_cb() - register block-device I/O hooks
+ * @id: plugin ID
+ * @start_cb: issue hook, or NULL
+ * @stop_cb: completion hook, or NULL
+ *
+ * Registers synchronous notification of block-device request issue and
+ * completion at the block backend's blk_aio_* chokepoints.  System
+ * emulation only.  A tracer uses these to place disk-request records in
+ * the body stream: the issue hook fires in vCPU context at the device
+ * doorbell (correct-path only), the completion hook where the request
+ * finishes.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_register_devio_cb(qemu_plugin_id_t id,
+                                   qemu_plugin_devio_start_cb_t start_cb,
+                                   qemu_plugin_devio_stop_cb_t stop_cb);
 
 /**
  * qemu_plugin_register_atexit_cb() - register exit callback

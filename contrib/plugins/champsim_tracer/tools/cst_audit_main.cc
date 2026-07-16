@@ -141,6 +141,9 @@ struct Stats {
      * one record per (segment, thread_id). */
     uint64_t regfile_count = 0;
     Bucket   regfile_bytes;
+    /* BODY_TAG_DEVIO_START / _STOP: disk-I/O request brackets. */
+    Bucket   devio_start;
+    Bucket   devio_stop;
 
     /* Per-bucket detail across CP and WP field-delta streams. */
     std::array<Bucket, NUM_BUCKETS> cp_fd{};
@@ -583,6 +586,23 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
             continue;
         }
 
+        if (tag == ids.body_tag_devio_start) {
+            (void)body.uleb();               /* request_id */
+            (void)body.u8();                 /* rw         */
+            (void)body.uleb();               /* bytes      */
+            (void)body.uleb();               /* block      */
+            s->devio_start.bytes += body.consumed() - tag_start;
+            s->devio_start.count += 1;
+            continue;
+        }
+
+        if (tag == ids.body_tag_devio_stop) {
+            (void)body.uleb();               /* request_id */
+            s->devio_stop.bytes += body.consumed() - tag_start;
+            s->devio_stop.count += 1;
+            continue;
+        }
+
         if (tag == ids.body_tag_end) {
             body.uleb();                     /* num_entries */
             s->body_terminator = body.consumed() - tag_start;
@@ -768,6 +788,12 @@ void print_report(const Stats &s, const cst::Header &h)
     std::printf("%s\n", row("REGFILE records (per-thread initial state)",
                              s.regfile_bytes.bytes, body,
                              s.regfile_count, "regfile").c_str());
+    std::printf("%s\n", row("DEVIO START records (disk request issue)",
+                             s.devio_start.bytes, body,
+                             s.devio_start.count, "req").c_str());
+    std::printf("%s\n", row("DEVIO STOP records (disk request complete)",
+                             s.devio_stop.bytes, body,
+                             s.devio_stop.count, "req").c_str());
     std::printf("%s\n", row("BODY terminator", s.body_terminator, body).c_str());
 
     uint64_t fd_total = s.cp_field_delta.bytes + s.wp_field_delta.bytes;
@@ -941,6 +967,8 @@ int main(int argc, char **argv)
                      + s.wp_events.bytes
                      + s.iframe_bytes.bytes
                      + s.regfile_bytes.bytes
+                     + s.devio_start.bytes
+                     + s.devio_stop.bytes
                      + s.body_terminator;
 
         print_report(s, h);

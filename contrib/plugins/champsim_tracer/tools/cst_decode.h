@@ -95,6 +95,21 @@ struct DecodedRegfile {
     std::vector<RegfileSlot>  regs;
 };
 
+/* A decoded disk-I/O record (BODY_TAG_DEVIO_START / _STOP), surfaced
+ * positionally as the body is walked.  is_start distinguishes the two;
+ * for a STOP only request_id is meaningful.  thread_id / asid are the
+ * body context in force at the record's stream position (the owning
+ * thread's stream). */
+struct DecodedDevio {
+    bool     is_start   = false;
+    uint64_t request_id = 0;
+    uint8_t  rw         = 0;   /* CST_DEVIO_* (START only) */
+    uint64_t bytes      = 0;   /* START only */
+    uint64_t block      = 0;   /* disk block number (START only) */
+    uint32_t thread_id  = 0;
+    uint32_t asid       = 0;
+};
+
 /* Structural counts surfaced after walk(), so consumers can
  * sanity-check writer cadence without re-walking the body. */
 struct BodyStats {
@@ -104,6 +119,8 @@ struct BodyStats {
     uint64_t regfile_count     = 0;
     uint64_t thread_switch_count = 0;
     uint64_t asid_switch_count = 0;
+    uint64_t devio_start_count = 0;
+    uint64_t devio_stop_count  = 0;
     uint64_t fault_count       = 0;
     uint64_t translation_unavail_count = 0;
     /* Count of insns observed carrying CST_INSN_FLAG_ATOMIC.
@@ -116,6 +133,11 @@ class BodyWalker {
 public:
     using Callback = std::function<void(const DecodedEntry &)>;
     using RegfileCallback = std::function<void(const DecodedRegfile &)>;
+    using DevioCallback = std::function<void(const DecodedDevio &)>;
+
+    /* Optional sink for BODY_TAG_DEVIO_START / _STOP records, surfaced
+     * positionally by both walk() and walk_bb().  Set before walking. */
+    void set_devio_callback(DevioCallback cb) { devio_cb_ = std::move(cb); }
 
     BodyWalker(const Header &header,
                const std::vector<Template> &templates,
@@ -259,6 +281,10 @@ private:
     void     handle_thread_switch(WalkState &ws);
     void     handle_asid_switch(WalkState &ws);
     void     handle_regfile(const RegfileCallback &rb);
+    /* Disk-I/O record: consumes the DEVIO_START / _STOP payload, bumps
+     * stats_, and fires devio_cb_ (if set) with the current context.
+     * Shared by walk() and walk_bb(). */
+    void     handle_devio(WalkState &ws, bool is_start);
     void     handle_entry(WalkState &ws, const Callback &cb);
     void     handle_iframe(WalkState &ws);
     uint64_t handle_end();
@@ -341,6 +367,8 @@ private:
     std::array<uint16_t, FID_LUT_SIZE> slot_lut_{};
     BodyStats stats_;
     AttributionLint lint_;
+    /* Optional positional sink for disk-I/O records (set_devio_callback). */
+    DevioCallback devio_cb_;
 };
 
 /*

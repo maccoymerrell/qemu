@@ -934,6 +934,18 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
      - ``0``
      - Per-segment interval histograms (N buckets) in the exit-time
        summary.
+   * - ``devio=0|1``
+     - ``1``
+     - Block-device (disk) I/O records (**system mode only**).  When on,
+       the tracer brackets each disk request in the body stream with a
+       ``BODY_TAG_DEVIO_START`` at the requesting process's resume after
+       the device doorbell and a ``BODY_TAG_DEVIO_STOP`` at completion,
+       carrying the direction (read/write/flush), byte length, and disk
+       block number (byte offset / 512).  A no-op without disk traffic
+       (a device-free or user-mode trace carries no such records and is
+       byte-identical), so it is safe to leave on.  Canonical
+       configuration: a real ``-drive`` with **no dedicated iothread**
+       (see :doc:`quickstart`).  ``devio=0`` disables the hook entirely.
    * - ``iframe_rate=<N>``
      - ``100000``
      - Emit a validation IFRAME after every Nth observation of a CP

@@ -584,6 +584,33 @@ void BodyWalker::handle_asid_switch(WalkState &ws)
     stats_.asid_switch_count++;
 }
 
+/*
+ * BODY_TAG_DEVIO_START / _STOP: a disk-I/O request bracket.  START
+ * payload: uleb request_id, u8 rw (CST_DEVIO_*), uleb bytes, uleb block
+ * (disk block number).  STOP payload: uleb request_id.  Standalone
+ * records (no delta state); the current (thread, asid) context gives
+ * the owning-thread attribution positionally.
+ */
+void BodyWalker::handle_devio(WalkState &ws, bool is_start)
+{
+    DecodedDevio d;
+    d.is_start = is_start;
+    d.request_id = body_.uleb();
+    if (is_start) {
+        d.rw = body_.u8();
+        d.bytes = body_.uleb();
+        d.block = body_.uleb();
+        stats_.devio_start_count++;
+    } else {
+        stats_.devio_stop_count++;
+    }
+    d.thread_id = ws.current_thread;
+    d.asid = ws.current_asid;
+    if (devio_cb_) {
+        devio_cb_(d);
+    }
+}
+
 void BodyWalker::handle_regfile(const RegfileCallback &rb)
 {
     DecodedRegfile rec;
@@ -851,6 +878,14 @@ void BodyWalker::walk(const Callback &cb, const RegfileCallback &rb)
         }
         if (tag == ids.body_tag_regfile) {
             handle_regfile(rb);
+            continue;
+        }
+        if (tag == ids.body_tag_devio_start) {
+            handle_devio(ws, /*is_start=*/true);
+            continue;
+        }
+        if (tag == ids.body_tag_devio_stop) {
+            handle_devio(ws, /*is_start=*/false);
             continue;
         }
         if (tag == ids.body_tag_entry) {
@@ -1449,6 +1484,14 @@ void BodyWalker::walk_bb(bool cp_fields, WpDecode wp,
         }
         if (tag == ids.body_tag_regfile) {
             handle_regfile(rb);
+            continue;
+        }
+        if (tag == ids.body_tag_devio_start) {
+            handle_devio(ws, /*is_start=*/true);
+            continue;
+        }
+        if (tag == ids.body_tag_devio_stop) {
+            handle_devio(ws, /*is_start=*/false);
             continue;
         }
         if (tag == ids.body_tag_entry) {

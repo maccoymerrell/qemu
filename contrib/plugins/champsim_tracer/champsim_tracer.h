@@ -112,6 +112,33 @@ extern "C" {
  * Wire format spec'd in champsim_tracer_format.md.
  */
 #define BODY_TAG_ASID_SWITCH     5
+/*
+ * BODY_TAG_DEVIO_START / BODY_TAG_DEVIO_STOP: a block-device (disk) I/O
+ * request bracketed in the body stream.  DEVIO_START is positioned in
+ * the owning thread's stream at the device doorbell (the driver's
+ * doorbell MMIO store executes in kernel code the kernel-ctx fold
+ * attributes to the requesting process/thread); DEVIO_STOP where the
+ * request's completion lands.  START payload: uleb request_id (compact
+ * monotonic per-segment), u8 rw (CST_DEVIO_*), uleb bytes, uleb block
+ * (disk block number = byte offset / logical block size, 512 B).  STOP
+ * payload: uleb request_id.  System mode only, correct path only (a
+ * speculative doorbell store is sandboxed and reaches no device).  The
+ * blocking/non-blocking nature is derived positionally by the consumer;
+ * absent entirely in device-free (e.g. user-mode) traces.  Wire format
+ * spec'd in champsim_tracer_format.md.
+ */
+#define BODY_TAG_DEVIO_START     6
+#define BODY_TAG_DEVIO_STOP      7
+
+/* DEVIO_START rw byte (mirrors enum qemu_plugin_devio_dir). */
+#define CST_DEVIO_READ           0
+#define CST_DEVIO_WRITE          1
+#define CST_DEVIO_FLUSH          2
+
+/* Logical block size for the DEVIO_START disk-block-number field: the
+ * block layer's fundamental sector unit (512 bytes).  block = byte
+ * offset >> CST_DEVIO_LBA_SHIFT. */
+#define CST_DEVIO_LBA_SHIFT      9
 
 /*
  * Per-insn template flags byte
@@ -1375,6 +1402,36 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
                                  double simpoint_weight,
                                  const std::vector<InitialRegSnap> *regfile);
 void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry);
+
+/*
+ * ---- Block-device (disk) I/O records (DEVIO) ----
+ *
+ * The devio state is process-wide (one block backend, cross-thread
+ * completions), owned by champsim_tracer_output.cc and serialised by
+ * its own mutex.  The plugin's registered devio hooks call note_start /
+ * note_stop; the pending records are drained into the body stream at
+ * the next body entry (under exec_lock), so a DEVIO_START lands in the
+ * owning thread's stream at the doorbell and a DEVIO_STOP where the
+ * completion resumes.  Reset per segment.
+ */
+
+/* Issue: assign a compact per-segment request id, compute the disk
+ * block number (offset >> CST_DEVIO_LBA_SHIFT), and queue a pending
+ * DEVIO_START.  @dir is a CST_DEVIO_* value.  Returns the request id
+ * (always nonzero here — the caller decides whether to track). */
+uint64_t devio_note_start(int vcpu_index, int dir,
+                          uint64_t offset, uint64_t bytes);
+/* Completion: queue a pending DEVIO_STOP for @request_id (dropped at
+ * drain if its START never reached the wire, e.g. a segment switch). */
+void devio_note_stop(uint64_t request_id);
+/* Segment-open reset: clear pending records, the live-id set, and the
+ * per-segment id counter. */
+void devio_reset_segment(void);
+/* Advertise the DEVIO_* body-tag names in the header encoding map only
+ * when the disk-I/O hook is active (system mode + devio enabled), so a
+ * device-free trace keeps the historical body_tag vocabulary and stays
+ * byte-identical. */
+void devio_set_map_active(bool on);
 /* Finish the body stream and hand the accumulated header buffer
  * back to the caller via @header_bytes (transferred ownership; the
  * caller must g_byte_array_unref it after writing).  The body

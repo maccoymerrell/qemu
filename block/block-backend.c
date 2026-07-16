@@ -25,6 +25,7 @@
 #include "qemu/id.h"
 #include "qemu/main-loop.h"
 #include "qemu/option.h"
+#include "qemu/plugin.h"
 #include "trace.h"
 #include "migration/misc.h"
 
@@ -1554,6 +1555,13 @@ typedef struct BlkAioEmAIOCB {
     BlkRwCo rwco;
     int64_t bytes;
     bool has_returned;
+    /*
+     * Plugin devio correlation id (qemu_plugin_devio_start), 0 when the
+     * request is not tracked.  Carried from the blk_aio_prwv issue
+     * chokepoint to blk_aio_complete so the completion notification
+     * references the same request.
+     */
+    uint64_t plugin_devio_id;
 } BlkAioEmAIOCB;
 
 static const AIOCBInfo blk_aio_em_aiocb_info = {
@@ -1563,6 +1571,9 @@ static const AIOCBInfo blk_aio_em_aiocb_info = {
 static void blk_aio_complete(BlkAioEmAIOCB *acb)
 {
     if (acb->has_returned) {
+        if (acb->plugin_devio_id) {
+            qemu_plugin_devio_stop(acb->plugin_devio_id);
+        }
         acb->common.cb(acb->common.opaque, acb->rwco.ret);
         blk_dec_in_flight(acb->rwco.blk);
         qemu_aio_unref(acb);
@@ -1575,6 +1586,10 @@ static void blk_aio_complete_bh(void *opaque)
     assert(acb->has_returned);
     blk_aio_complete(acb);
 }
+
+static void coroutine_fn blk_aio_read_entry(void *opaque);
+static void coroutine_fn blk_aio_write_entry(void *opaque);
+static void coroutine_fn blk_aio_flush_entry(void *opaque);
 
 static BlockAIOCB *blk_aio_prwv(BlockBackend *blk, int64_t offset,
                                 int64_t bytes,
@@ -1596,6 +1611,32 @@ static BlockAIOCB *blk_aio_prwv(BlockBackend *blk, int64_t offset,
     };
     acb->bytes = bytes;
     acb->has_returned = false;
+
+    /*
+     * Plugin devio issue notification.  This is the single async-request
+     * chokepoint, so it captures every blk_aio_* here.  Direction comes
+     * from the coroutine entry: read / write (data-moving, includes
+     * pwrite-zeroes via the write entry) / flush (barrier).  Other kinds
+     * (ioctl, discard, zone ops) are left untracked.  Under the canonical
+     * no-iothread configuration this runs on the doorbell-writing vCPU
+     * thread, so the plugin sees the correct issuing context.
+     */
+    acb->plugin_devio_id = 0;
+    {
+        int dir = -1;
+        if (co_entry == blk_aio_read_entry) {
+            dir = QEMU_PLUGIN_DEVIO_READ;
+        } else if (co_entry == blk_aio_write_entry) {
+            dir = QEMU_PLUGIN_DEVIO_WRITE;
+        } else if (co_entry == blk_aio_flush_entry) {
+            dir = QEMU_PLUGIN_DEVIO_FLUSH;
+        }
+        if (dir >= 0) {
+            acb->plugin_devio_id =
+                qemu_plugin_devio_start(dir, (uint64_t)offset,
+                                        (uint64_t)bytes);
+        }
+    }
 
     co = qemu_coroutine_create(co_entry, acb);
     aio_co_enter(qemu_get_current_aio_context(), co);

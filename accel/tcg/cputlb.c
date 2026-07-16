@@ -2528,10 +2528,14 @@ static uint64_t do_ld_beN(CPUState *cpu, MMULookupPageData *p,
     unsigned tmp, half_size;
 
 #ifdef CONFIG_PLUGIN
-    if (unlikely(p->flags & TLB_SPEC_ABSENT)) {
-        /* Wrong-path cross-page load whose page is absent: deterministic
-         * placeholder bytes, concatenated big-endian exactly as
-         * do_ld_bytes_beN concatenates the real bytes. */
+    if (unlikely(cpu_plugin_spec_active(cpu) &&
+                 (p->flags & (TLB_SPEC_ABSENT | TLB_MMIO)))) {
+        /* Wrong-path cross-page load whose page is absent OR a device
+         * MMIO region: deterministic placeholder bytes, concatenated
+         * big-endian exactly as do_ld_bytes_beN concatenates the real
+         * bytes.  A speculative MMIO read must never reach the device
+         * model — a device read can have side effects (clear-on-read
+         * status, FIFO pop) that a mis-speculated access must not cause. */
         for (int i = 0; i < p->size; i++) {
             uint8_t gb;
             plugin_spec_garbage_fill(&gb, 1, p->addr + i);
@@ -2592,11 +2596,14 @@ static Int128 do_ld16_beN(CPUState *cpu, MMULookupPageData *p,
     MemOp atom;
 
 #ifdef CONFIG_PLUGIN
-    if (unlikely(p->flags & TLB_SPEC_ABSENT)) {
-        /* Wrong-path cross-page 128-bit load whose page is absent: fill the
-         * per-page slice with deterministic placeholder bytes (big-endian,
-         * matching the MO_ATOM_NONE accumulation) instead of dereferencing the
-         * invalid host pointer.  8 < size <= 16 here. */
+    if (unlikely(cpu_plugin_spec_active(cpu) &&
+                 (p->flags & (TLB_SPEC_ABSENT | TLB_MMIO)))) {
+        /* Wrong-path cross-page 128-bit load whose page is absent OR a
+         * device MMIO region: fill the per-page slice with deterministic
+         * placeholder bytes (big-endian, matching the MO_ATOM_NONE
+         * accumulation) instead of dereferencing the invalid host pointer
+         * or issuing a side-effectful speculative device read.
+         * 8 < size <= 16 here. */
         uint8_t g[16];
         plugin_spec_garbage_fill(g, size, p->addr);
         uint64_t hi = a;
@@ -2662,9 +2669,11 @@ static uint8_t do_ld_1(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
         if (spec_load_byte(cpu, p->addr, &val)) {
             return val;
         }
-        if (unlikely(p->flags & TLB_SPEC_ABSENT)) {
-            /* Wrong-path load from an absent page: deterministic placeholder
-             * instead of dereferencing the invalid host pointer. */
+        if (unlikely(p->flags & (TLB_SPEC_ABSENT | TLB_MMIO))) {
+            /* Wrong-path load from an absent page OR a device MMIO region:
+             * deterministic placeholder instead of dereferencing the
+             * invalid host pointer or issuing a side-effectful speculative
+             * device read. */
             plugin_spec_garbage_fill(&val, 1, p->addr);
             cpu->plugin_spec_mem_faulted = true;
             return val;
@@ -2686,17 +2695,13 @@ static uint16_t do_ld_2(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
         /* Read from real memory, then overlay any speculative bytes */
-        if (unlikely(p->flags & TLB_SPEC_ABSENT)) {
-            /* Absent page: deterministic placeholder baseline (no host
-             * dereference), still overlaid with genuine forwarded stores. */
+        if (unlikely(p->flags & (TLB_SPEC_ABSENT | TLB_MMIO))) {
+            /* Absent page OR a device MMIO region: deterministic
+             * placeholder baseline (no host dereference, and never a
+             * side-effectful speculative device read), still overlaid
+             * with genuine forwarded stores. */
             plugin_spec_garbage_fill(&ret, 2, p->addr);
             cpu->plugin_spec_mem_faulted = true;
-        } else if (unlikely(p->flags & TLB_MMIO)) {
-            ret = do_ld_mmio_beN(cpu, p->full, 0, p->addr, 2,
-                                 mmu_idx, type, ra);
-            if ((memop & MO_BSWAP) == MO_LE) {
-                ret = bswap16(ret);
-            }
         } else {
             ret = load_atom_2(cpu, ra, p->haddr, memop);
             if (memop & MO_BSWAP) {
@@ -2732,15 +2737,11 @@ static uint32_t do_ld_4(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
 
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
-        if (unlikely(p->flags & TLB_SPEC_ABSENT)) {
+        if (unlikely(p->flags & (TLB_SPEC_ABSENT | TLB_MMIO))) {
+            /* Absent page OR device MMIO region: synthetic placeholder,
+             * never a side-effectful speculative device read. */
             plugin_spec_garbage_fill(&ret, 4, p->addr);
             cpu->plugin_spec_mem_faulted = true;
-        } else if (unlikely(p->flags & TLB_MMIO)) {
-            ret = do_ld_mmio_beN(cpu, p->full, 0, p->addr, 4,
-                                 mmu_idx, type, ra);
-            if ((memop & MO_BSWAP) == MO_LE) {
-                ret = bswap32(ret);
-            }
         } else {
             ret = load_atom_4(cpu, ra, p->haddr, memop);
             if (memop & MO_BSWAP) {
@@ -2775,15 +2776,11 @@ static uint64_t do_ld_8(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
 
 #ifdef CONFIG_PLUGIN
     if (cpu_plugin_spec_active(cpu)) {
-        if (unlikely(p->flags & TLB_SPEC_ABSENT)) {
+        if (unlikely(p->flags & (TLB_SPEC_ABSENT | TLB_MMIO))) {
+            /* Absent page OR device MMIO region: synthetic placeholder,
+             * never a side-effectful speculative device read. */
             plugin_spec_garbage_fill(&ret, 8, p->addr);
             cpu->plugin_spec_mem_faulted = true;
-        } else if (unlikely(p->flags & TLB_MMIO)) {
-            ret = do_ld_mmio_beN(cpu, p->full, 0, p->addr, 8,
-                                 mmu_idx, type, ra);
-            if ((memop & MO_BSWAP) == MO_LE) {
-                ret = bswap64(ret);
-            }
         } else {
             ret = load_atom_8(cpu, ra, p->haddr, memop);
             if (memop & MO_BSWAP) {
@@ -2904,9 +2901,12 @@ static Int128 do_ld16_mmu(CPUState *cpu, vaddr addr,
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_LOAD, &l);
     if (likely(!crosspage)) {
 #ifdef CONFIG_PLUGIN
-        if (unlikely(l.page[0].flags & TLB_SPEC_ABSENT)) {
-            /* Wrong-path 128-bit load from an absent page: deterministic
-             * placeholder instead of dereferencing the invalid host pointer. */
+        if (unlikely(cpu_plugin_spec_active(cpu) &&
+                     (l.page[0].flags & (TLB_SPEC_ABSENT | TLB_MMIO)))) {
+            /* Wrong-path 128-bit load from an absent page OR a device MMIO
+             * region: deterministic placeholder instead of dereferencing
+             * the invalid host pointer or issuing a side-effectful
+             * speculative device read. */
             uint8_t g[16];
             plugin_spec_garbage_fill(g, 16, addr);
             cpu->plugin_spec_mem_faulted = true;

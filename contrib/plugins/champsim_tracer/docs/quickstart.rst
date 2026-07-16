@@ -276,6 +276,29 @@ plugin sees its argv.
       from the ``SYSTEM`` bit rather than baked into the trace — see
       the *System-mode traces* discussion in :doc:`concepts`.
 
+   .. important::
+
+      **Run the block backend without a dedicated iothread** — do not
+      pass ``-object iothread`` / ``iothread=`` on a ``-drive`` /
+      ``-device``.  This is the **canonical configuration for disk-I/O
+      records** (``devio``, on by default): the block backend then runs
+      on the main loop, and the tracer brackets each disk request in the
+      body stream with ``DEVIO_START`` (at the requesting process's
+      resume after the device doorbell) and ``DEVIO_STOP`` (at
+      completion).  Attach a real disk to exercise it, e.g.::
+
+         qemu-system-x86_64 -kernel vmlinuz -initrd rootfs.cpio.gz \
+             -append "console=ttyS0 panic=-1 nopti" \
+             -drive file=scratch.raw,format=raw,if=virtio,cache=none \
+             -plugin ./libchampsim_tracer.so,outfile=run,\
+             trace_window=marker:simulation=20000000,devio=1 ...
+
+      An initramfs-only guest with no ``-drive`` produces no disk
+      traffic and therefore no ``DEVIO`` records — the trace is
+      otherwise identical.  See the ``devio`` option in
+      :doc:`reference` and the record layout in
+      ``champsim_tracer_format.md`` (§4.1b).
+
 ``latch_timeout=<ms>``
    Dead-latch detector for the marker *latch* policy
    (``trace_window=marker:policy=latch``, the default marker policy),

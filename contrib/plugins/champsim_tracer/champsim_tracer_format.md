@@ -612,10 +612,14 @@ Loop until a `BODY_TAG_END` is seen:
        ids.body_tag_thread_switch  → Step 6.2
        ids.body_tag_asid_switch    → Step 6.2a
        ids.body_tag_regfile        → Step 6.3
+       ids.body_tag_devio_start    → Step 6.3a  (system-mode disk I/O)
+       ids.body_tag_devio_stop     → Step 6.3a
        ids.body_tag_entry          → Step 6.4
        ids.body_tag_iframe         → Step 6.5
        ids.body_tag_end            → Step 6.6 (terminates loop)
        any other value             → malformed; reject
+       (ids.body_tag_devio_* are absent from device-free traces; a
+        decoder that never resolves them simply never dispatches here.)
 6.2  THREAD_SWITCH record:
        thread_id_delta : SLEB
        prev_thread_id += thread_id_delta
@@ -644,6 +648,18 @@ Loop until a `BODY_TAG_END` is seen:
        normalises from target byte order before write), so decoders
        interpret it as a little-endian unsigned scalar of `width`
        bytes regardless of guest endianness.
+6.3a DEVIO_START / DEVIO_STOP record (system-mode disk I/O, §4.1b):
+       DEVIO_START:
+         request_id : ULEB
+         rw         : u8            ; 0=read 1=write 2=flush
+         bytes      : ULEB          ; 0 for flush
+         block      : ULEB          ; byte offset / 512
+       DEVIO_STOP:
+         request_id : ULEB
+       Surface the record positionally under the current
+       (prev_asid_index, prev_thread_id) context; correlate a STOP to
+       its START by request_id.  No state output; the next ENTRY is
+       unaffected.
 6.4  ENTRY record:
        template_id_delta : SLEB
        cur_template_id = prev_entry_template_id + template_id_delta
@@ -805,9 +821,13 @@ IDs, flag-bit positions — is resolved through the per-trace encoding
 maps (§3.1) and is not pinned by this specification.  The body-tag
 values the writer currently assigns are `BODY_TAG_END = 0`,
 `BODY_TAG_ENTRY = 1`, `BODY_TAG_THREAD_SWITCH = 2`,
-`BODY_TAG_IFRAME = 3`, `BODY_TAG_REGFILE = 4`, and
-`BODY_TAG_ASID_SWITCH = 5`; a decoder obtains them from the `body_tag`
-map, not from these numbers.
+`BODY_TAG_IFRAME = 3`, `BODY_TAG_REGFILE = 4`,
+`BODY_TAG_ASID_SWITCH = 5`, and — only in system-mode traces with the
+disk-I/O hook active (§4.1b) — `BODY_TAG_DEVIO_START = 6` and
+`BODY_TAG_DEVIO_STOP = 7`; a decoder obtains them from the `body_tag`
+map, not from these numbers.  The two DEVIO names are present in the map
+only when a trace can carry disk records, so a device-free trace keeps
+the historical six-entry `body_tag` vocabulary.
 
 The body member begins with `CST_MAGIC` and ends with `CST_MAGIC`.  A
 file is treated as truncated if the trailing magic is missing.  The
@@ -1110,6 +1130,59 @@ Every trace opens with an initial `BODY_TAG_ASID_SWITCH` (before the
 opening `BODY_TAG_THREAD_SWITCH`), declaring the address space the trace
 starts in.  A single-address-space trace declares index 0 once and never
 switches the asid dimension again.
+
+### 4.1b BODY_TAG_DEVIO_START / BODY_TAG_DEVIO_STOP
+
+Block-device (disk) I/O requests are bracketed in the body stream by a
+pair of sparse records.  They appear only in **system-mode** traces that
+generate disk traffic; a device-free trace (every user-mode trace)
+carries none, and their names are omitted from the `body_tag` encoding
+map, so such traces are byte-identical to the pre-DEVIO format.  The two
+tag names appear in the map only when the disk-I/O hook is active (the
+`devio` option on, system mode).
+
+```
+BODY_TAG_DEVIO_START
++--------------------------------------------------+
+| tag = 6                         u8               |
+| request_id                      ULEB             |
+|   compact monotonic id, per segment (from 1)     |
+| rw                              u8                |
+|   0 = read, 1 = write, 2 = flush (CST_DEVIO_*)   |
+| bytes                           ULEB             |
+|   request length in bytes (0 for flush)          |
+| block                           ULEB             |
+|   disk block number = byte offset / 512          |
++--------------------------------------------------+
+
+BODY_TAG_DEVIO_STOP
++--------------------------------------------------+
+| tag = 7                         u8               |
+| request_id                      ULEB             |
+|   the id of the START this completion pairs with |
++--------------------------------------------------+
+```
+
+A `DEVIO_START` is positioned in the owning thread's stream where the
+requesting process resumes after issuing the request (the device
+doorbell); a `DEVIO_STOP` where that request's completion lands.  The
+`request_id` is a compact per-segment counter (reset to 1 at each segment
+open) so a consumer correlates the pair by id; a `DEVIO_STOP` never
+precedes its `DEVIO_START` on the wire.  Both are standalone records (no
+delta state) and inherit the surrounding `(asid, thread)` context
+positionally — under the canonical single-marker-process baseline that is
+the traced process.
+
+The **disk block number** is the request's byte offset within the backing
+image divided by the block layer's 512-byte sector unit (`block = offset
+>> 9`); `bytes` is the transfer length (0 for a flush barrier).  There is
+**no explicit blocking flag**: a consumer derives whether a request
+blocked the issuer from the positional distance between its START and STOP
+(adjacent, with no traced work between, means the issuer blocked to
+completion — e.g. an `O_DIRECT`/`O_SYNC` transfer).  These records are
+**correct-path only**: a speculative (wrong-path) doorbell store is
+sandboxed and reaches no device model, so a wrong-path excursion never
+mints a request.
 
 ### 4.2 BODY_TAG_ENTRY
 

@@ -91,6 +91,12 @@ bool set_kexc(PluginConfig *cfg, const char *v)
     return cfg->kexc == 0 || cfg->kexc == 1;
 }
 
+bool set_devio(PluginConfig *cfg, const char *v)
+{
+    cfg->devio = atoi(v);
+    return cfg->devio == 0 || cfg->devio == 1;
+}
+
 bool set_histogram(PluginConfig *cfg, const char *v)
 {
     int n = atoi(v);
@@ -304,6 +310,7 @@ const struct {
     { "wp_memdata", set_wp_memdata },
     { "wp_regdata", set_wp_regdata },
     { "kexc",       set_kexc       },
+    { "devio",      set_devio      },
     { "histogram",  set_histogram  },
     { "iframe_rate", set_iframe_rate },
     { "latch_timeout", set_latch_timeout },

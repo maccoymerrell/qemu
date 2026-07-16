@@ -38,6 +38,17 @@ namespace cst {
 
 inline constexpr uint32_t CST_MAGIC = cst_wire::MAGIC;
 
+} /* namespace cst */
+
+/* DEVIO_START rw byte values (BODY_TAG_DEVIO_START).  Macros (not in
+ * namespace cst) so the decoder frontends can name them unqualified,
+ * mirroring the plugin's champsim_tracer.h. */
+#define CST_DEVIO_READ   0
+#define CST_DEVIO_WRITE  1
+#define CST_DEVIO_FLUSH  2
+
+namespace cst {
+
 /* ===== Format-layout invariants =====
  *
  * Buffer-size limits the encoding maps cannot describe.  Everything
@@ -66,6 +77,12 @@ struct ResolvedIds {
     uint8_t body_tag_iframe        = 0;
     uint8_t body_tag_regfile       = 0;
     uint8_t body_tag_asid_switch   = 0;
+    /* Disk-I/O records (BODY_TAG_DEVIO_START / _STOP).  Optional: a
+     * device-free trace names neither, so these default to a sentinel
+     * (0xFF) that no real tag byte (0..7) can equal — dispatch on them
+     * simply never fires for a trace that predates the feature. */
+    uint8_t body_tag_devio_start   = 0xFF;
+    uint8_t body_tag_devio_stop    = 0xFF;
 
     /* field_id map: per-slot FID arrays + singletons.  FIDs are
      * ULEB128 on the wire; per-slot arrays are filled by name lookup

@@ -1542,6 +1542,52 @@ static void asid_write_track_cb(unsigned int vcpu_index, uint64_t new_asid)
     }
 }
 
+/* Block-device (disk) I/O tracing: emit DEVIO_START/STOP records.  Set
+ * from the devio= option (default on in system mode); the block hook is
+ * only registered when this is true and g_system_mode. */
+static bool g_devio_enabled = true;
+
+/*
+ * Devio issue hook (qemu_plugin_register_devio_cb): the block backend
+ * calls this from blk_aio_prwv when a disk request is issued.  Correct
+ * path only (a speculative doorbell store is sandboxed and never
+ * reaches the block layer).
+ *
+ * Attribution is POSITIONAL, not by the issuing vCPU: the block backend
+ * defers a virtio-blk virtqueue's processing to the main-loop
+ * AioContext even without a dedicated iothread, so blk_aio_prwv runs on
+ * the main thread (vcpu_index == -1), not the doorbell-writing vCPU.
+ * The record is queued and drained into the body stream at the next
+ * body entry, landing in the traced stream at the point execution
+ * resumes after the doorbell — the owning (single-address-space)
+ * process's stream under the canonical single-marker-process baseline.
+ *
+ * Gate: an active trace segment.  In marker mode that window is the
+ * pinned workload's, so disk I/O issued while it is open is the traced
+ * process's (the tracer is single-address-space by design; foreign I/O
+ * under multi-process latch gating is a documented scope boundary).
+ * Boot-time and inter-window I/O (segment inactive) is dropped.
+ * Returns the request id, or 0 to leave the request untracked (no
+ * paired completion notification is then delivered).
+ */
+static uint64_t devio_start_cb(int vcpu_index, int dir,
+                               uint64_t offset, uint64_t bytes)
+{
+    if (!g_devio_enabled || !g_trace_segments.is_active_atomic()) {
+        return 0;
+    }
+    return devio_note_start(vcpu_index, dir, offset, bytes);
+}
+
+/* Devio completion hook: the request the start hook tracked has
+ * finished (block backend completion chokepoint, main-loop thread
+ * under the no-iothread config).  Queue the paired DEVIO_STOP; it is
+ * drained into the body stream at the next body entry. */
+static void devio_stop_cb(uint64_t request_id)
+{
+    devio_note_stop(request_id);
+}
+
 /* Emit-time fault-depth trailer register (system mode): the exception-
  * nesting depth the deferred prev TB ran at, stamped by the PathBuilder
  * seal phase (which carries the depth pipeline) and read by
@@ -2111,6 +2157,12 @@ static void reset_segment_local_state(void)
     g_cp_chain.reset();
     g_mem_recorder.clear_cp();
     pending_reg_snaps.clear();
+
+    /* Per-segment disk-I/O record state: request ids are compact and
+     * monotonic WITHIN a segment, so the counter, the pending queues,
+     * and the live-id set all reset here (a request straddling the
+     * boundary yields no cross-segment orphan). */
+    devio_reset_segment();
 }
 
 /* Snapshot of g_rep_fanout_extra_insns at segment open, so
@@ -6623,6 +6675,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                 "(the vtime freeze only covers wall-clock). Trace is valid but "
                 "guest timing may be perturbed.\n");
     }
+    g_devio_enabled          = cfg.devio != 0;
     g_features.mem_data      = cfg.enable_mem_data;
     g_features.reg_data      = cfg.enable_reg_data;
     /* Per-path toggles default to their CP siblings when unset (-1). */
@@ -6801,6 +6854,18 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
          * Backs the coarse fast-forward compensation — see
          * asid_write_track_cb. */
         qemu_plugin_register_asid_write_cb(id, asid_write_track_cb);
+        /* Block-device I/O records: bracket disk requests in the body
+         * stream (DEVIO_START at the doorbell, DEVIO_STOP at completion).
+         * System mode only — the block backend does not exist in user
+         * mode.  A no-op without disk traffic (no blk_aio_* fires), so
+         * device-free system traces are byte-identical. */
+        if (g_devio_enabled) {
+            qemu_plugin_register_devio_cb(id, devio_start_cb, devio_stop_cb);
+            /* Advertise the DEVIO_* body-tag names in the header map only
+             * now (device-free / user-mode traces omit them and stay
+             * byte-identical). */
+            devio_set_map_active(true);
+        }
     }
 
     return 0;

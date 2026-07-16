@@ -300,6 +300,16 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
                 &ids->body_tag_regfile);
     resolve_one(maps.body_tag, "body_tag", "BODY_TAG_ASID_SWITCH",
                 &ids->body_tag_asid_switch);
+    /* Disk-I/O tags are optional (absent in device-free traces and in
+     * traces predating the feature); leave the 0xFF sentinel when a
+     * name is not present so dispatch on them simply never fires. */
+    for (const auto &kv : maps.body_tag) {
+        if (kv.second == "BODY_TAG_DEVIO_START") {
+            ids->body_tag_devio_start = (uint8_t)kv.first;
+        } else if (kv.second == "BODY_TAG_DEVIO_STOP") {
+            ids->body_tag_devio_stop = (uint8_t)kv.first;
+        }
+    }
 
     /* field_id (per-slot families + singletons): each looked up by
      * full CST_FID_<family><k> name, no stride/ordering assumption.

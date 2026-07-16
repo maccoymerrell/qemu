@@ -414,6 +414,13 @@ static void write_named_enum_map(BitWriter *bw, const char *map_name,
     }
 }
 
+/* Whether the DEVIO_* body-tag names are advertised in the header
+ * encoding map: true only when the disk-I/O hook is registered (system
+ * mode + devio enabled), set via devio_set_map_active().  A device-free
+ * trace keeps the historical body_tag vocabulary and stays
+ * byte-identical. */
+static bool g_devio_map_active = false;
+
 static void write_header_encoding_maps(BitWriter *main_bw)
 {
     /* opcode / branch_type / reg maps are driven by the shared name
@@ -457,6 +464,12 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         { BODY_TAG_IFRAME, "BODY_TAG_IFRAME" },
         { BODY_TAG_REGFILE, "BODY_TAG_REGFILE" },
         { BODY_TAG_ASID_SWITCH, "BODY_TAG_ASID_SWITCH" },
+        /* DEVIO_* MUST stay last: they are advertised only when the disk-I/O
+         * hook is active (g_devio_map_active) so a device-free trace — every
+         * user-mode trace — keeps the historical 6-entry body_tag vocabulary
+         * and stays byte-identical.  The count is trimmed below. */
+        { BODY_TAG_DEVIO_START, "BODY_TAG_DEVIO_START" },
+        { BODY_TAG_DEVIO_STOP, "BODY_TAG_DEVIO_STOP" },
     };
     static const EncodingMapEntry wp_event_flag_entries[] = {
         { CST_WP_EVENT_TRANSLATION_UNAVAIL,
@@ -484,8 +497,11 @@ static void write_header_encoding_maps(BitWriter *main_bw)
                        G_N_ELEMENTS(header_flag_entries));
     write_encoding_map(&sub, "insn_flag", insn_flag_entries,
                        G_N_ELEMENTS(insn_flag_entries));
-    write_encoding_map(&sub, "body_tag", body_tag_entries,
-                       G_N_ELEMENTS(body_tag_entries));
+    size_t n_body_tags = G_N_ELEMENTS(body_tag_entries);
+    if (!g_devio_map_active) {
+        n_body_tags -= 2;   /* omit the trailing DEVIO_START / _STOP names */
+    }
+    write_encoding_map(&sub, "body_tag", body_tag_entries, n_body_tags);
     write_encoding_map(&sub, "wp_event_flag", wp_event_flag_entries,
                        G_N_ELEMENTS(wp_event_flag_entries));
     write_encoding_map(&sub, "metaflags", metaflags_entries,
@@ -3733,8 +3749,133 @@ static void emit_iframe_if_due(BodyStreamState *st, BodyEntry *entry,
     }
 }
 
+/*
+ * ---- Block-device (disk) I/O records (DEVIO) ----
+ *
+ * Process-wide state: there is one block backend and completions land
+ * on the main loop thread (not the issuing vCPU), so a GMutex guards
+ * the queues, the per-segment id counter, and the live-id set.  The
+ * plugin's devio hooks call devio_note_start / devio_note_stop; the
+ * queued records are drained into the body stream at the next body
+ * entry (devio_drain, under exec_lock), so a DEVIO_START lands at an
+ * inter-entry boundary in the owning thread's stream and a DEVIO_STOP
+ * where the completion resumes.  Starts are drained before stops so a
+ * request's START always precedes its STOP on the wire; a STOP whose
+ * START never reached the wire is dropped (the live-id set).
+ */
+namespace {
+
+struct DevioStart {
+    uint64_t request_id;
+    uint8_t  rw;        /* CST_DEVIO_* */
+    uint64_t bytes;
+    uint64_t block;     /* disk block number = offset >> CST_DEVIO_LBA_SHIFT */
+};
+
+struct DevioState {
+    GMutex   mtx;
+    uint64_t next_id = 1;               /* compact per-segment, reset at open */
+    std::vector<DevioStart> pending_starts;
+    std::vector<uint64_t>   pending_stops;
+    std::unordered_set<uint64_t> live_ids;  /* START emitted, STOP not yet */
+};
+
+DevioState g_devio;
+
+} /* namespace */
+
+void devio_set_map_active(bool on)
+{
+    g_devio_map_active = on;
+}
+
+uint64_t devio_note_start(int vcpu_index, int dir,
+                          uint64_t offset, uint64_t bytes)
+{
+    (void)vcpu_index;
+    DevioStart s;
+    s.rw = (uint8_t)dir;   /* CST_DEVIO_* == enum qemu_plugin_devio_dir */
+    s.bytes = bytes;
+    s.block = offset >> CST_DEVIO_LBA_SHIFT;
+    g_mutex_lock(&g_devio.mtx);
+    s.request_id = g_devio.next_id++;
+    g_devio.pending_starts.push_back(s);
+    g_mutex_unlock(&g_devio.mtx);
+    return s.request_id;
+}
+
+void devio_note_stop(uint64_t request_id)
+{
+    if (!request_id) {
+        return;
+    }
+    g_mutex_lock(&g_devio.mtx);
+    g_devio.pending_stops.push_back(request_id);
+    g_mutex_unlock(&g_devio.mtx);
+}
+
+void devio_reset_segment(void)
+{
+    g_mutex_lock(&g_devio.mtx);
+    g_devio.next_id = 1;
+    g_devio.pending_starts.clear();
+    g_devio.pending_stops.clear();
+    g_devio.live_ids.clear();
+    g_mutex_unlock(&g_devio.mtx);
+}
+
+/* Drain pending DEVIO records into @st's body stream at an inter-entry
+ * boundary.  Caller holds exec_lock (body_stream_write_entry); the byte
+ * stream is byte-aligned here (the previous entry ended with
+ * bw_byte_align), and every DEVIO field is a byte-granular write, so
+ * the records stay byte-aligned. */
+static void devio_drain(BodyStreamState *st)
+{
+    std::vector<DevioStart> starts;
+    std::vector<uint64_t> stops;
+
+    g_mutex_lock(&g_devio.mtx);
+    if (g_devio.pending_starts.empty() && g_devio.pending_stops.empty()) {
+        g_mutex_unlock(&g_devio.mtx);
+        return;
+    }
+    starts.swap(g_devio.pending_starts);
+    for (const DevioStart &s : starts) {
+        g_devio.live_ids.insert(s.request_id);
+    }
+    /* Partition stops into emit / drop under the lock: a stop whose id is
+     * live (its START has now been queued for this drain, or reached the
+     * wire in a prior drain) is emitted and retired; otherwise dropped. */
+    for (uint64_t id : g_devio.pending_stops) {
+        auto it = g_devio.live_ids.find(id);
+        if (it != g_devio.live_ids.end()) {
+            g_devio.live_ids.erase(it);
+            stops.push_back(id);
+        }
+    }
+    g_devio.pending_stops.clear();
+    g_mutex_unlock(&g_devio.mtx);
+
+    for (const DevioStart &s : starts) {
+        bw_write_u8(&st->bw, BODY_TAG_DEVIO_START);
+        bw_write_uleb128(&st->bw, s.request_id);
+        bw_write_u8(&st->bw, s.rw);
+        bw_write_uleb128(&st->bw, s.bytes);
+        bw_write_uleb128(&st->bw, s.block);
+    }
+    for (uint64_t id : stops) {
+        bw_write_u8(&st->bw, BODY_TAG_DEVIO_STOP);
+        bw_write_uleb128(&st->bw, id);
+    }
+}
+
 void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
 {
+    /* Flush any pending disk-I/O records at this inter-entry boundary,
+     * before this entry's context declaration, so they land in the
+     * owning thread's stream where the doorbell / completion occurred. */
+    devio_drain(st);
+
     int64_t entry_tmpl = entry->template_id;
     uint32_t num_wp = (uint32_t)entry->wp_entries.size();
     uint64_t body_start = bw_tell_bytes(&st->bw);
@@ -3836,6 +3977,11 @@ void body_stream_set_warmup_end_arch_insns(BodyStreamState *st,
 
 void body_stream_finish(BodyStreamState *st, GByteArray **header_bytes)
 {
+    /* Flush any disk-I/O records still pending at segment close (a
+     * request that completed after this segment's last body entry), so
+     * they are not lost across the finish. */
+    devio_drain(st);
+
     uint64_t stats_start = bw_tell_bytes(&st->bw);
 
     /* --- Finalise the body member. --- */

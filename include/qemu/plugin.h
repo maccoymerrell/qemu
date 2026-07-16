@@ -183,6 +183,18 @@ void qemu_plugin_vcpu_mem_cb(CPUState *cpu, uint64_t vaddr,
 
 void qemu_plugin_flush_cb(void);
 
+/*
+ * Block-device I/O notification, dispatched to a plugin's registered
+ * devio hooks (qemu_plugin_register_devio_cb).  Called from the block
+ * backend's blk_aio_* issue chokepoint (start) and completion
+ * chokepoint (stop).  The issuing vCPU is resolved from current_cpu at
+ * dispatch (the caller need not know it).  qemu_plugin_devio_start
+ * returns the plugin's request id, or 0 when unregistered / not tracked
+ * (no stop is then dispatched for this request).
+ */
+uint64_t qemu_plugin_devio_start(int dir, uint64_t offset, uint64_t bytes);
+void qemu_plugin_devio_stop(uint64_t request_id);
+
 void qemu_plugin_atexit_cb(void);
 
 void qemu_plugin_add_dyn_cb_arr(GArray *arr);
@@ -270,6 +282,15 @@ static inline void qemu_plugin_vcpu_mem_cb(CPUState *cpu, uint64_t vaddr,
 { }
 
 static inline void qemu_plugin_flush_cb(void)
+{ }
+
+static inline uint64_t qemu_plugin_devio_start(int dir, uint64_t offset,
+                                               uint64_t bytes)
+{
+    return 0;
+}
+
+static inline void qemu_plugin_devio_stop(uint64_t request_id)
 { }
 
 static inline void qemu_plugin_atexit_cb(void)

@@ -47,6 +47,12 @@ struct PluginConfig {
      * differs from the pinned value — e.g. a PTI kernel page-table base
      * — is dropped); it is byte-for-byte the pre-ownership behavior. */
     int       kexc              = 1;
+    /* Block-device (disk) I/O records (devio=0/1, system mode only).
+     * When on (default), the plugin brackets disk requests in the body
+     * stream with DEVIO_START/STOP records (system emulation only; a
+     * no-op without disk traffic, so device-free traces are unchanged).
+     * devio=0 disables the block hook entirely. */
+    int       devio             = 1;
     /* Per-template IFRAME trigger interval.  0 disables. */
     uint32_t  iframe_rate         = 100000;
     uint64_t  simpoint_interval = 100000000ULL;

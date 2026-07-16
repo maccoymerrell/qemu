@@ -44,6 +44,44 @@ void qemu_plugin_register_asid_write_cb(qemu_plugin_id_t id,
     asid_write_hook = cb;
 }
 
+/*
+ * Block-device I/O hooks (qemu_plugin_register_devio_cb).  Like the
+ * ASID-write hook, a single slot suffices: the block backend has one
+ * issue and one completion chokepoint, and the consuming plugin
+ * serialises its own state.  The dispatch entry points are called from
+ * block/block-backend.c and are no-ops until a plugin registers.
+ */
+static qemu_plugin_devio_start_cb_t devio_start_hook;
+static qemu_plugin_devio_stop_cb_t devio_stop_hook;
+
+void qemu_plugin_register_devio_cb(qemu_plugin_id_t id,
+                                   qemu_plugin_devio_start_cb_t start_cb,
+                                   qemu_plugin_devio_stop_cb_t stop_cb)
+{
+    devio_start_hook = start_cb;
+    devio_stop_hook = stop_cb;
+}
+
+uint64_t qemu_plugin_devio_start(int dir, uint64_t offset, uint64_t bytes)
+{
+    if (devio_start_hook) {
+        /* Resolve the issuing vCPU here: under the canonical no-iothread
+         * configuration the block backend is entered synchronously on the
+         * doorbell-writing vCPU thread, so current_cpu is that vCPU; a
+         * request entered off any vCPU thread reports -1. */
+        int vcpu_index = current_cpu ? current_cpu->cpu_index : -1;
+        return devio_start_hook(vcpu_index, dir, offset, bytes);
+    }
+    return 0;
+}
+
+void qemu_plugin_devio_stop(uint64_t request_id)
+{
+    if (devio_stop_hook) {
+        devio_stop_hook(request_id);
+    }
+}
+
 void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
                          uint32_t depth_after)
 {

@@ -6727,8 +6727,16 @@ def validate(meta_path: Path, trace_path: Path,
                                        reg_name_to_id=_wp_reg_name_to_id)
 
     # wpprune drops the wrong path for monomorphic indirects, so the
-    # one-target/multi-target WP-shape assertions no longer hold.
-    if wpprune == 0:
+    # one-target/multi-target WP-shape assertions no longer hold.  The
+    # same relaxation applies in system-mode marker runs: the kernel
+    # interleaves with the pinned process, and a WP simulation for an
+    # individual indirect execution is legitimately suppressed when the
+    # excursion machinery owns the slot (WP-skip / first-TB-unavailable),
+    # so "every indirect execution carries a WP" is not an invariant
+    # there — only intermittently true, which is worse than useless as
+    # an oracle.  The per-event indirect WP shape stays fully asserted
+    # in user mode.
+    if wpprune == 0 and not marker:
         issues += _check_indirect_wp_assertions(cp_entries, templates_by_id,
                                                 blocks_by_id, pcmap, isa)
 

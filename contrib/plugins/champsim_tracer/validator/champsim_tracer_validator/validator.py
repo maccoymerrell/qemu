@@ -315,6 +315,73 @@ def _check_template_raw_bytes(templates: list[dict],
     return issues
 
 
+def _fallthrough_shortfall_unexplained(
+        bid: int, gt: dict, missing: set[int],
+        templates: list[dict], pcmap: "PcMap",
+        cond_branch_id: "int | None") -> set[int]:
+    """Return the subset of `missing` block PCs NOT accounted for as the
+    never-executed fall-through of an always-taken internal conditional
+    branch whose wrong-path fork minted no chain.
+
+    A block whose terminating conditional branch was observed ONLY taken
+    (``nottaken_cp == nottaken_wp == 0``) never runs the instruction(s)
+    between that branch and its in-block taken target on the correct path.
+    The sole way those PCs enter the trace is a wrong-path excursion forking
+    at the not-taken edge — and that excursion's FIRST speculative fetch can
+    be transiently unavailable: in system mode QEMU declines a spec-mode
+    fetch whose page is not TLB-resident (``cpu_plugin_exec_tb``'s
+    non-faulting ``probe_access_flags`` returns ``TLB_INVALID_MASK``), so a
+    faithful speculation takes no page-walk side effect.  The excursion then
+    returns an empty chain and the plugin records a chain-level
+    ``CST_WP_EVENT_TRANSLATION_UNAVAIL`` (``num_wp=0``) — honest on the wire,
+    but the fall-through PCs appear in no template.  Because TLB residency at
+    the instant of the fork is timing-dependent, this is nondeterministic:
+    a re-trace of the same binary often mints the fall-through normally.
+
+    Accept a shortfall of EXACTLY those PCs; every predicate below is read
+    from the wire (the terminal conditional branch, its single target's
+    ``nottaken_{cp,wp}`` counts, and the block-local not-taken span), so any
+    other missing PC — or an overcount — is left for the caller to flag.
+    """
+    if cond_branch_id is None or not missing:
+        return set(missing)
+    start = int(gt["start_pc"])
+    end = int(gt["end_pc"])
+    explained: set[int] = set()
+    for t in templates:
+        if t.get("is_system"):
+            continue
+        insns = t.get("insns") or []
+        if not insns:
+            continue
+        term = insns[-1]
+        if term.get("branch_type") != cond_branch_id:
+            continue
+        bpc = int(term["pc"])
+        if not (start <= bpc < end) or pcmap.lookup(bpc) != bid:
+            continue
+        tgts = (t.get("profile") or {}).get("targets") or []
+        if len(tgts) != 1:
+            continue
+        tg = tgts[0]
+        if int(tg.get("nottaken_cp", -1)) != 0 or \
+                int(tg.get("nottaken_wp", -1)) != 0:
+            continue
+        taken_target = int(tg["pc"])
+        fall_through = int(t.get("fall_through_pc", 0))
+        # Strictly-internal forward conditional skip: the taken edge lands
+        # inside the block ahead of the fall-through, so [fall_through,
+        # taken_target) is the never-executed not-taken span.
+        if not (start <= taken_target < end):
+            continue
+        if not (start <= fall_through < taken_target):
+            continue
+        for pc in missing:
+            if fall_through <= pc < taken_target:
+                explained.add(pc)
+    return set(missing) - explained
+
+
 def _check_block_insn_counts(templates: list[dict],
                              blocks_by_id: dict[int, dict],
                              pcmap: "PcMap",
@@ -328,6 +395,9 @@ def _check_block_insn_counts(templates: list[dict],
     instead we union all PCs seen in the trace that fall in the block's
     span and compare the count.
     """
+    _, _branch_names = _load_name_tables()
+    cond_branch_id = next(
+        (i for i, n in _branch_names.items() if n == "COND_DIRECT"), None)
     seen_pcs: dict[int, set[int]] = {bid: set() for bid in cp_set}
     for t in templates:
         # Skip kernel / kernel-context (CST_INSN_FLAG_SYSTEM) templates:
@@ -405,6 +475,22 @@ def _check_block_insn_counts(templates: list[dict],
         # disassembly.  An over-count still indicates contamination.
         if wpprune > 0 and actual < expected:
             continue
+        # Wrong-path-fork-unavailability carve-out: accept an undercount that
+        # is EXACTLY the never-executed fall-through of an always-taken
+        # internal conditional branch whose wrong-path fork minted no chain
+        # (a transient, honestly-recorded CST_WP_EVENT_TRANSLATION_UNAVAIL —
+        # see _fallthrough_shortfall_unexplained).  Any unexplained missing
+        # PC, or an overcount, still errors.
+        if actual < expected:
+            block_pcs = {
+                int(ins["pc"], 16) if isinstance(ins["pc"], str)
+                else int(ins["pc"])
+                for ins in gt.get("insns", [])
+            }
+            missing = block_pcs - seen_pcs[bid]
+            if missing and not _fallthrough_shortfall_unexplained(
+                    bid, gt, missing, templates, pcmap, cond_branch_id):
+                continue
         if actual != expected:
             issues.append(Issue(
                 "block_insn_count", "error",

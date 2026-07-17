@@ -258,61 +258,12 @@ plugin sees its argv.
 
    .. important::
 
-      **Boot the guest with kernel page-table isolation disabled** —
-      add ``nopti`` (equivalently ``pti=off``) to the kernel command
-      line for x86, and the analogous switch on other ISAs::
-
-         qemu-system-x86_64 -kernel vmlinuz -initrd rootfs.cpio.gz \
-             -append "console=ttyS0 panic=-1 nopti" \
-             -plugin ./libchampsim_tracer.so,outfile=run,\
-             trace_window=marker:simulation=20000000 ...
-
-      This is the **canonical system-mode configuration**.  With KPTI
-      off the kernel shares each process's address space, so a
-      kernel basic block is tagged with the owning process's ASID
-      (told apart from user code by the per-insn ``SYSTEM`` bit) and
-      shared kernel code deduplicates to a single template instead of
-      one per process.  OS isolation is then modeled *by the consumer*
-      from the ``SYSTEM`` bit rather than baked into the trace — see
-      the *System-mode traces* discussion in :doc:`concepts`.
-
-   .. important::
-
-      **Canonical configuration for disk-I/O records** (``devio``, on by
-      default): a ``virtio-blk`` device with **no dedicated iothread**
-      and **``ioeventfd=off``**.  The tracer brackets each disk request
-      in the body stream with ``DEVIO_START`` (at issue) and
-      ``DEVIO_STOP`` (at completion).  Attach a real disk to exercise
-      it, e.g.::
-
-         qemu-system-x86_64 -kernel vmlinuz -initrd rootfs.cpio.gz \
-             -append "console=ttyS0 panic=-1 nopti" -smp 2 \
-             -drive file=scratch.raw,format=raw,if=none,id=d0 \
-             -device virtio-blk-pci,drive=d0,ioeventfd=off \
-             -plugin ./libchampsim_tracer.so,outfile=run,\
-             trace_window=marker:simulation=20000000,devio=1 ...
-
-      **Why ``ioeventfd=off``.**  Each ``DEVIO_START`` is attributed to
-      the process/thread that issued it.  The guest's virtqueue kick runs
-      in the issuing vCPU's context, where the tracer captures the owner;
-      the block backend issues the request moments later on that same
-      vCPU, and the record is stamped with the captured owner (the
-      decoder shows ``attr=exact``).  This is what keeps attribution
-      correct on a multi-vCPU / multi-process guest, where two processes'
-      disk I/O interleaves in one body stream.  The default virtio
-      *ioeventfd* fast path services the kick without entering the vCPU
-      context the tracer hooks, so with it on the records fall back to
-      **positional** attribution (``attr=pos`` — correct for a single
-      marked process, a guess otherwise).  ``ioeventfd=off`` (and no
-      iothread) keeps the whole ``kick → blk_aio`` path on the issuing
-      vCPU.  Non-virtio disks (IDE/AHCI) and kernel-internal I/O always
-      use the positional fallback.
-
-      An initramfs-only guest with no ``-drive`` produces no disk
-      traffic and therefore no ``DEVIO`` records — the trace is
-      otherwise identical.  See the ``devio`` option in
-      :doc:`reference` and the record layout in
-      ``champsim_tracer_format.md`` (§4.1b).
+      System-mode tracing assumes a specific guest and device
+      configuration: kernel page-table isolation off (``nopti``), the
+      traced process pinned to one vCPU, and — for disk-I/O records — a
+      ``virtio-blk`` disk with ``ioeventfd=off`` and no dedicated
+      iothread.  These knobs and why each one matters are collected in
+      :ref:`canonical-system-config`.
 
 ``latch_timeout=<ms>``
    Dead-latch detector for the marker *latch* policy
@@ -564,6 +515,95 @@ header for downstream tools to identify the run.
 ``comment=<string>``
    Free-form note recorded in the header's ``comment`` field.
    Defaults to none.
+
+.. _canonical-system-config:
+
+Canonical system-mode configuration
+-----------------------------------
+
+System-mode tracing — ``qemu-system-<isa>`` driven by
+``trace_window=marker:...`` — assumes a specific guest and device
+configuration that the tracer's address-space model and owner
+attribution depend on.  The knobs are collected here.  Every one is a
+no-op for a user-mode (``qemu-<isa>``) run, so nothing in this section
+changes a user-mode trace.
+
+**Pin the traced process to one vCPU.**  A trace is scoped to a single
+guest address space, and kernel-code per-thread attribution stays
+clean only while the traced process remains on one vCPU.  A
+compiled-in marker gets this from ``taskset`` / ``isolcpus`` on the
+guest workload; :program:`cst_attach` confines an unmodified binary to
+one guest CPU by default (``--pin-cpu N`` selects the CPU, ``--no-pin``
+disables the confinement).  A process that migrates across vCPUs
+anyway draws one ``pin_multivcpu_observed`` warning per segment.
+
+**Boot with kernel page-table isolation off.**  Add ``nopti``
+(equivalently ``pti=off``) to the guest kernel command line for x86,
+and the analogous switch on other ISAs::
+
+   qemu-system-x86_64 -kernel vmlinuz -initrd rootfs.cpio.gz \
+       -append "console=ttyS0 panic=-1 nopti" \
+       -plugin ./libchampsim_tracer.so,outfile=run,\
+       trace_window=marker:simulation=20000000 ...
+
+With KPTI off the kernel shares each process's address space, so a
+kernel basic block is tagged with the owning process's ASID (told
+apart from user code by the per-insn ``SYSTEM`` bit) and shared kernel
+code deduplicates to a single template instead of one copy per
+process.  OS isolation is then modeled *by the consumer* from the
+``SYSTEM`` bit rather than baked into the trace — see the *System-mode
+traces* discussion in :doc:`concepts`.  When a kernel does run in a
+private address space on entry (a PTI-style page-table base), the
+``kexc`` option (default on) carries that kernel excursion back to the
+user process it was entered from so its synchronous-handler coverage is
+kept rather than dropped; see :doc:`reference`.
+
+**Disk-I/O records: virtio-blk with ioeventfd=off and no iothread.**
+With ``devio`` on (the default), the tracer brackets each disk request
+in the body stream with a ``DEVIO_START`` at issue and a
+``DEVIO_STOP`` at completion.  Attach a real disk to exercise it::
+
+   qemu-system-x86_64 -kernel vmlinuz -initrd rootfs.cpio.gz \
+       -append "console=ttyS0 panic=-1 nopti" -smp 2 \
+       -drive file=scratch.raw,format=raw,if=none,id=d0 \
+       -device virtio-blk-pci,drive=d0,ioeventfd=off \
+       -plugin ./libchampsim_tracer.so,outfile=run,\
+       trace_window=marker:simulation=20000000,devio=1 ...
+
+Each ``DEVIO_START`` is attributed to the process/thread that issued
+it.  The guest's virtqueue kick runs in the issuing vCPU's context,
+where the tracer captures the owner; the block backend issues the
+request moments later on that same vCPU, and the record is stamped with
+the captured owner (the decoder shows ``attr=exact``).  This is what
+keeps attribution correct on a multi-vCPU / multi-process guest, where
+two processes' disk I/O interleaves in one body stream.  The default
+virtio *ioeventfd* fast path services the kick without entering the
+vCPU context the tracer hooks, so with it on the records fall back to
+**positional** attribution (``attr=pos`` — correct for a single marked
+process, a guess otherwise).  ``ioeventfd=off`` together with no
+dedicated iothread keeps the whole ``kick → blk_aio`` path on the
+issuing vCPU.  Non-virtio disks (IDE/AHCI) and kernel-internal I/O
+always use the positional fallback.  An initramfs-only guest with no
+``-drive`` produces no disk traffic and therefore no ``DEVIO`` records
+— the trace is otherwise identical.  See the ``devio`` option in
+:doc:`reference` and the record layout in
+``champsim_tracer_format.md`` (§4.1b).
+
+**Physical-page records (optional).**  ``physaddr=1`` adds the physical
+**page** base of every load and store via the ``CST_FID_LOAD_PPAGE`` /
+``CST_FID_STORE_PPAGE`` families, letting a consumer rebuild the full
+physical address as ``ppage | (vaddr & 0xFFF)``.  It is off by default,
+forced off in user mode (no virtual-to-physical translation exists
+there), and records a page's mapping only on first touch, so a
+physaddr-free or user-mode trace is byte-identical regardless.  See the
+``physaddr`` option in :doc:`reference`.
+
+**Determinism.**  The reproducibility flags in
+:ref:`reproducibility-flags` (host CPU pin, host-ASLR disable,
+environment scrub) apply to the ``qemu-system`` process itself the same
+way they apply to user-mode QEMU; system-mode runs additionally benefit
+from QEMU's record/replay machinery (``docs/system/replay.rst``), which
+is system-mode only.
 
 Common configurations
 ---------------------

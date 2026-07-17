@@ -437,7 +437,7 @@ Branch types (``BranchType``)
        template-parse time.
 
 Per-block branch outcome (``CST_FID_BRANCH_TAKEN`` / ``CST_FID_BRANCH_TARGET``)
-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
 
 ``branch_type`` above is the *static* flavour of a template's terminating
 branch.  Its *dynamic* per-execution outcome rides two always-advertised
@@ -966,6 +966,17 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
      - ``0``
      - Per-segment interval histograms (N buckets) in the exit-time
        summary.
+   * - ``kexc=0|1``
+     - ``1``
+     - Kernel-excursion ownership (**system mode only**).  When on, a
+       kernel (privilege ``!= 0``) basic block is attributed to the
+       trace by the *owning excursion* — the user address space the
+       kernel was entered from, tracked through ASID-write path events —
+       rather than by the live ASID.  This keeps a kernel's synchronous
+       handler coverage even when the kernel switches to a private
+       address space on entry (a PTI-style page-table base).  ``kexc=0``
+       restores the strict live-ASID rule: kernel work whose live ASID
+       differs from the pinned value is dropped.  Ignored in user mode.
    * - ``devio=0|1``
      - ``1``
      - Block-device (disk) I/O records (**system mode only**).  When on,

@@ -31,6 +31,7 @@
 #include "champsim_tracer_bb_chain_assembler.h"
 #include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_branch_history.h"
+#include "champsim_tracer_marker_detect.h"
 #include "champsim_tracer_mem_access_recorder.h"
 #include "champsim_tracer_path_builder.h"
 #include "champsim_tracer_plugin_config.h"
@@ -4830,214 +4831,14 @@ static void split_tb_into_fragments(const qemu_plugin_insn_info *insn_info,
  * (the contract shared with the cst_attach injector). */
 static std::atomic<bool> g_marker_fired{false};
 
-/*
- * Per-ISA marker byte sequences, built once from the shared contract at
- * install time.  x86 is CST_MARKER_SEQ_LEN identical 5-byte movs; the
- * fixed-width ISAs are the minimal two-insn load pair repeated
- * CST_MARKER_SEQ_LEN times (so their per-insn words ALTERNATE — the
- * detector matches by sequence position, not by identical-insn run).
- */
-struct MarkerSeq {
-    uint8_t start[CST_MARKER_PAIR_SEQ_BYTES];
-    uint8_t end[CST_MARKER_PAIR_SEQ_BYTES];
-    uint8_t insn_bytes = 0;            /* fixed insn width in the seq */
-    uint8_t n_insns    = 0;            /* insns per full sequence */
-    bool    valid      = false;
-};
-static MarkerSeq g_marker_seq;
-
-static void marker_seq_init(void)
-{
-    MarkerSeq &m = g_marker_seq;
-    switch (trace_isa) {
-    case TRACE_ISA_X86:
-        static_assert(CST_MARKER_X86_SEQ_BYTES <= CST_MARKER_PAIR_SEQ_BYTES,
-                      "MarkerSeq buffers sized by the pair sequence");
-        cst_marker_x86_encode_seq_imm(m.start, CST_MARKER_MAGIC);
-        cst_marker_x86_encode_seq_imm(m.end, CST_MARKER_END_MAGIC);
-        m.insn_bytes = CST_MARKER_X86_INSN_BYTES;
-        m.n_insns    = CST_MARKER_SEQ_LEN;
-        m.valid      = true;
-        break;
-    case TRACE_ISA_AARCH64:
-        cst_marker_a64_encode_seq_imm(m.start, CST_MARKER_MAGIC);
-        cst_marker_a64_encode_seq_imm(m.end, CST_MARKER_END_MAGIC);
-        m.insn_bytes = CST_MARKER_PAIR_INSN_BYTES;
-        m.n_insns    = CST_MARKER_PAIR_SEQ_INSNS;
-        m.valid      = true;
-        break;
-    case TRACE_ISA_RISCV:
-        cst_marker_riscv_encode_seq_imm(m.start, CST_MARKER_MAGIC);
-        cst_marker_riscv_encode_seq_imm(m.end, CST_MARKER_END_MAGIC);
-        m.insn_bytes = CST_MARKER_PAIR_INSN_BYTES;
-        m.n_insns    = CST_MARKER_PAIR_SEQ_INSNS;
-        m.valid      = true;
-        break;
-    case TRACE_ISA_MIPS:
-        cst_marker_mips_encode_seq_imm(m.start, CST_MARKER_MAGIC);
-        cst_marker_mips_encode_seq_imm(m.end, CST_MARKER_END_MAGIC);
-        m.insn_bytes = CST_MARKER_PAIR_INSN_BYTES;
-        m.n_insns    = CST_MARKER_PAIR_SEQ_INSNS;
-        m.valid      = true;
-        break;
-    default:
-        m.valid = false;
-        break;
-    }
-}
-
-/* Does @bytes/@size match ANY per-insn word of @seq?  Membership is all
- * translation needs to know: consecutivity is judged at EXECUTION time,
- * in the user-space instruction stream, by PC adjacency (below) — so the
- * marker is detected regardless of how translation happens to slice it
- * into TBs (page splits, single-stepping under a guest debugger/ptrace
- * injector, chained 1-insn TBs). */
-static inline bool marker_word_match(const uint8_t *seq,
-                                     const uint8_t *bytes, uint8_t size)
-{
-    const MarkerSeq &m = g_marker_seq;
-    if (size != m.insn_bytes) {
-        return false;
-    }
-    for (uint32_t i = 0; i < m.n_insns; i++) {
-        if (memcmp(bytes, seq + (size_t)i * m.insn_bytes, m.insn_bytes) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/*
- * Execution-time marker run, per thread: three(+) marker instructions are
- * a marker exactly when they are CONSECUTIVE IN THE USER-SPACE STREAM —
- * i.e. each executes at user privilege, in the same address space, at the
- * PC immediately after the previous one.  Kernel instructions interposed
- * between them (single-step traps, interrupts) do not break the run: they
- * never match the adjacency test and are not part of the user stream.
- * A marker insn that is NOT adjacent to the previous one simply starts a
- * fresh run of length 1.
- */
-struct MarkerExecRun {
-    uint64_t next_pc = 0;      /* pc the run's next insn must have */
-    uint64_t asid = 0;         /* the address space this run belongs to */
-    uint32_t run = 0;          /* run length so far (0 == free slot) */
-    uint32_t used = 0;         /* LRU timestamp (0 == never advanced) */
-};
-
-/*
- * Per-vCPU set of in-flight marker runs, one slot per address space.
- *
- * A single shared run per vCPU cannot survive CONCURRENT ptrace injections:
- * cst_attach single-steps the marker's instructions (each a separate
- * ptrace stop -> resume, with a scheduling window between them), so two
- * simultaneous injections interleave in the user stream — A1, B1, A2, B2,
- * A3, B3.  A single run keyed nothing but "the last marker word seen"
- * resets on every foreign-asid step (the old `else { run = 1; asid = a; }`
- * branch), so NEITHER injection ever reaches full sequence length: they
- * mutually cancel (observed: traced_icount=0 on a simultaneous 2xmcf
- * launch).  Compiled-in markers execute back-to-back and so never exposed
- * this — only the stepped injector interleaves.
- *
- * Keying each run by address space isolates the injections: asid A advances
- * its own run across B's interposed steps, and vice versa.  Bounded to a
- * handful of slots (concurrent injections are few — the working set during
- * a simultaneous launch is just the injecting asids); the least-recently-
- * advanced slot is evicted when full.  A legitimate marker's words are
- * back-to-back in the user stream, so an evicted stale partial run costs
- * nothing (it would reset on its next non-adjacent word anyway).  A single
- * address space (user mode, or a compiled-in back-to-back marker) uses
- * exactly one slot and behaves identically to the former single run, so
- * those traces stay byte-identical.
- */
-struct MarkerRunSet {
-    static constexpr int SLOTS = 8;
-    MarkerExecRun runs[SLOTS];
-    uint32_t tick = 0;         /* monotonic LRU clock */
-};
+/* Per-thread execution-time marker runs (START / END).  The MarkerRunSet
+ * type and the detection primitives (marker_seq_init / marker_word_match /
+ * marker_exec_step / marker_run_peek / the udata pack-unpack) live in
+ * champsim_tracer_marker_detect.{h,cc}; these per-thread run sets and the
+ * one-shot fired flag above are touched only by the marker callbacks, so
+ * they stay here. */
 static thread_local MarkerRunSet tls_marker_run;
 static thread_local MarkerRunSet tls_marker_end_run;
-
-/* udata for the per-insn marker exec cb: the insn's vaddr and size packed
- * into a pointer-sized word (size in the low byte; marker insns are
- * 4/5/8-byte encodings, and vaddrs on every target fit 56 bits). */
-static inline void *marker_udata_pack(uint64_t pc, uint8_t size)
-{
-    return (void *)(uintptr_t)((pc << 8) | size);
-}
-
-static inline void marker_udata_unpack(void *udata, uint64_t *pc,
-                                       uint8_t *size)
-{
-    uintptr_t v = (uintptr_t)udata;
-    *size = (uint8_t)(v & 0xff);
-    *pc = (uint64_t)(v >> 8);
-}
-
-/* Locate @asid's run slot in @set; when it has none, claim a slot — a free
- * one (run == 0) if any, else the least-recently-advanced — and reset it for
- * a fresh run.  The returned slot's asid always equals @asid. */
-static inline MarkerExecRun *marker_run_slot(MarkerRunSet *set, uint64_t asid)
-{
-    int victim = 0;
-    uint32_t victim_age = UINT32_MAX;
-    for (int i = 0; i < MarkerRunSet::SLOTS; i++) {
-        MarkerExecRun &r = set->runs[i];
-        if (r.run > 0 && r.asid == asid) {
-            return &r;                      /* this asid's live run */
-        }
-        /* A free slot is the ideal victim (age 0); otherwise the oldest. */
-        uint32_t age = (r.run == 0) ? 0 : r.used;
-        if (age < victim_age) {
-            victim_age = age;
-            victim = i;
-        }
-    }
-    MarkerExecRun *r = &set->runs[victim];
-    r->run = 0;                             /* fresh run for a new asid */
-    r->asid = asid;
-    r->next_pc = 0;
-    return r;
-}
-
-/* Read-only peek at @asid's current run (diagnostics only); null if none. */
-static inline const MarkerExecRun *marker_run_peek(const MarkerRunSet *set,
-                                                   uint64_t asid)
-{
-    for (int i = 0; i < MarkerRunSet::SLOTS; i++) {
-        if (set->runs[i].run > 0 && set->runs[i].asid == asid) {
-            return &set->runs[i];
-        }
-    }
-    return nullptr;
-}
-
-/* Advance the current address space's execution-time run with this marker-
- * word execution; returns true when that run reaches full sequence length.
- * Runs are kept per address space (see MarkerRunSet) so a concurrently
- * injected marker in a different address space does not reset this one. */
-static inline bool marker_exec_step(MarkerRunSet *set, uint64_t pc,
-                                    uint8_t size)
-{
-    if (qemu_plugin_get_priv_level() != 0) {
-        return false;                       /* user-space stream only */
-    }
-    uint64_t asid = qemu_plugin_get_addr_space_id();
-    uint32_t now = ++set->tick;
-    MarkerExecRun *r = marker_run_slot(set, asid);
-    /* The slot is keyed by asid, so adjacency is the only remaining test. */
-    if (r->run > 0 && pc == r->next_pc) {
-        r->run++;
-    } else {
-        r->run = 1;
-    }
-    r->used = now;
-    r->next_pc = pc + size;
-    if (r->run >= g_marker_seq.n_insns) {
-        r->run = 0;
-        return true;
-    }
-    return false;
-}
 
 static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
 {

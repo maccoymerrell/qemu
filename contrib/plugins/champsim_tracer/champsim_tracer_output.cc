@@ -1571,13 +1571,6 @@ static bool extr_n_loads(const EntryView *ev, uint32_t i, uint8_t slot,
     *out = cst_wide_from_u64(ev->actual_n_loads[i]);
     return true;
 }
-static U512 deflt_n_loads(const BBTemplate *t, uint32_t i, uint8_t slot)
-{
-    (void)t;
-    (void)i;
-    (void)slot;
-    return cst_wide_from_u64(0);
-}
 
 static bool extr_n_stores(const EntryView *ev, uint32_t i, uint8_t slot,
                           U512 *out)
@@ -1586,13 +1579,6 @@ static bool extr_n_stores(const EntryView *ev, uint32_t i, uint8_t slot,
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
     *out = cst_wide_from_u64(ev->actual_n_stores[i]);
     return true;
-}
-static U512 deflt_n_stores(const BBTemplate *t, uint32_t i, uint8_t slot)
-{
-    (void)t;
-    (void)i;
-    (void)slot;
-    return cst_wide_from_u64(0);
 }
 
 /* Locate the @slot-th memop of @insn matching @want_type
@@ -2249,12 +2235,12 @@ static bool extr_store_data_lane_mask(const EntryView *ev, uint32_t i,
  * See FieldDescriptor.slot_stride. */
 static const FieldDescriptor field_descriptors[] = {
         { CST_FID_N_LOADS,          1, 1,  false, false,
-            extr_n_loads,        deflt_n_loads,         nullptr,
+            extr_n_loads,        deflt_zero,            nullptr,
             extr_u64_n_loads,    deflt_u64_zero,
             false /* dynamic: actual_n_loads[i] */,
             "N_LOADS" },
         { CST_FID_N_STORES,         1, 1,  false, false,
-            extr_n_stores,       deflt_n_stores,        nullptr,
+            extr_n_stores,       deflt_zero,            nullptr,
             extr_u64_n_stores,   deflt_u64_zero,
             false /* dynamic: actual_n_stores[i] */,
             "N_STORES" },

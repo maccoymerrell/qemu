@@ -13,7 +13,7 @@ matching code.
 Plugin API additions
 --------------------
 
-``include/qemu/qemu-plugin.h`` (``QEMU_PLUGIN_VERSION = 8``)
+``include/qemu/qemu-plugin.h`` (``QEMU_PLUGIN_VERSION = 12``)
 
    * ``qemu_plugin_insn_detail`` — Capstone-detail accessor that
      returns a structured ``qemu_plugin_insn_info`` for an
@@ -127,7 +127,32 @@ Plugin API additions
      three return their user-mode defaults — privilege 0, ASID 0, paging
      on — in ``*-linux-user``, where a process always has one valid
      address space.
-   * ``QEMU_PLUGIN_VERSION = 8`` advertises these entry
+   * ``qemu_plugin_vaddr_to_paddr`` — debug-walks the executing vCPU's
+     current translation to return the physical address a virtual
+     address maps to (0 when unmapped).  It supplies the physical-page
+     identity a narrow ASID cannot distinguish — two processes that
+     alias the same short MIPS ASID still occupy distinct physical
+     pages — and backs the ``physaddr=1`` per-memop physical-page
+     records.
+   * ``qemu_plugin_get_thread_ptr`` — the kernel-maintained per-thread
+     pointer register for the running thread, giving guest-thread
+     identity independent of the vCPU a thread happens to be scheduled
+     on.  The plugin keys ``thread_id`` off it rather than the vCPU
+     index.
+   * ``qemu_plugin_vaddr_is_kernel`` — classifies a code virtual
+     address's privilege domain through the target's own MMU / segment
+     logic: a kernel-vs-user split that needs no page-table walk and is
+     safe to consult on a speculative (wrong-path) address.  The plugin
+     uses it to fold shared kernel code to a single template rather than
+     re-minting one per process.
+   * ``qemu_plugin_register_devio_cb`` — registers block-device I/O
+     issue and completion notifications from the block backend, plus a
+     doorbell hook.  The guest's virtqueue-notify (kick) executes in
+     vCPU context, so the backend's later main-loop issue notification
+     is correlated back to the issuing vCPU through a device token,
+     giving the ``devio=1`` disk-I/O records their exact owner
+     attribution instead of a positional guess.
+   * ``QEMU_PLUGIN_VERSION = 12`` advertises these entry
      points to plugin loaders.
 
 ``include/accel/tcg/cpu-ops.h`` and per-target
@@ -866,15 +891,39 @@ not populate the normal-mode TLB they bypass.
    live.  Correct-path translation is untouched: the branch is keyed
    on the TB's cflags, and only spec-mode TBs carry the flag.
 
-   ``CF_FORCE_SLOW`` is implemented only in the i386 backend (which
-   serves both x86 and x86-64 **hosts** — guest ISA coverage is
-   unaffected).  Every other TCG backend (aarch64, ppc, riscv, s390x,
-   …) ignores the flag and emits its normal fast path, so on a
-   non-x86 host wrong-path stores reach real guest memory and
-   wrong-path simulation is unsafe to enable.  Porting wrong-path
-   support to another host architecture starts here: the equivalent
-   force-slow branch in that backend's address-preparation routine
-   (``tcg/<host>/tcg-target.c.inc``).
+   ``CF_FORCE_SLOW`` is implemented in the i386 backend (which serves
+   both x86 and x86-64 **hosts** — guest ISA coverage is unaffected),
+   advertised by ``TCG_TARGET_HAS_SPEC_FORCE_SLOW`` in
+   ``tcg/i386/tcg-target.h``.  A backend that does not honor the flag
+   emits its normal fast path, whose TLB-hit store would otherwise
+   write real guest memory.  For those hosts a second,
+   backend-independent containment path applies in **system mode**:
+   ``tlb_set_page_full`` (``accel/tcg/cputlb.c``, compiled in only
+   where the backend lacks ``CF_FORCE_SLOW``) stamps ``TLB_FORCE_SLOW``
+   on the data-load and data-store comparators of every TLB entry a
+   speculative excursion installs, and ``cpu_plugin_spec_tlb_flush_enter``
+   flushes any correct-path entries resident when the excursion begins
+   so they refill carrying the flag.  Every backend's inline fast-path
+   compare already treats a ``TLB_FORCE_SLOW`` entry as a miss, so
+   speculative loads and stores route to the ``do_ld*`` / ``do_st*``
+   helpers — and the spec store sandbox — on any host.
+
+   ``cpu_plugin_spec_mode_supported`` (``accel/tcg/cpu-exec.c``) is the
+   resulting capability gate: wrong-path containment holds when the host
+   backend honors ``CF_FORCE_SLOW`` **or** the build is system-mode.
+   The one uncontained configuration is user-mode tracing on a backend
+   without ``CF_FORCE_SLOW`` — no softmmu TLB exists there to carry
+   ``TLB_FORCE_SLOW``, so an inline store would commit to the guest
+   image.  ``qemu_plugin_spec_mode_begin`` (``plugins/api.c``) guards
+   against it: at the first speculative excursion it consults the gate
+   and, when containment is unavailable, calls ``error_report`` and
+   ``_exit(1)`` — refusing loudly rather than corrupting the guest image
+   or silently disabling wrong-path tracing.  On x86 the capability is a
+   compile-time constant, so the guard collapses to a no-op.  Porting
+   fast-path containment to another host starts at that backend's
+   address-preparation routine (``tcg/<host>/tcg-target.c.inc``); its
+   softmmu paths are already covered by the portable ``TLB_FORCE_SLOW``
+   path.
 
 ``include/elf.h``
 

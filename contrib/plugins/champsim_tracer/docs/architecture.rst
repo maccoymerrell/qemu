@@ -311,20 +311,26 @@ Practical implications:
 
 .. _single-address-space:
 
-Single address space (system-mode scope)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Address-space scope and per-thread attribution (system mode)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-A system-mode trace represents **one address space**.  The marker pins a
-single process, every virtual address in the body is that process's, and
-``thread_id`` distinguishes the software threads *within* it — nothing in
-the wire disambiguates memory across processes (the same VA in a different
-address space is different memory).  Whole-system / multi-process tracing
-would require an address-space id (CR3 / TTBR0 / SATP / MIPS ASID) on the
-wire so a consumer could key memory per process; that is a deliberate
-**future** format extension, not a current capability.
+A system-mode trace keys memory by ``(asid, virtual address)``.  Every
+body entry names both its software thread (``thread_id``) and its
+address-space id (``asid``), and a ``BODY_TAG_ASID_SWITCH`` record rebases
+the ASID dimension whenever the running address space changes — the
+address-space id being the page-table base / ASID register (x86 ``CR3``,
+RISC-V ``SATP``, Arm ``TTBR0_EL1``, MIPS ASID).  The same virtual address
+in a different address space is therefore different memory, and the wire
+disambiguates it.  *Which* processes are captured is the marker scope's
+decision — the default ``policy=latch`` traces each marker-owning process,
+``policy=trace-all`` every context — but the ``(thread, asid)`` context
+rides every entry regardless.  With kernel page-table isolation off (the
+canonical configuration), a process's synchronous kernel excursions share
+that process's ASID, so kernel and user code of one process fold to a
+single address space, told apart only by the per-insn ``SYSTEM`` bit.
 
-Within that one address space, clean per-thread attribution rests on the
-pinned process **not migrating across vCPUs**:
+Clean per-thread attribution of *kernel* code still rests on the traced
+process **not migrating across vCPUs**:
 
 * **User code is exact.**  ``thread_id`` is read from the per-thread
   pointer, a user register the kernel context-switches, so a thread's

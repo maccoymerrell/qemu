@@ -6,8 +6,12 @@ space (ASID)** alongside the thread in the body stream so memory is keyed by
 This is the work anticipated by the single-address-space scope boundary.
 
 Status: **DESIGN LOCKED** (all four open questions resolved by the maintainer,
-below). Phases 1/2/3A/B1 + kernel-context fold implemented; internal-cache
-asid keying in progress.
+below) and **IMPLEMENTED**. Phases 1/2/3A and Stage B1/B2/B3 are landed, along
+with the kernel-context fold, internal-cache asid keying, the KPTI-off canonical
+model, per-entry compact asid indices, and the `latch` / `trace-all` marker
+policies with the `latch_timeout` dead-latch backstop. The `(asid, thread)`
+context and `BODY_TAG_ASID_SWITCH` are on the wire (see
+`champsim_tracer_format.md` §4.1a).
 
 ---
 

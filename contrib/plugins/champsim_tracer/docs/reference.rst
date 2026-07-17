@@ -436,31 +436,37 @@ Branch types (``BranchType``)
        is always self-PC) and so the fan-out shape is obvious at
        template-parse time.
 
-Per-entry branch outcome (``CST_FID_BRANCH_TAKEN`` / ``CST_FID_BRANCH_TARGET``)
+Per-block branch outcome (``CST_FID_BRANCH_TAKEN`` / ``CST_FID_BRANCH_TARGET``)
 ------------------------------------------------------------------------------
 
 ``branch_type`` above is the *static* flavour of a template's terminating
 branch.  Its *dynamic* per-execution outcome rides two always-advertised
-singleton field-IDs on every branch-terminated **CP** entry, so a consumer
-recovers the branch's direction and landing PC directly, without decoding
-ahead to the successor entry:
+singleton field-IDs on every branch-terminated block — on the correct path
+**and** on every wrong-path chain block — so a consumer recovers the branch's
+direction and landing PC directly, without decoding ahead to the successor:
 
 * ``CST_FID_BRANCH_TAKEN`` — ``1`` if control transferred, ``0`` if the
   branch fell through.
-* ``CST_FID_BRANCH_TARGET`` — the PC the branch actually reached; equals the
-  template's ``fall_through_pc`` when not taken, so it is the architectural
-  successor either way.
+* ``CST_FID_BRANCH_TARGET`` — the branch's landing PC encoded as a *signed
+  displacement* from the branch instruction's own PC
+  (``successor − branch_pc``), reconstructed as ``branch_pc + displacement``.
+  It resolves to the template's ``fall_through_pc`` when not taken, so it is
+  the architectural successor either way.
 
 Both delta-encode against the terminating branch instruction's own previous
 value (baseline ``0``), so a static direct branch costs its two records once
 and nothing thereafter, while the bytes concentrate on indirect targets and
-direction flips.  They are **CP only** — a wrong-path block's successor is
-the next chain entry's ``start_pc``, needing no look-ahead — and appear only
-on entries whose template ends in a branch; a page-split continuation and the
+direction flips.  The displacement encoding keeps even a first sighting a
+small sleb.  On the wrong path the singletons delta through the same
+per-chain WP field-state overlay as ``LOAD_ADDR``
+(``wp_state → CP → default``), so WP branch overhead tracks CP branch
+overhead instead of paying a fresh baseline per excursion.  They appear only
+on blocks whose template ends in a branch; a page-split continuation and the
 segment-final flush carry neither.  A ``REP`` fan-out reports each iteration's
 self-loop (taken to the REP PC) until the final iteration exits.  ``cst_decode
---verify-branch`` cross-checks every entry's stored outcome against the
-successor-derived value.  See :doc:`format` §5.6 for the wire contract.
+--verify-branch`` cross-checks every CP entry's stored outcome against the
+successor-derived value and every non-final WP block against the next chain
+block's ``start_pc``.  See :doc:`format` §5.6 for the wire contract.
 
 .. _registers:
 

@@ -340,9 +340,11 @@ struct WPEntry {
     uint32_t                    fault_insn_index = 0;
     bool                        has_fault_idx = false;
     uint32_t                    n_insns = 0;
-    /* The CST_FID_BRANCH_* singletons are CP-only, so this always stays
-     * valid=false for a WP BB: its successor is simply the next chain
-     * entry's start_pc.  Kept for struct symmetry with DecodedEntry. */
+    /* Terminal-branch direction/target (CST_FID_BRANCH_*) for this WP block,
+     * decoded directly (displacement reconstructed to an absolute successor
+     * PC).  valid iff the block's template ends in a branch; the successor is
+     * the next chain block's start_pc, so a self-check can cross-verify it
+     * in-chain. */
     BranchOutcome               branch;
 };
 

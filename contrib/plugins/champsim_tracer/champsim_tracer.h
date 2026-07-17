@@ -388,20 +388,25 @@ extern "C" {
                                    (CST_FID_SLOT_COUNT - 1) * \
                                    CST_FID_PPAGE_BLOCK_STRIDE)
 
-/* Branch-outcome block (always present).  Two per-entry singletons that ride
- * the terminating branch of a branch-terminated BB, making the branch's
- * direction and dynamic target explicit so a consumer need not decode the
- * successor entry to recover them:
+/* Branch-outcome block (always present).  Two per-block singletons that ride
+ * the terminating branch of a branch-terminated BB — on the correct path and
+ * on every wrong-path chain block — making the branch's direction and dynamic
+ * target explicit so a consumer need not decode the successor to recover them:
  *   CST_FID_BRANCH_TAKEN  — 1 = control transferred (taken), 0 = fell through.
- *   CST_FID_BRANCH_TARGET — the branch's actual landing PC; equals the
- *                           fall-through when not taken (so it is simply the
- *                           architectural successor either way).
+ *   CST_FID_BRANCH_TARGET — the branch's landing PC encoded as a SIGNED
+ *                           DISPLACEMENT from the branch instruction's own PC
+ *                           (successor - branch_pc), so even a first sighting
+ *                           is a small sleb; the decoder reconstructs
+ *                           successor = branch_pc + displacement.  Equals the
+ *                           fall-through when not taken.
  * Placed AFTER the physical-page block so no pre-existing field-id moves.
  * Delta-encoded singletons keyed on the branch insn's position (like
- * CST_FID_METAFLAGS): a direct branch's target is static after its first
+ * CST_FID_METAFLAGS): a direct branch's displacement is static after its first
  * emission (delta 0 -> zero record bytes) and cost concentrates in indirect
- * targets and direction flips.  Non-branch-terminated entries (page-split
- * continuations) carry neither FID.  See champsim_tracer_format.md §5.6. */
+ * targets and direction flips.  WP blocks delta through the per-chain WP
+ * overlay (wp_state -> CP -> default), so WP overhead tracks CP overhead.
+ * Non-branch-terminated entries (page-split continuations) carry neither FID.
+ * See champsim_tracer_format.md §5.6. */
 #define CST_FID_BRANCH_BLOCK_BASE (CST_FID_PPAGE_BLOCK_END + 1)
 #define CST_FID_BRANCH_TAKEN      (CST_FID_BRANCH_BLOCK_BASE + 0)
 #define CST_FID_BRANCH_TARGET     (CST_FID_BRANCH_BLOCK_BASE + 1)
@@ -992,9 +997,17 @@ struct WPBBEntry {
      * only.  Captured pre-insn via a per-fragment wide regfile dump.
      * Empty when reg-data is disabled. */
     std::vector<RegSnap> reg_snaps;
-    /* No CST_FID_BRANCH_* fields: the branch-outcome singletons are CP-only.
-     * A WP BB's successor is the next chain entry's start_pc (see the WP
-     * walker), so per-WP-BB direction/target would duplicate in-chain data. */
+    /* Terminal-branch outcome for the CST_FID_BRANCH_TAKEN / _TARGET
+     * singletons, carried on WP blocks as well as CP entries.
+     * branch_successor_pc is the WP walker's commit_post_pc — the PC this
+     * speculative block's terminating branch actually reached, i.e. the next
+     * chain block's start_pc (and, for the chain's last block, where the
+     * excursion would have continued).  branch_successor_known gates
+     * emission.  Direction/target are derived at wire-emit time from the
+     * successor and the template's fall-through (see emit_field_delta_section)
+     * and delta-encode through the per-chain WP overlay. */
+    uint64_t branch_successor_pc = 0;
+    bool     branch_successor_known = false;
 };
 
 struct BodyEntry {

@@ -2194,8 +2194,19 @@ void emit_legacy_entry(FILE *out, const cst::Header &h,
     emit_legacy_observations(out, "    ", h, e.dyn_params, e.reg_snaps,
                              e.metaflags, e.lane_masks);
     for (const auto &wp : e.wp_entries) {
-        std::fprintf(out, "  wp[%u] template=BB%u n_insns=%u\n",
-                     wp.index, wp.template_id, wp.n_insns);
+        /* Terminal-branch direction/target (CST_FID_BRANCH_*) for this WP
+         * block, decoded directly (displacement reconstructed to an absolute
+         * successor PC).  Suffix, so a non-branch WP block keeps the
+         * historical line. */
+        char wbr[48];
+        wbr[0] = '\0';
+        if (wp.branch.valid) {
+            std::snprintf(wbr, sizeof(wbr), " branch=%s target=0x%" PRIx64,
+                          wp.branch.taken ? "taken" : "not-taken",
+                          wp.branch.target);
+        }
+        std::fprintf(out, "  wp[%u] template=BB%u n_insns=%u%s\n",
+                     wp.index, wp.template_id, wp.n_insns, wbr);
         std::string status = compute_legacy_wp_status(wp);
         if (!status.empty()) {
             std::fprintf(out, "    status: %s\n", status.c_str());
@@ -2312,8 +2323,9 @@ void print_usage(FILE *err, const char *argv0)
         "  --verify-branch[=N]  cross-check each branch-terminated CP\n"
         "                    entry's CST_FID_BRANCH_* against the\n"
         "                    successor-derived direction/target (the next\n"
-        "                    same-thread entry's start_pc); exit 1 on any\n"
-        "                    mismatch.  =N caps the entries walked\n",
+        "                    same-thread entry's start_pc), and each WP block\n"
+        "                    in-chain (the next block's start_pc); exit 1 on\n"
+        "                    any mismatch.  =N caps the entries walked\n",
         argv0);
 }
 
@@ -2439,7 +2451,12 @@ int run_body_render(const Options &opts, const cst::Header &h,
  * to decode ahead for).  Per-context tracking tolerates multi-vCPU
  * interleaving; a fault handler interposed on the same thread (system mode)
  * legitimately breaks the successor identity and is reported for inspection.
- * Returns 0 iff every checked entry agreed.
+ *
+ * WP chain blocks are cross-checked in-chain: a block's decoded target/
+ * direction must match the NEXT chain block's start_pc (the whole excursion
+ * is one CP entry's payload, so the successor is in-chain with no lookahead).
+ * The chain's last block has no in-chain successor and is left unchecked.
+ * Returns 0 iff every checked CP entry and WP block agreed.
  */
 int run_verify_branch(const Options &opts, const cst::Header &h,
                       cst::CstFile &cf,
@@ -2462,6 +2479,11 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
 
     uint64_t n_checked = 0, n_target_mism = 0, n_taken_mism = 0;
     uint64_t n_branch = 0, n_nonbranch = 0;
+    /* WP blocks are cross-checked in-chain: block w's decoded target/
+     * direction against block w+1's start_pc (the chain's last block has no
+     * in-chain successor and is not checked). */
+    uint64_t n_wp_branch = 0, n_wp_checked = 0;
+    uint64_t n_wp_target_mism = 0, n_wp_taken_mism = 0;
     std::string examples;
     int ex_count = 0;
 
@@ -2518,6 +2540,50 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
         }
         prev_by_ctx[ctx] = np;
         if (e.branch.valid) n_branch++; else n_nonbranch++;
+
+        /* WP in-chain cross-check.  Within one excursion the whole chain is
+         * this entry's payload, so block w's successor is block w+1's
+         * start_pc with no lookahead barrier.  Verify each non-final block's
+         * decoded target/direction against it; the chain's last block has no
+         * in-chain successor and is left unchecked. */
+        for (size_t w = 0; w < e.wp_entries.size(); w++) {
+            if (e.wp_entries[w].branch.valid) n_wp_branch++;
+        }
+        for (size_t w = 0; w + 1 < e.wp_entries.size(); w++) {
+            const cst::WPEntry &wp = e.wp_entries[w];
+            if (!wp.branch.valid) continue;
+            const cst::Template *wt = get_tmpl(wp.template_id);
+            const cst::Template *wn = get_tmpl(e.wp_entries[w + 1].template_id);
+            if (!wt || !wn) continue;
+            uint64_t succ = wn->start_pc;
+            bool wcond = false;
+            for (int j = (int)wt->insns.size() - 1; j >= 0; j--) {
+                if (wt->insns[j].branch_type != 0) {
+                    wcond = wt->insns[j].branch_conditional;
+                    break;
+                }
+            }
+            bool exp_taken = (succ != wt->fall_through_pc);
+            if (!wcond) exp_taken = true;
+            bool tmism = (wp.branch.target != succ);
+            bool dmism = (wp.branch.taken != exp_taken);
+            n_wp_checked++;
+            if (tmism) n_wp_target_mism++;
+            if (dmism) n_wp_taken_mism++;
+            if ((tmism || dmism) && ex_count < 20) {
+                char buf[320];
+                std::snprintf(buf, sizeof(buf),
+                    "  tid=%u asid=%u wp[%zu]=BB%u: FID target=0x%llx taken=%d"
+                    " | successor start=0x%llx expect_taken=%d%s%s\n",
+                    e.thread_id, e.asid, w, wp.template_id,
+                    (unsigned long long)wp.branch.target, (int)wp.branch.taken,
+                    (unsigned long long)succ, (int)exp_taken,
+                    tmism ? " [WP TARGET MISMATCH]" : "",
+                    dmism ? " [WP TAKEN MISMATCH]" : "");
+                examples += buf;
+                ex_count++;
+            }
+        }
     });
 
     bool stopped_early =
@@ -2529,15 +2595,24 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
         "%llu non-branch; cross-checked %llu against successor-derived "
         "target/direction\n"
         "  target mismatches: %llu\n"
-        "  taken  mismatches: %llu\n",
+        "  taken  mismatches: %llu\n"
+        "WP branch self-check: %llu branch-terminated WP blocks; "
+        "cross-checked %llu in-chain (next block's start_pc)\n"
+        "  WP target mismatches: %llu\n"
+        "  WP taken  mismatches: %llu\n",
         (unsigned long long)n_branch, (unsigned long long)n_nonbranch,
         (unsigned long long)n_checked,
         (unsigned long long)n_target_mism,
-        (unsigned long long)n_taken_mism);
+        (unsigned long long)n_taken_mism,
+        (unsigned long long)n_wp_branch,
+        (unsigned long long)n_wp_checked,
+        (unsigned long long)n_wp_target_mism,
+        (unsigned long long)n_wp_taken_mism);
     if (!examples.empty()) {
         std::fprintf(stdout, "first mismatches:\n%s", examples.c_str());
     }
-    return (n_target_mism == 0 && n_taken_mism == 0) ? 0 : 1;
+    return (n_target_mism == 0 && n_taken_mism == 0 &&
+            n_wp_target_mism == 0 && n_wp_taken_mism == 0) ? 0 : 1;
 }
 
 int run(const Options &opts)

@@ -200,7 +200,10 @@ _ENTRY_HEAD_RE = re.compile(
     r"(?: branch=(?:taken|not-taken) target=0x[0-9a-f]+)?$"
 )
 _WP_HEAD_RE = re.compile(
-    r"^  wp\[(\d+)\] template=BB(\d+) n_insns=(\d+)$"
+    r"^  wp\[(\d+)\] template=BB(\d+) n_insns=(\d+)"
+    # Terminal-branch direction/target (CST_FID_BRANCH_*), now carried on WP
+    # blocks too.  Non-capturing so group indices 1..3 are unchanged.
+    r"(?: branch=(?:taken|not-taken) target=0x[0-9a-f]+)?$"
 )
 _LOAD_RE  = re.compile(
     r"^( +)insn\[(\d+)\] load=0x([0-9a-f]+)"

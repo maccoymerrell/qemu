@@ -2958,18 +2958,30 @@ static void emit_field_delta_section(BitWriter *main_bw,
         }
 
         /* Branch-outcome singletons (CST_FID_BRANCH_TAKEN / _TARGET).  Once
-         * per entry, on the terminating branch of a branch-terminated BB,
-         * when the successor is known (see BodyEntry / WPBBEntry
+         * per entry, on the terminating branch of a branch-terminated BB —
+         * on BOTH the correct path and every wrong-path chain block — when
+         * the successor is known (see BodyEntry / WPBBEntry
          * branch_successor_*).  A page-split continuation (no branch) or the
          * segment-final flush stages neither, so those entries carry no
-         * direction/target.  Target = the architectural successor (== the
-         * next entry's start_pc); taken = it diverged from the fall-through,
-         * with unconditional terminators always "taken" — identical to
-         * profile_branch's classification and to the decoder's
-         * successor-derived cross-check.  Delta-encoded against the branch
-         * insn's own prior value (default 0): a static direct branch costs
-         * zero record bytes after its first sighting; cost concentrates in
-         * indirect targets and direction flips. */
+         * direction/target.
+         *
+         * TAKEN  = the successor diverged from the template's fall-through,
+         *          with unconditional terminators always "taken" — identical
+         *          to profile_branch's classification and to the decoder's
+         *          successor-derived cross-check.
+         * TARGET = the branch's landing PC encoded as a SIGNED DISPLACEMENT
+         *          from the branch instruction's own PC (successor -
+         *          branch_pc), NOT the raw PC.  A direct branch's displacement
+         *          is a tiny sleb even on its first sighting; an indirect
+         *          target is still far smaller than a full 64-bit PC.  The
+         *          decoder reconstructs successor = branch_pc + displacement.
+         *
+         * Both delta-encode against the branch insn's own prior value
+         * (default 0) through the same overlay as every other family: on the
+         * correct path that is cp_state; on the wrong path it is
+         * wp_state -> wp_base(CP) -> default, exactly like LOAD_ADDR, so a WP
+         * branch repeating a CP or earlier-WP displacement costs zero record
+         * bytes and WP overhead tracks CP overhead. */
         if (ev->branch_known && ev->tmpl) {
             int bidx = TemplateStore::template_branch_index(ev->tmpl);
             if (bidx >= 0) {
@@ -2977,9 +2989,14 @@ static void emit_field_delta_section(BitWriter *main_bw,
                 uint64_t target = ev->branch_successor_pc;
                 bool taken = (target != ev->tmpl->fall_through_pc);
                 if (!bf->branch_conditional) taken = true;
+                uint64_t branch_pc = ev->tmpl->insn_pcs
+                    ? ev->tmpl->insn_pcs[bidx] : ev->tmpl->start_pc;
+                /* Signed displacement held two's-complement in a u64; the
+                 * delta model sleb-encodes it small in either direction. */
+                uint64_t disp = target - branch_pc;
                 STAGE_U64((uint32_t)bidx, CST_FID_BRANCH_TAKEN,
                           (uint64_t)(taken ? 1 : 0), 0);
-                STAGE_U64((uint32_t)bidx, CST_FID_BRANCH_TARGET, target, 0);
+                STAGE_U64((uint32_t)bidx, CST_FID_BRANCH_TARGET, disp, 0);
             }
         }
 #undef STAGE_U64
@@ -3290,11 +3307,16 @@ static void emit_body_record_payload(
             uint32_t wp_tmpl = wp->template_id;
             bw_write_sleb128(&sub, (int64_t)wp_tmpl - prev_wp_template);
             prev_wp_template = wp_tmpl;
-            /* WP entries carry no CST_FID_BRANCH_* (CP-only); branch_known
-             * defaults false in BBDeltaInput, so none are staged. */
+            /* WP branch-outcome singletons ride here too: the WP block's
+             * successor (walker's commit_post_pc) is threaded through so the
+             * CST_FID_BRANCH_* deltas resolve against wp_state -> wp_base(CP)
+             * -> default — the same overlay LOAD_ADDR uses — instead of a
+             * fresh baseline per chain. */
             emit_one_bb_delta_with_base(&sub, st, wp_state, wp_base,
                                         {wp_tmpl, wp->tmpl,
-                                         &wp->dyn_params, &wp->reg_snaps},
+                                         &wp->dyn_params, &wp->reg_snaps,
+                                         wp->branch_successor_known,
+                                         wp->branch_successor_pc},
                                         true, entry->cpu_index);
         }
         bw_byte_align(&sub);

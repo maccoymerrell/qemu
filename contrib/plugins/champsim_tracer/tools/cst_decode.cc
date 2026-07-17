@@ -693,12 +693,14 @@ std::vector<WPEntry> BodyWalker::decode_wp_chain(
         if (!wtmpl && wp_tmpl != 0) {
             lint_.note_dangling((uint32_t)wp_tmpl, /*is_wp=*/true);
         }
-        /* No branch out-param: the CST_FID_BRANCH_* singletons are CP-only,
-         * so a WP entry never carries them (we.branch stays valid=false). */
+        /* WP blocks now carry the CST_FID_BRANCH_* singletons too, decoded
+         * into we.branch (displacement reconstructed against the template
+         * insn PC, same as CP).  The successor is the next chain block's
+         * start_pc, so --verify-branch can cross-check it in-chain. */
         decode_field_delta(wpb, (uint32_t)wp_tmpl, wtmpl,
                            state, base_state,
                            &we.dyn_params, &we.reg_snaps, &we.metaflags,
-                           &we.lane_masks, /*lint=*/nullptr);
+                           &we.lane_masks, /*lint=*/nullptr, &we.branch);
         out.push_back(std::move(we));
     }
     return out;
@@ -1258,15 +1260,18 @@ void BodyWalker::decode_field_delta(Reader &outer,
     }
 
     /* Branch-outcome singletons (CST_FID_BRANCH_TAKEN / _TARGET).  Exposed
-     * directly per entry, with no successor look-ahead: locate the
-     * terminating branch exactly as the writer does (highest-indexed
-     * branch-type insn — n-1 normally, n-2 on a delay-slot tail), then read
-     * its two persisted cells.  Direction/target ride the branch insn's
-     * position through the same delta model as METAFLAGS, so a static direct
-     * branch simply keeps its last value.  valid iff the template ends in a
-     * branch AND the trace advertises both FIDs; a pre-branch writer resolves
-     * them to the absent sentinel (>= FID_LUT_SIZE), so the block is skipped
-     * and no direction/target is surfaced for such a trace. */
+     * directly per entry (CP) and per WP chain block, with no successor
+     * look-ahead: locate the terminating branch exactly as the writer does
+     * (highest-indexed branch-type insn — n-1 normally, n-2 on a delay-slot
+     * tail), then read its two persisted cells.  Direction/target ride the
+     * branch insn's position through the same delta model as METAFLAGS, so a
+     * static direct branch simply keeps its last value.  BRANCH_TARGET is a
+     * SIGNED DISPLACEMENT from the branch insn's own PC, so the absolute
+     * successor is reconstructed as branch_pc + displacement (branch_pc is
+     * the template insn's PC).  valid iff the template ends in a branch AND
+     * the trace advertises both FIDs; a pre-branch writer resolves them to
+     * the absent sentinel (>= FID_LUT_SIZE), so the block is skipped and no
+     * direction/target is surfaced for such a trace. */
     if (branch && ids.fid_branch_taken  < FID_LUT_SIZE
                && ids.fid_branch_target < FID_LUT_SIZE) {
         int bidx = -1;
@@ -1279,9 +1284,10 @@ void BodyWalker::decode_field_delta(Reader &outer,
             branch->taken  = lookup_cell(state_blk, state_gen,
                                          base_blk, base_gen, slot_lut_,
                                          bi, ids.fid_branch_taken).low64() != 0;
-            branch->target = lookup_cell(state_blk, state_gen,
+            uint64_t disp  = lookup_cell(state_blk, state_gen,
                                          base_blk, base_gen, slot_lut_,
                                          bi, ids.fid_branch_target).low64();
+            branch->target = tmpl->insns[bi].pc + disp;
         }
     }
 }

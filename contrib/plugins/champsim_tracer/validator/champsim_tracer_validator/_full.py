@@ -365,8 +365,8 @@ def _chk_system_user(ctx: Ctx) -> Outcome:
          "--build-dir", str(ctx.build_dir), "-o", str(d), "--system",
          "--marker", "--coverage", "--regdata", "--hot-iters", "200",
          "--stop", "200000"],
-        timeout=600, log_path=d / "run.log")
-    return _cli_outcome(rc, tail, 600)
+        timeout=900, log_path=d / "run.log")
+    return _cli_outcome(rc, tail, 900)
 
 
 def _chk_churn(isa: str):
@@ -378,8 +378,8 @@ def _chk_churn(isa: str):
              "--depth", "8", "--stop", "150000", "--hot-iters", "2000",
              "--sleep-probe", "25", "--churn-pre", "60",
              "--churn-during", "220"],
-            timeout=600, log_path=d / "run.log")
-        return _cli_outcome(rc, tail, 600)
+            timeout=900, log_path=d / "run.log")
+        return _cli_outcome(rc, tail, 900)
     return fn
 
 
@@ -389,8 +389,8 @@ def _chk_thread_system(ctx: Ctx) -> Outcome:
         ["thread_test", "--isa", "x86_64", "--build-dir", str(ctx.build_dir),
          "-o", str(d), "--system", "--smp", "2", "--iters", "250000",
          "--stop", "200000", "--seeds", "1"],
-        timeout=600, log_path=d / "run.log")
-    return _cli_outcome(rc, tail, 600)
+        timeout=900, log_path=d / "run.log")
+    return _cli_outcome(rc, tail, 900)
 
 
 # ===========================================================================

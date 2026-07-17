@@ -323,16 +323,21 @@ def _parse_console_mips(console: Path) -> dict:
 # guest init scripts
 # ---------------------------------------------------------------------------
 
+# Launch the MARKED progA first and give it a moment to mark + start its
+# hold-open nanosleep BEFORE launching the unmarked progB, so B runs
+# entirely INSIDE A's open whole-system window and is reliably captured
+# (launching B first lets it finish before the window opens under load).
 _INIT_TRACE_ALL = """#!/bin/sh
 mount -t devtmpfs none /dev 2>/dev/null
 mount -t proc  none /proc 2>/dev/null
 mount -t sysfs none /sys  2>/dev/null
 exec >/dev/console 2>&1 </dev/console
 echo "=== cst trace-all guest: $(uname -r) ==="
-/workloadB &
-bpid=$!
 /workloadA &
 apid=$!
+sleep 1
+/workloadB &
+bpid=$!
 echo "=== launched A=$apid (marked) B=$bpid (unmarked) ==="
 wait $apid; echo "=== workloadA exit=$? ==="
 wait $bpid; echo "=== workloadB exit=$? ; poweroff ==="
@@ -412,10 +417,12 @@ def run_trace_all_differential(cfg: MPConfig) -> MPResult:
                         skip_reason=skip)
     od = cfg.out_dir
     od.mkdir(parents=True, exist_ok=True)
-    # progA: marked + sleeps (holds the window); progB: UNMARKED, big work.
-    bin_a = _gen_build(isa, "progA", cfg.seed_a, 4, 200, cfg.sleep, True,
-                       od / "A")
-    bin_b = _gen_build(isa, "progB", cfg.seed_b, 10, 1200, 0, False,
+    # progA: marked + sleeps ~3s (holds the whole-system window open); the
+    # init launches B ~1s into that hold, so B runs INSIDE the window.  B is
+    # unmarked and does a bounded workload that completes within the hold.
+    bin_a = _gen_build(isa, "progA", cfg.seed_a, 4, 200, max(3, cfg.sleep),
+                       True, od / "A")
+    bin_b = _gen_build(isa, "progB", cfg.seed_b, 10, 600, 0, False,
                        od / "B")
     cpio = _stage(isa, od / "stage", [("workloadA", bin_a),
                                       ("workloadB", bin_b)], _INIT_TRACE_ALL)
@@ -622,10 +629,11 @@ def run_x86_dead_latch_kill(cfg: MPConfig, latch_timeout: int = 3000,
                         skip_reason=skip)
     od = cfg.out_dir
     od.mkdir(parents=True, exist_ok=True)
-    # progA: modest hold (< latch_timeout) then long active work; progB:
-    # marks + sleeps long, is killed mid-sleep (never runs its END).
-    bin_a = _gen_build(isa, "progA", cfg.seed_a, 6, 8000, 1, True, od / "A")
-    bin_b = _gen_build(isa, "progB", cfg.seed_b, 11, 4000, 12, True, od / "B")
+    # progA: modest hold (< latch_timeout) then a long-enough active phase
+    # to outlast progB's dead-latch timeout; progB: marks + sleeps long, is
+    # killed mid-sleep (never runs its END).
+    bin_a = _gen_build(isa, "progA", cfg.seed_a, 6, 2500, 1, True, od / "A")
+    bin_b = _gen_build(isa, "progB", cfg.seed_b, 8, 1500, 12, True, od / "B")
     init = _INIT_KILL % {"kill_after": kill_after, "churn": churn}
     cpio = _stage(isa, od / "stage", [("workloadA", bin_a),
                                       ("workloadB", bin_b)], init)

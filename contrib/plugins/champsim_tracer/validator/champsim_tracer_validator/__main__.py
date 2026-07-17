@@ -26,6 +26,7 @@ from . import generator as G
 from . import analyzer as A
 from . import validator as V
 from . import _system as SYS
+from . import _full as FULL
 
 
 ISA_CHOICES = ("x86_64", "aarch64", "riscv64", "mipsel")
@@ -342,6 +343,9 @@ def _parse_args() -> argparse.Namespace:
                          "300 iterations comfortably roll MIPS's 8-bit "
                          "ASID space inside the sleep window).")
     system_args(ct)
+
+    # full — the ONE unified entrypoint (tiers + coverage map + one code).
+    FULL.add_parser(sub)
 
     return p.parse_args()
 
@@ -1096,6 +1100,8 @@ def main() -> int:
         return cmd_thread_test(args)
     if args.cmd == "churn_test":
         return cmd_churn_test(args)
+    if args.cmd == "full":
+        return FULL.cmd_full(args)
     return 2
 
 

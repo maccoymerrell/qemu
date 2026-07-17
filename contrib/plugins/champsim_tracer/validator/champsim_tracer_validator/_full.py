@@ -297,12 +297,18 @@ def _chk_wpprune(ctx: Ctx) -> Outcome:
 
 
 def _chk_symbol(ctx: Ctx) -> Outcome:
-    """Exercise trace_window=symbol.  If the plugin opens the window we
-    validate it; if the plugin never triggers (a known plugin-side issue —
-    the symbol trigger reads cur_tb_tmpl->symbol_name, which is null before a
-    segment is active, so the window never opens even for _start) we SKIP
-    with a precise diagnostic rather than emit a false FAIL."""
+    """Exercise trace_window=symbol end-to-end.  The plugin MUST open a
+    segment at the requested symbol occurrence, trace the simulation
+    instructions, and decode with the correct start symbol; the trace is
+    then validated (errors=0).  Also asserts the occurrence counter
+    advances — occurrence=2 on a hot symbol opens strictly later than
+    occurrence=1.  A non-triggering plugin is a FAIL, not a skip: this
+    check gates against the pre-segment symbol-trigger regression (the
+    trigger ran only in the vcpu_tb_exec callback, which is JIT-gated off
+    until a segment is active, so it never fired before the first open)."""
+    from collections import Counter
     from . import __main__ as M
+    import json
     d = ctx.dir("quick_symbol")
     args = _mk(out_dir=d, isa=["x86_64"], build_dir=ctx.build_dir,
                prog="sym", seed=ctx.seed, diamonds=8, hot_iters=300)
@@ -312,30 +318,69 @@ def _chk_symbol(ctx: Ctx) -> Outcome:
     bin_path = d / "sym_x86_64"
     out_base = d / "sym_x86_64"
     qemu = ctx.build_dir / "qemu-x86_64"
-    opts = (f"outfile={out_base},wpdepth=64,"
-            f"trace_window=symbol:name=blk_1+occurrence=1+simulation=100000,"
-            f"memdata=1")
-    subprocess.call([str(qemu), "-plugin", f"{ctx.plugin},{opts}",
-                     str(bin_path)], stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL)
+
+    def run_symbol(name: str, occ: int, out_tag: Path, sim: int) -> int | None:
+        """Trace name@occ; return the opened segment's start icount (parsed
+        from the plugin's 'starting segment ... [icount N ..]' line) or None
+        if no segment opened."""
+        opts = (f"outfile={out_tag},wpdepth=64,"
+                f"trace_window=symbol:name={name}+occurrence={occ}"
+                f"+simulation={sim},memdata=1")
+        p = subprocess.run([str(qemu), "-plugin", f"{ctx.plugin},{opts}",
+                            str(bin_path)], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, text=True)
+        m = re.search(r"starting segment '[^']*' \[icount (\d+)", p.stderr)
+        return int(m.group(1)) if m else None
+
+    # Primary: blk_1 occurrence=1 must open, trace, and validate.
+    start1 = run_symbol("blk_1", 1, out_base, sim=100_000)
     cst = Path(f"{out_base}.cst")
-    if cst.is_file():
-        args2 = _mk(out_dir=d, isa="x86_64", build_dir=ctx.build_dir,
-                    prog="sym", start_symbol="blk_1", stop=100_000)
-        M.cmd_analyze(args2, "x86_64")
-        rc = M.cmd_validate(args2, "x86_64")
-        return _rc_outcome(rc, "symbol window opened; ")
-    stats = Path(f"{out_base}.stats.log")
-    traced = ""
-    if stats.is_file():
-        import re as _re
-        m = _re.search(r"traced_icount=(\d+)", stats.read_text())
-        traced = m.group(0) if m else ""
-    return Outcome("skip",
-                   "trace_window=symbol never opened a segment "
-                   f"({traced or 'no stats'}); suspected plugin trigger bug "
-                   "(cur_tb_tmpl null before segment active) — reported "
-                   "upstream, not a validator fault")
+    if start1 is None or not cst.is_file():
+        stats = Path(f"{out_base}.stats.log")
+        traced = ""
+        if stats.is_file():
+            m = re.search(r"traced_icount=(\d+)", stats.read_text())
+            traced = m.group(0) if m else ""
+        return Outcome("fail",
+                       "trace_window=symbol never opened a segment for blk_1 "
+                       f"({traced or 'no stats'}) — symbol-trigger regression")
+    args2 = _mk(out_dir=d, isa="x86_64", build_dir=ctx.build_dir,
+                prog="sym", start_symbol="blk_1", stop=100_000)
+    M.cmd_analyze(args2, "x86_64")
+    rc = M.cmd_validate(args2, "x86_64")
+    if rc != 0:
+        return _rc_outcome(rc, "blk_1 symbol window opened but validation "
+                               "failed; ")
+
+    # Occurrence counter: a hot symbol's occurrence=2 opens strictly later
+    # than occurrence=1.  Pick hot blocks (>=2 correct-path visits) from the
+    # meta and use the first whose occurrence=1 actually opens (diamond
+    # blocks are branch targets, hence TB heads, but be defensive).
+    meta = json.loads((d / "sym_x86_64.meta.json").read_text())
+    hot = [bid for bid, n in Counter(meta.get("correct_path") or []).most_common()
+           if n >= 2]
+    occ_detail = "occurrence advance untested (no hot symbol)"
+    for bid in hot[:6]:
+        sym = f"blk_{bid}"
+        a = run_symbol(sym, 1, d / "sym_occ1", sim=2000)
+        if a is None:
+            continue
+        b = run_symbol(sym, 2, d / "sym_occ2", sim=2000)
+        if b is None:
+            return Outcome("fail",
+                           f"symbol {sym} opened at occurrence=1 (icount {a}) "
+                           "but occurrence=2 never opened")
+        if b <= a:
+            return Outcome("fail",
+                           f"symbol occurrence counter did not advance: {sym} "
+                           f"occ1 icount={a}, occ2 icount={b} (expected "
+                           "occ2 > occ1)")
+        occ_detail = f"{sym} occ1={a} < occ2={b}"
+        break
+
+    return Outcome("pass",
+                   f"symbol window opened & validated (blk_1 @ icount "
+                   f"{start1}); {occ_detail}")
 
 
 def _chk_tbflush(ctx: Ctx) -> Outcome:

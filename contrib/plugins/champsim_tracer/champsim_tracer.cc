@@ -3545,9 +3545,13 @@ static void tw_manage_window(unsigned int cpu_index,
         }
         if (g_window_mode == PluginConfig::WIN_SYMBOL &&
             !g_trace_segments.is_active() && start_symbol) {
-            /* cur_tb_tmpl IS the executing TB's template (passed
-             * straight from the caller's per-TB udata); no start_pc
-             * lookup needed. */
+            /* cur_tb_tmpl IS the executing TB's head-fragment template (its
+             * per-TB udata); no start_pc lookup needed.  Pre-segment this is
+             * delivered by vcpu_tb_check_budget (the heavy vcpu_tb_exec cb is
+             * gated off until a segment is active), so the occurrence counter
+             * advances here on the budget slow path — once open, the same
+             * pointer arrives via events_path_step, but is_active() is then
+             * true and this branch is skipped. */
             BBTemplate *cur_tmpl = cur_tb_tmpl;
             if (cur_tmpl && cur_tmpl->symbol_name &&
                 cst_str_eq(cur_tmpl->symbol_name, start_symbol)) {
@@ -3679,7 +3683,6 @@ static void tw_manage_window(unsigned int cpu_index,
  * which re-triggers this cb cleanly post-WP. */
 static void vcpu_tb_check_budget(unsigned int cpu_index, void *udata)
 {
-    (void)udata;
     if (g_wp_state.in_progress) {
         /* No-op inside WP; spec-mode TB inline_adds will keep firing
          * this cb on every spec TB until WP restores the saved
@@ -3725,10 +3728,19 @@ static void vcpu_tb_check_budget(unsigned int cpu_index, void *udata)
         return;
     }
     g_host_icount = icount_now;
-    /* tw_manage_window handles both icount-mode and simpoint-mode
-     * open/close logic.  Passing icount_now (post-inline-add value)
-     * matches BBV's "count past threshold" semantics. */
-    tw_manage_window(cpu_index, icount_now, nullptr);
+    /* tw_manage_window handles icount-, simpoint-, symbol- and marker-mode
+     * open/close logic.  Passing icount_now (post-inline-add value) matches
+     * BBV's "count past threshold" semantics.
+     *
+     * udata is the executing TB's head fragment (baked into this cond_cb's
+     * registration, same pointer the vcpu_tb_exec cond_cb gets).  It is
+     * load-bearing for WIN_SYMBOL: pre-segment the heavy vcpu_tb_exec cb is
+     * gated OFF (trace_this_ctx==0), so this budget cb — armed for every TB
+     * once recompute_next_threshold parks the symbol/marker threshold at 0
+     * ("every TB must take the slow path") — is the ONLY path that can see
+     * the executing TB's resolved symbol name and advance the start-symbol
+     * occurrence counter before a segment opens.  Other modes ignore it. */
+    tw_manage_window(cpu_index, icount_now, (BBTemplate *)udata);
     /* Re-arm the budget for the next event.  In-segment: sentinel
      * (won't fire while is_active=1 dispatches to vcpu_tb_exec for
      * close detection).  Inter-segment: countdown to next eff_start. */
@@ -6078,10 +6090,16 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * g_simpoint_close_pending and never clears is_active here, so
      * vcpu_tb_exec still fires and emits the closing TB's entry. */
     if (!ff_coarse_kernel_tb) {
+        /* udata = this TB's head fragment.  In WIN_SYMBOL the threshold is
+         * parked at 0 so this cb fires for every pre-segment TB; it forwards
+         * the head fragment to tw_manage_window, which reads its resolved
+         * symbol_name to advance the start-symbol occurrence counter (the
+         * heavy vcpu_tb_exec cb that used to do this is gated off until a
+         * segment is active).  Other modes ignore the udata. */
         qemu_plugin_register_vcpu_tb_exec_cond_cb(
             tb, vcpu_tb_check_budget, QEMU_PLUGIN_CB_NO_REGS,
             QEMU_PLUGIN_COND_GE, g_scoreboard.budget, (1ULL << 63),
-            nullptr);
+            (void *)head_fragment);
     }
     /* Light re-acquisition probe (narrow-ASID system pins only).  Gated
      * on pin_probe and registered BEFORE the heavy callback so that on

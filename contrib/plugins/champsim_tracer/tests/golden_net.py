@@ -244,7 +244,11 @@ def capture(build: Path, root: Path) -> int:
     if GOLDEN_TRACES.exists():
         shutil.rmtree(GOLDEN_TRACES)   # drop any stale frozen traces
     GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
-    manifest = {"cells": {}, "svg": {}, "svg_fixtures": {}, "excluded": {}}
+    # Record the capture-time work root: the path is a wire INPUT (guest
+    # argv[0]/AT_EXECFN sizes set the stack base -> REG_SP), so a check
+    # under any other root is structurally red.  check() enforces this.
+    manifest = {"work_root": str(root), "cells": {}, "svg": {},
+                "svg_fixtures": {}, "excluded": {}}
     bad = 0
     # Determinism pre-check: trace each cell N_DET times to the SAME out-dir
     # (check uses the identical path) and only record a golden for cells
@@ -330,6 +334,18 @@ def check(build: Path, root: Path) -> int:
         print(f"no manifest at {MANIFEST}; run capture first", file=sys.stderr)
         return 2
     manifest = json.loads(MANIFEST.read_text())
+    # The work root is a wire input (its length sets the guest stack base
+    # via argv[0]/AT_EXECFN -> the REGFILE REG_SP): checking under a
+    # different root than capture is a guaranteed all-cells hash red that
+    # says nothing about the tracer.  Fail it loudly as a HARNESS error.
+    cap_root = manifest.get("work_root")
+    if cap_root is not None and cap_root != str(root):
+        print(f"work-root mismatch: manifest captured under {cap_root}, "
+              f"check invoked under {root}.  The path length feeds the "
+              f"guest stack base (REG_SP), so hashes cannot match; re-run "
+              f"with --work-root {Path(cap_root).parent} or re-capture.",
+              file=sys.stderr)
+        return 2
     if root.exists():
         shutil.rmtree(root)
     fails, validate_fails = [], []
@@ -411,8 +427,19 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("mode", choices=("capture", "check"))
     ap.add_argument("--build-dir", type=Path, required=True)
-    ap.add_argument("--work-root", type=Path, default=Path("/tmp/ct_golden"),
-                    help="scratch dir for generated workloads/traces")
+    # Default matches the full harness's canonical GOLDEN_WORK_ROOT
+    # (validator/_full.py).  The work-root path appears in the qemu argv
+    # AND on the guest stack (argv[0] + AT_EXECFN), so its LENGTH shifts
+    # the guest stack base and with it the REGFILE record's REG_SP — a
+    # manifest captured under one root is byte-red under any other.  A
+    # /tmp default invited exactly that capture/check split (and /tmp is
+    # the wrong disk for run outputs on this host); default to the one
+    # canonical root instead.
+    ap.add_argument("--work-root", type=Path,
+                    default=Path("/mnt/md0/QEMU/cst_runs/valunify/golden_wr"),
+                    help="scratch dir for generated workloads/traces; MUST "
+                         "be the same path at capture and check (recorded "
+                         "in the manifest and enforced)")
     args = ap.parse_args()
     build = args.build_dir
     if not cst_decode_bin(build).exists():

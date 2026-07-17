@@ -2737,6 +2737,37 @@ static void emit_field_delta_section(BitWriter *main_bw,
                      state_block, state_generation, \
                      base_block, base_generation, \
                      ev, (I), (FID), (FD), (SLOT), (CUR))
+/* Physical-page staging under the IFRAME contract (9be3b92820): the IFRAME
+ * must reproduce the decoder's materialised running state.  A memop with no
+ * observable translation (ppage_valid=false) emits no record, and the
+ * decoder's ENTRY materialisation then reads the running cell — the last
+ * real translation — as this memop's ppage.  BACKFILL that running value
+ * into the dyn param here: on the persistent (ENTRY) pass the read IS the
+ * running state at exactly this position in the CP/WP staging sequence
+ * (mid-chain correct), and re-staging it would be a zero delta, so the
+ * ENTRY wire is byte-identical; the subsequent IFRAME re-encode of the same
+ * entry then stages the backfilled value absolutely against its fresh
+ * scratch, decoding to precisely what the ENTRY side materialised.  A cell
+ * that never saw a real translation reads 0 / misses and stays omitted on
+ * both sides (has_ppage=false in both decodes).  The cast is sound: the
+ * slot view points into the entry's own non-const dyn_params storage. */
+#define STAGE_PPAGE(I, FID, DP) \
+    do { \
+        if ((DP)->ppage_valid) { \
+            STAGE_U64((I), (FID), (DP)->ppage, 0); \
+        } else { \
+            uint64_t run_; \
+            FidLoc ploc_ = field_state_loc(FID); \
+            if ((field_state_get_scalar(state_block, state_generation, \
+                                        (I), ploc_, &run_) || \
+                 field_state_get_scalar(base_block, base_generation, \
+                                        (I), ploc_, &run_)) && run_ != 0) { \
+                DynParam *mdp_ = (DynParam *)(DP); \
+                mdp_->ppage = run_; \
+                mdp_->ppage_valid = true; \
+            } \
+        } \
+    } while (0)
 
         /* Pre-resolve the metaflags mapper once — devirtualizes the
          * per-insn `mapper(raw)` call into a hot loop where the ISA
@@ -2826,12 +2857,14 @@ static void emit_field_delta_section(BitWriter *main_bw,
                      * when no translation was observable (ppage_valid=false:
                      * user mode, MMIO, garbage-filled wrong path) so the
                      * delta stream keeps the last real translation and an
-                     * in-page walk costs zero bytes. */
-                    if (want_physaddr && dp->ppage_valid) {
+                     * in-page walk costs zero bytes; the running value is
+                     * backfilled into the dyn param for the IFRAME re-encode
+                     * (see STAGE_PPAGE). */
+                    if (want_physaddr) {
                         uint16_t lpp_fid =
                             (uint16_t)(CST_FID_LOAD_PPAGE_BASE +
                                        s * CST_FID_PPAGE_BLOCK_STRIDE);
-                        STAGE_U64(i, lpp_fid, dp->ppage, 0);
+                        STAGE_PPAGE(i, lpp_fid, dp);
                     }
                     if (want_memdata) {
                         U512 cur = dp->data;
@@ -2860,11 +2893,11 @@ static void emit_field_delta_section(BitWriter *main_bw,
                     STAGE_U64(i, sa_fid, dp->value, 0);
                     /* Physical PAGE base (physaddr, system mode); see the
                      * load path above. */
-                    if (want_physaddr && dp->ppage_valid) {
+                    if (want_physaddr) {
                         uint16_t spp_fid =
                             (uint16_t)(CST_FID_STORE_PPAGE_BASE +
                                        s * CST_FID_PPAGE_BLOCK_STRIDE);
-                        STAGE_U64(i, spp_fid, dp->ppage, 0);
+                        STAGE_PPAGE(i, spp_fid, dp);
                     }
                     if (want_memdata) {
                         U512 cur = dp->data;
@@ -2985,6 +3018,7 @@ static void emit_field_delta_section(BitWriter *main_bw,
                 STAGE_U64((uint32_t)bidx, CST_FID_BRANCH_TARGET, disp, 0);
             }
         }
+#undef STAGE_PPAGE
 #undef STAGE_U64
 #undef STAGE_WIDE
     }

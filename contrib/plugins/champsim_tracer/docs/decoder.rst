@@ -71,7 +71,7 @@ Sample, with ``wp=1,memdata=1,regdata=1`` capture flags:
    ; simpoint_weight=1
    ; templates=31
 
-   ; ----- BB 3 entry pc=0x401740 insns=12 seq=1 tid=0 -----
+   ; ----- BB 3 entry pc=0x401740 insns=12 seq=1 tid=0 asid=0 branch=taken target=0x403d50 -----
    ; profile: exec_cp=1 exec_wp=0
    ; target[0]: pc=0x403d50 taken_cp=1 nottaken_cp=0 taken_wp=0 nottaken_wp=0
    0x000000401740 <_start+0x0>: f3 0f 1e fa              nop
@@ -79,7 +79,7 @@ Sample, with ``wp=1,memdata=1,regdata=1`` capture flags:
    0x000000401749 <_start+0x9>: 5e                       pop     %sp -> %gp4[0x1], %sp[0x78b25adff138]  ld(0x78b25adff130)=0x1  prof: memops_cp=1 pat_cp=CST_PAT_REGULAR cp=[0x78b25adff130-0x78b25adff130]
    0x000000401751 <_start+0x11>: 50                       push    %gp0, %sp -> %sp[0x78b25adff128]  st(0x78b25adff128)=0x0
    0x00000040175f <_start+0x1f>: 67 e8 eb 25 00 00        jmp     $0x403d50, %sp, %ip -> %sp[0x78b25adff118], %ip[0x403d50]  st(0x78b25adff118)=0x401765
-   ; ----- BB 5 entry pc=0x403d50 insns=22 seq=2 tid=0 -----
+   ; ----- BB 5 entry pc=0x403d50 insns=22 seq=2 tid=0 asid=0 branch=not-taken target=0x403d9b -----
    ...
    0x000000403d99 <__libc_start_main_impl+0x49>: 75 f5                    jcc     $0x403d90, %flags, %ip -> %ip[0x403d90]  # 0x403d9b <__libc_start_main_impl>
 
@@ -127,20 +127,50 @@ Captured per-instruction data is folded into the operand line:
   (and ``,w<n>`` inside the parentheses of an address-only memop)
   gives the access byte width — the ``CST_FID_LOAD_SIZE`` /
   ``CST_FID_STORE_SIZE`` field — for value-prediction consumers.
-* ``# <target> <symbol+offset>`` trailing comment — branch
-  target captured from the ``REG_IP`` snapshot post-execution,
-  with the matching symbol name when known.
+* ``pa=0x<paddr>`` — the reconstructed physical address of the memop,
+  present only in ``physaddr=1`` system-mode traces.  It is the
+  recorded physical page base (``CST_FID_LOAD_PPAGE`` /
+  ``CST_FID_STORE_PPAGE``) ORed with the virtual in-page offset.
+  Absent for a memop with no observed translation and from every
+  user-mode or non-``physaddr`` trace.
+* ``# 0x<target> <symbol+offset>`` trailing comment — the branch's
+  landing PC, decoded from the per-entry ``CST_FID_BRANCH_TAKEN`` /
+  ``CST_FID_BRANCH_TARGET`` singletons (the encoded target = branch PC
+  + signed displacement), with the matching symbol name when known.
+  Because it is the encoded architectural successor, it is correct
+  exactly where an immediate-derived guess is not — ARM ``tbz`` /
+  ``tbnz`` (whose immediate is a bit index, not the label) and any
+  branch diverted by a fault or interrupt.  Only for a trace predating
+  the branch FIDs does the decoder fall back to the immediate-based
+  template target.
 
 Basic-block boundaries are marked by a single
 ``; ----- BB <template_id> entry pc=<pc> insns=<n> seq=<seq>
-tid=<n> -----`` separator line (note the ``;`` prefix so it
-groups with the header comments).  Wrong-path entries are
-attached to their parent CP entry's WP chain and rendered with
-the same per-instruction format under a separate
+tid=<n> asid=<n>[ (thread_switch)][ fault_depth=<n>][ branch=taken|not-taken
+target=0x<pc>] -----`` separator line (note the ``;`` prefix so it
+groups with the header comments).  The ``asid`` field is the entry's
+address-space id; ``(thread_switch)`` marks an entry that changed
+thread; ``fault_depth=<n>`` appears inside a synchronous fault handler;
+and ``branch=…/target=…`` carries the terminal branch's direction and
+landing PC, decoded straight from the branch singletons with no
+successor look-ahead.  Wrong-path entries are attached to their parent
+CP entry's WP chain and rendered with the same per-instruction format
+under a separate
 ``; ..... wp[k] BB <id> n_insns=<n> [status=...] -----``
 separator (the ``status=FAULT@insn<n>`` suffix appears when the
-WP simulator hit a fault on a non-terminating instruction
-inside that chain entry).
+WP simulator hit a synthetic-data fault on a non-terminating
+instruction inside that chain entry).
+
+A system-mode trace interleaves two out-of-band records with the
+entries in stream order.  A block-device request (``devio=1``) prints
+``; DEVIO START req=<id> read|write|flush bytes=<n> block=<lba>
+(thread=<t> asid=<a> attr=exact|pos)`` where it is issued and
+``; DEVIO STOP req=<id> (thread=<t> asid=<a>)`` where its completion
+lands — ``attr=exact`` is a doorbell-correlated owner, ``attr=pos``
+the stream-position fallback, and the STOP inherits its START's owner.
+An address-space rebase (``BODY_TAG_ASID_SWITCH``) is not rendered as
+its own disasm line; it takes effect in the ``asid=`` field of the
+next BB separator, and ``--format=raw`` shows the raw record.
 
 The run-aggregated profile block (see :doc:`concepts`,
 *Run-aggregated profile*) is rendered **as part of the BB it
@@ -309,10 +339,16 @@ list, symbol), ``instruction descriptors``, optional ``dependency
 sub-blocks``, and the run-aggregated ``template profile block``.
 The **BODY BREAKDOWN** likewise covers every body record kind: CP
 and WP entry framing and field-delta sections, WP events,
-``thread-switch records`` (one per ``BODY_TAG_THREAD_SWITCH``) and
-``REGFILE records`` (one ``BODY_TAG_REGFILE`` per thread, carrying
-that thread's initial regfile snapshot), the ``IFRAME records``
-line, and the body terminator.  The ``IFRAME records`` line appears
+``thread-switch records`` (one per ``BODY_TAG_THREAD_SWITCH``),
+``asid-switch records`` (one per ``BODY_TAG_ASID_SWITCH``), the
+``DEVIO START`` / ``DEVIO STOP`` disk-request lines (system mode with
+``devio=1``), ``REGFILE records`` (one ``BODY_TAG_REGFILE`` per
+thread, carrying that thread's initial regfile snapshot), the
+``IFRAME records`` line, and the body terminator.  The field-delta
+section is itself split per field-ID family, including a ``physical
+pages`` bucket (the ``physaddr=1`` ``CST_FID_*_PPAGE`` records) and a
+``branch outcome`` bucket (the always-present ``CST_FID_BRANCH_TAKEN``
+/ ``CST_FID_BRANCH_TARGET`` singletons).  The ``IFRAME records`` line appears
 only on traces produced with ``iframe_rate>0``; those bytes are
 pure validation overhead and disappear when the feature is off.
 

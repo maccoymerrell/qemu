@@ -226,7 +226,11 @@ per-family stride of ``CST_FID_SLOT_STRIDE`` so slot 0 of every family
 plus the hot singletons occupy the cheap low-ID range.  The lane-mask
 block follows at ``CST_FID_LANE_BLOCK_BASE`` (stride
 ``CST_FID_LANE_BLOCK_STRIDE``); the cold instruction-metadata scalars
-follow that, and ``CST_FID_EXTENDED`` is the reserved escape.
+follow that, and ``CST_FID_EXTENDED`` is the reserved escape.  After
+the escape come the physical-page block (``CST_FID_PPAGE_BLOCK_BASE``
+— the ``physaddr=1`` ``CST_FID_LOAD_PPAGE`` / ``STORE_PPAGE``
+families) and the terminal-branch block (``CST_FID_BRANCH_BLOCK_BASE``:
+``CST_FID_BRANCH_TAKEN`` / ``CST_FID_BRANCH_TARGET``).
 ``CST_FID_COUNT`` is the count sentinel.
 
 1. **Pick an ID range** in ``champsim_tracer.h`` next to the existing

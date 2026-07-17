@@ -443,6 +443,32 @@ Coverage / WP
    syscall, so downstream checks don't false-fail on the missing
    tail block.
 
+``unconditional_direction``
+   Every unconditional direct jump / direct call records its branch
+   outcome as *taken* — an unconditional branch can never fall
+   through.  A trace-wide guard on the ``CST_FID_BRANCH_TAKEN``
+   direction FID and the branch-type taxonomy that laundered-away
+   profile counts would otherwise hide.
+
+``call_return_balance``
+   Dynamic call and return counts stay in the same ballpark across the
+   trace, catching a systematic call-vs-return misclassification of the
+   branch-type map.
+
+Alongside these, the suite runs several checks that need no separate
+prose here: ``data_widths`` (the per-slot ``CST_FID_LOAD_SIZE`` /
+``STORE_SIZE`` / ``DST_REG_WIDTH`` family holds the recorded access /
+write width), ``per_execution_memop_data`` and
+``per_execution_memop_shape`` (the k-th execution carries the k-th
+expected memop sub-list, and the per-insn (loads, stores) shape is
+stable across executions), and — in system-mode runs —
+``syscall_transitions`` and ``fault_excursions`` (user→kernel→return
+privilege transitions off the ``SYSTEM`` bit, and the fault-depth
+invariants).  Not yet exercised by the harness: the ``devio`` and
+``physaddr`` record families — a trace's ``asid=`` context is parsed by
+the decode runner, but the ``BODY_TAG_ASID_SWITCH`` record and the
+disk-I/O / physical-page fields have no dedicated structural assertion.
+
 .. _validator-segmentation:
 
 Segmentation test (``simpoint_test``)

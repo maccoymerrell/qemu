@@ -24,6 +24,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 
 from .classify import get_classifier
+from . import asm_blocks as _B
 
 
 _HEX_TARGET_RE = None
@@ -263,6 +264,21 @@ def analyze(binary_path: Path, meta_path: Path) -> Path:
             gt_dict["loop_body_n_insns"] = loop_body_n_insns
             gt_dict["loop_through_n_insns"] = loop_through_n_insns
         node["ground_truth"] = gt_dict
+
+        # Dense author-intent annotation: for single-true-BB block classes
+        # that opt in (`auto_annotate`), record the generator's intended
+        # GenericOpcode / BranchType for every emitted machine instruction.
+        # Applied here — not at generate time — because the exact
+        # machine-instruction sequence (pseudo expansions resolved by the
+        # assembler) is only known once the binary is disassembled.  Hand-
+        # authored coverage probes already carry `expected_insns` and are
+        # left untouched.
+        try:
+            cls = _B.get_block(node.get("class", ""))
+        except KeyError:
+            cls = None
+        if cls is not None and getattr(cls, "auto_annotate", False):
+            _B.annotate_expected_insns(node, isa)
 
     # Record the leaf-helper insn count for ``direct_call`` /
     # ``indirect_call`` blocks.  The DirectCall/IndirectCall block

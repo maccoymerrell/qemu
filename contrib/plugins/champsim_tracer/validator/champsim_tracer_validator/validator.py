@@ -1886,14 +1886,25 @@ def _check_expected_insns(
             if bid not in counted_blocks:
                 counted_blocks.add(bid)
                 n_blocks += 1
-            expected_total = len(specs) + trailer
+            # `expected_insns_full` blocks (the dense author-intent
+            # annotator) spec EVERY machine instruction, so there is no
+            # generator-emitted trailer to carve out.  They are also matched
+            # tolerantly: a block whose true BB is exposed across more than
+            # one template (a mid-block page split, or re-entry at an
+            # interior PC) yields a partial `idxs` for some entries — those
+            # are skipped rather than flagged, since the block is still
+            # checked in full on the entry that carries the whole template.
+            full = bool(block.get("expected_insns_full"))
+            blk_trailer = 0 if full else trailer
+            expected_total = len(specs) + blk_trailer
             if len(idxs) != expected_total:
-                err("count",
-                    f"blk_{bid} ({block.get('class','?')}): declared "
-                    f"{len(specs)} insn specs + {trailer} trailer = "
-                    f"{expected_total}, trace template has {len(idxs)}",
-                    {"block_id": bid, "declared": len(specs),
-                     "trailer": trailer, "trace": len(idxs)})
+                if not full:
+                    err("count",
+                        f"blk_{bid} ({block.get('class','?')}): declared "
+                        f"{len(specs)} insn specs + {blk_trailer} trailer = "
+                        f"{expected_total}, trace template has {len(idxs)}",
+                        {"block_id": bid, "declared": len(specs),
+                         "trailer": blk_trailer, "trace": len(idxs)})
                 continue
 
             for spec, idx in zip(specs, idxs[:len(specs)]):

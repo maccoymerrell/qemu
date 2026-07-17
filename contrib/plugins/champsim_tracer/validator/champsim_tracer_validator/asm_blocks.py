@@ -471,6 +471,14 @@ class CodeBlock:
     randomizable: ClassVar[bool] = True
     coverage_probe: ClassVar[bool] = True
     terminal: ClassVar[bool] = False
+    # Opt-in to the dense author-intent annotator (analyze-time
+    # `annotate_expected_insns`).  Set True only on blocks that decode to a
+    # SINGLE true basic block — one terminal branch, no internal branch
+    # whose target lies within the block — so the per-template instruction
+    # count the exact-insn oracle sees equals the block's full disassembly.
+    # Multi-BB / internal-branch blocks (calls, indirect jumps, cond_cc,
+    # branch_zoo) keep their hand-authored asserted_* coverage oracles.
+    auto_annotate: ClassVar[bool] = False
 
     @classmethod
     def plan(cls, ctx: EmitCtx) -> BlockPlan:
@@ -518,6 +526,204 @@ def _insn(opcode: str, *,
     if load_data_lane_masks is not None:   d["load_data_lane_masks"] = load_data_lane_masks
     if store_data_lane_masks is not None:  d["store_data_lane_masks"] = store_data_lane_masks
     return d
+
+
+# ---------------------------------------------------------------------------
+# Dense author-intent annotation
+# ---------------------------------------------------------------------------
+#
+# The coverage-probe blocks below hand-author per-instruction `expected_insns`
+# check vectors.  The bulk of a generated program, however, is the randomizable
+# straight-line ALU blocks and the control-flow scaffolding (cond_branch, the
+# loop trio, exit) — historically these carried NO exact per-insn ground truth,
+# so `_check_expected_insns` / `_check_reg_value_assertions` never fired on
+# them and every one of their instructions decoded to `gen_op == UNKNOWN` in
+# the name-based ground-truth view.
+#
+# The table below records the generator's INTENT for the machine instructions
+# those blocks emit: the generator wrote `addq` to perform an INT_ADD, `ldr` to
+# perform a LOAD, `jmp` to perform an unconditional direct branch, and so on.
+# This is authorship, not re-derivation: the mapping is a fixed, per-ISA
+# statement of what each deliberately-emitted mnemonic MEANS, independent of
+# both the plugin's name-based classifier (which returns UNKNOWN here) and the
+# plugin's Capstone-detail refiner (whose output the trace carries and which
+# the oracle now locks against regression).
+#
+# Only mnemonics with a single, unambiguous intended GenericOpcode across every
+# generated occurrence are listed — verified against the live trace decode.
+# Mnemonics that are genuinely context-dependent (aarch64 `mov`, riscv `li`,
+# mips `move`) or a policy artifact (the mips delay-slot `nop`, encoded as
+# `sll $0,$0,0` and classified SHL) are deliberately absent: the annotator
+# leaves them unasserted rather than guess, which keeps the instruction count
+# exact while asserting only what the generator can honestly promise.
+#
+# `annotate_expected_insns()` (applied at analyze time, once the exact
+# machine-instruction sequence — pseudos already expanded by the assembler —
+# is known) walks a block's ground-truth disassembly and emits one spec per
+# instruction, a bare {} placeholder where the mnemonic is not in the table.
+
+# Branch mnemonics carry an intended BranchType in addition to GEN_OP_BRANCH.
+_INTENT_BRANCH: dict[str, dict[str, str]] = {
+    "x86_64": {
+        "jmp": "BRANCH_DIRECT_JUMP",
+        "je": "BRANCH_COND_DIRECT", "jne": "BRANCH_COND_DIRECT",
+        "ja": "BRANCH_COND_DIRECT", "jae": "BRANCH_COND_DIRECT",
+        "jb": "BRANCH_COND_DIRECT", "jbe": "BRANCH_COND_DIRECT",
+        "jl": "BRANCH_COND_DIRECT", "jle": "BRANCH_COND_DIRECT",
+        "jg": "BRANCH_COND_DIRECT", "jge": "BRANCH_COND_DIRECT",
+        "js": "BRANCH_COND_DIRECT", "jns": "BRANCH_COND_DIRECT",
+        "jp": "BRANCH_COND_DIRECT", "jnp": "BRANCH_COND_DIRECT",
+    },
+    "aarch64": {
+        "b": "BRANCH_DIRECT_JUMP",
+        "cbz": "BRANCH_COND_DIRECT", "cbnz": "BRANCH_COND_DIRECT",
+        "tbz": "BRANCH_COND_DIRECT", "tbnz": "BRANCH_COND_DIRECT",
+        "b.eq": "BRANCH_COND_DIRECT", "b.ne": "BRANCH_COND_DIRECT",
+        "b.lt": "BRANCH_COND_DIRECT", "b.le": "BRANCH_COND_DIRECT",
+        "b.gt": "BRANCH_COND_DIRECT", "b.ge": "BRANCH_COND_DIRECT",
+        "b.hi": "BRANCH_COND_DIRECT", "b.lo": "BRANCH_COND_DIRECT",
+        "b.hs": "BRANCH_COND_DIRECT", "b.ls": "BRANCH_COND_DIRECT",
+        "b.vs": "BRANCH_COND_DIRECT", "b.vc": "BRANCH_COND_DIRECT",
+        "b.mi": "BRANCH_COND_DIRECT", "b.pl": "BRANCH_COND_DIRECT",
+    },
+    "riscv64": {
+        "j": "BRANCH_DIRECT_JUMP",
+        "beqz": "BRANCH_COND_DIRECT", "bnez": "BRANCH_COND_DIRECT",
+        "beq": "BRANCH_COND_DIRECT", "bne": "BRANCH_COND_DIRECT",
+        "blt": "BRANCH_COND_DIRECT", "bltu": "BRANCH_COND_DIRECT",
+        "bge": "BRANCH_COND_DIRECT", "bgeu": "BRANCH_COND_DIRECT",
+    },
+    "mipsel": {
+        "j": "BRANCH_DIRECT_JUMP",
+        # mips `b target` lowers to `beq $0,$0,target`; the refiner reports
+        # it as a conditional-direct form.
+        "b": "BRANCH_COND_DIRECT",
+        "beqz": "BRANCH_COND_DIRECT", "bnez": "BRANCH_COND_DIRECT",
+        "beq": "BRANCH_COND_DIRECT", "bne": "BRANCH_COND_DIRECT",
+        "bgez": "BRANCH_COND_DIRECT", "bgtz": "BRANCH_COND_DIRECT",
+        "blez": "BRANCH_COND_DIRECT", "bltz": "BRANCH_COND_DIRECT",
+    },
+}
+
+# Non-branch mnemonics → intended GenericOpcode.  syscall entry points carry
+# both GEN_OP_SYSCALL and BRANCH_SYSCALL_TYPE (handled below).
+_INTENT_OPCODE: dict[str, dict[str, str]] = {
+    "x86_64": {
+        "leaq": "GEN_OP_LEA",
+        "movq": "GEN_OP_MOV", "movl": "GEN_OP_MOV",
+        "movw": "GEN_OP_MOV", "movb": "GEN_OP_MOV",
+        "addq": "GEN_OP_INT_ADD", "subq": "GEN_OP_INT_SUB",
+        "xorq": "GEN_OP_XOR", "xorl": "GEN_OP_XOR",
+        "andq": "GEN_OP_AND", "orq": "GEN_OP_OR",
+        "testq": "GEN_OP_TEST", "cmpq": "GEN_OP_CMP", "cmpl": "GEN_OP_CMP",
+        "sete": "GEN_OP_SETCC", "setne": "GEN_OP_SETCC",
+        "nop": "GEN_OP_NOP",
+        "syscall": "GEN_OP_SYSCALL",
+    },
+    "aarch64": {
+        "adrp": "GEN_OP_LEA", "adr": "GEN_OP_LEA",
+        "add": "GEN_OP_INT_ADD", "adds": "GEN_OP_INT_ADD",
+        "sub": "GEN_OP_INT_SUB", "subs": "GEN_OP_INT_SUB",
+        "ldr": "GEN_OP_LOAD", "ldrb": "GEN_OP_LOAD", "ldrh": "GEN_OP_LOAD",
+        "str": "GEN_OP_STORE", "strb": "GEN_OP_STORE", "strh": "GEN_OP_STORE",
+        "eor": "GEN_OP_XOR", "and": "GEN_OP_AND", "orr": "GEN_OP_OR",
+        "cmp": "GEN_OP_CMP", "tst": "GEN_OP_TEST",
+        "cset": "GEN_OP_CMOV", "csel": "GEN_OP_CMOV",
+        "nop": "GEN_OP_NOP",
+        "svc": "GEN_OP_SYSCALL",
+    },
+    "riscv64": {
+        "auipc": "GEN_OP_LEA",
+        "add": "GEN_OP_INT_ADD", "addi": "GEN_OP_INT_ADD",
+        "addw": "GEN_OP_INT_ADD", "addiw": "GEN_OP_INT_ADD",
+        "sub": "GEN_OP_INT_SUB", "subw": "GEN_OP_INT_SUB",
+        "ld": "GEN_OP_LOAD", "lwu": "GEN_OP_LOAD", "lw": "GEN_OP_LOAD",
+        "lhu": "GEN_OP_LOAD", "lh": "GEN_OP_LOAD",
+        "lbu": "GEN_OP_LOAD", "lb": "GEN_OP_LOAD",
+        "sd": "GEN_OP_STORE", "sw": "GEN_OP_STORE",
+        "sh": "GEN_OP_STORE", "sb": "GEN_OP_STORE",
+        "xor": "GEN_OP_XOR", "xori": "GEN_OP_XOR",
+        "and": "GEN_OP_AND", "andi": "GEN_OP_AND",
+        "or": "GEN_OP_OR", "ori": "GEN_OP_OR",
+        "lui": "GEN_OP_MOV", "mv": "GEN_OP_MOV",
+        "seqz": "GEN_OP_CMP", "snez": "GEN_OP_CMP",
+        "slt": "GEN_OP_CMP", "sltu": "GEN_OP_CMP",
+        "slti": "GEN_OP_CMP", "sltiu": "GEN_OP_CMP",
+        "nop": "GEN_OP_NOP",
+        "ecall": "GEN_OP_SYSCALL",
+    },
+    "mipsel": {
+        "lui": "GEN_OP_MOV",
+        "addiu": "GEN_OP_INT_ADD", "addu": "GEN_OP_INT_ADD",
+        "add": "GEN_OP_INT_ADD",
+        "subu": "GEN_OP_INT_SUB", "sub": "GEN_OP_INT_SUB",
+        "lw": "GEN_OP_LOAD", "lhu": "GEN_OP_LOAD", "lh": "GEN_OP_LOAD",
+        "lbu": "GEN_OP_LOAD", "lb": "GEN_OP_LOAD",
+        "sw": "GEN_OP_STORE", "sh": "GEN_OP_STORE", "sb": "GEN_OP_STORE",
+        "xor": "GEN_OP_XOR", "xori": "GEN_OP_XOR",
+        "and": "GEN_OP_AND", "andi": "GEN_OP_AND",
+        "or": "GEN_OP_OR", "ori": "GEN_OP_OR",
+        "slt": "GEN_OP_CMP", "sltu": "GEN_OP_CMP",
+        "slti": "GEN_OP_CMP", "sltiu": "GEN_OP_CMP",
+        "syscall": "GEN_OP_SYSCALL",
+        # NOTE: `nop` (== `sll $0,$0,0`) and `move` (addu/or alias) are
+        # deliberately omitted — see the module comment above.
+    },
+}
+
+
+def intent_for_insn(isa: str, mnemonic: str, op_str: str = "") -> dict:
+    """Return the author-intent `expected_insns` spec for one machine
+    instruction, or an empty placeholder dict when the mnemonic is not in
+    the intent table (context-dependent or policy-artifact — left
+    unasserted so the count stays exact without a guess).
+
+    Only the fields the generator can honestly promise are filled: the
+    intended GenericOpcode for every listed mnemonic, plus the intended
+    BranchType for control-flow forms.  Register sets, dep masks and lane
+    masks are left to the trace-vs-Capstone oracle (`_check_static_reg_sets`)
+    and to the hand-authored coverage probes.
+    """
+    mn = mnemonic.strip()
+    br = _INTENT_BRANCH.get(isa, {}).get(mn)
+    if br is not None:
+        return {"opcode": "GEN_OP_BRANCH", "branch_type": br}
+    op = _INTENT_OPCODE.get(isa, {}).get(mn)
+    if op is None:
+        return {}
+    if op == "GEN_OP_SYSCALL":
+        # The generic decoder's canonical BranchType spelling is
+        # BRANCH_SYSCALL (the wire encoding map calls it SYSCALL_TYPE; the
+        # exact-insn oracle resolves against the decoder table).
+        return {"opcode": op, "branch_type": "BRANCH_SYSCALL"}
+    return {"opcode": op}
+
+
+def annotate_expected_insns(node: dict, isa: str) -> bool:
+    """Fill @node['expected_insns'] from its ground-truth disassembly.
+
+    @node is a metadata block dict that already carries ``ground_truth``
+    (written by the analyzer).  One spec is emitted per machine
+    instruction — so the count is exact by construction, with pseudo
+    expansions (`lla`, `li`, oversized load/store offsets) already
+    resolved by the assembler — and ``expected_insns_full`` is set so the
+    validator checks every instruction with no trailer carve-out.
+
+    Returns True if annotation was applied.  A no-op when the block
+    already declares `expected_insns` (hand-authored coverage probe) or
+    lacks ground truth.
+    """
+    if node.get("expected_insns"):
+        return False
+    gt = node.get("ground_truth")
+    if not gt or not gt.get("insns"):
+        return False
+    specs = [intent_for_insn(isa, ins.get("mnemonic", ""),
+                             ins.get("op_str", ""))
+             for ins in gt["insns"]]
+    node["expected_insns"] = specs
+    node["expected_insns_full"] = True
+    return True
 
 
 def _u32(x: int) -> int:
@@ -843,12 +1049,34 @@ def _branch_zero_to(isa: str, reg: str, target: str) -> list[str]:
 class IntAdd(CodeBlock):
     name = "asm_int_add"
     scratch_slots = 3
+    auto_annotate = True
+
+    # Generic-reg name of the accumulator each ISA computes `a+b` into
+    # (the first scratch register the emit loads and adds into).  The
+    # trace's ENCODINGS map resolves these; the same convention the
+    # NarrowMemData probe uses.
+    _ACC_REG = {
+        "x86_64": "REG_GPR6",   # %r8
+        "aarch64": "REG_GPR9",  # x9
+        "riscv64": "REG_GPR5",  # t0
+        "mipsel": "REG_GPR8",   # $t0
+    }
 
     @classmethod
     def plan(cls, ctx: EmitCtx) -> BlockPlan:
         s0, s1, s2 = ctx.scratch_slots
         a = ctx.rng.randrange(1, 1 << 15)
         b = ctx.rng.randrange(1, 1 << 15)
+        # Best-effort value oracle: the accumulator provably holds a+b after
+        # the add (both inputs come from the arena slots this block seeded,
+        # so the result is generator-predictable).  The store memop already
+        # checks the same value on the memory side; asserting the register
+        # snapshot exercises the reg-value oracle on the block directly.
+        reg_asserts = [{
+            "reg": cls._ACC_REG[ctx.isa],
+            "bits": 32,
+            "value": _u32(a + b),
+        }] if ctx.isa in cls._ACC_REG else []
         return BlockPlan(
             block_id=ctx.block_id,
             name=cls.name,
@@ -857,6 +1085,7 @@ class IntAdd(CodeBlock):
                 ExpectedMemOp("load", s1, 8, b),
                 ExpectedMemOp("store", s2, 8, _u32(a + b)),
             ],
+            reg_value_assertions=reg_asserts,
             coarse_opcodes={"LOAD": 2, "INT_ADD": 1, "STORE": 1},
         )
 
@@ -895,6 +1124,7 @@ class IntAdd(CodeBlock):
 class XorMix(CodeBlock):
     name = "asm_xor_mix"
     scratch_slots = 4
+    auto_annotate = True
 
     @classmethod
     def plan(cls, ctx: EmitCtx) -> BlockPlan:
@@ -955,6 +1185,7 @@ class XorMix(CodeBlock):
 class LoadBurst(CodeBlock):
     name = "asm_load_burst"
     scratch_slots = 4
+    auto_annotate = True
 
     @classmethod
     def plan(cls, ctx: EmitCtx) -> BlockPlan:
@@ -1006,6 +1237,7 @@ class LoadBurst(CodeBlock):
 class StoreBurst(CodeBlock):
     name = "asm_store_burst"
     scratch_slots = 3
+    auto_annotate = True
 
     @classmethod
     def plan(cls, ctx: EmitCtx) -> BlockPlan:
@@ -1058,6 +1290,7 @@ class CondBranch(CodeBlock):
     needs_branch_slot = True
     randomizable = False
     coverage_probe = False
+    auto_annotate = True
 
     @classmethod
     def plan(cls, ctx: EmitCtx) -> BlockPlan:
@@ -1120,6 +1353,7 @@ class LoopHead(CodeBlock):
     scratch_slots = 1
     randomizable = False
     coverage_probe = False
+    auto_annotate = True
 
     @classmethod
     def plan(cls, ctx: EmitCtx) -> BlockPlan:
@@ -1185,6 +1419,7 @@ class LoopBody(CodeBlock):
     scratch_slots = 2
     randomizable = False
     coverage_probe = False
+    auto_annotate = True
 
     @classmethod
     def plan(cls, ctx: EmitCtx) -> BlockPlan:
@@ -1230,6 +1465,7 @@ class LoopExit(CodeBlock):
     scratch_slots = 2
     randomizable = False
     coverage_probe = False
+    auto_annotate = True
 
     @classmethod
     def plan(cls, ctx: EmitCtx) -> BlockPlan:
@@ -1378,6 +1614,7 @@ class ExitBlock(CodeBlock):
     randomizable = False
     coverage_probe = False
     terminal = True
+    auto_annotate = True
 
     @classmethod
     def plan(cls, ctx: EmitCtx) -> BlockPlan:

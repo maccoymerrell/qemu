@@ -4840,6 +4840,70 @@ static std::atomic<bool> g_marker_fired{false};
 static thread_local MarkerRunSet tls_marker_run;
 static thread_local MarkerRunSet tls_marker_end_run;
 
+/* Open the marker trace window on @cpu_index.  The three WIN_MARKER
+ * first-open paths — wide-register, narrow-ASID, and legacy single-pin —
+ * share this exact body: guard against a redundant open, then window +
+ * user-clock reset + segment start.  @root_phys is logged only on the
+ * narrow-ASID path (@have_root_phys); the trace-affecting statements are
+ * identical across all three callers.  The caller holds exec_lock. */
+static void marker_open_trace_window(unsigned int cpu_index, uint64_t asid,
+                                     bool have_root_phys, uint64_t root_phys)
+{
+    if (g_trace_segments.is_active() || g_trace_segments.is_shutting_down()) {
+        return;
+    }
+    uint64_t lo = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
+    uint64_t span = simulation_insns ? simulation_insns : 1000000;
+    uint64_t hi = lo + span;
+    g_trace_segments.set_window(lo, hi);
+    /* The window budget counts the pinned process's user-space insns from 0
+     * (kernel calls are traced but not counted); start the counter here at
+     * the marker's icount. */
+    user_count_reset(cpu_index, lo);
+    if (have_root_phys) {
+        fprintf(stderr,
+                "champsim_tracer: marker fired at icount %" PRIu64
+                ", asid 0x%" PRIx64 " priv=%d (0=user,3=kernel) "
+                "pc=0x%" PRIx64 " root_phys=0x%" PRIx64
+                " — tracing %" PRIu64 " insns\n",
+                lo, asid, qemu_plugin_get_priv_level(),
+                qemu_plugin_get_pc(), root_phys, span);
+    } else {
+        fprintf(stderr, "champsim_tracer: marker fired at icount %" PRIu64
+                ", asid 0x%" PRIx64 " priv=%d (0=user,3=kernel) pc=0x%" PRIx64
+                " — tracing %" PRIu64 " insns\n",
+                lo, asid, qemu_plugin_get_priv_level(),
+                qemu_plugin_get_pc(), span);
+    }
+    start_trace_segment("marker", lo, hi, /* warmup= */ 0, span,
+                        cpu_index, /* simpoint_weight= */ 0.0);
+}
+
+/* All-windows-closed stop shared by the END-marker paths.  The caller holds
+ * exec_lock; when a segment is live this latches the end-marker close, closes
+ * it, and exit(0)s (never returns); otherwise it releases exec_lock and
+ * returns.  @last_window selects the multi-process "(last window)" diagnostic
+ * over the legacy single-pin one. */
+static void marker_close_and_exit(bool last_window)
+{
+    if (g_trace_segments.is_active() && !g_trace_segments.is_shutting_down()) {
+        if (last_window) {
+            fprintf(stderr,
+                    "champsim_tracer: end marker — closing after %" PRIu64
+                    " user insns (last window)\n", g_user_icount);
+        } else {
+            fprintf(stderr, "champsim_tracer: end marker — closing after %"
+                    PRIu64 " user insns\n", g_user_icount);
+        }
+        g_seg_end_marker_close = true;
+        finish_trace_segment();
+        g_trace_segments.set_shutting_down();
+        g_rec_mutex_unlock(&exec_lock);
+        exit(0);
+    }
+    g_rec_mutex_unlock(&exec_lock);
+}
+
 static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
 {
     /* Wrong-path fence, two independent gates: the QEMU-side per-vCPU
@@ -4915,23 +4979,8 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
              * step (marker_trace_all() in events_path_step / refresh_ctx_gates),
              * so every context is traced from here without touching the owned
              * set — which stays this single clock pin (see the guard above). */
-            if (!g_trace_segments.is_active() &&
-                !g_trace_segments.is_shutting_down()) {
-                uint64_t lo =
-                    qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
-                uint64_t span = simulation_insns ? simulation_insns : 1000000;
-                uint64_t hi = lo + span;
-                g_trace_segments.set_window(lo, hi);
-                user_count_reset(cpu_index, lo);
-                fprintf(stderr,
-                        "champsim_tracer: marker fired at icount %" PRIu64
-                        ", asid 0x%" PRIx64 " priv=%d (0=user,3=kernel) "
-                        "pc=0x%" PRIx64 " — tracing %" PRIu64 " insns\n",
-                        lo, asid, qemu_plugin_get_priv_level(),
-                        qemu_plugin_get_pc(), span);
-                start_trace_segment("marker", lo, hi, /* warmup= */ 0, span,
-                                    cpu_index, /* simpoint_weight= */ 0.0);
-            }
+            marker_open_trace_window(cpu_index, asid,
+                                     /* have_root_phys= */ false, 0);
             /* Assign this root's compact asid index (index 0) with its own
              * marker-page signature.  Runs AFTER start_trace_segment (which
              * resets the per-segment identity map) so the pre-registration
@@ -5017,24 +5066,8 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
             g_pin_repr_sig.store(sig, std::memory_order_relaxed);
             pin_owned_reset_single(asid, cpu_index, root_phys, sig, vpage);
             pin_map_learn(0, pc);
-            if (!g_trace_segments.is_active() &&
-                !g_trace_segments.is_shutting_down()) {
-                uint64_t lo =
-                    qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
-                uint64_t span = simulation_insns ? simulation_insns : 1000000;
-                uint64_t hi = lo + span;
-                g_trace_segments.set_window(lo, hi);
-                user_count_reset(cpu_index, lo);
-                fprintf(stderr,
-                        "champsim_tracer: marker fired at icount %" PRIu64
-                        ", asid 0x%" PRIx64 " priv=%d (0=user,3=kernel) "
-                        "pc=0x%" PRIx64 " root_phys=0x%" PRIx64
-                        " — tracing %" PRIu64 " insns\n",
-                        lo, asid, qemu_plugin_get_priv_level(),
-                        qemu_plugin_get_pc(), root_phys, span);
-                start_trace_segment("marker", lo, hi, /* warmup= */ 0, span,
-                                    cpu_index, /* simpoint_weight= */ 0.0);
-            }
+            marker_open_trace_window(cpu_index, asid,
+                                     /* have_root_phys= */ true, root_phys);
             /* Pre-register owner 0's compact index (index 0) with its own
              * marker-page anchor, AFTER start_trace_segment reset the
              * per-segment identity map (mirrors the wide path). */
@@ -5172,23 +5205,7 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
     }
 
     g_rec_mutex_lock(&exec_lock);
-    if (!g_trace_segments.is_active() && !g_trace_segments.is_shutting_down()) {
-        uint64_t lo = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
-        uint64_t span = simulation_insns ? simulation_insns : 1000000;
-        uint64_t hi = lo + span;
-        g_trace_segments.set_window(lo, hi);
-        /* The window budget counts the pinned process's user-space insns
-         * from 0 (kernel calls are traced but not counted); start the
-         * counter here at the marker's icount. */
-        user_count_reset(cpu_index, lo);
-        fprintf(stderr, "champsim_tracer: marker fired at icount %" PRIu64
-                ", asid 0x%" PRIx64 " priv=%d (0=user,3=kernel) pc=0x%" PRIx64
-                " — tracing %" PRIu64 " insns\n",
-                lo, asid, qemu_plugin_get_priv_level(),
-                qemu_plugin_get_pc(), span);
-        start_trace_segment("marker", lo, hi, /* warmup= */ 0, span,
-                            cpu_index, /* simpoint_weight= */ 0.0);
-    }
+    marker_open_trace_window(cpu_index, asid, /* have_root_phys= */ false, 0);
     g_rec_mutex_unlock(&exec_lock);
 }
 
@@ -5288,18 +5305,7 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
         }
         /* Last window closed: all-windows-closed stop (peer of the
          * icount/budget stop — whichever fires first wins). */
-        if (g_trace_segments.is_active() &&
-            !g_trace_segments.is_shutting_down()) {
-            fprintf(stderr,
-                    "champsim_tracer: end marker — closing after %" PRIu64
-                    " user insns (last window)\n", g_user_icount);
-            g_seg_end_marker_close = true;
-            finish_trace_segment();
-            g_trace_segments.set_shutting_down();
-            g_rec_mutex_unlock(&exec_lock);
-            exit(0);
-        }
-        g_rec_mutex_unlock(&exec_lock);
+        marker_close_and_exit(/* last_window= */ true);
         return;
     }
 
@@ -5355,18 +5361,7 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
             return;
         }
         /* Last window closed: all-windows-closed stop. */
-        if (g_trace_segments.is_active() &&
-            !g_trace_segments.is_shutting_down()) {
-            fprintf(stderr,
-                    "champsim_tracer: end marker — closing after %" PRIu64
-                    " user insns (last window)\n", g_user_icount);
-            g_seg_end_marker_close = true;
-            finish_trace_segment();
-            g_trace_segments.set_shutting_down();
-            g_rec_mutex_unlock(&exec_lock);
-            exit(0);
-        }
-        g_rec_mutex_unlock(&exec_lock);
+        marker_close_and_exit(/* last_window= */ true);
         return;
     }
 
@@ -5383,16 +5378,7 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
         return;
     }
     g_rec_mutex_lock(&exec_lock);
-    if (g_trace_segments.is_active() && !g_trace_segments.is_shutting_down()) {
-        fprintf(stderr, "champsim_tracer: end marker — closing after %" PRIu64
-                " user insns\n", g_user_icount);
-        g_seg_end_marker_close = true;
-        finish_trace_segment();
-        g_trace_segments.set_shutting_down();
-        g_rec_mutex_unlock(&exec_lock);
-        exit(0);
-    }
-    g_rec_mutex_unlock(&exec_lock);
+    marker_close_and_exit(/* last_window= */ false);
 }
 
 /* Outcome of the pre-commit instruction-memory stability check. */

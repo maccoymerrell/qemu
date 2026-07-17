@@ -334,15 +334,33 @@ static const LaneFamily kLaneFamilies[] = {
     { CST_FID_LOAD_DATA_LANE_MASK_BASE,  "CST_FID_LOAD_DATA_LANE_MASK"  },
     { CST_FID_STORE_DATA_LANE_MASK_BASE, "CST_FID_STORE_DATA_LANE_MASK" },
 };
+/*
+ * The 2 stride-CST_FID_PPAGE_BLOCK_STRIDE physical-page families, in wire
+ * order.  Both land in the scalar plane at ordinals 9 + index (continuing
+ * after the lane masks).  Emitted only when g_features.physaddr — a
+ * non-physaddr trace advertises none, so its field_id map is byte-identical
+ * to a writer that predates the feature.  Shared by
+ * write_field_id_encoding_map and field_state_slot_lut_build.
+ */
+struct PpageFamily { uint16_t base; const char *prefix; uint8_t ord; };
+static const PpageFamily kPpageFamilies[] = {
+    { CST_FID_LOAD_PPAGE_BASE,  "CST_FID_LOAD_PPAGE",  9  },
+    { CST_FID_STORE_PPAGE_BASE, "CST_FID_STORE_PPAGE", 10 },
+};
 
 static void write_field_id_encoding_map(BitWriter *bw)
 {
     /* Count: 3 hot singletons + 8 slotted families × CST_FID_SLOT_COUNT
      * + 4 lane-mask families × CST_FID_SLOT_COUNT + 7 insn-metadata
-     * + 1 EXTENDED. */
-    const uint64_t n_entries =
+     * + 1 EXTENDED, plus (physaddr only) 2 ppage families × slot count.
+     * The ppage families are advertised only when physical-page capture is
+     * active, so a non-physaddr trace's map stays byte-identical. */
+    uint64_t n_entries =
         3 + (uint64_t)8 * CST_FID_SLOT_COUNT
           + (uint64_t)4 * CST_FID_SLOT_COUNT + 7 + 1;
+    if (g_features.physaddr) {
+        n_entries += (uint64_t)G_N_ELEMENTS(kPpageFamilies) * CST_FID_SLOT_COUNT;
+    }
     bw_write_string(bw, "field_id");
     bw_write_uleb128(bw, n_entries);
 
@@ -373,6 +391,21 @@ static void write_field_id_encoding_map(BitWriter *bw)
             g_autofree char *name = g_strdup_printf(
                 "%s%" PRIu64, kLaneFamilies[f].prefix, k);
             write_encoding_entry(bw, id, name);
+        }
+    }
+
+    /* Physical-page block (shared kPpageFamilies; separate stride-2 block
+     * after EXTENDED so it shifts no pre-existing field-id).  Advertised
+     * only under physaddr. */
+    if (g_features.physaddr) {
+        for (uint64_t k = 0; k < CST_FID_SLOT_COUNT; k++) {
+            for (size_t f = 0; f < G_N_ELEMENTS(kPpageFamilies); f++) {
+                unsigned id = kPpageFamilies[f].base
+                    + (unsigned)k * CST_FID_PPAGE_BLOCK_STRIDE;
+                g_autofree char *name = g_strdup_printf(
+                    "%s%" PRIu64, kPpageFamilies[f].prefix, k);
+                write_encoding_entry(bw, id, name);
+            }
         }
     }
 
@@ -432,6 +465,12 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         { CST_FLAG_PROFILE, "CST_FLAG_PROFILE" },
         { CST_FLAG_WP, "CST_FLAG_WP" },
         { CST_FLAG_FAULT, "CST_FLAG_FAULT" },
+        /* PHYSADDR MUST stay last: advertised only when physical-page
+         * capture is active (g_features.physaddr, system mode) so a
+         * non-physaddr trace keeps the historical 5-entry header_flag
+         * vocabulary and stays byte-identical.  The count is trimmed
+         * below. */
+        { CST_FLAG_PHYSADDR, "CST_FLAG_PHYSADDR" },
     };
     static const EncodingMapEntry insn_flag_entries[] = {
         { CST_INSN_FLAG_BRANCH_COND, "CST_INSN_FLAG_BRANCH_COND" },
@@ -493,8 +532,12 @@ static void write_header_encoding_maps(BitWriter *main_bw)
                          branch_type_name);
     write_reg_encoding_map(&sub);
     write_field_id_encoding_map(&sub);
+    size_t n_header_flags = G_N_ELEMENTS(header_flag_entries);
+    if (!g_features.physaddr) {
+        n_header_flags -= 1;    /* omit the trailing CST_FLAG_PHYSADDR name */
+    }
     write_encoding_map(&sub, "header_flag", header_flag_entries,
-                       G_N_ELEMENTS(header_flag_entries));
+                       n_header_flags);
     write_encoding_map(&sub, "insn_flag", insn_flag_entries,
                        G_N_ELEMENTS(insn_flag_entries));
     size_t n_body_tags = G_N_ELEMENTS(body_tag_entries);
@@ -1081,11 +1124,13 @@ enum {
      * insn-metadata cells (BYTES_LO..SIZE).  N_SCALAR_SLOTTED scalar
      * slotted families and N_WIDE_SLOTTED wide families follow. */
     FIELD_STATE_SCALAR_FIXED = 10,
-    FIELD_STATE_N_SCALAR_FAM = 9,   /* load/store addr, load/store size,
-                                     * dst_reg_width, 4 lane masks */
+    FIELD_STATE_N_SCALAR_FAM = 11,  /* load/store addr, load/store size,
+                                     * dst_reg_width, 4 lane masks,
+                                     * load/store ppage */
     FIELD_STATE_N_WIDE_FAM   = 3,   /* load_data, store_data, dst_reg */
     /* Power-of-two so fid -> location is a single load.  Largest FID
-     * ~778 at slot count 64 / stride-8 slotted, stride-4 lane block. */
+     * ~906 at slot count 64 / stride-8 slotted, stride-4 lane block,
+     * stride-2 ppage block. */
     FIELD_STATE_LUT_SIZE     = 1024,
 };
 
@@ -1181,6 +1226,19 @@ static void field_state_slot_lut_build(void)
             unsigned fid = kLaneFamilies[f].base + k * CST_FID_LANE_BLOCK_STRIDE;
             g_fid_loc[fid] = FidLoc{ FS_LOC_SCALAR_SLOT, (uint8_t)(5 + f),
                                      (uint8_t)k, 0 };
+        }
+    }
+    /* The 2 stride-CST_FID_PPAGE_BLOCK_STRIDE physical-page families
+     * (shared kPpageFamilies): scalar plane, ordinals 9..10.  Registered
+     * unconditionally — the cells are simply never written on a
+     * non-physaddr trace (the ppage FIDs are never staged), so the wire is
+     * unaffected while the reverse LUT stays a single build. */
+    for (unsigned k = 0; k < CST_FID_SLOT_COUNT; k++) {
+        for (unsigned f = 0; f < G_N_ELEMENTS(kPpageFamilies); f++) {
+            unsigned fid = kPpageFamilies[f].base
+                + k * CST_FID_PPAGE_BLOCK_STRIDE;
+            g_fid_loc[fid] = FidLoc{ FS_LOC_SCALAR_SLOT,
+                                     kPpageFamilies[f].ord, (uint8_t)k, 0 };
         }
     }
     g_field_state_slot_lut_built = true;
@@ -2649,6 +2707,7 @@ static void emit_field_delta_section(BitWriter *main_bw,
 
         const bool want_memdata = (header_flags & CST_FLAG_MEM_DATA) != 0;
         const bool want_regdata = (header_flags & CST_FLAG_REG_DATA) != 0;
+        const bool want_physaddr = (header_flags & CST_FLAG_PHYSADDR) != 0;
 
         /* Locked-in descriptor pointers — only the wide families
          * (LOAD_DATA, STORE_DATA, DST_REG) still need fd for the
@@ -2757,6 +2816,17 @@ static void emit_field_delta_section(BitWriter *main_bw,
                     uint16_t la_fid = (uint16_t)(CST_FID_LOAD_ADDR_BASE +
                                                  s * CST_FID_SLOT_STRIDE);
                     STAGE_U64(i, la_fid, dp->value, 0);
+                    /* Physical PAGE base (physaddr, system mode).  Omitted
+                     * when no translation was observable (ppage_valid=false:
+                     * user mode, MMIO, garbage-filled wrong path) so the
+                     * delta stream keeps the last real translation and an
+                     * in-page walk costs zero bytes. */
+                    if (want_physaddr && dp->ppage_valid) {
+                        uint16_t lpp_fid =
+                            (uint16_t)(CST_FID_LOAD_PPAGE_BASE +
+                                       s * CST_FID_PPAGE_BLOCK_STRIDE);
+                        STAGE_U64(i, lpp_fid, dp->ppage, 0);
+                    }
                     if (want_memdata) {
                         U512 cur = dp->data;
                         u512_mask_bytes(&cur, dp->data_size);
@@ -2782,6 +2852,14 @@ static void emit_field_delta_section(BitWriter *main_bw,
                     uint16_t sa_fid = (uint16_t)(CST_FID_STORE_ADDR_BASE +
                                                  s * CST_FID_SLOT_STRIDE);
                     STAGE_U64(i, sa_fid, dp->value, 0);
+                    /* Physical PAGE base (physaddr, system mode); see the
+                     * load path above. */
+                    if (want_physaddr && dp->ppage_valid) {
+                        uint16_t spp_fid =
+                            (uint16_t)(CST_FID_STORE_PPAGE_BASE +
+                                       s * CST_FID_PPAGE_BLOCK_STRIDE);
+                        STAGE_U64(i, spp_fid, dp->ppage, 0);
+                    }
                     if (want_memdata) {
                         U512 cur = dp->data;
                         u512_mask_bytes(&cur, dp->data_size);
@@ -2957,6 +3035,12 @@ BodyStreamState *body_stream_new(WriterCtx *w, const char *seg_datetime,
      * trailer. */
     if (g_features.fault_depth_trailer) {
         flags |= CST_FLAG_FAULT;
+    }
+    /* Physical-page families present (system mode, physaddr=1).  Advertised
+     * only when on, so a non-physaddr trace's field_id map + flag vocabulary
+     * are byte-identical to a writer that predates the feature. */
+    if (g_features.physaddr) {
+        flags |= CST_FLAG_PHYSADDR;
     }
     bw_write_u8(&st->header_bw, flags);
     st->header_flags = flags;

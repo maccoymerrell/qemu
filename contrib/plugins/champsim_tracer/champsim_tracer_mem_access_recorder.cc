@@ -148,6 +148,24 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
         capture_mem_value(info, vaddr, &acc);
     }
 
+    /* Physical-PAGE capture (physaddr=1, system mode).  Resolve the memop's
+     * physical address through the live TLB entry and mask it to the page
+     * granule.  qemu_plugin_get_hwaddr returns NULL for linux-user and for
+     * any access with no resolvable RAM translation; MMIO is excluded (its
+     * device traffic rides the DEVIO records, and it is not cacheable
+     * memory).  A garbage-filled wrong-path access (absent/unreadable page
+     * served a placeholder) has no real translation, so its ppage is
+     * likewise omitted — the FID simply does not appear for that memop and
+     * the delta stream keeps the last real translation as the baseline. */
+    if (g_features.physaddr && !(wp.in_progress && mem_faulted)) {
+        struct qemu_plugin_hwaddr *h = qemu_plugin_get_hwaddr(info, vaddr);
+        if (h && !qemu_plugin_hwaddr_is_io(h)) {
+            uint64_t pa = qemu_plugin_hwaddr_phys_addr(h);
+            acc.ppage = pa & ~CST_PPAGE_OFFSET_MASK;
+            acc.ppage_valid = true;
+        }
+    }
+
     if (wp.in_progress) {
         acc.faulted = mem_faulted;
         wp.mem_accesses.push_back(acc);
@@ -334,6 +352,8 @@ void MemAccessRecorder::drain_cp_into_dyn_params(
             .value = acc.mem_vaddr,
             .data_size = acc.data_size,
             .data = acc.data,
+            .ppage = acc.ppage,
+            .ppage_valid = acc.ppage_valid,
         };
         dyn_params.push_back(dp);
     };

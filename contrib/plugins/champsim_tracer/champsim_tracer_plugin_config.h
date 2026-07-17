@@ -53,6 +53,13 @@ struct PluginConfig {
      * no-op without disk traffic, so device-free traces are unchanged).
      * devio=0 disables the block hook entirely. */
     int       devio             = 1;
+    /* Physical-page capture (physaddr=0/1, system mode only).  When on,
+     * every load/store carries the physical PAGE base of its access via the
+     * CST_FID_LOAD_PPAGE / STORE_PPAGE families, so a consumer can rebuild
+     * the physical address as  ppage | (vaddr & CST_PPAGE_OFFSET_MASK).
+     * Off by default; ignored (forced off) in user mode, where no
+     * translation exists.  A device-/physaddr-free trace is unchanged. */
+    int       physaddr          = 0;
     /* Per-template IFRAME trigger interval.  0 disables. */
     uint32_t  iframe_rate         = 100000;
     uint64_t  simpoint_interval = 100000000ULL;

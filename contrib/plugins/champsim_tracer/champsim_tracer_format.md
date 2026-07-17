@@ -149,6 +149,7 @@ absence by the same gate:
 |---|---|
 | Load/store data *values* | `CST_FLAG_MEM_DATA` clear |
 | Destination-register snapshots | `CST_FLAG_REG_DATA` clear |
+| Per-memop physical page (`CST_FID_*_PPAGE`, §5.3.1) | `CST_FLAG_PHYSADDR` clear |
 | Per-template profile block (§6) | `CST_FLAG_PROFILE` clear |
 | Per-insn dependency sub-block | insn's `CST_INSN_FLAG_HAS_DEP_BLOCK` clear |
 | Immediate value | insn's `CST_INSN_FLAG_HAS_IMM` clear |
@@ -1573,6 +1574,30 @@ Field families (one canonical name each):
   emits a delta only when it changes.  Mask width is up to 64 lanes
   (ULEB on the wire; the common 2/4/8/16-lane cases stay one byte).
 
+* **Physical-page families** (two, one slot per memop, gated on the
+  `CST_FLAG_PHYSADDR` header bit — system-mode `physaddr=1` only):
+
+  * **`CST_FID_LOAD_PPAGE{k}`** — for load memop slot `k`: the physical
+    PAGE base of the access, i.e. its physical address masked to
+    `cst_wire::PPAGE_SHIFT` (4 KiB).  Consumers rebuild the full physical
+    address as `ppage | (vaddr & PPAGE_OFFSET_MASK)` — see §5.3.1.
+  * **`CST_FID_STORE_PPAGE{k}`** — analogous, for store memop slot `k`.
+
+  Each is a per-`(template_id, ins_pos, slot)` sparse scalar with baseline
+  default zero, delta-encoded exactly like `LOAD_ADDR` / `STORE_ADDR`.
+  These carry only *lazily-observed* translations: a page's mapping records
+  once on the first touch and then costs **zero bytes** while it holds — an
+  in-page walk (offset changes, page base does not) emits nothing, and an
+  OS remap (copy-on-write, page migration) self-corrects with a single
+  delta on the next access.  The families do **not** encode the page table;
+  they are a running observation of the translations the traced accesses
+  actually used.  A memop with no observable RAM translation — user mode,
+  MMIO, or a garbage-filled wrong-path access to an absent page — emits no
+  record for that slot, so the running value simply holds the last real
+  translation.  These families post-date the others; a trace produced
+  without `physaddr=1` names neither and is byte-identical to one from a
+  writer that predates them.
+
 * **Instruction-metadata singletons** (cold; emitted only when
   the dynamic execution differs from the template baseline):
   `CST_FID_INSN_BYTES_LO`, `CST_FID_INSN_BYTES_HI`,
@@ -1780,6 +1805,48 @@ emission as a scalar delta. The current QEMU plugin mem-value API directly
 exposes values up to 128 bits; wider values are representable by
 the wire format and by register snapshots, and can be populated by
 capture paths that can provide up to 64 bytes.
+
+#### 5.3.1 Physical Addresses (physaddr)
+
+When `CST_FLAG_PHYSADDR` is set (system-mode `physaddr=1`), each memop slot
+may carry a `CST_FID_LOAD_PPAGE{k}` / `CST_FID_STORE_PPAGE{k}` field giving
+the **physical PAGE base** of the access — the physical address masked to
+the 4 KiB page granule (`cst_wire::PPAGE_SHIFT`).  The consumer rebuilds
+the full physical address by ORing the page base with the in-page offset,
+which the virtual address already carries:
+
+```
+paddr = ppage | (vaddr & PPAGE_OFFSET_MASK)          PPAGE_OFFSET_MASK = 0xFFF
+```
+
+The offset is not duplicated on the wire — it rides the existing
+`LOAD_ADDR{k}` / `STORE_ADDR{k}` virtual address.  A 4 KiB granule
+reconstructs the **exact** physical address regardless of the guest's real
+hardware page size: for any page ≥ 4 KiB the low 12 bits of a virtual
+address equal the low 12 bits of its physical address, so the masked-off
+offset is identical whether taken from the VA or the PA.  A larger hardware
+page (16 KiB MIPS, 2 MiB / 1 GiB huge pages) merely re-emits the (unchanged)
+page base once per 4 KiB step; correctness does not depend on the granule.
+
+Only *lazily-observed* translations appear (see §5.1): the first access to a
+page records its base, subsequent in-page accesses cost nothing, and an OS
+remap self-corrects on the next touch.  An access with no observable
+translation (MMIO, or a garbage-filled wrong-path access to an absent page)
+emits no record, so the running per-`(template, ins_pos, slot)` value simply
+holds.  The consequence differs by path:
+
+* **Correct path** — every CP access has a real RAM translation and a
+  changed translation always emits a delta, so the reconstructed physical
+  address is *exact* for every CP memop.
+* **Wrong path** — a speculative access served synthetic data (see the
+  `CST_WP_EVENT_FAULT` machinery, §4.4) has no translation and emits
+  nothing; the decoded value for that WP memop is then the slot's *last
+  observed* translation — best-effort, and possibly stale for the wild
+  address.  TLB-hit WP accesses carry their real translation exactly like
+  CP ones.
+
+MMIO device traffic is carried separately by the `BODY_TAG_DEVIO_*`
+records, not by `PPAGE`.
 
 ### 5.4 Register Data
 

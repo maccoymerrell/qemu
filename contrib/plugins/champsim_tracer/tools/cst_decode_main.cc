@@ -1015,6 +1015,12 @@ void emit_disasm_memops(std::string &line, const DisasmContext &ctx,
                 line.append(std::to_string(dp.data_size));
             }
         }
+        /* Reconstructed physical address (CST_FLAG_PHYSADDR): the recorded
+         * physical page base ORed with the virtual in-page offset. */
+        if (dp.has_ppage) {
+            line.append("  pa=0x");
+            append_hex(&line, dp.paddr());
+        }
         if (is_load) load_idx++;
         else         store_idx++;
     }

@@ -844,6 +844,8 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                     .value = acc.mem_vaddr,
                     .data_size = acc.data_size,
                     .data = acc.data,
+                    .ppage = acc.ppage,
+                    .ppage_valid = acc.ppage_valid,
                 };
                 bb_dyn_params.push_back(dp);
                 stats.wp_total_mem_accesses++;

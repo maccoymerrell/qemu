@@ -61,6 +61,8 @@ void slot_lut_build(const ResolvedIds &ids,
         &ids.fid_dst_lane_mask,
         &ids.fid_load_data_lane_mask,
         &ids.fid_store_data_lane_mask,
+        &ids.fid_load_ppage,
+        &ids.fid_store_ppage,
     };
     constexpr size_t N_FAM = sizeof(slotted_fams) / sizeof(slotted_fams[0]);
 
@@ -100,7 +102,12 @@ void slot_lut_build(const ResolvedIds &ids,
  *                                cell FS_FIXED_CELLS + f*max_slots + k
  *   [.., +7)                     cold metadata   -> fixed offset 3..9
  */
-inline constexpr uint32_t FS_N_FAMILIES  = 12;
+/* Slotted families tracked in the decoder's family-major block: the 8 wire
+ * slotted families + 4 lane-mask families + 2 physical-page families.  Must
+ * equal the slotted_fams[] array length in slot_lut_build (a purely
+ * internal storage layout; the ppage families are simply never written on a
+ * non-physaddr trace, so decode of older traces is unaffected). */
+inline constexpr uint32_t FS_N_FAMILIES  = 14;
 inline constexpr uint32_t FS_FIXED_CELLS = 10;   /* 3 hot + 7 cold */
 inline constexpr uint32_t FS_SLOTTED_BASE = 3;
 inline constexpr uint32_t FS_SLOTTED_END  =
@@ -271,7 +278,9 @@ size_t first_dyn_param_diff(const std::vector<DynParam> &a,
             a[i].insn_index != b[i].insn_index ||
             a[i].addr != b[i].addr ||
             a[i].has_data != b[i].has_data ||
-            (a[i].has_data && a[i].data != b[i].data)) {
+            (a[i].has_data && a[i].data != b[i].data) ||
+            a[i].has_ppage != b[i].has_ppage ||
+            (a[i].has_ppage && a[i].ppage != b[i].ppage)) {
             return i + 1;
         }
     }
@@ -1003,7 +1012,9 @@ void materialise_slotted_memops(uint32_t insn_idx, uint64_t n_fixed,
                                 const std::array<uint16_t, FID_SLOT_COUNT> &addr_fids,
                                 const std::array<uint16_t, FID_SLOT_COUNT> &data_fids,
                                 const std::array<uint16_t, FID_SLOT_COUNT> &size_fids,
+                                const std::array<uint16_t, FID_SLOT_COUNT> &ppage_fids,
                                 bool has_mem,
+                                bool has_ppage,
                                 const FieldStateBlock *state_blk,
                                 uint32_t state_gen,
                                 const FieldStateBlock *base_blk,
@@ -1023,6 +1034,20 @@ void materialise_slotted_memops(uint32_t insn_idx, uint64_t n_fixed,
         dp.type = type;
         dp.insn_index = insn_idx;
         dp.addr = a.low64();
+        /* Physical PAGE base (CST_FLAG_PHYSADDR).  The delta stream omits
+         * the record for a memop with no observable translation, so a slot
+         * whose ppage cell was never written keeps the running (last real)
+         * value; a value of 0 means "no translation seen yet" -> not
+         * surfaced.  has_ppage gates the whole family off for non-physaddr
+         * traces. */
+        if (has_ppage && ppage_fids[s] != 0) {
+            uint64_t pp = lookup_cell(state_blk, state_gen, base_blk, base_gen,
+                                      slot_lut, insn_idx, ppage_fids[s]).low64();
+            if (pp != 0) {
+                dp.ppage = pp;
+                dp.has_ppage = true;
+            }
+        }
         if (has_mem) {
             dp.data = lookup_cell(state_blk, state_gen, base_blk, base_gen,
                                   slot_lut, insn_idx, data_fid);
@@ -1132,6 +1157,7 @@ void BodyWalker::decode_field_delta(Reader &outer,
     if (!tmpl) return;
     const bool has_mem = (flags_ & ids.flag_mem_data) != 0;
     const bool has_reg = (flags_ & ids.flag_reg_data) != 0;
+    const bool has_ppage = (flags_ & ids.flag_physaddr) != 0;
 
     for (size_t i = 0; i < tmpl->insns.size(); i++) {
         uint32_t idx = (uint32_t)i;
@@ -1159,7 +1185,8 @@ void BodyWalker::decode_field_delta(Reader &outer,
                                        ids.fid_load_addr,
                                        ids.fid_load_data,
                                        ids.fid_load_size,
-                                       has_mem,
+                                       ids.fid_load_ppage,
+                                       has_mem, has_ppage,
                                        state_blk, state_gen,
                                        base_blk,  base_gen,
                                        slot_lut_, dyn_params);
@@ -1167,7 +1194,8 @@ void BodyWalker::decode_field_delta(Reader &outer,
                                        ids.fid_store_addr,
                                        ids.fid_store_data,
                                        ids.fid_store_size,
-                                       has_mem,
+                                       ids.fid_store_ppage,
+                                       has_mem, has_ppage,
                                        state_blk, state_gen,
                                        base_blk,  base_gen,
                                        slot_lut_, dyn_params);

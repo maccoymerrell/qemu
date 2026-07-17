@@ -6760,6 +6760,16 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      * it wired verbatim rather than mode-gated. */
     g_features.kexc = cfg.kexc != 0;
 
+    /* Physical-page capture is SYSTEM-MODE ONLY: qemu_plugin_get_hwaddr
+     * returns NULL for linux-user, so there is no translation to record.
+     * Forcing it off in user mode keeps user-mode traces byte-identical
+     * regardless of the requested option. */
+    g_features.physaddr = (cfg.physaddr != 0) && g_system_mode;
+    if (cfg.physaddr != 0 && !g_system_mode) {
+        fprintf(stderr, "champsim_tracer: physaddr=1 ignored in user mode "
+                "(no virtual-to-physical translation exists)\n");
+    }
+
     if (!cfg.output_path) {
         cfg.output_path = g_strdup("champsim_tracer_out");
     }

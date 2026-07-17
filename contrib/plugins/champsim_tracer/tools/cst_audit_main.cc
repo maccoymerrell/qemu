@@ -40,8 +40,9 @@ enum : int {
     BIDX_INSN_META  = 7,
     BIDX_EXTENDED   = 8,
     BIDX_LANE_MASK  = 9,
-    BIDX_OTHER      = 10,
-    NUM_BUCKETS     = 11,
+    BIDX_PHYS_PAGE  = 10,   /* CST_FID_LOAD_PPAGE / STORE_PPAGE (physaddr) */
+    BIDX_OTHER      = 11,
+    NUM_BUCKETS     = 12,
 };
 
 /* FID -> bucket lookup over the ULEB FID space.  Slotted families
@@ -69,7 +70,7 @@ struct FidTables {
         const struct {
             const std::array<uint16_t, cst::FID_SLOT_COUNT> *fids;
             uint8_t bucket_id;
-        } fam[9] = {
+        } fam[11] = {
             { &ids.fid_load_addr,             (uint8_t)BIDX_LOAD_ADDR  },
             { &ids.fid_store_addr,            (uint8_t)BIDX_STORE_ADDR },
             { &ids.fid_load_data,             (uint8_t)BIDX_LOAD_DATA  },
@@ -79,6 +80,8 @@ struct FidTables {
             { &ids.fid_dst_lane_mask,         (uint8_t)BIDX_LANE_MASK  },
             { &ids.fid_load_data_lane_mask,   (uint8_t)BIDX_LANE_MASK  },
             { &ids.fid_store_data_lane_mask,  (uint8_t)BIDX_LANE_MASK  },
+            { &ids.fid_load_ppage,            (uint8_t)BIDX_PHYS_PAGE  },
+            { &ids.fid_store_ppage,           (uint8_t)BIDX_PHYS_PAGE  },
         };
         for (int k = 0; k < cst::FID_SLOT_COUNT; k++) {
             for (auto &fa : fam) {
@@ -815,6 +818,7 @@ void print_report(const Stats &s, const cst::Header &h)
         {"instruction metadata", BIDX_INSN_META},
         {"extended",             BIDX_EXTENDED},
         {"lane masks",           BIDX_LANE_MASK},
+        {"physical pages",       BIDX_PHYS_PAGE},
         {"other",                BIDX_OTHER},
     };
     for (auto &r : rows) {

@@ -952,6 +952,24 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        traffic (a device-free or user-mode trace carries no such records
        and is byte-identical), so it is safe to leave on.  ``devio=0``
        disables the hook entirely.
+   * - ``physaddr=0|1``
+     - ``0``
+     - Per-memop physical-page capture (**system mode only**).  When on,
+       every load and store carries the physical **page** base of its
+       access via the ``CST_FID_LOAD_PPAGE`` / ``CST_FID_STORE_PPAGE``
+       families, and the header sets ``CST_FLAG_PHYSADDR``.  A consumer
+       rebuilds the full physical address as
+       ``ppage | (vaddr & 0xFFF)`` — the in-page offset already rides the
+       existing virtual-address fields, so no bits are duplicated (see
+       :doc:`format` §5.3.1).  Only *lazily-observed* translations are
+       recorded: a page's mapping records once on first touch and costs
+       zero bytes thereafter, an in-page walk emits nothing, and an OS
+       remap self-corrects on the next access — the wire never encodes the
+       page table.  Forced **off** in user mode (no virtual-to-physical
+       translation exists there), so a user-mode trace is byte-identical
+       regardless of this option.  An access with no observable RAM
+       translation (MMIO, or a garbage-filled wrong-path access to an
+       absent page) emits no page record for that slot.
    * - ``iframe_rate=<N>``
      - ``100000``
      - Emit a validation IFRAME after every Nth observation of a CP

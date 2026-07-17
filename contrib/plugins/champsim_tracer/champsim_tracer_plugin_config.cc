@@ -97,6 +97,12 @@ bool set_devio(PluginConfig *cfg, const char *v)
     return cfg->devio == 0 || cfg->devio == 1;
 }
 
+bool set_physaddr(PluginConfig *cfg, const char *v)
+{
+    cfg->physaddr = atoi(v);
+    return cfg->physaddr == 0 || cfg->physaddr == 1;
+}
+
 bool set_histogram(PluginConfig *cfg, const char *v)
 {
     int n = atoi(v);
@@ -311,6 +317,7 @@ const struct {
     { "wp_regdata", set_wp_regdata },
     { "kexc",       set_kexc       },
     { "devio",      set_devio      },
+    { "physaddr",   set_physaddr   },
     { "histogram",  set_histogram  },
     { "iframe_rate", set_iframe_rate },
     { "latch_timeout", set_latch_timeout },

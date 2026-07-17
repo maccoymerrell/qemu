@@ -273,7 +273,26 @@ extern "C" {
                                           * anchor on a faulting BB); set in
                                           * system mode so user-mode traces
                                           * carry no trailer */
-/* bits 4..7 reserved */
+#define CST_FLAG_PHYSADDR      (1 << 5)  /* CST_FID_LOAD_PPAGE / STORE_PPAGE
+                                          * families present: per-memop
+                                          * physical PAGE bases for paddr
+                                          * reconstruction.  SYSTEM MODE ONLY
+                                          * (physaddr=1) — user-mode traces
+                                          * never set it and stay byte-
+                                          * identical.  See §5.3.1. */
+/* bits 6..7 reserved */
+
+/* Physical-page granule for the CST_FID_*_PPAGE families.  A ppage value
+ * is the physical address masked to this page size; the consumer rebuilds
+ * the full physical address as  ppage | (vaddr & CST_PPAGE_OFFSET_MASK).
+ * Fixed at 4 KiB: the low 12 bits of a virtual address always equal the
+ * low 12 bits of its physical address (page-offset invariance holds for
+ * every hardware page size >= 4 KiB — 4K/16K/64K/2M/1G alike), so a 4 KiB
+ * granule reconstructs the exact paddr regardless of the guest's actual
+ * page size.  A larger hardware page merely re-emits the (unchanged) ppage
+ * once per 4 KiB step; correctness is independent of the granule. */
+#define CST_PPAGE_SHIFT        (cst_wire::PPAGE_SHIFT)
+#define CST_PPAGE_OFFSET_MASK  (cst_wire::PPAGE_OFFSET_MASK)
 
 /* ===== Field-ID space (unified delta stream) =====
  *
@@ -352,8 +371,25 @@ extern "C" {
 #define CST_FID_INSN_SIZE        (CST_FID_LANE_BLOCK_END + 7)
 #define CST_FID_EXTENDED         (CST_FID_LANE_BLOCK_END + 8)  /* reserved escape */
 
+/* Physical-page block (system mode, gated by CST_FLAG_PHYSADDR).  Two
+ * slotted families parallel to LOAD_ADDR/STORE_ADDR — the physical PAGE
+ * base of each memop slot (see CST_PPAGE_SHIFT).  Kept AFTER the reserved
+ * EXTENDED escape, in its own stride-2 block, so no pre-existing field-id
+ * moves: a trace produced without the flag is byte-identical to one from a
+ * writer that predates the families.  Delta-encoded like every slotted
+ * family (baseline default 0) — a ppage records once per translation and
+ * then costs zero bytes until the mapping changes (in-page walks emit
+ * nothing; an OS remap self-corrects on the next touch). */
+#define CST_FID_PPAGE_BLOCK_BASE  (CST_FID_EXTENDED + 1)
+#define CST_FID_PPAGE_BLOCK_STRIDE 2
+#define CST_FID_LOAD_PPAGE_BASE   (CST_FID_PPAGE_BLOCK_BASE + 0)
+#define CST_FID_STORE_PPAGE_BASE  (CST_FID_PPAGE_BLOCK_BASE + 1)
+#define CST_FID_PPAGE_BLOCK_END   (CST_FID_STORE_PPAGE_BASE + \
+                                   (CST_FID_SLOT_COUNT - 1) * \
+                                   CST_FID_PPAGE_BLOCK_STRIDE)
+
 /* Total well-known field-id count, for sanity / encoding-map size. */
-#define CST_FID_COUNT            (CST_FID_EXTENDED + 1)
+#define CST_FID_COUNT            (CST_FID_PPAGE_BLOCK_END + 1)
 
 /* ===== Types ===== */
 
@@ -896,6 +932,12 @@ typedef struct {
     uint64_t value;        /* vaddr of the access                   */
     uint8_t  data_size;
     CSTWideValue data;
+    /* Physical PAGE base of the access (physaddr=1, system mode), masked
+     * to CST_PPAGE_SHIFT.  ppage_valid is false when no translation was
+     * observable (user mode, MMIO-spec, or a garbage-filled wrong-path
+     * access) — the CST_FID_*_PPAGE record is then omitted for this slot. */
+    uint64_t ppage;
+    bool     ppage_valid;
 } DynParam;
 
 /*
@@ -1117,6 +1159,12 @@ typedef struct {
      * the per-CPU qemu_plugin_spec_mem_faulted_take() flag; the walker marks
      * the owning WP BB entry as a synthetic-data fault at this insn. */
     bool faulted = false;
+    /* Physical PAGE base (physaddr=1, system mode), masked to
+     * CST_PPAGE_SHIFT.  ppage_valid is false when qemu_plugin_get_hwaddr
+     * resolved no translation (user mode always; MMIO/absent-page spec
+     * accesses on the wrong path) — the ppage FID is then omitted. */
+    uint64_t ppage = 0;
+    bool ppage_valid = false;
 } WPMemAccess;
 
 typedef struct BodyStreamState BodyStreamState;
@@ -1291,6 +1339,13 @@ struct TraceFeatures {
      * PathBuilder then consumes-and-ignores ASID_WRITE events.  See the
      * ownership state machine in champsim_tracer_path_builder.h. */
     bool     kexc = false;
+    /* Physical-page capture (physaddr=1): record the physical PAGE base of
+     * every load/store so a consumer can rebuild the physical address as
+     * ppage | (vaddr & CST_PPAGE_OFFSET_MASK).  SYSTEM MODE ONLY — forced
+     * off in user mode (qemu_plugin_get_hwaddr returns NULL there), so a
+     * user-mode trace never emits the CST_FID_*_PPAGE families and stays
+     * byte-identical.  Sets CST_FLAG_PHYSADDR in the header when on. */
+    bool     physaddr = false;
 };
 extern TraceFeatures g_features;
 extern char *qemu_command_line;

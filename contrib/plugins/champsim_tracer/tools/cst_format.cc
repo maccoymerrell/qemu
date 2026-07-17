@@ -335,6 +335,8 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
         { "CST_FID_DST_LANE_MASK",        &ResolvedIds::fid_dst_lane_mask        },
         { "CST_FID_LOAD_DATA_LANE_MASK",  &ResolvedIds::fid_load_data_lane_mask  },
         { "CST_FID_STORE_DATA_LANE_MASK", &ResolvedIds::fid_store_data_lane_mask },
+        { "CST_FID_LOAD_PPAGE",           &ResolvedIds::fid_load_ppage           },
+        { "CST_FID_STORE_PPAGE",          &ResolvedIds::fid_store_ppage          },
     };
     for (const auto &f : fam) {
         for (uint16_t k = 0; k < FID_SLOT_COUNT; k++) {
@@ -395,6 +397,10 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
      * resolves to 0 (never tests set) when absent. */
     resolve_optional_mask(maps.header_flag, "CST_FLAG_FAULT",
                           &ids->flag_fault);
+    /* Optional: present only in system-mode physaddr traces; resolves to 0
+     * (never tests set) when absent. */
+    resolve_optional_mask(maps.header_flag, "CST_FLAG_PHYSADDR",
+                          &ids->flag_physaddr);
 
     /* wp_event_flag (bit masks) */
     resolve_one(maps.wp_event_flag, "wp_event_flag",

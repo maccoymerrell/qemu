@@ -110,6 +110,11 @@ struct ResolvedIds {
     std::array<uint16_t, 64> fid_dst_lane_mask         {};
     std::array<uint16_t, 64> fid_load_data_lane_mask   {};
     std::array<uint16_t, 64> fid_store_data_lane_mask  {};
+    /* Per-slot physical PAGE base of each memop (CST_FID_LOAD_PPAGE /
+     * STORE_PPAGE).  Present only on CST_FLAG_PHYSADDR (system-mode) traces;
+     * absent -> sentinel 0, so a non-physaddr trace resolves none. */
+    std::array<uint16_t, 64> fid_load_ppage            {};
+    std::array<uint16_t, 64> fid_store_ppage           {};
     uint16_t fid_insn_bytes_lo    = 0;
     uint16_t fid_insn_bytes_hi    = 0;
     uint16_t fid_insn_opcode      = 0;
@@ -147,6 +152,10 @@ struct ResolvedIds {
     /* Bit mask within Header::flags marking the per-entry synchronous-fault
      * trailer (exception-nesting depth, + anchor on a faulting BB) present. */
     uint8_t flag_fault = 0;
+    /* Bit mask within Header::flags marking the physical-page families
+     * (CST_FID_LOAD_PPAGE / STORE_PPAGE) present.  Optional: 0 (never set)
+     * on user-mode / non-physaddr traces. */
+    uint8_t flag_physaddr = 0;
 
     /* wp_event_flag map: bit masks inside the per-WP-event flags byte */
     uint8_t wp_event_translation_unavail = 0;
@@ -249,10 +258,23 @@ struct DynParam {
     enum Type : uint8_t { Load, Store };
     Type     type        = Load;
     uint32_t insn_index  = 0;
-    uint64_t addr        = 0;     /* always low 64 bits */
-    Wide     data{};              /* full width when has_mem_data */
+    uint64_t addr        = 0;     /* always low 64 bits (virtual)          */
+    Wide     data{};              /* full width when has_mem_data          */
     bool     has_data    = false;
-    uint8_t  data_size   = 0;     /* access byte width; 0 = not captured */
+    uint8_t  data_size   = 0;     /* access byte width; 0 = not captured    */
+    /* Physical PAGE base of the access (CST_FLAG_PHYSADDR traces, system
+     * mode), masked to cst_wire::PPAGE_SHIFT.  has_ppage is false when the
+     * trace carried no translation for this memop (a non-physaddr trace,
+     * an MMIO/absent-page spec access) — paddr() is then undefined. */
+    uint64_t ppage       = 0;
+    bool     has_ppage   = false;
+
+    /* Reconstructed physical address: the recorded physical page base ORed
+     * with the in-page offset carried by the virtual address.  Valid only
+     * when has_ppage. */
+    uint64_t paddr() const {
+        return ppage | (addr & cst_wire::PPAGE_OFFSET_MASK);
+    }
 };
 
 struct RegSnap {

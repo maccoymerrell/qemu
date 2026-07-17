@@ -102,6 +102,23 @@ enum class Metric {
     DepDepth,
     Ilp,
     ReuseDistance,
+    /* System-mode / execution-context metrics.  Render meaningfully on
+     * system traces (privilege, ASIDs, faults, disk I/O, physical
+     * pages); each degrades to a well-defined chart on traces without
+     * the relevant feature (all-user, single-asid, no-fault, ...), and
+     * the feature-gated ones (devio / physaddr) are dropped from the
+     * unified all-metrics pass when the trace lacks the feature. */
+    UserKernel,
+    FaultRate,
+    ThreadSwitch,
+    AsidTimeline,
+    DevioQueue,
+    DevioLatency,
+    DevioLba,
+    WpTermination,
+    WsDivergence,
+    TranslationChurn,
+    Pagemap,
 };
 
 enum class CachePolicy { LRU, MRU, Random };
@@ -233,6 +250,22 @@ struct Options {
 "                      bottom pane = in-window issue-cycle histogram\n"
 "  -m reuse_distance   Histogram: log-bucketed memop reuse (stack) distance\n"
 "\n"
+"System-mode / context metrics (feature-gated ones are dropped from the\n"
+"all-metrics pass when the trace lacks the feature):\n"
+"  -m user_kernel      User vs kernel instruction share per window\n"
+"  -m fault_rate       Fault excursions/1k (top) + fault-nesting depth (bottom)\n"
+"  -m thread_switch    Thread switches + active threads per window\n"
+"  -m asid_timeline    Address-space (ASID) instruction share per window\n"
+"  -m devio_queue      Disk-I/O queue depth (top) + bytes issued (bottom)\n"
+"  -m devio_latency    Histogram: disk-request STOP-START distance (CP insns)\n"
+"  -m devio_lba        2D grid: disk block (LBA) touched over the run, by r/w\n"
+"  -m wp_termination   WP chain termination mix (completed / fault /\n"
+"                      translation / no-fetch) per window\n"
+"  -m ws_divergence    Virtual vs physical page working set (sliding window)\n"
+"  -m translation_churn  vpage->ppage remaps + first translations /1k\n"
+"  -m pagemap          2D grid: virtual pages touched over the run, colored\n"
+"                      by ASID, remapped pages outlined (physaddr traces)\n"
+"\n"
 "Options:\n"
 "  -H, --history=L,L,...   Gshare history lengths (default 0,2,4,8,12,16,24;\n"
 "                          0 = pure bimodal, 2 = short-history)\n"
@@ -362,6 +395,17 @@ static Metric parse_metric(const char *s)
     if (!std::strcmp(s, "dep_depth"))        return Metric::DepDepth;
     if (!std::strcmp(s, "ilp"))              return Metric::Ilp;
     if (!std::strcmp(s, "reuse_distance"))   return Metric::ReuseDistance;
+    if (!std::strcmp(s, "user_kernel"))      return Metric::UserKernel;
+    if (!std::strcmp(s, "fault_rate"))       return Metric::FaultRate;
+    if (!std::strcmp(s, "thread_switch"))    return Metric::ThreadSwitch;
+    if (!std::strcmp(s, "asid_timeline"))    return Metric::AsidTimeline;
+    if (!std::strcmp(s, "devio_queue"))      return Metric::DevioQueue;
+    if (!std::strcmp(s, "devio_latency"))    return Metric::DevioLatency;
+    if (!std::strcmp(s, "devio_lba"))        return Metric::DevioLba;
+    if (!std::strcmp(s, "wp_termination"))   return Metric::WpTermination;
+    if (!std::strcmp(s, "ws_divergence"))    return Metric::WsDivergence;
+    if (!std::strcmp(s, "translation_churn")) return Metric::TranslationChurn;
+    if (!std::strcmp(s, "pagemap"))          return Metric::Pagemap;
     std::fprintf(stderr, "cst_visualize: unknown metric '%s'\n", s);
     std::exit(2);
 }
@@ -387,6 +431,17 @@ static const char *metric_name(Metric m)
         case Metric::DepDepth:        return "dep_depth";
         case Metric::Ilp:             return "ilp";
         case Metric::ReuseDistance:   return "reuse_distance";
+        case Metric::UserKernel:      return "user_kernel";
+        case Metric::FaultRate:       return "fault_rate";
+        case Metric::ThreadSwitch:    return "thread_switch";
+        case Metric::AsidTimeline:    return "asid_timeline";
+        case Metric::DevioQueue:      return "devio_queue";
+        case Metric::DevioLatency:    return "devio_latency";
+        case Metric::DevioLba:        return "devio_lba";
+        case Metric::WpTermination:   return "wp_termination";
+        case Metric::WsDivergence:    return "ws_divergence";
+        case Metric::TranslationChurn: return "translation_churn";
+        case Metric::Pagemap:         return "pagemap";
     }
     return "unknown";
 }
@@ -397,7 +452,32 @@ static const char *metric_name(Metric m)
 static bool metric_needs_wp(Metric m)
 {
     return m == Metric::WpInsns || m == Metric::WpMemops ||
-           m == Metric::WpDivergence;
+           m == Metric::WpDivergence || m == Metric::WpTermination;
+}
+
+/* Whether a metric reads the physical-page families; dropped from a
+ * --all run on a non-CST_FLAG_PHYSADDR trace (every ppage cell would
+ * read 0). */
+static bool metric_needs_physaddr(Metric m)
+{
+    return m == Metric::WsDivergence || m == Metric::TranslationChurn ||
+           m == Metric::Pagemap;
+}
+
+/* Whether a metric consumes DEVIO disk-I/O records; dropped from a
+ * --all run when the trace's body-tag map never advertised them. */
+static bool metric_needs_devio(Metric m)
+{
+    return m == Metric::DevioQueue || m == Metric::DevioLatency ||
+           m == Metric::DevioLba;
+}
+
+/* Grid metrics render through the bespoke 2D-grid emitter, not a
+ * ChartPlan; they are excluded from aggregate montages and from the
+ * tidy-CSV writer. */
+static bool metric_is_grid(Metric m)
+{
+    return m == Metric::Pagemap || m == Metric::DevioLba;
 }
 
 /* Every metric, in a stable order, for the unified --all run. */
@@ -410,6 +490,10 @@ static std::vector<Metric> all_metrics()
         Metric::BbLength, Metric::IndirectTargets, Metric::BranchEntropy,
         Metric::WorkingSet, Metric::DepDepth, Metric::Ilp,
         Metric::ReuseDistance,
+        Metric::UserKernel, Metric::FaultRate, Metric::ThreadSwitch,
+        Metric::AsidTimeline, Metric::DevioQueue, Metric::DevioLatency,
+        Metric::DevioLba, Metric::WpTermination, Metric::WsDivergence,
+        Metric::TranslationChurn, Metric::Pagemap,
     };
 }
 
@@ -1092,6 +1176,16 @@ static const char *categorical_color(Metric m, const std::string &label)
         case Metric::GenOp:     return gen_op_color(label);
         case Metric::GenReg:    return gen_reg_color(label);
         case Metric::MemPat:    return mem_pat_color(label);
+        case Metric::UserKernel:
+            if (label == "user")   return "#1f77b4";     /* blue */
+            if (label == "kernel") return "#d62728";     /* red  */
+            return color_for_label(label);
+        case Metric::WpTermination:
+            if (label == "completed")        return "#2ca02c"; /* green  */
+            if (label == "fault stop")       return "#d62728"; /* red    */
+            if (label == "translation stop") return "#ff7f0e"; /* orange */
+            if (label == "no fetch")         return "#7f7f7f"; /* gray   */
+            return color_for_label(label);
         default:                return color_for_label(label);
     }
 }
@@ -1759,6 +1853,144 @@ static void render_plan(std::FILE *out, const ChartPlan &plan)
 }
 
 /* ===================================================================
+ *                       Bespoke 2D-grid renderer
+ * ===================================================================
+ *
+ * A GridPlan is a categorical raster: nx x-cells (trace position) by
+ * ny y-rows (an identity axis — virtual pages, disk blocks), each cell
+ * either empty or holding a class index (colored via the shared
+ * palette), optionally marked (drawn with an outline — e.g. a page
+ * whose physical backing changed).  This is a different chart species
+ * from ChartPlan's line/stack/bar plots — an evolving 2D occupancy
+ * canvas — so it gets its own small emitter rather than a ChartPlan
+ * mode. */
+struct GridPlan {
+    std::string title;
+    std::string x_label;
+    std::string y_label;
+    /* Footnote under the title (e.g. "N pages beyond row capacity"). */
+    std::string note;
+    int      nx = 0;
+    int      ny = 0;
+    uint64_t x_cell_insns = 1;    /* CP insns per x cell */
+    /* Row-major [row * nx + x]: 0 = empty, else class index + 1. */
+    std::vector<uint8_t> cell;
+    /* Row-major mark bit: 1 = draw the cell with the churn outline. */
+    std::vector<uint8_t> mark;
+    /* Legend, indexed by class. */
+    std::vector<std::string> class_labels;
+    /* Meaning of the mark outline (legend entry); empty = no marks. */
+    std::string mark_label;
+    /* Sparse y-axis labels: (row, text). */
+    std::vector<std::pair<int, std::string>> row_labels;
+};
+
+static void render_grid(std::FILE *out, const GridPlan &g,
+                        int width, int height)
+{
+    const int ml = 96, mr = 220, mt = 56, mb = 64;
+    write_svg_header(out, width, height);
+    std::fprintf(out,
+        "<rect x=\"0\" y=\"0\" width=\"%d\" height=\"%d\" fill=\"#ffffff\"/>\n",
+        width, height);
+    std::fprintf(out,
+        "<text x=\"%d\" y=\"24\" font-family=\"sans-serif\" font-size=\"17\" "
+        "font-weight=\"bold\" fill=\"#222\">%s</text>\n",
+        ml, xml_escape(g.title).c_str());
+    if (!g.note.empty()) {
+        std::fprintf(out,
+            "<text x=\"%d\" y=\"42\" font-family=\"sans-serif\" "
+            "font-size=\"12\" fill=\"#666\">%s</text>\n",
+            ml, xml_escape(g.note).c_str());
+    }
+    const double pw = (double)(width - ml - mr);
+    const double ph = (double)(height - mt - mb);
+    /* Plot frame. */
+    std::fprintf(out,
+        "<rect x=\"%d\" y=\"%d\" width=\"%.2f\" height=\"%.2f\" "
+        "fill=\"#fafafa\" stroke=\"#cccccc\"/>\n",
+        ml, mt, pw, ph);
+    if (g.nx > 0 && g.ny > 0 && !g.cell.empty()) {
+        const double cw = pw / (double)g.nx;
+        const double ch = ph / (double)g.ny;
+        for (int r = 0; r < g.ny; r++) {
+            for (int x = 0; x < g.nx; x++) {
+                uint8_t c = g.cell[(size_t)r * g.nx + x];
+                if (!c) continue;
+                bool marked = !g.mark.empty() &&
+                              g.mark[(size_t)r * g.nx + x];
+                /* Row 0 at the BOTTOM (low identity low). */
+                double cx = ml + cw * x;
+                double cy = mt + ph - ch * (r + 1);
+                std::fprintf(out,
+                    "<rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" "
+                    "height=\"%.2f\" fill=\"%s\"%s/>\n",
+                    cx, cy, cw > 1.0 ? cw : 1.0, ch > 1.0 ? ch : 1.0,
+                    palette_color((size_t)(c - 1)),
+                    marked ? " stroke=\"#111111\" stroke-width=\"0.9\"" : "");
+            }
+        }
+    }
+    /* X ticks: 5 positions in CP insns. */
+    for (int t = 0; t <= 4; t++) {
+        double fx = ml + pw * t / 4.0;
+        uint64_t v = (uint64_t)((double)g.nx * g.x_cell_insns * t / 4.0);
+        std::fprintf(out,
+            "<line x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\" "
+            "stroke=\"#cccccc\"/>\n"
+            "<text x=\"%.2f\" y=\"%d\" font-family=\"sans-serif\" "
+            "font-size=\"12\" fill=\"#555\" text-anchor=\"middle\">%s</text>\n",
+            fx, mt + (int)ph, fx, mt + (int)ph + 5,
+            fx, mt + (int)ph + 20, fmt_count(v).c_str());
+    }
+    std::fprintf(out,
+        "<text x=\"%.2f\" y=\"%d\" font-family=\"sans-serif\" font-size=\"13\" "
+        "fill=\"#333\" text-anchor=\"middle\">%s</text>\n",
+        ml + pw / 2.0, height - 18, xml_escape(g.x_label).c_str());
+    /* Sparse Y labels. */
+    if (g.ny > 0) {
+        const double ch = ph / (double)g.ny;
+        for (const auto &rl : g.row_labels) {
+            if (rl.first < 0 || rl.first >= g.ny) continue;
+            double cy = mt + ph - ch * (rl.first + 0.5);
+            std::fprintf(out,
+                "<text x=\"%d\" y=\"%.2f\" font-family=\"sans-serif\" "
+                "font-size=\"10\" fill=\"#555\" text-anchor=\"end\">%s</text>\n",
+                ml - 6, cy + 3.5, xml_escape(rl.second).c_str());
+        }
+    }
+    std::fprintf(out,
+        "<text x=\"20\" y=\"%.2f\" font-family=\"sans-serif\" font-size=\"13\" "
+        "fill=\"#333\" text-anchor=\"middle\" "
+        "transform=\"rotate(-90 20 %.2f)\">%s</text>\n",
+        mt + ph / 2.0, mt + ph / 2.0, xml_escape(g.y_label).c_str());
+    /* Legend. */
+    int ly = mt + 6;
+    for (size_t c = 0; c < g.class_labels.size(); c++) {
+        std::fprintf(out,
+            "<rect x=\"%d\" y=\"%d\" width=\"14\" height=\"14\" "
+            "fill=\"%s\"/>\n"
+            "<text x=\"%d\" y=\"%d\" font-family=\"sans-serif\" "
+            "font-size=\"12\" fill=\"#333\">%s</text>\n",
+            width - mr + 24, ly, palette_color(c),
+            width - mr + 44, ly + 11,
+            xml_escape(g.class_labels[c]).c_str());
+        ly += 22;
+    }
+    if (!g.mark_label.empty()) {
+        std::fprintf(out,
+            "<rect x=\"%d\" y=\"%d\" width=\"14\" height=\"14\" "
+            "fill=\"none\" stroke=\"#111111\" stroke-width=\"1.5\"/>\n"
+            "<text x=\"%d\" y=\"%d\" font-family=\"sans-serif\" "
+            "font-size=\"12\" fill=\"#333\">%s</text>\n",
+            width - mr + 24, ly,
+            width - mr + 44, ly + 11,
+            xml_escape(g.mark_label).c_str());
+    }
+    write_svg_footer(out);
+}
+
+/* ===================================================================
  *                          Bin accumulator
  * =================================================================== */
 
@@ -2071,6 +2303,69 @@ struct WalkCtx {
         uint64_t                               cold = 0; /* first-access cnt */
     };
     ReuseDistState ru;
+
+    /* --- user_kernel: per-template kernel (CST_INSN_FLAG_SYSTEM) insn
+     * count, precomputed in build_metric_state so the per-entry step
+     * is one subtraction. */
+    std::vector<uint32_t> tmpl_kernel_insns;
+
+    /* --- fault_rate.  Excursion starts = fault_depth increases over
+     * the previous CP entry; per-bin depth sum / max over entries for
+     * the bottom (nesting) pane. */
+    uint32_t              prev_fault_depth = 0;
+    std::vector<uint64_t> fault_entries_per_bin;   /* entries at depth>0 */
+    std::vector<uint64_t> fault_depth_sum_per_bin;
+    std::vector<uint64_t> fault_depth_max_per_bin;
+    std::vector<uint64_t> entries_per_bin;
+
+    /* --- thread_switch: per-thread last-seen bin, for the distinct-
+     * threads-per-bin series. */
+    std::unordered_map<uint32_t, int> thread_last_bin;
+
+    /* --- devio family: raw disk-I/O event retention (positional; the
+     * record stream is sparse — a handful to a few thousand per trace
+     * — so finalize sweeps the vector instead of binning live). */
+    struct DevioEv {
+        uint64_t pos;      /* CP insns at the record's stream position */
+        uint64_t bytes;    /* START only */
+        uint64_t block;    /* START only: disk block number */
+        uint64_t lat;      /* STOP only: pos - matching START pos */
+        uint8_t  rw;       /* CST_DEVIO_* (START only) */
+        bool     is_start;
+        bool     has_lat;
+    };
+    std::vector<DevioEv> devio_evs;
+    std::unordered_map<uint64_t, std::pair<uint64_t, uint8_t>> devio_open;
+
+    /* --- ws_divergence: sliding-window unique vpage vs ppage counts
+     * (working_set's retire discipline, keyed by page identities). */
+    struct WsDivState {
+        std::deque<std::pair<uint64_t, uint64_t>> v_accesses, p_accesses;
+        std::unordered_map<uint64_t, uint32_t>    v_count, p_count;
+        std::vector<uint64_t> vpages_per_bin;
+        std::vector<uint64_t> ppages_per_bin;
+    };
+    WsDivState wsd;
+
+    /* --- translation_churn + pagemap: last known ppage per vpage. */
+    std::unordered_map<uint64_t, uint64_t> vpage_last_ppage;
+
+    /* --- pagemap grid accumulation.  Rows are vpages in first-touch
+     * order (capped); classes are ASIDs in first-seen order (capped).
+     * Cells are written live; the GridPlan is assembled in finalize. */
+    struct PagemapState {
+        static constexpr int NY = 192;        /* row capacity */
+        static constexpr int MAX_CLASSES = 12;
+        int nx = 0;                            /* set at first use */
+        std::unordered_map<uint64_t, int> vpage_row;
+        std::vector<uint64_t>             row_vpage;   /* row -> vpage */
+        uint64_t                          overflow_pages = 0;
+        std::unordered_map<uint32_t, int> asid_class;
+        std::vector<uint8_t> cell;             /* row-major NY*nx */
+        std::vector<uint8_t> mark;
+        uint64_t             remaps = 0;
+    };
+    PagemapState pm;
 };
 
 /* Helper: classify a template's terminating instruction for
@@ -3040,6 +3335,294 @@ static void handle_genreg_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 }
 
 /* ===================================================================
+ *              System-mode / execution-context handlers
+ * =================================================================== */
+
+/* Per-bin CP-insn accounting shared by the context handlers (the
+ * per-1k normaliser reads cp_insns_per_bin). */
+static inline void ctx_bump_bin(WalkCtx &ctx, int bin, uint32_t n_insns)
+{
+    if ((int)ctx.cp_insns_per_bin.size() <= bin) {
+        ctx.cp_insns_per_bin.resize(bin + 1, 0);
+    }
+    ctx.cp_insns_per_bin[bin] += n_insns;
+    ctx.cp_insns_so_far += n_insns;
+}
+
+/* user_kernel: split each CP BB's insns into user vs kernel by the
+ * template's per-insn CST_INSN_FLAG_SYSTEM counts (precomputed). */
+static void handle_user_kernel_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
+{
+    if (bb.is_wp) return;
+    int bin = bin_of(ctx, ctx.cp_insns_so_far);
+    uint32_t k = (bb.template_index < ctx.tmpl_kernel_insns.size())
+                     ? ctx.tmpl_kernel_insns[bb.template_index] : 0;
+    if (k > bb.n_insns) k = bb.n_insns;
+    ctx.bins.at(0, bin) += (double)(bb.n_insns - k);   /* user   */
+    ctx.bins.at(1, bin) += (double)k;                  /* kernel */
+    ctx_bump_bin(ctx, bin, bb.n_insns);
+}
+
+/* fault_rate: excursion starts (fault_depth increases) per bin, plus
+ * per-bin nesting-depth stats over the entries executing in handlers. */
+static void handle_fault_rate_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
+{
+    if (bb.is_wp) return;
+    int bin = bin_of(ctx, ctx.cp_insns_so_far);
+    if ((int)ctx.entries_per_bin.size() <= bin) {
+        ctx.entries_per_bin.resize(bin + 1, 0);
+        ctx.fault_entries_per_bin.resize(bin + 1, 0);
+        ctx.fault_depth_sum_per_bin.resize(bin + 1, 0);
+        ctx.fault_depth_max_per_bin.resize(bin + 1, 0);
+    }
+    ctx.entries_per_bin[bin]++;
+    if (bb.fault_depth > ctx.prev_fault_depth) {
+        /* One excursion start per depth step gained. */
+        ctx.bins.at(0, bin) +=
+            (double)(bb.fault_depth - ctx.prev_fault_depth);
+    }
+    if (bb.fault_depth > 0) {
+        ctx.fault_entries_per_bin[bin]++;
+        ctx.fault_depth_sum_per_bin[bin] += bb.fault_depth;
+        if (bb.fault_depth > ctx.fault_depth_max_per_bin[bin]) {
+            ctx.fault_depth_max_per_bin[bin] = bb.fault_depth;
+        }
+    }
+    ctx.prev_fault_depth = bb.fault_depth;
+    ctx_bump_bin(ctx, bin, bb.n_insns);
+}
+
+/* thread_switch: switch records + distinct active threads per bin. */
+static void handle_thread_switch_bb(WalkCtx &ctx,
+                                    const cst::BodyWalker::BB &bb)
+{
+    if (bb.is_wp) return;
+    int bin = bin_of(ctx, ctx.cp_insns_so_far);
+    if (bb.thread_switched) {
+        ctx.bins.at(0, bin) += 1.0;
+    }
+    auto it = ctx.thread_last_bin.find(bb.thread_id);
+    if (it == ctx.thread_last_bin.end() || it->second != bin) {
+        ctx.bins.at(1, bin) += 1.0;      /* thread active in this bin */
+        ctx.thread_last_bin[bb.thread_id] = bin;
+    }
+    ctx_bump_bin(ctx, bin, bb.n_insns);
+}
+
+/* asid_timeline: per-ASID instruction share, stacked.  Labels are
+ * registered on first sight (deterministic: trace order). */
+static void handle_asid_timeline_bb(WalkCtx &ctx,
+                                    const cst::BodyWalker::BB &bb)
+{
+    if (bb.is_wp) return;
+    int bin = bin_of(ctx, ctx.cp_insns_so_far);
+    int sid = ctx.add_label("asid " + std::to_string(bb.asid));
+    ctx.bins.at(sid, bin) += (double)bb.n_insns;
+    ctx_bump_bin(ctx, bin, bb.n_insns);
+}
+
+/* Positional walker for the metrics whose data arrives on the DEVIO /
+ * WP-events callbacks: track the CP-insn clock and the current bin. */
+static void handle_position_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
+{
+    if (bb.is_wp) return;
+    int bin = bin_of(ctx, ctx.cp_insns_so_far);
+    ctx.pending_bin = (uint64_t)bin;
+    ctx_bump_bin(ctx, bin, bb.n_insns);
+}
+
+/* DEVIO record sink (devio_queue / devio_latency / devio_lba): retain
+ * the raw positional event; finalize sweeps the (small) vector. */
+static void handle_devio_event(WalkCtx &ctx, const cst::DecodedDevio &d)
+{
+    WalkCtx::DevioEv ev{};
+    ev.pos      = ctx.cp_insns_so_far;
+    ev.is_start = d.is_start;
+    if (d.is_start) {
+        ev.bytes = d.bytes;
+        ev.block = d.block;
+        ev.rw    = d.rw;
+        ctx.devio_open[d.request_id] = {ev.pos, d.rw};
+    } else {
+        auto it = ctx.devio_open.find(d.request_id);
+        if (it != ctx.devio_open.end()) {
+            ev.lat     = ev.pos - it->second.first;
+            ev.rw      = it->second.second;
+            ev.has_lat = true;
+            ctx.devio_open.erase(it);
+        }
+    }
+    ctx.devio_evs.push_back(ev);
+}
+
+/* WP-events summary sink (wp_termination): classify how each CP
+ * entry's wrong-path chain ended. */
+static void handle_wp_events(WalkCtx &ctx,
+                             const cst::BodyWalker::WpEventsSummary &s)
+{
+    int cls;
+    if (s.chain_len == 0) {
+        cls = 3;                     /* no fetch */
+    } else if (s.last_fault) {
+        cls = 1;                     /* fault stop */
+    } else if (s.last_unavail) {
+        cls = 2;                     /* translation stop */
+    } else {
+        cls = 0;                     /* completed (budget / natural) */
+    }
+    ctx.bins.at(cls, (int)ctx.pending_bin) += 1.0;
+}
+
+/* Iterate one CP BB's memops with both the virtual address and the
+ * physical-page cell (CST_FLAG_PHYSADDR).  Mirrors for_each_cp_memop's
+ * slot ordering + clamp. */
+template <typename F>
+static inline void for_each_cp_memop_pp(const cst::BodyWalker::BB &bb, F &&f)
+{
+    for (uint32_t i = 0; i < bb.n_insns; i++) {
+        uint64_t nl = bb.load_count(i);
+        if (nl > cst::FID_SLOT_COUNT) nl = cst::FID_SLOT_COUNT;
+        for (uint32_t k = 0; k < nl; k++) {
+            f(bb.load_addr(i, k), bb.load_ppage(i, k));
+        }
+        uint64_t ns = bb.store_count(i);
+        if (ns > cst::FID_SLOT_COUNT) ns = cst::FID_SLOT_COUNT;
+        for (uint32_t k = 0; k < ns; k++) {
+            f(bb.store_addr(i, k), bb.store_ppage(i, k));
+        }
+    }
+}
+
+/* ws_divergence: live unique virtual pages vs unique physical pages
+ * over a sliding --ws-window of CP insns (working_set's retirement
+ * discipline).  A vpage:ppage ratio > 1 exposes aliasing (several
+ * vpages onto one frame); a ppage count trailing vpage growth exposes
+ * lazily-backed regions. */
+static void handle_ws_divergence_bb(WalkCtx &ctx,
+                                    const cst::BodyWalker::BB &bb)
+{
+    if (bb.is_wp) return;
+    auto &w = ctx.wsd;
+    int bin = bin_of(ctx, ctx.cp_insns_so_far);
+    uint64_t now = ctx.cp_insns_so_far;
+    uint64_t window = ctx.opts.ws_window;
+    uint64_t cutoff = now > window ? now - window : 0;
+    auto retire = [&](std::deque<std::pair<uint64_t, uint64_t>> &dq,
+                      std::unordered_map<uint64_t, uint32_t> &cnt) {
+        while (!dq.empty() && dq.front().first < cutoff) {
+            uint64_t key = dq.front().second;
+            dq.pop_front();
+            auto it = cnt.find(key);
+            if (it != cnt.end() && --it->second == 0) cnt.erase(it);
+        }
+    };
+    retire(w.v_accesses, w.v_count);
+    retire(w.p_accesses, w.p_count);
+    for_each_cp_memop_pp(bb, [&](uint64_t addr, uint64_t ppage) {
+        uint64_t vpage = addr >> 12;
+        w.v_accesses.emplace_back(now, vpage);
+        w.v_count[vpage]++;
+        if (ppage != 0) {
+            w.p_accesses.emplace_back(now, ppage);
+            w.p_count[ppage]++;
+        }
+    });
+    if ((int)w.vpages_per_bin.size() <= bin) {
+        w.vpages_per_bin.resize(bin + 1, 0);
+        w.ppages_per_bin.resize(bin + 1, 0);
+    }
+    w.vpages_per_bin[bin] = w.v_count.size();
+    w.ppages_per_bin[bin] = w.p_count.size();
+    ctx_bump_bin(ctx, bin, bb.n_insns);
+}
+
+/* translation_churn: vpage->ppage remaps (an already-translated page
+ * observed with a different frame) and first translations, per bin. */
+static void handle_translation_churn_bb(WalkCtx &ctx,
+                                        const cst::BodyWalker::BB &bb)
+{
+    if (bb.is_wp) return;
+    int bin = bin_of(ctx, ctx.cp_insns_so_far);
+    for_each_cp_memop_pp(bb, [&](uint64_t addr, uint64_t ppage) {
+        if (ppage == 0) return;
+        uint64_t vpage = addr >> 12;
+        auto it = ctx.vpage_last_ppage.find(vpage);
+        if (it == ctx.vpage_last_ppage.end()) {
+            ctx.bins.at(1, bin) += 1.0;          /* first translation */
+            ctx.vpage_last_ppage.emplace(vpage, ppage);
+        } else if (it->second != ppage) {
+            ctx.bins.at(0, bin) += 1.0;          /* remap */
+            it->second = ppage;
+        }
+    });
+    ctx_bump_bin(ctx, bin, bb.n_insns);
+}
+
+/* pagemap: 2D occupancy raster.  Rows = virtual pages in first-touch
+ * order (capped at PagemapState::NY); x = trace position; cell class =
+ * the ASID that touched the page there; marked cells = the page's
+ * physical backing changed relative to its previous observation. */
+static void handle_pagemap_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
+{
+    if (bb.is_wp) return;
+    auto &pm = ctx.pm;
+    if (pm.nx == 0) {
+        pm.nx = ctx.opts.bins < 240 ? ctx.opts.bins : 240;
+        pm.cell.assign((size_t)WalkCtx::PagemapState::NY * pm.nx, 0);
+        pm.mark.assign((size_t)WalkCtx::PagemapState::NY * pm.nx, 0);
+    }
+    int bin = bin_of(ctx, ctx.cp_insns_so_far);
+    int gx = (int)((int64_t)bin * pm.nx / ctx.opts.bins);
+    if (gx >= pm.nx) gx = pm.nx - 1;
+    /* ASID class (first-seen order, capped; the overflow class folds
+     * every further ASID). */
+    int cls;
+    {
+        auto it = pm.asid_class.find(bb.asid);
+        if (it != pm.asid_class.end()) {
+            cls = it->second;
+        } else if ((int)pm.asid_class.size() <
+                   WalkCtx::PagemapState::MAX_CLASSES - 1) {
+            cls = (int)pm.asid_class.size();
+            pm.asid_class.emplace(bb.asid, cls);
+        } else {
+            cls = WalkCtx::PagemapState::MAX_CLASSES - 1;   /* "other" */
+            pm.asid_class.emplace(bb.asid, cls);
+        }
+    }
+    for_each_cp_memop_pp(bb, [&](uint64_t addr, uint64_t ppage) {
+        uint64_t vpage = addr >> 12;
+        int row;
+        auto it = pm.vpage_row.find(vpage);
+        if (it != pm.vpage_row.end()) {
+            row = it->second;
+        } else if ((int)pm.row_vpage.size() < WalkCtx::PagemapState::NY) {
+            row = (int)pm.row_vpage.size();
+            pm.row_vpage.push_back(vpage);
+            pm.vpage_row.emplace(vpage, row);
+        } else {
+            pm.vpage_row.emplace(vpage, -1);
+            pm.overflow_pages++;
+            return;
+        }
+        if (row < 0) return;
+        size_t ci = (size_t)row * pm.nx + gx;
+        pm.cell[ci] = (uint8_t)(cls + 1);
+        if (ppage != 0) {
+            auto pit = ctx.vpage_last_ppage.find(vpage);
+            if (pit == ctx.vpage_last_ppage.end()) {
+                ctx.vpage_last_ppage.emplace(vpage, ppage);
+            } else if (pit->second != ppage) {
+                pm.mark[ci] = 1;
+                pm.remaps++;
+                pit->second = ppage;
+            }
+        }
+    });
+    ctx_bump_bin(ctx, bin, bb.n_insns);
+}
+
+/* ===================================================================
  *                            Main driver
  * =================================================================== */
 
@@ -3050,6 +3633,9 @@ static void handle_genreg_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 struct TraceResult {
     ChartPlan   plan, plan2;
     bool        has_second_pane = false;
+    /* Grid metrics (pagemap / devio_lba) render through the bespoke 2D
+     * emitter instead of the plans; null for every ChartPlan metric. */
+    std::shared_ptr<GridPlan> grid;
     double      weight          = 0.0;        /* header simpoint_weight   */
     uint64_t    start_insn      = 0;          /* program-order sort key   */
     uint64_t    warmup_end_insns = UINT64_MAX;/* header §2.13             */
@@ -3204,7 +3790,7 @@ static int write_csv_result(const TraceResult &tr, const Options &opts)
 
 static int render_result(const TraceResult &tr, const Options &opts)
 {
-    if (opts.csv_output) {
+    if (opts.csv_output && !tr.grid) {
         int rc = write_csv_result(tr, opts);
         /* --csv alone (no -o) emits only CSV; with -o, also draw the SVG. */
         if (rc != 0 || !opts.output) {
@@ -3219,6 +3805,14 @@ static int render_result(const TraceResult &tr, const Options &opts)
                          opts.output);
             return 1;
         }
+    }
+    /* Grid metrics (pagemap / devio_lba): bespoke 2D emitter.  The
+     * tidy-CSV contract covers ChartPlan series only, so --csv is a
+     * no-op for these. */
+    if (tr.grid) {
+        render_grid(out, *tr.grid, opts.width, opts.height);
+        if (opts.output) std::fclose(out);
+        return 0;
     }
     ChartPlan plan  = tr.plan;
     ChartPlan plan2 = tr.plan2;
@@ -3400,12 +3994,27 @@ int main(int argc, char **argv)
         for (Metric m : mlist) {
             auto it = per_metric.find((int)m);
             if (it == per_metric.end() || it->second.empty()) continue;
+            if (metric_is_grid(m)) {
+                /* A grid is a per-trace occupancy raster; a weighted
+                 * montage of rasters has no defined composition.  Render
+                 * per-trace grids with single-trace invocations. */
+                std::fprintf(stderr, "cst_visualize: skipping %s in "
+                             "aggregate mode (grid metrics render "
+                             "per-trace)\n", metric_name(m));
+                continue;
+            }
             TraceResult agg = aggregate_results(it->second, opts);
             render_to_prefix(agg, m, opts, /*agg=*/true);
         }
         return 0;
     }
 
+    if (metric_is_grid(opts.metric)) {
+        std::fprintf(stderr, "cst_visualize: %s does not support aggregate "
+                     "mode (grid metrics render per-trace)\n",
+                     metric_name(opts.metric));
+        return 2;
+    }
     std::vector<TraceResult> rs;
     rs.reserve(N);
     for (size_t i = 0; i < N; i++) {
@@ -3657,6 +4266,34 @@ static void build_metric_state(WalkCtx &ctx,
         for (int n : opts.btb_entries) if (n > gate_size) gate_size = n;
         if (gate_size > 0) ctx.bp_btb_gate = BTB(gate_size);
     }
+
+    /* user_kernel: fixed two-series order + per-template kernel-insn
+     * counts (CST_INSN_FLAG_SYSTEM is a per-insn template property). */
+    if (opts.metric == Metric::UserKernel) {
+        ctx.add_label("user");
+        ctx.add_label("kernel");
+        ctx.tmpl_kernel_insns.resize(templates.size(), 0);
+        for (size_t i = 0; i < templates.size(); i++) {
+            uint32_t k = 0;
+            for (const auto &I : templates[i].insns) {
+                if (I.is_system) k++;
+            }
+            ctx.tmpl_kernel_insns[i] = k;
+        }
+    }
+    /* wp_termination: fixed class order (indices are hard-wired in
+     * handle_wp_events). */
+    if (opts.metric == Metric::WpTermination) {
+        ctx.add_label("completed");
+        ctx.add_label("fault stop");
+        ctx.add_label("translation stop");
+        ctx.add_label("no fetch");
+    }
+    /* translation_churn: fixed two-series order. */
+    if (opts.metric == Metric::TranslationChurn) {
+        ctx.add_label("remaps");
+        ctx.add_label("first translations");
+    }
 }
 
 /*
@@ -3742,6 +4379,34 @@ static std::string title_for(const Options &opts)
         }
         case Metric::ReuseDistance:
             return "Memory reuse-distance histogram";
+        case Metric::UserKernel:
+            return "User vs kernel instruction share";
+        case Metric::FaultRate:
+            return "Synchronous-fault activity";
+        case Metric::ThreadSwitch:
+            return "Thread scheduling activity";
+        case Metric::AsidTimeline:
+            return "Address-space (ASID) instruction share";
+        case Metric::DevioQueue:
+            return "Disk-I/O request activity";
+        case Metric::DevioLatency:
+            return "Disk-request STOP-START distance";
+        case Metric::DevioLba:
+            return "Disk blocks touched over the run";
+        case Metric::WpTermination:
+            return "Wrong-path chain termination mix";
+        case Metric::WsDivergence: {
+            char b[96];
+            uint64_t w = opts.ws_window;
+            std::snprintf(b, sizeof(b),
+                "Virtual vs physical page working set (window: %luK insns)",
+                (unsigned long)(w / 1000));
+            return std::string(b);
+        }
+        case Metric::TranslationChurn:
+            return "Translation churn (vpage-to-ppage remaps)";
+        case Metric::Pagemap:
+            return "Page map: virtual pages by ASID over the run";
     }
     return "";
 }
@@ -3760,7 +4425,9 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
      * configured @opts.bins (bin_of caps any overflow). */
     int actual_bins = opts.bins;
 
-    /* Build the chart plan and render. */
+    /* Build the chart plan and render.  Grid metrics assemble a
+     * GridPlan into @result_grid instead of the ChartPlans. */
+    std::shared_ptr<GridPlan> result_grid;
     ChartPlan plan;
     plan.viewport_w = opts.width;
     plan.viewport_h = opts.height;
@@ -3960,9 +4627,12 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
         case Metric::MemPat:
         case Metric::BranchDir:
         case Metric::GenOp:
-        case Metric::GenReg: {
+        case Metric::GenReg:
+        case Metric::UserKernel:
+        case Metric::AsidTimeline:
+        case Metric::WpTermination: {
             const char *cp_y_axis;
-            const char *wp_y_axis;
+            const char *wp_y_axis = "";
             switch (opts.metric) {
                 case Metric::MemPat:
                     cp_y_axis = "CP memops"; wp_y_axis = "WP memops"; break;
@@ -3970,6 +4640,11 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
                     cp_y_axis = "CP branches"; wp_y_axis = "WP branches"; break;
                 case Metric::GenOp:
                     cp_y_axis = "CP insns"; wp_y_axis = "WP insns"; break;
+                case Metric::UserKernel:
+                case Metric::AsidTimeline:
+                    cp_y_axis = "CP insns"; break;
+                case Metric::WpTermination:
+                    cp_y_axis = "WP chains"; break;
                 default:
                     cp_y_axis = "CP dst-reg refs";
                     wp_y_axis = "WP dst-reg refs"; break;
@@ -4014,6 +4689,337 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
                 plan2.title = std::string(pick_title()) + " (WP)";
                 has_second_pane = true;
             }
+            break;
+        }
+        case Metric::FaultRate: {
+            /* Top pane: fault-excursion starts per 1k CP insns.
+             * Bottom pane: nesting depth over the window — mean depth
+             * across the entries executing inside a handler, plus the
+             * per-bin maximum, so a deepening fault stack is visible
+             * even when handler time is a small share of the bin. */
+            plan.mode = ChartPlan::Mode::Lines;
+            plan.y_label = "fault excursions / 1k CP";
+            plan.series.resize(1);
+            plan.series[0].label = "excursions";
+            plan.series[0].color = palette_color(1);
+            plan.series[0].y.assign((size_t)actual_bins, 0.0);
+            double ymax1 = 0.0;
+            for (int b = 0; b < actual_bins; b++) {
+                double v = per_kilo(ctx.bins.get(0, b), b);
+                plan.series[0].y[b] = v;
+                if (b >= opts.warmup_bins && v > ymax1) ymax1 = v;
+            }
+            plan.y_max = ymax1 > 0 ? ymax1 * 1.1 : 1.0;
+            plan.warmup_bins = 0;
+
+            plan2.mode = ChartPlan::Mode::Lines;
+            plan2.y_label = "fault-nesting depth";
+            plan2.y_is_count = true;
+            plan2.series.resize(2);
+            plan2.series[0].label = "mean (handler entries)";
+            plan2.series[0].color = palette_color(0);
+            plan2.series[1].label = "max";
+            plan2.series[1].color = palette_color(3);
+            plan2.series[0].y.assign((size_t)actual_bins, 0.0);
+            plan2.series[1].y.assign((size_t)actual_bins, 0.0);
+            double ymax2 = 0.0;
+            for (int b = 0; b < actual_bins; b++) {
+                uint64_t fe = b < (int)ctx.fault_entries_per_bin.size()
+                                  ? ctx.fault_entries_per_bin[b] : 0;
+                uint64_t sum = b < (int)ctx.fault_depth_sum_per_bin.size()
+                                   ? ctx.fault_depth_sum_per_bin[b] : 0;
+                uint64_t mx = b < (int)ctx.fault_depth_max_per_bin.size()
+                                  ? ctx.fault_depth_max_per_bin[b] : 0;
+                plan2.series[0].y[b] = fe ? (double)sum / (double)fe : 0.0;
+                plan2.series[1].y[b] = (double)mx;
+                if ((double)mx > ymax2) ymax2 = (double)mx;
+            }
+            plan2.y_max = ymax2 > 0 ? ymax2 * 1.1 : 1.0;
+            plan2.warmup_bins = 0;
+            plan.title  = std::string(pick_title()) + " (rate)";
+            plan2.title = std::string(pick_title()) + " (nesting depth)";
+            has_second_pane = true;
+            break;
+        }
+        case Metric::ThreadSwitch: {
+            plan.mode = ChartPlan::Mode::Lines;
+            plan.y_label = "count per window";
+            plan.y_is_count = true;
+            plan.series.resize(2);
+            plan.series[0].label = "thread switches";
+            plan.series[0].color = palette_color(1);
+            plan.series[1].label = "active threads";
+            plan.series[1].color = palette_color(0);
+            plan.series[0].y.assign((size_t)actual_bins, 0.0);
+            plan.series[1].y.assign((size_t)actual_bins, 0.0);
+            double ymax = 0.0;
+            for (int b = 0; b < actual_bins; b++) {
+                double sw = ctx.bins.get(0, b);
+                double th = ctx.bins.get(1, b);
+                plan.series[0].y[b] = sw;
+                plan.series[1].y[b] = th;
+                if (sw > ymax) ymax = sw;
+                if (th > ymax) ymax = th;
+            }
+            plan.y_max = ymax > 0 ? ymax * 1.1 : 1.0;
+            plan.warmup_bins = 0;
+            break;
+        }
+        case Metric::DevioQueue: {
+            /* Sweep the retained DEVIO events once: per-bin peak
+             * outstanding requests (top) and per-bin bytes issued,
+             * split by direction (bottom).  Bins follow the shared
+             * CP-instruction x-axis. */
+            std::vector<double> depth((size_t)actual_bins, 0.0);
+            std::vector<double> rd((size_t)actual_bins, 0.0);
+            std::vector<double> wr((size_t)actual_bins, 0.0);
+            int64_t outstanding = 0;
+            for (const auto &ev : ctx.devio_evs) {
+                int b = (int)(ev.pos / bin_width);
+                if (b >= actual_bins) b = actual_bins - 1;
+                if (ev.is_start) {
+                    outstanding++;
+                    if (ev.rw == CST_DEVIO_READ)  rd[(size_t)b] += ev.bytes;
+                    if (ev.rw == CST_DEVIO_WRITE) wr[(size_t)b] += ev.bytes;
+                } else if (outstanding > 0) {
+                    outstanding--;
+                }
+                if ((double)outstanding > depth[(size_t)b]) {
+                    depth[(size_t)b] = (double)outstanding;
+                }
+            }
+            plan.mode = ChartPlan::Mode::Lines;
+            plan.y_label = "peak outstanding requests";
+            plan.y_is_count = true;
+            plan.series.resize(1);
+            plan.series[0].label = "queue depth";
+            plan.series[0].color = palette_color(0);
+            plan.series[0].y = depth;
+            double ymax1 = 0.0;
+            for (double v : depth) if (v > ymax1) ymax1 = v;
+            plan.y_max = ymax1 > 0 ? ymax1 * 1.1 : 1.0;
+            plan.warmup_bins = 0;
+
+            plan2.mode = ChartPlan::Mode::Lines;
+            plan2.y_label = "bytes issued per window";
+            plan2.y_is_count = true;
+            plan2.series.resize(2);
+            plan2.series[0].label = "read";
+            plan2.series[0].color = palette_color(2);
+            plan2.series[1].label = "write";
+            plan2.series[1].color = palette_color(3);
+            plan2.series[0].y = rd;
+            plan2.series[1].y = wr;
+            double ymax2 = 0.0;
+            for (double v : rd) if (v > ymax2) ymax2 = v;
+            for (double v : wr) if (v > ymax2) ymax2 = v;
+            plan2.y_max = ymax2 > 0 ? ymax2 * 1.1 : 1.0;
+            plan2.warmup_bins = 0;
+            plan.title  = std::string(pick_title()) + " (queue depth)";
+            plan2.title = std::string(pick_title()) + " (bytes)";
+            has_second_pane = true;
+            break;
+        }
+        case Metric::DevioLatency: {
+            /* Log2-bucketed histogram of STOP-START distances in CP
+             * insns (the positional cost of each disk request).  Same
+             * Bars shape as reuse_distance. */
+            std::vector<uint64_t> hist;
+            for (const auto &ev : ctx.devio_evs) {
+                if (ev.is_start || !ev.has_lat) continue;
+                size_t bkt = 0;
+                uint64_t d = ev.lat;
+                while (d > 0) { bkt++; d >>= 1; }
+                if (hist.size() <= bkt) hist.resize(bkt + 1, 0);
+                hist[bkt]++;
+            }
+            if (hist.empty()) hist.assign(1, 0);
+            plan.mode = ChartPlan::Mode::Bars;
+            plan.n_bins = (int)hist.size();
+            plan.x_bin_size = 1;
+            plan.x_label = "STOP-START distance (CP insns)";
+            plan.y_label = "requests";
+            plan.y_is_count = true;
+            plan.percent = false;
+            plan.warmup_bins = 0;
+            plan.series.resize(1);
+            plan.series[0].label = "";
+            plan.series[0].color = palette_color(0);
+            plan.series[0].y.assign(hist.size(), 0.0);
+            uint64_t peak = 0;
+            for (size_t b = 0; b < hist.size(); b++) {
+                plan.series[0].y[b] = (double)hist[b];
+                if (hist[b] > peak) peak = hist[b];
+            }
+            plan.y_max = peak > 0 ? (double)peak * 1.1 : 1.0;
+            plan.x_tick_labels.clear();
+            for (size_t b = 0; b < hist.size(); b++) {
+                plan.x_tick_labels.push_back(
+                    b == 0 ? "0" : "<" + fmt_count(1ull << b));
+            }
+            break;
+        }
+        case Metric::DevioLba: {
+            /* 2D grid: distinct disk blocks (rows, ascending) touched
+             * over the run, colored by direction. */
+            auto g = std::make_shared<GridPlan>();
+            std::vector<uint64_t> blocks;
+            for (const auto &ev : ctx.devio_evs) {
+                if (ev.is_start && ev.rw != CST_DEVIO_FLUSH) {
+                    blocks.push_back(ev.block);
+                }
+            }
+            std::sort(blocks.begin(), blocks.end());
+            blocks.erase(std::unique(blocks.begin(), blocks.end()),
+                         blocks.end());
+            const int NY_CAP = 64;
+            uint64_t folded = 0;
+            if ((int)blocks.size() > NY_CAP) {
+                folded = blocks.size() - NY_CAP;
+                blocks.resize(NY_CAP);
+            }
+            std::unordered_map<uint64_t, int> row_of;
+            for (size_t r = 0; r < blocks.size(); r++) {
+                row_of[blocks[r]] = (int)r;
+            }
+            g->nx = actual_bins < 240 ? actual_bins : 240;
+            g->ny = blocks.empty() ? 1 : (int)blocks.size();
+            g->x_cell_insns =
+                (bin_width * (uint64_t)actual_bins) / (uint64_t)g->nx;
+            if (g->x_cell_insns == 0) g->x_cell_insns = 1;
+            g->cell.assign((size_t)g->ny * g->nx, 0);
+            for (const auto &ev : ctx.devio_evs) {
+                if (!ev.is_start || ev.rw == CST_DEVIO_FLUSH) continue;
+                auto it = row_of.find(ev.block);
+                if (it == row_of.end()) continue;
+                int gx = (int)(ev.pos / g->x_cell_insns);
+                if (gx >= g->nx) gx = g->nx - 1;
+                size_t ci = (size_t)it->second * g->nx + gx;
+                uint8_t cls = (ev.rw == CST_DEVIO_READ) ? 1 : 2;
+                if (g->cell[ci] != 0 && g->cell[ci] != cls) cls = 3;
+                g->cell[ci] = cls;
+            }
+            g->class_labels = {"read", "write", "read+write"};
+            g->title   = title_for(opts);
+            g->x_label = "CP instruction window";
+            g->y_label = "disk block (LBA)";
+            for (size_t r = 0; r < blocks.size();
+                 r += blocks.size() > 8 ? blocks.size() / 8 : 1) {
+                g->row_labels.emplace_back((int)r, fmt_count(blocks[r]));
+            }
+            if (folded) {
+                g->note = fmt_count(folded) +
+                          " further distinct blocks beyond row capacity";
+            }
+            result_grid = g;
+            break;
+        }
+        case Metric::WsDivergence: {
+            plan.mode = ChartPlan::Mode::Lines;
+            plan.y_label = "unique pages in window";
+            plan.y_is_count = true;
+            plan.series.resize(2);
+            plan.series[0].label = "virtual pages";
+            plan.series[0].color = palette_color(0);
+            plan.series[1].label = "physical pages";
+            plan.series[1].color = palette_color(3);
+            plan.series[0].y.assign((size_t)actual_bins, 0.0);
+            plan.series[1].y.assign((size_t)actual_bins, 0.0);
+            uint64_t lv = 0, lp = 0, peak = 0;
+            for (int b = 0; b < actual_bins; b++) {
+                if (b < (int)ctx.wsd.vpages_per_bin.size()) {
+                    lv = ctx.wsd.vpages_per_bin[b];
+                }
+                if (b < (int)ctx.wsd.ppages_per_bin.size()) {
+                    lp = ctx.wsd.ppages_per_bin[b];
+                }
+                plan.series[0].y[b] = (double)lv;
+                plan.series[1].y[b] = (double)lp;
+                if (lv > peak) peak = lv;
+                if (lp > peak) peak = lp;
+            }
+            plan.y_max = peak > 0 ? (double)peak * 1.1 : 1.0;
+            plan.warmup_bins = 0;
+            break;
+        }
+        case Metric::TranslationChurn: {
+            build_lines_plan(plan, ctx.bins, std::vector<int>{0, 1},
+                             per_kilo, "events / 1k CP", false);
+            plan.series[0].label = "remaps";
+            plan.series[1].label = "first translations";
+            break;
+        }
+        case Metric::Pagemap: {
+            auto g = std::make_shared<GridPlan>();
+            const auto &pm = ctx.pm;
+            g->nx = pm.nx > 0 ? pm.nx
+                              : (actual_bins < 240 ? actual_bins : 240);
+            g->ny = WalkCtx::PagemapState::NY;
+            g->x_cell_insns =
+                (bin_width * (uint64_t)actual_bins) / (uint64_t)g->nx;
+            if (g->x_cell_insns == 0) g->x_cell_insns = 1;
+            if (!pm.cell.empty()) {
+                g->cell = pm.cell;
+                g->mark = pm.mark;
+            } else {
+                g->cell.assign((size_t)g->ny * g->nx, 0);
+            }
+            /* Legend: ASID classes in class order. */
+            {
+                std::vector<std::string> labels(
+                    (size_t)WalkCtx::PagemapState::MAX_CLASSES);
+                int max_cls = -1;
+                bool other_used = false;
+                for (const auto &kv : pm.asid_class) {
+                    int cls = kv.second;
+                    if (cls > max_cls) max_cls = cls;
+                    if (cls == WalkCtx::PagemapState::MAX_CLASSES - 1 &&
+                        !labels[(size_t)cls].empty()) {
+                        other_used = true;
+                        continue;
+                    }
+                    if (labels[(size_t)cls].empty()) {
+                        labels[(size_t)cls] =
+                            "asid " + std::to_string(kv.first);
+                    } else {
+                        other_used = true;
+                    }
+                }
+                if (other_used &&
+                    max_cls == WalkCtx::PagemapState::MAX_CLASSES - 1) {
+                    labels[(size_t)max_cls] = "other asids";
+                }
+                for (int c = 0; c <= max_cls; c++) {
+                    g->class_labels.push_back(labels[(size_t)c]);
+                }
+            }
+            if (pm.remaps) {
+                g->mark_label = "physical remap";
+            }
+            /* Sparse row labels: the page's virtual address. */
+            for (size_t r = 0; r < pm.row_vpage.size();
+                 r += pm.row_vpage.size() > 8 ? pm.row_vpage.size() / 8 : 1) {
+                char b[32];
+                std::snprintf(b, sizeof(b), "0x%llx",
+                              (unsigned long long)(pm.row_vpage[r] << 12));
+                g->row_labels.emplace_back((int)r, b);
+            }
+            g->title   = title_for(opts);
+            g->x_label = "CP instruction window";
+            g->y_label = "virtual page (first-touch order)";
+            {
+                std::string n;
+                if (pm.overflow_pages) {
+                    n = fmt_count(pm.overflow_pages) +
+                        " further pages beyond row capacity";
+                }
+                if (pm.remaps) {
+                    if (!n.empty()) n += "; ";
+                    n += fmt_count(pm.remaps) + " physical remaps";
+                }
+                g->note = n;
+            }
+            result_grid = g;
             break;
         }
         case Metric::BbLength:
@@ -4538,6 +5544,7 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
 
     TraceResult tr;
     tr.has_second_pane  = has_second_pane;
+    tr.grid             = std::move(result_grid);
     tr.weight           = h.weight;
     tr.start_insn       = h.start_insn;
     tr.warmup_end_insns = h.warmup_end_arch_insns;
@@ -4558,12 +5565,34 @@ struct MetricWalkSpec {
     bool cp_fields = false;
     cst::BodyWalker::WpDecode wp_mode = cst::BodyWalker::WpDecode::Skip;
     bool header_only = false;   /* computed from templates; no body walk */
+    bool wants_devio = false;   /* register the DEVIO record callback   */
+    bool wants_wp_events = false; /* register the WP-events summary sink */
 };
 static MetricWalkSpec metric_walk_spec(Metric m)
 {
     using Wp = cst::BodyWalker::WpDecode;
     MetricWalkSpec s;
     switch (m) {
+        case Metric::UserKernel:
+            s.bb_fn = handle_user_kernel_bb; break;
+        case Metric::FaultRate:
+            s.bb_fn = handle_fault_rate_bb; break;
+        case Metric::ThreadSwitch:
+            s.bb_fn = handle_thread_switch_bb; break;
+        case Metric::AsidTimeline:
+            s.bb_fn = handle_asid_timeline_bb; break;
+        case Metric::DevioQueue:
+        case Metric::DevioLatency:
+        case Metric::DevioLba:
+            s.bb_fn = handle_position_bb; s.wants_devio = true; break;
+        case Metric::WpTermination:
+            s.bb_fn = handle_position_bb; s.wants_wp_events = true; break;
+        case Metric::WsDivergence:
+            s.bb_fn = handle_ws_divergence_bb; s.cp_fields = true; break;
+        case Metric::TranslationChurn:
+            s.bb_fn = handle_translation_churn_bb; s.cp_fields = true; break;
+        case Metric::Pagemap:
+            s.bb_fn = handle_pagemap_bb; s.cp_fields = true; break;
         case Metric::GenOp:    s.bb_fn = handle_genop_bb; break;
         case Metric::GenReg:   s.bb_fn = handle_genreg_bb; break;
         case Metric::DepDepth:
@@ -4786,6 +5815,17 @@ static TraceResult process_trace(const char *path, const Options &opts)
             throw std::runtime_error(
                 "internal error: metric has no walk handler");
         }
+        if (spec.wants_devio) {
+            walker.set_devio_callback([&](const cst::DecodedDevio &d) {
+                handle_devio_event(ctx, d);
+            });
+        }
+        if (spec.wants_wp_events) {
+            walker.set_wp_events_callback(
+                [&](const cst::BodyWalker::WpEventsSummary &es) {
+                    handle_wp_events(ctx, es);
+                });
+        }
         walker.walk_bb(cp_fields, wp_mode,
                        [&](const cst::BodyWalker::BB &bb) {
                            bb_fn(ctx, bb);
@@ -4898,6 +5938,8 @@ process_trace_multi(const char *path, const Options &opts,
     if (bin_width == 0) bin_width = 1;
 
     const bool has_wp = (h.flags & h.ids.flag_wp) != 0;
+    const bool has_physaddr = (h.flags & h.ids.flag_physaddr) != 0;
+    const bool has_devio = (h.ids.body_tag_devio_start != 0xFF);
 
     /* One independent WalkCtx + walk-spec per applicable metric. */
     std::vector<std::unique_ptr<WalkCtx>> ctxs;
@@ -4906,6 +5948,12 @@ process_trace_multi(const char *path, const Options &opts,
     for (Metric m : metrics) {
         if (metric_needs_wp(m) && !has_wp) {
             continue;   /* would be empty on a CP-only trace */
+        }
+        if (metric_needs_physaddr(m) && !has_physaddr) {
+            continue;   /* every ppage cell would read 0 */
+        }
+        if (metric_needs_devio(m) && !has_devio) {
+            continue;   /* trace never advertised DEVIO records */
         }
         std::unique_ptr<WalkCtx> ctx(new WalkCtx());
         ctx->h         = &h;
@@ -4939,6 +5987,30 @@ process_trace_multi(const char *path, const Options &opts,
     if (any_body) {
         auto body_stream = cst::body_stream_open(*cf);
         cst::BodyWalker walker(h, templates, by_id, body_stream->reader());
+        bool any_devio = false, any_wp_events = false;
+        for (const auto &sp : specs) {
+            any_devio     = any_devio     || sp.wants_devio;
+            any_wp_events = any_wp_events || sp.wants_wp_events;
+        }
+        if (any_devio) {
+            walker.set_devio_callback([&](const cst::DecodedDevio &d) {
+                for (size_t i = 0; i < ctxs.size(); i++) {
+                    if (specs[i].wants_devio) {
+                        handle_devio_event(*ctxs[i], d);
+                    }
+                }
+            });
+        }
+        if (any_wp_events) {
+            walker.set_wp_events_callback(
+                [&](const cst::BodyWalker::WpEventsSummary &es) {
+                    for (size_t i = 0; i < ctxs.size(); i++) {
+                        if (specs[i].wants_wp_events) {
+                            handle_wp_events(*ctxs[i], es);
+                        }
+                    }
+                });
+        }
         walker.walk_bb(cp_fields, wp_mode,
                        [&](const cst::BodyWalker::BB &bb) {
                            for (size_t i = 0; i < ctxs.size(); i++) {

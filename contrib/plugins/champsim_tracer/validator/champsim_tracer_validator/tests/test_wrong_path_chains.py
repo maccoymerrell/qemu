@@ -1,28 +1,28 @@
-"""RETIRED — verdict-level tests for the removed DEP_BRANCH_KILL WP policy.
+"""Verdict-level tests for the LIVE wrong-path chain policy.
 
-This suite encodes the wrong-path termination policy the plugin RETIRED on
-2026-07-12 (commit 914d452978: WP execution-time faults now continue to the
-wpdepth budget instead of being killed at the first fault-dependent branch).
-It directly contradicts the LIVE policy asserted by
-``tests/test_wp_synthetic_fault.py`` and only stays green because
-``validator._check_wrong_path_chains`` still carries the same stale kill
-logic.  It is retired from the collectable suite pending reconciliation of
-that function with the continue-to-budget policy; see ``VALIDATION.md``.
-The unified ``full`` harness exercises the live policy via
-``features.wp_fault`` (``test_wp_synthetic_fault.py``), not this file.
+This suite REPLACES the retired DEP_BRANCH_KILL poison-replay tests (removed
+from the plugin on 2026-07-12; commits 18bbec8956, 914d452978, 7b69c88aa4).
+It exercises ``validator._check_wrong_path_chains`` directly against the
+continue-to-budget policy the plugin now implements:
 
-Original description follows:
+  * On a mispredicted path nothing retires, so a back-end synchronous fault is
+    served deterministic placeholder data, MARKED ``CST_WP_EVENT_FAULT`` at
+    ``fault_insn_index``, and the excursion CONTINUES to the wpdepth budget.
+  * SEQUENCE: up to the first marked fault the emitted block chain must be an
+    exact-or-longer prefix of the synthetic prediction (an UNMARKED divergence
+    is a bug).  Past a marked fault the tail is synthetic placeholder, so a
+    divergence at a position strictly after the first fault is EXPECTED.
+  * TERMINATION: a short chain is only legitimate at a real terminator —
+    depth budget, privilege-domain crossing, translation-unavailable, a
+    syscall-class terminator, or wpprune.  A fault must CONTINUE to one of
+    these; a fault that truncates the excursion short is itself an error.
+  * DEP_BRANCH_KILL is RETIRED: a fault-carrying chain that resolves a
+    fault-dependent branch and CONTINUES is now correct output, never an
+    error — the exact inversion of the old policy's canonical negative test.
 
-Exercises the wrong-path fault policy: the plugin proceeds around a
-suppressed speculative fault with the accumulated wrong-path state
-(independent instructions run exactly as they normally would), poisons
-the faulted instruction's destinations, propagates poison through
-register dataflow, and MUST kill the excursion at the first branch
-whose sources are poisoned (CST_WP_EVENT_DEP_BRANCH_KILL on the
-chain's last entry).  Post-fault divergence is an error; a chain that
-continues past a provably fault-dependent branch is an error; the old
-(pre-policy) trace shape — fault-carrying chains resolving the
-dependent branch and continuing — is the canonical NEGATIVE test.
+The end-to-end plugin-behaviour guard is ``tests/test_wp_synthetic_fault.py``
+(full's ``features.wp_fault``); this file is the fast, plugin-free verdict
+oracle for the same policy.
 
 Run standalone:
   python tests/test_wrong_path_chains.py
@@ -32,30 +32,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-# Retired from the collectable suite (see the module docstring): the policy
-# it asserts was removed from the plugin on 2026-07-12.  Skip at collection
-# time so it neither runs nor misleads; a standalone run prints the same.
-if __name__ != "__main__":
-    try:
-        import pytest as _pytest
-        _pytest.skip(
-            "retired DEP_BRANCH_KILL WP policy (removed 2026-07-12); "
-            "the live policy is covered by test_wp_synthetic_fault.py — "
-            "see VALIDATION.md",
-            allow_module_level=True)
-    except ImportError:
-        pass
-
 from champsim_tracer_validator.validator import _check_wrong_path_chains
 
 REG_ZERO = 241
 REG_FLAGS = 251
-REG_T0 = 8        # branch-condition register
-REG_T8 = 24       # arena base
+REG_T0 = 8
+REG_T8 = 24
 REG_T1 = 9
 REG_NAME_TO_ID = {"REG_ZERO": REG_ZERO, "REG_FLAGS": REG_FLAGS}
 
-BR_COND = 3       # any nonzero branch_type id
+BR_JUMP = 3        # a plain (non-syscall) branch id
+BR_SYSCALL = 7     # the syscall-class branch id
+SYSCALL_IDS = {BR_SYSCALL}
 
 
 def _blocks(n_insns_by_bid):
@@ -64,9 +52,8 @@ def _blocks(n_insns_by_bid):
             for bid, n in n_insns_by_bid.items()}
 
 
-def _load_burst_insns(n):
-    """Burst-block template: lui/addiu set t8, loads into t0/t1, ends
-    in an unconditional direct jump (no sources)."""
+def _burst_insns(n, terminator=BR_JUMP):
+    """Load-burst block: sets t8, loads t0/t1, ends in @terminator."""
     insns = [
         {"src_regs": [], "dst_regs": [REG_T8], "branch_type": 0,
          "branch_conditional": False},
@@ -80,44 +67,39 @@ def _load_burst_insns(n):
     while len(insns) < n - 1:
         insns.append({"src_regs": [REG_T0, REG_T1], "dst_regs": [REG_T0],
                       "branch_type": 0, "branch_conditional": False})
-    insns.append({"src_regs": [], "dst_regs": [], "branch_type": BR_COND,
-                  "branch_conditional": False})  # j (no sources)
+    insns.append({"src_regs": [], "dst_regs": [], "branch_type": terminator,
+                  "branch_conditional": False})
     return insns
 
 
-def _cond_branch_insns(n):
-    """Cond-branch block: reloads t0 from its slot (insn 2), ends in
-    beqz t0 (src = t0)."""
-    insns = _load_burst_insns(n)
-    insns[-1] = {"src_regs": [REG_T0], "dst_regs": [], "branch_type": BR_COND,
-                 "branch_conditional": True}     # beqz t0
-    return insns
-
-
-def _wp(template_id, fault=False, fault_idx=None, unavail=False,
-        kill=False, n_insns=13):
-    return {"index": 0, "template_id": template_id, "n_insns": n_insns,
+def _wp(bid, fault=False, fault_idx=None, unavail=False, n_insns=13,
+        kill=False):
+    return {"index": 0, "template_id": 200 + bid, "n_insns": n_insns,
             "fault": fault, "fault_insn_index": fault_idx,
             "translation_unavailable": unavail,
             "dep_branch_kill": kill}
 
 
+N_BY_BID = {13: 14, 14: 11, 15: 11, 16: 15, 17: 11, 18: 14,
+            22: 13, 23: 13}
+
+
 def run_case(wp_entries, exp_chain, budget=64, n_insns_by_bid=None,
-             chain_event=False, cond_bids=(17, 42)):
+             chain_event=False, syscall_bids=(), templates_by_id_extra=None):
     """One CP fork at cp_pos 0 (blk_0) with the given wrong path.
-    Template ids: 100 -> CP block 0; 200+bid -> WP block bid.  Blocks
-    in @cond_bids get a beqz-t0 terminator; others end in a bare j."""
+    Template ids: 100 -> CP block 0; 200+bid -> WP block bid.  Blocks in
+    @syscall_bids terminate in a BR_SYSCALL branch; others in a bare jump."""
     template_runs = {100: [(0, 1)]}
     blocks = dict(n_insns_by_bid or {})
     blocks.setdefault(0, 10)
-    templates_by_id = {}
+    templates_by_id = dict(templates_by_id_extra or {})
     bids = {wp["template_id"] - 200 for wp in wp_entries} | set(exp_chain)
     for bid in bids:
         template_runs.setdefault(200 + bid, [(bid, 1)])
         blocks.setdefault(bid, 13)
-        mk = _cond_branch_insns if bid in cond_bids else _load_burst_insns
+        term = BR_SYSCALL if bid in syscall_bids else BR_JUMP
         templates_by_id[200 + bid] = {"template_id": 200 + bid,
-                                      "insns": mk(blocks[bid])}
+                                      "insns": _burst_insns(blocks[bid], term)}
     entries = [{
         "template_id": 100,
         "wp_entries": wp_entries,
@@ -131,104 +113,147 @@ def run_case(wp_entries, exp_chain, budget=64, n_insns_by_bid=None,
         wp_insn_budget=budget,
         templates_by_id=templates_by_id,
         reg_name_to_id=REG_NAME_TO_ID,
+        syscall_ids=SYSCALL_IDS,
     )
 
 
-N_BY_BID = {13: 14, 14: 11, 15: 11, 16: 15, 17: 11, 18: 14,
-            22: 13, 23: 13}
+def _errs(issues):
+    return [i for i in issues if i.severity == "error"]
 
 
-def test_old_policy_shape_is_flagged():
-    # pf77/pg40/w6_m_24 (negative test): guest-TLB-cold excursion,
-    # every block faults at insn 2, the dependent branch at blk_17
-    # is RESOLVED with stale state and the chain continues to blk_18.
-    # Under the corrected policy this must be flagged: continuation
-    # past a fault-dependent branch AND post-fault divergence.
-    wps = [_wp(200 + b, fault=True, fault_idx=2, n_insns=N_BY_BID[b])
-           for b in (13, 14, 15, 16, 17, 18)]
-    issues = run_case(wps, [13, 14, 15, 16, 17, 22, 23],
-                      n_insns_by_bid=N_BY_BID)
-    errs = [i for i in issues if i.severity == "error"]
-    assert any("must die on that branch" in i.message for i in errs), \
-        f"expected required-kill error, got {[i.message for i in issues]}"
-    assert any("depth 5" in i.message for i in errs), \
-        f"expected depth-5 divergence error, got {[i.message for i in issues]}"
-
-
-def test_kill_terminated_chain_accepted():
-    # Corrected-policy shape: same TLB-cold scenario, but the chain
-    # dies at blk_17 (its beqz reads the faulted t0) with the kill
-    # marker on the last entry.  Prefix matches; accepted.
-    wps = [_wp(200 + b, fault=True, fault_idx=2, n_insns=N_BY_BID[b])
-           for b in (13, 14, 15, 16)]
-    wps.append(_wp(217, fault=True, fault_idx=2, kill=True,
-                   n_insns=N_BY_BID[17]))
-    issues = run_case(wps, [13, 14, 15, 16, 17, 22, 23],
-                      n_insns_by_bid=N_BY_BID)
-    assert not issues, f"expected clean, got {[i.message for i in issues]}"
-
-
-def test_kill_not_last_is_error():
-    wps = [_wp(213, fault=True, fault_idx=2, kill=True, n_insns=14),
-           _wp(214, n_insns=11)]
+# --------------------------------------------------------------------------
+# Exact-match / clean
+# --------------------------------------------------------------------------
+def test_exact_match_clean():
+    wps = [_wp(b, n_insns=N_BY_BID[b]) for b in (13, 14, 15, 16, 17)]
     issues = run_case(wps, [13, 14, 15, 16, 17], n_insns_by_bid=N_BY_BID)
-    errs = [i for i in issues if i.severity == "error"]
-    assert any("must be the last entry" in i.message for i in errs), \
-        f"expected kill-placement error, got {[i.message for i in issues]}"
-
-
-def test_kill_without_fault_is_error():
-    wps = [_wp(213, n_insns=14), _wp(217, kill=True, n_insns=11)]
-    issues = run_case(wps, [13, 17, 22, 23, 24], n_insns_by_bid=N_BY_BID)
-    errs = [i for i in issues if i.severity == "error"]
-    assert any("without a FAULT" in i.message for i in errs), \
-        f"expected kill-sanity error, got {[i.message for i in issues]}"
-
-
-def test_independent_branches_proceed():
-    # Fault in a burst block whose terminator is an unconditional j
-    # (no sources): the chain continues normally, no kill required,
-    # and a full-length matching chain is clean.
-    wps = [_wp(213, fault=True, fault_idx=3, n_insns=14),
-           _wp(214, n_insns=11), _wp(215, n_insns=11),
-           _wp(216, n_insns=15), _wp(218, n_insns=14)]
-    issues = run_case(wps, [13, 14, 15, 16, 18],
-                      n_insns_by_bid=N_BY_BID, cond_bids=())
     assert not issues, f"expected clean, got {[i.message for i in issues]}"
 
 
-def test_divergence_without_fault_still_errors():
-    wps = [_wp(200 + b, n_insns=N_BY_BID[b]) for b in
-           (13, 14, 15, 16, 17, 18)]
-    issues = run_case(wps, [13, 14, 15, 16, 17, 22, 23],
-                      n_insns_by_bid=N_BY_BID, cond_bids=())
-    errs = [i for i in issues if i.severity == "error"]
-    assert len(errs) == 1 and "depth 5" in errs[0].message, \
-        f"expected depth-5 error, got {[i.message for i in issues]}"
+def test_fault_full_match_clean():
+    # A fault mid-chain whose garbage happens to steer the SAME predicted
+    # way: full-length match, marked FAULT, no divergence -> clean.
+    wps = [_wp(13, n_insns=14), _wp(14, fault=True, fault_idx=2, n_insns=11),
+           _wp(15, n_insns=11), _wp(16, n_insns=15), _wp(17, n_insns=11)]
+    issues = run_case(wps, [13, 14, 15, 16, 17], n_insns_by_bid=N_BY_BID)
+    assert not issues, f"expected clean, got {[i.message for i in issues]}"
 
 
-def test_truncation_without_budget_still_errors():
-    # storm shape: matching prefix, chain ends early, unavail marker,
-    # sim_insns below budget -> still a truncation error.
-    wps = [_wp(213, n_insns=14), _wp(214, unavail=True, n_insns=11)]
-    issues = run_case(wps, [13, 14, 15, 16, 17],
-                      n_insns_by_bid=N_BY_BID, cond_bids=())
-    errs = [i for i in issues if i.severity == "error"]
+# --------------------------------------------------------------------------
+# Sequence verdicts
+# --------------------------------------------------------------------------
+def test_unmarked_divergence_errors():
+    # No fault anywhere; chain diverges at depth 3 -> real bug.
+    wps = [_wp(b, n_insns=N_BY_BID[b]) for b in (13, 14, 15, 18, 17)]
+    issues = run_case(wps, [13, 14, 15, 16, 17], n_insns_by_bid=N_BY_BID)
+    errs = _errs(issues)
+    assert len(errs) == 1 and "depth 3" in errs[0].message, \
+        f"expected depth-3 divergence error, got {[i.message for i in issues]}"
+
+
+def test_post_fault_divergence_accepted():
+    # Block 15 faults at insn 2, then the chain diverges at depth 3
+    # (blk_16 instead of predicted blk_22).  The divergence is strictly
+    # AFTER the fault's collapsed position (2 < 3) -> synthetic, accepted.
+    wps = [_wp(13, n_insns=14), _wp(14, n_insns=11),
+           _wp(15, fault=True, fault_idx=2, n_insns=11),
+           _wp(16, n_insns=15), _wp(17, n_insns=11)]
+    issues = run_case(wps, [13, 14, 15, 22, 23], n_insns_by_bid=N_BY_BID)
+    assert not issues, \
+        f"post-fault divergence must be accepted, got {[i.message for i in issues]}"
+
+
+def test_late_fault_does_not_excuse_early_divergence():
+    # Divergence at depth 0 (blk_14 instead of predicted blk_13); a fault
+    # marked on a LATER block (position 2) must NOT license it.
+    wps = [_wp(14, n_insns=11), _wp(13, n_insns=14),
+           _wp(15, fault=True, fault_idx=0, n_insns=11),
+           _wp(16, n_insns=15)]
+    issues = run_case(wps, [13, 14, 15, 16], n_insns_by_bid=N_BY_BID)
+    errs = _errs(issues)
+    assert any("depth 0" in i.message for i in errs), \
+        f"expected depth-0 divergence error, got {[i.message for i in issues]}"
+
+
+def test_dep_branch_kill_shape_no_longer_flagged():
+    # The retired policy's canonical NEGATIVE test, INVERTED: a chain that
+    # faults at insn 2 in every block and resolves the fault-dependent
+    # branch, CONTINUING to a full-length match, is now correct output.
+    # (The DEP_BRANCH_KILL flag, if a legacy trace still carries it, is
+    # simply ignored — no verdict keys off it any more.)
+    wps = [_wp(b, fault=True, fault_idx=2, n_insns=N_BY_BID[b])
+           for b in (13, 14, 15, 16, 17)]
+    issues = run_case(wps, [13, 14, 15, 16, 17], n_insns_by_bid=N_BY_BID)
+    assert not issues, \
+        f"continue-past-fault must be clean now, got {[i.message for i in issues]}"
+
+
+# --------------------------------------------------------------------------
+# Termination verdicts
+# --------------------------------------------------------------------------
+def test_truncation_without_terminator_errors():
+    # Fault-free short chain, below budget, no crossing/syscall -> truncation.
+    wps = [_wp(13, n_insns=14), _wp(14, n_insns=11)]
+    issues = run_case(wps, [13, 14, 15, 16, 17], n_insns_by_bid=N_BY_BID)
+    errs = _errs(issues)
     assert len(errs) == 1 and "truncated" in errs[0].message, \
         f"expected truncation error, got {[i.message for i in issues]}"
 
 
-def test_exact_match_clean():
-    wps = [_wp(200 + b, n_insns=N_BY_BID[b]) for b in (13, 14, 15, 16, 17)]
-    issues = run_case(wps, [13, 14, 15, 16, 17],
-                      n_insns_by_bid=N_BY_BID, cond_bids=())
-    assert not issues, f"expected clean, got {[i.message for i in issues]}"
+def test_fault_chain_truncated_without_terminator_errors():
+    # A fault chain that STOPS short of budget with no terminator is a
+    # regression of the continue-to-budget guarantee -> truncation error.
+    wps = [_wp(13, n_insns=14), _wp(14, fault=True, fault_idx=2, n_insns=11)]
+    issues = run_case(wps, [13, 14, 15, 16, 17], n_insns_by_bid=N_BY_BID)
+    errs = _errs(issues)
+    assert len(errs) == 1 and "truncated" in errs[0].message \
+        and "carries a FAULT" in errs[0].message, \
+        f"expected fault-truncation error, got {[i.message for i in issues]}"
+
+
+def test_budget_exhaustion_accepted():
+    # Short in block count but sim_insns >= budget -> legitimate budget end.
+    wps = [_wp(13, n_insns=40), _wp(14, n_insns=40)]
+    issues = run_case(wps, [13, 14, 15, 16, 17], budget=64,
+                      n_insns_by_bid=N_BY_BID)
+    assert not issues, \
+        f"budget exhaustion must be accepted, got {[i.message for i in issues]}"
+
+
+def test_syscall_terminator_accepted():
+    # Short chain whose LAST block ends in a syscall-class branch: the
+    # excursion legitimately terminates at the privilege escalation.
+    wps = [_wp(13, n_insns=14), _wp(14, n_insns=11)]
+    issues = run_case(wps, [13, 14, 15, 16, 17], n_insns_by_bid=N_BY_BID,
+                      syscall_bids=(14,))
+    assert not issues, \
+        f"syscall terminator must be accepted, got {[i.message for i in issues]}"
+
+
+def test_syscall_terminator_only_on_last_block():
+    # A syscall on a MIDDLE block does not terminate; the chain is still
+    # short at a non-syscall last block -> truncation error.
+    wps = [_wp(13, n_insns=14), _wp(14, n_insns=11)]
+    issues = run_case(wps, [13, 14, 15, 16, 17], n_insns_by_bid=N_BY_BID,
+                      syscall_bids=(13,))
+    errs = _errs(issues)
+    assert len(errs) == 1 and "truncated" in errs[0].message, \
+        f"a mid-chain syscall must not terminate, got {[i.message for i in issues]}"
 
 
 if __name__ == "__main__":
-    print("RETIRED: this suite asserts the DEP_BRANCH_KILL wrong-path policy "
-          "the plugin removed on 2026-07-12 (commit 914d452978).  The live "
-          "continue-to-budget policy is validated by "
-          "test_wp_synthetic_fault.py (full's features.wp_fault).  See "
-          "VALIDATION.md.  Not running the retired assertions.")
-    sys.exit(0)
+    fns = [v for k, v in sorted(globals().items())
+           if k.startswith("test_") and callable(v)]
+    n_pass = n_fail = 0
+    for fn in fns:
+        try:
+            fn()
+        except AssertionError as e:
+            print(f"FAIL {fn.__name__}: {e}")
+            n_fail += 1
+        else:
+            print(f"PASS {fn.__name__}")
+            n_pass += 1
+    print(f"{'OK' if n_fail == 0 else 'FAILED'} "
+          f"({n_pass} passed, {n_fail} failed)")
+    sys.exit(1 if n_fail else 0)

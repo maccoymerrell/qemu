@@ -481,6 +481,37 @@ def _m_wp_chain_missequence(triple, gen_meta) -> Optional[str]:
     return None
 
 
+def _m_wp_late_fault_no_excuse(triple, gen_meta) -> Optional[str]:
+    """Missequence the wrong-path chain at depth 0 AND mark a LATER block a
+    synthetic-data FAULT.  The reconciled fault policy licenses a block-
+    sequence divergence only at a position STRICTLY AFTER the first marked
+    fault (everything downstream of a fault is synthetic placeholder), so a
+    fault at block >= 2 must NOT retroactively excuse the depth-0 divergence.
+    This guards the reconciliation from degrading into a blanket
+    "any fault anywhere tolerates any divergence" hole: wrong_path_chains
+    must still fire on the unlicensed early divergence."""
+    forks, by_id, tmpl_blocks = _predicted_fork_entries(triple, gen_meta)
+    for e, _pred, wpe in forks:
+        if len(wpe) < 2:
+            continue
+        w0, w1 = wpe[0], wpe[1]
+        b0 = tmpl_blocks(by_id.get(w0["template_id"], {}))
+        b1 = tmpl_blocks(by_id.get(w1["template_id"], {}))
+        if b0 and b1 and b0[0] != b1[0]:
+            w0["template_id"], w1["template_id"] = \
+                w1["template_id"], w0["template_id"]
+            # Mark the LAST block a synthetic-data fault at its first insn:
+            # its collapsed position is strictly AFTER the depth-0 divergence
+            # the swap created, so it must not license that earlier divergence.
+            wpe[-1]["fault"] = True
+            wpe[-1]["fault_insn_index"] = 0
+            return (f"swapped WP blocks 0/1 (blk_{b0[0]}<->blk_{b1[0]}) and "
+                    f"FAULT-marked the last block on predicted-fork entry "
+                    f"seq={e.get('seq_num')} — a later fault must not excuse "
+                    f"the depth-0 divergence")
+    return None
+
+
 def _m_bb_successor_missequence(triple, gen_meta) -> Optional[str]:
     """Swap two CP entries carrying different templates so the emitted
     block-visit order no longer matches the ground-truth correct path."""
@@ -651,6 +682,11 @@ CATALOGUE: list = [
     Mutation("wp_chain_missequence", "oracle",
              "reorder the first two blocks of a predicted wrong-path chain",
              _m_wp_chain_missequence,
+             expect=("wrong_path_chains", "profile_consistency")),
+    Mutation("wp_late_fault_no_excuse", "oracle",
+             "depth-0 missequence plus a later synthetic-fault mark "
+             "(the fault must not excuse the earlier divergence)",
+             _m_wp_late_fault_no_excuse,
              expect=("wrong_path_chains", "profile_consistency")),
     Mutation("bb_successor_missequence", "oracle",
              "reorder two correct-path entries",

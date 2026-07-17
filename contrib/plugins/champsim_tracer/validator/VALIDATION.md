@@ -154,7 +154,7 @@ The unification folded in, revived, or retired every pre-existing piece:
 | `validator/tests/run_roundtrip.sh` | current but discouraged (CLAUDE.md: don't call directly) | **superseded** by `full`/`all`; left in place, not wired |
 | `validator/tests/large_scale.sh` | current standing seed-sweep | **complementary** (a large unmoderated sweep, not a gate); left in place |
 | `validator/tests/test_decoder_smoke.py` | misnamed 2-arg `.cst` diff tool, not a pytest test | left as a debug tool (near-dup of `_diff_entries.py`); not wired |
-| `validator/tests/test_wrong_path_chains.py` | **ROTTED** — asserts the retired DEP_BRANCH_KILL WP policy (superseded 2026-07-12), contradicts `test_wp_synthetic_fault.py` | **retired** (skipped with an explanatory note) |
+| `validator/tests/test_wrong_path_chains.py` | reconciled 2026-07-17 — the ROTTED DEP_BRANCH_KILL assertions were replaced with LIVE continue-to-budget verdict cases (fault-licensed divergence, positional non-excuse, terminator gate, retired-kill inversion) after `_check_wrong_path_chains` was reconciled with the plugin's live policy | **revived** (verdict-level oracle for `wrong_path_chains`; the plugin-behaviour half stays `features.wp_fault`) |
 | `validator/README.md` | **ROTTED** — documents the removed `genval` CLI | **rewritten** to the current CLI + this file |
 
 The out-of-repo harnesses formerly under `multiasid_b4/` are now

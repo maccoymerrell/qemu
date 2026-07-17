@@ -71,6 +71,21 @@ struct Stats {
      * upstream of the drain, the class the offline lint (cst_lint.h)
      * fails traces on. */
     uint64_t cp_impossible_slot_memops = 0;
+    /* Emitted entries whose pending reg-snap count did not equal the
+     * template's Σ n_dst_regs — the positional reg-snap invariant the wire
+     * relies on (build_entry_view prefix-sums n_dst_regs).  The entry's
+     * reg_snaps are DROPPED rather than mis-sliced (a code address landing
+     * on an ALU dst, metaflags read from the wrong slot).  A backstop for
+     * the eager-tail / foreign-drop / segment-boundary capture fixes; must
+     * be 0 on a correct run. */
+    uint64_t reg_snap_slice_dropped = 0;
+    /* Emitted entries whose surplus reg-snaps (a leaked prefix from a chain
+     * the assembler abandoned on a sync-fault-storm TB discontinuity) were
+     * TRIMMED at the front to recover this block's own correct positional
+     * reg-data (the dataflow oracle validates the recovered stream).  A
+     * recovered leak, not a dropped slice; distinct from reg_snap_slice_
+     * dropped, which is only the unrecoverable shortfall. */
+    uint64_t reg_snap_leak_trimmed = 0;
 
     /* Binary writer byte-count breakdown. */
     uint64_t bin_total_bits = 0;

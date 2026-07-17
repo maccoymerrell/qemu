@@ -2536,6 +2536,75 @@ void emit_body_entry(BodyStreamState *out_stream,
     entry.branch_successor_known = branch_successor_known;
 
     g_mem_recorder.drain_cp_into_dyn_params(entry.dyn_params, bb_tmpl);
+    /* Backstop for the positional reg-snap invariant.  The wire attributes
+     * reg_snaps POSITIONALLY: build_entry_view prefix-sums each insn's
+     * n_dst_regs, and the DST_REG / METAFLAGS stages index reg_snaps at that
+     * running offset.  So pending_reg_snaps MUST hold exactly Σ n_dst_regs
+     * for this template — otherwise every later insn's dst value and
+     * metaflags slide onto the wrong slot, landing code addresses on ALU
+     * dsts.  After the eager-tail / foreign-drop / segment-boundary fixes
+     * this holds by construction on the fault-free path (silent, so user-mode
+     * output stays byte-identical), so a residual mismatch is one of two
+     * shapes:
+     *
+     *   SURPLUS — a chain the assembler abandoned on a TB discontinuity in a
+     *     sync-fault storm dropped its fragments but left its already-captured
+     *     dst snaps at the FRONT of pending, ahead of this BB's own snaps.
+     *     This BB's snaps are intact and correct at the back, so trim the
+     *     leaked prefix and emit the recovered reg-data (the dataflow oracle
+     *     validates it).  Counted separately as a recovered leak, not a drop.
+     *
+     *   SHORTFALL — a tail snap the capture could not reach (the END-marker
+     *     exit block whose later insns never ran).  Nothing to recover; drop
+     *     this entry's reg-data rather than emit a mis-sliced stream.  The
+     *     END-marker terminator is expected and not counted; any other
+     *     shortfall is a real capture bug, counted loudly. */
+    if (g_features.reg_data && bb_tmpl) {
+        uint64_t expected_snaps = 0;
+        for (uint32_t i = 0; i < bb_tmpl->n_insns; i++) {
+            expected_snaps += bb_tmpl->insn_fields[i].n_dst_regs;
+        }
+        /* A merged fault entry carries its verified frame prefix at the FRONT
+         * of pending (complete_merge already trimmed its suffix's leak before
+         * prepending), so a residual surplus there must NOT front-trim the
+         * frame — drop it.  A plain seal (no fault anchors) has any leaked
+         * prefix genuinely at the front. */
+        bool is_merge_emit = !g_emit_fault_anchors.empty();
+        if (pending_reg_snaps.size() > expected_snaps && !is_merge_emit) {
+            size_t excess = pending_reg_snaps.size() - (size_t)expected_snaps;
+            if (getenv("CST_SNAP_DIAG")) {
+                fprintf(stderr, "champsim_tracer: [snapdiag] reg-snap SURPLUS "
+                        "BB start=0x%" PRIx64 " n_insns=%u pending=%zu "
+                        "expected=%" PRIu64 " fdepth=%u fanchors=%zu is_sys=%d "
+                        "— trimming %zu leaked prefix\n",
+                        bb_tmpl->start_pc, bb_tmpl->n_insns,
+                        pending_reg_snaps.size(), expected_snaps,
+                        g_emit_fault_depth, g_emit_fault_anchors.size(),
+                        (int)bb_tmpl->is_system, excess);
+            }
+            pending_reg_snaps.erase(pending_reg_snaps.begin(),
+                                    pending_reg_snaps.begin() + (ptrdiff_t)excess);
+            g_stats.reg_snap_leak_trimmed++;
+        } else if (pending_reg_snaps.size() != expected_snaps) {
+            if (!g_seg_end_marker_close) {
+                g_stats.reg_snap_slice_dropped++;
+            }
+            if (getenv("CST_SNAP_DIAG")) {
+                fprintf(stderr, "champsim_tracer: [snapdiag] reg-snap "
+                        "%s BB start=0x%" PRIx64 " n_insns=%u pending=%zu"
+                        " expected=%" PRIu64 " end_marker=%d fdepth=%u "
+                        "fanchors=%zu is_sys=%d — dropping reg_snaps\n",
+                        pending_reg_snaps.size() < expected_snaps
+                            ? "SHORTFALL" : "MERGE-SURPLUS",
+                        bb_tmpl->start_pc, bb_tmpl->n_insns,
+                        pending_reg_snaps.size(), expected_snaps,
+                        (int)g_seg_end_marker_close, g_emit_fault_depth,
+                        g_emit_fault_anchors.size(),
+                        (int)bb_tmpl->is_system);
+            }
+            pending_reg_snaps.clear();
+        }
+    }
     if (g_features.reg_data && !pending_reg_snaps.empty()) {
         entry.reg_snaps = std::move(pending_reg_snaps);
         pending_reg_snaps.clear();
@@ -3772,9 +3841,38 @@ bool collect_finalized_bbs(unsigned int cpu_index,
     g_mutex_lock(&data_lock);
     bool any_finalize = false;
 
+    /* Identify the last-executed fragment.  The scoreboard's @prev_start
+     * normally pinpoints it (a mid-TB trap prevents later fragments' first-
+     * insn stores from firing).  But an async interrupt or a foreign-ASID
+     * span BETWEEN prev's execution and this delayed seal overwrites
+     * @prev_start: the intervening TBs' per-fragment inline stores fire on
+     * their own execution, regardless of the capture mute (the mute gates
+     * only the C callbacks).  When no fragment matches, prev ran to
+     * completion — an interrupt / foreign TB is taken at a TB boundary, so
+     * the deferred prev finished — and its last-executed fragment is simply
+     * its LAST fragment.  Without this fallback, is_last_executed never
+     * fires at the resume seal, snap_prev_tail_dsts is skipped, and the tail
+     * insn's dst snaps go missing — sliding every later insn's POSITIONAL
+     * reg-snap attribution (build_entry_view prefix-sums n_dst_regs), which
+     * lands a code address on an ALU dst and reads metaflags from the wrong
+     * slot.  A clobbered @prev_start that coincidentally matches a fragment
+     * of prev is astronomically unlikely (disjoint code regions) and, if it
+     * ever happened, is caught by the emit-time reg-snap backstop. */
+    BBTemplate *last_frag = nullptr;
+    bool prev_start_matches = false;
     for (BBTemplate *frag = prev_tb_head; frag != nullptr;
          frag = frag->next_tb_fragment) {
-        bool is_last_executed = (frag->start_pc == prev_start);
+        last_frag = frag;
+        if (frag->start_pc == prev_start) {
+            prev_start_matches = true;
+        }
+    }
+
+    for (BBTemplate *frag = prev_tb_head; frag != nullptr;
+         frag = frag->next_tb_fragment) {
+        bool is_last_executed = prev_start_matches
+            ? (frag->start_pc == prev_start)
+            : (frag == last_frag);
 
         uint64_t frag_current_pc;
         uint64_t frag_prev_ft = frag->fall_through_pc;
@@ -6295,6 +6393,8 @@ static void append_stats_summary(GString *report, const char *label,
         { "CP total memory accesses",            stats.cp_total_mem_accesses },
         { "CP orphan memops dropped",            stats.cp_orphan_mem_accesses },
         { "CP impossible-slot memops",           stats.cp_impossible_slot_memops },
+        { "CP reg-snap slice dropped",           stats.reg_snap_slice_dropped },
+        { "CP reg-snap leak trimmed",            stats.reg_snap_leak_trimmed },
         { "WP simulations performed",            stats.wp_simulations },
         { "WP simulations skipped",              stats.wp_skipped },
         { "WP total instructions",               stats.wp_total_insns },

@@ -5927,6 +5927,23 @@ def _check_metaflags(
             snap = snap_idx.get((ipos, result_reg))
             if snap is None:
                 continue
+            # Width 0 is the WIRE-LEVEL "never captured" signal: the decoder
+            # reads width_bytes from CST_FID_DST_REG_WIDTH, whose field-state
+            # default is 0, so a dst that no runtime capture ever staged
+            # materialises as width 0.  This is NOT an oracle loosening — a
+            # captured-but-WRONG value (a mis-slice, slot contamination) is a
+            # real captured register and carries the wrong register's width
+            # (> 0), so it still fails this check; and a positionally
+            # mis-counted entry trips the plugin's emit-time backstop and is
+            # dropped whole (all-default, all-w0) before it reaches here.  The
+            # only entries with a w=0 RESULT are ones whose reg-data the plugin
+            # could not capture — the segment-final block the END marker cut
+            # mid-execution, whose later insns never ran.  Flags cannot be
+            # predicted from a result that was never observed; skip it.  (The
+            # mutation-strictness tier confirms real value mutations, which are
+            # width > 0, stay caught.)
+            if snap.get("width_bytes") == 0:
+                continue
             result = _reg_snap_value(snap)
             width = _operand_width_bits(I, isa)
             mask  = (1 << width) - 1

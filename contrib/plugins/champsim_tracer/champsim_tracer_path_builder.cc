@@ -161,6 +161,15 @@ void PathBuilder::on_segment_open()
     walk_prev_ = nullptr;
     walk_depth_ = 0;
     prev_depth_ = 0;
+    /* Reg-snap hygiene at the window-mode segment boundary (Case C): drop any
+     * pre-segment / opener snaps now, sync the generation stamp so the
+     * step_events check doesn't redundantly re-clear, and arm the one-shot
+     * follow-up — the opening block's OWN per-insn snaps are captured AFTER
+     * this reset (its insns run once this callback returns) and must be
+     * dropped before the first real block seals. */
+    pending_reg_snaps.clear();
+    seg_gen_seen_ = g_segment_generation.load(std::memory_order_relaxed);
+    drop_open_leak_pending_ = true;
     depth_next_ = 0;
     raw_depth_ = 0;
     async_excluding_ = false;
@@ -562,8 +571,9 @@ void PathBuilder::collect_piece(CtxFrame &f, uint64_t resume_pc)
     f.resume_pc = resume_pc;
     if (pb_diag()) {
         fprintf(stderr, "[pathbuilder] STASH full=0x%" PRIx64 " resume=0x%"
-                PRIx64 " depth=%u nmem=%zu nanchor=%zu frames=%zu\n",
+                PRIx64 " depth=%u nsnaps=%zu nmem=%zu nanchor=%zu frames=%zu\n",
                 f.full_tmpl ? f.full_tmpl->start_pc : 0, resume_pc, f.depth,
+                f.snaps.size(),
                 f.mem.size(), f.anchors.size(), frames_.size());
     }
 }
@@ -721,6 +731,26 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
      * harder bail between the phases also drops the walk prev the
      * override was meant for. */
     seal_pc_override_ = 0;
+
+    /* Segment-boundary reg-snap hygiene (Case C).  A change in the segment
+     * generation since this thread's last step means the segment just opened
+     * under it.  In marker mode the opener's own vcpu_tb_exec is JIT-gated
+     * off before the START marker fires, so on_segment_open never runs and
+     * THIS is the first dispatch after the open — with the marker block's
+     * post-open per-insn snaps (the 0x43535401 magic write among them) still
+     * pooled in pending_reg_snaps.  Drop them so the segment's first real
+     * block starts positionally clean.  In window mode on_segment_open ran
+     * last step and armed the one-shot follow-up so the opener block's own
+     * post-open leak is dropped the step after. */
+    uint32_t cur_gen = g_segment_generation.load(std::memory_order_relaxed);
+    if (seg_gen_seen_ != cur_gen) {
+        seg_gen_seen_ = cur_gen;
+        drop_open_leak_pending_ = false;
+        pending_reg_snaps.clear();
+    } else if (drop_open_leak_pending_) {
+        drop_open_leak_pending_ = false;
+        pending_reg_snaps.clear();
+    }
 
     /* Retain this step's drain: the queue's internal buffer is only
      * valid until the next push, and fault events may have to survive
@@ -881,6 +911,15 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
              * the step recomputes g_capture_mute at every dispatch, so
              * the mute self-clears with the foreign span. */
             g_mem_recorder.clear_cp();
+            /* Prev's per-insn reg snaps die with it too — SYMMETRIC with the
+             * memop clear above, and the leak this fix closes.  They are the
+             * deferred prev's already-captured dst snaps (drained only at
+             * prev's emit, which no longer happens); left in place they
+             * PREPEND to the next emitted entry's reg_snaps and slide its
+             * positional dst / metaflags attribution.  The abandoned-window
+             * recovery already clears them on its drop arm; the foreign-ASID
+             * drop must match. */
+            pending_reg_snaps.clear();
             g_capture_mute = true;
             clear_prev();
             return StepStatus::DROPPED_FOREIGN;
@@ -917,12 +956,41 @@ PathBuilder::complete_merge(size_t idx,
     CtxFrame &f = frames_[idx];
     const PendingEmit &pe = pending_emits.front();
     if (pb_diag()) {
-        fprintf(stderr, "[pathbuilder] EMIT full=0x%" PRIx64 " nmem=%zu "
+        fprintf(stderr, "[pathbuilder] EMIT full=0x%" PRIx64 " fsnaps=%zu "
+                "suffsnaps=%zu nmem=%zu "
                 "branch_pc=0x%" PRIx64 " cur=0x%" PRIx64 " wrong=0x%" PRIx64
                 " frames=%zu\n",
-                f.full_tmpl ? f.full_tmpl->start_pc : 0, f.mem.size(),
+                f.full_tmpl ? f.full_tmpl->start_pc : 0, f.snaps.size(),
+                pending_reg_snaps.size(), f.mem.size(),
                 pe.branch_pc, pe.emit_current_pc, pe.wrong_target,
                 frames_.size());
+    }
+    /* Discard any leaked prefix in the resume suffix's pending snaps before
+     * prepending the frame.  When a sync-fault handler abandons a chain on a
+     * TB discontinuity, the chain assembler drops its fragments but its
+     * already-captured dst snaps stay in pending_reg_snaps (no async-suspend
+     * or segment-edge clear runs on the sync-fault path), landing at the
+     * FRONT of pending — ahead of this resume suffix's own snaps.  The frame
+     * prefix (f.snaps, captured at stash and equal to the faulting BB's
+     * pre-fault dsts) is authoritative, so any excess over the merged
+     * template's Σ n_dst_regs is exactly that leaked front; trim it, keeping
+     * the suffix's real snaps.  Without this the merged entry over-counts and
+     * the emit-time backstop drops the whole entry's reg-data — this recovers
+     * the correct positional attribution instead. */
+    if (g_features.reg_data && f.full_tmpl) {
+        uint64_t expected = 0;
+        for (uint32_t i = 0; i < f.full_tmpl->n_insns; i++) {
+            expected += f.full_tmpl->insn_fields[i].n_dst_regs;
+        }
+        size_t have = f.snaps.size() + pending_reg_snaps.size();
+        if (have > expected && f.snaps.size() <= expected) {
+            size_t excess = have - expected;
+            if (excess <= pending_reg_snaps.size()) {
+                pending_reg_snaps.erase(
+                    pending_reg_snaps.begin(),
+                    pending_reg_snaps.begin() + (ptrdiff_t)excess);
+            }
+        }
     }
     g_mem_recorder.prepend_cp(f.mem);
     if (!f.snaps.empty()) {

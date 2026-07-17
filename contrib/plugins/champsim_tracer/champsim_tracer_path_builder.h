@@ -324,6 +324,19 @@ private:
     /* Lazy per-segment baseline; see prime_from_live(). */
     bool primed_ = false;
 
+    /* Segment-boundary reg-snap hygiene (Case C: marker-block leak).  The
+     * block that OPENS a segment captures its own per-insn dst snaps AFTER
+     * the open — the START marker's magic-value write among them — but its
+     * seal is skipped (marker mode: its own vcpu_tb_exec was JIT-gated off
+     * pre-open; window mode: on_segment_open drops it as one-TB-lossy), so
+     * those snaps would prepend to the first REAL block's positional reg-snap
+     * stream.  seg_gen_seen_ detects the first step in a new segment (marker
+     * mode, where on_segment_open never runs); drop_open_leak_pending_ is the
+     * one-shot follow-up clear for the window-mode opener whose leak lands
+     * the step AFTER its own on_segment_open. */
+    uint32_t seg_gen_seen_ = 0;
+    bool drop_open_leak_pending_ = false;
+
     /*
      * ---- Kernel-excursion ownership (kexc=1) ----
      *

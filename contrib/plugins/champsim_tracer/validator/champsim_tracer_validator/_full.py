@@ -684,25 +684,19 @@ def build_checks() -> list:
                    ["behavior:wire_determinism", "tool:cst_visualize",
                     "tool:cst_decode_templates"], _chk_golden))
 
+    # GATING as of the reg-snap positional-attribution fix: the system-mode
+    # per-insn value-capture divergence this battery was parked for (metaflags
+    # losing a parity bit at pc=0x402984, INT_ADD dst capturing a code address
+    # instead of the ALU result — reg-snap slot contamination) is fixed at the
+    # plugin's seal walk (clobbered-scoreboard tail fallback + foreign-drop
+    # reg-snap discard + segment-boundary marker-leak clear + fault-merge
+    # leaked-prefix trim).  Restored to a hard gate.
     C.append(Check("system.user_x86", "system",
                    "system-mode marker/pin full-oracle battery (x86)",
                    ["opt:window_marker", "opt:kexc",
                     "wire:BODY_TAG_ASID_SWITCH",
                     "behavior:syscall_fault_nesting",
-                    "behavior:user_code_identity"], _chk_system_user,
-                   known_issue=(
-                       "OPEN PLUGIN BUG CLASS (deterministic, system-mode "
-                       "only): per-insn value capture diverges from the "
-                       "dataflow oracle at a handful of sites — metaflags "
-                       "loses/gains a parity bit (e.g. pc=0x402984 mflags="
-                       "0x00 with dst=0x212 requiring P=1), and "
-                       "regdata_reconstruction sees wrong dst snapshots "
-                       "(one INT_ADD dst captured a code address 0x4019d1 "
-                       "instead of the ALU result — slot contamination). "
-                       "Reproduces on every run at seed 0x1111 under -cpu "
-                       "max; the identical user-mode run passes all "
-                       "oracles.  Non-gating until the plugin fix lands; "
-                       "churn/thread keep the pin machinery as hard gates.")))
+                    "behavior:user_code_identity"], _chk_system_user))
     C.append(Check("system.churn_x86", "system",
                    "multi-process ASID-churn pin (x86)",
                    ["tool:cst_decode_strict", "tool:cst_audit",

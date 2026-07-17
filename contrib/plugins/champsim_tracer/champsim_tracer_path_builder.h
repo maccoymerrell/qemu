@@ -90,7 +90,9 @@ void emit_body_entry(BodyStreamState *out_stream,
                      BBTemplate *bb_tmpl,
                      unsigned int cpu_index,
                      std::vector<WPBBEntry> wp_entries,
-                     bool wp_first_tb_unavail = false);
+                     bool wp_first_tb_unavail = false,
+                     uint64_t branch_successor_pc = 0,
+                     bool branch_successor_known = false);
 
 /* Thread-local CP-step accumulators owned by champsim_tracer.cc.
  * PathBuilder moves them into / out of its frames (the stash and the

@@ -2462,7 +2462,9 @@ void emit_body_entry(BodyStreamState *out_stream,
                      BBTemplate *bb_tmpl,
                      unsigned int cpu_index,
                      std::vector<WPBBEntry> wp_entries,
-                     bool wp_first_tb_unavail)
+                     bool wp_first_tb_unavail,
+                     uint64_t branch_successor_pc,
+                     bool branch_successor_known)
 {
     /* warmup→simulation boundary capture.  This BB is the first
      * emitted at host_icount >= window_start + warmup_insns, so
@@ -2525,6 +2527,13 @@ void emit_body_entry(BodyStreamState *out_stream,
         entry.asid_index = resolve_asid_index(cpu_index);
     }
     entry.cpu_index = cpu_index;
+    /* Terminal-branch outcome for the CST_FID_BRANCH_* singletons.  The
+     * successor is the deferred-seal landing PC (collect_finalized_bbs'
+     * frag_current_pc, threaded through emit_finalized_bb); unknown only for
+     * the segment-final flush.  Stamped verbatim; direction/target are
+     * derived from it at wire-emit time. */
+    entry.branch_successor_pc    = branch_successor_pc;
+    entry.branch_successor_known = branch_successor_known;
 
     g_mem_recorder.drain_cp_into_dyn_params(entry.dyn_params, bb_tmpl);
     if (g_features.reg_data && !pending_reg_snaps.empty()) {
@@ -2581,6 +2590,19 @@ void emit_body_entry(BodyStreamState *out_stream,
                 g_rep_fanout_extra_insns.fetch_add(
                     (uint64_t)(n_iter - 1),
                     std::memory_order_relaxed);
+                /* Branch-outcome for the fanned-out REP iterations.  The REP
+                 * prefix is a self-loop "branch": iterations 1..N-1 loop back
+                 * to the REP insn (taken, target = the rep_subtmpl's start_pc
+                 * = the REP PC), and the final iteration exits to the BB's
+                 * real successor.  Preserve that real successor (stamped on
+                 * @entry from the seal) before overriding the parent to the
+                 * self-loop target, so the emitted per-iteration direction/
+                 * target matches the stream's successor sequence (each entry's
+                 * start_pc is the REP PC until the last iter falls through). */
+                uint64_t rep_exit_pc     = entry.branch_successor_pc;
+                bool     rep_exit_known  = entry.branch_successor_known;
+                uint64_t rep_loop_pc     = rep_sub->start_pc;
+
                 /* Iter 1: parent BB template + non-REP memops +
                  * first mpi REP memops. */
                 entry.dyn_params = std::move(other_dps);
@@ -2588,6 +2610,9 @@ void emit_body_entry(BodyStreamState *out_stream,
                 for (unsigned j = 0; j < mpi; j++) {
                     entry.dyn_params.push_back(rep_dps[j]);
                 }
+                /* n_iter > 1 here, so iter 1 always loops. */
+                entry.branch_successor_pc    = rep_loop_pc;
+                entry.branch_successor_known = rep_exit_known;
                 if (out_stream) {
                     body_stream_write_entry(out_stream, &entry);
                 }
@@ -2609,6 +2634,7 @@ void emit_body_entry(BodyStreamState *out_stream,
                 sub_e.asid_index  = entry.asid_index;
                 sub_e.ctx_asid_index = entry.ctx_asid_index;
                 sub_e.cpu_index   = entry.cpu_index;
+                sub_e.branch_successor_known = rep_exit_known;
                 sub_e.dyn_params.reserve(mpi);
                 /* Dedup case: a 1-insn REP BB (its start_pc IS the REP PC)
                  * is its own rep_subtmpl (commit_true_bb deduped sub against
@@ -2641,6 +2667,10 @@ void emit_body_entry(BodyStreamState *out_stream,
                         dp.insn_index = 0;
                         sub_e.dyn_params.push_back(dp);
                     }
+                    /* Iters 2..N-1 loop back to the REP PC; the final iter
+                     * (k == n_iter-1) exits to the BB's real successor. */
+                    sub_e.branch_successor_pc =
+                        (k + 1 < n_iter) ? rep_loop_pc : rep_exit_pc;
                     if (out_stream) {
                         body_stream_write_entry(out_stream, &sub_e);
                     }
@@ -3332,8 +3362,13 @@ void emit_finalized_bb(BodyStreamState *out_stream,
         }
     }
 
+    /* @current_pc is the resolved architectural successor of this BB's
+     * terminating branch (collect_finalized_bbs' frag_current_pc / the seal
+     * point) — the PC the next emitted entry starts at.  Pass it so the
+     * CST_FID_BRANCH_* singletons record the true direction/target.  Marked
+     * known: every emit_finalized_bb caller resolved a successor. */
     emit_body_entry(out_stream, bb_tmpl, cpu_index, std::move(wp_entries),
-                    wp_first_tb_unavail);
+                    wp_first_tb_unavail, current_pc, /*known=*/true);
 }
 
 /*

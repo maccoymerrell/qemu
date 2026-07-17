@@ -1441,12 +1441,21 @@ void emit_bb_header(FILE *out, const cst::DecodedEntry &e,
     if (e.fault_depth > 0) {
         std::snprintf(fd, sizeof(fd), " fault_depth=%u", e.fault_depth);
     }
+    /* Terminal-branch direction/target, decoded directly from the
+     * CST_FID_BRANCH_* singletons (no successor look-ahead). */
+    char br[48];
+    br[0] = '\0';
+    if (e.branch.valid) {
+        std::snprintf(br, sizeof(br), " branch=%s target=0x%" PRIx64,
+                      e.branch.taken ? "taken" : "not-taken",
+                      e.branch.target);
+    }
     std::fprintf(out,
                  "; ----- BB %u entry pc=0x%" PRIx64
-                 " insns=%zu seq=%u tid=%u asid=%u%s%s -----\n",
+                 " insns=%zu seq=%u tid=%u asid=%u%s%s%s -----\n",
                  e.template_id, t.start_pc, t.insns.size(),
                  e.seq_num, e.thread_id, e.asid,
-                 e.thread_switched ? " (thread_switch)" : "", fd);
+                 e.thread_switched ? " (thread_switch)" : "", fd, br);
 }
 
 void emit_wp_run_separator(FILE *out, const cst::Instruction &first,
@@ -2170,8 +2179,17 @@ void emit_legacy_entry(FILE *out, const cst::Header &h,
                                i ? "," : "", e.fault_anchors[i]);
         }
     }
-    std::fprintf(out, "ENTRY %04u thread=%u asid=%u%s%s template=BB%u\n",
-                 e.seq_num, e.thread_id, e.asid, sw, fd, e.template_id);
+    /* Terminal-branch direction/target (CST_FID_BRANCH_*), decoded directly
+     * per entry.  Suffix, so a non-branch entry keeps the historical line. */
+    char br[48];
+    br[0] = '\0';
+    if (e.branch.valid) {
+        std::snprintf(br, sizeof(br), " branch=%s target=0x%" PRIx64,
+                      e.branch.taken ? "taken" : "not-taken",
+                      e.branch.target);
+    }
+    std::fprintf(out, "ENTRY %04u thread=%u asid=%u%s%s template=BB%u%s\n",
+                 e.seq_num, e.thread_id, e.asid, sw, fd, e.template_id, br);
     std::fprintf(out, "  cp:\n");
     emit_legacy_observations(out, "    ", h, e.dyn_params, e.reg_snaps,
                              e.metaflags, e.lane_masks);
@@ -2260,7 +2278,9 @@ struct Options {
     bool        show_deps      = false;
     bool        show_lanes     = false;
     bool        strict         = false;
+    bool        verify_branch  = false;    /* cross-check CST_FID_BRANCH_* */
     uint64_t    max_entries    = 0;        /* 0 = unbounded */
+    uint64_t    verify_limit   = 0;        /* 0 = all CP entries */
 };
 
 void print_usage(FILE *err, const char *argv0)
@@ -2288,7 +2308,12 @@ void print_usage(FILE *err, const char *argv0)
         "                    memop-incapable insn, dst-reg value on a\n"
         "                    nonexistent operand slot)\n"
         "  --max N           stop after N body entries (tears the\n"
-        "                    decompressor subprocess down early)\n",
+        "                    decompressor subprocess down early)\n"
+        "  --verify-branch[=N]  cross-check each branch-terminated CP\n"
+        "                    entry's CST_FID_BRANCH_* against the\n"
+        "                    successor-derived direction/target (the next\n"
+        "                    same-thread entry's start_pc); exit 1 on any\n"
+        "                    mismatch.  =N caps the entries walked\n",
         argv0);
 }
 
@@ -2313,6 +2338,11 @@ int parse_options(int argc, char **argv, Options *opts)
             opts->show_lanes = true;
         } else if (std::strcmp(a, "--strict") == 0) {
             opts->strict = true;
+        } else if (std::strcmp(a, "--verify-branch") == 0) {
+            opts->verify_branch = true;
+        } else if (std::strncmp(a, "--verify-branch=", 16) == 0) {
+            opts->verify_branch = true;
+            opts->verify_limit = std::strtoull(a + 16, nullptr, 10);
         } else if (std::strncmp(a, "--max=", 6) == 0) {
             opts->max_entries = std::strtoull(a + 6, nullptr, 10);
         } else if (std::strcmp(a, "--max") == 0 && i + 1 < argc) {
@@ -2396,6 +2426,120 @@ int run_body_render(const Options &opts, const cst::Header &h,
     return 0;
 }
 
+/*
+ * §8.e  Branch-outcome self-check  (--verify-branch)
+ *
+ * Cross-checks every branch-terminated CP entry's decoded CST_FID_BRANCH_*
+ * against the value a look-ahead consumer would derive: the NEXT CP entry on
+ * the SAME (thread, asid) supplies the architectural successor, so the stored
+ * target must equal that successor's start_pc and the stored direction must
+ * equal (successor != fall_through) with unconditional terminators forced
+ * taken — identical to the writer's classification.  Agreement proves the
+ * FIDs are truthful (they encode exactly what a decoder would otherwise have
+ * to decode ahead for).  Per-context tracking tolerates multi-vCPU
+ * interleaving; a fault handler interposed on the same thread (system mode)
+ * legitimately breaks the successor identity and is reported for inspection.
+ * Returns 0 iff every checked entry agreed.
+ */
+int run_verify_branch(const Options &opts, const cst::Header &h,
+                      cst::CstFile &cf,
+                      const std::vector<cst::Template> &templates,
+                      const std::unordered_map<uint32_t, size_t> &by_id)
+{
+    auto body_stream = cst::body_stream_open(cf);
+    cst::BodyWalker walker(h, templates, by_id, body_stream->reader());
+    if (opts.verify_limit) walker.set_max_entries(opts.verify_limit);
+
+    struct PrevBr {
+        bool     valid = false;
+        bool     taken = false;
+        uint64_t target = 0;
+        uint64_t fall_through = 0;
+        bool     conditional = false;
+        uint32_t template_id = 0;
+    };
+    std::unordered_map<uint64_t, PrevBr> prev_by_ctx;
+
+    uint64_t n_checked = 0, n_target_mism = 0, n_taken_mism = 0;
+    uint64_t n_branch = 0, n_nonbranch = 0;
+    std::string examples;
+    int ex_count = 0;
+
+    auto get_tmpl = [&](uint32_t tid) -> const cst::Template * {
+        auto it = by_id.find(tid);
+        return it == by_id.end() ? nullptr : &templates[it->second];
+    };
+
+    walker.walk([&](const cst::DecodedEntry &e) {
+        const cst::Template *t = get_tmpl(e.template_id);
+        uint64_t start_pc = t ? t->start_pc : 0;
+        uint64_t ctx = ((uint64_t)e.thread_id << 32) | e.asid;
+
+        auto pit = prev_by_ctx.find(ctx);
+        if (pit != prev_by_ctx.end() && pit->second.valid) {
+            const PrevBr &p = pit->second;
+            uint64_t succ = start_pc;                 /* successor-derived  */
+            bool exp_taken = (succ != p.fall_through);
+            if (!p.conditional) exp_taken = true;
+            bool tmism = (p.target != succ);
+            bool dmism = (p.taken != exp_taken);
+            n_checked++;
+            if (tmism) n_target_mism++;
+            if (dmism) n_taken_mism++;
+            if ((tmism || dmism) && ex_count < 20) {
+                char buf[320];
+                std::snprintf(buf, sizeof(buf),
+                    "  tid=%u asid=%u prev=BB%u: FID target=0x%llx taken=%d"
+                    " | successor start=0x%llx expect_taken=%d%s%s\n",
+                    (uint32_t)(ctx >> 32), (uint32_t)(ctx & 0xffffffffu),
+                    p.template_id,
+                    (unsigned long long)p.target, (int)p.taken,
+                    (unsigned long long)succ, (int)exp_taken,
+                    tmism ? " [TARGET MISMATCH]" : "",
+                    dmism ? " [TAKEN MISMATCH]" : "");
+                examples += buf;
+                ex_count++;
+            }
+        }
+
+        PrevBr np;
+        np.valid        = e.branch.valid;
+        np.taken        = e.branch.taken;
+        np.target       = e.branch.target;
+        np.fall_through = t ? t->fall_through_pc : 0;
+        np.template_id  = e.template_id;
+        if (t) {
+            for (int j = (int)t->insns.size() - 1; j >= 0; j--) {
+                if (t->insns[j].branch_type != 0) {
+                    np.conditional = t->insns[j].branch_conditional;
+                    break;
+                }
+            }
+        }
+        prev_by_ctx[ctx] = np;
+        if (e.branch.valid) n_branch++; else n_nonbranch++;
+    });
+
+    bool stopped_early =
+        opts.verify_limit != 0 && walker.stats().cp_entries >= opts.verify_limit;
+    if (!stopped_early) body_stream->finalize();
+
+    std::fprintf(stdout,
+        "branch self-check: %llu branch-terminated CP entries, "
+        "%llu non-branch; cross-checked %llu against successor-derived "
+        "target/direction\n"
+        "  target mismatches: %llu\n"
+        "  taken  mismatches: %llu\n",
+        (unsigned long long)n_branch, (unsigned long long)n_nonbranch,
+        (unsigned long long)n_checked,
+        (unsigned long long)n_target_mism,
+        (unsigned long long)n_taken_mism);
+    if (!examples.empty()) {
+        std::fprintf(stdout, "first mismatches:\n%s", examples.c_str());
+    }
+    return (n_target_mism == 0 && n_taken_mism == 0) ? 0 : 1;
+}
+
 int run(const Options &opts)
 {
     /* Outer .cst is a ustar archive holding two members
@@ -2423,6 +2567,9 @@ int run(const Options &opts)
          * owns its own body_stream_open + finalize. */
         cst::render_raw(stdout, *cf, h, templates, by_id, opts.max_entries);
         return 0;
+    }
+    if (opts.verify_branch) {
+        return run_verify_branch(opts, h, *cf, templates, by_id);
     }
     return run_body_render(opts, h, *cf, templates, by_id, odp);
 }

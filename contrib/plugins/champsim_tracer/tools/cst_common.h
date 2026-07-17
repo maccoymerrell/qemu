@@ -123,6 +123,12 @@ struct ResolvedIds {
     uint16_t fid_insn_immediate   = 0;
     uint16_t fid_insn_size        = 0;
     uint16_t fid_extended         = 0;
+    /* Branch-outcome singletons on the terminating branch (always advertised
+     * by a post-branch writer): direction (1=taken) and dynamic target PC.
+     * Sentinel 0 (never resolves) on traces predating the feature — a
+     * consumer then falls back to successor look-ahead. */
+    uint16_t fid_branch_taken     = 0;
+    uint16_t fid_branch_target    = 0;
 
     /* insn_flag map: bit masks inside the per-insn flags byte */
     uint8_t insn_flag_branch_cond   = 0;
@@ -304,6 +310,19 @@ struct LaneMaskEntry {
     uint64_t mask        = 0;
 };
 
+/* Terminal-branch outcome decoded from the CST_FID_BRANCH_TAKEN / _TARGET
+ * singletons, exposed directly per entry so a consumer never decodes the
+ * successor to recover the branch's direction or dynamic target.  valid is
+ * true iff the entry's template ends in a branch (a page-split continuation
+ * carries no branch); target == the architectural landing PC (equal to the
+ * fall-through when not taken).  On a trace predating the feature valid is
+ * false — the fields are unset and a consumer falls back to look-ahead. */
+struct BranchOutcome {
+    bool     valid  = false;
+    bool     taken  = false;
+    uint64_t target = 0;
+};
+
 struct WPEntry {
     uint32_t                    index = 0;
     uint32_t                    template_id = 0;
@@ -321,6 +340,10 @@ struct WPEntry {
     uint32_t                    fault_insn_index = 0;
     bool                        has_fault_idx = false;
     uint32_t                    n_insns = 0;
+    /* The CST_FID_BRANCH_* singletons are CP-only, so this always stays
+     * valid=false for a WP BB: its successor is simply the next chain
+     * entry's start_pc.  Kept for struct symmetry with DecodedEntry. */
+    BranchOutcome               branch;
 };
 
 struct DecodedEntry {
@@ -349,6 +372,11 @@ struct DecodedEntry {
     /* Faulting-instruction indices for a whole-BB-merged faulting BB (one
      * per fault excursion, in order); empty for ordinary entries. */
     std::vector<uint32_t>       fault_anchors;
+    /* Terminal-branch direction/target (CST_FID_BRANCH_*), materialised
+     * directly so a consumer need not decode the successor entry.  valid iff
+     * the template ends in a branch; target == the architectural successor
+     * (the next entry's start_pc), so a self-check can cross-verify it. */
+    BranchOutcome               branch;
 };
 
 /* Forward declarations so Instruction can hold non-owning pointers

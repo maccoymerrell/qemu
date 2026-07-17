@@ -352,12 +352,14 @@ static void write_field_id_encoding_map(BitWriter *bw)
 {
     /* Count: 3 hot singletons + 8 slotted families × CST_FID_SLOT_COUNT
      * + 4 lane-mask families × CST_FID_SLOT_COUNT + 7 insn-metadata
-     * + 1 EXTENDED, plus (physaddr only) 2 ppage families × slot count.
-     * The ppage families are advertised only when physical-page capture is
-     * active, so a non-physaddr trace's map stays byte-identical. */
+     * + 1 EXTENDED + 2 branch-outcome singletons (always present), plus
+     * (physaddr only) 2 ppage families × slot count.  The ppage families are
+     * advertised only when physical-page capture is active, so a
+     * non-physaddr trace's map differs from a pre-branch writer's only by the
+     * two always-on branch entries. */
     uint64_t n_entries =
         3 + (uint64_t)8 * CST_FID_SLOT_COUNT
-          + (uint64_t)4 * CST_FID_SLOT_COUNT + 7 + 1;
+          + (uint64_t)4 * CST_FID_SLOT_COUNT + 7 + 1 + 2;
     if (g_features.physaddr) {
         n_entries += (uint64_t)G_N_ELEMENTS(kPpageFamilies) * CST_FID_SLOT_COUNT;
     }
@@ -419,6 +421,12 @@ static void write_field_id_encoding_map(BitWriter *bw)
         { CST_FID_INSN_IMMEDIATE,   "CST_FID_INSN_IMMEDIATE" },
         { CST_FID_INSN_SIZE,        "CST_FID_INSN_SIZE" },
         { CST_FID_EXTENDED,         "CST_FID_EXTENDED" },
+        /* Branch-outcome singletons: always advertised (unlike the gated
+         * ppage families) so every branch-terminated entry can carry its
+         * direction/target.  FID numbers sit after the ppage block, so no
+         * pre-existing id moves. */
+        { CST_FID_BRANCH_TAKEN,     "CST_FID_BRANCH_TAKEN" },
+        { CST_FID_BRANCH_TARGET,    "CST_FID_BRANCH_TARGET" },
     };
     for (size_t i = 0; i < G_N_ELEMENTS(insn_fields); i++) {
         write_encoding_entry(bw, insn_fields[i].value, insn_fields[i].name);
@@ -1120,10 +1128,12 @@ static void bw_write_sleb128_u512(BitWriter *bw, U512 v)
  */
 enum {
     FIELD_STATE_SLOT_INVALID = 0xFFFFu,
-    /* Scalar fixed prefix: N_LOADS, N_STORES, METAFLAGS, then the 7
-     * insn-metadata cells (BYTES_LO..SIZE).  N_SCALAR_SLOTTED scalar
-     * slotted families and N_WIDE_SLOTTED wide families follow. */
-    FIELD_STATE_SCALAR_FIXED = 10,
+    /* Scalar fixed prefix: N_LOADS, N_STORES, METAFLAGS, the 7
+     * insn-metadata cells (BYTES_LO..SIZE), then the 2 branch-outcome
+     * singletons (BRANCH_TAKEN, BRANCH_TARGET) at offsets 10..11.
+     * N_SCALAR_SLOTTED scalar slotted families and N_WIDE_SLOTTED wide
+     * families follow. */
+    FIELD_STATE_SCALAR_FIXED = 12,
     FIELD_STATE_N_SCALAR_FAM = 11,  /* load/store addr, load/store size,
                                      * dst_reg_width, 4 lane masks,
                                      * load/store ppage */
@@ -1209,6 +1219,10 @@ static void field_state_slot_lut_build(void)
     for (unsigned f = CST_FID_INSN_BYTES_LO; f <= CST_FID_INSN_SIZE; f++) {
         set_fixed(f, (uint8_t)(3 + (f - CST_FID_INSN_BYTES_LO)));
     }
+    /* Branch-outcome singletons ride the branch insn's position like
+     * METAFLAGS; prefix offsets 10..11 (see FIELD_STATE_SCALAR_FIXED). */
+    set_fixed(CST_FID_BRANCH_TAKEN,  10);
+    set_fixed(CST_FID_BRANCH_TARGET, 11);
 
     /* The 8 stride-CST_FID_SLOT_STRIDE slotted families (shared
      * kSlottedFamilies): cls + family ordinal within plane. */
@@ -1461,6 +1475,12 @@ struct EntryView {
      * the InsnFields lane_mask_kind is dynamic (reads a runtime CSR
      * via cst_reg_read_u64). */
     unsigned int cpu_index;
+    /* Terminal-branch outcome for the CST_FID_BRANCH_* singletons.
+     * branch_known gates emission; branch_successor_pc is the architectural
+     * landing PC (== next entry's start_pc).  Direction/target are derived
+     * from it and the template's fall-through at staging time. */
+    bool     branch_known;
+    uint64_t branch_successor_pc;
 };
 
 typedef struct EntryView EntryView;
@@ -2936,6 +2956,32 @@ static void emit_field_delta_section(BitWriter *main_bw,
                 }
             }
         }
+
+        /* Branch-outcome singletons (CST_FID_BRANCH_TAKEN / _TARGET).  Once
+         * per entry, on the terminating branch of a branch-terminated BB,
+         * when the successor is known (see BodyEntry / WPBBEntry
+         * branch_successor_*).  A page-split continuation (no branch) or the
+         * segment-final flush stages neither, so those entries carry no
+         * direction/target.  Target = the architectural successor (== the
+         * next entry's start_pc); taken = it diverged from the fall-through,
+         * with unconditional terminators always "taken" — identical to
+         * profile_branch's classification and to the decoder's
+         * successor-derived cross-check.  Delta-encoded against the branch
+         * insn's own prior value (default 0): a static direct branch costs
+         * zero record bytes after its first sighting; cost concentrates in
+         * indirect targets and direction flips. */
+        if (ev->branch_known && ev->tmpl) {
+            int bidx = TemplateStore::template_branch_index(ev->tmpl);
+            if (bidx >= 0) {
+                const InsnFields *bf = &ev->tmpl->insn_fields[bidx];
+                uint64_t target = ev->branch_successor_pc;
+                bool taken = (target != ev->tmpl->fall_through_pc);
+                if (!bf->branch_conditional) taken = true;
+                STAGE_U64((uint32_t)bidx, CST_FID_BRANCH_TAKEN,
+                          (uint64_t)(taken ? 1 : 0), 0);
+                STAGE_U64((uint32_t)bidx, CST_FID_BRANCH_TARGET, target, 0);
+            }
+        }
 #undef STAGE_U64
 #undef STAGE_WIDE
     }
@@ -3149,6 +3195,9 @@ struct BBDeltaInput {
     const BBTemplate            *tmpl;
     const std::vector<DynParam> *dyn_params;
     const std::vector<RegSnap>  *reg_snaps;
+    /* Terminal-branch outcome, threaded to the CST_FID_BRANCH_* staging. */
+    bool                         branch_known = false;
+    uint64_t                     branch_successor_pc = 0;
 };
 
 static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
@@ -3170,6 +3219,8 @@ static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
                      scratch->load_slots,
                      scratch->store_slots);
     ev.cpu_index = cpu_index;
+    ev.branch_known         = rec.branch_known;
+    ev.branch_successor_pc  = rec.branch_successor_pc;
     emit_field_delta_section(bw, st, state, base_state, rec.template_id,
                              &ev, is_wp, st->header_flags);
 }
@@ -3200,7 +3251,9 @@ static void emit_body_record_payload(
 {
     emit_one_bb_delta(bw, st, cp_state,
                       {entry->template_id, entry->tmpl,
-                       &entry->dyn_params, &entry->reg_snaps},
+                       &entry->dyn_params, &entry->reg_snaps,
+                       entry->branch_successor_known,
+                       entry->branch_successor_pc},
                       false, entry->cpu_index);
 
     /* Per-entry synchronous-fault trailer (CST_FLAG_FAULT, system mode):
@@ -3237,6 +3290,8 @@ static void emit_body_record_payload(
             uint32_t wp_tmpl = wp->template_id;
             bw_write_sleb128(&sub, (int64_t)wp_tmpl - prev_wp_template);
             prev_wp_template = wp_tmpl;
+            /* WP entries carry no CST_FID_BRANCH_* (CP-only); branch_known
+             * defaults false in BBDeltaInput, so none are staged. */
             emit_one_bb_delta_with_base(&sub, st, wp_state, wp_base,
                                         {wp_tmpl, wp->tmpl,
                                          &wp->dyn_params, &wp->reg_snaps},

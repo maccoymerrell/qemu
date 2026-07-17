@@ -41,8 +41,9 @@ enum : int {
     BIDX_EXTENDED   = 8,
     BIDX_LANE_MASK  = 9,
     BIDX_PHYS_PAGE  = 10,   /* CST_FID_LOAD_PPAGE / STORE_PPAGE (physaddr) */
-    BIDX_OTHER      = 11,
-    NUM_BUCKETS     = 12,
+    BIDX_BRANCH     = 11,   /* CST_FID_BRANCH_TAKEN / _TARGET (always on)  */
+    BIDX_OTHER      = 12,
+    NUM_BUCKETS     = 13,
 };
 
 /* FID -> bucket lookup over the ULEB FID space.  Slotted families
@@ -101,6 +102,10 @@ struct FidTables {
             if (f < LUT_SIZE) bucket[f] = BIDX_INSN_META;
         }
         if (ids.fid_extended < LUT_SIZE) bucket[ids.fid_extended] = BIDX_EXTENDED;
+        /* Branch-outcome singletons (always-on): their own bucket so the
+         * direction/target cost is visible separately from "other". */
+        if (ids.fid_branch_taken  < LUT_SIZE) bucket[ids.fid_branch_taken]  = BIDX_BRANCH;
+        if (ids.fid_branch_target < LUT_SIZE) bucket[ids.fid_branch_target] = BIDX_BRANCH;
     }
 
     uint8_t bucket_for(unsigned fid) const {
@@ -819,6 +824,7 @@ void print_report(const Stats &s, const cst::Header &h)
         {"extended",             BIDX_EXTENDED},
         {"lane masks",           BIDX_LANE_MASK},
         {"physical pages",       BIDX_PHYS_PAGE},
+        {"branch outcome",       BIDX_BRANCH},
         {"other",                BIDX_OTHER},
     };
     for (auto &r : rows) {

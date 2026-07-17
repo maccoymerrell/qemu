@@ -193,7 +193,11 @@ _INSN_RE = re.compile(
 )
 _ENTRY_HEAD_RE = re.compile(
     r"^ENTRY (\d+) thread=(\d+)(?: asid=\d+)?(?: switch=(\d))?"
-    r"(?: fault_depth=(\d+))?(?: fault_at=([\d,]+))? template=BB(\d+)$"
+    r"(?: fault_depth=(\d+))?(?: fault_at=([\d,]+))? template=BB(\d+)"
+    # Terminal-branch direction/target (CST_FID_BRANCH_*), decoded directly
+    # per branch-terminated entry.  Non-capturing so group indices 1..6 are
+    # unchanged; the validator derives direction/target from the templates.
+    r"(?: branch=(?:taken|not-taken) target=0x[0-9a-f]+)?$"
 )
 _WP_HEAD_RE = re.compile(
     r"^  wp\[(\d+)\] template=BB(\d+) n_insns=(\d+)$"

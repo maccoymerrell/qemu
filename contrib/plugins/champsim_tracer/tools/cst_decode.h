@@ -351,7 +351,8 @@ private:
                             std::vector<RegSnap>        *reg_snaps,
                             std::vector<MetaFlagsEntry> *metaflags,
                             std::vector<LaneMaskEntry>  *lane_masks,
-                            AttributionLint             *lint);
+                            AttributionLint             *lint,
+                            BranchOutcome               *branch = nullptr);
 
     /* Compute the template-default for FID_INSN_* fields (those whose
      * baseline is the template's static value).  Returns Wide{} for

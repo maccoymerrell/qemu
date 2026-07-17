@@ -1609,6 +1609,21 @@ Field families (one canonical name each):
   scalar-delta byte after this field-id's record is followed by
   one extra ULEB whose value is reserved.
 
+* **Branch-outcome singletons** (two; always advertised — see §5.6):
+
+  * **`CST_FID_BRANCH_TAKEN`** — `1` if the BB's terminating branch
+    transferred control (taken), `0` if it fell through.
+  * **`CST_FID_BRANCH_TARGET`** — the branch's actual landing PC.  When
+    not taken this equals the fall-through, so the field is simply the
+    architectural successor either way.
+
+  Both ride the terminating branch instruction's `ins_pos` (like
+  `METAFLAGS`), with baseline default zero, and appear only on a
+  branch-terminated CP entry (a page-split continuation carries neither).
+  Their numeric IDs sit after the physical-page block, so a trace that
+  predates them names neither; a post-branch writer always advertises
+  both.  See §5.4 for the full contract.
+
 **Layout intent (non-normative).**  The writer assigns numeric
 IDs so the hot fields — slot counts, metaflags, and low-slot
 memops + destination snapshots — collectively occupy IDs `< 128`
@@ -1922,6 +1937,53 @@ INSN_* sparse records update only changed fields
 
 This permits traces where an instruction's raw bytes or classification
 changes without forcing a new template record.
+
+### 5.6 Branch Outcome
+
+Two singleton field-IDs make a branch-terminated CP entry's control-flow
+outcome explicit, so a consumer never has to decode the successor entry to
+recover it:
+
+* **`CST_FID_BRANCH_TAKEN`** — `1` when the terminating branch transferred
+  control, `0` when it fell through.
+* **`CST_FID_BRANCH_TARGET`** — the PC the branch actually reached this
+  execution.  When not taken this equals the template's `fall_through_pc`,
+  so `BRANCH_TARGET` is the architectural successor in both directions.
+
+Both ride the `ins_pos` of the BB's terminating branch — the
+highest-indexed branch-type instruction (`n-1` normally, `n-2` on a
+delay-slot tail, matching the writer's `template_branch_index`) — and are
+delta-encoded against that instruction's own previous value with baseline
+default `0`, exactly like `METAFLAGS`.  A **static direct branch** therefore
+costs the two records once (its target and, if taken, its direction) and
+**zero bytes** on every later execution; a **conditional** branch pays a
+one-byte direction delta only when its outcome flips; an **indirect** branch
+pays a target delta whenever the target moves.  A consumer reconstructs the
+direction it would otherwise derive by look-ahead as
+`taken == (successor != fall_through_pc)`, with an unconditional terminator
+always taken — identical to the writer's classification.
+
+Coverage and gating:
+
+* **CP only.**  A wrong-path (WP) chain entry carries neither FID: a WP
+  block's successor is simply the next chain entry's `start_pc`, available
+  with no look-ahead barrier (the whole excursion is one CP entry's
+  payload).  A CP entry's next same-thread successor, by contrast, may sit
+  arbitrarily far downstream past WP chains, IFRAMEs, and interleaved
+  other-thread entries — so the explicit FID earns its bytes there and would
+  be pure duplication on WP.
+* **Always advertised**, not header-gated: a post-branch writer names both
+  in every trace's `field_id` map (they cost nothing on non-branch entries).
+  A trace produced by a writer that predates the feature names neither, and
+  a consumer then falls back to successor look-ahead.
+* **Branch-terminated entries only.**  A page-split continuation (no
+  terminating branch) and the lone segment-final entry flushed with no
+  observed successor carry neither FID; a decoder surfaces the outcome only
+  when the template ends in a branch.
+* **REP string operations** fan out into one entry per iteration, all at the
+  REP PC; the self-looping REP "branch" is reported taken to its own PC for
+  every iteration but the last, which exits to the real successor — so the
+  per-entry outcome tracks the emitted successor sequence exactly.
 
 ## 6. Templates Section
 

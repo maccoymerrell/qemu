@@ -77,13 +77,19 @@ void slot_lut_build(const ResolvedIds &ids,
         }
     }
 
-    /* Cold insn-metadata singletons.  Each FID is resolved by name in
-     * ResolvedIds; map each into its own dense slot. */
+    /* Cold insn-metadata singletons + the 2 branch-outcome singletons.
+     * Each FID is resolved by name in ResolvedIds; map each into its own
+     * dense slot after the slotted region (fs_phys_offset lands them at
+     * fixed cells 3..11).  The branch pair (fixed cells 10..11) is a purely
+     * internal storage choice; it is simply never written on a trace that
+     * predates the feature (fid_branch_* == 0), so older traces decode
+     * unchanged. */
     const uint16_t cold_fids[] = {
         ids.fid_insn_bytes_lo, ids.fid_insn_bytes_hi,
         ids.fid_insn_opcode,   ids.fid_insn_branch_type,
         ids.fid_insn_flags,    ids.fid_insn_immediate,
         ids.fid_insn_size,
+        ids.fid_branch_taken,  ids.fid_branch_target,
     };
     for (size_t i = 0; i < sizeof(cold_fids) / sizeof(cold_fids[0]); i++) {
         if (cold_fids[i] < FID_LUT_SIZE) {
@@ -100,7 +106,8 @@ void slot_lut_build(const ResolvedIds &ids,
  *   [3, 3 + FID_SLOT_COUNT*12)   slot-major slotted: k=(L-3)/12,
  *                                f=(L-3)%12 -> family-major physical
  *                                cell FS_FIXED_CELLS + f*max_slots + k
- *   [.., +7)                     cold metadata   -> fixed offset 3..9
+ *   [.., +9)                     cold metadata (7) + branch pair (2)
+ *                                -> fixed offsets 3..11
  */
 /* Slotted families tracked in the decoder's family-major block: the 8 wire
  * slotted families + 4 lane-mask families + 2 physical-page families.  Must
@@ -108,7 +115,7 @@ void slot_lut_build(const ResolvedIds &ids,
  * internal storage layout; the ppage families are simply never written on a
  * non-physaddr trace, so decode of older traces is unaffected). */
 inline constexpr uint32_t FS_N_FAMILIES  = 14;
-inline constexpr uint32_t FS_FIXED_CELLS = 10;   /* 3 hot + 7 cold */
+inline constexpr uint32_t FS_FIXED_CELLS = 12;   /* 3 hot + 7 cold + 2 branch */
 inline constexpr uint32_t FS_SLOTTED_BASE = 3;
 inline constexpr uint32_t FS_SLOTTED_END  =
     FS_SLOTTED_BASE + FID_SLOT_COUNT * FS_N_FAMILIES;
@@ -686,6 +693,8 @@ std::vector<WPEntry> BodyWalker::decode_wp_chain(
         if (!wtmpl && wp_tmpl != 0) {
             lint_.note_dangling((uint32_t)wp_tmpl, /*is_wp=*/true);
         }
+        /* No branch out-param: the CST_FID_BRANCH_* singletons are CP-only,
+         * so a WP entry never carries them (we.branch stays valid=false). */
         decode_field_delta(wpb, (uint32_t)wp_tmpl, wtmpl,
                            state, base_state,
                            &we.dyn_params, &we.reg_snaps, &we.metaflags,
@@ -776,7 +785,7 @@ void BodyWalker::handle_entry(WalkState &ws, const Callback &cb)
     decode_field_delta(body_, (uint32_t)entry_tmpl, cp_tmpl,
                        cp_state, nullptr,
                        &entry.dyn_params, &entry.reg_snaps, &entry.metaflags,
-                       &entry.lane_masks, &lint_);
+                       &entry.lane_masks, &lint_, &entry.branch);
 
     /* Per-entry synchronous-fault trailer (Step 6.4a), present only when the
      * CST_FLAG_FAULT header bit is set; sits between the CP delta and the WP
@@ -1121,7 +1130,8 @@ void BodyWalker::decode_field_delta(Reader &outer,
                                     std::vector<RegSnap>        *reg_snaps,
                                     std::vector<MetaFlagsEntry> *metaflags,
                                     std::vector<LaneMaskEntry>  *lane_masks,
-                                    AttributionLint             *lint)
+                                    AttributionLint             *lint,
+                                    BranchOutcome               *branch)
 {
     SectionScope scope(outer);
     Reader &sec = scope;
@@ -1244,6 +1254,34 @@ void BodyWalker::decode_field_delta(Reader &outer,
             emit_fam(LaneMaskEntry::StoreData, ids.fid_store_data_lane_mask,
                      (uint8_t)std::min<uint32_t>(it.max_dep_stores,
                                                  (uint32_t)n_stores));
+        }
+    }
+
+    /* Branch-outcome singletons (CST_FID_BRANCH_TAKEN / _TARGET).  Exposed
+     * directly per entry, with no successor look-ahead: locate the
+     * terminating branch exactly as the writer does (highest-indexed
+     * branch-type insn — n-1 normally, n-2 on a delay-slot tail), then read
+     * its two persisted cells.  Direction/target ride the branch insn's
+     * position through the same delta model as METAFLAGS, so a static direct
+     * branch simply keeps its last value.  valid iff the template ends in a
+     * branch AND the trace advertises both FIDs; a pre-branch writer resolves
+     * them to the absent sentinel (>= FID_LUT_SIZE), so the block is skipped
+     * and no direction/target is surfaced for such a trace. */
+    if (branch && ids.fid_branch_taken  < FID_LUT_SIZE
+               && ids.fid_branch_target < FID_LUT_SIZE) {
+        int bidx = -1;
+        for (int j = (int)tmpl->insns.size() - 1; j >= 0; j--) {
+            if (tmpl->insns[j].branch_type != 0) { bidx = j; break; }
+        }
+        if (bidx >= 0) {
+            uint32_t bi = (uint32_t)bidx;
+            branch->valid  = true;
+            branch->taken  = lookup_cell(state_blk, state_gen,
+                                         base_blk, base_gen, slot_lut_,
+                                         bi, ids.fid_branch_taken).low64() != 0;
+            branch->target = lookup_cell(state_blk, state_gen,
+                                         base_blk, base_gen, slot_lut_,
+                                         bi, ids.fid_branch_target).low64();
         }
     }
 }

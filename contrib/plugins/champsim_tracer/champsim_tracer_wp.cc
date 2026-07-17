@@ -1205,9 +1205,17 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
 
             bool this_bb_fault_stop = acc.bb_fault_stop;
 
+            /* The CST_FID_BRANCH_* singletons are CP-only by design: a WP
+             * BB's successor is simply the next chain entry's start_pc (the
+             * whole excursion is one CP entry's payload, so there is no
+             * lookahead barrier — unlike a CP entry, whose next same-thread
+             * successor may sit far downstream past WP chains, IFRAMEs and
+             * interleaved other-thread entries).  Emitting them per WP BB
+             * would duplicate in-chain data at ~4x the CP branch cost on
+             * speculative code where targets vary per excursion. */
             wp_chain.push_back(acc.make_entry(bb_tmpl,
-                                             bb_has_fault,
-                                             bb_first_fault_idx));
+                                              bb_has_fault,
+                                              bb_first_fault_idx));
 
             acc.clear();
 

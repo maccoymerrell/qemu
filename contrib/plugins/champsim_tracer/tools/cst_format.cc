@@ -360,6 +360,12 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
                      &ids->fid_insn_size);
     resolve_optional(maps.field_id, "CST_FID_EXTENDED",
                      &ids->fid_extended);
+    /* Branch-outcome singletons (always advertised by a post-branch writer;
+     * resolve to 0 -> unused on older traces). */
+    resolve_optional(maps.field_id, "CST_FID_BRANCH_TAKEN",
+                     &ids->fid_branch_taken);
+    resolve_optional(maps.field_id, "CST_FID_BRANCH_TARGET",
+                     &ids->fid_branch_target);
 
     /* insn_flag (bit masks) */
     resolve_one(maps.insn_flag, "insn_flag", "CST_INSN_FLAG_BRANCH_COND",

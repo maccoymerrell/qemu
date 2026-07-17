@@ -1,4 +1,17 @@
-"""Verdict-level tests for _check_wrong_path_chains.
+"""RETIRED — verdict-level tests for the removed DEP_BRANCH_KILL WP policy.
+
+This suite encodes the wrong-path termination policy the plugin RETIRED on
+2026-07-12 (commit 914d452978: WP execution-time faults now continue to the
+wpdepth budget instead of being killed at the first fault-dependent branch).
+It directly contradicts the LIVE policy asserted by
+``tests/test_wp_synthetic_fault.py`` and only stays green because
+``validator._check_wrong_path_chains`` still carries the same stale kill
+logic.  It is retired from the collectable suite pending reconciliation of
+that function with the continue-to-budget policy; see ``VALIDATION.md``.
+The unified ``full`` harness exercises the live policy via
+``features.wp_fault`` (``test_wp_synthetic_fault.py``), not this file.
+
+Original description follows:
 
 Exercises the wrong-path fault policy: the plugin proceeds around a
 suppressed speculative fault with the accumulated wrong-path state
@@ -18,6 +31,20 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+# Retired from the collectable suite (see the module docstring): the policy
+# it asserts was removed from the plugin on 2026-07-12.  Skip at collection
+# time so it neither runs nor misleads; a standalone run prints the same.
+if __name__ != "__main__":
+    try:
+        import pytest as _pytest
+        _pytest.skip(
+            "retired DEP_BRANCH_KILL WP policy (removed 2026-07-12); "
+            "the live policy is covered by test_wp_synthetic_fault.py — "
+            "see VALIDATION.md",
+            allow_module_level=True)
+    except ImportError:
+        pass
 
 from champsim_tracer_validator.validator import _check_wrong_path_chains
 
@@ -199,8 +226,9 @@ def test_exact_match_clean():
 
 
 if __name__ == "__main__":
-    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    for fn in fns:
-        fn()
-        print(f"PASS {fn.__name__}")
-    print(f"OK ({len(fns)} tests)")
+    print("RETIRED: this suite asserts the DEP_BRANCH_KILL wrong-path policy "
+          "the plugin removed on 2026-07-12 (commit 914d452978).  The live "
+          "continue-to-budget policy is validated by "
+          "test_wp_synthetic_fault.py (full's features.wp_fault).  See "
+          "VALIDATION.md.  Not running the retired assertions.")
+    sys.exit(0)

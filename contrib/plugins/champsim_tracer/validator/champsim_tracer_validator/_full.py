@@ -35,6 +35,7 @@ import argparse
 import dataclasses
 import json
 import os
+import re
 import resource
 import subprocess
 import sys
@@ -633,11 +634,16 @@ def wait_for_quiet(max_wait_s: int = 3600, poll_s: int = 15) -> dict:
 # runner
 # ===========================================================================
 
-def _cleanup_qemu():
-    """Self-clean: reap any qemu a check leaked (a boot that neither
-    poweroff'd nor was torn down by the plugin exit).  Best-effort."""
+def _cleanup_qemu(work_root: Path):
+    """Self-clean: reap any qemu THIS check leaked (a boot that neither
+    poweroff'd nor was torn down by the plugin exit).  Scoped to processes
+    whose command line references the check's own work root — a leaked boot
+    always carries its outfile/initrd under there.  An unscoped
+    'build/qemu-system-' sweep would also SIGKILL unrelated system-mode
+    runs belonging to other sessions on a shared host.  Best-effort."""
     subprocess.run(["pkill", "-9", "-f",
-                    "build/qemu-system-"], capture_output=True)
+                    "build/qemu-system-.*" + re.escape(str(work_root))],
+                   capture_output=True)
 
 
 def run_full(args) -> int:
@@ -707,7 +713,7 @@ def run_full(args) -> int:
             out = Outcome("fail", f"exception: {e}\n"
                           + "".join(traceback.format_exc()))
         finally:
-            _cleanup_qemu()
+            _cleanup_qemu(ctx.work_root)
         dur = round(time.time() - t0, 1)
         counts[out.status] = counts.get(out.status, 0) + 1
         rec = {"id": c.id, "tier": c.tier, "status": out.status,

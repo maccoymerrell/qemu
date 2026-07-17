@@ -347,6 +347,10 @@ def _parse_args() -> argparse.Namespace:
     # full — the ONE unified entrypoint (tiers + coverage map + one code).
     FULL.add_parser(sub)
 
+    # mutation — adversarial strictness proof (see _mutation.py).
+    from . import _mutation as MUT
+    MUT.add_parser(sub)
+
     return p.parse_args()
 
 
@@ -1102,6 +1106,9 @@ def main() -> int:
         return cmd_churn_test(args)
     if args.cmd == "full":
         return FULL.cmd_full(args)
+    if args.cmd == "mutation":
+        from . import _mutation as MUT
+        return MUT.cmd_mutation(args)
     return 2
 
 

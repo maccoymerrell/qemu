@@ -129,6 +129,7 @@ FEATURES: dict[str, str] = {
     "behavior:tb_flush_reclaim": "template reclamation across a mid-trace tb_flush",
     "behavior:addr_is_data":     "aarch64 tagged-pointer data-is-address heuristic",
     "behavior:wire_determinism": "byte-for-byte reproducible wire (golden net)",
+    "behavior:mutation_strictness": "oracle catches deliberate trace corruption (mutation matrix)",
 }
 
 
@@ -574,6 +575,35 @@ def _chk_wp_fault(ctx: Ctx) -> Outcome:
                    f"rc={p.returncode}\n{tail}")
 
 
+def _chk_mutation(ctx: Ctx) -> Outcome:
+    """Adversarial strictness proof: build a known-good substrate, then
+    damage it one well-defined way at a time and assert a specific gating
+    check catches each corruption.  Any applied mutation that slips
+    through is a HOLE and fails the gate.  This is the suite's proof that
+    it actually rejects wrong traces, not just accepts right ones."""
+    from . import _mutation as MUT
+    d = ctx.dir("feat_mutation")
+    try:
+        res = MUT.run_mutations(ctx.build_dir, d, seed=ctx.seed)
+    except Exception as e:                                   # noqa: BLE001
+        return Outcome("fail", f"mutation harness raised: {e}")
+    subs = [{"name": r["name"],
+             "ok": r["status"] != "HOLE",
+             "detail": f"{r['status']}: "
+                       f"{','.join(r['caught_by']) or r['detail'][:60]}"}
+            for r in res["results"]]
+    if not res["baseline_clean"]:
+        return Outcome("fail",
+                       f"substrate did not validate clean "
+                       f"(baseline errors {res['baseline_errors']})", subs)
+    if res["holes"]:
+        return Outcome("fail",
+                       f"HOLES (uncaught corruptions): {res['holes']}", subs)
+    return Outcome("pass",
+                   f"{res['caught']}/{res['applied']} mutations caught, "
+                   f"0 holes; skipped={res['skipped']}", subs)
+
+
 def _chk_options_smoke(ctx: Ctx) -> Outcome:
     """Direct qemu-user drive of the long-tail options (histogram,
     wp_memdata, wp_regdata, program/comment) that no other check sets;
@@ -752,6 +782,9 @@ def build_checks() -> list:
                    "long-tail options (histogram/wp_memdata/wp_regdata/...)",
                    ["opt:histogram", "opt:wp_memdata", "opt:wp_regdata",
                     "opt:program_comment"], _chk_options_smoke))
+    C.append(Check("features.mutation_strictness", "features",
+                   "adversarial mutation matrix: oracle catches corruption",
+                   ["behavior:mutation_strictness"], _chk_mutation))
     return C
 
 

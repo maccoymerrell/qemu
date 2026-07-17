@@ -219,14 +219,19 @@ syscall itself).  Under ``qemu-system-<isa>`` the tracer targets one
 chosen process inside a full guest OS, and the kernel becomes part
 of the picture:
 
-* **The window is guest-driven and process-pinned.**  The workload
-  executes a magic marker instruction sequence at its entry; the
-  plugin opens the trace window there and pins it to the executing
-  address space.  Other processes never enter the trace, and the
-  window budget counts the pinned process's *user-space*
-  instructions — so a system-mode window covers the same workload
-  instructions a user-mode run would, with the kernel's
-  contribution added rather than substituted.
+* **The window is guest-driven and marker-scoped.**  A process runs a
+  magic marker instruction sequence at its entry; the plugin opens the
+  trace window there and admits that process's address space to an
+  owned-ASID set.  Under the default ``policy=latch`` every process
+  that runs the START marker joins the set and is traced concurrently
+  until its own END marker; ``policy=trace-all`` instead widens the
+  first START to capture every context.  Each captured entry carries a
+  ``(thread_id, asid)`` context — rebased by ``BODY_TAG_ASID_SWITCH``
+  records — so a consumer can separate interleaved processes in the one
+  body stream.  The window budget counts the *user-space* instructions
+  of the marker process that pins the clock, so a system-mode window
+  covers the same workload instructions a user-mode run would, with the
+  kernel's contribution added rather than substituted.
 * **Synchronous kernel code is first-class.**  The syscalls the
   workload makes and the fault handlers it triggers (page faults,
   TLB refills) are traced as ordinary basic blocks.  Kernel-context
@@ -287,13 +292,18 @@ wrong-path stream lets you study cache pollution from speculation:
 what cache lines a mispredicting machine would have brought in and
 later evicted.
 
-**Branch prediction.**  Every branch instruction in the trace has
-both a ``branch_type`` (direct / indirect / return / cond /
-syscall) and the actual outcome (which template the next body
-entry references).  The wrong-path chain models which alternate
+**Branch prediction.**  Every branch instruction in the trace carries
+a ``branch_type`` (direct / indirect jump, direct / indirect call,
+return, conditional, syscall) and, on every branch-terminated block —
+correct path and each wrong-path chain block — two always-present
+singletons that give its dynamic outcome directly:
+``CST_FID_BRANCH_TAKEN`` (taken vs fell through) and
+``CST_FID_BRANCH_TARGET`` (the landing PC as a signed offset from the
+branch), so a consumer recovers direction and target without decoding
+ahead to the successor.  The wrong-path chain models which alternate
 path a misprediction would have entered, bounded by ``wpdepth``
-instructions.  Useful for predictor accuracy, branch-history
-length studies, and BTB capacity work.
+instructions.  Useful for predictor accuracy, branch-history length
+studies, and BTB capacity work.
 
 **Prefetcher evaluation.**  Software prefetch hints
 (``GEN_OP_PREFETCH``) are surfaced as synthetic loads carrying
@@ -322,10 +332,11 @@ What the trace is *not* designed for
 A few categories the trace deliberately does not cover — see
 :doc:`limitations` for the full list:
 
-* **Whole-system behavior.**  A system-mode trace is pinned to one
-  process: it captures that process plus the kernel code it
-  synchronously invokes, not other processes, not asynchronous
-  interrupt handling, and not the OS at large.  In a user-mode
+* **Whole-system behavior.**  A system-mode trace is marker-scoped:
+  it captures the marker-owned process (or, under ``policy=trace-all``,
+  every context) plus the kernel code they synchronously invoke, not
+  processes that never run a marker, not asynchronous interrupt
+  handling, and not the OS at large.  In a user-mode
   trace, kernel execution is invisible entirely — system-call
   boundaries appear as ``GEN_OP_SYSCALL`` instructions and nothing
   more.

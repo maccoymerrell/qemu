@@ -8,26 +8,33 @@ usually a sign you want a different tool, or a documented workaround.
 Out-of-scope categories
 -----------------------
 
-**Whole-system tracing.**  System-mode tracing is process-pinned: a
-guest-issued marker opens the window and pins it to one address
-space, and the trace covers that process plus the kernel code it
-synchronously invokes (see the *System-mode tracing* section of
+**Whole-system tracing.**  System-mode tracing is marker-scoped, not
+whole-machine.  Each captured process carries a ``(thread_id, asid)``
+context; under the default ``policy=latch`` every process that runs
+the START marker joins an owned address-space set and is traced —
+along with the kernel code it synchronously invokes — until its END
+marker, while ``policy=trace-all`` widens the first START to capture
+all contexts (see the *System-mode tracing* section of
 :doc:`architecture`).  What it deliberately does not cover:
 asynchronous-interrupt handling (excluded by design — OS noise
-uncorrelated with the workload), other processes, and the
-pre-paging boot path (wrong-path speculation requires the guest MMU
-to bound fetches).  Tracing "everything the machine does" is not a
-supported shape.  In user mode, kernel execution is invisible
-entirely — system-call boundaries appear as ``GEN_OP_SYSCALL``
-instructions and the trace resumes at the syscall's return.
+uncorrelated with the workload), processes that never run a marker,
+and the pre-paging boot path (wrong-path speculation requires the
+guest MMU to bound fetches).  Tracing "everything the machine does"
+from power-on is not a supported shape.  In user mode, kernel
+execution is invisible entirely — system-call boundaries appear as
+``GEN_OP_SYSCALL`` instructions and the trace resumes at the
+syscall's return.
 
-**Wrong-path simulation requires an x86 host.**  The spec-mode
-slow-path routing flag (``CF_FORCE_SLOW``) is implemented in the
-i386 TCG backend only, which serves x86 and x86-64 *hosts* (guest
-ISA coverage is unaffected).  On another host architecture,
-wrong-path stores would reach real guest memory, so wrong-path
-simulation is unsafe to enable there; see the porting note in
-:doc:`qemu_modifications`.
+**Wrong-path simulation on non-x86 hosts is system-mode only.**
+Speculative stores are held off real guest memory by two mechanisms:
+on x86 / x86-64 hosts the i386 backend's ``CF_FORCE_SLOW`` inline
+bypass contains them in any mode, and on every other host backend the
+portable ``TLB_FORCE_SLOW`` path contains them in system mode.  The
+one unsupported configuration is user-mode wrong-path tracing on a
+non-x86 host, where no softmmu TLB exists to carry the flag; there the
+plugin detects the gap at its first speculative excursion and refuses
+— it aborts rather than ever writing real guest memory.  See the
+containment discussion in :doc:`qemu_modifications`.
 
 **Cycle-accurate timing.**  The trace is a *functional* record of
 the architectural correct path plus its speculative shadow.  It
@@ -216,6 +223,23 @@ runs without an explicit ``stop=`` set the header field to zero.
 Consumers that need a length-of-trace number must count body
 entries; the trailer's ``num_entries`` field is authoritative for
 that.
+
+**Physical-page and disk-I/O records are system-mode only.**
+``physaddr=1`` adds each memop's physical-page base
+(``CST_FID_LOAD_PPAGE`` / ``STORE_PPAGE``, rebuilt as
+``ppage | (vaddr & 0xFFF)``), and ``devio=1`` — on by default —
+brackets disk requests with ``DEVIO_START`` / ``DEVIO_STOP`` records.
+Both depend on the guest MMU and the block backend, so both are inert
+in user mode: a user-mode trace carries neither and is byte-identical
+regardless of the options.
+
+**A marker window held open by a dead process closes only at the
+icount budget.**  Under ``policy=latch`` a process that exits without
+running its END marker leaves its window open until the segment's
+icount budget elapses.  ``latch_timeout=<ms>`` is the opt-in backstop
+— it closes a window idle for longer than the given wall-clock
+interval — but it is off by default because idleness alone cannot
+distinguish a dead process from a merely long-blocked live one.
 
 Reproducibility caveats
 -----------------------

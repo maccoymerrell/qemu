@@ -14,8 +14,9 @@ every static basic block the program executed (the *templates*
 section), and a per-invocation stream of dynamic events keyed back
 into that dictionary (the *body*).  Per-invocation events include
 every load/store virtual address, optional load/store values,
-optional post-execution destination-register snapshots, and the
-bounded speculative chain attached at each branch.  See
+optional post-execution destination-register snapshots, each
+branch's taken/target outcome, and the bounded speculative chain
+attached at each branch.  See
 :doc:`concepts` for the qualitative picture and :doc:`format` for
 the byte-level wire format.
 
@@ -41,10 +42,12 @@ the byte-level wire format.
 The tracer contains no timing information — it captures *what*
 executed (*commit-order*), not when the hardware would issue it
 (*timing*).  User-mode traces stop at the system-call boundary;
-system-mode traces additionally carry the pinned process's
-synchronous kernel excursions (syscalls and fault handlers), tagged
-so consumers can model or filter them.  See :doc:`limitations` for
-the full list of out-of-scope categories.
+system-mode traces additionally carry the marker-owned processes'
+synchronous kernel excursions (syscalls and fault handlers) under a
+per-entry ``(thread, asid)`` context, tagged so consumers can model
+or filter them, and optionally block-device I/O records and
+per-access physical-page addresses.  See :doc:`limitations` for the
+full list of out-of-scope categories.
 
 Supported guest ISAs: x86_64, aarch64, riscv64, mipsel.  Per-ISA
 extension coverage is summarized in :doc:`reference`.
@@ -59,11 +62,12 @@ a SimPoint sweep into one weighted whole-program view.
 
 A Python harness, :doc:`validator`, generates self-checking
 workloads, runs them through the plugin, and validates the resulting
-trace against ~25 named correctness checks (encoding-map
+trace against roughly forty named correctness checks (encoding-map
 completeness, IFRAME / REGFILE / sync-hint / WP-event consistency,
-metaflags / regdata semantic reconstruction, multi-thread and
-multi-segment isolation, …).  It is the primary regression suite for
-tracer changes.
+metaflags / regdata semantic reconstruction, branch-direction and
+call/return taxonomy, system-mode privilege and fault-excursion
+invariants, multi-thread and multi-segment isolation, …).  It is the
+primary regression suite for tracer changes.
 
 If you use the tracer in published research, please cite the QEMU project
 as well as the tracer itself (an upcoming publication).

@@ -42,7 +42,7 @@ title.
 Metrics
 -------
 
-Metrics fall into four families by what they draw and what trace data they
+Metrics fall into five families by what they draw and what trace data they
 read.
 
 Time-series breakdowns (stacked area)
@@ -143,6 +143,73 @@ Long sparse tails on the ``bb_length`` and ``reuse_distance`` histograms
 fold into a ``>N`` overflow bin once they fall below ``--hist-tail-pct`` of
 the total, keeping the x-axis readable.
 
+Execution context and system-mode metrics
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+These metrics read the trace's execution-context records — privilege,
+fault nesting, threads, address spaces, disk I/O, and physical pages — so
+they are at their most informative on system-mode traces.  Each degrades
+to a well-defined chart on a trace without the relevant content (an
+all-user trace plots a 100 % user share; a single-ASID trace plots one
+band), and the feature-gated ones are dropped from the all-metrics pass
+when the trace lacks the capability entirely.
+
+``user_kernel``
+   User vs kernel instruction share per window, from the per-instruction
+   privilege flag.  Stacked.
+
+``fault_rate``
+   Synchronous-fault activity.  Dual pane: fault-excursion starts per
+   1 000 CP instructions on top; fault-nesting depth (mean across
+   handler-resident entries, plus the per-bin maximum) on the bottom.
+
+``thread_switch``
+   Thread switches and distinct active threads per window.
+
+``asid_timeline``
+   Instruction share per address space (ASID), stacked — the interleaving
+   of traced processes over the run.
+
+``devio_queue``
+   Disk-I/O request activity.  Dual pane: peak outstanding requests
+   (queue depth) on top; bytes issued per window, split read/write, on
+   the bottom.
+
+``devio_latency``
+   Histogram of each disk request's STOP−START distance in CP
+   instructions — the positional cost of a request, log-bucketed.
+
+``devio_lba``
+   A 2D grid of distinct disk blocks (rows, ascending LBA) against trace
+   position, colored read / write / read+write — the disk-access
+   locality picture.
+
+``wp_termination``
+   Why each wrong-path chain ended, stacked per window: ``completed``
+   (ran to the recorded end), ``fault stop``, ``translation stop``, and
+   ``no fetch`` (the excursion's first target was never realizable).
+
+``ws_divergence``
+   Distinct virtual pages vs distinct physical pages live within a
+   sliding ``--ws-window``.  A virtual count above the physical count
+   exposes aliasing; a physical count trailing virtual growth exposes
+   lazily-backed regions.
+
+``translation_churn``
+   Virtual→physical remaps (an already-translated page observed with a
+   different frame) and first translations, per 1 000 CP instructions.
+
+``pagemap``
+   A 2D page-occupancy canvas: virtual pages (rows, first-touch order)
+   against trace position, each cell colored by the ASID that touched
+   the page there, with cells outlined where the page's physical
+   backing changed since its previous observation.  This is the
+   address-space evolution picture — process interleave, working-set
+   phase changes, and physical remapping in one raster.  ``pagemap``
+   and ``devio_lba`` render through a dedicated grid emitter; they are
+   per-trace views and are skipped in aggregate mode, and ``--csv``
+   (which serialises chart series) does not apply to them.
+
 What each metric needs from the trace
 -------------------------------------
 
@@ -160,6 +227,16 @@ drive:
   correct-path-only trace the WP / pollution pane of ``branch_dir``,
   ``mem_pat``, ``branch_mpki``, ``btb_miss``, and ``cache_miss`` is simply
   empty; the correct-path pane is unaffected.
+* **Physical-page metrics need ``physaddr=1``.**  ``ws_divergence``,
+  ``translation_churn``, and ``pagemap`` read the per-memop physical-page
+  records, present only on system-mode traces captured with
+  ``physaddr=1``; without them these metrics are dropped from the
+  all-metrics pass.
+* **Disk-I/O metrics need DEVIO records.**  ``devio_queue``,
+  ``devio_latency``, and ``devio_lba`` consume the disk-I/O records a
+  system-mode trace carries when ``devio`` tracing is active; a trace
+  that never advertised them drops these metrics from the all-metrics
+  pass.  ``wp_termination`` follows the wrong-path rule above.
 
 The warmup marker
 -----------------

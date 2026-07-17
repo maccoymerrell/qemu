@@ -112,6 +112,34 @@ SVG_METRICS = [
     "gen_op", "gen_reg", "btb_miss", "wp_divergence", "cache_miss",
     "bb_length", "indirect_targets", "branch_entropy", "working_set",
     "dep_depth", "ilp", "reuse_distance",
+    # Context metrics that also render meaningfully on user-mode traces
+    # (single asid / no faults degrade to flat-but-valid charts).
+    "user_kernel", "fault_rate", "thread_switch", "asid_timeline",
+    "wp_termination",
+]
+
+# System-scoped metrics: they read physaddr / DEVIO / multi-context
+# content, so their SVG goldens render from the frozen system fixture
+# below (a user-mode validator trace has none of that content).
+SYS_METRICS = [
+    "devio_queue", "devio_latency", "devio_lba",
+    "ws_divergence", "translation_churn", "pagemap",
+]
+
+# Frozen system-mode fixture traces: renderer-golden inputs captured
+# OUTSIDE the validator.  A system boot is not byte-deterministic
+# across runs (boot timing moves the marker icount), so a single trace
+# is frozen once and SVG goldens only ever render that frozen file.
+# Fixtures live in FIXTURES_DIR permanently: `capture` clears
+# GOLDEN_TRACES but never this directory, and fails loudly when a
+# listed fixture is missing.  devio_sys_x86_64: qemu-system-x86_64 +
+# virtio-blk guest doing O_DIRECT disk I/O inside a marker window,
+# physaddr=1 wpdepth=64 regdata=1 memdata=1 (provenance:
+# cst_runs/vis44/devio_sys_x86_64/run_devio.sh).
+FIXTURES_DIR = GOLDEN_DIR / "fixtures"
+FIXTURES = [
+    {"name": "devio_sys_x86_64", "file": "devio_sys_x86_64.cst",
+     "metrics": SVG_METRICS + SYS_METRICS},
 ]
 
 VOLATILE_PREFIXES = ("COMMAND ", "DATETIME ", "; command=", "; datetime=")
@@ -216,7 +244,7 @@ def capture(build: Path, root: Path) -> int:
     if GOLDEN_TRACES.exists():
         shutil.rmtree(GOLDEN_TRACES)   # drop any stale frozen traces
     GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
-    manifest = {"cells": {}, "svg": {}, "excluded": {}}
+    manifest = {"cells": {}, "svg": {}, "svg_fixtures": {}, "excluded": {}}
     bad = 0
     # Determinism pre-check: trace each cell N_DET times to the SAME out-dir
     # (check uses the identical path) and only record a golden for cells
@@ -271,9 +299,28 @@ def capture(build: Path, root: Path) -> int:
                             svg_hash(build, frozen, m)
                     except subprocess.CalledProcessError:
                         print(f"  WARN svg {name}:{m} failed")
+    # Fixture SVG goldens: render each frozen system fixture (never
+    # re-traced, never cleared) with its metric set.  A missing fixture
+    # is a hard capture error -- silently skipping would drop the
+    # system-mode renderer coverage without anyone noticing.
+    for fx in FIXTURES:
+        cst = FIXTURES_DIR / fx["file"]
+        if not cst.exists():
+            print(f"  ERROR fixture {fx['name']}: {cst} missing "
+                  f"(install the frozen fixture trace first)")
+            bad += 1
+            continue
+        for m in fx["metrics"]:
+            try:
+                manifest["svg_fixtures"][f"{fx['name']}:{m}"] = \
+                    svg_hash(build, cst, m)
+            except subprocess.CalledProcessError:
+                print(f"  WARN fixture svg {fx['name']}:{m} failed")
+        print(f"  fixture {fx['name']}: {len(fx['metrics'])} svg goldens")
     MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True))
     print(f"\ncaptured {len(manifest['cells'])} cells, "
           f"{len(manifest['svg'])} svg goldens, "
+          f"{len(manifest['svg_fixtures'])} fixture svg goldens, "
           f"{len(manifest['excluded'])} excluded -> {MANIFEST}")
     return 1 if bad else 0
 
@@ -324,6 +371,19 @@ def check(build: Path, root: Path) -> int:
                          f"(re-run capture)"); continue
         if svg_hash(build, cst, metric) != want:
             fails.append(f"svg {key}: SVG mismatch (frozen trace {cst.name})")
+    # Fixture SVG goldens: same discipline against the permanent
+    # system-mode fixture traces.
+    fx_files = {fx["name"]: fx["file"] for fx in FIXTURES}
+    for key, want in manifest.get("svg_fixtures", {}).items():
+        name, metric = key.split(":")
+        fname = fx_files.get(name, f"{name}.cst")
+        cst = FIXTURES_DIR / fname
+        if not cst.exists():
+            fails.append(f"fixture svg {key}: frozen fixture missing "
+                         f"({cst})"); continue
+        if svg_hash(build, cst, metric) != want:
+            fails.append(f"fixture svg {key}: SVG mismatch "
+                         f"(fixture {fname})")
 
     if fails or validate_fails:
         print("\n=== GOLDEN NET FAILED ===")
@@ -333,7 +393,9 @@ def check(build: Path, root: Path) -> int:
             print(f"  VALID {f}")
         return 1
     print(f"\nGOLDEN NET GREEN: {len(manifest['cells'])} cells + "
-          f"{len(manifest.get('svg', {}))} svg goldens byte-identical; validator errors=0")
+          f"{len(manifest.get('svg', {}))} svg goldens + "
+          f"{len(manifest.get('svg_fixtures', {}))} fixture svg goldens "
+          f"byte-identical; validator errors=0")
     return 0
 
 

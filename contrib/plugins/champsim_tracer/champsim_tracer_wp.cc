@@ -96,7 +96,6 @@ struct WpAccum {
         e.n_insns_executed = (uint32_t)bb_pcs.size();
         e.fault = fault;
         e.translation_unavailable = false;
-        e.dep_branch_kill = false;   /* retired: poison/dep-branch-kill removed */
         e.fault_insn_index = fault_insn_index;
         e.tmpl = bb_tmpl;
         if (g_features.reg_data) {

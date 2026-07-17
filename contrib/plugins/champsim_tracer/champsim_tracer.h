@@ -979,14 +979,6 @@ struct WPBBEntry {
     bool fault;
     bool translation_unavailable;
     /*
-     * The excursion died AT this BB: its terminating branch reads a
-     * register carrying the (never-materialized) result of a faulted
-     * wrong-path instruction, so the branch outcome is unresolvable
-     * and fetch past it is unknowable.  Emitted as
-     * CST_WP_EVENT_DEP_BRANCH_KILL; always the chain's last entry.
-     */
-    bool dep_branch_kill = false;
-    /*
      * Index within THIS BB of the insn that raised the synchronous
      * exception when `fault`; undefined otherwise.  Consumers flag
      * that uop non-completing so its dependent slice is squashed.

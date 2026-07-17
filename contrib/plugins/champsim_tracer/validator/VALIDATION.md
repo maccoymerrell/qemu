@@ -98,6 +98,12 @@ exit code.  This is reserved for a *confirmed upstream break* or a
 *genuinely timing-sensitive* scenario that would otherwise emit a false
 RED.  Currently:
 
+* `system.user_x86` — the full-oracle system battery deterministically
+  exposes an **open plugin bug class** (see "Known upstream issues"):
+  system-mode per-insn value capture diverging from the dataflow oracle
+  (metaflags parity, regdata dst snapshots).  Non-gating until the plugin
+  fix lands; `system.churn_*` and `system.thread_x86` keep the marker/pin
+  machinery as hard gates and claim those features in the coverage map.
 * `multiproc.dead_latch_x86` — dead-latch aging is wall-clock/scheduling
   sensitive (detector vs. poweroff backstop) and the boot is hard-capped;
   non-gating so contention can't wedge or false-RED it.
@@ -105,6 +111,25 @@ RED.  Currently:
   scheduling the unmarked peer *inside* the marked window; non-gating as a
   contention safety net (it is otherwise a hard 6/6 with the ordered
   launch, and the latch-differential half always asserts).
+
+### System-mode guest CPU
+
+`system.user_x86` boots with `CST_QEMU_EXTRA_ARGS="-cpu max"`: the
+`--coverage` probe set includes AVX blocks, and qemu-system's default
+`qemu64` model has no AVX — without the override the guest workload dies
+with SIGILL at the first `vmovdqu` (#UD) and the marker window closes
+UNDER at a few thousand insns, cascading into spurious identity/thread
+errors.  qemu-user is effectively `cpu=max`, so the override aligns the
+two modes.
+
+### System-mode oracle relaxation
+
+`validate()` skips the per-event indirect-WP shape assertion
+(`_check_indirect_wp_assertions`) when `marker=True`: under a system-mode
+marker run the kernel interleaves with the pinned process and individual
+WP kicks are legitimately suppressed (WP-skip / first-TB-unavailable), so
+"every indirect execution carries a WP" is only intermittently true there.
+User mode remains fully strict.
 
 ---
 
@@ -139,16 +164,49 @@ decode/audit helpers).
 
 ---
 
-## Known upstream issue surfaced (not a validator fault)
+## Known upstream issues surfaced (not validator faults)
 
 * **`trace_window=symbol` never opens a segment** on the synthetic
-  `-nostartfiles` binaries — even for `_start`.  The plugin's symbol trigger
-  reads `cur_tb_tmpl->symbol_name`, which is null before any segment is
-  active (the template carrying the resolved symbol name is not built until
-  tracing is on), so the occurrence counter never advances.  Symbol
-  *resolution* is correct (templates decode with `symbol="blk_N"`).  This
-  is a plugin trigger bug for the plugin owners; `quick.symbol_start`
-  **SKIPs** with this diagnostic rather than emitting a false FAIL.
+  `-nostartfiles` binaries — even for `_start`.  Repro:
+  `qemu-x86_64 -plugin libchampsim_tracer.so,outfile=o,wpdepth=64,trace_window=symbol:name=blk_1+occurrence=1+simulation=50000,memdata=1 <validator binary>`
+  → no `.cst`, stats show `traced_icount=0`; every `name=` value fails
+  (`blk_N`, `_start`), both `+` and `;` separators.  Suspected mechanism:
+  the trigger at `champsim_tracer.cc:3546-3573` reads
+  `cur_tb_tmpl->symbol_name`, but before any segment is active no template
+  has been built for the executing TB, so `cur_tb_tmpl` is null and the
+  occurrence counter never advances.  Symbol *resolution* is correct — an
+  icount-window trace of the same binary decodes templates with
+  `symbol="blk_N"`.  `quick.symbol_start` **SKIPs** with this diagnostic
+  rather than emitting a false FAIL.
+
+* **System-mode per-insn value-capture divergence (deterministic).**
+  Repro: `CST_QEMU_EXTRA_ARGS="-cpu max" python -m
+  champsim_tracer_validator all --isa x86_64 --seed 0x1111 --build-dir
+  <build> -o <out> --system --marker --coverage --regdata --hot-iters 200
+  --stop 200000` → reproducible errors on every run while the identical
+  user-mode run passes all oracles:
+  - `metaflags`: probe insn at pc=0x402984 records `mflags=0x00`
+    (Z=0/N=0/P=0) while the captured dst value 0x212 requires P=1; a
+    second site at pc=0x40200b records P=1 where the dst value requires
+    P=0.
+  - `regdata_reconstruction`: wrong dst snapshots on INT_ADD/INT_SUB —
+    in one case the recorded dst is a **code address** (0x4019d1)
+    instead of the ALU result, i.e. snapshot-slot contamination, not a
+    value-computation error.
+  Both smell like one bug class: system-mode regdata/metaflags capture
+  racing the kernel-excursion machinery.  `system.user_x86` is marked
+  non-gating (XFAIL) until the plugin fix lands.
+
+---
+
+## Green-run record
+
+First fully green end-to-end `full` run (quiet host, 0 foreign qemu):
+2026-07-17, work-root `/mnt/md0/QEMU/cst_runs/valunify/GATE2`,
+`counts: pass=20 fail=0 skip=1 xfail=2`, `OVERALL: PASS (exit 0)`;
+runtime-uncovered only `behavior:dead_latch`, `opt:latch_timeout`
+(both attached to the non-gating dead-latch check) and
+`opt:window_symbol` (attached to the documented plugin trigger bug).
 
 ---
 

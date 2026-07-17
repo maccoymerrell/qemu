@@ -254,6 +254,15 @@ public:
         uint64_t store_count(uint32_t insn) const;
         uint64_t load_addr(uint32_t insn, uint32_t slot) const;
         uint64_t store_addr(uint32_t insn, uint32_t slot) const;
+        /* Physical PAGE base of the memop (CST_FLAG_PHYSADDR traces).
+         * Reads the running cell exactly like load_addr: 0 means no
+         * translation has been observed for this (insn, slot) cell yet
+         * (and always 0 on a non-physaddr trace, whose ppage FIDs never
+         * resolve).  A memop whose own execution had no observable
+         * translation reads the last real translation, per the delta
+         * stream's designed omission. */
+        uint64_t load_ppage(uint32_t insn, uint32_t slot) const;
+        uint64_t store_ppage(uint32_t insn, uint32_t slot) const;
         Wide     load_data(uint32_t insn, uint32_t slot) const;
         Wide     store_data(uint32_t insn, uint32_t slot) const;
         Wide     dst_reg(uint32_t insn, uint32_t op) const;
@@ -273,6 +282,32 @@ public:
         const ResolvedIds     *ids_      = nullptr;
     };
     using BBCallback = std::function<void(const BB &)>;
+
+    /* Per-entry wrong-path chain event summary (Step 6.9), surfaced by
+     * walk_bb() when a callback is registered — the batch walk()
+     * surfaces the same information on the WPEntry records themselves.
+     * Fired once per CP entry (after its chain), only on CST_FLAG_WP
+     * traces.  Registering the callback changes no byte consumption:
+     * the events section is parsed instead of parse-skipped, and under
+     * WpDecode::Skip only the chain-length prefix of the (already
+     * skipped) chain section is additionally read. */
+    struct WpEventsSummary {
+        uint32_t seq_num       = 0;   /* owning CP entry's seq        */
+        uint32_t chain_len     = 0;   /* WP BBs in the chain          */
+        uint32_t fault_count   = 0;   /* per-block FAULT events       */
+        uint32_t unavail_count = 0;   /* per-block TRANSLATION events */
+        /* Chain-level: the excursion's FIRST target was never
+         * realized (fetch/translation failed before any block). */
+        bool     chain_unavailable = false;
+        /* Event on the final chain block — the terminating condition
+         * when the chain stopped short of the budget. */
+        bool     last_fault    = false;
+        bool     last_unavail  = false;
+    };
+    using WpEventsCallback = std::function<void(const WpEventsSummary &)>;
+    void set_wp_events_callback(WpEventsCallback cb) {
+        wp_events_cb_ = std::move(cb);
+    }
 
     void walk_bb(bool cp_fields, WpDecode wp,
                  const BBCallback &cb,
@@ -311,10 +346,10 @@ private:
                                const Template *tmpl,
                                FieldStateTable *state,
                                const FieldStateTable *base_state);
-    void stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
-                            FieldStateTable &cp_state, WpDecode wp,
-                            uint32_t seq, uint32_t thread, uint32_t asid,
-                            const BBCallback &cb);
+    uint64_t stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
+                                FieldStateTable &cp_state, WpDecode wp,
+                                uint32_t seq, uint32_t thread, uint32_t asid,
+                                const BBCallback &cb);
     void handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
                          const BBCallback &cb);
     void skip_iframe_bb();
@@ -380,6 +415,9 @@ private:
     AttributionLint lint_;
     /* Optional positional sink for disk-I/O records (set_devio_callback). */
     DevioCallback devio_cb_;
+    /* Optional per-entry WP-events summary sink (set_wp_events_callback);
+     * walk_bb only. */
+    WpEventsCallback wp_events_cb_;
     /* request_id -> (thread_id, asid) captured from an EXACT DEVIO_START,
      * so its paired DEVIO_STOP can be surfaced with the same owner. */
     std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> devio_owner_;

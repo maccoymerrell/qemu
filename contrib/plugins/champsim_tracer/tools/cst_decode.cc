@@ -1330,6 +1330,22 @@ uint64_t BodyWalker::BB::store_addr(uint32_t insn, uint32_t slot) const
     return lookup_cell(blk_, state_gen_, base_blk_, base_gen_,
                        *slot_lut_, insn, ids_->fid_store_addr[slot]).low64();
 }
+/* Physical PAGE base of the memop (CST_FLAG_PHYSADDR).  Same cell
+ * hierarchy as load_addr; 0 = no translation observed yet for this
+ * (insn, slot) cell, and unconditionally 0 on a non-physaddr trace
+ * (the ppage FIDs resolve to 0, which the slot LUT never maps). */
+uint64_t BodyWalker::BB::load_ppage(uint32_t insn, uint32_t slot) const
+{
+    if (!blk_ || slot >= FID_SLOT_COUNT) return 0;
+    return lookup_cell(blk_, state_gen_, base_blk_, base_gen_,
+                       *slot_lut_, insn, ids_->fid_load_ppage[slot]).low64();
+}
+uint64_t BodyWalker::BB::store_ppage(uint32_t insn, uint32_t slot) const
+{
+    if (!blk_ || slot >= FID_SLOT_COUNT) return 0;
+    return lookup_cell(blk_, state_gen_, base_blk_, base_gen_,
+                       *slot_lut_, insn, ids_->fid_store_ppage[slot]).low64();
+}
 Wide BodyWalker::BB::load_data(uint32_t insn, uint32_t slot) const
 {
     if (!blk_ || slot >= FID_SLOT_COUNT) return Wide{};
@@ -1412,10 +1428,10 @@ void BodyWalker::consume_field_section(Reader &outer, uint32_t template_id,
                         /*lint=*/nullptr, /*lint_row=*/nullptr);
 }
 
-void BodyWalker::stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
-                                    FieldStateTable &cp_state, WpDecode wp,
-                                    uint32_t seq, uint32_t thread,
-                                    uint32_t asid, const BBCallback &cb)
+uint64_t BodyWalker::stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
+                                        FieldStateTable &cp_state, WpDecode wp,
+                                        uint32_t seq, uint32_t thread,
+                                        uint32_t asid, const BBCallback &cb)
 {
     const bool fields = (wp == WpDecode::Fields);
     uint64_t num_wp = wpb.uleb();
@@ -1459,6 +1475,7 @@ void BodyWalker::stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
         }
         cb(bb);
     }
+    return num_wp;
 }
 
 void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
@@ -1516,16 +1533,68 @@ void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
      * CST_FLAG_WP.  sub() consumes each section regardless of whether
      * we walk it, so Skip / event parse-skip are one line each. */
     if (flags_ & header_.ids.flag_wp) {
+        uint64_t chain_len = 0;
         { SectionScope s(body_); Reader &wpb = s;
           if (wp != WpDecode::Skip) {
               FieldStateTable &wp_state =
                   ws.state_at(ws.wp_states, ws.current_asid,
                               ws.current_thread);
-              stream_wp_chain_bb(wpb, wp_state, cp_state, wp, seq,
-                                 ws.current_thread, ws.current_asid, cb);
+              chain_len = stream_wp_chain_bb(wpb, wp_state, cp_state, wp,
+                                             seq, ws.current_thread,
+                                             ws.current_asid, cb);
+          } else if (wp_events_cb_) {
+              /* Chain walking skipped, but the events summary needs the
+               * chain length to resolve past-chain (chain-level) event
+               * indices; read only the length prefix — SectionScope
+               * skips the rest either way. */
+              chain_len = wpb.uleb();
           }
         }
-        { SectionScope s(body_); (void)s; }   /* WP events: parse-skipped */
+        { SectionScope s(body_);
+          if (wp_events_cb_) {
+              /* Parse the events section (identical byte consumption to
+               * the skip; see decode_wp_events for the batch-path twin)
+               * and fire the per-entry summary. */
+              Reader &evb = s;
+              const ResolvedIds &ids = header_.ids;
+              WpEventsSummary sum;
+              sum.seq_num   = seq;
+              sum.chain_len = (uint32_t)chain_len;
+              uint64_t num_events = evb.uleb();
+              int64_t prev_idx = -1;
+              for (uint64_t k = 0; k < num_events; k++) {
+                  uint64_t gap = evb.uleb();
+                  int64_t idx = prev_idx + 1 + (int64_t)gap;
+                  uint8_t evf = evb.u8();
+                  bool is_fault = (evf & ids.wp_event_fault) != 0;
+                  bool is_unavail =
+                      (evf & ids.wp_event_translation_unavail) != 0;
+                  if (idx < 0 || (uint64_t)idx >= chain_len) {
+                      /* Chain-level event (§4.4): the unrealized first
+                       * target.  FAULT payload consumed for wire
+                       * consistency. */
+                      if (is_unavail) sum.chain_unavailable = true;
+                      if (is_fault)   (void)evb.uleb();
+                  } else {
+                      if (is_fault) {
+                          sum.fault_count++;
+                          (void)evb.uleb();     /* fault insn index */
+                          if ((uint64_t)idx + 1 == chain_len) {
+                              sum.last_fault = true;
+                          }
+                      }
+                      if (is_unavail) {
+                          sum.unavail_count++;
+                          if ((uint64_t)idx + 1 == chain_len) {
+                              sum.last_unavail = true;
+                          }
+                      }
+                  }
+                  prev_idx = idx;
+              }
+              wp_events_cb_(sum);
+          }
+        }
     }
 }
 

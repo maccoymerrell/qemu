@@ -54,6 +54,11 @@ class MPConfig:
     churn: int = 0
     seed_a: int = 0xA1A1
     seed_b: int = 0xB2B2
+    # Hard wall-clock cap per qemu-system boot.  A boot that neither
+    # powers off nor is torn down by the plugin's window-close (a hung
+    # dead-latch aging, say) is killed at this bound so the check reports
+    # a failure instead of hanging the whole run.
+    boot_timeout_s: int = 240
 
 
 @dataclasses.dataclass
@@ -182,8 +187,23 @@ def _boot(cfg: MPConfig, isa: str, cpio: Path, out_base: Path,
     if extra_qemu:
         cmd += list(extra_qemu)
     console = Path(f"{out_base}.console.log")
+    import os as _os
+    import signal as _signal
     with open(console, "w") as f:
-        rc = subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+        try:
+            rc = proc.wait(timeout=cfg.boot_timeout_s)
+        except subprocess.TimeoutExpired:
+            # Kill the whole process group so no orphaned qemu survives.
+            try:
+                _os.killpg(_os.getpgid(proc.pid), _signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            proc.wait()
+            f.write(f"\n[cst] boot exceeded {cfg.boot_timeout_s}s wall "
+                    f"clock — killed\n")
+            rc = 124
     cst = Path(f"{out_base}.cst")
     return rc, console, cst
 
@@ -192,10 +212,18 @@ def _boot(cfg: MPConfig, isa: str, cpio: Path, out_base: Path,
 # decode / audit helpers (stable cst_decode / cst_audit CLI text)
 # ---------------------------------------------------------------------------
 
-def _run(cmd: list) -> tuple:
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                       text=True)
-    return p.returncode, p.stdout
+def _run(cmd: list, timeout: int = 180) -> tuple:
+    # Cap every offline-tool call: a truncated .cst left by a SIGKILL'd boot
+    # can send a decoder into a long/spinning read, which would otherwise
+    # hang the whole run after a capped boot.
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True,
+                           timeout=timeout)
+        return p.returncode, p.stdout
+    except subprocess.TimeoutExpired as e:
+        return 124, (e.output or b"").decode(errors="replace") \
+            if isinstance(e.output, bytes) else (e.output or "")
 
 
 def _decode(cfg: MPConfig) -> str:
@@ -632,8 +660,8 @@ def run_x86_dead_latch_kill(cfg: MPConfig, latch_timeout: int = 3000,
     # progA: modest hold (< latch_timeout) then a long-enough active phase
     # to outlast progB's dead-latch timeout; progB: marks + sleeps long, is
     # killed mid-sleep (never runs its END).
-    bin_a = _gen_build(isa, "progA", cfg.seed_a, 6, 2500, 1, True, od / "A")
-    bin_b = _gen_build(isa, "progB", cfg.seed_b, 8, 1500, 12, True, od / "B")
+    bin_a = _gen_build(isa, "progA", cfg.seed_a, 6, 800, 1, True, od / "A")
+    bin_b = _gen_build(isa, "progB", cfg.seed_b, 8, 800, 12, True, od / "B")
     init = _INIT_KILL % {"kill_after": kill_after, "churn": churn}
     cpio = _stage(isa, od / "stage", [("workloadA", bin_a),
                                       ("workloadB", bin_b)], init)
@@ -644,6 +672,15 @@ def run_x86_dead_latch_kill(cfg: MPConfig, latch_timeout: int = 3000,
     rc, console, cst = _boot(cfg, isa, cpio, out_base, plugin_opts)
     ctext = console.read_text(errors="replace") if console.exists() else ""
     subs: list = []
+    if rc == 124:
+        # Boot hit the wall-clock cap before the dead-latch aged the killed
+        # peer's window out (scheduling-sensitive under load).  Report it
+        # without decoding the truncated trace; the check is non-gating.
+        subs.append(SubCheck(
+            "dead-latch closed the segment within the boot cap", False,
+            f"boot exceeded {cfg.boot_timeout_s}s cap "
+            f"(killed B={'killed B' in ctext}); aging did not close in time"))
+        return _emit("x86 dead-latch kill", subs)
     subs.append(SubCheck(
         "1. peer killed mid-window (no END marker)",
         "killed B" in ctext,

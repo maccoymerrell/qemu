@@ -56,6 +56,12 @@ usual culprits, in order:
    was set in this run.  Drop to ``iframe_rate=0`` once you've
    verified decoder reproducibility — IFRAMEs are pure validation
    redundancy.
+4. In a **system-mode** trace: a ``physical pages`` line appears when
+   ``physaddr=1`` adds a physical-page base to every memop, and
+   ``DEVIO START`` / ``DEVIO STOP`` records appear when the guest does
+   disk I/O (``devio`` is on by default).  Set ``physaddr=0`` /
+   ``devio=0`` if you don't need them; both are user-mode no-ops, so
+   they never inflate a user-mode trace.
 
 **``GEN_OP_UNKNOWN`` appears in the exit summary**
 
@@ -91,6 +97,17 @@ empty ``wp_entries`` list.  See ``resolve_wrong_target`` and
 ``wp_branch_pruned`` in ``champsim_tracer.cc`` for the resolution
 logic.  A high count on a ``wpprune=0`` run of ordinary code
 usually just reflects a call-heavy instruction mix.
+
+**``trace_window=marker: policy must be 'latch' or 'trace-all'``**
+
+The marker window's ``policy=`` key accepts only ``latch`` (the
+default — each process that runs the START marker is traced until its
+own END marker) and ``trace-all`` (the first START captures every
+context).  A marked process that exits *without* running its END
+marker leaves its window open until the segment's icount budget
+closes it; set ``latch_timeout=<ms>`` to instead close a window that
+has been idle — never scheduled — for that many wall-clock
+milliseconds.
 
 **``no valid simpoints in: <file>``**
 

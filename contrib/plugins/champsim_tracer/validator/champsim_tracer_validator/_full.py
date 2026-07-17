@@ -179,6 +179,14 @@ class Ctx:
 
 ISA_ALL = ("x86_64", "aarch64", "riscv64", "mipsel")
 
+# Canonical golden work-root.  The committed manifest (tests/golden/) is
+# captured against THIS exact path; the check must reuse it byte-for-byte
+# because its length shifts the guest stack base (see _chk_golden).  To
+# refresh the baseline after an intentional plugin/wire change:
+#   python tests/golden_net.py capture --build-dir <build> \
+#       --work-root /mnt/md0/QEMU/cst_runs/valunify/golden_wr
+GOLDEN_WORK_ROOT = Path("/mnt/md0/QEMU/cst_runs/valunify/golden_wr")
+
 
 # ---- legacy-command namespace factory -------------------------------------
 
@@ -342,7 +350,13 @@ def _chk_golden(ctx: Ctx) -> Outcome:
           / "tests" / "golden_net.py")
     if not gn.is_file():
         return Outcome("skip", f"golden_net.py not found: {gn}")
-    work = ctx.dir("quick_golden")
+    # golden determinism requires the EXACT work-root path used at capture:
+    # the path appears in the qemu argv, and its length shifts the guest
+    # stack base (hence REG_SP in the REGFILE record, hence the wire bytes).
+    # Use a FIXED canonical work-root, matched by GOLDEN_WORK_ROOT at
+    # capture time — NOT the per-check ctx dir, whose length varies.
+    work = GOLDEN_WORK_ROOT
+    work.mkdir(parents=True, exist_ok=True)
     cmd = [sys.executable, str(gn), "check",
            "--build-dir", str(ctx.build_dir), "--work-root", str(work)]
     try:

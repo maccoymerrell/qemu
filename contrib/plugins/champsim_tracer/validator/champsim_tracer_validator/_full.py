@@ -119,6 +119,7 @@ FEATURES: dict[str, str] = {
     "behavior:dep_refine":       "dependency-refiner behaviour-group coverage",
     "behavior:wrong_path_chains": "wrong-path excursion chain reconstruction",
     "behavior:wp_fault_to_budget": "WP execution-time fault continues to budget",
+    "behavior:wp_tlb_cold_capture": "WP fetch of a valid-PTE but TLB-cold code page captures real bytes (system mode)",
     "behavior:syscall_fault_nesting": "system-mode syscall/fault nesting discipline",
     "behavior:user_code_identity": "ASID-pin: user templates byte-match binary",
     "behavior:guest_thread_identity": "thread_id is guest thread, not vCPU",
@@ -575,6 +576,24 @@ def _chk_wp_fault(ctx: Ctx) -> Outcome:
                    f"rc={p.returncode}\n{tail}")
 
 
+def _chk_wp_tlb_cold(ctx: Ctx) -> Outcome:
+    t = (Path(__file__).resolve().parent / "tests"
+         / "test_wp_tlb_cold_capture.py")
+    if not t.is_file():
+        return Outcome("skip", f"test not found: {t}")
+    env = dict(os.environ, CST_BUILD_DIR=str(ctx.build_dir),
+               BUILD_DIR=str(ctx.build_dir))
+    p = subprocess.run([sys.executable, str(t)], text=True,
+                       capture_output=True, env=env)
+    tail = "\n".join((p.stdout or p.stderr).splitlines()[-8:])
+    # The test self-skips (exit 0 + "SKIP ...") when system-mode fixtures are
+    # absent; surface that as a skip, not a pass.
+    if p.returncode == 0 and tail.startswith("SKIP"):
+        return Outcome("skip", tail)
+    return Outcome("pass" if p.returncode == 0 else "fail",
+                   f"rc={p.returncode}\n{tail}")
+
+
 def _chk_mutation(ctx: Ctx) -> Outcome:
     """Adversarial strictness proof: build a known-good substrate, then
     damage it one well-defined way at a time and assert a specific gating
@@ -772,6 +791,10 @@ def build_checks() -> list:
     C.append(Check("features.wp_fault", "features",
                    "WP execution-time fault continues to budget",
                    ["behavior:wp_fault_to_budget"], _chk_wp_fault))
+    C.append(Check("features.wp_tlb_cold", "features",
+                   "WP fetch of a valid-PTE but TLB-cold page captures real "
+                   "bytes; a no-PTE target terminates (system mode)",
+                   ["behavior:wp_tlb_cold_capture"], _chk_wp_tlb_cold))
     C.append(Check("features.options_smoke", "features",
                    "long-tail options (histogram/wp_memdata/wp_regdata/...)",
                    ["opt:histogram", "opt:wp_memdata", "opt:wp_regdata",

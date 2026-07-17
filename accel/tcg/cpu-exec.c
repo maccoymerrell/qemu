@@ -789,6 +789,44 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
                                     cpu_mmu_index(cpu, true),
                                     true, &host, 0);
     if (pflags & TLB_INVALID_MASK) {
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+        /*
+         * Wrong-path fetch-gate reject classifier (CST_FETCHGATE_DIAG).  The
+         * probe above already ran the target walker with probe=true, which
+         * walks EXISTING PTEs without demand-paging: a present, executable,
+         * privilege-OK but merely iTLB-cold page WALKS + FILLS + succeeds (it
+         * never lands here).  Landing here therefore means a real instruction
+         * fetch at the speculating context would FAULT — which is exactly the
+         * "translation-unavailable" terminate the wrong path takes.  The side
+         * effect-free debug walk plus a MMU_DATA_LOAD probe classify WHY:
+         *   phys==-1                -> absent (no PTE): a demand-page would be
+         *                             required; correctly declined.
+         *   phys!=-1, dload INVALID -> present but access-denied at this
+         *                             privilege (SMEP/SMAP/US/cross-domain).
+         *   phys!=-1, dload valid   -> present + readable but NON-executable
+         *                             (NX): a data region, not code.
+         * All three are legitimate terminates; the classifier only exists so
+         * a future WP-fetch question can be reconciled from runtime evidence
+         * without a rebuild (it never changes control flow).
+         */
+        if (unlikely(getenv("CST_FETCHGATE_DIAG"))) {
+            hwaddr phys = cpu_get_phys_page_debug(cpu, pc & TARGET_PAGE_MASK);
+            void *dhost;
+            int dflags = probe_access_flags(env, pc, 1, MMU_DATA_LOAD,
+                                            cpu_mmu_index(cpu, false),
+                                            true, &dhost, 0);
+            const char *verdict =
+                phys == (hwaddr)-1        ? "absent-no-PTE"
+                : (dflags & TLB_INVALID_MASK) ? "present-access-denied"
+                                          : "present-non-executable-NX";
+            fprintf(stderr, "[fetchgate] reject pc=0x%" PRIx64
+                    " ifetch_pflags=0x%x dload_pflags=0x%x ifidx=%d didx=%d"
+                    " phys=0x%" PRIx64 " verdict=%s (correct-terminate)\n",
+                    (uint64_t)pc, pflags, dflags,
+                    cpu_mmu_index(cpu, true), cpu_mmu_index(cpu, false),
+                    (uint64_t)phys, verdict);
+        }
+#endif
         return false;
     }
 

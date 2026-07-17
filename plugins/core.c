@@ -46,31 +46,49 @@ void qemu_plugin_register_asid_write_cb(qemu_plugin_id_t id,
 
 /*
  * Block-device I/O hooks (qemu_plugin_register_devio_cb).  Like the
- * ASID-write hook, a single slot suffices: the block backend has one
- * issue and one completion chokepoint, and the consuming plugin
- * serialises its own state.  The dispatch entry points are called from
- * block/block-backend.c and are no-ops until a plugin registers.
+ * ASID-write hook, a single slot per stage suffices: the block backend
+ * has one issue and one completion chokepoint, the virtqueue has one
+ * notify chokepoint, and the consuming plugin serialises its own state.
+ * The dispatch entry points are called from hw/virtio/virtio.c (the
+ * doorbell) and block/block-backend.c (issue / completion) and are
+ * no-ops until a plugin registers.
  */
+static qemu_plugin_devio_doorbell_cb_t devio_doorbell_hook;
 static qemu_plugin_devio_start_cb_t devio_start_hook;
 static qemu_plugin_devio_stop_cb_t devio_stop_hook;
 
 void qemu_plugin_register_devio_cb(qemu_plugin_id_t id,
+                                   qemu_plugin_devio_doorbell_cb_t doorbell_cb,
                                    qemu_plugin_devio_start_cb_t start_cb,
                                    qemu_plugin_devio_stop_cb_t stop_cb)
 {
+    devio_doorbell_hook = doorbell_cb;
     devio_start_hook = start_cb;
     devio_stop_hook = stop_cb;
 }
 
-uint64_t qemu_plugin_devio_start(int dir, uint64_t offset, uint64_t bytes)
+void qemu_plugin_devio_doorbell(uint64_t dev_token)
+{
+    if (devio_doorbell_hook) {
+        /* The virtqueue kick runs in vCPU context (an MMIO/PIO write the
+         * guest driver performs), so current_cpu is the doorbell-writing
+         * vCPU — the one datum the later, possibly main-loop, issue hook
+         * cannot recover.  Report -1 if somehow not on a vCPU thread. */
+        int vcpu_index = current_cpu ? current_cpu->cpu_index : -1;
+        devio_doorbell_hook(vcpu_index, dev_token);
+    }
+}
+
+uint64_t qemu_plugin_devio_start(int dir, uint64_t offset, uint64_t bytes,
+                                 uint64_t dev_token)
 {
     if (devio_start_hook) {
-        /* Resolve the issuing vCPU here: under the canonical no-iothread
-         * configuration the block backend is entered synchronously on the
-         * doorbell-writing vCPU thread, so current_cpu is that vCPU; a
-         * request entered off any vCPU thread reports -1. */
+        /* current_cpu is the issuing vCPU only when the block layer is
+         * entered synchronously on a vCPU thread; the canonical no-iothread
+         * virtio-blk path defers to the main loop, where it is NULL (-1).
+         * The plugin recovers the true owner from @dev_token instead. */
         int vcpu_index = current_cpu ? current_cpu->cpu_index : -1;
-        return devio_start_hook(vcpu_index, dir, offset, bytes);
+        return devio_start_hook(vcpu_index, dir, offset, bytes, dev_token);
     }
     return 0;
 }

@@ -1548,35 +1548,63 @@ static void asid_write_track_cb(unsigned int vcpu_index, uint64_t new_asid)
 static bool g_devio_enabled = true;
 
 /*
+ * Devio doorbell hook (qemu_plugin_register_devio_cb): the guest kicked
+ * a block device's virtqueue on vCPU @vcpu_index.  This runs in vCPU
+ * context (the transport's MMIO/PIO write handler), correct path only (a
+ * speculative doorbell store is sandboxed before it reaches the device),
+ * BEFORE the request processing runs — possibly on the main loop.  It is
+ * the one point where the issuing vCPU is known, so capture that vCPU's
+ * current owning (thread_id, asid) and queue it on a per-device FIFO
+ * keyed by @dev_token for the later note_start to attribute exactly.
+ *
+ * resolve_thread_id / resolve_ctx_asid_index read g_vcpu_cur_{tid,asid}
+ * for this vCPU — written only by this same vCPU's vcpu_tb_exec (same
+ * thread, so lock-free here) — which hold the process/thread that
+ * entered the kernel to issue the syscall (kernel code inherits the
+ * entering thread's identity).  Gate on an active segment, matching the
+ * start hook; a doorbell for an inactive segment is not captured and the
+ * request falls back to positional (and is itself gated out).
+ */
+static void devio_doorbell_cb(int vcpu_index, uint64_t dev_token)
+{
+    if (!g_devio_enabled || vcpu_index < 0 ||
+        !g_trace_segments.is_active_atomic()) {
+        return;
+    }
+    unsigned c = (unsigned)vcpu_index;
+    devio_note_doorbell(vcpu_index, dev_token,
+                        resolve_thread_id(c), resolve_ctx_asid_index(c));
+}
+
+/*
  * Devio issue hook (qemu_plugin_register_devio_cb): the block backend
  * calls this from blk_aio_prwv when a disk request is issued.  Correct
  * path only (a speculative doorbell store is sandboxed and never
  * reaches the block layer).
  *
- * Attribution is POSITIONAL, not by the issuing vCPU: the block backend
- * defers a virtio-blk virtqueue's processing to the main-loop
- * AioContext even without a dedicated iothread, so blk_aio_prwv runs on
- * the main thread (vcpu_index == -1), not the doorbell-writing vCPU.
- * The record is queued and drained into the body stream at the next
- * body entry, landing in the traced stream at the point execution
- * resumes after the doorbell — the owning (single-address-space)
- * process's stream under the canonical single-marker-process baseline.
+ * Attribution: EXACT when this request was issued on the vCPU thread
+ * whose most recent kick was to this same device (@dev_token) — under
+ * the canonical ioeventfd=off config the kick and blk_aio_prwv run back
+ * to back on that vCPU, so note_start reads the owner the kick captured
+ * and stamps it on the record.  POSITIONAL fallback when the issue is
+ * off any vCPU thread, or its device does not match the vCPU's last kick
+ * (non-virtio, IDE/AHCI, or kernel-internal I/O): the record carries no
+ * owner and the consumer uses its stream-position context, as before.
  *
  * Gate: an active trace segment.  In marker mode that window is the
- * pinned workload's, so disk I/O issued while it is open is the traced
- * process's (the tracer is single-address-space by design; foreign I/O
- * under multi-process latch gating is a documented scope boundary).
- * Boot-time and inter-window I/O (segment inactive) is dropped.
- * Returns the request id, or 0 to leave the request untracked (no
- * paired completion notification is then delivered).
+ * pinned workload's, so disk I/O issued while it is open is a traced
+ * process's.  Boot-time and inter-window I/O (segment inactive) is
+ * dropped.  Returns the request id, or 0 to leave the request untracked
+ * (no paired completion notification is then delivered).
  */
 static uint64_t devio_start_cb(int vcpu_index, int dir,
-                               uint64_t offset, uint64_t bytes)
+                               uint64_t offset, uint64_t bytes,
+                               uint64_t dev_token)
 {
     if (!g_devio_enabled || !g_trace_segments.is_active_atomic()) {
         return 0;
     }
-    return devio_note_start(vcpu_index, dir, offset, bytes);
+    return devio_note_start(vcpu_index, dir, offset, bytes, dev_token);
 }
 
 /* Devio completion hook: the request the start hook tracked has
@@ -6860,7 +6888,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
          * mode.  A no-op without disk traffic (no blk_aio_* fires), so
          * device-free system traces are byte-identical. */
         if (g_devio_enabled) {
-            qemu_plugin_register_devio_cb(id, devio_start_cb, devio_stop_cb);
+            qemu_plugin_register_devio_cb(id, devio_doorbell_cb,
+                                          devio_start_cb, devio_stop_cb);
             /* Advertise the DEVIO_* body-tag names in the header map only
              * now (device-free / user-mode traces omit them and stay
              * byte-identical). */

@@ -938,14 +938,20 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
      - ``1``
      - Block-device (disk) I/O records (**system mode only**).  When on,
        the tracer brackets each disk request in the body stream with a
-       ``BODY_TAG_DEVIO_START`` at the requesting process's resume after
-       the device doorbell and a ``BODY_TAG_DEVIO_STOP`` at completion,
-       carrying the direction (read/write/flush), byte length, and disk
-       block number (byte offset / 512).  A no-op without disk traffic
-       (a device-free or user-mode trace carries no such records and is
-       byte-identical), so it is safe to leave on.  Canonical
-       configuration: a real ``-drive`` with **no dedicated iothread**
-       (see :doc:`quickstart`).  ``devio=0`` disables the hook entirely.
+       ``BODY_TAG_DEVIO_START`` at issue and a ``BODY_TAG_DEVIO_STOP`` at
+       completion, carrying the direction (read/write/flush), byte
+       length, and disk block number (byte offset / 512).  Each START is
+       attributed to the issuing process/thread: **exact** (owner carried
+       inline) for a ``virtio-blk`` request correlated to the vCPU that
+       rang the device doorbell, or **positional** (owner from the
+       stream context) for non-virtio (IDE/AHCI) or kernel-internal I/O.
+       Exact attribution — required for correct owners on a multi-vCPU /
+       multi-process guest — needs the virtio-blk device run with
+       ``ioeventfd=off`` and **no dedicated iothread** (the canonical
+       configuration; see :doc:`quickstart`).  A no-op without disk
+       traffic (a device-free or user-mode trace carries no such records
+       and is byte-identical), so it is safe to leave on.  ``devio=0``
+       disables the hook entirely.
    * - ``iframe_rate=<N>``
      - ``100000``
      - Emit a validation IFRAME after every Nth observation of a CP

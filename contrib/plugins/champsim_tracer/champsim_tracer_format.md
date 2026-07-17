@@ -654,12 +654,21 @@ Loop until a `BODY_TAG_END` is seen:
          rw         : u8            ; 0=read 1=write 2=flush
          bytes      : ULEB          ; 0 for flush
          block      : ULEB          ; byte offset / 512
+         attr       : u8            ; 0=positional 1=exact
+         if attr == 1 (exact):
+           owner_thread_id : ULEB   ; the issuing process/thread
+           owner_asid      : ULEB   ; its context asid_index
        DEVIO_STOP:
          request_id : ULEB
-       Surface the record positionally under the current
-       (prev_asid_index, prev_thread_id) context; correlate a STOP to
-       its START by request_id.  No state output; the next ENTRY is
-       unaffected.
+       Owner attribution.  When attr == 1 (exact) the request was
+       correlated to the vCPU that rang the device doorbell, so the
+       owning (thread_id, asid) is carried inline — use it directly,
+       independent of where the record fell in the interleaved stream.
+       When attr == 0 (positional) no owner is carried: surface the
+       record under the current (prev_asid_index, prev_thread_id)
+       context, as before.  A STOP correlates to its START by
+       request_id and inherits that START's owner.  No state output;
+       the next ENTRY is unaffected.
 6.4  ENTRY record:
        template_id_delta : SLEB
        cur_template_id = prev_entry_template_id + template_id_delta
@@ -1153,6 +1162,14 @@ BODY_TAG_DEVIO_START
 |   request length in bytes (0 for flush)          |
 | block                           ULEB             |
 |   disk block number = byte offset / 512          |
+| attr                            u8                |
+|   0 = positional, 1 = exact  (CST_DEVIO_ATTR_*)  |
+|                                                  |
+| -- present iff attr == 1 (exact) --              |
+| owner_thread_id                 ULEB             |
+|   the issuing process/thread                     |
+| owner_asid                      ULEB             |
+|   its context asid_index                         |
 +--------------------------------------------------+
 
 BODY_TAG_DEVIO_STOP
@@ -1163,15 +1180,31 @@ BODY_TAG_DEVIO_STOP
 +--------------------------------------------------+
 ```
 
-A `DEVIO_START` is positioned in the owning thread's stream where the
-requesting process resumes after issuing the request (the device
-doorbell); a `DEVIO_STOP` where that request's completion lands.  The
-`request_id` is a compact per-segment counter (reset to 1 at each segment
-open) so a consumer correlates the pair by id; a `DEVIO_STOP` never
-precedes its `DEVIO_START` on the wire.  Both are standalone records (no
-delta state) and inherit the surrounding `(asid, thread)` context
-positionally — under the canonical single-marker-process baseline that is
-the traced process.
+**Owner attribution.**  A block request is issued from the block backend,
+which — under the canonical no-iothread configuration — may run off the
+issuing vCPU thread, so the record's position in the interleaved stream
+does not by itself identify the owner.  When the request was correlated
+to the vCPU that rang the device doorbell (see below), `attr = 1` (exact)
+and the owning `(owner_thread_id, owner_asid)` is carried **inline**; a
+consumer uses it directly and needs no positional guess.  This is what
+makes attribution correct for a multi-vCPU / multi-process trace where
+two processes' disk I/O interleaves in one body stream.  When no doorbell
+matched — a non-virtio device (IDE/AHCI), or kernel-internal I/O — `attr =
+0` (positional) and no owner is carried: the consumer attributes the
+record to the `(asid, thread)` context in force at its stream position, as
+a device-free trace never emits these records at all.  A `DEVIO_STOP`
+correlates to its `DEVIO_START` by `request_id` and inherits that START's
+owner; a `DEVIO_STOP` never precedes its `DEVIO_START` on the wire.
+
+**Exact attribution requires a virtio-blk device kicked in vCPU context.**
+The guest's virtqueue kick (`virtio_queue_notify`) executes on the issuing
+vCPU; the plugin captures that vCPU's owning `(thread, asid)` there and
+stamps it on the request the block backend issues moments later on the
+same vCPU.  Under the default virtio ioeventfd fast path the kick is
+serviced without entering `virtio_queue_notify` in vCPU context, so the
+records fall back to positional; run the traced virtio-blk device with
+`ioeventfd=off` (alongside no iothread) for exact attribution.  See
+:doc:`quickstart` for the canonical configuration.
 
 The **disk block number** is the request's byte offset within the backing
 image divided by the block layer's 512-byte sector unit (`block = offset

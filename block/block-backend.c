@@ -1617,9 +1617,13 @@ static BlockAIOCB *blk_aio_prwv(BlockBackend *blk, int64_t offset,
      * chokepoint, so it captures every blk_aio_* here.  Direction comes
      * from the coroutine entry: read / write (data-moving, includes
      * pwrite-zeroes via the write entry) / flush (barrier).  Other kinds
-     * (ioctl, discard, zone ops) are left untracked.  Under the canonical
-     * no-iothread configuration this runs on the doorbell-writing vCPU
-     * thread, so the plugin sees the correct issuing context.
+     * (ioctl, discard, zone ops) are left untracked.  This may run off
+     * the vCPU thread (the canonical no-iothread virtio-blk path defers
+     * to the main loop), so the issuing vCPU is not current_cpu here; the
+     * attached device pointer (blk->dev) is passed as a correlation token
+     * so the plugin can match the doorbell it captured in vCPU context.
+     * It is the same DeviceState the virtqueue-notify hook reported for
+     * this device; 0 when no device is attached (positional fallback).
      */
     acb->plugin_devio_id = 0;
     {
@@ -1634,7 +1638,8 @@ static BlockAIOCB *blk_aio_prwv(BlockBackend *blk, int64_t offset,
         if (dir >= 0) {
             acb->plugin_devio_id =
                 qemu_plugin_devio_start(dir, (uint64_t)offset,
-                                        (uint64_t)bytes);
+                                        (uint64_t)bytes,
+                                        (uint64_t)(uintptr_t)blk->dev);
         }
     }
 

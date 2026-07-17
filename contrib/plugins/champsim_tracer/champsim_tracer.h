@@ -114,18 +114,31 @@ extern "C" {
 #define BODY_TAG_ASID_SWITCH     5
 /*
  * BODY_TAG_DEVIO_START / BODY_TAG_DEVIO_STOP: a block-device (disk) I/O
- * request bracketed in the body stream.  DEVIO_START is positioned in
- * the owning thread's stream at the device doorbell (the driver's
- * doorbell MMIO store executes in kernel code the kernel-ctx fold
- * attributes to the requesting process/thread); DEVIO_STOP where the
- * request's completion lands.  START payload: uleb request_id (compact
- * monotonic per-segment), u8 rw (CST_DEVIO_*), uleb bytes, uleb block
- * (disk block number = byte offset / logical block size, 512 B).  STOP
- * payload: uleb request_id.  System mode only, correct path only (a
- * speculative doorbell store is sandboxed and reaches no device).  The
- * blocking/non-blocking nature is derived positionally by the consumer;
- * absent entirely in device-free (e.g. user-mode) traces.  Wire format
- * spec'd in champsim_tracer_format.md.
+ * request bracketed in the body stream.  DEVIO_START carries the owning
+ * (thread, asid) EXPLICITLY when the request was correlated to the vCPU
+ * that rang the device doorbell (attr == CST_DEVIO_ATTR_EXACT); the
+ * virtqueue kick executes in that vCPU's context, so the plugin captures
+ * the owner there and stamps it here even though the block backend
+ * issues the request later on the main loop.  When no doorbell matched
+ * (non-virtio, IDE/AHCI, or kernel-internal I/O) the record is
+ * POSITIONAL (attr == CST_DEVIO_ATTR_POSITIONAL): no owner fields, and
+ * the consumer attributes it to the (thread, asid) context in force at
+ * its stream position, as before.  DEVIO_STOP lands where the request's
+ * completion is observed and pairs to its START by request_id (the
+ * owner is inherited from the START).
+ *
+ *   START payload: uleb request_id (compact monotonic per-segment),
+ *                  u8 rw (CST_DEVIO_*), uleb bytes, uleb block (disk
+ *                  block number = byte offset / logical block size,
+ *                  512 B), u8 attr (CST_DEVIO_ATTR_*); iff attr ==
+ *                  CST_DEVIO_ATTR_EXACT then uleb owner_thread_id,
+ *                  uleb owner_asid.
+ *   STOP  payload: uleb request_id.
+ *
+ * System mode only, correct path only (a speculative doorbell store is
+ * sandboxed and reaches no device).  Absent entirely in device-free
+ * (e.g. user-mode) traces.  Wire format spec'd in
+ * champsim_tracer_format.md.
  */
 #define BODY_TAG_DEVIO_START     6
 #define BODY_TAG_DEVIO_STOP      7
@@ -134,6 +147,12 @@ extern "C" {
 #define CST_DEVIO_READ           0
 #define CST_DEVIO_WRITE          1
 #define CST_DEVIO_FLUSH          2
+
+/* DEVIO_START attribution byte: whether the owning (thread, asid) is
+ * carried inline (EXACT — doorbell-correlated) or the consumer must use
+ * the stream-position context (POSITIONAL — no doorbell matched). */
+#define CST_DEVIO_ATTR_POSITIONAL 0
+#define CST_DEVIO_ATTR_EXACT      1
 
 /* Logical block size for the DEVIO_START disk-block-number field: the
  * block layer's fundamental sector unit (512 bytes).  block = byte
@@ -1406,26 +1425,51 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry);
 /*
  * ---- Block-device (disk) I/O records (DEVIO) ----
  *
- * The devio state is process-wide (one block backend, cross-thread
- * completions), owned by champsim_tracer_output.cc and serialised by
- * its own mutex.  The plugin's registered devio hooks call note_start /
- * note_stop; the pending records are drained into the body stream at
- * the next body entry (under exec_lock), so a DEVIO_START lands in the
- * owning thread's stream at the doorbell and a DEVIO_STOP where the
- * completion resumes.  Reset per segment.
+ * The devio state is process-wide (one block backend), owned by
+ * champsim_tracer_output.cc and serialised by its own mutex.  The
+ * plugin's registered devio hooks call note_doorbell (in vCPU context,
+ * at the virtqueue kick) / note_start (block-backend issue) / note_stop
+ * (block-backend completion); the pending START/STOP records are drained
+ * into the body stream at the next body entry (under exec_lock).  A
+ * DEVIO_START carries its owner EXPLICITLY when the doorbell captured in
+ * vCPU context correlates to it, otherwise it is positional.  A
+ * DEVIO_STOP lands where the completion resumes.  Reset per segment.
+ *
+ * Correlation is PER-VCPU, not per-device.  Under the canonical
+ * ioeventfd=off configuration the virtqueue kick and the block backend's
+ * blk_aio_* issue run on the SAME vCPU thread, back to back with no
+ * yield (virtio_queue_notify -> handle_vq -> blk_aio_prwv), so the kick
+ * records the issuing owner in a per-vCPU slot that the immediately
+ * following issue reads by vCPU index.  A device token guards the slot
+ * so a non-virtio (IDE/AHCI) or kernel-internal blk_aio on that vCPU,
+ * which carries a different / absent device, does not borrow a stale
+ * owner.  A per-DEVICE queue would instead race: two vCPUs kicking the
+ * same shared device concurrently can interleave push/pop and cross-
+ * attribute, precisely the multi-vCPU case this exists to get right.
  */
 
+/* Doorbell: the guest kicked a block device's virtqueue on vCPU
+ * @vcpu_index (correct path, vCPU context).  Record that vCPU's current
+ * owning (thread_id, asid) and the device @dev_token in the per-vCPU
+ * slot, so the immediately following note_start on the same vCPU for the
+ * same device attributes its request to this exact owner. */
+void devio_note_doorbell(int vcpu_index, uint64_t dev_token,
+                         uint32_t owner_thread_id, uint32_t owner_asid);
 /* Issue: assign a compact per-segment request id, compute the disk
  * block number (offset >> CST_DEVIO_LBA_SHIFT), and queue a pending
- * DEVIO_START.  @dir is a CST_DEVIO_* value.  Returns the request id
- * (always nonzero here — the caller decides whether to track). */
+ * DEVIO_START.  When @vcpu_index issued the request on a vCPU thread and
+ * its per-vCPU slot holds a matching @dev_token doorbell, stamp that
+ * exact owner; otherwise the record is positional.  @dir is a CST_DEVIO_*
+ * value.  Returns the request id (always nonzero — the caller decides
+ * whether to track). */
 uint64_t devio_note_start(int vcpu_index, int dir,
-                          uint64_t offset, uint64_t bytes);
+                          uint64_t offset, uint64_t bytes,
+                          uint64_t dev_token);
 /* Completion: queue a pending DEVIO_STOP for @request_id (dropped at
  * drain if its START never reached the wire, e.g. a segment switch). */
 void devio_note_stop(uint64_t request_id);
-/* Segment-open reset: clear pending records, the live-id set, and the
- * per-segment id counter. */
+/* Segment-open reset: clear pending records, the live-id set, the
+ * per-vCPU doorbell slots, and the per-segment id counter. */
 void devio_reset_segment(void);
 /* Advertise the DEVIO_* body-tag names in the header encoding map only
  * when the disk-I/O hook is active (system mode + devio enabled), so a

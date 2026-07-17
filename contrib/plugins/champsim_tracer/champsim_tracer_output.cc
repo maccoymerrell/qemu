@@ -3752,16 +3752,32 @@ static void emit_iframe_if_due(BodyStreamState *st, BodyEntry *entry,
 /*
  * ---- Block-device (disk) I/O records (DEVIO) ----
  *
- * Process-wide state: there is one block backend and completions land
- * on the main loop thread (not the issuing vCPU), so a GMutex guards
- * the queues, the per-segment id counter, and the live-id set.  The
- * plugin's devio hooks call devio_note_start / devio_note_stop; the
- * queued records are drained into the body stream at the next body
- * entry (devio_drain, under exec_lock), so a DEVIO_START lands at an
- * inter-entry boundary in the owning thread's stream and a DEVIO_STOP
- * where the completion resumes.  Starts are drained before stops so a
- * request's START always precedes its STOP on the wire; a STOP whose
- * START never reached the wire is dropped (the live-id set).
+ * Process-wide state: there is one block backend, doorbells fire on the
+ * issuing vCPU thread, and completions land on the main loop thread, so
+ * a GMutex guards the queues, the per-segment id counter, the live-id
+ * set, and the per-vCPU doorbell slots.  The plugin's devio hooks call
+ * devio_note_doorbell (vCPU context, at the virtqueue kick) /
+ * devio_note_start (block backend, issue) / devio_note_stop (block
+ * backend, completion); the queued START/STOP records are drained into
+ * the body stream at the next body entry (devio_drain, under exec_lock).
+ *
+ * Attribution is PER-VCPU.  Under the canonical ioeventfd=off
+ * configuration the virtqueue kick (virtio_queue_notify) and the block
+ * backend's blk_aio_* issue run on the SAME vCPU thread, back to back
+ * with no yield, so the kick records the issuing owner (thread, asid)
+ * and the device token in that vCPU's slot, and the immediately
+ * following issue reads it by vCPU index.  The token guards the slot: a
+ * non-virtio (IDE/AHCI) or kernel-internal blk_aio on that vCPU carries
+ * a different / absent device and stays POSITIONAL (no owner on the
+ * wire; the consumer uses the record's stream-position context).  A
+ * per-DEVICE queue would instead race — two vCPUs kicking one shared
+ * device concurrently can interleave push/pop and cross-attribute, the
+ * exact multi-vCPU case this is built to get right — so the correlation
+ * key is the vCPU, not the device.
+ *
+ * Starts are drained before stops so a request's START always precedes
+ * its STOP on the wire; a STOP whose START never reached the wire is
+ * dropped (the live-id set).
  */
 namespace {
 
@@ -3770,6 +3786,18 @@ struct DevioStart {
     uint8_t  rw;        /* CST_DEVIO_* */
     uint64_t bytes;
     uint64_t block;     /* disk block number = offset >> CST_DEVIO_LBA_SHIFT */
+    bool     exact;     /* owner correlated from a doorbell */
+    uint32_t owner_thread_id;   /* valid iff exact */
+    uint32_t owner_asid;        /* valid iff exact */
+};
+
+/* Per-vCPU record of the most recent block-device kick: the device it
+ * kicked and the owning (thread, asid) captured in that vCPU's context.
+ * The immediately following blk_aio_* issue on the same vCPU reads it. */
+struct DevioKick {
+    uint64_t token = 0;         /* device token, 0 = slot empty */
+    uint32_t thread_id = 0;
+    uint32_t asid = 0;
 };
 
 struct DevioState {
@@ -3778,6 +3806,9 @@ struct DevioState {
     std::vector<DevioStart> pending_starts;
     std::vector<uint64_t>   pending_stops;
     std::unordered_set<uint64_t> live_ids;  /* START emitted, STOP not yet */
+    /* Last block-device kick per vCPU, keyed by vCPU index (a map, so no
+     * dependency on the plugin's vCPU cap and no bound to police). */
+    std::unordered_map<int, DevioKick> vcpu_kick;
 };
 
 DevioState g_devio;
@@ -3789,16 +3820,44 @@ void devio_set_map_active(bool on)
     g_devio_map_active = on;
 }
 
-uint64_t devio_note_start(int vcpu_index, int dir,
-                          uint64_t offset, uint64_t bytes)
+void devio_note_doorbell(int vcpu_index, uint64_t dev_token,
+                         uint32_t owner_thread_id, uint32_t owner_asid)
 {
-    (void)vcpu_index;
+    if (!dev_token || vcpu_index < 0) {
+        return;
+    }
+    g_mutex_lock(&g_devio.mtx);
+    DevioKick &k = g_devio.vcpu_kick[vcpu_index];
+    k.token = dev_token;
+    k.thread_id = owner_thread_id;
+    k.asid = owner_asid;
+    g_mutex_unlock(&g_devio.mtx);
+}
+
+uint64_t devio_note_start(int vcpu_index, int dir,
+                          uint64_t offset, uint64_t bytes,
+                          uint64_t dev_token)
+{
     DevioStart s;
     s.rw = (uint8_t)dir;   /* CST_DEVIO_* == enum qemu_plugin_devio_dir */
     s.bytes = bytes;
     s.block = offset >> CST_DEVIO_LBA_SHIFT;
+    s.exact = false;
+    s.owner_thread_id = 0;
+    s.owner_asid = 0;
     g_mutex_lock(&g_devio.mtx);
     s.request_id = g_devio.next_id++;
+    /* Exact attribution: the request was issued on a vCPU thread whose
+     * most recent kick was to this same device — the kick captured the
+     * issuing owner (they run back to back on that vCPU). */
+    if (vcpu_index >= 0 && dev_token) {
+        auto it = g_devio.vcpu_kick.find(vcpu_index);
+        if (it != g_devio.vcpu_kick.end() && it->second.token == dev_token) {
+            s.exact = true;
+            s.owner_thread_id = it->second.thread_id;
+            s.owner_asid = it->second.asid;
+        }
+    }
     g_devio.pending_starts.push_back(s);
     g_mutex_unlock(&g_devio.mtx);
     return s.request_id;
@@ -3821,6 +3880,7 @@ void devio_reset_segment(void)
     g_devio.pending_starts.clear();
     g_devio.pending_stops.clear();
     g_devio.live_ids.clear();
+    g_devio.vcpu_kick.clear();
     g_mutex_unlock(&g_devio.mtx);
 }
 
@@ -3862,6 +3922,13 @@ static void devio_drain(BodyStreamState *st)
         bw_write_u8(&st->bw, s.rw);
         bw_write_uleb128(&st->bw, s.bytes);
         bw_write_uleb128(&st->bw, s.block);
+        if (s.exact) {
+            bw_write_u8(&st->bw, CST_DEVIO_ATTR_EXACT);
+            bw_write_uleb128(&st->bw, s.owner_thread_id);
+            bw_write_uleb128(&st->bw, s.owner_asid);
+        } else {
+            bw_write_u8(&st->bw, CST_DEVIO_ATTR_POSITIONAL);
+        }
     }
     for (uint64_t id : stops) {
         bw_write_u8(&st->bw, BODY_TAG_DEVIO_STOP);

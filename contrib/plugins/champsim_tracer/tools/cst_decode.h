@@ -21,6 +21,8 @@
 
 #include <functional>
 #include <memory>
+#include <unordered_map>
+#include <utility>
 
 #include "cst_common.h"
 #include "cst_format.h"
@@ -95,13 +97,21 @@ struct DecodedRegfile {
     std::vector<RegfileSlot>  regs;
 };
 
-/* A decoded disk-I/O record (BODY_TAG_DEVIO_START / _STOP), surfaced
- * positionally as the body is walked.  is_start distinguishes the two;
- * for a STOP only request_id is meaningful.  thread_id / asid are the
- * body context in force at the record's stream position (the owning
- * thread's stream). */
+/* A decoded disk-I/O record (BODY_TAG_DEVIO_START / _STOP), surfaced as
+ * the body is walked.  is_start distinguishes the two; for a STOP only
+ * request_id is meaningful.
+ *
+ * thread_id / asid are the owning process/thread.  For an EXACT START
+ * (exact == true) they are carried inline on the record — the owner the
+ * doorbell captured in the issuing vCPU's context — so attribution does
+ * not depend on where the record fell in the interleaved stream.  For a
+ * POSITIONAL START (exact == false, and for every STOP) they are the
+ * body context in force at the record's stream position.  A STOP inherits
+ * its START's owner when the walker has seen that START (surfaced too, so
+ * consumers need not join). */
 struct DecodedDevio {
     bool     is_start   = false;
+    bool     exact      = false;   /* owner carried inline (START only) */
     uint64_t request_id = 0;
     uint8_t  rw         = 0;   /* CST_DEVIO_* (START only) */
     uint64_t bytes      = 0;   /* START only */
@@ -369,6 +379,9 @@ private:
     AttributionLint lint_;
     /* Optional positional sink for disk-I/O records (set_devio_callback). */
     DevioCallback devio_cb_;
+    /* request_id -> (thread_id, asid) captured from an EXACT DEVIO_START,
+     * so its paired DEVIO_STOP can be surfaced with the same owner. */
+    std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> devio_owner_;
 };
 
 /*

@@ -47,6 +47,11 @@ inline constexpr uint32_t CST_MAGIC = cst_wire::MAGIC;
 #define CST_DEVIO_WRITE  1
 #define CST_DEVIO_FLUSH  2
 
+/* DEVIO_START attribution byte: EXACT carries inline owner (thread,
+ * asid); POSITIONAL carries none and uses the stream-position context. */
+#define CST_DEVIO_ATTR_POSITIONAL 0
+#define CST_DEVIO_ATTR_EXACT      1
+
 namespace cst {
 
 /* ===== Format-layout invariants =====

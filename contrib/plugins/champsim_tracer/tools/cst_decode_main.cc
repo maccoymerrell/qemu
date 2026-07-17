@@ -1546,9 +1546,11 @@ void render_disasm(FILE *out, const cst::Header &h,
     DisasmContext ctx{&h, &by_id, &templates, &dt, od, show_deps, show_lanes};
 
     emit_disasm_file_header(out, h, templates.size());
-    /* Disk-I/O records surface positionally as comment lines, in stream
-     * order with the entries — a START at the doorbell, a STOP where the
-     * completion lands. */
+    /* Disk-I/O records surface as comment lines, in stream order with
+     * the entries — a START at the request issue, a STOP where the
+     * completion lands.  The (thread, asid) is the owning process: exact
+     * for a doorbell-correlated START (attr=exact), the paired START's
+     * owner for a STOP, else the stream-position context (attr=pos). */
     body.set_devio_callback([&](const cst::DecodedDevio &d) {
         if (d.is_start) {
             const char *rw = d.rw == CST_DEVIO_READ  ? "read"
@@ -1557,10 +1559,10 @@ void render_disasm(FILE *out, const cst::Header &h,
                                                      : "?";
             std::fprintf(out,
                 "; DEVIO START req=%llu %s bytes=%llu block=%llu "
-                "(thread=%u asid=%u)\n",
+                "(thread=%u asid=%u attr=%s)\n",
                 (unsigned long long)d.request_id, rw,
                 (unsigned long long)d.bytes, (unsigned long long)d.block,
-                d.thread_id, d.asid);
+                d.thread_id, d.asid, d.exact ? "exact" : "pos");
         } else {
             std::fprintf(out,
                 "; DEVIO STOP  req=%llu (thread=%u asid=%u)\n",

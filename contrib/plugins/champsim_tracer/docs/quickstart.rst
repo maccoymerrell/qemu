@@ -278,20 +278,35 @@ plugin sees its argv.
 
    .. important::
 
-      **Run the block backend without a dedicated iothread** — do not
-      pass ``-object iothread`` / ``iothread=`` on a ``-drive`` /
-      ``-device``.  This is the **canonical configuration for disk-I/O
-      records** (``devio``, on by default): the block backend then runs
-      on the main loop, and the tracer brackets each disk request in the
-      body stream with ``DEVIO_START`` (at the requesting process's
-      resume after the device doorbell) and ``DEVIO_STOP`` (at
-      completion).  Attach a real disk to exercise it, e.g.::
+      **Canonical configuration for disk-I/O records** (``devio``, on by
+      default): a ``virtio-blk`` device with **no dedicated iothread**
+      and **``ioeventfd=off``**.  The tracer brackets each disk request
+      in the body stream with ``DEVIO_START`` (at issue) and
+      ``DEVIO_STOP`` (at completion).  Attach a real disk to exercise
+      it, e.g.::
 
          qemu-system-x86_64 -kernel vmlinuz -initrd rootfs.cpio.gz \
-             -append "console=ttyS0 panic=-1 nopti" \
-             -drive file=scratch.raw,format=raw,if=virtio,cache=none \
+             -append "console=ttyS0 panic=-1 nopti" -smp 2 \
+             -drive file=scratch.raw,format=raw,if=none,id=d0 \
+             -device virtio-blk-pci,drive=d0,ioeventfd=off \
              -plugin ./libchampsim_tracer.so,outfile=run,\
              trace_window=marker:simulation=20000000,devio=1 ...
+
+      **Why ``ioeventfd=off``.**  Each ``DEVIO_START`` is attributed to
+      the process/thread that issued it.  The guest's virtqueue kick runs
+      in the issuing vCPU's context, where the tracer captures the owner;
+      the block backend issues the request moments later on that same
+      vCPU, and the record is stamped with the captured owner (the
+      decoder shows ``attr=exact``).  This is what keeps attribution
+      correct on a multi-vCPU / multi-process guest, where two processes'
+      disk I/O interleaves in one body stream.  The default virtio
+      *ioeventfd* fast path services the kick without entering the vCPU
+      context the tracer hooks, so with it on the records fall back to
+      **positional** attribution (``attr=pos`` — correct for a single
+      marked process, a guess otherwise).  ``ioeventfd=off`` (and no
+      iothread) keeps the whole ``kick → blk_aio`` path on the issuing
+      vCPU.  Non-virtio disks (IDE/AHCI) and kernel-internal I/O always
+      use the positional fallback.
 
       An initramfs-only guest with no ``-drive`` produces no disk
       traffic and therefore no ``DEVIO`` records — the trace is

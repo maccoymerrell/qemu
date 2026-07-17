@@ -587,9 +587,16 @@ void BodyWalker::handle_asid_switch(WalkState &ws)
 /*
  * BODY_TAG_DEVIO_START / _STOP: a disk-I/O request bracket.  START
  * payload: uleb request_id, u8 rw (CST_DEVIO_*), uleb bytes, uleb block
- * (disk block number).  STOP payload: uleb request_id.  Standalone
- * records (no delta state); the current (thread, asid) context gives
- * the owning-thread attribution positionally.
+ * (disk block number), u8 attr (CST_DEVIO_ATTR_*); iff attr == EXACT
+ * then uleb owner_thread_id, uleb owner_asid.  STOP payload: uleb
+ * request_id.
+ *
+ * Owner attribution: an EXACT START carries its owning (thread, asid)
+ * inline — the process the doorbell captured in the issuing vCPU's
+ * context — so it does not depend on the record's position in the
+ * interleaved stream.  A POSITIONAL START (no doorbell matched) and any
+ * STOP use the stream context, except a STOP inherits the owner of a
+ * START the walker has already seen (devio_owner_).
  */
 void BodyWalker::handle_devio(WalkState &ws, bool is_start)
 {
@@ -600,12 +607,30 @@ void BodyWalker::handle_devio(WalkState &ws, bool is_start)
         d.rw = body_.u8();
         d.bytes = body_.uleb();
         d.block = body_.uleb();
+        uint8_t attr = body_.u8();
+        if (attr == CST_DEVIO_ATTR_EXACT) {
+            d.exact = true;
+            d.thread_id = (uint32_t)body_.uleb();
+            d.asid = (uint32_t)body_.uleb();
+            devio_owner_[d.request_id] = { d.thread_id, d.asid };
+        } else {
+            d.thread_id = ws.current_thread;
+            d.asid = ws.current_asid;
+        }
         stats_.devio_start_count++;
     } else {
+        /* STOP: inherit the paired START's owner when known. */
+        auto it = devio_owner_.find(d.request_id);
+        if (it != devio_owner_.end()) {
+            d.thread_id = it->second.first;
+            d.asid = it->second.second;
+            devio_owner_.erase(it);
+        } else {
+            d.thread_id = ws.current_thread;
+            d.asid = ws.current_asid;
+        }
         stats_.devio_stop_count++;
     }
-    d.thread_id = ws.current_thread;
-    d.asid = ws.current_asid;
     if (devio_cb_) {
         devio_cb_(d);
     }

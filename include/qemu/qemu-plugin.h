@@ -106,7 +106,12 @@ typedef uint64_t qemu_plugin_id_t;
  *
  * version 12:
  * - added qemu_plugin_register_devio_cb (block-device I/O issue/complete
- *   notifications from the block backend, for disk-request wire records)
+ *   notifications from the block backend, for disk-request wire records).
+ *   The registration also carries a doorbell hook: the guest's virtqueue
+ *   notify (kick) executes in vCPU context, so the block backend's later
+ *   (main-loop) issue notification is correlated back to the issuing vCPU
+ *   through a device token, giving exact owner attribution instead of a
+ *   positional guess.
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
@@ -1065,13 +1070,44 @@ enum qemu_plugin_devio_dir {
 };
 
 /**
+ * typedef qemu_plugin_devio_doorbell_cb_t - virtqueue-notify (kick) hook
+ * @vcpu_index: the vCPU that rang the doorbell (wrote the virtqueue
+ *              notify register), resolved from current_cpu, or -1 if the
+ *              notify was not raised from a vCPU thread
+ * @dev_token: an opaque per-device identity (the block device's
+ *             DeviceState pointer, as an integer) that a later start
+ *             hook can match to correlate this doorbell with the
+ *             asynchronous requests it produced
+ *
+ * Fires synchronously in vCPU context when the guest kicks a
+ * block-device virtqueue, BEFORE the (possibly deferred, main-loop)
+ * request processing runs.  It is the one point where the issuing vCPU
+ * — and thus the plugin's owning process/thread — is known.  The plugin
+ * captures the owner keyed by @dev_token; the start hook, which fires on
+ * the main loop with the request geometry but no vCPU, pops the matching
+ * doorbell to attribute the request exactly.  System emulation only;
+ * correct path only (a spec-mode doorbell store reaches no device).
+ */
+typedef void (*qemu_plugin_devio_doorbell_cb_t)(int vcpu_index,
+                                                uint64_t dev_token);
+
+/**
  * typedef qemu_plugin_devio_start_cb_t - block-device request issue hook
- * @vcpu_index: the vCPU that issued the request (the doorbell-writing
- *              vCPU under the canonical no-iothread configuration), or
- *              -1 when the block layer was entered off any vCPU thread
+ * @vcpu_index: the vCPU that issued the request when the block layer was
+ *              entered synchronously on a vCPU thread, else -1 (the
+ *              canonical no-iothread virtio-blk path defers to the main
+ *              loop, so this is typically -1 — use @dev_token + the
+ *              doorbell hook for the true issuing vCPU)
  * @dir: an enum qemu_plugin_devio_dir value
  * @offset: byte offset of the request within the backing image
  * @bytes: request length in bytes (0 for flush)
+ * @dev_token: the attached device's identity (DeviceState pointer as an
+ *             integer), matching the doorbell hook's token for a device
+ *             whose kick was seen in vCPU context; 0 when no device is
+ *             attached.  The plugin correlates this against its captured
+ *             doorbells for exact owner attribution, falling back to
+ *             positional attribution when no doorbell matches (non-virtio
+ *             or kernel-internal I/O).
  *
  * Fires synchronously from the block backend when an asynchronous
  * request (blk_aio_*) is issued.  Returns a nonzero request id the
@@ -1084,7 +1120,8 @@ enum qemu_plugin_devio_dir {
 typedef uint64_t (*qemu_plugin_devio_start_cb_t)(int vcpu_index,
                                                  int dir,
                                                  uint64_t offset,
-                                                 uint64_t bytes);
+                                                 uint64_t bytes,
+                                                 uint64_t dev_token);
 
 /**
  * typedef qemu_plugin_devio_stop_cb_t - block-device completion hook
@@ -1101,18 +1138,22 @@ typedef void (*qemu_plugin_devio_stop_cb_t)(uint64_t request_id);
 /**
  * qemu_plugin_register_devio_cb() - register block-device I/O hooks
  * @id: plugin ID
+ * @doorbell_cb: virtqueue-notify (kick) hook, or NULL
  * @start_cb: issue hook, or NULL
  * @stop_cb: completion hook, or NULL
  *
- * Registers synchronous notification of block-device request issue and
- * completion at the block backend's blk_aio_* chokepoints.  System
- * emulation only.  A tracer uses these to place disk-request records in
- * the body stream: the issue hook fires in vCPU context at the device
- * doorbell (correct-path only), the completion hook where the request
- * finishes.
+ * Registers synchronous notification of block-device virtqueue kicks
+ * (in vCPU context) and of request issue / completion at the block
+ * backend's blk_aio_* chokepoints (on whichever thread the block layer
+ * runs).  System emulation only.  A tracer uses these to place
+ * disk-request records in the body stream attributed to the exact
+ * issuing process/thread: the doorbell hook captures the owner in vCPU
+ * context, the issue hook correlates the request to it by device token,
+ * and the completion hook marks where the request finishes.
  */
 QEMU_PLUGIN_API
 void qemu_plugin_register_devio_cb(qemu_plugin_id_t id,
+                                   qemu_plugin_devio_doorbell_cb_t doorbell_cb,
                                    qemu_plugin_devio_start_cb_t start_cb,
                                    qemu_plugin_devio_stop_cb_t stop_cb);
 

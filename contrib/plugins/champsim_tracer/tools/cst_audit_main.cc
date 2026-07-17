@@ -591,6 +591,11 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
             (void)body.u8();                 /* rw         */
             (void)body.uleb();               /* bytes      */
             (void)body.uleb();               /* block      */
+            uint8_t attr = body.u8();        /* attribution */
+            if (attr == CST_DEVIO_ATTR_EXACT) {
+                (void)body.uleb();           /* owner_thread_id */
+                (void)body.uleb();           /* owner_asid      */
+            }
             s->devio_start.bytes += body.consumed() - tag_start;
             s->devio_start.count += 1;
             continue;

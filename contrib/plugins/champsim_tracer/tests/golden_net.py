@@ -31,6 +31,8 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import resource
 import shutil
 import subprocess
 import sys
@@ -423,10 +425,373 @@ def _dump_legacy_diff(build: Path, cst: Path, cell: str) -> None:
           f"tree and diff the decoded output to localize)")
 
 
+# ===========================================================================
+# System-mode golden net
+# ===========================================================================
+#
+# DETERMINISM VERDICT (measured; see tests/golden/sysfixtures/EXPERIMENT.txt
+# for the full knob matrix and variant-field taxonomy).  A full-system boot is
+# NOT byte-deterministic run to run, and no available knob makes it so without
+# editing the plugin:
+#
+#   * baseline (canonical devio config, no icount): the marker fires at a
+#     different boot icount every run; trace length, template count, BB-id
+#     assignment, and every profile/exec count differ.  Two runs share a
+#     common prefix only up to line 8 (the START_INSN icount).
+#   * -icount shift=N,sleep=off -rtc clock=vm: still nondeterministic (marker
+#     icount moves ~10^5-10^7 between runs) and it changes trace SEMANTICS
+#     (x86 REP string ops single-step under icount -> rep_fanout collapses to
+#     0 and per-op instruction counts balloon).  Boot-hardening knobs
+#     (nokaslr, -cpu ...,-rdrand,-rdseed, random.trust_cpu=off, tsc=reliable)
+#     narrow the gap but do not close it.
+#   * record/replay (-icount ...,rr=record/replay): record WITH the plugin
+#     crashes ("Bad icount read", accel/tcg/icount-common.c) because the
+#     plugin's clock reads in its callbacks violate icount's can_do_io gating;
+#     replaying a plugin-free recording WITH the plugin does reproduce the
+#     boot deterministically (identical marker icount across replays) but the
+#     WP excursion under icount single-steps and produces a runaway,
+#     non-terminating trace (>1 GB, never finishes) -- impractical as a net.
+#     (Root cause is upstream/plugin interplay, not fixable from tests/.)
+#
+# So byte-identity across independent boots is out.  What IS invariant: the
+# marked workload runs the SAME user instructions every boot.  The
+# CORRECT-PATH USER-code slice of the template dictionary -- each CP-executed
+# user BB's start_pc, shape, decoded bytes, operand roles and classification,
+# with the run-varying fields (BB-id, exec/profile counts, kernel branch
+# targets, WP-only BBs, kernel BBs) canonicalized away -- is byte-identical
+# across independent boots (verified: 5/5 boots -> one canon hash).  That
+# slice is exactly the translation-time output a plugin refactor must
+# preserve (fragment splitter, chain assembler, decoder, lane-mask/operand
+# roles, dep classifier), so it is the normalized net.
+#
+# The system net therefore has two byte-exact guards (its own manifest,
+# tests/golden/manifest_system.json; the same GREEN-twice + recorded-inputs
+# discipline as the user net):
+#
+#   (1) fixture-decode net -- guards the DECODER/tools on a REAL system trace.
+#       Triple-hash (body member / --format=legacy / --templates-only) of the
+#       FROZEN system fixture .cst.  The fixture bytes never change, so any
+#       hash move is a decoder/tool change.  (User-mode cells never carry
+#       kernel BBs, faults, multi-context, physaddr, or DEVIO content.)
+#   (2) canon-retrace net -- guards the PLUGIN's trace generation.  Re-boot
+#       the canonical system recipe, canonicalize the CP-user-slice, compare
+#       to the recorded hash.  capture traces N_DET times and refuses to
+#       record a cell whose canon slice is not identical across the runs.
+#
+# System assets (kernel + initrd) are local, not in the repo (as with the
+# validator's system mode).  capture freezes copies into sysfixtures/ and
+# records their sha256; both guards SKIP cleanly when the assets are absent.
+
+SYS_MANIFEST = GOLDEN_DIR / "manifest_system.json"
+SYS_FIXTURES_DIR = GOLDEN_DIR / "sysfixtures"    # frozen kernel/initrd (local)
+
+# Canonical system recipe (the devio config: nopti + ioeventfd=off + Haswell +
+# virtio-blk O_DIRECT disk I/O in a marker window -- the same shape as the
+# frozen devio fixture).  Kernel/initrd default to the maintainer's local
+# devio build; override with CST_SYS_KERNEL / CST_SYS_INITRD.
+SYS_KERNEL_DEFAULT = Path(os.environ.get(
+    "CST_SYS_KERNEL",
+    "/mnt/md0/QEMU/cst_runs/devio/kbuild-x86/arch/x86/boot/bzImage"))
+SYS_INITRD_DEFAULT = Path(os.environ.get(
+    "CST_SYS_INITRD",
+    "/mnt/md0/QEMU/cst_runs/devio/disk/rootfs.cpio.gz"))
+SYS_CPU_MODEL = "Haswell"
+SYS_APPEND = "console=ttyS0 panic=-1 nopti"
+SYS_PLUGIN_OPTS = ("wpdepth=64,trace_window=marker:simulation=3000000"
+                   "+policy=latch,physaddr=1,regdata=1,memdata=1")
+SYS_MEM = "512M"
+SYS_SCRATCH_BYTES = 16 * 1024 * 1024
+# Host CPU to pin the boot to (quiet-host isolation only; the canon slice is
+# CPU-independent).  Override with CST_SYS_CPU.
+SYS_CPU = os.environ.get("CST_SYS_CPU", "100")
+SYS_TIMEOUT = 3600
+SYS_VMEM_KB = 25165824                            # ulimit -v (24 GiB)
+SYS_N_DET = 2                                     # GREEN-twice determinism gate
+
+# One canonical system cell (extend as more system fixtures are added).
+SYS_CELLS = [{"name": "devio_sys_x86_64", "isa": "x86_64"}]
+
+# Frozen system fixtures for the DECODER guard (reuse the SVG fixture files).
+SYS_DECODE_FIXTURES = [
+    {"name": "devio_sys_x86_64", "file": "devio_sys_x86_64.cst"},
+]
+
+# --- CP-user-slice canonicalization ----------------------------------------
+# Kernel/user split: x86-64 user VAs sit below the non-canonical hole; kernel
+# and vsyscall live at/above it.  A user BB whose branch target is >= this is
+# a syscall/int into the (KASLR-shifted) kernel and must be masked.
+SYS_USER_MAX = 0x0000800000000000
+_BB_RE = re.compile(r'^(BB\d+)\s+(0x[0-9a-fA-F]+)\s+\(insns=(\d+)\s+'
+                    r'fall_through=(0x[0-9a-fA-F]+)\)')
+_PROFILE_RE = re.compile(r'^\s*profile:\s+exec_cp=(\d+)\s+exec_wp=(\d+)')
+_TARGET_RE = re.compile(r'^\s*target\[\d+\]:\s*pc=(0x[0-9a-fA-F]+)')
+_INSN_RE = re.compile(r'^\s+([0-9a-fA-F]{16}):\s+(.*)$')
+
+
+def canon_user_slice(build: Path, cst: Path) -> str:
+    """Canonical CP-user-slice of a system trace's template dump: for every
+    CP-executed user BB (exec_cp > 0, start_pc < SYS_USER_MAX), emit its
+    id-stripped header, its user-range branch targets (counts dropped), and
+    its decoded instruction lines (profile annotations dropped), sorted by
+    start_pc.  Everything nondeterministic across boots -- kernel BBs, WP-only
+    user BBs, exec/profile counts, BB-ids, kernel branch targets -- is masked.
+    Byte-identical across independent boots (the determinism verdict above)."""
+    txt = decode_text(build, cst, "templates")
+    blocks: dict[int, list[str]] = {}
+    cur = None
+    cur_lines: list[str] = []
+    cur_user = False
+    exec_cp = 0
+
+    def flush() -> None:
+        if cur is not None and cur_user and exec_cp > 0:
+            blocks[cur] = cur_lines
+
+    for line in txt.splitlines():
+        m = _BB_RE.match(line)
+        if m:
+            flush()
+            cur = int(m.group(2), 16)
+            cur_user = cur < SYS_USER_MAX
+            exec_cp = 0
+            cur_lines = [f"BB {m.group(2)} insns={m.group(3)} "
+                         f"fall_through={m.group(4)}"]
+            continue
+        if cur is None or not cur_user:
+            continue
+        mp = _PROFILE_RE.match(line)
+        if mp:
+            exec_cp = int(mp.group(1))
+            continue
+        mt = _TARGET_RE.match(line)
+        if mt:
+            if int(mt.group(1), 16) < SYS_USER_MAX:
+                cur_lines.append(f"  target pc={mt.group(1)}")
+            continue
+        mi = _INSN_RE.match(line)
+        if mi:
+            body = re.sub(r'\s*prof:.*$', '', mi.group(2)).rstrip()
+            cur_lines.append(f"  {mi.group(1)}: {body}")
+    flush()
+    out: list[str] = []
+    for pc in sorted(blocks):
+        out.extend(blocks[pc])
+    return "\n".join(out) + "\n"
+
+
+# --- system recipe runner ---------------------------------------------------
+def _set_vmem():
+    resource.setrlimit(resource.RLIMIT_AS, (SYS_VMEM_KB * 1024,
+                                            SYS_VMEM_KB * 1024))
+
+
+def sys_assets(freeze: bool):
+    """Resolve the (kernel, initrd) to boot.  On @freeze (capture), copy the
+    default local assets into sysfixtures/ so check runs against stable frozen
+    copies; otherwise read the already-frozen copies (falling back to the
+    defaults).  Returns (kernel, initrd) or (None, None) when unavailable."""
+    fk = SYS_FIXTURES_DIR / "kernel"
+    fi = SYS_FIXTURES_DIR / "initrd.cpio.gz"
+    if freeze:
+        if not (SYS_KERNEL_DEFAULT.exists() and SYS_INITRD_DEFAULT.exists()):
+            return None, None
+        SYS_FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(SYS_KERNEL_DEFAULT, fk)
+        shutil.copyfile(SYS_INITRD_DEFAULT, fi)
+        return fk, fi
+    if fk.exists() and fi.exists():
+        return fk, fi
+    if SYS_KERNEL_DEFAULT.exists() and SYS_INITRD_DEFAULT.exists():
+        return SYS_KERNEL_DEFAULT, SYS_INITRD_DEFAULT
+    return None, None
+
+
+def sys_qemu_system_bin(build: Path) -> Path:
+    return build / "qemu-system-x86_64"
+
+
+def sys_trace_once(build: Path, kernel: Path, initrd: Path, out_dir: Path,
+                   label: str) -> Path | None:
+    """Boot the canonical system recipe once with the plugin loaded, tracing
+    to <out_dir>/<label>.cst.  Returns the .cst path, or None on failure."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    scratch = out_dir / f"{label}.scratch.raw"
+    with open(scratch, "wb") as f:               # fresh zero-filled disk
+        f.truncate(SYS_SCRATCH_BYTES)
+    plugin = build / "contrib" / "plugins" / "libchampsim_tracer.so"
+    out_base = out_dir / label
+    cmd = [
+        "taskset", "-c", SYS_CPU, str(sys_qemu_system_bin(build)),
+        "-cpu", SYS_CPU_MODEL, "-nographic", "-no-reboot", "-m", SYS_MEM,
+        "-kernel", str(kernel), "-initrd", str(initrd),
+        "-append", SYS_APPEND,
+        "-drive", f"file={scratch},format=raw,if=none,id=vblk0",
+        "-device", "virtio-blk-pci,drive=vblk0,ioeventfd=off",
+        "-plugin", f"{plugin},outfile={out_base},{SYS_PLUGIN_OPTS}",
+    ]
+    log = out_dir / f"{label}.run.log"
+    with open(log, "w") as f:
+        try:
+            rc = subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT,
+                                 timeout=SYS_TIMEOUT, preexec_fn=_set_vmem)
+        except subprocess.TimeoutExpired:
+            print(f"  sys trace {label}: TIMEOUT after {SYS_TIMEOUT}s")
+            return None
+    cst = Path(f"{out_base}.cst")
+    if rc != 0 or not cst.is_file():
+        print(f"  sys trace {label}: FAIL rc={rc} (see {log})")
+        return None
+    return cst
+
+
+def sys_capture(build: Path, root: Path) -> int:
+    if SYS_MANIFEST.exists():
+        SYS_MANIFEST.unlink()
+    if root.exists():
+        shutil.rmtree(root)
+    GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
+    manifest = {"work_root": str(root), "recipe": {}, "canon_cells": {},
+                "fixture_decode": {}, "excluded": {}}
+    bad = 0
+
+    # (1) fixture-decode net: triple-hash the frozen system fixture's decode.
+    for fx in SYS_DECODE_FIXTURES:
+        cst = FIXTURES_DIR / fx["file"]
+        if not cst.exists():
+            manifest["excluded"][f"decode:{fx['name']}"] = "fixture missing"
+            print(f"  EXCLUDE decode:{fx['name']}: {cst} missing")
+            bad += 1
+            continue
+        h0 = triple_hash(build, cst)
+        h1 = triple_hash(build, cst)             # GREEN-twice (decoder)
+        if h0 != h1:
+            manifest["excluded"][f"decode:{fx['name']}"] = "decode not stable"
+            print(f"  EXCLUDE decode:{fx['name']}: decode nondeterministic")
+            bad += 1
+            continue
+        manifest["fixture_decode"][fx["name"]] = h0
+        print(f"  decode:{fx['name']}: stable triple-hash")
+
+    # (2) canon-retrace net: boot the recipe N_DET times; record only if the
+    # CP-user-slice is byte-identical across the runs (GREEN-twice).
+    kernel, initrd = sys_assets(freeze=True)
+    if kernel is None:
+        for c in SYS_CELLS:
+            manifest["excluded"][f"canon:{c['name']}"] = "system assets absent"
+        print("  canon-retrace: SKIP (no local kernel/initrd; set "
+              "CST_SYS_KERNEL / CST_SYS_INITRD)")
+    else:
+        manifest["recipe"] = {
+            "kernel_sha": sha(kernel.read_bytes()),
+            "initrd_sha": sha(initrd.read_bytes()),
+            "cpu": SYS_CPU_MODEL, "append": SYS_APPEND,
+            "plugin_opts": SYS_PLUGIN_OPTS, "mem": SYS_MEM,
+        }
+        for c in SYS_CELLS:
+            name = c["name"]
+            hs = []
+            for i in range(SYS_N_DET):
+                cst = sys_trace_once(build, kernel, initrd, root / name,
+                                     f"{name}_{i}")
+                hs.append(sha(canon_user_slice(build, cst).encode())
+                          if cst else None)
+            if any(h is None for h in hs):
+                manifest["excluded"][f"canon:{name}"] = "trace not produced"
+                print(f"  EXCLUDE canon:{name}: trace missing")
+                bad += 1
+                continue
+            if any(h != hs[0] for h in hs[1:]):
+                manifest["excluded"][f"canon:{name}"] = \
+                    f"CP-user-slice nondeterministic over {SYS_N_DET} runs"
+                print(f"  EXCLUDE canon:{name}: NONDETERMINISTIC user-slice")
+                bad += 1
+                continue
+            manifest["canon_cells"][name] = {"canon": hs[0]}
+            print(f"  canon:{name}: deterministic CP-user-slice")
+
+    SYS_MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    print(f"\ncaptured {len(manifest['fixture_decode'])} decode + "
+          f"{len(manifest['canon_cells'])} canon cells, "
+          f"{len(manifest['excluded'])} excluded -> {SYS_MANIFEST}")
+    return 1 if bad else 0
+
+
+def sys_check(build: Path, root: Path) -> int:
+    if not SYS_MANIFEST.exists():
+        print(f"no system manifest at {SYS_MANIFEST}; run "
+              f"`capture --system` first", file=sys.stderr)
+        return 2
+    manifest = json.loads(SYS_MANIFEST.read_text())
+    cap_root = manifest.get("work_root")
+    if cap_root is not None and cap_root != str(root):
+        print(f"work-root mismatch: manifest captured under {cap_root}, "
+              f"check invoked under {root}.  Re-run with "
+              f"--work-root {Path(cap_root).parent} or re-capture.",
+              file=sys.stderr)
+        return 2
+    if root.exists():
+        shutil.rmtree(root)
+    fails = []
+
+    # (1) fixture-decode net.
+    for fx in SYS_DECODE_FIXTURES:
+        want = manifest.get("fixture_decode", {}).get(fx["name"])
+        if want is None:
+            continue
+        cst = FIXTURES_DIR / fx["file"]
+        if not cst.exists():
+            fails.append(f"decode:{fx['name']}: fixture missing ({cst})")
+            continue
+        got = triple_hash(build, cst)
+        if got != want:
+            moved = [k for k in want if got.get(k) != want[k]]
+            fails.append(f"decode:{fx['name']}: decode hash mismatch {moved}")
+
+    # (2) canon-retrace net.
+    canon_cells = manifest.get("canon_cells", {})
+    if canon_cells:
+        kernel, initrd = sys_assets(freeze=False)
+        if kernel is None:
+            fails.append("canon: system assets absent at check "
+                         "(kernel/initrd) -- cannot verify")
+        else:
+            for c in SYS_CELLS:
+                name = c["name"]
+                want = canon_cells.get(name)
+                if want is None:
+                    continue
+                cst = sys_trace_once(build, kernel, initrd, root / name,
+                                     f"{name}_chk")
+                if cst is None:
+                    fails.append(f"canon:{name}: trace not produced")
+                    continue
+                got = sha(canon_user_slice(build, cst).encode())
+                if got != want["canon"]:
+                    fails.append(f"canon:{name}: CP-user-slice mismatch "
+                                 f"(plugin trace-generation changed)")
+
+    if fails:
+        print("\n=== SYSTEM GOLDEN NET FAILED ===")
+        for f in fails:
+            print(f"  {f}")
+        return 1
+    print(f"\nSYSTEM GOLDEN NET GREEN: "
+          f"{len(manifest.get('fixture_decode', {}))} decode + "
+          f"{len(canon_cells)} canon cells byte-identical")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("mode", choices=("capture", "check"))
     ap.add_argument("--build-dir", type=Path, required=True)
+    ap.add_argument("--system", action="store_true",
+                    help="operate on the SYSTEM-mode cells (separate manifest "
+                         "manifest_system.json): the frozen-fixture decoder "
+                         "guard and the normalized CP-user-slice re-trace "
+                         "guard.  A full-system boot is not byte-deterministic "
+                         "(see the module notes); this net byte-compares the "
+                         "proven-invariant slices only.")
     # Default matches the full harness's canonical GOLDEN_WORK_ROOT
     # (validator/_full.py).  The work-root path appears in the qemu argv
     # AND on the guest stack (argv[0] + AT_EXECFN), so its LENGTH shifts
@@ -449,6 +814,18 @@ def main() -> int:
     # capture and check MUST use the identical trace path so the qemu argv
     # (and thus the guest stack base / initial REG_SP) matches.
     shared = args.work_root / "t"
+    if args.system:
+        # System-mode net: its own manifest + recorded work root.  The system
+        # trace path does NOT feed a guest stack (the workload is staged in
+        # the initramfs, not passed via argv), so the canon slice is path-
+        # independent; the root is still recorded/enforced for provenance.
+        if not sys_qemu_system_bin(build).exists():
+            print(f"qemu-system-x86_64 not found under {build}; build it first",
+                  file=sys.stderr)
+            return 2
+        sys_root = args.work_root / "sys"
+        return sys_capture(build, sys_root) if args.mode == "capture" \
+            else sys_check(build, sys_root)
     if args.mode == "capture":
         return capture(build, shared)
     return check(build, shared)

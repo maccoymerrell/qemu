@@ -1026,11 +1026,35 @@ void emit_disasm_memops(std::string &line, const DisasmContext &ctx,
     }
 }
 
-/* "  # 0x<pc> <symbol>" when a branch insn has a resolved target. */
+/* "  # 0x<pc> <symbol>" when a branch insn has a resolved target.
+ *
+ * Source of truth is the ENCODED per-entry branch target (CST_FID_BRANCH_*),
+ * attached by render_entry_disasm to the terminating branch insn.  It is the
+ * true architectural successor, so it is right where an immediate-derived
+ * guess is wrong: ARM tbz/tbnz (whose immediate is a bit index, not the
+ * label) and any branch diverted by a fault/interrupt.  The symbol is looked
+ * up from a template starting at that PC, if one is in the window.  Only when
+ * the trace predates the branch FIDs (branch_outcome_valid == false) do we
+ * fall back to the immediate-based branch_target_template. */
 void emit_disasm_branch_target(std::string &line, const DisasmContext &ctx,
                                const cst::Instruction &insn)
 {
     if (branch_is_none(*ctx.h, insn.branch_type)) return;
+    if (insn.branch_outcome_valid) {
+        line.append("  # 0x");
+        append_hex(&line, insn.branch_outcome_target);
+        /* branch_target_template was resolved to the encoded target's PC by
+         * render_entry_disasm; use it only for the <symbol> suffix, and only
+         * if it really starts at that PC. */
+        const cst::Template *tgt = insn.branch_target_template;
+        if (tgt && tgt->start_pc == insn.branch_outcome_target &&
+            !tgt->symbol_name.empty()) {
+            line.append(" <");
+            line.append(tgt->symbol_name);
+            line.push_back('>');
+        }
+        return;
+    }
     if (!insn.branch_target_template) return;
     line.append("  # 0x");
     append_hex(&line, insn.branch_target_template->start_pc);
@@ -1515,8 +1539,22 @@ void render_entry_disasm(FILE *out, const DisasmContext &ctx,
             (insn.is_wp && (int)insns[i + 1].wp_index != (int)insn.wp_index);
 
         if (!insn.is_wp) {
-            if (is_last_of_group && !insn.branch_target_template) {
-                insn.branch_target_template = cp_fallback;
+            if (is_last_of_group) {
+                /* Source of truth for the terminal branch's direction/target
+                 * is the encoded CST_FID_BRANCH_* outcome; resolve the target
+                 * template at the encoded successor PC so tbz/tbnz (bit-index
+                 * immediate) and fault-diverted branches annotate correctly.
+                 * cp_fallback (immediate-based) is only the pre-FID fallback. */
+                if (e.branch.valid) {
+                    insn.branch_outcome_valid  = true;
+                    insn.branch_outcome_taken  = e.branch.taken;
+                    insn.branch_outcome_target = e.branch.target;
+                    insn.branch_target_template =
+                        find_template_by_start_pc(*ctx.templates,
+                                                  e.branch.target);
+                } else if (!insn.branch_target_template) {
+                    insn.branch_target_template = cp_fallback;
+                }
             }
             render_disasm_insn(out, ctx, insn, /*wp_status=*/nullptr);
             continue;
@@ -1530,9 +1568,23 @@ void render_entry_disasm(FILE *out, const DisasmContext &ctx,
                                   count_wp_run_length(insns, i), wp_status);
         }
 
-        if (is_last_of_group && !insn.branch_target_template) {
-            insn.branch_target_template = find_next_wp_run_template(
-                insns, i, cur_wp_run, *ctx.by_id, *ctx.templates);
+        if (is_last_of_group) {
+            /* Encoded WP branch outcome (per WP chain block) is the source
+             * of truth, mirroring the CP path; the next-WP-run template is
+             * the pre-FID fallback. */
+            const cst::WPEntry *wp = insn.wp_index < e.wp_entries.size()
+                ? &e.wp_entries[insn.wp_index] : nullptr;
+            if (wp && wp->branch.valid) {
+                insn.branch_outcome_valid  = true;
+                insn.branch_outcome_taken  = wp->branch.taken;
+                insn.branch_outcome_target = wp->branch.target;
+                insn.branch_target_template =
+                    find_template_by_start_pc(*ctx.templates,
+                                              wp->branch.target);
+            } else if (!insn.branch_target_template) {
+                insn.branch_target_template = find_next_wp_run_template(
+                    insns, i, cur_wp_run, *ctx.by_id, *ctx.templates);
+            }
         }
 
         render_disasm_insn(out, ctx, insn,

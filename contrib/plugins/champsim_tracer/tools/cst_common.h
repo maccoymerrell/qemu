@@ -457,6 +457,21 @@ struct Instruction {
     bool                  wp_has_fault_idx        = false;
     uint32_t              wp_fault_insn_index     = 0;
 
+    /* Dynamic terminal-branch outcome from the CST_FID_BRANCH_TAKEN /
+     * _TARGET singletons, attached by the renderer to the entry's (or WP
+     * run's) terminating branch insn.  When @branch_outcome_valid, the
+     * disassembly annotates the ENCODED architectural successor
+     * (@branch_outcome_target — the taken target, or the fall-through when
+     * not taken) instead of an immediate-derived guess.  This is the source
+     * of truth: it is correct for ISAs whose branch immediate is not a
+     * target displacement (ARM tbz/tbnz encode a bit index, not the label)
+     * and under fault/interrupt diversions.  Left invalid on pre-branch-FID
+     * traces, where the immediate-based branch_target_template is the
+     * fallback. */
+    bool                  branch_outcome_valid    = false;
+    bool                  branch_outcome_taken    = false;
+    uint64_t              branch_outcome_target   = 0;
+
     /* Dynamic per-instance data, already filtered to this insn. */
     std::vector<DynParam>       dyn_params;
     std::vector<RegSnap>        reg_snaps;

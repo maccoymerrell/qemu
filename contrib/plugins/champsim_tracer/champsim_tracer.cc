@@ -2099,13 +2099,16 @@ static char *segment_label = nullptr;  /* g_strdup'd, freed at finish */
  * (one per equal icount interval) mirroring g_stats bumps, walked at
  * finish for per-interval breakdowns.
  *
- * g_current_hist_bucket points into g_histogram_buckets, refreshed at
+ * g_current_hist_bucket points into g_hist.buckets, refreshed at
  * the top of vcpu_tb_exec; null when inactive/disabled so attribution
  * sites collapse to one nullable check. */
-static unsigned int g_histogram_intervals = 0;
-static std::vector<Stats> g_histogram_buckets;
-static uint64_t g_histogram_interval_size = 0;
-static uint64_t g_histogram_segment_start = 0;
+struct HistogramState {
+    unsigned int intervals = 0;      /* configured interval count (0 == off) */
+    std::vector<Stats> buckets;      /* one Stats per interval, per segment */
+    uint64_t interval_size = 0;      /* insns per interval */
+    uint64_t segment_start = 0;      /* icount at segment open */
+};
+static HistogramState g_hist;
 Stats *g_current_hist_bucket = nullptr;  /* extern in stats.h */
 
 /* append_stats_summary / append_histogram now live in
@@ -2326,17 +2329,17 @@ static void start_trace_segment(const char *label,
     /* One Stats per interval, zero-init.  Interval size rounds up so
      * the last bucket absorbs the remainder; lookup clamps so a late
      * icount past stop still maps into it. */
-    if (g_histogram_intervals > 0 && span > 0) {
-        g_histogram_buckets.assign(g_histogram_intervals, Stats{});
-        g_histogram_interval_size =
-            (span + g_histogram_intervals - 1) / g_histogram_intervals;
-        if (g_histogram_interval_size == 0) {
-            g_histogram_interval_size = 1;
+    if (g_hist.intervals > 0 && span > 0) {
+        g_hist.buckets.assign(g_hist.intervals, Stats{});
+        g_hist.interval_size =
+            (span + g_hist.intervals - 1) / g_hist.intervals;
+        if (g_hist.interval_size == 0) {
+            g_hist.interval_size = 1;
         }
-        g_histogram_segment_start = start;
+        g_hist.segment_start = start;
     } else {
-        g_histogram_buckets.clear();
-        g_histogram_interval_size = 0;
+        g_hist.buckets.clear();
+        g_hist.interval_size = 0;
     }
     g_current_hist_bucket = nullptr;
 
@@ -2369,16 +2372,16 @@ static void start_trace_segment(const char *label,
  * or no segment is active.  Caller holds exec_lock. */
 static Stats *select_histogram_bucket(uint64_t icount)
 {
-    if (g_histogram_buckets.empty() || g_histogram_interval_size == 0) {
+    if (g_hist.buckets.empty() || g_hist.interval_size == 0) {
         return nullptr;
     }
-    uint64_t off = icount > g_histogram_segment_start
-        ? icount - g_histogram_segment_start : 0;
-    size_t idx = (size_t)(off / g_histogram_interval_size);
-    if (idx >= g_histogram_buckets.size()) {
-        idx = g_histogram_buckets.size() - 1;
+    uint64_t off = icount > g_hist.segment_start
+        ? icount - g_hist.segment_start : 0;
+    size_t idx = (size_t)(off / g_hist.interval_size);
+    if (idx >= g_hist.buckets.size()) {
+        idx = g_hist.buckets.size() - 1;
     }
-    return &g_histogram_buckets[idx];
+    return &g_hist.buckets[idx];
 }
 
 /* True when the window budget runs on the pinned process's user-space
@@ -2893,11 +2896,11 @@ static void finish_trace_segment(void)
                                              segment_label ? segment_label
                                                            : "trace");
     append_stats_summary(report, label, seg_stats);
-    if (!g_histogram_buckets.empty()) {
+    if (!g_hist.buckets.empty()) {
         append_histogram(report, label,
-                         g_histogram_buckets,
-                         g_histogram_segment_start,
-                         g_histogram_interval_size);
+                         g_hist.buckets,
+                         g_hist.segment_start,
+                         g_hist.interval_size);
     }
     qemu_plugin_outs(report->str);
 }
@@ -6331,7 +6334,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         ? g_features.mem_data : (cfg.wp_mem_data != 0);
     g_features.wp_reg_data   = (cfg.wp_reg_data < 0)
         ? g_features.reg_data : (cfg.wp_reg_data != 0);
-    g_histogram_intervals = cfg.histogram_intervals > 0
+    g_hist.intervals = cfg.histogram_intervals > 0
         ? (unsigned int)cfg.histogram_intervals : 0;
     g_features.iframe_rate         = cfg.iframe_rate;
     simpoint_interval_insns = cfg.simpoint_interval;

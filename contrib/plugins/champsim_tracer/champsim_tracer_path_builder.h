@@ -99,6 +99,7 @@ void emit_body_entry(BodyStreamState *out_stream,
  * merge re-injection) and stamps the emit-time fault trailer values
  * emit_body_entry reads. */
 extern thread_local uint32_t g_emit_fault_depth CST_TLS_HOT;
+extern thread_local uint64_t g_dbg_last_emit_seq;
 extern thread_local std::vector<uint32_t> g_emit_fault_anchors CST_TLS_HOT;
 extern thread_local std::vector<RegSnap> pending_reg_snaps CST_TLS_HOT;
 

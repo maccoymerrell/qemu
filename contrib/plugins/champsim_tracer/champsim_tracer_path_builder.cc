@@ -1153,8 +1153,27 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
          * but that privilege boundary is already exempted by the nesting
          * check as a documented approximation. */
         if (fault_on && in.pinned && in.live_priv == 0) {
+            uint32_t leaked = 0;
             for (CtxFrame &f : frames_) {
+                if (!f.returned) {
+                    leaked++;
+                    if (pb_diag()) {
+                        fprintf(stderr, "[pathbuilder] RETIRE-LEAK user_tb=0x%"
+                                PRIx64 " frame full=0x%" PRIx64 " resume=0x%"
+                                PRIx64 " frame_depth=%u\n",
+                                in.cur ? in.cur->start_pc : 0,
+                                f.full_tmpl ? f.full_tmpl->start_pc : 0,
+                                f.resume_pc, f.depth);
+                    }
+                }
                 f.returned = true;
+            }
+            /* One-line summary: a user TB retiring >1 un-returned frame at
+             * once is exactly the residual 2->0 leak-drain discontinuity. */
+            if ((pb_diag() || pb_depth_diag()) && leaked > 1) {
+                fprintf(stderr, "[pathbuilder] RETIRE-LEAK-BURST user_tb=0x%"
+                        PRIx64 " count=%u (inflight drops %u->0)\n",
+                        in.cur ? in.cur->start_pc : 0, leaked, leaked);
             }
         }
         uint32_t pinned_inflight = 0;
@@ -1164,14 +1183,25 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
             }
         }
         depth_next_ = pinned_inflight;
-        if (pb_depth_diag()) {
-            fprintf(stderr, "[depthdiag] cur=0x%" PRIx64 " walk_prev=0x%"
-                    PRIx64 " raw=%u inflight=%u depth_next=%u "
-                    "walk_depth=%u frames=%zu\n",
+        /* Skip the pure user/steady-state (depth 0, no frames, prev depth 0)
+         * UNLESS the current TB is a REP string op (rep_subtmpl), whose
+         * fanned-out emit is the residual jump's locus: keep every step that
+         * carries excursion context or a REP so the per-step log stays small
+         * yet captures the interleave.  g_dbg_last_emit_seq ties the step to
+         * the wire position. */
+        bool cur_is_rep = in.cur && in.cur->rep_subtmpl.ptr != nullptr;
+        if (pb_depth_diag() &&
+            (cur_is_rep ||
+             !(depth_next_ == 0 && walk_depth_ == 0 && prev_depth_ == 0 &&
+               frames_.empty()))) {
+            fprintf(stderr, "[depthdiag] seq~%" PRIu64 " cur=0x%" PRIx64
+                    " walk_prev=0x%" PRIx64 " priv=%d rep=%d raw=%u inflight=%u "
+                    "depth_next=%u prev_depth=%u walk_depth=%u frames=%zu\n",
+                    g_dbg_last_emit_seq,
                     in.cur ? in.cur->start_pc : 0,
-                    walk_prev_ ? walk_prev_->start_pc : 0,
-                    raw_depth_, pinned_inflight, depth_next_,
-                    walk_depth_, frames_.size());
+                    walk_prev_ ? walk_prev_->start_pc : 0, in.live_priv,
+                    (int)cur_is_rep, raw_depth_, pinned_inflight, depth_next_,
+                    prev_depth_, walk_depth_, frames_.size());
         }
     }
 

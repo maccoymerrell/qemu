@@ -1625,6 +1625,10 @@ static void devio_stop_cb(uint64_t request_id)
  * >=1 = fault-handler code at that nesting. */
 thread_local uint32_t g_emit_fault_depth CST_TLS_HOT = 0;
 
+/* CST diag correlation: the seq_num of the most recent body entry emitted on
+ * this thread, so the per-step depth diag can be tied to a wire position. */
+thread_local uint64_t g_dbg_last_emit_seq = 0;
+
 /* Anchors (faulting-insn indices) for the whole-BB merge emit currently in
  * flight; read by emit_body_entry into the entry's fault trailer. */
 thread_local std::vector<uint32_t> g_emit_fault_anchors CST_TLS_HOT;
@@ -2480,6 +2484,7 @@ void emit_body_entry(BodyStreamState *out_stream,
 
     BodyEntry entry;
     entry.seq_num = g_trace_segments.next_seq_num();
+    g_dbg_last_emit_seq = entry.seq_num;
     entry.template_id = bb_tmpl ? bb_tmpl->template_id : 0;
     entry.dyn_params.reserve(g_mem_recorder.cp_count());
     entry.wp_entries = std::move(wp_entries);
@@ -2700,6 +2705,20 @@ void emit_body_entry(BodyStreamState *out_stream,
                 sub_e.asid_index  = entry.asid_index;
                 sub_e.ctx_asid_index = entry.ctx_asid_index;
                 sub_e.cpu_index   = entry.cpu_index;
+                /* The system-mode fault-nesting depth is a property of the
+                 * excursion the whole REP instruction runs inside, so every
+                 * fanned-out iteration inherits iter 1's depth.  Without this
+                 * the sub-entries default to depth 0: a REP string op (a
+                 * kernel memset/memcpy) executed inside a fault handler then
+                 * emits depth-0 iterations amid its depth-D neighbours,
+                 * fabricating a D->0->D step that the syscall_fault_nesting
+                 * oracle flags whenever D>1 (the residual 2->0/0->2 kernel
+                 * "spin loop" — actually a rep stosq — under churn, where a
+                 * leaked handler frame has inflated the excursion to depth 2).
+                 * fault_anchors stay iter-1 only (they mark the faulting insn
+                 * indices of the merged faulting BB, not a per-iteration
+                 * property). */
+                sub_e.fault_depth = entry.fault_depth;
                 sub_e.branch_successor_known = rep_exit_known;
                 sub_e.dyn_params.reserve(mpi);
                 /* Dedup case: a 1-insn REP BB (its start_pc IS the REP PC)

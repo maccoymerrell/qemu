@@ -9,10 +9,10 @@ instruction with ``CST_WP_EVENT_FAULT`` (a synthetic-data fault at
 ``fault_insn_index``), and CONTINUES speculating to the ``wpdepth`` budget.
 This holds symmetrically in user and system mode.
 
-This retires the previous poison + ``CST_WP_EVENT_DEP_BRANCH_KILL`` policy,
-which truncated the excursion at the first branch dependent on the faulted
-load.  A wrong-path chain must therefore now carry FAULT (never
-DEP_BRANCH_KILL) and run PAST the faulting block.
+This retires the previous poison + dep-branch-kill policy, which truncated
+the excursion at the first branch dependent on the faulted load.  A
+wrong-path chain must therefore now carry FAULT and run PAST the faulting
+block.
 
 Only a FRONT-end fault (translation-unavailable / can't-fetch) still stops
 the excursion.  A NON-memory EXECUTION-TIME fault -- an x86 divide-by-zero
@@ -32,7 +32,8 @@ SIGSEGV/SIGFPE leak would abort it instead).
 For the wild-load cases the fall-through continues with a straight-line
 arithmetic sled past the ``wpdepth`` budget, so the marked wrong-path block
 runs to the budget rather than truncating.  This FAILS against a pre-fix
-build (which emits DEP_BRANCH_KILL and truncates) and PASSES post-fix.
+build (which truncated at the first fault-dependent branch) and PASSES
+post-fix.
 Point it at any build with ``CST_BUILD_DIR=/path/to/build``.  The x86-64
 cases are required (the host ISA is always buildable); other ISAs are
 best-effort and skipped when their cross toolchain or qemu-<isa> binary is
@@ -259,12 +260,8 @@ def _assert_wildload_synthetic(isa: str):
         f"{isa}: wrong-path wild load was NOT marked FAULT "
         f"(blocks={[b['status'] for b in blocks]}); a bad speculative load "
         f"must be tagged a synthetic-data fault.")
-    # (b) it does NOT truncate: no DEP_BRANCH_KILL, and the excursion runs to
-    # the wpdepth budget (the marked block continues on placeholder data).
-    assert not _has(blocks, "DEP_BRANCH_KILL"), (
-        f"{isa}: retired DEP_BRANCH_KILL still emitted "
-        f"(blocks={[b['status'] for b in blocks]}); wrong-path memory faults "
-        f"must continue, not squash at the dependent branch.")
+    # (b) it does NOT truncate: the excursion runs to the wpdepth budget
+    # (the marked block continues on placeholder data).
     total = sum(b["n_insns"] for b in blocks)
     assert total >= WPDEPTH // 2, (
         f"{isa}: wrong-path excursion truncated early (total WP insns "
@@ -293,8 +290,6 @@ def test_x86_divzero_synthetic():
         "x86_64: wrong-path divide-by-zero was NOT marked FAULT "
         f"(blocks={[b['status'] for b in blocks]}); an arithmetic wrong-path "
         "trap must be tagged a synthetic fault just like a bad load.")
-    assert not _has(blocks, "DEP_BRANCH_KILL"), (
-        "x86_64: retired DEP_BRANCH_KILL still emitted for divzero")
     total = sum(b["n_insns"] for b in blocks)
     assert total >= WPDEPTH // 2, (
         f"x86_64: wrong-path divide-by-zero excursion truncated early (total "
@@ -307,7 +302,7 @@ def test_x86_wildload_no_mark_under_cst_no_fault():
     # A/B control: CST_NO_FAULT disables the synthetic-fault marking, so the
     # bad load still runs on placeholder data but the block is NOT marked.
     # This both proves the marking is what the policy produces and mirrors the
-    # pre-policy shape (no FAULT, no DEP_BRANCH_KILL).
+    # pre-policy shape (no FAULT event at all).
     reason = _toolchain_ready("x86_64")
     if reason:
         raise unittest.SkipTest(reason)
@@ -315,8 +310,6 @@ def test_x86_wildload_no_mark_under_cst_no_fault():
     assert not _has(blocks, "FAULT"), (
         "x86_64: CST_NO_FAULT must disable synthetic-fault marking, but a "
         f"FAULT event was emitted (blocks={[b['status'] for b in blocks]})")
-    assert not _has(blocks, "DEP_BRANCH_KILL"), (
-        "x86_64: DEP_BRANCH_KILL is retired and must never be emitted")
 
 
 # ---- best-effort (skipped when cross toolchain / qemu-<isa> absent) -------

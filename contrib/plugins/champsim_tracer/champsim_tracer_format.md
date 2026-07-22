@@ -1305,14 +1305,9 @@ result — it currently ends the chain cleanly at its marked block rather
 than continuing; such a block is the chain's last, distinguished from a
 memory fault only by being terminal.
 
-Bit 2 of `ev_flags` is **reserved** and never set.  It formerly carried
-`CST_WP_EVENT_DEP_BRANCH_KILL`, a terminator emitted when a fault
-poisoned a register whose value a later branch consumed; that policy is
-retired now that wrong-path faults continue on synthetic data instead of
-squashing at the first dependent branch.  Traces written before the bit
-was retired may list `CST_WP_EVENT_DEP_BRANCH_KILL` in their
-`wp_event_flag` encoding map; readers resolve it optionally and treat it
-as an excursion terminator on the block it addresses.
+Bit 2 of `ev_flags` is **free** — unassigned, available for a future
+event flag.  Writers write it 0 and readers ignore it, per the
+reserved-bits rule ("Format Stability and Conformance").
 
 The event index space extends one convention beyond the chain: a
 resolved index `>= num_wp` does not address any encoded wrong-path

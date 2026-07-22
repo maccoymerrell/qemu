@@ -251,12 +251,8 @@ extern "C" {
  * non-memory synchronous faults — arithmetic / illegal-opcode — pending the
  * arithmetic pass).  See champsim_tracer_format.md §4.4. */
 #define CST_WP_EVENT_FAULT               (1u << 1)
-/* DEPRECATED / RETIRED (bit 2 reserved, never emitted): formerly marked an
- * excursion terminated at a branch dependent on a faulted wrong-path insn
- * (the poison + dep-branch-kill policy).  That policy is retired — wrong-path
- * memory faults now continue on synthetic data instead of squashing at the
- * first dependent branch.  Kept defined for decoder back-compat only. */
-#define CST_WP_EVENT_DEP_BRANCH_KILL     (1u << 2)
+/* Bit 2 is free — unassigned, reserved for a future event flag.  Writers
+ * write it 0; readers ignore it (reserved-bits rule, format.md). */
 
 /* Header feature flags.  MEM_DATA / REG_DATA advise which optional
  * field-ID families may appear (the field IDs still determine actual

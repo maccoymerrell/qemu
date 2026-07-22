@@ -1364,10 +1364,6 @@ std::string compute_wp_status(const cst::Instruction &insn)
         if (!out.empty()) out += ",";
         out += "TRANSLATION_UNAVAILABLE";
     }
-    if (insn.wp_dep_branch_kill) {
-        if (!out.empty()) out += ",";
-        out += "DEP_BRANCH_KILL";
-    }
     return out;
 }
 
@@ -2196,9 +2192,6 @@ std::string compute_legacy_wp_status(const cst::WPEntry &wp)
     }
     if (wp.translation_unavailable) {
         parts.push_back("TRANSLATION_UNAVAILABLE");
-    }
-    if (wp.dep_branch_kill) {
-        parts.push_back("DEP_BRANCH_KILL");
     }
     std::string out;
     for (size_t i = 0; i < parts.size(); i++) {

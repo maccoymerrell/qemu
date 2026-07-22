@@ -3392,8 +3392,8 @@ def _check_wrong_path_chains(entries: list[dict],
     surfaced as a notable INFO issue naming the branch and target.
 
     Wrong-path fault policy (architecture.rst "Wrong-path chain
-    termination", live since 2026-07-12; the poison/DEP_BRANCH_KILL
-    policy this once replayed was RETIRED — commits 18bbec8956,
+    termination", live since 2026-07-12; the poison/dep-branch-kill
+    policy this once replayed was retired — commits 18bbec8956,
     914d452978, 7b69c88aa4).  On a mispredicted path nothing retires, so
     a back-end synchronous fault is never actually taken: the tracer
     serves the faulting instruction deterministic placeholder data,
@@ -4561,56 +4561,21 @@ def _check_wp_events(body_stats: dict,
 
     Walking ensures the writer's runtime counter agrees with the
     per-WP-entry payload that was actually encoded.
-
-    Also lints CST_WP_EVENT_DEP_BRANCH_KILL structurally as a
-    BACK-COMPAT guard only: the flag is RETIRED (bit 2 reserved, never
-    emitted by the live plugin since 2026-07-12), so ``walk_kills`` is 0
-    on any current trace and no verdict here keys off the live policy.
-    A legacy trace that still carries the flag is held to its old
-    contract — the kill is an excursion terminator, so it may only
-    appear on a chain's last entry and only with a FAULT at/before it —
-    per format.md §4.4 (readers resolve the retired bit optionally).
     """
     walk_faults  = 0
     walk_translu = 0
-    walk_kills   = 0
-    kill_issues: list[Issue] = []
     for e in cp_entries:
         wps = e.get("wp_entries") or []
-        first_fault = None
-        for wi, wp in enumerate(wps):
+        for wp in wps:
             if wp.get("fault"):
                 walk_faults += 1
-                if first_fault is None:
-                    first_fault = wi
             if wp.get("translation_unavailable"):
                 walk_translu += 1
-            if wp.get("dep_branch_kill"):
-                walk_kills += 1
-                if wi != len(wps) - 1:
-                    kill_issues.append(Issue(
-                        "wp_events", "error",
-                        f"entry seq={e.get('seq_num')}: DEP_BRANCH_KILL "
-                        f"on chain entry {wi} of {len(wps)} — the kill "
-                        f"is an excursion terminator and must be the "
-                        f"chain's last entry",
-                        {"seq_num": e.get("seq_num"), "kill_at": wi,
-                         "n_wp": len(wps)},
-                    ))
-                elif first_fault is None:
-                    kill_issues.append(Issue(
-                        "wp_events", "error",
-                        f"entry seq={e.get('seq_num')}: DEP_BRANCH_KILL "
-                        f"with no FAULT at/before it in the chain — a "
-                        f"dependent-branch kill requires a faulted "
-                        f"instruction upstream",
-                        {"seq_num": e.get("seq_num"), "kill_at": wi},
-                    ))
 
     body_faults  = int(body_stats.get("fault_count", 0))
     body_translu = int(body_stats.get("translation_unavail_count", 0))
     if (walk_faults, walk_translu) != (body_faults, body_translu):
-        return kill_issues + [Issue(
+        return [Issue(
             "wp_events", "error",
             f"WP event counts disagree with per-entry walk: "
             f"writer={{fault: {body_faults}, "
@@ -4622,13 +4587,11 @@ def _check_wp_events(body_stats: dict,
              "walk": {"fault": walk_faults,
                       "translation_unavail": walk_translu}},
         )]
-    return kill_issues + [Issue(
+    return [Issue(
         "wp_events", "info",
         f"WP events: fault={body_faults}, "
-        f"translation_unavail={body_translu}, "
-        f"dep_branch_kill={walk_kills}",
-        {"fault": body_faults, "translation_unavail": body_translu,
-         "dep_branch_kill": walk_kills},
+        f"translation_unavail={body_translu}",
+        {"fault": body_faults, "translation_unavail": body_translu},
     )]
 
 

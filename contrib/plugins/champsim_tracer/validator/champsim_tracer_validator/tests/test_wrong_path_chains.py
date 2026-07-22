@@ -1,6 +1,6 @@
 """Verdict-level tests for the LIVE wrong-path chain policy.
 
-This suite REPLACES the retired DEP_BRANCH_KILL poison-replay tests (removed
+This suite REPLACES the retired poison + dep-branch-kill replay tests (removed
 from the plugin on 2026-07-12; commits 18bbec8956, 914d452978, 7b69c88aa4).
 It exercises ``validator._check_wrong_path_chains`` directly against the
 continue-to-budget policy the plugin now implements:
@@ -16,7 +16,7 @@ continue-to-budget policy the plugin now implements:
     depth budget, privilege-domain crossing, translation-unavailable, a
     syscall-class terminator, or wpprune.  A fault must CONTINUE to one of
     these; a fault that truncates the excursion short is itself an error.
-  * DEP_BRANCH_KILL is RETIRED: a fault-carrying chain that resolves a
+  * The kill policy is RETIRED: a fault-carrying chain that resolves a
     fault-dependent branch and CONTINUES is now correct output, never an
     error — the exact inversion of the old policy's canonical negative test.
 
@@ -72,12 +72,10 @@ def _burst_insns(n, terminator=BR_JUMP):
     return insns
 
 
-def _wp(bid, fault=False, fault_idx=None, unavail=False, n_insns=13,
-        kill=False):
+def _wp(bid, fault=False, fault_idx=None, unavail=False, n_insns=13):
     return {"index": 0, "template_id": 200 + bid, "n_insns": n_insns,
             "fault": fault, "fault_insn_index": fault_idx,
-            "translation_unavailable": unavail,
-            "dep_branch_kill": kill}
+            "translation_unavailable": unavail}
 
 
 N_BY_BID = {13: 14, 14: 11, 15: 11, 16: 15, 17: 11, 18: 14,
@@ -175,12 +173,11 @@ def test_late_fault_does_not_excuse_early_divergence():
         f"expected depth-0 divergence error, got {[i.message for i in issues]}"
 
 
-def test_dep_branch_kill_shape_no_longer_flagged():
-    # The retired policy's canonical NEGATIVE test, INVERTED: a chain that
-    # faults at insn 2 in every block and resolves the fault-dependent
-    # branch, CONTINUING to a full-length match, is now correct output.
-    # (The DEP_BRANCH_KILL flag, if a legacy trace still carries it, is
-    # simply ignored — no verdict keys off it any more.)
+def test_continue_past_fault_dependent_branch_clean():
+    # The retired kill policy's canonical NEGATIVE test, INVERTED: a chain
+    # that faults at insn 2 in every block and resolves the fault-dependent
+    # branch, CONTINUING to a full-length match, is now correct output —
+    # no verdict keys off any kill flag any more.
     wps = [_wp(b, fault=True, fault_idx=2, n_insns=N_BY_BID[b])
            for b in (13, 14, 15, 16, 17)]
     issues = run_case(wps, [13, 14, 15, 16, 17], n_insns_by_bid=N_BY_BID)

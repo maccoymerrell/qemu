@@ -522,7 +522,6 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         { CST_WP_EVENT_TRANSLATION_UNAVAIL,
           "CST_WP_EVENT_TRANSLATION_UNAVAIL" },
         { CST_WP_EVENT_FAULT, "CST_WP_EVENT_FAULT" },
-        /* CST_WP_EVENT_DEP_BRANCH_KILL (bit 2) retired — never emitted. */
     };
     static const EncodingMapEntry metaflags_entries[] = {
         { CST_METAFLAGS_Z, "CST_METAFLAGS_Z" },

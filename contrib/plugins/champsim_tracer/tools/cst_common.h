@@ -166,9 +166,6 @@ struct ResolvedIds {
     /* wp_event_flag map: bit masks inside the per-WP-event flags byte */
     uint8_t wp_event_translation_unavail = 0;
     uint8_t wp_event_fault               = 0;
-    /* Optional: absent (0, never tests set) in traces written before the
-     * dep-branch-kill chain terminator existed. */
-    uint8_t wp_event_dep_branch_kill     = 0;
 
     /* metaflags map: bit positions inside the FID_METAFLAGS byte */
     uint8_t metaflags_z = 0;
@@ -332,10 +329,6 @@ struct WPEntry {
     std::vector<LaneMaskEntry>  lane_masks;
     bool                        fault = false;
     bool                        translation_unavailable = false;
-    /* The excursion terminated AT this block: its terminating branch
-     * depends (through registers) on a faulted wrong-path insn
-     * (CST_WP_EVENT_DEP_BRANCH_KILL).  Always the chain's last entry. */
-    bool                        dep_branch_kill = false;
     /* Only meaningful when fault. */
     uint32_t                    fault_insn_index = 0;
     bool                        has_fault_idx = false;
@@ -453,7 +446,6 @@ struct Instruction {
     uint16_t              wp_index                = 0;
     bool                  wp_fault                = false;
     bool                  wp_translation_unavail  = false;
-    bool                  wp_dep_branch_kill      = false;
     bool                  wp_has_fault_idx        = false;
     uint32_t              wp_fault_insn_index     = 0;
 

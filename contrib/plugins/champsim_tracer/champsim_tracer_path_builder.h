@@ -267,8 +267,14 @@ private:
      * the seal (StepIn::pinned_asid = pin_effective_asid): a frame can only
      * complete against a suffix sealed in ITS OWN (thread,asid) — the thread
      * dimension is implicit (PathBuilder is per-vCPU-thread TLS), and this
-     * asid is the second half of the (thread,asid) key.  With the asid key
-     * load-bearing, merge_suffix_matches is a PURE DIAGNOSTIC (Decision C). */
+     * asid is the second half of the (thread,asid) key.  USER frames match
+     * the hard asid key (merge_suffix_matches is a PURE DIAGNOSTIC there —
+     * Decision C); KERNEL-code frames (is_system) also complete on the
+     * byte-content path when the key misses, because kernel fault events
+     * stamp the loaded mm, not ownership (see the .cc comment). */
+    static bool frame_matches_completion(const CtxFrame &f,
+                                         const BBTemplate *suffix,
+                                         uint64_t seal_asid);
     ptrdiff_t frame_idx_for_completion(const BBTemplate *suffix,
                                        uint64_t seal_asid) const;
     void collect_piece(CtxFrame &f, uint64_t resume_pc);

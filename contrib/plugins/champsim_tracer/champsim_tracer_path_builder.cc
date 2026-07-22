@@ -497,37 +497,45 @@ ptrdiff_t PathBuilder::frame_idx_for_block(const BBTemplate *piece,
  * resume suffix.  Keyed on the completing seal's (thread,asid): the thread
  * is implicit (PathBuilder is per-vCPU-thread TLS), and @seal_asid — the
  * pinned process's effective asid at the seal (StepIn::pinned_asid) — is the
- * second half of the key.  A frame can only complete against a suffix sealed
- * in ITS OWN address space (f.asid == seal_asid), so the cross-ASID swallow
- * the byte guard was added to catch (a same-VA frame from ANOTHER process
- * consuming an innocent seal, e.g. resume 0x4003f0) is IMPOSSIBLE BY
- * CONSTRUCTION.  merge_suffix_matches is therefore no longer load-bearing —
- * it is demoted to a pure diagnostic (Decision C): on a byte mismatch under
- * the asid key it reports (env-gated, CST_FAULT_DIAG) but does NOT reject the
- * completion.  In single-process the asid predicate is always true and the
- * byte check always held where it fired, so output is byte-identical.
+ * second half of the key.
+ *
+ * USER frames match on the hard key (f.asid == seal_asid).  That makes the
+ * cross-ASID swallow the byte guard was added to catch (a same-VA frame from
+ * ANOTHER process consuming an innocent seal, e.g. resume 0x4003f0 — owned
+ * processes all map code at the same low VAs) IMPOSSIBLE BY CONSTRUCTION,
+ * and a user fault's event stamp is reliably the faulting process's own
+ * asid, so the key never misses a genuine completion.  merge_suffix_matches
+ * is demoted to a pure diagnostic on this arm (Decision C).
+ *
+ * KERNEL-code frames (full_tmpl->is_system, CP-authoritative) additionally
+ * complete on the byte-content path when the asid key misses: a kernel
+ * fault's event stamp is whatever mm is loaded at the fault instant — under
+ * multi-process churn routinely another task's (live ASID is not ownership
+ * for kernel code; the reason kexc ownership exists) — so the hard key alone
+ * strands the pinned process's own kernel-handler frames un-completable,
+ * leaving stale frames to perturb the fault-storm interleave.  The content
+ * guard is not process-ambiguous here the way it is for user VAs: kernel
+ * text is one shared image, frames_ only ever holds the pinned process's
+ * excursions (a foreign TB's prev is dropped before classification can
+ * stash one), and the completing suffix is a kexc-kept kernel block of the
+ * pinned process.  The stamp drift is reported as a diagnostic.
  *
  * Preferred match: a frame whose FAULT_RETURN was already observed (event
  * identity).  Fallback: QEMU's fault-stack pop is strict LIFO, so a non-LIFO
  * guest exception return — a context switch inside a blocking fault resuming
  * the OUTER task first — produces NO FAULT_RETURN event even though the
- * suffix genuinely resumes; complete those on the (asid, resume_pc) key too.
+ * suffix genuinely resumes; complete those on the same keys.
  */
-ptrdiff_t PathBuilder::frame_idx_for_completion(const BBTemplate *suffix,
-                                                uint64_t seal_asid) const
+bool PathBuilder::frame_matches_completion(const CtxFrame &f,
+                                           const BBTemplate *suffix,
+                                           uint64_t seal_asid)
 {
-    if (!suffix) {
-        return -1;
+    if (f.resume_pc != suffix->start_pc) {
+        return false;
     }
-    for (size_t i = frames_.size(); i-- > 0; ) {
-        const CtxFrame &f = frames_[i];
-        if (!(f.returned && f.resume_pc == suffix->start_pc &&
-              f.asid == seal_asid)) {
-            continue;
-        }
-        /* Byte guard demoted to a pure diagnostic: the (thread,asid) key
-         * above already makes a cross-ASID swallow impossible, so a byte
-         * mismatch here is a bug to REPORT (self-modified code, a decode
+    if (f.asid == seal_asid) {
+        /* Byte guard demoted to a pure diagnostic on the asid-keyed arm:
+         * a mismatch here is a bug to REPORT (self-modified code, a decode
          * drift), not a reason to reject a same-address-space completion. */
         if (pb_diag() && !merge_suffix_matches(f.full_tmpl, suffix)) {
             fprintf(stderr, "[pathbuilder] DIAG completion byte mismatch "
@@ -537,19 +545,37 @@ ptrdiff_t PathBuilder::frame_idx_for_completion(const BBTemplate *suffix,
                     f.full_tmpl ? f.full_tmpl->start_pc : 0,
                     f.resume_pc, f.asid, suffix->start_pc);
         }
-        return (ptrdiff_t)i;
+        return true;
+    }
+    if (f.full_tmpl && f.full_tmpl->is_system &&
+        merge_suffix_matches(f.full_tmpl, suffix)) {
+        if (pb_diag()) {
+            fprintf(stderr, "[pathbuilder] DIAG kernel-frame completion via "
+                    "content (asid stamp drift): frame full=0x%" PRIx64
+                    " resume=0x%" PRIx64 " asid=0x%" PRIx64 " vs seal asid=0x%"
+                    PRIx64 "\n",
+                    f.full_tmpl->start_pc, f.resume_pc, f.asid, seal_asid);
+        }
+        return true;
+    }
+    return false;
+}
+
+ptrdiff_t PathBuilder::frame_idx_for_completion(const BBTemplate *suffix,
+                                                uint64_t seal_asid) const
+{
+    if (!suffix) {
+        return -1;
     }
     for (size_t i = frames_.size(); i-- > 0; ) {
         const CtxFrame &f = frames_[i];
-        if (f.resume_pc == suffix->start_pc && f.asid == seal_asid) {
-            if (pb_diag() && !merge_suffix_matches(f.full_tmpl, suffix)) {
-                fprintf(stderr, "[pathbuilder] DIAG completion byte mismatch "
-                        "(non-behavioral; asid-keyed, no-return): frame "
-                        "full=0x%" PRIx64 " resume=0x%" PRIx64 " asid=0x%"
-                        PRIx64 " vs suffix=0x%" PRIx64 "\n",
-                        f.full_tmpl ? f.full_tmpl->start_pc : 0,
-                        f.resume_pc, f.asid, suffix->start_pc);
-            }
+        if (f.returned && frame_matches_completion(f, suffix, seal_asid)) {
+            return (ptrdiff_t)i;
+        }
+    }
+    for (size_t i = frames_.size(); i-- > 0; ) {
+        const CtxFrame &f = frames_[i];
+        if (frame_matches_completion(f, suffix, seal_asid)) {
             return (ptrdiff_t)i;
         }
     }

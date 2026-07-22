@@ -1280,13 +1280,26 @@ the resume suffix's *seal*, one or more steps later: when a sealed
 BB starts at a frame's resume PC, the merge re-injects the frame's
 accumulated pieces ahead of the suffix's own, emits the **full**
 template once with the suffix's resolved branch, and retires the
-frame.  A returned frame matches by event identity; a frame whose
-return was never observed (a non-LIFO guest return — a context
-switch inside a blocking fault resuming the outer task first)
-completes on a byte-content check alone.  The content check is what
-keeps a same-VA frame from *another* address space — reachable
-through ASID reuse, since every process maps code at the same low
-VAs — from swallowing an innocent block's seal.
+frame.  Completion is keyed on the sealing context's ``(thread,
+asid)``: the thread dimension is implicit (the PathBuilder is
+per-vCPU-thread state), and the seal's effective pin asid is the
+second half of the key.  A *user* frame completes only when its
+event-stamped asid equals the seal's — which makes the same-VA
+swallow (a frame from *another* address space, reachable through
+ASID reuse since every process maps code at the same low VAs,
+consuming an innocent block's seal) impossible by construction, so
+the byte-content comparison on that arm is a diagnostic, not a
+gate.  A *kernel-code* frame additionally completes on the
+byte-content path when the asid key misses: a kernel fault's event
+stamp is whatever mm is loaded at the fault instant — under
+multi-process churn routinely another task's, for the same reason
+kernel-excursion ownership exists — while the frame stack only ever
+holds the pinned process's own excursions, so content identity over
+the one shared kernel image is the reliable key there.  A returned
+frame is preferred by event identity; a frame whose return was
+never observed (a non-LIFO guest return — a context switch inside a
+blocking fault resuming the outer task first) completes on the same
+keys at its suffix's seal.
 
 **Retire-at-return when the resume suffix is dropped.**  A foreign-ASID
 excursion (or an abandoned async window) can preempt the pinned process

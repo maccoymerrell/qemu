@@ -1304,8 +1304,19 @@ arm clears the deferred prev it checks whether that prev is an inner
 ``flush_frame_unwound`` emits the frame's full template at its own depth and
 anchors, from its own accumulated pieces, with no wrong-path and an unresolved
 terminal branch (the resolving suffix is gone), exactly like the
-segment-finish flush.  Because the flush emits an *anchored* (merged) entry,
-and an anchored entry must follow a strictly deeper one, a guard
+segment-finish flush.  When a frame *does* complete, ``complete_merge`` runs
+the same flush over any frame still in flight that nests **deeper** than the
+one it is completing and shares its ``(thread, asid)`` — strict LIFO makes a
+surviving deeper same-address-space frame a leak — deepest-first, so the
+unwind steps down a level at a time (``2 -> 1 -> 0``) rather than collapsing
+straight to the completing frame's depth.  This is the leak that
+``flush_frame_unwound`` on the drop arm cannot reach, because the leaked
+frame's own suffix was never on a drop arm to trigger it.  The ``asid`` filter
+is what makes the deeper-frame flush safe: the completing frame is picked
+under the ``(thread, asid)`` completion key, and only deeper frames of that
+same address space are unwound, so a foreign process's live excursion is left
+untouched.  Because the flush emits an *anchored* (merged) entry, and an
+anchored entry must follow a strictly deeper one, a guard
 (``g_last_emit_fault_depth``) refuses to emit unless the last entry on the
 wire is deeper than the frame; a level it cannot place is dropped rather than
 emitted out of order, so the retire-at-return can never trade the depth jump

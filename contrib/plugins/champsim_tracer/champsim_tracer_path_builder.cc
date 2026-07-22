@@ -977,18 +977,33 @@ PathBuilder::complete_merge(size_t idx,
                             BodyStreamState *out_stream,
                             unsigned int cpu_index)
 {
-    /* TODO(stage2/3): retire-at-return backstop — flush any frame still in
-     * flight that nests DEEPER than the one now completing (a higher stack
-     * index; strict LIFO makes a surviving deeper frame a leak), deepest-
-     * first, BEFORE the outer frame's merged BB, so the unwind steps down one
-     * level at a time (2->1->0) rather than collapsing straight to the outer's
-     * depth (2->0).  DEFERRED from Stage 0: the frame it would pick is found
-     * via frame_idx_for_completion's resume-PC+bytes byte guard, which is
-     * cross-process-ambiguous for shared kernel code — an unconditional
-     * deeper-frame flush here could erase another process's live excursion.
-     * It becomes safe only once Stage 2 unifies frame identity on
-     * (thread,asid) (fault_merge_wp_rearch_plan.md Decision C), where it
-     * lands together with the suspend-or-seal arrow. */
+    /* Retire-at-return backstop (deferred from Stage 0, landed now that
+     * completion is (thread,asid)-scoped — Stage 2).  @idx was picked by
+     * frame_idx_for_completion under the asid key, so it is unambiguously
+     * THIS process's completing frame.  Any frame still in flight that nests
+     * DEEPER (a higher stack index; frames_ is push / fault-nesting order) and
+     * belongs to the SAME (thread,asid) has leaked: inner faults unwind before
+     * their outer under strict LIFO, so a deeper same-asid frame surviving to
+     * this completion means its own resume suffix was dropped / never sealed
+     * under contention.  Emit each such frame's depth level now, deepest-first,
+     * BEFORE the outer frame's merged BB, so the unwind steps down one level at
+     * a time (2->1->0) instead of collapsing straight to the outer's depth
+     * (2->0 — the syscall_fault_nesting jump the drop-arm flush_dropped_prev
+     * couldn't reach because the leaked frame's suffix was never on a DROP arm).
+     * The asid filter is what makes this safe: before the (thread,asid) key, an
+     * unconditional deeper-frame flush could erase ANOTHER process's live
+     * excursion; now a foreign frame (different asid) is left untouched.
+     * flush_frame_unwound erases index i > idx, which never shifts @idx, so the
+     * reference below stays valid; its own anchor guard drops any level it
+     * cannot place without an anchor-at-unwind violation. */
+    if (out_stream) {
+        const uint64_t complete_asid = frames_[idx].asid;
+        for (size_t i = frames_.size(); i-- > idx + 1; ) {
+            if (frames_[i].asid == complete_asid) {
+                flush_frame_unwound(i, out_stream, cpu_index);
+            }
+        }
+    }
     CtxFrame &f = frames_[idx];
     const PendingEmit &pe = pending_emits.front();
     if (pb_diag()) {

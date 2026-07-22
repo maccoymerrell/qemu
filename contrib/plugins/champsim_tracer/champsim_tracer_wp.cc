@@ -510,6 +510,129 @@ static WpStep wp_check_forward_progress(WpWalkState &st)
     return WpStep::PROCEED;
 }
 
+/*
+ * Run one speculative exec_tb and classify its outcome.  Returns:
+ *   RETRY_SESSION       — a tb_flush unwound the exec_tb before any guest
+ *                         insn ran (*flush_interrupted set); the caller
+ *                         re-runs the whole WP from a fresh spec session
+ *   TRANSLATION_UNAVAIL — genuine null template: the wrong-path target could
+ *                         not be fetched/translated; the chain (or
+ *                         *first_tb_unavail) carries the truncation marker
+ *   STUCK_BAIL          — a wild speculative store overflowed the sandbox
+ *   PROCEED             — a template ran; st.tmpl / st.tb_ok are set for the
+ *                         fragment walk
+ * The body is moved verbatim; each terminal break -> return, all latching
+ * st.early_exit exactly as the monolith did.
+ */
+static WpStep wp_exec_one_tb(WpWalkState &st)
+{
+    auto &tb_ok        = st.tb_ok;
+    auto &tmpl         = st.tmpl;
+    auto &acc          = st.acc;
+    auto &bb_reg_snaps = acc.bb_reg_snaps;
+    auto &wp_chain     = st.chain;
+    auto &early_exit   = st.early_exit;
+    bool *flush_interrupted = st.flush_interrupted;
+    bool *first_tb_unavail  = st.first_tb_unavail;
+    uint64_t wrong_target   = st.wrong_target;
+
+        /*
+         * Use the TB-fragment template vcpu_tb_exec stashed in
+         * g_wp_state.last_executed_tb rather than a bb_map_ lookup: the
+         * fragment template is branch-terminated identically (next_tb_fragment
+         * chains the mid-TB splits) and yields the same WPBBEntry shape after
+         * the fragment walk, while skipping the global data_lock a cache
+         * lookup takes on every WP iter (~100ns × tens of millions of iters
+         * on full mcf runs).
+         *
+         * Per-insn regdata: clear the per-thread WP scratch buffer here;
+         * exec_tb then fires the per-insn callbacks (registered at
+         * translation time) that append dst snaps in execution order during
+         * WP (see vcpu_insn_reg_snap_cb).  The fragment walk pulls them FIFO
+         * for every insn except each fragment's last executed insn, which
+         * has no in-fragment successor hook and falls back to a live read.
+         */
+        if (g_features.wp_reg_data) {
+            wp_pending_reg_snaps.clear();
+        }
+        g_wp_state.last_executed_tb = nullptr;
+        g_last_spec_refusal = SpecRefusal::FETCH;   /* refined by translation */
+        uint64_t flush_before =
+            g_tb_flush_count.load(std::memory_order_acquire);
+        tb_ok = qemu_plugin_exec_tb();
+        tmpl = g_wp_state.last_executed_tb;
+
+        if (!tmpl) {
+            /* A tb_flush during this exec_tb unwound it (via cpu_loop_exit,
+             * caught by cpu_plugin_exec_tb's local guard) before the guest
+             * insn ran, so nothing executed.  Signal the caller to re-run
+             * the whole WP from a fresh spec session in the now-fresh
+             * cache; do NOT continue this session (the flush dropped the
+             * spec-mode translation, and resuming would run wrong-path
+             * code outside the sandbox).  A genuine null (no flush) means
+             * the wrong-path target could not be fetched/translated —
+             * un-resident code under demand paging, or a refused garbage
+             * region — and truncates the chain: mark the last completed WP
+             * BB translation_unavailable so the truncation is explicit on
+             * the wire (CST_WP_EVENT_TRANSLATION_UNAVAIL) instead of
+             * indistinguishable from a clean depth-budget end.  The
+             * validator reads the marker to tell an honest boundary from a
+             * silently short chain. */
+            if (g_tb_flush_count.load(std::memory_order_acquire) !=
+                    flush_before) {
+                *flush_interrupted = true;
+            } else if (!wp_chain.empty()) {
+                wp_chain.back().translation_unavailable = true;
+            } else {
+                /* Genuine null on the FIRST target: the wrong-path entry
+                 * point itself could not be fetched/translated and there
+                 * is no chain to carry the truncation marker.  Hand the
+                 * condition to the caller via @first_tb_unavail so the
+                 * emitter makes it explicit on the wire as a chain-level
+                 * CST_WP_EVENT_TRANSLATION_UNAVAIL event (§4.4) instead
+                 * of leaving an indistinguishable silent 0-block chain.
+                 * Also count it (a nonzero count against resident
+                 * targets is a bug) and expose the instance under
+                 * CST_WP_DIAG. */
+                *first_tb_unavail = true;
+                thread_stats_get().wp_first_tb_unavail++;
+                if (Stats *h = g_current_hist_bucket) {
+                    h->wp_first_tb_unavail++;
+                }
+                if (getenv("CST_WP_DIAG")) {
+                    fprintf(stderr, "[wpdiag] first-TB unavailable: "
+                            "target=0x%" PRIx64 " wrong_target=0x%" PRIx64
+                            " reason=%s\n",
+                            qemu_plugin_get_pc(), wrong_target,
+                            g_last_spec_refusal == SpecRefusal::POISON
+                                ? "poison" : "fetch");
+                }
+            }
+            acc.clear();
+            bb_reg_snaps.clear();
+            early_exit = true;
+            return *flush_interrupted ? WpStep::RETRY_SESSION
+                                      : WpStep::TRANSLATION_UNAVAIL;
+        }
+
+        /*
+         * Wild speculative store: a garbage-size memop the wrong path just
+         * executed wrote past the spec-store soft budget into the sandbox
+         * without faulting (it is buffered, not real).  The wrong path has
+         * diverged into nonsense — a real CPU's wrong-path store would fault and
+         * mispredict-recover — so terminate the excursion rather than fill the
+         * sandbox to its hard cap and start dropping stores.  Drop the in-flight
+         * chain; the correct-path BBs already emitted are preserved. */
+        if (qemu_plugin_spec_store_overflowed()) {
+            acc.clear();
+            bb_reg_snaps.clear();
+            early_exit = true;
+            return WpStep::STUCK_BAIL;
+        }
+
+    return WpStep::PROCEED;
+}
+
 std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                                uint64_t correct_target,
                                                uint64_t wrong_target,
@@ -675,96 +798,11 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             bb_start_pc = pre_pc;
         }
 
-        /*
-         * Use the TB-fragment template vcpu_tb_exec stashed in
-         * g_wp_state.last_executed_tb rather than a bb_map_ lookup: the
-         * fragment template is branch-terminated identically (next_tb_fragment
-         * chains the mid-TB splits) and yields the same WPBBEntry shape after
-         * the fragment walk, while skipping the global data_lock a cache
-         * lookup takes on every WP iter (~100ns × tens of millions of iters
-         * on full mcf runs).
-         *
-         * Per-insn regdata: clear the per-thread WP scratch buffer here;
-         * exec_tb then fires the per-insn callbacks (registered at
-         * translation time) that append dst snaps in execution order during
-         * WP (see vcpu_insn_reg_snap_cb).  The fragment walk pulls them FIFO
-         * for every insn except each fragment's last executed insn, which
-         * has no in-fragment successor hook and falls back to a live read.
-         */
-        if (g_features.wp_reg_data) {
-            wp_pending_reg_snaps.clear();
-        }
-        g_wp_state.last_executed_tb = nullptr;
-        g_last_spec_refusal = SpecRefusal::FETCH;   /* refined by translation */
-        uint64_t flush_before =
-            g_tb_flush_count.load(std::memory_order_acquire);
-        tb_ok = qemu_plugin_exec_tb();
-        tmpl = g_wp_state.last_executed_tb;
-
-        if (!tmpl) {
-            /* A tb_flush during this exec_tb unwound it (via cpu_loop_exit,
-             * caught by cpu_plugin_exec_tb's local guard) before the guest
-             * insn ran, so nothing executed.  Signal the caller to re-run
-             * the whole WP from a fresh spec session in the now-fresh
-             * cache; do NOT continue this session (the flush dropped the
-             * spec-mode translation, and resuming would run wrong-path
-             * code outside the sandbox).  A genuine null (no flush) means
-             * the wrong-path target could not be fetched/translated —
-             * un-resident code under demand paging, or a refused garbage
-             * region — and truncates the chain: mark the last completed WP
-             * BB translation_unavailable so the truncation is explicit on
-             * the wire (CST_WP_EVENT_TRANSLATION_UNAVAIL) instead of
-             * indistinguishable from a clean depth-budget end.  The
-             * validator reads the marker to tell an honest boundary from a
-             * silently short chain. */
-            if (g_tb_flush_count.load(std::memory_order_acquire) !=
-                    flush_before) {
-                *flush_interrupted = true;
-            } else if (!wp_chain.empty()) {
-                wp_chain.back().translation_unavailable = true;
-            } else {
-                /* Genuine null on the FIRST target: the wrong-path entry
-                 * point itself could not be fetched/translated and there
-                 * is no chain to carry the truncation marker.  Hand the
-                 * condition to the caller via @first_tb_unavail so the
-                 * emitter makes it explicit on the wire as a chain-level
-                 * CST_WP_EVENT_TRANSLATION_UNAVAIL event (§4.4) instead
-                 * of leaving an indistinguishable silent 0-block chain.
-                 * Also count it (a nonzero count against resident
-                 * targets is a bug) and expose the instance under
-                 * CST_WP_DIAG. */
-                *first_tb_unavail = true;
-                thread_stats_get().wp_first_tb_unavail++;
-                if (Stats *h = g_current_hist_bucket) {
-                    h->wp_first_tb_unavail++;
-                }
-                if (getenv("CST_WP_DIAG")) {
-                    fprintf(stderr, "[wpdiag] first-TB unavailable: "
-                            "target=0x%" PRIx64 " wrong_target=0x%" PRIx64
-                            " reason=%s\n",
-                            qemu_plugin_get_pc(), wrong_target,
-                            g_last_spec_refusal == SpecRefusal::POISON
-                                ? "poison" : "fetch");
-                }
-            }
-            acc.clear();
-            bb_reg_snaps.clear();
-            early_exit = true;
-            break;
-        }
-
-        /*
-         * Wild speculative store: a garbage-size memop the wrong path just
-         * executed wrote past the spec-store soft budget into the sandbox
-         * without faulting (it is buffered, not real).  The wrong path has
-         * diverged into nonsense — a real CPU's wrong-path store would fault and
-         * mispredict-recover — so terminate the excursion rather than fill the
-         * sandbox to its hard cap and start dropping stores.  Drop the in-flight
-         * chain; the correct-path BBs already emitted are preserved. */
-        if (qemu_plugin_spec_store_overflowed()) {
-            acc.clear();
-            bb_reg_snaps.clear();
-            early_exit = true;
+        WpStep ex = wp_exec_one_tb(st);
+        if (ex != WpStep::PROCEED) {
+            /* RETRY_SESSION / TRANSLATION_UNAVAIL / STUCK_BAIL: the exec
+             * phase already dropped the accumulator and latched early_exit
+             * (and, for a flush, *flush_interrupted). */
             break;
         }
 

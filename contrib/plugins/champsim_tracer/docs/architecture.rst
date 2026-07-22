@@ -1305,17 +1305,23 @@ arm clears the deferred prev it checks whether that prev is an inner
 anchors, from its own accumulated pieces, with no wrong-path and an unresolved
 terminal branch (the resolving suffix is gone), exactly like the
 segment-finish flush.  When a frame *does* complete, ``complete_merge`` runs
-the same flush over any frame still in flight that nests **deeper** than the
-one it is completing and shares its ``(thread, asid)`` — strict LIFO makes a
-surviving deeper same-address-space frame a leak — deepest-first, so the
-unwind steps down a level at a time (``2 -> 1 -> 0``) rather than collapsing
-straight to the completing frame's depth.  This is the leak that
-``flush_frame_unwound`` on the drop arm cannot reach, because the leaked
-frame's own suffix was never on a drop arm to trigger it.  The ``asid`` filter
-is what makes the deeper-frame flush safe: the completing frame is picked
-under the ``(thread, asid)`` completion key, and only deeper frames of that
-same address space are unwound, so a foreign process's live excursion is left
-untouched.  Because the flush emits an *anchored* (merged) entry, and an
+the same flush over any inner (depth ≥ 1) frame still in flight that nests
+**deeper** than the one it is completing — strict LIFO makes a surviving
+deeper frame a leak — deepest-first, so the unwind steps down a level at a
+time (``2 -> 1 -> 0``) rather than collapsing straight to the completing
+frame's depth.  This is the leak that ``flush_frame_unwound`` on the drop arm
+cannot reach, because the leaked frame's own suffix was never on a drop arm
+to trigger it.  What makes the deeper-frame flush safe is the ``(thread,
+asid)`` completion key on the *completing* frame: the frame stack only ever
+holds the pinned process's own excursions (a foreign TB's deferred prev is
+dropped before classification can stash one), so once the completing frame is
+process-unambiguous, every deeper frame unwound with it is the pinned
+process's own.  The deeper frames' own event-stamped asids are deliberately
+*not* an equality gate — a kernel fault is stamped with whatever mm is loaded
+at the fault instant, which under multi-process churn is routinely another
+task's (the same reason kernel-excursion ownership exists: a live ASID is not
+ownership for kernel code); a stamp mismatch is reported as a diagnostic
+only.  Because the flush emits an *anchored* (merged) entry, and an
 anchored entry must follow a strictly deeper one, a guard
 (``g_last_emit_fault_depth``) refuses to emit unless the last entry on the
 wire is deeper than the frame; a level it cannot place is dropped rather than

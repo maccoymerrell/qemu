@@ -980,28 +980,53 @@ PathBuilder::complete_merge(size_t idx,
     /* Retire-at-return backstop (deferred from Stage 0, landed now that
      * completion is (thread,asid)-scoped — Stage 2).  @idx was picked by
      * frame_idx_for_completion under the asid key, so it is unambiguously
-     * THIS process's completing frame.  Any frame still in flight that nests
-     * DEEPER (a higher stack index; frames_ is push / fault-nesting order) and
-     * belongs to the SAME (thread,asid) has leaked: inner faults unwind before
-     * their outer under strict LIFO, so a deeper same-asid frame surviving to
-     * this completion means its own resume suffix was dropped / never sealed
-     * under contention.  Emit each such frame's depth level now, deepest-first,
-     * BEFORE the outer frame's merged BB, so the unwind steps down one level at
-     * a time (2->1->0) instead of collapsing straight to the outer's depth
-     * (2->0 — the syscall_fault_nesting jump the drop-arm flush_dropped_prev
-     * couldn't reach because the leaked frame's suffix was never on a DROP arm).
-     * The asid filter is what makes this safe: before the (thread,asid) key, an
-     * unconditional deeper-frame flush could erase ANOTHER process's live
-     * excursion; now a foreign frame (different asid) is left untouched.
-     * flush_frame_unwound erases index i > idx, which never shifts @idx, so the
-     * reference below stays valid; its own anchor guard drops any level it
-     * cannot place without an anchor-at-unwind violation. */
+     * THIS process's completing frame — and that scoped pick is what makes
+     * the flush below safe (the Stage-0 hazard was an ambiguous @idx: flushing
+     * deeper than a mis-picked foreign frame could erase another process's
+     * live excursion).  Any frame still in flight that nests DEEPER (a higher
+     * stack index; frames_ is push / fault-nesting order) has leaked: inner
+     * faults unwind before their outer under strict LIFO, so a deeper frame
+     * surviving to this completion means its own resume suffix was dropped /
+     * never sealed under contention.  Emit each inner (depth >= 1) frame's
+     * level now, deepest-first, BEFORE the outer frame's merged BB, so the
+     * unwind steps down one level at a time (2->1->0) instead of collapsing
+     * straight to the outer's depth (2->0 — the syscall_fault_nesting jump the
+     * drop-arm flush_dropped_prev cannot reach, because the leaked frame's
+     * suffix was never on a DROP arm).  Depth >= 1 mirrors flush_dropped_prev:
+     * a depth-0 (user) frame is the unwind floor and never anchors a >1 jump,
+     * and emitting user code standalone would degrade an entry the content
+     * oracle validates.
+     *
+     * The deeper frames are NOT filtered on CtxFrame::asid equality: frames_
+     * only ever holds the pinned process's own excursions (a foreign TB's
+     * prev is dropped before classification can stash it), but a KERNEL
+     * fault's event-stamped asid is whatever mm happens to be loaded at the
+     * fault instant — under multi-process churn routinely another task's
+     * (the same reason kexc ownership exists: live ASID is not ownership for
+     * kernel code).  An equality filter here would skip exactly the pinned
+     * process's own leaked handler frames (observed: the depth-1 kernel frame
+     * stamped with a churn CR3, its level then lost to a 2->0 jump).  A stamp
+     * mismatch is reported as a diagnostic, same demotion as the completion
+     * byte guard.  flush_frame_unwound erases index i > idx, which never
+     * shifts @idx, so the reference below stays valid; its own anchor guard
+     * drops any level it cannot place without an anchor-at-unwind
+     * violation. */
     if (out_stream) {
         const uint64_t complete_asid = frames_[idx].asid;
         for (size_t i = frames_.size(); i-- > idx + 1; ) {
-            if (frames_[i].asid == complete_asid) {
-                flush_frame_unwound(i, out_stream, cpu_index);
+            if (frames_[i].depth < 1) {
+                continue;
             }
+            if (pb_diag() && frames_[i].asid != complete_asid) {
+                fprintf(stderr, "[pathbuilder] DIAG deeper-flush asid stamp "
+                        "drift (non-behavioral): frame full=0x%" PRIx64
+                        " depth=%u asid=0x%" PRIx64 " vs completing asid=0x%"
+                        PRIx64 "\n",
+                        frames_[i].full_tmpl ? frames_[i].full_tmpl->start_pc
+                                             : 0,
+                        frames_[i].depth, frames_[i].asid, complete_asid);
+            }
+            flush_frame_unwound(i, out_stream, cpu_index);
         }
     }
     CtxFrame &f = frames_[idx];

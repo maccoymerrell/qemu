@@ -157,6 +157,31 @@ struct WpWalkState {
 };
 
 /*
+ * Status a WP-walk phase hands back to its caller.  Each value makes one of
+ * the former monolith's break/continue/fall-through exits explicit, so the
+ * driver dispatches on a named outcome instead of steering a ~900-line scope
+ * with raw continue/break.  Two scopes consume it:
+ *   - the outer driver loop: PROCEED (run the next phase this iteration),
+ *     NEXT_ITER (continue the outer while), or a terminal reason
+ *     (DOMAIN_CROSS / TRANSLATION_UNAVAIL / STUCK_BAIL / RETRY_SESSION /
+ *     FAULT_STOP) — for every terminal the phase has already latched
+ *     st.early_exit or st.fault_stop, exactly as the monolith did, so the
+ *     driver's tail break fires;
+ *   - the inner fragment loop (in wp_walk_fragments): BREAK_WALK (break the
+ *     fragment for-loop) or PROCEED (fall through to the commit).
+ */
+enum class WpStep {
+    PROCEED,              // fall through to the next phase / the commit
+    NEXT_ITER,            // continue the outer while loop
+    BREAK_WALK,           // break the inner fragment for-loop
+    RETRY_SESSION,        // flush unwound exec_tb: caller re-runs the whole WP
+    DOMAIN_CROSS,         // SMEP/PXN cross-domain terminate
+    TRANSLATION_UNAVAIL,  // wrong-path target unfetchable / null template
+    STUCK_BAIL,           // no-forward-progress / poison / nop-slide / wild store
+    FAULT_STOP,           // post-completion graceful stop
+};
+
+/*
  * Enter a wrong-path speculative session: snapshot the scoreboard cursor
  * into g_wp_state (so the nested vcpu_tb_exec on this thread observes WP
  * mode and can restore the cursor afterwards), flip spec mode on, and
@@ -342,6 +367,149 @@ static uint32_t wp_append_fragment_insns(WpAccum &acc, BBTemplate *cur,
     return appended_insns;
 }
 
+/*
+ * Forward-progress / poison / domain-cross guard for one outer-while
+ * iteration, run before the speculative exec_tb.  Returns:
+ *   NEXT_ITER     — a rep-string overrun was nudged past; retry the iteration
+ *   STUCK_BAIL    — poisoned PC, no-forward-progress, or an already-poisoned
+ *                   target: the accumulator was dropped and early_exit latched
+ *   DOMAIN_CROSS  — an SMEP/PXN cross-domain fetch terminated the excursion
+ *   PROCEED       — clear to fetch/execute this iteration
+ * The body is moved verbatim from the monolith; break -> return terminal,
+ * continue -> return NEXT_ITER.
+ */
+static WpStep wp_check_forward_progress(WpWalkState &st)
+{
+    auto &acc               = st.acc;
+    auto &bb_pcs            = acc.bb_pcs;
+    auto &bb_reg_snaps      = acc.bb_reg_snaps;
+    auto &wp_chain          = st.chain;
+    auto &poisoned_targets  = st.poisoned_targets;
+    auto &pre_pc            = st.pre_pc;
+    auto &early_exit        = st.early_exit;
+    auto &prev_pre_pc       = st.prev_pre_pc;
+    auto &same_pre_pc_count = st.same_pre_pc_count;
+    auto &wp_noprogress_count = st.wp_noprogress_count;
+    auto &prev_mem_size     = st.prev_mem_size;
+    const bool excursion_is_kernel = st.excursion_is_kernel;
+    bool *first_tb_unavail  = st.first_tb_unavail;
+
+        /* Refuse to speculate into a previously-poisoned PC.  A PC
+         * gets poisoned when vcpu_tb_trans detects either a Capstone
+         * decode failure or a bytes-changed-since-first-sighting at
+         * any of the TB's canonical insns — both signals that the
+         * region is dynamic data, not real code.  Drop the in-flight
+         * accumulator and end this WP simulation; chain so far is
+         * preserved.
+         *
+         * EXCEPT on the very first iteration (empty chain): the branch
+         * predictor deliberately chose this wrong_target, so a stale
+         * global poison (keyed by TB start_pc, sometimes never erased
+         * because the correct path only reaches this VA mid-TB) must not
+         * veto the excursion's entry and produce a 0-block truncation.
+         * The per-TB detect_tb_poison in vcpu_tb_trans still refuses a
+         * genuinely-garbage first TB (Capstone-fail -> null tmpl below),
+         * so dropping the global check here only recovers real code. */
+        if (!(wp_chain.empty() && bb_pcs.empty()) &&
+            cst_pc_is_poisoned(pre_pc)) {
+            acc.clear();
+            bb_reg_snaps.clear();
+            poisoned_targets.insert(pre_pc);
+            early_exit = true;
+            return WpStep::STUCK_BAIL;
+        }
+
+        /* Forward-progress guard.  An x86 REP iter in spec mode can
+         * decrement RCX while the sandboxed write keeps PC anchored, so
+         * exec_tb returns without advancing PC; dedup skips appending
+         * and the loop spins forever until a downstream NULL-deref.
+         * Force PC past the offending insn after CST_FID_SLOT_COUNT
+         * same-PC iterations (same threshold as the per-insn memop cap). */
+        if (pre_pc == prev_pre_pc) {
+            same_pre_pc_count++;
+            /*
+             * A legitimate same-PC repeat is a rep-string op: PC stays
+             * anchored while each sandboxed iteration advances state
+             * (its memop grows g_wp_state.mem_accesses).  A repeat with
+             * NO such progress is a genuinely stuck excursion — a
+             * degenerate wrong-path target that re-faults or self-loops
+             * on every fetch, making no forward progress at all.  Those
+             * must die fast: in a system-mode kernel a stuck excursion
+             * recurs on essentially every BB, and at the old
+             * CST_FID_SLOT_COUNT (64) threshold each wasted ~64 steps,
+             * so the trace never advanced (observed: ~900k degenerate
+             * kernel excursions pinning an aarch64 system-mode run).
+             * Bail after two no-progress repeats; rep-string keeps the
+             * higher tolerance because its memop count climbs. */
+            if (g_wp_state.mem_accesses.size() == prev_mem_size) {
+                if (++wp_noprogress_count >= 2) {
+                    poisoned_targets.insert(pre_pc);
+                    acc.clear();
+                    bb_reg_snaps.clear();
+                    early_exit = true;
+                    return WpStep::STUCK_BAIL;
+                }
+            } else {
+                wp_noprogress_count = 0;
+            }
+        } else {
+            prev_pre_pc = pre_pc;
+            same_pre_pc_count = 1;
+            wp_noprogress_count = 0;
+        }
+        prev_mem_size = g_wp_state.mem_accesses.size();
+        if (same_pre_pc_count > CST_FID_SLOT_COUNT) {
+            /* rep-string overrun guard (PC anchored, memops climbing
+             * past the per-insn cap): nudge past the offending insn. */
+            BBTemplate *stuck = g_wp_state.last_executed_tb;
+            uint8_t isz = (stuck && stuck->n_insns > 0)
+                ? stuck->insn_sizes[0] : 1;
+            qemu_plugin_set_pc(pre_pc + isz);
+            same_pre_pc_count = 0;
+            prev_pre_pc = UINT64_MAX;
+            return WpStep::NEXT_ITER;
+        }
+
+        if (poisoned_targets.count(pre_pc)) {
+            early_exit = true;
+            return WpStep::STUCK_BAIL;
+        }
+
+        /*
+         * Privilege-domain-switch terminate — the faithful SMEP/PXN model.
+         * The excursion speculates at the launching context's privilege
+         * (excursion_is_kernel); a mispredicted fetch that reaches a code VA
+         * in the OTHER domain (kernel-context excursion reaching a user-VA
+         * fetch, or the reverse) is architecturally forbidden — the
+         * speculative fetch faults and the pipeline recovers — so no real core
+         * follows it.  End the excursion cleanly here, the same shape as the
+         * translation-unavailable terminate: the sealed chain so far is
+         * preserved and its last entry marked, and the crossing block is NOT
+         * fetched.  This complements the syscall-boundary terminate (a
+         * legitimate CORRECT-path domain transition, never a wrong-path one)
+         * and eliminates the cross-domain mis-stamp at its source, so a
+         * committed wrong-path block's VA class is always its true domain.
+         */
+        if (cst_va_is_kernel_code(pre_pc) != excursion_is_kernel) {
+            if (!wp_chain.empty()) {
+                wp_chain.back().translation_unavailable = true;
+            } else {
+                /* Crossing on the very first target (e.g. an indirect branch
+                 * mispredicted across the boundary): no entry to mark, so the
+                 * emitter writes a chain-level CST_WP_EVENT_TRANSLATION_UNAVAIL.
+                 * Not the wp_first_tb_unavail "bug" counter — this is an
+                 * expected architectural terminate, not an unfetchable target. */
+                *first_tb_unavail = true;
+            }
+            acc.clear();
+            bb_reg_snaps.clear();
+            early_exit = true;
+            return WpStep::DOMAIN_CROSS;
+        }
+
+    return WpStep::PROCEED;
+}
+
 std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                                uint64_t correct_target,
                                                uint64_t wrong_target,
@@ -371,7 +539,6 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
      * hardware and terminates the excursion (see the loop body).
      */
     st.excursion_is_kernel = cst_va_is_kernel_code(branch_pc);
-    const bool excursion_is_kernel = st.excursion_is_kernel;
     /* Set true if a tb_flush unwound a spec-mode exec_tb before its guest
      * insn ran (last_executed_tb stayed null while the flush count moved).
      * The caller cleanly re-runs the whole WP in the now-fresh code cache
@@ -470,15 +637,13 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         bb_reg_snaps.reserve((size_t)initial_insn_cap * MAX_SRC_REGS);
     }
 
-    auto &prev_pre_pc = st.prev_pre_pc;
-    auto &same_pre_pc_count = st.same_pre_pc_count;
     /* No-forward-progress detection: a same-PC repeat with no memop
      * growth is a stuck excursion; bail after two (see the stuck-PC
      * handler below).  prev_mem_size tracks the spec memop count to
-     * tell a stuck loop from a legitimately-advancing rep-string. */
-    auto &wp_noprogress_count = st.wp_noprogress_count;
+     * tell a stuck loop from a legitimately-advancing rep-string.
+     * prev_pre_pc / same_pre_pc_count / wp_noprogress_count / prev_mem_size
+     * live in st and are owned by wp_check_forward_progress now. */
     st.prev_mem_size = g_wp_state.mem_accesses.size();
-    auto &prev_mem_size = st.prev_mem_size;
     /* Per-iteration / per-walk scratch aliases (reset at the iteration top
      * below); folded into st so the walk phases can move into helpers. */
     auto &pre_pc = st.pre_pc;
@@ -496,116 +661,13 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
         mem_start_idx = g_wp_state.mem_accesses.size();
         tmpl = nullptr;
 
-        /* Refuse to speculate into a previously-poisoned PC.  A PC
-         * gets poisoned when vcpu_tb_trans detects either a Capstone
-         * decode failure or a bytes-changed-since-first-sighting at
-         * any of the TB's canonical insns — both signals that the
-         * region is dynamic data, not real code.  Drop the in-flight
-         * accumulator and end this WP simulation; chain so far is
-         * preserved.
-         *
-         * EXCEPT on the very first iteration (empty chain): the branch
-         * predictor deliberately chose this wrong_target, so a stale
-         * global poison (keyed by TB start_pc, sometimes never erased
-         * because the correct path only reaches this VA mid-TB) must not
-         * veto the excursion's entry and produce a 0-block truncation.
-         * The per-TB detect_tb_poison in vcpu_tb_trans still refuses a
-         * genuinely-garbage first TB (Capstone-fail -> null tmpl below),
-         * so dropping the global check here only recovers real code. */
-        if (!(wp_chain.empty() && bb_pcs.empty()) &&
-            cst_pc_is_poisoned(pre_pc)) {
-            acc.clear();
-            bb_reg_snaps.clear();
-            poisoned_targets.insert(pre_pc);
-            early_exit = true;
-            break;
-        }
-
-        /* Forward-progress guard.  An x86 REP iter in spec mode can
-         * decrement RCX while the sandboxed write keeps PC anchored, so
-         * exec_tb returns without advancing PC; dedup skips appending
-         * and the loop spins forever until a downstream NULL-deref.
-         * Force PC past the offending insn after CST_FID_SLOT_COUNT
-         * same-PC iterations (same threshold as the per-insn memop cap). */
-        if (pre_pc == prev_pre_pc) {
-            same_pre_pc_count++;
-            /*
-             * A legitimate same-PC repeat is a rep-string op: PC stays
-             * anchored while each sandboxed iteration advances state
-             * (its memop grows g_wp_state.mem_accesses).  A repeat with
-             * NO such progress is a genuinely stuck excursion — a
-             * degenerate wrong-path target that re-faults or self-loops
-             * on every fetch, making no forward progress at all.  Those
-             * must die fast: in a system-mode kernel a stuck excursion
-             * recurs on essentially every BB, and at the old
-             * CST_FID_SLOT_COUNT (64) threshold each wasted ~64 steps,
-             * so the trace never advanced (observed: ~900k degenerate
-             * kernel excursions pinning an aarch64 system-mode run).
-             * Bail after two no-progress repeats; rep-string keeps the
-             * higher tolerance because its memop count climbs. */
-            if (g_wp_state.mem_accesses.size() == prev_mem_size) {
-                if (++wp_noprogress_count >= 2) {
-                    poisoned_targets.insert(pre_pc);
-                    acc.clear();
-                    bb_reg_snaps.clear();
-                    early_exit = true;
-                    break;
-                }
-            } else {
-                wp_noprogress_count = 0;
-            }
-        } else {
-            prev_pre_pc = pre_pc;
-            same_pre_pc_count = 1;
-            wp_noprogress_count = 0;
-        }
-        prev_mem_size = g_wp_state.mem_accesses.size();
-        if (same_pre_pc_count > CST_FID_SLOT_COUNT) {
-            /* rep-string overrun guard (PC anchored, memops climbing
-             * past the per-insn cap): nudge past the offending insn. */
-            BBTemplate *stuck = g_wp_state.last_executed_tb;
-            uint8_t isz = (stuck && stuck->n_insns > 0)
-                ? stuck->insn_sizes[0] : 1;
-            qemu_plugin_set_pc(pre_pc + isz);
-            same_pre_pc_count = 0;
-            prev_pre_pc = UINT64_MAX;
+        WpStep fp = wp_check_forward_progress(st);
+        if (fp == WpStep::NEXT_ITER) {
             continue;
         }
-
-        if (poisoned_targets.count(pre_pc)) {
-            early_exit = true;
-            break;
-        }
-
-        /*
-         * Privilege-domain-switch terminate — the faithful SMEP/PXN model.
-         * The excursion speculates at the launching context's privilege
-         * (excursion_is_kernel); a mispredicted fetch that reaches a code VA
-         * in the OTHER domain (kernel-context excursion reaching a user-VA
-         * fetch, or the reverse) is architecturally forbidden — the
-         * speculative fetch faults and the pipeline recovers — so no real core
-         * follows it.  End the excursion cleanly here, the same shape as the
-         * translation-unavailable terminate: the sealed chain so far is
-         * preserved and its last entry marked, and the crossing block is NOT
-         * fetched.  This complements the syscall-boundary terminate (a
-         * legitimate CORRECT-path domain transition, never a wrong-path one)
-         * and eliminates the cross-domain mis-stamp at its source, so a
-         * committed wrong-path block's VA class is always its true domain.
-         */
-        if (cst_va_is_kernel_code(pre_pc) != excursion_is_kernel) {
-            if (!wp_chain.empty()) {
-                wp_chain.back().translation_unavailable = true;
-            } else {
-                /* Crossing on the very first target (e.g. an indirect branch
-                 * mispredicted across the boundary): no entry to mark, so the
-                 * emitter writes a chain-level CST_WP_EVENT_TRANSLATION_UNAVAIL.
-                 * Not the wp_first_tb_unavail "bug" counter — this is an
-                 * expected architectural terminate, not an unfetchable target. */
-                *first_tb_unavail = true;
-            }
-            acc.clear();
-            bb_reg_snaps.clear();
-            early_exit = true;
+        if (fp != WpStep::PROCEED) {
+            /* STUCK_BAIL / DOMAIN_CROSS: the guard already dropped the
+             * accumulator and latched early_exit — end the excursion. */
             break;
         }
 

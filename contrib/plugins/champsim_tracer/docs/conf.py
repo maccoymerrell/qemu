@@ -18,20 +18,24 @@ author = "Maccoy Merrell"
 # downstream consumer.  Author is the individual contributor.
 copyright = "2026, ChampSim"
 
-# Read the trace format version from the C header so the docs and the
+# Read the trace format version from the C++ header so the docs and the
 # wire format never drift.  The format spec page references this.
+#
+# ``CST_MAGIC`` in champsim_tracer.h is an alias for ``cst_wire::MAGIC``,
+# whose numeric value lives in cst_wire_spec.h as
+# ``constexpr uint32_t MAGIC = 0x1D545343u``.  Parse that definition.
+# The magic is "CST" + an epoch byte in the high byte (0x1D545343 → 0x1D);
+# the epoch byte splits into major.minor nibbles (0x1D → "1.13").
 import re
 
 def _read_format_version() -> str:
-    header = os.path.join(os.path.dirname(__file__), "..", "champsim_tracer.h")
+    header = os.path.join(os.path.dirname(__file__), "..", "cst_wire_spec.h")
     try:
         with open(header, encoding="utf-8") as f:
             for line in f:
-                m = re.match(r"#define\s+CST_MAGIC\s+0x([0-9a-fA-F]+)u", line)
+                m = re.search(r"\bMAGIC\b\s*=\s*0x([0-9a-fA-F]+)u", line)
                 if m:
                     magic = int(m.group(1), 16)
-                    # Magic byte is "CST" + version-byte; the version
-                    # byte is the high byte (e.g., 0x19 → "1.9").
                     vb = (magic >> 24) & 0xFF
                     return f"{vb >> 4}.{vb & 0xF}"
     except FileNotFoundError:
@@ -44,9 +48,9 @@ version = release
 extensions = [
     "sphinx.ext.autosectionlabel",
     "sphinx.ext.intersphinx",
-    # myst-parser lets format.md stay as the canonical wire-format
-    # spec while Sphinx renders it alongside the .rst pages.  Optional
-    # — the format page falls back to a stub if myst isn't installed.
+    # myst-parser renders any Markdown docs in the tree.  The
+    # wire-format spec is reStructuredText (format.rst); myst stays
+    # available for incidental Markdown (e.g. README files).
     "myst_parser",
     # Local extension that parses the per-ISA classification tables
     # in champsim_tracer_mnemonics_*.h and emits the appendix at
@@ -60,10 +64,9 @@ extensions = [
     "auto_index",
 ]
 
-# Treat both .rst and .md as primary docs.  format.md is markdown so
-# the tracer's wire-format spec lives in one source file shared
-# between Sphinx, GitHub's repo browser, and any reader who wants raw
-# text.
+# Treat both .rst and .md as primary docs.  The reference pages,
+# including the wire-format spec (format.rst), are reStructuredText;
+# the .md mapping lets any incidental Markdown render alongside them.
 source_suffix = {
     ".rst": "restructuredtext",
     ".md":  "markdown",

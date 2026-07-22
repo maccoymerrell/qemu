@@ -1411,9 +1411,11 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     (void)correct_target;
 
     /* All loop-carried, per-iteration and per-excursion context lives in one
-     * WpWalkState so each phase can later move into a helper taking
-     * WpWalkState &; the same-name references below keep every moved body
-     * verbatim (the auto &bb_pcs = acc.bb_pcs; pattern). */
+     * WpWalkState.  Each phase of the walk is a helper taking WpWalkState &
+     * (wp_check_forward_progress / wp_exec_one_tb / wp_walk_fragments and the
+     * leaves those call); the same-name references below keep the driver's
+     * few remaining statements reading the accumulator verbatim (the
+     * auto &bb_pcs = acc.bb_pcs; pattern). */
     WpWalkState st;
     st.cpu_index         = cpu_index;
     st.wrong_target      = wrong_target;
@@ -1534,6 +1536,19 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     auto &pre_pc = st.pre_pc;
     auto &mem_start_idx = st.mem_start_idx;
     auto &tmpl = st.tmpl;
+    /*
+     * WP-walk driver.  Each outer iteration runs the phase pipeline over one
+     * speculative step and dispatches on the WpStep each phase returns:
+     * NEXT_ITER retries the iteration, PROCEED advances to the next phase,
+     * and any terminal reason has already latched st.early_exit / st.fault_stop
+     * so the tail break ends the excursion.  This compact dispatch is the
+     * SealedBB -> simulate_wrong_path seam a future WpScheduler (task #92)
+     * slots into.
+     *
+     *   wp_check_forward_progress  poison / stuck / rep-overrun / domain-cross
+     *   wp_exec_one_tb             one spec exec_tb + null/flush/wild-store
+     *   wp_walk_fragments          per-fragment append / memops / fault / commit
+     */
     while (sim_insns < (uint64_t)max_wrong_path_depth ||
            !bb_pcs.empty()) {
         pre_pc = qemu_plugin_get_pc();

@@ -174,6 +174,17 @@ struct Stats {
     uint64_t susp_displaced = 0;
     uint64_t susp_stale_retired = 0;
     uint64_t susp_orphan_dropped = 0;
+    /* Suspend-or-seal, abandoned-async arrow (Stage 4).  The stuck-window
+     * recovery's no-departure-PC arm suspends the deferred prev instead of
+     * dropping it, so the interrupted block seals at its own depth when the
+     * pinned context resumes (rather than the block's fault level being lost
+     * to a drop).  A subset of susp_pushed, tagged separately because it is a
+     * distinct drop site with its own (async-storm) contention signature; the
+     * abandoned arm falls through to the promote, so its suspension defers to
+     * a LATER resume (the same step's resume arrow is held off — cur is the
+     * force-closed window's OTHER thread, not this prev's successor).  Zero
+     * off the async-recovery path. */
+    uint64_t susp_abandoned = 0;
 
     /* Per-execution attribution.  cp_* bumped at vcpu_tb_exec walking
      * the prev TB's template; wp_* inside the WP per-iteration loop.

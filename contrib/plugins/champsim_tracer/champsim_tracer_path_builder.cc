@@ -802,6 +802,21 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
      * override was meant for. */
     seal_pc_override_ = 0;
 
+    /* One-step hold-off for the resume arrow (Stage 4).  The abandoned-async
+     * no-departure arm suspends the deferred prev and then FALLS THROUGH to
+     * the promote (unlike the foreign-ASID arrow, which returns early).  If
+     * the resume arrow ran on this same step it would immediately re-arm and
+     * seal that just-suspended prev against cur — but the abandoned window
+     * means cur is the OTHER guest thread the scheduler handed this vCPU
+     * (a proper resume would have refetched the departure PC), not prev's
+     * successor, so that seal is the cross-thread taken-edge poisoning the
+     * departure-PC override exists to prevent.  Holding the resume off this
+     * one step lets cur promote fresh and defers the suspended prev to its
+     * TRUE successor's later resume (or the retire-at-return backstop).  Only
+     * the abandoned arm sets it; off the async-recovery path it stays false
+     * and the resume arrow is unchanged (byte-identical). */
+    bool hold_resume_this_step = false;
+
     /* Segment-boundary reg-snap hygiene (Case C).  A change in the segment
      * generation since this thread's last step means the segment just opened
      * under it.  In marker mode the opener's own vcpu_tb_exec is JIT-gated
@@ -905,13 +920,43 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
                 seal_pc_override_ = async_departure_pc_;
                 async_departure_pc_ = 0;
             } else if (prev_tb_) {
-                /* Same retire-at-return as the foreign-ASID drop: the
-                 * abandoned window is dropping prev, so an inner frame whose
-                 * resume suffix it is must be flushed at its depth first. */
-                flush_dropped_prev(in.cpu_index, in.pinned_asid);
-                g_mem_recorder.clear_cp();
-                pending_reg_snaps.clear();
-                clear_prev();
+                if (pb_foreign_drop_legacy()) {
+                    /* LEGACY drop (CST_FOREIGN_DROP, Decision D A/B).  Retire
+                     * the level (if prev is an inner fault frame's resume
+                     * suffix, emit its depth before the drop loses it), then
+                     * drop prev — the one-TB lossy boundary. */
+                    flush_dropped_prev(in.cpu_index, in.pinned_asid);
+                    g_mem_recorder.clear_cp();
+                    pending_reg_snaps.clear();
+                    clear_prev();
+                } else {
+                    /* SUSPEND-OR-SEAL, abandoned-async arrow (default, plan
+                     * §1.2, Stage 4).  Freeze the deferred prev + its four
+                     * sinks onto the suspension stack instead of dropping
+                     * them, so an inner fault-handler level interrupted by an
+                     * abandoned window seals at ITS OWN depth when the pinned
+                     * context returns, rather than being lost to the drop.
+                     * The abandoned arm falls THROUGH to promote cur (the
+                     * force-closed window's block, which the recovery keeps
+                     * traced — g_capture_mute stayed false), so the resume
+                     * arrow is held off this one step (hold_resume_this_step):
+                     * cur is the other thread, not prev's successor, and an
+                     * immediate resume would seal prev against it — exactly
+                     * the cross-thread edge the no-departure drop avoided.
+                     * The suspension defers to prev's true later resume, or
+                     * to the retire-at-return backstop if it never returns. */
+                    suspend_prev(prev_owner_asid_, prev_owner_live_,
+                                 in.cpu_index);
+                    g_stats.susp_abandoned++;
+                    clear_prev();
+                    hold_resume_this_step = true;
+                    if (pb_diag() || pb_susp_diag()) {
+                        fprintf(stderr, "[pathbuilder] ABANDONED-SUSPEND "
+                                "cur=0x%" PRIx64 " (no departure pc; prev "
+                                "deferred to later resume)\n",
+                                in.cur ? in.cur->start_pc : 0);
+                    }
+                }
             }
             if (pb_diag()) {
                 fprintf(stderr, "[pathbuilder] ABANDONED-WINDOW recovery "
@@ -1020,8 +1065,14 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
      * restoring the deferred prev + its four frozen sinks — so the promote
      * below walks the SUSPENDED prev and the seal emits the intermediate
      * handler level at its own depth.  Off the contention path the stack is
-     * empty and this is a no-op (byte-identical). */
-    if (!susp_stack_.empty()) {
+     * empty and this is a no-op (byte-identical).
+     *
+     * hold_resume_this_step suppresses the pop for the one step where the
+     * abandoned-async arrow just suspended prev and fell through (Stage 4):
+     * cur is the force-closed window's OTHER thread, so resuming prev against
+     * it here would fabricate the cross-thread edge the arm suspended to
+     * avoid — the suspension waits for prev's true successor instead. */
+    if (!susp_stack_.empty() && !hold_resume_this_step) {
         resume_suspension(in.pinned_asid, in.live_asid);
     }
 

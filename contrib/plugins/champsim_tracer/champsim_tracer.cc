@@ -4085,7 +4085,7 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
      * capture_owned == CAPTURE ownership: which user TBs reach the trace.
      *                In latch it equals user_owned; in trace-all it widens
      *                to EVERY user TB (foreign processes are captured too),
-     *                so the foreign-ASID drop in step_events lets them
+     *                so the foreign-ASID boundary in step_events lets them
      *                through and kernel work folds to whichever process
      *                last ran user code. */
     bool user_owned = false;
@@ -4173,7 +4173,7 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     in.cpu_index = cpu_index;
     in.watch_pc = watch_pc;
 
-    /* Pre-window phase: async-window arrows, foreign-ASID drop, prev
+    /* Pre-window phase: async-window arrows, foreign-ASID boundary, prev
      * swap — in that order, before any window decision. */
     PathBuilder::StepStatus st = pb.step_events(in);
     if (st != PathBuilder::StepStatus::CONTINUE) {
@@ -4182,8 +4182,7 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
              * here means the user clock advances but nothing traces. */
             if (st == PathBuilder::StepStatus::SUSPENDED) {
                 tls_mkdiag_susp_user++;
-            } else if (st == PathBuilder::StepStatus::DROPPED_FOREIGN ||
-                       st == PathBuilder::StepStatus::SUSPENDED_FOREIGN) {
+            } else if (st == PathBuilder::StepStatus::SUSPENDED_FOREIGN) {
                 tls_mkdiag_foreign_user++;
             }
         }
@@ -4312,9 +4311,9 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
  * unpinned system, or a wide-register pin.  It is the whole per-foreign-
  * TB budget: no VClockPauseGuard, no PathBuilder step, and exec_lock is
  * taken only on the user-TB probe path.  Everything the heavy callback's
- * DROPPED_FOREIGN branch used to do for a foreign span (mute the per-insn
- * capture callbacks, drop the deferred prev so nothing seals across the
- * gap, tick the user-clock cursor) is done here instead — cheaply — and
+ * foreign-ASID arm used to do for a foreign span (mute the per-insn
+ * capture callbacks, set the deferred prev aside so nothing seals across
+ * the gap, tick the user-clock cursor) is done here instead — cheaply — and
  * on the TB that re-acquires the pinned process it flips trace_this_ctx
  * to 1 so the heavy callback's re-loaded brcond fires for that same TB.
  */

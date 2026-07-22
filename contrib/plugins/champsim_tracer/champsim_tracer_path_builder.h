@@ -205,10 +205,8 @@ public:
     enum class StepStatus {
         CONTINUE,         /* step_events: proceed to window mgmt + seal */
         SUSPENDED,        /* async window open: prev untouched, TB dropped */
-        DROPPED_FOREIGN,  /* foreign ASID: prev dropped (one-TB lossy; the
-                           * CST_FOREIGN_DROP legacy A/B path) */
         SUSPENDED_FOREIGN,/* foreign ASID: prev SUSPENDED onto the stack for
-                           * the pinned process's resume (default) */
+                           * the pinned process's resume */
         STASHED,          /* prev folded into a fault frame; nothing seals */
         NO_SEAL,          /* no previous context / no BB completed */
         MERGED,           /* a fault frame completed and emitted */
@@ -321,22 +319,14 @@ private:
      * Caller holds exec_lock; data_lock is NOT held. */
     void flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
                              unsigned int cpu_index);
-    /* Called from a step_events DROP arm (foreign-ASID / abandoned-async)
-     * right before the deferred prev is cleared: if that prev is an inner
-     * fault frame's resume suffix — the block whose seal would have
-     * completed the merge — retire the frame now via flush_frame_unwound so
-     * its depth level is not lost with the dropped block.  Fetches the
-     * active body stream itself (no-op when no segment is active).
-     * @seal_asid is the pinned process's effective asid (StepIn::pinned_asid):
-     * the dropped prev is the pinned process's OWN block, so the retired
-     * frame is matched within one (thread,asid) — same key as completion. */
-    void flush_dropped_prev(unsigned int cpu_index, uint64_t seal_asid);
-
     /* Retire-at-return on the block @prev (the pinned process's own deferred
      * prev, matched within its (thread,asid)): if @prev is an inner fault
-     * frame's resume suffix, flush that frame at its depth so its level is
-     * not lost.  The (prev, seal_asid) generalisation of flush_dropped_prev;
-     * shared by the DROP arm and by a suspension retired without resuming. */
+     * frame's resume suffix, flush that frame at its depth via
+     * flush_frame_unwound so its level is not lost.  Fetches the active body
+     * stream itself (no-op when no segment is active).  Used for a
+     * suspension retired without resuming (over-cap displacement / stale
+     * sweep).  @seal_asid is the owning effective asid, so the retired frame
+     * is matched within one (thread,asid) — same key as completion. */
     void retire_prev_frame(BBTemplate *prev, uint64_t seal_asid,
                            unsigned int cpu_index);
 

@@ -786,8 +786,7 @@ events must survive bailed steps until a seal consumes them), then:
   deferred prev is set aside — *suspended* onto a bounded per-thread
   stack keyed on the pinned effective ASID, so the interrupted block
   seals at its own fault depth when the pinned context returns, rather
-  than being dropped (see :ref:`suspend-or-seal <suspend-or-seal>`; legacy drop stays
-  behind ``CST_FOREIGN_DROP`` for A/B).  The async mute suspend runs
+  than being dropped (see :ref:`suspend-or-seal <suspend-or-seal>`).  The async mute suspend runs
   *first*: an async excursion routinely context-switches through
   foreign address spaces, and those TBs must take the mute suspend
   (which leaves the pending seal untouched for the resume), not the
@@ -1349,8 +1348,6 @@ guest thread the abandoned window hid, not the suspended prev's successor,
 so the resume arrow is held off for that one step: the suspension waits for
 its true successor's later resume rather than sealing against the wrong
 thread (the cross-thread taken edge the departure-PC seal exists to avoid).
-Legacy behaviour — dropping the deferred prev outright — is retained behind
-``CST_FOREIGN_DROP`` for byte-parity A/B.
 
 **Retire-at-return: the backstop suspend-or-seal cannot cover.**  A
 suspension normally resumes and reseals.  A residual set cannot: one
@@ -1467,8 +1464,7 @@ deferred prev is *suspended* like the foreign-ASID boundary suspends
 it (see :ref:`suspend-or-seal <suspend-or-seal>`), to seal at its own depth when the
 pinned context truly resumes — with its same-step resume held off, so
 the current (other-thread) TB promotes fresh instead of taking the
-suspended prev's seal.  Legacy behaviour drops it, accumulated captures
-included, behind ``CST_FOREIGN_DROP``.
+suspended prev's seal.
 
 .. _time-transparency:
 

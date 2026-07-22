@@ -73,6 +73,15 @@ guard byte-inert off-path per the byte-identical goldens).
 - **D — SHIP suspend as default**, legacy-drop behind `CST_FOREIGN_DROP` for
   byte-parity A/B; remove the flag once the contention gate is 0-fail over two
   independent 50-seed waves.
+  **SATISFIED 2026-07-22 — flag and legacy drop arms REMOVED.**  Wave 1
+  (`rearch_s3/wave_suspend_v2`, seeds 7300-7351): 52 traces, JUMP=0 ANCHOR=0,
+  44 PASS / 10 TIMEOUT / 0 FAULTNEST_FAIL.  Wave 2 (`retire/wave2`, fresh
+  seeds 8300-8351, same 2×4-core-island `parallel -j12` regime): 52 traces,
+  JUMP=0 ANCHOR=0 decode-errors=0, 45 PASS / 9 TIMEOUT / 0 FAULTNEST_FAIL.
+  Suspend-or-seal is now the only foreign-ASID / abandoned-async path; the
+  `CST_FOREIGN_DROP` env check, both legacy drop arms, `flush_dropped_prev`,
+  and the `DROPPED_FOREIGN` step status are deleted
+  (`champsim_tracer_path_builder.{h,cc}`, `champsim_tracer.cc`).
 - **E — retire-at-return PERMANENT backstop** (covers the structurally
   un-resumable cases the stack can't: killed task, orphan, over-cap, a foreign
   span that never returns; its anchor guard bars any depth-JUMP→anchor trade). Everything cited was read in the current tree, not assumed. The

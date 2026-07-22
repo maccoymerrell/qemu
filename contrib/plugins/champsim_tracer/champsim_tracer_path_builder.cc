@@ -50,17 +50,6 @@ static bool pb_diag()
     return v;
 }
 
-/* Suspend-or-seal A/B toggle (Decision D): the foreign-ASID boundary
- * SUSPENDS the deferred prev by default (Stage 3); CST_FOREIGN_DROP selects
- * the legacy one-TB-lossy DROP for byte-parity A/B against pre-Stage-3.
- * Removed once the contention gate is 0-fail over two independent 50-seed
- * waves. */
-static bool pb_foreign_drop_legacy()
-{
-    static const bool v = getenv("CST_FOREIGN_DROP") != nullptr;
-    return v;
-}
-
 /* Suspend-stack push/pop/displacement diagnostics (env-gated), for the
  * contention-run evidence the acceptance gate asks for. */
 static bool pb_susp_diag()
@@ -910,9 +899,9 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
              * where the interrupted flow architecturally continues, making
              * this seal identical to the one a proper resume would have
              * produced.  When no departure PC is known (window predates
-             * the segment prime), drop prev like the foreign-ASID
-             * boundary does — prev's accumulated memops die with it, or
-             * they would collapse onto the next entry's slots. */
+             * the segment prime), that seal target is unavailable, so
+             * prev is suspended like the foreign-ASID boundary suspends
+             * it (below). */
             qemu_plugin_async_int_reset();
             async_excluding_ = false;
             g_capture_mute = false;
@@ -920,42 +909,31 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
                 seal_pc_override_ = async_departure_pc_;
                 async_departure_pc_ = 0;
             } else if (prev_tb_) {
-                if (pb_foreign_drop_legacy()) {
-                    /* LEGACY drop (CST_FOREIGN_DROP, Decision D A/B).  Retire
-                     * the level (if prev is an inner fault frame's resume
-                     * suffix, emit its depth before the drop loses it), then
-                     * drop prev — the one-TB lossy boundary. */
-                    flush_dropped_prev(in.cpu_index, in.pinned_asid);
-                    g_mem_recorder.clear_cp();
-                    pending_reg_snaps.clear();
-                    clear_prev();
-                } else {
-                    /* SUSPEND-OR-SEAL, abandoned-async arrow (default, plan
-                     * §1.2, Stage 4).  Freeze the deferred prev + its four
-                     * sinks onto the suspension stack instead of dropping
-                     * them, so an inner fault-handler level interrupted by an
-                     * abandoned window seals at ITS OWN depth when the pinned
-                     * context returns, rather than being lost to the drop.
-                     * The abandoned arm falls THROUGH to promote cur (the
-                     * force-closed window's block, which the recovery keeps
-                     * traced — g_capture_mute stayed false), so the resume
-                     * arrow is held off this one step (hold_resume_this_step):
-                     * cur is the other thread, not prev's successor, and an
-                     * immediate resume would seal prev against it — exactly
-                     * the cross-thread edge the no-departure drop avoided.
-                     * The suspension defers to prev's true later resume, or
-                     * to the retire-at-return backstop if it never returns. */
-                    suspend_prev(prev_owner_asid_, prev_owner_live_,
-                                 in.cpu_index);
-                    g_stats.susp_abandoned++;
-                    clear_prev();
-                    hold_resume_this_step = true;
-                    if (pb_diag() || pb_susp_diag()) {
-                        fprintf(stderr, "[pathbuilder] ABANDONED-SUSPEND "
-                                "cur=0x%" PRIx64 " (no departure pc; prev "
-                                "deferred to later resume)\n",
-                                in.cur ? in.cur->start_pc : 0);
-                    }
+                /* SUSPEND-OR-SEAL, abandoned-async arrow (plan §1.2,
+                 * Stage 4).  Freeze the deferred prev + its four sinks
+                 * onto the suspension stack, so an inner fault-handler
+                 * level interrupted by an abandoned window seals at ITS
+                 * OWN depth when the pinned context returns, rather than
+                 * being lost.  The abandoned arm falls THROUGH to promote
+                 * cur (the force-closed window's block, which the
+                 * recovery keeps traced — g_capture_mute stayed false),
+                 * so the resume arrow is held off this one step
+                 * (hold_resume_this_step): cur is the other thread, not
+                 * prev's successor, and an immediate resume would seal
+                 * prev against it — exactly the cross-thread taken edge
+                 * the departure-PC seal exists to avoid.  The suspension
+                 * defers to prev's true later resume, or to the
+                 * retire-at-return backstop if it never returns. */
+                suspend_prev(prev_owner_asid_, prev_owner_live_,
+                             in.cpu_index);
+                g_stats.susp_abandoned++;
+                clear_prev();
+                hold_resume_this_step = true;
+                if (pb_diag() || pb_susp_diag()) {
+                    fprintf(stderr, "[pathbuilder] ABANDONED-SUSPEND "
+                            "cur=0x%" PRIx64 " (no departure pc; prev "
+                            "deferred to later resume)\n",
+                            in.cur ? in.cur->start_pc : 0);
                 }
             }
             if (pb_diag()) {
@@ -1014,28 +992,8 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
             drop = !kexc_kernel_tb_keep();
         }
         if (drop) {
-            if (pb_foreign_drop_legacy()) {
-                /* LEGACY drop (CST_FOREIGN_DROP, Decision D A/B).  The
-                 * deferred prev is DROPPED — the one-TB lossy boundary —
-                 * rather than suspended, so its fragments never bridge across
-                 * the gap.  Retire-at-return first (if prev is an inner fault
-                 * frame's resume suffix, emit its depth level before the drop
-                 * loses it — otherwise the frame leaks and the unwind
-                 * collapses into a >1 depth jump).  Then prev's memops and
-                 * reg snaps die with it (left in place they collapse onto the
-                 * next emitted entry's insn 0 / slide its positional dst
-                 * attribution); mute the foreign TB's upcoming accesses too
-                 * (the step recomputes g_capture_mute at every dispatch, so
-                 * the mute self-clears with the span). */
-                flush_dropped_prev(in.cpu_index, in.pinned_asid);
-                g_mem_recorder.clear_cp();
-                pending_reg_snaps.clear();
-                g_capture_mute = true;
-                clear_prev();
-                return StepStatus::DROPPED_FOREIGN;
-            }
-            /* SUSPEND-OR-SEAL (default, plan §1.2).  Freeze the deferred prev
-             * + its four sinks onto the suspension stack instead of dropping
+            /* SUSPEND-OR-SEAL (plan §1.2).  Freeze the deferred prev + its
+             * four sinks onto the suspension stack instead of dropping
              * them, so the pinned process's resume seals the interrupted
              * (fault-handler) block at ITS OWN DEPTH — closing the
              * syscall_fault_nesting manifestations where the intermediate
@@ -1045,8 +1003,10 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
              * retire-at-return backstop covers only the un-resumable tail
              * (displacement / orphan / stale sweep).  When prev is null there
              * is nothing to suspend (a second foreign TB in the same span,
-             * prev already cleared) — just clear the accumulators as the
-             * legacy path did.  Mute the foreign TB's accesses either way. */
+             * prev already cleared) — just clear the accumulators.  Mute the
+             * foreign TB's accesses either way (the step recomputes
+             * g_capture_mute at every dispatch, so the mute self-clears with
+             * the span). */
             if (prev_tb_) {
                 suspend_prev(prev_owner_asid_, prev_owner_live_, in.cpu_index);
             } else {
@@ -1119,13 +1079,13 @@ PathBuilder::complete_merge(size_t idx,
      * live excursion).  Any frame still in flight that nests DEEPER (a higher
      * stack index; frames_ is push / fault-nesting order) has leaked: inner
      * faults unwind before their outer under strict LIFO, so a deeper frame
-     * surviving to this completion means its own resume suffix was dropped /
+     * surviving to this completion means its own resume suffix was lost /
      * never sealed under contention.  Emit each inner (depth >= 1) frame's
      * level now, deepest-first, BEFORE the outer frame's merged BB, so the
      * unwind steps down one level at a time (2->1->0) instead of collapsing
-     * straight to the outer's depth (2->0 — the syscall_fault_nesting jump the
-     * drop-arm flush_dropped_prev cannot reach, because the leaked frame's
-     * suffix was never on a DROP arm).  Depth >= 1 mirrors flush_dropped_prev:
+     * straight to the outer's depth (2->0 — the syscall_fault_nesting jump
+     * retire_prev_frame cannot reach, because the leaked frame's suffix never
+     * passed through a suspension).  Depth >= 1 mirrors retire_prev_frame:
      * a depth-0 (user) frame is the unwind floor and never anchors a >1 jump,
      * and emitting user code standalone would degrade an entry the content
      * oracle validates.
@@ -1331,16 +1291,18 @@ void PathBuilder::flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
 }
 
 /*
- * A step_events DROP arm is about to clear the deferred prev.  If that prev is
- * an in-flight INNER fault frame's resume suffix, its seal would have
- * completed the merge — retiring that frame at its return.  Dropping it
- * silently is exactly what leaks the frame under contention (it lingers
- * un-returned, inflating every later fault's depth until a coarse sweep
- * collapses it: the residual 2->0 / kernel 2->0->2 depth jump).  Retire it
- * now instead, emitting its depth level at the unwind.  Only inner (depth>=1,
- * kernel-handler) frames flush: a depth-0 (user) frame is the unwind floor —
- * it can never anchor a >1 jump — and emitting user code standalone would
- * degrade a user entry the content oracle validates.
+ * A deferred prev is about to be discarded without resuming (the
+ * retire-at-return tail: an over-cap displacement or a stale sweep past its
+ * owner's return).  If that prev is an in-flight INNER fault frame's resume
+ * suffix, its seal would have completed the merge — retiring that frame at
+ * its return.  Discarding it silently is exactly what leaks the frame under
+ * contention (it lingers un-returned, inflating every later fault's depth
+ * until a coarse sweep collapses it: the residual 2->0 / kernel 2->0->2
+ * depth jump).  Retire it now instead, emitting its depth level at the
+ * unwind.  Only inner (depth>=1, kernel-handler) frames flush: a depth-0
+ * (user) frame is the unwind floor — it can never anchor a >1 jump — and
+ * emitting user code standalone would degrade a user entry the content
+ * oracle validates.
  */
 void PathBuilder::retire_prev_frame(BBTemplate *prev, uint64_t seal_asid,
                                     unsigned int cpu_index)
@@ -1360,11 +1322,6 @@ void PathBuilder::retire_prev_frame(BBTemplate *prev, uint64_t seal_asid,
     if (ci >= 0 && frames_[(size_t)ci].depth >= 1) {
         flush_frame_unwound((size_t)ci, out_stream, cpu_index);
     }
-}
-
-void PathBuilder::flush_dropped_prev(unsigned int cpu_index, uint64_t seal_asid)
-{
-    retire_prev_frame(prev_tb_, seal_asid, cpu_index);
 }
 
 /*

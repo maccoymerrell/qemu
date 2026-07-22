@@ -708,6 +708,168 @@ static void wp_attribute_memops(WpWalkState &st, BBTemplate *cur,
             }
 }
 
+/*
+ * Seal a completed true BB discovered on the wrong path: pick its landing
+ * PC, compute the architectural fall-through, commit it into the shared
+ * template cache (seeding is_system from its VA class), record the
+ * terminal-branch taken edge for non-indirect branches, and push the
+ * WPBBEntry onto the chain.  Reports the block's landing PC in
+ * @commit_post_pc and whether it sealed on a post-completion fault-stop in
+ * @this_bb_fault_stop (both consumed by the fragment loop's terminal
+ * checks, which run after acc.clear()).  Body moved verbatim.
+ */
+static void wp_commit_bb(WpWalkState &st, BBTemplate *cur,
+                         uint32_t n_executed_in_cur, uint8_t last_insn_size,
+                         uint64_t fault_redispatch_pc,
+                         uint64_t &commit_post_pc, bool &this_bb_fault_stop)
+{
+    auto &acc               = st.acc;
+    auto &bb_pcs            = acc.bb_pcs;
+    auto &bb_sizes          = acc.bb_sizes;
+    auto &bb_bytes          = acc.bb_bytes;
+    auto &bb_fields         = acc.bb_fields;
+    auto &bb_regnames       = acc.bb_regnames;
+    auto &bb_start_pc       = acc.bb_start_pc;
+    auto &bb_symbol_name    = acc.bb_symbol_name;
+    auto &bb_has_fault      = acc.bb_has_fault;
+    auto &bb_first_fault_idx = acc.bb_first_fault_idx;
+    auto &wp_chain          = st.chain;
+    auto &pre_pc            = st.pre_pc;
+    auto &post_pc_now       = st.post_pc_now;
+    auto &repeated_fault_pc = st.repeated_fault_pc;
+    auto &last_fault_pc     = st.last_fault_pc;
+
+            /* Branch fired: commit completed BB.  Still a true
+             * branch-bounded BB (basic_block.md), so it goes into
+             * bb_map_ unconditionally; bb_has_fault carries any
+             * earlier in-BB fault and the WPBBEntry's fault flag
+             * tells the consumer speculation would have squashed at
+             * fault_insn_index. */
+            if (fault_redispatch_pc != UINT64_MAX) {
+                /* A direct-match execution fault landed on this BB's terminator
+                 * (a conditional trap).  The trap itself never redirected — the
+                 * excursion continues at its architectural fall-through — so
+                 * land at skip_pc, not the trap's own PC (which post_pc_now
+                 * holds and which we just poisoned). */
+                commit_post_pc = fault_redispatch_pc;
+            } else if (cur->next_tb_fragment) {
+                /* Mid-TB fragment whose branch we just classified as
+                 * fired: by construction (only the trap-fires path
+                 * stops the walk via fault_consumed) we never reach
+                 * here for a no-trap intermediate; if execution did
+                 * continue past this fragment, branch_fired wouldn't
+                 * really have fired and we'd not be on this code
+                 * path.  Use the next fragment's start_pc as the
+                 * landing point. */
+                commit_post_pc = cur->next_tb_fragment->start_pc;
+            } else {
+                commit_post_pc = post_pc_now;
+            }
+            repeated_fault_pc = 0;
+            last_fault_pc = UINT64_MAX;
+
+            /*
+             * Architectural fall-through = PC after the BB's LAST
+             * INSTRUCTION (the branch), NOT @pre_pc + last_insn_size.
+             * @pre_pc is the START of the current TB fragment; for a
+             * multi-insn fragment that's some insn BEFORE the branch
+             * and gives a fall_through that lands INSIDE the BB.
+             * Use the branch's own PC + its size instead.  Because
+             * WP-discovered BBs are committed to the shared
+             * bb_template_cache BEFORE the CP-side commit (WP runs
+             * inside emit_finalized_bb), a wrong value here is
+             * inherited by every subsequent CP lookup of the same BB.
+             */
+            uint64_t last_insn_pc = n_executed_in_cur > 0
+                ? cur->insn_pcs[n_executed_in_cur - 1]
+                : pre_pc;
+            uint64_t fall_through = last_insn_pc + last_insn_size;
+
+            g_mutex_lock(&data_lock);
+            /* The shared-kernel-bucket key is chosen from bb_start_pc's VA
+             * class inside commit_true_bb_refs (store_asid_root): a kernel-VA
+             * block joins the one shared kernel template even when only the
+             * wrong path ever discovers it, while a user VA can never reach
+             * the sentinel (kernel/user VA ranges are disjoint), so a
+             * speculative is_system mis-stamp cannot conflate two processes'
+             * user code.  The domain-switch terminate above guarantees this
+             * committed block was fetched entirely within one privilege
+             * domain, so its VA class is its true domain. */
+            BBTemplate *bb_tmpl = g_template_store.commit_true_bb_refs(
+                bb_start_pc, (uint32_t)bb_pcs.size(),
+                bb_pcs.data(),
+                bb_fields.data(),
+                bb_sizes.data(),
+                bb_bytes.data(),
+                g_features.reg_data ? bb_regnames.data() : nullptr,
+                bb_symbol_name, fall_through);
+            /* Privilege seed for WP-only-discovered BBs.  Seed from the
+             * architectural VA class of the block's start, not the wrong-path
+             * priv level: a kernel-VA block IS kernel code regardless of what
+             * a speculative translation observed, so this is a reliable seed
+             * (SMEP/PXN forbid kernel-context execution of user pages, and the
+             * domain-switch terminate ends any excursion that would cross the
+             * boundary).  A correct-path finalize of the same BB still
+             * overrides and latches the authoritative value (see
+             * BBTemplate::is_system). */
+            if (bb_tmpl && !bb_tmpl->is_system_cp_confirmed) {
+                bb_tmpl->is_system = cst_va_is_kernel_code(bb_start_pc);
+            }
+            g_mutex_unlock(&data_lock);
+
+            /*
+             * Record the terminal-branch taken edge for NON-indirect
+             * branches found on the wrong path (see the pre-splitter
+             * comment).
+             */
+            if (bb_tmpl && bb_tmpl->taken_pc == 0 && !bb_fields.empty()) {
+                const InsnFields *lf = bb_fields.back();
+                if (lf->branch_type == BRANCH_NONE && bb_fields.size() >= 2) {
+                    /* Delay-slot tail: terminator is the insn before
+                     * the trailing delay slot. */
+                    lf = bb_fields[bb_fields.size() - 2];
+                }
+                bool indirect =
+                    lf->branch_type == BRANCH_INDIRECT_JUMP ||
+                    lf->branch_type == BRANCH_RETURN ||
+                    lf->branch_type == BRANCH_INDIRECT_CALL;
+                if (!indirect) {
+                    bool cond = lf->branch_type == BRANCH_COND_DIRECT ||
+                                (lf->branch_type == BRANCH_DIRECT_JUMP &&
+                                 lf->branch_conditional);
+                    uint64_t taken;
+                    if (commit_post_pc != fall_through) {
+                        taken = commit_post_pc;
+                    } else if (cond && lf->has_immediate &&
+                               (uint64_t)lf->immediate != fall_through) {
+                        taken = (uint64_t)lf->immediate;
+                    } else {
+                        taken = commit_post_pc;
+                    }
+                    if (taken != 0) {
+                        bb_tmpl->taken_pc = taken;
+                    }
+                }
+            }
+
+            this_bb_fault_stop = acc.bb_fault_stop;
+
+            /* Terminal-branch outcome for the CST_FID_BRANCH_* singletons on
+             * this WP block.  commit_post_pc is the PC the block's terminating
+             * branch actually reached — the next chain block's start_pc (and,
+             * for the chain's last block, where the excursion would continue).
+             * Stamped verbatim; direction/target are derived at wire-emit time
+             * and delta-encode through the per-chain WP overlay (correction:
+             * WP now carries these, delta'd against the last WP emission, not
+             * a fresh baseline). */
+            WPBBEntry wp_entry = acc.make_entry(bb_tmpl,
+                                                bb_has_fault,
+                                                bb_first_fault_idx);
+            wp_entry.branch_successor_pc    = commit_post_pc;
+            wp_entry.branch_successor_known = true;
+            wp_chain.push_back(std::move(wp_entry));
+}
+
 std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                                uint64_t correct_target,
                                                uint64_t wrong_target,
@@ -1285,136 +1447,11 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                 continue;
             }
 
-            /* Branch fired: commit completed BB.  Still a true
-             * branch-bounded BB (basic_block.md), so it goes into
-             * bb_map_ unconditionally; bb_has_fault carries any
-             * earlier in-BB fault and the WPBBEntry's fault flag
-             * tells the consumer speculation would have squashed at
-             * fault_insn_index. */
             uint64_t commit_post_pc;
-            if (fault_redispatch_pc != UINT64_MAX) {
-                /* A direct-match execution fault landed on this BB's terminator
-                 * (a conditional trap).  The trap itself never redirected — the
-                 * excursion continues at its architectural fall-through — so
-                 * land at skip_pc, not the trap's own PC (which post_pc_now
-                 * holds and which we just poisoned). */
-                commit_post_pc = fault_redispatch_pc;
-            } else if (cur->next_tb_fragment) {
-                /* Mid-TB fragment whose branch we just classified as
-                 * fired: by construction (only the trap-fires path
-                 * stops the walk via fault_consumed) we never reach
-                 * here for a no-trap intermediate; if execution did
-                 * continue past this fragment, branch_fired wouldn't
-                 * really have fired and we'd not be on this code
-                 * path.  Use the next fragment's start_pc as the
-                 * landing point. */
-                commit_post_pc = cur->next_tb_fragment->start_pc;
-            } else {
-                commit_post_pc = post_pc_now;
-            }
-            repeated_fault_pc = 0;
-            last_fault_pc = UINT64_MAX;
-
-            /*
-             * Architectural fall-through = PC after the BB's LAST
-             * INSTRUCTION (the branch), NOT @pre_pc + last_insn_size.
-             * @pre_pc is the START of the current TB fragment; for a
-             * multi-insn fragment that's some insn BEFORE the branch
-             * and gives a fall_through that lands INSIDE the BB.
-             * Use the branch's own PC + its size instead.  Because
-             * WP-discovered BBs are committed to the shared
-             * bb_template_cache BEFORE the CP-side commit (WP runs
-             * inside emit_finalized_bb), a wrong value here is
-             * inherited by every subsequent CP lookup of the same BB.
-             */
-            uint64_t last_insn_pc = n_executed_in_cur > 0
-                ? cur->insn_pcs[n_executed_in_cur - 1]
-                : pre_pc;
-            uint64_t fall_through = last_insn_pc + last_insn_size;
-
-            g_mutex_lock(&data_lock);
-            /* The shared-kernel-bucket key is chosen from bb_start_pc's VA
-             * class inside commit_true_bb_refs (store_asid_root): a kernel-VA
-             * block joins the one shared kernel template even when only the
-             * wrong path ever discovers it, while a user VA can never reach
-             * the sentinel (kernel/user VA ranges are disjoint), so a
-             * speculative is_system mis-stamp cannot conflate two processes'
-             * user code.  The domain-switch terminate above guarantees this
-             * committed block was fetched entirely within one privilege
-             * domain, so its VA class is its true domain. */
-            BBTemplate *bb_tmpl = g_template_store.commit_true_bb_refs(
-                bb_start_pc, (uint32_t)bb_pcs.size(),
-                bb_pcs.data(),
-                bb_fields.data(),
-                bb_sizes.data(),
-                bb_bytes.data(),
-                g_features.reg_data ? bb_regnames.data() : nullptr,
-                bb_symbol_name, fall_through);
-            /* Privilege seed for WP-only-discovered BBs.  Seed from the
-             * architectural VA class of the block's start, not the wrong-path
-             * priv level: a kernel-VA block IS kernel code regardless of what
-             * a speculative translation observed, so this is a reliable seed
-             * (SMEP/PXN forbid kernel-context execution of user pages, and the
-             * domain-switch terminate ends any excursion that would cross the
-             * boundary).  A correct-path finalize of the same BB still
-             * overrides and latches the authoritative value (see
-             * BBTemplate::is_system). */
-            if (bb_tmpl && !bb_tmpl->is_system_cp_confirmed) {
-                bb_tmpl->is_system = cst_va_is_kernel_code(bb_start_pc);
-            }
-            g_mutex_unlock(&data_lock);
-
-            /*
-             * Record the terminal-branch taken edge for NON-indirect
-             * branches found on the wrong path (see the pre-splitter
-             * comment).
-             */
-            if (bb_tmpl && bb_tmpl->taken_pc == 0 && !bb_fields.empty()) {
-                const InsnFields *lf = bb_fields.back();
-                if (lf->branch_type == BRANCH_NONE && bb_fields.size() >= 2) {
-                    /* Delay-slot tail: terminator is the insn before
-                     * the trailing delay slot. */
-                    lf = bb_fields[bb_fields.size() - 2];
-                }
-                bool indirect =
-                    lf->branch_type == BRANCH_INDIRECT_JUMP ||
-                    lf->branch_type == BRANCH_RETURN ||
-                    lf->branch_type == BRANCH_INDIRECT_CALL;
-                if (!indirect) {
-                    bool cond = lf->branch_type == BRANCH_COND_DIRECT ||
-                                (lf->branch_type == BRANCH_DIRECT_JUMP &&
-                                 lf->branch_conditional);
-                    uint64_t taken;
-                    if (commit_post_pc != fall_through) {
-                        taken = commit_post_pc;
-                    } else if (cond && lf->has_immediate &&
-                               (uint64_t)lf->immediate != fall_through) {
-                        taken = (uint64_t)lf->immediate;
-                    } else {
-                        taken = commit_post_pc;
-                    }
-                    if (taken != 0) {
-                        bb_tmpl->taken_pc = taken;
-                    }
-                }
-            }
-
-            bool this_bb_fault_stop = acc.bb_fault_stop;
-
-            /* Terminal-branch outcome for the CST_FID_BRANCH_* singletons on
-             * this WP block.  commit_post_pc is the PC the block's terminating
-             * branch actually reached — the next chain block's start_pc (and,
-             * for the chain's last block, where the excursion would continue).
-             * Stamped verbatim; direction/target are derived at wire-emit time
-             * and delta-encode through the per-chain WP overlay (correction:
-             * WP now carries these, delta'd against the last WP emission, not
-             * a fresh baseline). */
-            WPBBEntry wp_entry = acc.make_entry(bb_tmpl,
-                                                bb_has_fault,
-                                                bb_first_fault_idx);
-            wp_entry.branch_successor_pc    = commit_post_pc;
-            wp_entry.branch_successor_known = true;
-            wp_chain.push_back(std::move(wp_entry));
+            bool this_bb_fault_stop;
+            wp_commit_bb(st, cur, n_executed_in_cur, last_insn_size,
+                         fault_redispatch_pc, commit_post_pc,
+                         this_bb_fault_stop);
 
             acc.clear();
 

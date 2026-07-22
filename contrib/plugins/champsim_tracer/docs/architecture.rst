@@ -782,11 +782,16 @@ events must survive bailed steps until a seal consumes them), then:
   force-closed there (stuck-window recovery — the one local reset
   that produces no event).
 * **Foreign-ASID boundary.**  A pinned run executing under another
-  address space drops the deferred prev (a one-TB-lossy boundary) so
-  its fragments never bridge across the gap.  The async suspend runs
+  address space cannot bridge its fragments across the gap, so the
+  deferred prev is set aside — *suspended* onto a bounded per-thread
+  stack keyed on the pinned effective ASID, so the interrupted block
+  seals at its own fault depth when the pinned context returns, rather
+  than being dropped (see :ref:`suspend-or-seal <suspend-or-seal>`; legacy drop stays
+  behind ``CST_FOREIGN_DROP`` for A/B).  The async mute suspend runs
   *first*: an async excursion routinely context-switches through
-  foreign address spaces, and those TBs must take the suspend (which
-  preserves the deferred prev for the resume), not the drop.
+  foreign address spaces, and those TBs must take the mute suspend
+  (which leaves the pending seal untouched for the resume), not the
+  ASID-boundary suspension.
 * **The pending-seal swap.**  On ``CONTINUE`` the current TB is
   promoted into the pending-seal slot and the old occupant becomes
   the TB the seal phase walks, together with the fault depth stamped
@@ -815,9 +820,12 @@ fault events exactly once, then runs the shared seal walk:
   raw-minus-baseline scheme produced (a merged faulting BB stamped at
   its own handler's depth, and a handler depth jumping ``0 <-> 2``
   across a kernel spin loop).  ``frames_`` holds exactly the pinned
-  process's in-flight faults: foreign excursions are dropped and async
-  excursions are suspended *before* they reach the merge, so neither
-  ever seeds a frame, and the boot's leaked frames predate ``frames_``,
+  process's in-flight faults: foreign TBs are excluded and async
+  excursions mute-suspended *before* they reach the merge, so neither
+  ever seeds a frame (a foreign span suspends only the pinned process's
+  own deferred prev, never a foreign excursion — see
+  :ref:`suspend-or-seal <suspend-or-seal>`), and the boot's leaked frames predate
+  ``frames_``,
   which ``on_segment_open`` clears.  Counting its un-returned frames
   therefore yields the pinned nesting depth directly — ISA-agnostic,
   immune to the shared stack's pollution, and ``0`` on the fault-free
@@ -1160,8 +1168,11 @@ The pin defines both the trace filter and the window clock:
   in the wrong context — and serialized on every instruction
   descriptor as the ``SYSTEM`` flag bit.
 * **Foreign address spaces** are neither traced nor counted: the
-  PathBuilder's foreign-ASID boundary drops them (async excursions
-  are suspended instead — see :ref:`async-exclusion`).
+  PathBuilder's foreign-ASID boundary excludes their TBs.  The pinned
+  process's own deferred prev is *suspended* across the span, not lost
+  with it, so an interrupted handler level still seals on return (see
+  :ref:`suspend-or-seal <suspend-or-seal>`); async excursions take the mute suspend
+  instead — see :ref:`async-exclusion`.
 
 Two per-target refinements keep the pin honest about what the
 address-space register can actually attest.  On RISC-V the highest
@@ -1301,47 +1312,83 @@ never observed (a non-LIFO guest return — a context switch inside a
 blocking fault resuming the outer task first) completes on the same
 keys at its suffix's seal.
 
-**Retire-at-return when the resume suffix is dropped.**  A foreign-ASID
-excursion (or an abandoned async window) can preempt the pinned process
-*exactly* at a handler's return — the block whose seal would complete the
-merge is the deferred prev the drop arm then discards.  Dropping it silently
-leaks the inner frame: its ``FAULT_RETURN`` was suppressed on the shared
-per-vCPU stack (non-LIFO), so it lingers un-returned, inflating every later
-fault's depth until the coarse user-privilege stale-frame sweep collapses the
-whole stack to 0 at once — and the frame's own depth level, its merged BB,
-never reaches the wire, so ``fault_depth`` steps from the deepest handler
-straight to the resumed level (a ``2 -> 0`` jump the ``syscall_fault_nesting``
-oracle flags; symmetrically ``0 -> 2`` on the re-nest).  So before the drop
-arm clears the deferred prev it checks whether that prev is an inner
-(``depth >= 1``) frame's resume suffix and, if so, retires the frame *there*:
-``flush_frame_unwound`` emits the frame's full template at its own depth and
-anchors, from its own accumulated pieces, with no wrong-path and an unresolved
-terminal branch (the resolving suffix is gone), exactly like the
-segment-finish flush.  When a frame *does* complete, ``complete_merge`` runs
-the same flush over any inner (depth ≥ 1) frame still in flight that nests
-**deeper** than the one it is completing — strict LIFO makes a surviving
-deeper frame a leak — deepest-first, so the unwind steps down a level at a
-time (``2 -> 1 -> 0``) rather than collapsing straight to the completing
-frame's depth.  This is the leak that ``flush_frame_unwound`` on the drop arm
-cannot reach, because the leaked frame's own suffix was never on a drop arm
-to trigger it.  What makes the deeper-frame flush safe is the ``(thread,
-asid)`` completion key on the *completing* frame: the frame stack only ever
-holds the pinned process's own excursions (a foreign TB's deferred prev is
-dropped before classification can stash one), so once the completing frame is
-process-unambiguous, every deeper frame unwound with it is the pinned
-process's own.  The deeper frames' own event-stamped asids are deliberately
-*not* an equality gate — a kernel fault is stamped with whatever mm is loaded
-at the fault instant, which under multi-process churn is routinely another
-task's (the same reason kernel-excursion ownership exists: a live ASID is not
-ownership for kernel code); a stamp mismatch is reported as a diagnostic
-only.  Because the flush emits an *anchored* (merged) entry, and an
-anchored entry must follow a strictly deeper one, a guard
-(``g_last_emit_fault_depth``) refuses to emit unless the last entry on the
-wire is deeper than the frame; a level it cannot place is dropped rather than
-emitted out of order, so the retire-at-return can never trade the depth jump
-for an anchor-at-unwind violation.  Off the contention path — user mode and a
-deterministic single-process system trace take no foreign drops and leak no
-frames — no flush fires and the output is byte-identical.
+.. _suspend-or-seal:
+
+**Suspend-or-seal across a foreign or abandoned span.**  A foreign-ASID
+span (or an abandoned async window) can preempt the pinned process
+*exactly* at a handler's return — the block whose seal would complete a
+fault merge is the deferred prev the boundary would otherwise discard.
+Discarding it silently leaks the inner frame: its ``FAULT_RETURN`` was
+suppressed on the shared per-vCPU stack (non-LIFO), so it lingers
+un-returned, inflating every later fault's depth until the coarse
+user-privilege stale-frame sweep collapses the whole stack to 0 at once —
+and the frame's own depth level, its merged BB, never reaches the wire, so
+``fault_depth`` steps from the deepest handler straight to the resumed
+level (a ``2 -> 0`` jump the ``syscall_fault_nesting`` oracle flags;
+symmetrically ``0 -> 2`` on the re-nest).  So the boundary does not
+discard the deferred prev — it **suspends** it.  The prev and the four
+thread-local sinks its seal consumes — the committed CP memops, the
+per-instruction destination snaps, the in-flight chain-assembler prefix,
+and the promote-time depth stamp — freeze atomically onto a bounded
+per-thread suspension stack, tagged with the owning pinned effective ASID.
+When the pinned process next reaches an owned, non-excluded TB, the resume
+arrow pops the suspension whose ASID matches and re-arms those four sinks,
+so the promote walks the restored prev and the seal emits the interrupted
+handler block at its own depth: the wire steps ``2 -> 1 -> 0`` (or
+``0 -> 1 -> 2`` on a re-nest) across the span rather than losing the
+intermediate level.  The resume match keys on the pinned *effective* ASID
+alone, never the live ASID — a kept kernel block's live address-space
+register is whatever mm is loaded at that instant (a PTI entry overlay, a
+TLB-maintenance scratch), not ownership, so a live-ASID gate would strand
+the pinned process's own kernel-handler suspensions un-resumable; cross-
+process safety is the completion key's job (below), not the resume re-arm's.
+The **abandoned-async** arm suspends the same way but, unlike the foreign
+boundary, falls through to promote the current TB (kept — the pinned
+process at user privilege is real traced content).  That TB is the *other*
+guest thread the abandoned window hid, not the suspended prev's successor,
+so the resume arrow is held off for that one step: the suspension waits for
+its true successor's later resume rather than sealing against the wrong
+thread (the cross-thread taken edge the departure-PC seal exists to avoid).
+Legacy behaviour — dropping the deferred prev outright — is retained behind
+``CST_FOREIGN_DROP`` for byte-parity A/B.
+
+**Retire-at-return: the backstop suspend-or-seal cannot cover.**  A
+suspension normally resumes and reseals.  A residual set cannot: one
+displaced when the stack overflows its bound, one orphaned at a segment
+open, one the stale-frame sweep reaches while the pinned process runs past
+without resuming, or a foreign span that never returns to the pinned
+context at all.  There, retire-at-return emits the level directly — when
+the deferred prev (or the un-resumable suspension) is an inner
+(``depth >= 1``) frame's resume suffix, ``flush_frame_unwound`` emits the
+frame's full template at its own depth and anchors, from its own
+accumulated pieces, with no wrong-path and an unresolved terminal branch
+(the resolving suffix is gone), exactly like the segment-finish flush.
+When a frame *does* complete, ``complete_merge`` runs the same flush over
+any inner (depth ≥ 1) frame still in flight that nests **deeper** than the
+one it is completing — strict LIFO makes a surviving deeper frame a leak —
+deepest-first, so the unwind steps down a level at a time (``2 -> 1 -> 0``)
+rather than collapsing straight to the completing frame's depth.  What
+makes the deeper-frame flush safe is the ``(thread, asid)`` completion key
+on the *completing* frame: the frame stack only ever holds the pinned
+process's own excursions (a foreign TB seeds none — its deferred prev is
+suspended, or dropped under the legacy flag, before classification could
+stash one), so once the completing frame is process-unambiguous, every
+deeper frame unwound with it is the pinned process's own.  The deeper
+frames' own event-stamped asids are deliberately *not* an equality gate — a
+kernel fault is stamped with whatever mm is loaded at the fault instant,
+which under multi-process churn is routinely another task's (the same
+reason kernel-excursion ownership exists: a live ASID is not ownership for
+kernel code); a stamp mismatch is reported as a diagnostic only.  Because
+both flushes emit an *anchored* (merged) entry, and an anchored entry must
+follow a strictly deeper one, a guard (``g_last_emit_fault_depth``) fires
+when the last entry on the wire is not deeper than the frame: a level it
+cannot place is never emitted out of order — the retire drops it, while the
+merge emits it instead as a plain, unanchored block clamped to the
+predecessor's depth — so neither can trade the depth jump for an
+anchor-at-unwind violation.  Off the contention path — user mode and a
+deterministic single-process system trace take no foreign or abandoned
+drops and leak no frames — no suspension forms, no flush fires, and the
+output is byte-identical.
 
 On the wire (``CST_FLAG_FAULT``, set in marker mode; user-mode
 traces carry no trailer): every CP entry carries ``fault_depth``
@@ -1415,8 +1462,13 @@ interrupted flow architecturally resumes, read from the retained
 outermost ``ASYNC_ENTER`` event — making the abandoned-window seal
 identical to the one a proper resume would have produced.  When no
 departure PC is known (a window latched from live state before the
-segment's first prime), the deferred prev is dropped like the
-foreign-ASID boundary drops it, accumulated captures included.
+segment's first prime), that seal target is unavailable, so the
+deferred prev is *suspended* like the foreign-ASID boundary suspends
+it (see :ref:`suspend-or-seal <suspend-or-seal>`), to seal at its own depth when the
+pinned context truly resumes — with its same-step resume held off, so
+the current (other-thread) TB promotes fresh instead of taking the
+suspended prev's seal.  Legacy behaviour drops it, accumulated captures
+included, behind ``CST_FOREIGN_DROP``.
 
 .. _time-transparency:
 

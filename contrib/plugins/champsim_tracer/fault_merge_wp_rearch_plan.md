@@ -1,9 +1,60 @@
 # Fault / Merge / WP-Machinery Rearchitecture — Design Plan
 
-**Prepared for:** Maccoy Merrell (sole maintainer), for sign-off before any
-code is written. **Status: DECISIONS LOCKED 2026-07-18 — ready for staged
-implementation.** All paths relative to `/mnt/md0/QEMU/qemu`, branch
-`champsim-trace`, HEAD `ff9cbdaef7`.
+**Prepared for:** Maccoy Merrell (sole maintainer). **Status: IMPLEMENTED
+2026-07-22 — stages 0–5 landed on `champsim-trace` (NOT pushed).** All paths
+relative to `/mnt/md0/QEMU/qemu`; the plan below is preserved as the design of
+record and annotated where the implementation refined it.
+
+### Implementation status (stages 0–5 landed)
+
+| Stage | Content | Byte class | Result |
+|---|---|---|---|
+| 0 | Baseline lock: retire-at-return primitive (byte-inert pieces); `complete_merge` deeper flush deferred | inert | goldens byte-identical; baseline contention rate recorded |
+| 1 | WP-walker decomposition (`WpWalkState`/`WpStep`, full driver switch) | inert everywhere | 8/8 golden-gated extractions byte-identical |
+| 2 | Per-`(thread,asid)` frame identity into completion; byte guard → diagnostic | inert single-process | goldens byte-identical; 2-process A/B clean |
+| 3 | Suspend-or-seal, **foreign-ASID** arrow (`SuspendedPrev`/`susp_stack_`, resume arrow, `SUSPENDED_FOREIGN`, `complete_merge` anchor guard) | byte-affecting system multi-process (the fix) | contention JUMP=0 ANCHOR=0; A/B confirms the named improvement |
+| 4 | Suspend-or-seal, **abandoned-async** arrow (same machinery + one-step resume hold-off) | inert off async-recovery path | goldens byte-identical; 30-seed wave JUMP=0 ANCHOR=0; arm not exercised (see below) |
+| 5 | Docs (`architecture.rst` suspend-or-seal section) + validator-semantics confirmation | non-wire | docs build clean; validator green; goldens byte-identical |
+
+**Gate summary (per stage):** both golden nets byte-identical (user 4-ISA +
+`--system` CP-user-slice); `validator full` green (pass=24 fail=0 xfail=1
+non-gating, mutation 15/15, `syscall_fault_nesting` info=1); the tight-island
+contention matrix (2× 4-core islands, `-j12` = 3× oversub) at
+**depth-JUMP = 0 AND anchor-at-unwind = 0** post-arc, against a recorded
+non-zero pre-arc baseline.
+
+**Two load-bearing findings (recorded so they are not re-litigated):**
+
+1. **Resume keys on `pin_effective_asid` ONLY, not the live ASID.** A kept
+   kernel block's live address-space register is a PTI/TLB overlay, not
+   ownership (observed `asid=0x2480000` vs `live=0x18c0000`); a live-ASID
+   resume gate stranded the pinned process's own depth-1 kernel-handler
+   suspensions. Cross-process safety at *completion* keys user frames on the
+   hard asid and kernel frames on content — that is the completion path's
+   job, not the resume re-arm's.
+2. **The `complete_merge` anchor guard is required alongside suspend-or-seal.**
+   Suspend-or-seal closes the depth-JUMP class (a dropped pinned depth-1
+   handler; manifestations 2/3). The residual ANCHOR-at-depth-0 came from a
+   *foreign* task's fault frame completed via the kernel-content path with no
+   traced pinned excursion; the guard emits it as a plain block clamped to the
+   predecessor depth (no anchor, no jump). Both are needed for the 0/0 gate;
+   both are byte-inert off the contention path.
+
+**Stage-4 refinement of §1.2 (recorded).** The plan's "same substitution" for
+the abandoned-async arm is correct in machinery but needed one guard the plan
+did not scope: the foreign arm *returns* (its suspension defers to a later
+step), whereas the abandoned arm *falls through* to promote the current TB, so
+a bare substitution would let the same step's resume arrow immediately seal the
+just-suspended prev against that TB — the cross-thread taken edge the
+departure-PC override exists to prevent. A one-step resume hold-off defers the
+suspension to prev's true successor. The abandoned arm did **not** fire in the
+churn harness (`susp_abandoned = 0` across 15 harvested seeds while the foreign
+arm fired 26× balanced): its trigger — an async window latched from live state
+before the segment's first prime, with a non-null deferred prev — is a
+startup/segment-boundary race the marker-window workload does not reproduce and
+that cannot be forced deterministically from userspace. It is documented as
+structurally-identical-to-proven (identical `suspend_prev`/`resume_suspension`,
+guard byte-inert off-path per the byte-identical goldens).
 
 ## 0. DECISIONS LOCKED (§5 detail below)
 
@@ -569,6 +620,9 @@ between the shipped E/F and the future H.
 
 ## Deliverable status
 
-This plan is **design-lock only** — no `.cc`/`.h` touched. Leave it uncommitted
-for the maintainer to review, or commit as a docs-only change (the maintainer's
-call; `multiasid_plan.md` was committed). No code, no push.
+**Implemented.** Stages 0–5 are landed on `champsim-trace` (see the
+implementation-status table at the top); the runtime model is documented in
+`docs/architecture.rst` (the `.. _suspend-or-seal:` section). The wire format
+and `CST_MAGIC` are untouched by every stage. **Not pushed** — the push
+acceptance bar (system mode flawless + an end-to-end trial) governs that, per
+the maintainer's standing gate.

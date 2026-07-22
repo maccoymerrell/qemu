@@ -908,7 +908,7 @@ static void write_template_profile(BitWriter *sub,
 
 /*
  * Write the template dictionary section.  Wire layout (template and
- * per-insn record fields) is specified in champsim_tracer_format.md.
+ * per-insn record fields) is specified in docs/format.rst.
  *
  * Encoding gotcha: max_dep_loads / max_dep_stores are template-static
  * MAX counts, not per-iter.  max_dep_loads bounds the dep-mask bit
@@ -958,7 +958,7 @@ static void write_bin_templates(BitWriter *bw)
 /* ============== Unified field-typed delta stream ==============
  *
  * Wire layout of the per-entry delta_section: see
- * champsim_tracer_format.md.  Records are non-descending
+ * docs/format.rst.  Records are non-descending
  * (ins_pos, field_id); unchanged fields cost zero bytes.
  * Per-(template_id, ins_pos, field_id) state tables hold the
  * most-recent value as the baseline.  CP state advances on every CP
@@ -4208,7 +4208,7 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
 
 /*
  * Finish the body stream and produce the header buffer.  Member
- * layouts are specified in champsim_tracer_format.md; each is its
+ * layouts are specified in docs/format.rst; each is its
  * own self-contained ustar member (no trailer) assembled by the
  * segment manager after this returns.  The body's two-magic bracket
  * makes truncation visible without reading the whole stream.

@@ -3,7 +3,7 @@
  *
  * Walks the raw bytes of a .cst trace (header member then body record
  * stream) and prints every field, record, and section in decode order,
- * annotated with its byte offset and the champsim_tracer_format.md
+ * annotated with its byte offset and the docs/format.rst
  * recipe step that produced it.  Unlike the disasm/legacy renderers it
  * does NOT reconstruct architectural state — it surfaces the wire
  * structure verbatim (tags, ULEB/SLEB framing, per-record field-deltas)

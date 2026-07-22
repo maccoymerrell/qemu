@@ -60,7 +60,7 @@ extern "C" {
 
 /*
  * Binary format magic ("CST" + version 0x1D, u32 LE).  Wire format
- * fully specified in champsim_tracer_format.md.  Key invariants:
+ * fully specified in docs/format.rst.  Key invariants:
  * scalar fields carry a signed LEB delta against the active overlay's
  * most-recent observation (WP falls back to CP; template-default on
  * first appearance); WP state persists across chains, CP is the
@@ -95,7 +95,7 @@ extern "C" {
  * consumers can prime each vCPU's state independently.  Absolute
  * values.  width=0 means the plugin couldn't resolve a live value
  * (e.g. install-time pre-vCPU snapshot): leave that slot uninitialised.
- * Wire format spec'd in champsim_tracer_format.md.
+ * Wire format spec'd in docs/format.rst.
  */
 #define BODY_TAG_REGFILE         4
 /*
@@ -109,7 +109,7 @@ extern "C" {
  * address) + u64 sig (content signature) — mirroring how a thread's
  * register file rides its first sighting.  Every trace opens with an
  * initial (asid, thread) declaration before the first entry.
- * Wire format spec'd in champsim_tracer_format.md.
+ * Wire format spec'd in docs/format.rst.
  */
 #define BODY_TAG_ASID_SWITCH     5
 /*
@@ -138,7 +138,7 @@ extern "C" {
  * System mode only, correct path only (a speculative doorbell store is
  * sandboxed and reaches no device).  Absent entirely in device-free
  * (e.g. user-mode) traces.  Wire format spec'd in
- * champsim_tracer_format.md.
+ * docs/format.rst.
  */
 #define BODY_TAG_DEVIO_START     6
 #define BODY_TAG_DEVIO_STOP      7
@@ -249,7 +249,7 @@ extern "C" {
  * fault is never taken by a real core; the excursion CONTINUES past it (memory
  * faults) or STOPS cleanly at this block (the interim graceful-stop for
  * non-memory synchronous faults — arithmetic / illegal-opcode — pending the
- * arithmetic pass).  See champsim_tracer_format.md §4.4. */
+ * arithmetic pass).  See docs/format.rst §4.4. */
 #define CST_WP_EVENT_FAULT               (1u << 1)
 /* Bit 2 is free — unassigned, reserved for a future event flag.  Writers
  * write it 0; readers ignore it (reserved-bits rule, format.md). */
@@ -259,7 +259,7 @@ extern "C" {
  * presence).  PROFILE / WP are structural gates: they decide whether
  * a whole block is present (the §6 template profile block, and the
  * per-entry wrong-path chain + events sections respectively).  See
- * champsim_tracer_format.md "Format Stability and Conformance". */
+ * docs/format.rst "Format Stability and Conformance". */
 #define CST_FLAG_MEM_DATA      (1 << 0)  /* CST_FID_LOAD_DATA / STORE_DATA */
 #define CST_FLAG_REG_DATA      (1 << 1)  /* CST_FID_DST_REG values        */
 #define CST_FLAG_PROFILE       (1 << 2)  /* §6 profile block per template  */
@@ -296,7 +296,7 @@ extern "C" {
  * Slotted families are interleaved-by-slot so slot k's five family
  * IDs are contiguous, keeping low slots in the 1-byte ULEB range
  * alongside the hot singletons (slot 0..24 → 1 byte, 25..63 → 2).
- * See champsim_tracer_format.md §5.1.
+ * See docs/format.rst §5.1.
  */
 #define CST_FID_SLOT_COUNT       (cst_wire::FID_SLOT_COUNT)  /* slots per slotted family */
 #define CST_FID_SLOT_STRIDE      8    /* family IDs per slot (== family count) */
@@ -402,7 +402,7 @@ extern "C" {
  * targets and direction flips.  WP blocks delta through the per-chain WP
  * overlay (wp_state -> CP -> default), so WP overhead tracks CP overhead.
  * Non-branch-terminated entries (page-split continuations) carry neither FID.
- * See champsim_tracer_format.md §5.6. */
+ * See docs/format.rst §5.6. */
 #define CST_FID_BRANCH_BLOCK_BASE (CST_FID_PPAGE_BLOCK_END + 1)
 #define CST_FID_BRANCH_TAKEN      (CST_FID_BRANCH_BLOCK_BASE + 0)
 #define CST_FID_BRANCH_TARGET     (CST_FID_BRANCH_BLOCK_BASE + 1)
@@ -593,7 +593,7 @@ typedef struct {
 
 /*
  * Run-aggregated PGO-style profiling per template instruction
- * (champsim_tracer_format.md §6).  Pure metadata, never affects
+ * (docs/format.rst §6).  Pure metadata, never affects
  * deterministic replay; POD for the BBTemplate g_new0/g_free
  * lifecycle.  On-disk values are final run totals.
  *
@@ -853,7 +853,7 @@ struct BBTemplate {
      * next use (see ensure_rep_subtmpl).
      */
     SegRef rep_subtmpl;
-    /* Run-aggregated profiling (champsim_tracer_format.md §6).
+    /* Run-aggregated profiling (docs/format.rst §6).
      * Lazily allocated on first accumulation; freed with the
      * template.  NULL until this BB executes at least once. */
     TemplateProfile *profile;
@@ -1010,7 +1010,7 @@ struct BodyEntry {
      * not be fetched/translated (wp_entries is empty, so there is no
      * WPBBEntry to carry translation_unavailable).  The body writer
      * emits it as a chain-level CST_WP_EVENT_TRANSLATION_UNAVAIL event
-     * (resolved index >= num_wp; see champsim_tracer_format.md §4.4).
+     * (resolved index >= num_wp; see docs/format.rst §4.4).
      * Set from simulate_wrong_path_ext's first_tb_unavail out-param;
      * always false in user mode and on REP fan-out sub-entries. */
     bool wp_first_tb_unavail = false;
@@ -1481,7 +1481,7 @@ typedef struct _WideRegSnap WideRegSnap;
  * returned chain is empty and carries no WPBBEntry to mark, so the
  * condition rides this out-param instead.  The emitter records it as a
  * chain-level CST_WP_EVENT_TRANSLATION_UNAVAIL event (§4.4 of
- * champsim_tracer_format.md). */
+ * docs/format.rst). */
 #ifdef __cplusplus
 std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                                uint64_t correct_target,
@@ -1573,7 +1573,7 @@ void devio_set_map_active(bool on);
 void body_stream_finish(BodyStreamState *st, GByteArray **header_bytes);
 /* Stash the in-trace architectural CP-insn count at which warmup
  * ends and the simulation phase begins, so finish writes it into
- * the header (§2.13 in champsim_tracer_format.md).  Call before
+ * the header (§2.13 in docs/format.rst).  Call before
  * body_stream_finish.  0 = no warmup configured / warmup never
  * elapsed (the entire trace is warmup). */
 void body_stream_set_warmup_end_arch_insns(BodyStreamState *st,

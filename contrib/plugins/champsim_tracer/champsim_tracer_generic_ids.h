@@ -159,7 +159,7 @@ enum BranchType {
      * x86 REP / REPNZ self-loop terminator: a conditional self-loop
      * branch (target = self-PC, fall-through = next PC).  The tracer
      * fans iterations into per-iteration entries on a 1-insn
-     * self-loop sub-template (see champsim_tracer_format.md
+     * self-loop sub-template (see docs/format.rst
      * §"REP-prefixed self-loop BBs").  Kept distinct from
      * BRANCH_COND_DIRECT so consumers see the no-target-diversity
      * self-loop semantics.

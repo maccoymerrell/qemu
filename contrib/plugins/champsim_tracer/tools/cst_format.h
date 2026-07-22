@@ -111,7 +111,7 @@ private:
 std::unique_ptr<BodyStream> body_stream_open(const CstFile &cf);
 
 /* Parse the header member into a cst::Header (layout in
- * champsim_tracer_format.md).  Consumes the entire @view; trailing
+ * docs/format.rst).  Consumes the entire @view; trailing
  * templates go into @out_templates / @out_by_id. */
 Header parse_header(MemberView view,
                     std::vector<Template> *out_templates,

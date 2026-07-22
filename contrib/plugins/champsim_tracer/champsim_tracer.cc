@@ -2815,7 +2815,7 @@ static void finish_trace_segment(void)
 
     /* Hand the warmup→simulation arch-insn boundary to the body
      * stream so body_stream_finish writes it into the header
-     * (§2.13 in champsim_tracer_format.md). */
+     * (§2.13 in docs/format.rst). */
     if (BodyStreamState *bs = g_trace_segments.body_stream()) {
         body_stream_set_warmup_end_arch_insns(
             bs, g_seg_warmup_end_arch_insns);

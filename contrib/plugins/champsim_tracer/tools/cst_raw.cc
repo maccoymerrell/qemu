@@ -2,7 +2,7 @@
  * cst_decode --format=raw — pseudo-wire structural dump.
  *
  * See cst_raw.h for the contract.  The walk mirrors the Part I decoder
- * recipe of champsim_tracer_format.md step for step:
+ * recipe of docs/format.rst step for step:
  *
  *   §A  Header member            (recipe Step 2)
  *   §B  Encoding maps            (recipe Step 3)

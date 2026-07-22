@@ -83,7 +83,7 @@ void emit_finalized_bb(BodyStreamState *out_stream,
  * is moved in.  @wp_first_tb_unavail marks a kicked excursion whose
  * first wrong-path target could not be fetched/translated (so
  * @wp_entries is empty); the writer emits it as a chain-level
- * CST_WP_EVENT_TRANSLATION_UNAVAIL event (champsim_tracer_format.md
+ * CST_WP_EVENT_TRANSLATION_UNAVAIL event (docs/format.rst
  * §4.4).  Caller holds exec_lock; data_lock is NOT held.  Used by
  * PathBuilder::flush_final, which emits without branch resolution or WP
  * (unlike emit_finalized_bb above). */

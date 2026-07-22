@@ -36,8 +36,8 @@ unconfigured.
   every prospective modifier needs to know.
 * `extending.rst` — step-by-step guides for adding generic opcodes,
   register IDs, branch types, and dynamic fields.
-* `format.rst` — wraps `champsim_tracer_format.md` (the canonical
-  wire-format spec) so it reads as a Sphinx page.
+* `format.rst` — the canonical wire-format spec: the decoder recipe
+  (Part I) and the byte-level reference (Part II).
 * `reference.rst` — symbolic ID tables (generic opcodes, branch
   types, registers, sync events, field IDs, ISA codes).
 * `decoder.rst` — `cst_decode` (objdump-style and legacy text dumps)

@@ -1000,7 +1000,7 @@ Header parse_header(MemberView view,
     /* §2.13: in-trace architectural CP-insn count at the
      * warmup→simulation boundary.  Lets consumers skip warmup
      * without re-counting BBV-vs-architectural insns under REP
-     * fan-out.  See champsim_tracer_format.md. */
+     * fan-out.  See docs/format.rst. */
     h.warmup_end_arch_insns = r.uleb();
 
     /* Reverse-resolve every well-known name in the encoding maps to

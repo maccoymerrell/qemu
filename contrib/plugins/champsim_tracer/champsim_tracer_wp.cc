@@ -633,6 +633,81 @@ static WpStep wp_exec_one_tb(WpWalkState &st)
     return WpStep::PROCEED;
 }
 
+/*
+ * Attribute the speculative memory accesses recorded during this exec_tb to
+ * the just-appended fragment's insns (by matching insn_pc), pushing a
+ * DynParam per matched access and marking the BB synthetic-faulted on the
+ * first faulted access.  @bb_idx_base is bb_pcs.size() sampled BEFORE the
+ * fragment's insns were appended, so bb_idx_base + i is the WP BB-local
+ * index of fragment insn i.  A void leaf, moved verbatim.
+ */
+static void wp_attribute_memops(WpWalkState &st, BBTemplate *cur,
+                                uint32_t n_executed_in_cur, uint32_t bb_idx_base)
+{
+    auto &bb_has_fault       = st.acc.bb_has_fault;
+    auto &bb_first_fault_idx = st.acc.bb_first_fault_idx;
+    auto &bb_dyn_params      = st.acc.bb_dyn_params;
+    auto &mem_start_idx      = st.mem_start_idx;
+    Stats &stats = *st.stats;
+    Stats *hist  = st.hist;
+
+            /* Attribute mem accesses to this fragment's insns by
+             * matching insn_pc.  Only walk the @n_executed_in_cur
+             * prefix — mem callbacks past the fault / partial-exec
+             * boundary never fired. */
+            for (size_t m = mem_start_idx;
+                 m < g_wp_state.mem_accesses.size(); m++) {
+                const WPMemAccess &acc = g_wp_state.mem_accesses[m];
+                uint16_t insn_idx = (uint16_t)bb_idx_base;
+                bool matched = false;
+                for (uint32_t i = 0; i < n_executed_in_cur; i++) {
+                    if (cur->insn_pcs[i] == acc.insn_pc) {
+                        insn_idx = (uint16_t)(bb_idx_base + i);
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) {
+                    /* Memop belongs to a different fragment in this
+                     * exec_tb; the loop iteration for THAT fragment
+                     * will pick it up. */
+                    continue;
+                }
+                /* Synthetic-data memory fault (new wrong-path policy): this
+                 * access hit an absent/unreadable page and ran on a
+                 * deterministic placeholder value.  Mark the owning WP BB
+                 * entry as faulted at this insn (the FIRST such insn is
+                 * sufficient — everything downstream is synthetic anyway) and
+                 * let the excursion CONTINUE.  wp_synthetic_marking gates the
+                 * marking for A/B (CST_NO_FAULT); the access still runs on
+                 * garbage either way. */
+                if (acc.faulted && g_features.wp_synthetic_marking &&
+                    !bb_has_fault) {
+                    bb_has_fault = true;
+                    bb_first_fault_idx = insn_idx;
+                    stats.wp_synthetic_faults++;
+                    if (hist) {
+                        hist->wp_synthetic_faults++;
+                    }
+                }
+                DynParam dp = {
+                    .type = (uint8_t)(acc.is_store ? DYN_STORE_ADDR
+                                                    : DYN_LOAD_ADDR),
+                    .insn_index = insn_idx,
+                    .value = acc.mem_vaddr,
+                    .data_size = acc.data_size,
+                    .data = acc.data,
+                    .ppage = acc.ppage,
+                    .ppage_valid = acc.ppage_valid,
+                };
+                bb_dyn_params.push_back(dp);
+                stats.wp_total_mem_accesses++;
+                if (hist) {
+                    hist->wp_total_mem_accesses++;
+                }
+            }
+}
+
 std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                                uint64_t correct_target,
                                                uint64_t wrong_target,
@@ -973,61 +1048,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                 sim_insns += appended_insns;
             }
 
-            /* Attribute mem accesses to this fragment's insns by
-             * matching insn_pc.  Only walk the @n_executed_in_cur
-             * prefix — mem callbacks past the fault / partial-exec
-             * boundary never fired. */
-            for (size_t m = mem_start_idx;
-                 m < g_wp_state.mem_accesses.size(); m++) {
-                const WPMemAccess &acc = g_wp_state.mem_accesses[m];
-                uint16_t insn_idx = (uint16_t)bb_idx_base;
-                bool matched = false;
-                for (uint32_t i = 0; i < n_executed_in_cur; i++) {
-                    if (cur->insn_pcs[i] == acc.insn_pc) {
-                        insn_idx = (uint16_t)(bb_idx_base + i);
-                        matched = true;
-                        break;
-                    }
-                }
-                if (!matched) {
-                    /* Memop belongs to a different fragment in this
-                     * exec_tb; the loop iteration for THAT fragment
-                     * will pick it up. */
-                    continue;
-                }
-                /* Synthetic-data memory fault (new wrong-path policy): this
-                 * access hit an absent/unreadable page and ran on a
-                 * deterministic placeholder value.  Mark the owning WP BB
-                 * entry as faulted at this insn (the FIRST such insn is
-                 * sufficient — everything downstream is synthetic anyway) and
-                 * let the excursion CONTINUE.  wp_synthetic_marking gates the
-                 * marking for A/B (CST_NO_FAULT); the access still runs on
-                 * garbage either way. */
-                if (acc.faulted && g_features.wp_synthetic_marking &&
-                    !bb_has_fault) {
-                    bb_has_fault = true;
-                    bb_first_fault_idx = insn_idx;
-                    stats.wp_synthetic_faults++;
-                    if (hist) {
-                        hist->wp_synthetic_faults++;
-                    }
-                }
-                DynParam dp = {
-                    .type = (uint8_t)(acc.is_store ? DYN_STORE_ADDR
-                                                    : DYN_LOAD_ADDR),
-                    .insn_index = insn_idx,
-                    .value = acc.mem_vaddr,
-                    .data_size = acc.data_size,
-                    .data = acc.data,
-                    .ppage = acc.ppage,
-                    .ppage_valid = acc.ppage_valid,
-                };
-                bb_dyn_params.push_back(dp);
-                stats.wp_total_mem_accesses++;
-                if (hist) {
-                    hist->wp_total_mem_accesses++;
-                }
-            }
+            wp_attribute_memops(st, cur, n_executed_in_cur, bb_idx_base);
 
             /* Per-fragment bb_complete computation.  Each fragment's
              * terminus drives whether the in-flight WP BB completes

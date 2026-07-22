@@ -87,3 +87,32 @@ void BBChainAssembler::reset()
     bb_complete_ = false;
     fragments_.clear();
 }
+
+BBChainAssembler::ChainState BBChainAssembler::detach_state()
+{
+    ChainState s;
+    s.entry_pc = entry_pc_;
+    s.last_ft = last_ft_;
+    s.my_gen = my_gen_;
+    s.awaiting_delay_slot = awaiting_delay_slot_;
+    s.bb_complete = bb_complete_;
+    s.fragments = std::move(fragments_);
+    /* Leave *this in the reset state (fragments_ is moved-from -> cleared
+     * below to be definite); a fresh chain starts cleanly after a detach. */
+    fragments_.clear();
+    entry_pc_ = 0;
+    last_ft_ = 0;
+    awaiting_delay_slot_ = false;
+    bb_complete_ = false;
+    return s;
+}
+
+void BBChainAssembler::attach_state(ChainState &&s)
+{
+    entry_pc_ = s.entry_pc;
+    last_ft_ = s.last_ft;
+    my_gen_ = s.my_gen;
+    awaiting_delay_slot_ = s.awaiting_delay_slot;
+    bb_complete_ = s.bb_complete;
+    fragments_ = std::move(s.fragments);
+}

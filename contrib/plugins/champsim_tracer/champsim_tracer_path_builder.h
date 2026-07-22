@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "champsim_tracer.h"
+#include "champsim_tracer_bb_chain_assembler.h"
 
 /*
  * ---- Shared CP-step machinery owned by champsim_tracer.cc ----
@@ -127,6 +128,28 @@ extern thread_local std::vector<RegSnap> pending_reg_snaps CST_TLS_HOT;
  * StepIn::pinned_asid at suspend time, and a resume requires the resuming
  * TB's effective asid to match — the identical key frame_idx_for_completion
  * now uses, so a suspension cannot be resumed cross-process.) */
+/* One suspended deferred-prev: the four thread-local sinks the seal phase
+ * consumes, frozen atomically across a foreign-ASID span (plan §1.1) so the
+ * pinned process's resume seals the interrupted block at its own depth
+ * instead of the block being DROPPED and its fault level lost (the
+ * manifestation-2/3 fix).  Keyed on the OWNING (thread,asid): @asid is the
+ * pinned effective asid (StepIn::pinned_asid) sampled at the block's promote
+ * — the Stage-2 frame-identity key (the dwell tag on narrow-ASID targets) —
+ * and @owner_live is the live asid the block executed under (a wide-register
+ * per-process discriminator: a constant marker pin cannot tell two owned
+ * x86 processes apart, but their CR3s can).  A resume requires BOTH to
+ * match, so a suspension can never be restored into a foreign context. */
+struct SuspendedPrev {
+    BBTemplate *prev = nullptr;         /* the deferred prev block; its seal
+                                         * emits the intermediate level */
+    uint32_t depth = 0;                 /* prev's promote-time depth stamp */
+    uint64_t asid = 0;                  /* owning pinned effective asid */
+    uint64_t owner_live = 0;            /* owning live asid (wide discriminator) */
+    std::vector<WPMemAccess> mem;       /* prev's committed CP memops */
+    std::vector<RegSnap> snaps;         /* prev's per-insn dst snaps */
+    BBChainAssembler::ChainState chain; /* in-flight chain prefix (page-split BB) */
+};
+
 struct CtxFrame {
     BBTemplate *full_tmpl = nullptr;   /* the faulting BB's full template */
     uint64_t asid = 0;                 /* event-stamped owning address space;
@@ -182,7 +205,10 @@ public:
     enum class StepStatus {
         CONTINUE,         /* step_events: proceed to window mgmt + seal */
         SUSPENDED,        /* async window open: prev untouched, TB dropped */
-        DROPPED_FOREIGN,  /* foreign ASID: prev dropped (one-TB lossy) */
+        DROPPED_FOREIGN,  /* foreign ASID: prev dropped (one-TB lossy; the
+                           * CST_FOREIGN_DROP legacy A/B path) */
+        SUSPENDED_FOREIGN,/* foreign ASID: prev SUSPENDED onto the stack for
+                           * the pinned process's resume (default) */
         STASHED,          /* prev folded into a fault frame; nothing seals */
         NO_SEAL,          /* no previous context / no BB completed */
         MERGED,           /* a fault frame completed and emitted */
@@ -306,9 +332,38 @@ private:
      * frame is matched within one (thread,asid) — same key as completion. */
     void flush_dropped_prev(unsigned int cpu_index, uint64_t seal_asid);
 
+    /* Retire-at-return on the block @prev (the pinned process's own deferred
+     * prev, matched within its (thread,asid)): if @prev is an inner fault
+     * frame's resume suffix, flush that frame at its depth so its level is
+     * not lost.  The (prev, seal_asid) generalisation of flush_dropped_prev;
+     * shared by the DROP arm and by a suspension retired without resuming. */
+    void retire_prev_frame(BBTemplate *prev, uint64_t seal_asid,
+                           unsigned int cpu_index);
+
+    /* Suspend-or-seal arrows (Stage 3, plan §1.2/§1.3).  suspend_prev freezes
+     * the deferred prev + its four sinks onto susp_stack_ (over-cap: retire
+     * the oldest via retire_prev_frame and evict it); resume_suspension pops
+     * the entry whose (asid, owner_live) matches the resuming context and
+     * restores the four sinks so the seal walks the suspended prev; the
+     * @cpu_index is only needed for the over-cap retire. */
+    void suspend_prev(uint64_t owner_asid, uint64_t owner_live,
+                      unsigned int cpu_index);
+    bool resume_suspension(uint64_t resume_asid, uint64_t resume_live);
+    /* Emit a held suspension's fault level via retire_prev_frame, then drop
+     * it from the stack (the "suspend couldn't cover this" tail). */
+    void retire_suspension(size_t idx, unsigned int cpu_index);
+
     /* In-flight fault excursions, fault-nesting order (completion may
      * retire a mid-stack frame; see frame_idx_for_completion). */
     std::vector<CtxFrame> frames_;
+
+    /* Suspended deferred-prev blocks (Stage 3).  A bounded stack — nested
+     * foreign/async spans across different (thread,asid) owners each push an
+     * entry, and a resume pops the matching one (Decision A); over-cap the
+     * oldest falls back to retire-at-return.  Orphan-dropped at
+     * on_segment_open (like frames_).  Empty off the contention path. */
+    std::vector<SuspendedPrev> susp_stack_;
+    static constexpr size_t SUSP_STACK_CAP = 8;
 
     /* Drained-but-unapplied events.  Copied out of the queue's internal
      * buffer at drain time (that buffer is only valid until the next
@@ -324,6 +379,16 @@ private:
      * at seal would lose the handler's level. */
     BBTemplate *prev_tb_ = nullptr;
     uint32_t prev_depth_ = 0;
+
+    /* Owner identity of the current pending-seal prev, sampled at its promote
+     * (Stage 3): the (thread,asid) the block executed under, frozen into a
+     * suspension so a resume matches the SAME owned process.  prev_owner_asid_
+     * is the pinned effective asid (dwell tag on narrow targets); prev_owner_
+     * live_ is the live asid (the wide-register per-process discriminator).
+     * Both restored from a suspension on resume so a re-suspension re-freezes
+     * the right owner. */
+    uint64_t prev_owner_asid_ = 0;
+    uint64_t prev_owner_live_ = 0;
 
     /* Cross-phase snapshot: the prev the seal phase walks (and its
      * promote-time depth stamp), captured by step_events before the

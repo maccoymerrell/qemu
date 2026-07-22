@@ -50,6 +50,25 @@ static bool pb_diag()
     return v;
 }
 
+/* Suspend-or-seal A/B toggle (Decision D): the foreign-ASID boundary
+ * SUSPENDS the deferred prev by default (Stage 3); CST_FOREIGN_DROP selects
+ * the legacy one-TB-lossy DROP for byte-parity A/B against pre-Stage-3.
+ * Removed once the contention gate is 0-fail over two independent 50-seed
+ * waves. */
+static bool pb_foreign_drop_legacy()
+{
+    static const bool v = getenv("CST_FOREIGN_DROP") != nullptr;
+    return v;
+}
+
+/* Suspend-stack push/pop/displacement diagnostics (env-gated), for the
+ * contention-run evidence the acceptance gate asks for. */
+static bool pb_susp_diag()
+{
+    static const bool v = getenv("CST_SUSP_DIAG") != nullptr;
+    return v;
+}
+
 static bool pb_depth_diag()
 {
     static const bool v = getenv("CST_DEPTH_DIAG") != nullptr;
@@ -155,12 +174,24 @@ void PathBuilder::on_segment_open()
                     f.resume_pc, f.depth, f.mem.size());
         }
     }
+    /* Orphan-drop the suspension stack too (Stage 3, Decision A): each
+     * entry's prev + frozen chain point into the bb_map_ the opener cleared,
+     * so a suspension straddling the boundary is discarded with no emit — the
+     * same rule frames_ follows (the segment is a fresh trace). */
+    if ((pb_diag() || pb_susp_diag()) && !susp_stack_.empty()) {
+        fprintf(stderr, "[pathbuilder] SUSP-ORPHAN dropping %zu suspension(s) "
+                "at segment open\n", susp_stack_.size());
+    }
+    g_stats.susp_orphan_dropped += susp_stack_.size();
+    susp_stack_.clear();
     frames_.clear();
     pending_evs_.clear();
     clear_prev();
     walk_prev_ = nullptr;
     walk_depth_ = 0;
     prev_depth_ = 0;
+    prev_owner_asid_ = 0;
+    prev_owner_live_ = 0;
     /* Reg-snap hygiene at the window-mode segment boundary (Case C): drop any
      * pre-segment / opener snaps now, sync the generation stamp so the
      * step_events check doesn't redundantly re-clear, and arm the one-shot
@@ -938,42 +969,60 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
             drop = !kexc_kernel_tb_keep();
         }
         if (drop) {
-            /* Retire-at-return: if the prev being dropped is an inner fault
-             * frame's resume suffix, complete its merge now (emit its depth
-             * level) before the drop loses it — otherwise the frame leaks
-             * and the unwind collapses into a >1 depth jump under contention.
-             * Runs before the accumulator clear below: it saves/restores the
-             * CP buffer around its own emit, and needs prev_tb_ intact. */
-            flush_dropped_prev(in.cpu_index, in.pinned_asid);
-            /* rearch: suspend-or-seal candidate.  For now the deferred
-             * prev is DROPPED — the one-TB lossy boundary — rather than
-             * suspended, so its fragments never bridge across the
-             * gap.
-             *
-             * Prev's memops die with it: they are still sitting in the
-             * CP accumulator (drained only at prev's emit, which now
-             * never happens) and would otherwise be attributed to the
-             * NEXT emitted entry — whose template contains none of
-             * their PCs, collapsing them onto insn 0 as a phantom blob
-             * and displacing that entry's own memops in the drain's
-             * monotonic walk.  The TB being dispatched right now is
-             * equally unemitted, so mute its upcoming accesses too;
-             * the step recomputes g_capture_mute at every dispatch, so
-             * the mute self-clears with the foreign span. */
-            g_mem_recorder.clear_cp();
-            /* Prev's per-insn reg snaps die with it too — SYMMETRIC with the
-             * memop clear above, and the leak this fix closes.  They are the
-             * deferred prev's already-captured dst snaps (drained only at
-             * prev's emit, which no longer happens); left in place they
-             * PREPEND to the next emitted entry's reg_snaps and slide its
-             * positional dst / metaflags attribution.  The abandoned-window
-             * recovery already clears them on its drop arm; the foreign-ASID
-             * drop must match. */
-            pending_reg_snaps.clear();
+            if (pb_foreign_drop_legacy()) {
+                /* LEGACY drop (CST_FOREIGN_DROP, Decision D A/B).  The
+                 * deferred prev is DROPPED — the one-TB lossy boundary —
+                 * rather than suspended, so its fragments never bridge across
+                 * the gap.  Retire-at-return first (if prev is an inner fault
+                 * frame's resume suffix, emit its depth level before the drop
+                 * loses it — otherwise the frame leaks and the unwind
+                 * collapses into a >1 depth jump).  Then prev's memops and
+                 * reg snaps die with it (left in place they collapse onto the
+                 * next emitted entry's insn 0 / slide its positional dst
+                 * attribution); mute the foreign TB's upcoming accesses too
+                 * (the step recomputes g_capture_mute at every dispatch, so
+                 * the mute self-clears with the span). */
+                flush_dropped_prev(in.cpu_index, in.pinned_asid);
+                g_mem_recorder.clear_cp();
+                pending_reg_snaps.clear();
+                g_capture_mute = true;
+                clear_prev();
+                return StepStatus::DROPPED_FOREIGN;
+            }
+            /* SUSPEND-OR-SEAL (default, plan §1.2).  Freeze the deferred prev
+             * + its four sinks onto the suspension stack instead of dropping
+             * them, so the pinned process's resume seals the interrupted
+             * (fault-handler) block at ITS OWN DEPTH — closing the
+             * syscall_fault_nesting manifestations where the intermediate
+             * level was lost to a DROP (2->1->0 / 0->1->2 instead of 2->0 /
+             * 0->2).  Do NOT retire-at-return here: the frame stays in flight
+             * and completes normally when the suspension resumes; the
+             * retire-at-return backstop covers only the un-resumable tail
+             * (displacement / orphan / stale sweep).  When prev is null there
+             * is nothing to suspend (a second foreign TB in the same span,
+             * prev already cleared) — just clear the accumulators as the
+             * legacy path did.  Mute the foreign TB's accesses either way. */
+            if (prev_tb_) {
+                suspend_prev(prev_owner_asid_, prev_owner_live_, in.cpu_index);
+            } else {
+                g_mem_recorder.clear_cp();
+                pending_reg_snaps.clear();
+            }
             g_capture_mute = true;
             clear_prev();
-            return StepStatus::DROPPED_FOREIGN;
+            return StepStatus::SUSPENDED_FOREIGN;
         }
+    }
+
+    /* Resume arrow (plan §1.3): the pinned process is back at an owned,
+     * non-excluded TB (every gate above passed, so this step will CONTINUE).
+     * Pop the suspension whose (asid, live) matches this resuming context —
+     * restoring the deferred prev + its four frozen sinks — so the promote
+     * below walks the SUSPENDED prev and the seal emits the intermediate
+     * handler level at its own depth.  Off the contention path the stack is
+     * empty and this is a no-op (byte-identical). */
+    if (!susp_stack_.empty()) {
+        resume_suspension(in.pinned_asid, in.live_asid);
     }
 
     /* Promote: cur becomes the pending seal; the seal phase walks the
@@ -984,6 +1033,13 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
     walk_prev_ = prev_tb_;
     walk_depth_ = prev_depth_;
     set_prev(in.cur);
+    /* Record cur's owning (thread,asid) so a later foreign span that
+     * suspends this now-deferred prev freezes the RIGHT owner (Stage 3): the
+     * pinned effective asid is the frame-identity key, the live asid the
+     * wide-register per-process discriminator.  A kernel TB under KPTI-off
+     * shares its process's CR3, so live is the owning process there too. */
+    prev_owner_asid_ = in.pinned_asid;
+    prev_owner_live_ = in.live_asid;
     return StepStatus::CONTINUE;
 }
 
@@ -1204,10 +1260,11 @@ void PathBuilder::flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
  * it can never anchor a >1 jump — and emitting user code standalone would
  * degrade a user entry the content oracle validates.
  */
-void PathBuilder::flush_dropped_prev(unsigned int cpu_index, uint64_t seal_asid)
+void PathBuilder::retire_prev_frame(BBTemplate *prev, uint64_t seal_asid,
+                                    unsigned int cpu_index)
 {
     if (!g_features.fault_depth_trailer || pb_no_merge() ||
-        !prev_tb_ || frames_.empty()) {
+        !prev || frames_.empty()) {
         return;
     }
     BodyStreamState *out_stream =
@@ -1215,11 +1272,119 @@ void PathBuilder::flush_dropped_prev(unsigned int cpu_index, uint64_t seal_asid)
     if (!out_stream) {
         return;
     }
-    /* The dropped prev is the pinned process's OWN block, so it is matched
+    /* The retired prev is the pinned process's OWN block, so it is matched
      * within its (thread,asid): seal_asid is the pinned effective asid. */
-    ptrdiff_t ci = frame_idx_for_completion(prev_tb_, seal_asid);
+    ptrdiff_t ci = frame_idx_for_completion(prev, seal_asid);
     if (ci >= 0 && frames_[(size_t)ci].depth >= 1) {
         flush_frame_unwound((size_t)ci, out_stream, cpu_index);
+    }
+}
+
+void PathBuilder::flush_dropped_prev(unsigned int cpu_index, uint64_t seal_asid)
+{
+    retire_prev_frame(prev_tb_, seal_asid, cpu_index);
+}
+
+/*
+ * Suspend-or-seal (Stage 3, plan §1.2).  Freeze the deferred prev and its
+ * four thread-local sinks (committed CP memops, per-insn dst snaps, the
+ * in-flight chain prefix, and the depth stamp) onto susp_stack_, keyed on
+ * the OWNING (asid, live) captured at the block's promote.  The caller
+ * guarantees prev_tb_ != nullptr.  Over the SUSP_STACK_CAP bound the OLDEST
+ * suspension falls back to retire-at-return (Decision A): flush its fault
+ * level now and evict it to make room, so the stack stays bounded and no
+ * depth level is silently lost to displacement.
+ */
+void PathBuilder::suspend_prev(uint64_t owner_asid, uint64_t owner_live,
+                               unsigned int cpu_index)
+{
+    if (susp_stack_.size() >= SUSP_STACK_CAP) {
+        retire_suspension(0, cpu_index);        /* oldest -> retire-at-return */
+        susp_stack_.erase(susp_stack_.begin());
+        g_stats.susp_displaced++;
+    }
+    susp_stack_.emplace_back();
+    SuspendedPrev &s = susp_stack_.back();
+    s.prev = prev_tb_;
+    s.depth = prev_depth_;
+    s.asid = owner_asid;
+    s.owner_live = owner_live;
+    g_mem_recorder.take_cp(s.mem);              /* drains the CP buffer */
+    s.snaps = std::move(pending_reg_snaps);
+    pending_reg_snaps.clear();
+    s.chain = g_cp_chain.detach_state();
+    g_stats.susp_pushed++;
+    if (pb_diag() || pb_susp_diag()) {
+        fprintf(stderr, "[pathbuilder] SUSPEND prev=0x%" PRIx64 " depth=%u "
+                "asid=0x%" PRIx64 " live=0x%" PRIx64 " nmem=%zu nsnaps=%zu "
+                "stack=%zu\n",
+                s.prev ? s.prev->start_pc : 0, s.depth, s.asid, s.owner_live,
+                s.mem.size(), s.snaps.size(), susp_stack_.size());
+    }
+}
+
+/*
+ * The resume arrow (plan §1.3).  The pinned process is back at an owned,
+ * non-excluded TB (all gates passed).  Pop the top-most suspension whose
+ * (asid, live) matches the resuming context and re-arm the four sinks so the
+ * promote below walks the suspended prev and the seal emits the intermediate
+ * handler block AT ITS OWN DEPTH.  The BOTH-key match (pinned effective asid
+ * AND live asid) is what forbids a cross-process restore: a constant marker
+ * pin shares its asid across two owned x86 processes, but their CR3s
+ * (owner_live) differ, so a resume never seals one process's block against
+ * another's successor.  Returns true iff a suspension was restored.
+ */
+bool PathBuilder::resume_suspension(uint64_t resume_asid, uint64_t resume_live)
+{
+    for (size_t i = susp_stack_.size(); i-- > 0; ) {
+        SuspendedPrev &s = susp_stack_[i];
+        if (s.asid != resume_asid || s.owner_live != resume_live) {
+            continue;
+        }
+        prev_tb_ = s.prev;                       /* re-arm the pending seal */
+        prev_depth_ = s.depth;
+        prev_owner_asid_ = s.asid;
+        prev_owner_live_ = s.owner_live;
+        g_mem_recorder.prepend_cp(s.mem);        /* restore committed memops */
+        if (!s.snaps.empty()) {                  /* restore per-insn snaps */
+            pending_reg_snaps.insert(pending_reg_snaps.begin(),
+                                     s.snaps.begin(), s.snaps.end());
+        }
+        g_cp_chain.attach_state(std::move(s.chain));
+        if (pb_diag() || pb_susp_diag()) {
+            fprintf(stderr, "[pathbuilder] RESUME prev=0x%" PRIx64 " depth=%u "
+                    "asid=0x%" PRIx64 " live=0x%" PRIx64 " stack=%zu\n",
+                    prev_tb_ ? prev_tb_->start_pc : 0, prev_depth_,
+                    resume_asid, resume_live, susp_stack_.size() - 1);
+        }
+        susp_stack_.erase(susp_stack_.begin() + (ptrdiff_t)i);
+        g_stats.susp_resumed++;
+        return true;
+    }
+    return false;
+}
+
+/*
+ * Retire a held suspension without resuming it — the "suspend couldn't cover
+ * this" tail (over-cap displacement; a stale sweep past its owner's return).
+ * Emit its fault level via retire_prev_frame (keyed on its own owning asid,
+ * anchor-guarded so it can never trade a depth-JUMP for an anchor-at-unwind
+ * violation), draining the frozen accumulators back so the flush emits from
+ * them, then leave the entry for the caller to erase.
+ */
+void PathBuilder::retire_suspension(size_t idx, unsigned int cpu_index)
+{
+    SuspendedPrev &s = susp_stack_[idx];
+    /* retire_prev_frame -> flush_frame_unwound emits from the FRAME's own
+     * buffers and save/restores the LIVE accumulators around its emit, so the
+     * suspension's frozen mem/snaps need not be re-injected; only prev + its
+     * owning asid drive the frame match. */
+    retire_prev_frame(s.prev, s.asid, cpu_index);
+    if (pb_diag() || pb_susp_diag()) {
+        fprintf(stderr, "[pathbuilder] SUSP-RETIRE prev=0x%" PRIx64 " depth=%u "
+                "asid=0x%" PRIx64 " stack=%zu\n",
+                s.prev ? s.prev->start_pc : 0, s.depth, s.asid,
+                susp_stack_.size());
     }
 }
 
@@ -1377,6 +1542,24 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                 fprintf(stderr, "[pathbuilder] RETIRE-LEAK-BURST user_tb=0x%"
                         PRIx64 " count=%u (inflight drops %u->0)\n",
                         in.cur ? in.cur->start_pc : 0, leaked, leaked);
+            }
+            /* Suspension stale sweep (Stage 3, Decision A "stale-sweep retire
+             * while held").  This pinned USER TB proves the process is at
+             * fault-nesting depth 0, and the resume arrow already ran in
+             * step_events — so any suspension STILL held for THIS process's
+             * (asid, live) reached user privilege without resuming (its owner
+             * took a different path than the suspended continuation).  It can
+             * no longer reseal; retire it at its depth (anchor-guarded) so its
+             * level is not silently lost, then drop it.  Only this process's
+             * suspensions are touched — a peer process's held suspension stays
+             * for its own resume. */
+            for (size_t i = susp_stack_.size(); i-- > 0; ) {
+                if (susp_stack_[i].asid == in.pinned_asid &&
+                    susp_stack_[i].owner_live == in.live_asid) {
+                    retire_suspension(i, in.cpu_index);
+                    susp_stack_.erase(susp_stack_.begin() + (ptrdiff_t)i);
+                    g_stats.susp_stale_retired++;
+                }
             }
         }
         uint32_t pinned_inflight = 0;

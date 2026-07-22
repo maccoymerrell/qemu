@@ -158,6 +158,23 @@ struct Stats {
      * mode, and on any unpinned run. */
     uint64_t pin_multivcpu_observed = 0;
 
+    /* Suspend-or-seal, foreign-ASID arrow (Stage 3).  A foreign span
+     * suspends the deferred prev onto a bounded per-thread stack instead
+     * of dropping it, so the pinned process's resume seals the interrupted
+     * (fault-handler) block at its own depth.  pushed/resumed count the
+     * suspend and matching-resume arrows; displaced counts an over-cap
+     * eviction retired at return (the oldest suspension flushed at its
+     * depth to free the slot); stale_retired counts a suspension the
+     * pinned context reached user privilege past without resuming, flushed
+     * at its depth by the sweep; orphan_dropped counts entries discarded
+     * (no emit) at a segment-open boundary.  All zero off the contention
+     * path (no foreign drops -> no suspensions). */
+    uint64_t susp_pushed = 0;
+    uint64_t susp_resumed = 0;
+    uint64_t susp_displaced = 0;
+    uint64_t susp_stale_retired = 0;
+    uint64_t susp_orphan_dropped = 0;
+
     /* Per-execution attribution.  cp_* bumped at vcpu_tb_exec walking
      * the prev TB's template; wp_* inside the WP per-iteration loop.
      * Sized by the generic enum sentinels to stay in lockstep. */

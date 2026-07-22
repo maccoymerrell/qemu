@@ -4182,7 +4182,8 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
              * here means the user clock advances but nothing traces. */
             if (st == PathBuilder::StepStatus::SUSPENDED) {
                 tls_mkdiag_susp_user++;
-            } else if (st == PathBuilder::StepStatus::DROPPED_FOREIGN) {
+            } else if (st == PathBuilder::StepStatus::DROPPED_FOREIGN ||
+                       st == PathBuilder::StepStatus::SUSPENDED_FOREIGN) {
                 tls_mkdiag_foreign_user++;
             }
         }

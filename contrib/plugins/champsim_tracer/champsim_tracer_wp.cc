@@ -1094,178 +1094,38 @@ static WpStep wp_handle_fault_fragment(WpWalkState &st, BBTemplate *cur,
     return WpStep::PROCEED;
 }
 
-std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
-                                               uint64_t correct_target,
-                                               uint64_t wrong_target,
-                                               unsigned int cpu_index,
-                                               bool *flush_interrupted,
-                                               bool *first_tb_unavail)
+/*
+ * Walk the fragment list one speculative exec_tb produced, committing each
+ * true BB it completes.  Owns the per-exec_tb fragment loop and its
+ * abnormal-exit tail; all outcomes land in st (early_exit / fault_stop /
+ * walk_done / fault_consumed), which the driver inspects after the call.
+ * The former outer-while break in the fault-PC-outside-TB tail becomes a
+ * return (early_exit is latched, so the driver's tail break fires); every
+ * break/continue inside the for-loop keeps steering the fragment loop.
+ * Body moved verbatim.
+ */
+static void wp_walk_fragments(WpWalkState &st)
 {
-    (void)correct_target;
-
-    /* All loop-carried, per-iteration and per-excursion context lives in one
-     * WpWalkState so each phase can later move into a helper taking
-     * WpWalkState &; the same-name references below keep every moved body
-     * verbatim (the auto &bb_pcs = acc.bb_pcs; pattern). */
-    WpWalkState st;
-    st.cpu_index         = cpu_index;
-    st.wrong_target      = wrong_target;
-    st.flush_interrupted = flush_interrupted;
-    st.first_tb_unavail  = first_tb_unavail;
-
-    /*
-     * Privilege domain the excursion speculates in: the launching correct-path
-     * context's, fixed by branch_pc's VA class.  Spec mode redirects only PC
-     * and sandboxes memory — it never writes the paging/privilege registers —
-     * so the architectural VA classifier (qemu_plugin_vaddr_is_kernel) reports
-     * the same kernel/user split for every fetch on the walk.  A wrong-path
-     * fetch that lands in the OTHER domain is SMEP/PXN-forbidden on real
-     * hardware and terminates the excursion (see the loop body).
-     */
-    st.excursion_is_kernel = cst_va_is_kernel_code(branch_pc);
-    /* Set true if a tb_flush unwound a spec-mode exec_tb before its guest
-     * insn ran (last_executed_tb stayed null while the flush count moved).
-     * The caller cleanly re-runs the whole WP in the now-fresh code cache
-     * — re-running across the flush IN-PLACE would execute wrong-path code
-     * after the flush dropped its translation, unsandboxed; restarting a
-     * fresh spec session avoids that. */
-    *flush_interrupted = false;
-    /* Set true only by the genuine-null empty-chain arm below (the one
-     * that bumps wp_first_tb_unavail): the wrong path's FIRST target
-     * could not be fetched/translated, so the returned chain is empty
-     * and there is no WPBBEntry to carry the truncation marker.  The
-     * emitter reads this and writes the chain-level
-     * CST_WP_EVENT_TRANSLATION_UNAVAIL event instead.  Saved-state
-     * failure, fault-loop exits, and flush interruption do NOT set it. */
-    *first_tb_unavail = false;
-
-    /* Cache the per-thread Stats ref once: g_stats expands to a
-     * thread_stats_get()/__tls_get_addr call, ~1% of total time from
-     * this function alone (10+ bumps per WP chain).  Named "stats" to
-     * avoid shadowing inner `s` loop indices. */
-    st.stats = &thread_stats_get();
-    st.hist  = g_current_hist_bucket;
-    Stats &stats = *st.stats;
-    Stats *hist = st.hist;
-
-    st.initial_insn_cap = max_wrong_path_depth > 16
-        ? (unsigned int)max_wrong_path_depth : 16;
-    unsigned int initial_insn_cap = st.initial_insn_cap;
-    auto &wp_chain = st.chain;
-    wp_chain.reserve(initial_insn_cap);
-    auto &poisoned_targets = st.poisoned_targets;
-    auto &sim_insns = st.sim_insns;
-    auto &early_exit = st.early_exit;
-    /* A POST-COMPLETION system-mode wrong-path fault (an SVC/ECALL kernel-entry
-     * that failed out of spec mode) committed its BB with the synthetic-fault
-     * marker and the excursion is ending cleanly at that block — the interim
-     * graceful-stop.  Execution-time arithmetic / illegal / trap faults do NOT
-     * set this: they skip the faulting insn and continue to the budget.
-     * Distinct from early_exit (an abnormal drop): the chain so far is honest
-     * and terminated on a marked fault, not truncated. */
-    auto &fault_stop = st.fault_stop;
-    /* last_fault_pc / repeated_fault_pc live in st, owned by
-     * wp_handle_fault_fragment and wp_commit_bb. */
-    /* Set when the previously appended TB ended with a bare delay-
-     * slot branch (TB_TERMINUS_BARE_BRANCH): its delay slot lives in
-     * the NEXT TB, so the BB is not yet complete.  Cleared when the
-     * next TB is appended, signalling the BB-complete commit. */
-    auto &awaiting_delay_slot = st.awaiting_delay_slot;
-
-    struct qemu_plugin_cpu_state *saved_state = qemu_plugin_cpu_state_save();
-    if (!saved_state) {
-        stats.wp_early_exits++;
-        stats.wp_simulations++;
-        if (hist) {
-            hist->wp_early_exits++;
-            hist->wp_simulations++;
-        }
-        return wp_chain;
-    }
-
-    wp_enter_spec_session(cpu_index, wrong_target, saved_state);
-
-    /*
-     * Per-insn accumulator for the BB being built.  Each exec_tb runs a
-     * multi-insn wrong-path TB up to its branch terminator — CF_SINGLE_STEP
-     * bounds rep-string ops to one iteration per exec_tb, it does NOT limit
-     * the TB to a single instruction — and a fault or partial run can stop
-     * inside it.  The fragment walk below accumulates exactly the insns that
-     * executed (post_pc matching) into raw arrays and commits a true BB at
-     * each branch fire via commit_true_bb_refs().
-     */
-    auto &acc = st.acc;
-    /* Same-name references keep the walk body below verbatim. */
+    auto &acc                = st.acc;
     auto &bb_pcs             = acc.bb_pcs;
-    auto &bb_sizes           = acc.bb_sizes;
-    auto &bb_bytes           = acc.bb_bytes;
     auto &bb_fields          = acc.bb_fields;
-    auto &bb_regnames        = acc.bb_regnames;
-    auto &bb_dyn_params      = acc.bb_dyn_params;
     auto &bb_reg_snaps       = acc.bb_reg_snaps;
     auto &bb_start_pc        = acc.bb_start_pc;
     auto &bb_symbol_name     = acc.bb_symbol_name;
-    /* bb_has_fault / bb_first_fault_idx live in st.acc, owned by
-     * wp_attribute_memops / wp_handle_fault_fragment / wp_commit_bb. */
-    /* Stable zeroed sentinel for the rare reg-data-on-but-template-has-no-
-     * regnames case (keeps a valid pointer to push). */
-    bb_pcs.reserve(initial_insn_cap);
-    bb_sizes.reserve(initial_insn_cap);
-    bb_bytes.reserve(initial_insn_cap * MAX_INSN_BYTES);
-    bb_fields.reserve(initial_insn_cap);
-    bb_dyn_params.reserve(initial_insn_cap);
-    if (g_features.reg_data) {
-        bb_regnames.reserve(initial_insn_cap);
-    }
-    if (g_features.wp_reg_data) {
-        bb_reg_snaps.reserve((size_t)initial_insn_cap * MAX_SRC_REGS);
-    }
-
-    /* No-forward-progress detection: a same-PC repeat with no memop
-     * growth is a stuck excursion; bail after two (see the stuck-PC
-     * handler below).  prev_mem_size tracks the spec memop count to
-     * tell a stuck loop from a legitimately-advancing rep-string.
-     * prev_pre_pc / same_pre_pc_count / wp_noprogress_count / prev_mem_size
-     * live in st and are owned by wp_check_forward_progress now. */
-    st.prev_mem_size = g_wp_state.mem_accesses.size();
-    /* Per-iteration / per-walk scratch aliases (reset at the iteration top
-     * below); folded into st so the walk phases can move into helpers. */
-    auto &pre_pc = st.pre_pc;
-    auto &mem_start_idx = st.mem_start_idx;
-    auto &tmpl = st.tmpl;
-    auto &tb_ok = st.tb_ok;
-    auto &post_pc_now = st.post_pc_now;
-    auto &fault_consumed = st.fault_consumed;
-    auto &walk_done = st.walk_done;
-    auto &wp_snap_cursor = st.wp_snap_cursor;
-    while (sim_insns < (uint64_t)max_wrong_path_depth ||
-           !bb_pcs.empty()) {
-        pre_pc = qemu_plugin_get_pc();
-        cst_ring_push('W', pre_pc);  /* #77 ring (gated) */
-        mem_start_idx = g_wp_state.mem_accesses.size();
-        tmpl = nullptr;
-
-        WpStep fp = wp_check_forward_progress(st);
-        if (fp == WpStep::NEXT_ITER) {
-            continue;
-        }
-        if (fp != WpStep::PROCEED) {
-            /* STUCK_BAIL / DOMAIN_CROSS: the guard already dropped the
-             * accumulator and latched early_exit — end the excursion. */
-            break;
-        }
-
-        if (bb_pcs.empty()) {
-            bb_start_pc = pre_pc;
-        }
-
-        WpStep ex = wp_exec_one_tb(st);
-        if (ex != WpStep::PROCEED) {
-            /* RETRY_SESSION / TRANSLATION_UNAVAIL / STUCK_BAIL: the exec
-             * phase already dropped the accumulator and latched early_exit
-             * (and, for a flush, *flush_interrupted). */
-            break;
-        }
+    auto &tmpl               = st.tmpl;
+    auto &tb_ok              = st.tb_ok;
+    auto &post_pc_now        = st.post_pc_now;
+    auto &fault_consumed     = st.fault_consumed;
+    auto &walk_done          = st.walk_done;
+    auto &wp_snap_cursor     = st.wp_snap_cursor;
+    auto &sim_insns          = st.sim_insns;
+    auto &awaiting_delay_slot = st.awaiting_delay_slot;
+    auto &early_exit         = st.early_exit;
+    auto &fault_stop         = st.fault_stop;
+    auto &poisoned_targets   = st.poisoned_targets;
+    unsigned int cpu_index   = st.cpu_index;
+    Stats &stats = *st.stats;
+    Stats *hist  = st.hist;
 
         /*
          * Walk the fragment list produced by the mid-TB-branch
@@ -1537,8 +1397,174 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             acc.clear();
             bb_reg_snaps.clear();
             early_exit = true;
+            return;
+        }
+}
+
+std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
+                                               uint64_t correct_target,
+                                               uint64_t wrong_target,
+                                               unsigned int cpu_index,
+                                               bool *flush_interrupted,
+                                               bool *first_tb_unavail)
+{
+    (void)correct_target;
+
+    /* All loop-carried, per-iteration and per-excursion context lives in one
+     * WpWalkState so each phase can later move into a helper taking
+     * WpWalkState &; the same-name references below keep every moved body
+     * verbatim (the auto &bb_pcs = acc.bb_pcs; pattern). */
+    WpWalkState st;
+    st.cpu_index         = cpu_index;
+    st.wrong_target      = wrong_target;
+    st.flush_interrupted = flush_interrupted;
+    st.first_tb_unavail  = first_tb_unavail;
+
+    /*
+     * Privilege domain the excursion speculates in: the launching correct-path
+     * context's, fixed by branch_pc's VA class.  Spec mode redirects only PC
+     * and sandboxes memory — it never writes the paging/privilege registers —
+     * so the architectural VA classifier (qemu_plugin_vaddr_is_kernel) reports
+     * the same kernel/user split for every fetch on the walk.  A wrong-path
+     * fetch that lands in the OTHER domain is SMEP/PXN-forbidden on real
+     * hardware and terminates the excursion (see the loop body).
+     */
+    st.excursion_is_kernel = cst_va_is_kernel_code(branch_pc);
+    /* Set true if a tb_flush unwound a spec-mode exec_tb before its guest
+     * insn ran (last_executed_tb stayed null while the flush count moved).
+     * The caller cleanly re-runs the whole WP in the now-fresh code cache
+     * — re-running across the flush IN-PLACE would execute wrong-path code
+     * after the flush dropped its translation, unsandboxed; restarting a
+     * fresh spec session avoids that. */
+    *flush_interrupted = false;
+    /* Set true only by the genuine-null empty-chain arm below (the one
+     * that bumps wp_first_tb_unavail): the wrong path's FIRST target
+     * could not be fetched/translated, so the returned chain is empty
+     * and there is no WPBBEntry to carry the truncation marker.  The
+     * emitter reads this and writes the chain-level
+     * CST_WP_EVENT_TRANSLATION_UNAVAIL event instead.  Saved-state
+     * failure, fault-loop exits, and flush interruption do NOT set it. */
+    *first_tb_unavail = false;
+
+    /* Cache the per-thread Stats ref once: g_stats expands to a
+     * thread_stats_get()/__tls_get_addr call, ~1% of total time from
+     * this function alone (10+ bumps per WP chain).  Named "stats" to
+     * avoid shadowing inner `s` loop indices. */
+    st.stats = &thread_stats_get();
+    st.hist  = g_current_hist_bucket;
+    Stats &stats = *st.stats;
+    Stats *hist = st.hist;
+
+    st.initial_insn_cap = max_wrong_path_depth > 16
+        ? (unsigned int)max_wrong_path_depth : 16;
+    unsigned int initial_insn_cap = st.initial_insn_cap;
+    auto &wp_chain = st.chain;
+    wp_chain.reserve(initial_insn_cap);
+    auto &sim_insns = st.sim_insns;
+    auto &early_exit = st.early_exit;
+    /* A POST-COMPLETION system-mode wrong-path fault (an SVC/ECALL kernel-entry
+     * that failed out of spec mode) committed its BB with the synthetic-fault
+     * marker and the excursion is ending cleanly at that block — the interim
+     * graceful-stop.  Execution-time arithmetic / illegal / trap faults do NOT
+     * set this: they skip the faulting insn and continue to the budget.
+     * Distinct from early_exit (an abnormal drop): the chain so far is honest
+     * and terminated on a marked fault, not truncated. */
+    auto &fault_stop = st.fault_stop;
+    /* last_fault_pc / repeated_fault_pc / awaiting_delay_slot live in st,
+     * owned by the fault / walk phases. */
+
+    struct qemu_plugin_cpu_state *saved_state = qemu_plugin_cpu_state_save();
+    if (!saved_state) {
+        stats.wp_early_exits++;
+        stats.wp_simulations++;
+        if (hist) {
+            hist->wp_early_exits++;
+            hist->wp_simulations++;
+        }
+        return wp_chain;
+    }
+
+    wp_enter_spec_session(cpu_index, wrong_target, saved_state);
+
+    /*
+     * Per-insn accumulator for the BB being built.  Each exec_tb runs a
+     * multi-insn wrong-path TB up to its branch terminator — CF_SINGLE_STEP
+     * bounds rep-string ops to one iteration per exec_tb, it does NOT limit
+     * the TB to a single instruction — and a fault or partial run can stop
+     * inside it.  The fragment walk below accumulates exactly the insns that
+     * executed (post_pc matching) into raw arrays and commits a true BB at
+     * each branch fire via commit_true_bb_refs().
+     */
+    auto &acc = st.acc;
+    /* Same-name references keep the walk body below verbatim. */
+    auto &bb_pcs             = acc.bb_pcs;
+    auto &bb_sizes           = acc.bb_sizes;
+    auto &bb_bytes           = acc.bb_bytes;
+    auto &bb_fields          = acc.bb_fields;
+    auto &bb_regnames        = acc.bb_regnames;
+    auto &bb_dyn_params      = acc.bb_dyn_params;
+    auto &bb_reg_snaps       = acc.bb_reg_snaps;
+    auto &bb_start_pc        = acc.bb_start_pc;
+    /* bb_symbol_name / bb_has_fault / bb_first_fault_idx live in st.acc,
+     * owned by the walk / memop / fault / commit phases. */
+    /* Stable zeroed sentinel for the rare reg-data-on-but-template-has-no-
+     * regnames case (keeps a valid pointer to push). */
+    bb_pcs.reserve(initial_insn_cap);
+    bb_sizes.reserve(initial_insn_cap);
+    bb_bytes.reserve(initial_insn_cap * MAX_INSN_BYTES);
+    bb_fields.reserve(initial_insn_cap);
+    bb_dyn_params.reserve(initial_insn_cap);
+    if (g_features.reg_data) {
+        bb_regnames.reserve(initial_insn_cap);
+    }
+    if (g_features.wp_reg_data) {
+        bb_reg_snaps.reserve((size_t)initial_insn_cap * MAX_SRC_REGS);
+    }
+
+    /* No-forward-progress detection: a same-PC repeat with no memop
+     * growth is a stuck excursion; bail after two (see the stuck-PC
+     * handler below).  prev_mem_size tracks the spec memop count to
+     * tell a stuck loop from a legitimately-advancing rep-string.
+     * prev_pre_pc / same_pre_pc_count / wp_noprogress_count / prev_mem_size
+     * live in st and are owned by wp_check_forward_progress now. */
+    st.prev_mem_size = g_wp_state.mem_accesses.size();
+    /* Per-iteration scratch reset at the iteration top below; the rest
+     * (tb_ok / post_pc_now / fault_consumed / walk_done / wp_snap_cursor)
+     * live in st and are owned by wp_exec_one_tb / wp_walk_fragments. */
+    auto &pre_pc = st.pre_pc;
+    auto &mem_start_idx = st.mem_start_idx;
+    auto &tmpl = st.tmpl;
+    while (sim_insns < (uint64_t)max_wrong_path_depth ||
+           !bb_pcs.empty()) {
+        pre_pc = qemu_plugin_get_pc();
+        cst_ring_push('W', pre_pc);  /* #77 ring (gated) */
+        mem_start_idx = g_wp_state.mem_accesses.size();
+        tmpl = nullptr;
+
+        WpStep fp = wp_check_forward_progress(st);
+        if (fp == WpStep::NEXT_ITER) {
+            continue;
+        }
+        if (fp != WpStep::PROCEED) {
+            /* STUCK_BAIL / DOMAIN_CROSS: the guard already dropped the
+             * accumulator and latched early_exit — end the excursion. */
             break;
         }
+
+        if (bb_pcs.empty()) {
+            bb_start_pc = pre_pc;
+        }
+
+        WpStep ex = wp_exec_one_tb(st);
+        if (ex != WpStep::PROCEED) {
+            /* RETRY_SESSION / TRANSLATION_UNAVAIL / STUCK_BAIL: the exec
+             * phase already dropped the accumulator and latched early_exit
+             * (and, for a flush, *flush_interrupted). */
+            break;
+        }
+
+        wp_walk_fragments(st);
+
         if (early_exit || fault_stop) {
             break;
         }

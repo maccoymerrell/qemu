@@ -122,10 +122,17 @@ extern thread_local std::vector<RegSnap> pending_reg_snaps CST_TLS_HOT;
  * suffix's SEAL, one or more TB steps later.  (The plan's
  * susp_prev/susp_chain suspend fields arrive with the foreign-ASID
  * suspend-or-seal arrow; until then the foreign-ASID boundary DROPS the
- * deferred prev, so a frame never freezes chain state.) */
+ * deferred prev, so a frame never freezes chain state.  When that arrow
+ * lands, its SuspendedPrev keys on this SAME (thread,asid): susp_.asid =
+ * StepIn::pinned_asid at suspend time, and a resume requires the resuming
+ * TB's effective asid to match — the identical key frame_idx_for_completion
+ * now uses, so a suspension cannot be resumed cross-process.) */
 struct CtxFrame {
     BBTemplate *full_tmpl = nullptr;   /* the faulting BB's full template */
-    uint64_t asid = 0;                 /* event-stamped owning address space */
+    uint64_t asid = 0;                 /* event-stamped owning address space;
+                                        * the (thread,asid) match key for
+                                        * resume / block / completion — and,
+                                        * Stage 3, suspend/resume */
     uint64_t resume_pc = 0;            /* faulting insn = where ERET lands */
     uint32_t depth = 0;                /* depth the faulting BB ran at */
     bool returned = false;             /* FAULT_RETURN observed, seal pending */
@@ -255,7 +262,15 @@ private:
     ptrdiff_t frame_idx_for_resume(uint64_t resume_pc, uint64_t asid) const;
     ptrdiff_t frame_idx_for_block(const BBTemplate *piece, uint64_t resume,
                                   uint64_t asid) const;
-    ptrdiff_t frame_idx_for_completion(const BBTemplate *suffix) const;
+    /* Completion candidate for a just-sealed BB claiming to be some frame's
+     * resume suffix.  @seal_asid is the pinned process's effective asid at
+     * the seal (StepIn::pinned_asid = pin_effective_asid): a frame can only
+     * complete against a suffix sealed in ITS OWN (thread,asid) — the thread
+     * dimension is implicit (PathBuilder is per-vCPU-thread TLS), and this
+     * asid is the second half of the (thread,asid) key.  With the asid key
+     * load-bearing, merge_suffix_matches is a PURE DIAGNOSTIC (Decision C). */
+    ptrdiff_t frame_idx_for_completion(const BBTemplate *suffix,
+                                       uint64_t seal_asid) const;
     void collect_piece(CtxFrame &f, uint64_t resume_pc);
     BBTemplate *fold_prev_full_bb(BBTemplate *prev);
     StepStatus complete_merge(size_t idx,
@@ -279,8 +294,11 @@ private:
      * fault frame's resume suffix — the block whose seal would have
      * completed the merge — retire the frame now via flush_frame_unwound so
      * its depth level is not lost with the dropped block.  Fetches the
-     * active body stream itself (no-op when no segment is active). */
-    void flush_dropped_prev(unsigned int cpu_index);
+     * active body stream itself (no-op when no segment is active).
+     * @seal_asid is the pinned process's effective asid (StepIn::pinned_asid):
+     * the dropped prev is the pinned process's OWN block, so the retired
+     * frame is matched within one (thread,asid) — same key as completion. */
+    void flush_dropped_prev(unsigned int cpu_index, uint64_t seal_asid);
 
     /* In-flight fault excursions, fault-nesting order (completion may
      * retire a mid-stack frame; see frame_idx_for_completion). */

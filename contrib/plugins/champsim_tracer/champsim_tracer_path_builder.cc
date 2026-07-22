@@ -494,53 +494,62 @@ ptrdiff_t PathBuilder::frame_idx_for_block(const BBTemplate *piece,
 
 /*
  * Completion candidate for a just-sealed BB claiming to be some frame's
- * resume suffix.  Preferred match: a frame whose FAULT_RETURN was already
- * observed (event identity; the byte-content check is demoted to a
- * diagnostic there).  Fallback: QEMU's fault-stack pop is strict LIFO, so
- * a non-LIFO guest exception return — a context switch inside a blocking
- * fault resuming the OUTER task first — produces NO FAULT_RETURN event
- * even though the suffix genuinely resumes; complete those on the
- * byte-content check alone (the content match is what keeps a same-VA
- * frame from another address space from swallowing an innocent seal).
+ * resume suffix.  Keyed on the completing seal's (thread,asid): the thread
+ * is implicit (PathBuilder is per-vCPU-thread TLS), and @seal_asid — the
+ * pinned process's effective asid at the seal (StepIn::pinned_asid) — is the
+ * second half of the key.  A frame can only complete against a suffix sealed
+ * in ITS OWN address space (f.asid == seal_asid), so the cross-ASID swallow
+ * the byte guard was added to catch (a same-VA frame from ANOTHER process
+ * consuming an innocent seal, e.g. resume 0x4003f0) is IMPOSSIBLE BY
+ * CONSTRUCTION.  merge_suffix_matches is therefore no longer load-bearing —
+ * it is demoted to a pure diagnostic (Decision C): on a byte mismatch under
+ * the asid key it reports (env-gated, CST_FAULT_DIAG) but does NOT reject the
+ * completion.  In single-process the asid predicate is always true and the
+ * byte check always held where it fired, so output is byte-identical.
+ *
+ * Preferred match: a frame whose FAULT_RETURN was already observed (event
+ * identity).  Fallback: QEMU's fault-stack pop is strict LIFO, so a non-LIFO
+ * guest exception return — a context switch inside a blocking fault resuming
+ * the OUTER task first — produces NO FAULT_RETURN event even though the
+ * suffix genuinely resumes; complete those on the (asid, resume_pc) key too.
  */
-ptrdiff_t PathBuilder::frame_idx_for_completion(const BBTemplate *suffix) const
+ptrdiff_t PathBuilder::frame_idx_for_completion(const BBTemplate *suffix,
+                                                uint64_t seal_asid) const
 {
     if (!suffix) {
         return -1;
     }
     for (size_t i = frames_.size(); i-- > 0; ) {
         const CtxFrame &f = frames_[i];
-        if (!(f.returned && f.resume_pc == suffix->start_pc)) {
+        if (!(f.returned && f.resume_pc == suffix->start_pc &&
+              f.asid == seal_asid)) {
             continue;
         }
-        /* Content guard — the SAME check the fallback loop below uses, and
-         * the fix for the cross-ASID completion hazard the header comment
-         * names.  A returned frame's resume PC matching the seal is NOT
-         * proof of same-address-space identity: owned processes share load
-         * VAs, so a frame stashed by ANOTHER process's fault at this VA can
-         * carry the matching resume_pc while its template is foreign code.
-         * merge_suffix_matches must therefore be a HARD condition, not the
-         * old assert: under NDEBUG the assert compiles out, which let a
-         * cross-ASID frame silently complete and emit a foreign template in
-         * the innocent seal's place.  A genuine resume suffix is
-         * byte-identical to the stashed template at the resume position, so
-         * this rejects nothing real and leaves single-process output
-         * byte-identical (the check always held where the old assert did). */
-        if (merge_suffix_matches(f.full_tmpl, suffix)) {
-            return (ptrdiff_t)i;
-        }
-        if (pb_diag()) {
-            fprintf(stderr, "[pathbuilder] WARN completion content "
-                    "mismatch (cross-ASID guard): frame full=0x%" PRIx64
-                    " resume=0x%" PRIx64 " vs suffix=0x%" PRIx64 "\n",
+        /* Byte guard demoted to a pure diagnostic: the (thread,asid) key
+         * above already makes a cross-ASID swallow impossible, so a byte
+         * mismatch here is a bug to REPORT (self-modified code, a decode
+         * drift), not a reason to reject a same-address-space completion. */
+        if (pb_diag() && !merge_suffix_matches(f.full_tmpl, suffix)) {
+            fprintf(stderr, "[pathbuilder] DIAG completion byte mismatch "
+                    "(non-behavioral; asid-keyed): frame full=0x%" PRIx64
+                    " resume=0x%" PRIx64 " asid=0x%" PRIx64 " vs suffix=0x%"
+                    PRIx64 "\n",
                     f.full_tmpl ? f.full_tmpl->start_pc : 0,
-                    f.resume_pc, suffix->start_pc);
+                    f.resume_pc, f.asid, suffix->start_pc);
         }
+        return (ptrdiff_t)i;
     }
     for (size_t i = frames_.size(); i-- > 0; ) {
         const CtxFrame &f = frames_[i];
-        if (f.resume_pc == suffix->start_pc &&
-            merge_suffix_matches(f.full_tmpl, suffix)) {
+        if (f.resume_pc == suffix->start_pc && f.asid == seal_asid) {
+            if (pb_diag() && !merge_suffix_matches(f.full_tmpl, suffix)) {
+                fprintf(stderr, "[pathbuilder] DIAG completion byte mismatch "
+                        "(non-behavioral; asid-keyed, no-return): frame "
+                        "full=0x%" PRIx64 " resume=0x%" PRIx64 " asid=0x%"
+                        PRIx64 " vs suffix=0x%" PRIx64 "\n",
+                        f.full_tmpl ? f.full_tmpl->start_pc : 0,
+                        f.resume_pc, f.asid, suffix->start_pc);
+            }
             return (ptrdiff_t)i;
         }
     }
@@ -842,7 +851,7 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
                 /* Same retire-at-return as the foreign-ASID drop: the
                  * abandoned window is dropping prev, so an inner frame whose
                  * resume suffix it is must be flushed at its depth first. */
-                flush_dropped_prev(in.cpu_index);
+                flush_dropped_prev(in.cpu_index, in.pinned_asid);
                 g_mem_recorder.clear_cp();
                 pending_reg_snaps.clear();
                 clear_prev();
@@ -909,7 +918,7 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
              * and the unwind collapses into a >1 depth jump under contention.
              * Runs before the accumulator clear below: it saves/restores the
              * CP buffer around its own emit, and needs prev_tb_ intact. */
-            flush_dropped_prev(in.cpu_index);
+            flush_dropped_prev(in.cpu_index, in.pinned_asid);
             /* rearch: suspend-or-seal candidate.  For now the deferred
              * prev is DROPPED — the one-TB lossy boundary — rather than
              * suspended, so its fragments never bridge across the
@@ -1129,7 +1138,7 @@ void PathBuilder::flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
  * it can never anchor a >1 jump — and emitting user code standalone would
  * degrade a user entry the content oracle validates.
  */
-void PathBuilder::flush_dropped_prev(unsigned int cpu_index)
+void PathBuilder::flush_dropped_prev(unsigned int cpu_index, uint64_t seal_asid)
 {
     if (!g_features.fault_depth_trailer || pb_no_merge() ||
         !prev_tb_ || frames_.empty()) {
@@ -1140,7 +1149,9 @@ void PathBuilder::flush_dropped_prev(unsigned int cpu_index)
     if (!out_stream) {
         return;
     }
-    ptrdiff_t ci = frame_idx_for_completion(prev_tb_);
+    /* The dropped prev is the pinned process's OWN block, so it is matched
+     * within its (thread,asid): seal_asid is the pinned effective asid. */
+    ptrdiff_t ci = frame_idx_for_completion(prev_tb_, seal_asid);
     if (ci >= 0 && frames_[(size_t)ci].depth >= 1) {
         flush_frame_unwound((size_t)ci, out_stream, cpu_index);
     }
@@ -1389,9 +1400,12 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
     }
 
     /* ---- merge completion (front seal only) ---- */
+    /* The seal runs on the pinned process's live context; its effective asid
+     * (in.pinned_asid) is the (thread,asid) key completion matches on. */
     ptrdiff_t mtop = -1;
     if (fault_on && !pb_no_merge() && any_finalize && !pending_emits.empty()) {
-        mtop = frame_idx_for_completion(pending_emits.front().bb_tmpl);
+        mtop = frame_idx_for_completion(pending_emits.front().bb_tmpl,
+                                        in.pinned_asid);
     }
     if (in.watch_pc && walk_prev_ && walk_prev_->start_pc == in.watch_pc) {
         fprintf(stderr, "[blkwatch] mtop=%td frames=%zu (events)\n",

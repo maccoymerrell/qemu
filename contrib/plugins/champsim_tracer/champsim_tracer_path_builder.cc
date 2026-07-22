@@ -1162,8 +1162,39 @@ PathBuilder::complete_merge(size_t idx,
         f.full_tmpl->taken_pc = pe.bb_tmpl->taken_pc;
         g_mutex_unlock(&data_lock);
     }
-    g_emit_fault_depth = f.depth;
-    g_emit_fault_anchors = f.anchors;
+    /* Anchor guard on the merge emit (mirrors flush_frame_unwound's guard,
+     * plan §1.4 — the safety net against a depth-JUMP / anchor-at-unwind
+     * trade).  A merged (fault-anchored) entry must land at its excursion's
+     * unwind — its same-tid predecessor strictly DEEPER.  Under multi-process
+     * kernel-fault interleave a frame can be created off the pinned process's
+     * shared-kernel deferred prev by ANOTHER task's fault (a kernel event's
+     * asid stamp is not ownership — the Stage-2 finding) and then completed by
+     * the pinned process via the kernel-content path, with the excursion's
+     * deeper handler blocks never traced in the pinned stream
+     * (g_last_emit_fault_depth <= f.depth).  Emitting it anchored at f.depth
+     * then fabricates the residual depth-0 merge (anch=[0] at depth 0 whose
+     * predecessor is also depth 0) or a >1 depth JUMP.  When the deeper
+     * predecessor is absent, emit the faulting BB as a PLAIN block clamped to
+     * the predecessor's depth (no anchor, no jump) — the honest
+     * representation of a fault whose excursion the pinned stream did not see.
+     * Byte-inert off the contention path: a genuine nested fault's handler
+     * emits deeper first, so the guard never triggers (g_last_emit > f.depth).
+     * The deeper-frame flush above may have just emitted the true deeper
+     * predecessor, in which case g_last_emit is deep and the anchor stays. */
+    if (g_last_emit_fault_depth > f.depth) {
+        g_emit_fault_depth = f.depth;
+        g_emit_fault_anchors = f.anchors;
+    } else {
+        g_emit_fault_depth = g_last_emit_fault_depth;
+        g_emit_fault_anchors.clear();
+        if (pb_diag() || pb_susp_diag()) {
+            fprintf(stderr, "[pathbuilder] MERGE-DEANCHOR full=0x%" PRIx64
+                    " f.depth=%u last_emit=%u nanchor=%zu (no deeper "
+                    "predecessor; emit plain)\n",
+                    f.full_tmpl ? f.full_tmpl->start_pc : 0, f.depth,
+                    g_last_emit_fault_depth, f.anchors.size());
+        }
+    }
     BBTemplate *merged = f.full_tmpl;
     uint64_t merge_wrong = pb_no_fault_wp() ? 0 : pe.wrong_target;
     frames_.erase(frames_.begin() + idx);
@@ -1326,19 +1357,27 @@ void PathBuilder::suspend_prev(uint64_t owner_asid, uint64_t owner_live,
 /*
  * The resume arrow (plan §1.3).  The pinned process is back at an owned,
  * non-excluded TB (all gates passed).  Pop the top-most suspension whose
- * (asid, live) matches the resuming context and re-arm the four sinks so the
- * promote below walks the suspended prev and the seal emits the intermediate
- * handler block AT ITS OWN DEPTH.  The BOTH-key match (pinned effective asid
- * AND live asid) is what forbids a cross-process restore: a constant marker
- * pin shares its asid across two owned x86 processes, but their CR3s
- * (owner_live) differ, so a resume never seals one process's block against
- * another's successor.  Returns true iff a suspension was restored.
+ * owning asid matches the resuming context's pinned effective asid and
+ * re-arm the four sinks so the promote below walks the suspended prev and
+ * the seal emits the intermediate handler block AT ITS OWN DEPTH.
+ *
+ * The match keys ONLY on the pinned effective asid (StepIn::pinned_asid, the
+ * dwell tag on narrow-ASID targets) — the load-bearing Stage-2 finding: a
+ * kept KERNEL block's LIVE asid is whatever mm is loaded (a PTI overlay, a
+ * TLB-maintenance scratch), NOT ownership, so gating the resume on live asid
+ * strands the pinned process's own kernel-handler suspensions un-resumable
+ * (observed: a kept kernel block promoted under a 0x...d2000 overlay never
+ * matches the pinned 0x...c4000).  Cross-process safety in trace-all is the
+ * COMPLETION path's job (frame_matches_completion keys user frames on the
+ * hard asid and kernel frames on content), not the resume re-arm's.  Returns
+ * true iff a suspension was restored.
  */
 bool PathBuilder::resume_suspension(uint64_t resume_asid, uint64_t resume_live)
 {
+    (void)resume_live;                           /* diagnostic only; see above */
     for (size_t i = susp_stack_.size(); i-- > 0; ) {
         SuspendedPrev &s = susp_stack_[i];
-        if (s.asid != resume_asid || s.owner_live != resume_live) {
+        if (s.asid != resume_asid) {
             continue;
         }
         prev_tb_ = s.prev;                       /* re-arm the pending seal */
@@ -1554,8 +1593,7 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
              * suspensions are touched — a peer process's held suspension stays
              * for its own resume. */
             for (size_t i = susp_stack_.size(); i-- > 0; ) {
-                if (susp_stack_[i].asid == in.pinned_asid &&
-                    susp_stack_[i].owner_live == in.live_asid) {
+                if (susp_stack_[i].asid == in.pinned_asid) {
                     retire_suspension(i, in.cpu_index);
                     susp_stack_.erase(susp_stack_.begin() + (ptrdiff_t)i);
                     g_stats.susp_stale_retired++;

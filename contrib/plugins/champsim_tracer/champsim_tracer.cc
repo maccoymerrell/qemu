@@ -1625,6 +1625,11 @@ static void devio_stop_cb(uint64_t request_id)
  * >=1 = fault-handler code at that nesting. */
 thread_local uint32_t g_emit_fault_depth CST_TLS_HOT = 0;
 
+/* Fault depth of the LAST body entry emitted on this thread; the unwind-flush
+ * anchor guard (PathBuilder::flush_frame_unwound) reads it to keep a merged
+ * faulting BB from landing at a depth its predecessor doesn't strictly exceed. */
+thread_local uint32_t g_last_emit_fault_depth = 0;
+
 /* CST diag correlation: the seq_num of the most recent body entry emitted on
  * this thread, so the per-step depth diag can be tied to a wire position. */
 thread_local uint64_t g_dbg_last_emit_seq = 0;
@@ -2491,6 +2496,11 @@ void emit_body_entry(BodyStreamState *out_stream,
     entry.wp_first_tb_unavail = wp_first_tb_unavail;
     entry.tmpl = bb_tmpl;
     entry.fault_depth = g_emit_fault_depth;
+    /* Record this thread's last-emitted depth for the unwind-flush anchor
+     * guard.  A REP fan-out below emits its sub-entries at this same depth
+     * (they inherit entry.fault_depth), so the parent stamp is the last
+     * emitted level regardless. */
+    g_last_emit_fault_depth = g_emit_fault_depth;
     entry.fault_anchors = g_emit_fault_anchors;
     /* Guest-thread identity on the wire (system-mode pin); the raw vCPU
      * index otherwise.  cpu_index is retained for live register reads only

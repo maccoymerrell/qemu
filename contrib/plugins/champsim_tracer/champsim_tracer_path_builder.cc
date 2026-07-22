@@ -188,8 +188,12 @@ void PathBuilder::on_segment_open()
      * rather than inheriting a pre-trace excursion. */
     primed_ = false;
     /* The emit-side trailer registers are shared with emit_body_entry;
-     * zero them so nothing leaks into the new segment's first entry. */
+     * zero them so nothing leaks into the new segment's first entry.  The
+     * last-emitted-depth guard likewise resets so the new segment's first
+     * unwind flush compares against a clean baseline, not a stale prior
+     * segment's depth. */
     g_emit_fault_depth = 0;
+    g_last_emit_fault_depth = 0;
     g_emit_fault_anchors.clear();
 }
 
@@ -835,6 +839,10 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
                 seal_pc_override_ = async_departure_pc_;
                 async_departure_pc_ = 0;
             } else if (prev_tb_) {
+                /* Same retire-at-return as the foreign-ASID drop: the
+                 * abandoned window is dropping prev, so an inner frame whose
+                 * resume suffix it is must be flushed at its depth first. */
+                flush_dropped_prev(in.cpu_index);
                 g_mem_recorder.clear_cp();
                 pending_reg_snaps.clear();
                 clear_prev();
@@ -895,6 +903,13 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
             drop = !kexc_kernel_tb_keep();
         }
         if (drop) {
+            /* Retire-at-return: if the prev being dropped is an inner fault
+             * frame's resume suffix, complete its merge now (emit its depth
+             * level) before the drop loses it — otherwise the frame leaks
+             * and the unwind collapses into a >1 depth jump under contention.
+             * Runs before the accumulator clear below: it saves/restores the
+             * CP buffer around its own emit, and needs prev_tb_ intact. */
+            flush_dropped_prev(in.cpu_index);
             /* rearch: suspend-or-seal candidate.  For now the deferred
              * prev is DROPPED — the one-TB lossy boundary — rather than
              * suspended, so its fragments never bridge across the
@@ -953,6 +968,18 @@ PathBuilder::complete_merge(size_t idx,
                             BodyStreamState *out_stream,
                             unsigned int cpu_index)
 {
+    /* TODO(stage2/3): retire-at-return backstop — flush any frame still in
+     * flight that nests DEEPER than the one now completing (a higher stack
+     * index; strict LIFO makes a surviving deeper frame a leak), deepest-
+     * first, BEFORE the outer frame's merged BB, so the unwind steps down one
+     * level at a time (2->1->0) rather than collapsing straight to the outer's
+     * depth (2->0).  DEFERRED from Stage 0: the frame it would pick is found
+     * via frame_idx_for_completion's resume-PC+bytes byte guard, which is
+     * cross-process-ambiguous for shared kernel code — an unconditional
+     * deeper-frame flush here could erase another process's live excursion.
+     * It becomes safe only once Stage 2 unifies frame identity on
+     * (thread,asid) (fault_merge_wp_rearch_plan.md Decision C), where it
+     * lands together with the suspend-or-seal arrow. */
     CtxFrame &f = frames_[idx];
     const PendingEmit &pe = pending_emits.front();
     if (pb_diag()) {
@@ -1018,6 +1045,105 @@ PathBuilder::complete_merge(size_t idx,
                           pe2.emit_current_pc, pe2.wrong_target, cpu_index);
     }
     return StepStatus::MERGED;
+}
+
+/*
+ * Unwind flush (see the header): retire an inner fault frame AT ITS RETURN by
+ * emitting its merged faulting BB standalone — the frame's own template, at
+ * its own fault depth + anchors, from its OWN accumulated memop / reg-snap
+ * buffers — then erasing it.  Used when the frame's resume suffix (the block
+ * whose seal would complete the merge) is DROPPED or never seals under host
+ * contention, so its depth level is emitted at the unwind rather than lost
+ * and collapsed into a >1 depth jump.  No wrong-path, and the terminal branch
+ * is left unresolved (the suffix that resolves it is gone), like the
+ * segment-final flush.
+ *
+ * The current CP memop / pending reg-snap accumulators hold the block being
+ * sealed THIS step (the outer frame's resume suffix, still pending), so they
+ * are set aside and restored around the frame's own emit.
+ *
+ * Anchor-at-unwind guard: an anchored (merged) entry must follow a strictly
+ * DEEPER one (syscall_fault_nesting).  If this thread's last-emitted depth is
+ * not strictly greater than the frame's, emitting here would fabricate that
+ * violation (the unwind already stepped past this level, or the predecessor
+ * is not this frame's handler) — so the frame is dropped WITHOUT emit.  Its
+ * merged BB is lost, but no anchor/step violation is introduced: depth is
+ * already at or below this level, so no >1 jump opens either.
+ */
+void PathBuilder::flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
+                                      unsigned int cpu_index)
+{
+    CtxFrame f = std::move(frames_[idx]);
+    frames_.erase(frames_.begin() + (ptrdiff_t)idx);
+
+    if (!out_stream || !f.full_tmpl) {
+        return;
+    }
+    if (!(g_last_emit_fault_depth > f.depth)) {
+        if (pb_diag()) {
+            fprintf(stderr, "[pathbuilder] UNWIND-FLUSH-SKIP full=0x%" PRIx64
+                    " depth=%u last_emit_depth=%u (anchor guard)\n",
+                    f.full_tmpl->start_pc, f.depth, g_last_emit_fault_depth);
+        }
+        return;
+    }
+
+    /* Set the current block's accumulators aside; emit from the frame's own. */
+    std::vector<WPMemAccess> cur_mem;
+    g_mem_recorder.take_cp(cur_mem);
+    std::vector<RegSnap> cur_snaps = std::move(pending_reg_snaps);
+    pending_reg_snaps.clear();
+
+    g_mem_recorder.prepend_cp(f.mem);
+    pending_reg_snaps = f.snaps;
+    g_emit_fault_depth = f.depth;
+    g_emit_fault_anchors = f.anchors;
+
+    if (pb_diag() || pb_depth_diag()) {
+        fprintf(stderr, "[pathbuilder] UNWIND-FLUSH full=0x%" PRIx64 " depth=%u "
+                "nanchor=%zu nmem=%zu pred_depth=%u frames_left=%zu\n",
+                f.full_tmpl->start_pc, f.depth, f.anchors.size(),
+                f.mem.size(), g_last_emit_fault_depth, frames_.size());
+    }
+
+    emit_body_entry(out_stream, f.full_tmpl, cpu_index, {});
+
+    g_emit_fault_anchors.clear();
+    g_emit_fault_depth = 0;
+
+    /* Restore the current block's accumulators (emit drained them). */
+    g_mem_recorder.clear_cp();
+    g_mem_recorder.prepend_cp(cur_mem);
+    pending_reg_snaps = std::move(cur_snaps);
+}
+
+/*
+ * A step_events DROP arm is about to clear the deferred prev.  If that prev is
+ * an in-flight INNER fault frame's resume suffix, its seal would have
+ * completed the merge — retiring that frame at its return.  Dropping it
+ * silently is exactly what leaks the frame under contention (it lingers
+ * un-returned, inflating every later fault's depth until a coarse sweep
+ * collapses it: the residual 2->0 / kernel 2->0->2 depth jump).  Retire it
+ * now instead, emitting its depth level at the unwind.  Only inner (depth>=1,
+ * kernel-handler) frames flush: a depth-0 (user) frame is the unwind floor —
+ * it can never anchor a >1 jump — and emitting user code standalone would
+ * degrade a user entry the content oracle validates.
+ */
+void PathBuilder::flush_dropped_prev(unsigned int cpu_index)
+{
+    if (!g_features.fault_depth_trailer || pb_no_merge() ||
+        !prev_tb_ || frames_.empty()) {
+        return;
+    }
+    BodyStreamState *out_stream =
+        g_trace_segments.is_active() ? g_trace_segments.body_stream() : nullptr;
+    if (!out_stream) {
+        return;
+    }
+    ptrdiff_t ci = frame_idx_for_completion(prev_tb_);
+    if (ci >= 0 && frames_[(size_t)ci].depth >= 1) {
+        flush_frame_unwound((size_t)ci, out_stream, cpu_index);
+    }
 }
 
 PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,

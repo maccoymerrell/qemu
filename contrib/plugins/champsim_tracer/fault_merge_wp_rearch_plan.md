@@ -206,6 +206,20 @@ a second foreign span before it could resume (Decision A). The two are
 - Land the preserved patch (`flush_dropped_prev` + the `complete_merge` deeper-
   frame backstop + the `g_last_emit_fault_depth` anchor guard,
   `faultb_attempt_FINAL.patch`) as the retire-at-return primitive.
+  **Stage 0 landed only the byte-inert, hazard-free pieces** — `flush_dropped_prev`
+  (the two DROP-arm retire calls), `flush_frame_unwound`, and the
+  `g_last_emit_fault_depth` anchor guard. The **`complete_merge` deeper-frame
+  flush is DEFERRED** (a `TODO(stage2/3)` marks its site in
+  `champsim_tracer_path_builder.cc`): it unconditionally flushes every frame
+  nesting deeper than the one completing, and the frame it reaches is picked by
+  `frame_idx_for_completion`'s resume-PC+bytes byte guard, which is
+  cross-process-ambiguous for shared kernel code — an errant flush there could
+  erase another process's live excursion. It becomes safe only once Stage 2
+  unifies frame identity on `(thread,asid)` (Decision C), and lands then
+  alongside the suspend-or-seal arrow. `flush_dropped_prev` carries no such
+  hazard: it fires on a DROP arm where `prev_tb_` is the *pinned* process's own
+  block (the foreign TB has seeded no frame), so its `frame_idx_for_completion`
+  match is within one process.
 - Under suspend-or-seal, `flush_dropped_prev` fires only when a suspension is
   **discarded without resuming** (segment orphan-drop; displacement;
   stale-frame sweep while a suspension is held) — it becomes the "suspend
@@ -361,14 +375,24 @@ pre-captured traces, `setarch -R`; (2) `python -m champsim_tracer_validator all
 stages additionally clear the **contention gate G-C** (§6). Stages are ordered by
 dependency and by risk (lowest-risk motion first).
 
-### Stage 0 — Baseline lock (no behavior change)
-Land the retire-at-return primitive (`faultb_attempt_FINAL.patch`) as the
-committed backstop (§1.4). Re-capture both goldens. Capture the **pre**-arc
-contention matrix over 50+ varied seeds (`drive_tight.sh`, `check_violations.py`)
-so the acceptance A/B is clean — memory rule: intermittent-bug fixes need ~50+
-seeds pre **and** post. **Byte:** identical off the contention path (patch is
-inert there, proven — `postfix2xB` goldens green). **Gate:** G0 + record the
-pre-arc JUMP/ANCHOR seed-fail rate.
+### Stage 0 — Baseline lock (no behavior change) — LANDED
+Landed the retire-at-return primitive (`faultb_attempt_FINAL.patch`) as the
+committed backstop (§1.4), **byte-inert pieces only**: `flush_dropped_prev` +
+`flush_frame_unwound` + the `g_last_emit_fault_depth` anchor guard. The
+`complete_merge` deeper-frame flush is **DEFERRED to Stage 2/3** (see §1.4;
+`TODO(stage2/3)` in `champsim_tracer_path_builder.cc`) because its frame pick is
+cross-process-ambiguous until frame identity is `(thread,asid)`-keyed. Both
+golden nets stayed **byte-identical** (user 4-ISA + `--system` CP-user-slice),
+confirming byte-inertness off the contention path. Captured the **pre**-arc
+contention baseline over 50+ varied seeds on a tight 4-core island
+(`rearch_s0/drive_baseline.sh`, `check_violations.py`) so the acceptance A/B is
+clean — memory rule: intermittent-bug fixes need ~50+ seeds pre **and** post.
+The recorded pre-arc JUMP/ANCHOR seed-fail rate and its config are in
+`/mnt/md0/QEMU/cst_runs/rearch_s0/BASELINE.txt` (referenced from §6): non-zero
+(Stage 0 lands only the backstop, so manifestations 2/3 remain — that is the
+residual the suspend-or-seal stages close). **Gate:** G0 met (both goldens
+byte-identical, `validator full` green, 4-ISA user battery errors=0, mutation
+15/15) + the baseline rate recorded.
 
 ### Stage 1 — WP-walker decomposition (byte-identical; independent TU)
 §3, staged extraction (each helper its own golden-gated commit): forward-progress
@@ -465,12 +489,15 @@ is the safety net that prevents any depth-JUMP -> anchor-violation trade.*
 The arc is accepted when **all** hold:
 
 1. **Contention matrix G-C = 0-fail over 50+ varied seeds, pre and post**
-   (`drive_tight.sh` tight 4-core islands, 3× oversubscription; the
-   Heisenbug-surfacing regime that caught 2/3). Post-arc, `check_violations.py`
-   over every kept trace: **depth-JUMP = 0 AND anchor-at-unwind = 0**. The
-   pre-arc baseline (Stage 0) must show the non-zero fail rate the arc closes,
-   so the A/B is real — memory rule: <50 seeds proves nothing; run parallel
-   waves under contention.
+   (tight 4-core islands, 3× oversubscription; the Heisenbug-surfacing regime
+   that caught 2/3). Post-arc, `check_violations.py` over every kept trace:
+   **depth-JUMP = 0 AND anchor-at-unwind = 0**. The pre-arc baseline (Stage 0,
+   with `flush_dropped_prev` landed but the suspend arrows not yet) is the A/B
+   reference and is recorded in `/mnt/md0/QEMU/cst_runs/rearch_s0/BASELINE.txt`
+   (seed-fail rate + depth-JUMP / anchor-at-unwind counts + exact island /
+   oversub config); it must show the non-zero fail rate the arc closes, so the
+   A/B is real — memory rule: <50 seeds proves nothing; run parallel waves under
+   contention.
 2. **Both golden nets byte-identical** — user-mode 4 ISAs and the `--system`
    CP-user-slice — at every stage (the WP decomposition and single-process
    fault-identity stages are byte-identical *everywhere*; the suspend stages are

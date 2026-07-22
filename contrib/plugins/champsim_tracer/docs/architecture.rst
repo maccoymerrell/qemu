@@ -1288,6 +1288,31 @@ keeps a same-VA frame from *another* address space — reachable
 through ASID reuse, since every process maps code at the same low
 VAs — from swallowing an innocent block's seal.
 
+**Retire-at-return when the resume suffix is dropped.**  A foreign-ASID
+excursion (or an abandoned async window) can preempt the pinned process
+*exactly* at a handler's return — the block whose seal would complete the
+merge is the deferred prev the drop arm then discards.  Dropping it silently
+leaks the inner frame: its ``FAULT_RETURN`` was suppressed on the shared
+per-vCPU stack (non-LIFO), so it lingers un-returned, inflating every later
+fault's depth until the coarse user-privilege stale-frame sweep collapses the
+whole stack to 0 at once — and the frame's own depth level, its merged BB,
+never reaches the wire, so ``fault_depth`` steps from the deepest handler
+straight to the resumed level (a ``2 -> 0`` jump the ``syscall_fault_nesting``
+oracle flags; symmetrically ``0 -> 2`` on the re-nest).  So before the drop
+arm clears the deferred prev it checks whether that prev is an inner
+(``depth >= 1``) frame's resume suffix and, if so, retires the frame *there*:
+``flush_frame_unwound`` emits the frame's full template at its own depth and
+anchors, from its own accumulated pieces, with no wrong-path and an unresolved
+terminal branch (the resolving suffix is gone), exactly like the
+segment-finish flush.  Because the flush emits an *anchored* (merged) entry,
+and an anchored entry must follow a strictly deeper one, a guard
+(``g_last_emit_fault_depth``) refuses to emit unless the last entry on the
+wire is deeper than the frame; a level it cannot place is dropped rather than
+emitted out of order, so the retire-at-return can never trade the depth jump
+for an anchor-at-unwind violation.  Off the contention path — user mode and a
+deterministic single-process system trace take no foreign drops and leak no
+frames — no flush fires and the output is byte-identical.
+
 On the wire (``CST_FLAG_FAULT``, set in marker mode; user-mode
 traces carry no trailer): every CP entry carries ``fault_depth``
 (0 = normal code, ≥1 = handler code at that nesting level,

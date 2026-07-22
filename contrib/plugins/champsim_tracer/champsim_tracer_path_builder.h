@@ -99,6 +99,12 @@ void emit_body_entry(BodyStreamState *out_stream,
  * merge re-injection) and stamps the emit-time fault trailer values
  * emit_body_entry reads. */
 extern thread_local uint32_t g_emit_fault_depth CST_TLS_HOT;
+/* Fault depth stamped on the MOST RECENTLY emitted body entry of this
+ * thread (set by emit_body_entry).  Read by the unwind-flush anchor guard
+ * so a leaked inner frame is only emitted at the unwind when its depth is
+ * strictly shallower than its predecessor (an anchored entry must follow a
+ * deeper one); never write it elsewhere. */
+extern thread_local uint32_t g_last_emit_fault_depth;
 extern thread_local uint64_t g_dbg_last_emit_seq;
 extern thread_local std::vector<uint32_t> g_emit_fault_anchors CST_TLS_HOT;
 extern thread_local std::vector<RegSnap> pending_reg_snaps CST_TLS_HOT;
@@ -256,6 +262,25 @@ private:
                               const std::vector<PendingEmit> &pending_emits,
                               BodyStreamState *out_stream,
                               unsigned int cpu_index);
+    /* Unwind flush: emit frames_[idx]'s merged faulting BB at its own
+     * fault depth + anchors, using the frame's OWN accumulated buffers
+     * (the current CP / reg-snap accumulators are saved and restored), no
+     * wrong-path, unresolved terminal branch — then erase the frame.  This
+     * retires an inner fault frame AT ITS RETURN when its resume suffix was
+     * dropped / never sealed under host contention, so its depth level is
+     * emitted (the interrupted BB carries the depth it ran at) instead of
+     * being collaterally lost and collapsed into a >1 depth jump.  Guarded
+     * against an anchor-at-unwind violation via g_last_emit_fault_depth.
+     * Caller holds exec_lock; data_lock is NOT held. */
+    void flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
+                             unsigned int cpu_index);
+    /* Called from a step_events DROP arm (foreign-ASID / abandoned-async)
+     * right before the deferred prev is cleared: if that prev is an inner
+     * fault frame's resume suffix — the block whose seal would have
+     * completed the merge — retire the frame now via flush_frame_unwound so
+     * its depth level is not lost with the dropped block.  Fetches the
+     * active body stream itself (no-op when no segment is active). */
+    void flush_dropped_prev(unsigned int cpu_index);
 
     /* In-flight fault excursions, fault-nesting order (completion may
      * retire a mid-stack frame; see frame_idx_for_completion). */

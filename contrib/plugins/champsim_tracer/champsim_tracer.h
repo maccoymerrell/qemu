@@ -932,6 +932,16 @@ struct BBTemplate {
      * pre-lock fast gate in vcpu_tb_exec reads it racily, which is
      * benign — promote() rechecks under data_lock. */
     bool chain_indexed;
+    /* Opportunistic branch-alternate minting (static_templates=1): latched
+     * once this true BB's untaken-side alternate has been checked/minted, so
+     * a block re-walked on every CP seal / WP excursion pays the mint check
+     * ONCE, not per visit (the check is otherwise the dominant cost —
+     * millions of block commits per trace).  Separate CP / WP latches so a
+     * block reached on BOTH paths handles each path's alternate independently
+     * (their not-followed sides can differ).  Meaningful on true-BB (bb_map_)
+     * templates; zero-initialised, segment-scoped (dies with bb_map_). */
+    bool alt_checked_cp;
+    bool alt_checked_wp;
     /* Linked list of sibling fragments produced from the same QEMU TB
      * by the mid-TB-branch splitter.  Head is what vcpu_tb_trans
      * attached as the per-TB exec-cb udata; vcpu_tb_exec and the WP
@@ -1414,6 +1424,18 @@ struct TraceFeatures {
      * advertises the trailing CST_INSN_FLAG_STATIC name; a trace without
      * the sweep never does, so its wire is byte-identical. */
     bool     static_templates = false;
+    /* Opportunistic branch-alternate minting (static_templates=1, BOTH
+     * modes).  At every evaluated branch on the correct path and inside a
+     * wrong-path excursion, the UNTAKEN side's true BB is decoded and minted
+     * as a never-executed dictionary template if not already covered — the
+     * fall-through / branch-target coverage a trace-inferred wrong-path
+     * consumer needs, filled convergently as branches are seen rather than by
+     * an eager sweep.  Unlike the sweep (static_templates, user-mode only)
+     * this is mode-independent, so it also gives system-mode traces their
+     * never-executed coverage.  Enabled by static_templates=1 in either mode;
+     * carries NO wire flag (alternates are ordinary never-executed entries),
+     * so a trace without it is byte-identical. */
+    bool     alt_mint = false;
 };
 extern TraceFeatures g_features;
 extern char *qemu_command_line;
@@ -1477,6 +1499,31 @@ extern FILE *unknown_warn_file;
  * champsim_tracer_mnemonics.h, which this header pulls in below. */
 
 /* ===== Cross-TU functions ===== */
+
+/*
+ * Opportunistic branch-alternate minting (static_templates=1).  Defined in
+ * champsim_tracer.cc.  No-op unless g_features.alt_mint.  Caller holds
+ * exec_lock and must NOT hold data_lock (both take data_lock internally,
+ * releasing it around the guest-byte read).
+ */
+
+/* Decode and mint the true BB starting at @alt_pc as a never-executed
+ * dictionary template (alt_map_), unless it is already covered by an
+ * executed or previously-minted template, the per-segment mint budget is
+ * exhausted, or its page is unmapped (probing read fails → silently
+ * skipped).  @alt_pc is a branch's untaken successor (fall-through or taken
+ * target). */
+void altmint_pc(uint64_t alt_pc);
+
+/* Convenience for the wrong-path walker: given a completed block's terminal
+ * branch @terminal, its architectural fall-through @fall_through, and the
+ * successor the walk actually followed @followed_pc, mint the UNTAKEN side
+ * (the statically-known alternate of a conditional-direct branch).  A no-op
+ * for unconditional / indirect terminators (no decodable untaken side) or
+ * when @followed_pc is neither edge (a fault redirect). */
+void altmint_conditional_alternate(const InsnFields *terminal,
+                                   uint64_t fall_through,
+                                   uint64_t followed_pc);
 
 /* Defined in champsim_tracer_decode.cc */
 void decode_detail_to_generic(uint64_t pc,

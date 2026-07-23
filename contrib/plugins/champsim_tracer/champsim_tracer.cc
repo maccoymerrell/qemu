@@ -2686,6 +2686,275 @@ static void run_static_template_resweep(void)
     sweep_regions(batch, /*late=*/true);
 }
 
+/* ============================================================
+ * Opportunistic branch-alternate minting (static_templates=1, both modes).
+ *
+ * The executable-region sweep (P1) covers the never-executed fetch/decode
+ * space EAGERLY, but only in user mode and only for what a page-flags walk
+ * can enumerate.  Opportunistic minting covers it CONVERGENTLY and
+ * mode-independently: at every branch the correct path or a wrong-path
+ * excursion evaluates, the UNTAKEN side's true BB is decoded (through the
+ * same Capstone -> decode_detail_to_generic -> fragment-splitter machinery
+ * the dynamic path uses) and minted as an ordinary never-executed dictionary
+ * template — unless it is already covered.  This fills the two gaps the
+ * sweep and the wrong path leave: branches INSIDE wrong-path blocks (which
+ * follow their resolved direction, so their alternates are never walked) and
+ * branches whose wrong-path fork never launched (wpprune, budget,
+ * translation-unavail, wp=0).
+ *
+ * Off the hot path by construction: the presence test is one hash lookup per
+ * evaluated branch (the walker already does lookups); the decode fires only
+ * on a miss, which trends to ~0 after warmup.  Guest bytes are read with the
+ * same probing read the wrong path uses (mapped page -> decode; unmapped ->
+ * skipped, counted), so enumeration never demand-pages or perturbs the guest.
+ * ============================================================ */
+
+struct AltMintStats {
+    uint64_t checks         = 0;  /* branches whose untaken side was tested   */
+    uint64_t mints          = 0;  /* never-executed alternates minted         */
+    uint64_t skips_unmapped = 0;  /* untaken target unmapped/undecodable      */
+    uint64_t budget_hits    = 0;  /* mints skipped for the per-segment budget */
+};
+static AltMintStats g_alt_mint;
+
+/* Per-segment mint budget: bounds the DECODE+MINT work (the presence test is
+ * always allowed).  Ample for a code footprint's distinct never-executed
+ * blocks; a runaway (data-in-text minting garbage alternates) is capped.
+ * Reset at every segment open. */
+static constexpr uint64_t CST_ALT_MINT_BUDGET = 1u << 20;   /* 1,048,576 */
+static uint64_t g_alt_mint_budget_used = 0;
+
+/*
+ * Decode ONE true BB starting at @pc into the supplied scratch arrays,
+ * stopping at the first branch terminator (folding a delay slot on
+ * delay-slot ISAs) or CST_STATIC_BB_MAX_INSNS.  Guest bytes are read in one
+ * page-bounded window via the probing qemu_plugin_read_memory_vaddr (unmapped
+ * -> read fails).  Returns the instruction count (0 iff the very first insn
+ * could not be read/decoded — unmapped or undecodable), sets *out_ft to the
+ * architectural fall-through (post-terminator PC, or the next linear PC for
+ * an unterminated cap/edge stop) and *out_taken to the terminal
+ * direct-branch's decoded target (0 if none).  Takes NO lock (pure guest
+ * read + decode).
+ */
+static uint32_t alt_decode_one_bb(uint64_t pc,
+                                  std::vector<uint64_t> &pcs,
+                                  std::vector<InsnFields> &fields,
+                                  std::vector<InsnRegNames> &regnames,
+                                  std::vector<uint8_t> &sizes,
+                                  std::vector<uint8_t> &bytes,
+                                  bool with_names,
+                                  uint64_t *out_ft,
+                                  uint64_t *out_taken)
+{
+    const bool delay_isa = isa_properties[trace_isa].branch_delay_slots > 0;
+    *out_ft = 0;
+    *out_taken = 0;
+
+    /* One page-bounded read window (a true BB never spans far); refilled if a
+     * folded delay slot crosses the initial window. */
+    GByteArray *win = g_byte_array_new();
+    uint64_t win_base = 0, win_len = 0;
+    bool     win_ok = false;
+    auto window_at = [&](uint64_t at, const uint8_t **out,
+                         uint64_t *avail) -> bool {
+        if (!win_ok || at < win_base || at >= win_base + win_len) {
+            if (!qemu_plugin_read_memory_vaddr(at, win, 4096)) {
+                win_ok = false;
+                return false;
+            }
+            win_base = at;
+            win_len  = win->len;
+            win_ok   = true;
+        }
+        *out   = win->data + (at - win_base);
+        *avail = win_base + win_len - at;
+        return *avail > 0;
+    };
+
+    InsnFieldsScratch   fs;
+    InsnRegNamesScratch ns;
+
+    /* Decode the insn at @at into slot @i; returns bytes consumed (0 on
+     * failure) and reports the branch type in @out_bt. */
+    auto decode_one = [&](uint64_t at, uint32_t i, uint8_t *out_bt,
+                          bool *out_dslot) -> uint8_t {
+        const uint8_t *p = nullptr;
+        uint64_t avail = 0;
+        if (!window_at(at, &p, &avail)) {
+            return 0;
+        }
+        qemu_plugin_insn_info info;
+        if (!qemu_plugin_cap_decode(cst_cap_arch, cst_cap_mode, p,
+                                    (size_t)avail, at, &info)) {
+            return 0;
+        }
+        uint8_t sz = info.insn_size;
+        if (sz == 0 || sz > MAX_INSN_BYTES || sz > avail) {
+            return 0;
+        }
+        insn_fields_scratch_reset(&fs);
+        if (with_names) {
+            insn_reg_names_scratch_reset(&ns);
+        }
+        decode_detail_to_generic(at, &info, &fs.f, with_names ? &ns.rn
+                                                              : nullptr);
+        uint8_t bt = fs.f.branch_type;
+        pcs[i]   = at;
+        sizes[i] = sz;
+        memcpy(&bytes[(size_t)i * MAX_INSN_BYTES], p, sz);
+        if (sz < MAX_INSN_BYTES) {
+            memset(&bytes[(size_t)i * MAX_INSN_BYTES + sz], 0,
+                   MAX_INSN_BYTES - sz);
+        }
+        fields[i] = fs.f;
+        if (with_names) {
+            regnames[i] = ns.rn;
+        }
+        *out_bt = bt;
+        *out_dslot = (delay_isa && bt != BRANCH_NONE &&
+                      static_sweep_has_delay_slot(bt, info.mnemonic));
+        return sz;
+    };
+
+    uint64_t cur = pc;
+    uint32_t n = 0;
+    bool sealed = false;
+    while (n < CST_STATIC_BB_MAX_INSNS) {
+        uint8_t bt = BRANCH_NONE;
+        bool dslot = false;
+        uint8_t sz = decode_one(cur, n, &bt, &dslot);
+        if (sz == 0) {
+            break;      /* undecodable (or unmapped at n==0) */
+        }
+        uint32_t branch_idx = n;
+        n++;
+        cur += sz;
+        if (bt == BRANCH_NONE) {
+            continue;
+        }
+        /* Fold the delay slot, then seal. */
+        if (dslot && n < CST_STATIC_BB_MAX_INSNS) {
+            uint8_t sbt = BRANCH_NONE;
+            bool sd = false;
+            uint8_t ssz = decode_one(cur, n, &sbt, &sd);
+            if (ssz != 0) {
+                n++;
+                cur += ssz;
+            }
+        }
+        if ((bt == BRANCH_COND_DIRECT || bt == BRANCH_DIRECT_JUMP ||
+             bt == BRANCH_DIRECT_CALL) &&
+            fields[branch_idx].has_immediate) {
+            *out_taken = (uint64_t)fields[branch_idx].immediate;
+        }
+        sealed = true;
+        break;
+    }
+
+    g_byte_array_free(win, TRUE);
+    if (n == 0) {
+        return 0;
+    }
+    *out_ft = sealed ? cur : pcs[n - 1] + sizes[n - 1];
+    return n;
+}
+
+void altmint_pc(uint64_t alt_pc)
+{
+    if (!g_features.alt_mint || alt_pc == 0) {
+        return;
+    }
+    g_alt_mint.checks++;
+
+    /* One hash lookup: already carried by an executed or previously-minted
+     * template?  Existing wins (find_existing_true_bb / alt_map_ dedup
+     * semantics) — nothing to do. */
+    g_mutex_lock(&data_lock);
+    bool covered = g_template_store.alt_or_bb_covered(alt_pc);
+    g_mutex_unlock(&data_lock);
+    if (covered) {
+        return;
+    }
+
+    if (g_alt_mint_budget_used >= CST_ALT_MINT_BUDGET) {
+        g_alt_mint.budget_hits++;
+        return;
+    }
+    if (cst_cap_arch < 0) {
+        return;   /* no Capstone arch for this ISA — cannot decode */
+    }
+
+    const bool with_names = g_features.reg_data || g_features.wp_reg_data;
+
+    /* Per-BB scratch (plain locals; a mint is rare after warmup — misses
+     * trend to zero — so a fresh allocation here keeps these large buffers
+     * out of the plugin's static TLS block).  fscratch/nscratch back the
+     * span copies inside build_bb_template's pack, which deep-copies. */
+    std::vector<uint64_t>      pcs(CST_STATIC_BB_MAX_INSNS);
+    std::vector<InsnFields>    fields(CST_STATIC_BB_MAX_INSNS);
+    std::vector<InsnRegNames>  regnames(CST_STATIC_BB_MAX_INSNS);
+    std::vector<uint8_t>       sizes(CST_STATIC_BB_MAX_INSNS);
+    std::vector<uint8_t>       bytes((size_t)CST_STATIC_BB_MAX_INSNS *
+                                     MAX_INSN_BYTES);
+
+    uint64_t ft = 0, taken = 0;
+    /* The guest read + decode runs WITHOUT data_lock: the probing read takes
+     * the mmap_lock (user) / walks the page table (system), and the
+     * translation path holds mmap_lock before data_lock — holding data_lock
+     * across the read would invert that order. */
+    uint32_t n = alt_decode_one_bb(alt_pc, pcs, fields, regnames, sizes,
+                                   bytes, with_names, &ft, &taken);
+    if (n == 0) {
+        g_alt_mint.skips_unmapped++;   /* unmapped page or undecodable head */
+        return;
+    }
+
+    g_mutex_lock(&data_lock);
+    BBTemplate *t = g_template_store.commit_alt_bb(
+        alt_pc, n, pcs.data(), fields.data(), sizes.data(), bytes.data(),
+        with_names ? regnames.data() : nullptr,
+        /* symbol_name= */ nullptr, ft);
+    if (t && taken != 0 && t->taken_pc == 0) {
+        /* A never-executed direct branch's declared taken edge is its
+         * decoded target (BTB coverage of the never-executed destination). */
+        t->taken_pc = taken;
+    }
+    g_mutex_unlock(&data_lock);
+
+    g_alt_mint.mints++;
+    g_alt_mint_budget_used++;
+}
+
+void altmint_conditional_alternate(const InsnFields *terminal,
+                                   uint64_t fall_through,
+                                   uint64_t followed_pc)
+{
+    if (!g_features.alt_mint || !terminal) {
+        return;
+    }
+    /* Only a conditional DIRECT branch has a statically-known untaken side
+     * (both edges architecturally reachable): its taken target is the decoded
+     * immediate, its not-taken edge the fall-through.  Unconditional /
+     * indirect terminators have no decodable alternate here. */
+    bool direct_cond = terminal->branch_type == BRANCH_COND_DIRECT ||
+                       (terminal->branch_type == BRANCH_DIRECT_JUMP &&
+                        terminal->branch_conditional);
+    if (!direct_cond || !terminal->has_immediate) {
+        return;
+    }
+    uint64_t taken = (uint64_t)terminal->immediate;
+
+    uint64_t alt;
+    if (followed_pc == fall_through) {
+        alt = taken;              /* walk fell through -> taken is untaken */
+    } else if (followed_pc == taken) {
+        alt = fall_through;       /* walk took -> fall-through is untaken */
+    } else {
+        return;                   /* neither edge (fault redirect): ambiguous */
+    }
+    altmint_pc(alt);
+}
+
 static void start_trace_segment(const char *label,
                                 uint64_t start, uint64_t stop,
                                 uint64_t warmup,
@@ -2853,6 +3122,10 @@ static void start_trace_segment(const char *label,
      * exactly once.  User mode only — g_features.static_templates is forced
      * off in system mode. */
     g_static_sweep_armed = g_features.static_templates;
+
+    /* Opportunistic branch-alternate minting is segment-scoped (alt_map_ is
+     * dropped at clear_bb_map); re-arm its per-segment mint budget. */
+    g_alt_mint_budget_used = 0;
 }
 
 /* Pick the bucket matching @icount; null when histograms are disabled
@@ -3935,6 +4208,20 @@ void emit_finalized_bb(BodyStreamState *out_stream,
         }
     }
 
+    /*
+     * Opportunistic branch-alternate minting (static_templates=1),
+     * translation-unavail case: the wrong-path fork launched but its FIRST
+     * target could not be fetched/translated, so the wrong path covered
+     * nothing.  The collect-time CP mint deferred this branch to the fork
+     * (it was going to launch), so nothing has covered the untaken side —
+     * mint it here through the probing read (a mapped page a spec-mode fetch
+     * quirk skipped is decoded; a genuinely unmapped one is skip-counted).
+     * No-op unless the feature is on; data_lock is NOT held here.
+     */
+    if (wp_first_tb_unavail) {
+        altmint_pc(wrong_target);
+    }
+
     /* @current_pc is the resolved architectural successor of this BB's
      * terminating branch (collect_finalized_bbs' frag_current_pc / the seal
      * point) — the PC the next emitted entry starts at.  Pass it so the
@@ -4345,6 +4632,11 @@ bool collect_finalized_bbs(unsigned int cpu_index,
     g_mutex_lock(&data_lock);
     bool any_finalize = false;
 
+    /* Opportunistic branch-alternate mint targets collected under data_lock
+     * (PC only — no decode), minted after the lock is released: altmint_pc
+     * takes data_lock itself, so it cannot run inside this region. */
+    std::vector<uint64_t> alt_pcs;
+
     /* Identify the last-executed fragment.  The scoreboard's @prev_start
      * normally pinpoints it (a mid-TB trap prevents later fragments' first-
      * insn stores from firing).  But an async interrupt or a foreign-ASID
@@ -4409,14 +4701,42 @@ bool collect_finalized_bbs(unsigned int cpu_index,
                 pe.wrong_target = resolve_wrong_target(
                     bb_tmpl, br, frag_branch_taken,
                     frag_current_pc, frag_prev_ft, &taken_target);
+                uint64_t raw_wrong = pe.wrong_target;
                 if (taken_target != 0) {
                     bb_tmpl->taken_pc = taken_target;
                 }
                 /* wpprune: skip the wrong path for a cold branch.  The
                  * taken edge above is already recorded; only the
                  * speculative walk is suppressed. */
-                if (pe.wrong_target != 0 && wp_branch_pruned(bb_tmpl, br)) {
+                bool pruned =
+                    (pe.wrong_target != 0 && wp_branch_pruned(bb_tmpl, br));
+                if (pruned) {
                     pe.wrong_target = 0;
+                }
+                /*
+                 * Opportunistic branch-alternate minting (static_templates=1):
+                 * when this branch's wrong-path fork will NOT launch — pruned,
+                 * wrong-path disabled, or paging off — nothing will decode its
+                 * untaken side, so mint it here as a never-executed template.
+                 * When the fork DOES launch, the wrong path itself covers the
+                 * untaken block (and its inner branches feed the WP-side mint),
+                 * so we leave it.  Queued; minted after the data_lock release.
+                 *
+                 * bb_tmpl->alt_checked_cp latches this to ONCE per block (the
+                 * cheap flag read gates the paging_enabled() call and the
+                 * lookup): the executed side is always covered by execution,
+                 * and the first visit's alternate covers the not-executed
+                 * side, so a single latch suffices even as the branch flips
+                 * direction across visits.
+                 */
+                if (g_features.alt_mint && raw_wrong != 0 &&
+                    !bb_tmpl->alt_checked_cp) {
+                    bb_tmpl->alt_checked_cp = true;
+                    bool wp_will_launch = enable_wrong_path && !pruned &&
+                                          qemu_plugin_paging_enabled();
+                    if (!wp_will_launch) {
+                        alt_pcs.push_back(raw_wrong);
+                    }
                 }
             }
             pending_emits.push_back(pe);
@@ -4429,6 +4749,13 @@ bool collect_finalized_bbs(unsigned int cpu_index,
     }
 
     g_mutex_unlock(&data_lock);
+
+    /* Mint the branch alternates queued above, now that data_lock is
+     * released (altmint_pc reacquires it, releasing around the guest read).
+     * Empty unless static_templates=1 and a fork-less branch was sealed. */
+    for (uint64_t alt : alt_pcs) {
+        altmint_pc(alt);
+    }
     return any_finalize;
 }
 
@@ -6706,6 +7033,17 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
             g_static_sweep.seconds, mbps, mb);
     }
 
+    /* Opportunistic branch-alternate minting accounting (static_templates=1,
+     * both modes).  mints/checks is the post-warmup miss rate; skips_unmapped
+     * are untaken targets whose page was not mapped (probing read failed). */
+    if (g_features.alt_mint) {
+        g_string_append_printf(report,
+            "Branch-alternate minting: checks=%" PRIu64 " mints=%" PRIu64
+            " skips_unmapped=%" PRIu64 " budget_hits=%" PRIu64 "\n",
+            g_alt_mint.checks, g_alt_mint.mints,
+            g_alt_mint.skips_unmapped, g_alt_mint.budget_hits);
+    }
+
     qemu_plugin_outs(report->str);
 
     /* qemu_plugin_outs goes via qemu_log, whose target (stderr by
@@ -6942,15 +7280,27 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                 "(no virtual-to-physical translation exists)\n");
     }
 
-    /* Static-template sweep is USER-MODE ONLY (P1): the executable-region
-     * enumeration walks the user-mode page-flags map.  Under system
-     * emulation the executable footprint is a guest-owned page table this
-     * pass does not walk, so force the feature off (and warn), keeping a
-     * system-mode trace byte-identical regardless of the requested option. */
+    /* static_templates=1 turns on two complementary coverers of the
+     * never-executed fetch/decode space:
+     *
+     *   - the executable-region SWEEP (P1), which is USER-MODE ONLY: the
+     *     enumeration walks the user-mode page-flags map, absent under system
+     *     emulation (a guest-owned page table this pass does not walk).  Force
+     *     it off (and warn) in system mode, keeping the sweep's STATIC-flag
+     *     wire vocabulary out of a system trace.
+     *   - opportunistic branch-alternate MINTING, which is mode-INDEPENDENT
+     *     (it reads guest bytes at a branch's untaken target through the same
+     *     probing read the wrong path uses), so it also gives system-mode
+     *     traces their never-executed coverage.
+     *
+     * Both ride the one static_templates=1 option. */
     g_features.static_templates = (cfg.static_templates != 0) && !g_system_mode;
+    g_features.alt_mint = (cfg.static_templates != 0);
     if (cfg.static_templates != 0 && g_system_mode) {
-        fprintf(stderr, "champsim_tracer: static_templates=1 ignored in system "
-                "mode (page-table-walk enumeration is not yet implemented)\n");
+        fprintf(stderr, "champsim_tracer: static_templates=1 executable-region "
+                "sweep ignored in system mode (page-table-walk enumeration is "
+                "not yet implemented); opportunistic branch-alternate minting "
+                "is active\n");
     }
 
     if (!cfg.output_path) {

@@ -868,6 +868,35 @@ static void wp_commit_bb(WpWalkState &st, BBTemplate *cur,
             wp_entry.branch_successor_pc    = commit_post_pc;
             wp_entry.branch_successor_known = true;
             wp_chain.push_back(std::move(wp_entry));
+
+            /*
+             * Opportunistic branch-alternate minting (static_templates=1).
+             * A branch INSIDE a wrong-path block resolves ONE direction (the
+             * excursion follows commit_post_pc); its untaken side is never
+             * walked, so an executed-only + wrong-path dictionary misses it.
+             * Decode+mint that side as a never-executed template.  No-op
+             * unless the feature is on; the terminal is the last insn (or the
+             * insn before a trailing delay slot).  data_lock is NOT held here
+             * (released after the commit_true_bb_refs above), so altmint_pc's
+             * own lock discipline is safe.
+             *
+             * bb_tmpl->alt_checked_wp latches this to ONCE per WP block: the
+             * same block is re-walked on every excursion (millions of commits
+             * per trace), but its untaken side is invariant, so a per-visit
+             * hash lookup + lock would be the dominant cost.  The in-hand flag
+             * read skips all but the first visit; the flag is set
+             * unconditionally (even for non-mintable terminators) so a block
+             * is never re-examined.
+             */
+            if (g_features.alt_mint && bb_tmpl && !bb_tmpl->alt_checked_wp &&
+                !bb_fields.empty()) {
+                bb_tmpl->alt_checked_wp = true;
+                const InsnFields *lf = bb_fields.back();
+                if (lf->branch_type == BRANCH_NONE && bb_fields.size() >= 2) {
+                    lf = bb_fields[bb_fields.size() - 2];
+                }
+                altmint_conditional_alternate(lf, fall_through, commit_post_pc);
+            }
 }
 
 /*

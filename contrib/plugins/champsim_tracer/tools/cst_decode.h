@@ -349,7 +349,7 @@ private:
     uint64_t stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
                                 FieldStateTable &cp_state, WpDecode wp,
                                 uint32_t seq, uint32_t thread, uint32_t asid,
-                                const BBCallback &cb);
+                                const BBCallback &cb, bool *has_events);
     void handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
                          const BBCallback &cb);
     void skip_iframe_bb();
@@ -357,10 +357,14 @@ private:
     /* Read one WP chain section from @wpb, returning the populated WP
      * entries.  Used by both handle_entry and handle_iframe.  @state
      * is the per-thread WP overlay; @base_state is the corresponding
-     * CP overlay that WP cells fall back into. */
+     * CP overlay that WP cells fall back into.  The section's leading
+     * ULEB packs num_wp with the CST_WP_CHAIN_HAS_EVENTS bit (format.rst
+     * Step 6.8); *@has_events reports that bit so the caller knows
+     * whether a wp_events_section follows on the wire. */
     std::vector<WPEntry> decode_wp_chain(Reader &wpb,
                                          FieldStateTable &state,
-                                         const FieldStateTable *base_state);
+                                         const FieldStateTable *base_state,
+                                         bool *has_events);
     /* Read one WP events sub-section, attaching fault /
      * translation_unavailable flags to entries in @wp_entries by
      * index.  An event whose resolved index is past the chain length

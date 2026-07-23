@@ -672,10 +672,14 @@ void BodyWalker::handle_regfile(const RegfileCallback &rb)
 
 std::vector<WPEntry> BodyWalker::decode_wp_chain(
     Reader &wpb, FieldStateTable &state,
-    const FieldStateTable *base_state)
+    const FieldStateTable *base_state, bool *has_events)
 {
     std::vector<WPEntry> out;
-    uint64_t num_wp = wpb.uleb();
+    uint64_t chain_hdr = wpb.uleb();
+    uint64_t num_wp = chain_hdr >> 1;
+    if (has_events) {
+        *has_events = (chain_hdr & header_.ids.wp_chain_has_events) != 0;
+    }
     out.reserve(num_wp);
     int32_t prev_wp_tmpl = 0;
     for (uint64_t w = 0; w < num_wp; w++) {
@@ -798,15 +802,21 @@ void BodyWalker::handle_entry(WalkState &ws, const Callback &cb)
         }
     }
 
-    /* WP chain + events.  Each is its own length-prefixed
-     * sub-section, present only when the CST_FLAG_WP header bit is
-     * set; otherwise the entry is just its CP delta. */
+    /* WP chain + events, present only when the CST_FLAG_WP header bit
+     * is set; otherwise the entry is just its CP delta.  wp_chain is
+     * its own length-prefixed sub-section; wp_events is conditional on
+     * that chain's CST_WP_CHAIN_HAS_EVENTS bit — entirely absent from
+     * the wire (no length prefix) when the chain produced no event. */
     if (flags_ & header_.ids.flag_wp) {
+        bool has_events = false;
         { SectionScope s(body_); Reader &wpb = s;
-          entry.wp_entries = decode_wp_chain(wpb, wp_state, &cp_state); }
-        { SectionScope s(body_); Reader &evb = s;
-          decode_wp_events(evb, &entry.wp_entries,
-                           &entry.wp_first_fetch_unavailable); }
+          entry.wp_entries = decode_wp_chain(wpb, wp_state, &cp_state,
+                                             &has_events); }
+        if (has_events) {
+            SectionScope s(body_); Reader &evb = s;
+            decode_wp_events(evb, &entry.wp_entries,
+                             &entry.wp_first_fetch_unavailable);
+        }
     }
 
     entry.thread_id       = ws.current_thread;
@@ -881,12 +891,16 @@ void BodyWalker::handle_iframe(WalkState &ws)
      * overlay falls back to iframe_cp as base, matching
      * st->iframe_cp_scratch shared between wp_state and wp_base. */
     if (flags_ & header_.ids.flag_wp) {
+        bool has_events = false;
         { SectionScope s(body_); Reader &wpb = s;
           iframe_entry.wp_entries = decode_wp_chain(wpb, iframe_wp,
-                                                    &iframe_cp); }
-        { SectionScope s(body_); Reader &evb = s;
-          decode_wp_events(evb, &iframe_entry.wp_entries,
-                           &iframe_entry.wp_first_fetch_unavailable); }
+                                                    &iframe_cp,
+                                                    &has_events); }
+        if (has_events) {
+            SectionScope s(body_); Reader &evb = s;
+            decode_wp_events(evb, &iframe_entry.wp_entries,
+                             &iframe_entry.wp_first_fetch_unavailable);
+        }
     }
 
     validate_iframe(*ws.prev_entry, iframe_entry);
@@ -1429,10 +1443,15 @@ void BodyWalker::consume_field_section(Reader &outer, uint32_t template_id,
 uint64_t BodyWalker::stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
                                         FieldStateTable &cp_state, WpDecode wp,
                                         uint32_t seq, uint32_t thread,
-                                        uint32_t asid, const BBCallback &cb)
+                                        uint32_t asid, const BBCallback &cb,
+                                        bool *has_events)
 {
     const bool fields = (wp == WpDecode::Fields);
-    uint64_t num_wp = wpb.uleb();
+    uint64_t chain_hdr = wpb.uleb();
+    uint64_t num_wp = chain_hdr >> 1;
+    if (has_events) {
+        *has_events = (chain_hdr & header_.ids.wp_chain_has_events) != 0;
+    }
     int32_t prev_wp_tmpl = 0;
     for (uint64_t w = 0; w < num_wp; w++) {
         int32_t wt = prev_wp_tmpl + (int32_t)wpb.sleb();
@@ -1529,9 +1548,15 @@ void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
 
     /* WP chain + events (Steps 6.8 / 6.9), present only under
      * CST_FLAG_WP.  sub() consumes each section regardless of whether
-     * we walk it, so Skip / event parse-skip are one line each. */
+     * we walk it, so Skip / event parse-skip are one line each.  The
+     * events section is conditional on the chain header's
+     * CST_WP_CHAIN_HAS_EVENTS bit (unpacked below as @has_events) —
+     * absent entirely from the wire when clear, so it must be read
+     * unconditionally (not just when wp_events_cb_ is set) to know
+     * whether a second SectionScope even has bytes to open. */
     if (flags_ & header_.ids.flag_wp) {
         uint64_t chain_len = 0;
+        bool has_events = false;
         { SectionScope s(body_); Reader &wpb = s;
           if (wp != WpDecode::Skip) {
               FieldStateTable &wp_state =
@@ -1539,14 +1564,21 @@ void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
                               ws.current_thread);
               chain_len = stream_wp_chain_bb(wpb, wp_state, cp_state, wp,
                                              seq, ws.current_thread,
-                                             ws.current_asid, cb);
-          } else if (wp_events_cb_) {
-              /* Chain walking skipped, but the events summary needs the
-               * chain length to resolve past-chain (chain-level) event
-               * indices; read only the length prefix — SectionScope
-               * skips the rest either way. */
-              chain_len = wpb.uleb();
+                                             ws.current_asid, cb,
+                                             &has_events);
+          } else {
+              /* Chain walking skipped, but num_wp (chain length, used to
+               * resolve past-chain / chain-level event indices) and the
+               * HAS_EVENTS bit both live in the header's leading ULEB —
+               * SectionScope skips the remaining chain bytes either
+               * way. */
+              uint64_t chain_hdr = wpb.uleb();
+              chain_len = chain_hdr >> 1;
+              has_events = (chain_hdr & header_.ids.wp_chain_has_events) != 0;
           }
+        }
+        if (!has_events) {
+            return;
         }
         { SectionScope s(body_);
           if (wp_events_cb_) {
@@ -1611,8 +1643,14 @@ void BodyWalker::skip_iframe_bb()
         }
     }
     if (flags_ & header_.ids.flag_wp) {
-        { SectionScope s(body_); (void)s; }
-        { SectionScope s(body_); (void)s; }
+        bool has_events = false;
+        { SectionScope s(body_); Reader &wpb = s;
+          uint64_t chain_hdr = wpb.uleb();
+          has_events = (chain_hdr & header_.ids.wp_chain_has_events) != 0;
+        }
+        if (has_events) {
+            SectionScope s(body_); (void)s;
+        }
     }
     stats_.iframe_count++;
 }

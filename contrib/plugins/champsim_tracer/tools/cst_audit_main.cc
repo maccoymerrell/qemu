@@ -475,7 +475,12 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
             s->wp_chain_envelope.bytes +=
                 (wpb.consumed() - wp_in_start) + wp_env_payload;
 
-            uint64_t num_wp = wpb.uleb();
+            /* Chain header (format.rst Step 6.8): num_wp packed with the
+             * CST_WP_CHAIN_HAS_EVENTS bit that announces whether a
+             * wp_events_section follows this entry on the wire. */
+            uint64_t chain_hdr = wpb.uleb();
+            uint64_t num_wp = chain_hdr >> 1;
+            bool has_wp_events = (chain_hdr & ids.wp_chain_has_events) != 0;
             int32_t prev_wp_tid = 0;
             for (uint64_t w = 0; w < num_wp; w++) {
                 size_t wfs = wpb.consumed();
@@ -526,11 +531,16 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                 throw std::runtime_error("WP chain had trailing bytes");
             }
 
-            /* WP events sub-section: opaque to audit — skip in place. */
-            size_t ev_in = body.consumed();
-            uint64_t ev_payload = body.uleb();
-            body.skip(ev_payload);
-            s->wp_events.bytes += body.consumed() - ev_in;
+            /* WP events sub-section: opaque to audit — skip in place.
+             * Entirely absent from the wire (no length prefix) unless
+             * the chain header's HAS_EVENTS bit, just decoded above,
+             * announced one. */
+            if (has_wp_events) {
+                size_t ev_in = body.consumed();
+                uint64_t ev_payload = body.uleb();
+                body.skip(ev_payload);
+                s->wp_events.bytes += body.consumed() - ev_in;
+            }
             continue;
         }
 
@@ -568,8 +578,21 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                 }
             }
             if (have_wp) {
-                { uint64_t n = body.uleb(); body.skip(n); }  /* wp chain  */
-                { uint64_t n = body.uleb(); body.skip(n); }  /* wp events */
+                /* wp chain: peek the leading chain_hdr ULEB (packs
+                 * num_wp with CST_WP_CHAIN_HAS_EVENTS) before skipping
+                 * the rest of the section's payload. */
+                bool has_wp_events = false;
+                {
+                    uint64_t n = body.uleb();
+                    size_t chain_end = body.consumed() + n;
+                    uint64_t chain_hdr = body.uleb();
+                    has_wp_events = (chain_hdr & ids.wp_chain_has_events) != 0;
+                    body.skip_to_consumed(chain_end);
+                }
+                /* wp events: entirely absent unless has_wp_events. */
+                if (has_wp_events) {
+                    uint64_t n = body.uleb(); body.skip(n);
+                }
             }
             s->iframe_count++;
             s->iframe_bytes.bytes += body.consumed() - tag_start;

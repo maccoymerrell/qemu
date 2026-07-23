@@ -523,6 +523,12 @@ static void write_header_encoding_maps(BitWriter *main_bw)
           "CST_WP_EVENT_TRANSLATION_UNAVAIL" },
         { CST_WP_EVENT_FAULT, "CST_WP_EVENT_FAULT" },
     };
+    /* WP chain section header self-description (format.rst Step 6.8):
+     * the bit packed into wp_chain_section's leading ULEB alongside
+     * num_wp. */
+    static const EncodingMapEntry wp_chain_flag_entries[] = {
+        { CST_WP_CHAIN_HAS_EVENTS, "CST_WP_CHAIN_HAS_EVENTS" },
+    };
     static const EncodingMapEntry metaflags_entries[] = {
         { CST_METAFLAGS_Z, "CST_METAFLAGS_Z" },
         { CST_METAFLAGS_N, "CST_METAFLAGS_N" },
@@ -533,7 +539,7 @@ static void write_header_encoding_maps(BitWriter *main_bw)
 
     BitWriter sub;
     bw_init_buf(&sub);
-    bw_write_uleb128(&sub, 12);
+    bw_write_uleb128(&sub, 13);
     write_named_enum_map(&sub, "opcode", GEN_OP_COUNT, generic_opcode_name);
     write_named_enum_map(&sub, "branch_type", BRANCH_TYPE_COUNT,
                          branch_type_name);
@@ -554,6 +560,8 @@ static void write_header_encoding_maps(BitWriter *main_bw)
     write_encoding_map(&sub, "body_tag", body_tag_entries, n_body_tags);
     write_encoding_map(&sub, "wp_event_flag", wp_event_flag_entries,
                        G_N_ELEMENTS(wp_event_flag_entries));
+    write_encoding_map(&sub, "wp_chain_flag", wp_chain_flag_entries,
+                       G_N_ELEMENTS(wp_chain_flag_entries));
     write_encoding_map(&sub, "metaflags", metaflags_entries,
                        G_N_ELEMENTS(metaflags_entries));
     write_encoding_map(&sub, "dep_block_flag", dep_block_flag_entries,
@@ -3297,6 +3305,12 @@ static void emit_one_bb_delta(BitWriter *bw, BodyStreamState *st,
  * the caller's responsibility (ENTRY has a tmpl_delta; IFRAME omits
  * it, inheriting the preceding ENTRY's template).
  *
+ * The WP events sub-section is conditional: it is written only when
+ * this entry's chain produced at least one event, and its presence is
+ * announced by CST_WP_CHAIN_HAS_EVENTS packed into the WP chain
+ * header (see that macro's comment in champsim_tracer.h).  An entry
+ * with no event costs nothing beyond the chain header itself.
+ *
  * ENTRY passes the persistent overlays (deltas compress, post-record
  * state reflects the observation).  IFRAME passes generation-bumped
  * scratch overlays so all baselines fall to template_default (every
@@ -3338,11 +3352,36 @@ static void emit_body_record_payload(
         return;
     }
 
-    /* WP chain sub-section */
+    /* Whether any wrong-path event will be emitted for this entry,
+     * decided up front so the WP chain header (written next) can
+     * announce it via CST_WP_CHAIN_HAS_EVENTS — see that macro's
+     * comment in champsim_tracer.h for the framing-cost rationale.
+     *
+     * Chain-level event (§4.4): the excursion was kicked but its FIRST
+     * wrong-path target could not be fetched/translated, so the chain
+     * is empty and no per-block event can carry the marker.  Encoded as
+     * a single event whose resolved index (0) is >= num_wp (0) — the
+     * index-past-the-chain convention that addresses the unrealized
+     * first target itself. */
+    bool chain_unavail = (num_wp == 0) && entry->wp_first_tb_unavail;
+
+    uint32_t num_events = chain_unavail ? 1 : 0;
+    for (uint32_t w = 0; w < num_wp; w++) {
+        const WPBBEntry *wp = &entry->wp_entries[w];
+        if (wp->fault || wp->translation_unavailable) {
+            num_events++;
+        }
+    }
+    bool has_wp_events = (num_events != 0);
+
+    /* WP chain sub-section.  The leading ULEB packs num_wp in its high
+     * bits and CST_WP_CHAIN_HAS_EVENTS in bit 0 (format.rst Step 6.8);
+     * a reader that only wants num_wp shifts right by one. */
     {
         BitWriter sub;
         bw_section_begin_rb(&sub, &st->sub_scratch);
-        bw_write_uleb128(&sub, num_wp);
+        bw_write_uleb128(&sub, ((uint64_t)num_wp << 1) |
+                              (has_wp_events ? CST_WP_CHAIN_HAS_EVENTS : 0));
         int64_t prev_wp_template = 0;
         for (uint32_t w = 0; w < num_wp; w++) {
             const WPBBEntry *wp = &entry->wp_entries[w];
@@ -3365,24 +3404,12 @@ static void emit_body_record_payload(
         bw_section_end_rb(bw, &st->sub_scratch);
     }
 
-    /* WP events sub-section */
-    {
-        /* Chain-level event (§4.4): the excursion was kicked but its
-         * FIRST wrong-path target could not be fetched/translated, so
-         * the chain is empty and no per-block event can carry the
-         * marker.  Encoded as a single event whose resolved index (0)
-         * is >= num_wp (0) — the index-past-the-chain convention that
-         * addresses the unrealized first target itself. */
-        bool chain_unavail = (num_wp == 0) && entry->wp_first_tb_unavail;
-
-        uint32_t num_events = chain_unavail ? 1 : 0;
-        for (uint32_t w = 0; w < num_wp; w++) {
-            const WPBBEntry *wp = &entry->wp_entries[w];
-            if (wp->fault || wp->translation_unavailable) {
-                num_events++;
-            }
-        }
-
+    /* WP events sub-section — entirely absent (no length prefix, no
+     * payload) when this entry's chain produced no event, rather than
+     * an empty section.  The chain header's CST_WP_CHAIN_HAS_EVENTS bit,
+     * already written above, is what tells the reader whether to expect
+     * it. */
+    if (has_wp_events) {
         BitWriter sub;
         bw_section_begin_rb(&sub, &st->sub_scratch);
         bw_write_uleb128(&sub, num_events);

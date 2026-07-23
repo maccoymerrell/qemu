@@ -167,6 +167,11 @@ struct ResolvedIds {
     uint8_t wp_event_translation_unavail = 0;
     uint8_t wp_event_fault               = 0;
 
+    /* wp_chain_flag map: bit mask inside the WP chain section's leading
+     * ULEB (packed alongside num_wp; see CST_WP_CHAIN_HAS_EVENTS).
+     * Announces whether a wp_events_section follows this entry's chain. */
+    uint8_t wp_chain_has_events = 0;
+
     /* metaflags map: bit positions inside the FID_METAFLAGS byte */
     uint8_t metaflags_z = 0;
     uint8_t metaflags_n = 0;
@@ -604,6 +609,9 @@ struct EncodingMaps {
     std::unordered_map<uint64_t, std::string> insn_flag;
     std::unordered_map<uint64_t, std::string> body_tag;
     std::unordered_map<uint64_t, std::string> wp_event_flag;
+    /* Bit mask inside the WP chain section's leading ULEB (packed
+     * alongside num_wp; see CST_WP_CHAIN_HAS_EVENTS, format.rst §4.3). */
+    std::unordered_map<uint64_t, std::string> wp_chain_flag;
     std::unordered_map<uint64_t, std::string> metaflags;
     std::unordered_map<uint64_t, std::string> dep_block_flag;
     /* Template-profile self-description (format §6). */

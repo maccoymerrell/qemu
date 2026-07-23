@@ -523,7 +523,9 @@ void dump_field_delta_section(FILE *out, const Header &h, Reader &b,
 }
 
 /* WP chain (Step 6.8) + WP events (Step 6.9) sections, present only
- * under CST_FLAG_WP. */
+ * under CST_FLAG_WP.  wp_events_section is itself conditional on the
+ * chain header's CST_WP_CHAIN_HAS_EVENTS bit — entirely absent from the
+ * wire (no length prefix) when the chain produced no event. */
 void dump_wp_sections(FILE *out, const Header &h, Reader &b, int depth)
 {
     const ResolvedIds &ids = h.ids;
@@ -534,8 +536,13 @@ void dump_wp_sections(FILE *out, const Header &h, Reader &b, int depth)
     emitf(out, b, coff, depth, "wp_chain_section  len=%" PRIu64 "  [Step 6.8]",
           chain_payload);
     size_t noff = b.consumed();
-    uint64_t num_wp = b.uleb();
-    emitf(out, b, noff, depth + 1, "num_wp=%" PRIu64, num_wp);
+    uint64_t chain_hdr = b.uleb();
+    uint64_t num_wp = chain_hdr >> 1;
+    bool has_wp_events = (chain_hdr & ids.wp_chain_has_events) != 0;
+    emitf(out, b, noff, depth + 1,
+          "chain_hdr=%" PRIu64 " ->num_wp=%" PRIu64 " (%s)",
+          chain_hdr, num_wp,
+          flag_bits(h.maps.wp_chain_flag, chain_hdr & 1).c_str());
     int32_t wp_tid = 0;
     for (uint64_t w = 0; w < num_wp; w++) {
         size_t woff = b.consumed();
@@ -548,6 +555,13 @@ void dump_wp_sections(FILE *out, const Header &h, Reader &b, int depth)
     }
     if (b.consumed() != chain_end) {
         b.skip_to_consumed(chain_end);
+    }
+
+    if (!has_wp_events) {
+        emit_note(out, b.consumed(), depth,
+                  "wp_events_section  absent (CST_WP_CHAIN_HAS_EVENTS clear)"
+                  "  [Step 6.9]");
+        return;
     }
 
     size_t eoff = b.consumed();

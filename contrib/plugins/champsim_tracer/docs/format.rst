@@ -197,8 +197,10 @@ absence by the same gate:
      - ``n_targets == 0``
    * - Symbol name
      - empty ``symbol_name``
-   * - Wrong-path chain + events (per entry)
-     - ``CST_FLAG_WP`` clear (both sections omitted from every ENTRY/IFRAME); with the flag set, an individual entry may still carry ``num_wp == 0``
+   * - Wrong-path chain (per entry)
+     - ``CST_FLAG_WP`` clear (the section is omitted from every ENTRY/IFRAME); with the flag set, an individual entry may still carry ``num_wp == 0``
+   * - Wrong-path events (per entry)
+     - the chain header's ``CST_WP_CHAIN_HAS_EVENTS`` bit clear (§4.3/§4.4) — true whenever the entry's chain, if any, produced no event; independent of ``CST_FLAG_WP``'s own per-trace gate
    * - Validation IFRAMEs
      - record simply absent (pure redundancy)
 
@@ -213,9 +215,9 @@ header member (Step 1):
 
 * ``template_by_id`` — map from ``template_id : u32`` to a parsed
   ``Template`` (start_pc, num_insns, per-insn descriptors).
-* ``encoding_maps`` — twelve maps (``opcode``, ``branch_type``,
+* ``encoding_maps`` — thirteen maps (``opcode``, ``branch_type``,
   ``reg``, ``field_id``, ``header_flag``, ``insn_flag``, ``body_tag``,
-  ``wp_event_flag``, ``metaflags``, ``dep_block_flag``,
+  ``wp_event_flag``, ``wp_chain_flag``, ``metaflags``, ``dep_block_flag``,
   ``mem_access_pattern``, ``profile_flag``), each
   ``value : u64 → name : string``.  Built from the encoding-maps
   section in Step 1.  (Parsing is generic — Step 3 reads whatever
@@ -357,6 +359,10 @@ self-describing.  Decode it into a fresh ``encoding_maps`` table.
                                                   sub-block appears)
               wp_event_flag:  CST_WP_EVENT_FAULT (iff a wrong-path
                                                   event record appears)
+              wp_chain_flag:  CST_WP_CHAIN_HAS_EVENTS (iff
+                                                  CST_FLAG_WP is set —
+                                                  every wp_chain_section
+                                                  carries this bit)
               field_id:       CST_FID_EXTENDED   (iff an extended
                                                   field-delta record
                                                   appears)
@@ -725,10 +731,20 @@ Loop until a ``BODY_TAG_END`` is seen:
           prev_entry_template_id = cur_template_id
           cp_delta_section   : section          ; see Step 6.7
           if (header.flags & header_flag.CST_FLAG_WP):
-            wp_chain_section  : section          ; see Step 6.8
-            wp_events_section : section          ; see Step 6.9
-          ; when CST_FLAG_WP is clear both sections are absent and the
-          ; entry has no wrong-path chain (num_wp treated as 0).
+            wp_chain_section  : section          ; see Step 6.8; its
+                                                  ; leading ULEB also
+                                                  ; carries the
+                                                  ; wp_chain_flag.
+                                                  ; CST_WP_CHAIN_HAS_EVENTS
+                                                  ; bit decoded below
+            if (has_wp_events):                  ; from Step 6.8's chain
+                                                  ; header, just decoded
+              wp_events_section : section          ; see Step 6.9
+          ; when CST_FLAG_WP is clear the wp_chain_section is absent
+          ; and the entry has no wrong-path chain (num_wp treated as
+          ; 0).  When CST_FLAG_WP is set but has_wp_events is clear,
+          ; wp_events_section is entirely absent — no length prefix,
+          ; no payload — rather than an empty section (§4.3/§4.4).
           seq_num += 1
           Emit a CP body entry tagged (seq_num, cur_template_id,
           prev_thread_id, prev_asid_index) carrying the cp_delta_section's decoded
@@ -737,8 +753,10 @@ Loop until a ``BODY_TAG_END`` is seen:
    6.5  IFRAME record (validation-only; producers may omit it):
           cp_delta_section   : section
           if (header.flags & header_flag.CST_FLAG_WP):
-            wp_chain_section  : section
-            wp_events_section : section
+            wp_chain_section  : section          ; see Step 6.8
+            if (has_wp_events):                  ; from the chain
+                                                  ; header just decoded
+              wp_events_section : section          ; see Step 6.9
           Decode each section against fresh "nothing observed yet"
           overlays; the values reconstructed must match the
           immediately-preceding ENTRY exactly (template_id, dyn_params,
@@ -760,10 +778,17 @@ Loop until a ``BODY_TAG_END`` is seen:
         After all records are consumed the section payload must be
         empty.
    6.8  WP chain section payload:
-          num_wp : ULEB
+          chain_hdr     : ULEB
+          num_wp        = chain_hdr >> 1
+          has_wp_events = (chain_hdr & ids.wp_chain_has_events) != 0
           repeat num_wp times:
             wp_template_id_delta : SLEB
             wp_delta_section     : section    ; decode per Step 6.7
+        ; chain_hdr packs num_wp in its high bits and the
+        ; wp_chain_flag.CST_WP_CHAIN_HAS_EVENTS bit in bit 0 — a
+        ; decoder that only wants num_wp shifts right by one.  See
+        ; §4.3 for why the presence bit rides here instead of a
+        ; dedicated per-entry byte.
    6.9  WP events section payload:
           num_events : ULEB
           prev_wp_index : i32 = -1
@@ -937,7 +962,7 @@ families — the field IDs still determine what actually appears in
 each delta section.  CST_FLAG_PROFILE and CST_FLAG_WP are
 structural: they gate the presence of whole blocks (the
 per-template profile block — Step 4.6 / §6, and the per-entry
-wrong-path chain + events sections — Steps 6.4–6.5), exactly as the
+wrong-path chain section — Steps 6.4–6.5), exactly as the
 per-insn CST_INSN_FLAG_HAS_DEP_BLOCK gates the dep sub-block.  Resolve
 every flag through the ``header_flag`` map — the trace assigns each bit,
 a reader never assumes a position:
@@ -945,7 +970,11 @@ a reader never assumes a position:
 - ``CST_FLAG_MEM_DATA`` — LOAD_DATA / STORE_DATA may appear
 - ``CST_FLAG_REG_DATA`` — DST_REG fields may appear
 - ``CST_FLAG_PROFILE`` — per-template §6 profile block present
-- ``CST_FLAG_WP`` — per-entry wrong-path chain + events present
+- ``CST_FLAG_WP`` — per-entry wrong-path chain present (§4.3); the
+  sibling wrong-path *events* section is gated one level finer, by the
+  chain header's own ``CST_WP_CHAIN_HAS_EVENTS`` bit (below) rather than
+  by a header flag, since whether a given entry's chain produced an
+  event varies entry to entry where ``CST_FLAG_WP`` itself does not
 
 Per-instruction template flags, resolved through the ``insn_flag`` map
 (again: names, not fixed positions):
@@ -998,6 +1027,13 @@ Wrong-path event flags, resolved through the ``wp_event_flag`` map:
 
 - ``CST_WP_EVENT_TRANSLATION_UNAVAIL``
 - ``CST_WP_EVENT_FAULT``
+
+WP chain header flag, resolved through the ``wp_chain_flag`` map — the
+bit packed into the WP chain section's leading ``chain_hdr`` ULEB
+alongside ``num_wp`` (§4.3):
+
+- ``CST_WP_CHAIN_HAS_EVENTS`` — a ``wp_events_section`` (§4.4) follows
+  this entry's chain
 
 3. Header
 ~~~~~~~~~
@@ -1092,6 +1128,7 @@ The writer emits these maps:
    | dep_block_flag| CST_DEP_BLOCK_* dep sub-block flag bits       |
    | body_tag      | BODY_TAG_* stream record tags                 |
    | wp_event_flag | CST_WP_EVENT_* wrong-path event bits          |
+   | wp_chain_flag | CST_WP_CHAIN_* wrong-path chain header bits   |
    | metaflags     | CST_METAFLAGS_* canonical flag bits           |
    | mem_access_pattern | CST_PAT_* template-profile access classes|
    | profile_flag  | CST_PROFILE_* template-profile pat_flags bits |
@@ -1309,6 +1346,10 @@ wrong-path chain.
    | wp_chain_section                section          |  only if CST_FLAG_WP
    +--------------------------------------------------+
    | wp_events_section               section          |  only if CST_FLAG_WP
+   |                                                   |  AND the chain
+   |                                                   |  header's
+   |                                                   |  CST_WP_CHAIN_HAS_EVENTS
+   |                                                   |  bit is set (§4.3)
    +--------------------------------------------------+
 
 ``previous_entry_template`` starts at 0 and updates after each CP entry.
@@ -1328,7 +1369,9 @@ the CP block. Template IDs are delta-coded within the chain.
 
    wp_chain_section payload:
 
-     num_wp : ULEB
+     chain_hdr : ULEB
+       num_wp        = chain_hdr >> 1
+       has_wp_events = chain_hdr & wp_chain_flag.CST_WP_CHAIN_HAS_EVENTS
 
      repeat num_wp times:
        wp_template_id_delta : SLEB
@@ -1336,6 +1379,16 @@ the CP block. Template IDs are delta-coded within the chain.
 
 Wrong-path field state is forked from the current correct-path state at
 the start of the chain and discarded at the end of the entry.
+
+The chain header's low bit, ``CST_WP_CHAIN_HAS_EVENTS``, announces
+whether the following ``wp_events_section`` (§4.4) is present at all —
+see that section for why the presence signal lives here rather than in
+a dedicated per-entry byte. ``num_wp`` occupies the remaining bits, so a
+reader that wants only the block count shifts ``chain_hdr`` right by
+one; the shift costs nothing in practice because ``num_wp`` stays small
+(bounded by the ``wpdepth`` excursion budget) and so keeps the header a
+single wire byte in the overwhelming majority of entries, exactly as
+the unpacked ``num_wp : ULEB`` did before.
 
 4.4 Wrong-Path Events Section
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1345,6 +1398,13 @@ index addresses a chain position identifies a wrong-path block that
 contains a synthetic-data fault or could not be translated; an event
 whose resolved index lies past the chain is chain-level and describes
 the unrealized first target of the wrong path itself (see below).
+
+The section itself is present on the wire only when the preceding
+``wp_chain_section``'s header carried ``CST_WP_CHAIN_HAS_EVENTS`` (§4.3);
+an entry whose chain produced no event carries no ``wp_events_section``
+at all — no length prefix, no ``num_events = 0`` payload, nothing. A
+reader that has already decoded the chain header therefore knows before
+reaching this point in the stream whether to expect the section below.
 
 ::
 
@@ -1372,6 +1432,30 @@ The sparse form is under a third the size of the per-``WPEntry``
 alternative on such a trace.  It also expresses what a per-``WPEntry`` byte
 cannot: a chain-level event on an empty chain (``num_wp == 0``) has no
 block to attach a flag byte to.
+
+Sparse-within-the-section is not, on its own, sparse-across-the-*trace*:
+even an entry that carries zero events still paid, until the
+``CST_WP_CHAIN_HAS_EVENTS`` bit was introduced, an unconditional
+``wp_events_section`` — its own length prefix plus a ``num_events = 0``
+payload byte — on *every* ``BODY_TAG_ENTRY`` and ``BODY_TAG_IFRAME``, not
+just the ones with something to report. How many entries carry an event
+is workload-dependent — measured traces range from about one entry in a
+hundred to roughly one in five on a fault-heavy workload — but the
+no-event majority's framing is pure overhead at either density: on the
+fault-heavy end it was half the section's total wire cost, and on the
+sparse end essentially all of it. ``wp_chain_flag`` closes that gap by
+moving the presence signal one level up: the writer decides, before it
+even opens the WP chain sub-section, whether this entry has any event
+to report, and packs that decision into a bit of the chain header's
+leading ``chain_hdr`` ULEB (§4.3) — a field that is already
+unconditionally present whenever ``CST_FLAG_WP`` is set, so folding a
+bit into it costs nothing new. When the bit is clear the
+``wp_events_section`` is skipped entirely rather than emitted empty,
+collapsing its cost on a no-event entry from two bytes to zero. A
+dedicated per-entry flag byte would have worked semantically but would
+itself cost one byte on every entry, undoing most of the saving it was
+meant to provide; reusing the chain header's existing field is what
+keeps the common case free.
 
 ``CST_WP_EVENT_FAULT`` marks a wrong-path block that contains a
 **synthetic-data fault** at ``fault_insn_index``.  On a mispredicted path
@@ -1431,6 +1515,10 @@ writer had, or skip it entirely.
    | cp_delta_section                section          |
    | wp_chain_section                section          |  only if CST_FLAG_WP
    | wp_events_section               section          |  only if CST_FLAG_WP
+   |                                                   |  AND the chain
+   |                                                   |  header's
+   |                                                   |  CST_WP_CHAIN_HAS_EVENTS
+   |                                                   |  bit is set (§4.3)
    +--------------------------------------------------+
 
 The IFRAME inherits the ``template_id`` of the preceding ENTRY (no

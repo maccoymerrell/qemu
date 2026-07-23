@@ -42,6 +42,7 @@ _PATTERNS: list[tuple[re.Pattern, str, str]] = [
     (re.compile(r"^CST_FID_([A-Z0-9_]+)$"),         "CST_FID_",         "CST_FID_*"),
     (re.compile(r"^CST_METAFLAGS_([A-Z])$"),        "CST_METAFLAGS_",   "CST_METAFLAGS_*"),
     (re.compile(r"^CST_WP_EVENT_([A-Z0-9_]+)$"),    "CST_WP_EVENT_",    "CST_WP_EVENT_*"),
+    (re.compile(r"^CST_WP_CHAIN_([A-Z0-9_]+)$"),    "CST_WP_CHAIN_",    "CST_WP_CHAIN_*"),
     (re.compile(r"^CST_INSN_FLAG_([A-Z0-9_]+)$"),   "CST_INSN_FLAG_",   "CST_INSN_FLAG_*"),
     (re.compile(r"^CST_FLAG_([A-Z0-9_]+)$"),        "CST_FLAG_",        "CST_FLAG_*"),
     (re.compile(r"^BODY_TAG_([A-Z0-9_]+)$"),        "BODY_TAG_",        "BODY_TAG_*"),

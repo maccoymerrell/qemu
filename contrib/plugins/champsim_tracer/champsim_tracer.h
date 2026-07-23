@@ -267,6 +267,28 @@ extern "C" {
 /* Bit 2 is free — unassigned, reserved for a future event flag.  Writers
  * write it 0; readers ignore it (reserved-bits rule, format.md). */
 
+/*
+ * WP chain header flag: packed into the low bit of the wp_chain_section's
+ * leading ULEB (docs/format.rst Step 6.8), alongside num_wp in the
+ * remaining high bits (num_wp = chain_hdr >> 1).  Set when a
+ * wp_events_section (Step 6.9) follows the chain on the wire; when clear,
+ * the events section is entirely absent from this entry — no length
+ * prefix, no payload — rather than present-but-empty.
+ *
+ * Event density is workload-dependent — measured traces range from ~1%
+ * of CP entries carrying any wrong-path event (see docs/format.rst §4.4)
+ * up to ~22% on a fault-heavy user-mode workload — but the no-event
+ * majority always paid the unconditional wp_events_section's two-byte
+ * empty-section framing (outer length prefix + num_events=0) for no
+ * informational content.  Packing the presence bit
+ * into the chain header's existing leading ULEB — rather than adding a
+ * dedicated per-entry flag byte — keeps the common (no-event) case at
+ * zero added bytes: the chain header is already unconditionally present
+ * once CST_FLAG_WP is set, so this reinterprets an existing field instead
+ * of introducing a new one.
+ */
+#define CST_WP_CHAIN_HAS_EVENTS           (1u << 0)
+
 /* Header feature flags.  MEM_DATA / REG_DATA advise which optional
  * field-ID families may appear (the field IDs still determine actual
  * presence).  PROFILE / WP are structural gates: they decide whether

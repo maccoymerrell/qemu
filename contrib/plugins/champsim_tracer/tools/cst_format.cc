@@ -78,6 +78,7 @@ void parse_encoding_maps(Reader &r, EncodingMaps *out)
         else if (name == "insn_flag")      target = &out->insn_flag;
         else if (name == "body_tag")       target = &out->body_tag;
         else if (name == "wp_event_flag")  target = &out->wp_event_flag;
+        else if (name == "wp_chain_flag")  target = &out->wp_chain_flag;
         else if (name == "metaflags")      target = &out->metaflags;
         else if (name == "dep_block_flag") target = &out->dep_block_flag;
         else if (name == "mem_access_pattern")
@@ -414,6 +415,10 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
                 &ids->wp_event_translation_unavail);
     resolve_one(maps.wp_event_flag, "wp_event_flag", "CST_WP_EVENT_FAULT",
                 &ids->wp_event_fault);
+
+    /* wp_chain_flag (bit mask inside the WP chain section's leading ULEB) */
+    resolve_one(maps.wp_chain_flag, "wp_chain_flag", "CST_WP_CHAIN_HAS_EVENTS",
+                &ids->wp_chain_has_events);
 
     /* metaflags (bit positions inside the FID_METAFLAGS byte) */
     resolve_one(maps.metaflags, "metaflags", "CST_METAFLAGS_Z",

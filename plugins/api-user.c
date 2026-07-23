@@ -48,6 +48,13 @@ bool qemu_plugin_vaddr_to_paddr(uint64_t vaddr, uint64_t *paddr)
 }
 
 /*
+ * qemu_plugin_walk_exec_regions() has a user-mode implementation in
+ * accel/tcg/user-exec.c (where walk_memory_regions and the target page-flags
+ * map live) — this file is compiled target-independently and cannot reach
+ * that target-gated machinery.  api-system.c carries the system stub.
+ */
+
+/*
  * Time control - for user mode the only real time is wall clock time
  * so realistically all you can do in user mode is slow down execution
  * which doesn't require the ability to mess with the clock.

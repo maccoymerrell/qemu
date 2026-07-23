@@ -1171,6 +1171,7 @@ bool cap_disas_plugin_detail(disassemble_info *info, uint64_t pc, size_t size,
     g_strlcpy(out->op_str, insn->op_str,
               QEMU_PLUGIN_INSN_DETAIL_OPSTRSZ);
     out->insn_id = insn->id;
+    out->insn_size = insn->size;
 
     if (insn->detail) {
         const cs_detail *detail = insn->detail;
@@ -1235,28 +1236,54 @@ bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
                           const uint8_t *data, size_t data_size,
                           uint64_t pc, struct qemu_plugin_insn_info *out)
 {
+    /*
+     * Thread-local handle cache.  cs_open()/cs_malloc()/cs_close() per call
+     * dominates a bulk decode (the static-template sweep linear-decodes an
+     * entire executable region), so reuse the handle across calls with the
+     * same arch/mode — Capstone supports repeated cs_disasm_iter() on one
+     * handle.  Thread-local because the decode runs on any vCPU thread and a
+     * Capstone handle is not safe for concurrent iteration.  The handle is
+     * never explicitly freed (one per thread per arch/mode, released at
+     * thread/process exit); a mode change closes the stale one first.
+     */
+    static __thread csh th_handle;
+    static __thread cs_insn *th_insn;
+    static __thread int th_arch = -1;
+    static __thread unsigned int th_mode;
+    static __thread bool th_valid;
+
     csh handle;
     cs_insn *insn;
-    cs_err err;
 
     memset(out, 0, sizeof(*out));
 
-    err = cs_open(cap_arch, cap_mode, &handle);
-    if (err != CS_ERR_OK) {
-        return false;
-    }
-
-    /* x86 AT&T syntax to match QEMU's default disassembly style */
-    if (cap_arch == CS_ARCH_X86) {
-        cs_option(handle, CS_OPT_SYNTAX, CS_OPT_SYNTAX_ATT);
-    }
-
-    cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
-
-    insn = cs_malloc(handle);
-    if (!insn) {
-        cs_close(&handle);
-        return false;
+    if (th_valid && th_arch == cap_arch && th_mode == cap_mode) {
+        handle = th_handle;
+        insn = th_insn;
+    } else {
+        if (th_valid) {
+            cs_free(th_insn, 1);
+            cs_close(&th_handle);
+            th_valid = false;
+        }
+        if (cs_open(cap_arch, cap_mode, &handle) != CS_ERR_OK) {
+            return false;
+        }
+        /* x86 AT&T syntax to match QEMU's default disassembly style */
+        if (cap_arch == CS_ARCH_X86) {
+            cs_option(handle, CS_OPT_SYNTAX, CS_OPT_SYNTAX_ATT);
+        }
+        cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+        insn = cs_malloc(handle);
+        if (!insn) {
+            cs_close(&handle);
+            return false;
+        }
+        th_handle = handle;
+        th_insn   = insn;
+        th_arch   = cap_arch;
+        th_mode   = cap_mode;
+        th_valid  = true;
     }
 
     const uint8_t *code = data;
@@ -1268,9 +1295,7 @@ bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
     }
 
     if (!cs_disasm_iter(handle, &code, &sz, &addr, insn)) {
-        cs_free(insn, 1);
-        cs_close(&handle);
-        return false;
+        return false;   /* handle stays cached for the next call */
     }
 
     /* Copy mnemonic and operand string */
@@ -1279,6 +1304,7 @@ bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
     g_strlcpy(out->op_str, insn->op_str,
               QEMU_PLUGIN_INSN_DETAIL_OPSTRSZ);
     out->insn_id = insn->id;
+    out->insn_size = insn->size;
 
     if (insn->detail) {
         const cs_detail *detail = insn->detail;
@@ -1322,7 +1348,6 @@ bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
         }
     }
 
-    cs_free(insn, 1);
-    cs_close(&handle);
+    /* handle / insn stay cached in the thread-local slots for reuse */
     return true;
 }

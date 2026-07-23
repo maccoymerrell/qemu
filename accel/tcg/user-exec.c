@@ -38,6 +38,7 @@
 #include "internal-common.h"
 #include "internal-target.h"
 #include "tb-internal.h"
+#include "qemu/qemu-plugin.h"
 
 __thread uintptr_t helper_retaddr;
 
@@ -322,6 +323,43 @@ void page_dump(FILE *f)
             length, "start", length, "end", length, "size", "prot");
     walk_memory_regions(f, dump_region);
 }
+
+#ifdef CONFIG_PLUGIN
+/*
+ * Executable-region enumeration for plugins (qemu_plugin_walk_exec_regions).
+ * Lives here rather than in plugins/api-user.c because that file is compiled
+ * target-independently and cannot reach walk_memory_regions / target_ulong;
+ * the page-flags map this walks IS the linux-user page table.  The system
+ * stub is in plugins/api-system.c.
+ */
+struct plugin_exec_region_walk {
+    qemu_plugin_exec_region_cb cb;
+    void                      *userp;
+};
+
+static int plugin_exec_region_one(void *priv, target_ulong start,
+                                  target_ulong end, unsigned long prot)
+{
+    struct plugin_exec_region_walk *w = priv;
+
+    if (!(prot & PAGE_EXEC)) {
+        return 0;
+    }
+    return w->cb(w->userp, (uint64_t)start, (uint64_t)end);
+}
+
+int qemu_plugin_walk_exec_regions(qemu_plugin_exec_region_cb cb, void *userp)
+{
+    struct plugin_exec_region_walk w = { cb, userp };
+
+    if (!cb) {
+        return 0;
+    }
+    /* walk_memory_regions reports contiguous same-flags runs of the
+     * user-mode page-flags map; the callback filters to PAGE_EXEC. */
+    return walk_memory_regions(&w, plugin_exec_region_one);
+}
+#endif /* CONFIG_PLUGIN */
 
 int page_get_flags(target_ulong address)
 {

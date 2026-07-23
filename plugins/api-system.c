@@ -121,6 +121,16 @@ bool qemu_plugin_vaddr_to_paddr(uint64_t vaddr, uint64_t *paddr)
     return true;
 }
 
+int qemu_plugin_walk_exec_regions(qemu_plugin_exec_region_cb cb, void *userp)
+{
+    /*
+     * System emulation: the executable footprint lives in a guest-owned
+     * page table this API does not walk (that is a separate, page-table
+     * driven facility).  Report nothing rather than guess.
+     */
+    return 0;
+}
+
 /*
  * Time control
  */

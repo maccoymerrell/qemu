@@ -112,11 +112,18 @@ typedef uint64_t qemu_plugin_id_t;
  *   (main-loop) issue notification is correlated back to the issuing vCPU
  *   through a device token, giving exact owner attribution instead of a
  *   positional guess.
+ *
+ * version 13:
+ * - added qemu_plugin_walk_exec_regions (enumerate the guest's mapped
+ *   executable virtual-address regions).  User-mode only: it reports the
+ *   PAGE_EXEC ranges of the user-mode page-flags map — the page table for
+ *   linux-user.  System mode reports nothing (a page-table walk of the
+ *   owned roots is a separate facility).
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 12
+#define QEMU_PLUGIN_VERSION 13
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -921,7 +928,7 @@ typedef struct qemu_plugin_insn_info {
     uint8_t  n_regs_write;
     bool     has_lock;    /* x86 LOCK prefix detected */
     bool     has_rep;     /* x86 REP/REPNZ prefix detected */
-    uint8_t  _pad;
+    uint8_t  insn_size;   /* decoded instruction length in bytes (Capstone) */
     char     mnemonic[QEMU_PLUGIN_INSN_DETAIL_MNEMSZ];
     char     op_str[QEMU_PLUGIN_INSN_DETAIL_OPSTRSZ];
     qemu_plugin_operand operands[QEMU_PLUGIN_INSN_DETAIL_MAX_OPS];
@@ -1286,6 +1293,42 @@ GArray *qemu_plugin_get_registers(void);
 QEMU_PLUGIN_API
 bool qemu_plugin_read_memory_vaddr(uint64_t addr,
                                    GByteArray *data, size_t len);
+
+/**
+ * typedef qemu_plugin_exec_region_cb - executable-region walk callback
+ * @userp: opaque pointer forwarded from qemu_plugin_walk_exec_regions()
+ * @start: first virtual address of the region
+ * @end:   one past the last virtual address of the region (half-open)
+ *
+ * Invoked once per contiguous executable virtual-address region.  Return
+ * 0 to continue the walk; any non-zero value stops it early and becomes
+ * the return value of qemu_plugin_walk_exec_regions().
+ */
+typedef int (*qemu_plugin_exec_region_cb)(void *userp,
+                                          uint64_t start, uint64_t end);
+
+/**
+ * qemu_plugin_walk_exec_regions() - enumerate mapped executable regions
+ *
+ * @cb: callback invoked for each contiguous executable (PAGE_EXEC) region
+ * @userp: opaque pointer forwarded to @cb
+ *
+ * Walks the guest's currently-mapped virtual address space and invokes
+ * @cb once for every contiguous run of pages carrying execute permission,
+ * in ascending address order.  This is the fetch/decode footprint a
+ * consumer needs to cover instructions that are mapped but not (yet)
+ * executed — predicted-not-taken fall-throughs and branch targets that a
+ * dynamic, executed-only view never reaches.
+ *
+ * USER-MODE ONLY.  In linux-user the reported regions are the PAGE_EXEC
+ * ranges of the process page-flags map — the authoritative page table for
+ * that mode.  Under system emulation the mapping is a guest-owned page
+ * table this call does not walk; it invokes @cb zero times and returns 0.
+ *
+ * Returns 0 after a full walk, or the first non-zero value @cb returned.
+ */
+QEMU_PLUGIN_API
+int qemu_plugin_walk_exec_regions(qemu_plugin_exec_region_cb cb, void *userp);
 
 /**
  * qemu_plugin_read_register() - read register for current vCPU

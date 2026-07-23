@@ -398,6 +398,29 @@ private:
     uint32_t depth_next_ = 0;
     uint32_t raw_depth_ = 0;
 
+    /* Captured asynchronous-interrupt depth (interrupts=1 only).  QEMU emits
+     * one ASYNC_ENTER at the outermost async delivery and one ASYNC_RETURN at
+     * the outermost return, so a captured window contributes exactly one
+     * level: 0 outside a window, 1 while an async handler is being traced.
+     * Added to the synchronous-fault frame count to form the emitted depth
+     * trailer, so an async handler taking a sync fault nests one level deeper.
+     * Assignment (not increment) keeps the retained-event rescan idempotent.
+     * Always 0 with interrupts=0 (the window is muted, never captured), so the
+     * depth trailer stays byte-identical to today. */
+    uint32_t async_captured_ = 0;
+
+    /* Synchronous-fault-span markers for faults=0 handler suppression.  A
+     * block that executed while this thread had an un-returned synchronous
+     * fault frame in flight is handler content — excluded when trace_faults is
+     * off.  prev_in_sync_ is stamped for the pending-seal prev at the seal (a
+     * user-privilege TB is never handler content, so it stamps false, mirroring
+     * the depth clamp); walk_in_sync_ captures it at the promote, so the seal
+     * phase suppresses the emit of a handler block by the same
+     * stamp-at-execution rule the depth uses.  Untouched (and unread) with
+     * faults=1, so the default path is byte-identical. */
+    bool prev_in_sync_ = false;
+    bool walk_in_sync_ = false;
+
     /* Async-interrupt mute window, driven by ASYNC_ENTER/ASYNC_RETURN
      * events plus the two local reset arrows that produce NO event
      * (stuck-window recovery, segment open).  Latched from the live flag

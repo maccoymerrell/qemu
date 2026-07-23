@@ -194,6 +194,9 @@ void PathBuilder::on_segment_open()
     raw_depth_ = 0;
     async_excluding_ = false;
     async_departure_pc_ = 0;
+    async_captured_ = 0;
+    prev_in_sync_ = false;
+    walk_in_sync_ = false;
     seal_pc_override_ = 0;
     /* Kernel-excursion ownership starts the segment unowned: the pin was
      * just captured at user privilege, so the first user TB re-seeds
@@ -856,16 +859,35 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
      * rescan of retained events across a bailed step idempotent.  An
      * ASYNC_RETURN drained this step unmutes the resume TB's body
      * callbacks (the event precedes the resume TB's execution). */
+    bool async_enter_this_batch = false;
     if (!primed_) {
-        async_excluding_ = qemu_plugin_in_async_int();
+        /* interrupts=1 never mutes; a pre-prime window carries no departure
+         * PC, so it is neither muted nor captured — the segment just opened at
+         * a clean user marker and the first well-formed ASYNC_ENTER after the
+         * prime drives the capture. */
+        async_excluding_ = qemu_plugin_in_async_int() &&
+                           !g_features.trace_interrupts;
         async_departure_pc_ = 0;    /* pre-prime windows carry no pc */
+        async_captured_ = 0;
     } else {
         for (const struct qemu_plugin_cpu_event &ev : pending_evs_) {
             if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER) {
-                async_excluding_ = true;
+                if (g_features.trace_interrupts) {
+                    /* Capture: contribute one depth level and remember the
+                     * batch opened a window, so the interrupted prev seals
+                     * against the departure PC below. */
+                    async_captured_ = 1;
+                    async_enter_this_batch = true;
+                } else {
+                    async_excluding_ = true;
+                }
                 async_departure_pc_ = ev.pc;
             } else if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_RETURN) {
-                async_excluding_ = false;
+                if (g_features.trace_interrupts) {
+                    async_captured_ = 0;
+                } else {
+                    async_excluding_ = false;
+                }
                 async_departure_pc_ = 0;
             }
             /* ASID_WRITE (kind 4) is window-neutral: consumed by the
@@ -874,6 +896,19 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
         }
     }
     g_capture_mute = async_excluding_;
+
+    /* interrupts=1: a freshly-opened capture window means the deferred prev is
+     * the interrupted block and cur is the handler entry.  Seal prev against
+     * the async departure PC — where the interrupted flow architecturally
+     * resumes — so no phantom edge runs through the handler entry (the same
+     * successor substitution the abandoned-window recovery makes).  Only on
+     * the batch that opened the window; subsequent handler steps seal against
+     * each other normally, and the handler's tail seals against the resume TB
+     * (which re-executes the departure PC). */
+    if (g_features.trace_interrupts && async_enter_this_batch &&
+        async_departure_pc_) {
+        seal_pc_override_ = async_departure_pc_;
+    }
 
     if (async_excluding_) {
         if (in.pinned && in.user_owned) {
@@ -1043,6 +1078,7 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
      * next surviving seal). */
     walk_prev_ = prev_tb_;
     walk_depth_ = prev_depth_;
+    walk_in_sync_ = prev_in_sync_;
     set_prev(in.cur);
     /* Record cur's owning (thread,asid) so a later foreign span that
      * suspends this now-deferred prev freezes the RIGHT owner (Stage 3): the
@@ -1070,6 +1106,66 @@ PathBuilder::complete_merge(size_t idx,
                             BodyStreamState *out_stream,
                             unsigned int cpu_index)
 {
+    /* faults=0: the synchronous-fault handler excursion is excluded, but the
+     * merge still runs so a fault-split interrupted block reassembles whole.
+     * A frame at depth >= 1 is a NESTED fault's interrupted HANDLER block —
+     * excluded like the handler's other blocks; drop it (its prefix was
+     * capture-muted, so its buffers are empty) and discard the resume suffix's
+     * accumulators.  A depth-0 frame is the top-level interrupted block: emit
+     * it whole, its pre-fault prefix re-injected ahead of the resume suffix,
+     * but with NO fault anchors and depth clamped to 0 — a faults=0 trace
+     * carries no depth>0 entries.  Wrong-path stays on: it is ordinary
+     * correct-path code.  (The faults=1 machinery below — deeper-frame flush,
+     * anchor guard — is bypassed entirely, so it stays byte-identical.) */
+    if (!g_features.trace_faults) {
+        CtxFrame &f0 = frames_[idx];
+        if (f0.depth >= 1) {
+            frames_.erase(frames_.begin() + (ptrdiff_t)idx);
+            g_mem_recorder.clear_cp();
+            pending_reg_snaps.clear();
+            return StepStatus::MERGED;
+        }
+        const PendingEmit &pe0 = pending_emits.front();
+        if (g_features.reg_data && f0.full_tmpl) {
+            uint64_t expected = 0;
+            for (uint32_t i = 0; i < f0.full_tmpl->n_insns; i++) {
+                expected += f0.full_tmpl->insn_fields[i].n_dst_regs;
+            }
+            size_t have = f0.snaps.size() + pending_reg_snaps.size();
+            if (have > expected && f0.snaps.size() <= expected) {
+                size_t excess = have - expected;
+                if (excess <= pending_reg_snaps.size()) {
+                    pending_reg_snaps.erase(
+                        pending_reg_snaps.begin(),
+                        pending_reg_snaps.begin() + (ptrdiff_t)excess);
+                }
+            }
+        }
+        g_mem_recorder.prepend_cp(f0.mem);
+        if (!f0.snaps.empty()) {
+            pending_reg_snaps.insert(pending_reg_snaps.begin(),
+                                     f0.snaps.begin(), f0.snaps.end());
+        }
+        if (pe0.bb_tmpl && f0.full_tmpl && pe0.bb_tmpl->taken_pc) {
+            g_mutex_lock(&data_lock);
+            f0.full_tmpl->taken_pc = pe0.bb_tmpl->taken_pc;
+            g_mutex_unlock(&data_lock);
+        }
+        g_emit_fault_depth = 0;
+        g_emit_fault_anchors.clear();
+        BBTemplate *merged0 = f0.full_tmpl;
+        uint64_t merge_wrong0 = pb_no_fault_wp() ? 0 : pe0.wrong_target;
+        frames_.erase(frames_.begin() + (ptrdiff_t)idx);
+        emit_finalized_bb(out_stream, merged0, pe0.branch_pc,
+                          pe0.emit_current_pc, merge_wrong0, cpu_index);
+        for (size_t i = 1; i < pending_emits.size(); i++) {
+            const PendingEmit &pe2 = pending_emits[i];
+            emit_finalized_bb(out_stream, pe2.bb_tmpl, pe2.branch_pc,
+                              pe2.emit_current_pc, pe2.wrong_target, cpu_index);
+        }
+        return StepStatus::MERGED;
+    }
+
     /* Retire-at-return backstop (deferred from Stage 0, landed now that
      * completion is (thread,asid)-scoped — Stage 2).  @idx was picked by
      * frame_idx_for_completion under the asid key, so it is unambiguously
@@ -1608,13 +1704,36 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                 }
             }
         }
+        /* interrupts=1 abandoned-window recovery: a pinned USER TB proves the
+         * process is at async-nesting depth 0 (user code never runs inside its
+         * own async handler), so a still-open captured window whose departure
+         * PC was never re-fetched (an SMP guest-thread switch the capture
+         * spanned, or a killed task) is stale.  Reset it — and the QEMU-side
+         * flag, so a fresh ASYNC_ENTER opens a well-formed new window — exactly
+         * as the interrupts=0 abandoned-window arrow force-closes the mute.
+         * The interrupts=0 path never reaches here with a live window (it
+         * SUSPENDS at step_events instead), so this is capture-only. */
+        if (g_features.trace_interrupts && in.pinned && in.live_priv == 0 &&
+            async_captured_) {
+            async_captured_ = 0;
+            async_departure_pc_ = 0;
+            qemu_plugin_async_int_reset();
+            if (pb_diag()) {
+                fprintf(stderr, "[pathbuilder] ASYNC-ABANDON reset at pinned "
+                        "user tb=0x%" PRIx64 "\n",
+                        in.cur ? in.cur->start_pc : 0);
+            }
+        }
         uint32_t pinned_inflight = 0;
         for (const CtxFrame &f : frames_) {
             if (!f.returned) {
                 pinned_inflight++;
             }
         }
-        depth_next_ = pinned_inflight;
+        /* Emitted fault-trailer depth = synchronous-fault frame nesting +
+         * captured async level.  async_captured_ is 0 with interrupts=0, so
+         * the trailer is byte-identical to today there. */
+        depth_next_ = pinned_inflight + async_captured_;
         /* Skip the pure user/steady-state (depth 0, no frames, prev depth 0)
          * UNLESS the current TB is a REP string op (rep_subtmpl), whose
          * fanned-out emit is the residual jump's locus: keep every step that
@@ -1652,6 +1771,23 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
      * per-vCPU stack cannot attribute frames per guest thread, an
      * accepted approximation. */
     prev_depth_ = (in.pinned && in.live_priv == 0) ? 0 : depth_next_;
+    /* Synchronous-fault-span stamp (faults=0 handler suppression): true when
+     * cur runs while an un-returned synchronous-fault frame is in flight and
+     * cur is not user code.  pinned_inflight == depth_next_ - async_captured_
+     * (both members); a user TB is never handler content, so it stamps false,
+     * mirroring the depth clamp above. */
+    prev_in_sync_ = (in.pinned && in.live_priv == 0)
+                        ? false
+                        : (depth_next_ - async_captured_) > 0;
+    /* faults=0: suspend capture across the synchronous-fault handler exactly
+     * as the async mute does — the handler's memops / reg snaps never pool
+     * into the interrupted block's slots, and its BB is dropped at the seal
+     * (walk_in_sync_).  The merge is untouched, so the interrupted block still
+     * reassembles whole from its pre-fault prefix and its post-return suffix.
+     * Never fires with faults=1 (byte-identical). */
+    if (!g_features.trace_faults && (depth_next_ - async_captured_) > 0) {
+        g_capture_mute = true;
+    }
     if (fault_on) {
         g_emit_fault_depth = walk_depth_;
     }
@@ -1712,6 +1848,20 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
     }
 
     if (!any_finalize) {
+        return StepStatus::NO_SEAL;
+    }
+
+    /* faults=0: a block that executed inside a synchronous-fault handler
+     * (walk_in_sync_) is excluded.  Its capture was already muted at the
+     * depth stamp above, so dropping its emission leaves nothing behind — the
+     * accumulators clear is defensive.  A nested-fault resume suffix that
+     * completes a merge took the complete_merge return above (which drops the
+     * inner handler content on the same rule); this path is the handler's own
+     * standalone BBs.  The interrupted (depth-0) block still reassembles
+     * whole via the merge. */
+    if (!g_features.trace_faults && walk_in_sync_) {
+        g_mem_recorder.clear_cp();
+        pending_reg_snaps.clear();
         return StepStatus::NO_SEAL;
     }
 

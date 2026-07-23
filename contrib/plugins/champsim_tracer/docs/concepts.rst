@@ -24,8 +24,8 @@ runs a million times the template is in the trace exactly once.
 Each template also carries a small **run-aggregated profile block**
 — PGO-style metadata accumulated over the whole run (execution
 counts, terminal-branch behaviour, per-instruction memory-access
-shape).  It is pure annotation: a consumer that does not model it
-skips the bytes.
+shape).  It is pure annotation: it does not affect replay, and a
+consumer that does not model PGO can discard it at decode.
 
 **Body** (the timeline).  One record per dynamic invocation of a
 basic block.  Each record points at a basic block by ID and adds the
@@ -34,71 +34,48 @@ optional destination-register data snapshots, and (when wrong-path
 simulation is enabled) the speculative chain a mispredicting CPU
 *would have* run from the just-finished branch.
 
-Trace size on a measured workload — 20 M instructions of
-``505.mcf_r`` and ``502.gcc_r`` (SPEC CPU2017 refrate input,
-x86_64), each captured in three plugin configurations and
-compressed in-process by the tracer with ``xz -T0 -q -c``.
-Numbers are bytes per architectural instruction of the 20 M
-window:
+Trace size on a measured workload — ``sha256sum`` over a fixed 5 MiB
+input (14.5 M architectural instructions, x86_64), captured in three
+plugin configurations and compressed with ``xz -T0``.  Numbers are
+bytes per architectural instruction:
 
 .. list-table::
    :header-rows: 1
-   :widths: 38 12 16 16 18
+   :widths: 50 16 16 18
 
    * - Configuration
-     - Workload
      - Raw B/insn
      - xz B/insn
      - Ratio
    * - CP-only, addresses only
        (``wp=0,memdata=0``)
-     - mcf
-     - 1.83
-     - 0.21
-     - 8.9×
-   * -
-     - gcc
-     - 2.00
-     - 0.07
-     - 27×
+     - 0.234
+     - 0.015
+     - 15×
    * - CP+WP, addresses only
-       (``wp=1,memdata=0,wp_memdata=0``)
-     - mcf
-     - 22.5
-     - 2.29
-     - 9.8×
-   * -
-     - gcc
-     - 21.9
-     - 0.88
-     - 25×
+       (``wp=1,memdata=0``)
+     - 1.23
+     - 0.058
+     - 21×
    * - CP+WP full
        (``wp=1,memdata=1,regdata=1``)
-     - mcf
-     - 66.3
-     - 7.94
-     - 8.3×
-   * -
-     - gcc
-     - 49.4
-     - 4.52
-     - 11×
+     - 7.62
+     - 4.12
+     - 1.8×
 
 Compression ratio falls as more entropy is captured: the CP-only
-trace is dominated by sparse delta records that compress well,
-while memop addresses are nearly random and load / store /
-register values are entropy-rich.  The :doc:`decoder`
-``cst_audit`` tool breaks any trace down into this byte
-structure exactly.
+trace is dominated by sparse delta records that compress well, while
+memop addresses are nearly random and load / store / register values
+are entropy-rich.  This workload is an extreme of that trend — its
+full-capture register data is SHA hash state, near-incompressible, so
+the full row compresses under 2×; a workload with lower-entropy
+register values compresses several times better.  The :doc:`decoder`
+``cst_audit`` tool breaks any trace down into this byte structure
+exactly.
 
-These numbers are workload-dependent.  gcc has more BB diversity
-and more conditional flow than mcf but a smaller and more
-repetitive memory footprint, so its CP-only trace compresses 3×
-better despite being slightly larger raw.  mcf's heavy random-
-ish memory traffic inflates the CP+WP-full configuration and
-caps its compression ratio around 8×.  Run ``cst_audit`` on a
-representative slice of your own workload before sizing storage
-for a long run.
+These numbers are workload-dependent.  Run ``cst_audit`` on a
+representative slice of your own workload before sizing storage for a
+long run.
 
 What a body entry represents
 ----------------------------
@@ -214,9 +191,10 @@ System-mode traces
 The tracer runs against both of QEMU's TCG emulators.  Under
 ``qemu-<isa>`` (user mode) the trace covers one process's user-space
 execution; system-call boundaries appear as ``GEN_OP_SYSCALL``
-instructions and kernel execution is invisible (QEMU emulates the
-syscall itself).  Under ``qemu-system-<isa>`` the tracer targets one
-chosen process inside a full guest OS, and the kernel becomes part
+instructions and kernel execution is invisible — user-mode QEMU passes
+each syscall through to the host kernel, which services it outside the
+guest.  Under ``qemu-system-<isa>`` QEMU emulates a whole guest OS; the
+tracer targets one chosen process inside it, and the kernel becomes part
 of the picture:
 
 * **The window is guest-driven and marker-scoped.**  A process runs a

@@ -25,16 +25,16 @@ execution is invisible entirely — system-call boundaries appear as
 ``GEN_OP_SYSCALL`` instructions and the trace resumes at the
 syscall's return.
 
-**Wrong-path simulation on non-x86 hosts is system-mode only.**
-Speculative stores are held off real guest memory by two mechanisms:
-on x86 / x86-64 hosts the i386 backend's ``CF_FORCE_SLOW`` inline
-bypass contains them in any mode, and on every other host backend the
-portable ``TLB_FORCE_SLOW`` path contains them in system mode.  The
-one unsupported configuration is user-mode wrong-path tracing on a
-non-x86 host, where no softmmu TLB exists to carry the flag; there the
-plugin detects the gap at its first speculative excursion and refuses
-— it aborts rather than ever writing real guest memory.  See the
-containment discussion in :doc:`qemu_modifications`.
+**Wrong-path simulation in user mode requires an x86 host.**
+System-mode wrong-path tracing is portable to every host: speculative
+stores are held off real guest memory by the portable
+``TLB_FORCE_SLOW`` path on non-x86 backends and by the i386 backend's
+``CF_FORCE_SLOW`` inline bypass on x86, which contains them in any
+mode.  The single unsupported configuration is user-mode wrong-path
+tracing on a non-x86 host, where no softmmu TLB exists to carry the
+flag; the plugin detects the gap at its first speculative excursion
+and refuses loudly — it aborts rather than ever writing real guest
+memory.  See the containment discussion in :doc:`qemu_modifications`.
 
 **Cycle-accurate timing.**  The trace is a *functional* record of
 the architectural correct path plus its speculative shadow.  It

@@ -932,11 +932,13 @@ static void write_template_profile(BitWriter *sub,
 static void write_bin_templates(BitWriter *bw)
 {
     /* Count is the executed dictionary plus the never-executed STATIC
-     * templates that survive the shadow filter.  static_serialisable_count()
-     * is 0 (and every static path below a no-op) unless the executable-region
-     * sweep ran, so a trace without static_templates is byte-identical. */
+     * templates and opportunistic branch alternates that survive the shadow
+     * filter.  static_serialisable_count() / alt_serialisable_count() are 0
+     * (and every static/alt path below a no-op) unless static_templates ran,
+     * so a trace without it is byte-identical. */
     bw_write_uleb128(bw, g_template_store.bb_count() +
-                         g_template_store.static_serialisable_count());
+                         g_template_store.static_serialisable_count() +
+                         g_template_store.alt_serialisable_count());
 
     auto write_one = [bw](BBTemplate &tmpl_ref) {
         BBTemplate *tmpl = &tmpl_ref;
@@ -983,9 +985,15 @@ static void write_bin_templates(BitWriter *bw)
 
     /* STATIC (never-executed) templates, in sorted start_pc order, each
      * assigned a fresh section-local id above every executed id.  No-op
-     * when the sweep did not run. */
+     * when the sweep did not run.  for_each_static post-increments the id
+     * counter, so it holds the next free id afterward. */
     uint32_t static_next_id = max_exec_id + 1;
     g_template_store.for_each_static(static_next_id, write_one);
+
+    /* Opportunistic branch alternates (never-executed, no wire flag), in
+     * sorted start_pc order, each assigned a fresh section-local id strictly
+     * above every executed AND static id.  No-op when nothing was minted. */
+    g_template_store.for_each_alt(static_next_id, write_one);
 }
 
 /* ========================= Dyn param helpers ========================= */

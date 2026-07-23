@@ -205,12 +205,49 @@ public:
                                  const char *symbol_name,
                                  uint64_t fall_through_pc);
 
+    /* Opportunistic branch-alternate minting (static_templates=1, both
+     * modes).  Mint a never-executed true-BB template into the
+     * segment-scoped alt_map_ — a sibling of bb_map_ / static_map_, keyed by
+     * the same (asid_root, start_pc).  Unlike commit_static_bb this carries
+     * NO wire flag (life CODE, so write_insn_descriptors stamps no
+     * CST_INSN_FLAG_STATIC): an alternate is an ordinary never-executed
+     * dictionary entry, indistinguishable on the wire from any other block
+     * that happened not to execute.  Like a static, it does NOT consume the
+     * executed-template id counter (placeholder id 0; the serialised id is
+     * assigned lazily by for_each_alt above every executed id) so executed
+     * blocks number exactly as they would with the feature off — the trace
+     * body stays byte-identical.  Dedups within alt_map_ by (asid_root,
+     * start_pc); a re-mint of the same block is idempotent.  Caller holds
+     * data_lock.  Returns the (possibly pre-existing) record. */
+    BBTemplate *commit_alt_bb(uint64_t start_pc,
+                              uint32_t n_insns,
+                              const uint64_t *insn_pcs,
+                              const InsnFields *insn_fields,
+                              const uint8_t *insn_sizes,
+                              const uint8_t *insn_bytes,
+                              const InsnRegNames *insn_reg_names,
+                              const char *symbol_name,
+                              uint64_t fall_through_pc);
+
+    /* True iff @start_pc's true BB is already covered by an executed
+     * (bb_map_) or a previously-minted alternate (alt_map_) template — the
+     * opportunistic-mint miss test (skip the decode when either wins).  The
+     * cache key's asid_root is selected from @start_pc by the VA-domain
+     * classifier, exactly as commit_alt_bb / commit_true_bb.  Caller holds
+     * data_lock. */
+    bool alt_or_bb_covered(uint64_t start_pc) const;
+
     size_t tb_count() const;
     size_t bb_count() const;
     /* Count of static_map_ templates that WOULD serialise: those whose
      * (asid_root, start_pc) key is not shadowed by an executed bb_map_
      * template (a block that ran is carried by bb_map_; dynamic wins). */
     size_t static_serialisable_count() const;
+    /* Count of alt_map_ templates that WOULD serialise: those not shadowed
+     * by an executed bb_map_ entry OR a static_map_ entry (a block that ran
+     * is carried by bb_map_; a swept block is carried, flagged, by
+     * static_map_ — both win over the flag-less alternate). */
+    size_t alt_serialisable_count() const;
 
     /* Iterate true-BB templates in sorted start_pc order (deterministic
      * serialization).  Invoked once at end-of-trace by the writer. */
@@ -226,6 +263,16 @@ public:
      * for_each_bb. */
     void for_each_static(uint32_t &next_id,
                          const std::function<void(BBTemplate &)> &fn);
+
+    /* Iterate the serialisable alternate templates (alt_map_ entries not
+     * shadowed by an executed bb_map_ OR a static_map_ template) in sorted
+     * start_pc order, assigning each a fresh wire template_id from @next_id
+     * (post-incremented) just before @fn runs.  Alternate ids are
+     * section-local and referenced by nothing, so @next_id must start above
+     * every executed AND static id already written in this segment's
+     * templates section.  Invoked by the writer after for_each_static. */
+    void for_each_alt(uint32_t &next_id,
+                      const std::function<void(BBTemplate &)> &fn);
 
     /* Diagnostic: dump a per-bucket census of the serialisable true-BB
      * cache (bb_map_) to @out, splitting the shared kernel sentinel bucket
@@ -442,6 +489,15 @@ private:
      * (and inert) unless the sweep runs, so a trace without static
      * templates is byte-identical. */
     std::unordered_map<BBKey, BBTemplatePtr, BBKeyHash> static_map_;
+    /* Segment-scoped never-executed true-BB templates minted opportunistically
+     * at branch evaluation (static_templates=1, both modes) for the UNTAKEN
+     * side of a branch not already templated.  Keyed by (asid_root, start_pc)
+     * like bb_map_ / static_map_.  Serialised (by for_each_alt) as ordinary
+     * dictionary entries carrying NO wire flag, for the subset shadowed by
+     * neither an executed bb_map_ key nor a static_map_ key.  Dropped wholesale
+     * by clear_bb_map at the segment boundary.  Empty (and inert) unless the
+     * feature runs, so a trace without it is byte-identical. */
+    std::unordered_map<BBKey, BBTemplatePtr, BBKeyHash> alt_map_;
     uint32_t                                    next_template_id_ = 1;
     uint64_t                                    spec_pending_bytes_ = 0;
     /* Current bb_map_ generation, bumped by clear_bb_map at every

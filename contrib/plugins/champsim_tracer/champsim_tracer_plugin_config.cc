@@ -103,6 +103,12 @@ bool set_physaddr(PluginConfig *cfg, const char *v)
     return cfg->physaddr == 0 || cfg->physaddr == 1;
 }
 
+bool set_static_templates(PluginConfig *cfg, const char *v)
+{
+    cfg->static_templates = atoi(v);
+    return cfg->static_templates == 0 || cfg->static_templates == 1;
+}
+
 bool set_histogram(PluginConfig *cfg, const char *v)
 {
     int n = atoi(v);
@@ -318,6 +324,7 @@ const struct {
     { "kexc",       set_kexc       },
     { "devio",      set_devio      },
     { "physaddr",   set_physaddr   },
+    { "static_templates", set_static_templates },
     { "histogram",  set_histogram  },
     { "iframe_rate", set_iframe_rate },
     { "latch_timeout", set_latch_timeout },

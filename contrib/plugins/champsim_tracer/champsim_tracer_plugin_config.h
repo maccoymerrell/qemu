@@ -60,6 +60,14 @@ struct PluginConfig {
      * Off by default; ignored (forced off) in user mode, where no
      * translation exists.  A device-/physaddr-free trace is unchanged. */
     int       physaddr          = 0;
+    /* Static-template sweep (static_templates=0/1, user mode only).  When
+     * on, every segment open linear-decodes the guest's mapped executable
+     * regions and mints never-executed STATIC true-BB templates so the
+     * template dictionary covers the fall-through / branch-target space a
+     * trace-inferred wrong-path consumer needs.  Off by default;
+     * warned-and-ignored in system mode (P2 page-table-walk enumeration is
+     * a later facility). */
+    int       static_templates  = 0;
     /* Per-template IFRAME trigger interval.  0 disables. */
     uint32_t  iframe_rate         = 100000;
     uint64_t  simpoint_interval = 100000000ULL;

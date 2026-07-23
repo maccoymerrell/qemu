@@ -16,10 +16,11 @@ along with the kernel code it synchronously invokes — until its END
 marker, while ``policy=trace-all`` widens the first START to capture
 all contexts (see the *System-mode tracing* section of
 :doc:`architecture`).  What it deliberately does not cover:
-asynchronous-interrupt handling (excluded by design — OS noise
-uncorrelated with the workload), processes that never run a marker,
-and the pre-paging boot path (wrong-path speculation requires the
-guest MMU to bound fetches).  Tracing "everything the machine does"
+asynchronous-interrupt handling (excluded by default as OS noise
+uncorrelated with the workload — though ``interrupts=1`` opts into
+tracing it), processes that never run a marker, and the pre-paging
+boot path (wrong-path speculation requires the guest MMU to bound
+fetches).  Tracing "everything the machine does"
 from power-on is not a supported shape.  In user mode, kernel
 execution is invisible entirely — system-call boundaries appear as
 ``GEN_OP_SYSCALL`` instructions and the trace resumes at the

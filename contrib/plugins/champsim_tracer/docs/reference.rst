@@ -977,6 +977,35 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        address space on entry (a PTI-style page-table base).  ``kexc=0``
        restores the strict live-ASID rule: kernel work whose live ASID
        differs from the pinned value is dropped.  Ignored in user mode.
+   * - ``faults=0|1``
+     - ``1``
+     - Synchronous-fault handler tracing (**system mode only**).  When on,
+       a synchronous fault (page fault, coprocessor lazy-enable) detours
+       execution into a handler that is traced as first-class code carrying
+       its exception-nesting depth, and the interrupted basic block
+       reassembles whole after the handler, its faulting instructions
+       marked by the fault trailer's anchor list.  ``faults=0`` **excludes**
+       the handler excursion: capture is suspended across the handler
+       exactly as an asynchronous interrupt's is, the interrupted block
+       still emits whole (the reassembly is kept), but it carries no anchors
+       and every entry's depth trailer stays ``0``.  Independent of
+       ``interrupts``.  Ignored in user mode (no fault stack).
+   * - ``interrupts=0|1``
+     - ``0``
+     - Asynchronous-interrupt handler tracing (**system mode only**).  Off
+       by default: an asynchronous interrupt's whole delivery-to-return
+       excursion is excluded — capture suspends and the interrupted flow
+       seals against its real successor.  When on, the handler is **traced**:
+       its kernel basic blocks appear at exception depth ``>= 1`` between
+       the interrupted context's entries (a captured async window is one
+       level; a synchronous fault taken inside it nests one deeper),
+       attributed to the interrupted address space through the same
+       kernel-excursion ownership (``kexc``) machinery a synchronous fault
+       uses, and the interrupted block seals against the interrupt's
+       departure PC so no phantom edge runs through the handler entry.  The
+       depth rides the existing fault trailer — no new wire records.
+       Independent of ``faults``.  Ignored in user mode (no asynchronous
+       delivery).
    * - ``devio=0|1``
      - ``1``
      - Block-device (disk) I/O records (**system mode only**).  When on,

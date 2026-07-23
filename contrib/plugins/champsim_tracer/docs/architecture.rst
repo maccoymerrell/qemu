@@ -1409,12 +1409,24 @@ Three environment toggles support A/B diagnosis: ``CST_NO_FAULT``
 
 .. _async-exclusion:
 
-Asynchronous-interrupt exclusion
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Asynchronous interrupts and the two handler-tracing flags
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Two independent flags choose whether each kind of handler excursion is
+traced.  ``faults=1`` (default) traces synchronous-fault handlers at
+their nesting depth and reassembles the interrupted block whole (the
+merge machinery below); ``interrupts=0`` (default) excludes asynchronous
+handlers whole.  Setting ``faults=0`` excludes the synchronous handler
+instead, and ``interrupts=1`` traces the asynchronous handler instead —
+each reusing the other's mechanism, because the two are mirror images:
+one suspends capture across the excursion, the other captures it at a
+depth.  Both are system-mode concepts; in ``*-linux-user`` neither flag
+has any effect.
 
 Asynchronous interrupts — timer ticks, device IRQs, the scheduler
-activity they trigger — are not induced by the traced workload, so
-the entire delivery-to-return excursion is excluded from the trace.
+activity they trigger — are not induced by the traced workload, so by
+default the entire delivery-to-return excursion is excluded from the
+trace.
 
 QEMU marks the window: the target's exception-delivery path sets a
 per-vCPU flag on an *asynchronous* entry and records the
@@ -1466,6 +1478,34 @@ it (see :ref:`suspend-or-seal <suspend-or-seal>`), to seal at its own depth when
 pinned context truly resumes — with its same-step resume held off, so
 the current (other-thread) TB promotes fresh instead of taking the
 suspended prev's seal.
+
+**Tracing the asynchronous handler (``interrupts=1``).**  When the
+handler is worth tracing — asynchronous kernel work is real
+OS-overhead a full-system model wants — the capture is inverted rather
+than muted.  The window contributes one exception-depth level, added to
+any live synchronous-fault nesting, so the handler's kernel blocks
+appear at depth ``>= 1`` between the interrupted context's entries; the
+same kernel-excursion ownership that attributes a synchronous handler
+attributes this one, keyed to the address space the interrupt was
+delivered from.  No merge is needed — an asynchronous interrupt is taken
+at a basic-block boundary, so the interrupted block is complete — but the
+seal must still target the **departure PC** (the same substitution the
+abandoned-window recovery makes), because the block executing after the
+interrupted one is the handler entry, not its architectural successor.
+The window closes on ``ASYNC_RETURN`` (or the abandoned-window recovery
+at a pinned user TB, which proves depth 0); the resume TB re-executing
+the departure PC then seals normally.  The depth rides the existing
+fault trailer, so a captured async handler needs no new wire records.
+
+**Excluding the synchronous handler (``faults=0``).**  The mirror case
+reuses the async mute.  While a synchronous-fault frame is in flight
+the handler's capture is suspended and its basic blocks are dropped at
+the seal, exactly as an excluded async window's are — but the
+fault-reassembly merge is kept, so the interrupted block still emits
+whole from its pre-fault prefix and its post-return suffix.  The
+reassembled block is de-anchored and clamped to depth 0, so a
+``faults=0`` trace advertises the fault trailer yet carries no anchors
+and no depth ``> 0`` entry.
 
 .. _time-transparency:
 

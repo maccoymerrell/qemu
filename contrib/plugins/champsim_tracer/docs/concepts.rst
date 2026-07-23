@@ -218,11 +218,18 @@ of the picture:
   additionally carry the handler's nesting depth, and a faulting
   basic block appears once, whole, with its faulting instructions
   marked.  (See :doc:`format` for the flag bit and the per-entry
-  fault trailer.)
-* **Asynchronous interrupts are excluded.**  Timer ticks, device
-  IRQs, and the scheduling they trigger are OS noise uncorrelated
-  with the traced workload; the whole delivery-to-return excursion
-  is left out of the trace by design.
+  fault trailer.)  Setting ``faults=0`` excludes the synchronous
+  handler instead — the interrupted block still appears whole, but
+  the handler excursion is suspended and the trace carries no anchors
+  or nesting depth.
+* **Asynchronous interrupts are excluded by default.**  Timer ticks,
+  device IRQs, and the scheduling they trigger are OS noise
+  uncorrelated with the traced workload, so the whole
+  delivery-to-return excursion is left out of the trace.  Setting
+  ``interrupts=1`` traces the handler instead — its kernel blocks
+  appear at exception depth ``>= 1`` between the interrupted context's
+  entries, attributed to the interrupted process — for a model that
+  wants the asynchronous OS overhead too.
 * **The wrong path crosses the privilege boundary.**  Speculative
   chains run through kernel code like any other, bounded by the
   same MMU rules a real speculative fetch obeys.

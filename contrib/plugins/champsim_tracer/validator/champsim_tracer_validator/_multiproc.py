@@ -838,3 +838,99 @@ def run_devio_probe(cfg: MPConfig) -> MPResult:
     res = _emit("devio disk-I/O records", subs)
     res.artifacts = {"cst": str(cst)}
     return res
+
+
+# ---------------------------------------------------------------------------
+# scenario 6: faults / interrupts — the two handler-tracing flags (system)
+# ---------------------------------------------------------------------------
+
+def _depth_hist(cfg: MPConfig, cst: Path) -> dict:
+    """{depth -> count} over the trace's per-entry fault trailers."""
+    _, raw = _run([_decode(cfg), "--format=raw", str(cst)], timeout=600)
+    hist: dict = {}
+    for m in re.finditer(r"fault_depth=(\d+)", raw):
+        d = int(m.group(1))
+        hist[d] = hist.get(d, 0) + 1
+    return hist
+
+
+def _anchor_count(cfg: MPConfig, cst: Path) -> int:
+    """Number of entries carrying a non-empty fault anchor list."""
+    _, raw = _run([_decode(cfg), "--format=raw", str(cst)], timeout=600)
+    return len(re.findall(r"anchors=\[\d", raw))
+
+
+def run_faults_interrupts_probe(cfg: MPConfig) -> MPResult:
+    """Exercise faults=0 and interrupts=1 against a fault-triggering system
+    workload:
+
+      * faults=1 (default) establishes the workload triggers synchronous
+        handlers (a depth>=1 entry) — otherwise faults=0 proves nothing;
+      * faults=0 SUPPRESSES them: no depth>0 entry, no anchor, and the
+        interrupted blocks still reassemble whole (audit clean / strict rc=0);
+      * interrupts=1 CAPTURES the asynchronous handler: depth>=1 present,
+        audit clean, strict rc=0, no WP storm (boot completes in-budget).
+    """
+    isa = "x86_64"
+    skip = _preconditions(cfg, isa)
+    if skip:
+        return MPResult(ok=True, subchecks=[], artifacts={}, skipped=True,
+                        skip_reason=skip)
+    od = cfg.out_dir
+    od.mkdir(parents=True, exist_ok=True)
+    bin_a = _gen_build(isa, "workloadA", cfg.seed_a, 8, 300, 0, True,
+                       od / "A")
+    cpio = _stage(isa, od / "stage", [("workloadA", bin_a)], _INIT_SINGLE)
+    common = (f"wpdepth={cfg.depth},"
+              f"trace_window=marker:simulation={cfg.budget},memdata=1")
+    subs: list = []
+
+    # --- (1) faults=1 baseline: the workload must trigger a sync handler ---
+    out1 = od / "faults1"
+    rc1, _c1, cst1 = _boot(cfg, isa, cpio, out1, f"outfile={out1},{common}")
+    base_deep = 0
+    if cst1.exists():
+        h1 = _depth_hist(cfg, cst1)
+        base_deep = sum(c for d, c in h1.items() if d >= 1)
+    subs.append(SubCheck(
+        "1. faults=1 baseline triggers a synchronous handler (depth>=1)",
+        base_deep >= 1, f"qemu_rc={rc1} deep_entries={base_deep}"))
+
+    # --- (2) faults=0: handler excluded, interrupted blocks whole ---
+    out0 = od / "faults0"
+    rc0, _c0, cst0 = _boot(cfg, isa, cpio, out0,
+                           f"outfile={out0},{common},faults=0")
+    if not cst0.exists():
+        subs.append(SubCheck("2. faults=0 boot produced a trace", False,
+                             f"qemu_rc={rc0} cst MISSING"))
+        return _emit("faults / interrupts handler-tracing flags", subs)
+    h0 = _depth_hist(cfg, cst0)
+    deep0 = sum(c for d, c in h0.items() if d >= 1)
+    anch0 = _anchor_count(cfg, cst0)
+    ok0a, asum0 = _audit_clean(cfg, cst0)
+    src0 = _strict_rc(cfg, cst0)
+    subs.append(SubCheck(
+        "2. faults=0 excludes handlers (no depth>0, no anchors) + clean",
+        deep0 == 0 and anch0 == 0 and ok0a and src0 == 0,
+        f"deep_entries={deep0} anchors={anch0} strict_rc={src0} audit[{asum0}]"))
+
+    # --- (3) interrupts=1: async handler captured at depth>=1 ---
+    outi = od / "interrupts1"
+    rci, _ci, csti = _boot(cfg, isa, cpio, outi,
+                           f"outfile={outi},{common},interrupts=1")
+    if not csti.exists():
+        subs.append(SubCheck("3. interrupts=1 boot produced a trace", False,
+                             f"qemu_rc={rci} cst MISSING"))
+        return _emit("faults / interrupts handler-tracing flags", subs)
+    hi = _depth_hist(cfg, csti)
+    deepi = sum(c for d, c in hi.items() if d >= 1)
+    okia, asumi = _audit_clean(cfg, csti)
+    srci = _strict_rc(cfg, csti)
+    subs.append(SubCheck(
+        "3. interrupts=1 captures async handlers (depth>=1) + clean + rc=0",
+        deepi >= 1 and okia and srci == 0 and rci == 0,
+        f"qemu_rc={rci} deep_entries={deepi} strict_rc={srci} audit[{asumi}]"))
+
+    res = _emit("faults / interrupts handler-tracing flags", subs)
+    res.artifacts = {"faults0": str(cst0), "interrupts1": str(csti)}
+    return res

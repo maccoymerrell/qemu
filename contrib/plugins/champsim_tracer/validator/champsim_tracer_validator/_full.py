@@ -65,6 +65,8 @@ FEATURES: dict[str, str] = {
     "opt:wp_memdata":            "WP-side mem-data tristate override",
     "opt:wp_regdata":            "WP-side reg-data tristate override",
     "opt:kexc":                  "kernel-excursion ownership model (kexc=0|1)",
+    "opt:faults":                "synchronous-fault handler tracing (faults=0|1)",
+    "opt:interrupts":            "asynchronous-interrupt handler tracing (interrupts=0|1)",
     "opt:devio":                 "disk-I/O bracketing records (devio=1)",
     "opt:physaddr":              "per-memop physical-page capture (physaddr=1)",
     "opt:histogram":             "per-segment histogram intervals (histogram=N)",
@@ -546,6 +548,13 @@ def _chk_devio(ctx: Ctx) -> Outcome:
     return _mp_outcome(MP.run_devio_probe(cfg))
 
 
+def _chk_faults_interrupts(ctx: Ctx) -> Outcome:
+    cfg = MP.MPConfig(build_dir=ctx.build_dir,
+                      out_dir=ctx.dir("feat_faults_interrupts"),
+                      budget=4_000_000)
+    return _mp_outcome(MP.run_faults_interrupts_probe(cfg))
+
+
 def _chk_tagged_ptr(ctx: Ctx) -> Outcome:
     sh = (Path(__file__).resolve().parent.parent
           / "tests" / "tagged_ptr_addr.sh")
@@ -930,6 +939,12 @@ def build_checks() -> list:
                    "disk-I/O bracketing records (virtio-blk, system)",
                    ["opt:devio", "wire:BODY_TAG_DEVIO_START",
                     "wire:BODY_TAG_DEVIO_STOP"], _chk_devio))
+    C.append(Check("features.faults_interrupts", "features",
+                   "synchronous-fault exclusion + async-interrupt capture "
+                   "(faults=0 / interrupts=1, system)",
+                   ["opt:faults", "opt:interrupts",
+                    "behavior:syscall_fault_nesting"],
+                   _chk_faults_interrupts))
     C.append(Check("features.tagged_ptr", "features",
                    "aarch64 tagged-pointer data-is-address heuristic",
                    ["behavior:addr_is_data"], _chk_tagged_ptr))

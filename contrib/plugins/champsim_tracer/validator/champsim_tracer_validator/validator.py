@@ -5165,7 +5165,16 @@ def _check_syscall_fault_nesting(entries: list[dict],
         issues.append(Issue(
             "syscall_fault_nesting", "error",
             f"...and {step_errors - 5} more depth-step violations"))
-    if require_nested and window_count and not nested_windows:
+    # faults=0 deliberately EXCLUDES synchronous handler excursions, so a
+    # trace produced with it carries no fault_depth >= 1 entry by design —
+    # the nested-fault requirement is N/A there.  Gate on the advertised
+    # option (the plugin command line recorded in the header), not on the
+    # empty result, so a genuine nesting regression under faults=1 is still
+    # caught.  The step-discipline and anchor checks above still run: a
+    # faults=0 trace's uniform depth 0 satisfies them trivially.
+    faults_excluded = "faults=0" in str(trace_meta.get("command", ""))
+    if (require_nested and window_count and not nested_windows
+            and not faults_excluded):
         issues.append(Issue(
             "syscall_fault_nesting", "error",
             f"no user-syscall excursion contains fault_depth >= 1 "

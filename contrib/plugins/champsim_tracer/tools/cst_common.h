@@ -139,6 +139,10 @@ struct ResolvedIds {
     uint8_t insn_flag_has_dep_block = 0;
     /* Optional (absent in traces predating the bit): 0 = never set. */
     uint8_t insn_flag_system        = 0;
+    /* Optional (advertised only by a static_templates=1 trace): 0 = never
+     * set.  Marks a never-executed template minted by the executable-region
+     * sweep — fetch/decode coverage of mapped-but-unexecuted code. */
+    uint8_t insn_flag_static        = 0;
 
     /* dep_block_flag map: bit masks inside the optional dep sub-block
      * header (only inspected when insn_flag_has_dep_block is set on
@@ -494,6 +498,10 @@ struct InsnTemplate {
      * Uniform across a template; always false in user-mode traces and
      * in traces predating the flag. */
     bool     is_system = false;
+    /* CST_INSN_FLAG_STATIC: never-executed template minted by the
+     * executable-region sweep (static_templates=1).  Uniform across a
+     * template; false in every trace without the sweep. */
+    bool     is_static = false;
     /*
      * Template-static MAX memop counts.  Runtime counts arrive via
      * CST_FID_N_LOADS/N_STORES and may be smaller but never larger.

@@ -184,12 +184,48 @@ public:
                                           BBTemplate *const *fragments,
                                           unsigned int n_fragments);
 
+    /* Static-template sweep (static_templates=1, user mode).  Mint a
+     * never-executed true-BB template into the segment-scoped static_map_
+     * (a sibling of bb_map_, keyed by the same (asid_root, start_pc)).
+     * Life STATIC; the wire CST_INSN_FLAG_STATIC bit rides its per-insn
+     * flags.  Does NOT consume the executed-template id counter — the
+     * serialised id is assigned lazily by for_each_static so executed
+     * blocks number exactly as they would with the sweep off (the trace
+     * body stays byte-identical).  Dedups within static_map_ by
+     * (asid_root, start_pc); a re-sweep of the same block is idempotent.
+     * @insn_fields / @insn_reg_names are contiguous, as commit_true_bb.
+     * Caller holds data_lock.  Returns the (possibly pre-existing) record. */
+    BBTemplate *commit_static_bb(uint64_t start_pc,
+                                 uint32_t n_insns,
+                                 const uint64_t *insn_pcs,
+                                 const InsnFields *insn_fields,
+                                 const uint8_t *insn_sizes,
+                                 const uint8_t *insn_bytes,
+                                 const InsnRegNames *insn_reg_names,
+                                 const char *symbol_name,
+                                 uint64_t fall_through_pc);
+
     size_t tb_count() const;
     size_t bb_count() const;
+    /* Count of static_map_ templates that WOULD serialise: those whose
+     * (asid_root, start_pc) key is not shadowed by an executed bb_map_
+     * template (a block that ran is carried by bb_map_; dynamic wins). */
+    size_t static_serialisable_count() const;
 
     /* Iterate true-BB templates in sorted start_pc order (deterministic
      * serialization).  Invoked once at end-of-trace by the writer. */
     void for_each_bb(const std::function<void(BBTemplate &)> &fn);
+
+    /* Iterate the serialisable STATIC templates (those not shadowed by an
+     * executed bb_map_ template) in sorted start_pc order, assigning each a
+     * fresh wire template_id from @next_id (post-incremented) just before
+     * @fn runs.  Static ids are section-local and referenced by nothing,
+     * so @next_id must start above every executed id already written in
+     * this segment's templates section to avoid a same-section collision.
+     * Caller supplies that high base.  Invoked by the writer after
+     * for_each_bb. */
+    void for_each_static(uint32_t &next_id,
+                         const std::function<void(BBTemplate &)> &fn);
 
     /* Diagnostic: dump a per-bucket census of the serialisable true-BB
      * cache (bb_map_) to @out, splitting the shared kernel sentinel bucket
@@ -397,6 +433,15 @@ private:
      * fix: a shared code VA in two owned processes now lands two distinct
      * templates instead of the second block silently adopting the first. */
     std::unordered_map<BBKey, BBTemplatePtr, BBKeyHash> bb_map_;
+    /* Segment-scoped STATIC true-BB templates from the executable-region
+     * sweep (static_templates=1), keyed by (asid_root, start_pc) like
+     * bb_map_.  Never executed, never referenced by a body entry; the
+     * writer serialises the subset NOT shadowed by an executed bb_map_
+     * key as extra dictionary entries carrying CST_INSN_FLAG_STATIC.
+     * Dropped wholesale by clear_bb_map at the segment boundary.  Empty
+     * (and inert) unless the sweep runs, so a trace without static
+     * templates is byte-identical. */
+    std::unordered_map<BBKey, BBTemplatePtr, BBKeyHash> static_map_;
     uint32_t                                    next_template_id_ = 1;
     uint64_t                                    spec_pending_bytes_ = 0;
     /* Current bb_map_ generation, bumped by clear_bb_map at every

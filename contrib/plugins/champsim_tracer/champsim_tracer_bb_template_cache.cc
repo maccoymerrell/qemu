@@ -217,6 +217,10 @@ void TemplateStore::life_audit_after_clear() const
 void TemplateStore::clear_bb_map()
 {
     bb_map_.clear();
+    /* Static-sweep templates are segment-scoped exactly like bb_map_ (the
+     * sweep re-mints them at the next segment open), and nothing outside
+     * this store references them, so drop them on the same boundary. */
+    static_map_.clear();
     /* TB templates hold two back-edges into the store just dropped —
      * parent_true_bb (fast-path link to the assembled true-BB) and
      * rep_subtmpl (the 1-insn REP self-loop true-BB for x86 REP
@@ -375,6 +379,96 @@ void TemplateStore::for_each_bb(const std::function<void(BBTemplate &)> &fn)
     for (const BBKey &k : keys) {
         fn(*bb_map_[k]);
     }
+}
+
+/* Defined below (shared with the commit_true_bb paths). */
+static BBTemplatePtr build_bb_template(uint32_t template_id,
+                                       uint64_t start_pc,
+                                       uint32_t n_insns,
+                                       const uint64_t *insn_pcs,
+                                       const InsnFields *insn_fields,
+                                       const uint8_t *insn_sizes,
+                                       const uint8_t *insn_bytes,
+                                       const InsnRegNames *insn_reg_names,
+                                       const char *symbol_name,
+                                       uint64_t fall_through_pc);
+
+size_t TemplateStore::static_serialisable_count() const
+{
+    /* Only static templates NOT shadowed by an executed bb_map_ entry
+     * serialise (a block that ran is carried by its bb_map_ template;
+     * dynamic wins).  Match the for_each_static filter exactly. */
+    size_t n = 0;
+    for (const auto &kv : static_map_) {
+        if (bb_map_.find(kv.first) == bb_map_.end()) {
+            n++;
+        }
+    }
+    return n;
+}
+
+void TemplateStore::for_each_static(uint32_t &next_id,
+                                    const std::function<void(BBTemplate &)> &fn)
+{
+    /* Deterministic (start_pc, asid_root) order, as for_each_bb.  Skip any
+     * static whose key is shadowed by an executed bb_map_ template — that
+     * block ran, so its bb_map_ (CODE) template is the canonical one and
+     * emitting the static twin would duplicate the start_pc in the section.
+     * Assign each survivor a fresh section-local wire id from @next_id just
+     * before serialisation: statics are referenced by nothing, so this
+     * never perturbs the executed-block ids the body depends on. */
+    std::vector<BBKey> keys;
+    keys.reserve(static_map_.size());
+    for (const auto &kv : static_map_) {
+        if (bb_map_.find(kv.first) == bb_map_.end()) {
+            keys.push_back(kv.first);
+        }
+    }
+    std::sort(keys.begin(), keys.end(), [](const BBKey &a, const BBKey &b) {
+        if (a.start_pc != b.start_pc) {
+            return a.start_pc < b.start_pc;
+        }
+        return a.asid_root < b.asid_root;
+    });
+    for (const BBKey &k : keys) {
+        BBTemplate *t = static_map_[k].get();
+        t->template_id = next_id++;
+        fn(*t);
+    }
+}
+
+BBTemplate *TemplateStore::commit_static_bb(uint64_t start_pc,
+                                            uint32_t n_insns,
+                                            const uint64_t *insn_pcs,
+                                            const InsnFields *insn_fields,
+                                            const uint8_t *insn_sizes,
+                                            const uint8_t *insn_bytes,
+                                            const InsnRegNames *insn_reg_names,
+                                            const char *symbol_name,
+                                            uint64_t fall_through_pc)
+{
+    uint64_t asid_root = store_asid_root(start_pc);
+    BBKey key{asid_root, start_pc};
+    auto it = static_map_.find(key);
+    if (it != static_map_.end()) {
+        /* Idempotent re-sweep of the same block. */
+        return it->second.get();
+    }
+
+    /* template_id 0 is a placeholder: the real wire id is assigned lazily
+     * by for_each_static so the sweep never consumes an id an executed
+     * block would otherwise take.  build_bb_template deep-copies the span
+     * payloads into the template's own pool. */
+    BBTemplatePtr tmpl = build_bb_template(/* template_id= */ 0,
+                                           start_pc, n_insns,
+                                           insn_pcs, insn_fields,
+                                           insn_sizes, insn_bytes,
+                                           insn_reg_names,
+                                           symbol_name, fall_through_pc);
+    tmpl->life = TmplLife::STATIC;
+    BBTemplate *raw = tmpl.get();
+    static_map_[key] = std::move(tmpl);
+    return raw;
 }
 
 void TemplateStore::census(std::FILE *out) const

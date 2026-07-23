@@ -488,6 +488,11 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         { CST_INSN_FLAG_LANE_PARALLEL, "CST_INSN_FLAG_LANE_PARALLEL" },
         { CST_INSN_FLAG_HAS_DEP_BLOCK, "CST_INSN_FLAG_HAS_DEP_BLOCK" },
         { CST_INSN_FLAG_SYSTEM, "CST_INSN_FLAG_SYSTEM" },
+        /* STATIC MUST stay last: advertised only when the executable-region
+         * sweep is active (g_features.static_templates) so a trace without
+         * static templates keeps the historical 7-entry insn_flag vocabulary
+         * and stays byte-identical.  The count is trimmed below. */
+        { CST_INSN_FLAG_STATIC, "CST_INSN_FLAG_STATIC" },
     };
     static const EncodingMapEntry dep_block_flag_entries[] = {
         { CST_DEP_BLOCK_HAS_REG,  "CST_DEP_BLOCK_HAS_REG" },
@@ -545,8 +550,12 @@ static void write_header_encoding_maps(BitWriter *main_bw)
     }
     write_encoding_map(&sub, "header_flag", header_flag_entries,
                        n_header_flags);
+    size_t n_insn_flags = G_N_ELEMENTS(insn_flag_entries);
+    if (!g_features.static_templates) {
+        n_insn_flags -= 1;    /* omit the trailing CST_INSN_FLAG_STATIC name */
+    }
     write_encoding_map(&sub, "insn_flag", insn_flag_entries,
-                       G_N_ELEMENTS(insn_flag_entries));
+                       n_insn_flags);
     size_t n_body_tags = G_N_ELEMENTS(body_tag_entries);
     if (!g_devio_map_active) {
         n_body_tags -= 2;   /* omit the trailing DEVIO_START / _STOP names */
@@ -789,6 +798,9 @@ static void write_insn_descriptors(BitWriter *sub, const BBTemplate *tmpl)
         if (tmpl->is_system) {
             flags |= CST_INSN_FLAG_SYSTEM;
         }
+        if (tmpl->life == TmplLife::STATIC) {
+            flags |= CST_INSN_FLAG_STATIC;
+        }
         bw_write_u8(sub, flags);
 
         bw_write_u8(sub, fld->n_src_regs);
@@ -919,9 +931,14 @@ static void write_template_profile(BitWriter *sub,
  */
 static void write_bin_templates(BitWriter *bw)
 {
-    bw_write_uleb128(bw, g_template_store.bb_count());
+    /* Count is the executed dictionary plus the never-executed STATIC
+     * templates that survive the shadow filter.  static_serialisable_count()
+     * is 0 (and every static path below a no-op) unless the executable-region
+     * sweep ran, so a trace without static_templates is byte-identical. */
+    bw_write_uleb128(bw, g_template_store.bb_count() +
+                         g_template_store.static_serialisable_count());
 
-    g_template_store.for_each_bb([bw](BBTemplate &tmpl_ref) {
+    auto write_one = [bw](BBTemplate &tmpl_ref) {
         BBTemplate *tmpl = &tmpl_ref;
         BitWriter sub;
         bw_init_buf(&sub);
@@ -950,7 +967,25 @@ static void write_bin_templates(BitWriter *bw)
         bw_byte_align(&sub);
         GByteArray *data = bw_finish_buf(&sub);
         bw_write_section(bw, data);
+    };
+
+    /* Executed templates keep their run-assigned ids (the body references
+     * them); track the high-water so the static section's lazily-assigned
+     * ids start strictly above it and cannot collide within this segment's
+     * templates section. */
+    uint32_t max_exec_id = 0;
+    g_template_store.for_each_bb([&](BBTemplate &t) {
+        if (t.template_id > max_exec_id) {
+            max_exec_id = t.template_id;
+        }
+        write_one(t);
     });
+
+    /* STATIC (never-executed) templates, in sorted start_pc order, each
+     * assigned a fresh section-local id above every executed id.  No-op
+     * when the sweep did not run. */
+    uint32_t static_next_id = max_exec_id + 1;
+    g_template_store.for_each_static(static_next_id, write_one);
 }
 
 /* ========================= Dyn param helpers ========================= */

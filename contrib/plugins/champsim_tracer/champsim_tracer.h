@@ -165,13 +165,25 @@ extern "C" {
  *   bit 0    BRANCH_COND
  *   bit 1    HAS_IMM
  *   bit 2    ATOMIC         — atomic / locked memory op
- *   bit 3    (reserved)
+ *   bit 3    STATIC         — never-executed static template (fetch/decode
+ *                             coverage of mapped-but-unexecuted code)
  *   bit 4    VEC            — per-slot lane bitmaps present
  *   bit 5    LANE_PARALLEL  — lane bitmaps line up by lane index
  *                             (consumer can model per-lane chains).
  *                             LANE_PARALLEL implies VEC.
  *   bit 6    HAS_DEP_BLOCK
  *   bit 7    SYSTEM         — privileged (non-user) execution context
+ *
+ * STATIC marks a template minted by the segment-open executable-region
+ * sweep (static_templates=1, user mode) rather than by execution: the
+ * block was fetched/decoded from a mapped executable region but never ran
+ * on the correct or wrong path.  It exists so a consumer reconstructing
+ * wrong-path fetch from the binary can resolve fall-through and branch-
+ * target PCs that an executed-only dictionary never reaches.  Uniform
+ * across the template (a whole block is static or it is not); its profile
+ * counts are zero.  A block that is both swept and later executed is
+ * carried by its executed template (no STATIC bit); the flag is never set
+ * on an executed block.  Absent from every trace without the sweep.
  *
  * SYSTEM marks instructions translated at a privilege level other
  * than user (qemu_plugin_get_priv_level() != 0): in a system-mode
@@ -193,6 +205,7 @@ extern "C" {
 #define CST_INSN_FLAG_BRANCH_COND   (1u << 0)
 #define CST_INSN_FLAG_HAS_IMM       (1u << 1)
 #define CST_INSN_FLAG_ATOMIC        (1u << 2)
+#define CST_INSN_FLAG_STATIC        (1u << 3)
 #define CST_INSN_FLAG_VEC           (1u << 4)
 #define CST_INSN_FLAG_LANE_PARALLEL (1u << 5)
 /*
@@ -769,12 +782,20 @@ typedef struct BBTemplate BBTemplate;
  *          on first correct-path execution (TemplateStore::promote).
  *          Persistent for the run; the CODE-class dedup index only
  *          ever contains CODE chains, so reclaim never touches it.
+ *   STATIC — minted by the segment-open executable-region sweep
+ *          (static_templates=1, user mode) from a mapped-but-unexecuted
+ *          block.  Never executed by construction: it lives in the
+ *          segment-scoped static_map_ (a sibling of bb_map_), carries
+ *          the CST_INSN_FLAG_STATIC wire bit, and is dropped wholesale at
+ *          clear_bb_map().  Only ever appears on static_map_ records; a
+ *          block that later executes is carried by its bb_map_ (CODE)
+ *          template, which shadows the static one at serialization.
  *
- * The third lifetime regime — segment-scoped true-BB templates — is
- * expressed by bb_map_ membership, not by this enum: bb_map_ owns its
- * records and drops them wholesale at clear_bb_map().
+ * The remaining lifetime regime — segment-scoped executed true-BB
+ * templates — is expressed by bb_map_ membership, not by this enum:
+ * bb_map_ owns its records and drops them wholesale at clear_bb_map().
  */
-enum class TmplLife : uint8_t { SPEC, CODE };
+enum class TmplLife : uint8_t { SPEC, CODE, STATIC };
 
 /*
  * Generation-stamped handle for a cross-lifetime reference INTO the
@@ -1380,6 +1401,16 @@ struct TraceFeatures {
      * user-mode trace never emits the CST_FID_*_PPAGE families and stays
      * byte-identical.  Sets CST_FLAG_PHYSADDR in the header when on. */
     bool     physaddr = false;
+    /* Static-template sweep (static_templates=1): at every segment open,
+     * linear-decode the guest's mapped executable regions and mint
+     * never-executed STATIC true-BB templates so the template dictionary
+     * covers the fall-through / branch-target space a consumer needs for
+     * trace-inferred wrong-path reconstruction.  USER MODE ONLY — forced
+     * off (with a warning) in system mode, where enumeration is a
+     * page-table walk of the owned roots (a later facility).  When on, the
+     * header advertises the trailing CST_INSN_FLAG_STATIC name; a trace
+     * without the sweep never does, so its wire is byte-identical. */
+    bool     static_templates = false;
 };
 extern TraceFeatures g_features;
 extern char *qemu_command_line;

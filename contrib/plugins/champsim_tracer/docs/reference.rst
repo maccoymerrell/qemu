@@ -1013,6 +1013,26 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        regardless of this option.  An access with no observable RAM
        translation (MMIO, or a garbage-filled wrong-path access to an
        absent page) emits no page record for that slot.
+   * - ``static_templates=0|1``
+     - ``0``
+     - Static-template sweep (**user mode only**).  When on, each segment
+       open linear-decodes the guest's mapped executable regions and mints
+       never-executed **STATIC** templates so the dictionary covers the
+       fall-through and branch-target space a *trace-inferred* wrong-path
+       consumer needs — code that is fetched and decoded on a mispredicted
+       path (predicted-not-taken fall-throughs, BTB-miss wanders) but never
+       architecturally executed, which executed-only templates cannot
+       resolve.  Static templates ride the normal templates section as
+       unreferenced dictionary entries, each instruction carrying
+       ``CST_INSN_FLAG_STATIC``; their profile counts are zero, and the
+       trace **body** is byte-identical to a run without the sweep (a block
+       that is both swept and later executed is carried by its executed
+       template, with no ``STATIC`` bit).  Fixed-width ISAs decode exactly;
+       x86 accepts data-in-text mis-decodes as inert noise at never-queried
+       PCs.  Forced **off** in system mode (enumeration there is a
+       page-table walk of the owned roots — a later facility), so a
+       system-mode trace is byte-identical regardless of this option.  See
+       :doc:`format` for the ``CST_INSN_FLAG_STATIC`` bit.
    * - ``iframe_rate=<N>``
      - ``100000``
      - Emit a validation IFRAME after every Nth observation of a CP

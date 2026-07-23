@@ -957,6 +957,8 @@ Per-instruction template flags, resolved through the ``insn_flag`` map
 - ``CST_INSN_FLAG_LANE_PARALLEL`` — lane k of each dst depends only on
   lane k of every src
 - ``CST_INSN_FLAG_HAS_DEP_BLOCK`` — intra-instruction dep mask present
+- ``CST_INSN_FLAG_STATIC`` — never-executed template from the
+  executable-region sweep; uniform across a template
 - ``CST_INSN_FLAG_SYSTEM`` — privileged (non-user) execution context;
   uniform across a template, always clear in user-mode traces
 
@@ -969,6 +971,20 @@ instruction (syscall / interrupt entry / return) seals the block.
 User-mode traces, and traces predating the flag, omit the name from the
 ``insn_flag`` map and never set the bit; a consumer resolves an absent
 name as "always user".
+
+``CST_INSN_FLAG_STATIC`` marks a template minted by the segment-open
+executable-region sweep (``static_templates=1``) rather than by
+execution: the block was fetched and decoded from a mapped executable
+region but never ran on the correct or wrong path.  It exists so a
+consumer reconstructing a wrong path from the binary can resolve
+fall-through and branch-target PCs an executed-only dictionary never
+reaches.  Static templates are unreferenced dictionary entries — no body
+record points at them — and their profile counts are zero; a block that
+is both swept and later executed is carried by its executed template,
+which never sets the bit.  Uniform across a template (a whole block is
+static or it is not).  Traces without the sweep omit the name from the
+``insn_flag`` map and never set the bit, so they are byte-identical to a
+pre-feature trace.
 
 ``dep_block_flag`` map (only inspected when ``CST_INSN_FLAG_HAS_DEP_BLOCK``
 is set on the per-insn flag byte), resolved through the

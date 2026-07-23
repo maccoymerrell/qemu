@@ -47,6 +47,26 @@ struct PluginConfig {
      * differs from the pinned value — e.g. a PTI kernel page-table base
      * — is dropped); it is byte-for-byte the pre-ownership behavior. */
     int       kexc              = 1;
+    /* Synchronous-fault handler tracing (faults=0/1, system mode).  When on
+     * (default), a synchronous fault detours execution into a handler that is
+     * traced as first-class code at its exception-nesting depth, and the
+     * interrupted basic block reassembles whole after the handler via the
+     * kernel-handler merge (today's behavior).  faults=0 EXCLUDES the handler
+     * excursion: capture is suspended across the handler exactly as an
+     * asynchronous interrupt's is, the interrupted block still emits whole
+     * (the merge is kept), but it carries no fault anchors and every entry's
+     * depth trailer stays 0.  Inert in user mode (no fault stack). */
+    int       faults            = 1;
+    /* Asynchronous-interrupt handler tracing (interrupts=0/1, system mode).
+     * When off (default), an async interrupt's whole delivery-to-return
+     * excursion is excluded — capture suspends and the interrupted flow seals
+     * against its real successor (today's behavior).  interrupts=1 TRACES the
+     * handler: its kernel basic blocks appear at exception depth >= 1 between
+     * the interrupted context's entries, attributed to the interrupted address
+     * space through the same kexc excursion-ownership machinery a synchronous
+     * fault uses.  The wire carries it through the existing depth trailer — no
+     * new records.  Inert in user mode (no asynchronous interrupts). */
+    int       interrupts        = 0;
     /* Block-device (disk) I/O records (devio=0/1, system mode only).
      * When on (default), the plugin brackets disk requests in the body
      * stream with DEVIO_START/STOP records (system emulation only; a

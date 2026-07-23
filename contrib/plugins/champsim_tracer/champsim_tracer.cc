@@ -6850,6 +6850,20 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      * it wired verbatim rather than mode-gated. */
     g_features.kexc = cfg.kexc != 0;
 
+    /* Independent synchronous-fault / asynchronous-interrupt handler tracing.
+     * Both are system-mode concepts: faults ride the depth-trailer machinery
+     * (fault_depth_trailer) and interrupts ride the async-window machinery,
+     * neither of which exists in user mode.  trace_faults defaults on (today's
+     * behavior); trace_interrupts defaults off and is forced off in user mode
+     * so a user-mode trace is byte-identical regardless of the requested
+     * value. */
+    g_features.trace_faults = cfg.faults != 0;
+    g_features.trace_interrupts = (cfg.interrupts != 0) && g_system_mode;
+    if (cfg.interrupts != 0 && !g_system_mode) {
+        fprintf(stderr, "champsim_tracer: interrupts=1 ignored in user mode "
+                "(no asynchronous-interrupt delivery exists)\n");
+    }
+
     /* Physical-page capture is SYSTEM-MODE ONLY: qemu_plugin_get_hwaddr
      * returns NULL for linux-user, so there is no translation to record.
      * Forcing it off in user mode keeps user-mode traces byte-identical

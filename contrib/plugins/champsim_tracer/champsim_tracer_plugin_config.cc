@@ -91,6 +91,18 @@ bool set_kexc(PluginConfig *cfg, const char *v)
     return cfg->kexc == 0 || cfg->kexc == 1;
 }
 
+bool set_faults(PluginConfig *cfg, const char *v)
+{
+    cfg->faults = atoi(v);
+    return cfg->faults == 0 || cfg->faults == 1;
+}
+
+bool set_interrupts(PluginConfig *cfg, const char *v)
+{
+    cfg->interrupts = atoi(v);
+    return cfg->interrupts == 0 || cfg->interrupts == 1;
+}
+
 bool set_devio(PluginConfig *cfg, const char *v)
 {
     cfg->devio = atoi(v);
@@ -332,6 +344,8 @@ const struct {
     { "wp_memdata", set_wp_memdata },
     { "wp_regdata", set_wp_regdata },
     { "kexc",       set_kexc       },
+    { "faults",     set_faults     },
+    { "interrupts", set_interrupts },
     { "devio",      set_devio      },
     { "physaddr",   set_physaddr   },
     { "static_templates", set_static_templates },

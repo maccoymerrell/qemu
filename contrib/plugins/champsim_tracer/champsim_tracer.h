@@ -1386,6 +1386,25 @@ struct TraceFeatures {
      * kernel-privilege depth machinery — decoupled from the wrong-path
      * fault-poisoning policy below, which runs in BOTH modes. */
     bool     fault_depth_trailer = false;
+    /* Synchronous-fault handler tracing (faults=1, default).  Orthogonal to
+     * fault_depth_trailer, which gates the depth-trailer WIRE machinery and
+     * the kernel-handler merge in system mode: when trace_faults is off
+     * (faults=0) that machinery still runs — the interrupted BB reassembles
+     * whole through the merge — but the handler blocks are capture-suppressed
+     * and every emitted entry is de-anchored and clamped to depth 0, so a
+     * synchronous fault's handler excursion is excluded exactly as an async
+     * interrupt's is.  Meaningful only where fault_depth_trailer is on. */
+    bool     trace_faults = true;
+    /* Asynchronous-interrupt handler tracing (interrupts=1).  Off by default:
+     * an async excursion suspends (the handler is excluded, the interrupted
+     * flow seals against its real successor).  When on, the async handler is
+     * CAPTURED — its kernel blocks ride the fault depth trailer at exception
+     * depth >= 1 (a captured async window contributes one level, added to any
+     * live synchronous-fault nesting) and the interrupted block seals against
+     * the departure PC so no phantom edge runs through the handler entry.
+     * System mode only (forced off in user mode, where no async delivery
+     * exists), so a user-mode trace is byte-identical regardless. */
+    bool     trace_interrupts = false;
     /* Wrong-path SYNTHETIC-FAULT marking policy: when set, a speculative
      * memory access to an absent/unreadable page — served a deterministic
      * placeholder value instead of real memory (accel/tcg garbage-fill seam) —

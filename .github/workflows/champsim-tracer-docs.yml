@@ -1,7 +1,7 @@
 # Build the champsim_tracer Sphinx docs and deploy to GitHub Pages.
 #
 # Triggered on pushes to champsim-trace that touch the docs source or
-# the format/basic-block markdown next to the plugin.
+# the basic-block markdown next to the plugin.
 #
 # REQUIRED REPO SETTING: Settings -> Pages -> "Build and deployment"
 #                        -> "Source: GitHub Actions"
@@ -19,7 +19,6 @@ on:
     branches: [champsim-trace]
     paths:
       - 'contrib/plugins/champsim_tracer/docs/**'
-      - 'contrib/plugins/champsim_tracer/champsim_tracer_format.md'
       - 'contrib/plugins/champsim_tracer/basic_block.md'
       - '.github/workflows/champsim-tracer-docs.yml'
   workflow_dispatch: {}

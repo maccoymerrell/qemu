@@ -586,8 +586,7 @@ issuing vCPU.  Non-virtio disks (IDE/AHCI) and kernel-internal I/O
 always use the positional fallback.  An initramfs-only guest with no
 ``-drive`` produces no disk traffic and therefore no ``DEVIO`` records
 — the trace is otherwise identical.  See the ``devio`` option in
-:doc:`reference` and the record layout in
-``champsim_tracer_format.md`` (§4.1b).
+:doc:`reference` and the record layout in :doc:`format` (§4.1b).
 
 **Physical-page records (optional).**  ``physaddr=1`` adds the physical
 **page** base of every load and store via the ``CST_FID_LOAD_PPAGE`` /

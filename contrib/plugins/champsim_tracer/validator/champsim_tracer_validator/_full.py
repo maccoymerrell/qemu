@@ -131,6 +131,7 @@ FEATURES: dict[str, str] = {
     "behavior:addr_is_data":     "aarch64 tagged-pointer data-is-address heuristic",
     "behavior:wire_determinism": "byte-for-byte reproducible wire (golden net)",
     "behavior:mutation_strictness": "oracle catches deliberate trace corruption (mutation matrix)",
+    "behavior:wrong_path_coverage": "static_templates=1: never-executed fall-through + BTB target template coverage (4-ISA)",
 }
 
 
@@ -661,6 +662,124 @@ def _chk_options_smoke(ctx: Ctx) -> Outcome:
                    f"audit[{asum}] strict_rc={src_rc}", subs)
 
 
+def _static_cov_analyze(cst: Path):
+    """Decode @cst and score the static-template coverage oracle.  Returns a
+    dict of the four load-bearing quantities plus a human summary."""
+    from . import validator as V
+    meta, templates, _entries = V._load_decoder().decode_champsim_tracer(cst)
+    bt_names = meta.get("encoding_maps", {}).get("branch_type", {})
+    starts = {int(t["start_pc"]) for t in templates}
+    exec_ft: set[int] = set()
+    static_ft: set[int] = set()
+    btb_res = 0
+    btb_tot = 0
+    n_static = 0
+    for t in templates:
+        insns = t.get("insns") or []
+        if not insns:
+            continue
+        prof = t.get("profile") or {}
+        is_exec = (int(prof.get("exec_cp", 0)) > 0 or
+                   int(prof.get("exec_wp", 0)) > 0)
+        if not is_exec:
+            n_static += 1
+        last = insns[-1]
+        bname = bt_names.get(int(last.get("branch_type", 0)), "")
+        ft = int(t["fall_through_pc"])
+        # Fall-through coverage: the not-taken successor of a conditional
+        # direct branch must resolve to a template start_pc.
+        if last.get("branch_conditional") and bname == "BRANCH_COND_DIRECT":
+            (exec_ft if is_exec else static_ft).add(ft)
+        # BTB coverage: a NEVER-executed direct branch/jump/call's decoded
+        # target must resolve — the never-executed destination space.
+        if not is_exec and bname in ("BRANCH_DIRECT_JUMP",
+                                     "BRANCH_DIRECT_CALL",
+                                     "BRANCH_COND_DIRECT"):
+            for tg in (t.get("target_pcs") or []):
+                btb_tot += 1
+                if int(tg) in starts:
+                    btb_res += 1
+    exec_unres = sum(1 for f in exec_ft if f not in starts)
+    static_res = sum(1 for f in static_ft if f in starts)
+    return {
+        "n_templates": len(templates),
+        "n_static": n_static,
+        "exec_ft": len(exec_ft),
+        "exec_unres": exec_unres,
+        "static_ft": len(static_ft),
+        "static_res": static_res,
+        "btb_res": btb_res,
+        "btb_tot": btb_tot,
+    }
+
+
+def _chk_static_coverage(ctx: Ctx) -> Outcome:
+    """Coverage oracle for static_templates=1 (trace-inferred wrong-path
+    fall-through / BTB coverage) — the point of the feature.
+
+    Per ISA, with the executable-region sweep ON:
+      (a) every EXECUTED conditional-branch block's fall-through resolves to a
+          template start_pc  (dictionary self-consistency; a deleted/mutated
+          template breaks it),
+      (b) NEVER-EXECUTED (static) conditional-branch fall-throughs are covered
+          (>0)  — the predicted-not-taken space executed-only templates miss,
+      (c) never-executed direct-branch TARGETS resolve (BTB spot-check).
+    The disabled-sweep (static_templates=0) run must lose (b) entirely
+    (static_res == 0), proving the oracle has teeth.
+    """
+    from . import __main__ as M
+    from . import generator as G
+
+    subs: list = []
+    all_ok = True
+    for isa in ISA_ALL:
+        d = ctx.dir(f"feat_wp_coverage_{isa}")
+        cc = M.ISA_COMPILER.get(isa)
+        if not cc:
+            subs.append({"name": isa, "ok": True, "detail": "skip (no compiler)"})
+            continue
+        params = G.GenerateParams(seed=ctx.seed, isa=isa, num_diamonds=8,
+                                  hot_iters=200)
+        src, _m = G.generate(params, d, f"wpc_{isa}")
+        binp = d / f"wpc_{isa}"
+        bcmd = [cc] + M.ISA_CFLAGS[isa] + ["-O1", str(src), "-o", str(binp)]
+        if subprocess.call(bcmd) != 0:
+            subs.append({"name": isa, "ok": True, "detail": "skip (build failed)"})
+            continue
+        qemu = ctx.build_dir / f"qemu-{isa}"
+        win = "trace_window=icount:start=0;stop=200000"
+        on = d / f"wpc_{isa}_on"
+        off = d / f"wpc_{isa}_off"
+        rc1 = subprocess.call([str(qemu), "-plugin",
+            f"{ctx.plugin},outfile={on},wpdepth=32,{win},memdata=1,"
+            f"static_templates=1", str(binp)])
+        rc0 = subprocess.call([str(qemu), "-plugin",
+            f"{ctx.plugin},outfile={off},wpdepth=32,{win},memdata=1",
+            str(binp)])
+        con = Path(f"{on}.cst")
+        coff = Path(f"{off}.cst")
+        if rc1 != 0 or rc0 != 0 or not con.is_file() or not coff.is_file():
+            subs.append({"name": isa, "ok": False,
+                         "detail": f"trace rc on={rc1} off={rc0}"})
+            all_ok = False
+            continue
+        a_on = _static_cov_analyze(con)
+        a_off = _static_cov_analyze(coff)
+        ok = (a_on["exec_unres"] == 0 and     # (a) self-consistency
+              a_on["static_res"] > 0 and      # (b) never-executed FT coverage
+              a_on["btb_res"] > 0 and         # (c) BTB targets resolve
+              a_off["static_res"] == 0)       # catch: disabled sweep loses (b)
+        all_ok = all_ok and ok
+        subs.append({"name": isa, "ok": ok, "detail": (
+            f"exec_ft={a_on['exec_ft']} unres={a_on['exec_unres']} | "
+            f"static({a_on['n_static']}) ft_resolved={a_on['static_res']} | "
+            f"btb={a_on['btb_res']}/{a_on['btb_tot']} | "
+            f"catch off_static_res={a_off['static_res']}")})
+    return Outcome("pass" if all_ok else "fail",
+                   "static_templates fall-through + BTB coverage (4 ISAs, "
+                   "disabled-sweep catch)", subs)
+
+
 # ===========================================================================
 # The check table.  features[] is the coverage claim for each check.
 # ===========================================================================
@@ -802,6 +921,9 @@ def build_checks() -> list:
     C.append(Check("features.mutation_strictness", "features",
                    "adversarial mutation matrix: oracle catches corruption",
                    ["behavior:mutation_strictness"], _chk_mutation))
+    C.append(Check("features.wrong_path_coverage", "features",
+                   "static_templates=1 fall-through/BTB coverage oracle (4-ISA)",
+                   ["behavior:wrong_path_coverage"], _chk_static_coverage))
     return C
 
 

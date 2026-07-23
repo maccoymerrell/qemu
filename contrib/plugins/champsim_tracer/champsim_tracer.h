@@ -1401,15 +1401,18 @@ struct TraceFeatures {
      * user-mode trace never emits the CST_FID_*_PPAGE families and stays
      * byte-identical.  Sets CST_FLAG_PHYSADDR in the header when on. */
     bool     physaddr = false;
-    /* Static-template sweep (static_templates=1): at every segment open,
+    /* Static-template sweep (static_templates=1): at segment open,
      * linear-decode the guest's mapped executable regions and mint
      * never-executed STATIC true-BB templates so the template dictionary
      * covers the fall-through / branch-target space a consumer needs for
-     * trace-inferred wrong-path reconstruction.  USER MODE ONLY — forced
-     * off (with a warning) in system mode, where enumeration is a
-     * page-table walk of the owned roots (a later facility).  When on, the
-     * header advertises the trailing CST_INSN_FLAG_STATIC name; a trace
-     * without the sweep never does, so its wire is byte-identical. */
+     * trace-inferred wrong-path reconstruction.  A region mapped or
+     * granted execute permission later — a dynamically-loaded library, a
+     * JIT code page — is swept too, on the next correct-path TB exec after
+     * the mapping/mprotect that created it.  USER MODE ONLY — forced off
+     * (with a warning) in system mode, where enumeration is a page-table
+     * walk of the owned roots (a later facility).  When on, the header
+     * advertises the trailing CST_INSN_FLAG_STATIC name; a trace without
+     * the sweep never does, so its wire is byte-identical. */
     bool     static_templates = false;
 };
 extern TraceFeatures g_features;

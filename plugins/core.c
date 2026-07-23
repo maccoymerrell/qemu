@@ -100,6 +100,29 @@ void qemu_plugin_devio_stop(uint64_t request_id)
     }
 }
 
+/*
+ * Executable-region-growth hook (qemu_plugin_register_exec_region_grew_cb).
+ * Single slot, same reasoning as the ASID-write and devio hooks above.  The
+ * dispatch entry point is called from accel/tcg/user-exec.c's
+ * page_set_flags, which exists only in linux-user builds (CONFIG_USER_ONLY);
+ * system builds compile user-exec-stub.c instead, so under system emulation
+ * this hook is a registered-but-never-fired no-op.
+ */
+static qemu_plugin_exec_region_grew_cb_t exec_region_grew_hook;
+
+void qemu_plugin_register_exec_region_grew_cb(qemu_plugin_id_t id,
+                                              qemu_plugin_exec_region_grew_cb_t cb)
+{
+    exec_region_grew_hook = cb;
+}
+
+void qemu_plugin_exec_region_grew(uint64_t start, uint64_t end)
+{
+    if (exec_region_grew_hook) {
+        exec_region_grew_hook(start, end);
+    }
+}
+
 void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
                          uint32_t depth_after)
 {

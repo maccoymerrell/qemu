@@ -64,9 +64,10 @@ struct PluginConfig {
      * on, every segment open linear-decodes the guest's mapped executable
      * regions and mints never-executed STATIC true-BB templates so the
      * template dictionary covers the fall-through / branch-target space a
-     * trace-inferred wrong-path consumer needs.  Off by default;
-     * warned-and-ignored in system mode (P2 page-table-walk enumeration is
-     * a later facility). */
+     * trace-inferred wrong-path consumer needs; a region mapped or granted
+     * execute permission later (dlopen, JIT) is swept too, as it appears.
+     * Off by default; warned-and-ignored in system mode (P2
+     * page-table-walk enumeration is a later facility). */
     int       static_templates  = 0;
     /* Per-template IFRAME trigger interval.  0 disables. */
     uint32_t  iframe_rate         = 100000;

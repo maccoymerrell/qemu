@@ -1022,7 +1022,13 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        consumer needs — code that is fetched and decoded on a mispredicted
        path (predicted-not-taken fall-throughs, BTB-miss wanders) but never
        architecturally executed, which executed-only templates cannot
-       resolve.  Static templates ride the normal templates section as
+       resolve.  A region that gains execute permission *after* the
+       segment-open sweep already ran — a dynamically-loaded library, a JIT
+       code page — is swept too: the plugin hooks linux-user's
+       mmap/mprotect path and resweeps just that region on the next
+       correct-path step, so dlopen'd libraries and JIT-compiled code reach
+       the same fall-through/branch-target coverage as the binary mapped at
+       open.  Static templates ride the normal templates section as
        unreferenced dictionary entries, each instruction carrying
        ``CST_INSN_FLAG_STATIC``; their profile counts are zero, and the
        trace **body** is byte-identical to a run without the sweep (a block

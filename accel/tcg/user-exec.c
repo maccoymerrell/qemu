@@ -39,6 +39,7 @@
 #include "internal-target.h"
 #include "tb-internal.h"
 #include "qemu/qemu-plugin.h"
+#include "qemu/plugin.h"
 
 __thread uintptr_t helper_retaddr;
 
@@ -668,6 +669,19 @@ void page_set_flags(target_ulong start, target_ulong last, int flags)
     }
     if (inval_tb) {
         tb_invalidate_phys_range(start, last);
+    }
+
+    /*
+     * Notify a registered plugin hook whenever this call grants execute
+     * permission — the chokepoint every mapping/mprotect path (target_mmap,
+     * target_mprotect, shmat, the ELF loader's PT_LOAD / vsyscall / commpage
+     * setup) funnels through.  Cheap when unregistered (a null
+     * function-pointer check in qemu_plugin_exec_region_grew); a registered
+     * hook is expected to queue the range rather than do work inline, since
+     * this runs with mmap_lock held.
+     */
+    if (flags & PAGE_EXEC) {
+        qemu_plugin_exec_region_grew(start, last + 1);
     }
 }
 

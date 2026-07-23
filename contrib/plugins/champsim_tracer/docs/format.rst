@@ -972,10 +972,12 @@ User-mode traces, and traces predating the flag, omit the name from the
 ``insn_flag`` map and never set the bit; a consumer resolves an absent
 name as "always user".
 
-``CST_INSN_FLAG_STATIC`` marks a template minted by the segment-open
-executable-region sweep (``static_templates=1``) rather than by
-execution: the block was fetched and decoded from a mapped executable
-region but never ran on the correct or wrong path.  It exists so a
+``CST_INSN_FLAG_STATIC`` marks a template minted by the executable-region
+sweep (``static_templates=1`` — armed at segment open, and again for any
+region that gains execute permission afterward, such as a dynamically
+loaded library) rather than by execution: the block was fetched and
+decoded from a mapped executable region but never ran on the correct or
+wrong path.  It exists so a
 consumer reconstructing a wrong path from the binary can resolve
 fall-through and branch-target PCs an executed-only dictionary never
 reaches.  Static templates are unreferenced dictionary entries — no body

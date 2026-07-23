@@ -2228,6 +2228,16 @@ static uint64_t g_seg_warmup_end_arch_insns = UINT64_MAX;
  * branch-target space a trace-inferred wrong-path consumer needs but
  * executed-only templates never reach.  Cost is one-time per segment open;
  * nothing here touches the execution hot path.
+ *
+ * A region mapped or granted execute permission AFTER the segment-open
+ * sweep already ran — a dynamically-loaded library, a JIT code page — is
+ * covered too: qemu_plugin_exec_region_grew (registered as
+ * static_sweep_region_grew_cb) fires from the linux-user mmap/mprotect
+ * path whenever a call grants PAGE_EXEC, queues the range, and the next CP
+ * TB exec resweeps just that range (run_static_template_resweep).  The
+ * notify callback itself is off the execution hot path (it runs from
+ * syscall emulation, not TB exec); the hot path only pays for a cheap
+ * atomic-flag check per TB.
  * ============================================================ */
 
 /* Per-run and process-wide sweep accounting (reported at segment finish /
@@ -2242,6 +2252,8 @@ struct StaticSweepStats {
     uint64_t desync_reseeds = 0;  /* runs abandoned on a decode desync      */
     uint64_t targets_seeded = 0;  /* direct-branch targets queued as seeds  */
     uint64_t cap_hits      = 0;   /* sweeps that hit the per-sweep insn cap */
+    uint64_t late_events   = 0;   /* exec_region_grew notifications queued  */
+    uint64_t late_resweeps = 0;   /* late-mapping regions actually resweapt */
     double   seconds       = 0.0; /* cumulative wall time                   */
 };
 static StaticSweepStats g_static_sweep;
@@ -2258,6 +2270,17 @@ static bool g_static_sweep_armed = false;
 static constexpr uint64_t CST_STATIC_SWEEP_INSN_CAP = 16ull * 1024 * 1024;
 static constexpr uint32_t CST_STATIC_BB_MAX_INSNS   = 4096;
 
+/* Consecutive zero-progress desyncs (no instruction decoded between two
+ * resync steps) that abandon the rest of a seed's linear scan.  Ordinary
+ * data-in-text noise recovers within a handful of bytes (n > 0 resets the
+ * run); this bounds the pathological case a late resweep can hit that the
+ * segment-open sweep cannot — a region queued by
+ * qemu_plugin_exec_region_grew and unmapped again before the drain runs,
+ * where every decode in [seed, reg->end) fails and the CST_STATIC_SWEEP_
+ * INSN_CAP above (an insns-decoded budget) never trips because nothing
+ * decodes. */
+static constexpr uint32_t CST_STATIC_STALE_DESYNC_LIMIT = 256;
+
 namespace {
 struct SweepRegion { uint64_t start; uint64_t end; };
 }
@@ -2269,6 +2292,33 @@ static int static_sweep_collect_cb(void *userp, uint64_t start, uint64_t end)
     auto *out = static_cast<std::vector<SweepRegion> *>(userp);
     out->push_back({start, end});
     return 0;
+}
+
+/* Late-mapping resweep queue (static_templates=1).  qemu_plugin_exec_region_
+ * grew fires from the linux-user mmap/mprotect path (page_set_flags), with
+ * the guest's mmap_lock held, whenever a call grants PAGE_EXEC over a
+ * range — a region mapped after the segment-open sweep already ran (a
+ * dynamically-loaded library, a JIT code page).  The notify callback only
+ * pushes the range here; g_pending_sweep_lock is a leaf lock never held
+ * across a guest-memory read or exec_lock/data_lock acquisition, so it
+ * cannot invert the mmap_lock-before-data_lock order the segment-open sweep
+ * documents.  The queue is drained on the owning vCPU's next CP TB exec
+ * (events_path_step), where exec_lock is already held and a normal (not
+ * recursively-locked) call into the decode pipeline is safe. */
+static GMutex g_pending_sweep_lock;
+static std::vector<SweepRegion> g_pending_sweep_regions;
+static std::atomic<bool> g_pending_sweep_nonempty{false};
+
+/* Registered as the qemu_plugin_register_exec_region_grew_cb hook (armed
+ * only when static_templates is on — see qemu_plugin_install).  Must stay
+ * cheap: it runs on whatever thread is servicing the guest's mmap/mprotect
+ * syscall, with the linux-user mmap_lock held. */
+static void static_sweep_region_grew_cb(uint64_t start, uint64_t end)
+{
+    g_mutex_lock(&g_pending_sweep_lock);
+    g_pending_sweep_regions.push_back({start, end});
+    g_mutex_unlock(&g_pending_sweep_lock);
+    g_pending_sweep_nonempty.store(true, std::memory_order_release);
 }
 
 /* True iff @bt is a control-transfer that carries an architectural delay
@@ -2289,26 +2339,18 @@ static bool static_sweep_has_delay_slot(uint8_t bt, const char *mnem)
 }
 
 /*
- * Sweep every mapped executable region and mint STATIC true-BB templates.
+ * Sweep @regions and mint STATIC true-BB templates.  Shared by the
+ * segment-open sweep (run_static_template_sweep, @late false, every
+ * currently-mapped region) and the late-mapping resweep
+ * (run_static_template_resweep, @late true, only regions notified via
+ * qemu_plugin_exec_region_grew after the segment-open sweep already ran).
  * Caller holds exec_lock and guarantees: static_templates on, user mode, a
- * live executing vCPU (current_cpu valid).  Grabs data_lock around the
- * static_map_ mutations, matching the dynamic commit paths.
+ * live executing vCPU (current_cpu valid), cst_cap_arch resolved, @regions
+ * non-empty.  Grabs data_lock around the static_map_ mutations, matching
+ * the dynamic commit paths.
  */
-static void run_static_template_sweep(void)
+static void sweep_regions(const std::vector<SweepRegion> &regions, bool late)
 {
-    if (cst_cap_arch < 0) {
-        return;   /* no Capstone arch for this ISA — cannot decode */
-    }
-    /* cst_cap_mode is resolved in the first vcpu_init_cb, which precedes any
-     * TB exec (and thus this sweep); a legitimately-zero mode
-     * (CS_MODE_LITTLE_ENDIAN == 0 for AArch64) is correct, not "unresolved". */
-
-    std::vector<SweepRegion> regions;
-    qemu_plugin_walk_exec_regions(static_sweep_collect_cb, &regions);
-    if (regions.empty()) {
-        return;
-    }
-
     GTimer *timer = g_timer_new();
 
     const bool delay_isa = isa_properties[trace_isa].branch_delay_slots > 0;
@@ -2450,6 +2492,7 @@ static void run_static_template_sweep(void)
          * undecodable bytes (x86 desync, data in text).  Stop early if the
          * scan reaches a BB start an earlier scan already covered. */
         uint64_t cur = seed;
+        uint32_t stale_run = 0;
         while (cur < reg->end && swept < CST_STATIC_SWEEP_INSN_CAP) {
             if (visited.count(cur)) {
                 break;   /* the remainder of this line is already covered */
@@ -2501,6 +2544,7 @@ static void run_static_template_sweep(void)
             }
 
             if (n > 0) {
+                stale_run = 0;
                 /* Commit the block: sealed → fall-through is the post-branch
                  * PC; unterminated (desync mid-block, region end, or length
                  * cap) → the next linear PC.  data_lock scopes ONLY the
@@ -2534,6 +2578,23 @@ static void run_static_template_sweep(void)
                  * (When n == 0, cur == bb_start.) */
                 g_static_sweep.desync_reseeds++;
                 cur += resync_step;
+                /* late-only: the segment-open sweep's region list is fresh
+                 * from the walk it just performed, so it cannot go stale
+                 * mid-scan the way a queued late-resweep region can (see
+                 * CST_STATIC_STALE_DESYNC_LIMIT).  Scoping the abandon to
+                 * @late keeps run_static_template_sweep's output exactly as
+                 * measured before this resweep path existed. */
+                if (late && n == 0 &&
+                    ++stale_run >= CST_STATIC_STALE_DESYNC_LIMIT) {
+                    /* CST_STATIC_STALE_DESYNC_LIMIT consecutive desyncs with
+                     * no successful decode between them: this is not
+                     * data-in-text noise (which recovers within a handful
+                     * of bytes and resets stale_run above) — abandon the
+                     * rest of this seed's scan rather than stepping
+                     * byte-by-byte to reg->end for a region unmapped again
+                     * before the drain ran. */
+                    break;
+                }
             }
             /* else cur already sits at the fall-through / next-BB start. */
         }
@@ -2542,13 +2603,87 @@ static void run_static_template_sweep(void)
 
     g_byte_array_free(win, TRUE);
 
-    g_static_sweep.sweeps++;
+    if (late) {
+        g_static_sweep.late_resweeps += regions.size();
+    } else {
+        g_static_sweep.sweeps++;
+    }
     g_static_sweep.insns += swept;
     if (cap_hit) {
         g_static_sweep.cap_hits++;
     }
     g_static_sweep.seconds += g_timer_elapsed(timer, nullptr);
     g_timer_destroy(timer);
+}
+
+/*
+ * Segment-open sweep: enumerate every currently-mapped executable region
+ * via qemu_plugin_walk_exec_regions and sweep all of them.  See
+ * sweep_regions() for the caller contract (exec_lock held, etc.).
+ */
+static void run_static_template_sweep(void)
+{
+    if (cst_cap_arch < 0) {
+        return;   /* no Capstone arch for this ISA — cannot decode */
+    }
+    /* cst_cap_mode is resolved in the first vcpu_init_cb, which precedes any
+     * TB exec (and thus this sweep); a legitimately-zero mode
+     * (CS_MODE_LITTLE_ENDIAN == 0 for AArch64) is correct, not "unresolved". */
+
+    std::vector<SweepRegion> regions;
+    qemu_plugin_walk_exec_regions(static_sweep_collect_cb, &regions);
+    if (regions.empty()) {
+        return;
+    }
+    sweep_regions(regions, /*late=*/false);
+}
+
+/*
+ * Late-mapping resweep: drain the queue static_sweep_region_grew_cb filled
+ * (a linux-user mmap/mprotect grants execute permission after the
+ * segment-open sweep already ran — a dynamically-loaded library, a JIT code
+ * page) and sweep just those regions.  Runs from events_path_step, on the
+ * owning vCPU's next CP TB exec after the notification, with exec_lock
+ * already held — see sweep_regions() for the rest of the caller contract.
+ *
+ * Batch dedup only: exact-duplicate (start, end) pairs queued between two
+ * drains collapse to one sweep.  A region swept in an earlier drain is not
+ * excluded from a later one — a re-mprotect'd JIT page legitimately may
+ * carry new code, and commit_static_bb's own key dedup makes resweeping
+ * unchanged content a cheap no-op rather than a correctness hazard.
+ */
+static void run_static_template_resweep(void)
+{
+    if (cst_cap_arch < 0) {
+        g_mutex_lock(&g_pending_sweep_lock);
+        g_pending_sweep_regions.clear();
+        g_mutex_unlock(&g_pending_sweep_lock);
+        g_pending_sweep_nonempty.store(false, std::memory_order_relaxed);
+        return;
+    }
+
+    std::vector<SweepRegion> batch;
+    g_mutex_lock(&g_pending_sweep_lock);
+    batch.swap(g_pending_sweep_regions);
+    g_mutex_unlock(&g_pending_sweep_lock);
+    g_pending_sweep_nonempty.store(false, std::memory_order_relaxed);
+    if (batch.empty()) {
+        return;
+    }
+    g_static_sweep.late_events += batch.size();
+
+    std::sort(batch.begin(), batch.end(),
+             [](const SweepRegion &a, const SweepRegion &b) {
+                 return a.start != b.start ? a.start < b.start
+                                            : a.end < b.end;
+             });
+    batch.erase(std::unique(batch.begin(), batch.end(),
+                            [](const SweepRegion &a, const SweepRegion &b) {
+                                return a.start == b.start && a.end == b.end;
+                            }),
+               batch.end());
+
+    sweep_regions(batch, /*late=*/true);
 }
 
 static void start_trace_segment(const char *label,
@@ -4411,6 +4546,17 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     if (g_static_sweep_armed) {
         g_static_sweep_armed = false;
         run_static_template_sweep();
+    }
+
+    /* Late-mapping resweep: a cheap atomic-flag check on every CP TB exec
+     * (the notify callback is the only writer, release/acquire-paired), so
+     * this costs nothing when static_templates is off or no exec-region-
+     * grew notification is pending — the actual decode work only runs when
+     * the flag is set.  run_static_template_resweep grabs data_lock
+     * internally for the static_map_ mutation, same as the segment-open
+     * sweep above. */
+    if (g_pending_sweep_nonempty.load(std::memory_order_acquire)) {
+        run_static_template_resweep();
     }
 
     /* Address-space pin + count set (marker mode only — pinned !=
@@ -6549,11 +6695,14 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
             "Static-template sweep: sweeps=%" PRIu64 " regions=%" PRIu64
             " region_bytes=%" PRIu64 " insns=%" PRIu64 " static_bbs=%" PRIu64
             " desync_reseeds=%" PRIu64 " targets_seeded=%" PRIu64
-            " cap_hits=%" PRIu64 " time=%.3fs (%.1f MB/s over %.2f MiB)\n",
+            " cap_hits=%" PRIu64 " late_events=%" PRIu64
+            " late_resweeps=%" PRIu64
+            " time=%.3fs (%.1f MB/s over %.2f MiB)\n",
             g_static_sweep.sweeps, g_static_sweep.regions,
             g_static_sweep.region_bytes, g_static_sweep.insns,
             g_static_sweep.bbs, g_static_sweep.desync_reseeds,
             g_static_sweep.targets_seeded, g_static_sweep.cap_hits,
+            g_static_sweep.late_events, g_static_sweep.late_resweeps,
             g_static_sweep.seconds, mbps, mb);
     }
 
@@ -6919,6 +7068,16 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     qemu_plugin_register_flush_cb(id, vcpu_tb_flush);
     qemu_plugin_register_vcpu_init_cb(id, vcpu_init_cb);
     qemu_plugin_register_atexit_cb(id, plugin_exit, nullptr);
+    if (g_features.static_templates) {
+        /* Late-mapping coverage for the static-template sweep: a mapping/
+         * mprotect that grants execute permission after the segment-open
+         * sweep already ran (a dynamically-loaded library, a JIT code
+         * page) queues its range here instead of going uncovered until the
+         * next segment open.  User-mode only by construction — the
+         * dispatch call site lives in accel/tcg/user-exec.c, which system
+         * builds do not compile. */
+        qemu_plugin_register_exec_region_grew_cb(id, static_sweep_region_grew_cb);
+    }
     if (g_system_mode) {
         /* Keep the per-vCPU asid_match flag current from the
          * architectural ASID-write commit points (fires even while the

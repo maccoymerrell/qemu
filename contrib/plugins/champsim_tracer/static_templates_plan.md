@@ -79,6 +79,50 @@ Profile counts stay 0 (never executed). A defensive per-BB length cap
 (`CST_STATIC_BB_MAX_INSNS`, 4096) and a per-sweep instruction cap
 (`CST_STATIC_SWEEP_INSN_CAP`, 16M) bound the work.
 
+### Late-mapping resweep
+
+The segment-open sweep only sees what is mapped at that instant. Code
+mapped afterward — a `dlopen`'d shared library, a JIT code page — needs its
+own trigger, not another full segment-open-style walk: `page_set_flags`
+(`accel/tcg/user-exec.c`) is the single chokepoint every linux-user mapping
+path funnels through (`target_mmap`, `target_mprotect`, `shmat`, the ELF
+loader's executable `PT_LOAD` / vsyscall / commpage setup), so it is where
+QEMU notifies a registered plugin hook whenever a call grants `PAGE_EXEC`
+over a range. This is exposed as a small, dedicated plugin API —
+`qemu_plugin_register_exec_region_grew_cb` (`qemu_plugin_exec_region_grew`
+is the dispatch entry point, mirroring the single-slot shape of the
+ASID-write and devio hooks in `plugins/core.c`) — rather than growing
+`qemu_plugin_walk_exec_regions` into something pollable, since the plugin
+needs to learn about *new* regions as they appear, not re-enumerate
+everything on a schedule.
+
+The hook runs on whatever thread is servicing the guest's mmap/mprotect
+syscall, with the linux-user `mmap_lock` held, so the callback
+(`static_sweep_region_grew_cb`) only pushes the range onto a queue —
+`g_pending_sweep_regions`, guarded by a dedicated leaf lock never held
+across a guest-memory read or `exec_lock`/`data_lock` acquisition. The
+queue drains on the owning vCPU's next correct-path TB exec
+(`events_path_step`), where `exec_lock` is already held: a cheap
+atomic-flag check costs nothing on the hot path when nothing is pending,
+and `run_static_template_resweep` reuses the segment-open sweep's decode
+core (factored out as `sweep_regions`) scoped to just the queued ranges,
+sharing its caps, its `commit_static_bb` dedup, and its stats. Duplicate
+`(start, end)` pairs queued between two drains collapse to one sweep; a
+region swept in an earlier drain is not otherwise excluded from a later
+one, since a re-mprotect'd JIT page may legitimately carry new code, and
+resweeping unchanged content is a cheap no-op via `commit_static_bb`'s own
+key dedup rather than a correctness hazard. A region unmapped again before
+its queued drain runs — the one race a purely synchronous, walk-then-sweep
+design cannot hit — is bounded by `CST_STATIC_STALE_DESYNC_LIMIT`
+consecutive zero-progress desyncs, so an abandoned resweep costs a small
+constant rather than a byte-by-byte walk to the (now stale) region end.
+
+User mode only, by construction: the dispatch call site lives in
+`accel/tcg/user-exec.c`, which system builds do not compile (they build
+`user-exec-stub.c` instead), so registering the hook under system
+emulation is a harmless no-op with no call site to fire it — exactly
+mirroring `qemu_plugin_walk_exec_regions`'s empty system-mode report.
+
 ### Template lifetime & dedup by construction
 
 A third `TmplLife` class, **STATIC**, sits alongside CODE/SPEC. STATIC templates
@@ -157,17 +201,18 @@ does), so throughput tracks the executable footprint, not execution length.
 
 ### Known P1 limitations
 
-- **Late mappings.** The sweep runs once, at segment open. Executable regions
-  mapped *later* (a dynamically-loaded library, a JIT page) are not swept unless
-  a subsequent segment opens. Code executed after the sweep is covered by its
-  executed `bb_map_` template regardless; only the never-executed fall-through
-  space of late-mapped regions is missed. (A dynamic binary whose window opens
-  at `icount:start=0` sweeps at the loader's first instruction, before shared
-  libraries are mapped.)
 - **x86 alignment.** Functions reached only through indirect transfers (never a
   direct-branch seed) are covered by the linear scan, which may enter them at a
   byte offset that disagrees with real execution; such mis-aligned blocks are
   inert noise at never-queried PCs.
+
+Late mappings (a dynamically-loaded library, a JIT page mapped after the
+segment-open sweep already ran) were an earlier P1 gap — the sweep only saw
+what was mapped at open, so a window opening at the loader's first
+instruction (`icount:start=0`) never covered shared libraries mapped
+afterward. See **Late-mapping resweep** above: `qemu_plugin_exec_region_grew`
+closes it by resweeping newly-exec-permitted regions as they appear, for any
+window shape.
 
 ---
 

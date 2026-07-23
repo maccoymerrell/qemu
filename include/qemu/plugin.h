@@ -204,6 +204,15 @@ uint64_t qemu_plugin_devio_start(int dir, uint64_t offset, uint64_t bytes,
                                  uint64_t dev_token);
 void qemu_plugin_devio_stop(uint64_t request_id);
 
+/*
+ * Executable-region-growth notification
+ * (qemu_plugin_register_exec_region_grew_cb).  Called from
+ * accel/tcg/user-exec.c's page_set_flags (linux-user only) whenever a
+ * mapping/mprotect call grants PAGE_EXEC over [start, end).  A no-op until
+ * a plugin registers a hook; there is no call site under system emulation.
+ */
+void qemu_plugin_exec_region_grew(uint64_t start, uint64_t end);
+
 void qemu_plugin_atexit_cb(void);
 
 void qemu_plugin_add_dyn_cb_arr(GArray *arr);
@@ -304,6 +313,9 @@ static inline uint64_t qemu_plugin_devio_start(int dir, uint64_t offset,
 }
 
 static inline void qemu_plugin_devio_stop(uint64_t request_id)
+{ }
+
+static inline void qemu_plugin_exec_region_grew(uint64_t start, uint64_t end)
 { }
 
 static inline void qemu_plugin_atexit_cb(void)

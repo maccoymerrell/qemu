@@ -245,3 +245,127 @@ the owning process root; STATIC rides the same `CST_INSN_FLAG_STATIC`.
 `qemu_plugin_walk_exec_regions`'s system stub (returns 0 today) is where the
 page-table walk lands, or a distinct system-mode enumeration entry point is
 added — to be decided when P2 is built.
+
+---
+
+## Opportunistic alternate minting
+
+The system-mode coverage P2 chases — never-executed fall-through and
+branch-target templates without a user-mode page-flags map — is delivered by a
+different mechanism that supersedes the P2 page-table walk: **opportunistic
+branch-alternate minting**.  It is mode-independent (it needs no region
+enumeration at all) and rides the same `static_templates=1` option, so
+`static_templates=1` now means *sweep (user) + alternate minting (both
+modes)*.  The P1 sweep is retained as-is.
+
+### The idea
+
+The never-executed space a trace-inferred wrong path fetches is, block by
+block, the **untaken side of a branch**.  Rather than enumerate the whole
+executable footprint up front, the plugin mints that side exactly when a
+branch is evaluated: at every branch the correct path or a wrong-path
+excursion resolves, it checks whether the side NOT followed already has a
+template; on a miss it decodes that one true BB — through the same
+`qemu_plugin_cap_decode` → `decode_detail_to_generic` → fragment-splitter
+machinery the dynamic path uses — and mints it as an ordinary never-executed
+template.  The alternate is never traced as a wrong-path block: no `WPBBEntry`,
+no dynamic state, no body record — only a dictionary entry.
+
+Coverage is therefore **convergent, not eager**: the dictionary fills in as
+branches are seen over the run, not all at once at segment open.  A branch
+never evaluated in the window contributes no alternate (correctly — a
+consumer never fetches its untaken side either); a rarely-taken branch's
+alternate appears the first time the branch is evaluated.  This is a weaker
+guarantee than the sweep's "every mapped byte decoded", and an honest one: it
+matches exactly the fetch space a mispredict-driven consumer reaches from the
+branches the workload actually executed, which is the space that matters.
+
+### Two hook sites
+
+Complementary, covering the two gaps a wrong path alone leaves:
+
+1. **Wrong-path walk** (`wp_commit_bb`, the decomposed `WpStep` pipeline).  A
+   branch *inside* a wrong-path block resolves one direction (the excursion
+   follows its computed successor); its untaken side is never walked, so an
+   executed + wrong-path dictionary misses it.  The hook mints that side —
+   the statically-known alternate of a conditional-direct terminator (taken
+   target = the decoded immediate, not-taken edge = the fall-through) — after
+   the block is committed.  This fills the *deep* gap.
+
+2. **Correct-path seal** (`collect_finalized_bbs`, the PathBuilder seal walk).
+   When a branch's wrong-path fork will NOT launch — `wpprune` pruned it,
+   wrong-path is disabled (`wp=0`), or paging is off — nothing decodes its
+   untaken side, so the seal queues that side (`resolve_wrong_target`'s output,
+   the not-taken block) for minting once `data_lock` is released.  When the
+   fork DOES launch, the wrong path itself covers the untaken block (and its
+   inner branches feed hook 1), so the seal leaves it.  The
+   translation-unavail tail — a fork that launched but could not fetch its
+   first target — is caught in `emit_finalized_bb` after the walk.
+
+### Keying, lifetime, and the byte-identity discipline
+
+Alternates live in a segment-scoped `alt_map_`, a sibling of `bb_map_` and the
+sweep's `static_map_`, keyed by the same `(asid_root, start_pc)` — kernel VAs to
+the shared kernel sentinel bucket, user VAs to the owning process root, via the
+established VA-domain classification.  Dedup is by construction: a mint whose
+key is already in `bb_map_` (executed) or `alt_map_` (minted) is skipped
+(`alt_or_bb_covered`; existing wins, `find_existing_true_bb` semantics).
+
+The **body stays byte-identical** to a run with the option off, by the same
+shadowing / id-ordering discipline P1 uses.  An alternate takes a placeholder
+id at commit and is assigned its real, section-local wire id lazily by
+`for_each_alt` at serialization — strictly above every executed *and* static
+id — so it never consumes an id an executed block would otherwise take; the
+executed dictionary numbers exactly as it would with the option off.  At
+serialization an alternate whose key is shadowed by an executed (`bb_map_`) or
+swept (`static_map_`) entry is dropped: the executed template wins (real id,
+real profile), the swept one wins (with its `CST_INSN_FLAG_STATIC`), and the
+flag-less alternate covers only what neither reached.
+
+Unlike a STATIC template, an alternate carries **no wire flag** (life `CODE`,
+so `write_insn_descriptors` stamps no `CST_INSN_FLAG_STATIC`): it is an
+ordinary never-executed dictionary entry, indistinguishable on the wire from
+any block that happened not to execute — because that is exactly what it is.
+
+### Guest-read policy, bound, and stats
+
+Guest bytes at the alternate's PC are read with the probing
+`qemu_plugin_read_memory_vaddr` (mapped page → decode; unmapped → skipped and
+counted), so enumeration never demand-pages or perturbs the guest — the same
+valid-mapping policy the wrong path obeys, and the reason a genuinely-unmapped
+fall-through is left uncovered (a consumer would fault there too).  A
+per-segment mint budget (`CST_ALT_MINT_BUDGET`) caps the decode+mint work; the
+presence test (one hash lookup per evaluated branch) is always allowed, and
+the decode fires only on a miss, so after warmup — every reachable alternate
+already minted — the steady-state cost is one lookup per branch.  Reported at
+exit (`Branch-alternate minting: ...`): `checks`, `mints`, `skips_unmapped`,
+`budget_hits`.
+
+### Measured
+
+* **Flag OFF** — user golden net GREEN (25 cells byte-identical, validator
+  errors=0); the feature paths are inert when `static_templates=0`.
+* **Flag ON, body byte-identical** — a deterministic freestanding diamond
+  (all four ISAs), traced with `wp` on and under `wpprune`, has a **body**
+  byte-identical to the flag-off trace; the delta is templates-section-only.
+  A system trace's canonical user-code slice is likewise identical off vs on.
+* **Coverage (system mode, alternate minting alone — the sweep is off there)**
+  — on a `qemu-system-x86_64` virtio-blk marker-window trace, executed
+  conditional-branch fall-through resolution rises from ~84 % to **99.1 %**
+  (unresolved ~665 → 35); the residual is genuinely-unmapped kernel
+  fall-throughs the probing read cannot (and should not) cover.  In user mode
+  the sweep already drives this to 0; minting adds the branches the sweep's
+  linear scan reaches only indirectly.  The mint here is ~1 200 alternates.
+* **Footprint & cost (user mode, mcf 100 M window, sweep + minting)** — the
+  minting side mints **2 590** alternates on top of the sweep's 129 504 static
+  BBs: the template-section growth is proportional to the distinct
+  *evaluated-branch* alternates, far leaner than an eager whole-footprint
+  walk (which for mcf would decode millions of blocks).  Runtime cost is
+  dominated by the *check latch*: the per-`bb_tmpl` `alt_checked_{cp,wp}` flags
+  cut the presence check from **222 million** (once per WP-block commit) to
+  **3 759** (once per distinct block), so minting's own hot-path cost is a
+  handful of hash lookups over the whole run — unmeasurable.  The residual
+  wall-time delta with `static_templates=1` (~2 % on mcf) is the P1 sweep's
+  one-time decode + serialisation of its 129 K static templates, not the
+  minting; in system mode, where the sweep is off, only the minting cost
+  remains.

@@ -1015,30 +1015,53 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        absent page) emits no page record for that slot.
    * - ``static_templates=0|1``
      - ``0``
-     - Static-template sweep (**user mode only**).  When on, each segment
-       open linear-decodes the guest's mapped executable regions and mints
-       never-executed **STATIC** templates so the dictionary covers the
-       fall-through and branch-target space a *trace-inferred* wrong-path
-       consumer needs — code that is fetched and decoded on a mispredicted
-       path (predicted-not-taken fall-throughs, BTB-miss wanders) but never
-       architecturally executed, which executed-only templates cannot
-       resolve.  A region that gains execute permission *after* the
-       segment-open sweep already ran — a dynamically-loaded library, a JIT
-       code page — is swept too: the plugin hooks linux-user's
-       mmap/mprotect path and resweeps just that region on the next
-       correct-path step, so dlopen'd libraries and JIT-compiled code reach
-       the same fall-through/branch-target coverage as the binary mapped at
-       open.  Static templates ride the normal templates section as
-       unreferenced dictionary entries, each instruction carrying
-       ``CST_INSN_FLAG_STATIC``; their profile counts are zero, and the
-       trace **body** is byte-identical to a run without the sweep (a block
-       that is both swept and later executed is carried by its executed
-       template, with no ``STATIC`` bit).  Fixed-width ISAs decode exactly;
-       x86 accepts data-in-text mis-decodes as inert noise at never-queried
-       PCs.  Forced **off** in system mode (enumeration there is a
-       page-table walk of the owned roots — a later facility), so a
-       system-mode trace is byte-identical regardless of this option.  See
-       :doc:`format` for the ``CST_INSN_FLAG_STATIC`` bit.
+     - Never-executed fetch/decode coverage.  When on, the dictionary is
+       extended to cover the fall-through and branch-target space a
+       *trace-inferred* wrong-path consumer needs — code fetched and decoded
+       on a mispredicted path (predicted-not-taken fall-throughs, BTB-miss
+       wanders) but never architecturally executed, which executed-only
+       templates cannot resolve.  Two complementary coverers ride this one
+       option:
+
+       * an executable-region **sweep** (**user mode only**), which at each
+         segment open linear-decodes the guest's mapped executable regions
+         and mints never-executed **STATIC** templates.  A region that gains
+         execute permission *after* the segment-open sweep — a
+         dynamically-loaded library, a JIT code page — is swept too: the
+         plugin hooks linux-user's mmap/mprotect path and resweeps just that
+         region on the next correct-path step.  STATIC templates ride the
+         normal templates section as unreferenced entries, each instruction
+         carrying ``CST_INSN_FLAG_STATIC``.  Forced **off** in system mode
+         (enumeration there is a page-table walk of the owned roots — a
+         later facility).
+       * **opportunistic branch-alternate minting** (**both modes**), which
+         at every branch the correct path or a wrong-path excursion
+         evaluates decodes the branch's UNTAKEN side and mints it as an
+         ordinary never-executed template if not already covered.  Unlike
+         the sweep this is mode-independent, so it also gives *system-mode*
+         traces their never-executed coverage.  Alternates carry **no** wire
+         flag — indistinguishable from any other block that happened not to
+         execute — and cover the two gaps the sweep and the wrong path
+         leave: branches inside wrong-path blocks (which follow their
+         resolved direction, so their alternates are never walked) and
+         branches whose wrong-path fork never launched (``wpprune``, budget,
+         translation-unavail, ``wp=0``).  Coverage is *convergent, not
+         eager*: it fills in as branches are seen over the run rather than
+         by an up-front sweep, so a rarely-taken branch's alternate appears
+         once the branch is first evaluated.  Guest bytes are read with the
+         same probing read the wrong path uses (mapped page → decode;
+         unmapped → skipped, counted), so enumeration never demand-pages or
+         perturbs the guest.
+
+       Both coverers keep the trace **body** byte-identical to a run with
+       the option off: never-executed templates take a section-local id
+       assigned above every executed id, so executed blocks number exactly
+       as they would with the option off, and a block that is both minted
+       and later executed is carried by its executed template.  The delta is
+       templates-section-only.  Fixed-width ISAs decode exactly; x86 accepts
+       data-in-text mis-decodes as inert noise at never-queried PCs.  See
+       :doc:`format` for the ``CST_INSN_FLAG_STATIC`` bit and
+       ``static_templates_plan.md`` for the design.
    * - ``iframe_rate=<N>``
      - ``100000``
      - Emit a validation IFRAME after every Nth observation of a CP

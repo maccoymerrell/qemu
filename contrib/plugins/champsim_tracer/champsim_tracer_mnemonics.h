@@ -528,6 +528,28 @@ typedef struct {
     RegAliasInserterFn    reg_alias_inserter;
     MetaFlagsMapperFn     flags_to_metaflags;
     AddrCanonicalizeFn    canonicalize_addr;
+    /*
+     * xlate_bypass_priv — the privilege level that executes with the
+     * paging/translation register bypassed, so pinned attribution must
+     * exclude it (RISC-V M-mode runs with satp inert).  -1 means no such
+     * level; every row that has none states it explicitly, because a
+     * zero-filled default would read as user privilege.
+     */
+    int                   xlate_bypass_priv;
+    /*
+     * pin_reuse_asid — arm the ASID-reuse detector.  Set on ISAs whose
+     * architectural ASID space is narrow enough that the OS recycles a
+     * value within one trace (MIPS pins a bare 8-bit EntryHi.ASID); the
+     * wide-register targets leave it clear.
+     */
+    bool                  pin_reuse_asid;
+    /*
+     * has_be_variant — the ISA ships a big-endian QEMU target.  The run
+     * is big-endian when set unless the target_name carries the
+     * little-endian "el" suffix (MIPS mips/mips64 vs mipsel/mips64el);
+     * clear for the always-little-endian ISAs.
+     */
+    bool                  has_be_variant;
 } IsaProperties;
 
 #ifdef CHAMPSIM_MNEMONIC_TABLES_IMPL
@@ -540,7 +562,7 @@ static const char *const isa_prefixes_mips[]    = { "mips64el", "mips64",
 
 extern const IsaProperties isa_properties[];
 const IsaProperties isa_properties[] = {
-    [TRACE_ISA_UNKNOWN] = { 0 },
+    [TRACE_ISA_UNKNOWN] = { .xlate_bypass_priv = -1 },
     [TRACE_ISA_X86]     = {
         .include_implicit_regs = true,
         .target_prefixes = isa_prefixes_x86,
@@ -548,6 +570,7 @@ const IsaProperties isa_properties[] = {
         .cap_mode_for_target = cap_mode_x86,
         .flags_to_metaflags = x86_flags_to_metaflags,
         .canonicalize_addr = x86_canonicalize_addr,
+        .xlate_bypass_priv = -1,
     },
     [TRACE_ISA_AARCH64] = {
         .include_implicit_regs = true,
@@ -557,6 +580,7 @@ const IsaProperties isa_properties[] = {
         .reg_alias_inserter = insert_aarch64_reg_aliases,
         .flags_to_metaflags = aarch64_flags_to_metaflags,
         .canonicalize_addr = aarch64_canonicalize_addr,
+        .xlate_bypass_priv = -1,
     },
     [TRACE_ISA_RISCV]   = {
         .include_implicit_regs = false,
@@ -564,6 +588,8 @@ const IsaProperties isa_properties[] = {
         .cap_arch = CS_ARCH_RISCV,
         .cap_mode_for_target = cap_mode_riscv,
         .canonicalize_addr = riscv_canonicalize_addr,
+        /* M-mode (normalized priv 3) executes with satp bypassed. */
+        .xlate_bypass_priv = 3,
     },
     [TRACE_ISA_MIPS]    = {
         .branch_delay_slots = 1,
@@ -579,6 +605,11 @@ const IsaProperties isa_properties[] = {
         .cap_arch = CS_ARCH_MIPS,
         .cap_mode_for_target = cap_mode_mips,
         .canonicalize_addr = mips_canonicalize_addr,
+        .xlate_bypass_priv = -1,
+        /* Bare 8-bit EntryHi.ASID; the OS recycles values within a run. */
+        .pin_reuse_asid = true,
+        /* mips/mips64 are big-endian; mipsel/mips64el carry the "el" suffix. */
+        .has_be_variant = true,
     },
 };
 

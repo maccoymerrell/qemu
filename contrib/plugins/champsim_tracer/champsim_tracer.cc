@@ -6707,26 +6707,26 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                 "instruction decode will be limited\n", target_name);
     }
 
-    /* RISC-V M-mode (normalized priv 3, the raw PRV_M the target hook
-     * reports) executes with satp bypassed, so pinned attribution must
-     * exclude it — see g_xlate_bypass_priv at the pin machinery. */
-    if (trace_isa == TRACE_ISA_RISCV) {
-        g_xlate_bypass_priv = 3;
-    }
-
-    /* MIPS pins a bare EntryHi.ASID value from an 8-bit (10 with
-     * Config4.AE) space the OS must recycle, so arm the reuse detector —
-     * see pin_reuse_track.  The wide-register targets stay unarmed. */
-    if (trace_isa == TRACE_ISA_MIPS) {
-        g_pin_reuse_guard = true;
-    }
-
-    /* Target byte order.  The four currently-supported ISAs (x86, AArch64,
-     * RISC-V, MIPS) are LE in every QEMU configuration we ship except the
-     * MIPS BE variants (qemu-mips, qemu-mips64), distinguished by the
-     * lack of an "el" suffix on the target_name. */
-    target_big_endian = (trace_isa == TRACE_ISA_MIPS &&
-                         !g_str_has_suffix(target_name, "el"));
+    /*
+     * Per-ISA init-time flags are sourced from the ISA property table so
+     * the whole port surface lives in one declarative place
+     * (isa_properties[] in champsim_tracer_mnemonics.h), not as scattered
+     * trace_isa special cases here:
+     *   - xlate_bypass_priv: the privilege level that runs with the
+     *     paging register bypassed, excluded from pinned attribution
+     *     (RISC-V M-mode is priv 3; -1 = none) — see the pin machinery.
+     *   - pin_reuse_asid: arm the ASID-reuse detector for a narrow ASID
+     *     space the OS recycles (MIPS 8-bit EntryHi.ASID) — see
+     *     pin_reuse_track.
+     *   - has_be_variant: the ISA ships a big-endian QEMU target, taken
+     *     unless the target_name carries the little-endian "el" suffix
+     *     (qemu-mips / qemu-mips64 are BE; mipsel / mips64el are LE).
+     */
+    const IsaProperties *ip = &isa_properties[trace_isa];
+    g_xlate_bypass_priv = ip->xlate_bypass_priv;
+    g_pin_reuse_guard   = ip->pin_reuse_asid;
+    target_big_endian   = ip->has_be_variant &&
+                          !g_str_has_suffix(target_name, "el");
 
     /* Build the per-ISA marker byte sequences (WIN_MARKER detection).
      * The MIPS encoding is little-endian — mipsel only, matching the

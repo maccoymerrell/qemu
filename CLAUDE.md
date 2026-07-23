@@ -77,8 +77,8 @@ The doc tree (`architecture.rst`, `concepts.rst`, `decoder.rst`, `extending.rst`
 `limitations.rst`, `quickstart.rst`, `reference.rst`, `troubleshooting.rst`) is the authoritative source
 for plugin behaviour — read it before guessing.
 
-The wire-format spec is `contrib/plugins/champsim_tracer/champsim_tracer_format.md` (referenced from
-`format.rst`).
+The wire-format spec is `contrib/plugins/champsim_tracer/docs/format.rst` (the single
+source of truth).
 
 ## Plugin architecture (big picture)
 
@@ -144,7 +144,7 @@ Read `docs/architecture.rst` for the full picture; the key load-bearing pieces:
 | `contrib/plugins/champsim_tracer/tools/` | `cst_decode`, `cst_audit`, `cst_visualize` (C++ offline tools) |
 | `contrib/plugins/champsim_tracer/validator/` | Seed-driven multi-ISA self-check harness |
 | `contrib/plugins/champsim_tracer/docs/` | Sphinx documentation (the canonical reference) |
-| `contrib/plugins/champsim_tracer/champsim_tracer_format.md` | Wire-format spec |
+| `contrib/plugins/champsim_tracer/docs/format.rst` | Wire-format spec |
 | `contrib/plugins/meson.build` | Build entry for the plugin and tools |
 | `disas/capstone.c` | Capstone boundary including the access-flag bug workarounds |
 | `subprojects/capstone.wrap` | Pinned Capstone revision |

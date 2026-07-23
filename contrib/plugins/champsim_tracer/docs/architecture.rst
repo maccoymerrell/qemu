@@ -55,13 +55,14 @@ three layers in series:
    cost is roughly proportional to ``wpdepth`` instructions of
    speculative execution per branch.
 
-The numbers below are measured on the SPEC CPU2017 ``mcf_r``
-refrate input, 20 M architectural instructions of capture
-(x86_64 host, gcc 13).  They are representative of this workload
-only; other workloads vary in both runtime and trace size.
-Sizes are MiB; compressed sizes come from recompressing the raw
-body+header pair with ``xz -T0`` (the tracer's default in-process
-compressor when ``compress=`` is set).
+The numbers below are measured tracing ``qemu-x86_64 -seed 1
+-B 0x400000 /usr/bin/sha256sum`` over a fixed 5 MiB input, 14.5 M
+architectural instructions of capture (x86_64 host, Intel Xeon
+Ice Lake-SP).  They are representative of this workload only; other
+workloads vary in both runtime and trace size.  Raw size is the
+uncompressed ``.cst`` container; the xz column recompresses the same
+members with ``xz -T0`` (the codec the tracer runs in-process when
+``compress=`` is set).
 
 .. list-table::
    :header-rows: 1
@@ -73,69 +74,68 @@ compressor when ``compress=`` is set).
      - xz size
      - B/insn raw
      - Slowdown
-   * - stoptrigger only (no recording)
-     - 0.18
+   * - bare ``qemu-x86_64`` (no plugin)
+     - 0.13
      - n/a
      - n/a
      - n/a
      - 1× (baseline)
    * - ``wp=0,memdata=0,regdata=0``
-     - 3.2
-     - 19.4 MiB
-     - 0.15 MiB
-     - 1.0
-     - 18×
+     - 1.48
+     - 3.24 MiB
+     - 217 KiB
+     - 0.23
+     - 11×
    * - ``wp=1,memdata=0,regdata=0``
-     - 60.4
-     - 272 MiB
-     - 2.4 MiB
-     - 14
-     - 335×
+     - 4.21
+     - 17.0 MiB
+     - 830 KiB
+     - 1.23
+     - 32×
    * - ``wp=1,memdata=1,regdata=0,wp_memdata=0``
-     - 63.6
-     - 281 MiB
-     - 3.0 MiB
-     - 15
-     - 353×
+     - 4.50
+     - 17.6 MiB
+     - 1.04 MiB
+     - 1.27
+     - 35×
    * - ``wp=1,memdata=1,regdata=1``
-     - 109.2
-     - 623 MiB
-     - 18.8 MiB
-     - 33
-     - 607×
+     - 9.11
+     - 106 MiB
+     - 57.1 MiB
+     - 7.62
+     - 70×
 
 Reading the table:
 
-* **Slowdown vs the stoptrigger plugin** (which is roughly
-  unmodified-QEMU runtime): tracing without WP costs ~18× on this
+* **Slowdown vs bare QEMU:** tracing without WP costs ~11× on this
   workload because every TB pays a ``vcpu_tb_exec`` callback +
-  Capstone-classification + chain-assembly walk.  Enabling
-  WP simulation jumps to several-hundred× because every CP branch
-  triggers a separate TCG re-entry for the speculative side-trip.
-  Adding ``regdata=1`` is a further ~1.8× on top — every
-  instruction's destination registers are read out via
+  Capstone-classification + chain-assembly walk.  Enabling WP
+  simulation raises it to ~32× because every CP branch triggers a
+  separate TCG re-entry for the speculative side-trip.  Adding
+  ``regdata=1`` roughly doubles it again — every instruction's
+  destination registers are read out via
   ``qemu_plugin_read_register``.
-* **Trace size:** the field-delta encoder is highly compression-
-  friendly.  CP-only addresses produce ~1 byte/insn raw and
-  compress to under a hundredth of a byte each.  The full
-  configuration (CP+WP, all data, all reg snaps) lands near
-  33 bytes/insn raw, compressing to ~1 byte/insn.  The recent
-  encoder optimisations (per-template field-state cache, inlined
-  field-delta emit loop) account for the gap vs. older numbers in
-  the public small-trace bundle.
+* **Trace size:** the field-delta encoder is compact for addresses.
+  CP-only addresses produce ~0.23 bytes/insn raw and compress ~15×.
+  The full configuration (CP+WP, all data, all reg snaps) lands near
+  7.6 bytes/insn raw.  Compression is workload-dependent: the
+  address-bearing rows compress 15–21× under xz, but this workload's
+  register data is SHA hash state — near-incompressible — so its
+  full-capture row compresses under 2×.  A workload with lower-
+  entropy register values compresses several times better.
 * **Memory footprint:** the plugin's RSS grows roughly with the
   template-cache size (one ``BBTemplate`` per static basic block,
   on the order of a few hundred bytes each) plus the WP simulator's
   speculative-store buffer (bounded by ``wpdepth`` × the workload's
-  store rate).  Peak RSS on this 20 M run was ~320 MiB with
-  ``wp=0,memdata=0`` and ~1.25 GiB with full capture.
+  store rate).
 
-Workload-dependence caveat: mcf has a tight inner loop that delta-
-encodes well.  Branch-heavy workloads (e.g. SPEC ``perlbench``)
-push more bytes per instruction; memory-bound workloads with
-diverse access patterns inflate the data-bearing configurations
-further.  Run ``cst_audit`` on a representative slice of your own
-workload before sizing storage for a long run.
+Workload-dependence caveat: ``sha256sum`` has a tight compute kernel
+that delta-encodes well but produces high-entropy register state.
+Branch-heavy workloads push more bytes per instruction on the
+control-flow fields; memory-bound workloads with diverse access
+patterns inflate the data-bearing configurations further.  Run
+``cst_audit`` on a representative slice of your own workload before
+sizing storage for a long run.
 
 How to measure
 ~~~~~~~~~~~~~~
@@ -164,11 +164,12 @@ If trace size or runtime is a problem:
   ``compress="zstd -T0 -19 -q -c"`` runs the compressor in-process
   so each member inside the ``.cst`` archive lands compressed.
   The wire format's delta encoding leaves long runs of small bytes
-  that both compressors handle well — measured ratios on the mcf
-  workload above range from ~33× (full data) to ~129× (CP-only
-  addresses) under default ``xz -T0``.  ``zstd -19`` lands at
-  similar ratios on this data (within ~10 %).  The in-memory trace
-  size is unchanged but the on-disk footprint shrinks substantially.
+  that both compressors handle well — measured ratios on the workload
+  above range from ~15× (CP-only addresses) under ``xz -T0`` down to
+  under 2× when the capture carries high-entropy register data (this
+  workload's SHA hash state); most workloads sit toward the high end.
+  The in-memory trace size is unchanged but the on-disk footprint
+  shrinks substantially.
 * **``wp_memdata=0``** keeps the WP cache-pollution stream
   (addresses) but drops the WP data values.  This is usually the
   biggest single trace-size knob.

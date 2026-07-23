@@ -708,17 +708,16 @@ Reading the trace
    ; cst_decode disassembly
    ; version=0x1D545343
    ; isa=x86_64
+   ; flags=MEM_DATA REG_DATA
+   ; templates=7979
    ...
-   ; ----- BB 3 entry pc=0x401740 insns=12 seq=1 tid=0 -----
-   0x000000401740 <_start+0x0>: f3 0f 1e fa              nop
-   0x000000401744 <_start+0x4>: 31 ed                    xor     %fpr -> %fpr[0x0], %flags[0x202], %mflags[-]
-   0x000000401749 <_start+0x9>: 5e                       pop     %sp -> %gp4[0x1], %sp[0x78b25adff138]  ld(0x78b25adff130)=0x1
-   0x000000401751 <_start+0x11>: 50                       push    %gp0, %sp -> %sp[0x78b25adff128]  st(0x78b25adff128)=0x0
-   0x00000040175f <_start+0x1f>: 67 e8 eb 25 00 00        jmp     $0x403d50, %sp, %ip -> %sp[0x78b25adff118], %ip[0x403d50]  st(0x78b25adff118)=0x401765
+   ; ----- BB 3 entry pc=0x734e6b076540 insns=2 seq=1 tid=0 asid=0 branch=taken target=0x734e6b0771d0 -----
+   0x734e6b076540: 48 89 e7                 mov     %sp -> %gp5[0x734e595feca0/w8]
+   0x734e6b076543: e8 88 0c 00 00           call    %sp, $0x734e6b0771d0 -> %sp[0x734e595fec98/w8]  ...
 
 Each line is self-contained — pipe it through ``grep`` by PC,
 mnemonic, register reference (``%gp1`` etc.), memop pattern
-(``ld(`` / ``st(``), branch-target comment (``# 0x``), or the
+(``ld[`` / ``st[``), branch-target comment (``# 0x``), or the
 ``; ----- BB`` boundary markers.  See :doc:`decoder` for the
 full column reference, the ``--templates-only`` and ``--objdump``
 flags, and the block-formatted ``--format=legacy`` output.
@@ -728,27 +727,26 @@ A byte-budget audit (helpful when tuning trace size) is one command:
 .. code-block:: console
 
    $ build/contrib/plugins/cst_audit run.cst
-     profile: exec_cp=142 exec_wp=317  mem-insns=279 addr-insns=0  pat[none/reg/irr/rand]=1153/192/2/0
+     profile: exec_cp=213099 exec_wp=2473849  mem-insns=14631 addr-insns=5306  pat[none/reg/irr/rand]=32999/6530/160/77
    === ON DISK ===
-     container (.cst)                                82.00 KiB
+     container (.cst)                               105.69 MiB
 
    === MEMBER SIZES (uncompressed) ===
-     TOTAL uncompressed                              79.71 KiB  100.00%
-     HEADER member                                   54.96 KiB   68.95%  [       140 tmpl, avg  402.0 B]
-     BODY member (records)                           24.75 KiB   31.05%
+     TOTAL uncompressed                             105.68 MiB  100.00%
+     HEADER member                                    1.31 MiB    1.24%  [     7,979 tmpl, avg  172.6 B]
+     BODY member (records)                          104.37 MiB   98.76%
 
-   === HEADER BREAKDOWN (54.96 KiB) ===
-     preamble + encoding maps                        19.18 KiB   34.89%
-     section framing (counts+lengths)                    221 B    0.39%
-     BB info (id/pc/n/ft/targets/sym)                 3.10 KiB    5.64%
-     instruction descriptors                         21.92 KiB   39.88%
-     dependency sub-blocks                            3.58 KiB    6.52%
-     template profile block                           6.96 KiB   12.67%
+   === HEADER BREAKDOWN (1.31 MiB) ===
+     preamble + encoding maps                        23.70 KiB    1.76%
+     BB info (id/pc/n/ft/targets/sym)               200.59 KiB   14.92%
+     instruction descriptors                        659.84 KiB   49.07%
+     dependency sub-blocks                          103.22 KiB    7.68%
+     template profile block                         345.52 KiB   25.70%
 
-   === BODY BREAKDOWN (24.75 KiB) ===
-     CP entry framing                                    284 B    1.12%
-     CP field-delta section                          13.42 KiB   54.22%
-     WP chain envelope (incl. inner)                 10.17 KiB   41.10%
+   === BODY BREAKDOWN (104.37 MiB) ===
+     CP field-delta section                          63.71 MiB   61.04%
+     WP chain envelope (incl. inner)                 39.75 MiB   38.08%
+     WP events                                      470.77 KiB    0.44%
      ...
 
 The report distinguishes the on-disk ``.cst`` container size (the

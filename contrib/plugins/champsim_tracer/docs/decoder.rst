@@ -64,24 +64,21 @@ Sample, with ``wp=1,memdata=1,regdata=1`` capture flags:
    ; cst_decode disassembly
    ; version=0x1D545343
    ; isa=x86_64
-   ; command=qemu-x86_64 -seed 42 -plugin libchampsim_tracer.so,outfile=run,...
-   ; datetime=2026-05-10 16:11:23
+   ; command=qemu-x86_64 -seed 42 -B 0x400000 -plugin libchampsim_tracer.so,outfile=run,wp=1,memdata=1,regdata=1
    ; flags=MEM_DATA REG_DATA
-   ; start_insn=0 warmup_insns=0 total_target_insns=10000
-   ; simpoint_weight=1
-   ; templates=31
+   ; start_insn=0 warmup_insns=0 total_target_insns=0
+   ; templates=52
 
-   ; ----- BB 3 entry pc=0x401740 insns=12 seq=1 tid=0 asid=0 branch=taken target=0x403d50 -----
+   ; ----- BB 3 entry pc=0x40100e insns=1 seq=1 tid=0 asid=0 (thread_switch) branch=taken target=0x401010 -----
+   0x00000040100e: eb 00                    jmp     %ip, $0x401010 -> %ip[0x401010/w8]  # 0x401010 <blk_0>
+   ; ----- BB 5 entry pc=0x401010 insns=9 seq=2 tid=0 asid=0 branch=taken target=0x401036 -----
    ; profile: exec_cp=1 exec_wp=0
-   ; target[0]: pc=0x403d50 taken_cp=1 nottaken_cp=0 taken_wp=0 nottaken_wp=0
-   0x000000401740 <_start+0x0>: f3 0f 1e fa              nop
-   0x000000401744 <_start+0x4>: 31 ed                    xor     %fpr -> %fpr[0x0], %flags[0x202], %mflags[-]
-   0x000000401749 <_start+0x9>: 5e                       pop     %sp -> %gp4[0x1], %sp[0x78b25adff138]  ld(0x78b25adff130)=0x1  prof: memops_cp=1 pat_cp=CST_PAT_REGULAR cp=[0x78b25adff130-0x78b25adff130]
-   0x000000401751 <_start+0x11>: 50                       push    %gp0, %sp -> %sp[0x78b25adff128]  st(0x78b25adff128)=0x0
-   0x00000040175f <_start+0x1f>: 67 e8 eb 25 00 00        jmp     $0x403d50, %sp, %ip -> %sp[0x78b25adff118], %ip[0x403d50]  st(0x78b25adff118)=0x401765
-   ; ----- BB 5 entry pc=0x403d50 insns=22 seq=2 tid=0 asid=0 branch=not-taken target=0x403d9b -----
+   ; target[0]: pc=0x401036 taken_cp=1 nottaken_cp=0 taken_wp=0 nottaken_wp=0
+   0x000000401010 <blk_0+0x0>: 4c 8d 3d e9 0f 00 00     lea     %ip -> %gp13[0x402000/w8]
+   0x000000401017 <blk_0+0x7>: 4d 8b 47 60              mov     ld[%gp13](0x402060) -> %gp6[0x1360/w8]  ld=0x1360/w8  prof: memops_cp=1 pat_cp=CST_PAT_REGULAR cp=[0x402060-0x402060]
+   0x00000040101f <blk_0+0xf>: 4d 31 c8                 xor     %gp7, %gp6 -> %gp6[0x6c92/w8], %flags[0x202/w4], %mflags[-]
+   0x000000401029 <blk_0+0x19>: 4d 89 47 70              mov     %gp6 -> st[%gp13](0x402070)  st=0xc23c/w8
    ...
-   0x000000403d99 <__libc_start_main_impl+0x49>: 75 f5                    jcc     $0x403d90, %flags, %ip -> %ip[0x403d90]  # 0x403d9b <__libc_start_main_impl>
 
 Per-instruction line columns:
 
@@ -117,16 +114,16 @@ Captured per-instruction data is folded into the operand line:
   an integer flags register (x86, AArch64); spares consumers
   from per-ISA bit-shuffle math.  RISC-V and MIPS templates do
   not carry this slot.
-* ``ld(<addr>)=<value>`` / ``st(<addr>)=<value>`` — memory
-  operation effective address with the loaded / stored value
-  (when ``memdata=1``), or just the address ``ld(<addr>)`` /
-  ``st(<addr>)`` (when ``memdata=0``).  When ``memdata=1`` the
-  ``=<value>`` suffix is always present, including for zero
-  values, so the absence of ``=`` unambiguously means
-  ``memdata`` was not captured.  A ``/w<n>`` suffix on the value
-  (and ``,w<n>`` inside the parentheses of an address-only memop)
-  gives the access byte width — the ``CST_FID_LOAD_SIZE`` /
-  ``CST_FID_STORE_SIZE`` field — for value-prediction consumers.
+* ``ld[<base>](<addr>)`` / ``st[<base>](<addr>)`` in the operand
+  list — a memory operation's base register and effective address
+  (``ld(<addr>)`` / ``st(<addr>)`` when no base register resolves,
+  e.g. an absolute address).  With ``memdata=1`` the loaded / stored
+  value rides a trailing ``ld=<value>/w<n>`` / ``st=<value>/w<n>``
+  token, where ``/w<n>`` is the access byte width — the
+  ``CST_FID_LOAD_SIZE`` / ``CST_FID_STORE_SIZE`` field — for
+  value-prediction consumers.  With ``memdata=0`` only the address
+  operand appears and no ``ld=`` / ``st=`` token, so the absence of
+  the value token unambiguously means ``memdata`` was not captured.
 * ``pa=0x<paddr>`` — the reconstructed physical address of the memop,
   present only in ``physaddr=1`` system-mode traces.  It is the
   recorded physical page base (``CST_FID_LOAD_PPAGE`` /
@@ -307,29 +304,30 @@ Sample output (abridged):
 
    $ build/contrib/plugins/cst_audit trace.cst
    === ON DISK ===
-     container (.cst)                          12.04 KiB
+     container (.cst)                          48.00 KiB
 
    === MEMBER SIZES (uncompressed) ===
-     TOTAL uncompressed                       28.68 KiB  100.00%
-     HEADER member                            25.93 KiB   90.41%  [   31 tmpl, avg  856.4 B]
-     BODY member (records)                     2.75 KiB    9.59%
+     TOTAL uncompressed                       45.86 KiB  100.00%
+     HEADER member                            35.41 KiB   77.22%  [   52 tmpl, avg  697.3 B]
+     BODY member (records)                    10.45 KiB   22.78%
 
-   === HEADER BREAKDOWN (25.93 KiB) ===
-     preamble + encoding maps                 19.15 KiB   73.87%
-     section framing (counts+lengths)              61 B    0.23%
-     BB info (id/pc/n/ft/targets/sym)             666 B    2.51%  [   31 tmpl, avg  21.5 B]
-     instruction descriptors                   3.94 KiB   15.19%  [   31 tmpl, avg 130.1 B]
-     dependency sub-blocks                        595 B    2.24%  [   31 tmpl, avg  19.2 B]
-     template profile block                    1.54 KiB    5.96%  [   31 tmpl, avg  51.0 B]
-       sum                                    25.93 KiB  100.00%  [rollup 100.00%]
+   === HEADER BREAKDOWN (35.41 KiB) ===
+     preamble + encoding maps                 23.74 KiB   67.05%
+     section framing (counts+lengths)             103 B    0.28%
+     BB info (id/pc/n/ft/targets/sym)           1.10 KiB    3.11%  [   52 tmpl, avg  21.7 B]
+     instruction descriptors                   6.77 KiB   19.11%  [   52 tmpl, avg 133.2 B]
+     dependency sub-blocks                      1.01 KiB    2.85%  [   52 tmpl, avg  19.9 B]
+     template profile block                    2.69 KiB    7.60%  [   52 tmpl, avg  53.0 B]
+       sum                                    35.41 KiB  100.00%  [rollup 100.00%]
 
-   === BODY BREAKDOWN (2.75 KiB) ===
-     CP entry framing                              42 B    1.49%  [   21 entry, avg   2.0 B]
-     CP field-delta section                       892 B   31.68%  [   21 entry, avg  42.5 B]
-     thread-switch records                          0 B    0.00%  [    0 switch]
+   === BODY BREAKDOWN (10.45 KiB) ===
+     CP entry framing                              70 B    0.65%  [   35 entry, avg   2.0 B]
+     CP field-delta section                     4.18 KiB   40.00%  [   35 entry, avg 122.3 B]
+     WP chain envelope (incl. inner)            5.50 KiB   52.68%  [   35 entry, avg 161.0 B]
+     WP events                                     82 B    0.77%  [   35 entry, avg   2.3 B]
      ...
      IFRAME records (validation redundancy)         0 B    0.00%
-     REGFILE records (per-thread initial state)    96 B    3.41%  [    1 regfile]
+     REGFILE records (per-thread initial state)   609 B    5.69%  [    1 regfile]
 
 The **HEADER BREAKDOWN** attributes every header byte to a
 template-block group, so the cost of each piece of static metadata

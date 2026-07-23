@@ -518,6 +518,16 @@ typedef uint8_t (*MetaFlagsMapperFn)(uint64_t raw_flags);
  */
 typedef uint64_t (*AddrCanonicalizeFn)(uint64_t addr);
 
+/*
+ * Per-ISA guest trace-marker encoder.  Writes the ISA's full marker
+ * sequence for @imm (CST_MARKER_MAGIC / CST_MARKER_END_MAGIC) into @out
+ * and returns the byte count.  The encoders themselves live in the
+ * shared champsim_marker.h contract (also built into cst_attach); the
+ * ISA row names the one to use.  NULL on an ISA with no marker support,
+ * which leaves the window-marker detector disabled.
+ */
+typedef int (*MarkerEncodeSeqFn)(uint8_t *out, uint32_t imm);
+
 typedef struct {
     uint8_t               branch_delay_slots;
     bool                  pc_relative_branch_imm;
@@ -550,6 +560,17 @@ typedef struct {
      * clear for the always-little-endian ISAs.
      */
     bool                  has_be_variant;
+    /*
+     * marker_encode_seq / marker_insn_bytes / marker_seq_insns — the
+     * guest window-marker sequence for this ISA.  marker_encode_seq
+     * builds the START/END byte patterns; marker_insn_bytes is the fixed
+     * per-insn width in the sequence and marker_seq_insns the insn count,
+     * both read by the execution-time adjacency detector.  A NULL encoder
+     * (the unknown ISA) leaves the marker detector disabled.
+     */
+    MarkerEncodeSeqFn     marker_encode_seq;
+    uint8_t               marker_insn_bytes;
+    uint8_t               marker_seq_insns;
 } IsaProperties;
 
 #ifdef CHAMPSIM_MNEMONIC_TABLES_IMPL
@@ -571,6 +592,9 @@ const IsaProperties isa_properties[] = {
         .flags_to_metaflags = x86_flags_to_metaflags,
         .canonicalize_addr = x86_canonicalize_addr,
         .xlate_bypass_priv = -1,
+        .marker_encode_seq = cst_marker_x86_encode_seq_imm,
+        .marker_insn_bytes = CST_MARKER_X86_INSN_BYTES,
+        .marker_seq_insns  = CST_MARKER_SEQ_LEN,
     },
     [TRACE_ISA_AARCH64] = {
         .include_implicit_regs = true,
@@ -581,6 +605,9 @@ const IsaProperties isa_properties[] = {
         .flags_to_metaflags = aarch64_flags_to_metaflags,
         .canonicalize_addr = aarch64_canonicalize_addr,
         .xlate_bypass_priv = -1,
+        .marker_encode_seq = cst_marker_a64_encode_seq_imm,
+        .marker_insn_bytes = CST_MARKER_PAIR_INSN_BYTES,
+        .marker_seq_insns  = CST_MARKER_PAIR_SEQ_INSNS,
     },
     [TRACE_ISA_RISCV]   = {
         .include_implicit_regs = false,
@@ -590,6 +617,9 @@ const IsaProperties isa_properties[] = {
         .canonicalize_addr = riscv_canonicalize_addr,
         /* M-mode (normalized priv 3) executes with satp bypassed. */
         .xlate_bypass_priv = 3,
+        .marker_encode_seq = cst_marker_riscv_encode_seq_imm,
+        .marker_insn_bytes = CST_MARKER_PAIR_INSN_BYTES,
+        .marker_seq_insns  = CST_MARKER_PAIR_SEQ_INSNS,
     },
     [TRACE_ISA_MIPS]    = {
         .branch_delay_slots = 1,
@@ -610,6 +640,9 @@ const IsaProperties isa_properties[] = {
         .pin_reuse_asid = true,
         /* mips/mips64 are big-endian; mipsel/mips64el carry the "el" suffix. */
         .has_be_variant = true,
+        .marker_encode_seq = cst_marker_mips_encode_seq_imm,
+        .marker_insn_bytes = CST_MARKER_PAIR_INSN_BYTES,
+        .marker_seq_insns  = CST_MARKER_PAIR_SEQ_INSNS,
     },
 };
 

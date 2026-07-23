@@ -17,6 +17,10 @@ extern "C" {
 #include <qemu-plugin.h>
 }
 
+/* The isa_properties[] rows name the shared guest-marker encoders and
+ * their byte sizes; pull in the contract before the table is defined. */
+#include "champsim_marker.h"
+
 #define CHAMPSIM_MNEMONIC_TABLES_IMPL 1
 #include "champsim_tracer_mnemonics.h"
 

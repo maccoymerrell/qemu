@@ -16,43 +16,27 @@
 
 MarkerSeq g_marker_seq;
 
+/* The x86 marker is CST_MARKER_SEQ_LEN 5-byte movs; the fixed-width ISAs
+ * use the longer two-insn pair sequence.  MarkerSeq's buffers are sized by
+ * the pair sequence, so every ISA's pattern fits. */
+static_assert(CST_MARKER_X86_SEQ_BYTES <= CST_MARKER_PAIR_SEQ_BYTES,
+              "MarkerSeq buffers sized by the pair sequence");
+
 void marker_seq_init(void)
 {
     MarkerSeq &m = g_marker_seq;
-    switch (trace_isa) {
-    case TRACE_ISA_X86:
-        static_assert(CST_MARKER_X86_SEQ_BYTES <= CST_MARKER_PAIR_SEQ_BYTES,
-                      "MarkerSeq buffers sized by the pair sequence");
-        cst_marker_x86_encode_seq_imm(m.start, CST_MARKER_MAGIC);
-        cst_marker_x86_encode_seq_imm(m.end, CST_MARKER_END_MAGIC);
-        m.insn_bytes = CST_MARKER_X86_INSN_BYTES;
-        m.n_insns    = CST_MARKER_SEQ_LEN;
+    /* The per-ISA marker sequence is a declarative isa_properties[] row:
+     * the encoder plus the fixed insn width and count the adjacency
+     * detector needs.  A NULL encoder (the unknown ISA) leaves it invalid. */
+    const IsaProperties &p = isa_properties[trace_isa];
+    if (p.marker_encode_seq) {
+        p.marker_encode_seq(m.start, CST_MARKER_MAGIC);
+        p.marker_encode_seq(m.end, CST_MARKER_END_MAGIC);
+        m.insn_bytes = p.marker_insn_bytes;
+        m.n_insns    = p.marker_seq_insns;
         m.valid      = true;
-        break;
-    case TRACE_ISA_AARCH64:
-        cst_marker_a64_encode_seq_imm(m.start, CST_MARKER_MAGIC);
-        cst_marker_a64_encode_seq_imm(m.end, CST_MARKER_END_MAGIC);
-        m.insn_bytes = CST_MARKER_PAIR_INSN_BYTES;
-        m.n_insns    = CST_MARKER_PAIR_SEQ_INSNS;
-        m.valid      = true;
-        break;
-    case TRACE_ISA_RISCV:
-        cst_marker_riscv_encode_seq_imm(m.start, CST_MARKER_MAGIC);
-        cst_marker_riscv_encode_seq_imm(m.end, CST_MARKER_END_MAGIC);
-        m.insn_bytes = CST_MARKER_PAIR_INSN_BYTES;
-        m.n_insns    = CST_MARKER_PAIR_SEQ_INSNS;
-        m.valid      = true;
-        break;
-    case TRACE_ISA_MIPS:
-        cst_marker_mips_encode_seq_imm(m.start, CST_MARKER_MAGIC);
-        cst_marker_mips_encode_seq_imm(m.end, CST_MARKER_END_MAGIC);
-        m.insn_bytes = CST_MARKER_PAIR_INSN_BYTES;
-        m.n_insns    = CST_MARKER_PAIR_SEQ_INSNS;
-        m.valid      = true;
-        break;
-    default:
+    } else {
         m.valid = false;
-        break;
     }
 }
 

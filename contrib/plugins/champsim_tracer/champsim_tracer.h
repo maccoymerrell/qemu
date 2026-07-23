@@ -205,7 +205,7 @@ extern "C" {
 #define CST_INSN_FLAG_BRANCH_COND   (1u << 0)
 #define CST_INSN_FLAG_HAS_IMM       (1u << 1)
 #define CST_INSN_FLAG_ATOMIC        (1u << 2)
-#define CST_INSN_FLAG_STATIC        (1u << 3)
+/* bit 3 reserved (formerly CST_INSN_FLAG_STATIC, retired with the P1 sweep) */
 #define CST_INSN_FLAG_VEC           (1u << 4)
 #define CST_INSN_FLAG_LANE_PARALLEL (1u << 5)
 /*
@@ -782,20 +782,16 @@ typedef struct BBTemplate BBTemplate;
  *          on first correct-path execution (TemplateStore::promote).
  *          Persistent for the run; the CODE-class dedup index only
  *          ever contains CODE chains, so reclaim never touches it.
- *   STATIC — minted by the segment-open executable-region sweep
- *          (static_templates=1, user mode) from a mapped-but-unexecuted
- *          block.  Never executed by construction: it lives in the
- *          segment-scoped static_map_ (a sibling of bb_map_), carries
- *          the CST_INSN_FLAG_STATIC wire bit, and is dropped wholesale at
- *          clear_bb_map().  Only ever appears on static_map_ records; a
- *          block that later executes is carried by its bb_map_ (CODE)
- *          template, which shadows the static one at serialization.
+ *          Opportunistically-minted branch alternates (alt_map_) also
+ *          carry this class — they are ordinary never-executed dictionary
+ *          entries with no wire flag, indistinguishable from any block
+ *          that happened not to run.
  *
  * The remaining lifetime regime — segment-scoped executed true-BB
  * templates — is expressed by bb_map_ membership, not by this enum:
  * bb_map_ owns its records and drops them wholesale at clear_bb_map().
  */
-enum class TmplLife : uint8_t { SPEC, CODE, STATIC };
+enum class TmplLife : uint8_t { SPEC, CODE };
 
 /*
  * Generation-stamped handle for a cross-lifetime reference INTO the
@@ -1356,6 +1352,12 @@ extern bool enable_wrong_path;
 /* #77 diagnostic ring buffer (gated on CST_RING); 'C'=correct-path BB start,
  * 'W'=wrong-path instruction PC. */
 void cst_ring_push(char tag, uint64_t pc);
+/* Default depth of the alternate-minting successor walk (static_depth=N).
+ * Chosen by the knee of the coverage/size sweep on mcf + system churn:
+ * beyond this, executed-fall-through resolution barely rises while the
+ * template count keeps climbing. */
+#define CST_ALT_DEPTH_DEFAULT 4
+
 /* Effective per-run trace-feature toggles, derived once from PluginConfig
  * at install (the tristate WP flags resolved against their CP counterparts)
  * and immutable after.  Grouped so the write-once/read-many feature set
@@ -1411,31 +1413,28 @@ struct TraceFeatures {
      * user-mode trace never emits the CST_FID_*_PPAGE families and stays
      * byte-identical.  Sets CST_FLAG_PHYSADDR in the header when on. */
     bool     physaddr = false;
-    /* Static-template sweep (static_templates=1): at segment open,
-     * linear-decode the guest's mapped executable regions and mint
-     * never-executed STATIC true-BB templates so the template dictionary
-     * covers the fall-through / branch-target space a consumer needs for
-     * trace-inferred wrong-path reconstruction.  A region mapped or
-     * granted execute permission later — a dynamically-loaded library, a
-     * JIT code page — is swept too, on the next correct-path TB exec after
-     * the mapping/mprotect that created it.  USER MODE ONLY — forced off
-     * (with a warning) in system mode, where enumeration is a page-table
-     * walk of the owned roots (a later facility).  When on, the header
-     * advertises the trailing CST_INSN_FLAG_STATIC name; a trace without
-     * the sweep never does, so its wire is byte-identical. */
-    bool     static_templates = false;
     /* Opportunistic branch-alternate minting (static_templates=1, BOTH
      * modes).  At every evaluated branch on the correct path and inside a
      * wrong-path excursion, the UNTAKEN side's true BB is decoded and minted
      * as a never-executed dictionary template if not already covered — the
      * fall-through / branch-target coverage a trace-inferred wrong-path
-     * consumer needs, filled convergently as branches are seen rather than by
-     * an eager sweep.  Unlike the sweep (static_templates, user-mode only)
-     * this is mode-independent, so it also gives system-mode traces their
-     * never-executed coverage.  Enabled by static_templates=1 in either mode;
-     * carries NO wire flag (alternates are ordinary never-executed entries),
-     * so a trace without it is byte-identical. */
+     * consumer needs, filled convergently as branches are seen.  Mode-
+     * independent (it reads guest bytes at a branch's untaken target through
+     * the same probing read the wrong path uses), so it gives system-mode
+     * traces their never-executed coverage as well as user-mode's.  Enabled
+     * by static_templates=1 in either mode; carries NO wire flag (alternates
+     * are ordinary never-executed entries), so a trace without it is
+     * byte-identical. */
     bool     alt_mint = false;
+    /* Depth-N alternate exploration (static_depth=N, default CST_ALT_DEPTH_
+     * DEFAULT).  From each minted alternate BB, follow its statically-known
+     * successors — the architectural fall-through always, and a direct
+     * branch's decoded target — recursively up to N levels, minting each
+     * never-executed block along the way (dedup + per-segment mint budget
+     * bound the walk; an indirect terminator has no static target, so that
+     * edge ends the chain).  0 mints only the immediate untaken side (no
+     * successor walk).  Inert unless alt_mint is on. */
+    uint32_t alt_depth = 0;
 };
 extern TraceFeatures g_features;
 extern char *qemu_command_line;
@@ -1512,7 +1511,9 @@ extern FILE *unknown_warn_file;
  * executed or previously-minted template, the per-segment mint budget is
  * exhausted, or its page is unmapped (probing read fails → silently
  * skipped).  @alt_pc is a branch's untaken successor (fall-through or taken
- * target). */
+ * target).  When static_depth>0, each freshly-minted block's own
+ * statically-known successors (fall-through always; a direct branch's
+ * decoded target too) are followed recursively up to that depth. */
 void altmint_pc(uint64_t alt_pc);
 
 /* Convenience for the wrong-path walker: given a completed block's terminal

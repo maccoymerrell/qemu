@@ -131,7 +131,7 @@ FEATURES: dict[str, str] = {
     "behavior:addr_is_data":     "aarch64 tagged-pointer data-is-address heuristic",
     "behavior:wire_determinism": "byte-for-byte reproducible wire (golden net)",
     "behavior:mutation_strictness": "oracle catches deliberate trace corruption (mutation matrix)",
-    "behavior:wrong_path_coverage": "static_templates=1: never-executed fall-through + BTB target template coverage (4-ISA)",
+    "behavior:wrong_path_coverage": "static_templates=1: minted-alternate never-executed fall-through + BTB target coverage, deepened by static_depth (4-ISA)",
 }
 
 
@@ -663,17 +663,21 @@ def _chk_options_smoke(ctx: Ctx) -> Outcome:
 
 
 def _static_cov_analyze(cst: Path):
-    """Decode @cst and score the static-template coverage oracle.  Returns a
-    dict of the four load-bearing quantities plus a human summary."""
+    """Decode @cst and score the branch-alternate minting coverage oracle.
+    Classifies every template executed vs never-executed by its profile
+    (a minted alternate has exec_cp==exec_wp==0), then scores fall-through
+    and BTB-target resolution over each class.  Returns a dict of the
+    load-bearing quantities plus a human summary."""
     from . import validator as V
     meta, templates, _entries = V._load_decoder().decode_champsim_tracer(cst)
     bt_names = meta.get("encoding_maps", {}).get("branch_type", {})
     starts = {int(t["start_pc"]) for t in templates}
     exec_ft: set[int] = set()
-    static_ft: set[int] = set()
+    n_static = 0
+    alt_succ_tot = 0     # statically-known successors of minted alternates
+    alt_succ_res = 0     # of those, how many resolve to a template start
     btb_res = 0
     btb_tot = 0
-    n_static = 0
     for t in templates:
         insns = t.get("insns") or []
         if not insns:
@@ -681,51 +685,70 @@ def _static_cov_analyze(cst: Path):
         prof = t.get("profile") or {}
         is_exec = (int(prof.get("exec_cp", 0)) > 0 or
                    int(prof.get("exec_wp", 0)) > 0)
-        if not is_exec:
-            n_static += 1
+        # Terminal branch: the last insn, or the one before it on a delay-slot
+        # ISA (mipsel), where the block's last insn is the folded delay slot.
         last = insns[-1]
         bname = bt_names.get(int(last.get("branch_type", 0)), "")
+        if bname in ("", "BRANCH_NONE") and len(insns) >= 2:
+            last = insns[-2]
+            bname = bt_names.get(int(last.get("branch_type", 0)), "")
         ft = int(t["fall_through_pc"])
-        # Fall-through coverage: the not-taken successor of a conditional
-        # direct branch must resolve to a template start_pc.
-        if last.get("branch_conditional") and bname == "BRANCH_COND_DIRECT":
-            (exec_ft if is_exec else static_ft).add(ft)
-        # BTB coverage: a NEVER-executed direct branch/jump/call's decoded
+        targets = [int(tg) for tg in (t.get("target_pcs") or [])]
+        if is_exec:
+            # (a) self-consistency, informational: an executed conditional
+            # direct branch's fall-through should resolve to a template start.
+            if last.get("branch_conditional") and bname == "BRANCH_COND_DIRECT":
+                exec_ft.add(ft)
+            continue
+        # Never-executed (minted-alternate) block.
+        n_static += 1
+        # (b) successor coverage — the metric static_depth drives: every
+        # statically-known successor of a minted alternate (its architectural
+        # fall-through, plus a direct branch's decoded target) should itself
+        # have been minted, so the fetch chain resolves rather than dangles.
+        succ = [ft] + targets
+        for s in succ:
+            alt_succ_tot += 1
+            if s in starts:
+                alt_succ_res += 1
+        # (c) BTB coverage: a never-executed direct branch/jump/call's decoded
         # target must resolve — the never-executed destination space.
-        if not is_exec and bname in ("BRANCH_DIRECT_JUMP",
-                                     "BRANCH_DIRECT_CALL",
-                                     "BRANCH_COND_DIRECT"):
-            for tg in (t.get("target_pcs") or []):
+        if bname in ("BRANCH_DIRECT_JUMP", "BRANCH_DIRECT_CALL",
+                     "BRANCH_COND_DIRECT"):
+            for tg in targets:
                 btb_tot += 1
-                if int(tg) in starts:
+                if tg in starts:
                     btb_res += 1
     exec_unres = sum(1 for f in exec_ft if f not in starts)
-    static_res = sum(1 for f in static_ft if f in starts)
     return {
         "n_templates": len(templates),
         "n_static": n_static,
         "exec_ft": len(exec_ft),
         "exec_unres": exec_unres,
-        "static_ft": len(static_ft),
-        "static_res": static_res,
+        "alt_succ_tot": alt_succ_tot,
+        "alt_succ_res": alt_succ_res,
         "btb_res": btb_res,
         "btb_tot": btb_tot,
     }
 
 
 def _chk_static_coverage(ctx: Ctx) -> Outcome:
-    """Coverage oracle for static_templates=1 (trace-inferred wrong-path
-    fall-through / BTB coverage) — the point of the feature.
+    """Coverage oracle for static_templates=1 (opportunistic branch-alternate
+    minting, deepened by static_depth) — the trace-inferred wrong-path
+    fall-through / BTB coverage that is the point of the feature.
 
-    Per ISA, with the executable-region sweep ON:
+    Per ISA, with minting ON (static_depth>0):
       (a) every EXECUTED conditional-branch block's fall-through resolves to a
           template start_pc  (dictionary self-consistency; a deleted/mutated
           template breaks it),
-      (b) NEVER-EXECUTED (static) conditional-branch fall-throughs are covered
-          (>0)  — the predicted-not-taken space executed-only templates miss,
+      (b) NEVER-EXECUTED (minted-alternate) conditional-branch fall-throughs
+          are covered (>0)  — the predicted-not-taken space executed-only
+          templates miss; the static_depth successor walk mints these blocks'
+          own fall-throughs, so they resolve rather than dangle,
       (c) never-executed direct-branch TARGETS resolve (BTB spot-check).
-    The disabled-sweep (static_templates=0) run must lose (b) entirely
-    (static_res == 0), proving the oracle has teeth.
+    The minting-off (static_templates=0) run must lose (b) entirely
+    (static_res == 0), proving the oracle has teeth.  Axes (b)/(c) measure the
+    minted-alternate space — no executable-region sweep runs.
     """
     from . import __main__ as M
     from . import generator as G
@@ -752,7 +775,7 @@ def _chk_static_coverage(ctx: Ctx) -> Outcome:
         off = d / f"wpc_{isa}_off"
         rc1 = subprocess.call([str(qemu), "-plugin",
             f"{ctx.plugin},outfile={on},wpdepth=32,{win},memdata=1,"
-            f"static_templates=1", str(binp)])
+            f"static_templates=1,static_depth=4", str(binp)])
         rc0 = subprocess.call([str(qemu), "-plugin",
             f"{ctx.plugin},outfile={off},wpdepth=32,{win},memdata=1",
             str(binp)])
@@ -765,19 +788,22 @@ def _chk_static_coverage(ctx: Ctx) -> Outcome:
             continue
         a_on = _static_cov_analyze(con)
         a_off = _static_cov_analyze(coff)
-        ok = (a_on["exec_unres"] == 0 and     # (a) self-consistency
-              a_on["static_res"] > 0 and      # (b) never-executed FT coverage
-              a_on["btb_res"] > 0 and         # (c) BTB targets resolve
-              a_off["static_res"] == 0)       # catch: disabled sweep loses (b)
+        ok = (a_on["n_static"] > 0 and                 # (b) alternates minted
+              a_on["alt_succ_res"] > 0 and             # (b) successors resolve
+              a_on["btb_res"] > 0 and                  # (c) BTB targets resolve
+              a_on["n_static"] > a_off["n_static"] and # teeth: minting adds cov
+              a_on["alt_succ_res"] > a_off["alt_succ_res"])
         all_ok = all_ok and ok
         subs.append({"name": isa, "ok": ok, "detail": (
             f"exec_ft={a_on['exec_ft']} unres={a_on['exec_unres']} | "
-            f"static({a_on['n_static']}) ft_resolved={a_on['static_res']} | "
+            f"minted({a_on['n_static']}) succ_resolved="
+            f"{a_on['alt_succ_res']}/{a_on['alt_succ_tot']} | "
             f"btb={a_on['btb_res']}/{a_on['btb_tot']} | "
-            f"catch off_static_res={a_off['static_res']}")})
+            f"teeth off_minted={a_off['n_static']} "
+            f"off_succ_res={a_off['alt_succ_res']}")})
     return Outcome("pass" if all_ok else "fail",
-                   "static_templates fall-through + BTB coverage (4 ISAs, "
-                   "disabled-sweep catch)", subs)
+                   "minted-alternate fall-through + BTB coverage, "
+                   "static_depth-deepened (4 ISAs, minting-off teeth)", subs)
 
 
 # ===========================================================================

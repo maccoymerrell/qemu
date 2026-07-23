@@ -957,10 +957,12 @@ Per-instruction template flags, resolved through the ``insn_flag`` map
 - ``CST_INSN_FLAG_LANE_PARALLEL`` — lane k of each dst depends only on
   lane k of every src
 - ``CST_INSN_FLAG_HAS_DEP_BLOCK`` — intra-instruction dep mask present
-- ``CST_INSN_FLAG_STATIC`` — never-executed template from the
-  executable-region sweep; uniform across a template
 - ``CST_INSN_FLAG_SYSTEM`` — privileged (non-user) execution context;
   uniform across a template, always clear in user-mode traces
+
+(Bit 3 is reserved — it formerly carried ``CST_INSN_FLAG_STATIC``, retired
+with the executable-region sweep.  Never-executed coverage is now supplied
+by opportunistic branch-alternate minting, whose templates carry no flag.)
 
 ``CST_INSN_FLAG_SYSTEM`` distinguishes the kernel instructions of a
 system-mode trace (the traced-but-not-counted privileged execution of
@@ -972,21 +974,18 @@ User-mode traces, and traces predating the flag, omit the name from the
 ``insn_flag`` map and never set the bit; a consumer resolves an absent
 name as "always user".
 
-``CST_INSN_FLAG_STATIC`` marks a template minted by the executable-region
-sweep (``static_templates=1`` — armed at segment open, and again for any
-region that gains execute permission afterward, such as a dynamically
-loaded library) rather than by execution: the block was fetched and
-decoded from a mapped executable region but never ran on the correct or
-wrong path.  It exists so a
-consumer reconstructing a wrong path from the binary can resolve
-fall-through and branch-target PCs an executed-only dictionary never
-reaches.  Static templates are unreferenced dictionary entries — no body
-record points at them — and their profile counts are zero; a block that
-is both swept and later executed is carried by its executed template,
-which never sets the bit.  Uniform across a template (a whole block is
-static or it is not).  Traces without the sweep omit the name from the
-``insn_flag`` map and never set the bit, so they are byte-identical to a
-pre-feature trace.
+Never-executed fetch/decode coverage (``static_templates=1``) is delivered
+by opportunistic branch-alternate minting.  A minted alternate is an
+**ordinary** dictionary entry carrying **no** distinguishing wire flag: it
+is a template whose profile counts are zero and which no body record
+references, indistinguishable from any block that simply never executed —
+because that is exactly what it is.  A consumer reconstructing a wrong path
+from the binary resolves fall-through and branch-target PCs against the
+dictionary as a whole; it does not need to tell minted from merely-unexecuted
+blocks apart.  A block that is both minted and later executed is carried by
+its executed template (real id, real profile), which shadows the alternate at
+serialization.  The trace is byte-identical in the body whether or not the
+feature is on; the delta is templates-section-only.
 
 ``dep_block_flag`` map (only inspected when ``CST_INSN_FLAG_HAS_DEP_BLOCK``
 is set on the per-insn flag byte), resolved through the

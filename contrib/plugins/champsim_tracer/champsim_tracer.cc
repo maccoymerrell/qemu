@@ -2218,114 +2218,49 @@ static uint64_t g_seg_arch_insns = 0;
 static uint64_t g_seg_warmup_end_arch_insns = UINT64_MAX;
 
 /* ============================================================
- * Static-template sweep (static_templates=1, user mode).
+ * Opportunistic branch-alternate minting (static_templates=1, both modes).
  *
- * At segment open, linear-decode the guest's mapped executable regions
- * through the SAME decode pipeline the dynamic path uses (Capstone raw
- * decode -> decode_detail_to_generic -> the fragment-splitter's
- * branch-terminator / delay-slot rules) and mint never-executed STATIC
- * true-BB templates into static_map_.  This covers the fall-through and
- * branch-target space a trace-inferred wrong-path consumer needs but
- * executed-only templates never reach.  Cost is one-time per segment open;
- * nothing here touches the execution hot path.
+ * The never-executed fetch/decode space a trace-inferred wrong-path consumer
+ * fetches is, block by block, the UNTAKEN side of a branch.  Rather than
+ * enumerate the whole executable footprint up front, the plugin mints that
+ * side exactly when a branch is evaluated: at every branch the correct path
+ * or a wrong-path excursion resolves, the UNTAKEN side's true BB is decoded
+ * (through the same Capstone -> decode_detail_to_generic -> fragment-splitter
+ * machinery the dynamic path uses) and minted as an ordinary never-executed
+ * dictionary template — unless it is already covered.  Coverage is therefore
+ * CONVERGENT (the dictionary fills as branches are seen) and mode-independent
+ * (it needs no region enumeration at all, so it covers system mode too).
  *
- * A region mapped or granted execute permission AFTER the segment-open
- * sweep already ran — a dynamically-loaded library, a JIT code page — is
- * covered too: qemu_plugin_exec_region_grew (registered as
- * static_sweep_region_grew_cb) fires from the linux-user mmap/mprotect
- * path whenever a call grants PAGE_EXEC, queues the range, and the next CP
- * TB exec resweeps just that range (run_static_template_resweep).  The
- * notify callback itself is off the execution hot path (it runs from
- * syscall emulation, not TB exec); the hot path only pays for a cheap
- * atomic-flag check per TB.
+ * With static_depth>0, each freshly-minted block's own statically-known
+ * successors are followed recursively — the architectural fall-through
+ * always, and a direct branch's decoded target too (both edges of a
+ * direct terminator are statically known; an indirect terminator has no
+ * static target, so that edge ends the chain).  This deepens coverage from
+ * just the immediate untaken side toward the whole reachable never-executed
+ * region a mispredict-driven consumer wanders into.
+ *
+ * This fills the two gaps a wrong path alone leaves: branches INSIDE
+ * wrong-path blocks (which follow their resolved direction, so their
+ * alternates are never walked) and branches whose wrong-path fork never
+ * launched (wpprune, budget, translation-unavail, wp=0).
+ *
+ * Off the hot path by construction: the presence test is one hash lookup per
+ * evaluated branch (the walker already does lookups); the decode + successor
+ * walk fire only on a miss, which trends to ~0 after warmup.  Guest bytes are
+ * read with the same probing read the wrong path uses (mapped page -> decode;
+ * unmapped -> skipped, counted), so enumeration never demand-pages or
+ * perturbs the guest.
  * ============================================================ */
 
-/* Per-run and process-wide sweep accounting (reported at segment finish /
- * plugin exit).  Written under exec_lock (the sweep runs from
- * start_trace_segment, which holds it). */
-struct StaticSweepStats {
-    uint64_t sweeps        = 0;   /* segment-open sweeps performed          */
-    uint64_t regions       = 0;   /* executable regions enumerated          */
-    uint64_t region_bytes  = 0;   /* total bytes spanned by those regions   */
-    uint64_t insns         = 0;   /* instructions decoded                   */
-    uint64_t bbs           = 0;   /* STATIC true-BB templates minted        */
-    uint64_t desync_reseeds = 0;  /* runs abandoned on a decode desync      */
-    uint64_t targets_seeded = 0;  /* direct-branch targets queued as seeds  */
-    uint64_t cap_hits      = 0;   /* sweeps that hit the per-sweep insn cap */
-    uint64_t late_events   = 0;   /* exec_region_grew notifications queued  */
-    uint64_t late_resweeps = 0;   /* late-mapping regions actually resweapt */
-    double   seconds       = 0.0; /* cumulative wall time                   */
-};
-static StaticSweepStats g_static_sweep;
-
-/* Armed at each segment open (static_templates=1); consumed once, on the
- * first in-segment correct-path TB exec, where a live vCPU and the mapped
- * guest exist — the default user-mode window opens at install time with no
- * vCPU yet, so the sweep cannot run at open.  Touched only under exec_lock. */
-static bool g_static_sweep_armed = false;
-
-/* Per-sweep instruction budget (task: ~16M) and a defensive per-BB length
- * cap so a branch-free region (or data decoding as straight-line insns)
- * cannot mint one unbounded template. */
-static constexpr uint64_t CST_STATIC_SWEEP_INSN_CAP = 16ull * 1024 * 1024;
-static constexpr uint32_t CST_STATIC_BB_MAX_INSNS   = 4096;
-
-/* Consecutive zero-progress desyncs (no instruction decoded between two
- * resync steps) that abandon the rest of a seed's linear scan.  Ordinary
- * data-in-text noise recovers within a handful of bytes (n > 0 resets the
- * run); this bounds the pathological case a late resweep can hit that the
- * segment-open sweep cannot — a region queued by
- * qemu_plugin_exec_region_grew and unmapped again before the drain runs,
- * where every decode in [seed, reg->end) fails and the CST_STATIC_SWEEP_
- * INSN_CAP above (an insns-decoded budget) never trips because nothing
- * decodes. */
-static constexpr uint32_t CST_STATIC_STALE_DESYNC_LIMIT = 256;
-
-namespace {
-struct SweepRegion { uint64_t start; uint64_t end; };
-}
-
-/* walk_exec_regions callback: append region bounds only (runs under the
- * user-mode mmap_lock; the decode/read pass runs after the walk returns). */
-static int static_sweep_collect_cb(void *userp, uint64_t start, uint64_t end)
-{
-    auto *out = static_cast<std::vector<SweepRegion> *>(userp);
-    out->push_back({start, end});
-    return 0;
-}
-
-/* Late-mapping resweep queue (static_templates=1).  qemu_plugin_exec_region_
- * grew fires from the linux-user mmap/mprotect path (page_set_flags), with
- * the guest's mmap_lock held, whenever a call grants PAGE_EXEC over a
- * range — a region mapped after the segment-open sweep already ran (a
- * dynamically-loaded library, a JIT code page).  The notify callback only
- * pushes the range here; g_pending_sweep_lock is a leaf lock never held
- * across a guest-memory read or exec_lock/data_lock acquisition, so it
- * cannot invert the mmap_lock-before-data_lock order the segment-open sweep
- * documents.  The queue is drained on the owning vCPU's next CP TB exec
- * (events_path_step), where exec_lock is already held and a normal (not
- * recursively-locked) call into the decode pipeline is safe. */
-static GMutex g_pending_sweep_lock;
-static std::vector<SweepRegion> g_pending_sweep_regions;
-static std::atomic<bool> g_pending_sweep_nonempty{false};
-
-/* Registered as the qemu_plugin_register_exec_region_grew_cb hook (armed
- * only when static_templates is on — see qemu_plugin_install).  Must stay
- * cheap: it runs on whatever thread is servicing the guest's mmap/mprotect
- * syscall, with the linux-user mmap_lock held. */
-static void static_sweep_region_grew_cb(uint64_t start, uint64_t end)
-{
-    g_mutex_lock(&g_pending_sweep_lock);
-    g_pending_sweep_regions.push_back({start, end});
-    g_mutex_unlock(&g_pending_sweep_lock);
-    g_pending_sweep_nonempty.store(true, std::memory_order_release);
-}
+/* Defensive per-BB length cap: a branch-free region (or data decoding as
+ * straight-line insns) cannot mint one unbounded template. */
+static constexpr uint32_t CST_ALT_BB_MAX_INSNS = 4096;
 
 /* True iff @bt is a control-transfer that carries an architectural delay
  * slot on this ISA (mirrors split_tb_into_fragments::has_delay_slot).  The
  * exception-return family (eret/eretnc/deret) is BRANCH_RETURN but has no
  * slot; QEMU ends the TB there, so exclude it. */
-static bool static_sweep_has_delay_slot(uint8_t bt, const char *mnem)
+static bool alt_has_delay_slot(uint8_t bt, const char *mnem)
 {
     if (bt != BRANCH_DIRECT_JUMP && bt != BRANCH_INDIRECT_JUMP &&
         bt != BRANCH_RETURN && bt != BRANCH_COND_DIRECT &&
@@ -2338,381 +2273,11 @@ static bool static_sweep_has_delay_slot(uint8_t bt, const char *mnem)
     return strcmp(mnem, "deret") != 0;
 }
 
-/*
- * Sweep @regions and mint STATIC true-BB templates.  Shared by the
- * segment-open sweep (run_static_template_sweep, @late false, every
- * currently-mapped region) and the late-mapping resweep
- * (run_static_template_resweep, @late true, only regions notified via
- * qemu_plugin_exec_region_grew after the segment-open sweep already ran).
- * Caller holds exec_lock and guarantees: static_templates on, user mode, a
- * live executing vCPU (current_cpu valid), cst_cap_arch resolved, @regions
- * non-empty.  Grabs data_lock around the static_map_ mutations, matching
- * the dynamic commit paths.
- */
-static void sweep_regions(const std::vector<SweepRegion> &regions, bool late)
-{
-    GTimer *timer = g_timer_new();
-
-    const bool delay_isa = isa_properties[trace_isa].branch_delay_slots > 0;
-    const bool with_names = g_features.reg_data || g_features.wp_reg_data;
-
-    /* Worklist of BB-start PCs (DFS) with a visited filter.  Seeded with
-     * every region base (covers all fall-through blocks linearly) and grown
-     * with each direct branch's decoded target (covers BTB destinations into
-     * never-executed space). */
-    std::vector<uint64_t> worklist;
-    std::unordered_set<uint64_t> visited;
-    for (const SweepRegion &r : regions) {
-        worklist.push_back(r.start);
-        g_static_sweep.region_bytes += r.end - r.start;
-    }
-    g_static_sweep.regions += regions.size();
-
-    auto find_region = [&](uint64_t pc) -> const SweepRegion * {
-        for (const SweepRegion &r : regions) {
-            if (pc >= r.start && pc < r.end) {
-                return &r;
-            }
-        }
-        return nullptr;
-    };
-
-    /* Reusable guest-byte window: refilled in ~page chunks as the sweep
-     * advances, so decode is a sequential scan rather than a read per insn. */
-    GByteArray *win = g_byte_array_new();
-    uint64_t win_base = 0;
-    uint64_t win_len  = 0;
-    bool     win_ok   = false;
-    auto window_at = [&](uint64_t pc, uint64_t region_end,
-                         const uint8_t **out, uint64_t *avail) -> bool {
-        if (!win_ok || pc < win_base || pc >= win_base + win_len) {
-            uint64_t want = region_end - pc;
-            if (want == 0) {
-                return false;
-            }
-            if (want > 4096) {
-                want = 4096;
-            }
-            if (!qemu_plugin_read_memory_vaddr(pc, win, (size_t)want)) {
-                win_ok = false;
-                return false;
-            }
-            win_base = pc;
-            win_len  = win->len;
-            win_ok   = true;
-        }
-        *out   = win->data + (pc - win_base);
-        *avail = win_base + win_len - pc;
-        return *avail > 0;
-    };
-
-    /* Per-BB scratch (plain locals — the sweep runs once per segment open,
-     * so a fresh allocation here is cheap and keeps these large buffers out
-     * of the plugin's static TLS block).  fscratch/nscratch own the span
-     * backing; the InsnFields/InsnRegNames copies carry span pointers into
-     * that backing, which stays alive across the commit. */
-    std::vector<InsnFieldsScratch>   fscratch(CST_STATIC_BB_MAX_INSNS);
-    std::vector<InsnRegNamesScratch> nscratch(CST_STATIC_BB_MAX_INSNS);
-    std::vector<InsnFields>          fields(CST_STATIC_BB_MAX_INSNS);
-    std::vector<InsnRegNames>        regnames(CST_STATIC_BB_MAX_INSNS);
-    std::vector<uint64_t>            pcs(CST_STATIC_BB_MAX_INSNS);
-    std::vector<uint8_t>             sizes(CST_STATIC_BB_MAX_INSNS);
-    std::vector<uint8_t>             bytes((size_t)CST_STATIC_BB_MAX_INSNS *
-                                           MAX_INSN_BYTES);
-    std::vector<uint8_t>             dslot(CST_STATIC_BB_MAX_INSNS);
-
-    uint64_t swept = 0;
-    bool     cap_hit = false;
-
-    /* Decode ONE instruction at @pc into slot @i; returns bytes consumed
-     * (0 on decode failure).  Fills pcs/sizes/bytes/fields[/regnames] and
-     * records the branch type (@out_bt) and whether it carries a delay slot
-     * (dslot[i]) — both derived while the Capstone detail is in hand. */
-    auto decode_one = [&](uint64_t pc, uint64_t region_end, uint32_t i,
-                          uint8_t *out_bt) -> uint8_t {
-        const uint8_t *p = nullptr;
-        uint64_t avail = 0;
-        if (!window_at(pc, region_end, &p, &avail)) {
-            return 0;
-        }
-        qemu_plugin_insn_info info;
-        if (!qemu_plugin_cap_decode(cst_cap_arch, cst_cap_mode, p,
-                                    (size_t)avail, pc, &info)) {
-            return 0;
-        }
-        uint8_t sz = info.insn_size;
-        if (sz == 0 || sz > MAX_INSN_BYTES || sz > avail) {
-            return 0;
-        }
-        insn_fields_scratch_reset(&fscratch[i]);
-        if (with_names) {
-            insn_reg_names_scratch_reset(&nscratch[i]);
-        }
-        decode_detail_to_generic(pc, &info, &fscratch[i].f,
-                                 with_names ? &nscratch[i].rn : nullptr);
-        uint8_t bt = fscratch[i].f.branch_type;
-        pcs[i]   = pc;
-        sizes[i] = sz;
-        memcpy(&bytes[(size_t)i * MAX_INSN_BYTES], p, sz);
-        if (sz < MAX_INSN_BYTES) {
-            memset(&bytes[(size_t)i * MAX_INSN_BYTES + sz], 0,
-                   MAX_INSN_BYTES - sz);
-        }
-        fields[i] = fscratch[i].f;
-        if (with_names) {
-            regnames[i] = nscratch[i].rn;
-        }
-        dslot[i] = (delay_isa && bt != BRANCH_NONE &&
-                    static_sweep_has_delay_slot(bt, info.mnemonic)) ? 1 : 0;
-        *out_bt = bt;
-        return sz;
-    };
-
-    /* Byte-granular resync step over an undecodable position: 1 for x86
-     * (variable width — the next instruction may start at the next byte);
-     * a small fixed step elsewhere (RISC-V's 2-byte compressed granularity
-     * is the safe minimum). */
-    const uint64_t resync_step = (trace_isa == TRACE_ISA_X86) ? 1 : 2;
-
-    /* data_lock is taken ONLY around each commit_static_bb below — never
-     * across a guest-byte read.  qemu_plugin_read_memory_vaddr takes the
-     * user-mode mmap_lock, and the translation path holds mmap_lock before
-     * data_lock; holding data_lock across a read here would invert that
-     * order and can deadlock a concurrently-translating vCPU. */
-    while (!worklist.empty() && swept < CST_STATIC_SWEEP_INSN_CAP) {
-        uint64_t seed = worklist.back();
-        worklist.pop_back();
-        const SweepRegion *reg = find_region(seed);
-        if (!reg) {
-            continue;   /* a target outside every exec region — inert */
-        }
-
-        /* Linear scan from @seed to the region end: mint every branch-
-         * delimited true BB in that span, resyncing byte-by-byte over any
-         * undecodable bytes (x86 desync, data in text).  Stop early if the
-         * scan reaches a BB start an earlier scan already covered. */
-        uint64_t cur = seed;
-        uint32_t stale_run = 0;
-        while (cur < reg->end && swept < CST_STATIC_SWEEP_INSN_CAP) {
-            if (visited.count(cur)) {
-                break;   /* the remainder of this line is already covered */
-            }
-            uint64_t bb_start = cur;
-            uint32_t n = 0;
-            bool     sealed = false;
-            bool     desync = false;
-            uint64_t bb_target = 0;
-            bool     bb_target_valid = false;
-
-            while (n < CST_STATIC_BB_MAX_INSNS && cur < reg->end &&
-                   swept < CST_STATIC_SWEEP_INSN_CAP) {
-                uint8_t bt = BRANCH_NONE;
-                uint8_t sz = decode_one(cur, reg->end, n, &bt);
-                if (sz == 0) {
-                    desync = true;
-                    break;
-                }
-                uint32_t branch_idx = n;
-                n++;
-                swept++;
-                cur += sz;
-
-                if (bt == BRANCH_NONE) {
-                    continue;
-                }
-                /* Fold the delay slot (delay-slot ISA branch), then seal. */
-                if (dslot[branch_idx] && n < CST_STATIC_BB_MAX_INSNS &&
-                    cur < reg->end && swept < CST_STATIC_SWEEP_INSN_CAP) {
-                    uint8_t sbt = BRANCH_NONE;
-                    uint8_t ssz = decode_one(cur, reg->end, n, &sbt);
-                    if (ssz != 0) {
-                        n++;
-                        swept++;
-                        cur += ssz;
-                    }
-                }
-                /* Direct-branch target from the normalized immediate
-                 * (absolute after decode_detail_to_generic). */
-                if ((bt == BRANCH_COND_DIRECT || bt == BRANCH_DIRECT_JUMP ||
-                     bt == BRANCH_DIRECT_CALL) &&
-                    fields[branch_idx].has_immediate) {
-                    bb_target = (uint64_t)fields[branch_idx].immediate;
-                    bb_target_valid = true;
-                }
-                sealed = true;
-                break;
-            }
-
-            if (n > 0) {
-                stale_run = 0;
-                /* Commit the block: sealed → fall-through is the post-branch
-                 * PC; unterminated (desync mid-block, region end, or length
-                 * cap) → the next linear PC.  data_lock scopes ONLY the
-                 * static_map_ mutation — not the reads above. */
-                uint64_t bb_ft = sealed ? cur : pcs[n - 1] + sizes[n - 1];
-                g_mutex_lock(&data_lock);
-                BBTemplate *t = g_template_store.commit_static_bb(
-                    bb_start, n, pcs.data(), fields.data(), sizes.data(),
-                    bytes.data(), with_names ? regnames.data() : nullptr,
-                    /* symbol_name= */ nullptr, bb_ft);
-                if (t && bb_target_valid && t->taken_pc == 0) {
-                    /* A never-executed direct branch's declared taken edge
-                     * is its decoded target (counts stay zero). */
-                    t->taken_pc = bb_target;
-                }
-                g_mutex_unlock(&data_lock);
-                visited.insert(bb_start);
-                if (t) {
-                    g_static_sweep.bbs++;
-                }
-                /* Queue the taken target for BTB coverage of never-executed
-                 * destinations. */
-                if (sealed && bb_target_valid) {
-                    worklist.push_back(bb_target);
-                    g_static_sweep.targets_seeded++;
-                }
-            }
-
-            if (desync) {
-                /* Undecodable byte at @cur: step past it and keep scanning.
-                 * (When n == 0, cur == bb_start.) */
-                g_static_sweep.desync_reseeds++;
-                cur += resync_step;
-                /* late-only: the segment-open sweep's region list is fresh
-                 * from the walk it just performed, so it cannot go stale
-                 * mid-scan the way a queued late-resweep region can (see
-                 * CST_STATIC_STALE_DESYNC_LIMIT).  Scoping the abandon to
-                 * @late keeps run_static_template_sweep's output exactly as
-                 * measured before this resweep path existed. */
-                if (late && n == 0 &&
-                    ++stale_run >= CST_STATIC_STALE_DESYNC_LIMIT) {
-                    /* CST_STATIC_STALE_DESYNC_LIMIT consecutive desyncs with
-                     * no successful decode between them: this is not
-                     * data-in-text noise (which recovers within a handful
-                     * of bytes and resets stale_run above) — abandon the
-                     * rest of this seed's scan rather than stepping
-                     * byte-by-byte to reg->end for a region unmapped again
-                     * before the drain ran. */
-                    break;
-                }
-            }
-            /* else cur already sits at the fall-through / next-BB start. */
-        }
-    }
-    cap_hit = (swept >= CST_STATIC_SWEEP_INSN_CAP);
-
-    g_byte_array_free(win, TRUE);
-
-    if (late) {
-        g_static_sweep.late_resweeps += regions.size();
-    } else {
-        g_static_sweep.sweeps++;
-    }
-    g_static_sweep.insns += swept;
-    if (cap_hit) {
-        g_static_sweep.cap_hits++;
-    }
-    g_static_sweep.seconds += g_timer_elapsed(timer, nullptr);
-    g_timer_destroy(timer);
-}
-
-/*
- * Segment-open sweep: enumerate every currently-mapped executable region
- * via qemu_plugin_walk_exec_regions and sweep all of them.  See
- * sweep_regions() for the caller contract (exec_lock held, etc.).
- */
-static void run_static_template_sweep(void)
-{
-    if (cst_cap_arch < 0) {
-        return;   /* no Capstone arch for this ISA — cannot decode */
-    }
-    /* cst_cap_mode is resolved in the first vcpu_init_cb, which precedes any
-     * TB exec (and thus this sweep); a legitimately-zero mode
-     * (CS_MODE_LITTLE_ENDIAN == 0 for AArch64) is correct, not "unresolved". */
-
-    std::vector<SweepRegion> regions;
-    qemu_plugin_walk_exec_regions(static_sweep_collect_cb, &regions);
-    if (regions.empty()) {
-        return;
-    }
-    sweep_regions(regions, /*late=*/false);
-}
-
-/*
- * Late-mapping resweep: drain the queue static_sweep_region_grew_cb filled
- * (a linux-user mmap/mprotect grants execute permission after the
- * segment-open sweep already ran — a dynamically-loaded library, a JIT code
- * page) and sweep just those regions.  Runs from events_path_step, on the
- * owning vCPU's next CP TB exec after the notification, with exec_lock
- * already held — see sweep_regions() for the rest of the caller contract.
- *
- * Batch dedup only: exact-duplicate (start, end) pairs queued between two
- * drains collapse to one sweep.  A region swept in an earlier drain is not
- * excluded from a later one — a re-mprotect'd JIT page legitimately may
- * carry new code, and commit_static_bb's own key dedup makes resweeping
- * unchanged content a cheap no-op rather than a correctness hazard.
- */
-static void run_static_template_resweep(void)
-{
-    if (cst_cap_arch < 0) {
-        g_mutex_lock(&g_pending_sweep_lock);
-        g_pending_sweep_regions.clear();
-        g_mutex_unlock(&g_pending_sweep_lock);
-        g_pending_sweep_nonempty.store(false, std::memory_order_relaxed);
-        return;
-    }
-
-    std::vector<SweepRegion> batch;
-    g_mutex_lock(&g_pending_sweep_lock);
-    batch.swap(g_pending_sweep_regions);
-    g_mutex_unlock(&g_pending_sweep_lock);
-    g_pending_sweep_nonempty.store(false, std::memory_order_relaxed);
-    if (batch.empty()) {
-        return;
-    }
-    g_static_sweep.late_events += batch.size();
-
-    std::sort(batch.begin(), batch.end(),
-             [](const SweepRegion &a, const SweepRegion &b) {
-                 return a.start != b.start ? a.start < b.start
-                                            : a.end < b.end;
-             });
-    batch.erase(std::unique(batch.begin(), batch.end(),
-                            [](const SweepRegion &a, const SweepRegion &b) {
-                                return a.start == b.start && a.end == b.end;
-                            }),
-               batch.end());
-
-    sweep_regions(batch, /*late=*/true);
-}
-
-/* ============================================================
- * Opportunistic branch-alternate minting (static_templates=1, both modes).
- *
- * The executable-region sweep (P1) covers the never-executed fetch/decode
- * space EAGERLY, but only in user mode and only for what a page-flags walk
- * can enumerate.  Opportunistic minting covers it CONVERGENTLY and
- * mode-independently: at every branch the correct path or a wrong-path
- * excursion evaluates, the UNTAKEN side's true BB is decoded (through the
- * same Capstone -> decode_detail_to_generic -> fragment-splitter machinery
- * the dynamic path uses) and minted as an ordinary never-executed dictionary
- * template — unless it is already covered.  This fills the two gaps the
- * sweep and the wrong path leave: branches INSIDE wrong-path blocks (which
- * follow their resolved direction, so their alternates are never walked) and
- * branches whose wrong-path fork never launched (wpprune, budget,
- * translation-unavail, wp=0).
- *
- * Off the hot path by construction: the presence test is one hash lookup per
- * evaluated branch (the walker already does lookups); the decode fires only
- * on a miss, which trends to ~0 after warmup.  Guest bytes are read with the
- * same probing read the wrong path uses (mapped page -> decode; unmapped ->
- * skipped, counted), so enumeration never demand-pages or perturbs the guest.
- * ============================================================ */
-
 struct AltMintStats {
-    uint64_t checks         = 0;  /* branches whose untaken side was tested   */
+    uint64_t checks         = 0;  /* PCs whose coverage was tested            */
     uint64_t mints          = 0;  /* never-executed alternates minted         */
-    uint64_t skips_unmapped = 0;  /* untaken target unmapped/undecodable      */
+    uint64_t depth_mints    = 0;  /* subset of mints from the depth>0 walk     */
+    uint64_t skips_unmapped = 0;  /* target unmapped/undecodable              */
     uint64_t budget_hits    = 0;  /* mints skipped for the per-segment budget */
 };
 static AltMintStats g_alt_mint;
@@ -2727,7 +2292,7 @@ static uint64_t g_alt_mint_budget_used = 0;
 /*
  * Decode ONE true BB starting at @pc into the supplied scratch arrays,
  * stopping at the first branch terminator (folding a delay slot on
- * delay-slot ISAs) or CST_STATIC_BB_MAX_INSNS.  Guest bytes are read in one
+ * delay-slot ISAs) or CST_ALT_BB_MAX_INSNS.  Guest bytes are read in one
  * page-bounded window via the probing qemu_plugin_read_memory_vaddr (unmapped
  * -> read fails).  Returns the instruction count (0 iff the very first insn
  * could not be read/decoded — unmapped or undecodable), sets *out_ft to the
@@ -2812,14 +2377,14 @@ static uint32_t alt_decode_one_bb(uint64_t pc,
         }
         *out_bt = bt;
         *out_dslot = (delay_isa && bt != BRANCH_NONE &&
-                      static_sweep_has_delay_slot(bt, info.mnemonic));
+                      alt_has_delay_slot(bt, info.mnemonic));
         return sz;
     };
 
     uint64_t cur = pc;
     uint32_t n = 0;
     bool sealed = false;
-    while (n < CST_STATIC_BB_MAX_INSNS) {
+    while (n < CST_ALT_BB_MAX_INSNS) {
         uint8_t bt = BRANCH_NONE;
         bool dslot = false;
         uint8_t sz = decode_one(cur, n, &bt, &dslot);
@@ -2833,7 +2398,7 @@ static uint32_t alt_decode_one_bb(uint64_t pc,
             continue;
         }
         /* Fold the delay slot, then seal. */
-        if (dslot && n < CST_STATIC_BB_MAX_INSNS) {
+        if (dslot && n < CST_ALT_BB_MAX_INSNS) {
             uint8_t sbt = BRANCH_NONE;
             bool sd = false;
             uint8_t ssz = decode_one(cur, n, &sbt, &sd);
@@ -2859,29 +2424,39 @@ static uint32_t alt_decode_one_bb(uint64_t pc,
     return n;
 }
 
-void altmint_pc(uint64_t alt_pc)
+/*
+ * Mint ONE never-executed alternate at @pc into alt_map_, unless it is
+ * already covered (executed / previously-minted), the mint budget is
+ * exhausted, or its page is unmapped/undecodable.  On a successful mint,
+ * reports the block's statically-known successors: *out_ft is the
+ * architectural fall-through (always defined) and *out_taken the terminal
+ * direct-branch's decoded target (0 for an indirect / non-branch terminator).
+ * Returns true iff a fresh template was committed (the only case the caller
+ * recurses on).  Takes data_lock internally, releasing it around the guest
+ * read; caller must hold exec_lock and NOT data_lock.
+ */
+static bool altmint_one(uint64_t pc, uint64_t *out_ft, uint64_t *out_taken)
 {
-    if (!g_features.alt_mint || alt_pc == 0) {
-        return;
-    }
+    *out_ft = 0;
+    *out_taken = 0;
     g_alt_mint.checks++;
 
     /* One hash lookup: already carried by an executed or previously-minted
      * template?  Existing wins (find_existing_true_bb / alt_map_ dedup
      * semantics) — nothing to do. */
     g_mutex_lock(&data_lock);
-    bool covered = g_template_store.alt_or_bb_covered(alt_pc);
+    bool covered = g_template_store.alt_or_bb_covered(pc);
     g_mutex_unlock(&data_lock);
     if (covered) {
-        return;
+        return false;
     }
 
     if (g_alt_mint_budget_used >= CST_ALT_MINT_BUDGET) {
         g_alt_mint.budget_hits++;
-        return;
+        return false;
     }
     if (cst_cap_arch < 0) {
-        return;   /* no Capstone arch for this ISA — cannot decode */
+        return false;   /* no Capstone arch for this ISA — cannot decode */
     }
 
     const bool with_names = g_features.reg_data || g_features.wp_reg_data;
@@ -2890,11 +2465,11 @@ void altmint_pc(uint64_t alt_pc)
      * trend to zero — so a fresh allocation here keeps these large buffers
      * out of the plugin's static TLS block).  fscratch/nscratch back the
      * span copies inside build_bb_template's pack, which deep-copies. */
-    std::vector<uint64_t>      pcs(CST_STATIC_BB_MAX_INSNS);
-    std::vector<InsnFields>    fields(CST_STATIC_BB_MAX_INSNS);
-    std::vector<InsnRegNames>  regnames(CST_STATIC_BB_MAX_INSNS);
-    std::vector<uint8_t>       sizes(CST_STATIC_BB_MAX_INSNS);
-    std::vector<uint8_t>       bytes((size_t)CST_STATIC_BB_MAX_INSNS *
+    std::vector<uint64_t>      pcs(CST_ALT_BB_MAX_INSNS);
+    std::vector<InsnFields>    fields(CST_ALT_BB_MAX_INSNS);
+    std::vector<InsnRegNames>  regnames(CST_ALT_BB_MAX_INSNS);
+    std::vector<uint8_t>       sizes(CST_ALT_BB_MAX_INSNS);
+    std::vector<uint8_t>       bytes((size_t)CST_ALT_BB_MAX_INSNS *
                                      MAX_INSN_BYTES);
 
     uint64_t ft = 0, taken = 0;
@@ -2902,16 +2477,16 @@ void altmint_pc(uint64_t alt_pc)
      * the mmap_lock (user) / walks the page table (system), and the
      * translation path holds mmap_lock before data_lock — holding data_lock
      * across the read would invert that order. */
-    uint32_t n = alt_decode_one_bb(alt_pc, pcs, fields, regnames, sizes,
+    uint32_t n = alt_decode_one_bb(pc, pcs, fields, regnames, sizes,
                                    bytes, with_names, &ft, &taken);
     if (n == 0) {
         g_alt_mint.skips_unmapped++;   /* unmapped page or undecodable head */
-        return;
+        return false;
     }
 
     g_mutex_lock(&data_lock);
     BBTemplate *t = g_template_store.commit_alt_bb(
-        alt_pc, n, pcs.data(), fields.data(), sizes.data(), bytes.data(),
+        pc, n, pcs.data(), fields.data(), sizes.data(), bytes.data(),
         with_names ? regnames.data() : nullptr,
         /* symbol_name= */ nullptr, ft);
     if (t && taken != 0 && t->taken_pc == 0) {
@@ -2923,6 +2498,59 @@ void altmint_pc(uint64_t alt_pc)
 
     g_alt_mint.mints++;
     g_alt_mint_budget_used++;
+    *out_ft = ft;
+    *out_taken = taken;
+    return true;
+}
+
+void altmint_pc(uint64_t alt_pc)
+{
+    if (!g_features.alt_mint || alt_pc == 0) {
+        return;
+    }
+
+    /* Depth-0 (static_depth==0): mint just the immediate untaken side.  The
+     * fast common case skips the worklist machinery entirely. */
+    uint64_t ft = 0, taken = 0;
+    bool minted = altmint_one(alt_pc, &ft, &taken);
+    if (!minted || g_features.alt_depth == 0) {
+        return;
+    }
+
+    /*
+     * Depth-N: from each freshly-minted block, follow its statically-known
+     * successors — the fall-through always, and a direct branch's decoded
+     * target too (an indirect terminator reports taken==0, ending that
+     * chain).  DFS worklist of (pc, depth); recurse only on blocks this call
+     * actually minted, so dedup (alt_or_bb_covered) + the per-segment budget
+     * bound the walk and a cycle can never spin (a re-visited PC is already
+     * covered and stops).  A local seen-set keeps the worklist from ballooning
+     * with duplicate pending PCs.  All off the hot path: this runs only when
+     * a miss was minted, which trends to zero after warmup.
+     */
+    std::vector<std::pair<uint64_t, uint32_t>> work;
+    std::unordered_set<uint64_t> seen;
+    auto enqueue = [&](uint64_t pc, uint32_t depth) {
+        if (pc != 0 && seen.insert(pc).second) {
+            work.emplace_back(pc, depth);
+        }
+    };
+    seen.insert(alt_pc);
+    enqueue(ft, 1);
+    enqueue(taken, 1);
+    while (!work.empty()) {
+        auto [pc, depth] = work.back();
+        work.pop_back();
+        uint64_t s_ft = 0, s_taken = 0;
+        if (!altmint_one(pc, &s_ft, &s_taken)) {
+            continue;   /* covered / unmapped / budget — chain ends here */
+        }
+        g_alt_mint.depth_mints++;
+        if (depth < g_features.alt_depth) {
+            enqueue(s_ft, depth + 1);
+            enqueue(s_taken, depth + 1);
+        }
+    }
 }
 
 void altmint_conditional_alternate(const InsnFields *terminal,
@@ -3113,15 +2741,6 @@ static void start_trace_segment(const char *label,
                 mi.arena / 1073741824.0, mi.uordblks / 1073741824.0,
                 mi.hblkhd / 1073741824.0);
     }
-
-    /* Arm the static-template sweep for this segment.  It cannot run here:
-     * the default user-mode window opens at install time (cpu_index == -1)
-     * with no vCPU and no guest mapped yet.  The first in-segment
-     * correct-path TB exec (events_path_step, under exec_lock, live vCPU,
-     * guest mapped) consumes the flag and runs run_static_template_sweep
-     * exactly once.  User mode only — g_features.static_templates is forced
-     * off in system mode. */
-    g_static_sweep_armed = g_features.static_templates;
 
     /* Opportunistic branch-alternate minting is segment-scoped (alt_map_ is
      * dropped at clear_bb_map); re-arm its per-segment mint budget. */
@@ -4864,27 +4483,6 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     }
 
     g_rec_mutex_lock(&exec_lock);
-
-    /* Static-template sweep, one-shot per segment.  Runs on the first
-     * in-segment correct-path TB — a live user-mode vCPU with the guest's
-     * executable regions mapped — which is where the armed flag (set at
-     * segment open) is first observed.  run_static_template_sweep grabs
-     * data_lock internally for the static_map_ mutation. */
-    if (g_static_sweep_armed) {
-        g_static_sweep_armed = false;
-        run_static_template_sweep();
-    }
-
-    /* Late-mapping resweep: a cheap atomic-flag check on every CP TB exec
-     * (the notify callback is the only writer, release/acquire-paired), so
-     * this costs nothing when static_templates is off or no exec-region-
-     * grew notification is pending — the actual decode work only runs when
-     * the flag is set.  run_static_template_resweep grabs data_lock
-     * internally for the static_map_ mutation, same as the segment-open
-     * sweep above. */
-    if (g_pending_sweep_nonempty.load(std::memory_order_acquire)) {
-        run_static_template_resweep();
-    }
 
     /* Address-space pin + count set (marker mode only — pinned !=
      * UNPINNED).  The inline-add counts every TB; here we fold this TB's
@@ -7012,36 +6610,18 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     }
     g_mutex_unlock(&data_lock);
 
-    /* Static-template sweep accounting (static_templates=1).  MB/s gives
-     * the per-MB cost against the executable footprint swept. */
-    if (g_features.static_templates) {
-        double mb = g_static_sweep.region_bytes / (1024.0 * 1024.0);
-        double mbps = g_static_sweep.seconds > 0.0
-            ? mb / g_static_sweep.seconds : 0.0;
-        g_string_append_printf(report,
-            "Static-template sweep: sweeps=%" PRIu64 " regions=%" PRIu64
-            " region_bytes=%" PRIu64 " insns=%" PRIu64 " static_bbs=%" PRIu64
-            " desync_reseeds=%" PRIu64 " targets_seeded=%" PRIu64
-            " cap_hits=%" PRIu64 " late_events=%" PRIu64
-            " late_resweeps=%" PRIu64
-            " time=%.3fs (%.1f MB/s over %.2f MiB)\n",
-            g_static_sweep.sweeps, g_static_sweep.regions,
-            g_static_sweep.region_bytes, g_static_sweep.insns,
-            g_static_sweep.bbs, g_static_sweep.desync_reseeds,
-            g_static_sweep.targets_seeded, g_static_sweep.cap_hits,
-            g_static_sweep.late_events, g_static_sweep.late_resweeps,
-            g_static_sweep.seconds, mbps, mb);
-    }
-
     /* Opportunistic branch-alternate minting accounting (static_templates=1,
-     * both modes).  mints/checks is the post-warmup miss rate; skips_unmapped
-     * are untaken targets whose page was not mapped (probing read failed). */
+     * both modes).  mints/checks is the post-warmup miss rate; depth_mints is
+     * the subset minted by the static_depth successor walk; skips_unmapped are
+     * targets whose page was not mapped (probing read failed). */
     if (g_features.alt_mint) {
         g_string_append_printf(report,
             "Branch-alternate minting: checks=%" PRIu64 " mints=%" PRIu64
-            " skips_unmapped=%" PRIu64 " budget_hits=%" PRIu64 "\n",
-            g_alt_mint.checks, g_alt_mint.mints,
-            g_alt_mint.skips_unmapped, g_alt_mint.budget_hits);
+            " depth_mints=%" PRIu64 " (depth=%u) skips_unmapped=%" PRIu64
+            " budget_hits=%" PRIu64 "\n",
+            g_alt_mint.checks, g_alt_mint.mints, g_alt_mint.depth_mints,
+            g_features.alt_depth, g_alt_mint.skips_unmapped,
+            g_alt_mint.budget_hits);
     }
 
     qemu_plugin_outs(report->str);
@@ -7280,28 +6860,14 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                 "(no virtual-to-physical translation exists)\n");
     }
 
-    /* static_templates=1 turns on two complementary coverers of the
-     * never-executed fetch/decode space:
-     *
-     *   - the executable-region SWEEP (P1), which is USER-MODE ONLY: the
-     *     enumeration walks the user-mode page-flags map, absent under system
-     *     emulation (a guest-owned page table this pass does not walk).  Force
-     *     it off (and warn) in system mode, keeping the sweep's STATIC-flag
-     *     wire vocabulary out of a system trace.
-     *   - opportunistic branch-alternate MINTING, which is mode-INDEPENDENT
-     *     (it reads guest bytes at a branch's untaken target through the same
-     *     probing read the wrong path uses), so it also gives system-mode
-     *     traces their never-executed coverage.
-     *
-     * Both ride the one static_templates=1 option. */
-    g_features.static_templates = (cfg.static_templates != 0) && !g_system_mode;
+    /* static_templates=1 turns on opportunistic branch-alternate MINTING —
+     * mode-INDEPENDENT (it reads guest bytes at a branch's untaken target
+     * through the same probing read the wrong path uses), so it covers the
+     * never-executed fetch/decode space in user AND system mode alike.
+     * static_depth=N (default) deepens that coverage from just the immediate
+     * untaken side to its statically-known successors, N levels out. */
     g_features.alt_mint = (cfg.static_templates != 0);
-    if (cfg.static_templates != 0 && g_system_mode) {
-        fprintf(stderr, "champsim_tracer: static_templates=1 executable-region "
-                "sweep ignored in system mode (page-table-walk enumeration is "
-                "not yet implemented); opportunistic branch-alternate minting "
-                "is active\n");
-    }
+    g_features.alt_depth = cfg.static_depth;
 
     if (!cfg.output_path) {
         cfg.output_path = g_strdup("champsim_tracer_out");
@@ -7418,16 +6984,6 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     qemu_plugin_register_flush_cb(id, vcpu_tb_flush);
     qemu_plugin_register_vcpu_init_cb(id, vcpu_init_cb);
     qemu_plugin_register_atexit_cb(id, plugin_exit, nullptr);
-    if (g_features.static_templates) {
-        /* Late-mapping coverage for the static-template sweep: a mapping/
-         * mprotect that grants execute permission after the segment-open
-         * sweep already ran (a dynamically-loaded library, a JIT code
-         * page) queues its range here instead of going uncovered until the
-         * next segment open.  User-mode only by construction — the
-         * dispatch call site lives in accel/tcg/user-exec.c, which system
-         * builds do not compile. */
-        qemu_plugin_register_exec_region_grew_cb(id, static_sweep_region_grew_cb);
-    }
     if (g_system_mode) {
         /* Keep the per-vCPU asid_match flag current from the
          * architectural ASID-write commit points (fires even while the

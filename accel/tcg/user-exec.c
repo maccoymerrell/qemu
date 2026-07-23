@@ -325,43 +325,6 @@ void page_dump(FILE *f)
     walk_memory_regions(f, dump_region);
 }
 
-#ifdef CONFIG_PLUGIN
-/*
- * Executable-region enumeration for plugins (qemu_plugin_walk_exec_regions).
- * Lives here rather than in plugins/api-user.c because that file is compiled
- * target-independently and cannot reach walk_memory_regions / target_ulong;
- * the page-flags map this walks IS the linux-user page table.  The system
- * stub is in plugins/api-system.c.
- */
-struct plugin_exec_region_walk {
-    qemu_plugin_exec_region_cb cb;
-    void                      *userp;
-};
-
-static int plugin_exec_region_one(void *priv, target_ulong start,
-                                  target_ulong end, unsigned long prot)
-{
-    struct plugin_exec_region_walk *w = priv;
-
-    if (!(prot & PAGE_EXEC)) {
-        return 0;
-    }
-    return w->cb(w->userp, (uint64_t)start, (uint64_t)end);
-}
-
-int qemu_plugin_walk_exec_regions(qemu_plugin_exec_region_cb cb, void *userp)
-{
-    struct plugin_exec_region_walk w = { cb, userp };
-
-    if (!cb) {
-        return 0;
-    }
-    /* walk_memory_regions reports contiguous same-flags runs of the
-     * user-mode page-flags map; the callback filters to PAGE_EXEC. */
-    return walk_memory_regions(&w, plugin_exec_region_one);
-}
-#endif /* CONFIG_PLUGIN */
-
 int page_get_flags(target_ulong address)
 {
     PageFlagsNode *p = pageflags_find(address, address);
@@ -669,19 +632,6 @@ void page_set_flags(target_ulong start, target_ulong last, int flags)
     }
     if (inval_tb) {
         tb_invalidate_phys_range(start, last);
-    }
-
-    /*
-     * Notify a registered plugin hook whenever this call grants execute
-     * permission — the chokepoint every mapping/mprotect path (target_mmap,
-     * target_mprotect, shmat, the ELF loader's PT_LOAD / vsyscall / commpage
-     * setup) funnels through.  Cheap when unregistered (a null
-     * function-pointer check in qemu_plugin_exec_region_grew); a registered
-     * hook is expected to queue the range rather than do work inline, since
-     * this runs with mmap_lock held.
-     */
-    if (flags & PAGE_EXEC) {
-        qemu_plugin_exec_region_grew(start, last + 1);
     }
 }
 

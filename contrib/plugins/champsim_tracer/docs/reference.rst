@@ -1015,53 +1015,56 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        absent page) emits no page record for that slot.
    * - ``static_templates=0|1``
      - ``0``
-     - Never-executed fetch/decode coverage.  When on, the dictionary is
-       extended to cover the fall-through and branch-target space a
-       *trace-inferred* wrong-path consumer needs — code fetched and decoded
-       on a mispredicted path (predicted-not-taken fall-throughs, BTB-miss
-       wanders) but never architecturally executed, which executed-only
-       templates cannot resolve.  Two complementary coverers ride this one
-       option:
+     - Never-executed fetch/decode coverage by **opportunistic
+       branch-alternate minting** (both user and system mode).  When on, at
+       every branch the correct path or a wrong-path excursion evaluates, the
+       plugin decodes the branch's UNTAKEN side and mints it as an ordinary
+       never-executed template if not already covered — extending the
+       dictionary to the fall-through and branch-target space a
+       *trace-inferred* wrong-path consumer needs (code fetched and decoded on
+       a mispredicted path — predicted-not-taken fall-throughs, BTB-miss
+       wanders — but never architecturally executed, which executed-only
+       templates cannot resolve).  It fills the two gaps the wrong path alone
+       leaves: branches inside wrong-path blocks (which follow their resolved
+       direction, so their alternates are never walked) and branches whose
+       wrong-path fork never launched (``wpprune``, budget,
+       translation-unavail, ``wp=0``).
 
-       * an executable-region **sweep** (**user mode only**), which at each
-         segment open linear-decodes the guest's mapped executable regions
-         and mints never-executed **STATIC** templates.  A region that gains
-         execute permission *after* the segment-open sweep — a
-         dynamically-loaded library, a JIT code page — is swept too: the
-         plugin hooks linux-user's mmap/mprotect path and resweeps just that
-         region on the next correct-path step.  STATIC templates ride the
-         normal templates section as unreferenced entries, each instruction
-         carrying ``CST_INSN_FLAG_STATIC``.  Forced **off** in system mode
-         (enumeration there is a page-table walk of the owned roots — a
-         later facility).
-       * **opportunistic branch-alternate minting** (**both modes**), which
-         at every branch the correct path or a wrong-path excursion
-         evaluates decodes the branch's UNTAKEN side and mints it as an
-         ordinary never-executed template if not already covered.  Unlike
-         the sweep this is mode-independent, so it also gives *system-mode*
-         traces their never-executed coverage.  Alternates carry **no** wire
-         flag — indistinguishable from any other block that happened not to
-         execute — and cover the two gaps the sweep and the wrong path
-         leave: branches inside wrong-path blocks (which follow their
-         resolved direction, so their alternates are never walked) and
-         branches whose wrong-path fork never launched (``wpprune``, budget,
-         translation-unavail, ``wp=0``).  Coverage is *convergent, not
-         eager*: it fills in as branches are seen over the run rather than
-         by an up-front sweep, so a rarely-taken branch's alternate appears
-         once the branch is first evaluated.  Guest bytes are read with the
-         same probing read the wrong path uses (mapped page → decode;
-         unmapped → skipped, counted), so enumeration never demand-pages or
-         perturbs the guest.
+       Coverage is *convergent, not eager*: it fills in as branches are seen
+       over the run, so a rarely-taken branch's alternate appears once the
+       branch is first evaluated.  It needs no region enumeration, so it is
+       mode-independent — a system trace gets the same coverage as a user one.
+       Guest bytes are read with the same probing read the wrong path uses
+       (mapped page → decode; unmapped → skipped, counted), so enumeration
+       never demand-pages or perturbs the guest.  A per-segment mint budget
+       bounds the decode work; after warm-up the steady-state cost is one hash
+       lookup per evaluated branch.
 
-       Both coverers keep the trace **body** byte-identical to a run with
-       the option off: never-executed templates take a section-local id
-       assigned above every executed id, so executed blocks number exactly
-       as they would with the option off, and a block that is both minted
-       and later executed is carried by its executed template.  The delta is
-       templates-section-only.  Fixed-width ISAs decode exactly; x86 accepts
-       data-in-text mis-decodes as inert noise at never-queried PCs.  See
-       :doc:`format` for the ``CST_INSN_FLAG_STATIC`` bit and
-       ``static_templates_plan.md`` for the design.
+       Alternates carry **no** wire flag — an alternate is indistinguishable
+       from any other block that happened not to execute, because that is
+       exactly what it is.  The trace **body** stays byte-identical to a run
+       with the option off: each alternate takes a section-local id assigned
+       above every executed id, so executed blocks number exactly as they
+       would with the option off, and a block that is both minted and later
+       executed is carried by its executed template.  The delta is
+       templates-section-only.  See ``static_depth`` to deepen the coverage
+       and ``static_templates_plan.md`` for the design.
+   * - ``static_depth=<N>``
+     - ``4``
+     - Depth of the alternate-minting successor walk.  From each minted
+       alternate BB, its statically-known successors are followed recursively
+       up to ``N`` levels and minted along the way: the architectural
+       fall-through **always**, plus a direct branch's decoded target (both
+       edges of a direct terminator are statically known).  An **indirect**
+       terminator has no static target, so that edge ends the chain.  ``0``
+       mints only the immediate untaken side of each evaluated branch;
+       higher ``N`` extends coverage from that one block toward the whole
+       reachable never-executed region a mispredict-driven consumer wanders
+       into.  The default ``4`` is the knee of the coverage/size sweep on
+       ``mcf`` and a system churn boot — beyond it, executed-fall-through
+       resolution barely rises while the template count keeps climbing.
+       Dedup (a successor already templated is skipped) and the per-segment
+       mint budget bound the walk; inert unless ``static_templates=1``.
    * - ``iframe_rate=<N>``
      - ``100000``
      - Emit a validation IFRAME after every Nth observation of a CP

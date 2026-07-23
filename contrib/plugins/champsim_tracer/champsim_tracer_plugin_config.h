@@ -60,15 +60,20 @@ struct PluginConfig {
      * Off by default; ignored (forced off) in user mode, where no
      * translation exists.  A device-/physaddr-free trace is unchanged. */
     int       physaddr          = 0;
-    /* Static-template sweep (static_templates=0/1, user mode only).  When
-     * on, every segment open linear-decodes the guest's mapped executable
-     * regions and mints never-executed STATIC true-BB templates so the
-     * template dictionary covers the fall-through / branch-target space a
-     * trace-inferred wrong-path consumer needs; a region mapped or granted
-     * execute permission later (dlopen, JIT) is swept too, as it appears.
-     * Off by default; warned-and-ignored in system mode (P2
-     * page-table-walk enumeration is a later facility). */
+    /* Opportunistic branch-alternate minting (static_templates=0/1, both
+     * modes).  When on, at every evaluated branch the plugin decodes the
+     * UNTAKEN side's true BB and mints it as a never-executed dictionary
+     * template (if not already covered), so the dictionary convergently
+     * covers the fall-through / branch-target space a trace-inferred
+     * wrong-path consumer needs.  Off by default. */
     int       static_templates  = 0;
+    /* Depth-N alternate exploration (static_depth=N).  From each minted
+     * alternate BB, follow its statically-known successors — fall-through
+     * always, and a direct branch's decoded target too — recursively up to
+     * N levels, minting each never-executed block along the way (an indirect
+     * terminator has no static target, so that edge ends the chain).  0 mints
+     * only the immediate untaken side.  Inert unless static_templates=1. */
+    int       static_depth      = CST_ALT_DEPTH_DEFAULT;
     /* Per-template IFRAME trigger interval.  0 disables. */
     uint32_t  iframe_rate         = 100000;
     uint64_t  simpoint_interval = 100000000ULL;

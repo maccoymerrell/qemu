@@ -144,7 +144,6 @@ void parse_templates_at(Reader &r,
             I.is_atomic          = (flags & ids.insn_flag_atomic) != 0;
             I.lane_parallel      = (flags & ids.insn_flag_lane_parallel) != 0;
             I.is_system          = (flags & ids.insn_flag_system) != 0;
-            I.is_static          = (flags & ids.insn_flag_static) != 0;
             if (I.has_imm) I.imm = sub.sleb();
             uint8_t insn_size = sub.u8();
             I.raw_bytes.resize(insn_size);
@@ -383,8 +382,6 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
                 &ids->insn_flag_has_dep_block);
     resolve_optional_mask(maps.insn_flag, "CST_INSN_FLAG_SYSTEM",
                           &ids->insn_flag_system);
-    resolve_optional_mask(maps.insn_flag, "CST_INSN_FLAG_STATIC",
-                          &ids->insn_flag_static);
 
     /* dep_block_flag (bit masks inside the optional dependency sub-block) */
     resolve_one(maps.dep_block_flag, "dep_block_flag",

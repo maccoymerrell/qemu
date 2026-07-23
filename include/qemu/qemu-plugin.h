@@ -112,25 +112,11 @@ typedef uint64_t qemu_plugin_id_t;
  *   (main-loop) issue notification is correlated back to the issuing vCPU
  *   through a device token, giving exact owner attribution instead of a
  *   positional guess.
- *
- * version 13:
- * - added qemu_plugin_walk_exec_regions (enumerate the guest's mapped
- *   executable virtual-address regions).  User-mode only: it reports the
- *   PAGE_EXEC ranges of the user-mode page-flags map — the page table for
- *   linux-user.  System mode reports nothing (a page-table walk of the
- *   owned roots is a separate facility).
- *
- * version 14:
- * - added qemu_plugin_register_exec_region_grew_cb (notification hook
- *   fired whenever a linux-user mapping/mprotect grants execute permission
- *   over a virtual-address range, including ranges mapped after
- *   registration — a dynamically-loaded library or a JIT code page).
- *   User-mode only, complementing qemu_plugin_walk_exec_regions.
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 14
+#define QEMU_PLUGIN_VERSION 12
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -1300,83 +1286,6 @@ GArray *qemu_plugin_get_registers(void);
 QEMU_PLUGIN_API
 bool qemu_plugin_read_memory_vaddr(uint64_t addr,
                                    GByteArray *data, size_t len);
-
-/**
- * typedef qemu_plugin_exec_region_cb - executable-region walk callback
- * @userp: opaque pointer forwarded from qemu_plugin_walk_exec_regions()
- * @start: first virtual address of the region
- * @end:   one past the last virtual address of the region (half-open)
- *
- * Invoked once per contiguous executable virtual-address region.  Return
- * 0 to continue the walk; any non-zero value stops it early and becomes
- * the return value of qemu_plugin_walk_exec_regions().
- */
-typedef int (*qemu_plugin_exec_region_cb)(void *userp,
-                                          uint64_t start, uint64_t end);
-
-/**
- * qemu_plugin_walk_exec_regions() - enumerate mapped executable regions
- *
- * @cb: callback invoked for each contiguous executable (PAGE_EXEC) region
- * @userp: opaque pointer forwarded to @cb
- *
- * Walks the guest's currently-mapped virtual address space and invokes
- * @cb once for every contiguous run of pages carrying execute permission,
- * in ascending address order.  This is the fetch/decode footprint a
- * consumer needs to cover instructions that are mapped but not (yet)
- * executed — predicted-not-taken fall-throughs and branch targets that a
- * dynamic, executed-only view never reaches.
- *
- * USER-MODE ONLY.  In linux-user the reported regions are the PAGE_EXEC
- * ranges of the process page-flags map — the authoritative page table for
- * that mode.  Under system emulation the mapping is a guest-owned page
- * table this call does not walk; it invokes @cb zero times and returns 0.
- *
- * Returns 0 after a full walk, or the first non-zero value @cb returned.
- */
-QEMU_PLUGIN_API
-int qemu_plugin_walk_exec_regions(qemu_plugin_exec_region_cb cb, void *userp);
-
-/**
- * typedef qemu_plugin_exec_region_grew_cb_t - executable-region growth hook
- * @start: first virtual address of the range that gained execute
- *         permission
- * @end:   one past the last such address (half-open)
- *
- * Reports one contiguous range at a time — the extent of the triggering
- * mapping/mprotect call itself, not the guest's total PAGE_EXEC footprint
- * at that instant.  A consumer wanting the latter re-walks with
- * qemu_plugin_walk_exec_regions().
- */
-typedef void (*qemu_plugin_exec_region_grew_cb_t)(uint64_t start,
-                                                   uint64_t end);
-
-/**
- * qemu_plugin_register_exec_region_grew_cb() - register exec-region-growth
- *                                              hook
- * @id: plugin ID
- * @cb: callback, or NULL to unregister
- *
- * Fires synchronously, on the calling thread, each time linux-user grants
- * execute permission over a virtual-address range — target_mmap(PROT_EXEC),
- * target_mprotect() gaining PROT_EXEC, shmat(SHM_EXEC), or the ELF loader's
- * executable PT_LOAD / vsyscall / commpage setup.  This is how a consumer
- * of qemu_plugin_walk_exec_regions() learns about regions mapped *after*
- * an initial walk — a dynamically-loaded library or a JIT code page —
- * without re-walking the whole address space on a schedule.
- *
- * The callback runs with the linux-user mmap lock held (recursively safe
- * to call qemu_plugin_read_memory_vaddr() from it), so it should stay
- * cheap: queue the range for later processing rather than decoding it
- * inline.
- *
- * USER-MODE ONLY.  A no-op registration under system emulation — there is
- * no call site, mirroring qemu_plugin_walk_exec_regions() reporting no
- * regions there.
- */
-QEMU_PLUGIN_API
-void qemu_plugin_register_exec_region_grew_cb(qemu_plugin_id_t id,
-                                              qemu_plugin_exec_region_grew_cb_t cb);
 
 /**
  * qemu_plugin_read_register() - read register for current vCPU

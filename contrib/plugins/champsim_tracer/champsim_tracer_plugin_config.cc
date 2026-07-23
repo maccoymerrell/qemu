@@ -109,6 +109,16 @@ bool set_static_templates(PluginConfig *cfg, const char *v)
     return cfg->static_templates == 0 || cfg->static_templates == 1;
 }
 
+bool set_static_depth(PluginConfig *cfg, const char *v)
+{
+    int n = atoi(v);
+    if (n < 0) {
+        return false;
+    }
+    cfg->static_depth = n;
+    return true;
+}
+
 bool set_histogram(PluginConfig *cfg, const char *v)
 {
     int n = atoi(v);
@@ -325,6 +335,7 @@ const struct {
     { "devio",      set_devio      },
     { "physaddr",   set_physaddr   },
     { "static_templates", set_static_templates },
+    { "static_depth", set_static_depth },
     { "histogram",  set_histogram  },
     { "iframe_rate", set_iframe_rate },
     { "latch_timeout", set_latch_timeout },

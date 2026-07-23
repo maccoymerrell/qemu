@@ -29,6 +29,24 @@ must disassemble the target, and ``TraceISA`` in
 ``champsim_tracer_generic_ids.h`` gets the new enumerator (the value
 the header's ``isa`` byte carries).
 
+The declarative hub for everything below is **one row** in the
+``isa_properties[]`` table in ``champsim_tracer_mnemonics.h``, keyed by
+the new ``TraceISA`` enumerator.  The plugin never branches on
+``trace_isa`` in its shared paths; it reads that row.  A row carries the
+target-name prefixes that resolve the ISA (``target_prefixes``), the
+Capstone arch and mode resolver (``cap_arch`` / ``cap_mode_for_target``),
+the operand-walk and branch-immediate conventions
+(``include_implicit_regs``, ``pc_relative_branch_imm``,
+``branch_delay_slots``), the value-shaping hooks
+(``flags_to_metaflags``, ``canonicalize_addr``, ``reg_alias_inserter``),
+the install-time behaviour flags (``xlate_bypass_priv`` for a
+translation-bypass privilege level, ``pin_reuse_asid`` for a narrow
+recycled ASID space, ``has_be_variant`` for a big-endian target), and
+the guest window-marker descriptor (``marker_encode_seq`` /
+``marker_insn_bytes`` / ``marker_seq_insns``, step 5).  Adding the row
+is the port's spine; the steps below fill in the tables and hooks it
+names.
+
 1. **Classify instructions — the mnemonic table.**
    ``champsim_tracer_mnemonic_audit.py --isa <isa> --apply`` emits
    ``champsim_tracer_mnemonics_<isa>.h``, one ``InsnClassification``
@@ -75,9 +93,13 @@ the header's ``isa`` byte carries).
 5. **Encode the marker — window control.**
    ``champsim_marker.h`` holds one encoder per ISA (x86
    ``mov $imm,%eax``, RISC-V ``lui`` / ``addi``, MIPS ``lui`` / ``ori``).
-   A new ISA adds its magic-immediate instruction sequence there so a
-   traced process can open and close its own window from inside the
-   guest.
+   A new ISA adds its magic-immediate instruction sequence there, then
+   names it from its ``isa_properties[]`` row: ``marker_encode_seq``
+   points at the encoder and ``marker_insn_bytes`` / ``marker_seq_insns``
+   give the fixed insn width and count the execution-time adjacency
+   detector reads.  ``marker_seq_init`` builds the pattern from the row,
+   so a traced process can open and close its own window from inside the
+   guest with no new special case in the detector.
    *Verify:* run a workload that emits the marker sequence and confirm
    the window opens where the marker runs.
 
@@ -366,8 +388,12 @@ execution must be both *bounded* (the MMU faults stop it) and
 *side-effect-free* (nothing escapes the discarded path).  The
 load/store/atomic sandbox and the translation-fault handling are
 already ISA-generic in the TCG memory path; what a new target must
-supply is everything that is expressed in *that target's* code.  See
-:doc:`qemu_modifications` for the reference description of each.
+supply is everything that is expressed in *that target's* code.  These
+are edits in the target's own QEMU tree (``target/<isa>/``), not in the
+plugin; :doc:`qemu_modifications` is the reference description of each,
+and its *Per-ISA translator call sites* and *synchronous-fault resume
+stack* sections name the exact functions the four shipped targets touch,
+which a new target mirrors.
 
 #. **State introspection** — implement ``TCGCPUOps::get_plugin_state``
    (``#if CONFIG_PLUGIN && !CONFIG_USER_ONLY``) to report ``priv``,
@@ -394,6 +420,17 @@ supply is everything that is expressed in *that target's* code.  See
    bypasses the softmmu helpers, or performs a complete mode switch.
    Call ``cpu_loop_exit`` under ``plugin_spec_mode`` to end the walk,
    the same way ``hlt`` does.
+
+#. **Deliver path-event causality** (optional; enriches system-mode
+   traces).  Call ``cpu_plugin_fault_push`` / ``cpu_plugin_fault_pop``
+   from the target's re-executing-fault and exception-return paths, and
+   set ``plugin_in_async_int`` on asynchronous exception entry, so faults
+   and interrupts appear as ordered path events; both fault calls are
+   no-ops on the wrong path.  For sharper wrong-path speculation, also
+   call ``plugin_gen_record_branch_target`` at the target's direct-branch
+   decode sites (indirect forms deliberately do not, falling back to
+   observed-target history).  See :doc:`qemu_modifications` for the
+   per-target call-site inventory.
 
 The :doc:`validator` runs only in linux-user, so it does not exercise
 these system-mode hooks; validate a new ISA's wrong-path-in-system-mode

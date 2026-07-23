@@ -1,16 +1,89 @@
 Extending the tracer
 ====================
 
-The most common changes — adding a new generic opcode, a new register
-ID, a new branch type, or a new dynamic field on the wire — touch a
-small, predictable set of files because of the carve-outs in
-``champsim_tracer_generic_ids.h`` and the descriptor-driven design of
-``champsim_tracer_output.cc``.
+The tracer extends in two directions.  An **incremental addition**
+within the ISAs already supported — a new generic opcode, register ID,
+branch type, or dynamic field — touches a small, predictable set of
+files, because the carve-outs in ``champsim_tracer_generic_ids.h`` and
+the descriptor-driven design of ``champsim_tracer_output.cc`` size
+everything off ``*_COUNT`` sentinels and resolve names through the
+per-trace encoding maps.  Porting to a **whole new target ISA** is a
+larger job with a fixed shape; the ordered guide directly below walks
+it, and the incremental-addition sections after it are the reference
+for the individual edits.
 
-This page walks each scenario.  In every case the high-level rule is
-the same: **add the ID at exactly one place in the C-side enum, and
-its name at exactly one place in the inline ``*_name`` switch.**
-Everything else is sized off the COUNT sentinels.
+For an incremental addition the rule is uniform: **add the ID at one
+place in the C-side enum and its name at one place in the inline
+``*_name`` switch.**  Everything else follows from the count sentinels
+and the encoding maps.
+
+Porting to a new ISA
+--------------------
+
+A new target ISA comes up one subsystem at a time, in the order below.
+Each step is independently testable, so the port stays green as it
+grows: correct-path tracing is functional after step 2 and complete
+after step 5, and wrong-path simulation follows in
+*Wrong-path in system mode*.  Two prerequisites come first — Capstone
+must disassemble the target, and ``TraceISA`` in
+``champsim_tracer_generic_ids.h`` gets the new enumerator (the value
+the header's ``isa`` byte carries).
+
+1. **Classify instructions — the mnemonic table.**
+   ``champsim_tracer_mnemonic_audit.py --isa <isa> --apply`` emits
+   ``champsim_tracer_mnemonics_<isa>.h``, one ``InsnClassification``
+   row per Capstone insn ID carrying the generic ``opcode``,
+   ``branch_type``, ``flags``, the ``dep_refine`` classifier, and the
+   ``lane_mask_kind``.  Teach the generator's rules, never the rows.
+   *Verify:* ``--isa <isa> --diff`` prints every Capstone mnemonic with
+   no row (a silent ``GEN_OP_UNKNOWN``); a clean diff plus the
+   exit-time "Generic opcode breakdown" on a sample workload confirms
+   coverage.
+
+2. **Classify registers — the register table.**
+   ``champsim_tracer_mnemonic_audit.py --regs --isa <isa> --apply``
+   emits the ``RegClassification`` rows in the same header: each
+   Capstone register ID maps to a ``GenericRegId`` plus the QEMU
+   GDB-stub feature/name the register-handle cache reads to snapshot
+   the value.
+   *Verify:* ``champsim_tracer_mnemonic_survey.py`` lists the Capstone
+   register names the disassembler actually emits on a workload; the
+   exit-time register-attribution tables should show no unmapped
+   register.
+
+3. **Assign lane-mask kinds — vector instructions.**
+   Each vector row's ``lane_mask_kind`` (``LaneMaskKind`` in
+   ``champsim_tracer_mnemonics.h``) tells the decoder *where* to read
+   the active-lane count: ``LANE_MASK_KIND_STATIC`` for an
+   encoding-fixed width, or an ISA-specific kind (e.g.
+   ``LANE_MASK_KIND_RISCV_VTYPE``, which reads ``vl`` at run time).
+   The four per-operand masks (src / dst / load / store) are then
+   computed dynamically from the operand and memop layout; the kind
+   only selects the source of the active-lane value.
+   *Verify:* ``cst_decode --show-lanes`` annotates each vector operand
+   with its lane set — check that a known SIMD op partitions correctly.
+
+4. **Wire branch types and wrong-path targets.**
+   The terminal branch of every block carries a ``BranchType`` set on
+   its classification row.  ``resolve_wrong_target`` in
+   ``champsim_tracer.cc`` chooses the speculative target per branch
+   type; an unmapped type is simply not speculated — no harm, no
+   coverage.
+   *Verify:* ``cst_decode --verify-branch`` cross-checks each block's
+   recorded direction and target against the next entry's start PC.
+
+5. **Encode the marker — window control.**
+   ``champsim_marker.h`` holds one encoder per ISA (x86
+   ``mov $imm,%eax``, RISC-V ``lui`` / ``addi``, MIPS ``lui`` / ``ori``).
+   A new ISA adds its magic-immediate instruction sequence there so a
+   traced process can open and close its own window from inside the
+   guest.
+   *Verify:* run a workload that emits the marker sequence and confirm
+   the window opens where the marker runs.
+
+Correct-path tracing is complete at this point.  Wrong-path simulation
+on the new ISA needs the QEMU-base sandbox hooks described in
+*Wrong-path in system mode*, below.
 
 Adding a generic opcode
 -----------------------
@@ -283,15 +356,14 @@ hint.
    add a branch that consults the new manager when its option was
    set.  Cf. how SimPoint mode and stop-only mode coexist there.
 
-Porting to a new target ISA (system-mode wrong-path)
-----------------------------------------------------
+Wrong-path in system mode
+-------------------------
 
-Correct-path tracing of a new ISA needs only a classification table
-(see *Adding a generic opcode* / *Adding a register ID*) and Capstone
-support.  Supporting the **wrong-path simulator in system mode** on a
-new ISA additionally requires a few QEMU-base hooks, because
-speculative execution must be both *bounded* (the MMU faults stop it)
-and *side-effect-free* (nothing escapes the discarded path).  The
+The steps in *Porting to a new ISA* bring up correct-path tracing.
+Supporting the **wrong-path simulator in system mode** on the new ISA
+additionally requires a few QEMU-base hooks, because speculative
+execution must be both *bounded* (the MMU faults stop it) and
+*side-effect-free* (nothing escapes the discarded path).  The
 load/store/atomic sandbox and the translation-fault handling are
 already ISA-generic in the TCG memory path; what a new target must
 supply is everything that is expressed in *that target's* code.  See

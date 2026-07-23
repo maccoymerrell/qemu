@@ -28,8 +28,8 @@ with the following toolchain and library version(s); other environments may work
   :doc:`qemu_modifications`; building against an unmodified
   upstream QEMU will not work because the plugin uses
   ``qemu_plugin_insn_detail``, ``qemu_plugin_cap_decode``, and
-  ``qemu_plugin_insn_branch_target_pc``, which were added on this
-  fork.
+  ``qemu_plugin_insn_branch_target_pc``, which this fork provides and
+  upstream QEMU does not.
 
 Build invocation
 ~~~~~~~~~~~~~~~~

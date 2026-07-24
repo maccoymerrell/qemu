@@ -413,9 +413,23 @@ def _chk_golden(ctx: Ctx) -> Outcome:
     # golden determinism requires the EXACT work-root path used at capture:
     # the path appears in the qemu argv, and its length shifts the guest
     # stack base (hence REG_SP in the REGFILE record, hence the wire bytes).
-    # Use a FIXED canonical work-root, matched by GOLDEN_WORK_ROOT at
-    # capture time — NOT the per-check ctx dir, whose length varies.
+    # Use the EXACT work-root the manifest records from capture time —
+    # NOT the per-check ctx dir, whose length varies.  Fall back to the
+    # canonical GOLDEN_WORK_ROOT if the manifest predates root recording.
     work = GOLDEN_WORK_ROOT
+    try:
+        import json
+        mf = (Path(__file__).resolve().parent.parent.parent
+              / "tests" / "golden" / "manifest.json")
+        rec = json.load(open(mf)).get("work_root")
+        if rec:
+            # the manifest records the tool's INTERNAL root (…/<wr>/t);
+            # --work-root expects the parent it was invoked with.
+            work = Path(rec)
+            if work.name == "t":
+                work = work.parent
+    except Exception:
+        pass
     work.mkdir(parents=True, exist_ok=True)
     cmd = [sys.executable, str(gn), "check",
            "--build-dir", str(ctx.build_dir), "--work-root", str(work)]

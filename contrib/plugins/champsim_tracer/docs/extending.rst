@@ -262,7 +262,8 @@ Adding a branch type
 
 Use this if some control-flow class isn't captured by the existing
 ``BRANCH_DIRECT_JUMP`` / ``BRANCH_INDIRECT_JUMP`` / ``BRANCH_RETURN`` /
-``BRANCH_SYSCALL_TYPE`` / ``BRANCH_COND_DIRECT`` set — for example, a
+``BRANCH_SYSCALL_TYPE`` / ``BRANCH_COND_DIRECT`` / ``BRANCH_REP`` /
+``BRANCH_DIRECT_CALL`` / ``BRANCH_INDIRECT_CALL`` set — for example, a
 predicated branch with a specific microarchitectural flavour, or a
 trap-style branch that you want to model differently from a syscall.
 
@@ -373,7 +374,7 @@ hint.
    options-table row, and a field on ``PluginConfig``).
 2. Plumb the field through to a new manager class alongside
    ``SimPointManager``, exposing the same surface
-   (``current() -> SegmentEntry *``, ``advance()``, ``is_active()``).
+   (``current() -> SimPointEntry *``, ``advance()``, ``is_active()``).
 3. In ``champsim_tracer.cc::vcpu_tb_exec``'s window-management block,
    add a branch that consults the new manager when its option was
    set.  Cf. how SimPoint mode and stop-only mode coexist there.

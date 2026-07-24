@@ -1,9 +1,11 @@
 # Self-Modifying Code Support — Design Plan
 
-**Prepared for:** Maccoy Merrell (sole maintainer), for sign-off before any code
-is written. **Status: DECISIONS LOCKED 2026-07-23 — ready for implementation.** Branch
-`champsim-trace`. The wire format gains **no new records**; `CST_MAGIC` is
-untouched.
+**Prepared for:** Maccoy Merrell (sole maintainer). **Status: IMPLEMENTED
+2026-07-23** on `champsim-trace` (phase 1 — revision minting at the detector
+seam — landed in `7503d62587`; phases 2–3 — version-aware tools, the
+`_smc.py` validator family, and docs — landed in `2ccbc641d0`). The plan below
+is preserved as the design of record. The wire format gained **no new
+records**; `CST_MAGIC` is untouched.
 
 ## 0. Problem
 

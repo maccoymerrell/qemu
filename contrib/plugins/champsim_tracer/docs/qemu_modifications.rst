@@ -148,10 +148,18 @@ Plugin API additions
    * ``qemu_plugin_register_devio_cb`` — registers block-device I/O
      issue and completion notifications from the block backend, plus a
      doorbell hook.  The guest's virtqueue-notify (kick) executes in
-     vCPU context, so the backend's later main-loop issue notification
-     is correlated back to the issuing vCPU through a device token,
-     giving the ``devio=1`` disk-I/O records their exact owner
-     attribution instead of a positional guess.
+     vCPU context, so the doorbell callback captures the kicking vCPU's
+     owning (thread, asid) into a small bounded FIFO scoped to that same
+     vCPU; the backend's later issue notification matches the oldest
+     queued kick in that vCPU's FIFO by device token (mirroring a
+     device's own in-order queue service) and stamps its owner on the
+     request, giving the ``devio=1`` disk-I/O records their exact owner
+     attribution instead of a positional guess.  A per-vCPU FIFO, rather
+     than a single slot, is needed because one vCPU can ring the
+     doorbell more than once before the backend drains the first
+     request; scoping the match to the issuing vCPU's own FIFO, rather
+     than searching every vCPU's, keeps two vCPUs' separate virtqueues
+     from being confused when they share one device token.
    * ``QEMU_PLUGIN_VERSION = 12`` advertises these entry
      points to plugin loaders.
 

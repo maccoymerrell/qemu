@@ -1098,6 +1098,20 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        resolution barely rises while the template count keeps climbing.
        Dedup (a successor already templated is skipped) and the per-segment
        mint budget bound the walk; inert unless ``static_templates=1``.
+   * - ``smc_revisions=<N>``
+     - ``1024``
+     - Self-modifying-code per-``(asid_root, start_pc)`` revision cap.  Each
+       time a correct-path slot's executed program text differs from every
+       revision already minted for it, the plugin mints a new template
+       revision for that slot; once a slot has minted more than ``N``
+       distinct revisions, minting stops and the body keeps referencing the
+       last one, and a loud once-per-segment warning fires on stderr.  A
+       **bug detector, not a fidelity budget**: the default is sized far
+       above any real self-modifying-code pattern, so reaching the cap
+       usually signals a decode or attribution bug rather than legitimate
+       code rewriting.  The ``CST_SMC_REVISION_CAP`` environment variable
+       overrides the cap at apply time (used by the validator's
+       cap-overflow test).
    * - ``iframe_rate=<N>``
      - ``100000``
      - Emit a validation IFRAME after every Nth observation of a CP
@@ -1118,7 +1132,8 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        ``icount:start=<lo>+stop=<hi>``;
        ``simpoint:file=<path>+interval=<insns>+warmup=<insns>+simulation=<insns>``;
        ``symbol:name=<sym>+occurrence=<N>+simulation=<insns>``;
-       ``marker:simulation=<insns>`` (guest-driven, system-mode).
+       ``marker:simulation=<insns>+policy=latch|trace-all`` (guest-driven,
+       system-mode; ``policy`` defaults to ``latch`` — see :doc:`quickstart`).
    * - ``program=<string>``
      - unset
      - Free-form program identifier stamped into the header.

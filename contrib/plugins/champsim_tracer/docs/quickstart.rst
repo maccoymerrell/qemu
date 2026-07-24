@@ -226,7 +226,7 @@ plugin sees its argv.
    ``qemu_plugin_insn_symbol`` on the TB's first instruction; the
    symbol name must match exactly (no demangling, no fnmatch).
 
-``trace_window=marker:simulation=<insns>``
+``trace_window=marker:simulation=<insns>+policy=latch|trace-all``
    Guest-driven window for **system-mode** tracing
    (``qemu-system-<isa>``).  The workload carries a magic marker
    instruction sequence at its entry point; when it executes, the
@@ -235,11 +235,28 @@ plugin sees its argv.
    instructions (its synchronous kernel calls are traced but not
    counted against the budget).  A matching end-marker in the
    workload closes the window early when the program finishes under
-   budget.  ``simulation`` is the only legal key and must be
-   positive when given; with no key list the window spans 1 million
-   user instructions.  See the *System-mode tracing* section of
-   :doc:`architecture` for the marker contract, the address-space
-   pin, and what a system-mode trace contains.
+   budget.  ``simulation`` and ``policy`` are the only legal keys;
+   ``simulation`` must be positive when given, and with no key list
+   the window spans 1 million user instructions.  See the
+   *System-mode tracing* section of :doc:`architecture` for the
+   marker contract, the address-space pin, and what a system-mode
+   trace contains.
+
+   ``policy`` governs what happens once more than one process is
+   running the marker sequence concurrently:
+
+   * ``latch`` (default) — each process that runs the *start* marker
+     joins the traced set on its own; the segment closes once every
+     joined process has run its *end* marker (or the icount budget is
+     met), whichever comes first.  See the ``latch_timeout=`` bullet
+     below for the backstop that closes a joined process's window if
+     it dies without reaching its end marker.
+   * ``trace-all`` — the *first* start marker widens capture to every
+     context/ASID in the system (no foreign-process filtering) until
+     that first process runs its end marker or the icount budget is
+     met.  Only the capture gate widens: the icount clock and
+     end-of-window detection still ride that first marker process's
+     user instructions, so the owned set stays the single clock pin.
 
    To trace an **unmodified binary** (no compiled-in marker), run it
    inside the guest under :program:`cst_attach`, which injects the
@@ -300,6 +317,7 @@ Examples::
    trace_window=symbol:name=main+occurrence=3+simulation=20000000
    trace_window=marker:simulation=20000000
    trace_window=marker:policy=latch+simulation=20000000 latch_timeout=2000
+   trace_window=marker:policy=trace-all+simulation=20000000
 
 Without ``trace_window=`` the segment opens at process start and runs
 until the guest exits — equivalent to ``trace_window=icount:start=0``

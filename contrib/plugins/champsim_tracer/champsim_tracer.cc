@@ -3,9 +3,10 @@
  *
  * Main translation unit: plugin install/lifecycle, tracing-window
  * management (windows + simpoints), the tb_trans/tb_exec/tb_flush
- * and memory-access callbacks, and exit-time statistics.  Peer TUs:
- * champsim_tracer_decode.cc, champsim_tracer_wp.cc,
- * champsim_tracer_output.cc.  Output: packed binary (.cst).
+ * and memory-access callbacks, and exit-time statistics.  Every other
+ * subsystem (decode, WP, output, and the headers included below) is
+ * its own champsim_tracer_<name>.{h,cc} peer TU.  Output: packed
+ * binary (.cst).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -173,11 +174,10 @@ std::unordered_map<uint64_t, uint32_t> &g_first_insn_word =
     *new std::unordered_map<uint64_t, uint32_t>();
 
 /* TB start_pcs that have been detected as carrying non-stable
- * instruction bytes (decode failure OR byte change since first
- * sighting).  WP speculation refuses to enter these; subsequent
- * translation re-attempts at the same start_pc skip fragment
- * materialization.  Persistent across WP simulations; cleared with
- * tb_flush. */
+ * instruction bytes (Capstone decode failure — see detect_tb_poison).
+ * WP speculation refuses to enter these; subsequent translation
+ * re-attempts at the same start_pc skip fragment materialization.
+ * Persistent across WP simulations AND tb_flush (see vcpu_tb_flush). */
 /* pc -> hash of the TB's full canonical byte image when the poison verdict
  * was made.  The stored content is the staleness discriminator: every VA is
  * reused across address spaces (static binaries map at the same base), so a
@@ -813,10 +813,9 @@ static uint32_t g_vcpu_cur_asid_index[CST_PIN_MAX_VCPUS];
 /*
  * Pinned-process migration-detect guard (system-mode pin, SMP guests).
  *
- * The wire is single-address-space by construction: a marker-mode trace
- * pins ONE process, every VA is that process's, and thread_id distinguishes
- * the software threads WITHIN it (see docs/architecture.rst, "Single
- * address space").  Clean per-thread attribution therefore relies on the
+ * thread_id distinguishes the software threads WITHIN an owned process
+ * (see docs/architecture.rst, "Address-space scope and per-thread
+ * attribution").  Clean per-thread attribution therefore relies on the
  * pinned process NOT migrating across vCPUs — kernel code carries no
  * architecturally-reliable per-thread identity (the thread pointer is a
  * USER register; no ISA exposes a kernel-privilege one), so a thread the
@@ -1821,9 +1820,11 @@ static void recompute_budget(unsigned int cpu_index)
 
 /* ========================= Thread ID assignment =========================
  *
- * thread_id on the wire IS the guest vCPU index, verbatim (stable for
- * the whole run, no remapping).  Each segment's body opens with an
- * explicit BODY_TAG_THREAD_SWITCH naming the starting thread.
+ * thread_id on the wire is resolve_thread_id()'s result: the vCPU index
+ * verbatim in user mode / any unpinned run, or the remapped guest-thread
+ * identity (stable across vCPU migration) in a system-mode pinned trace.
+ * Each segment's body opens with an explicit BODY_TAG_THREAD_SWITCH
+ * naming the starting thread.
  */
 
 /* ========================= SimPoints ========================= */
@@ -5854,25 +5855,25 @@ struct TbPoison {
 
 /*
  * Detect non-stable "instruction" memory before committing this TB as a
- * fragment.  Two independent signals:
+ * fragment.  Only one signal poisons: Capstone decode failure on any
+ * canonical insn (empty mnemonic) — the bytes don't parse as a valid
+ * instruction of this ISA, so they cannot be real code.  Poisoning the
+ * TB's start_pc makes the WP walker bail before re-entering it, and
+ * short-circuits fragment creation on subsequent translations.  Decode
+ * failure also fires on perfectly stable .rodata that the R-E LOAD
+ * segment happens to cover (static binaries place .text and .rodata in
+ * the same R-E LOAD, so start_code/end_code spans both) — that is WP
+ * wrong-pathing into data, not self-modifying code.
  *
- *   1. Capstone decode failure on any canonical insn (empty mnemonic): the
- *      bytes don't parse as a valid instruction of this ISA.  Cannot be
- *      real code.
- *
- *   2. Byte change since the first sighting of this VA: the same address
- *      now reads different bytes than the last time the tracer saw it.
- *      Real code does not change (no self-modification in this workload);
- *      writable memory (stack, heap, .bss) does.
- *
- * Either signal poisons the TB's start_pc — the WP walker bails before
- * re-entering, and subsequent translations short-circuit fragment creation.
- * Only the byte-change signal points specifically at self-modifying code;
- * Capstone decode failure also fires on perfectly stable .rodata that the
- * R-E LOAD segment happens to cover (static binaries place .text and
- * .rodata in the same R-E LOAD, so start_code/end_code spans both) — that
- * is WP wrong-pathing into data, not SMC.  Records the first-sighting word
- * of every new canonical PC.  Takes data_lock.
+ * A byte change since the first sighting of this VA is tracked
+ * separately (see g_first_insn_word) but does NOT poison by itself:
+ * self-modifying code is handled by BB template revisioning (see
+ * champsim_tracer_bb_template_cache.{cc,h}), not refusal, so the
+ * correct path just refreshes the cached first word to the new bytes,
+ * and a wrong-path read that differs is assumed to be another address
+ * space's real code (ASID reuse) rather than SMC, so the fragment still
+ * forms.  Records the first-sighting word of every new canonical PC.
+ * Takes data_lock.
  */
 static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
                                  const uint8_t *insn_bytes,

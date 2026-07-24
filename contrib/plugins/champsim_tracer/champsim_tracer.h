@@ -165,25 +165,13 @@ extern "C" {
  *   bit 0    BRANCH_COND
  *   bit 1    HAS_IMM
  *   bit 2    ATOMIC         — atomic / locked memory op
- *   bit 3    STATIC         — never-executed static template (fetch/decode
- *                             coverage of mapped-but-unexecuted code)
+ *   bit 3    reserved (formerly STATIC, retired with the P1 sweep)
  *   bit 4    VEC            — per-slot lane bitmaps present
  *   bit 5    LANE_PARALLEL  — lane bitmaps line up by lane index
  *                             (consumer can model per-lane chains).
  *                             LANE_PARALLEL implies VEC.
  *   bit 6    HAS_DEP_BLOCK
  *   bit 7    SYSTEM         — privileged (non-user) execution context
- *
- * STATIC marks a template minted by the segment-open executable-region
- * sweep (static_templates=1, user mode) rather than by execution: the
- * block was fetched/decoded from a mapped executable region but never ran
- * on the correct or wrong path.  It exists so a consumer reconstructing
- * wrong-path fetch from the binary can resolve fall-through and branch-
- * target PCs that an executed-only dictionary never reaches.  Uniform
- * across the template (a whole block is static or it is not); its profile
- * counts are zero.  A block that is both swept and later executed is
- * carried by its executed template (no STATIC bit); the flag is never set
- * on an executed block.  Absent from every trace without the sweep.
  *
  * SYSTEM marks instructions translated at a privilege level other
  * than user (qemu_plugin_get_priv_level() != 0): in a system-mode
@@ -247,7 +235,6 @@ extern "C" {
  */
 #define CST_INSN_FLAG_HAS_DEP_BLOCK (1u << 6)
 #define CST_INSN_FLAG_SYSTEM        (1u << 7)
-/* bit 7 reserved */
 
 /* dep_block_flags bits inside the optional dependency sub-block. */
 #define CST_DEP_BLOCK_HAS_REG       (1u << 0)
@@ -256,16 +243,20 @@ extern "C" {
 /* WP event flags byte */
 #define CST_WP_EVENT_TRANSLATION_UNAVAIL (1u << 0)
 /* This wrong-path BB contains a SYNTHETIC-DATA FAULT at fault_insn_index: a
- * speculative memory access to an absent/unreadable page that was served a
- * deterministic placeholder value (plugin_spec_garbage_fill) rather than real
- * memory.  On a mispredicted path no instruction retires, so such a back-end
- * fault is never taken by a real core; the excursion CONTINUES past it (memory
- * faults) or STOPS cleanly at this block (the interim graceful-stop for
- * non-memory synchronous faults — arithmetic / illegal-opcode — pending the
- * arithmetic pass).  See docs/format.rst §4.4. */
+ * speculative memory access to an absent/unreadable page was served a
+ * deterministic placeholder value (plugin_spec_garbage_fill), or a
+ * mid-block execution-time exception (arithmetic overflow, illegal opcode,
+ * alignment, a conditional trap) was skipped, its stale destination left as
+ * a deterministic placeholder.  On a mispredicted path no instruction
+ * retires, so neither kind is ever taken by a real core; the excursion
+ * CONTINUES past it to the wpdepth budget.  Only a fault AT the BB's
+ * terminator that is itself a syscall-type control transfer (a real
+ * privilege escalation the single-address-space spec model cannot follow)
+ * TERMINATES the excursion here instead, sealing this block as the chain's
+ * last.  See docs/format.rst §4.4. */
 #define CST_WP_EVENT_FAULT               (1u << 1)
 /* Bit 2 is free — unassigned, reserved for a future event flag.  Writers
- * write it 0; readers ignore it (reserved-bits rule, format.md). */
+ * write it 0; readers ignore it (reserved-bits rule, docs/format.rst). */
 
 /*
  * WP chain header flag: packed into the low bit of the wp_chain_section's
@@ -1596,9 +1587,10 @@ void build_qemu_reg_reverse_index(void);
 
 /*
  * Wide regfile snapshot: opaque TLS scratch keyed by the active reg
- * table's QEMU descriptors.  Used by the WP loop to capture
- * pre-fragment register state (spec-mode CF_MEMI_ONLY suppresses
- * per-insn exec callbacks).
+ * table's QEMU descriptors.  RegSnapCollector::capture_wide() builds one
+ * (a single upfront snapshot of every readable register); unused by the
+ * WP loop today, which instead reads each instruction's destination
+ * registers live — see champsim_tracer_reg_snap_collector.h.
  */
 typedef struct _WideRegSnap WideRegSnap;
 

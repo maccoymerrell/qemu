@@ -1318,11 +1318,31 @@ owner; a ``DEVIO_STOP`` never precedes its ``DEVIO_START`` on the wire.
 **Exact attribution requires a virtio-blk device kicked in vCPU context.**
 The guest's virtqueue kick (``virtio_queue_notify``) executes on the issuing
 vCPU; the plugin captures that vCPU's owning ``(thread, asid)`` there and
-stamps it on the request the block backend issues moments later on the
-same vCPU.  Under the default virtio ioeventfd fast path the kick is
-serviced without entering ``virtio_queue_notify`` in vCPU context, so the
-records fall back to positional; run the traced virtio-blk device with
-``ioeventfd=off`` (alongside no iothread) for exact attribution.  See
+queues it, with the device token, on a small bounded FIFO owned by that
+vCPU.  The block backend's later issue is matched against that SAME
+vCPU's FIFO for the oldest still-queued kick to the same device, so a
+burst of kicks from one vCPU (e.g. queued requests outrunning the block
+backend) is attributed in the order the device actually services them
+rather than by a single overwritable slot.  A multi-vCPU guest ordinarily
+runs one virtqueue per vCPU (virtio-blk's queue count tracks the vCPU
+count), so scoping the match to the issuing vCPU is also what keeps two
+processes' concurrent disk I/O from cross-attributing — the device token
+alone does not distinguish separate queues on the same device.  Under
+the default virtio ioeventfd fast path the kick is serviced without
+entering ``virtio_queue_notify`` in vCPU context, so the records fall
+back to positional; run the traced virtio-blk device with
+``ioeventfd=off`` (alongside no iothread) for exact attribution.
+
+The captured owner is only as precise as the per-vCPU kernel-mode
+ownership model every kernel basic block already uses (see
+:ref:`single-address-space`): it comes from whichever thread most
+recently entered the kernel on the kicking vCPU, which is correct while
+that thread stays on one vCPU and has no clean answer once the guest
+scheduler migrates it mid-syscall.  A concurrent multi-process exact-
+attribution guest therefore needs each traced process pinned to its own
+vCPU (``taskset``/``isolcpus``, or ``sched_setaffinity`` inside the
+workload) — the same confinement a single pinned process already needs
+for clean kernel-code attribution — not merely ``ioeventfd=off``.  See
 :doc:`quickstart` for the canonical configuration.
 
 The **disk block number** is the request's byte offset within the backing

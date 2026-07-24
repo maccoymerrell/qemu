@@ -1655,33 +1655,52 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry);
  * vCPU context correlates to it, otherwise it is positional.  A
  * DEVIO_STOP lands where the completion resumes.  Reset per segment.
  *
- * Correlation is PER-VCPU, not per-device.  Under the canonical
- * ioeventfd=off configuration the virtqueue kick and the block backend's
- * blk_aio_* issue run on the SAME vCPU thread, back to back with no
- * yield (virtio_queue_notify -> handle_vq -> blk_aio_prwv), so the kick
- * records the issuing owner in a per-vCPU slot that the immediately
- * following issue reads by vCPU index.  A device token guards the slot
- * so a non-virtio (IDE/AHCI) or kernel-internal blk_aio on that vCPU,
- * which carries a different / absent device, does not borrow a stale
- * owner.  A per-DEVICE queue would instead race: two vCPUs kicking the
- * same shared device concurrently can interleave push/pop and cross-
- * attribute, precisely the multi-vCPU case this exists to get right.
+ * Correlation is a bounded FIFO of queued kicks per KICKING vCPU, matched
+ * at issue against that SAME vCPU's FIFO by device token, oldest match
+ * first — not a single per-vCPU slot, and not a search across every
+ * vCPU.  A single slot assumed the kick and the matching blk_aio_* issue
+ * always run back to back with nothing able to land in between; that
+ * assumption breaks when one vCPU rings the doorbell twice before the
+ * first is drained, overwriting the slot the first issue was about to
+ * read.  The FIFO fixes it: each vCPU's FIFO has exactly one producer
+ * (that vCPU's own doorbell, already BQL-serialised), so a burst of
+ * kicks queues up instead of clobbering, and note_start matches
+ * oldest-kick-first, mirroring a device's own in-order queue service.
+ * The lookup stays scoped to the ISSUING vCPU rather than searching
+ * every FIFO: virtio-blk's default queue count tracks the vCPU count,
+ * so a multi-vCPU guest ordinarily runs one virtqueue per vCPU, and the
+ * device token alone (the block backend has no queue index to report)
+ * cannot tell two vCPUs' queues apart — only the issuing vCPU can.
+ * Widening the search to every FIFO regardless of vCPU identity can
+ * reattribute a request to whichever vCPU holds the globally-oldest
+ * matching kick even when it belongs to a DIFFERENT queue, exactly the
+ * concurrent multi-process failure this exists to get right and exactly
+ * what 88d9b7e526's own report rejected a shared per-device FIFO over.
+ * Each FIFO is capped; an overflowing kick is DROPPED (never evicts an
+ * older, still-unmatched entry) so its own request falls back to
+ * positional instead of ever borrowing a wrong owner.  See the
+ * champsim_tracer_output.cc file-header comment for the full rationale.
  */
 
 /* Doorbell: the guest kicked a block device's virtqueue on vCPU
- * @vcpu_index (correct path, vCPU context).  Record that vCPU's current
- * owning (thread_id, asid) and the device @dev_token in the per-vCPU
- * slot, so the immediately following note_start on the same vCPU for the
- * same device attributes its request to this exact owner. */
+ * @vcpu_index (correct path, vCPU context).  Push that vCPU's current
+ * owning (thread_id, asid) and the device @dev_token onto @vcpu_index's
+ * own kick FIFO, so a later note_start on that SAME vCPU can match it in
+ * kick order. */
 void devio_note_doorbell(int vcpu_index, uint64_t dev_token,
                          uint32_t owner_thread_id, uint32_t owner_asid);
 /* Issue: assign a compact per-segment request id, compute the disk
  * block number (offset >> CST_DEVIO_LBA_SHIFT), and queue a pending
- * DEVIO_START.  When @vcpu_index issued the request on a vCPU thread and
- * its per-vCPU slot holds a matching @dev_token doorbell, stamp that
- * exact owner; otherwise the record is positional.  @dir is a CST_DEVIO_*
- * value.  Returns the request id (always nonzero — the caller decides
- * whether to track). */
+ * DEVIO_START.  When @vcpu_index is known (>=0), searches ONLY that
+ * vCPU's kick FIFO for the oldest queued kick whose device token
+ * matches @dev_token — @vcpu_index is what disambiguates two vCPUs'
+ * separate virtqueues sharing one device token, so the lookup never
+ * crosses into another vCPU's FIFO (see the file-header comment).  When
+ * @vcpu_index is unknown (-1, off any vCPU thread), widens to every
+ * FIFO and takes the globally oldest match as the best available guess.
+ * Stamps the exact owner and pops the matched entry on a hit; otherwise
+ * the record is positional.  @dir is a CST_DEVIO_* value.  Returns the
+ * request id (always nonzero — the caller decides whether to track). */
 uint64_t devio_note_start(int vcpu_index, int dir,
                           uint64_t offset, uint64_t bytes,
                           uint64_t dev_token);
@@ -1689,7 +1708,7 @@ uint64_t devio_note_start(int vcpu_index, int dir,
  * drain if its START never reached the wire, e.g. a segment switch). */
 void devio_note_stop(uint64_t request_id);
 /* Segment-open reset: clear pending records, the live-id set, the
- * per-vCPU doorbell slots, and the per-segment id counter. */
+ * per-vCPU kick FIFOs, and the per-segment id / sequence counters. */
 void devio_reset_segment(void);
 /* Advertise the DEVIO_* body-tag names in the header encoding map only
  * when the disk-I/O hook is active (system mode + devio enabled), so a

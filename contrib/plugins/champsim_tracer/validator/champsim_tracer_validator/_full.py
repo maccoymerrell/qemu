@@ -1007,27 +1007,7 @@ def build_checks() -> list:
                    "each own only their own band's DEVIO_START records "
                    "(88d9b7e526's verification scenario)",
                    ["opt:devio", "wire:BODY_TAG_DEVIO_START",
-                    "wire:BODY_TAG_DEVIO_STOP"], _chk_devio_attrib,
-                   known_issue=(
-                       "the per-vCPU kick-doorbell slot "
-                       "(champsim_tracer_output.cc devio_note_doorbell / "
-                       "vcpu_kick) can rarely be overwritten by an "
-                       "interleaved kick from the OTHER concurrently-"
-                       "marked process before the matching block-backend "
-                       "issue reads it back, misattributing a handful of "
-                       "requests per run under real -smp 2 host-scheduling "
-                       "load (observed intermittently — roughly 1 in 3 "
-                       "boots in in-repo testing, not every boot; when it "
-                       "does not race the band split is clean, matching "
-                       "88d9b7e526's own verification).  This is a genuine "
-                       "plugin correctness gap in the exact-attribution "
-                       "seam, not a validator artifact; a fix needs the "
-                       "slot guarded by a token+in-flight generation (or "
-                       "correlating by (vcpu,token) pairs) instead of one "
-                       "overwritable per-vCPU slot — out of scope for this "
-                       "validator-only change.  Non-gating so the race "
-                       "does not produce a false RED; loudly reported as "
-                       "XFAIL when it fires.")))
+                    "wire:BODY_TAG_DEVIO_STOP"], _chk_devio_attrib))
     C.append(Check("features.faults_interrupts", "features",
                    "synchronous-fault exclusion + async-interrupt capture "
                    "(faults=0 / interrupts=1, system)",

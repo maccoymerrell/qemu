@@ -159,6 +159,18 @@ struct Stats {
     uint64_t pin_unverified_dropped = 0;
     uint64_t pin_pages_mapped = 0;
 
+    /* DEVIO exact-owner attribution (devio=1, system mode; zero otherwise).
+     * A doorbell kick is queued on its kicking vCPU's bounded FIFO
+     * (kDevioKickFifoCap entries, champsim_tracer_output.cc) and matched
+     * at block-backend issue by device token, oldest kick first.
+     * devio_fifo_kicks_dropped counts kicks refused because that vCPU's
+     * FIFO was already full — the dropped kick's own request loses exact
+     * attribution (falls back to POSITIONAL) but no request is ever
+     * matched to the wrong owner.  Zero on a healthy run; a nonzero count
+     * means one vCPU is kicking a device far faster than the block
+     * backend drains it. */
+    uint64_t devio_fifo_kicks_dropped = 0;
+
     /* Pinned-process migration-detect guard (system-mode pin, SMP guests).
      * Set once per segment when the pinned process is seen executing USER
      * code on more than one vCPU within a segment — a pinned-process-mode

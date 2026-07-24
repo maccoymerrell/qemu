@@ -806,6 +806,7 @@ _DEVIO_WORKLOAD_C = r"""/* champsim_tracer validator -- devio payload-oracle wor
  * this program issues.  SPDX-License-Identifier: GPL-2.0-or-later */
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <sched.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
@@ -830,6 +831,25 @@ int main(void)
     long base = {base}L;
     int  nops = {nops};
     int  fill = {fill};
+    int  pin_cpu = {cpu};
+
+    /* Pin to one vCPU before any traced work: the tracer's kernel-mode
+     * ownership model (g_vcpu_cur_tid, champsim_tracer.cc) attributes
+     * kernel code to whichever thread most recently entered the kernel
+     * on that vCPU -- a thread the guest scheduler migrates mid-syscall
+     * leaves its in-flight kernel work (here, the block-layer submission
+     * + virtqueue kick) with no clean owner on the vCPU it left.  This
+     * is a documented requirement of the whole ownership model, not
+     * devio-specific (see the pinned-process migration-detect guard
+     * comment in champsim_tracer.cc); an unpinned multi-process -smp
+     * workload is outside its clean-attribution envelope regardless of
+     * how the block-device doorbell is correlated. */
+    if (pin_cpu >= 0) {{
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(pin_cpu, &set);
+        if (sched_setaffinity(0, sizeof(set), &set) != 0) {{ return 6; }}
+    }}
 
     marker_start();
 
@@ -860,15 +880,20 @@ int main(void)
 
 
 def _build_devio_c(out_dir: Path, name: str, base: int, nops: int,
-                   fill: int, dev: str = "/dev/vda") -> Path:
+                   fill: int, dev: str = "/dev/vda", cpu: int = -1) -> Path:
     """Render + statically compile _DEVIO_WORKLOAD_C for (base, nops,
     fill).  Full libc (posix_memalign/open/pwrite/pread/fsync), so unlike
     the diamond generator's asm workloads this is a plain static build —
-    no -nostdlib/-nostartfiles."""
+    no -nostdlib/-nostartfiles.  @cpu >= 0 pins the workload to that vCPU
+    via sched_setaffinity before any traced work -- required to stay
+    inside the tracer's kernel-mode ownership model's clean-attribution
+    envelope on a concurrent multi-process -smp run (see the template's
+    own comment); -1 (default) leaves it unpinned, fine for a single-
+    process run with no other traced process to race against."""
     out_dir.mkdir(parents=True, exist_ok=True)
     src = out_dir / f"{name}.c"
     src.write_text(_DEVIO_WORKLOAD_C.format(base=base, nops=nops, fill=fill,
-                                            dev=dev))
+                                            dev=dev, cpu=cpu))
     binp = out_dir / name
     subprocess.check_call(["gcc", "-O1", "-static", "-fno-stack-protector",
                            str(src), "-o", str(binp)])
@@ -1089,9 +1114,12 @@ poweroff -f
 
 
 def run_devio_attrib_probe(cfg: MPConfig) -> MPResult:
-    """Two marked processes (policy=latch), each pinned to its own ASID,
-    CONCURRENTLY issue O_DIRECT|O_SYNC disk I/O to DISJOINT LBA bands on
-    one virtio-blk disk under -smp 2 (ioeventfd=off) -- the exact-owner
+    """Two marked processes (policy=latch), each pinned to its own ASID
+    AND its own vCPU (sched_setaffinity in _DEVIO_WORKLOAD_C -- required
+    to stay inside the tracer's kernel-mode ownership model's clean-
+    attribution envelope; see that template's comment), CONCURRENTLY
+    issue O_DIRECT|O_SYNC disk I/O to DISJOINT LBA bands on one
+    virtio-blk disk under -smp 2 (ioeventfd=off) -- the exact-owner
     attribution scenario from 88d9b7e526.  The block backend issues each
     request off the vCPU thread, so a POSITIONAL record would attribute it
     to whichever process's context happened to be in force at the record's
@@ -1107,8 +1135,18 @@ def run_devio_attrib_probe(cfg: MPConfig) -> MPResult:
     od = cfg.out_dir
     od.mkdir(parents=True, exist_ok=True)
     lo_base, hi_base, nops = 0, 256, 8
-    bin_lo = _build_devio_c(od / "lo", "devio_lo", lo_base, nops, 0xA0)
-    bin_hi = _build_devio_c(od / "hi", "devio_hi", hi_base, nops, 0xB0)
+    # Pin each workload to its own vCPU (cpu=0 / cpu=1): required to stay
+    # inside the tracer's kernel-mode ownership model's clean-attribution
+    # envelope (see _DEVIO_WORKLOAD_C's own comment and the pinned-process
+    # migration-detect guard in champsim_tracer.cc) -- an unpinned process
+    # the guest scheduler migrates mid-syscall leaves its in-flight kernel
+    # work (the block-layer submission + virtqueue kick) with no clean
+    # owner on the vCPU it left, independent of how devio correlates the
+    # doorbell.
+    bin_lo = _build_devio_c(od / "lo", "devio_lo", lo_base, nops, 0xA0,
+                            cpu=0)
+    bin_hi = _build_devio_c(od / "hi", "devio_hi", hi_base, nops, 0xB0,
+                            cpu=1)
     cpio = _stage(isa, od / "stage",
                   [("devio_lo", bin_lo), ("devio_hi", bin_hi)],
                   _INIT_DEVIO_ATTRIB)

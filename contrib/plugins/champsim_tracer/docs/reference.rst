@@ -1020,10 +1020,14 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        Exact attribution — required for correct owners on a multi-vCPU /
        multi-process guest — needs the virtio-blk device run with
        ``ioeventfd=off`` and **no dedicated iothread** (the canonical
-       configuration; see :doc:`quickstart`).  A no-op without disk
-       traffic (a device-free or user-mode trace carries no such records
-       and is byte-identical), so it is safe to leave on.  ``devio=0``
-       disables the hook entirely.
+       configuration; see :doc:`quickstart`), and each CONCURRENTLY
+       traced process pinned to its own vCPU (``taskset``/``isolcpus``)
+       — the doorbell's captured owner rests on the same per-vCPU
+       kernel-mode ownership model kernel code attribution already
+       needs it for.  A no-op without disk traffic (a device-free or
+       user-mode trace carries no such records and is byte-identical),
+       so it is safe to leave on.  ``devio=0`` disables the hook
+       entirely.
    * - ``physaddr=0|1``
      - ``0``
      - Per-memop physical-page capture (**system mode only**).  When on,

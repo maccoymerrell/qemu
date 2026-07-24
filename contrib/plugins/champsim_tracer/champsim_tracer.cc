@@ -1557,8 +1557,12 @@ static bool g_devio_enabled = true;
  * speculative doorbell store is sandboxed before it reaches the device),
  * BEFORE the request processing runs — possibly on the main loop.  It is
  * the one point where the issuing vCPU is known, so capture that vCPU's
- * current owning (thread_id, asid) and queue it on a per-device FIFO
- * keyed by @dev_token for the later note_start to attribute exactly.
+ * current owning (thread_id, asid) and push it onto @vcpu_index's own
+ * bounded kick FIFO (keyed by the KICKING vCPU, one producer per FIFO)
+ * for a later note_start — on any thread, matched by @dev_token in kick
+ * order — to attribute exactly.  See the DEVIO comment block in
+ * champsim_tracer_output.cc for why a per-vCPU FIFO, not a per-device
+ * one or a single per-vCPU slot.
  *
  * resolve_thread_id / resolve_ctx_asid_index read g_vcpu_cur_{tid,asid}
  * for this vCPU — written only by this same vCPU's vcpu_tb_exec (same
@@ -1585,14 +1589,16 @@ static void devio_doorbell_cb(int vcpu_index, uint64_t dev_token)
  * path only (a speculative doorbell store is sandboxed and never
  * reaches the block layer).
  *
- * Attribution: EXACT when this request was issued on the vCPU thread
- * whose most recent kick was to this same device (@dev_token) — under
- * the canonical ioeventfd=off config the kick and blk_aio_prwv run back
- * to back on that vCPU, so note_start reads the owner the kick captured
- * and stamps it on the record.  POSITIONAL fallback when the issue is
- * off any vCPU thread, or its device does not match the vCPU's last kick
- * (non-virtio, IDE/AHCI, or kernel-internal I/O): the record carries no
- * owner and the consumer uses its stream-position context, as before.
+ * Attribution: EXACT when @vcpu_index's own kick FIFO still holds a
+ * queued kick to this same device (@dev_token) — note_start matches the
+ * oldest such entry in THAT vCPU's FIFO (the vCPU actually draining its
+ * virtqueue right now, which disambiguates two vCPUs' separate queues
+ * sharing one device token; only widened to every FIFO when @vcpu_index
+ * itself is unknown) and stamps that kick's owner on the record.
+ * POSITIONAL fallback when no matching kick is found (non-virtio,
+ * IDE/AHCI, kernel-internal I/O, or a kick dropped by the FIFO's
+ * overflow guard): the record carries no owner and the consumer uses
+ * its stream-position context, as before.
  *
  * Gate: an active trace segment.  In marker mode that window is the
  * pinned workload's, so disk I/O issued while it is open is a traced

@@ -572,21 +572,34 @@ in the body stream with a ``DEVIO_START`` at issue and a
 
 Each ``DEVIO_START`` is attributed to the process/thread that issued
 it.  The guest's virtqueue kick runs in the issuing vCPU's context,
-where the tracer captures the owner; the block backend issues the
-request moments later on that same vCPU, and the record is stamped with
-the captured owner (the decoder shows ``attr=exact``).  This is what
-keeps attribution correct on a multi-vCPU / multi-process guest, where
-two processes' disk I/O interleaves in one body stream.  The default
-virtio *ioeventfd* fast path services the kick without entering the
-vCPU context the tracer hooks, so with it on the records fall back to
-**positional** attribution (``attr=pos`` — correct for a single marked
-process, a guess otherwise).  ``ioeventfd=off`` together with no
-dedicated iothread keeps the whole ``kick → blk_aio`` path on the
-issuing vCPU.  Non-virtio disks (IDE/AHCI) and kernel-internal I/O
-always use the positional fallback.  An initramfs-only guest with no
-``-drive`` produces no disk traffic and therefore no ``DEVIO`` records
-— the trace is otherwise identical.  See the ``devio`` option in
-:doc:`reference` and the record layout in :doc:`format` (§4.1b).
+where the tracer queues the owner on that vCPU's bounded kick FIFO; the
+block backend's later issue matches the oldest queued kick on that SAME
+vCPU's FIFO and stamps its owner (the decoder shows ``attr=exact``).
+This is what keeps attribution correct on a multi-vCPU / multi-process
+guest, where two processes' disk I/O interleaves in one body stream.
+The default virtio *ioeventfd* fast path services the kick without
+entering the vCPU context the tracer hooks, so with it on the records
+fall back to **positional** attribution (``attr=pos`` — correct for a
+single marked process, a guess otherwise).  ``ioeventfd=off`` together
+with no dedicated iothread keeps the whole ``kick → blk_aio`` path
+observable on the issuing vCPU.  Non-virtio disks (IDE/AHCI) and
+kernel-internal I/O always use the positional fallback.  An
+initramfs-only guest with no ``-drive`` produces no disk traffic and
+therefore no ``DEVIO`` records — the trace is otherwise identical.  See
+the ``devio`` option in :doc:`reference` and the record layout in
+:doc:`format` (§4.1b).
+
+**Multi-process exact attribution also needs each traced process pinned
+to its own vCPU.**  The doorbell's captured owner comes from the same
+per-vCPU kernel-mode ownership model every kernel basic block uses (see
+:ref:`single-address-space` and the ``--pin-cpu`` guidance above): a
+process the guest scheduler migrates mid-syscall leaves its in-flight
+block-layer submission on the vCPU it left with no clean owner,
+independent of how the doorbell is correlated.  Two
+CONCURRENT marked processes issuing disk I/O therefore want the same
+``taskset``/``isolcpus`` (or ``sched_setaffinity`` inside the workload)
+confinement a single pinned process already needs — not merely
+``ioeventfd=off`` — to stay inside the clean-attribution envelope.
 
 **Physical-page records (optional).**  ``physaddr=1`` adds the physical
 **page** base of every load and store via the ``CST_FID_LOAD_PPAGE`` /

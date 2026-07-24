@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include <algorithm>
+#include <deque>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -3986,27 +3987,60 @@ static void emit_iframe_if_due(BodyStreamState *st, BodyEntry *entry,
  * ---- Block-device (disk) I/O records (DEVIO) ----
  *
  * Process-wide state: there is one block backend, doorbells fire on the
- * issuing vCPU thread, and completions land on the main loop thread, so
+ * kicking vCPU thread, and completions land on the main loop thread, so
  * a GMutex guards the queues, the per-segment id counter, the live-id
- * set, and the per-vCPU doorbell slots.  The plugin's devio hooks call
+ * set, and the per-vCPU kick FIFOs.  The plugin's devio hooks call
  * devio_note_doorbell (vCPU context, at the virtqueue kick) /
  * devio_note_start (block backend, issue) / devio_note_stop (block
  * backend, completion); the queued START/STOP records are drained into
  * the body stream at the next body entry (devio_drain, under exec_lock).
  *
- * Attribution is PER-VCPU.  Under the canonical ioeventfd=off
- * configuration the virtqueue kick (virtio_queue_notify) and the block
- * backend's blk_aio_* issue run on the SAME vCPU thread, back to back
- * with no yield, so the kick records the issuing owner (thread, asid)
- * and the device token in that vCPU's slot, and the immediately
- * following issue reads it by vCPU index.  The token guards the slot: a
- * non-virtio (IDE/AHCI) or kernel-internal blk_aio on that vCPU carries
- * a different / absent device and stays POSITIONAL (no owner on the
- * wire; the consumer uses the record's stream-position context).  A
- * per-DEVICE queue would instead race — two vCPUs kicking one shared
- * device concurrently can interleave push/pop and cross-attribute, the
- * exact multi-vCPU case this is built to get right — so the correlation
- * key is the vCPU, not the device.
+ * Attribution is a bounded FIFO per KICKING vCPU, matched at issue
+ * against that SAME vCPU's FIFO by device token, oldest first.  A single
+ * per-vCPU slot (the original design) assumed the kick and the matching
+ * blk_aio_* issue always run back to back with nothing else able to land
+ * in between; that breaks when one vCPU rings the doorbell twice — e.g.
+ * two queued requests — before the block backend drains the first, so
+ * the second kick overwrites the slot the first issue was about to read
+ * and that first request comes out attributed to the second request's
+ * owner.  The FIFO fixes this: pushes never race (each vCPU's FIFO has
+ * exactly one producer — only that vCPU's own doorbell — and doorbells
+ * are already BQL-serialised), so a burst of kicks queues up instead of
+ * clobbering, and note_start matches oldest-kick-first, mirroring a
+ * device's own in-order queue service.
+ *
+ * The FIFO lookup is scoped to @vcpu_index — the vCPU note_start's
+ * caller reports as actually draining a virtqueue right now — not
+ * searched across every vCPU.  virtio-blk's default queue count tracks
+ * the vCPU count (Linux's blk-mq maps each software queue to its
+ * submitting CPU), so a multi-vCPU guest ordinarily runs one virtqueue
+ * PER vCPU; @dev_token is the attached DEVICE's identity, not a
+ * per-queue one (the block backend has no queue index to report), so it
+ * alone cannot tell two vCPUs' queues apart.  Searching every FIFO
+ * regardless of @vcpu_index — which a per-DEVICE FIFO, or a naive
+ * cross-vCPU search over per-vCPU FIFOs, both amount to — reattributes a
+ * request to WHICHEVER vCPU happens to hold the globally-oldest matching
+ * kick, which is wrong whenever two vCPUs each have one outstanding kick
+ * on their own queue at the same time: exactly the concurrent
+ * multi-process case this exists to get right, and exactly the failure
+ * mode 88d9b7e526's own report rejected a shared per-device FIFO over.
+ * @vcpu_index is what a per-queue token cannot be without deeper
+ * plumbing through the block layer: under the canonical no-iothread
+ * config it reliably is the vCPU that owns the virtqueue being drained,
+ * so scoping the lookup to it recovers queue-level precision for free.
+ * Only when @vcpu_index is unknown (-1: the issue landed off any vCPU
+ * thread, so there is no queue hint at all) does the search widen to
+ * every FIFO, taking the globally oldest match as the best available
+ * guess.
+ *
+ * Each FIFO is capped (see kDevioKickFifoCap); a kick that arrives when
+ * its vCPU's FIFO is full is DROPPED rather than evicting the oldest
+ * entry — evicting would let a later issue match a newer, different
+ * kick's owner for the request whose real kick was discarded, which is
+ * exactly the wrong-owner outcome this exists to prevent.  A dropped
+ * kick only costs its own request its exactness (note_start finds no
+ * match and falls back to POSITIONAL); no request is ever attributed to
+ * the wrong owner.
  *
  * Starts are drained before stops so a request's START always precedes
  * its STOP on the wire; a STOP whose START never reached the wire is
@@ -4024,24 +4058,34 @@ struct DevioStart {
     uint32_t owner_asid;        /* valid iff exact */
 };
 
-/* Per-vCPU record of the most recent block-device kick: the device it
- * kicked and the owning (thread, asid) captured in that vCPU's context.
- * The immediately following blk_aio_* issue on the same vCPU reads it. */
+/* One queued block-device kick: the device it kicked, the owning
+ * (thread, asid) captured in the kicking vCPU's context, and a
+ * monotonic sequence number establishing kick order ACROSS vCPU FIFOs
+ * (doorbells are BQL-serialised, so a single global counter taken under
+ * g_devio.mtx totally orders them). */
 struct DevioKick {
-    uint64_t token = 0;         /* device token, 0 = slot empty */
-    uint32_t thread_id = 0;
-    uint32_t asid = 0;
+    uint64_t token;         /* device token */
+    uint32_t thread_id;
+    uint32_t asid;
+    uint64_t seq;
 };
+
+/* Per-vCPU kick FIFO cap.  A vCPU with this many un-drained kicks to one
+ * device indicates the block backend has fallen far behind the guest's
+ * submission rate; further kicks are dropped (see the file-header
+ * comment) rather than risk a wrong-owner match. */
+constexpr size_t kDevioKickFifoCap = 16;
 
 struct DevioState {
     GMutex   mtx;
     uint64_t next_id = 1;               /* compact per-segment, reset at open */
+    uint64_t next_kick_seq = 1;         /* orders kicks across vCPU FIFOs */
     std::vector<DevioStart> pending_starts;
     std::vector<uint64_t>   pending_stops;
     std::unordered_set<uint64_t> live_ids;  /* START emitted, STOP not yet */
-    /* Last block-device kick per vCPU, keyed by vCPU index (a map, so no
+    /* Queued kicks per KICKING vCPU, keyed by vCPU index (a map, so no
      * dependency on the plugin's vCPU cap and no bound to police). */
-    std::unordered_map<int, DevioKick> vcpu_kick;
+    std::unordered_map<int, std::deque<DevioKick>> vcpu_kick;
 };
 
 DevioState g_devio;
@@ -4060,10 +4104,17 @@ void devio_note_doorbell(int vcpu_index, uint64_t dev_token,
         return;
     }
     g_mutex_lock(&g_devio.mtx);
-    DevioKick &k = g_devio.vcpu_kick[vcpu_index];
-    k.token = dev_token;
-    k.thread_id = owner_thread_id;
-    k.asid = owner_asid;
+    std::deque<DevioKick> &fifo = g_devio.vcpu_kick[vcpu_index];
+    if (fifo.size() >= kDevioKickFifoCap) {
+        /* Full: drop the new kick instead of evicting the oldest (see
+         * the file-header comment — evicting risks a wrong-owner match
+         * for a later request, dropping only costs this one exactness). */
+        g_mutex_unlock(&g_devio.mtx);
+        g_stats.devio_fifo_kicks_dropped++;
+        return;
+    }
+    fifo.push_back(DevioKick{dev_token, owner_thread_id, owner_asid,
+                             g_devio.next_kick_seq++});
     g_mutex_unlock(&g_devio.mtx);
 }
 
@@ -4080,15 +4131,61 @@ uint64_t devio_note_start(int vcpu_index, int dir,
     s.owner_asid = 0;
     g_mutex_lock(&g_devio.mtx);
     s.request_id = g_devio.next_id++;
-    /* Exact attribution: the request was issued on a vCPU thread whose
-     * most recent kick was to this same device — the kick captured the
-     * issuing owner (they run back to back on that vCPU). */
-    if (vcpu_index >= 0 && dev_token) {
-        auto it = g_devio.vcpu_kick.find(vcpu_index);
-        if (it != g_devio.vcpu_kick.end() && it->second.token == dev_token) {
+    /* Exact attribution.  virtio-blk's default queue count tracks the
+     * vCPU count (blk-mq maps each software queue to its submitting
+     * CPU), so a multi-vCPU guest ordinarily runs one virtqueue PER
+     * vCPU — but @dev_token is the DEVICE, not the queue (the block
+     * backend has no queue index to report), so it alone cannot tell
+     * two vCPUs' queues apart.  @vcpu_index is what disambiguates them:
+     * under the canonical no-iothread config it is the vCPU actually
+     * draining ITS OWN virtqueue right now, which is exactly the vCPU
+     * whose FIFO holds the matching kick — so the search stays scoped
+     * to that one FIFO.  Searching every FIFO regardless of
+     * @vcpu_index (an earlier version of this fix did exactly that)
+     * reattributes a request to WHICHEVER vCPU happens to have the
+     * globally-oldest matching kick, which is wrong whenever two
+     * vCPUs each have one outstanding kick on their own queue at the
+     * same time — precisely the concurrent multi-process case this
+     * exists to get right.  Only when @vcpu_index itself is unknown
+     * (-1: the issue landed off any vCPU thread, so there is no queue
+     * hint at all) does the search widen to every FIFO, taking the
+     * globally oldest match as the best available guess. */
+    if (dev_token) {
+        std::deque<DevioKick> *fifo = nullptr;
+        std::deque<DevioKick>::iterator match{};
+        bool have_match = false;
+        if (vcpu_index >= 0) {
+            auto vit = g_devio.vcpu_kick.find(vcpu_index);
+            if (vit != g_devio.vcpu_kick.end()) {
+                for (auto it = vit->second.begin(); it != vit->second.end();
+                     ++it) {
+                    if (it->token == dev_token) {
+                        fifo = &vit->second;
+                        match = it;
+                        have_match = true;
+                        break;
+                    }
+                }
+            }
+        } else {
+            uint64_t best_seq = UINT64_MAX;
+            for (auto &kv : g_devio.vcpu_kick) {
+                for (auto it = kv.second.begin(); it != kv.second.end();
+                     ++it) {
+                    if (it->token == dev_token && it->seq < best_seq) {
+                        best_seq = it->seq;
+                        fifo = &kv.second;
+                        match = it;
+                        have_match = true;
+                    }
+                }
+            }
+        }
+        if (have_match) {
             s.exact = true;
-            s.owner_thread_id = it->second.thread_id;
-            s.owner_asid = it->second.asid;
+            s.owner_thread_id = match->thread_id;
+            s.owner_asid = match->asid;
+            fifo->erase(match);
         }
     }
     g_devio.pending_starts.push_back(s);
@@ -4110,6 +4207,7 @@ void devio_reset_segment(void)
 {
     g_mutex_lock(&g_devio.mtx);
     g_devio.next_id = 1;
+    g_devio.next_kick_seq = 1;
     g_devio.pending_starts.clear();
     g_devio.pending_stops.clear();
     g_devio.live_ids.clear();

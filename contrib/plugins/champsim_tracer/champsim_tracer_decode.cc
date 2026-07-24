@@ -688,17 +688,18 @@ void decode_detail_to_generic(uint64_t pc,
      * just-populated lane masks), writes dst_dep_mask[] /
      * store_data_dep_mask[].  NULL → no HAS_REG block (consumer
      * falls back to all-to-all).  Refiner library in
-     * champsim_tracer_mnemonic_tables.c.
+     * champsim_tracer_mnemonic_tables.cc.
      */
     if (cls && cls->dep_refine) {
         cls->dep_refine(info, out);
     }
 
     /*
-     * Normalize direct-branch immediate to an absolute target so the
-     * WP-target derivation in champsim_tracer.cc is ISA-agnostic.
-     * Capstone convention: x86/ARM64 op->imm is already absolute;
-     * RISC-V/MIPS op->imm is a raw signed PC-relative offset (add pc).
+     * Normalize direct-branch immediate to an absolute target when
+     * pc_relative_branch_imm is set for this ISA.  No ISA sets it
+     * today (see champsim_tracer_mnemonics.h), so this never fires;
+     * WP target selection uses InsnFields::taken_target_pc instead,
+     * which the translator already resolves to an absolute PC.
      */
     if (out->has_immediate &&
         isa_properties[trace_isa].pc_relative_branch_imm) {

@@ -468,15 +468,21 @@ extern const unsigned isa_insn_class_size[TRACE_ISA_MIPS + 1];
  *
  *   branch_delay_slots     — delay-slot insns after a branch (1 MIPS,
  *                            else 0)
- *   pc_relative_branch_imm — Capstone reports direct-branch imm
- *                            relative to the branch PC (RISC-V, MIPS)
- *                            vs absolute (x86, ARM64); the decoder
- *                            normalizes so the wire imm is always
- *                            absolute.
+ *   pc_relative_branch_imm — gates a decode.cc normalization of
+ *                            direct-branch `immediate` to an absolute
+ *                            target; unset (false) for every ISA today,
+ *                            so it never fires.  InsnFields::immediate
+ *                            is NOT the source of truth for a WP target
+ *                            regardless — that is taken_target_pc,
+ *                            resolved by the translator per instruction
+ *                            (see its doc comment below).
  *   include_implicit_regs  — fold Capstone implicit regs_read/write
- *                            into src/dst.  False where the operand
- *                            walk already covers them (RISC-V, MIPS;
- *                            else double-count).
+ *                            into src/dst.  False only for RISC-V,
+ *                            whose operand walk already covers them
+ *                            (folding would double-count); true
+ *                            elsewhere, including MIPS, where an
+ *                            implicit-only register (HI:LO) would
+ *                            otherwise vanish from the dependency chain.
  *   target_prefixes        — QEMU target_name prefixes for this ISA
  *   cap_arch               — Capstone CS_ARCH_*, or -1 if unsupported
  *   cap_mode_for_target    — derives the Capstone cs_mode bitmask

@@ -791,9 +791,10 @@ void BodyWalker::handle_entry(WalkState &ws, const Callback &cb)
                        &entry.dyn_params, &entry.reg_snaps, &entry.metaflags,
                        &entry.lane_masks, &lint_, &entry.branch);
 
-    /* Per-entry synchronous-fault trailer (Step 6.4a), present only when the
-     * CST_FLAG_FAULT header bit is set; sits between the CP delta and the WP
-     * sections.  Exception-nesting depth at which this BB executed. */
+    /* Per-entry synchronous-fault trailer (docs/format.rst §4.2a), present
+     * only when the CST_FLAG_FAULT header bit is set; sits between the CP
+     * delta and the WP sections.  Exception-nesting depth at which this
+     * BB executed. */
     if (flags_ & header_.ids.flag_fault) {
         entry.fault_depth = (uint32_t)body_.uleb();
         uint64_t n_anchors = body_.uleb();
@@ -1512,7 +1513,8 @@ void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
     consume_field_section(body_, (uint32_t)entry_tmpl, cp_tmpl,
                           cp_fields ? &cp_state : nullptr, nullptr);
 
-    /* Fault trailer (Step 6.4a), between the CP delta and the WP sections. */
+    /* Fault trailer (docs/format.rst §4.2a), between the CP delta and the
+     * WP sections. */
     uint32_t fault_depth = 0;
     if (flags_ & header_.ids.flag_fault) {
         fault_depth = (uint32_t)body_.uleb();

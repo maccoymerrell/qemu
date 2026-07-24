@@ -85,8 +85,8 @@ not a fidelity budget: no legitimate SMC pattern approaches it, so
 crossing it — a false-mutation loop or a pathological JIT — stops
 minting, keeps the body referencing the last revision (decoded bytes
 at that pc become approximate from there), and emits a loud
-once-per-segment stderr warning plus a ``smc_revision_overflow``
-statistic.
+once-per-segment stderr warning plus an ``SMC revision overflow
+events`` line in the exit-time statistics report.
 
 Revisions mint **only** from correct-path-confirmed translations.  A
 wrong-path speculative translation that observes mid-write bytes never
@@ -252,6 +252,40 @@ brackets disk requests with ``DEVIO_START`` / ``DEVIO_STOP`` records.
 Both depend on the guest MMU and the block backend, so both are inert
 in user mode: a user-mode trace carries neither and is byte-identical
 regardless of the options.
+
+**Disk-I/O owner attribution is exact only under a specific virtio
+configuration.**  A ``DEVIO_START`` record carries an *exact*
+``(owner_thread_id, owner_asid)`` only when the guest's virtqueue kick
+is observable in vCPU context — a ``virtio-blk`` device run with
+``ioeventfd=off`` and no dedicated iothread.  Under the default virtio
+ioeventfd fast path, a non-virtio device (IDE/AHCI), or kernel-internal
+I/O, the record falls back to *positional* attribution (the
+``(asid, thread)`` context in force at its stream position) — correct
+for a single marked process, a guess once two processes' disk I/O
+interleaves in the same body stream.  Multi-process exact attribution
+additionally requires each traced process pinned to its own vCPU: the
+captured owner comes from the same per-vCPU kernel-mode ownership model
+every kernel basic block uses, which has no clean answer once the guest
+scheduler migrates a process mid-syscall.  See the *Disk-I/O records*
+recipe in :doc:`quickstart` for the canonical invocation.
+
+**Never-executed template coverage (``static_templates=1``) is
+convergent, not exhaustive.**  When enabled (off by default, both
+modes), the plugin mints the untaken side of a branch as a
+dictionary-only template the first time that branch is evaluated by
+the correct path or a wrong-path excursion — it does not enumerate the
+binary's mapped executable footprint up front.  Coverage therefore
+accumulates over the run: a branch the workload never evaluates
+contributes no alternate, and a rarely-taken branch's alternate appears
+only once that branch is finally evaluated.  This matches exactly the
+fetch space a mispredict-driven consumer reaches from the branches the
+workload actually executes, but it will under-cover a consumer that
+wants every reachable instruction decoded from a cold start.
+``static_depth=N`` (default 4) extends each freshly-minted alternate
+along its statically-known successors — the fall-through always, and a
+direct branch's decoded target — to widen coverage per mint; an
+indirect terminator (indirect jump/call, return) has no static target,
+so that edge ends the walk.
 
 **A marker window held open by a dead process closes only at the
 icount budget.**  Under ``policy=latch`` a process that exits without

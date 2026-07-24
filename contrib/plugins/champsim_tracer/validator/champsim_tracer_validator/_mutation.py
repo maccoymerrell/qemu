@@ -29,6 +29,14 @@ Two mutation layers, matching the two places strictness lives:
     structurally malformed input rather than silently producing a
     partial trace a downstream consumer would trust.
 
+  * **wire_oracle** — a wire mutation whose catch is not guaranteed to be
+    an explicit decoder bounds/tag check: the corruption may desync the
+    body record stream in a way ``cst_decode`` merely tolerates (garbage
+    in, garbage out) rather than rejects outright.  The real decoder is
+    still run first, but when it returns 0 the mutated file is handed to
+    the full :func:`validator.validate` oracle as a second line of
+    defense — a semantic mismatch there is an equally valid catch.
+
 Each mutation carries an ``expect`` set of check ids (oracle) or a wire
 predicate; the runner records, per mutation, whether it was applied,
 whether it was caught, and by which check — the "mutation matrix".  The
@@ -41,6 +49,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import io
+import re
 import subprocess
 import tarfile
 from pathlib import Path
@@ -184,11 +193,14 @@ def _first_expected_insns_block(gen_meta: dict, field: str):
 @dataclasses.dataclass
 class Mutation:
     name: str
-    layer: str                       # "oracle" | "wire"
+    layer: str                       # "oracle" | "wire" | "wire_oracle"
     desc: str
-    # oracle: apply(triple) -> str|None  (returns a human note, or None
-    #   when the substrate can't carry the mutation -> SKIP)
-    # wire:   apply(cst_bytes) -> bytes|None
+    # oracle:       apply(triple) -> str|None  (returns a human note, or
+    #   None when the substrate can't carry the mutation -> SKIP)
+    # wire:         apply(cst_bytes) -> bytes|None
+    # wire_oracle:  apply(cst_bytes, decode_bin, work) -> bytes|None
+    #   (locating the target needs its own raw-format decode pass, so it
+    #   gets the tool path + a scratch dir the plain wire layer doesn't)
     apply: Callable
     expect: tuple = ()               # oracle: acceptable catching-check ids
     expect_wire_rc_nonzero: bool = True   # wire: decoder must reject
@@ -637,6 +649,94 @@ def _mw_body_truncate(cst_bytes: bytes) -> Optional[bytes]:
     return _repack(members)
 
 
+def _raw_dump(cst_path: Path, decode_bin: Path) -> Optional[str]:
+    """``cst_decode --format=raw`` stdout for @cst_path, or None if the
+    (supposedly pristine) substrate doesn't even raw-decode."""
+    proc = subprocess.run([str(decode_bin), "--format=raw", str(cst_path)],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def _wp_chain_hdr_offset(raw_text: str, want_has_events: bool) -> Optional[int]:
+    """First WP chain header's ``body.cst`` byte offset (format.rst Step
+    6.8 / §4.3) whose ``CST_WP_CHAIN_HAS_EVENTS`` bit matches
+    @want_has_events, per a ``cst_decode --format=raw`` structural dump
+    (every line there carries the absolute in-member byte offset the
+    line's read started at, per cst_raw.cc).  ``chain_hdr`` packs
+    ``num_wp`` in its high bits and the presence bit in bit 0; bit 0 of an
+    unsigned LEB128 encoding always lands in bit 0 of the FIRST byte
+    regardless of how many bytes the value spans, so flipping just that
+    bit (the caller's job) never perturbs num_wp."""
+    marker = "CST_WP_CHAIN_HAS_EVENTS"
+    for line in raw_text.splitlines():
+        if "chain_hdr=" not in line:
+            continue
+        if (marker in line) != want_has_events:
+            continue
+        m = re.match(r"\s*@([0-9a-fA-F]+)", line)
+        if m:
+            return int(m.group(1), 16)
+    return None
+
+
+def _mw_wp_events_presence_flip(cst_bytes: bytes, decode_bin: Path,
+                                work: Path,
+                                want_has_events: bool) -> Optional[bytes]:
+    """Flip the ``CST_WP_CHAIN_HAS_EVENTS`` bit (format.rst §4.3/§4.4,
+    Step 6.8) of one WP chain header on the wire, in the direction
+    selected by @want_has_events (True: an events-bearing header,
+    set->clear; False: an events-free header, clear->set).  Locates the
+    target byte via a ``cst_decode --format=raw`` structural dump of the
+    pristine substrate, then XORs bit 0 of that single byte in the
+    ``body.cst`` tar member -- num_wp (the ULEB's remaining bits) is left
+    untouched.  Returns None (SKIP) if the substrate carries no chain
+    header in the requested direction, or if it doesn't raw-decode."""
+    probe = work / "_wp_events_presence_probe.cst"
+    probe.write_bytes(cst_bytes)
+    try:
+        raw_text = _raw_dump(probe, decode_bin)
+    finally:
+        probe.unlink(missing_ok=True)
+    if raw_text is None:
+        return None
+    off = _wp_chain_hdr_offset(raw_text, want_has_events)
+    if off is None:
+        return None
+    members = _tar_members(cst_bytes)
+    bn = _member_name(members, "body.cst")
+    if bn is None or off >= len(members[bn][1]):
+        return None
+    m, data = members[bn]
+    b = bytearray(data)
+    b[off] ^= 0x01
+    members[bn] = (m, bytes(b))
+    return _repack(members)
+
+
+def _mw_wp_events_presence_clear(cst_bytes: bytes, decode_bin: Path,
+                                 work: Path) -> Optional[bytes]:
+    """HAS_EVENTS set->clear on a chain that DOES carry a
+    ``wp_events_section``: the decoder stops expecting it, so that
+    section's real bytes (its own length prefix, then num_events + event
+    records) are left on the wire exactly where the next body record's
+    tag byte is expected -- a stream desync."""
+    return _mw_wp_events_presence_flip(cst_bytes, decode_bin, work,
+                                       want_has_events=True)
+
+
+def _mw_wp_events_presence_set(cst_bytes: bytes, decode_bin: Path,
+                               work: Path) -> Optional[bytes]:
+    """HAS_EVENTS clear->set on a chain that carries NO events section:
+    the decoder now expects a ``wp_events_section`` immediately following
+    and consumes the next body record's bytes as a phantom section (its
+    own bogus length prefix, then whatever that many bytes decode to as
+    num_events + event records) -- a stream desync."""
+    return _mw_wp_events_presence_flip(cst_bytes, decode_bin, work,
+                                       want_has_events=False)
+
+
 def _m_smc_revision_byte_flip(triple, smc_sub) -> Optional[str]:
     """Corrupt a NON-baseline template revision's load-immediate byte at the
     self-modified pc.  The version-aware revision oracle must flag it — a
@@ -749,6 +849,15 @@ CATALOGUE: list = [
     Mutation("body_truncate", "wire",
              "truncate the body member payload",
              _mw_body_truncate),
+    Mutation("wp_events_presence_flip_clear", "wire_oracle",
+             "flip CST_WP_CHAIN_HAS_EVENTS set->clear on a chain that has "
+             "an events section (orphans its bytes onto the next record)",
+             _mw_wp_events_presence_clear),
+    Mutation("wp_events_presence_flip_set", "wire_oracle",
+             "flip CST_WP_CHAIN_HAS_EVENTS clear->set on a chain with no "
+             "events section (consumes the next record as a phantom "
+             "wp_events_section)",
+             _mw_wp_events_presence_set),
 ]
 
 
@@ -860,6 +969,54 @@ def _run_wire_mutation(m: Mutation, cst_bytes: bytes, work: Path,
                      detail="cst_decode accepted a structurally corrupt .cst")
 
 
+def _run_wire_oracle_mutation(m: Mutation, cst_bytes: bytes, work: Path,
+                              decode_bin: Path, meta_path: Path,
+                              binary_path: Path, vkw: dict) -> MutResult:
+    """Like :func:`_run_wire_mutation`, but when ``cst_decode`` tolerates
+    the corrupt bytes (rc==0) falls back to the full end-to-end oracle
+    (real decode + :func:`validator.validate`) so a corruption that
+    desyncs the body stream WITHOUT tripping an explicit decoder
+    bounds/tag check is still required to surface as a semantic
+    mismatch, not pass silently.  @m.apply takes (cst_bytes, decode_bin,
+    work) -- unlike the plain "wire" layer's apply(cst_bytes) -- because
+    locating the mutation target needs its own raw-format decode pass."""
+    try:
+        mutated = m.apply(cst_bytes, decode_bin, work)
+    except Exception as e:                                 # noqa: BLE001
+        return MutResult(m.name, m.layer, "skip",
+                         detail=f"apply raised: {e}")
+    if mutated is None:
+        return MutResult(m.name, m.layer, "skip",
+                         detail="substrate lacks a matching WP chain header")
+    p = work / f"mut_{m.name}.cst"
+    p.write_bytes(mutated)
+    proc = subprocess.run([str(decode_bin), "--format=legacy", str(p)],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        return MutResult(m.name, m.layer, "caught", applied=m.desc,
+                         caught_by=("cst_decode",),
+                         detail=f"cst_decode rejected (rc={proc.returncode})")
+    # The decoder tolerated the corrupt bytes -- fall back to the full
+    # oracle re-run on the mutated file (real decode, not an injected
+    # triple): an exception counts as a catch, same as _run_oracle_mutation.
+    try:
+        report = V.validate(meta_path, p, binary_path, **vkw)
+    except Exception as e:                                 # noqa: BLE001
+        return MutResult(m.name, m.layer, "caught", applied=m.desc,
+                         caught_by=("<oracle-exception>",),
+                         detail=("cst_decode accepted the corrupt wire but "
+                                 f"validate() raised: {e}"))
+    errs = tuple(sorted(_error_checks(report)))
+    if errs:
+        return MutResult(m.name, m.layer, "caught", applied=m.desc,
+                         caught_by=errs,
+                         detail=(f"cst_decode accepted the corrupt wire; "
+                                 f"oracle check(s) fired: {errs}"))
+    return MutResult(m.name, m.layer, "HOLE", applied=m.desc,
+                     detail="cst_decode accepted AND the full oracle "
+                            "validated clean")
+
+
 def run_mutations(build_dir: Path, work_root: Path, seed: int = 0x1111,
                   substrate=None) -> dict:
     """Build (or reuse) a known-good substrate trace, apply every
@@ -911,6 +1068,10 @@ def run_mutations(build_dir: Path, work_root: Path, seed: int = 0x1111,
             results.append(_run_oracle_mutation(
                 m, good, gen_meta, meta_path, trace_path, binary_path, vkw,
                 baseline_errcks))
+        elif m.layer == "wire_oracle":
+            results.append(_run_wire_oracle_mutation(
+                m, cst_bytes, work_root, decode_bin, meta_path, binary_path,
+                vkw))
         else:
             results.append(_run_wire_mutation(m, cst_bytes, work_root,
                                               decode_bin))

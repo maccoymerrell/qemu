@@ -94,6 +94,11 @@ FEATURES: dict[str, str] = {
     "wire:FLAG_WP":              "CST_FLAG_WP header bit",
     "wire:FLAG_FAULT":           "CST_FLAG_FAULT header bit",
     "wire:FLAG_PHYSADDR":        "CST_FLAG_PHYSADDR header bit",
+    # ---- wire: WP chain header flags -------------------------------------
+    "wire:wp_chain_flag":        "CST_WP_CHAIN_HAS_EVENTS presence bit "
+                                  "packed into the WP chain section's "
+                                  "leading chain_hdr ULEB (format.rst §4.3 "
+                                  "/ Step 6.8)",
     # ---- wire: FID families ---------------------------------------------
     "wire:FID_load_store_counts": "N_LOADS / N_STORES per-entry counts",
     "wire:FID_mem_addr":         "LOAD_ADDR / STORE_ADDR slot families",
@@ -1008,7 +1013,8 @@ def build_checks() -> list:
                     "opt:program_comment"], _chk_options_smoke))
     C.append(Check("features.mutation_strictness", "features",
                    "adversarial mutation matrix: oracle catches corruption",
-                   ["behavior:mutation_strictness"], _chk_mutation))
+                   ["behavior:mutation_strictness", "wire:wp_chain_flag"],
+                   _chk_mutation))
     C.append(Check("features.wrong_path_coverage", "features",
                    "static_templates=1 fall-through/BTB coverage oracle (4-ISA)",
                    ["behavior:wrong_path_coverage"], _chk_static_coverage))

@@ -120,14 +120,13 @@ extern thread_local std::vector<RegSnap> pending_reg_snaps CST_TLS_HOT;
  * instant — so a page-fault handler rewriting the MMU context register
  * mid-excursion cannot drift the key), and @returned records the frame's
  * FAULT_RETURN event — the completion is still fired by the resume
- * suffix's SEAL, one or more TB steps later.  (The plan's
- * susp_prev/susp_chain suspend fields arrive with the foreign-ASID
- * suspend-or-seal arrow; until then the foreign-ASID boundary DROPS the
- * deferred prev, so a frame never freezes chain state.  When that arrow
- * lands, its SuspendedPrev keys on this SAME (thread,asid): susp_.asid =
+ * suffix's SEAL, one or more TB steps later.  (The foreign-ASID
+ * suspend-or-seal arrow freezes the deferred prev in a SuspendedPrev
+ * instead of dropping it, so a frame never loses chain state.
+ * SuspendedPrev keys on this SAME (thread,asid): susp_.asid =
  * StepIn::pinned_asid at suspend time, and a resume requires the resuming
  * TB's effective asid to match — the identical key frame_idx_for_completion
- * now uses, so a suspension cannot be resumed cross-process.) */
+ * uses, so a suspension cannot be resumed cross-process.) */
 /* One suspended deferred-prev: the four thread-local sinks the seal phase
  * consumes, frozen atomically across a foreign-ASID span (plan §1.1) so the
  * pinned process's resume seals the interrupted block at its own depth

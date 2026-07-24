@@ -24,15 +24,6 @@
 #include "champsim_tracer_wp_thread_state.h"
 
 /*
- * Execute wrong-path basic blocks starting from @wrong_target.
- *
- * Per iteration: exec one TB via qemu_plugin_exec_tb() (triggers
- * vcpu_tb_trans + vcpu_mem_cb, not vcpu_tb_exec/inline stores), look up
- * its template, build a WPBBEntry, pick next PC, repeat until depth or
- * fault.  Returns the WPBBEntry chain by value (callers move it into
- * BodyEntry::wp_entries).
- */
-/*
  * Per-BB accumulator for the wrong-path walk.  Each spec-mode exec_tb runs
  * a (possibly multi-insn) wrong-path fragment up to its branch terminator;
  * the fragment walk appends exactly the insns that executed into these
@@ -163,12 +154,15 @@ struct WpWalkState {
  * with raw continue/break.  Two scopes consume it:
  *   - the outer driver loop: PROCEED (run the next phase this iteration),
  *     NEXT_ITER (continue the outer while), or a terminal reason
- *     (DOMAIN_CROSS / TRANSLATION_UNAVAIL / STUCK_BAIL / RETRY_SESSION /
- *     FAULT_STOP) — for every terminal the phase has already latched
- *     st.early_exit or st.fault_stop, exactly as the monolith did, so the
- *     driver's tail break fires;
+ *     (DOMAIN_CROSS / TRANSLATION_UNAVAIL / STUCK_BAIL / RETRY_SESSION) —
+ *     for every terminal the phase has already latched st.early_exit or
+ *     st.fault_stop, exactly as the monolith did, so the driver's tail
+ *     break fires;
  *   - the inner fragment loop (in wp_walk_fragments): BREAK_WALK (break the
  *     fragment for-loop) or PROCEED (fall through to the commit).
+ * The post-completion graceful stop (a syscall-boundary fault) is signaled
+ * by setting st.fault_stop directly inside the fragment loop, not by a
+ * dedicated WpStep value.
  */
 enum class WpStep {
     PROCEED,              // fall through to the next phase / the commit
@@ -178,7 +172,7 @@ enum class WpStep {
     DOMAIN_CROSS,         // SMEP/PXN cross-domain terminate
     TRANSLATION_UNAVAIL,  // wrong-path target unfetchable / null template
     STUCK_BAIL,           // no-forward-progress / poison / nop-slide / wild store
-    FAULT_STOP,           // post-completion graceful stop
+    FAULT_STOP,           // unused: reserved, not returned by any phase today
 };
 
 /*

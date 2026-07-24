@@ -1149,8 +1149,9 @@ static void bw_write_sleb128_u512(BitWriter *bw, U512 v)
  * on demand:
  *
  *   - scalar plane (u64 cells): the 3 singletons (N_LOADS / N_STORES /
- *     METAFLAGS) + 7 insn-metadata cells in a fixed [0..9] prefix, then
- *     9 scalar slotted families × max_slots.
+ *     METAFLAGS) + 7 insn-metadata cells + 2 branch-outcome singletons
+ *     in a fixed [0..11] prefix, then 11 scalar slotted families ×
+ *     max_slots.
  *   - wide plane (U512 cells): the 3 genuinely-wide families
  *     (LOAD_DATA / STORE_DATA / DST_REG) × max_slots.
  *
@@ -2546,8 +2547,6 @@ static void entry_view_scratch_free(EntryViewScratch *scratch)
     memset(scratch, 0, sizeof(*scratch));
 }
 
-/* Look up baseline value for (template_id, ins_pos, field_id).  Falls
- * back to the descriptor's template_default if no prior observation. */
 /* Look up baseline value for (ins_pos, field_id) in the wide plane.
  * Falls back to the WP base overlay, then the descriptor's template
  * default.  Wide families only (LOAD_DATA / STORE_DATA / DST_REG). */
@@ -3827,8 +3826,10 @@ static void accumulate_template_profiles(BodyStreamState *st, BodyEntry *entry,
  * the compact asid index; the FIRST sighting of an index additionally
  * writes its identity — @root_phys (page-table root physical address)
  * and @sig (content signature) — inline, mirroring the per-thread
- * regfile's first-sighting emission.  Phase 1 is single-ASID: index 0 is
- * declared once and never switches again.
+ * regfile's first-sighting emission.  Single-address-space traces carry
+ * index 0 declared once and never switching again; Stage B's
+ * multi-process gating is what makes the index vary and switch
+ * mid-stream.
  */
 static void emit_asid_switch_if_needed(BodyStreamState *st,
                                        uint64_t asid_index,

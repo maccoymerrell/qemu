@@ -35,9 +35,8 @@ the new ``TraceISA`` enumerator.  The plugin never branches on
 ``trace_isa`` in its shared paths; it reads that row.  A row carries the
 target-name prefixes that resolve the ISA (``target_prefixes``), the
 Capstone arch and mode resolver (``cap_arch`` / ``cap_mode_for_target``),
-the operand-walk and branch-immediate conventions
-(``include_implicit_regs``, ``pc_relative_branch_imm``,
-``branch_delay_slots``), the value-shaping hooks
+the operand-walk and branch-delay convention
+(``include_implicit_regs``, ``branch_delay_slots``), the value-shaping hooks
 (``flags_to_metaflags``, ``canonicalize_addr``, ``reg_alias_inserter``),
 the install-time behaviour flags (``xlate_bypass_priv`` for a
 translation-bypass privilege level, ``pin_reuse_asid`` for a narrow

@@ -468,14 +468,6 @@ extern const unsigned isa_insn_class_size[TRACE_ISA_MIPS + 1];
  *
  *   branch_delay_slots     — delay-slot insns after a branch (1 MIPS,
  *                            else 0)
- *   pc_relative_branch_imm — gates a decode.cc normalization of
- *                            direct-branch `immediate` to an absolute
- *                            target; unset (false) for every ISA today,
- *                            so it never fires.  InsnFields::immediate
- *                            is NOT the source of truth for a WP target
- *                            regardless — that is taken_target_pc,
- *                            resolved by the translator per instruction
- *                            (see its doc comment below).
  *   include_implicit_regs  — fold Capstone implicit regs_read/write
  *                            into src/dst.  False only for RISC-V,
  *                            whose operand walk already covers them
@@ -536,7 +528,6 @@ typedef int (*MarkerEncodeSeqFn)(uint8_t *out, uint32_t imm);
 
 typedef struct {
     uint8_t               branch_delay_slots;
-    bool                  pc_relative_branch_imm;
     bool                  include_implicit_regs;
     const char *const    *target_prefixes;
     int                   cap_arch;

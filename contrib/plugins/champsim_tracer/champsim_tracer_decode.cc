@@ -693,25 +693,6 @@ void decode_detail_to_generic(uint64_t pc,
     if (cls && cls->dep_refine) {
         cls->dep_refine(info, out);
     }
-
-    /*
-     * Normalize direct-branch immediate to an absolute target when
-     * pc_relative_branch_imm is set for this ISA.  No ISA sets it
-     * today (see champsim_tracer_mnemonics.h), so this never fires;
-     * WP target selection uses InsnFields::taken_target_pc instead,
-     * which the translator already resolves to an absolute PC.
-     */
-    if (out->has_immediate &&
-        isa_properties[trace_isa].pc_relative_branch_imm) {
-        bool is_direct_branch =
-            out->branch_type == BRANCH_COND_DIRECT ||
-            out->branch_type == BRANCH_DIRECT_JUMP ||
-            out->branch_type == BRANCH_DIRECT_CALL;
-        if (is_direct_branch) {
-            out->immediate = (int64_t)((uint64_t)pc + (uint64_t)out->immediate);
-        }
-    }
-
 }
 
 /*

@@ -123,6 +123,18 @@ const char *isa_name(uint8_t isa)
     }
 }
 
+/* DEVIO_START rw byte (CST_DEVIO_*) — not an encoding-map id, so named
+ * directly rather than through named(). */
+const char *devio_rw_name(uint8_t rw)
+{
+    switch (rw) {
+    case CST_DEVIO_READ:  return "read";
+    case CST_DEVIO_WRITE: return "write";
+    case CST_DEVIO_FLUSH: return "flush";
+    default:              return "?";
+    }
+}
+
 std::string hex(uint64_t v)
 {
     char b[24];
@@ -653,7 +665,7 @@ void dump_body(FILE *out, BodyStream &bs, const Header &h, uint64_t max_entries)
         }
 
         if (tag == ids.body_tag_asid_switch) {
-            emitf(out, b, off, 0, "ASID_SWITCH  tag=%u  [Step 6.7]",
+            emitf(out, b, off, 0, "ASID_SWITCH  tag=%u  [Step 6.2a]",
                   (unsigned)tag);
             size_t doff = b.consumed();
             int64_t d = b.sleb();
@@ -739,6 +751,45 @@ void dump_body(FILE *out, BodyStream &bs, const Header &h, uint64_t max_entries)
                       "bytes=%s", i, named(h.maps.reg, gen_id).c_str(),
                       (unsigned)width, bytes.c_str());
             }
+            continue;
+        }
+
+        /* BODY_TAG_DEVIO_START / _STOP (Step 6.3a, format.rst §4.1b): disk-
+         * I/O request bracket, present only in system-mode traces with the
+         * disk-I/O hook active.  Absent from the body_tag map (and so never
+         * dispatched here) for a device-free trace. */
+        if (tag == ids.body_tag_devio_start) {
+            emitf(out, b, off, 0, "DEVIO_START  tag=%u  [Step 6.3a]",
+                  (unsigned)tag);
+            size_t doff = b.consumed();
+            uint64_t request_id = b.uleb();
+            uint8_t rw = b.u8();
+            uint64_t bytes = b.uleb();
+            uint64_t block = b.uleb();
+            uint8_t attr = b.u8();
+            emitf(out, b, doff, 1,
+                  "request_id=%" PRIu64 "  rw=%u (%s)  bytes=%" PRIu64
+                  "  block=%" PRIu64 "  attr=%u (%s)",
+                  request_id, (unsigned)rw, devio_rw_name(rw), bytes, block,
+                  (unsigned)attr,
+                  attr == CST_DEVIO_ATTR_EXACT ? "exact" : "positional");
+            if (attr == CST_DEVIO_ATTR_EXACT) {
+                size_t ooff = b.consumed();
+                uint64_t owner_thread_id = b.uleb();
+                uint64_t owner_asid = b.uleb();
+                emitf(out, b, ooff, 1,
+                      "owner_thread_id=%" PRIu64 "  owner_asid=%" PRIu64,
+                      owner_thread_id, owner_asid);
+            }
+            continue;
+        }
+
+        if (tag == ids.body_tag_devio_stop) {
+            emitf(out, b, off, 0, "DEVIO_STOP  tag=%u  [Step 6.3a]",
+                  (unsigned)tag);
+            size_t doff = b.consumed();
+            uint64_t request_id = b.uleb();
+            emitf(out, b, doff, 1, "request_id=%" PRIu64, request_id);
             continue;
         }
 

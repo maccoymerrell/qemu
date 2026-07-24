@@ -66,6 +66,8 @@ public:
             end_     = o.end_;
             pos_     = o.pos_;
             consumed_total_ = o.consumed_total_;
+            poisoned_   = o.poisoned_;
+            poison_msg_ = std::move(o.poison_msg_);
             /* If we own a buffer, rebase data_ to it after the move. */
             if (!owned_.empty()) {
                 data_ = owned_.data();
@@ -74,6 +76,8 @@ public:
             o.end_ = 0;
             o.pos_ = 0;
             o.consumed_total_ = 0;
+            o.poisoned_ = false;
+            o.poison_msg_.clear();
         }
         return *this;
     }
@@ -81,6 +85,7 @@ public:
     Reader &operator=(const Reader &) = delete;
 
     bool   eof() {
+        check_poison();
         if (pos_ < end_) return false;
         if (!src_) return true;
         /* Streaming: maybe more bytes to pull. */
@@ -109,11 +114,13 @@ public:
     }
 
     uint8_t u8() {
+        check_poison();
         ensure(1);
         return data_[pos_++];
     }
 
     uint32_t u32_le() {
+        check_poison();
         ensure(4);
         uint32_t v;
         std::memcpy(&v, data_ + pos_, 4);
@@ -122,6 +129,7 @@ public:
     }
 
     uint64_t u64_le() {
+        check_poison();
         ensure(8);
         uint64_t v;
         std::memcpy(&v, data_ + pos_, 8);
@@ -130,6 +138,7 @@ public:
     }
 
     void raw(uint8_t *out, size_t n) {
+        check_poison();
         while (n > 0) {
             ensure(1);
             size_t take = end_ - pos_;
@@ -153,6 +162,7 @@ public:
      * length-prefixed section decoded in place (forward-compat) and to
      * parse-skip sections the consumer doesn't read. */
     void skip(uint64_t n) {
+        check_poison();
         while (n > 0) {
             if (pos_ >= end_) {
                 ensure(1);   /* refill (streaming) or throw (past end) */
@@ -174,6 +184,21 @@ public:
         skip(target - cur);
     }
 
+    /* Record a deferred malformed-input error detected by a caller that
+     * cannot itself throw (SectionScope::~SectionScope() -- destructors
+     * are implicitly noexcept, so an escaping exception there is
+     * std::terminate(), not a catchable error).  The first cause wins;
+     * later calls (e.g. a second SectionScope's destructor unwinding the
+     * same underlying corruption) are no-ops.  Sticky: once poisoned, the
+     * reader keeps refusing every subsequent read via check_poison()
+     * rather than risk quietly resyncing on corrupt input. */
+    void poison(const std::string &what) {
+        if (!poisoned_) {
+            poisoned_ = true;
+            poison_msg_ = what;
+        }
+    }
+
     /*
      * Fast path: a single-byte ULEB already resident in the buffer window
      * — overwhelmingly the common case in delta-encoded bodies.  Just a
@@ -183,6 +208,7 @@ public:
      * buffer boundaries fall to the out-of-line uleb_slow().
      */
     uint64_t uleb() {
+        check_poison();
         size_t p = pos_;
         if (p < end_) {
             uint8_t b = data_[p];
@@ -236,6 +262,7 @@ public:
      * 7-bit two's-complement payload; sign-extend bit 6.  Multi-byte and
      * boundary cases fall to sleb_slow(). */
     int64_t sleb() {
+        check_poison();
         size_t p = pos_;
         if (p < end_) {
             uint8_t b = data_[p];
@@ -325,6 +352,17 @@ private:
         }
     }
 
+    /* Surface a deferred poison() error (see its comment) as an ordinary
+     * exception.  Called first thing by every read entry point so a
+     * SectionScope destructor that swallowed a malformed-section error
+     * gets it rethrown from the very next legitimate read, rather than
+     * from the destructor itself. */
+    void check_poison() const {
+        if (poisoned_) {
+            throw std::runtime_error(poison_msg_);
+        }
+    }
+
     /* Ensure at least @n bytes are available at data_[pos_..end_).
      * For memory-backed Readers this is just a bounds check.  For
      * streaming Readers it shifts the buffer and pulls more from
@@ -371,6 +409,9 @@ private:
     /* For streaming readers: cumulative bytes shifted out of the
      * sliding buffer; consumed() returns this + pos_. */
     size_t                  consumed_total_ = 0;
+    /* Deferred malformed-input error; see poison()/check_poison(). */
+    bool                    poisoned_ = false;
+    std::string             poison_msg_;
 };
 
 /*
@@ -391,7 +432,22 @@ public:
         uint64_t n = r_.uleb();              /* section payload length */
         end_ = r_.consumed() + n;            /* sequence after the length read */
     }
-    ~SectionScope() { r_.skip_to_consumed(end_); }
+    /* Destructors are implicitly noexcept: skip_to_consumed() throwing
+     * out of here on malformed input (the record loop consumed more or
+     * fewer bytes than the section's own declared length promised) would
+     * be std::terminate()/SIGABRT instead of a clean, catchable error.
+     * Absorb it into the reader's deferred-error state instead -- the
+     * next read on @r_ (the next SectionScope's length ULEB, or the body
+     * walker's next tag byte) rethrows it as an ordinary exception, so
+     * the corruption is still rejected with a real message, just from a
+     * safe call site instead of a destructor. */
+    ~SectionScope() {
+        try {
+            r_.skip_to_consumed(end_);
+        } catch (const std::exception &e) {
+            r_.poison(e.what());
+        }
+    }
     SectionScope(const SectionScope &) = delete;
     SectionScope &operator=(const SectionScope &) = delete;
     operator Reader &() { return r_; }

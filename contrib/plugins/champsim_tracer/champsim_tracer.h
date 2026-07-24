@@ -1488,18 +1488,6 @@ extern char *trace_comment;
 extern uint64_t warmup_insns;
 extern uint64_t simulation_insns;
 
-/* Executable code range of the main binary, captured at plugin install.
- * Gates fragment-template creation and WP speculation entry; a PC
- * outside this range is dynamic memory and any "instructions" we'd read
- * there are non-deterministic.  See champsim_tracer.cc for details. */
-extern uint64_t g_code_start;
-extern uint64_t g_code_end;
-
-static inline bool cst_pc_in_code(uint64_t pc)
-{
-    return pc >= g_code_start && pc < g_code_end;
-}
-
 /* Is @pc a TB start_pc that has been poisoned (decode failure or
  * byte change detected at translation time)?  Acquires data_lock. */
 bool cst_pc_is_poisoned(uint64_t pc);

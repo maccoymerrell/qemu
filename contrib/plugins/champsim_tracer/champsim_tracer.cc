@@ -142,20 +142,6 @@ TraceFeatures g_features;
 uint64_t warmup_insns = 0;
 uint64_t simulation_insns = 0;
 
-/* Executable code region of the main binary, captured at plugin install
- * from qemu_plugin_start_code() / qemu_plugin_end_code().  Used to gate
- * fragment-template creation and WP speculation: a PC outside this range
- * is dynamic memory (stack/heap/data) whose contents are not stable
- * "instructions", and any "BB" the tracer would build there is
- * non-deterministic (the bytes change as the program runs).  CP never
- * leaves the executable range (that would crash the guest), so the gate
- * only ever rejects WP wrong-path divergences.  Statically-linked
- * binaries have all real code inside [start, end); for
- * dynamically-linked binaries this would need extending to track loaded
- * library text segments (TODO). */
-uint64_t g_code_start = 0;
-uint64_t g_code_end   = 0;
-
 /* First-seen 4-byte instruction word per VA.  Populated at every
  * vcpu_tb_trans and consulted at subsequent translations to detect
  * bytes-changed-since-last-time at the same VA — a sure sign that the
@@ -1887,23 +1873,6 @@ static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int cpu_index)
     }
     refresh_ctx_gates(cpu_index);
     recompute_budget(cpu_index);
-
-    /* Snapshot the main binary's text-segment range on first vCPU
-     * init.  qemu_plugin_start_code() / end_code() dereference the
-     * TaskState, which is not initialized at plugin_install time but
-     * is by the first vcpu_init.  The bytes-change / decode-failure
-     * detector in vcpu_tb_trans uses this range to decide whether to
-     * warn (in-text → SMC suspect) vs silent-kill (out-of-text → WP
-     * wrong-path into data). */
-    if (g_code_start == 0 && g_code_end == 0) {
-        g_code_start = qemu_plugin_start_code();
-        g_code_end   = qemu_plugin_end_code();
-        fprintf(stderr,
-                "champsim_tracer: text segment [0x%" PRIx64
-                " .. 0x%" PRIx64 ") (%" PRIu64 " bytes)\n",
-                g_code_start, g_code_end,
-                g_code_end - g_code_start);
-    }
 }
 
 /* ========================= Global state ========================= */
@@ -5850,7 +5819,6 @@ struct TbPoison {
     bool        poisoned = false;
     uint64_t    pc = 0;
     const char *reason = nullptr;
-    bool        is_smc_signal = false;
 };
 
 /*
@@ -6197,25 +6165,12 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     uint32_t canonical_n_insns =
         build_canonical_insns(tb, raw_n_insns, scratch);
 
-    /* Pre-commit instruction-memory stability check.  If the poisoning
-     * fires inside the main binary's text segment, warn once: that is a
-     * real SMC suspect, not WP wrong-pathing into data. */
+    /* Pre-commit instruction-memory stability check: bail without creating
+     * fragments/callbacks for a TB whose bytes don't parse as valid code
+     * (see detect_tb_poison). */
     TbPoison poison = detect_tb_poison(pc, insn_pcs, insn_bytes, insn_info,
                                        canonical_n_insns);
     if (poison.poisoned) {
-        if (poison.is_smc_signal && cst_pc_in_code(poison.pc)) {
-            static std::atomic<int> warned{0};
-            int expected = 0;
-            if (warned.compare_exchange_strong(expected, 1)) {
-                fprintf(stderr,
-                    "champsim_tracer: WARNING in-text-segment "
-                    "instruction at 0x%" PRIx64 " %s — possible "
-                    "self-modifying code; suppressing fragment "
-                    "creation for TB at 0x%" PRIx64 ".  "
-                    "(Further occurrences suppressed.)\n",
-                    poison.pc, poison.reason, pc);
-            }
-        }
         /* Do not create fragments, do not arm callbacks.  vcpu_tb_exec gets
          * no udata for this TB; scratch is freed by TbScratch on return. */
         return;

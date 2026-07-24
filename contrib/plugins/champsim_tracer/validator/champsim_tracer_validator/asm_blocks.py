@@ -645,7 +645,20 @@ _INTENT_OPCODE: dict[str, dict[str, str]] = {
         "xor": "GEN_OP_XOR", "xori": "GEN_OP_XOR",
         "and": "GEN_OP_AND", "andi": "GEN_OP_AND",
         "or": "GEN_OP_OR", "ori": "GEN_OP_OR",
-        "lui": "GEN_OP_MOV", "mv": "GEN_OP_MOV",
+        # "mv" is deliberately absent: it is disassembler ALIAS TEXT for
+        # `addi rd, rs, 0`, not a distinct instruction, and the assembler
+        # picks it purely from the immediate happening to be zero -- which
+        # `lla`'s auipc+addi expansion coincidentally hits whenever a
+        # block's address lands pcrel_lo-aligned to `arena` (an address-
+        # layout accident, unrelated to the instruction's intent). The
+        # underlying instruction is always ADDI (GEN_OP_INT_ADD in the
+        # plugin's ID-based classifier, which does not special-case the
+        # immediate value), so asserting MOV here is context-dependent in
+        # exactly the same way as riscv `li` / mips `move` above, and is
+        # excluded for the same reason (confirmed via `lla`-expansion
+        # false positives surfaced by many-block "breadth" generation:
+        # blk_* insn #1 pc=... 'INT_ADD' vs expected 'MOV').
+        "lui": "GEN_OP_MOV",
         "seqz": "GEN_OP_CMP", "snez": "GEN_OP_CMP",
         "slt": "GEN_OP_CMP", "sltu": "GEN_OP_CMP",
         "slti": "GEN_OP_CMP", "sltiu": "GEN_OP_CMP",

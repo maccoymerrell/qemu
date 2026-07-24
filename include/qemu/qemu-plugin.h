@@ -1379,8 +1379,11 @@ uint64_t qemu_plugin_u64_sum(qemu_plugin_u64 entry);
 /*
  * struct qemu_plugin_cpu_state - Opaque handle to a saved CPU state
  *
- * Holds a complete snapshot of the CPU's register state, captured via
- * the GDB register interface. Architecture-agnostic: works with any
+ * Holds a raw memcpy snapshot of the target's CPUArchState execution
+ * fields (plus the handful of CPUState fields a speculative walk can
+ * dirty), not a per-register walk through the GDB register interface —
+ * this also captures internal state (lazy flags, FPU, etc.) that GDB
+ * register access would miss. Architecture-agnostic: works with any
  * target (x86, ARM, RISC-V, etc.).
  */
 struct qemu_plugin_cpu_state;
@@ -1403,9 +1406,10 @@ int qemu_plugin_write_register(struct qemu_plugin_register *handle,
 /**
  * qemu_plugin_cpu_state_save() - snapshot all CPU registers
  *
- * Captures the complete register state of the current vCPU using the
- * architecture-agnostic GDB register interface. The returned handle
- * must be freed with qemu_plugin_cpu_state_free().
+ * Captures the complete execution state of the current vCPU via a raw
+ * memcpy of its CPUArchState (architecture-agnostic: works with any
+ * target). The returned handle must be freed with
+ * qemu_plugin_cpu_state_free().
  *
  * This function is only available in a context that register read access is
  * explicitly requested via QEMU_PLUGIN_CB_R_REGS or QEMU_PLUGIN_CB_RW_REGS.
@@ -1421,8 +1425,7 @@ struct qemu_plugin_cpu_state *qemu_plugin_cpu_state_save(void);
  * @state: handle returned by qemu_plugin_cpu_state_save()
  *
  * Restores the complete register state of the current vCPU from a
- * previously saved snapshot. After restoration, translation and TLB
- * caches are flushed to ensure consistency.
+ * previously saved snapshot.
  *
  * This function is only available in a context that register write access is
  * explicitly requested via QEMU_PLUGIN_CB_RW_REGS.

@@ -22,10 +22,24 @@ Layout::
     │   ├── classify.py            # per-ISA reg classification scanning
     │   ├── _cst_decode_runner.py  # parses cst_decode's legacy output
     │   ├── _diff_entries.py       # entry-level diff helper
+    │   ├── _system.py             # qemu-system-<isa> runner (marker/initramfs staging)
+    │   ├── _multiproc.py          # multi-process ASID / marker-latch harnesses
+    │   ├── _smc.py                # self-modifying-code workload family
+    │   ├── _full.py               # `full` unified runner: tiers + coverage registry
+    │   ├── _mutation.py           # `mutation` adversarial strictness harness
     │   └── tests/
-    │       └── test_decoder_smoke.py  # package unit test
+    │       ├── test_decoder_smoke.py       # package unit test
+    │       ├── test_wp_synthetic_fault.py  # WP fault continue-to-budget test
+    │       └── test_wp_tlb_cold_capture.py # WP TLB-cold code-page capture test
     └── tests/                          # sibling shell-out harnesses
-        └── run_roundtrip.sh       # default smoke shell-out
+        ├── run_roundtrip.sh       # default smoke shell-out
+        ├── tagged_ptr_addr.sh     # aarch64 tagged-pointer cross-compile smoke
+        └── large_scale.sh         # large-scale / long-running smoke
+
+``contrib/plugins/champsim_tracer/tests/golden_net.py`` (a sibling of
+``validator/``, not inside it) captures and re-checks byte-for-byte
+golden ``.cst`` / SVG output; ``full``'s ``quick.golden`` check drives
+it (see :ref:`Unified runner <validator-full>` below).
 
 What it does
 ------------
@@ -167,6 +181,312 @@ Sub-commands
    processes before and while the marked workload runs, rolling the
    ASID space over while the pinned window is open; asserts the pin
    followed only the marked process.
+
+``full``
+   :ref:`Unified runner <validator-full>`.  ONE command that runs a
+   fixed battery of checks across four tiers, reduces the whole run
+   to a single JSON summary and a single exit code, and enforces that
+   every registered plugin option / wire record / cross-cutting
+   behaviour is claimed by at least one check.  This is the
+   release-gate entrypoint.
+
+``mutation``
+   :ref:`Mutation testing <validator-mutation>`.  Adversarial
+   strictness proof: damages a known-good trace one well-defined way
+   at a time and asserts a specific check catches each corruption.
+   Runs standalone, or in-process from ``full``'s
+   ``features.mutation_strictness`` check.
+
+.. _validator-full:
+
+Unified runner (``full``)
+--------------------------
+
+``full`` is the single entrypoint that exercises everything else in
+this document plus a battery of coverage no other sub-command
+reaches on its own, and collapses the result into one JSON summary
+and one exit code.  It is the release gate: design-doc gate summaries
+(e.g. ``fault_merge_wp_rearch_plan.md``'s per-stage table) cite it
+verbatim as ``validator full`` green (``pass=N fail=0 ...``) alongside
+the golden-trace nets.
+
+.. code-block:: console
+
+   $ python3 -m champsim_tracer_validator full \
+         --build-dir ../../../../build \
+         -o /mnt/md0/QEMU/cst_runs/valunify
+
+Reliability contract:
+
+* every check gets its **own uniquely-named work directory** under
+  ``--work-root``, so nothing collides across a run;
+* every check **self-cleans** any qemu process it leaked, scoped to
+  its own work root, on the way out (``pkill`` best-effort);
+* unless ``--no-wait``, the whole run first loop-waits for a **quiet
+  host** — zero foreign ``qemu`` processes by COMM name, polled every
+  15s up to ``--max-wait`` — because the golden-byte check and
+  system-mode timing produce false failures under concurrent host
+  load;
+* the whole process tree runs under a 24 GiB ``RLIMIT_AS`` cap.
+
+Arguments:
+
+``--build-dir``
+   QEMU build directory (``qemu-<isa>``, ``qemu-system-<isa>``, the
+   plugin, and the offline tools).  Required.
+``-o`` / ``--work-root``
+   Output root (default ``/mnt/md0/QEMU/cst_runs/valunify``); each
+   check gets a unique subdirectory under it.
+``--tier`` (repeatable)
+   Restrict the run to one or more of ``quick`` / ``system`` /
+   ``multiproc`` / ``features``.
+``--only`` (repeatable)
+   Restrict the run to specific check ids, e.g. ``--only
+   features.smc --only features.devio``.
+``--seed``
+   Base seed for every generated workload in the run.
+``--no-wait`` / ``--max-wait``
+   Skip, or bound (default 3600s), the quiet-host wait above.
+``--dry-run``
+   Build the check table and coverage map, and enforce the
+   registration gap below, without running anything — a fast sanity
+   check on the registry itself.
+``--summary-json``
+   Also write the JSON summary to this path.  It is always written to
+   ``<work-root>/full_summary.json`` regardless.
+
+Coverage enforcement
+~~~~~~~~~~~~~~~~~~~~
+
+Every plugin option, wire record, offline-tool invocation, and
+cross-cutting behaviour the tracer supports is registered in a
+feature table (76 ids, spanning the ``opt:*`` / ``wire:*`` /
+``tool:*`` / ``behavior:*`` namespaces) and mapped to the
+check id(s) that exercise it.  ``full`` fails — independent of
+whether any check itself failed — if a registered feature has **zero**
+exercising checks (a *static gap*: the registry rotted out from under
+a real feature) or if a check claims a feature id that was never
+registered (a typo in the check's own ``features=[...]`` list).  Each
+run's summary additionally reports *runtime-uncovered* features: ones
+whose only exercising check(s) did not pass this particular run — a
+softer signal than the static gap, since a flaky or currently-broken
+check can runtime-uncover a feature the registry still statically
+claims.
+
+Tiers
+~~~~~
+
+Checks are registered with :func:`Check(id, tier, desc, features, fn,
+known_issue=...)`.  A check whose ``known_issue`` is set is
+**non-gating**: a failure is remapped to ``XFAIL`` — reported loudly
+in the summary, but it does not flip the run's exit code.  This is
+reserved for a confirmed upstream break or a genuinely
+timing-sensitive scenario that would otherwise produce a false RED
+under host contention; two ``multiproc`` checks use it (below).
+
+**quick** — 9 checks.  Mostly the ``all`` pipeline documented above,
+run under fixed flags per ISA, plus a handful of narrow one-off smoke
+checks and a byte-for-byte golden regression net:
+
+``quick.user_x86_64`` / ``quick.user_aarch64`` / ``quick.user_riscv64`` / ``quick.user_mipsel``
+   ``all`` with ``--diamonds 8 --coverage --regdata --hot-iters 200``,
+   one per ISA — user-mode 4-ISA correctness.
+``quick.iframe``
+   ``all --iframe-rate 500 --regdata`` (x86_64) — IFRAME resync
+   cadence under an aggressive override.
+``quick.wpprune``
+   ``all --wpprune 2`` (x86_64) — cold-branch wrong-path pruning.
+``quick.symbol_start``
+   Drives ``trace_window=symbol:`` directly (not through ``all``):
+   asserts a segment actually opens at the requested symbol
+   occurrence and that the occurrence counter advances
+   (``occurrence=2`` opens strictly later than ``occurrence=1``).
+``quick.tbflush``
+   ``all --tb-size 1 --diamonds 16 --hot-iters 100`` (x86_64) —
+   template reclamation across a mid-trace ``tb_flush``.
+``quick.golden``
+   Drives ``tests/golden_net.py check`` against a fixed canonical
+   work-root (the guest stack base — and hence wire bytes — shifts
+   with the work-root path length, so this check reuses one exact
+   path rather than its own per-check directory) — byte-for-byte
+   wire and ``cst_visualize`` SVG regression.
+
+**system** — 5 checks.  ``system.churn_x86``, ``system.churn_mipsel``,
+and ``system.thread_x86`` literally invoke the ``churn_test`` /
+``thread_test`` sub-commands documented above under fixed arguments;
+cross-reference those sections for what they assert.
+``system.user_x86`` and ``system.smc_x86`` add coverage no other
+sub-command exposes:
+
+``system.user_x86``
+   ``all --system --marker --coverage --regdata`` under ``-cpu max``
+   — the full-oracle marker/pin battery (ASID-switch records, kexc
+   excursion ownership, syscall/fault nesting, user-code identity)
+   against a real system boot.
+``system.churn_x86`` / ``system.churn_mipsel``
+   :ref:`Multi-process churn test <validator-churn>`, x86_64 and
+   mipsel (narrow 8-bit ASID).
+``system.thread_x86``
+   :ref:`Multi-thread test <validator-multi-thread>` under
+   ``--system --smp 2``.
+``system.smc_x86``
+   Self-modifying code mints revisions under the marker window /
+   pinned ASID (x86 system boot).
+
+**multiproc** — 3 checks.  Genuinely new coverage, folded in from
+:mod:`_multiproc` (three multi-ASID harnesses that used to live
+outside the repo as standalone scripts):
+
+``multiproc.trace_all_x86``
+   ``policy=trace-all`` vs ``policy=latch`` differential: trace-all
+   must capture a CONCURRENT unmarked peer's user code; latch must
+   render it invisible.  **Non-gating** (``known_issue``) — the
+   unmarked peer must be scheduled by the guest *inside* the marked
+   window to be captured, which the host cannot guarantee under
+   concurrent load, so a miss is a scheduling artefact rather than a
+   wire fault; the latch-differential half is still a hard assertion.
+``multiproc.latch_mips``
+   Narrow-ASID (mipsel, 8-bit) two-process latch: two MARKED
+   workloads latch independently, anchored by physical-code-page
+   identity rather than the aliased ``EntryHi.ASID`` value; a
+   ``--churn`` variant rolls the 8-bit ASID space to prove
+   recycle-no-cross-attribution.
+``multiproc.dead_latch_x86``
+   A marked peer is ``kill -9``'d mid-window with no END marker; the
+   dead-latch detector must age it out so the segment still closes
+   cleanly.  **Non-gating** — whether the detector or the guest's
+   poweroff backstop closes the window first is wall-clock/scheduling
+   sensitive; the trace well-formedness assertions still run once it
+   closes.
+
+**features** — 13 checks.  Plugin options and wire records that no
+``quick`` / ``system`` / ``multiproc`` check happens to exercise:
+
+``features.simpoint``
+   :ref:`Segmentation test <validator-segmentation>` — per-simpoint
+   segment independence and cross-segment consistency.
+``features.branch_verify``
+   ``cst_decode --verify-branch`` direction/target cross-check
+   against a traced (not validated) run.
+``features.physaddr``
+   Per-memop physical-page capture (``physaddr=1``, system mode).
+``features.devio``
+   Disk-I/O bracketing records (virtio-blk, system mode): a pairing
+   oracle (every STOP pairs a prior START) plus an exact payload
+   oracle (R/W, byte count, LBA match the workload's known request
+   list).
+``features.devio_attrib``
+   Exact-owner disk-I/O attribution: two CONCURRENTLY marked
+   processes (``-smp 2``, disjoint LBA bands) must each own only
+   their own band's ``DEVIO_START`` records.
+``features.faults_interrupts``
+   Synchronous-fault exclusion plus asynchronous-interrupt capture
+   (``faults=0`` / ``interrupts=1``, system mode).
+``features.tagged_ptr``
+   aarch64 tagged-pointer data-is-address heuristic (skips cleanly
+   without a cross-compiler).
+``features.wp_fault``
+   WP execution-time fault continues to budget (deterministic
+   garbage past the fault, not a poison/kill).
+``features.wp_tlb_cold``
+   WP fetch of a valid-PTE but TLB-cold code page captures real
+   bytes; a no-PTE target terminates the chain (system mode).
+``features.options_smoke``
+   Direct qemu-user drive of the long-tail options no other check
+   sets (``histogram``, ``wp_memdata``, ``wp_regdata``,
+   ``program``/``comment``); asserts the trace decodes clean.
+``features.mutation_strictness``
+   The :ref:`mutation <validator-mutation>` matrix, run in-process.
+``features.wrong_path_coverage``
+   ``static_templates=1`` fall-through / BTB coverage oracle across
+   all four ISAs (minted-alternate blocks, deepened by
+   ``static_depth``), with a minting-off run proving the oracle has
+   teeth.
+``features.smc``
+   Self-modifying code: revision minting, content-signature id
+   reuse, and the per-pc revision cap, across four ISAs and four SMC
+   families (``patch_once`` / ``flip_flop`` / ``cap_overflow`` /
+   ``write_no_exec``).
+
+.. _validator-mutation:
+
+Mutation testing (``mutation``)
+--------------------------------
+
+The rest of the validator asks *does a correct trace pass?*.
+``mutation`` asks the dual, more important question: *does an
+incorrect trace fail — and does the right check catch it?*  It builds
+one known-good substrate trace, then applies a catalogue of
+deliberate corruptions one at a time and asserts a specific check
+reacts to each.  A corruption nothing catches is a **HOLE** — a place
+the suite would silently accept a wrong trace — and the command exits
+non-zero if any applied mutation is not caught.
+
+.. code-block:: console
+
+   $ python3 -m champsim_tracer_validator mutation \
+         --build-dir ../../../../build \
+         -o out/mutation --json out/mutation/matrix.json
+
+Three mutation layers, matching where strictness has to live:
+
+``oracle``
+   The mutation is applied to the already-decoded ``(trace_meta,
+   templates, entries)`` triple, and the full ``validator.validate``
+   oracle is re-run against the damaged decode through a
+   decoder-shaped stand-in (no re-tracing needed); it must raise a
+   gating error in one of the mutation's declared ``expect`` checks.
+   15 of the 20 catalogue entries are this layer: flipping a captured
+   dst-register value or misattributing it to the wrong register id,
+   swapping two memop addresses or flipping a captured load/store data
+   byte, relabeling a pinned instruction's opcode class or branch
+   classification, flipping a raw instruction byte in a template,
+   truncating / reordering the first two blocks of a predicted
+   wrong-path chain, a depth-0 WP missequence paired with a later
+   synthetic fault mark (the fault must not excuse the earlier
+   divergence), reordering two correct-path entries, forging a
+   foreign guest-thread id onto an entry, corrupting a per-memop
+   physical-page value, dropping a ``DEVIO_STOP`` record, and
+   corrupting a self-modified block's non-baseline revision bytes.
+   The last two (DEVIO, SMC) run against dedicated purpose-built
+   substrates rather than the shared diamond-CFG one, since the
+   diamond CFG carries neither disk I/O nor self-modification.
+``wire``
+   The mutation is applied to the raw ``.cst`` container bytes (ustar
+   member payloads), and the real ``cst_decode`` binary runs against
+   the damaged file — it must reject the file outright (non-zero
+   exit).  This proves the decoder itself rejects structurally
+   malformed input rather than silently emitting a partial trace. 3
+   catalogue entries: corrupting the ``CST_MAGIC`` in the header
+   member, removing the body member from the container, and
+   truncating the body member payload.
+``wire_oracle``
+   A wire-level mutation whose catch is not guaranteed to be an
+   explicit decoder bounds/tag check — the corruption may desync the
+   body stream in a way ``cst_decode`` tolerates rather than rejects.
+   The real decoder runs first; if it accepts the file (rc=0), the
+   mutated file is handed to the full ``validate()`` oracle as a
+   second line of defense, and a semantic mismatch there is an
+   equally valid catch. 2 catalogue entries: flipping the WP chain
+   header's ``CST_WP_CHAIN_HAS_EVENTS`` presence bit set→clear on a
+   chain that has an events section, and clear→set on a chain that
+   doesn't.
+
+Each catalogue entry records, per mutation, whether it was applied,
+caught (and by which check id), or skipped (the substrate did not
+carry the feature the mutation targets — e.g. no DEVIO records on a
+non-devio substrate) — the *mutation matrix*.  The substrate itself
+must validate clean before any mutation is applied
+(``baseline_clean``), or every subsequent "catch" would be a false
+positive from a substrate that was already broken.
+
+Arguments: ``--build-dir``, ``-o``/``--work-root`` (default
+``/mnt/md0/QEMU/cst_runs/strictaudit/mutation``), ``--seed``, and
+``--json`` (also write the matrix to this path).
+
+``full``'s ``features.mutation_strictness`` check calls the same
+``run_mutations()`` machinery in-process rather than shelling out to
+this sub-command.
 
 What gets checked
 -----------------
@@ -464,10 +784,12 @@ expected memop sub-list, and the per-insn (loads, stores) shape is
 stable across executions), and — in system-mode runs —
 ``syscall_transitions`` and ``fault_excursions`` (user→kernel→return
 privilege transitions off the ``SYSTEM`` bit, and the fault-depth
-invariants).  Not yet exercised by the harness: the ``devio`` and
-``physaddr`` record families — a trace's ``asid=`` context is parsed by
-the decode runner, but the ``BODY_TAG_ASID_SWITCH`` record and the
-disk-I/O / physical-page fields have no dedicated structural assertion.
+invariants).  The ``devio`` and ``physaddr`` record families have their
+own dedicated structural assertions too, but as ``features`` tier
+checks (``features.devio`` / ``features.devio_attrib`` /
+``features.physaddr``) run through the unified ``full`` runner rather
+than a plain ``validate`` invocation — see
+:ref:`Unified runner <validator-full>` above.
 
 .. _validator-segmentation:
 

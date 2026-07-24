@@ -37,6 +37,7 @@
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "champsim_tracer.h"
 
@@ -91,6 +92,47 @@ struct BBKeyHash {
         h ^= h >> 27;
         return (size_t)h;
     }
+};
+
+/*
+ * Self-modifying-code (SMC) revision key: a (asid_root, start_pc) slot plus
+ * the FNV content signature of a specific executed program-text STATE at that
+ * pc.  When correct-path code re-executes with different bytes at a pc the
+ * tracer already committed, the store mints a new template revision (a fresh
+ * template_id) and remembers the retired one by this key, so a state the guest
+ * later restores (inline-cache A/B/A patching) reuses its original id rather
+ * than minting an unbounded chain of revisions.  See smc_plan.md §1.3. */
+struct RevKey {
+    uint64_t asid_root;
+    uint64_t start_pc;
+    uint64_t content_sig;
+    bool operator==(const RevKey &o) const
+    {
+        return asid_root == o.asid_root && start_pc == o.start_pc &&
+               content_sig == o.content_sig;
+    }
+};
+
+struct RevKeyHash {
+    size_t operator()(const RevKey &k) const
+    {
+        uint64_t h = k.asid_root + 0x9e3779b97f4a7c15ULL;
+        h ^= k.start_pc + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= k.content_sig + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= h >> 30;
+        h *= 0xbf58476d1ce4e5b9ULL;
+        h ^= h >> 27;
+        return (size_t)h;
+    }
+};
+
+/* Per-(asid_root, start_pc) SMC bookkeeping: how many DISTINCT executed states
+ * have minted a revision at this pc (the cap backstop, smc_plan.md §5-A), and
+ * whether the overflow warning has already fired this segment (LOUD once per
+ * segment, §5-B).  Segment-scoped: cleared with bb_map_. */
+struct RevisionSlot {
+    uint32_t distinct = 0;
+    bool     overflow_warned = false;
 };
 
 /*
@@ -159,7 +201,8 @@ public:
                                const uint8_t *insn_bytes,
                                const InsnRegNames *insn_reg_names,
                                const char *symbol_name,
-                               uint64_t fall_through_pc);
+                               uint64_t fall_through_pc,
+                               bool cp_confirmed);
     /*
      * Reference variant of commit_true_bb for the wrong-path walker.
      * @insn_fields / @insn_reg_names are arrays of *pointers* into
@@ -179,7 +222,8 @@ public:
                                     const uint8_t *insn_bytes,
                                     const InsnRegNames *const *insn_reg_names,
                                     const char *symbol_name,
-                                    uint64_t fall_through_pc);
+                                    uint64_t fall_through_pc,
+                                    bool cp_confirmed);
     BBTemplate *get_or_create_bb_template(uint64_t entry_pc,
                                           BBTemplate *const *fragments,
                                           unsigned int n_fragments);
@@ -217,6 +261,11 @@ public:
 
     size_t tb_count() const;
     size_t bb_count() const;
+    /* Count of retired SMC revisions across all (asid_root, start_pc) slots —
+     * displaced-but-still-serialised templates.  Zero unless code
+     * self-modifies, so a non-SMC trace's template count (and wire bytes) is
+     * unchanged.  Added to the templates-section count alongside bb_count(). */
+    size_t retired_revision_count() const;
     /* Count of alt_map_ templates that WOULD serialise: those whose
      * (asid_root, start_pc) key is not shadowed by an executed bb_map_
      * entry (a block that ran is carried by bb_map_; dynamic wins over the
@@ -411,6 +460,47 @@ private:
                                       uint32_t n_insns,
                                       const uint64_t *insn_pcs);
 
+    /*
+     * SMC revision resolver — the shared front-end for both commit_true_bb
+     * variants (smc_plan.md §1).  Given the incoming canonical arrays for a
+     * (asid_root, start_pc) slot, decide whether to REUSE an existing template
+     * or BUILD a fresh one:
+     *
+     *   - returns a non-null BBTemplate*  -> reuse it, do not build.  Covers
+     *       the byte-identical hot path, the length/prefix-divergence
+     *       "keep original" legacy path, the wrong-path speculation guard
+     *       (spec never versions), the content-signature A/B/A reuse of a
+     *       retired revision, and the cap-overflow degrade.
+     *   - returns nullptr                 -> the caller must build a fresh
+     *       template and hand it to install_live_revision(@key, tmpl,
+     *       *out_sig).  Covers a first sighting and a newly-minted revision;
+     *       for a revision the current live template has ALREADY been retired
+     *       here so the caller's install just re-populates the live slot.
+     *
+     * Revisions mint ONLY when @cp_confirmed and the superseded live template
+     * was itself CP-confirmed — a wrong-path/spec translation, or the very
+     * first CP confirmation of a WP-seeded block, never versions (the
+     * established mis-stamp guard, §1.4).  Caller holds data_lock. */
+    BBTemplate *resolve_true_bb(const BBKey &key, uint32_t n_insns,
+                                const uint64_t *insn_pcs,
+                                const uint8_t *insn_sizes,
+                                const uint8_t *insn_bytes,
+                                bool cp_confirmed, uint64_t *out_sig);
+    /* Insert @tmpl as the live revision of @key and index it by @sig for a
+     * future A/B/A return.  Bumps the slot's distinct-state count. */
+    void install_live_revision(const BBKey &key, BBTemplatePtr tmpl,
+                               uint64_t sig);
+    /* Move @key's current live template into the retired stash (still
+     * serialised; body entries pin it).  The live slot is emptied so the
+     * caller's install re-populates it. */
+    void retire_live_revision(const BBKey &key);
+    /* Make retired revision @prior the live one for @key, retiring whatever
+     * was live — the A/B/A content-signature swap. */
+    void swap_live_revision(const BBKey &key, BBTemplate *prior);
+    /* One-shot per-segment LOUD overflow warning + stats when @key exceeds the
+     * revision cap (smc_plan.md §5-B). */
+    void note_revision_overflow(const BBKey &key, RevisionSlot &slot);
+
     /* Persistent set of per-translation templates (one BBTemplatePtr per
      * TB fragment), never freed on tb_flush.  Owned here for the whole
      * run; deduped via tb_chain_dedup_ so a re-translation reuses the
@@ -454,6 +544,24 @@ private:
      * Empty (and inert) unless the feature runs, so a trace without it is
      * byte-identical. */
     std::unordered_map<BBKey, BBTemplatePtr, BBKeyHash> alt_map_;
+    /* Retired SMC revisions, per (asid_root, start_pc): templates a newer
+     * correct-path revision displaced from bb_map_.  They keep their run-
+     * assigned template_id and serialise alongside their successors (body
+     * entries emitted while they were live reference them), so the wire stays
+     * self-consistent.  Segment-scoped: cleared wholesale by clear_bb_map.
+     * Empty (and every dependent path inert) unless code self-modifies, so a
+     * non-SMC trace is byte-identical. */
+    std::unordered_map<BBKey, std::vector<BBTemplatePtr>, BBKeyHash>
+        retired_revisions_;
+    /* Content-signature index for A/B/A/B state reuse: (asid_root, start_pc,
+     * FNV content_sig) -> the template (live or retired) that carries exactly
+     * that program-text state, so a mutation returning to a previously-seen
+     * state reuses its template_id instead of minting an unbounded chain.
+     * Segment-scoped. */
+    std::unordered_map<RevKey, BBTemplate *, RevKeyHash> revision_by_sig_;
+    /* Per-(asid_root, start_pc) distinct-state count + overflow latch — the
+     * cap backstop and its once-per-segment warning.  Segment-scoped. */
+    std::unordered_map<BBKey, RevisionSlot, BBKeyHash> revision_slots_;
     uint32_t                                    next_template_id_ = 1;
     uint64_t                                    spec_pending_bytes_ = 0;
     /* Current bb_map_ generation, bumped by clear_bb_map at every

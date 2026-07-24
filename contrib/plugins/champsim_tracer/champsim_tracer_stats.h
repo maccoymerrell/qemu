@@ -27,6 +27,17 @@ struct Stats {
     uint64_t bb_templates_created = 0;
     uint64_t unique_branch_pcs = 0;
 
+    /* Self-modifying-code revisioning (smc_plan.md).  A CP re-execution of a
+     * (asid_root, start_pc) slot whose committed template holds different
+     * bytes mints a new template revision; a state the guest later restores
+     * reuses its original revision id.  smc_overflow_* count the cap backstop
+     * (a per-PC distinct-state count above g_smc_revision_cap = a bug signal,
+     * §5-B).  All zero unless code self-modifies. */
+    uint64_t smc_revisions_minted = 0;
+    uint64_t smc_revision_reuses = 0;
+    uint64_t smc_overflow_events = 0;
+    uint64_t smc_overflow_pcs = 0;
+
     /* Branch transitions observed at vcpu_tb_exec time. */
     uint64_t branches_observed = 0;
     uint64_t branches_taken = 0;

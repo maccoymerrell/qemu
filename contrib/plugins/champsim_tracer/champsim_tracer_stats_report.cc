@@ -91,6 +91,10 @@ void append_stats_summary(GString *report, const char *label,
                                  const Stats &stats)
 {
     const struct { const char *name; uint64_t value; } counters[] = {
+        { "SMC revisions minted",                stats.smc_revisions_minted },
+        { "SMC revision id reuses",              stats.smc_revision_reuses },
+        { "SMC revision overflow events",        stats.smc_overflow_events },
+        { "SMC revision overflow PCs",           stats.smc_overflow_pcs },
         { "Branch transitions observed",         stats.branches_observed },
         { "  Taken",                             stats.branches_taken },
         { "  Not-taken",                         stats.branches_not_taken },

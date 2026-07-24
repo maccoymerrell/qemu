@@ -221,6 +221,14 @@ void TemplateStore::clear_bb_map()
      * bb_map_ (re-minted at the next branch evaluation) and referenced by
      * nothing — drop on the same boundary. */
     alt_map_.clear();
+    /* SMC revision state is segment-scoped too: retired revisions are pinned
+     * only by THIS segment's body entries (which are flushed at the boundary),
+     * and the content-signature / distinct-count bookkeeping restarts with the
+     * fresh template-id space below.  Dropping retired_revisions_ frees their
+     * heap; the once-per-segment overflow warning re-arms via revision_slots_. */
+    retired_revisions_.clear();
+    revision_by_sig_.clear();
+    revision_slots_.clear();
     /* TB templates hold two back-edges into the store just dropped —
      * parent_true_bb (fast-path link to the assembled true-BB) and
      * rep_subtmpl (the 1-insn REP self-loop true-BB for x86 REP
@@ -356,28 +364,49 @@ size_t TemplateStore::bb_count() const
     return bb_map_.size();
 }
 
+size_t TemplateStore::retired_revision_count() const
+{
+    size_t n = 0;
+    for (const auto &kv : retired_revisions_) {
+        n += kv.second.size();
+    }
+    return n;
+}
+
 void TemplateStore::for_each_bb(const std::function<void(BBTemplate &)> &fn)
 {
-    /* Walk by sorted (start_pc, asid_root) so templates-section
-     * serialization is deterministic (unordered_map order is
-     * implementation-defined).  start_pc is the PRIMARY sort key: with a
-     * single address space every entry shares asid_root 0, so the order —
-     * and thus the serialized bytes — are identical to the old start_pc
-     * sort.  Called once at end-of-trace; sort cost amortized over the
-     * run. */
-    std::vector<BBKey> keys;
-    keys.reserve(bb_map_.size());
+    /* Serialise every true-BB template: the live revision of each
+     * (asid_root, start_pc) slot, plus any retired SMC revisions still pinned
+     * by emitted body entries.  Deterministic order: start_pc PRIMARY,
+     * asid_root SECONDARY (identical to the old sort for a single address
+     * space), then template_id to break ties between revisions sharing a slot
+     * (mint order = body-reference order).  Without SMC the retired set is
+     * empty and every slot is unique, so the template_id tiebreak never fires
+     * and the serialized bytes match the old start_pc sort exactly.  Called
+     * once at end-of-trace; sort cost amortized over the run. */
+    std::vector<std::pair<BBKey, BBTemplate *>> all;
+    all.reserve(bb_map_.size() + retired_revision_count());
     for (const auto &kv : bb_map_) {
-        keys.push_back(kv.first);
+        all.emplace_back(kv.first, kv.second.get());
     }
-    std::sort(keys.begin(), keys.end(), [](const BBKey &a, const BBKey &b) {
-        if (a.start_pc != b.start_pc) {
-            return a.start_pc < b.start_pc;
+    for (const auto &kv : retired_revisions_) {
+        for (const auto &up : kv.second) {
+            all.emplace_back(kv.first, up.get());
         }
-        return a.asid_root < b.asid_root;
+    }
+    std::sort(all.begin(), all.end(),
+              [](const std::pair<BBKey, BBTemplate *> &a,
+                 const std::pair<BBKey, BBTemplate *> &b) {
+        if (a.first.start_pc != b.first.start_pc) {
+            return a.first.start_pc < b.first.start_pc;
+        }
+        if (a.first.asid_root != b.first.asid_root) {
+            return a.first.asid_root < b.first.asid_root;
+        }
+        return a.second->template_id < b.second->template_id;
     });
-    for (const BBKey &k : keys) {
-        fn(*bb_map_[k]);
+    for (const auto &p : all) {
+        fn(*p.second);
     }
 }
 
@@ -811,6 +840,181 @@ static BBTemplatePtr build_bb_template(uint32_t template_id,
     return tmpl;
 }
 
+/* FNV-1a content signature of a canonical program-text state: the insn count,
+ * then each insn's size and its fixed-stride byte image.  Two commits at one
+ * (asid_root, start_pc) share a signature iff they carry byte-identical code,
+ * which is exactly the "same state" test the A/B/A revision reuse needs. */
+static uint64_t bb_content_sig(uint32_t n_insns, const uint8_t *insn_sizes,
+                               const uint8_t *insn_bytes)
+{
+    uint64_t h = 1469598103934665603ULL;            /* FNV-1a offset basis */
+    auto mix = [&h](uint8_t b) {
+        h ^= b;
+        h *= 1099511628211ULL;                      /* FNV-1a prime */
+    };
+    for (int i = 0; i < 4; i++) {
+        mix((uint8_t)((n_insns >> (i * 8)) & 0xff));
+    }
+    for (uint32_t i = 0; i < n_insns; i++) {
+        mix(insn_sizes[i]);
+        const uint8_t *p = &insn_bytes[(size_t)i * MAX_INSN_BYTES];
+        for (uint32_t j = 0; j < MAX_INSN_BYTES; j++) {
+            mix(p[j]);
+        }
+    }
+    return h;
+}
+
+/* How incoming canonical arrays relate to an already-committed template @e at
+ * the same (asid_root, start_pc):
+ *   EXACT            — same shape AND byte-identical (the non-SMC reuse).
+ *   SMC_SAME_SHAPE   — same insn PCs, DIFFERENT bytes: genuine in-place
+ *                      self-modification (opcode/immediate patched in place).
+ *   DIVERGENT        — different insn count or PC sequence: a chain finalised
+ *                      at a different length / prefix, NOT in-place SMC (the
+ *                      historical "keep original" case). */
+enum class BBMatch { EXACT, SMC_SAME_SHAPE, DIVERGENT };
+
+static BBMatch classify_bb_match(const BBTemplate *e, uint32_t n_insns,
+                                 const uint64_t *insn_pcs,
+                                 const uint8_t *insn_sizes,
+                                 const uint8_t *insn_bytes)
+{
+    if (e->n_insns != n_insns) {
+        return BBMatch::DIVERGENT;
+    }
+    for (uint32_t i = 0; i < n_insns; i++) {
+        if (e->insn_pcs[i] != insn_pcs[i]) {
+            return BBMatch::DIVERGENT;
+        }
+    }
+    /* Same PC shape — compare sizes and byte images. */
+    for (uint32_t i = 0; i < n_insns; i++) {
+        if (e->insn_sizes[i] != insn_sizes[i] ||
+            memcmp(&e->insn_bytes[(size_t)i * MAX_INSN_BYTES],
+                   &insn_bytes[(size_t)i * MAX_INSN_BYTES],
+                   MAX_INSN_BYTES) != 0) {
+            return BBMatch::SMC_SAME_SHAPE;
+        }
+    }
+    return BBMatch::EXACT;
+}
+
+void TemplateStore::install_live_revision(const BBKey &key,
+                                          BBTemplatePtr tmpl, uint64_t sig)
+{
+    BBTemplate *raw = tmpl.get();
+    bb_map_[key] = std::move(tmpl);
+    revision_by_sig_[RevKey{key.asid_root, key.start_pc, sig}] = raw;
+    revision_slots_[key].distinct++;
+}
+
+void TemplateStore::retire_live_revision(const BBKey &key)
+{
+    auto it = bb_map_.find(key);
+    if (it == bb_map_.end() || !it->second) {
+        return;
+    }
+    retired_revisions_[key].push_back(std::move(it->second));
+    bb_map_.erase(it);   /* install re-populates the live slot */
+}
+
+void TemplateStore::swap_live_revision(const BBKey &key, BBTemplate *prior)
+{
+    auto rit = retired_revisions_.find(key);
+    if (rit == retired_revisions_.end()) {
+        return;
+    }
+    for (auto &up : rit->second) {
+        if (up.get() == prior) {
+            BBTemplatePtr live = std::move(bb_map_[key]);
+            bb_map_[key] = std::move(up);
+            up = std::move(live);   /* the just-displaced live becomes retired */
+            return;
+        }
+    }
+}
+
+void TemplateStore::note_revision_overflow(const BBKey &key, RevisionSlot &slot)
+{
+    g_stats.smc_overflow_events++;
+    if (!slot.overflow_warned) {
+        slot.overflow_warned = true;
+        g_stats.smc_overflow_pcs++;
+        fprintf(stderr,
+            "champsim_tracer: WARNING self-modifying code at start_pc=0x%"
+            PRIx64 " exceeded the revision cap (%u distinct states) — "
+            "minting stopped; the body keeps referencing the last revision "
+            "so decoded bytes at this pc are approximate from here.  This "
+            "cap is a bug detector (smc_revisions=); reaching it usually "
+            "means a false-mutation loop or a runaway JIT.  Counted in "
+            "smc_revision_overflow_events (once per segment).\n",
+            key.start_pc, g_smc_revision_cap);
+    }
+}
+
+BBTemplate *TemplateStore::resolve_true_bb(
+    const BBKey &key, uint32_t n_insns, const uint64_t *insn_pcs,
+    const uint8_t *insn_sizes, const uint8_t *insn_bytes,
+    bool cp_confirmed, uint64_t *out_sig)
+{
+    BBTemplate *existing = find_bb_template(key.asid_root, key.start_pc);
+    if (!existing) {
+        /* First sighting of this slot: build and install as revision 0. */
+        *out_sig = bb_content_sig(n_insns, insn_sizes, insn_bytes);
+        return nullptr;
+    }
+
+    BBMatch m = classify_bb_match(existing, n_insns, insn_pcs,
+                                  insn_sizes, insn_bytes);
+    if (m == BBMatch::EXACT) {
+        return existing;   /* non-SMC reuse — byte-identical to the old path */
+    }
+    if (m == BBMatch::DIVERGENT) {
+        /* Length/prefix divergence, NOT in-place SMC: preserve the historical
+         * "keep original" behavior and its one-shot warning (via
+         * find_existing_true_bb below).  No revision is minted, so output for
+         * this legacy case stays byte-identical. */
+        return find_existing_true_bb(key.asid_root, key.start_pc,
+                                     n_insns, insn_pcs);
+    }
+
+    /* BBMatch::SMC_SAME_SHAPE — genuine in-place self-modification. */
+    if (!cp_confirmed || !existing->is_system_cp_confirmed) {
+        /* Speculation guard (smc_plan.md §1.4): a wrong-path/spec translation
+         * never versions, and neither does the FIRST correct-path confirmation
+         * of a block only the wrong path had seeded (its stored bytes were
+         * never authoritative).  Both cases reuse the live template exactly as
+         * the pre-SMC code did — the byte-identical guarantee for non-SMC and
+         * WP-first-commit traces. */
+        return existing;
+    }
+
+    /* CP-confirmed re-execution with changed bytes: mint or reuse a revision. */
+    uint64_t sig = bb_content_sig(n_insns, insn_sizes, insn_bytes);
+    RevKey rk{key.asid_root, key.start_pc, sig};
+    if (auto it = revision_by_sig_.find(rk);
+        it != revision_by_sig_.end() && it->second != existing) {
+        /* A state the guest already ran (A/B/A patching) — reuse its id. */
+        swap_live_revision(key, it->second);
+        g_stats.smc_revision_reuses++;
+        return it->second;
+    }
+
+    RevisionSlot &slot = revision_slots_[key];
+    if (slot.distinct >= g_smc_revision_cap) {
+        note_revision_overflow(key, slot);
+        return existing;   /* degrade: keep referencing the last revision */
+    }
+
+    /* A new distinct state: retire the current live template and tell the
+     * caller to build the fresh revision (install re-populates the slot). */
+    retire_live_revision(key);
+    g_stats.smc_revisions_minted++;
+    *out_sig = sig;
+    return nullptr;
+}
+
 BBTemplate *TemplateStore::find_existing_true_bb(
     uint64_t asid_root, uint64_t start_pc, uint32_t n_insns,
     const uint64_t *insn_pcs)
@@ -873,12 +1077,15 @@ BBTemplate *TemplateStore::commit_true_bb(uint64_t start_pc,
                                             const uint8_t *insn_bytes,
                                             const InsnRegNames *insn_reg_names,
                                             const char *symbol_name,
-                                            uint64_t fall_through_pc)
+                                            uint64_t fall_through_pc,
+                                            bool cp_confirmed)
 {
-    uint64_t asid_root = store_asid_root(start_pc);
-    if (BBTemplate *existing =
-            find_existing_true_bb(asid_root, start_pc, n_insns, insn_pcs)) {
-        return existing;
+    BBKey key{store_asid_root(start_pc), start_pc};
+    uint64_t sig = 0;
+    if (BBTemplate *reuse = resolve_true_bb(key, n_insns, insn_pcs,
+                                            insn_sizes, insn_bytes,
+                                            cp_confirmed, &sig)) {
+        return reuse;
     }
 
     BBTemplatePtr tmpl = build_bb_template(next_template_id_++,
@@ -888,7 +1095,7 @@ BBTemplate *TemplateStore::commit_true_bb(uint64_t start_pc,
                                            insn_reg_names,
                                            symbol_name, fall_through_pc);
     BBTemplate *raw = tmpl.get();
-    bb_map_[BBKey{asid_root, start_pc}] = std::move(tmpl);
+    install_live_revision(key, std::move(tmpl), sig);
     g_stats.bb_templates_created++;
     return raw;
 }
@@ -899,15 +1106,19 @@ BBTemplate *TemplateStore::commit_true_bb_refs(
     const InsnFields *const *insn_fields,
     const uint8_t *insn_sizes, const uint8_t *insn_bytes,
     const InsnRegNames *const *insn_reg_names,
-    const char *symbol_name, uint64_t fall_through_pc)
+    const char *symbol_name, uint64_t fall_through_pc,
+    bool cp_confirmed)
 {
-    /* Already-templated BB: return the cached record without touching
-     * the field/regnames payload at all.  Templates are stored in true
-     * execution order, so the dedup compares insn PCs directly. */
-    uint64_t asid_root = store_asid_root(start_pc);
-    if (BBTemplate *existing =
-            find_existing_true_bb(asid_root, start_pc, n_insns, insn_pcs)) {
-        return existing;
+    /* Already-templated BB (byte-identical): return the cached record without
+     * touching the field/regnames payload at all.  On a CP-confirmed re-run
+     * whose bytes changed in place, resolve_true_bb mints/reuses a revision;
+     * a wrong-path/spec commit never versions (§1.4). */
+    BBKey key{store_asid_root(start_pc), start_pc};
+    uint64_t sig = 0;
+    if (BBTemplate *reuse = resolve_true_bb(key, n_insns, insn_pcs,
+                                            insn_sizes, insn_bytes,
+                                            cp_confirmed, &sig)) {
+        return reuse;
     }
 
     /* Cold path (first sighting of this BB only): gather the
@@ -940,7 +1151,7 @@ BBTemplate *TemplateStore::commit_true_bb_refs(
                                            reg_src,
                                            symbol_name, fall_through_pc);
     BBTemplate *raw = tmpl.get();
-    bb_map_[BBKey{asid_root, start_pc}] = std::move(tmpl);
+    install_live_revision(key, std::move(tmpl), sig);
     g_stats.bb_templates_created++;
     return raw;
 }
@@ -1087,7 +1298,8 @@ BBTemplate *TemplateStore::get_or_create_bb_template(
                                            insn_pcs, field_ptrs,
                                            insn_sizes, insn_bytes,
                                            regname_ptrs,
-                                           symbol_name, final_ft);
+                                           symbol_name, final_ft,
+                                           /* cp_confirmed= */ true);
     /* Privilege context rides from the translation-time stamp on the
      * fragments onto the assembled true-BB.  Fragments of one BB share
      * one privilege level (the transition instruction seals the BB).
@@ -1285,10 +1497,14 @@ void TemplateStore::ensure_rep_subtmpl(BBTemplate *tb)
      * routes it into the shared kernel bucket iff sub_pc is a kernel VA (a
      * kernel REP such as clear_page/memset shares the one kernel template; a
      * user REP keys by its live process root). */
+    /* The REP self-loop sub-template is a synthetic 1-insn artifact, not a
+     * fetched-and-executed block; it never participates in SMC revisioning
+     * (cp_confirmed=false keeps the historical dedup-by-shape behavior). */
     BBTemplate *sub = commit_true_bb(sub_pc, 1, &sub_pc, lf,
                                      &sub_size, sub_bytes,
                                      sub_regs,
-                                     tb->symbol_name, sub_ft);
+                                     tb->symbol_name, sub_ft,
+                                     /* cp_confirmed= */ false);
     tb->rep_subtmpl = seg_ref(sub);
     /* Inherit the parent REP TB's privilege: the sub-template covers the
      * same instruction, so it shares its execution context.  commit_true_bb

@@ -52,6 +52,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 int max_wrong_path_depth = 64;
 int g_wp_prune = 0;          /* wpprune level: 0 none, 1 cold, 2 monotone */
 bool enable_wrong_path = true;
+uint32_t g_smc_revision_cap = 1024;   /* SMC per-PC revision cap (smc_plan §5-A) */
 
 /* ---- #77 diagnostic ring buffer (gated on CST_RING) -------------------
  * Records recent correct-path BB starts ('C') and wrong-path instruction
@@ -6803,6 +6804,16 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         ? g_features.reg_data : (cfg.wp_reg_data != 0);
     g_hist.intervals = cfg.histogram_intervals > 0
         ? (unsigned int)cfg.histogram_intervals : 0;
+    /* SMC per-PC revision cap (smc_plan.md §5-A).  The plugin option sets it;
+     * CST_SMC_REVISION_CAP overrides for testability (the validator's cap-
+     * overflow workload drives it far below the 1024 default). */
+    g_smc_revision_cap = cfg.smc_revisions;
+    if (const char *env = getenv("CST_SMC_REVISION_CAP")) {
+        long long n = g_ascii_strtoll(env, nullptr, 10);
+        if (n >= 0 && n <= UINT32_MAX) {
+            g_smc_revision_cap = (uint32_t)n;
+        }
+    }
     g_features.iframe_rate         = cfg.iframe_rate;
     simpoint_interval_insns = cfg.simpoint_interval;
     warmup_insns        = cfg.warmup_insns;

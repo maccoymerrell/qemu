@@ -148,6 +148,18 @@ bool set_latch_timeout(PluginConfig *cfg, const char *v)
     return true;
 }
 
+bool set_smc_revisions(PluginConfig *cfg, const char *v)
+{
+    /* Per-PC SMC revision cap (bug detector; smc_plan.md §5-A).  Any
+     * non-negative value; 0 disables minting past the first state. */
+    long long n = g_ascii_strtoll(v, nullptr, 10);
+    if (n < 0 || n > UINT32_MAX) {
+        return false;
+    }
+    cfg->smc_revisions = (uint32_t)n;
+    return true;
+}
+
 bool set_iframe_rate(PluginConfig *cfg, const char *v)
 {
     long long n = g_ascii_strtoll(v, nullptr, 10);
@@ -350,6 +362,7 @@ const struct {
     { "physaddr",   set_physaddr   },
     { "static_templates", set_static_templates },
     { "static_depth", set_static_depth },
+    { "smc_revisions", set_smc_revisions },
     { "histogram",  set_histogram  },
     { "iframe_rate", set_iframe_rate },
     { "latch_timeout", set_latch_timeout },

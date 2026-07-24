@@ -94,6 +94,14 @@ struct PluginConfig {
      * terminator has no static target, so that edge ends the chain).  0 mints
      * only the immediate untaken side.  Inert unless static_templates=1. */
     int       static_depth      = CST_ALT_DEPTH_DEFAULT;
+    /* Self-modifying-code per-PC revision cap (smc_revisions=N).  When a
+     * correct-path (asid_root, start_pc) slot mints more than this many
+     * DISTINCT executed program-text states, minting stops and the body keeps
+     * referencing the last revision (a LOUD once-per-segment warning fires).
+     * A BUG DETECTOR, not a fidelity budget (smc_plan.md §5-A): default 1024,
+     * sized far above any real SMC pattern.  The CST_SMC_REVISION_CAP env var
+     * overrides this at apply time (for the validator's cap-overflow test). */
+    uint32_t  smc_revisions       = 1024;
     /* Per-template IFRAME trigger interval.  0 disables. */
     uint32_t  iframe_rate         = 100000;
     uint64_t  simpoint_interval = 100000000ULL;

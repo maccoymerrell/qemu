@@ -1371,6 +1371,14 @@ extern unsigned active_reg_table_size;
 extern int max_wrong_path_depth;
 extern int g_wp_prune;
 extern bool enable_wrong_path;
+/* Self-modifying-code per-PC revision cap (smc_plan.md §5-A).  When a
+ * correct-path (asid_root, start_pc) slot mints more than this many DISTINCT
+ * executed states, minting stops: the body keeps referencing the last
+ * revision and a LOUD once-per-segment warning fires.  The cap is a BUG
+ * DETECTOR sized far above any legitimate SMC pattern, not a fidelity budget;
+ * default 1024, settable via smc_revisions=N and overridable for testing via
+ * the CST_SMC_REVISION_CAP env var. */
+extern uint32_t g_smc_revision_cap;
 /* #77 diagnostic ring buffer (gated on CST_RING); 'C'=correct-path BB start,
  * 'W'=wrong-path instruction PC. */
 void cst_ring_push(char tag, uint64_t pc);

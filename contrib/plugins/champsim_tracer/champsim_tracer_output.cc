@@ -927,11 +927,14 @@ static void write_template_profile(BitWriter *sub,
  */
 static void write_bin_templates(BitWriter *bw)
 {
-    /* Count is the executed dictionary plus the never-executed opportunistic
-     * branch alternates that survive the shadow filter.
-     * alt_serialisable_count() is 0 (and the alt path below a no-op) unless
-     * minting ran, so a trace without it is byte-identical. */
+    /* Count is the executed dictionary (live revisions) plus any retired SMC
+     * revisions still pinned by emitted body entries, plus the never-executed
+     * opportunistic branch alternates that survive the shadow filter.
+     * retired_revision_count() and alt_serialisable_count() are both 0 (and
+     * their emit paths no-ops) unless the respective feature ran, so a trace
+     * without SMC or alternates is byte-identical. */
     bw_write_uleb128(bw, g_template_store.bb_count() +
+                         g_template_store.retired_revision_count() +
                          g_template_store.alt_serialisable_count());
 
     auto write_one = [bw](BBTemplate &tmpl_ref) {

@@ -795,6 +795,10 @@ static void wp_commit_bb(WpWalkState &st, BBTemplate *cur,
              * user code.  The domain-switch terminate above guarantees this
              * committed block was fetched entirely within one privilege
              * domain, so its VA class is its true domain. */
+            /* Wrong-path commit: cp_confirmed=false — a speculative
+             * translation observing mid-write bytes must NEVER version a
+             * template (smc_plan.md §1.4).  A byte-drifted block reuses the
+             * live template silently, exactly as before SMC support. */
             BBTemplate *bb_tmpl = g_template_store.commit_true_bb_refs(
                 bb_start_pc, (uint32_t)bb_pcs.size(),
                 bb_pcs.data(),
@@ -802,7 +806,8 @@ static void wp_commit_bb(WpWalkState &st, BBTemplate *cur,
                 bb_sizes.data(),
                 bb_bytes.data(),
                 g_features.reg_data ? bb_regnames.data() : nullptr,
-                bb_symbol_name, fall_through);
+                bb_symbol_name, fall_through,
+                /* cp_confirmed= */ false);
             /* Privilege seed for WP-only-discovered BBs.  Seed from the
              * architectural VA class of the block's start, not the wrong-path
              * priv level: a kernel-VA block IS kernel code regardless of what

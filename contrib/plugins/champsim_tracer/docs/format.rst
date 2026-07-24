@@ -185,6 +185,8 @@ absence by the same gate:
      - ``CST_FLAG_PHYSADDR`` clear
    * - Per-template profile block (§6)
      - ``CST_FLAG_PROFILE`` clear
+   * - Synchronous-fault depth trailer (per entry, §4.2a)
+     - ``CST_FLAG_FAULT`` clear (system mode only; every entry's depth is implicitly ``0`` with no anchors)
    * - Per-insn dependency sub-block
      - insn's ``CST_INSN_FLAG_HAS_DEP_BLOCK`` clear
    * - Immediate value
@@ -350,7 +352,7 @@ self-describing.  Decode it into a fresh ``encoding_maps`` table.
             omit one is rejected here:
               body_tag:    BODY_TAG_END, BODY_TAG_ENTRY,
                            BODY_TAG_THREAD_SWITCH, BODY_TAG_ASID_SWITCH
-              header_flag: CST_FLAG_PROFILE, CST_FLAG_WP
+              header_flag: CST_FLAG_PROFILE, CST_FLAG_WP, CST_FLAG_FAULT
               insn_flag:   CST_INSN_FLAG_HAS_IMM,
                            CST_INSN_FLAG_HAS_DEP_BLOCK
 
@@ -738,6 +740,11 @@ Loop until a ``BODY_TAG_END`` is seen:
           cur_template_id = prev_entry_template_id + template_id_delta
           prev_entry_template_id = cur_template_id
           cp_delta_section   : section          ; see Step 6.7
+          if (header.flags & header_flag.CST_FLAG_FAULT):
+            fault_depth      : ULEB              ; see §4.2a
+            n_anchors        : ULEB
+            repeat n_anchors times:
+              anchor         : ULEB
           if (header.flags & header_flag.CST_FLAG_WP):
             wp_chain_section  : section          ; see Step 6.8; its
                                                   ; leading ULEB also
@@ -748,6 +755,8 @@ Loop until a ``BODY_TAG_END`` is seen:
             if (has_wp_events):                  ; from Step 6.8's chain
                                                   ; header, just decoded
               wp_events_section : section          ; see Step 6.9
+          ; when CST_FLAG_FAULT is clear the fault trailer is absent and
+          ; this entry's depth is implicitly 0 with no anchors (§4.2a).
           ; when CST_FLAG_WP is clear the wp_chain_section is absent
           ; and the entry has no wrong-path chain (num_wp treated as
           ; 0).  When CST_FLAG_WP is set but has_wp_events is clear,
@@ -756,10 +765,16 @@ Loop until a ``BODY_TAG_END`` is seen:
           seq_num += 1
           Emit a CP body entry tagged (seq_num, cur_template_id,
           prev_thread_id, prev_asid_index) carrying the cp_delta_section's decoded
-          dyn_params + reg_snaps, the wp_chain_section's WPEntries,
-          and the wp_events bits applied to those WPEntries.
+          dyn_params + reg_snaps, fault_depth/anchors (if CST_FLAG_FAULT),
+          the wp_chain_section's WPEntries, and the wp_events bits applied
+          to those WPEntries.
    6.5  IFRAME record (validation-only; producers may omit it):
           cp_delta_section   : section
+          if (header.flags & header_flag.CST_FLAG_FAULT):
+            fault_depth      : ULEB              ; see §4.2a
+            n_anchors        : ULEB
+            repeat n_anchors times:
+              anchor         : ULEB
           if (header.flags & header_flag.CST_FLAG_WP):
             wp_chain_section  : section          ; see Step 6.8
             if (has_wp_events):                  ; from the chain
@@ -768,8 +783,8 @@ Loop until a ``BODY_TAG_END`` is seen:
           Decode each section against fresh "nothing observed yet"
           overlays; the values reconstructed must match the
           immediately-preceding ENTRY exactly (template_id, dyn_params,
-          reg_snaps, WP chain).  IFRAMEs do not advance
-          prev_entry_template_id and do not emit a body entry.
+          reg_snaps, fault_depth/anchors, WP chain).  IFRAMEs do not
+          advance prev_entry_template_id and do not emit a body entry.
    6.6  END record:
           num_entries : ULEB
           must equal the total number of BODY_TAG_ENTRY records seen
@@ -965,12 +980,13 @@ CPSR) N→N, Z→Z, C→C, V→V (no parity).
 
 Readers reject any file whose magic disagrees with ``CST_MAGIC``.
 
-The MEM_DATA / REG_DATA bits are advisory hints about field
+The MEM_DATA / REG_DATA / PHYSADDR bits are advisory hints about field
 families — the field IDs still determine what actually appears in
-each delta section.  CST_FLAG_PROFILE and CST_FLAG_WP are
+each delta section.  CST_FLAG_PROFILE, CST_FLAG_WP, and CST_FLAG_FAULT are
 structural: they gate the presence of whole blocks (the
-per-template profile block — Step 4.6 / §6, and the per-entry
-wrong-path chain section — Steps 6.4–6.5), exactly as the
+per-template profile block — Step 4.6 / §6, the per-entry
+wrong-path chain section — Steps 6.4–6.5, and the per-entry
+synchronous-fault depth trailer — §4.2a), exactly as the
 per-insn CST_INSN_FLAG_HAS_DEP_BLOCK gates the dep sub-block.  Resolve
 every flag through the ``header_flag`` map — the trace assigns each bit,
 a reader never assumes a position:
@@ -983,6 +999,14 @@ a reader never assumes a position:
   chain header's own ``CST_WP_CHAIN_HAS_EVENTS`` bit (below) rather than
   by a header flag, since whether a given entry's chain produced an
   event varies entry to entry where ``CST_FLAG_WP`` itself does not
+- ``CST_FLAG_FAULT`` — per-entry synchronous-fault depth trailer present
+  (§4.2a); system mode only — a user-mode trace never sets it, and every
+  entry's depth is implicitly ``0`` with no anchors
+- ``CST_FLAG_PHYSADDR`` — ``CST_FID_*_PPAGE`` families may appear
+  (§5.3.1); system mode only (``physaddr=1``); its name is present in
+  the ``header_flag`` map only when physical-page capture is active, so
+  a non-``physaddr`` trace keeps the historical five-entry
+  ``header_flag`` vocabulary (MEM_DATA, REG_DATA, PROFILE, WP, FAULT)
 
 Per-instruction template flags, resolved through the ``insn_flag`` map
 (again: names, not fixed positions):
@@ -1371,6 +1395,9 @@ wrong-path chain.
    +--------------------------------------------------+
    | cp_delta_section                section          |
    +--------------------------------------------------+
+   | fault_depth_trailer                              |  only if CST_FLAG_FAULT
+   |                                                   |  (§4.2a)
+   +--------------------------------------------------+
    | wp_chain_section                section          |  only if CST_FLAG_WP
    +--------------------------------------------------+
    | wp_events_section               section          |  only if CST_FLAG_WP
@@ -1386,6 +1413,67 @@ The current guest-thread ID comes from the most recent
 recent ``BODY_TAG_ASID_SWITCH``; because the body opens with an
 ``(asid, thread)`` declaration (§4.1a, §4.1), an ENTRY is always preceded
 by both, and every entry carries a well-defined ``(asid, thread)`` context.
+
+4.2a Synchronous-Fault Depth Trailer
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Rides every ``BODY_TAG_ENTRY`` and ``BODY_TAG_IFRAME`` payload, immediately
+after ``cp_delta_section`` and before the (optional) wrong-path chain, when
+the header's ``CST_FLAG_FAULT`` bit is set.  System mode only — a user-mode
+trace never sets the flag, the trailer is absent from every entry, and a
+reader treats every entry's depth as ``0`` with no anchors.
+
+::
+
+   +--------------------------------------------------+
+   | fault_depth                     ULEB             |
+   |   0 = normal code; >= 1 = handler code at this   |
+   |   exception-nesting depth                        |
+   | n_anchors                       ULEB             |
+   |   count of faulting-instruction indices below    |
+   | repeat n_anchors times:                          |
+   |   anchor                        ULEB             |
+   |     0-based index of a faulting instruction      |
+   |     within this (possibly merged) block          |
+   +--------------------------------------------------+
+
+``fault_depth`` is the exception-nesting depth at which this basic block
+executed: ``0`` for ordinary, non-handler code; ``>= 1`` for the code of a
+synchronous-fault handler — or, with ``interrupts=1``, an asynchronous-
+interrupt handler — that detoured execution at that nesting level.
+User-privilege entries always carry depth ``0``: user code is never handler
+content.
+
+``n_anchors`` / ``anchor`` mark a *faulting basic block reassembled whole*.
+When a synchronous fault interrupts a block mid-flight, the plugin merges
+the block's pre-fault prefix and its post-return suffix back into one
+entry rather than splitting it at the fault, and each ``anchor`` records the
+0-based instruction index of one faulting excursion, in order, so a
+consumer sees the interrupted block once, whole, with its detour points
+marked instead of twice with a phantom seam.  ``n_anchors == 0`` on every
+ordinary entry, including an ordinary (non-merged) handler-body entry — a
+handler's own basic blocks did not themselves fault, so they carry no
+anchors of their own.
+
+The trailer is the single wire mechanism behind both system-mode
+handler-tracing options (see :doc:`reference` for the full option
+semantics); neither adds a wire record of its own:
+
+- ``faults=1`` (default) traces a synchronous-fault handler as first-class
+  code at its depth, with the interrupted block's anchors populated.
+  ``faults=0`` excludes the handler from capture instead — the interrupted
+  block still reassembles whole (the merge is kept) but is de-anchored and
+  clamped to depth ``0``, exactly as if no fault had occurred, so a
+  ``faults=0`` trace advertises ``CST_FLAG_FAULT`` yet never emits an
+  anchor or a depth ``> 0`` entry.
+- ``interrupts=0`` (default) excludes an asynchronous interrupt's handler
+  excursion entirely.  ``interrupts=1`` traces it instead, riding this same
+  trailer at depth ``>= 1`` — one level added on top of any live
+  synchronous-fault nesting — with no anchors of its own: an asynchronous
+  interrupt lands on a basic-block boundary, so nothing needs reassembling.
+
+See :doc:`architecture`, "Asynchronous interrupts and the two
+handler-tracing flags", for the capture-side mechanics behind both options.
 
 4.3 Wrong-Path Chain Section
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1541,6 +1629,8 @@ writer had, or skip it entirely.
    +--------------------------------------------------+
    | tag = 3                         u8               |
    | cp_delta_section                section          |
+   | fault_depth_trailer                              |  only if CST_FLAG_FAULT
+   |                                                   |  (§4.2a)
    | wp_chain_section                section          |  only if CST_FLAG_WP
    | wp_events_section               section          |  only if CST_FLAG_WP
    |                                                   |  AND the chain
@@ -2220,6 +2310,12 @@ every non-final WP block against the next chain block's ``start_pc``.
 
 The templates section is mandatory and is appended at the tail of the
 header member, immediately after the encoding maps section.
+``template_id`` is the sole identity of a template; ``start_pc`` is
+**not** unique.  A self-modified block emits multiple templates that
+share a ``start_pc`` but differ in ``template_id`` and instruction
+bytes — its revision history, minted lazily on re-execution of
+mutated bytes (Step 0).  A body ``ENTRY`` (§4.2) always names a block
+by ``template_id``; never resolve a block by ``start_pc`` alone.
 
 ::
 
@@ -2384,8 +2480,13 @@ Template profile block
 ^^^^^^^^^^^^^^^^^^^^^^
 
 Appended to every template payload immediately after the last
-per-insn descriptor (always present — there is no opt-in flag).
-It is run-aggregated, PGO-style profiling metadata: it never
+per-insn descriptor, present when the header's ``CST_FLAG_PROFILE`` bit
+is set (§2, §3.1; Step 4.6).  The in-tree writer sets the flag
+unconditionally — no plugin option clears it, so every trace this
+tracer produces carries the block — but a reader still gates presence
+through the flag exactly as it does for ``CST_FLAG_WP``; a producer
+without the aggregation machinery may omit the block and clear the
+bit.  It is run-aggregated, PGO-style profiling metadata: it never
 affects deterministic replay, and a consumer that does not model
 it simply skips the bytes.  Because the templates section is
 serialized at segment finish (after all execution), these are

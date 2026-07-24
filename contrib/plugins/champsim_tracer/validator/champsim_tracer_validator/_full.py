@@ -554,6 +554,13 @@ def _chk_devio(ctx: Ctx) -> Outcome:
     return _mp_outcome(MP.run_devio_probe(cfg))
 
 
+def _chk_devio_attrib(ctx: Ctx) -> Outcome:
+    cfg = MP.MPConfig(build_dir=ctx.build_dir,
+                      out_dir=ctx.dir("feat_devio_attrib"), budget=20_000_000,
+                      boot_timeout_s=300)
+    return _mp_outcome(MP.run_devio_attrib_probe(cfg))
+
+
 def _chk_faults_interrupts(ctx: Ctx) -> Outcome:
     cfg = MP.MPConfig(build_dir=ctx.build_dir,
                       out_dir=ctx.dir("feat_faults_interrupts"),
@@ -988,9 +995,39 @@ def build_checks() -> list:
                    ["opt:physaddr", "wire:FLAG_PHYSADDR", "wire:FID_ppage"],
                    _chk_physaddr))
     C.append(Check("features.devio", "features",
-                   "disk-I/O bracketing records (virtio-blk, system)",
+                   "disk-I/O bracketing records (virtio-blk, system): "
+                   "pairing oracle (every STOP pairs a prior START) + "
+                   "exact payload oracle (R/W, bytes, LBA match the "
+                   "workload's known request list)",
                    ["opt:devio", "wire:BODY_TAG_DEVIO_START",
                     "wire:BODY_TAG_DEVIO_STOP"], _chk_devio))
+    C.append(Check("features.devio_attrib", "features",
+                   "exact-owner disk-I/O attribution: two CONCURRENTLY "
+                   "marked processes (-smp 2, disjoint LBA bands) must "
+                   "each own only their own band's DEVIO_START records "
+                   "(88d9b7e526's verification scenario)",
+                   ["opt:devio", "wire:BODY_TAG_DEVIO_START",
+                    "wire:BODY_TAG_DEVIO_STOP"], _chk_devio_attrib,
+                   known_issue=(
+                       "the per-vCPU kick-doorbell slot "
+                       "(champsim_tracer_output.cc devio_note_doorbell / "
+                       "vcpu_kick) can rarely be overwritten by an "
+                       "interleaved kick from the OTHER concurrently-"
+                       "marked process before the matching block-backend "
+                       "issue reads it back, misattributing a handful of "
+                       "requests per run under real -smp 2 host-scheduling "
+                       "load (observed intermittently — roughly 1 in 3 "
+                       "boots in in-repo testing, not every boot; when it "
+                       "does not race the band split is clean, matching "
+                       "88d9b7e526's own verification).  This is a genuine "
+                       "plugin correctness gap in the exact-attribution "
+                       "seam, not a validator artifact; a fix needs the "
+                       "slot guarded by a token+in-flight generation (or "
+                       "correlating by (vcpu,token) pairs) instead of one "
+                       "overwritable per-vCPU slot — out of scope for this "
+                       "validator-only change.  Non-gating so the race "
+                       "does not produce a false RED; loudly reported as "
+                       "XFAIL when it fires.")))
     C.append(Check("features.faults_interrupts", "features",
                    "synchronous-fault exclusion + async-interrupt capture "
                    "(faults=0 / interrupts=1, system)",

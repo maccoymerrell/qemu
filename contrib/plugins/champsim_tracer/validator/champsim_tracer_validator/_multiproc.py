@@ -32,6 +32,7 @@ Author: Maccoy Merrell.  SPDX-License-Identifier: GPL-2.0-or-later
 from __future__ import annotations
 
 import dataclasses
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -170,10 +171,11 @@ def _stage(isa: str, stage_dir: Path, payload: list, init_text: str) -> Path:
 
 
 def _boot(cfg: MPConfig, isa: str, cpio: Path, out_base: Path,
-          plugin_opts: str, extra_qemu: list | None = None) -> tuple:
+          plugin_opts: str, extra_qemu: list | None = None,
+          kernel: Path | None = None) -> tuple:
     plugin = cfg.build_dir / "contrib/plugins/libchampsim_tracer.so"
     qemu = cfg.build_dir / f"qemu-system-{isa}"
-    kernel = SYS.default_kernel(isa)
+    kernel = Path(kernel) if kernel is not None else SYS.default_kernel(isa)
     if isa == "x86_64":
         # KPTI-off is the canonical system-mode config (multiasid_plan §0):
         # the kernel shares each process's ASID, so (asid,vaddr) covers both.
@@ -762,32 +764,247 @@ def run_physaddr_probe(cfg: MPConfig) -> MPResult:
 # ---------------------------------------------------------------------------
 # scenario 5: devio — disk-I/O bracketing records (virtio-blk, system mode)
 # ---------------------------------------------------------------------------
+#
+# The probe drives a small, self-contained O_DIRECT|O_SYNC C workload (NOT
+# the diamond-CFG generator — devio cares about the disk requests a program
+# issues, not instruction coverage) that brackets a KNOWN, deterministic
+# request sequence inside the trace marker window: nops writes at ascending
+# 4K-block offsets, then nops reads at the same offsets.  Mirrors the
+# historical devio2/workload2.c exact-attribution harness (88d9b7e526) —
+# imported here as two probes:
+#
+#   run_devio_probe          single marked process: pairing oracle + the
+#                             exact (rw, bytes, LBA) payload assertion.
+#   run_devio_attrib_probe   two CONCURRENTLY marked processes (-smp 2,
+#                             disjoint LBA bands) proving DEVIO_START owner
+#                             attribution, not just positional guessing.
 
-def _init_devio(sleep_s: int) -> str:
-    # workloadA marks + holds the (frozen-clock) window open on its
-    # sleep_probe; while it holds, we read the virtio disk so the plugin
-    # brackets each request with DEVIO_START/STOP inside the open window.
-    return f"""#!/bin/sh
+def _devio_kernel(isa: str) -> Path:
+    """Kernel to boot for the devio probe family.  A block-device probe
+    needs virtio-blk compiled IN (CONFIG_VIRTIO_BLK=y): the busybox guest
+    has no modprobe/hotplug wiring to pull in a module, so a kernel that
+    only carries virtio_blk as =m never grows /dev/vda and every probe
+    below reports the (pre-existing) NO_VDA skip.  CST_DEVIO_KERNEL
+    overrides the shared system-mode kernel asset (SYS.default_kernel) for
+    exactly these probes, so a maintainer with a virtio-blk-enabled build
+    can point at it without moving every OTHER system-mode check off the
+    default kernel."""
+    override = os.environ.get("CST_DEVIO_KERNEL")
+    return Path(override) if override else SYS.default_kernel(isa)
+
+
+# x86-64 START/END markers: 3x `mov $imm,%eax` (champsim_marker.h) inlined
+# directly, exactly as devio2/workload2.c did — this workload is its own
+# tiny standalone C program, not generator.py's marker-emitting diamond CFG,
+# so it embeds the same fixed byte pattern the plugin's detector matches.
+_DEVIO_WORKLOAD_C = r"""/* champsim_tracer validator -- devio payload-oracle workload (generated).
+ * Brackets a KNOWN, deterministic O_DIRECT|O_SYNC disk-request sequence
+ * inside the trace marker window: {nops} writes at ascending 4K-block
+ * offsets starting at block {base}, then {nops} reads at the same offsets.
+ * O_DIRECT|O_SYNC forces one real device request per pwrite/pread (no
+ * merging), so the sequence the decoded trace shows is exactly the one
+ * this program issues.  SPDX-License-Identifier: GPL-2.0-or-later */
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+
+static inline void marker_start(void){{
+    __asm__ __volatile__(
+        "mov $0x43535401,%%eax\n\t"
+        "mov $0x43535401,%%eax\n\t"
+        "mov $0x43535401,%%eax\n\t" ::: "eax");
+}}
+static inline void marker_end(void){{
+    __asm__ __volatile__(
+        "mov $0x43535402,%%eax\n\t"
+        "mov $0x43535402,%%eax\n\t"
+        "mov $0x43535402,%%eax\n\t" ::: "eax");
+}}
+
+#define BLK 4096
+
+int main(void)
+{{
+    long base = {base}L;
+    int  nops = {nops};
+    int  fill = {fill};
+
+    marker_start();
+
+    void *buf = NULL;
+    if (posix_memalign(&buf, BLK, BLK) != 0) {{ marker_end(); return 2; }}
+
+    int fd = open("{dev}", O_RDWR | O_DIRECT | O_SYNC);
+    if (fd < 0) {{ marker_end(); return 3; }}
+
+    for (int i = 0; i < nops; i++) {{
+        memset(buf, fill + (i & 0xf), BLK);
+        long off = (base + i) * (long)BLK;
+        if (pwrite(fd, buf, BLK, off) != BLK) {{ marker_end(); return 4; }}
+    }}
+    fsync(fd);
+
+    for (int i = 0; i < nops; i++) {{
+        long off = (base + i) * (long)BLK;
+        if (pread(fd, buf, BLK, off) != BLK) {{ marker_end(); return 5; }}
+    }}
+    fsync(fd);
+    close(fd);
+
+    marker_end();
+    return 0;
+}}
+"""
+
+
+def _build_devio_c(out_dir: Path, name: str, base: int, nops: int,
+                   fill: int, dev: str = "/dev/vda") -> Path:
+    """Render + statically compile _DEVIO_WORKLOAD_C for (base, nops,
+    fill).  Full libc (posix_memalign/open/pwrite/pread/fsync), so unlike
+    the diamond generator's asm workloads this is a plain static build —
+    no -nostdlib/-nostartfiles."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    src = out_dir / f"{name}.c"
+    src.write_text(_DEVIO_WORKLOAD_C.format(base=base, nops=nops, fill=fill,
+                                            dev=dev))
+    binp = out_dir / name
+    subprocess.check_call(["gcc", "-O1", "-static", "-fno-stack-protector",
+                           str(src), "-o", str(binp)])
+    return binp
+
+
+def _devio_expected(base: int, nops: int) -> list:
+    """The known (rw, bytes, block) sequence _DEVIO_WORKLOAD_C(base, nops)
+    issues: nops WRITEs at ascending LBA, then nops READs at the same LBAs
+    -- the two O_DIRECT|O_SYNC loops, each call its own device request.
+    FLUSH requests (fsync) are deliberately excluded from this exact list:
+    their COUNT depends on the guest kernel's O_SYNC write-barrier policy
+    (observed 2x per write + 1 trailing against the reference harness),
+    not on anything this workload explicitly calls, so pinning an exact
+    flush count would assert a kernel implementation detail rather than
+    the workload's own contract.  _devio_flush_sanity covers them instead
+    (payload must be empty, wherever they fall)."""
+    lba = lambda i: (base + i) * 8   # BLK(4096) >> CST_DEVIO_LBA_SHIFT(9)
+    out = [("write", 4096, lba(i)) for i in range(nops)]
+    out += [("read", 4096, lba(i)) for i in range(nops)]
+    return out
+
+
+_DEVIO_START_RE = re.compile(
+    r"; DEVIO START req=(\d+) (\w+) bytes=(\d+) block=(\d+) "
+    r"\(thread=(\d+) asid=(\d+) attr=(\w+)\)")
+_DEVIO_STOP_RE = re.compile(
+    r"; DEVIO STOP  req=(\d+) \(thread=(\d+) asid=(\d+)\)")
+
+
+def _decode_devio_events(cfg: MPConfig, cst: Path) -> list:
+    """Every DEVIO_START/STOP record cst_decode's disasm renderer surfaces,
+    in stream order: {"kind": "start"|"stop", "req", "rw", "bytes",
+    "block", "thread", "asid", "exact"} ("stop" only sets kind/req/thread/
+    asid).  --format=disasm is the only cst_decode mode with full DEVIO
+    payload text: --format=raw's structural walker (cst_raw.cc dump_body)
+    has no DEVIO_* branch and aborts the rest of the walk on the first one
+    it meets, and the header's encoding-map dump only proves the tag NAMES
+    were advertised (g_devio_map_active), not that any request actually
+    happened -- the smoke-test gap this probe family replaces."""
+    _, raw = _run([_decode(cfg), "--format=disasm", str(cst)], timeout=300)
+    out = []
+    for line in raw.splitlines():
+        m = _DEVIO_START_RE.search(line)
+        if m:
+            out.append({"kind": "start", "req": int(m.group(1)),
+                        "rw": m.group(2), "bytes": int(m.group(3)),
+                        "block": int(m.group(4)), "thread": int(m.group(5)),
+                        "asid": int(m.group(6)),
+                        "exact": m.group(7) == "exact"})
+            continue
+        m = _DEVIO_STOP_RE.search(line)
+        if m:
+            out.append({"kind": "stop", "req": int(m.group(1)),
+                        "thread": int(m.group(2)), "asid": int(m.group(3))})
+    return out
+
+
+def _devio_pairing_check(events: list) -> tuple:
+    """Every STOP must pair a prior START by request_id: no orphan STOPs
+    (a STOP whose request_id was never opened), no dangling STARTs (a
+    START never closed), no duplicate STARTs, and a STOP must inherit its
+    paired START's owner when that START is exact-attributed (the
+    decoder's own devio_owner_ contract, re-asserted here)."""
+    open_starts: dict = {}
+    dup_starts = []
+    orphan_stops = []
+    owner_mismatch = []
+    for e in events:
+        if e["kind"] == "start":
+            if e["req"] in open_starts:
+                dup_starts.append(e["req"])
+            open_starts[e["req"]] = e
+        else:
+            st = open_starts.pop(e["req"], None)
+            if st is None:
+                orphan_stops.append(e["req"])
+            elif st["exact"] and (st["thread"], st["asid"]) != \
+                    (e["thread"], e["asid"]):
+                owner_mismatch.append(e["req"])
+    dangling = sorted(open_starts.keys())
+    ok = not (orphan_stops or dangling or dup_starts or owner_mismatch)
+    detail = (f"stops={sum(1 for e in events if e['kind'] == 'stop')} "
+              f"orphan_stops={orphan_stops} dangling_starts={dangling} "
+              f"dup_starts={dup_starts} owner_mismatch={owner_mismatch}")
+    return ok, detail
+
+
+def _devio_payload_check(events: list, expected: list) -> tuple:
+    """Filter to non-flush STARTs, in stream order, and assert they equal
+    @expected EXACTLY: same length, same (rw, bytes, block) tuples, same
+    order -- the workload's own known request list (_devio_expected)."""
+    got = [(e["rw"], e["bytes"], e["block"]) for e in events
+           if e["kind"] == "start" and e["rw"] != "flush"]
+    ok = got == expected
+    detail = f"got={len(got)} expected={len(expected)}"
+    if not ok:
+        mismatch = next(((i, g, x) for i, (g, x)
+                         in enumerate(zip(got, expected)) if g != x), None)
+        if mismatch:
+            i, g, x = mismatch
+            detail += f" first_mismatch@{i}: got={g} want={x}"
+        else:
+            detail += f" length mismatch (got[:3]={got[:3]} want[:3]={expected[:3]})"
+    return ok, detail
+
+
+def _devio_flush_sanity(events: list) -> tuple:
+    bad = [e["req"] for e in events if e["kind"] == "start"
+           and e["rw"] == "flush" and (e["bytes"] != 0 or e["block"] != 0)]
+    return not bad, f"bad_flush_payload_reqs={bad}"
+
+
+_INIT_DEVIO_SINGLE = """#!/bin/sh
 mount -t devtmpfs none /dev 2>/dev/null
 mount -t proc  none /proc 2>/dev/null
 mount -t sysfs none /sys  2>/dev/null
 exec >/dev/console 2>&1 </dev/console
 echo "=== cst devio guest: $(uname -r) ==="
-/workloadA &
-apid=$!
-sleep 1
 if [ -b /dev/vda ]; then
-  dd if=/dev/vda of=/dev/null bs=4096 count=256 2>/dev/null
-  echo "=== DEVIO_DD_OK ==="
+  echo "=== /dev/vda present ==="
 else
   echo "=== NO_VDA (guest kernel lacks virtio-blk) ==="
 fi
-wait $apid; echo "=== workloadA exit=$? ; poweroff ==="
+/devio_wl
+echo "=== DEVIO_WL_EXIT=$? ==="
+echo "=== poweroff ==="
 poweroff -f
 """
 
 
 def run_devio_probe(cfg: MPConfig) -> MPResult:
+    """Single marked process, known I/O: pairing oracle (every STOP pairs
+    a prior START, no orphans) + exact payload oracle (R/W direction,
+    bytes, and LBA match the workload's known request list byte-for-byte,
+    not just "some DEVIO records appeared")."""
     isa = "x86_64"
     skip = _preconditions(cfg, isa)
     if skip:
@@ -795,49 +1012,200 @@ def run_devio_probe(cfg: MPConfig) -> MPResult:
                         skip_reason=skip)
     od = cfg.out_dir
     od.mkdir(parents=True, exist_ok=True)
-    # workloadA holds the whole-system (trace-all) window open ~6s so the
-    # concurrent disk read lands in-window.
-    bin_a = _gen_build(isa, "workloadA", cfg.seed_a, 6, 200, 6, True,
-                       od / "A")
-    cpio = _stage(isa, od / "stage", [("workloadA", bin_a)],
-                  _init_devio(6))
-    # A scratch disk to actually read.
+    base, nops, fill = 0, 8, 0xA0
+    binp = _build_devio_c(od / "wl", "devio_wl", base, nops, fill)
+    cpio = _stage(isa, od / "stage", [("devio_wl", binp)],
+                  _INIT_DEVIO_SINGLE)
     scratch = od / "scratch.raw"
     with open(scratch, "wb") as f:
         f.truncate(4 * 1024 * 1024)
     out_base = od / "devio"
     plugin_opts = (f"outfile={out_base},wpdepth={cfg.depth},"
-                   f"trace_window=marker:policy=trace-all+"
+                   f"trace_window=marker:policy=latch+"
                    f"simulation={cfg.budget},memdata=1,devio=1")
     extra_qemu = ["-drive", f"file={scratch},format=raw,if=none,id=d0",
                   "-device", "virtio-blk-pci,drive=d0,ioeventfd=off"]
     rc, console, cst = _boot(cfg, isa, cpio, out_base, plugin_opts,
-                             extra_qemu=extra_qemu)
+                             extra_qemu=extra_qemu, kernel=_devio_kernel(isa))
     ctext = console.read_text(errors="replace") if console.exists() else ""
     subs: list = []
     if not cst.exists():
         subs.append(SubCheck("boot produced a trace", False,
                              f"qemu_rc={rc} cst MISSING"))
         return _emit("devio disk-I/O records", subs)
-    _, raw = _run([_decode(cfg), "--format=raw", str(cst)])
-    devio = len(re.findall(r"DEVIO_(START|STOP)", raw))
-    if devio == 0 and "NO_VDA" in ctext:
+    events = _decode_devio_events(cfg, cst)
+    if not any(e["kind"] == "start" for e in events):
+        reason = ("guest kernel lacks virtio-blk (/dev/vda absent)"
+                  if "NO_VDA" in ctext else
+                  "no real DEVIO_START records observed")
         return MPResult(ok=True, subchecks=[SubCheck(
-            "devio records", False,
-            "guest kernel lacks virtio-blk (/dev/vda absent)")],
-            artifacts={"cst": str(cst)}, skipped=True,
-            skip_reason="guest kernel lacks virtio-blk (/dev/vda absent)")
+            "devio records", False, reason)],
+            artifacts={"cst": str(cst)}, skipped=True, skip_reason=reason)
+
+    expected = _devio_expected(base, nops)
+    pair_ok, pair_detail = _devio_pairing_check(events)
     subs.append(SubCheck(
-        "1. DEVIO_START/STOP records bracketed in the body stream",
-        devio >= 1, f"devio_records={devio} dd_ok={'DEVIO_DD_OK' in ctext}"))
+        "1. every STOP pairs a prior START by request_id (no orphans/"
+        "dangling/duplicates)", pair_ok, pair_detail))
+    payload_ok, payload_detail = _devio_payload_check(events, expected)
+    subs.append(SubCheck(
+        "2. R/W direction + bytes + LBA match the workload's known "
+        "request list exactly", payload_ok, payload_detail))
+    flush_ok, flush_detail = _devio_flush_sanity(events)
+    subs.append(SubCheck(
+        "3. FLUSH requests carry no payload (bytes=0 block=0)",
+        flush_ok, flush_detail))
     ok_a, asum = _audit_clean(cfg, cst)
     src = _strict_rc(cfg, cst)
-    subs.append(SubCheck("2. audit clean + strict rc=0",
+    subs.append(SubCheck("4. audit clean + strict rc=0",
                          ok_a and src == 0,
                          f"strict_rc={src} audit[{asum}]"))
     res = _emit("devio disk-I/O records", subs)
     res.artifacts = {"cst": str(cst)}
     return res
+
+
+_INIT_DEVIO_ATTRIB = """#!/bin/sh
+mount -t devtmpfs none /dev 2>/dev/null
+mount -t proc  none /proc 2>/dev/null
+mount -t sysfs none /sys  2>/dev/null
+exec >/dev/console 2>&1 </dev/console
+echo "=== cst devio attribution guest: $(uname -r) ==="
+if [ -b /dev/vda ]; then
+  echo "=== /dev/vda present ==="
+else
+  echo "=== NO_VDA (guest kernel lacks virtio-blk) ==="
+fi
+/devio_lo &
+lopid=$!
+/devio_hi &
+hipid=$!
+echo "=== launched lo=$lopid hi=$hipid ==="
+wait $lopid; echo "=== devio_lo exit=$? ==="
+wait $hipid; echo "=== devio_hi exit=$? ==="
+echo "=== poweroff ==="
+poweroff -f
+"""
+
+
+def run_devio_attrib_probe(cfg: MPConfig) -> MPResult:
+    """Two marked processes (policy=latch), each pinned to its own ASID,
+    CONCURRENTLY issue O_DIRECT|O_SYNC disk I/O to DISJOINT LBA bands on
+    one virtio-blk disk under -smp 2 (ioeventfd=off) -- the exact-owner
+    attribution scenario from 88d9b7e526.  The block backend issues each
+    request off the vCPU thread, so a POSITIONAL record would attribute it
+    to whichever process's context happened to be in force at the record's
+    fall position in the interleaved stream, not the process that actually
+    issued it; asserts every DEVIO_START is attr=exact and that the LOW
+    band resolves to exactly one (thread,asid) owner, the HIGH band to a
+    DIFFERENT one, despite the interleaving."""
+    isa = "x86_64"
+    skip = _preconditions(cfg, isa)
+    if skip:
+        return MPResult(ok=True, subchecks=[], artifacts={}, skipped=True,
+                        skip_reason=skip)
+    od = cfg.out_dir
+    od.mkdir(parents=True, exist_ok=True)
+    lo_base, hi_base, nops = 0, 256, 8
+    bin_lo = _build_devio_c(od / "lo", "devio_lo", lo_base, nops, 0xA0)
+    bin_hi = _build_devio_c(od / "hi", "devio_hi", hi_base, nops, 0xB0)
+    cpio = _stage(isa, od / "stage",
+                  [("devio_lo", bin_lo), ("devio_hi", bin_hi)],
+                  _INIT_DEVIO_ATTRIB)
+    scratch = od / "scratch.raw"
+    with open(scratch, "wb") as f:
+        f.truncate(4 * 1024 * 1024)
+    out_base = od / "devio_attrib"
+    plugin_opts = (f"outfile={out_base},wpdepth={cfg.depth},"
+                   f"trace_window=marker:policy=latch+"
+                   f"simulation={cfg.budget},memdata=1,devio=1")
+    extra_qemu = ["-smp", "2",
+                  "-drive", f"file={scratch},format=raw,if=none,id=d0",
+                  "-device", "virtio-blk-pci,drive=d0,ioeventfd=off"]
+    rc, console, cst = _boot(cfg, isa, cpio, out_base, plugin_opts,
+                             extra_qemu=extra_qemu, kernel=_devio_kernel(isa))
+    ctext = console.read_text(errors="replace") if console.exists() else ""
+    subs: list = []
+    if not cst.exists():
+        subs.append(SubCheck("boot produced a trace", False,
+                             f"qemu_rc={rc} cst MISSING"))
+        return _emit("devio exact-owner attribution (-smp 2)", subs)
+    events = _decode_devio_events(cfg, cst)
+    starts = [e for e in events if e["kind"] == "start"]
+    if not starts:
+        reason = ("guest kernel lacks virtio-blk (/dev/vda absent)"
+                  if "NO_VDA" in ctext else
+                  "no real DEVIO_START records observed")
+        return MPResult(ok=True, subchecks=[SubCheck(
+            "devio records", False, reason)],
+            artifacts={"cst": str(cst)}, skipped=True, skip_reason=reason)
+
+    lo_lba = {(lo_base + i) * 8 for i in range(nops)}
+    hi_lba = {(hi_base + i) * 8 for i in range(nops)}
+
+    exact = [e for e in starts if e["exact"]]
+    subs.append(SubCheck(
+        "1. every DEVIO_START is exact-attributed (ioeventfd=off vCPU "
+        "doorbell)", len(exact) == len(starts),
+        f"exact={len(exact)}/{len(starts)}"))
+
+    owner_ctxs = {(e["thread"], e["asid"]) for e in exact}
+    subs.append(SubCheck(
+        "2. two distinct (thread,asid) owners observed",
+        len(owner_ctxs) >= 2, f"owner_contexts={sorted(owner_ctxs)}"))
+
+    band_starts = [e for e in exact if e["rw"] != "flush"]
+    lo_owners = {(e["thread"], e["asid"]) for e in band_starts
+                if e["block"] in lo_lba}
+    hi_owners = {(e["thread"], e["asid"]) for e in band_starts
+                if e["block"] in hi_lba}
+    subs.append(SubCheck(
+        "3. LOW-band requests attribute to ONE owner, HIGH-band to a "
+        "DIFFERENT one (disjoint by LBA, despite an interleaved stream)",
+        len(lo_owners) == 1 and len(hi_owners) == 1
+        and lo_owners != hi_owners,
+        f"lo_owners={sorted(lo_owners)} hi_owners={sorted(hi_owners)}"))
+
+    lo_cnt = sum(1 for e in band_starts if e["block"] in lo_lba)
+    hi_cnt = sum(1 for e in band_starts if e["block"] in hi_lba)
+    subs.append(SubCheck(
+        "4. request counts match the known per-process list (2*nops each)",
+        lo_cnt == 2 * nops and hi_cnt == 2 * nops,
+        f"lo={lo_cnt} hi={hi_cnt} want={2 * nops} each"))
+
+    pair_ok, pair_detail = _devio_pairing_check(events)
+    subs.append(SubCheck(
+        "5. every STOP pairs a prior START by request_id, inheriting its "
+        "owner (no orphans/dangling)", pair_ok, pair_detail))
+
+    ok_a, asum = _audit_clean(cfg, cst)
+    src = _strict_rc(cfg, cst)
+    subs.append(SubCheck("6. audit clean + strict rc=0",
+                         ok_a and src == 0,
+                         f"strict_rc={src} audit[{asum}]"))
+    res = _emit("devio exact-owner attribution (-smp 2)", subs)
+    res.artifacts = {"cst": str(cst)}
+    return res
+
+
+def devio_mutation_substrate(build_dir: Path, work_root: Path) -> dict | None:
+    """Build + trace a real single-process devio substrate for the
+    mutation tier (devio_stop_drop), reusing run_devio_probe's own build/
+    boot/decode pipeline so the mutation exercises the SAME wire a real
+    probe run produces -- mirrors _smc.mutation_substrate's dedicated-
+    substrate pattern (the shared diamond-CFG substrate carries no DEVIO
+    records at all).  Returns {"cst", "events"} or None when devio
+    coverage is unavailable in this environment (compiler/qemu-system/
+    virtio-blk kernel absent, or no real DEVIO_START observed)."""
+    cfg = MPConfig(build_dir=build_dir, out_dir=work_root)
+    res = run_devio_probe(cfg)
+    cst = res.artifacts.get("cst")
+    if res.skipped or not cst or not Path(cst).exists():
+        return None
+    events = _decode_devio_events(cfg, Path(cst))
+    if not any(e["kind"] == "stop" for e in events):
+        return None
+    return {"cst": cst, "events": events}
 
 
 # ---------------------------------------------------------------------------

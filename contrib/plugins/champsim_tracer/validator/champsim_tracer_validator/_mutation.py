@@ -56,6 +56,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import validator as V
+from . import _multiproc as MP
 
 
 # ===========================================================================
@@ -210,6 +211,11 @@ class Mutation:
     # diamond CFG never self-modifies) with the version-aware revision oracle,
     # not the shared diamond substrate + validate().
     smc: bool = False
+    # devio mutations run against a dedicated real devio trace (the diamond
+    # CFG substrate carries no DEVIO records) with _multiproc's pairing
+    # oracle, not validate().  apply(events, devio_sub) mutates the decoded
+    # DEVIO event list in place.
+    devio: bool = False
 
 
 # ---- oracle mutations ------------------------------------------------------
@@ -563,17 +569,30 @@ def _m_ppage_corrupt(triple, gen_meta) -> Optional[str]:
     return None
 
 
-def _m_devio_stop_drop(triple, gen_meta) -> Optional[str]:
-    """Drop a DEVIO_STOP body record, unbalancing the disk-I/O bracket.
-    Requires a devio=1 (system-mode virtio-blk) substrate; the user-mode
-    substrate carries none, so this SKIPs with a cross-ref to the gating
-    features.devio probe."""
-    trace_meta, _tmpl, _entries = triple
-    bs = trace_meta.get("body_stats") or {}
-    if not (bs.get("devio_start") or bs.get("devio_stop")):
-        return None
-    bs["devio_stop"] = int(bs.get("devio_stop", 0)) - 1
-    return "decremented devio_stop count (unbalanced bracket)"
+def _m_devio_stop_drop(events: list, _devio_sub: dict) -> Optional[str]:
+    """Drop one DEVIO_STOP event, unbalancing its START's bracket.
+
+    Runs against a REAL devio trace (devio_mutation_substrate, the same
+    build/boot/decode pipeline run_devio_probe uses), not the shared
+    diamond-CFG substrate, which carries no DEVIO records at all.  The
+    drop happens on the DECODED event list --format=disasm's real
+    cst_decode already surfaced from that trace, rather than a byte-exact
+    wire splice: tools/cst_raw.cc's --format=raw structural walker
+    (dump_body) has no DEVIO_* branch and aborts the rest of the walk on
+    the first one it meets, so there is no tool-supported way to locate a
+    DEVIO_STOP's exact body.cst byte offset without extending cst_raw.cc
+    (a tools/ change, out of scope here) -- dropping the event a real
+    decode of a real wire already produced is the substrate-faithful
+    equivalent of losing that STOP on the wire.  _run_devio_mutation then
+    re-runs _multiproc._devio_pairing_check, the SAME oracle
+    run_devio_probe's own check (1) uses, and it must flag the resulting
+    dangling START."""
+    for i, e in enumerate(events):
+        if e["kind"] == "stop":
+            req = e["req"]
+            del events[i]
+            return f"dropped DEVIO STOP req={req} (unbalanced bracket)"
+    return None
 
 
 def _m_thread_id_forge(triple, gen_meta) -> Optional[str]:
@@ -833,8 +852,8 @@ CATALOGUE: list = [
     Mutation("devio_stop_drop", "oracle",
              "drop a DEVIO_STOP record (unbalanced disk-I/O bracket)",
              _m_devio_stop_drop,
-             expect=("wp_events", "profile_consistency"),
-             covered_by="features.devio (system-mode MP probe, gating)"),
+             covered_by="features.devio (system-mode MP probe, gating)",
+             devio=True),
     Mutation("smc_revision_byte_flip", "oracle",
              "corrupt a self-modified block's non-baseline revision bytes",
              _m_smc_revision_byte_flip,
@@ -913,6 +932,41 @@ def _run_oracle_mutation(m: Mutation, good_triple, gen_meta, meta_path,
     return MutResult(m.name, m.layer, "HOLE", applied=note,
                      detail=(f"NO gating error; expected one of {m.expect}. "
                              f"The oracle tolerated this corruption."))
+
+
+def _run_devio_mutation(m: Mutation, devio_sub) -> MutResult:
+    """Run a devio mutation against a dedicated real devio trace
+    (devio_mutation_substrate) with _multiproc._devio_pairing_check --
+    the SAME oracle run_devio_probe's own check (1) runs -- rather than
+    validate(), which knows nothing about DEVIO records.  The baseline
+    decode MUST pass the pairing oracle clean (a probe substrate that
+    doesn't is unfit); the mutation then drops a STOP and MUST be
+    flagged by that same oracle."""
+    if devio_sub is None:
+        return MutResult(m.name, m.layer, "skip",
+                         detail="no devio substrate (compiler/qemu-system/"
+                                "virtio-blk kernel absent, or no real "
+                                "DEVIO_START observed in this environment)")
+    good_events = devio_sub["events"]
+    base_ok, base_detail = MP._devio_pairing_check(good_events)
+    if not base_ok:
+        return MutResult(m.name, m.layer, "skip",
+                         detail=f"substrate not clean: {base_detail}")
+    events = copy.deepcopy(good_events)
+    try:
+        note = m.apply(events, devio_sub)
+    except Exception as e:                                 # noqa: BLE001
+        return MutResult(m.name, m.layer, "skip", detail=f"apply raised: {e}")
+    if note is None:
+        return MutResult(m.name, m.layer, "skip",
+                         detail="substrate carries no DEVIO STOP record")
+    ok, detail = MP._devio_pairing_check(events)
+    if not ok:
+        return MutResult(m.name, m.layer, "caught", applied=note,
+                         caught_by=("devio_pairing",), detail=detail)
+    return MutResult(m.name, m.layer, "HOLE", applied=note,
+                     detail=f"pairing oracle tolerated the dropped STOP: "
+                            f"{detail}")
 
 
 def _run_smc_mutation(m: Mutation, smc_sub) -> MutResult:
@@ -1061,9 +1115,21 @@ def run_mutations(build_dir: Path, work_root: Path, seed: int = 0x1111,
         except Exception:                                  # noqa: BLE001
             smc_sub = None
 
+    # devio mutations run on a dedicated real devio trace (the diamond CFG
+    # substrate carries no DEVIO records): build it once, on demand.
+    devio_sub = None
+    if any(getattr(m, "devio", False) for m in CATALOGUE):
+        try:
+            devio_sub = MP.devio_mutation_substrate(build_dir,
+                                                    work_root / "devio")
+        except Exception:                                  # noqa: BLE001
+            devio_sub = None
+
     for m in CATALOGUE:
         if getattr(m, "smc", False):
             results.append(_run_smc_mutation(m, smc_sub))
+        elif getattr(m, "devio", False):
+            results.append(_run_devio_mutation(m, devio_sub))
         elif m.layer == "oracle":
             results.append(_run_oracle_mutation(
                 m, good, gen_meta, meta_path, trace_path, binary_path, vkw,

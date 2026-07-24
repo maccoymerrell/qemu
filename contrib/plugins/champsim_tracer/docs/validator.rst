@@ -149,6 +149,22 @@ Flags worth knowing:
    stderr) is captured to ``<base>.console.log`` and the segment-close
    coverage line is asserted after the run.
 
+``--attach``
+   System-mode variant that opens the window by *injection* instead of
+   a compiled-in marker, exercising the path an unmodified binary has
+   to take.  :program:`cst_attach` is cross-built for the guest ISA
+   (statically, with that ISA's toolchain), staged into the initramfs
+   as ``/bin/cst_trace``, and handed the workload to exec under
+   ``ptrace``; it pokes the marker sequence into the workload's entry
+   point, runs it, restores the original bytes and registers, and
+   detaches.  The workload is generated with **no start marker** — the
+   in-window probes and the END marker are unchanged — so a run that
+   produces a trace at all is evidence the injection worked, and one
+   whose injection fails stops rather than falling back.  Mutually
+   exclusive with a custom guest init (the injector owns the
+   workload's exec).  An ISA whose cross compiler is not installed is
+   skipped, not failed.
+
 Sub-commands
 ~~~~~~~~~~~~
 

@@ -97,8 +97,19 @@ def _parse_args() -> argparse.Namespace:
         sp.add_argument("--system", action="store_true",
                         help="Trace under qemu-system-<isa> (boot a guest with "
                              "the workload staged into an initramfs) instead of "
-                             "qemu-user. Implies --marker. x86_64 only. Use "
-                             "--build-dir pointing at the softmmu build.")
+                             "qemu-user. Implies --marker. Runs on any ISA with "
+                             "a boot shape (x86_64, aarch64, riscv64, mipsel). "
+                             "Use --build-dir pointing at the softmmu build.")
+        sp.add_argument("--attach", action="store_true",
+                        help="System-mode: open the trace window by INJECTING "
+                             "the marker instead of compiling it in. cst_attach "
+                             "is cross-built for the guest ISA, staged as "
+                             "/bin/cst_trace, and exec's the workload under "
+                             "ptrace, poking the marker sequence into its entry "
+                             "point -- the path an unmodified binary has to "
+                             "take. The workload is generated WITHOUT a start "
+                             "marker, so the injection is the only thing that "
+                             "can open the window.")
         sp.add_argument("--kernel", type=Path, default=None,
                         help="System-mode kernel image (default: the local "
                              "systest vmlinuz).")
@@ -397,6 +408,10 @@ def cmd_generate(args, isa: str | None = None) -> None:
         # System-mode tracing relies on the marker firing in the workload's
         # own address space, so --system implies --marker.
         marker=getattr(args, "marker", False) or getattr(args, "system", False),
+        # --attach has cst_attach poke the start marker into the entry point
+        # instead, so the image must not carry one: an injected run that
+        # produced a trace anyway would prove nothing about the injector.
+        start_marker=not getattr(args, "attach", False),
         sleep_probe=getattr(args, "sleep_probe", 0),
     )
     # Emit per-ISA metadata and a per-ISA assembly source.
@@ -462,7 +477,9 @@ def _trace_system(args, isa: str, bin_path: Path, plugin: Path,
                   out_base) -> int:
     """System-mode trace: boot qemu-system-<isa> with @bin_path staged into
     an initramfs.  The workload's compiled-in marker (generate --marker)
-    opens and ASID-pins the trace window inside the guest."""
+    opens and ASID-pins the trace window inside the guest — or, under
+    --attach, the staged cst_attach injects that marker into the workload's
+    entry point over ptrace, which is how an unmodified binary is traced."""
     if isa not in SYS.ISA_QEMU_SYSTEM:
         print(f"trace[{isa}]: SKIP  no system-mode boot shape for this ISA")
         return 0
@@ -485,8 +502,28 @@ def _trace_system(args, isa: str, bin_path: Path, plugin: Path,
 
     stage_dir = args.out_dir / f"sysstage_{isa}"
     stage_dir.mkdir(parents=True, exist_ok=True)
+
+    init_text = getattr(args, "_init_text", None)
+    attach_bin = None
+    if getattr(args, "attach", False):
+        if init_text is not None:
+            print(f"trace[{isa}]: SKIP  --attach and a custom guest init are "
+                  f"mutually exclusive (the injector owns the workload's "
+                  f"exec)")
+            return 0
+        attach_bin = SYS.build_cst_attach(isa, stage_dir)
+        if attach_bin is None:
+            print(f"trace[{isa}]: SKIP  --attach needs "
+                  f"{SYS.ISA_ATTACH_CC.get(isa)} to cross-build the guest-side "
+                  f"injector")
+            return 0
+        init_text = SYS.default_init(attach=True)
+        print(f"trace[{isa}] (system): injecting marker via "
+              f"{attach_bin.name} -> /{SYS.ATTACH_GUEST_PATH}")
+
     initrd = SYS.stage_initramfs(base_root, bin_path, stage_dir,
-                                 init_text=getattr(args, "_init_text", None))
+                                 init_text=init_text,
+                                 attach_bin=attach_bin)
     cmd = SYS.system_qemu_cmd(qemu_sys, kernel, initrd, plugin, plugin_opts,
                               mem=getattr(args, "sys_mem", "512M"), isa=isa,
                               smp=getattr(args, "smp", 1))

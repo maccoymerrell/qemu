@@ -129,6 +129,7 @@ FEATURES: dict[str, str] = {
     "behavior:wp_tlb_cold_capture": "WP fetch of a valid-PTE but TLB-cold code page captures real bytes (system mode)",
     "behavior:syscall_fault_nesting": "system-mode syscall/fault nesting discipline",
     "behavior:user_code_identity": "ASID-pin: user templates byte-match binary",
+    "behavior:marker_injection": "cst_attach ptrace-injects the marker into an unmarked target's entry point",
     "behavior:guest_thread_identity": "thread_id is guest thread, not vCPU",
     "behavior:asid_recycle":     "narrow-ASID recycle-no-cross-attribution",
     "behavior:whole_system_capture": "trace-all captures an unmarked peer",
@@ -471,6 +472,25 @@ def _chk_churn(isa: str):
              "--depth", "8", "--stop", "150000", "--hot-iters", "2000",
              "--sleep-probe", "25", "--churn-pre", "60",
              "--churn-during", "220"],
+            timeout=900, log_path=d / "run.log")
+        return _cli_outcome(rc, tail, 900)
+    return fn
+
+
+def _chk_attach(isa: str):
+    """Injected-marker system trace: the workload carries no start marker,
+    so the window can only be opened by cst_attach poking the sequence into
+    its entry point over ptrace.  mipsel is the check ISA because its
+    injector backend is the one no other check reaches — the fixed-width
+    ISAs read the PC through PTRACE_GETREGSET, MIPS through the
+    PEEKUSER/POKEUSER index space, and it is also the cheapest guest to
+    boot.  A missing cross compiler makes the run a SKIP, not a failure."""
+    def fn(ctx: Ctx) -> Outcome:
+        d = ctx.dir(f"system_attach_{isa}")
+        rc, tail = _run_cli(
+            ["all", "--isa", isa, "--seed", _seedhex(ctx),
+             "--build-dir", str(ctx.build_dir), "-o", str(d),
+             "--system", "--attach", "--stop", "200000"],
             timeout=900, log_path=d / "run.log")
         return _cli_outcome(rc, tail, 900)
     return fn
@@ -957,6 +977,11 @@ def build_checks() -> list:
     C.append(Check("system.churn_mipsel", "system",
                    "multi-process ASID-churn pin, narrow ASID (mipsel)",
                    ["behavior:asid_recycle"], _chk_churn("mipsel")))
+    C.append(Check("system.attach_mipsel", "system",
+                   "ptrace-injected marker opens the window for a workload "
+                   "with no compiled-in marker (mipsel)",
+                   ["behavior:marker_injection", "opt:window_marker"],
+                   _chk_attach("mipsel")))
     C.append(Check("system.thread_x86", "system",
                    "SMP guest-thread identity (x86, --smp 2)",
                    ["wire:BODY_TAG_THREAD_SWITCH",

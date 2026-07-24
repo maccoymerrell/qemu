@@ -142,19 +142,41 @@ def default_kernel(isa: str) -> Path:
 def default_root(isa: str) -> Path:
     return SYSTEST_ROOT / _ISA_BOOT[isa]["dir"] / "root"
 
-# Guest init: mount the pseudo-filesystems, run the staged workload (which
-# fires the marker at _start so the plugin attaches + pins), then power off
-# so qemu exits and the plugin finalizes the trace.
+# Guest init: mount the pseudo-filesystems, run the staged workload, then
+# power off so qemu exits and the plugin finalizes the trace.
+#
+# Two ways the workload's address space gets marked, chosen by
+# default_init(attach=...):
+#
+#   compiled-in  the workload carries the marker at _start
+#                (``generate --marker``) and init exec's it directly.
+#   injected     the workload carries NO start marker; the staged
+#                cst_attach (as /bin/cst_trace) exec's it under ptrace and
+#                pokes the marker into its entry point.  This is the path
+#                an UNMODIFIED binary must take, so running the validator
+#                over it keeps the injector honest on every ISA.
 _INIT = """#!/bin/sh
 mount -t devtmpfs none /dev 2>/dev/null
 mount -t proc  none /proc 2>/dev/null
 mount -t sysfs none /sys  2>/dev/null
 exec >/dev/console 2>&1 </dev/console
 echo "=== cst_validator system-mode guest: $(uname -r) ==="
-/workload
+{run}
 echo "=== /workload exit=$? ; powering off ==="
 poweroff -f
 """
+
+# Where the injector lands inside the guest, and what it is called there.
+ATTACH_GUEST_PATH = "bin/cst_trace"
+
+
+def default_init(attach: bool = False) -> str:
+    """The run-then-poweroff /init script.  @attach routes the workload
+    through the staged ptrace marker injector instead of exec'ing it
+    directly."""
+    return _INIT.format(
+        run=f"/{ATTACH_GUEST_PATH} /workload" if attach else "/workload")
+
 
 # Churn-test init: the marked workload runs concurrently with a stream of
 # short-lived unmarked processes (each shell-loop iteration forks a subshell
@@ -192,11 +214,49 @@ def churn_init(pre: int, during: int) -> str:
     return _INIT_CHURN.format(pre=int(pre), during=int(during))
 
 
+# The ptrace marker injector, built for the GUEST (it runs inside the
+# guest, on the guest's own /workload).  The tracer's four target ISAs all
+# have a backend in cst_attach.c; the compiler for each is the same cross
+# toolchain the validator already uses to build workloads, minus the ++.
+ATTACH_SRC = Path(__file__).resolve().parents[2] / "tools" / "cst_attach.c"
+
+ISA_ATTACH_CC = {
+    "x86_64":  "gcc",
+    "aarch64": "aarch64-linux-gnu-gcc",
+    "riscv64": "riscv64-linux-gnu-gcc",
+    "mipsel":  "mipsel-linux-gnu-gcc",
+}
+
+
+def build_cst_attach(isa: str, out_dir: Path) -> Path | None:
+    """Build cst_attach for @isa into @out_dir and return the binary, or
+    None when that ISA's cross compiler is not installed (the caller then
+    skips rather than staging an injector that cannot run).
+
+    Static, because the guest rootfs it is staged into is a busybox tree
+    with no matching dynamic loader for a foreign toolchain's libc."""
+    cc = ISA_ATTACH_CC.get(isa)
+    if cc is None or shutil.which(cc) is None:
+        return None
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"cst_attach_{isa}"
+    if out.is_file() and out.stat().st_mtime >= ATTACH_SRC.stat().st_mtime:
+        return out
+    cmd = [cc, "-std=gnu11", "-O2", "-static",
+           str(ATTACH_SRC), "-o", str(out)]
+    if subprocess.call(cmd) != 0:
+        raise RuntimeError(f"build_cst_attach[{isa}]: {' '.join(cmd)} failed")
+    return out
+
+
 def stage_initramfs(base_root: Path, workload: Path, stage_dir: Path,
-                    init_text: str | None = None) -> Path:
+                    init_text: str | None = None,
+                    attach_bin: Path | None = None) -> Path:
     """Copy @base_root, add @workload as /workload plus an init that runs it,
     and repack into <stage_dir>/rootfs.cpio.gz.  Returns the cpio path.
-    @init_text overrides the default run-then-poweroff /init script."""
+    @init_text overrides the default run-then-poweroff /init script.
+    @attach_bin, when given, is installed as the guest's /bin/cst_trace so
+    an init built by default_init(attach=True) can inject the marker."""
     root = stage_dir / "sysroot"
     if root.exists():
         shutil.rmtree(root)
@@ -209,8 +269,17 @@ def stage_initramfs(base_root: Path, workload: Path, stage_dir: Path,
     dst = root / "workload"
     shutil.copy2(workload, dst)
     dst.chmod(0o755)
+    if attach_bin is not None:
+        guest_attach = root / ATTACH_GUEST_PATH
+        guest_attach.parent.mkdir(parents=True, exist_ok=True)
+        # The base root's /bin/* are hardlinks into one busybox inode, so
+        # write through a fresh path rather than over an existing name.
+        if guest_attach.exists():
+            guest_attach.unlink()
+        shutil.copy2(attach_bin, guest_attach)
+        guest_attach.chmod(0o755)
     init = root / "init"
-    init.write_text(init_text if init_text is not None else _INIT)
+    init.write_text(init_text if init_text is not None else default_init())
     init.chmod(0o755)
 
     cpio = stage_dir / "rootfs.cpio.gz"

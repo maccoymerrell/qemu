@@ -126,8 +126,11 @@ if get_option('plugins')
     install: false)
   # cst_attach: ptrace launcher that injects the trace marker at a target's
   # entry so the plugin attaches + pins to its address space (system mode).
-  # Plain C, no deps.  Built here for the host (host==guest for an x86-64
-  # Linux guest); for other guests build it statically against that sysroot.
+  # Plain C, no deps.  It runs INSIDE the guest, so this host build only
+  # serves a guest of the host's architecture; for any other guest,
+  # cross-build the same source statically against that guest's toolchain
+  # (backends: x86/x86-64, aarch64, rv64, little-endian mips32 — see the
+  # file header).  The validator does this for you under --system --attach.
   t += executable(
     'cst_attach',
     files('champsim_tracer/tools/cst_attach.c'),

@@ -287,6 +287,20 @@ direct branch's decoded target — to widen coverage per mint; an
 indirect terminator (indirect jump/call, return) has no static target,
 so that edge ends the walk.
 
+**Marker injection covers the tracer's four target ISAs, on Linux
+guests only.**  A workload with no compiled-in marker is traced by
+running it under :program:`cst_attach`, which pokes the marker into
+the target's entry point over ``ptrace``.  That is guest-side code, so
+it needs a per-guest backend: Linux backends exist for x86/x86-64,
+AArch64, RV64 and **little-endian** 32-bit MIPS.  Big-endian MIPS is
+excluded because the shared marker encoder emits a little-endian
+instruction stream, and a non-Linux guest would need a different debug
+API entirely (Windows debug API, macOS Mach, BSD ``ptrace``).  On an
+uncovered host/arch pair :program:`cst_attach` refuses to run rather
+than injecting bytes that would decode as something else.  A workload
+that can be rebuilt does not need the injector at all — a compiled-in
+marker works on every ISA the tracer targets.
+
 **A marker window held open by a dead process closes only at the
 icount budget.**  Under ``policy=latch`` a process that exits without
 running its END marker leaves its window open until the segment's

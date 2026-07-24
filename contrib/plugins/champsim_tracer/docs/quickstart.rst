@@ -264,6 +264,25 @@ plugin sees its argv.
 
       cst_attach ./workload arg1 arg2
 
+   :program:`cst_attach` runs *inside the guest*, on the guest's own
+   binary, so it is a guest-architecture program: the copy built by
+   ``ninja -C build contrib-plugins`` is a host binary and only serves a
+   guest of the host's architecture.  For any other guest, cross-build
+   it against that guest's toolchain and stage it into the rootfs::
+
+      aarch64-linux-gnu-gcc -std=gnu11 -O2 -static \
+          contrib/plugins/champsim_tracer/tools/cst_attach.c \
+          -o sysroot/bin/cst_trace
+
+   Static linking matters: a busybox rootfs has no dynamic loader for a
+   foreign toolchain's libc.  Injector backends exist for the four ISAs
+   the tracer targets — x86/x86-64, AArch64, RV64, and little-endian
+   32-bit MIPS.  A big-endian MIPS guest is *not* covered, because the
+   marker encoder emits a little-endian instruction stream; on any other
+   host/arch pair :program:`cst_attach` refuses to run rather than
+   mis-inject.  The validator cross-builds and stages the injector for
+   you under ``--system --attach`` (:doc:`validator`).
+
    Because the tracer is single-address-space and kernel-code
    per-thread attribution is only clean while the process stays on one
    vCPU, ``cst_attach`` confines the target to a single guest CPU by

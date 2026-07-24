@@ -3,7 +3,8 @@
  *
  * Holds the per-vCPU correct-path memop accumulator and the mem-data
  * read scratch.  The QEMU mem callback funnels here; record() routes
- * to the CP buffer or the WP buffer (owned by wp.cc) by wp_in_progress.
+ * to the CP buffer or the WP buffer (owned by wp.cc) by
+ * WPThreadState::in_progress.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -18,9 +19,10 @@
 class MemAccessRecorder {
 public:
     /* Called from the QEMU mem callback once per memory access.
-     * Builds a WPMemAccess (capturing data when CST_FLAG_MEM_DATA is
-     * enabled) and appends it to the WP buffer if wp_in_progress, or
-     * to the CP buffer if a trace segment is active. */
+     * Builds a WPMemAccess (capturing data per g_features.mem_data on
+     * the CP path, g_features.wp_mem_data on the WP path) and appends
+     * it to the WP buffer if WPThreadState::in_progress, or to the CP
+     * buffer if a trace segment is active. */
     void record(qemu_plugin_meminfo_t info,
                 uint64_t vaddr,
                 uint64_t insn_pc);

@@ -61,7 +61,8 @@ struct Stats {
     /* Wrong-path BBs marked with a SYNTHETIC-DATA fault: a speculative memory
      * access to an absent/unreadable page served a deterministic placeholder
      * value, or a non-memory synchronous fault (arithmetic / illegal opcode)
-     * stopped the excursion cleanly.  Emitted as CST_WP_EVENT_FAULT. */
+     * skipped the faulting insn and let the excursion continue to the depth
+     * budget.  Emitted as CST_WP_EVENT_FAULT. */
     uint64_t wp_synthetic_faults = 0;
     uint64_t wp_total_mem_accesses = 0;
 

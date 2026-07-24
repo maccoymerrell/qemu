@@ -27,7 +27,9 @@ GMutex stats_registry_lock;
  *   - each ThreadStats CTOR registers its slot (push_back into the registry);
  *   - each ThreadStats DTOR (a vCPU thread exiting mid-run, or the main thread
  *     at process exit) folds the slot into the graveyard and erases it;
- *   - plugin_exit (an atexit callback) reads them via body_stream_finish.
+ *   - body_stream_finish (main thread, at segment close) writes them,
+ *     which can trigger the registry's push_back; plugin_exit later
+ *     reads the aggregate directly via stats_snapshot().
  * A plain file-scope global would get an implicit __cxa_atexit destructor whose
  * run-order vs. plugin_exit and vs. the (later) main-thread ThreadStats dtor is
  * not guaranteed.  In system mode the main thread first touches its slot AT

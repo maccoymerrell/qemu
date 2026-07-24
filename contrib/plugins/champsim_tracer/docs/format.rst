@@ -214,7 +214,15 @@ A decoder needs three working data structures, all built from the
 header member (Step 1):
 
 * ``template_by_id`` — map from ``template_id : u32`` to a parsed
-  ``Template`` (start_pc, num_insns, per-insn descriptors).
+  ``Template`` (start_pc, num_insns, per-insn descriptors).  The
+  ``template_id`` is the sole block identity: ``start_pc`` is **not**
+  unique.  A self-modified block emits multiple templates that share a
+  ``start_pc`` but differ in ``template_id`` and bytes — its revision
+  history.  A decoder that also wants a per-pc view builds
+  ``templates_by_pc`` (``start_pc → [template_id, …]`` in serialised,
+  i.e. body-reference, order); the live revision at any point in the
+  body stream is simply whichever ``template_id`` the entries there
+  name.  Never resolve a block by ``start_pc`` alone.
 * ``encoding_maps`` — thirteen maps (``opcode``, ``branch_type``,
   ``reg``, ``field_id``, ``header_flag``, ``insn_flag``, ``body_tag``,
   ``wp_event_flag``, ``wp_chain_flag``, ``metaflags``, ``dep_block_flag``,

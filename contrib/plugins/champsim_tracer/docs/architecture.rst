@@ -1589,22 +1589,26 @@ stability checks on every canonical insn in the candidate TB:
 * **Byte change since first sighting** — every per-PC 4-byte
   instruction word is memoized in ``g_first_insn_word`` on first
   observation.  A subsequent translation of the same PC whose bytes
-  differ from the memoized value means the underlying memory is
-  writable storage being interpreted as code (stack / heap / .bss
-  / .rodata frame the program is writing through).  Real code does
-  not change.
+  differ is disambiguated by path.  On a *spec-mode* translation it is
+  treated as foreign / mid-refill content (a virtual address reused by
+  another address space, or a page being demand-paged) and the read
+  stays non-mutating.  On the *correct path* it is ground truth: the
+  CPU really is executing these bytes.  In system mode a stable VA
+  legitimately reads different bytes across CP translations (demand
+  paging, ASID reuse), so the memo is refreshed rather than treated as
+  a fault; and where the change is genuine correct-path
+  self-modification, the revision-minting seam at true-BB commit turns
+  it into a new template revision (see :ref:`smc-revisions`).
 
-Either signal poisons the TB's ``start_pc`` (adding it to
-``g_poisoned_pcs``); the fragment is *not* created and no exec-cb
-``udata`` is registered for the TB.  Subsequent WP walks check
-``cst_pc_is_poisoned`` at the top of each iteration (excursion entry
-excepted — see :ref:`wp-flow`) and abort before re-translating the
-address.  When poisoning fires inside the main binary's text segment
-(``[qemu_plugin_start_code(), qemu_plugin_end_code())``) the plugin
-emits a one-shot SMC-suspect warning to stderr — that is the actual
-self-modifying-code signal.  Out-of-text-segment poison fires
-silently because the symptom is "WP wrong-pathed into data," which
-is normal speculative behaviour the tracer just refuses to record.
+The **Capstone decode failure** signal poisons the TB's ``start_pc``
+(adding it to ``g_poisoned_pcs``); the fragment is *not* created and
+no exec-cb ``udata`` is registered for the TB.  Subsequent WP walks
+check ``cst_pc_is_poisoned`` at the top of each iteration (excursion
+entry excepted — see :ref:`wp-flow`) and abort before re-translating
+the address.  This is what keeps a wrong path that wanders into stack
+/ heap / data — bytes that do not decode — from minting garbage
+fragments; it fires silently because that symptom is normal
+speculative behaviour the tracer simply declines to record.
 
 Both the byte-memo and the poison set **persist across**
 ``vcpu_tb_flush``: a flush is JIT housekeeping, so SMC detection
@@ -1634,6 +1638,45 @@ lifetime:
   word or park a permanent poison that would block the correct path.
   The WP walker tracks its own transient poison in an
   excursion-local set.
+
+.. _smc-revisions:
+
+Self-modifying code: template revisions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The true-BB cache keys on ``(asid_root, start_pc)`` and holds one
+*live* template per slot.  When a correct-path re-execution finalises
+a block whose live template holds byte-different but same-shape code
+(identical insn PCs — an in-place patch), the commit seam
+(``TemplateStore::resolve_true_bb``) mints a **revision**: it builds a
+fresh template with a new ``template_id``, retires the previous live
+template into a segment-scoped stash (still serialised, because body
+entries emitted while it was live reference it), and installs the new
+one as live.  Body entries always name the ``template_id`` live when
+they executed, so the revision timeline is implicit in the body's own
+references — no new wire record, and ``CST_MAGIC`` is untouched.
+
+Three properties bound the mechanism:
+
+* **Lazy.**  A revision mints only when a mutated block *re-executes*.
+  Writes to never-re-translated code never surface, so a JIT region
+  written many times and entered once produces exactly one template.
+* **Content-signature reuse.**  Retired revisions are indexed by an
+  FNV signature of their byte image, so a mutation returning to a
+  previously-seen state reuses that state's original ``template_id``.
+  A/B/A/B call-target patching resolves to two ids, not four.
+* **CP-confirmed only.**  Revisions mint only from correct-path
+  translations superseding a correct-path-confirmed state — a
+  wrong-path spec translation observing mid-write bytes never versions
+  a template (the same guard the byte-change memo above applies).
+
+A per-PC cap (``smc_revisions=N``, default 1024) is a backstop bug
+detector: beyond N distinct states minting stops, the body keeps
+referencing the last revision, and a loud once-per-segment warning
+plus the ``smc_revision_overflow`` statistic flag the anomaly.  A
+patch that changes the block's instruction *boundaries* (a different
+insn-PC sequence, not just bytes) is shape divergence, not an in-place
+revision: the original template is kept, as before.
 
 *REP-prefixed x86 string instructions fan out per iteration.*  An x86
 ``REP MOVS`` executes N times against architectural memory.  The

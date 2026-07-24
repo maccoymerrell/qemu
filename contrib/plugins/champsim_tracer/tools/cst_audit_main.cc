@@ -958,14 +958,31 @@ int main(int argc, char **argv)
         uint64_t prof_exec_cp = 0, prof_exec_wp = 0;
         uint64_t prof_memop_insns = 0, prof_addr_insns = 0;
         uint64_t prof_pat[4] = {0, 0, 0, 0};
+        /* Self-modifying-code revision tally (smc_plan.md §1.5): templates are
+         * id-keyed, so an SMC revision is a second (or later) template sharing
+         * one start_pc.  Count them and the distinct pcs that carry >1.
+         * (The overflow event is a plugin-side stat only — no wire bit — so it
+         * is not recoverable here; a start_pc holding exactly the configured
+         * cap is the on-wire hint, reported by the plugin's own stats.) */
+        std::unordered_map<uint64_t, uint32_t> tmpls_by_start_pc;
+        tmpls_by_start_pc.reserve(templates.size());
         for (const auto &t : templates) {
             insns_by_tid[t.template_id] = (uint32_t)t.insns.size();
+            tmpls_by_start_pc[t.start_pc]++;
             prof_exec_cp += t.profile.exec_cp;
             prof_exec_wp += t.profile.exec_wp;
             for (const auto &ip : t.profile.insns) {
                 if (ip.memops_cp || ip.memops_wp) prof_memop_insns++;
                 if (ip.addr_cp || ip.addr_wp) prof_addr_insns++;
                 prof_pat[ip.pat_cp & 0x3]++;
+            }
+        }
+        uint64_t smc_revisions = 0, smc_revised_pcs = 0, smc_max_rev = 0;
+        for (const auto &kv : tmpls_by_start_pc) {
+            if (kv.second > 1) {
+                smc_revisions += (kv.second - 1);
+                smc_revised_pcs++;
+                if (kv.second > smc_max_rev) smc_max_rev = kv.second;
             }
         }
         std::printf("  profile: exec_cp=%llu exec_wp=%llu  "
@@ -979,6 +996,13 @@ int main(int argc, char **argv)
                     (unsigned long long)prof_pat[1],
                     (unsigned long long)prof_pat[2],
                     (unsigned long long)prof_pat[3]);
+        if (smc_revisions > 0) {
+            std::printf("  smc: %llu revision templates across %llu pc(s) "
+                        "(max %llu states at one pc)\n",
+                        (unsigned long long)smc_revisions,
+                        (unsigned long long)smc_revised_pcs,
+                        (unsigned long long)smc_max_rev);
+        }
 
         cst::AttributionLint lint(h, templates);
         try {

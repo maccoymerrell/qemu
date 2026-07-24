@@ -134,6 +134,7 @@ FEATURES: dict[str, str] = {
     "behavior:wire_determinism": "byte-for-byte reproducible wire (golden net)",
     "behavior:mutation_strictness": "oracle catches deliberate trace corruption (mutation matrix)",
     "behavior:wrong_path_coverage": "static_templates=1: minted-alternate never-executed fall-through + BTB target coverage, deepened by static_depth (4-ISA)",
+    "behavior:smc_revisions": "self-modifying code: correct-path template-revision minting, content-signature id reuse, and the per-pc revision cap (4-ISA)",
 }
 
 
@@ -815,6 +816,48 @@ def _chk_static_coverage(ctx: Ctx) -> Outcome:
                    "static_depth-deepened (4 ISAs, minting-off teeth)", subs)
 
 
+def _chk_smc(ctx: Ctx) -> Outcome:
+    """Self-modifying-code revision oracle (smc_plan.md §3).  Across all four
+    ISAs, drive four SMC families whose expected revision structure is known a
+    priori and assert the trace matches exactly:
+
+      patch_once    → 2 revisions          (state changed once, both retained)
+      flip_flop     → 2 revisions          (A/B/A/B reuses the two ids, not 4)
+      cap_overflow  → 2 revisions          (5 states, smc_revisions=2 caps it)
+      write_no_exec → 1 template           (writes that never re-execute never
+                                            surface as revisions)
+
+    The oracle locates the self-modified block by its load-immediate opcode
+    and counts distinct byte-states serialised at that one start_pc.  Any
+    mint/reuse/cap bug perturbs the count and fails here."""
+    from . import __main__ as M
+    from . import _smc
+
+    d = ctx.dir("feat_smc")
+    all_ok, subs = _smc.run_families(ctx.build_dir, d, ctx.plugin,
+                                     M.ISA_COMPILER)
+    return Outcome("pass" if all_ok else "fail",
+                   "SMC template-revision minting + content-sig id reuse + "
+                   "per-pc cap (4 ISAs, 4 families)", subs)
+
+
+def _chk_smc_system(ctx: Ctx) -> Outcome:
+    """System-mode SMC proof (smc_plan.md §4.3): a marker-emitting program
+    ASID-pins itself and self-modifies inside the marker window; the trace
+    must mint exactly two revisions at the self-modified pc under the pinned
+    address-space root — the same commit seam as user mode, keyed by
+    asid_root.  Skips cleanly when the x86 system fixtures are absent."""
+    from . import __main__ as M
+    from . import _smc
+
+    d = ctx.dir("system_smc")
+    all_ok, subs = _smc.run_system_family(ctx.build_dir, d, ctx.plugin,
+                                          M.ISA_COMPILER)
+    return Outcome("pass" if all_ok else "fail",
+                   "SMC revision minting under the marker window / pinned "
+                   "ASID (x86 system boot)", subs)
+
+
 # ===========================================================================
 # The check table.  features[] is the coverage claim for each check.
 # ===========================================================================
@@ -892,6 +935,10 @@ def build_checks() -> list:
                    "SMP guest-thread identity (x86, --smp 2)",
                    ["wire:BODY_TAG_THREAD_SWITCH",
                     "behavior:guest_thread_identity"], _chk_thread_system))
+    C.append(Check("system.smc_x86", "system",
+                   "self-modifying code mints revisions under the marker "
+                   "window / pinned ASID (x86 system boot)",
+                   ["behavior:smc_revisions"], _chk_smc_system))
 
     C.append(Check("multiproc.trace_all_x86", "multiproc",
                    "trace-all vs latch differential (x86)",
@@ -965,6 +1012,10 @@ def build_checks() -> list:
     C.append(Check("features.wrong_path_coverage", "features",
                    "static_templates=1 fall-through/BTB coverage oracle (4-ISA)",
                    ["behavior:wrong_path_coverage"], _chk_static_coverage))
+    C.append(Check("features.smc", "features",
+                   "self-modifying code: revision minting / id reuse / cap "
+                   "(4-ISA, 4 families)",
+                   ["behavior:smc_revisions"], _chk_smc))
     return C
 
 

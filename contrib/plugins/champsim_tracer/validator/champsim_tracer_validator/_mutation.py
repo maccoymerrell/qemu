@@ -194,6 +194,10 @@ class Mutation:
     expect_wire_rc_nonzero: bool = True   # wire: decoder must reject
     covered_by: str = ""             # cross-ref printed when the mutation
                                      # SKIPs (feature absent from substrate)
+    # SMC mutations run against a dedicated self-modifying substrate (the
+    # diamond CFG never self-modifies) with the version-aware revision oracle,
+    # not the shared diamond substrate + validate().
+    smc: bool = False
 
 
 # ---- oracle mutations ------------------------------------------------------
@@ -633,6 +637,30 @@ def _mw_body_truncate(cst_bytes: bytes) -> Optional[bytes]:
     return _repack(members)
 
 
+def _m_smc_revision_byte_flip(triple, smc_sub) -> Optional[str]:
+    """Corrupt a NON-baseline template revision's load-immediate byte at the
+    self-modified pc.  The version-aware revision oracle must flag it — a
+    revision whose bytes no longer match any known patch state (or the
+    consequent count mismatch) is exactly the corruption class SMC support
+    introduces.  Returns None (SKIP) if the substrate lacks ≥2 revisions."""
+    _meta, templates, _entries = triple
+    pc = int(smc_sub["pc"])
+    revs = [t for t in templates
+            if int(t["start_pc"]) == pc and t.get("insns")]
+    revs.sort(key=lambda t: int(t["template_id"]))
+    if len(revs) < 2:
+        return None
+    t = revs[1]                      # a non-baseline revision
+    ins = t["insns"][0]              # the load-immediate word
+    rb = bytearray(ins["raw_bytes"])
+    if not rb:
+        return None
+    rb[-1] ^= 0xFF                   # corrupt the immediate's high byte
+    ins["raw_bytes"] = bytes(rb)
+    return (f"revision tmpl {t['template_id']} @pc=0x{pc:x} "
+            f"load-immediate byte flipped")
+
+
 CATALOGUE: list = [
     Mutation("regdata_value_flip", "oracle",
              "flip a captured dst-register value bit",
@@ -707,6 +735,11 @@ CATALOGUE: list = [
              _m_devio_stop_drop,
              expect=("wp_events", "profile_consistency"),
              covered_by="features.devio (system-mode MP probe, gating)"),
+    Mutation("smc_revision_byte_flip", "oracle",
+             "corrupt a self-modified block's non-baseline revision bytes",
+             _m_smc_revision_byte_flip,
+             expect=("smc_revision_bytes",),
+             smc=True),
     Mutation("header_magic_corrupt", "wire",
              "corrupt the CST_MAGIC in the header member",
              _mw_header_magic_corrupt),
@@ -773,6 +806,38 @@ def _run_oracle_mutation(m: Mutation, good_triple, gen_meta, meta_path,
                              f"The oracle tolerated this corruption."))
 
 
+def _run_smc_mutation(m: Mutation, smc_sub) -> MutResult:
+    """Run an SMC mutation against a dedicated self-modifying substrate with
+    the version-aware revision oracle.  The baseline decode MUST pass the
+    revision oracle clean; the mutation then corrupts a revision and MUST be
+    caught by the same oracle."""
+    from . import _smc
+    if smc_sub is None:
+        return MutResult(m.name, m.layer, "skip",
+                         detail="no SMC substrate (compiler/qemu absent)")
+    isa, family = smc_sub["isa"], smc_sub["family"]
+    good = smc_sub["templates"]
+    base = _smc.check_substrate(good, isa, family)
+    if base:
+        return MutResult(m.name, m.layer, "skip",
+                         detail=f"substrate not clean: {base}")
+    triple = ({}, copy.deepcopy(good), [])
+    try:
+        note = m.apply(triple, smc_sub)
+    except Exception as e:                                 # noqa: BLE001
+        return MutResult(m.name, m.layer, "skip", detail=f"apply raised: {e}")
+    if note is None:
+        return MutResult(m.name, m.layer, "skip",
+                         detail="substrate lacks ≥2 revisions")
+    issues = _smc.check_substrate(triple[1], isa, family)
+    if issues:
+        return MutResult(m.name, m.layer, "caught", applied=note,
+                         caught_by=tuple(i[0] for i in issues),
+                         detail=str([i[2] for i in issues]))
+    return MutResult(m.name, m.layer, "HOLE", applied=note,
+                     detail="the revision oracle tolerated corrupted bytes")
+
+
 def _run_wire_mutation(m: Mutation, cst_bytes: bytes, work: Path,
                        decode_bin: Path) -> MutResult:
     try:
@@ -825,8 +890,24 @@ def run_mutations(build_dir: Path, work_root: Path, seed: int = 0x1111,
     with open(trace_path, "rb") as f:
         cst_bytes = f.read()
 
+    # SMC mutations run on a dedicated self-modifying substrate (the diamond
+    # CFG never self-modifies): build it once, on demand.
+    smc_sub = None
+    if any(getattr(m, "smc", False) for m in CATALOGUE):
+        from . import __main__ as M
+        from . import _smc
+        plugin = build_dir / "contrib/plugins/libchampsim_tracer.so"
+        try:
+            smc_sub = _smc.mutation_substrate(build_dir,
+                                              work_root / "smc",
+                                              M.ISA_COMPILER, plugin)
+        except Exception:                                  # noqa: BLE001
+            smc_sub = None
+
     for m in CATALOGUE:
-        if m.layer == "oracle":
+        if getattr(m, "smc", False):
+            results.append(_run_smc_mutation(m, smc_sub))
+        elif m.layer == "oracle":
             results.append(_run_oracle_mutation(
                 m, good, gen_meta, meta_path, trace_path, binary_path, vkw,
                 baseline_errcks))

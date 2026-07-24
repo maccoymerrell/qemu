@@ -60,24 +60,43 @@ internals, and the resulting traces have not been validated.  A
 trace from a forking workload should be treated as best-effort
 until the body stream is confirmed to cover the path of interest.
 
-**Self-modifying code (SMC).**  Translation-time poison detection
-(see :ref:`poison-detection` in the architecture doc) catches both
-the *real* SMC case and the *wrong-path-into-data* case at the
-fragment-creation boundary.  Two stability signals are checked on
-every canonical insn before the splitter materializes a fragment:
-a Capstone decode failure, and a 4-byte-instruction-word change
-against the first sighting at that PC.  Either signal poisons the
-TB's ``start_pc``; the fragment is not created, the WP walker
-refuses to re-enter that PC, and (only when the poisoned PC is
-inside the main binary's text segment) the plugin emits a one-shot
-SMC-suspect warning to stderr.  Workloads that genuinely modify
-their own code (JIT compilers replacing trace fragments, dynamic
-patchers) will surface that warning and lose later behaviour at the
-modified addresses — the templates section snapshots the first-seen
-program text at each ``start_pc``.  Out-of-text-segment poisoning
-fires silently because the symptom is "WP wrong-pathed into data,"
-which is normal speculative behaviour the tracer just refuses to
-record.
+**Self-modifying code (SMC).**  Self-modifying code is traced, not
+refused.  When the correct path re-executes a basic block whose
+committed template holds different bytes — an in-place patch that
+preserves the block's instruction boundaries, the canonical inline-
+cache / call-target / boot-time alternatives shape — the plugin mints
+a new template *revision*: a fresh ``template_id`` at the same
+``start_pc``, keyed internally by ``(asid_root, start_pc)``.  The
+superseded revision is retained and serialised alongside its
+successor, and every body entry references the ``template_id`` that
+was live when it executed, so the version timeline is implicit in the
+body's own references (see :ref:`poison-detection` for the detector
+seam and the consumer contract in ``format.rst``).
+
+Two properties keep this bounded.  Writes to code that is never
+re-executed never surface (no re-translation, no revision — a region
+written many times and entered once mints exactly one revision, the
+state at execution).  A mutation that *returns* to a previously-seen
+state reuses that state's original ``template_id`` via a content
+signature, so A/B/A/B call-target patching resolves to the two
+distinct states rather than an unbounded transition count.  A per-PC
+cap (``smc_revisions=N``, default 1024) is a backstop *bug detector*,
+not a fidelity budget: no legitimate SMC pattern approaches it, so
+crossing it — a false-mutation loop or a pathological JIT — stops
+minting, keeps the body referencing the last revision (decoded bytes
+at that pc become approximate from there), and emits a loud
+once-per-segment stderr warning plus a ``smc_revision_overflow``
+statistic.
+
+Revisions mint **only** from correct-path-confirmed translations.  A
+wrong-path speculative translation that observes mid-write bytes never
+versions a template (it reuses the live one), and neither does the
+first correct-path confirmation of a block only the wrong path had
+seeded — the same guard that keeps speculative mis-stamps out of the
+dictionary.  The remaining hard edge is a patch that changes the
+block's instruction *boundaries* (different insn PCs, not just bytes):
+that is treated as shape divergence rather than an in-place revision,
+and the original template is kept.
 
 Hard bounds at a glance
 -----------------------
@@ -277,10 +296,16 @@ separate flavour of WP non-determinism — multiple distinct
 speculator wandered into stack / heap / data and decoded *bytes*
 as "instructions" — is handled.  The translation-time
 poison detector (see :ref:`poison-detection` in the architecture
-doc) catches both Capstone decode failures and
-bytes-changed-since-first-sighting before any divergent fragment
-can reach the chain assembler, so the BB cache stays canonical
-regardless of which WP path discovers a given ``start_pc``.  The
-residual byte-level non-determinism above is data-only (load
-values, store values, register snapshots) and operates over
-*real, decoded code* — the BB shapes themselves are stable.
+doc) catches Capstone decode failures before any divergent fragment
+can reach the chain assembler, and revision minting is gated to
+correct-path-confirmed translations, so a speculative wander never
+adds a template.  The BB cache therefore stays canonical regardless
+of which WP path discovers a given ``start_pc``.  The residual
+byte-level non-determinism above is data-only (load values, store
+values, register snapshots) and operates over *real, decoded code* —
+the BB shapes themselves are stable.  The one deliberate exception is
+correct-path self-modifying code, which mints a byte-distinct
+*revision* at the same ``start_pc`` on purpose (see **Self-modifying
+code** above); those revisions are still deterministic — one per
+distinct executed state — and are distinguished on the wire by
+``template_id``, not by ``start_pc``.

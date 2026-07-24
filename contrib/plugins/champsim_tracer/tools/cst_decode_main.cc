@@ -46,6 +46,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -1784,6 +1785,39 @@ void render_templates_only(FILE *out, const cst::Header &h,
             const cst::InsnProfileInfo *ip =
                 k < t.profile.insns.size() ? &t.profile.insns[k] : nullptr;
             emit_template_only_line(out, h, dt, od, t.insns[k], ip);
+        }
+    }
+
+    /* Self-modifying-code version awareness (smc_plan.md §1.5): expose the
+     * per-pc revision list.  Templates serialise in (start_pc, template_id)
+     * order and template_id is minted in body-reference order, so grouping by
+     * start_pc yields each pc's revisions oldest-first — the live version at
+     * any stream position is whichever id the body entries there reference.
+     * The section is emitted only when at least one pc carries >1 template, so
+     * a trace without SMC prints nothing extra. */
+    {
+        std::map<uint64_t, std::vector<uint32_t>> by_pc;
+        for (const cst::Template &t : templates) {
+            by_pc[t.start_pc].push_back(t.template_id);
+        }
+        bool any = false;
+        for (const auto &kv : by_pc) {
+            if (kv.second.size() > 1) { any = true; break; }
+        }
+        if (any) {
+            std::fprintf(out, "\nREVISIONS\n---------\n");
+            for (auto &kv : by_pc) {
+                if (kv.second.size() <= 1) {
+                    continue;
+                }
+                std::sort(kv.second.begin(), kv.second.end());
+                std::fprintf(out, "0x%llx: %zu revisions:",
+                             (unsigned long long)kv.first, kv.second.size());
+                for (uint32_t id : kv.second) {
+                    std::fprintf(out, " BB%u", id);
+                }
+                std::fprintf(out, "\n");
+            }
         }
     }
 }

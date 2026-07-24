@@ -234,6 +234,25 @@ comment prefix.
    analogue of ``objdump -d`` over the binary, restricted to PCs
    the guest actually executed.
 
+   ``start_pc`` is not a unique key once self-modifying code has
+   minted a revision (see :doc:`format`, *Self-modifying code*):
+   a patched block re-executes as a second template at the same
+   ``start_pc``, and both revisions are listed, in ``template_id``
+   order, at their own ``BB<id>`` entries above.  When any ``pc``
+   carries more than one template, a trailing ``REVISIONS`` section
+   lists each such ``pc`` and the ordered ``template_id`` list of
+   its revisions — the sequence a body reference resolves against
+   as it walks the trace — so the timeline is visible without
+   scanning the whole dictionary for shared ``start_pc`` values:
+
+   .. code-block:: text
+
+      REVISIONS
+      ---------
+      0x401176: 2 revisions: BB4099 BB4119
+
+   A trace with no self-modified code omits the section entirely.
+
 ``--objdump``
    Add a side-by-side Capstone-disassembly column to each printed
    line so the generic-opcode rendering can be cross-checked
@@ -292,6 +311,17 @@ exactly once and each section sums to its parent (a
 ``[rollup 100.00%]`` line asserts the header reconciles), so the
 workflow when tuning trace size is:
 
+Two summary lines lead the report, ahead of the byte-budget table:
+a ``profile:`` line totalling the run-aggregated profile across every
+template (``exec_cp`` / ``exec_wp`` execution counts, the memop- and
+address-carrying instruction counts, and the four-way access-pattern
+histogram ``pat[none/reg/irr/rand]`` — see :doc:`concepts`,
+*Run-aggregated profile*), and, only when the trace holds
+self-modified code, an ``smc:`` line tallying revision templates
+(``start_pc`` values with more than one ``template_id`` — see
+:doc:`format`, *Self-modifying code*) and the deepest revision chain
+found. A trace with no SMC omits the ``smc:`` line entirely.
+
 1. Run ``cst_audit`` on a baseline trace.
 2. Toggle a writer flag (``wp_memdata=0``, ``wp_regdata=0``,
    ``memdata=0``).
@@ -303,6 +333,7 @@ Sample output (abridged):
 .. code-block:: console
 
    $ build/contrib/plugins/cst_audit trace.cst
+     profile: exec_cp=27528 exec_wp=0  mem-insns=4920 addr-insns=1699  pat[none/reg/irr/rand]=7728/4839/56/25
    === ON DISK ===
      container (.cst)                          48.00 KiB
 
@@ -366,6 +397,22 @@ lands in an ``(unresolved)`` row).  This is the tool to reach for when
 responsible — a single hot accumulator or the flags register often
 dominates, and the CP/WP split shows whether the cost is correct-path
 state or wrong-path speculation.
+
+An **ATTRIBUTION LINT** verdict always closes the report:
+``impossible attributions: <n> memop (<m> distinct insns), <n> regdata
+(<m> distinct insns), <n> dangling template refs (<m> distinct ids)``.
+This is a structural sanity check, not a byte accounting: it flags a
+body observation landing on an instruction that statically cannot
+produce it — a memop value on an insn with zero static load/store
+slots, a destination-register value past the template's static dst
+count, or a CP/WP entry naming a ``template_id`` the templates section
+never defines — the signature of attribution corruption (records
+leaking into the wrong entry's drain) rather than a decode-quality
+nuance. It is always printed and, unlike every other line in the
+report, a nonzero count is fatal: ``cst_audit`` exits 1 instead of 0.
+A clean trace always reads ``impossible attributions: 0 memop (0
+distinct insns), 0 regdata (0 distinct insns), 0 dangling template
+refs (0 distinct ids)``.
 
 Validating a trace
 ------------------

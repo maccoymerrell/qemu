@@ -137,6 +137,15 @@ before invoking QEMU.
 Trace decode
 ------------
 
+Both tools treat any malformed or truncated ``.cst`` input the same
+way: a diagnostic message on stderr and a clean exit code 1, never a
+crash.  A length-prefixed section that over- or under-consumes
+relative to its own declared length, a reference to a template id the
+templates section never defines, or a stream that ends mid-record all
+surface through this path.  If a trace instead aborts (a signal, not
+a clean rc=1), that is a tool bug — file an issue with the offending
+file rather than assuming the trace itself is merely corrupt.
+
 **``cst_decode`` errors with ``IFRAME with no preceding ENTRY``**
 
 The trace's body stream starts with an IFRAME record before any

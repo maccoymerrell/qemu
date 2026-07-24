@@ -265,16 +265,57 @@ def _insns_in_block(template: dict, start_pc: int, end_pc: int
             if start_pc <= ins["pc"] < end_pc]
 
 
+def _load_pt_load_segments(binary_path: "Path | None"
+                           ) -> list[tuple[int, bytes]]:
+    """Return [(virtual_address, content_bytes), ...] for every PT_LOAD
+    segment of @binary_path, or [] if it can't be parsed (missing LIEF,
+    bad path, etc.) — callers treat that as "no fallback available", not
+    an error, since the labeled-block ground truth still covers the
+    templates it covers."""
+    if binary_path is None:
+        return []
+    try:
+        import lief
+    except ImportError:
+        return []
+    img = lief.parse(str(binary_path))
+    if img is None:
+        return []
+    # LIEF >= 0.17 nests the enum as Segment.TYPE; older releases used
+    # lief.ELF.SEGMENT_TYPES (same compat split as elsewhere in this file).
+    seg_load = (getattr(getattr(lief.ELF.Segment, "TYPE", None), "LOAD", None)
+                or lief.ELF.SEGMENT_TYPES.LOAD)
+    return [(int(seg.virtual_address), bytes(seg.content))
+            for seg in img.segments if seg.type == seg_load]
+
+
 def _check_template_raw_bytes(templates: list[dict],
-                              blocks_by_id: dict[int, dict]
+                              blocks_by_id: dict[int, dict],
+                              binary_path: "Path | None" = None
                               ) -> list[Issue]:
-    """Byte-for-byte compare each template insn's `raw_bytes` against the
-    analyzer's ground-truth disassembly bytes for the same PC.
+    """Byte-for-byte compare each template insn's `raw_bytes` against
+    ground truth for the same PC.
 
     This catches any first-order corruption in the champsim_tracer binary format
     (wrong size encoding, endian mix-ups, truncated bytes, merged-insn
     bugs, etc.) before any higher-level check runs — a divergence here
     makes all downstream checks meaningless.
+
+    Two tiers of ground truth, so coverage is never gated on generator
+    labeling:
+
+      1. The analyzer's per-block disassembly (`ground_truth`, keyed by
+         `blk_N` symbol) — exact, and carries mnemonic/op_str for the
+         error message.
+      2. For any template PC that tier 1 doesn't index (there is no
+         requirement that every byte of user code sit inside a labeled
+         `blk_N` span — e.g. the `_start`/CRT prologue that runs before
+         the first block label runs on the correct path like any other
+         user code and is just as much a target for corruption) — the
+         compiled ELF's own PT_LOAD bytes at that virtual address are the
+         authoritative reference.  A PC outside every PT_LOAD segment is
+         genuinely unknowable from the binary alone (vdso, JIT'd/kernel
+         code) and is skipped, but counted, rather than silently ignored.
     """
     # Index ground-truth instructions by PC for O(1) lookup.
     gt_by_pc: dict[int, dict] = {}
@@ -285,33 +326,72 @@ def _check_template_raw_bytes(templates: list[dict],
         for ins in gt["insns"]:
             gt_by_pc[int(ins["pc"])] = ins
 
+    image_loads = _load_pt_load_segments(binary_path)
+
+    def _image_bytes(va: int, n: int) -> bytes | None:
+        for base, blob in image_loads:
+            if base <= va and va + n <= base + len(blob):
+                return blob[va - base: va - base + n]
+        return None
+
     issues: list[Issue] = []
     mismatches = 0
+    labeled_checked = 0
+    fallback_checked = 0
+    unresolvable = 0
     for t in templates:
         # Kernel / kernel-context (CST_INSN_FLAG_SYSTEM) templates are not
         # in the compiled binary — no ground-truth bytes to compare.
         if t.get("is_system"):
             continue
         for ins in t.get("insns", []):
-            gt = gt_by_pc.get(int(ins["pc"]))
-            if gt is None:
-                continue
-            trace_bytes = bytes(ins["raw_bytes"]).hex()
-            gt_bytes = gt["raw_bytes_hex"]
+            pc = int(ins["pc"])
+            trace_raw = bytes(ins["raw_bytes"])
+            trace_bytes = trace_raw.hex()
+            gt = gt_by_pc.get(pc)
+            if gt is not None:
+                labeled_checked += 1
+                gt_bytes = gt["raw_bytes_hex"]
+                context = f" [{gt['mnemonic']} {gt['op_str']}]"
+                ref = "disasm"
+            else:
+                # Unlabeled template (no blk_N span covers this PC) —
+                # fall back to the ELF image itself.
+                expect = _image_bytes(pc, len(trace_raw))
+                if expect is None:
+                    unresolvable += 1
+                    continue
+                fallback_checked += 1
+                gt_bytes = expect.hex()
+                context = " [unlabeled/prologue template]"
+                ref = "ELF image"
             if trace_bytes != gt_bytes:
                 mismatches += 1
                 if mismatches <= 10:
                     issues.append(Issue(
                         "template_raw_bytes", "error",
-                        f"PC 0x{ins['pc']:x} (tmpl {t['template_id']}): "
+                        f"PC 0x{pc:x} (tmpl {t['template_id']}): "
                         f"trace bytes {trace_bytes!r} != "
-                        f"disasm bytes {gt_bytes!r} "
-                        f"[{gt['mnemonic']} {gt['op_str']}]",
+                        f"{ref} bytes {gt_bytes!r}{context}",
                         {"template_id": t["template_id"],
-                         "pc": ins["pc"],
+                         "pc": pc,
                          "trace": trace_bytes,
                          "disasm": gt_bytes},
                     ))
+    if mismatches > 10:
+        issues.append(Issue(
+            "template_raw_bytes", "error",
+            f"...and {mismatches - 10} more raw-byte mismatches"))
+    if not issues:
+        issues.append(Issue(
+            "template_raw_bytes", "info",
+            f"{labeled_checked} labeled-block + {fallback_checked} "
+            f"unlabeled/ELF-fallback instruction(s) byte-match ground "
+            f"truth ({unresolvable} unresolvable PC(s) outside every "
+            f"PT_LOAD segment skipped)",
+            {"labeled_checked": labeled_checked,
+             "fallback_checked": fallback_checked,
+             "unresolvable": unresolvable}))
     return issues
 
 
@@ -6654,7 +6734,7 @@ def validate(meta_path: Path, trace_path: Path,
     wpprune = _parse_wpprune_from_command(trace_meta.get("command", ""))
 
     # Disassembly-driven first-order sanity checks.
-    issues += _check_template_raw_bytes(templates, blocks_by_id)
+    issues += _check_template_raw_bytes(templates, blocks_by_id, binary_path)
     issues += _check_block_insn_counts(templates, blocks_by_id, pcmap,
                                        cp_set, wpprune=wpprune)
     # The per-block opcode/branch-type coverage assertions assume the full

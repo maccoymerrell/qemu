@@ -373,6 +373,52 @@ def _m_template_raw_byte_flip(triple, gen_meta) -> Optional[str]:
     return None
 
 
+def _pick_unlabeled_template(triple, gen_meta):
+    """A non-system template every one of whose instructions falls
+    OUTSIDE every generator block's PC span -- e.g. the `_start`/CRT
+    prologue that runs before the first `blk_N` label.  This is exactly
+    the class of template the labeled-block ground truth (`_block_span`)
+    cannot index, so it is the class `template_raw_bytes`'s binary-image
+    fallback exists to cover; targeting it here proves that fallback
+    fires rather than relying on `_pick_executed_template` landing there
+    incidentally (which is substrate/ISA order dependent)."""
+    _meta, templates, _entries = triple
+    spans = [s for s in (_block_span(b) for b in gen_meta.get("blocks", []))
+             if s[1] > s[0]]
+
+    def _labeled(pc: int) -> bool:
+        return any(s <= pc < e for s, e in spans)
+
+    for t in templates:
+        if t.get("is_system") or not t.get("insns"):
+            continue
+        if all(not _labeled(int(ins["pc"])) for ins in t["insns"]):
+            return t
+    return None
+
+
+def _m_template_raw_byte_flip_prologue(triple, gen_meta) -> Optional[str]:
+    """Flip a raw byte in an UNLABELED template (no generator block spans
+    its PCs -- the `_start`/CRT prologue). Dedicated from
+    `_m_template_raw_byte_flip`, whose "richest executed template" pick
+    lands on the prologue only incidentally: this row exists so the
+    binary-image fallback in `_check_template_raw_bytes` is exercised on
+    every substrate/ISA, not just the ones where target selection
+    happens to wander there."""
+    t = _pick_unlabeled_template(triple, gen_meta)
+    if t is None:
+        return None
+    for ins in t["insns"]:
+        rb = ins.get("raw_bytes")
+        if rb:
+            b = bytearray(rb)
+            b[0] ^= 0xFF
+            ins["raw_bytes"] = bytes(b)
+            return (f"template {t['template_id']} insn@0x{ins['pc']:x} "
+                    f"raw byte0 flipped [unlabeled/prologue template]")
+    return None
+
+
 def _m_branch_type_change(triple, gen_meta) -> Optional[str]:
     """Corrupt the branch classification of an instruction the generator
     pinned via an expected_insns ``branch_type`` spec (and set its
@@ -811,6 +857,14 @@ CATALOGUE: list = [
              _m_template_raw_byte_flip,
              expect=("template_raw_bytes", "block_insn_count",
                      "static_reg_sets", "opcode_assertion")),
+    Mutation("template_raw_byte_flip_prologue", "oracle",
+             "flip a raw instruction byte in an UNLABELED template (no "
+             "generator block spans it, e.g. the _start/CRT prologue) -- "
+             "proves the ELF-image fallback in template_raw_bytes covers "
+             "user code the ground-truth ISN'T indexed by, not just "
+             "labeled blk_N spans",
+             _m_template_raw_byte_flip_prologue,
+             expect=("template_raw_bytes",)),
     Mutation("branch_type_change", "oracle",
              "corrupt a pinned instruction's branch classification",
              _m_branch_type_change,

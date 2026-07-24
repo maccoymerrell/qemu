@@ -991,7 +991,7 @@ operation):
         terminus or a delay-slot landing for a previously-pending
         ``BARE_BRANCH`` seals the in-flight WP BB.  Commit the
         accumulator to the BB cache via ``commit_true_bb_refs``,
-        push a :class:`WPBBEntry`, ``clear_accum``, and start the
+        push a :class:`WPBBEntry`, ``acc.clear()``, and start the
         next BB with the next fragment's ``start_pc``.  A single
         ``exec_tb`` can therefore commit multiple BBs (one per
         mid-TB branch the splitter found).
@@ -1089,6 +1089,77 @@ its own wire semantics.  Consumers should treat them differently:
   chain and re-runs the whole excursion in the fresh code cache.
   The wire contract is exact-or-longer — a flush-shortened chain
   would be indistinguishable from a silent bug.
+
+.. _static-templates:
+
+Static templates: opportunistic branch-alternate minting
+----------------------------------------------------------
+
+A consumer reconstructing a *trace-inferred* wrong path — replaying
+mispredictions against the binary plus a BTB model, rather than replaying
+the plugin's own WP excursions — needs decode coverage of code that is
+fetched on a mispredicted path but never architecturally executed:
+predicted-not-taken fall-throughs and BTB-miss wanders.  An executed-only
+template dictionary cannot resolve those PCs.  ``static_templates=1``
+closes the gap by minting the untaken side of every evaluated branch as
+an ordinary, never-executed dictionary entry, in both user and system
+mode — the mechanism needs no region enumeration, so the mode split
+other approaches would force does not arise.
+
+At every branch the correct path or a wrong-path excursion resolves, the
+plugin checks whether the side NOT followed already has a template and,
+on a miss, decodes that one true BB through the same
+``qemu_plugin_cap_decode`` -> ``decode_detail_to_generic`` ->
+fragment-splitter path the dynamic path uses, then mints it.  The
+alternate is dictionary-only: no :class:`WPBBEntry`, no dynamic state,
+no body record, and no wire flag at all — a minted alternate is
+indistinguishable from any other block that simply never executed,
+because that is exactly what it is.
+
+Two hook sites cover the two gaps a wrong path alone leaves:
+
+* **The wrong-path walk** (``wp_commit_bb``, part of the WP-walker's
+  phase pipeline — see :ref:`wp-flow`).  A branch *inside* a
+  wrong-path block resolves only the direction the excursion followed;
+  its untaken side is never walked, so an executed-plus-wrong-path
+  dictionary misses it.  ``altmint_conditional_alternate`` mints the
+  untaken side once the block commits.
+* **The correct-path seal** (``collect_finalized_bbs``, the
+  PathBuilder's shared seal walk — see :ref:`cp-flow`).  When a sealed
+  branch's wrong-path fork will not launch (``wpprune`` pruned it,
+  ``wp=0``, or paging is off), nothing else decodes its untaken side,
+  so the seal queues that PC and mints it (``altmint_pc``) once
+  ``data_lock`` is released.  When the fork does launch, the wrong
+  path itself covers the untaken block — and its own inner branches
+  feed the first hook — so the seal leaves it alone.
+
+From each freshly-minted alternate, ``static_depth=N`` (default 4)
+recursively mints its statically-known successors — the architectural
+fall-through always, and a direct branch's decoded target — as a DFS
+worklist bounded by the existing-template dedup (``alt_or_bb_covered``)
+and a per-segment mint budget (``CST_ALT_MINT_BUDGET``); an indirect
+terminator ends the chain.  Alternates live in a segment-scoped
+``alt_map_``, a sibling of ``bb_map_`` keyed by the same
+``(asid_root, start_pc)``; at serialization an executed template always
+shadows a minted alternate at the same key, so the trace body is
+byte-identical whether or not the option is on — the delta is
+templates-section-only.  Guest bytes are read with the same probing
+``qemu_plugin_read_memory_vaddr`` the wrong path uses (mapped page ->
+decode; unmapped -> skipped and counted), so minting never demand-pages
+or perturbs the guest.  The exit-time summary reports the mechanism's
+``checks`` / ``mints`` / ``depth_mints`` / ``skips_unmapped`` /
+``budget_hits`` counters.
+
+Opportunistic minting superseded an earlier eager executable-region
+*sweep* (``qemu_plugin_walk_exec_regions`` plus a late-mapping growth
+hook), which decoded a guest's entire mapped executable footprint up
+front into a dedicated ``static_map_`` and carried a per-insn
+``CST_INSN_FLAG_STATIC`` wire bit (bit 3, now back in the reserved
+pool).  The sweep worked only in user mode and paid the decode cost for
+a footprint most of which a consumer's fetch pattern never reached;
+minting delivers the same coverage goal convergently, in both modes,
+with no wire-format footprint.  See ``static_templates_plan.md`` for
+the full design history.
 
 System-mode tracing
 -------------------
@@ -1369,9 +1440,9 @@ rather than collapsing straight to the completing frame's depth.  What
 makes the deeper-frame flush safe is the ``(thread, asid)`` completion key
 on the *completing* frame: the frame stack only ever holds the pinned
 process's own excursions (a foreign TB seeds none — its deferred prev is
-suspended, or dropped under the legacy flag, before classification could
-stash one), so once the completing frame is process-unambiguous, every
-deeper frame unwound with it is the pinned process's own.  The deeper
+suspended before classification could stash one), so once the completing
+frame is process-unambiguous, every deeper frame unwound with it is the
+pinned process's own.  The deeper
 frames' own event-stamped asids are deliberately *not* an equality gate — a
 kernel fault is stamped with whatever mm is loaded at the fault instant,
 which under multi-process churn is routinely another task's (the same
@@ -1673,10 +1744,11 @@ Three properties bound the mechanism:
 A per-PC cap (``smc_revisions=N``, default 1024) is a backstop bug
 detector: beyond N distinct states minting stops, the body keeps
 referencing the last revision, and a loud once-per-segment warning
-plus the ``smc_revision_overflow`` statistic flag the anomaly.  A
-patch that changes the block's instruction *boundaries* (a different
-insn-PC sequence, not just bytes) is shape divergence, not an in-place
-revision: the original template is kept, as before.
+plus the ``smc_overflow_events`` / ``smc_overflow_pcs`` statistics
+flag the anomaly.  A patch that changes the block's instruction
+*boundaries* (a different insn-PC sequence, not just bytes) is shape
+divergence, not an in-place revision: the original template is kept,
+as before.
 
 *REP-prefixed x86 string instructions fan out per iteration.*  An x86
 ``REP MOVS`` executes N times against architectural memory.  The

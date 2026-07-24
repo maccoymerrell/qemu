@@ -419,7 +419,7 @@ static inline const char *generic_reg_name(unsigned id)
     } else if (id >= REG_ACC0 && id < REG_ACC0 + 4) {
         snprintf(buf, sizeof(buf), "REG_ACC%u", id - REG_ACC0);
     } else {
-        return NULL;  /* unallocated hole (247..249) */
+        return NULL;  /* unallocated hole (246..249) */
     }
     return buf;
 }

@@ -176,6 +176,7 @@ bool set_iframe_rate(PluginConfig *cfg, const char *v)
  *   trace_window=icount:start=0+stop=20000000
  *   trace_window=simpoint:file=mcf.sp+interval=100000000+simulation=20000000+warmup=2000000
  *   trace_window=symbol:name=main+occurrence=3+simulation=20000000
+ *   trace_window=marker:simulation=20000000+policy=latch
  *
  * First colon-delimited token names the mode; each mode accepts only
  * its own keys (cross-mode keys are rejected, no silent mixing).

@@ -62,10 +62,9 @@ until the body stream is confirmed to cover the path of interest.
 
 **Self-modifying code (SMC).**  Self-modifying code is traced, not
 refused.  When the correct path re-executes a basic block whose
-committed template holds different bytes — an in-place patch that
-preserves the block's instruction boundaries, the canonical inline-
-cache / call-target / boot-time alternatives shape — the plugin mints
-a new template *revision*: a fresh ``template_id`` at the same
+committed template holds different bytes — an inline-cache or
+call-target patch, a boot-time alternative, a JIT re-emission — the
+plugin mints a new template *revision*: a fresh ``template_id`` at the same
 ``start_pc``, keyed internally by ``(asid_root, start_pc)``.  The
 superseded revision is retained and serialised alongside its
 successor, and every body entry references the ``template_id`` that
@@ -93,10 +92,32 @@ wrong-path speculative translation that observes mid-write bytes never
 versions a template (it reuses the live one), and neither does the
 first correct-path confirmation of a block only the wrong path had
 seeded — the same guard that keeps speculative mis-stamps out of the
-dictionary.  The remaining hard edge is a patch that changes the
-block's instruction *boundaries* (different insn PCs, not just bytes):
-that is treated as shape divergence rather than an in-place revision,
-and the original template is kept.
+dictionary.
+
+Revision minting is **shape-agnostic**.  A rewrite is detected by
+comparing the overlapping prefix of the committed template and the
+freshly-assembled block — the first ``min(old, new)`` instructions, at
+PC-aligned positions — so a byte difference anywhere in that overlap
+mints a revision whatever the new block's shape is: an in-place patch
+that preserves the instruction boundaries, a rewrite that *moves* them
+(kernel alternatives and static-key patching, JIT re-emission), or one
+that changes the instruction count outright.  A revision is only ever a
+new ``template_id``, and the wire represents that identically for any
+shape, so nothing about the block's new layout constrains it.  Because
+a template's byte image is a zero-padded fixed-stride copy of each
+instruction's real bytes, an instruction whose *length* changed can
+never compare equal to the one previously recorded at its PC, so the
+prefix comparison detects a boundary move at the position where it
+begins.
+
+The one difference that does **not** mint is an *extent-only* one: the
+overlapping instructions agree byte for byte and only the block's
+length differs, meaning the same code was assembled over a different
+run of itself — a chain sealed at a different terminator, a page-split
+fragment, a chain force-committed by the fault machinery.  That is an
+assembly artifact rather than a code change; the committed template is
+kept, a once-per-run explanatory note goes to stderr, and the event is
+counted in the ``SMC extent-only artifacts`` statistic.
 
 Hard bounds at a glance
 -----------------------

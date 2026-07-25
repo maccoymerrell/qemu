@@ -37,6 +37,13 @@ struct Stats {
     uint64_t smc_revision_reuses = 0;
     uint64_t smc_overflow_events = 0;
     uint64_t smc_overflow_pcs = 0;
+    /* Commits at an already-committed slot whose overlapping instructions are
+     * byte-identical and whose EXTENT alone differs — the chain-length
+     * artifact the revision discriminator deliberately does NOT version (a
+     * fault-interrupted or wrong-path-budget-cut chain, a page-split
+     * fragment).  Nonzero on ordinary workloads; it is the negative control
+     * for revision minting, not an error signal. */
+    uint64_t smc_extent_artifacts = 0;
 
     /* Branch transitions observed at vcpu_tb_exec time. */
     uint64_t branches_observed = 0;

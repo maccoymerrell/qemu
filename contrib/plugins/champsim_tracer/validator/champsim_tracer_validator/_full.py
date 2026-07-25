@@ -140,7 +140,7 @@ FEATURES: dict[str, str] = {
     "behavior:wire_determinism": "byte-for-byte reproducible wire (golden net)",
     "behavior:mutation_strictness": "oracle catches deliberate trace corruption (mutation matrix)",
     "behavior:wrong_path_coverage": "static_templates=1: minted-alternate never-executed fall-through + BTB target coverage, deepened by static_depth (4-ISA)",
-    "behavior:smc_revisions": "self-modifying code: correct-path template-revision minting, content-signature id reuse, and the per-pc revision cap (4-ISA)",
+    "behavior:smc_revisions": "self-modifying code: correct-path template-revision minting for rewrites that preserve OR change the block's instruction boundaries, content-signature id reuse, and the per-pc revision cap (4-ISA)",
 }
 
 
@@ -864,18 +864,43 @@ def _chk_static_coverage(ctx: Ctx) -> Outcome:
 
 def _chk_smc(ctx: Ctx) -> Outcome:
     """Self-modifying-code revision oracle (smc_plan.md §3).  Across all four
-    ISAs, drive four SMC families whose expected revision structure is known a
-    priori and assert the trace matches exactly:
+    ISAs, drive the SMC families whose expected revision structure is known a
+    priori and assert the trace matches exactly.
 
-      patch_once    → 2 revisions          (state changed once, both retained)
-      flip_flop     → 2 revisions          (A/B/A/B reuses the two ids, not 4)
-      cap_overflow  → 2 revisions          (5 states, smc_revisions=2 caps it)
-      write_no_exec → 1 template           (writes that never re-execute never
-                                            surface as revisions)
+    Same-shape rewrites (the instruction boundaries stay put):
 
-    The oracle locates the self-modified block by its load-immediate opcode
-    and counts distinct byte-states serialised at that one start_pc.  Any
-    mint/reuse/cap bug perturbs the count and fails here."""
+      patch_once     → 2 revisions   (state changed once, both retained)
+      flip_flop      → 2 revisions   (A/B/A/B reuses the two ids, not 4)
+      cap_overflow   → 2 revisions   (5 states, smc_revisions=2 caps it)
+      write_no_exec  → 1 template    (writes that never re-execute never
+                                      surface as revisions)
+
+    Shape-changing rewrites (the boundaries move — kernel alternatives and
+    static-key patching, JIT re-emission):
+
+      grow           → 2 revisions   (the second holds one instruction MORE)
+      shrink         → 2 revisions   (the second holds one instruction FEWER)
+      boundary_shift → 2 revisions   (the same code BYTES re-cut into
+                                      different instructions; x86_64 and
+                                      riscv64, the variable-width ISAs)
+      grow_return    → 2 revisions   (A/B/A across a shape change: the
+                                      returning A reuses its ORIGINAL id)
+
+    Negative control:
+
+      rewrite_identical → 1 template (identical bytes rewritten and
+                                      re-executed 4x mints nothing)
+
+    plus a host-side truth table over the discriminator itself
+    (champsim_tracer_smc_match.h) covering the EXTENT_ONLY branch — a
+    byte-identical overlap at a different extent must NOT mint — which no
+    guest workload can reach.
+
+    The oracle locates the self-modified block by its instruction bytes,
+    asserts the exact revision count at that one start_pc, that every retained
+    revision is byte-correct for a written state, and that the body's ENTRY
+    records name the revision that was live at each position.  Any
+    mint/reuse/cap bug perturbs the structure and fails here."""
     from . import __main__ as M
     from . import _smc
 
@@ -883,8 +908,9 @@ def _chk_smc(ctx: Ctx) -> Outcome:
     all_ok, subs = _smc.run_families(ctx.build_dir, d, ctx.plugin,
                                      M.ISA_COMPILER)
     return Outcome("pass" if all_ok else "fail",
-                   "SMC template-revision minting + content-sig id reuse + "
-                   "per-pc cap (4 ISAs, 4 families)", subs)
+                   "SMC template-revision minting (shape-preserving AND "
+                   "shape-changing) + content-sig id reuse + per-pc cap + "
+                   "discriminator truth table (4 ISAs, 9 families)", subs)
 
 
 def _chk_smc_system(ctx: Ctx) -> Outcome:
@@ -1075,8 +1101,9 @@ def build_checks() -> list:
                    "static_templates=1 fall-through/BTB coverage oracle (4-ISA)",
                    ["behavior:wrong_path_coverage"], _chk_static_coverage))
     C.append(Check("features.smc", "features",
-                   "self-modifying code: revision minting / id reuse / cap "
-                   "(4-ISA, 4 families)",
+                   "self-modifying code: revision minting (shape-preserving "
+                   "AND shape-changing) / id reuse / cap / discriminator "
+                   "truth table (4-ISA, 9 families)",
                    ["behavior:smc_revisions"], _chk_smc))
     return C
 

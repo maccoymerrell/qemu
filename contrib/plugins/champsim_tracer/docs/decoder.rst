@@ -236,9 +236,13 @@ comment prefix.
 
    ``start_pc`` is not a unique key once self-modifying code has
    minted a revision (see :doc:`format`, *Self-modifying code*):
-   a patched block re-executes as a second template at the same
+   a rewritten block re-executes as a second template at the same
    ``start_pc``, and both revisions are listed, in ``template_id``
-   order, at their own ``BB<id>`` entries above.  When any ``pc``
+   order, at their own ``BB<id>`` entries above.  Sibling revisions
+   need not agree in instruction count or boundaries — a guest that
+   re-cuts a block into different instructions mints a revision of
+   the new shape — so each ``BB<id>`` entry is read on its own
+   terms.  When any ``pc``
    carries more than one template, a trailing ``REVISIONS`` section
    lists each such ``pc`` and the ordered ``template_id`` list of
    its revisions — the sequence a body reference resolves against

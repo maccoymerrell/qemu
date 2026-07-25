@@ -22,11 +22,12 @@ register IDs, immediate, raw instruction bytes.  Templates are
 shared across every dynamic invocation of that BB; if a hot loop
 runs a million times the template is in the trace exactly once.
 A template's true identity is its ``template_id``, not its
-``start_pc``: self-modifying code that patches a block in place
-mints a fresh template — a new ``template_id`` at the same
-``start_pc`` — each time the correct path re-executes a changed
-block, so a decoder resolves a block by the ``template_id`` a body
-entry names, never by address alone (see :doc:`limitations`).  With
+``start_pc``: self-modifying code mints a fresh template — a new
+``template_id`` at the same ``start_pc`` — each time the correct path
+re-executes a changed block, whether the rewrite patched bytes in
+place or re-cut the block into a different number of instructions, so
+a decoder resolves a block by the ``template_id`` a body entry names,
+never by address alone (see :doc:`limitations`).  With
 ``static_templates=1`` (off by default) the dictionary also gains
 never-executed entries: at every branch the correct or wrong path
 evaluates, the plugin mints the untaken side's true BB if it isn't

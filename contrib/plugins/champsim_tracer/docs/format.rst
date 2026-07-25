@@ -220,7 +220,14 @@ header member (Step 1):
   ``template_id`` is the sole block identity: ``start_pc`` is **not**
   unique.  A self-modified block emits multiple templates that share a
   ``start_pc`` but differ in ``template_id`` and bytes — its revision
-  history.  A decoder that also wants a per-pc view builds
+  history.  Revisions at one ``start_pc`` are **not required to agree
+  in shape**: they may carry different ``num_insns`` and different
+  per-instruction PCs and sizes, because the guest may re-cut the block
+  into different instructions (kernel alternatives and static-key
+  patching, JIT re-emission) and not merely patch bytes in place.  Size
+  every per-block structure from the ``template_id`` actually
+  referenced, never from another revision at the same address.  A
+  decoder that also wants a per-pc view builds
   ``templates_by_pc`` (``start_pc → [template_id, …]`` in serialised,
   i.e. body-reference, order); the live revision at any point in the
   body stream is simply whichever ``template_id`` the entries there
@@ -2343,8 +2350,13 @@ header member, immediately after the encoding maps section.
 **not** unique.  A self-modified block emits multiple templates that
 share a ``start_pc`` but differ in ``template_id`` and instruction
 bytes — its revision history, minted lazily on re-execution of
-mutated bytes (Step 0).  A body ``ENTRY`` (§4.2) always names a block
-by ``template_id``; never resolve a block by ``start_pc`` alone.
+mutated bytes (Step 0).  Revisions at one ``start_pc`` need not agree
+in ``num_insns`` or in their per-instruction PCs and sizes: a guest
+that re-cuts a block into different instructions mints a revision of
+the new shape, and the wire carries it exactly as it carries any other
+template.  A body ``ENTRY`` (§4.2) always names a block
+by ``template_id``; never resolve a block by ``start_pc`` alone, and
+never size a block from a sibling revision.
 
 ::
 

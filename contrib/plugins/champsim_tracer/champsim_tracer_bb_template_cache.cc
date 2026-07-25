@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "champsim_tracer_bb_template_cache.h"
+#include "champsim_tracer_smc_match.h"
 #include "champsim_tracer_stats.h"
 
 /* Immortalized (never-destructed heap object): exit(0) at a segment close
@@ -865,39 +866,19 @@ static uint64_t bb_content_sig(uint32_t n_insns, const uint8_t *insn_sizes,
     return h;
 }
 
-/* How incoming canonical arrays relate to an already-committed template @e at
- * the same (asid_root, start_pc):
- *   EXACT            — same shape AND byte-identical (the non-SMC reuse).
- *   SMC_SAME_SHAPE   — same insn PCs, DIFFERENT bytes: genuine in-place
- *                      self-modification (opcode/immediate patched in place).
- *   DIVERGENT        — different insn count or PC sequence: a chain finalised
- *                      at a different length / prefix, NOT in-place SMC (the
- *                      historical "keep original" case). */
-enum class BBMatch { EXACT, SMC_SAME_SHAPE, DIVERGENT };
-
+/* Thin binding of the shape-agnostic SMC discriminator (BBMatch and the full
+ * rationale live in champsim_tracer_smc_match.h) onto a committed template's
+ * parallel arrays.  EXACT reuses the template, SMC mints or reuses a revision,
+ * EXTENT_ONLY keeps the committed template untouched. */
 static BBMatch classify_bb_match(const BBTemplate *e, uint32_t n_insns,
                                  const uint64_t *insn_pcs,
                                  const uint8_t *insn_sizes,
                                  const uint8_t *insn_bytes)
 {
-    if (e->n_insns != n_insns) {
-        return BBMatch::DIVERGENT;
-    }
-    for (uint32_t i = 0; i < n_insns; i++) {
-        if (e->insn_pcs[i] != insn_pcs[i]) {
-            return BBMatch::DIVERGENT;
-        }
-    }
-    /* Same PC shape — compare sizes and byte images. */
-    for (uint32_t i = 0; i < n_insns; i++) {
-        if (e->insn_sizes[i] != insn_sizes[i] ||
-            memcmp(&e->insn_bytes[(size_t)i * MAX_INSN_BYTES],
-                   &insn_bytes[(size_t)i * MAX_INSN_BYTES],
-                   MAX_INSN_BYTES) != 0) {
-            return BBMatch::SMC_SAME_SHAPE;
-        }
-    }
-    return BBMatch::EXACT;
+    return cst_classify_bb_match(e->n_insns, e->insn_pcs, e->insn_sizes,
+                                 e->insn_bytes,
+                                 n_insns, insn_pcs, insn_sizes, insn_bytes,
+                                 MAX_INSN_BYTES);
 }
 
 void TemplateStore::install_live_revision(const BBKey &key,
@@ -970,16 +951,21 @@ BBTemplate *TemplateStore::resolve_true_bb(
     if (m == BBMatch::EXACT) {
         return existing;   /* non-SMC reuse — byte-identical to the old path */
     }
-    if (m == BBMatch::DIVERGENT) {
-        /* Length/prefix divergence, NOT in-place SMC: preserve the historical
-         * "keep original" behavior and its one-shot warning (via
-         * find_existing_true_bb below).  No revision is minted, so output for
-         * this legacy case stays byte-identical. */
+    if (m == BBMatch::EXTENT_ONLY) {
+        /* Extent-only divergence — the overlapping instructions are byte-
+         * identical, so no code changed; the chain was just finalised over a
+         * different run of it.  Preserve the historical "keep original"
+         * behavior and its one-shot warning (via find_existing_true_bb
+         * below).  No revision is minted, so output for this case stays
+         * byte-identical to the pre-SMC tracer. */
+        g_stats.smc_extent_artifacts++;
         return find_existing_true_bb(key.asid_root, key.start_pc,
                                      n_insns, insn_pcs);
     }
 
-    /* BBMatch::SMC_SAME_SHAPE — genuine in-place self-modification. */
+    /* BBMatch::SMC — genuine self-modification, of any shape: an in-place
+     * patch that preserves the instruction boundaries, or a rewrite that
+     * moves them / changes the instruction count. */
     if (!cp_confirmed || !existing->is_system_cp_confirmed) {
         /* Speculation guard (smc_plan.md §1.4): a wrong-path/spec translation
          * never versions, and neither does the FIRST correct-path confirmation
@@ -1039,9 +1025,12 @@ BBTemplate *TemplateStore::find_existing_true_bb(
         static std::atomic<int> warned{0};
         int expected = 0;
         if (warned.compare_exchange_strong(expected, 1)) {
-            /* First divergence distinguishes a length-only prefix
-             * difference (chain finalized at different lengths)
-             * from a true sequence mismatch (likely SMC). */
+            /* Report where the two instruction-PC sequences part company.
+             * Genuine self-modification (of any shape) never reaches here —
+             * resolve_true_bb routes a byte difference over the overlapping
+             * prefix to revision minting — so this warning now means only one
+             * thing: the same run of code was assembled over a different
+             * extent. */
             uint32_t first_diff = 0;
             uint32_t common = existing->n_insns < n_insns
                 ? existing->n_insns : n_insns;
@@ -1051,13 +1040,17 @@ BBTemplate *TemplateStore::find_existing_true_bb(
                 first_diff++;
             }
             fprintf(stderr,
-                "champsim_tracer: WARNING true-BB at start_pc=0x%"
-                PRIx64 " seen with differing insn sequence "
+                "champsim_tracer: NOTE true-BB at start_pc=0x%"
+                PRIx64 " re-assembled over a different extent "
                 "(existing n_insns=%u, new n_insns=%u, "
                 "first_diff at i=%u; "
                 "existing[i]=0x%" PRIx64 ", new[i]=0x%" PRIx64 "). "
-                "Keeping original; this indicates self-modifying "
-                "code or a tracer bug.  (Further occurrences "
+                "The overlapping instructions are byte-identical, so this "
+                "is a chain-length artifact (a fault-interrupted or "
+                "budget-cut chain, a page-split fragment), not code "
+                "rewriting: self-modified code mints a revision instead.  "
+                "Keeping the committed template.  Counted in "
+                "smc_extent_artifacts.  (Further occurrences "
                 "suppressed.)\n",
                 start_pc, existing->n_insns, n_insns, first_diff,
                 first_diff < existing->n_insns

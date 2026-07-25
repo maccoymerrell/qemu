@@ -209,8 +209,10 @@ class Mutation:
                                      # SKIPs (feature absent from substrate)
     # SMC mutations run against a dedicated self-modifying substrate (the
     # diamond CFG never self-modifies) with the version-aware revision oracle,
-    # not the shared diamond substrate + validate().
-    smc: bool = False
+    # not the shared diamond substrate + validate().  The value names the
+    # _smc.FAMILIES entry the substrate is traced from, so a mutation can
+    # target a same-shape or a shape-changing revision structure.
+    smc: str = ""
     # devio mutations run against a dedicated real devio trace (the diamond
     # CFG substrate carries no DEVIO records) with _multiproc's pairing
     # oracle, not validate().  apply(events, devio_sub) mutates the decoded
@@ -826,6 +828,33 @@ def _m_smc_revision_byte_flip(triple, smc_sub) -> Optional[str]:
             f"load-immediate byte flipped")
 
 
+def _m_smc_shape_revision_byte_flip(triple, smc_sub) -> Optional[str]:
+    """Corrupt a SHAPE-CHANGED revision at the self-modified pc: the substrate
+    is the ``grow`` family, whose second revision holds one instruction MORE
+    than the block's original template, so the corrupted template is one that
+    only shape-agnostic revision minting produces at all.  Flip a byte of its
+    LAST pre-terminator instruction — the one the grow added — which the
+    version-aware oracle must reject as bytes matching no written state.
+    Returns None (SKIP) if the substrate lacks a shape-changed revision."""
+    _meta, templates, _entries = triple
+    pc = int(smc_sub["pc"])
+    revs = [t for t in templates
+            if int(t["start_pc"]) == pc and t.get("insns")]
+    revs.sort(key=lambda t: len(t["insns"]))
+    if len(revs) < 2 or len(revs[-1]["insns"]) == len(revs[0]["insns"]):
+        return None                  # no shape change in this substrate
+    t = revs[-1]                     # the revision with the LARGER insn count
+    ins = t["insns"][-2]             # the instruction the grow introduced
+    rb = bytearray(ins["raw_bytes"])
+    if not rb:
+        return None
+    rb[0] ^= 0xFF
+    ins["raw_bytes"] = bytes(rb)
+    return (f"shape-changed revision tmpl {t['template_id']} @pc=0x{pc:x} "
+            f"({len(t['insns'])} insns vs {len(revs[0]['insns'])}) "
+            f"insn[-2] byte flipped")
+
+
 CATALOGUE: list = [
     Mutation("regdata_value_flip", "oracle",
              "flip a captured dst-register value bit",
@@ -912,7 +941,14 @@ CATALOGUE: list = [
              "corrupt a self-modified block's non-baseline revision bytes",
              _m_smc_revision_byte_flip,
              expect=("smc_revision_bytes",),
-             smc=True),
+             smc="flip_flop"),
+    Mutation("smc_shape_revision_byte_flip", "oracle",
+             "corrupt a SHAPE-CHANGED revision's bytes (a revision minted at "
+             "a different instruction count than the block's original "
+             "template -- the class only shape-agnostic minting produces)",
+             _m_smc_shape_revision_byte_flip,
+             expect=("smc_revision_bytes",),
+             smc="grow"),
     Mutation("header_magic_corrupt", "wire",
              "corrupt the CST_MAGIC in the header member",
              _mw_header_magic_corrupt),
@@ -1023,15 +1059,17 @@ def _run_devio_mutation(m: Mutation, devio_sub) -> MutResult:
                             f"{detail}")
 
 
-def _run_smc_mutation(m: Mutation, smc_sub) -> MutResult:
-    """Run an SMC mutation against a dedicated self-modifying substrate with
-    the version-aware revision oracle.  The baseline decode MUST pass the
-    revision oracle clean; the mutation then corrupts a revision and MUST be
-    caught by the same oracle."""
+def _run_smc_mutation(m: Mutation, smc_subs) -> MutResult:
+    """Run an SMC mutation against the dedicated self-modifying substrate its
+    ``smc`` family names, with the version-aware revision oracle.  The baseline
+    decode MUST pass the revision oracle clean; the mutation then corrupts a
+    revision and MUST be caught by the same oracle."""
     from . import _smc
+    smc_sub = (smc_subs or {}).get(m.smc)
     if smc_sub is None:
         return MutResult(m.name, m.layer, "skip",
-                         detail="no SMC substrate (compiler/qemu absent)")
+                         detail=f"no SMC substrate for family '{m.smc}' "
+                                f"(compiler/qemu absent)")
     isa, family = smc_sub["isa"], smc_sub["family"]
     good = smc_sub["templates"]
     base = _smc.check_substrate(good, isa, family)
@@ -1157,17 +1195,19 @@ def run_mutations(build_dir: Path, work_root: Path, seed: int = 0x1111,
 
     # SMC mutations run on a dedicated self-modifying substrate (the diamond
     # CFG never self-modifies): build it once, on demand.
-    smc_sub = None
-    if any(getattr(m, "smc", False) for m in CATALOGUE):
+    smc_subs: dict = {}
+    smc_families = sorted({m.smc for m in CATALOGUE if getattr(m, "smc", "")})
+    if smc_families:
         from . import __main__ as M
         from . import _smc
         plugin = build_dir / "contrib/plugins/libchampsim_tracer.so"
         try:
-            smc_sub = _smc.mutation_substrate(build_dir,
-                                              work_root / "smc",
-                                              M.ISA_COMPILER, plugin)
+            smc_subs = _smc.mutation_substrates(build_dir,
+                                                work_root / "smc",
+                                                M.ISA_COMPILER, plugin,
+                                                families=smc_families)
         except Exception:                                  # noqa: BLE001
-            smc_sub = None
+            smc_subs = {}
 
     # devio mutations run on a dedicated real devio trace (the diamond CFG
     # substrate carries no DEVIO records): build it once, on demand.
@@ -1180,8 +1220,8 @@ def run_mutations(build_dir: Path, work_root: Path, seed: int = 0x1111,
             devio_sub = None
 
     for m in CATALOGUE:
-        if getattr(m, "smc", False):
-            results.append(_run_smc_mutation(m, smc_sub))
+        if getattr(m, "smc", ""):
+            results.append(_run_smc_mutation(m, smc_subs))
         elif getattr(m, "devio", False):
             results.append(_run_devio_mutation(m, devio_sub))
         elif m.layer == "oracle":

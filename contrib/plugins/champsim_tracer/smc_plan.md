@@ -7,6 +7,26 @@ seam — landed in `7503d62587`; phases 2–3 — version-aware tools, the
 is preserved as the design of record. The wire format gained **no new
 records**; `CST_MAGIC` is untouched.
 
+**Shape-agnostic minting (2026-07-24).** The first implementation only minted
+when the rewrite left the block's instruction boundaries alone (identical insn
+PCs, different bytes); a rewrite that moved the boundaries or changed the
+instruction count fell into the historical "keep the original template" path
+and only warned. That was a gap, not a design choice — §1 is explicit that a
+revision is *just a new template id*, which the wire represents fine whatever
+the block's new shape is, so nothing about shape should gate it. The
+discriminator (`cst_classify_bb_match`, `champsim_tracer_smc_match.h`) now
+compares the **overlapping prefix** — the first `min(old, new)` instructions,
+at PC-aligned positions — and mints on any byte or size difference there,
+regardless of length. The artifact the old rule was really guarding against is
+narrower and is still excluded: a byte-identical overlap whose *extent* alone
+differs (a chain sealed at a different terminator, a page-split fragment, a
+chain force-committed by the fault machinery) mints nothing and is counted in
+`smc_extent_artifacts`. Validation gained the `grow` / `shrink` /
+`boundary_shift` / `grow_return` families plus a `rewrite_identical` negative
+control, and a host-side truth table covering the extent-only branch, which no
+guest workload can reach (the fault machinery merges an interrupted chain back
+into a whole BB and the wrong-path walker commits only sealed BBs).
+
 ## 0. Problem
 
 The tracer has no mechanism to introduce *updated* template blocks: templates

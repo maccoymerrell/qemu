@@ -1644,7 +1644,9 @@ of static binary content alone.  Any commit attempt whose shape
 disagrees with the cached BB indicates either real self-modifying
 code or that the trace is reading dynamic memory as if it were code
 — the poison detector below catches the second case at translation
-time, before a divergent fragment can ever reach commit.
+time, before a divergent fragment can ever reach commit, and the
+revision seam handles the first by minting a new template of the new
+shape (see :ref:`the discriminator <smc-discriminator>`).
 
 .. _poison-detection:
 
@@ -1717,8 +1719,7 @@ Self-modifying code: template revisions
 
 The true-BB cache keys on ``(asid_root, start_pc)`` and holds one
 *live* template per slot.  When a correct-path re-execution finalises
-a block whose live template holds byte-different but same-shape code
-(identical insn PCs — an in-place patch), the commit seam
+a block whose live template holds different code, the commit seam
 (``TemplateStore::resolve_true_bb``) mints a **revision**: it builds a
 fresh template with a new ``template_id``, retires the previous live
 template into a segment-scoped stash (still serialised, because body
@@ -1726,6 +1727,42 @@ entries emitted while it was live reference it), and installs the new
 one as live.  Body entries always name the ``template_id`` live when
 they executed, so the revision timeline is implicit in the body's own
 references — no new wire record, and ``CST_MAGIC`` is untouched.
+
+.. _smc-discriminator:
+
+**The discriminator** (``cst_classify_bb_match``, in
+``champsim_tracer_smc_match.h``) reads the **overlapping prefix**: the
+first ``min(committed, incoming)`` instructions, compared at PC-aligned
+positions.  It answers one of three ways.
+
+*EXACT* — same instruction sequence, byte-identical.  The committed
+template is reused; this is the overwhelmingly common case.
+
+*SMC* — an overlapping instruction's size or byte image differs.  The
+code really changed, so a revision mints.  This test is **shape-
+agnostic**: it does not care whether the rewrite preserved the block's
+instruction boundaries (an in-place immediate or opcode patch), moved
+them (kernel alternatives and static-key patching, JIT re-emission), or
+changed the instruction count outright.  A revision is only a new
+``template_id``, which the wire represents identically for any shape, so
+the block's new layout constrains nothing.  A template's byte image is a
+zero-padded fixed-stride copy of each instruction's real bytes, so an
+instruction whose *length* changed can never compare equal to the one
+previously recorded at its PC: the prefix walk sees a boundary move at
+the instruction where it begins, however the boundaries downstream land.
+
+*EXTENT_ONLY* — every overlapping instruction agrees byte for byte and
+only the block's extent differs.  The same code was assembled over a
+different run of itself: a chain sealed at a different terminator, a
+page-split fragment, a chain force-committed by the fault machinery.
+That is an assembly artifact, not a code change, so nothing mints; the
+committed template is kept, a once-per-run explanatory note goes to
+stderr, and the event is counted in ``smc_extent_artifacts``.  The
+instructions of a true BB are contiguous, so ``insn_pcs[i]`` follows
+from ``insn_pcs[i-1] + insn_sizes[i-1]``: a PC divergence *past* a
+byte-identical prefix can only be an extent artifact.  Position 0 is the
+exception — both arrays anchor at ``start_pc``, so a re-anchored start
+is decided by the bytes at that shared PC.
 
 Three properties bound the mechanism:
 
@@ -1745,10 +1782,7 @@ A per-PC cap (``smc_revisions=N``, default 1024) is a backstop bug
 detector: beyond N distinct states minting stops, the body keeps
 referencing the last revision, and a loud once-per-segment warning
 plus the ``smc_overflow_events`` / ``smc_overflow_pcs`` statistics
-flag the anomaly.  A patch that changes the block's instruction
-*boundaries* (a different insn-PC sequence, not just bytes) is shape
-divergence, not an in-place revision: the original template is kept,
-as before.
+flag the anomaly.
 
 *REP-prefixed x86 string instructions fan out per iteration.*  An x86
 ``REP MOVS`` executes N times against architectural memory.  The

@@ -24,7 +24,7 @@ Layout::
     │   ├── _diff_entries.py       # entry-level diff helper
     │   ├── _system.py             # qemu-system-<isa> runner (marker/initramfs staging)
     │   ├── _multiproc.py          # multi-process ASID / marker-latch harnesses
-    │   ├── _smc.py                # self-modifying-code workload family
+    │   ├── _smc.py                # self-modifying-code workload family (shape-preserving + shape-changing) + discriminator truth table
     │   ├── _full.py               # `full` unified runner: tiers + coverage registry
     │   ├── _mutation.py           # `mutation` adversarial strictness harness
     │   └── tests/
@@ -347,7 +347,8 @@ sub-command exposes:
    ``--system --smp 2``.
 ``system.smc_x86``
    Self-modifying code mints revisions under the marker window /
-   pinned ASID (x86 system boot).
+   pinned ASID (x86 system boot), across a shape-changing rewrite
+   (2 instructions re-emitted as 3 at one ``start_pc``).
 
 **multiproc** — 3 checks.  Genuinely new coverage, folded in from
 :mod:`_multiproc` (three multi-ASID harnesses that used to live
@@ -420,9 +421,24 @@ outside the repo as standalone scripts):
    teeth.
 ``features.smc``
    Self-modifying code: revision minting, content-signature id
-   reuse, and the per-pc revision cap, across four ISAs and four SMC
-   families (``patch_once`` / ``flip_flop`` / ``cap_overflow`` /
-   ``write_no_exec``).
+   reuse, and the per-pc revision cap, across four ISAs and nine SMC
+   families.  Four rewrite a block without disturbing its instruction
+   boundaries (``patch_once`` / ``flip_flop`` / ``cap_overflow`` /
+   ``write_no_exec``); four are **shape-changing** — ``grow`` and
+   ``shrink`` re-emit the block with one instruction more or fewer,
+   ``boundary_shift`` re-cuts the same code bytes into different
+   instructions (``x86_64`` and ``riscv64``, the variable-width ISAs),
+   and ``grow_return`` runs A → B → A across a shape change to prove
+   the returning state reuses its original ``template_id``.
+   ``rewrite_identical`` is the negative control: identical bytes
+   rewritten and re-executed four times must mint nothing.  Every
+   family asserts an exact revision count, that each retained revision
+   is byte-correct for a written state, and that the body's ``ENTRY``
+   records name the revision that was live at each position.  A
+   host-side truth table over ``champsim_tracer_smc_match.h`` drives
+   the discriminator directly, covering the extent-only branch
+   (byte-identical overlap, different extent — must not mint) that no
+   guest workload can reach.
 
 .. _validator-mutation:
 
@@ -462,11 +478,15 @@ Three mutation layers, matching where strictness has to live:
    synthetic fault mark (the fault must not excuse the earlier
    divergence), reordering two correct-path entries, forging a
    foreign guest-thread id onto an entry, corrupting a per-memop
-   physical-page value, dropping a ``DEVIO_STOP`` record, and
-   corrupting a self-modified block's non-baseline revision bytes.
-   The last two (DEVIO, SMC) run against dedicated purpose-built
-   substrates rather than the shared diamond-CFG one, since the
-   diamond CFG carries neither disk I/O nor self-modification.
+   physical-page value, dropping a ``DEVIO_STOP`` record, corrupting a
+   self-modified block's non-baseline revision bytes, and corrupting a
+   *shape-changed* revision's bytes (a revision minted at a different
+   instruction count than the block's original template — the class
+   only shape-agnostic minting produces).  The DEVIO and SMC mutations
+   run against dedicated purpose-built substrates rather than the
+   shared diamond-CFG one, since the diamond CFG carries neither disk
+   I/O nor self-modification; the two SMC mutations use different
+   substrates (``flip_flop`` and ``grow``).
 ``wire``
    The mutation is applied to the raw ``.cst`` container bytes (ustar
    member payloads), and the real ``cst_decode`` binary runs against

@@ -457,6 +457,24 @@ collectively check every one:
    on any, and ``cst_decode --strict`` escalates its trailing
    lint summary to exit 1.  WP id 0 is exempt (the writer's
    "no template" sentinel; real ids start at 1).
+7. **Every branch's recorded outcome agrees with where its context
+   actually went.**  ``cst_decode --verify-branch[=N]`` cross-checks
+   each branch-terminated CP entry's ``CST_FID_BRANCH_TAKEN`` /
+   ``CST_FID_BRANCH_TARGET`` against the *architectural continuation*
+   — the entry where its ``(thread, asid)`` context resumes the
+   encoded target, at that entry's ``start_pc`` or at one of a
+   fault-merged entry's anchors — rather than against the next entry
+   in stream order; a pair the next entry does not resolve is deferred
+   only on a positive diversion signal (a ``fault_depth`` step, the
+   successor's fault anchors, a thread switch, a privilege-domain gap,
+   or both endpoints inside a kernel excursion) and must then be
+   resumed or corroborated by a later entry of the same context.  WP
+   chain blocks are checked in-chain against the next block's
+   ``start_pc``.  Every diversion is tallied by signal
+   (resumed / corroborated / never-resumed); an unresumed mismatch
+   with no diversion signal exits 1.  ``=N`` caps the number of body
+   entries walked.  See :doc:`format` §5.6 for the full diversion
+   taxonomy and the wire contract this check verifies.
 
 The recommended validation workflow:
 

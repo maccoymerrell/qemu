@@ -2379,8 +2379,11 @@ does not carry the target is deferred only when the trace positively signals
 the diversion (a ``fault_depth`` step, the successor's fault anchors, a
 thread switch, a privilege-domain gap, or both endpoints inside a kernel
 excursion), and the deferred target must then be matched by a later entry of
-the same context; every deferral is reported by signal with its verified /
-never-resumed split.  A fault-merged entry is checked from the other side as
+the same context — directly, at that entry's own ``start_pc`` (*resumed*), or
+indirectly, at a later block of the excursion naming the same PC
+(*corroborated*).  Every deferral is tallied by signal with its resumed /
+corroborated / never-resumed split, so a suppression cannot hide inside the
+diversion accounting.  A fault-merged entry is checked from the other side as
 well: each of its resume PCs — ``start_pc`` and every anchor's instruction PC
 — must be the encoded target of some branch in that context.  Non-final WP
 blocks are cross-checked in-chain against the next chain block's

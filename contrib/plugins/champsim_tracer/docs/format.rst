@@ -1144,6 +1144,22 @@ Per-thread initial register files are emitted as ``BODY_TAG_REGFILE``
 records inline in the body stream (see §4.6), not as part of the
 ``reg`` encoding map.
 
+A slotted family contributes one ``(value, name)`` pair per slot, so the
+``field_id`` map is the one section whose size tracks
+``CST_FID_SLOT_COUNT``: about 180 KiB per segment header at 512 slots.
+It is highly repetitive text and compresses to a few KiB under the
+container codec. Two consequences for readers:
+
+* The map states what *this trace* can address. A writer built against a
+  narrower slot ceiling names only the slots it can emit, so a reader
+  must bound per-slot materialisation by the names actually present, not
+  by its own compile-time ceiling — otherwise a trace whose dynamic
+  memop count was clamped at the writer's ceiling (``n_stores`` records
+  the pre-clamp count; see §5.2) yields phantom zero memops for the
+  clamped tail.
+* A slot's absence is not an error and is not the same as the slot being
+  present with a zero value.
+
 The writer emits these maps:
 
 ::

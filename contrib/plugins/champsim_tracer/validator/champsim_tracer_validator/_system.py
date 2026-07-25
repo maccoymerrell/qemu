@@ -150,6 +150,13 @@ CLOCK_INFLATION_MAX = 20.0
 # stalled one never emits another.
 CLOCK_STALL_TIMEOUT_S = 180
 
+# Multiplier applied to that budget while the user clock is still at zero,
+# i.e. the window is open but the marked workload has not started running
+# yet.  Booting a guest and churning through a pre-window process stream is
+# slow and bursty, so the startup state needs far more slack than a clock
+# that was already moving; measured worst case for the churn guest is ~200s.
+CLOCK_STALL_STARTUP_FACTOR = 4
+
 _PROGRESS_RE = re.compile(r"champsim_tracer: progress (\d+)/(\d+) user insns")
 _SEG_START_RE = re.compile(r"champsim_tracer: starting segment ")
 
@@ -210,6 +217,15 @@ def run_with_clock_watchdog(cmd: list[str], log_path,
     @stall_timeout_s of wall time after the window opens, the guest is killed
     and the run reported as stalled.
 
+    Armed once the trace window opens, on two different budgets.  A guest
+    that has already reported progress and then stops is unambiguous, and
+    gets @stall_timeout_s.  A guest still at zero user instructions is not:
+    the window can be open long before the marked workload runs (the churn
+    guest spends its whole pre-churn phase there), so that state gets a
+    grace period several times longer -- enough that no legitimate startup
+    trips it, short enough that a guest which wedges before making any
+    progress is still bounded rather than left to some outer timeout.
+
     Returns (rc, stall_reason); stall_reason is "" when the watchdog did not
     fire.  The process group is killed so a qemu that ignores SIGTERM in the
     TCG loop still dies."""
@@ -234,8 +250,13 @@ def run_with_clock_watchdog(cmd: list[str], log_path,
                 if now != last_progress:
                     last_progress, last_change = now, time.monotonic()
                     continue
+                # Zero is "the workload has not started yet", which is a
+                # legitimate state for a while; anything else is a clock
+                # that was moving and stopped.
+                budget = stall_timeout_s * (CLOCK_STALL_STARTUP_FACTOR
+                                            if now == 0 else 1)
                 idle = time.monotonic() - last_change
-                if idle >= stall_timeout_s:
+                if idle >= budget:
                     os.killpg(os.getpgid(p.pid), signal.SIGKILL)
                     p.wait()
                     return 1, (f"user clock frozen at {now} user insns for "

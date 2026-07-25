@@ -276,7 +276,7 @@ Coverage enforcement
 
 Every plugin option, wire record, offline-tool invocation, and
 cross-cutting behaviour the tracer supports is registered in a
-feature table (77 ids, spanning the ``opt:*`` / ``wire:*`` /
+feature table (78 ids, spanning the ``opt:*`` / ``wire:*`` /
 ``tool:*`` / ``behavior:*`` namespaces) and mapped to the
 check id(s) that exercise it.  ``full`` fails — independent of
 whether any check itself failed — if a registered feature has **zero**
@@ -327,10 +327,11 @@ checks and a byte-for-byte golden regression net:
    path rather than its own per-check directory) — byte-for-byte
    wire and ``cst_visualize`` SVG regression.
 
-**system** — 6 checks.  ``system.churn_x86``, ``system.churn_mipsel``,
-and ``system.thread_x86`` literally invoke the ``churn_test`` /
-``thread_test`` sub-commands documented above under fixed arguments;
-cross-reference those sections for what they assert.
+**system** — 10 checks.  ``system.churn_x86``,
+``system.churn_mipsel``, ``system.thread_x86`` and the four
+``system.clock_progress_<isa>`` checks literally invoke the
+``churn_test`` / ``thread_test`` sub-commands documented above under
+fixed arguments; cross-reference those sections for what they assert.
 ``system.user_x86``, ``system.smc_x86``, and ``system.attach_mipsel``
 add coverage no other sub-command exposes:
 
@@ -349,6 +350,29 @@ add coverage no other sub-command exposes:
    Self-modifying code mints revisions under the marker window /
    pinned ASID (x86 system boot), across a shape-changing rewrite
    (2 instructions re-emitted as 3 at one ``start_pc``).
+``system.clock_progress_x86_64`` / ``_aarch64`` / ``_riscv64`` / ``_mipsel``
+   The guest's clock keeps advancing across wrong-path excursions.
+   A guest whose clock dies stops taking interrupts and spins in the
+   kernel; it does not crash, and the tracer records the spin
+   faithfully, so every structural oracle passes on a well-formed
+   trace of a wedged machine.  Three symptom detectors run instead:
+   a window that closes ``UNDER`` budget, a traced/user instruction
+   ratio past 20 (healthy runs sit between 1 and 8.5), and a
+   user-instruction clock that stops advancing in wall time.  The
+   first two are asserted by ``_check_segment_coverage`` — so every
+   system-mode check in the suite carries them — and the third by a
+   live watchdog in the system trace path, which also bounds a
+   wedged run's cost, since a spinning guest never exits on its own.
+
+   None of the three knows anything about timers or interrupt lines,
+   which is the point: they detect the symptom, so a clock source
+   nobody thought to reconcile cannot slip past them.  Run on all
+   four ISAs because the class recurred three times as per-ISA point
+   patches, and the reason the suite stayed green through a 19%
+   aarch64 stall rate is that the system tier booted only x86_64 and
+   mipsel.  Uses the churn guest under the full system option set —
+   a gate for a clock bug has to run the configuration in which the
+   clocks are touched.
 ``system.attach_mipsel``
    ``all --system --attach`` on mipsel — the ptrace-injected marker
    (:program:`cst_attach`'s ``PTRACE_PEEKUSER``/``POKEUSER`` backend)

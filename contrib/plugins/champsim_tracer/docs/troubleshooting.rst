@@ -207,6 +207,40 @@ guest binary failed to start (missing dynamic linker, missing
 shared library, wrong target ISA).  Run without ``-plugin`` to
 isolate.
 
+System-mode guest timing
+------------------------
+
+**A system-mode run never reaches its budget: the segment closes
+``UNDER``, the guest console goes quiet, and ``trace_arch_insns`` is
+tens or hundreds of times ``user_covered``**
+
+The guest has stopped taking interrupts and is spinning in the
+kernel.  The tracer is working correctly — it is faithfully recording
+the spin — so the trace itself is well-formed and every structural
+check passes; the only signature is the accounting.  Healthy
+system-mode runs sit between roughly 1 and 8 traced architectural
+instructions per covered user instruction; a wedged guest runs into
+the hundreds.
+
+The cause is a guest clock that did not survive a wrong-path
+excursion: a host timer left parked, an interrupt line left
+disagreeing with its pending register, or an externally-asserted
+interrupt erased by the excursion's register rollback.  Guest-time
+transparency is QEMU's ``TCGCPUOps::spec_clock_resync`` contract (see
+:doc:`qemu_modifications`), and every system-mode target registers
+it.  If you have added a target, or a new clock source to an existing
+one, that hook is where it has to be reconciled.
+
+To confirm the diagnosis rather than infer it, re-run with ``wp=0``:
+without wrong-path excursions there is nothing to freeze and the
+symptom disappears.  Note that ``-icount`` also hides it — its
+deterministic scheduling serialises the iothread — so a run that is
+healthy only under ``-icount`` is evidence *for* this cause, not
+against it.
+
+The validator gates on all three symptoms directly, on all four
+ISAs, in ``system.clock_progress_<isa>``.
+
 Where to look next
 ------------------
 

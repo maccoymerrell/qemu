@@ -336,6 +336,21 @@ icount budget elapses.  ``latch_timeout=<ms>`` is the opt-in backstop
 interval — but it is off by default because idleness alone cannot
 distinguish a dead process from a merely long-blocked live one.
 
+**Wrong-path excursions are time-transparent, but not free.**  An
+excursion consumes zero guest time — the guest virtual clock is frozen
+for its duration, the instruction counter is checkpointed under
+``-icount``, and every clock, host timer and interrupt line is
+resynchronised to the frozen time on exit (QEMU's
+``TCGCPUOps::spec_clock_resync``; see :doc:`qemu_modifications`).  What
+that buys is that the guest observes the same tick count, and takes the
+same interrupts, whether wrong-path simulation is on or off.  What it
+does not buy is wall-clock parity: a traced system-mode run advances
+guest time only while the guest is actually executing, so it takes
+several times longer in real time than an untraced boot, and anything
+outside the guest that measures real time — a host-side watchdog, an
+NTP peer, an interactive session — sees that stretch.  Time *inside*
+the guest remains self-consistent.
+
 Reproducibility caveats
 -----------------------
 

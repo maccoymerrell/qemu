@@ -1609,24 +1609,71 @@ each is catalogued in :doc:`qemu_modifications`.
   pauses guest virtual time for the entire excursion via
   ``qemu_plugin_spec_vtime_pause`` / ``resume`` — at the *outer*
   boundary, not per spec-mode entry, so a fault-skip's spec-mode
-  teardown/re-entry cannot leak ticks.  On excursion exit the QEMU
-  base re-syncs register-coupled host timers (the Arm generic
-  timer, the RISC-V/MIPS timer compare) to the rolled-back
-  register state, so a speculative timer write or a mid-walk timer
-  expiry cannot park a one-shot host timer dead.
-* **The x86 TSC pin.**  x86 guests read two clock families (TSC
-  and HPET-class devices) and their watchdog cross-checks them;
-  the QEMU base locks the guest TSC to the guest virtual clock at
-  each resume with a once-calibrated frozen ratio, and holds the
-  BQL across each wrong-path excursion, so the two clocksources
-  cannot skew regardless of how often excursions cycle.
+  teardown/re-entry cannot leak ticks.  The freeze covers both
+  sources of guest time: the host wall clock (``cpu_disable_ticks``)
+  and, under ``-icount``, the instruction counter, whose position is
+  checkpointed at excursion entry and restored at exit.  A wrong-path
+  excursion therefore consumes exactly zero guest time under either
+  timekeeping mode, and the guest observes the same tick count with
+  wrong-path simulation on as with it off.
+* **Freeze-and-resync on exit.**  Freezing is only half the
+  contract.  While the clock stands still the excursion rolls
+  architectural state back, and the machine around the vCPU does
+  not roll back with it: compare registers rewind underneath host
+  timers that stay armed for the speculative deadline, interrupt
+  lines keep levels their pending registers no longer agree with,
+  and an interrupt controller that asserted a line mid-excursion has
+  its assertion erased by the register restore.  QEMU's
+  ``TCGCPUOps::spec_clock_resync`` hook closes all of that, per
+  target, on every excursion exit.  Its contract is one sentence:
+  *on return, every architectural clock or counter the guest can
+  observe, and every armed host timer backing one, is consistent with
+  the frozen virtual time* — as if the excursion had consumed exactly
+  zero guest time.  The frozen clock is authoritative; an
+  implementation resynchronises the sources to it, never the reverse.
 
-The virtual-clock freeze covers wall-clock-driven time only.  Under
-``-icount`` the virtual clock is driven by the instruction count,
-which a tick freeze does not stop, so wrong-path instructions leak
-into guest time; the plugin warns once at install when wrong-path
-simulation is enabled together with ``-icount`` (the trace is
-valid; guest timing may be perturbed).
+  Each target reconciles all of its clocks unconditionally, whether
+  or not that particular excursion is known to have disturbed one.
+  The reconciles are idempotent, so the only cost is the recompute,
+  and correctness does not depend on having enumerated every way a
+  clock can drift.  What each target owns:
+
+  .. list-table::
+     :header-rows: 1
+     :widths: 12 44 44
+
+     * - Target
+       - Counters
+       - Timers and lines reconciled
+     * - x86
+       - TSC re-pinned to the virtual clock at every thaw (it free-runs
+         off the host rdtsc, a different oscillator from the one the
+         virtual clock uses, so it drifts across every freeze).
+       - LAPIC/TSC-deadline/HPET/PIT are armed directly off
+         ``QEMU_CLOCK_VIRTUAL`` and hold no architectural shadow, so
+         they need no re-arm.
+     * - Arm
+       - CNTVCT/CNTPCT are computed from the virtual clock; nothing to
+         re-derive.
+       - Every generic timer re-armed from its restored ``ctl``/``cval``
+         (and CNTVOFF); the six inbound interrupt lines re-driven from
+         ``irq_line_state``, which the excursion carries across the
+         rollback as the device state it is.
+     * - RISC-V
+       - ``time`` is the ACLINT counter, a function of the virtual clock.
+       - ACLINT machine timer and the Sstc ``stimer``/``vstimer``
+         re-armed from ``mtimecmp``/``stimecmp``/``vstimecmp``, deferred
+         expiries re-delivered; ``mip`` external assertions replayed over
+         the rollback and ``CPU_INTERRUPT_HARD`` re-derived from it.
+     * - MIPS
+       - CP0 ``Count`` is a function of the virtual clock.
+       - R4K timer re-armed from ``Compare``, a suppressed expiry
+         re-delivered, and ``CPU_INTERRUPT_HARD`` re-derived from
+         ``CP0_Cause.IP``.
+
+  A target that does not register the hook accumulates clock skew
+  across excursions; registering it is how a system-mode target opts
+  in to wrong-path execution being time-transparent.
 
 .. _caveats:
 

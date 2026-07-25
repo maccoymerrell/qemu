@@ -347,37 +347,74 @@ tick/scheduler storm.
    Whole-excursion guest-clock freeze for wrong-path simulation,
    idempotent and balanced so a fault-skip's spec-mode
    teardown/re-entry cannot leak ticks.  The resume side is also
-   the excursion-exit hook where per-target timer state is
-   reconciled (below).
+   the excursion-exit boundary where every guest clock is
+   resynchronised (below).  The BQL is additionally held across each
+   wrong-path excursion on x86 only (other targets' wrong path
+   legitimately takes the BQL for sandboxed device accesses) so the
+   iothread cannot interleave mid-excursion.
 
-``CPUState::plugin_spec_timer_dirty`` + per-target timer resync
+``IcountFreeze`` + ``icount_plugin_freeze`` / ``_thaw``
+(``accel/tcg/icount-common.c``)
 
-   Some targets back an architected timer with a host ``QEMUTimer``
-   that lives outside the register snapshot the wrong-path walk
-   rolls back; a speculative timer-register write is gated, and the
-   host timer can fire mid-walk into the spec gate without
-   re-arming — either way the registers and the host timer desync
-   and a one-shot timer parks dead.  The spec-gated timer paths set
-   the flag; at true excursion exit (``spec_vtime_resume``) the
-   per-target resync (``riscv_cpu_plugin_resync_timers``,
-   ``arm_cpu_plugin_resync_timers``,
-   ``mips_cpu_plugin_resync_timers``) re-arms the host timer to
-   match the restored registers, idempotently.
+   ``cpu_disable_ticks()`` stops the host-wall-clock source of
+   ``QEMU_CLOCK_VIRTUAL``.  Under ``-icount`` that is not the source:
+   guest time is a pure function of retired instructions, so a
+   wrong-path excursion would advance guest time in proportion to its
+   speculation depth.  The excursion checkpoints the instruction
+   counter — both the per-vCPU in-flight counters and the global
+   accumulator, since anything that reads the clock inside the window
+   folds one into the other — and restores it on exit, so the
+   excursion consumes zero icount as well as zero wall-clock guest
+   time.
 
-x86 TSC pin + BQL hold (``accel/tcg/cpu-exec.c``)
+``TCGCPUOps::spec_clock_resync`` (``include/accel/tcg/cpu-ops.h``)
 
-   x86 guests read two clock families — TSC and HPET-class devices —
-   and the guest's clocksource watchdog cross-checks them; excursion
-   pause/resume cycling can skew the two until the watchdog marks
-   the TSC unstable and wedges timekeeping.  At each resume the
-   guest TSC is forced to ``ref_tsc + tsc_hz × (guest_clock −
-   ref_clock)`` with a ratio calibrated once and then frozen, so the
-   two guest clocksources are locked by construction.  The BQL is
-   additionally held across each wrong-path excursion (x86 only;
-   other targets' WP legitimately takes the BQL for sandboxed device
-   accesses) so the iothread cannot interleave mid-excursion.  Other
-   ISAs read a single guest clock family reconciled by their timer
-   resync, so they need no pin.
+   The per-target clock resynchronisation hook, called for every
+   target at the end of both plugin clock freezes.  Its contract: on
+   return, every architectural clock or counter the guest can observe,
+   and every armed host ``QEMUTimer`` backing one, is consistent with
+   the FROZEN virtual time — as if the freeze had consumed exactly
+   zero guest time.  The frozen clock is authoritative, so an
+   implementation resynchronises the sources to it rather than the
+   reverse.  Three obligations: re-derive each architectural counter
+   from the frozen clock (x86's TSC free-runs off the host rdtsc and
+   is re-pinned; Arm, RISC-V and MIPS counters are already functions
+   of the virtual clock); re-arm every host timer from its restored
+   compare register and re-deliver any expiry the excursion
+   suppressed; and re-derive the CPU interrupt-request line from the
+   restored architectural pending state.  Called with the BQL held and
+   spec mode already ended, so an implementation may drive IRQ lines
+   directly, and required to be idempotent — it runs on every
+   excursion exit, including ones that disturbed nothing.
+
+   Registered by all four system-mode targets.  A target that does not
+   register it silently accumulates clock skew across excursions.
+
+   Reconciling unconditionally rather than on an event flag is
+   deliberate.  The predecessor of this hook was three per-ISA point
+   patches behind a ``plugin_spec_timer_dirty`` gate that only fired
+   when a desync had been *observed*; every clock source no patch
+   covered, and every desync the register rollback produced on its
+   own, drifted silently.  ``CPUState::plugin_spec_timer_dirty`` and
+   ``plugin_spec_irq_dirty`` survive only as the record of *which*
+   deferred expiry has to be re-delivered, not as the gate on whether
+   to reconcile.
+
+Interrupt replay across the wrong-path rollback
+
+   Arm's ``env->irq_line_state`` and RISC-V's ``env->mip`` are inside
+   ``CPUArchState``, so the excursion-exit register restore rewinds
+   them.  For guest-caused changes that is correct; for changes an
+   interrupt controller made while the excursion was in flight it is
+   not — the assertion is real, and rewinding it drops the interrupt
+   for good.  Arm carries ``irq_line_state`` across the restore
+   wholesale (guest instructions never write it).  RISC-V separates
+   the two cases at ``riscv_cpu_update_mip``, the single point every
+   ``mip`` change passes through: the externally-caused delta is
+   logged and replayed over the rewound register, while the guest's
+   own ``mip``/``sip`` CSR write flags itself and is discarded with the
+   rest of the speculative state.  Timer bits stay out of the replay —
+   the resync re-derives them from the architected compare registers.
 
 Speculative-execution support
 -----------------------------
@@ -637,11 +674,11 @@ Suppressing device and global side effects
    per target (``target/i386/tcg/system/excp_helper.c`` ``ptw_setl``,
    ``target/arm/ptw.c`` ``arm_casq_ptw``, ``target/riscv/cpu_helper.c``).
 
-   The gated timer writes (Arm generic timer, RISC-V ``timecmp``,
-   MIPS ``Count`` / ``Compare``) additionally flag
-   ``plugin_spec_timer_dirty`` so the post-walk timer resync (see
-   *Guest-time transparency*) re-arms the host ``QEMUTimer`` to the
-   restored register state at excursion exit.
+   A gated timer expiry (Arm generic timer, RISC-V ``timecmp``, MIPS
+   ``Count`` / ``Compare``) additionally records that its delivery was
+   deferred, so the excursion-exit resync (see *Guest-time
+   transparency*) knows to re-deliver it rather than merely re-arm.
+   The re-arm itself is unconditional and needs no such record.
 
 ``accel/tcg/cputlb.c`` — wrong-path TLB-install log
 

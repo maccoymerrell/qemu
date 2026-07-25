@@ -42,7 +42,7 @@ declares the features it exercises.  Checks are grouped into four **tiers**:
 | Tier | What it runs |
 | --- | --- |
 | **quick** | user-mode 4-ISA correctness (`all`), plus iframe / wpprune / symbol-start / tb-flush variants, plus the golden byte-and-render net |
-| **system** | system-mode marker/pin suites: `all --system` (x86), ASID-churn (`churn_test`, x86 + mipsel), SMP guest-thread identity (`thread_test --system`) |
+| **system** | system-mode marker/pin suites: `all --system` (x86), ASID-churn (`churn_test`, x86 + mipsel), SMP guest-thread identity (`thread_test --system`), guest-clock progress across wrong-path excursions (`system.clock_progress_*`, all four ISAs) |
 | **multiproc** | the folded-in multi-process ASID harnesses: trace-all differential, mipsel narrow-ASID latch + recycle, x86 dead-latch kill |
 | **features** | devio, physaddr, `--verify-branch`, simpoint segmentation, aarch64 tagged-pointer, WP synthetic fault, long-tail options smoke |
 
@@ -142,7 +142,7 @@ The unification folded in, revived, or retired every pre-existing piece:
 | `all` (user 4-ISA, ~48 checks in `validator.py::validate`) | current, exercised | **tier: quick** (per-ISA) + system |
 | `simpoint_test` | current | **tier: features** (`features.simpoint`) |
 | `thread_test` (user + `--system --smp`) | current | **tier: system** (`system.thread_x86`) |
-| `churn_test` (x86 + mipsel ASID churn) | current | **tier: system** (`system.churn_*`) |
+| `churn_test` (4-ISA; ASID churn on x86 + mipsel) | current | **tier: system** (`system.churn_*`, `system.clock_progress_*`) |
 | `tests/golden_net.py` + `tests/golden/` | current (fresh 07-16) | **tier: quick** (`quick.golden`); quiet-host wait now baked in |
 | `validator/tests/tagged_ptr_addr.sh` | current | **tier: features** (`features.tagged_ptr`) |
 | `.../tests/test_wp_synthetic_fault.py` | current (matches live FAULT→budget policy) | **tier: features** (`features.wp_fault`) |

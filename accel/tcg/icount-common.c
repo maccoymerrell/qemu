@@ -501,3 +501,63 @@ void icount_notify_exit(void)
         qemu_clock_notify(QEMU_CLOCK_VIRTUAL);
     }
 }
+
+#ifdef CONFIG_PLUGIN
+/*
+ * Instruction-counter side of the plugin clock freeze.
+ *
+ * cpu_disable_ticks() stops the host-wall-clock source of
+ * QEMU_CLOCK_VIRTUAL.  Under -icount that source is not the wall clock at
+ * all: guest time is icount_get() = bias + icount_to_ns(qemu_icount +
+ * in-flight), i.e. a pure function of retired instructions.  A wrong-path
+ * excursion retires instructions, so without this the excursion advances
+ * guest time in direct proportion to the speculation depth -- the icount
+ * analogue of the wall-clock leak, and the reason -icount both hid the
+ * stall (its deterministic scheduling serialises the iothread) and
+ * overshot the physically-correct tick count.
+ *
+ * Freeze captures the position; thaw puts it back.  Both halves of the
+ * position must be handled: the per-vCPU in-flight counters
+ * (icount_decr.u16.low + icount_extra, measured against icount_budget) and
+ * the global accumulator (timers_state.qemu_icount), because anything that
+ * reads the clock inside the window -- a sandboxed device access, a timer
+ * poll -- folds the in-flight count into the global via
+ * icount_update_locked() and resets the budget behind us.  Restoring all
+ * four fields makes the window atomic regardless of what happened inside.
+ */
+void icount_plugin_freeze(CPUState *cpu, IcountFreeze *st)
+{
+    st->active = false;
+    if (!icount_enabled()) {
+        return;
+    }
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    st->budget = cpu->icount_budget;
+    st->extra = cpu->icount_extra;
+    st->decr_low = cpu->neg.icount_decr.u16.low;
+    st->qemu_icount = qatomic_read_i64(&timers_state.qemu_icount);
+    st->active = true;
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+}
+
+void icount_plugin_thaw(CPUState *cpu, IcountFreeze *st)
+{
+    if (!st->active) {
+        return;
+    }
+    st->active = false;
+    if (!icount_enabled()) {
+        return;
+    }
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    cpu->icount_budget = st->budget;
+    cpu->icount_extra = st->extra;
+    cpu->neg.icount_decr.u16.low = st->decr_low;
+    qatomic_set_i64(&timers_state.qemu_icount, st->qemu_icount);
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+}
+#endif /* CONFIG_PLUGIN */

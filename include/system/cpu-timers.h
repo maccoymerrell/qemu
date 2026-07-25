@@ -73,6 +73,53 @@ void icount_start_warp_timer(void);
 void icount_account_warp_timer(void);
 void icount_notify_exit(void);
 
+#ifdef CONFIG_PLUGIN
+/**
+ * IcountFreeze: saved instruction-counter position across a plugin clock freeze
+ *
+ * Opaque to callers; only icount_plugin_freeze/_thaw interpret it.  @active
+ * distinguishes "nothing was captured" (icount off, or an unbalanced thaw)
+ * from a captured position of zero.
+ */
+typedef struct IcountFreeze {
+    int64_t budget;
+    int64_t extra;
+    int64_t qemu_icount;
+    uint16_t decr_low;
+    bool active;
+} IcountFreeze;
+
+/**
+ * icount_plugin_freeze: capture the instruction-counter position
+ * @cpu: the vCPU entering the freeze (must be the caller's own vCPU)
+ * @st: save area, filled in
+ *
+ * Companion to cpu_disable_ticks() for -icount runs.  With icount enabled the
+ * guest's virtual clock is driven by RETIRED INSTRUCTIONS, not by the host
+ * wall clock, so stopping the wall clock does not stop guest time: the
+ * instructions a plugin executes speculatively would advance
+ * QEMU_CLOCK_VIRTUAL exactly as correct-path ones do.  Capture the position
+ * here and restore it with icount_plugin_thaw() so the frozen window consumes
+ * zero icount as well as zero wall time -- the same freeze-and-resync
+ * principle, applied to the other clock source.
+ *
+ * No-op (and leaves @st inactive) when icount is disabled.  Must be called
+ * with the BQL held.
+ */
+void icount_plugin_freeze(CPUState *cpu, IcountFreeze *st);
+
+/**
+ * icount_plugin_thaw: restore a captured instruction-counter position
+ * @cpu: the vCPU leaving the freeze
+ * @st: save area filled by icount_plugin_freeze(); consumed (deactivated)
+ *
+ * Rewinds both the per-vCPU in-flight counters and the global accumulator to
+ * the captured position, so no instruction executed inside the window is
+ * visible to QEMU_CLOCK_VIRTUAL.  Must be called with the BQL held.
+ */
+void icount_plugin_thaw(CPUState *cpu, IcountFreeze *st);
+#endif /* CONFIG_PLUGIN */
+
 /*
  * CPU Ticks and Clock
  */

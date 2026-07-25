@@ -1052,6 +1052,17 @@ void materialise_slotted_memops(uint32_t insn_idx, uint64_t n_fixed,
     for (uint64_t s = 0; s < n_fixed; s++) {
         uint16_t addr_fid = addr_fids[s];
         uint16_t data_fid = data_fids[s];
+        /* Stop at the first slot this TRACE does not advertise.  The
+         * real bound on materialisation is the writer's slot ceiling,
+         * which the trace states by naming CST_FID_<family><k> in its
+         * field_id map — not this decoder's compile-time ceiling.  A
+         * trace written against a narrower ceiling clamps its own memop
+         * count to that ceiling and names no higher slot, so a
+         * wider-built decoder that materialised up to n_fixed anyway
+         * would invent phantom zero memops for the clamped tail.
+         * An unadvertised name resolves to the out-of-range sentinel
+         * (see resolve_optional), not to 0. */
+        if (addr_fid >= FID_LUT_SIZE) break;
         Wide a = lookup_cell(state_blk, state_gen, base_blk, base_gen,
                              slot_lut, insn_idx, addr_fid);
         DynParam dp;
@@ -1103,6 +1114,10 @@ void materialise_reg_snaps_and_metaflags(uint32_t insn_idx,
     for (size_t op_i = 0; op_i < it.dst_regs.size(); op_i++) {
         if (op_i >= FID_SLOT_COUNT) break;
         uint16_t fid = ids.fid_dst_reg[op_i];
+        /* Same trace-advertised bound as the memop families: an
+         * unadvertised slot (out-of-range sentinel) carries no cell,
+         * so stop rather than synthesise a zero-valued snapshot. */
+        if (fid >= FID_LUT_SIZE) break;
         Wide v = lookup_cell(state_blk, state_gen, base_blk, base_gen,
                              slot_lut, insn_idx, fid);
         RegSnap r;

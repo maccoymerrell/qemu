@@ -179,6 +179,39 @@ static bool riscv_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
     }
     return vaddr >= (~(uint64_t)0 << (va_bits - 1));
 }
+
+/*
+ * TCGCPUOps::spec_clock_resync for RISC-V — see the contract in
+ * include/accel/tcg/cpu-ops.h.
+ *
+ * RISC-V's audit.  The guest reads time through the `time` CSR, which is
+ * rdtime_fn into the ACLINT mtime counter, itself a function of
+ * QEMU_CLOCK_VIRTUAL: frozen and thawed at the same value, so the counter
+ * needs no re-derivation.  The armed host timers are three -- the ACLINT
+ * machine timer behind mtimecmp (device state, but a one-shot QEMUTimer that
+ * does not re-arm itself), and the Sstc env->stimer/env->vstimer behind
+ * stimecmp/vstimecmp (architectural registers inside the rolled-back
+ * snapshot).  All three are re-armed from their compare registers, and any
+ * expiry the excursion gates suppressed is re-delivered, by
+ * riscv_cpu_plugin_resync_timers.
+ *
+ * The pending-interrupt side has two halves.  CPU_INTERRUPT_HARD is
+ * recomputed from the restored mip (riscv_cpu_interrupt suppresses line
+ * drives for the whole excursion, so line and register can disagree in either
+ * direction), and the externally-asserted mip bits an excursion would
+ * otherwise have swallowed are replayed by cpu_plugin_arch_state_restore
+ * before we get here.
+ *
+ * SPEC_CLOCK_THAW needs nothing: every RISC-V counter is a pure function of
+ * the virtual clock.
+ */
+static void riscv_spec_clock_resync(CPUState *cs, SpecClockResyncReason reason)
+{
+    if (reason != SPEC_CLOCK_EXCURSION_END) {
+        return;
+    }
+    riscv_cpu_plugin_resync_timers(cs);
+}
 #endif
 
 static const TCGCPUOps riscv_tcg_ops = {
@@ -190,6 +223,7 @@ static const TCGCPUOps riscv_tcg_ops = {
     .get_plugin_state = riscv_get_plugin_state,
     .get_plugin_thread_ptr = riscv_get_plugin_thread_ptr,
     .vaddr_is_kernel = riscv_vaddr_is_kernel,
+    .spec_clock_resync = riscv_spec_clock_resync,
 #endif
 
 #ifndef CONFIG_USER_ONLY

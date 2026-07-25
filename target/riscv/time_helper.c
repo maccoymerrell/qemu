@@ -282,14 +282,14 @@ void riscv_cpu_plugin_resync_timers(CPUState *cs)
      * observably (a stuck line costs the TB loop its BQL fast path), even
      * though the mip-based wake/deliver paths ignore it.
      * riscv_cpu_interrupt is the normal mip-update path's own line logic,
-     * idempotent from current state. */
-    if (cs->plugin_spec_irq_dirty) {
-        cs->plugin_spec_irq_dirty = false;
-        riscv_cpu_update_mip(env, 0, 0);
-    }
-    if (likely(!cs->plugin_spec_timer_dirty) && !getenv("CST_ALWAYS_RESYNC")) {
-        return;
-    }
+     * idempotent from current state.
+     *
+     * Unconditional, like the timer reconcile below.  The previous gate
+     * (plugin_spec_irq_dirty) only fired when a line drive had actually been
+     * observed and suppressed during the excursion, which misses every
+     * desync produced by the rollback alone. */
+    cs->plugin_spec_irq_dirty = false;
+    riscv_cpu_update_mip(env, 0, 0);
     cs->plugin_spec_timer_dirty = false;
     if (getenv("CST_TIMER_DIAG")) {
         fprintf(stderr, "[stimer] RESYNC stimecmp=0x%llx vstimecmp=0x%llx "

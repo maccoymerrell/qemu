@@ -11,6 +11,7 @@
 #define TCG_CPU_OPS_H
 
 #include "exec/breakpoint.h"
+#include "exec/cpu-common.h"
 #include "exec/hwaddr.h"
 #include "exec/memattrs.h"
 #include "exec/memop.h"
@@ -118,6 +119,47 @@ struct TCGCPUOps {
      * (user-mode QEMU) do not register this hook, so the API reports "user".
      */
     bool (*vaddr_is_kernel)(CPUState *cpu, uint64_t vaddr);
+
+    /**
+     * @spec_clock_resync: reconcile every guest clock with the frozen time
+     *
+     * Optional; system-mode targets only.  Called at the end of a plugin
+     * clock freeze, once the virtual clock has been thawed and (for a
+     * wrong-path excursion) the speculative register state has been rolled
+     * back.  @reason says which of the two freezes ended.
+     *
+     * The contract is a single sentence: ON RETURN, EVERY ARCHITECTURAL
+     * CLOCK OR COUNTER THE GUEST CAN OBSERVE, AND EVERY ARMED HOST
+     * QEMUTimer BACKING ONE, MUST BE CONSISTENT WITH THE FROZEN VIRTUAL
+     * TIME -- as if the freeze had consumed exactly zero guest time.  The
+     * frozen clock is authoritative: an implementation resyncs the SOURCES
+     * to it, never the other way round.  Concretely, for each time source
+     * the target exposes, an implementation must
+     *
+     *   - re-derive the architectural counter (Arm CNTVCT/CNTPCT, x86 TSC,
+     *     RISC-V time, MIPS CP0_Count) from the frozen virtual clock, so a
+     *     counter that free-runs off a different host source cannot drift
+     *     across the freeze;
+     *   - re-arm every host QEMUTimer from the (restored) architectural
+     *     compare register, so a compare rolled back by the excursion, or a
+     *     one-shot host timer that fired and was suppressed during it,
+     *     cannot leave the timer parked and never firing again;
+     *   - re-deliver any interrupt whose raise the excursion suppressed, and
+     *     re-derive the CPU interrupt-request line from the restored
+     *     architectural pending state (Arm irq_line_state, RISC-V mip, MIPS
+     *     CP0_Cause.IP), so line and register cannot disagree.
+     *
+     * Called with the BQL held and with plugin spec mode already ended, so
+     * an implementation may drive IRQ lines directly.  It must be
+     * idempotent: it runs on every excursion exit, including ones that
+     * perturbed nothing.
+     *
+     * Registering this hook is how a system-mode target opts in to
+     * wrong-path (speculative) plugin execution being time-transparent.  A
+     * target that does not register it will silently accumulate clock skew
+     * across excursions; see docs/devel/tcg-plugins.rst.
+     */
+    void (*spec_clock_resync)(CPUState *cpu, SpecClockResyncReason reason);
 #endif
 
 #ifdef CONFIG_USER_ONLY

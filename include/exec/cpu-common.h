@@ -39,6 +39,36 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size);
  */
 void cpu_plugin_spec_vtime_pause(CPUState *cpu);
 void cpu_plugin_spec_vtime_resume(CPUState *cpu);
+
+/**
+ * SpecClockResyncReason: which plugin clock freeze just ended
+ *
+ * The plugin freezes the guest virtual clock in two situations, and the
+ * per-target TCGCPUOps::spec_clock_resync hook is told which one it is
+ * unfreezing from.  Both freezes must leave guest time unmoved; they differ
+ * in whether guest architectural state also moved and came back.
+ */
+typedef enum SpecClockResyncReason {
+    /*
+     * A wrong-path (speculative) excursion ended.  The clock was frozen for
+     * its whole duration AND the speculative register state has just been
+     * rolled back, so architectural compare registers and pending-interrupt
+     * bits may have been rewound underneath host timers and IRQ lines that
+     * were not.  Host timer callbacks that fired during the excursion were
+     * suppressed and must be re-delivered.  This is the full reconcile.
+     */
+    SPEC_CLOCK_EXCURSION_END,
+    /*
+     * A correct-path plugin instrumentation window ended (translation-time
+     * decoding, per-TB trace emission).  No guest state moved; only the
+     * clock was frozen and thawed.  A target whose architectural counter is
+     * derived from a different host source than the virtual clock (x86's
+     * TSC) must still re-pin it, because the two sources drift apart across
+     * every freeze; a target whose counters are all derived from the virtual
+     * clock has nothing to do.
+     */
+    SPEC_CLOCK_THAW,
+} SpecClockResyncReason;
 void cpu_plugin_spec_tlb_flush(CPUState *cpu);
 void cpu_plugin_spec_tlb_flush_enter(CPUState *cpu);
 bool cpu_plugin_spec_mode_supported(void);

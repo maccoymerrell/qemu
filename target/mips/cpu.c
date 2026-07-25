@@ -628,6 +628,32 @@ static bool mips_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
 #endif
     return true;                              /* kseg / xsseg / xkphys / xkseg */
 }
+
+/*
+ * TCGCPUOps::spec_clock_resync for MIPS — see the contract in
+ * include/accel/tcg/cpu-ops.h.
+ *
+ * MIPS's audit.  The only architectural time source is the CP0 Count/Compare
+ * pair (with Cause.DC as the count-disable), and Count is computed on demand
+ * from QEMU_CLOCK_VIRTUAL (cpu_mips_get_count_val), so the freeze already
+ * leaves it consistent with the frozen time.  What has to be reconciled is the
+ * R4K host QEMUTimer behind Compare -- an architectural register inside the
+ * rolled-back snapshot -- together with any expiry the excursion gate in
+ * cpu_mips_timer_expire suppressed, and the CPU_INTERRUPT_HARD line, which
+ * cpu_mips_irq_request stops driving for the whole excursion while
+ * CP0_Cause.IP is rewound underneath it.  mips_cpu_plugin_resync_timers does
+ * both, unconditionally.
+ *
+ * SPEC_CLOCK_THAW needs nothing: Count is a pure function of the virtual
+ * clock.
+ */
+static void mips_spec_clock_resync(CPUState *cs, SpecClockResyncReason reason)
+{
+    if (reason != SPEC_CLOCK_EXCURSION_END) {
+        return;
+    }
+    mips_cpu_plugin_resync_timers(cs);
+}
 #endif
 
 static const TCGCPUOps mips_tcg_ops = {
@@ -639,6 +665,7 @@ static const TCGCPUOps mips_tcg_ops = {
     .get_plugin_state = mips_get_plugin_state,
     .get_plugin_thread_ptr = mips_get_plugin_thread_ptr,
     .vaddr_is_kernel = mips_vaddr_is_kernel,
+    .spec_clock_resync = mips_spec_clock_resync,
 #endif
 
 #if !defined(CONFIG_USER_ONLY)

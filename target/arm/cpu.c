@@ -2704,6 +2704,82 @@ static bool arm_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
     }
     return extract64(vaddr, 55, 1) != 0;
 }
+
+/*
+ * Re-derive cs->interrupt_request from the restored env->irq_line_state.
+ *
+ * Arm keeps the state of the six inbound interrupt lines in
+ * env->irq_line_state, which sits inside CPUARMState and therefore inside the
+ * wrong-path register snapshot, while the CPU_INTERRUPT_* bits it drives live
+ * in CPUState, outside it.  A GIC level change delivered by the iothread
+ * during an excursion updates both; the excursion-exit restore then rewinds
+ * only the former, and the two disagree — a line the guest believes is
+ * asserted that the interrupt-request word says is clear, or the reverse.
+ * The virtual-interrupt lines are worse, because arm_cpu_update_virq() and
+ * friends derive their CPU_INTERRUPT_V* bits from irq_line_state combined
+ * with HCR_EL2, so a stale irq_line_state keeps producing the wrong answer at
+ * every subsequent HCR write, not just once.
+ *
+ * cpu_plugin_arch_state_restore carries the live irq_line_state across the
+ * memcpy (it is device-driven state that a discarded path has no business
+ * rewinding), and this re-drives every derived bit from it.  Idempotent: each
+ * arm_cpu_update_* is a plain recompute, and cpu_interrupt/cpu_reset_interrupt
+ * on an already-correct bit is a no-op.
+ *
+ * This is Arm's counterpart of the RISC-V mip reconcile and the MIPS
+ * CP0_Cause.IP reconcile; Arm previously had no interrupt-line reconcile at
+ * all, so an excursion that raced a GIC level change left the line stuck.
+ */
+static void arm_cpu_plugin_reconcile_irq(CPUState *cs)
+{
+    ARMCPU *cpu = ARM_CPU(cs);
+    CPUARMState *env = &cpu->env;
+    static const int lines[] = {
+        CPU_INTERRUPT_HARD, CPU_INTERRUPT_FIQ, CPU_INTERRUPT_NMI,
+    };
+
+    for (int i = 0; i < ARRAY_SIZE(lines); i++) {
+        if (env->irq_line_state & lines[i]) {
+            cpu_interrupt(cs, lines[i]);
+        } else {
+            cpu_reset_interrupt(cs, lines[i]);
+        }
+    }
+    if (arm_feature(env, ARM_FEATURE_EL2)) {
+        arm_cpu_update_virq(cpu);
+        arm_cpu_update_vfiq(cpu);
+        arm_cpu_update_vinmi(cpu);
+        arm_cpu_update_vfnmi(cpu);
+        arm_cpu_update_vserr(cpu);
+    }
+}
+
+/*
+ * TCGCPUOps::spec_clock_resync for Arm — see the contract in
+ * include/accel/tcg/cpu-ops.h.
+ *
+ * Arm's audit: every architectural counter the guest can read (CNTVCT_EL0,
+ * CNTPCT_EL0, and the CNTHP/CNTHV/CNTPS/CNTHVIRT views) is computed on demand
+ * from QEMU_CLOCK_VIRTUAL plus CNTVOFF/CNTPOFF, so the freeze already leaves
+ * them exactly consistent with the frozen time and nothing has to be re-derived
+ * for the counters themselves.  What does need work is the pair of things the
+ * excursion can leave behind: the host QEMUTimers shadowing the compare
+ * registers, and the interrupt lines shadowing irq_line_state.  Both are
+ * reconciled here, unconditionally.
+ *
+ * SPEC_CLOCK_THAW needs nothing: no guest state moved, and every Arm counter
+ * is a pure function of the virtual clock, which resumes at the value it was
+ * frozen at.  (Contrast x86, whose TSC free-runs off a different host
+ * oscillator and must be re-pinned on every thaw.)
+ */
+static void arm_spec_clock_resync(CPUState *cs, SpecClockResyncReason reason)
+{
+    if (reason != SPEC_CLOCK_EXCURSION_END) {
+        return;
+    }
+    arm_cpu_plugin_resync_timers(cs);
+    arm_cpu_plugin_reconcile_irq(cs);
+}
 #endif
 
 static const TCGCPUOps arm_tcg_ops = {
@@ -2716,6 +2792,7 @@ static const TCGCPUOps arm_tcg_ops = {
     .get_plugin_state = arm_get_plugin_state,
     .get_plugin_thread_ptr = arm_get_plugin_thread_ptr,
     .vaddr_is_kernel = arm_vaddr_is_kernel,
+    .spec_clock_resync = arm_spec_clock_resync,
 #endif
 
 #ifdef CONFIG_USER_ONLY

@@ -937,66 +937,48 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
      * restored registers.  This is NOT covered by the spec-gate dirty flag,
      * because the desyncing gt_recalc_timer ran with spec mode closed.
      */
-    {
-        const CPUARMState *s = (const CPUARMState *)saved;
-        for (int i = 0; i < NUM_GTIMERS; i++) {
-            if (env->cp15.c14_timer[i].ctl != s->cp15.c14_timer[i].ctl ||
-                env->cp15.c14_timer[i].cval != s->cp15.c14_timer[i].cval) {
-                current_cpu->plugin_spec_timer_dirty = true;
-                break;
-            }
-        }
-    }
+    /*
+     * env->irq_line_state is the level of the six inbound interrupt lines,
+     * driven by the GIC through arm_cpu_set_irq() from the iothread.  It is
+     * DEVICE state that merely happens to live inside CPUARMState: guest
+     * instructions never write it, so a discarded speculative path has
+     * nothing to roll back, while a GIC level change that lands during the
+     * excursion is real and must survive.  Rewinding it desyncs it from the
+     * CPU_INTERRUPT_* bits in CPUState (which the memcpy does not touch) and
+     * poisons every later arm_cpu_update_virq/vfiq/vinmi recomputation, which
+     * reads it.  Carry the live value forward, exactly as the breakpoint and
+     * watchpoint pointers below are carried, and let the excursion-exit
+     * resync re-derive the interrupt-request word from it.
+     */
+    uint32_t irq_line_save = env->irq_line_state;
 #endif
     memcpy(env, saved, size);
     memcpy(env->cpu_breakpoint, bp_save, sizeof(bp_save));
     memcpy(env->cpu_watchpoint, wp_save, sizeof(wp_save));
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    env->irq_line_state = irq_line_save;
+#endif
     /*
-     * Timer resync deferred to cpu_plugin_spec_vtime_resume (true excursion
+     * Clock resync deferred to cpu_plugin_spec_vtime_resume (true excursion
      * exit) -- see the riscv branch / #77.  Running it at this restore would
      * fire at an intermediate fault-skip restore too.
      */
 #elif defined(TARGET_RISCV)
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     /*
-     * The Sstc supervisor/VS host timers (env->stimer/vstimer) live outside
-     * this register snapshot.  If the restore rolls back the architected
-     * compare register (stimecmp/vstimecmp), the host QEMUTimer is left armed
-     * for the speculative deadline while the register says otherwise -- re-sync
-     * so a rolled-back compare can't leave the host timer stale (the ARM storm
-     * class: architected timer register desynced from the host timer).
-     *
-     * Only compare fields that are actually inside the snapshot (i.e. before
-     * end_reset_fields): stimecmp/vstimecmp qualify.  vstime_irq, stimer and
-     * vstimer all sit AFTER end_reset_fields, so they are neither saved nor
-     * rolled back -- reading them through `s` would index past the saved
-     * buffer.
+     * The Sstc supervisor/VS host timers (env->stimer/vstimer) and the ACLINT
+     * machine timer live outside this register snapshot, so a rolled-back
+     * stimecmp/vstimecmp, or an expiry the excursion suppressed, can leave a
+     * host QEMUTimer armed for a deadline the architected registers no longer
+     * ask for (the storm class: architected timer register desynced from the
+     * host timer).  The excursion-exit resync re-derives every deadline and
+     * level from the compare registers unconditionally, so this restore no
+     * longer has to detect which of those happened -- it just has to not
+     * damage the compare registers, and it does not (mtimecmp is device
+     * state; stimecmp/vstimecmp revert to their correct-path values).
      */
     {
         const CPURISCVState *s = (const CPURISCVState *)saved;
-        if (env->stimecmp != s->stimecmp || env->vstimecmp != s->vstimecmp) {
-            current_cpu->plugin_spec_timer_dirty = true;
-        }
-        /*
-         * A timer-pending bit that materialised in the LIVE env->mip after
-         * the snapshot was taken is about to be erased by the memcpy below.
-         * This happens when a host timer cb (ACLINT mtimer -> MTIP, Sstc
-         * stimer/vstimer -> STIP/VSTIP; iothread, under BQL) fires in the
-         * race window at excursion ENTRY: the snapshot is already taken but
-         * the spec/vtime flags are not yet visible to the cb's thread, so
-         * the cb-side deferral gates cannot catch it (the freezing fire
-         * observably logs spec=0 vtp=0).  The one-shot host timer has
-         * already fired and will not re-arm itself, so the erased raise
-         * would be lost forever — the machine-timer park that freezes an
-         * SBI-timer (sstc=false) guest at its next nanosleep tick.  Flag
-         * the excursion dirty; the exit resync re-derives the level + host
-         * deadline from the compare registers, which this restore does not
-         * damage (mtimecmp is device state; stimecmp/vstimecmp revert to
-         * their correct-path values).
-         */
-        if ((env->mip & ~s->mip) & (MIP_MTIP | MIP_STIP | MIP_VSTIP)) {
-            current_cpu->plugin_spec_timer_dirty = true;
-        }
 #ifdef CONFIG_PLUGIN
         /* #77 (i)-vs-(ii) probe: does a WP restore knock mstatus.VS On->Off,
          * i.e. clobber a real correct-path vector-enable with a stale snapshot? */
@@ -1007,18 +989,38 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
                     (int)!!(env->mstatus & MSTATUS_FS),
                     (int)!!(s->mstatus & MSTATUS_FS));
         }
+#else
+        (void)s;
 #endif
     }
     /*
-     * Pure rollback: WP is fully transparent to the correct path, so env->mip
-     * (interrupt-pending) is reverted to its pre-excursion value -- interrupts
-     * remain untouched and unhandled by WP.  A timer that fired during the
-     * excursion is deferred by the timer-cb gate (plugin_spec_timer_dirty) and
-     * re-asserted by riscv_cpu_plugin_resync_timers at vtime_resume; it is not
-     * carried forward here (that force-carry perturbed interrupt-delivery
-     * timing across the merge, #77).
+     * Rollback with EXTERNAL REPLAY.  env->mip is architectural register
+     * state, so a speculative CSR write to sip/mip is reverted with everything
+     * else -- interrupts remain untouched and unhandled by the wrong path.
+     * But env->mip is also where the machine's interrupt controllers park
+     * their pending bits, and a device assertion that lands inside the
+     * excursion window is not speculative: rewinding it silently drops a real
+     * interrupt.  Only the TIMER bits had a recovery path (the exit reconcile
+     * re-derives them from the architected compare registers); the PLIC's
+     * SEIP/MEIP, the ACLINT software interrupt's MSIP/SSIP, SGEIP and LCOFIP
+     * had none, and were simply lost.
+     *
+     * riscv_cpu_update_mip separates the two cases at the source -- it logs
+     * the externally-caused delta and ignores the guest's own writes -- so the
+     * replay here is exact: revert everything, then re-apply the external
+     * delta.  Timer bits are excluded from that delta (the reconcile owns
+     * them; carrying them here as well perturbed interrupt-delivery timing
+     * across the merge, #77).
      */
-    memcpy(env, saved, size);
+    {
+        uint64_t replay_set = env->plugin_spec_mip_set;
+        uint64_t replay_clear = env->plugin_spec_mip_clear;
+
+        memcpy(env, saved, size);
+        env->mip = (env->mip | replay_set) & ~replay_clear;
+        env->plugin_spec_mip_set = 0;
+        env->plugin_spec_mip_clear = 0;
+    }
     /*
      * Timer resync is deferred to cpu_plugin_spec_vtime_resume (the true
      * excursion-exit boundary).  Running it here would fire at an intermediate
@@ -1471,63 +1473,31 @@ static void cst_clkprobe(bool resume)
 }
 #endif
 
-#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY) && defined(TARGET_I386)
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
 /*
- * Re-lock the guest TSC to QEMU_CLOCK_VIRTUAL after every wrong-path excursion.
- *
- * The guest TSC is derived from the host rdtsc (cpu_get_host_ticks) and the
- * guest HPET/LAPIC clock from host CLOCK_MONOTONIC (get_clock).  Those two host
- * oscillators do not keep a constant ratio across the excursion windows vs the
- * correct-path windows (TSC read jitter across host-core migration, P-state
- * effects), so however balanced the per-excursion freeze is, the guest TSC and
- * guest HPET diverge by a growing skew (measured ~38ns/excursion -> hundreds of
- * ms) and the guest's clocksource watchdog marks the TSC unstable, wedging
- * timekeeping/RCU (the x86 system-mode livelock).
- *
- * Fix: force guest_TSC == ref_tsc + tsc_hz * (guest_clock - ref_clock) at each
- * resume, so the two guest clocksources are locked by construction and cannot
- * skew — regardless of the host clocks' relationship.  tsc_hz is self-
- * calibrated once from the host rdtsc/monotonic ratio over the first stretch of
- * correct-path execution (both host clocks measured over the SAME real
- * intervals), then frozen so the lock slope never moves.  x86-only: other ISAs
- * read one guest clock family (arm CNTVCT, riscv time, mips Count) reconciled by
- * their per-target timer resync, so they have no two-clock split to lock.
+ * Instruction-counter position captured at wrong-path excursion entry and put
+ * back at exit, so the excursion consumes zero icount just as the tick freeze
+ * makes it consume zero wall-clock guest time.  Thread-local rather than
+ * per-CPU because the pause/resume pair always runs on the vCPU's own thread,
+ * and the pair is made non-reentrant by plugin_spec_vtime_paused.
  */
-static __thread int64_t g_pin_cp_tsc, g_pin_cp_ns;      /* CP calibration sums */
-static __thread int64_t g_pin_last_ht, g_pin_last_hm;   /* host tsc/mono @ resume */
-static __thread double  g_pin_tsc_hz;                   /* frozen once calibrated */
-static __thread int64_t g_pin_ref_tsc, g_pin_ref_clk;   /* lock reference point */
-static __thread bool    g_pin_ready;
+static __thread IcountFreeze g_spec_icount_freeze;
 
-static void cst_pin_note_pause(void)
+/*
+ * The per-target clock resynchronisation hook (TCGCPUOps::spec_clock_resync).
+ * Every guest-observable clock and every armed host QEMUTimer is reconciled
+ * to the FROZEN virtual time by the target, at the end of both plugin clock
+ * freezes.  The generic code owns the freeze/thaw and the ordering; the
+ * target owns the knowledge of what its clocks are.  See the hook's contract
+ * in include/accel/tcg/cpu-ops.h.
+ */
+static void cpu_plugin_clock_resync(CPUState *cpu, SpecClockResyncReason why)
 {
-    int64_t ht = cpu_get_host_ticks();
-    int64_t hm = get_clock();
-    if (g_pin_last_hm) {                 /* accumulate the correct-path interval */
-        g_pin_cp_tsc += ht - g_pin_last_ht;
-        g_pin_cp_ns  += hm - g_pin_last_hm;
-    }
-}
+    const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
 
-static void cst_pin_tsc_to_clock(void)
-{
-    if (!g_pin_ready) {
-        /* Calibrate over ~0.2s of correct-path host time, then freeze the
-         * ratio and anchor the lock at the current (still-unskewed) values. */
-        if (g_pin_cp_ns >= 200 * 1000 * 1000) {
-            g_pin_tsc_hz  = (double)g_pin_cp_tsc / (double)g_pin_cp_ns * 1e9;
-            g_pin_ref_tsc = cpu_get_ticks();
-            g_pin_ref_clk = cpu_get_clock();
-            g_pin_ready   = true;
-        }
-    } else {
-        int64_t target = g_pin_ref_tsc +
-            (int64_t)(g_pin_tsc_hz * (double)(cpu_get_clock() - g_pin_ref_clk)
-                      / 1e9);
-        cpu_plugin_pin_tsc(target);
+    if (tcg_ops && tcg_ops->spec_clock_resync) {
+        tcg_ops->spec_clock_resync(cpu, why);
     }
-    g_pin_last_ht = cpu_get_host_ticks();
-    g_pin_last_hm = get_clock();
 }
 #endif
 
@@ -1565,15 +1535,20 @@ void cpu_plugin_spec_vtime_pause(CPUState *cpu)
     }
 #ifdef CONFIG_PLUGIN
     cst_clkprobe(false);              /* #80: skew measurement (gated) */
-#if defined(TARGET_I386)
-    cst_pin_note_pause();             /* #80: accumulate correct-path calibration */
-#endif
     /* #77 test: keep the excursion flag + resync, but DON'T freeze the guest
      * virtual clock during WP (lets the stimer deadline still be reached in a
      * WP-saturated spin).  Distinguishes timer-freeze starvation from a leak. */
     if (!cst_nofreeze())
 #endif
-    cpu_disable_ticks();
+    {
+        cpu_disable_ticks();
+#ifdef CONFIG_PLUGIN
+        /* The other half of the freeze: under -icount the guest clock is
+         * driven by retired instructions, which cpu_disable_ticks() does not
+         * touch.  See icount_plugin_freeze(). */
+        icount_plugin_freeze(cpu, &g_spec_icount_freeze);
+#endif
+    }
     cpu->plugin_spec_vtime_paused = true;
 #ifdef CONFIG_PLUGIN
     if (wprot_ready()) {           /* #77: write-protect guest RAM for the WP */
@@ -1654,8 +1629,8 @@ void cpu_plugin_spec_vtime_resume(CPUState *cpu)
         && cpu->plugin_vclock_depth == 0  /* callback freeze still active */
         ) {
         cpu_enable_ticks();
-#if defined(CONFIG_PLUGIN) && defined(TARGET_I386)
-        cst_pin_tsc_to_clock();   /* #80: re-lock guest TSC to QEMU_CLOCK_VIRTUAL */
+#ifdef CONFIG_PLUGIN
+        icount_plugin_thaw(cpu, &g_spec_icount_freeze);
 #endif
     }
     cpu->plugin_spec_vtime_paused = false;
@@ -1669,25 +1644,26 @@ void cpu_plugin_spec_vtime_resume(CPUState *cpu)
     sdiff_compare(cpu);           /* #77: detect un-restored CPU-state leak */
 #endif
     /*
-     * Reconcile the host QEMUTimers with the restored registers HERE -- the true
+     * Resync every guest clock to the frozen virtual time HERE -- the true
      * excursion-exit boundary -- not inside cpu_plugin_arch_state_restore.  A
      * wrong-path fault-skip does an intermediate cpu_state_restore mid-excursion
      * (spec_mode_end -> restore -> spec_mode_begin) without resuming vtime; doing
-     * the resync at every restore would consume plugin_spec_timer_dirty there and
-     * synthesise a pending timer IRQ (e.g. riscv STIP) that the FINAL wp_end
+     * the resync at every restore would consume the deferred-expiry record there
+     * and synthesise a pending timer IRQ (e.g. riscv STIP) that the FINAL wp_end
      * restore then clobbers with the stale snapshot, losing the timer event and
-     * livelocking the guest (#77).  Deferring to vtime_resume lets the dirty flag
+     * livelocking the guest (#77).  Deferring to vtime_resume lets the deferral
      * survive intermediate restores so the resync runs once against the final
      * state, after ticks are re-enabled and with spec mode already ended.
+     *
+     * Unconditional and per-target: every registered target reconciles all of
+     * its clocks here, whether or not this particular excursion is known to
+     * have perturbed one.  The predecessor of this call was three unrelated
+     * per-ISA point patches behind an event-driven "dirty" gate, and every
+     * clock source no patch happened to cover -- or that desynced without
+     * setting the flag -- silently drifted.
      */
 #if defined(CONFIG_PLUGIN)
-#if defined(TARGET_RISCV)
-    riscv_cpu_plugin_resync_timers(cpu);
-#elif defined(TARGET_ARM)
-    arm_cpu_plugin_resync_timers(cpu);
-#elif defined(TARGET_MIPS)
-    mips_cpu_plugin_resync_timers(cpu);
-#endif
+    cpu_plugin_clock_resync(cpu, SPEC_CLOCK_EXCURSION_END);
 #ifdef CONFIG_PLUGIN
     /* #77 test: the WP-saturated vCPU starves the main loop's QEMU_CLOCK_VIRTUAL
      * timer processing, so the guest stimer never fires -> tick death.  Process
@@ -1760,8 +1736,15 @@ void cpu_plugin_vclock_resume(CPUState *cpu)
     }
     if (runstate_is_running()) {
         cpu_enable_ticks();
-#if defined(CONFIG_PLUGIN) && defined(TARGET_I386)
-        cst_pin_tsc_to_clock();   /* #80: re-lock guest TSC to the virtual clock */
+#if defined(CONFIG_PLUGIN)
+        /* A wrong-path excursion that ended while this instrumentation window
+         * was open left the tick re-enable (and so the icount restore) to us;
+         * no-op when it did not. */
+        icount_plugin_thaw(cpu, &g_spec_icount_freeze);
+        /* Same contract, cheaper case: no guest state moved, but a counter
+         * derived from a different host oscillator than the virtual clock
+         * still has to be re-pinned to the frozen time on every thaw. */
+        cpu_plugin_clock_resync(cpu, SPEC_CLOCK_THAW);
 #endif
     }
     if (need_bql) {

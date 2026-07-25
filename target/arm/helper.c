@@ -3203,26 +3203,46 @@ void arm_gt_hvtimer_cb(void *opaque)
 #ifdef CONFIG_PLUGIN
 /*
  * Re-synchronise the host generic-timer QEMUTimers with the architected timer
- * registers after a wrong-path (speculative) state restore.  See the
- * plugin_spec_timer_dirty comment in include/hw/core/cpu.h: the host timers
- * live outside the rolled-back register snapshot, so a spec-gated reprogram or
- * a host-timer callback that fired (and bailed) mid-walk can leave them out of
- * step with the restored cval/ctl — wedging the guest's timer subsystem.
+ * registers at the end of a wrong-path (speculative) excursion.  Part of the
+ * TCGCPUOps::spec_clock_resync contract; see arm_spec_clock_resync in cpu.c.
  *
- * gt_recalc_timer recomputes ISTATUS from the restored registers + current
- * (un-frozen) count and re-arms / re-fires each timer, so it is exactly the
- * reconciliation needed; it is idempotent on an already-consistent timer.
- * Called only after spec mode has ended, so its own spec gate is open.  It
- * drives the IRQ line, which requires the BQL.
+ * Arm's guest-observable time sources are the generic timers, and every one
+ * of them is a (ctl, cval) register pair inside CPUARMState shadowed by a
+ * host QEMUTimer outside it — plus the CNTVOFF_EL2 / CNTPOFF_EL2 offsets and
+ * CNTFRQ, also inside.  The wrong-path register restore rolls the registers
+ * back; the host timers do not follow.  Two ways that wedges the guest:
+ *
+ *   - the timer expired during the excursion's host wall-clock window and its
+ *     callback advanced ctl.ISTATUS to 1, which the restore then reverts; the
+ *     one-shot host timer has already fired and is left parked (at INT64_MAX
+ *     for a disabled/expired timer) and never fires again;
+ *   - a speculative write to CNTV_CVAL/CNTV_CTL (or to CNTVOFF) reprogrammed
+ *     the host timer for a deadline the correct path never asked for.
+ *
+ * Either way the guest's clockevent stops arriving: the aarch64 system-mode
+ * storm.  gt_recalc_timer recomputes ISTATUS from the restored registers plus
+ * the current (thawed, and therefore frozen-time-consistent) count and
+ * re-arms or re-fires the host timer, so it is exactly the reconciliation the
+ * contract asks for, for every source at once.
+ *
+ * Run over every present timer UNCONDITIONALLY.  This used to be gated on
+ * plugin_spec_timer_dirty, i.e. on having observed one of the two mechanisms
+ * above; anything that desynced a timer without tripping that flag — a
+ * rolled-back CNTVOFF, an expiry racing excursion entry before the gates are
+ * visible to the iothread, a timer reprogrammed from a path with no spec gate
+ * — was silently missed.  gt_recalc_timer is idempotent on an already
+ * consistent timer, so the only cost of dropping the gate is the recompute
+ * itself; correctness no longer depends on having enumerated every way a
+ * timer can drift.
+ *
+ * Called after spec mode has ended, so gt_recalc_timer's own spec gate is
+ * open, and with the BQL held (it drives the timer IRQ line).
  */
 void arm_cpu_plugin_resync_timers(CPUState *cs)
 {
     ARMCPU *cpu = ARM_CPU(cs);
     bool held;
 
-    if (likely(!cs->plugin_spec_timer_dirty)) {
-        return;
-    }
     cs->plugin_spec_timer_dirty = false;
 
     held = bql_locked();

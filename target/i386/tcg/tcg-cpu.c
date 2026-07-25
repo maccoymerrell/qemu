@@ -23,6 +23,10 @@
 #include "qemu/accel.h"
 #include "accel/accel-cpu-target.h"
 #include "exec/translation-block.h"
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+#include "qemu/timer.h"
+#include "system/cpu-timers.h"
+#endif
 
 #include "tcg-cpu.h"
 
@@ -178,6 +182,87 @@ static bool x86_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
     unsigned va_bits = (env->cr[4] & CR4_LA57_MASK) ? 57 : 48;
     return vaddr >= (~(uint64_t)0 << (va_bits - 1));
 }
+
+/*
+ * TCGCPUOps::spec_clock_resync for x86 — see the contract in
+ * include/accel/tcg/cpu-ops.h.
+ *
+ * x86's audit of guest-observable time sources:
+ *
+ *   TSC (and TSC_AUX/rdtscp)   derived from the HOST rdtsc via
+ *                              cpu_get_ticks(); needs the pin below.
+ *   LAPIC timer, TSC-deadline  QEMUTimers armed off QEMU_CLOCK_VIRTUAL
+ *   HPET, PIT (i8254), RTC     (hw/intc/apic.c, hw/timer/).
+ *
+ * Only the first is a problem.  Everything in the second group is armed
+ * directly from QEMU_CLOCK_VIRTUAL, which the freeze stops and the thaw
+ * resumes at the same value: a deadline expressed in frozen-clock ns is
+ * still the same deadline afterwards, so those timers need no re-arm.  None
+ * of them lives in CPUX86State either, so the wrong-path register restore
+ * cannot roll one back — x86 has no architectural compare register shadowing
+ * a host timer the way Arm's CNTV_CVAL, RISC-V's stimecmp and MIPS's
+ * CP0_Compare do.  (A speculative MSR write to IA32_TSC_DEADLINE reaches
+ * apic_handle_tsc_deadline, but wrong-path device access is sandboxed, so it
+ * never reaches the APIC model.)
+ *
+ * The TSC is the exception, and the reason this hook must also run on the
+ * plain thaw and not just at excursion exit.  The guest TSC comes from the
+ * host rdtsc (cpu_get_host_ticks) while the guest HPET/LAPIC clock comes
+ * from host CLOCK_MONOTONIC (get_clock).  Those two host oscillators do not
+ * keep a constant ratio across frozen windows versus running ones (TSC read
+ * jitter, P-state effects), so however exactly balanced the freeze is, the
+ * two GUEST clocksources diverge by a growing skew — measured ~38 ns per
+ * excursion, accumulating to hundreds of ms — until the guest's
+ * clocksource watchdog marks the TSC unstable and wedges timekeeping and
+ * RCU.  That is the x86 system-mode livelock.
+ *
+ * Resync per the contract's first clause: re-derive the architectural
+ * counter FROM the frozen virtual clock rather than letting it free-run off
+ * its own host source.  Forcing
+ *
+ *     guest_TSC := ref_tsc + tsc_hz * (guest_clock - ref_clock)
+ *
+ * at every thaw locks the two guest clocksources together by construction,
+ * whatever the host clocks do.  tsc_hz is the host TSC frequency, self-
+ * calibrated from the host rdtsc/monotonic ratio over the first ~0.2 s of
+ * emulation (both host clocks sampled over the same real intervals, so the
+ * ratio is the hardware property and freezes in the interval do not bias
+ * it), then frozen so the lock slope never moves afterwards.
+ */
+static __thread int64_t g_pin_last_ht, g_pin_last_hm;  /* previous host sample */
+static __thread int64_t g_pin_cal_tsc, g_pin_cal_ns;   /* calibration sums */
+static __thread double  g_pin_tsc_hz;                  /* frozen once ready */
+static __thread int64_t g_pin_ref_tsc, g_pin_ref_clk;  /* lock reference point */
+static __thread bool    g_pin_ready;
+
+static void x86_spec_clock_resync(CPUState *cs, SpecClockResyncReason reason)
+{
+    int64_t ht = cpu_get_host_ticks();
+    int64_t hm = get_clock();
+
+    if (g_pin_ready) {
+        int64_t target = g_pin_ref_tsc +
+            (int64_t)(g_pin_tsc_hz * (double)(cpu_get_clock() - g_pin_ref_clk)
+                      / 1e9);
+        cpu_plugin_pin_tsc(target);
+    } else {
+        if (g_pin_last_hm) {
+            g_pin_cal_tsc += ht - g_pin_last_ht;
+            g_pin_cal_ns  += hm - g_pin_last_hm;
+        }
+        if (g_pin_cal_ns >= 200 * 1000 * 1000) {
+            /* Freeze the ratio and anchor the lock at the current (still
+             * unskewed) values; from here the TSC is a pure function of the
+             * virtual clock. */
+            g_pin_tsc_hz  = (double)g_pin_cal_tsc / (double)g_pin_cal_ns * 1e9;
+            g_pin_ref_tsc = cpu_get_ticks();
+            g_pin_ref_clk = cpu_get_clock();
+            g_pin_ready   = true;
+        }
+    }
+    g_pin_last_ht = ht;
+    g_pin_last_hm = hm;
+}
 #endif
 
 static const TCGCPUOps x86_tcg_ops = {
@@ -191,6 +276,7 @@ static const TCGCPUOps x86_tcg_ops = {
     .get_plugin_state = x86_get_plugin_state,
     .get_plugin_thread_ptr = x86_get_plugin_thread_ptr,
     .vaddr_is_kernel = x86_vaddr_is_kernel,
+    .spec_clock_resync = x86_spec_clock_resync,
 #endif
 #ifdef CONFIG_USER_ONLY
     .fake_user_interrupt = x86_cpu_do_interrupt,

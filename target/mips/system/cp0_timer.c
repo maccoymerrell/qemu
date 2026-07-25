@@ -100,15 +100,14 @@ void mips_cpu_plugin_resync_timers(CPUState *cs)
     /* Reconcile the interrupt line from restored CP0_Cause first: an
      * excursion (or its fault-skip gap) can suppress a line update while
      * the register snapshot is live, leaving the line stuck relative to
-     * the restored IP bits (#77).  Idempotent; independent of the timer. */
-    if (cs->plugin_spec_irq_dirty) {
-        cs->plugin_spec_irq_dirty = false;
-        cpu_mips_plugin_reconcile_irq(env);
-    }
+     * the restored IP bits (#77).  Idempotent; independent of the timer.
+     * Unconditional, like the timer reconcile below: the previous gate
+     * (plugin_spec_irq_dirty) only fired when a line drive had actually been
+     * observed and suppressed, missing every desync the rollback produced on
+     * its own. */
+    cs->plugin_spec_irq_dirty = false;
+    cpu_mips_plugin_reconcile_irq(env);
 
-    if (likely(!cs->plugin_spec_timer_dirty)) {
-        return;
-    }
     cs->plugin_spec_timer_dirty = false;
     expired = env->plugin_spec_timer_expired;
     env->plugin_spec_timer_expired = false;

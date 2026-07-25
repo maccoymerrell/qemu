@@ -197,7 +197,9 @@ load-bearing:
 * **Field-state cache indexed by ``template_id``.**  A flat vector
   keyed by the dense ``template_id`` replaces a per-entry glib hash
   lookup; the hash lookup measures ~10 % on mcf.
-* **``field_id`` to slot via a 1024-entry LUT.**  The LUT replaces an
+* **``field_id`` to slot via an 8192-entry LUT.**  Power-of-two sized
+  to cover the whole well-known FID space at the 512-slot ceiling
+  (the largest slotted field-id is ~7180); the LUT replaces an
   eight-branch chain that measures ~2.6 % at ~80 M calls.
 * **``template_static`` skip.**  Instruction-encoding families
   (opcode, branch type, insn bytes, flags, immediate, size) equal

@@ -276,7 +276,7 @@ Coverage enforcement
 
 Every plugin option, wire record, offline-tool invocation, and
 cross-cutting behaviour the tracer supports is registered in a
-feature table (76 ids, spanning the ``opt:*`` / ``wire:*`` /
+feature table (77 ids, spanning the ``opt:*`` / ``wire:*`` /
 ``tool:*`` / ``behavior:*`` namespaces) and mapped to the
 check id(s) that exercise it.  ``full`` fails — independent of
 whether any check itself failed — if a registered feature has **zero**
@@ -327,12 +327,12 @@ checks and a byte-for-byte golden regression net:
    path rather than its own per-check directory) — byte-for-byte
    wire and ``cst_visualize`` SVG regression.
 
-**system** — 5 checks.  ``system.churn_x86``, ``system.churn_mipsel``,
+**system** — 6 checks.  ``system.churn_x86``, ``system.churn_mipsel``,
 and ``system.thread_x86`` literally invoke the ``churn_test`` /
 ``thread_test`` sub-commands documented above under fixed arguments;
 cross-reference those sections for what they assert.
-``system.user_x86`` and ``system.smc_x86`` add coverage no other
-sub-command exposes:
+``system.user_x86``, ``system.smc_x86``, and ``system.attach_mipsel``
+add coverage no other sub-command exposes:
 
 ``system.user_x86``
    ``all --system --marker --coverage --regdata`` under ``-cpu max``
@@ -349,6 +349,15 @@ sub-command exposes:
    Self-modifying code mints revisions under the marker window /
    pinned ASID (x86 system boot), across a shape-changing rewrite
    (2 instructions re-emitted as 3 at one ``start_pc``).
+``system.attach_mipsel``
+   ``all --system --attach`` on mipsel — the ptrace-injected marker
+   (:program:`cst_attach`'s ``PTRACE_PEEKUSER``/``POKEUSER`` backend)
+   opens the window for a workload with no compiled-in marker; a run
+   that produces a trace at all is the check, since only the
+   injection can have opened it.  The only standing gate that reaches
+   the peek/poke backend — the other three ISAs' fixed-width
+   ``PTRACE_GETREGSET`` backends are exercised by ``--attach`` runs
+   outside the gated battery.
 
 **multiproc** — 3 checks.  Genuinely new coverage, folded in from
 :mod:`_multiproc` (three multi-ASID harnesses that used to live

@@ -143,9 +143,23 @@ void append_byte_hex(std::string *out, uint8_t b)
     out->push_back(kHexDigits[b & 0xF]);
 }
 
+/* Pad @out with spaces up to column @target for the common case.  When
+ * @out has *already reached or passed* @target -- e.g. a >7-byte x86
+ * instruction overflowing BYTES_COL_PAD, or a long Capstone operand
+ * string overflowing OBJDUMP_COL_WIDTH -- still emit exactly one space
+ * so the next column never runs directly into this one with zero
+ * separation.  Without this, a 10..15-byte x86 instruction (raw bytes
+ * sized only for the <=7-byte common case) glued straight into the
+ * following mnemonic: "...ff 7fmovabsq", which a naive
+ * `(?:[0-9a-f]{2}\s)+` byte-column parser then silently truncates by
+ * one byte. */
 void append_pad_to(std::string *out, size_t target)
 {
-    while (out->size() < target) out->push_back(' ');
+    if (out->size() < target) {
+        out->append(target - out->size(), ' ');
+    } else {
+        out->push_back(' ');
+    }
 }
 
 /* Append a lane-mask as "{0..3,6}" (set bits coalesced into ranges).
@@ -523,6 +537,17 @@ void append_mnem(std::string *out, const DisasmContext &ctx, uint64_t op)
 /* --- §8.a Per-column emitters ------------------------------------- */
 
 constexpr int PC_COL_WIDTH       = 12;     /* hex digits */
+/* BYTES_COL_BYTES sizes the *common* case only, not the true maximum:
+ * aarch64/mipsel are fixed 4 bytes, riscv is 2 or 4, and x86 usually
+ * decodes in 1-7 bytes.  x86 can still legally reach
+ * cst::MAX_INSN_BYTES (16; the wire format's per-insn ceiling --
+ * architecturally x86 tops out at 15) via REX + multi-byte opcode +
+ * ModRM/SIB + disp32 + imm32, or a movabs-class instruction (10
+ * bytes).  Padding every line out to that true max would make the
+ * overwhelmingly common short-instruction case ugly, so the column
+ * stays sized for the common case and append_pad_to() guarantees a
+ * single separating space instead of silently running the overflow
+ * into the next column. */
 constexpr int BYTES_COL_BYTES    = 7;      /* objdump-style */
 constexpr int BYTES_COL_PAD      = BYTES_COL_BYTES * 3 + 4;
 constexpr int OBJDUMP_COL_WIDTH  = 40;

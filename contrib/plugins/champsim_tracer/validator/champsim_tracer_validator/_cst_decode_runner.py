@@ -81,27 +81,12 @@ BRANCH_NAMES = {
     6: "REP", 7: "DIRECT_CALL", 8: "INDIRECT_CALL",
 }
 
-# Field IDs mirror champsim_tracer.h.
-FID_SLOT_COUNT       = 16
-FID_N_LOADS          = 0x00
-FID_LOAD_ADDR_BASE   = 0x01
-FID_STORE_ADDR_BASE  = 0x11
-FID_LOAD_DATA_BASE   = 0x21
-FID_STORE_DATA_BASE  = 0x31
-FID_DST_REG_BASE     = 0x51
-FID_N_STORES         = 0x61
-FID_EXTRA_LOAD_ADDR  = 0x62
-FID_EXTRA_STORE_ADDR = 0x63
-FID_EXTRA_LOAD_DATA  = 0x64
-FID_EXTRA_STORE_DATA = 0x65
-FID_INSN_BYTES_LO    = 0x70
-FID_INSN_BYTES_HI    = 0x71
-FID_INSN_OPCODE      = 0x72
-FID_INSN_BRANCH_TYPE = 0x73
-FID_INSN_FLAGS       = 0x74
-FID_INSN_IMMEDIATE   = 0x75
-FID_INSN_SIZE        = 0x76
-FID_EXTENDED         = 0xFF
+# No field-ID table lives here.  This module reads the textual output of
+# `cst_decode --format=legacy`, which has already resolved every field by
+# NAME through the trace's own field_id encoding map; a numeric mirror of
+# champsim_tracer.h would be a second, silently-diverging source of truth.
+# (One used to sit here, still describing a 16-slot layout with EXTRA_*
+# overflow escapes that the format has not had for a long time.)
 
 
 def build_reg_names() -> dict[int, str]:

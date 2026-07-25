@@ -72,6 +72,21 @@ inline constexpr int     MAX_INSN_BYTES       = cst_wire::INSN_BYTES_MAX;
  * fixed per-header table, not a per-entry or per-template structure. */
 using FidSlotArray = std::array<uint16_t, FID_SLOT_COUNT>;
 
+/* Span of every reverse index the tools build over the field-id space
+ * (fid -> state cell, fid -> audit bucket, fid -> lint slot).  A fid at
+ * or above this is treated as unknown, so the span MUST cover the whole
+ * well-known field-id space or records silently fall out of the tools'
+ * accounting.  That space is 3 hot singletons + 14 slotted families x
+ * FID_SLOT_COUNT + 9 cold singletons, plus the reserved EXTENDED
+ * escape; rounded up to a power of two for a single-load lookup.  ONE
+ * definition, shared by every tool, so raising the slot ceiling can
+ * never leave one index behind. */
+inline constexpr size_t FID_SPACE_SIZE = 3 + 14 * (size_t)FID_SLOT_COUNT + 10;
+inline constexpr size_t FID_LUT_SIZE   =
+    FID_SPACE_SIZE <= 1024 ? 1024 : (FID_SPACE_SIZE <= 8192 ? 8192 : 65536);
+static_assert(FID_LUT_SIZE > FID_SPACE_SIZE,
+              "fid LUT must span the whole well-known field-id space");
+
 /* ===== Resolved IDs =====
  *
  * parse_header reverse-resolves the well-known names in the trace's

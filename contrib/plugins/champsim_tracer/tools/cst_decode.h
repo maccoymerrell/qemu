@@ -59,13 +59,8 @@ namespace cst {
 inline constexpr size_t  FIELD_STATE_SLOT_COUNT   =
     3 + 14 * FID_SLOT_COUNT + 9;
 inline constexpr uint16_t FIELD_STATE_SLOT_INVALID = 0xFFFFu;
-/* Reverse index over the wire's ULEB-encoded field-id space: a fid at or
- * above this is treated as unknown and its record skipped.  It must
- * therefore cover the WHOLE well-known fid space, which the writer sizes
- * from FID_SLOT_COUNT (the top of the branch block sits just past
- * 14 * FID_SLOT_COUNT).  Rounded to a power of two for a single-load
- * lookup; at 512 slots the highest well-known fid is ~7180. */
-inline constexpr size_t  FID_LUT_SIZE             = 8192;
+/* FID_LUT_SIZE (the reverse index's span over the field-id space) is
+ * defined once in cst_common.h and shared by every tool. */
 static_assert(FID_LUT_SIZE > FIELD_STATE_SLOT_COUNT,
               "fid LUT must span the whole well-known field-id space");
 static_assert(FIELD_STATE_SLOT_COUNT < FIELD_STATE_SLOT_INVALID,

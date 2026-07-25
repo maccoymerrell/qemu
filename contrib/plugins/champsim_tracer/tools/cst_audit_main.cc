@@ -49,7 +49,9 @@ enum : int {
 /* FID -> bucket lookup over the ULEB FID space.  Slotted families
  * come from ResolvedIds' name-resolved per-slot arrays (no stride). */
 struct FidTables {
-    static constexpr size_t LUT_SIZE = 1024;
+    /* cst_common.h owns the one definition, sized from the wire's slot
+     * ceiling, so this index can never fall behind it. */
+    static constexpr size_t LUT_SIZE = cst::FID_LUT_SIZE;
     std::array<uint8_t, LUT_SIZE> bucket{};
     /* For FIDs in the dst-register-value family, the per-instruction
      * destination slot index this FID names (so a field-delta record
@@ -69,7 +71,7 @@ struct FidTables {
         if (ids.fid_metaflags < LUT_SIZE) bucket[ids.fid_metaflags] = BIDX_INSN_META;
 
         const struct {
-            const std::array<uint16_t, cst::FID_SLOT_COUNT> *fids;
+            const cst::FidSlotArray *fids;
             uint8_t bucket_id;
         } fam[11] = {
             { &ids.fid_load_addr,             (uint8_t)BIDX_LOAD_ADDR  },

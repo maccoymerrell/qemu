@@ -96,8 +96,10 @@ public:
      * slot count (clamped; real insns stay <= 64). */
     static constexpr uint8_t MEM_IMPOSSIBLE = 0x80;
     static constexpr uint8_t N_DST_MASK     = 0x7F;
-    /* fid lookup span; ULEB fid space, same bound the other tools use. */
-    static constexpr size_t  FID_LUT = 1024;
+    /* fid lookup span; ULEB fid space, same bound the other tools use
+     * (cst_common.h owns the one definition, sized from the wire's slot
+     * ceiling, so this index can never fall behind it). */
+    static constexpr size_t  FID_LUT = cst::FID_LUT_SIZE;
 
     AttributionLint(const Header &h, const std::vector<Template> &templates)
         : reg_enabled_(h.has_reg_data()),

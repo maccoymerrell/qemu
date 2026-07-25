@@ -132,6 +132,7 @@ FEATURES: dict[str, str] = {
     "behavior:marker_injection": "cst_attach ptrace-injects the marker into an unmarked target's entry point",
     "behavior:guest_thread_identity": "thread_id is guest thread, not vCPU",
     "behavior:asid_recycle":     "narrow-ASID recycle-no-cross-attribution",
+    "behavior:spec_clock_resync": "wrong-path excursions are time-transparent: every guest clock, host timer and interrupt line is resynchronised to the frozen virtual time on exit, so the guest keeps taking interrupts and making user-space progress (4-ISA, system mode)",
     "behavior:whole_system_capture": "trace-all captures an unmarked peer",
     "behavior:dead_latch":       "dead-latch ages a killed peer's window out",
     "behavior:cross_segment_consistency": "per-simpoint template shape consistency",
@@ -493,6 +494,60 @@ def _chk_attach(isa: str):
              "--system", "--attach", "--stop", "200000"],
             timeout=900, log_path=d / "run.log")
         return _cli_outcome(rc, tail, 900)
+    return fn
+
+
+def _chk_clock_progress(isa: str):
+    """Guest-clock progress under wrong-path speculation, on every ISA.
+
+    A wrong-path excursion freezes the guest virtual clock; on exit every
+    clock source has to be resynchronised TO that frozen time
+    (TCGCPUOps::spec_clock_resync).  A source that is missed -- a host timer
+    left parked, an interrupt line left disagreeing with its pending
+    register, an externally-asserted interrupt swallowed by the register
+    rollback -- makes the guest stop taking interrupts.  It does not crash:
+    it spins in the kernel, the tracer records the spin faithfully, and every
+    structural oracle still passes.  The symptom is purely in the accounting,
+    which is what this check reads -- the window closes UNDER budget, the
+    traced/user instruction ratio explodes, and the user clock stops
+    advancing in wall time (_system.assess_clock_progress and
+    run_with_clock_watchdog, both wired into the system trace path).
+
+    Runs on all four ISAs deliberately.  The class has been fixed three times
+    as per-ISA point patches and recurred each time, and the reason the suite
+    stayed green through a 19% aarch64 stall rate is that the system tier
+    only ever booted x86_64 and mipsel -- aarch64 and riscv64 had no
+    system-mode check at all.  The window is large enough that the guest
+    takes thousands of timer interrupts inside it, so a dead clock cannot
+    hide; the deep wrong-path budget is what makes excursions frequent enough
+    to expose a per-excursion leak.
+
+    Built on the churn guest rather than the plain marker boot because the
+    failure needs the guest to be USING its clock: a stream of short-lived
+    processes keeps the scheduler, the tick and the interrupt controller busy
+    for the whole window, so a timer left parked or a line left stuck has
+    something to break.  The churn body is ISA-generic (a busybox shell
+    loop).
+
+    Run with the full system-mode option set -- devio, interrupts, faults,
+    kexc, physaddr -- rather than the trace-shape defaults.  Those are the
+    options a real system-mode capture uses, and they are the ones that put
+    the wrong path in contact with the machine's clocks: devio sandboxes
+    speculative device access, and interrupts/kexc keep the excursion
+    machinery interleaved with interrupt entry.  A gate for a clock bug has
+    to run the configuration in which the clocks are actually touched."""
+    def fn(ctx: Ctx) -> Outcome:
+        d = ctx.dir(f"system_clock_{isa}")
+        rc, tail = _run_cli(
+            ["churn_test", "--isa", isa, "--seed", _seedhex(ctx),
+             "--build-dir", str(ctx.build_dir), "-o", str(d),
+             "--depth", "64", "--stop", "400000", "--hot-iters", "4000",
+             "--sleep-probe", "25", "--churn-pre", "60",
+             "--churn-during", "220"],
+            timeout=1200, log_path=d / "run.log",
+            extra_env={"CST_PLUGIN_EXTRA_ARGS":
+                       "physaddr=1,devio=1,interrupts=1,faults=1,kexc=1"})
+        return _cli_outcome(rc, tail, 1200)
     return fn
 
 
@@ -1016,6 +1071,12 @@ def build_checks() -> list:
                    "self-modifying code mints revisions under the marker "
                    "window / pinned ASID (x86 system boot)",
                    ["behavior:smc_revisions"], _chk_smc_system))
+    for _isa in ISA_ALL:
+        C.append(Check(f"system.clock_progress_{_isa}", "system",
+                       f"guest clock keeps advancing across wrong-path "
+                       f"excursions ({_isa} system boot)",
+                       ["behavior:spec_clock_resync", "opt:window_marker"],
+                       _chk_clock_progress(_isa)))
 
     C.append(Check("multiproc.trace_all_x86", "multiproc",
                    "trace-all vs latch differential (x86)",

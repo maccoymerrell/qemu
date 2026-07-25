@@ -36,7 +36,9 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 # Default local harness (override with --kernel / --rootfs).  The base root
@@ -112,6 +114,140 @@ def parse_finished_segments(console_text: str) -> list[dict]:
             "flag": m.group(9),
         })
     return out
+
+
+# --------------------------------------------------------------------------
+# Guest-clock progress gate
+#
+# A system-mode guest whose clock stops advancing during wrong-path
+# (speculative) excursions stops taking timer interrupts and spins in the
+# kernel.  Nothing crashes: the tracer faithfully records the spin loop, the
+# trace is well-formed, and every structural oracle passes.  The only visible
+# signature is in the ACCOUNTING -- the window fails to reach its budget, and
+# the ratio of traced architectural instructions to covered user instructions
+# explodes, because the kernel spin is charged to the trace while the user
+# clock stands still.
+#
+# Measured on the mcf system-mode marker cell (5M user-insn window, wpdepth
+# 64), 72 healthy cells against 5 stalled ones:
+#
+#              healthy arch/user      stalled arch/user
+#   aarch64      1.15 -  2.23           67.6 - 645.0
+#   riscv64      1.31 -  3.11
+#   x86_64       1.50 -  8.43
+#
+# so a bound of 20 sits a factor of 2.4 clear of the worst healthy run and a
+# factor of 3.4 below the mildest stall.  Kept uniform across ISAs rather than
+# tuned per ISA: the separation is orders of magnitude wide, and one number
+# cannot rot into a per-ISA exemption.
+# --------------------------------------------------------------------------
+
+CLOCK_INFLATION_MAX = 20.0
+
+# Wall-clock seconds the guest may go without the user-instruction clock
+# advancing before the run is declared stalled.  The plugin prints a progress
+# line every 10% of the window; a healthy cell emits one every few seconds, a
+# stalled one never emits another.
+CLOCK_STALL_TIMEOUT_S = 180
+
+_PROGRESS_RE = re.compile(r"champsim_tracer: progress (\d+)/(\d+) user insns")
+_SEG_START_RE = re.compile(r"champsim_tracer: starting segment ")
+
+
+def parse_user_clock_progress(console_text: str) -> int | None:
+    """The most recent user-instruction count the plugin reported, or None
+    when the trace window has not opened yet.  This is the guest's user
+    clock: the quantity that stops moving when the guest stops taking
+    interrupts."""
+    if not _SEG_START_RE.search(console_text):
+        return None
+    last = None
+    for m in _PROGRESS_RE.finditer(console_text):
+        last = int(m.group(1))
+    return last if last is not None else 0
+
+
+def assess_clock_progress(segments: list[dict], label: str = "") -> list[str]:
+    """The accounting half of the guest-clock progress gate: one message per
+    way @segments show a guest whose clock stopped.  Empty list means clean.
+
+    Two legs live here; the third, a live no-progress watchdog, has to run
+    alongside the guest (see run_with_clock_watchdog).  All three are symptom
+    detectors, deliberately: they know nothing about timers or interrupt
+    lines, so they cannot be defeated by a new clock source nobody thought to
+    reconcile."""
+    if not segments:
+        return [f"{label}: no 'finished segment' line "
+                f"(the plugin never closed a window)"]
+    bad = []
+    for s in segments:
+        if s["flag"] == "UNDER":
+            bad.append(f"{label}: window closed UNDER budget "
+                       f"(covered={s['covered']} budget={s['budget']}) -- "
+                       f"the guest stopped making user-space progress")
+        cov, arch = s["covered"], s["trace_arch_insns"]
+        if cov > 0 and arch / cov > CLOCK_INFLATION_MAX:
+            bad.append(
+                f"{label}: traced/user instruction ratio {arch / cov:.1f} "
+                f"exceeds {CLOCK_INFLATION_MAX:.0f} "
+                f"(trace_arch_insns={arch} covered={cov}) -- the guest is "
+                f"spinning in the kernel while its user clock stands still")
+    return bad
+
+
+def run_with_clock_watchdog(cmd: list[str], log_path,
+                            stall_timeout_s: int = CLOCK_STALL_TIMEOUT_S,
+                            poll_s: float = 5.0) -> tuple[int, str]:
+    """Run a system-mode qemu @cmd with console + plugin stderr to
+    @log_path, watching the guest's user-instruction clock while it runs.
+
+    The third leg of the guest-clock progress gate.  A guest that has stopped
+    taking interrupts still runs -- it spins in the kernel -- so it neither
+    exits nor trips a normal timeout for as long as the harness is willing to
+    wait; the segment-accounting legs only fire once it finally gives up.
+    Watching the user clock instead detects the stall while it is happening
+    and bounds the check's runtime: if no progress line advances for
+    @stall_timeout_s of wall time after the window opens, the guest is killed
+    and the run reported as stalled.
+
+    Returns (rc, stall_reason); stall_reason is "" when the watchdog did not
+    fire.  The process group is killed so a qemu that ignores SIGTERM in the
+    TCG loop still dies."""
+    with open(log_path, "w") as f:
+        p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+        last_progress, last_change = None, time.monotonic()
+        try:
+            while True:
+                try:
+                    return p.wait(timeout=poll_s), ""
+                except subprocess.TimeoutExpired:
+                    pass
+                try:
+                    now = parse_user_clock_progress(
+                        Path(log_path).read_text(errors="replace"))
+                except OSError:
+                    continue
+                if now is None:        # window not open yet; not our business
+                    last_change = time.monotonic()
+                    continue
+                if now != last_progress:
+                    last_progress, last_change = now, time.monotonic()
+                    continue
+                idle = time.monotonic() - last_change
+                if idle >= stall_timeout_s:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                    p.wait()
+                    return 1, (f"user clock frozen at {now} user insns for "
+                               f"{idle:.0f}s of wall time -- the guest has "
+                               f"stopped making progress")
+        finally:
+            if p.poll() is None:
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except OSError:
+                    pass
+                p.wait()
 
 
 _PIN_REUSE_RE = re.compile(r"pin ASID reuse suspected\s+(\d+)")

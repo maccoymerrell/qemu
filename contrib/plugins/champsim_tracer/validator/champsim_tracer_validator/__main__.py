@@ -317,10 +317,12 @@ def _parse_args() -> argparse.Namespace:
              "audit/strict-lint stay clean.")
     common(ct)
     ct.add_argument("--seed", type=_parse_seed, required=True)
-    ct.add_argument("--isa", choices=("x86_64", "mipsel"), action="append",
+    ct.add_argument("--isa", choices=ISA_CHOICES, action="append",
                     required=True,
                     help="mipsel (8-bit ASIDs; churn forces a generation "
-                         "rollover) and/or x86_64.")
+                         "rollover), x86_64, aarch64 or riscv64.  The test "
+                         "body is ISA-generic; the guest-side churn is a "
+                         "busybox shell loop.")
     ct.add_argument("--build-dir", type=Path, required=True)
     ct.add_argument("--diamonds", type=int, default=8)
     ct.add_argument("--side-len-min", type=int, default=2)
@@ -528,10 +530,23 @@ def _trace_system(args, isa: str, bin_path: Path, plugin: Path,
                               mem=getattr(args, "sys_mem", "512M"), isa=isa,
                               smp=getattr(args, "smp", 1))
     print(f"trace[{isa}] (system): {' '.join(cmd)}")
-    rc = _run_and_log(cmd, Path(f"{out_base}.console.log"))
+    console = Path(f"{out_base}.console.log")
+    # Third leg of the guest-clock progress gate: watch the user-instruction
+    # clock while the guest runs.  A guest that has stopped taking interrupts
+    # keeps executing (it spins in the kernel), so it never exits on its own;
+    # without this the run only ends when some outer timeout fires.
+    rc, stall = SYS.run_with_clock_watchdog(cmd, console)
+    if stall:
+        print(f"trace[{isa}]: FAIL  clock stall: {stall}")
+        return 1
     cst = Path(f"{out_base}.cst")
     if rc != 0 or not cst.is_file():
         print(f"trace[{isa}]: FAIL rc={rc}")
+        try:
+            for line in console.read_text().splitlines()[-15:]:
+                print(f"  {line}")
+        except OSError:
+            pass
         return rc or 1
     print(f"trace[{isa}]: wrote {cst.name}")
     return 0
@@ -576,9 +591,10 @@ def _check_segment_coverage(console_log: Path, require_ok: bool = False,
         return 1
     rc = 0
     for s in segs:
+        ratio = (s["trace_arch_insns"] / s["covered"]) if s["covered"] else 0.0
         line = (f"coverage[{label}]: covered={s['covered']} "
                 f"budget={s['budget']} flag={s['flag']} "
-                f"(user_clock={s['user_clock']})")
+                f"arch/user={ratio:.2f} (user_clock={s['user_clock']})")
         if s["flag"] == "UNDER":
             print(f"{line}  FAIL (window closed under budget)")
             rc = 1
@@ -588,6 +604,14 @@ def _check_segment_coverage(console_log: Path, require_ok: bool = False,
             rc = 1
         else:
             print(f"{line}  ok")
+    # Guest-clock progress gate.  A guest that stops taking interrupts spins
+    # in the kernel: the window closes UNDER and the traced/user instruction
+    # ratio explodes.  The UNDER leg overlaps the check above; the ratio leg
+    # also catches the milder form where the window still closes but the
+    # guest spent nearly all of it in a kernel spin.
+    for msg in SYS.assess_clock_progress(segs, label=label):
+        print(f"clock: {msg}  FAIL")
+        rc = 1
     return rc
 
 

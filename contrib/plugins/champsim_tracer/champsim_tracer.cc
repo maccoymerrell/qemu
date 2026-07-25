@@ -6743,19 +6743,13 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     g_wp_prune           = cfg.wp_prune;
     enable_wrong_path    = cfg.enable_wp;
     /*
-     * Wrong-path speculation freezes the guest virtual clock for the excursion
-     * via cpu_disable_ticks (host wall-clock).  Under -icount the virtual clock
-     * is driven by the instruction count, which that freeze does NOT stop, so a
-     * speculative excursion's instructions leak into guest time.  WP still runs
-     * under icount (the trace is still valid); warn once that guest timing may
-     * be perturbed.
+     * A wrong-path excursion is transparent to guest time under -icount as
+     * well as without it: the excursion freezes the wall-clock source
+     * (cpu_disable_ticks) and checkpoints the instruction counter
+     * (icount_plugin_freeze), so speculation consumes neither.  Nothing to
+     * warn about — the guest sees the same tick count with wrong-path
+     * speculation on as with it off.
      */
-    if (enable_wrong_path && qemu_plugin_icount_enabled()) {
-        fprintf(stderr, "champsim_tracer: warning: -icount is active; "
-                "wrong-path speculation advances guest instruction-count time "
-                "(the vtime freeze only covers wall-clock). Trace is valid but "
-                "guest timing may be perturbed.\n");
-    }
     g_devio_enabled          = cfg.devio != 0;
     g_features.mem_data      = cfg.enable_mem_data;
     g_features.reg_data      = cfg.enable_reg_data;

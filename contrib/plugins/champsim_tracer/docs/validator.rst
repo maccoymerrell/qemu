@@ -384,7 +384,9 @@ outside the repo as standalone scripts):
    segment independence and cross-segment consistency.
 ``features.branch_verify``
    ``cst_decode --verify-branch`` direction/target cross-check
-   against a traced (not validated) run.
+   against a traced (not validated) run: each branch outcome against
+   the entry where its context resumes the encoded target, with every
+   control-flow diversion tallied by the signal that excused it.
 ``features.physaddr``
    Per-memop physical-page capture (``physaddr=1``, system mode).
 ``features.devio``
@@ -460,7 +462,7 @@ non-zero if any applied mutation is not caught.
          --build-dir ../../../../build \
          -o out/mutation --json out/mutation/matrix.json
 
-Three mutation layers, matching where strictness has to live:
+Four mutation layers, matching where strictness has to live:
 
 ``oracle``
    The mutation is applied to the already-decoded ``(trace_meta,
@@ -468,7 +470,7 @@ Three mutation layers, matching where strictness has to live:
    oracle is re-run against the damaged decode through a
    decoder-shaped stand-in (no re-tracing needed); it must raise a
    gating error in one of the mutation's declared ``expect`` checks.
-   15 of the 20 catalogue entries are this layer: flipping a captured
+   17 of the 23 catalogue entries are this layer: flipping a captured
    dst-register value or misattributing it to the wrong register id,
    swapping two memop addresses or flipping a captured load/store data
    byte, relabeling a pinned instruction's opcode class or branch
@@ -496,6 +498,17 @@ Three mutation layers, matching where strictness has to live:
    catalogue entries: corrupting the ``CST_MAGIC`` in the header
    member, removing the body member from the container, and
    truncating the body member payload.
+``wire_verify``
+   A wire-level mutation that leaves the body stream structurally
+   well-formed and corrupts only what a record *means*, so no decode
+   can reject it — the catch has to come from the check that owns that
+   meaning.  The mutated file is handed to ``cst_decode --strict
+   --verify-branch``, which must reject it.  1 catalogue entry:
+   ``branch_target_corrupt`` moves one encoded branch target by
+   flipping the low bit of its ``CST_FID_BRANCH_TARGET`` displacement
+   delta — the negative control for the branch-outcome self-check,
+   including its control-flow-diversion accounting, which must keep
+   flagging a moved target rather than filing it under a diversion.
 ``wire_oracle``
    A wire-level mutation whose catch is not guaranteed to be an
    explicit decoder bounds/tag check — the corruption may desync the

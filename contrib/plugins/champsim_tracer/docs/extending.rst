@@ -87,7 +87,10 @@ names.
    type; an unmapped type is simply not speculated — no harm, no
    coverage.
    *Verify:* ``cst_decode --verify-branch`` cross-checks each block's
-   recorded direction and target against the next entry's start PC.
+   recorded direction and target against the entry where its context
+   resumes the target's instruction stream — the next entry on a
+   user-mode trace, and the post-excursion resumption point on a
+   system-mode one.
 
 5. **Encode the marker — window control.**
    ``champsim_marker.h`` holds one encoder per ISA (x86

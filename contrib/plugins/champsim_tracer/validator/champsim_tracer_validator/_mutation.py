@@ -194,11 +194,15 @@ def _first_expected_insns_block(gen_meta: dict, field: str):
 @dataclasses.dataclass
 class Mutation:
     name: str
-    layer: str                       # "oracle" | "wire" | "wire_oracle"
+    layer: str                       # "oracle" | "wire" | "wire_verify" |
+                                     # "wire_oracle"
     desc: str
     # oracle:       apply(triple) -> str|None  (returns a human note, or
     #   None when the substrate can't carry the mutation -> SKIP)
     # wire:         apply(cst_bytes) -> bytes|None
+    # wire_verify:  apply(cst_bytes, decode_bin, work) -> bytes|None
+    #   (structurally valid but semantically corrupt; caught by
+    #   `cst_decode --strict --verify-branch`, not by a plain decode)
     # wire_oracle:  apply(cst_bytes, decode_bin, work) -> bytes|None
     #   (locating the target needs its own raw-format decode pass, so it
     #   gets the tool path + a scratch dir the plain wire layer doesn't)
@@ -748,6 +752,59 @@ def _wp_chain_hdr_offset(raw_text: str, want_has_events: bool) -> Optional[int]:
     return None
 
 
+_BR_TARGET_REC = re.compile(r"^\s*@([0-9a-fA-F]+)\s+((?:[0-9a-f]{2} )+)\s")
+
+
+def _branch_target_cell_offset(raw_text: str) -> Optional[int]:
+    """``body.cst`` byte offset of the LAST byte of the first
+    ``CST_FID_BRANCH_TARGET`` delta record (format.rst §5.6) in a
+    ``cst_decode --format=raw`` structural dump.  That byte closes the
+    record's signed-LEB displacement delta, so flipping its low bit moves
+    the encoded branch target without changing the record's length -- the
+    body stream stays structurally intact and only the SEMANTICS of the
+    branch outcome are corrupt.  Records whose byte column the raw dump
+    elided (trailing ``+``) are skipped: their length is unknown."""
+    for line in raw_text.splitlines():
+        if "CST_FID_BRANCH_TARGET" not in line or "rec[" not in line:
+            continue
+        if "+" in line.split("rec[")[0]:
+            continue
+        m = _BR_TARGET_REC.match(line)
+        if m:
+            return int(m.group(1), 16) + len(m.group(2).split()) - 1
+    return None
+
+
+def _mw_branch_target_corrupt(cst_bytes: bytes, decode_bin: Path,
+                              work: Path) -> Optional[bytes]:
+    """Move one encoded branch target on the wire.  The decoder replays the
+    corrupt displacement without complaint (it is a well-formed LEB in a
+    well-formed record), so the catch has to come from the branch-outcome
+    self-check: ``cst_decode --strict --verify-branch`` cross-checks every
+    CST_FID_BRANCH_* against the architectural continuation and must flag
+    the moved target."""
+    probe = work / "_branch_target_probe.cst"
+    probe.write_bytes(cst_bytes)
+    try:
+        raw_text = _raw_dump(probe, decode_bin)
+    finally:
+        probe.unlink(missing_ok=True)
+    if raw_text is None:
+        return None
+    off = _branch_target_cell_offset(raw_text)
+    if off is None:
+        return None
+    members = _tar_members(cst_bytes)
+    bn = _member_name(members, "body.cst")
+    if bn is None or off >= len(members[bn][1]):
+        return None
+    m, data = members[bn]
+    b = bytearray(data)
+    b[off] ^= 0x01
+    members[bn] = (m, bytes(b))
+    return _repack(members)
+
+
 def _mw_wp_events_presence_flip(cst_bytes: bytes, decode_bin: Path,
                                 work: Path,
                                 want_has_events: bool) -> Optional[bytes]:
@@ -958,6 +1015,10 @@ CATALOGUE: list = [
     Mutation("body_truncate", "wire",
              "truncate the body member payload",
              _mw_body_truncate),
+    Mutation("branch_target_corrupt", "wire_verify",
+             "move one encoded branch target (CST_FID_BRANCH_TARGET "
+             "displacement) on the wire",
+             _mw_branch_target_corrupt),
     Mutation("wp_events_presence_flip_clear", "wire_oracle",
              "flip CST_WP_CHAIN_HAS_EVENTS set->clear on a chain that has "
              "an events section (orphans its bytes onto the next record)",
@@ -1115,6 +1176,49 @@ def _run_wire_mutation(m: Mutation, cst_bytes: bytes, work: Path,
                      detail="cst_decode accepted a structurally corrupt .cst")
 
 
+def _run_wire_verify_mutation(m: Mutation, cst_bytes: bytes, work: Path,
+                              decode_bin: Path) -> MutResult:
+    """Wire mutation whose catcher is the branch-outcome self-check rather
+    than a structural decode.  A corruption that keeps the body stream
+    well-formed but moves a recorded branch outcome is invisible to
+    ``--format=legacy``; ``--strict --verify-branch`` is the check that
+    owns it, and it must reject.  The PRISTINE substrate has to pass that
+    same check first, or the "catch" would be inherited from a substrate
+    that was already flagged."""
+    base = work / f"base_{m.name}.cst"
+    base.write_bytes(cst_bytes)
+    try:
+        pre = subprocess.run([str(decode_bin), "--strict", "--verify-branch",
+                              str(base)], capture_output=True, text=True)
+    finally:
+        base.unlink(missing_ok=True)
+    if pre.returncode != 0:
+        return MutResult(m.name, m.layer, "skip",
+                         detail=f"substrate not clean: --verify-branch "
+                                f"rc={pre.returncode}")
+    try:
+        mutated = m.apply(cst_bytes, decode_bin, work)
+    except Exception as e:                                 # noqa: BLE001
+        return MutResult(m.name, m.layer, "skip",
+                         detail=f"apply raised: {e}")
+    if mutated is None:
+        return MutResult(m.name, m.layer, "skip",
+                         detail="substrate carries no addressable "
+                                "CST_FID_BRANCH_TARGET cell")
+    p = work / f"mut_{m.name}.cst"
+    p.write_bytes(mutated)
+    proc = subprocess.run([str(decode_bin), "--strict", "--verify-branch",
+                           str(p)], capture_output=True, text=True)
+    if proc.returncode != 0:
+        return MutResult(m.name, m.layer, "caught", applied=m.desc,
+                         caught_by=("cst_decode --verify-branch",),
+                         detail=f"branch self-check rejected "
+                                f"(rc={proc.returncode})")
+    return MutResult(m.name, m.layer, "HOLE", applied=m.desc,
+                     detail="the branch self-check accepted a moved "
+                            "branch target")
+
+
 def _run_wire_oracle_mutation(m: Mutation, cst_bytes: bytes, work: Path,
                               decode_bin: Path, meta_path: Path,
                               binary_path: Path, vkw: dict) -> MutResult:
@@ -1228,6 +1332,9 @@ def run_mutations(build_dir: Path, work_root: Path, seed: int = 0x1111,
             results.append(_run_oracle_mutation(
                 m, good, gen_meta, meta_path, trace_path, binary_path, vkw,
                 baseline_errcks))
+        elif m.layer == "wire_verify":
+            results.append(_run_wire_verify_mutation(m, cst_bytes, work_root,
+                                                     decode_bin))
         elif m.layer == "wire_oracle":
             results.append(_run_wire_oracle_mutation(
                 m, cst_bytes, work_root, decode_bin, meta_path, binary_path,

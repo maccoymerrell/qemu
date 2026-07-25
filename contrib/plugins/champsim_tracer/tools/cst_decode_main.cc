@@ -2401,10 +2401,15 @@ void print_usage(FILE *err, const char *argv0)
         "                    decompressor subprocess down early)\n"
         "  --verify-branch[=N]  cross-check each branch-terminated CP\n"
         "                    entry's CST_FID_BRANCH_* against the\n"
-        "                    successor-derived direction/target (the next\n"
-        "                    same-thread entry's start_pc), and each WP block\n"
-        "                    in-chain (the next block's start_pc); exit 1 on\n"
-        "                    any mismatch.  =N caps the entries walked\n",
+        "                    architectural continuation: the entry where its\n"
+        "                    (thread, asid) context resumes the encoded\n"
+        "                    target (its start_pc, or a fault anchor of a\n"
+        "                    merged faulting BB).  A pair the OS diverted is\n"
+        "                    deferred only on a positive signal and verified\n"
+        "                    at the resumption; every diversion is tallied\n"
+        "                    by signal.  WP blocks are checked in-chain (the\n"
+        "                    next block's start_pc).  Exit 1 on any\n"
+        "                    mismatch.  =N caps the entries walked\n",
         argv0);
 }
 
@@ -2521,22 +2526,122 @@ int run_body_render(const Options &opts, const cst::Header &h,
  * §8.e  Branch-outcome self-check  (--verify-branch)
  *
  * Cross-checks every branch-terminated CP entry's decoded CST_FID_BRANCH_*
- * against the value a look-ahead consumer would derive: the NEXT CP entry on
- * the SAME (thread, asid) supplies the architectural successor, so the stored
- * target must equal that successor's start_pc and the stored direction must
- * equal (successor != fall_through) with unconditional terminators forced
- * taken — identical to the writer's classification.  Agreement proves the
- * FIDs are truthful (they encode exactly what a decoder would otherwise have
- * to decode ahead for).  Per-context tracking tolerates multi-vCPU
- * interleaving; a fault handler interposed on the same thread (system mode)
- * legitimately breaks the successor identity and is reported for inspection.
+ * against the ARCHITECTURAL CONTINUATION: the entry where the branch's own
+ * (thread, asid) context actually picks the target's instruction stream up
+ * again.  Direction is checked against the encoded target itself — taken iff
+ * target != fall_through, unconditional terminators forced taken, identical
+ * to the writer's classification — so the two singletons must agree with each
+ * other as well as with the stream.
+ *
+ * On a user-mode trace the continuation is simply the next entry in the
+ * context, and the check reduces to the look-ahead a consumer would perform.
+ * A system-mode trace also carries the OS: the next entry in a context is not
+ * always the architectural continuation, because an excursion can intervene
+ * between a branch and its target's first retired instruction —
+ *
+ *   - a synchronous fault, a syscall or (with interrupts=1) an
+ *     asynchronous interrupt diverts to handler code, whose blocks are
+ *     emitted first;
+ *   - a BB that faults part-way is emitted ONCE, whole, keyed on its
+ *     architectural start_pc, after every excursion it took has completed, so
+ *     the handler's return lands on one of the BB's fault ANCHORS rather than
+ *     on its start;
+ *   - kernel work owned by one traced context but executed on several vCPUs
+ *     interleaves in the body stream, so consecutive entries in a context can
+ *     belong to independent strands;
+ *   - a foreign address space or a guest-thread handoff can gate the target's
+ *     own blocks out of the trace entirely.
+ *
+ * In every one of those cases the FID is right and the next entry is simply
+ * not where the branch went.  The check therefore models the resumption
+ * instead of assuming adjacency: a pair whose successor does not carry the
+ * target is DEFERRED — but only when the trace itself signals the diversion
+ * (a fault-depth step, the successor's fault anchors, a thread switch, a
+ * privilege-domain gap, or both endpoints being inside a kernel excursion) —
+ * and the deferred target must then be matched by a later entry of the same
+ * context, at its start_pc or at one of its fault anchors.  That resumption
+ * match is a STRONGER statement than successor adjacency: it verifies the
+ * encoded target against the instruction the interrupted context actually
+ * re-entered.  A mismatch with NO diversion signal is an error, and every
+ * deferral is tallied by signal with its resumed / corroborated /
+ * never-resumed split, so a regression cannot hide inside the diversion
+ * accounting.
+ *
+ * A fault-merged entry is checked from the other side too, which is what
+ * keeps the deferral path honest: control entered such a block once at its
+ * start_pc and re-entered it once per anchor, so every one of those PCs must
+ * be the encoded target of some branch of that context.  A target moved on
+ * the wire leaves one of them unnamed and fails, deferred or not.
  *
  * WP chain blocks are cross-checked in-chain: a block's decoded target/
  * direction must match the NEXT chain block's start_pc (the whole excursion
  * is one CP entry's payload, so the successor is in-chain with no lookahead).
- * The chain's last block has no in-chain successor and is left unchecked.
+ * The chain's last block has no in-chain successor and is left unchecked; a
+ * block the wp_events section marks as faulting or untranslatable ends its
+ * strand, so a mismatch there is tallied as a diversion rather than an error.
  * Returns 0 iff every checked CP entry and WP block agreed.
  */
+namespace {
+
+/* Diversion signals, in the order they are tested.  A branch whose encoded
+ * target is not carried by the next entry of its context may only be deferred
+ * when one of these is positively present in the trace. */
+enum DivCat {
+    DIV_EXC_ENTRY = 0,   /* fault_depth rose: handler entry               */
+    DIV_EXC_RETURN,      /* fault_depth fell: excursion exit              */
+    DIV_MERGED_RESUME,   /* successor is a fault-merged BB (has anchors)  */
+    DIV_THREAD_HANDOFF,  /* successor is marked thread_switched           */
+    DIV_PRIV_GAP,        /* privilege domain changed: gated-out work      */
+    DIV_KERNEL_EXC,      /* both endpoints inside a kernel excursion      */
+    DIV_NONE,            /* no signal at all — a real mismatch            */
+    DIV_N
+};
+
+const char *const kDivName[DIV_N] = {
+    "excursion entry (fault_depth rose)",
+    "excursion return (fault_depth fell)",
+    "merged faulting BB (successor carries fault anchors)",
+    "guest-thread handoff (successor is a thread switch)",
+    "privilege-domain gap (kernel/user work not in the trace)",
+    "interleaved kernel-excursion strand",
+    "no diversion signal",
+};
+
+/* One branch whose target has not yet been seen resumed in its context. */
+struct DeferredBranch {
+    uint64_t target      = 0;
+    uint32_t seq         = 0;
+    uint32_t template_id = 0;
+    uint32_t fault_depth = 0;   /* depth the diverted branch executed at */
+    int      cat         = DIV_NONE;
+};
+
+/* The previous entry of one (thread, asid) context. */
+struct PrevBr {
+    bool     seen         = false;
+    bool     valid        = false;
+    bool     taken        = false;
+    uint64_t target       = 0;
+    uint64_t fall_through = 0;
+    bool     conditional  = false;
+    uint32_t template_id  = 0;
+    uint32_t seq          = 0;
+    uint32_t fault_depth  = 0;
+    bool     is_system    = false;
+};
+
+struct CtxState {
+    PrevBr                      prev;
+    std::vector<DeferredBranch> open;
+};
+
+/* Ceiling on a context's outstanding deferrals.  A well-formed trace keeps
+ * this in single digits (one per excursion in flight); the cap only bounds
+ * what a corrupt one can allocate. */
+constexpr size_t kMaxOpenPerCtx = 4096;
+
+}  // namespace
+
 int run_verify_branch(const Options &opts, const cst::Header &h,
                       cst::CstFile &cf,
                       const std::vector<cst::Template> &templates,
@@ -2546,23 +2651,21 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
     cst::BodyWalker walker(h, templates, by_id, body_stream->reader());
     if (opts.verify_limit) walker.set_max_entries(opts.verify_limit);
 
-    struct PrevBr {
-        bool     valid = false;
-        bool     taken = false;
-        uint64_t target = 0;
-        uint64_t fall_through = 0;
-        bool     conditional = false;
-        uint32_t template_id = 0;
-    };
-    std::unordered_map<uint64_t, PrevBr> prev_by_ctx;
+    std::unordered_map<uint64_t, CtxState> ctx_by_key;
 
     uint64_t n_checked = 0, n_target_mism = 0, n_taken_mism = 0;
     uint64_t n_branch = 0, n_nonbranch = 0;
+    uint64_t n_immediate = 0, n_at_anchor = 0;
+    uint64_t n_deferred[DIV_N]     = {0};
+    uint64_t n_resumed[DIV_N]      = {0};
+    uint64_t n_corroborated[DIV_N] = {0};
     /* WP blocks are cross-checked in-chain: block w's decoded target/
      * direction against block w+1's start_pc (the chain's last block has no
      * in-chain successor and is not checked). */
     uint64_t n_wp_branch = 0, n_wp_checked = 0;
     uint64_t n_wp_target_mism = 0, n_wp_taken_mism = 0;
+    uint64_t n_wp_diverted = 0;
+    uint64_t n_resume_unnamed = 0;
     std::string examples;
     int ex_count = 0;
 
@@ -2575,40 +2678,175 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
         const cst::Template *t = get_tmpl(e.template_id);
         uint64_t start_pc = t ? t->start_pc : 0;
         uint64_t ctx = ((uint64_t)e.thread_id << 32) | e.asid;
+        CtxState &cs = ctx_by_key[ctx];
 
-        auto pit = prev_by_ctx.find(ctx);
-        if (pit != prev_by_ctx.end() && pit->second.valid) {
-            const PrevBr &p = pit->second;
-            uint64_t succ = start_pc;                 /* successor-derived  */
-            bool exp_taken = (succ != p.fall_through);
+        /* The PCs at which this entry picks an instruction stream up: its
+         * architectural start, plus — when it is a fault-merged BB — the PC
+         * of every instruction an excursion returned to (format.rst §4.2a's
+         * fault anchors).  A branch that aimed at any of them was realised
+         * by this entry. */
+        auto is_resume_pc = [&](uint64_t pc) {
+            if (!t) return false;
+            if (pc == t->start_pc) return true;
+            for (uint32_t a : e.fault_anchors) {
+                if (a < t->insns.size() && t->insns[a].pc == pc) return true;
+            }
+            return false;
+        };
+
+        /* (1) Resumption pass: every deferred branch of this context whose
+         * target this entry carries is now verified.  One entry can settle
+         * several — a BB that took N excursions resumes the branch that
+         * entered it AND the exit of each excursion.
+         *
+         * Second tier: a block executing at or deeper than the diverted
+         * branch's own nesting depth that NAMES the deferred PC as its
+         * architectural successor corroborates the encoded target even when
+         * the context never re-enters it — an exception return records where
+         * it was headed whether or not that instruction goes on to retire.
+         * Kept in its own column: resumption is direct evidence,
+         * corroboration is a second record agreeing with the first. */
+        std::vector<uint64_t> named;   /* resume PCs a branch aimed at */
+        for (size_t i = cs.open.size(); i-- > 0; ) {
+            const DeferredBranch &d = cs.open[i];
+            if (is_resume_pc(d.target)) {
+                n_resumed[d.cat]++;
+                named.push_back(d.target);
+            } else if (e.branch.valid && e.branch.target == d.target &&
+                       e.fault_depth >= d.fault_depth) {
+                n_corroborated[d.cat]++;
+            } else {
+                continue;
+            }
+            cs.open.erase(cs.open.begin() + (long)i);
+        }
+
+        /* (2) Continuation check for the context's previous branch. */
+        if (cs.prev.seen && cs.prev.valid) {
+            const PrevBr &p = cs.prev;
+            /* Direction against the encoded target: the two singletons must
+             * agree with each other (taken iff the target left the
+             * fall-through, unconditional terminators forced taken) — the
+             * writer's own classification, and well-defined even when the
+             * successor is not the continuation. */
+            bool exp_taken = (p.target != p.fall_through);
             if (!p.conditional) exp_taken = true;
-            bool tmism = (p.target != succ);
             bool dmism = (p.taken != exp_taken);
             n_checked++;
-            if (tmism) n_target_mism++;
             if (dmism) n_taken_mism++;
-            if ((tmism || dmism) && ex_count < 20) {
-                char buf[320];
+
+            int cat = -1;
+            if (is_resume_pc(p.target)) {
+                n_immediate++;
+                named.push_back(p.target);
+                if (t && p.target != t->start_pc) n_at_anchor++;
+            } else if (e.fault_depth > p.fault_depth) {
+                cat = DIV_EXC_ENTRY;
+            } else if (e.fault_depth < p.fault_depth) {
+                cat = DIV_EXC_RETURN;
+            } else if (!e.fault_anchors.empty()) {
+                cat = DIV_MERGED_RESUME;
+            } else if (e.thread_switched) {
+                cat = DIV_THREAD_HANDOFF;
+            } else if (t && !t->insns.empty() &&
+                       t->insns[0].is_system != p.is_system) {
+                cat = DIV_PRIV_GAP;
+            } else if (p.fault_depth > 0 && e.fault_depth > 0) {
+                cat = DIV_KERNEL_EXC;
+            } else {
+                cat = DIV_NONE;
+                n_target_mism++;
+            }
+            if (cat >= 0) {
+                n_deferred[cat]++;
+                if (cat != DIV_NONE) {
+                    /* Bounded: a corrupt trace must not be able to grow the
+                     * deferral list without limit.  The oldest deferral ages
+                     * out unverified, exactly as if the trace had ended
+                     * without resuming it. */
+                    if (cs.open.size() >= kMaxOpenPerCtx) {
+                        cs.open.erase(cs.open.begin());
+                    }
+                    cs.open.push_back({p.target, p.seq, p.template_id,
+                                       p.fault_depth, cat});
+                }
+            }
+            if ((cat == DIV_NONE || dmism) && ex_count < 20) {
+                char buf[400];
                 std::snprintf(buf, sizeof(buf),
-                    "  tid=%u asid=%u prev=BB%u: FID target=0x%llx taken=%d"
-                    " | successor start=0x%llx expect_taken=%d%s%s\n",
+                    "  tid=%u asid=%u seq=%u prev=BB%u: FID target=0x%llx"
+                    " taken=%d expect_taken=%d | next entry seq=%u BB%u"
+                    " start=0x%llx%s%s\n",
                     (uint32_t)(ctx >> 32), (uint32_t)(ctx & 0xffffffffu),
-                    p.template_id,
+                    p.seq, p.template_id,
                     (unsigned long long)p.target, (int)p.taken,
-                    (unsigned long long)succ, (int)exp_taken,
-                    tmism ? " [TARGET MISMATCH]" : "",
+                    (int)exp_taken, e.seq_num, e.template_id,
+                    (unsigned long long)start_pc,
+                    cat == DIV_NONE ? " [TARGET MISMATCH: no diversion"
+                                      " signal]" : "",
                     dmism ? " [TAKEN MISMATCH]" : "");
                 examples += buf;
                 ex_count++;
             }
         }
 
+        /* (3) Merged-BB resumption invariant.  A fault-merged entry
+         * (format.rst §4.2a) is emitted whole, keyed on its architectural
+         * start, with one anchor per excursion it took: control entered it
+         * once at start_pc and re-entered it once at each anchor.  Every one
+         * of those PCs must therefore be NAMED by a branch of this context —
+         * the immediate predecessor, or one of the branches deferred across
+         * the excursions.  An unnamed resume PC means some branch that
+         * reached this BB encoded a target that is not where it arrived, so
+         * it is a hard error, not a diversion. */
+        if (!e.fault_anchors.empty() && t) {
+            auto was_named = [&](uint64_t pc) {
+                for (uint64_t n : named) if (n == pc) return true;
+                return false;
+            };
+            for (size_t k = 0; k <= e.fault_anchors.size(); k++) {
+                uint64_t pc;
+                if (k == 0) {
+                    /* start_pc can only be required of a context that has
+                     * already shown a branch outcome: the context's first
+                     * entry has no predecessor, and a page-split
+                     * continuation carries no branch FIDs, so neither can
+                     * name where this block was entered. */
+                    if (!cs.prev.seen || !cs.prev.valid) continue;
+                    pc = t->start_pc;
+                } else {
+                    uint32_t a = e.fault_anchors[k - 1];
+                    if (a >= t->insns.size()) continue;
+                    pc = t->insns[a].pc;
+                }
+                if (was_named(pc)) continue;
+                n_resume_unnamed++;
+                if (ex_count < 20) {
+                    char buf[320];
+                    std::snprintf(buf, sizeof(buf),
+                        "  tid=%u asid=%u seq=%u BB%u: merged-BB resume pc="
+                        "0x%llx (%s) is not the encoded target of any branch"
+                        " in this context [UNNAMED RESUME]\n",
+                        e.thread_id, e.asid, e.seq_num, e.template_id,
+                        (unsigned long long)pc,
+                        k == 0 ? "start_pc" : "fault anchor");
+                    examples += buf;
+                    ex_count++;
+                }
+            }
+        }
+
         PrevBr np;
+        np.seen         = true;
         np.valid        = e.branch.valid;
         np.taken        = e.branch.taken;
         np.target       = e.branch.target;
         np.fall_through = t ? t->fall_through_pc : 0;
         np.template_id  = e.template_id;
+        np.seq          = e.seq_num;
+        np.fault_depth  = e.fault_depth;
+        np.is_system    = (t && !t->insns.empty()) ? t->insns[0].is_system
+                                                   : false;
         if (t) {
             for (int j = (int)t->insns.size() - 1; j >= 0; j--) {
                 if (t->insns[j].branch_type != 0) {
@@ -2617,7 +2855,7 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
                 }
             }
         }
-        prev_by_ctx[ctx] = np;
+        cs.prev = np;
         if (e.branch.valid) n_branch++; else n_nonbranch++;
 
         /* WP in-chain cross-check.  Within one excursion the whole chain is
@@ -2647,6 +2885,14 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
             bool tmism = (wp.branch.target != succ);
             bool dmism = (wp.branch.taken != exp_taken);
             n_wp_checked++;
+            /* Symmetric with the CP side: a block the wp_events section marks
+             * as faulting or untranslatable ends its strand, so its successor
+             * in the chain need not be its architectural target.  Tallied as
+             * a diversion, not an error. */
+            if (tmism && (wp.fault || wp.translation_unavailable)) {
+                n_wp_diverted++;
+                tmism = false;
+            }
             if (tmism) n_wp_target_mism++;
             if (dmism) n_wp_taken_mism++;
             if ((tmism || dmism) && ex_count < 20) {
@@ -2669,28 +2915,69 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
         opts.verify_limit != 0 && walker.stats().cp_entries >= opts.verify_limit;
     if (!stopped_early) body_stream->finalize();
 
+    uint64_t n_div = 0;
+    for (int c = 0; c < DIV_N; c++) {
+        if (c != DIV_NONE) n_div += n_deferred[c];
+    }
+
     std::fprintf(stdout,
         "branch self-check: %llu branch-terminated CP entries, "
-        "%llu non-branch; cross-checked %llu against successor-derived "
-        "target/direction\n"
+        "%llu non-branch; cross-checked %llu against the architectural "
+        "continuation\n"
+        "  next entry carried the target: %llu"
+        " (at a merged BB's fault anchor: %llu)\n"
+        "  deferred across a diversion:   %llu\n"
         "  target mismatches: %llu\n"
         "  taken  mismatches: %llu\n"
+        "  unnamed merged-BB resume points: %llu\n",
+        (unsigned long long)n_branch, (unsigned long long)n_nonbranch,
+        (unsigned long long)n_checked,
+        (unsigned long long)n_immediate, (unsigned long long)n_at_anchor,
+        (unsigned long long)n_div,
+        (unsigned long long)n_target_mism,
+        (unsigned long long)n_taken_mism,
+        (unsigned long long)n_resume_unnamed);
+    if (n_div) {
+        /* Per-signal accounting for every deferral, so a suppression can
+         * never hide a regression: each line names the signal the trace
+         * carried, how many pairs it excused, and how many of those were
+         * then VERIFIED — directly, against the entry the context re-entered
+         * (resumed), or indirectly, against a later block of the excursion
+         * naming the same PC (corroborated).  "never resumed" are branches
+         * whose target the trace never reaches again in that context (the
+         * target's own instruction faulted before retiring, its blocks were
+         * gated out, or the context ended) — unverifiable, and reported as
+         * such rather than silently passed. */
+        std::fprintf(stdout, "diversion signals (deferred / resumed / "
+                             "corroborated / never resumed):\n");
+        for (int c = 0; c < DIV_N; c++) {
+            if (c == DIV_NONE || !n_deferred[c]) continue;
+            std::fprintf(stdout,
+                         "  %-56s %6llu / %6llu / %6llu / %6llu\n",
+                         kDivName[c],
+                         (unsigned long long)n_deferred[c],
+                         (unsigned long long)n_resumed[c],
+                         (unsigned long long)n_corroborated[c],
+                         (unsigned long long)(n_deferred[c] - n_resumed[c] -
+                                              n_corroborated[c]));
+        }
+    }
+    std::fprintf(stdout,
         "WP branch self-check: %llu branch-terminated WP blocks; "
         "cross-checked %llu in-chain (next block's start_pc)\n"
         "  WP target mismatches: %llu\n"
-        "  WP taken  mismatches: %llu\n",
-        (unsigned long long)n_branch, (unsigned long long)n_nonbranch,
-        (unsigned long long)n_checked,
-        (unsigned long long)n_target_mism,
-        (unsigned long long)n_taken_mism,
+        "  WP taken  mismatches: %llu\n"
+        "  WP diverted (block carries a fault/translation event): %llu\n",
         (unsigned long long)n_wp_branch,
         (unsigned long long)n_wp_checked,
         (unsigned long long)n_wp_target_mism,
-        (unsigned long long)n_wp_taken_mism);
+        (unsigned long long)n_wp_taken_mism,
+        (unsigned long long)n_wp_diverted);
     if (!examples.empty()) {
         std::fprintf(stdout, "first mismatches:\n%s", examples.c_str());
     }
     return (n_target_mism == 0 && n_taken_mism == 0 &&
+            n_resume_unnamed == 0 &&
             n_wp_target_mism == 0 && n_wp_taken_mism == 0) ? 0 : 1;
 }
 

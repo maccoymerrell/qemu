@@ -2309,7 +2309,7 @@ direction) and **zero bytes** on every later execution; a **conditional**
 branch pays a one-byte direction delta only when its outcome flips; an
 **indirect** branch pays a (still-compact) displacement delta whenever the
 target moves.  A consumer reconstructs the direction it would otherwise
-derive by look-ahead as ``taken == (successor != fall_through_pc)``, with an
+derive by look-ahead as ``taken == (target != fall_through_pc)``, with an
 unconditional terminator always taken — identical to the writer's
 classification.
 
@@ -2337,9 +2337,55 @@ Coverage and gating:
   every iteration but the last, which exits to the real successor — so the
   per-entry outcome tracks the emitted successor sequence exactly.
 
-``cst_decode --verify-branch`` cross-checks both: every branch-terminated CP
-entry's stored outcome against the next same-context entry's ``start_pc``, and
-every non-final WP block against the next chain block's ``start_pc``.
+**Successor adjacency and diversion.**  ``BRANCH_TARGET`` is the
+**architectural** successor: the PC the branch sent control to.  It is not a
+promise about the next record.  On a user-mode trace the two coincide — the
+next entry of the same ``(thread_id, asid)`` context starts at the target,
+which is exactly the look-ahead the FIDs spare a consumer.  A system-mode
+trace also carries the OS, and there the next entry in a context need not be
+where the branch went:
+
+* **An excursion intervenes.**  A synchronous fault, a syscall or (with
+  ``interrupts=1``) an asynchronous interrupt diverts to handler code, whose
+  blocks are emitted before the target's first instruction retires.  The
+  handler's entry carries a higher ``fault_depth`` (§4.2a).
+* **The target's block faults part-way.**  A faulting block is emitted
+  **once, whole**, keyed on its architectural ``start_pc``, only after every
+  excursion it took has completed, and carries one *fault anchor* per
+  excursion (§4.2a).  The branch that entered it names its ``start_pc``
+  while
+  each excursion's return names an anchor's instruction PC — and the record
+  that follows either of them is the handler, not the block.
+* **Strands interleave.**  Kernel work owned by one traced context but
+  executed on several vCPUs is stamped with that one context, so consecutive
+  entries can belong to independent strands.
+* **Blocks are gated out.**  A foreign address space or a guest-thread
+  handoff can keep the target's own blocks out of the trace entirely, so the
+  branch's target is never reached again in that context.
+
+In every one of those cases the encoded target is right and the adjacent
+record is not the continuation.  A consumer that reconstructs control flow
+from ``BRANCH_TARGET`` is unaffected — that is what the FIDs are for.  A
+consumer that instead *derives* the outcome by look-ahead is wrong wherever
+the OS intervenes.
+
+``cst_decode --verify-branch`` therefore cross-checks both singletons against
+the architectural continuation rather than against adjacency: direction
+against the encoded target itself (``taken == (target != fall_through_pc)``,
+unconditional terminators forced taken), and the target against the entry
+where the context resumes the target's instruction stream — at its
+``start_pc`` or at one of its fault anchors.  A pair whose adjacent record
+does not carry the target is deferred only when the trace positively signals
+the diversion (a ``fault_depth`` step, the successor's fault anchors, a
+thread switch, a privilege-domain gap, or both endpoints inside a kernel
+excursion), and the deferred target must then be matched by a later entry of
+the same context; every deferral is reported by signal with its verified /
+never-resumed split.  A fault-merged entry is checked from the other side as
+well: each of its resume PCs — ``start_pc`` and every anchor's instruction PC
+— must be the encoded target of some branch in that context.  Non-final WP
+blocks are cross-checked in-chain against the next chain block's
+``start_pc``; a block the ``wp_events`` section marks faulting or
+untranslatable ends its strand and is tallied as a diversion.
 
 6. Templates Section
 ~~~~~~~~~~~~~~~~~~~~

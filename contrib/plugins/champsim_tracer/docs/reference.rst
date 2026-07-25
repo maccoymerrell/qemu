@@ -463,10 +463,16 @@ per-chain WP field-state overlay as ``LOAD_ADDR``
 overhead instead of paying a fresh baseline per excursion.  They appear only
 on blocks whose template ends in a branch; a page-split continuation and the
 segment-final flush carry neither.  A ``REP`` fan-out reports each iteration's
-self-loop (taken to the REP PC) until the final iteration exits.  ``cst_decode
---verify-branch`` cross-checks every CP entry's stored outcome against the
-successor-derived value and every non-final WP block against the next chain
-block's ``start_pc``.  See :doc:`format` §5.6 for the wire contract.
+self-loop (taken to the REP PC) until the final iteration exits.  The encoded
+target is the ARCHITECTURAL successor, which on a system-mode trace is not
+always the next record: a fault, a syscall, an interrupt, an interleaved
+kernel strand or a gated-out address space can stand between a branch and
+its target's first retired instruction.  ``cst_decode --verify-branch``
+cross-checks each CP entry's stored outcome against the entry where its
+context resumes the target's instruction stream (its ``start_pc`` or one of
+its fault anchors), and each non-final WP block against the next chain
+block's ``start_pc``.  See :doc:`format` §5.6 for the wire contract and the
+diversion semantics.
 
 .. _registers:
 
